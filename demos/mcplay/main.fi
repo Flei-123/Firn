@@ -27,6 +27,7 @@
 //          config file (MC_PACK_CONFIG) line `sounds=synth|original|both` does the same; O = switch pack sounds off/on while playing; pack "weight" entries are honoured
 //   MCPLAY_DIG_MS=700  hold time before the "finish digging" packet in survival (there is no hardness table yet)
 //   MCPLAY_PLACE_ID=0  block state id painted locally on a place click (0 = wait for the server's Block Update)
+//   MCPLAY_ENTITIES=0  do not draw entity boxes (spawn / move / destroy packets are still tracked; end line `mcplay: entities ...`)
 //   MCPLAY_RUN_S=0     quit after N seconds (tests)       MCPLAY_SHOT=<file.png>  write the last frame as PNG on exit + print its hash
 //   MCPLAY_AUDIO=0     sound: 0 off, 1 on (FIRN_AUDIO=null|file:<path>|device selects the sink)
 //
@@ -78,6 +79,7 @@ import gpu.gl_scene
 import gpu.glshow
 import mc.mc_audio
 import mc.mc_entity
+import mc.mc_entity_draw
 import mc.v763.mc_snd_v763
 import audio.engine
 import audio.bank
@@ -106,6 +108,10 @@ const SC_M: u32 = 50
 const SC_O: u32 = 24
 const AUDIO_RATE: u32 = 44100
 const PLACE_WAIT_MS: u64 = 1500
+const ENT_TAU: f64 = 0.05
+const ENT_SNAP: f64 = 8.0
+const ENT_MAX_DIST: f64 = 96.0
+const ENT_FAR_LOD: f64 = 40.0
 
 fn now_ns() -> u64 {
     var ts: [i64; 2] = [0; 2]
@@ -367,6 +373,15 @@ struct Ctx {
     ma: *mut mc_audio.McAudio,
     wk: mc_audio.Walker,
     ents: mc_entity.Store,
+    ents_on: bool, // MCPLAY_ENTITIES=0 switches the entity boxes off (packets are still tracked)
+    entl: mc_entity_draw.EntList,
+    ent_t: u64, // ns of the last interpolation step
+    ent_peak: usize, // most entities tracked at once
+    ent_vis_max: u32, // most entities that passed culling in one frame
+    ent_boxes: u64, // boxes handed to the back end, all frames
+    ent_frames: u64, // frames that drew at least one box
+    ent_moving: u64, // sum over frames of entities still interpolating
+    ent_resets: u64, // Respawn packets (store cleared)
     reg: mc_registry.Registry,
     pend_place: bool,
     pend_x: i32,
@@ -713,6 +728,13 @@ fn on_packet(c: *mut Ctx, id: i32) {
         dump_raw_inv("slot", (*cl).ver.protocol, mc_client.client_body(cl))
         mc_inv.inv_set_efficiency_id(&(*c).inv, mc_client.client_enchant_efficiency(cl))
         mc_inv.inv_on_set_slot_v(&(*c).inv, &(*cl).ver, mc_client.client_body(cl))
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_RESPAWN) {
+        // new dimension: the old entities are gone (the server sends no destroy for them)
+        mc_entity.store_clear(&(*c).ents)
+        (*c).ent_resets = (*c).ent_resets + 1 as u64
+    } else if mc_entity.entity_on_packet(&(*c).ents, &(*cl).ver, id, mc_client.client_body(cl)) {
+        let n: usize = mc_entity.store_count(&(*c).ents)
+        if n > (*c).ent_peak { (*c).ent_peak = n }
     } else if (*c).aud {
         if mc_audio.mca_on_packet((*c).ma, &(*cl).ver, id, mc_client.client_body(cl), &(*c).ents) {
             (*c).n_snd_pkt = (*c).n_snd_pkt + 1 as u64
@@ -1617,6 +1639,28 @@ fn audio_stop(c: *mut Ctx) {
 
 // GL frame: same pass order as draw_frame (sky -> world -> selection box -> tint -> HUD), shown by present.
 #[allow_escape]
+// Entities: one interpolation step per frame (real time), then the visible ones become box records for the back end `b`.
+fn ents_step(c: *mut Ctx) {
+    let t: u64 = now_ns()
+    var dt: f64 = 0.0
+    if (*c).ent_t != 0 as u64 { dt = ((t - (*c).ent_t) as f64) / 1.0e9 }
+    (*c).ent_t = t
+    (*c).ent_moving = (*c).ent_moving + mc_entity.store_interp(&(*c).ents, dt, ENT_TAU, ENT_SNAP)
+}
+
+fn ents_draw(c: *mut Ctx, b: *mut mc_backend.Backend) {
+    if !(*c).ents_on || !(*c).have_pos { return }
+    mc_entity_draw.entlist_build_reg(&(*c).entl, &(*c).ents, &(*c).cam, ENT_MAX_DIST, ENT_FAR_LOD, &(*c).reg)
+    let vis: u32 = (*c).entl.n_in - (*c).entl.n_culled
+    if vis > (*c).ent_vis_max { (*c).ent_vis_max = vis }
+    let n: u64 = mc_entity_draw.entlist_draw(&(*c).entl, b)
+    if n > 0 as u64 {
+        (*c).ent_boxes = (*c).ent_boxes + n
+        (*c).ent_frames = (*c).ent_frames + 1 as u64
+    }
+}
+
+#[allow_escape]
 fn draw_frame_gl(c: *mut Ctx) {
     let view: f64 = far_view(c) as f64
     let fog_start: f64 = view * 16.0 * 0.5
@@ -1639,6 +1683,10 @@ fn draw_frame_gl(c: *mut Ctx) {
         }
     }
     (*c).be.end((*c).be.obj)
+    // entity boxes: ONE instanced call through the scene layer, after end (the world is in the depth buffer)
+    var ebe: mc_backend.Backend = (*c).be
+    gl_scene.scene_attach(&(*c).gsc, &ebe)
+    ents_draw(c, &ebe)
     if (*c).hit {
         // selection box = 12 thin boxes along the block edges
         let e: f64 = 0.03
@@ -1718,6 +1766,8 @@ fn draw_frame(c: *mut Ctx) {
             stream_time(c, now_ns() - ts0)
         }
     }
+    var ebe: mc_backend.Backend = mc_backend.backend_cpu(r)
+    ents_draw(c, &ebe)
     if !(*c).light { mc_sky.sky_tint_frame(&(*c).sky, r) }
     if (*c).hit {
         mc_input.input_draw_box(r, (*c).pk.x, (*c).pk.y, (*c).pk.z, BOX_RGBA)
@@ -1880,6 +1930,8 @@ fn main(start: u64) -> i32 {
         light: env_flag("MCPLAY_LIGHT", true), wl: mc_wlight.wl_new(0, 24), region_done: false, n_region_moves: 0 as u64, day_time: 0, day_fixed: false, n_time: 0,
         aud: false, aud_thread: false, aud_t0: 0, aud_owed: 0.0, aud_muted: false,
         eng: &eng, bnk: &bnk, snk: &snk, ma: &ma, wk: mc_audio.mca_walker_new(), ents: mc_entity.store_new(), reg: ver.registry_of(),
+        ents_on: env_flag("MCPLAY_ENTITIES", true), entl: mc_entity_draw.entlist_new(), ent_t: 0 as u64, ent_peak: 0, ent_vis_max: 0 as u32, ent_boxes: 0 as u64,
+        ent_frames: 0 as u64, ent_moving: 0 as u64, ent_resets: 0 as u64,
         pend_place: false, pend_x: 0, pend_y: 0, pend_z: 0, pend_t: 0, n_snd: 0, n_snd_pkt: 0,
         probe: env_flag("MCPLAY_AUDIO_PROBE", false), probe_i: 0, probe_next: 0 as u64, amb: mc_audio.mca_ambient_new(4242 as i64), amb_x: (env_int("MCPLAY_AMBIENT_X", 1) as f64), amb_dark: env_flag("MCPLAY_AMBIENT_DARK", false), n_amb: 0 as u64,
         n_chunks: 0, n_unload: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, fps: 0,
@@ -2018,6 +2070,7 @@ fn main(start: u64) -> i32 {
         }
         handle_mouse(&c)
         audio_frame(&c)
+        ents_step(&c)
         draw_frame(&c)
         present(&c)
         c.n_frames = c.n_frames + 1 as u64
@@ -2047,6 +2100,22 @@ fn main(start: u64) -> i32 {
     say(f"mcplay: inv updates={c.inv.n_updates} bad={c.inv.bad} hotbar={mc_inv.inv_hotbar_item(&c.inv, 0)}x{mc_inv.inv_hotbar_count(&c.inv, 0)},{mc_inv.inv_hotbar_item(&c.inv, 1)}x{mc_inv.inv_hotbar_count(&c.inv, 1)},{mc_inv.inv_hotbar_item(&c.inv, 2)}x{mc_inv.inv_hotbar_count(&c.inv, 2)} dig_ms={c.dig_ms} dig_total={c.dig_total} dig_table={c.dg.nblocks}\n")
     say(f"mcplay: fx haste={mc_effect.fx_haste(&c.fx)} fatigue={mc_effect.fx_fatigue(&c.fx)} eff={mc_inv.inv_held_eff(&c.inv, c.pl.slot)} eff0={mc_inv.inv_held_eff(&c.inv, 0)} fx_ticks={c.fx_ticks} plain_ticks={c.fx_plain} clicks={c.inv.n_clicks} cursor={mc_inv.inv_cursor_item(&c.inv)}x{mc_inv.inv_cursor_count(&c.inv)} slot10={mc_inv.inv_count(&c.inv, 10)} slot11={mc_inv.inv_count(&c.inv, 11)}\n")
     say(f"mcplay: light={c.light} region={c.region_done} region_moves={c.n_region_moves} time_packets={c.n_time} day_time={c.day_time} daylight={c.sky.daylight}\n")
+    say(f"mcplay: entities count={mc_entity.store_count(&c.ents)} peak={c.ent_peak} players={mc_entity.store_player_count(&c.ents)} spawns={c.ents.spawns} moves={c.ents.moves} teleports={c.ents.teleports} looks={c.ents.looks} destroys={c.ents.destroys} velocities={c.ents.velocities} bad={c.ents.bad} misses={c.ents.misses} dropped={c.ents.dropped} resets={c.ent_resets} on={c.ents_on}\n")
+    say(f"mcplay: entities_draw boxes={c.ent_boxes} frames={c.ent_frames} vis_max={c.ent_vis_max} in={c.entl.n_in} culled={c.entl.n_culled} lod={c.entl.n_lod} interp_moving={c.ent_moving}\n")
+    if env_flag("MCPLAY_ENT_LIST", false) {
+        // up to 16 entities with network and render position (debug / tests)
+        var ei: usize = 0
+        var shown: i32 = 0
+        let ecap: usize = mc_entity.store_slot_cap(&c.ents)
+        while ei < ecap && shown < 16 {
+            let ee: *mut mc_entity.Entity = mc_entity.store_at(&c.ents, ei)
+            ei = ei + 1
+            if (ee as u64) == 0 as u64 { continue }
+            shown = shown + 1
+            say(f"mcplay: ent id={(*ee).id} kind={(*ee).kind} type={(*ee).type_id} x={(*ee).x} y={(*ee).y} z={(*ee).z} rx={(*ee).rx} ry={(*ee).ry} rz={(*ee).rz} yaw={(*ee).yaw}\n")
+        }
+        say(f"mcplay: cam x={c.cam.x} y={c.cam.y} z={c.cam.z} yaw={c.cam.yaw} pitch={c.cam.pitch} far={c.cam.far} fov={c.cam.fov}\n")
+    }
     say(f"mcplay: pos x={c.pl.x as i64} y={c.pl.y as i64} z={c.pl.z as i64} fps={c.fps}\n")
     var rc: i32 = 0
     if c.gl {
@@ -2085,6 +2154,8 @@ fn main(start: u64) -> i32 {
         mc_render_world.wr_free(&c.g.wr, &c.g.r)
     }
     window.close_window(c.wp)
+    mc_entity_draw.entlist_free(&c.entl)
+    mc_entity.store_free(&c.ents)
     mc_world.world_free(&c.world)
     mc_chunk.scratch_free(&c.sc)
     mc_client.client_free(&c.cl)

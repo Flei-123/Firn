@@ -18,9 +18,10 @@ import mc.mc_entity
 import mc.mc_camera
 import mc.mc_math
 import mc.mc_backend
+import mc.mc_registry
 
 export {
-    EntList, entlist_new, entlist_free, entlist_clear, entlist_add_model, entlist_build, entlist_draw, entlist_boxes,
+    EntList, entlist_new, entlist_free, entlist_clear, entlist_add_model, entlist_add_sized, entlist_build, entlist_build_reg, entlist_draw, entlist_boxes,
 }
 
 struct EntList {
@@ -92,9 +93,32 @@ fn entlist_add_model(l: *mut EntList, x: f64, y: f64, z: f64, yaw_deg: f64, seed
     part(l, x, y, z, ys, yc, 0.0, 1.75, 0.0, 0.5, 0.5, 0.5, r + 60, g + 60, b + 60)
 }
 
+// One box of the registry size (width x height x width, feet at y) for a non-humanoid entity; a few shades of the seed tint.
+fn entlist_add_sized(l: *mut EntList, x: f64, y: f64, z: f64, yaw_deg: f64, seed: u64, w: f64, h: f64) {
+    let rad: f64 = yaw_deg * 0.017453292519943295
+    let ys: f64 = math.sin(rad)
+    let yc: f64 = math.cos(rad)
+    let hh: u64 = (seed *% 11400714819323198485) >> 40
+    let r: i32 = 60 + ((hh & 127 as u64) as i32)
+    let g: i32 = 60 + (((hh >> 7 as u64) & 127 as u64) as i32)
+    let b: i32 = 60 + (((hh >> 14 as u64) & 127 as u64) as i32)
+    part(l, x, y, z, ys, yc, 0.0, h * 0.5, 0.0, w, h, w, r, g, b)
+}
+
 // Replaces the list by the visible entities of `s`: frustum culling with the camera, `max_dist` blocks (0 = no limit),
-// single box beyond `far_lod` blocks.
+// single box beyond `far_lod` blocks. Without a registry every non-player entity is the 0.5 block object box.
 fn entlist_build(l: *mut EntList, s: *mut mc_entity.Store, cam: *mut mc_camera.Camera, max_dist: f64, far_lod: f64) {
+    build_inner(l, s, cam, max_dist, far_lod, 0 as u64 as *mut mc_registry.Registry)
+}
+
+// Same, but non-player entities use the registry width / height of their type (entity type id -> mc_registry entity record).
+fn entlist_build_reg(l: *mut EntList, s: *mut mc_entity.Store, cam: *mut mc_camera.Camera, max_dist: f64, far_lod: f64,
+    reg: *mut mc_registry.Registry) {
+    build_inner(l, s, cam, max_dist, far_lod, reg)
+}
+
+fn build_inner(l: *mut EntList, s: *mut mc_entity.Store, cam: *mut mc_camera.Camera, max_dist: f64, far_lod: f64,
+    reg: *mut mc_registry.Registry) {
     entlist_clear(l)
     let cap: usize = mc_entity.store_slot_cap(s)
     var i: usize = 0
@@ -103,15 +127,36 @@ fn entlist_build(l: *mut EntList, s: *mut mc_entity.Store, cam: *mut mc_camera.C
         i = i + 1
         if e as u64 == 0 { continue }
         (*l).n_in = (*l).n_in + 1 as u32
-        let dx: f64 = (*e).x - (*cam).x
-        let dy: f64 = (*e).y - (*cam).y
-        let dz: f64 = (*e).z - (*cam).z
+        // smoothed render state (mc_entity.store_interp) when it exists, else the network position
+        var ex: f64 = (*e).x
+        var ey: f64 = (*e).y
+        var ez: f64 = (*e).z
+        var eyaw: f64 = (*e).yaw
+        if (*e).rinit {
+            ex = (*e).rx
+            ey = (*e).ry
+            ez = (*e).rz
+            eyaw = (*e).ryaw
+        }
+        // registry size of the type (0 = unknown / player / no registry)
+        var bw: f64 = 0.0
+        var bh: f64 = 0.0
+        if (reg as u64) != 0 as u64 && (*e).kind != mc_entity.KIND_PLAYER && (*e).type_id >= 0 {
+            let ri: i32 = mc_registry.reg_entity_find(reg, (*e).type_id)
+            if ri >= 0 {
+                bw = (mc_registry.reg_entity_width_milli(reg, ri) as f64) * 0.001
+                bh = (mc_registry.reg_entity_height_milli(reg, ri) as f64) * 0.001
+            }
+        }
+        let dx: f64 = ex - (*cam).x
+        let dy: f64 = ey - (*cam).y
+        let dz: f64 = ez - (*cam).z
         let d2: f64 = dx * dx + dy * dy + dz * dz
         if max_dist > 0.0 && d2 > max_dist * max_dist {
             (*l).n_culled = (*l).n_culled + 1 as u32
             continue
         }
-        if mc_math.frustum_test_box(&(*cam).frustum, (*e).x - 0.6, (*e).y, (*e).z - 0.6, (*e).x + 0.6, (*e).y + 2.0, (*e).z + 0.6) == 0 {
+        if mc_math.frustum_test_box(&(*cam).frustum, ex - 0.6 - bw * 0.5, ey, ez - 0.6 - bw * 0.5, ex + 0.6 + bw * 0.5, ey + 2.0 + bh, ez + 0.6 + bw * 0.5) == 0 {
             (*l).n_culled = (*l).n_culled + 1 as u32
             continue
         }
@@ -120,7 +165,11 @@ fn entlist_build(l: *mut EntList, s: *mut mc_entity.Store, cam: *mut mc_camera.C
             lod = true
             (*l).n_lod = (*l).n_lod + 1 as u32
         }
-        entlist_add_model(l, (*e).x, (*e).y, (*e).z, (*e).yaw, ((*e).id as u64) + 1 as u64, (*e).kind != mc_entity.KIND_OBJECT, lod)
+        if bw > 0.0 && bh > 0.0 {
+            entlist_add_sized(l, ex, ey, ez, eyaw, ((*e).id as u64) + 1 as u64, bw, bh)
+            continue
+        }
+        entlist_add_model(l, ex, ey, ez, eyaw, ((*e).id as u64) + 1 as u64, (*e).kind != mc_entity.KIND_OBJECT, lod)
     }
 }
 
