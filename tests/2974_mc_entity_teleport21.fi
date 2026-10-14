@@ -1,0 +1,110 @@
+// expect_exit: 0
+// Entity position packets of 1.21.2+ (protocol 768+), the layouts verified/derived in docs/mc/entity.md:
+//   sync_entity_position  id, pos f64x3, delta f64x3, yaw f32, pitch f32, on ground       (live proven 1.21.4/1.21.11/26.1)
+//   entity_teleport       id, pos f64x3, delta f64x3, yaw f32, pitch f32, flags i32, on ground
+//                         (minecraft-data still has the pre-1.21.2 layout; gen_entity.py OVERRIDES)
+// plus the lpVec3 spawn velocity bytes of a REAL 1.21.11 server (scale 8 -> octet 0xf4 + varint extension).
+import std.rt
+import std.io
+import std.bytes
+import mc.mc_entity
+import mc.mc_sem
+import mc.mc_version
+import mc.v769.mc_proto_v769
+import mc.v774.mc_proto_v774
+import mc.v775.mc_proto_v775
+
+fn check(failures: *mut i32, ok: bool, tag: str, what: str) {
+    if !ok {
+        io.fmt_print(f"FAIL {tag} {what}\n")
+        *failures = *failures + 1
+    }
+}
+
+fn feed(s: *mut mc_entity.Store, ver: *mut mc_version.Version, sem: usize, b: *mut bytes.Bytes) -> bool {
+    bytes.bytes_set_pos(b, 0)
+    let id: i32 = (*ver).sem[sem]
+    let r: bool = mc_entity.entity_on_packet(s, ver, id, b)
+    bytes.bytes_clear(b)
+    return r
+}
+
+fn spawn(s: *mut mc_entity.Store, ver: *mut mc_version.Version, eid: i32, lp: bool, failures: *mut i32, tag: str) {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&b, eid)
+    bytes.put_uuid(&b, 7 as u64, eid as u64)
+    bytes.put_varint(&b, 100)
+    bytes.put_f64(&b, 1.0)
+    bytes.put_f64(&b, 2.0)
+    bytes.put_f64(&b, 3.0)
+    if lp {
+        // velocity captured from a real 1.21.11 server: summon pig {Motion:[8.0d,1.0d,-6.0d]}
+        bytes.put_u8(&b, 0xf4 as u8)
+        bytes.put_u8(&b, 0xff as u8)
+        bytes.put_u32(&b, 0x20011fff as u32)
+        bytes.put_varint(&b, 2)
+    }
+    bytes.put_i8(&b, 64 as i8) // pitch
+    bytes.put_i8(&b, 32 as i8) // yaw
+    if lp {
+        bytes.put_i8(&b, 0 as i8) // head yaw
+    }
+    bytes.put_varint(&b, 0)
+    check(failures, feed(s, ver, mc_sem.SEM_PLAY_S2C_SPAWN_ENTITY, &b), tag, "spawn handled")
+    bytes.bytes_free(&b)
+}
+
+// teleport / sync body: id, pos, delta, yaw f32, pitch f32, [flags i32], on ground
+fn pos_body(b: *mut bytes.Bytes, eid: i32, x: f64, flags: bool, ground: bool) {
+    bytes.put_varint(b, eid)
+    bytes.put_f64(b, x)
+    bytes.put_f64(b, 70.5)
+    bytes.put_f64(b, 0.0 - 9.25)
+    bytes.put_f64(b, 0.125) // delta
+    bytes.put_f64(b, 0.25)
+    bytes.put_f64(b, 0.5)
+    bytes.put_f32(b, 90.0 as f32)
+    bytes.put_f32(b, 30.0 as f32)
+    if flags {
+        bytes.put_i32(b, 0 as i32)
+    }
+    bytes.put_bool(b, ground)
+}
+
+fn run_version(failures: *mut i32, ver: *mut mc_version.Version, lp: bool, tag: str) {
+    var s: mc_entity.Store = mc_entity.store_new()
+    spawn(&s, ver, 5, lp, failures, tag)
+    let e: *mut mc_entity.Entity = mc_entity.store_get(&s, 5)
+    check(failures, (e as u64) != 0 as u64, tag, "entity exists")
+    if (e as u64) == 0 as u64 {
+        mc_entity.store_free(&s)
+        return
+    }
+    check(failures, (*e).x == 1.0 && (*e).z == 3.0 && (*e).yaw == 45.0 && (*e).pitch == 90.0, tag, "spawn fields behind the velocity")
+    var b: bytes.Bytes = bytes.bytes_new()
+    pos_body(&b, 5, 12.5, false, true)
+    check(failures, feed(&s, ver, mc_sem.SEM_PLAY_S2C_SYNC_ENTITY_POSITION, &b), tag, "sync handled")
+    check(failures, (*e).x == 12.5 && (*e).y == 70.5 && (*e).z == 0.0 - 9.25 && (*e).yaw == 90.0 && (*e).pitch == 30.0 && (*e).on_ground, tag, "sync applied")
+    pos_body(&b, 5, 0.0 - 3.75, true, false)
+    check(failures, feed(&s, ver, mc_sem.SEM_PLAY_S2C_ENTITY_TELEPORT, &b), tag, "teleport handled")
+    check(failures, (*e).x == 0.0 - 3.75 && (*e).y == 70.5 && (*e).z == 0.0 - 9.25 && (*e).yaw == 90.0 && (*e).pitch == 30.0 && !(*e).on_ground, tag, "teleport applied (delta + flags skipped)")
+    bytes.bytes_free(&b)
+    check(failures, s.bad == 0 as u64 && s.misses == 0 as u64, tag, "nothing bad or missed")
+    mc_entity.store_free(&s)
+}
+
+fn main() -> i32 {
+    var failures: i32 = 0
+    var v769: mc_version.Version = mc_proto_v769.version_make()
+    var v774: mc_version.Version = mc_proto_v774.version_make()
+    var v775: mc_version.Version = mc_proto_v775.version_make()
+    run_version(&failures, &v769, false, "769")
+    run_version(&failures, &v774, true, "774")
+    run_version(&failures, &v775, true, "775")
+    if failures != 0 {
+        io.fmt_print(f"entity teleport21: {failures} failures\n")
+        return 1
+    }
+    io.fmt_print(f"entity teleport21: ok\n")
+    return 0
+}

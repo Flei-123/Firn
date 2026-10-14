@@ -84,6 +84,23 @@ def layout_of(proto, names, move):
     return ""
 
 
+# minecraft-data lags behind the game for a few packets. An override replaces the generated program of `kind`
+# from protocol `since` on, ONLY while minecraft-data still yields the `stale` program (so a fixed minecraft-data
+# is taken as is). Each entry is proven against a real server (tools/mcclient/run.sh with MC_RAW_NAMES, docs/mc/entity.md).
+#   entity_teleport 1.21.2+ (protocol 768+): id, position f64x3, delta movement f64x3, yaw f32, pitch f32,
+#   relative-flags i32, on ground bool (minecraft-data still lists the pre-1.21.2 layout).
+OVERRIDES = [
+    ("TELEPORT", 768, "EvXdYdZdWbPbGo", "EvXdYdZd-d-d-dWfPf-iGo"),
+]
+
+
+def apply_overrides(kname, pver, prog):
+    for k, since, stale, fixed in OVERRIDES:
+        if k == kname and pver >= since and prog == stale:
+            return fixed
+    return prog
+
+
 def generate(data_dir, versions, load_protocol, out_path):
     entries = []
     for vkey in versions:
@@ -91,7 +108,7 @@ def generate(data_dir, versions, load_protocol, out_path):
         progs = []
         for kname, names in KINDS:
             move = kname in ("REL_MOVE", "MOVE_LOOK")
-            progs.append(layout_of(proto, names, move))
+            progs.append(apply_overrides(kname, pver, layout_of(proto, names, move)))
         entries.append((pver, vkey, progs))
     w = []
     a = w.append

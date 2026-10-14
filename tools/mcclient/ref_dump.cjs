@@ -21,6 +21,18 @@
 
 const NMP_VERSION = process.env.MC_NMP || '1.20.1'
 const PROTOCOL = parseInt(process.env.MC_PROTOCOL || '763', 10)
+
+function teleportV21 (buf) {
+  let o = 0
+  const vi = () => { let r = 0; let sh = 0; let c; do { c = buf[o++]; r |= (c & 0x7f) << sh; sh += 7 } while (c & 0x80); return r }
+  vi() // packet id
+  const entityId = vi()
+  const x = buf.readDoubleBE(o); const y = buf.readDoubleBE(o + 8); const z = buf.readDoubleBE(o + 16)
+  o += 48 // position + delta movement
+  const yaw = buf.readFloatBE(o); const pitch = buf.readFloatBE(o + 4)
+  o += 8 + 4 // + relative flags
+  return { entityId, x, y, z, yaw, pitch, onGround: buf[o] !== 0, v21: true }
+}
 const LEGACY_SECTIONS = PROTOCOL <= 340 && PROTOCOL >= 107 // 1.9 - 1.12.2: CF_SECTIONS_19
 const LEGACY8 = PROTOCOL <= 47 // 1.8 - 1.8.9: CF_LEGACY_8 (map_chunk + map_chunk_bulk, unpaletted u16 LE blocks)
 const SECTIONS_114 = PROTOCOL >= 751 && PROTOCOL <= 754 // 1.16.2 - 1.16.5: CF_SECTIONS_114
@@ -589,6 +601,9 @@ function main () {
   client.on('packet', (data, meta, buffer, full) => {
     packets++; walkOk++
     if (RAW_NAMES && RAW_NAMES.has(meta.name) && buffer) fs.appendFileSync(dumpFile + '.raw', `${meta.name} ${buffer.toString('hex')}\n`) // MC_RAW_NAMES=a,b: raw bodies for layout checks
+    // minecraft-data lists the pre-1.21.2 entity_teleport layout for 1.21.2+: decode the real one from the raw body
+    // (packet id varint, entity id varint, pos f64x3, delta f64x3, yaw f32, pitch f32, flags i32, on ground bool)
+    if (meta.name === 'entity_teleport' && PROTOCOL >= 768 && buffer) data = teleportV21(buffer)
     try { tracker.onPacket(meta.name, data) } catch (e) { entityErrors++; console.error('entity packet ' + meta.name + ': ' + e.message) }
     bytesDec += (full || buffer || Buffer.alloc(0)).length
   })

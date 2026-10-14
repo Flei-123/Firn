@@ -97,8 +97,24 @@ const lines = []
 const live = [] // ids of entities that should exist
 let nextId = 1
 let ok = 0
+// 1.21.2+ (protocol 768+): minecraft-data still lists the old entity_teleport layout, the game sends
+// id, pos f64x3, delta f64x3, yaw f32, pitch f32, flags i32, on ground = sync_entity_position + an i32 before the last octet
+const TELEPORT_V21 = V.protocol >= 768
+function teleportV21Body (params) {
+  const sync = Buffer.from(codec.serialize('sync_entity_position', params))
+  const flags = Buffer.alloc(4)
+  flags.writeInt32BE(ri(-2147483648, 2147483647), 0)
+  return Buffer.concat([sync.subarray(0, sync.length - 1), flags, sync.subarray(sync.length - 1)])
+}
 function emit (name, params) {
-  const body = codec.serialize(name, params)
+  let body
+  if (name === 'entity_teleport' && TELEPORT_V21) {
+    params = build('sync_entity_position', { entityId: params.entityId })
+    body = teleportV21Body(params)
+    params = Object.assign({ v21: true }, params)
+  } else {
+    body = codec.serialize(name, params)
+  }
   lines.push(`${name} ${Buffer.from(body).toString('hex')}`)
   tracker.onPacket(name, params)
   ok++

@@ -73,7 +73,7 @@ class EntityTracker {
         const e = this.ents.get(p.entityId)
         if (!e) { this.count.miss++; return }
         e.x = this.pos(p.x); e.y = this.pos(p.y); e.z = this.pos(p.z)
-        e.yaw = this.angle(p.yaw); e.pitch = this.angle(p.pitch)
+        if (p.v21) { e.yaw = p.yaw; e.pitch = p.pitch } else { e.yaw = this.angle(p.yaw); e.pitch = this.angle(p.pitch) } // v21: float degrees
         e.ground = !!p.onGround
         return
       }
