@@ -13,11 +13,12 @@
 // minimum is refined to a sub-pixel position by a parabola through the cost of its neighbours (x and y
 // separately, +-0.5 pixel). The result is one (dx, dy) per tile; `flow_at` interpolates it bilinearly between
 // tile centres, so the per-pixel flow field is smooth (no blocking at tile borders).
-// HONEST: pure scalar code, one thread: 256x192 costs ~0.1 s per frame; a 12 MP frame needs lib/jobs over the
-// tile rows and SIMD in `tile_cost` (not done yet). Rotation / perspective is only followed as far as tiles
+// SPEED: tile rows run in parallel (photo.par; every tile is independent), and tile_cost has a no-clamp path for
+// tiles whose shifted window lies inside the image (same arithmetic, same order, bit-identical to the clamped one). Rotation / perspective is only followed as far as tiles
 // follow it (translation per tile).
 import std.rt
 import photo.image
+import photo.par
 
 export {
     Pyr, Flow,
@@ -46,22 +47,35 @@ fn zero_image() -> image.Image {
     return image.Image { w: 0, h: 0, ch: 0, px: 0 as u64 }
 }
 
+struct DownCtx {
+    src: *mut image.Image,
+    d: *mut image.Image,
+}
+
+fn down2_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut DownCtx = ctx as *mut DownCtx
+    let src: *mut image.Image = (*k).src
+    let w: i32 = (*(*k).d).w
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            let s: f32 = image.img_getc(src, 0, 2 * x, 2 * y) + image.img_getc(src, 0, 2 * x + 1, 2 * y) +
+                         image.img_getc(src, 0, 2 * x, 2 * y + 1) + image.img_getc(src, 0, 2 * x + 1, 2 * y + 1)
+            image.img_set((*k).d, 0, x, y, s * 0.25f)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
 // 2x2 box downsample of a 1 channel image (odd borders clamp).
 fn down2(src: *mut image.Image) -> image.Image {
     let w: i32 = ((*src).w + 1) / 2
     let h: i32 = ((*src).h + 1) / 2
     var d: image.Image = image.img_new(w, h, 1)
-    var y: i32 = 0
-    while y < h {
-        var x: i32 = 0
-        while x < w {
-            let s: f32 = image.img_getc(src, 0, 2 * x, 2 * y) + image.img_getc(src, 0, 2 * x + 1, 2 * y) +
-                         image.img_getc(src, 0, 2 * x, 2 * y + 1) + image.img_getc(src, 0, 2 * x + 1, 2 * y + 1)
-            image.img_set(&d, 0, x, y, s * 0.25f)
-            x = x + 1
-        }
-        y = y + 1
-    }
+    var k: DownCtx = DownCtx { src: src, d: &d }
+    par.rows(h, 16, down2_rows, (&k) as u64)
     return d
 }
 
@@ -123,8 +137,32 @@ fn fput(p: u64, i: i32, v: f32) {
 }
 
 // Sum of squared differences between the reference tile at (tx, ty) and the alt tile shifted by (sx, sy).
+// Both windows inside the image: raw loads, no clamping (same order of the sum as the clamped loop).
 fn tile_cost(r: *mut image.Image, a: *mut image.Image, tx: i32, ty: i32, sx: i32, sy: i32) -> f32 {
     var s: f32 = 0.0f
+    let w: i32 = (*r).w
+    let ax: i32 = tx + sx
+    let ay: i32 = ty + sy
+    if tx >= 0 && ty >= 0 && tx + TILE <= w && ty + TILE <= (*r).h && ax >= 0 && ay >= 0 && ax + TILE <= (*a).w && ay + TILE <= (*a).h {
+        let aw: i32 = (*a).w
+        var pr: u64 = (*r).px + ((ty * w + tx) as u64) * (4 as u64)
+        var pa: u64 = (*a).px + ((ay * aw + ax) as u64) * (4 as u64)
+        let sr: u64 = (w as u64) * (4 as u64)
+        let sa: u64 = (aw as u64) * (4 as u64)
+        var y: i32 = 0
+        while y < TILE {
+            var x: u64 = 0
+            while x < 16 {
+                let d: f32 = *((pr + x * (4 as u64)) as *mut f32) - *((pa + x * (4 as u64)) as *mut f32)
+                s = s + d * d
+                x = x + 1
+            }
+            pr = pr + sr
+            pa = pa + sa
+            y = y + 1
+        }
+        return s
+    }
     var y: i32 = 0
     while y < TILE {
         var x: i32 = 0
@@ -136,6 +174,60 @@ fn tile_cost(r: *mut image.Image, a: *mut image.Image, tx: i32, ty: i32, sx: i32
         y = y + 1
     }
     return s
+}
+
+// The costs of EIGHT horizontally adjacent shifts at once (SSE/NEON lanes = shifts ax0 - tx + 0..7, same row shift):
+// lane k runs the very same sequence `s = s + d * d` over the tile as `tile_cost` does for its shift, so every lane
+// is bit-identical to the scalar value. Needs both windows (all eight shifts) inside the image; returns false
+// otherwise and leaves `out` alone. out[0..8] = costs.
+fn tile_cost8(r: *mut image.Image, a: *mut image.Image, tx: i32, ty: i32, ax0: i32, ay: i32, out: *mut f32) -> bool {
+    let w: i32 = (*r).w
+    let aw: i32 = (*a).w
+    if !(tx >= 0 && ty >= 0 && tx + TILE <= w && ty + TILE <= (*r).h && ax0 >= 0 && ay >= 0 && ax0 + TILE + 7 <= aw && ay + TILE <= (*a).h) {
+        return false
+    }
+    var acc0: v128 = __v128_zero()
+    var acc1: v128 = __v128_zero()
+    var pr: u64 = (*r).px + ((ty * w + tx) as u64) * (4 as u64)
+    var pa: u64 = (*a).px + ((ay * aw + ax0) as u64) * (4 as u64)
+    let sr: u64 = (w as u64) * (4 as u64)
+    let sa: u64 = (aw as u64) * (4 as u64)
+    var y: i32 = 0
+    while y < TILE {
+        // four reference pixels per load, each broadcast by a shuffle (the register allocator keeps these in xmm)
+        var x: u64 = 0
+        while x < 16 {
+            let r4: v128 = __v128_load((pr + x * (4 as u64)) as *u8)
+            let pb: u64 = pa + x * (4 as u64)
+            let s0: v128 = __v128_shuffle32(r4, 0)
+            let d00: v128 = __v128_subf32(s0, __v128_load(pb as *u8))
+            let d01: v128 = __v128_subf32(s0, __v128_load((pb + 16) as *u8))
+            acc0 = __v128_addf32(acc0, __v128_mulf32(d00, d00))
+            acc1 = __v128_addf32(acc1, __v128_mulf32(d01, d01))
+            let s1: v128 = __v128_shuffle32(r4, 85)
+            let d10: v128 = __v128_subf32(s1, __v128_load((pb + 4) as *u8))
+            let d11: v128 = __v128_subf32(s1, __v128_load((pb + 20) as *u8))
+            acc0 = __v128_addf32(acc0, __v128_mulf32(d10, d10))
+            acc1 = __v128_addf32(acc1, __v128_mulf32(d11, d11))
+            let s2: v128 = __v128_shuffle32(r4, 170)
+            let d20: v128 = __v128_subf32(s2, __v128_load((pb + 8) as *u8))
+            let d21: v128 = __v128_subf32(s2, __v128_load((pb + 24) as *u8))
+            acc0 = __v128_addf32(acc0, __v128_mulf32(d20, d20))
+            acc1 = __v128_addf32(acc1, __v128_mulf32(d21, d21))
+            let s3: v128 = __v128_shuffle32(r4, 255)
+            let d30: v128 = __v128_subf32(s3, __v128_load((pb + 12) as *u8))
+            let d31: v128 = __v128_subf32(s3, __v128_load((pb + 28) as *u8))
+            acc0 = __v128_addf32(acc0, __v128_mulf32(d30, d30))
+            acc1 = __v128_addf32(acc1, __v128_mulf32(d31, d31))
+            x = x + 4
+        }
+        pr = pr + sr
+        pa = pa + sa
+        y = y + 1
+    }
+    __v128_store(out as *mut u8, acc0)
+    __v128_store(((out as u64) + 16) as *mut u8, acc1)
+    return true
 }
 
 // Tile (i, j) top-left corner on a level of size (w, h): clamped so the last tile ends at the border.
@@ -195,6 +287,88 @@ fn vertex(cm: f32, c0: f32, cp: f32) -> f32 {
     return image.fclampf((cm - cp) / (2.0f * den), -0.5f, 0.5f)
 }
 
+struct AlignCtx {
+    ri: *mut image.Image,
+    ai: *mut image.Image,
+    fl: *mut Flow,
+    up: *mut Flow,
+    have_up: bool,
+    lv: i32,
+}
+
+// One row of tiles of one pyramid level.
+fn align_tile_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut AlignCtx = ctx as *mut AlignCtx
+    let ri: *mut image.Image = (*c).ri
+    let ai: *mut image.Image = (*c).ai
+    let fl: *mut Flow = (*c).fl
+    var j: i32 = lo as i32
+    while j < (hi as i32) {
+        let ty: i32 = tile_origin(j, (*ri).h)
+        var i: i32 = 0
+        while i < (*fl).tw {
+            let tx: i32 = tile_origin(i, (*ri).w)
+            var cx: i32 = 0
+            var cy: i32 = 0
+            if (*c).have_up {
+                var ux: f32 = 0.0f
+                var uy: f32 = 0.0f
+                flow_at((*c).up, ((tx + TILE / 2) as f32) * 0.5f, ((ty + TILE / 2) as f32) * 0.5f, &ux, &uy)
+                cx = (ux * 2.0f + 100000.5f) as i32 - 100000
+                cy = (uy * 2.0f + 100000.5f) as i32 - 100000
+            }
+            var best: f32 = 1.0e30f
+            var bestc: f32 = 0.0f
+            var bx: i32 = 0
+            var by: i32 = 0
+            // the zero shift of this level is always a candidate as well (first frame of a still burst)
+            var costs: [f32; 8] = [0.0f; 8]
+            var sy: i32 = -RADIUS
+            while sy <= RADIUS {
+                // shifts cx - 3 .. cx + 3 of this row in one vector pass when the windows are inside the image
+                let vec_ok: bool = tile_cost8(ri, ai, tx, ty, tx + cx - RADIUS, ty + cy + sy, &costs[0])
+                var sx: i32 = -RADIUS
+                while sx <= RADIUS {
+                    var cc: f32 = 0.0f
+                    if vec_ok {
+                        cc = costs[(sx + RADIUS) as usize]
+                    } else {
+                        cc = tile_cost(ri, ai, tx, ty, cx + sx, cy + sy)
+                    }
+                    // slight preference for small shifts keeps flat tiles still
+                    let bias: f32 = cc + 1.0e-6f * (((sx * sx + sy * sy) as f32))
+                    if bias < best {
+                        best = bias
+                        bestc = cc
+                        bx = cx + sx
+                        by = cy + sy
+                    }
+                    sx = sx + 1
+                }
+                sy = sy + 1
+            }
+            var fx: f32 = bx as f32
+            var fy: f32 = by as f32
+            // the cost of the winning shift was computed above (same call, same value)
+            let c0: f32 = bestc
+            if (*c).lv == 0 {
+                let cxm: f32 = tile_cost(ri, ai, tx, ty, bx - 1, by)
+                let cxp: f32 = tile_cost(ri, ai, tx, ty, bx + 1, by)
+                let cym: f32 = tile_cost(ri, ai, tx, ty, bx, by - 1)
+                let cyp: f32 = tile_cost(ri, ai, tx, ty, bx, by + 1)
+                fx = fx + vertex(cxm, c0, cxp)
+                fy = fy + vertex(cym, c0, cyp)
+            }
+            let k: i32 = j * (*fl).tw + i
+            fput((*fl).dx, k, fx)
+            fput((*fl).dy, k, fy)
+            fput((*fl).err, k, c0 / ((TILE * TILE) as f32))
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+
 // Align `alt` to `ref`: alt(x + dx, y + dy) ~ ref(x, y). Result at the finest level, sub-pixel.
 fn align_flow(r: *mut Pyr, a: *mut Pyr) -> Flow {
     var levels: i32 = (*r).n
@@ -206,60 +380,8 @@ fn align_flow(r: *mut Pyr, a: *mut Pyr) -> Flow {
         let ri: *mut image.Image = &(*r).l[lv as usize]
         let ai: *mut image.Image = &(*a).l[lv as usize]
         var fl: Flow = flow_new((*ri).w, (*ri).h)
-        var j: i32 = 0
-        while j < fl.th {
-            let ty: i32 = tile_origin(j, (*ri).h)
-            var i: i32 = 0
-            while i < fl.tw {
-                let tx: i32 = tile_origin(i, (*ri).w)
-                var cx: i32 = 0
-                var cy: i32 = 0
-                if have_up {
-                    var ux: f32 = 0.0f
-                    var uy: f32 = 0.0f
-                    flow_at(&up, ((tx + TILE / 2) as f32) * 0.5f, ((ty + TILE / 2) as f32) * 0.5f, &ux, &uy)
-                    cx = (ux * 2.0f + 100000.5f) as i32 - 100000
-                    cy = (uy * 2.0f + 100000.5f) as i32 - 100000
-                }
-                var best: f32 = 1.0e30f
-                var bx: i32 = 0
-                var by: i32 = 0
-                // the zero shift of this level is always a candidate as well (first frame of a still burst)
-                var sy: i32 = -RADIUS
-                while sy <= RADIUS {
-                    var sx: i32 = -RADIUS
-                    while sx <= RADIUS {
-                        let c: f32 = tile_cost(ri, ai, tx, ty, cx + sx, cy + sy)
-                        // slight preference for small shifts keeps flat tiles still
-                        let bias: f32 = c + 1.0e-6f * (((sx * sx + sy * sy) as f32))
-                        if bias < best {
-                            best = bias
-                            bx = cx + sx
-                            by = cy + sy
-                        }
-                        sx = sx + 1
-                    }
-                    sy = sy + 1
-                }
-                var fx: f32 = bx as f32
-                var fy: f32 = by as f32
-                let c0: f32 = tile_cost(ri, ai, tx, ty, bx, by)
-                if lv == 0 {
-                    let cxm: f32 = tile_cost(ri, ai, tx, ty, bx - 1, by)
-                    let cxp: f32 = tile_cost(ri, ai, tx, ty, bx + 1, by)
-                    let cym: f32 = tile_cost(ri, ai, tx, ty, bx, by - 1)
-                    let cyp: f32 = tile_cost(ri, ai, tx, ty, bx, by + 1)
-                    fx = fx + vertex(cxm, c0, cxp)
-                    fy = fy + vertex(cym, c0, cyp)
-                }
-                let k: i32 = j * fl.tw + i
-                fput(fl.dx, k, fx)
-                fput(fl.dy, k, fy)
-                fput(fl.err, k, c0 / ((TILE * TILE) as f32))
-                i = i + 1
-            }
-            j = j + 1
-        }
+        var ac: AlignCtx = AlignCtx { ri: ri, ai: ai, fl: &fl, up: &up, have_up: have_up, lv: lv }
+        par.rows(fl.th, 1, align_tile_rows, (&ac) as u64)
         if have_up {
             flow_free(&up)
         }

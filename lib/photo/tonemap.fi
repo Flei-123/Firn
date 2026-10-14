@@ -16,6 +16,7 @@ import std.rt
 import std.math
 import photo.image
 import photo.filter
+import photo.par
 
 export {
     ToneOpts, tone_default, tonemap,
@@ -67,20 +68,86 @@ fn percentile(p: *mut image.Image, lo: f32, hi: f32, q: f32) -> f32 {
     return lo + ((k as f32) + 0.5f) / sc
 }
 
+struct LogCtx {
+    yl: *mut image.Image,
+    ll: *mut image.Image,
+}
+
+fn log_range(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut LogCtx = ctx as *mut LogCtx
+    var n: u64 = lo
+    while n < hi {
+        let o4: u64 = n * (4 as u64)
+        var v: f32 = *(((*(*k).yl).px + o4) as *mut f32)
+        if v < 1.0e-5f { v = 1.0e-5f }
+        *(((*(*k).ll).px + o4) as *mut f32) = flnf(v)
+        n = n + 1
+    }
+}
+
+struct ToneCtx {
+    im: *mut image.Image,
+    yl: *mut image.Image,
+    ll: *mut image.Image,
+    base: *mut image.Image,
+    o: *mut ToneOpts,
+    lw: f32,
+    p99: f32,
+    c: f32,
+}
+
+fn tone_range(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut ToneCtx = ctx as *mut ToneCtx
+    let im: *mut image.Image = (*k).im
+    let o: *mut ToneOpts = (*k).o
+    let w: i32 = (*im).w
+    let h: i32 = (*im).h
+    var n: u64 = lo
+    while n < hi {
+        let o4: u64 = n * (4 as u64)
+        let b: f32 = *(((*(*k).base).px + o4) as *mut f32)
+        let l: f32 = *(((*(*k).ll).px + o4) as *mut f32)
+        var d: f32 = (l - b) * (*o).detail
+        d = image.fclampf(d, -1.2f, 1.2f)
+        let nb: f32 = (*k).lw + (b - (*k).p99) * (*k).c
+        var ny: f32 = fexpf(nb + d)
+        // soft knee for the top 8 %
+        if ny > 0.85f {
+            let t: f32 = ny - 0.85f
+            ny = 0.85f + 0.15f * (1.0f - image.expneg(t * 6.0f)) * 1.0f
+            if ny > 1.0f { ny = 1.0f }
+        }
+        var y0: f32 = *(((*(*k).yl).px + o4) as *mut f32)
+        if y0 < 1.0e-5f { y0 = 1.0e-5f }
+        var ch: i32 = 0
+        while ch < 3 {
+            let cv: f32 = *(((*im).px + ((ch * w * h) as u64) * (4 as u64) + o4) as *mut f32)
+            var ratio: f32 = cv / y0
+            if ratio < 0.0f { ratio = 0.0f }
+            // chroma ratio ** sat
+            var rs: f32 = ratio
+            if (*o).sat < 0.999f && ratio > 1.0e-4f {
+                rs = fexpf((*o).sat * flnf(ratio))
+            }
+            *(((*im).px + ((ch * w * h) as u64) * (4 as u64) + o4) as *mut f32) = image.fclampf(ny * rs, 0.0f, 1.0f)
+            ch = ch + 1
+        }
+        n = n + 1
+    }
+}
+
 fn tonemap(im: *mut image.Image, o: *mut ToneOpts) {
     let w: i32 = (*im).w
     let h: i32 = (*im).h
     var yl: image.Image = image.img_luma(im)
     var ll: image.Image = image.img_new(w, h, 1)
+    var lg: LogCtx = LogCtx { yl: &yl, ll: &ll }
+    par.rows(w * h, 65536, log_range, (&lg) as u64)
     var lo: f32 = 1.0e30f
     var hi: f32 = -1.0e30f
     var n: i32 = 0
     while n < w * h {
-        let o4: u64 = (n as u64) * (4 as u64)
-        var v: f32 = *((yl.px + o4) as *mut f32)
-        if v < 1.0e-5f { v = 1.0e-5f }
-        let l: f32 = flnf(v)
-        *((ll.px + o4) as *mut f32) = l
+        let l: f32 = *((ll.px + (n as u64) * (4 as u64)) as *mut f32)
         if l < lo { lo = l }
         if l > hi { hi = l }
         n = n + 1
@@ -103,38 +170,8 @@ fn tonemap(im: *mut image.Image, o: *mut ToneOpts) {
         if c > 1.0f { c = 1.0f }
     }
     c = 1.0f - (*o).strength * (1.0f - c)
-    n = 0
-    while n < w * h {
-        let o4: u64 = (n as u64) * (4 as u64)
-        let b: f32 = *((base.px + o4) as *mut f32)
-        let l: f32 = *((ll.px + o4) as *mut f32)
-        var d: f32 = (l - b) * (*o).detail
-        d = image.fclampf(d, -1.2f, 1.2f)
-        let nb: f32 = lw + (b - p99) * c
-        var ny: f32 = fexpf(nb + d)
-        // soft knee for the top 8 %
-        if ny > 0.85f {
-            let t: f32 = ny - 0.85f
-            ny = 0.85f + 0.15f * (1.0f - image.expneg(t * 6.0f)) * 1.0f
-            if ny > 1.0f { ny = 1.0f }
-        }
-        var y0: f32 = *((yl.px + o4) as *mut f32)
-        if y0 < 1.0e-5f { y0 = 1.0e-5f }
-        var ch: i32 = 0
-        while ch < 3 {
-            let cv: f32 = *(((*im).px + ((ch * w * h) as u64) * (4 as u64) + o4) as *mut f32)
-            var ratio: f32 = cv / y0
-            if ratio < 0.0f { ratio = 0.0f }
-            // chroma ratio ** sat
-            var rs: f32 = ratio
-            if (*o).sat < 0.999f && ratio > 1.0e-4f {
-                rs = fexpf((*o).sat * flnf(ratio))
-            }
-            *(((*im).px + ((ch * w * h) as u64) * (4 as u64) + o4) as *mut f32) = image.fclampf(ny * rs, 0.0f, 1.0f)
-            ch = ch + 1
-        }
-        n = n + 1
-    }
+    var tc: ToneCtx = ToneCtx { im: im, yl: &yl, ll: &ll, base: &base, o: o, lw: lw, p99: p99, c: c }
+    par.rows(w * h, 65536, tone_range, (&tc) as u64)
     image.img_free(&yl)
     image.img_free(&ll)
     image.img_free(&base)

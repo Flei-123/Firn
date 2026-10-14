@@ -11,11 +11,182 @@
 //   2. chroma smoothing: (R - Y) and (B - Y) get a joint bilateral blur (radius 4) guided by luma, much stronger
 //      than the luma filtering because colour noise is ugly and colour detail is low-frequency.
 // Finally `keep` (0..1) of the REMOVED residual is added back: a little natural grain instead of plastic skin.
+import std.rt
 import photo.image
 import photo.filter
+import photo.par
 
 export {
     denoise, denoise_chroma,
+}
+
+// ---- shared helpers: raw plane access (interior pixels need no border clamping) ----
+#[inline]
+fn pl(base: u64, i: i32) -> f32 {
+    return *((base + (i as u64) * (4 as u64)) as *mut f32)
+}
+
+struct NlmCtx {
+    src: *mut image.Image,
+    yi: *mut image.Image,
+    vp: *mut image.Image,
+    nl: *mut image.Image,
+    strength: f32,
+}
+
+// Non-local means of one pixel next to the border: every read is clamped (the reference implementation).
+fn nlm_pixel_edge(c: *mut NlmCtx, x: i32, y: i32) {
+    let src: *mut image.Image = (*c).src
+    let y_img: *mut image.Image = (*c).yi
+    let sig2: f32 = 0.7f * image.img_get((*c).vp, 0, x, y) + 1.0e-9f
+    let h2: f32 = (*c).strength * (*c).strength * sig2
+    var wsum: f32 = 0.0f
+    var a0: f32 = 0.0f
+    var a1: f32 = 0.0f
+    var a2: f32 = 0.0f
+    var sy: i32 = -3
+    while sy <= 3 {
+        var sx: i32 = -3
+        while sx <= 3 {
+            var d2: f32 = 0.0f
+            var py: i32 = -1
+            while py <= 1 {
+                var px: i32 = -1
+                while px <= 1 {
+                    let d: f32 = image.img_getc(y_img, 0, x + px, y + py) - image.img_getc(y_img, 0, x + sx + px, y + sy + py)
+                    d2 = d2 + d * d
+                    px = px + 1
+                }
+                py = py + 1
+            }
+            d2 = d2 * (1.0f / 9.0f)
+            var wt: f32 = image.expneg(image.fmaxf(d2 - 2.0f * sig2, 0.0f) / h2)
+            if sx == 0 && sy == 0 { wt = 1.0f }
+            wsum = wsum + wt
+            a0 = a0 + wt * image.img_getc(src, 0, x + sx, y + sy)
+            a1 = a1 + wt * image.img_getc(src, 1, x + sx, y + sy)
+            a2 = a2 + wt * image.img_getc(src, 2, x + sx, y + sy)
+            sx = sx + 1
+        }
+        sy = sy + 1
+    }
+    image.img_set((*c).nl, 0, x, y, a0 / wsum)
+    image.img_set((*c).nl, 1, x, y, a1 / wsum)
+    image.img_set((*c).nl, 2, x, y, a2 / wsum)
+}
+
+// The same arithmetic in the same order for a pixel at least 4 pixels away from every border: no clamping,
+// the nine centre-patch values stay in registers, so the result is bit-identical to `nlm_pixel_edge`.
+fn nlm_pixel_fast(c: *mut NlmCtx, x: i32, y: i32) {
+    let w: i32 = (*(*c).yi).w
+    let h: i32 = (*(*c).yi).h
+    let yp: u64 = (*(*c).yi).px
+    let p0: u64 = (*(*c).src).px
+    let p1: u64 = p0 + (w as u64) * (h as u64) * (4 as u64)
+    let p2: u64 = p1 + (w as u64) * (h as u64) * (4 as u64)
+    let vi: i32 = y * w + x
+    let sig2: f32 = 0.7f * pl((*(*c).vp).px, vi) + 1.0e-9f
+    let h2: f32 = (*c).strength * (*c).strength * sig2
+    let t2: f32 = 2.0f * sig2
+    let m00: f32 = pl(yp, vi - w - 1)
+    let m01: f32 = pl(yp, vi - w)
+    let m02: f32 = pl(yp, vi - w + 1)
+    let m10: f32 = pl(yp, vi - 1)
+    let m11: f32 = pl(yp, vi)
+    let m12: f32 = pl(yp, vi + 1)
+    let m20: f32 = pl(yp, vi + w - 1)
+    let m21: f32 = pl(yp, vi + w)
+    let m22: f32 = pl(yp, vi + w + 1)
+    var wsum: f32 = 0.0f
+    var a0: f32 = 0.0f
+    var a1: f32 = 0.0f
+    var a2: f32 = 0.0f
+    var sy: i32 = -3
+    while sy <= 3 {
+        var sx: i32 = -3
+        while sx <= 3 {
+            let q: i32 = vi + sy * w + sx
+            var d: f32 = m00 - pl(yp, q - w - 1)
+            var d2: f32 = 0.0f + d * d
+            d = m01 - pl(yp, q - w)
+            d2 = d2 + d * d
+            d = m02 - pl(yp, q - w + 1)
+            d2 = d2 + d * d
+            d = m10 - pl(yp, q - 1)
+            d2 = d2 + d * d
+            d = m11 - pl(yp, q)
+            d2 = d2 + d * d
+            d = m12 - pl(yp, q + 1)
+            d2 = d2 + d * d
+            d = m20 - pl(yp, q + w - 1)
+            d2 = d2 + d * d
+            d = m21 - pl(yp, q + w)
+            d2 = d2 + d * d
+            d = m22 - pl(yp, q + w + 1)
+            d2 = d2 + d * d
+            d2 = d2 * (1.0f / 9.0f)
+            var wt: f32 = image.expneg(image.fmaxf(d2 - t2, 0.0f) / h2)
+            if sx == 0 && sy == 0 { wt = 1.0f }
+            wsum = wsum + wt
+            a0 = a0 + wt * pl(p0, q)
+            a1 = a1 + wt * pl(p1, q)
+            a2 = a2 + wt * pl(p2, q)
+            sx = sx + 1
+        }
+        sy = sy + 1
+    }
+    let o0: u64 = (*(*c).nl).px
+    let o1: u64 = o0 + (w as u64) * (h as u64) * (4 as u64)
+    let o2: u64 = o1 + (w as u64) * (h as u64) * (4 as u64)
+    *((o0 + (vi as u64) * (4 as u64)) as *mut f32) = a0 / wsum
+    *((o1 + (vi as u64) * (4 as u64)) as *mut f32) = a1 / wsum
+    *((o2 + (vi as u64) * (4 as u64)) as *mut f32) = a2 / wsum
+}
+
+fn nlm_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut NlmCtx = ctx as *mut NlmCtx
+    let w: i32 = (*(*c).yi).w
+    let h: i32 = (*(*c).yi).h
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            if x >= 4 && x < w - 4 && y >= 4 && y < h - 4 {
+                nlm_pixel_fast(c, x, y)
+            } else {
+                nlm_pixel_edge(c, x, y)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+struct AddCtx {
+    nl: *mut image.Image,
+    src: *mut image.Image,
+    out: *mut image.Image,
+    keep: f32,
+}
+
+fn addback_rows(ctx: u64, lo: u64, hi: u64) {
+    let a: *mut AddCtx = ctx as *mut AddCtx
+    let w: i32 = (*(*a).nl).w
+    var c: i32 = 0
+    while c < 3 {
+        var y: i32 = lo as i32
+        while y < (hi as i32) {
+            var x: i32 = 0
+            while x < w {
+                let o: f32 = image.img_get((*a).nl, c, x, y)
+                let s: f32 = image.img_get((*a).src, c, x, y)
+                image.img_set((*a).out, c, x, y, o + (*a).keep * (s - o))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        c = c + 1
+    }
 }
 
 fn denoise(src: *mut image.Image, var_plane: *mut image.Image, strength: f32, keep: f32, out: *mut image.Image) {
@@ -23,69 +194,138 @@ fn denoise(src: *mut image.Image, var_plane: *mut image.Image, strength: f32, ke
     let h: i32 = (*src).h
     var y_img: image.Image = image.img_luma(src)
     var nl: image.Image = image.img_new(w, h, 3)
-    var y: i32 = 0
-    while y < h {
-        var x: i32 = 0
-        while x < w {
-            let sig2: f32 = 0.7f * image.img_get(var_plane, 0, x, y) + 1.0e-9f
-            let h2: f32 = strength * strength * sig2
-            var wsum: f32 = 0.0f
-            var a0: f32 = 0.0f
-            var a1: f32 = 0.0f
-            var a2: f32 = 0.0f
-            var sy: i32 = -3
-            while sy <= 3 {
-                var sx: i32 = -3
-                while sx <= 3 {
-                    var d2: f32 = 0.0f
-                    var py: i32 = -1
-                    while py <= 1 {
-                        var px: i32 = -1
-                        while px <= 1 {
-                            let d: f32 = image.img_getc(&y_img, 0, x + px, y + py) - image.img_getc(&y_img, 0, x + sx + px, y + sy + py)
-                            d2 = d2 + d * d
-                            px = px + 1
-                        }
-                        py = py + 1
-                    }
-                    d2 = d2 * (1.0f / 9.0f)
-                    var wt: f32 = image.expneg(image.fmaxf(d2 - 2.0f * sig2, 0.0f) / h2)
-                    if sx == 0 && sy == 0 { wt = 1.0f }
-                    wsum = wsum + wt
-                    a0 = a0 + wt * image.img_getc(src, 0, x + sx, y + sy)
-                    a1 = a1 + wt * image.img_getc(src, 1, x + sx, y + sy)
-                    a2 = a2 + wt * image.img_getc(src, 2, x + sx, y + sy)
-                    sx = sx + 1
-                }
-                sy = sy + 1
-            }
-            image.img_set(&nl, 0, x, y, a0 / wsum)
-            image.img_set(&nl, 1, x, y, a1 / wsum)
-            image.img_set(&nl, 2, x, y, a2 / wsum)
-            x = x + 1
-        }
-        y = y + 1
-    }
+    var nc: NlmCtx = NlmCtx { src: src, yi: &y_img, vp: var_plane, nl: &nl, strength: strength }
+    par.rows(h, 4, nlm_rows, (&nc) as u64)
     image.img_free(&y_img)
     denoise_chroma(&nl, var_plane, strength)
     // add back a fraction of the removed residual (natural grain)
     *out = image.img_new(w, h, 3)
-    var c: i32 = 0
-    while c < 3 {
-        y = 0
-        while y < h {
-            var x: i32 = 0
-            while x < w {
-                let o: f32 = image.img_get(&nl, c, x, y)
-                let s: f32 = image.img_get(src, c, x, y)
-                image.img_set(out, c, x, y, o + keep * (s - o))
-                x = x + 1
-            }
-            y = y + 1
-        }
-        c = c + 1
-    }
+    var ac: AddCtx = AddCtx { nl: &nl, src: src, out: out, keep: keep }
+    par.rows(h, 16, addback_rows, (&ac) as u64)
     image.img_free(&nl)
+}
+
+struct ChromaCtx {
+    im: *mut image.Image,
+    vp: *mut image.Image,
+    yl: *mut image.Image,
+    cr: *mut image.Image,
+    cb: *mut image.Image,
+    cr2: *mut image.Image,
+    cb2: *mut image.Image,
+    strength: f32,
+}
+
+fn chroma_split_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut ChromaCtx = ctx as *mut ChromaCtx
+    let w: i32 = (*(*k).im).w
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            let l: f32 = image.img_get((*k).yl, 0, x, y)
+            image.img_set((*k).cr, 0, x, y, image.img_get((*k).im, 0, x, y) - l)
+            image.img_set((*k).cb, 0, x, y, image.img_get((*k).im, 2, x, y) - l)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn chroma_pixel_edge(k: *mut ChromaCtx, x: i32, y: i32) {
+    let sig2: f32 = 0.7f * image.img_get((*k).vp, 0, x, y) + 1.0e-9f
+    // luma tolerance: 3 sigma plus a little, so luma EDGES stop the chroma blur
+    let tol2: f32 = 9.0f * sig2 * (*k).strength * (*k).strength + 1.0e-6f
+    let l0: f32 = image.img_get((*k).yl, 0, x, y)
+    var ws: f32 = 0.0f
+    var sr: f32 = 0.0f
+    var sb: f32 = 0.0f
+    var dy: i32 = -4
+    while dy <= 4 {
+        var dx: i32 = -4
+        while dx <= 4 {
+            let dl: f32 = image.img_getc((*k).yl, 0, x + dx, y + dy) - l0
+            let sp: f32 = ((dx * dx + dy * dy) as f32) * (1.0f / 16.0f)
+            let wt: f32 = image.expneg(sp + dl * dl / tol2)
+            ws = ws + wt
+            sr = sr + wt * image.img_getc((*k).cr, 0, x + dx, y + dy)
+            sb = sb + wt * image.img_getc((*k).cb, 0, x + dx, y + dy)
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+    image.img_set((*k).cr2, 0, x, y, sr / ws)
+    image.img_set((*k).cb2, 0, x, y, sb / ws)
+}
+
+// Same arithmetic for a pixel at least 4 pixels from every border (no clamping).
+fn chroma_pixel_fast(k: *mut ChromaCtx, x: i32, y: i32) {
+    let w: i32 = (*(*k).yl).w
+    let vi: i32 = y * w + x
+    let yp: u64 = (*(*k).yl).px
+    let crp: u64 = (*(*k).cr).px
+    let cbp: u64 = (*(*k).cb).px
+    let sig2: f32 = 0.7f * pl((*(*k).vp).px, vi) + 1.0e-9f
+    let tol2: f32 = 9.0f * sig2 * (*k).strength * (*k).strength + 1.0e-6f
+    let l0: f32 = pl(yp, vi)
+    var ws: f32 = 0.0f
+    var sr: f32 = 0.0f
+    var sb: f32 = 0.0f
+    var dy: i32 = -4
+    while dy <= 4 {
+        var dx: i32 = -4
+        while dx <= 4 {
+            let q: i32 = vi + dy * w + dx
+            let dl: f32 = pl(yp, q) - l0
+            let sp: f32 = ((dx * dx + dy * dy) as f32) * (1.0f / 16.0f)
+            let wt: f32 = image.expneg(sp + dl * dl / tol2)
+            ws = ws + wt
+            sr = sr + wt * pl(crp, q)
+            sb = sb + wt * pl(cbp, q)
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+    *(((*(*k).cr2).px + (vi as u64) * (4 as u64)) as *mut f32) = sr / ws
+    *(((*(*k).cb2).px + (vi as u64) * (4 as u64)) as *mut f32) = sb / ws
+}
+
+fn chroma_blur_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut ChromaCtx = ctx as *mut ChromaCtx
+    let w: i32 = (*(*k).yl).w
+    let h: i32 = (*(*k).yl).h
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            if x >= 4 && x < w - 4 && y >= 4 && y < h - 4 {
+                chroma_pixel_fast(k, x, y)
+            } else {
+                chroma_pixel_edge(k, x, y)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn chroma_join_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut ChromaCtx = ctx as *mut ChromaCtx
+    let w: i32 = (*(*k).im).w
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            let l: f32 = image.img_get((*k).yl, 0, x, y)
+            let r: f32 = l + image.img_get((*k).cr2, 0, x, y)
+            let b: f32 = l + image.img_get((*k).cb2, 0, x, y)
+            image.img_set((*k).im, 0, x, y, r)
+            image.img_set((*k).im, 2, x, y, b)
+            image.img_set((*k).im, 1, x, y, (l - 0.2126f * r - 0.0722f * b) / 0.7152f)
+            x = x + 1
+        }
+        y = y + 1
+    }
 }
 
 // In-place chroma smoothing of a 3 channel image (see header).
@@ -95,64 +335,12 @@ fn denoise_chroma(im: *mut image.Image, var_plane: *mut image.Image, strength: f
     var yl: image.Image = image.img_luma(im)
     var cr: image.Image = image.img_new(w, h, 1)
     var cb: image.Image = image.img_new(w, h, 1)
-    var y: i32 = 0
-    while y < h {
-        var x: i32 = 0
-        while x < w {
-            let l: f32 = image.img_get(&yl, 0, x, y)
-            image.img_set(&cr, 0, x, y, image.img_get(im, 0, x, y) - l)
-            image.img_set(&cb, 0, x, y, image.img_get(im, 2, x, y) - l)
-            x = x + 1
-        }
-        y = y + 1
-    }
     var cr2: image.Image = image.img_new(w, h, 1)
     var cb2: image.Image = image.img_new(w, h, 1)
-    y = 0
-    while y < h {
-        var x: i32 = 0
-        while x < w {
-            let sig2: f32 = 0.7f * image.img_get(var_plane, 0, x, y) + 1.0e-9f
-            // luma tolerance: 3 sigma plus a little, so luma EDGES stop the chroma blur
-            let tol2: f32 = 9.0f * sig2 * strength * strength + 1.0e-6f
-            let l0: f32 = image.img_get(&yl, 0, x, y)
-            var ws: f32 = 0.0f
-            var sr: f32 = 0.0f
-            var sb: f32 = 0.0f
-            var dy: i32 = -4
-            while dy <= 4 {
-                var dx: i32 = -4
-                while dx <= 4 {
-                    let dl: f32 = image.img_getc(&yl, 0, x + dx, y + dy) - l0
-                    let sp: f32 = ((dx * dx + dy * dy) as f32) * (1.0f / 16.0f)
-                    let wt: f32 = image.expneg(sp + dl * dl / tol2)
-                    ws = ws + wt
-                    sr = sr + wt * image.img_getc(&cr, 0, x + dx, y + dy)
-                    sb = sb + wt * image.img_getc(&cb, 0, x + dx, y + dy)
-                    dx = dx + 1
-                }
-                dy = dy + 1
-            }
-            image.img_set(&cr2, 0, x, y, sr / ws)
-            image.img_set(&cb2, 0, x, y, sb / ws)
-            x = x + 1
-        }
-        y = y + 1
-    }
-    y = 0
-    while y < h {
-        var x: i32 = 0
-        while x < w {
-            let l: f32 = image.img_get(&yl, 0, x, y)
-            let r: f32 = l + image.img_get(&cr2, 0, x, y)
-            let b: f32 = l + image.img_get(&cb2, 0, x, y)
-            image.img_set(im, 0, x, y, r)
-            image.img_set(im, 2, x, y, b)
-            image.img_set(im, 1, x, y, (l - 0.2126f * r - 0.0722f * b) / 0.7152f)
-            x = x + 1
-        }
-        y = y + 1
-    }
+    var k: ChromaCtx = ChromaCtx { im: im, vp: var_plane, yl: &yl, cr: &cr, cb: &cb, cr2: &cr2, cb2: &cb2, strength: strength }
+    par.rows(h, 16, chroma_split_rows, (&k) as u64)
+    par.rows(h, 4, chroma_blur_rows, (&k) as u64)
+    par.rows(h, 16, chroma_join_rows, (&k) as u64)
     image.img_free(&yl)
     image.img_free(&cr)
     image.img_free(&cb)
