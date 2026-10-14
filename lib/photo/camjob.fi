@@ -1,0 +1,383 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/camjob.fi -- photo.camjob: one camera shot job for the FirnCam app (host testable, no camera code).
+//
+//     import photo.camjob
+//
+//     var j: camjob.Job = camjob.job_new()
+//     j.mode = camjob.MODE_NIGHT
+//     camjob.job_add_shot(&j, kind, w, h, ptr, size, exp_ns, iso)    // RAW16 mosaic / JPEG, memory stays the caller's
+//     j.meta = ...                                                    // SensorMeta (RAW: CFA, black/white, noise)
+//     camjob.job_entry((&j) as u64)                                   // run (on any thread; the app uses thread_start)
+//     // j.out / j.out_n = the JPEG, j.have_pdf / j.pdf = scan PDF, j.progress 0..100, j.done = 1 when finished
+//     camjob.job_free(&j)
+//
+// MODES: PHOTO (burst merge + bracketed exposures = auto HDR, tone map), NIGHT (photo.night), PORTRAIT (merge +
+// segmentation + bokeh), DOC (page scan + PDF), STACK (focus stack). Fed with RAW16 the work is done in linear
+// light at HALF resolution (one RGGB quad -> one RGB pixel, so 12 MP RAW = 3 MP float); fed with JPEG (the
+// fallback when a device has no RAW / burst) the pictures are decoded, linearised and the same chain runs
+// with the noise measured from the pixels. `max_px` bounds the working size (box downscale, default 3 MP):
+// a burst of 8 then needs ~300 MB instead of > 1 GB. Progress is a plain counter the UI polls.
+import std.rt
+import jpeg.jpeg
+import photo.image
+import photo.meta
+import photo.merge
+import photo.pipeline
+import photo.night
+import photo.portrait
+import photo.focus
+import photo.document
+import photo.par
+import photo.jpegenc
+
+export {
+    Shot, Job, job_new, job_add_shot, job_free, job_entry, run_job, job_progress, job_finished,
+    MODE_PHOTO, MODE_NIGHT, MODE_PORTRAIT, MODE_DOC, MODE_STACK, SHOT_RAW, SHOT_JPEG, MAX_SHOTS,
+    shrink_factor, raw_half,
+}
+
+const MODE_PHOTO: i32 = 0
+const MODE_NIGHT: i32 = 1
+const MODE_PORTRAIT: i32 = 2
+const MODE_DOC: i32 = 3
+const MODE_STACK: i32 = 4
+const SHOT_RAW: i32 = 1
+const SHOT_JPEG: i32 = 0
+const MAX_SHOTS: i32 = 16
+
+struct Shot {
+    kind: i32,
+    w: i32,
+    h: i32,
+    ptr: u64,
+    size: usize,
+    exp_ns: i64,
+    iso: i32,
+}
+
+struct Job {
+    mode: i32,
+    n: i32,
+    shots: [Shot; 16],
+    meta: meta.SensorMeta,
+    max_px: i32,
+    quality: i32,
+    orientation: i32,     // EXIF orientation 1..8 written into the JPEG
+    out: u64,
+    out_cap: usize,
+    out_n: usize,
+    out_w: i32,
+    out_h: i32,
+    pdf: rt.Buf,
+    have_pdf: bool,
+    progress: u64,
+    done: u64,
+    ok: bool,
+}
+
+fn job_new() -> Job {
+    return Job {
+        mode: 0, n: 0,
+        shots: [Shot { kind: 0, w: 0, h: 0, ptr: 0, size: 0, exp_ns: 0, iso: 0 }; 16],
+        meta: meta.meta_default(), max_px: 3000000, quality: 92, orientation: 1,
+        out: 0, out_cap: 0, out_n: 0, out_w: 0, out_h: 0, pdf: rt.buf_new(), have_pdf: false,
+        progress: 0, done: 0, ok: false,
+    }
+}
+
+fn job_add_shot(j: *mut Job, kind: i32, w: i32, h: i32, ptr: u64, size: usize, exp_ns: i64, iso: i32) -> bool {
+    if (*j).n >= MAX_SHOTS { return false }
+    (*j).shots[(*j).n as usize] = Shot { kind: kind, w: w, h: h, ptr: ptr, size: size, exp_ns: exp_ns, iso: iso }
+    (*j).n = (*j).n + 1
+    return true
+}
+
+fn job_free(j: *mut Job) {
+    if (*j).out != 0 as u64 { rt.heap_free((*j).out, (*j).out_cap); (*j).out = 0 as u64 }
+    rt.buf_free(&(*j).pdf)
+}
+
+fn set_progress(j: *mut Job, p: u64) {
+    __atomic_add((&(*j).progress) as *mut u64, 0)
+    (*j).progress = p
+}
+
+fn job_progress(j: *mut Job) -> u64 {
+    return __atomic_add((&(*j).progress) as *mut u64, 0)
+}
+
+fn job_finished(j: *mut Job) -> bool {
+    return __atomic_add((&(*j).done) as *mut u64, 0) != (0 as u64)
+}
+
+// smallest integer box factor so that (w / f) * (h / f) <= max_px
+fn shrink_factor(w: i32, h: i32, max_px: i32) -> i32 {
+    var f: i32 = 1
+    while ((w / f) as i64) * ((h / f) as i64) > (max_px as i64) { f = f + 1 }
+    return f
+}
+
+// ---------------------------------------------------------------- RAW16 -> linear RGB at half resolution
+struct HalfCtx {
+    p: u64,
+    w: i32,
+    cfa: u32,
+    black: [f32; 4],
+    white: f32,
+    out: image.Image,
+}
+
+fn half_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut HalfCtx = ctx as *mut HalfCtx
+    let hw: i32 = (*c).out.w
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < hw {
+            var sum: [f32; 3] = [0.0f; 3]
+            var cnt: [f32; 3] = [0.0f; 3]
+            var s: u32 = 0
+            while s < 4 {
+                let sx: i32 = x * 2 + ((s & 1) as i32)
+                let sy: i32 = y * 2 + ((s >> 1) as i32)
+                let col: usize = meta.cfa_color((*c).cfa, s) as usize
+                let raw: f32 = (*(((*c).p + (((sy * (*c).w + sx) * 2) as u64)) as *mut u16)) as f32
+                let v: f32 = (raw - (*c).black[s as usize]) / ((*c).white - (*c).black[s as usize])
+                if col < 3 {
+                    sum[col] = sum[col] + v
+                    cnt[col] = cnt[col] + 1.0f
+                }
+                s = s + 1
+            }
+            var ch: i32 = 0
+            while ch < 3 {
+                var v: f32 = 0.0f
+                if cnt[ch as usize] > 0.0f { v = sum[ch as usize] / cnt[ch as usize] }
+                image.img_set(&(*c).out, ch, x, y, v)
+                ch = ch + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// u16 mosaic (w x h, tightly packed) -> normalised linear RGB, half size
+fn raw_half(p: u64, w: i32, h: i32, m: *mut meta.SensorMeta) -> image.Image {
+    var c: HalfCtx = HalfCtx { p: p, w: w, cfa: (*m).cfa, black: [0.0f; 4], white: 65535.0f, out: image.img_new(w / 2, h / 2, 3) }
+    if (*m).has_black {
+        c.white = (*m).white_level
+        var i: usize = 0
+        while i < 4 { c.black[i] = (*m).black[i]; i = i + 1 }
+    }
+    par.rows(h / 2, 8, half_rows, (&c) as u64)
+    return c.out
+}
+
+// float image -> box downscaled copy when it is above max_px (the input is consumed), else the input
+fn shrink_img(im: image.Image, max_px: i32) -> image.Image {
+    let f: i32 = shrink_factor(im.w, im.h, max_px)
+    if f == 1 { return im }
+    var src: image.Image = im
+    var d: image.Image = image.img_new(src.w / f, src.h / f, src.ch)
+    var c: i32 = 0
+    while c < src.ch {
+        var y: i32 = 0
+        while y < d.h {
+            var x: i32 = 0
+            while x < d.w {
+                var s: f32 = 0.0f
+                var dy: i32 = 0
+                while dy < f {
+                    var dx: i32 = 0
+                    while dx < f {
+                        s = s + image.img_get(&src, c, x * f + dx, y * f + dy)
+                        dx = dx + 1
+                    }
+                    dy = dy + 1
+                }
+                image.img_set(&d, c, x, y, s / ((f * f) as f32))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        c = c + 1
+    }
+    image.img_free(&src)
+    return d
+}
+
+// JPEG bytes -> linear RGB at <= max_px
+fn jpeg_linear(p: u64, n: usize, max_px: i32) -> image.Image {
+    var dj: jpeg.JpegImage = jpeg.jpeg_image_new()
+    let ok: bool = jpeg.jpeg_decode(p, n, &dj) catch false
+    if !ok { return image.img_new(0, 0, 3) }
+    let w: i32 = dj.w as i32
+    let h: i32 = dj.h as i32
+    let f: i32 = shrink_factor(w, h, max_px)
+    var d: image.Image = image.img_new(w / f, h / f, 3)
+    let base: u64 = rt.buf_ptr(&dj.px)
+    var y: i32 = 0
+    while y < d.h {
+        var x: i32 = 0
+        while x < d.w {
+            var c: i32 = 0
+            while c < 3 {
+                var s: u32 = 0
+                var dy: i32 = 0
+                while dy < f {
+                    var dx: i32 = 0
+                    while dx < f {
+                        s = s + (*((base + ((((y * f + dy) * w + x * f + dx) * 4 + c) as u64)) as *mut u8)) as u32
+                        dx = dx + 1
+                    }
+                    dy = dy + 1
+                }
+                image.img_set(&d, c, x, y, (s as f32) / ((f * f) as f32 * 255.0f))
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    jpeg.jpeg_image_free(&dj)
+    image.img_from_srgb(&d)
+    return d
+}
+
+fn load_shot(s: *mut Shot, m: *mut meta.SensorMeta, max_px: i32) -> image.Image {
+    if (*s).kind == SHOT_RAW {
+        let h: image.Image = raw_half((*s).ptr, (*s).w, (*s).h, m)
+        return shrink_img(h, max_px)
+    }
+    return jpeg_linear((*s).ptr, (*s).size, max_px)
+}
+
+// exposure * iso of a shot as a double, 0 when unknown
+fn expo_of(s: *mut Shot) -> f64 {
+    if (*s).exp_ns <= 0 || (*s).iso <= 0 { return 0.0 }
+    return ((*s).exp_ns as f64) * ((*s).iso as f64)
+}
+
+// median of the known exposures (the "normal" exposure of a bracket), 0 = unknown
+fn median_expo(j: *mut Job) -> f64 {
+    var v: [f64; 16] = [0.0; 16]
+    var n: usize = 0
+    var i: i32 = 0
+    while i < (*j).n {
+        let e: f64 = expo_of(&(*j).shots[i as usize])
+        if e > 0.0 {
+            var k: usize = n
+            while k > 0 && v[k - 1] > e { v[k] = v[k - 1]; k = k - 1 }
+            v[k] = e
+            n = n + 1
+        }
+        i = i + 1
+    }
+    if n == 0 { return 0.0 }
+    return v[n / 2]
+}
+
+// builds the burst of linear frames; gains from the exposures when the shots are RAW
+fn load_burst(j: *mut Job, b: *mut merge.Burst, bracket: bool) -> bool {
+    let med: f64 = median_expo(j)
+    var i: i32 = 0
+    while i < (*j).n {
+        let s: *mut Shot = &(*j).shots[i as usize]
+        let im: image.Image = load_shot(s, &(*j).meta, (*j).max_px)
+        if im.w < 8 || im.h < 8 { image.img_free(&im); return false }
+        var gain: f32 = 1.0f
+        if bracket && (*s).kind == SHOT_RAW && med > 0.0 && expo_of(s) > 0.0 { gain = (expo_of(s) / med) as f32 }
+        if !merge.burst_add(b, im, gain) { break }
+        set_progress(j, (5 + (35 * (i + 1)) / (*j).n) as u64)
+        i = i + 1
+    }
+    return (*b).n > 0
+}
+
+fn run_job(j: *mut Job) -> bool {
+    (*j).ok = false
+    set_progress(j, 1)
+    if (*j).n < 1 { return false }
+    let jpeg_in: bool = (*j).shots[0].kind != SHOT_RAW
+    var b: merge.Burst = merge.burst_new()
+    if !load_burst(j, &b, (*j).mode == MODE_PHOTO || (*j).mode == MODE_PORTRAIT) {
+        merge.burst_free(&b)
+        return false
+    }
+    var m: meta.SensorMeta = (*j).meta
+    var out: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&out)
+    var po: pipeline.PipeOpts = pipeline.opts_default()
+    if jpeg_in { po.sharpen = 0.3f; po.tone = 0.5f }
+    let mode: i32 = (*j).mode
+    if mode == MODE_NIGHT {
+        var no: night.NightOpts = night.night_default()
+        if jpeg_in { no.pipe.sharpen = 0.3f }
+        if b.n > 1 {
+            night.night_process(&b, &m, &no, &out)
+        } else {
+            night.night_single(&b.frames[0], &m, &no, &out)
+        }
+    } else if mode == MODE_STACK && b.n > 1 {
+        var fo: focus.FocusOpts = focus.focus_default()
+        var st: image.Image = image.img_new(1, 1, 3)
+        var dp: image.Image = image.img_new(1, 1, 1)
+        image.img_free(&st)
+        image.img_free(&dp)
+        focus.focus_stack(&b, &fo, &st, &dp)
+        image.img_free(&dp)
+        set_progress(j, 70)
+        pipeline.process_single_linear(&st, &m, &po, &out)
+        image.img_free(&st)
+    } else if b.n > 1 {
+        pipeline.process_burst(&b, &m, &po, &out)
+    } else {
+        pipeline.process_single_linear(&b.frames[0], &m, &po, &out)
+    }
+    merge.burst_free(&b)
+    set_progress(j, 75)
+    if mode == MODE_PORTRAIT {
+        var pr: portrait.PortraitOpts = portrait.portrait_default()
+        var res: image.Image = image.img_new(1, 1, 3)
+        image.img_free(&res)
+        portrait.portrait_auto(&out, &pr, &res)
+        image.img_free(&out)
+        out = res
+    } else if mode == MODE_DOC {
+        var dopt: document.DocOpts = document.doc_default()
+        var res: image.Image = image.img_new(1, 1, 3)
+        image.img_free(&res)
+        if document.scan_document(&out, &dopt, &res) {
+            image.img_free(&out)
+            out = res
+        }
+        (*j).have_pdf = document.pdf_write(&out, 200.0f, &(*j).pdf)
+    }
+    set_progress(j, 90)
+    var eo: jpegenc.EncOpts = jpegenc.enc_default()
+    eo.quality = (*j).quality
+    eo.orientation = (*j).orientation
+    let cap: usize = jpegenc.jpeg_max_size(out.w, out.h)
+    let buf: u64 = rt.heap_alloc(cap)
+    if buf == 0 as u64 { image.img_free(&out); return false }
+    let n: usize = jpegenc.jpeg_encode_image(&out, &eo, buf, cap)
+    (*j).out_w = out.w
+    (*j).out_h = out.h
+    image.img_free(&out)
+    if n == 0 { rt.heap_free(buf, cap); return false }
+    (*j).out = buf
+    (*j).out_cap = cap
+    (*j).out_n = n
+    (*j).ok = true
+    set_progress(j, 100)
+    return true
+}
+
+// thread entry: the app starts it with thread_start(JOB_KIND, address of the Job)
+fn job_entry(arg: u64) -> u64 {
+    let j: *mut Job = arg as *mut Job
+    run_job(j)
+    __atomic_add((&(*j).done) as *mut u64, 1)
+    return 0
+}
