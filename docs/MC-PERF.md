@@ -102,7 +102,7 @@ Not a clean A/B (the load of the server changes between runs); the direction (ab
 * The server is shared (load 10-30 during the runs): treat times as noisy; the harness stores the load per run.
 
 ## Messserie 14.10. (u1, PERF_COMP an, 3 Laeufe, Median [min..max], 640x360, Fixture-Welt, Server-Load ~14-16)
-Hinweis: llvmpipe = Software-GL, KEINE echte GPU. Vanilla NICHT gemessen.
+Note: llvmpipe = software GL, NOT a real GPU. Vanilla NOT measured.
 
 | Backend | Radius | Frame p50 ms | p99 ms |
 |---|---|---|---|
@@ -113,9 +113,9 @@ Hinweis: llvmpipe = Software-GL, KEINE echte GPU. Vanilla NICHT gemessen.
 | CPU-Raster | 32 | 3453 [3367..3584] | 4853 [4591..4872] |
 | GL llvmpipe | 32 | 1235 [1211..1552] | 1583 [1501..2695] |
 
-Mesher (915 Sektionen, p50): naiv+AO 823 us, naiv ohne AO 780 us, greedy+AO 807 us (CPU-Lauf). Upload/Free p50 130 us/Sektion.
+Mesher (915 sections, p50): naive+AO 823 us, naive without AO 780 us, greedy+AO 807 us (CPU run). Upload/Free p50 130 us/section.
 Radius 32 (v1, PERF_FRAMES=30, 3 Laeufe, reports/perf_20261014-085359_cpu_r32.tsv + perf_20261014-085901_gl_r32.tsv):
-* Skalierung CPU p50: r8 336 -> r16 1040 (3.1x) -> r32 3453 ms (3.3x); GL p50: 86 -> 347 (4.0x) -> 1235 ms (3.6x). Tris/Frame 0.46M -> 2.0M -> 7.4M, Sektionen 485 -> 2185 -> 8088: Zeit ~ linear in Tris, kein Culling-/LOD-Gewinn sichtbar.
+* Scaling CPU p50: r8 336 -> r16 1040 (3.1x) -> r32 3453 ms (3.3x); GL p50: 86 -> 347 (4.0x) -> 1235 ms (3.6x). Tris/frame 0.46M -> 2.0M -> 7.4M, sections 485 -> 2185 -> 8088: time ~ linear in tris, no culling/LOD gain visible.
 * GL r32 Streuung gross (p50 max 1552, p99 max 2695): Server-Load lief 16-24 (r8/r16: 13-17) -> r32 GL-Zahl pessimistisch/verrauscht. CPU r32 stabiler (+-3%).
 * Weltaufbau r32: load_e2e CPU 144 s, GL 118 s (5329 Chunks, 76670 Sektionen), RSS-Peak 1.6-1.7 GB (r16: 0.46-0.63 GB, r8: 0.15-0.3 GB).
-* Einordnung: llvmpipe/CPU, KEINE echte GPU, Vanilla NICHT gemessen. Keine Aussage ueber Vanilla/echte GPU moeglich.
+* Classification: llvmpipe/CPU, NOT a real GPU, vanilla NOT measured. No statement about vanilla/a real GPU is possible.
