@@ -6,6 +6,7 @@
 set -u
 cd "$(dirname "$0")/../../.."
 FIRNC=${1:-${FIRNC:-compiler/target/release/firnc}}
+[ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc   # worktrees have no built compiler (r194)
 export FIRNLIB="$(pwd)/lib"
 [ -e /usr/lib/x86_64-linux-gnu/libvulkan.so.1 ] || [ -e /usr/lib64/libvulkan.so.1 ] || { echo "   SKIP: no libvulkan.so.1"; exit 0; }
 D=$(mktemp -d); XP=""
