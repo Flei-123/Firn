@@ -146,7 +146,7 @@ echo "-- 3b. Phasen-Fragmentierung (gross -> klein) --"
 grep '^#' "$OUT/frag2.tsv"
 python3 - "$OUT/frag2.tsv" <<'PYEOF2'
 import sys
-a_max = b_max = ende = None
+a_max = b_max = end_val = None
 for z in open(sys.argv[1]):
     z = z.strip()
     if z.startswith('# rss_phase_a_max_kib='):
@@ -154,9 +154,9 @@ for z in open(sys.argv[1]):
     if z.startswith('# rss_phase_b_max_kib='):
         b_max = int(z.split('=')[1])
     if z.startswith('# rss_ende_kib='):
-        ende = int(z.split('=')[1])
-print(f'   Phase A max {a_max} KiB, Phase B max {b_max} KiB, Ende {ende} KiB')
-if ende is not None and a_max and ende > a_max * 0.5:
+        end_val = int(z.split('=')[1])
+print(f'   Phase A max {a_max} KiB, Phase B max {b_max} KiB, Ende {end_val} KiB')
+if end_val is not None and a_max and end_val > a_max * 0.5:
     print('   NOTE: the RSS at the end is above 50 % of the phase A maximum -- check the return')
 PYEOF2
 

@@ -22,7 +22,7 @@ RUNS="${3:-9}"
 WORK=.bench-ab
 rm -rf "$WORK"; mkdir -p "$WORK"
 
-beste() {
+best_of() {
     local best="" i a b t
     for ((i = 0; i < RUNS; i++)); do
         a=$(date +%s.%N)
@@ -53,8 +53,8 @@ for src in bench/firn/*.fi; do
         printf '%-14s   RESULT DIFFERS — measurement invalid\n' "$name"
         continue
     fi
-    ta=$(beste "$WORK/$name.old")
-    tn=$(beste "$WORK/$name.new")
+    ta=$(best_of "$WORK/$name.old")
+    tn=$(best_of "$WORK/$name.new")
     sum_old=$(awk -v a="$sum_old" -v b="$ta" 'BEGIN{print a+b}')
     sum_new=$(awk -v a="$sum_new" -v b="$tn" 'BEGIN{print a+b}')
     awk -v n="$name" -v a="$ta" -v b="$tn" \

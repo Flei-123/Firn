@@ -88,8 +88,8 @@ fi
 echo
 echo "== 5. soak run: build and discard trees without growing =="
 if [ "$FAST" -eq 1 ]; then
-    BAUM_RUNDEN=${BAUM_RUNDEN:-4000} BAUM_MS=${BAUM_MS:-3000} \
-      BAUM_LECK_RUNDEN=${BAUM_LECK_RUNDEN:-3000} bash tools/html/gc_tree.sh | sed 's/^/   /'
+    TREE_ROUNDS=${TREE_ROUNDS:-4000} BAUM_MS=${BAUM_MS:-3000} \
+      TREE_LEAK_ROUNDS=${TREE_LEAK_ROUNDS:-3000} bash tools/html/gc_tree.sh | sed 's/^/   /'
 else
     bash tools/html/gc_tree.sh | sed 's/^/   /'
 fi

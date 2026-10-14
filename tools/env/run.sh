@@ -157,7 +157,7 @@ struct Text {
 }
 
 fn produkt() -> Text {
-    let t: Text = __env_or("OSUM_MARKE_PRODUKT", "OrientOS")
+    let t: Text = __env_or("OSUM_BRAND_PRODUCT", "OrientOS")
     return t
 }
 
@@ -167,7 +167,7 @@ fn k_main() -> i32 {
 }
 EOF
 rm -f "$WORK/marke.o"
-OSUM_MARKE_PRODUKT="Xoffi OS" "$FIRNC" --env-allow=OSUM_MARKE_ -c "$WORK/marke.fi" -o "$WORK/marke.o" >/dev/null 2>&1
+OSUM_BRAND_PRODUCT="Xoffi OS" "$FIRNC" --env-allow=OSUM_BRAND_ -c "$WORK/marke.fi" -o "$WORK/marke.o" >/dev/null 2>&1
 if [ -s "$WORK/marke.o" ]; then
     # the octets of the brand really stand in the object file, and no
     # collector came along for the ride

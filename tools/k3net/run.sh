@@ -374,17 +374,34 @@ PYEOF
         TRY=0
         while [ "$TRY" -lt 3 ]; do
             TRY=$((TRY + 1))
+            # K3_LOGDIR=<dir>: keep a pcap of the Linux side, ss samples and the
+            # driver output of every FAILED try (r578; see netem_in_repro.sh).
+            TDP=""
+            if [ -n "${K3_LOGDIR:-}" ] && command -v tcpdump >/dev/null 2>&1; then
+                mkdir -p "$K3_LOGDIR"
+                L tcpdump -i "$LIF" -n -tt -U -w "$W/lossin.pcap" >/dev/null 2>&1 &
+                TDP=$!
+            fi
             F sink 4711 $((LOSSKB * 1024)) 60 > "$W/lossin.out" 2>&1 &
             DRV=$!
             sleep "$(settle)"
             L timeout 60 nc -q 3 "$FIP" 4711 < "$W/small.bin" > /dev/null 2>&1
             wait $DRV 2>/dev/null
             LRC=$?
+            if [ -n "$TDP" ]; then
+                L ss -tin dst "$FIP" > "$W/lossin.ss" 2>&1
+                sleep 0.3; kill "$TDP" 2>/dev/null; wait "$TDP" 2>/dev/null
+            fi
             n=$(val "$W/lossin.out" octets)
             ooo=$(val "$W/lossin.out" out_of_order)
             if [ "$LRC" -eq 0 ] && [ "${n:-0}" = "$((LOSSKB * 1024))" ] && [ "${ooo:-0}" -gt 0 ]; then break; fi
             echo "  (netem in, try $TRY: ${n:-0} of $((LOSSKB * 1024)) octets, out of order ${ooo:-0} -- trying again)"
             cp "$W/lossin.out" "$W/lossin.try$TRY.out"
+            if [ -n "${K3_LOGDIR:-}" ]; then
+                for x in out pcap ss; do
+                    [ -f "$W/lossin.$x" ] && cp "$W/lossin.$x" "$K3_LOGDIR/netem_in_$(date +%s)_try$TRY.$x"
+                done
+            fi
         done
         DIN=$(netem_drops "$LNS" "$LIF")
         L tc qdisc del dev "$LIF" root >/dev/null 2>&1

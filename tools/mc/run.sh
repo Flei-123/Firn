@@ -44,5 +44,10 @@ if [ -z "$ONLY" ] || [ "$ONLY" = lodplay ]; then
     echo "== mc/lodplay =="
     bash tools/mc/play/run_lod.sh || ERR=$((ERR+1))
 fi
+# entities in the mcplay play path against the real server (live packets + CPU/GL pictures with / without boxes): ~4 min, needs Xvfb + java.
+if [ -z "$ONLY" ] || [ "$ONLY" = ents ]; then
+    echo "== mc/ents =="
+    bash tools/mc/play/run_ents.sh || ERR=$((ERR+1))
+fi
 if [ $ERR -eq 0 ]; then echo "RESULT mc: ok"; else echo "RESULT mc: $ERR failing parts"; fi
 exit $ERR

@@ -42,7 +42,7 @@ if "$FIRNC" --target=x86_64-windows -o "$D/vkp.exe" tools/gpu/vk/vkprobe.fi 2>"$
 else
     echo "   FAIL: Windows build of vkprobe.fi"; head -5 "$D/errw"; fail=1
 fi
-# MC renderer shaders (docs/VK-SHADERS.md): committed .spv == fresh glslang build (byte equal) + GL parity diff. SKIP without glslang.
+# MC renderer shaders (docs/VK-RENDERER.md (Shaders)): committed .spv == fresh glslang build (byte equal) + GL parity diff. SKIP without glslang.
 if command -v glslangValidator >/dev/null 2>&1 && command -v spirv-val >/dev/null 2>&1; then
     if bash tools/gpu/mkspv.sh --check >"$D/mkspv.txt" 2>&1; then echo "   ok:   Vulkan shaders: committed SPIR-V == fresh build ($(grep -c '^ok' "$D/mkspv.txt") modules)"
     else echo "   FAIL: tools/gpu/mkspv.sh --check"; sed 's/^/   /' "$D/mkspv.txt" | head; fail=1; fi
