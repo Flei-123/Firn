@@ -1,0 +1,442 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/jpegenc.fi -- photo.jpegenc: a baseline JPEG encoder (ITU T.81, sequential Huffman, 8 bit).
+//
+//     import photo.jpegenc
+//
+//     var o: jpegenc.EncOpts = jpegenc.enc_default()   // quality 92, 4:2:0, orientation 1
+//     o.quality = 95
+//     let cap: usize = jpegenc.jpeg_max_size(w, h)
+//     let n: usize = jpegenc.jpeg_encode_rgba(rgba, w, h, &o, out, cap)   // 0 = failed (buffer too small)
+//     let n2: usize = jpegenc.jpeg_encode_image(&img, &o, out, cap)       // photo.image, 3 ch, display encoded 0..1
+//
+// WHAT IT WRITES: JFIF + the standard (Annex K) quantisation and Huffman tables, the quantisation scaled
+// by `quality` 1..100 like libjpeg, YCbCr (BT.601, full range), 4:2:0 (`subsample`) or 4:4:4, an optional
+// EXIF APP1 with the Orientation tag (`orientation` 2..8; 1 = none written). The image size is any
+// (edges are replicated up to the MCU). Float 8x8 DCT. Output is a normal baseline file: lib/jpeg, libjpeg
+// and Pillow decode it (tests/2966_photo_jpegenc.fi, tools/photo/jpegenc_pil.py).
+import std.rt
+import std.math
+import photo.image
+
+export {
+    EncOpts, enc_default, jpeg_max_size, jpeg_encode_rgba, jpeg_encode_image,
+}
+
+struct EncOpts {
+    quality: i32,
+    subsample: bool,
+    orientation: i32,
+}
+
+fn enc_default() -> EncOpts {
+    return EncOpts { quality: 92, subsample: true, orientation: 1 }
+}
+
+// bits[16] + values for DC luma, AC luma, DC chroma, AC chroma (28 + 178 + 28 + 178 octets), Annex K.
+static HUFF_HEX: [u8; 824] = "00010501010101010100000000000000000102030405060708090a0b0002010303020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738393a434445464748494a535455565758595a636465666768696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9fa00030101010101010101010000000000000102030405060708090a0b00020102040403040705040400010277000102031104052131061241510761711322328108144291a1b1c109233352f0156272d10a162434e125f11718191a262728292a35363738393a434445464748494a535455565758595a636465666768696a737475767778797a82838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6e7e8e9eaf2f3f4f5f6f7f8f9fa"
+// Annex K quantisation tables, natural (row major) order.
+static QL_HEX: [u8; 128] = "100b0a101828333d0c0c0e131a3a3c370e0d1018283945380e11161d3357503e12162538446d674d182337405168715c31404e5767797865485c5f6270646763"
+static QC_HEX: [u8; 128] = "1112182f6363636312151a4263636363181a3863636363632f426363636363636363636363636363636363636363636363636363636363636363636363636363"
+static ZZ_HEX: [u8; 128] = "000108100902030a11182019120b04050c131a21283029221b140d06070e151c232a313839322b241d160f171e252c333a3b342d261f272e353c3d362f373e3f"
+
+fn hv(c: u8) -> u32 {
+    let v: u32 = c as u32
+    if v >= 97 { return v - 87 }
+    return v - 48
+}
+
+fn hex_at(s: u64, i: usize) -> u32 {
+    return hv(*((s + (i * 2) as u64) as *mut u8)) * 16 + hv(*((s + (i * 2 + 1) as u64) as *mut u8))
+}
+
+struct Enc {
+    out: u64,
+    cap: usize,
+    n: usize,
+    acc: u64,
+    nb: i32,
+    bad: bool,
+    dc_code: [u32; 24],
+    dc_len: [u8; 24],
+    ac_code: [u32; 512],
+    ac_len: [u8; 512],
+    qt: [i32; 128],        // 0..63 luma, 64..127 chroma, natural order
+    dm: [f32; 64],         // DCT matrix
+    zz: [u8; 64],
+}
+
+fn emit(e: *mut Enc, b: u32) {
+    if (*e).n + 2 > (*e).cap { (*e).bad = true; return }
+    *(((*e).out + (*e).n as u64) as *mut u8) = b as u8
+    (*e).n = (*e).n + 1
+    if b == 255 {
+        *(((*e).out + (*e).n as u64) as *mut u8) = 0 as u8
+        (*e).n = (*e).n + 1
+    }
+}
+
+fn raw8(e: *mut Enc, b: u32) {
+    if (*e).n + 1 > (*e).cap { (*e).bad = true; return }
+    *(((*e).out + (*e).n as u64) as *mut u8) = b as u8
+    (*e).n = (*e).n + 1
+}
+
+fn raw16(e: *mut Enc, v: u32) {
+    raw8(e, (v >> 8) & 255)
+    raw8(e, v & 255)
+}
+
+fn put_bits(e: *mut Enc, code: u32, len: i32) {
+    if len <= 0 { return }
+    (*e).acc = ((*e).acc << (len as u64)) | (code as u64)
+    (*e).nb = (*e).nb + len
+    while (*e).nb >= 8 {
+        emit(e, (((*e).acc >> (((*e).nb - 8) as u64)) & 255) as u32)
+        (*e).nb = (*e).nb - 8
+    }
+    (*e).acc = (*e).acc & (((1 as u64) << ((*e).nb as u64)) - 1)
+}
+
+// canonical Huffman codes from bits/values at `at` (table index: DC 0|1, AC 0|1)
+fn build_table(e: *mut Enc, at: usize, dc: bool, set: usize) {
+    let s: u64 = (&HUFF_HEX[0]) as u64
+    var code: u32 = 0
+    var k: usize = 0
+    var l: usize = 1
+    while l <= 16 {
+        let cnt: u32 = hex_at(s, at + l - 1)
+        var i: u32 = 0
+        while i < cnt {
+            let v: usize = hex_at(s, at + 16 + k) as usize
+            if dc {
+                (*e).dc_code[set * 12 + v] = code
+                (*e).dc_len[set * 12 + v] = l as u8
+            } else {
+                (*e).ac_code[set * 256 + v] = code
+                (*e).ac_len[set * 256 + v] = l as u8
+            }
+            code = code + 1
+            k = k + 1
+            i = i + 1
+        }
+        code = code << 1
+        l = l + 1
+    }
+}
+
+fn round_i(x: f32) -> i32 {
+    if x >= 0.0f { return (x + 0.5f) as i32 }
+    return 0 - ((0.0f - x + 0.5f) as i32)
+}
+
+fn bitlen(v: i32) -> i32 {
+    var a: i32 = v
+    if a < 0 { a = 0 - a }
+    var n: i32 = 0
+    while a > 0 { n = n + 1; a = a >> 1 }
+    return n
+}
+
+// One 8x8 block of f32 samples (level shifted) -> quantised, entropy coded. Returns the new DC predictor.
+fn code_block(e: *mut Enc, px: u64, stride: usize, tq: usize, set: usize, pred: i32) -> i32 {
+    var t: [f32; 64] = [0.0f; 64]
+    var f: [f32; 64] = [0.0f; 64]
+    var y: usize = 0
+    while y < 8 {
+        let row: u64 = px + (y * stride * 4) as u64
+        var u: usize = 0
+        while u < 8 {
+            var s: f32 = 0.0f
+            var x: usize = 0
+            while x < 8 {
+                s = s + (*e).dm[u * 8 + x] * (*((row + (x * 4) as u64) as *mut f32) - 128.0f)
+                x = x + 1
+            }
+            t[y * 8 + u] = s
+            u = u + 1
+        }
+        y = y + 1
+    }
+    var v: usize = 0
+    while v < 8 {
+        var u: usize = 0
+        while u < 8 {
+            var s: f32 = 0.0f
+            var yy: usize = 0
+            while yy < 8 {
+                s = s + (*e).dm[v * 8 + yy] * t[yy * 8 + u]
+                yy = yy + 1
+            }
+            f[v * 8 + u] = s
+            u = u + 1
+        }
+        v = v + 1
+    }
+    var q: [i32; 64] = [0; 64]
+    var k: usize = 0
+    while k < 64 {
+        let nat: usize = (*e).zz[k] as usize
+        q[k] = round_i(f[nat] / ((*e).qt[tq * 64 + nat] as f32))
+        k = k + 1
+    }
+    let diff: i32 = q[0] - pred
+    let cat: i32 = bitlen(diff)
+    put_bits(e, (*e).dc_code[set * 12 + cat as usize], (*e).dc_len[set * 12 + cat as usize] as i32)
+    if cat > 0 {
+        var bits: i32 = diff
+        if diff < 0 { bits = diff - 1 }
+        put_bits(e, (bits & ((1 << cat) - 1)) as u32, cat)
+    }
+    var run: i32 = 0
+    var i: usize = 1
+    while i < 64 {
+        let c: i32 = q[i]
+        if c == 0 {
+            run = run + 1
+        } else {
+            while run > 15 {
+                put_bits(e, (*e).ac_code[set * 256 + 240], (*e).ac_len[set * 256 + 240] as i32)
+                run = run - 16
+            }
+            let sz: i32 = bitlen(c)
+            let sym: usize = (run * 16 + sz) as usize
+            put_bits(e, (*e).ac_code[set * 256 + sym], (*e).ac_len[set * 256 + sym] as i32)
+            var bits: i32 = c
+            if c < 0 { bits = c - 1 }
+            put_bits(e, (bits & ((1 << sz) - 1)) as u32, sz)
+            run = 0
+        }
+        i = i + 1
+    }
+    if run > 0 {
+        put_bits(e, (*e).ac_code[set * 256], (*e).ac_len[set * 256] as i32)
+    }
+    return q[0]
+}
+
+fn jpeg_max_size(w: i32, h: i32) -> usize {
+    let pw: usize = (((w + 15) / 16) * 16) as usize
+    let ph: usize = (((h + 15) / 16) * 16) as usize
+    return pw * ph * 3 + 4096
+}
+
+fn write_dht(e: *mut Enc, tc: u32, at: usize, nv: usize) {
+    raw16(e, 0xffc4)
+    raw16(e, (19 + nv) as u32)
+    raw8(e, tc)
+    var i: usize = 0
+    while i < 16 + nv {
+        raw8(e, hex_at((&HUFF_HEX[0]) as u64, at + i))
+        i = i + 1
+    }
+}
+
+fn write_exif(e: *mut Enc, ori: i32) {
+    raw16(e, 0xffe1)
+    raw16(e, 34)
+    raw8(e, 69); raw8(e, 120); raw8(e, 105); raw8(e, 102); raw8(e, 0); raw8(e, 0)   // "Exif\0\0"
+    raw8(e, 77); raw8(e, 77); raw16(e, 42); raw16(e, 0); raw16(e, 8)               // "MM" 42, IFD at 8
+    raw16(e, 1)                                                                     // one entry
+    raw16(e, 0x0112); raw16(e, 3); raw16(e, 0); raw16(e, 1)                         // Orientation, SHORT, count 1
+    raw16(e, ori as u32); raw16(e, 0)
+    raw16(e, 0); raw16(e, 0)                                                        // no next IFD
+}
+
+fn clampf255(v: f32) -> f32 {
+    if v < 0.0f { return 0.0f }
+    if v > 255.0f { return 255.0f }
+    return v
+}
+
+// RGBA8 (row 0 at the top) -> JPEG in `out` (cap octets). Returns the file size, 0 when it does not fit /
+// the arguments are unusable.
+fn jpeg_encode_rgba(rgba: u64, w: i32, h: i32, o: *mut EncOpts, out: u64, cap: usize) -> usize {
+    if w < 1 || h < 1 || w > 65535 || h > 65535 || rgba == 0 || out == 0 { return 0 }
+    var qual: i32 = (*o).quality
+    if qual < 1 { qual = 1 }
+    if qual > 100 { qual = 100 }
+    var e: Enc = Enc {
+        out: out, cap: cap, n: 0, acc: 0, nb: 0, bad: false,
+        dc_code: [0 as u32; 24], dc_len: [0 as u8; 24], ac_code: [0 as u32; 512], ac_len: [0 as u8; 512],
+        qt: [1; 128], dm: [0.0f; 64], zz: [0 as u8; 64],
+    }
+    var scale: i32 = 200 - qual * 2
+    if qual < 50 { scale = 5000 / qual }
+    var i: usize = 0
+    while i < 64 {
+        var a: i32 = ((hex_at((&QL_HEX[0]) as u64, i) as i32) * scale + 50) / 100
+        var b: i32 = ((hex_at((&QC_HEX[0]) as u64, i) as i32) * scale + 50) / 100
+        if a < 1 { a = 1 }
+        if a > 255 { a = 255 }
+        if b < 1 { b = 1 }
+        if b > 255 { b = 255 }
+        e.qt[i] = a
+        e.qt[64 + i] = b
+        e.zz[i] = hex_at((&ZZ_HEX[0]) as u64, i) as u8
+        i = i + 1
+    }
+    var u: usize = 0
+    while u < 8 {
+        var x: usize = 0
+        while x < 8 {
+            var c: f64 = math.cos((((2 * x + 1) * u) as f64) * 3.14159265358979323846 / 16.0)
+            if u == 0 { c = c * 0.35355339059327373 } else { c = c * 0.5 }
+            e.dm[u * 8 + x] = c as f32
+            x = x + 1
+        }
+        u = u + 1
+    }
+    build_table(&e, 0, true, 0)
+    build_table(&e, 28, false, 0)
+    build_table(&e, 28 + 178, true, 1)
+    build_table(&e, 28 + 178 + 28, false, 1)
+
+    let sub: bool = (*o).subsample
+    let mw: i32 = if sub { 16 } else { 8 }
+    let pw: i32 = ((w + mw - 1) / mw) * mw
+    let ph: i32 = ((h + mw - 1) / mw) * mw
+    let cw: i32 = if sub { pw / 2 } else { pw }
+    let ch: i32 = if sub { ph / 2 } else { ph }
+    let ysz: usize = (pw as usize) * (ph as usize) * 4
+    let csz: usize = (cw as usize) * (ch as usize) * 4
+    let yp: u64 = rt.heap_alloc(ysz)
+    let cbp: u64 = rt.heap_alloc(csz)
+    let crp: u64 = rt.heap_alloc(csz)
+    if yp == 0 || cbp == 0 || crp == 0 {
+        if yp != 0 { rt.heap_free(yp, ysz) }
+        if cbp != 0 { rt.heap_free(cbp, csz) }
+        if crp != 0 { rt.heap_free(crp, csz) }
+        return 0
+    }
+    // colour conversion (clamped reads replicate the edge)
+    var y: i32 = 0
+    while y < ph {
+        let sy: i32 = if y < h { y } else { h - 1 }
+        var x: i32 = 0
+        while x < pw {
+            let sx: i32 = if x < w { x } else { w - 1 }
+            let q: u64 = rgba + (((sy * w + sx) * 4) as u64)
+            let r: f32 = (*(q as *mut u8)) as f32
+            let g: f32 = (*((q + 1 as u64) as *mut u8)) as f32
+            let b: f32 = (*((q + 2 as u64) as *mut u8)) as f32
+            *((yp + (((y * pw + x) * 4) as u64)) as *mut f32) = 0.299f * r + 0.587f * g + 0.114f * b
+            if !sub {
+                *((cbp + (((y * pw + x) * 4) as u64)) as *mut f32) = 128.0f - 0.168736f * r - 0.331264f * g + 0.5f * b
+                *((crp + (((y * pw + x) * 4) as u64)) as *mut f32) = 128.0f + 0.5f * r - 0.418688f * g - 0.081312f * b
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if sub {
+        y = 0
+        while y < ch {
+            var x: i32 = 0
+            while x < cw {
+                var sr: f32 = 0.0f
+                var sg: f32 = 0.0f
+                var sb: f32 = 0.0f
+                var dy: i32 = 0
+                while dy < 2 {
+                    var dx: i32 = 0
+                    while dx < 2 {
+                        var sy: i32 = y * 2 + dy
+                        var sx: i32 = x * 2 + dx
+                        if sy >= h { sy = h - 1 }
+                        if sx >= w { sx = w - 1 }
+                        let q: u64 = rgba + (((sy * w + sx) * 4) as u64)
+                        sr = sr + (*(q as *mut u8)) as f32
+                        sg = sg + (*((q + 1 as u64) as *mut u8)) as f32
+                        sb = sb + (*((q + 2 as u64) as *mut u8)) as f32
+                        dx = dx + 1
+                    }
+                    dy = dy + 1
+                }
+                sr = sr * 0.25f
+                sg = sg * 0.25f
+                sb = sb * 0.25f
+                *((cbp + (((y * cw + x) * 4) as u64)) as *mut f32) = 128.0f - 0.168736f * sr - 0.331264f * sg + 0.5f * sb
+                *((crp + (((y * cw + x) * 4) as u64)) as *mut f32) = 128.0f + 0.5f * sr - 0.418688f * sg - 0.081312f * sb
+                x = x + 1
+            }
+            y = y + 1
+        }
+    }
+    // headers
+    raw16(&e, 0xffd8)
+    raw16(&e, 0xffe0); raw16(&e, 16)
+    raw8(&e, 74); raw8(&e, 70); raw8(&e, 73); raw8(&e, 70); raw8(&e, 0)            // "JFIF\0"
+    raw16(&e, 0x0101); raw8(&e, 0); raw16(&e, 1); raw16(&e, 1); raw8(&e, 0); raw8(&e, 0)
+    if (*o).orientation >= 2 && (*o).orientation <= 8 { write_exif(&e, (*o).orientation) }
+    var t: usize = 0
+    while t < 2 {
+        raw16(&e, 0xffdb); raw16(&e, 67); raw8(&e, t as u32)
+        var k: usize = 0
+        while k < 64 {
+            raw8(&e, e.qt[t * 64 + e.zz[k] as usize] as u32)
+            k = k + 1
+        }
+        t = t + 1
+    }
+    raw16(&e, 0xffc0); raw16(&e, 17); raw8(&e, 8)
+    raw16(&e, h as u32); raw16(&e, w as u32); raw8(&e, 3)
+    var yfac: u32 = 0x11
+    if sub { yfac = 0x22 }
+    raw8(&e, 1); raw8(&e, yfac); raw8(&e, 0)
+    raw8(&e, 2); raw8(&e, 0x11); raw8(&e, 1)
+    raw8(&e, 3); raw8(&e, 0x11); raw8(&e, 1)
+    write_dht(&e, 0x00, 0, 12)
+    write_dht(&e, 0x10, 28, 162)
+    write_dht(&e, 0x01, 28 + 178, 12)
+    write_dht(&e, 0x11, 28 + 178 + 28, 162)
+    raw16(&e, 0xffda); raw16(&e, 12); raw8(&e, 3)
+    raw8(&e, 1); raw8(&e, 0x00); raw8(&e, 2); raw8(&e, 0x11); raw8(&e, 3); raw8(&e, 0x11)
+    raw8(&e, 0); raw8(&e, 63); raw8(&e, 0)
+    // scan
+    var pdy: i32 = 0
+    var pcb: i32 = 0
+    var pcr: i32 = 0
+    let mx: i32 = pw / mw
+    let my: i32 = ph / mw
+    var by: i32 = 0
+    while by < my && !e.bad {
+        var bx: i32 = 0
+        while bx < mx {
+            if sub {
+                var s: i32 = 0
+                while s < 4 {
+                    let px0: i32 = bx * 16 + (s & 1) * 8
+                    let py0: i32 = by * 16 + (s >> 1) * 8
+                    pdy = code_block(&e, yp + (((py0 * pw + px0) * 4) as u64), pw as usize, 0, 0, pdy)
+                    s = s + 1
+                }
+                pcb = code_block(&e, cbp + ((((by * 8) * cw + bx * 8) * 4) as u64), cw as usize, 1, 1, pcb)
+                pcr = code_block(&e, crp + ((((by * 8) * cw + bx * 8) * 4) as u64), cw as usize, 1, 1, pcr)
+            } else {
+                pdy = code_block(&e, yp + ((((by * 8) * pw + bx * 8) * 4) as u64), pw as usize, 0, 0, pdy)
+                pcb = code_block(&e, cbp + ((((by * 8) * pw + bx * 8) * 4) as u64), pw as usize, 1, 1, pcb)
+                pcr = code_block(&e, crp + ((((by * 8) * pw + bx * 8) * 4) as u64), pw as usize, 1, 1, pcr)
+            }
+            bx = bx + 1
+        }
+        by = by + 1
+    }
+    if e.nb > 0 { put_bits(&e, 127, 8 - e.nb) }   // pad with 1 bits
+    raw16(&e, 0xffd9)
+    rt.heap_free(yp, ysz)
+    rt.heap_free(cbp, csz)
+    rt.heap_free(crp, csz)
+    if e.bad { return 0 }
+    return e.n
+}
+
+// 3 channel float image (display encoded 0..1) -> JPEG.
+fn jpeg_encode_image(im: *mut image.Image, o: *mut EncOpts, out: u64, cap: usize) -> usize {
+    let n: usize = ((*im).w as usize) * ((*im).h as usize) * 4
+    let tmp: u64 = rt.heap_alloc(n)
+    if tmp == 0 { return 0 }
+    image.img_to_rgba8(im, tmp)
+    let r: usize = jpeg_encode_rgba(tmp, (*im).w, (*im).h, o, out, cap)
+    rt.heap_free(tmp, n)
+    return r
+}
