@@ -1,0 +1,791 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/firncam/ui.fi -- THE CAMERA SCREEN of FirnCam: layout in dp, immediate-mode painter, touch gestures.
+//
+// The UI knows NOTHING about the camera. main.fi copies the state it has into `Ui` once a frame (modes, lenses,
+// manual rows, busy, progress), feeds it the pointer records and the clock, draws, and takes the COMMANDS out
+// (shot, mode, lens, flip, flash, manual, slider, zoom, focus point, gallery). Every control is a command; what a
+// command does is main.fi's / camera.fi's business. Pinch zoom, tap to focus and flash are UI + command only here
+// (stubs for the camera logic); the timer is real (the countdown runs here, then it asks for the shot).
+//
+// Screen (portrait): top bar [flash timer grid ........ manual] over the preview, the preview (cover fit, camview),
+// lens chips and the manual sliders floating over its bottom edge, below it the mode bar (swipe it sideways, it
+// snaps), then the shutter row [last photo | shutter | switch front/back]. Landscape: the shutter row becomes a
+// column on the right, the mode bar floats over the preview bottom.
+//   Gestures: tap = buttons / tap to focus (ring), drag on the mode bar or swipe the preview = next mode,
+//   drag on a slider = value, pinch = zoom, double tap = zoom 1x <-> 2x.
+import std.rt
+import fui.painter
+import fui.gpu
+import fui.icons
+import fui.lucide
+import fui.kittouch
+import fui.preview
+import window.pointers
+
+export {
+    Ui, Cmd, Chip, ui_new, ui_prepare, ui_pointer, ui_gesture, ui_update, ui_draw, ui_take, ui_status, ui_preview_rect,
+    ui_shown_mode, ui_set_zoom,
+    M_PHOTO, M_NIGHT, M_PORTRAIT, M_DOC, M_STACK, M_VIDEO, M_RAW,
+    C_NONE, C_SHOT, C_MODE, C_LENS, C_FLIP, C_FLASH, C_MAN, C_SLIDER, C_ZOOM, C_FOCUS, C_GALLERY, C_TIMER,
+}
+
+// same numbers as the modes in main.fi
+const M_PHOTO: i32 = 0
+const M_NIGHT: i32 = 1
+const M_PORTRAIT: i32 = 2
+const M_DOC: i32 = 3
+const M_STACK: i32 = 4
+const M_VIDEO: i32 = 5
+const M_RAW: i32 = 6
+
+const C_NONE: i32 = 0
+const C_SHOT: i32 = 1        // shutter (photo, or start/stop of the video)
+const C_MODE: i32 = 2        // a = mode
+const C_LENS: i32 = 3        // a = lens index
+const C_FLIP: i32 = 4        // front <-> back
+const C_FLASH: i32 = 5       // a = 0 off, 1 auto, 2 on
+const C_MAN: i32 = 6         // manual sliders on/off
+const C_SLIDER: i32 = 7      // a = row kind (0 ISO, 1 exposure, 2 focus), b = 0..1000
+const C_ZOOM: i32 = 8        // f = zoom factor
+const C_FOCUS: i32 = 9       // f, g = point in the preview, 0..1 from the top left
+const C_GALLERY: i32 = 10
+const C_TIMER: i32 = 11      // a = seconds (information; the countdown is the UI's)
+
+const WHITE: u32 = 0xFFFFFFFF as u32
+const YELLOW: u32 = 0xFFFFD60A as u32
+const RED: u32 = 0xFFE5392F as u32
+const SCRIM: u32 = 0x66000000 as u32
+const PANEL: u32 = 0xFF000000 as u32
+const DIM: u32 = 0xB3FFFFFF as u32
+
+const QMAX: usize = 16
+
+struct Cmd {
+    kind: i32,
+    a: i32,
+    b: i32,
+    f: f64,
+    g: f64,
+}
+
+struct Chip {
+    idx: i32,        // lens index for C_LENS
+    x10: i32,        // zoom ratio against the main lens, times 10 (0.6x = 6, 1x = 10, 2x = 20)
+    sel: bool,
+}
+
+struct Ui {
+    // ---- set by main.fi every frame
+    w: f64,                  // canvas size in pixels
+    h: f64,
+    dp: f64,                 // pixels per dp
+    now: i64,                // ms
+    modes: [i32; 8],         // visible modes in bar order
+    nmodes: i32,
+    mode: i32,               // current mode
+    man_ok: bool,            // the manual button exists
+    manual: bool,
+    nrows: i32,
+    rows: [i32; 3],          // kind of each row: 0 ISO, 1 exposure, 2 focus
+    row_txt: [[u8; 24]; 3],
+    row_n: [usize; 3],
+    sl: [i32; 3],            // slider positions by kind, 0..1000
+    chips: [Chip; 6],
+    nchips: i32,
+    can_flip: bool,
+    busy: bool,
+    recording: bool,
+    progress: i32,           // 0..100 while busy
+    zoom_max: f64,
+    thumb_px: u64,           // premultiplied RGBA, thumb_w x thumb_h (0 = no photo yet)
+    thumb_w: i32,
+    thumb_h: i32,
+    thumb_key: u64,
+    // ---- the UI's own state
+    flash: i32,
+    timer_s: i32,
+    grid: bool,
+    zoom: f64,
+    zoom0: f64,
+    zoom_t: i64,             // last zoom change (the pill shows for a while)
+    shown: f64,              // mode bar position as a fractional mode index
+    last_ms: i64,
+    gown: i32,               // what the running drag belongs to: 0 none, 1 mode bar, 3 preview, 10 + r slider row r
+    fx: f64,                 // focus ring point (px) and start time
+    fy: f64,
+    ft: i64,
+    cd_end: i64,             // countdown end (ms), 0 = none
+    pdown: bool,             // primary pointer is down at (px, py)
+    px: f64,
+    py: f64,
+    status: [u8; 48],
+    status_n: usize,
+    status_t: i64,
+    q: [Cmd; 16],
+    qh: usize,
+    qt: usize,
+}
+
+fn cmd_blank() -> Cmd { return Cmd { kind: 0, a: 0, b: 0, f: 0.0, g: 0.0 } }
+fn chip_blank() -> Chip { return Chip { idx: 0, x10: 10, sel: false } }
+
+fn ui_new() -> Ui {
+    return Ui { w: 0.0, h: 0.0, dp: 2.0, now: 0, modes: [0; 8], nmodes: 0, mode: 0, man_ok: false, manual: false,
+        nrows: 0, rows: [0; 3], row_txt: [[0 as u8; 24]; 3], row_n: [0; 3], sl: [500, 500, 0], chips: [chip_blank(); 6],
+        nchips: 0, can_flip: false, busy: false, recording: false, progress: 0, zoom_max: 8.0, thumb_px: 0,
+        thumb_w: 0, thumb_h: 0, thumb_key: 0, flash: 0, timer_s: 0, grid: false, zoom: 1.0, zoom0: 1.0, zoom_t: 0,
+        shown: 0.0, last_ms: 0, gown: 0, fx: 0.0, fy: 0.0, ft: 0, cd_end: 0, pdown: false, px: 0.0, py: 0.0,
+        status: [0 as u8; 48], status_n: 0, status_t: 0, q: [cmd_blank(); 16], qh: 0, qt: 0 }
+}
+
+// ---------------------------------------------------------------- commands
+fn push(u: *mut Ui, kind: i32, a: i32, b: i32, f: f64, g: f64) {
+    if (*u).qt - (*u).qh >= QMAX { (*u).qh = (*u).qh + 1 }
+    (*u).q[(*u).qt % QMAX] = Cmd { kind: kind, a: a, b: b, f: f, g: g }
+    (*u).qt = (*u).qt + 1
+}
+
+// The next command; false when there is none.
+fn ui_take(u: *mut Ui, out: *mut Cmd) -> bool {
+    if (*u).qh >= (*u).qt { return false }
+    *out = (*u).q[(*u).qh % QMAX]
+    (*u).qh = (*u).qh + 1
+    return true
+}
+
+fn ui_status(u: *mut Ui, s: str) {
+    var i: usize = 0
+    while i < s.n && i < 47 {
+        (*u).status[i] = *((s.p as u64 + i as u64) as *mut u8)
+        i = i + 1
+    }
+    (*u).status_n = i
+    (*u).status_t = (*u).now
+}
+
+fn ui_set_zoom(u: *mut Ui, z: f64) {
+    (*u).zoom = z
+}
+
+// ---------------------------------------------------------------- layout (dp)
+struct Lay {
+    land: bool,
+    pvx: f64, pvy: f64, pvw: f64, pvh: f64,     // the preview
+    top_h: f64,                                 // top bar height
+    mbx: f64, mby: f64, mbw: f64, mbh: f64,     // the mode bar
+    chy: f64,                                   // centre line of the lens chips
+    rowy: f64, rowh: f64,                       // top of the first slider row, row height
+    shx: f64, shy: f64, shr: f64,               // the shutter: centre, outer radius
+    thx: f64, thy: f64, ths: f64,               // last photo: centre, side
+    flx: f64, fly: f64,                         // switch button centre
+}
+
+fn lay(u: *mut Ui) -> Lay {
+    let d: f64 = (*u).dp
+    let w: f64 = (*u).w
+    let h: f64 = (*u).h
+    var l: Lay = Lay { land: false, pvx: 0.0, pvy: 0.0, pvw: w, pvh: h, top_h: 56.0 * d,
+        mbx: 0.0, mby: 0.0, mbw: w, mbh: 44.0 * d, chy: 0.0, rowy: 0.0, rowh: 44.0 * d,
+        shx: 0.0, shy: 0.0, shr: 36.0 * d, thx: 0.0, thy: 0.0, ths: 52.0 * d, flx: 0.0, fly: 0.0 }
+    if w > h {
+        // landscape: the shutter column on the right
+        l.land = true
+        let pw: f64 = 128.0 * d
+        l.pvw = w - pw
+        l.pvh = h
+        l.shx = w - pw / 2.0
+        l.shy = h / 2.0
+        l.thx = l.shx
+        l.thy = h / 2.0 - 100.0 * d
+        l.flx = l.shx
+        l.fly = h / 2.0 + 100.0 * d
+        l.mbx = 0.0
+        l.mbw = l.pvw
+        l.mby = h - 52.0 * d
+        l.chy = l.mby - 28.0 * d
+    } else {
+        let panel: f64 = 164.0 * d
+        l.pvh = h - panel
+        l.mby = h - panel
+        l.shx = w / 2.0
+        l.shy = h - 60.0 * d
+        l.thx = 56.0 * d
+        l.thy = l.shy
+        l.flx = w - 56.0 * d
+        l.fly = l.shy
+        l.chy = l.pvh - 28.0 * d
+    }
+    var rows: f64 = 0.0
+    if (*u).manual { rows = (*u).nrows as f64 }
+    l.rowy = l.chy - 28.0 * d - 4.0 * d - rows * l.rowh
+    return l
+}
+
+// The preview rectangle in whole pixels (main renders the camera into exactly this size).
+fn ui_prepare(u: *mut Ui, w: i32, h: i32, dp: f64, now: i64) {
+    (*u).w = w as f64
+    (*u).h = h as f64
+    var d: f64 = dp
+    if d < 1.0 { d = 1.0 }
+    (*u).dp = d
+    (*u).now = now
+}
+
+fn ui_preview_rect(u: *mut Ui, x: *mut i32, y: *mut i32, w: *mut i32, h: *mut i32) {
+    var l: Lay = lay(u)
+    *x = l.pvx as i32
+    *y = l.pvy as i32
+    *w = l.pvw as i32
+    *h = l.pvh as i32
+}
+
+fn mode_index(u: *mut Ui) -> i32 {
+    var i: i32 = 0
+    while i < (*u).nmodes {
+        if (*u).modes[i as usize] == (*u).mode { return i }
+        i = i + 1
+    }
+    return 0
+}
+
+// the mode the bar shows as selected (nearest to the bar position while it is being dragged)
+fn ui_shown_mode(u: *mut Ui) -> i32 {
+    if (*u).nmodes <= 0 { return (*u).mode }
+    var i: i32 = ((*u).shown + 0.5) as i32
+    if i < 0 { i = 0 }
+    if i >= (*u).nmodes { i = (*u).nmodes - 1 }
+    return (*u).modes[i as usize]
+}
+
+fn item_w(u: *mut Ui) -> f64 { return 92.0 * (*u).dp }
+
+// ---------------------------------------------------------------- input
+fn ui_pointer(u: *mut Ui, p: *mut pointers.Pointer) {
+    if (*p).primary == 0 as u32 { return }
+    if (*p).kind == pointers.PK_DOWN {
+        (*u).pdown = true
+    } else if (*p).kind == pointers.PK_UP || (*p).kind == pointers.PK_CANCEL {
+        (*u).pdown = false
+    }
+    (*u).px = (*p).x
+    (*u).py = (*p).y
+}
+
+fn inside(x: f64, y: f64, rx: f64, ry: f64, rw: f64, rh: f64) -> bool {
+    return x >= rx && y >= ry && x < rx + rw && y < ry + rh
+}
+
+fn near_circle(x: f64, y: f64, cx: f64, cy: f64, r: f64) -> bool {
+    let dx: f64 = x - cx
+    let dy: f64 = y - cy
+    return dx * dx + dy * dy <= r * r
+}
+
+// left-hand top icons: 0 flash, 1 timer, 2 grid; the manual button on the right is 3
+fn top_cell_x(u: *mut Ui, l: *mut Lay, i: i32) -> f64 {
+    let d: f64 = (*u).dp
+    if i == 3 { return (*l).pvw - 12.0 * d - 48.0 * d }
+    return 12.0 * d + (i as f64) * 56.0 * d
+}
+
+fn slider_set(u: *mut Ui, r: i32, x: f64) {
+    var l: Lay = lay(u)
+    let d: f64 = (*u).dp
+    let tx: f64 = 124.0 * d
+    let tw: f64 = l.pvw - tx - 24.0 * d
+    if tw <= 1.0 { return }
+    var v: i32 = (((x - tx) * 1000.0) / tw) as i32
+    if v < 0 { v = 0 }
+    if v > 1000 { v = 1000 }
+    let kind: i32 = (*u).rows[r as usize]
+    (*u).sl[kind as usize] = v
+    push(u, C_SLIDER, kind, v, 0.0, 0.0)
+}
+
+fn row_at(u: *mut Ui, l: *mut Lay, x: f64, y: f64) -> i32 {
+    if !(*u).manual || (*u).nrows <= 0 { return 0 - 1 }
+    if x >= (*l).pvw { return 0 - 1 }
+    var i: i32 = 0
+    while i < (*u).nrows {
+        let ry: f64 = (*l).rowy + (i as f64) * (*l).rowh
+        if y >= ry && y < ry + (*l).rowh { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn press_shutter(u: *mut Ui) {
+    if (*u).cd_end > 0 { (*u).cd_end = 0; return }
+    if (*u).busy && !(*u).recording { return }
+    if (*u).recording { push(u, C_SHOT, 0, 0, 0.0, 0.0); return }
+    if (*u).timer_s > 0 {
+        (*u).cd_end = (*u).now + ((*u).timer_s as i64) * 1000
+        return
+    }
+    push(u, C_SHOT, 0, 0, 0.0, 0.0)
+}
+
+fn set_mode_index(u: *mut Ui, i: i32) {
+    if i < 0 || i >= (*u).nmodes { return }
+    if (*u).modes[i as usize] != (*u).mode { push(u, C_MODE, (*u).modes[i as usize], 0, 0.0, 0.0) }
+}
+
+fn on_tap(u: *mut Ui, x: f64, y: f64) {
+    var l: Lay = lay(u)
+    let d: f64 = (*u).dp
+    // top bar
+    if y < l.top_h && x < l.pvw {
+        var c: i32 = 0
+        while c < 4 {
+            let cx: f64 = top_cell_x(u, &l, c)
+            if x >= cx - 4.0 * d && x < cx + 52.0 * d {
+                if c == 0 {
+                    (*u).flash = ((*u).flash + 1) % 3
+                    push(u, C_FLASH, (*u).flash, 0, 0.0, 0.0)
+                } else if c == 1 {
+                    var t: i32 = 0
+                    if (*u).timer_s == 0 { t = 3 } else if (*u).timer_s == 3 { t = 10 }
+                    (*u).timer_s = t
+                    push(u, C_TIMER, t, 0, 0.0, 0.0)
+                } else if c == 2 {
+                    (*u).grid = !(*u).grid
+                } else if (*u).man_ok {
+                    push(u, C_MAN, 0, 0, 0.0, 0.0)
+                }
+                return
+            }
+            c = c + 1
+        }
+    }
+    if near_circle(x, y, l.shx, l.shy, l.shr + 12.0 * d) { press_shutter(u); return }
+    if near_circle(x, y, l.thx, l.thy, l.ths * 0.7 + 8.0 * d) { push(u, C_GALLERY, 0, 0, 0.0, 0.0); return }
+    if (*u).can_flip && near_circle(x, y, l.flx, l.fly, 32.0 * d) && !(*u).recording { push(u, C_FLIP, 0, 0, 0.0, 0.0); return }
+    // lens chips: centred on the preview width
+    if (*u).nchips > 0 && y >= l.chy - 24.0 * d && y < l.chy + 24.0 * d && x < l.pvw {
+        let cw: f64 = 48.0 * d
+        let x0: f64 = l.pvw / 2.0 - cw * ((*u).nchips as f64) / 2.0
+        var i: i32 = 0
+        while i < (*u).nchips {
+            if x >= x0 + (i as f64) * cw && x < x0 + ((i + 1) as f64) * cw {
+                if !(*u).recording { push(u, C_LENS, (*u).chips[i as usize].idx, 0, 0.0, 0.0) }
+                return
+            }
+            i = i + 1
+        }
+    }
+    // mode labels
+    if inside(x, y, l.mbx, l.mby - 4.0 * d, l.mbw, l.mbh + 8.0 * d) && (*u).nmodes > 0 {
+        let iw: f64 = item_w(u)
+        let cx: f64 = l.mbx + l.mbw / 2.0
+        let k: i32 = (((x - cx) / iw) + (*u).shown + 0.5 + 1000.0) as i32 - 1000
+        if !(*u).recording && !(*u).busy { set_mode_index(u, k) }
+        return
+    }
+    // manual rows: a tap sets the value
+    let r: i32 = row_at(u, &l, x, y)
+    if r >= 0 { slider_set(u, r, x); return }
+    // the preview: tap to focus
+    if inside(x, y, l.pvx, l.pvy + l.top_h, l.pvw, l.pvh - l.top_h) {
+        (*u).fx = x
+        (*u).fy = y
+        (*u).ft = (*u).now
+        push(u, C_FOCUS, 0, 0, (x - l.pvx) / l.pvw, (y - l.pvy) / l.pvh)
+    }
+}
+
+fn clampz(u: *mut Ui, z: f64) -> f64 {
+    var k: f64 = z
+    if k < 1.0 { k = 1.0 }
+    if k > (*u).zoom_max { k = (*u).zoom_max }
+    return k
+}
+
+fn zoom_to(u: *mut Ui, z: f64) {
+    let k: f64 = clampz(u, z)
+    (*u).zoom = k
+    (*u).zoom_t = (*u).now
+    push(u, C_ZOOM, 0, 0, k, 0.0)
+}
+
+fn ui_gesture(u: *mut Ui, e: *mut kittouch.Gesture) {
+    var l: Lay = lay(u)
+    let d: f64 = (*u).dp
+    let k: u32 = (*e).kind
+    if k == kittouch.TG_TAP {
+        on_tap(u, (*e).x, (*e).y)
+    } else if k == kittouch.TG_DOUBLE_TAP {
+        if inside((*e).x, (*e).y, l.pvx, l.pvy + l.top_h, l.pvw, l.pvh - l.top_h - 80.0 * d) && (*u).gown == 0 {
+            if (*u).zoom > 1.01 { zoom_to(u, 1.0) } else { zoom_to(u, 2.0) }
+        }
+    } else if k == kittouch.TG_PAN_START {
+        let sx: f64 = (*e).x - (*e).tx
+        let sy: f64 = (*e).y - (*e).ty
+        (*u).gown = 0
+        if inside(sx, sy, l.mbx, l.mby - 8.0 * d, l.mbw, l.mbh + 16.0 * d) && (*u).nmodes > 0 {
+            (*u).gown = 1
+        } else {
+            let r: i32 = row_at(u, &l, sx, sy)
+            if r >= 0 {
+                (*u).gown = 10 + r
+                slider_set(u, r, (*e).x)
+            } else if inside(sx, sy, l.pvx, l.pvy + l.top_h, l.pvw, l.pvh - l.top_h) {
+                (*u).gown = 3
+            }
+        }
+    } else if k == kittouch.TG_PAN_MOVE {
+        if (*u).gown == 1 {
+            (*u).shown = (*u).shown - (*e).dx / item_w(u)
+            if (*u).shown < 0.0 - 0.4 { (*u).shown = 0.0 - 0.4 }
+            let mx: f64 = ((*u).nmodes as f64) - 0.6
+            if (*u).shown > mx { (*u).shown = mx }
+        } else if (*u).gown >= 10 {
+            slider_set(u, (*u).gown - 10, (*e).x)
+        }
+    } else if k == kittouch.TG_PAN_END {
+        if (*u).gown == 1 && !(*u).busy && !(*u).recording {
+            var t: f64 = (*u).shown - (*e).vx / item_w(u) * 0.12
+            if t < 0.0 { t = 0.0 }
+            let mx: f64 = ((*u).nmodes as f64) - 1.0
+            if t > mx { t = mx }
+            set_mode_index(u, (t + 0.5) as i32)
+        } else if (*u).gown == 3 && !(*u).busy && !(*u).recording {
+            // a sideways swipe over the preview: next / previous mode
+            var ax: f64 = (*e).tx
+            var ay: f64 = (*e).ty
+            if ax < 0.0 { ax = 0.0 - ax }
+            if ay < 0.0 { ay = 0.0 - ay }
+            if ax > 90.0 * d && ax > ay * 1.5 {
+                let cur: i32 = mode_index(u)
+                if (*e).tx < 0.0 { set_mode_index(u, cur + 1) } else { set_mode_index(u, cur - 1) }
+            }
+        }
+        (*u).gown = 0
+    } else if k == kittouch.TG_PINCH_START {
+        (*u).zoom0 = (*u).zoom
+        (*u).gown = 4
+    } else if k == kittouch.TG_PINCH_MOVE {
+        zoom_to(u, (*u).zoom0 * (*e).scale)
+    } else if k == kittouch.TG_PINCH_END {
+        (*u).gown = 0
+    }
+}
+
+// once a frame: the countdown, the mode bar easing
+fn ui_update(u: *mut Ui) {
+    var dt: i64 = (*u).now - (*u).last_ms
+    if dt < 0 || dt > 200 { dt = 16 }
+    (*u).last_ms = (*u).now
+    if (*u).cd_end > 0 && (*u).now >= (*u).cd_end {
+        (*u).cd_end = 0
+        push(u, C_SHOT, 0, 0, 0.0, 0.0)
+    }
+    if (*u).gown != 1 {
+        let tgt: f64 = mode_index(u) as f64
+        var k: f64 = (dt as f64) * 0.016
+        if k > 1.0 { k = 1.0 }
+        (*u).shown = (*u).shown + (tgt - (*u).shown) * k
+    }
+}
+
+// ---------------------------------------------------------------- drawing
+fn with_alpha(col: u32, a: f64) -> u32 {
+    var v: i32 = (a * 255.0) as i32
+    if v < 1 { v = 1 }
+    if v > 255 { v = 255 }
+    let rgb: u32 = col & (0x00FFFFFF as u32)
+    return rgb | ((v as u32) << 24)
+}
+
+fn circle(z: *mut painter.Painter, cx: f64, cy: f64, r: f64, col: u32) {
+    painter.round_rect(z, cx - r, cy - r, 2.0 * r, 2.0 * r, r, col)
+}
+
+fn ring(z: *mut painter.Painter, cx: f64, cy: f64, r: f64, st: f64, col: u32) {
+    painter.round_ring(z, cx - r, cy - r, 2.0 * r, 2.0 * r, r, st, col)
+}
+
+// text centred / aligned in (x, w) around the vertical centre cy
+fn label(u: *mut Ui, z: *mut painter.Painter, x: f64, cy: f64, w: f64, sz: f64, col: u32, p: u64, n: usize,
+    al: u32) {
+    let size: f64 = sz * (*u).dp
+    let hh: f64 = size * 1.6
+    let by: f64 = painter.text_baseline_mid(z, cy - hh / 2.0, hh, size)
+    painter.text(z, x, by, w, size, col, p, n, al)
+}
+
+fn labels(u: *mut Ui, z: *mut painter.Painter, x: f64, cy: f64, w: f64, sz: f64, col: u32, s: str, al: u32) {
+    label(u, z, x, cy, w, sz, col, s.p as u64, s.n, al)
+}
+
+// decimal into a buffer; returns the new length
+fn put_int(b: *mut [u8; 24], at: usize, v: i64) -> usize {
+    var tmp: [u8; 24] = [0 as u8; 24]
+    var n: usize = 0
+    var x: i64 = v
+    if x < 0 { x = 0 - x }
+    if x == 0 { tmp[0] = 48 as u8; n = 1 }
+    while x > 0 && n < 20 {
+        tmp[n] = (48 + (x % 10)) as u8
+        x = x / 10
+        n = n + 1
+    }
+    var o: usize = at
+    var i: usize = 0
+    while i < n && o < 23 {
+        (*b)[o] = tmp[n - 1 - i]
+        o = o + 1
+        i = i + 1
+    }
+    return o
+}
+
+fn bstr(b: *mut [u8; 24], n: usize) -> str {
+    var s: str = ""
+    s.p = (&(*b)[0]) as u64 as *mut u8
+    s.n = n
+    return s
+}
+
+fn mode_label(m: i32) -> str {
+    if m == M_PHOTO { return "Photo" }
+    if m == M_NIGHT { return "Night" }
+    if m == M_PORTRAIT { return "Portrait" }
+    if m == M_DOC { return "Scan" }
+    if m == M_STACK { return "Stack" }
+    if m == M_VIDEO { return "Video" }
+    return "RAW"
+}
+
+fn draw_top(u: *mut Ui, z: *mut painter.Painter, l: *mut Lay) {
+    let d: f64 = (*u).dp
+    painter.surface(z, (*l).pvx, (*l).pvy, (*l).pvw, (*l).top_h, SCRIM)
+    let cy: f64 = (*l).pvy + (*l).top_h / 2.0
+    var c: i32 = 0
+    while c < 4 {
+        if c < 3 || (*u).man_ok {
+            let cx: f64 = top_cell_x(u, l, c)
+            var id: i64 = lucide.ZAP
+            var col: u32 = WHITE
+            if c == 0 {
+                if (*u).flash == 0 { id = lucide.ZAP_OFF } else if (*u).flash == 2 { col = YELLOW }
+            } else if c == 1 {
+                id = lucide.TIMER_OFF
+                if (*u).timer_s > 0 { id = lucide.TIMER; col = YELLOW }
+            } else if c == 2 {
+                id = lucide.GRID_3X3
+                if (*u).grid { col = YELLOW }
+            } else {
+                id = lucide.SLIDERS_HORIZONTAL
+                if (*u).manual { col = YELLOW }
+            }
+            icons.icon(z, id, cx + 12.0 * d, cy - 12.0 * d, 24.0 * d, col)
+            // small tag next to the icon: A for auto flash, seconds for the timer
+            if c == 0 && (*u).flash == 1 {
+                labels(u, z, cx + 36.0 * d, cy - 8.0 * d, 14.0 * d, 11.0, WHITE, "A", painter.TEXT_L)
+            }
+            if c == 1 && (*u).timer_s > 0 {
+                var b: [u8; 24] = [0 as u8; 24]
+                let n: usize = put_int(&b, 0, (*u).timer_s as i64)
+                label(u, z, cx + 36.0 * d, cy - 8.0 * d, 24.0 * d, 11.0, YELLOW, (&b[0]) as u64, n, painter.TEXT_L)
+            }
+        }
+        c = c + 1
+    }
+}
+
+fn draw_grid(u: *mut Ui, z: *mut painter.Painter, l: *mut Lay) {
+    let t: f64 = (*u).dp
+    let col: u32 = 0x80FFFFFF as u32
+    var i: i32 = 1
+    while i < 3 {
+        let fx: f64 = (*l).pvx + (*l).pvw * (i as f64) / 3.0
+        let fy: f64 = (*l).pvy + (*l).pvh * (i as f64) / 3.0
+        painter.surface(z, fx - t / 2.0, (*l).pvy, t, (*l).pvh, col)
+        painter.surface(z, (*l).pvx, fy - t / 2.0, (*l).pvw, t, col)
+        i = i + 1
+    }
+}
+
+fn draw_modes(u: *mut Ui, z: *mut painter.Painter, l: *mut Lay) {
+    let d: f64 = (*u).dp
+    if (*l).land { painter.surface(z, (*l).mbx, (*l).mby, (*l).mbw, (*l).mbh, SCRIM) }
+    let iw: f64 = item_w(u)
+    let cx: f64 = (*l).mbx + (*l).mbw / 2.0
+    let cy: f64 = (*l).mby + (*l).mbh / 2.0
+    let sel: i32 = (((*u).shown + 0.5 + 1000.0) as i32) - 1000
+    var i: i32 = 0
+    while i < (*u).nmodes {
+        let off: f64 = (i as f64) - (*u).shown
+        var ao: f64 = off
+        if ao < 0.0 { ao = 0.0 - ao }
+        var al: f64 = 1.0 - ao * 0.3
+        if al < 0.12 { al = 0.12 }
+        var col: u32 = with_alpha(WHITE, al * 0.75)
+        if i == sel { col = YELLOW }
+        let m: str = mode_label((*u).modes[i as usize])
+        labels(u, z, cx + off * iw - iw / 2.0, cy, iw, 14.0, col, m, painter.TEXT_M)
+        i = i + 1
+    }
+    // a small dot under the selected mode
+    circle(z, cx, (*l).mby + (*l).mbh - 3.0 * d, 2.0 * d, YELLOW)
+}
+
+fn draw_chips(u: *mut Ui, z: *mut painter.Painter, l: *mut Lay) {
+    if (*u).nchips <= 0 { return }
+    let d: f64 = (*u).dp
+    let cw: f64 = 48.0 * d
+    let x0: f64 = (*l).pvw / 2.0 - cw * ((*u).nchips as f64) / 2.0
+    var i: i32 = 0
+    while i < (*u).nchips {
+        let ch: *mut Chip = &(*u).chips[i as usize]
+        let cx: f64 = x0 + ((i as f64) + 0.5) * cw
+        var r: f64 = 15.0 * d
+        var col: u32 = WHITE
+        if (*ch).sel { r = 18.0 * d; col = YELLOW }
+        circle(z, cx, (*l).chy, r, 0x99000000 as u32)
+        var b: [u8; 24] = [0 as u8; 24]
+        var n: usize = 0
+        let whole: i64 = ((*ch).x10 / 10) as i64
+        let frac: i64 = ((*ch).x10 % 10) as i64
+        n = put_int(&b, 0, whole)
+        if frac != 0 {
+            b[n] = 46 as u8
+            n = put_int(&b, n + 1, frac)
+        }
+        if (*ch).sel { b[n] = 120 as u8; n = n + 1 }
+        label(u, z, cx - cw / 2.0, (*l).chy, cw, 12.0, col, (&b[0]) as u64, n, painter.TEXT_M)
+        i = i + 1
+    }
+}
+
+fn draw_rows(u: *mut Ui, z: *mut painter.Painter, l: *mut Lay) {
+    if !(*u).manual || (*u).nrows <= 0 { return }
+    let d: f64 = (*u).dp
+    painter.round_rect(z, 8.0 * d, (*l).rowy, (*l).pvw - 16.0 * d, (*l).rowh * ((*u).nrows as f64), 14.0 * d, 0x99000000 as u32)
+    let tx: f64 = 124.0 * d
+    let tw: f64 = (*l).pvw - tx - 24.0 * d
+    var i: i32 = 0
+    while i < (*u).nrows {
+        let cy: f64 = (*l).rowy + ((i as f64) + 0.5) * (*l).rowh
+        let kind: i32 = (*u).rows[i as usize]
+        var ln: [u8; 24] = (*u).row_txt[i as usize]
+        label(u, z, 20.0 * d, cy, 100.0 * d, 13.0, YELLOW, (&ln[0]) as u64, (*u).row_n[i as usize], painter.TEXT_L)
+        painter.round_rect(z, tx, cy - 1.5 * d, tw, 3.0 * d, 1.5 * d, 0x66FFFFFF as u32)
+        let kx: f64 = tx + tw * ((*u).sl[kind as usize] as f64) / 1000.0
+        painter.round_rect(z, tx, cy - 1.5 * d, kx - tx, 3.0 * d, 1.5 * d, YELLOW)
+        circle(z, kx, cy, 10.0 * d, WHITE)
+        i = i + 1
+    }
+}
+
+fn draw_shutter(u: *mut Ui, z: *mut painter.Painter, l: *mut Lay) {
+    let d: f64 = (*u).dp
+    if !(*l).land { painter.surface(z, 0.0, (*l).mby, (*u).w, (*u).h - (*l).mby, PANEL) } else {
+        painter.surface(z, (*l).pvw, 0.0, (*u).w - (*l).pvw, (*u).h, PANEL)
+    }
+    let cx: f64 = (*l).shx
+    let cy: f64 = (*l).shy
+    var down: bool = (*u).pdown && near_circle((*u).px, (*u).py, cx, cy, (*l).shr + 12.0 * d)
+    var ringc: u32 = WHITE
+    if (*u).busy && !(*u).recording { ringc = 0x66FFFFFF as u32 }
+    ring(z, cx, cy, (*l).shr - 2.0 * d, 4.0 * d, ringc)
+    var core: f64 = 29.0 * d
+    if down { core = 26.0 * d }
+    if (*u).recording {
+        // stop: a red rounded square
+        painter.round_rect(z, cx - 15.0 * d, cy - 15.0 * d, 30.0 * d, 30.0 * d, 6.0 * d, RED)
+    } else if (*u).busy {
+        circle(z, cx, cy, core, 0xFF808080 as u32)
+    } else if (*u).mode == M_VIDEO {
+        circle(z, cx, cy, core, RED)
+    } else if (*u).cd_end > 0 {
+        circle(z, cx, cy, core, YELLOW)
+    } else {
+        circle(z, cx, cy, core, WHITE)
+    }
+    // last photo
+    let s: f64 = (*l).ths
+    let tx: f64 = (*l).thx - s / 2.0
+    let ty: f64 = (*l).thy - s / 2.0
+    if (*u).thumb_px != 0 && (*u).thumb_w > 0 {
+        var src: preview.Src = preview.src_rgba((*u).thumb_px, (*u).thumb_w, (*u).thumb_h, (*u).thumb_key)
+        preview.preview_draw(z, gpu.gpu_of(painter.painter_canvas(z)), &src, tx, ty, s, s, 1.0, 0.0, 0.0)
+    } else {
+        painter.round_rect(z, tx, ty, s, s, 10.0 * d, 0xFF262626 as u32)
+    }
+    painter.round_ring(z, tx, ty, s, s, 10.0 * d, 1.5 * d, 0x66FFFFFF as u32)
+    // switch front / back
+    if (*u).can_flip {
+        circle(z, (*l).flx, (*l).fly, 24.0 * d, 0xFF262626 as u32)
+        icons.icon(z, lucide.SWITCH_CAMERA, (*l).flx - 12.0 * d, (*l).fly - 12.0 * d, 24.0 * d, WHITE)
+    }
+}
+
+fn draw_focus_ring(u: *mut Ui, z: *mut painter.Painter) {
+    if (*u).ft == 0 { return }
+    let age: i64 = (*u).now - (*u).ft
+    if age > 1800 { return }
+    let d: f64 = (*u).dp
+    var k: f64 = 1.0
+    if age < 200 { k = 1.4 - 0.4 * (age as f64) / 200.0 }
+    var a: f64 = 1.0
+    if age > 1200 { a = 1.0 - ((age - 1200) as f64) / 600.0 }
+    let r: f64 = 34.0 * d * k
+    ring(z, (*u).fx, (*u).fy, r, 2.0 * d, with_alpha(YELLOW, a))
+}
+
+fn draw_status(u: *mut Ui, z: *mut painter.Painter, l: *mut Lay) {
+    let d: f64 = (*u).dp
+    let cx: f64 = (*l).pvw / 2.0
+    let y: f64 = (*l).pvy + (*l).top_h + 6.0 * d
+    if (*u).busy {
+        // progress bar under the top bar
+        painter.surface(z, 0.0, (*l).pvy + (*l).top_h, (*l).pvw, 3.0 * d, 0x55FFFFFF as u32)
+        painter.surface(z, 0.0, (*l).pvy + (*l).top_h, (*l).pvw * (((*u).progress as f64) / 100.0), 3.0 * d, YELLOW)
+    }
+    if (*u).status_n > 0 && ((*u).now - (*u).status_t < 3500 || (*u).busy || (*u).recording) {
+        var s: str = ""
+        s.p = (&(*u).status[0]) as u64 as *mut u8
+        s.n = (*u).status_n
+        let tw: f64 = painter.text_width(z, s.p as u64, s.n, 13.0 * d) + 28.0 * d
+        painter.round_rect(z, cx - tw / 2.0, y + 6.0 * d, tw, 30.0 * d, 15.0 * d, 0x99000000 as u32)
+        labels(u, z, cx - tw / 2.0, y + 21.0 * d, tw, 13.0, WHITE, s, painter.TEXT_M)
+    }
+    // zoom pill
+    if (*u).zoom > 1.01 && (*u).now - (*u).zoom_t < 1500 {
+        var b: [u8; 24] = [0 as u8; 24]
+        let z10: i64 = (((*u).zoom * 10.0) + 0.5) as i64
+        var n: usize = put_int(&b, 0, z10 / 10)
+        b[n] = 46 as u8
+        n = put_int(&b, n + 1, z10 % 10)
+        b[n] = 120 as u8
+        n = n + 1
+        var rows_h: f64 = 0.0
+        if (*u).manual { rows_h = ((*u).nrows as f64) * (*l).rowh }
+        let py: f64 = (*l).chy - 28.0 * d - 22.0 * d - rows_h
+        painter.round_rect(z, cx - 28.0 * d, py - 14.0 * d, 56.0 * d, 28.0 * d, 14.0 * d, 0x99000000 as u32)
+        label(u, z, cx - 28.0 * d, py, 56.0 * d, 14.0, YELLOW, (&b[0]) as u64, n, painter.TEXT_M)
+    }
+}
+
+fn draw_countdown(u: *mut Ui, z: *mut painter.Painter, l: *mut Lay) {
+    if (*u).cd_end <= 0 { return }
+    let left: i64 = ((*u).cd_end - (*u).now + 999) / 1000
+    var b: [u8; 24] = [0 as u8; 24]
+    let n: usize = put_int(&b, 0, left)
+    label(u, z, (*l).pvx, (*l).pvy + (*l).pvh / 2.0, (*l).pvw, 96.0, WHITE, (&b[0]) as u64, n, painter.TEXT_M)
+}
+
+// Everything except the preview picture itself (main draws that first, into ui_preview_rect).
+fn ui_draw(u: *mut Ui, z: *mut painter.Painter) {
+    var l: Lay = lay(u)
+    if (*u).grid { draw_grid(u, z, &l) }
+    draw_focus_ring(u, z)
+    draw_countdown(u, z, &l)
+    draw_top(u, z, &l)
+    draw_status(u, z, &l)
+    draw_rows(u, z, &l)
+    draw_chips(u, z, &l)
+    draw_shutter(u, z, &l)
+    draw_modes(u, z, &l)
+}
