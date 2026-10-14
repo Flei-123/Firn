@@ -75,6 +75,13 @@ S = [
 ("L_REC_FAILED", "video recorder setup failed"),
 ("C_DOWNLOADS", "android/provider/MediaStore$Downloads"),
 ("S_DOWNLOAD", "Download/FirnCam"),
+("C_INTENT", "android/content/Intent"),
+("S_ACTION_VIEW", "android.intent.action.VIEW"),
+("G_INTENT_INIT", "(Ljava/lang/String;Landroid/net/Uri;)V"),
+("N_SET_FLAGS", "setFlags"),
+("G_SET_FLAGS", "(I)Landroid/content/Intent;"),
+("N_START_ACT", "startActivity"),
+("G_START_ACT", "(Landroid/content/Intent;)V"),
 ]
 txt = ""
 offs = []
