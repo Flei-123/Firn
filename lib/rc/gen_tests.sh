@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 MOD=tests/modules/rc.fi
 
-erzeuge() {                 # $1 = body, $2 = target file
+generate() {                 # $1 = body, $2 = target file
     local rumpf="$1" ziel="$2"
     {
         head -1 "$rumpf"
@@ -27,23 +27,23 @@ erzeuge() {                 # $1 = body, $2 = target file
 }
 
 for r in lib/rc/parts/5*.fi; do
-    erzeuge "$r" "tests/$(basename "$r")"
+    generate "$r" "tests/$(basename "$r")"
     echo "  tests/$(basename "$r")"
 done
 for r in lib/rc/parts/neg_*.fi; do
     n=$(basename "$r"); n=${n#neg_}
-    erzeuge "$r" "tests/neg/$n"
+    generate "$r" "tests/neg/$n"
     echo "  tests/neg/$n"
 done
 
 # Round 47: the same mechanism for `Arc[T]` (lib/rc/arc.fi).
 MOD=lib/rc/arc.fi
 for r in lib/rc/parts/83*.fi; do
-    erzeuge "$r" "tests/$(basename "$r")"
+    generate "$r" "tests/$(basename "$r")"
     echo "  tests/$(basename "$r")"
 done
 for r in lib/rc/parts/negarc_*.fi; do
     n=$(basename "$r"); n=${n#negarc_}
-    erzeuge "$r" "tests/neg/$n"
+    generate "$r" "tests/neg/$n"
     echo "  tests/neg/$n"
 done

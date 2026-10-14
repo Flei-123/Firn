@@ -50,7 +50,7 @@ def finde(tab, starts, adr):
     return tab[k][1]
 
 
-KOPF = re.compile(r"^(c?fn)=\((\d+)\)(?:\s+(.*))?$")
+HEAD = re.compile(r"^(c?fn)=\((\d+)\)(?:\s+(.*))?$")
 
 
 def read_cg(path):
@@ -66,7 +66,7 @@ def read_cg(path):
             z = z.rstrip("\n")
             if not z:
                 continue
-            m = KOPF.match(z)
+            m = HEAD.match(z)
             if m:
                 kind, ident, name = m.group(1), m.group(2), m.group(3)
                 if name:
