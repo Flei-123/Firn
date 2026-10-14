@@ -735,8 +735,12 @@ fn thunk_asm(name: &str, argc: u32) -> String {
 /// of `xmm` room keep it 0 -- which is exactly what System V wants at a
 /// `call`.
 fn cb_thunk_asm(sym: &str, argc: u32) -> String {
+    win64_thunk_asm(&cb_thunk(sym), sym, argc)
+}
+
+/// Win64 entry `t` -> System V function `sym` (see `cb_thunk_asm`).
+fn win64_thunk_asm(t: &str, sym: &str, argc: u32) -> String {
     let mut s = String::new();
-    let t = cb_thunk(sym);
     s.push_str(&format!("\n.globl {}\n{}:\n", t, t));
     s.push_str(&format!(
         "    # Win64 -> System V for {}({} arguments)\n",
@@ -974,13 +978,37 @@ pub fn start_asm(gc_init: Option<&str>, seam_init: &str, argv_sym: &str, main_sy
     s
 }
 
+/// **DLL entry** (`--shared --target=x86_64-windows`). Win64: `ecx` = hinstance, `edx` = reason.
+/// On `DLL_PROCESS_ATTACH` (1) only the seam init runs (standard handles); the collector and the
+/// thread block start lazily on the first export call. Always returns TRUE.
+pub fn dll_entry_asm(seam_init: &str) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(".globl {}\n{}:\n", DLL_ENTRY, DLL_ENTRY));
+    s.push_str("    cmp edx, 1\n    jne .L__dll_done\n");
+    s.push_str("    push rbp\n    mov rbp, rsp\n    push rsi\n    push rdi\n    sub rsp, 160\n");
+    for k in 0..10u32 {
+        s.push_str(&format!("    movaps [rsp+{}], xmm{}\n", k * 16, k + 6));
+    }
+    s.push_str(&format!("    call {}\n", seam_init));
+    for k in 0..10u32 {
+        s.push_str(&format!("    movaps xmm{}, [rsp+{}]\n", k + 6, k * 16));
+    }
+    s.push_str("    add rsp, 160\n    pop rdi\n    pop rsi\n    pop rbp\n");
+    s.push_str(".L__dll_done:\n    mov eax, 1\n    ret\n");
+    s
+}
+
+/// The linker entry symbol of a DLL.
+pub const DLL_ENTRY: &str = "__firn_dll_entry";
+
 /// Everything the Windows target adds at the END of the assembly file:
 /// the thunks, the stack probe and the import table.
 pub fn runtime_asm() -> String {
     let used: Vec<String> = USED.with(|u| u.borrow().iter().cloned().collect());
     let mut s = String::new();
     let any_cb = CBUSED.with(|c| !c.borrow().is_empty());
-    if used.is_empty() && !probed() && !sysstub_used() && !any_cb && !thread_main_used() {
+    let any_export = crate::target::shared() && !crate::extfn::export_names().is_empty();
+    if used.is_empty() && !probed() && !sysstub_used() && !any_cb && !thread_main_used() && !any_export {
         return s;
     }
     s.push_str("\n# ==== round WINDOWS: the boundary to Win32 ====\n");
@@ -997,6 +1025,12 @@ pub fn runtime_asm() -> String {
         CBUSED.with(|c| c.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect());
     for (sym, argc) in &cbs {
         s.push_str(&cb_thunk_asm(sym, *argc));
+    }
+    if crate::target::shared() {
+        for (internal, c_name, argc, _) in crate::extfn::export_thunk_info() {
+            let target = crate::codegen_x86::label(&internal);
+            s.push_str(&win64_thunk_asm(&c_name, &target, argc as u32));
+        }
     }
     if probed() {
         s.push_str(&chkstk_asm());
