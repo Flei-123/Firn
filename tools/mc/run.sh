@@ -39,5 +39,10 @@ if [ -z "$ONLY" ] || [ "$ONLY" = wine ]; then
     echo "== mc/wine =="
     bash tools/mc/play/run_wine.sh || ERR=$((ERR+1))
 fi
+# mcplay with LOD rings (MCPLAY_LOD, mc_stream) against the real server: ~2 min, needs Xvfb + xdotool + java.
+if [ -z "$ONLY" ] || [ "$ONLY" = lodplay ]; then
+    echo "== mc/lodplay =="
+    bash tools/mc/play/run_lod.sh || ERR=$((ERR+1))
+fi
 if [ $ERR -eq 0 ]; then echo "RESULT mc: ok"; else echo "RESULT mc: $ERR failing parts"; fi
 exit $ERR

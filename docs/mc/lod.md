@@ -89,3 +89,19 @@ Screen-door (ordered dither) fade between two representations of a column, in th
 - Translucent fade-out columns (`lod_draw_trans`) are drawn back to front now (farthest ring distance squared first, ties by table index); tests/2918 records the translucent
   draws with a recording back end: old code 15..36 draws out of order, new 0 (checks 78/79).
 - Gate floor `fog_flat` is back to 75 dB: dump.fi renders that scene with `raster_set_edge_expand(false)` (the arithmetic is what it checks), the expansion stays on for all other scenes.
+
+## Client integration + ring bench (z4, 14.10.)
+- mcplay can draw through mc_stream instead of mc_render_world: `MCPLAY_LOD=<n>` (LOD up to n chunks beyond `MCPLAY_VIEW`, implies the stream) or `MCPLAY_STREAM=1` (stream without LOD, control).
+  With LOD the client asks the server for n chunks (`client_send_settings`), `dist` of the stream = MCPLAY_VIEW (full detail), `lod_dist` = n; fog and far plane use n. The stream meshes inline (pool 0, the budgets of mc_stream apply).
+  Column unload packets go to `stream_chunk_unloaded`, edits to `stream_mark_block`, the moving light region marks its sections through `stream_mark_section` (`stream_region_follow`). Resize frees the stream before the raster changes and re-announces every loaded column.
+  Default stays `mc_render_world` (no behaviour change without the env vars). End line: `mcplay: stream sections=.. lod_cols=.. lod_tris=..`.
+- `bash tools/mc/play/run_lod.sh` (heavy, java server): run A view 3 + LOD 9 vs run B view 3 without LOD; checks frames, more chunks in A, LOD columns/triangles drawn in A and none in B. `RESULT mc-play-lod: ok`.
+- Ring bench `tools/mc/stream/run.sh --bench 8 8 ring` (terrain world, radius 8, CPU raster 160x90, llvmpipe-class machine, NO GPU, shared load ~20): same horizon as full detail vs near ring 3 + LOD ring.
+  | | full detail | near 3 + LOD |
+  | --- | --- | --- |
+  | tris/frame | 108,254 | 59,327 (-45 %) |
+  | draw (CPU raster) | 61.5 ms | 37.7 ms (-39 %) |
+  | sections drawn/frame | 728 | 162 |
+  | cull search | 1149 us | 263 us |
+  | converge (inline meshing, whole window) | 3527 ms | 731 ms |
+  Real GPU numbers still missing (Boss).
