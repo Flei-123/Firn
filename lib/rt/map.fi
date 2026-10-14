@@ -24,6 +24,10 @@
 //   * `K` and `V` are scalars. Strings as keys go through their internal
 //     number (`Map[u32, ...]`) -- that is exactly how the Rust compiler does
 //     it with `Interner` too.
+//   * r497: a `fn` value (capturing `gc fn` closure) as `K` / `V` points at a
+//     GC record. The arrays of such a Map / BMap are collector roots
+//     (`gc_track` / `gc_untrack`, same as `Vec[T]`); for integers, `bool` and
+//     raw pointers the calls vanish at compile time.
 //   * There is no protection against the null value: for a missing key
 //     `map_get` returns `0 as V`. Whoever has to tell 0 from "missing" puts
 //     `map_has` in front of it.
@@ -117,6 +121,9 @@ fn map_new[K: Scalar, V: Scalar]() -> Map[K, V] {
 
 fn map_free[K: Scalar, V: Scalar](m: *mut Map[K, V]) {
     if (*m).cap > 0 {
+        // r497: the arrays were collector roots if K / V hold GC pointers
+        gc_untrack[K]((*m).key)
+        gc_untrack[V]((*m).values)
         rt.heap_free((*m).key, (*m).cap * size_of[K]())
         rt.heap_free((*m).values, (*m).cap * size_of[V]())
         rt.heap_free((*m).state, (*m).cap)
@@ -135,6 +142,9 @@ fn map_free[K: Scalar, V: Scalar](m: *mut Map[K, V]) {
 fn map_clear[K: Scalar, V: Scalar](m: *mut Map[K, V]) {
     if (*m).cap > 0 {
         rt.mem_set((*m).state, 0 as u8, (*m).cap)
+        // r497: do not keep dead closures alive through stale slots
+        if has_gc[K]() { rt.mem_set((*m).key, 0 as u8, (*m).cap * size_of[K]()) }
+        if has_gc[V]() { rt.mem_set((*m).values, 0 as u8, (*m).cap * size_of[V]()) }
     }
     (*m).len = 0
     (*m).dead = 0
@@ -249,6 +259,10 @@ fn map_grow[K: Scalar, V: Scalar](m: *mut Map[K, V], new_cap: usize) -> bool {
         return false
     }
     rt.mem_set(sz, 0 as u8, cap)
+    // r497: with GC pointers in K / V the new arrays are collector roots,
+    // registered BEFORE the old ones are dropped (same as vec_grow)
+    gc_track[K](sk, cap * size_of[K]())
+    gc_track[V](sw, cap * size_of[V]())
 
     // Remember the old table, hang in the new one, then rehash.
     let old_k: u64 = (*m).key
@@ -275,6 +289,8 @@ fn map_grow[K: Scalar, V: Scalar](m: *mut Map[K, V], new_cap: usize) -> bool {
     }
 
     if old_cap > 0 {
+        gc_untrack[K](old_k)
+        gc_untrack[V](old_v)
         rt.heap_free(old_k, old_cap * size_of[K]())
         rt.heap_free(old_v, old_cap * size_of[V]())
         rt.heap_free(old_z, old_cap)
@@ -673,6 +689,7 @@ fn bmap_new[V: Scalar]() -> BMap[V] {
 
 fn bmap_free[V: Scalar](m: *mut BMap[V]) {
     if (*m).cap > 0 {
+        gc_untrack[V]((*m).values) // r497
         rt.heap_free((*m).hashes, (*m).cap * 8)
         rt.heap_free((*m).koff, (*m).cap * 8)
         rt.heap_free((*m).klen, (*m).cap * 4)
@@ -701,6 +718,8 @@ fn bmap_free[V: Scalar](m: *mut BMap[V]) {
 fn bmap_clear[V: Scalar](m: *mut BMap[V]) {
     if (*m).cap > 0 {
         rt.mem_set((*m).state, 0 as u8, (*m).cap)
+        // r497: do not keep dead closures alive through stale slots
+        if has_gc[V]() { rt.mem_set((*m).values, 0 as u8, (*m).cap * size_of[V]()) }
     }
     (*m).len = 0
     (*m).dead = 0
@@ -884,6 +903,7 @@ fn bmap_grow[V: Scalar](m: *mut BMap[V], new_cap: usize) -> bool {
         return false
     }
     rt.mem_set(a_s, 0 as u8, cap)
+    gc_track[V](a_v, cap * size_of[V]()) // r497: root if V holds GC pointers
 
     // How many octets the live keys really need.
     var live: usize = 0
@@ -900,6 +920,7 @@ fn bmap_grow[V: Scalar](m: *mut BMap[V], new_cap: usize) -> bool {
     }
     let a_b: u64 = rt.heap_alloc(bcap)
     if a_b == 0 {
+        gc_untrack[V](a_v)
         rt.heap_free(a_h, cap * 8)
         rt.heap_free(a_o, cap * 8)
         rt.heap_free(a_l, cap * 4)
@@ -942,6 +963,7 @@ fn bmap_grow[V: Scalar](m: *mut BMap[V], new_cap: usize) -> bool {
     }
 
     if old_cap > 0 {
+        gc_untrack[V](old_v) // r497
         rt.heap_free(old_h, old_cap * 8)
         rt.heap_free(old_o, old_cap * 8)
         rt.heap_free(old_l, old_cap * 4)
