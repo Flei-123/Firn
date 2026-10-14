@@ -66,5 +66,7 @@ if [ -f "$A.entities" ] && [ -f "$B.entities" ]; then
   cmp -s "$T/a.ent" "$T/b.ent" && ent=0 || ent=1
   echo "  entities (ids/mob uuids masked): $(verdict $ent) ($(head -1 "$A.entities" | cut -d' ' -f2) vs $(head -1 "$B.entities" | cut -d' ' -f2) entities)"
   if [ "$ent" -ne 0 ]; then diff "$T/a.ent" "$T/b.ent" | head -10 | sed 's/^/    /'; fi
+  # MC_ENTITIES=0 (block/light check only): natural entities of a running world are not deterministic -> informational
+  if [ "${MC_ENTITIES:-1}" = 0 ] && [ "$ent" -ne 0 ]; then echo "  (entities differ but MC_ENTITIES=0: not counted)"; ent=0; fi
 fi
 [ "$full" -eq 0 ] && [ "$ent" -eq 0 ]

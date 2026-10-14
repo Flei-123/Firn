@@ -24,6 +24,8 @@
 #      MC_VIEW            view distance for server and clients (default 4)
 #      MC_IDLE_MS         client idle time after the last chunk (default 2500)
 #      MC_SETTLE_MS       settle run (player online, dump discarded) before A so fluids settle (default 45000; 0 = off)
+#      MC_FREEZE          1 = `tick freeze` after the settle run (1.20.3+; default 1 when MC_ENTITIES=0, else 0)
+#      MC_CLEAR_MOBS      1 (default) = with MC_ENTITIES=0 kill natural mobs once after the settle run
 #      REF_EXTRA          number of additional reference runs (A3, A4, ...) for stability checks
 #      ALLOW_SKIP=1       exit 0 when B is skipped and A == A2 (default: exit 3)
 #      JAVA               java binary (default /usr/bin/java)
@@ -243,6 +245,18 @@ OK=1
 if [ "$SETTLE" -gt 0 ]; then
   echo "(settle run: dump discarded)"
   run_ref W0 "$SETTLE" || OK=0
+fi
+# MC_FREEZE=1 (default 1 only without the entity scenario): `tick freeze` (1.20.3+, protocol >= 765) after the settle run, so
+# fluids / scheduled ticks cannot keep changing blocks between the reference sessions (A != A2 in a few edge sections otherwise).
+# Not used with the entity scenario: killed mobs would stay "dying" while the world is frozen.
+FREEZE="${MC_FREEZE:-$(( 1 - ENT ))}"
+if [ "$FREEZE" = 1 ] && [ "$LEGACY" -eq 0 ] && [ "$PROTO" -ge 765 ]; then
+  echo "tick freeze" >&3; sleep 1; echo "(world frozen: tick freeze)"
+fi
+# without the entity scenario natural mobs still wander between the sessions: remove them once (MC_CLEAR_MOBS=0 keeps them)
+if [ "$ENT" -ne 1 ] && [ "${MC_CLEAR_MOBS:-1}" = 1 ]; then
+  case "$MCV" in 1.8*) _pl=Player ;; *) _pl=player ;; esac
+  echo "kill @e[type=!$_pl]" >&3; sleep 1
 fi
 run_ref A || OK=0
 B_STATE=SKIPPED
