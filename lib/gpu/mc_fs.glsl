@@ -15,6 +15,7 @@ uniform vec4 u_fog;     // x = 1 fog on, y = start, z = end
 uniform vec3 u_fogc;    // fog colour 0..255
 uniform int u_trans;    // 1 = translucent pass: discard only alpha 0, output alpha = texel alpha (blend SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
 uniform int u_filter;   // 0 = exact texelFetch like mc_raster, 1 = filtered (mipmaps / anisotropy)
+uniform vec4 u_fade;    // x = fade a (>= 64 off), y = 1 inverted, z = frame height: screen-door of the LOD cross-fade (mc_raster.bayer8)
 uniform vec4 u_light;   // x = day (sky light multiplier 0..256), yzw = block light tint per channel 0..256
 in vec2 v_light;
 in vec3 v_uvao;
@@ -58,6 +59,15 @@ void main() {
         else s = grad_page(pg, vec3(v_uvao.xy, float(tl)), gdx, gdy);
         if (u_trans == 0 ? s.a < 0.5 : s.a < 0.004) discard;
         t = ivec4(s * 255.0 + 0.5);
+    }
+    if (u_fade.x < 63.5) {
+        int px = int(gl_FragCoord.x);
+        int py = int(u_fade.z) - 1 - int(gl_FragCoord.y);
+        int xr = (px ^ py) & 7;
+        int yy = py & 7;
+        int bay = ((xr & 1) << 5) | ((yy & 1) << 4) | ((xr & 2) << 2) | ((yy & 2) << 1) | ((xr & 4) >> 1) | ((yy & 4) >> 2);
+        int fa = int(u_fade.x + 0.5);
+        if (u_fade.y > 0.5 ? bay < fa : bay >= fa) discard;
     }
     int fq = clamp(int(floor(100.0 + 52.0 * v_uvao.z)), 0, 256);
     int total = (fq * v_fk) >> 8;

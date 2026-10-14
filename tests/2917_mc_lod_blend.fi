@@ -5,6 +5,11 @@
 //    (mc_lod.lod_bin_min: skirts reach the exact minimum of the neighbour span).
 // B  error (differing pixels) and pop (frame-to-frame change) with the mid ring stay below the no-mid-ring stream
 // C  lod_bin_min unit: min of the non-empty span, 0 for an empty span
+// D  cross-fade (v2): STATIC camera, a converged stream is hit by three ring events (full detail radius 2 -> 4, 4 -> 2, far LOD
+//    cells 4 -> 8), one stream_frame per frame for 16 frames. Nothing moves, so every changed pixel is a representation switch:
+//    pop = pixels that changed clearly against the previous frame (summed), jump = the worst single frame, holes = clear pixels
+//    that were terrain before the event. Hard switch (lod_fade_frames 0) against the screen-door fade (10 frames): the fade must
+//    cut the worst jump to half or less and add no holes.
 // Numbers go to stderr (LODBLEND ...).
 import std.rt
 import std.io
@@ -116,6 +121,90 @@ fn holes(a: *mut mc_raster.Raster, b: *mut mc_raster.Raster) -> i32 {
     return n
 }
 
+fn copy_img(dst: *mut mc_raster.Raster, src: *mut mc_raster.Raster) {
+    rt.mem_copy((*dst).color, (*src).color, 96 * 54 * 4)
+}
+
+// ring event on a stream with a STATIC camera: 0 = full detail radius 2 -> 4 (LOD -> sections), 1 = 4 -> 2 (sections -> LOD),
+// 2 = far LOD cells 4 -> 8 (LOD mesh replaced)
+fn ring_event(s: *mut mc_stream.Stream, e: i32) {
+    if e == 0 { (*s).dist = 4 }
+    if e == 1 { (*s).dist = DIST }
+    if e == 2 { (*s).lod_bin = 8 }
+}
+
+// N frames after the event, one stream_frame each: out[o..o+4] += pop (pixels changed against the previous frame), jump (worst
+// frame), holes (clear here but terrain in the frame before the event), fading frames (columns x frames with a running fade)
+#[allow_escape]
+fn run_phase(s: *mut mc_stream.Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, r: *mut mc_raster.Raster,
+    cam: *mut mc_camera.Camera, a: *mut mc_texture.Atlas, e: i32, out: u64, o: usize) {
+    var p0: mc_raster.Raster = fresh_raster(a)
+    var pv: mc_raster.Raster = fresh_raster(a)
+    frame(s, w, b, cam)
+    copy_img(&p0, r)
+    copy_img(&pv, r)
+    ring_event(s, e)
+    var f: i32 = 0
+    while f < 16 {
+        mc_stream.stream_flush(s, w, b, cam, 1)
+        frame(s, w, b, cam)
+        let d: i32 = diff_px(r, &pv)
+        rt.st64(out, o, rt.ld64(out, o) + (d as u64))
+        if (d as u64) > rt.ld64(out, o + 1) { rt.st64(out, o + 1, d as u64) }
+        rt.st64(out, o + 2, rt.ld64(out, o + 2) + (holes(r, &p0) as u64))
+        rt.st64(out, o + 3, rt.ld64(out, o + 3) + ((*s).st.lod_fading as u64))
+        copy_img(&pv, r)
+        f = f + 1
+    }
+    mc_stream.stream_flush(s, w, b, cam, 400)
+    mc_raster.raster_free(&p0)
+    mc_raster.raster_free(&pv)
+}
+
+// one static pose, two converged streams (hard switch / fade) hit by the same three ring events one after the other
+// out: per stream 4 values [pop, jump, holes, fading frames], summed over the events
+#[allow_escape]
+fn fade_flight(a: *mut mc_texture.Atlas, tb: *mut mc_mesh.MeshTables, ids: u64, fa: i32, fb: i32, out: u64) {
+    var cam: mc_camera.Camera = mc_camera.camera_new(96, 54)
+    mc_camera.camera_set_lens(&cam, 70.0, 0.05, 900.0)
+    var ra: mc_raster.Raster = fresh_raster(a)
+    var ba: mc_backend.Backend = mc_backend.backend_cpu(&ra)
+    var wa: mc_world.World = mc_world.world_new()
+    var sa: mc_stream.Stream = mc_stream.stream_new(0, NSEC, DIST, tb, 0)
+    sa.lod_dist = R
+    sa.lod_fade_frames = fa
+    sa.nbr_wait = 3 as u32
+    load_all(&wa, &sa, ids)
+    var rb: mc_raster.Raster = fresh_raster(a)
+    var bb: mc_backend.Backend = mc_backend.backend_cpu(&rb)
+    var wb: mc_world.World = mc_world.world_new()
+    var sb: mc_stream.Stream = mc_stream.stream_new(0, NSEC, DIST, tb, 0)
+    sb.lod_dist = R
+    sb.lod_fade_frames = fb
+    sb.nbr_wait = 3 as u32
+    load_all(&wb, &sb, ids)
+    var k: usize = 0
+    while k < 8 {
+        rt.st64(out, k, 0 as u64)
+        k = k + 1
+    }
+    pose(&cam, 0.0 - 40.0, 4.0)
+    mc_stream.stream_flush(&sa, &wa, &ba, &cam, 400)
+    mc_stream.stream_flush(&sb, &wb, &bb, &cam, 400)
+    var e: i32 = 0
+    while e < 3 {
+        run_phase(&sa, &wa, &ba, &ra, &cam, a, e, out, 0)
+        run_phase(&sb, &wb, &bb, &rb, &cam, a, e, out, 4)
+        e = e + 1
+    }
+    mc_stream.stream_free(&sa, &ba)
+    mc_stream.stream_free(&sb, &bb)
+    mc_world.world_free(&wa)
+    mc_world.world_free(&wb)
+    mc_raster.raster_free(&ra)
+    mc_raster.raster_free(&rb)
+}
+
 #[allow_escape]
 fn main() -> i32 {
     // C: lod_bin_min unit
@@ -205,6 +294,14 @@ fn main() -> i32 {
     check(pop1 <= pop0 + 40, 3)
     check(hol1 < 150, 4)
     check(worst1 < 20, 5)
+    // D: cross-fade
+    let fo: u64 = rt.heap_alloc(8 * 8)
+    fade_flight(&a, &tb, ids, 0, 10, fo)
+    io.fmt_eprint_line(f"LODFADE hard: pop {rt.ld64(fo, 0)} jump {rt.ld64(fo, 1)} holes {rt.ld64(fo, 2)} | fade10: pop {rt.ld64(fo, 4)} jump {rt.ld64(fo, 5)} holes {rt.ld64(fo, 6)} fading-frames {rt.ld64(fo, 7)} (3 events x 16 frames, 5184 px)")
+    check(rt.ld64(fo, 3) == 0 as u64, 70) // hard switch never fades
+    check(rt.ld64(fo, 7) > 0 as u64, 71) // the fade ran
+    check(rt.ld64(fo, 5) * 10 <= rt.ld64(fo, 1) * 5, 72) // worst jump at most half of the hard switch
+    check(rt.ld64(fo, 6) <= rt.ld64(fo, 2) + 20, 73) // no extra holes from the fade
     mc_stream.stream_free(&st, &bt)
     mc_stream.stream_free(&s0, &b0)
     mc_stream.stream_free(&s1, &b1)
