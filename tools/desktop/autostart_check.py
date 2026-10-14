@@ -11,6 +11,7 @@
 #
 #   usage: autostart_check.py <autostart_main binary>
 import os, shutil, subprocess, sys, tempfile, time, configparser
+from tscale import T, scratch_dir
 
 FAILED = []
 def check(name, cond, extra=""):
@@ -19,7 +20,7 @@ def check(name, cond, extra=""):
         FAILED.append(name)
 
 binary = sys.argv[1]
-td = tempfile.mkdtemp(prefix="autostart-check-")
+td = scratch_dir("autostart-check-")
 adir = os.path.join(td, "config", "autostart")
 
 def run(*args, env=None):
@@ -106,7 +107,7 @@ try:
         check("%s: file ends with a newline, no CR, no NUL" % name, raw.endswith("\n") and "\r" not in raw and "\0" not in raw)
         if have_gio:
             out = os.path.join(td, "out-%s" % name)
-            r2 = subprocess.run(["gio", "launch", path], capture_output=True, text=True, env=dict(os.environ, OUT=out), timeout=30)
+            r2 = subprocess.run(["gio", "launch", path], capture_output=True, text=True, env=dict(os.environ, OUT=out), timeout=T(30))
             for _ in range(50):
                 if os.path.exists(out):
                     break

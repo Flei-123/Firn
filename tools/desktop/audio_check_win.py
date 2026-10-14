@@ -11,6 +11,7 @@
 #   * the PCM of the plain MP3 decoder, and CRC-32 from zlib, through the player at 100 % and at
 #     other volumes (the formula of audio.pcm, written again here).
 import array, os, shutil, subprocess, sys, tempfile, zlib
+from tscale import T, scratch_dir
 
 FAILED = []
 def check(name, cond, extra=""):
@@ -22,7 +23,7 @@ if shutil.which("wine") is None:
     print("  SKIP  wine not installed")
     sys.exit(0)
 sink_exe, audio_exe, mp3_ref, root = [os.path.abspath(a) for a in sys.argv[1:5]]
-td = tempfile.mkdtemp(prefix="audio-win-")
+td = scratch_dir("audio-win-")
 raw = os.path.join(td, "alsa-out.raw")
 conf = os.path.join(td, "asound.conf")
 open(conf, "w").write('pcm.null { type null }\npcm.!default {\n    type file\n    slave.pcm "null"\n    file "%s"\n    format "raw"\n}\n' % raw)
@@ -37,7 +38,7 @@ def z(p):
 def run(exe, *args):
     if os.path.exists(raw):
         os.unlink(raw)
-    r = subprocess.run(["wine", exe] + list(args), capture_output=True, text=True, env=env, timeout=120)
+    r = subprocess.run(["wine", exe] + list(args), capture_output=True, text=True, env=env, timeout=T(120))
     data = open(raw, "rb").read() if os.path.exists(raw) else b""
     return r, data
 

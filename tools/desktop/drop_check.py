@@ -13,6 +13,7 @@
 #     not produce: other types than files, a type list in the XdndTypeList property, remote
 #     hosts, percent escapes, comments, a drag that leaves again.
 import os, shutil, subprocess, sys, time, signal
+from tscale import T, scratch_dir, free_display as _free_display
 from Xlib import X, display, protocol, Xatom
 
 FAILED = []
@@ -30,17 +31,14 @@ binary = sys.argv[1]
 WINE = len(sys.argv) > 2 and sys.argv[2] == "wine"
 here = os.path.dirname(os.path.abspath(__file__))
 
-def free_display():
-    for n in range(150, 250):
-        if not os.path.exists("/tmp/.X11-unix/X%d" % n) and not os.path.exists("/tmp/.X%d-lock" % n):
-            return n
-    raise SystemExit("no free display")
+def free_display(lo=150, hi=250, _f=_free_display):
+    return _f(lo, hi) or sys.exit("no free display")
 
 n = free_display()
 xvfb = subprocess.Popen(["Xvfb", ":%d" % n, "-screen", "0", "800x600x24"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 env = dict(os.environ, DISPLAY=":%d" % n)
 os.environ["DISPLAY"] = ":%d" % n
-for _ in range(100):
+for _ in range(int(T(100))):
     if os.path.exists("/tmp/.X11-unix/X%d" % n):
         break
     time.sleep(0.1)
@@ -118,7 +116,7 @@ try:
             ev = protocol.event.ClientMessage(window=self.target, client_type=self.A(mtype), data=(32, (list(data) + [0] * 5)[:5]))
             self.target.send_event(ev, event_mask=0)
             self.d.flush()
-        def pump(self, until, timeout=3.0):
+        def pump(self, until, timeout=T(3.0)):
             end = time.time() + timeout
             while time.time() < end:
                 while self.d.pending_events():

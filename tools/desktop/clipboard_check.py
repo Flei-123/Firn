@@ -13,6 +13,7 @@
 # bridge to the X selections stands between it and GTK. FIRN_CLIPBOARD=native is set for the Linux program: the
 # helper programs (xclip ...) must not be what is being measured.
 import hashlib, os, shutil, subprocess, sys, tempfile, time
+from tscale import T, scratch_dir, free_display as _free_display
 
 FAILED = []
 def check(name, cond, extra=""):
@@ -31,19 +32,18 @@ except ImportError:
 binary = sys.argv[1]
 WINE = len(sys.argv) > 2 and sys.argv[2] == "wine"
 here = os.path.dirname(os.path.abspath(__file__))
-td = tempfile.mkdtemp(prefix="clipboard-check-")
+td = scratch_dir("clipboard-check-")
 
-def free_display():
-    for n in range(300, 400):
-        if not os.path.exists("/tmp/.X11-unix/X%d" % n) and not os.path.exists("/tmp/.X%d-lock" % n):
-            return n
+def free_display(lo=300, hi=400, _f=_free_display):
+    return _f(lo, hi) or sys.exit("no free display")
+
 n = free_display()
 xvfb = subprocess.Popen(["Xvfb", ":%d" % n, "-screen", "0", "800x600x24", "-nolisten", "tcp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 env = dict(os.environ, DISPLAY=":%d" % n, FIRN_CLIPBOARD="native")
 if WINE:
     env["WINEPREFIX"] = os.environ.get("WINEPREFIX", os.path.expanduser("~/.wine-firn"))
     env["WINEDEBUG"] = "-all"
-for _ in range(100):
+for _ in range(int(T(100))):
     if os.path.exists("/tmp/.X11-unix/X%d" % n):
         break
     time.sleep(0.1)
@@ -57,12 +57,12 @@ def prog(*args, out):
     procs.append(p)
     return p
 
-def run_prog(*args, out, timeout=90):
+def run_prog(*args, out, timeout=T(90)):
     p = prog(*args, out=out)
     p.wait(timeout=timeout)
     return open(out, "rb").read()
 
-def wait_for(path, text, timeout=60):
+def wait_for(path, text, timeout=T(60)):
     end = time.time() + timeout
     while time.time() < end:
         if os.path.exists(path) and text.encode() in open(path, "rb").read():
@@ -73,7 +73,7 @@ def wait_for(path, text, timeout=60):
 def host(path):
     return ("Z:" + path.replace("/", "\\")) if WINE else path
 
-def gtk(*args, timeout=60):
+def gtk(*args, timeout=T(60)):
     return subprocess.run([sys.executable, os.path.join(here, "gtk_peer.py")] + list(args), capture_output=True, text=True, env=env, timeout=timeout)
 
 def got_payload(data):
@@ -93,7 +93,7 @@ def wine_kill():
 def stop(p):
     p.terminate()
     try:
-        p.wait(timeout=10)
+        p.wait(timeout=T(10))
     except subprocess.TimeoutExpired:
         p.kill()
     wine_kill()
@@ -145,7 +145,7 @@ try:
         h = run_prog("has", out=os.path.join(td, "o4")).decode()
         check("has_text is true while GTK's text is there (%s)" % label, "text=1" in h, h)
         gp.terminate()
-        gp.wait(timeout=10)
+        gp.wait(timeout=T(10))
         time.sleep(1.0)
     gp = subprocess.Popen([sys.executable, os.path.join(here, "gtk_peer.py"), "set-png", pngf], stdout=subprocess.PIPE, text=True, env=env)
     procs.append(gp)
@@ -162,7 +162,7 @@ try:
     h = run_prog("has", out=os.path.join(td, "o6")).decode()
     check("has_png is true while GTK's picture is there", "png=1" in h, h)
     gp.terminate()
-    gp.wait(timeout=10)
+    gp.wait(timeout=T(10))
     time.sleep(1.0)
     # --- 3. clear takes it away from a foreign owner
     tf = os.path.join(td, "c.txt")
@@ -174,7 +174,7 @@ try:
     c = run_prog("clear", out=os.path.join(td, "o7")).decode()
     check("clear answered true", "CLEAR ok" in c, c)
     time.sleep(0.5)
-    g = gtk("get-text", os.path.join(td, "after"), timeout=60)
+    g = gtk("get-text", os.path.join(td, "after"), timeout=T(60))
     check("GTK finds no text after the program cleared the clipboard", g.stdout.startswith("NOTEXT"), g.stdout + g.stderr)
     h = run_prog("has", out=os.path.join(td, "o8")).decode()
     check("has_text / has_png are false after clear", "text=0" in h and "png=0" in h, h)

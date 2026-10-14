@@ -5,6 +5,7 @@
 #
 #   usage: notify_check.py <notify_main binary>
 import os, subprocess, sys, threading, time
+from tscale import T, scratch_dir
 import dbus, dbus.service, dbus.bus
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
@@ -63,7 +64,7 @@ class Server(dbus.service.Object):
         pass
 
 # --- 1. no server at all
-r = subprocess.run([binary], capture_output=True, text=True, timeout=20)
+r = subprocess.run([binary], capture_output=True, text=True, timeout=T(20))
 check("without a server: READY no and ID 0", r.stdout.split() == ["READY", "no", "ID", "0"], r.stdout)
 check("without a server: exit 0", r.returncode == 0, r.returncode)
 
@@ -76,7 +77,7 @@ time.sleep(0.2)
 
 proc = subprocess.Popen([binary], stdout=subprocess.PIPE, text=True, bufsize=1)
 lines = []
-def read_until(tag, timeout=10):
+def read_until(tag, timeout=T(10)):
     end = time.time() + timeout
     while time.time() < end:
         l = proc.stdout.readline()
@@ -118,7 +119,7 @@ srv.ActionInvoked(1, "open")
 srv.NotificationClosed(1, 2)
 read_until("CLOSED 1 2")
 try:
-    proc.wait(timeout=10)
+    proc.wait(timeout=T(10))
 except subprocess.TimeoutExpired:
     proc.kill()
 rest = [l.rstrip("\n") for l in proc.stdout.read().splitlines()]

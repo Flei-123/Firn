@@ -13,6 +13,7 @@
 #     program's window) become the same events as on Linux: click, middle click, context menu, the menu
 #     item chosen, the balloon clicked / timed out.
 import os, shutil, subprocess, sys, tempfile, time
+from tscale import T, scratch_dir, free_display as _free_display
 
 FAILED = []
 def check(name, cond, extra=""):
@@ -25,16 +26,15 @@ for tool in ("wine", "Xvfb", "xwd"):
         print("  SKIP  %s not installed" % tool)
         sys.exit(0)
 tray_exe, poke_exe, notify_exe, root = [os.path.abspath(a) for a in sys.argv[1:5]]
-td = tempfile.mkdtemp(prefix="tray-win-")
+td = scratch_dir("tray-win-")
 
-def free_display():
-    for n in range(300, 350):
-        if not os.path.exists("/tmp/.X11-unix/X%d" % n) and not os.path.exists("/tmp/.X%d-lock" % n):
-            return n
+def free_display(lo=300, hi=350, _f=_free_display):
+    return _f(lo, hi) or sys.exit("no free display")
+
 n = free_display()
 xvfb = subprocess.Popen(["Xvfb", ":%d" % n, "-screen", "0", "800x600x24"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 env = dict(os.environ, DISPLAY=":%d" % n, WINEPREFIX=os.environ.get("WINEPREFIX", os.path.expanduser("~/.wine-firn")), WINEDEBUG="-all")
-for _ in range(100):
+for _ in range(int(T(100))):
     if os.path.exists("/tmp/.X11-unix/X%d" % n):
         break
     time.sleep(0.1)
@@ -48,7 +48,7 @@ def start(exe, *args, out):
     procs.append(p)
     return p
 
-def wait_for(path, text, timeout=60):
+def wait_for(path, text, timeout=T(60)):
     end = time.time() + timeout
     while time.time() < end:
         if os.path.exists(path) and text.encode() in open(path, "rb").read():
@@ -57,7 +57,7 @@ def wait_for(path, text, timeout=60):
     return False
 
 def poke(*args):
-    r = subprocess.run(DESK + [poke_exe] + list(args), capture_output=True, text=True, env=env, timeout=60)
+    r = subprocess.run(DESK + [poke_exe] + list(args), capture_output=True, text=True, env=env, timeout=T(60))
     time.sleep(1.2)
     return r
 
@@ -68,7 +68,7 @@ try:
     # ---- a program without any shell: the shell refuses the icon
     subprocess.run(["wineserver", "-k"], env=env)       # no explorer left over from an earlier check
     time.sleep(1.5)
-    r = subprocess.run(["wine", tray_exe], capture_output=True, text=True, env=env, timeout=60)
+    r = subprocess.run(["wine", tray_exe], capture_output=True, text=True, env=env, timeout=T(60))
     # Wine may or may not have started its own shell by now (it does when it boots a fresh prefix session):
     # either way the program must say what the shell did, and `VISIBLE` must agree with `SHOWN`.
     o0 = r.stdout.split()
@@ -111,7 +111,7 @@ try:
     poke("click")
     poke("cmd", "1")        # Open (id 1)
     poke("cmd", "4")        # Quit (id 2)
-    p1.wait(timeout=60)
+    p1.wait(timeout=T(60))
     ev = [tuple(int(x) for x in l.split()[1:]) for l in lines(o1) if l.startswith("EV ")]
     check("left click -> EV_ACTIVATE (1) at the cursor", any(e[0] == 1 for e in ev), ev)
     check("middle click -> EV_SECONDARY (2)", any(e[0] == 2 for e in ev), ev)
