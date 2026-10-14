@@ -14,6 +14,7 @@
 #define LOAD(p) dlopen(p, RTLD_NOW)
 #define SYM(h, n) dlsym(h, n)
 #endif
+typedef float v4f __attribute__((vector_size(16)));
 static int bad = 0;
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL " __VA_ARGS__); printf("\n"); bad++; } } while (0)
 int main(int argc, char **argv) {
@@ -42,6 +43,20 @@ int main(int argc, char **argv) {
     CHECK(got == want, "mix14 got %f want %f", got, want);
     CHECK(int9f(1, 2, 3, 4, 5, 6, 7, 8, 9) == 22.5, "int9f %f", int9f(1, 2, 3, 4, 5, 6, 7, 8, 9));
     CHECK(fcount(1, -1, 1, -1, 1) == 1 + 4 + 16, "fcount %lld", (long long)fcount(1, -1, 1, -1, 1));
+    /* v128: hidden pointer on Win64, xmm / q registers elsewhere (symbols only exist in lib_abi builds with r506) */
+    v4f (*v128add)(v4f, v4f) = SYM(h, "abi_v128_add");
+    double (*v128mix)(int64_t, v4f, double, v4f, int32_t) = SYM(h, "abi_v128_mix");
+    CHECK(v128add && v128mix, "v128 symbols");
+    if (v128add && v128mix) {
+        v4f x = {1.0f, 2.0f, 3.0f, 4.0f}, y = {10.0f, 20.0f, 30.0f, 40.0f};
+        v4f r = v128add(x, y);
+        CHECK(r[0] == 11.0f && r[1] == 22.0f && r[2] == 33.0f && r[3] == 44.0f, "v128add %f %f %f %f", r[0], r[1], r[2], r[3]);
+        double m = v128mix(-5, x, 0.25, y, 7);
+        double wm = -5 + 0.25 * 2.0 + 7 * 3.0 + 11.0 * 4.0 + 44.0 * 5.0;
+        CHECK(m == wm, "v128mix got %f want %f", m, wm);
+        for (int i = 0; i < 1000; i++) { r = v128add(r, x); }
+        CHECK(r[0] == 1011.0f && r[3] == 4044.0f, "v128 loop");
+    }
     /* many calls: nothing may drift (callee-saved registers of the host survive) */
     double acc = 0;
     for (int i = 0; i < 1000; i++) acc += fadd((double)i, 0.5) + mix4(i, 1.0, i, 1.0f);
