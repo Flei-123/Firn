@@ -38,6 +38,18 @@ barrier `snap_barrier` on the render thread (so the world may change again after
 Test tests/2915_mc_stream_budget.fi: async load from empty with 4 workers: >= 90 % of the frames keep the snapshot+submit phase inside `snap_budget_us` (+3 ms), no frame above 250 ms,
 image == reference. Image identity of all other tests (2773/2861/2885/2886) unchanged.
 
+## Client default (a2, 14.10.)
+mcplay draws through mc_stream by DEFAULT (`MCPLAY_STREAM=0` = old mc_render_world path). Mesher threads: `MCPLAY_WORKERS` (default 3, 0 = inline), `jobs.create` before the first
+`stream_make` (join packet), the pool address goes into `stream_new`; `__thread_work` in mcplay dispatches `jobs.WORKER_KIND` next to the audio thread. GL stays on the render thread:
+workers only produce vertex/index copies, `consume` uploads. Resize frees the stream (waits for the group) before the back end changes, the pool lives until exit.
+`stream_window_sync(s, w, b, cam, extra, max_drop, max_add)`: columns farther than dist + extra (or the LOD window) leave the STREAM (meshes + section entries freed) but stay in the world
+(the server owns them and unloads by packet); columns that come back inside are announced again. mcplay calls it with extra 2 when the camera column changes (else every 40 frames).
+**GL + threads: not possible yet.** With `MCPLAY_GL=1` and Firn worker threads alive mcplay segfaults (gdb: first in `dlopen(libEGL)` -> glibc `_dl_update_slotinfo`, when the pool is created before GL; created after GL init: in `libGLdispatch` on the first `glBindFramebuffer` of the main thread). Firn threads are raw clone threads without glibc TLS setup. So the default is `MCPLAY_WORKERS=0` (inline) with GL, 3 on the CPU path. Firn runtime issue, see roadmap.
+`MCPLAY_SHOT`: before the last frame `stream_flush` lets the workers finish, so the screenshot is the converged picture.
+mcview: `MCVIEW_STREAM=1` (+ `MCVIEW_WORKERS`, default 3) draws with the stream; image == wr_render image == python reference (hash a6b8fe3e... on the fixture, `--all`). Default stays wr_render
+(the reference gate needs it). Cold frame is slower in stream mode (it runs flush frames), cached frame ~10 % faster.
+Test tests/2773 block H: window sync (drop/keep/return, idempotent, budgets).
+
 ## Open
 - snapshot pointers + kind are the only serial part now (see "Parallel snapshot"); the pad fill itself still reads the live world, so the world must not change while a frame runs (true: stream_frame owns it).
 - light: see docs/mc/light.md ("Light in Stream / Render"): `stream_set_light`, region volume + Chunk.light, `stream_light_sync` after edits. Moving region and update_light wiring open.
