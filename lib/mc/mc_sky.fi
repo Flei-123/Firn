@@ -28,6 +28,7 @@ struct Sky {
     daylight: i32, // 0 (night) .. 256 (day)
     glow: i32, // sunset / sunrise strength 0..256
     discs: bool, // sun and moon are drawn (false in heavy rain)
+    approx: bool, // sky_draw: sunset glow by forward differences + rsqrt series (<= 1 level off, ~2x faster); false = bit exact
     sunx: f64, suny: f64, sunz: f64, // unit-ish direction to the sun (world: +x east, +y up, +z south)
     zr: i32, zg: i32, zb: i32, // zenith
     hr: i32, hg: i32, hb: i32, // horizon
@@ -38,7 +39,7 @@ struct Sky {
 
 fn sky_new() -> Sky {
     var s: Sky = Sky {
-        time: 0, rain: 0, daylight: 0, glow: 0, discs: true,
+        time: 0, rain: 0, daylight: 0, glow: 0, discs: true, approx: false,
         sunx: 1.0, suny: 0.0, sunz: 0.0,
         zr: 0, zg: 0, zb: 0, hr: 0, hg: 0, hb: 0, fr: 0, fg: 0, fb: 0, lr: 255, lg: 120, lb: 60,
         tr: 256, tg: 256, tb: 256,
@@ -230,6 +231,73 @@ fn sky_f_at(c: *mut RowCtx, x: usize) -> u32 {
     return (gg * 256.0) as u32 // gg >= 0: truncation == floor
 }
 
+// gradient position 256 gg of column x before the floor (sky_f_at = floor of this)
+fn sky_f_val(c: *mut RowCtx, x: usize) -> f64 {
+    let o: u64 = (x as u64) << (3 as u64)
+    let ws: u64 = ((*c).wn as u64) << (3 as u64)
+    let dx: f64 = *((((*c).cols) + o) as *mut f64) + (*c).eyx
+    let dy: f64 = *((((*c).cols) + ws + o) as *mut f64) + (*c).eyy
+    let dz: f64 = *((((*c).cols) + ws + ws + o) as *mut f64) + (*c).eyz
+    let len: f64 = math.sqrt((dx * dx + dy * dy) + dz * dz)
+    var g: f64 = (dy / len) * 1.6
+    if g < 0.0 { g = 0.0 }
+    if g > 1.0 { g = 1.0 }
+    return (1.0 - (1.0 - g) * (1.0 - g)) * 256.0
+}
+
+const F_BLK: usize = 16 // approx gradient: exact position every F_BLK columns, linear in between
+const F_FLAT: f64 = 1.0 // ... when the second difference of the samples is below this (floor error <= 1 level of f)
+
+// Gradient index of every column of the row for Sky.approx: exact (sqrt + division) every F_BLK columns, linear in between
+// where the neighbouring samples are flat enough (a convex combination of values in 0..256 stays in 0..256), exact per column
+// elsewhere and in the remainder at the right edge. Index off by at most 1 against sky_f_at.
+fn sky_f_row_approx(c: *mut RowCtx, wn: usize) {
+    let nfull: usize = (wn - 1) / F_BLK
+    var fm: f64 = 0.0
+    var f0: f64 = sky_f_val(c, 0)
+    var f1: f64 = 0.0
+    var j: usize = 0
+    if nfull > 0 { f1 = sky_f_val(c, F_BLK) }
+    let ib: f64 = 1.0 / (F_BLK as f64)
+    var pf: u64 = (*c).fcol
+    while j < nfull {
+        var f2: f64 = f1
+        if (j + 2) * F_BLK < wn { f2 = sky_f_val(c, (j + 2) * F_BLK) }
+        var c1: f64 = 0.0
+        if j > 0 { c1 = (fm - 2.0 * f0) + f1 }
+        var c2: f64 = 0.0
+        if (j + 2) * F_BLK < wn { c2 = (f0 - 2.0 * f1) + f2 }
+        if c1 < 0.0 { c1 = 0.0 - c1 }
+        if c2 < 0.0 { c2 = 0.0 - c2 }
+        let pe: u64 = pf + ((F_BLK as u64) << (2 as u64))
+        if c1 < F_FLAT && c2 < F_FLAT {
+            var v: f64 = f0
+            let dv: f64 = (f1 - f0) * ib
+            while pf < pe {
+                *(pf as *mut u32) = v as u32
+                v = v + dv
+                pf = pf + (4 as u64)
+            }
+        } else {
+            var x: usize = j * F_BLK
+            while pf < pe {
+                *(pf as *mut u32) = sky_f_at(c, x)
+                x = x + 1
+                pf = pf + (4 as u64)
+            }
+        }
+        fm = f0
+        f0 = f1
+        f1 = f2
+        j = j + 1
+    }
+    var x: usize = nfull * F_BLK
+    while x < wn {
+        rt.st32((*c).fcol, x, sky_f_at(c, x))
+        x = x + 1
+    }
+}
+
 // Fills fcol[a..b] (both ends already set) for a segment on which ny is monotone: if both ends agree the whole
 // segment has that value, otherwise bisect.
 fn sky_fill(c: *mut RowCtx, a: usize, b: usize) {
@@ -306,11 +374,146 @@ fn sky_glow_pixel(s: *mut Sky, px: u32, dx: f64, dy: f64, dz: f64, ss: f64, du: 
     return (cr as u32) | ((cg as u32) << 8 as u32) | ((cb as u32) << 16 as u32) | 0xFF000000 as u32
 }
 
+const GLOW_BLK: usize = 8 // approx glow: exact weight every GLOW_BLK columns, linear in between
+const GLOW_FLAT: f64 = 4.0 // ... when the second difference of the samples is below this (error <= 0.5 level)
+
+struct GlowAnchor { il0: f64, il0sq: f64 }
+
+// Glow weight floor() argument (d3 (1-gg) glow, 0 behind the sun) at column offset k of the row, from the linear ray
+// d(k) = d0 + k s. 1/|d| = anchor series (1 - t)^(-1/2) = 1 + t/2 + 3t^2/8 + 5t^3/16, t = 1 - |d|^2 / |anchor|^2; the anchor
+// (one sqrt + one division) is renewed when t^2 > 0.0025 (series error < 1e-6 relative).
+fn sky_glow_v(a: *mut GlowAnchor, dx0: f64, dy0: f64, dz0: f64, sx: f64, sy: f64, sz: f64, sunx: f64, suny: f64, sunz: f64, glowf: f64, k: f64) -> f64 {
+    let dx: f64 = dx0 + k * sx
+    let dy: f64 = dy0 + k * sy
+    let dz: f64 = dz0 + k * sz
+    let du: f64 = (dx * sunx + dy * suny) + dz * sunz
+    if du <= 0.0 { return 0.0 }
+    let ss: f64 = (dx * dx + dy * dy) + dz * dz
+    var t: f64 = 1.0 - ss * (*a).il0sq
+    if t * t > 0.0025 {
+        (*a).il0 = 1.0 / math.sqrt(ss)
+        (*a).il0sq = (*a).il0 * (*a).il0
+        t = 0.0
+    }
+    let il: f64 = (*a).il0 * (1.0 + t * (0.5 + t * (0.375 + t * 0.3125)))
+    let dsun: f64 = du * il
+    var g: f64 = (dy * il) * 1.6
+    if g < 0.0 { g = 0.0 }
+    if g > 1.0 { g = 1.0 }
+    let om: f64 = 1.0 - g
+    return ((dsun * dsun) * dsun) * (om * om) * glowf
+}
+
+// px blended towards the glow colour by fg/256 (0 < fg <= 256): r and b share one word (16 bit lanes, every lane sum
+// <= 255 * 256 so no carries), g sits in its own word. Same result as the per channel (c (256 - fg) + l fg) >> 8.
+fn sky_blend(px: u32, fg: i64, lrb: u64, lgs: u64) -> u32 {
+    var fk: i64 = fg
+    if fk > 256 as i64 { fk = 256 }
+    let kk: u64 = (256 as i64 - fk) as u64
+    let fu: u64 = fk as u64
+    let pu: u64 = px as u64
+    let rb: u64 = ((pu & 0xFF00FF as u64) * kk + lrb * fu) >> 8 as u64
+    let gg: u64 = (((pu & 0xFF00 as u64) * kk + lgs * fu) >> 8 as u64) & 0xFF00 as u64
+    return ((rb & 0xFF00FF as u64) | gg | 0xFF000000 as u64) as u32
+}
+
+// Approximate glow for the columns [lo, hi) of one lit row (Sky.approx). The weight is evaluated exactly (series, see
+// sky_glow_v) every GLOW_BLK columns and interpolated linearly in between where the second difference of the neighbouring
+// samples is below GLOW_FLAT (interpolation error <= 0.5 level); other blocks, and blocks next to the sun, are evaluated per
+// pixel. Result: glow weight within 0.5 + 1e-3 of the plain model, so every channel is at most 1 level off.
+fn sky_glow_mid_fast(s: *mut Sky, cols: u64, wn: usize, lo: usize, hi: usize, eyx: f64, eyy: f64, eyz: f64, fcol: u64, tab: u64, out: u64) {
+    if hi <= lo { return }
+    let glowf: f64 = (*s).glow as f64
+    let sunx: f64 = (*s).sunx
+    let suny: f64 = (*s).suny
+    let sunz: f64 = (*s).sunz
+    let lrb: u64 = ((*s).lr as u64) | (((*s).lb as u64) << 16 as u64)
+    let lgs: u64 = ((*s).lg as u64) << 8 as u64
+    let wb: u64 = (wn as u64) << (3 as u64)
+    let n: usize = hi - lo
+    let pl: u64 = cols + ((lo as u64) << (3 as u64))
+    let dx0: f64 = *(pl as *mut f64) + eyx
+    let dy0: f64 = *((pl + wb) as *mut f64) + eyy
+    let dz0: f64 = *((pl + wb + wb) as *mut f64) + eyz
+    var sx: f64 = 0.0
+    var sy: f64 = 0.0
+    var sz: f64 = 0.0
+    if n > 1 {
+        let ph: u64 = cols + (((hi - 1) as u64) << (3 as u64))
+        let inv: f64 = 1.0 / ((n - 1) as f64)
+        sx = (*(ph as *mut f64) - *(pl as *mut f64)) * inv
+        sy = (*((ph + wb) as *mut f64) - *((pl + wb) as *mut f64)) * inv
+        sz = (*((ph + wb + wb) as *mut f64) - *((pl + wb + wb) as *mut f64)) * inv
+    }
+    var an: GlowAnchor = GlowAnchor { il0: 0.0, il0sq: 0.0 }
+    let bf: f64 = GLOW_BLK as f64
+    let ibf: f64 = 1.0 / bf
+    var vm: f64 = sky_glow_v(&an, dx0, dy0, dz0, sx, sy, sz, sunx, suny, sunz, glowf, 0.0 - bf)
+    var v0: f64 = sky_glow_v(&an, dx0, dy0, dz0, sx, sy, sz, sunx, suny, sunz, glowf, 0.0)
+    var v1: f64 = sky_glow_v(&an, dx0, dy0, dz0, sx, sy, sz, sunx, suny, sunz, glowf, bf)
+    var pf: u64 = fcol + ((lo as u64) << (2 as u64))
+    var po: u64 = out + ((lo as u64) << (2 as u64))
+    var b0: usize = 0
+    while b0 < n {
+        let v2: f64 = sky_glow_v(&an, dx0, dy0, dz0, sx, sy, sz, sunx, suny, sunz, glowf, ((b0 + GLOW_BLK + GLOW_BLK) as f64))
+        var cnt: usize = n - b0
+        if cnt > GLOW_BLK { cnt = GLOW_BLK }
+        let pe: u64 = pf + ((cnt as u64) << (2 as u64))
+        var c1: f64 = (vm - 2.0 * v0) + v1
+        var c2: f64 = (v0 - 2.0 * v1) + v2
+        if c1 < 0.0 { c1 = 0.0 - c1 }
+        if c2 < 0.0 { c2 = 0.0 - c2 }
+        if vm < 0.5 && v0 < 0.5 && v1 < 0.5 && v2 < 0.5 {
+            while pf < pe {
+                *(po as *mut u32) = *((tab + ((*(pf as *mut u32)) as u64) * (4 as u64)) as *mut u32)
+                pf = pf + (4 as u64)
+                po = po + (4 as u64)
+            }
+        } else if c1 < GLOW_FLAT && c2 < GLOW_FLAT {
+            var v: f64 = v0
+            let dv: f64 = (v1 - v0) * ibf
+            while pf < pe {
+                var px: u32 = *((tab + ((*(pf as *mut u32)) as u64) * (4 as u64)) as *mut u32)
+                var fg: i64 = v as i64
+                if v >= 1.0 {
+                    if fg > 256 as i64 { fg = 256 }
+                    let kk: u64 = (256 as i64 - fg) as u64
+                    let fu: u64 = fg as u64
+                    let pu: u64 = px as u64
+                    let rb: u64 = ((pu & 0xFF00FF as u64) * kk + lrb * fu) >> 8 as u64
+                    let gg: u64 = (((pu & 0xFF00 as u64) * kk + lgs * fu) >> 8 as u64) & 0xFF00 as u64
+                    px = ((rb & 0xFF00FF as u64) | gg | 0xFF000000 as u64) as u32
+                }
+                *(po as *mut u32) = px
+                v = v + dv
+                pf = pf + (4 as u64)
+                po = po + (4 as u64)
+            }
+        } else {
+            var k: usize = b0
+            while pf < pe {
+                var px: u32 = *((tab + ((*(pf as *mut u32)) as u64) * (4 as u64)) as *mut u32)
+                let v: f64 = sky_glow_v(&an, dx0, dy0, dz0, sx, sy, sz, sunx, suny, sunz, glowf, k as f64)
+                if v >= 1.0 { px = sky_blend(px, v as i64, lrb, lgs) }
+                *(po as *mut u32) = px
+                k = k + 1
+                pf = pf + (4 as u64)
+                po = po + (4 as u64)
+            }
+        }
+        vm = v0
+        v0 = v1
+        v1 = v2
+        b0 = b0 + GLOW_BLK
+    }
+}
+
 // One lit row: gradient colour from the table, glow where the conservative test passes (see sky_draw).
 // Pointer walking instead of indexed helper calls: this loop is the hot spot of the sunset frame.
 // d . sun is linear in the column: columns whose value is below -1e-3 cannot glow (they need d . sun > 0), they are
 // plain table copies; only the (conservatively widened) range [lo, hi) gets the per pixel test.
 fn sky_glow_row(s: *mut Sky, cols: u64, wn: usize, eyx: f64, eyy: f64, eyz: f64, fcol: u64, tab: u64, gsq: u64, out: u64) {
+    let approx: bool = (*s).approx
     let glowf: f64 = (*s).glow as f64
     let sunx: f64 = (*s).sunx
     let suny: f64 = (*s).suny
@@ -356,6 +559,11 @@ fn sky_glow_row(s: *mut Sky, cols: u64, wn: usize, eyx: f64, eyy: f64, eyz: f64,
         *(po as *mut u32) = *((tab + ((*(pf as *mut u32)) as u64) * (4 as u64)) as *mut u32)
         pf = pf + (4 as u64)
         po = po + (4 as u64)
+    }
+    if approx {
+        sky_glow_mid_fast(s, cols, wn, lo, hi, eyx, eyy, eyz, fcol, tab, out)
+        pf = pb
+        po = out + (pb - fcol)
     }
     while pf < pb {
         let f: u64 = (*(pf as *mut u32)) as u64
@@ -524,7 +732,9 @@ fn sky_draw(s: *mut Sky, r: *mut mc_raster.Raster) {
         rc.eyy = ey * uy
         rc.eyz = ey * uz
         // ---- gradient index per column
-        if fast {
+        if (*s).approx {
+            sky_f_row_approx(&rc, wn)
+        } else if fast {
             // extremum of ny along the row: d(ex) = P + ex R, ny = (Py + ex ry) / |d|, derivative zero at
             // ex* = (Py (P.R) - ry (P.P)) / ((P.R) ry - Py (R.R))  (the ex^2 terms cancel)
             let px: f64 = fx + rc.eyx
