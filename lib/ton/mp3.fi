@@ -66,6 +66,7 @@ export {
     Mp3Dec, Mp3Info, Mp3Scratch,
     mp3_new, mp3_scratch_new, mp3_decode_frame,
     MAX_SAMPLES_PER_FRAME,
+    scale_pcm, scale_pcm4c,
     hdr_valid, hdr_frame_octets, hdr_abtastrate, hdr_kanaele,
     hdr_bitrate_kbps, hdr_frame_samples,
 }
@@ -757,6 +758,16 @@ fn cache_negative(l: *mut HuffLage) -> bool {
     return ((*l).cache & 2147483648 as u32) != 0 as u32
 }
 
+#[inline]
+fn count1_value(l: *mut HuffLage, dst_in: u64, at: i64, one: f32) {
+    var v: f32 = one
+    if cache_negative(l) {
+        v = -one
+    }
+    sf(dst_in, at, v)
+    flush_bits(l, 1)
+}
+
 fn l3_huffman(t: *mut mp3_tab.Tabs, dst_in: u64, bs: *mut Bs, gr: *mut GrInfo,
     scf_in: u64, layer3gr_limit: i32) {
     var dst: i64 = 0
@@ -859,32 +870,46 @@ fn l3_huffman(t: *mut mp3_tab.Tabs, dst_in: u64, bs: *mut Bs, gr: *mut GrInfo,
         if bspos > layer3gr_limit {
             done = true
         } else {
-            // r144: the early exit is a `break`, so the counted loop
-            // (4 passes) has a second way out and `unroll` can peel it.
-            var s: i32 = 0
-            while s < 4 {
-                if s == 0 || s == 2 {
-                    np = np - 1
+            // Four unrolled steps (r144 left them as a counted loop with a
+            // side exit that stayed rolled): the band counter `np` ticks at
+            // steps 0 and 2; reaching the end of the table ends the region.
+            np = np - 1
+            if np == 0 {
+                np = (lb(sfb, 0) as i32) / 2
+                sfb = sfb + 1
+                if np == 0 {
+                    done = true
+                } else {
+                    one = lf(scf_in, scf)
+                    scf = scf + 1
+                }
+            }
+            if !done {
+                if (leaf & 128) != 0 {
+                    count1_value(l, dst_in, dst, one)
+                }
+                if (leaf & 64) != 0 {
+                    count1_value(l, dst_in, dst + 1, one)
+                }
+                np = np - 1
+                if np == 0 {
+                    np = (lb(sfb, 0) as i32) / 2
+                    sfb = sfb + 1
                     if np == 0 {
-                        np = (lb(sfb, 0) as i32) / 2
-                        sfb = sfb + 1
-                        if np == 0 {
-                            done = true
-                            break
-                        }
+                        done = true
+                    } else {
                         one = lf(scf_in, scf)
                         scf = scf + 1
                     }
                 }
-                if (leaf & (128 >> (s as u32))) != 0 {
-                    var v: f32 = one
-                    if cache_negative(l) {
-                        v = -one
+                if !done {
+                    if (leaf & 32) != 0 {
+                        count1_value(l, dst_in, dst + 2, one)
                     }
-                    sf(dst_in, dst + s as i64, v)
-                    flush_bits(l, 1)
+                    if (leaf & 16) != 0 {
+                        count1_value(l, dst_in, dst + 3, one)
+                    }
                 }
-                s = s + 1
             }
             if !done {
                 check_bits(l)
@@ -1648,6 +1673,18 @@ fn scale_pcm4(src: u64, out: u64) {
     __v128_store(out as *mut u8, r)
 }
 
+// Same result as `scale_pcm4`, but the limits are applied BEFORE the
+// conversion: clamping to [-32767.5, 32766.5] gives exactly 32767 / -32768 after
+// the +0.5 / truncation / negative correction, and a NaN lands on the upper
+// limit (min returns its second operand for NaN) like in the scalar version.
+fn scale_pcm4c(v: v128) -> v128 {
+    let kp: u64 = (&PCM_CONST[0]) as u64
+    let t: v128 = __v128_minf32(__v128_maxf32(bcast(kp, 2), v), bcast(kp, 1))
+    let i0: v128 = __v128_trunc_f32_i32(__v128_addf32(t, bcast(kp, 0)))
+    let neg: v128 = __v128_cmpgt_i32(__v128_zero(), i0)
+    return __v128_add32(i0, neg)
+}
+
 fn scale_pcm(abtast: f32) -> i16 {
     let bottom: i32 = -32768
     if abtast >= 32766.5f {
@@ -1721,9 +1758,17 @@ fn synth(t: *mut mp3_tab.Tabs, xl: u64, dstl: u64, nch: i32, lins: u64) {
     // instead of an array, the addresses are computed once per (i,k)
     // instead of four times, and the body is unrolled. The ORDER of the
     // computation is unchanged -- the output stays bit-identical.
-    var w: i64 = 0
-    var i: i32 = 14
-    while i >= 0 {
+    let nl: i64 = nch as i64
+    var o1: i64 = nl
+    var o2: i64 = 31 * nl
+    let n32: i64 = 32 * nl
+    var pt_l: u64 = adr4(xl, 18 * 17)
+    let dx: u64 = xr - xl
+    var pb_l: u64 = adr4(xl, 18 * 15)
+    var zb: u64 = adr4(zlin, 4 * 14 - 15 * 64)
+    var pwp: u64 = win
+    let wend: u64 = adr4(win, 240)
+    while pwp < wend {
         // INTERLEAVE INSTEAD OF EIGHT SINGLE ACCESSES (round TEMPO 7).
         //
         // The eight values come in pairs from `xl` and `xr` -- from
@@ -1740,21 +1785,15 @@ fn synth(t: *mut mp3_tab.Tabs, xl: u64, dstl: u64, nch: i32, lins: u64) {
         // The second half writes into TWO pairs at different places;
         // for that there is `__v128_store64` (only the lower half) and once
         // `shuffle32(.., 0x0E)`, which brings the upper two lanes down.
-        let il: i64 = i as i64
-        let nl: i64 = nch as i64
-        let a_top: i64 = 18 * (31 - il)
-        let vl_top: v128 = __v128_load(adr4(xl, a_top) as *u8)
-        let vr_top: v128 = __v128_load(adr4(xr, a_top) as *u8)
-        __v128_store(adr4(zlin, 4 * il) as *mut u8,
-            __v128_unpacklo32(vl_top, vr_top))
+        let vl_top: v128 = __v128_load(pt_l as *u8)
+        let vr_top: v128 = __v128_load((pt_l +% dx) as *u8)
+        __v128_store((zb +% 3840) as *mut u8, __v128_unpacklo32(vl_top, vr_top))
 
-        let b_bottom: i64 = 18 * (1 + il)
-        let vl_bottom: v128 = __v128_load(adr4(xl, b_bottom) as *u8)
-        let vr_bottom: v128 = __v128_load(adr4(xr, b_bottom) as *u8)
+        let vl_bottom: v128 = __v128_load(pb_l as *u8)
+        let vr_bottom: v128 = __v128_load((pb_l +% dx) as *u8)
         let verzahnt: v128 = __v128_unpacklo32(vl_bottom, vr_bottom)
-        __v128_store64(adr4(zlin, 4 * (il - 16) + 2) as *mut u8, verzahnt)
-        __v128_store64(adr4(zlin, 4 * (il + 16)) as *mut u8,
-            __v128_shuffle32(verzahnt, 14))
+        __v128_store64((zb +% 3592) as *mut u8, verzahnt)
+        __v128_store64((zb +% 4096) as *mut u8, __v128_shuffle32(verzahnt, 14))
 
         // FOUR LANES AT ONCE (round TEMPO 4).
         //
@@ -1770,8 +1809,6 @@ fn synth(t: *mut mp3_tab.Tabs, xl: u64, dstl: u64, nch: i32, lins: u64) {
         // and `__v128_shuffle32` spreads each onto all four lanes. That is why
         // `win` has four values of padding (`mp3_tab.fi`) -- the last load reads
         // sixteen octets from the second-to-last pair.
-        var va: v128 = __v128_zero()
-        var vb: v128 = __v128_zero()
 
         // POINTER INSTEAD OF INDEX (round TEMPO 5). The three addresses run in
         // fixed steps: `zlin` 256 octets downwards, the second the same
@@ -1779,55 +1816,115 @@ fn synth(t: *mut mp3_tab.Tabs, xl: u64, dstl: u64, nch: i32, lins: u64) {
         // and then advanced, it saves the whole index computation -- measured,
         // it was half of the work here. The same addresses, so
         // the same output.
-        var pz: u64 = adr4(zlin, 4 * il)
-        var py: u64 = adr4(zlin, 4 * il - 15 * 64)
-        var pw: u64 = adr4(win, w)
-        var k: i32 = 0
-        while k < 8 {
-            let vwp: v128 = __v128_load(pw as *u8)
-            let vw0: v128 = __v128_shuffle32(vwp, 0)
-            let vw1: v128 = __v128_shuffle32(vwp, 85)
-            w = w + 2
-            pw = pw +% 8
-            let vz: v128 = __v128_load(pz as *u8)
-            let vy: v128 = __v128_load(py as *u8)
-            pz = pz -% 256
-            py = py +% 256
-            let zw1: v128 = __v128_mulf32(vz, vw1)
-            let yw0: v128 = __v128_mulf32(vy, vw0)
-            let zw0: v128 = __v128_mulf32(vz, vw0)
-            let yw1: v128 = __v128_mulf32(vy, vw1)
-            if k == 0 {
-                vb = __v128_addf32(zw1, yw0)
-                va = __v128_subf32(zw0, yw1)
-            } else {
-                vb = __v128_addf32(vb, __v128_addf32(zw1, yw0))
-                if (k & 1) == 1 {
-                    va = __v128_addf32(va, __v128_subf32(yw1, zw0))
-                } else {
-                    va = __v128_addf32(va, __v128_subf32(zw0, yw1))
-                }
-            }
-            k = k + 1
-        }
-        var af: [f32; 4] = [0.0f; 4]
-        var bf: [f32; 4] = [0.0f; 4]
+        let pw: u64 = pwp
+        var va: v128 = __v128_zero()
+        var vb: v128 = __v128_zero()
+        let vwp0: v128 = __v128_load(pw as *u8)
+        let vw0_0: v128 = __v128_shuffle32(vwp0, 0)
+        let vw1_0: v128 = __v128_shuffle32(vwp0, 85)
+        let vz0: v128 = __v128_load((zb +% 3840) as *u8)
+        let vy0: v128 = __v128_load(zb as *u8)
+        let zw1_0: v128 = __v128_mulf32(vz0, vw1_0)
+        let yw0_0: v128 = __v128_mulf32(vy0, vw0_0)
+        let zw0_0: v128 = __v128_mulf32(vz0, vw0_0)
+        let yw1_0: v128 = __v128_mulf32(vy0, vw1_0)
+        vb = __v128_addf32(zw1_0, yw0_0)
+        va = __v128_subf32(zw0_0, yw1_0)
+        let vwp1: v128 = __v128_load((pw +% 8) as *u8)
+        let vw0_1: v128 = __v128_shuffle32(vwp1, 0)
+        let vw1_1: v128 = __v128_shuffle32(vwp1, 85)
+        let vz1: v128 = __v128_load((zb +% 3584) as *u8)
+        let vy1: v128 = __v128_load((zb +% 256) as *u8)
+        let zw1_1: v128 = __v128_mulf32(vz1, vw1_1)
+        let yw0_1: v128 = __v128_mulf32(vy1, vw0_1)
+        let zw0_1: v128 = __v128_mulf32(vz1, vw0_1)
+        let yw1_1: v128 = __v128_mulf32(vy1, vw1_1)
+        vb = __v128_addf32(vb, __v128_addf32(zw1_1, yw0_1))
+        va = __v128_addf32(va, __v128_subf32(yw1_1, zw0_1))
+        let vwp2: v128 = __v128_load((pw +% 16) as *u8)
+        let vw0_2: v128 = __v128_shuffle32(vwp2, 0)
+        let vw1_2: v128 = __v128_shuffle32(vwp2, 85)
+        let vz2: v128 = __v128_load((zb +% 3328) as *u8)
+        let vy2: v128 = __v128_load((zb +% 512) as *u8)
+        let zw1_2: v128 = __v128_mulf32(vz2, vw1_2)
+        let yw0_2: v128 = __v128_mulf32(vy2, vw0_2)
+        let zw0_2: v128 = __v128_mulf32(vz2, vw0_2)
+        let yw1_2: v128 = __v128_mulf32(vy2, vw1_2)
+        vb = __v128_addf32(vb, __v128_addf32(zw1_2, yw0_2))
+        va = __v128_addf32(va, __v128_subf32(zw0_2, yw1_2))
+        let vwp3: v128 = __v128_load((pw +% 24) as *u8)
+        let vw0_3: v128 = __v128_shuffle32(vwp3, 0)
+        let vw1_3: v128 = __v128_shuffle32(vwp3, 85)
+        let vz3: v128 = __v128_load((zb +% 3072) as *u8)
+        let vy3: v128 = __v128_load((zb +% 768) as *u8)
+        let zw1_3: v128 = __v128_mulf32(vz3, vw1_3)
+        let yw0_3: v128 = __v128_mulf32(vy3, vw0_3)
+        let zw0_3: v128 = __v128_mulf32(vz3, vw0_3)
+        let yw1_3: v128 = __v128_mulf32(vy3, vw1_3)
+        vb = __v128_addf32(vb, __v128_addf32(zw1_3, yw0_3))
+        va = __v128_addf32(va, __v128_subf32(yw1_3, zw0_3))
+        let vwp4: v128 = __v128_load((pw +% 32) as *u8)
+        let vw0_4: v128 = __v128_shuffle32(vwp4, 0)
+        let vw1_4: v128 = __v128_shuffle32(vwp4, 85)
+        let vz4: v128 = __v128_load((zb +% 2816) as *u8)
+        let vy4: v128 = __v128_load((zb +% 1024) as *u8)
+        let zw1_4: v128 = __v128_mulf32(vz4, vw1_4)
+        let yw0_4: v128 = __v128_mulf32(vy4, vw0_4)
+        let zw0_4: v128 = __v128_mulf32(vz4, vw0_4)
+        let yw1_4: v128 = __v128_mulf32(vy4, vw1_4)
+        vb = __v128_addf32(vb, __v128_addf32(zw1_4, yw0_4))
+        va = __v128_addf32(va, __v128_subf32(zw0_4, yw1_4))
+        let vwp5: v128 = __v128_load((pw +% 40) as *u8)
+        let vw0_5: v128 = __v128_shuffle32(vwp5, 0)
+        let vw1_5: v128 = __v128_shuffle32(vwp5, 85)
+        let vz5: v128 = __v128_load((zb +% 2560) as *u8)
+        let vy5: v128 = __v128_load((zb +% 1280) as *u8)
+        let zw1_5: v128 = __v128_mulf32(vz5, vw1_5)
+        let yw0_5: v128 = __v128_mulf32(vy5, vw0_5)
+        let zw0_5: v128 = __v128_mulf32(vz5, vw0_5)
+        let yw1_5: v128 = __v128_mulf32(vy5, vw1_5)
+        vb = __v128_addf32(vb, __v128_addf32(zw1_5, yw0_5))
+        va = __v128_addf32(va, __v128_subf32(yw1_5, zw0_5))
+        let vwp6: v128 = __v128_load((pw +% 48) as *u8)
+        let vw0_6: v128 = __v128_shuffle32(vwp6, 0)
+        let vw1_6: v128 = __v128_shuffle32(vwp6, 85)
+        let vz6: v128 = __v128_load((zb +% 2304) as *u8)
+        let vy6: v128 = __v128_load((zb +% 1536) as *u8)
+        let zw1_6: v128 = __v128_mulf32(vz6, vw1_6)
+        let yw0_6: v128 = __v128_mulf32(vy6, vw0_6)
+        let zw0_6: v128 = __v128_mulf32(vz6, vw0_6)
+        let yw1_6: v128 = __v128_mulf32(vy6, vw1_6)
+        vb = __v128_addf32(vb, __v128_addf32(zw1_6, yw0_6))
+        va = __v128_addf32(va, __v128_subf32(zw0_6, yw1_6))
+        let vwp7: v128 = __v128_load((pw +% 56) as *u8)
+        let vw0_7: v128 = __v128_shuffle32(vwp7, 0)
+        let vw1_7: v128 = __v128_shuffle32(vwp7, 85)
+        let vz7: v128 = __v128_load((zb +% 2048) as *u8)
+        let vy7: v128 = __v128_load((zb +% 1792) as *u8)
+        let zw1_7: v128 = __v128_mulf32(vz7, vw1_7)
+        let yw0_7: v128 = __v128_mulf32(vy7, vw0_7)
+        let zw0_7: v128 = __v128_mulf32(vz7, vw0_7)
+        let yw1_7: v128 = __v128_mulf32(vy7, vw1_7)
+        vb = __v128_addf32(vb, __v128_addf32(zw1_7, yw0_7))
+        va = __v128_addf32(va, __v128_subf32(yw1_7, zw0_7))
         var ai: [i32; 4] = [0; 4]
         var bi: [i32; 4] = [0; 4]
-        __v128_store((&af[0]) as *mut u8, va)
-        __v128_store((&bf[0]) as *mut u8, vb)
-        scale_pcm4((&af[0]) as u64, (&ai[0]) as u64)
-        scale_pcm4((&bf[0]) as u64, (&bi[0]) as u64)
-
-        s16(dstr, (15 - il) * nl, ai[1] as i16)
-        s16(dstr, (17 + il) * nl, bi[1] as i16)
-        s16(dstl, (15 - il) * nl, ai[0] as i16)
-        s16(dstl, (17 + il) * nl, bi[0] as i16)
-        s16(dstr, (47 - il) * nl, ai[3] as i16)
-        s16(dstr, (49 + il) * nl, bi[3] as i16)
-        s16(dstl, (47 - il) * nl, ai[2] as i16)
-        s16(dstl, (49 + il) * nl, bi[2] as i16)
-        i = i - 1
+        __v128_store((&ai[0]) as *mut u8, scale_pcm4c(va))
+        __v128_store((&bi[0]) as *mut u8, scale_pcm4c(vb))
+        s16(dstr, o1, ai[1] as i16)
+        s16(dstr, o2, bi[1] as i16)
+        s16(dstl, o1, ai[0] as i16)
+        s16(dstl, o2, bi[0] as i16)
+        s16(dstr, o1 + n32, ai[3] as i16)
+        s16(dstr, o2 + n32, bi[3] as i16)
+        s16(dstl, o1 + n32, ai[2] as i16)
+        s16(dstl, o2 + n32, bi[2] as i16)
+        pt_l = pt_l +% 72
+        pb_l = pb_l -% 72
+        zb = zb -% 16
+        pwp = pwp +% 64
+        o1 = o1 + nl
+        o2 = o2 - nl
     }
 }
 

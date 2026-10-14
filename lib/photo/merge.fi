@@ -1,0 +1,290 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/merge.fi -- photo.merge: robust burst merge with ghost rejection and exposure bracketing.
+//
+//     var b: merge.Burst = merge.burst_new()
+//     merge.burst_add(&b, frame0, 1.0f)           // owns the image; 2nd argument = exposure gain (1 = normal)
+//     merge.burst_add(&b, frame1, 1.0f)
+//     merge.burst_add(&b, short_frame, 0.25f)     // a bracketed frame with a quarter of the exposure
+//     var out: image.Image = ...                  // filled by merge_burst
+//     merge.merge_burst(&b, 0, &nm, &out, &var_plane, &wsum)
+//     merge.burst_free(&b)
+//
+// Frames are LINEAR RGB (3 channels, 0..1 sensor range, 1 = clipped). `gain` is the exposure of the frame
+// relative to a normal exposure; the merge divides by it, so the output is in scene radiance units of the
+// reference frame (it may exceed 1.0 when a short frame recovered clipped highlights).
+// METHOD per alternate frame: tile alignment (photo.align) -> sample at the per-pixel flow -> normalised
+// difference to the reference in units of the expected noise (from the (S, O) model) -> 3x3 mean -> soft weight
+// exp(-max(0, T - 1.5) / 1.5) (Wiener-like: a pixel that differs by more than noise explains is a mover or a
+// misalignment and is ignored) -> inverse-variance weighting -> weighted mean. Clipped pixels get weight 0
+// in any frame. `var_plane` is the expected noise variance of the result (channel G, radiance units) and
+// `wsum` the summed weights (about the number of frames that contributed).
+import std.rt
+import photo.image
+import photo.align
+import photo.noise
+import photo.filter
+
+export {
+    Burst, BURST_MAX,
+    MergeOpts, merge_default, burst_new, burst_add, burst_free, merge_burst, merge_burst_opts, CLIP,
+}
+
+const BURST_MAX: i32 = 24
+const CLIP: f32 = 0.97f
+
+struct Burst {
+    n: i32,
+    frames: [image.Image; 24],
+    gain: [f32; 24],
+}
+
+fn burst_new() -> Burst {
+    return Burst { n: 0, frames: [image.Image { w: 0, h: 0, ch: 0, px: 0 as u64 }; 24], gain: [1.0f; 24] }
+}
+
+// Takes ownership of `im` (3 channels). Returns false when the burst is full.
+fn burst_add(b: *mut Burst, im: image.Image, gain: f32) -> bool {
+    if (*b).n >= BURST_MAX { return false }
+    (*b).frames[(*b).n as usize] = im
+    (*b).gain[(*b).n as usize] = gain
+    (*b).n = (*b).n + 1
+    return true
+}
+
+fn burst_free(b: *mut Burst) {
+    var i: i32 = 0
+    while i < (*b).n {
+        image.img_free(&(*b).frames[i as usize])
+        i = i + 1
+    }
+    (*b).n = 0
+}
+
+// A pixel counts as clipped when it or any pixel of its 3x3 neighbourhood is at the sensor limit (a bilinear
+// sample next to a clipped pixel is an under-estimate and must not be trusted).
+fn is_clipped(im: *mut image.Image, x: i32, y: i32) -> bool {
+    var dy: i32 = -1
+    while dy <= 1 {
+        var dx: i32 = -1
+        while dx <= 1 {
+            if image.img_getc(im, 0, x + dx, y + dy) > CLIP || image.img_getc(im, 1, x + dx, y + dy) > CLIP || image.img_getc(im, 2, x + dx, y + dy) > CLIP {
+                return true
+            }
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+    return false
+}
+
+// Tuning of the temporal filter. thr/soft: a pixel whose normalised difference T (1 = pure noise) is above
+// `thr` gets weight exp(-(T - thr) / soft); larger values accept more (night mode: very noisy, the difference
+// statistic itself is noisy). align_blur: Gaussian sigma applied to the luma used for ALIGNMENT only (0 = none),
+// which keeps the tile search from locking onto noise in dark frames.
+struct MergeOpts {
+    thr: f32,
+    soft: f32,
+    align_blur: f32,
+}
+
+fn merge_default() -> MergeOpts {
+    return MergeOpts { thr: 1.5f, soft: 1.5f, align_blur: 0.0f }
+}
+
+fn merge_burst(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, out: *mut image.Image, var_plane: *mut image.Image, wsum: *mut image.Image) {
+    var mo: MergeOpts = merge_default()
+    merge_burst_opts(b, ref_idx, nm, &mo, out, var_plane, wsum)
+}
+
+// Merge the burst around frame `ref_idx`. `out` (3 ch), `var_plane` and `wsum` (1 ch) are created here.
+fn merge_burst_opts(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, mo: *mut MergeOpts, out: *mut image.Image, var_plane: *mut image.Image, wsum: *mut image.Image) {
+    let rf: *mut image.Image = &(*b).frames[ref_idx as usize]
+    let w: i32 = (*rf).w
+    let h: i32 = (*rf).h
+    let gr: f32 = (*b).gain[ref_idx as usize]
+    *out = image.img_new(w, h, 3)
+    *var_plane = image.img_new(w, h, 1)
+    *wsum = image.img_new(w, h, 1)
+    var acc: image.Image = image.img_new(w, h, 3)
+    var vnum: image.Image = image.img_new(w, h, 1)
+    var tmap: image.Image = image.img_new(w, h, 1)
+    var wmap: image.Image = image.img_new(w, h, 1)
+
+    // reference contribution
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            var wr: f32 = 1.0f
+            if is_clipped(rf, x, y) { wr = 0.0f }
+            var c: i32 = 0
+            while c < 3 {
+                image.img_set(&acc, c, x, y, wr * image.img_get(rf, c, x, y) / gr)
+                c = c + 1
+            }
+            let vg: f32 = noise.variance(nm, 1, image.img_get(rf, 1, x, y)) / (gr * gr)
+            image.img_set(wsum, 0, x, y, wr)
+            image.img_set(&vnum, 0, x, y, wr * wr * vg)
+            x = x + 1
+        }
+        y = y + 1
+    }
+
+    var lr: image.Image = image.img_luma(rf)
+    if (*mo).align_blur > 0.0f {
+        let lb: image.Image = filter.gauss_blur(&lr, (*mo).align_blur)
+        image.img_free(&lr)
+        lr = lb
+    }
+    var pr: align.Pyr = align.pyr_build(&lr)
+    image.img_free(&lr)
+
+    var j: i32 = 0
+    while j < (*b).n {
+        if j == ref_idx {
+            j = j + 1
+            continue
+        }
+        let af: *mut image.Image = &(*b).frames[j as usize]
+        let ga: f32 = (*b).gain[j as usize]
+        // alignment on exposure-normalised luma
+        var la: image.Image = image.img_luma(af)
+        var n: i32 = 0
+        while n < w * h {
+            let p: *mut f32 = (la.px + (n as u64) * (4 as u64)) as *mut f32
+            *p = image.fminf(*p * gr / ga, 1.0f)
+            n = n + 1
+        }
+        // the reference luma must be exposure-normalised the same way: reference luma is at gain gr already
+        if (*mo).align_blur > 0.0f {
+            let lb: image.Image = filter.gauss_blur(&la, (*mo).align_blur)
+            image.img_free(&la)
+            la = lb
+        }
+        var pa: align.Pyr = align.pyr_build(&la)
+        image.img_free(&la)
+        var fl: align.Flow = align.align_flow(&pr, &pa)
+        align.pyr_free(&pa)
+
+        // pass 1: normalised squared difference T (mean over channels, expected 1 for pure noise)
+        y = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                var dx: f32 = 0.0f
+                var dy: f32 = 0.0f
+                align.flow_at(&fl, x as f32, y as f32, &dx, &dy)
+                let sx: f32 = (x as f32) + dx
+                let sy: f32 = (y as f32) + dy
+                var t: f32 = 0.0f
+                var c: i32 = 0
+                while c < 3 {
+                    let av: f32 = image.img_sample(af, c, sx, sy)
+                    let rv: f32 = image.img_get(rf, c, x, y)
+                    let d: f32 = av / ga - rv / gr
+                    let va: f32 = noise.variance(nm, c, av) / (ga * ga) + noise.variance(nm, c, rv) / (gr * gr)
+                    t = t + d * d / va
+                    c = c + 1
+                }
+                if is_clipped(rf, x, y) {
+                    t = 0.0f
+                }
+                image.img_set(&tmap, 0, x, y, t / 3.0f)
+                // mark clipped alt samples with a huge T
+                if is_clipped(af, (sx + 0.5f) as i32, (sy + 0.5f) as i32) {
+                    image.img_set(&tmap, 0, x, y, 1.0e6f)
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        // pass 2: 3x3 mean of T (clipped marks stay huge), weight, accumulate
+        y = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                var s: f32 = 0.0f
+                var mx: f32 = 0.0f
+                var dy: i32 = -1
+                while dy <= 1 {
+                    var dx: i32 = -1
+                    while dx <= 1 {
+                        let v: f32 = image.img_getc(&tmap, 0, x + dx, y + dy)
+                        if v > mx { mx = v }
+                        s = s + v
+                        dx = dx + 1
+                    }
+                    dy = dy + 1
+                }
+                var tt: f32 = s / 9.0f
+                var wgt: f32 = image.expneg(image.fmaxf(tt - (*mo).thr, 0.0f) / (*mo).soft)
+                if image.img_get(&tmap, 0, x, y) > 1.0e5f { wgt = 0.0f }
+                image.img_set(&wmap, 0, x, y, wgt)
+                x = x + 1
+            }
+            y = y + 1
+        }
+        y = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                var dx: f32 = 0.0f
+                var dy: f32 = 0.0f
+                align.flow_at(&fl, x as f32, y as f32, &dx, &dy)
+                let sx: f32 = (x as f32) + dx
+                let sy: f32 = (y as f32) + dy
+                let ag: f32 = image.img_sample(af, 1, sx, sy)
+                let va: f32 = noise.variance(nm, 1, ag) / (ga * ga)
+                let vr: f32 = noise.variance(nm, 1, image.img_get(rf, 1, x, y)) / (gr * gr)
+                // inverse-variance weight relative to the reference, bounded
+                var rel: f32 = vr / va
+                if rel > 4.0f { rel = 4.0f }
+                let wgt: f32 = image.img_get(&wmap, 0, x, y) * rel
+                if wgt > 0.0f {
+                    var c: i32 = 0
+                    while c < 3 {
+                        image.img_set(&acc, c, x, y, image.img_get(&acc, c, x, y) + wgt * image.img_sample(af, c, sx, sy) / ga)
+                        c = c + 1
+                    }
+                    image.img_set(wsum, 0, x, y, image.img_get(wsum, 0, x, y) + wgt)
+                    image.img_set(&vnum, 0, x, y, image.img_get(&vnum, 0, x, y) + wgt * wgt * va)
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        align.flow_free(&fl)
+        j = j + 1
+    }
+    align.pyr_free(&pr)
+
+    y = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let ws: f32 = image.img_get(wsum, 0, x, y)
+            if ws > 1.0e-3f {
+                var c: i32 = 0
+                while c < 3 {
+                    image.img_set(out, c, x, y, image.img_get(&acc, c, x, y) / ws)
+                    c = c + 1
+                }
+                image.img_set(var_plane, 0, x, y, image.img_get(&vnum, 0, x, y) / (ws * ws))
+            } else {
+                var c: i32 = 0
+                while c < 3 {
+                    image.img_set(out, c, x, y, image.img_get(rf, c, x, y) / gr)
+                    c = c + 1
+                }
+                image.img_set(var_plane, 0, x, y, noise.variance(nm, 1, image.img_get(rf, 1, x, y)) / (gr * gr))
+                image.img_set(wsum, 0, x, y, 1.0f)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image.img_free(&acc)
+    image.img_free(&vnum)
+    image.img_free(&tmap)
+    image.img_free(&wmap)
+}

@@ -1,0 +1,158 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/pipeline.fi -- photo.pipeline: the whole photo pipeline in three entry points (FirnCam core).
+//
+//     import photo.pipeline
+//
+//     var m: meta.SensorMeta = meta.meta_default()      // fill from Camera2 or leave the defaults
+//     var o: pipeline.PipeOpts = pipeline.opts_default()
+//     var out: image.Image = ...                         // created by the call: 3 ch, sRGB encoded, 0..1
+//     pipeline.process_burst(&burst, &m, &o, &out)       // burst of linear frames, optionally bracketed
+//     pipeline.process_single_linear(&frame, &m, &o, &out)
+//     pipeline.process_rgba8(rgba_ptr, w, h, &o, &out)   // JPEG / YUV only: denoise + tone + sharpen
+//
+// INPUT KINDS: RAW Bayer mosaics (`raw_to_linear`: black level per CFA site, white level, any CFA order,
+// demosaic), YUV 4:2:0 (`image.img_from_yuv420`), RGBA8/JPEG (`image.img_from_rgba8`). Everything else is the
+// same chain: merge (if >1 frame) -> colour (metadata WB/matrix, else gray-world) -> denoise -> local tone map
+// -> sRGB -> sharpen. The noise model comes from the metadata when it has a profile, else it is MEASURED from the
+// pixels (`noise.estimate_model`), so unknown devices work. No device constant is built in.
+import std.rt
+import photo.image
+import photo.meta
+import photo.noise
+import photo.merge
+import photo.denoise
+import photo.tonemap
+import photo.sharpen
+import photo.color
+
+export {
+    PipeOpts, opts_default, raw_to_linear, process_burst, process_single_linear, process_rgba8, pick_reference, finish_chain,
+}
+
+struct PipeOpts {
+    denoise: f32,
+    keep: f32,
+    tone: f32,
+    sharpen: f32,
+    wb: f32,
+    ref_idx: i32,
+}
+
+fn opts_default() -> PipeOpts {
+    return PipeOpts { denoise: 1.0f, keep: 0.10f, tone: 1.0f, sharpen: 0.6f, wb: 0.7f, ref_idx: -1 }
+}
+
+// u16 RAW mosaic (stride in samples) -> demosaiced camera RGB, normalised by the black / white level of the
+// metadata (defaults: black 0, white 65535 when has_black is false). Values may go slightly negative (noise
+// below the black level) and are kept: clamping would bias the dark noise.
+fn raw_to_linear(p: u64, w: i32, h: i32, stride: i32, m: *mut meta.SensorMeta) -> image.Image {
+    var mosaic: image.Image = image.img_new(w, h, 1)
+    var white: f32 = 65535.0f
+    if (*m).has_black { white = (*m).white_level }
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let site: usize = (((y & 1) * 2 + (x & 1))) as usize
+            var bl: f32 = 0.0f
+            if (*m).has_black { bl = (*m).black[site] }
+            let v: f32 = ((*((p + (((y * stride + x) * 2) as u64)) as *mut u16)) as f32 - bl) / (white - bl)
+            image.img_set(&mosaic, 0, x, y, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let rgb: image.Image = image.img_demosaic(&mosaic, (*m).cfa)
+    image.img_free(&mosaic)
+    return rgb
+}
+
+// Frame closest to gain 1 that is the sharpest (variance of the Laplacian of green).
+fn pick_reference(b: *mut merge.Burst) -> i32 {
+    var best: i32 = 0
+    var bs: f32 = -1.0f
+    var i: i32 = 0
+    while i < (*b).n {
+        var g: f32 = (*b).gain[i as usize]
+        if g < 1.0f { g = 1.0f / g }
+        var s: f32 = image.sharpness(&(*b).frames[i as usize], 1) / (g * g * g * g)
+        if s > bs {
+            bs = s
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn finish_chain(lin: *mut image.Image, var_plane: *mut image.Image, m: *mut meta.SensorMeta, o: *mut PipeOpts, out: *mut image.Image) {
+    if (*m).has_wb || (*m).has_forward {
+        color.apply_meta_color(lin, m)
+    } else if (*o).wb > 0.0f {
+        color.gray_world(lin, (*o).wb)
+    }
+    var den: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&den)
+    denoise.denoise(lin, var_plane, (*o).denoise, (*o).keep, &den)
+    var to: tonemap.ToneOpts = tonemap.tone_default()
+    to.strength = (*o).tone
+    tonemap.tonemap(&den, &to)
+    image.img_to_srgb(&den)
+    if (*o).sharpen > 0.0f {
+        sharpen.sharpen(&den, (*o).sharpen, 1.2f, 0.004f)
+    }
+    *out = den
+}
+
+// Burst (optionally bracketed). The burst keeps ownership of its frames.
+fn process_burst(b: *mut merge.Burst, m: *mut meta.SensorMeta, o: *mut PipeOpts, out: *mut image.Image) {
+    var r: i32 = (*o).ref_idx
+    if r < 0 || r >= (*b).n { r = pick_reference(b) }
+    var nm: noise.NoiseModel = noise.from_meta(m)
+    if !(*m).has_noise {
+        nm = noise.estimate_model(&(*b).frames[r as usize])
+    }
+    var lin: image.Image = image.img_new(1, 1, 3)
+    var vp: image.Image = image.img_new(1, 1, 1)
+    var ws: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&lin)
+    image.img_free(&vp)
+    image.img_free(&ws)
+    merge.merge_burst(b, r, &nm, &lin, &vp, &ws)
+    image.img_free(&ws)
+    finish_chain(&lin, &vp, m, o, out)
+    image.img_free(&lin)
+    image.img_free(&vp)
+}
+
+// One linear frame (gain 1): no merge, noise from the model, then the common chain.
+fn process_single_linear(im: *mut image.Image, m: *mut meta.SensorMeta, o: *mut PipeOpts, out: *mut image.Image) {
+    var nm: noise.NoiseModel = noise.from_meta(m)
+    if !(*m).has_noise {
+        nm = noise.estimate_model(im)
+    }
+    var lin: image.Image = image.img_copy(im)
+    var vp: image.Image = image.img_new((*im).w, (*im).h, 1)
+    var y: i32 = 0
+    while y < (*im).h {
+        var x: i32 = 0
+        while x < (*im).w {
+            image.img_set(&vp, 0, x, y, noise.variance(&nm, 1, image.img_get(im, 1, x, y)))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    finish_chain(&lin, &vp, m, o, out)
+    image.img_free(&lin)
+    image.img_free(&vp)
+}
+
+// JPEG-only fallback (display-encoded RGBA8): linearise, MEASURE the noise, denoise + tone + sharpen.
+// There is no metadata, so no WB from the device; gray-world is applied only when o.wb > 0.
+fn process_rgba8(rgba: u64, w: i32, h: i32, o: *mut PipeOpts, out: *mut image.Image) {
+    var m: meta.SensorMeta = meta.meta_default()
+    var im: image.Image = image.img_from_rgba8(rgba, w, h)
+    image.img_from_srgb(&im)
+    process_single_linear(&im, &m, o, out)
+    image.img_free(&im)
+}

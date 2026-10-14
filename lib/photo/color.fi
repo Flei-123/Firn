@@ -1,0 +1,96 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/color.fi -- photo.color: white balance and colour space for the photo pipeline.
+//
+//     color.apply_meta_color(&img, &meta)         // camera RGB -> linear sRGB when the device gave WB gains / matrix
+//     color.gray_world(&img, 0.7f)                // partial gray-world balance with bounds (no metadata needed)
+//
+// * apply_meta_color: uses `has_wb` (R, G(r+b mean of Gr/Gb), B gains) and `has_forward` (DNG ForwardMatrix:
+//   white-balanced camera RGB -> XYZ D50, then the fixed XYZ D50 -> linear sRGB matrix). Missing parts are skipped.
+// * gray_world: gains = mean(G) / mean(c) over non-clipped mid-tone pixels (0.02 < Y < 0.9), clamped to [0.6, 1.7]
+//   and applied with `strength` (a sunset keeps part of its warmth). Skip it when the device gave WB gains.
+// * The display encoding is `image.img_to_srgb`.
+import photo.image
+import photo.meta
+
+export {
+    apply_meta_color, gray_world, apply_gains, estimate_gains,
+}
+
+fn apply_gains(im: *mut image.Image, gr: f32, gg: f32, gb: f32) {
+    var y: i32 = 0
+    while y < (*im).h {
+        var x: i32 = 0
+        while x < (*im).w {
+            image.img_set(im, 0, x, y, image.img_get(im, 0, x, y) * gr)
+            image.img_set(im, 1, x, y, image.img_get(im, 1, x, y) * gg)
+            image.img_set(im, 2, x, y, image.img_get(im, 2, x, y) * gb)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// Gray-world gains (R, G, B) with G = 1, bounded; out = [gr, 1, gb] times strength in the exponent.
+fn estimate_gains(im: *mut image.Image, strength: f32, out: *mut f32) {
+    var sr: f64 = 0.0
+    var sg: f64 = 0.0
+    var sb: f64 = 0.0
+    var y: i32 = 0
+    while y < (*im).h {
+        var x: i32 = 0
+        while x < (*im).w {
+            let r: f32 = image.img_get(im, 0, x, y)
+            let g: f32 = image.img_get(im, 1, x, y)
+            let b: f32 = image.img_get(im, 2, x, y)
+            let l: f32 = 0.2126f * r + 0.7152f * g + 0.0722f * b
+            if l > 0.02f && l < 0.9f && r < 0.97f && g < 0.97f && b < 0.97f {
+                sr = sr + (r as f64)
+                sg = sg + (g as f64)
+                sb = sb + (b as f64)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var gr: f32 = 1.0f
+    var gb: f32 = 1.0f
+    if sr > 0.0 && sb > 0.0 {
+        gr = image.fclampf((sg / sr) as f32, 0.6f, 1.7f)
+        gb = image.fclampf((sg / sb) as f32, 0.6f, 1.7f)
+    }
+    // partial strength: g^strength via linear blend in log-ish space (small deviations: linear is fine)
+    *out = 1.0f + strength * (gr - 1.0f)
+    *((out as u64 + 4 as u64) as *mut f32) = 1.0f
+    *((out as u64 + 8 as u64) as *mut f32) = 1.0f + strength * (gb - 1.0f)
+}
+
+fn gray_world(im: *mut image.Image, strength: f32) {
+    var g: [f32; 3] = [1.0f; 3]
+    estimate_gains(im, strength, &g[0])
+    apply_gains(im, g[0], g[1], g[2])
+}
+
+fn apply_meta_color(im: *mut image.Image, m: *mut meta.SensorMeta) {
+    if (*m).has_wb {
+        apply_gains(im, (*m).wb[0], 0.5f * ((*m).wb[1] + (*m).wb[2]), (*m).wb[3])
+    }
+    if (*m).has_forward {
+        var y: i32 = 0
+        while y < (*im).h {
+            var x: i32 = 0
+            while x < (*im).w {
+                let r: f32 = image.img_get(im, 0, x, y)
+                let g: f32 = image.img_get(im, 1, x, y)
+                let b: f32 = image.img_get(im, 2, x, y)
+                let xx: f32 = (*m).forward[0] * r + (*m).forward[1] * g + (*m).forward[2] * b
+                let yy: f32 = (*m).forward[3] * r + (*m).forward[4] * g + (*m).forward[5] * b
+                let zz: f32 = (*m).forward[6] * r + (*m).forward[7] * g + (*m).forward[8] * b
+                image.img_set(im, 0, x, y, meta.srgb_from_xyz_d50(0) * xx + meta.srgb_from_xyz_d50(1) * yy + meta.srgb_from_xyz_d50(2) * zz)
+                image.img_set(im, 1, x, y, meta.srgb_from_xyz_d50(3) * xx + meta.srgb_from_xyz_d50(4) * yy + meta.srgb_from_xyz_d50(5) * zz)
+                image.img_set(im, 2, x, y, meta.srgb_from_xyz_d50(6) * xx + meta.srgb_from_xyz_d50(7) * yy + meta.srgb_from_xyz_d50(8) * zz)
+                x = x + 1
+            }
+            y = y + 1
+        }
+    }
+}

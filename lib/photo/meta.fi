@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/meta.fi -- photo.meta: sensor / capture metadata for the photo pipeline (FirnCam).
+//
+//     import photo.meta
+//
+//     var m: meta.SensorMeta = meta.meta_default()      // robust defaults, nothing hard coded per device
+//     m.iso = 800 as u32                                // fill what the camera API reports ...
+//     meta.meta_set_noise(&m, 0, 2.0e-5f, 1.0e-6f)      // ... e.g. SENSOR_NOISE_PROFILE per CFA channel
+//
+// The Camera2 side fills this struct 1:1 from CameraCharacteristics / CaptureResult (same layout, same units).
+// EVERY field has a `has_*` flag: when the flag is false the pipeline uses a robust default or estimates
+// the value from the pixels (noise: `photo.noise.estimate_model`). No device constants live in the core.
+//
+// Units (Camera2 conventions):
+//   * pixel values of RAW frames are raw integers (0..white_level); `black_level` is subtracted per CFA site
+//   * CFA pattern: Camera2 SENSOR_INFO_COLOR_FILTER_ARRANGEMENT enum: 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR, 4 RGB (no mosaic)
+//   * noise profile: variance of the NORMALISED linear value x in [0,1] (after black level / white level) is
+//     var(x) = S * x + O, one (S, O) pair per CFA site in the order of the 2x2 pattern (top-left, top-right,
+//     bottom-left, bottom-right)
+//   * forward_matrix: camera white-balanced -> XYZ D50 (row-major 3x3), DNG ForwardMatrix1
+//   * wb_gain: R, Gr, Gb, B gains (CaptureResult COLOR_CORRECTION_GAINS), neutral = 1
+//   * exposure_ns: sensor exposure time in nanoseconds; iso: SENSOR_SENSITIVITY
+//   * focus: diopters (1 / metres). min_focus_distance = LENS_INFO_MINIMUM_FOCUS_DISTANCE (nearest focus),
+//     hyperfocal_distance = LENS_INFO_HYPERFOCAL_DISTANCE (both in diopters), focus_calib 0 uncalibrated,
+//     1 approximate, 2 calibrated (LENS_INFO_FOCUS_DISTANCE_CALIBRATION)
+//   * lens fields: focal_length mm, aperture f-number, sensor_width mm
+export {
+    SensorMeta,
+    CFA_RGGB, CFA_GRBG, CFA_GBRG, CFA_BGGR, CFA_RGB,
+    CALIB_NONE, CALIB_APPROX, CALIB_CALIBRATED,
+    meta_default, meta_set_noise, meta_set_black, meta_set_forward, meta_set_wb, meta_set_focus,
+    cfa_color, noise_s, noise_o, black_of, noise_model_rgb,
+    default_noise_for_iso, srgb_from_xyz_d50,
+}
+
+const CFA_RGGB: u32 = 0
+const CFA_GRBG: u32 = 1
+const CFA_GBRG: u32 = 2
+const CFA_BGGR: u32 = 3
+const CFA_RGB: u32 = 4
+
+const CALIB_NONE: u32 = 0
+const CALIB_APPROX: u32 = 1
+const CALIB_CALIBRATED: u32 = 2
+
+struct SensorMeta {
+    cfa: u32,
+    black: [f32; 4],
+    white_level: f32,
+    has_black: bool,
+    ns: [f32; 4],
+    no: [f32; 4],
+    has_noise: bool,
+    forward: [f32; 9],
+    has_forward: bool,
+    wb: [f32; 4],
+    has_wb: bool,
+    iso: u32,
+    exposure_ns: u64,
+    has_exposure: bool,
+    focal_length: f32,
+    aperture: f32,
+    sensor_width: f32,
+    min_focus_distance: f32,
+    hyperfocal_distance: f32,
+    focus_calib: u32,
+    has_focus: bool,
+}
+
+// Defaults: RGGB, 10-bit style white level 1023 / black 64 is NOT assumed -- black 0 and white 1.0 mean
+// "values are already normalised floats". Callers with integer RAW set black/white from the API.
+#[no_gc]
+fn meta_default() -> SensorMeta {
+    return SensorMeta {
+        cfa: CFA_RGGB,
+        black: [0.0f, 0.0f, 0.0f, 0.0f],
+        white_level: 1.0f,
+        has_black: false,
+        ns: [0.0f, 0.0f, 0.0f, 0.0f],
+        no: [0.0f, 0.0f, 0.0f, 0.0f],
+        has_noise: false,
+        forward: [1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f],
+        has_forward: false,
+        wb: [1.0f, 1.0f, 1.0f, 1.0f],
+        has_wb: false,
+        iso: 100 as u32,
+        exposure_ns: 0 as u64,
+        has_exposure: false,
+        focal_length: 0.0f,
+        aperture: 0.0f,
+        sensor_width: 0.0f,
+        min_focus_distance: 0.0f,
+        hyperfocal_distance: 0.0f,
+        focus_calib: CALIB_NONE,
+        has_focus: false,
+    }
+}
+
+#[no_gc]
+fn meta_set_noise(m: *mut SensorMeta, site: usize, s: f32, o: f32) {
+    (*m).ns[site] = s
+    (*m).no[site] = o
+    (*m).has_noise = true
+}
+
+#[no_gc]
+fn meta_set_black(m: *mut SensorMeta, site: usize, black: f32, white: f32) {
+    (*m).black[site] = black
+    (*m).white_level = white
+    (*m).has_black = true
+}
+
+#[no_gc]
+fn meta_set_forward(m: *mut SensorMeta, i: usize, v: f32) {
+    (*m).forward[i] = v
+    (*m).has_forward = true
+}
+
+#[no_gc]
+fn meta_set_wb(m: *mut SensorMeta, site: usize, gain: f32) {
+    (*m).wb[site] = gain
+    (*m).has_wb = true
+}
+
+#[no_gc]
+fn meta_set_focus(m: *mut SensorMeta, min_focus: f32, hyperfocal: f32, calib: u32) {
+    (*m).min_focus_distance = min_focus
+    (*m).hyperfocal_distance = hyperfocal
+    (*m).focus_calib = calib
+    (*m).has_focus = true
+}
+
+// Colour of the CFA site (0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right):
+// 0 red, 1 green, 2 blue. `cfa` outside 0..3 (mosaic-free) answers green.
+fn cfa_color(cfa: u32, site: u32) -> u32 {
+    if cfa == CFA_RGGB {
+        if site == 0 as u32 { return 0 as u32 }
+        if site == 3 as u32 { return 2 as u32 }
+        return 1 as u32
+    }
+    if cfa == CFA_GRBG {
+        if site == 1 as u32 { return 0 as u32 }
+        if site == 2 as u32 { return 2 as u32 }
+        return 1 as u32
+    }
+    if cfa == CFA_GBRG {
+        if site == 2 as u32 { return 0 as u32 }
+        if site == 1 as u32 { return 2 as u32 }
+        return 1 as u32
+    }
+    if cfa == CFA_BGGR {
+        if site == 3 as u32 { return 0 as u32 }
+        if site == 0 as u32 { return 2 as u32 }
+        return 1 as u32
+    }
+    return 1 as u32
+}
+
+fn noise_s(m: *mut SensorMeta, site: usize) -> f32 { return (*m).ns[site] }
+fn noise_o(m: *mut SensorMeta, site: usize) -> f32 { return (*m).no[site] }
+fn black_of(m: *mut SensorMeta, site: usize) -> f32 { return (*m).black[site] }
+
+// Typical order of magnitude when a device reports no profile and the pixels are normalised linear values:
+// S grows linearly with the gain (ISO), O with its square. Only a LAST RESORT -- the pipeline prefers
+// `photo.noise.estimate_model` over this.
+fn default_noise_for_iso(iso: u32, out_s: *mut f32, out_o: *mut f32) {
+    var g: f32 = (iso as f32) / 100.0f
+    if g < 1.0f { g = 1.0f }
+    *out_s = 4.0e-5f * g
+    *out_o = 2.0e-7f * g * g
+}
+
+// Mean (S, O) over the sites of each colour: out = [S_r, O_r, S_g, O_g, S_b, O_b]. Without a profile the
+// ISO fallback is returned.
+fn noise_model_rgb(m: *mut SensorMeta, out: *mut f32) {
+    var s: [f32; 3] = [0.0f, 0.0f, 0.0f]
+    var o: [f32; 3] = [0.0f, 0.0f, 0.0f]
+    var n: [f32; 3] = [0.0f, 0.0f, 0.0f]
+    var k: usize = 0
+    while k < 4 {
+        let c: usize = cfa_color((*m).cfa, k as u32) as usize
+        s[c] = s[c] + (*m).ns[k]
+        o[c] = o[c] + (*m).no[k]
+        n[c] = n[c] + 1.0f
+        k = k + 1
+    }
+    var c: usize = 0
+    while c < 3 {
+        if n[c] > 0.0f && (*m).has_noise {
+            *((out as u64 + (c * 8) as u64) as *mut f32) = s[c] / n[c]
+            *((out as u64 + (c * 8 + 4) as u64) as *mut f32) = o[c] / n[c]
+        } else {
+            default_noise_for_iso((*m).iso, (out as u64 + (c * 8) as u64) as *mut f32, (out as u64 + (c * 8 + 4) as u64) as *mut f32)
+        }
+        c = c + 1
+    }
+}
+
+// XYZ (D50) -> linear sRGB (Bradford-adapted D65 matrix, row-major).
+fn srgb_from_xyz_d50(i: usize) -> f32 {
+    if i == 0 { return 3.1338561f }
+    if i == 1 { return -1.6168667f }
+    if i == 2 { return -0.4906146f }
+    if i == 3 { return -0.9787684f }
+    if i == 4 { return 1.9161415f }
+    if i == 5 { return 0.0334540f }
+    if i == 6 { return 0.0719453f }
+    if i == 7 { return -0.2289914f }
+    return 1.4052427f
+}

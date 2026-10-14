@@ -1,0 +1,128 @@
+// expect_out: ok
+// tests/2962_photo_portrait.fi -- FirnCam portrait: a skin coloured, mildly textured subject (ellipse) on the
+// busy synthetic scene. Checks: segmentation IoU > 0.85 against the true ellipse; bokeh makes the background
+// at least 4x smoother (Laplacian energy) while the subject stays sharp (ratio > 0.97) and its centre pixel is
+// untouched; no bleed: the mean red of a ring just outside the subject changes by < 0.05 (a blur that pulls in
+// the skin coloured subject would raise it). Deterministic.
+import std.io
+import std.rt
+import photo.image
+import photo.portrait
+
+fn inside(x: i32, y: i32, w: i32, h: i32, grow: f32) -> bool {
+    let u: f32 = ((x as f32) + 0.5f) - (w as f32) * 0.5f
+    let v: f32 = ((y as f32) + 0.5f) - (h as f32) * 0.5f
+    let rx: f32 = (w as f32) * 0.20f + grow
+    let ry: f32 = (h as f32) * 0.30f + grow
+    return (u * u) / (rx * rx) + (v * v) / (ry * ry) < 1.0f
+}
+
+fn pf(s: str, v: f32) {
+    io.print(s)
+    io.fmt_print_line(io.fmt_f32(io.fmt_new(), v))
+}
+
+fn region_lap(im: *mut image.Image, w: i32, h: i32, subject: bool) -> f32 {
+    // mean squared 4-neighbour Laplacian of green over the chosen region (eroded by 6 px)
+    var s: f32 = 0.0f
+    var n: f32 = 0.0f
+    var y: i32 = 2
+    while y < h - 2 {
+        var x: i32 = 2
+        while x < w - 2 {
+            let in_s: bool = inside(x, y, w, h, -6.0f)
+            let out_s: bool = !inside(x, y, w, h, 6.0f)
+            if (subject && in_s) || (!subject && out_s) {
+                let l: f32 = image.img_get(im, 1, x - 1, y) + image.img_get(im, 1, x + 1, y) + image.img_get(im, 1, x, y - 1) + image.img_get(im, 1, x, y + 1) - 4.0f * image.img_get(im, 1, x, y)
+                s = s + l * l
+                n = n + 1.0f
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return s / n
+}
+
+fn main() -> i32 {
+    let w: i32 = 160
+    let h: i32 = 120
+    var ok: bool = true
+    var im: image.Image = image.scene_make(w, h)
+    image.img_clamp01(&im)
+    var rng: image.Rng = image.rng_new(5 as u64)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            if inside(x, y, w, h, 0.0f) {
+                let t: f32 = 0.04f * image.rng_gauss(&rng)
+                image.img_set(&im, 0, x, y, image.fclampf(0.85f + t, 0.0f, 1.0f))
+                image.img_set(&im, 1, x, y, image.fclampf(0.62f + t, 0.0f, 1.0f))
+                image.img_set(&im, 2, x, y, image.fclampf(0.50f + t, 0.0f, 1.0f))
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var o: portrait.PortraitOpts = portrait.portrait_default()
+    var mask: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&mask)
+    portrait.segment(&im, &o, &mask)
+    var inter: f32 = 0.0f
+    var uni: f32 = 0.0f
+    y = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let a: bool = image.img_get(&mask, 0, x, y) > 0.5f
+            let b: bool = inside(x, y, w, h, 0.0f)
+            if a && b { inter = inter + 1.0f }
+            if a || b { uni = uni + 1.0f }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let iou: f32 = inter / uni
+    pf("IoU: ", iou)
+    ok = iou > 0.85f && ok
+
+    var out: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&out)
+    portrait.bokeh(&im, &mask, &o, &out)
+    let bg0: f32 = region_lap(&im, w, h, false)
+    let bg1: f32 = region_lap(&out, w, h, false)
+    let fg0: f32 = region_lap(&im, w, h, true)
+    let fg1: f32 = region_lap(&out, w, h, true)
+    pf("background sharpness ratio (before/after): ", bg0 / bg1)
+    pf("subject sharpness ratio (after/before): ", fg1 / fg0)
+    ok = bg0 / bg1 > 4.0f && fg1 / fg0 > 0.97f && ok
+    // the exact subject centre is untouched
+    ok = image.img_get(&out, 0, w / 2, h / 2) == image.img_get(&im, 0, w / 2, h / 2) && ok
+    // no bleed: red of the 3..8 px ring outside the subject vs the unblurred red of the same ring and the far field
+    var rr: f32 = 0.0f
+    var r0: f32 = 0.0f
+    var cnt: f32 = 0.0f
+    y = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            if !inside(x, y, w, h, 3.0f) && inside(x, y, w, h, 8.0f) {
+                rr = rr + image.img_get(&out, 0, x, y)
+                r0 = r0 + image.img_get(&im, 0, x, y)
+                cnt = cnt + 1.0f
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let bleed: f32 = (rr - r0) / cnt
+    pf("ring red shift after blur: ", bleed)
+    ok = bleed < 0.05f && bleed > -0.05f && ok
+    if ok {
+        io.print("ok")
+        io.new_line()
+        return 0
+    }
+    return 1
+}

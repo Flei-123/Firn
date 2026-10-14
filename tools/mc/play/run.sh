@@ -180,7 +180,7 @@ else echo "  FAIL  psnr: missing picture"; ERR=1; fi
 fi
 # ---- survival: iron pickaxe from /give, look down, hold the left button -> a block is dug with the table time (mc_dig)
 if [ "${MCPLAY_SKIP_SURVIVAL:-0}" != 1 ]; then
-MCPLAY_AUDIO=0 MCPLAY_RUN_S=14 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_RUN_S=14 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 120 "$W/mcplay" 127.0.0.1 "$PORT" Player6 > "$W/surv.out" 2>&1 &
 PP=$!
 sleep 5

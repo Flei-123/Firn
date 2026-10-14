@@ -59,7 +59,7 @@ export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty, sema_widen32,
     // ROUND OWN-3 (moves.fi, twin of compiler/src/moves.rs) -- `drop` and moves.
     sema_mv_reset, sema_mv_drop_set, sema_mv_drop, sema_has_drops,
     sema_mv_moved_set, sema_moved, sema_moved_any,
-    sema_leave_set, sema_leave, sema_needs_drop, sema_drop_name,
+    sema_type_has_gc, sema_leave_set, sema_leave, sema_needs_drop, sema_drop_name,
     sema_fn_index, sema_recv_by_address }
 
 const NONE: u32 = 4294967295
@@ -986,12 +986,15 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
         if op >= 10 && op <= 17 {
             return (*s).t_bool
         }
+        // r176: probe the left operand ONCE. Probing it twice (pointer test,
+        // then the float rule) doubled the work per nesting level of a
+        // left-leaning `a + b + c + ...` chain: 2^n.
+        let plp: u32 = probe_t(s, ast.e_b(b, e), d + 1)
         if op == 8 || op == 9 {
-            return probe_t(s, ast.e_b(b, e), d + 1)
+            return plp
         }
         // Round GAPS (ptrarith.rs): `p +/- n` is the pointer, `p - q` i64.
         if op == 0 || op == 1 {
-            let plp: u32 = probe_t(s, ast.e_b(b, e), d + 1)
             if arith_ptr(s, plp) {
                 if op == 1 && arith_ptr(s, probe_t(s, ast.e_c(b, e), d + 1)) {
                     return (*s).t_i64
@@ -1003,8 +1006,7 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
         // operands of different width the wider one is what comes out.
         // Otherwise `a_f32 + b_f64` would probe as `f32` and the literal
         // next to it would get the wrong type.
-        return float_want(s, probe_t(s, ast.e_b(b, e), d + 1),
-            probe_t(s, ast.e_c(b, e), d + 1))
+        return float_want(s, plp, probe_t(s, ast.e_c(b, e), d + 1))
     }
     if a == ast.E_FIELD {
         let bt: u32 = probe_t(s, ast.e_a(b, e), d + 1)
@@ -1036,6 +1038,13 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
     }
     if a == ast.E_CALL {
         if ast.e_number(b, e) != 0 {
+            let pk: u32 = (ast.e_number(b, e) >> 32) as u32
+            if pk == 1 {
+                return (*s).t_bool
+            }
+            if pk >= 2 {
+                return (*s).t_void
+            }
             return (*s).t_usize
         }
         // HOOK fnval: a call THROUGH a function value yields the result
@@ -2922,21 +2931,124 @@ fn mmio_check(s: *mut Sema, w: u32, e: u32, write: bool) -> u32 {
     return (*s).t_void
 }
 
+// r169 (sizeof.rs::type_has_gc): does a value of type `t` hold pointers the
+// collector must see? `str`, `Gc[C]`, closures (`fn` values) and every
+// struct / array that holds one. Raw pointers / `u64` do not count,
+// `GcWeak` is deliberately not a root. Depth limit 16 as in stage 0.
+fn tyhas_walk(s: *mut Sema, t: u32, seen: *mut Vec[u32], depth: u32) -> bool {
+    if depth > 16 {
+        return false
+    }
+    let tt: *mut types.Types = table(s)
+    if has_gc(s) && gc.gc_is_gc_ptr(gcp(s), tt, t) {
+        return true
+    }
+    let k: u32 = types.ty_kind(tt, t)
+    if k == types.K_FN {
+        return true
+    }
+    if k == types.K_ARR {
+        return tyhas_walk(s, types.ty_a(tt, t), seen, depth + 1)
+    }
+    if k != types.K_STRUCT {
+        return false
+    }
+    let si: u32 = types.ty_a(tt, t)
+    if types.st_count(tt) > types.STR_INDEX as usize && si == types.STR_INDEX {
+        return true
+    }
+    if has_gc(s) && gc.gc_is_gc_weak(gcp(s), tt, t) {
+        return false
+    }
+    var q: usize = 0
+    while q < vec_len[u32](seen) {
+        if vec_at[u32](seen, q) == si {
+            return false
+        }
+        q = q + 1
+    }
+    vec_push[u32](seen, si)
+    var f: u32 = 0
+    while f < types.st_flen(tt, si as usize) {
+        let fty: u32 = types.sf_ty(tt, types.st_foff(tt, si as usize) + f)
+        if tyhas_walk(s, fty, seen, depth + 1) {
+            return true
+        }
+        f = f + 1
+    }
+    return false
+}
+
+fn sema_type_has_gc(s: *mut Sema, t: u32) -> bool {
+    var seen: Vec[u32] = vec_new[u32]()
+    let r: bool = tyhas_walk(s, t, &seen, 0)
+    vec_free[u32](&seen)
+    return r
+}
+
 fn call(s: *mut Sema, e: u32) -> u32 {
     let b: *mut ast.Tree = tree(s)
     // `size_of[T]()` -- not an ordinary call but a size fixed at compile
     // time (sizeof.rs). The parser has put the type node into `e_number`
     // (node + 1); both are resolved only here, because the struct table
-    // is only available here.
+    // is only available here. r169: the same for `has_gc[T]()`,
+    // `gc_track[T](p, n)`, `gc_untrack[T](p)`; the kind sits in the upper
+    // half of `e_number` (0 size_of, 1 has_gc, 2 gc_track, 3 gc_untrack).
     if ast.e_number(b, e) != 0 {
-        let st: u32 = ast_ty(s, (ast.e_number(b, e) - 1) as u32)
+        let znum: u64 = ast.e_number(b, e)
+        let zkind: u32 = (znum >> 32) as u32
+        let st: u32 = ast_ty(s, ((znum & 0xffffffff) - 1) as u32)
+        let ioff: u32 = ast.e_b(b, e)
+        let icnt: u32 = ast.e_c(b, e)
+        var iwant: u32 = 0
+        if zkind == 2 {
+            iwant = 2
+        } else if zkind == 3 {
+            iwant = 1
+        }
+        if icnt != iwant {
+            var ik: u32 = 0
+            while ik < icnt {
+                infer(s, ast.child_at(b, ioff + ik))
+                ik = ik + 1
+            }
+            complain(s)
+            return (*s).t_error
+        }
         if is_error(s, st) {
+            var ik2: u32 = 0
+            while ik2 < icnt {
+                infer(s, ast.child_at(b, ioff + ik2))
+                ik2 = ik2 + 1
+            }
             complain(s)
             return (*s).t_error
         }
         if types.ty_kind(table(s), st) == types.K_VOID {
+            var ik3: u32 = 0
+            while ik3 < icnt {
+                infer(s, ast.child_at(b, ioff + ik3))
+                ik3 = ik3 + 1
+            }
             complain(s)
             return (*s).t_error
+        }
+        if zkind == 1 {
+            return (*s).t_bool
+        }
+        if zkind >= 2 {
+            // every argument is a `u64` or `usize` (same width)
+            let u64i: u32 = types.new_ty(table(s), types.K_U64, 0, 0)
+            var ik4: u32 = 0
+            while ik4 < icnt {
+                let at: u32 = expr(s, ast.child_at(b, ioff + ik4), u64i)
+                if !is_error(s, at) && types.ty_kind(table(s), at) != types.K_U64
+                    && types.ty_kind(table(s), at) != types.K_USIZE {
+                    complain(s)
+                }
+                ik4 = ik4 + 1
+            }
+            return (*s).t_void
         }
         return (*s).t_usize
     }

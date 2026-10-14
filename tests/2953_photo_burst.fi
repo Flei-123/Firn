@@ -1,0 +1,92 @@
+// expect_out: ok
+// tests/2953_photo_burst.fi -- FirnCam core: synthetic burst (hand shake shifts + sensor noise + one short
+// exposure) through align + merge + denoise + tone map. Checks: merge beats the single frame by > 3 dB PSNR,
+// the full chain beats the single-frame chain (small 96x72 image: only +0.3 dB asserted, 256x192 gives +3.5 dB in tools/photo/run.sh), a clipped sun is recovered from the short frame (radiance > 1.5),
+// the noise estimator finds the order of magnitude, and a JPEG-only (RGBA8) call works. Deterministic.
+import std.io
+import std.rt
+import photo.image
+import photo.meta
+import photo.noise
+import photo.merge
+import photo.synth
+import photo.pipeline
+
+fn disp(im: *mut image.Image) -> image.Image {
+    var d: image.Image = image.img_copy(im)
+    image.img_clamp01(&d)
+    image.img_to_srgb(&d)
+    return d
+}
+
+fn main() -> i32 {
+    let w: i32 = 96
+    let h: i32 = 72
+    var ok: bool = true
+    var scene: image.Image = image.scene_make(w, h)
+    var rng: image.Rng = image.rng_new(3 as u64)
+    var m: meta.SensorMeta = meta.meta_default()
+    var k: usize = 0
+    while k < 4 {
+        meta.meta_set_noise(&m, k, 2.0e-3f, 2.0e-5f)
+        k = k + 1
+    }
+    var b: merge.Burst = merge.burst_new()
+    synth.synth_burst(&scene, 6, 1.0f, 2.0e-3f, 2.0e-5f, 3.0f, &rng, &b)
+    merge.burst_add(&b, synth.synth_frame(&scene, 1.5f, -1.0f, 0.25f, 2.0e-3f, 2.0e-5f, &rng), 0.25f)
+
+    var truth: image.Image = image.img_copy(&scene)
+    image.img_clamp01(&truth)
+    var td: image.Image = disp(&truth)
+    var sd: image.Image = disp(&b.frames[0])
+    let p_single: f32 = image.psnr(&sd, &td, 1.0f)
+    var nm: noise.NoiseModel = noise.from_meta(&m)
+    var mg: image.Image = image.img_new(1, 1, 3)
+    var vp: image.Image = image.img_new(1, 1, 1)
+    var ws: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&mg)
+    image.img_free(&vp)
+    image.img_free(&ws)
+    merge.merge_burst(&b, 0, &nm, &mg, &vp, &ws)
+    var md: image.Image = disp(&mg)
+    let p_merge: f32 = image.psnr(&md, &td, 1.0f)
+    ok = p_merge > p_single + 3.0f && ok
+    // sun centre of the scene: radiance 2.05, the normal frames clip at 1.0
+    let sun: f32 = image.img_get(&mg, 1, (0.78f * (w as f32)) as i32, (0.18f * (h as f32)) as i32)
+    ok = sun > 1.5f && ok
+    ok = image.img_mean(&ws, 0) > 3.0f && ok
+
+    // estimator: right order of magnitude (within a factor 4) for the noise at mid brightness
+    var est: noise.NoiseModel = noise.estimate_model(&b.frames[0])
+    let v_true: f32 = 2.0e-3f * 0.2f + 2.0e-5f
+    let v_est: f32 = noise.variance(&est, 1, 0.2f)
+    ok = v_est > v_true * 0.25f && v_est < v_true * 4.0f && ok
+
+    // full chain vs the chain on the noise free scene
+    var o: pipeline.PipeOpts = pipeline.opts_default()
+    var ideal: image.Image = image.img_new(1, 1, 3)
+    var o1: image.Image = image.img_new(1, 1, 3)
+    var o8: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&ideal)
+    image.img_free(&o1)
+    image.img_free(&o8)
+    pipeline.process_single_linear(&scene, &m, &o, &ideal)
+    pipeline.process_single_linear(&b.frames[0], &m, &o, &o1)
+    pipeline.process_burst(&b, &m, &o, &o8)
+    ok = image.psnr(&o8, &ideal, 1.0f) > image.psnr(&o1, &ideal, 1.0f) + 0.3f && ok
+
+    // JPEG-only fallback runs and keeps the picture recognisable
+    var rgba: u64 = rt.heap_alloc((w * h * 4) as usize)
+    image.img_to_rgba8(&sd, rgba)
+    var oj: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&oj)
+    pipeline.process_rgba8(rgba, w, h, &o, &oj)
+    ok = oj.w == w && oj.h == h && image.psnr(&oj, &ideal, 1.0f) > 25.0f && ok
+
+    if ok {
+        io.print("ok")
+        io.new_line()
+        return 0
+    }
+    return 1
+}

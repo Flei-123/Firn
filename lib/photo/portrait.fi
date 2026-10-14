@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/portrait.fi -- photo.portrait: simple subject segmentation + depth-of-field blur (FirnCam core).
+//
+//     var o: portrait.PortraitOpts = portrait.portrait_default()
+//     var mask: image.Image = ...                           // created by the call: 1 ch, 1 = subject, 0 = background
+//     portrait.segment(&im, &o, &mask)                      // no ML: colour histograms + centre prior + guided matte
+//     portrait.bokeh(&im, &mask, &o, &out)                  // out = RGB image (new), background blurred
+//     portrait.portrait_auto(&im, &o, &out)                 // both in one call
+//
+// SEGMENTATION (GrabCut-lite): hard seeds -- an ellipse around the centre is subject, a ring at the border is
+// background; both colour models are 8x8x8 histograms (multimodal backgrounds work); the per-pixel posterior is
+// p_fg * prior / (p_fg * prior + p_bg * (1 - prior)) with a Gaussian centre prior; 3 EM rounds re-estimate the
+// histograms from the soft mask; the result is refined with a guided filter (luma guide, so the matte follows
+// image edges) and steepened. A caller that has a better mask (ML segmenter, depth map, face box) skips `segment`
+// and hands it to `bokeh`: the mask is just a 1 channel image.
+// BOKEH: for a background pixel with background weight b = 1 - mask a disc of radius b * blur_max is sampled
+// (golden-angle spiral, `samples` taps); taps are weighted by THEIR OWN background weight, so the subject never
+// bleeds into the background (no halo); bright taps get extra weight (`highlight`) which makes round bokeh
+// discs from point lights. Subject pixels stay untouched; the matte edge blends smoothly. Image values 0..1.
+import std.rt
+import std.math
+import photo.image
+import photo.filter
+
+export {
+    PortraitOpts, portrait_default, segment, bokeh, portrait_auto,
+}
+
+struct PortraitOpts {
+    seed_rx: f32,
+    seed_ry: f32,
+    ring: f32,
+    prior_sigma: f32,
+    rounds: i32,
+    refine_r: i32,
+    refine_eps: f32,
+    blur_max: f32,
+    samples: i32,
+    highlight: f32,
+}
+
+fn portrait_default() -> PortraitOpts {
+    return PortraitOpts { seed_rx: 0.12f, seed_ry: 0.16f, ring: 0.05f, prior_sigma: 0.22f, rounds: 3, refine_r: 4,
+                          refine_eps: 4.0e-4f, blur_max: 0.025f, samples: 40, highlight: 4.0f }
+}
+
+const BINS: i32 = 8
+
+fn bin_of(im: *mut image.Image, x: i32, y: i32) -> i32 {
+    var r: i32 = (image.fclampf(image.img_get(im, 0, x, y), 0.0f, 0.999f) * 8.0f) as i32
+    var g: i32 = (image.fclampf(image.img_get(im, 1, x, y), 0.0f, 0.999f) * 8.0f) as i32
+    var b: i32 = (image.fclampf(image.img_get(im, 2, x, y), 0.0f, 0.999f) * 8.0f) as i32
+    return (r * BINS + g) * BINS + b
+}
+
+fn smooth_hist(h: *mut [f32; 512], floor: f32) {
+    // normalise with a floor so unseen colours are not impossible
+    var s: f32 = 0.0f
+    var i: i32 = 0
+    while i < 512 {
+        (*h)[i as usize] = (*h)[i as usize] + floor
+        s = s + (*h)[i as usize]
+        i = i + 1
+    }
+    i = 0
+    while i < 512 {
+        (*h)[i as usize] = (*h)[i as usize] / s
+        i = i + 1
+    }
+}
+
+// mask: created here (1 ch, 0..1).
+fn segment(im: *mut image.Image, o: *mut PortraitOpts, mask: *mut image.Image) {
+    let w: i32 = (*im).w
+    let h: i32 = (*im).h
+    let fw: f32 = w as f32
+    let fh: f32 = h as f32
+    *mask = image.img_new(w, h, 1)
+    var seed: image.Image = image.img_new(w, h, 1)      // 1 = subject seed, -1 = background seed, 0 = free
+    var prior: image.Image = image.img_new(w, h, 1)
+    var bins: image.Image = image.img_new(w, h, 1)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let u: f32 = ((x as f32) + 0.5f) / fw - 0.5f
+            let v: f32 = ((y as f32) + 0.5f) / fh - 0.5f
+            let e: f32 = (u * u) / ((*o).seed_rx * (*o).seed_rx) + (v * v) / ((*o).seed_ry * (*o).seed_ry)
+            var sd: f32 = 0.0f
+            if e < 1.0f { sd = 1.0f }
+            if (x as f32) < (*o).ring * fw || (y as f32) < (*o).ring * fh || (x as f32) > (1.0f - (*o).ring) * fw || (y as f32) > (1.0f - (*o).ring) * fh {
+                sd = -1.0f
+            }
+            image.img_set(&seed, 0, x, y, sd)
+            let ps: f32 = (*o).prior_sigma
+            let pr: f32 = image.expneg((u * u + v * v) / (2.0f * ps * ps))
+            image.img_set(&prior, 0, x, y, image.fclampf(pr, 0.03f, 0.97f))
+            image.img_set(&bins, 0, x, y, bin_of(im, x, y) as f32)
+            image.img_set(mask, 0, x, y, image.fmaxf(sd, 0.0f) * 0.9f + 0.05f)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var round: i32 = 0
+    while round < (*o).rounds {
+        var hf: [f32; 512] = [0.0f; 512]
+        var hb: [f32; 512] = [0.0f; 512]
+        y = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                let k: usize = image.img_get(&bins, 0, x, y) as usize
+                let m: f32 = image.img_get(mask, 0, x, y)
+                let sd: f32 = image.img_get(&seed, 0, x, y)
+                if sd > 0.5f {
+                    hf[k] = hf[k] + 1.0f
+                } else if sd < -0.5f {
+                    hb[k] = hb[k] + 1.0f
+                } else {
+                    hf[k] = hf[k] + m
+                    hb[k] = hb[k] + (1.0f - m)
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        smooth_hist(&hf, 0.02f)
+        smooth_hist(&hb, 0.3f)      // colours seen nowhere count as background
+        y = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                let k: usize = image.img_get(&bins, 0, x, y) as usize
+                let pr: f32 = image.img_get(&prior, 0, x, y)
+                let a: f32 = hf[k] * pr
+                let b: f32 = hb[k] * (1.0f - pr)
+                var m: f32 = a / (a + b)
+                let sd: f32 = image.img_get(&seed, 0, x, y)
+                if sd > 0.5f { m = 1.0f }
+                if sd < -0.5f { m = 0.0f }
+                image.img_set(mask, 0, x, y, m)
+                x = x + 1
+            }
+            y = y + 1
+        }
+        round = round + 1
+    }
+    // matte: guided filter on the luma, then steepen around 0.5
+    var luma: image.Image = image.img_luma(im)
+    var g: image.Image = filter.guided(mask, &luma, (*o).refine_r, (*o).refine_eps)
+    y = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let t: f32 = image.fclampf((image.img_get(&g, 0, x, y) - 0.5f) * 2.2f + 0.5f, 0.0f, 1.0f)
+            image.img_set(mask, 0, x, y, t * t * (3.0f - 2.0f * t))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image.img_free(&g)
+    image.img_free(&luma)
+    image.img_free(&seed)
+    image.img_free(&prior)
+    image.img_free(&bins)
+}
+
+fn bokeh(im: *mut image.Image, mask: *mut image.Image, o: *mut PortraitOpts, out: *mut image.Image) {
+    let w: i32 = (*im).w
+    let h: i32 = (*im).h
+    let rmax: f32 = (*o).blur_max * (w as f32)
+    *out = image.img_copy(im)
+    let n: i32 = (*o).samples
+    var tx: [f32; 128] = [0.0f; 128]
+    var ty: [f32; 128] = [0.0f; 128]
+    var k: i32 = 0
+    while k < n && k < 128 {
+        let rr: f32 = image.sqrtf(((k as f32) + 0.5f) / (n as f32))
+        let a: f64 = (k as f64) * 2.399963
+        tx[k as usize] = rr * (math.cos(a) as f32)
+        ty[k as usize] = rr * (math.sin(a) as f32)
+        k = k + 1
+    }
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let bg: f32 = 1.0f - image.img_get(mask, 0, x, y)
+            let r: f32 = bg * rmax
+            if r >= 0.6f {
+                var sr: f32 = 0.0f
+                var sg: f32 = 0.0f
+                var sb: f32 = 0.0f
+                var sw: f32 = 0.0f
+                k = 0
+                while k < n && k < 128 {
+                    let px: i32 = x + ((tx[k as usize] * r + 1000.5f) as i32 - 1000)
+                    let py: i32 = y + ((ty[k as usize] * r + 1000.5f) as i32 - 1000)
+                    let bs: f32 = 1.0f - image.img_getc(mask, 0, px, py)
+                    if bs > 0.02f {
+                        let cr: f32 = image.img_getc(im, 0, px, py)
+                        let cg: f32 = image.img_getc(im, 1, px, py)
+                        let cb: f32 = image.img_getc(im, 2, px, py)
+                        let l: f32 = 0.299f * cr + 0.587f * cg + 0.114f * cb
+                        let hl: f32 = image.fmaxf(l - 0.75f, 0.0f)
+                        let wt: f32 = bs * bs * (1.0f + (*o).highlight * hl * hl * 16.0f)
+                        sr = sr + wt * cr
+                        sg = sg + wt * cg
+                        sb = sb + wt * cb
+                        sw = sw + wt
+                    }
+                    k = k + 1
+                }
+                if sw > 1.0e-4f {
+                    image.img_set(out, 0, x, y, sr / sw)
+                    image.img_set(out, 1, x, y, sg / sw)
+                    image.img_set(out, 2, x, y, sb / sw)
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn portrait_auto(im: *mut image.Image, o: *mut PortraitOpts, out: *mut image.Image) {
+    var m: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&m)
+    segment(im, o, &m)
+    bokeh(im, &m, o, out)
+    image.img_free(&m)
+}

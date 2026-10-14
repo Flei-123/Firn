@@ -64,11 +64,17 @@ Entry `__firn_dll_entry` (DllMain shape): on `DLL_PROCESS_ATTACH` it runs the se
 `_start`, so the collector does NOT start itself** (same as the Linux `.so`): a library that uses `gc` types exports an init that calls `gc_init()`
 (idempotent) and the host calls it once before any other export (`wd_init` in `tools/stack_e/lib_win.fi`). Threads and jobs work in a DLL
 (`tools/stack_e/lib_rt.fi`: heap_alloc, `jobs` with 0 and 3 workers, GC on 4 threads) because the Windows thread block lives in the TEB slot, not behind
-a host register. Limits (compile errors, not miscompiles): no `v128` parameters (Win64 passes vectors by hidden pointer: take a pointer). Not done:
-`thread_attach` from host threads of their own (only proven on the Linux x86-64 `.so` and the aarch64 `.so`), by-value structs in exports, a `.lib`
-import library (use `LoadLibrary` / `GetProcAddress`).
+a host register. **Host threads of their own (r506)**: `thread_attach()` / `thread_host_detach()` work in a DLL exactly as in the Linux `.so`
+(export them, bracket runtime-using exports with `thread_blocking_out()` / `thread_blocking_an()`). Why it needs no extra code: the seam answers
+`/proc/self/maps` out of `GetCurrentThreadStackLimits` of the CALLING thread (stack bounds), `arch_prctl(ARCH_SET_FS, tcb)` is `TlsSetValue` of the
+shared slot for the calling thread only (`0` on detach), `gettid` is `GetCurrentThreadId`. A host thread that never attached reads an empty TLS slot and
+crashes on its first runtime access (like the x86-64 `.so`). Proof: `host_attach_win.c` (4 `CreateThread` threads, two waves so entries are recycled,
+one idles in host code during collections; jobs with 0/3 workers, GC chains), dev-fast + release-fast, 3 runs each. **`v128` (r506)**: a `v128`
+parameter is a pointer to 16 octets in its Win64 integer slot (hidden pointer, the C side passes `__m128` that way); the thunk loads it into the next
+`xmm0-7`. A `v128` result is `xmm0` in both conventions. Compile error only if a `v128` would not find an `xmm` register (more than 8 float / vector
+parameters). Limits: by-value structs in exports, a `.lib` import library (use `LoadLibrary` / `GetProcAddress`).
 Proof: gate 134 -> `tools/stack_e/run_g5.sh` (mingw host `host_win.c` under Wine, dev-fast + release-fast, plus the runtime probe, plus
-`host_abi.c` against `lib_abi.fi`: `f64`/`f32` in every slot, 8 integers, 10 doubles, 14 mixed arguments, 9 integers with a float result; the same C host
+`host_abi.c` against `lib_abi.fi`: `f64`/`f32` in every slot, 8 integers, 10 doubles, 14 mixed arguments, 9 integers with a float result, `v128` arguments and result; the same C host
 runs against the Linux x86-64 `.so` and the aarch64 `.so`, whose native conventions already carry floats and stack arguments). **Wine only; a real Windows
 is untested.**
 
