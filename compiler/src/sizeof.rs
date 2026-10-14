@@ -226,11 +226,11 @@ pub(crate) fn hook_call(
     if prefix == P_HASGC {
         return Some(Type::Bool);
     }
-    // gc_track / gc_untrack: every argument is a `u64`
+    // gc_track / gc_untrack: every argument is a `u64` or `usize` (same width)
     for a in args {
         let at = ck.expr(a, Some(&Type::U64));
-        if !at.is_error() && at != Type::U64 && !matches!(at, Type::UntypedInt) {
-            ck.dg.error(a.span, format!("'{}' expects 'u64' arguments", what));
+        if !at.is_error() && at != Type::U64 && at != Type::Usize && !matches!(at, Type::UntypedInt) {
+            ck.dg.error(a.span, format!("'{}' expects 'u64' or 'usize' arguments", what));
         }
     }
     Some(Type::Void)
