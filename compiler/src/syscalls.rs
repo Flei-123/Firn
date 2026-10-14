@@ -42,6 +42,10 @@ pub enum A64 {
     Direct(u32),
     /// `AT_FDCWD` in front of the arguments, then this number
     AtFdcwd(u32),
+    /// FIRN r75: the call becomes another number with a re-ordered
+    /// argument list (same `X` notation as the Android table): stat ->
+    /// newfstatat(AT_FDCWD, path, buf, 0), pipe -> pipe2(fds, 0), ...
+    Rewrite(u32, &'static [X]),
     /// FIRN r64: rename(old, new) -> renameat(AT_FDCWD, old, AT_FDCWD, new)
     /// -- TWO directory descriptors, which `AtFdcwd` cannot express.
     RenameAt(u32),
@@ -123,7 +127,9 @@ const TABLE: &[(i64, A64)] = &[
     (1, A64::Direct(64)),            // write
     (2, A64::AtFdcwd(56)),           // open      -> openat
     (3, A64::Direct(57)),            // close
+    (4, A64::Rewrite(79, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::I(0)])), // stat  -> newfstatat (Firn r75)
     (5, A64::Direct(80)),            // fstat
+    (6, A64::Rewrite(79, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::I(0x100)])), // lstat -> newfstatat, AT_SYMLINK_NOFOLLOW (Firn r75)
     // ROUND C-059 (Certus): without this line the browser is not
     // translatable for the phone at all — `poll` sits in net/atem.fi and
     // therefore under every socket, every TLS handshake and every HTTP
@@ -142,6 +148,7 @@ const TABLE: &[(i64, A64)] = &[
     (19, A64::Direct(65)),           // readv
     (20, A64::Direct(66)),           // writev
     (21, A64::AtFdcwd(48)),          // access    -> faccessat (Firn r64)
+    (22, A64::Rewrite(59, &[X::A(0), X::I(0)])),                          // pipe  -> pipe2 (Firn r75)
     (24, A64::Direct(124)),          // sched_yield
     (25, A64::Direct(216)),          // mremap
     (28, A64::Direct(233)),          // madvise
@@ -194,6 +201,7 @@ const TABLE: &[(i64, A64)] = &[
     // untranslatable for the phone, and that is the whole browser.
     (82, A64::RenameAt(38)),         // rename    -> renameat (Firn r64)
     (83, A64::AtFdcwd(34)),          // mkdir     -> mkdirat
+    (84, A64::Rewrite(35, &[X::I(AT_FDCWD), X::A(0), X::I(0x200)])),      // rmdir -> unlinkat, AT_REMOVEDIR (Firn r75)
     // ROUND VERIFY (Certus): the crash report deletes itself after it has
     // been sent (lib/android/absturz.fi). Same shape as `open` and
     // `mkdir` above -- the generic table has no `unlink`, only
@@ -201,6 +209,7 @@ const TABLE: &[(i64, A64)] = &[
     // same thing. The third argument (flags) is 0, which is what
     // `unlinkat` wants for a plain file.
     (87, A64::AtFdcwd(35)),          // unlink    -> unlinkat
+    (89, A64::Rewrite(78, &[X::I(AT_FDCWD), X::A(0), X::A(1), X::A(2)])), // readlink -> readlinkat (Firn r75)
     // ROUND CSS/STACK (Certus, 10.09.2026): lib/js/interp.fi asks for the
     // REAL stack (getrlimit(RLIMIT_STACK)) instead of guessing 6 MiB
     // -- the guessed number killed the Windows build, because
@@ -238,6 +247,7 @@ const TABLE: &[(i64, A64)] = &[
     (263, A64::Direct(35)),          // unlinkat
     (266, A64::Direct(36)),          // symlinkat (std.fs.symlink)
     (267, A64::Direct(78)),          // readlinkat (std.fs.readlink)
+    (280, A64::Direct(88)),          // utimensat (std.fs.set_mtime) (Firn r75)
     (281, A64::Direct(22)),          // epoll_pwait   (lib/async; epoll_wait has no generic form)
     (288, A64::Direct(242)),         // accept4
     (290, A64::Direct(19)),          // eventfd2      (lib/async: wake-up from threads)
@@ -327,6 +337,7 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     // One thread: yielding to nobody returns at once, as the kernel does
     // when no other thread is runnable.
     (21, "access", Wasm::Missing(NO_FILES)),
+    (22, "pipe", Wasm::Missing(NO_FILES)),
     (24, "sched_yield", Wasm::Constant(0)),
     // WebAssembly linear memory cannot be remapped in place: a caller that
     // wants to grow a block maps a new one and copies (Certus lib/html/mem.fi
@@ -375,7 +386,9 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (80, "chdir", Wasm::Missing(NO_FILES)),
     (82, "rename", Wasm::Missing(NO_FILES)),
     (83, "mkdir", Wasm::Missing(NO_FILES)),
+    (84, "rmdir", Wasm::Missing(NO_FILES)),
     (87, "unlink", Wasm::Missing(NO_FILES)),
+    (89, "readlink", Wasm::Missing(NO_FILES)),
     (90, "chmod", Wasm::Missing(NO_FILES)),
     (96, "gettimeofday", Wasm::Missing("use clock_gettime (228), which the host provides")),
     (97, "getrlimit", Wasm::Missing("a browser page has no resource limits")),
@@ -401,6 +414,7 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (263, "unlinkat", Wasm::Missing(NO_FILES)),
     (266, "symlinkat", Wasm::Missing(NO_FILES)),
     (267, "readlinkat", Wasm::Missing(NO_FILES)),
+    (280, "utimensat", Wasm::Missing(NO_FILES)),
     (281, "epoll_pwait", Wasm::Missing(NO_FILES)),
     (288, "accept4", Wasm::Missing(NO_SOCKETS)),
     (290, "eventfd2", Wasm::Missing(NO_FILES)),
@@ -488,8 +502,9 @@ mod tests {
         for w in X86_ANDROID.windows(2) {
             assert!(w[0].0 < w[1].0, "x86 android table not sorted at {}", w[0].0);
         }
-        // aarch64 got the two FIRNCHAT needed; stat, lstat, pipe, rmdir and
-        // readlink still have no aarch64 form (a compile error, not a guess).
+        // aarch64: stat, lstat, pipe, rmdir, readlink are rewritten (r75).
+        assert_eq!(aarch64(22), Some(A64::Rewrite(59, &[X::A(0), X::I(0)])));
+        assert_eq!(aarch64(84).is_some(), true);
         assert_eq!(aarch64(90), Some(A64::AtFdcwd(53)));
         assert_eq!(aarch64(82), Some(A64::RenameAt(38)));
     }
