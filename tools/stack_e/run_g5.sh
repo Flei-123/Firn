@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # tools/stack_e/run_g5.sh -- G5: `firnc --shared` for the Windows DLL (x86_64-windows, run under Wine) and the aarch64 .so (run under qemu-aarch64).
 # Called by run.sh (gate 134); also usable alone. Wine stages share ~/.wine-firn: never run two at once.
-# NOT covered: a real Windows, a real aarch64 machine, v128 beyond xmm7 in DLL exports (refused), v128 beyond the vector registers next to a struct in a Linux .so (refused), alignment-16 structs.
+# NOT covered: a real Windows, a real aarch64 machine, v128 beyond the vector registers next to a struct in a Linux .so (refused), alignment-16 structs.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
@@ -56,14 +56,18 @@ if command -v wine >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null; t
     grep -q "^EXPORTS" "$D/wdx.def" && grep -q wd_gc_chains "$D/wdx.def" || { echo "FAIL --def: EXPORTS/wd_gc_chains missing"; rc=1; }
     x86_64-w64-mingw32-dlltool -d "$D/wdx.def" -l "$D/libwd.a" -D wd.dll 2>"$D/err" && [ -s "$D/libwd.a" ] && echo "ok  --def + dlltool import library" || { echo "FAIL dlltool on --def"; rc=1; }
     # a v128 parameter that finds no xmm0-7 register is refused with a clear error (the others are passed: abi_v128_* above)
-    printf '#[export_c]\nfn bad_v(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f64, h: f64, x: v128) -> u64 { return 0 }\n' > "$D/badv.fi"
-    "$FIRNC" --shared --target=x86_64-windows -o "$D/badv.dll" "$D/badv.fi" 2> "$D/err" && { echo "FAIL dll: v128 export accepted"; rc=1; } || grep -q 'v128' "$D/err" || { echo "FAIL dll: v128 error text"; rc=1; }
+    # r570: ten v128 parameters (Win64 hands them over as pointers; the thunk puts the ones beyond xmm7 on the stack, 16 aligned)
+    x86_64-w64-mingw32-gcc -O1 -o "$D/hv.exe" tools/stack_e/host_v128stack.c || { echo "FAIL mingw host_v128stack"; rc=1; }
+    "$FIRNC" --shared --target=x86_64-windows --opt-level=dev-fast -o "$D/v128s.dll" tools/stack_e/lib_v128stack.fi || { echo "FAIL dll lib_v128stack"; rc=1; }
+    (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 300 wine hv.exe v128s.dll 2>&1 | tail -1 | grep -q 'ok  host_v128stack') && echo "ok  Windows DLL ten v128 parameters under Wine" || { echo "FAIL DLL v128 stack parameters (wine)"; rc=1; }
 else echo "skip  Windows DLL (no wine / mingw)"; fi
 if command -v qemu-aarch64 >/dev/null && command -v aarch64-linux-gnu-gcc >/dev/null && [ -d /usr/aarch64-linux-gnu/lib ]; then
     aarch64-linux-gnu-gcc -O1 -fstack-protector-all -o "$D/host_a64" tools/stack_e/host_a64.c -ldl || { echo "FAIL aarch64 gcc host"; rc=1; }
     aarch64-linux-gnu-gcc -O1 -o "$D/host_abi_a" tools/stack_e/host_abi.c -ldl || { echo "FAIL aarch64 gcc host_abi"; rc=1; }
     aarch64-linux-gnu-gcc -O1 -fstack-protector-all -pthread -o "$D/hostrt_a" tools/stack_e/host_rt.c -ldl || { echo "FAIL aarch64 gcc host_rt"; rc=1; }
     aarch64-linux-gnu-gcc -O1 -fstack-protector-all -pthread -o "$D/hostatt_a" tools/stack_e/host_attach.c -ldl || { echo "FAIL aarch64 gcc host_attach"; rc=1; }
+    aarch64-linux-gnu-gcc -O1 -fstack-protector-all -pthread -o "$D/hostnoatt_a" tools/stack_e/host_noattach.c -ldl || { echo "FAIL aarch64 gcc host_noattach"; rc=1; }
+    aarch64-linux-gnu-gcc -O1 -o "$D/hostv128_a" tools/stack_e/host_v128stack.c -ldl || { echo "FAIL aarch64 gcc host_v128stack"; rc=1; }
     for lvl in dev-fast release-fast; do
         "$FIRNC" --shared --target=aarch64-linux --opt-level=$lvl -o "$D/abi_a.so" tools/stack_e/lib_abi.fi || { echo "FAIL aarch64 lib_abi $lvl"; rc=1; }
         (cd "$D" && timeout 120 qemu-aarch64 -L /usr/aarch64-linux-gnu ./host_abi_a ./abi_a.so 2>&1 | grep -q 'host_abi: all ok') && echo "ok  aarch64 .so floats + stack arguments under qemu ($lvl)" || { echo "FAIL aarch64 float/stack ABI ($lvl)"; rc=1; }
@@ -71,6 +75,11 @@ if command -v qemu-aarch64 >/dev/null && command -v aarch64-linux-gnu-gcc >/dev/
         "$FIRNC" --shared --target=aarch64-linux --opt-level=$lvl -o "$D/rt_a.so" tools/stack_e/lib_rt.fi || { echo "FAIL aarch64 lib_rt $lvl"; rc=1; continue; }
         (cd "$D" && timeout 600 qemu-aarch64 -L /usr/aarch64-linux-gnu ./hostrt_a ./rt_a.so 2>&1 | tail -1 | grep -q 'ok') && echo "ok  aarch64 .so Firn threads + GC + jobs under qemu ($lvl)" || { echo "FAIL aarch64 .so threads (host_rt, $lvl)"; rc=1; }
         (cd "$D" && timeout 600 qemu-aarch64 -L /usr/aarch64-linux-gnu ./hostatt_a ./rt_a.so 2>&1 | tail -1 | grep -q 'ok') && echo "ok  aarch64 .so attached host threads under qemu ($lvl)" || { echo "FAIL aarch64 .so host_attach ($lvl)"; rc=1; }
+        # r571: host threads that never call se_attach: the export guard finds them (thread block by stack range + thread id)
+        (cd "$D" && timeout 600 qemu-aarch64 -L /usr/aarch64-linux-gnu ./hostnoatt_a ./rt_a.so 2>&1 | tail -1 | grep -q 'ok  host_noattach') && echo "ok  aarch64 .so unattached host threads under qemu ($lvl)" || { echo "FAIL aarch64 .so host_noattach ($lvl)"; rc=1; }
+        # r570: ten v128 parameters, two of them on the stack (16 octets, 16 aligned)
+        "$FIRNC" --shared --target=aarch64-linux --opt-level=$lvl -o "$D/v128_a.so" tools/stack_e/lib_v128stack.fi || { echo "FAIL aarch64 lib_v128stack $lvl"; rc=1; }
+        (cd "$D" && timeout 120 qemu-aarch64 -L /usr/aarch64-linux-gnu ./hostv128_a ./v128_a.so 2>&1 | tail -1 | grep -q 'ok  host_v128stack') && echo "ok  aarch64 .so ten v128 parameters under qemu ($lvl)" || { echo "FAIL aarch64 v128 stack parameters ($lvl)"; rc=1; }
         "$FIRNC" --shared --target=aarch64-linux --opt-level=$lvl -o "$D/a64.so" tools/stack_e/lib_win.fi || { echo "FAIL aarch64 --shared $lvl"; rc=1; continue; }
         readelf -d "$D/a64.so" | grep -q TEXTREL && { echo "FAIL aarch64 $lvl: TEXTREL"; rc=1; }
         (cd "$D" && timeout 300 qemu-aarch64 -L /usr/aarch64-linux-gnu ./host_a64 ./a64.so 2>&1 | grep -q 'all ok') && echo "ok  aarch64 .so under qemu ($lvl)" || { echo "FAIL aarch64 .so host ($lvl)"; rc=1; }

@@ -139,21 +139,36 @@ fn vreg(d: &str) -> String {
     format!("v{}", &d[1..])
 }
 
-/// AAPCS64 gives a stack-passed 128-bit vector sixteen octets AND a sixteen
-/// octet boundary; the outgoing area of this backend counts in words of
-/// eight. Nothing in this repository passes more than eight vector arguments,
-/// so the ninth is REFUSED rather than laid out wrong.
-fn check_v128_stack(f: &Func, args: &[Val], spot: &[Option<&'static str>]) -> Result<(), String> {
-    for (k, a) in args.iter().enumerate() {
-        if spot[k].is_none() && f.val_ty(*a) == FTy::V128 {
-            return Err(format!(
-                "aarch64: a ninth 'v128' argument in '{}' would travel on the stack, \
-                 and this code generator does not lay that out yet (round 91)",
-                f.name
-            ));
-        }
-    }
-    Ok(())
+/// `.so` (see SHARED_TP_BASE): leaves in `A` the thread block whose stack range holds `sp`, else the main thread's
+/// block (entry 0), else 0 while nothing is registered. Clobbers `A`, `B`, `C`, `T1`, `ADDR`.
+fn emit_host_thread_block(e: &mut Emitter) {
+        let lp = uniq(e, "tp_loop");
+        let nx = uniq(e, "tp_next");
+        let dn = uniq(e, "tp_done");
+        e.line(&format!("adrp {}, {}", ADDR, SHARED_TP_BASE));
+        e.line(&format!("ldr {}, [{}, :lo12:{}]", A, ADDR, SHARED_TP_BASE));
+        e.line(&format!("cbz {}, {}", A, dn));
+        e.line(&format!("adrp {}, {}", ADDR, SHARED_TP_HI));
+        e.line(&format!("ldr {}, [{}, :lo12:{}]", B, ADDR, SHARED_TP_HI));
+        e.line(&format!("mov {}, sp", C));
+        e.line(&format!("add {}, {}, {}, lsl #{}", B, A, B, TCB_BYTES_LOG2));
+        e.line(&format!("add {}, {}, #{}", T1, A, 1u32 << TCB_BYTES_LOG2));
+        e.raw(&format!("{}:", lp));
+        e.line(&format!("cmp {}, {}", T1, B));
+        e.line(&format!("b.hs {}", dn));
+        e.line(&format!("ldr {}, [{}, #{}]", ADDR, T1, TCB_LO));
+        e.line(&format!("cbz {}, {}", ADDR, nx));
+        e.line(&format!("cmp {}, {}", C, ADDR));
+        e.line(&format!("b.lo {}", nx));
+        e.line(&format!("ldr {}, [{}, #{}]", ADDR, T1, TCB_BOTTOM));
+        e.line(&format!("cmp {}, {}", C, ADDR));
+        e.line(&format!("b.hs {}", nx));
+        e.line(&format!("mov {}, {}", A, T1));
+        e.line(&format!("b {}", dn));
+        e.raw(&format!("{}:", nx));
+        e.line(&format!("add {}, {}, #{}", T1, T1, 1u32 << TCB_BYTES_LOG2));
+        e.line(&format!("b {}", lp));
+        e.raw(&format!("{}:", dn));
 }
 
 fn align_up(x: u64, a: u64) -> u64 {
@@ -283,7 +298,7 @@ fn layout(f: &Func) -> Frame {
                 _ => continue,
             };
             let (_, stack) = place_args(f, args);
-            outgoing = outgoing.max(8 * stack.len() as u64);
+            outgoing = outgoing.max(crate::codegen_x86::stack_offsets(f, &stack).1);
         }
     }
     outgoing = align_up(outgoing, 16);
@@ -730,9 +745,18 @@ fn load_args(e: &mut Emitter, f: &Func, fr: &Frame, args: &[Val], spot: &[Option
         .filter(|(k, _)| spot[*k].is_none())
         .map(|(_, a)| *a)
         .collect();
+    // r570: a `v128` on the stack takes 16 octets at a 16 octet boundary (AAPCS64 §6.4, rule C.14/C.15).
+    let (offs, _) = crate::codegen_x86::stack_offsets(f, &stack);
     for (k, a) in stack.iter().enumerate() {
+        if f.val_ty(*a) == FTy::V128 {
+            // v16 is no argument register (v0-v7) and nothing is cached across the call.
+            crate::simd_a64::vload(e, fr, "v16", *a);
+            let m = at_base(e, "sp", offs[k], 16);
+            e.line(&format!("str q16, {}", m));
+            continue;
+        }
         load_full(e, fr, A, *a);
-        let m = at_base(e, "sp", 8 * k as u64, 8);
+        let m = at_base(e, "sp", offs[k], 8);
         e.line(&format!("str {}, {}", A, m));
     }
     for (k, a) in args.iter().enumerate() {
@@ -903,8 +927,8 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     // parameter VALUES, so the caller's rule and the callee's rule are
     // literally the same function.
     let pvals: Vec<Val> = (0..f.params.len() as Val).collect();
-    let (spot, _stack) = place_args(f, &pvals);
-    check_v128_stack(f, &pvals, &spot)?;
+    let (spot, stack_vals) = place_args(f, &pvals);
+    let (stack_offs, _) = crate::codegen_x86::stack_offsets(f, &stack_vals);
     let mut stack_i = 0usize;
     for (i, _t) in f.params.iter().enumerate() {
         match spot[i] {
@@ -918,8 +942,14 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
             Some(r) => store_dst(e, &fr, i as Val, r),
             None => {
                 // Incoming stack arguments sit ABOVE the saved x29/x30 pair.
-                let off = 16 + 8 * stack_i as u64;
+                let off = 16 + stack_offs[stack_i];
                 stack_i += 1;
+                if f.params[i] == FTy::V128 {
+                    let m = at_base(e, "x29", off, 16);
+                    e.line(&format!("ldr q16, {}", m));
+                    crate::simd_a64::vstore(e, &fr, i as Val, "v16");
+                    continue;
+                }
                 let m = at_base(e, "x29", off, 8);
                 e.line(&format!("ldr {}, {}", A, m));
                 store_dst(e, &fr, i as Val, A);
@@ -1383,7 +1413,6 @@ fn emit_inst(
         }
         Op::Call { name, args } => {
             let (spot, _stack) = place_args(f, args);
-            check_v128_stack(f, args, &spot)?;
             load_args(e, f, fr, args, &spot);
             e.line(&format!("bl {}", label(name)));
             if let Some(d) = i.dst {
@@ -1398,7 +1427,6 @@ fn emit_inst(
         }
         Op::CallIndirect { target, args } => {
             let (spot, _stack) = place_args(f, args);
-            check_v128_stack(f, args, &spot)?;
             load_args(e, f, fr, args, &spot);
             // x9 is no argument register — the target may be loaded last
             // without destroying anything that is already in place.
@@ -1550,33 +1578,7 @@ fn emit_inst(
                 // `.so`: `tpidr_el0` belongs to the HOST (glibc TLS). Find the calling thread's block by its
                 // stack range (see SHARED_TP_BASE). Result: the entry whose [FT_LO, FT_BOTTOM) holds `sp`,
                 // else the main thread's block (entry 0), else 0 while nothing is registered.
-                let lp = uniq(e, "tp_loop");
-                let nx = uniq(e, "tp_next");
-                let dn = uniq(e, "tp_done");
-                e.line(&format!("adrp {}, {}", ADDR, SHARED_TP_BASE));
-                e.line(&format!("ldr {}, [{}, :lo12:{}]", A, ADDR, SHARED_TP_BASE));
-                e.line(&format!("cbz {}, {}", A, dn));
-                e.line(&format!("adrp {}, {}", ADDR, SHARED_TP_HI));
-                e.line(&format!("ldr {}, [{}, :lo12:{}]", B, ADDR, SHARED_TP_HI));
-                e.line(&format!("mov {}, sp", C));
-                e.line(&format!("add {}, {}, {}, lsl #{}", B, A, B, TCB_BYTES_LOG2));
-                e.line(&format!("add {}, {}, #{}", T1, A, 1u32 << TCB_BYTES_LOG2));
-                e.raw(&format!("{}:", lp));
-                e.line(&format!("cmp {}, {}", T1, B));
-                e.line(&format!("b.hs {}", dn));
-                e.line(&format!("ldr {}, [{}, #{}]", ADDR, T1, TCB_LO));
-                e.line(&format!("cbz {}, {}", ADDR, nx));
-                e.line(&format!("cmp {}, {}", C, ADDR));
-                e.line(&format!("b.lo {}", nx));
-                e.line(&format!("ldr {}, [{}, #{}]", ADDR, T1, TCB_BOTTOM));
-                e.line(&format!("cmp {}, {}", C, ADDR));
-                e.line(&format!("b.hs {}", nx));
-                e.line(&format!("mov {}, {}", A, T1));
-                e.line(&format!("b {}", dn));
-                e.raw(&format!("{}:", nx));
-                e.line(&format!("add {}, {}, #{}", T1, T1, 1u32 << TCB_BYTES_LOG2));
-                e.line(&format!("b {}", lp));
-                e.raw(&format!("{}:", dn));
+                emit_host_thread_block(e);
             } else {
                 e.line(&format!("mrs {}, tpidr_el0", A));
             }
@@ -1736,10 +1738,16 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
         }
         if let Some(v) = fr.consts.get(&given[0]) {
             if *v as i64 == syscalls::ARCH_GET_TCB {
-                // The aarch64 `.so` finds its thread block by the stack pointer; it cannot tell "unattached".
-                load_full(e, fr, A, given[1]);
-                e.line(&format!("mov {}, -1", B));
-                e.line(&format!("str {}, [{}]", B, A));
+                // r571: the same lookup `Op::ThreadSelf` does. In a `.so` the answer can be entry 0 for a thread that
+                // has no block (the stack is in no entry's range); the runtime tells those apart by the thread id in
+                // the block (`__thread_known` in lib/gc/gc.fi), exactly as it does behind the x86-64 `gs` base.
+                load_full(e, fr, T2, given[1]);
+                if crate::target::host_tp() {
+                    emit_host_thread_block(e);
+                } else {
+                    e.line(&format!("mrs {}, tpidr_el0", A));
+                }
+                e.line(&format!("str {}, [{}]", A, T2));
                 if let Some(d) = i.dst {
                     e.line(&format!("mov {}, xzr", A));
                     store_dst(e, fr, d, A);

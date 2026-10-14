@@ -931,23 +931,39 @@ fn win64_thunk_asm_ex(t: &str, sym: &str, params: &[WinParam], ret: &WinRet) -> 
             stack_args.push(src);
         }
     }
-    // The stack block keeps the 16-octet alignment the call needs.
-    let stack_room = (stack_args.len() * 8 + 15) / 16 * 16;
+    // The stack block keeps the 16-octet alignment the call needs. A `v128` takes 16 octets at a 16 octet
+    // boundary (r570, same rule as `codegen_x86::stack_offsets`); Win64 hands it over as a pointer.
+    let mut stack_offs: Vec<usize> = Vec::new();
+    let mut stack_end = 0usize;
+    for src in &stack_args {
+        if matches!(src, ArgSrc::V128(_)) {
+            stack_end = (stack_end + 15) / 16 * 16;
+            stack_offs.push(stack_end);
+            stack_end += 16;
+        } else {
+            stack_offs.push(stack_end);
+            stack_end += 8;
+        }
+    }
+    let stack_room = (stack_end + 15) / 16 * 16;
     if stack_room > 0 {
         s.push_str(&format!("    sub rsp, {}\n", stack_room));
         for (j, src) in stack_args.iter().enumerate() {
+            let at = stack_offs[j];
             match src {
                 ArgSrc::F32(a) => s.push_str(&format!(
                     "    mov eax, dword ptr [rbp+{}]\n    mov qword ptr [rsp+{}], rax\n",
-                    a,
-                    j * 8
+                    a, at
                 )),
-                ArgSrc::F64(a) | ArgSrc::Slot(a) | ArgSrc::V128(a) => s.push_str(&format!(
+                ArgSrc::V128(a) => s.push_str(&format!(
+                    "    mov rax, qword ptr [rbp+{}]\n    movups xmm8, xmmword ptr [rax]\n    movups xmmword ptr [rsp+{}], xmm8\n",
+                    a, at
+                )),
+                ArgSrc::F64(a) | ArgSrc::Slot(a) => s.push_str(&format!(
                     "    mov rax, qword ptr [rbp+{}]\n    mov qword ptr [rsp+{}], rax\n",
-                    a,
-                    j * 8
+                    a, at
                 )),
-                w => s.push_str(&format!("{}    mov qword ptr [rsp+{}], rax\n", word_rax(w), j * 8)),
+                w => s.push_str(&format!("{}    mov qword ptr [rsp+{}], rax\n", word_rax(w), at)),
             }
         }
     }
