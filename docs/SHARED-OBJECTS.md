@@ -78,12 +78,23 @@ Proof: gate 134 -> `tools/stack_e/run_g5.sh` (mingw host `host_win.c` under Wine
 runs against the Linux x86-64 `.so` and the aarch64 `.so`, whose native conventions already carry floats and stack arguments). **Wine only; a real Windows
 is untested.**
 
-**Structs by value in a Linux `.so` (x86-64 System V, aarch64 AAPCS64)** have NO thunk: Firn's placement equals the C ABI only for integer structs that
-fit the remaining registers whole, and for results of at most 8 octets (rax / x0). `firnc --shared` therefore REFUSES (clear error, "pass a pointer
-instead") a struct over 16 octets (C passes a copy, Firn a pointer), a struct that no longer fits the registers (C puts all of it on the stack, Firn splits
-it), a result of 9-16 octets on x86-64 (rax:rdx) and every result over 8 octets on aarch64 (x8 / x0:x1), and on aarch64 every struct with float words
-(homogeneous float aggregates are in s/d registers in C). Proof: `lib_struct_so.fi` + `host_struct_so.c` (accepted shapes, gcc / qemu) and the refusal of
-`lib_struct.fi` in `run_g5.sh`. **A host thread that never called `thread_attach`**: on the aarch64 `.so` it runs as the Firn main thread (fallback to entry 0, only
+**Structs by value in a Linux `.so` (x86-64 System V, aarch64 AAPCS64, r558).** Firn's placement equals the C ABI only for integer structs that fit the
+remaining registers whole, and for results of at most 8 octets (rax / x0); those exports are emitted as before (no thunk, the Firn function carries the C
+name). For every other export `compiler/src/so_thunk.rs` writes a C-ABI entry THUNK under the C name; the Firn function keeps its internal symbol
+(`extfn::so_needs_thunk`, `codegen_x86::label`). The thunk parks all incoming argument registers in its frame, loads each Firn word from memory (so no
+source is clobbered), calls the Firn function and converts the result. What it converts: **x86-64** - a struct of up to 16 octets that does not find all its
+registers (C copies all of it to the stack and leaves the registers free for later arguments; Firn splits it), a struct over 16 octets (C: copy on the
+stack, Firn: pointer to a copy; the thunk passes the address of the copy), a result of 9-16 octets (Firn: hidden pointer; C: `rax:rdx` / `xmm0:xmm1` by word
+class; the thunk gives Firn a 16 octet buffer and loads the registers); a result over 16 octets is a hidden pointer on both sides. **aarch64** - homogeneous
+float aggregates (1-4 `f32` or `f64` members, `abi::hfa`; C: one `s`/`d` register per member, Firn: packed eightbyte words; the thunk stages the members into
+memory first), non-HFA structs with float words (C: `x` registers), the closing of the register file when a struct does not fit (C: `NGRN`/`NSRN` = 8,
+the struct goes to the stack), HFAs over 16 octets (`f64` x3 / x4), results: HFA in `s0-s3`/`d0-d3`, up to 16 octets in `x0:x1`, more through `x8` (Firn: hidden
+pointer in `x0`). Not supported (compile error "a v128 parameter finds no vector register"): a `v128` that does not find a vector register in an export that
+needs a thunk; structs with 16-octet alignment do not exist in Firn. Proof: gate 134 -> `run_g5.sh`: `lib_struct_so.fi` + `host_struct_so.c` (shapes without a
+thunk), `lib_struct.fi` + `host_struct.c` (the Win64 test set, now also against gcc System V and aarch64 gcc under qemu) and `lib_struct2.fi` +
+`host_struct2.c` (HFA of 1-4 members, mixed int/float words, 5 / 7 integers then a 16 octet struct, `f64` x7 then a struct, HFAs running out of `d`
+registers, 14 mixed arguments, results of every shape, results next to struct arguments, a result with 7 stack-bound integers), dev-fast + release-fast; the C
+compiler's own ABI is the reference. gcc + qemu only; a real aarch64 machine is untested. **A host thread that never called `thread_attach`**: on the aarch64 `.so` it runs as the Firn main thread (fallback to entry 0, only
 safe while the host serialises it with the real main thread); in the DLL and the x86-64 `.so` it crashes on its first runtime access.
 
 **aarch64 .so.** Same C ABI (AAPCS64 is already Firn's calling convention: floats in `d0-d7`, more than 8 per class on the stack), no `_start`, symbols

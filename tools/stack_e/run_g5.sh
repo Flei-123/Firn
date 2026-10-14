@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # tools/stack_e/run_g5.sh -- G5: `firnc --shared` for the Windows DLL (x86_64-windows, run under Wine) and the aarch64 .so (run under qemu-aarch64).
 # Called by run.sh (gate 134); also usable alone. Wine stages share ~/.wine-firn: never run two at once.
-# NOT covered: a real Windows, a real aarch64 machine, v128 beyond xmm7 in DLL exports (refused), by-value structs beyond the safe subset in a Linux .so (refused).
+# NOT covered: a real Windows, a real aarch64 machine, v128 beyond xmm7 in DLL exports (refused), v128 beyond the vector registers next to a struct in a Linux .so (refused), alignment-16 structs.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
@@ -66,15 +66,27 @@ if command -v qemu-aarch64 >/dev/null && command -v aarch64-linux-gnu-gcc >/dev/
         (cd "$D" && timeout 300 qemu-aarch64 -L /usr/aarch64-linux-gnu ./host_a64 ./a64.so 2>&1 | grep -q 'all ok') && echo "ok  aarch64 .so under qemu ($lvl)" || { echo "FAIL aarch64 .so host ($lvl)"; rc=1; }
     done
 else echo "skip  aarch64 .so (no qemu-aarch64 / cross gcc / sysroot)"; fi
-# structs by value in a Linux .so (r506): the shapes C and Firn share work, every other shape is refused at build time
+# structs by value in a Linux .so (r506 safe subset, r558 thunks): the shapes C and Firn share go straight to the Firn function;
+# every other shape (float aggregates, 9-16 octet results, structs that do not fit the registers, structs over 16 octets)
+# gets a C-ABI entry thunk (compiler/src/so_thunk.rs). The C hosts are compiled by gcc / aarch64-linux-gnu-gcc: their ABI is the reference.
 for tgt in x86_64-linux aarch64-linux; do
     if [ $tgt = x86_64-linux ]; then HC=gcc; RUN=""; else
         command -v qemu-aarch64 >/dev/null && command -v aarch64-linux-gnu-gcc >/dev/null || { echo "skip  aarch64 struct .so"; continue; }
         HC=aarch64-linux-gnu-gcc; RUN="qemu-aarch64 -L /usr/aarch64-linux-gnu"; fi
     $HC -O1 -o "$D/hso_$tgt" tools/stack_e/host_struct_so.c -ldl || { echo "FAIL $tgt gcc host_struct_so"; rc=1; continue; }
     "$FIRNC" --shared --target=$tgt -o "$D/so_$tgt.so" tools/stack_e/lib_struct_so.fi || { echo "FAIL $tgt lib_struct_so"; rc=1; continue; }
-    (cd "$D" && timeout 120 $RUN ./hso_$tgt ./so_$tgt.so 2>&1 | grep -q 'host_struct_so: all ok') && echo "ok  $tgt .so structs by value (safe subset)" || { echo "FAIL $tgt .so struct subset"; rc=1; }
-    "$FIRNC" --shared --target=$tgt -o "$D/bad_$tgt.so" tools/stack_e/lib_struct.fi 2> "$D/err_$tgt" && { echo "FAIL $tgt .so: unsafe struct shapes accepted"; rc=1; } || grep -q 'pass a pointer instead' "$D/err_$tgt" || { echo "FAIL $tgt .so: refusal text"; rc=1; }
+    (cd "$D" && timeout 120 $RUN ./hso_$tgt ./so_$tgt.so 2>&1 | grep -q 'host_struct_so: all ok') && echo "ok  $tgt .so structs by value (shared shapes, no thunk)" || { echo "FAIL $tgt .so struct subset"; rc=1; }
+    $HC -O1 -o "$D/hs_$tgt" tools/stack_e/host_struct.c -ldl || { echo "FAIL $tgt gcc host_struct"; rc=1; continue; }
+    $HC -O1 -o "$D/hs2_$tgt" tools/stack_e/host_struct2.c -ldl || { echo "FAIL $tgt gcc host_struct2"; rc=1; continue; }
+    for lvl in dev-fast release-fast; do
+        "$FIRNC" --shared --target=$tgt --opt-level=$lvl -o "$D/st_$tgt.so" tools/stack_e/lib_struct.fi || { echo "FAIL $tgt .so lib_struct $lvl"; rc=1; continue; }
+        (cd "$D" && timeout 120 $RUN ./hs_$tgt ./st_$tgt.so 2>&1 | grep -q 'host_struct: all ok') && echo "ok  $tgt .so structs by value, thunks ($lvl)" || { echo "FAIL $tgt .so struct thunks ($lvl)"; rc=1; }
+        "$FIRNC" --shared --target=$tgt --opt-level=$lvl -o "$D/st2_$tgt.so" tools/stack_e/lib_struct2.fi || { echo "FAIL $tgt .so lib_struct2 $lvl"; rc=1; continue; }
+        (cd "$D" && timeout 120 $RUN ./hs2_$tgt ./st2_$tgt.so 2>&1 | grep -q 'host_struct2: all ok') && echo "ok  $tgt .so float aggregates, mixed words, register overflow, results over 8 octets ($lvl)" || { echo "FAIL $tgt .so struct thunks 2 ($lvl)"; rc=1; }
+    done
+    # a v128 that finds no vector register next to a struct that needs the thunk is refused with a clear error
+    printf 'struct D24 { x: f64, y: f64, z: f64 }\n#[export_c]\nfn bad_v(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f64, h: f64, x: v128, p: D24) -> u64 { return 0 }\n' > "$D/badv_$tgt.fi"
+    "$FIRNC" --shared --target=$tgt -o "$D/badv_$tgt.so" "$D/badv_$tgt.fi" 2> "$D/errv_$tgt" && { echo "FAIL $tgt .so: v128 beyond the vector registers accepted"; rc=1; } || grep -q 'v128' "$D/errv_$tgt" || { echo "FAIL $tgt .so: v128 error text"; rc=1; }
 done
 [ $rc = 0 ] && echo "RESULT g5: ok" || echo "RESULT g5: FAIL"
 exit $rc

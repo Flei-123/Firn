@@ -2457,19 +2457,26 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
                 }
                 let size = info.tcx.size_of(p) as u32;
                 Some(match abi::classify(p, &info.tcx) {
-                    ArgClass::Regs { .. } => crate::extfn::AggArg::Words { size, sse: words_of(p) },
-                    _ => crate::extfn::AggArg::Ref { size },
+                    ArgClass::Regs { .. } => {
+                        crate::extfn::AggArg::Words { size, sse: words_of(p), hfa: abi::hfa(p, &info.tcx) }
+                    }
+                    _ => crate::extfn::AggArg::Ref { size, hfa: abi::hfa(p, &info.tcx) },
                 })
             })
             .collect();
         let ret = if !is_agg(&sig.ret) {
             crate::extfn::AggRet::None
         } else if sret {
-            crate::extfn::AggRet::Sret { size: info.tcx.size_of(&sig.ret) as u32 }
+            crate::extfn::AggRet::Sret {
+                size: info.tcx.size_of(&sig.ret) as u32,
+                sse: words_of(&sig.ret),
+                hfa: abi::hfa(&sig.ret, &info.tcx),
+            }
         } else {
             crate::extfn::AggRet::Word {
                 size: info.tcx.size_of(&sig.ret) as u32,
                 sse: words_of(&sig.ret).first().copied().unwrap_or(false),
+                hfa: abi::hfa(&sig.ret, &info.tcx),
             }
         };
         crate::extfn::record_export_abi(&d.name, crate::extfn::ExportAbi { args, ret });

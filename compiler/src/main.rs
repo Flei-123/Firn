@@ -104,6 +104,7 @@ mod wasm_cfg;
 mod wasm_enc;
 mod wasm_locals;
 mod wasm_rt;
+mod so_thunk;
 mod win;
 mod win_seam;
 
@@ -1387,13 +1388,6 @@ fn link_shared(obj: &Path, so: &Path) -> Result<(), i32> {
     }
     if target::windows() {
         return link_dll(obj, so, &names);
-    }
-    let abi_errs = extfn::so_abi_errors(matches!(target::active(), target::Target::Aarch64));
-    if !abi_errs.is_empty() {
-        for e in &abi_errs {
-            eprintln!("error: --shared: export {}; pass a pointer instead (by-value structs of this shape work in a Windows DLL only)", e);
-        }
-        return Err(2);
     }
     let ver = so.with_extension("ver");
     let script = format!("{{ global: {}; local: *; }};\n", names.join("; "));
