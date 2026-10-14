@@ -518,9 +518,10 @@ function main () {
       packets_per_s: (packets / secs).toFixed(1),
       chunks: chunks.size,
       walk_ok: walkOk,
-      walk_fail: walkFail + chunkErrors,
+      walk_fail: walkFail + chunkErrors + lightBad,
       num_sections: numSections,
       partial_chunks: partialChunks,
+      update_light: { applied: lightApplied, orphan: lightOrphans, bad: lightBad },
       bulk_packets: bulkPackets,
       bulk_columns: bulkColumns,
       trailing_nonzero_chunks: trailingNonZero,
@@ -556,6 +557,7 @@ function main () {
 
   let hasSky = true
   let partialChunks = 0
+  let lightOrphans = 0; let lightApplied = 0; let lightBad = 0
   client.on('login', (p) => {
     m.join_ms = Date.now() - t0
     if (LEGACY_SECTIONS || LEGACY8) {
@@ -607,6 +609,42 @@ function main () {
       if (process.env.MC_REF_DEBUG_FILE) fs.writeFileSync(process.env.MC_REF_DEBUG_FILE, Buffer.from(p.chunkData).toString('hex'))
       if (process.env.MC_REF_DEBUG) console.error(`  debug chunkData(${p.chunkData.length}) head=${Buffer.from(p.chunkData).subarray(0, 96).toString('hex')}`)
     }
+    armIdle()
+  })
+
+  // 1.14 - 1.16.5: light arrives in its own (partial) update_light packets. MC_KEEP_LIGHT=1 merges them per column (an
+  // array replaces the one of the same section bit, an "empty" bit drops it) and hashes sky arrays then block arrays in
+  // ascending bit order. Own parser (restBuffer), independent of the Firn decoder. A packet for an unknown column is
+  // counted as orphan (the Firn client drops it too).
+  client.on('update_light', (p) => {
+    if (!SECTIONS_114 || !process.env.MC_KEEP_LIGHT) return
+    const c = chunks.get(`${p.chunkX},${p.chunkZ}`)
+    if (!c) { lightOrphans++; return }
+    try {
+      const r = new Reader(p.data)
+      const st = c.lightState || (c.lightState = { sky: new Map(), block: new Map() })
+      const u32 = (v) => v >>> 0
+      const readSet = (mask, empty, map) => {
+        for (let bit = 0; bit < 32; bit++) {
+          if (u32(mask) & (2 ** bit)) {
+            const n = r.varint()
+            if (n !== 2048) throw new Error(`light array length ${n}`)
+            map.set(bit, Buffer.from(r.bytes(2048)))
+          }
+        }
+        for (let bit = 0; bit < 32; bit++) if (u32(empty) & (2 ** bit) && !(u32(mask) & (2 ** bit))) map.delete(bit)
+      }
+      // the arrays of one kind are consecutive: all sky first, then all block
+      readSet(p.skyLightMask, p.emptySkyLightMask, st.sky)
+      readSet(p.blockLightMask, p.emptyBlockLightMask, st.block)
+      if (!r.eof()) throw new Error('update_light: trailing octets')
+      const f = new Fnv64()
+      for (const map of [st.sky, st.block]) {
+        for (const bit of [...map.keys()].sort((a, b) => a - b)) for (const b of map.get(bit)) f.byte(b)
+      }
+      c.light = { sky: st.sky.size, block: st.block.size, h: f.hex() }
+      lightApplied++
+    } catch (e) { lightBad++; console.error(`update_light failed at ${p.chunkX},${p.chunkZ}: ${e.message}`) }
     armIdle()
   })
 
