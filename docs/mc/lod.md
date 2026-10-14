@@ -75,3 +75,17 @@ Screen-door (ordered dither) fade between two representations of a column, in th
 - glweb: `set_fade` implemented (`glweb.fi be_set_fade`, uniform `u_fade = (a, inv, height, 0)`, re-applied at `begin`). Gate scenes `chunk_fade_a` / `chunk_fade_b` (a = 24) in tools/gpu/web/webscene.fi: coverage mismatch 7 / 14 px, PSNR 41 / 39 dB (SwiftShader).
 - Water / glass at FK_TOLOD: the translucent loop follows the cull window; a column that already left it had NO translucent draw, so its far water vanished at the FIRST fade frame (clear pixels at the lake horizon) instead of at the end. `lod_draw_trans` now draws the translucent meshes of the
   fading-out sections in PASS_TRANS with the same screen-door mask as their opaque mesh (columns in arbitrary order, the fade lasts a few frames). tests/2918 part 2 (lake world, water level 60): worst jump with fade 104 -> 38 px (hard switch 87), holes 306 -> 68 (hard 89), end-of-fade frame 6 px.
+
+## LOD silhouette rim, pin hole, translucent order (y3, 14.10.)
+- Skyline pixels were NOT a LOD height problem: with every column at bin 1 (exact height field) the same 6 pixels stayed. The cells are maxima, the LOD hull is never below
+  the full-detail terrain; the difference is the rasterizer: the LOD mesh has other (smaller) quads than the greedy full-detail mesh, so its silhouette vertices snap to
+  1/16 px independently and the edge can end up ~1/32 px inside. The wide expansion of the first pass (l1/4) is already spent on BOTH images, so more of it for everything just grows
+  both silhouettes (sweep of w3). Fix: LOD columns are drawn in their own pass `PASS_LOD` (mc_backend, value 2): opaque for every back end (GL treats it as PASS_OPAQUE), the CPU
+  raster expands the edges by l1/`LOD_EXP_DIV` (= 2) instead of l1/4. Only the LOD side grows, the full-detail reference keeps l1/4.
+- Measured (tests/2917, 40-frame flight, 5184 px, 96x54): holes mid ring 6 -> 1 (worst frame 1), no mid ring 3 -> 1; err (differing px) 10196 -> 10623 (+4 %), pop 1900 -> 1975. DIV 1: holes 1, err 11866.
+- The last hole (x62 y38, frame 4) is NOT in the LOD stream: a 1-px crack in the near full-detail mesh (ray grazes a block corner at 17 blocks) shows the inside of the terrain. The full-detail
+  reference has cave walls there (a stone wall at 87 blocks, ray inside the hill), the LOD height field has no inside (top quads are back-face culled from below) -> clear colour. Found by
+  marching the pixel ray through terrain_block. A radius-3 sections-only stream shows clear there too. Open (r154): crack in the section mesh, or draw LOD tops double sided.
+- Translucent fade-out columns (`lod_draw_trans`) are drawn back to front now (farthest ring distance squared first, ties by table index); tests/2918 records the translucent
+  draws with a recording back end: old code 15..36 draws out of order, new 0 (checks 78/79).
+- Gate floor `fog_flat` is back to 75 dB: dump.fi renders that scene with `raster_set_edge_expand(false)` (the arithmetic is what it checks), the expansion stays on for all other scenes.
