@@ -34,5 +34,10 @@ for s in tools/mc/*/run.sh; do
     echo "== mc/$lib =="
     bash "$s" || ERR=$((ERR+1))
 done
+# Windows build under Wine (cross-compile, login, window, raw mouse, F11, GUI exe + bank + log, recv-timeout seam): ~4 min, needs wine + Xvfb + java.
+if [ -z "$ONLY" ] || [ "$ONLY" = wine ]; then
+    echo "== mc/wine =="
+    bash tools/mc/play/run_wine.sh || ERR=$((ERR+1))
+fi
 if [ $ERR -eq 0 ]; then echo "RESULT mc: ok"; else echo "RESULT mc: $ERR failing parts"; fi
 exit $ERR

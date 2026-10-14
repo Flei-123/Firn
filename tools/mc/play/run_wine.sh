@@ -147,6 +147,8 @@ run_dist() {
 run_play WinCpu MCPLAY_GL=0
 run_input
 run_dist
+# 5) the seam maps a recv timeout to EAGAIN like Linux (needs a firnc built after the win_seam.rs fix, r133)
+bash tools/windows/timeout.sh 2>&1 | sed "s/^/  seam: /" | grep -v "^  seam: RESULT" ; [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "  FAIL  seam recv timeout"; ERR=1; }
 [ "${MCPLAY_GL:-0}" = 1 ] && run_play WinGl MCPLAY_GL=1
 [ $ERR -eq 0 ] && echo "RESULT mc-wine: ok" || echo "RESULT mc-wine: FAIL"
 exit $ERR
