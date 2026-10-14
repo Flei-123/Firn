@@ -22,6 +22,8 @@ mkdir -p "$W/srv"
 bash tools/mcclient/fetch_server.sh "$W/srv" "$MCV" || fail "server download"
 echo "eula=true" > "$W/srv/eula.txt"
 PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+# NOTE: spawn-animals must be true: with false the 1.20.1 server discards summoned animals (cow/pig/sheep) within one tick
+# (found with per-tick data get; natural spawning stays off through gamerule doMobSpawning false).
 cat > "$W/srv/server.properties" <<PROPS
 server-ip=127.0.0.1
 server-port=$PORT
@@ -34,7 +36,7 @@ simulation-distance=$VIEW
 spawn-protection=0
 difficulty=peaceful
 spawn-monsters=false
-spawn-animals=false
+spawn-animals=true
 spawn-npcs=false
 enable-rcon=false
 enable-query=false
@@ -63,7 +65,7 @@ PP=$!
 wait_join Watcher || fail "Watcher never joined"
 platform Watcher
 sleep 2
-for cmd in "summon minecraft:cow 0.5 121 5.5 {NoAI:1b,Tags:[\"ent\"]}" "summon minecraft:pig 2.5 121 6.5 {NoAI:1b,Tags:[\"ent\"]}" "summon minecraft:sheep -1.5 121 6.5 {NoAI:1b,Tags:[\"ent\"]}" "summon minecraft:armor_stand -3.5 121 8.5 {Tags:[\"ent\"]}" "summon minecraft:cow 4.5 121 8.5 {NoAI:1b,Tags:[\"ent\"]}"; do echo "$cmd" >&3; done
+for cmd in "summon minecraft:cow 0.5 121 5.5 {NoAI:1b,PersistenceRequired:1b,Tags:[\"ent\"]}" "summon minecraft:pig 2.5 121 6.5 {NoAI:1b,PersistenceRequired:1b,Tags:[\"ent\"]}" "summon minecraft:sheep -1.5 121 6.5 {NoAI:1b,PersistenceRequired:1b,Tags:[\"ent\"]}" "summon minecraft:armor_stand -3.5 121 8.5 {Tags:[\"ent\"]}" "summon minecraft:cow 4.5 121 8.5 {NoAI:1b,PersistenceRequired:1b,Tags:[\"ent\"]}"; do echo "$cmd" >&3; done
 sleep 1
 echo "data get entity @e[tag=ent,type=minecraft:cow,limit=1] Pos" >&3; echo "data get entity @e[tag=ent,type=minecraft:cow,limit=1] Health" >&3
 sleep 1
@@ -109,8 +111,8 @@ shot() { # <name> <gl 0|1> <entities 0|1>
 }
 # the stage 1 mobs are still there: re-place the survivors in a fixed pattern so every picture shows the same scene
 for cmd in "kill @e[tag=ent,type=minecraft:armor_stand]" "kill @e[tag=ent,type=minecraft:pig]" "kill @e[tag=ent,type=minecraft:cow]" \
-           "summon minecraft:cow 0.5 121 5.5 {NoAI:1b,Tags:[\"ent\"],Rotation:[0f,0f]}" "summon minecraft:pig 2.5 121 6.5 {NoAI:1b,Tags:[\"ent\"],Rotation:[0f,0f]}" \
-           "summon minecraft:pig -1.5 121 6.5 {NoAI:1b,Tags:[\"ent\"],Rotation:[0f,0f]}" "summon minecraft:cow 3.5 121 9.5 {NoAI:1b,Tags:[\"ent\"],Rotation:[0f,0f]}"; do echo "$cmd" >&3; done
+           "summon minecraft:cow 0.5 121 5.5 {NoAI:1b,PersistenceRequired:1b,Tags:[\"ent\"],Rotation:[0f,0f]}" "summon minecraft:pig 2.5 121 6.5 {NoAI:1b,PersistenceRequired:1b,Tags:[\"ent\"],Rotation:[0f,0f]}" \
+           "summon minecraft:pig -1.5 121 6.5 {NoAI:1b,PersistenceRequired:1b,Tags:[\"ent\"],Rotation:[0f,0f]}" "summon minecraft:cow 3.5 121 9.5 {NoAI:1b,PersistenceRequired:1b,Tags:[\"ent\"],Rotation:[0f,0f]}"; do echo "$cmd" >&3; done
 sleep 2
 shot cpu_on 0 1
 shot cpu_off 0 0
