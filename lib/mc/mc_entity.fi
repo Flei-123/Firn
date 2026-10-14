@@ -34,7 +34,7 @@ import mc.mc_entity_layout
 
 export {
     Store, Entity, store_new, store_free, store_get, store_count, store_player_count,
-    store_player_name, store_slot_cap, store_at, entity_on_packet, entity_dump, store_clear,
+    store_player_name, store_slot_cap, store_at, entity_on_packet, entity_dump, store_clear, store_interp, angle_delta,
     KIND_OBJECT, KIND_LIVING, KIND_PLAYER, MAX_ENTITIES, MAX_PLAYERS, NAME_MAX,
 }
 
@@ -67,6 +67,13 @@ struct Entity {
     vz: i32,
     name_len: usize,
     name: [u8; 32],
+    // render state (store_interp): smoothed position / yaw / pitch that follow x y z yaw pitch; rinit = false until the first call (snap)
+    rx: f64,
+    ry: f64,
+    rz: f64,
+    ryaw: f64,
+    rpitch: f64,
+    rinit: bool,
 }
 
 struct Player {
@@ -235,7 +242,7 @@ fn ent_empty() -> Entity {
     return Entity {
         k0: 0, k1: 0, id: 0, kind: 0, type_id: 0 - 1, has_uuid: false, on_ground: false, uuid_hi: 0,
         uuid_lo: 0, x: 0.0, y: 0.0, z: 0.0, yaw: 0.0, pitch: 0.0, vx: 0, vy: 0, vz: 0, name_len: 0,
-        name: [0 as u8; 32],
+        name: [0 as u8; 32], rx: 0.0, ry: 0.0, rz: 0.0, ryaw: 0.0, rpitch: 0.0, rinit: false,
     }
 }
 
@@ -551,6 +558,58 @@ fn parse_layout(prog: str, b: *mut bytes.Bytes, f: *mut Fields) -> bool {
         i = i + 1
     }
     return true
+}
+
+// ------------------------------------------------------------------------ per frame smoothing
+
+// Shortest signed difference a - b in degrees, in [-180, 180].
+fn angle_delta(a: f64, b: f64) -> f64 {
+    var d: f64 = a - b
+    while d > 180.0 { d = d - 360.0 }
+    while d <= 0.0 - 180.0 { d = d + 360.0 }
+    return d
+}
+
+// Moves the render state of every entity toward its network state: exponential approach with time constant `tau` seconds
+// (vanilla spreads a position update over 3 ticks = 0.15 s; tau 0.05 reaches 95 % in that time). The first call for an entity,
+// and a jump of more than `snap` blocks (teleport, dimension change), sets the render state directly. dt in seconds.
+// Returns the number of entities whose render position is still off by more than 1/1000 block (the ones that are moving).
+fn store_interp(s: *mut Store, dt: f64, tau: f64, snap: f64) -> u64 {
+    var a: f64 = 1.0
+    if tau > 0.0 && dt < 10.0 * tau {
+        a = 1.0 - math.exp(0.0 - dt / tau)
+    }
+    if dt <= 0.0 { a = 0.0 }
+    var moving: u64 = 0 as u64
+    let cap: usize = (*s).ents.cap
+    var i: usize = 0
+    while i < cap {
+        let e: *mut Entity = store_at(s, i)
+        i = i + 1
+        if (e as u64) == 0 as u64 { continue }
+        let dx: f64 = (*e).x - (*e).rx
+        let dy: f64 = (*e).y - (*e).ry
+        let dz: f64 = (*e).z - (*e).rz
+        if !(*e).rinit || dx * dx + dy * dy + dz * dz > snap * snap {
+            (*e).rx = (*e).x
+            (*e).ry = (*e).y
+            (*e).rz = (*e).z
+            (*e).ryaw = (*e).yaw
+            (*e).rpitch = (*e).pitch
+            (*e).rinit = true
+            continue
+        }
+        (*e).rx = (*e).rx + dx * a
+        (*e).ry = (*e).ry + dy * a
+        (*e).rz = (*e).rz + dz * a
+        (*e).ryaw = (*e).ryaw + angle_delta((*e).yaw, (*e).ryaw) * a
+        (*e).rpitch = (*e).rpitch + angle_delta((*e).pitch, (*e).rpitch) * a
+        let ex: f64 = (*e).x - (*e).rx
+        let ey: f64 = (*e).y - (*e).ry
+        let ez: f64 = (*e).z - (*e).rz
+        if ex * ex + ey * ey + ez * ez > 0.000001 { moving = moving + 1 as u64 }
+    }
+    return moving
 }
 
 // ----------------------------------------------------------------------------- applying

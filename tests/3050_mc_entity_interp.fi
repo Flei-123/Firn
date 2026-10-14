@@ -1,0 +1,174 @@
+// expect_exit: 0
+// Entity render smoothing (mc_entity.store_interp) + mc_entity_draw using the smoothed position:
+// first step snaps, a move is approached exponentially (no overshoot, converges), a teleport / jump > snap distance snaps,
+// yaw takes the short way round 360, entlist_build draws the render position (not the network position).
+import std.rt
+import std.io
+import std.bytes
+import std.math
+import mc.mc_entity
+import mc.mc_entity_draw
+import mc.mc_camera
+import mc.mc_registry
+import mc.mc_sem
+import mc.mc_version
+import mc.v763.mc_proto_v763
+
+fn check(failures: *mut i32, ok: bool, what: str) {
+    if !ok {
+        io.fmt_print(f"FAIL {what}\n")
+        *failures = *failures + 1
+    }
+}
+
+fn feed(s: *mut mc_entity.Store, ver: *mut mc_version.Version, sem: usize, b: *mut bytes.Bytes) -> bool {
+    bytes.bytes_set_pos(b, 0)
+    let id: i32 = (*ver).sem[sem]
+    let r: bool = mc_entity.entity_on_packet(s, ver, id, b)
+    bytes.bytes_clear(b)
+    return r
+}
+
+fn spawn_object(s: *mut mc_entity.Store, ver: *mut mc_version.Version, id: i32, x: f64, y: f64, z: f64) -> bool {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&b, id)
+    bytes.put_uuid(&b, 1 as u64, id as u64)
+    bytes.put_varint(&b, 5)
+    bytes.put_f64(&b, x)
+    bytes.put_f64(&b, y)
+    bytes.put_f64(&b, z)
+    bytes.put_i8(&b, 0 as i8)
+    bytes.put_u8(&b, 0 as u8)
+    bytes.put_i8(&b, 0 as i8)
+    bytes.put_varint(&b, 0)
+    bytes.put_i16(&b, 0 as i16)
+    bytes.put_i16(&b, 0 as i16)
+    bytes.put_i16(&b, 0 as i16)
+    let r: bool = feed(s, ver, mc_sem.SEM_PLAY_S2C_SPAWN_ENTITY, &b)
+    bytes.bytes_free(&b)
+    return r
+}
+
+fn rel_move(s: *mut mc_entity.Store, ver: *mut mc_version.Version, id: i32, dx: i16, dy: i16, dz: i16) -> bool {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&b, id)
+    bytes.put_i16(&b, dx)
+    bytes.put_i16(&b, dy)
+    bytes.put_i16(&b, dz)
+    bytes.put_bool(&b, true)
+    let r: bool = feed(s, ver, mc_sem.SEM_PLAY_S2C_REL_ENTITY_MOVE, &b)
+    bytes.bytes_free(&b)
+    return r
+}
+
+fn teleport(s: *mut mc_entity.Store, ver: *mut mc_version.Version, id: i32, x: f64, y: f64, z: f64) -> bool {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&b, id)
+    bytes.put_f64(&b, x)
+    bytes.put_f64(&b, y)
+    bytes.put_f64(&b, z)
+    bytes.put_i8(&b, 0 as i8)
+    bytes.put_i8(&b, 0 as i8)
+    bytes.put_bool(&b, true)
+    let r: bool = feed(s, ver, mc_sem.SEM_PLAY_S2C_ENTITY_TELEPORT, &b)
+    bytes.bytes_free(&b)
+    return r
+}
+
+fn main() -> i32 {
+    var failures: i32 = 0
+    var ver: mc_version.Version = mc_proto_v763.version_make()
+    var s: mc_entity.Store = mc_entity.store_new()
+    check(&failures, spawn_object(&s, &ver, 7, 0.0, 0.0, 5.0), "spawn handled")
+    let e: *mut mc_entity.Entity = mc_entity.store_get(&s, 7)
+    if (e as u64) == 0 as u64 { return 1 }
+    check(&failures, !(*e).rinit, "render state not initialised before the first step")
+    // first step snaps, nothing is moving
+    let m0: u64 = mc_entity.store_interp(&s, 0.016, 0.05, 8.0)
+    check(&failures, (*e).rinit && (*e).rx == 0.0 && (*e).rz == 5.0 && m0 == 0 as u64, "first step snaps")
+    // move +0.5 in x (2048 / 4096): network position jumps, render position follows
+    check(&failures, rel_move(&s, &ver, 7, 2048 as i16, 0 as i16, 0 as i16), "rel move handled")
+    check(&failures, (*e).x == 0.5 && (*e).rx == 0.0, "network position moved, render position did not yet")
+    let m1: u64 = mc_entity.store_interp(&s, 0.05, 0.05, 8.0)
+    // dt == tau -> 1 - 1/e = 0.6321
+    check(&failures, (*e).rx > 0.3 && (*e).rx < 0.32 && m1 == 1 as u64, "one tau step covers ~63 percent")
+    var prev: f64 = (*e).rx
+    var i: i32 = 0
+    var mono: bool = true
+    while i < 30 {
+        mc_entity.store_interp(&s, 0.05, 0.05, 8.0)
+        if (*e).rx < prev || (*e).rx > 0.5 { mono = false }
+        prev = (*e).rx
+        i = i + 1
+    }
+    check(&failures, mono, "monotonic, no overshoot")
+    check(&failures, math.fabs((*e).rx - 0.5) < 0.0001, "converges to the network position")
+    // dt = 0 changes nothing
+    let before: f64 = (*e).rx
+    mc_entity.store_interp(&s, 0.0, 0.05, 8.0)
+    check(&failures, (*e).rx == before, "dt 0 keeps the state")
+    // teleport far away snaps in one step
+    check(&failures, teleport(&s, &ver, 7, 100.0, 70.0, 100.0), "teleport handled")
+    mc_entity.store_interp(&s, 0.016, 0.05, 8.0)
+    check(&failures, (*e).rx == 100.0 && (*e).ry == 70.0 && (*e).rz == 100.0, "teleport > snap distance snaps")
+    // a short teleport (2 blocks) is smoothed
+    check(&failures, teleport(&s, &ver, 7, 102.0, 70.0, 100.0), "short teleport handled")
+    mc_entity.store_interp(&s, 0.016, 0.05, 8.0)
+    check(&failures, (*e).rx > 100.0 && (*e).rx < 102.0, "short teleport is smoothed")
+    // yaw: 350 -> 10 degrees goes up through 360 (short way), not down through 180
+    (*e).ryaw = 350.0
+    (*e).yaw = 10.0
+    mc_entity.store_interp(&s, 0.05, 0.05, 8.0)
+    check(&failures, (*e).ryaw > 360.0 && (*e).ryaw < 370.0, "yaw takes the short way")
+    check(&failures, mc_entity.angle_delta(10.0, 350.0) == 20.0 && mc_entity.angle_delta(350.0, 10.0) == 0.0 - 20.0, "angle_delta wraps")
+    check(&failures, mc_entity.angle_delta(0.0, 180.0) == 180.0 && mc_entity.angle_delta(180.0, 0.0) == 180.0, "angle_delta +-180")
+
+    // drawing: the box record carries the RENDER x, not the network x
+    var s2: mc_entity.Store = mc_entity.store_new()
+    check(&failures, spawn_object(&s2, &ver, 3, 0.0, 0.0, 5.0), "spawn 2")
+    mc_entity.store_interp(&s2, 0.016, 0.05, 8.0)
+    check(&failures, rel_move(&s2, &ver, 3, 2048 as i16, 0 as i16, 0 as i16), "move 2")
+    mc_entity.store_interp(&s2, 0.05, 0.05, 8.0)
+    let e2: *mut mc_entity.Entity = mc_entity.store_get(&s2, 3)
+    var cam: mc_camera.Camera = mc_camera.camera_new(64, 48)
+    mc_camera.camera_set_pos(&cam, 0.0, 1.0, 0.0)
+    mc_camera.camera_update(&cam)
+    var l: mc_entity_draw.EntList = mc_entity_draw.entlist_new()
+    mc_entity_draw.entlist_build(&l, &s2, &cam, 64.0, 24.0)
+    check(&failures, mc_entity_draw.entlist_boxes(&l) == 1, "object = one box in front of the camera")
+    if mc_entity_draw.entlist_boxes(&l) == 1 {
+        let bx: f64 = *(rt.buf_ptr(&l.buf) as *mut f64)
+        check(&failures, bx == (*e2).rx && bx != (*e2).x && bx > 0.0 && bx < 0.5, "box uses the render position")
+    }
+    // far away (beyond max_dist) is culled, behind the camera is culled
+    mc_entity_draw.entlist_build(&l, &s2, &cam, 2.0, 24.0)
+    check(&failures, mc_entity_draw.entlist_boxes(&l) == 0 && l.n_culled == 1 as u32, "beyond max_dist culled")
+    check(&failures, spawn_object(&s2, &ver, 4, 0.0, 0.0, 0.0 - 5.0), "spawn behind")
+    mc_entity_draw.entlist_build(&l, &s2, &cam, 64.0, 24.0)
+    check(&failures, mc_entity_draw.entlist_boxes(&l) == 1 && l.n_culled == 1 as u32 && l.n_in == 2 as u32, "entity behind the camera culled")
+    // registry sizes: an object of type 5 (spawn_object helper) gets the box of its entity record (width x height x width)
+    var reg: mc_registry.Registry = ver.registry_of()
+    check(&failures, mc_registry.registry_ok(&reg), "registry")
+    let ri: i32 = mc_registry.reg_entity_find(&reg, 5)
+    check(&failures, ri >= 0, "entity type 5 in the registry")
+    if ri >= 0 {
+        let rw: f64 = (mc_registry.reg_entity_width_milli(&reg, ri) as f64) * 0.001
+        let rh: f64 = (mc_registry.reg_entity_height_milli(&reg, ri) as f64) * 0.001
+        var s3: mc_entity.Store = mc_entity.store_new()
+        check(&failures, spawn_object(&s3, &ver, 9, 0.0, 0.0, 5.0), "spawn 3")
+        mc_entity_draw.entlist_build_reg(&l, &s3, &cam, 64.0, 24.0, &reg)
+        check(&failures, mc_entity_draw.entlist_boxes(&l) == 1, "sized entity = one box")
+        if mc_entity_draw.entlist_boxes(&l) == 1 {
+            let rec: *mut f64 = rt.buf_ptr(&l.buf) as *mut f64
+            let sx: f64 = *((rec as u64 + 24) as *mut f64)
+            let sy: f64 = *((rec as u64 + 32) as *mut f64)
+            check(&failures, math.fabs(sx - rw) < 0.0001 && math.fabs(sy - rh) < 0.0001 && rw > 0.0 && rh > 0.0, "box has the registry width / height")
+        }
+        mc_entity.store_free(&s3)
+    }
+    mc_entity_draw.entlist_free(&l)
+    mc_entity.store_free(&s)
+    mc_entity.store_free(&s2)
+    if failures == 0 { io.fmt_print(f"ok\n") }
+    return failures
+}
