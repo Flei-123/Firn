@@ -7,9 +7,9 @@
 // its flags (`FLAG_LOGIN_UUID_*`, `FLAG_CONFIG_PHASE`, `FLAG_CHUNK_BATCHES`), and the few
 // values the replies need are found with the schema walker (`field_range`), not with a
 // hard coded offset. Honest limits:
-//   * client written packets are built by hand (Client Information only in the layout of
-//     1.20.1 / 1.20.2) but every one is held against the version's generated schema before
-//     it is sent (`send`): a layout that does not fit the version is refused, never sent.
+//   * every client written packet is ENCODED from a value store (client_send_values /
+//     mc_encode) with the version's generated schema, no per-version writer; a layout that
+//     does not fit the version is refused, never sent.
 //     Schema driven writers are the proper fix (docs/MC-VERSIONS.md, "client-written packets");
 //   * login: `client_login_offline` (no account: an Encryption Request is reported as
 //     CL_ONLINE_MODE) and `client_login_online` (OnlineAccount: Encryption Request -> RSA with
@@ -188,13 +188,13 @@ fn wire_code(e: WireError) -> i32 {
 
 // Handshake; `next_state` 1 = status, 2 = login. Moves the client into that state.
 fn client_handshake(c: *mut Client, host: u64, port: u16, next_state: i32) -> bool {
-    var b: bytes.Bytes = bytes.bytes_new()
-    bytes.put_varint(&b, (*c).ver.protocol)
-    bytes.put_string(&b, host, rt.c_length(host))
-    bytes.put_u16(&b, port)
-    bytes.put_varint(&b, next_state)
-    let ok: bool = send(c, mc_version.ST_HANDSHAKE, mc_sem.SEM_HANDSHAKE_C2S_SET_PROTOCOL, &b)
-    bytes.bytes_free(&b)
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_i64(&v, "protocolVersion", (*c).ver.protocol as i64)
+    mc_encode.vals_text(&v, "serverHost", host, rt.c_length(host))
+    mc_encode.vals_i64(&v, "serverPort", port as i64)
+    mc_encode.vals_i64(&v, "nextState", next_state as i64)
+    let ok: bool = client_send_values(c, mc_version.ST_HANDSHAKE, mc_sem.SEM_HANDSHAKE_C2S_SET_PROTOCOL, &v)
+    rt.buf_free(&v)
     if ok {
         (*c).state = next_state
     }
@@ -219,8 +219,6 @@ fn has_account(a: *mut OnlineAccount) -> bool {
 fn send_login_start(c: *mut Client, name: u64, acct: *mut OnlineAccount) -> bool {
     var high: u64 = 0
     var low: u64 = 0
-    var b: bytes.Bytes = bytes.bytes_new()
-    bytes.put_string(&b, name, rt.c_length(name))
     var has_uuid: bool = false
     if has_account(acct) {
         high = be64((&(*acct).uuid[0]) as u64, 0)
@@ -229,16 +227,15 @@ fn send_login_start(c: *mut Client, name: u64, acct: *mut OnlineAccount) -> bool
     } else {
         has_uuid = md5.md5_offline_uuid(name, rt.c_length(name), &high, &low)
     }
-    if mc_version.version_has(&(*c).ver, mc_version.FLAG_LOGIN_UUID_OPTIONAL) {
-        bytes.put_bool(&b, has_uuid)
-        if has_uuid {
-            bytes.put_uuid(&b, high, low)
-        }
-    } else if mc_version.version_has(&(*c).ver, mc_version.FLAG_LOGIN_UUID_REQUIRED) {
-        bytes.put_uuid(&b, high, low)
+    // one value store for every version: the writer takes the fields the version's packet has
+    // (username only before 1.19, optional playerUUID 1.19 - 1.20.1, mandatory from 1.20.2)
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_text(&v, "username", name, rt.c_length(name))
+    if has_uuid {
+        mc_encode.vals_uuid(&v, "playerUUID", high, low)
     }
-    let ok: bool = send(c, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_C2S_LOGIN_START, &b)
-    bytes.bytes_free(&b)
+    let ok: bool = client_send_values(c, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_C2S_LOGIN_START, &v)
+    rt.buf_free(&v)
     return ok
 }
 
@@ -350,18 +347,8 @@ fn encryption(c: *mut Client, acct: *mut OnlineAccount) -> i32 {
         var v: rt.Buf = rt.buf_new()
         mc_encode.vals_hex(&v, "sharedSecret", (&enc_s[0]) as u64, ls)
         mc_encode.vals_hex(&v, "verifyToken", (&enc_v[0]) as u64, lv)
-        var sent: bool = client_send_values(c, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_C2S_ENCRYPTION_BEGIN, &v)
+        let sent: bool = client_send_values(c, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_C2S_ENCRYPTION_BEGIN, &v)
         rt.buf_free(&v)
-        if !sent {
-            // hand written fallback: two length prefixed arrays (layouts before 1.19 / from 1.19.3)
-            var r: bytes.Bytes = bytes.bytes_new()
-            bytes.put_varint(&r, ls as i32)
-            bytes.put_raw(&r, (&enc_s[0]) as u64, ls)
-            bytes.put_varint(&r, lv as i32)
-            bytes.put_raw(&r, (&enc_v[0]) as u64, lv)
-            sent = send(c, mc_version.ST_LOGIN, mc_sem.SEM_LOGIN_C2S_ENCRYPTION_BEGIN, &r)
-            bytes.bytes_free(&r)
-        }
         if sent {
             // everything after the answer is encrypted in both directions
             mc_codec.wire_enable_encryption(&(*c).w, sp)
@@ -600,17 +587,11 @@ fn client_auto_reply(c: *mut Client, id: i32) -> bool {
         field_f32(c, id, "yaw".p as u64, 3, &yaw)
         field_f32(c, id, "pitch".p as u64, 5, &pitch)
         if has_tid && pid(c, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM) >= 0 {
-            // schema driven writer (mc_encode); the hand written body stays as the fallback
+            // schema driven writer (mc_encode)
             var tv: rt.Buf = rt.buf_new()
             mc_encode.vals_i64(&tv, "teleportId", tid as i64)
-            let sent: bool = client_send_values(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM, &tv)
+            client_send_values(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM, &tv)
             rt.buf_free(&tv)
-            if !sent {
-                var r: bytes.Bytes = bytes.bytes_new()
-                bytes.put_varint(&r, tid)
-                send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM, &r)
-                bytes.bytes_free(&r)
-            }
         }
         var pv: rt.Buf = rt.buf_new()
         mc_encode.vals_f64(&pv, "x", x)
@@ -619,19 +600,8 @@ fn client_auto_reply(c: *mut Client, id: i32) -> bool {
         mc_encode.vals_f32(&pv, "yaw", yaw)
         mc_encode.vals_f32(&pv, "pitch", pitch)
         mc_encode.vals_bool(&pv, "onGround", false)
-        let sent_pl: bool = client_send_values(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_POSITION_LOOK, &pv)
+        client_send_values(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_POSITION_LOOK, &pv)
         rt.buf_free(&pv)
-        if !sent_pl {
-            var p: bytes.Bytes = bytes.bytes_new()
-            bytes.put_f64(&p, x)
-            bytes.put_f64(&p, y)
-            bytes.put_f64(&p, z)
-            bytes.put_f32(&p, yaw)
-            bytes.put_f32(&p, pitch)
-            bytes.put_bool(&p, false)
-            send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_POSITION_LOOK, &p)
-            bytes.bytes_free(&p)
-        }
         (*c).teleports = (*c).teleports + 1 as u64
         (*c).pos_set = true
         (*c).pos_x = x
@@ -642,14 +612,8 @@ fn client_auto_reply(c: *mut Client, id: i32) -> bool {
     if mc_version.version_has(&(*c).ver, mc_version.FLAG_CHUNK_BATCHES) && client_is(c, id, mc_sem.SEM_PLAY_S2C_CHUNK_BATCH_FINISHED) {
         var cv: rt.Buf = rt.buf_new()
         mc_encode.vals_f32(&cv, "chunksPerTick", 10.0f) // desired chunks per tick
-        let sent_cb: bool = client_send_values(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_CHUNK_BATCH_RECEIVED, &cv)
+        client_send_values(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_CHUNK_BATCH_RECEIVED, &cv)
         rt.buf_free(&cv)
-        if !sent_cb {
-            var r: bytes.Bytes = bytes.bytes_new()
-            bytes.put_f32(&r, 10.0f) // desired chunks per tick
-            send(c, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_CHUNK_BATCH_RECEIVED, &r)
-            bytes.bytes_free(&r)
-        }
         return true
     }
     return false
@@ -657,8 +621,7 @@ fn client_auto_reply(c: *mut Client, id: i32) -> bool {
 
 // Client Information (view distance, chat settings). One value store for every version: the
 // schema driven writer takes the fields the version's packet has and ignores the rest (1.8: no
-// main hand, 1.9 - 1.16: no text filtering / server listing, 1.17+: all eight). The hand built
-// bodies of the two known layouts stay as the fallback if the writer refuses.
+// main hand, 1.9 - 1.16: no text filtering / server listing, 1.17+: all eight).
 fn client_send_settings(c: *mut Client, view: i32) -> bool {
     let sem_state: i32 = (*c).state
     var st: i32 = mc_version.ST_PLAY
@@ -680,36 +643,5 @@ fn client_send_settings(c: *mut Client, view: i32) -> bool {
     mc_encode.vals_i64(&v, "particleStatus", 0) // 1.21.2+: all
     let done: bool = client_send_values(c, st, sem, &v)
     rt.buf_free(&v)
-    if done {
-        return true
-    }
-    // fallback layouts, newest first: 0 = 1.21.2+ (adds particle status), 1 = 1.17 - 1.21.1,
-    // 2 = 1.9 - 1.16 (ends after the main hand), 3 = 1.8 (no main hand)
-    var tried: i32 = 0
-    while tried < 4 {
-        var b: bytes.Bytes = bytes.bytes_new()
-        var loc2: [u8; 6] = "en_us\0"
-        bytes.put_string_c(&b, (&loc2[0]) as u64)
-        bytes.put_i8(&b, view as i8)
-        bytes.put_varint(&b, 0) // chat: enabled
-        bytes.put_bool(&b, true) // chat colors
-        bytes.put_u8(&b, 127 as u8) // skin parts
-        if tried < 3 {
-            bytes.put_varint(&b, 1) // main hand: right (1.9 and later)
-        }
-        if tried < 2 {
-            bytes.put_bool(&b, false) // text filtering
-            bytes.put_bool(&b, true) // server listing
-        }
-        if tried == 0 {
-            bytes.put_varint(&b, 0) // particle status: all (1.21.2+)
-        }
-        let ok: bool = send(c, st, sem, &b)
-        bytes.bytes_free(&b)
-        if ok {
-            return true
-        }
-        tried = tried + 1
-    }
-    return false
+    return done
 }
