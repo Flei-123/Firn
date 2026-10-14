@@ -77,6 +77,38 @@ SU=$(grep -o 'inv updates=[0-9]*' "$W/surv.out" | head -1 | cut -d= -f2); SB=$(g
 echo "  survival dig=${SD:-?} dig_ms=${SMS:-?} inv_updates=${SU:-?} bad=${SB:-?} $(grep -o 'hotbar=[^ ]*' "$W/surv.out" | head -1)"
 [ "${SD:-0}" -ge 1 ] || { echo "  FAIL  survival: nothing dug"; ERR=1; }
 [ "${SU:-0}" -gt 0 ] && [ "${SB:-1}" -eq 0 ] || { echo "  FAIL  survival: inventory updates=${SU:-0} bad=${SB:-?}"; ERR=1; }
+# ---- efficiency + haste + inventory clicks: enchanted pickaxe, Haste III, Click Container script (MCPLAY_CLICK_TEST) checked against the server's inventory
+case "$PROTO" in 763) ENCH='{Enchantments:[{id:"minecraft:efficiency",lvl:5}]}';; 767|769) ENCH='[enchantments={levels:{"minecraft:efficiency":5}}]';; *) ENCH='[enchantments={"minecraft:efficiency":5}]';; esac
+MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CLICK_TEST=1 MCPLAY_RUN_S=24 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player8 > "$W/fx.out" 2>&1 &
+PP=$!
+sleep 5
+echo "gamemode survival Player8" >&3; echo "give Player8 diamond_pickaxe$ENCH 1" >&3; echo "give Player8 stone 32" >&3; echo "effect give Player8 minecraft:haste 300 2" >&3
+sleep 8
+echo "data get entity Player8 Inventory" >&3
+sleep 2
+xdotool mousemove 320 180 2>/dev/null; xdotool mousemove_relative -- 0 300; xdotool key 1; sleep 0.5
+xdotool mousedown 1; sleep 4; xdotool mouseup 1; sleep 1
+wait $PP
+FXL=$(grep 'mcplay: fx ' "$W/fx.out" | head -1); CTL=$(grep 'mcplay: clicktest' "$W/fx.out" | head -1)
+echo "  $FXL"; echo "  $CTL"
+case "$FXL" in *"haste=3"*"eff=5"*"eff0=5"*) ;; *) echo "  FAIL  fx: expected haste=3 eff=5"; ERR=1;; esac
+FT=$(echo "$FXL" | grep -o 'fx_ticks=[-0-9]*' | cut -d= -f2); PT=$(echo "$FXL" | grep -o 'plain_ticks=[-0-9]*' | cut -d= -f2)
+[ "${FT:--9}" != "-9" ] && [ "${FT:--1}" -ge 0 ] && [ "${FT}" -le "${PT:-0}" ] || { echo "  FAIL  fx: break ticks ${FT:-?} not <= plain ${PT:-?}"; ERR=1; }
+case "$CTL" in *"slot10=1x15"*"slot11=1x16"*) ;; *) case "$CTL" in *"x15"*"x16"*) ;; *) echo "  FAIL  clicks: local result $CTL"; ERR=1;; esac;; esac
+INVL=$(grep 'Player8 has the following entity data' "$W/server.log" | tail -1)
+python3 - "$INVL" <<'PY' || ERR=1
+import re,sys
+t=sys.argv[1]
+def cnt(slot):
+    for m in re.finditer(r'\{[^{}]*Slot: %db[^{}]*\}' % slot, t):
+        c=re.search(r'(?:Count: |count: )(\d+)', m.group(0))
+        if c and 'stone' in m.group(0): return int(c.group(1))
+    return 0
+a,b=cnt(10),cnt(11)
+print("  server inventory: slot10=%d slot11=%d" % (a,b))
+sys.exit(0 if (a,b)==(15,16) else 1)
+PY
 echo stop >&3; sleep 1
 [ $ERR -eq 0 ] && echo "RESULT mc-play-inv: ok" || echo "RESULT mc-play-inv: FAIL"
 exit $ERR

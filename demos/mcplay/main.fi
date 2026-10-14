@@ -58,6 +58,7 @@ import mc.mc_wlight
 import mc.mc_packs
 import mc.mc_backend
 import mc.mc_inv
+import mc.mc_effect
 import mc.mc_dig
 import mc.mc_dig_sel
 import gpu.glctx
@@ -370,6 +371,12 @@ struct Ctx {
     show_inv: bool,
     give_done: bool,
     dig_total: i32,
+    fx: mc_effect.Fx, // own Haste / Mining Fatigue (Entity Effect packets)
+    fx_ticks: i32, // last computed break time in ticks (with Efficiency / Haste / Fatigue) and without them
+    fx_plain: i32,
+    click_phase: i32, // MCPLAY_CLICK_TEST script (Click Container against a real server)
+    click_t: u64,
+    click_src: i32,
 }
 
 fn mark_air(c: *mut Ctx, x: i32, y: i32, z: i32, id: i32) {
@@ -506,6 +513,7 @@ fn on_packet(c: *mut Ctx, id: i32) {
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_JOIN_GAME) {
         if !(*c).join {
             (*c).join = true
+            mc_effect.fx_own_from_join(&(*c).fx, mc_client.client_body(cl))
             mc_dimension.dim_from_join(&(*cl).ver, id, mc_client.client_body(cl), &(*c).dim)
             (*c).g.wr.min_y = (*c).dim.min_y
             if (*c).light { light_setup(c) }
@@ -524,11 +532,20 @@ fn on_packet(c: *mut Ctx, id: i32) {
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_KICK_DISCONNECT) {
         (*c).n_kick = (*c).n_kick + 1 as u64
         (*c).closed = true
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_ENTITY_EFFECT) {
+        mc_effect.fx_on_effect(&(*c).fx, (*cl).ver.protocol, mc_client.client_body(cl))
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_REMOVE_ENTITY_EFFECT) {
+        mc_effect.fx_on_remove(&(*c).fx, (*cl).ver.protocol, mc_client.client_body(cl))
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_SET_CURSOR_ITEM) {
+        mc_inv.inv_set_efficiency_id(&(*c).inv, mc_client.client_enchant_efficiency(cl))
+        mc_inv.inv_on_set_cursor_v(&(*c).inv, &(*cl).ver, mc_client.client_body(cl))
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_WINDOW_ITEMS) {
         dump_raw_inv("items", (*cl).ver.protocol, mc_client.client_body(cl))
+        mc_inv.inv_set_efficiency_id(&(*c).inv, mc_client.client_enchant_efficiency(cl))
         mc_inv.inv_on_window_items_v(&(*c).inv, &(*cl).ver, mc_client.client_body(cl))
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_SET_SLOT) {
         dump_raw_inv("slot", (*cl).ver.protocol, mc_client.client_body(cl))
+        mc_inv.inv_set_efficiency_id(&(*c).inv, mc_client.client_enchant_efficiency(cl))
         mc_inv.inv_on_set_slot_v(&(*c).inv, &(*cl).ver, mc_client.client_body(cl))
     } else if (*c).aud {
         if mc_audio.mca_on_packet((*c).ma, &(*cl).ver, id, mc_client.client_body(cl), &(*c).ents) {
@@ -672,7 +689,18 @@ fn handle_hotbar(c: *mut Ctx) {
         (*c).sent_slot = (*c).pl.slot
     }
     if raw.key_pressed(&(*c).rw, 18 as u32) { (*c).show_inv = !(*c).show_inv }
+    if raw.key_pressed(&(*c).rw, 16 as u32) && !(*c).show_inv {
+        // Q drops one item of the held stack (Ctrl+Q the whole stack): player action 4 / 3
+        let all: bool = raw.key_down(&(*c).rw, 29 as u32)
+        let hs: i32 = mc_inv.INV_HOTBAR0 + (*c).pl.slot
+        if mc_inv.inv_local_drop(&(*c).inv, hs, all) {
+            var st: i32 = 4
+            if all { st = 3 }
+            mc_play.send_dig(&(*c).cl, st, 0, 0, 0, 0, 0)
+        }
+    }
     if (*c).have_pos { give_items(c) }
+    if (*c).have_pos && env_flag("MCPLAY_CLICK_TEST", false) { click_test(c) }
     if raw.key_pressed(&(*c).rw, SC_F as u32) { (*c).want_fly = true }
     if raw.key_pressed(&(*c).rw, SC_N as u32) { (*c).want_noclip = true }
 }
@@ -802,6 +830,8 @@ fn draw_inventory(c: *mut Ctx, r: *mut mc_raster.Raster) {
         }
         row = row + 1
     }
+    // the carried stack follows the mouse
+    draw_slot_label(c, r, (raw.mouse_x(&(*c).rw) as i32) - 8 * s, (raw.mouse_y(&(*c).rw) as i32) - 8 * s, s, mc_inv.inv_cursor_item(&(*c).inv), mc_inv.inv_cursor_count(&(*c).inv))
 }
 
 // Creative: MCPLAY_GIVE="stone:64,diamond_pickaxe:1" fills the hotbar from slot 1 (Set Creative Slot; the server does not echo it).
@@ -858,13 +888,93 @@ fn dig_time_ms(c: *mut Ctx, state: i32) -> i32 {
     let blk: i32 = mc_registry.reg_block_of_state(&(*c).reg, state)
     if blk < 0 { return env_int("MCPLAY_DIG_MS", 700) }
     let item: i32 = mc_inv.inv_held_item(&(*c).inv, (*c).pl.slot)
-    let t: i32 = mc_dig.dig_ticks(&(*c).dg, blk, mc_registry.reg_block_hardness_milli(&(*c).reg, blk), item, 0, (*c).pl.on_ground, false)
+    let hard: i32 = mc_registry.reg_block_hardness_milli(&(*c).reg, blk)
+    let eff: i32 = mc_inv.inv_held_eff(&(*c).inv, (*c).pl.slot)
+    let t: i32 = mc_dig.dig_ticks_fx(&(*c).dg, blk, hard, item, eff, mc_effect.fx_haste(&(*c).fx), mc_effect.fx_fatigue(&(*c).fx), (*c).pl.on_ground, false)
+    (*c).fx_ticks = t
+    (*c).fx_plain = mc_dig.dig_ticks(&(*c).dg, blk, hard, item, 0, (*c).pl.on_ground, false)
     if t <= 0 { return t }
     (*c).dig_total = t
     return t * 50
 }
 
+// Inventory panel (same geometry as draw_inventory): slot under the mouse, -1 = on the panel but no slot, CLICK_OUTSIDE (-999) = outside
+fn ui_slot_at(c: *mut Ctx) -> i32 {
+    let s: i32 = mc_hud.hud_scale((*c).w, (*c).h)
+    let pw: i32 = 9 * 20 * s + 8 * s
+    let ph: i32 = 5 * 20 * s + 20 * s
+    let px: i32 = ((*c).w - pw) / 2
+    let py: i32 = ((*c).h - ph) / 2
+    let mx: i32 = raw.mouse_x(&(*c).rw) as i32
+    let my: i32 = raw.mouse_y(&(*c).rw) as i32
+    if mx < px || my < py || mx >= px + pw || my >= py + ph { return 0 - 999 }
+    var row: i32 = 0
+    while row < 4 {
+        var col: i32 = 0
+        while col < 9 {
+            var slot: i32 = mc_inv.INV_MAIN0 + row * 9 + col
+            var gy: i32 = py + 14 * s + row * 20 * s
+            if row == 3 {
+                slot = mc_inv.INV_HOTBAR0 + col
+                gy = gy + 4 * s
+            }
+            let gx: i32 = px + 4 * s + col * 20 * s
+            if mx >= gx && my >= gy && mx < gx + 19 * s && my < gy + 19 * s { return slot }
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return 0 - 1
+}
+
+// Mouse in the open inventory panel: left / right click = Click Container (shift = quick move, asks the server only)
+fn ui_inv_click(c: *mut Ctx) {
+    var btn: i32 = 0 - 1
+    if raw.mouse_pressed(&(*c).rw, raw.MB_LEFT) { btn = 0 }
+    if raw.mouse_pressed(&(*c).rw, raw.MB_RIGHT) { btn = 1 }
+    if btn < 0 { return }
+    let slot: i32 = ui_slot_at(c)
+    if slot == 0 - 1 { return }
+    var mode: i32 = 0
+    if raw.key_down(&(*c).rw, 42 as u32) && slot >= 0 { mode = 1 }
+    mc_inv.inv_click(&(*c).cl, &(*c).inv, slot, btn, mode)
+}
+
+// MCPLAY_CLICK_TEST=1 (survival, after `give <name> stone 32`): picks the stack of 32 up, puts it into slot 10, takes half, puts that
+// into slot 11, drops one from slot 10 -> expected 15 in slot 10, 16 in slot 11 (the harness compares with the server's inventory).
+fn click_test(c: *mut Ctx) {
+    let now: u64 = now_ms()
+    if (*c).click_phase >= 7 { return }
+    if (*c).click_phase > 0 && now - (*c).click_t < 350 as u64 { return }
+    let cl: *mut mc_client.Client = &(*c).cl
+    if (*c).click_phase == 0 {
+        var k: i32 = 0
+        while k < 36 && (*c).click_src < 0 {
+            if mc_inv.inv_count(&(*c).inv, 9 + k) == 32 { (*c).click_src = 9 + k }
+            k = k + 1
+        }
+        if (*c).click_src < 0 { return }
+        mc_inv.inv_click(cl, &(*c).inv, (*c).click_src, 0, 0)
+    } else if (*c).click_phase == 1 {
+        mc_inv.inv_click(cl, &(*c).inv, 10, 0, 0)
+    } else if (*c).click_phase == 2 {
+        mc_inv.inv_click(cl, &(*c).inv, 10, 1, 0)
+    } else if (*c).click_phase == 3 {
+        mc_inv.inv_click(cl, &(*c).inv, 11, 0, 0)
+    } else if (*c).click_phase == 4 {
+        mc_inv.inv_drop_slot(cl, &(*c).inv, 10, false)
+    } else if (*c).click_phase == 5 {
+        say(f"mcplay: clicktest src={(*c).click_src} slot10={mc_inv.inv_item(&(*c).inv, 10)}x{mc_inv.inv_count(&(*c).inv, 10)} slot11={mc_inv.inv_item(&(*c).inv, 11)}x{mc_inv.inv_count(&(*c).inv, 11)} cursor={mc_inv.inv_cursor_item(&(*c).inv)}x{mc_inv.inv_cursor_count(&(*c).inv)} clicks={(*c).inv.n_clicks}\n")
+    }
+    (*c).click_phase = (*c).click_phase + 1
+    (*c).click_t = now
+}
+
 fn handle_mouse(c: *mut Ctx) {
+    if (*c).show_inv && (*c).have_pos {
+        ui_inv_click(c)
+        return
+    }
     let lmb: bool = raw.mouse_down(&(*c).rw, raw.MB_LEFT)
     let lp: bool = raw.mouse_pressed(&(*c).rw, raw.MB_LEFT)
     let rp: bool = raw.mouse_pressed(&(*c).rw, raw.MB_RIGHT)
@@ -1274,6 +1384,7 @@ fn main(start: u64) -> i32 {
         probe: env_flag("MCPLAY_AUDIO_PROBE", false), probe_i: 0, probe_next: 0 as u64, amb: mc_audio.mca_ambient_new(4242 as i64), amb_x: (env_int("MCPLAY_AMBIENT_X", 1) as f64), amb_dark: env_flag("MCPLAY_AMBIENT_DARK", false), n_amb: 0 as u64,
         n_chunks: 0, n_unload: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, fps: 0,
         inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), show_inv: false, give_done: false, dig_total: 0,
+        fx: mc_effect.fx_new(), fx_ticks: 0 - 1, fx_plain: 0 - 1, click_phase: 0, click_t: 0 as u64, click_src: 0 - 1,
     }
     if !c.g.ok {
         io.eprint_line("mcplay: this version has no block registry")
@@ -1412,6 +1523,7 @@ fn main(start: u64) -> i32 {
     audio_stop(&c)
     say(f"mcplay: end frames={c.n_frames} ticks={c.n_ticks} chunks={c.n_chunks} unloads={c.n_unload} block_updates={c.n_bchange} multi_updates={c.n_mchange} dig={c.n_dig} place={c.n_place} kicked={c.n_kick} alive={alive}\n")
     say(f"mcplay: inv updates={c.inv.n_updates} bad={c.inv.bad} hotbar={mc_inv.inv_hotbar_item(&c.inv, 0)}x{mc_inv.inv_hotbar_count(&c.inv, 0)},{mc_inv.inv_hotbar_item(&c.inv, 1)}x{mc_inv.inv_hotbar_count(&c.inv, 1)},{mc_inv.inv_hotbar_item(&c.inv, 2)}x{mc_inv.inv_hotbar_count(&c.inv, 2)} dig_ms={c.dig_ms} dig_total={c.dig_total} dig_table={c.dg.nblocks}\n")
+    say(f"mcplay: fx haste={mc_effect.fx_haste(&c.fx)} fatigue={mc_effect.fx_fatigue(&c.fx)} eff={mc_inv.inv_held_eff(&c.inv, c.pl.slot)} eff0={mc_inv.inv_held_eff(&c.inv, 0)} fx_ticks={c.fx_ticks} plain_ticks={c.fx_plain} clicks={c.inv.n_clicks} cursor={mc_inv.inv_cursor_item(&c.inv)}x{mc_inv.inv_cursor_count(&c.inv)} slot10={mc_inv.inv_count(&c.inv, 10)} slot11={mc_inv.inv_count(&c.inv, 11)}\n")
     say(f"mcplay: light={c.light} region={c.region_done} region_moves={c.n_region_moves} time_packets={c.n_time} day_time={c.day_time} daylight={c.sky.daylight}\n")
     say(f"mcplay: pos x={c.pl.x as i64} y={c.pl.y as i64} z={c.pl.z as i64} fps={c.fps}\n")
     var rc: i32 = 0
