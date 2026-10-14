@@ -3,7 +3,7 @@
 // lib/gpu/vkmc/mc.vert -- Vulkan twin of lib/gpu/mc_vs.glsl (u_pool == 0 path: one section per draw, origin in a push constant).
 // Interface contract (VK2 swaps the SPIR-V without touching vk_mc.fi): location 0 = uvec2 mesh vertex; set 0 binding 0 = UBO
 // (rv, fog, fogc, tiles), binding 1 = sampler2DArray atlas; push constant = org.xyz + trans flag, fade, light.
-// Vulkan clip space: y points down, depth 0..1 -> y is flipped and z remapped here, so the host matrix stays the GL one.
+// Vulkan clip space: depth 0..1 -> z is remapped here; y is flipped by the viewport (y = h, height = -h, Vulkan 1.1 core), so the host matrix stays the GL one AND the rasterisation rules match GL.
 layout(location = 0) in uvec2 a_w;
 layout(set = 0, binding = 0) uniform U {
     mat4 rv;
@@ -27,7 +27,7 @@ void main() {
     uint w1 = a_w.y;
     vec3 p = vec3(float(w0 & 255u), float((w0 >> 8) & 255u), float((w0 >> 16) & 255u)) + pc.org.xyz;
     vec4 c = u.rv * vec4(p, 1.0);
-    gl_Position = vec4(c.x, -c.y, (c.z + c.w) * 0.5, c.w);
+    gl_Position = vec4(c.x, c.y, (c.z + c.w) * 0.5, c.w); // y stays GL: the viewport has a negative height
     v_depth = c.w;
     v_uvao = vec3(float((w1 >> 14) & 31u), float((w1 >> 19) & 31u), float((w0 >> 27) & 3u));
     v_tile = int(w1 & 16383u);
