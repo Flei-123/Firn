@@ -4,7 +4,7 @@
 #   --offline      fixture world (tools/mc/view/fixture/world.mcw) tiled to the radius; CPU back end; radii PERF_RADII (8 16 32),
 #                  PERF_RUNS (3) runs each; reports/perf_<stamp>_cpu_r<R>.tsv/.json. Start it via heavy (server is shared).
 #   --live         first joins a local vanilla 1.20.1 server with demos/mcview (tools/mc/view/run.sh --live) -- NOT wired yet.
-#   PERF_COMP=1      also run the mesh/upload component probe (perf_components): CRASHES (segfault) intermittently with R >= 8 on main 14.10. -> off by default
+#   PERF_COMP=0      switch the mesh/upload component probe (perf_components) off (default ON since 14.10.: the segfault was mc_mesh MAX_QUADS too small, tests/2950)
 #   PERF_BACKEND=gl  (with --offline) uses tools/mc/perf/bench_gl.fi: GL back end (lib/gpu/gl_mc) on EGL surfaceless = llvmpipe, i.e. SOFTWARE GL, NO real GPU.
 # Honesty: llvmpipe numbers are marked "no real GPU"; Vanilla is NOT measured (needs the Boss's ok).
 set -uo pipefail
@@ -27,7 +27,7 @@ else
         fs=()
         for i in $(seq 1 "${PERF_RUNS:-3}"); do
             LOAD=$(cut -d' ' -f1 /proc/loadavg)
-            BENCH_COMP=${PERF_COMP:-0} BENCH_COMPUPLOAD=${PERF_COMP:-0} BENCH_T0_NS=$(date +%s%N) "$W/bench" tools/mc/view/fixture/world.mcw "$R" "${PERF_FRAMES:-100}" 10 > "$W/r${R}_$i.txt" 2>&1
+            BENCH_COMP=${PERF_COMP:-1} BENCH_COMPUPLOAD=${PERF_COMP:-1} BENCH_T0_NS=$(date +%s%N) "$W/bench" tools/mc/view/fixture/world.mcw "$R" "${PERF_FRAMES:-100}" 10 > "$W/r${R}_$i.txt" 2>&1
             echo "RESULT server_load $LOAD load" >> "$W/r${R}_$i.txt"; fs+=("$W/r${R}_$i.txt")
         done
         if [ "$BTAG" = gl ]; then BN=gl-llvmpipe; GN="none (llvmpipe software GL, NO real GPU)"; else BN=cpu-raster; GN="none (CPU rasterizer, single thread)"; fi
