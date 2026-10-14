@@ -7,6 +7,7 @@
 #
 #   usage: tray_check.py <tray_main binary>
 import os, subprocess, sys, threading, time, signal
+from tscale import T, scratch_dir
 import dbus, dbus.service, dbus.bus
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
@@ -144,7 +145,7 @@ try:
     check("Peer.Ping", True)
     menu.Event(2, "clicked", dbus.String("", variant_level=1), dbus.UInt32(0))   # Quit
     try:
-        rest = proc.communicate(timeout=10)[0]
+        rest = proc.communicate(timeout=T(10))[0]
     except subprocess.TimeoutExpired:
         proc.kill()
         rest = proc.communicate()[0]

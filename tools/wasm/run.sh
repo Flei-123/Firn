@@ -37,6 +37,13 @@
 #
 # Usage: bash tools/wasm/run.sh [file.fi ...]
 set -uo pipefail
+# Timeouts scale with the machine load (1x .. 4x): a busy server made the slow dev wasm runs hit the
+# fixed 120 s limit (r579). Override: TIME_SCALE=<integer>.
+if [ -z "${TIME_SCALE:-}" ]; then
+    TIME_SCALE=$(awk -v l="$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0)" -v c="$(nproc 2>/dev/null || echo 8)" \
+        'BEGIN { s = l / (c / 8); if (s < 1) s = 1; if (s > 4) s = 4; printf "%d", s + 0.999 }')
+fi
+RUN_TIMEOUT=$((120 * TIME_SCALE))
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 export FIRNLIB="$ROOT/lib"
@@ -49,7 +56,7 @@ fi
 export W
 LEVELS=${LEVELS:-"release-fast dev dev-fast release-safe"}
 JOBS=${JOBS:-8}
-export LEVELS ROOT
+export LEVELS ROOT RUN_TIMEOUT
 rm -rf "$W"
 mkdir -p "$W/res"
 
@@ -65,6 +72,19 @@ one() {
     id=$(echo "$f" | tr '/' '_')
     base="$W/$id"
     local verdict="SAME" detail=""
+    # A test may declare that it cannot be compared natively vs. WebAssembly
+    # ("// wasm_skip: <reason>" in its first 5 lines). Counted as REFUSED with
+    # the reason class "skipped", so it stays visible in the report.
+    local skip
+    skip=$(head -5 "$f" | sed -n 's|^// wasm_skip: *||p' | head -1)
+    # "// wasm_nostderr: <reason>" (first 5 lines): stdout and exit code are compared, stderr is not
+    # (timing-dependent diagnostics, e.g. hole counts that depend on wall-clock budgets).
+    local nostderr=0
+    head -5 "$f" | grep -q '^// wasm_nostderr:' && nostderr=1
+    if [ -n "$skip" ]; then
+        printf 'REFUSED\t%s\tskipped -- %s\n' "$f" "$skip" > "$W/res/$id"
+        return
+    fi
     for lvl in $LEVELS; do
         flags="--opt-level=$lvl"
         [ "$lvl" = "dev" ] && flags="--no-opt"
@@ -98,10 +118,11 @@ one() {
             fi
             break
         fi
-        timeout 120 "$base.$lvl.nat" < /dev/null > "$base.$lvl.nout" 2> "$base.$lvl.nerr"
+        timeout "$RUN_TIMEOUT" "$base.$lvl.nat" < /dev/null > "$base.$lvl.nout" 2> "$base.$lvl.nerr"
         echo $? > "$base.$lvl.nrc"
-        timeout 120 node --stack-size=7800 "$ROOT/tools/wasm/run.mjs" "$base.$lvl.wasm" < /dev/null > "$base.$lvl.wout" 2> "$base.$lvl.werr"
+        timeout "$RUN_TIMEOUT" node --stack-size=7800 "$ROOT/tools/wasm/run.mjs" "$base.$lvl.wasm" < /dev/null > "$base.$lvl.wout" 2> "$base.$lvl.werr"
         echo $? > "$base.$lvl.wrc"
+        if [ "$nostderr" = 1 ]; then cp "$base.$lvl.nerr" "$base.$lvl.werr"; fi
         if ! cmp -s "$base.$lvl.nout" "$base.$lvl.wout" || ! cmp -s "$base.$lvl.nerr" "$base.$lvl.werr" \
             || ! cmp -s "$base.$lvl.nrc" "$base.$lvl.wrc"; then
             verdict="DIFFERENT"
@@ -184,7 +205,7 @@ for f in $(grep '^SAME' "$W/results.tsv" | cut -f2); do
     head -5 "$f" | grep -q '^// only_mode: opt$' && lvl=release-fast
     FIRN_WASM_DISPATCH=1 "$FIRNC" --opt-level=$lvl --target=wasm32-browser -o "$W/$id.disp.wasm" "$f" 2>/dev/null || { bad="$bad $f"; continue; }
     n=$((n + 1))
-    timeout 120 node --stack-size=7800 tools/wasm/run.mjs "$W/$id.disp.wasm" < /dev/null > "$W/$id.dout" 2> "$W/$id.derr"
+    timeout "$RUN_TIMEOUT" node --stack-size=7800 tools/wasm/run.mjs "$W/$id.disp.wasm" < /dev/null > "$W/$id.dout" 2> "$W/$id.derr"
     rc=$?
     if [ "$rc" = "$(cat "$W/$id.$lvl.nrc" 2>/dev/null)" ] && cmp -s "$W/$id.dout" "$W/$id.$lvl.nout" \
         && cmp -s "$W/$id.derr" "$W/$id.$lvl.nerr"; then

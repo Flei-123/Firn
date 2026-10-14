@@ -1,0 +1,111 @@
+// expect_exit: 0
+// mc.vk_mc sky pass (lavapipe, NO real GPU): vkbe_sky covers the whole frame and matches mc_sky.sky_draw_plain on mc_raster within one
+// level per channel; the pipeline switch sky -> voxel -> sky inside one frame keeps working. SKIP (exit 0) without a Vulkan device.
+import std.rt
+import std.io
+import mc.mc_backend
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_sky
+import mc.vk_mc
+
+const W: i32 = 160
+const H: i32 = 90
+
+fn check(fails: *mut i32, what: str, ok: bool) {
+    if ok {
+        io.fmt_print(f"   ok   {what}\n")
+    } else {
+        io.fmt_print(f"   FAIL {what}\n")
+        *fails = *fails + 1
+    }
+}
+
+// number of pixels whose channel difference exceeds one level
+fn big_diff(a: u64, b: u64, n: usize) -> u64 {
+    var cnt: u64 = 0
+    var i: usize = 0
+    while i < n {
+        let pa: u32 = rt.ld32(a, i)
+        let pb: u32 = rt.ld32(b, i)
+        var k: u32 = 0 as u32
+        var bad: bool = false
+        while k < 4 as u32 {
+            let ca: i32 = ((pa >> (k * 8 as u32)) & 255 as u32) as i32
+            let cb: i32 = ((pb >> (k * 8 as u32)) & 255 as u32) as i32
+            var d: i32 = ca - cb
+            if d < 0 { d = 0 - d }
+            if d > 1 { bad = true }
+            k = k + 1 as u32
+        }
+        if bad { cnt = cnt + 1 as u64 }
+        i = i + 1
+    }
+    return cnt
+}
+
+fn main() -> i32 {
+    var vb: vk_mc.VkBackend = vk_mc.vkbe_open(W, H)
+    if !vb.ok {
+        io.fmt_print(f"SKIP vkbe_open step={vb.step}\n")
+        return 0
+    }
+    var r: mc_raster.Raster = mc_raster.raster_new(W, H)
+    var bc: mc_backend.Backend = mc_backend.backend_cpu(&r)
+    var bg: mc_backend.Backend = vk_mc.vkbe_backend(&vb)
+    var ta: mc_texture.Atlas = mc_texture.atlas_default()
+    bc.upload_atlas(bc.obj, (&ta) as u64)
+    bg.upload_atlas(bg.obj, (&ta) as u64)
+    var cam: mc_camera.Camera = mc_camera.camera_new(W, H)
+    mc_camera.camera_set_pos(&cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&cam, 30.0, 10.0)
+    mc_camera.camera_update(&cam)
+    var sky: mc_sky.Sky = mc_sky.sky_new()
+    mc_sky.sky_set_time(&sky, 12600 as i64, 0)
+    let clear: u32 = 0xFF302010 as u32
+    var fails: i32 = 0
+    let n: usize = (W as usize) * (H as usize)
+
+    bc.begin(bc.obj, (&cam) as u64, clear)
+    mc_sky.sky_draw_plain(&sky, &r)
+    bc.end(bc.obj)
+    let pc: u64 = bc.present(bc.obj)
+
+    bg.begin(bg.obj, (&cam) as u64, clear)
+    vk_mc.vkbe_sky(&vb, &cam, &sky)
+    bg.end(bg.obj)
+    let pg: u64 = bg.present(bg.obj)
+    check(&fails, "frame returned", pg != 0 as u64)
+    if pg != 0 as u64 {
+        var cov: u64 = 0
+        var i: usize = 0
+        while i < n {
+            if rt.ld32(pg, i) != clear { cov = cov + 1 as u64 }
+            i = i + 1
+        }
+        check(&fails, "sky covers every pixel", cov == (n as u64))
+        let bad: u64 = big_diff(pc, pg, n)
+        io.fmt_print(f"   pixels off by more than one level: {bad}\n")
+        check(&fails, "sky equals mc_sky.sky_draw_plain (+-1 level)", bad == 0 as u64)
+    }
+
+    // second frame, same slot cycle: sky again after a frame without it (pipeline bind tracking restarts at begin)
+    bg.begin(bg.obj, (&cam) as u64, clear)
+    bg.end(bg.obj)
+    let pe: u64 = bg.present(bg.obj)
+    check(&fails, "frame without sky keeps the clear colour", pe != 0 as u64 && rt.ld32(pe, 0) == clear && rt.ld32(pe, n - 1) == clear)
+    bg.begin(bg.obj, (&cam) as u64, clear)
+    vk_mc.vkbe_sky(&vb, &cam, &sky)
+    bg.end(bg.obj)
+    let p3: u64 = bg.present(bg.obj)
+    check(&fails, "sky again after a frame without it", p3 != 0 as u64 && big_diff(pc, p3, n) == 0 as u64)
+
+    vk_mc.vkbe_close(&vb)
+    if fails != 0 {
+        io.fmt_print(f"FAIL {fails}\n")
+        return 1
+    }
+    io.print("vk_mc sky ok\n")
+    return 0
+}

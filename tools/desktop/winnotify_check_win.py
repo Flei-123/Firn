@@ -6,6 +6,7 @@
 # Checked: the balloon is accepted, stay_alive keeps the icon after the window is closed (a second balloon
 # still goes out), stay_alive(false) takes it away; with no shell the answers agree (notify == stay_alive).
 import os, shutil, subprocess, sys, tempfile, time
+from tscale import T, scratch_dir
 
 FAILED = []
 def check(name, cond, extra=""):
@@ -28,7 +29,7 @@ for _ in range(100):
 time.sleep(0.3)
 
 def run(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=90)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=T(90))
     return r.stdout.split()
 
 try:

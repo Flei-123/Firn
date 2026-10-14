@@ -76,7 +76,7 @@ Program `docs/gdb_example.fi`:
 
 ```firn
 // expect_exit: 55
-fn summe(n: i32) -> i32 {
+fn sum_to(n: i32) -> i32 {
     var s: i32 = 0
     for i in 1 as i32..n + 1 as i32 {
         s = s + i
@@ -85,7 +85,7 @@ fn summe(n: i32) -> i32 {
 }
 
 fn main() -> i32 {
-    let r: i32 = summe(10)
+    let r: i32 = sum_to(10)
     return r
 }
 ```
@@ -97,15 +97,15 @@ $ readelf -S /tmp/gdbdemo | grep debug
   [ 3] .debug_abbrev     PROGBITS         0000000000000000  000003b2
   [ 4] .debug_line       PROGBITS         0000000000000000  00000451
 
-$ gdb -batch -ex "break summe" -ex run -ex bt -ex "info args" -ex "info locals" \
+$ gdb -batch -ex "break sum_to" -ex run -ex bt -ex "info args" -ex "info locals" \
         -ex next -ex next -ex next \
-        -ex "print s" -ex "print i" -ex "print n" -ex "ptype summe" \
+        -ex "print s" -ex "print i" -ex "print n" -ex "ptype sum_to" \
         -ex continue /tmp/gdbdemo
 Breakpoint 1 at 0x40010e: file docs/gdb_example.fi, line 3.
 
-Breakpoint 1, summe (n=10) at docs/gdb_example.fi:3
+Breakpoint 1, sum_to (n=10) at docs/gdb_example.fi:3
 3	    var s: i32 = 0
-#0  summe (n=10) at docs/gdb_example.fi:3
+#0  sum_to (n=10) at docs/gdb_example.fi:3
 #1  0x0000000000400257 in main () at docs/gdb_example.fi:11
 n = 10
 s = 0

@@ -8,6 +8,7 @@
 # (a MinGW program, tools/desktop/argv_dump.c, prints the arguments MSVCRT's parser made of the
 # registered command line; launch.exe starts it with CreateProcess, as the shell starts a Run entry).
 import os, shutil, subprocess, sys, tempfile
+from tscale import T, scratch_dir
 
 FAILED = []
 def check(name, cond, extra=""):
@@ -19,12 +20,12 @@ if shutil.which("wine") is None:
     print("  SKIP  wine not installed")
     sys.exit(0)
 main_exe, dump_exe, launch_exe = [os.path.abspath(a) for a in sys.argv[1:4]]
-td = tempfile.mkdtemp(prefix="autostart-win-")
+td = scratch_dir("autostart-win-")
 env = dict(os.environ, WINEPREFIX=os.environ.get("WINEPREFIX", os.path.expanduser("~/.wine-firn")), WINEDEBUG="-all")
 env.setdefault("DISPLAY", ":0")
 KEY = "Software\\FirnTest\\Run"
 
-def wine(*args, extra=None, timeout=60):
+def wine(*args, extra=None, timeout=T(60)):
     e = dict(env)
     if extra:
         e.update(extra)

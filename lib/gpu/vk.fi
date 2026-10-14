@@ -34,7 +34,7 @@ export {
     open, close, idle, device_name, is_cpu, device_type, api_version, has_surface_ext, has_swapchain, mem_type,
     target_new, target_free, read_pixels, pipeline_tri, pipeline_new, pipeline_free, shader_make, shader_free,
     buf_new, buf_write, buf_free, draw,
-    sc_open, sc_resize, sc_frame, sc_close, window_pixels,
+    sc_open, sc_resize, sc_frame, sc_close, window_pixels, sc_acquire, sc_present, sc_image,
     // lifecycle layer (gpu.vk_life): raw helpers, result tracking, fault injection, release
     call, sa, good, r32, r64, w32, w64, cstr, release, inject, INJ_SUBMIT, INJ_ACQUIRE, INJ_PRESENT,
     STEP_NO_LOADER, STEP_NO_SYMBOL, STEP_NO_INSTANCE, STEP_NO_DEVICE, STEP_NO_QUEUE, STEP_NO_LOGICAL, STEP_NO_POOL,
@@ -216,6 +216,8 @@ struct Sc {
     xid: u64,
     mode: i32, // 0 xlib, 1 xcb
     frames: u64,
+    xfer: bool, // swapchain images also have TRANSFER_DST (blit target, r195)
+    idx: u64, // image index of the last sc_acquire
 }
 
 fn vk_new() -> Vk {
@@ -238,7 +240,7 @@ fn buf_blank() -> Buf {
 
 fn sc_blank() -> Sc {
     return Sc { ok: false, surface: 0, chain: 0, fmt: 0, w: 0, h: 0, n: 0, images: 0, views: 0, fbs: 0, rpass: 0, sem_acq: 0,
-        sem_done: 0, xid: 0, mode: 0, frames: 0 }
+        sem_done: 0, xid: 0, mode: 0, frames: 0, xfer: false, idx: 0 }
 }
 
 // ---- raw access helpers --------------------------------------------------------------------------------------
@@ -1380,7 +1382,13 @@ fn sc_build(v: *mut Vk, s: *mut Sc, w: i32, h: i32) -> bool {
     w32(ci, 44, ew)
     w32(ci, 48, eh)
     w32(ci, 52, 1)
-    w32(ci, 56, 0x10) // COLOR_ATTACHMENT
+    var usage: u64 = 0x10 // COLOR_ATTACHMENT
+    (*s).xfer = false
+    if (r32(caps, 48) & 0x2) != 0 { // supportedUsageFlags has TRANSFER_DST: vk_mc blits its colour image into the swapchain
+        usage = usage | 0x2
+        (*s).xfer = true
+    }
+    w32(ci, 56, usage)
     w32(ci, 80, r32(caps, 40)) // current transform
     w32(ci, 84, alpha)
     w32(ci, 88, 2) // FIFO (always supported)
@@ -1485,35 +1493,56 @@ fn sc_frame(v: *mut Vk, s: *mut Sc, p: *mut Pipe, vb: *mut Buf, nverts: u64, cle
     if !(*s).ok || !(*p).ok {
         return FRAME_ERROR
     }
-    (*v).top = 0
-    let idx: u64 = sa(v, 8)
-    var ra: u64 = 0
-    if take_inject(v, INJ_ACQUIRE) {
-        ra = (*v).inj_res
-        note(v, ra)
-    } else {
-        ra = note(v, c(v, F_ACQUIRE, (*v).dev, (*s).chain, 0xFFFFFFFFFFFFFFFF, (*s).sem_acq, 0, idx))
-    }
+    let ra: u64 = sc_acquire(v, s, (*s).sem_acq)
     if ra == 0xC4653214 { // VK_ERROR_OUT_OF_DATE_KHR (-1000001004)
         return FRAME_RESIZE
     }
     if ra != 0 && ra != 1000001003 { // SUBOPTIMAL is fine
         return FRAME_ERROR
     }
-    let i: u64 = r32(idx, 0)
+    let i: u64 = (*s).idx
     if !record_pass(v, (*s).rpass, rt.ld64((*s).fbs, i as usize), (*s).w, (*s).h, p, vb, nverts, clear) {
         return FRAME_ERROR
     }
     if !submit_wait(v, (*s).sem_acq, (*s).sem_done) {
         return FRAME_ERROR
     }
+    let rp: u64 = sc_present(v, s, i, (*s).sem_done)
+    if rp == 0xC4653214 {
+        return FRAME_RESIZE
+    }
+    if rp != 0 && rp != 1000001003 {
+        return FRAME_ERROR
+    }
+    return FRAME_OK
+}
+
+// Acquires the next swapchain image (signals `sem` when it is ready; s.idx = its index). Returns the VkResult (low 32 bits): 0, SUBOPTIMAL
+// (1000001003, usable), OUT_OF_DATE (0xC4653214, rebuild), DEVICE_LOST ... Honours vk.inject(INJ_ACQUIRE); a failing acquire signals nothing.
+fn sc_acquire(v: *mut Vk, s: *mut Sc, sem: u64) -> u64 {
+    (*v).top = 0
+    let idx: u64 = sa(v, 8)
+    var ra: u64 = 0
+    if take_inject(v, INJ_ACQUIRE) {
+        ra = (*v).inj_res
+        note(v, ra)
+        return ra
+    }
+    ra = note(v, c(v, F_ACQUIRE, (*v).dev, (*s).chain, 0xFFFFFFFFFFFFFFFF, sem, 0, idx))
+    if ra == 0 || ra == 1000001003 { (*s).idx = r32(idx, 0) }
+    return ra
+}
+
+// Queues the present of image `i`, waiting for `wait_sem`. Returns the VkResult like sc_acquire (injection: the present really happens, the
+// result is replaced). Counts s.frames.
+fn sc_present(v: *mut Vk, s: *mut Sc, i: u64, wait_sem: u64) -> u64 {
     (*v).top = 0
     let ch: u64 = sa(v, 8)
     w64(ch, 0, (*s).chain)
     let ix: u64 = sa(v, 8)
     w32(ix, 0, i)
     let wsm: u64 = sa(v, 8)
-    w64(wsm, 0, (*s).sem_done)
+    w64(wsm, 0, wait_sem)
     let pi: u64 = sa(v, 64)
     w32(pi, 0, 1000001001) // PRESENT_INFO_KHR
     w32(pi, 16, 1)
@@ -1527,13 +1556,13 @@ fn sc_frame(v: *mut Vk, s: *mut Sc, p: *mut Pipe, vb: *mut Buf, nverts: u64, cle
         note(v, rp)
     }
     (*s).frames = (*s).frames + 1
-    if rp == 0xC4653214 {
-        return FRAME_RESIZE
-    }
-    if rp != 0 && rp != 1000001003 {
-        return FRAME_ERROR
-    }
-    return FRAME_OK
+    return rp
+}
+
+// VkImage handle of swapchain image `i`.
+fn sc_image(s: *mut Sc, i: u64) -> u64 {
+    if (*s).images == 0 || i >= (*s).n { return 0 }
+    return rt.ld64((*s).images, i as usize)
 }
 
 // What the X server currently shows in the window (XGetImage): w*h RGBA octets. Waits for the queue first.

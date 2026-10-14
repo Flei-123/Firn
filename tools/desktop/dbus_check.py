@@ -6,6 +6,7 @@
 #
 #   usage: dbus_check.py <dbus_main binary>
 import os, subprocess, sys, threading, time
+from tscale import T, scratch_dir
 import dbus, dbus.service, dbus.bus
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
@@ -119,7 +120,7 @@ except dbus.DBusException as e:
 obj.get_dbus_method("Slow", IF)()
 obj.get_dbus_method("Quit", IF)()
 try:
-    rest = proc.communicate(timeout=10)[0]
+    rest = proc.communicate(timeout=T(10))[0]
 except subprocess.TimeoutExpired:
     proc.kill()
     rest = proc.communicate()[0]

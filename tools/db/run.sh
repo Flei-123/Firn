@@ -12,6 +12,7 @@
 #               and by lib/db                                                check_crash.py
 #   locks       SQLite and lib/db processes on one file                      check_lock.py
 #   hostile     damaged files: no crash, panic or hang                       check_hostile.py
+#               (check_hostile_selftest.py: output via files, not pipes -- Wine's wineserver daemon)
 #   Windows     the same programs built for x86_64-windows, run under Wine   (RUNNER=wine)
 #
 # Usage: tools/db/run.sh [quick]        quick = fewer hostile files, no Windows build
@@ -49,6 +50,7 @@ run "DML, DDL, transactions" 8 python3 tools/db/check_dml.py "$W/sql_probe"
 run "crashes" 8 python3 tools/db/check_crash.py "$W/sql_probe"
 run "locks" 12 python3 tools/db/check_lock.py "$W/sql_probe"
 run "damaged files ($HOSTILE)" 4 python3 tools/db/check_hostile.py "$W/sql_probe" "$HOSTILE"
+run "damaged files harness (daemon left behind, r581)" 3 python3 tools/db/check_hostile_selftest.py
 if [ "${1:-}" != "quick" ]; then
     WINE=${WINE:-}
     if [ -z "$WINE" ]; then

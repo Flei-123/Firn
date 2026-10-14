@@ -33,16 +33,16 @@ import zlib
 from . import common
 from .common import PackError
 
-FELDER = ("name", "fassung", "titel", "info", "keys")
+FIELDS = ("name", "fassung", "titel", "info", "keys")
 RESERVED = ("app", "kernel", "source", "setting", "account", "pref", "arch")
 
 
 def meta_bytes(fields, braucht=(), handles=()):
-    lines = ["%s=%s" % (f, fields.get(f, "")) for f in FELDER]
+    lines = ["%s=%s" % (f, fields.get(f, "")) for f in FIELDS]
     lines += ["braucht=%s" % b for b in sorted(braucht)]
     lines += ["handle=%s" % h for h in sorted(handles)]
     for k in sorted(fields):
-        if k in FELDER or k in ("braucht", "handle"):
+        if k in FIELDS or k in ("braucht", "handle"):
             continue
         lines.append("%s=%s" % (k, fields[k]))
     return ("\n".join(lines) + "\n").encode("utf-8")

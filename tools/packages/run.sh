@@ -235,8 +235,8 @@ expect_error version "invalid version '0.2' (expected number.number.number)"
 check "unknown key in the manifest"
 P=$(copy_pkg f_key)
 sed -i 's/^public  *geo dot$/publi   geo dot/' "$P/geo/firn.package"
-beide schluessel --package "$P/app" -o "$WORK/f_sch.bin"
-expect_error schluessel "unknown key 'publi'"
+beide key --package "$P/app" -o "$WORK/f_key.bin"
+expect_error key "unknown key 'publi'"
 
 # --- 12: missing mandatory line ------------------------------------------
 
@@ -394,8 +394,8 @@ fi
 # --- 21: `--package` and a source file exclude each other -----------------
 
 check "--package together with a source file is rejected"
-beide beides --package demos/packages/app tests/110_module.fi -o "$WORK/f_beides.bin"
-expect_error beides "--package and an input file are mutually exclusive"
+beide both --package demos/packages/app tests/110_module.fi -o "$WORK/f_both.bin"
+expect_error both "--package and an input file are mutually exclusive"
 
 
 # =========================================================================

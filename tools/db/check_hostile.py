@@ -120,13 +120,19 @@ def one(args):
     try:
         p = os.path.join(d, "h.db")
         open(p, "wb").write(mutate(data, rnd))
+        # Output goes to FILES, not pipes: under Wine the first client forks a wineserver daemon
+        # that inherits the pipe ends and lives while other jobs keep it busy, so a pipe read
+        # (capture_output) would block until the daemon exits -- a false TIMEOUT (r581).
+        op = os.path.join(d, "out.txt")
+        ep = os.path.join(d, "err.txt")
         try:
-            r = subprocess.run(RUNNER + [probe, p, qpath], capture_output=True, timeout=30,
-                               **({"preexec_fn": limit} if resource else {}))
+            with open(op, "wb") as fo, open(ep, "wb") as fe:
+                r = subprocess.run(RUNNER + [probe, p, qpath], stdin=subprocess.DEVNULL, stdout=fo, stderr=fe,
+                                   timeout=30, **({"preexec_fn": limit} if resource else {}))
         except subprocess.TimeoutExpired:
             return (seed, src, "TIMEOUT", "")
-        out = r.stdout.decode("utf-8", "replace")
-        err = r.stderr.decode("utf-8", "replace")
+        out = open(op, "rb").read().decode("utf-8", "replace")
+        err = open(ep, "rb").read().decode("utf-8", "replace")
         if r.returncode < 0:
             return (seed, src, f"SIGNAL {-r.returncode}", err[:200])
         if "panic" in err or "panic" in out:

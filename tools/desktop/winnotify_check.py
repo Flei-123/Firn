@@ -3,6 +3,7 @@
 # tools/desktop/winnotify_check.py -- window.notify on X11: a Firn window under Xvfb posts a notification to a
 # notification server (dbus-python) on a private bus. usage: winnotify_check.py <winnotify_main binary>
 import os, subprocess, sys, threading, time
+from tscale import T, scratch_dir
 import dbus, dbus.service, dbus.bus
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
@@ -38,7 +39,7 @@ class Server(dbus.service.Object):
         return ("FirnTestServer", "Firn", "1.2", "1.2")
 
 try:
-    r = subprocess.run([binary], capture_output=True, text=True, timeout=30, env=env)
+    r = subprocess.run([binary], capture_output=True, text=True, timeout=T(30), env=env)
     check("without a server: NOTIFY no", "NOTIFY no" in r.stdout, r.stdout + r.stderr)
     check("stay_alive honestly false", "ALIVE no" in r.stdout, r.stdout)
     host = dbus.bus.BusConnection(address)
@@ -46,7 +47,7 @@ try:
     loop = GLib.MainLoop()
     threading.Thread(target=loop.run, daemon=True).start()
     time.sleep(0.2)
-    r = subprocess.run([binary], capture_output=True, text=True, timeout=30, env=env)
+    r = subprocess.run([binary], capture_output=True, text=True, timeout=T(30), env=env)
     check("with a server: NOTIFY yes", "NOTIFY yes" in r.stdout, r.stdout + r.stderr)
     check("one Notify call", len(calls) == 1, calls)
     if calls:

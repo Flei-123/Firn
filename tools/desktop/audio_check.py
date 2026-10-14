@@ -12,6 +12,7 @@
 #    recorder, records the sink's monitor, so the samples that came out of the
 #    sound server can be compared) and `pactl` reading the stream back.
 import array, os, shutil, struct, subprocess, sys, tempfile, threading, time, wave, zlib
+from tscale import T, scratch_dir
 
 FAILED = []
 def check(name, cond, extra=""):
@@ -20,10 +21,10 @@ def check(name, cond, extra=""):
         FAILED.append(name)
 
 audio_main, mp3_ref, root = sys.argv[1], sys.argv[2], sys.argv[3]
-td = tempfile.mkdtemp(prefix="audio-check-")
+td = scratch_dir("audio-check-")
 songs = {n: os.path.join(root, "testdata", "ton", n + ".mp3") for n in ("stereo44", "mono24", "shortblocks", "mono8")}
 
-def run(song, percent, mode, env_extra, timeout=60):
+def run(song, percent, mode, env_extra, timeout=T(60)):
     env = dict(os.environ)
     env.pop("PULSE_SERVER", None)
     env.update(env_extra)
@@ -172,7 +173,7 @@ try:
             check("pactl sees our stream by name", "Firn audio test" in li, li[:400])
             check("pactl: sample specification s16le 2ch 44100Hz", "s16le 2ch 44100Hz" in li, li[:600])
             check("pactl: media role music", "music" in li, li[:600])
-            out = drv.communicate(timeout=30)[0]
+            out = drv.communicate(timeout=T(30))[0]
             res = [l for l in out.splitlines() if l.startswith("RESULT")]
             check("player finished through PulseAudio", len(res) == 1 and res[0].split()[1] == "3" and res[0].split()[4] == "4", out)
             capture = cap.stop()
@@ -184,7 +185,7 @@ try:
             check("CRC reported by the program is the CRC of that PCM", len(res) == 1 and int(res[0].split()[3]) == zlib.crc32(ref), res)
             # volume
             cap = Cap(); cap.start()
-            r2 = subprocess.run([audio_main, songs["stereo44"], "50", "play"], capture_output=True, text=True, env=dict(os.environ, **senv), timeout=30)
+            r2 = subprocess.run([audio_main, songs["stereo44"], "50", "play"], capture_output=True, text=True, env=dict(os.environ, **senv), timeout=T(30))
             capture = cap.stop()
             half = scale(ref, 50)
             off = locate(capture, half)
@@ -196,7 +197,7 @@ try:
             time.sleep(0.8)
             li = subprocess.run(pactl + ["list", "sink-inputs"], capture_output=True, text=True).stdout
             check("pactl: mono 24 kHz stream announced as s16le 1ch 24000Hz", "s16le 1ch 24000Hz" in li, li[:600])
-            out = drv.communicate(timeout=30)[0]
+            out = drv.communicate(timeout=T(30))[0]
             capture = cap.stop()
             a = array.array("h"); a.frombytes(bytes(capture[:len(capture) // 4 * 4]))
             nz = sum(1 for v in a[::2] if abs(v) > 200)
@@ -205,13 +206,13 @@ try:
             # stop: the stream is deleted and the server goes quiet
             drv = subprocess.Popen([audio_main, songs["stereo44"], "100", "stop"], stdout=subprocess.PIPE, text=True,
                                    env=dict(os.environ, **senv))
-            out = drv.communicate(timeout=30)[0]
+            out = drv.communicate(timeout=T(30))[0]
             time.sleep(0.3)
             li = subprocess.run(pactl + ["list", "short", "sink-inputs"], capture_output=True, text=True).stdout
             check("after stop no stream is left on the server", li.strip() == "", li)
             # no server at all: a clean failure
             r3 = subprocess.run([audio_main, songs["stereo44"], "100", "play"], capture_output=True, text=True,
-                                env=dict(os.environ, PULSE_SERVER="unix:" + os.path.join(pa, "nothing-here")), timeout=30)
+                                env=dict(os.environ, PULSE_SERVER="unix:" + os.path.join(pa, "nothing-here")), timeout=T(30))
             check("no server: reported as an error (state 4), no crash", "play failed" not in r3.stdout and "RESULT 4" in r3.stdout, r3.stdout + r3.stderr)
         finally:
             daemon.terminate()
