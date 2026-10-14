@@ -28,7 +28,9 @@
 //   n    = camera.camera_scan()                      // lenses (logical + physical ids)
 //   camera.camera_info(i, &info)                     // everything the API knows about lens i
 //   camera.camera_open(i)  ->  camera.camera_start(KIND_JPEG | KIND_RAW | KIND_YUV)
-//   camera.camera_preview_bgrx(buf, w, h, rot)       // frames for window.image
+//   camera.camera_preview_bgrx(buf, w, h, rot)       // frames for window.image (CPU, slow: fallback only)
+//   camera.camera_preview_acquire(&pf) / camera_preview_release(&pf)   // newest YUV frame as planes, for the GPU
+//                                                    // preview (lib/gpu/campreview.fi: YUV->RGB, rotation, cover)
 //   camera.camera_set_manual(exp_ns, iso, focus_d) / camera.camera_set_auto()
 //   camera.camera_capture(n, exp_list, focus_list, iso, out, cap, frames)   // the one capture function
 //   camera.camera_save(data, n, name, mime)          // MediaStore (Pictures/FirnCam)
@@ -48,7 +50,8 @@ export {
     camera_permission, camera_request_permission, camera_scan, camera_info, camera_meta,
     camera_open, camera_close, camera_start, camera_is_open, camera_kind,
     zero_frame, sizeof_frame, frame_at,
-    camera_preview_bgrx, camera_set_auto, camera_set_manual, camera_lock, camera_stream_size,
+    camera_preview_bgrx, PreviewFrame, preview_frame_new, camera_preview_acquire, camera_preview_release,
+    camera_sensor_rotation, camera_is_front, camera_set_auto, camera_set_manual, camera_lock, camera_stream_size,
     camera_best_kind, camera_capture, camera_save, camera_alloc, camera_free,
     focus_plan, focus_converged, camera_dng_extra, camera_last_slot, camera_error_text, zero_info,
     camera_video_start, camera_video_stop, camera_video_active, camera_save_doc,
@@ -410,6 +413,7 @@ const B_REC_OUT: u64 = 336    // u64 ACaptureSessionOutput
 const B_REC_TGT: u64 = 344    // u64 ACameraOutputTarget
 const B_REC_PFD: u64 = 352    // u64 global ref of the ParcelFileDescriptor
 const B_REC_ON: u64 = 360     // i32 1 = recording
+const B_FACING: u64 = 368     // i32 lens facing of the open camera + 1 (0 = unknown; 1 front, 2 back, 3 external)
 const CB_DEV: u64 = 1024      // ACameraDevice_StateCallbacks (24)
 const CB_SESS: u64 = 1056     // ACameraCaptureSession_stateCallbacks (32)
 const CB_CAP: u64 = 1096      // ACameraCaptureSession_captureCallbacks (64)
@@ -1098,6 +1102,7 @@ fn camera_open(index: i32) -> i32 {
     var ci: CamInfo = zero_info()
     if camera_info(index, &ci) {
         wr32(b + B_ROT, ci.orientation)
+        wr32(b + B_FACING, ci.facing + 1)
         *((b + B_CAPS) as *mut u32) = ci.caps
         wr32(b + B_S_W, 0)
         wr32(b + B_P_W, ci.prev_w)
@@ -1549,6 +1554,100 @@ fn camera_preview_bgrx(out: u64, ow: i32, oh: i32, rot: i32, mirror: bool) -> i3
     }
     AImage_delete(img)
     return 1
+}
+
+// ------------------------------------------------------------ preview frames for the GPU
+// The newest preview image as raw planes (YUV_420_888): nothing is converted here, lib/gpu/campreview.fi
+// uploads the planes and the shader does YUV -> RGB, rotation and the aspect crop. The image stays held
+// (its planes are camera memory) until camera_preview_release; hold it only for the upload.
+//   up/vp: the U and V plane starts, ups = pixel stride of U/V (1 planar, 2 interleaved semi-planar)
+//   ts: sensor timestamp in ns (0 if the NDK does not say)
+struct PreviewFrame {
+    w: i32,
+    h: i32,
+    yp: u64,
+    up: u64,
+    vp: u64,
+    ys: i32,
+    us: i32,
+    vs: i32,
+    ups: i32,
+    ts: i64,
+    img: u64,
+}
+
+#[no_gc]
+fn preview_frame_new() -> PreviewFrame {
+    return PreviewFrame { w: 0, h: 0, yp: 0, up: 0, vp: 0, ys: 0, us: 0, vs: 0, ups: 0, ts: 0, img: 0 }
+}
+
+// 1 = a new frame is in `f` (call camera_preview_release when uploaded), 0 = no new frame, <0 = error.
+// Older queued images are dropped, so the preview never lags behind.
+#[no_gc]
+fn camera_preview_acquire(f: *mut PreviewFrame) -> i32 {
+    let b: u64 = block()
+    let rd: u64 = *((b + B_PREV_RD) as *mut u64)
+    if rd == 0 { return 0 - 1 }
+    if (*f).img != 0 { camera_preview_release(f) }
+    let ip: u64 = b + B_SCRATCH + 480
+    var img: u64 = 0
+    while true {
+        wr64(ip, 0)
+        if AImageReader_acquireNextImage(rd, ip) != 0 { break }
+        let n: u64 = *(ip as *mut u64)
+        if n == 0 { break }
+        if img != 0 { AImage_delete(img) }
+        img = n
+    }
+    if img == 0 { return 0 }
+    let q: u64 = b + B_SCRATCH + 488
+    let pp: u64 = b + B_SCRATCH + 496
+    (*f).w = img_int(AImage_getWidth(img, q), q)
+    (*f).h = img_int(AImage_getHeight(img, q), q)
+    wr64(pp, 0)
+    let r0: i32 = AImage_getPlaneData(img, 0, pp, q)
+    (*f).yp = *(pp as *mut u64)
+    wr64(pp, 0)
+    let r1: i32 = AImage_getPlaneData(img, 1, pp, q)
+    (*f).up = *(pp as *mut u64)
+    wr64(pp, 0)
+    let r2: i32 = AImage_getPlaneData(img, 2, pp, q)
+    (*f).vp = *(pp as *mut u64)
+    (*f).ys = plane_int(AImage_getPlaneRowStride(img, 0, q), q)
+    (*f).us = plane_int(AImage_getPlaneRowStride(img, 1, q), q)
+    (*f).vs = plane_int(AImage_getPlaneRowStride(img, 2, q), q)
+    (*f).ups = plane_int(AImage_getPlanePixelStride(img, 1, q), q)
+    wr64(q, 0)
+    (*f).ts = 0
+    if AImage_getTimestamp(img, q) == 0 { (*f).ts = rd64(q) }
+    (*f).img = img
+    if (*f).yp == 0 || (*f).up == 0 || (*f).vp == 0 || (*f).w <= 0 || (*f).h <= 0 || (*f).ys <= 0 || (*f).us <= 0 {
+        camera_preview_release(f)
+        return 0 - 1
+    }
+    return 1
+}
+
+#[no_gc]
+fn camera_preview_release(f: *mut PreviewFrame) {
+    if (*f).img != 0 { AImage_delete((*f).img) }
+    (*f).img = 0
+    (*f).yp = 0
+    (*f).up = 0
+    (*f).vp = 0
+}
+
+// Sensor orientation (degrees clockwise to be upright at display rotation 0) and facing of the OPEN lens,
+// for the preview: rot = campreview.cp_rotation(camera_sensor_rotation(), display_deg, camera_is_front()),
+// mirror = camera_is_front().
+#[no_gc]
+fn camera_sensor_rotation() -> i32 {
+    return rd32(block() + B_ROT)
+}
+
+#[no_gc]
+fn camera_is_front() -> bool {
+    return rd32(block() + B_FACING) == 1
 }
 
 #[no_gc]
