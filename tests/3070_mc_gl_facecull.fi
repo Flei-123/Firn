@@ -1,0 +1,218 @@
+// expect_exit: 0
+// tests/3070_mc_gl_facecull.fi -- gl_mc face buckets (glbe_set_facecull, docs/MC-PERF.md 7): the frame is the SAME with and without
+// the buckets for many camera positions (inside, above, below, beside the section), fewer triangles reach GL for at least one
+// view, never more, and a mesh uploaded as MESH_TRANS keeps the full range. Needs a GL context (EGL surfaceless / llvmpipe);
+// without one the test prints SKIP and passes.
+import std.rt
+import std.io
+import mc.mc_camera
+import mc.mc_backend
+import mc.mc_mesh
+import mc.mc_texture
+import gpu.gl_mc
+
+const W: i32 = 160
+const H: i32 = 90
+
+fn hash_frame(px: u64) -> u64 {
+    var h: u64 = 2166136261 as u64
+    var i: usize = 0
+    while i < ((W * H) as usize) {
+        h = ((h ^ (rt.ld32(px, i) as u64)) * 16777619 as u64) & 4294967295 as u64
+        i = i + 1
+    }
+    return h
+}
+
+fn fail(code: i32, what: str) -> i32 {
+    io.eprint_line(what)
+    return code
+}
+
+fn main(start: u64) -> i32 {
+    var gb: gl_mc.GlBackend = gl_mc.glbe_open(W, H)
+    if !gb.ok {
+        io.print_line("SKIP no GL context")
+        return 0
+    }
+    var b: mc_backend.Backend = gl_mc.glbe_backend(&gb)
+    var atlas: mc_texture.Atlas = mc_texture.atlas_default()
+    b.upload_atlas(b.obj, (&atlas) as u64)
+    // tables: block 1 = opaque cube with a different tile per face
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    tb.opaque = rt.heap_alloc(32768)
+    tb.tiles = rt.heap_alloc(32768 * 6 * 2)
+    var i: usize = 0
+    while i < 32768 {
+        rt.st8(tb.opaque, i, 0 as u8)
+        i = i + 1
+    }
+    i = 0
+    while i < 32768 * 6 {
+        rt.st16(tb.tiles, i, 0 as u16)
+        i = i + 1
+    }
+    i = 0
+    while i < 6 {
+        rt.st16(tb.tiles, 6 + i, (3 + i) as u16)
+        i = i + 1
+    }
+    rt.st8(tb.opaque, 1, 1 as u8)
+    // padded 18^3 section: a 5x5x5 block with a 3x3 hole through the middle in x, plus two loose blocks (all six face directions)
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    i = 0
+    while i < 5832 {
+        rt.st16(pad, i, 0 as u16)
+        i = i + 1
+    }
+    var y: usize = 5
+    while y < 10 {
+        var z: usize = 5
+        while z < 10 {
+            var x: usize = 5
+            while x < 10 {
+                if !(y >= 6 && y <= 8 && z >= 6 && z <= 8) {
+                    rt.st16(pad, (y * 18 + z) * 18 + x, 1 as u16)
+                }
+                x = x + 1
+            }
+            z = z + 1
+        }
+        y = y + 1
+    }
+    rt.st16(pad, (12 * 18 + 3) * 18 + 13, 1 as u16)
+    rt.st16(pad, (2 * 18 + 14) * 18 + 2, 1 as u16)
+    var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+    mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+    if m.nverts == 0 as u32 {
+        return fail(2, "mesh is empty")
+    }
+    // three uploads of the same mesh: plain, face buckets, face buckets but class TRANS (keeps the order, full range)
+    gl_mc.glbe_set_facecull(&gb, false)
+    let h_plain: usize = b.mesh_upload(b.obj, 1 as u64, m.verts, m.nverts as usize, m.idx, m.nidx as usize)
+    gl_mc.glbe_set_facecull(&gb, true)
+    let h_fc: usize = b.mesh_upload(b.obj, 2 as u64, m.verts, m.nverts as usize, m.idx, m.nidx as usize)
+    b.mesh_class(b.obj, mc_backend.MESH_TRANS)
+    let h_keep: usize = b.mesh_upload(b.obj, 3 as u64, m.verts, m.nverts as usize, m.idx, m.nidx as usize)
+    b.mesh_class(b.obj, mc_backend.MESH_OPAQUE)
+    if h_plain == 0 || h_fc == 0 || h_keep == 0 {
+        return fail(3, "upload failed")
+    }
+    var cam: mc_camera.Camera = mc_camera.camera_new(W, H)
+    var saw_object: bool = false
+    var saw_fewer: bool = false
+    var view: i32 = 0
+    while view < 14 {
+        var px: f64 = 8.0
+        var py: f64 = 8.0
+        var pz: f64 = 8.0
+        var yaw: f64 = 0.0
+        var pitch: f64 = 0.0
+        if view < 4 {
+            // beside the section, looking at it from the four sides
+            if view == 0 {
+                px = 8.0
+                pz = 0.0 - 30.0
+                yaw = 0.0
+            }
+            if view == 1 {
+                px = 46.0
+                pz = 8.0
+                yaw = 90.0
+            }
+            if view == 2 {
+                px = 8.0
+                pz = 46.0
+                yaw = 180.0
+            }
+            if view == 3 {
+                px = 0.0 - 30.0
+                pz = 8.0
+                yaw = 270.0
+            }
+        } else if view < 8 {
+            // above and below, looking down / up
+            px = 8.0
+            pz = 8.0
+            if view == 4 {
+                py = 40.0
+                pitch = 90.0
+            }
+            if view == 5 {
+                py = 0.0 - 24.0
+                pitch = 0.0 - 90.0
+            }
+            if view == 6 {
+                py = 30.0
+                pz = 0.0 - 12.0
+                pitch = 45.0
+            }
+            if view == 7 {
+                py = 0.0 - 10.0
+                px = 30.0
+                pitch = 0.0 - 35.0
+                yaw = 90.0
+            }
+        } else {
+            // inside the section bounding box and on its edge (conservative plane tests)
+            px = 4.0 + (view - 8) as f64 * 2.5
+            py = 12.0 - (view - 8) as f64
+            pz = 1.0 + (view - 8) as f64 * 3.0
+            yaw = (view * 57) as f64
+            pitch = 10.0
+        }
+        mc_camera.camera_set_pos(&cam, px, py, pz)
+        mc_camera.camera_set_angles(&cam, yaw, pitch)
+        mc_camera.camera_update(&cam)
+        // nothing drawn
+        b.begin(b.obj, (&cam) as u64, 0xFF804020 as u32)
+        b.end(b.obj)
+        let hc: u64 = hash_frame(b.present(b.obj))
+        // plain
+        gl_mc.glbe_reset_stats(&gb)
+        b.begin(b.obj, (&cam) as u64, 0xFF804020 as u32)
+        b.draw(b.obj, h_plain, 0.0, 0.0, 0.0)
+        b.end(b.obj)
+        let hp: u64 = hash_frame(b.present(b.obj))
+        let tp: u64 = gl_mc.glbe_tris_submitted(&gb)
+        // buckets
+        gl_mc.glbe_reset_stats(&gb)
+        b.begin(b.obj, (&cam) as u64, 0xFF804020 as u32)
+        b.draw(b.obj, h_fc, 0.0, 0.0, 0.0)
+        b.end(b.obj)
+        let hf: u64 = hash_frame(b.present(b.obj))
+        let tf: u64 = gl_mc.glbe_tris_submitted(&gb)
+        // class TRANS keeps everything
+        gl_mc.glbe_reset_stats(&gb)
+        b.begin(b.obj, (&cam) as u64, 0xFF804020 as u32)
+        b.draw(b.obj, h_keep, 0.0, 0.0, 0.0)
+        b.end(b.obj)
+        let hk: u64 = hash_frame(b.present(b.obj))
+        let tk: u64 = gl_mc.glbe_tris_submitted(&gb)
+        if hp != hf {
+            io.fmt_print(f"view {view}: frame differs plain={hp} buckets={hf}\n")
+            return fail(10 + view, "face buckets changed the image")
+        }
+        if hp != hk || tk != tp {
+            return fail(30 + view, "class TRANS changed the image / the range")
+        }
+        if tf > tp {
+            return fail(50 + view, "buckets submit MORE triangles")
+        }
+        if tf < tp {
+            saw_fewer = true
+        }
+        if hp != hc {
+            saw_object = true
+        }
+        view = view + 1
+    }
+    if !saw_object {
+        return fail(70, "nothing was ever drawn")
+    }
+    if !saw_fewer {
+        return fail(71, "buckets never saved a triangle")
+    }
+    io.print_line("ok facecull")
+    return 0
+}
