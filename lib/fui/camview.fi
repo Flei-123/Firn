@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/camview.fi -- THE CAMERA PREVIEW INSIDE AN IMMEDIATE-MODE fUi PROGRAM (glue, no Android, no camera calls).
+//
+// Two libraries meet here: gpu.campreview (YUV planes -> one shader -> an RGBA8 texture of its own) and fUi's
+// GPU renderer (lib/fui/gpu.fi, which draws the program's canvas). The camera frame never touches the CPU:
+//
+//   var v: camview.CamView = camview.camview_new()
+//   camview.camview_open(&v, &api)                       // after window.gpu_open; again after gpu_lost
+//   loop:
+//     if <new YUV frame> { camview.camview_feed(&v, w, h, yp, ys, up, vp, us, vs, ups) }   // upload, release the frame
+//     camview.camview_render(&v, w, h, rot, mirror)       // BEFORE the first painter call of the frame
+//     ... painter calls ...
+//     camview.camview_draw(&v, painter, gpu, x, y, w, h)  // the picture, where the layout wants it (w x h as rendered)
+//
+// WHY render BEFORE the frame's painting: cp_render binds the preview's own framebuffer; fUi's renderer binds its
+// own target again when it flushes a batch, but a batch that is half full would then land in the wrong target.
+// With no GPU (camview_open false) the CPU path takes over: `camview_cpu` turns a BGRX picture (the old
+// camera_preview_bgrx) into premultiplied RGBA and `camview_draw` hands it to lib/fui/preview.fi (cover fit).
+//
+// ZOOM: `camview_zoom(v, z)` crops the centre of the picture (digital zoom, 1..16) in the shader, in the same
+// render, so it costs nothing. Real optical/ZOOM_RATIO zoom of the lens is camera logic and stays elsewhere;
+// a program that does it itself keeps this at 1.
+// THUMBNAIL: `camview_thumb` samples the same planes into a small RGBA picture with rounded corners (for the
+// "last photo" button): same plan as the shader, no second implementation of rotation/crop.
+import std.rt
+import gpu.campreview
+import fui.gpu
+import fui.painter
+import fui.preview
+import paint.gl
+
+export {
+    CamView, camview_new, camview_open, camview_close, camview_on, camview_feed, camview_has_frame, camview_render,
+    camview_draw, camview_zoom, camview_cpu, camview_thumb, camview_frames,
+}
+
+struct CamView {
+    cp: campreview.CamPreview,
+    tgt: gpu.Target,
+    on: bool,
+    dirty: bool,       // the texture must be drawn again (new frame, zoom, size, rotation)
+    ready: bool,       // the texture holds a picture
+    rw: i32,           // size / rotation of the last render
+    rh: i32,
+    rrot: i32,
+    rmir: bool,
+    zoom: f64,
+    frames: u64,
+    rgba: u64,         // CPU fallback picture
+    rcap: usize,
+    src: preview.Src,
+    key: u64,
+}
+
+fn camview_new() -> CamView {
+    return CamView { cp: campreview.cp_new(), tgt: gpu.target_new(), on: false, dirty: false, ready: false,
+        rw: 0, rh: 0, rrot: 0, rmir: false, zoom: 1.0, frames: 0, rgba: 0, rcap: 0, src: preview.src_none(), key: 0 }
+}
+
+// Builds the preview's shader on the GL table. False: no GPU path (use camview_cpu).
+fn camview_open(v: *mut CamView, api: *mut gl.GlApi) -> bool {
+    (*v).ready = false
+    (*v).dirty = true
+    (*v).on = campreview.cp_open(&(*v).cp, api)
+    return (*v).on
+}
+
+fn camview_close(v: *mut CamView) {
+    campreview.cp_close(&(*v).cp)
+    (*v).on = false
+    (*v).ready = false
+    if (*v).rcap > 0 { rt.heap_free((*v).rgba, (*v).rcap) }
+    (*v).rgba = 0
+    (*v).rcap = 0
+}
+
+fn camview_on(v: *mut CamView) -> bool { return (*v).on }
+fn camview_frames(v: *mut CamView) -> u64 { return (*v).frames }
+
+fn camview_has_frame(v: *mut CamView) -> bool {
+    if (*v).on { return campreview.cp_has_frame(&(*v).cp) }
+    return (*v).src.kind == preview.SRC_RGBA
+}
+
+fn camview_zoom(v: *mut CamView, z: f64) {
+    var k: f64 = z
+    if k < 1.0 { k = 1.0 }
+    if k > 16.0 { k = 16.0 }
+    if k != (*v).zoom { (*v).dirty = true }
+    (*v).zoom = k
+}
+
+// Uploads one camera frame (the planes of camera.PreviewFrame); the caller releases the frame afterwards.
+fn camview_feed(v: *mut CamView, w: i32, h: i32, yp: u64, ys: i32, up: u64, vp: u64, us: i32, vs: i32,
+    ups: i32) -> bool {
+    if !(*v).on { return false }
+    if !campreview.cp_upload(&(*v).cp, w, h, yp, ys, up, vp, us, vs, ups) { return false }
+    (*v).dirty = true
+    (*v).frames = (*v).frames + 1
+    return true
+}
+
+// Renders the newest frame into the preview texture (w x h, upright, cover). True: the texture is ready for
+// camview_draw. Cheap when nothing changed (the texture stays).
+fn camview_render(v: *mut CamView, w: i32, h: i32, rot: i32, mirror: bool) -> bool {
+    if !(*v).on || w <= 0 || h <= 0 || !campreview.cp_has_frame(&(*v).cp) { return false }
+    if (*v).ready && !(*v).dirty && (*v).rw == w && (*v).rh == h && (*v).rrot == rot && (*v).rmir == mirror {
+        return true
+    }
+    campreview.cp_set_zoom(&(*v).cp, (*v).zoom)
+    if !campreview.cp_render(&(*v).cp, w, h, rot, mirror, true) {
+        (*v).ready = false
+        return false
+    }
+    (*v).tgt.fb = (*v).cp.fb
+    (*v).tgt.tex = (*v).cp.tex
+    (*v).tgt.w = w
+    (*v).tgt.h = h
+    (*v).rw = w
+    (*v).rh = h
+    (*v).rrot = rot
+    (*v).rmir = mirror
+    (*v).dirty = false
+    (*v).ready = true
+    return true
+}
+
+// The CPU fallback: `px` = BGRX (4 octets, alpha ignored) w x h, already upright (camera_preview_bgrx).
+fn camview_cpu(v: *mut CamView, px: u64, w: i32, h: i32) -> bool {
+    if w <= 0 || h <= 0 || px == 0 { return false }
+    let need: usize = (w as usize) * (h as usize) * 4
+    if (*v).rcap < need {
+        if (*v).rcap > 0 { rt.heap_free((*v).rgba, (*v).rcap) }
+        (*v).rgba = rt.heap_alloc(need)
+        if (*v).rgba == 0 { (*v).rcap = 0; return false }
+        (*v).rcap = need
+    }
+    var i: usize = 0
+    let n: usize = (w as usize) * (h as usize)
+    while i < n {
+        let o: u64 = (i * 4) as u64
+        *(((*v).rgba + o) as *mut u8) = *((px + o + 2) as *mut u8)
+        *(((*v).rgba + o + 1) as *mut u8) = *((px + o + 1) as *mut u8)
+        *(((*v).rgba + o + 2) as *mut u8) = *((px + o) as *mut u8)
+        *(((*v).rgba + o + 3) as *mut u8) = 255 as u8
+        i = i + 1
+    }
+    (*v).key = (*v).key + 1
+    (*v).src = preview.src_rgba((*v).rgba, w, h, (*v).key + 1000000)
+    return true
+}
+
+// Draws the preview over (x, y, w, h). The GPU path needs w x h to be the size camview_render was given.
+fn camview_draw(v: *mut CamView, z: *mut painter.Painter, g: *mut gpu.Gpu, x: f64, y: f64, w: f64, h: f64) -> bool {
+    if (*v).on && (*v).ready && g as u64 != 0 {
+        gpu.gpu_draw_target(g, &(*v).tgt, 0.0, 0.0, (*v).tgt.w as f64, (*v).tgt.h as f64, x, y, 255 as u32)
+        return true
+    }
+    if (*v).src.kind == preview.SRC_RGBA {
+        return preview.preview_draw(z, g, &(*v).src, x, y, w, h, (*v).zoom, 0.0, 0.0)
+    }
+    return false
+}
+
+fn clamp255(a: i32) -> i32 {
+    if a < 0 { return 0 }
+    if a > 255 { return 255 }
+    return a
+}
+
+// A small picture of the same frame: ow x oh premultiplied RGBA at `out`, upright, cover, corners rounded with
+// radius `rad` pixels (outside = transparent). Same rotation/mirror as the preview. Nearest sampling.
+fn camview_thumb(w: i32, h: i32, yp: u64, ys: i32, up: u64, vp: u64, us: i32, vs: i32, ups: i32,
+    rot: i32, mirror: bool, out: u64, ow: i32, oh: i32, rad: f64) -> bool {
+    if w < 2 || h < 2 || yp == 0 || up == 0 || vp == 0 || out == 0 || ow <= 0 || oh <= 0 { return false }
+    var pl: campreview.Plan = campreview.Plan { crop: [0.0; 4], m: [0.0; 4], t: [0.0; 2], quad: [1.0; 2], rot: 0 }
+    campreview.cp_plan(w, h, rot, mirror, ow, oh, true, &pl)
+    var oy: i32 = 0
+    while oy < oh {
+        var ox: i32 = 0
+        while ox < ow {
+            var sx: f64 = 0.0
+            var sy: f64 = 0.0
+            campreview.cp_map(&pl, ((ox as f64) + 0.5) / (ow as f64), ((oy as f64) + 0.5) / (oh as f64), &sx, &sy)
+            var px: i32 = (sx * (w as f64)) as i32
+            var py: i32 = (sy * (h as f64)) as i32
+            if px < 0 { px = 0 }
+            if py < 0 { py = 0 }
+            if px >= w { px = w - 1 }
+            if py >= h { py = h - 1 }
+            let yy: i32 = (*((yp + ((py * ys + px) as u64)) as *mut u8)) as i32
+            let ci: u64 = ((py / 2) * us + (px / 2) * ups) as u64
+            let ci2: u64 = ((py / 2) * vs + (px / 2) * ups) as u64
+            let uu: i32 = ((*((up + ci) as *mut u8)) as i32) - 128
+            let vv: i32 = ((*((vp + ci2) as *mut u8)) as i32) - 128
+            var r: i32 = clamp255(yy + (359 * vv) / 256)
+            var gg: i32 = clamp255(yy - (88 * uu + 183 * vv) / 256)
+            var b: i32 = clamp255(yy + (454 * uu) / 256)
+            // rounded corners: coverage 0..1 from the distance to the corner circle
+            var cov: f64 = 1.0
+            let fx: f64 = (ox as f64) + 0.5
+            let fy: f64 = (oy as f64) + 0.5
+            var cx: f64 = -1.0
+            var cy: f64 = -1.0
+            if fx < rad { cx = rad } else if fx > (ow as f64) - rad { cx = (ow as f64) - rad }
+            if fy < rad { cy = rad } else if fy > (oh as f64) - rad { cy = (oh as f64) - rad }
+            if cx >= 0.0 && cy >= 0.0 {
+                let dx: f64 = fx - cx
+                let dy: f64 = fy - cy
+                // distance without sqrt: compare squares, soft over one pixel via a linear ramp on the square
+                let d2: f64 = dx * dx + dy * dy
+                let lo: f64 = (rad - 0.5) * (rad - 0.5)
+                let hi: f64 = (rad + 0.5) * (rad + 0.5)
+                if d2 >= hi { cov = 0.0 } else if d2 > lo { cov = (hi - d2) / (hi - lo) }
+            }
+            r = (((r as f64) * cov) + 0.5) as i32
+            gg = (((gg as f64) * cov) + 0.5) as i32
+            b = (((b as f64) * cov) + 0.5) as i32
+            let a: i32 = ((255.0 * cov) + 0.5) as i32
+            let o: u64 = out + (((oy * ow + ox) * 4) as u64)
+            *(o as *mut u8) = r as u8
+            *((o + 1) as *mut u8) = gg as u8
+            *((o + 2) as *mut u8) = b as u8
+            *((o + 3) as *mut u8) = a as u8
+            ox = ox + 1
+        }
+        oy = oy + 1
+    }
+    return true
+}
