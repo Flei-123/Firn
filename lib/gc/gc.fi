@@ -4282,7 +4282,7 @@ const SYS_NANOSLEEP: i64 = 35
 const ARCH_SET_FS: i64 = 4098
 const ARCH_GET_FS: i64 = 4099
 // Compiler-translated request (compiler/src/lower.rs retarget_thread_base): the thread block base of the calling
-// thread as THIS target keeps it (`gs` in an x86-64 `.so`, a TLS slot in a DLL); the aarch64 `.so` answers -1 (cannot tell).
+// thread as THIS target keeps it (`gs` in an x86-64 `.so`, a TLS slot in a DLL); the aarch64 `.so` looks the block up by stack range and answers entry 0 for a thread without one (r571).
 const ARCH_GET_TCB: i64 = 7937
 // FUTEX_WAIT/FUTEX_WAKE, each with FUTEX_PRIVATE_FLAG (128): the futex
 // belongs to this process only, and the kernel saves itself the mapping onto
@@ -4930,9 +4930,19 @@ fn thread_attach() -> bool {
     __thread_lock_plain(st + S_TSPERRE)
     let hi: u64 = __gc_ld64(st + S_THREAD_HI)
     var i: u64 = 0
+    var stale: u64 = 0
     while i < hi {
         let t: u64 = tab + i * FT_BYTES
         let z: u64 = __gc_ld64(t + FT_STATE)
+        // r571: a host thread that ended without `thread_host_detach` leaves its entry behind, and a new thread may get
+        // the same stack (and a new id). An aarch64 `.so` finds a block by stack range, so that entry would shadow the
+        // new one. Live threads never share a stack: an entry of ANOTHER id that holds our `sp` is stale.
+        if z != Z_FREE && z != Z_DEAD && i > 0 && __gc_ld64(t + FT_HOST) == 1 && __gc_ld32(t + FT_TID) as u64 != tid {
+            let lo: u64 = __gc_ld64(t + FT_LO)
+            if lo != 0 && sp >= lo && sp < __gc_ld64(t + FT_BOTTOM) {
+                stale = t
+            }
+        }
         if z != Z_FREE && z != Z_DEAD && __gc_ld32(t + FT_TID) as u64 == tid {
             __thread_unlock(st + S_TSPERRE)
             if __thread_known() || __gc_ld64(t + FT_HOST) != 1 {
@@ -4944,6 +4954,11 @@ fn thread_attach() -> bool {
             return thread_attach()
         }
         i = i + 1
+    }
+    if stale != 0 {
+        __thread_unlock(st + S_TSPERRE)
+        __thread_recycle_host(stale)
+        return thread_attach()
     }
     var bottom: u64 = __gc_stack_bottom_maps(sp)
     if bottom == 0 || bottom <= sp {
@@ -4999,19 +5014,20 @@ fn thread_attach() -> bool {
     return true
 }
 
-// Does the calling thread have a thread block of its own? true also when the target cannot tell (aarch64 `.so`).
+// Does the calling thread have a thread block of its own? (r571: answered on every target, aarch64 `.so` included.)
 fn __thread_known() -> bool {
     var v: u64 = 0
     let r: i64 = syscall(SYS_ARCH_PRCTL, ARCH_GET_TCB, (&v) as u64 as i64, 0, 0, 0, 0)
     if v == 0 {
         return false
     }
-    // aarch64 `.so` answers all-ones ("cannot tell"); the Windows seam answers 1 (a TLS slot, never inherited).
-    let cant_tell: i64 = 0 - 1
-    if (v as i64) == cant_tell || r == 1 {
+    // The Windows seam answers 1 (a TLS slot, never inherited).
+    if r == 1 {
         return true
     }
-    // x86-64: fs/gs is INHERITED by a new thread (clone without CLONE_SETTLS for gs): a pthread created by an attached
+    // aarch64 `.so`: the block is found by stack range and a thread without one gets entry 0 (the main thread's); on
+    // x86-64 fs/gs is INHERITED by a new thread. Both are caught by the id check below.
+    // (x86-64: clone without CLONE_SETTLS for gs): a pthread created by an attached
     // thread starts with its creator's block. The block is its own only when it carries this thread's id.
     return __gc_ld32(v + FT_TID) as u64 == __thread_gettid()
 }

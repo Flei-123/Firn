@@ -234,14 +234,12 @@ pub fn def_text(dll: &str) -> String {
     s
 }
 
-/// One Win64 entry thunk to write: `(internal name, C name, parameters, result, unsupported)`.
+/// One Win64 entry thunk to write: `(internal name, C name, parameters, result)`.
 pub struct ExportThunk {
     pub internal: String,
     pub c_name: String,
     pub params: Vec<crate::win::WinParam>,
     pub ret: crate::win::WinRet,
-    /// a `v128` would not find an `xmm0-7` register (System V puts it on the stack then)
-    pub unsupported: bool,
 }
 
 /// Windows DLL (`--shared --target=x86_64-windows`): one Win64 entry thunk per `#[export_c]` function.
@@ -250,8 +248,8 @@ pub struct ExportThunk {
 /// 4 and 8 octets, else a pointer to a copy; Firn takes it as eightbyte words). A struct over 16 octets is a pointer on
 /// both sides: `Int`. The result is a scalar (`Plain`), a struct of at most 8 octets (`Word`) or a struct over 8
 /// octets (`Sret`, hidden pointer on both sides). The thunk moves `rcx/rdx/r8/r9 | xmm0-3 | stack` to the System V
-/// placement Firn code uses (integers `rdi..r9`, floats `xmm0-7`, the rest on the stack). `unsupported` is set when a
-/// `v128` would not find an `xmm0-7` register: the caller rejects that with a clear error.
+/// placement Firn code uses (integers `rdi..r9`, floats `xmm0-7`, the rest on the stack). A `v128` beyond `xmm7` goes to the
+/// stack (16 octets, 16 aligned; r570).
 pub fn export_thunk_info() -> Vec<ExportThunk> {
     use crate::win::{WinParam, WinRet};
     let exported: Vec<(String, String)> =
@@ -286,16 +284,7 @@ pub fn export_thunk_info() -> Vec<ExportThunk> {
                     AggRet::Word { size, sse, .. } => WinRet::Word { size, sse },
                     AggRet::Sret { .. } => WinRet::Sret,
                 };
-                let sse_count: usize = params
-                    .iter()
-                    .map(|p| match p {
-                        WinParam::F32 | WinParam::F64 | WinParam::V128 => 1,
-                        WinParam::Agg { sse, .. } => sse.iter().filter(|b| **b).count(),
-                        WinParam::Int => 0,
-                    })
-                    .sum();
-                let unsupported = params.contains(&WinParam::V128) && sse_count > 8;
-                Some(ExportThunk { internal, c_name: sig.c_name.clone(), params, ret, unsupported })
+                Some(ExportThunk { internal, c_name: sig.c_name.clone(), params, ret })
             })
             .collect()
     })

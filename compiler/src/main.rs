@@ -1445,17 +1445,6 @@ fn link_shared(obj: &Path, so: &Path) -> Result<(), i32> {
 /// `--shared --target=x86_64-windows`: a PE DLL. Exports = the Win64 thunks `win.rs` wrote under the
 /// bare `#[export_c]` names, listed in a `.def` file. Entry = `win::DLL_ENTRY`.
 fn link_dll(obj: &Path, dll: &Path, names: &[String]) -> Result<(), i32> {
-    for th in extfn::export_thunk_info() {
-        let c_name = &th.c_name;
-        if th.unsupported {
-            eprintln!(
-                "error: --shared (Windows DLL): '{}' has a v128 parameter that finds no xmm0-7 register \
-                 (more than 8 float / vector parameters); take a pointer instead",
-                c_name
-            );
-            return Err(2);
-        }
-    }
     let def = dll.with_extension("def");
     let libname = dll.file_name().and_then(|x| x.to_str()).unwrap_or("firn.dll");
     let text = format!("LIBRARY \"{}\"\nEXPORTS\n{}\n", libname, names.iter().map(|n| format!("    {}", n)).collect::<Vec<_>>().join("\n"));

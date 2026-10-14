@@ -83,7 +83,7 @@ pub const ARCH_SET_FS: i64 = 0x1002;
 /// `ARCH_GET_FS`: read side of the same request, translated to `mrs x, tpidr_el0` (aarch64 only).
 pub const ARCH_GET_FS: i64 = 0x1003;
 /// `ARCH_GET_TCB`: the thread block base of the calling thread (r506 host-thread guard, see `lower.rs`). x86-64 Linux:
-/// rewritten to `ARCH_GET_GS` / `ARCH_GET_FS`; Windows: answered by the seam; aarch64: -1 ("cannot tell").
+/// rewritten to `ARCH_GET_GS` / `ARCH_GET_FS`; Windows: answered by the seam; aarch64: the block found by stack range (`.so`, entry 0 for a thread without one) or `tpidr_el0` (r571).
 pub const ARCH_GET_TCB: i64 = 0x1f01;
 /// `SIGCHLD` — the flag word that turns `clone` into `fork`.
 pub const SIGCHLD: i64 = 17;
