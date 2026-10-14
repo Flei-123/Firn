@@ -1,0 +1,181 @@
+// expect_exit: 0
+// gpu.vk_life pipeline cache on a real Vulkan device (lavapipe; SKIP = exit 0 without loader / device): empty -> pipeline ->
+// save -> reload (CACHE_LOADED, bytes equal) -> pipeline renders the same pixels; damaged / truncated / empty / foreign-device
+// files are refused (CACHE_BAD_FILE / CACHE_BAD_HEADER) and still give a working empty cache. NOT a GPU result.
+import std.rt
+import std.io
+import std.fs
+import std.time
+import gpu.vk
+import gpu.vk_life
+
+const W: i32 = 64
+const H: i32 = 48
+
+fn check(f: *mut i32, name: str, ok: bool) {
+    if !ok {
+        io.print("FAIL ")
+        io.print(name)
+        io.print("\n")
+        *f = *f + 1
+    }
+}
+
+// "<temp dir>/<prefix><ns clock><suffix>": a name no parallel run shares
+fn uniq(prefix: str, suffix: str) -> str {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, prefix.p as u64, prefix.length())
+    rt.buf_push_dec_u64(&t, time.monotonic_ns())
+    rt.buf_push_bytes(&t, suffix.p as u64, suffix.length())
+    let name: str = __str_copy(str { p: rt.buf_data(&t), n: rt.buf_len(&t) })
+    rt.buf_free(&t)
+    return fs.path_join(fs.temp_dir(), name)
+}
+
+fn putf(p: u64, i: usize, x: f64) {
+    rt.st32(p, i, __bits(x as f32) as u32)
+}
+
+fn fill(vb: *mut vk.Buf) -> bool {
+    let tmp: u64 = rt.heap_alloc(60)
+    let xs: [f64; 3] = [0.0 - 0.8, 0.8, 0.0]
+    let ys: [f64; 3] = [0.7, 0.7, 0.0 - 0.7]
+    var i: usize = 0
+    while i < 3 {
+        putf(tmp, i * 5, xs[i])
+        putf(tmp, i * 5 + 1, ys[i])
+        putf(tmp, i * 5 + 2, 1.0 - (i as f64) * 0.4)
+        putf(tmp, i * 5 + 3, (i as f64) * 0.5)
+        putf(tmp, i * 5 + 4, 0.25)
+        i = i + 1
+    }
+    let ok: bool = vk.buf_write(vb, tmp, 60)
+    rt.heap_free(tmp, 60)
+    return ok
+}
+
+// pipeline on a fresh render pass of `t`, one frame, pixels into `out`
+fn render(v: *mut vk.Vk, t: *mut vk.Target, vb: *mut vk.Buf, out: u64) -> bool {
+    var p: vk.Pipe = vk.pipe_blank()
+    if !vk.pipeline_tri(v, &p, (*t).rpass) { return false }
+    let ok: bool = vk.draw(v, t, &p, vb, 3 as u64, 0xFF202020 as u32) && vk.read_pixels(t, out)
+    vk.pipeline_free(v, &p)
+    return ok
+}
+
+fn read_all(path: str, b: *mut rt.Buf) -> bool {
+    let n: usize = fs.read_file(path, b) catch | e | (0)
+    return n > 0
+}
+
+fn write_all(path: str, p: u64, n: usize) -> bool {
+    return fs.write_atomic(path, p, n) catch false
+}
+
+fn main(start: u64) -> i32 {
+    var fails: i32 = 0
+    var v: vk.Vk = vk.vk_new()
+    if !vk.open(&v, false, true) {
+        io.print("SKIP: no Vulkan device\n")
+        return 0
+    }
+    var l: vk_life.Life = vk_life.life_new()
+    check(&fails, "life_open", vk_life.life_open(&v, &l))
+    io.fmt_print(f"device vendor={l.vendor} id={l.device_id} cpu={vk.is_cpu(&v)}\n")
+    let path: str = uniq("vk3101-", ".vkc")
+    fs.remove(path) catch false
+
+    // 1. no file -> empty cache, pipelines use it
+    check(&fails, "no file -> CACHE_NONE", vk_life.cache_open(&v, &l, path) == vk_life.CACHE_NONE)
+    check(&fails, "cache handle set", l.cache != 0 && v.cache == l.cache)
+    var t: vk.Target = vk.target_new_blank()
+    var vb: vk.Buf = vk.buf_blank()
+    check(&fails, "target", vk.target_new(&v, &t, W, H))
+    check(&fails, "vertex buffer", vk.buf_new(&v, &vb, 60) && fill(&vb))
+    let n: usize = (W as usize) * (H as usize) * 4
+    let ref_px: u64 = rt.heap_alloc(n)
+    let px: u64 = rt.heap_alloc(n)
+    check(&fails, "render with the empty cache", render(&v, &t, &vb, ref_px))
+
+    // 2. save
+    let bytes: usize = vk_life.cache_bytes(&v, &l)
+    io.fmt_print(f"cache bytes after one pipeline: {bytes}\n")
+    check(&fails, "cache has data (>= header)", bytes >= 32)
+    check(&fails, "cache_save", vk_life.cache_save(&v, &l, path))
+    check(&fails, "file exists", fs.exists(path))
+    check(&fails, "saved bytes recorded", l.cache_saved > 0)
+    let saved: usize = l.cache_saved
+
+    // 3. reload
+    check(&fails, "reload -> CACHE_LOADED", vk_life.cache_open(&v, &l, path) == vk_life.CACHE_LOADED)
+    check(&fails, "loaded bytes == saved bytes", l.cache_loaded == saved)
+    check(&fails, "render with the loaded cache", render(&v, &t, &vb, px))
+    check(&fails, "pixels equal", rt.mem_eq(px, ref_px, n))
+
+    // 4. damage: flipped data octet, truncated, empty, garbage -> BAD_FILE and a working empty cache
+    var good_file: rt.Buf = rt.buf_new()
+    check(&fails, "read back the file", read_all(path, &good_file))
+    let gl: usize = rt.buf_len(&good_file)
+    let gp: u64 = rt.buf_ptr(&good_file)
+    check(&fails, "file = wrapper + data", gl == saved + vk_life.WRAP_HEADER)
+    let bad: u64 = rt.heap_alloc(gl)
+    rt.mem_copy(bad, gp, gl)
+    rt.st8(bad, gl - 1, (rt.ld8(bad, gl - 1) as usize ^ 255) as u8)
+    check(&fails, "write flipped", write_all(path, bad, gl))
+    check(&fails, "flipped octet -> BAD_FILE", vk_life.cache_open(&v, &l, path) == vk_life.CACHE_BAD_FILE)
+    check(&fails, "still an empty cache", l.cache != 0 && render(&v, &t, &vb, px) && rt.mem_eq(px, ref_px, n))
+    check(&fails, "write truncated", write_all(path, gp, gl - 5))
+    check(&fails, "truncated -> BAD_FILE", vk_life.cache_open(&v, &l, path) == vk_life.CACHE_BAD_FILE)
+    check(&fails, "write garbage", write_all(path, ref_px, 100))
+    check(&fails, "garbage -> BAD_FILE", vk_life.cache_open(&v, &l, path) == vk_life.CACHE_BAD_FILE)
+    check(&fails, "pipeline after garbage", render(&v, &t, &vb, px) && rt.mem_eq(px, ref_px, n))
+
+    // 5. foreign device / driver: valid wrapper + CRC, other vendor / UUID in the Vulkan header
+    var k: i32 = 0
+    while k < 3 {
+        let blob: u64 = rt.heap_alloc(saved)
+        rt.mem_copy(blob, gp + (vk_life.WRAP_HEADER as u64), saved)
+        if k == 0 { rt.st32(blob, 2, (l.vendor as u32) ^ (1 as u32)) } // vendor
+        if k == 1 { rt.st32(blob, 3, (l.device_id as u32) ^ (1 as u32)) } // device id
+        if k == 2 { rt.st8(blob, 16, (rt.ld8(blob, 16) as usize ^ 255) as u8) } // pipelineCacheUUID
+        var w: rt.Buf = rt.buf_new()
+        vk_life.wrap_blob(blob, saved, &w)
+        check(&fails, "write foreign", write_all(path, rt.buf_ptr(&w), rt.buf_len(&w)))
+        check(&fails, "foreign header -> BAD_HEADER", vk_life.cache_open(&v, &l, path) == vk_life.CACHE_BAD_HEADER)
+        check(&fails, "pipeline after foreign header", render(&v, &t, &vb, px) && rt.mem_eq(px, ref_px, n))
+        rt.buf_free(&w)
+        rt.heap_free(blob, saved)
+        k = k + 1
+    }
+
+    // 6. after all that the good file is accepted again; a path in a missing directory is created by save
+    check(&fails, "restore good file", write_all(path, gp, gl))
+    check(&fails, "good again -> CACHE_LOADED", vk_life.cache_open(&v, &l, path) == vk_life.CACHE_LOADED)
+    let dir: str = uniq("vk3101d-", "")
+    let nested: str = fs.path_join(dir, "sub/p.vkc")
+    check(&fails, "save into a missing directory", vk_life.cache_save(&v, &l, nested) && fs.exists(nested))
+    check(&fails, "save with an empty path refuses", !vk_life.cache_save(&v, &l, ""))
+    fs.remove_tree(dir) catch false
+
+    // 7. no cache at all (path ""): pipelines work, save refuses
+    check(&fails, "empty path -> CACHE_NONE", vk_life.cache_open(&v, &l, "") == vk_life.CACHE_NONE)
+    vk_life.cache_close(&v, &l)
+    check(&fails, "closed: v.cache cleared", v.cache == 0 && l.cache == 0)
+    check(&fails, "render without a cache", render(&v, &t, &vb, px) && rt.mem_eq(px, ref_px, n))
+    check(&fails, "save without a cache refuses", !vk_life.cache_save(&v, &l, path))
+
+    fs.remove(path) catch false
+    rt.buf_free(&good_file)
+    rt.heap_free(bad, gl)
+    rt.heap_free(px, n)
+    rt.heap_free(ref_px, n)
+    vk.buf_free(&v, &vb)
+    vk.target_free(&v, &t)
+    vk_life.life_close(&v, &l)
+    vk.close(&v)
+    if fails == 0 {
+        io.print("vk_life cache ok\n")
+        return 0
+    }
+    return 1
+}

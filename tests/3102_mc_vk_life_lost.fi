@@ -1,0 +1,165 @@
+// expect_exit: 0
+// gpu.vk_life device loss on a real Vulkan device (lavapipe; SKIP = exit 0 without loader / device). The loss is SIMULATED with
+// vk.inject (lavapipe never loses its device): the failing call is reported as LF_DEVICE_LOST, the state sticks, on_lost fires
+// once, recover_device() brings instance + device + pipeline cache back, and the re-created objects render the same pixels.
+// Other failures (out of memory) are LF_ERROR and NOT a loss. NOT a GPU result.
+import std.rt
+import std.io
+import std.fs
+import std.time
+import gpu.vk
+import gpu.vk_life
+
+const W: i32 = 64
+const H: i32 = 48
+
+fn check(f: *mut i32, name: str, ok: bool) {
+    if !ok {
+        io.print("FAIL ")
+        io.print(name)
+        io.print("\n")
+        *f = *f + 1
+    }
+}
+
+// "<temp dir>/<prefix><ns clock><suffix>": a name no parallel run shares
+fn uniq(prefix: str, suffix: str) -> str {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, prefix.p as u64, prefix.length())
+    rt.buf_push_dec_u64(&t, time.monotonic_ns())
+    rt.buf_push_bytes(&t, suffix.p as u64, suffix.length())
+    let name: str = __str_copy(str { p: rt.buf_data(&t), n: rt.buf_len(&t) })
+    rt.buf_free(&t)
+    return fs.path_join(fs.temp_dir(), name)
+}
+
+fn putf(p: u64, i: usize, x: f64) {
+    rt.st32(p, i, __bits(x as f32) as u32)
+}
+
+fn fill(vb: *mut vk.Buf) -> bool {
+    let tmp: u64 = rt.heap_alloc(60)
+    let xs: [f64; 3] = [0.0 - 0.8, 0.8, 0.0]
+    let ys: [f64; 3] = [0.7, 0.7, 0.0 - 0.7]
+    var i: usize = 0
+    while i < 3 {
+        putf(tmp, i * 5, xs[i])
+        putf(tmp, i * 5 + 1, ys[i])
+        putf(tmp, i * 5 + 2, 1.0 - (i as f64) * 0.4)
+        putf(tmp, i * 5 + 3, (i as f64) * 0.5)
+        putf(tmp, i * 5 + 4, 0.25)
+        i = i + 1
+    }
+    let ok: bool = vk.buf_write(vb, tmp, 60)
+    rt.heap_free(tmp, 60)
+    return ok
+}
+
+// pipeline on a fresh render pass of `t`, one frame, pixels into `out`
+fn render(v: *mut vk.Vk, t: *mut vk.Target, vb: *mut vk.Buf, out: u64) -> bool {
+    var p: vk.Pipe = vk.pipe_blank()
+    if !vk.pipeline_tri(v, &p, (*t).rpass) { return false }
+    let ok: bool = vk.draw(v, t, &p, vb, 3 as u64, 0xFF202020 as u32) && vk.read_pixels(t, out)
+    vk.pipeline_free(v, &p)
+    return ok
+}
+
+
+struct Hook {
+    lost_calls: i32,
+}
+
+fn on_lost(ud: u64) {
+    let h: *mut Hook = ud as *mut Hook
+    (*h).lost_calls = (*h).lost_calls + 1
+}
+
+struct Objs {
+    t: vk.Target,
+    vb: vk.Buf,
+    p: vk.Pipe,
+}
+
+fn objs_make(v: *mut vk.Vk, o: *mut Objs) -> bool {
+    (*o).t = vk.target_new_blank()
+    (*o).vb = vk.buf_blank()
+    (*o).p = vk.pipe_blank()
+    return vk.target_new(v, &(*o).t, W, H) && vk.buf_new(v, &(*o).vb, 60) && fill(&(*o).vb) && vk.pipeline_tri(v, &(*o).p, (*o).t.rpass)
+}
+
+fn objs_free(v: *mut vk.Vk, o: *mut Objs) {
+    vk.pipeline_free(v, &(*o).p)
+    vk.buf_free(v, &(*o).vb)
+    vk.target_free(v, &(*o).t)
+}
+
+fn main(start: u64) -> i32 {
+    var fails: i32 = 0
+    var v: vk.Vk = vk.vk_new()
+    if !vk.open(&v, false, true) {
+        io.print("SKIP: no Vulkan device\n")
+        return 0
+    }
+    var l: vk_life.Life = vk_life.life_new()
+    var hook: Hook = Hook { lost_calls: 0 }
+    l.ud = (&hook) as u64
+    l.on_lost = on_lost
+    check(&fails, "life_open", vk_life.life_open(&v, &l))
+    let path: str = uniq("vk3102-", ".vkc")
+    fs.remove(path) catch false
+    check(&fails, "cache_open", vk_life.cache_open(&v, &l, path) == vk_life.CACHE_NONE)
+    var o: Objs = Objs { t: vk.target_new_blank(), vb: vk.buf_blank(), p: vk.pipe_blank() }
+    check(&fails, "objects", objs_make(&v, &o))
+    let n: usize = (W as usize) * (H as usize) * 4
+    let ref_px: u64 = rt.heap_alloc(n)
+    let px: u64 = rt.heap_alloc(n)
+    check(&fails, "frame 1", vk_life.draw_checked(&v, &l, &o.t, &o.p, &o.vb, 3 as u64, 0xFF202020 as u32) == vk_life.LF_OK && vk.read_pixels(&o.t, ref_px))
+    check(&fails, "cache saved before the loss", vk_life.cache_save(&v, &l, path))
+
+    // ---- not a loss: out of memory on submit -> LF_ERROR, device stays usable
+    vk.inject(&v, vk.INJ_SUBMIT, vk_life.RES_OOM_DEVICE)
+    check(&fails, "OOM -> LF_ERROR", vk_life.draw_checked(&v, &l, &o.t, &o.p, &o.vb, 3 as u64, 0xFF202020 as u32) == vk_life.LF_ERROR)
+    check(&fails, "OOM is no loss", !l.lost && l.last_class == vk_life.CLS_OOM && hook.lost_calls == 0)
+    check(&fails, "frame after OOM", vk_life.draw_checked(&v, &l, &o.t, &o.p, &o.vb, 3 as u64, 0xFF202020 as u32) == vk_life.LF_OK)
+
+    // ---- device lost at submit
+    vk.inject(&v, vk.INJ_SUBMIT, vk_life.RES_DEVICE_LOST)
+    check(&fails, "lost -> LF_DEVICE_LOST", vk_life.draw_checked(&v, &l, &o.t, &o.p, &o.vb, 3 as u64, 0xFF202020 as u32) == vk_life.LF_DEVICE_LOST)
+    check(&fails, "lost state", l.lost && l.lost_count == 1 && l.last_class == vk_life.CLS_DEVICE_LOST && hook.lost_calls == 1)
+    check(&fails, "lost sticks", vk_life.draw_checked(&v, &l, &o.t, &o.p, &o.vb, 3 as u64, 0xFF202020 as u32) == vk_life.LF_DEVICE_LOST)
+    check(&fails, "on_lost fired once", hook.lost_calls == 1)
+
+    // ---- recovery: free own objects, recover, re-create
+    objs_free(&v, &o)
+    let gen0: u64 = l.sc_gen
+    check(&fails, "recover_device", vk_life.recover_device(&v, &l, false, true, path))
+    check(&fails, "recovered state", !l.lost && l.epoch == 1 && l.sc_gen == gen0 + 1 && v.ok)
+    check(&fails, "cache came back from the file", l.cache_status == vk_life.CACHE_LOADED && l.cache != 0 && v.cache == l.cache)
+    check(&fails, "objects again", objs_make(&v, &o))
+    check(&fails, "frame after recovery", vk_life.draw_checked(&v, &l, &o.t, &o.p, &o.vb, 3 as u64, 0xFF202020 as u32) == vk_life.LF_OK && vk.read_pixels(&o.t, px))
+    check(&fails, "same pixels after recovery", rt.mem_eq(px, ref_px, n))
+
+    // ---- three more losses in a row (no leak of the loader state, epoch counts)
+    var k: i32 = 0
+    while k < 3 {
+        vk.inject(&v, vk.INJ_SUBMIT, vk_life.RES_DEVICE_LOST)
+        check(&fails, "loop: lost", vk_life.draw_checked(&v, &l, &o.t, &o.p, &o.vb, 3 as u64, 0xFF202020 as u32) == vk_life.LF_DEVICE_LOST)
+        objs_free(&v, &o)
+        check(&fails, "loop: recover", vk_life.recover_device(&v, &l, false, true, path) && objs_make(&v, &o))
+        check(&fails, "loop: frame", vk_life.draw_checked(&v, &l, &o.t, &o.p, &o.vb, 3 as u64, 0xFF202020 as u32) == vk_life.LF_OK && vk.read_pixels(&o.t, px) && rt.mem_eq(px, ref_px, n))
+        k = k + 1
+    }
+    check(&fails, "epoch 4, lost_count 4, hook 4", l.epoch == 4 && l.lost_count == 4 && hook.lost_calls == 4)
+
+    objs_free(&v, &o)
+    fs.remove(path) catch false
+    rt.heap_free(px, n)
+    rt.heap_free(ref_px, n)
+    vk_life.life_close(&v, &l)
+    vk.close(&v)
+    if fails == 0 {
+        io.print("vk_life lost ok\n")
+        return 0
+    }
+    return 1
+}

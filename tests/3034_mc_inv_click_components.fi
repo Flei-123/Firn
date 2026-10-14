@@ -1,0 +1,114 @@
+// expect_exit: 0
+// mc_inv 1.20.5+: shift click, double click and drag respect the component signature + max_stack_size of a stack: only equal stacks merge /
+// are collected / are dragged onto, a moved stack keeps its signature and limit.
+// Exit codes are 8 bit: the failing check (the first failing protocol).
+import std.rt
+import std.bytes
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_sem
+import mc.mc_inv
+
+fn put_window(b: *mut bytes.Bytes, p: i32, w: i32) {
+    if p == 767 { bytes.put_u8(b, w as u8) } else { bytes.put_varint(b, w) }
+}
+
+// item stack with two components: max_stack_size (type 1) = mx, damage (type 3) = dmg
+fn put_comp(b: *mut bytes.Bytes, item: i32, count: i32, mx: i32, dmg: i32) {
+    bytes.put_varint(b, count)
+    bytes.put_varint(b, item)
+    bytes.put_varint(b, 2)
+    bytes.put_varint(b, 0)
+    bytes.put_varint(b, 1)
+    bytes.put_varint(b, mx)
+    bytes.put_varint(b, 3)
+    bytes.put_varint(b, dmg)
+}
+
+fn put_plain(b: *mut bytes.Bytes, item: i32, count: i32) {
+    bytes.put_varint(b, count)
+    bytes.put_varint(b, item)
+    bytes.put_varint(b, 0)
+    bytes.put_varint(b, 0)
+}
+
+fn click(v: *mut mc_inv.Inv, ver: *mut mc_version.Version, slot: i32, button: i32, mode: i32) -> bool {
+    var b: bytes.Bytes = bytes.bytes_new()
+    let ok: bool = mc_inv.inv_click_build(v, (*ver).protocol, slot, button, mode, &b)
+    bytes.bytes_free(&b)
+    return ok
+}
+
+// window: 10 and 11 = item 6 x10 with the components (limit 16), 36 = the same x5, 37 / 14 / 21 = item 6 without components, 15 = components x3
+fn load_window(v: *mut mc_inv.Inv, ver: *mut mc_version.Version) -> bool {
+    var b: bytes.Bytes = bytes.bytes_new()
+    put_window(&b, (*ver).protocol, 0)
+    bytes.put_varint(&b, 5)
+    bytes.put_varint(&b, 46)
+    var i: i32 = 0
+    while i < 46 {
+        if i == 10 || i == 11 { put_comp(&b, 6, 10, 16, 0) }
+        else if i == 36 { put_comp(&b, 6, 5, 16, 0) }
+        else if i == 37 || i == 14 || i == 21 { put_plain(&b, 6, 5) }
+        else if i == 15 { put_comp(&b, 6, 3, 16, 0) }
+        else { bytes.put_varint(&b, 0) }
+        i = i + 1
+    }
+    bytes.put_varint(&b, 0)
+    bytes.bytes_set_pos(&b, 0)
+    let ok: bool = mc_inv.inv_on_window_items_v(v, ver, &b)
+    bytes.bytes_free(&b)
+    return ok
+}
+
+fn check(p: i32) -> i32 {
+    var ver: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(p, &ver) { return 100 }
+    var v: mc_inv.Inv = mc_inv.inv_new()
+    v.state_id = 5
+    if !load_window(&v, &ver) { return 101 }
+    let s: i32 = mc_inv.inv_sig(&v, 10)
+    if s == 0 || mc_inv.inv_sig(&v, 36) != s || mc_inv.inv_sig(&v, 37) != 0 { return 102 }
+
+    // shift: 10 (x10) merges into 36 (x5 -> 15 <= 16); the plain 37 is not touched
+    if !click(&v, &ver, 10, 0, 1) { return 1 }
+    if mc_inv.inv_item(&v, 10) != 0 - 1 || mc_inv.inv_count(&v, 36) != 15 || mc_inv.inv_sig(&v, 36) != s { return 2 }
+    if mc_inv.inv_count(&v, 37) != 5 || mc_inv.inv_sig(&v, 37) != 0 { return 3 }
+    // shift: 11 (x10): 36 takes 1 (limit 16), the other 9 go to the first free hotbar slot (38) with signature + limit
+    if !click(&v, &ver, 11, 0, 1) { return 4 }
+    if mc_inv.inv_count(&v, 36) != 16 || mc_inv.inv_item(&v, 11) != 0 - 1 { return 5 }
+    if mc_inv.inv_item(&v, 38) != 6 || mc_inv.inv_count(&v, 38) != 9 || mc_inv.inv_sig(&v, 38) != s || mc_inv.inv_max_stack(&v, 38) != 16 { return 6 }
+    // a plain stack shifted to the hotbar does not merge into the component stacks (36 is full anyway): 14 -> merges into 37 (plain x5 -> 10)
+    if !click(&v, &ver, 14, 0, 1) { return 7 }
+    if mc_inv.inv_count(&v, 37) != 10 || mc_inv.inv_sig(&v, 37) != 0 || mc_inv.inv_item(&v, 14) != 0 - 1 { return 8 }
+
+    // double click: 3 (components) in hand, empty slot 22 clicked: 10 and 11 collect to 13 -> 16 (limit), the plain 14 stays
+    if !load_window(&v, &ver) { return 20 }
+    if !click(&v, &ver, 15, 0, 0) { return 21 }
+    if mc_inv.inv_cursor_count(&v) != 3 || mc_inv.inv_cursor_sig(&v) != s { return 22 }
+    if !click(&v, &ver, 22, 0, 6) { return 23 }
+    if mc_inv.inv_cursor_count(&v) != 16 || mc_inv.inv_item(&v, 10) != 0 - 1 || mc_inv.inv_count(&v, 11) != 7 { return 24 }
+    if mc_inv.inv_count(&v, 14) != 5 || mc_inv.inv_count(&v, 36) != 5 || mc_inv.inv_count(&v, 37) != 5 { return 25 }
+
+    // drag: 10 components in hand over 20, 21 (plain: rejected), 22 -> 5 each with signature + limit
+    if !load_window(&v, &ver) { return 30 }
+    if !click(&v, &ver, 10, 0, 0) { return 31 }
+    if mc_inv.inv_cursor_count(&v) != 10 { return 32 }
+    if !click(&v, &ver, 0 - 999, 0, 5) || !click(&v, &ver, 20, 1, 5) || !click(&v, &ver, 21, 1, 5) || !click(&v, &ver, 22, 1, 5) || !click(&v, &ver, 0 - 999, 2, 5) { return 33 }
+    if mc_inv.inv_count(&v, 20) != 5 || mc_inv.inv_count(&v, 22) != 5 || mc_inv.inv_sig(&v, 20) != s || mc_inv.inv_max_stack(&v, 22) != 16 { return 34 }
+    if mc_inv.inv_count(&v, 21) != 5 || mc_inv.inv_sig(&v, 21) != 0 || mc_inv.inv_cursor_item(&v) != 0 - 1 { return 35 }
+    mc_inv.inv_free(&v)
+    return 0
+}
+
+fn main() -> i32 {
+    var r: i32 = check(767)
+    if r != 0 { return r }
+    r = check(769)
+    if r != 0 { return r }
+    r = check(772)
+    if r != 0 { return r }
+    r = check(775)
+    if r != 0 { return r }
+    return 0
+}
