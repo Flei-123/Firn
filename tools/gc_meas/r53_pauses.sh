@@ -142,6 +142,6 @@ build_case kern "$TMPD/coreq" "$ROOT/compiler/target/release/firnc" && measure k
 
 echo
 echo "== C  SAMMLUNGEN (Runde 53, DOM auf GcVec/GcMap) =="
-build_case samml "$ROOT" "$ROOT/compiler/target/release/firnc" && measure samml
+build_case collect "$ROOT" "$ROOT/compiler/target/release/firnc" && measure collect
 echo
 echo "Fertig."

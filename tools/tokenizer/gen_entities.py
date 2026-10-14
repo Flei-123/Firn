@@ -63,16 +63,16 @@ def main() -> int:
     bytes_total = off_pos + 4 * count
 
     # Build the raw picture (only the generated part; OFF_POS comes into being at run time).
-    bild = bytearray(off_pos)
-    bild[off_namen:off_namen + len(blob)] = blob
-    bild[off_len:off_len + len(lens)] = lens
+    image = bytearray(off_pos)
+    image[off_namen:off_namen + len(blob)] = blob
+    image[off_len:off_len + len(lens)] = lens
     for i, v in enumerate(values):
-        bild[off_wert + 8 * i:off_wert + 8 * i + 8] = v.to_bytes(8, "little")
+        image[off_wert + 8 * i:off_wert + 8 * i + 8] = v.to_bytes(8, "little")
 
     # Words from index 2 on (the first 16 bytes are magic + reserve).
     words = []
-    for i in range(2, len(bild) // 8):
-        w = int.from_bytes(bild[8 * i:8 * i + 8], "little")
+    for i in range(2, len(image) // 8):
+        w = int.from_bytes(image[8 * i:8 * i + 8], "little")
         if w != 0:
             words.append((i, w))
 

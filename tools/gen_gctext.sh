@@ -24,12 +24,12 @@ python3 - <<'PYEOF'
 import os
 target = os.environ.get('GCTEXT_TARGET', 'lib/firnc1/gctext.fi')
 kern = open('lib/gc/gc.fi','rb').read()
-samml = open('lib/gc/gcvec.fi','rb').read() + open('lib/gc/gcmap.fi','rb').read()
-src = kern + samml
+collect = open('lib/gc/gcvec.fi','rb').read() + open('lib/gc/gcmap.fi','rb').read()
+src = kern + collect
 n = len(kern)
-alle = len(src)
+all = len(src)
 words = []
-for i in range(0, alle, 8):
+for i in range(0, all, 8):
     chunk = src[i:i+8].ljust(8, b'\0')
     words.append(int.from_bytes(chunk, 'little'))
 out = []
@@ -51,7 +51,7 @@ out.append('')
 out.append('// Length of the core (lib/gc/gc.fi) in octets.')
 out.append('const GCTEXT_N: u64 = %d' % n)
 out.append('// Length including the collections (gcvec.fi + gcmap.fi) behind it.')
-out.append('const GCTEXT_ALL: u64 = %d' % alle)
+out.append('const GCTEXT_ALL: u64 = %d' % all)
 out.append('')
 out.append('// `with_collections` decides whether GcVec/GcMap get unpacked too --')
 out.append('// exactly like the third parameter of runtime_source.')
@@ -81,5 +81,5 @@ out.append('        i = i + 1')
 out.append('    }')
 out.append('}')
 open(target,'w').write('\n'.join(out) + '\n')
-print(target + ':', alle, 'bytes (core', n, ') as', len(words), 'words')
+print(target + ':', all, 'bytes (core', n, ') as', len(words), 'words')
 PYEOF
