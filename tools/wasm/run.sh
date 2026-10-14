@@ -65,6 +65,15 @@ one() {
     id=$(echo "$f" | tr '/' '_')
     base="$W/$id"
     local verdict="SAME" detail=""
+    # A test may declare that it cannot be compared natively vs. WebAssembly
+    # ("// wasm_skip: <reason>" in its first 5 lines). Counted as REFUSED with
+    # the reason class "skipped", so it stays visible in the report.
+    local skip
+    skip=$(head -5 "$f" | sed -n 's|^// wasm_skip: *||p' | head -1)
+    if [ -n "$skip" ]; then
+        printf 'REFUSED\t%s\tskipped -- %s\n' "$f" "$skip" > "$W/res/$id"
+        return
+    fi
     for lvl in $LEVELS; do
         flags="--opt-level=$lvl"
         [ "$lvl" = "dev" ] && flags="--no-opt"

@@ -1,0 +1,174 @@
+// expect_exit: 0
+// tests/3190_mc_jobs_lf_shutdown.fi -- r192: jobs.create_lf pools must start, work and SHUT DOWN reliably, in the
+// way mc_stream uses them (many single-item group_go calls on one group, polling group_pending, then
+// group_wait + group_free + destroy). A hang shows up as the runner timeout (exit 124); slow phases return a code.
+//
+// A  40 x create_lf(4): 200 "frames" of 32 single-item jobs each on one group, polled like mc_stream, then destroy
+// B  create_lf + destroy at once (workers still starting), 100 times, with 0/1/4 workers
+// C  nested: chunks that call group_go + group_wait of their own (ring and locked-queue spill mixed)
+// D  every worker really sleeps (idle 20 ms) between bursts, then wakes: 300 bursts, each must complete
+// E  futures (spawn/join) interleaved with group_go from the ring and the locked queue
+// F  two pools alive at the same time, both destroyed (the old bench leaked one: its workers kept the process alive)
+import std.rt
+import std.time
+import jobs.jobs
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND {
+        return jobs.worker_main(arg)
+    }
+    return 0
+}
+
+static mut g_sum: u64 = 0
+static mut g_pool: u64 = 0
+
+fn body_add(ctx: u64, lo: u64, hi: u64) {
+    var i: u64 = lo
+    while i < hi {
+        __atomic_add(ctx as *mut u64, i + 1)
+        i = i + 1
+    }
+}
+
+fn body_nested(ctx: u64, lo: u64, hi: u64) {
+    // runs on any thread: submits its own work to the same pool and waits for it
+    var jv: jobs.Jobs = jobs.Jobs { blk: g_pool }
+    let j: *mut jobs.Jobs = &jv
+    var i: u64 = lo
+    while i < hi {
+        let g: u64 = jobs.group_new(j)
+        if g != 0 {
+            // 700 chunks > RING/2 (512) -> locked queue, 5 chunks -> ring
+            var n: u64 = 5
+            if i % 3 == 0 { n = 700 }
+            jobs.group_go(j, g, 0, n, 1, body_add, ctx)
+            jobs.group_wait(j, g)
+            jobs.group_free(j, g)
+        }
+        i = i + 1
+    }
+}
+
+fn task_one(arg: u64) -> u64 {
+    return arg + 1
+}
+
+fn elapsed_ms(t0: u64) -> u64 {
+    return (time.monotonic_ns() - t0) / 1000000
+}
+
+fn main() -> i32 {
+    var round: u64 = 0
+
+    // A
+    let ta: u64 = time.monotonic_ns()
+    while round < 40 {
+        var j: jobs.Jobs = jobs.create_lf(4)
+        if jobs.worker_count(&j) != 4 { return 1 }
+        let g: u64 = jobs.group_new(&j)
+        if g == 0 { return 2 }
+        var frame: u64 = 0
+        while frame < 200 {
+            g_sum = 0
+            var k: u64 = 0
+            while k < 32 {
+                jobs.group_go(&j, g, k, k + 1, 1, body_add, (&g_sum) as u64)
+                k = k + 1
+            }
+            var polls: u64 = 0
+            while jobs.group_pending(g) != 0 && polls < 200 {
+                polls = polls + 1
+                time.sleep_ms(0)
+            }
+            jobs.group_wait(&j, g)
+            if g_sum != 32 * 33 / 2 { return 3 }
+            frame = frame + 1
+        }
+        jobs.group_free(&j, g)
+        jobs.destroy(&j)
+        round = round + 1
+    }
+    if elapsed_ms(ta) > 60000 { return 4 }
+
+    // B
+    let tb: u64 = time.monotonic_ns()
+    round = 0
+    while round < 100 {
+        let w: u64 = (round % 3) * 2 // 0, 2, 4 workers
+        var j: jobs.Jobs = jobs.create_lf(w)
+        if jobs.worker_count(&j) != w { return 10 }
+        if round % 2 == 0 {
+            g_sum = 0
+            jobs.parallel_for(&j, 0, 100, 3, body_add, (&g_sum) as u64)
+            if g_sum != 5050 { return 11 }
+        }
+        jobs.destroy(&j)
+        round = round + 1
+    }
+    if elapsed_ms(tb) > 30000 { return 12 }
+
+    // C
+    let tc: u64 = time.monotonic_ns()
+    var jc: jobs.Jobs = jobs.create_lf(3)
+    g_pool = jc.blk
+    round = 0
+    while round < 20 {
+        g_sum = 0
+        let gc: u64 = jobs.group_new(&jc)
+        jobs.group_go(&jc, gc, 0, 12, 1, body_nested, (&g_sum) as u64)
+        jobs.group_wait(&jc, gc)
+        jobs.group_free(&jc, gc)
+        // 12 outer items: i = 0,3,6,9 -> n = 700, the other 8 -> n = 5
+        let want: u64 = 4 * (700 * 701 / 2) + 8 * 15
+        if g_sum != want { return 20 }
+        round = round + 1
+    }
+    jobs.destroy(&jc)
+    if elapsed_ms(tc) > 60000 { return 21 }
+
+    // D
+    let td: u64 = time.monotonic_ns()
+    var jd: jobs.Jobs = jobs.create_lf(4)
+    round = 0
+    while round < 300 {
+        time.sleep_ms(20)
+        g_sum = 0
+        jobs.parallel_for(&jd, 0, 64, 1, body_add, (&g_sum) as u64)
+        if g_sum != 64 * 65 / 2 { return 30 }
+        round = round + 1
+    }
+    jobs.destroy(&jd)
+    if elapsed_ms(td) > 60000 { return 31 }
+
+    // E
+    var je: jobs.Jobs = jobs.create_lf(4)
+    round = 0
+    while round < 200 {
+        let t1: u64 = jobs.spawn(&je, task_one, round)
+        g_sum = 0
+        let ge: u64 = jobs.group_new(&je)
+        var n: u64 = 20
+        if round % 5 == 0 { n = 900 }
+        jobs.group_go(&je, ge, 0, n, 1, body_add, (&g_sum) as u64)
+        let t2: u64 = jobs.spawn(&je, task_one, round + 100)
+        if jobs.join(&je, t2) != round + 101 { return 40 }
+        jobs.group_wait(&je, ge)
+        jobs.group_free(&je, ge)
+        if jobs.join(&je, t1) != round + 1 { return 41 }
+        if g_sum != n * (n + 1) / 2 { return 42 }
+        round = round + 1
+    }
+    jobs.destroy(&je)
+
+    // F
+    var jf1: jobs.Jobs = jobs.create(3)
+    var jf2: jobs.Jobs = jobs.create_lf(3)
+    g_sum = 0
+    jobs.parallel_for(&jf1, 0, 100, 5, body_add, (&g_sum) as u64)
+    jobs.parallel_for(&jf2, 0, 100, 5, body_add, (&g_sum) as u64)
+    if g_sum != 10100 { return 50 }
+    jobs.destroy(&jf1)
+    jobs.destroy(&jf2)
+    return 0
+}
