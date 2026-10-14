@@ -31,7 +31,7 @@ client.on('error', (e) => { console.error('bot error: ' + (e && e.message)) })
 client.on('end', () => { console.log('bye'); process.exit(0) })
 client.on('login', () => {
   if (SETTINGS_OLD) client.write('settings', { locale: 'en_US', viewDistance: 2, chatFlags: 0, chatColors: true, skinParts: 0x7f, mainHand: 1 })
-  else client.write('settings', { locale: 'en_US', viewDistance: 2, chatFlags: 0, chatColors: true, skinParts: 0x7f, mainHand: 1, enableTextFiltering: false, enableServerListing: true })
+  else client.write('settings', { locale: 'en_US', viewDistance: 2, chatFlags: 0, chatColors: true, skinParts: 0x7f, mainHand: 1, enableTextFiltering: false, enableServerListing: true, particleStatus: 0 })
 })
 client.on('chunk_batch_finished', () => { client.write('chunk_batch_received', { chunksPerTick: 10 }) })
 client.on('position', (p) => {

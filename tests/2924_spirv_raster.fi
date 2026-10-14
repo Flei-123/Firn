@@ -1,0 +1,108 @@
+// expect_exit: 0
+// tests/2924_spirv_raster.fi -- gpu.spirv end to end: tri.vert runs for 3 vertices, a 32 x 32 edge-function rasterizer
+// interpolates `vcol`, tri.frag runs once per covered pixel (several hundred invocations on ONE interpreter instance).
+// The framebuffer is compared with the colour the rasterizer computes itself.
+import std.rt
+import std.math
+import gpu.spirv
+
+const VS: str = __include_str("../lib/gpu/spv/tri.vert.spv")
+const FS: str = __include_str("../lib/gpu/spv/tri.frag.spv")
+const W: usize = 32
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
+    return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+}
+
+fn main() -> i32 {
+    var v: spirv.Spv = spirv.spv_zero()
+    var f: spirv.Spv = spirv.spv_zero()
+    check(spirv.spv_new(VS.p as u64, VS.n, &v), 1)
+    check(spirv.spv_new(FS.p as u64, FS.n, &f), 2)
+    let vent: u32 = spirv.spv_find_entry(&v, 0)
+    let fent: u32 = spirv.spv_find_entry(&f, 4)
+    let v_pos: usize = spirv.spv_find_location(&v, 1, 0)
+    let v_col: usize = spirv.spv_find_location(&v, 1, 1)
+    let v_vcol: usize = spirv.spv_find_location(&v, 3, 0)
+    let v_gp: usize = spirv.spv_find_builtin(&v, 3, 0)
+    let f_in: usize = spirv.spv_find_location(&f, 1, 0)
+    let f_out: usize = spirv.spv_find_location(&f, 3, 0)
+
+    // vertex stage
+    let px: [f32; 3] = [-0.8, 0.8, 0.0]
+    let py: [f32; 3] = [-0.8, -0.6, 0.9]
+    let cr: [f32; 3] = [1.0, 0.0, 0.0]
+    let cg: [f32; 3] = [0.0, 1.0, 0.0]
+    let cb: [f32; 3] = [0.0, 0.0, 1.0]
+    var sx: [f32; 3] = [0.0, 0.0, 0.0]
+    var sy: [f32; 3] = [0.0, 0.0, 0.0]
+    var vc: [f32; 9] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    var i: usize = 0
+    while i < 3 {
+        spirv.spv_mem_set_f32(&v, v_pos, 0, px[i])
+        spirv.spv_mem_set_f32(&v, v_pos, 1, py[i])
+        spirv.spv_mem_set_f32(&v, v_col, 0, cr[i])
+        spirv.spv_mem_set_f32(&v, v_col, 1, cg[i])
+        spirv.spv_mem_set_f32(&v, v_col, 2, cb[i])
+        check(spirv.spv_run(&v, vent, 1000), 10)
+        check(spirv.spv_mem_get_f32(&v, v_gp, 3) == 1.0, 11)
+        sx[i] = (spirv.spv_mem_get_f32(&v, v_gp, 0) + 1.0) * 0.5 * (W as f32)
+        sy[i] = (spirv.spv_mem_get_f32(&v, v_gp, 1) + 1.0) * 0.5 * (W as f32)
+        var k: usize = 0
+        while k < 3 {
+            vc[i * 3 + k] = spirv.spv_mem_get_f32(&v, v_vcol, k)
+            k = k + 1
+        }
+        i = i + 1
+    }
+    // the vertex stage passed the colour through
+    check(vc[0] == 1.0 && vc[4] == 1.0 && vc[8] == 1.0 && vc[1] == 0.0, 12)
+
+    // raster + fragment stage
+    let area: f32 = edge(sx[0], sy[0], sx[1], sy[1], sx[2], sy[2])
+    check(area != 0.0, 20)
+    var covered: i32 = 0
+    var invocations: i32 = 0
+    var y: usize = 0
+    while y < W {
+        var x: usize = 0
+        while x < W {
+            let fx: f32 = (x as f32) + 0.5
+            let fy: f32 = (y as f32) + 0.5
+            let w0: f32 = edge(sx[1], sy[1], sx[2], sy[2], fx, fy) / area
+            let w1: f32 = edge(sx[2], sy[2], sx[0], sy[0], fx, fy) / area
+            let w2: f32 = edge(sx[0], sy[0], sx[1], sy[1], fx, fy) / area
+            if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                covered = covered + 1
+                var k: usize = 0
+                while k < 3 {
+                    let c: f32 = w0 * vc[k] + w1 * vc[3 + k] + w2 * vc[6 + k]
+                    spirv.spv_mem_set_f32(&f, f_in, k, c)
+                    k = k + 1
+                }
+                check(spirv.spv_run(&f, fent, 1000), 30)
+                invocations = invocations + 1
+                k = 0
+                while k < 3 {
+                    let c: f32 = w0 * vc[k] + w1 * vc[3 + k] + w2 * vc[6 + k]
+                    check(spirv.spv_mem_get_f32(&f, f_out, k) == c, 31)
+                    k = k + 1
+                }
+                check(spirv.spv_mem_get_f32(&f, f_out, 3) == 1.0, 32)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    // the triangle covers roughly a third of the viewport; exact count is geometry, not interpreter, but it must be stable
+    check(covered > 150 && covered < 600 && covered == invocations, 40)
+    spirv.spv_free(&v)
+    spirv.spv_free(&f)
+    return 0
+}
