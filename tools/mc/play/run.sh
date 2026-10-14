@@ -61,7 +61,6 @@ xdotool key 3; sleep 0.3
 xdotool click 4; sleep 0.3
 xdotool mousemove_relative -- 100 0; sleep 1
 wait $PP; rc=$?
-echo stop >&3; sleep 1
 sed 's/^/  /' "$W/play.out" | tail -8
 ERR=0
 [ $rc -eq 0 ] || { echo "  FAIL  mcplay exit code $rc"; ERR=1; }
@@ -86,6 +85,7 @@ ND=$(grep -o 'daylight=[0-9]*' "$W/night.out" | head -1 | cut -d= -f2)
 [ "${ND:-256}" -le 20 ] || { echo "  FAIL  midnight daylight too high (${ND:-?})"; ERR=1; }
 NH=$(grep -o 'hash=[0-9a-f]*' "$W/night.out" | head -1); DH=$(grep -o 'hash=[0-9a-f]*' "$W/play.out" | head -1)
 [ -n "$NH" ] && [ "$NH" != "$DH" ] || { echo "  FAIL  night picture equals day picture"; ERR=1; }
+echo stop >&3; sleep 1
 echo "  day daylight=${DL:-?} night daylight=${ND:-?} night $NH"
 grep -o 'hash=[0-9a-f]*' "$W/play.out" | sed 's/^/  /'
 if [ -n "${MCPLAY_PNG_OUT:-}" ] && [ -s "$W/shot.png" ]; then cp "$W/shot.png" "$MCPLAY_PNG_OUT"; echo "  PNG: $MCPLAY_PNG_OUT"; fi

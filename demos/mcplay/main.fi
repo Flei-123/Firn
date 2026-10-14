@@ -15,6 +15,8 @@
 //   MCPLAY_CREATIVE=1  the server is creative: fly allowed and the creative reach (6 blocks)
 //   MCPLAY_TICKS=2000  time of day until the first update_time packet arrives (then the server time drives the sky)
 //   MCPLAY_LIGHT=1     vertex light (mc_wlight: Chunk.light + 5x5 column region, edits repair it) + sky daylight uniform; 0 = old flat tint
+//   sound: MCPLAY_SOUNDS=<dir with bank.json + wavs> (default $HOME/.cache/mcplay/sounds; made by tools/sounds/gen tools/sounds/mc.json <dir>)
+//          FIRN_AUDIO=file:/x.wav|null|device (default device); MCPLAY_AUDIO=0 off; MCPLAY_VOL_<MASTER|BLOCKS|AMBIENT|PLAYERS|HOSTILE|NEUTRAL|MUSIC|UI>=0..100; M = mute
 //   packs: MC_PACKS / MC_PACK_CONFIG / MC_PACK_AUTO (see docs/mc/resourcepacks.md); T = hot reload, animated tiles tick at 20 Hz
 //   MCPLAY_DIG_MS=700  hold time before the "finish digging" packet in survival (there is no hardness table yet)
 //   MCPLAY_PLACE_ID=0  block state id painted locally on a place click (0 = wait for the server's Block Update)
@@ -55,6 +57,18 @@ import mc.mc_play
 import mc.mc_wlight
 import mc.mc_packs
 import mc.mc_backend
+import mc.mc_audio
+import mc.mc_entity
+import mc.v763.mc_snd_v763
+import audio.engine
+import audio.bank
+import audio.sink
+
+// The audio thread (FIRN_AUDIO=device) needs the program's dispatcher.
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == engine.AUDIO_KIND { return engine.audio_main(arg) }
+    return 0
+}
 
 const LOGIN_WAITS: i32 = 200
 const FOG_R: u32 = 150
@@ -67,6 +81,9 @@ const SC_F: u32 = 33
 const SC_N: u32 = 49
 const SC_F11: u32 = 87
 const SC_T: u32 = 20
+const SC_M: u32 = 50
+const AUDIO_RATE: u32 = 44100
+const PLACE_WAIT_MS: u64 = 1500
 
 fn now_ns() -> u64 {
     var ts: [i64; 2] = [0; 2]
@@ -293,6 +310,26 @@ struct Ctx {
     day_time: i64,
     day_fixed: bool,
     n_time: u64,
+    // sound
+    aud: bool,
+    aud_thread: bool,
+    aud_t0: u64,
+    aud_owed: f64,
+    aud_muted: bool,
+    eng: *mut engine.Engine,
+    bnk: *mut bank.Bank,
+    snk: *mut sink.Sink,
+    ma: *mut mc_audio.McAudio,
+    wk: mc_audio.Walker,
+    ents: mc_entity.Store,
+    reg: mc_registry.Registry,
+    pend_place: bool,
+    pend_x: i32,
+    pend_y: i32,
+    pend_z: i32,
+    pend_t: u64,
+    n_snd: u64,
+    n_snd_pkt: u64,
     // counters
     n_chunks: u64,
     n_unload: u64,
@@ -360,6 +397,12 @@ fn on_block_change(c: *mut Ctx) {
     var z: i32 = 0
     var s: i32 = 0
     if mc_play.decode_block_change(mc_client.client_body(&(*c).cl), &x, &y, &z, &s) {
+        if (*c).aud && (*c).pend_place && s > 0 && x == (*c).pend_x && y == (*c).pend_y && z == (*c).pend_z {
+            (*c).pend_place = false
+            if now_ms() - (*c).pend_t < PLACE_WAIT_MS {
+                if mc_audio.mca_block_sound((*c).ma, &(*c).reg, s, mc_audio.ACT_PLACE, x, y, z) != 0 as u32 { (*c).n_snd = (*c).n_snd + 1 as u64 }
+            }
+        }
         mark_air(c, x, y, z, s)
         (*c).n_bchange = (*c).n_bchange + 1 as u64
     }
@@ -444,6 +487,10 @@ fn on_packet(c: *mut Ctx, id: i32) {
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_KICK_DISCONNECT) {
         (*c).n_kick = (*c).n_kick + 1 as u64
         (*c).closed = true
+    } else if (*c).aud {
+        if mc_audio.mca_on_packet((*c).ma, &(*cl).ver, id, mc_client.client_body(cl), &(*c).ents) {
+            (*c).n_snd_pkt = (*c).n_snd_pkt + 1 as u64
+        }
     }
 }
 
@@ -538,6 +585,10 @@ fn handle_window(c: *mut Ctx) {
     if raw.key_pressed(&(*c).rw, raw.KEY_ESC) {
         grab_mouse(c, !(*c).grab)
     }
+    if (*c).aud && raw.key_pressed(&(*c).rw, SC_M) {
+        (*c).aud_muted = !(*c).aud_muted
+        mc_audio.mca_set_muted((*c).ma, (*c).aud_muted)
+    }
     if (*c).g.use_res && raw.key_pressed(&(*c).rw, SC_T) {
         var be: mc_backend.Backend = mc_backend.backend_cpu(&(*c).g.r)
         mc_packs.res_on_key(&(*c).g.res, &be, mc_packs.RES_KEY_RELOAD)
@@ -583,6 +634,10 @@ fn do_tick(c: *mut Ctx) {
     mc_input.player_tick(&(*c).pl, &ev, &(*c).world, &(*c).itb, (*c).dim.min_y)
     mc_play.send_pos_look(&(*c).cl, (*c).pl.x, (*c).pl.y, (*c).pl.z, (*c).pl.yaw, (*c).pl.pitch, (*c).pl.on_ground)
     (*c).n_ticks = (*c).n_ticks + 1 as u64
+    if (*c).aud {
+        let st: i32 = mc_audio.mca_walk((*c).ma, &(*c).wk, &(*c).reg, &(*c).world, (*c).dim.min_y, (*c).pl.x, (*c).pl.y, (*c).pl.z, (*c).pl.on_ground, (*c).pl.sneaking)
+        (*c).n_snd = (*c).n_snd + st as u64
+    }
     if !(*c).day_fixed && (*c).n_time > 0 as u64 {
         (*c).day_time = (*c).day_time + 1
         mc_sky.sky_set_time(&(*c).sky, (*c).day_time, 0)
@@ -612,6 +667,10 @@ fn sync_position(c: *mut Ctx) {
 // ---- mouse actions: break / place ------------------------------------------------------------------
 
 fn break_local(c: *mut Ctx, x: i32, y: i32, z: i32) {
+    if (*c).aud {
+        let old: i32 = mc_audio.mca_state_at(&(*c).world, (*c).dim.min_y, x, y, z)
+        if mc_audio.mca_block_sound((*c).ma, &(*c).reg, old, mc_audio.ACT_BREAK, x, y, z) != 0 as u32 { (*c).n_snd = (*c).n_snd + 1 as u64 }
+    }
     mark_air(c, x, y, z, 0)
     (*c).n_dig = (*c).n_dig + 1 as u64
 }
@@ -661,10 +720,113 @@ fn handle_mouse(c: *mut Ctx) {
         mc_play.send_place(cl, (*c).pk.x, (*c).pk.y, (*c).pk.z, face3, (*c).seq)
         mc_play.send_swing(cl, (*c).seq)
         (*c).n_place = (*c).n_place + 1 as u64
+        (*c).pend_place = true
+        (*c).pend_x = (*c).pk.x + (*c).pk.nx
+        (*c).pend_y = (*c).pk.y + (*c).pk.ny
+        (*c).pend_z = (*c).pk.z + (*c).pk.nz
+        (*c).pend_t = now_ms()
         if (*c).place_id > 0 {
             mark_air(c, (*c).pk.x + (*c).pk.nx, (*c).pk.y + (*c).pk.ny, (*c).pk.z + (*c).pk.nz, (*c).place_id)
         }
     }
+}
+
+fn push_str(out: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(out, s.p as u64, s.n)
+}
+
+// ---- sound -------------------------------------------------------------------------------------------
+
+// Percent from the environment (-1 = unset).
+fn env_pct(name: str) -> i32 {
+    if !env.has(name) { return 0 - 1 }
+    return env_int(name, 100)
+}
+
+fn audio_volumes(c: *mut Ctx) {
+    let names: [str; 8] = ["MCPLAY_VOL_MASTER", "MCPLAY_VOL_BLOCKS", "MCPLAY_VOL_AMBIENT", "MCPLAY_VOL_PLAYERS", "MCPLAY_VOL_HOSTILE", "MCPLAY_VOL_NEUTRAL", "MCPLAY_VOL_MUSIC", "MCPLAY_VOL_UI"]
+    let cats: [i32; 8] = [mc_audio.CAT_MASTER, mc_audio.CAT_BLOCKS, mc_audio.CAT_AMBIENT, mc_audio.CAT_PLAYERS, mc_audio.CAT_HOSTILE, mc_audio.CAT_NEUTRAL, mc_audio.CAT_MUSIC, mc_audio.CAT_UI]
+    var i: usize = 0
+    while i < 8 {
+        let v: i32 = env_pct(names[i])
+        if v >= 0 {
+            var f: f32 = (v as f32) / 100.0
+            if f > 1.0 { f = 1.0 }
+            mc_audio.mca_set_category_volume((*c).ma, cats[i], f)
+        }
+        i = i + 1
+    }
+}
+
+// Opens the sink + bank. false = no sound (the game runs on). Called once the Ctx is in place (the engine must not move).
+fn audio_start(c: *mut Ctx) -> bool {
+    sink.sink_close((*c).snk)
+    *(*c).snk = sink.sink_open("mcplay", AUDIO_RATE, 2 as u32)
+    if !sink.sink_is_open((*c).snk) {
+        io.eprint_line("mcplay: no sound output (no PulseAudio? FIRN_AUDIO=null|file:/x.wav works anywhere) -- running silent")
+        return false
+    }
+    var dir: rt.Buf = rt.buf_new()
+    if env.has("MCPLAY_SOUNDS") {
+        push_str(&dir, env.get("MCPLAY_SOUNDS"))
+    } else if env.has("HOME") {
+        push_str(&dir, env.get("HOME"))
+        push_str(&dir, "/.cache/mcplay/sounds")
+    }
+    push_str(&dir, "/bank.json")
+    rt.buf_push(&dir, 0 as u8)
+    let path: str = str { p: rt.buf_data(&dir), n: rt.buf_len(&dir) - 1 }
+    let r: i32 = mc_audio.mca_bank_load_file((*c).ma, (*c).bnk, path)
+    rt.buf_free(&dir)
+    if r != bank.BANK_OK {
+        io.eprint_line("mcplay: no sound bank (build one: firnc -o gen tools/sounds/gen/main.fi; ./gen tools/sounds/mc.json <dir>; set MCPLAY_SOUNDS=<dir>) -- running silent")
+        sink.sink_close((*c).snk)
+        return false
+    }
+    if (*c).protocol == 763 {
+        mc_audio.mca_sound_table_load((*c).ma, mc_snd_v763.SND_BLOB.p as u64, mc_snd_v763.SND_COUNT, mc_snd_v763.SND_FIRST)
+    }
+    audio_volumes(c)
+    // a real device paces itself: audio thread. file/null sinks never wait, so they are fed by wall clock in audio_pump.
+    if sink.sink_kind((*c).snk) == sink.KIND_DEVICE {
+        (*c).aud_thread = engine.engine_audio_start((*c).eng, (*c).snk, 1024)
+        if !(*c).aud_thread { io.eprint_line("mcplay: audio thread did not start -- running silent") ; return false }
+    }
+    (*c).aud_t0 = now_ms()
+    return true
+}
+
+// Per frame: listener + finished voices; sinks without a clock get exactly the frames of the elapsed time.
+fn audio_frame(c: *mut Ctx) {
+    if !(*c).aud { return }
+    mc_audio.mca_update((*c).ma, &(*c).cam, 0.016)
+    if !(*c).aud_thread {
+        let t: u64 = now_ms()
+        (*c).aud_owed = (*c).aud_owed + ((t - (*c).aud_t0) as f64) * (AUDIO_RATE as f64) / 1000.0
+        (*c).aud_t0 = t
+        var guard: i32 = 0
+        while (*c).aud_owed >= 512.0 && guard < 64 {
+            let n: usize = engine.engine_pump((*c).eng, (*c).snk, (*c).aud_owed as usize)
+            if n == 0 { break }
+            (*c).aud_owed = (*c).aud_owed - (n as f64)
+            guard = guard + 1
+        }
+    }
+}
+
+fn audio_stop(c: *mut Ctx) {
+    if !(*c).aud { return }
+    if (*c).aud_thread { engine.engine_audio_stop((*c).eng) }
+    sink.sink_drain((*c).snk)
+    let crc: u32 = sink.sink_crc((*c).snk)
+    let nb: u64 = sink.sink_bytes((*c).snk)
+    let np: u64 = (*(*c).ma).n_played
+    let nm: u64 = (*(*c).ma).n_missing
+    let ncu: u64 = (*(*c).ma).n_culled
+    let ns: u64 = (*c).n_snd
+    let npk: u64 = (*c).n_snd_pkt
+    say(f"mcplay: audio bytes={nb} crc={crc} sounds={ns} packets={npk} played={np} missing={nm} culled={ncu}\n")
+    sink.sink_close((*c).snk)
 }
 
 // ---- drawing -----------------------------------------------------------------------------------------
@@ -718,6 +880,7 @@ fn present(c: *mut Ctx) {
 
 // ---- main ----------------------------------------------------------------------------------------------
 
+#[allow_escape]
 fn main(start: u64) -> i32 {
     if rt.arg_count(start) < 4 {
         io.eprint_line("usage: mcplay <host-ipv4> <port> <name>   (options: environment, see the header of demos/mcplay/main.fi)")
@@ -753,6 +916,10 @@ fn main(start: u64) -> i32 {
         return 3
     }
     net.set_no_delay(&conn, true) catch false
+    var eng: engine.Engine = engine.engine_new(AUDIO_RATE, 48 as u32)
+    var bnk: bank.Bank = bank.bank_new()
+    var snk: sink.Sink = sink.sink_open_file("/dev/null", AUDIO_RATE, 2 as u32, false)
+    var ma: mc_audio.McAudio = mc_audio.mca_new(&eng)
     var c: Ctx = Ctx {
         cl: mc_client.client_new(conn, ver),
         world: mc_world.world_new(),
@@ -773,6 +940,9 @@ fn main(start: u64) -> i32 {
         digging: false, dig_x: 0, dig_y: 0, dig_z: 0, dig_t0: 0, dig_ms: env_int("MCPLAY_DIG_MS", 700) as u64, seq: 0,
         place_id: env_int("MCPLAY_PLACE_ID", 0), ticks_day: env_int("MCPLAY_TICKS", 2000),
         light: env_flag("MCPLAY_LIGHT", true), wl: mc_wlight.wl_new(0, 24), region_done: false, day_time: 0, day_fixed: false, n_time: 0,
+        aud: false, aud_thread: false, aud_t0: 0, aud_owed: 0.0, aud_muted: false,
+        eng: &eng, bnk: &bnk, snk: &snk, ma: &ma, wk: mc_audio.mca_walker_new(), ents: mc_entity.store_new(), reg: ver.registry_of(),
+        pend_place: false, pend_x: 0, pend_y: 0, pend_z: 0, pend_t: 0, n_snd: 0, n_snd_pkt: 0,
         n_chunks: 0, n_unload: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, fps: 0,
     }
     if !c.g.ok {
@@ -785,6 +955,7 @@ fn main(start: u64) -> i32 {
         light_setup(&c)
     }
     c.itb = pick_tables(&c.g.tb)
+    if env_flag("MCPLAY_AUDIO", true) { c.aud = audio_start(&c) }
     c.pl.creative = c.creative
     c.bg = rt.heap_alloc((w0 as usize) * (h0 as usize) * 4)
     mc_camera.camera_set_lens(&c.cam, 70.0, 0.05, (view as f64 + 2.0) * 16.0 * 1.5)
@@ -848,6 +1019,7 @@ fn main(start: u64) -> i32 {
             c.hit = mc_input.input_pick_camera(&c.world, c.dim.min_y, &c.itb, &c.cam, mc_input.player_reach(&c.pl), &c.pk)
         }
         handle_mouse(&c)
+        audio_frame(&c)
         draw_frame(&c)
         present(&c)
         c.n_frames = c.n_frames + 1 as u64
@@ -863,6 +1035,7 @@ fn main(start: u64) -> i32 {
             window.wait_event(&c.win, ((frame_ns - spent) / 1000000 as u64) as i64)
         }
     }
+    audio_stop(&c)
     say(f"mcplay: end frames={c.n_frames} ticks={c.n_ticks} chunks={c.n_chunks} unloads={c.n_unload} block_updates={c.n_bchange} multi_updates={c.n_mchange} dig={c.n_dig} place={c.n_place} kicked={c.n_kick} alive={alive}\n")
     say(f"mcplay: light={c.light} region={c.region_done} time_packets={c.n_time} day_time={c.day_time} daylight={c.sky.daylight}\n")
     say(f"mcplay: pos x={c.pl.x as i64} y={c.pl.y as i64} z={c.pl.z as i64} fps={c.fps}\n")
