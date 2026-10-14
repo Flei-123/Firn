@@ -33,7 +33,7 @@ Rules:
   runtime use (it works with `gs = 0`; it gets its own table entry, stack bounds from `/proc/self/maps`, its own `gs`
   base) and `thread_host_detach()` before it ends (free lists back, entry recycled, `gs` cleared). Both are plain Firn
   functions: export them (`#[export_c] fn se_attach() -> u64 { ... }`). A second `thread_attach()` on the same thread
-  returns true and changes nothing. A host thread that was not attached crashes on its first runtime access (`gs = 0`).
+  returns true and changes nothing. A host thread that was not attached is registered by **the export guard** (r506, below) instead of crashing on its first runtime access.
 * **Host mode**: `thread_attach()` returns with the thread counted as BLOCKED (its stack is scanned, the collector does
   not wait for it while it runs host code that never reaches a safepoint). Every export that touches the runtime on such a
   thread brackets its work: `thread_blocking_out()` ... `thread_blocking_an()`. Without the bracket, a thread idling in host
@@ -67,12 +67,11 @@ Entry `__firn_dll_entry` (DllMain shape): on `DLL_PROCESS_ATTACH` it runs the se
 a host register. **Host threads of their own (r506)**: `thread_attach()` / `thread_host_detach()` work in a DLL exactly as in the Linux `.so`
 (export them, bracket runtime-using exports with `thread_blocking_out()` / `thread_blocking_an()`). Why it needs no extra code: the seam answers
 `/proc/self/maps` out of `GetCurrentThreadStackLimits` of the CALLING thread (stack bounds), `arch_prctl(ARCH_SET_FS, tcb)` is `TlsSetValue` of the
-shared slot for the calling thread only (`0` on detach), `gettid` is `GetCurrentThreadId`. A host thread that never attached reads an empty TLS slot and
-crashes on its first runtime access (like the x86-64 `.so`). Proof: `host_attach_win.c` (4 `CreateThread` threads, two waves so entries are recycled,
+shared slot for the calling thread only (`0` on detach), `gettid` is `GetCurrentThreadId`. A host thread that never attached reads an empty TLS slot: the export guard (below) registers it. Proof: `host_attach_win.c` (4 `CreateThread` threads, two waves so entries are recycled,
 one idles in host code during collections; jobs with 0/3 workers, GC chains), dev-fast + release-fast, 3 runs each. **`v128` (r506)**: a `v128`
 parameter is a pointer to 16 octets in its Win64 integer slot (hidden pointer, the C side passes `__m128` that way); the thunk loads it into the next
 `xmm0-7`. A `v128` result is `xmm0` in both conventions. Compile error only if a `v128` would not find an `xmm` register (more than 8 float / vector
-parameters). **Structs by value (r506)**: parameters and results follow the Win64 rules, the thunk converts to Firn's word placement (`abi.rs`: up to 16 octets as eightbyte words, over 16 a pointer to a copy, result over 8 octets through a hidden pointer). A struct of 1, 2, 4 or 8 octets travels IN the integer slot (also when it holds floats, e.g. `{f32, f32}` or `{f64}`); every other size is a pointer to the caller's copy (the thunk loads exactly `size` octets, so 3/5/6/7-octet structs never read past the copy). A result of 1/2/4/8 octets comes back in `rax` (the thunk moves `xmm0` there for a float struct); other results use the hidden pointer in slot 0 (rcx), which shifts every other slot by one, and `rax` hands it back (the thunk stores a 3/5/6/7-octet word piecewise). Proof: `lib_struct.fi` + `host_struct.c` (sizes 1-8, 12, 16, 24, float words, mixed with scalars past the registers, results), dev-fast + release-fast under Wine. Limit: a `.lib` import library (use `LoadLibrary` / `GetProcAddress`).
+parameters). **Structs by value (r506)**: parameters and results follow the Win64 rules, the thunk converts to Firn's word placement (`abi.rs`: up to 16 octets as eightbyte words, over 16 a pointer to a copy, result over 8 octets through a hidden pointer). A struct of 1, 2, 4 or 8 octets travels IN the integer slot (also when it holds floats, e.g. `{f32, f32}` or `{f64}`); every other size is a pointer to the caller's copy (the thunk loads exactly `size` octets, so 3/5/6/7-octet structs never read past the copy). A result of 1/2/4/8 octets comes back in `rax` (the thunk moves `xmm0` there for a float struct); other results use the hidden pointer in slot 0 (rcx), which shifts every other slot by one, and `rax` hands it back (the thunk stores a 3/5/6/7-octet word piecewise). Proof: `lib_struct.fi` + `host_struct.c` (sizes 1-8, 12, 16, 24, float words, mixed with scalars past the registers, results), dev-fast + release-fast under Wine. Import library: `--def=<file>` writes `LIBRARY x.dll` + `EXPORTS` (one line per `#[export_c]` function); `dlltool -d x.def -l x.lib` (mingw) or `lib /def:x.def` (MSVC) makes the `.lib`. `v128` past `xmm7` is still a compile error.
 Proof: gate 134 -> `tools/stack_e/run_g5.sh` (mingw host `host_win.c` under Wine, dev-fast + release-fast, plus the runtime probe, plus
 `host_abi.c` against `lib_abi.fi`: `f64`/`f32` in every slot, 8 integers, 10 doubles, 14 mixed arguments, 9 integers with a float result, `v128` arguments and result; the same C host
 runs against the Linux x86-64 `.so` and the aarch64 `.so`, whose native conventions already carry floats and stack arguments). **Wine only; a real Windows
@@ -111,3 +110,17 @@ main thread's block; `__cpu_features()` reads the auxiliary vector that `_start`
 to the baseline. Proof: `host_a64.c` (aarch64-linux-gnu-gcc, `-fstack-protector-all`, checks that the host's TLS and `errno` survive the calls), and the
 same `host_rt.c` / `host_attach.c` as the x86-64 gate (Firn threads, jobs with 0/3 workers, GC on 4 threads, 4 attached pthreads in two waves) under
 `qemu-aarch64 -L /usr/aarch64-linux-gnu`, dev-fast + release-fast. **qemu only; a real aarch64 machine is untested.**
+
+## Host threads without `thread_attach` (r506, the export guard)
+
+Every `#[export_c]` function of a `--shared` build with the runtime starts with `thread_host_guard()` and ends with
+`thread_host_guard_end()` (`lib/gc/gc.fi`, inserted by `lower.rs`; a `defer`-like exit that also runs on every `return`).
+The guard asks the target for the calling thread's block (`arch_prctl(ARCH_GET_TCB)`, a compiler-translated request:
+x86-64 `.so` = `ARCH_GET_GS`, DLL = `TlsGetValue` in the seam, aarch64 = "cannot tell"):
+
+* runtime not started yet: nothing (the first caller becomes the Firn main thread, as before);
+* thread has a block (attached explicitly, started by Firn, or the main thread): nothing, one `arch_prctl` call (x86-64 `.so`) or one TLS read (DLL);
+* thread has NO block: `thread_attach()` registers it, it runs, and on exit the thread goes back to host mode (counted as blocked), so a thread idling in host code never stalls a collection. Explicit `thread_attach` + manual `thread_blocking_out/an` brackets keep working (the state setters are idempotent); an export that calls `thread_host_detach()` ends the registration (the guard end then does nothing).
+* A lazily attached thread that ends WITHOUT an export that detaches leaves a stale table entry; the next unattached thread with the same thread id recycles it (`__thread_recycle_host`). Entries of ids that never return stay until detached: call the detach export before a thread ends when threads come and go in numbers.
+* Cost: one `arch_prctl` system call per export call on the x86-64 `.so` (also when Firn code calls an exported function itself). Table full: message and exit code 71.
+* aarch64 `.so`: no guard effect (the target cannot tell), an unattached host thread still runs as the Firn main thread. Proof: `tools/stack_e/host_noattach.c` (x86-64 `.so`, 3 waves of 4 pthreads, no `se_attach`, one idles in host code; ids reused).

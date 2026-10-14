@@ -4281,6 +4281,9 @@ const SYS_FUTEX: i64 = 202
 const SYS_NANOSLEEP: i64 = 35
 const ARCH_SET_FS: i64 = 4098
 const ARCH_GET_FS: i64 = 4099
+// Compiler-translated request (compiler/src/lower.rs retarget_thread_base): the thread block base of the calling
+// thread as THIS target keeps it (`gs` in an x86-64 `.so`, a TLS slot in a DLL); the aarch64 `.so` answers -1 (cannot tell).
+const ARCH_GET_TCB: i64 = 7937
 // FUTEX_WAIT/FUTEX_WAKE, each with FUTEX_PRIVATE_FLAG (128): the futex
 // belongs to this process only, and the kernel saves itself the mapping onto
 // a global key object.
@@ -4922,7 +4925,13 @@ fn thread_attach() -> bool {
         let z: u64 = __gc_ld64(t + FT_STATE)
         if z != Z_FREE && z != Z_DEAD && __gc_ld32(t + FT_TID) as u64 == tid {
             __thread_unlock(st + S_TSPERRE)
-            return true
+            if __thread_known() || __gc_ld64(t + FT_HOST) != 1 {
+                return true
+            }
+            // Same thread id but this thread has no thread block: the entry belongs to a host thread that ended
+            // without `thread_host_detach` and whose id was reused. Recycle it and register this thread afresh.
+            __thread_recycle_host(t)
+            return thread_attach()
         }
         i = i + 1
     }
@@ -4978,6 +4987,60 @@ fn thread_attach() -> bool {
     syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, tcb as i64, 0, 0, 0, 0)
     __thread_unlock(st + S_TSPERRE)
     return true
+}
+
+// Does the calling thread have a thread block of its own? true also when the target cannot tell (aarch64 `.so`).
+fn __thread_known() -> bool {
+    var v: u64 = 0
+    syscall(SYS_ARCH_PRCTL, ARCH_GET_TCB, (&v) as u64 as i64, 0, 0, 0, 0)
+    return v != 0
+}
+
+// Entry of a host thread that vanished without `thread_host_detach` (called with a stale entry, not the caller's own).
+fn __thread_recycle_host(t: u64) {
+    let st: u64 = __gc_state() as u64
+    __thread_lists_back(t)
+    __gc_st64(t + FT_RES, 0)
+    __gc_st64(t + FT_HOST, 0)
+    __gc_st64(t + FT_LO, 0)
+    __gc_st64(t + FT_TID, 0)
+    __gc_st64(t + FT_DETACH, 1)
+    __gc_st64(t + FT_STATE, Z_DEAD)
+    __atomic_add((st + S_THREAD_N) as *mut u64, THREAD_MINUS1)
+}
+
+// Entry guard of every `#[export_c]` function of a shared object (the compiler inserts it, compiler/src/lower.rs):
+// a host thread that never called `thread_attach` is registered here instead of crashing on its first runtime
+// access. Returns 0 = nothing to do (runtime not started yet, or the thread has a block), 1 = attached just now
+// and running; the export's exit then calls `thread_host_guard_end(1)`, which puts the thread back into host mode.
+// Such a thread has no `thread_host_detach`: its entry is recycled when its thread id shows up again, or call the
+// export that wraps `thread_host_detach` before the thread ends. Table full: aborts (code 71).
+fn thread_host_guard() -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_THREAD_TAB) == 0 {
+        return 0
+    }
+    if __thread_known() {
+        return 0
+    }
+    if !thread_attach() {
+        var m: [u8; 40] = "firn: host thread could not be attached\n"
+        syscall(GC_SYS_WRITE, 2, (&m) as u64 as i64, 40, 0, 0, 0)
+        syscall(GC_SYS_EXIT_GROUP, 71, 0, 0, 0, 0, 0)
+    }
+    __thread_blocked_out()
+    return 1
+}
+
+fn thread_host_guard_end(t: u64) {
+    if t == 0 {
+        return
+    }
+    // The export may have detached the thread (`thread_host_detach`): no block, nothing to report.
+    if !__thread_known() {
+        return
+    }
+    __thread_blocked_an()
 }
 
 // The calling host thread leaves the runtime for good (call it before the thread ends). Its free
