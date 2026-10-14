@@ -30,4 +30,4 @@ Code: `lib/gpu/vk_life.fi` on top of `lib/gpu/vk.fi`. Gate: `bash tools/mc/vk/ru
 - Open: ANativeWindow from the Firn android window layer, `VK_KHR_swapchain` surface formats (RGBA8 common), no validation layers.
 
 ## vk_mc in mcplay (r193)
-`vk_mc` does not use `vk_life.frame` (no swapchain yet); it keeps `life` for the pipeline cache only and detects loss itself (failed frame submit or `vkbe_inject_lost`), see docs/VK-RENDERER.md "mcplay with the Vulkan back end". Recovery = close + `vkbe_open_into` + re-upload (mcplay `vk_recover`), simulated only.
+`vk_mc` does not use `vk_life.frame` (it renders into its own images and blits); since r195 it uses `vk_life.sc_sync` + `sc_note` for the swapchain (docs/VK-RENDERER.md "Swapchain present") and keeps `life` for the pipeline cache; it detects loss itself (failed frame submit or `vkbe_inject_lost`), see docs/VK-RENDERER.md "mcplay with the Vulkan back end". Recovery = close + `vkbe_open_into` + re-upload (mcplay `vk_recover`), simulated only.
