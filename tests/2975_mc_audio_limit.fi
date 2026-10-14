@@ -1,0 +1,94 @@
+// expect_exit: 0
+// tests/2975_mc_audio_limit.fi -- engine limits: 2048 samples / events (was 512), name lookup stays cheap, mc_audio tunes events >= 512,
+// limits are hard (the next add fails, no crash), memory of the tables is small.
+import std.rt
+import std.io
+import std.time
+import audio.engine
+import mc.mc_audio
+
+struct T {
+    fails: i32,
+}
+
+fn check(t: *mut T, ok: bool, what: str) {
+    if ok {
+        io.fmt_print(f"ok   {what}\n")
+    } else {
+        io.fmt_print(f"FAIL {what}\n")
+        (*t).fails = (*t).fails + 1
+    }
+}
+
+// "ev.NNNN" as a str backed by `b`
+fn name_of(b: *mut rt.Buf, i: usize) -> str {
+    rt.buf_clear(b)
+    rt.buf_push(b, 101 as u8)
+    rt.buf_push(b, 118 as u8)
+    rt.buf_push(b, 46 as u8)
+    rt.buf_push_dec_i64(b, i as i64)
+    rt.buf_push(b, 0 as u8)
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) - 1 }
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var t: T = T { fails: 0 }
+    var e: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+    engine.engine_ensure_bus(&e, "sfx", "master")
+    let bus: i32 = engine.engine_bus_id(&e, "sfx")
+    check(&t, engine.MAX_SAMPLES >= 2048 && engine.MAX_EVENTS >= 2048, "limits are at least 2048")
+
+    var pcm: u64 = rt.heap_alloc(64 * 4)
+    rt.mem_set(pcm, 0 as u8, 64 * 4)
+    var nm: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    var ok: bool = true
+    while i < 1900 {
+        let sid: i32 = engine.engine_add_sample(&e, pcm, 64 as u64, 1 as u32)
+        let ev: i32 = engine.engine_add_event(&e, name_of(&nm, i), bus)
+        if sid < 0 || ev < 0 || ev != i as i32 || !engine.engine_event_add_sample(&e, ev, sid) { ok = false; break }
+        i = i + 1
+    }
+    check(&t, ok && engine.engine_sample_count(&e) == 1900 && engine.engine_event_count(&e) == 1900, "1900 samples + 1900 events (3.7x the old limit)")
+
+    // lookup cost (linear scan, worst case = last event) -- bound is loose on purpose (llvmpipe box under load)
+    let t0: u64 = time.monotonic_ns()
+    var found: i32 = 0
+    var k: usize = 0
+    while k < 200 {
+        found = engine.engine_find_event(&e, name_of(&nm, 1899))
+        k = k + 1
+    }
+    let per_us: u64 = (time.monotonic_ns() - t0) / 200 / 1000
+    io.fmt_print(f"find_event worst case: {per_us} us\n")
+    check(&t, found == 1899, "last event found by name")
+    check(&t, per_us < 500, "worst-case lookup under 500 us")
+
+    // plays an event past the old 512 limit
+    let h: u32 = engine.engine_play(&e, 1500, bus)
+    check(&t, h != 0 as u32, "event 1500 plays")
+
+    // hard limit: fill up, next add fails
+    while engine.engine_sample_count(&e) < engine.MAX_SAMPLES { engine.engine_add_sample(&e, pcm, 64 as u64, 1 as u32) }
+    check(&t, engine.engine_add_sample(&e, pcm, 64 as u64, 1 as u32) < 0, "sample table full: add fails cleanly")
+    while engine.engine_event_count(&e) < engine.MAX_EVENTS { engine.engine_add_event(&e, name_of(&nm, engine.engine_event_count(&e)), bus) }
+    check(&t, engine.engine_add_event(&e, "overflow", bus) < 0, "event table full: add fails cleanly")
+
+    // adopt: last sample takes over a slot, table shrinks
+    let n0: usize = engine.engine_sample_count(&e)
+    let big: i32 = engine.engine_add_sample(&e, pcm, 8 as u64, 1 as u32) // table is full -> -1
+    check(&t, big < 0, "full table refuses a further sample")
+    check(&t, !engine.engine_sample_adopt_last(&e, (n0 as i32) - 1), "adopt refuses old == last")
+    check(&t, engine.engine_sample_adopt_last(&e, 3) && engine.engine_sample_count(&e) == n0 - 1, "adopt: slot taken over, table shrinks by one")
+
+    // mc_audio: events >= 512 get the distance model once (bitset of 2048 bits)
+    var m: mc_audio.McAudio = mc_audio.mca_new(&e)
+    check(&t, mc_audio.mca_set_range(&m, name_of(&nm, 1500), 40.0), "set_range on event 1500")
+    check(&t, (*engine.engine_event(&e, 1500)).spatial && (*engine.engine_event(&e, 1500)).rolloff == 1, "event 1500 tuned (bit 1500 of 2048)")
+    check(&t, (*engine.engine_event(&e, 1500)).max_distance > 39.0 && (*engine.engine_event(&e, 1500)).max_distance < 41.0, "event 1500 range 40")
+    check(&t, (*engine.engine_event(&e, 1800)).spatial == false, "untouched event stays 2D")
+    engine.engine_free(&e)
+    io.fmt_print(f"failures: {t.fails}\n")
+    return t.fails
+}

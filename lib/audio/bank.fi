@@ -30,7 +30,7 @@ import audio.load_ogg
 // DIFFERENT (honest):
 // B1  Samples: WAV and MP3 (by extension). OGG via audio.load_ogg (ton.vorbis). `bank_provide` registers samples that are
 //     already in the engine under a name; those win over files.
-// B2  The engine limits apply (16 samples/event, 8 params, 16 curve points, 512 samples/events, 32 buses): above
+// B2  The engine limits apply (16 samples/event, 8 params, 16 curve points, 2048 samples/events, 32 buses): above
 //     them the load fails with a message instead of truncating.
 // B3  The bank must not be loaded while the audio thread runs (engine_audio_stop first); loading refuses with
 //     BANK_ERR_BUSY. Aulos stops the device for that, too.
@@ -41,7 +41,7 @@ import std.json
 import audio.engine
 
 export {
-    Bank, bank_new, bank_free, bank_provide, bank_load_text, bank_load_file, bank_error, bank_clean,
+    Bank, bank_new, bank_free, bank_provide, bank_provide_hashed, bank_cached_id, bank_name_count, bank_load_text, bank_load_file, bank_error, bank_clean,
     bank_play, bank_bus_name, bank_setup_buses,
     BANK_OK, BANK_ERR_FILE, BANK_ERR_PARSE, BANK_ERR_ARG, BANK_ERR_BUSY,
     BUS_MASTER, BUS_MUSIC, BUS_SFX, BUS_UI, BUS_COUNT, BUS_EVENT,
@@ -61,10 +61,11 @@ const BUS_UI: i32 = 3
 const BUS_COUNT: i32 = 4
 const BUS_EVENT: i32 = -1
 
-const MAX_NAMES: usize = 1024
+const MAX_NAMES: usize = 4096
 
 struct Bank {
     names: u64, // MAX_NAMES * 3 words: name pointer, name length, sample id
+    hashes: u64, // MAX_NAMES words: content hash of a provided sample (0 = none / unknown)
     count: usize,
     dir: rt.Buf, // base directory for sample files ("" = as given)
     err: rt.Buf,
@@ -75,7 +76,11 @@ fn bank_new() -> Bank {
     if t != 0 {
         rt.mem_set(t, 0 as u8, MAX_NAMES * 3 * 8)
     }
-    return Bank { names: t, count: 0, dir: rt.buf_new(), err: rt.buf_new() }
+    let h: u64 = rt.heap_alloc(MAX_NAMES * 8)
+    if h != 0 {
+        rt.mem_set(h, 0 as u8, MAX_NAMES * 8)
+    }
+    return Bank { names: t, hashes: h, count: 0, dir: rt.buf_new(), err: rt.buf_new() }
 }
 
 fn bank_free(b: *mut Bank) {
@@ -88,6 +93,10 @@ fn bank_free(b: *mut Bank) {
         rt.heap_free((*b).names, MAX_NAMES * 3 * 8)
     }
     (*b).names = 0
+    if (*b).hashes != 0 {
+        rt.heap_free((*b).hashes, MAX_NAMES * 8)
+    }
+    (*b).hashes = 0
     (*b).count = 0
     rt.buf_free(&(*b).dir)
     rt.buf_free(&(*b).err)
@@ -106,6 +115,19 @@ fn set_err(b: *mut Bank, a: str, name: str, c: str) {
     rt.buf_push_bytes(&(*b).err, a.p as u64, a.length())
     rt.buf_push_bytes(&(*b).err, name.p as u64, name.length())
     rt.buf_push_bytes(&(*b).err, c.p as u64, c.length())
+}
+
+fn find_slot(b: *mut Bank, p: u64, n: usize) -> i32 {
+    var i: usize = 0
+    while i < (*b).count {
+        let np: u64 = rt.ld64((*b).names, i * 3)
+        let nn: usize = rt.ld64((*b).names, i * 3 + 1) as usize
+        if nn == n && rt.mem_eq(np, p, n) {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
 }
 
 fn find_name(b: *mut Bank, p: u64, n: usize) -> i32 {
@@ -141,6 +163,42 @@ fn bank_provide(b: *mut Bank, name: str, sample_id: i32) {
     if find_name(b, name.p as u64, name.length()) < 0 {
         remember(b, name.p as u64, name.length(), sample_id)
     }
+}
+
+// Hot reload: `name` was provided before with exactly this content hash -> its sample id (reuse, do not decode again). Else -1.
+fn bank_cached_id(b: *mut Bank, name: str, hash: u64) -> i32 {
+    if (*b).hashes == 0 || hash == 0 as u64 {
+        return -1
+    }
+    let k: i32 = find_slot(b, name.p as u64, name.length())
+    if k < 0 || rt.ld64((*b).hashes, k as usize) != hash {
+        return -1
+    }
+    return rt.ld64((*b).names, (k as usize) * 3 + 2) as i32
+}
+
+// Like bank_provide, but remembers the content hash and UPDATES an existing name (new sample id + hash), so a changed file wins on
+// reload. Returns the previous sample id of that name (-1 = new name or unknown).
+fn bank_provide_hashed(b: *mut Bank, name: str, hash: u64, sample_id: i32) -> i32 {
+    let k: i32 = find_slot(b, name.p as u64, name.length())
+    if k >= 0 {
+        var old: i32 = rt.ld64((*b).names, (k as usize) * 3 + 2) as i32
+        if (*b).hashes == 0 || rt.ld64((*b).hashes, k as usize) == 0 as u64 { old = -1 } // not ours (plain bank_provide): never adopt
+        rt.st64((*b).names, (k as usize) * 3 + 2, sample_id as u64)
+        if (*b).hashes != 0 {
+            rt.st64((*b).hashes, k as usize, hash)
+        }
+        return old
+    }
+    remember(b, name.p as u64, name.length(), sample_id)
+    if (*b).hashes != 0 && (*b).count > 0 {
+        rt.st64((*b).hashes, (*b).count - 1, hash)
+    }
+    return -1
+}
+
+fn bank_name_count(b: *mut Bank) -> usize {
+    return (*b).count
 }
 
 // ----------------------------------------------------------------------------- text cleaning
