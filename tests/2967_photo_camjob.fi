@@ -1,0 +1,203 @@
+// expect_out: ok
+// tests/2967_photo_camjob.fi -- photo.camjob: the FirnCam shot job end to end on synthetic frames. RAW16 mosaics
+// (RGGB, 12 bit, a 3 frame exposure bracket) and JPEG frames (the no-RAW fallback) run through every mode
+// (PHOTO / NIGHT / PORTRAIT / DOC / STACK); the result must be a JPEG that lib/jpeg decodes, at the half
+// (RAW) or box-reduced (max_px) size, with sane brightness, progress 100; the DOC mode also writes a PDF;
+// one job runs on a real thread (thread_start + polling) like the app does.
+import std.io
+import std.rt
+import jobs.jobs
+import jpeg.jpeg
+import photo.image
+import photo.meta
+import photo.par
+import photo.jpegenc
+import photo.camjob
+
+const JOB_KIND: u64 = 77
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+    if kind == JOB_KIND { return camjob.job_entry(arg) }
+    return 0
+}
+
+fn check(c: bool, msg: str) -> bool {
+    if !c { io.print(msg); io.new_line() }
+    return c
+}
+
+// RGGB mosaic (u16, 12 bit) of the scene shifted by (dx, dy), scaled by `gain`, clipped
+fn make_raw(scene: *mut image.Image, dx: f32, dy: f32, gain: f32) -> u64 {
+    let w: i32 = (*scene).w
+    let h: i32 = (*scene).h
+    var sh: image.Image = image.shift_image(scene, dx, dy)
+    let p: u64 = rt.heap_alloc(((w * h) as usize) * 2)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            var c: i32 = 1
+            if (y & 1) == 0 && (x & 1) == 0 { c = 0 }
+            if (y & 1) == 1 && (x & 1) == 1 { c = 2 }
+            var v: f32 = image.img_get(&sh, c, x, y) * gain
+            if v > 1.0f { v = 1.0f }
+            *((p + (((y * w + x) * 2) as u64)) as *mut u16) = (v * 4095.0f) as u16
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image.img_free(&sh)
+    return p
+}
+
+fn make_jpeg(scene: *mut image.Image, dx: f32, dy: f32, size: *mut usize) -> u64 {
+    var sh: image.Image = image.shift_image(scene, dx, dy)
+    var o: jpegenc.EncOpts = jpegenc.enc_default()
+    let cap: usize = jpegenc.jpeg_max_size(sh.w, sh.h)
+    let p: u64 = rt.heap_alloc(cap)
+    *size = jpegenc.jpeg_encode_image(&sh, &o, p, cap)
+    image.img_free(&sh)
+    return p
+}
+
+// decodes the job output; returns mean brightness (0..1), negative on failure; sets w / h
+fn inspect(j: *mut camjob.Job, w: *mut i32, h: *mut i32) -> f32 {
+    if (*j).out_n == 0 { return 0.0f - 1.0f }
+    var dj: jpeg.JpegImage = jpeg.jpeg_image_new()
+    let ok: bool = jpeg.jpeg_decode((*j).out, (*j).out_n, &dj) catch false
+    if !ok { return 0.0f - 2.0f }
+    *w = dj.w as i32
+    *h = dj.h as i32
+    var im: image.Image = image.img_from_rgba8(rt.buf_ptr(&dj.px), *w, *h)
+    let m: f32 = (image.img_mean(&im, 0) + image.img_mean(&im, 1) + image.img_mean(&im, 2)) / 3.0f
+    image.img_free(&im)
+    jpeg.jpeg_image_free(&dj)
+    return m
+}
+
+// dark table, bright page with ink lines
+fn doc_scene(w: i32, h: i32) -> image.Image {
+    var d: image.Image = image.img_new(w, h, 3)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            var r: f32 = 0.12f
+            var g: f32 = 0.09f
+            var b: f32 = 0.06f
+            if x >= 18 && x < 142 && y >= 14 && y < 106 {
+                r = 0.88f; g = 0.85f; b = 0.78f
+                if (y % 9) < 2 && x > 28 && x < 130 { r = 0.1f; g = 0.1f; b = 0.1f }
+            }
+            image.img_set(&d, 0, x, y, r)
+            image.img_set(&d, 1, x, y, g)
+            image.img_set(&d, 2, x, y, b)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return d
+}
+
+fn mode_name(m: i32) -> str {
+    if m == camjob.MODE_PHOTO { return "photo" }
+    if m == camjob.MODE_NIGHT { return "night" }
+    if m == camjob.MODE_PORTRAIT { return "portrait" }
+    if m == camjob.MODE_DOC { return "doc" }
+    return "stack"
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var ok: bool = true
+    par.init(3)
+    var scene: image.Image = image.scene_make(160, 120)
+    var dsc: image.Image = doc_scene(160, 120)
+    let raw_bytes: usize = 160 * 120 * 2
+    var raws: [u64; 8] = [0; 8]
+    var jsz: [usize; 6] = [0; 6]
+    var jp: [u64; 6] = [0; 6]
+    var si: usize = 0
+    while si < 2 {
+        var sc: *mut image.Image = &scene
+        if si == 1 { sc = &dsc }
+        raws[si * 4] = make_raw(sc, 0.0f, 0.0f, 1.0f)
+        raws[si * 4 + 1] = make_raw(sc, 0.8f, -0.6f, 0.5f)
+        raws[si * 4 + 2] = make_raw(sc, -0.7f, 0.9f, 1.0f)
+        raws[si * 4 + 3] = make_raw(sc, 1.1f, 0.3f, 2.0f)
+        jp[si * 3] = make_jpeg(sc, 0.0f, 0.0f, &jsz[si * 3])
+        jp[si * 3 + 1] = make_jpeg(sc, 0.9f, 0.4f, &jsz[si * 3 + 1])
+        jp[si * 3 + 2] = make_jpeg(sc, -0.8f, -0.5f, &jsz[si * 3 + 2])
+        si = si + 1
+    }
+
+    var mode: i32 = 0
+    while mode < 5 {
+        var so: usize = 0
+        if mode == camjob.MODE_DOC { so = 1 }
+        // ---- RAW bracket
+        var j: camjob.Job = camjob.job_new()
+        j.mode = mode
+        j.meta.has_black = true
+        j.meta.white_level = 4095.0f
+        j.orientation = 6
+        camjob.job_add_shot(&j, camjob.SHOT_RAW, 160, 120, raws[so * 4 + 0], raw_bytes, 10000000, 100)
+        camjob.job_add_shot(&j, camjob.SHOT_RAW, 160, 120, raws[so * 4 + 1], raw_bytes, 5000000, 100)
+        camjob.job_add_shot(&j, camjob.SHOT_RAW, 160, 120, raws[so * 4 + 2], raw_bytes, 10000000, 100)
+        camjob.job_add_shot(&j, camjob.SHOT_RAW, 160, 120, raws[so * 4 + 3], raw_bytes, 20000000, 100)
+        let r: bool = camjob.run_job(&j)
+        var w: i32 = 0
+        var h: i32 = 0
+        let mean: f32 = inspect(&j, &w, &h)
+        ok = check(r, "raw job failed") && ok
+        ok = check(camjob.job_progress(&j) == 100, "raw progress") && ok
+        // orientation 6: the decoder turns it upright -> 60 x 80
+        if mode != camjob.MODE_DOC { ok = check(w == 60 && h == 80, "raw size (half, rotated)") && ok }
+        ok = check(mean > 0.05f && mean < 0.95f, "raw brightness") && ok
+        if mode == camjob.MODE_DOC { ok = check(j.have_pdf && rt.buf_len(&j.pdf) > 200, "doc pdf") && ok }
+        camjob.job_free(&j)
+        // ---- JPEG fallback with max_px reduction (160x120 -> /2)
+        var k: camjob.Job = camjob.job_new()
+        k.mode = mode
+        k.max_px = 5000
+        camjob.job_add_shot(&k, camjob.SHOT_JPEG, 160, 120, jp[so * 3 + 0], jsz[so * 3 + 0], 0, 0)
+        camjob.job_add_shot(&k, camjob.SHOT_JPEG, 160, 120, jp[so * 3 + 1], jsz[so * 3 + 1], 0, 0)
+        camjob.job_add_shot(&k, camjob.SHOT_JPEG, 160, 120, jp[so * 3 + 2], jsz[so * 3 + 2], 0, 0)
+        let r2: bool = camjob.run_job(&k)
+        let mean2: f32 = inspect(&k, &w, &h)
+        ok = check(r2, "jpeg job failed") && ok
+        ok = check(w * h <= 5000 && w >= 60, "jpeg max_px") && ok
+        ok = check(mean2 > 0.05f && mean2 < 0.95f, "jpeg brightness") && ok
+        camjob.job_free(&k)
+        io.print(mode_name(mode))
+        io.print(" raw / jpeg ")
+        io.fmt_print_line(io.fmt_f32(io.fmt_new(), mean))
+        io.fmt_print_line(io.fmt_f32(io.fmt_new(), mean2))
+        io.fmt_print_line(io.fmt_f32(io.fmt_new(), (w * h) as f32))
+        mode = mode + 1
+    }
+    // ---- a job on a real thread, polled like the UI does
+    var t: camjob.Job = camjob.job_new()
+    t.mode = camjob.MODE_PHOTO
+    camjob.job_add_shot(&t, camjob.SHOT_JPEG, 160, 120, jp[0], jsz[0], 0, 0)
+    camjob.job_add_shot(&t, camjob.SHOT_JPEG, 160, 120, jp[1], jsz[1], 0, 0)
+    let th: u64 = thread_start(JOB_KIND, (&t) as u64)
+    ok = check(th != 0, "thread_start") && ok
+    var spins: i32 = 0
+    while !camjob.job_finished(&t) && spins < 20000 {
+        thread_sleep(5)
+        spins = spins + 1
+    }
+    thread_wait(th)
+    ok = check(camjob.job_finished(&t) && t.ok && t.out_n > 0, "threaded job") && ok
+    camjob.job_free(&t)
+    // ---- no shots / empty input
+    var e: camjob.Job = camjob.job_new()
+    ok = check(!camjob.run_job(&e), "empty job must fail") && ok
+    camjob.job_free(&e)
+    par.shutdown()
+    if ok { io.print("ok") } else { io.print("FAIL") }
+    io.new_line()
+    return 0
+}
