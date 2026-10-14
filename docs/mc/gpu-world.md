@@ -78,6 +78,8 @@ Section: 4084 vertices = 32672 B VBO + 24504 B IBO (test chunk). Not implemented
 * r94 `tools/gpu/dump.fi` scenes `water_glass`, `water_glass_fog`, `boxes` (PASS_TRANS via `set_pass`, entity boxes via `gl_scene.scene_attach`, entity culling off):
   PSNR 42.3 / 43.4 / 42.4 dB, coverage mismatch 6-10 px of 57600, threshold 38 dB (same float-vs-1/16-pixel-snap + texture-sampling difference as the chunk scenes, 37-43 dB).
   Visual check: images equal by eye. Note: dump.fi still builds vertex word1 in the OLD layout (u<<16, v<<24), CPU and GL read it the same way, so it compares fine (open item).
+* t3 (r105) lit scenes in `tools/gpu/dump.fi`: `lit_day` / `lit_night` (day 70, warm tint) / `lit_night_fog`; F_LIGHT mesh from `mesh_padded_lit` (sky/block gradient + emitter + roof shadow), `set_light` on both back ends.
+  llvmpipe: PSNR 41.5 / 41.0 / 41.4 dB, coverage mismatch 9 px of 57600, threshold 38 dB (same float-vs-snap difference as the unlit scenes, 42-43 dB; light itself does not widen the gap). Real GPU: still not measured.
 * r95 `tools/gpu/mc/ent_bench.fi` (640x360, median of 21, busy server): 100 boxes instanced 4.0 ms / individual (100 calls) 9.4 ms / CPU raster 4.9 ms;
   1000 boxes instanced (1 glDrawElementsInstanced) 10.3 ms / individual (1000 calls) 54.2 ms / HiZ+frustum culling 8.2 ms (991 drawn) / CPU raster 20.5 ms.
   Persistent mapped buffers / fences NOT built: on llvmpipe the upload is not the bottleneck, nothing measurable to justify them.

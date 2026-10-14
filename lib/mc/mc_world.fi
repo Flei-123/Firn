@@ -11,7 +11,7 @@ import mc.mc_lightpkt
 
 export {
     World, world_new, world_free, world_put, world_count, world_chunk_at,
-    world_find, world_remove, world_apply, world_update_light, ULIGHT_APPLIED, ULIGHT_ORPHAN, ULIGHT_BAD, ULIGHT_IGNORED, APPLY_STORED, APPLY_MERGED, APPLY_DROPPED, APPLY_NOMEM,
+    world_find, world_remove, world_apply, world_update_light, ULIGHT_APPLIED, ULIGHT_ORPHAN, ULIGHT_BAD, ULIGHT_IGNORED, ULIGHT_PENDING, APPLY_STORED, APPLY_MERGED, APPLY_DROPPED, APPLY_NOMEM,
     floor_div, floor_mod, block_to_chunk, block_in_chunk, section_index,
 }
 
@@ -19,10 +19,15 @@ struct World {
     n: usize,
     cap: usize,
     items: u64, // array of u64 = pointers to heap allocated Chunk
+    pend_n: usize, // light of columns that are not stored yet (1.14 - 1.16.5 send update_light BEFORE the chunk)
+    pend: u64, // PEND_CAP entries of 24 octets: x i32, z i32, LightData*, update_hash flag
 }
 
+const PEND_CAP: usize = 64
+const PEND_BYTES: usize = 24
+
 fn world_new() -> World {
-    return World { n: 0, cap: 0, items: 0 }
+    return World { n: 0, cap: 0, items: 0, pend_n: 0, pend: 0 }
 }
 
 fn world_count(w: *mut World) -> usize { return (*w).n }
@@ -39,6 +44,7 @@ fn world_free(w: *mut World) {
     (*w).items = 0
     (*w).n = 0
     (*w).cap = 0
+    pend_clear(w)
 }
 
 fn world_chunk_at(w: *mut World, i: usize) -> *mut mc_chunk.Chunk {
@@ -48,6 +54,15 @@ fn world_chunk_at(w: *mut World, i: usize) -> *mut mc_chunk.Chunk {
 // Stores a decoded chunk (the world takes ownership of `p`). A chunk that is
 // sent again replaces the old one. Returns false when memory is out.
 fn world_put(w: *mut World, p: u64) -> bool {
+    if !world_store(w, p) { return false }
+    if (*w).pend_n > 0 {
+        let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+        pend_apply(w, c)
+    }
+    return true
+}
+
+fn world_store(w: *mut World, p: u64) -> bool {
     let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
     var i: usize = 0
     while i < (*w).n {
@@ -166,7 +181,86 @@ fn section_index(y: i32, min_y: i32) -> i32 { return floor_div(y - min_y, 16) }
 const ULIGHT_APPLIED: i32 = 1
 const ULIGHT_ORPHAN: i32 = 0 // the column is not in the world (packet dropped)
 const ULIGHT_BAD: i32 = 0 - 1 // does not decode / out of memory
+const ULIGHT_PENDING: i32 = 3 // the column is not in the world yet: light kept, applied when the column arrives (world_put)
 const ULIGHT_IGNORED: i32 = 2 // chunk format without a separate light packet (1.8 - 1.12)
+
+// ---- light that arrives before its column ---------------------------------------------------------------------------
+
+fn pend_clear(w: *mut World) {
+    var i: usize = 0
+    while i < (*w).pend_n {
+        mc_lightpkt.lightdata_release(rt.ld64((*w).pend, i * 3 + 1))
+        i = i + 1
+    }
+    if (*w).pend != 0 { rt.heap_free((*w).pend, PEND_CAP * PEND_BYTES) }
+    (*w).pend = 0
+    (*w).pend_n = 0
+}
+
+fn pend_x(w: *mut World, i: usize) -> i32 { return rt.ld32((*w).pend, i * 6) as i32 }
+fn pend_z(w: *mut World, i: usize) -> i32 { return rt.ld32((*w).pend, i * 6 + 1) as i32 }
+
+// Takes ownership of the CONTENT of `ld` on success (it is moved into a heap LightData); false = nothing kept, the caller frees.
+fn pend_add(w: *mut World, ld: *mut mc_lightpkt.LightData, hash_flag: bool) -> bool {
+    if (*w).pend == 0 {
+        (*w).pend = rt.heap_alloc(PEND_CAP * PEND_BYTES)
+        if (*w).pend == 0 { return false }
+        (*w).pend_n = 0
+    }
+    let lx: i32 = (*ld).x
+    let lz: i32 = (*ld).z
+    var i: usize = 0
+    while i < (*w).pend_n {
+        if pend_x(w, i) == lx && pend_z(w, i) == lz {
+            let dst: *mut mc_lightpkt.LightData = rt.ld64((*w).pend, i * 3 + 1) as *mut mc_lightpkt.LightData
+            if !mc_lightpkt.lightdata_merge(dst, ld) { return false }
+            mc_lightpkt.lightdata_free(ld)
+            return true
+        }
+        i = i + 1
+    }
+    let hp: u64 = mc_lightpkt.lightdata_alloc()
+    if hp == 0 { return false }
+    if !mc_lightpkt.lightdata_merge(hp as *mut mc_lightpkt.LightData, ld) {
+        mc_lightpkt.lightdata_release(hp)
+        return false
+    }
+    mc_lightpkt.lightdata_free(ld)
+    if (*w).pend_n == PEND_CAP {
+        // full: the oldest entry is dropped
+        mc_lightpkt.lightdata_release(rt.ld64((*w).pend, 1))
+        rt.mem_copy((*w).pend, (*w).pend + (PEND_BYTES as u64), (PEND_CAP - 1) * PEND_BYTES)
+        (*w).pend_n = PEND_CAP - 1
+    }
+    let k: usize = (*w).pend_n
+    rt.st32((*w).pend, k * 6, lx as u32)
+    rt.st32((*w).pend, k * 6 + 1, lz as u32)
+    rt.st64((*w).pend, k * 3 + 1, hp)
+    var hf: u64 = 0
+    if hash_flag { hf = 1 }
+    rt.st64((*w).pend, k * 3 + 2, hf)
+    (*w).pend_n = k + 1
+    return true
+}
+
+fn pend_apply(w: *mut World, c: *mut mc_chunk.Chunk) {
+    var i: usize = 0
+    while i < (*w).pend_n {
+        if pend_x(w, i) == (*c).x && pend_z(w, i) == (*c).z {
+            let hp: u64 = rt.ld64((*w).pend, i * 3 + 1)
+            mc_chunk.chunk_apply_light_update(c, hp as *mut mc_lightpkt.LightData, rt.ld64((*w).pend, i * 3 + 2) != 0)
+            mc_lightpkt.lightdata_release(hp)
+            var j: usize = i + 1
+            while j < (*w).pend_n {
+                rt.mem_copy((*w).pend + ((j - 1) * PEND_BYTES) as u64, (*w).pend + (j * PEND_BYTES) as u64, PEND_BYTES)
+                j = j + 1
+            }
+            (*w).pend_n = (*w).pend_n - 1
+            return
+        }
+        i = i + 1
+    }
+}
 
 // Decodes the body of an update_light packet (cursor at the first field) and merges it into the column's Chunk.light.
 // 1.14 - 1.16.5 (CF_SECTIONS_114): int masks, trustEdges from 1.16 (protocol 735); the merged state also drives the column's
@@ -189,6 +283,8 @@ fn world_update_light(w: *mut World, chunk_format: i32, protocol: i32, b: *mut b
     }
     let p: u64 = world_find(w, ld.x, ld.z)
     if p == 0 {
+        // the column comes later: keep the light (merged per column) and apply it in world_put
+        if pend_add(w, &ld, chunk_format == mc_version.CF_SECTIONS_114) { return ULIGHT_PENDING }
         mc_lightpkt.lightdata_free(&ld)
         return ULIGHT_ORPHAN
     }

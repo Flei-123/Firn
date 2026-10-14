@@ -521,7 +521,7 @@ function main () {
       walk_fail: walkFail + chunkErrors + lightBad,
       num_sections: numSections,
       partial_chunks: partialChunks,
-      update_light: { applied: lightApplied, orphan: lightOrphans, bad: lightBad },
+      update_light: { applied: lightApplied, pending: lightPending, orphan: lightOrphans, bad: lightBad },
       bulk_packets: bulkPackets,
       bulk_columns: bulkColumns,
       trailing_nonzero_chunks: trailingNonZero,
@@ -557,7 +557,7 @@ function main () {
 
   let hasSky = true
   let partialChunks = 0
-  let lightOrphans = 0; let lightApplied = 0; let lightBad = 0
+  let lightOrphans = 0; let lightPending = 0; let lightApplied = 0; let lightBad = 0
   client.on('login', (p) => {
     m.join_ms = Date.now() - t0
     if (LEGACY_SECTIONS || LEGACY8) {
@@ -603,6 +603,7 @@ function main () {
       if ((LEGACY_SECTIONS || SECTIONS_114) && !p.groundUp) { partialChunks++; armIdle(); return } // section-only update: ignored (documented)
       const c = LEGACY_SECTIONS ? decodeLegacyColumn(p, hasSky) : SECTIONS_114 ? decodeChunk114(p) : decodeChunk(p, numSections)
       chunks.set(`${c.x},${c.z}`, c)
+      if (SECTIONS_114 && process.env.MC_KEEP_LIGHT) attachPending(c)
     } catch (e) {
       chunkErrors++
       console.error(`chunk decode failed at ${p.x},${p.z}: ${e.message}`)
@@ -616,13 +617,34 @@ function main () {
   // array replaces the one of the same section bit, an "empty" bit drops it) and hashes sky arrays then block arrays in
   // ascending bit order. Own parser (restBuffer), independent of the Firn decoder. A packet for an unknown column is
   // counted as orphan (the Firn client drops it too).
+  // Light for a column that is not stored yet (1.14 - 1.16.5 send update_light BEFORE the chunk) is kept per column and
+  // attached when the column arrives (counted as pending, then applied). A chunk sent again starts without light.
+  const pendingLight = new Map()
+  const lightHash = (st) => {
+    const f = new Fnv64()
+    for (const map of [st.sky, st.block]) {
+      for (const bit of [...map.keys()].sort((a, b) => a - b)) for (const b of map.get(bit)) f.byte(b)
+    }
+    return { sky: st.sky.size, block: st.block.size, h: f.hex() }
+  }
+  const attachPending = (c) => {
+    const k = `${c.x},${c.z}`
+    const st = pendingLight.get(k)
+    if (!st) return
+    pendingLight.delete(k)
+    c.lightState = st
+    c.light = lightHash(st)
+    lightApplied++
+  }
   client.on('update_light', (p) => {
     if (!SECTIONS_114 || !process.env.MC_KEEP_LIGHT) return
-    const c = chunks.get(`${p.chunkX},${p.chunkZ}`)
-    if (!c) { lightOrphans++; return }
+    const key = `${p.chunkX},${p.chunkZ}`
+    const c = chunks.get(key)
+    let st
+    if (c) st = c.lightState || (c.lightState = { sky: new Map(), block: new Map() })
+    else { st = pendingLight.get(key); if (!st) { st = { sky: new Map(), block: new Map() }; pendingLight.set(key, st) } }
     try {
       const r = new Reader(p.data)
-      const st = c.lightState || (c.lightState = { sky: new Map(), block: new Map() })
       const u32 = (v) => v >>> 0
       const readSet = (mask, empty, map) => {
         for (let bit = 0; bit < 32; bit++) {
@@ -638,12 +660,7 @@ function main () {
       readSet(p.skyLightMask, p.emptySkyLightMask, st.sky)
       readSet(p.blockLightMask, p.emptyBlockLightMask, st.block)
       if (!r.eof()) throw new Error('update_light: trailing octets')
-      const f = new Fnv64()
-      for (const map of [st.sky, st.block]) {
-        for (const bit of [...map.keys()].sort((a, b) => a - b)) for (const b of map.get(bit)) f.byte(b)
-      }
-      c.light = { sky: st.sky.size, block: st.block.size, h: f.hex() }
-      lightApplied++
+      if (c) { c.light = lightHash(st); lightApplied++ } else lightPending++
     } catch (e) { lightBad++; console.error(`update_light failed at ${p.chunkX},${p.chunkZ}: ${e.message}`) }
     armIdle()
   })
