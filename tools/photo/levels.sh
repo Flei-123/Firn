@@ -2,7 +2,7 @@
 # Run one test file at the 4 opt levels + aarch64/qemu (release-fast). Usage: tools/photo/levels.sh tests/N_x.fi
 set -e
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-FIRNC="${FIRNC:-/root/firn/compiler/target/release/firnc}"
+FIRNC="${FIRNC:-$ROOT/compiler/target/release/firnc}"
 D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT
 T="$1"; rc=0
 for L in no-opt dev-fast release-safe release-fast; do

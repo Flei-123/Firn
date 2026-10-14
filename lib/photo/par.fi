@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/par.fi -- photo.par: one shared thread pool for the photo pipeline (rows / tiles in parallel).
+//
+//     import photo.par
+//
+//     par.init(7)                                // 7 workers + the calling thread = 8 threads (0 = sequential)
+//     ...every photo.* call now uses the pool...
+//     par.shutdown()
+//
+// The program wires the pool workers ONCE (a library cannot define the per-program dispatcher):
+//
+//     fn __thread_work(kind: u64, arg: u64) -> u64 {
+//         if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+//         return 0
+//     }
+//
+// Without `par.init` (or with 0 workers) every loop runs on the caller, in order, so results never depend on
+// the pool: all parallel loops of lib/photo write DISJOINT rows and read only data nobody writes during the
+// loop, so the output is bit-identical for any thread count (no float reduction is ever split across threads).
+// `rows(n, grain, body, ctx)` calls `body(ctx, lo, hi)` for disjoint row ranges of [0, n).
+import std.rt
+import jobs.jobs
+
+export {
+    init, shutdown, threads, rows, rows_min,
+}
+
+static mut par_blk: u64 = 0
+
+// Create the pool (replaces an existing one). Returns the number of threads that now work (workers + caller).
+fn init(workers: u64) -> u64 {
+    shutdown()
+    if workers == 0 { return 1 }
+    var j: jobs.Jobs = jobs.create(workers)
+    par_blk = j.blk
+    return threads()
+}
+
+fn shutdown() {
+    if par_blk != 0 {
+        var j: jobs.Jobs = jobs.Jobs { blk: par_blk }
+        par_blk = 0
+        jobs.destroy(&j)
+    }
+}
+
+fn threads() -> u64 {
+    if par_blk == 0 { return 1 }
+    var j: jobs.Jobs = jobs.Jobs { blk: par_blk }
+    return jobs.worker_count(&j) + 1
+}
+
+// body(ctx, lo, hi) over disjoint chunks of `grain` rows of [0, n).
+#[allow_escape]
+fn rows(n: i32, grain: i32, body: fn(u64, u64, u64), ctx: u64) {
+    if n <= 0 { return }
+    var g: i32 = grain
+    if g < 1 { g = 1 }
+    if par_blk == 0 {
+        body(ctx, 0 as u64, n as u64)
+        return
+    }
+    var j: jobs.Jobs = jobs.Jobs { blk: par_blk }
+    jobs.parallel_for(&j, 0 as u64, n as u64, g as u64, body, ctx)
+}
+
+// Same as `rows`, but small jobs (fewer than `min_items` rows) stay on the caller (the queue costs more than they do).
+#[allow_escape]
+fn rows_min(n: i32, grain: i32, min_items: i32, body: fn(u64, u64, u64), ctx: u64) {
+    if n < min_items {
+        if n > 0 { body(ctx, 0 as u64, n as u64) }
+        return
+    }
+    rows(n, grain, body, ctx)
+}
