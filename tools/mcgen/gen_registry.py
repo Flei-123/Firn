@@ -15,6 +15,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NO_HARDNESS = 0xFFFFFFF
+UNBREAKABLE = frozenset(["bedrock", "barrier", "light", "command_block", "chain_command_block", "repeating_command_block", "structure_block", "jigsaw",
+                         "end_portal", "end_portal_frame", "end_gateway", "nether_portal", "moving_piston"])
 
 
 def num(v):
@@ -159,6 +161,8 @@ def build(blocks, items, entities, biomes):
         flags |= (b.get("filterLight", 0) & 15) << 4
         flags |= (b.get("emitLight", 0) & 15) << 8
         h = b.get("hardness")
+        if h == 0 and b["name"] in UNBREAKABLE:
+            h = None  # minecraft-data 1.16.x lists these as hardness 0 (instant); the game says -1 (unbreakable)
         hm = NO_HARDNESS if (h is None or h < 0) else int(math.floor(h * 1000 + 0.5))
         assert hm <= NO_HARDNESS
         for v in (pool_off + pool.idx[b["name"]], b["minStateId"], b["maxStateId"], b["defaultState"],
