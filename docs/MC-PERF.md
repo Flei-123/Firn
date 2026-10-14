@@ -85,7 +85,7 @@ run.sh now leaves the probe off (`PERF_COMP=1` enables it). The TSVs of that run
 Not a clean A/B (the load of the server changes between runs); the direction (about 2x less on the render thread) held in every pair. Frame budget test: >= 90 % of the frames inside `snap_budget_us` + 3 ms, no frame > 250 ms (CPU raster draw included).
 
 ## 5. Known problems / open
-* **perf_components segfault (14.10., reproducible):** `BENCH_COMP=1 bench world.mcw 8 20 5` (with `BENCH_T0_NS` set) crashes after `world_chunks` (rc 139); the same command without T0 passed twice, so it is timing/heap dependent. The r4 note below ("does NOT reproduce") was too optimistic. Open: find the heap corruption (backend_mesh_upload / perf_components).
+* **perf_components segfault: FIXED (14.10., u1).** Cause: `mc_mesh.MAX_QUADS` = 13056 assumed one visible face per neighbour pair; sections of non-opaque blocks (leaves, glass, water) show up to 6 faces per block = 24576 quads -> vertex / index buffers overflowed (heap corruption, crash far from the cause: after `world_chunks`, timing dependent). Fix: MAX_QUADS 24576; regression test tests/2950 (checkerboard of two non-opaque blocks, exit 2 on the old bound). Before: 12 of 12 runs `BENCH_COMP=1 BENCH_COMPUPLOAD=1` (R 8 / 16, 100 frames) rc 139; after: 10 of 10 completed runs (R 8 / 16, 20 frames, with and without upload probe) rc 0. `run.sh` runs the probe by default now (`PERF_COMP=0` switches it off). The old hypothesis (backend_mesh_upload heap cache) was wrong.
 * `BENCH_COMP=1 BENCH_COMPUPLOAD=1` (mesh + upload components per section): the reported crash in `mc_raster.backend_mesh_upload` does
   **NOT reproduce** on main (13.10.): 915 upload/free cycles at radius 8 and 16, with and without free (`BENCH_NOFREE=1`), with both firnc builds
   (8 Oct and w-r5), no crash. Regression test tests/2862_mc_upload_cycles.fi (6000 cycles, random sizes, 300 live handles, slot table growth, content
@@ -100,3 +100,16 @@ Not a clean A/B (the load of the server changes between runs); the direction (ab
 * No GPU exists on this server; nothing here is a GPU number. The CPU renderer is the reference, not the end goal on desktop.
 * No Vanilla number exists yet. "Better than Vanilla" is NOT shown by this document.
 * The server is shared (load 10-30 during the runs): treat times as noisy; the harness stores the load per run.
+
+## Messserie 14.10. (u1, PERF_COMP an, 3 Laeufe, Median [min..max], 640x360, Fixture-Welt, Server-Load ~14-16)
+Hinweis: llvmpipe = Software-GL, KEINE echte GPU. Vanilla NICHT gemessen.
+
+| Backend | Radius | Frame p50 ms | p99 ms |
+|---|---|---|---|
+| CPU-Raster | 8 | 336 [319..339] | 531 [378..539] |
+| CPU-Raster | 16 | 1040 [989..1070] | 1205 [1090..1208] |
+| GL llvmpipe | 8 | 86 [82..87] | 117 [105..127] |
+| GL llvmpipe | 16 | 347 [341..367] | 540 [407..561] |
+
+Mesher (915 Sektionen, p50): naiv+AO 823 us, naiv ohne AO 780 us, greedy+AO 807 us (CPU-Lauf). Upload/Free p50 130 us/Sektion.
+Radius 32: Lauf gequeued (PERF_FRAMES=30), Ergebnis in reports/perf_*_r32.tsv.

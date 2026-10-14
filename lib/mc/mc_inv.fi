@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_inv.fi -- the player inventory (window 0) from the server packets, for demos/mcplay.
+//
+//   inv_new()/inv_free(i)                    46 slots (item id, count): 0 craft result, 1-4 craft grid, 5-8 armour, 9-35 main, 36-44 hotbar, 45 off hand
+//   inv_slot_format(protocol)                1 = slot layout "present bool, varint item, i8 count, NBT" (1.13.2 .. 1.20.4), else 0 (not decoded)
+//   inv_on_window_items(i, protocol, body)   Window Items (container_set_content) of window 0: stateId (1.17.1+), slot array, carried item
+//   inv_on_set_slot(i, protocol, body)       Set Slot of window 0
+//   inv_hotbar_item(i, k) / inv_hotbar_count(i, k)    hotbar slot k = 0..8 (item -1 = empty)
+//   inv_held_item(i, k)                      item id in hand when hotbar slot k is selected
+//   inv_set(i, slot, item, count)            local update (the server does not echo Set Creative Slot)
+//   inv_send_creative(cl, slot, item, count) Set Creative Slot (creative mode only): puts `count` x `item` into inventory slot `slot`
+//
+// Enchantments (efficiency) in the item NBT are skipped, not evaluated.
+import std.rt
+import std.bytes
+import mc.mc_client
+import mc.mc_sem
+import mc.mc_version
+import mc.mc_nbt
+
+export {
+    Inv, inv_new, inv_free, inv_slot_format, inv_on_window_items, inv_on_set_slot, inv_hotbar_item, inv_hotbar_count, inv_held_item,
+    inv_item, inv_count, inv_set, inv_send_creative, inv_clear, INV_SLOTS, INV_HOTBAR0, INV_MAIN0,
+}
+
+const INV_SLOTS: usize = 46
+const INV_HOTBAR0: i32 = 36
+const INV_MAIN0: i32 = 9
+
+struct Inv {
+    ids: u64, // u32 [46], item id + 1 (0 = empty)
+    counts: u64, // i32 [46]
+    state_id: i32,
+    n_updates: u32,
+    bad: u32,
+}
+
+fn inv_new() -> Inv {
+    var v: Inv = Inv { ids: rt.heap_alloc(INV_SLOTS * 4), counts: rt.heap_alloc(INV_SLOTS * 4), state_id: 0, n_updates: 0 as u32, bad: 0 as u32 }
+    inv_clear(&v)
+    return v
+}
+
+fn inv_free(v: *mut Inv) {
+    rt.heap_free((*v).ids, INV_SLOTS * 4)
+    rt.heap_free((*v).counts, INV_SLOTS * 4)
+    (*v).ids = 0
+    (*v).counts = 0
+}
+
+fn inv_clear(v: *mut Inv) {
+    var i: usize = 0
+    while i < INV_SLOTS {
+        rt.st32((*v).ids, i, 0 as u32)
+        rt.st32((*v).counts, i, 0 as u32)
+        i = i + 1
+    }
+}
+
+fn inv_slot_format(protocol: i32) -> i32 {
+    if protocol >= 404 && protocol <= 765 { return 1 }
+    return 0
+}
+
+fn inv_item(v: *mut Inv, slot: i32) -> i32 {
+    if slot < 0 || slot as usize >= INV_SLOTS { return 0 - 1 }
+    return (rt.ld32((*v).ids, slot as usize) as i32) - 1 // stored +1: 0 = empty
+}
+
+fn inv_count(v: *mut Inv, slot: i32) -> i32 {
+    if slot < 0 || slot as usize >= INV_SLOTS { return 0 }
+    return rt.ld32((*v).counts, slot as usize) as i32
+}
+
+fn inv_hotbar_item(v: *mut Inv, k: i32) -> i32 { return inv_item(v, INV_HOTBAR0 + k) }
+fn inv_hotbar_count(v: *mut Inv, k: i32) -> i32 { return inv_count(v, INV_HOTBAR0 + k) }
+fn inv_held_item(v: *mut Inv, k: i32) -> i32 { return inv_item(v, INV_HOTBAR0 + k) }
+
+fn inv_set(v: *mut Inv, slot: i32, item: i32, count: i32) { put_slot(v, slot, item, count) }
+
+fn put_slot(v: *mut Inv, slot: i32, item: i32, count: i32) {
+    if slot < 0 || slot as usize >= INV_SLOTS { return }
+    if item < 0 || count <= 0 {
+        rt.st32((*v).ids, slot as usize, 0 as u32)
+        rt.st32((*v).counts, slot as usize, 0 as u32)
+    } else {
+        rt.st32((*v).ids, slot as usize, (item + 1) as u32)
+        rt.st32((*v).counts, slot as usize, count as u32)
+    }
+    (*v).n_updates = (*v).n_updates + 1 as u32
+}
+
+// Reads one slot value (present bool, varint item, i8 count, optional NBT). item = -1 for an empty slot. false = malformed.
+fn read_slot(b: *mut bytes.Bytes, protocol: i32, item: *mut i32, count: *mut i32) -> bool {
+    *item = 0 - 1
+    *count = 0
+    let present: bool = bytes.get_bool(b) catch false
+    if !present { return true }
+    let it: i32 = bytes.get_varint(b) catch (0 - 1)
+    if it < 0 { return false }
+    let n: i8 = bytes.get_i8(b) catch (0 as i8)
+    let tag: u8 = bytes.get_u8(b) catch (255 as u8)
+    if tag == 255 as u8 { return false }
+    if tag != 0 as u8 {
+        // a compound follows (named root up to 1.20.1; nameless since 1.20.2): step back and parse it
+        bytes.bytes_set_pos(b, bytes.bytes_pos(b) - 1)
+        var d: mc_nbt.Doc = mc_nbt.doc_new()
+        let ok: bool = mc_nbt.doc_parse(&d, b, protocol >= 764, false) catch false
+        mc_nbt.doc_free(&d)
+        if !ok { return false }
+    }
+    *item = it
+    *count = n as i32
+    return true
+}
+
+fn inv_on_window_items(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool {
+    if inv_slot_format(protocol) == 0 { return false }
+    let wid: u8 = bytes.get_u8(b) catch (255 as u8)
+    if wid != 0 as u8 { return false }
+    if protocol >= 756 { (*v).state_id = bytes.get_varint(b) catch 0 }
+    var n: i32 = 0
+    if protocol >= 756 {
+        n = bytes.get_varint(b) catch (0 - 1)
+    } else {
+        let n16: i16 = bytes.get_i16(b) catch ((0 - 1) as i16)
+        n = n16 as i32
+    }
+    if n < 0 || n > 128 { (*v).bad = (*v).bad + 1 as u32; return false }
+    var i: i32 = 0
+    while i < n {
+        var item: i32 = 0 - 1
+        var cnt: i32 = 0
+        if !read_slot(b, protocol, &item, &cnt) { (*v).bad = (*v).bad + 1 as u32; return false }
+        put_slot(v, i, item, cnt)
+        i = i + 1
+    }
+    return true
+}
+
+fn inv_on_set_slot(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool {
+    if inv_slot_format(protocol) == 0 { return false }
+    let wid: i8 = bytes.get_i8(b) catch ((0 - 2) as i8)
+    if wid != 0 as i8 { return false }
+    if protocol >= 756 { (*v).state_id = bytes.get_varint(b) catch 0 }
+    let slot16: i16 = bytes.get_i16(b) catch ((0 - 1) as i16)
+    let slot: i32 = slot16 as i32
+    var item: i32 = 0 - 1
+    var cnt: i32 = 0
+    if !read_slot(b, protocol, &item, &cnt) { (*v).bad = (*v).bad + 1 as u32; return false }
+    put_slot(v, slot, item, cnt)
+    return true
+}
+
+// Set Creative Slot: i16 slot + slot value (no NBT)
+fn inv_send_creative(cl: *mut mc_client.Client, slot: i32, item: i32, count: i32) -> bool {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_i16(&b, slot as i16)
+    if item < 0 || count <= 0 {
+        bytes.put_bool(&b, false)
+    } else {
+        bytes.put_bool(&b, true)
+        bytes.put_varint(&b, item)
+        bytes.put_i8(&b, count as i8)
+        bytes.put_u8(&b, 0 as u8)
+    }
+    let ok: bool = mc_client.client_send(cl, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_SET_CREATIVE_SLOT, &b)
+    bytes.bytes_free(&b)
+    return ok
+}

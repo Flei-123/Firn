@@ -62,6 +62,15 @@ that frame copy.
    consistent, but: polling loops on shared memory can be hoisted, and stale
    register values can be written back over concurrent writes. Shared memory
    that is polled or written concurrently needs `read_once`/atomics (below).
+
+   **Wait loops (r489, fixed):** a loop whose exit test is a pure function of
+   loop-invariant values and exact loads of a cell that nothing in the loop
+   writes (`while *flag == 0 {}`, also with a bound `&& n < LIMIT`) is a wait
+   for memory that another thread / a signal / hardware changes: without a
+   concurrent writer it never loops or never ends. `promote.rs` (`polls_cell`)
+   now leaves such a cell in memory, so the load stays in the loop (tests/2944).
+   Not covered: loops that also write the cell, and any real synchronisation
+   need (ordering, torn values): use atomics / `read_once` for those.
 2. **References and raw pointers are read at every source access.** A `&T`/
    `inout T` parameter or `*T` is not a snapshot: `p.len` twice in the source
    is two reads (by design, same as C without the compiler-invented ones).

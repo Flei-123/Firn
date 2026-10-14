@@ -1078,6 +1078,72 @@ impl<'a> Ctx<'a> {
             _ => None,
         }
     }
+    /// Is `k` POLLED by loop `l`? True when an exit test of the loop is a pure function of loop-invariant
+    /// values and loads, one of them an exact load of `k`, and nothing in the loop writes `k` (neither an
+    /// exact store nor a store/call/atomic that may alias it). Without a concurrent writer such a loop
+    /// either never loops or never ends, so a loop like that exists to wait for memory that ANOTHER thread,
+    /// a signal handler or the hardware changes (`while *flag == 0 {}`). Keeping the load in a register would
+    /// turn the wait into an endless loop, so the cell is left in memory (the load stays in the loop).
+    /// (`read_once` and atomics are `Wild` effects and are never promoted anyway.)
+    fn polls_cell(&self, l: &LoopInfo, blocks: &[usize], exiting: &[usize], k: &Cell) -> bool {
+        // any write to the cell in the loop: the value changes by the program itself, nothing to poll
+        for &b in blocks {
+            for ii in 0..self.f.blocks[b].insts.len() {
+                if let Some(true) = self.is_exact(b, ii, k) {
+                    return false;
+                }
+                if self.clobbers(b, ii, k).1 {
+                    return false;
+                }
+            }
+        }
+        'exit: for &b in exiting {
+            let c = match term_use(&self.f.blocks[b].term) {
+                Some(c) => c,
+                None => continue,
+            };
+            let mut seen: HashSet<Val> = HashSet::new();
+            let mut stack: Vec<Val> = vec![c];
+            let mut hit = false;
+            while let Some(v) = stack.pop() {
+                if !seen.insert(v) {
+                    continue;
+                }
+                match self.def_block(v) {
+                    Some(db) if l.has(db) => {}
+                    _ => continue, // defined outside the loop (or a parameter): invariant
+                }
+                let inst = match self.op_of(v) {
+                    Some(i) => i,
+                    None => continue 'exit,
+                };
+                match &inst.op {
+                    Op::Phi { .. } => continue 'exit, // changes per iteration: a counted loop, not a wait
+                    Op::Load { addr } => {
+                        let (r, o) = self.decompose(*addr);
+                        if o.is_none() || self.def_block(r).is_some_and(|db| l.has(db)) {
+                            continue 'exit; // the address itself varies
+                        }
+                        if r == k.root && o == Some(k.off) && inst.ty == k.ty {
+                            hit = true;
+                        }
+                    }
+                    op => {
+                        if !matches!(self.eff(inst), Eff::Pure) {
+                            continue 'exit;
+                        }
+                        let mut us = Vec::new();
+                        op.uses(&mut us);
+                        stack.extend(us);
+                    }
+                }
+            }
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
     /// Does the instruction touch `k` in any way other than an exact access?
     /// Yields (reads, writes).
     fn clobbers(&self, b: usize, ii: usize, k: &Cell) -> (bool, bool) {
@@ -1313,6 +1379,25 @@ fn analyse(
     k: &Cell,
 ) -> Option<Plan> {
     let n = f.blocks.len();
+    // a wait on shared memory (`while *flag == 0 {}`) keeps its load in the loop
+    if cx.polls_cell(l, blocks, exiting, k) {
+        return None;
+    }
+    // ... also when a loop NESTED in this one waits on it (the outer loop must not hoist the load either)
+    for m in loops {
+        if m.head == l.head || m.size >= l.size || !l.has(m.head) {
+            continue;
+        }
+        let mb: Vec<usize> = (0..f.blocks.len()).filter(|b| m.has(*b)).collect();
+        let mx: Vec<usize> = mb
+            .iter()
+            .copied()
+            .filter(|&b| f.blocks[b].term.successors().iter().any(|s| !m.has(*s as usize)))
+            .collect();
+        if cx.polls_cell(m, &mb, &mx, k) {
+            return None;
+        }
+    }
     // regions: direct children with any clobber of k
     let mut live = vec![false; n];
     for &b in blocks {
@@ -1440,7 +1525,15 @@ fn analyse(
         return None;
     }
     // Is it worth it? At least one exact access inside a loop block that
-    // runs every iteration -- given by guard_access. Nothing else to check.
+    // runs every iteration -- given by guard_access.
+    // Every region (a child loop that may clobber the cell) forces a write
+    // back before it and a reload after it, so a cell with no more exact
+    // accesses than regions gains nothing but the rotation and its copies
+    // (l3_huffman count1 loop: two cells, two regions, +0.6 M instructions).
+    // Only measured for two or more regions; one region stays as before.
+    if regions.len() >= 2 && exact.len() <= regions.len() {
+        return None;
+    }
     Some(Plan { live, regions, reads, exact })
 }
 

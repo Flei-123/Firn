@@ -25,6 +25,8 @@ if not re.search(r"lost-frames=[1-9]", out): fail.append("Firn side never saw CT
 if "restores=1" not in out: fail.append("Firn side did not see exactly one CTX_RESTORED")
 if "same=1" not in out: fail.append("frame after restore differs from the frame before the loss")
 if not re.search(r"pad seen=[1-9]\d* connected=1 ", out): fail.append("the faked gamepad (A, left stick right, trigger 0.5) never reached the Firn side as one connected pad")
+m = re.search(r"page: rumble (\S*)", out)
+if not m or m.group(1) != "dual-rumble:0.8:0.25:300,reset": fail.append("the rumble request (strong 0.8, weak 0.25, 300 ms, then a stop) did not reach the faked vibrationActuator as playEffect + reset: %r" % (m.group(1) if m else None))
 if "context loss ok" not in out: fail.append("no 'context loss ok' line")
 print("RESULT webgl2-context-loss: " + ("ok" if not fail else "FAIL " + "; ".join(fail)))
 sys.exit(1 if fail else 0)
