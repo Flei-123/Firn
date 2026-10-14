@@ -119,7 +119,22 @@ def main():
     floor = max(3.0, float(np.percentile(rms, 20)) * 3.0)
     lat = []
     cent = {}
+    # Probe run: the 12 probe events are one CONTIGUOUS run in the log (mcplay holds the cave-mood clock back while the probe plays).
+    # Every other event ("mood clock" ambient.cave: random angle, 4..16 blocks away, so it may legitimately be near-silent) is only
+    # counted, never checked for onset / peak -- before this, those random events made the probe flaky (peak 9 / 68).
+    probe_at = -1
+    if probe:
+        names_all = [e[1] for e in ev]
+        for j in range(0, len(names_all) - len(PROBE) + 1):
+            if names_all[j:j + len(PROBE)] == PROBE:
+                probe_at = j
+                break
+    extras = 0
     for i, (fr, name, cat, v, p) in enumerate(ev):
+        if probe and probe_at >= 0 and not (probe_at <= i < probe_at + len(PROBE)):
+            extras += 1
+            print(f"  audio ev {name:26s} frame={fr:8d} (extra, mood clock: not checked)")
+            continue
         b0 = fr // blk
         end = min(nb, b0 + int(0.4 / 0.005))
         if end <= b0:
@@ -158,9 +173,9 @@ def main():
             bad.append(f"median onset latency {med:.0f} ms")
     if probe:
         names = [e[1] for e in ev]
-        it = iter(names)
-        if not all(nm in it for nm in PROBE):  # PROBE must be a subsequence (extra ambient.cave from the mood clock is fine)
-            bad.append("probe list incomplete / out of order: " + ",".join(names))
+        if probe_at < 0:  # PROBE must be one contiguous run (extra ambient.cave from the mood clock only outside of it)
+            bad.append("probe list incomplete / out of order / interrupted: " + ",".join(names))
+        print(f"  audio probe run at event {probe_at}, extra events={extras}")
         if stats is not None and int(stats.get("ambient", "0")) < 1 and "--ambient" in sys.argv:
             bad.append("mood-clock ambient.cave never played")
         g = np.mean(cent.get("block.glass.break", [0]))
