@@ -51,6 +51,7 @@ if [ -n "$WINE" ] && "$FIRNC" --target=x86_64-windows -o "$D/p.exe" tests/3100_m
 fi
 if [ -e lib/mc/vk_mc.fi ]; then
     bash tools/gpu/vk/vkmc_run.sh "$FIRNC" || fail=1
+    bash tools/gpu/vk/vkscene_run.sh "$FIRNC" || fail=1   # sky / tint / HUD / entities vs mc_sky + mc_hud + mc_raster (r180)
 else
     echo "   NOTE: lib/mc/vk_mc.fi not on this branch: voxel scene PSNR vs mc_raster not run (vkprobe covers flat + gradient triangles only)"
 fi
