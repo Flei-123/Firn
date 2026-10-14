@@ -490,13 +490,234 @@ def effects():
     return o
 
 
+# ------------------------------------------------------------------------------------------------ coverage gaps (tier 1, z1)
+# Items, containers, note block instruments, portals, firework, toasts, ambience. Names that only differ by a variant of the same
+# action are ALIASES of one sound (an alias costs an engine event, no sample: limit 512 events / 512 samples).
+def tone(sid, seed, dur, f, wave="sine", harm=(), lp=None, att=2, dec=200, vib=0.0, nz=None, sweep=None, var=1, peak=-5,
+         aliases=None, bus="sfx", q=0.7, fo=None, gmain=1.0):
+    """pitched hit: main oscillator (optional low pass, vibrato, pitch sweep) + sine partials [(mult, gain, decay_ms)] + noise click
+    nz = (color, kind, cut, q, decay_ms, gain)"""
+    nodes = []
+    fq = SW(sweep[0], sweep[1], sweep[2], -1) if sweep else R(f * 0.99, f * 1.01)
+    m0 = osc("m0", wave, fq, width=0.4)
+    if vib:
+        nodes.append(osc("vb", "sine", R(5, 7), scale=vib))
+        m0["pm"] = "vb"
+        m0["pm_depth"] = 1.0
+    nodes.append(m0)
+    src = "m0"
+    if lp:
+        nodes.append(filt("mf", "lp", "m0", lp, q))
+        src = "mf"
+    nodes += [adsr("me", att, dec, r=8), gain("mg", src, "me")]
+    mixin = [("mg", gmain)]
+    for i, (mult, g, d) in enumerate(harm):
+        nodes += [osc("h%d" % i, "sine", R(f * mult * 0.995, f * mult * 1.005)), adsr("he%d" % i, att, d, r=6), gain("hg%d" % i, "h%d" % i, "he%d" % i)]
+        mixin.append(("hg%d" % i, g))
+    if nz:
+        color, kind, cut, qq, d, g = nz
+        nodes += [noise("nc", color), filt("ncf", kind, "nc", R(cut * 0.9, cut * 1.1), qq), adsr("nce", 0.4, d, r=2), gain("ncg", "ncf", "nce")]
+        mixin.append(("ncg", g))
+    nodes.append(mix("o", mixin))
+    return sound(sid, dur, seed, nodes, "o", variants=var, peak=peak, bus=bus, fo=fo or max(8, dur // 10), aliases=aliases)
+
+
+def loopify(s, fade=150):
+    s["event"]["loop"] = True
+    s["fade_in_ms"] = fade
+    s["fade_out_ms"] = fade
+    return s
+
+
+def al(prefix, names):
+    return [prefix + n for n in names]
+
+
+def coverage_sounds():
+    o = []
+    # --- items
+    o.append(perc("item.armor.equip_generic", 9000, 240, nz=[("pink", "bp", 1800, 1.0, 50, 0.9, 0), ("white", "bp", 3000, 2, 10, 0.4, 40)],
+                  body=(200, 120, 60, 0.6, 0), var=2, peak=-7, aliases=al("item.armor.equip_", ["leather", "elytra", "turtle"])))
+    o.append(perc("item.armor.equip_iron", 9001, 380, nz=[("white", "hp", 4000, 1.0, 12, 0.6, 0), ("pink", "bp", 2200, 1.2, 40, 0.5, 30)],
+                  parts=[(1200, 0.5, 200, 0), (1900, 0.3, 150, 0), (2800, 0.2, 100, 10)], var=1, peak=-7,
+                  aliases=al("item.armor.equip_", ["chain", "gold", "diamond", "netherite"])))
+    o.append(crackle("item.bucket.fill", 9010, 520, 4, 400, "brown", 70, var=2, peak=-7, kind="lp", q=0.7, pitch=300,
+                     aliases=al("item.bucket.fill_", ["axolotl", "fish", "lava", "powder_snow", "tadpole"])))
+    o.append(whoosh("item.bucket.empty", 9011, 520, 1500, 500, "pink", "bp", 0.8, att=40, var=2, peak=-7,
+                    aliases=al("item.bucket.empty_", ["axolotl", "fish", "lava", "powder_snow", "tadpole"])))
+    o.append(crackle("item.bottle.fill", 9012, 380, 3, 500, "brown", 60, var=2, peak=-8, kind="lp", q=0.7, pitch=520,
+                     aliases=["item.bottle.fill_dragonbreath"]))
+    o.append(whoosh("item.bottle.empty", 9013, 320, 900, 400, "pink", "bp", 0.8, att=30, var=1, peak=-8))
+    o.append(perc("item.flintandsteel.use", 9020, 260, nz=[("white", "hp", 4500, 1.0, 10, 0.9, 0), ("white", "hp", 5500, 1.2, 8, 0.7, 45),
+                                                            ("white", "bp", 2500, 1.0, 60, 0.4, 80)], parts=[(2600, 0.2, 40, 0)], var=2, peak=-7))
+    o.append(whoosh("item.firecharge.use", 9021, 450, 600, 2200, "pink", "bp", 0.8, att=40, var=1, peak=-7))
+    o.append(perc("item.shield.block", 9030, 280, nz=[("white", "bp", 1600, 1.5, 30, 0.9, 0)], body=(280, 140, 80, 1.0, 0),
+                  parts=[(900, 0.4, 200, 0), (1500, 0.3, 150, 0)], var=2, peak=-5))
+    o.append(perc("item.shield.break", 9031, 450, nz=[("white", "bp", 2000, 1.2, 50, 0.9, 0), ("white", "bp", 1500, 1.2, 60, 0.7, 70),
+                                                       ("white", "hp", 3000, 1.0, 40, 0.5, 140)], body=(200, 70, 200, 1.0, 0), var=1, peak=-4))
+    o.append(whoosh("item.trident.throw", 9040, 350, 600, 2800, "white", "bp", 1.0, att=20, var=1, peak=-6, aliases=["item.trident.return"]))
+    o.append(perc("item.trident.hit", 9041, 240, nz=[("white", "bp", 2200, 1.5, 20, 0.8, 0)], body=(300, 120, 80, 1.0, 0),
+                  parts=[(1100, 0.3, 120, 0)], var=1, peak=-5, aliases=["item.trident.hit_ground"]))
+    o.append(whoosh("item.trident.riptide_1", 9042, 700, 400, 4000, "white", "bp", 0.9, att=120, var=1, peak=-6, sub=(120, 300),
+                    aliases=["item.trident.riptide_2", "item.trident.riptide_3"]))
+    # --- blocks
+    o.append(perc("block.anvil.use", 9100, 600, nz=[("white", "hp", 3000, 0.7, 10, 0.6, 0)],
+                  parts=[(520, 0.8, 350, 0), (1120, 0.6, 260, 0), (1650, 0.4, 200, 0), (2400, 0.25, 120, 0)], var=1, peak=-6))
+    o.append(perc("block.anvil.land", 9101, 600, nz=[("white", "bp", 2000, 1.0, 25, 0.8, 0)], body=(130, 60, 120, 1.1, 0),
+                  parts=[(480, 0.6, 300, 0), (1030, 0.5, 240, 0), (1530, 0.3, 180, 0)], var=2, peak=-4))
+    o.append(perc("block.anvil.destroy", 9102, 700, nz=[("white", "bp", 2200, 1.0, 40, 0.8, 0), ("white", "hp", 3500, 0.8, 30, 0.6, 90)],
+                  body=(160, 60, 160, 1.0, 0), parts=[(420, 0.5, 400, 0), (960, 0.4, 300, 90), (1480, 0.3, 200, 90)], var=1, peak=-4))
+    o.append(seq("block.beacon.activate", 9110, [("D4", 0, 300, 0.7), ("A4", 130, 300, 0.7), ("D5", 260, 320, 0.8), ("F#5", 390, 340, 0.8),
+                                                 ("A5", 520, 700, 0.9)], 1500, rev=0.35, bus="sfx", peak=-6, aliases=["block.beacon.power_select"]))
+    o.append(seq("block.beacon.deactivate", 9111, [("A5", 0, 260, 0.8), ("F#5", 140, 280, 0.8), ("D5", 280, 320, 0.8), ("A4", 420, 380, 0.8),
+                                                   ("D4", 560, 700, 0.9)], 1500, rev=0.35, bus="sfx", peak=-6))
+    o.append(seq("block.beacon.ambient", 9112, [("D3", 0, 2100, 0.8), ("A3", 0, 2100, 0.5)], 2600, rev=0.3, bus="sfx", peak=-12, attack=350,
+                 tail=300, fo=300))
+    o.append(perc("block.bell.use", 9120, 1600, nz=[("white", "hp", 3500, 0.8, 12, 0.5, 0)],
+                  parts=[(880, 1.0, 1200, 0), (1480, 0.5, 900, 0), (2210, 0.3, 600, 0), (3400, 0.15, 300, 0)], var=1, peak=-5,
+                  aliases=["block.bell.resonate"]))
+    o.append(crackle("block.brewing_stand.brew", 9130, 900, 9, 500, "brown", 50, var=1, peak=-8, kind="lp", q=0.7, pitch=350))
+    o.append(crackle("block.bubble_column.bubble_pop", 9131, 350, 2, 600, "pink", 40, var=2, peak=-8, kind="lp", q=0.7, pitch=700,
+                     aliases=al("block.bubble_column.", ["upwards_ambient", "upwards_inside", "whirlpool_ambient", "whirlpool_inside"])))
+    o.append(perc("block.composter.fill", 9140, 220, nz=[("pink", "bp", 1200, 0.8, 40, 0.9, 0), ("pink", "bp", 900, 0.8, 40, 0.6, 60)],
+                  var=2, peak=-8, aliases=[]))
+    o.append(perc("block.composter.fill_success", 9141, 320, nz=[("pink", "bp", 1300, 0.8, 40, 0.5, 0)], body=(300, 700, 120, 0.8, 0),
+                  parts=[(900, 0.4, 100, 40)], var=1, peak=-7, aliases=["block.composter.ready"]))
+    o.append(whoosh("block.composter.empty", 9142, 400, 1500, 600, "pink", "lp", 0.7, att=30, var=1, peak=-8))
+    o.append(perc("block.dispenser.dispense", 9150, 220, nz=[("white", "bp", 2000, 1.5, 15, 0.9, 0), ("white", "bp", 1500, 1.5, 25, 0.7, 60)],
+                  body=(160, 90, 50, 0.7, 0), var=1, peak=-7))
+    o.append(whoosh("block.dispenser.launch", 9151, 300, 700, 2500, "white", "bp", 1.0, att=15, var=1, peak=-7))
+    o.append(perc("block.dispenser.fail", 9152, 160, nz=[("white", "bp", 2400, 1.6, 12, 0.8, 0), ("white", "bp", 2000, 1.6, 12, 0.6, 55)],
+                  var=1, peak=-9))
+    o.append(seq("block.enchantment_table.use", 9160, [("E5", 0, 400, 0.5), ("A5", 100, 400, 0.5), ("B5", 200, 400, 0.5), ("E6", 350, 600, 0.6),
+                                                       ("D6", 500, 700, 0.5)], 1500, rev=0.5, bus="sfx", peak=-8, room=0.6))
+    o.append(perc("block.piston.extend", 9170, 350, nz=[("brown", "lp", 800, 0.7, 150, 1.0, 0)], body=(100, 55, 180, 1.2, 0), var=1, peak=-5))
+    o.append(perc("block.piston.contract", 9171, 300, nz=[("pink", "bp", 600, 0.8, 100, 0.8, 0)], body=(70, 130, 150, 1.2, 0), var=1, peak=-5))
+    o.append(whoosh("block.portal.ambient", 9180, 2500, 300, 700, "brown", "lp", 0.8, att=800, var=1, peak=-10, sub=(70, 110)))
+    o.append(whoosh("block.portal.trigger", 9181, 1800, 300, 2500, "pink", "bp", 0.8, att=600, var=1, peak=-8, sub=(60, 200)))
+    o.append(whoosh("block.portal.travel", 9182, 1500, 2500, 200, "pink", "bp", 0.8, att=100, var=1, peak=-6, sub=(300, 70)))
+    o.append(perc("block.tripwire.click_on", 9190, 90, nz=[("white", "bp", 3500, 2, 8, 0.8, 0)], body=(1200, 700, 20, 0.5, 0), var=1, peak=-8,
+                  aliases=["block.tripwire.attach"]))
+    o.append(perc("block.tripwire.click_off", 9191, 90, nz=[("white", "bp", 2800, 2, 8, 0.8, 0)], body=(900, 500, 20, 0.5, 0), var=1, peak=-8,
+                  aliases=["block.tripwire.detach"]))
+    # --- note block instruments (base pitch around F#4; the game transposes by the pitch field)
+    nb = "block.note_block."
+    o.append(tone(nb + "harp", 9200, 600, 370, harm=[(2, 0.3, 300), (3, 0.1, 200)], dec=450, att=3))
+    o.append(tone(nb + "bass", 9201, 420, 92.5, wave="saw", lp=700, dec=320, att=3, harm=[(2, 0.3, 200)]))
+    o.append(tone(nb + "bell", 9202, 1200, 740, harm=[(2.76, 0.4, 700), (5.4, 0.2, 400)], dec=900, att=1, nz=("white", "hp", 5000, 0.8, 8, 0.2)))
+    o.append(tone(nb + "chime", 9203, 1000, 1480, harm=[(2.0, 0.4, 600), (3.0, 0.25, 400)], dec=800, att=1))
+    o.append(tone(nb + "flute", 9204, 550, 740, att=45, dec=420, harm=[(2, 0.12, 300)], nz=("pink", "bp", 2200, 1.2, 380, 0.15), vib=0.004))
+    o.append(tone(nb + "guitar", 9205, 700, 185, wave="saw", lp=1800, dec=500, att=1, harm=[(2, 0.35, 300), (3, 0.2, 200)],
+                  nz=("white", "bp", 2500, 1.0, 12, 0.3)))
+    o.append(tone(nb + "pling", 9206, 500, 740, wave="square", lp=3200, dec=330, att=1, harm=[(2, 0.25, 200)]))
+    o.append(tone(nb + "xylophone", 9207, 420, 1480, harm=[(4.0, 0.25, 90)], dec=260, att=0.5, nz=("white", "bp", 3000, 1.5, 6, 0.3)))
+    o.append(tone(nb + "iron_xylophone", 9208, 800, 740, harm=[(2.76, 0.5, 500), (5.4, 0.25, 300)], dec=600, att=0.5,
+                  nz=("white", "hp", 4500, 1.0, 6, 0.3)))
+    o.append(tone(nb + "cow_bell", 9209, 450, 560, wave="square", lp=2400, dec=300, att=0.5, harm=[(1.51, 0.6, 250)]))
+    o.append(tone(nb + "didgeridoo", 9210, 600, 92.5, wave="saw", lp=420, dec=520, att=30, q=1.5, vib=0.01))
+    o.append(tone(nb + "bit", 9211, 380, 740, wave="square", lp=4500, dec=250, att=1))
+    o.append(tone(nb + "banjo", 9212, 450, 370, wave="saw", lp=2600, dec=260, att=0.5, harm=[(2, 0.4, 160)], nz=("white", "bp", 3000, 1.2, 10, 0.4)))
+    o.append(perc(nb + "basedrum", 9213, 380, nz=[("white", "bp", 900, 1.0, 12, 0.5, 0)], body=(150, 45, 280, 1.3, 0), var=1, peak=-4))
+    o.append(perc(nb + "snare", 9214, 280, nz=[("white", "bp", 2200, 0.8, 140, 1.0, 0)], body=(230, 150, 70, 0.7, 0), var=1, peak=-5))
+    o.append(perc(nb + "hat", 9215, 120, nz=[("white", "hp", 7000, 0.8, 45, 1.0, 0)], var=1, peak=-8))
+    # --- entities
+    o.append(whoosh("entity.boat.paddle_water", 9300, 450, 500, 900, "pink", "bp", 0.8, att=100, var=1, peak=-8))
+    o.append(perc("entity.boat.paddle_land", 9301, 250, nz=[("pink", "bp", 800, 0.8, 60, 0.9, 0)], body=(140, 80, 90, 1.0, 0), var=1, peak=-8))
+    o.append(whoosh("entity.snowball.throw", 9310, 220, 1500, 700, "white", "bp", 1.0, att=15, var=2, peak=-8,
+                    aliases=al("entity.", ["egg.throw", "ender_pearl.throw", "fishing_bobber.throw", "splash_potion.throw"])))
+    o.append(whoosh("entity.firework_rocket.launch", 9320, 900, 1200, 4500, "white", "bp", 0.8, att=80, var=1, peak=-7,
+                    aliases=["entity.firework_rocket.shoot"]))
+    o.append(whoosh("entity.firework_rocket.blast", 9321, 600, 2500, 300, "white", "lp", 0.7, att=3, var=2, peak=-4, sub=(200, 60),
+                    aliases=al("entity.firework_rocket.", ["large_blast", "blast_far", "large_blast_far"])))
+    o.append(crackle("entity.firework_rocket.twinkle", 9322, 700, 14, 5500, "white", 8, var=1, peak=-8, kind="hp", q=0.8,
+                     aliases=["entity.firework_rocket.twinkle_far"]))
+    o.append(whoosh("entity.fishing_bobber.retrieve", 9330, 300, 900, 2500, "pink", "bp", 1.0, att=20, var=1, peak=-8))
+    o.append(perc("entity.item_frame.add_item", 9340, 140, nz=[("pink", "bp", 2000, 1.0, 20, 0.8, 0)], body=(400, 250, 40, 0.6, 0), var=1,
+                  peak=-8, aliases=["entity.item_frame.rotate_item", "entity.item_frame.remove_item"]))
+    o.append(loopify(whoosh("entity.minecart.riding", 9350, 1200, 300, 500, "brown", "bp", 1.0, att=200, var=1, peak=-10,
+                            aliases=["entity.minecart.inside", "entity.minecart.inside.underwater"])))
+    o.append(perc("enchant.thorns.hit", 9360, 160, nz=[("white", "hp", 3000, 1.0, 15, 0.8, 0)], body=(300, 150, 50, 0.6, 0), parts=[(1800, 0.4, 80, 0)],
+                  var=1, peak=-7))
+    # --- UI
+    o.append(seq("ui.toast.in", 9400, [("A5", 0, 100, 0.8), ("E6", 80, 300, 1.0)], 700, rev=0.2, peak=-8))
+    o.append(seq("ui.toast.out", 9401, [("E6", 0, 100, 0.8), ("A5", 80, 280, 1.0)], 700, rev=0.2, peak=-8))
+    o.append(seq("ui.toast.challenge_complete", 9402, [("D5", 0, 200, 0.8), ("F#5", 150, 200, 0.8), ("A5", 300, 200, 0.8), ("D6", 450, 900, 1.0)],
+                 1800, rev=0.3, peak=-6))
+    # --- mob steps (Tier 2 stand-ins: the other mobs alias these)
+    o.append(perc("entity.zombie.step", 9450, 140, nz=[("pink", "bp", 900, 0.9, 35, 0.9, 0)], body=(120, 70, 60, 0.8, 0), var=1, peak=-10))
+    o.append(perc("entity.cow.step", 9451, 160, nz=[("pink", "bp", 700, 0.9, 40, 0.9, 0)], body=(100, 60, 70, 1.0, 0), var=1, peak=-10))
+    # --- ambience
+    o.append(whoosh("ambient.mood", 9500, 2200, 500, 150, "brown", "lp", 0.7, att=700, var=1, peak=-9, sub=(70, 45),
+                    aliases=[b + s for b in ("ambient.basalt_deltas.", "ambient.crimson_forest.", "ambient.nether_wastes.", "ambient.soul_sand_valley.",
+                                             "ambient.warped_forest.") for s in ("additions", "mood")]))
+    o.append(whoosh("ambient.underwater.enter", 9510, 600, 4000, 400, "pink", "lp", 0.7, att=20, var=1, peak=-7))
+    o.append(whoosh("ambient.underwater.exit", 9511, 600, 400, 4000, "pink", "lp", 0.7, att=20, var=1, peak=-7))
+    return o
+
+
+# events that are a stand-in on a sound which already exists (no new sample)
+MUSIC_NAMES = (["music.overworld." + x for x in ("deep_dark", "dripstone_caves", "grove", "jagged_peaks", "lush_caves", "swamp", "forest",
+                "old_growth_taiga", "meadow", "cherry_grove", "frozen_peaks", "snowy_slopes", "stony_peaks", "flower_forest", "desert", "badlands",
+                "jungle", "sparse_jungle", "bamboo_jungle")]
+               + ["music.nether." + x for x in ("basalt_deltas", "crimson_forest", "nether_wastes", "soul_sand_valley", "warped_forest")]
+               + ["music.credits", "music.dragon", "music.end", "music.under_water"])
+EXTRA_ALIASES = {
+    "music.ambient_loop": MUSIC_NAMES,
+    "ambient.cave": [b + ".loop" for b in ("ambient.basalt_deltas", "ambient.crimson_forest", "ambient.nether_wastes", "ambient.soul_sand_valley",
+                                           "ambient.warped_forest", "ambient.underwater")],
+    "ambient.drip": ["ambient.underwater.loop.additions", "ambient.underwater.loop.additions.rare", "ambient.underwater.loop.additions.ultra_rare"],
+    # Tier 2 mob stand-ins: related mobs share the voice (no new samples)
+    "entity.zombie.ambient": ["block.note_block.imitate.zombie"] + [f"entity.{m}.ambient" for m in ("husk", "zombie_villager", "drowned")],
+    "entity.zombie.hurt": [f"entity.{m}.hurt" for m in ("husk", "zombie_villager", "drowned")],
+    "entity.zombie.death": ["block.note_block.imitate.ender_dragon"] + [f"entity.{m}.death" for m in ("husk", "zombie_villager", "drowned")],
+    "entity.zombie.step": [f"entity.{m}.step" for m in ("husk", "zombie_villager", "drowned", "piglin", "wither_skeleton", "iron_golem")],
+    "entity.cow.ambient": [f"entity.{m}.ambient" for m in ("horse", "donkey", "mule", "llama", "polar_bear", "hoglin", "sheep")],
+    "entity.cow.hurt": [f"entity.{m}.hurt" for m in ("horse", "donkey", "mule", "llama", "polar_bear", "hoglin", "sheep")],
+    "entity.cow.death": [f"entity.{m}.death" for m in ("horse", "donkey", "mule", "llama", "polar_bear", "hoglin", "sheep")],
+    "entity.cow.step": ["entity.pig.step", "entity.sheep.step", "entity.horse.step", "entity.horse.step_wood", "entity.llama.step",
+                        "entity.wolf.step", "entity.hoglin.step", "entity.polar_bear.step", "entity.panda.step", "entity.chicken.step",
+                        "entity.parrot.step"],
+    "entity.pig.hurt": ["entity.piglin.hurt"],
+    "entity.pig.death": ["entity.piglin.death"],
+    "entity.chicken.ambient": ["entity.parrot.ambient"],
+    "entity.chicken.hurt": ["entity.parrot.hurt"],
+    "entity.chicken.death": ["entity.parrot.death"],
+    "entity.skeleton.hurt": ["entity.wither_skeleton.hurt"],
+    "entity.skeleton.death": ["entity.wither_skeleton.death"],
+    "entity.spider.ambient": ["entity.silverfish.ambient"],
+    "entity.spider.hurt": ["entity.silverfish.hurt"],
+    "entity.spider.death": ["entity.silverfish.death"],
+    "entity.spider.step": ["entity.silverfish.step"],
+    "block.fire.ambient": ["block.campfire.crackle", "block.furnace.fire_crackle"],
+    "block.wood.place": ["entity.item_frame.place", "entity.painting.place", "entity.leash_knot.place"],
+    "block.wood.break": ["entity.item_frame.break", "entity.painting.break", "entity.leash_knot.break"],
+    "block.glass.break": ["entity.splash_potion.break"],
+    "entity.generic.explode": ["entity.dragon_fireball.explode"],
+    "entity.generic.splash": ["entity.fishing_bobber.splash"],
+    "entity.lightning_bolt.impact": ["item.trident.thunder"],
+    "ui.button.click": ["ui.loom.select_pattern", "ui.stonecutter.select_recipe"],
+    "entity.item.pickup": ["ui.loom.take_result", "ui.stonecutter.take_result", "ui.cartography_table.take_result"],
+    "entity.skeleton.ambient": ["block.note_block.imitate.skeleton", "block.note_block.imitate.wither_skeleton", "entity.wither_skeleton.ambient"],
+    "entity.creeper.hurt": ["block.note_block.imitate.creeper"],
+    "entity.pig.ambient": ["block.note_block.imitate.piglin", "entity.piglin.ambient"],
+}
+
+
 def mc():
     sounds = []
     for mat in MATS:
         for act in ACTS:
             s = block(mat, act)
             sounds.append(s)
-    sounds += ambience() + uisounds() + entities() + effects() + music()
+    sounds += ambience() + uisounds() + entities() + effects() + music() + coverage_sounds()
+    byid = {x["id"]: x for x in sounds}
+    for sid, names in EXTRA_ALIASES.items():
+        byid[sid].setdefault("aliases", []).extend(names)
+    seen = set()
+    for x in sounds:
+        for nm in [x["id"]] + x.get("aliases", []):
+            assert nm not in seen, "duplicate event name " + nm
+            seen.add(nm)
     return {"format": "synth-recipe-1", "name": "mc", "rate": 44100, "license": "own", "buses": BUSES_MC, "sounds": sounds}
 
 

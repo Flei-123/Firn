@@ -10,6 +10,8 @@
 // Environment (all optional):
 //   MCPLAY_GL=1        GL path: glwindow (EGL/GLX) + gl_mc/gl_scene back end, frame shown without read back; MCPLAY_VSYNC=0|1 (default 1); CPU stays the default
 //   MCPLAY_VIEW=6      view distance in chunks            MCPLAY_PROTOCOL=763   protocol number
+//   MCPLAY_LOD=<n>     LOD terrain beyond MCPLAY_VIEW up to n chunks (mc_stream + mc_lod, cross-fade at ring changes; asks the server for n chunks); 0 = off (default)
+//   MCPLAY_STREAM=1    mc_stream instead of mc_render_world for the world (implied by MCPLAY_LOD)
 //   MCPLAY_W / MCPLAY_H window size (default 854x480)     MCPLAY_FULLSCREEN=1   start fullscreen
 //   MCPLAY_FPS=60      frame cap (0 = uncapped)           MCPLAY_VSYNC=1        swap interval for the GL path (CPU path: no-op)
 //   MCPLAY_CREATIVE=1  the server is creative: fly allowed and the creative reach (6 blocks)
@@ -50,6 +52,7 @@ import mc.mc_camera
 import mc.mc_texture
 import mc.mc_raster
 import mc.mc_render_world
+import mc.mc_stream
 import mc.mc_sky
 import mc.mc_input
 import mc.mc_hud
@@ -289,6 +292,10 @@ struct Ctx {
     gsc: gl_scene.Scene,
     sh: glshow.Show,
     be: mc_backend.Backend, // the GL back end table
+    stm: mc_stream.Stream, // MCPLAY_STREAM / MCPLAY_LOD: the world drawn by mc_stream (inline meshing, LOD rings) instead of g.wr
+    stream_on: bool,
+    stm_live: bool,
+    lod: i32, // LOD radius in chunks (0 = off)
     pk: mc_input.Pick,
     bg: u64, // BGRX copy of the frame for the window
     w: i32,
@@ -385,6 +392,80 @@ struct Ctx {
     click_src: i32,
 }
 
+// ---- mc_stream mode (MCPLAY_STREAM / MCPLAY_LOD) -------------------------------------------------------
+
+// Chunks the server is asked for: the LOD radius when LOD is on, else the view distance.
+fn wire_view(c: *mut Ctx) -> i32 {
+    if (*c).lod > (*c).view { return (*c).lod }
+    return (*c).view
+}
+
+// Fog / far plane distance in chunks.
+fn far_view(c: *mut Ctx) -> i32 { return wire_view(c) }
+
+// Frees the stream (its meshes live in the CURRENT back end: call before the back end changes).
+fn stream_release(c: *mut Ctx) {
+    if !(*c).stream_on || !(*c).stm_live { return }
+    var be: mc_backend.Backend = cur_be(c)
+    mc_stream.stream_free(&(*c).stm, &be)
+    (*c).stm_live = false
+}
+
+// New stream for the current dimension; every loaded column is announced again (join, resize).
+fn stream_make(c: *mut Ctx) {
+    if !(*c).stream_on { return }
+    stream_release(c)
+    (*c).stm = mc_stream.stream_new((*c).dim.min_y, mc_dimension.dim_sections(&(*c).dim) as i32, (*c).view, &(*c).g.tb, 0 as u64)
+    (*c).stm_live = true
+    if (*c).lod > (*c).view { (*c).stm.lod_dist = (*c).lod }
+    if env_flag("MCPLAY_TRANS", true) {
+        mc_stream.stream_set_translucent(&(*c).stm, true, mc_texture.T_WATER, mc_texture.T_ICE, mc_texture.T_GLASS)
+    }
+    if (*c).light { mc_stream.stream_set_light(&(*c).stm, true, ((&(*c).wl) as *mut mc_wlight.WorldLight) as u64) }
+    var i: usize = 0
+    while i < mc_world.world_count(&(*c).world) {
+        let ch: *mut mc_chunk.Chunk = mc_world.world_chunk_at(&(*c).world, i)
+        let okc: bool = mc_stream.stream_chunk_loaded(&(*c).stm, &(*c).world, (*ch).x, (*ch).z)
+        i = i + 1
+    }
+}
+
+// The light region follows the player: dirties the sections of the old and the new region (counterpart of wr_region_follow).
+fn stream_region_follow(c: *mut Ctx, pcx: i32, pcz: i32) -> i32 {
+    let wl: *mut mc_wlight.WorldLight = &(*c).wl
+    let was_on: bool = mc_wlight.wl_active(wl)
+    let ox0: i32 = (*wl).cx0
+    let oz0: i32 = (*wl).cz0
+    let ox1: i32 = ox0 + (*wl).ncx
+    let oz1: i32 = oz0 + (*wl).ncz
+    let r: i32 = mc_wlight.wl_region_recenter(wl, &(*c).world, pcx, pcz, 5, 5, 1, true)
+    if r == 0 { return 0 }
+    var x0: i32 = (*wl).cx0
+    var z0: i32 = (*wl).cz0
+    var x1: i32 = x0 + (*wl).ncx
+    var z1: i32 = z0 + (*wl).ncz
+    if was_on {
+        if ox0 < x0 { x0 = ox0 }
+        if oz0 < z0 { z0 = oz0 }
+        if ox1 > x1 { x1 = ox1 }
+        if oz1 > z1 { z1 = oz1 }
+    }
+    var cz: i32 = z0
+    while cz < z1 {
+        var cx: i32 = x0
+        while cx < x1 {
+            var sy: i32 = 0
+            while sy < (*wl).nsec {
+                mc_stream.stream_mark_section(&(*c).stm, cx, sy, cz)
+                sy = sy + 1
+            }
+            cx = cx + 1
+        }
+        cz = cz + 1
+    }
+    return r
+}
+
 fn mark_air(c: *mut Ctx, x: i32, y: i32, z: i32, id: i32) {
     var old: i32 = 0
     if (*c).light {
@@ -393,8 +474,13 @@ fn mark_air(c: *mut Ctx, x: i32, y: i32, z: i32, id: i32) {
         old = mc_blockset.world_set_block(&(*c).world, (*c).dim.min_y, x, y, z, id)
     }
     if old >= 0 && old != id {
-        mc_render_world.wr_mark_block(&(*c).g.wr, x, y, z)
-        if (*c).light { mc_render_world.wr_light_sync(&(*c).g.wr) }
+        if (*c).stream_on {
+            mc_stream.stream_mark_block(&(*c).stm, x, y, z)
+            if (*c).light { mc_stream.stream_light_sync(&(*c).stm) }
+        } else {
+            mc_render_world.wr_mark_block(&(*c).g.wr, x, y, z)
+            if (*c).light { mc_render_world.wr_light_sync(&(*c).g.wr) }
+        }
     }
 }
 
@@ -413,7 +499,11 @@ fn on_map_chunk(c: *mut Ctx) {
         mc_chunk.chunk_release(p)
         return
     }
-    mc_render_world.wr_mark_chunk(&(*c).g.wr, cx, cz)
+    if (*c).stream_on {
+        let okc: bool = mc_stream.stream_chunk_loaded(&(*c).stm, &(*c).world, cx, cz)
+    } else {
+        mc_render_world.wr_mark_chunk(&(*c).g.wr, cx, cz)
+    }
     (*c).n_chunks = (*c).n_chunks + 1 as u64
 }
 
@@ -427,7 +517,10 @@ fn on_unload(c: *mut Ctx) {
         cx = second
         cz = first
     }
-    if (*c).gl {
+    if (*c).stream_on {
+        var sbe: mc_backend.Backend = cur_be(c)
+        mc_stream.stream_chunk_unloaded(&(*c).stm, &sbe, cx, cz)
+    } else if (*c).gl {
         mc_render_world.wr_drop_chunk_b(&(*c).g.wr, &(*c).be, cx, cz)
     } else {
         mc_render_world.wr_drop_chunk(&(*c).g.wr, &(*c).g.r, cx, cz)
@@ -498,6 +591,7 @@ fn light_setup(c: *mut Ctx) {
     var reg: mc_registry.Registry = (*c).cl.ver.registry_of()
     if mc_registry.registry_ok(&reg) { mc_wlight.wl_set_tables_registry(&(*c).wl, &reg) }
     mc_render_world.wr_set_light(&(*c).g.wr, ((&(*c).wl) as *mut mc_wlight.WorldLight) as u64)
+    if (*c).stream_on && (*c).stm_live { mc_stream.stream_set_light(&(*c).stm, true, ((&(*c).wl) as *mut mc_wlight.WorldLight) as u64) }
 }
 
 // Once enough columns arrived: a 5x5 column region that FOLLOWS the player (hysteresis 1 column, server light wins) so that block
@@ -508,7 +602,12 @@ fn light_region_tick(c: *mut Ctx) {
     if !(*c).region_done && (*c).n_chunks < 25 as u64 { return }
     let cx: i32 = mc_world.block_to_chunk(math.floor((*c).pl.x) as i32)
     let cz: i32 = mc_world.block_to_chunk(math.floor((*c).pl.z) as i32)
-    let r: i32 = mc_render_world.wr_region_follow(&(*c).g.wr, &(*c).world, cx, cz, 5, 5, 1, true)
+    var r: i32 = 0
+    if (*c).stream_on {
+        r = stream_region_follow(c, cx, cz)
+    } else {
+        r = mc_render_world.wr_region_follow(&(*c).g.wr, &(*c).world, cx, cz, 5, 5, 1, true)
+    }
     if r != 0 { (*c).region_done = true }
     if r == 1 { (*c).n_region_moves = (*c).n_region_moves + 1 as u64 }
 }
@@ -523,8 +622,9 @@ fn on_packet(c: *mut Ctx, id: i32) {
             mc_effect.fx_own_from_join(&(*c).fx, mc_client.client_body(cl))
             mc_dimension.dim_from_join(&(*cl).ver, id, mc_client.client_body(cl), &(*c).dim)
             (*c).g.wr.min_y = (*c).dim.min_y
+            stream_make(c)
             if (*c).light { light_setup(c) }
-            mc_client.client_send_settings(cl, (*c).view)
+            mc_client.client_send_settings(cl, wire_view(c))
         }
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_MAP_CHUNK) {
         on_map_chunk(c)
@@ -631,6 +731,7 @@ fn cur_be(c: *mut Ctx) -> mc_backend.Backend {
 }
 
 fn gfx_resize(c: *mut Ctx, w: i32, h: i32) {
+    stream_release(c)
     if (*c).gl {
         mc_render_world.wr_clear_b(&(*c).g.wr, &(*c).be)
         gl_mc.glbe_resize(&(*c).gb, w, h)
@@ -653,6 +754,7 @@ fn gfx_resize(c: *mut Ctx, w: i32, h: i32) {
     (*c).w = w
     (*c).h = h
     mc_camera.camera_resize(&(*c).cam, w, h)
+    if (*c).join { stream_make(c) }
 }
 
 // Window events that change state: resize, fullscreen, mouse capture, quit key.
@@ -1241,7 +1343,7 @@ fn audio_stop(c: *mut Ctx) {
 // GL frame: same pass order as draw_frame (sky -> world -> selection box -> tint -> HUD), shown by present.
 #[allow_escape]
 fn draw_frame_gl(c: *mut Ctx) {
-    let view: f64 = (*c).view as f64
+    let view: f64 = far_view(c) as f64
     let fog_start: f64 = view * 16.0 * 0.5
     let fog_end: f64 = view * 16.0 + 8.0
     let clear: u32 = (255 as u32 << 24 as u32) | (FOG_B << 16 as u32) | (FOG_G << 8 as u32) | FOG_R
@@ -1251,7 +1353,11 @@ fn draw_frame_gl(c: *mut Ctx) {
     gl_scene.scene_sky(&(*c).gsc, &(*c).cam, &(*c).sky)
     if (*c).light { mc_render_world.wr_set_daylight(&(*c).be, (*c).sky.daylight) }
     if (*c).have_pos {
-        mc_render_world.wr_render_b(&(*c).g.wr, &(*c).world, &(*c).be, &(*c).cam, 0 - 1)
+        if (*c).stream_on {
+            let tg: u64 = mc_stream.stream_frame(&(*c).stm, &(*c).world, &(*c).be, &(*c).cam)
+        } else {
+            mc_render_world.wr_render_b(&(*c).g.wr, &(*c).world, &(*c).be, &(*c).cam, 0 - 1)
+        }
     }
     (*c).be.end((*c).be.obj)
     if (*c).hit {
@@ -1309,7 +1415,7 @@ fn draw_frame(c: *mut Ctx) {
         return
     }
     let r: *mut mc_raster.Raster = &(*c).g.r
-    let view: f64 = (*c).view as f64
+    let view: f64 = far_view(c) as f64
     let fog_start: f64 = view * 16.0 * 0.5
     let fog_end: f64 = view * 16.0 + 8.0
     mc_raster.raster_set_fog(r, true, fog_start, fog_end, FOG_R, FOG_G, FOG_B)
@@ -1322,7 +1428,12 @@ fn draw_frame(c: *mut Ctx) {
         mc_render_world.wr_set_daylight(&be, (*c).sky.daylight)
     }
     if (*c).have_pos {
-        mc_render_world.wr_render(&(*c).g.wr, &(*c).world, r, &(*c).cam, 0 - 1)
+        if (*c).stream_on {
+            var sbe: mc_backend.Backend = mc_backend.backend_cpu(r)
+            let tc: u64 = mc_stream.stream_frame(&(*c).stm, &(*c).world, &sbe, &(*c).cam)
+        } else {
+            mc_render_world.wr_render(&(*c).g.wr, &(*c).world, r, &(*c).cam, 0 - 1)
+        }
     }
     if !(*c).light { mc_sky.sky_tint_frame(&(*c).sky, r) }
     if (*c).hit {
@@ -1451,6 +1562,9 @@ fn main(start: u64) -> i32 {
         return 3
     }
     net.set_no_delay(&conn, true) catch false
+    let lod_n: i32 = env_int("MCPLAY_LOD", 0)
+    let want_stream: bool = lod_n > 0 || env_flag("MCPLAY_STREAM", false)
+    var dummy_tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
     var eng: engine.Engine = engine.engine_new(AUDIO_RATE, 48 as u32)
     var bnk: bank.Bank = bank.bank_new()
     var snk: sink.Sink = sink.sink_open_file("/dev/null", AUDIO_RATE, 2 as u32, false)
@@ -1467,6 +1581,7 @@ fn main(start: u64) -> i32 {
         pl: mc_input.player_new(0.0, 0.0, 0.0),
         rw: raw.raw_new(),
         win: window.window_new(), wp: 0 as *mut window.Window, gl: false, gw: glwindow.glwindow_new(), gb: gb0, gsc: gl_scene.scene_empty(&gb0), sh: glshow.show_new(), be: mc_backend.backend_new(),
+        stm: mc_stream.stream_new(0, 1, 1, &dummy_tb, 0 as u64), stream_on: want_stream, stm_live: true, lod: lod_n,
         pk: mc_input.Pick { x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, dist: 0.0, id: 0 },
         bg: 0, w: w0, h: h0, view: view, protocol: proto,
         join: false, have_pos: false, last_tp: 0, grab: false, closed: false, resized: false, fullscreen: false, hit: false,
@@ -1501,7 +1616,8 @@ fn main(start: u64) -> i32 {
         // both back ends (CPU mc_raster PASS_TRANS and GL) so the two pictures agree
         mc_render_world.wr_set_translucent(&c.g.wr, true, mc_texture.T_WATER, mc_texture.T_ICE, mc_texture.T_GLASS)
     }
-    mc_camera.camera_set_lens(&c.cam, 70.0, 0.05, (view as f64 + 2.0) * 16.0 * 1.5)
+    mc_camera.camera_set_lens(&c.cam, 70.0, 0.05, (wire_view(&c) as f64 + 2.0) * 16.0 * 1.5)
+    c.sky.approx = !env_flag("MCPLAY_SKY_EXACT", false) // approximate glow + gradient (<= 1 level, ~2.5x faster at sunset)
     mc_sky.sky_set_time(&c.sky, c.ticks_day as i64, 0)
     mc_render_world.wr_set_flags(&c.g.wr, mc_mesh.F_AO | mc_mesh.F_GREEDY)
     mc_codec.wire_timeout(&c.cl.w, 100) // login phase: slow (cold) servers answer after 0.5 s and more; 2 ms x 200 waits was too short for 1.21.11 / 26.1
@@ -1649,6 +1765,10 @@ fn main(start: u64) -> i32 {
         io.print("\n")
         rt.heap_free(hb, 64)
         rt.buf_free(&pb)
+    }
+    if c.stream_on {
+        say(f"mcplay: stream sections={mc_stream.stream_sections(&c.stm)} lod_cols={c.stm.st.lod_cols} lod_tris={c.stm.st.lod_tris} lod_todo={c.stm.st.lod_todo} lod_fading={c.stm.st.lod_fading} lod_us={c.stm.st.lod_us}\n")
+        stream_release(&c)
     }
     if c.gl {
         mc_render_world.wr_free_b(&c.g.wr, &c.be)

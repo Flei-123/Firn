@@ -1,0 +1,95 @@
+// expect_exit: 0
+// tests/2767_mc_sky_approx.fi -- mc_sky: the approximate background pass (Sky.approx: glow by forward differences + rsqrt series +
+// linear blocks, gradient index by linear blocks) must stay within 1 level per channel of the plain model on random scenes
+// (any time of day, rain, yaw / pitch, lens 20..170 degrees, odd sizes) and reach PSNR >= 60 dB over all scenes. Counter-check:
+// the exact path (approx = false) must still be byte identical.
+import std.rt
+import std.io
+import mc.mc_camera
+import mc.mc_raster
+import mc.mc_sky
+
+struct Rng { s: u64 }
+
+fn next(r: *mut Rng) -> u64 {
+    (*r).s = ((*r).s * 1103515245 as u64 + 12345 as u64) % (2147483648 as u64)
+    return (*r).s >> 4 as u64
+}
+
+fn frac(r: *mut Rng) -> f64 {
+    return ((next(r) % (1000000 as u64)) as f64) / 1000000.0
+}
+
+struct Stat { maxd: i64, sq: i64, n: i64, differing: i64 }
+
+fn chan(v: u32, sh: u32) -> i64 {
+    return ((v >> sh) & 255 as u32) as i64
+}
+
+fn compare(a: *mut mc_raster.Raster, b: *mut mc_raster.Raster, st: *mut Stat) {
+    let total: usize = ((*a).w as usize) * ((*a).h as usize)
+    var i: usize = 0
+    while i < total {
+        let pa: u32 = rt.ld32((*a).color, i)
+        let pb: u32 = rt.ld32((*b).color, i)
+        if pa != pb { (*st).differing = (*st).differing + 1 }
+        var c: u32 = 0
+        while c < 24 {
+            var d: i64 = chan(pa, c) - chan(pb, c)
+            if d < 0 { d = 0 - d }
+            if d > (*st).maxd { (*st).maxd = d }
+            (*st).sq = (*st).sq + d * d
+            c = c + 8
+        }
+        i = i + 1
+    }
+    (*st).n = (*st).n + (total as i64) * 3
+}
+
+fn main() -> i32 {
+    var rng: Rng = Rng { s: 777 }
+    var s: mc_sky.Sky = mc_sky.sky_new()
+    var st: Stat = Stat { maxd: 0, sq: 0, n: 0, differing: 0 }
+    var exact_bad: i64 = 0
+    var scene: i32 = 0
+    while scene < 120 {
+        var w: i32 = 64 + (next(&rng) % (400 as u64)) as i32
+        var h: i32 = 48 + (next(&rng) % (200 as u64)) as i32
+        var cam: mc_camera.Camera = mc_camera.camera_new(w, h)
+        var a: mc_raster.Raster = mc_raster.raster_new(w, h)
+        var b: mc_raster.Raster = mc_raster.raster_new(w, h)
+        var ticks: i64 = (next(&rng) % (24000 as u64)) as i64
+        if scene % 2 == 0 {
+            let base: i64 = if scene % 4 == 0 { 0 as i64 } else { 12000 as i64 }
+            ticks = base + ((next(&rng) % (3000 as u64)) as i64) - 1500 as i64
+        }
+        var rain: i32 = 0
+        if scene % 4 == 1 { rain = (next(&rng) % (257 as u64)) as i32 }
+        mc_sky.sky_set_time(&s, ticks, rain)
+        mc_camera.camera_set_pos(&cam, 0.0, 0.0, 0.0)
+        mc_camera.camera_set_angles(&cam, frac(&rng) * 360.0, frac(&rng) * 180.0 - 90.0)
+        mc_camera.camera_set_lens(&cam, 20.0 + frac(&rng) * 150.0, 0.05, 512.0)
+        mc_camera.camera_update(&cam)
+        mc_raster.raster_set_camera(&a, &cam)
+        mc_raster.raster_set_camera(&b, &cam)
+        s.approx = true
+        mc_sky.sky_draw(&s, &a)
+        mc_sky.sky_draw_plain(&s, &b)
+        compare(&a, &b, &st)
+        s.approx = false
+        mc_sky.sky_draw(&s, &a)
+        var diff: Stat = Stat { maxd: 0, sq: 0, n: 0, differing: 0 }
+        compare(&a, &b, &diff)
+        if diff.differing != 0 as i64 { exact_bad = exact_bad + 1 }
+        mc_raster.raster_free(&a)
+        mc_raster.raster_free(&b)
+        scene = scene + 1
+    }
+    // PSNR = 10 log10(255^2 n / sq) >= 60  <=>  sq * 10^6 <= 255^2 n
+    let ok_psnr: bool = st.sq * 1000000 as i64 <= 65025 as i64 * st.n
+    io.fmt_print(f"sky approx: max channel diff {st.maxd}, differing pixels {st.differing}, sum sq {st.sq} of {st.n} channels, exact_bad {exact_bad}\n")
+    if st.maxd > 1 as i64 { return 1 }
+    if !ok_psnr { return 2 }
+    if exact_bad != 0 as i64 { return 3 }
+    return 0
+}
