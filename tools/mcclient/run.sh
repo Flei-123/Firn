@@ -292,7 +292,7 @@ if [ "$ENT" -eq 1 ] && [ -f "$W/out/A.dump.entities" ]; then
 fi
 echo "== metrics =="
 metric() { grep -h "^metric $2=" "$W/out/$1.metrics" 2>/dev/null | head -1 | cut -d= -f2-; }
-KEYS="entities entity_spawns connect_ms join_ms first_chunk_ms total_ms packets bytes_in bytes_decompressed packets_per_s chunks walk_ok walk_fail bulk_packets bulk_columns"
+KEYS="entities entity_spawns connect_ms join_ms first_chunk_ms total_ms packets bytes_in bytes_decompressed packets_per_s chunks walk_ok walk_fail bulk_packets bulk_columns partial_chunks merged_chunks"
 COLS="A B A2$EXTRA_LABELS"
 printf '%-20s' key; for c in $COLS; do printf '%-14s' "$c"; done; echo
 for k in $KEYS; do

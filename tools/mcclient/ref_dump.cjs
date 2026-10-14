@@ -164,6 +164,7 @@ class Reader {
 }
 
 // 1.21.5+ (protocol 770): a paletted container has no data array length any more (derived from the bits per entry).
+const SEC_FLUID = Number(process.env.MC_PROTOCOL || 0) >= 775
 const NO_LEN = Number(process.env.MC_PROTOCOL || 0) >= 770
 
 // One paletted container. kind 'blocks' (4096, indirect 4..8) or 'biomes' (64, indirect 1..3).
@@ -215,6 +216,7 @@ function decodeSections (chunkData, numSections) {
   const sections = []
   while (sections.length < numSections) {
     const blockCount = r.i16()
+    if (SEC_FLUID) r.i16() // 26.1 (775): non-empty fluid count follows the block count (found by raw bytes of the real server)
     const blocks = readContainer(r, 'blocks')
     const biomes = readContainer(r, 'biomes')
     sections.push({ blockCount, blocksHash: hashU16(blocks), biomesHash: hashU16(biomes), distinct: new Set(blocks).size })
