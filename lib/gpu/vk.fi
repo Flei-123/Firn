@@ -32,9 +32,11 @@ import gpu.vkplat
 export {
     Vk, Target, Pipe, Buf, Sc, vk_new, target_new_blank, pipe_blank, buf_blank, sc_blank,
     open, close, idle, device_name, is_cpu, device_type, api_version, has_surface_ext, has_swapchain, mem_type,
-    target_new, target_free, read_pixels, pipeline_tri, pipeline_new, pipeline_free,
+    target_new, target_free, read_pixels, pipeline_tri, pipeline_new, pipeline_free, shader_make, shader_free,
     buf_new, buf_write, buf_free, draw,
     sc_open, sc_resize, sc_frame, sc_close, window_pixels,
+    // lifecycle layer (gpu.vk_life): raw helpers, result tracking, fault injection, release
+    call, sa, good, r32, r64, w32, w64, cstr, release, inject, INJ_SUBMIT, INJ_ACQUIRE, INJ_PRESENT,
     STEP_NO_LOADER, STEP_NO_SYMBOL, STEP_NO_INSTANCE, STEP_NO_DEVICE, STEP_NO_QUEUE, STEP_NO_LOGICAL, STEP_NO_POOL,
     DEV_OTHER, DEV_INTEGRATED, DEV_DISCRETE, DEV_VIRTUAL, DEV_CPU,
     FRAME_OK, FRAME_RESIZE, FRAME_ERROR,
@@ -57,6 +59,10 @@ const DEV_CPU: i32 = 4
 const FRAME_OK: i32 = 0
 const FRAME_RESIZE: i32 = 1
 const FRAME_ERROR: i32 = 2
+
+const INJ_SUBMIT: i32 = 1
+const INJ_ACQUIRE: i32 = 2
+const INJ_PRESENT: i32 = 3
 
 const TRI_VS: str = __include_str("spv/tri.vert.spv")
 const TRI_FS: str = __include_str("spv/tri.frag.spv")
@@ -157,6 +163,10 @@ struct Vk {
     ext_mask: u64, // instance surface extensions enabled (bit i = vkplat.surface_ext_name(i))
     swapchain: bool, // VK_KHR_swapchain enabled on the device
     plat: vkplat.PlatState,
+    cache: u64, // VkPipelineCache used by pipeline_new (0 = none), owned by gpu.vk_life
+    last_res: u64, // last non-zero VkResult (low 32 bits) seen by submit / acquire / present; gpu.vk_life resets it
+    inj_site: i32, // INJ_*: the next call at this site returns inj_res instead (tests: simulated DEVICE_LOST etc.)
+    inj_res: u64,
 }
 
 struct Target {
@@ -211,7 +221,7 @@ struct Sc {
 fn vk_new() -> Vk {
     return Vk { ok: false, step: 0, lib: 0, gipa: 0, ft: 0, scratch: 0, top: 0, inst: 0, phys: 0, dev: 0, queue: 0, qfam: 0,
         pool: 0, cmd: 0, fence: 0, dev_type: 0, api_ver: 0, vendor: 0, name: 0, mprops: 0, ext_mask: 0, swapchain: false,
-        plat: vkplat.plat_new() }
+        plat: vkplat.plat_new(), cache: 0, last_res: 0, inj_site: 0, inj_res: 0 }
 }
 
 fn target_new_blank() -> Target {
@@ -254,6 +264,30 @@ fn r64(p: u64, off: usize) -> u64 {
 
 fn good(r: u64) -> bool {
     return (r & 0xFFFFFFFF) == 0
+}
+
+// Fault injection (tests): the NEXT call at `site` (INJ_*) fails with the VkResult `res` (e.g. 0xC4653214 = OUT_OF_DATE,
+// 0xFFFFFFFC = DEVICE_LOST, see vk_life.RES_*). Acquire and submit are skipped for real, present really presents.
+fn inject(v: *mut Vk, site: i32, res: u64) {
+    (*v).inj_site = site
+    (*v).inj_res = res & 0xFFFFFFFF
+}
+
+fn take_inject(v: *mut Vk, site: i32) -> bool {
+    if (*v).inj_site == site {
+        (*v).inj_site = 0
+        return true
+    }
+    return false
+}
+
+// remembers a non-zero VkResult for gpu.vk_life (SUBOPTIMAL included)
+fn note(v: *mut Vk, r: u64) -> u64 {
+    let x: u64 = r & 0xFFFFFFFF
+    if x != 0 {
+        (*v).last_res = x
+    }
+    return x
 }
 
 // zeroed scratch bytes (valid until the next stage resets `top`)
@@ -702,6 +736,19 @@ fn close(v: *mut Vk) {
     (*v).ok = false
 }
 
+// Frees the host side memory open() allocated (after close()). open() may be called again afterwards (device re-creation).
+fn release(v: *mut Vk) {
+    if (*v).scratch != 0 { rt.heap_free((*v).scratch, SCRATCH) }
+    if (*v).ft != 0 { rt.heap_free((*v).ft, F_COUNT * 8) }
+    if (*v).name != 0 { rt.heap_free((*v).name, 256) }
+    if (*v).mprops != 0 { rt.heap_free((*v).mprops, 528) }
+    (*v).scratch = 0
+    (*v).ft = 0
+    (*v).name = 0
+    (*v).mprops = 0
+    (*v).cache = 0
+}
+
 fn device_name(v: *mut Vk) -> u64 {
     return (*v).name // NUL terminated octets (io.print_c)
 }
@@ -1020,6 +1067,11 @@ fn shader_make(v: *mut Vk, code: u64, size: usize) -> u64 {
     return r64(out, 0)
 }
 
+// destroy a module made by shader_make (0 is ignored)
+fn shader_free(v: *mut Vk, m: u64) {
+    if m != 0 { c(v, F_DESTROY_SHADER, (*v).dev, m, 0, 0, 0, 0) }
+}
+
 // Graphics pipeline for render pass `rpass`: vertex stride 20 = vec2 position (location 0) + vec3 colour (location 1),
 // triangle list, no culling, no depth, opaque, dynamic viewport + scissor. SPIR-V from memory (vs/fs: octets, size in octets).
 fn pipeline_new(v: *mut Vk, p: *mut Pipe, rpass: u64, vs: u64, vs_size: usize, fs: u64, fs_size: usize) -> bool {
@@ -1109,7 +1161,7 @@ fn pipeline_new(v: *mut Vk, p: *mut Pipe, rpass: u64, vs: u64, vs_size: usize, f
     w64(gi, 104, (*p).layout)
     w64(gi, 112, rpass)
     w32(gi, 136, 0xFFFFFFFF)
-    if !good(c(v, F_CREATE_GPIPE, (*v).dev, 0, 1, gi, 0, out)) {
+    if !good(c(v, F_CREATE_GPIPE, (*v).dev, (*v).cache, 1, gi, 0, out)) {
         return false
     }
     (*p).pipe = r64(out, 0)
@@ -1214,11 +1266,15 @@ fn submit_wait(v: *mut Vk, wait_sem: u64, signal_sem: u64) -> bool {
         w32(si, 56, 1)
         w64(si, 64, ss)
     }
-    if !good(c(v, F_SUBMIT, (*v).queue, 1, si, (*v).fence, 0, 0)) {
+    if take_inject(v, INJ_SUBMIT) {
+        (*v).last_res = (*v).inj_res
+        return false
+    }
+    if !good(note(v, c(v, F_SUBMIT, (*v).queue, 1, si, (*v).fence, 0, 0))) {
         return false
     }
     // timeout 10 s (ns); all fences
-    return good(c(v, F_WAIT_FENCES, (*v).dev, 1, fe, 1, 10000000000, 0))
+    return good(note(v, c(v, F_WAIT_FENCES, (*v).dev, 1, fe, 1, 10000000000, 0)))
 }
 
 // Renders `nverts` vertices of `vb` with `p` into the target (clear colour packed 0xAABBGGRR), copies the image into the
@@ -1431,7 +1487,13 @@ fn sc_frame(v: *mut Vk, s: *mut Sc, p: *mut Pipe, vb: *mut Buf, nverts: u64, cle
     }
     (*v).top = 0
     let idx: u64 = sa(v, 8)
-    let ra: u64 = c(v, F_ACQUIRE, (*v).dev, (*s).chain, 0xFFFFFFFFFFFFFFFF, (*s).sem_acq, 0, idx) & 0xFFFFFFFF
+    var ra: u64 = 0
+    if take_inject(v, INJ_ACQUIRE) {
+        ra = (*v).inj_res
+        note(v, ra)
+    } else {
+        ra = note(v, c(v, F_ACQUIRE, (*v).dev, (*s).chain, 0xFFFFFFFFFFFFFFFF, (*s).sem_acq, 0, idx))
+    }
     if ra == 0xC4653214 { // VK_ERROR_OUT_OF_DATE_KHR (-1000001004)
         return FRAME_RESIZE
     }
@@ -1459,7 +1521,11 @@ fn sc_frame(v: *mut Vk, s: *mut Sc, p: *mut Pipe, vb: *mut Buf, nverts: u64, cle
     w32(pi, 32, 1)
     w64(pi, 40, ch)
     w64(pi, 48, ix)
-    let rp: u64 = c(v, F_PRESENT, (*v).queue, pi, 0, 0, 0, 0) & 0xFFFFFFFF
+    var rp: u64 = note(v, c(v, F_PRESENT, (*v).queue, pi, 0, 0, 0, 0))
+    if take_inject(v, INJ_PRESENT) {
+        rp = (*v).inj_res
+        note(v, rp)
+    }
     (*s).frames = (*s).frames + 1
     if rp == 0xC4653214 {
         return FRAME_RESIZE

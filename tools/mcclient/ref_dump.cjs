@@ -35,7 +35,11 @@ function teleportV21 (buf) {
 }
 const LEGACY_SECTIONS = PROTOCOL <= 340 && PROTOCOL >= 107 // 1.9 - 1.12.2: CF_SECTIONS_19
 const LEGACY8 = PROTOCOL <= 47 // 1.8 - 1.8.9: CF_LEGACY_8 (map_chunk + map_chunk_bulk, unpaletted u16 LE blocks)
-const SECTIONS_114 = PROTOCOL >= 751 && PROTOCOL <= 754 // 1.16.2 - 1.16.5: CF_SECTIONS_114
+const P14 = PROTOCOL >= 477 && PROTOCOL <= 498 // 1.14 - 1.14.4: dense longs, 256 biome ints at the end of chunkData
+const P15 = PROTOCOL >= 573 && PROTOCOL <= 578 // 1.15 - 1.15.2: dense longs, 1024 biome ints as an own field
+const P17 = PROTOCOL >= 755 && PROTOCOL <= 756 // 1.17 - 1.17.1: no groundUp, bitMap = BitSet (long array), light masks = long arrays
+const SPAN_114 = P14 || P15
+const SECTIONS_114 = P14 || P15 || (PROTOCOL >= 751 && PROTOCOL <= 756) // CF_SECTIONS_114 (1.14, 1.15, 1.16.2 - 1.17.1)
 
 const fs = require('fs')
 const crypto = require('crypto')
@@ -141,6 +145,7 @@ class Reader {
   eof () { return this.p >= this.b.length }
   u8 () { if (this.p >= this.b.length) throw new Error('read past end'); return this.b[this.p++] }
   i16 () { const v = this.b.readInt16BE(this.p); this.p += 2; return v }
+  i32 () { const v = this.b.readInt32BE(this.p); this.p += 4; return v }
   varint () {
     let r = 0; let shift = 0
     for (;;) {
@@ -212,6 +217,29 @@ function readContainer (r, kind) {
   return ids
 }
 
+// 1.14 / 1.15 block container: bits (u8, below 4 = 4), palette (varint length + varints) only when bits <= 8,
+// data length in longs, dense longs (an entry may span two longs).
+function readContainerSpan (r) {
+  let bits = r.u8()
+  if (bits < 4) bits = 4
+  let palette = null
+  if (bits <= 8) {
+    const n = r.varint()
+    palette = new Array(n)
+    for (let i = 0; i < n; i++) palette[i] = r.varint()
+  }
+  const nl = r.varint()
+  if (nl !== Math.ceil(4096 * bits / 64)) throw new Error(`span container long count ${nl} (bits ${bits})`)
+  const ids = unpackSpanning(r.longsBig(nl), bits, 4096)
+  if (palette) {
+    for (let i = 0; i < 4096; i++) {
+      if (ids[i] >= palette.length) throw new Error('span palette index out of range')
+      ids[i] = palette[ids[i]]
+    }
+  }
+  return ids
+}
+
 function hashU16 (arr) {
   const f = new Fnv64()
   for (let i = 0; i < arr.length; i++) f.u16le(arr[i])
@@ -239,6 +267,11 @@ function decodeSections (chunkData, numSections) {
 
 // nmp gives long arrays as [hi, lo] signed int32 pairs
 function heightmapValues (arr) {
+  if (SPAN_114) {
+    const big = arr.map(([h, l]) => (BigInt(h >>> 0) << 32n) | BigInt(l >>> 0))
+    if (big.length !== 36) throw new Error(`span heightmap has ${big.length} longs`)
+    return unpackSpanning(big, 9, 256)
+  }
   const longs = arr.map(([h, l]) => [h >>> 0, l >>> 0])
   return unpackLongs(longs, 9, 256)
 }
@@ -348,28 +381,51 @@ function decodeLegacyColumn (p, hasSky) {
   }
 }
 
-// ---------------------------------------------------------------- 1.16.2 - 1.16.5 (CF_SECTIONS_114)
+// ---------------------------------------------------------------- 1.14 - 1.15, 1.16.2 - 1.17.1 (CF_SECTIONS_114)
+// 1.14: dense longs, biomes = 256 ints at the end of chunkData; 1.15: dense longs, biomes = int[1024] field; 1.17: no groundUp, bitMap = long array.
 // map_chunk: x, z, groundUp, bitMap (section i present), heightmaps (NBT), biomes (int[1024], ground-up only),
 // chunkData, blockEntities. Per present section: blockCount (i16), bits per block (u8), palette (bits <= 8),
 // packed longs that NEVER span two longs. A 1.16 column is 256 high = 16 sections; an absent one is all air.
 // The biome array is ordered (y*4+z)*4+x over 64 cells of 4 blocks, so section i owns entries i*64 .. i*64+63.
 // Light is a separate packet (update_light) and not part of the dump: sky=0 block=0, h = FNV offset basis.
-function decodeChunk114 (p) {
+function decodeChunk114 (p, numSections) {
   const r = new Reader(p.chunkData)
   const sections = []
-  for (let i = 0; i < 16; i++) {
+  const ns = P17 ? numSections : 16
+  // bitMap: a number (1.14 - 1.16) or a BitSet as [hi, lo] pairs (1.17)
+  const has = (i) => {
+    if (!P17) return (p.bitMap & (1 << i)) !== 0
+    const l = p.bitMap[i >> 6]
+    if (!l) return false
+    const w = (i & 63) >= 32 ? l[0] : l[1]
+    return ((w >>> 0) >>> (i & 31)) & 1
+  }
+  if (P17) {
+    for (let i = ns; i < p.bitMap.length * 64; i++) if (has(i)) throw new Error(`bitMap bit ${i} beyond ${ns} sections`)
+  }
+  const groundUp = P17 ? true : p.groundUp
+  const bioSrc = P14 ? null : (groundUp ? p.biomes : null)
+  for (let i = 0; i < ns; i++) {
     let blockCount = 0
     let ids = new Array(4096).fill(0)
-    if (p.bitMap & (1 << i)) {
+    if (has(i)) {
       blockCount = r.i16()
-      ids = readContainer(r, 'blocks')
+      ids = SPAN_114 ? readContainerSpan(r) : readContainer(r, 'blocks')
     }
-    const bio = p.groundUp ? p.biomes.slice(i * 64, i * 64 + 64) : new Array(64).fill(0)
-    if (bio.length !== 64) throw new Error('biome array too short')
+    let bio = new Array(64).fill(0)
+    if (bioSrc) {
+      bio = bioSrc.slice(i * 64, i * 64 + 64)
+      if (bio.length !== 64) throw new Error('biome array too short')
+    }
     sections.push({ blockCount, blocksHash: hashU16(ids), biomesHash: hashU16(bio), distinct: new Set(ids).size })
   }
-  if (p.groundUp && p.biomes.length !== 1024) throw new Error(`biome count ${p.biomes.length}`)
-  if (!r.eof()) trailingNonZero++ // 1.16 pads nothing: any leftover is reported
+  if (bioSrc && bioSrc.length !== ns * 64) throw new Error(`biome count ${bioSrc.length}`)
+  let colBiomes = null
+  if (P14 && groundUp) {
+    colBiomes = new Array(256)
+    for (let i = 0; i < 256; i++) colBiomes[i] = r.i32()
+  }
+  if (!P14 && !r.eof()) trailingNonZero++ // 1.15 - 1.17 pad nothing: any leftover is reported
   const hm = []
   const entries = (p.heightmaps && p.heightmaps.value) || {}
   for (const name of Object.keys(entries)) {
@@ -382,6 +438,8 @@ function decodeChunk114 (p) {
     x: p.x,
     z: p.z,
     sections,
+    legacy: P14, // 1.14: the biomes are one array per column (B line), not per section
+    biomesHash: colBiomes ? hashU16(colBiomes) : null,
     blockEntities: p.blockEntities.length,
     hm,
     light: { sky: 0, block: 0, h: new Fnv64().hex() }
@@ -621,6 +679,14 @@ function main () {
       })
       return
     }
+    if (P17 && p.dimension) {
+      try {
+        const nbt = require('prismarine-nbt')
+        const el = nbt.simplify(p.dimension)
+        if (el && el.height > 0) numSections = el.height / 16
+      } catch (err) { console.error('1.17 dimension height lookup failed, assuming 16 sections: ' + err.message) }
+      if (numSections === 24) numSections = 16
+    }
     if (p.dimensionCodec && !SECTIONS_114) {
       try {
         const nbt = require('prismarine-nbt')
@@ -653,8 +719,9 @@ function main () {
       armIdle()
       return
     }
+    if (P17) p.groundUp = true // 1.17 has no groundUp: a packet is always a whole column
     try {
-      const c = LEGACY_SECTIONS ? decodeLegacyColumn(p, hasSky) : SECTIONS_114 ? decodeChunk114(p) : decodeChunk(p, numSections)
+      const c = LEGACY_SECTIONS ? decodeLegacyColumn(p, hasSky) : SECTIONS_114 ? decodeChunk114(p, numSections) : decodeChunk(p, numSections)
       if ((LEGACY_SECTIONS || SECTIONS_114) && !p.groundUp) {
         // section-only update: merged into the stored column (like mc_world.world_apply); unknown column = dropped
         const stored = chunks.get(`${c.x},${c.z}`)
@@ -704,6 +771,35 @@ function main () {
     let st
     if (c) st = c.lightState || (c.lightState = { sky: new Map(), block: new Map() })
     else { st = pendingLight.get(key); if (!st) { st = { sky: new Map(), block: new Map() }; pendingLight.set(key, st) } }
+    if (P17) {
+      // 1.17: masks are long arrays ([hi, lo] pairs), the arrays are already split by nmp (skyLight / blockLight: byte arrays per set bit)
+      try {
+        const bitOf = (mask, bit) => {
+          const l = mask[bit >> 6]
+          if (!l) return false
+          const w = (bit & 63) >= 32 ? l[0] : l[1]
+          return (((w >>> 0) >>> (bit & 31)) & 1) === 1
+        }
+        const apply = (mask, empty, arrays, map) => {
+          const nbits = Math.max(mask.length, empty.length) * 64
+          let k = 0
+          for (let bit = 0; bit < nbits; bit++) {
+            if (bitOf(mask, bit)) {
+              const arr = arrays[k++]
+              if (!arr || arr.length !== 2048) throw new Error(`light array length ${arr && arr.length}`)
+              map.set(bit, Buffer.from(arr))
+            }
+          }
+          if (k !== arrays.length) throw new Error(`light arrays ${arrays.length} != mask bits ${k}`)
+          for (let bit = 0; bit < nbits; bit++) if (bitOf(empty, bit) && !bitOf(mask, bit)) map.delete(bit)
+        }
+        apply(p.skyLightMask, p.emptySkyLightMask, p.skyLight, st.sky)
+        apply(p.blockLightMask, p.emptyBlockLightMask, p.blockLight, st.block)
+        if (c) { c.light = lightHash(st); lightApplied++ } else lightPending++
+      } catch (e) { lightBad++; console.error(`update_light failed at ${p.chunkX},${p.chunkZ}: ${e.message}`) }
+      armIdle()
+      return
+    }
     try {
       const r = new Reader(p.data)
       const u32 = (v) => v >>> 0

@@ -1,0 +1,113 @@
+// expect_exit: 0
+// gpu.vk_life without a GPU: VkResult classification, the cache file wrapper (magic / version / length / CRC), the Vulkan
+// pipeline cache header check against a device identity (vendor, device, UUID, header version, size).
+import std.rt
+import std.io
+import gpu.vk_life
+
+fn check(f: *mut i32, name: str, ok: bool) {
+    if !ok {
+        io.print("FAIL ")
+        io.print(name)
+        io.print("\n")
+        *f = *f + 1
+    }
+}
+
+// a header of VkPipelineCacheHeaderVersionOne + 40 octets of "driver data"
+fn make_blob(p: u64, vendor: u32, device: u32, uuid0: u8, version: u32, hsize: u32) {
+    rt.mem_set(p, 0 as u8, 72)
+    rt.st32(p, 0, hsize)
+    rt.st32(p, 1, version)
+    rt.st32(p, 2, vendor)
+    rt.st32(p, 3, device)
+    var i: usize = 0
+    while i < 16 {
+        rt.st8(p, 16 + i, (uuid0 as usize + i) as u8)
+        i = i + 1
+    }
+    i = 32
+    while i < 72 {
+        rt.st8(p, i, ((i * 7) & 255) as u8)
+        i = i + 1
+    }
+}
+
+fn main(start: u64) -> i32 {
+    var fails: i32 = 0
+    // ---- classification of VkResult codes
+    check(&fails, "classify ok", vk_life.classify(0 as u64) == vk_life.CLS_OK)
+    check(&fails, "classify suboptimal", vk_life.classify(1000001003 as u64) == vk_life.CLS_SUBOPTIMAL)
+    check(&fails, "classify out of date", vk_life.classify(0xC4653214 as u64) == vk_life.CLS_OUT_OF_DATE)
+    check(&fails, "classify out of date (64 bit sign extended)", vk_life.classify(0xFFFFFFFFC4653214 as u64) == vk_life.CLS_OUT_OF_DATE)
+    check(&fails, "classify device lost", vk_life.classify(0xFFFFFFFC as u64) == vk_life.CLS_DEVICE_LOST)
+    check(&fails, "classify device lost (64 bit)", vk_life.classify(0xFFFFFFFFFFFFFFFC as u64) == vk_life.CLS_DEVICE_LOST)
+    check(&fails, "classify surface lost", vk_life.classify(0xC4653600 as u64) == vk_life.CLS_SURFACE_LOST)
+    check(&fails, "classify oom host", vk_life.classify(0xFFFFFFFF as u64) == vk_life.CLS_OOM)
+    check(&fails, "classify oom device", vk_life.classify(0xFFFFFFFE as u64) == vk_life.CLS_OOM)
+    check(&fails, "classify timeout", vk_life.classify(2 as u64) == vk_life.CLS_TIMEOUT)
+    check(&fails, "classify other", vk_life.classify(0xFFFFFFF7 as u64) == vk_life.CLS_OTHER)
+
+    // ---- wrapper: roundtrip + every kind of damage
+    let blob: u64 = rt.heap_alloc(72)
+    make_blob(blob, 0x10DE as u32, 0x2204 as u32, 5 as u8, 1 as u32, 32 as u32)
+    var out: rt.Buf = rt.buf_new()
+    vk_life.wrap_blob(blob, 72, &out)
+    let sz: usize = rt.buf_len(&out)
+    let p: u64 = rt.buf_ptr(&out)
+    check(&fails, "wrapped size", sz == 72 + vk_life.WRAP_HEADER)
+    check(&fails, "unwrap roundtrip", vk_life.unwrap_blob(p, sz) == (72 as i64))
+    check(&fails, "unwrap data equal", rt.mem_eq(p + (vk_life.WRAP_HEADER as u64), blob, 72))
+    check(&fails, "unwrap too short", vk_life.unwrap_blob(p, 8) < (0 as i64))
+    check(&fails, "unwrap truncated", vk_life.unwrap_blob(p, sz - 1) < (0 as i64))
+    check(&fails, "unwrap empty", vk_life.unwrap_blob(p, 0) < (0 as i64))
+    rt.st8(p, sz - 1, (rt.ld8(p, sz - 1) as usize + 1) as u8) // flip a data bit
+    check(&fails, "unwrap crc mismatch", vk_life.unwrap_blob(p, sz) < (0 as i64))
+    rt.st8(p, sz - 1, (rt.ld8(p, sz - 1) as usize - 1) as u8)
+    check(&fails, "unwrap restored", vk_life.unwrap_blob(p, sz) == (72 as i64))
+    rt.st32(p, 0, 0x12345678 as u32)
+    check(&fails, "unwrap bad magic", vk_life.unwrap_blob(p, sz) < (0 as i64))
+    rt.st32(p, 0, 0x43504E46 as u32)
+    rt.st32(p, 1, 2 as u32)
+    check(&fails, "unwrap bad version", vk_life.unwrap_blob(p, sz) < (0 as i64))
+    rt.st32(p, 1, 1 as u32)
+    rt.st32(p, 2, 71 as u32)
+    check(&fails, "unwrap bad length", vk_life.unwrap_blob(p, sz) < (0 as i64))
+    rt.buf_free(&out)
+
+    // ---- header check against a device identity
+    var l: vk_life.Life = vk_life.life_new()
+    l.vendor = 0x10DE as u64
+    l.device_id = 0x2204 as u64
+    l.uuid = rt.heap_alloc(16)
+    var i: usize = 0
+    while i < 16 {
+        rt.st8(l.uuid, i, (5 + i) as u8)
+        i = i + 1
+    }
+    check(&fails, "header ok", vk_life.cache_header_check(&l, blob, 72) == vk_life.HDR_OK)
+    check(&fails, "header short", vk_life.cache_header_check(&l, blob, 31) == vk_life.HDR_SHORT)
+    make_blob(blob, 0x10DE as u32, 0x2204 as u32, 5 as u8, 1 as u32, 24 as u32)
+    check(&fails, "header size < 32", vk_life.cache_header_check(&l, blob, 72) == vk_life.HDR_SIZE)
+    make_blob(blob, 0x10DE as u32, 0x2204 as u32, 5 as u8, 1 as u32, 100 as u32)
+    check(&fails, "header size > data", vk_life.cache_header_check(&l, blob, 72) == vk_life.HDR_SIZE)
+    make_blob(blob, 0x10DE as u32, 0x2204 as u32, 5 as u8, 2 as u32, 32 as u32)
+    check(&fails, "header version", vk_life.cache_header_check(&l, blob, 72) == vk_life.HDR_VERSION)
+    make_blob(blob, 0x1002 as u32, 0x2204 as u32, 5 as u8, 1 as u32, 32 as u32)
+    check(&fails, "header vendor", vk_life.cache_header_check(&l, blob, 72) == vk_life.HDR_VENDOR)
+    make_blob(blob, 0x10DE as u32, 0x2205 as u32, 5 as u8, 1 as u32, 32 as u32)
+    check(&fails, "header device", vk_life.cache_header_check(&l, blob, 72) == vk_life.HDR_DEVICE)
+    make_blob(blob, 0x10DE as u32, 0x2204 as u32, 6 as u8, 1 as u32, 32 as u32)
+    check(&fails, "header uuid (driver update)", vk_life.cache_header_check(&l, blob, 72) == vk_life.HDR_UUID)
+    rt.heap_free(l.uuid, 16)
+    rt.heap_free(blob, 72)
+
+    // ---- a new Life has the documented defaults
+    var d: vk_life.Life = vk_life.life_new()
+    check(&fails, "life defaults", !d.ok && !d.lost && d.sc_gen == 0 && d.epoch == 0 && d.cache == 0)
+    if fails == 0 {
+        io.print("vk_life pure ok\n")
+        return 0
+    }
+    return 1
+}
