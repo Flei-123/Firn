@@ -1,0 +1,770 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/vk_mc.fi -- mc.vk_mc: the Vulkan back end of the voxel client (docs/VK-RENDERER.md). Same `mc_backend.Backend` table as the CPU
+// rasterizer (the reference) and lib/gpu/gl_mc.fi:
+//
+//     var vb: vk_mc.VkBackend = vk_mc.vkbe_open(640, 360)           // loader + device (lavapipe allowed) + targets + pipelines
+//     if vb.ok {
+//         var b: mc_backend.Backend = vk_mc.vkbe_backend(&vb)
+//         b.upload_atlas(b.obj, (&atlas) as u64)                       // texture array, staged copy + layout transitions
+//         b.begin(b.obj, (&cam) as u64, 0xFFE6BE96 as u32)
+//         let h: usize = b.mesh_upload(b.obj, key, verts, nverts, idx, nidx)    // staging buffer -> device local buffer (batched)
+//         b.draw(b.obj, h, ox, oy, oz)
+//         b.end(b.obj)                                                 // submit, signals the slot fence (frame in flight)
+//         let px: u64 = b.present(b.obj)                               // waits for the last frame, RGBA, row 0 = top
+//     }
+//
+// Parts: vk_mem (suballocating allocator), vk_desc (render pass + depth, descriptor sets, pipeline), vk_frame (frames in flight,
+// barriers, immediate submit). Two frames in flight: every slot owns colour + depth image, framebuffer, UBO, read back buffer, descriptor
+// set, command buffer, fence. `end` does not wait; `begin` waits for the slot it reuses; `present` waits for the newest frame.
+// Mesh upload: vertices + indices of one mesh in ONE device buffer; the copy is recorded into the upload command buffer of the next
+// frame slot (submitted before that frame, one barrier to vertex/index reads), staging buffers and freed meshes are released once the
+// frame that could use them has finished. Shaders: lib/gpu/vkmc/mc.vert|frag (SPIR-V embedded).
+// Not here yet (roadmap r180): sky, HUD, entities (draw_entities is a no-op), LOD cross fade works (fade in the push constants).
+// THREADS: main thread only.
+
+import std.rt
+import std.time
+import mc.mc_backend
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_math
+import gpu.vk
+import gpu.vk_mem
+import gpu.vk_desc
+import gpu.vk_frame
+
+export {
+    VkBackend, vkbe_open, vkbe_close, vkbe_backend, vkbe_set_fog, vkbe_set_light, vkbe_resize, vkbe_device_name, vkbe_is_cpu,
+    vkbe_draws, vkbe_tris, vkbe_frames, vkbe_layers_lost, vkbe_in_flight, vkbe_set_readback, vkbe_wait, vkbe_mem_stats,
+    vkbe_live_meshes, vkbe_upload_bytes, vkbe_frame_ms,
+}
+
+const VS_SPV: str = __include_str("../gpu/vkmc/mc.vert.spv")
+const FS_SPV: str = __include_str("../gpu/vkmc/mc.frag.spv")
+
+const NFR: usize = 2 // frames in flight
+const UBO_BYTES: u64 = 112
+const MW: usize = 8 // words per mesh slot
+const M_USED: usize = 0
+const M_BUF: usize = 1
+const M_BLK: usize = 2
+const M_OFF: usize = 3
+const M_SIZE: usize = 4
+const M_IOFF: usize = 5
+const M_NIDX: usize = 6
+const M_KEY: usize = 7
+const DW: usize = 6 // words per deferred release
+const D_KIND: usize = 0 // 0 = mesh buffer (+ its allocation), 1 = staging buffer
+const D_BUF: usize = 1
+const D_BLK: usize = 2
+const D_OFF: usize = 3
+const D_SIZE: usize = 4
+const D_TAG: usize = 5 // free once frames.done >= tag
+
+struct FSlot {
+    col: vk_mem.Img,
+    dep: vk_mem.Img,
+    fb: u64,
+    ubo: vk_mem.Buf,
+    rb: vk_mem.Buf, // read back buffer (w * h * 4)
+}
+
+struct VkBackend {
+    ok: bool,
+    step: i32, // 0 ok, 1 = no Vulkan device/loader, 2 = function table, 3 = frames/descriptors, 4 = render pass/pipelines, 5 = targets, 6 = shaders
+    v: vk.Vk,
+    x: vk_mem.X,
+    fr: vk_frame.Frames,
+    d: vk_desc.Desc,
+    w: i32,
+    h: i32,
+    rp: u64,
+    playout: u64,
+    pipe_op: vk_desc.VPipe,
+    pipe_tr: vk_desc.VPipe,
+    fs: [FSlot; 2],
+    atlas: vk_mem.Img,
+    tile: i32,
+    layers_lost: i32,
+    meshes: u64, // mcap * MW words
+    mcap: usize,
+    live: usize,
+    dfr: u64, // dcap * DW words
+    dcap: usize,
+    dn: usize,
+    // frame state
+    cur: usize, // slot being recorded
+    next: usize, // slot the next begin uses
+    in_frame: bool,
+    has_last: bool,
+    last: usize, // newest submitted slot
+    trec: bool, // the upload command buffer of slot `next` is recording
+    readback: bool,
+    trans: bool,
+    cx: f64,
+    cy: f64,
+    cz: f64,
+    fade_a: f64,
+    fade_inv: f64,
+    day: f64,
+    tr: f64,
+    tg: f64,
+    tb: f64,
+    fog_on: bool,
+    fog_start: f64,
+    fog_end: f64,
+    fog_r: f64,
+    fog_g: f64,
+    fog_b: f64,
+    draws: u64,
+    tris: u64,
+    frames: u64,
+    upload_bytes: u64,
+    t0_ns: u64,
+    frame_ns: u64,
+    push: u64, // 48 octets scratch for the push constants
+    vb: u64, // 8 octets: the vertex buffer handle for vkCmdBindVertexBuffers + offset
+}
+
+fn fslot_none() -> FSlot {
+    return FSlot { col: vk_mem.img_none(), dep: vk_mem.img_none(), fb: 0, ubo: vk_mem.buf_none(), rb: vk_mem.buf_none() }
+}
+
+fn blank() -> VkBackend {
+    return VkBackend { ok: false, step: 0, v: vk.vk_new(), x: vk_mem.x_new(),
+        fr: vk_frame.Frames { ok: false, pool: 0, n: 0, w: 0, icmd: 0, ifence: 0, serial: 0, done: 0, tpending: false },
+        d: vk_desc.desc_none(), w: 0, h: 0, rp: 0, playout: 0, pipe_op: vk_desc.vpipe_none(), pipe_tr: vk_desc.vpipe_none(),
+        fs: [fslot_none(); 2], atlas: vk_mem.img_none(), tile: 0, layers_lost: 0, meshes: 0, mcap: 0, live: 0, dfr: 0, dcap: 0,
+        dn: 0, cur: 0, next: 0, in_frame: false, has_last: false, last: 0, trec: false, readback: true, trans: false,
+        cx: 0.0, cy: 0.0, cz: 0.0, fade_a: 64.0, fade_inv: 0.0, day: 256.0, tr: 256.0, tg: 256.0, tb: 256.0, fog_on: false,
+        fog_start: 20.0, fog_end: 90.0, fog_r: 150.0, fog_g: 190.0, fog_b: 230.0, draws: 0, tris: 0,
+        frames: 0, upload_bytes: 0, t0_ns: 0, frame_ns: 0, push: 0, vb: 0 }
+}
+
+// ---- targets (colour + depth + framebuffer + UBO + read back per slot) -------------------------------------------------------
+fn targets_free(b: *mut VkBackend) {
+    var i: usize = 0
+    while i < NFR {
+        if (*b).fs[i].fb != 0 {
+            vk_mem.cx(&(*b).x, vk_mem.X_DESTROY_FB, (*b).x.dev, (*b).fs[i].fb, 0, 0, 0, 0, 0, 0, 0, 0)
+            (*b).fs[i].fb = 0
+        }
+        vk_mem.img_free(&(*b).x, &(*b).fs[i].col)
+        vk_mem.img_free(&(*b).x, &(*b).fs[i].dep)
+        vk_mem.buf_free(&(*b).x, &(*b).fs[i].ubo)
+        vk_mem.buf_free(&(*b).x, &(*b).fs[i].rb)
+        i = i + 1
+    }
+}
+
+fn targets_make(b: *mut VkBackend) -> bool {
+    var i: usize = 0
+    while i < NFR {
+        // colour: render target + copy source
+        (*b).fs[i].col = vk_mem.img_make(&(*b).x, (*b).w as u32, (*b).h as u32, 1 as u32, vk_desc.FMT_RGBA8, 0x11 as u64, 1 as u64)
+        (*b).fs[i].dep = vk_desc.depth_make(&(*b).x, (*b).w as u32, (*b).h as u32)
+        if !(*b).fs[i].col.ok || !(*b).fs[i].dep.ok {
+            return false
+        }
+        (*b).fs[i].fb = vk_desc.fb_make2(&(*b).x, (*b).rp, (*b).fs[i].col.view, (*b).fs[i].dep.view, (*b).w as u32, (*b).h as u32)
+        if (*b).fs[i].fb == 0 {
+            return false
+        }
+        if !(*b).fs[i].ubo.ok {
+            (*b).fs[i].ubo = vk_mem.buf_make(&(*b).x, UBO_BYTES, vk_mem.U_UNIFORM, vk_mem.MEM_STAGING)
+            if !(*b).fs[i].ubo.ok {
+                return false
+            }
+            vk_desc.desc_write_ubo(&(*b).x, &(*b).d, i, (*b).fs[i].ubo.buf, UBO_BYTES)
+        }
+        (*b).fs[i].rb = vk_mem.buf_make(&(*b).x, ((*b).w as u64) * ((*b).h as u64) * 4, vk_mem.U_DST, vk_mem.MEM_STAGING)
+        if !(*b).fs[i].rb.ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn vkbe_open(w: i32, h: i32) -> VkBackend {
+    var b: VkBackend = blank()
+    b.w = w
+    b.h = h
+    if !vk.open(&b.v, false, true) {
+        b.step = 1
+        return b
+    }
+    if !vk_mem.x_open(&b.x, &b.v) {
+        b.step = 2
+        return b
+    }
+    b.fr = vk_frame.frames_new(&b.x, NFR)
+    b.d = vk_desc.desc_new(&b.x, NFR)
+    if !b.fr.ok || !b.d.ok {
+        b.step = 3
+        return b
+    }
+    b.rp = vk_desc.rpass_voxel(&b.x, vk_desc.FMT_RGBA8, vk_desc.FINAL_TRANSFER_SRC)
+    b.playout = vk_desc.playout_make(&b.x, b.d.dsl)
+    if b.rp == 0 || b.playout == 0 {
+        b.step = 4
+        return b
+    }
+    b.pipe_op = vk_desc.pipeline_voxel(&b.x, b.rp, b.playout, VS_SPV.p as u64, VS_SPV.n, FS_SPV.p as u64, FS_SPV.n, false)
+    b.pipe_tr = vk_desc.pipeline_voxel(&b.x, b.rp, b.playout, VS_SPV.p as u64, VS_SPV.n, FS_SPV.p as u64, FS_SPV.n, true)
+    if !b.pipe_op.ok || !b.pipe_tr.ok {
+        b.step = 6
+        return b
+    }
+    b.mcap = 64
+    b.meshes = rt.heap_alloc(b.mcap * MW * 8)
+    rt.mem_set(b.meshes, 0 as u8, b.mcap * MW * 8)
+    b.dcap = 1024
+    b.dfr = rt.heap_alloc(b.dcap * DW * 8)
+    b.push = rt.heap_alloc(64)
+    b.vb = rt.heap_alloc(32)
+    if !targets_make(&b) {
+        b.step = 5
+        return b
+    }
+    b.ok = true
+    return b
+}
+
+fn vkbe_device_name(b: *mut VkBackend) -> u64 {
+    return vk.device_name(&(*b).v)
+}
+
+fn vkbe_is_cpu(b: *mut VkBackend) -> bool {
+    return vk.is_cpu(&(*b).v)
+}
+
+fn vkbe_draws(b: *mut VkBackend) -> u64 {
+    return (*b).draws
+}
+
+fn vkbe_tris(b: *mut VkBackend) -> u64 {
+    return (*b).tris
+}
+
+fn vkbe_frames(b: *mut VkBackend) -> u64 {
+    return (*b).frames
+}
+
+fn vkbe_layers_lost(b: *mut VkBackend) -> i32 {
+    return (*b).layers_lost
+}
+
+fn vkbe_live_meshes(b: *mut VkBackend) -> usize {
+    return (*b).live
+}
+
+fn vkbe_upload_bytes(b: *mut VkBackend) -> u64 {
+    return (*b).upload_bytes
+}
+
+// wall time of the last frame from begin to the end of present (ns)
+fn vkbe_frame_ms(b: *mut VkBackend) -> f64 {
+    return ((*b).frame_ns as f64) / 1000000.0
+}
+
+// frames submitted and not yet known to be finished
+fn vkbe_in_flight(b: *mut VkBackend) -> u64 {
+    return (*b).fr.serial - (*b).fr.done
+}
+
+fn vkbe_mem_stats(b: *mut VkBackend, out: *mut [u64; 4]) {
+    vk_mem.mem_stats(&(*b).x, out)
+}
+
+// read back the colour image into the slot's host buffer at the end of every frame (default on); off = the frame only renders
+fn vkbe_set_readback(b: *mut VkBackend, on: bool) {
+    (*b).readback = on
+}
+
+fn vkbe_set_light(b: *mut VkBackend, day: i32, tr: i32, tg: i32, tb: i32) {
+    (*b).day = day as f64
+    (*b).tr = tr as f64
+    (*b).tg = tg as f64
+    (*b).tb = tb as f64
+}
+
+fn vkbe_set_fog(b: *mut VkBackend, on: bool, start: f64, end: f64, r: u32, g: u32, bl: u32) {
+    (*b).fog_on = on
+    (*b).fog_start = start
+    (*b).fog_end = end
+    (*b).fog_r = r as f64
+    (*b).fog_g = g as f64
+    (*b).fog_b = bl as f64
+}
+
+// ---- deferred releases ---------------------------------------------------------------------------------------------------
+fn reap(b: *mut VkBackend) {
+    var i: usize = 0
+    var keep: usize = 0
+    while i < (*b).dn {
+        let q: usize = i * DW
+        if rt.ld64((*b).dfr, q + D_TAG) <= (*b).fr.done {
+            vk_mem.cx(&(*b).x, vk_mem.X_DESTROY_BUFFER, (*b).x.dev, rt.ld64((*b).dfr, q + D_BUF), 0, 0, 0, 0, 0, 0, 0, 0)
+            var a: vk_mem.Alloc = vk_mem.alloc_none()
+            a.ok = true
+            a.blk = rt.ld64((*b).dfr, q + D_BLK) as usize
+            a.off = rt.ld64((*b).dfr, q + D_OFF)
+            a.size = rt.ld64((*b).dfr, q + D_SIZE)
+            vk_mem.mem_free(&(*b).x, &a)
+        } else {
+            if keep != i {
+                var k: usize = 0
+                while k < DW {
+                    rt.st64((*b).dfr, keep * DW + k, rt.ld64((*b).dfr, q + k))
+                    k = k + 1
+                }
+            }
+            keep = keep + 1
+        }
+        i = i + 1
+    }
+    (*b).dn = keep
+}
+
+fn defer_add(b: *mut VkBackend, kind: u64, buf: u64, blk: usize, off: u64, size: u64) {
+    if (*b).dn >= (*b).dcap {
+        // full: finish all frames, which releases everything
+        vk_frame.frame_wait_all(&(*b).x, &(*b).fr)
+        reap(b)
+    }
+    let q: usize = (*b).dn * DW
+    rt.st64((*b).dfr, q + D_KIND, kind)
+    rt.st64((*b).dfr, q + D_BUF, buf)
+    rt.st64((*b).dfr, q + D_BLK, blk as u64)
+    rt.st64((*b).dfr, q + D_OFF, off)
+    rt.st64((*b).dfr, q + D_SIZE, size)
+    rt.st64((*b).dfr, q + D_TAG, (*b).fr.serial + 1)
+    (*b).dn = (*b).dn + 1
+}
+
+// ---- atlas -----------------------------------------------------------------------------------------------------------------
+fn be_atlas(o: u64, a: u64) {
+    let b: *mut VkBackend = o as *mut VkBackend
+    let at: *mut mc_texture.Atlas = a as *mut mc_texture.Atlas
+    if !(*b).ok || (*at).px == 0 {
+        return
+    }
+    vk_frame.frame_wait_all(&(*b).x, &(*b).fr)
+    reap(b)
+    vk_mem.img_free(&(*b).x, &(*b).atlas)
+    let t: usize = (*at).tile as usize
+    var layers: usize = ((*at).cols as usize) * ((*at).rows as usize)
+    (*b).layers_lost = 0
+    if (layers as u64) > (*b).x.max_layers {
+        (*b).layers_lost = (layers as i32) - ((*b).x.max_layers as i32)
+        layers = (*b).x.max_layers as usize
+    }
+    let row: usize = t * 4
+    let lbytes: usize = t * row
+    let stride: usize = ((*at).w as usize) * 4
+    var st: vk_mem.Buf = vk_mem.buf_make(&(*b).x, (layers * lbytes) as u64, vk_mem.U_SRC, vk_mem.MEM_STAGING)
+    if !st.ok {
+        return
+    }
+    var l: usize = 0
+    while l < layers {
+        let col: usize = l % ((*at).cols as usize)
+        let rw: usize = l / ((*at).cols as usize)
+        var y: usize = 0
+        while y < t {
+            rt.mem_copy(st.ptr + (l * lbytes + y * row) as u64, (*at).px + ((rw * t + y) * stride + col * row) as u64, row)
+            y = y + 1
+        }
+        l = l + 1
+    }
+    (*b).atlas = vk_mem.img_make(&(*b).x, (*at).tile as u32, (*at).tile as u32, layers as u32, vk_desc.FMT_RGBA8, 0x6 as u64, 1 as u64)
+    if !(*b).atlas.ok {
+        vk_mem.buf_free(&(*b).x, &st)
+        return
+    }
+    let cmd: u64 = vk_frame.imm_begin(&(*b).x, &(*b).fr)
+    // UNDEFINED -> TRANSFER_DST, copy all layers, -> SHADER_READ_ONLY (visible to the fragment shader)
+    vk_frame.image_barrier(&(*b).x, cmd, (*b).atlas.img, 1, layers as u64, vk_frame.LAYOUT_UNDEFINED, vk_frame.LAYOUT_TRANSFER_DST,
+        vk_frame.ST_TOP, vk_frame.ST_TRANSFER, 0, vk_frame.AC_TRANSFER_WRITE)
+    (*b).x.top = 0
+    let rg: u64 = vk_mem.xsa(&(*b).x, 56)
+    vk_mem.w32(rg, 16, 1) // aspect colour
+    vk_mem.w32(rg, 24, 0)
+    vk_mem.w32(rg, 28, layers as u64)
+    vk_mem.w32(rg, 44, t as u64)
+    vk_mem.w32(rg, 48, t as u64)
+    vk_mem.w32(rg, 52, 1)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_COPY_B2I, cmd, st.buf, (*b).atlas.img, vk_frame.LAYOUT_TRANSFER_DST, 1, rg, 0, 0, 0, 0)
+    vk_frame.image_barrier(&(*b).x, cmd, (*b).atlas.img, 1, layers as u64, vk_frame.LAYOUT_TRANSFER_DST, vk_frame.LAYOUT_SHADER_READ,
+        vk_frame.ST_TRANSFER, vk_frame.ST_FRAGMENT, vk_frame.AC_TRANSFER_WRITE, vk_frame.AC_SHADER_READ)
+    vk_frame.imm_submit(&(*b).x, &(*b).fr)
+    vk_mem.buf_free(&(*b).x, &st)
+    (*b).tile = (*at).tile
+    var i: usize = 0
+    while i < NFR {
+        vk_desc.desc_write_atlas(&(*b).x, &(*b).d, i, (*b).atlas.view)
+        i = i + 1
+    }
+}
+
+// ---- meshes ------------------------------------------------------------------------------------------------------------------
+fn ensure_tcmd(b: *mut VkBackend) -> u64 {
+    let c: u64 = vk_frame.frame_tcmd(&(*b).fr, (*b).next)
+    if (*b).trec {
+        return c
+    }
+    // the slot's previous use must be finished before its command buffer is reset
+    vk_frame.frame_wait(&(*b).x, &(*b).fr, (*b).next)
+    reap(b)
+    if !vk_frame.cmd_begin(&(*b).x, c) {
+        return 0
+    }
+    (*b).trec = true
+    return c
+}
+
+fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize) -> usize {
+    let b: *mut VkBackend = o as *mut VkBackend
+    if !(*b).ok || nverts == 0 || nidx < 3 {
+        return 0
+    }
+    let vbytes: u64 = (nverts as u64) * 8
+    let ioff: u64 = (vbytes + 15) / 16 * 16
+    let total: u64 = ioff + (nidx as u64) * 4
+    let c: u64 = ensure_tcmd(b)
+    if c == 0 {
+        return 0
+    }
+    var st: vk_mem.Buf = vk_mem.buf_make(&(*b).x, total, vk_mem.U_SRC, vk_mem.MEM_STAGING)
+    if !st.ok {
+        return 0
+    }
+    var dv: vk_mem.Buf = vk_mem.buf_make(&(*b).x, total, vk_mem.U_VERTEX | vk_mem.U_INDEX | vk_mem.U_DST, vk_mem.MEM_DEVICE)
+    if !dv.ok {
+        vk_mem.buf_free(&(*b).x, &st)
+        return 0
+    }
+    rt.mem_copy(st.ptr, verts, nverts * 8)
+    rt.mem_copy(st.ptr + ioff, idx, nidx * 4)
+    (*b).x.top = 0
+    let rg: u64 = vk_mem.xsa(&(*b).x, 24)
+    vk_mem.w64(rg, 16, total)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_COPY_BUF, c, st.buf, dv.buf, 1, rg, 0, 0, 0, 0, 0)
+    (*b).upload_bytes = (*b).upload_bytes + total
+    // the staging buffer goes away once the frame that carries this copy has finished
+    defer_add(b, 1, st.buf, st.a.blk, st.a.off, st.a.size)
+    // slot in the mesh table
+    var s: usize = 0
+    while s < (*b).mcap && rt.ld64((*b).meshes, s * MW + M_USED) != 0 {
+        s = s + 1
+    }
+    if s >= (*b).mcap {
+        let ncap: usize = (*b).mcap * 2
+        let nm: u64 = rt.heap_alloc(ncap * MW * 8)
+        rt.mem_set(nm, 0 as u8, ncap * MW * 8)
+        rt.mem_copy(nm, (*b).meshes, (*b).mcap * MW * 8)
+        rt.heap_free((*b).meshes, (*b).mcap * MW * 8)
+        (*b).meshes = nm
+        (*b).mcap = ncap
+    }
+    let q: usize = s * MW
+    rt.st64((*b).meshes, q + M_USED, 1)
+    rt.st64((*b).meshes, q + M_BUF, dv.buf)
+    rt.st64((*b).meshes, q + M_BLK, dv.a.blk as u64)
+    rt.st64((*b).meshes, q + M_OFF, dv.a.off)
+    rt.st64((*b).meshes, q + M_SIZE, dv.a.size)
+    rt.st64((*b).meshes, q + M_IOFF, ioff)
+    rt.st64((*b).meshes, q + M_NIDX, nidx as u64)
+    rt.st64((*b).meshes, q + M_KEY, key)
+    (*b).live = (*b).live + 1
+    return s + 1
+}
+
+fn be_free(o: u64, h: usize) {
+    let b: *mut VkBackend = o as *mut VkBackend
+    if h < 1 || h > (*b).mcap {
+        return
+    }
+    let q: usize = (h - 1) * MW
+    if rt.ld64((*b).meshes, q + M_USED) == 0 {
+        return
+    }
+    defer_add(b, 0, rt.ld64((*b).meshes, q + M_BUF), rt.ld64((*b).meshes, q + M_BLK) as usize, rt.ld64((*b).meshes, q + M_OFF),
+        rt.ld64((*b).meshes, q + M_SIZE))
+    rt.st64((*b).meshes, q + M_USED, 0)
+    (*b).live = (*b).live - 1
+}
+
+// ---- frame ---------------------------------------------------------------------------------------------------------------------
+fn be_begin(o: u64, cam: u64, rgba: u32) {
+    let b: *mut VkBackend = o as *mut VkBackend
+    let c: *mut mc_camera.Camera = cam as *mut mc_camera.Camera
+    if !(*b).ok || (*b).in_frame {
+        return
+    }
+    (*b).t0_ns = (time.monotonic_ns() as u64)
+    let s: usize = (*b).next
+    (*b).cur = s
+    vk_frame.frame_wait(&(*b).x, &(*b).fr, s)
+    reap(b)
+    (*b).cx = (*c).x
+    (*b).cy = (*c).y
+    (*b).cz = (*c).z
+    // projection * view rotation (the camera translation is applied per draw on the CPU, f64)
+    var rot: mc_math.Mat4 = (*c).view
+    rot.m[12] = 0.0
+    rot.m[13] = 0.0
+    rot.m[14] = 0.0
+    var rv: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
+    mc_math.mat4_mul(&rv, &(*c).proj, &rot)
+    let u: u64 = (*b).fs[s].ubo.ptr
+    var i: usize = 0
+    while i < 16 {
+        vk_mem.wf(u, i * 4, rv.m[i])
+        i = i + 1
+    }
+    var fo: f64 = 0.0
+    if (*b).fog_on { fo = 1.0 }
+    vk_mem.wf(u, 64, fo)
+    vk_mem.wf(u, 68, (*b).fog_start)
+    vk_mem.wf(u, 72, (*b).fog_end)
+    vk_mem.wf(u, 80, (*b).fog_r)
+    vk_mem.wf(u, 84, (*b).fog_g)
+    vk_mem.wf(u, 88, (*b).fog_b)
+    vk_mem.wf(u, 96, (*b).tile as f64)
+    let cmd: u64 = vk_frame.frame_cmd(&(*b).fr, s)
+    vk_frame.cmd_begin(&(*b).x, cmd)
+    (*b).x.top = 0
+    let cv: u64 = vk_mem.xsa(&(*b).x, 32)
+    vk_mem.wf(cv, 0, ((rgba & 255 as u32) as f64) / 255.0)
+    vk_mem.wf(cv, 4, (((rgba >> 8 as u32) & 255 as u32) as f64) / 255.0)
+    vk_mem.wf(cv, 8, (((rgba >> 16 as u32) & 255 as u32) as f64) / 255.0)
+    vk_mem.wf(cv, 12, (((rgba >> 24 as u32) & 255 as u32) as f64) / 255.0)
+    vk_mem.wf(cv, 16, 1.0) // depth
+    let bi: u64 = vk_mem.xsa(&(*b).x, 64)
+    vk_mem.w32(bi, 0, 43) // RENDER_PASS_BEGIN_INFO
+    vk_mem.w64(bi, 16, (*b).rp)
+    vk_mem.w64(bi, 24, (*b).fs[s].fb)
+    vk_mem.w32(bi, 40, (*b).w as u64)
+    vk_mem.w32(bi, 44, (*b).h as u64)
+    vk_mem.w32(bi, 48, 2)
+    vk_mem.w64(bi, 56, cv)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BEGIN_RP, cmd, bi, 0, 0, 0, 0, 0, 0, 0, 0)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_PIPE, cmd, 0, (*b).pipe_op.pipe, 0, 0, 0, 0, 0, 0, 0)
+    let ds: u64 = vk_mem.xsa(&(*b).x, 8)
+    vk_mem.w64(ds, 0, vk_mem.r64((*b).d.sets, s * 8))
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_DS, cmd, 0, (*b).playout, 0, 1, ds, 0, 0, 0, 0)
+    let vp: u64 = vk_mem.xsa(&(*b).x, 24)
+    vk_mem.wf(vp, 8, (*b).w as f64)
+    vk_mem.wf(vp, 12, (*b).h as f64)
+    vk_mem.wf(vp, 20, 1.0)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_SET_VP, cmd, 0, 1, vp, 0, 0, 0, 0, 0, 0)
+    let sc: u64 = vk_mem.xsa(&(*b).x, 16)
+    vk_mem.w32(sc, 8, (*b).w as u64)
+    vk_mem.w32(sc, 12, (*b).h as u64)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_SET_SC, cmd, 0, 1, sc, 0, 0, 0, 0, 0, 0)
+    (*b).trans = false
+    (*b).fade_a = 64.0
+    (*b).fade_inv = 0.0
+    (*b).in_frame = true
+}
+
+fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
+    let b: *mut VkBackend = o as *mut VkBackend
+    if !(*b).in_frame || h < 1 || h > (*b).mcap {
+        return 0 as u64
+    }
+    let q: usize = (h - 1) * MW
+    if rt.ld64((*b).meshes, q + M_USED) == 0 {
+        return 0 as u64
+    }
+    let nidx: u64 = rt.ld64((*b).meshes, q + M_NIDX)
+    let cmd: u64 = vk_frame.frame_cmd(&(*b).fr, (*b).cur)
+    let p: u64 = (*b).push
+    vk_mem.wf(p, 0, ox - (*b).cx)
+    vk_mem.wf(p, 4, oy - (*b).cy)
+    vk_mem.wf(p, 8, oz - (*b).cz)
+    var tf: f64 = 0.0
+    if (*b).trans { tf = 1.0 }
+    vk_mem.wf(p, 12, tf)
+    vk_mem.wf(p, 16, (*b).fade_a)
+    vk_mem.wf(p, 20, (*b).fade_inv)
+    vk_mem.wf(p, 24, 0.0)
+    vk_mem.wf(p, 28, 0.0)
+    vk_mem.wf(p, 32, (*b).day)
+    vk_mem.wf(p, 36, (*b).tr)
+    vk_mem.wf(p, 40, (*b).tg)
+    vk_mem.wf(p, 44, (*b).tb)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_PUSH, cmd, (*b).playout, 0x11, 0, vk_desc.PUSH_BYTES, p, 0, 0, 0, 0)
+    let buf: u64 = rt.ld64((*b).meshes, q + M_BUF)
+    vk_mem.w64((*b).vb, 0, buf)
+    vk_mem.w64((*b).vb, 8, 0)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_VB, cmd, 0, 1, (*b).vb, (*b).vb + 8, 0, 0, 0, 0, 0)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_IB, cmd, buf, rt.ld64((*b).meshes, q + M_IOFF), 1, 0, 0, 0, 0, 0, 0)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_DRAW_IDX, cmd, nidx, 1, 0, 0, 0, 0, 0, 0, 0)
+    (*b).draws = (*b).draws + 1 as u64
+    let t: u64 = nidx / 3
+    (*b).tris = (*b).tris + t
+    return t
+}
+
+fn be_set_pass(o: u64, pass: i32) {
+    let b: *mut VkBackend = o as *mut VkBackend
+    if !(*b).in_frame {
+        return
+    }
+    let tr: bool = pass == mc_backend.PASS_TRANS
+    if tr == (*b).trans {
+        return
+    }
+    (*b).trans = tr
+    var pipe: u64 = (*b).pipe_op.pipe
+    if tr { pipe = (*b).pipe_tr.pipe }
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_PIPE, vk_frame.frame_cmd(&(*b).fr, (*b).cur), 0, pipe, 0, 0, 0, 0, 0, 0, 0)
+}
+
+fn be_set_light(o: u64, day: i32, tr: i32, tg: i32, tb: i32) {
+    vkbe_set_light(o as *mut VkBackend, day, tr, tg, tb)
+}
+
+fn be_set_fade(o: u64, a: i32, inv: i32) {
+    let b: *mut VkBackend = o as *mut VkBackend
+    (*b).fade_a = a as f64
+    (*b).fade_inv = inv as f64
+}
+
+fn be_end(o: u64) {
+    let b: *mut VkBackend = o as *mut VkBackend
+    if !(*b).in_frame {
+        return
+    }
+    let s: usize = (*b).cur
+    let cmd: u64 = vk_frame.frame_cmd(&(*b).fr, s)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_END_RP, cmd, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    if (*b).readback {
+        (*b).x.top = 0
+        let rg: u64 = vk_mem.xsa(&(*b).x, 56)
+        vk_mem.w32(rg, 16, 1)
+        vk_mem.w32(rg, 28, 1)
+        vk_mem.w32(rg, 44, (*b).w as u64)
+        vk_mem.w32(rg, 48, (*b).h as u64)
+        vk_mem.w32(rg, 52, 1)
+        vk_mem.cx(&(*b).x, vk_mem.X_CMD_COPY_I2B, cmd, (*b).fs[s].col.img, vk_frame.LAYOUT_TRANSFER_SRC, (*b).fs[s].rb.buf, 1, rg, 0, 0, 0, 0)
+        vk_frame.mem_barrier(&(*b).x, cmd, vk_frame.ST_TRANSFER, vk_frame.ST_HOST, vk_frame.AC_TRANSFER_WRITE, vk_frame.AC_HOST_READ)
+    }
+    vk_frame.cmd_end(&(*b).x, cmd)
+    var pre: u64 = 0
+    if (*b).trec {
+        // uploads recorded for this slot: make them visible to the vertex / index fetch, then submit them BEFORE the frame
+        let tc: u64 = vk_frame.frame_tcmd(&(*b).fr, s)
+        vk_frame.mem_barrier(&(*b).x, tc, vk_frame.ST_TRANSFER, vk_frame.ST_VERTEX_INPUT, vk_frame.AC_TRANSFER_WRITE,
+            vk_frame.AC_INDEX_READ | vk_frame.AC_VERTEX_READ)
+        vk_frame.cmd_end(&(*b).x, tc)
+        pre = tc
+        (*b).trec = false
+    }
+    vk_frame.frame_submit(&(*b).x, &(*b).fr, s, pre, 0, 0)
+    (*b).in_frame = false
+    (*b).has_last = true
+    (*b).last = s
+    (*b).next = (s + 1) % NFR
+    (*b).frames = (*b).frames + 1 as u64
+}
+
+fn vkbe_wait(b: *mut VkBackend) {
+    vk_frame.frame_wait_all(&(*b).x, &(*b).fr)
+    reap(b)
+}
+
+// Address of the newest frame (waits for it): w*h*4 octets RGBA, row 0 = top. 0 = no frame yet / read back off.
+fn be_present(o: u64) -> u64 {
+    let b: *mut VkBackend = o as *mut VkBackend
+    if !(*b).has_last || !(*b).readback {
+        return 0 as u64
+    }
+    vk_frame.frame_wait(&(*b).x, &(*b).fr, (*b).last)
+    reap(b)
+    (*b).frame_ns = (time.monotonic_ns() as u64) - (*b).t0_ns
+    return (*b).fs[(*b).last].rb.ptr
+}
+
+fn be_read(o: u64, out: u64) {
+    let b: *mut VkBackend = o as *mut VkBackend
+    let p: u64 = be_present(o)
+    if p != 0 {
+        rt.mem_copy(out, p, ((*b).w as usize) * ((*b).h as usize) * 4)
+    }
+}
+
+fn nop_ents(o: u64, recs: u64, n: usize) -> u64 {
+    return 0 as u64
+}
+
+// New target size (waits for all frames).
+fn vkbe_resize(b: *mut VkBackend, w: i32, h: i32) -> bool {
+    if !(*b).ok || (*b).in_frame {
+        return false
+    }
+    vk_frame.frame_wait_all(&(*b).x, &(*b).fr)
+    targets_free(b)
+    (*b).w = w
+    (*b).h = h
+    (*b).has_last = false
+    return targets_make(b)
+}
+
+fn vkbe_close(b: *mut VkBackend) {
+    if !(*b).v.ok {
+        return
+    }
+    if (*b).x.ok {
+        vk_mem.x_idle(&(*b).x)
+        (*b).fr.done = (*b).fr.serial
+        reap(b)
+        var s: usize = 0
+        while s < (*b).mcap && (*b).meshes != 0 {
+            if rt.ld64((*b).meshes, s * MW + M_USED) != 0 {
+                vk_mem.cx(&(*b).x, vk_mem.X_DESTROY_BUFFER, (*b).x.dev, rt.ld64((*b).meshes, s * MW + M_BUF), 0, 0, 0, 0, 0, 0, 0, 0)
+                rt.st64((*b).meshes, s * MW + M_USED, 0)
+            }
+            s = s + 1
+        }
+        targets_free(b)
+        vk_mem.img_free(&(*b).x, &(*b).atlas)
+        vk_desc.vpipe_free(&(*b).x, &(*b).pipe_op)
+        vk_desc.vpipe_free(&(*b).x, &(*b).pipe_tr)
+        if (*b).playout != 0 {
+            vk_mem.cx(&(*b).x, vk_mem.X_DESTROY_PLAYOUT, (*b).x.dev, (*b).playout, 0, 0, 0, 0, 0, 0, 0, 0)
+        }
+        if (*b).rp != 0 {
+            vk_mem.cx(&(*b).x, vk_mem.X_DESTROY_RP, (*b).x.dev, (*b).rp, 0, 0, 0, 0, 0, 0, 0, 0)
+        }
+        vk_desc.desc_free(&(*b).x, &(*b).d)
+        vk_frame.frames_free(&(*b).x, &(*b).fr)
+        vk_mem.x_close(&(*b).x)
+    }
+    vk.close(&(*b).v)
+    (*b).ok = false
+}
+
+// The Vulkan back end as a `mc_backend.Backend` table (kind KIND_VK). `b` must outlive the table.
+fn vkbe_backend(b: *mut VkBackend) -> mc_backend.Backend {
+    var t: mc_backend.Backend = mc_backend.backend_new()
+    t.kind = mc_backend.KIND_VK
+    t.obj = b as u64
+    t.upload_atlas = be_atlas
+    t.mesh_upload = be_upload
+    t.mesh_free = be_free
+    t.begin = be_begin
+    t.draw = be_draw
+    t.end = be_end
+    t.present = be_present
+    t.read_pixels = be_read
+    t.set_pass = be_set_pass
+    t.set_light = be_set_light
+    t.set_fade = be_set_fade
+    t.ent_obj = 0
+    t.draw_entities = nop_ents
+    return t
+}
