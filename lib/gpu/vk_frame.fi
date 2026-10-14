@@ -1,0 +1,337 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/vk_frame.fi -- gpu.vk_frame: frames in flight + command recording helpers (docs/VK-RENDERER.md).
+//
+// `Frames` owns a command pool and N frame slots; every slot has a primary command buffer, a fence (created signaled) and an
+// acquire/done semaphore pair (for a swapchain present, used by the window path; the offscreen path only needs the fence).
+// A frame is: frame_wait(slot) (blocks until the slot's previous submission finished) -> record into slot.cmd -> frame_submit.
+// Per slot a `tcmd` (batch of uploads recorded before the slot's frame, submitted with it) and one `icmd` for synchronous work
+// (atlas upload, one shot copies) that is submitted and waited on in place.
+// THREADS: main thread only.
+
+import std.rt
+import gpu.vk_mem
+
+export {
+    Frames, frames_new, frames_free, frame_cmd, frame_tcmd, frame_fence, frame_sem_acq, frame_sem_done, frame_wait, frame_wait_all,
+    frame_submit, cmd_begin, cmd_end, image_barrier, mem_barrier, imm_begin, imm_submit, submit_one,
+    LAYOUT_UNDEFINED, LAYOUT_COLOR, LAYOUT_DEPTH, LAYOUT_SHADER_READ, LAYOUT_TRANSFER_SRC, LAYOUT_TRANSFER_DST, LAYOUT_PRESENT,
+    ST_TOP, ST_VERTEX_INPUT, ST_VERTEX, ST_FRAGMENT, ST_EARLY, ST_LATE, ST_COLOR_OUT, ST_TRANSFER, ST_BOTTOM, ST_HOST,
+    AC_TRANSFER_READ, AC_TRANSFER_WRITE, AC_SHADER_READ, AC_COLOR_WRITE, AC_INDEX_READ, AC_VERTEX_READ, AC_UNIFORM_READ, AC_HOST_READ,
+    AC_HOST_WRITE,
+}
+
+const LAYOUT_UNDEFINED: u64 = 0
+const LAYOUT_COLOR: u64 = 2
+const LAYOUT_DEPTH: u64 = 3
+const LAYOUT_SHADER_READ: u64 = 5
+const LAYOUT_TRANSFER_SRC: u64 = 6
+const LAYOUT_TRANSFER_DST: u64 = 7
+const LAYOUT_PRESENT: u64 = 1000001002
+
+const ST_TOP: u64 = 0x1
+const ST_VERTEX_INPUT: u64 = 0x4
+const ST_VERTEX: u64 = 0x8
+const ST_FRAGMENT: u64 = 0x80
+const ST_EARLY: u64 = 0x100
+const ST_LATE: u64 = 0x200
+const ST_COLOR_OUT: u64 = 0x400
+const ST_TRANSFER: u64 = 0x1000
+const ST_BOTTOM: u64 = 0x2000
+const ST_HOST: u64 = 0x4000
+
+const AC_INDEX_READ: u64 = 0x2
+const AC_VERTEX_READ: u64 = 0x4
+const AC_UNIFORM_READ: u64 = 0x8
+const AC_SHADER_READ: u64 = 0x20
+const AC_COLOR_WRITE: u64 = 0x100
+const AC_TRANSFER_READ: u64 = 0x800
+const AC_TRANSFER_WRITE: u64 = 0x1000
+const AC_HOST_READ: u64 = 0x2000
+const AC_HOST_WRITE: u64 = 0x4000
+
+const FW: usize = 7 // words per frame slot
+const W_CMD: usize = 0
+const W_FENCE: usize = 1
+const W_SEM_ACQ: usize = 2
+const W_SEM_DONE: usize = 3
+const W_PENDING: usize = 4 // 1 = submitted and not yet waited on
+const W_SERIAL: usize = 5 // submit serial of the pending submission
+const W_TCMD: usize = 6 // per-slot upload batch command buffer (recorded before the slot's frame, submitted with it)
+
+struct Frames {
+    ok: bool,
+    pool: u64,
+    n: usize,
+    w: u64, // n * FW u64
+    icmd: u64, // immediate command buffer
+    ifence: u64, // fence of the immediate submissions + upload batches
+    serial: u64, // last submit serial
+    done: u64, // highest serial known to be finished
+    tpending: bool, // tcmd was submitted with ifence and not waited on
+}
+
+fn frame_cmd(f: *mut Frames, i: usize) -> u64 {
+    return rt.ld64((*f).w, i * FW + W_CMD)
+}
+
+fn frame_tcmd(f: *mut Frames, i: usize) -> u64 {
+    return rt.ld64((*f).w, i * FW + W_TCMD)
+}
+
+fn frame_fence(f: *mut Frames, i: usize) -> u64 {
+    return rt.ld64((*f).w, i * FW + W_FENCE)
+}
+
+fn frame_sem_acq(f: *mut Frames, i: usize) -> u64 {
+    return rt.ld64((*f).w, i * FW + W_SEM_ACQ)
+}
+
+fn frame_sem_done(f: *mut Frames, i: usize) -> u64 {
+    return rt.ld64((*f).w, i * FW + W_SEM_DONE)
+}
+
+fn mk_fence(x: *mut vk_mem.X, signaled: bool) -> u64 {
+    (*x).top = 0
+    let fi: u64 = vk_mem.xsa(x, 24)
+    vk_mem.w32(fi, 0, 8) // FENCE_CREATE_INFO
+    if signaled {
+        vk_mem.w32(fi, 16, 1)
+    }
+    let out: u64 = vk_mem.xsa(x, 8)
+    if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_FENCE, (*x).dev, fi, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return 0
+    }
+    return vk_mem.r64(out, 0)
+}
+
+fn mk_sem(x: *mut vk_mem.X) -> u64 {
+    (*x).top = 0
+    let si: u64 = vk_mem.xsa(x, 24)
+    vk_mem.w32(si, 0, 9) // SEMAPHORE_CREATE_INFO
+    let out: u64 = vk_mem.xsa(x, 8)
+    if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_SEM, (*x).dev, si, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return 0
+    }
+    return vk_mem.r64(out, 0)
+}
+
+fn frames_new(x: *mut vk_mem.X, n: usize) -> Frames {
+    var f: Frames = Frames { ok: false, pool: 0, n: n, w: 0, icmd: 0, ifence: 0, serial: 0, done: 0, tpending: false }
+    (*x).top = 0
+    let pi: u64 = vk_mem.xsa(x, 24)
+    vk_mem.w32(pi, 0, 39) // COMMAND_POOL_CREATE_INFO
+    vk_mem.w32(pi, 16, 2) // RESET_COMMAND_BUFFER
+    vk_mem.w32(pi, 20, (*x).qfam)
+    let out: u64 = vk_mem.xsa(x, 8)
+    if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_CPOOL, (*x).dev, pi, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return f
+    }
+    f.pool = vk_mem.r64(out, 0)
+    f.w = rt.heap_alloc(n * FW * 8)
+    rt.mem_set(f.w, 0 as u8, n * FW * 8)
+    let cmds: u64 = rt.heap_alloc((2 * n + 1) * 8) // heap: mk_fence / mk_sem reset the scratch
+    rt.mem_set(cmds, 0 as u8, (2 * n + 1) * 8)
+    let ai: u64 = vk_mem.xsa(x, 32)
+    vk_mem.w32(ai, 0, 40) // COMMAND_BUFFER_ALLOCATE_INFO
+    vk_mem.w64(ai, 16, f.pool)
+    vk_mem.w32(ai, 24, 0) // PRIMARY
+    vk_mem.w32(ai, 28, (2 * n + 1) as u64)
+    if !vk_mem.good(vk_mem.cx(x, vk_mem.X_ALLOC_CMD, (*x).dev, ai, cmds, 0, 0, 0, 0, 0, 0, 0)) {
+        rt.heap_free(cmds, (2 * n + 1) * 8)
+        return f
+    }
+    var i: usize = 0
+    while i < n {
+        rt.st64(f.w, i * FW + W_CMD, vk_mem.r64(cmds, i * 8))
+        rt.st64(f.w, i * FW + W_FENCE, mk_fence(x, false))
+        rt.st64(f.w, i * FW + W_SEM_ACQ, mk_sem(x))
+        rt.st64(f.w, i * FW + W_SEM_DONE, mk_sem(x))
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        rt.st64(f.w, i * FW + W_TCMD, vk_mem.r64(cmds, (n + i) * 8))
+        i = i + 1
+    }
+    f.icmd = vk_mem.r64(cmds, (2 * n) * 8)
+    rt.heap_free(cmds, (2 * n + 1) * 8)
+    f.ifence = mk_fence(x, false)
+    f.ok = f.ifence != 0
+    return f
+}
+
+fn frames_free(x: *mut vk_mem.X, f: *mut Frames) {
+    if (*f).pool == 0 {
+        return
+    }
+    var i: usize = 0
+    while i < (*f).n {
+        vk_mem.cx(x, vk_mem.X_DESTROY_FENCE, (*x).dev, frame_fence(f, i), 0, 0, 0, 0, 0, 0, 0, 0)
+        vk_mem.cx(x, vk_mem.X_DESTROY_SEM, (*x).dev, frame_sem_acq(f, i), 0, 0, 0, 0, 0, 0, 0, 0)
+        vk_mem.cx(x, vk_mem.X_DESTROY_SEM, (*x).dev, frame_sem_done(f, i), 0, 0, 0, 0, 0, 0, 0, 0)
+        i = i + 1
+    }
+    vk_mem.cx(x, vk_mem.X_DESTROY_FENCE, (*x).dev, (*f).ifence, 0, 0, 0, 0, 0, 0, 0, 0)
+    vk_mem.cx(x, vk_mem.X_DESTROY_CPOOL, (*x).dev, (*f).pool, 0, 0, 0, 0, 0, 0, 0, 0)
+    rt.heap_free((*f).w, (*f).n * FW * 8)
+    (*f).pool = 0
+    (*f).ok = false
+}
+
+fn wait_one(x: *mut vk_mem.X, fence: u64) -> bool {
+    (*x).top = 0
+    let fp: u64 = vk_mem.xsa(x, 8)
+    vk_mem.w64(fp, 0, fence)
+    let r: u64 = vk_mem.cx(x, vk_mem.X_WAIT_FENCES, (*x).dev, 1, fp, 1, 0xFFFFFFFFFFFFFFFF, 0, 0, 0, 0, 0)
+    if !vk_mem.good(r) {
+        return false
+    }
+    vk_mem.cx(x, vk_mem.X_RESET_FENCES, (*x).dev, 1, fp, 0, 0, 0, 0, 0, 0, 0)
+    return true
+}
+
+// Blocks until the previous submission of slot `i` has finished (no-op when it has none). Returns the highest finished serial.
+fn frame_wait(x: *mut vk_mem.X, f: *mut Frames, i: usize) -> u64 {
+    if rt.ld64((*f).w, i * FW + W_PENDING) != 0 {
+        wait_one(x, frame_fence(f, i))
+        rt.st64((*f).w, i * FW + W_PENDING, 0)
+        let s: u64 = rt.ld64((*f).w, i * FW + W_SERIAL)
+        if s > (*f).done { (*f).done = s }
+    }
+    return (*f).done
+}
+
+fn frame_wait_all(x: *mut vk_mem.X, f: *mut Frames) -> u64 {
+    var i: usize = 0
+    while i < (*f).n {
+        frame_wait(x, f, i)
+        i = i + 1
+    }
+    if (*f).tpending {
+        wait_one(x, (*f).ifence)
+        (*f).tpending = false
+    }
+    (*f).done = (*f).serial
+    return (*f).done
+}
+
+fn cmd_begin(x: *mut vk_mem.X, cmd: u64) -> bool {
+    (*x).top = 0
+    vk_mem.cx(x, vk_mem.X_RESET_CMD, cmd, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    let bi: u64 = vk_mem.xsa(x, 32)
+    vk_mem.w32(bi, 0, 42) // COMMAND_BUFFER_BEGIN_INFO
+    vk_mem.w32(bi, 16, 1) // ONE_TIME_SUBMIT
+    return vk_mem.good(vk_mem.cx(x, vk_mem.X_BEGIN_CMD, cmd, bi, 0, 0, 0, 0, 0, 0, 0, 0))
+}
+
+fn cmd_end(x: *mut vk_mem.X, cmd: u64) -> bool {
+    return vk_mem.good(vk_mem.cx(x, vk_mem.X_END_CMD, cmd, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+}
+
+// Submits up to 2 command buffers (in this order) on the queue with `fence`; wait_sem / signal_sem 0 = none.
+fn submit_two(x: *mut vk_mem.X, c0: u64, c1: u64, wait_sem: u64, wait_stage: u64, signal_sem: u64, fence: u64) -> bool {
+    (*x).top = 0
+    let cm: u64 = vk_mem.xsa(x, 16)
+    var nc: u64 = 0
+    if c0 != 0 {
+        vk_mem.w64(cm, 0, c0)
+        nc = 1
+    }
+    if c1 != 0 {
+        vk_mem.w64(cm, (nc as usize) * 8, c1)
+        nc = nc + 1
+    }
+    let si: u64 = vk_mem.xsa(x, 72)
+    vk_mem.w32(si, 0, 4) // SUBMIT_INFO
+    if wait_sem != 0 {
+        let ws: u64 = vk_mem.xsa(x, 8)
+        let wm: u64 = vk_mem.xsa(x, 4)
+        vk_mem.w64(ws, 0, wait_sem)
+        vk_mem.w32(wm, 0, wait_stage)
+        vk_mem.w32(si, 16, 1)
+        vk_mem.w64(si, 24, ws)
+        vk_mem.w64(si, 32, wm)
+    }
+    vk_mem.w32(si, 40, nc)
+    vk_mem.w64(si, 48, cm)
+    if signal_sem != 0 {
+        let ss: u64 = vk_mem.xsa(x, 8)
+        vk_mem.w64(ss, 0, signal_sem)
+        vk_mem.w32(si, 56, 1)
+        vk_mem.w64(si, 64, ss)
+    }
+    return vk_mem.good(vk_mem.cx(x, vk_mem.X_SUBMIT, (*x).queue, 1, si, fence, 0, 0, 0, 0, 0, 0))
+}
+
+fn submit_one(x: *mut vk_mem.X, cmd: u64, fence: u64) -> bool {
+    return submit_two(x, cmd, 0, 0, 0, 0, fence)
+}
+
+// Frame submit: `pre` (e.g. the upload batch tcmd, 0 = none) then the slot's command buffer, signalling the slot fence (and
+// `signal_sem` when a swapchain waits on it). Marks the slot pending.
+fn frame_submit(x: *mut vk_mem.X, f: *mut Frames, i: usize, pre: u64, wait_sem: u64, signal_sem: u64) -> bool {
+    var c0: u64 = pre
+    var c1: u64 = frame_cmd(f, i)
+    if pre == 0 {
+        c0 = frame_cmd(f, i)
+        c1 = 0
+    }
+    let ok: bool = submit_two(x, c0, c1, wait_sem, 0x400, signal_sem, frame_fence(f, i))
+    if ok {
+        (*f).serial = (*f).serial + 1
+        rt.st64((*f).w, i * FW + W_PENDING, 1)
+        rt.st64((*f).w, i * FW + W_SERIAL, (*f).serial)
+    }
+    return ok
+}
+
+// Starts / ends the immediate command buffer. imm_submit waits for the GPU (fence), so it is the synchronous path.
+fn imm_begin(x: *mut vk_mem.X, f: *mut Frames) -> u64 {
+    if (*f).tpending {
+        wait_one(x, (*f).ifence)
+        (*f).tpending = false
+    }
+    if !cmd_begin(x, (*f).icmd) {
+        return 0
+    }
+    return (*f).icmd
+}
+
+fn imm_submit(x: *mut vk_mem.X, f: *mut Frames) -> bool {
+    if !cmd_end(x, (*f).icmd) {
+        return false
+    }
+    if !submit_one(x, (*f).icmd, (*f).ifence) {
+        return false
+    }
+    return wait_one(x, (*f).ifence)
+}
+
+// Image layout transition + memory dependency for the whole image (mip 0, layers 0..n-1).
+fn image_barrier(x: *mut vk_mem.X, cmd: u64, image: u64, aspect: u64, layers: u64, old: u64, new: u64, src_st: u64, dst_st: u64,
+    src_ac: u64, dst_ac: u64) {
+    (*x).top = 0
+    let b: u64 = vk_mem.xsa(x, 72)
+    vk_mem.w32(b, 0, 45) // IMAGE_MEMORY_BARRIER
+    vk_mem.w32(b, 16, src_ac)
+    vk_mem.w32(b, 20, dst_ac)
+    vk_mem.w32(b, 24, old)
+    vk_mem.w32(b, 28, new)
+    vk_mem.w32(b, 32, 0xFFFFFFFF)
+    vk_mem.w32(b, 36, 0xFFFFFFFF)
+    vk_mem.w64(b, 40, image)
+    vk_mem.w32(b, 48, aspect)
+    vk_mem.w32(b, 56, 1)
+    vk_mem.w32(b, 64, layers)
+    vk_mem.cx(x, vk_mem.X_CMD_BARRIER, cmd, src_st, dst_st, 0, 0, 0, 0, 0, 1, b)
+}
+
+// Global memory barrier (buffer uploads -> vertex / index reads, transfer -> host read).
+fn mem_barrier(x: *mut vk_mem.X, cmd: u64, src_st: u64, dst_st: u64, src_ac: u64, dst_ac: u64) {
+    (*x).top = 0
+    let b: u64 = vk_mem.xsa(x, 24)
+    vk_mem.w32(b, 0, 46) // MEMORY_BARRIER
+    vk_mem.w32(b, 16, src_ac)
+    vk_mem.w32(b, 20, dst_ac)
+    vk_mem.cx(x, vk_mem.X_CMD_BARRIER, cmd, src_st, dst_st, 0, 1, b, 0, 0, 0, 0)
+}
