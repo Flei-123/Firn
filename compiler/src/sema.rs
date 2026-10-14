@@ -3230,6 +3230,13 @@ constants declared before it, and '+ - * /'"
                 if crate::sizeof::value(name).is_some() || name.starts_with("size_of$") {
                     return Some(Type::Usize);
                 }
+                // r169: `has_gc[T]()` is a `bool`, `gc_track`/`gc_untrack` are `void`
+                if name.starts_with("has_gc$") {
+                    return Some(Type::Bool);
+                }
+                if name.starts_with("gc_track$") || name.starts_with("gc_untrack$") {
+                    return Some(Type::Void);
+                }
                 // HOOK gc: type of `weak(g)`, `strong(w)` and `x.as?[C]` WITHOUT
                 // a check, so that a literal beside it gets its type (gc.rs)
                 let arg0 = args.first().and_then(|a| self.probe_d(a, d + 1));
