@@ -156,6 +156,7 @@ pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
             | K::Shr64
             | K::ShlBytes
             | K::ShrBytes
+            | K::Srl16
             // ROUND TEMPO 5: convert, compare, combine -- all
             // simple two-operand forms without special rules.
             | K::TruncF32I32
@@ -237,6 +238,7 @@ pub(crate) fn two_address_simd(k: crate::simd::SimdKind) -> bool {
             | K::Shr64
             | K::ShlBytes
             | K::ShrBytes
+            | K::Srl16
     )
 }
 
@@ -6422,7 +6424,7 @@ fn emit_inst(
                     }
                 }
                 // In-place shifts by an immediate: `pslld d, imm` shifts `d` itself.
-                K::Shl32 | K::Shr32 | K::Shl64 | K::Shr64 | K::ShlBytes | K::ShrBytes => {
+                K::Shl32 | K::Shr32 | K::Shl64 | K::Shr64 | K::ShlBytes | K::ShrBytes | K::Srl16 => {
                     let d = i.dst.ok_or("internal error: shift without target")?;
                     let m = match kind {
                         K::Shl32 => "pslld",
@@ -6430,6 +6432,7 @@ fn emit_inst(
                         K::Shl64 => "psllq",
                         K::Shr64 => "psrlq",
                         K::ShlBytes => "pslldq",
+                        K::Srl16 => "psrlw",
                         _ => "psrldq",
                     };
                     let w = ra.v_work(d);
