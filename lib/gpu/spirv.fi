@@ -1,0 +1,1749 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/spirv.fi -- gpu.spirv: SPIR-V binary reader + interpreter (docs/GRAPHICS-STACK-E-REQUIREMENTS.md G7, "interpreter first").
+//
+//     import gpu.spirv
+//     var m: spirv.Spv = spirv.spv_zero()
+//     if !spirv.spv_new(code_ptr, code_octets, &m) { /* m.err, m.err_op */ }
+//     let ent: u32 = spirv.spv_find_entry(&m, 0)                 // 0 = Vertex, 4 = Fragment, 5 = GLCompute; 0 = none
+//     let pos: usize = spirv.spv_find_location(&m, 1, 0)         // storage class Input = 1, Output = 3; location 0
+//     spirv.spv_mem_set_f32(&m, pos, 0, 0.5)                     // host writes the input
+//     spirv.spv_run(&m, ent, 100000)                             // runs ONE invocation of main()
+//     let gl_position: usize = spirv.spv_find_builtin(&m, 3, 0)  // BuiltIn Position = 0, in the output block
+//     let x: f32 = spirv.spv_mem_get_f32(&m, gl_position, 0)
+//     spirv.spv_free(&m)
+//
+// MODEL. Every id with a result type owns a fixed region of 32-bit words ("values"); every OpVariable owns a region in
+// "memory". Both use the PACKED layout of the type (bool/int/float = 1 word, vector n words, matrix = columns, array and
+// struct = elements/members one after the other). A pointer is the word offset into memory. So vectors, matrices, structs
+// and arrays all work with the same copy loops; `Offset`/`ArrayStride` decorations are ignored (host data is set word by
+// word through spv_mem_set*, not via a std140 buffer image).
+// One invocation at a time, no recursion (values are static per id; Vulkan forbids recursion anyway).
+//
+// WHAT IS SUPPORTED: see docs/SPIRV.md (and what is NOT). Unsupported opcodes stop the run with err = E_OP, err_op = opcode.
+//
+// SAFETY. Every read of the module is bounds checked (words, ids, values, memory): a damaged module sets `err`, it does not crash.
+
+import std.rt
+import std.math
+
+export {
+    Spv, spv_zero, spv_new, spv_free, spv_reset, spv_find_entry, spv_run, spv_find_location, spv_find_builtin,
+    spv_mem_get, spv_mem_set, spv_mem_get_f32, spv_mem_set_f32, spv_instr_count, spv_id_bound, spv_killed,
+    E_SHORT, E_MAGIC, E_BROKEN, E_ID, E_TYPE, E_OP, E_OOM, E_ENTRY, E_STEPS, E_RANGE, E_DEPTH, E_EXT, E_VERSION, SPV_NONE,
+}
+
+const E_SHORT: u32 = 1
+const E_MAGIC: u32 = 2
+const E_BROKEN: u32 = 3
+const E_ID: u32 = 4
+const E_TYPE: u32 = 5
+const E_OP: u32 = 6
+const E_OOM: u32 = 7
+const E_ENTRY: u32 = 8
+const E_STEPS: u32 = 9
+const E_RANGE: u32 = 10
+const E_DEPTH: u32 = 11
+const E_EXT: u32 = 12
+const E_VERSION: u32 = 13
+
+const SPV_NONE: usize = 0xffffffffffffffff
+const MAGIC: u32 = 0x07230203
+const MAX_DEPTH: usize = 64
+const TMP_WORDS: usize = 4096
+const MAX_BOUND: usize = 4194304
+const MAX_TYPE_WORDS: usize = 8192
+const MAX_TOTAL_WORDS: usize = 4194304
+
+struct Spv {
+    code: u64, // copy of the module (u32 words)
+    nwords: usize,
+    bound: usize,
+    op: u64, // per id: defining opcode (0 = none)
+    at: u64, // per id: word index of the defining instruction
+    ty: u64, // per id: result type id (0 = none)
+    voff: u64, // per id: offset of its value region in `vals`
+    sz: u64, // per id: memoised tsize (0xffffffff = not yet, 0xfffffffe = being computed)
+    vals: u64,
+    nvals: usize,
+    mem: u64,
+    nmem: usize,
+    stk_ret: u64,
+    stk_res: u64,
+    stk_lbl: u64,
+    tmp: u64,
+    err: u32,
+    err_op: u32,
+    killed: u32,
+    steps: u64,
+    ninstr: usize,
+}
+
+fn spv_zero() -> Spv {
+    return Spv { code: 0, nwords: 0, bound: 0, op: 0, at: 0, ty: 0, voff: 0, sz: 0, vals: 0, nvals: 0, mem: 0, nmem: 0,
+        stk_ret: 0, stk_res: 0, stk_lbl: 0, tmp: 0, err: 0, err_op: 0, killed: 0, steps: 0, ninstr: 0 }
+}
+
+fn spv_instr_count(m: *mut Spv) -> usize {
+    return (*m).ninstr
+}
+
+fn spv_id_bound(m: *mut Spv) -> usize {
+    return (*m).bound
+}
+
+fn spv_killed(m: *mut Spv) -> bool {
+    return (*m).killed != 0
+}
+
+fn fail(m: *mut Spv, code: u32, opc: u32) {
+    if (*m).err == 0 {
+        (*m).err = code
+        (*m).err_op = opc
+    }
+}
+
+// ------------------------------------------------------------ checked access
+
+fn cw(m: *mut Spv, i: usize) -> u32 {
+    if i >= (*m).nwords {
+        fail(m, E_BROKEN, 0)
+        return 0
+    }
+    return rt.ld32((*m).code, i)
+}
+
+// table lookup per id (op / at / ty / voff)
+fn tget(m: *mut Spv, tab: u64, id: u32) -> usize {
+    if id as usize >= (*m).bound {
+        fail(m, E_ID, 0)
+        return 0
+    }
+    return rt.ld32(tab, id as usize) as usize
+}
+
+// result type id of `id`
+fn tyid(m: *mut Spv, id: u32) -> u32 {
+    return tget(m, (*m).ty, id) as u32
+}
+
+fn vget(m: *mut Spv, id: u32, k: usize) -> u32 {
+    let i: usize = tget(m, (*m).voff, id) + k
+    if i >= (*m).nvals {
+        fail(m, E_RANGE, 0)
+        return 0
+    }
+    return rt.ld32((*m).vals, i)
+}
+
+fn vput(m: *mut Spv, id: u32, k: usize, v: u32) {
+    let i: usize = tget(m, (*m).voff, id) + k
+    if i >= (*m).nvals {
+        fail(m, E_RANGE, 0)
+        return
+    }
+    rt.st32((*m).vals, i, v)
+}
+
+fn fget(m: *mut Spv, id: u32, k: usize) -> f32 {
+    return math.math_f32(vget(m, id, k))
+}
+
+fn fput(m: *mut Spv, id: u32, k: usize, x: f32) {
+    vput(m, id, k, math.math_bits32(x))
+}
+
+fn memget(m: *mut Spv, off: usize) -> u32 {
+    if off >= (*m).nmem {
+        fail(m, E_RANGE, 0)
+        return 0
+    }
+    return rt.ld32((*m).mem, off)
+}
+
+fn memput(m: *mut Spv, off: usize, v: u32) {
+    if off >= (*m).nmem {
+        fail(m, E_RANGE, 0)
+        return
+    }
+    rt.st32((*m).mem, off, v)
+}
+
+fn spv_mem_get(m: *mut Spv, base: usize, k: usize) -> u32 {
+    return memget(m, base + k)
+}
+
+fn spv_mem_set(m: *mut Spv, base: usize, k: usize, v: u32) {
+    memput(m, base + k, v)
+}
+
+fn spv_mem_get_f32(m: *mut Spv, base: usize, k: usize) -> f32 {
+    return math.math_f32(memget(m, base + k))
+}
+
+fn spv_mem_set_f32(m: *mut Spv, base: usize, k: usize, x: f32) {
+    memput(m, base + k, math.math_bits32(x))
+}
+
+fn spv_free(m: *mut Spv) {
+    let nb: usize = (*m).bound * 4 + 4
+    if (*m).code != 0 {
+        rt.heap_free((*m).code, (*m).nwords * 4)
+    }
+    if (*m).op != 0 {
+        rt.heap_free((*m).op, nb)
+        rt.heap_free((*m).at, nb)
+        rt.heap_free((*m).ty, nb)
+        rt.heap_free((*m).voff, nb)
+        rt.heap_free((*m).sz, nb)
+    }
+    if (*m).vals != 0 {
+        rt.heap_free((*m).vals, (*m).nvals * 4 + 4)
+    }
+    if (*m).mem != 0 {
+        rt.heap_free((*m).mem, (*m).nmem * 4 + 4)
+    }
+    if (*m).stk_ret != 0 {
+        rt.heap_free((*m).stk_ret, MAX_DEPTH * 4)
+        rt.heap_free((*m).stk_res, MAX_DEPTH * 4)
+        rt.heap_free((*m).stk_lbl, MAX_DEPTH * 4)
+    }
+    if (*m).tmp != 0 {
+        rt.heap_free((*m).tmp, TMP_WORDS * 4)
+    }
+    *m = spv_zero()
+}
+
+// ------------------------------------------------------------ opcode classes
+
+fn is_noresult(o: u32) -> bool {
+    if o == 0 || o == 3 || o == 4 || o == 5 || o == 6 || o == 8 || o == 10 || o == 14 || o == 15 || o == 16 || o == 17 {
+        return true
+    }
+    if o == 39 || o == 56 || o == 62 || o == 63 || o == 71 || o == 72 || o == 73 || o == 74 || o == 75 {
+        return true
+    }
+    if o == 224 || o == 225 || o == 246 || o == 247 || (o >= 249 && o <= 255) || o == 317 {
+        return true
+    }
+    return false
+}
+
+fn is_result_only(o: u32) -> bool {
+    return o == 7 || o == 11 || (o >= 19 && o <= 38) || o == 248
+}
+
+// ------------------------------------------------------------ types
+
+// size of a type in words (bool/int/float 32 bit = 1), memoised; a type that contains itself or exceeds
+// MAX_TYPE_WORDS is an error
+fn tsize(m: *mut Spv, t: u32) -> usize {
+    if t as usize >= (*m).bound {
+        fail(m, E_ID, 0)
+        return 0
+    }
+    let c: u32 = rt.ld32((*m).sz, t as usize)
+    if c == 0xfffffffe {
+        fail(m, E_TYPE, 0)
+        return 0
+    }
+    if c != 0xffffffff {
+        return c as usize
+    }
+    rt.st32((*m).sz, t as usize, 0xfffffffe)
+    var r: usize = tsize_raw(m, t)
+    if r > MAX_TYPE_WORDS {
+        fail(m, E_TYPE, 0)
+        r = 0
+    }
+    rt.st32((*m).sz, t as usize, r as u32)
+    return r
+}
+
+fn tsize_raw(m: *mut Spv, t: u32) -> usize {
+    let o: u32 = tget(m, (*m).op, t) as u32
+    let a: usize = tget(m, (*m).at, t)
+    if o == 19 || o == 33 {
+        return 0
+    }
+    if o == 20 || o == 32 {
+        return 1
+    }
+    if o == 21 || o == 22 {
+        if cw(m, a + 2) == 32 {
+            return 1
+        }
+        fail(m, E_TYPE, o)
+        return 0
+    }
+    if o == 23 || o == 24 {
+        return safe_mul(m, cw(m, a + 3) as usize, tsize(m, cw(m, a + 2)))
+    }
+    if o == 28 {
+        let lid: u32 = cw(m, a + 3)
+        if tget(m, (*m).op, lid) != 43 && tget(m, (*m).op, lid) != 50 {
+            fail(m, E_TYPE, o)
+            return 0
+        }
+        return safe_mul(m, cw(m, tget(m, (*m).at, lid) + 3) as usize, tsize(m, cw(m, a + 2)))
+    }
+    if o == 30 {
+        let wc: usize = (cw(m, a) >> 16) as usize
+        var s: usize = 0
+        var i: usize = 2
+        while i < wc {
+            s = s + tsize(m, cw(m, a + i))
+            i = i + 1
+        }
+        return s
+    }
+    fail(m, E_TYPE, o)
+    return 0
+}
+
+// number of direct children of an aggregate / vector type
+// a * b without overflow; above MAX_TYPE_WORDS the result is an error
+fn safe_mul(m: *mut Spv, a: usize, b: usize) -> usize {
+    if a > MAX_TYPE_WORDS || b > MAX_TYPE_WORDS || a * b > MAX_TYPE_WORDS {
+        fail(m, E_TYPE, 0)
+        return 0
+    }
+    return a * b
+}
+
+fn tcount(m: *mut Spv, t: u32) -> usize {
+    let o: u32 = tget(m, (*m).op, t) as u32
+    let a: usize = tget(m, (*m).at, t)
+    if o == 23 || o == 24 {
+        return cw(m, a + 3) as usize
+    }
+    if o == 28 {
+        return cw(m, tget(m, (*m).at, cw(m, a + 3)) + 3) as usize
+    }
+    if o == 30 {
+        let wcs: usize = (cw(m, a) >> 16) as usize
+        if wcs < 2 {
+            return 0
+        }
+        return wcs - 2
+    }
+    return 0
+}
+
+// type of child `idx`
+fn tchild(m: *mut Spv, t: u32, idx: usize) -> u32 {
+    let o: u32 = tget(m, (*m).op, t) as u32
+    let a: usize = tget(m, (*m).at, t)
+    if o == 23 || o == 24 || o == 28 {
+        return cw(m, a + 2)
+    }
+    if o == 30 {
+        return cw(m, a + 2 + idx)
+    }
+    fail(m, E_TYPE, o)
+    return 0
+}
+
+// word offset of child `idx` inside its parent (packed layout)
+fn toff(m: *mut Spv, t: u32, idx: usize) -> usize {
+    let o: u32 = tget(m, (*m).op, t) as u32
+    if o == 23 || o == 24 || o == 28 {
+        return idx * tsize(m, tchild(m, t, 0))
+    }
+    if idx >= tcount(m, t) {
+        fail(m, E_RANGE, o)
+        return 0
+    }
+    var s: usize = 0
+    var i: usize = 0
+    while i < idx {
+        s = s + tsize(m, tchild(m, t, i))
+        i = i + 1
+    }
+    return s
+}
+
+// pointee type of a pointer type id
+fn pointee(m: *mut Spv, ptr_type: u32) -> u32 {
+    if tget(m, (*m).op, ptr_type) != 32 {
+        fail(m, E_TYPE, 0)
+        return 0
+    }
+    return cw(m, tget(m, (*m).at, ptr_type) + 3)
+}
+
+// ------------------------------------------------------------ loading
+
+fn spv_new(code: u64, nbytes: usize, m: *mut Spv) -> bool {
+    *m = spv_zero()
+    if nbytes < 20 || nbytes % 4 != 0 {
+        fail(m, E_SHORT, 0)
+        return false
+    }
+    let nw: usize = nbytes / 4
+    if rt.ld32(code, 0) != MAGIC {
+        fail(m, E_MAGIC, 0)
+        return false
+    }
+    let bound: usize = rt.ld32(code, 3) as usize
+    if bound == 0 || bound > MAX_BOUND || (rt.ld32(code, 1) >> 16) != 1 {
+        fail(m, E_VERSION, 0)
+        return false
+    }
+    let copy: u64 = rt.heap_alloc(nbytes)
+    if copy == 0 {
+        fail(m, E_OOM, 0)
+        return false
+    }
+    rt.mem_copy(copy, code, nbytes)
+    (*m).code = copy
+    (*m).nwords = nw
+    (*m).bound = bound
+    let nb: usize = bound * 4 + 4
+    (*m).op = rt.heap_alloc(nb)
+    (*m).at = rt.heap_alloc(nb)
+    (*m).ty = rt.heap_alloc(nb)
+    (*m).voff = rt.heap_alloc(nb)
+    (*m).sz = rt.heap_alloc(nb)
+    (*m).stk_ret = rt.heap_alloc(MAX_DEPTH * 4)
+    (*m).stk_res = rt.heap_alloc(MAX_DEPTH * 4)
+    (*m).stk_lbl = rt.heap_alloc(MAX_DEPTH * 4)
+    (*m).tmp = rt.heap_alloc(TMP_WORDS * 4)
+    if (*m).op == 0 || (*m).at == 0 || (*m).ty == 0 || (*m).voff == 0 || (*m).sz == 0 || (*m).stk_ret == 0 || (*m).stk_res == 0 || (*m).stk_lbl == 0 || (*m).tmp == 0 {
+        fail(m, E_OOM, 0)
+        spv_free(m)
+        return false
+    }
+    rt.mem_set((*m).sz, 255, nb)
+    // pass A: instruction boundaries + definitions
+    var i: usize = 5
+    var count: usize = 0
+    while i < nw {
+        let w: u32 = rt.ld32(copy, i)
+        let wc: usize = (w >> 16) as usize
+        let o: u32 = w & 0xffff
+        if wc == 0 || i + wc > nw {
+            fail(m, E_BROKEN, o)
+            break
+        }
+        count = count + 1
+        if !is_noresult(o) {
+            var rp: usize = 2
+            if is_result_only(o) {
+                rp = 1
+            }
+            if wc > rp {
+                let id: u32 = rt.ld32(copy, i + rp)
+                if id as usize >= bound || id == 0 {
+                    fail(m, E_ID, o)
+                    break
+                }
+                rt.st32((*m).op, id as usize, o)
+                rt.st32((*m).at, id as usize, i as u32)
+                if rp == 2 {
+                    rt.st32((*m).ty, id as usize, rt.ld32(copy, i + 1))
+                }
+            }
+        }
+        i = i + wc
+    }
+    (*m).ninstr = count
+    if (*m).err != 0 {
+        let ok: bool = false
+        spv_free_keep_err(m)
+        return ok
+    }
+    // pass B: value regions and variable memory
+    var id: usize = 1
+    var total: usize = 0
+    while id < bound {
+        let o: u32 = rt.ld32((*m).op, id)
+        let t: u32 = rt.ld32((*m).ty, id)
+        rt.st32((*m).voff, id, total as u32)
+        if t != 0 && o != 54 && o != 248 {
+            total = total + tsize(m, t)
+            if total > MAX_TOTAL_WORDS {
+                fail(m, E_OOM, o)
+                break
+            }
+        }
+        id = id + 1
+    }
+    if (*m).err != 0 {
+        spv_free_keep_err(m)
+        return false
+    }
+    (*m).nvals = total
+    (*m).vals = rt.heap_alloc(total * 4 + 4)
+    var mtotal: usize = 0
+    id = 1
+    while id < bound {
+        if rt.ld32((*m).op, id) == 59 {
+            mtotal = mtotal + tsize(m, pointee(m, rt.ld32((*m).ty, id)))
+            if mtotal > MAX_TOTAL_WORDS {
+                fail(m, E_OOM, 59)
+                break
+            }
+        }
+        id = id + 1
+    }
+    (*m).nmem = mtotal
+    (*m).mem = rt.heap_alloc(mtotal * 4 + 4)
+    if (*m).vals == 0 || (*m).mem == 0 {
+        fail(m, E_OOM, 0)
+    }
+    if (*m).err != 0 {
+        spv_free_keep_err(m)
+        return false
+    }
+    // variable addresses
+    var moff: usize = 0
+    id = 1
+    while id < bound {
+        if rt.ld32((*m).op, id) == 59 {
+            rt.st32((*m).vals, rt.ld32((*m).voff, id) as usize, moff as u32)
+            moff = moff + tsize(m, pointee(m, rt.ld32((*m).ty, id)))
+        }
+        id = id + 1
+    }
+    init_constants(m)
+    if (*m).err != 0 {
+        spv_free_keep_err(m)
+        return false
+    }
+    return true
+}
+
+// frees the buffers but keeps the error code for the caller
+fn spv_free_keep_err(m: *mut Spv) {
+    let e: u32 = (*m).err
+    let eo: u32 = (*m).err_op
+    spv_free(m)
+    (*m).err = e
+    (*m).err_op = eo
+}
+
+// copies `n` words from value region of `src` to value region of `dst` at offset `k`
+fn vcopy(m: *mut Spv, dst: u32, k: usize, src: u32, n: usize) {
+    var i: usize = 0
+    while i < n {
+        vput(m, dst, k + i, vget(m, src, i))
+        i = i + 1
+    }
+}
+
+// constants (in file order) and initialised globals
+fn init_constants(m: *mut Spv) {
+    var i: usize = 5
+    while i < (*m).nwords && (*m).err == 0 {
+        let w: u32 = rt.ld32((*m).code, i)
+        let wc: usize = (w >> 16) as usize
+        let o: u32 = w & 0xffff
+        if wc == 0 {
+            break
+        }
+        if o == 41 || o == 48 {
+            vput(m, cw(m, i + 2), 0, 1)
+        }
+        if o == 42 || o == 49 {
+            vput(m, cw(m, i + 2), 0, 0)
+        }
+        if o == 43 || o == 50 {
+            vput(m, cw(m, i + 2), 0, cw(m, i + 3))
+        }
+        if o == 44 || o == 51 {
+            let res: u32 = cw(m, i + 2)
+            var k: usize = 0
+            var j: usize = 3
+            while j < wc {
+                let part: u32 = cw(m, i + j)
+                let n: usize = tsize(m, tyid(m, part))
+                vcopy(m, res, k, part, n)
+                k = k + n
+                j = j + 1
+            }
+        }
+        if o == 52 {
+            fail(m, E_OP, o)
+        }
+        if o == 59 && wc >= 5 {
+            // global variable with initializer (Function storage class is initialised when executed)
+            if cw(m, i + 3) != 7 {
+                init_variable(m, cw(m, i + 2), cw(m, i + 4))
+            }
+        }
+        i = i + wc
+    }
+}
+
+fn init_variable(m: *mut Spv, var_id: u32, init: u32) {
+    let base: usize = vget(m, var_id, 0) as usize
+    let n: usize = tsize(m, tyid(m, init))
+    var k: usize = 0
+    while k < n {
+        memput(m, base + k, vget(m, init, k))
+        k = k + 1
+    }
+}
+
+// zero memory and re-apply initialisers of globals
+fn spv_reset(m: *mut Spv) {
+    rt.mem_set((*m).mem, 0, (*m).nmem * 4)
+    (*m).err = 0
+    (*m).err_op = 0
+    (*m).killed = 0
+    var i: usize = 5
+    while i < (*m).nwords && (*m).err == 0 {
+        let w: u32 = rt.ld32((*m).code, i)
+        let wc: usize = (w >> 16) as usize
+        if wc == 0 {
+            break
+        }
+        if (w & 0xffff) == 59 && wc >= 5 && cw(m, i + 3) != 7 {
+            init_variable(m, cw(m, i + 2), cw(m, i + 4))
+        }
+        i = i + wc
+    }
+}
+
+// ------------------------------------------------------------ queries
+
+// first OpEntryPoint of the execution model; returns the function id or 0
+fn spv_find_entry(m: *mut Spv, model: u32) -> u32 {
+    var i: usize = 5
+    while i < (*m).nwords {
+        let w: u32 = rt.ld32((*m).code, i)
+        let wc: usize = (w >> 16) as usize
+        if wc == 0 {
+            return 0
+        }
+        if (w & 0xffff) == 15 && cw(m, i + 1) == model {
+            return cw(m, i + 2)
+        }
+        i = i + wc
+    }
+    return 0
+}
+
+// word offset in memory of the variable with Location `loc` and storage class `sc`; usize max = none
+fn spv_find_location(m: *mut Spv, sc: u32, loc: u32) -> usize {
+    var i: usize = 5
+    while i < (*m).nwords {
+        let w: u32 = rt.ld32((*m).code, i)
+        let wc: usize = (w >> 16) as usize
+        if wc == 0 {
+            break
+        }
+        if (w & 0xffff) == 71 && wc >= 4 && cw(m, i + 2) == 30 && cw(m, i + 3) == loc {
+            let v: u32 = cw(m, i + 1)
+            if tget(m, (*m).op, v) == 59 && cw(m, tget(m, (*m).at, v) + 3) == sc {
+                return vget(m, v, 0) as usize
+            }
+        }
+        i = i + wc
+    }
+    return SPV_NONE
+}
+
+// word offset of a BuiltIn: a plain decorated variable or a member of a block struct variable; usize max = none
+fn spv_find_builtin(m: *mut Spv, sc: u32, builtin: u32) -> usize {
+    var i: usize = 5
+    while i < (*m).nwords {
+        let w: u32 = rt.ld32((*m).code, i)
+        let wc: usize = (w >> 16) as usize
+        if wc == 0 {
+            break
+        }
+        let o: u32 = w & 0xffff
+        if o == 71 && wc >= 4 && cw(m, i + 2) == 11 && cw(m, i + 3) == builtin {
+            let v: u32 = cw(m, i + 1)
+            if tget(m, (*m).op, v) == 59 && cw(m, tget(m, (*m).at, v) + 3) == sc {
+                return vget(m, v, 0) as usize
+            }
+        }
+        if o == 72 && wc >= 5 && cw(m, i + 3) == 11 && cw(m, i + 4) == builtin {
+            // member `idx` of struct type `st`: find a variable of that struct type with the storage class
+            let st: u32 = cw(m, i + 1)
+            let idx: usize = cw(m, i + 2) as usize
+            if idx >= tcount(m, st) {
+                i = i + wc
+                continue
+            }
+            var id: usize = 1
+            while id < (*m).bound {
+                if rt.ld32((*m).op, id) == 59 {
+                    let pt: u32 = rt.ld32((*m).ty, id)
+                    if pt != 0 && cw(m, tget(m, (*m).at, id as u32) + 3) == sc && pointee(m, pt) == st {
+                        return vget(m, id as u32, 0) as usize + toff(m, st, idx)
+                    }
+                }
+                id = id + 1
+            }
+        }
+        i = i + wc
+    }
+    return SPV_NONE
+}
+
+// ------------------------------------------------------------ arithmetic
+
+// k % n that survives n = 0
+fn wrapk(k: usize, n: usize) -> usize {
+    if n == 0 {
+        return 0
+    }
+    return k % n
+}
+
+fn is_nan32(x: f32) -> bool {
+    return x != x
+}
+
+fn f2i(x: f32) -> u32 {
+    // OpConvertFToS: truncation, out of range saturates, NaN = 0
+    if x != x {
+        return 0
+    }
+    if x >= 2147483648.0 {
+        return 0x7fffffff
+    }
+    if x <= -2147483648.0 {
+        return 0x80000000
+    }
+    return (x as i32) as% u32
+}
+
+fn f2u(x: f32) -> u32 {
+    if x != x || x <= 0.0 {
+        return 0
+    }
+    if x >= 4294967296.0 {
+        return 0xffffffff
+    }
+    return (x as i64) as% u32
+}
+
+fn bool_word(b: bool) -> u32 {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+// component-wise unary operation; unknown opcode: err
+fn alu1(m: *mut Spv, o: u32, x: u32) -> u32 {
+    let fx: f32 = math.math_f32(x)
+    if o == 126 {
+        return 0 -% x
+    }
+    if o == 127 {
+        return math.math_bits32(0.0 - fx)
+    }
+    if o == 200 {
+        return ~x
+    }
+    if o == 168 {
+        return bool_word(x == 0)
+    }
+    if o == 109 {
+        return f2u(fx)
+    }
+    if o == 110 {
+        return f2i(fx)
+    }
+    if o == 111 {
+        return math.math_bits32((x as% i32) as f32)
+    }
+    if o == 112 {
+        return math.math_bits32((x as u64) as f32)
+    }
+    if o == 156 {
+        return bool_word(is_nan32(fx))
+    }
+    if o == 157 {
+        return bool_word(!is_nan32(fx) && (fx > 3.0e38 || fx < -3.0e38) && math.math_bits32(fx) << 1 == 0xff000000)
+    }
+    if o == 124 || o == 113 || o == 114 || o == 115 || o == 83 {
+        return x
+    }
+    fail(m, E_OP, o)
+    return 0
+}
+
+fn alu2(m: *mut Spv, o: u32, x: u32, y: u32) -> u32 {
+    let fx: f32 = math.math_f32(x)
+    let fy: f32 = math.math_f32(y)
+    let sx: i32 = x as% i32
+    let sy: i32 = y as% i32
+    let un: bool = is_nan32(fx) || is_nan32(fy)
+    if o == 128 {
+        return x +% y
+    }
+    if o == 130 {
+        return x -% y
+    }
+    if o == 132 {
+        return x *% y
+    }
+    if o == 129 {
+        return math.math_bits32(fx + fy)
+    }
+    if o == 131 {
+        return math.math_bits32(fx - fy)
+    }
+    if o == 133 {
+        return math.math_bits32(fx * fy)
+    }
+    if o == 136 {
+        return math.math_bits32(fx / fy)
+    }
+    if o == 134 {
+        if y == 0 {
+            return 0xffffffff
+        }
+        return x / y
+    }
+    if o == 137 {
+        if y == 0 {
+            return 0
+        }
+        return x % y
+    }
+    if o == 135 || o == 138 || o == 139 {
+        if sy == 0 {
+            return 0xffffffff
+        }
+        if sy == -1 {
+            if o == 135 {
+                return 0 -% x
+            }
+            return 0
+        }
+        if o == 135 {
+            return (sx / sy) as% u32
+        }
+        var r: i32 = sx % sy
+        if o == 139 && r != 0 && ((r < 0) != (sy < 0)) {
+            r = r + sy
+        }
+        return r as% u32
+    }
+    if o == 140 || o == 141 {
+        let dx: f64 = fx as f64
+        let dy: f64 = fy as f64
+        var r: f64 = math.fmod(dx, dy)
+        if o == 141 && r != 0.0 && ((r < 0.0) != (dy < 0.0)) {
+            r = r + dy
+        }
+        return math.math_bits32(r as f32)
+    }
+    if o == 194 {
+        return x >> (y & 31)
+    }
+    if o == 195 {
+        return (sx >> (y & 31)) as% u32
+    }
+    if o == 196 {
+        return x << (y & 31)
+    }
+    if o == 197 {
+        return x | y
+    }
+    if o == 198 {
+        return x ^ y
+    }
+    if o == 199 {
+        return x & y
+    }
+    if o == 164 {
+        return bool_word((x != 0) == (y != 0))
+    }
+    if o == 165 {
+        return bool_word((x != 0) != (y != 0))
+    }
+    if o == 166 {
+        return bool_word(x != 0 || y != 0)
+    }
+    if o == 167 {
+        return bool_word(x != 0 && y != 0)
+    }
+    if o == 170 {
+        return bool_word(x == y)
+    }
+    if o == 171 {
+        return bool_word(x != y)
+    }
+    if o == 172 {
+        return bool_word(x > y)
+    }
+    if o == 173 {
+        return bool_word(sx > sy)
+    }
+    if o == 174 {
+        return bool_word(x >= y)
+    }
+    if o == 175 {
+        return bool_word(sx >= sy)
+    }
+    if o == 176 {
+        return bool_word(x < y)
+    }
+    if o == 177 {
+        return bool_word(sx < sy)
+    }
+    if o == 178 {
+        return bool_word(x <= y)
+    }
+    if o == 179 {
+        return bool_word(sx <= sy)
+    }
+    if o == 180 {
+        return bool_word(fx == fy)
+    }
+    if o == 181 {
+        return bool_word(fx == fy || un)
+    }
+    if o == 182 {
+        return bool_word(!un && fx != fy)
+    }
+    if o == 183 {
+        return bool_word(fx != fy)
+    }
+    if o == 184 {
+        return bool_word(fx < fy)
+    }
+    if o == 185 {
+        return bool_word(fx < fy || un)
+    }
+    if o == 186 {
+        return bool_word(fx > fy)
+    }
+    if o == 187 {
+        return bool_word(fx > fy || un)
+    }
+    if o == 188 {
+        return bool_word(fx <= fy)
+    }
+    if o == 189 {
+        return bool_word(fx <= fy || un)
+    }
+    if o == 190 {
+        return bool_word(fx >= fy)
+    }
+    if o == 191 {
+        return bool_word(fx >= fy || un)
+    }
+    fail(m, E_OP, o)
+    return 0
+}
+
+fn is_unary(o: u32) -> bool {
+    return o == 126 || o == 127 || o == 200 || o == 168 || (o >= 109 && o <= 115) || o == 124 || o == 156 || o == 157 || o == 83
+}
+
+fn is_binary(o: u32) -> bool {
+    return (o >= 128 && o <= 141) || (o >= 164 && o <= 167) || (o >= 170 && o <= 191) || (o >= 194 && o <= 199)
+}
+
+// ------------------------------------------------------------ GLSL.std.450
+
+fn glsl_scalar1(m: *mut Spv, e: u32, x: f32) -> f32 {
+    let d: f64 = x as f64
+    if e == 3 {
+        return math.trunc32(x)
+    }
+    if e == 1 || e == 2 {
+        return math.round32(x)
+    }
+    if e == 4 {
+        return math.fabs32(x)
+    }
+    if e == 8 {
+        return math.floor32(x)
+    }
+    if e == 9 {
+        return math.ceil32(x)
+    }
+    if e == 10 {
+        return x - math.floor32(x)
+    }
+    if e == 13 {
+        return math.sin(d) as f32
+    }
+    if e == 14 {
+        return math.cos(d) as f32
+    }
+    if e == 15 {
+        return math.tan(d) as f32
+    }
+    if e == 18 {
+        return math.atan(d) as f32
+    }
+    if e == 27 {
+        return math.exp(d) as f32
+    }
+    if e == 28 {
+        return math.ln(d) as f32
+    }
+    if e == 29 {
+        return math.powf(2.0, d) as f32
+    }
+    if e == 30 {
+        return math.log2(d) as f32
+    }
+    if e == 31 {
+        return math.sqrt32(x)
+    }
+    if e == 32 {
+        return 1.0 / math.sqrt32(x)
+    }
+    fail(m, E_OP, 12)
+    return 0.0
+}
+
+fn glsl_scalar2(m: *mut Spv, e: u32, x: f32, y: f32) -> f32 {
+    if e == 25 {
+        return math.atan2(x as f64, y as f64) as f32
+    }
+    if e == 26 {
+        return math.powf(x as f64, y as f64) as f32
+    }
+    if e == 37 {
+        if y < x {
+            return y
+        }
+        return x
+    }
+    if e == 40 {
+        if x < y {
+            return y
+        }
+        return x
+    }
+    if e == 48 {
+        // Step(edge, x)
+        if y < x {
+            return 0.0
+        }
+        return 1.0
+    }
+    fail(m, E_OP, 12)
+    return 0.0
+}
+
+// ExtInst of the GLSL.std.450 set
+fn exec_glsl(m: *mut Spv, res: u32, rtype: u32, e: u32, a: usize) {
+    let n: usize = tsize(m, rtype)
+    let x: u32 = cw(m, a)
+    var k: usize = 0
+    // one-operand floating point functions
+    if e == 1 || e == 2 || e == 3 || e == 4 || e == 8 || e == 9 || e == 10 || e == 13 || e == 14 || e == 15 || e == 18 || (e >= 27 && e <= 32) {
+        while k < n {
+            fput(m, res, k, glsl_scalar1(m, e, fget(m, x, k)))
+            k = k + 1
+        }
+        return
+    }
+    if e == 5 || e == 7 {
+        // SAbs / SSign
+        while k < n {
+            let v: i32 = vget(m, x, k) as% i32
+            var r: i32 = v
+            if e == 5 && v < 0 {
+                r = 0 -% v
+            }
+            if e == 7 {
+                r = 0
+                if v > 0 {
+                    r = 1
+                }
+                if v < 0 {
+                    r = -1
+                }
+            }
+            vput(m, res, k, r as% u32)
+            k = k + 1
+        }
+        return
+    }
+    if e == 6 {
+        while k < n {
+            let v: f32 = fget(m, x, k)
+            var r: f32 = 0.0
+            if v > 0.0 {
+                r = 1.0
+            }
+            if v < 0.0 {
+                r = -1.0
+            }
+            fput(m, res, k, r)
+            k = k + 1
+        }
+        return
+    }
+    let y: u32 = cw(m, a + 1)
+    if e == 25 || e == 26 || e == 37 || e == 40 || e == 48 {
+        let ny: usize = tsize(m, tyid(m, y))
+        while k < n {
+            var yk: usize = k
+            if ny == 1 {
+                yk = 0
+            }
+            var xk: usize = k
+            if tsize(m, tyid(m, x)) == 1 {
+                xk = 0
+            }
+            fput(m, res, k, glsl_scalar2(m, e, fget(m, x, xk), fget(m, y, yk)))
+            k = k + 1
+        }
+        return
+    }
+    if e == 38 || e == 39 || e == 41 || e == 42 {
+        // UMin SMin UMax SMax
+        while k < n {
+            let p: u32 = vget(m, x, k)
+            let q: u32 = vget(m, y, k)
+            var r: u32 = p
+            if e == 38 && q < p {
+                r = q
+            }
+            if e == 41 && q > p {
+                r = q
+            }
+            if e == 39 && (q as% i32) < (p as% i32) {
+                r = q
+            }
+            if e == 42 && (q as% i32) > (p as% i32) {
+                r = q
+            }
+            vput(m, res, k, r)
+            k = k + 1
+        }
+        return
+    }
+    let z: u32 = cw(m, a + 2)
+    if e == 43 {
+        // FClamp: min(max(x, lo), hi)
+        while k < n {
+            let lo: f32 = fget(m, y, wrapk(k, tsize(m, tyid(m, y))))
+            let hi: f32 = fget(m, z, wrapk(k, tsize(m, tyid(m, z))))
+            var v: f32 = fget(m, x, k)
+            if v < lo {
+                v = lo
+            }
+            if hi < v {
+                v = hi
+            }
+            fput(m, res, k, v)
+            k = k + 1
+        }
+        return
+    }
+    if e == 44 || e == 45 {
+        while k < n {
+            let lo: u32 = vget(m, y, wrapk(k, tsize(m, tyid(m, y))))
+            let hi: u32 = vget(m, z, wrapk(k, tsize(m, tyid(m, z))))
+            var v: u32 = vget(m, x, k)
+            if e == 44 {
+                if v < lo {
+                    v = lo
+                }
+                if hi < v {
+                    v = hi
+                }
+            } else {
+                if (v as% i32) < (lo as% i32) {
+                    v = lo
+                }
+                if (hi as% i32) < (v as% i32) {
+                    v = hi
+                }
+            }
+            vput(m, res, k, v)
+            k = k + 1
+        }
+        return
+    }
+    if e == 46 {
+        // FMix(x, y, a) = x * (1 - a) + y * a
+        while k < n {
+            let t: f32 = fget(m, z, wrapk(k, tsize(m, tyid(m, z))))
+            fput(m, res, k, fget(m, x, k) * (1.0 - t) + fget(m, y, k) * t)
+            k = k + 1
+        }
+        return
+    }
+    if e == 49 {
+        // SmoothStep(edge0, edge1, x)
+        while k < n {
+            let e0: f32 = fget(m, x, wrapk(k, tsize(m, tyid(m, x))))
+            let e1: f32 = fget(m, y, wrapk(k, tsize(m, tyid(m, y))))
+            var t: f32 = (fget(m, z, k) - e0) / (e1 - e0)
+            if t < 0.0 {
+                t = 0.0
+            }
+            if t > 1.0 {
+                t = 1.0
+            }
+            fput(m, res, k, t * t * (3.0 - 2.0 * t))
+            k = k + 1
+        }
+        return
+    }
+    if e == 50 {
+        // Fma, not fused: a * b rounded, then + c rounded
+        while k < n {
+            fput(m, res, k, fget(m, x, k) * fget(m, y, k) + fget(m, z, k))
+            k = k + 1
+        }
+        return
+    }
+    let nx: usize = tsize(m, tyid(m, x))
+    if e == 66 || e == 67 || e == 69 {
+        // Length, Distance, Normalize
+        var s: f32 = 0.0
+        while k < nx {
+            var d: f32 = fget(m, x, k)
+            if e == 67 {
+                d = d - fget(m, y, k)
+            }
+            s = s + d * d
+            k = k + 1
+        }
+        let len: f32 = math.sqrt32(s)
+        if e == 69 {
+            k = 0
+            while k < nx {
+                fput(m, res, k, fget(m, x, k) / len)
+                k = k + 1
+            }
+        } else {
+            fput(m, res, 0, len)
+        }
+        return
+    }
+    if e == 68 {
+        // Cross
+        let x0: f32 = fget(m, x, 0)
+        let x1: f32 = fget(m, x, 1)
+        let x2: f32 = fget(m, x, 2)
+        let y0: f32 = fget(m, y, 0)
+        let y1: f32 = fget(m, y, 1)
+        let y2: f32 = fget(m, y, 2)
+        fput(m, res, 0, x1 * y2 - y1 * x2)
+        fput(m, res, 1, x2 * y0 - y2 * x0)
+        fput(m, res, 2, x0 * y1 - y0 * x1)
+        return
+    }
+    if e == 71 {
+        // Reflect(I, N) = I - 2 * dot(N, I) * N
+        var dt: f32 = 0.0
+        while k < nx {
+            dt = dt + fget(m, y, k) * fget(m, x, k)
+            k = k + 1
+        }
+        k = 0
+        while k < nx {
+            fput(m, res, k, fget(m, x, k) - 2.0 * dt * fget(m, y, k))
+            k = k + 1
+        }
+        return
+    }
+    fail(m, E_OP, 12)
+}
+
+// ------------------------------------------------------------ execution
+
+// pointer arithmetic of OpAccessChain: new word offset
+fn chain_offset(m: *mut Spv, base_ptr: u32, pc: usize, wc: usize) -> usize {
+    var off: usize = vget(m, base_ptr, 0) as usize
+    var t: u32 = pointee(m, tyid(m, base_ptr))
+    var j: usize = 4
+    while j < wc && (*m).err == 0 {
+        let idx: usize = vget(m, cw(m, pc + j), 0) as usize
+        if idx >= tcount(m, t) {
+            fail(m, E_RANGE, 65)
+            return 0
+        }
+        off = off + toff(m, t, idx)
+        t = tchild(m, t, idx)
+        j = j + 1
+    }
+    return off
+}
+
+// runs OpFunction `fn_id` to its Return; true = finished without error
+fn spv_run(m: *mut Spv, fn_id: u32, max_steps: u64) -> bool {
+    (*m).err = 0
+    (*m).err_op = 0
+    (*m).killed = 0
+    (*m).steps = 0
+    if fn_id == 0 || tget(m, (*m).op, fn_id) != 54 {
+        fail(m, E_ENTRY, 0)
+        return false
+    }
+    var pc: usize = after_params(m, fn_id)
+    var depth: usize = 0
+    var cur: u32 = 0
+    var prev: u32 = 0
+    while (*m).err == 0 {
+        if pc >= (*m).nwords {
+            fail(m, E_BROKEN, 0)
+            break
+        }
+        (*m).steps = (*m).steps + 1
+        if (*m).steps > max_steps {
+            fail(m, E_STEPS, 0)
+            break
+        }
+        let w: u32 = rt.ld32((*m).code, pc)
+        let wc: usize = (w >> 16) as usize
+        let o: u32 = w & 0xffff
+        if wc == 0 {
+            fail(m, E_BROKEN, o)
+            break
+        }
+        var next: usize = pc + wc
+        if o == 0 || o == 8 || o == 317 || o == 247 || o == 246 || o == 224 || o == 225 {
+            // Nop, Line, NoLine, merge hints, barriers (single invocation): nothing to do
+        } else if o == 248 {
+            cur = cw(m, pc + 1)
+        } else if o == 249 {
+            prev = cur
+            next = tget(m, (*m).at, cw(m, pc + 1))
+        } else if o == 250 {
+            prev = cur
+            if vget(m, cw(m, pc + 1), 0) != 0 {
+                next = tget(m, (*m).at, cw(m, pc + 2))
+            } else {
+                next = tget(m, (*m).at, cw(m, pc + 3))
+            }
+        } else if o == 251 {
+            prev = cur
+            let sel: u32 = vget(m, cw(m, pc + 1), 0)
+            var target: u32 = cw(m, pc + 2)
+            var j: usize = 3
+            while j + 1 < wc {
+                if cw(m, pc + j) == sel {
+                    target = cw(m, pc + j + 1)
+                }
+                j = j + 2
+            }
+            next = tget(m, (*m).at, target)
+        } else if o == 253 || o == 254 {
+            if o == 254 && depth > 0 {
+                let rid: u32 = rt.ld32((*m).stk_res, depth - 1)
+                vcopy(m, rid, 0, cw(m, pc + 1), tsize(m, tyid(m, rid)))
+            }
+            if depth == 0 {
+                return (*m).err == 0
+            }
+            depth = depth - 1
+            next = rt.ld32((*m).stk_ret, depth) as usize
+            cur = rt.ld32((*m).stk_lbl, depth)
+        } else if o == 252 {
+            (*m).killed = 1
+            return true
+        } else if o == 255 {
+            fail(m, E_OP, o)
+        } else if o == 57 {
+            // FunctionCall: result type, result id, function, arguments
+            if depth >= MAX_DEPTH {
+                fail(m, E_DEPTH, o)
+            } else {
+                let callee: u32 = cw(m, pc + 3)
+                var pp: usize = tget(m, (*m).at, callee)
+                pp = pp + (cw(m, pp) >> 16) as usize
+                var ai: usize = 4
+                while ai < wc && (cw(m, pp) & 0xffff) == 55 {
+                    let pid: u32 = cw(m, pp + 2)
+                    vcopy(m, pid, 0, cw(m, pc + ai), tsize(m, cw(m, pp + 1)))
+                    pp = pp + (cw(m, pp) >> 16) as usize
+                    ai = ai + 1
+                }
+                rt.st32((*m).stk_ret, depth, (pc + wc) as u32)
+                rt.st32((*m).stk_res, depth, cw(m, pc + 2))
+                rt.st32((*m).stk_lbl, depth, cur)
+                depth = depth + 1
+                next = pp
+            }
+        } else if o == 245 {
+            next = exec_phis(m, pc, prev)
+        } else {
+            exec_value(m, pc, wc, o)
+        }
+        pc = next
+    }
+    return false
+}
+
+// the first instruction after OpFunction and its OpFunctionParameters
+fn after_params(m: *mut Spv, fn_id: u32) -> usize {
+    var p: usize = tget(m, (*m).at, fn_id)
+    p = p + (cw(m, p) >> 16) as usize
+    while (cw(m, p) & 0xffff) == 55 && (*m).err == 0 {
+        p = p + (cw(m, p) >> 16) as usize
+    }
+    return p
+}
+
+// a run of OpPhi instructions: read all incoming values first, then write (swap-safe). Returns the next pc.
+fn exec_phis(m: *mut Spv, start: usize, prev: u32) -> usize {
+    var pc: usize = start
+    var used: usize = 0
+    while (cw(m, pc) & 0xffff) == 245 && (*m).err == 0 {
+        let wc: usize = (cw(m, pc) >> 16) as usize
+        let n: usize = tsize(m, cw(m, pc + 1))
+        if used + n > TMP_WORDS {
+            fail(m, E_RANGE, 245)
+            return pc
+        }
+        var j: usize = 3
+        var found: bool = false
+        while j + 1 < wc {
+            if cw(m, pc + j + 1) == prev {
+                var k: usize = 0
+                while k < n {
+                    rt.st32((*m).tmp, used + k, vget(m, cw(m, pc + j), k))
+                    k = k + 1
+                }
+                found = true
+            }
+            j = j + 2
+        }
+        if !found {
+            fail(m, E_BROKEN, 245)
+            return pc
+        }
+        used = used + n
+        pc = pc + wc
+    }
+    var q: usize = start
+    var u: usize = 0
+    while q < pc {
+        let wc: usize = (cw(m, q) >> 16) as usize
+        let n: usize = tsize(m, cw(m, q + 1))
+        var k: usize = 0
+        while k < n {
+            vput(m, cw(m, q + 2), k, rt.ld32((*m).tmp, u + k))
+            k = k + 1
+        }
+        u = u + n
+        q = q + wc
+    }
+    return pc
+}
+
+// every instruction that produces or stores a value (not control flow)
+fn exec_value(m: *mut Spv, pc: usize, wc: usize, o: u32) {
+    if o == 59 {
+        // OpVariable: Function storage class with an initializer is initialised here
+        if wc >= 5 && cw(m, pc + 3) == 7 {
+            init_variable(m, cw(m, pc + 2), cw(m, pc + 4))
+        }
+        return
+    }
+    if o == 61 {
+        let res: u32 = cw(m, pc + 2)
+        let base: usize = vget(m, cw(m, pc + 3), 0) as usize
+        let n: usize = tsize(m, cw(m, pc + 1))
+        var k: usize = 0
+        while k < n {
+            vput(m, res, k, memget(m, base + k))
+            k = k + 1
+        }
+        return
+    }
+    if o == 62 {
+        let base: usize = vget(m, cw(m, pc + 1), 0) as usize
+        let obj: u32 = cw(m, pc + 2)
+        let n: usize = tsize(m, tyid(m, obj))
+        var k: usize = 0
+        while k < n {
+            memput(m, base + k, vget(m, obj, k))
+            k = k + 1
+        }
+        return
+    }
+    if o == 63 {
+        let dst: u32 = cw(m, pc + 1)
+        let src: usize = vget(m, cw(m, pc + 2), 0) as usize
+        let to: usize = vget(m, dst, 0) as usize
+        let n: usize = tsize(m, pointee(m, tyid(m, dst)))
+        var k: usize = 0
+        while k < n {
+            memput(m, to + k, memget(m, src + k))
+            k = k + 1
+        }
+        return
+    }
+    if o == 65 || o == 66 {
+        vput(m, cw(m, pc + 2), 0, chain_offset(m, cw(m, pc + 3), pc, wc) as u32)
+        return
+    }
+    let rtype: u32 = cw(m, pc + 1)
+    let res: u32 = cw(m, pc + 2)
+    let n: usize = tsize(m, rtype)
+    var k: usize = 0
+    if o == 1 {
+        return
+    }
+    if is_unary(o) {
+        let a: u32 = cw(m, pc + 3)
+        while k < n {
+            vput(m, res, k, alu1(m, o, vget(m, a, k)))
+            k = k + 1
+        }
+        return
+    }
+    if is_binary(o) {
+        let a: u32 = cw(m, pc + 3)
+        let b: u32 = cw(m, pc + 4)
+        while k < n {
+            vput(m, res, k, alu2(m, o, vget(m, a, k), vget(m, b, k)))
+            k = k + 1
+        }
+        return
+    }
+    if o == 142 || o == 143 {
+        // VectorTimesScalar / MatrixTimesScalar
+        let a: u32 = cw(m, pc + 3)
+        let s: f32 = fget(m, cw(m, pc + 4), 0)
+        while k < n {
+            fput(m, res, k, fget(m, a, k) * s)
+            k = k + 1
+        }
+        return
+    }
+    if o == 148 {
+        let a: u32 = cw(m, pc + 3)
+        let b: u32 = cw(m, pc + 4)
+        let len: usize = tsize(m, tyid(m, a))
+        var s: f32 = 0.0
+        while k < len {
+            s = s + fget(m, a, k) * fget(m, b, k)
+            k = k + 1
+        }
+        fput(m, res, 0, s)
+        return
+    }
+    if o == 145 || o == 144 || o == 146 {
+        exec_matmul(m, pc, o, res, rtype)
+        return
+    }
+    if o == 84 {
+        // Transpose: source has `c` columns of `r` rows; result has r columns of c rows
+        let a: u32 = cw(m, pc + 3)
+        let st: u32 = tyid(m, a)
+        let c: usize = tcount(m, st)
+        let r: usize = tcount(m, tchild(m, st, 0))
+        var j: usize = 0
+        while j < c {
+            var i: usize = 0
+            while i < r {
+                vput(m, res, i * c + j, vget(m, a, j * r + i))
+                i = i + 1
+            }
+            j = j + 1
+        }
+        return
+    }
+    if o == 154 || o == 155 {
+        // Any / All
+        let a: u32 = cw(m, pc + 3)
+        let len: usize = tsize(m, tyid(m, a))
+        var r: u32 = 0
+        if o == 155 {
+            r = 1
+        }
+        while k < len {
+            if o == 154 && vget(m, a, k) != 0 {
+                r = 1
+            }
+            if o == 155 && vget(m, a, k) == 0 {
+                r = 0
+            }
+            k = k + 1
+        }
+        vput(m, res, 0, r)
+        return
+    }
+    if o == 169 {
+        // Select(cond, a, b): scalar condition picks a whole object, vector condition picks per component
+        let cnd: u32 = cw(m, pc + 3)
+        let a: u32 = cw(m, pc + 4)
+        let b: u32 = cw(m, pc + 5)
+        let nc: usize = tsize(m, tyid(m, cnd))
+        while k < n {
+            var ck: usize = 0
+            if nc > 1 {
+                ck = k
+            }
+            if vget(m, cnd, ck) != 0 {
+                vput(m, res, k, vget(m, a, k))
+            } else {
+                vput(m, res, k, vget(m, b, k))
+            }
+            k = k + 1
+        }
+        return
+    }
+    if o == 80 {
+        // CompositeConstruct: constituents one after the other
+        var j: usize = 3
+        var off: usize = 0
+        while j < wc {
+            let part: u32 = cw(m, pc + j)
+            let np: usize = tsize(m, tyid(m, part))
+            vcopy(m, res, off, part, np)
+            off = off + np
+            j = j + 1
+        }
+        return
+    }
+    if o == 81 || o == 82 {
+        // CompositeExtract(composite, idx...) / CompositeInsert(object, composite, idx...)
+        var comp: u32 = cw(m, pc + 3)
+        var j: usize = 4
+        if o == 82 {
+            comp = cw(m, pc + 4)
+            j = 5
+            vcopy(m, res, 0, comp, n)
+        }
+        var t: u32 = tyid(m, comp)
+        var off: usize = 0
+        while j < wc && (*m).err == 0 {
+            let idx: usize = cw(m, pc + j) as usize
+            if idx >= tcount(m, t) {
+                fail(m, E_RANGE, o)
+                return
+            }
+            off = off + toff(m, t, idx)
+            t = tchild(m, t, idx)
+            j = j + 1
+        }
+        let len: usize = tsize(m, t)
+        if o == 81 {
+            while k < len {
+                vput(m, res, k, vget(m, comp, off + k))
+                k = k + 1
+            }
+        } else {
+            vcopy(m, res, off, cw(m, pc + 3), len)
+        }
+        return
+    }
+    if o == 79 {
+        // VectorShuffle
+        let v1: u32 = cw(m, pc + 3)
+        let v2: u32 = cw(m, pc + 4)
+        let n1: usize = tsize(m, tyid(m, v1))
+        while k < n {
+            let c: u32 = cw(m, pc + 5 + k)
+            if c == 0xffffffff {
+                vput(m, res, k, 0)
+            } else if (c as usize) < n1 {
+                vput(m, res, k, vget(m, v1, c as usize))
+            } else {
+                vput(m, res, k, vget(m, v2, c as usize - n1))
+            }
+            k = k + 1
+        }
+        return
+    }
+    if o == 77 {
+        // VectorExtractDynamic
+        let v: u32 = cw(m, pc + 3)
+        let idx: usize = vget(m, cw(m, pc + 4), 0) as usize
+        if idx >= tsize(m, tyid(m, v)) {
+            fail(m, E_RANGE, o)
+            return
+        }
+        vput(m, res, 0, vget(m, v, idx))
+        return
+    }
+    if o == 78 {
+        // VectorInsertDynamic(vector, component, index)
+        let v: u32 = cw(m, pc + 3)
+        let idx: usize = vget(m, cw(m, pc + 5), 0) as usize
+        if idx >= n {
+            fail(m, E_RANGE, o)
+            return
+        }
+        vcopy(m, res, 0, v, n)
+        vput(m, res, idx, vget(m, cw(m, pc + 4), 0))
+        return
+    }
+    if o == 12 {
+        // ExtInst(set, instruction, operands...)
+        let set: u32 = cw(m, pc + 3)
+        let sa: usize = tget(m, (*m).at, set)
+        if tget(m, (*m).op, set) != 11 || cw(m, sa + 2) != 0x4C534C47 || cw(m, sa + 3) != 0x6474732E || cw(m, sa + 4) != 0x3035342E {
+            fail(m, E_EXT, o)
+            return
+        }
+        exec_glsl(m, res, rtype, cw(m, pc + 4), pc + 5)
+        return
+    }
+    fail(m, E_OP, o)
+}
+
+// matrix products; matrices are column-major: element (column j, row i) at j * rows + i
+fn exec_matmul(m: *mut Spv, pc: usize, o: u32, res: u32, rtype: u32) {
+    let a: u32 = cw(m, pc + 3)
+    let b: u32 = cw(m, pc + 4)
+    let ta: u32 = tyid(m, a)
+    let tb: u32 = tyid(m, b)
+    if o == 145 {
+        // MatrixTimesVector: res[i] = sum_j M[j][i] * v[j]
+        let cols: usize = tcount(m, ta)
+        let rows: usize = tcount(m, tchild(m, ta, 0))
+        var i: usize = 0
+        while i < rows {
+            var s: f32 = 0.0
+            var j: usize = 0
+            while j < cols {
+                s = s + fget(m, a, j * rows + i) * fget(m, b, j)
+                j = j + 1
+            }
+            fput(m, res, i, s)
+            i = i + 1
+        }
+        return
+    }
+    if o == 144 {
+        // VectorTimesMatrix: res[j] = sum_i v[i] * M[j][i]
+        let cols: usize = tcount(m, tb)
+        let rows: usize = tcount(m, tchild(m, tb, 0))
+        var j: usize = 0
+        while j < cols {
+            var s: f32 = 0.0
+            var i: usize = 0
+            while i < rows {
+                s = s + fget(m, a, i) * fget(m, b, j * rows + i)
+                i = i + 1
+            }
+            fput(m, res, j, s)
+            j = j + 1
+        }
+        return
+    }
+    // MatrixTimesMatrix: A (ca cols, ra rows) * B (cb cols, ca rows)
+    let ca: usize = tcount(m, ta)
+    let ra: usize = tcount(m, tchild(m, ta, 0))
+    let cb: usize = tcount(m, tb)
+    var kcol: usize = 0
+    while kcol < cb {
+        var i: usize = 0
+        while i < ra {
+            var s: f32 = 0.0
+            var j: usize = 0
+            while j < ca {
+                s = s + fget(m, a, j * ra + i) * fget(m, b, kcol * ca + j)
+                j = j + 1
+            }
+            fput(m, res, kcol * ra + i, s)
+            i = i + 1
+        }
+        kcol = kcol + 1
+    }
+}
