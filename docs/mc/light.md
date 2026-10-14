@@ -40,8 +40,11 @@ Measured (llvmpipe box, 64^3 terrain, release): full recompute 47 ms (262144 cel
 * Tests: tests/2885_mc_stream_light.fi (stream inline / 4 workers, wr, Chunk.light only, no light data, edit; all images == reference built from `light_pad_section` + `mesh_padded_lit`; fixed day / night hashes; incremental volume == full recompute after an edit).
 * Live: `MC_KEEP_LIGHT=1` makes demos/mcclient keep Chunk.light and print `LIGHTKEPT ok=N bad=M` (kept arrays hash == packet octets hash; the dump hash itself is compared with prismarine by tools/mcclient/run.sh).
 
+## update_light wiring + moving region (mc-t3)
+* 1.14 - 1.16.5: `mc_world.world_update_light(w, chunk_format, protocol, body)` decodes one update_light and merges it into `Chunk.light` (`chunk_apply_light_update`: an array replaces the one of the same section bit, an empty bit drops it). The vanilla server sends update_light BEFORE the map_chunk of the column, so light for a column that is not stored yet is kept in `World.pend` (64 columns, merged per column, result `ULIGHT_PENDING`) and attached by `world_put`. A chunk sent again starts without light (the server sends a new update_light first). demos/mcclient: `MC_KEEP_LIGHT=1` + stderr `UPDATELIGHT applied/pending/orphan/bad`; `ref_dump.cjs` has the same pending logic (own parser). Test tests/2906.
+* Moving region: `mc_wlight.wl_region_recenter(wl, w, pcx, pcz, ncx, ncz, margin, from_packets)` keeps the region while the player column is `margin` columns inside it, else reloads it centered (0 kept / 1 moved / 2 first load). Memory stays `ncx*ncz*nsec*4096*5` octets (`wl_region_bytes`). After 1 the caller remeshes (`stream_set_light` again; border columns changed source). Columns outside the region use Chunk.light or the sky-15 default. Test tests/2907 (volume after a move == fresh load, edits survive).
+* GL vs CPU lit scenes: tools/gpu/dump.fi `lit_day`, `lit_night`, `lit_night_fog` (llvmpipe PSNR 41.0 - 41.5 dB, threshold 38).
+
 ## Not done yet (roadmap)
-* update_light (separate packet) is decoded (mc_lightpkt) but not wired into mc_client / the demo: 1.14 - 1.17 columns get no Chunk.light yet, so they render with sky 15 until the packet handler fills it.
-* A moving region (re-centre on the camera) does not exist; the region is loaded once.
-* GL rendering of the lit scenes is not compared with the CPU image (only the default light).
-* No live image check against a real client; llvmpipe/CPU only.
+* The stream does not call `wl_region_recenter` by itself (the play client has to, then remesh); no image test of the follow-up remesh.
+* No live image check against a real client; llvmpipe/CPU only. GL lit scene: llvmpipe only, no real GPU.
