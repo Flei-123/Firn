@@ -117,6 +117,15 @@ use crate::fir::{BlockId, Func, Inst, Module, Op, Term, Val};
 pub fn eliminate(m: &mut Module) -> Result<(), String> {
     for f in m.funcs.iter_mut() {
         eliminate_func(f)?;
+        if std::env::var("FIRN_DUMP_POSTPHI").map(|n| n == f.name).unwrap_or(false) {
+            for b in &f.blocks {
+                eprintln!("bb{}:", b.id);
+                for i in &b.insts {
+                    eprintln!("  {}", crate::fir::fmt_inst(i));
+                }
+                eprintln!("  {}", crate::fir::fmt_term(&b.term));
+            }
+        }
     }
     Ok(())
 }
@@ -863,11 +872,19 @@ fn sequentialize(f: &mut Func, mut par: Vec<Par>) -> Vec<Inst> {
     let mut out: Vec<Inst> = Vec::new();
     // 1. `x = x` does nothing.
     par.retain(|c| c.dst != c.src);
+    // r526 -- the limit comes from the ORIGINAL size. It used to be
+    // `4 * par.len() + 64` re-read every round while `par` shrank, so an edge
+    // with 69 or more copies hit the limit on its last copy and the loop
+    // silently dropped it (a phi kept its old value: wrong sums in
+    // release-fast, where ivsr makes many phis). Every round either emits a
+    // copy or breaks a cycle, and a cycle break is followed by an emit, so
+    // `2 * n` rounds are enough.
+    let limit = 2 * par.len() + 64;
     let mut guard = 0usize;
     while !par.is_empty() {
         guard += 1;
-        if guard > 4 * par.len() + 64 {
-            break; // cannot happen: every round either emits or breaks a cycle
+        if guard > limit {
+            panic!("internal error: phi elimination did not terminate ({} copies left)", par.len());
         }
         // 2. a target nobody else still reads
         let free = par.iter().position(|c| !par.iter().any(|o| o.src == c.dst));

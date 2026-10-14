@@ -1073,7 +1073,7 @@ pub(crate) fn asm_escape(v: &str) -> String {
     o
 }
 
-fn fmt_inst(i: &Inst) -> String {
+pub(crate) fn fmt_inst(i: &Inst) -> String {
     let head = match i.dst {
         Some(d) => format!("%{} = ", d),
         None => String::new(),
@@ -1184,7 +1184,7 @@ fn fmt_inst(i: &Inst) -> String {
     format!("{}{}", head, body)
 }
 
-fn fmt_term(t: &Term) -> String {
+pub(crate) fn fmt_term(t: &Term) -> String {
     match t {
         Term::Br(b) => format!("br bb{}", b),
         Term::BrCond { cond, then_bb, else_bb } => {
