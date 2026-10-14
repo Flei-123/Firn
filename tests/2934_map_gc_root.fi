@@ -1,0 +1,112 @@
+// expect_exit: 0
+// r497: the arrays of a `Map[K, V]` are collector roots when `K` / `V` hold
+// GC pointers (a capturing `gc fn` closure). Before, a collection swept the
+// capture record and the Map called into freed memory. A Map of plain
+// scalars registers nothing.
+import std.map
+
+type Thunk = fn() -> u64
+
+gc class Cell { value: u64, next: Gc[Cell] }
+
+fn make(v: u64) -> AllocError!fn() -> u64 {
+    let c: Gc[Cell] = try gc Cell { value: v, next: gc_null[Cell]() }
+    return try gc fn() -> u64 { return c.value }
+}
+
+// Clears dead stack so the conservative scan cannot keep objects alive by
+// accident (same helper as tests/873).
+fn scrub(n: u64) {
+    var buffer: [u64; 256] = [0; 256]
+    let p: u64 = (&buffer) as u64
+    var i: u64 = 0
+    while i < 256 {
+        *((p + i * 8) as *mut u64) = 0
+        i = i + 1
+    }
+    if n > 0 {
+        scrub(n - 1)
+    }
+}
+
+fn churn(n: u64) -> AllocError!u64 {
+    var i: u64 = 0
+    var s: u64 = 0
+    while i < n {
+        let d: Gc[Cell] = try gc Cell { value: 999999, next: gc_null[Cell]() }
+        s = s + d.value
+        i = i + 1
+    }
+    return s
+}
+
+fn fill(m: *mut Map[u32, Thunk]) -> AllocError!bool {
+    var i: u32 = 0
+    while i < 200 {
+        let f: fn() -> u64 = try make(1000 + i as u64)
+        if !map_set[u32, Thunk](m, i, f) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn check(m: *mut Map[u32, Thunk]) -> bool {
+    var i: u32 = 0
+    while i < 200 {
+        let f: fn() -> u64 = map_get[u32, Thunk](m, i)
+        if f() != 1000 + i as u64 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn run() -> AllocError!i32 {
+    // 1. compile-time facts
+    if has_gc[u32]() { return 2 }
+    // 2. the closures live ONLY in the Map; it grows several times
+    var m: Map[u32, Thunk] = map_new[u32, Thunk]()
+    if !(try fill(&m)) { return 4 }
+    scrub(8)
+    let a: u64 = try churn(5000)
+    gc_collect()
+    scrub(8)
+    let b: u64 = try churn(5000)
+    gc_collect()
+    if a == 0 || b == 0 { return 5 }
+    if !check(&m) { return 6 }
+    // 3. clear drops the stale slots; refill works
+    map_clear[u32, Thunk](&m)
+    if !(try fill(&m)) { return 7 }
+    scrub(8)
+    gc_collect()
+    if !check(&m) { return 8 }
+    map_free[u32, Thunk](&m)
+    // 4. no root leak: free removed the roots, a scalar Map adds none
+    gc_collect()
+    let before: u64 = gc_roots()
+    var s: Map[u32, u64] = map_new[u32, u64]()
+    var k: u32 = 0
+    while k < 100 {
+        map_set[u32, u64](&s, k, k as u64)
+        k = k + 1
+    }
+    if gc_roots() != before { return 9 }
+    map_free[u32, u64](&s)
+    if gc_roots() != before { return 10 }
+    var t: Map[u32, Thunk] = map_new[u32, Thunk]()
+    if !(try fill(&t)) { return 11 }
+    if gc_roots() == before { return 12 }
+    map_free[u32, Thunk](&t)
+    if gc_roots() != before { return 13 }
+    return 0
+}
+
+fn main() -> i32 {
+    if !gc_init() { return 1 }
+    let r: i32 = run() catch | e | 99
+    return r
+}

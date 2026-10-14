@@ -151,7 +151,7 @@ if [ "$WHICH" = all ] || [ "$WHICH" = windows ]; then
         for SRC in tray_main wintray_poke notify_main autostart_main sink_main audio_main clipboard_main; do
             build "--target=x86_64-windows --opt-level=dev-fast" "$WB/$SRC.exe" "tools/desktop/$SRC.fi" || true
         done
-        for SRC in windrop_main clip_main; do
+        for SRC in windrop_main clip_main winnotify_win_main; do
             cp "tools/desktop/$SRC.fi" "$WB/wn/"
             build "--target=x86_64-windows --opt-level=dev-fast" "$WB/$SRC.exe" "$WB/wn/$SRC.fi" || true
         done
@@ -181,6 +181,13 @@ if [ "$WHICH" = all ] || [ "$WHICH" = windows ]; then
             run python3 tools/desktop/tray_check_win.py "$WB/tray_main.exe" "$WB/wintray_poke.exe" "$WB/notify_main.exe" "$ROOT"
         else
             echo "  SKIP  Xvfb/xwd missing"
+        fi
+
+        step "13b. window.notify / stay_alive on Win32: a balloon from an icon that stays (Wine's explorer as the shell)"
+        if have Xvfb; then
+            run python3 tools/desktop/winnotify_check_win.py "$WB/winnotify_win_main.exe"
+        else
+            echo "  SKIP  Xvfb missing"
         fi
 
         step "14. audio: waveOut -> Wine's ALSA driver -> ALSA's file plugin (bit for bit)"
