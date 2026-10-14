@@ -1,0 +1,157 @@
+// expect_exit: 0
+// tests/2993_mc_packsnd_weights.fi -- pack sounds: "weight" of sounds.json entries (slots of the engine's uniform pick) + no pool growth on reload.
+import std.rt
+import std.io
+import zip.zip
+import audio.engine
+import audio.bank
+import mc.mc_audio
+import mc.mc_assets
+import mc.mc_packs
+import mc.mc_packsnd
+
+struct T {
+    fails: i32,
+}
+
+fn check(t: *mut T, ok: bool, what: str) {
+    if ok {
+        io.fmt_print(f"ok   {what}\n")
+    } else {
+        io.fmt_print(f"FAIL {what}\n")
+        (*t).fails = (*t).fails + 1
+    }
+}
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+const OGG_A: str = "tests/data/vorbis/sine_m22k_q3.ogg"
+const OGG_B: str = "tests/data/vorbis/impulse_m44k_q4.ogg"
+
+fn add_str(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    var ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn add_file(w: *mut zip.ZipWriter, name: str, src: str) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&p, src.p as u64, src.length())
+    rt.buf_push(&p, 0 as u8)
+    var d: rt.Buf = rt.buf_new()
+    var ok: bool = rt.read_file(rt.buf_ptr(&p), &d)
+    if ok { ok = zip.zip_add(w, name, rt.buf_ptr(&d), rt.buf_len(&d), false) catch | e | (false) }
+    rt.buf_free(&p)
+    rt.buf_free(&d)
+    return ok
+}
+
+// Sets the weights of a fresh Acc and returns it with the slots computed.
+fn slots(w: [i32; 16], n: usize) -> mc_packsnd.Acc {
+    var a: mc_packsnd.Acc = mc_packsnd.acc_new()
+    a.n = n
+    var k: usize = 0
+    while k < n { a.w[k] = w[k]; k = k + 1 }
+    mc_packsnd.acc_slots(&a)
+    return a
+}
+
+fn cnt_sum(a: *mut mc_packsnd.Acc) -> i32 {
+    var s: i32 = 0
+    var k: usize = 0
+    while k < (*a).n { s = s + (*a).cnt[k]; k = k + 1 }
+    return s
+}
+
+// How often does sample `id` appear in the pool slots of event `ev`?
+fn slots_of(e: *mut engine.Engine, ev: i32, id: i32) -> i32 {
+    let d: *mut engine.EventDef = engine.engine_event(e, ev)
+    var c: i32 = 0
+    var k: usize = 0
+    while k < (*d).sample_n as usize {
+        if *at[i32]((*e).sample_ids, (*d).sample_first as usize + k) == id { c = c + 1 }
+        k = k + 1
+    }
+    return c
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var t: T = T { fails: 0 }
+
+    // ---- slot arithmetic
+    var w1: [i32; 16] = [1; 16]
+    var a1: mc_packsnd.Acc = slots(w1, 3)
+    check(&t, a1.cnt[0] == 1 && a1.cnt[1] == 1 && a1.cnt[2] == 1, "weights 1,1,1 -> 1 slot each (old behaviour)")
+    var w2: [i32; 16] = [1; 16]
+    w2[0] = 3
+    var a2: mc_packsnd.Acc = slots(w2, 2)
+    check(&t, a2.cnt[0] == 3 && a2.cnt[1] == 1, "weights 3,1 -> 3,1 (exact while the sum <= 16)")
+    var w3: [i32; 16] = [1; 16]
+    w3[0] = 100
+    var a3: mc_packsnd.Acc = slots(w3, 2)
+    check(&t, a3.cnt[0] == 15 && a3.cnt[1] == 1 && cnt_sum(&a3) == 16, "weights 100,1 -> 15,1 (scaled, every file keeps a slot)")
+    var w4: [i32; 16] = [1; 16]
+    w4[0] = 20
+    w4[1] = 10
+    w4[2] = 5
+    var a4: mc_packsnd.Acc = slots(w4, 4)
+    check(&t, cnt_sum(&a4) <= 16 && a4.cnt[0] > a4.cnt[1] && a4.cnt[1] > a4.cnt[2] && a4.cnt[2] >= a4.cnt[3] && a4.cnt[3] >= 1, "20,10,5,1 -> ordered, sum <= 16, none lost")
+    var w5: [i32; 16] = [7; 16]
+    var a5: mc_packsnd.Acc = slots(w5, 16)
+    check(&t, cnt_sum(&a5) == 16, "16 files with weight 7 -> 1 slot each")
+    var w6: [i32; 16] = [1; 16]
+    w6[0] = 2
+    var a6: mc_packsnd.Acc = slots(w6, 16)
+    check(&t, cnt_sum(&a6) == 16 && a6.cnt[0] == 1, "17 would-be slots -> trimmed to 16")
+
+    // ---- through a pack: weight 3 + plain entry, weight 1000 vs 1, weights ignored when absent / bad
+    var e: engine.Engine = engine.engine_new(48000 as u32, 64 as u32)
+    var b: bank.Bank = bank.bank_new()
+    var m: mc_audio.McAudio = mc_audio.mca_new(&e)
+    var stack: mc_assets.PackStack = mc_assets.stack_new()
+    var buf: rt.Buf = rt.buf_new()
+    var w: zip.ZipWriter = zip.zip_writer_new(&buf)
+    var ok: bool = add_str(&w, "pack.mcmeta", META)
+    ok = add_str(&w, "assets/minecraft/sounds.json", "{\"w.three\":{\"sounds\":[{\"name\":\"custom/a\",\"weight\":3},\"custom/b\"]},\"w.big\":{\"sounds\":[{\"name\":\"custom/a\",\"weight\":1000},{\"name\":\"custom/b\",\"weight\":1}]},\"w.bad\":{\"sounds\":[{\"name\":\"custom/a\",\"weight\":0},{\"name\":\"custom/b\",\"weight\":-4}]},\"w.plain\":{\"sounds\":[\"custom/a\",\"custom/b\"]}}") && ok
+    ok = add_file(&w, "assets/minecraft/sounds/custom/a.ogg", OGG_A) && ok
+    ok = add_file(&w, "assets/minecraft/sounds/custom/b.ogg", OGG_B) && ok
+    var n: usize = zip.zip_finish(&w) catch | e2 | (0)
+    zip.zip_writer_free(&w)
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if n > 0 && mc_assets.pack_open_mem(&pk, rt.buf_ptr(&buf), rt.buf_len(&buf)) == mc_assets.ASSET_OK { ok = mc_assets.stack_push(&stack, &pk) == mc_assets.ASSET_OK && ok } else { ok = false }
+    check(&t, ok, "pack built")
+
+    check(&t, mc_packsnd.packsnd_apply(&m, &b, &e, &stack, mc_packs.SOUNDS_BOTH) == 4, "4 events")
+    let e3: i32 = engine.engine_find_event(&e, "w.three")
+    let eb: i32 = engine.engine_find_event(&e, "w.big")
+    let ex: i32 = engine.engine_find_event(&e, "w.bad")
+    let ep: i32 = engine.engine_find_event(&e, "w.plain")
+    check(&t, e3 >= 0 && eb >= 0 && ex >= 0 && ep >= 0, "events exist")
+    let d3: *mut engine.EventDef = engine.engine_event(&e, e3)
+    check(&t, (*d3).sample_n == 4, "w.three: 3 + 1 = 4 slots")
+    let ida: i32 = *at[i32](e.sample_ids, (*d3).sample_first as usize)
+    check(&t, slots_of(&e, e3, ida) == 3, "w.three: the weight-3 file holds 3 of the 4 slots")
+    check(&t, (*engine.engine_event(&e, eb)).sample_n == 16 && slots_of(&e, eb, ida) == 15, "w.big: 1000 vs 1 -> 15 of 16 slots")
+    check(&t, (*engine.engine_event(&e, ex)).sample_n == 2, "w.bad: weight 0 / negative = 1 -> 2 slots")
+    check(&t, (*engine.engine_event(&e, ep)).sample_n == 2, "w.plain: no weight = 2 slots (unchanged)")
+
+    // the pack event plays
+    var ne: i32 = 0
+    var k: i32 = 0
+    while k < 40 {
+        if mc_audio.mca_play_ui(&m, "w.three", 1.0, 1.0) != 0 as u32 { ne = ne + 1 }
+        k = k + 1
+    }
+    check(&t, ne > 0, "w.three plays")
+
+    // ---- reload: the sample id pool does not grow (engine_event_replace gives the tail back)
+    let pool0: usize = e.n_sample_ids
+    let ns0: usize = engine.engine_sample_count(&e)
+    check(&t, mc_packsnd.packsnd_apply(&m, &b, &e, &stack, mc_packs.SOUNDS_BOTH) == 4, "reload 1: 4 events")
+    check(&t, mc_packsnd.packsnd_apply(&m, &b, &e, &stack, mc_packs.SOUNDS_BOTH) == 4, "reload 2: 4 events")
+    check(&t, e.n_sample_ids == pool0, "reloads: sample id pool did not grow")
+    check(&t, engine.engine_sample_count(&e) == ns0, "reloads: sample table did not grow")
+    check(&t, (*engine.engine_event(&e, engine.engine_find_event(&e, "w.three"))).sample_n == 4 && slots_of(&e, engine.engine_find_event(&e, "w.three"), ida) == 3, "reloads: weights survive")
+
+    io.fmt_print(f"failures: {t.fails}\n")
+    return t.fails
+}
