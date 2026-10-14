@@ -768,6 +768,141 @@ fn count1_value(l: *mut HuffLage, dst_in: u64, at: i64, one: f32) {
     flush_bits(l, 1)
 }
 
+struct HuffState {
+    cache: u32,
+    sh: i32,
+    next: u64,
+    dst: i64,
+    scf: i64,
+    sfb: u64,
+    np: i32,
+    one: f32,
+}
+
+// The count1 region: only values -1, 0, +1 left, in groups of four.
+// `np` counts the pairs left in the current scalefactor band; it ticks at
+// steps 0 and 2; reaching the end of the band table ends the region.
+fn l3_count1(t: *mut mp3_tab.Tabs, dst_in: u64, bs: *mut Bs, gr: *mut GrInfo,
+    scf_in: u64, layer3gr_limit: i32, st: *mut HuffState) {
+    var cache: u32 = (*st).cache
+    var sh: i32 = (*st).sh
+    var nxt: u64 = (*st).next
+    var dst: i64 = (*st).dst
+    var scf: i64 = (*st).scf
+    var sfb: u64 = (*st).sfb
+    var np: i32 = (*st).np
+    var one: f32 = (*st).one
+    var tab: u64 = (&(*t).tab32[0]) as u64
+    if (*gr).count1_table != 0 {
+        tab = (&(*t).tab33[0]) as u64
+    }
+    let buf: u64 = (*bs).buf
+    // bspos > limit  <=>  (nxt - buf) * 8 + sh > limit + 24
+    let nlim: i32 = layer3gr_limit + 24
+    while true {
+        var leaf: i32 = lb(tab, (cache >> 28 as u32) as i64) as i32
+        if (leaf & 8) == 0 {
+            let offset: i32 = (leaf >> 3) + (((cache << 4 as u32) >> ((32 - (leaf & 3)) as u32)) as i32)
+            leaf = lb(tab, offset as i64) as i32
+        }
+        let used: i32 = leaf & 7
+        cache = cache << (used as u32)
+        sh = sh + used
+        if (((nxt - buf) as i32) * 8) + sh > nlim {
+            break
+        }
+        np = np - 1
+        if np == 0 {
+            np = (lb(sfb, 0) as i32) / 2
+            sfb = sfb + 1
+            if np == 0 {
+                break
+            }
+            one = lf(scf_in, scf)
+            scf = scf + 1
+        }
+        if (leaf & 128) != 0 {
+            var v: f32 = one
+            if (cache & 2147483648 as u32) != 0 as u32 {
+                v = -one
+            }
+            sf(dst_in, dst, v)
+            cache = cache << 1 as u32
+            sh = sh + 1
+        }
+        if (leaf & 64) != 0 {
+            var v: f32 = one
+            if (cache & 2147483648 as u32) != 0 as u32 {
+                v = -one
+            }
+            sf(dst_in, dst + 1, v)
+            cache = cache << 1 as u32
+            sh = sh + 1
+        }
+        np = np - 1
+        if np == 0 {
+            np = (lb(sfb, 0) as i32) / 2
+            sfb = sfb + 1
+            if np == 0 {
+                break
+            }
+            one = lf(scf_in, scf)
+            scf = scf + 1
+        }
+        if (leaf & 32) != 0 {
+            var v: f32 = one
+            if (cache & 2147483648 as u32) != 0 as u32 {
+                v = -one
+            }
+            sf(dst_in, dst + 2, v)
+            cache = cache << 1 as u32
+            sh = sh + 1
+        }
+        if (leaf & 16) != 0 {
+            var v: f32 = one
+            if (cache & 2147483648 as u32) != 0 as u32 {
+                v = -one
+            }
+            sf(dst_in, dst + 3, v)
+            cache = cache << 1 as u32
+            sh = sh + 1
+        }
+        while sh >= 0 {
+            cache = cache | ((lb(nxt, 0) as u32) << (sh as u32))
+            nxt = nxt + 1
+            sh = sh - 8
+        }
+        dst = dst + 4
+    }
+}
+
+// One big-values coefficient: `lsb` is the 4 bit magnitude from the leaf;
+// 15 with linbits != 0 means an escape value read from the stream.
+#[inline]
+fn big_value(t: *mut mp3_tab.Tabs, l: *mut HuffLage, dst_in: u64, at: i64, lsb_in: i32,
+    linbits: i32, one: f32) {
+    var lsb: i32 = lsb_in
+    if linbits != 0 && lsb == 15 {
+        lsb = lsb + peek_bits(l, linbits)
+        flush_bits(l, linbits)
+        check_bits(l)
+        var v: f32 = one * l3_pow_43(t, lsb)
+        if cache_negative(l) {
+            v = -v
+        }
+        sf(dst_in, at, v)
+    } else {
+        var idx: i32 = 16 + lsb
+        if cache_negative(l) {
+            idx = idx - 16
+        }
+        sf(dst_in, at, (*t).pow43[idx as usize] * one)
+    }
+    if lsb != 0 {
+        flush_bits(l, 1)
+    }
+}
+
 fn l3_huffman(t: *mut mp3_tab.Tabs, dst_in: u64, bs: *mut Bs, gr: *mut GrInfo,
     scf_in: u64, layer3gr_limit: i32) {
     var dst: i64 = 0
@@ -810,32 +945,9 @@ fn l3_huffman(t: *mut mp3_tab.Tabs, dst_in: u64, bs: *mut Bs, gr: *mut GrInfo,
                     leaf = (*t).tabs[(cb + peek_bits(l, w) - (leaf >> 3)) as usize] as i32
                 }
                 flush_bits(l, leaf >> 8)
-                var j: i32 = 0
-                while j < 2 {
-                    var lsb: i32 = leaf & 15
-                    if linbits != 0 && lsb == 15 {
-                        lsb = lsb + peek_bits(l, linbits)
-                        flush_bits(l, linbits)
-                        check_bits(l)
-                        var v: f32 = one * l3_pow_43(t, lsb)
-                        if cache_negative(l) {
-                            v = -v
-                        }
-                        sf(dst_in, dst, v)
-                    } else {
-                        var idx: i32 = 16 + lsb
-                        if cache_negative(l) {
-                            idx = idx - 16
-                        }
-                        sf(dst_in, dst, (*t).pow43[idx as usize] * one)
-                    }
-                    if lsb != 0 {
-                        flush_bits(l, 1)
-                    }
-                    dst = dst + 1
-                    leaf = leaf >> 4
-                    j = j + 1
-                }
+                big_value(t, l, dst_in, dst, leaf & 15, linbits, one)
+                big_value(t, l, dst_in, dst + 1, (leaf >> 4) & 15, linbits, one)
+                dst = dst + 2
                 check_bits(l)
                 pairs = pairs - 1
             }
@@ -847,76 +959,12 @@ fn l3_huffman(t: *mut mp3_tab.Tabs, dst_in: u64, bs: *mut Bs, gr: *mut GrInfo,
         }
     }
 
-    // The count1 region: only values -1, 0, +1 left, in groups of four.
-    var np: i32 = 1 - big_val_cnt
-    var done: bool = false
-    while !done {
-        var leaf: i32 = 0
-        if (*gr).count1_table != 0 {
-            leaf = (*t).tab33[peek_bits(l, 4) as usize] as i32
-        } else {
-            leaf = (*t).tab32[peek_bits(l, 4) as usize] as i32
-        }
-        if (leaf & 8) == 0 {
-            let offset: i32 = (leaf >> 3) + (((lage.cache << 4 as u32) >> ((32 - (leaf & 3)) as u32)) as i32)
-            if (*gr).count1_table != 0 {
-                leaf = (*t).tab33[offset as usize] as i32
-            } else {
-                leaf = (*t).tab32[offset as usize] as i32
-            }
-        }
-        flush_bits(l, leaf & 7)
-        let bspos: i32 = (((lage.next - (*bs).buf) as i32) * 8) - 24 + lage.sh
-        if bspos > layer3gr_limit {
-            done = true
-        } else {
-            // Four unrolled steps (r144 left them as a counted loop with a
-            // side exit that stayed rolled): the band counter `np` ticks at
-            // steps 0 and 2; reaching the end of the table ends the region.
-            np = np - 1
-            if np == 0 {
-                np = (lb(sfb, 0) as i32) / 2
-                sfb = sfb + 1
-                if np == 0 {
-                    done = true
-                } else {
-                    one = lf(scf_in, scf)
-                    scf = scf + 1
-                }
-            }
-            if !done {
-                if (leaf & 128) != 0 {
-                    count1_value(l, dst_in, dst, one)
-                }
-                if (leaf & 64) != 0 {
-                    count1_value(l, dst_in, dst + 1, one)
-                }
-                np = np - 1
-                if np == 0 {
-                    np = (lb(sfb, 0) as i32) / 2
-                    sfb = sfb + 1
-                    if np == 0 {
-                        done = true
-                    } else {
-                        one = lf(scf_in, scf)
-                        scf = scf + 1
-                    }
-                }
-                if !done {
-                    if (leaf & 32) != 0 {
-                        count1_value(l, dst_in, dst + 2, one)
-                    }
-                    if (leaf & 16) != 0 {
-                        count1_value(l, dst_in, dst + 3, one)
-                    }
-                }
-            }
-            if !done {
-                check_bits(l)
-                dst = dst + 4
-            }
-        }
+    // The count1 region (own function: fewer live values, fewer spills).
+    var st: HuffState = HuffState {
+        cache: lage.cache, sh: lage.sh, next: lage.next, dst: dst, scf: scf,
+        sfb: sfb, np: 1 - big_val_cnt, one: one,
     }
+    l3_count1(t, dst_in, bs, gr, scf_in, layer3gr_limit, &st)
     (*bs).pos = layer3gr_limit
 }
 
@@ -1113,7 +1161,8 @@ fn l3_antialias(t: *mut mp3_tab.Tabs, grbuf_in: u64, nbands_in: i32) {
 }
 
 #[inline]
-fn l3_dct3_9(y: u64) {
+// With `neg` the odd outputs 1, 3, 5, 7 leave negated (saves a pass over the array).
+fn l3_dct3_9(y: u64, neg: bool) {
     var s0: f32 = lf(y, 0)
     var s2: f32 = lf(y, 2)
     var s4: f32 = lf(y, 4)
@@ -1148,13 +1197,20 @@ fn l3_dct3_9(y: u64) {
     s3 = t4 + s3 - t2
 
     sf(y, 0, s4 - s7)
-    sf(y, 1, s2 + s1)
     sf(y, 2, s0 - s3)
-    sf(y, 3, s8 + s5)
-    sf(y, 5, s8 - s5)
     sf(y, 6, s0 + s3)
-    sf(y, 7, s2 - s1)
     sf(y, 8, s4 + s7)
+    if neg {
+        sf(y, 1, -(s2 + s1))
+        sf(y, 3, -(s8 + s5))
+        sf(y, 5, -(s8 - s5))
+        sf(y, 7, -(s2 - s1))
+    } else {
+        sf(y, 1, s2 + s1)
+        sf(y, 3, s8 + s5)
+        sf(y, 5, s8 - s5)
+        sf(y, 7, s2 - s1)
+    }
 }
 
 fn l3_imdct36(t: *mut mp3_tab.Tabs, grbuf_in: u64, overlap_in: u64, window: u64, nbands: i32) {
@@ -1182,12 +1238,8 @@ fn l3_imdct36(t: *mut mp3_tab.Tabs, grbuf_in: u64, overlap_in: u64, window: u64,
             co[(2 + 2 * i) as usize] = -(lf(grbuf, (4 * i + 3) as i64) + lf(grbuf, (4 * i + 4) as i64))
             i = i + 1
         }
-        l3_dct3_9(cop)
-        l3_dct3_9(sip)
-        si[1] = -si[1]
-        si[3] = -si[3]
-        si[5] = -si[5]
-        si[7] = -si[7]
+        l3_dct3_9(cop, false)
+        l3_dct3_9(sip, true)
 
         // FOUR LANES AT ONCE (round TEMPO 5). All seven rows read
         // run upwards with `i` and lie next to one another; only the
@@ -1928,22 +1980,31 @@ fn synth(t: *mut mp3_tab.Tabs, xl: u64, dstl: u64, nch: i32, lins: u64) {
     }
 }
 
-// SIXTEEN OCTETS PER PASS (round TEMPO 7).
-//
-// `rt.mem_copy` copies eight octets per pass -- correct and usable
-// everywhere, also in the kernel without SSE. Here it is about ONE hot case: the
-// 3840 octets of state of the synthesis filter bank, twice per granule. With
-// `v128` that is half the passes. The length is always a
-// multiple of sixteen; for the remainder the old way stands beside it.
-fn copy16(target: u64, source: u64, n: usize) {
-    var i: usize = 0
-    while i + 16 <= n {
-        __v128_store((target + (i as u64)) as *mut u8,
-            __v128_load((source + (i as u64)) as *u8))
-        i = i + 16
-    }
-    if i < n {
-        rt.mem_copy(target + (i as u64), source + (i as u64), n - i)
+// The 3840 octets of filter state, 128 octets per pass (eight v128 pairs):
+// (the old 16 octet loop spent most of its instructions on loop overhead). 3840 = 30 * 128.
+fn copy_qmf(target: u64, source: u64) {
+    var d: u64 = target
+    var q: u64 = source
+    let dend: u64 = target + 3840
+    while d < dend {
+        let a0: v128 = __v128_load(q as *u8)
+        let a1: v128 = __v128_load((q +% 16) as *u8)
+        let a2: v128 = __v128_load((q +% 32) as *u8)
+        let a3: v128 = __v128_load((q +% 48) as *u8)
+        let a4: v128 = __v128_load((q +% 64) as *u8)
+        let a5: v128 = __v128_load((q +% 80) as *u8)
+        let a6: v128 = __v128_load((q +% 96) as *u8)
+        let a7: v128 = __v128_load((q +% 112) as *u8)
+        __v128_store(d as *mut u8, a0)
+        __v128_store((d +% 16) as *mut u8, a1)
+        __v128_store((d +% 32) as *mut u8, a2)
+        __v128_store((d +% 48) as *mut u8, a3)
+        __v128_store((d +% 64) as *mut u8, a4)
+        __v128_store((d +% 80) as *mut u8, a5)
+        __v128_store((d +% 96) as *mut u8, a6)
+        __v128_store((d +% 112) as *mut u8, a7)
+        d = d + 128
+        q = q + 128
     }
 }
 
@@ -1953,7 +2014,7 @@ fn synth_granule(t: *mut mp3_tab.Tabs, qmf_state: u64, grbuf: u64, nbands: i32, 
         dct_ii(t, adr4(grbuf, (576 * i) as i64), nbands)
         i = i + 1
     }
-    copy16(lins, qmf_state, 15 * 64 * 4)
+    copy_qmf(lins, qmf_state)
     i = 0
     while i < nbands {
         synth(t, adr4(grbuf, i as i64), adr2(pcm, (32 * nch * i) as i64), nch, adr4(lins, (i * 64) as i64))
@@ -1966,7 +2027,7 @@ fn synth_granule(t: *mut mp3_tab.Tabs, qmf_state: u64, grbuf: u64, nbands: i32, 
             i = i + 2
         }
     } else {
-        copy16(qmf_state, adr4(lins, (nbands * 64) as i64), 15 * 64 * 4)
+        copy_qmf(qmf_state, adr4(lins, (nbands * 64) as i64))
     }
 }
 
