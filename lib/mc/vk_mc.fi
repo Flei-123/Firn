@@ -39,7 +39,7 @@ import gpu.vk_life
 export {
     VkBackend, vkbe_open, vkbe_open_cache, vkbe_on_rebuild, vkbe_close, vkbe_backend, vkbe_set_fog, vkbe_set_light, vkbe_resize, vkbe_device_name, vkbe_is_cpu,
     vkbe_draws, vkbe_tris, vkbe_frames, vkbe_layers_lost, vkbe_in_flight, vkbe_set_readback, vkbe_wait, vkbe_mem_stats,
-    vkbe_live_meshes, vkbe_upload_bytes, vkbe_frame_ms, vkbe_sky,
+    vkbe_live_meshes, vkbe_upload_bytes, vkbe_frame_ms, vkbe_sky, vkbe_tint,
 }
 
 const NFR: usize = 2 // frames in flight
@@ -98,6 +98,7 @@ struct VkBackend {
     pipe_op: vk_desc.VPipe,
     pipe_tr: vk_desc.VPipe,
     pipe_sky: vk_desc.VPipe,
+    pipe_tint: vk_desc.VPipe,
     bound: u64, // pipeline currently bound in the recording command buffer (0 = none)
     fs: [FSlot; 2],
     atlas: vk_mem.Img,
@@ -151,7 +152,7 @@ fn blank() -> VkBackend {
     return VkBackend { ok: false, step: 0, v: vk.vk_new(), x: vk_mem.x_new(),
         fr: vk_frame.Frames { ok: false, pool: 0, n: 0, w: 0, icmd: 0, ifence: 0, serial: 0, done: 0, tpending: false },
         d: vk_desc.desc_none(), life: vk_life.life_new(), cache_path: "", base: 0, nslice: 0, slice_off: 0, ubo_over: 0, dirty: true,
-        gran: vk_mem.buf_none(), org: vk_mem.buf_none(), gran_view: 0, org_view: 0, w: 0, h: 0, rp: 0, playout: 0, pipe_op: vk_desc.vpipe_none(), pipe_tr: vk_desc.vpipe_none(), pipe_sky: vk_desc.vpipe_none(), bound: 0,
+        gran: vk_mem.buf_none(), org: vk_mem.buf_none(), gran_view: 0, org_view: 0, w: 0, h: 0, rp: 0, playout: 0, pipe_op: vk_desc.vpipe_none(), pipe_tr: vk_desc.vpipe_none(), pipe_sky: vk_desc.vpipe_none(), pipe_tint: vk_desc.vpipe_none(), bound: 0,
         fs: [fslot_none(); 2], atlas: vk_mem.img_none(), tile: 0, layers_lost: 0, meshes: 0, mcap: 0, live: 0, dfr: 0, dcap: 0,
         dn: 0, cur: 0, next: 0, in_frame: false, has_last: false, last: 0, trec: false, readback: true, trans: false,
         cx: 0.0, cy: 0.0, cz: 0.0, fade_a: 64.0, fade_inv: 0.0, day: 256.0, tr: 256.0, tg: 256.0, tb: 256.0, fog_on: false,
@@ -274,7 +275,14 @@ fn vkbe_open_cache(w: i32, h: i32, cache_path: str) -> VkBackend {
     var ssp: vk_desc.PipeSpec = vk_desc.spec_new(vk_shaders.SKY_VS.p as u64, vk_shaders.SKY_VS.n, vk_shaders.SKY_FS.p as u64, vk_shaders.SKY_FS.n)
     ssp.topo = vk_desc.TOPO_STRIP
     b.pipe_sky = vk_desc.pipeline_make(&b.x, b.v.cache, b.rp, b.playout, &ssp)
-    if !b.pipe_op.ok || !b.pipe_tr.ok || !b.pipe_sky.ok {
+    // tint: the same strip, only where the world left depth < 1 (fragment depth 1.0 GREATER), no depth write, colour * tint (DST_COLOR, ZERO)
+    var tsp: vk_desc.PipeSpec = vk_desc.spec_new(vk_shaders.TINT_VS.p as u64, vk_shaders.TINT_VS.n, vk_shaders.TINT_FS.p as u64, vk_shaders.TINT_FS.n)
+    tsp.topo = vk_desc.TOPO_STRIP
+    tsp.depth_test = true
+    tsp.depth_op = vk_desc.CMP_GREATER
+    tsp.blend = vk_desc.BLEND_MUL
+    b.pipe_tint = vk_desc.pipeline_make(&b.x, b.v.cache, b.rp, b.playout, &tsp)
+    if !b.pipe_op.ok || !b.pipe_tr.ok || !b.pipe_sky.ok || !b.pipe_tint.ok {
         b.step = 6
         return b
     }
@@ -730,6 +738,21 @@ fn vkbe_sky(b: *mut VkBackend, cam: *mut mc_camera.Camera, sky: *mut mc_sky.Sky)
     vk_mem.cx(&(*b).x, vk_mem.X_CMD_DRAW, cmd, vk_shaders.SKY_VERTS as u64, 1, 0, 0, 0, 0, 0, 0, 0)
 }
 
+// mc_sky.sky_tint_frame on the GPU: multiplies every pixel that has geometry (depth < 1) by tint / 256. Call after the world (and the
+// entities), before the HUD. Identity tints (256) draw nothing.
+fn vkbe_tint(b: *mut VkBackend, sky: *mut mc_sky.Sky) {
+    if !(*b).ok || !(*b).in_frame { return }
+    if (*sky).tr >= 256 && (*sky).tg >= 256 && (*sky).tb >= 256 { return }
+    let u: u64 = (*b).base
+    vk_mem.wf(u, vk_shaders.U_TINT, ((*sky).tr as f64) / 256.0)
+    vk_mem.wf(u, vk_shaders.U_TINT + 4, ((*sky).tg as f64) / 256.0)
+    vk_mem.wf(u, vk_shaders.U_TINT + 8, ((*sky).tb as f64) / 256.0)
+    let cmd: u64 = vk_frame.frame_cmd(&(*b).fr, (*b).cur)
+    bake(b, cmd)
+    bind_pipe(b, cmd, (*b).pipe_tint.pipe)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_DRAW, cmd, vk_shaders.SKY_VERTS as u64, 1, 0, 0, 0, 0, 0, 0, 0)
+}
+
 fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
     let b: *mut VkBackend = o as *mut VkBackend
     if !(*b).in_frame || h < 1 || h > (*b).mcap {
@@ -898,6 +921,7 @@ fn vkbe_close(b: *mut VkBackend) {
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_op)
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_tr)
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_sky)
+        vk_desc.vpipe_free(&(*b).x, &(*b).pipe_tint)
         if (*b).playout != 0 {
             vk_mem.cx(&(*b).x, vk_mem.X_DESTROY_PLAYOUT, (*b).x.dev, (*b).playout, 0, 0, 0, 0, 0, 0, 0, 0)
         }
