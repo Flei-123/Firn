@@ -97,7 +97,7 @@ The client picks the version from the protocol number in the server-list ping.
 | **1.21.4** | **769** | yes | yes (948) | `CF_CONTAINERS_118` **verified** | **yes** (11.10.2026: real 1.21.4 server, client information with particle status, dump byte-identical, 117 chunks) |
 | **1.21.8** | **772** | yes | yes (980) | `CF_CONTAINERS_118` + 1.21.5 shape (`FLAG_HM_MAP`) **verified** | **yes** (11.10.2026: real 1.21.8 server, heightmap map + containers without length, dump byte-identical, 117 chunks) |
 | 1.21.11 | 774 | yes | yes (1008) | `CF_CONTAINERS_118` + 1.21.5 shape: Firn joins and decodes all 117 chunks without a decode error, but **byte equality NOT proven** (see below) | joins; dump compare open |
-| 26.1 | 775 (in minecraft-data) | yes | yes (1028) | **NOT verified**: the 26.1 section data is not read by the 1.21.8 rules (see below) | joins; chunks open |
+| 26.1 | 775 (in minecraft-data) | yes | yes (1028) | `CF_CONTAINERS_118` + 1.21.5 shape + `FLAG_SEC_FLUID` (a second i16 after every block count): layout FOUND 14.10.2026 from raw bytes (see below); Firn decode rule built + unit tested (tests/2931), real-server byte equality see the 26.1 row below | joins; layout fixed |
 
 Tables for 1.20.5+ needed four generator/walker extensions (all in this round, no data typed by hand):
 `registryEntryHolderSet` (op 18), `lpVec3` (op 19, 1.21.9+; format from the public protocol
@@ -131,8 +131,8 @@ particle status (without it the server falls back to view distance 2: 49 instead
 | 1.21.1 (767) | PASS: A == A2, B == A, 109 chunks, byte identical |
 | 1.21.4 (769) | PASS: 117 chunks, byte identical |
 | 1.21.8 (772) | PASS: 117 chunks, byte identical (reference reads the new shape: `MC_PROTOCOL >= 770` in `ref_dump.cjs`) |
-| 1.21.11 (774) | Firn: 117 chunks, no decode or walk error. The reference needed an `lpVec3` reader for nmp 1.54 (added in `ref_dump.cjs`). A vs A2 differ in a few sections (world not frozen: the game rules were renamed to snake_case in 1.21.11; `run.sh` now sends both spellings) -> equality **not proven** |
-| 26.1 (775) | **not verified**: the reference itself fails on most chunks ("palette index out of range", "long array past end") and Firn gets only a few chunks, so the section layout of 26.1 differs from the 1.21.8 rules (cause not found yet; raw chunk bytes via `MC_REF_DEBUG_FILE=<path>`) |
+| 1.21.11 (774) | (14.10.2026: A vs A2 still differ in the SAME few sections with a 30 s settle run (`S -2 -2 1`, `S 1 0 1`, `S 5 4 1`: block count and distinct grow from session to session = something still flows / grows underground; 1.21.8 shows the same sections with a 20 s settle) -> settle time, not the gamerule names; see the settle note below) Firn: 117 chunks, no decode or walk error. The reference needed an `lpVec3` reader for nmp 1.54 (added in `ref_dump.cjs`). A vs A2 differ in a few sections (world not frozen: the game rules were renamed to snake_case in 1.21.11; `run.sh` now sends both spellings) -> equality **not proven** |
+| 26.1 (775) | **Cause found (14.10.2026)**: every section starts with `blockCount` (i16) followed by a **second i16 = non-empty fluid count** (e.g. 0 deep down, 31 / 146 / 1415 in water sections), then the two paletted containers exactly as in 1.21.5+ (no data array length). Proof: the raw `chunkData` of a real 26.1 server (18773 octets, `MC_REF_DEBUG_FILE`) parses with 24 sections and is consumed to the LAST octet only with this extra i16; without it the reference fails with "palette index out of range" / "long array past end". Implemented as `mc_version.FLAG_SEC_FLUID` (versions.json flag of 26.1, read in `mc_chunk.read_sections`, skipped in `ref_dump.cjs` for protocol >= 775); the dump contract is unchanged (fluid count is not dumped). |
 | 1.21.5 (770), 1.21.6/7 | no table in this repo (versions.json has 1.21.8 for 772); not tested |
 | 26.2 | protocol number unknown here; jar exists in the piston manifest, minecraft-data does not know it |
 
@@ -210,8 +210,9 @@ are ignored (one store can serve several versions, e.g. Client Information). The
   decode -> encode must give the reference bytes, also with the store reversed, plus damaged stores
   (never crash). Known answers and refusals: `tests/2651_mc_encode_basic.fi`.
 * Client: `mc_client.client_send_values(c, state, sem, &store)` (sem -> wire id and schema per version).
-  Teleport Confirm, Position+Look, Chunk Batch Received and Client Information use it; the hand built bodies
-  stay as fallback.
+  Handshake, Login Start, Encryption Response, Teleport Confirm, Position+Look, Chunk Batch Received and Client
+  Information all use it (14.10.2026, r32: the hand built bodies and fallbacks are gone; a layout the version's schema
+  does not fit is refused, never sent).
 * Limits: topBitSetTerminatedArray patches bit 7 of the first octet of an element (an i8 in all versions);
   unlisted bits of a bitflags field are written as 0.
 
@@ -228,6 +229,10 @@ view distance 4), `MC_VERSION=<release> bash tools/mcclient/run.sh <firn client>
   Client Information is sent in the 1.9-1.16 layout (`client_send_settings` tries the 1.17+ layout first; the schema check
   refuses what does not fit). A section-only update (`groundUp = false`) is counted
   (`partial_chunks`) and dropped in both clients; the library merge exists since the flattening round (see below).
+  **Since r33 (14.10.2026)** both clients MERGE a section update into the stored column (demo: `mc_world.world_apply`, reference:
+  `mergeUpdate` in `ref_dump.cjs`); the metrics show `merged_chunks` next to `partial_chunks` (update for an unknown column = dropped).
+  `MC_FLATTEN=1` (1.12.2): the demo remaps `id << 4 | meta` to 1.20.1 states with `mc_flat`, the reference with the independent
+  `tools/mc/flat/ref_flat.cjs`.
 * **1.20.2 (764)**: PASS, checksum `87ad3f91c1ad...`, 109 chunks. Bug found by the real server and fixed: from 1.20.2 the
   NBT roots in the chunk packet (heightmaps, block entities) have **no name** (`FLAG_NBT_ANON`);
   `chunk_decode_anon` honours the flag, `chunk_decode_for` passes it. The configuration phase
@@ -256,7 +261,7 @@ view distance 4), `MC_VERSION=<release> bash tools/mcclient/run.sh <firn client>
 (`APPLY_MERGED`, `mc_chunk.chunk_merge_update`: the sections of the mask replace the stored ones; biomes/heightmaps/block entities stay, `light_hash` stays that of
 the original packet) or drops an update for an unknown column (`APPLY_DROPPED`). `chunk_decode_19` now also requires the section data to be consumed exactly.
 `tests/2745_mc_chunk19.fi` covers decode (5/13/4 bit, spanning longs, sky/no sky, biomes, truncation) and the merge. **Open**: the demo client + `ref_dump.cjs` still drop updates
-(`partial_chunks`); switching both to merge changes the dump contract.
+(`partial_chunks`); switching both to merge changes the dump contract (done in r33, both clients at once, see 1.12.2 above).
 
 ## 9. Round 2026-10-11 (worker mc-w3-1-16-5-join-cf-sections-114)
 
