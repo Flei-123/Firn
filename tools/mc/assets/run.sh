@@ -9,7 +9,7 @@ export FIRNLIB="$(pwd)/lib"
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
 ERR=0
-for tst in tests/2812_mc_assets.fi tests/2813_mc_assets_ext.fi; do
+for tst in tests/2812_mc_assets.fi tests/3212_mc_assets_ext.fi; do
 for stage in "" "--no-opt"; do
     name="$(basename $tst .fi) ${stage:-release-fast}"
     if ! $FIRNC $stage -o "$W/t" $tst 2>"$W/err"; then

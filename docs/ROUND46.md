@@ -159,7 +159,7 @@ scans both conservatively (`SPEC.md` §3.5.3), and before a collection
 With that an interface value keeps its object alive, even if there is no
 other root left.
 
-`tests/822_iface_gc_core.fi` demonstrates that without relying on
+`tests/3215_iface_gc_core.fi` demonstrates that without relying on
 chance:
 
 * 64 `gc class` cells are created and stored **exclusively** as
@@ -276,7 +276,7 @@ order (`iface.rs::typ_struct`, `iface.fi::typ_struct`):
    a module"). Several hits are an error — guessing would be the
    more dangerous choice.
 
-`tests/821_iface_module_core.fi` drives both at the same time: two
+`tests/3214_iface_module_core.fi` drives both at the same time: two
 implementations in the module, one in the root file, all over the same
 interface.
 

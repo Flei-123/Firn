@@ -88,7 +88,7 @@ tests/500_gc_grundlagen.fi
 tests/520_gc_weak.fi
 tests/1610_hash_map.fi
 tests/1611_deflate.fi
-tests/1612_json.fi
+tests/3202_json.fi
 tests/1613_crypto.fi
 tests/332_adressierung.fi
 tests/1403_core_page_allocator.fi

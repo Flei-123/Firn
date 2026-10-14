@@ -275,7 +275,7 @@ view distance 4), `MC_VERSION=<release> bash tools/mcclient/run.sh <firn client>
 `Chunk.sec_mask` says which sections a packet carried. `mc_world.world_apply(w, p)` stores a whole column (`APPLY_STORED`), merges an update into the stored column
 (`APPLY_MERGED`, `mc_chunk.chunk_merge_update`: the sections of the mask replace the stored ones; biomes/heightmaps/block entities stay, `light_hash` stays that of
 the original packet) or drops an update for an unknown column (`APPLY_DROPPED`). `chunk_decode_19` now also requires the section data to be consumed exactly.
-`tests/2745_mc_chunk19.fi` covers decode (5/13/4 bit, spanning longs, sky/no sky, biomes, truncation) and the merge. **Open**: the demo client + `ref_dump.cjs` still drop updates
+`tests/3211_mc_chunk19.fi` covers decode (5/13/4 bit, spanning longs, sky/no sky, biomes, truncation) and the merge. **Open**: the demo client + `ref_dump.cjs` still drop updates
 (`partial_chunks`); switching both to merge changes the dump contract (done in r33, both clients at once, see 1.12.2 above).
 
 ## 9. Round 2026-10-11 (worker mc-w3-1-16-5-join-cf-sections-114)

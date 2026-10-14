@@ -301,7 +301,7 @@ old `vec.fi` and **209.579** with the new one. The price for `Ord` and ten
 implementations in a program that does not use them is therefore **191
 lines of assembly (+0,09 %)**.
 
-**What it brings** — `tests/831_bounds_std_core.fi` drives both sides:
+**What it brings** — `tests/3217_bounds_std_core.fi` drives both sides:
 the same functions with `i32` (as before) and with
 
 ```firn

@@ -282,7 +282,7 @@ pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
 /// read one of them -- either in `T`'s own copies (they run AFTER the copies
 /// of `S`, in the same block) or in code that follows `T`.
 ///
-/// Found by `tests/2813_mc_assets_ext.fi` at `--opt-level=release-fast`
+/// Found by `tests/3212_mc_assets_ext.fi` at `--opt-level=release-fast`
 /// (SIGFPE in `mc_assets.anim_step`): after inlining and loop rotation the
 /// block `bb1` ended in `brcond bb2 / bb3` with phis in both targets, the
 /// copy for `bb2` overwrote `%393`, and the copy for `bb3` then read the
