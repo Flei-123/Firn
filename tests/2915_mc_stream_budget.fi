@@ -1,0 +1,304 @@
+// expect_exit: 0
+// tests/2915_mc_stream_budget.fi -- mc_stream frame-time budget while loading (r103/r77).
+//
+// A  4 workers, asynchronous frames from an empty stream: the render thread's snapshot phase (submit_us) stays inside
+//    snap_budget_us (+ slack for one submit) in >= 90 % of the frames, no frame takes longer than FRAME_CAP_US,
+//    the pads are filled by the workers / the end-of-frame barrier (snap_wait_us is reported)
+// B  after convergence the image == the reference image (sections meshed from a padded array, as in tests/2773)
+// C  pad parallelisation: stream_flush (sync) and the async path give the same image
+import std.rt
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import mc.mc_cull
+import mc.mc_terrain
+import mc.mc_render_world
+import mc.mc_stream
+import jobs.jobs
+import std.io
+import std.time
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND {
+        return jobs.worker_main(arg)
+    }
+    return 0
+}
+
+const NSEC: i32 = 6
+const RAD: i32 = 3
+const WIN: i32 = 6 // stream window: every generated column is inside it for any pose
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+fn floor_div16(v: i32) -> i32 {
+    var q: i32 = v / 16
+    if v % 16 != 0 && v < 0 { q = q - 1 }
+    return q
+}
+
+fn fl(v: f64) -> i32 {
+    var x: i32 = v as i32
+    if (x as f64) > v { x = x - 1 }
+    return x
+}
+
+fn world_pad(cx: i32, sy: i32, cz: i32, pad: u64) {
+    var py: i32 = 0
+    while py < 18 {
+        var pz: i32 = 0
+        while pz < 18 {
+            var px: i32 = 0
+            while px < 18 {
+                let x: i32 = cx * 16 + px - 1
+                let y: i32 = sy * 16 + py - 1
+                let z: i32 = cz * 16 + pz - 1
+                let colx: i32 = floor_div16(x)
+                let colz: i32 = floor_div16(z)
+                var id: u16 = 65535 as u16
+                if colx >= 0 - RAD && colx <= RAD && colz >= 0 - RAD && colz <= RAD && y >= 0 && y < NSEC * 16 {
+                    id = mc_terrain.terrain_block(x, y, z, NSEC)
+                }
+                rt.st16(pad, ((py * 18 + pz) * 18 + px) as usize, id)
+                px = px + 1
+            }
+            pz = pz + 1
+        }
+        py = py + 1
+    }
+}
+
+fn cell(cx: i32, sy: i32, cz: i32) -> usize {
+    return (((cz + RAD) * (RAD * 2 + 1) + cx + RAD) * NSEC + sy) as usize
+}
+
+// reference handles of every section (0 = no faces)
+fn build_ref(r: *mut mc_raster.Raster, tb: *mut mc_mesh.MeshTables, hs: u64) {
+    var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    var cz: i32 = 0 - RAD
+    while cz <= RAD {
+        var cx: i32 = 0 - RAD
+        while cx <= RAD {
+            var sy: i32 = 0
+            while sy < NSEC {
+                world_pad(cx, sy, cz, pad)
+                mc_mesh.mesh_padded(&m, pad, tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+                var hd: usize = 0
+                if m.nverts > 0 as u32 {
+                    hd = mc_raster.backend_mesh_upload(r, mc_cull.cull_pack(cx, sy, cz), m.verts, m.nverts as usize, m.idx, m.nidx as usize)
+                }
+                rt.st64(hs, cell(cx, sy, cz), hd as u64)
+                sy = sy + 1
+            }
+            cx = cx + 1
+        }
+        cz = cz + 1
+    }
+    mc_mesh.mesher_free(&m)
+    rt.heap_free(pad, 5832 * 2)
+}
+
+// reference image of the frustum section list
+fn ref_image(r: *mut mc_raster.Raster, cam: *mut mc_camera.Camera, c: *mut mc_cull.Cull, hs: u64, h: u64) {
+    let n: usize = mc_cull.cull_run_frustum(c, cam, WIN)
+    mc_raster.backend_begin(r, cam, 0xFF3C2814 as u32)
+    var k: usize = 0
+    while k < n {
+        let key: u64 = mc_cull.cull_out_key(c, k)
+        let cx: i32 = mc_cull.cull_out_cx(key)
+        let cz: i32 = mc_cull.cull_out_cz(key)
+        let sy: i32 = mc_cull.cull_out_sy(key)
+        k = k + 1
+        if cx < 0 - RAD || cx > RAD || cz < 0 - RAD || cz > RAD { continue }
+        let hd: usize = rt.ld64(hs, cell(cx, sy, cz)) as usize
+        if hd != 0 {
+            mc_raster.backend_draw(r, hd, (cx * 16) as f64, (sy * 16) as f64, (cz * 16) as f64)
+        }
+    }
+    mc_raster.backend_end(r)
+    mc_raster.raster_hash_hex(r, h)
+}
+
+// one stream frame -> image hash
+#[allow_escape]
+fn stream_image(s: *mut mc_stream.Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, r: *mut mc_raster.Raster,
+    cam: *mut mc_camera.Camera, h: u64) -> u64 {
+    (*b).begin((*b).obj, cam as u64, 0xFF3C2814 as u32)
+    let tris: u64 = mc_stream.stream_frame(s, w, b, cam)
+    (*b).end((*b).obj)
+    mc_raster.raster_hash_hex(r, h)
+    return tris
+}
+
+fn same_hash(a: u64, b: u64) -> bool {
+    var i: usize = 0
+    while i < 64 {
+        if rt.ld8(a, i) != rt.ld8(b, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+#[allow_escape]
+fn load_column(w: *mut mc_world.World, s: *mut mc_stream.Stream, cx: i32, cz: i32, ids: u64) {
+    mc_terrain.terrain_column(cx, cz, NSEC, ids)
+    check(mc_world.world_put(w, mc_render_world.wr_make_chunk(cx, cz, NSEC as usize, ids)), 50)
+    check(mc_stream.stream_chunk_loaded(s, w, cx, cz), 51)
+}
+
+#[allow_escape]
+fn load_all(w: *mut mc_world.World, s: *mut mc_stream.Stream, ids: u64) {
+    var cz: i32 = 0 - RAD
+    while cz <= RAD {
+        var cx: i32 = 0 - RAD
+        while cx <= RAD {
+            load_column(w, s, cx, cz, ids)
+            cx = cx + 1
+        }
+        cz = cz + 1
+    }
+}
+
+static mut g_seed: u64 = 777
+
+fn rnd_f(lo: f64, hi: f64) -> f64 {
+    g_seed = g_seed *% 6364136223846793005 as u64 +% 1442695040888963407 as u64
+    return lo + (hi - lo) * (((g_seed >> 33 as u64) % 100000 as u64) as f64 / 100000.0)
+}
+
+fn pose(cam: *mut mc_camera.Camera, i: i32) {
+    var px: f64 = rnd_f(0.0 - 30.0, 30.0)
+    var pz: f64 = rnd_f(0.0 - 30.0, 30.0)
+    var py: f64 = (mc_terrain.terrain_height(fl(px), fl(pz), NSEC) + 3) as f64
+    if i % 2 == 1 { py = rnd_f(6.0, 30.0) }
+    var guard: i32 = 0
+    while mc_terrain.terrain_block(fl(px), fl(py), fl(pz), NSEC) != 0 as u16 && guard < 80 {
+        py = py + 1.0
+        guard = guard + 1
+    }
+    mc_camera.camera_set_pos(cam, px, py, pz)
+    mc_camera.camera_set_angles(cam, rnd_f(0.0 - 180.0, 180.0), rnd_f(0.0 - 25.0, 25.0))
+    mc_camera.camera_update(cam)
+}
+
+fn fresh_raster(a: *mut mc_texture.Atlas) -> mc_raster.Raster {
+    var r: mc_raster.Raster = mc_raster.raster_new(96, 54)
+    mc_raster.backend_upload_atlas(&r, a)
+    return r
+}
+
+// stream with 6 pose checks against the reference; returns the sum of visible and of frustum sections
+#[allow_escape]
+fn poses_equal(s: *mut mc_stream.Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, r: *mut mc_raster.Raster,
+    rr: *mut mc_raster.Raster, cam: *mut mc_camera.Camera, c: *mut mc_cull.Cull, hs: u64, code: i32) -> u64 {
+    let h1: u64 = rt.heap_alloc(64)
+    let h2: u64 = rt.heap_alloc(64)
+    var vis: u64 = 0
+    var fr: u64 = 0
+    var i: i32 = 0
+    while i < 6 {
+        pose(cam, i)
+        let nfl: usize = mc_stream.stream_flush(s, w, b, cam, 200)
+        check(nfl < 200, code)
+        check(mc_stream.stream_pending(s) == 0, code + 1)
+        ref_image(rr, cam, c, hs, h1)
+        stream_image(s, w, b, r, cam, h2)
+        check(same_hash(h1, h2), code + 2)
+        vis = vis + (*s).st.visible as u64
+        fr = fr + (mc_cull.cull_run_frustum(c, cam, WIN)) as u64
+        i = i + 1
+    }
+    rt.heap_free(h1, 64)
+    rt.heap_free(h2, 64)
+    return vis * 100000 + fr
+}
+
+#[allow_escape]
+const FRAME_CAP_US: u64 = 250000
+
+#[allow_escape]
+fn main() -> i32 {
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_terrain.terrain_tables(&tb)
+    var a: mc_texture.Atlas = mc_texture.atlas_default()
+    var rr: mc_raster.Raster = fresh_raster(&a)
+    var cam: mc_camera.Camera = mc_camera.camera_new(96, 54)
+    mc_camera.camera_set_lens(&cam, 70.0, 0.05, 160.0)
+    var c: mc_cull.Cull = mc_cull.cull_new(0, NSEC)
+    let hs: u64 = rt.heap_alloc(7 * 7 * NSEC as usize * 8)
+    build_ref(&rr, &tb, hs)
+    let ids: u64 = rt.heap_alloc(NSEC as usize * 4096 * 2)
+    var pool: jobs.Jobs = jobs.create(4)
+    check(jobs.worker_count(&pool) > 0 as u64, 1)
+
+    var r: mc_raster.Raster = fresh_raster(&a)
+    var b: mc_backend.Backend = mc_backend.backend_cpu(&r)
+    var w: mc_world.World = mc_world.world_new()
+    var s: mc_stream.Stream = mc_stream.stream_new(0, NSEC, WIN, &tb, (&pool) as *mut jobs.Jobs as u64)
+    s.nbr_wait = 3 as u32
+    s.max_inflight = 16
+    s.max_submit = 8
+    load_all(&w, &s, ids)
+    pose(&cam, 0)
+    let h1: u64 = rt.heap_alloc(64)
+    let h2: u64 = rt.heap_alloc(64)
+    var frames: i32 = 0
+    var over: i32 = 0
+    var maxframe: u64 = 0
+    var maxsubmit: u64 = 0
+    var maxwait: u64 = 0
+    var sumwait: u64 = 0
+    var sumsubmit: u64 = 0
+    var submitted: u32 = 0 as u32
+    while frames < 100000 {
+        let t0: u64 = time.monotonic_ns()
+        stream_image(&s, &w, &b, &r, &cam, h2)
+        let dt: u64 = (time.monotonic_ns() - t0) / 1000 as u64
+        if dt > maxframe { maxframe = dt }
+        if s.st.submit_us > maxsubmit { maxsubmit = s.st.submit_us }
+        if s.st.snap_wait_us > maxwait { maxwait = s.st.snap_wait_us }
+        sumwait = sumwait + s.st.snap_wait_us
+        sumsubmit = sumsubmit + s.st.submit_us
+        if s.st.submit_us > s.snap_budget_us + 3000 as u64 { over = over + 1 }
+        submitted = submitted + s.st.submitted
+        frames = frames + 1
+        if mc_stream.stream_pending(&s) == 0 && s.inflight == 0 { break }
+    }
+    check(frames < 100000, 2)
+    check(submitted > 0 as u32, 3)
+    io.fmt_eprint_line(f"frames {frames as u64} submitted {submitted as u64}")
+    io.fmt_eprint_line(f"max_frame_us {maxframe}")
+    io.fmt_eprint_line(f"max_submit_us {maxsubmit}")
+    io.fmt_eprint_line(f"sum_submit_us {sumsubmit}")
+    io.fmt_eprint_line(f"max_snap_wait_us {maxwait}")
+    io.fmt_eprint_line(f"sum_snap_wait_us {sumwait}")
+    io.fmt_eprint_line(f"frames_over_budget {over as u64}")
+    // A: budget
+    check((over as u64) * 10 <= frames as u64, 4)
+    check(maxframe < FRAME_CAP_US, 5)
+    // B: image == reference
+    ref_image(&rr, &cam, &c, hs, h1)
+    stream_image(&s, &w, &b, &r, &cam, h2)
+    check(same_hash(h1, h2), 6)
+    // C: another pose through the sync flush
+    pose(&cam, 3)
+    let nfl: usize = mc_stream.stream_flush(&s, &w, &b, &cam, 200)
+    check(nfl < 200 && mc_stream.stream_pending(&s) == 0, 7)
+    ref_image(&rr, &cam, &c, hs, h1)
+    stream_image(&s, &w, &b, &r, &cam, h2)
+    check(same_hash(h1, h2), 8)
+    mc_stream.stream_free(&s, &b)
+    mc_world.world_free(&w)
+    jobs.destroy(&pool)
+    mc_cull.cull_free(&c)
+    return 0
+}

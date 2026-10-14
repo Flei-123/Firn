@@ -31,7 +31,14 @@ the render thread uploads it with the opaque one, `stream_frame` draws all opaqu
 `tables.opaque` bit 0 = opaque (cull_conn / id_opaque look at bit 0 only). Columns shown as LOD have no water. Test tests/2886: image == wr_render (0 / 0 / 1 px), visible vs single pass.
 GL path not rendered (CPU back end only); quad sorting inside a section not done.
 
+## Parallel snapshot (r103/r77, 14.10.)
+`try_submit` only takes the 27 section pointers (`snap_ptrs`, R_PTR) and decides air / enclosed solid (`snap_kind`) on the render thread. The 18^3 pad is filled by `snap_fill`
+(row-wise `row_ids` instead of one `container_get` per cell) by whoever comes first: the worker at the start of `mesh_one` (`snap_ensure`, R_SNAP 1 -> 2 -> 0 by CAS) or the end-of-frame
+barrier `snap_barrier` on the render thread (so the world may change again after `stream_frame`; `stats.snap_wait_us` = time spent there). A job cancelled while queued never fills (R_SNAP = 0).
+Test tests/2915_mc_stream_budget.fi: async load from empty with 4 workers: >= 90 % of the frames keep the snapshot+submit phase inside `snap_budget_us` (+3 ms), no frame above 250 ms,
+image == reference. Image identity of all other tests (2773/2861/2885/2886) unchanged.
+
 ## Open
-- snapshot is serial (render thread, ~0.2 ms per section): a copy-on-write or per-column palette read on the worker would scale better.
+- snapshot pointers + kind are the only serial part now (see "Parallel snapshot"); the pad fill itself still reads the live world, so the world must not change while a frame runs (true: stream_frame owns it).
 - light: see docs/mc/light.md ("Light in Stream / Render"): `stream_set_light`, region volume + Chunk.light, `stream_light_sync` after edits. Moving region and update_light wiring open.
 - GL path uses stream_frame through mc_backend (not measured on a real GPU).

@@ -183,6 +183,33 @@ pub fn export_names() -> Vec<String> {
     SIGS.with(|v| v.borrow().iter().map(|s| s.c_name.clone()).collect())
 }
 
+/// Windows DLL (`--shared --target=x86_64-windows`): one Win64 entry thunk per
+/// `#[export_c]` function. `(internal name, C name, argument count, has a float
+/// or non-scalar-by-value parameter)`. The thunk moves `rcx, rdx, r8, r9, stack` to
+/// the System V registers Firn code uses; floats would need a different move, so
+/// the caller rejects them with a clear error.
+pub fn export_thunk_info() -> Vec<(String, String, usize, bool)> {
+    let exported: Vec<(String, String)> =
+        EXPORTED.with(|e| e.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    SIGS.with(|v| {
+        v.borrow()
+            .iter()
+            .filter_map(|sig| {
+                let internal = exported.iter().find(|(_, c)| *c == sig.c_name).map(|(k, _)| k.clone())?;
+                let mut float = false;
+                for (_, ty, _) in &sig.params {
+                    if let TypeExpr::Named(n, _) = ty {
+                        if matches!(n.as_str(), "f32" | "f64" | "v128") {
+                            float = true;
+                        }
+                    }
+                }
+                Some((internal, sig.c_name.clone(), sig.params.len(), float))
+            })
+            .collect()
+    })
+}
+
 /// C spelling of a Firn scalar type name, `None` if it is not one.
 fn c_scalar(n: &str) -> Option<&'static str> {
     Some(match n {

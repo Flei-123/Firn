@@ -1,6 +1,7 @@
 # Firn shared objects (C ABI `.so`) -- `firnc --shared`
 
-x86-64 Linux. Windows DLL and aarch64 `.so` are not built by this path (G5 in GRAPHICS-STACK-E-REQUIREMENTS.md).
+x86-64 Linux `.so` (full), Windows DLL (`--target=x86_64-windows`) and aarch64 `.so` (`--target=aarch64-linux`) with the limits in
+the last section ("Windows DLL and aarch64 .so (G5)").
 
 ## Build (one command)
 
@@ -44,3 +45,31 @@ Rules:
   Do not keep the only reference to a `gc` object in host-owned memory.
 * A C callback is a bare code address. Wrap it with `std.cfn` (`cfn.rec(addr)`, `cfn.as_u1(&rec)` ...), call it
   from the thread that received it.
+
+## Windows DLL and aarch64 .so (G5)
+
+```
+firnc --shared --target=x86_64-windows [--header=f.h] -o foo.dll foo.fi     # PE DLL, x86_64-w64-mingw32-ld --dll
+firnc --shared --target=aarch64-linux  [--header=f.h] -o libfoo.so foo.fi   # aarch64-linux-gnu-ld -shared
+```
+
+**Windows DLL.** Exports are Win64 entry thunks under the bare `#[export_c]` names (`win.rs::win64_thunk_asm`, the callback-thunk code the other
+way round: `rcx, rdx, r8, r9, stack` -> System V registers, shadow space, callee-saved xmm6-15 kept); the Firn function itself keeps its internal
+symbol. The export list is a temporary `.def`. Entry `__firn_dll_entry` (DllMain shape): on `DLL_PROCESS_ATTACH` it runs the seam init (standard
+handles) only, always returns TRUE. **There is no `_start`, so the collector does NOT start itself** (same as the Linux `.so`): a library that uses
+`gc` types exports an init that calls `gc_init()` (idempotent) and the host calls it once before any other export (`wd_init` in `tools/stack_e/lib_win.fi`).
+Threads and jobs work in a DLL (`tools/stack_e/lib_rt.fi`: heap_alloc, `jobs` with 0 and 3 workers, GC on 4 threads) because the Windows thread block
+lives in the TEB slot, not behind a host register. Limits (compile errors, not miscompiles): up to 6 integer / pointer arguments per export, no
+`f32` / `f64` / `v128` parameters. Return values: integer / pointer in `rax`. Not done: `thread_attach` from host threads of their own (only proven on the
+Linux x86-64 `.so`), floats / by-value structs in exports, a `.lib` import library (use `LoadLibrary` / `GetProcAddress`).
+Proof: gate 134 -> `tools/stack_e/run_g5.sh` (mingw host `host_win.c` under Wine, dev-fast + release-fast, plus the runtime probe, plus a float export
+that must be refused). **Wine only; a real Windows is untested.**
+
+**aarch64 .so.** Same C ABI (AAPCS64 is already Firn's calling convention), no `_start`, symbols as in the x86-64 `.so` (version script). The one real
+difference is the thread register: Firn keeps the thread block pointer in `tpidr_el0`, which in a `.so` belongs to the HOST (glibc TLS: errno, stack
+protector, locale). In `--shared` builds the pointer lives in a private word of the library (`__firn_thread_ptr`) and **`thread_start` / `jobs` workers
+fail with `-ENOSYS`** (no second thread block can exist). So an aarch64 `.so` is single-threaded for the runtime: GC (stop-the-world with one thread), heap,
+statics, all work; `thread_attach` from several host threads is NOT supported. `__cpu_features()` reads the auxiliary vector that `_start` saves, which a
+`.so` never sees: NEON/crypto code that asks falls back to the baseline. Proof: `host_a64.c` (aarch64-linux-gnu-gcc, `-fstack-protector-all`, checks
+that the host's TLS and `errno` survive the calls) under `qemu-aarch64 -L /usr/aarch64-linux-gnu`, dev-fast + release-fast. **qemu only; a real aarch64
+machine is untested.**

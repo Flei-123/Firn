@@ -69,7 +69,7 @@ Until then `glweb.fi` is the maintained twin: **any change of the Backend table 
   (`cssSize * devicePixelRatio`, as `lib/plat/web.fi` does for fUi). The camera aspect is the caller's job (as in `glbe_resize`).
 - Loop: the prototype renders synchronously in `_start`. A real page needs `requestAnimationFrame` calling an exported frame function
   (`#[export_c]`, like `firn_web_frame` in `lib/plat/web.fi`) -- NOT built.
-- Context loss (`webglcontextlost/restored`): NOT handled. Plan like `webgl.fi`/gpucheck (`WEBGL_lose_context`): on restore re-run `glweb_open`
+- Context loss (`webglcontextlost/restored`): handled since gate 133 and PROVEN in a browser by gate 141 (section 10); the old plan was: Plan like `webgl.fi`/gpucheck (`WEBGL_lose_context`): on restore re-run `glweb_open`
   work (program, FBO, atlas, re-upload of all sections from the CPU meshes; `gl_mc` already keeps CPU copies only when staged -> keep meshes in `mc_mesh` memory).
 
 ## 6. Input / audio / network (interface only)
@@ -123,3 +123,24 @@ same as with `lib/window` (`raw.key_pressed`, `raw.mouse_dx`). Pointer Lock: `we
 
 **@web twins (section 4)**: still NOT done. `gl_mc.fi` pulls gl33 (1011 lines), gl_ext (662), glctx (669), gl_fbo, gl_tex, gl_prog, gl_query, glpool = ~3500 lines of `dynlib` wrappers to re-implement on `firn_glw_*`.
 Smallest clean step: `lib/@web/gpu/gl33.fi` + `gl_ext.fi` twins with identical exports; until then `glweb.fi` + `glweb_scene.fi` are the maintained twins.
+
+## 10. Context loss test, frame loop fix, gamepads (round G5, gate 141)
+
+**Gate 141** (`tools/gpu/web/run_loss.sh`, `web_loss_main.fi`, `loss.html`, `check_loss.py`): headless Chromium/SwiftShader. The page takes the context away with
+`WEBGL_lose_context.loseContext()` after 4 frames and gives it back with `restoreContext()` once `webglcontextlost` arrived; the Firn frame function
+calls `glweb_poll_context` (22 frames of `CTX_LOST` in the last run, then exactly one `CTX_RESTORED`) and the frame after the restore is **byte-equal**
+(FNV-32 of the readback) to the one before the loss: program, FBO, atlas and the mesh (CPU copy, `keep_meshes`) were rebuilt. Not covered: a real GPU reset
+(driver crash, GPU process kill), Firefox / Safari / mobile, loss in the middle of a frame, loss while a texture upload is in flight.
+Headless Chromium under `--virtual-time-budget` never fires `requestAnimationFrame`; `loss.html` drives the loop with a timer-based `requestAnimationFrame`
+shim (same frame function, other clock). A real `requestAnimationFrame` loop was therefore NOT exercised by any test.
+
+**Bug found while writing gate 141 (fixed in parallel on main, same fix):** `glweb.js` returned right after `main` (every wasm program ends in `exit(0)`, thrown as `Exit`), so a program that exports
+`firn_mc_frame` never got its frame loop. Now an `Exit` with code 0 from a module that exports `firn_mc_frame` continues into the loop (the module memory is intact).
+
+**Gamepads (browser Gamepad API)**: `lib/input/webpad.fi` (`input.webpad`). `glweb.js` polls `navigator.getGamepads()` once per frame before `firn_mc_frame`
+and calls `firn_pad_state(slot, buttons_mask, lt, rt, lx, ly, rx, ry)` for every pad with `mapping == "standard"`, `firn_pad_gone(slot)` when it left.
+`webpad_poll(slot, &pad)` feeds the logical `padcore.Pad` through `pad_feed_xinput` (radial stick deadzone, trigger deadzone, edges, PE_CONNECTED / PE_DISCONNECTED).
+Tests: `tests/2930_input_webpad.fi` (button map, scaling, clamps, y direction, slots, unplug / replug, 3000 random frames vs a naive model; x86-64 3 opt levels,
+aarch64/qemu and Windows/Wine run it too) and the browser smoke in gate 141 (a FAKED `navigator.getGamepads`: A held, stick right, trigger 0.5 reaches Firn as
+one connected pad). Not done: rumble (`vibrationActuator`), non-standard mappings (ignored, not guessed), a real pad in a real browser (untested), disconnect in
+the browser run (only the native test covers it).
