@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/fuishell.fi -- A WINDOW FOR AN IMMEDIATE-MODE fUi PROGRAM (no scene tree, no host).
+//
+// lib/plat/fuiwin.fi is the window loop of the scene based fUi (it needs a fuiwirt.Host and a Theme). A program that
+// draws every frame itself with the painter (a camera UI, a game HUD, a viewer) wants less: a window, a canvas, a
+// painter with a font, the GPU when the platform has one, the pointer records. This is that, in about 200 lines:
+//
+//     var s: fuishell.Shell = fuishell.shell_new()
+//     if !fuishell.shell_open(&s, "Camera", 480, 800) { return 1 }
+//     while open {
+//         window.wait_event(fuishell.shell_window(&s), 15)
+//         ... window.next_pointer / window.next_event ...
+//         fuishell.shell_begin(&s)
+//         ... paint with shell_painter(&s) (and shell_gpu(&s) for photos) ...
+//         fuishell.shell_end(&s)
+//     }
+//
+// On Android the canvas is GPU backed (fui.gpu, OpenGL ES 3): shell_end presents it between the system bars and
+// swaps. Without a GPU the canvas is in memory and shell_end pushes RGBA -> BGRX through window.image.
+// `shell_dp` is the Android density unit (dpi / 160) in device pixels.
+import std.rt
+import paint.canvas
+import paint.gl
+import fui.painter
+import fui.gpu
+import font.metrics
+import window.window
+import plat.sysfont
+
+export {
+    Shell, shell_new, shell_open, shell_close, shell_begin, shell_end, shell_resize,
+    shell_window, shell_painter, shell_canvas, shell_gpu, shell_w, shell_h, shell_dp, shell_gpu_on,
+    shell_now_ms,
+}
+
+const FONTSET_BYTES: usize = 4096
+
+struct Shell {
+    f: window.Window,
+    cv: canvas.Canvas,
+    z: painter.Painter,
+    fm: u64,
+    gl: gl.GlApi,
+    gp: gpu.Gpu,
+    gpu_an: bool,
+    bgrx: u64,
+    cap: usize,
+    w: usize,
+    h: usize,
+    open: bool,
+}
+
+fn shell_new() -> Shell {
+    return Shell { f: window.window_new(), cv: canvas.canvas_new(), z: painter.painter_new(), fm: 0,
+        gl: gl.gl_api_new(), gp: gpu.gpu_new(), gpu_an: false, bgrx: 0, cap: 0, w: 0, h: 0, open: false }
+}
+
+fn shell_window(s: *mut Shell) -> *mut window.Window { return &(*s).f }
+fn shell_painter(s: *mut Shell) -> *mut painter.Painter { return &(*s).z }
+fn shell_canvas(s: *mut Shell) -> *mut canvas.Canvas { return &(*s).cv }
+fn shell_w(s: *mut Shell) -> usize { return (*s).w }
+fn shell_h(s: *mut Shell) -> usize { return (*s).h }
+fn shell_gpu_on(s: *mut Shell) -> bool { return (*s).gpu_an }
+
+// The GPU renderer, or a null pointer when the canvas is in memory.
+fn shell_gpu(s: *mut Shell) -> *mut gpu.Gpu {
+    if (*s).gpu_an { return &(*s).gp }
+    return 0 as u64 as *mut gpu.Gpu
+}
+
+// Device pixels of one density independent pixel (Android: dpi / 160).
+fn shell_dp(s: *mut Shell) -> f64 {
+    return (window.dpi(&(*s).f) as f64) / 160.0
+}
+
+fn shell_now_ms() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000 + ts[1] / 1000000
+}
+
+fn gpu_start(s: *mut Shell) {
+    (*s).gpu_an = false
+    if (*s).cap == 0 { return }
+    if !window.gpu_open(&(*s).f, (&(*s).gl) as u64) { return }
+    if !gpu.gpu_open(&(*s).gp, &(*s).gl) { return }
+    if !gpu.gpu_attach(&(*s).gp, &(*s).cv) { return }
+    (*s).gpu_an = true
+}
+
+// canvas, painter and the BGRX copy for w x h -- new, never stretched
+fn surfaces(s: *mut Shell, w: usize, h: usize) -> bool {
+    if (*s).cap > 0 {
+        painter.painter_free(&(*s).z)
+        canvas.canvas_free(&(*s).cv)
+        rt.heap_free((*s).bgrx, (*s).cap)
+        (*s).cap = 0
+    }
+    if !canvas.canvas_init(&(*s).cv, w, h) { return false }
+    if !painter.painter_init(&(*s).z, &(*s).cv, w, h) { return false }
+    painter.painter_set_font(&(*s).z, (*s).fm)
+    (*s).bgrx = rt.heap_alloc(w * h * 4)
+    if (*s).bgrx == 0 { return false }
+    (*s).cap = w * h * 4
+    (*s).w = w
+    (*s).h = h
+    if (*s).gpu_an && !gpu.gpu_attach(&(*s).gp, &(*s).cv) { (*s).gpu_an = false }
+    return true
+}
+
+// Opens the window (Android: the activity's surface, `w` x `h` is only a hint) with the system font.
+#[allow_escape]
+fn shell_open(s: *mut Shell, title: str, w: usize, h: usize) -> bool {
+    let fs: *mut metrics.FontSet = rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fs as u64 == 0 || !sysfont.sysfont_load(fs) { return false }
+    (*s).fm = fs as u64
+    if !window.open_window(&(*s).f, 0) { return false }
+    if !window.full_input(&(*s).f, true) { }
+    if !window.make(&(*s).f, w, h) { return false }
+    if !window.title(&(*s).f, title.p as u64, title.n) { }
+    if !surfaces(s, window.width(&(*s).f), window.height(&(*s).f)) { return false }
+    if !window.show_window(&(*s).f) { return false }
+    gpu_start(s)
+    if !window.real_pointers(&(*s).f, true) { }
+    (*s).open = true
+    return true
+}
+
+// After EV_CONFIGURE: new surfaces when the size changed. False = out of memory.
+fn shell_resize(s: *mut Shell) -> bool {
+    let nw: usize = window.width(&(*s).f)
+    let nh: usize = window.height(&(*s).f)
+    if nw == (*s).w && nh == (*s).h { return true }
+    return surfaces(s, nw, nh)
+}
+
+fn shell_begin(s: *mut Shell) {
+    if (*s).gpu_an {
+        var pl: [u64; 4] = [0; 4]
+        window.gpu_place(&(*s).f, (&pl[0]) as u64)
+        gpu.gpu_frame_begin(&(*s).gp, pl[2] as i32, pl[3] as i32)
+    }
+}
+
+fn shell_end(s: *mut Shell) {
+    if (*s).gpu_an {
+        var pl: [u64; 4] = [0; 4]
+        window.gpu_place(&(*s).f, (&pl[0]) as u64)
+        gpu.gpu_present_at(&(*s).gp, pl[0] as i32, pl[1] as i32)
+        if !window.gpu_swap(&(*s).f) { }
+        if window.gpu_lost(&(*s).f) { gpu_start(s) }
+        return
+    }
+    let src: u64 = canvas.canvas_pixels(&(*s).cv) as u64
+    let n: usize = (*s).w * (*s).h
+    var i: usize = 0
+    while i < n {
+        let o: u64 = (i * 4) as u64
+        *(((*s).bgrx + o) as *mut u8) = *((src + o + 2) as *mut u8)
+        *(((*s).bgrx + o + 1) as *mut u8) = *((src + o + 1) as *mut u8)
+        *(((*s).bgrx + o + 2) as *mut u8) = *((src + o) as *mut u8)
+        *(((*s).bgrx + o + 3) as *mut u8) = 0 as u8
+        i = i + 1
+    }
+    if !window.image(&(*s).f, (*s).bgrx, (*s).w, (*s).h, 0, 0) { }
+    if !window.present(&(*s).f) { }
+}
+
+fn shell_close(s: *mut Shell) {
+    if !(*s).open { return }
+    window.close_window(&(*s).f)
+    (*s).open = false
+}
