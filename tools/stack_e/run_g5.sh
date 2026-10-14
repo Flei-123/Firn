@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # tools/stack_e/run_g5.sh -- G5: `firnc --shared` for the Windows DLL (x86_64-windows, run under Wine) and the aarch64 .so (run under qemu-aarch64).
 # Called by run.sh (gate 134); also usable alone. Wine stages share ~/.wine-firn: never run two at once.
-# NOT covered: a real Windows, a real aarch64 machine, by-value structs in exports, v128 beyond xmm7 in DLL exports (refused).
+# NOT covered: a real Windows, a real aarch64 machine, v128 beyond xmm7 in DLL exports (refused), by-value structs beyond the safe subset in a Linux .so (refused).
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
@@ -27,6 +27,13 @@ if command -v wine >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null; t
     for lvl in dev-fast release-fast; do
         "$FIRNC" --shared --target=x86_64-windows --opt-level=$lvl -o "$D/abi.dll" tools/stack_e/lib_abi.fi || { echo "FAIL dll lib_abi $lvl"; rc=1; continue; }
         (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 120 wine host_abi.exe abi.dll 2>&1 | grep -q 'host_abi: all ok') && echo "ok  Windows DLL floats + stack arguments under Wine ($lvl)" || { echo "FAIL DLL float/stack ABI (wine, $lvl)"; rc=1; }
+    done
+    # structs by value in DLL exports (r506): sizes 1-8 in the slot, odd sizes via a pointer, 12/16 as two words, 24 as a pointer,
+    # float words, struct results in rax / through the hidden pointer; the same C host would pass them to a mingw-built library
+    x86_64-w64-mingw32-gcc -O1 -o "$D/host_struct.exe" tools/stack_e/host_struct.c || { echo "FAIL mingw host_struct"; rc=1; }
+    for lvl in dev-fast release-fast; do
+        "$FIRNC" --shared --target=x86_64-windows --opt-level=$lvl -o "$D/st.dll" tools/stack_e/lib_struct.fi || { echo "FAIL dll lib_struct $lvl"; rc=1; continue; }
+        (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 120 wine host_struct.exe st.dll 2>&1 | grep -q 'host_struct: all ok') && echo "ok  Windows DLL structs by value under Wine ($lvl)" || { echo "FAIL DLL struct ABI (wine, $lvl)"; rc=1; }
     done
     # host threads of their own in a DLL (r506): 4 CreateThread threads attach/detach in two waves (entries recycled), jobs + GC
     x86_64-w64-mingw32-gcc -O1 -o "$D/hat.exe" tools/stack_e/host_attach_win.c || { echo "FAIL mingw host_attach_win"; rc=1; }
@@ -59,5 +66,15 @@ if command -v qemu-aarch64 >/dev/null && command -v aarch64-linux-gnu-gcc >/dev/
         (cd "$D" && timeout 300 qemu-aarch64 -L /usr/aarch64-linux-gnu ./host_a64 ./a64.so 2>&1 | grep -q 'all ok') && echo "ok  aarch64 .so under qemu ($lvl)" || { echo "FAIL aarch64 .so host ($lvl)"; rc=1; }
     done
 else echo "skip  aarch64 .so (no qemu-aarch64 / cross gcc / sysroot)"; fi
+# structs by value in a Linux .so (r506): the shapes C and Firn share work, every other shape is refused at build time
+for tgt in x86_64-linux aarch64-linux; do
+    if [ $tgt = x86_64-linux ]; then HC=gcc; RUN=""; else
+        command -v qemu-aarch64 >/dev/null && command -v aarch64-linux-gnu-gcc >/dev/null || { echo "skip  aarch64 struct .so"; continue; }
+        HC=aarch64-linux-gnu-gcc; RUN="qemu-aarch64 -L /usr/aarch64-linux-gnu"; fi
+    $HC -O1 -o "$D/hso_$tgt" tools/stack_e/host_struct_so.c -ldl || { echo "FAIL $tgt gcc host_struct_so"; rc=1; continue; }
+    "$FIRNC" --shared --target=$tgt -o "$D/so_$tgt.so" tools/stack_e/lib_struct_so.fi || { echo "FAIL $tgt lib_struct_so"; rc=1; continue; }
+    (cd "$D" && timeout 120 $RUN ./hso_$tgt ./so_$tgt.so 2>&1 | grep -q 'host_struct_so: all ok') && echo "ok  $tgt .so structs by value (safe subset)" || { echo "FAIL $tgt .so struct subset"; rc=1; }
+    "$FIRNC" --shared --target=$tgt -o "$D/bad_$tgt.so" tools/stack_e/lib_struct.fi 2> "$D/err_$tgt" && { echo "FAIL $tgt .so: unsafe struct shapes accepted"; rc=1; } || grep -q 'pass a pointer instead' "$D/err_$tgt" || { echo "FAIL $tgt .so: refusal text"; rc=1; }
+done
 [ $rc = 0 ] && echo "RESULT g5: ok" || echo "RESULT g5: FAIL"
 exit $rc

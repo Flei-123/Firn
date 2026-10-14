@@ -738,9 +738,104 @@ fn cb_thunk_asm(sym: &str, argc: u32) -> String {
     win64_thunk_asm(&cb_thunk(sym), sym, &vec![b'i'; argc as usize])
 }
 
-/// Win64 entry `t` -> System V function `sym` (see `cb_thunk_asm`).
+/// A parameter of an exported function as the Win64 entry thunk sees it (`extfn::export_thunk_info`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum WinParam {
+    /// integer / pointer / bool, and a struct over 16 octets (a pointer to a copy on both sides)
+    Int,
+    F32,
+    F64,
+    /// Win64 passes a pointer to 16 octets in an integer slot; System V wants the vector in an `xmm`
+    V128,
+    /// a struct of at most 16 octets. Win64: by value in the slot (1, 2, 4, 8 octets, ALWAYS an integer slot, also for
+    /// floats) else a pointer to a copy. Firn: eightbyte words, `sse[k]` = word `k` travels in an `xmm`.
+    Agg { size: u32, sse: Vec<bool> },
+}
+
+/// The result of an exported function as the Win64 entry thunk sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WinRet {
+    /// scalar or nothing: `rax` / `xmm0` are the same in both conventions
+    Plain,
+    /// a struct of at most 8 octets: Firn answers in `rax` (`sse`: `xmm0`); Win64 in `rax` for 1, 2, 4, 8 octets, else
+    /// through a hidden pointer in the first slot
+    Word { size: u32, sse: bool },
+    /// a struct over 8 octets: hidden pointer in the first integer slot / register, handed back in `rax` (both sides)
+    Sret,
+}
+
+/// Win64 passes a struct of exactly these sizes in the slot itself; every other size as a pointer to a copy.
+fn win_by_value(size: u32) -> bool {
+    matches!(size, 1 | 2 | 4 | 8)
+}
+
+/// Where one System V argument comes from. Every source is MEMORY (the parked slot, or the copy a pointer slot names).
+enum ArgSrc {
+    Slot(usize),
+    V128(usize),
+    F32(usize),
+    F64(usize),
+    /// word `off/8` of an aggregate: `ptr` = slot holding the pointer to the copy (`None`: the value is the slot itself),
+    /// `rem` = octets of this word (1..=8)
+    Word { ptr: Option<usize>, slot: usize, off: u32, rem: u32 },
+}
+
+/// `rax` = the `rem` octets at `[base+off]`, zero extended (`r11` is scratch).
+fn load_bits_rax(base: &str, off: usize, rem: u32) -> String {
+    let m = |o: usize| format!("[{}+{}]", base, off + o);
+    match rem {
+        1 => format!("    movzx eax, byte ptr {}\n", m(0)),
+        2 => format!("    movzx eax, word ptr {}\n", m(0)),
+        3 => format!(
+            "    movzx eax, word ptr {}\n    movzx r11d, byte ptr {}\n    shl r11, 16\n    or rax, r11\n",
+            m(0),
+            m(2)
+        ),
+        4 => format!("    mov eax, dword ptr {}\n", m(0)),
+        5 => format!(
+            "    mov eax, dword ptr {}\n    movzx r11d, byte ptr {}\n    shl r11, 32\n    or rax, r11\n",
+            m(0),
+            m(4)
+        ),
+        6 => format!(
+            "    mov eax, dword ptr {}\n    movzx r11d, word ptr {}\n    shl r11, 32\n    or rax, r11\n",
+            m(0),
+            m(4)
+        ),
+        7 => format!(
+            "    mov eax, dword ptr {}\n    movzx r11d, word ptr {}\n    shl r11, 32\n    or rax, r11\n    movzx r11d, byte ptr {}\n    shl r11, 48\n    or rax, r11\n",
+            m(0),
+            m(4),
+            m(6)
+        ),
+        _ => format!("    mov rax, qword ptr {}\n", m(0)),
+    }
+}
+
+/// Win64 entry `t` -> System V function `sym` (see `cb_thunk_asm`); scalar parameters only.
 fn win64_thunk_asm(t: &str, sym: &str, kinds: &[u8]) -> String {
-    let argc = kinds.len();
+    let params: Vec<WinParam> = kinds
+        .iter()
+        .map(|k| match k {
+            b'f' => WinParam::F32,
+            b'd' => WinParam::F64,
+            b'v' => WinParam::V128,
+            _ => WinParam::Int,
+        })
+        .collect();
+    win64_thunk_asm_ex(t, sym, &params, &WinRet::Plain)
+}
+
+/// Win64 entry `t` -> System V function `sym`: scalars, `v128` and structs by value, struct results.
+fn win64_thunk_asm_ex(t: &str, sym: &str, params: &[WinParam], ret: &WinRet) -> String {
+    let argc = params.len();
+    // A result that comes back through a hidden pointer takes Win64 slot 0 (rcx).
+    let hidden = match ret {
+        WinRet::Sret => true,
+        WinRet::Word { size, .. } => !win_by_value(*size),
+        WinRet::Plain => false,
+    };
+    let shift = hidden as usize;
     let mut s = String::new();
     s.push_str(&format!("\n.globl {}\n{}:\n", t, t));
     s.push_str(&format!(
@@ -758,13 +853,38 @@ fn win64_thunk_asm(t: &str, sym: &str, kinds: &[u8]) -> String {
     // at [rbp+8], the 32-octet shadow space above it). Park the four register slots in their
     // own shadow space first: after that every argument sits in memory at [rbp+16+8*i] and
     // the System V placement below can load them in any order without clobbering a source.
-    for (i, k) in kinds.iter().enumerate().take(4) {
+    for i in 0..(argc + shift).min(4) {
         let home = 16 + 8 * i;
         let win_int = ["rcx", "rdx", "r8", "r9"];
+        let k = if i < shift { &WinParam::Int } else { &params[i - shift] };
         match k {
-            b'f' => s.push_str(&format!("    movss dword ptr [rbp+{}], xmm{}\n", home, i)),
-            b'd' => s.push_str(&format!("    movsd qword ptr [rbp+{}], xmm{}\n", home, i)),
+            WinParam::F32 => s.push_str(&format!("    movss dword ptr [rbp+{}], xmm{}\n", home, i)),
+            WinParam::F64 => s.push_str(&format!("    movsd qword ptr [rbp+{}], xmm{}\n", home, i)),
             _ => s.push_str(&format!("    mov qword ptr [rbp+{}], {}\n", home, win_int[i])),
+        }
+    }
+    // The System V arguments in order of writing, each with its class (`true` = SSE).
+    let mut items: Vec<(bool, ArgSrc)> = Vec::new();
+    if matches!(ret, WinRet::Sret) {
+        items.push((false, ArgSrc::Slot(16))); // hidden result pointer = Firn's first integer argument
+    }
+    for (j, k) in params.iter().enumerate() {
+        let src = 16 + 8 * (j + shift);
+        match k {
+            WinParam::F32 => items.push((true, ArgSrc::F32(src))),
+            WinParam::F64 => items.push((true, ArgSrc::F64(src))),
+            // `v128`: Win64 passed a pointer to 16 octets (an integer slot, parked above); System V
+            // wants the vector itself in the next xmm (extfn.rs rejects the overflow case).
+            WinParam::V128 => items.push((true, ArgSrc::V128(src))),
+            WinParam::Int => items.push((false, ArgSrc::Slot(src))),
+            WinParam::Agg { size, sse } => {
+                for (w, is_sse) in sse.iter().enumerate() {
+                    let off = 8 * w as u32;
+                    let rem = (*size - off).min(8);
+                    let ptr = if win_by_value(*size) { None } else { Some(src) };
+                    items.push((*is_sse, ArgSrc::Word { ptr, slot: src, off, rem }));
+                }
+            }
         }
     }
     // System V placement (what Firn code expects, `codegen_x86::place_args`): integers in
@@ -772,33 +892,41 @@ fn win64_thunk_asm(t: &str, sym: &str, kinds: &[u8]) -> String {
     // stack in order of writing.
     let sysv_int = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
     let (mut ni, mut nx) = (0usize, 0usize);
-    let mut stack_args: Vec<usize> = Vec::new();
+    let mut stack_args: Vec<&ArgSrc> = Vec::new();
     let mut loads: Vec<String> = Vec::new();
-    for (i, k) in kinds.iter().enumerate() {
-        let src = 16 + 8 * i;
-        match k {
-            b'f' | b'd' if nx < 8 => {
-                let op = if *k == b'f' { "movss" } else { "movsd" };
-                let w = if *k == b'f' { "dword" } else { "qword" };
-                loads.push(format!("    {} xmm{}, {} ptr [rbp+{}]\n", op, nx, w, src));
-                nx += 1;
-            }
-            b'f' | b'd' => stack_args.push(src),
-            // `v128`: Win64 passed a pointer to 16 octets (an integer slot, parked above); System V
-            // wants the vector itself in the next xmm (extfn.rs rejects the overflow case).
-            b'v' => {
-                loads.push(format!(
+    // aggregate word -> rax (zero extended); `rax`, `r10`, `r11` are free in both conventions
+    let word_rax = |src: &ArgSrc| -> String {
+        match src {
+            ArgSrc::Word { ptr: Some(p), off, rem, .. } => format!(
+                "    mov r10, qword ptr [rbp+{}]\n{}",
+                p,
+                load_bits_rax("r10", *off as usize, *rem)
+            ),
+            ArgSrc::Word { ptr: None, slot, rem, .. } => load_bits_rax("rbp", *slot, *rem),
+            ArgSrc::Slot(a) => format!("    mov rax, qword ptr [rbp+{}]\n", a),
+            _ => String::new(),
+        }
+    };
+    for (sse, src) in &items {
+        if *sse && nx < 8 {
+            match src {
+                ArgSrc::F32(a) => loads.push(format!("    movss xmm{}, dword ptr [rbp+{}]\n", nx, a)),
+                ArgSrc::F64(a) => loads.push(format!("    movsd xmm{}, qword ptr [rbp+{}]\n", nx, a)),
+                ArgSrc::V128(a) => loads.push(format!(
                     "    mov rax, qword ptr [rbp+{}]\n    movups xmm{}, xmmword ptr [rax]\n",
-                    src,
-                    nx.min(7)
-                ));
-                nx += 1;
+                    a, nx
+                )),
+                w => loads.push(format!("{}    movq xmm{}, rax\n", word_rax(w), nx)),
             }
-            _ if ni < 6 => {
-                loads.push(format!("    mov {}, qword ptr [rbp+{}]\n", sysv_int[ni], src));
-                ni += 1;
+            nx += 1;
+        } else if !*sse && ni < 6 {
+            match src {
+                ArgSrc::Slot(a) => loads.push(format!("    mov {}, qword ptr [rbp+{}]\n", sysv_int[ni], a)),
+                w => loads.push(format!("{}    mov {}, rax\n", word_rax(w), sysv_int[ni])),
             }
-            _ => stack_args.push(src),
+            ni += 1;
+        } else {
+            stack_args.push(src);
         }
     }
     // The stack block keeps the 16-octet alignment the call needs.
@@ -806,7 +934,19 @@ fn win64_thunk_asm(t: &str, sym: &str, kinds: &[u8]) -> String {
     if stack_room > 0 {
         s.push_str(&format!("    sub rsp, {}\n", stack_room));
         for (j, src) in stack_args.iter().enumerate() {
-            s.push_str(&format!("    mov rax, qword ptr [rbp+{}]\n    mov qword ptr [rsp+{}], rax\n", src, j * 8));
+            match src {
+                ArgSrc::F32(a) => s.push_str(&format!(
+                    "    mov eax, dword ptr [rbp+{}]\n    mov qword ptr [rsp+{}], rax\n",
+                    a,
+                    j * 8
+                )),
+                ArgSrc::F64(a) | ArgSrc::Slot(a) | ArgSrc::V128(a) => s.push_str(&format!(
+                    "    mov rax, qword ptr [rbp+{}]\n    mov qword ptr [rsp+{}], rax\n",
+                    a,
+                    j * 8
+                )),
+                w => s.push_str(&format!("{}    mov qword ptr [rsp+{}], rax\n", word_rax(w), j * 8)),
+            }
         }
     }
     for l in &loads {
@@ -816,7 +956,25 @@ fn win64_thunk_asm(t: &str, sym: &str, kinds: &[u8]) -> String {
     if stack_room > 0 {
         s.push_str(&format!("    add rsp, {}\n", stack_room));
     }
-    // A float result is in xmm0 in both conventions, an integer one in rax.
+    // A float result is in xmm0 in both conventions, an integer one in rax. A struct of at most 8 octets
+    // answers in rax or xmm0 (Firn) and must end up in rax (Win64, sizes 1/2/4/8) or behind the hidden pointer.
+    if let WinRet::Word { size, sse } = ret {
+        if *sse {
+            s.push_str("    movq rax, xmm0\n");
+        }
+        if !win_by_value(*size) {
+            s.push_str("    mov r10, qword ptr [rbp+16]\n");
+            match size {
+                3 => s.push_str("    mov word ptr [r10], ax\n    shr eax, 16\n    mov byte ptr [r10+2], al\n"),
+                5 => s.push_str("    mov dword ptr [r10], eax\n    shr rax, 32\n    mov byte ptr [r10+4], al\n"),
+                6 => s.push_str("    mov dword ptr [r10], eax\n    shr rax, 32\n    mov word ptr [r10+4], ax\n"),
+                _ => s.push_str(
+                    "    mov dword ptr [r10], eax\n    shr rax, 32\n    mov word ptr [r10+4], ax\n    shr eax, 16\n    mov byte ptr [r10+6], al\n",
+                ),
+            }
+            s.push_str("    mov rax, r10\n");
+        }
+    }
     for k in 0..10u32 {
         s.push_str(&format!("    movaps xmm{}, [rsp+{}]\n", k + 6, k * 16));
     }
@@ -1066,9 +1224,9 @@ pub fn runtime_asm() -> String {
         s.push_str(&cb_thunk_asm(sym, *argc));
     }
     if crate::target::shared() {
-        for (internal, c_name, kinds, _) in crate::extfn::export_thunk_info() {
-            let target = crate::codegen_x86::label(&internal);
-            s.push_str(&win64_thunk_asm(&c_name, &target, &kinds));
+        for th in crate::extfn::export_thunk_info() {
+            let target = crate::codegen_x86::label(&th.internal);
+            s.push_str(&win64_thunk_asm_ex(&th.c_name, &target, &th.params, &th.ret));
         }
     }
     if probed() {
@@ -1251,6 +1409,43 @@ mod tests {
         assert!(a.contains("mov rax, qword ptr [rbp+24]\n    movups xmm0, xmmword ptr [rax]"), "{}", a);
         assert!(a.contains("mov rax, qword ptr [rbp+32]\n    movups xmm1, xmmword ptr [rax]"), "{}", a);
         assert!(a.contains("movsd xmm2, qword ptr [rbp+40]"), "{}", a);
+    }
+
+    #[test]
+    fn a_struct_argument_is_loaded_by_value_or_through_its_pointer() {
+        // (S8 by value, S12 by pointer, F4 {f32} by value): slots 0..2; Firn: S8 -> rdi, S12 -> rsi + rdx (words 4/8 octets),
+        // F4 -> xmm0 (SSE word)
+        let params = [
+            WinParam::Agg { size: 8, sse: vec![false] },
+            WinParam::Agg { size: 12, sse: vec![false, false] },
+            WinParam::Agg { size: 4, sse: vec![true] },
+        ];
+        let a = win64_thunk_asm_ex("t", "sym", &params, &WinRet::Plain);
+        assert!(a.contains("mov rax, qword ptr [rbp+16]\n    mov rdi, rax"), "{}", a);
+        assert!(a.contains("mov r10, qword ptr [rbp+24]\n    mov rax, qword ptr [r10+0]\n    mov rsi, rax"), "{}", a);
+        assert!(a.contains("mov r10, qword ptr [rbp+24]\n    mov eax, dword ptr [r10+8]\n    mov rdx, rax"), "{}", a);
+        assert!(a.contains("mov eax, dword ptr [rbp+32]\n    movq xmm0, rax"), "{}", a);
+    }
+
+    #[test]
+    fn a_hidden_result_pointer_shifts_every_slot() {
+        // S16 result (Sret): slot 0 = result pointer -> Firn rdi; the i64 is slot 1 (rdx) -> rsi; rax comes back from Firn
+        let a = win64_thunk_asm_ex("t", "sym", &[WinParam::Int], &WinRet::Sret);
+        assert!(a.contains("mov qword ptr [rbp+24], rdx"), "{}", a);
+        assert!(a.contains("mov rdi, qword ptr [rbp+16]"), "{}", a);
+        assert!(a.contains("mov rsi, qword ptr [rbp+24]"), "{}", a);
+    }
+
+    #[test]
+    fn a_small_struct_result_goes_behind_the_hidden_pointer_for_odd_sizes() {
+        let a = win64_thunk_asm_ex("t", "sym", &[], &WinRet::Word { size: 3, sse: false });
+        assert!(a.contains("mov word ptr [r10], ax"), "{}", a);
+        assert!(a.contains("mov byte ptr [r10+2], al"), "{}", a);
+        assert!(a.contains("mov rax, r10"), "{}", a);
+        // size 8 with floats: Firn answers in xmm0, Win64 wants rax
+        let b = win64_thunk_asm_ex("t", "sym", &[], &WinRet::Word { size: 8, sse: true });
+        assert!(b.contains("movq rax, xmm0"), "{}", b);
+        assert!(!b.contains("r10"), "{}", b);
     }
 
     #[test]

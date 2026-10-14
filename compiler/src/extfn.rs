@@ -66,6 +66,45 @@ struct ExportSig {
     ret: Option<TypeExpr>,
 }
 
+/// How ONE aggregate parameter of an `#[export_c]` function crosses the Firn boundary (`abi.rs`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum AggArg {
+    /// up to 16 octets: one or two eightbyte words, `sse[k]` = word `k` is of the SSE class
+    Words { size: u32, sse: Vec<bool> },
+    /// over 16 octets: a pointer to a copy owned by the caller
+    Ref { size: u32 },
+}
+
+/// How the result of an `#[export_c]` function crosses the Firn boundary.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum AggRet {
+    /// scalar or nothing
+    #[default]
+    None,
+    /// an aggregate of at most 8 octets: one word in `rax` (`sse` = `xmm0`)
+    Word { size: u32, sse: bool },
+    /// an aggregate over 8 octets: hidden pointer in the first integer register, handed back in `rax`
+    Sret { size: u32 },
+}
+
+/// The aggregate part of an export's signature, recorded by lowering (it needs the struct layouts).
+#[derive(Clone, Debug, Default)]
+pub struct ExportAbi {
+    /// per source parameter: `Some` when it is an aggregate
+    pub args: Vec<Option<AggArg>>,
+    pub ret: AggRet,
+}
+
+thread_local! {
+    /// aggregate ABI of every export, by internal name (filled by `lower::lower_fn`)
+    static ABIS: RefCell<HashMap<String, ExportAbi>> = RefCell::new(HashMap::new());
+}
+
+/// Called by lowering for every `#[export_c]` function.
+pub fn record_export_abi(internal: &str, abi: ExportAbi) {
+    ABIS.with(|m| m.borrow_mut().insert(internal.to_string(), abi));
+}
+
 thread_local! {
     /// exported signatures, in source order (for `--header` / `--shared`)
     static SIGS: RefCell<Vec<ExportSig>> = RefCell::new(Vec::new());
@@ -77,6 +116,7 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn reset() {
     SIGS.with(|e| e.borrow_mut().clear());
+    ABIS.with(|e| e.borrow_mut().clear());
     STRUCTS.with(|e| e.borrow_mut().clear());
     EXTERNS.with(|e| e.borrow_mut().clear());
     EXPORTED.with(|e| e.borrow_mut().clear());
@@ -183,15 +223,26 @@ pub fn export_names() -> Vec<String> {
     SIGS.with(|v| v.borrow().iter().map(|s| s.c_name.clone()).collect())
 }
 
-/// Windows DLL (`--shared --target=x86_64-windows`): one Win64 entry thunk per
-/// `#[export_c]` function. `(internal name, C name, parameter classes, unsupported)`.
-/// The classes are `b'i'` (integer / pointer / bool), `b'f'` (`f32`), `b'd'` (`f64`) and `b'v'` (`v128`, which Win64
-/// passes as a pointer to 16 octets: integer slot, the thunk loads it into the next `xmm`);
-/// the thunk moves `rcx/rdx/r8/r9 | xmm0-3 | stack` to the System V placement Firn
-/// code uses (integers `rdi..r9`, floats `xmm0-7`, the rest on the stack). `unsupported`
-/// is set when a `v128` would not find an `xmm0-7` register (System V puts it on the stack
-/// then): the caller rejects that with a clear error.
-pub fn export_thunk_info() -> Vec<(String, String, Vec<u8>, bool)> {
+/// One Win64 entry thunk to write: `(internal name, C name, parameters, result, unsupported)`.
+pub struct ExportThunk {
+    pub internal: String,
+    pub c_name: String,
+    pub params: Vec<crate::win::WinParam>,
+    pub ret: crate::win::WinRet,
+    /// a `v128` would not find an `xmm0-7` register (System V puts it on the stack then)
+    pub unsupported: bool,
+}
+
+/// Windows DLL (`--shared --target=x86_64-windows`): one Win64 entry thunk per `#[export_c]` function.
+/// A parameter is `Int` (integer / pointer / bool), `F32`, `F64`, `V128` (Win64 passes a pointer to 16 octets: integer
+/// slot, the thunk loads it into the next `xmm`) or `Agg` (a struct of at most 16 octets: by value in the slot for 1, 2,
+/// 4 and 8 octets, else a pointer to a copy; Firn takes it as eightbyte words). A struct over 16 octets is a pointer on
+/// both sides: `Int`. The result is a scalar (`Plain`), a struct of at most 8 octets (`Word`) or a struct over 8
+/// octets (`Sret`, hidden pointer on both sides). The thunk moves `rcx/rdx/r8/r9 | xmm0-3 | stack` to the System V
+/// placement Firn code uses (integers `rdi..r9`, floats `xmm0-7`, the rest on the stack). `unsupported` is set when a
+/// `v128` would not find an `xmm0-7` register: the caller rejects that with a clear error.
+pub fn export_thunk_info() -> Vec<ExportThunk> {
+    use crate::win::{WinParam, WinRet};
     let exported: Vec<(String, String)> =
         EXPORTED.with(|e| e.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect());
     SIGS.with(|v| {
@@ -199,27 +250,115 @@ pub fn export_thunk_info() -> Vec<(String, String, Vec<u8>, bool)> {
             .iter()
             .filter_map(|sig| {
                 let internal = exported.iter().find(|(_, c)| *c == sig.c_name).map(|(k, _)| k.clone())?;
-                let mut unsupported = false;
-                let mut kinds: Vec<u8> = Vec::new();
-                for (_, ty, _) in &sig.params {
-                    let mut k = b'i';
-                    if let TypeExpr::Named(n, _) = ty {
-                        match n.as_str() {
-                            "f32" => k = b'f',
-                            "f64" => k = b'd',
-                            "v128" => k = b'v',
-                            _ => {}
+                let abi = ABIS.with(|m| m.borrow().get(&internal).cloned()).unwrap_or_default();
+                let mut params: Vec<WinParam> = Vec::new();
+                for (i, (_, ty, _)) in sig.params.iter().enumerate() {
+                    let mut k = WinParam::Int;
+                    match abi.args.get(i).cloned().flatten() {
+                        Some(AggArg::Words { size, sse }) => k = WinParam::Agg { size, sse },
+                        Some(AggArg::Ref { .. }) => {}
+                        None => {
+                            if let TypeExpr::Named(n, _) = ty {
+                                match n.as_str() {
+                                    "f32" => k = WinParam::F32,
+                                    "f64" => k = WinParam::F64,
+                                    "v128" => k = WinParam::V128,
+                                    _ => {}
+                                }
+                            }
                         }
                     }
-                    kinds.push(k);
+                    params.push(k);
                 }
-                if kinds.contains(&b'v') && kinds.iter().filter(|k| **k != b'i').count() > 8 {
-                    unsupported = true;
-                }
-                Some((internal, sig.c_name.clone(), kinds, unsupported))
+                let ret = match abi.ret {
+                    AggRet::None => WinRet::Plain,
+                    AggRet::Word { size, sse } => WinRet::Word { size, sse },
+                    AggRet::Sret { .. } => WinRet::Sret,
+                };
+                let sse_count: usize = params
+                    .iter()
+                    .map(|p| match p {
+                        WinParam::F32 | WinParam::F64 | WinParam::V128 => 1,
+                        WinParam::Agg { sse, .. } => sse.iter().filter(|b| **b).count(),
+                        WinParam::Int => 0,
+                    })
+                    .sum();
+                let unsupported = params.contains(&WinParam::V128) && sse_count > 8;
+                Some(ExportThunk { internal, c_name: sig.c_name.clone(), params, ret, unsupported })
             })
             .collect()
     })
+}
+
+/// Linux `.so` (`--shared`, x86-64 or aarch64): the aggregate shapes whose Firn placement differs from the C ABI of the
+/// platform. Firn takes an aggregate as eightbyte words placed one by one, passes a struct over 16 octets as a pointer
+/// and answers a struct over 8 octets through a hidden pointer. C (System V / AAPCS64) agrees on small integer structs
+/// that fit in the registers; every other shape would silently read the wrong registers, so it is refused here
+/// (the Windows DLL has a Win64 thunk for all of them). Returns one message per offending export.
+pub fn so_abi_errors(a64: bool) -> Vec<String> {
+    let exported: Vec<(String, String)> =
+        EXPORTED.with(|e| e.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    let (int_regs, sse_regs) = (if a64 { 8 } else { 6 }, 8);
+    let mut errs = Vec::new();
+    SIGS.with(|v| {
+        for sig in v.borrow().iter() {
+            let internal = match exported.iter().find(|(_, c)| *c == sig.c_name) {
+                Some((k, _)) => k.clone(),
+                None => continue,
+            };
+            let abi = match ABIS.with(|m| m.borrow().get(&internal).cloned()) {
+                Some(a) => a,
+                None => continue,
+            };
+            let mut why: Vec<String> = Vec::new();
+            let (mut ni, mut nx) = (0usize, 0usize);
+            match &abi.ret {
+                AggRet::Sret { size } => {
+                    if a64 {
+                        why.push(format!("returns a struct of {} octets (AAPCS64: hidden pointer in x8 or x0:x1, Firn: x0)", size));
+                    } else if *size <= 16 {
+                        why.push(format!("returns a struct of {} octets (System V: rax:rdx / xmm0:xmm1, Firn: hidden pointer)", size));
+                    } else {
+                        ni = 1;
+                    }
+                }
+                AggRet::Word { size, sse } if a64 && *sse => {
+                    why.push(format!("returns a struct of {} octets of floats (AAPCS64: s0-s3 / d0-d3, Firn: one d0 word)", size));
+                }
+                _ => {}
+            }
+            for (i, (_, ty, _)) in sig.params.iter().enumerate() {
+                match abi.args.get(i).cloned().flatten() {
+                    Some(AggArg::Ref { size }) => {
+                        why.push(format!("parameter {} is a struct of {} octets (C passes a copy, Firn a pointer)", i + 1, size));
+                    }
+                    Some(AggArg::Words { size, sse }) => {
+                        let (a, b) = (sse.iter().filter(|x| !**x).count(), sse.iter().filter(|x| **x).count());
+                        if a64 && b > 0 {
+                            why.push(format!("parameter {} is a struct of {} octets with floats (AAPCS64 homogeneous float aggregate rules)", i + 1, size));
+                        } else if ni + a > int_regs || nx + b > sse_regs {
+                            why.push(format!("parameter {} is a struct of {} octets that no longer fits the registers (C puts all of it on the stack)", i + 1, size));
+                        } else {
+                            ni += a;
+                            nx += b;
+                        }
+                    }
+                    None => {
+                        let is_f = matches!(ty, TypeExpr::Named(n, _) if matches!(n.as_str(), "f32" | "f64" | "v128"));
+                        if is_f {
+                            nx += 1;
+                        } else {
+                            ni += 1;
+                        }
+                    }
+                }
+            }
+            if !why.is_empty() {
+                errs.push(format!("'{}' {}", sig.c_name, why.join("; ")));
+            }
+        }
+    });
+    errs
 }
 
 /// C spelling of a Firn scalar type name, `None` if it is not one.

@@ -1388,6 +1388,13 @@ fn link_shared(obj: &Path, so: &Path) -> Result<(), i32> {
     if target::windows() {
         return link_dll(obj, so, &names);
     }
+    let abi_errs = extfn::so_abi_errors(matches!(target::active(), target::Target::Aarch64));
+    if !abi_errs.is_empty() {
+        for e in &abi_errs {
+            eprintln!("error: --shared: export {}; pass a pointer instead (by-value structs of this shape work in a Windows DLL only)", e);
+        }
+        return Err(2);
+    }
     let ver = so.with_extension("ver");
     let script = format!("{{ global: {}; local: *; }};\n", names.join("; "));
     if let Err(e) = std::fs::write(&ver, script.as_bytes()) {
@@ -1425,8 +1432,9 @@ fn link_shared(obj: &Path, so: &Path) -> Result<(), i32> {
 /// `--shared --target=x86_64-windows`: a PE DLL. Exports = the Win64 thunks `win.rs` wrote under the
 /// bare `#[export_c]` names, listed in a `.def` file. Entry = `win::DLL_ENTRY`.
 fn link_dll(obj: &Path, dll: &Path, names: &[String]) -> Result<(), i32> {
-    for (_, c_name, _, unsupported) in extfn::export_thunk_info() {
-        if unsupported {
+    for th in extfn::export_thunk_info() {
+        let c_name = &th.c_name;
+        if th.unsupported {
             eprintln!(
                 "error: --shared (Windows DLL): '{}' has a v128 parameter that finds no xmm0-7 register \
                  (more than 8 float / vector parameters); take a pointer instead",

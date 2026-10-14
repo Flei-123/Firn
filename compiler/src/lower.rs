@@ -2443,6 +2443,38 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         }
     };
 
+    // r506: an `#[export_c]` function records how its aggregates cross the boundary (the Win64 thunk needs it).
+    if crate::extfn::export_link_name(&d.name).is_some() {
+        let words_of = |t: &Type| -> Vec<bool> {
+            abi::classify(t, &info.tcx).words().iter().map(|w| *w == abi::Word::Sse).collect()
+        };
+        let args: Vec<Option<crate::extfn::AggArg>> = sig
+            .params
+            .iter()
+            .map(|p| {
+                if !is_agg(p) {
+                    return None;
+                }
+                let size = info.tcx.size_of(p) as u32;
+                Some(match abi::classify(p, &info.tcx) {
+                    ArgClass::Regs { .. } => crate::extfn::AggArg::Words { size, sse: words_of(p) },
+                    _ => crate::extfn::AggArg::Ref { size },
+                })
+            })
+            .collect();
+        let ret = if !is_agg(&sig.ret) {
+            crate::extfn::AggRet::None
+        } else if sret {
+            crate::extfn::AggRet::Sret { size: info.tcx.size_of(&sig.ret) as u32 }
+        } else {
+            crate::extfn::AggRet::Word {
+                size: info.tcx.size_of(&sig.ret) as u32,
+                sse: words_of(&sig.ret).first().copied().unwrap_or(false),
+            }
+        };
+        crate::extfn::record_export_abi(&d.name, crate::extfn::ExportAbi { args, ret });
+    }
+
     let mut f = Func::new(&d.name, pf.clone(), rf);
     // HOOK kern: `#[interrupt]` — its own calling convention in the code
     // generator (core.rs/codegen_x86.rs, round 52).

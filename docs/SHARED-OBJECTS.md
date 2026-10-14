@@ -72,11 +72,19 @@ crashes on its first runtime access (like the x86-64 `.so`). Proof: `host_attach
 one idles in host code during collections; jobs with 0/3 workers, GC chains), dev-fast + release-fast, 3 runs each. **`v128` (r506)**: a `v128`
 parameter is a pointer to 16 octets in its Win64 integer slot (hidden pointer, the C side passes `__m128` that way); the thunk loads it into the next
 `xmm0-7`. A `v128` result is `xmm0` in both conventions. Compile error only if a `v128` would not find an `xmm` register (more than 8 float / vector
-parameters). Limits: by-value structs in exports, a `.lib` import library (use `LoadLibrary` / `GetProcAddress`).
+parameters). **Structs by value (r506)**: parameters and results follow the Win64 rules, the thunk converts to Firn's word placement (`abi.rs`: up to 16 octets as eightbyte words, over 16 a pointer to a copy, result over 8 octets through a hidden pointer). A struct of 1, 2, 4 or 8 octets travels IN the integer slot (also when it holds floats, e.g. `{f32, f32}` or `{f64}`); every other size is a pointer to the caller's copy (the thunk loads exactly `size` octets, so 3/5/6/7-octet structs never read past the copy). A result of 1/2/4/8 octets comes back in `rax` (the thunk moves `xmm0` there for a float struct); other results use the hidden pointer in slot 0 (rcx), which shifts every other slot by one, and `rax` hands it back (the thunk stores a 3/5/6/7-octet word piecewise). Proof: `lib_struct.fi` + `host_struct.c` (sizes 1-8, 12, 16, 24, float words, mixed with scalars past the registers, results), dev-fast + release-fast under Wine. Limit: a `.lib` import library (use `LoadLibrary` / `GetProcAddress`).
 Proof: gate 134 -> `tools/stack_e/run_g5.sh` (mingw host `host_win.c` under Wine, dev-fast + release-fast, plus the runtime probe, plus
 `host_abi.c` against `lib_abi.fi`: `f64`/`f32` in every slot, 8 integers, 10 doubles, 14 mixed arguments, 9 integers with a float result, `v128` arguments and result; the same C host
 runs against the Linux x86-64 `.so` and the aarch64 `.so`, whose native conventions already carry floats and stack arguments). **Wine only; a real Windows
 is untested.**
+
+**Structs by value in a Linux `.so` (x86-64 System V, aarch64 AAPCS64)** have NO thunk: Firn's placement equals the C ABI only for integer structs that
+fit the remaining registers whole, and for results of at most 8 octets (rax / x0). `firnc --shared` therefore REFUSES (clear error, "pass a pointer
+instead") a struct over 16 octets (C passes a copy, Firn a pointer), a struct that no longer fits the registers (C puts all of it on the stack, Firn splits
+it), a result of 9-16 octets on x86-64 (rax:rdx) and every result over 8 octets on aarch64 (x8 / x0:x1), and on aarch64 every struct with float words
+(homogeneous float aggregates are in s/d registers in C). Proof: `lib_struct_so.fi` + `host_struct_so.c` (accepted shapes, gcc / qemu) and the refusal of
+`lib_struct.fi` in `run_g5.sh`. **A host thread that never called `thread_attach`**: on the aarch64 `.so` it runs as the Firn main thread (fallback to entry 0, only
+safe while the host serialises it with the real main thread); in the DLL and the x86-64 `.so` it crashes on its first runtime access.
 
 **aarch64 .so.** Same C ABI (AAPCS64 is already Firn's calling convention: floats in `d0-d7`, more than 8 per class on the stack), no `_start`, symbols
 as in the x86-64 `.so` (version script). The one real difference is the thread register: Firn keeps the thread block pointer in `tpidr_el0`, which in a
