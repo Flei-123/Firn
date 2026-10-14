@@ -55,6 +55,12 @@ const mv = (o) => (PROTOCOL >= 768 ? Object.assign({}, o, { onGround: undefined,
 const client = mc.createClient({ host, port, username: name, version: NMP, auth: 'offline', viewDistance: '2' })
 let pos = null // { x, y, z, yaw, pitch }
 let ready = false
+// BOT_DEBUG=1: log inbound position packets and outbound movement / confirm packets to stderr (tools/mcclient/run.sh keeps bot.err with MC_KEEP_DIR)
+if (process.env.BOT_DEBUG) {
+  client.on('packet', (d, m) => { if (m.name === 'position' || m.name === 'entity_teleport') console.error('<- ' + m.name + ' ' + JSON.stringify(d)) })
+  const w0 = client.write.bind(client)
+  client.write = (n, o) => { if (/position|look|teleport/.test(n)) console.error('-> ' + n + ' ' + JSON.stringify(o)); return w0(n, o) }
+}
 
 client.on('error', (e) => { console.error('bot error: ' + (e && e.message)) })
 client.on('end', () => { console.log('bye'); process.exit(0) })
@@ -73,7 +79,11 @@ client.on('position', (p) => {
     yaw: fl.yaw ? base.yaw + p.yaw : p.yaw, pitch: fl.pitch ? base.pitch + p.pitch : p.pitch
   }
   if (!LEGACY8) client.write('teleport_confirm', { teleportId: p.teleportId })
-  client.write('position_look', mv({ x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw, pitch: pos.pitch, onGround: false }))
+  // 1.14 - 1.17 servers only re-sync their "last tick position" once per tick while no teleport is pending: a move packet sent in the same tick
+  // as the teleport_confirm is rejected ("moved too quickly"), the server re-teleports and the bot answers at once again -> endless loop and
+  // the bot never leaves its old position. A short pause lets one server tick pass between the confirm and the move.
+  const reply = () => client.write('position_look', mv({ x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw, pitch: pos.pitch, onGround: false }))
+  if (PROTOCOL <= 756 && PROTOCOL > 47 && ready) setTimeout(reply, 120); else reply()
   if (!ready) { ready = true; console.log('ready') }
 })
 
