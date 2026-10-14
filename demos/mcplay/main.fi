@@ -57,6 +57,9 @@ import mc.mc_play
 import mc.mc_wlight
 import mc.mc_packs
 import mc.mc_backend
+import mc.mc_inv
+import mc.mc_dig
+import mc.v763.mc_dig_v763
 import gpu.glctx
 import gpu.glwindow
 import gpu.gl_mc
@@ -353,6 +356,12 @@ struct Ctx {
     n_frames: u64,
     n_kick: u64,
     fps: i32,
+    // inventory + break time (mc_inv, mc_dig)
+    inv: mc_inv.Inv,
+    dg: mc_dig.DigData,
+    show_inv: bool,
+    give_done: bool,
+    dig_total: i32,
 }
 
 fn mark_air(c: *mut Ctx, x: i32, y: i32, z: i32, id: i32) {
@@ -503,6 +512,10 @@ fn on_packet(c: *mut Ctx, id: i32) {
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_KICK_DISCONNECT) {
         (*c).n_kick = (*c).n_kick + 1 as u64
         (*c).closed = true
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_WINDOW_ITEMS) {
+        mc_inv.inv_on_window_items(&(*c).inv, (*cl).ver.protocol, mc_client.client_body(cl))
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_SET_SLOT) {
+        mc_inv.inv_on_set_slot(&(*c).inv, (*cl).ver.protocol, mc_client.client_body(cl))
     } else if (*c).aud {
         if mc_audio.mca_on_packet((*c).ma, &(*cl).ver, id, mc_client.client_body(cl), &(*c).ents) {
             (*c).n_snd_pkt = (*c).n_snd_pkt + 1 as u64
@@ -644,6 +657,8 @@ fn handle_hotbar(c: *mut Ctx) {
         mc_play.send_slot(&(*c).cl, (*c).pl.slot)
         (*c).sent_slot = (*c).pl.slot
     }
+    if raw.key_pressed(&(*c).rw, 18 as u32) { (*c).show_inv = !(*c).show_inv }
+    if (*c).have_pos { give_items(c) }
     if raw.key_pressed(&(*c).rw, SC_F as u32) { (*c).want_fly = true }
     if raw.key_pressed(&(*c).rw, SC_N as u32) { (*c).want_noclip = true }
 }
@@ -694,6 +709,105 @@ fn sync_position(c: *mut Ctx) {
     }
 }
 
+// ---- inventory HUD + creative give ------------------------------------------------------------------
+
+// Item label inside a 20 x 20 (HUD px * scale) slot cell at (x, y): first 3 letters of the item name, count at the bottom right.
+fn draw_slot_label(c: *mut Ctx, r: *mut mc_raster.Raster, x: i32, y: i32, s: i32, item: i32, count: i32) {
+    if item < 0 { return }
+    var n: usize = 0
+    let p: u64 = mc_registry.reg_item_name(&(*c).reg, item, &n)
+    var m: usize = n
+    if m > 3 { m = 3 }
+    mc_hud.hud_text_bytes(r, x + 2 * s, y + 3 * s, s, 0xFFFFFFFF as u32, 0xFF3F3F3F as u32, p, m)
+    if count > 1 {
+        var b: rt.Buf = rt.buf_new()
+        mc_hud.hud_push_int(&b, count as i64)
+        let w: i32 = mc_hud.hud_text_width(b.len, s)
+        mc_hud.hud_text_bytes(r, x + 19 * s - w, y + 12 * s, s, 0xFFFFFFFF as u32, 0xFF3F3F3F as u32, b.ptr, b.len)
+        rt.buf_free(&b)
+    }
+}
+
+// Hotbar item labels, the dig progress bar and (E) the inventory panel (36 slots: main 3 rows, hotbar row below).
+fn draw_inventory(c: *mut Ctx, r: *mut mc_raster.Raster) {
+    let s: i32 = mc_hud.hud_scale((*c).w, (*c).h)
+    let bx: i32 = ((*r).w - 181 * s) / 2
+    let by: i32 = (*r).h - 23 * s
+    var k: i32 = 0
+    while k < 9 {
+        draw_slot_label(c, r, bx + k * 20 * s + s, by + s, s, mc_inv.inv_hotbar_item(&(*c).inv, k), mc_inv.inv_hotbar_count(&(*c).inv, k))
+        k = k + 1
+    }
+    if (*c).digging && (*c).dig_total > 0 {
+        var done: i32 = ((now_ms() - (*c).dig_t0) / 50 as u64) as i32
+        if done > (*c).dig_total { done = (*c).dig_total }
+        let w: i32 = 40 * s
+        let x0: i32 = ((*r).w - w) / 2
+        let y0: i32 = (*r).h / 2 + 12 * s
+        mc_hud.hud_rect(r, x0 - s, y0 - s, w + 2 * s, 4 * s, 0x90000000 as u32)
+        mc_hud.hud_rect(r, x0, y0, (w * done) / (*c).dig_total, 2 * s, 0xFFFFFFFF as u32)
+    }
+    if !(*c).show_inv { return }
+    let pw: i32 = 9 * 20 * s + 8 * s
+    let ph: i32 = 5 * 20 * s + 20 * s
+    let px: i32 = ((*r).w - pw) / 2
+    let py: i32 = ((*r).h - ph) / 2
+    mc_hud.hud_rect(r, px, py, pw, ph, 0xC8000000 as u32)
+    mc_hud.hud_text(r, px + 4 * s, py + 3 * s, s, 0xFFFFFFFF as u32, 0xFF3F3F3F as u32, "Inventory")
+    var row: i32 = 0
+    while row < 4 {
+        var col: i32 = 0
+        while col < 9 {
+            var slot: i32 = mc_inv.INV_MAIN0 + row * 9 + col
+            var gy: i32 = py + 14 * s + row * 20 * s
+            if row == 3 {
+                slot = mc_inv.INV_HOTBAR0 + col
+                gy = gy + 4 * s
+            }
+            let gx: i32 = px + 4 * s + col * 20 * s
+            mc_hud.hud_rect(r, gx, gy, 19 * s, 19 * s, 0x60808080 as u32)
+            draw_slot_label(c, r, gx - s, gy - s, s, mc_inv.inv_item(&(*c).inv, slot), mc_inv.inv_count(&(*c).inv, slot))
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+// Creative: MCPLAY_GIVE="stone:64,diamond_pickaxe:1" fills the hotbar from slot 1 (Set Creative Slot; the server does not echo it).
+fn give_items(c: *mut Ctx) {
+    if (*c).give_done { return }
+    (*c).give_done = true
+    if !(*c).creative { return }
+    if !env.has("MCPLAY_GIVE") { return }
+    let g: str = env.get("MCPLAY_GIVE")
+    var i: usize = 0
+    var slot: i32 = 0
+    while i < g.n && slot < 9 {
+        var j: usize = i
+        while j < g.n && rt.ld8(g.p as u64, j) != 58 as u8 && rt.ld8(g.p as u64, j) != 44 as u8 { j = j + 1 }
+        let item: i32 = mc_registry.reg_item_by_name(&(*c).reg, g.p as u64 + i as u64, j - i)
+        var cnt: i32 = 1
+        var e: usize = j
+        if j < g.n && rt.ld8(g.p as u64, j) == 58 as u8 {
+            e = j + 1
+            var v: i32 = 0
+            while e < g.n && rt.ld8(g.p as u64, e) >= 48 as u8 && rt.ld8(g.p as u64, e) <= 57 as u8 {
+                v = v * 10 + ((rt.ld8(g.p as u64, e) - 48 as u8) as i32)
+                e = e + 1
+            }
+            if v > 0 { cnt = v }
+        }
+        if item >= 0 {
+            mc_inv.inv_send_creative(&(*c).cl, mc_inv.INV_HOTBAR0 + slot, item, cnt)
+            mc_inv.inv_set(&(*c).inv, mc_inv.INV_HOTBAR0 + slot, item, cnt)
+            slot = slot + 1
+        }
+        i = e
+        while i < g.n && rt.ld8(g.p as u64, i) == 44 as u8 { i = i + 1 }
+    }
+    say(f"mcplay: gave {slot} items\n")
+}
+
 // ---- mouse actions: break / place ------------------------------------------------------------------
 
 fn break_local(c: *mut Ctx, x: i32, y: i32, z: i32) {
@@ -705,6 +819,19 @@ fn break_local(c: *mut Ctx, x: i32, y: i32, z: i32) {
     (*c).n_dig = (*c).n_dig + 1 as u64
 }
 
+// Break time in ms of the block state `state` with the item in hand (mc_dig): -1 unbreakable, 0 instant. Without a dig table for this
+// protocol (only 1.20.1 is generated) the fixed MCPLAY_DIG_MS is used.
+fn dig_time_ms(c: *mut Ctx, state: i32) -> i32 {
+    if !mc_dig.dig_ok(&(*c).dg) || (*c).cl.ver.protocol != 763 { return env_int("MCPLAY_DIG_MS", 700) }
+    let blk: i32 = mc_registry.reg_block_of_state(&(*c).reg, state)
+    if blk < 0 { return env_int("MCPLAY_DIG_MS", 700) }
+    let item: i32 = mc_inv.inv_held_item(&(*c).inv, (*c).pl.slot)
+    let t: i32 = mc_dig.dig_ticks(&(*c).dg, blk, mc_registry.reg_block_hardness_milli(&(*c).reg, blk), item, 0, (*c).pl.on_ground, false)
+    if t <= 0 { return t }
+    (*c).dig_total = t
+    return t * 50
+}
+
 fn handle_mouse(c: *mut Ctx) {
     let lmb: bool = raw.mouse_down(&(*c).rw, raw.MB_LEFT)
     let lp: bool = raw.mouse_pressed(&(*c).rw, raw.MB_LEFT)
@@ -714,6 +841,7 @@ fn handle_mouse(c: *mut Ctx) {
         return
     }
     if !(*c).have_pos { return }
+    if (*c).show_inv { return }
     let cl: *mut mc_client.Client = &(*c).cl
     if lp && (*c).hit {
         let face: i32 = mc_play.face_of((*c).pk.nx, (*c).pk.ny, (*c).pk.nz)
@@ -722,7 +850,14 @@ fn handle_mouse(c: *mut Ctx) {
         mc_play.send_dig(cl, mc_play.DIG_START, (*c).pk.x, (*c).pk.y, (*c).pk.z, face, (*c).seq)
         if (*c).creative {
             break_local(c, (*c).pk.x, (*c).pk.y, (*c).pk.z)
+        } else if dig_time_ms(c, (*c).pk.id) < 0 {
+            // unbreakable (bedrock, barrier): the server answers with the block again
+        } else if dig_time_ms(c, (*c).pk.id) == 0 {
+            (*c).seq = (*c).seq + 1
+            mc_play.send_dig(cl, mc_play.DIG_FINISH, (*c).pk.x, (*c).pk.y, (*c).pk.z, face, (*c).seq)
+            break_local(c, (*c).pk.x, (*c).pk.y, (*c).pk.z)
         } else {
+            (*c).dig_ms = dig_time_ms(c, (*c).pk.id) as u64
             (*c).digging = true
             (*c).dig_x = (*c).pk.x
             (*c).dig_y = (*c).pk.y
@@ -802,6 +937,13 @@ fn audio_start(c: *mut Ctx) -> bool {
     } else if env.has("HOME") {
         push_str(&dir, env.get("HOME"))
         push_str(&dir, "/.cache/mcplay/sounds")
+    } else if env.has("LOCALAPPDATA") {
+        // Windows: no HOME; the bank lives under %LOCALAPPDATA%\mcplay\sounds (forward slashes work in Win32 paths)
+        push_str(&dir, env.get("LOCALAPPDATA"))
+        push_str(&dir, "/mcplay/sounds")
+    } else if env.has("USERPROFILE") {
+        push_str(&dir, env.get("USERPROFILE"))
+        push_str(&dir, "/.cache/mcplay/sounds")
     }
     push_str(&dir, "/bank.json")
     rt.buf_push(&dir, 0 as u8)
@@ -820,7 +962,7 @@ fn audio_start(c: *mut Ctx) -> bool {
     // a real device paces itself: audio thread. file/null sinks never wait, so they are fed by wall clock in audio_pump.
     if sink.sink_kind((*c).snk) == sink.KIND_DEVICE {
         (*c).aud_thread = engine.engine_audio_start((*c).eng, (*c).snk, 1024)
-        if !(*c).aud_thread { io.eprint_line("mcplay: audio thread did not start -- running silent") ; return false }
+        if !(*c).aud_thread { io.eprint_line("mcplay: audio thread did not start -- running silent"); return false }
     }
     (*c).aud_t0 = now_ms()
     return true
@@ -920,6 +1062,7 @@ fn draw_frame_gl(c: *mut Ctx) {
     var rec: rt.Buf = rt.buf_new()
     mc_hud.hud_record(&rec)
     mc_hud.hud_frame(&(*c).g.r, mc_hud.hud_scale((*c).w, (*c).h), mc_hud.HUD_CROSSHAIR | mc_hud.HUD_HOTBAR | mc_hud.HUD_DEBUG, (*c).pl.slot, &d)
+    draw_inventory(c, &(*c).g.r)
     mc_hud.hud_record(0 as *mut rt.Buf)
     gl_scene.scene_hud(&(*c).gsc, &rec)
     rt.buf_free(&rec)
@@ -968,6 +1111,7 @@ fn draw_frame(c: *mut Ctx) {
         d.nz = (*c).pk.nz
     }
     mc_hud.hud_frame(r, mc_hud.hud_scale((*c).w, (*c).h), mc_hud.HUD_CROSSHAIR | mc_hud.HUD_HOTBAR | mc_hud.HUD_DEBUG, (*c).pl.slot, &d)
+    draw_inventory(c, r)
 }
 
 fn present(c: *mut Ctx) {
@@ -1046,6 +1190,7 @@ fn main(start: u64) -> i32 {
         eng: &eng, bnk: &bnk, snk: &snk, ma: &ma, wk: mc_audio.mca_walker_new(), ents: mc_entity.store_new(), reg: ver.registry_of(),
         pend_place: false, pend_x: 0, pend_y: 0, pend_z: 0, pend_t: 0, n_snd: 0, n_snd_pkt: 0,
         n_chunks: 0, n_unload: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, fps: 0,
+        inv: mc_inv.inv_new(), dg: mc_dig_v763.dig_make(), show_inv: false, give_done: false, dig_total: 0,
     }
     if !c.g.ok {
         io.eprint_line("mcplay: this version has no block registry")
@@ -1105,6 +1250,10 @@ fn main(start: u64) -> i32 {
             mc_packs.res_reload_upload(&c.g.res, &c.be)
         } else {
             c.be.upload_atlas(c.be.obj, ((&c.g.atlas) as u64))
+        }
+        if env_flag("MCPLAY_TRANS", true) {
+            // translucent pass (water, glass, ice): second mesh per section, drawn back to front with blending (mc_mesh.F_TRANS)
+            mc_render_world.wr_set_translucent(&c.g.wr, true, mc_texture.T_WATER, mc_texture.T_ICE, mc_texture.T_GLASS)
         }
         io.print("mcplay: gl renderer=")
         io.print_c(gl_mc.glbe_renderer(&c.gb))
@@ -1177,6 +1326,7 @@ fn main(start: u64) -> i32 {
     }
     audio_stop(&c)
     say(f"mcplay: end frames={c.n_frames} ticks={c.n_ticks} chunks={c.n_chunks} unloads={c.n_unload} block_updates={c.n_bchange} multi_updates={c.n_mchange} dig={c.n_dig} place={c.n_place} kicked={c.n_kick} alive={alive}\n")
+    say(f"mcplay: inv updates={c.inv.n_updates} bad={c.inv.bad} hotbar={mc_inv.inv_hotbar_item(&c.inv, 0)}x{mc_inv.inv_hotbar_count(&c.inv, 0)},{mc_inv.inv_hotbar_item(&c.inv, 1)}x{mc_inv.inv_hotbar_count(&c.inv, 1)},{mc_inv.inv_hotbar_item(&c.inv, 2)}x{mc_inv.inv_hotbar_count(&c.inv, 2)} dig_ms={c.dig_ms}\n")
     say(f"mcplay: light={c.light} region={c.region_done} time_packets={c.n_time} day_time={c.day_time} daylight={c.sky.daylight}\n")
     say(f"mcplay: pos x={c.pl.x as i64} y={c.pl.y as i64} z={c.pl.z as i64} fps={c.fps}\n")
     var rc: i32 = 0

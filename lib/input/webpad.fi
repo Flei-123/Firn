@@ -18,13 +18,20 @@
 // (the XInput path: radial stick deadzone, trigger deadzone, edge detection) -- the conversion below is the only code of this file.
 // Units: buttons = bit mask of the W3C standard buttons 0..16 (bit i = buttons[i].pressed), triggers (buttons 6 and 7) 0..1000 =
 // buttons[i].value * 1000, sticks -1000..1000 = axes * 1000 (y positive DOWN, as the browser reports it).
-// NOT done: rumble (Gamepad.vibrationActuator), non-"standard" mappings (they are ignored, not guessed), touchpad / extra axes.
+// RUMBLE: webpad_rumble(slot, strong, weak, ms) queues a request; the host (glweb.js) plays it after the frame with
+// gamepad.vibrationActuator.playEffect("dual-rumble", ...) when its counter (firn_pad_rumble_seq) moved, and reset()s for a stop.
+// webpad_rumble_supported = the host saw an actuator (firn_pad_rumble_cap). Chrome/Edge have one; Firefox/Safari mostly do not.
+// NOT done: non-"standard" mappings (they are ignored, not guessed), touchpad / extra axes.
 // NOT proven: a real browser with a real pad (headless Chromium with a faked navigator.getGamepads only).
 
 import std.rt
 import input.padcore
 
-export { webpad_poll, webpad_slots, webpad_present, firn_pad_state, firn_pad_gone }
+export {
+    webpad_poll, webpad_slots, webpad_present, firn_pad_state, firn_pad_gone,
+    webpad_rumble_supported, webpad_rumble, webpad_rumble_stop,
+    firn_pad_rumble_cap, firn_pad_rumble_seq, firn_pad_rumble_strong, firn_pad_rumble_weak, firn_pad_rumble_ms,
+}
 
 const SLOTS: usize = 4
 const W_ON: usize = 0
@@ -36,7 +43,12 @@ const W_LX: usize = 5
 const W_LY: usize = 6
 const W_RX: usize = 7
 const W_RY: usize = 8
-const W_COUNT: usize = 9
+const W_CAP: usize = 9 // the host said: this pad has a vibrationActuator
+const W_RSEQ: usize = 10 // counts the rumble requests (the host plays a request when the counter moved)
+const W_RSTR: usize = 11 // strong (big) motor 0..1000
+const W_RWEAK: usize = 12 // weak (small) motor 0..1000
+const W_RMS: usize = 13 // duration in ms
+const W_COUNT: usize = 14
 
 static mut G_STATE: u64 = 0
 
@@ -79,10 +91,43 @@ fn firn_pad_state(slot: u32, buttons: u32, lt: i32, rt_: i32, lx: i32, ly: i32, 
 fn firn_pad_gone(slot: u32) {
     if (slot as usize) >= SLOTS { return }
     let s: usize = slot as usize
+    wr(s, W_CAP, 0 as u32) // the actuator is gone with the pad; a request still queued is dropped by the host with the pad
     if rd(s, W_ON) != 0 as u32 {
         wr(s, W_ON, 0 as u32)
         wr(s, W_EVT, rd(s, W_EVT) | 2 as u32)
     }
+}
+
+// The pad in `slot` has a vibrationActuator (on = 1) or not; the host says it with the state, once per frame.
+#[export_c]
+fn firn_pad_rumble_cap(slot: u32, on: u32) {
+    if (slot as usize) >= SLOTS { return }
+    wr(slot as usize, W_CAP, if on != 0 as u32 { 1 as u32 } else { 0 as u32 })
+}
+
+// The last rumble request of `slot` (host reads these after every frame; a new request moves the counter).
+#[export_c]
+fn firn_pad_rumble_seq(slot: u32) -> u32 {
+    if (slot as usize) >= SLOTS { return 0 as u32 }
+    return rd(slot as usize, W_RSEQ)
+}
+
+#[export_c]
+fn firn_pad_rumble_strong(slot: u32) -> i32 {
+    if (slot as usize) >= SLOTS { return 0 }
+    return padcore.s32(rd(slot as usize, W_RSTR))
+}
+
+#[export_c]
+fn firn_pad_rumble_weak(slot: u32) -> i32 {
+    if (slot as usize) >= SLOTS { return 0 }
+    return padcore.s32(rd(slot as usize, W_RWEAK))
+}
+
+#[export_c]
+fn firn_pad_rumble_ms(slot: u32) -> i32 {
+    if (slot as usize) >= SLOTS { return 0 }
+    return padcore.s32(rd(slot as usize, W_RMS))
 }
 
 // ---- Firn side -------------------------------------------------------------------------------------------------------
@@ -139,4 +184,37 @@ fn webpad_poll(slot: usize, p: *mut padcore.Pad) -> bool {
         padcore.pad_event_force(p, padcore.PE_DISCONNECTED, 0 as u32, 0.0)
     }
     return false
+}
+
+// ---- rumble (Firn -> host) ---------------------------------------------------------------------------------------------
+
+// can this slot rumble? (a pad is there and the browser gave it a vibrationActuator)
+fn webpad_rumble_supported(slot: usize) -> bool {
+    return slot < SLOTS && rd(slot, W_ON) != 0 as u32 && rd(slot, W_CAP) != 0 as u32
+}
+
+fn permille(v: f64) -> u32 {
+    if v <= 0.0 { return 0 as u32 }
+    if v >= 1.0 { return 1000 as u32 }
+    return (v * 1000.0 + 0.5) as u32
+}
+
+// strong = the big (low frequency) motor, weak = the small one, 0.0 .. 1.0 each (both 0 = stop); ms 0 = the longest (65535).
+// true = the request is queued for the host (it does not know whether the browser really vibrates).
+fn webpad_rumble(slot: usize, strong: f64, weak: f64, ms: u32) -> bool {
+    if !webpad_rumble_supported(slot) { return false }
+    let a: u32 = permille(strong)
+    let b: u32 = permille(weak)
+    var d: u32 = ms
+    if d == 0 as u32 || d > 65535 as u32 { d = 65535 as u32 }
+    if a == 0 as u32 && b == 0 as u32 { d = 0 as u32 }
+    wr(slot, W_RSTR, a)
+    wr(slot, W_RWEAK, b)
+    wr(slot, W_RMS, d)
+    wr(slot, W_RSEQ, rd(slot, W_RSEQ) +% 1 as u32)
+    return true
+}
+
+fn webpad_rumble_stop(slot: usize) -> bool {
+    return webpad_rumble(slot, 0.0, 0.0, 0 as u32)
 }
