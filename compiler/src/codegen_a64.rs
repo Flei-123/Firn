@@ -1792,6 +1792,46 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
             }
             return Ok(());
         }
+        syscalls::A64::Rewrite(n, form) => {
+            // FIRN r75: stat/lstat/pipe/rmdir/readlink -> the *at forms.
+            // `A(j)` = the j-th argument the program wrote, `I(v)` = immediate.
+            // Arguments the form does not use must be the padding zeroes.
+            let used = form
+                .iter()
+                .filter_map(|x| if let syscalls::X::A(j) = x { Some(*j) } else { None })
+                .max()
+                .map_or(0, |j| j + 1);
+            for (k, a) in given.iter().enumerate().skip(used) {
+                if !matches!(fr.consts.get(a), Some(0)) {
+                    return Err(format!(
+                        "aarch64: system call {} is rewritten to the *at form; argument {} is not the padding zero",
+                        nr,
+                        k + 1
+                    ));
+                }
+            }
+            if given.len() < used {
+                return Err(format!("aarch64: system call {} needs {} arguments", nr, used));
+            }
+            // Load the program's arguments first (they may be spilled
+            // anywhere), then the immediates; targets are fresh x0..x5 only.
+            for (k, x) in form.iter().enumerate() {
+                if let syscalls::X::A(j) = x {
+                    load_full(e, fr, SYS_REGS[k], given[*j]);
+                }
+            }
+            for (k, x) in form.iter().enumerate() {
+                if let syscalls::X::I(c) = x {
+                    imm_into(e, SYS_REGS[k], *c);
+                }
+            }
+            imm_into(e, "x8", n as i64);
+            e.line("svc #0");
+            if let Some(d) = i.dst {
+                store_dst(e, fr, d, "x0");
+            }
+            return Ok(());
+        }
         syscalls::A64::SetThreadPointer => unreachable!(),
         syscalls::A64::Missing(why) => {
             return Err(format!("aarch64: system call {} — {}", nr, why))

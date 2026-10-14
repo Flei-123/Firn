@@ -195,13 +195,17 @@
         } catch (e) {
             if (e instanceof Exit) run.exit_code = e.code;
             else { run.exit_code = 134; run.error = (e && e.stack) ? e.stack : String(e); }
-            return run;
+            // _start ends in exit(main's result): a clean exit(0) of a program that exports firn_mc_frame keeps the instance alive for the frame loop
+            if (!(run.exit_code === 0 && instance && instance.exports && typeof instance.exports.firn_mc_frame === 'function')) return run;
         }
         const x = instance.exports;
         if (typeof x.firn_mc_frame !== 'function') return run;   // one-shot program (gate 131 scenes)
 
         // ---- frame loop: requestAnimationFrame -> firn_mc_frame(ms) -> 0 = stop, else keep going ----
         run.loop = true;
+        // opts.timerLoop (tests): setTimeout instead of requestAnimationFrame -- headless Chromium with --virtual-time-budget starves rAF (4 callbacks in 30 s)
+        const sched = opts.timerLoop ? (f) => setTimeout(() => f(performance.now()), 0) : (f) => requestAnimationFrame(f);
+        const unsched = opts.timerLoop ? (id) => clearTimeout(id) : (id) => cancelAnimationFrame(id);
         let raf = 0, stopped = false;
         const guard = (f) => (...a) => {
             if (stopped) return;
@@ -214,7 +218,7 @@
             raf = 0;
             const r = x.firn_mc_frame(ms);
             run.frames++;
-            if (r !== 0 && !stopped) raf = requestAnimationFrame(tick);
+            if (r !== 0 && !stopped) raf = sched(tick);
             else stop();
         });
         const dprMilli = () => Math.round((window.devicePixelRatio || 1) * 1000);
@@ -228,12 +232,12 @@
         function stop() {
             if (stopped) return;
             stopped = true;
-            if (raf) cancelAnimationFrame(raf);
+            if (raf) unsched(raf);
             for (const c of cleanup) c();
             if (opts.onStop) opts.onStop(run);
         }
         run.stop = stop;
-        run.pump = () => { if (!raf && !stopped) raf = requestAnimationFrame(tick); };   // restart after a paused loop
+        run.pump = () => { if (!raf && !stopped) raf = sched(tick); };   // restart after a paused loop
 
         if (typeof ResizeObserver !== 'undefined') {
             const ro = new ResizeObserver(sendResize); ro.observe(canvas); cleanup.push(() => ro.disconnect());
@@ -276,7 +280,7 @@
             };
         }
         sendResize();
-        raf = requestAnimationFrame(tick);
+        raf = sched(tick);
         return run;
     }
 

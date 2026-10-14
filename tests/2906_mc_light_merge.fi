@@ -1,0 +1,137 @@
+// expect_exit: 0
+// update_light merging (1.14 - 1.16.5 partial packets): world_update_light -> Chunk.light. Later arrays replace earlier ones of
+// the same section bit, an empty bit drops the array, untouched bits stay; orphan column; hash = ascending bit, sky then block.
+import std.rt
+import std.bytes
+import mc.mc_lightpkt
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_version
+
+fn pat(a: usize, i: usize) -> u8 {
+    return (((a * 37 + i * 13 + 5) & 255) as u8)
+}
+
+fn put_arrays(b: *mut bytes.Bytes, first: usize, n: usize) {
+    var a: usize = 0
+    while a < n {
+        bytes.put_varint(b, 2048)
+        var i: usize = 0
+        while i < 2048 {
+            bytes.put_u8(b, pat(first + a, i))
+            i = i + 1
+        }
+        a = a + 1
+    }
+}
+
+// 1.16.5 shape: x z trustEdges sky block emptySky emptyBlock; arrays (sky first, then block)
+fn packet(b: *mut bytes.Bytes, x: i32, z: i32, sm: i32, bm: i32, es: i32, eb: i32, sky_first: usize, nsky: usize, block_first: usize, nblock: usize) {
+    bytes.put_varint(b, x)
+    bytes.put_varint(b, z)
+    bytes.put_bool(b, true)
+    bytes.put_varint(b, sm)
+    bytes.put_varint(b, bm)
+    bytes.put_varint(b, es)
+    bytes.put_varint(b, eb)
+    put_arrays(b, sky_first, nsky)
+    put_arrays(b, block_first, nblock)
+}
+
+const FNV_OFF: u64 = 14695981039346656037
+
+fn fnv_arr(h: u64, a: usize) -> u64 {
+    var x: u64 = h
+    var i: usize = 0
+    while i < 2048 {
+        x = (x ^ (pat(a, i) as u64)) *% 1099511628211 as u64
+        i = i + 1
+    }
+    return x
+}
+
+fn main() -> i32 {
+    var w: mc_world.World = mc_world.world_new()
+    let p: u64 = mc_chunk.chunk_alloc()
+    if p == 0 { return 1 }
+    let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+    (*c).x = 3
+    (*c).z = 0 - 2
+    if !mc_world.world_put(&w, p) { return 2 }
+    let cf: i32 = mc_version.CF_SECTIONS_114
+    // packet 1: sky bits 0,1,2 (arrays 0,1,2), block bit 1 (array 10)
+    var b1: bytes.Bytes = bytes.bytes_new()
+    packet(&b1, 3, 0 - 2, 7, 2, 0, 0, 0, 3, 10, 1)
+    bytes.bytes_set_pos(&b1, 0)
+    if mc_world.world_update_light(&w, cf, 754, &b1) != mc_world.ULIGHT_APPLIED { return 3 }
+    if (*c).sky_n != 3 || (*c).block_n != 1 { return 4 }
+    var h: u64 = FNV_OFF
+    h = fnv_arr(h, 0)
+    h = fnv_arr(h, 1)
+    h = fnv_arr(h, 2)
+    h = fnv_arr(h, 10)
+    if (*c).light_hash != h { return 5 }
+    // packet 2: sky bit 1 replaced (array 20), sky bit 2 declared empty, sky bit 5 new (array 21), block bit 0 new (array 30)
+    var b2: bytes.Bytes = bytes.bytes_new()
+    packet(&b2, 3, 0 - 2, 34 + 0, 1, 4, 0, 20, 2, 30, 1)
+    bytes.bytes_set_pos(&b2, 0)
+    if mc_world.world_update_light(&w, cf, 754, &b2) != mc_world.ULIGHT_APPLIED { return 6 }
+    // sky now: bit0 = 0, bit1 = 20, bit5 = 21; block: bit0 = 30, bit1 = 10
+    if (*c).sky_n != 3 || (*c).block_n != 2 { return 7 }
+    h = FNV_OFF
+    h = fnv_arr(h, 0)
+    h = fnv_arr(h, 20)
+    h = fnv_arr(h, 21)
+    h = fnv_arr(h, 30)
+    h = fnv_arr(h, 10)
+    if (*c).light_hash != h { return 8 }
+    let ld: *mut mc_lightpkt.LightData = (*c).light as *mut mc_lightpkt.LightData
+    if (*ld).sky_mask != 35 as u64 || (*ld).block_mask != 3 as u64 || (*ld).empty_sky != 4 as u64 { return 9 }
+    // orphan column
+    var b3: bytes.Bytes = bytes.bytes_new()
+    packet(&b3, 9, 9, 1, 0, 0, 0, 0, 1, 0, 0)
+    bytes.bytes_set_pos(&b3, 0)
+    if mc_world.world_update_light(&w, cf, 754, &b3) != mc_world.ULIGHT_ORPHAN { return 10 }
+    // truncated packet: bad, state unchanged
+    var b4: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&b4, 3)
+    bytes.put_varint(&b4, 0 - 2)
+    bytes.put_bool(&b4, false)
+    bytes.put_varint(&b4, 1)
+    bytes.put_varint(&b4, 0)
+    bytes.put_varint(&b4, 0)
+    bytes.put_varint(&b4, 0)
+    bytes.put_varint(&b4, 2048)
+    bytes.put_zero(&b4, 50)
+    bytes.bytes_set_pos(&b4, 0)
+    if mc_world.world_update_light(&w, cf, 735, &b4) != mc_world.ULIGHT_BAD { return 11 }
+    if (*c).light_hash != h { return 12 }
+    // old chunk formats are ignored
+    if mc_world.world_update_light(&w, mc_version.CF_SECTIONS_19, 340, &b4) != mc_world.ULIGHT_IGNORED { return 13 }
+    // 1.18+ shape on the same machinery: counted masks with position (x z, 4 long arrays, counts)
+    var b5: bytes.Bytes = bytes.bytes_new()
+    bytes.put_varint(&b5, 3)
+    bytes.put_varint(&b5, 0 - 2)
+    bytes.put_varint(&b5, 1)
+    bytes.put_i64(&b5, 4 as i64)   // sky mask: bit 2
+    bytes.put_varint(&b5, 1)
+    bytes.put_i64(&b5, 0 as i64)   // block mask
+    bytes.put_varint(&b5, 1)
+    bytes.put_i64(&b5, 0 as i64)
+    bytes.put_varint(&b5, 1)
+    bytes.put_i64(&b5, 0 as i64)
+    bytes.put_varint(&b5, 1)
+    put_arrays(&b5, 40, 1)
+    bytes.put_varint(&b5, 0)
+    bytes.bytes_set_pos(&b5, 0)
+    if mc_world.world_update_light(&w, mc_version.CF_CONTAINERS_118, 763, &b5) != mc_world.ULIGHT_APPLIED { return 14 }
+    if (*ld).sky_mask != 39 as u64 || (*ld).sky_n != 4 { return 15 }
+    if (*c).light_hash != h { return 16 } // 1.18+: the map_chunk hash is left alone
+    bytes.bytes_free(&b1)
+    bytes.bytes_free(&b2)
+    bytes.bytes_free(&b3)
+    bytes.bytes_free(&b4)
+    bytes.bytes_free(&b5)
+    mc_world.world_free(&w)
+    return 0
+}
