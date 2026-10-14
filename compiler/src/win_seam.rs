@@ -1741,10 +1741,10 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
             let out: *mut i64 = a2 as *mut i64
             if __win_tlsset == 0 {
                 *out = 0
-                return 0
+                return 1
             }
             *out = TlsGetValue(__win_tlsidx as i64)
-            return 0
+            return 1
         }
         if a1 != 4098 {
             return 0 - 22

@@ -4683,13 +4683,23 @@ fn __gc_threads_scan() {
             if z != Z_DEAD {
                 let sp: u64 = __gc_ld64(t + FT_SP)
                 let bottom: u64 = __gc_ld64(t + FT_BOTTOM)
-                if sp != 0 && bottom > sp {
+                // A host thread that ended without `thread_host_detach` leaves its entry behind and the host
+                // frees the stack: scanning that range would fault. madvise(MADV_NORMAL) says ENOMEM for it.
+                if sp != 0 && bottom > sp && (__gc_ld64(t + FT_HOST) != 1 || __thread_stack_mapped(sp, bottom)) {
                     __gc_scan(sp, bottom)
                 }
             }
         }
         i = i + 1
     }
+}
+
+// Is [sp, bottom) still mapped? Only an explicit ENOMEM (-12) says no; a target without madvise answers
+// something else (Windows seam: ENOSYS) and counts as mapped.
+fn __thread_stack_mapped(sp: u64, bottom: u64) -> bool {
+    let lo: u64 = sp - sp % 4096
+    let r: i64 = syscall(28, lo as i64, (bottom - lo) as i64, 0, 0, 0, 0)
+    return r != 0 - 12
 }
 
 // -------------------------------------------------------- The thread table
@@ -4992,8 +5002,18 @@ fn thread_attach() -> bool {
 // Does the calling thread have a thread block of its own? true also when the target cannot tell (aarch64 `.so`).
 fn __thread_known() -> bool {
     var v: u64 = 0
-    syscall(SYS_ARCH_PRCTL, ARCH_GET_TCB, (&v) as u64 as i64, 0, 0, 0, 0)
-    return v != 0
+    let r: i64 = syscall(SYS_ARCH_PRCTL, ARCH_GET_TCB, (&v) as u64 as i64, 0, 0, 0, 0)
+    if v == 0 {
+        return false
+    }
+    // aarch64 `.so` answers all-ones ("cannot tell"); the Windows seam answers 1 (a TLS slot, never inherited).
+    let cant_tell: i64 = 0 - 1
+    if (v as i64) == cant_tell || r == 1 {
+        return true
+    }
+    // x86-64: fs/gs is INHERITED by a new thread (clone without CLONE_SETTLS for gs): a pthread created by an attached
+    // thread starts with its creator's block. The block is its own only when it carries this thread's id.
+    return __gc_ld32(v + FT_TID) as u64 == __thread_gettid()
 }
 
 // Entry of a host thread that vanished without `thread_host_detach` (called with a stale entry, not the caller's own).

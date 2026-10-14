@@ -121,6 +121,13 @@ pub const ATTRS: &[AttrInfo] = &[
         what: "make a Firn function callable under its bare name from C (SPEC 14.5)",
     },
     AttrInfo {
+        name: "no_host_guard",
+        target: Target::Func,
+        args: 0,
+        implemented: true,
+        what: "#[export_c] of a shared object: skip the entry guard that attaches an unattached host thread (r506); for exports that attach/detach themselves or sit on a hot path",
+    },
+    AttrInfo {
         name: "inline",
         target: Target::Func,
         args: 0,
@@ -330,6 +337,7 @@ mod tests {
                 "link_lib",
                 "win_callback",
                 "export_c",
+                "no_host_guard",
                 "inline",
                 "no_inline",
                 "allow_escape",

@@ -2630,6 +2630,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         && crate::gc::runtime_active()
         && crate::extfn::export_link_name(&d.name).is_some()
         && !d.name.starts_with("thread_host_guard")
+        && !d.attrs.iter().any(|a| a.name == "no_host_guard")
     {
         let tok = lo.push(FTy::I64, Op::Call { name: "thread_host_guard".to_string(), args: vec![] });
         let slot = lo.alloca(8, 8);
