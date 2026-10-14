@@ -47,7 +47,7 @@ export {
     glbe_gl, glbe_renderer, glbe_draws, glbe_tris, glbe_resize, glbe_fbo_texture,
     MODE_LEGACY, MODE_POOL, MODE_MULTI, MODE_INDIRECT,
     glbe_set_mode, glbe_mode, glbe_set_page_verts, glbe_set_upload_budget, glbe_set_filter, glbe_defrag,
-    glbe_max_layers, glbe_layers_lost, glbe_set_layer_limit, glbe_atlas_pages, glbe_calls, glbe_upload_bytes, glbe_frame_upload_bytes, glbe_staged, glbe_pages, glbe_pool_used_bytes,
+    glbe_max_layers, glbe_layers_lost, glbe_set_layer_limit, glbe_atlas_pages, glbe_calls, glbe_tris_submitted, glbe_set_facecull, glbe_upload_bytes, glbe_frame_upload_bytes, glbe_staged, glbe_pages, glbe_pool_used_bytes,
     glbe_pool_cap_bytes, glbe_pool_frag_permille, glbe_defrags, glbe_reset_stats, glbe_flush_uploads,
     // scene layer (lib/gpu/gl_scene.fi): extra passes around the Backend table, MSAA, resolve
     glbe_x, glbe_near, glbe_rebind, glbe_flush, glbe_bind_draw, glbe_set_msaa, glbe_msaa, glbe_resolve, glbe_width, glbe_height, glbe_camera_rv,
@@ -68,7 +68,7 @@ const MAX_PAGE_VERTS: usize = 1048576 // later pages grow x4 up to 8 MB + 6 MB
 const NONE: usize = 0xFFFFFFFFFFFFFFFF as usize
 
 // mesh slot (words): vao, vbo, ibo (legacy only), nidx, used, key, page, voff, ioff, nverts, staged, stage_v, stage_i, scratch, stamp
-const SLOT_WORDS: usize = 15
+const SLOT_WORDS: usize = 20
 const S_VAO: usize = 0
 const S_VBO: usize = 1
 const S_IBO: usize = 2
@@ -84,6 +84,9 @@ const S_SV: usize = 11
 const S_SI: usize = 12
 const S_OLDI: usize = 13 // defrag scratch: old index offset
 const S_STAMP: usize = 14 // batch number of the last collected draw (a slot drawn twice in one batch splits the batch)
+const S_BK: usize = 15 // 1 = the indices are sorted by face direction (glbe_set_facecull), S_BKE.. hold the bucket ends
+const S_BKE: usize = 16 // 4 words: bucket ends (index counts, 7 buckets: faces -x +x -y +y -z +z, other), 2 x u32 per word
+const FB_N: usize = 7
 
 // page (words): vbo, ibo, vao, vertex pool, index pool, granule buffer, granule texture, granule CPU copy, vcap, icap, live
 const PAGE_WORDS: usize = 12
@@ -179,6 +182,9 @@ struct GlBackend {
     sc_offs: u64, // scratch: u64 per draw (byte offset into the index buffer)
     sc_bv: u64, // scratch: i32 per draw (base vertex); indirect: 5 x u32 per draw
     ind_buf: u32,
+    facecull: bool, // sort the indices of opaque meshes by face direction; draw only the directions that can face the camera
+    up_keep: bool, // the next uploads keep their index order (MESH_TRANS)
+    tris_sub: u64, // triangles really submitted (after the face buckets), glbe_tris_submitted
     batch: u64, // batch counter (see S_STAMP)
     // ---- textures
     mip: bool,
@@ -206,7 +212,7 @@ fn empty(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
         slots: 0, slot_cap: 0, pix: 0, tmp: 0, fresh: false, draws: 0, tris: 0, calls: 0, log: [0; 512],
         mode: MODE_MULTI, page_verts: DEFAULT_PAGE_VERTS, pages: 0, npages: 0, page_cap: 0, cur_vao: 0 as u32, defrags: 0,
         org_cpu: 0, org_buf: 0 as u32, org_tex: 0 as u32, org_cap: 0, org_max: 0, pend: 0, pend_n: 0, pend_cap: 0,
-        sc_counts: 0, sc_offs: 0, sc_bv: 0, ind_buf: 0 as u32, batch: 1 as u64, mip: false, aniso: 1.0, budget: 0, staged: 0,
+        sc_counts: 0, sc_offs: 0, sc_bv: 0, ind_buf: 0 as u32, facecull: false, up_keep: false, tris_sub: 0 as u64, batch: 1 as u64, mip: false, aniso: 1.0, budget: 0, staged: 0,
         up_bytes: 0, frame_up: 0, x: gl_ext.glx_new(), xok: false, msaa: 0,
         mt: gl_fbo.Target { ok: false, w: w, h: h, n_color: 1, depth_mode: gl_fbo.DEPTH_RENDERBUFFER, samples: 0, fbo: 0 as u32,
             rfbo: 0 as u32, color: [0 as u32; 4], msrb: [0 as u32; 4], depth_tex: 0 as u32, depth_rb: 0 as u32 }, dirty: false }
@@ -287,6 +293,23 @@ fn glbe_tris(gb: *mut GlBackend) -> u64 {
 }
 
 // GL draw calls really issued (MODE_MULTI: one per page and frame; LEGACY / POOL: one per section).
+// Triangles really handed to GL (with glbe_set_facecull: only the face directions that can face the camera).
+fn glbe_tris_submitted(gb: *mut GlBackend) -> u64 {
+    return (*gb).tris_sub
+}
+
+// Face buckets (MODE_MULTI / MODE_INDIRECT, GL back-face culling on): opaque meshes uploaded afterwards are sorted by face direction
+// (stable) and a section draws only the directions whose face plane the camera is in front of. The image is the same as
+// with GL back-face culling (those triangles would be culled anyway), the vertex shader and the setup skip them. Off by default.
+fn glbe_set_facecull(gb: *mut GlBackend, on: bool) {
+    (*gb).facecull = on
+}
+
+fn be_mesh_class(o: u64, c: i32) {
+    let gb: *mut GlBackend = o as *mut GlBackend
+    (*gb).up_keep = c != 0
+}
+
 fn glbe_calls(gb: *mut GlBackend) -> u64 {
     return (*gb).calls
 }
@@ -315,6 +338,7 @@ fn glbe_defrags(gb: *mut GlBackend) -> u64 {
 
 fn glbe_reset_stats(gb: *mut GlBackend) {
     (*gb).draws = 0 as u64
+    (*gb).tris_sub = 0 as u64
     (*gb).tris = 0 as u64
     (*gb).calls = 0 as u64
     (*gb).up_bytes = 0 as u64
@@ -516,9 +540,9 @@ fn glbe_close(gb: *mut GlBackend) {
     }
     if (*gb).pend != 0 {
         rt.heap_free((*gb).pend, (*gb).pend_cap * 8)
-        rt.heap_free((*gb).sc_counts, (*gb).pend_cap * 4)
-        rt.heap_free((*gb).sc_offs, (*gb).pend_cap * 8)
-        rt.heap_free((*gb).sc_bv, (*gb).pend_cap * 20)
+        rt.heap_free((*gb).sc_counts, (*gb).pend_cap * FB_N * 4)
+        rt.heap_free((*gb).sc_offs, (*gb).pend_cap * FB_N * 8)
+        rt.heap_free((*gb).sc_bv, (*gb).pend_cap * FB_N * 20)
     }
     (*gb).pix = 0
     (*gb).tmp = 0
@@ -1018,6 +1042,91 @@ fn upload_block(gb: *mut GlBackend, s: usize, verts: u64, idx: u64) {
     (*gb).frame_up = (*gb).frame_up + bytes
 }
 
+// Stable counting sort of the triangles by the face direction of their first vertex (mc_mesh face 0..5, 6/7 = other -> bucket 6).
+// Returns a new index array (caller frees nidx * 4 bytes) and stores the 7 bucket ends in the slot; 0 = no allocation.
+fn sort_by_face(gb: *mut GlBackend, s: usize, verts: u64, nverts: usize, idx: u64, nidx: usize) -> u64 {
+    let out: u64 = rt.heap_alloc(nidx * 4)
+    if out == 0 {
+        return 0
+    }
+    let cnt: u64 = rt.heap_alloc(FB_N * 8 * 2)
+    var k: usize = 0
+    while k < FB_N * 2 {
+        rt.st64(cnt, k, 0 as u64)
+        k = k + 1
+    }
+    let ntri: usize = nidx / 3
+    var t: usize = 0
+    while t < ntri {
+        let vi: usize = rt.ld32(idx, t * 3) as usize
+        var f: usize = 6
+        if vi < nverts {
+            let fc: usize = ((rt.ld32(verts, vi * 2) >> 24 as u32) & 7 as u32) as usize
+            if fc < 6 {
+                f = fc
+            }
+        }
+        rt.st64(cnt, f, rt.ld64(cnt, f) + 1 as u64)
+        t = t + 1
+    }
+    // cnt[0..6] = counts, cnt[7..13] = write cursors (in triangles), the bucket ends go to the slot
+    var acc: usize = 0
+    k = 0
+    while k < FB_N {
+        rt.st64(cnt, FB_N + k, acc as u64)
+        acc = acc + (rt.ld64(cnt, k) as usize)
+        rt.st64(cnt, k, acc as u64) // end (triangles)
+        k = k + 1
+    }
+    t = 0
+    while t < ntri {
+        let vi: usize = rt.ld32(idx, t * 3) as usize
+        var f: usize = 6
+        if vi < nverts {
+            let fc: usize = ((rt.ld32(verts, vi * 2) >> 24 as u32) & 7 as u32) as usize
+            if fc < 6 {
+                f = fc
+            }
+        }
+        let w: usize = rt.ld64(cnt, FB_N + f) as usize
+        rt.st64(cnt, FB_N + f, (w + 1) as u64)
+        rt.st32(out, w * 3, rt.ld32(idx, t * 3))
+        rt.st32(out, w * 3 + 1, rt.ld32(idx, t * 3 + 1))
+        rt.st32(out, w * 3 + 2, rt.ld32(idx, t * 3 + 2))
+        t = t + 1
+    }
+    let b: usize = s * SLOT_WORDS
+    rt.st64((*gb).slots, b + S_BK, 1 as u64)
+    var e: usize = 0
+    while e < 4 {
+        let lo: u64 = if e * 2 < FB_N { rt.ld64(cnt, e * 2) * 3 as u64 } else { 0 as u64 }
+        let hi: u64 = if e * 2 + 1 < FB_N { rt.ld64(cnt, e * 2 + 1) * 3 as u64 } else { 0 as u64 }
+        rt.st64((*gb).slots, b + S_BKE + e, lo | (hi << 32 as u64))
+        e = e + 1
+    }
+    rt.heap_free(cnt, FB_N * 8 * 2)
+    return out
+}
+
+fn bk_end(gb: *mut GlBackend, b: usize, k: usize) -> usize {
+    let w: u64 = rt.ld64((*gb).slots, b + S_BKE + k / 2)
+    if k % 2 == 0 {
+        return (w & 4294967295 as u64) as usize
+    }
+    return (w >> 32 as u64) as usize
+}
+
+// Face direction k (0..5) can face a camera at (-rx, -ry, -rz) relative to the section corner (rx = corner - camera)? Conservative by 1/100 block.
+fn bk_visible(k: usize, rx: f64, ry: f64, rz: f64) -> bool {
+    if k == 0 { return rx + 16.0 > 0.0 - 0.01 }
+    if k == 1 { return rx < 0.01 }
+    if k == 2 { return ry + 16.0 > 0.0 - 0.01 }
+    if k == 3 { return ry < 0.01 }
+    if k == 4 { return rz + 16.0 > 0.0 - 0.01 }
+    if k == 5 { return rz < 0.01 }
+    return true
+}
+
 fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize) -> usize {
     let gb: *mut GlBackend = o as *mut GlBackend
     let s: usize = alloc_slot(gb)
@@ -1064,23 +1173,37 @@ fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize)
         rt.st64((*gb).slots, b + S_USED, 0 as u64)
         return 0
     }
+    var uidx: u64 = idx
+    var sorted: u64 = 0
+    if (*gb).facecull && !(*gb).up_keep && (*gb).mode >= MODE_MULTI && nidx % 3 == 0 {
+        sorted = sort_by_face(gb, s, verts, nverts, idx, nidx)
+        if sorted != 0 {
+            uidx = sorted
+        }
+    }
     if (*gb).budget > 0 {
         // stage the bytes on the CPU; begin uploads them within the per-frame budget
         let sv: u64 = rt.heap_alloc(nverts * 8)
         let si: u64 = rt.heap_alloc(nidx * 4)
         if sv != 0 && si != 0 {
             rt.mem_copy(sv, verts, nverts * 8)
-            rt.mem_copy(si, idx, nidx * 4)
+            rt.mem_copy(si, uidx, nidx * 4)
             rt.st64((*gb).slots, b + S_SV, sv)
             rt.st64((*gb).slots, b + S_SI, si)
             rt.st64((*gb).slots, b + S_STAGED, 1 as u64)
             (*gb).staged = (*gb).staged + 1
+            if sorted != 0 {
+                rt.heap_free(sorted, nidx * 4)
+            }
             return s + 1
         }
         if sv != 0 { rt.heap_free(sv, nverts * 8) }
         if si != 0 { rt.heap_free(si, nidx * 4) }
     }
-    upload_block(gb, s, verts, idx)
+    upload_block(gb, s, verts, uidx)
+    if sorted != 0 {
+        rt.heap_free(sorted, nidx * 4)
+    }
     return s + 1
 }
 
@@ -1183,15 +1306,15 @@ fn ensure_pend(gb: *mut GlBackend) {
     }
     let ncap: usize = (*gb).pend_cap * 2 + 256
     let np: u64 = rt.heap_alloc(ncap * 8)
-    let nc: u64 = rt.heap_alloc(ncap * 4)
-    let no: u64 = rt.heap_alloc(ncap * 8)
-    let nb: u64 = rt.heap_alloc(ncap * 20)
+    let nc: u64 = rt.heap_alloc(ncap * FB_N * 4)
+    let no: u64 = rt.heap_alloc(ncap * FB_N * 8)
+    let nb: u64 = rt.heap_alloc(ncap * FB_N * 20)
     if (*gb).pend != 0 {
         rt.mem_copy(np, (*gb).pend, (*gb).pend_n * 8)
         rt.heap_free((*gb).pend, (*gb).pend_cap * 8)
-        rt.heap_free((*gb).sc_counts, (*gb).pend_cap * 4)
-        rt.heap_free((*gb).sc_offs, (*gb).pend_cap * 8)
-        rt.heap_free((*gb).sc_bv, (*gb).pend_cap * 20)
+        rt.heap_free((*gb).sc_counts, (*gb).pend_cap * FB_N * 4)
+        rt.heap_free((*gb).sc_offs, (*gb).pend_cap * FB_N * 8)
+        rt.heap_free((*gb).sc_bv, (*gb).pend_cap * FB_N * 20)
     }
     (*gb).pend = np
     (*gb).sc_counts = nc
@@ -1540,23 +1663,60 @@ fn flush_batch(gb: *mut GlBackend) {
             let s: usize = rt.ld64((*gb).pend, k) as usize
             let b: usize = s * SLOT_WORDS
             if rt.ld64((*gb).slots, b + S_PAGE) == p as u64 {
-                let cnt: u32 = rt.ld64((*gb).slots, b + S_NIDX) as u32
-                let io: u32 = rt.ld64((*gb).slots, b + S_IOFF) as u32
+                var cnt: u32 = rt.ld64((*gb).slots, b + S_NIDX) as u32
+                var io: u32 = rt.ld64((*gb).slots, b + S_IOFF) as u32
                 let vo: u32 = rt.ld64((*gb).slots, b + S_VOFF) as u32
-                if (*gb).mode == MODE_INDIRECT {
-                    // command: count, instance count, first index, base vertex, base instance
-                    let c: u64 = (*gb).sc_bv + (n * 20) as u64
-                    rt.st32(c, 0, cnt)
-                    rt.st32(c, 1, 1 as u32)
-                    rt.st32(c, 2, io)
-                    rt.st32(c, 3, vo)
-                    rt.st32(c, 4, 0 as u32)
-                } else {
-                    rt.st32((*gb).sc_counts, n, cnt)
-                    rt.st64((*gb).sc_offs, n, (io as u64) * (4 as u64))
-                    rt.st32((*gb).sc_bv, n, vo)
+                var nr: usize = 1 // ranges of this section (face buckets: up to FB_N)
+                var rn: [u32; 8] = [0 as u32; 8]
+                var rc: [u32; 8] = [0 as u32; 8]
+                rn[0] = io
+                rc[0] = cnt
+                if rt.ld64((*gb).slots, b + S_BK) != 0 as u64 && (*gb).cull {
+                    let q: u64 = (*gb).org_cpu + (s * 16) as u64
+                    let rx: f64 = (*(q as *mut f32)) as f64
+                    let ry: f64 = (*((q + 4 as u64) as *mut f32)) as f64
+                    let rz: f64 = (*((q + 8 as u64) as *mut f32)) as f64
+                    nr = 0
+                    var kb: usize = 0
+                    var prev_end: usize = 0
+                    while kb < FB_N {
+                        let be: usize = bk_end(gb, b, kb)
+                        if be > prev_end && bk_visible(kb, rx, ry, rz) {
+                            let st: u32 = io + (prev_end as u32)
+                            let ln: u32 = (be - prev_end) as u32
+                            if nr > 0 && rn[nr - 1] + rc[nr - 1] == st {
+                                rc[nr - 1] = rc[nr - 1] + ln
+                            } else {
+                                rn[nr] = st
+                                rc[nr] = ln
+                                nr = nr + 1
+                            }
+                        }
+                        prev_end = be
+                        kb = kb + 1
+                    }
                 }
-                n = n + 1
+                var ri: usize = 0
+                while ri < nr {
+                    cnt = rc[ri]
+                    io = rn[ri]
+                    (*gb).tris_sub = (*gb).tris_sub + ((cnt / 3 as u32) as u64)
+                    if (*gb).mode == MODE_INDIRECT {
+                        // command: count, instance count, first index, base vertex, base instance
+                        let c: u64 = (*gb).sc_bv + (n * 20) as u64
+                        rt.st32(c, 0, cnt)
+                        rt.st32(c, 1, 1 as u32)
+                        rt.st32(c, 2, io)
+                        rt.st32(c, 3, vo)
+                        rt.st32(c, 4, 0 as u32)
+                    } else {
+                        rt.st32((*gb).sc_counts, n, cnt)
+                        rt.st64((*gb).sc_offs, n, (io as u64) * (4 as u64))
+                        rt.st32((*gb).sc_bv, n, vo)
+                    }
+                    n = n + 1
+                    ri = ri + 1
+                }
             }
             k = k + 1
         }
@@ -1626,5 +1786,6 @@ fn glbe_backend(gb: *mut GlBackend) -> mc_backend.Backend {
     b.set_pass = be_set_pass
     b.set_light = be_set_light
     b.set_fade = be_set_fade
+    b.mesh_class = be_mesh_class
     return b
 }

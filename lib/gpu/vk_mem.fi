@@ -1,0 +1,799 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/vk_mem.fi -- gpu.vk_mem: Vulkan memory allocator with suballocation + the extension function table of the voxel
+// renderer (docs/VK-RENDERER.md). vk.fi stays the probe (instance, device, queue); this file adds what a renderer needs on top:
+//
+//     var x: vk_mem.X = vk_mem.x_new()
+//     vk_mem.x_open(&x, &v)                                  // function table through vkGetInstanceProcAddr, limits
+//     var b: vk_mem.Buf = vk_mem.buf_make(&x, 65536, vk_mem.U_VERTEX | vk_mem.U_DST, vk_mem.MEM_DEVICE)
+//     var s: vk_mem.Buf = vk_mem.buf_make(&x, 65536, vk_mem.U_SRC, vk_mem.MEM_STAGING)    // s.ptr = mapped
+//     vk_mem.buf_free(&x, &b)
+//
+// The driver limits the NUMBER of vkAllocateMemory calls (maxMemoryAllocationCount, 4096 is the Vulkan minimum), so every buffer and
+// image is bound into a big block (64 MB, bigger for bigger requests) at an aligned offset; a first-fit free list per block
+// (sorted ranges, coalescing) hands the space back. Linear resources (buffers) and optimal images live in SEPARATE blocks, so
+// bufferImageGranularity never matters. Blocks of host visible memory are mapped once.
+// THREADS: main thread only (like vk.fi). Struct offsets are x86_64 / Vulkan 1.0 headers.
+
+import std.rt
+import std.dynlib
+import gpu.vk
+
+export {
+    X, Alloc, Buf, Img, x_new, x_open, x_close, alloc_none, buf_none, img_none,
+    mem_alloc, mem_free, buf_make, buf_free, img_make, img_free, mem_stats, x_idle,
+    cx, w32, w64, wf, r32, r64, good, xsa, xcstr, xfn,
+    MEM_DEVICE, MEM_STAGING, MEM_UPLOAD, U_SRC, U_DST, U_UNIFORM, U_INDEX, U_VERTEX, BLOCK_SIZE,
+    X_ALLOC_MEM, X_FREE_MEM, X_MAP, X_UNMAP, X_CREATE_BUFFER, X_DESTROY_BUFFER, X_BUF_REQ, X_BIND_BUF, X_CREATE_IMAGE,
+    X_DESTROY_IMAGE, X_IMG_REQ, X_BIND_IMG, X_CREATE_VIEW, X_DESTROY_VIEW, X_CREATE_SAMPLER, X_DESTROY_SAMPLER,
+    X_CREATE_DSL, X_DESTROY_DSL, X_CREATE_DPOOL, X_DESTROY_DPOOL, X_ALLOC_DSETS, X_UPDATE_DSETS, X_CREATE_PLAYOUT,
+    X_DESTROY_PLAYOUT, X_CREATE_SHADER, X_DESTROY_SHADER, X_CREATE_GPIPE, X_DESTROY_PIPE, X_CREATE_RP, X_DESTROY_RP,
+    X_CREATE_FB, X_DESTROY_FB, X_CREATE_CPOOL, X_DESTROY_CPOOL, X_ALLOC_CMD, X_FREE_CMD, X_BEGIN_CMD, X_END_CMD, X_RESET_CMD,
+    X_CMD_BEGIN_RP, X_CMD_END_RP, X_CMD_BIND_PIPE, X_CMD_BIND_VB, X_CMD_BIND_IB, X_CMD_BIND_DS, X_CMD_PUSH, X_CMD_DRAW_IDX,
+    X_CMD_SET_VP, X_CMD_SET_SC, X_CMD_COPY_BUF, X_CMD_COPY_B2I, X_CMD_COPY_I2B, X_CMD_BARRIER, X_CREATE_FENCE,
+    X_DESTROY_FENCE, X_WAIT_FENCES, X_RESET_FENCES, X_GET_FENCE, X_CREATE_SEM, X_DESTROY_SEM, X_SUBMIT, X_QWAIT, X_DEV_WAIT,
+    X_PHYS_PROPS, X_FLUSH_RANGES,
+}
+
+const SCRATCH: usize = 32768
+const BLOCK_SIZE: u64 = 67108864 // 64 MB
+const MAX_BLOCKS: usize = 256
+const BLK_WORDS: usize = 9
+const B_MEM: usize = 0
+const B_TYPE: usize = 1
+const B_SIZE: usize = 2
+const B_PTR: usize = 3 // mapped base (host visible) or 0
+const B_RANGES: usize = 4 // heap pointer: (offset, size) u64 pairs, sorted by offset
+const B_NR: usize = 5
+const B_FREE: usize = 6 // free bytes
+const B_KIND: usize = 7 // 0 = linear (buffers), 1 = optimal images
+const B_USED: usize = 8 // 1 = block exists
+const RANGE_CAP: usize = 2048
+
+const MEM_DEVICE: u64 = 1 // DEVICE_LOCAL (falls back to any type when there is none)
+const MEM_STAGING: u64 = 6 // HOST_VISIBLE | HOST_COHERENT
+const MEM_UPLOAD: u64 = 7 // DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT (resizable BAR / unified memory), falls back to MEM_STAGING
+
+const U_SRC: u64 = 0x1 // TRANSFER_SRC
+const U_DST: u64 = 0x2 // TRANSFER_DST
+const U_UNIFORM: u64 = 0x10
+const U_INDEX: u64 = 0x40
+const U_VERTEX: u64 = 0x80
+
+// function table indices
+const X_ALLOC_MEM: usize = 0
+const X_FREE_MEM: usize = 1
+const X_MAP: usize = 2
+const X_UNMAP: usize = 3
+const X_CREATE_BUFFER: usize = 4
+const X_DESTROY_BUFFER: usize = 5
+const X_BUF_REQ: usize = 6
+const X_BIND_BUF: usize = 7
+const X_CREATE_IMAGE: usize = 8
+const X_DESTROY_IMAGE: usize = 9
+const X_IMG_REQ: usize = 10
+const X_BIND_IMG: usize = 11
+const X_CREATE_VIEW: usize = 12
+const X_DESTROY_VIEW: usize = 13
+const X_CREATE_SAMPLER: usize = 14
+const X_DESTROY_SAMPLER: usize = 15
+const X_CREATE_DSL: usize = 16
+const X_DESTROY_DSL: usize = 17
+const X_CREATE_DPOOL: usize = 18
+const X_DESTROY_DPOOL: usize = 19
+const X_ALLOC_DSETS: usize = 20
+const X_UPDATE_DSETS: usize = 21
+const X_CREATE_PLAYOUT: usize = 22
+const X_DESTROY_PLAYOUT: usize = 23
+const X_CREATE_SHADER: usize = 24
+const X_DESTROY_SHADER: usize = 25
+const X_CREATE_GPIPE: usize = 26
+const X_DESTROY_PIPE: usize = 27
+const X_CREATE_RP: usize = 28
+const X_DESTROY_RP: usize = 29
+const X_CREATE_FB: usize = 30
+const X_DESTROY_FB: usize = 31
+const X_CREATE_CPOOL: usize = 32
+const X_DESTROY_CPOOL: usize = 33
+const X_ALLOC_CMD: usize = 34
+const X_FREE_CMD: usize = 35
+const X_BEGIN_CMD: usize = 36
+const X_END_CMD: usize = 37
+const X_RESET_CMD: usize = 38
+const X_CMD_BEGIN_RP: usize = 39
+const X_CMD_END_RP: usize = 40
+const X_CMD_BIND_PIPE: usize = 41
+const X_CMD_BIND_VB: usize = 42
+const X_CMD_BIND_IB: usize = 43
+const X_CMD_BIND_DS: usize = 44
+const X_CMD_PUSH: usize = 45
+const X_CMD_DRAW_IDX: usize = 46
+const X_CMD_SET_VP: usize = 47
+const X_CMD_SET_SC: usize = 48
+const X_CMD_COPY_BUF: usize = 49
+const X_CMD_COPY_B2I: usize = 50
+const X_CMD_COPY_I2B: usize = 51
+const X_CMD_BARRIER: usize = 52
+const X_CREATE_FENCE: usize = 53
+const X_DESTROY_FENCE: usize = 54
+const X_WAIT_FENCES: usize = 55
+const X_RESET_FENCES: usize = 56
+const X_GET_FENCE: usize = 57
+const X_CREATE_SEM: usize = 58
+const X_DESTROY_SEM: usize = 59
+const X_SUBMIT: usize = 60
+const X_QWAIT: usize = 61
+const X_DEV_WAIT: usize = 62
+const X_PHYS_PROPS: usize = 63
+const X_FLUSH_RANGES: usize = 64
+const X_COUNT: usize = 72
+
+struct X {
+    ok: bool,
+    step: i32, // 0 ok, 1 = a function is missing
+    ft: u64,
+    scratch: u64,
+    top: usize,
+    inst: u64,
+    dev: u64,
+    phys: u64,
+    queue: u64,
+    qfam: u64,
+    mprops: u64,
+    blocks: u64, // MAX_BLOCKS * BLK_WORDS u64
+    nblocks: usize,
+    max_layers: u64, // limits.maxImageArrayLayers
+    max_dim: u64, // limits.maxImageDimension2D
+    max_alloc: u64, // limits.maxMemoryAllocationCount
+    max_push: u64, // limits.maxPushConstantsSize
+    max_ubo: u64, // limits.maxUniformBufferRange
+    n_allocs: u64, // vkAllocateMemory calls made
+    live_bytes: u64, // bytes handed out
+    block_bytes: u64, // bytes of all blocks
+    fallbacks: u64, // allocations that had to relax the wanted memory properties
+    dev_name: u64,
+}
+
+struct Alloc {
+    ok: bool,
+    blk: usize,
+    off: u64,
+    size: u64,
+    mem: u64, // VkDeviceMemory of the block
+    ptr: u64, // mapped pointer at `off` (0 = not host visible)
+}
+
+struct Buf {
+    ok: bool,
+    buf: u64,
+    a: Alloc,
+    size: u64,
+    ptr: u64, // mapped (host visible memory only)
+}
+
+struct Img {
+    ok: bool,
+    img: u64,
+    view: u64,
+    a: Alloc,
+    w: u32,
+    h: u32,
+    layers: u32,
+    fmt: u32,
+}
+
+fn x_new() -> X {
+    return X { ok: false, step: 0, ft: 0, scratch: 0, top: 0, inst: 0, dev: 0, phys: 0, queue: 0, qfam: 0, mprops: 0, blocks: 0,
+        nblocks: 0, max_layers: 0, max_dim: 0, max_alloc: 0, max_push: 0, max_ubo: 0, n_allocs: 0, live_bytes: 0, block_bytes: 0,
+        fallbacks: 0, dev_name: 0 }
+}
+
+fn alloc_none() -> Alloc {
+    return Alloc { ok: false, blk: 0, off: 0, size: 0, mem: 0, ptr: 0 }
+}
+
+fn buf_none() -> Buf {
+    return Buf { ok: false, buf: 0, a: alloc_none(), size: 0, ptr: 0 }
+}
+
+fn img_none() -> Img {
+    return Img { ok: false, img: 0, view: 0, a: alloc_none(), w: 0 as u32, h: 0 as u32, layers: 0 as u32, fmt: 0 as u32 }
+}
+
+// ---- raw access ----------------------------------------------------------------------------------------------------
+fn w32(p: u64, off: usize, x: u64) {
+    rt.st32(p, off / 4, x as u32)
+}
+
+fn w64(p: u64, off: usize, x: u64) {
+    rt.st64(p, off / 8, x)
+}
+
+fn wf(p: u64, off: usize, x: f64) {
+    rt.st32(p, off / 4, __bits(x as f32) as u32)
+}
+
+fn r32(p: u64, off: usize) -> u64 {
+    return rt.ld32(p, off / 4) as u64
+}
+
+fn r64(p: u64, off: usize) -> u64 {
+    return rt.ld64(p, off / 8)
+}
+
+fn good(r: u64) -> bool {
+    return (r & 0xFFFFFFFF) == 0
+}
+
+// zeroed scratch bytes; `top` is reset by the caller at the start of one call sequence
+fn xsa(x: *mut X, n: usize) -> u64 {
+    let p: u64 = (*x).scratch + ((*x).top as u64)
+    let m: usize = (n + 15) / 16 * 16
+    if (*x).top + m > SCRATCH {
+        (*x).top = 0
+        rt.mem_set((*x).scratch, 0 as u8, m)
+        (*x).top = m
+        return (*x).scratch
+    }
+    rt.mem_set(p, 0 as u8, m)
+    (*x).top = (*x).top + m
+    return p
+}
+
+fn xcstr(x: *mut X, s: str) -> u64 {
+    let n: usize = s.length()
+    let p: u64 = xsa(x, n + 1)
+    var i: usize = 0
+    while i < n {
+        rt.st8(p, i, s.chars(i))
+        i = i + 1
+    }
+    return p
+}
+
+fn xfn(x: *mut X, i: usize) -> u64 {
+    return rt.ld64((*x).ft, i)
+}
+
+// call table entry `i` with up to 10 integer / pointer arguments (System V: 6 registers + stack)
+fn cx(x: *mut X, i: usize, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64, a9: u64) -> u64 {
+    var a: [u64; 10] = [0; 10]
+    a[0] = a0
+    a[1] = a1
+    a[2] = a2
+    a[3] = a3
+    a[4] = a4
+    a[5] = a5
+    a[6] = a6
+    a[7] = a7
+    a[8] = a8
+    a[9] = a9
+    return dynlib.callx(rt.ld64((*x).ft, i), "iiiiiiiiii", (&a[0]) as u64, false)
+}
+
+fn ldsym(x: *mut X, v: *mut vk.Vk, i: usize, name: str) -> bool {
+    var a: [u64; 2] = [0; 2]
+    a[0] = (*v).inst
+    a[1] = xcstr(x, name)
+    let p: u64 = dynlib.callx((*v).gipa, "ii", (&a[0]) as u64, false)
+    rt.st64((*x).ft, i, p)
+    return p != 0
+}
+
+fn load_all(x: *mut X, v: *mut vk.Vk) -> bool {
+    var ok: bool = true
+    (*x).top = 0
+    if !ldsym(x, v, X_ALLOC_MEM, "vkAllocateMemory") { ok = false }
+    if !ldsym(x, v, X_FREE_MEM, "vkFreeMemory") { ok = false }
+    if !ldsym(x, v, X_MAP, "vkMapMemory") { ok = false }
+    if !ldsym(x, v, X_UNMAP, "vkUnmapMemory") { ok = false }
+    if !ldsym(x, v, X_CREATE_BUFFER, "vkCreateBuffer") { ok = false }
+    if !ldsym(x, v, X_DESTROY_BUFFER, "vkDestroyBuffer") { ok = false }
+    if !ldsym(x, v, X_BUF_REQ, "vkGetBufferMemoryRequirements") { ok = false }
+    if !ldsym(x, v, X_BIND_BUF, "vkBindBufferMemory") { ok = false }
+    if !ldsym(x, v, X_CREATE_IMAGE, "vkCreateImage") { ok = false }
+    if !ldsym(x, v, X_DESTROY_IMAGE, "vkDestroyImage") { ok = false }
+    if !ldsym(x, v, X_IMG_REQ, "vkGetImageMemoryRequirements") { ok = false }
+    if !ldsym(x, v, X_BIND_IMG, "vkBindImageMemory") { ok = false }
+    if !ldsym(x, v, X_CREATE_VIEW, "vkCreateImageView") { ok = false }
+    if !ldsym(x, v, X_DESTROY_VIEW, "vkDestroyImageView") { ok = false }
+    if !ldsym(x, v, X_CREATE_SAMPLER, "vkCreateSampler") { ok = false }
+    if !ldsym(x, v, X_DESTROY_SAMPLER, "vkDestroySampler") { ok = false }
+    if !ldsym(x, v, X_CREATE_DSL, "vkCreateDescriptorSetLayout") { ok = false }
+    if !ldsym(x, v, X_DESTROY_DSL, "vkDestroyDescriptorSetLayout") { ok = false }
+    if !ldsym(x, v, X_CREATE_DPOOL, "vkCreateDescriptorPool") { ok = false }
+    if !ldsym(x, v, X_DESTROY_DPOOL, "vkDestroyDescriptorPool") { ok = false }
+    if !ldsym(x, v, X_ALLOC_DSETS, "vkAllocateDescriptorSets") { ok = false }
+    if !ldsym(x, v, X_UPDATE_DSETS, "vkUpdateDescriptorSets") { ok = false }
+    if !ldsym(x, v, X_CREATE_PLAYOUT, "vkCreatePipelineLayout") { ok = false }
+    if !ldsym(x, v, X_DESTROY_PLAYOUT, "vkDestroyPipelineLayout") { ok = false }
+    if !ldsym(x, v, X_CREATE_SHADER, "vkCreateShaderModule") { ok = false }
+    if !ldsym(x, v, X_DESTROY_SHADER, "vkDestroyShaderModule") { ok = false }
+    if !ldsym(x, v, X_CREATE_GPIPE, "vkCreateGraphicsPipelines") { ok = false }
+    if !ldsym(x, v, X_DESTROY_PIPE, "vkDestroyPipeline") { ok = false }
+    if !ldsym(x, v, X_CREATE_RP, "vkCreateRenderPass") { ok = false }
+    if !ldsym(x, v, X_DESTROY_RP, "vkDestroyRenderPass") { ok = false }
+    if !ldsym(x, v, X_CREATE_FB, "vkCreateFramebuffer") { ok = false }
+    if !ldsym(x, v, X_DESTROY_FB, "vkDestroyFramebuffer") { ok = false }
+    if !ldsym(x, v, X_CREATE_CPOOL, "vkCreateCommandPool") { ok = false }
+    if !ldsym(x, v, X_DESTROY_CPOOL, "vkDestroyCommandPool") { ok = false }
+    if !ldsym(x, v, X_ALLOC_CMD, "vkAllocateCommandBuffers") { ok = false }
+    if !ldsym(x, v, X_FREE_CMD, "vkFreeCommandBuffers") { ok = false }
+    if !ldsym(x, v, X_BEGIN_CMD, "vkBeginCommandBuffer") { ok = false }
+    if !ldsym(x, v, X_END_CMD, "vkEndCommandBuffer") { ok = false }
+    if !ldsym(x, v, X_RESET_CMD, "vkResetCommandBuffer") { ok = false }
+    if !ldsym(x, v, X_CMD_BEGIN_RP, "vkCmdBeginRenderPass") { ok = false }
+    if !ldsym(x, v, X_CMD_END_RP, "vkCmdEndRenderPass") { ok = false }
+    if !ldsym(x, v, X_CMD_BIND_PIPE, "vkCmdBindPipeline") { ok = false }
+    if !ldsym(x, v, X_CMD_BIND_VB, "vkCmdBindVertexBuffers") { ok = false }
+    if !ldsym(x, v, X_CMD_BIND_IB, "vkCmdBindIndexBuffer") { ok = false }
+    if !ldsym(x, v, X_CMD_BIND_DS, "vkCmdBindDescriptorSets") { ok = false }
+    if !ldsym(x, v, X_CMD_PUSH, "vkCmdPushConstants") { ok = false }
+    if !ldsym(x, v, X_CMD_DRAW_IDX, "vkCmdDrawIndexed") { ok = false }
+    if !ldsym(x, v, X_CMD_SET_VP, "vkCmdSetViewport") { ok = false }
+    if !ldsym(x, v, X_CMD_SET_SC, "vkCmdSetScissor") { ok = false }
+    if !ldsym(x, v, X_CMD_COPY_BUF, "vkCmdCopyBuffer") { ok = false }
+    if !ldsym(x, v, X_CMD_COPY_B2I, "vkCmdCopyBufferToImage") { ok = false }
+    if !ldsym(x, v, X_CMD_COPY_I2B, "vkCmdCopyImageToBuffer") { ok = false }
+    if !ldsym(x, v, X_CMD_BARRIER, "vkCmdPipelineBarrier") { ok = false }
+    if !ldsym(x, v, X_CREATE_FENCE, "vkCreateFence") { ok = false }
+    if !ldsym(x, v, X_DESTROY_FENCE, "vkDestroyFence") { ok = false }
+    if !ldsym(x, v, X_WAIT_FENCES, "vkWaitForFences") { ok = false }
+    if !ldsym(x, v, X_RESET_FENCES, "vkResetFences") { ok = false }
+    if !ldsym(x, v, X_GET_FENCE, "vkGetFenceStatus") { ok = false }
+    if !ldsym(x, v, X_CREATE_SEM, "vkCreateSemaphore") { ok = false }
+    if !ldsym(x, v, X_DESTROY_SEM, "vkDestroySemaphore") { ok = false }
+    if !ldsym(x, v, X_SUBMIT, "vkQueueSubmit") { ok = false }
+    if !ldsym(x, v, X_QWAIT, "vkQueueWaitIdle") { ok = false }
+    if !ldsym(x, v, X_DEV_WAIT, "vkDeviceWaitIdle") { ok = false }
+    if !ldsym(x, v, X_PHYS_PROPS, "vkGetPhysicalDeviceProperties") { ok = false }
+    if !ldsym(x, v, X_FLUSH_RANGES, "vkFlushMappedMemoryRanges") { ok = false }
+    return ok
+}
+
+// Builds the table on an opened vk.Vk (vk.open done: instance, device, queue). Reads the limits the renderer needs.
+fn x_open(x: *mut X, v: *mut vk.Vk) -> bool {
+    (*x).ok = false
+    (*x).step = 0
+    if !(*v).ok {
+        (*x).step = 1
+        return false
+    }
+    (*x).scratch = rt.heap_alloc(SCRATCH)
+    (*x).ft = rt.heap_alloc(X_COUNT * 8)
+    (*x).blocks = rt.heap_alloc(MAX_BLOCKS * BLK_WORDS * 8)
+    if (*x).scratch == 0 || (*x).ft == 0 || (*x).blocks == 0 {
+        (*x).step = 1
+        return false
+    }
+    rt.mem_set((*x).ft, 0 as u8, X_COUNT * 8)
+    rt.mem_set((*x).blocks, 0 as u8, MAX_BLOCKS * BLK_WORDS * 8)
+    (*x).inst = (*v).inst
+    (*x).dev = (*v).dev
+    (*x).phys = (*v).phys
+    (*x).queue = (*v).queue
+    (*x).qfam = (*v).qfam
+    (*x).mprops = (*v).mprops
+    if !load_all(x, v) {
+        (*x).step = 1
+        return false
+    }
+    // VkPhysicalDeviceProperties (824 octets): limits at 296; maxImageDimension2D +4, maxImageArrayLayers +16,
+    // maxUniformBufferRange +24, maxPushConstantsSize +32, maxMemoryAllocationCount +36
+    let pp: u64 = rt.heap_alloc(1024)
+    rt.mem_set(pp, 0 as u8, 1024)
+    cx(x, X_PHYS_PROPS, (*x).phys, pp, 0, 0, 0, 0, 0, 0, 0, 0)
+    (*x).max_dim = r32(pp, 296 + 4)
+    (*x).max_layers = r32(pp, 296 + 16)
+    (*x).max_ubo = r32(pp, 296 + 24)
+    (*x).max_push = r32(pp, 296 + 32)
+    (*x).max_alloc = r32(pp, 296 + 36)
+    (*x).dev_name = (*v).name
+    rt.heap_free(pp, 1024)
+    (*x).ok = true
+    return true
+}
+
+fn x_idle(x: *mut X) {
+    cx(x, X_DEV_WAIT, (*x).dev, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+}
+
+// ---- blocks + free lists --------------------------------------------------------------------------------------------
+fn bw(x: *mut X, b: usize, w: usize) -> u64 {
+    return rt.ld64((*x).blocks, b * BLK_WORDS + w)
+}
+
+fn bset(x: *mut X, b: usize, w: usize, v: u64) {
+    rt.st64((*x).blocks, b * BLK_WORDS + w, v)
+}
+
+fn align_up(v: u64, a: u64) -> u64 {
+    if a <= 1 {
+        return v
+    }
+    return (v + a - 1) / a * a
+}
+
+// memory type index with all `want` bits inside `bits`; -1 = none
+fn find_type(x: *mut X, bits: u64, want: u64) -> i64 {
+    let n: u64 = r32((*x).mprops, 0)
+    var i: u64 = 0
+    while i < n && i < 32 {
+        if (bits & (1 << i)) != 0 && (r32((*x).mprops, 4 + (i as usize) * 8) & want) == want {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn block_new(x: *mut X, mtype: u64, size: u64, kind: u64, host: bool) -> usize {
+    var b: usize = 0
+    while b < MAX_BLOCKS && bw(x, b, B_USED) != 0 {
+        b = b + 1
+    }
+    if b >= MAX_BLOCKS {
+        return MAX_BLOCKS
+    }
+    (*x).top = 0
+    let ai: u64 = xsa(x, 32)
+    w32(ai, 0, 5) // MEMORY_ALLOCATE_INFO
+    w64(ai, 16, size)
+    w32(ai, 24, mtype)
+    let out: u64 = xsa(x, 8)
+    if !good(cx(x, X_ALLOC_MEM, (*x).dev, ai, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return MAX_BLOCKS
+    }
+    let mem: u64 = r64(out, 0)
+    var ptr: u64 = 0
+    if host {
+        if !good(cx(x, X_MAP, (*x).dev, mem, 0, size, 0, out, 0, 0, 0, 0)) {
+            cx(x, X_FREE_MEM, (*x).dev, mem, 0, 0, 0, 0, 0, 0, 0, 0)
+            return MAX_BLOCKS
+        }
+        ptr = r64(out, 0)
+    }
+    let rg: u64 = rt.heap_alloc(RANGE_CAP * 16)
+    if rg == 0 {
+        cx(x, X_FREE_MEM, (*x).dev, mem, 0, 0, 0, 0, 0, 0, 0, 0)
+        return MAX_BLOCKS
+    }
+    rt.st64(rg, 0, 0)
+    rt.st64(rg, 1, size)
+    bset(x, b, B_MEM, mem)
+    bset(x, b, B_TYPE, mtype)
+    bset(x, b, B_SIZE, size)
+    bset(x, b, B_PTR, ptr)
+    bset(x, b, B_RANGES, rg)
+    bset(x, b, B_NR, 1)
+    bset(x, b, B_FREE, size)
+    bset(x, b, B_KIND, kind)
+    bset(x, b, B_USED, 1)
+    if b >= (*x).nblocks {
+        (*x).nblocks = b + 1
+    }
+    (*x).n_allocs = (*x).n_allocs + 1
+    (*x).block_bytes = (*x).block_bytes + size
+    return b
+}
+
+// first fit inside block b; returns the offset or 0xFFFFFFFFFFFFFFFF
+fn block_take(x: *mut X, b: usize, size: u64, align: u64) -> u64 {
+    if bw(x, b, B_FREE) < size {
+        return 0xFFFFFFFFFFFFFFFF
+    }
+    let rg: u64 = bw(x, b, B_RANGES)
+    let nr: usize = bw(x, b, B_NR) as usize
+    var i: usize = 0
+    while i < nr {
+        let ro: u64 = rt.ld64(rg, i * 2)
+        let rs: u64 = rt.ld64(rg, i * 2 + 1)
+        let ao: u64 = align_up(ro, align)
+        if ao + size <= ro + rs {
+            let left: u64 = ao - ro
+            let right: u64 = ro + rs - (ao + size)
+            if left > 0 && right > 0 {
+                if nr < RANGE_CAP {
+                    // split: shift the tail by one
+                    var k: usize = nr
+                    while k > i + 1 {
+                        rt.st64(rg, k * 2, rt.ld64(rg, (k - 1) * 2))
+                        rt.st64(rg, k * 2 + 1, rt.ld64(rg, (k - 1) * 2 + 1))
+                        k = k - 1
+                    }
+                    rt.st64(rg, i * 2 + 1, left)
+                    rt.st64(rg, (i + 1) * 2, ao + size)
+                    rt.st64(rg, (i + 1) * 2 + 1, right)
+                    bset(x, b, B_NR, (nr + 1) as u64)
+                } else {
+                    rt.st64(rg, i * 2 + 1, left) // list full: the right remainder is lost until the block is reused
+                    bset(x, b, B_FREE, bw(x, b, B_FREE) - right)
+                }
+            } else if left > 0 {
+                rt.st64(rg, i * 2 + 1, left)
+            } else if right > 0 {
+                rt.st64(rg, i * 2, ao + size)
+                rt.st64(rg, i * 2 + 1, right)
+            } else {
+                var k: usize = i
+                while k + 1 < nr {
+                    rt.st64(rg, k * 2, rt.ld64(rg, (k + 1) * 2))
+                    rt.st64(rg, k * 2 + 1, rt.ld64(rg, (k + 1) * 2 + 1))
+                    k = k + 1
+                }
+                bset(x, b, B_NR, (nr - 1) as u64)
+            }
+            bset(x, b, B_FREE, bw(x, b, B_FREE) - size)
+            return ao
+        }
+        i = i + 1
+    }
+    return 0xFFFFFFFFFFFFFFFF
+}
+
+fn block_give(x: *mut X, b: usize, off: u64, size: u64) {
+    let rg: u64 = bw(x, b, B_RANGES)
+    var nr: usize = bw(x, b, B_NR) as usize
+    var i: usize = 0
+    while i < nr && rt.ld64(rg, i * 2) < off {
+        i = i + 1
+    }
+    // merge with the previous range
+    var merged: bool = false
+    if i > 0 && rt.ld64(rg, (i - 1) * 2) + rt.ld64(rg, (i - 1) * 2 + 1) == off {
+        rt.st64(rg, (i - 1) * 2 + 1, rt.ld64(rg, (i - 1) * 2 + 1) + size)
+        merged = true
+        i = i - 1
+    }
+    if merged {
+        // merge with the next one as well
+        if i + 1 < nr && rt.ld64(rg, i * 2) + rt.ld64(rg, i * 2 + 1) == rt.ld64(rg, (i + 1) * 2) {
+            rt.st64(rg, i * 2 + 1, rt.ld64(rg, i * 2 + 1) + rt.ld64(rg, (i + 1) * 2 + 1))
+            var k: usize = i + 1
+            while k + 1 < nr {
+                rt.st64(rg, k * 2, rt.ld64(rg, (k + 1) * 2))
+                rt.st64(rg, k * 2 + 1, rt.ld64(rg, (k + 1) * 2 + 1))
+                k = k + 1
+            }
+            bset(x, b, B_NR, (nr - 1) as u64)
+        }
+    } else if i < nr && off + size == rt.ld64(rg, i * 2) {
+        rt.st64(rg, i * 2, off)
+        rt.st64(rg, i * 2 + 1, rt.ld64(rg, i * 2 + 1) + size)
+    } else if nr < RANGE_CAP {
+        var k: usize = nr
+        while k > i {
+            rt.st64(rg, k * 2, rt.ld64(rg, (k - 1) * 2))
+            rt.st64(rg, k * 2 + 1, rt.ld64(rg, (k - 1) * 2 + 1))
+            k = k - 1
+        }
+        rt.st64(rg, i * 2, off)
+        rt.st64(rg, i * 2 + 1, size)
+        bset(x, b, B_NR, (nr + 1) as u64)
+        nr = nr + 1
+    } else {
+        return // list full: the space stays lost (bounded by RANGE_CAP fragments per 64 MB block)
+    }
+    bset(x, b, B_FREE, bw(x, b, B_FREE) + size)
+}
+
+// Allocates `size` bytes with `align` out of memory types in `bits` (VkMemoryRequirements.memoryTypeBits). `want` = property
+// bits (MEM_*); MEM_UPLOAD falls back to MEM_STAGING, MEM_DEVICE to any type (fallbacks counts those). kind 0 = buffer, 1 = image.
+fn mem_alloc(x: *mut X, size: u64, align: u64, bits: u64, want: u64, kind: u64) -> Alloc {
+    var a: Alloc = alloc_none()
+    var w: u64 = want
+    var mt: i64 = find_type(x, bits, w)
+    if mt < 0 && want == MEM_UPLOAD {
+        w = MEM_STAGING
+        mt = find_type(x, bits, w)
+        (*x).fallbacks = (*x).fallbacks + 1
+    }
+    if mt < 0 && (want & 1) != 0 {
+        w = want & 6
+        mt = find_type(x, bits, w)
+        (*x).fallbacks = (*x).fallbacks + 1
+    }
+    if mt < 0 {
+        return a
+    }
+    let host: bool = (r32((*x).mprops, 4 + (mt as usize) * 8) & 2) != 0
+    var b: usize = 0
+    while b < (*x).nblocks {
+        if bw(x, b, B_USED) != 0 && bw(x, b, B_TYPE) == (mt as u64) && bw(x, b, B_KIND) == kind {
+            let off: u64 = block_take(x, b, size, align)
+            if off != 0xFFFFFFFFFFFFFFFF {
+                a.ok = true
+                a.blk = b
+                a.off = off
+                a.size = size
+                a.mem = bw(x, b, B_MEM)
+                if bw(x, b, B_PTR) != 0 {
+                    a.ptr = bw(x, b, B_PTR) + off
+                }
+                (*x).live_bytes = (*x).live_bytes + size
+                return a
+            }
+        }
+        b = b + 1
+    }
+    var bs: u64 = BLOCK_SIZE
+    if size + align > bs {
+        bs = align_up(size + align, 65536)
+    }
+    let nb: usize = block_new(x, mt as u64, bs, kind, host)
+    if nb >= MAX_BLOCKS {
+        return a
+    }
+    let off: u64 = block_take(x, nb, size, align)
+    if off == 0xFFFFFFFFFFFFFFFF {
+        return a
+    }
+    a.ok = true
+    a.blk = nb
+    a.off = off
+    a.size = size
+    a.mem = bw(x, nb, B_MEM)
+    if bw(x, nb, B_PTR) != 0 {
+        a.ptr = bw(x, nb, B_PTR) + off
+    }
+    (*x).live_bytes = (*x).live_bytes + size
+    return a
+}
+
+// Gives the range back; a block that becomes completely free is released to the driver (keeps one block per type warm: not done,
+// the first-fit list simply merges back to one range).
+fn mem_free(x: *mut X, a: *mut Alloc) {
+    if !(*a).ok {
+        return
+    }
+    block_give(x, (*a).blk, (*a).off, (*a).size)
+    (*x).live_bytes = (*x).live_bytes - (*a).size
+    (*a).ok = false
+    (*a).ptr = 0
+}
+
+// blocks, bytes in blocks, bytes in use, vkAllocateMemory calls
+fn mem_stats(x: *mut X, out: *mut [u64; 4]) {
+    var n: u64 = 0
+    var b: usize = 0
+    while b < (*x).nblocks {
+        if bw(x, b, B_USED) != 0 { n = n + 1 }
+        b = b + 1
+    }
+    (*out)[0] = n
+    (*out)[1] = (*x).block_bytes
+    (*out)[2] = (*x).live_bytes
+    (*out)[3] = (*x).n_allocs
+}
+
+// ---- buffers ---------------------------------------------------------------------------------------------------------
+fn buf_make(x: *mut X, size: u64, usage: u64, want: u64) -> Buf {
+    var b: Buf = buf_none()
+    (*x).top = 0
+    let bi: u64 = xsa(x, 56)
+    w32(bi, 0, 12) // BUFFER_CREATE_INFO
+    w64(bi, 24, size)
+    w32(bi, 32, usage)
+    let out: u64 = xsa(x, 8)
+    if !good(cx(x, X_CREATE_BUFFER, (*x).dev, bi, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return b
+    }
+    b.buf = r64(out, 0)
+    let req: u64 = xsa(x, 24)
+    cx(x, X_BUF_REQ, (*x).dev, b.buf, req, 0, 0, 0, 0, 0, 0, 0)
+    b.a = mem_alloc(x, r64(req, 0), r64(req, 8), r32(req, 16), want, 0)
+    if !b.a.ok {
+        cx(x, X_DESTROY_BUFFER, (*x).dev, b.buf, 0, 0, 0, 0, 0, 0, 0, 0)
+        return buf_none()
+    }
+    if !good(cx(x, X_BIND_BUF, (*x).dev, b.buf, b.a.mem, b.a.off, 0, 0, 0, 0, 0, 0)) {
+        mem_free(x, &b.a)
+        cx(x, X_DESTROY_BUFFER, (*x).dev, b.buf, 0, 0, 0, 0, 0, 0, 0, 0)
+        return buf_none()
+    }
+    b.size = size
+    b.ptr = b.a.ptr
+    b.ok = true
+    return b
+}
+
+fn buf_free(x: *mut X, b: *mut Buf) {
+    if !(*b).ok {
+        return
+    }
+    cx(x, X_DESTROY_BUFFER, (*x).dev, (*b).buf, 0, 0, 0, 0, 0, 0, 0, 0)
+    mem_free(x, &(*b).a)
+    (*b).ok = false
+    (*b).ptr = 0
+}
+
+// ---- images (optimal tiling, 2D, `layers` array layers, one mip level, 1 sample) ----------------------------------------
+// usage: VK_IMAGE_USAGE_* bits; aspect 1 = colour, 2 = depth. View type 2D_ARRAY when layers > 1, else 2D.
+fn img_make(x: *mut X, w: u32, h: u32, layers: u32, fmt: u32, usage: u64, aspect: u64) -> Img {
+    var m: Img = img_none()
+    (*x).top = 0
+    let ci: u64 = xsa(x, 88)
+    w32(ci, 0, 14) // IMAGE_CREATE_INFO
+    w32(ci, 20, 1) // 2D
+    w32(ci, 24, fmt as u64)
+    w32(ci, 28, w as u64)
+    w32(ci, 32, h as u64)
+    w32(ci, 36, 1)
+    w32(ci, 40, 1) // mip levels
+    w32(ci, 44, layers as u64)
+    w32(ci, 48, 1) // samples
+    w32(ci, 52, 0) // OPTIMAL
+    w32(ci, 56, usage)
+    w32(ci, 80, 0) // UNDEFINED
+    let out: u64 = xsa(x, 8)
+    if !good(cx(x, X_CREATE_IMAGE, (*x).dev, ci, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return m
+    }
+    m.img = r64(out, 0)
+    let req: u64 = xsa(x, 24)
+    cx(x, X_IMG_REQ, (*x).dev, m.img, req, 0, 0, 0, 0, 0, 0, 0)
+    m.a = mem_alloc(x, r64(req, 0), r64(req, 8), r32(req, 16), MEM_DEVICE, 1)
+    if !m.a.ok {
+        cx(x, X_DESTROY_IMAGE, (*x).dev, m.img, 0, 0, 0, 0, 0, 0, 0, 0)
+        return img_none()
+    }
+    if !good(cx(x, X_BIND_IMG, (*x).dev, m.img, m.a.mem, m.a.off, 0, 0, 0, 0, 0, 0)) {
+        mem_free(x, &m.a)
+        cx(x, X_DESTROY_IMAGE, (*x).dev, m.img, 0, 0, 0, 0, 0, 0, 0, 0)
+        return img_none()
+    }
+    let vi: u64 = xsa(x, 80)
+    w32(vi, 0, 15) // IMAGE_VIEW_CREATE_INFO
+    w64(vi, 24, m.img)
+    if layers > 1 {
+        w32(vi, 32, 5) // 2D_ARRAY
+    } else {
+        w32(vi, 32, 1) // 2D
+    }
+    w32(vi, 36, fmt as u64)
+    w32(vi, 56, aspect)
+    w32(vi, 64, 1) // level count
+    w32(vi, 72, layers as u64)
+    if !good(cx(x, X_CREATE_VIEW, (*x).dev, vi, 0, out, 0, 0, 0, 0, 0, 0)) {
+        mem_free(x, &m.a)
+        cx(x, X_DESTROY_IMAGE, (*x).dev, m.img, 0, 0, 0, 0, 0, 0, 0, 0)
+        return img_none()
+    }
+    m.view = r64(out, 0)
+    m.w = w
+    m.h = h
+    m.layers = layers
+    m.fmt = fmt
+    m.ok = true
+    return m
+}
+
+fn img_free(x: *mut X, m: *mut Img) {
+    if !(*m).ok {
+        return
+    }
+    cx(x, X_DESTROY_VIEW, (*x).dev, (*m).view, 0, 0, 0, 0, 0, 0, 0, 0)
+    cx(x, X_DESTROY_IMAGE, (*x).dev, (*m).img, 0, 0, 0, 0, 0, 0, 0, 0)
+    mem_free(x, &(*m).a)
+    (*m).ok = false
+}
+
+fn x_close(x: *mut X) {
+    if (*x).scratch == 0 {
+        return
+    }
+    var b: usize = 0
+    while b < (*x).nblocks {
+        if bw(x, b, B_USED) != 0 {
+            if bw(x, b, B_PTR) != 0 {
+                cx(x, X_UNMAP, (*x).dev, bw(x, b, B_MEM), 0, 0, 0, 0, 0, 0, 0, 0)
+            }
+            cx(x, X_FREE_MEM, (*x).dev, bw(x, b, B_MEM), 0, 0, 0, 0, 0, 0, 0, 0)
+            rt.heap_free(bw(x, b, B_RANGES), RANGE_CAP * 16)
+            bset(x, b, B_USED, 0)
+        }
+        b = b + 1
+    }
+    (*x).nblocks = 0
+    (*x).block_bytes = 0
+    (*x).live_bytes = 0
+}
