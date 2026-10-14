@@ -19,7 +19,9 @@
 // Mesh upload: vertices + indices of one mesh in ONE device buffer; the copy is recorded into the upload command buffer of the next
 // frame slot (submitted before that frame, one barrier to vertex/index reads), staging buffers and freed meshes are released once the
 // frame that could use them has finished. Shaders: lib/gpu/vk_shaders.fi (VK2, docs/VK-RENDERER.md): Frame UBO slices with dynamic offset,
-// push constants 16 B (origin), pipeline cache from gpu.vk_life. Not here yet (roadmap r180): sky, HUD, entities (draw_entities is a no-op).
+// push constants 16 B (origin), pipeline cache from gpu.vk_life. Scene layer (roadmap r180): vkbe_sky (right after begin), draw_entities (Backend table, instanced unit cube, one draw), vkbe_tint,
+// vkbe_hud(rec) (last, before end); each switches the pipeline through bind_pipe, UBO slices carry the sky / tint / invert values; HUD
+// rectangles and entity instances live in a per-frame bump buffer (DYN_BYTES).
 // THREADS: main thread only.
 
 import std.rt
@@ -50,6 +52,9 @@ const DYN_BYTES: u64 = 4194304 // per frame slot: HUD rectangles + entity instan
 const TB_BYTES: u64 = 256 // dummy texel buffers (pool mode off): zero filled
 const PAGEL_SINGLE: u64 = 1073741824 // u_pagel >= 1048576: the whole atlas is ONE array (page 0)
 const HUD_REC_BYTES: usize = 24 // one mc_hud.hud_record rectangle: x0 y0 x1 y1 colour mode (u32 each)
+const CUBE_IB: u64 = 384 // byte offset of the 36 u16 cube indices (24 vertices * 16 octets before it)
+const CUBE_BYTES: u64 = 512
+const ENT_INST_BYTES: usize = 48 // 3 x vec4 per box instance
 const MW: usize = 8 // words per mesh slot
 const M_USED: usize = 0
 const M_BUF: usize = 1
@@ -103,6 +108,9 @@ struct VkBackend {
     pipe_sky: vk_desc.VPipe,
     pipe_tint: vk_desc.VPipe,
     pipe_hud: vk_desc.VPipe,
+    pipe_ent: vk_desc.VPipe,
+    cube: vk_mem.Buf, // unit cube for the entity boxes: 24 vertices (pos f32 x3 + face f32) at 0, 36 u16 indices at CUBE_IB
+    ents_drawn: u64,
     pipe_hud_inv: vk_desc.VPipe,
     dyn_top: u64,
     dyn_over: u64, // allocations that did not fit into DYN_BYTES in one frame
@@ -160,12 +168,52 @@ fn blank() -> VkBackend {
     return VkBackend { ok: false, step: 0, v: vk.vk_new(), x: vk_mem.x_new(),
         fr: vk_frame.Frames { ok: false, pool: 0, n: 0, w: 0, icmd: 0, ifence: 0, serial: 0, done: 0, tpending: false },
         d: vk_desc.desc_none(), life: vk_life.life_new(), cache_path: "", base: 0, nslice: 0, slice_off: 0, ubo_over: 0, dirty: true,
-        gran: vk_mem.buf_none(), org: vk_mem.buf_none(), gran_view: 0, org_view: 0, w: 0, h: 0, rp: 0, playout: 0, pipe_op: vk_desc.vpipe_none(), pipe_tr: vk_desc.vpipe_none(), pipe_sky: vk_desc.vpipe_none(), pipe_tint: vk_desc.vpipe_none(), pipe_hud: vk_desc.vpipe_none(), pipe_hud_inv: vk_desc.vpipe_none(), dyn_top: 0, dyn_over: 0, inv_on: false, bound: 0,
+        gran: vk_mem.buf_none(), org: vk_mem.buf_none(), gran_view: 0, org_view: 0, w: 0, h: 0, rp: 0, playout: 0, pipe_op: vk_desc.vpipe_none(), pipe_tr: vk_desc.vpipe_none(), pipe_sky: vk_desc.vpipe_none(), pipe_tint: vk_desc.vpipe_none(), pipe_hud: vk_desc.vpipe_none(), pipe_ent: vk_desc.vpipe_none(), cube: vk_mem.buf_none(), ents_drawn: 0, pipe_hud_inv: vk_desc.vpipe_none(), dyn_top: 0, dyn_over: 0, inv_on: false, bound: 0,
         fs: [fslot_none(); 2], atlas: vk_mem.img_none(), tile: 0, layers_lost: 0, meshes: 0, mcap: 0, live: 0, dfr: 0, dcap: 0,
         dn: 0, cur: 0, next: 0, in_frame: false, has_last: false, last: 0, trec: false, readback: true, trans: false,
         cx: 0.0, cy: 0.0, cz: 0.0, fade_a: 64.0, fade_inv: 0.0, day: 256.0, tr: 256.0, tg: 256.0, tb: 256.0, fog_on: false,
         fog_start: 20.0, fog_end: 90.0, fog_r: 150.0, fog_g: 190.0, fog_b: 230.0, draws: 0, tris: 0,
         frames: 0, upload_bytes: 0, t0_ns: 0, frame_ns: 0, push: 0, vb: 0 }
+}
+
+// The 24 vertices (x y z face as f32, faces -x +x -y +y -z +z) and 36 u16 indices of the unit cube -0.5 .. 0.5 (same order as gl_scene).
+fn cube_fill(p: u64) {
+    var f: usize = 0
+    while f < 6 {
+        let axis: usize = f / 2
+        var sgn: f64 = 0.0 - 0.5
+        if f % 2 == 1 { sgn = 0.5 }
+        var k: usize = 0
+        while k < 4 {
+            var a: f64 = 0.0 - 0.5
+            if k % 2 == 1 { a = 0.5 }
+            var bb: f64 = 0.0 - 0.5
+            if k / 2 == 1 { bb = 0.5 }
+            var c: [f64; 3] = [0.0, 0.0, 0.0]
+            c[axis] = sgn
+            c[(axis + 1) % 3] = a
+            c[(axis + 2) % 3] = bb
+            let o: usize = (f * 4 + k) * 16
+            vk_mem.wf(p, o, c[0])
+            vk_mem.wf(p, o + 4, c[1])
+            vk_mem.wf(p, o + 8, c[2])
+            vk_mem.wf(p, o + 12, f as f64)
+            k = k + 1
+        }
+        let base: u16 = (f * 4) as u16
+        let ip: u64 = p + CUBE_IB + (f as u64) * (12 as u64)
+        *(ip as *mut u16) = base
+        *((ip + 2 as u64) as *mut u16) = base + 1 as u16
+        *((ip + 4 as u64) as *mut u16) = base + 3 as u16
+        *((ip + 6 as u64) as *mut u16) = base
+        *((ip + 8 as u64) as *mut u16) = base + 3 as u16
+        *((ip + 10 as u64) as *mut u16) = base + 2 as u16
+        f = f + 1
+    }
+}
+
+fn rec_f(p: u64, i: usize) -> f64 {
+    return *((p + (i as u64) * (8 as u64)) as *mut f64)
 }
 
 // ---- targets (colour + depth + framebuffer + UBO + read back per slot) -------------------------------------------------------
@@ -307,7 +355,21 @@ fn vkbe_open_cache(w: i32, h: i32, cache_path: str) -> VkBackend {
     b.pipe_hud = vk_desc.pipeline_make(&b.x, b.v.cache, b.rp, b.playout, &hsp)
     hsp.blend = vk_desc.BLEND_INVERT
     b.pipe_hud_inv = vk_desc.pipeline_make(&b.x, b.v.cache, b.rp, b.playout, &hsp)
-    if !b.pipe_op.ok || !b.pipe_tr.ok || !b.pipe_sky.ok || !b.pipe_tint.ok || !b.pipe_hud.ok || !b.pipe_hud_inv.ok {
+    // entities: instanced unit cube (binding 0 per vertex: pos + face, binding 1 per instance: 3 x vec4), depth LESS with write, no culling
+    var esp: vk_desc.PipeSpec = vk_desc.spec_new(vk_shaders.ENT_VS.p as u64, vk_shaders.ENT_VS.n, vk_shaders.ENT_FS.p as u64, vk_shaders.ENT_FS.n)
+    vk_desc.spec_bind(&esp, vk_shaders.ENT_VERT_STRIDE as u32, false)
+    vk_desc.spec_bind(&esp, vk_shaders.ENT_INST_STRIDE as u32, true)
+    vk_desc.spec_attr(&esp, 0 as u32, 0 as u32, vk_desc.FMT_R32G32B32_SFLOAT, 0 as u32)
+    vk_desc.spec_attr(&esp, 1 as u32, 0 as u32, vk_desc.FMT_R32_SFLOAT, 12 as u32)
+    vk_desc.spec_attr(&esp, 2 as u32, 1 as u32, vk_desc.FMT_R32G32B32A32_SFLOAT, 0 as u32)
+    vk_desc.spec_attr(&esp, 3 as u32, 1 as u32, vk_desc.FMT_R32G32B32A32_SFLOAT, 16 as u32)
+    vk_desc.spec_attr(&esp, 4 as u32, 1 as u32, vk_desc.FMT_R32G32B32A32_SFLOAT, 32 as u32)
+    esp.depth_test = true
+    esp.depth_write = true
+    b.pipe_ent = vk_desc.pipeline_make(&b.x, b.v.cache, b.rp, b.playout, &esp)
+    b.cube = vk_mem.buf_make(&b.x, CUBE_BYTES, vk_mem.U_VERTEX | vk_mem.U_INDEX, vk_mem.MEM_STAGING)
+    if b.cube.ok { cube_fill(b.cube.ptr) }
+    if !b.pipe_op.ok || !b.pipe_tr.ok || !b.pipe_sky.ok || !b.pipe_tint.ok || !b.pipe_hud.ok || !b.pipe_hud_inv.ok || !b.pipe_ent.ok || !b.cube.ok {
         b.step = 6
         return b
     }
@@ -953,8 +1015,55 @@ fn be_read(o: u64, out: u64) {
     }
 }
 
-fn nop_ents(o: u64, recs: u64, n: usize) -> u64 {
-    return 0 as u64
+// b.draw_entities: n box records (mc_backend.ENT_WORDS f64 each, world coordinates: centre, size, yaw sin / cos, colour 0..255) as ONE instanced draw of
+// the unit cube, depth tested against the world. Only between begin and end. Returns the boxes drawn. (No culling here: the depth test
+// decides; GL culling only skips boxes that cannot be seen, the picture is byte equal.)
+fn be_ents(o: u64, recs: u64, n: usize) -> u64 {
+    let b: *mut VkBackend = o as *mut VkBackend
+    if !(*b).ok || !(*b).in_frame || n == 0 {
+        return 0 as u64
+    }
+    let off: u64 = dyn_alloc(b, (n * ENT_INST_BYTES) as u64)
+    if off == 0xFFFFFFFFFFFFFFFF as u64 {
+        return 0 as u64
+    }
+    let d: u64 = (*b).fs[(*b).cur].dyn.ptr + off
+    var i: usize = 0
+    while i < n {
+        let e: u64 = recs + (i * mc_backend.ENT_BYTES) as u64
+        let q: u64 = d + (i * ENT_INST_BYTES) as u64
+        vk_mem.wf(q, 0, rec_f(e, 0) - (*b).cx)
+        vk_mem.wf(q, 4, rec_f(e, 1) - (*b).cy)
+        vk_mem.wf(q, 8, rec_f(e, 2) - (*b).cz)
+        vk_mem.wf(q, 12, rec_f(e, 6))
+        vk_mem.wf(q, 16, rec_f(e, 3))
+        vk_mem.wf(q, 20, rec_f(e, 4))
+        vk_mem.wf(q, 24, rec_f(e, 5))
+        vk_mem.wf(q, 28, rec_f(e, 7))
+        vk_mem.wf(q, 32, rec_f(e, 8))
+        vk_mem.wf(q, 36, rec_f(e, 9))
+        vk_mem.wf(q, 40, rec_f(e, 10))
+        vk_mem.wf(q, 44, 0.0)
+        i = i + 1
+    }
+    let cmd: u64 = vk_frame.frame_cmd(&(*b).fr, (*b).cur)
+    if (*b).dirty {
+        bake(b, cmd)
+    }
+    bind_pipe(b, cmd, (*b).pipe_ent.pipe)
+    (*b).x.top = 0
+    let vbs: u64 = vk_mem.xsa(&(*b).x, 32)
+    vk_mem.w64(vbs, 0, (*b).cube.buf)
+    vk_mem.w64(vbs, 8, (*b).fs[(*b).cur].dyn.buf)
+    vk_mem.w64(vbs, 16, 0)
+    vk_mem.w64(vbs, 24, off)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_VB, cmd, 0, 2, vbs, vbs + 16, 0, 0, 0, 0, 0)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_IB, cmd, (*b).cube.buf, CUBE_IB, 0, 0, 0, 0, 0, 0, 0)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_DRAW_IDX, cmd, 36, n as u64, 0, 0, 0, 0, 0, 0, 0)
+    (*b).draws = (*b).draws + 1 as u64
+    (*b).tris = (*b).tris + (12 * n) as u64
+    (*b).ents_drawn = (*b).ents_drawn + n as u64
+    return n as u64
 }
 
 // New target size (waits for all frames).
@@ -1003,6 +1112,8 @@ fn vkbe_close(b: *mut VkBackend) {
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_sky)
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_tint)
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_hud)
+        vk_desc.vpipe_free(&(*b).x, &(*b).pipe_ent)
+        vk_mem.buf_free(&(*b).x, &(*b).cube)
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_hud_inv)
         if (*b).playout != 0 {
             vk_mem.cx(&(*b).x, vk_mem.X_DESTROY_PLAYOUT, (*b).x.dev, (*b).playout, 0, 0, 0, 0, 0, 0, 0, 0)
@@ -1042,7 +1153,7 @@ fn vkbe_backend(b: *mut VkBackend) -> mc_backend.Backend {
     t.set_pass = be_set_pass
     t.set_light = be_set_light
     t.set_fade = be_set_fade
-    t.ent_obj = 0
-    t.draw_entities = nop_ents
+    t.ent_obj = b as u64
+    t.draw_entities = be_ents
     return t
 }

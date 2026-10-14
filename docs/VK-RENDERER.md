@@ -25,13 +25,13 @@ Validation recipe: layer manifest in a temp dir with `library_path=/usr/lib/chro
 - Time 640x360 5x5 sections, llvmpipe-Vulkan with readback vs CPU raster: ~21 ms vs ~52 ms per frame (not a GPU number).
 
 ## Not done (state before r183)
-Sky/HUD/entities (VK4 r180), swap to the VK2 shaders (`lib/gpu/spv/vk_mc.*`: 4 atlas pages, texel buffers, Frame UBO 320 B, trans/fade in the UBO), swapchain present (VK3 `vk_life`), pipeline cache wiring (`v.cache`), device lost, real GPU, why chunk_inside is 8 dB below GL (suspect: texture sample / UV edge, big_px 337 vs 93).
+swap to the VK2 shaders (`lib/gpu/spv/vk_mc.*`: 4 atlas pages, texel buffers, Frame UBO 320 B, trans/fade in the UBO), swapchain present (VK3 `vk_life`), pipeline cache wiring (`v.cache`), device lost, real GPU, why chunk_inside is 8 dB below GL (suspect: texture sample / UV edge, big_px 337 vs 93).
 
 ## Shaders (round VK2, r178; merged here in r183)
 
 Status 2026-10-14. The GL shaders `lib/gpu/{mc,gl_sky,gl_ent,gl_hud,gl_tint}_*.glsl` ported 1:1 to Vulkan GLSL 450.
 **No real GPU was available**: the SPIR-V is validated (`spirv-val`, Vulkan 1.0), interface-checked (test 3090) and accepted by Mesa
-lavapipe (`vkCreateShaderModule`, test 3091). Pixel output of the voxel pass is measured since r183 (gate `tools/gpu/vk/vkmc_run.sh`, PSNR vs `mc_raster`, chunk 36.16 / chunk_inside 41.19 dB); sky / entities / HUD / tint are not drawn yet (r180).
+lavapipe (`vkCreateShaderModule`, test 3091). Pixel output of the voxel pass is measured since r183 (gate `tools/gpu/vk/vkmc_run.sh`, PSNR vs `mc_raster`, chunk 36.16 / chunk_inside 41.19 dB); the scene layer (r180, `vk_mc.vkbe_sky` / `draw_entities` / `vkbe_tint` / `vkbe_hud`) is checked by `tools/gpu/vk/vkscene_run.sh` (CPU path = mc_raster + mc_sky + mc_hud, PSNR >= 34 dB; lavapipe, NO real GPU). Pass order: begin, sky (full-screen strip, no depth), world (opaque, translucent), entities (instanced cube, depth LESS + write), tint (same strip, depth GREATER, no write, blend DST_COLOR x ZERO), HUD (instanced rectangles from `hud_record`, alpha or invert pipeline, colour mask RGB), end. Fixed on the way: `TOPO_STRIP` was 5 (= triangle FAN in Vulkan) and must be 4.
 
 ### Files
 | File | Content |
