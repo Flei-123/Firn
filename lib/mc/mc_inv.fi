@@ -13,7 +13,16 @@
 //   inv_set(i, slot, item, count)            local update (the server does not echo Set Creative Slot)
 //   inv_send_creative(cl, slot, item, count) Set Creative Slot (creative mode only): puts `count` x `item` into inventory slot `slot`
 //
-// Enchantments (efficiency) in the item NBT / components are skipped, not evaluated.
+//   inv_set_efficiency_id(i, id)            enchantment registry id of "minecraft:efficiency" for 1.21+ (mc_client.enchant_efficiency; -1 = unknown)
+//   inv_eff(i, slot) / inv_held_eff(i, k)   Efficiency level of the stack (0 = none): <= 1.20.4 from the item NBT "Enchantments" (string ids),
+//                                            1.20.5+ from the enchantments component (varint enchantment id = the registry id above)
+//   inv_cursor_item(i) / inv_cursor_count(i) the carried stack (Window Items carried item, Set Slot window -1, Set Cursor Item 1.21.2+)
+//   inv_use_registry(i, reg)                 stack sizes for the click prediction (mc_registry.reg_item_stack; default 64)
+//   inv_click(cl, i, slot, button, mode)     Click Container for window 0 (all versions with a slot layout, 1.21.5+ hashed stacks): sends the packet with the
+//                                            predicted result (modes 0 = click, 2 = hotbar swap, 4 = drop; other modes only ask the server) and applies it
+//                                            locally. The server answers with Set Slot / Window Items whenever the prediction was wrong.
+//   inv_drop_slot(cl, i, slot, all)          Drop (mode 4) of a slot via Click Container
+//   inv_local_drop(i, slot, all)             local part of the "Drop Item" player action (the caller sends the action)
 import std.rt
 import std.bytes
 import mc.mc_client
@@ -21,11 +30,17 @@ import mc.mc_sem
 import mc.mc_version
 import mc.mc_nbt
 import mc.mc_schema
+import mc.mc_registry
 
 export {
     Inv, inv_new, inv_free, inv_slot_format, inv_on_window_items, inv_on_set_slot, inv_on_window_items_v, inv_on_set_slot_v, inv_hotbar_item, inv_hotbar_count, inv_held_item,
     inv_item, inv_count, inv_set, inv_send_creative, inv_clear, INV_SLOTS, INV_HOTBAR0, INV_MAIN0,
+    inv_eff, inv_held_eff, inv_set_efficiency_id, inv_cursor_item, inv_cursor_count, inv_use_registry, inv_on_set_cursor_v,
+    inv_click, inv_click_build, inv_drop_slot, inv_local_drop, inv_set_eff, inv_click_kind,
 }
+
+const SLOT_CUR: i32 = 1000
+const CLICK_OUTSIDE: i32 = 0 - 999
 
 const INV_SLOTS: usize = 46
 const INV_HOTBAR0: i32 = 36
@@ -34,13 +49,22 @@ const INV_MAIN0: i32 = 9
 struct Inv {
     ids: u64, // u32 [46], item id + 1 (0 = empty)
     counts: u64, // i32 [46]
+    effs: u64, // u32 [46], Efficiency level of the stack
+    cur_id: i32, // carried stack: item id (-1 = empty), count, Efficiency level
+    cur_count: i32,
+    cur_eff: i32,
+    eff_id: i32, // enchantment registry id of efficiency (1.21+), -1 = unknown
+    reg: u64, // *mut mc_registry.Registry for stack sizes, 0 = none
     state_id: i32,
+    action: i32, // click counter of the legacy (<= 1.16.5) Click Window packet
     n_updates: u32,
+    n_clicks: u32,
     bad: u32,
 }
 
 fn inv_new() -> Inv {
-    var v: Inv = Inv { ids: rt.heap_alloc(INV_SLOTS * 4), counts: rt.heap_alloc(INV_SLOTS * 4), state_id: 0, n_updates: 0 as u32, bad: 0 as u32 }
+    var v: Inv = Inv { ids: rt.heap_alloc(INV_SLOTS * 4), counts: rt.heap_alloc(INV_SLOTS * 4), effs: rt.heap_alloc(INV_SLOTS * 4),
+        cur_id: 0 - 1, cur_count: 0, cur_eff: 0, eff_id: 0 - 1, reg: 0, state_id: 0, action: 1, n_updates: 0 as u32, n_clicks: 0 as u32, bad: 0 as u32 }
     inv_clear(&v)
     return v
 }
@@ -48,8 +72,28 @@ fn inv_new() -> Inv {
 fn inv_free(v: *mut Inv) {
     rt.heap_free((*v).ids, INV_SLOTS * 4)
     rt.heap_free((*v).counts, INV_SLOTS * 4)
+    rt.heap_free((*v).effs, INV_SLOTS * 4)
     (*v).ids = 0
     (*v).counts = 0
+    (*v).effs = 0
+}
+
+fn inv_set_efficiency_id(v: *mut Inv, id: i32) { (*v).eff_id = id }
+fn inv_use_registry(v: *mut Inv, reg: *mut mc_registry.Registry) { (*v).reg = reg as u64 }
+fn inv_cursor_item(v: *mut Inv) -> i32 { return (*v).cur_id }
+fn inv_cursor_count(v: *mut Inv) -> i32 { return (*v).cur_count }
+
+fn inv_eff(v: *mut Inv, slot: i32) -> i32 {
+    if slot < 0 || slot as usize >= INV_SLOTS { return 0 }
+    return rt.ld32((*v).effs, slot as usize) as i32
+}
+fn inv_held_eff(v: *mut Inv, k: i32) -> i32 { return inv_eff(v, INV_HOTBAR0 + k) }
+
+// sets the Efficiency level of a slot (SLOT_CUR = the carried stack)
+fn inv_set_eff(v: *mut Inv, slot: i32, lvl: i32) {
+    if slot == SLOT_CUR { (*v).cur_eff = lvl; return }
+    if slot < 0 || slot as usize >= INV_SLOTS { return }
+    rt.st32((*v).effs, slot as usize, lvl as u32)
 }
 
 fn inv_clear(v: *mut Inv) {
@@ -57,8 +101,12 @@ fn inv_clear(v: *mut Inv) {
     while i < INV_SLOTS {
         rt.st32((*v).ids, i, 0 as u32)
         rt.st32((*v).counts, i, 0 as u32)
+        rt.st32((*v).effs, i, 0 as u32)
         i = i + 1
     }
+    (*v).cur_id = 0 - 1
+    (*v).cur_count = 0
+    (*v).cur_eff = 0
 }
 
 fn inv_slot_format(protocol: i32) -> i32 {
@@ -84,7 +132,14 @@ fn inv_held_item(v: *mut Inv, k: i32) -> i32 { return inv_item(v, INV_HOTBAR0 + 
 fn inv_set(v: *mut Inv, slot: i32, item: i32, count: i32) { put_slot(v, slot, item, count) }
 
 fn put_slot(v: *mut Inv, slot: i32, item: i32, count: i32) {
+    if slot == SLOT_CUR {
+        if item < 0 || count <= 0 { (*v).cur_id = 0 - 1; (*v).cur_count = 0 } else { (*v).cur_id = item; (*v).cur_count = count }
+        (*v).cur_eff = 0
+        (*v).n_updates = (*v).n_updates + 1 as u32
+        return
+    }
     if slot < 0 || slot as usize >= INV_SLOTS { return }
+    rt.st32((*v).effs, slot as usize, 0 as u32)
     if item < 0 || count <= 0 {
         rt.st32((*v).ids, slot as usize, 0 as u32)
         rt.st32((*v).counts, slot as usize, 0 as u32)
@@ -95,10 +150,36 @@ fn put_slot(v: *mut Inv, slot: i32, item: i32, count: i32) {
     (*v).n_updates = (*v).n_updates + 1 as u32
 }
 
+fn named(d: *mut mc_nbt.Doc, n: u32, lit: str) -> u32 { return mc_nbt.nbt_get(d, n, lit.p as u64, lit.n) }
+
+// Efficiency level from the item NBT (<= 1.20.4): "Enchantments" is a list of {id: "minecraft:efficiency", lvl: N}
+fn nbt_efficiency(d: *mut mc_nbt.Doc) -> i32 {
+    let root: u32 = mc_nbt.doc_root(d)
+    let en: u32 = named(d, root, "Enchantments")
+    if en == 0 as u32 || mc_nbt.nbt_kind(d, en) != 9 as u8 { return 0 }
+    var e: u32 = mc_nbt.nbt_first(d, en)
+    var guard: i32 = 0
+    while e != 0 as u32 && guard < 64 {
+        let idn: u32 = named(d, e, "id")
+        if idn != 0 as u32 && mc_nbt.nbt_kind(d, idn) == 8 as u8 {
+            var n: usize = 0
+            let p: u64 = mc_nbt.nbt_str(d, idn, &n)
+            if n >= 10 && line_is(p + ((n - 10) as u64), 10, "efficiency") {
+                let ln: u32 = named(d, e, "lvl")
+                if ln != 0 as u32 { return mc_nbt.nbt_i64(d, ln) as i32 }
+            }
+        }
+        e = mc_nbt.nbt_next(d, e)
+        guard = guard + 1
+    }
+    return 0
+}
+
 // Reads one slot value (present bool, varint item, i8 count, optional NBT). item = -1 for an empty slot. false = malformed.
-fn read_slot(b: *mut bytes.Bytes, protocol: i32, item: *mut i32, count: *mut i32) -> bool {
+fn read_slot(b: *mut bytes.Bytes, protocol: i32, item: *mut i32, count: *mut i32, eff: *mut i32) -> bool {
     *item = 0 - 1
     *count = 0
+    *eff = 0
     let present: bool = bytes.get_bool(b) catch false
     if !present { return true }
     let it: i32 = bytes.get_varint(b) catch (0 - 1)
@@ -111,12 +192,18 @@ fn read_slot(b: *mut bytes.Bytes, protocol: i32, item: *mut i32, count: *mut i32
         bytes.bytes_set_pos(b, bytes.bytes_pos(b) - 1)
         var d: mc_nbt.Doc = mc_nbt.doc_new()
         let ok: bool = mc_nbt.doc_parse(&d, b, protocol >= 764, false) catch false
+        if ok { *eff = nbt_efficiency(&d) }
         mc_nbt.doc_free(&d)
         if !ok { return false }
     }
     *item = it
     *count = n as i32
     return true
+}
+
+fn put_slot_e(v: *mut Inv, slot: i32, item: i32, count: i32, eff: i32) {
+    put_slot(v, slot, item, count)
+    if item >= 0 && count > 0 { inv_set_eff(v, slot, eff) }
 }
 
 fn inv_on_window_items(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool {
@@ -136,9 +223,18 @@ fn inv_on_window_items(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool 
     while i < n {
         var item: i32 = 0 - 1
         var cnt: i32 = 0
-        if !read_slot(b, protocol, &item, &cnt) { (*v).bad = (*v).bad + 1 as u32; return false }
-        put_slot(v, i, item, cnt)
+        var eff: i32 = 0
+        if !read_slot(b, protocol, &item, &cnt, &eff) { (*v).bad = (*v).bad + 1 as u32; return false }
+        put_slot_e(v, i, item, cnt, eff)
         i = i + 1
+    }
+    if protocol >= 756 {
+        // the carried item (1.17.1+); 1.16.5 has none
+        var item: i32 = 0 - 1
+        var cnt: i32 = 0
+        var eff: i32 = 0
+        if !read_slot(b, protocol, &item, &cnt, &eff) { (*v).bad = (*v).bad + 1 as u32; return false }
+        put_slot_e(v, SLOT_CUR, item, cnt, eff)
     }
     return true
 }
@@ -146,14 +242,20 @@ fn inv_on_window_items(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool 
 fn inv_on_set_slot(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool {
     if inv_slot_format(protocol) != 1 { return false }
     let wid: i8 = bytes.get_i8(b) catch ((0 - 2) as i8)
-    if wid != 0 as i8 { return false }
+    if wid != 0 as i8 && wid != (0 - 1) as i8 { return false }
     if protocol >= 756 { (*v).state_id = bytes.get_varint(b) catch 0 }
     let slot16: i16 = bytes.get_i16(b) catch ((0 - 1) as i16)
-    let slot: i32 = slot16 as i32
+    var slot: i32 = slot16 as i32
+    if wid != 0 as i8 {
+        // window -1 slot -1 = the carried stack
+        if slot != 0 - 1 { return false }
+        slot = SLOT_CUR
+    }
     var item: i32 = 0 - 1
     var cnt: i32 = 0
-    if !read_slot(b, protocol, &item, &cnt) { (*v).bad = (*v).bad + 1 as u32; return false }
-    put_slot(v, slot, item, cnt)
+    var eff: i32 = 0
+    if !read_slot(b, protocol, &item, &cnt, &eff) { (*v).bad = (*v).bad + 1 as u32; return false }
+    put_slot_e(v, slot, item, cnt, eff)
     return true
 }
 
@@ -187,15 +289,23 @@ fn parse_dec(p: u64, n: usize, ok: *mut bool) -> i32 {
     return r as i32
 }
 
+// Component type id of `enchantments` per protocol (minecraft-data SlotComponentType): 767 -> 9, 769/772 -> 10, 774/775 -> 13
+fn ench_comp_type(protocol: i32) -> i32 {
+    if protocol <= 767 { return 9 }
+    if protocol <= 772 { return 10 }
+    return 13
+}
+
 // Runs the schema of packet `sem` over the body and applies the slot lines to the inventory.
-// window_items: lines `items[N].itemCount=C` then `items[N].itemId=I` (components and nested slots have longer paths and are ignored).
-// set_slot:     lines `slot=S`, `item.itemCount=C`, `item.itemId=I`.
+// window_items: `items[N].itemCount` then `items[N].itemId`, the carried stack `carriedItem.*`; set_slot: `slot=S`, `item.itemCount`, `item.itemId`
+// (window -1 / slot -1 = carried stack); set_cursor_item: `contents.*`. Component lines `<prefix>.components[K].type=T` and
+// `<prefix>.components[K].data.enchantments[J].id|level=X` give the Efficiency level; nested slots have longer paths and are ignored.
 fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *mut bytes.Bytes) -> bool {
     let id: i32 = mc_version.version_pid(ver, sem)
     if id < 0 { return false }
     let sch: u64 = (*ver).schema_of(mc_version.ST_PLAY, mc_version.DIR_S2C, id)
     if sch == 0 as u64 { return false }
-    let is_items: bool = sem == mc_sem.SEM_PLAY_S2C_WINDOW_ITEMS
+    let kind: i32 = sem_kind(sem)
     let p0: usize = bytes.bytes_pos(b)
     var out: rt.Buf = rt.buf_new()
     let ok: bool = mc_schema.walk_values(sch, b, &out)
@@ -207,12 +317,16 @@ fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *m
     }
     let base: u64 = rt.buf_ptr(&out)
     let total: usize = rt.buf_len(&out)
+    let ect: i32 = ench_comp_type((*ver).protocol)
     var pos: usize = 0
     var target: i32 = 0 - 1 // set_slot: the slot number
+    var win_cur: bool = false
     var pend_n: i32 = 0 - 1
     var pend_c: i32 = 0
+    var comp_type: i32 = 0 - 1
+    var ench_cur: i32 = 0 - 1
     var good: bool = true
-    var n_win_ok: bool = false
+    var n_win_ok: bool = kind == 2
     while pos < total && good {
         var e: usize = pos
         while e < total && rt.ld8(base, e) != 10 as u8 { e = e + 1 }
@@ -227,54 +341,81 @@ fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *m
         var okn: bool = false
         if eq == 8 && line_is(ln, 8, "windowId") {
             let w: i32 = parse_dec(vp, vn, &okn)
-            if !okn || w != 0 { good = false } else { n_win_ok = true }
+            if !okn { good = false } else if w == 0 { n_win_ok = true } else if kind == 1 && (w == 0 - 1 || w == 255) { n_win_ok = true; win_cur = true } else { good = false }
         } else if eq == 7 && line_is(ln, 7, "stateId") {
             let st: i32 = parse_dec(vp, vn, &okn)
             if okn { (*v).state_id = st }
-        } else if is_items {
-            // items[N].itemCount / items[N].itemId
-            if line_is(ln, eq, "items[") {
+        } else if kind == 1 && eq == 4 && line_is(ln, 4, "slot") {
+            target = parse_dec(vp, vn, &okn)
+            if !okn { good = false }
+            if good && win_cur {
+                if target != 0 - 1 { good = false } else { target = SLOT_CUR }
+            }
+        } else {
+            // which stack does the line belong to?
+            var tgt: i32 = 0 - 1
+            var po: usize = 0
+            if kind == 0 && line_is(ln, eq, "items[") {
                 var q: usize = 6
                 while q < eq && rt.ld8(ln, q) != 93 as u8 { q = q + 1 }
-                if q < eq {
-                    let idx: i32 = parse_dec(ln + 6 as u64, q - 6, &okn)
-                    if okn && q + 1 < eq && rt.ld8(ln, q + 1) == 46 as u8 {
-                        let fp: u64 = ln + ((q + 2) as u64)
-                        let fnn: usize = eq - q - 2
-                        if fnn == 9 && line_is(fp, 9, "itemCount") {
-                            let c: i32 = parse_dec(vp, vn, &okn)
-                            if okn && c <= 0 {
-                                put_slot(v, idx, 0 - 1, 0)
-                                pend_n = 0 - 1
-                            } else if okn {
-                                pend_n = idx
-                                pend_c = c
+                let idx: i32 = parse_dec(ln + 6 as u64, q - 6, &okn)
+                if q < eq && okn && q + 1 < eq && rt.ld8(ln, q + 1) == 46 as u8 { tgt = idx; po = q + 2 }
+            } else if kind == 0 && line_is(ln, eq, "carriedItem.") {
+                tgt = SLOT_CUR
+                po = 12
+            } else if kind == 1 && line_is(ln, eq, "item.") {
+                tgt = target
+                po = 5
+            } else if kind == 2 && line_is(ln, eq, "contents.") {
+                tgt = SLOT_CUR
+                po = 9
+            }
+            if tgt != 0 - 1 && po < eq {
+                let fp: u64 = ln + (po as u64)
+                let fnn: usize = eq - po
+                if fnn == 9 && line_is(fp, 9, "itemCount") {
+                    let c: i32 = parse_dec(vp, vn, &okn)
+                    comp_type = 0 - 1
+                    ench_cur = 0 - 1
+                    if okn && c <= 0 {
+                        put_slot(v, tgt, 0 - 1, 0)
+                        pend_n = 0 - 1
+                    } else if okn {
+                        pend_n = tgt
+                        pend_c = c
+                    }
+                } else if fnn == 6 && line_is(fp, 6, "itemId") {
+                    if tgt == pend_n && pend_c > 0 {
+                        let it: i32 = parse_dec(vp, vn, &okn)
+                        if okn { put_slot(v, tgt, it, pend_c) }
+                    }
+                    pend_n = 0 - 1
+                } else if fnn > 12 && line_is(fp, fnn, "components[") {
+                    var r: usize = 11
+                    while r < fnn && rt.ld8(fp, r) != 93 as u8 { r = r + 1 }
+                    if r + 2 < fnn && rt.ld8(fp, r + 1) == 46 as u8 {
+                        let rp: u64 = fp + ((r + 2) as u64)
+                        let rn: usize = fnn - r - 2
+                        if rn == 4 && line_is(rp, 4, "type") {
+                            comp_type = parse_dec(vp, vn, &okn)
+                            if !okn { comp_type = 0 - 1 }
+                        } else if comp_type == ect && (*v).eff_id >= 0 && rn > 19 && line_is(rp, 19, "data.enchantments[") {
+                            var t: usize = 18
+                            while t < rn && rt.ld8(rp, t) != 93 as u8 { t = t + 1 }
+                            if t + 1 < rn && rt.ld8(rp, t + 1) == 46 as u8 {
+                                let sp: u64 = rp + ((t + 2) as u64)
+                                let sn: usize = rn - t - 2
+                                if sn == 2 && line_is(sp, 2, "id") {
+                                    ench_cur = parse_dec(vp, vn, &okn)
+                                    if !okn { ench_cur = 0 - 1 }
+                                } else if sn == 5 && line_is(sp, 5, "level") && ench_cur == (*v).eff_id {
+                                    let lv: i32 = parse_dec(vp, vn, &okn)
+                                    if okn { inv_set_eff(v, tgt, lv) }
+                                }
                             }
-                        } else if fnn == 6 && line_is(fp, 6, "itemId") && idx == pend_n && pend_c > 0 {
-                            let it: i32 = parse_dec(vp, vn, &okn)
-                            if okn { put_slot(v, idx, it, pend_c) }
-                            pend_n = 0 - 1
                         }
                     }
                 }
-            }
-        } else {
-            if eq == 4 && line_is(ln, 4, "slot") {
-                target = parse_dec(vp, vn, &okn)
-                if !okn { good = false }
-            } else if eq == 14 && line_is(ln, 14, "item.itemCount") {
-                let c: i32 = parse_dec(vp, vn, &okn)
-                if okn && c <= 0 {
-                    put_slot(v, target, 0 - 1, 0)
-                    pend_n = 0 - 1
-                } else if okn {
-                    pend_n = target
-                    pend_c = c
-                }
-            } else if eq == 11 && line_is(ln, 11, "item.itemId") && pend_n >= 0 && pend_c > 0 {
-                let it: i32 = parse_dec(vp, vn, &okn)
-                if okn { put_slot(v, pend_n, it, pend_c) }
-                pend_n = 0 - 1
             }
         }
     }
@@ -283,12 +424,24 @@ fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *m
     return true
 }
 
+fn sem_kind(sem: usize) -> i32 {
+    if sem == mc_sem.SEM_PLAY_S2C_WINDOW_ITEMS { return 0 }
+    if sem == mc_sem.SEM_PLAY_S2C_SET_SLOT { return 1 }
+    return 2
+}
+
 // Window Items of window 0, any supported version (hand reader up to 1.20.4, packet schema from 1.20.5)
 fn inv_on_window_items_v(v: *mut Inv, ver: *mut mc_version.Version, b: *mut bytes.Bytes) -> bool {
     let f: i32 = inv_slot_format((*ver).protocol)
     if f == 1 { return inv_on_window_items(v, (*ver).protocol, b) }
     if f == 2 { return apply_components(v, ver, mc_sem.SEM_PLAY_S2C_WINDOW_ITEMS, b) }
     return false
+}
+
+// Set Cursor Item (1.21.2+): the carried stack
+fn inv_on_set_cursor_v(v: *mut Inv, ver: *mut mc_version.Version, b: *mut bytes.Bytes) -> bool {
+    if inv_slot_format((*ver).protocol) != 2 { return false }
+    return apply_components(v, ver, mc_sem.SEM_PLAY_S2C_SET_CURSOR_ITEM, b)
 }
 
 fn inv_on_set_slot_v(v: *mut Inv, ver: *mut mc_version.Version, b: *mut bytes.Bytes) -> bool {
@@ -319,4 +472,210 @@ fn inv_send_creative(cl: *mut mc_client.Client, slot: i32, item: i32, count: i32
     let ok: bool = mc_client.client_send(cl, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_SET_CREATIVE_SLOT, &b)
     bytes.bytes_free(&b)
     return ok
+}
+
+// ---- Click Container (window 0) ---------------------------------------------------------------------------------------
+
+// slot encoding of the click packets: 0 = none (no slot layout), 1 = "present bool, item, i8 count, NBT" (1.13.2 .. 1.20.4),
+// 2 = data components (1.20.5 .. 1.21.4), 3 = hashed stacks "option(item, count, added hashes, removed ids)" (1.21.5+, protocol 770+)
+fn inv_click_kind(protocol: i32) -> i32 {
+    let f: i32 = inv_slot_format(protocol)
+    if f == 1 { return 1 }
+    if f == 2 && protocol >= 770 { return 3 }
+    if f == 2 { return 2 }
+    return 0
+}
+
+fn put_click_slot(b: *mut bytes.Bytes, kind: i32, item: i32, count: i32) {
+    let empty: bool = item < 0 || count <= 0
+    if kind == 1 {
+        if empty { bytes.put_bool(b, false); return }
+        bytes.put_bool(b, true)
+        bytes.put_varint(b, item)
+        bytes.put_i8(b, count as i8)
+        bytes.put_u8(b, 0 as u8)
+    } else if kind == 2 {
+        if empty { bytes.put_varint(b, 0); return }
+        bytes.put_varint(b, count)
+        bytes.put_varint(b, item)
+        bytes.put_varint(b, 0)
+        bytes.put_varint(b, 0)
+    } else {
+        if empty { bytes.put_bool(b, false); return }
+        bytes.put_bool(b, true)
+        bytes.put_varint(b, item)
+        bytes.put_varint(b, count)
+        bytes.put_varint(b, 0)
+        bytes.put_varint(b, 0)
+    }
+}
+
+fn stack_max(v: *mut Inv, item: i32) -> i32 {
+    if (*v).reg == 0 { return 64 }
+    let m: i32 = mc_registry.reg_item_stack((*v).reg as *mut mc_registry.Registry, item)
+    if m <= 0 { return 64 }
+    return m
+}
+
+// stack at `slot` (SLOT_CUR = carried) as plain values
+fn load(v: *mut Inv, slot: i32, item: *mut i32, count: *mut i32, eff: *mut i32) {
+    if slot == SLOT_CUR {
+        *item = (*v).cur_id
+        *count = (*v).cur_count
+        *eff = (*v).cur_eff
+        return
+    }
+    *item = inv_item(v, slot)
+    *count = inv_count(v, slot)
+    *eff = inv_eff(v, slot)
+}
+
+fn store(v: *mut Inv, slot: i32, item: i32, count: i32, eff: i32) {
+    put_slot_e(v, slot, item, count, eff)
+}
+
+// Applies mode 0 / 2 / 4 to the local inventory (vanilla ClickType PICKUP / SWAP / THROW). `ca` / `cb` get the changed slots (-1 = none).
+// false = not predicted (shift click, double click, drag, crafting result): nothing is changed.
+fn predict(v: *mut Inv, slot: i32, button: i32, mode: i32, ca: *mut i32, cb: *mut i32) -> bool {
+    *ca = 0 - 1
+    *cb = 0 - 1
+    var ci: i32 = 0 - 1
+    var cc: i32 = 0
+    var ce: i32 = 0
+    load(v, SLOT_CUR, &ci, &cc, &ce)
+    if mode == 0 && slot == CLICK_OUTSIDE {
+        if ci < 0 { return true }
+        if button == 0 { store(v, SLOT_CUR, 0 - 1, 0, 0) } else { store(v, SLOT_CUR, ci, cc - 1, ce) }
+        return true
+    }
+    if slot <= 0 || slot as usize >= INV_SLOTS { return false }
+    var si: i32 = 0 - 1
+    var sc: i32 = 0
+    var se: i32 = 0
+    load(v, slot, &si, &sc, &se)
+    if mode == 0 && (button == 0 || button == 1) {
+        *ca = slot
+        if ci < 0 && si < 0 { return true }
+        if ci >= 0 && si >= 0 && ci == si && ce == se {
+            let mx: i32 = stack_max(v, si)
+            var mv: i32 = cc
+            if button == 1 { mv = 1 }
+            if sc + mv > mx { mv = mx - sc }
+            if mv <= 0 { return true }
+            store(v, slot, si, sc + mv, se)
+            store(v, SLOT_CUR, ci, cc - mv, ce)
+            return true
+        }
+        if button == 0 || (ci >= 0 && si >= 0) {
+            // swap (left click: also move whole stacks to / from an empty side)
+            store(v, slot, ci, cc, ce)
+            store(v, SLOT_CUR, si, sc, se)
+            return true
+        }
+        if ci < 0 {
+            // right click on a stack with an empty hand: take half (rounded up)
+            let take: i32 = (sc + 1) / 2
+            store(v, SLOT_CUR, si, take, se)
+            store(v, slot, si, sc - take, se)
+            return true
+        }
+        // right click with a stack on an empty slot: put one
+        store(v, slot, ci, 1, ce)
+        store(v, SLOT_CUR, ci, cc - 1, ce)
+        return true
+    }
+    if mode == 2 {
+        var other: i32 = 0 - 1
+        if button >= 0 && button <= 8 { other = INV_HOTBAR0 + button }
+        if button == 40 { other = 45 }
+        if other < 0 || other == slot { return false }
+        var oi: i32 = 0 - 1
+        var oc: i32 = 0
+        var oe: i32 = 0
+        load(v, other, &oi, &oc, &oe)
+        *ca = slot
+        *cb = other
+        store(v, slot, oi, oc, oe)
+        store(v, other, si, sc, se)
+        return true
+    }
+    if mode == 4 && (button == 0 || button == 1) {
+        if si < 0 { return true }
+        *ca = slot
+        if button == 1 { store(v, slot, 0 - 1, 0, 0) } else { store(v, slot, si, sc - 1, se) }
+        return true
+    }
+    return false
+}
+
+// Builds the Click Container body for window 0 (with the predicted result) and applies the prediction to the local inventory.
+// false = this protocol has no slot layout (nothing built, nothing changed).
+fn inv_click_build(v: *mut Inv, protocol: i32, slot: i32, button: i32, mode: i32, b: *mut bytes.Bytes) -> bool {
+    let kind: i32 = inv_click_kind(protocol)
+    if kind == 0 { return false }
+    // the stack the client believes is in the slot (legacy packets carry it)
+    var pi: i32 = 0 - 1
+    var pc: i32 = 0
+    var pe: i32 = 0
+    if slot >= 0 { load(v, slot, &pi, &pc, &pe) }
+    var ca: i32 = 0 - 1
+    var cb: i32 = 0 - 1
+    let pred: bool = predict(v, slot, button, mode, &ca, &cb)
+    if protocol < 756 {
+        bytes.put_u8(b, 0 as u8)
+        bytes.put_i16(b, slot as i16)
+        bytes.put_i8(b, button as i8)
+        bytes.put_i16(b, (*v).action as i16)
+        (*v).action = (*v).action + 1
+        bytes.put_i8(b, mode as i8)
+        put_click_slot(b, kind, pi, pc)
+    } else {
+        if protocol >= 768 { bytes.put_varint(b, 0) } else { bytes.put_u8(b, 0 as u8) }
+        bytes.put_varint(b, (*v).state_id)
+        bytes.put_i16(b, slot as i16)
+        bytes.put_i8(b, button as i8)
+        bytes.put_varint(b, mode)
+        var n: i32 = 0
+        if pred && ca >= 0 { n = n + 1 }
+        if pred && cb >= 0 { n = n + 1 }
+        bytes.put_varint(b, n)
+        var k: i32 = 0
+        while k < 2 {
+            var s: i32 = ca
+            if k == 1 { s = cb }
+            if pred && s >= 0 { bytes.put_i16(b, s as i16); put_click_slot(b, kind, inv_item(v, s), inv_count(v, s)) }
+            k = k + 1
+        }
+        put_click_slot(b, kind, (*v).cur_id, (*v).cur_count)
+    }
+    return true
+}
+
+// Click Container for window 0: builds the packet (see inv_click_build), sends it, counts it.
+fn inv_click(cl: *mut mc_client.Client, v: *mut Inv, slot: i32, button: i32, mode: i32) -> bool {
+    var b: bytes.Bytes = bytes.bytes_new()
+    if !inv_click_build(v, (*cl).ver.protocol, slot, button, mode, &b) {
+        bytes.bytes_free(&b)
+        return false
+    }
+    let ok: bool = mc_client.client_send(cl, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_WINDOW_CLICK, &b)
+    bytes.bytes_free(&b)
+    if ok { (*v).n_clicks = (*v).n_clicks + 1 as u32 }
+    return ok
+}
+
+fn inv_drop_slot(cl: *mut mc_client.Client, v: *mut Inv, slot: i32, all: bool) -> bool {
+    var btn: i32 = 0
+    if all { btn = 1 }
+    return inv_click(cl, v, slot, btn, 4)
+}
+
+// local part of the Drop Item player action (status 4 = one, 3 = the whole stack) on a hotbar / inventory slot
+fn inv_local_drop(v: *mut Inv, slot: i32, all: bool) -> bool {
+    let it: i32 = inv_item(v, slot)
+    let c: i32 = inv_count(v, slot)
+    if it < 0 || c <= 0 { return false }
+    let e: i32 = inv_eff(v, slot)
+    if all { put_slot(v, slot, 0 - 1, 0) } else { put_slot_e(v, slot, it, c - 1, e) }
+    return true
 }
