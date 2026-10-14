@@ -34,5 +34,13 @@ Entity { id, kind (0 object, 1 living, 2 player), type_id, uuid, x y z (f64 bloc
 * Real vanilla servers byte-identical to node-minecraft-protocol: 1.20.1, 1.8.9 (see the report of w10 for 1.21.4).
 
 ## Open
-* 1.21.2+ `entity_teleport`: minecraft-data lists the OLD layout (yaw i8); check against a real 1.21.4 server (override in gen_entity.py if it differs).
+* 1.21.2+ `entity_teleport` (z3, 14.10.2026): minecraft-data lists the OLD layout (yaw i8); the game layout is id, pos f64x3, delta f64x3,
+  yaw f32, pitch f32, relative flags i32, on ground (= sync_entity_position + flags). `gen_entity.py` OVERRIDES applies it from protocol 768
+  (only while minecraft-data still yields the stale program), `ref_dump.cjs`/`gen.cjs` decode/serialize it the same way, test 2974.
+  NOT proven live: a real 1.21.4 server never sent entity_teleport in any trigger tried (pig /tp with and without rotation, `data merge Pos`,
+  passengers on stand/boat/horse, 40 m teleports, dimension change of the bot, falling block, item frame, crystals ...) -- 1.21.2+ servers
+  send sync_entity_position instead (live proven, byte-identical incl. yaw/pitch f32). The layout rests on the packet structure
+  (position + delta movement + rotation + relatives + on ground), shared with the proven sync packet.
+* lpVec3 (1.21.9+) proven live on 1.21.11 + 26.1 (z3): spawn_entity / entity_velocity with Motion [0.5,0.3,-0.2] (6 octets) and
+  [8,1,-6] (scale 8 -> bit 2 set, varint extension, 7 octets); decoded values equal the summoned Motion, entity files EQUAL.
 * 1.20.2+: players arrive as spawn_entity; name is resolved by uuid from player_info (cross-check yes, real server only via the bot).

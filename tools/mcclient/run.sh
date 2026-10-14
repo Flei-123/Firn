@@ -199,6 +199,18 @@ ent_script() { # $1 = number of the join line to wait for; then plays the events
   echo "$EXEC_AT tp @e[type=$PIG] ~ ~3 ~-3" >&3; sleep 0.5
   # MC_ENT_ROT=1: teleport the pig again WITH a rotation (yaw 90, pitch 30) to check the entity_teleport layout
   [ "${MC_ENT_ROT:-0}" = 1 ] && { echo "$EXEC_AT tp @e[type=$PIG] ~ ~3 ~-3 90 30" >&3; sleep 0.5; }
+  # MC_ENT_EXTRA="cmd1;cmd2": extra server commands after the rotation teleport (placeholders @PIG@ @CHICKEN@ @STAND@
+  # @AT@ = type names / the execute-at prefix); used to provoke rarer packets (entity_teleport with passengers ...)
+  if [ -n "${MC_ENT_EXTRA:-}" ]; then
+    local IFS_OLD="$IFS" ex
+    IFS=';'; for ex in $MC_ENT_EXTRA; do
+      IFS="$IFS_OLD"
+      ex="${ex//@PIG@/$PIG}"; ex="${ex//@CHICKEN@/$CHICKEN}"; ex="${ex//@STAND@/$STAND}"; ex="${ex//@AT@/$EXEC_AT}"
+      echo "$ex" >&3; sleep 0.6
+      IFS=';'
+    done
+    IFS="$IFS_OLD"
+  fi
   echo "$EXEC_AT summon $CHICKEN ~ ~2 ~-3 {NoAI:1b}" >&3; sleep 0.5
   echo "kill @e[type=$CHICKEN]" >&3; sleep 0.3
 }
