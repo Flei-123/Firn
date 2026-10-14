@@ -784,6 +784,16 @@ fn win64_thunk_asm(t: &str, sym: &str, kinds: &[u8]) -> String {
                 nx += 1;
             }
             b'f' | b'd' => stack_args.push(src),
+            // `v128`: Win64 passed a pointer to 16 octets (an integer slot, parked above); System V
+            // wants the vector itself in the next xmm (extfn.rs rejects the overflow case).
+            b'v' => {
+                loads.push(format!(
+                    "    mov rax, qword ptr [rbp+{}]\n    movups xmm{}, xmmword ptr [rax]\n",
+                    src,
+                    nx.min(7)
+                ));
+                nx += 1;
+            }
             _ if ni < 6 => {
                 loads.push(format!("    mov {}, qword ptr [rbp+{}]\n", sysv_int[ni], src));
                 ni += 1;
@@ -1230,6 +1240,17 @@ mod tests {
         assert!(a.contains("add rsp, 48"), "{}", a);
         // the last stack word is argument position 12: [rbp+16+8*12]
         assert!(a.contains("mov rax, qword ptr [rbp+112]"), "{}", a);
+    }
+
+    #[test]
+    fn a_v128_argument_is_loaded_through_its_hidden_pointer() {
+        // (i64, v128, v128, f64): slots 1 and 2 are pointers (rdx, r8), the vectors land in xmm0 / xmm1, the f64 in xmm2.
+        let a = win64_thunk_asm("t", "sym", &[b'i', b'v', b'v', b'd']);
+        assert!(a.contains("mov qword ptr [rbp+24], rdx"), "{}", a);
+        assert!(a.contains("mov qword ptr [rbp+32], r8"), "{}", a);
+        assert!(a.contains("mov rax, qword ptr [rbp+24]\n    movups xmm0, xmmword ptr [rax]"), "{}", a);
+        assert!(a.contains("mov rax, qword ptr [rbp+32]\n    movups xmm1, xmmword ptr [rax]"), "{}", a);
+        assert!(a.contains("movsd xmm2, qword ptr [rbp+40]"), "{}", a);
     }
 
     #[test]

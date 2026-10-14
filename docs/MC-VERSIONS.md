@@ -91,6 +91,8 @@ The client picks the version from the protocol number in the server-list ping.
 | **1.8.9** | **47** | yes | yes (448 packets x 4 stages) | `CF_LEGACY_8` **implemented** (`mc_chunk.chunk_decode_legacy8`, `legacy8_bulk_*`) | **yes** (11.10.2026: real 1.8.9 server, dump byte-identical to the reference client, 81 chunks) |
 | **1.12.2** | **340** | yes | yes (500) | `CF_SECTIONS_19` **implemented** (`mc_chunk.chunk_decode_19`) | **yes** (11.10.2026: real 1.12.2 server, dump byte-identical to the reference client, 81 chunks) |
 | **1.16.5** | **754** | yes | yes (616) | `CF_SECTIONS_114` **implemented** (`mc_chunk.chunk_decode_114`, protocols 751-754) | **yes** (11.10.2026: real 1.16.5 server, dump byte-identical to the reference client, 121 chunks) |
+| **1.18.2** | **758** | yes | yes | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` **implemented** | **yes** (14.10.2026: real 1.18.2 server, dump byte-identical to the reference client, 121 chunks) |
+| **1.19.4** | **762** | yes | yes | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` **implemented** | **yes** (14.10.2026: real 1.19.4 server, byte-identical, 121 chunks, entities equal) |
 | **1.20.1** | **763** | yes | yes (704) | `CF_CONTAINERS_118` **implemented** | in progress (M0) |
 | **1.20.2** | **764** | yes (has the Configuration state) | yes (788) | `CF_CONTAINERS_118` (same, nameless NBT roots) | **yes** (11.10.2026: real 1.20.2 server incl. configuration phase, dump byte-identical, 109 chunks) |
 | **1.21.1** | **767** | yes | yes (904) | `CF_CONTAINERS_118` **verified** | **yes** (11.10.2026: real 1.21.1 server, Known Packs answered, dump byte-identical to the reference, 109 chunks) |
@@ -128,6 +130,8 @@ particle status (without it the server falls back to view distance 2: 49 instead
 
 | Version | Result |
 |---|---|
+| 1.18.2 (758) | **PASS (14.10.2026)**: A == A2, B == A, 121 chunks, checksum cddbe507a6b4. **Cause of `chunk_bad=121`**: map_chunk and update_light of 1.18 - 1.19.4 carry a `trustEdges` bool before the four light masks (minecraft-data lists it); the decoder did not read it, so the packet was not consumed exactly. Fix: `FLAG_TRUST_EDGES` (versions.json 1.18.2/1.19.4 -> `mc_chunk.Scratch.trust`, `lightdata_decode_118(.., trust_edges)`); test 2952. 1.20 (763) dropped the bool. |
+| 1.19.4 (762) | **PASS (14.10.2026)**: A == A2, B == A, 121 chunks, checksum 0fb83124ffed, entities equal; same fix. The earlier A != A2 did not reproduce with the existing gamerule block (randomTickSpeed 0, doMobSpawning false, doDaylightCycle false) and the default settle run. |
 | 1.21.1 (767) | PASS: A == A2, B == A, 109 chunks, byte identical |
 | 1.21.4 (769) | PASS: 117 chunks, byte identical |
 | 1.21.8 (772) | PASS: 117 chunks, byte identical (reference reads the new shape: `MC_PROTOCOL >= 770` in `ref_dump.cjs`) |

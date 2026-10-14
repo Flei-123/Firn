@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # tools/stack_e/run_g5.sh -- G5: `firnc --shared` for the Windows DLL (x86_64-windows, run under Wine) and the aarch64 .so (run under qemu-aarch64).
 # Called by run.sh (gate 134); also usable alone. Wine stages share ~/.wine-firn: never run two at once.
-# NOT covered: a real Windows, a real aarch64 machine, v128 in DLL exports (refused), by-value structs in exports,
-# host threads in a DLL (thread_attach is only proven for the Linux x86-64 .so and the aarch64 .so under qemu).
+# NOT covered: a real Windows, a real aarch64 machine, by-value structs in exports, v128 beyond xmm7 in DLL exports (refused).
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
@@ -29,8 +28,18 @@ if command -v wine >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null; t
         "$FIRNC" --shared --target=x86_64-windows --opt-level=$lvl -o "$D/abi.dll" tools/stack_e/lib_abi.fi || { echo "FAIL dll lib_abi $lvl"; rc=1; continue; }
         (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 120 wine host_abi.exe abi.dll 2>&1 | grep -q 'host_abi: all ok') && echo "ok  Windows DLL floats + stack arguments under Wine ($lvl)" || { echo "FAIL DLL float/stack ABI (wine, $lvl)"; rc=1; }
     done
-    # a v128 parameter is still refused with a clear error (Win64 passes vectors by hidden pointer)
-    printf '#[export_c]\nfn bad_v(x: v128) -> u64 { return 0 }\n' > "$D/badv.fi"
+    # host threads of their own in a DLL (r506): 4 CreateThread threads attach/detach in two waves (entries recycled), jobs + GC
+    x86_64-w64-mingw32-gcc -O1 -o "$D/hat.exe" tools/stack_e/host_attach_win.c || { echo "FAIL mingw host_attach_win"; rc=1; }
+    for lvl in dev-fast release-fast; do
+        "$FIRNC" --shared --target=x86_64-windows --opt-level=$lvl -o "$D/rta.dll" tools/stack_e/lib_rt.fi || { echo "FAIL dll lib_rt (attach) $lvl"; rc=1; continue; }
+        ok=1
+        for rep in 1 2 3; do
+            (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 300 wine hat.exe rta.dll 2>&1 | tail -1 | grep -q 'ok  host_attach') || { echo "FAIL DLL attached host threads (wine, $lvl, run $rep)"; rc=1; ok=0; break; }
+        done
+        [ $ok = 1 ] && echo "ok  Windows DLL attached host threads under Wine ($lvl)"
+    done
+    # a v128 parameter that finds no xmm0-7 register is refused with a clear error (the others are passed: abi_v128_* above)
+    printf '#[export_c]\nfn bad_v(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f64, h: f64, x: v128) -> u64 { return 0 }\n' > "$D/badv.fi"
     "$FIRNC" --shared --target=x86_64-windows -o "$D/badv.dll" "$D/badv.fi" 2> "$D/err" && { echo "FAIL dll: v128 export accepted"; rc=1; } || grep -q 'v128' "$D/err" || { echo "FAIL dll: v128 error text"; rc=1; }
 else echo "skip  Windows DLL (no wine / mingw)"; fi
 if command -v qemu-aarch64 >/dev/null && command -v aarch64-linux-gnu-gcc >/dev/null && [ -d /usr/aarch64-linux-gnu/lib ]; then

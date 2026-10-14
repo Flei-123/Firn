@@ -185,11 +185,12 @@ pub fn export_names() -> Vec<String> {
 
 /// Windows DLL (`--shared --target=x86_64-windows`): one Win64 entry thunk per
 /// `#[export_c]` function. `(internal name, C name, parameter classes, unsupported)`.
-/// The classes are `b'i'` (integer / pointer / bool), `b'f'` (`f32`) and `b'd'` (`f64`);
+/// The classes are `b'i'` (integer / pointer / bool), `b'f'` (`f32`), `b'd'` (`f64`) and `b'v'` (`v128`, which Win64
+/// passes as a pointer to 16 octets: integer slot, the thunk loads it into the next `xmm`);
 /// the thunk moves `rcx/rdx/r8/r9 | xmm0-3 | stack` to the System V placement Firn
 /// code uses (integers `rdi..r9`, floats `xmm0-7`, the rest on the stack). `unsupported`
-/// is set for `v128` parameters (Win64 passes those by hidden pointer): the caller
-/// rejects them with a clear error.
+/// is set when a `v128` would not find an `xmm0-7` register (System V puts it on the stack
+/// then): the caller rejects that with a clear error.
 pub fn export_thunk_info() -> Vec<(String, String, Vec<u8>, bool)> {
     let exported: Vec<(String, String)> =
         EXPORTED.with(|e| e.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect());
@@ -206,11 +207,14 @@ pub fn export_thunk_info() -> Vec<(String, String, Vec<u8>, bool)> {
                         match n.as_str() {
                             "f32" => k = b'f',
                             "f64" => k = b'd',
-                            "v128" => unsupported = true,
+                            "v128" => k = b'v',
                             _ => {}
                         }
                     }
                     kinds.push(k);
+                }
+                if kinds.contains(&b'v') && kinds.iter().filter(|k| **k != b'i').count() > 8 {
+                    unsupported = true;
                 }
                 Some((internal, sig.c_name.clone(), kinds, unsupported))
             })

@@ -74,7 +74,8 @@
 //! The one thing of the collector that cannot work unchanged is where the
 //! stack BEGINS: `gc_init` reads it from `/proc/self/maps`. There are no
 //! files in a browser. The two functions that read it
-//! (`__gc_stack_bottom_maps`, `__gc_stack_bottom`) are therefore given a
+//! (`__gc_stack_bottom_maps`, `__gc_stack_range_maps` -- the wrapper may be inlined into `gc_init` --,
+//! `__gc_stack_bottom`) are therefore given a
 //! body of one instruction here — the top of the shadow stack — and their
 //! file access is never translated (`OVERRIDES`).
 //!
@@ -154,7 +155,7 @@ const PAGE: u32 = 65536;
 /// `__gc_vdso_find` reads `/proc/self/auxv` to find the vDSO of the Linux
 /// kernel (the fast clock of the collector); a browser has neither, so it
 /// answers 1 = "there is none here" and `__gc_now_ns` takes the host clock.
-const OVERRIDES: [&str; 3] = ["__gc_stack_bottom_maps", "__gc_stack_bottom", "__gc_vdso_find"];
+const OVERRIDES: [&str; 4] = ["__gc_stack_bottom_maps", "__gc_stack_range_maps", "__gc_stack_bottom", "__gc_vdso_find"];
 
 /// The imports the host provides, in index order.
 const HOST: [(&str, &[VT], &[VT]); 6] = [
