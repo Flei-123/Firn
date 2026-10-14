@@ -1,0 +1,310 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/android/dngwrite.fi -- DNG (TIFF/EP style, little endian) WRITER for RAW_SENSOR frames.
+//
+//     import plat.android.dngwrite
+//     import photo.meta
+//
+// Android's DngCreator is Java-only. This file writes the same kind of file in pure Firn from the
+// de-strided RAW16 pixels (w * h * 2 octets, little endian, as the camera delivers them) and the
+// metadata the camera API reported (photo.meta.SensorMeta + DngExtra). Nothing is hard coded for one
+// device: every tag whose source value is missing (`has_*` false) is simply left out, and readers
+// fall back to their own defaults (no ColorMatrix -> identity-ish, no NoiseProfile -> estimate).
+//
+// Layout: header | IFD0 (<= MAX_ENTRIES entries) | extra values | raw strip (4 octet aligned).
+// The result is a baseline DNG 1.4 (backward version 1.1): one CFA image, uncompressed 16 bit.
+import photo.meta
+
+export {
+    DngExtra, dng_extra_default, dng_max_size, dng_write, dng_check,
+    DNG_ILLUM_UNKNOWN, DNG_ILLUM_D65, DNG_ILLUM_D50, DNG_ILLUM_A,
+}
+
+const DNG_ILLUM_UNKNOWN: u32 = 0
+const DNG_ILLUM_D65: u32 = 21
+const DNG_ILLUM_D50: u32 = 23
+const DNG_ILLUM_A: u32 = 17
+
+const MAX_ENTRIES: usize = 30
+const HEADER_AND_IFD: usize = 8 + 2 + 30 * 12 + 4 // = 374
+const TAIL_RESERVE: usize = 1024
+
+// Values that are not part of SensorMeta but belong into a DNG.
+struct DngExtra {
+    color: [f32; 9],       // ColorMatrix1: XYZ (D50-ish reference illuminant) -> camera, row major
+    has_color: bool,
+    illuminant: u32,       // CalibrationIlluminant1, EXIF LightSource numbers (Camera2 uses the same)
+    neutral: [f32; 3],     // AsShotNeutral: camera white as R, G, B (1 = full scale)
+    has_neutral: bool,
+    orientation: u32,      // TIFF orientation 1..8 (1 = as stored)
+    model: [u8; 48],       // UniqueCameraModel, zero terminated ASCII
+    has_model: bool,
+}
+
+#[no_gc]
+fn dng_extra_default() -> DngExtra {
+    return DngExtra {
+        color: [1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f],
+        has_color: false,
+        illuminant: DNG_ILLUM_UNKNOWN,
+        neutral: [1.0f, 1.0f, 1.0f],
+        has_neutral: false,
+        orientation: 1 as u32,
+        model: [0 as u8; 48],
+        has_model: false,
+    }
+}
+
+// Upper bound of the file size for a w x h frame.
+fn dng_max_size(w: u32, h: u32) -> usize {
+    return HEADER_AND_IFD + TAIL_RESERVE + (w as usize) * (h as usize) * 2 + 16
+}
+
+fn st8(p: u64, at: usize, v: u32) {
+    *((p + at as u64) as *mut u8) = (v & 255 as u32) as u8
+}
+
+fn st16(p: u64, at: usize, v: u32) {
+    st8(p, at, v)
+    st8(p, at + 1, v >> 8 as u32)
+}
+
+fn st32(p: u64, at: usize, v: u32) {
+    st16(p, at, v & 65535 as u32)
+    st16(p, at + 2, v >> 16 as u32)
+}
+
+fn ld16(p: u64, at: usize) -> u32 {
+    return (*((p + at as u64) as *mut u8)) as u32 | ((*((p + at as u64 + 1 as u64) as *mut u8)) as u32) << 8 as u32
+}
+
+fn ld32(p: u64, at: usize) -> u32 {
+    return ld16(p, at) | ld16(p, at + 2) << 16 as u32
+}
+
+// IFD writer state lives in a tiny raw struct so helpers can share it.
+struct W {
+    out: u64,
+    n: usize,      // entries written
+    x: usize,      // next free octet of the extra area
+}
+
+fn put_entry(w: *mut W, tag: u32, typ: u32, count: u32) -> usize {
+    let at: usize = 10 + (*w).n * 12
+    st16((*w).out, at, tag)
+    st16((*w).out, at + 2, typ)
+    st32((*w).out, at + 4, count)
+    (*w).n = (*w).n + 1
+    return at + 8
+}
+
+fn e_short(w: *mut W, tag: u32, v: u32) {
+    let a: usize = put_entry(w, tag, 3 as u32, 1 as u32)
+    st16((*w).out, a, v)
+}
+
+fn e_long(w: *mut W, tag: u32, v: u32) {
+    let a: usize = put_entry(w, tag, 4 as u32, 1 as u32)
+    st32((*w).out, a, v)
+}
+
+fn e_bytes4(w: *mut W, tag: u32, b0: u32, b1: u32, b2: u32, b3: u32) {
+    let a: usize = put_entry(w, tag, 1 as u32, 4 as u32)
+    st8((*w).out, a, b0)
+    st8((*w).out, a + 1, b1)
+    st8((*w).out, a + 2, b2)
+    st8((*w).out, a + 3, b3)
+}
+
+// Reserve `size` octets in the extra area (4 aligned), point the entry at it, return its position.
+fn e_extra(w: *mut W, tag: u32, typ: u32, count: u32, size: usize) -> usize {
+    let a: usize = put_entry(w, tag, typ, count)
+    let pos: usize = (*w).x
+    st32((*w).out, a, pos as u32)
+    (*w).x = pos + ((size + 3) / 4) * 4
+    return pos
+}
+
+fn round_i32(v: f32, scale: f32) -> i32 {
+    let s: f32 = v * scale
+    if s >= 0.0f {
+        return (s + 0.5f) as i32
+    }
+    return 0 - ((0.0f - s + 0.5f) as i32)
+}
+
+fn e_srational(w: *mut W, tag: u32, v: u64, n: usize) {
+    let pos: usize = e_extra(w, tag, 10 as u32, n as u32, n * 8)
+    var i: usize = 0
+    while i < n {
+        st32((*w).out, pos + i * 8, ((round_i32(*((v + (i * 4) as u64) as *mut f32), 10000.0f) as i64) & 4294967295) as u32)
+        st32((*w).out, pos + i * 8 + 4, 10000 as u32)
+        i = i + 1
+    }
+}
+
+// Writes the DNG into `out` (capacity >= dng_max_size). `raw` points at w*h u16 samples (row major,
+// no padding). Returns the file size, 0 on bad arguments.
+fn dng_write(out: u64, cap: usize, raw: u64, wpx: u32, hpx: u32, m: *mut meta.SensorMeta,
+             ex: *mut DngExtra) -> usize {
+    if out == 0 || raw == 0 || wpx == 0 as u32 || hpx == 0 as u32 {
+        return 0
+    }
+    let data_bytes: usize = (wpx as usize) * (hpx as usize) * 2
+    if cap < dng_max_size(wpx, hpx) {
+        return 0
+    }
+    var zi: usize = 0
+    while zi < HEADER_AND_IFD {
+        st8(out, zi, 0 as u32)
+        zi = zi + 1
+    }
+    st8(out, 0, 73 as u32)
+    st8(out, 1, 73 as u32)
+    st16(out, 2, 42 as u32)
+    st32(out, 4, 8 as u32)
+    var w: W = W { out: out, n: 0, x: HEADER_AND_IFD }
+    let pw: *mut W = &w
+    // The strip goes behind the extra values; its offset is patched after the extra area is known.
+    e_long(pw, 254 as u32, 0 as u32)
+    e_long(pw, 256 as u32, wpx)
+    e_long(pw, 257 as u32, hpx)
+    e_short(pw, 258 as u32, 16 as u32)
+    e_short(pw, 259 as u32, 1 as u32)
+    e_short(pw, 262 as u32, 32803 as u32)
+    let strip_entry: usize = put_entry(pw, 273 as u32, 4 as u32, 1 as u32)
+    var orient: u32 = (*ex).orientation
+    if orient < 1 as u32 || orient > 8 as u32 {
+        orient = 1 as u32
+    }
+    e_short(pw, 274 as u32, orient)
+    e_short(pw, 277 as u32, 1 as u32)
+    e_long(pw, 278 as u32, hpx)
+    e_long(pw, 279 as u32, data_bytes as u32)
+    e_short(pw, 284 as u32, 1 as u32)
+    // CFA repeat dim 2x2 and the pattern (0 red, 1 green, 2 blue)
+    let a1: usize = put_entry(pw, 33421 as u32, 3 as u32, 2 as u32)
+    st16(out, a1, 2 as u32)
+    st16(out, a1 + 2, 2 as u32)
+    e_bytes4(pw, 33422 as u32,
+        meta.cfa_color((*m).cfa, 0 as u32), meta.cfa_color((*m).cfa, 1 as u32),
+        meta.cfa_color((*m).cfa, 2 as u32), meta.cfa_color((*m).cfa, 3 as u32))
+    e_bytes4(pw, 50706 as u32, 1 as u32, 4 as u32, 0 as u32, 0 as u32)
+    e_bytes4(pw, 50707 as u32, 1 as u32, 1 as u32, 0 as u32, 0 as u32)
+    if (*ex).has_model {
+        var ml: usize = 0
+        while ml < 47 && (*ex).model[ml] != 0 as u8 {
+            ml = ml + 1
+        }
+        let mp: usize = e_extra(pw, 50708 as u32, 2 as u32, (ml + 1) as u32, ml + 1)
+        var k: usize = 0
+        while k < ml {
+            st8(out, mp + k, (*ex).model[k] as u32)
+            k = k + 1
+        }
+        st8(out, mp + ml, 0 as u32)
+    }
+    // black level: 2x2 repeat, rational 1/16 steps; white level
+    let a2: usize = put_entry(pw, 50713 as u32, 3 as u32, 2 as u32)
+    st16(out, a2, 2 as u32)
+    st16(out, a2 + 2, 2 as u32)
+    var black: [f32; 4] = [0.0f, 0.0f, 0.0f, 0.0f]
+    var white: u32 = 65535 as u32
+    if (*m).has_black {
+        black = (*m).black
+        white = (*m).white_level as u32
+    }
+    let bp: usize = e_extra(pw, 50714 as u32, 5 as u32, 4 as u32, 32)
+    var bi: usize = 0
+    while bi < 4 {
+        st32(out, bp + bi * 8, round_i32(black[bi], 16.0f) as u32)
+        st32(out, bp + bi * 8 + 4, 16 as u32)
+        bi = bi + 1
+    }
+    e_long(pw, 50717 as u32, white)
+    if (*ex).has_color {
+        e_srational(pw, 50721 as u32, (&(*ex).color[0]) as u64, 9)
+    }
+    if (*ex).has_neutral {
+        let np: usize = e_extra(pw, 50728 as u32, 5 as u32, 3 as u32, 24)
+        var ni: usize = 0
+        while ni < 3 {
+            st32(out, np + ni * 8, round_i32((*ex).neutral[ni], 1000000.0f) as u32)
+            st32(out, np + ni * 8 + 4, 1000000 as u32)
+            ni = ni + 1
+        }
+    }
+    if (*ex).has_color || (*m).has_forward {
+        if (*ex).illuminant != DNG_ILLUM_UNKNOWN {
+            e_short(pw, 50778 as u32, (*ex).illuminant)
+        }
+    }
+    if (*m).has_forward {
+        e_srational(pw, 50964 as u32, (&(*m).forward[0]) as u64, 9)
+    }
+    if (*m).has_noise {
+        // NoiseProfile: (S, O) per CFA site, doubles
+        let dp: usize = e_extra(pw, 51041 as u32, 12 as u32, 8 as u32, 64)
+        var di: usize = 0
+        while di < 4 {
+            st_f64(out, dp + di * 16, (*m).ns[di] as f64)
+            st_f64(out, dp + di * 16 + 8, (*m).no[di] as f64)
+            di = di + 1
+        }
+    }
+    st16(out, 8, w.n as u32)
+    st32(out, 10 + w.n * 12, 0 as u32)
+    // the strip
+    let strip: usize = ((w.x + 3) / 4) * 4
+    st32(out, strip_entry, strip as u32)
+    var i: usize = 0
+    while i < data_bytes {
+        *((out + (strip + i) as u64) as *mut u8) = *((raw + i as u64) as *mut u8)
+        i = i + 1
+    }
+    return strip + data_bytes
+}
+
+fn st_f64(p: u64, at: usize, v: f64) {
+    *((p + at as u64) as *mut f64) = v
+}
+
+// Structural check of a DNG written here (used by tests and the camera smoke test): header, one IFD,
+// width/height/strip tags consistent with the file length. Returns 0 when fine, else a small error code.
+fn dng_check(p: u64, size: usize, wpx: u32, hpx: u32) -> i32 {
+    if size < HEADER_AND_IFD {
+        return 1
+    }
+    if ld16(p, 0) != 18761 as u32 || ld16(p, 2) != 42 as u32 || ld32(p, 4) != 8 as u32 {
+        return 2
+    }
+    let n: usize = ld16(p, 8) as usize
+    if n == 0 || n > MAX_ENTRIES {
+        return 3
+    }
+    var width: u32 = 0
+    var height: u32 = 0
+    var off: u32 = 0
+    var cnt: u32 = 0
+    var prev: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let at: usize = 10 + i * 12
+        let tag: u32 = ld16(p, at)
+        if i > 0 && tag <= prev {
+            return 4
+        }
+        prev = tag
+        if tag == 256 as u32 { width = ld32(p, at + 8) }
+        if tag == 257 as u32 { height = ld32(p, at + 8) }
+        if tag == 273 as u32 { off = ld32(p, at + 8) }
+        if tag == 279 as u32 { cnt = ld32(p, at + 8) }
+        i = i + 1
+    }
+    if width != wpx || height != hpx {
+        return 5
+    }
+    if cnt != wpx * hpx * 2 as u32 || (off as usize) + (cnt as usize) != size {
+        return 6
+    }
+    return 0
+}

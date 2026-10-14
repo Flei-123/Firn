@@ -47,6 +47,8 @@
 #                         from the gallery or the camera): the manifest gets
 #                         the invisible org.firn.FirnPick activity (same
 #                         classes.dex as --push)
+#   --camera              the program uses lib/plat/android/camera.fi (NDK Camera2): links
+#                         libcamera2ndk + libmediandk, the manifest gets CAMERA
 #   --icon-res <dir>      launcher icon resources (tools/pack/icons.fi makes them:
 #                         <outdir>/android/res with mipmap-*dpi, mipmap-anydpi-v26
 #                         and values/ic_launcher_background.xml): compiled with
@@ -68,7 +70,7 @@ SRCDIR=$(dirname "$ENTRY_ABS")
 
 NAME=$(basename "$SRCDIR"); PKG=""; LIB=firnapp; ABI=both
 VCODE=1; VNAME=0.1; OPT=release-safe; ASSETS=""; PERMS=(); EXTRA=""; DEX=""
-PUSH=0; PICK=0; ARGSFILE=""
+PUSH=0; PICK=0; CAMERA=0; ARGSFILE=""
 OUT=""; ICONRES=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -85,6 +87,7 @@ while [ $# -gt 0 ]; do
         --dex) DEX=$2; shift 2 ;;
         --push) PUSH=1; shift ;;
         --pick) PICK=1; shift ;;
+        --camera) CAMERA=1; shift ;;
         --args-file) ARGSFILE=$2; shift 2 ;;
         --icon-res) ICONRES=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
@@ -100,6 +103,8 @@ NDK=${NDK:-/root/android-ndk-min/android-ndk-r27c/toolchains/llvm/prebuilt/linux
 SDK=${SDK:-/root/android-sdk}
 BT=${BUILDTOOLS:-$SDK/build-tools/35.0.0}
 API=${API:-29}
+CAMLIBS=""
+if [ $CAMERA -eq 1 ]; then CAMLIBS="-lcamera2ndk -lmediandk"; PERMS+=(android.permission.CAMERA); fi
 KEYSTORE=${KEYSTORE:-$HOME/.firn/android.keystore}
 KSPASS=${KSPASS:-firnstore}
 export FIRNLIB
@@ -131,7 +136,7 @@ build_abi() { # $1 abi dir, $2 firn target, $3 linker, $4 NDK triple
         -z noexecstack -z max-page-size=16384 \
         -soname "lib$LIB.so" -o "$out/lib$LIB.so" "$out/app.o" \
         -L"$syslib" -landroid -llog -lc -lm -ldl \
-        --as-needed -lEGL -lGLESv3 --no-as-needed
+        --as-needed -lEGL -lGLESv3 --no-as-needed $CAMLIBS
     if readelf -d "$out/lib$LIB.so" | grep -q TEXTREL; then
         echo "ERROR: $abi: TEXTREL -- Android would refuse the library" >&2
         exit 1
