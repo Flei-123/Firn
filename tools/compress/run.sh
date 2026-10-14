@@ -75,7 +75,31 @@ if [ -n "$WINE" ] && command -v x86_64-w64-mingw32-ld >/dev/null 2>&1; then
     if "$FIRNC" --target=x86_64-windows --opt-level=dev-fast -o "$W/probe_win.exe" tools/compress/probe.fi > "$W/probe_win.log" 2>&1; then
         # CHECK_QUICK=3 and decode+encode only: a smoke test of the platform seam (files, descriptors,
         # the clock-free code paths) -- every probe run is a Wine process start
-        CHECK_QUICK=3 CHECK_PARTS=decode,encode RUNNER="$WINE" python3 tools/compress/check.py "$W/probe_win.exe" lz4 zstd xz lzma bz2 br gz auto || rc=1
+        # r572: one check.py per format, two at a time on the ONE Wine prefix (each has its own temp
+        # directory; the formats are independent). The serial run was dominated by Wine start-up
+        # latency, not CPU. WINE_JOBS=1 gives the old serial order.
+        WJ=${WINE_JOBS:-2}
+        # The real cost: wine starts a fresh wineserver (plus wineboot, services) for EVERY probe
+        # run and tears it down afterwards (~4-5 s each, 0.4 s with a warm server). Keep one
+        # persistent server for the whole section and stop it again at the end. Wine stages share
+        # ~/.wine-firn and never run in parallel with each other, so killing it here is safe.
+        wineserver -p 2>/dev/null || true
+        # warm up ONCE before the parallel jobs: two cold starts at the same time raced on the
+        # first process (a 120 s TIMEOUT on the very first probe run was seen)
+        timeout 120 "$WINE" cmd /c exit >/dev/null 2>&1 || true
+        trap 'wineserver -k 2>/dev/null || true; rm -rf "$W"' EXIT
+        FMTS=(lz4 zstd xz lzma bz2 br gz auto)
+        WPIDS=()
+        for ((wi = 0; wi < ${#FMTS[@]}; wi++)); do
+            CHECK_QUICK=3 CHECK_PARTS=decode,encode RUNNER="$WINE" python3 tools/compress/check.py "$W/probe_win.exe" "${FMTS[$wi]}" > "$W/wine_${FMTS[$wi]}.log" 2>&1 &
+            WPIDS+=($!)
+            if (( (wi + 1) % WJ == 0 )); then
+                for wp in "${WPIDS[@]}"; do wait "$wp" || rc=1; done
+                WPIDS=()
+            fi
+        done
+        for wp in "${WPIDS[@]}"; do wait "$wp" || rc=1; done
+        for f in "${FMTS[@]}"; do cat "$W/wine_$f.log"; done
     else
         echo "  FAIL the probe does not build for Windows"; grep -v RWX "$W/probe_win.log" | head -5; rc=1
     fi
