@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/noise.fi -- photo.noise: the sensor noise model of the pipeline.
+//
+//     var nm: noise.NoiseModel = noise.from_meta(&meta)          // (S, O) from Camera2 SENSOR_NOISE_PROFILE
+//     var nm2: noise.NoiseModel = noise.estimate_model(&image)   // no metadata: measure it from the pixels
+//     let v: f32 = noise.variance(&nm, 1, 0.2f)                  // variance of channel 1 at value 0.2
+//
+// Model: variance of a linear value x in 0..1 is  S * x + O  (shot noise + read noise), one pair per colour
+// channel R, G, B. `from_meta` takes the profile when the device reports one and the ISO fallback otherwise;
+// `estimate_model` needs no metadata at all (JPEG/YUV-only frames, unknown devices): it measures the local noise
+// of many 8x8 blocks with a Laplacian-type residual that ignores gradients, bins the blocks by brightness, keeps
+// the flattest quarter of each bin (those carry noise only) and fits  var = S x + O  by least squares.
+import std.rt
+import photo.image
+import photo.meta
+
+export {
+    NoiseModel, from_meta, estimate_model, variance, sigma_of, model_scale,
+}
+
+struct NoiseModel {
+    s: [f32; 3],
+    o: [f32; 3],
+}
+
+fn from_meta(m: *mut meta.SensorMeta) -> NoiseModel {
+    var t: [f32; 6] = [0.0f; 6]
+    meta.noise_model_rgb(m, &t[0])
+    return NoiseModel { s: [t[0], t[2], t[4]], o: [t[1], t[3], t[5]] }
+}
+
+fn variance(nm: *mut NoiseModel, c: i32, x: f32) -> f32 {
+    var xx: f32 = x
+    if xx < 0.0f { xx = 0.0f }
+    return (*nm).s[c as usize] * xx + (*nm).o[c as usize]
+}
+
+fn sigma_of(nm: *mut NoiseModel, c: i32, x: f32) -> f32 {
+    return image.sqrtf(variance(nm, c, x))
+}
+
+// The model of a frame that was multiplied by `k` (exposure normalisation): variance scales with k^2,
+// S with k (shot noise: var(kx) = k^2 S x ... expressed in the scaled value y = kx: S*k*y + O*k^2).
+fn model_scale(nm: *mut NoiseModel, k: f32) -> NoiseModel {
+    var r: NoiseModel = NoiseModel { s: [0.0f; 3], o: [0.0f; 3] }
+    var c: usize = 0
+    while c < 3 {
+        r.s[c] = (*nm).s[c] * k
+        r.o[c] = (*nm).o[c] * k * k
+        c = c + 1
+    }
+    return r
+}
+
+const NBIN: i32 = 8
+const BLOCK: i32 = 8
+const CAP: i32 = 512
+
+fn insertion_sort(p: u64, n: i32) {
+    var i: i32 = 1
+    while i < n {
+        let v: f32 = *((p + (i as u64) * (4 as u64)) as *mut f32)
+        var j: i32 = i - 1
+        while j >= 0 && *((p + (j as u64) * (4 as u64)) as *mut f32) > v {
+            *((p + ((j + 1) as u64) * (4 as u64)) as *mut f32) = *((p + (j as u64) * (4 as u64)) as *mut f32)
+            j = j - 1
+        }
+        *((p + ((j + 1) as u64) * (4 as u64)) as *mut f32) = v
+        i = i + 1
+    }
+}
+
+// Mean absolute Laplacian-residual (Immerkaer kernel) and mean of one 8x8 block of channel c (interior only).
+fn block_stats(im: *mut image.Image, c: i32, bx: i32, by: i32, out_mean: *mut f32) -> f32 {
+    var s: f32 = 0.0f
+    var m: f32 = 0.0f
+    var y: i32 = by
+    while y < by + BLOCK {
+        var x: i32 = bx
+        while x < bx + BLOCK {
+            let v: f32 = image.img_get(im, c, x - 1, y - 1) - 2.0f * image.img_get(im, c, x, y - 1) + image.img_get(im, c, x + 1, y - 1)
+                - 2.0f * image.img_get(im, c, x - 1, y) + 4.0f * image.img_get(im, c, x, y) - 2.0f * image.img_get(im, c, x + 1, y)
+                + image.img_get(im, c, x - 1, y + 1) - 2.0f * image.img_get(im, c, x, y + 1) + image.img_get(im, c, x + 1, y + 1)
+            if v < 0.0f { s = s - v } else { s = s + v }
+            m = m + image.img_get(im, c, x, y)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    *out_mean = m / ((BLOCK * BLOCK) as f32)
+    // E|v| = sigma * 6 * sqrt(2/pi)  ->  sigma = |v| * sqrt(pi/2) / 6
+    return (s / ((BLOCK * BLOCK) as f32)) * 0.20888568955f
+}
+
+// Measure (S, O) per channel from the pixels of a linear image (1 or 3 channels). Robust, no metadata.
+fn estimate_model(im: *mut image.Image) -> NoiseModel {
+    var r: NoiseModel = NoiseModel { s: [0.0f; 3], o: [0.0f; 3] }
+    let bw: i32 = ((*im).w - 2) / BLOCK
+    let bh: i32 = ((*im).h - 2) / BLOCK
+    if bw < 2 || bh < 2 {
+        var c: i32 = 0
+        while c < 3 {
+            r.s[c as usize] = 4.0e-5f
+            r.o[c as usize] = 2.0e-7f
+            c = c + 1
+        }
+        return r
+    }
+    let scratch: u64 = rt.heap_alloc((CAP as usize) * 4)
+    let nblocks: i32 = bw * bh
+    var c: i32 = 0
+    while c < 3 {
+        var cc: i32 = c
+        if cc >= (*im).ch { cc = 0 }
+        var cnt: [i32; 8] = [0; 8]
+        // pass 1: count blocks per brightness bin (bin by sqrt(mean))
+        var k: i32 = 0
+        while k < nblocks {
+            var m: f32 = 0.0f
+            block_stats(im, cc, 1 + (k % bw) * BLOCK, 1 + (k / bw) * BLOCK, &m)
+            var bi: i32 = (image.sqrtf(image.fmaxf(m, 0.0f)) * (NBIN as f32)) as i32
+            if bi >= NBIN { bi = NBIN - 1 }
+            cnt[bi as usize] = cnt[bi as usize] + 1
+            k = k + 1
+        }
+        // fit sums
+        var sw: f64 = 0.0
+        var sx: f64 = 0.0
+        var sy: f64 = 0.0
+        var sxx: f64 = 0.0
+        var sxy: f64 = 0.0
+        var b: i32 = 0
+        while b < NBIN {
+            if cnt[b as usize] >= 4 {
+                var step: i32 = cnt[b as usize] / CAP + 1
+                var n: i32 = 0
+                var seen: i32 = 0
+                var msum: f64 = 0.0
+                var kk: i32 = 0
+                while kk < nblocks && n < CAP {
+                    var m: f32 = 0.0
+                    let sg: f32 = block_stats(im, cc, 1 + (kk % bw) * BLOCK, 1 + (kk / bw) * BLOCK, &m)
+                    var bi: i32 = (image.sqrtf(image.fmaxf(m, 0.0f)) * (NBIN as f32)) as i32
+                    if bi >= NBIN { bi = NBIN - 1 }
+                    if bi == b {
+                        if seen % step == 0 {
+                            *((scratch + (n as u64) * (4 as u64)) as *mut f32) = sg * sg
+                            msum = msum + (m as f64)
+                            n = n + 1
+                        }
+                        seen = seen + 1
+                    }
+                    kk = kk + 1
+                }
+                if n >= 4 {
+                    insertion_sort(scratch, n)
+                    // flattest quarter: take the 25th percentile of the variance
+                    let q: f32 = *((scratch + ((n / 4) as u64) * (4 as u64)) as *mut f32)
+                    let mx: f64 = msum / (n as f64)
+                    let wgt: f64 = n as f64
+                    sw = sw + wgt
+                    sx = sx + wgt * mx
+                    sy = sy + wgt * (q as f64)
+                    sxx = sxx + wgt * mx * mx
+                    sxy = sxy + wgt * mx * (q as f64)
+                }
+            }
+            b = b + 1
+        }
+        var s: f64 = 0.0
+        var o: f64 = 0.0
+        let den: f64 = sw * sxx - sx * sx
+        if sw > 0.0 {
+            if den > 1.0e-12 * sw * sw {
+                s = (sw * sxy - sx * sy) / den
+                o = (sy - s * sx) / sw
+            } else {
+                o = sy / sw
+            }
+        }
+        // the 25th percentile of a chi-like quantity sits below the mean: scale back (about 0.9 of the mean)
+        s = s * 1.15
+        o = o * 1.15
+        if s < 0.0 {
+            // brightness-independent noise only
+            s = 0.0
+            o = sy / sw * 1.15
+        }
+        if o < 0.0 { o = 0.0 }
+        if s < 1.0e-7 { s = 1.0e-7 }
+        r.s[c as usize] = s as f32
+        r.o[c as usize] = o as f32
+        c = c + 1
+    }
+    rt.heap_free(scratch, (CAP as usize) * 4)
+    return r
+}

@@ -1,0 +1,203 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/filter.fi -- photo.filter: separable blurs, guided filter, local min/max on 1 channel planes.
+//
+//     var b: image.Image = filter.box_blur(&plane, 8)        // (2r+1)^2 mean, border clamped, f64 running sums
+//     var g: image.Image = filter.gauss_blur(&plane, 1.2f)   // true Gaussian, radius ceil(3 sigma)
+//     var base: image.Image = filter.guided(&plane, &guide, 12, 0.01f)   // edge preserving smoothing (He et al.)
+//
+// All functions take the plane of channel `c` of an image and return a NEW 1-channel image.
+import std.rt
+import photo.image
+
+export {
+    box_blur, gauss_blur, guided, local_minmax, plane_of,
+}
+
+// Copy of channel c as its own 1-channel image.
+fn plane_of(im: *mut image.Image, c: i32) -> image.Image {
+    var d: image.Image = image.img_new((*im).w, (*im).h, 1)
+    rt.mem_copy(d.px, image.img_plane(im, c), ((*im).w as usize) * ((*im).h as usize) * 4)
+    return d
+}
+
+fn box_blur(src: *mut image.Image, r: i32) -> image.Image {
+    let w: i32 = (*src).w
+    let h: i32 = (*src).h
+    var tmp: image.Image = image.img_new(w, h, 1)
+    var d: image.Image = image.img_new(w, h, 1)
+    let inv: f64 = 1.0 / ((2 * r + 1) as f64)
+    var y: i32 = 0
+    while y < h {
+        var s: f64 = 0.0
+        var k: i32 = -r
+        while k <= r {
+            s = s + (image.img_getc(src, 0, k, y) as f64)
+            k = k + 1
+        }
+        var x: i32 = 0
+        while x < w {
+            image.img_set(&tmp, 0, x, y, (s * inv) as f32)
+            s = s + (image.img_getc(src, 0, x + r + 1, y) as f64) - (image.img_getc(src, 0, x - r, y) as f64)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var x2: i32 = 0
+    while x2 < w {
+        var s: f64 = 0.0
+        var k: i32 = -r
+        while k <= r {
+            s = s + (image.img_getc(&tmp, 0, x2, k) as f64)
+            k = k + 1
+        }
+        var y2: i32 = 0
+        while y2 < h {
+            image.img_set(&d, 0, x2, y2, (s * inv) as f32)
+            s = s + (image.img_getc(&tmp, 0, x2, y2 + r + 1) as f64) - (image.img_getc(&tmp, 0, x2, y2 - r) as f64)
+            y2 = y2 + 1
+        }
+        x2 = x2 + 1
+    }
+    image.img_free(&tmp)
+    return d
+}
+
+fn gauss_blur(src: *mut image.Image, sigma: f32) -> image.Image {
+    var r: i32 = ((sigma * 3.0f) + 0.999f) as i32
+    if r < 1 { r = 1 }
+    var kern: [f32; 33] = [0.0f; 33]
+    if r > 16 { r = 16 }
+    var sum: f32 = 0.0f
+    var i: i32 = -r
+    while i <= r {
+        let v: f32 = image.expneg(((i * i) as f32) / (2.0f * sigma * sigma))
+        kern[(i + r) as usize] = v
+        sum = sum + v
+        i = i + 1
+    }
+    i = 0
+    while i <= 2 * r {
+        kern[i as usize] = kern[i as usize] / sum
+        i = i + 1
+    }
+    let w: i32 = (*src).w
+    let h: i32 = (*src).h
+    var tmp: image.Image = image.img_new(w, h, 1)
+    var d: image.Image = image.img_new(w, h, 1)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            var s: f32 = 0.0f
+            var k: i32 = -r
+            while k <= r {
+                s = s + kern[(k + r) as usize] * image.img_getc(src, 0, x + k, y)
+                k = k + 1
+            }
+            image.img_set(&tmp, 0, x, y, s)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    y = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            var s: f32 = 0.0f
+            var k: i32 = -r
+            while k <= r {
+                s = s + kern[(k + r) as usize] * image.img_getc(&tmp, 0, x, y + k)
+                k = k + 1
+            }
+            image.img_set(&d, 0, x, y, s)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image.img_free(&tmp)
+    return d
+}
+
+// Guided filter with a single-channel guide: q = mean(a) * guide + mean(b), a = var / (var + eps).
+// guide == src gives the classic edge preserving smoothing; eps is in the squared units of the data.
+fn guided(src: *mut image.Image, guide: *mut image.Image, r: i32, eps: f32) -> image.Image {
+    let w: i32 = (*src).w
+    let h: i32 = (*src).h
+    var ii: image.Image = image.img_new(w, h, 1)
+    var ip: image.Image = image.img_new(w, h, 1)
+    var n: i32 = 0
+    while n < w * h {
+        let g: f32 = *(((*guide).px + (n as u64) * (4 as u64)) as *mut f32)
+        let s: f32 = *(((*src).px + (n as u64) * (4 as u64)) as *mut f32)
+        *((ii.px + (n as u64) * (4 as u64)) as *mut f32) = g * g
+        *((ip.px + (n as u64) * (4 as u64)) as *mut f32) = g * s
+        n = n + 1
+    }
+    var mi: image.Image = box_blur(guide, r)
+    var mp: image.Image = box_blur(src, r)
+    var mii: image.Image = box_blur(&ii, r)
+    var mip: image.Image = box_blur(&ip, r)
+    var a: image.Image = image.img_new(w, h, 1)
+    var b: image.Image = image.img_new(w, h, 1)
+    n = 0
+    while n < w * h {
+        let o: u64 = (n as u64) * (4 as u64)
+        let m1: f32 = *((mi.px + o) as *mut f32)
+        let m2: f32 = *((mp.px + o) as *mut f32)
+        let vr: f32 = *((mii.px + o) as *mut f32) - m1 * m1
+        let cv: f32 = *((mip.px + o) as *mut f32) - m1 * m2
+        let av: f32 = cv / (vr + eps)
+        *((a.px + o) as *mut f32) = av
+        *((b.px + o) as *mut f32) = m2 - av * m1
+        n = n + 1
+    }
+    var ma: image.Image = box_blur(&a, r)
+    var mb: image.Image = box_blur(&b, r)
+    var q: image.Image = image.img_new(w, h, 1)
+    n = 0
+    while n < w * h {
+        let o: u64 = (n as u64) * (4 as u64)
+        *((q.px + o) as *mut f32) = *((ma.px + o) as *mut f32) * *(((*guide).px + o) as *mut f32) + *((mb.px + o) as *mut f32)
+        n = n + 1
+    }
+    image.img_free(&ii)
+    image.img_free(&ip)
+    image.img_free(&mi)
+    image.img_free(&mp)
+    image.img_free(&mii)
+    image.img_free(&mip)
+    image.img_free(&a)
+    image.img_free(&b)
+    image.img_free(&ma)
+    image.img_free(&mb)
+    return q
+}
+
+// 3x3 local minimum and maximum of a plane (for halo limiting): out_min / out_max are created here.
+fn local_minmax(src: *mut image.Image, out_min: *mut image.Image, out_max: *mut image.Image) {
+    *out_min = image.img_new((*src).w, (*src).h, 1)
+    *out_max = image.img_new((*src).w, (*src).h, 1)
+    var y: i32 = 0
+    while y < (*src).h {
+        var x: i32 = 0
+        while x < (*src).w {
+            var lo: f32 = 1.0e30f
+            var hi: f32 = -1.0e30f
+            var dy: i32 = -1
+            while dy <= 1 {
+                var dx: i32 = -1
+                while dx <= 1 {
+                    let v: f32 = image.img_getc(src, 0, x + dx, y + dy)
+                    if v < lo { lo = v }
+                    if v > hi { hi = v }
+                    dx = dx + 1
+                }
+                dy = dy + 1
+            }
+            image.img_set(out_min, 0, x, y, lo)
+            image.img_set(out_max, 0, x, y, hi)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
