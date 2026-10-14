@@ -72,6 +72,21 @@ FR=$(grep -o 'frames=[0-9]*' "$W/play.out" | head -1 | cut -d= -f2); CH=$(grep -
 [ "${CH:-0}" -gt 10 ] || { echo "  FAIL  too few chunks (${CH:-0})"; ERR=1; }
 [ "${TK:-0}" -gt 20 ] || { echo "  FAIL  too few ticks (${TK:-0})"; ERR=1; }
 [ -s "$W/shot.png" ] || { echo "  FAIL  no screenshot"; ERR=1; }
+# light + time of day: update_time packets were applied, the 5x5 light region loaded, noon = daylight 256
+grep -q 'light=true region=true' "$W/play.out" || { echo "  FAIL  light region not loaded"; ERR=1; }
+TP=$(grep -o 'time_packets=[0-9]*' "$W/play.out" | head -1 | cut -d= -f2); DL=$(grep -o 'daylight=[0-9]*' "$W/play.out" | head -1 | cut -d= -f2)
+[ "${TP:-0}" -gt 0 ] || { echo "  FAIL  no update_time packet applied (${TP:-0})"; ERR=1; }
+[ "${DL:-0}" -ge 200 ] || { echo "  FAIL  noon daylight too low (${DL:-0})"; ERR=1; }
+# second short run at midnight: server time drives the sky (daylight 0) and the picture differs from noon
+echo "time set 18000" >&3; sleep 1
+MCPLAY_RUN_S=6 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/night.png" \
+    "$W/mcplay" 127.0.0.1 "$PORT" Player2 > "$W/night.out" 2>&1; nrc=$?
+[ $nrc -eq 0 ] || { echo "  FAIL  night run exit code $nrc"; ERR=1; }
+ND=$(grep -o 'daylight=[0-9]*' "$W/night.out" | head -1 | cut -d= -f2)
+[ "${ND:-256}" -le 20 ] || { echo "  FAIL  midnight daylight too high (${ND:-?})"; ERR=1; }
+NH=$(grep -o 'hash=[0-9a-f]*' "$W/night.out" | head -1); DH=$(grep -o 'hash=[0-9a-f]*' "$W/play.out" | head -1)
+[ -n "$NH" ] && [ "$NH" != "$DH" ] || { echo "  FAIL  night picture equals day picture"; ERR=1; }
+echo "  day daylight=${DL:-?} night daylight=${ND:-?} night $NH"
 grep -o 'hash=[0-9a-f]*' "$W/play.out" | sed 's/^/  /'
 if [ -n "${MCPLAY_PNG_OUT:-}" ] && [ -s "$W/shot.png" ]; then cp "$W/shot.png" "$MCPLAY_PNG_OUT"; echo "  PNG: $MCPLAY_PNG_OUT"; fi
 [ $ERR -eq 0 ] && echo "RESULT mc-play: ok" || echo "RESULT mc-play: FAIL"

@@ -13,7 +13,9 @@
 //   MCPLAY_W / MCPLAY_H window size (default 854x480)     MCPLAY_FULLSCREEN=1   start fullscreen
 //   MCPLAY_FPS=60      frame cap (0 = uncapped)           MCPLAY_VSYNC=1        swap interval for the GL path (CPU path: no-op)
 //   MCPLAY_CREATIVE=1  the server is creative: fly allowed and the creative reach (6 blocks)
-//   MCPLAY_TICKS=2000  time of day for the sky (the time update packet is not decoded yet)
+//   MCPLAY_TICKS=2000  time of day until the first update_time packet arrives (then the server time drives the sky)
+//   MCPLAY_LIGHT=1     vertex light (mc_wlight: Chunk.light + 5x5 column region, edits repair it) + sky daylight uniform; 0 = old flat tint
+//   packs: MC_PACKS / MC_PACK_CONFIG / MC_PACK_AUTO (see docs/mc/resourcepacks.md); T = hot reload, animated tiles tick at 20 Hz
 //   MCPLAY_DIG_MS=700  hold time before the "finish digging" packet in survival (there is no hardness table yet)
 //   MCPLAY_PLACE_ID=0  block state id painted locally on a place click (0 = wait for the server's Block Update)
 //   MCPLAY_RUN_S=0     quit after N seconds (tests)       MCPLAY_SHOT=<file.png>  write the last frame as PNG on exit + print its hash
@@ -50,6 +52,9 @@ import mc.mc_input
 import mc.mc_hud
 import mc.mc_blockset
 import mc.mc_play
+import mc.mc_wlight
+import mc.mc_packs
+import mc.mc_backend
 
 const LOGIN_WAITS: i32 = 200
 const FOG_R: u32 = 150
@@ -61,6 +66,7 @@ const SC_ESC: u32 = 1
 const SC_F: u32 = 33
 const SC_N: u32 = 49
 const SC_F11: u32 = 87
+const SC_T: u32 = 20
 
 fn now_ns() -> u64 {
     var ts: [i64; 2] = [0; 2]
@@ -174,21 +180,45 @@ struct Gfx {
     r: mc_raster.Raster,
     wr: mc_render_world.WorldRender,
     ok: bool,
+    res: mc_packs.ResMgr,
+    use_res: bool,
 }
 
-fn gfx_new(w: i32, h: i32, ver: *mut mc_version.Version, min_y: i32, view: i32) -> Gfx {
+fn gfx_new(w: i32, h: i32, ver: *mut mc_version.Version, min_y: i32, view: i32, use_res: bool) -> Gfx {
     var atlas: mc_texture.Atlas = mc_texture.atlas_default()
     var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
     mc_texture.tex_alloc_tables(&tb)
     var reg: mc_registry.Registry = ver.registry_of()
     let ok: bool = mc_registry.registry_ok(&reg)
+    var res: mc_packs.ResMgr = mc_packs.res_new()
     if ok {
-        mc_texture.tex_build_tables(&reg, &tb)
+        if use_res {
+            mc_packs.res_build_tables(&res, &reg, &tb)
+        } else {
+            mc_texture.tex_build_tables(&reg, &tb)
+        }
     }
     var r: mc_raster.Raster = mc_raster.raster_new(w, h)
     mc_raster.backend_upload_atlas(&r, &atlas)
     var wr: mc_render_world.WorldRender = mc_render_world.wr_new(min_y, view, &tb)
-    return Gfx { atlas: atlas, tb: tb, r: r, wr: wr, ok: ok }
+    return Gfx { atlas: atlas, tb: tb, r: r, wr: wr, ok: ok, res: res, use_res: use_res }
+}
+
+// Loads the packs (env) into the manager and uploads the atlas. Warnings go to stderr.
+fn gfx_packs_load(g: *mut Gfx, protocol: i32) {
+    mc_packs.res_setup_env(&(*g).res, protocol)
+    gfx_packs_reload(g)
+}
+
+// Hot reload: re-reads the packs, new atlas, upload. Block tile ids do not change, so cached meshes stay valid.
+fn gfx_packs_reload(g: *mut Gfx) -> i32 {
+    var be: mc_backend.Backend = mc_backend.backend_cpu(&(*g).r)
+    let n: i32 = mc_packs.res_reload_upload(&(*g).res, &be)
+    if mc_packs.res_warn_count(&(*g).res) > 0 {
+        let wt: str = mc_packs.res_warn_text(&(*g).res)
+        io.eprint_line(wt)
+    }
+    return n
 }
 
 // Pick table: a block state is targetable when any face is drawn, solid = opaque (same as demos/mcview).
@@ -256,6 +286,13 @@ struct Ctx {
     seq: i32,
     place_id: i32,
     ticks_day: i32,
+    // light + time of day
+    light: bool,
+    wl: mc_wlight.WorldLight,
+    region_done: bool,
+    day_time: i64,
+    day_fixed: bool,
+    n_time: u64,
     // counters
     n_chunks: u64,
     n_unload: u64,
@@ -270,9 +307,15 @@ struct Ctx {
 }
 
 fn mark_air(c: *mut Ctx, x: i32, y: i32, z: i32, id: i32) {
-    let old: i32 = mc_blockset.world_set_block(&(*c).world, (*c).dim.min_y, x, y, z, id)
+    var old: i32 = 0
+    if (*c).light {
+        old = mc_wlight.wl_edit(&(*c).wl, &(*c).world, x, y, z, id)
+    } else {
+        old = mc_blockset.world_set_block(&(*c).world, (*c).dim.min_y, x, y, z, id)
+    }
     if old >= 0 && old != id {
         mc_render_world.wr_mark_block(&(*c).g.wr, x, y, z)
+        if (*c).light { mc_render_world.wr_light_sync(&(*c).g.wr) }
     }
 }
 
@@ -341,6 +384,41 @@ fn on_multi_change(c: *mut Ctx) {
     (*c).n_mchange = (*c).n_mchange + 1 as u64
 }
 
+// update_time: i64 world age, i64 time of day (negative = daylight cycle off, |value| is the fixed time).
+fn on_time(c: *mut Ctx) {
+    let b: *mut bytes.Bytes = mc_client.client_body(&(*c).cl)
+    let age: i64 = bytes.get_i64(b) catch 0
+    let tm: i64 = bytes.get_i64(b) catch 0
+    if tm < 0 {
+        (*c).day_fixed = true
+        (*c).day_time = 0 - tm
+    } else {
+        (*c).day_fixed = false
+        (*c).day_time = tm
+    }
+    (*c).n_time = (*c).n_time + 1 as u64
+    mc_sky.sky_set_time(&(*c).sky, (*c).day_time, 0)
+}
+
+// Vertex light: the lit mesher needs the filter/emit tables of the registry; Chunk.light supplies the server light of every column,
+// the region volume (light_region_tick) makes edits repair the light incrementally.
+fn light_setup(c: *mut Ctx) {
+    mc_wlight.wl_free(&(*c).wl)
+    (*c).wl = mc_wlight.wl_new((*c).dim.min_y, mc_dimension.dim_sections(&(*c).dim) as i32)
+    var reg: mc_registry.Registry = (*c).cl.ver.registry_of()
+    if mc_registry.registry_ok(&reg) { mc_wlight.wl_set_tables_registry(&(*c).wl, &reg) }
+    mc_render_world.wr_set_light(&(*c).g.wr, ((&(*c).wl) as *mut mc_wlight.WorldLight) as u64)
+}
+
+// Once enough columns arrived: a 5x5 column region around the player (server light wins) so that block edits repair the light.
+fn light_region_tick(c: *mut Ctx) {
+    if !(*c).light || (*c).region_done || !(*c).have_pos || (*c).n_chunks < 25 as u64 { return }
+    let cx: i32 = mc_world.block_to_chunk(math.floor((*c).pl.x) as i32)
+    let cz: i32 = mc_world.block_to_chunk(math.floor((*c).pl.z) as i32)
+    mc_wlight.wl_region_load(&(*c).wl, &(*c).world, cx - 2, cz - 2, 5, 5, true)
+    (*c).region_done = true
+}
+
 // One packet.
 fn on_packet(c: *mut Ctx, id: i32) {
     let cl: *mut mc_client.Client = &(*c).cl
@@ -350,6 +428,7 @@ fn on_packet(c: *mut Ctx, id: i32) {
             (*c).join = true
             mc_dimension.dim_from_join(&(*cl).ver, id, mc_client.client_body(cl), &(*c).dim)
             (*c).g.wr.min_y = (*c).dim.min_y
+            if (*c).light { light_setup(c) }
             mc_client.client_send_settings(cl, (*c).view)
         }
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_MAP_CHUNK) {
@@ -360,6 +439,8 @@ fn on_packet(c: *mut Ctx, id: i32) {
         on_block_change(c)
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_MULTI_BLOCK_CHANGE) {
         on_multi_change(c)
+    } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_UPDATE_TIME) {
+        on_time(c)
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_KICK_DISCONNECT) {
         (*c).n_kick = (*c).n_kick + 1 as u64
         (*c).closed = true
@@ -431,7 +512,12 @@ fn gfx_resize(c: *mut Ctx, w: i32, h: i32) {
     mc_render_world.wr_clear(&(*c).g.wr, &(*c).g.r)
     mc_raster.raster_free(&(*c).g.r)
     (*c).g.r = mc_raster.raster_new(w, h)
-    mc_raster.backend_upload_atlas(&(*c).g.r, &(*c).g.atlas)
+    if (*c).g.use_res {
+        var be: mc_backend.Backend = mc_backend.backend_cpu(&(*c).g.r)
+        mc_packs.res_upload(&(*c).g.res, &be)
+    } else {
+        mc_raster.backend_upload_atlas(&(*c).g.r, &(*c).g.atlas)
+    }
     if (*c).bg != 0 { rt.heap_free((*c).bg, ((*c).w as usize) * ((*c).h as usize) * 4) }
     (*c).bg = rt.heap_alloc((w as usize) * (h as usize) * 4)
     (*c).w = w
@@ -451,6 +537,10 @@ fn handle_window(c: *mut Ctx) {
     }
     if raw.key_pressed(&(*c).rw, raw.KEY_ESC) {
         grab_mouse(c, !(*c).grab)
+    }
+    if (*c).g.use_res && raw.key_pressed(&(*c).rw, SC_T) {
+        var be: mc_backend.Backend = mc_backend.backend_cpu(&(*c).g.r)
+        mc_packs.res_on_key(&(*c).g.res, &be, mc_packs.RES_KEY_RELOAD)
     }
     if raw.key_pressed(&(*c).rw, SC_F11 as u32) {
         (*c).fullscreen = !(*c).fullscreen
@@ -493,6 +583,14 @@ fn do_tick(c: *mut Ctx) {
     mc_input.player_tick(&(*c).pl, &ev, &(*c).world, &(*c).itb, (*c).dim.min_y)
     mc_play.send_pos_look(&(*c).cl, (*c).pl.x, (*c).pl.y, (*c).pl.z, (*c).pl.yaw, (*c).pl.pitch, (*c).pl.on_ground)
     (*c).n_ticks = (*c).n_ticks + 1 as u64
+    if !(*c).day_fixed && (*c).n_time > 0 as u64 {
+        (*c).day_time = (*c).day_time + 1
+        mc_sky.sky_set_time(&(*c).sky, (*c).day_time, 0)
+    }
+    if (*c).g.use_res {
+        var be: mc_backend.Backend = mc_backend.backend_cpu(&(*c).g.r)
+        mc_packs.res_tick(&(*c).g.res, (*c).n_ticks as i64, &be)
+    }
 }
 
 // The server moved us (join, teleport): take its position.
@@ -581,10 +679,14 @@ fn draw_frame(c: *mut Ctx) {
     mc_raster.backend_begin(r, &(*c).cam, clear)
     mc_sky.sky_draw(&(*c).sky, r)
     mc_sky.sky_set_raster_fog(&(*c).sky, r, fog_start, fog_end)
+    if (*c).light {
+        var be: mc_backend.Backend = mc_backend.backend_cpu(r)
+        mc_render_world.wr_set_daylight(&be, (*c).sky.daylight)
+    }
     if (*c).have_pos {
         mc_render_world.wr_render(&(*c).g.wr, &(*c).world, r, &(*c).cam, 0 - 1)
     }
-    mc_sky.sky_tint_frame(&(*c).sky, r)
+    if !(*c).light { mc_sky.sky_tint_frame(&(*c).sky, r) }
     if (*c).hit {
         mc_input.input_draw_box(r, (*c).pk.x, (*c).pk.y, (*c).pk.z, BOX_RGBA)
     }
@@ -635,6 +737,7 @@ fn main(start: u64) -> i32 {
     let w0: i32 = env_int("MCPLAY_W", 854)
     let h0: i32 = env_int("MCPLAY_H", 480)
     let fps_cap: i32 = env_int("MCPLAY_FPS", 60)
+    let use_res: bool = mc_packs.res_env_wanted()
     let run_s: i32 = env_int("MCPLAY_RUN_S", 0)
     if env_flag("MCPLAY_GL", false) {
         io.eprint_line("mcplay: MCPLAY_GL=1 -- the GL path is not wired into this demo yet, using the CPU rasterizer")
@@ -655,7 +758,7 @@ fn main(start: u64) -> i32 {
         world: mc_world.world_new(),
         sc: mc_chunk.scratch_new(),
         dim: mc_dimension.dim_default_overworld(),
-        g: gfx_new(w0, h0, &ver, 0, view),
+        g: gfx_new(w0, h0, &ver, 0, view, use_res),
         itb: mc_input.InputTables { pick: 0, solid: 0, n: 0 },
         cam: mc_camera.camera_new(w0, h0),
         sky: mc_sky.sky_new(),
@@ -669,11 +772,17 @@ fn main(start: u64) -> i32 {
         acc_dx: 0.0, acc_dy: 0.0, want_fly: false, want_noclip: false, sent_slot: 0 - 1,
         digging: false, dig_x: 0, dig_y: 0, dig_z: 0, dig_t0: 0, dig_ms: env_int("MCPLAY_DIG_MS", 700) as u64, seq: 0,
         place_id: env_int("MCPLAY_PLACE_ID", 0), ticks_day: env_int("MCPLAY_TICKS", 2000),
+        light: env_flag("MCPLAY_LIGHT", true), wl: mc_wlight.wl_new(0, 24), region_done: false, day_time: 0, day_fixed: false, n_time: 0,
         n_chunks: 0, n_unload: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, fps: 0,
     }
     if !c.g.ok {
         io.eprint_line("mcplay: this version has no block registry")
         return 5
+    }
+    if use_res { gfx_packs_load(&c.g, proto) }
+    if c.light {
+        mc_chunk.scratch_set_keep_light(&c.sc, true)
+        light_setup(&c)
     }
     c.itb = pick_tables(&c.g.tb)
     c.pl.creative = c.creative
@@ -724,6 +833,7 @@ fn main(start: u64) -> i32 {
         handle_window(&c)
         alive = net_drain(&c, 400)
         sync_position(&c)
+        light_region_tick(&c)
         handle_hotbar(&c)
         let nowm: u64 = now_ms()
         var nt: i32 = 0
@@ -754,6 +864,7 @@ fn main(start: u64) -> i32 {
         }
     }
     say(f"mcplay: end frames={c.n_frames} ticks={c.n_ticks} chunks={c.n_chunks} unloads={c.n_unload} block_updates={c.n_bchange} multi_updates={c.n_mchange} dig={c.n_dig} place={c.n_place} kicked={c.n_kick} alive={alive}\n")
+    say(f"mcplay: light={c.light} region={c.region_done} time_packets={c.n_time} day_time={c.day_time} daylight={c.sky.daylight}\n")
     say(f"mcplay: pos x={c.pl.x as i64} y={c.pl.y as i64} z={c.pl.z as i64} fps={c.fps}\n")
     var rc: i32 = 0
     if env.has("MCPLAY_SHOT") {
