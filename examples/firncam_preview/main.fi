@@ -1,0 +1,428 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/firncam_preview -- the GPU camera preview alone, full screen, with a frame-time meter.
+//
+// Camera2 (AImageReader, YUV_420_888) -> planes -> lib/gpu/campreview.fi -> GL texture -> shader (YUV->RGB,
+// sensor rotation, aspect "cover") -> EGL window. No CPU pixel loop, no window.image.
+//
+// It is the measuring rig for the preview (tools/android/campreview_check.sh) and the smallest example of the
+// widget interface: acquire, upload, release, draw. Every 90 camera frames it writes one line to stderr:
+//   campreview: frames=N fps=F sensor_fps=S dt_p50=..ms dt_p95=..ms dt_max=..ms cpu=..ms/frame glerr=E rot=R src=WxH
+// and once (frame 45) it checks the shader's picture against a CPU reference computed from the same planes:
+//   campreview: check WxH max=.. mean=.. psnr=.. dB
+import window.window
+import plat.android.camera
+import gpu.campreview
+import paint.gl
+import std.rt
+import android.ndk
+
+#[no_gc]
+#[link_name(__android_log_write)]
+extern fn log_write(prio: i32, tag: u64, text: u64) -> i32;
+
+struct Line {
+    b: [u8; 320],
+    n: usize,
+}
+
+fn line_new() -> Line {
+    return Line { b: [0 as u8; 320], n: 0 }
+}
+
+fn ls(l: *mut Line, s: str) {
+    var i: usize = 0
+    while i < s.n && (*l).n < 300 {
+        (*l).b[(*l).n] = (*((s.p as u64 + i as u64) as *mut u8))
+        (*l).n = (*l).n + 1
+        i = i + 1
+    }
+}
+
+fn li(l: *mut Line, v: i64) {
+    var tmp: [u8; 24] = [0 as u8; 24]
+    var n: usize = 0
+    var x: i64 = v
+    if x < 0 {
+        ls(l, "-")
+        x = 0 - x
+    }
+    if x == 0 { tmp[0] = 48 as u8; n = 1 }
+    while x > 0 {
+        tmp[n] = (48 + (x % 10)) as u8
+        x = x / 10
+        n = n + 1
+    }
+    while n > 0 && (*l).n < 300 {
+        n = n - 1
+        (*l).b[(*l).n] = tmp[n]
+        (*l).n = (*l).n + 1
+    }
+}
+
+// one decimal
+fn lf(l: *mut Line, v: f64) {
+    var x: f64 = v
+    if x < 0.0 {
+        ls(l, "-")
+        x = 0.0 - x
+    }
+    let t: i64 = (x * 10.0 + 0.5) as i64
+    li(l, t / 10)
+    ls(l, ".")
+    li(l, t % 10)
+}
+
+fn lflush(l: *mut Line) {
+    (*l).b[(*l).n] = 0 as u8
+    // stderr of an app goes nowhere: write to logcat (tag "campreview")
+    var tag: [u8; 12] = [99 as u8, 97 as u8, 109 as u8, 112 as u8, 114 as u8, 101 as u8, 118 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8]
+    let r: i32 = log_write(4, (&tag[0]) as u64, (&(*l).b[0]) as u64)
+    (*l).n = 0
+}
+
+fn now_ns() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000000000 + ts[1]
+}
+
+// ---------------------------------------------------------------- CPU reference for the check
+
+fn clampf(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn at8(a: u64) -> f64 {
+    return (*(a as *mut u8)) as f64
+}
+
+// Bilinear sample of an octet plane the way GL_LINEAR + CLAMP_TO_EDGE does it; (sx, sy) in 0..1.
+fn samp(p: u64, stride: i32, pstride: i32, w: i32, h: i32, sx: f64, sy: f64) -> f64 {
+    let fx: f64 = sx * (w as f64) - 0.5
+    let fy: f64 = sy * (h as f64) - 0.5
+    var x0: i32 = fx as i32
+    var y0: i32 = fy as i32
+    if fx < 0.0 { x0 = 0 - 1 }
+    if fy < 0.0 { y0 = 0 - 1 }
+    let tx: f64 = fx - (x0 as f64)
+    let ty: f64 = fy - (y0 as f64)
+    var x1: i32 = x0 + 1
+    var y1: i32 = y0 + 1
+    if x0 < 0 { x0 = 0 }
+    if y0 < 0 { y0 = 0 }
+    if x1 < 0 { x1 = 0 }
+    if y1 < 0 { y1 = 0 }
+    if x0 > w - 1 { x0 = w - 1 }
+    if x1 > w - 1 { x1 = w - 1 }
+    if y0 > h - 1 { y0 = h - 1 }
+    if y1 > h - 1 { y1 = h - 1 }
+    let a: f64 = at8(p + ((y0 * stride + x0 * pstride) as u64))
+    let b: f64 = at8(p + ((y0 * stride + x1 * pstride) as u64))
+    let c: f64 = at8(p + ((y1 * stride + x0 * pstride) as u64))
+    let d: f64 = at8(p + ((y1 * stride + x1 * pstride) as u64))
+    return (a * (1.0 - tx) + b * tx) * (1.0 - ty) + (c * (1.0 - tx) + d * tx) * ty
+}
+
+// log10 by series (no libm needed here): x > 0
+fn log10_approx(x: f64) -> f64 {
+    var v: f64 = x
+    var e: f64 = 0.0
+    while v >= 10.0 { v = v / 10.0; e = e + 1.0 }
+    while v < 1.0 { v = v * 10.0; e = e - 1.0 }
+    let t: f64 = (v - 1.0) / (v + 1.0)
+    let t2: f64 = t * t
+    var s: f64 = t
+    var term: f64 = t
+    var k: f64 = 3.0
+    var i: i32 = 0
+    while i < 12 {
+        term = term * t2
+        s = s + term / k
+        k = k + 2.0
+        i = i + 1
+    }
+    return e + 2.0 * s / 2.302585093
+}
+
+// Compares the picture the shader made (RGBA, rows from the bottom, ow x oh) with the CPU reference.
+fn check_picture(pf: *mut camera.PreviewFrame, pl: *mut campreview.Plan, ow: i32, oh: i32, rgba: u64) {
+    var maxd: i32 = 0
+    var sum: f64 = 0.0
+    var sq: f64 = 0.0
+    var cnt: i64 = 0
+    let cw: i32 = ((*pf).w + 1) / 2
+    let ch: i32 = ((*pf).h + 1) / 2
+    var oy: i32 = 0
+    while oy < oh {
+        var ox: i32 = 0
+        while ox < ow {
+            var sx: f64 = 0.0
+            var sy: f64 = 0.0
+            campreview.cp_map(pl, ((ox as f64) + 0.5) / (ow as f64), ((oy as f64) + 0.5) / (oh as f64), &sx, &sy)
+            let y: f64 = samp((*pf).yp, (*pf).ys, 1, (*pf).w, (*pf).h, sx, sy)
+            let u: f64 = samp((*pf).up, (*pf).us, (*pf).ups, cw, ch, sx, sy) - 128.0
+            let v: f64 = samp((*pf).vp, (*pf).vs, (*pf).ups, cw, ch, sx, sy) - 128.0
+            let r: f64 = clampf(y + 1.402 * v, 0.0, 255.0)
+            let g: f64 = clampf(y - 0.344136 * u - 0.714136 * v, 0.0, 255.0)
+            let b: f64 = clampf(y + 1.772 * u, 0.0, 255.0)
+            let o: u64 = rgba + (((oh - 1 - oy) * ow + ox) * 4) as u64
+            let gr: i32 = (*(o as *mut u8)) as i32
+            let gg: i32 = (*((o + 1) as *mut u8)) as i32
+            let gb: i32 = (*((o + 2) as *mut u8)) as i32
+            var d0: i32 = gr - (r + 0.5) as i32
+            var d1: i32 = gg - (g + 0.5) as i32
+            var d2: i32 = gb - (b + 0.5) as i32
+            if d0 < 0 { d0 = 0 - d0 }
+            if d1 < 0 { d1 = 0 - d1 }
+            if d2 < 0 { d2 = 0 - d2 }
+            if d0 > maxd { maxd = d0 }
+            if d1 > maxd { maxd = d1 }
+            if d2 > maxd { maxd = d2 }
+            sum = sum + ((d0 + d1 + d2) as f64)
+            sq = sq + ((d0 * d0 + d1 * d1 + d2 * d2) as f64)
+            cnt = cnt + 3
+            ox = ox + 1
+        }
+        oy = oy + 1
+    }
+    let mean: f64 = sum / (cnt as f64)
+    let mse: f64 = sq / (cnt as f64)
+    var psnr: f64 = 99.0
+    if mse > 0.0 { psnr = 10.0 * log10_approx(65025.0 / mse) }
+    var l: Line = line_new()
+    ls(&l, "campreview: check ")
+    li(&l, ow as i64)
+    ls(&l, "x")
+    li(&l, oh as i64)
+    ls(&l, " max=")
+    li(&l, maxd as i64)
+    ls(&l, " mean=")
+    lf(&l, mean)
+    ls(&l, " psnr=")
+    lf(&l, psnr)
+    ls(&l, " dB")
+    lflush(&l)
+}
+
+// ---------------------------------------------------------------- stats
+
+struct Meter {
+    last_present: i64,
+    first_present: i64,
+    n: i64,
+    dts: [i32; 128],   // frame intervals in 100 us units, ring of the last 128
+    cpu_sum: i64,      // ns spent in acquire + upload + draw + swap
+    cpu_n: i64,
+    cam_first: i64,
+    cam_last: i64,
+    cam_n: i64,
+}
+
+fn meter_new() -> Meter {
+    return Meter { last_present: 0, first_present: 0, n: 0, dts: [0; 128], cpu_sum: 0, cpu_n: 0,
+        cam_first: 0, cam_last: 0, cam_n: 0 }
+}
+
+fn sort128(a: *mut [i32; 128], n: usize) {
+    var i: usize = 1
+    while i < n {
+        let v: i32 = (*a)[i]
+        var j: usize = i
+        while j > 0 && (*a)[j - 1] > v {
+            (*a)[j] = (*a)[j - 1]
+            j = j - 1
+        }
+        (*a)[j] = v
+        i = i + 1
+    }
+}
+
+fn report(m: *mut Meter, rot: i32, w: i32, h: i32, gpu_err: u32) {
+    var cnt: usize = 128
+    if (*m).n - 1 < 128 { cnt = ((*m).n - 1) as usize }
+    if cnt < 4 { return }
+    var s: [i32; 128] = [0; 128]
+    var i: usize = 0
+    while i < cnt {
+        s[i] = (*m).dts[i]
+        i = i + 1
+    }
+    sort128(&s, cnt)
+    var fps: f64 = 0.0
+    if (*m).last_present > (*m).first_present {
+        fps = (((*m).n - 1) as f64) * 1000000000.0 / (((*m).last_present - (*m).first_present) as f64)
+    }
+    var cfps: f64 = 0.0
+    if (*m).cam_last > (*m).cam_first && (*m).cam_n > 1 {
+        cfps = (((*m).cam_n - 1) as f64) * 1000000000.0 / (((*m).cam_last - (*m).cam_first) as f64)
+    }
+    var l: Line = line_new()
+    ls(&l, "campreview: frames=")
+    li(&l, (*m).n)
+    ls(&l, " fps=")
+    lf(&l, fps)
+    ls(&l, " sensor_fps=")
+    lf(&l, cfps)
+    ls(&l, " dt_p50=")
+    lf(&l, (s[cnt / 2] as f64) / 10.0)
+    ls(&l, "ms dt_p95=")
+    lf(&l, (s[cnt * 95 / 100] as f64) / 10.0)
+    ls(&l, "ms dt_max=")
+    lf(&l, (s[cnt - 1] as f64) / 10.0)
+    ls(&l, "ms cpu=")
+    if (*m).cpu_n > 0 { lf(&l, ((*m).cpu_sum as f64) / ((*m).cpu_n as f64) / 1000000.0) } else { ls(&l, "0") }
+    ls(&l, "ms/frame glerr=")
+    li(&l, gpu_err as i64)
+    ls(&l, " rot=")
+    li(&l, rot as i64)
+    ls(&l, " src=")
+    li(&l, w as i64)
+    ls(&l, "x")
+    li(&l, h as i64)
+    lflush(&l)
+}
+
+// ---------------------------------------------------------------- main
+
+#[allow_escape]
+fn main() -> i32 {
+    var f: window.Window = window.window_new()
+    if !window.open_window(&f, 0) || !window.make(&f, 480, 800) { return 1 }
+    window.show_window(&f)
+    var api: gl.GlApi = gl.gl_api_new()
+    let ap: *mut gl.GlApi = &api
+    var cp: campreview.CamPreview = campreview.cp_new()
+    var gpu_on: bool = window.gpu_open(&f, ap as u64)
+    var l0: Line = line_new()
+    if gpu_on { gpu_on = campreview.cp_open(&cp, ap) }
+    ls(&l0, "campreview: GPU ")
+    if gpu_on { ls(&l0, "ok") } else { ls(&l0, "NOT AVAILABLE") }
+    lflush(&l0)
+    if !gpu_on { return 3 }
+
+    var pf: camera.PreviewFrame = camera.preview_frame_new()
+    var info: camera.CamInfo = camera.zero_info()
+    var m: Meter = meter_new()
+    var ready: bool = false
+    var asked: bool = false
+    var nlens: i32 = 0
+    var open: bool = true
+    var checked: bool = false
+    var rot: i32 = 0
+    var front: bool = false
+    var last_w: i32 = 0
+    var last_h: i32 = 0
+    var place: [u64; 4] = [0; 4]
+    var errs: u32 = 0 as u32
+    var it: i64 = 0
+    var n0: i64 = 0
+    var nneg: i64 = 0
+    while open {
+        it = it + 1
+        if it % 300 == 0 {
+            var ld: Line = line_new()
+            ls(&ld, "campreview: loop it=")
+            li(&ld, it)
+            ls(&ld, " ready=")
+            li(&ld, if ready { 1 } else { 0 })
+            ls(&ld, " nolens=")
+            li(&ld, nlens as i64)
+            ls(&ld, " no_frame=")
+            li(&ld, n0)
+            ls(&ld, " err=")
+            li(&ld, nneg)
+            ls(&ld, " presented=")
+            li(&ld, m.n)
+            lflush(&ld)
+        }
+        if !ready && nlens == 0 {
+            if camera.camera_permission() == 1 {
+                nlens = camera.camera_scan()
+                if nlens > 0 && camera.camera_info(0, &info) && camera.camera_open(0) == camera.E_OK {
+                    if camera.camera_start(camera.KIND_JPEG) == camera.E_OK {
+                        ready = true
+                        front = camera.camera_is_front()
+                        rot = campreview.cp_rotation(camera.camera_sensor_rotation(), 0, front)
+                    }
+                }
+            } else if !asked {
+                asked = true
+                camera.camera_request_permission()
+            }
+        }
+        window.wait_event(&f, 3)
+        var k: u32 = window.next_event(&f)
+        while k != window.EV_NONE {
+            if k == window.EV_CLOSED { open = false }
+            if k == window.EV_KEY && window.ev_a(&f) == window.K_ESCAPE { open = false }
+            k = window.next_event(&f)
+        }
+        if window.gpu_lost(&f) {
+            // the context went away: every GL object is gone, build the renderer again
+            var again: bool = window.gpu_open(&f, ap as u64)
+            if again { again = campreview.cp_open(&cp, ap) }
+            if !again { return 4 }
+        }
+        if ready {
+            let t0: i64 = now_ns()
+            let got: i32 = camera.camera_preview_acquire(&pf)
+            if got == 1 {
+                var want_check: bool = false
+                if !checked && m.n >= 45 { want_check = true }
+                let upl: bool = campreview.cp_upload(&cp, pf.w, pf.h, pf.yp, pf.ys, pf.up, pf.vp, pf.us, pf.vs, pf.ups)
+                if m.cam_n == 0 { m.cam_first = pf.ts }
+                m.cam_last = pf.ts
+                m.cam_n = m.cam_n + 1
+                last_w = pf.w
+                last_h = pf.h
+                if upl && want_check {
+                    checked = true
+                    // render 1:1 into the preview's own target and read it back
+                    var dw: i32 = pf.w
+                    var dh: i32 = pf.h
+                    if rot == 90 || rot == 270 { dw = pf.h; dh = pf.w }
+                    if campreview.cp_render(&cp, dw, dh, rot, front, true) {
+                        let bytes: usize = (dw * dh * 4) as usize
+                        let buf: u64 = camera.camera_alloc(bytes)
+                        if buf != 0 {
+                            (*ap).read_pixels(0, 0, dw as i64, dh as i64, buf)
+                            var pl: campreview.Plan = campreview.Plan { crop: [0.0; 4], m: [0.0; 4], t: [0.0; 2], quad: [1.0; 2], rot: 0 }
+                            campreview.cp_plan(pf.w, pf.h, rot, front, dw, dh, true, &pl)
+                            check_picture(&pf, &pl, dw, dh, buf)
+                            camera.camera_free(buf, bytes)
+                        }
+                    }
+                    (*ap).bind_framebuffer(gl.GL_FRAMEBUFFER as u64, 0)
+                }
+                camera.camera_preview_release(&pf)
+                window.gpu_place(&f, (&place[0]) as u64)
+                let sw: i32 = place[2] as i32
+                let sh: i32 = place[3] as i32
+                if campreview.cp_draw(&cp, 0, 0, sw, sh, sh, rot, front, true) {
+                    let sw_ok: bool = window.gpu_swap(&f)
+                    errs = campreview.cp_error(&cp)
+                    let t1: i64 = now_ns()
+                    m.cpu_sum = m.cpu_sum + (t1 - t0)
+                    m.cpu_n = m.cpu_n + 1
+                    if m.n == 0 { m.first_present = t1 } else {
+                        m.dts[((m.n - 1) % 128) as usize] = ((t1 - m.last_present) / 100000) as i32
+                    }
+                    m.last_present = t1
+                    m.n = m.n + 1
+                    if m.n % 90 == 0 { report(&m, rot, last_w, last_h, errs) }
+                }
+            } else if got < 0 {
+                nneg = nneg + 1
+                camera.camera_preview_release(&pf)
+            } else {
+                n0 = n0 + 1
+            }
+        }
+    }
+    campreview.cp_close(&cp)
+    camera.camera_close()
+    window.close_window(&f)
+    return 0
+}
