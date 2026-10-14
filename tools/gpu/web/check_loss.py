@@ -24,6 +24,7 @@ if "page: context restored" not in out: fail.append("browser never reported webg
 if not re.search(r"lost-frames=[1-9]", out): fail.append("Firn side never saw CTX_LOST")
 if "restores=1" not in out: fail.append("Firn side did not see exactly one CTX_RESTORED")
 if "same=1" not in out: fail.append("frame after restore differs from the frame before the loss")
+if not re.search(r"pad seen=[1-9]\d* connected=1 ", out): fail.append("the faked gamepad (A, left stick right, trigger 0.5) never reached the Firn side as one connected pad")
 if "context loss ok" not in out: fail.append("no 'context loss ok' line")
 print("RESULT webgl2-context-loss: " + ("ok" if not fail else "FAIL " + "; ".join(fail)))
 sys.exit(1 if fail else 0)
