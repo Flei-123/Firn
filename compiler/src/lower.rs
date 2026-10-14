@@ -1335,8 +1335,8 @@ impl<'a> Lower<'a> {
         }
         // HOOK sizeof: `size_of[T]()` is a constant — at run time nothing of
         // it is left (sizeof.rs)
-        if let Some(g) = crate::sizeof::value(name) {
-            return Some(Some(self.constant(FTy::U64, g)));
+        if let Some(r) = crate::sizeof::lower_hook(self, name, args, span) {
+            return r;
         }
         // HOOK kern: inline assembler and MMIO (core.rs, round 52)
         if let Some(r) = crate::core::lower_hook(self, name, args, span) {

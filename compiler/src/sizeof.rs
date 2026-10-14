@@ -44,6 +44,24 @@ use std::collections::HashMap;
 /// Reserved identifier prefix. Firn identifiers cannot contain a `$`, so a
 /// collision with user code is ruled out.
 const P_SIZE: &str = "size_of$";
+/// r169: `has_gc[T]()` -- compile-time `bool`: does a `T` hold GC pointers?
+const P_HASGC: &str = "has_gc$";
+/// r169: `gc_track[T](p, bytes)` / `gc_untrack[T](p)` -- register / drop a
+/// buffer as a collector root, but ONLY when `T` holds GC pointers (and the
+/// collector runtime is part of the program); otherwise they vanish.
+const P_TRACK: &str = "gc_track$";
+const P_UNTRACK: &str = "gc_untrack$";
+const PREFIXES: [&str; 4] = [P_SIZE, P_HASGC, P_TRACK, P_UNTRACK];
+
+/// Is `name` one of the reserved intrinsic call names of this module?
+pub(crate) fn is_intrinsic(name: &str) -> bool {
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// The prefix of `name` (with its `$`), if it is one of ours.
+pub(crate) fn prefix_of(name: &str) -> Option<&'static str> {
+    PREFIXES.iter().copied().find(|p| name.starts_with(p))
+}
 
 thread_local! {
     /// Identifier -> size. Filled by the type checker, read by lowering.
@@ -62,49 +80,94 @@ pub(crate) fn hook_reset() {
 
 /// Round TUPLES: the call name for `size_of[T]()` with `T` bound to a type
 /// that is not a plain name (`mono.rs::subst_call_name`).
-pub(crate) fn stash_type(te: &TypeExpr) -> String {
+pub(crate) fn stash_type(prefix: &str, te: &TypeExpr) -> String {
     let idx = TYPES.with(|t| {
         let mut t = t.borrow_mut();
         t.push(te.clone());
         t.len() - 1
     });
-    format!("{}#{}", P_SIZE, idx)
+    format!("{}#{}", prefix, idx)
 }
 
-/// `// HOOK sizeof` in `parser.rs::primary` — `size_of[T]()`.
+/// `// HOOK sizeof` in `parser.rs::primary` -- `size_of[T]()`, `has_gc[T]()`,
+/// `gc_track[T](p, n)`, `gc_untrack[T](p)`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
-    match p.kind() {
-        TokKind::Ident(n) if n == "size_of" => {}
+    let (prefix, nargs): (&str, usize) = match p.kind() {
+        TokKind::Ident(n) if n == "size_of" => (P_SIZE, 0),
+        TokKind::Ident(n) if n == "has_gc" => (P_HASGC, 0),
+        TokKind::Ident(n) if n == "gc_track" => (P_TRACK, 2),
+        TokKind::Ident(n) if n == "gc_untrack" => (P_UNTRACK, 1),
         _ => return None,
-    }
+    };
     if !matches!(p.toks.get(p.pos + 1).map(|t| &t.kind), Some(TokKind::LBracket)) {
         return None;
     }
-    let start = p.bump(); // 'size_of'
+    let what = prefix.trim_end_matches('$').to_string();
+    let start = p.bump(); // the intrinsic name
     p.bump(); // '['
     // DELIBERATELY JUST ONE TYPE NAME, no full type expression:
     // `size_of[i32]`, `size_of[Point]`. Whoever needs the size of a composite
     // type gives it a name — which reads better anyway than `size_of[*mut u8]`.
-    let (ty_name, ty_span) = p.ident("after 'size_of['")?;
+    let (ty_name, ty_span) = p.ident(&format!("after '{}['", what))?;
     // HOOK alias: `size_of[Idx]()` with `type Idx = u32` is `size_of[u32]()`
     let ty_name = crate::alias::hook_plain_name(p, ty_name, ty_span);
-    if !p.expect(TokKind::RBracket, "after the type argument of 'size_of'") {
+    if !p.expect(TokKind::RBracket, &format!("after the type argument of '{}'", what)) {
         return None;
     }
-    if !p.expect(TokKind::LParen, "after the type argument of 'size_of'") {
+    if !p.expect(TokKind::LParen, &format!("after the type argument of '{}'", what)) {
         return None;
     }
-    let end = match p.kind() {
-        TokKind::RParen => p.bump(),
-        _ => {
-            p.error_here("'size_of' takes no arguments".to_string());
-            return None;
+    let (args, end) = if nargs == 0 {
+        match p.kind() {
+            TokKind::RParen => (Vec::new(), p.bump()),
+            _ => {
+                p.error_here(format!("'{}' takes no arguments", what));
+                return None;
+            }
         }
+    } else {
+        p.call_args(&format!("after the arguments of '{}'", what))
     };
     let span = Parser::join(start, end);
     // The type text moves into the name; it is resolved in the type checker,
     // which knows the struct table.
-    Some(p.mk(span, ExprKind::Call(format!("{}{}", P_SIZE, ty_name), Vec::new(), start)))
+    Some(p.mk(span, ExprKind::Call(format!("{}{}", prefix, ty_name), args, start)))
+}
+
+/// r169: does a value of type `t` hold pointers the collector must see?
+/// `str` (its octets may live on the GC heap), `Gc[C]`, closures (`fn`
+/// values may point at a GC record) and every struct / array that holds one.
+/// Raw `*mut u8` / `u64` are NOT counted: the compiler cannot know what they
+/// hold. `GcWeak` is deliberately not a root.
+pub(crate) fn type_has_gc(ck: &Checker, t: &Type) -> bool {
+    fn walk(ck: &Checker, t: &Type, seen: &mut Vec<usize>, depth: u32) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        if crate::gc::is_gc_ptr(t) {
+            return true;
+        }
+        match t {
+            Type::Fn { .. } => true,
+            Type::Array(e, _) => walk(ck, e, seen, depth + 1),
+            Type::Struct(i) => {
+                if crate::strtype::is_str(t) {
+                    return true;
+                }
+                if crate::gc::is_gc_weak(t) || seen.contains(i) {
+                    return false;
+                }
+                seen.push(*i);
+                let fields: Vec<Type> = match ck.tcx.structs.get(*i) {
+                    Some(sd) => sd.fields.iter().map(|f| f.ty.clone()).collect(),
+                    None => Vec::new(),
+                };
+                fields.iter().any(|f| walk(ck, f, seen, depth + 1))
+            }
+            _ => false,
+        }
+    }
+    walk(ck, t, &mut Vec::new(), 0)
 }
 
 /// `// HOOK sizeof` in `sema::call`.
@@ -114,9 +177,21 @@ pub(crate) fn hook_call(
     args: &[Expr],
     span: Span,
 ) -> Option<Type> {
-    let ty_text = name.strip_prefix(P_SIZE)?;
-    if !args.is_empty() {
-        ck.dg.error(span, "'size_of' takes no arguments".to_string());
+    let prefix = prefix_of(name)?;
+    let what = prefix.trim_end_matches('$');
+    let ty_text = &name[prefix.len()..];
+    let want = if prefix == P_TRACK {
+        2
+    } else if prefix == P_UNTRACK {
+        1
+    } else {
+        0
+    };
+    if args.len() != want {
+        for a in args {
+            ck.type_out_expr(a);
+        }
+        ck.dg.error(span, format!("'{}' takes {} argument(s)", what, want));
         return Some(Type::Error);
     }
     // Round TUPLES: `#<index>` names a stashed type expression
@@ -129,15 +204,72 @@ pub(crate) fn hook_call(
     };
     let t = ck.resolve_ty(&te);
     if t.is_error() {
+        for a in args {
+            ck.type_out_expr(a);
+        }
         return Some(Type::Error);
     }
     if matches!(t, Type::Void) {
-        ck.dg.error(span, "'size_of[void]' is not meaningful".to_string());
+        for a in args {
+            ck.type_out_expr(a);
+        }
+        ck.dg.error(span, format!("'{}[void]' is not meaningful", what));
         return Some(Type::Error);
     }
-    let size = ck.tcx.size_of(&t) as i128;
-    VALUES.with(|w| w.borrow_mut().insert(name.to_string(), size));
-    Some(Type::Usize)
+    if prefix == P_SIZE {
+        let size = ck.tcx.size_of(&t) as i128;
+        VALUES.with(|w| w.borrow_mut().insert(name.to_string(), size));
+        return Some(Type::Usize);
+    }
+    let flag = type_has_gc(ck, &t) as i128;
+    VALUES.with(|w| w.borrow_mut().insert(name.to_string(), flag));
+    if prefix == P_HASGC {
+        return Some(Type::Bool);
+    }
+    // gc_track / gc_untrack: every argument is a `u64`
+    for a in args {
+        let at = ck.expr(a, Some(&Type::U64));
+        if !at.is_error() && at != Type::U64 && !matches!(at, Type::UntypedInt) {
+            ck.dg.error(a.span, format!("'{}' expects 'u64' arguments", what));
+        }
+    }
+    Some(Type::Void)
+}
+
+/// r169: lowering of the intrinsics of this module. `None` = not ours.
+/// `Some(r)` has the shape `lower_call` returns.
+pub(crate) fn lower_hook(
+    lo: &mut crate::lower::Lower,
+    name: &str,
+    args: &[Expr],
+    _span: Span,
+) -> Option<Option<Option<crate::fir::Val>>> {
+    let prefix = prefix_of(name)?;
+    let flag = VALUES.with(|w| w.borrow().get(name).copied()).unwrap_or(0);
+    if prefix == P_SIZE {
+        return Some(Some(Some(lo.constant(crate::fir::FTy::U64, flag))));
+    }
+    if prefix == P_HASGC {
+        return Some(Some(Some(lo.constant(crate::fir::FTy::Bool, flag))));
+    }
+    // gc_track / gc_untrack: the arguments are always evaluated (order of
+    // effects); the call is emitted only for a GC-holding element type AND
+    // when the collector runtime is part of the program.
+    let target = if prefix == P_TRACK { "gc_root_add" } else { "gc_root_del" };
+    let mut vals = Vec::new();
+    for a in args {
+        match lo.lower_expr(a) {
+            Some(v) => vals.push(v),
+            None => return Some(None),
+        }
+    }
+    if flag != 0 && lo.info.fns.contains_key(target) {
+        lo.push_void(
+            crate::fir::FTy::Void,
+            crate::fir::Op::Call { name: target.to_string(), args: vals },
+        );
+    }
+    Some(Some(None))
 }
 
 /// The size determined by the type checker — for lowering.
