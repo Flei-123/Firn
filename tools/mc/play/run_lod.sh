@@ -65,7 +65,8 @@ run_one() { # name, env...
 }
 run_one A MCPLAY_VIEW=3 MCPLAY_LOD=9
 run_one B MCPLAY_VIEW=3
-num() { grep -o "$2=[0-9]*" "$W/$1.out" | tail -1 | cut -d= -f2; }
+# only the `mcplay: end` / `mcplay: stream` lines: `mcplay: entities_draw ... frames=0` (entity draw frames) comes after them and used to win the tail -1
+num() { grep -E "mcplay: (end|stream)" "$W/$1.out" | grep -o "$2=[0-9]*" | tail -1 | cut -d= -f2; }
 FA=$(num A frames); FB=$(num B frames); CA=$(num A chunks); CB=$(num B chunks)
 LA=$(num A lod_cols); LB=$(num B lod_cols); TA=$(num A lod_tris); TB=$(num B lod_tris)
 echo "  A frames=${FA:-?} chunks=${CA:-?} lod_cols=${LA:-?} lod_tris=${TA:-?}   B frames=${FB:-?} chunks=${CB:-?} lod_cols=${LB:-?}"
