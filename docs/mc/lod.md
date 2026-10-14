@@ -32,5 +32,10 @@ tests/2861 C (70 frames, 3 submits/frame, loaded server): worst 351 -> 17 px, to
 `stream_drop_far` keeps the whole LOD window (lod_dist + lod_ahead) by itself, whatever `extra` is passed.
 
 ## Open
-- no blending (pop at bin switches incl. bin 1 <-> 4), no LOD for water/trees, LOD builds run on the render thread (0.2 ms/column at bin 4, more at bin 1).
+- no blending (pop at bin switches), no LOD for water/trees, LOD builds run on the render thread (0.2 ms/column at bin 4, more at bin 1).
 - remaining flight holes (<= 17 px) come from the build budget (wall clock) at ring switches.
+
+## Mid ring (r78, 14.10.)
+`lod_bin_mid` (default 2, 0 = off) for `lod_mid_w` (5) columns beyond the near ring: bin steps are 1 -> 2 -> 4 -> 8 instead of 1 -> 4, so each switch changes the surface less (cells are maxima of their bin).
+Hysteresis +1 like the other rings. Test tests/2916_mc_lod_pop.fi: converged streams along a 40-frame flight (2 blocks/frame) against the full-detail image: differing pixels (sum over 40 frames of 5184 px)
+11932 -> ~10200 (-14 %), frame-to-frame change of that error ("pop") 2104 -> ~1880 (-11 %) with the mid ring (stderr line `LODPOP`). Still no blending: pops remain, only smaller. `stream_lod_bin` = built cell size of a column.

@@ -1,4 +1,10 @@
-# Browser build + WebSocket gateway (plan only, NOT built)
+# Browser build + WebSocket gateway
+
+## Status (mc-t5, 14.10.2026)
+* Browser hills demo BUILT: `tools/gpu/web/hills*.fi` (WebGL2 wasm, WASD/orbit/mouse look), `demos/mcweb/hills.html`, gate `tools/mc/web/run.sh` (headless Chromium on SwiftShader vs native mc_raster frames, PSNR 48-59 dB, deterministic canvas hashes). NO real GPU / Firefox / Safari tested; headless needs `timerLoop` (rAF is starved under --virtual-time-budget).
+* Gateway PROTOTYPE `tools/mc/web/ws_gateway.cjs` (node, no deps, own RFC 6455 framing): allow-list, private-range block, 1 MiB message cap, idle/connect timeouts, backpressure. Test `tools/mc/web/gateway_test.cjs` against a FAKE status server (handshake, status, ping/pong, refusals). NOT done: signed token, per-IP limits, TLS, real-server join from the browser (the Firn wasm client has no TCP/WS transport yet), Mojang session join (CORS).
+
+# (original plan below)
 
 ## Why a gateway
 Browsers have no raw TCP. Minecraft Java protocol = TCP. So: **browser client <-WebSocket(binary)-> gateway <-TCP-> MC server.**

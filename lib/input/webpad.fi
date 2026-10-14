@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/input/webpad.fi -- input.webpad: the browser Gamepad API as the SAME logical pad as lib/input/padcore (SDL layout: 16 buttons,
+// 6 axes, pressed / released edges, connect / disconnect events).
+//
+//     import input.padcore
+//     import input.webpad
+//     var pad: padcore.Pad = padcore.pad_new()
+//     // every frame (inside the exported frame function):
+//     if webpad.webpad_poll(0, &pad) {                  // slot 0..3; false = no pad there
+//         if padcore.pad_pressed(&pad, padcore.PB_A) { jump() }
+//         move(padcore.pad_axis(&pad, padcore.PA_LX), padcore.pad_axis(&pad, padcore.PA_LY))
+//     }
+//
+// The browser has no gamepad events worth using for state: the host (demos/mcweb/glweb.js) polls `navigator.getGamepads()` once per
+// frame, before `firn_mc_frame`, and calls `firn_pad_state` for every pad whose `mapping` is "standard" (W3C layout: the browser did the
+// mapping work, so no SDL database is needed) and `firn_pad_gone` when a pad that was there is not. Only the latest state is kept per
+// slot (a frame sees one consistent snapshot); the exports store plain numbers, webpad_poll feeds them to padcore.pad_feed_xinput
+// (the XInput path: radial stick deadzone, trigger deadzone, edge detection) -- the conversion below is the only code of this file.
+// Units: buttons = bit mask of the W3C standard buttons 0..16 (bit i = buttons[i].pressed), triggers (buttons 6 and 7) 0..1000 =
+// buttons[i].value * 1000, sticks -1000..1000 = axes * 1000 (y positive DOWN, as the browser reports it).
+// NOT done: rumble (Gamepad.vibrationActuator), non-"standard" mappings (they are ignored, not guessed), touchpad / extra axes.
+// NOT proven: a real browser with a real pad (headless Chromium with a faked navigator.getGamepads only).
+
+import std.rt
+import input.padcore
+
+export { webpad_poll, webpad_slots, webpad_present, firn_pad_state, firn_pad_gone }
+
+const SLOTS: usize = 4
+const W_ON: usize = 0
+const W_EVT: usize = 1 // bit 0 = connect pending, bit 1 = disconnect pending
+const W_BTN: usize = 2
+const W_LT: usize = 3
+const W_RT: usize = 4
+const W_LX: usize = 5
+const W_LY: usize = 6
+const W_RX: usize = 7
+const W_RY: usize = 8
+const W_COUNT: usize = 9
+
+static mut G_STATE: u64 = 0
+
+fn st() -> u64 {
+    if G_STATE == 0 {
+        G_STATE = rt.heap_alloc(SLOTS * W_COUNT * 4)
+    }
+    return G_STATE
+}
+
+fn rd(slot: usize, w: usize) -> u32 { return rt.ld32(st(), slot * W_COUNT + w) }
+fn wr(slot: usize, w: usize, v: u32) { rt.st32(st(), slot * W_COUNT + w, v) }
+
+fn clampi(v: i32, lo: i32, hi: i32) -> i32 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// ---- host -> Firn ----------------------------------------------------------------------------------------------------
+
+// The state of pad `slot` (standard mapping), once per frame while it is connected.
+#[export_c]
+fn firn_pad_state(slot: u32, buttons: u32, lt: i32, rt_: i32, lx: i32, ly: i32, rx: i32, ry: i32) {
+    if (slot as usize) >= SLOTS { return }
+    let s: usize = slot as usize
+    if rd(s, W_ON) == 0 as u32 { wr(s, W_EVT, 1 as u32) } // a connect replaces an unread disconnect
+    wr(s, W_ON, 1 as u32)
+    wr(s, W_BTN, buttons)
+    wr(s, W_LT, padcore.u32_of_i32(clampi(lt, 0, 1000)))
+    wr(s, W_RT, padcore.u32_of_i32(clampi(rt_, 0, 1000)))
+    wr(s, W_LX, padcore.u32_of_i32(clampi(lx, 0 - 1000, 1000)))
+    wr(s, W_LY, padcore.u32_of_i32(clampi(ly, 0 - 1000, 1000)))
+    wr(s, W_RX, padcore.u32_of_i32(clampi(rx, 0 - 1000, 1000)))
+    wr(s, W_RY, padcore.u32_of_i32(clampi(ry, 0 - 1000, 1000)))
+}
+
+// The pad in `slot` was unplugged (or has a mapping other than "standard").
+#[export_c]
+fn firn_pad_gone(slot: u32) {
+    if (slot as usize) >= SLOTS { return }
+    let s: usize = slot as usize
+    if rd(s, W_ON) != 0 as u32 {
+        wr(s, W_ON, 0 as u32)
+        wr(s, W_EVT, rd(s, W_EVT) | 2 as u32)
+    }
+}
+
+// ---- Firn side -------------------------------------------------------------------------------------------------------
+
+fn webpad_slots() -> usize { return SLOTS }
+fn webpad_present(slot: usize) -> bool { return slot < SLOTS && rd(slot, W_ON) != 0 as u32 }
+
+// standard button i -> XInput mask bit (XINPUT_GAMEPAD_*)
+fn xi_mask(b: u32) -> u32 {
+    var m: u32 = 0 as u32
+    if (b & 1 as u32) != 0 as u32 { m = m | 0x1000 as u32 } // 0 A
+    if (b & 2 as u32) != 0 as u32 { m = m | 0x2000 as u32 } // 1 B
+    if (b & 4 as u32) != 0 as u32 { m = m | 0x4000 as u32 } // 2 X
+    if (b & 8 as u32) != 0 as u32 { m = m | 0x8000 as u32 } // 3 Y
+    if (b & 16 as u32) != 0 as u32 { m = m | 0x100 as u32 } // 4 left bumper
+    if (b & 32 as u32) != 0 as u32 { m = m | 0x200 as u32 } // 5 right bumper
+    // 6, 7 = triggers (analog, below)
+    if (b & 256 as u32) != 0 as u32 { m = m | 0x20 as u32 } // 8 back
+    if (b & 512 as u32) != 0 as u32 { m = m | 0x10 as u32 } // 9 start
+    if (b & 1024 as u32) != 0 as u32 { m = m | 0x40 as u32 } // 10 left stick
+    if (b & 2048 as u32) != 0 as u32 { m = m | 0x80 as u32 } // 11 right stick
+    if (b & 4096 as u32) != 0 as u32 { m = m | 0x1 as u32 } // 12 up
+    if (b & 8192 as u32) != 0 as u32 { m = m | 0x2 as u32 } // 13 down
+    if (b & 16384 as u32) != 0 as u32 { m = m | 0x4 as u32 } // 14 left
+    if (b & 32768 as u32) != 0 as u32 { m = m | 0x8 as u32 } // 15 right
+    if (b & 65536 as u32) != 0 as u32 { m = m | 0x400 as u32 } // 16 guide
+    return m
+}
+
+// ±1000 (y down) -> XInput ±32767 (y up: the sign flips for the y axes)
+fn xi_stick(v: i32, flip: bool) -> i32 {
+    var w: i32 = v * 32767 / 1000
+    if flip { w = 0 - w }
+    return w
+}
+
+// Once per frame for pad `slot`: clears the edges, queues connect / disconnect events, feeds the newest state. true = connected now.
+fn webpad_poll(slot: usize, p: *mut padcore.Pad) -> bool {
+    padcore.pad_begin(p)
+    if slot >= SLOTS { return false }
+    let evt: u32 = rd(slot, W_EVT)
+    wr(slot, W_EVT, 0 as u32)
+    if (evt & 1 as u32) != 0 as u32 { padcore.pad_event_force(p, padcore.PE_CONNECTED, 0 as u32, 1.0) }
+    if rd(slot, W_ON) != 0 as u32 {
+        padcore.pad_feed_xinput(p, xi_mask(rd(slot, W_BTN)), (padcore.s32(rd(slot, W_LT)) * 255 / 1000) as u32,
+            (padcore.s32(rd(slot, W_RT)) * 255 / 1000) as u32, xi_stick(padcore.s32(rd(slot, W_LX)), false),
+            xi_stick(padcore.s32(rd(slot, W_LY)), true), xi_stick(padcore.s32(rd(slot, W_RX)), false),
+            xi_stick(padcore.s32(rd(slot, W_RY)), true))
+        return true
+    }
+    if (evt & 2 as u32) != 0 as u32 {
+        // unplugged: everything goes back to rest (release edges), then the event
+        padcore.pad_feed_xinput(p, 0 as u32, 0 as u32, 0 as u32, 0 as i32, 0 as i32, 0 as i32, 0 as i32)
+        padcore.pad_event_force(p, padcore.PE_DISCONNECTED, 0 as u32, 0.0)
+    }
+    return false
+}
