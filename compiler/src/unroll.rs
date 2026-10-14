@@ -88,6 +88,8 @@ use std::collections::HashMap;
 const MAX_TRIPS: u64 = 16;
 /// At most this many instructions after unrolling (phis not counted).
 const BUDGET: usize = 640;
+/// At most this many edges leave the loop besides the header's own exit.
+const MAX_SIDE_EXITS: usize = 4;
 
 fn budget() -> usize {
     std::env::var("FIRN_UNROLL_BUDGET")
@@ -131,6 +133,8 @@ struct Plan {
     /// all loop blocks, header first, in block order after that
     blocks: Vec<usize>,
     trips: u64,
+    /// the loop has exits besides the header's (`while a && !done`)
+    side: bool,
 }
 
 fn preds_of(f: &Func) -> Vec<Vec<usize>> {
@@ -220,8 +224,9 @@ fn find(f: &Func) -> Option<Plan> {
         let blocks: Vec<usize> = std::iter::once(h)
             .chain((0..nb).filter(|&b| inl[b] && b != h))
             .collect();
-        // every loop block dominated by h, reachable, no second back edge,
-        // no exit except through h
+        // every loop block dominated by h, reachable, no second back edge;
+        // exits besides the header's are counted (at most MAX_SIDE_EXITS)
+        let mut side_edges = 0usize;
         for &b in &blocks {
             if !reach[b] || !dom[b][h] {
                 continue 'head;
@@ -237,9 +242,13 @@ fn find(f: &Func) -> Option<Plan> {
                         continue 'head;
                     }
                 } else if b != h {
-                    continue 'head;
+                    // a side exit (r144): handled by `fix_side_exits`
+                    side_edges += 1;
                 }
             }
+        }
+        if side_edges > MAX_SIDE_EXITS {
+            continue 'head;
         }
         // the header: brcond on a compare of a header phi with a constant
         let (cond, then_bb, else_bb) = match f.blocks[h].term {
@@ -377,7 +386,17 @@ fn find(f: &Func) -> Option<Plan> {
             }
             let mut uses = Vec::new();
             for i in &f.blocks[bb].insts {
-                i.op.uses(&mut uses);
+                if let Op::Phi { incoming } = &i.op {
+                    // an incoming value from a loop block is renamed per
+                    // copy (see `fix_side_exits`); only the others count
+                    for (q, v) in incoming {
+                        if !inl[*q as usize] {
+                            uses.push(*v);
+                        }
+                    }
+                } else {
+                    i.op.uses(&mut uses);
+                }
             }
             term_uses(&f.blocks[bb].term, &mut uses);
             for u in uses {
@@ -387,7 +406,7 @@ fn find(f: &Func) -> Option<Plan> {
                 }
             }
         }
-        return Some(Plan { p, h, x, body, latch, blocks, trips });
+        return Some(Plan { p, h, x, body, latch, blocks, trips, side: side_edges > 0 });
     }
     None
 }
@@ -498,6 +517,7 @@ fn apply(f: &mut Func, pl: &Plan) {
     }
     let resolve = |m: &HashMap<Val, Val>, v: Val| -> Val { m.get(&v).copied().unwrap_or(v) };
     let mut prev: HashMap<Val, Val> = HashMap::new();
+    let mut vms: Vec<HashMap<Val, Val>> = Vec::new();
     for j in 0..=trips {
         let mut vm: HashMap<Val, Val> = HashMap::new();
         for &(d, from_p, from_l) in &hphis {
@@ -585,12 +605,23 @@ fn apply(f: &mut Func, pl: &Plan) {
             blk.insts = insts;
             blk.term = term;
         }
+        if pl.side {
+            vms.push(vm.clone());
+        }
         prev = vm;
     }
     let last_h = bmap[trips][&h];
     // the preheader now enters copy 0
     let first_h = bmap[0][&h];
     retarget(&mut f.blocks[pl.p].term, h as BlockId, first_h);
+    if pl.side {
+        fix_side_exits(f, pl, &bmap, &vms);
+        for &b in &pl.blocks {
+            f.blocks[b].insts.clear();
+            f.blocks[b].term = Term::Br(b as BlockId);
+        }
+        return;
+    }
     // behind the loop: header values are those of the last header copy,
     // and the exit's phis come from it
     let header_vals: Vec<Val> = f.blocks[h].insts.iter().filter_map(|i| i.dst).collect();
@@ -682,4 +713,202 @@ fn retarget(t: &mut Term, from: BlockId, to: BlockId) {
         }
         _ => {}
     }
+}
+
+/// One edge that leaves the unrolled code: copy `j` of loop block `orig`
+/// (now block `new`) jumps to the outside block `target`.
+struct ExitEdge {
+    new: usize,
+    orig: usize,
+    j: usize,
+    target: usize,
+}
+
+/// The reaching-definition search for header values behind a loop with
+/// several exits. Every exit edge carries the value of its own copy; a block
+/// that several exit paths join gets a phi.
+struct Reach<'a> {
+    f: &'a mut Func,
+    preds: Vec<Vec<usize>>,
+    /// new copy block -> pass number
+    copy_of: HashMap<usize, usize>,
+    vms: &'a [HashMap<Val, Val>],
+    memo: HashMap<(usize, Val), Val>,
+    phis: Vec<(usize, Val, Vec<(BlockId, Val)>)>,
+}
+
+impl<'a> Reach<'a> {
+    /// The value of header value `d` at the end of block `p`.
+    fn at_end(&mut self, p: usize, d: Val) -> Val {
+        if let Some(&j) = self.copy_of.get(&p) {
+            return self.vms[j].get(&d).copied().unwrap_or(d);
+        }
+        self.at_start(p, d)
+    }
+
+    /// The value of header value `d` at the start of outside block `u`.
+    fn at_start(&mut self, u: usize, d: Val) -> Val {
+        if let Some(&v) = self.memo.get(&(u, d)) {
+            return v;
+        }
+        let ps = self.preds[u].clone();
+        if ps.is_empty() {
+            return d;
+        }
+        if ps.len() == 1 {
+            // placeholder against a cycle of single predecessor blocks
+            self.memo.insert((u, d), d);
+            let v = self.at_end(ps[0], d);
+            self.memo.insert((u, d), v);
+            return v;
+        }
+        let ty = self.f.val_ty(d);
+        let nv = self.f.new_val_pub(ty);
+        self.memo.insert((u, d), nv);
+        let mut inc: Vec<(BlockId, Val)> = Vec::new();
+        for p in ps {
+            let v = self.at_end(p, d);
+            inc.push((p as BlockId, v));
+        }
+        inc.sort_by_key(|(q, _)| *q);
+        self.phis.push((u, nv, inc));
+        nv
+    }
+}
+
+/// Behind an unrolled loop with side exits (r144, `while s < 4 && !done`):
+/// the exit blocks have new predecessors (one per copy), their phis get
+/// one entry per exit edge, and every read of a header value behind the
+/// loop finds the version that belongs to the path it arrives on (a phi
+/// where several paths join).
+fn fix_side_exits(f: &mut Func, pl: &Plan, bmap: &[HashMap<usize, BlockId>], vms: &[HashMap<Val, Val>]) {
+    let h = pl.h;
+    let trips = pl.trips as usize;
+    let in_loop: std::collections::HashSet<usize> = pl.blocks.iter().copied().collect();
+    let mut copy_of: HashMap<usize, usize> = HashMap::new();
+    let mut new_block_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (j, m) in bmap.iter().enumerate() {
+        for &nb in m.values() {
+            copy_of.insert(nb as usize, j);
+            new_block_set.insert(nb as usize);
+        }
+    }
+    let mut edges: Vec<ExitEdge> = Vec::new();
+    for (j, m) in bmap.iter().enumerate() {
+        for (&b, &nb) in m {
+            let nb = nb as usize;
+            let mut seen: Vec<usize> = Vec::new();
+            for s in f.blocks[nb].term.successors() {
+                let s = s as usize;
+                // the targets of a copy block are either other copy blocks
+                // or original outside blocks
+                if !new_block_set.contains(&s) && !seen.contains(&s) {
+                    seen.push(s);
+                    edges.push(ExitEdge { new: nb, orig: b, j, target: s });
+                }
+            }
+        }
+    }
+    // predecessors in the new graph: the old loop blocks do not count
+    let nb_all = f.blocks.len();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb_all];
+    for (i, b) in f.blocks.iter().enumerate() {
+        if in_loop.contains(&i) {
+            continue;
+        }
+        for s in b.term.successors() {
+            let s = s as usize;
+            if s < nb_all && !preds[s].contains(&i) {
+                preds[s].push(i);
+            }
+        }
+    }
+    // header values: phis and instructions of the header
+    let hdefs: std::collections::HashSet<Val> = f.blocks[h].insts.iter().filter_map(|i| i.dst).collect();
+    // the old phi entries of the exit blocks, before anything is changed
+    let outside: Vec<usize> = (0..nb_all).filter(|b| !in_loop.contains(b) && !new_block_set.contains(b)).collect();
+    let mut reach = Reach { f, preds, copy_of, vms, memo: HashMap::new(), phis: Vec::new() };
+    // 1. plan the new phi entries and the renamed uses of every outside block
+    struct Edit {
+        phi_inc: Vec<Vec<(BlockId, Val)>>,
+        rename: HashMap<Val, Val>,
+    }
+    let mut edits: Vec<(usize, Edit)> = Vec::new();
+    for &u in &outside {
+        let mut phi_inc: Vec<Vec<(BlockId, Val)>> = Vec::new();
+        let mut uses: Vec<Val> = Vec::new();
+        let insts = reach.f.blocks[u].insts.clone();
+        for i in &insts {
+            if let Op::Phi { incoming } = &i.op {
+                let mut ninc: Vec<(BlockId, Val)> = Vec::new();
+                for (q, v) in incoming {
+                    if in_loop.contains(&(*q as usize)) {
+                        continue;
+                    }
+                    let nv = if hdefs.contains(v) { reach.at_end(*q as usize, *v) } else { *v };
+                    ninc.push((*q, nv));
+                }
+                for e in edges.iter().filter(|e| e.target == u) {
+                    if let Some((_, v)) = incoming.iter().find(|(q, _)| *q as usize == e.orig) {
+                        let nv = vms[e.j].get(v).copied().unwrap_or(*v);
+                        ninc.push((e.new as BlockId, nv));
+                    }
+                }
+                ninc.sort_by_key(|(q, _)| *q);
+                phi_inc.push(ninc);
+            } else {
+                i.op.uses(&mut uses);
+            }
+        }
+        term_uses(&reach.f.blocks[u].term, &mut uses);
+        let mut rename: HashMap<Val, Val> = HashMap::new();
+        for d in uses {
+            if hdefs.contains(&d) && !rename.contains_key(&d) {
+                let v = reach.at_start(u, d);
+                if v != d {
+                    rename.insert(d, v);
+                }
+            }
+        }
+        edits.push((u, Edit { phi_inc, rename }));
+    }
+    let new_phis = std::mem::take(&mut reach.phis);
+    let f = reach.f;
+    // 2. apply
+    for (u, e) in edits {
+        let blk = &mut f.blocks[u];
+        let mut k = 0;
+        for i in blk.insts.iter_mut() {
+            if let Op::Phi { incoming } = &mut i.op {
+                *incoming = e.phi_inc[k].clone();
+                k += 1;
+            } else {
+                map_all(&mut i.op, &e.rename);
+            }
+        }
+        match &mut blk.term {
+            Term::BrCond { cond, .. } => {
+                if let Some(&n) = e.rename.get(cond) {
+                    *cond = n;
+                }
+            }
+            Term::Switch { val, .. } => {
+                if let Some(&n) = e.rename.get(val) {
+                    *val = n;
+                }
+            }
+            Term::Ret(Some(v)) => {
+                if let Some(&n) = e.rename.get(v) {
+                    *v = n;
+                }
+            }
+            _ => {}
+        }
+    }
+    for (u, dst, inc) in new_phis {
+        let ty = f.val_ty(dst);
+        let inst = Inst { dst: Some(dst), ty, op: Op::Phi { incoming: inc }, loc: f.blocks[u].insts.first().map(|i| i.loc).unwrap_or_default() };
+        f.blocks[u].insts.insert(0, inst);
+    }
+    let _ = trips;
 }
