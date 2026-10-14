@@ -74,7 +74,7 @@ echo "  A frames=${FA:-?} chunks=${CA:-?} lod_cols=${LA:-?} lod_tris=${TA:-?}   
 [ "${LA:-0}" -gt 0 ] && [ "${TA:-0}" -gt 0 ] || { echo "  FAIL  no LOD columns drawn in run A"; ERR=1; }
 [ "${LB:-0}" -eq 0 ] || { echo "  FAIL  LOD columns drawn without MCPLAY_LOD (${LB:-?})"; ERR=1; }
 # worker pool + window logic (a2): B has view 3 but the server sends MC_VIEW_SRV chunks -> columns beyond view + 2 leave the stream (window_ops > 0), the pool is up
-WB=$(num B window_ops); KB=$(num B cols)
+WB=$(num B window_ops); KB=$(grep -o " cols=[0-9]*" "$W/B.out" | tail -1 | cut -d= -f2)
 grep -q 'stream workers=3 pool=true' "$W/B.out" || { echo "  FAIL  stream has no mesher pool (workers=3 expected)"; ERR=1; }
 [ "${WB:-0}" -gt 0 ] || { echo "  FAIL  window sync did nothing (window_ops=${WB:-?}) although the server sends more than view+2"; ERR=1; }
 [ "${KB:-9999}" -lt "${CB:-0}" ] || { echo "  FAIL  stream keeps all ${KB:-?} of ${CB:-?} columns"; ERR=1; }
