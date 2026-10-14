@@ -2,7 +2,10 @@
 // lib/mc/mc_inv.fi -- the player inventory (window 0) from the server packets, for demos/mcplay.
 //
 //   inv_new()/inv_free(i)                    46 slots (item id, count): 0 craft result, 1-4 craft grid, 5-8 armour, 9-35 main, 36-44 hotbar, 45 off hand
-//   inv_slot_format(protocol)                1 = slot layout "present bool, varint item, i8 count, NBT" (1.13.2 .. 1.20.4), else 0 (not decoded)
+//   inv_slot_format(protocol)                1 = slot layout "present bool, varint item, i8 count, NBT" (1.13.2 .. 1.20.4),
+//                                            2 = data components "varint count (0 = empty), varint item, added/removed component counts" (1.20.5+), else 0
+//   inv_on_window_items_v(i, ver, body)      Window Items / Set Slot of ANY supported version: <= 1.20.4 by the hand reader below, 1.20.5+ by the generated packet
+//   inv_on_set_slot_v(i, ver, body)          schema (mc_schema.walk_values; it knows every component type, so the components are skipped exactly)
 //   inv_on_window_items(i, protocol, body)   Window Items (container_set_content) of window 0: stateId (1.17.1+), slot array, carried item
 //   inv_on_set_slot(i, protocol, body)       Set Slot of window 0
 //   inv_hotbar_item(i, k) / inv_hotbar_count(i, k)    hotbar slot k = 0..8 (item -1 = empty)
@@ -10,16 +13,17 @@
 //   inv_set(i, slot, item, count)            local update (the server does not echo Set Creative Slot)
 //   inv_send_creative(cl, slot, item, count) Set Creative Slot (creative mode only): puts `count` x `item` into inventory slot `slot`
 //
-// Enchantments (efficiency) in the item NBT are skipped, not evaluated.
+// Enchantments (efficiency) in the item NBT / components are skipped, not evaluated.
 import std.rt
 import std.bytes
 import mc.mc_client
 import mc.mc_sem
 import mc.mc_version
 import mc.mc_nbt
+import mc.mc_schema
 
 export {
-    Inv, inv_new, inv_free, inv_slot_format, inv_on_window_items, inv_on_set_slot, inv_hotbar_item, inv_hotbar_count, inv_held_item,
+    Inv, inv_new, inv_free, inv_slot_format, inv_on_window_items, inv_on_set_slot, inv_on_window_items_v, inv_on_set_slot_v, inv_hotbar_item, inv_hotbar_count, inv_held_item,
     inv_item, inv_count, inv_set, inv_send_creative, inv_clear, INV_SLOTS, INV_HOTBAR0, INV_MAIN0,
 }
 
@@ -59,6 +63,7 @@ fn inv_clear(v: *mut Inv) {
 
 fn inv_slot_format(protocol: i32) -> i32 {
     if protocol >= 404 && protocol <= 765 { return 1 }
+    if protocol >= 766 { return 2 }
     return 0
 }
 
@@ -115,7 +120,7 @@ fn read_slot(b: *mut bytes.Bytes, protocol: i32, item: *mut i32, count: *mut i32
 }
 
 fn inv_on_window_items(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool {
-    if inv_slot_format(protocol) == 0 { return false }
+    if inv_slot_format(protocol) != 1 { return false }
     let wid: u8 = bytes.get_u8(b) catch (255 as u8)
     if wid != 0 as u8 { return false }
     if protocol >= 756 { (*v).state_id = bytes.get_varint(b) catch 0 }
@@ -139,7 +144,7 @@ fn inv_on_window_items(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool 
 }
 
 fn inv_on_set_slot(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool {
-    if inv_slot_format(protocol) == 0 { return false }
+    if inv_slot_format(protocol) != 1 { return false }
     let wid: i8 = bytes.get_i8(b) catch ((0 - 2) as i8)
     if wid != 0 as i8 { return false }
     if protocol >= 756 { (*v).state_id = bytes.get_varint(b) catch 0 }
@@ -152,12 +157,159 @@ fn inv_on_set_slot(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool {
     return true
 }
 
-// Set Creative Slot: i16 slot + slot value (no NBT)
+// ---- 1.20.5+ (data components): the generated packet schema walks the packet, the dump lines carry the fields we need ----
+
+fn line_is(ln: u64, n: usize, lit: str) -> bool {
+    if n < lit.n { return false }
+    var i: usize = 0
+    while i < lit.n {
+        if rt.ld8(ln, i) != rt.ld8(lit.p as u64, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// decimal at p[0..n) (optional '-'); ok = false when there is any other character
+fn parse_dec(p: u64, n: usize, ok: *mut bool) -> i32 {
+    var i: usize = 0
+    var neg: bool = false
+    var r: i64 = 0
+    *ok = n > 0
+    if n > 0 && rt.ld8(p, 0) == 45 as u8 { neg = true; i = 1; *ok = n > 1 }
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 { *ok = false; return 0 }
+        r = r * 10 + ((c as i64) - 48)
+        if r > 2000000000 { *ok = false; return 0 }
+        i = i + 1
+    }
+    if neg { r = 0 - r }
+    return r as i32
+}
+
+// Runs the schema of packet `sem` over the body and applies the slot lines to the inventory.
+// window_items: lines `items[N].itemCount=C` then `items[N].itemId=I` (components and nested slots have longer paths and are ignored).
+// set_slot:     lines `slot=S`, `item.itemCount=C`, `item.itemId=I`.
+fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *mut bytes.Bytes) -> bool {
+    let id: i32 = mc_version.version_pid(ver, sem)
+    if id < 0 { return false }
+    let sch: u64 = (*ver).schema_of(mc_version.ST_PLAY, mc_version.DIR_S2C, id)
+    if sch == 0 as u64 { return false }
+    let is_items: bool = sem == mc_sem.SEM_PLAY_S2C_WINDOW_ITEMS
+    let p0: usize = bytes.bytes_pos(b)
+    var out: rt.Buf = rt.buf_new()
+    let ok: bool = mc_schema.walk_values(sch, b, &out)
+    bytes.bytes_set_pos(b, p0)
+    if !ok {
+        rt.buf_free(&out)
+        (*v).bad = (*v).bad + 1 as u32
+        return false
+    }
+    let base: u64 = rt.buf_ptr(&out)
+    let total: usize = rt.buf_len(&out)
+    var pos: usize = 0
+    var target: i32 = 0 - 1 // set_slot: the slot number
+    var pend_n: i32 = 0 - 1
+    var pend_c: i32 = 0
+    var good: bool = true
+    var n_win_ok: bool = false
+    while pos < total && good {
+        var e: usize = pos
+        while e < total && rt.ld8(base, e) != 10 as u8 { e = e + 1 }
+        let ln: u64 = base + (pos as u64)
+        let n: usize = e - pos
+        pos = e + 1
+        var eq: usize = 0
+        while eq < n && rt.ld8(ln, eq) != 61 as u8 { eq = eq + 1 }
+        if eq >= n { continue }
+        let vp: u64 = ln + ((eq + 1) as u64)
+        let vn: usize = n - eq - 1
+        var okn: bool = false
+        if eq == 8 && line_is(ln, 8, "windowId") {
+            let w: i32 = parse_dec(vp, vn, &okn)
+            if !okn || w != 0 { good = false } else { n_win_ok = true }
+        } else if eq == 7 && line_is(ln, 7, "stateId") {
+            let st: i32 = parse_dec(vp, vn, &okn)
+            if okn { (*v).state_id = st }
+        } else if is_items {
+            // items[N].itemCount / items[N].itemId
+            if line_is(ln, eq, "items[") {
+                var q: usize = 6
+                while q < eq && rt.ld8(ln, q) != 93 as u8 { q = q + 1 }
+                if q < eq {
+                    let idx: i32 = parse_dec(ln + 6 as u64, q - 6, &okn)
+                    if okn && q + 1 < eq && rt.ld8(ln, q + 1) == 46 as u8 {
+                        let fp: u64 = ln + ((q + 2) as u64)
+                        let fnn: usize = eq - q - 2
+                        if fnn == 9 && line_is(fp, 9, "itemCount") {
+                            let c: i32 = parse_dec(vp, vn, &okn)
+                            if okn && c <= 0 {
+                                put_slot(v, idx, 0 - 1, 0)
+                                pend_n = 0 - 1
+                            } else if okn {
+                                pend_n = idx
+                                pend_c = c
+                            }
+                        } else if fnn == 6 && line_is(fp, 6, "itemId") && idx == pend_n && pend_c > 0 {
+                            let it: i32 = parse_dec(vp, vn, &okn)
+                            if okn { put_slot(v, idx, it, pend_c) }
+                            pend_n = 0 - 1
+                        }
+                    }
+                }
+            }
+        } else {
+            if eq == 4 && line_is(ln, 4, "slot") {
+                target = parse_dec(vp, vn, &okn)
+                if !okn { good = false }
+            } else if eq == 14 && line_is(ln, 14, "item.itemCount") {
+                let c: i32 = parse_dec(vp, vn, &okn)
+                if okn && c <= 0 {
+                    put_slot(v, target, 0 - 1, 0)
+                    pend_n = 0 - 1
+                } else if okn {
+                    pend_n = target
+                    pend_c = c
+                }
+            } else if eq == 11 && line_is(ln, 11, "item.itemId") && pend_n >= 0 && pend_c > 0 {
+                let it: i32 = parse_dec(vp, vn, &okn)
+                if okn { put_slot(v, pend_n, it, pend_c) }
+                pend_n = 0 - 1
+            }
+        }
+    }
+    rt.buf_free(&out)
+    if !good || !n_win_ok { return false }
+    return true
+}
+
+// Window Items of window 0, any supported version (hand reader up to 1.20.4, packet schema from 1.20.5)
+fn inv_on_window_items_v(v: *mut Inv, ver: *mut mc_version.Version, b: *mut bytes.Bytes) -> bool {
+    let f: i32 = inv_slot_format((*ver).protocol)
+    if f == 1 { return inv_on_window_items(v, (*ver).protocol, b) }
+    if f == 2 { return apply_components(v, ver, mc_sem.SEM_PLAY_S2C_WINDOW_ITEMS, b) }
+    return false
+}
+
+fn inv_on_set_slot_v(v: *mut Inv, ver: *mut mc_version.Version, b: *mut bytes.Bytes) -> bool {
+    let f: i32 = inv_slot_format((*ver).protocol)
+    if f == 1 { return inv_on_set_slot(v, (*ver).protocol, b) }
+    if f == 2 { return apply_components(v, ver, mc_sem.SEM_PLAY_S2C_SET_SLOT, b) }
+    return false
+}
+
+// Set Creative Slot: i16 slot + slot value (no NBT / no components; 1.20.5+: count, item, 0 added, 0 removed)
 fn inv_send_creative(cl: *mut mc_client.Client, slot: i32, item: i32, count: i32) -> bool {
     var b: bytes.Bytes = bytes.bytes_new()
     bytes.put_i16(&b, slot as i16)
+    let comp: bool = inv_slot_format((*cl).ver.protocol) == 2
     if item < 0 || count <= 0 {
-        bytes.put_bool(&b, false)
+        if comp { bytes.put_varint(&b, 0) } else { bytes.put_bool(&b, false) }
+    } else if comp {
+        bytes.put_varint(&b, count)
+        bytes.put_varint(&b, item)
+        bytes.put_varint(&b, 0)
+        bytes.put_varint(&b, 0)
     } else {
         bytes.put_bool(&b, true)
         bytes.put_varint(&b, item)
