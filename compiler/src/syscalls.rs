@@ -82,6 +82,9 @@ pub enum A64 {
 pub const ARCH_SET_FS: i64 = 0x1002;
 /// `ARCH_GET_FS`: read side of the same request, translated to `mrs x, tpidr_el0` (aarch64 only).
 pub const ARCH_GET_FS: i64 = 0x1003;
+/// `ARCH_GET_TCB`: the thread block base of the calling thread (r506 host-thread guard, see `lower.rs`). x86-64 Linux:
+/// rewritten to `ARCH_GET_GS` / `ARCH_GET_FS`; Windows: answered by the seam; aarch64: -1 ("cannot tell").
+pub const ARCH_GET_TCB: i64 = 0x1f01;
 /// `SIGCHLD` — the flag word that turns `clone` into `fork`.
 pub const SIGCHLD: i64 = 17;
 

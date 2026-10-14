@@ -178,6 +178,8 @@ extern fn SystemFunction036(buf: u64, n: i64) -> i32;
 // ROUND WIN-THREADS: the thread runtime's futex and thread block pointer.
 extern fn TlsAlloc() -> i32;
 extern fn TlsSetValue(i: i64, v: i64) -> i32;
+extern fn TlsGetValue(i: i64) -> i64;
+extern fn VirtualQuery(a: u64, b: u64, c: u64) -> u64;
 extern fn WaitOnAddress(a: u64, cmp: u64, n: i64, ms: i64) -> i32;
 extern fn WakeByAddressSingle(a: u64);
 extern fn WakeByAddressAll(a: u64);
@@ -1293,6 +1295,26 @@ fn __win_scratch_call(nr: i64) -> bool {
 }
 
 fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) -> i64 {
+    if nr == 28 {
+        // madvise(addr, len, MADV_NORMAL) as the collector's "is this range still mapped" probe (r506: the stack of a host
+        // thread that ended without detaching): ENOMEM when the first or last page is not committed.
+        var mbi: [i64; 8] = [0; 8]
+        if VirtualQuery(a1 as u64, (&mbi[0]) as u64, 48) == 0 {
+            return 0 - 12
+        }
+        if (mbi[4] & 4294967295) != 4096 {
+            return 0 - 12
+        }
+        if a2 > 1 {
+            if VirtualQuery((a1 + a2 - 1) as u64, (&mbi[0]) as u64, 48) == 0 {
+                return 0 - 12
+            }
+            if (mbi[4] & 4294967295) != 4096 {
+                return 0 - 12
+            }
+        }
+        return 0
+    }
     if nr == 202 {
         // futex(addr, op, val): the thread runtime's wait and wake. WAIT
         // sleeps while the 32 bit word at `addr` still holds `val` (it
@@ -1735,6 +1757,16 @@ fn __win_syscall_one(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i
         // call, which is the main thread's). `Op::ThreadSelf` reads the
         // slot straight out of the TEB. Slots 0..63 only: the TEB keeps
         // those inline, which is what makes the read one instruction.
+        if a1 == 7937 {
+            // ARCH_GET_TCB (r506): the thread block of the calling thread, 0 = none (an unattached host thread).
+            let out: *mut i64 = a2 as *mut i64
+            if __win_tlsset == 0 {
+                *out = 0
+                return 1
+            }
+            *out = TlsGetValue(__win_tlsidx as i64)
+            return 1
+        }
         if a1 != 4098 {
             return 0 - 22
         }

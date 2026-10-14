@@ -224,6 +224,16 @@ pub fn export_names() -> Vec<String> {
     SIGS.with(|v| v.borrow().iter().map(|s| s.c_name.clone()).collect())
 }
 
+/// A module-definition file for a Windows DLL: `LIBRARY <dll>` and one `EXPORTS` line per `#[export_c]`
+/// function (r506). `dlltool -d x.def -l x.lib` or `lib /def:x.def` turn it into the import library.
+pub fn def_text(dll: &str) -> String {
+    let mut s = format!("LIBRARY {}\nEXPORTS\n", dll);
+    for n in export_names() {
+        s.push_str(&format!("    {}\n", n));
+    }
+    s
+}
+
 /// One Win64 entry thunk to write: `(internal name, C name, parameters, result, unsupported)`.
 pub struct ExportThunk {
     pub internal: String,

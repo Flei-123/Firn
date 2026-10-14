@@ -192,6 +192,8 @@ pub(crate) enum Deferred {
     Stmt(Stmt, bool),
     /// `drop` of the value at this address, unless it has been moved away.
     Drop(Val, Type),
+    /// r506: end of the host-thread guard of an `#[export_c]` function (slot holding the token `thread_host_guard` returned).
+    HostGuard(Val),
 }
 
 pub(crate) struct Local {
@@ -1672,7 +1674,13 @@ impl<'a> Lower<'a> {
     /// `thread::use_gs`): `arch_prctl(ARCH_SET_FS, p)` with constant operands
     /// becomes `arch_prctl(ARCH_SET_GS, p)`. Anything else is left alone.
     fn retarget_thread_base(&mut self, args: &mut [Val]) {
-        if args.len() < 3 || !crate::thread::use_gs() {
+        if args.len() < 3 {
+            return;
+        }
+        let gs = crate::thread::use_gs();
+        // x86-64 Linux executable: ARCH_GET_TCB is a plain ARCH_GET_FS; Windows and aarch64 translate it themselves.
+        let get_fs = !gs && !crate::target::windows() && matches!(crate::target::active(), crate::target::Target::X86_64);
+        if !gs && !get_fs {
             return;
         }
         let const_val = |me: &Self, v: Val| -> Option<i128> {
@@ -1683,8 +1691,12 @@ impl<'a> Lower<'a> {
                 .find(|i| i.dst == Some(v))
                 .and_then(|i| if let Op::Const(c) = i.op { Some(c) } else { None })
         };
-        if const_val(self, args[0]) == Some(158) && const_val(self, args[1]) == Some(crate::thread::ARCH_SET_FS as i128) {
+        if gs && const_val(self, args[0]) == Some(158) && const_val(self, args[1]) == Some(crate::thread::ARCH_SET_FS as i128) {
             args[1] = self.constant(FTy::I64, crate::thread::ARCH_SET_GS as i128);
+        }
+        if const_val(self, args[0]) == Some(158) && const_val(self, args[1]) == Some(crate::syscalls::ARCH_GET_TCB as i128) {
+            let req = if gs { crate::thread::ARCH_GET_GS } else { crate::thread::ARCH_GET_FS };
+            args[1] = self.constant(FTy::I64, req as i128);
         }
     }
 
@@ -1722,6 +1734,7 @@ impl<'a> Lower<'a> {
                     }
                 }
                 Deferred::Drop(slot, ty) => self.run_drop(*slot, ty),
+                Deferred::HostGuard(tok) => self.run_host_guard_end(*tok),
             }
         }
         self.leave();
@@ -1768,10 +1781,17 @@ impl<'a> Lower<'a> {
                         }
                     }
                     Deferred::Drop(slot, ty) => self.run_drop(*slot, ty),
+                    Deferred::HostGuard(tok) => self.run_host_guard_end(*tok),
                 }
             }
         }
         r
+    }
+
+    /// `thread_host_guard_end(token)` at the exit of a guarded export.
+    fn run_host_guard_end(&mut self, slot: Val) {
+        let tok = self.load(FTy::I64, slot);
+        self.push_void(FTy::Void, Op::Call { name: "thread_host_guard_end".to_string(), args: vec![tok] });
     }
 
     /// Is there any active `errdefer` in this function at all?
@@ -2602,6 +2622,20 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
             let a = lo.field_addr_at(env, c.off);
             lo.declare_ty(&c.name, a, c.ty.clone());
         }
+    }
+    // r506: a host thread that never called `thread_attach` is registered by the first export it calls (the guard
+    // lives in lib/gc/gc.fi). Only shared objects with the runtime, and only where a thread block exists to attach.
+    if crate::target::shared()
+        && !crate::target::active().is_wasm()
+        && crate::gc::runtime_active()
+        && crate::extfn::export_link_name(&d.name).is_some()
+        && !d.name.starts_with("thread_host_guard")
+        && !d.attrs.iter().any(|a| a.name == "no_host_guard")
+    {
+        let tok = lo.push(FTy::I64, Op::Call { name: "thread_host_guard".to_string(), args: vec![] });
+        let slot = lo.alloca(8, 8);
+        lo.store(FTy::I64, slot, tok);
+        param_drops.push(Deferred::HostGuard(slot));
     }
     let has_param_drops = !param_drops.is_empty();
     if has_param_drops {

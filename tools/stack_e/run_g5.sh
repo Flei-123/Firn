@@ -45,6 +45,16 @@ if command -v wine >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null; t
         done
         [ $ok = 1 ] && echo "ok  Windows DLL attached host threads under Wine ($lvl)"
     done
+    # host threads that never call se_attach (r506): the export guard registers them (TLS slot), threads end with and without detach
+    x86_64-w64-mingw32-gcc -O1 -o "$D/hna.exe" tools/stack_e/host_noattach_win.c || { echo "FAIL mingw host_noattach_win"; rc=1; }
+    for lvl in dev-fast release-fast; do
+        "$FIRNC" --shared --target=x86_64-windows --opt-level=$lvl -o "$D/rtn.dll" tools/stack_e/lib_rt.fi || { echo "FAIL dll lib_rt (noattach) $lvl"; rc=1; continue; }
+        (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 300 wine hna.exe rtn.dll 2>&1 | tail -1 | grep -q 'ok  host_noattach') && echo "ok  Windows DLL unattached host threads under Wine ($lvl)" || { echo "FAIL DLL unattached host threads (wine, $lvl)"; rc=1; }
+    done
+    # --def: module definition of the exports; dlltool turns it into an import library that links against the DLL
+    "$FIRNC" --shared --target=x86_64-windows --def="$D/wdx.def" -o "$D/wd.dll" tools/stack_e/lib_win.fi || { echo "FAIL dll --def"; rc=1; }
+    grep -q "^EXPORTS" "$D/wdx.def" && grep -q wd_gc_chains "$D/wdx.def" || { echo "FAIL --def: EXPORTS/wd_gc_chains missing"; rc=1; }
+    x86_64-w64-mingw32-dlltool -d "$D/wdx.def" -l "$D/libwd.a" -D wd.dll 2>"$D/err" && [ -s "$D/libwd.a" ] && echo "ok  --def + dlltool import library" || { echo "FAIL dlltool on --def"; rc=1; }
     # a v128 parameter that finds no xmm0-7 register is refused with a clear error (the others are passed: abi_v128_* above)
     printf '#[export_c]\nfn bad_v(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f64, h: f64, x: v128) -> u64 { return 0 }\n' > "$D/badv.fi"
     "$FIRNC" --shared --target=x86_64-windows -o "$D/badv.dll" "$D/badv.fi" 2> "$D/err" && { echo "FAIL dll: v128 export accepted"; rc=1; } || grep -q 'v128' "$D/err" || { echo "FAIL dll: v128 error text"; rc=1; }
