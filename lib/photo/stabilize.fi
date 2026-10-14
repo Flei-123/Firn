@@ -1,0 +1,515 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/stabilize.fi -- photo.stabilize: simple digital video stabilisation (FirnCam core).
+//
+//     import photo.stabilize
+//
+//     var o: stabilize.StabOpts = stabilize.stab_default()
+//     // OFFLINE (a whole clip): one luma image per frame (any size, 120..320 px wide is plenty)
+//     var path: stabilize.Path = stabilize.path_new(n)             // camera path from frame to frame
+//     var m: stabilize.Motion = stabilize.stab_motion(&prev, &cur, &o)   // content moved by (m.dx, m.dy)
+//     stabilize.path_add(&path, m.dx, m.dy)                         // call once per frame after the first
+//     var sm: stabilize.Path = stabilize.path_new(n)
+//     stabilize.path_smooth(&path, o.smooth, &sm)                   // Gaussian low pass, centred window
+//     var cor: stabilize.Path = stabilize.path_new(n)
+//     stabilize.path_correction(&path, &sm, mx, my, &cor)           // shift to apply to frame i, clamped to the crop
+//     stabilize.stab_crop(&frame, cx, cy, mx, my, &out)             // shifted + cropped frame (any channel count)
+//     // LIVE (preview, causal): stabilize.live_push(&live, &luma, &cx, &cy) per frame, then stab_zoom_bgrx.
+//
+// MOTION: block matching in a 3 level pyramid (1/4, 1/2, 1/1). Per level a grid of blocks (textured ones only)
+// searches +-2 px around the prediction of the coarser level (+-search/4 at the top) with SAD; the MEDIAN of the
+// per-block shifts is the global motion (moving objects and noise blocks are outvoted). At full resolution the
+// blocks that agree with the median are re-evaluated with SSD on a 3x3 neighbourhood and a parabola per axis gives
+// the sub-pixel part. Pure translation: rotation / rolling shutter are NOT modelled (they stay as residual).
+// PATH: the camera path is the running sum of the motions; the smooth path is a Gaussian low pass over it
+// (sigma in frames; the slow, intentional pan survives, the jitter goes). Frame i is shifted by smooth - raw and
+// cropped by the margin: a correction that would leave the frame is clamped to the margin (so very large
+// shakes are only partly removed -- the crop is the budget).
+// LIVE: causal exponential smoothing instead of the centred window. It lags a steady pan, which shows as a
+// correction that grows until it is clamped: right for hand jitter, only an approximation for long pans.
+import std.rt
+import photo.image
+
+export {
+    StabOpts, stab_default, Motion, stab_motion, stab_luma_small, stab_luma_bgrx, stab_margin,
+    Path, path_new, path_free, path_add, path_get_x, path_get_y, path_smooth, path_correction,
+    Live, live_new, live_free, live_push,
+    stab_crop, stab_zoom_bgrx,
+}
+
+struct StabOpts {
+    search: i32,     // largest frame-to-frame shift in input pixels
+    grid_x: i32,     // blocks per row (<= 8)
+    grid_y: i32,     // blocks per column (<= 8)
+    block: i32,      // block size at full resolution (pixels)
+    smooth: f32,     // sigma of the path smoothing, frames
+    crop: f32,       // total crop fraction of the width / height (margin = crop / 2 per side)
+}
+
+fn stab_default() -> StabOpts {
+    return StabOpts { search: 16, grid_x: 5, grid_y: 4, block: 16, smooth: 6.0f, crop: 0.12f }
+}
+
+struct Motion {
+    dx: f32,         // content moved by +dx to the right ...
+    dy: f32,         // ... and +dy downwards from prev to cur: cur(x, y) = prev(x - dx, y - dy)
+    conf: f32,       // fraction of the blocks that voted for it, 0 = no texture (motion = 0)
+}
+
+fn absf(x: f32) -> f32 {
+    if x < 0.0f { return 0.0f - x }
+    return x
+}
+
+// Box 2x2 down sampling of a 1 channel image.
+fn down2(src: *mut image.Image) -> image.Image {
+    var w: i32 = (*src).w / 2
+    var h: i32 = (*src).h / 2
+    if w < 1 { w = 1 }
+    if h < 1 { h = 1 }
+    var d: image.Image = image.img_new(w, h, 1)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let a: f32 = image.img_getc(src, 0, 2 * x, 2 * y) + image.img_getc(src, 0, 2 * x + 1, 2 * y)
+            let b: f32 = image.img_getc(src, 0, 2 * x, 2 * y + 1) + image.img_getc(src, 0, 2 * x + 1, 2 * y + 1)
+            image.img_set(&d, 0, x, y, (a + b) * 0.25f)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return d
+}
+
+// Luma image of the BGRX buffer `p` (w x h), box filtered down by the integer factor `k` (>= 1).
+fn stab_luma_bgrx(p: u64, w: i32, h: i32, k: i32) -> image.Image {
+    var kk: i32 = k
+    if kk < 1 { kk = 1 }
+    let ow: i32 = w / kk
+    let oh: i32 = h / kk
+    var d: image.Image = image.img_new(ow, oh, 1)
+    var y: i32 = 0
+    while y < oh {
+        var x: i32 = 0
+        while x < ow {
+            var s: u32 = 0
+            var yy: i32 = 0
+            while yy < kk {
+                var xx: i32 = 0
+                while xx < kk {
+                    let v: u32 = *((p + ((((y * kk + yy) * w + x * kk + xx) * 4) as u64)) as *mut u32)
+                    // BGRX little endian: B = bits 0..7, G = 8..15, R = 16..23; luma ~ (R + 2 G + B) / 4
+                    s = s + ((v >> 16) & 255) + 2 * ((v >> 8) & 255) + (v & 255)
+                    xx = xx + 1
+                }
+                yy = yy + 1
+            }
+            image.img_set(&d, 0, x, y, (s as f32) / ((kk * kk) as f32 * 1020.0f))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return d
+}
+
+// Luma of any image (1 or 3 channels) box filtered down by `k`.
+fn stab_luma_small(im: *mut image.Image, k: i32) -> image.Image {
+    var l: image.Image = image.img_luma(im)
+    var kk: i32 = k
+    while kk > 1 {
+        var t: image.Image = down2(&l)
+        image.img_free(&l)
+        l = t
+        kk = kk / 2
+    }
+    return l
+}
+
+// Cost of the block of `cur` at (x, y) against the block of `prev` at (x - ox, y - oy). SAD or SSD, mean per pixel.
+// 1e9 when the prev block leaves the image.
+fn block_cost(prev: *mut image.Image, cur: *mut image.Image, x: i32, y: i32, bs: i32, ox: i32, oy: i32, ssd: bool) -> f32 {
+    let px: i32 = x - ox
+    let py: i32 = y - oy
+    if px < 0 || py < 0 || px + bs > (*prev).w || py + bs > (*prev).h { return 1.0e9f }
+    var s: f32 = 0.0f
+    var j: i32 = 0
+    while j < bs {
+        var i: i32 = 0
+        while i < bs {
+            let d: f32 = image.img_get(cur, 0, x + i, y + j) - image.img_get(prev, 0, px + i, py + j)
+            if ssd { s = s + d * d } else { s = s + absf(d) }
+            i = i + 1
+        }
+        j = j + 1
+    }
+    return s / ((bs * bs) as f32)
+}
+
+// Mean absolute gradient of a block (texture measure).
+fn block_texture(im: *mut image.Image, x: i32, y: i32, bs: i32) -> f32 {
+    var s: f32 = 0.0f
+    var j: i32 = 0
+    while j < bs - 1 {
+        var i: i32 = 0
+        while i < bs - 1 {
+            let c: f32 = image.img_get(im, 0, x + i, y + j)
+            s = s + absf(image.img_get(im, 0, x + i + 1, y + j) - c) + absf(image.img_get(im, 0, x + i, y + j + 1) - c)
+            i = i + 1
+        }
+        j = j + 1
+    }
+    return s / (((bs - 1) * (bs - 1)) as f32)
+}
+
+fn median(a: *mut [f32; 64], n: i32) -> f32 {
+    var t: [f32; 64] = *a
+    var i: i32 = 1
+    while i < n {
+        let v: f32 = t[i as usize]
+        var j: i32 = i - 1
+        while j >= 0 && t[j as usize] > v {
+            t[(j + 1) as usize] = t[j as usize]
+            j = j - 1
+        }
+        t[(j + 1) as usize] = v
+        i = i + 1
+    }
+    if n <= 0 { return 0.0f }
+    if n % 2 == 1 { return t[(n / 2) as usize] }
+    return (t[(n / 2 - 1) as usize] + t[(n / 2) as usize]) * 0.5f
+}
+
+// Block origin k of the grid (n blocks across `len` with margin mg and block size bs).
+fn grid_pos(k: i32, n: i32, len: i32, mg: i32, bs: i32) -> i32 {
+    let span: i32 = len - 2 * mg - bs
+    if n <= 1 || span <= 0 { return mg + (if span > 0 { span / 2 } else { 0 }) }
+    return mg + (k * span) / (n - 1)
+}
+
+// One level: per block full search of +-r around (pdx, pdy); median of the winners. Returns the number of voters.
+fn level_search(prev: *mut image.Image, cur: *mut image.Image, o: *mut StabOpts, bs: i32, mg: i32,
+                pdx: i32, pdy: i32, r: i32, odx: *mut i32, ody: *mut i32, inl: *mut [i32; 64]) -> i32 {
+    var vx: [f32; 64] = [0.0f; 64]
+    var vy: [f32; 64] = [0.0f; 64]
+    var bxs: [i32; 64] = [0; 64]
+    var bys: [i32; 64] = [0; 64]
+    var n: i32 = 0
+    var gy: i32 = 0
+    while gy < (*o).grid_y {
+        var gx: i32 = 0
+        while gx < (*o).grid_x {
+            let x: i32 = grid_pos(gx, (*o).grid_x, (*cur).w, mg, bs)
+            let y: i32 = grid_pos(gy, (*o).grid_y, (*cur).h, mg, bs)
+            if x >= 0 && y >= 0 && x + bs <= (*cur).w && y + bs <= (*cur).h && block_texture(cur, x, y, bs) > 0.004f {
+                var best: f32 = 1.0e9f
+                var bx: i32 = pdx
+                var by: i32 = pdy
+                var oy: i32 = pdy - r
+                while oy <= pdy + r {
+                    var ox: i32 = pdx - r
+                    while ox <= pdx + r {
+                        // small pull towards the prediction: flat blocks do not wander
+                        let pen: f32 = 1.0e-5f * ((absf((ox - pdx) as f32)) + absf((oy - pdy) as f32))
+                        let c: f32 = block_cost(prev, cur, x, y, bs, ox, oy, false) + pen
+                        if c < best {
+                            best = c
+                            bx = ox
+                            by = oy
+                        }
+                        ox = ox + 1
+                    }
+                    oy = oy + 1
+                }
+                if best < 1.0e8f {
+                    vx[n as usize] = bx as f32
+                    vy[n as usize] = by as f32
+                    bxs[n as usize] = x
+                    bys[n as usize] = y
+                    n = n + 1
+                }
+            }
+            gx = gx + 1
+        }
+        gy = gy + 1
+    }
+    if n < 3 {
+        *odx = pdx
+        *ody = pdy
+        return 0
+    }
+    let mx: f32 = median(&vx, n)
+    let my: f32 = median(&vy, n)
+    *odx = (if mx < 0.0f { mx - 0.5f } else { mx + 0.5f }) as i32
+    *ody = (if my < 0.0f { my - 0.5f } else { my + 0.5f }) as i32
+    // inliers (block origins packed as x * 65536 + y) for the sub-pixel step
+    var k: i32 = 0
+    var m: i32 = 0
+    while k < n {
+        if absf(vx[k as usize] - mx) <= 1.5f && absf(vy[k as usize] - my) <= 1.5f {
+            (*inl)[m as usize] = bxs[k as usize] * 65536 + bys[k as usize]
+            m = m + 1
+        }
+        k = k + 1
+    }
+    return m
+}
+
+fn ssd_sum(prev: *mut image.Image, cur: *mut image.Image, inl: *mut [i32; 64], m: i32, bs: i32, ox: i32, oy: i32) -> f32 {
+    var s: f32 = 0.0f
+    var k: i32 = 0
+    while k < m {
+        let x: i32 = (*inl)[k as usize] / 65536
+        let y: i32 = (*inl)[k as usize] % 65536
+        s = s + block_cost(prev, cur, x, y, bs, ox, oy, true)
+        k = k + 1
+    }
+    return s
+}
+
+fn parab(a: f32, b: f32, c: f32) -> f32 {
+    let den: f32 = a - 2.0f * b + c
+    if den <= 1.0e-12f { return 0.0f }
+    var v: f32 = (a - c) / (2.0f * den)
+    if v > 0.5f { v = 0.5f }
+    if v < 0.0f - 0.5f { v = 0.0f - 0.5f }
+    return v
+}
+
+// Global translation prev -> cur (1 channel images of the same size).
+fn stab_motion(prev: *mut image.Image, cur: *mut image.Image, o: *mut StabOpts) -> Motion {
+    var res: Motion = Motion { dx: 0.0f, dy: 0.0f, conf: 0.0f }
+    if (*prev).w != (*cur).w || (*prev).h != (*cur).h { return res }
+    var p1: image.Image = down2(prev)
+    var c1: image.Image = down2(cur)
+    var p2: image.Image = down2(&p1)
+    var c2: image.Image = down2(&c1)
+    var inl: [i32; 64] = [0; 64]
+    var dx: i32 = 0
+    var dy: i32 = 0
+    var voters: i32 = 0
+    let total: i32 = (*o).grid_x * (*o).grid_y
+    // level 2 (1/4): the whole search range
+    var bs2: i32 = (*o).block / 4
+    if bs2 < 6 { bs2 = 6 }
+    let r2: i32 = (*o).search / 4 + 1
+    var m2: i32 = r2 + 1
+    if c2.w - 2 * m2 - bs2 < 0 { m2 = 2 }
+    voters = level_search(&p2, &c2, o, bs2, m2, 0, 0, r2, &dx, &dy, &inl)
+    var ok: bool = voters > 0
+    // level 1 (1/2)
+    var bs1: i32 = (*o).block / 2
+    if bs1 < 6 { bs1 = 6 }
+    var m1: i32 = (*o).search / 2 + 2
+    if c1.w - 2 * m1 - bs1 < 0 { m1 = 2 }
+    var v1: i32 = level_search(&p1, &c1, o, bs1, m1, dx * 2, dy * 2, 2, &dx, &dy, &inl)
+    if v1 > 0 { voters = v1 } else { ok = false }
+    // level 0 (1/1)
+    var bs0: i32 = (*o).block
+    var m0: i32 = (*o).search + 2
+    if (*cur).w - 2 * m0 - bs0 < 0 { m0 = 2 }
+    var v0: i32 = level_search(prev, cur, o, bs0, m0, dx * 2, dy * 2, 2, &dx, &dy, &inl)
+    if v0 > 0 { voters = v0 } else { ok = false }
+    image.img_free(&p1)
+    image.img_free(&c1)
+    image.img_free(&p2)
+    image.img_free(&c2)
+    if voters < 3 || total <= 0 { return res }
+    // sub-pixel: SSD on the inliers, parabola per axis
+    let s00: f32 = ssd_sum(prev, cur, &inl, voters, bs0, dx, dy)
+    let sxm: f32 = ssd_sum(prev, cur, &inl, voters, bs0, dx - 1, dy)
+    let sxp: f32 = ssd_sum(prev, cur, &inl, voters, bs0, dx + 1, dy)
+    let sym: f32 = ssd_sum(prev, cur, &inl, voters, bs0, dx, dy - 1)
+    let syp: f32 = ssd_sum(prev, cur, &inl, voters, bs0, dx, dy + 1)
+    res.dx = dx as f32 + parab(sxm, s00, sxp)
+    res.dy = dy as f32 + parab(sym, s00, syp)
+    res.conf = (voters as f32) / (total as f32)
+    return res
+}
+
+// ---------------------------------------------------------------- path
+
+struct Path {
+    n: i32,
+    cap: i32,
+    x: u64,
+    y: u64,
+}
+
+fn path_new(cap: i32) -> Path {
+    let bytes: usize = (cap as usize) * 4
+    var p: Path = Path { n: 1, cap: cap, x: rt.heap_alloc(bytes), y: rt.heap_alloc(bytes) }
+    *(p.x as *mut f32) = 0.0f
+    *(p.y as *mut f32) = 0.0f
+    return p
+}
+
+fn path_free(p: *mut Path) {
+    if (*p).x != 0 as u64 { rt.heap_free((*p).x, ((*p).cap as usize) * 4) }
+    if (*p).y != 0 as u64 { rt.heap_free((*p).y, ((*p).cap as usize) * 4) }
+    (*p).x = 0 as u64
+    (*p).y = 0 as u64
+}
+
+fn path_get_x(p: *mut Path, i: i32) -> f32 { return *(((*p).x + (i as u64) * (4 as u64)) as *mut f32) }
+fn path_get_y(p: *mut Path, i: i32) -> f32 { return *(((*p).y + (i as u64) * (4 as u64)) as *mut f32) }
+fn path_set(p: *mut Path, i: i32, x: f32, y: f32) {
+    *(((*p).x + (i as u64) * (4 as u64)) as *mut f32) = x
+    *(((*p).y + (i as u64) * (4 as u64)) as *mut f32) = y
+}
+
+// Appends the next frame: its position is the previous one plus the measured motion.
+fn path_add(p: *mut Path, dx: f32, dy: f32) -> bool {
+    if (*p).n >= (*p).cap { return false }
+    let n: i32 = (*p).n
+    path_set(p, n, path_get_x(p, n - 1) + dx, path_get_y(p, n - 1) + dy)
+    (*p).n = n + 1
+    return true
+}
+
+// Gaussian low pass (sigma in frames), centred window, renormalised at both ends. dst gets src.n points.
+fn path_smooth(src: *mut Path, sigma: f32, dst: *mut Path) {
+    (*dst).n = (*src).n
+    var half: i32 = (sigma * 3.0f + 0.999f) as i32
+    if half < 1 { half = 1 }
+    var i: i32 = 0
+    while i < (*src).n {
+        var sx: f32 = 0.0f
+        var sy: f32 = 0.0f
+        var sw: f32 = 0.0f
+        var k: i32 = 0 - half
+        while k <= half {
+            let j: i32 = i + k
+            if j >= 0 && j < (*src).n {
+                let t: f32 = (k as f32) / sigma
+                let w: f32 = image.expneg(0.5f * t * t)
+                sx = sx + w * path_get_x(src, j)
+                sy = sy + w * path_get_y(src, j)
+                sw = sw + w
+            }
+            k = k + 1
+        }
+        path_set(dst, i, sx / sw, sy / sw)
+        i = i + 1
+    }
+}
+
+fn clampf(v: f32, lim: f32) -> f32 {
+    if v > lim { return lim }
+    if v < 0.0f - lim { return 0.0f - lim }
+    return v
+}
+
+// Shift to apply to frame i (out(x) = src(x - c)): smooth - raw, limited to +-mx / +-my pixels.
+fn path_correction(raw: *mut Path, smooth: *mut Path, mx: f32, my: f32, dst: *mut Path) {
+    (*dst).n = (*raw).n
+    var i: i32 = 0
+    while i < (*raw).n {
+        path_set(dst, i, clampf(path_get_x(smooth, i) - path_get_x(raw, i), mx), clampf(path_get_y(smooth, i) - path_get_y(raw, i), my))
+        i = i + 1
+    }
+}
+
+// Margin in pixels for a total crop fraction of a length.
+fn stab_margin(len: i32, crop: f32) -> i32 {
+    return ((len as f32) * crop * 0.5f) as i32
+}
+
+// ---------------------------------------------------------------- live
+
+struct Live {
+    o: StabOpts,
+    prev: image.Image,
+    have: bool,
+    rx: f32,
+    ry: f32,
+    sx: f32,
+    sy: f32,
+    k: f32,
+}
+
+fn live_new(o: *mut StabOpts) -> Live {
+    var l: Live = Live { o: *o, prev: image.img_new(1, 1, 1), have: false, rx: 0.0f, ry: 0.0f, sx: 0.0f, sy: 0.0f, k: 1.0f / (1.0f + (*o).smooth) }
+    return l
+}
+
+fn live_free(l: *mut Live) {
+    image.img_free(&(*l).prev)
+}
+
+// Next luma frame -> correction (cx, cy) in luma pixels (apply with stab_zoom_bgrx after scaling by the luma factor).
+fn live_push(l: *mut Live, luma: *mut image.Image, cx: *mut f32, cy: *mut f32) {
+    if !(*l).have || (*l).prev.w != (*luma).w || (*l).prev.h != (*luma).h {
+        image.img_free(&(*l).prev)
+        (*l).prev = image.img_copy(luma)
+        (*l).have = true
+        (*l).rx = 0.0f
+        (*l).ry = 0.0f
+        (*l).sx = 0.0f
+        (*l).sy = 0.0f
+        *cx = 0.0f
+        *cy = 0.0f
+        return
+    }
+    let m: Motion = stab_motion(&(*l).prev, luma, &(*l).o)
+    image.img_free(&(*l).prev)
+    (*l).prev = image.img_copy(luma)
+    (*l).rx = (*l).rx + m.dx
+    (*l).ry = (*l).ry + m.dy
+    (*l).sx = (*l).sx + ((*l).rx - (*l).sx) * (*l).k
+    (*l).sy = (*l).sy + ((*l).ry - (*l).sy) * (*l).k
+    let mgx: f32 = ((*luma).w as f32) * (*l).o.crop * 0.5f
+    let mgy: f32 = ((*luma).h as f32) * (*l).o.crop * 0.5f
+    let ccx: f32 = clampf((*l).sx - (*l).rx, mgx)
+    let ccy: f32 = clampf((*l).sy - (*l).ry, mgy)
+    // no wind-up: the smooth path never runs further from the raw one than the crop allows
+    (*l).sx = (*l).rx + ccx
+    (*l).sy = (*l).ry + ccy
+    *cx = ccx
+    *cy = ccy
+}
+
+// ---------------------------------------------------------------- applying
+
+// Shifted + cropped copy: out is (w - 2 mx) x (h - 2 my), out(x, y) = src(x + mx - cx, y + my - cy), bilinear.
+fn stab_crop(src: *mut image.Image, cx: f32, cy: f32, mx: i32, my: i32, out: *mut image.Image) {
+    let ow: i32 = (*src).w - 2 * mx
+    let oh: i32 = (*src).h - 2 * my
+    *out = image.img_new(ow, oh, (*src).ch)
+    var c: i32 = 0
+    while c < (*src).ch {
+        var y: i32 = 0
+        while y < oh {
+            var x: i32 = 0
+            while x < ow {
+                image.img_set(out, c, x, y, image.img_sample(src, c, ((x + mx) as f32) - cx, ((y + my) as f32) - cy))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        c = c + 1
+    }
+}
+
+// BGRX frame -> BGRX frame of the same size: the stabilised crop (nearest neighbour, zoomed back to full size).
+// (cx, cy) in pixels of the SRC buffer; crop = the total crop fraction of StabOpts.
+fn stab_zoom_bgrx(src: u64, w: i32, h: i32, cx: f32, cy: f32, crop: f32, dst: u64) {
+    let mx: f32 = (w as f32) * crop * 0.5f
+    let my: f32 = (h as f32) * crop * 0.5f
+    let sw: f32 = (w as f32) - 2.0f * mx
+    let sh: f32 = (h as f32) - 2.0f * my
+    var y: i32 = 0
+    while y < h {
+        var sy: i32 = (my + ((y as f32) + 0.5f) * sh / (h as f32) - cy) as i32
+        if sy < 0 { sy = 0 }
+        if sy >= h { sy = h - 1 }
+        var x: i32 = 0
+        while x < w {
+            var sx: i32 = (mx + ((x as f32) + 0.5f) * sw / (w as f32) - cx) as i32
+            if sx < 0 { sx = 0 }
+            if sx >= w { sx = w - 1 }
+            *((dst + (((y * w + x) * 4) as u64)) as *mut u32) = *((src + (((sy * w + sx) * 4) as u64)) as *mut u32)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
