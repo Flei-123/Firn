@@ -22,7 +22,8 @@ $FIRNC -o "$W/dump" tools/mc/registry/dump.fi 2>"$W/err" || { echo "FAIL compile
 python3 - tools/mcgen/versions.json > "$W/versions.txt" <<'PY'
 import json, sys
 for k, v in json.load(open(sys.argv[1]))["versions"].items():
-    print(k, v["nmp"], v["protocol"])
+    if "nmp" in v:  # newer versions (1.21.8+, 26.x) have no prismarine-block reference
+        print(k, v["nmp"], v["protocol"])
 PY
 while read -r key nmpv proto; do
     "$W/dump" "$proto" > "$W/got.txt" 2>"$W/err" || { echo "  FAIL  $key: dump exit $?"; ERR=1; continue; }

@@ -25,6 +25,7 @@ import wave
 
 import numpy as np
 
+MIN_WIN = 0.4  # seconds: minimum length of an event window (see the slow-attack note below)
 PROBE = ["block.stone.step", "block.stone.break", "block.stone.place", "block.stone.hit", "block.stone.fall",
          "block.glass.break", "block.wood.break", "block.grass.step", "block.gravel.step", "ambient.cave",
          "entity.zombie.ambient", "ui.button.click"]
@@ -135,6 +136,12 @@ def main():
         nxt = ev[i + 1][0] if i + 1 < len(ev) else fr + int(0.7 * rate)
         a = fr
         z = min(n, max(a + blk * 4, min(nxt, a + int(0.7 * rate))))
+        # Slow-attack voices (ambient.cave: low rumble fading in over ~200 ms) are still near-silent in the first ~150 ms. A
+        # following event that starts earlier than MIN_WIN would cut the window before the voice is audible, so the window is
+        # at least MIN_WIN long (the later event may then add to it: such an overlapped window only proves "not silent").
+        overlap = (z - a) < int(MIN_WIN * rate)
+        if overlap:
+            z = min(n, a + int(0.7 * rate))
         win = mono[a:z]
         wpeak = float(np.abs(win).max()) if len(win) else 0.0
         if wpeak < 200:
@@ -143,7 +150,7 @@ def main():
         fq = np.fft.rfftfreq(len(win), 1.0 / rate) if len(win) > 64 else np.zeros(2)
         c = float((spec * fq).sum() / max(spec.sum(), 1e-9))
         cent.setdefault(name, []).append(c)
-        print(f"  audio ev {name:26s} frame={fr:8d} onset+{l_ms:5.0f}ms peak={wpeak:7.0f} centroid={c:7.0f}Hz")
+        print(f"  audio ev {name:26s} frame={fr:8d} onset+{l_ms:5.0f}ms peak={wpeak:7.0f} centroid={c:7.0f}Hz" + (" (overlapped by next event)" if overlap else ""))
     if lat:
         med = float(np.median(lat))
         print(f"  audio latency onset-after-start: median={med:.0f}ms max={max(lat):.0f}ms")
