@@ -22,6 +22,8 @@ const NMP = process.env.MC_NMP || '1.20.1'
 const PROTOCOL = parseInt(process.env.MC_PROTOCOL || '763', 10)
 const LEGACY8 = PROTOCOL <= 47
 const SETTINGS_OLD = PROTOCOL <= 340
+// 1.21.2+ (768): the movement packets carry `flags` {onGround, horizontalCollision} instead of onGround
+const mv = (o) => (PROTOCOL >= 768 ? Object.assign({}, o, { onGround: undefined, flags: { onGround: !!o.onGround, horizontalCollision: false } }) : o)
 
 const client = mc.createClient({ host, port, username: name, version: NMP, auth: 'offline', viewDistance: '2' })
 let pos = null // { x, y, z, yaw, pitch }
@@ -44,7 +46,7 @@ client.on('position', (p) => {
     yaw: fl.yaw ? base.yaw + p.yaw : p.yaw, pitch: fl.pitch ? base.pitch + p.pitch : p.pitch
   }
   if (!LEGACY8) client.write('teleport_confirm', { teleportId: p.teleportId })
-  client.write('position_look', { x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw, pitch: pos.pitch, onGround: false })
+  client.write('position_look', mv({ x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw, pitch: pos.pitch, onGround: false }))
   if (!ready) { ready = true; console.log('ready') }
 })
 
@@ -63,13 +65,13 @@ async function run (a) {
     const ms = a[4] ? parseInt(a[4], 10) : 120
     for (let i = 0; i < steps; i++) {
       pos.x += dx; pos.z += dz
-      client.write('position', { x: pos.x, y: pos.y, z: pos.z, onGround: false })
+      client.write('position', mv({ x: pos.x, y: pos.y, z: pos.z, onGround: false }))
       await sleep(ms)
     }
     console.log(`pos ${pos.x} ${pos.y} ${pos.z}`)
   } else if (a[0] === 'look' && pos) {
     pos.yaw = parseFloat(a[1]); pos.pitch = parseFloat(a[2])
-    client.write('look', { yaw: pos.yaw, pitch: pos.pitch, onGround: false })
+    client.write('look', mv({ yaw: pos.yaw, pitch: pos.pitch, onGround: false }))
     await sleep(100)
   } else if (a[0] === 'quit') {
     try { client.end('bot quit') } catch (e) { /* ignore */ }
