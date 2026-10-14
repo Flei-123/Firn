@@ -24,7 +24,7 @@ import html.entities
 import os
 import sys
 
-WORTE_JE_FUNKTION = 400
+WORDS_PER_FUNCTION = 400
 
 
 def main() -> int:
@@ -56,18 +56,18 @@ def main() -> int:
     def auf8(n: int) -> int:
         return (n + 7) // 8 * 8
 
-    off_namen = 16
-    off_len = off_namen + auf8(len(blob))
-    off_wert = off_len + auf8(len(lens))
-    off_pos = off_wert + 8 * count
+    off_names = 16
+    off_len = off_names + auf8(len(blob))
+    off_values = off_len + auf8(len(lens))
+    off_pos = off_values + 8 * count
     bytes_total = off_pos + 4 * count
 
     # Build the raw picture (only the generated part; OFF_POS comes into being at run time).
     image = bytearray(off_pos)
-    image[off_namen:off_namen + len(blob)] = blob
+    image[off_names:off_names + len(blob)] = blob
     image[off_len:off_len + len(lens)] = lens
     for i, v in enumerate(values):
-        image[off_wert + 8 * i:off_wert + 8 * i + 8] = v.to_bytes(8, "little")
+        image[off_values + 8 * i:off_values + 8 * i + 8] = v.to_bytes(8, "little")
 
     # Words from index 2 on (the first 16 bytes are magic + reserve).
     words = []
@@ -88,9 +88,9 @@ def main() -> int:
     a("export { ANZAHL, OFF_NAMEN, OFF_LEN, OFF_WERT, OFF_POS, BYTES, KENNUNG, lade }")
     a("")
     a("const ANZAHL: usize = %d" % count)
-    a("const OFF_NAMEN: usize = %d" % off_namen)
+    a("const OFF_NAMEN: usize = %d" % off_names)
     a("const OFF_LEN: usize = %d" % off_len)
-    a("const OFF_WERT: usize = %d" % off_wert)
+    a("const OFF_WERT: usize = %d" % off_values)
     a("const OFF_POS: usize = %d" % off_pos)
     a("const BYTES: usize = %d" % bytes_total)
     a("const KENNUNG: u64 = 0x464952_4E454E54")
@@ -101,11 +101,11 @@ def main() -> int:
     a("")
 
     parts = []
-    for start in range(0, len(words), WORTE_JE_FUNKTION):
+    for start in range(0, len(words), WORDS_PER_FUNCTION):
         nr = len(parts)
         parts.append(nr)
         a("fn teil%d(p: *mut u8) {" % nr)
-        for i, v in words[start:start + WORTE_JE_FUNKTION]:
+        for i, v in words[start:start + WORDS_PER_FUNCTION]:
             a("    w(p, %d, 0x%016X)" % (i, v))
         a("}")
         a("")

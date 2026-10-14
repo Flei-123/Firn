@@ -4,22 +4,27 @@
 // descriptor pool + sets, nearest sampler, pipeline layout with a push constant range, and the voxel graphics pipeline
 // (vertex = one uvec2 per vertex like lib/mc/mc_mesh.fi, depth LESS, optional alpha blend without depth write).
 //
-// Shader contract (lib/gpu/vkmc/mc.vert/.frag, VK2 replaces the SPIR-V behind the same interface): location 0 uvec2; set 0 binding 0
-// UBO (vertex + fragment), binding 1 combined image sampler (fragment); push constants PUSH_BYTES (vertex + fragment).
+// Shader contract (lib/gpu/vk_shaders.fi, VK2): location 0 uvec2; set 0: binding 0 dynamic UBO `Frame` (320 octets, vertex + fragment),
+// bindings 1..4 atlas pages (combined image sampler, 2D_ARRAY, fragment), bindings 5 / 6 uniform texel buffers (vertex, pool mode);
+// push constants PUSH_BYTES (vertex stage only: origin.xyz + pool).
 // THREADS: main thread only.
 
 import std.rt
 import gpu.vk_mem
 
 export {
-    Desc, VPipe, desc_new, desc_free, desc_write_ubo, desc_write_atlas, sampler_make, playout_make, rpass_voxel,
-    depth_make, fb_make2, shader_module, pipeline_voxel, vpipe_none, vpipe_free, desc_none,
-    PUSH_BYTES, FMT_RGBA8, FMT_D32, FINAL_TRANSFER_SRC, FINAL_PRESENT,
+    Desc, VPipe, desc_new, desc_free, desc_write_ubo, desc_write_atlas, desc_write_texel, bview_make, bview_free, sampler_make, playout_make, rpass_voxel,
+    depth_make, fb_make2, shader_module, pipeline_voxel, pipeline_make, PipeSpec, spec_new, spec_bind, spec_attr,
+    BLEND_NONE, BLEND_ALPHA, BLEND_MUL, BLEND_INVERT, TOPO_LIST, TOPO_STRIP, CMP_LESS, CMP_GREATER, FMT_R32_UINT, FMT_R32_SFLOAT,
+    FMT_R32G32_UINT, FMT_R32G32B32_SFLOAT, FMT_R32G32B32A32_SINT, FMT_R32G32B32A32_SFLOAT, vpipe_none, vpipe_free, desc_none,
+    PUSH_BYTES, FMT_RGBA8, FMT_D32, FMT_R32UI, FMT_RGBA32F, FINAL_TRANSFER_SRC, FINAL_PRESENT,
 }
 
-const PUSH_BYTES: u64 = 48 // org.xyz + trans, fade, light (3 x vec4)
+const PUSH_BYTES: u64 = 16 // vec3 origin (minus camera) + int pool, vertex stage
 const FMT_RGBA8: u32 = 37 // R8G8B8A8_UNORM
 const FMT_D32: u32 = 126 // D32_SFLOAT
+const FMT_R32UI: u32 = 98 // R32_UINT (texel buffer u_gran)
+const FMT_RGBA32F: u32 = 109 // R32G32B32A32_SFLOAT (texel buffer u_org)
 const FINAL_TRANSFER_SRC: u64 = 6
 const FINAL_PRESENT: u64 = 1000001002
 
@@ -75,33 +80,46 @@ fn desc_new(x: *mut vk_mem.X, nsets: usize) -> Desc {
         return desc_none()
     }
     (*x).top = 0
-    let bd: u64 = vk_mem.xsa(x, 48)
-    vk_mem.w32(bd, 0, 0) // binding 0
-    vk_mem.w32(bd, 4, 6) // UNIFORM_BUFFER
+    let bd: u64 = vk_mem.xsa(x, 24 * 7) // 7 VkDescriptorSetLayoutBinding (24 octets each)
+    vk_mem.w32(bd, 0, 0) // binding 0: dynamic UBO `Frame`
+    vk_mem.w32(bd, 4, 8) // UNIFORM_BUFFER_DYNAMIC
     vk_mem.w32(bd, 8, 1)
     vk_mem.w32(bd, 12, 0x11) // VERTEX | FRAGMENT
-    vk_mem.w32(bd, 24, 1) // binding 1
-    vk_mem.w32(bd, 28, 1) // COMBINED_IMAGE_SAMPLER
-    vk_mem.w32(bd, 32, 1)
-    vk_mem.w32(bd, 36, 0x10) // FRAGMENT
+    var k: usize = 1
+    while k <= 4 {
+        vk_mem.w32(bd, k * 24, k as u64) // bindings 1..4: atlas pages
+        vk_mem.w32(bd, k * 24 + 4, 1) // COMBINED_IMAGE_SAMPLER
+        vk_mem.w32(bd, k * 24 + 8, 1)
+        vk_mem.w32(bd, k * 24 + 12, 0x10) // FRAGMENT
+        k = k + 1
+    }
+    while k <= 6 {
+        vk_mem.w32(bd, k * 24, k as u64) // bindings 5, 6: texel buffers (pool mode)
+        vk_mem.w32(bd, k * 24 + 4, 4) // UNIFORM_TEXEL_BUFFER (4; 5 = STORAGE_TEXEL_BUFFER)
+        vk_mem.w32(bd, k * 24 + 8, 1)
+        vk_mem.w32(bd, k * 24 + 12, 0x1) // VERTEX
+        k = k + 1
+    }
     let li: u64 = vk_mem.xsa(x, 32)
     vk_mem.w32(li, 0, 32) // DESCRIPTOR_SET_LAYOUT_CREATE_INFO
-    vk_mem.w32(li, 20, 2)
+    vk_mem.w32(li, 20, 7)
     vk_mem.w64(li, 24, bd)
     let out: u64 = vk_mem.xsa(x, 8)
     if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_DSL, (*x).dev, li, 0, out, 0, 0, 0, 0, 0, 0)) {
         return desc_none()
     }
     d.dsl = vk_mem.r64(out, 0)
-    let ps: u64 = vk_mem.xsa(x, 16)
-    vk_mem.w32(ps, 0, 6)
+    let ps: u64 = vk_mem.xsa(x, 24)
+    vk_mem.w32(ps, 0, 8) // UNIFORM_BUFFER_DYNAMIC
     vk_mem.w32(ps, 4, nsets as u64)
-    vk_mem.w32(ps, 8, 1)
-    vk_mem.w32(ps, 12, nsets as u64)
+    vk_mem.w32(ps, 8, 1) // COMBINED_IMAGE_SAMPLER
+    vk_mem.w32(ps, 12, (nsets * 4) as u64)
+    vk_mem.w32(ps, 16, 4) // UNIFORM_TEXEL_BUFFER (4; 5 = STORAGE_TEXEL_BUFFER)
+    vk_mem.w32(ps, 20, (nsets * 2) as u64)
     let pi: u64 = vk_mem.xsa(x, 40)
     vk_mem.w32(pi, 0, 33) // DESCRIPTOR_POOL_CREATE_INFO
     vk_mem.w32(pi, 20, nsets as u64)
-    vk_mem.w32(pi, 24, 2)
+    vk_mem.w32(pi, 24, 3)
     vk_mem.w64(pi, 32, ps)
     if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_DPOOL, (*x).dev, pi, 0, out, 0, 0, 0, 0, 0, 0)) {
         return desc_none()
@@ -158,33 +176,74 @@ fn desc_write_ubo(x: *mut vk_mem.X, d: *mut Desc, i: usize, buf: u64, range: u64
     vk_mem.w64(wr, 16, vk_mem.r64((*d).sets, i * 8))
     vk_mem.w32(wr, 24, 0)
     vk_mem.w32(wr, 32, 1)
-    vk_mem.w32(wr, 36, 6) // UNIFORM_BUFFER
+    vk_mem.w32(wr, 36, 8) // UNIFORM_BUFFER_DYNAMIC
     vk_mem.w64(wr, 48, bi)
     vk_mem.cx(x, vk_mem.X_UPDATE_DSETS, (*x).dev, 1, wr, 0, 0, 0, 0, 0, 0, 0)
 }
 
-// Binding 1 of set `i`: the atlas texture array (layout SHADER_READ_ONLY) + the sampler.
+// Bindings 1..4 of set `i`: the atlas texture array (layout SHADER_READ_ONLY) + the sampler. Unused pages bind the same view again.
 fn desc_write_atlas(x: *mut vk_mem.X, d: *mut Desc, i: usize, view: u64) {
     (*x).top = 0
     let ii: u64 = vk_mem.xsa(x, 24)
     vk_mem.w64(ii, 0, (*d).sampler)
     vk_mem.w64(ii, 8, view)
     vk_mem.w32(ii, 16, 5) // SHADER_READ_ONLY_OPTIMAL
+    let wr: u64 = vk_mem.xsa(x, 64 * 4)
+    var k: usize = 0
+    while k < 4 {
+        vk_mem.w32(wr, k * 64, 35)
+        vk_mem.w64(wr, k * 64 + 16, vk_mem.r64((*d).sets, i * 8))
+        vk_mem.w32(wr, k * 64 + 24, (k + 1) as u64)
+        vk_mem.w32(wr, k * 64 + 32, 1)
+        vk_mem.w32(wr, k * 64 + 36, 1) // COMBINED_IMAGE_SAMPLER
+        vk_mem.w64(wr, k * 64 + 40, ii)
+        k = k + 1
+    }
+    vk_mem.cx(x, vk_mem.X_UPDATE_DSETS, (*x).dev, 4, wr, 0, 0, 0, 0, 0, 0, 0)
+}
+
+// Binding `binding` (5 or 6) of set `i`: a uniform texel buffer view.
+fn desc_write_texel(x: *mut vk_mem.X, d: *mut Desc, i: usize, binding: u64, bview: u64) {
+    (*x).top = 0
+    let bv: u64 = vk_mem.xsa(x, 8)
+    vk_mem.w64(bv, 0, bview)
     let wr: u64 = vk_mem.xsa(x, 64)
     vk_mem.w32(wr, 0, 35)
     vk_mem.w64(wr, 16, vk_mem.r64((*d).sets, i * 8))
-    vk_mem.w32(wr, 24, 1)
+    vk_mem.w32(wr, 24, binding)
     vk_mem.w32(wr, 32, 1)
-    vk_mem.w32(wr, 36, 1) // COMBINED_IMAGE_SAMPLER
-    vk_mem.w64(wr, 40, ii)
+    vk_mem.w32(wr, 36, 4) // UNIFORM_TEXEL_BUFFER (4; 5 = STORAGE_TEXEL_BUFFER)
+    vk_mem.w64(wr, 56, bv)
     vk_mem.cx(x, vk_mem.X_UPDATE_DSETS, (*x).dev, 1, wr, 0, 0, 0, 0, 0, 0, 0)
 }
 
-// Pipeline layout: set layout `dsl` + one push constant range (VERTEX | FRAGMENT, offset 0, PUSH_BYTES).
+// Buffer view over `size` octets of `buf` (usage must include U_TEXEL). 0 = failed.
+fn bview_make(x: *mut vk_mem.X, buf: u64, fmt: u32, size: u64) -> u64 {
+    (*x).top = 0
+    let ci: u64 = vk_mem.xsa(x, 56)
+    vk_mem.w32(ci, 0, 13) // BUFFER_VIEW_CREATE_INFO
+    vk_mem.w64(ci, 24, buf)
+    vk_mem.w32(ci, 32, fmt as u64)
+    vk_mem.w64(ci, 40, 0)
+    vk_mem.w64(ci, 48, size)
+    let out: u64 = vk_mem.xsa(x, 8)
+    if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_BVIEW, (*x).dev, ci, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return 0
+    }
+    return vk_mem.r64(out, 0)
+}
+
+fn bview_free(x: *mut vk_mem.X, v: u64) {
+    if v != 0 {
+        vk_mem.cx(x, vk_mem.X_DESTROY_BVIEW, (*x).dev, v, 0, 0, 0, 0, 0, 0, 0, 0)
+    }
+}
+
+// Pipeline layout: set layout `dsl` + one push constant range (VERTEX, offset 0, PUSH_BYTES).
 fn playout_make(x: *mut vk_mem.X, dsl: u64) -> u64 {
     (*x).top = 0
     let pr: u64 = vk_mem.xsa(x, 12)
-    vk_mem.w32(pr, 0, 0x11)
+    vk_mem.w32(pr, 0, 0x1)
     vk_mem.w32(pr, 4, 0)
     vk_mem.w32(pr, 8, PUSH_BYTES)
     let sl: u64 = vk_mem.xsa(x, 8)
@@ -309,12 +368,59 @@ fn shader_module(x: *mut vk_mem.X, code: u64, size: usize) -> u64 {
     return vk_mem.r64(out, 0)
 }
 
-// The voxel pipeline: one binding, stride 8, location 0 = R32G32_UINT; triangle list, back-face culling (as GL and mc_raster), depth test LESS (write on, or off for
-// the translucent pass `trans`, which also blends SRC_ALPHA / ONE_MINUS_SRC_ALPHA); viewport + scissor dynamic.
-fn pipeline_voxel(x: *mut vk_mem.X, rpass: u64, playout: u64, vs: u64, vsn: usize, fs: u64, fsn: usize, trans: bool) -> VPipe {
+// ---- generic graphics pipeline -------------------------------------------------------------------------------------------------
+// One spec describes every pass of the renderer (voxel, sky, entities, tint, HUD): shaders, up to 2 vertex bindings / 6 attributes,
+// topology, culling, depth state, blend mode, colour write mask. Viewport + scissor are dynamic, one subpass, no multisampling.
+const BLEND_NONE: u32 = 0
+const BLEND_ALPHA: u32 = 1 // SRC_ALPHA, ONE_MINUS_SRC_ALPHA
+const BLEND_MUL: u32 = 2 // DST_COLOR, ZERO (the tint pass)
+const BLEND_INVERT: u32 = 3 // ONE_MINUS_DST_COLOR, ZERO (HUD invert rectangles)
+const TOPO_LIST: u32 = 3
+const TOPO_STRIP: u32 = 5
+const CMP_LESS: u32 = 1
+const CMP_GREATER: u32 = 4
+const FMT_R32_UINT: u32 = 98
+const FMT_R32_SFLOAT: u32 = 100
+const FMT_R32G32_UINT: u32 = 101
+const FMT_R32G32B32_SFLOAT: u32 = 106
+const FMT_R32G32B32A32_SINT: u32 = 108
+const FMT_R32G32B32A32_SFLOAT: u32 = 109
+
+struct PipeSpec {
+    vs: u64, vsn: usize, fs: u64, fsn: usize,
+    nbind: u32, b_stride: [u32; 2], b_inst: [u32; 2], // inst 1 = per instance
+    nattr: u32, a_loc: [u32; 6], a_bind: [u32; 6], a_fmt: [u32; 6], a_off: [u32; 6],
+    topo: u32, cull: u32, // cull 0 none, 2 back
+    depth_test: bool, depth_op: u32, depth_write: bool,
+    blend: u32, wmask: u32, // colour write mask bits R=1 G=2 B=4 A=8
+}
+
+fn spec_new(vs: u64, vsn: usize, fs: u64, fsn: usize) -> PipeSpec {
+    return PipeSpec { vs: vs, vsn: vsn, fs: fs, fsn: fsn, nbind: 0 as u32, b_stride: [0 as u32; 2], b_inst: [0 as u32; 2],
+        nattr: 0 as u32, a_loc: [0 as u32; 6], a_bind: [0 as u32; 6], a_fmt: [0 as u32; 6], a_off: [0 as u32; 6],
+        topo: TOPO_LIST, cull: 0 as u32, depth_test: false, depth_op: CMP_LESS, depth_write: false, blend: BLEND_NONE, wmask: 15 as u32 }
+}
+
+fn spec_bind(sp: *mut PipeSpec, stride: u32, inst: bool) {
+    let n: usize = (*sp).nbind as usize
+    (*sp).b_stride[n] = stride
+    if inst { (*sp).b_inst[n] = 1 as u32 }
+    (*sp).nbind = (*sp).nbind + 1 as u32
+}
+
+fn spec_attr(sp: *mut PipeSpec, loc: u32, binding: u32, fmt: u32, off: u32) {
+    let n: usize = (*sp).nattr as usize
+    (*sp).a_loc[n] = loc
+    (*sp).a_bind[n] = binding
+    (*sp).a_fmt[n] = fmt
+    (*sp).a_off[n] = off
+    (*sp).nattr = (*sp).nattr + 1 as u32
+}
+
+fn pipeline_make(x: *mut vk_mem.X, cache: u64, rpass: u64, playout: u64, sp: *mut PipeSpec) -> VPipe {
     var p: VPipe = vpipe_none()
-    p.vs = shader_module(x, vs, vsn)
-    p.fs = shader_module(x, fs, fsn)
+    p.vs = shader_module(x, (*sp).vs, (*sp).vsn)
+    p.fs = shader_module(x, (*sp).fs, (*sp).fsn)
     if p.vs == 0 || p.fs == 0 {
         return p
     }
@@ -330,24 +436,34 @@ fn pipeline_voxel(x: *mut vk_mem.X, rpass: u64, playout: u64, vs: u64, vsn: usiz
     vk_mem.w32(st, 68, 0x10) // FRAGMENT
     vk_mem.w64(st, 72, p.fs)
     vk_mem.w64(st, 80, main)
-    let bind: u64 = vk_mem.xsa(x, 12)
-    vk_mem.w32(bind, 0, 0)
-    vk_mem.w32(bind, 4, 8)
-    vk_mem.w32(bind, 8, 0)
-    let attr: u64 = vk_mem.xsa(x, 16)
-    vk_mem.w32(attr, 0, 0)
-    vk_mem.w32(attr, 4, 0)
-    vk_mem.w32(attr, 8, 101) // R32G32_UINT
-    vk_mem.w32(attr, 12, 0)
+    let nb: usize = (*sp).nbind as usize
+    let na: usize = (*sp).nattr as usize
+    let bind: u64 = vk_mem.xsa(x, 12 * 2 + 4)
+    var i: usize = 0
+    while i < nb {
+        vk_mem.w32(bind, i * 12, i as u64)
+        vk_mem.w32(bind, i * 12 + 4, (*sp).b_stride[i] as u64)
+        vk_mem.w32(bind, i * 12 + 8, (*sp).b_inst[i] as u64)
+        i = i + 1
+    }
+    let attr: u64 = vk_mem.xsa(x, 16 * 6 + 4)
+    i = 0
+    while i < na {
+        vk_mem.w32(attr, i * 16, (*sp).a_loc[i] as u64)
+        vk_mem.w32(attr, i * 16 + 4, (*sp).a_bind[i] as u64)
+        vk_mem.w32(attr, i * 16 + 8, (*sp).a_fmt[i] as u64)
+        vk_mem.w32(attr, i * 16 + 12, (*sp).a_off[i] as u64)
+        i = i + 1
+    }
     let vi: u64 = vk_mem.xsa(x, 48)
     vk_mem.w32(vi, 0, 19)
-    vk_mem.w32(vi, 20, 1)
+    vk_mem.w32(vi, 20, nb as u64)
     vk_mem.w64(vi, 24, bind)
-    vk_mem.w32(vi, 32, 1)
+    vk_mem.w32(vi, 32, na as u64)
     vk_mem.w64(vi, 40, attr)
     let ia: u64 = vk_mem.xsa(x, 32)
     vk_mem.w32(ia, 0, 20)
-    vk_mem.w32(ia, 20, 3)
+    vk_mem.w32(ia, 20, (*sp).topo as u64)
     let vp: u64 = vk_mem.xsa(x, 48)
     vk_mem.w32(vp, 0, 22)
     vk_mem.w32(vp, 20, 1)
@@ -355,7 +471,7 @@ fn pipeline_voxel(x: *mut vk_mem.X, rpass: u64, playout: u64, vs: u64, vsn: usiz
     let rs: u64 = vk_mem.xsa(x, 64)
     vk_mem.w32(rs, 0, 23)
     vk_mem.w32(rs, 28, 0)
-    vk_mem.w32(rs, 32, 2) // cull BACK (VK_CULL_MODE_BACK_BIT), like GL_CULL_FACE + mc_raster cull; frontFace CCW = 0 stays valid with the negative viewport
+    vk_mem.w32(rs, 32, (*sp).cull as u64) // 2 = BACK (like GL_CULL_FACE + mc_raster cull); frontFace CCW = 0 stays valid with the negative viewport
     vk_mem.w32(rs, 36, 0)
     vk_mem.wf(rs, 56, 1.0)
     let ms: u64 = vk_mem.xsa(x, 48)
@@ -363,25 +479,31 @@ fn pipeline_voxel(x: *mut vk_mem.X, rpass: u64, playout: u64, vs: u64, vsn: usiz
     vk_mem.w32(ms, 20, 1)
     let ds: u64 = vk_mem.xsa(x, 128)
     vk_mem.w32(ds, 0, 25) // DEPTH_STENCIL_STATE
-    vk_mem.w32(ds, 20, 1) // depth test
-    if trans {
-        vk_mem.w32(ds, 24, 0) // no depth write
-    } else {
-        vk_mem.w32(ds, 24, 1)
-    }
-    vk_mem.w32(ds, 28, 1) // LESS
+    if (*sp).depth_test { vk_mem.w32(ds, 20, 1) }
+    if (*sp).depth_write { vk_mem.w32(ds, 24, 1) }
+    vk_mem.w32(ds, 28, (*sp).depth_op as u64)
     vk_mem.wf(ds, 124, 1.0)
     let cba: u64 = vk_mem.xsa(x, 32)
-    if trans {
+    if (*sp).blend != BLEND_NONE {
+        var sf: u64 = 6 // SRC_ALPHA
+        var df: u64 = 7 // ONE_MINUS_SRC_ALPHA
+        if (*sp).blend == BLEND_MUL {
+            sf = 4 // DST_COLOR
+            df = 0 // ZERO
+        }
+        if (*sp).blend == BLEND_INVERT {
+            sf = 5 // ONE_MINUS_DST_COLOR
+            df = 0
+        }
         vk_mem.w32(cba, 0, 1)
-        vk_mem.w32(cba, 4, 6) // SRC_ALPHA
-        vk_mem.w32(cba, 8, 7) // ONE_MINUS_SRC_ALPHA
+        vk_mem.w32(cba, 4, sf)
+        vk_mem.w32(cba, 8, df)
         vk_mem.w32(cba, 12, 0)
-        vk_mem.w32(cba, 16, 6)
-        vk_mem.w32(cba, 20, 7)
+        vk_mem.w32(cba, 16, sf)
+        vk_mem.w32(cba, 20, df)
         vk_mem.w32(cba, 24, 0)
     }
-    vk_mem.w32(cba, 28, 0xF)
+    vk_mem.w32(cba, 28, (*sp).wmask as u64)
     let cb: u64 = vk_mem.xsa(x, 56)
     vk_mem.w32(cb, 0, 26)
     vk_mem.w32(cb, 28, 1)
@@ -408,12 +530,25 @@ fn pipeline_voxel(x: *mut vk_mem.X, rpass: u64, playout: u64, vs: u64, vsn: usiz
     vk_mem.w64(gi, 104, playout)
     vk_mem.w64(gi, 112, rpass)
     vk_mem.w32(gi, 136, 0xFFFFFFFF)
-    if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_GPIPE, (*x).dev, 0, 1, gi, 0, out, 0, 0, 0, 0)) {
+    if !vk_mem.good(vk_mem.cx(x, vk_mem.X_CREATE_GPIPE, (*x).dev, cache, 1, gi, 0, out, 0, 0, 0, 0)) {
         return p
     }
     p.pipe = vk_mem.r64(out, 0)
     p.ok = true
     return p
+}
+
+// The voxel pipeline: one binding, stride 8, location 0 = R32G32_UINT; triangle list, back-face culling (as GL and mc_raster), depth test LESS (write on, or off for
+// the translucent pass `trans`, which also blends SRC_ALPHA / ONE_MINUS_SRC_ALPHA). `cache` = VkPipelineCache (v.cache, 0 = none).
+fn pipeline_voxel(x: *mut vk_mem.X, cache: u64, rpass: u64, playout: u64, vs: u64, vsn: usize, fs: u64, fsn: usize, trans: bool) -> VPipe {
+    var sp: PipeSpec = spec_new(vs, vsn, fs, fsn)
+    spec_bind(&sp, 8 as u32, false)
+    spec_attr(&sp, 0 as u32, 0 as u32, FMT_R32G32_UINT, 0 as u32)
+    sp.cull = 2 as u32
+    sp.depth_test = true
+    sp.depth_write = !trans
+    if trans { sp.blend = BLEND_ALPHA }
+    return pipeline_make(x, cache, rpass, playout, &sp)
 }
 
 fn vpipe_free(x: *mut vk_mem.X, p: *mut VPipe) {

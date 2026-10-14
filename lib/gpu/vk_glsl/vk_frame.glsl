@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-// lib/gpu/vk_glsl/vk_frame.glsl -- shared interface of ALL Vulkan shaders of the MC renderer (docs/VK-SHADERS.md).
+// lib/gpu/vk_glsl/vk_frame.glsl -- shared interface of ALL Vulkan shaders of the MC renderer (docs/VK-RENDERER.md (Shaders)).
 // Included by every stage (GL_GOOGLE_include_directive). Not compiled on its own.
 //
 // set 0 is the ONLY descriptor set. One descriptor set layout / one pipeline layout fits every pipeline; a stage simply

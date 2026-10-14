@@ -1,0 +1,132 @@
+// expect_exit: 0
+// mc.vk_mc on the VK2 shaders (lavapipe, NO real GPU): UBO slices (dynamic offset) per pass / fade state, pipeline cache file round trip
+// (save at close, CACHE_LOADED on reopen), resize re-creates the depth image. SKIP (exit 0) without a Vulkan device.
+import std.rt
+import std.io
+import std.fs
+import std.time
+import mc.mc_backend
+import mc.mc_camera
+import mc.mc_texture
+import gpu.vk_life
+import mc.vk_mc
+
+fn uniq(prefix: str, suffix: str) -> str {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&t, prefix.p as u64, prefix.length())
+    rt.buf_push_dec_u64(&t, time.monotonic_ns())
+    rt.buf_push_bytes(&t, suffix.p as u64, suffix.length())
+    let name: str = __str_copy(str { p: rt.buf_data(&t), n: rt.buf_len(&t) })
+    rt.buf_free(&t)
+    return fs.path_join(fs.temp_dir(), name)
+}
+
+fn check(fails: *mut i32, what: str, ok: bool) {
+    if ok {
+        io.fmt_print(f"   ok   {what}\n")
+    } else {
+        io.fmt_print(f"   FAIL {what}\n")
+        *fails = *fails + 1
+    }
+}
+
+fn covered(px: u64, n: usize, clear: u32) -> u64 {
+    var cov: u64 = 0
+    var i: usize = 0
+    while i < n {
+        if rt.ld32(px, i) != clear { cov = cov + 1 as u64 }
+        i = i + 1
+    }
+    return cov
+}
+
+// One quad (tile 1) at z = 10; returns the mesh handle.
+fn upload_quad(b: *mut mc_backend.Backend) -> usize {
+    let v: u64 = rt.heap_alloc(4 * 8)
+    let ix: u64 = rt.heap_alloc(6 * 4)
+    var k: usize = 0
+    let xs: [u32; 4] = [12 as u32, 4 as u32, 4 as u32, 12 as u32]
+    let ys: [u32; 4] = [2 as u32, 2 as u32, 14 as u32, 14 as u32]
+    while k < 4 {
+        rt.st32(v, k * 2, xs[k] | (ys[k] << 8 as u32) | (10 as u32 << 16 as u32) | (3 as u32 << 24 as u32))
+        rt.st32(v, k * 2 + 1, 1 as u32)
+        k = k + 1
+    }
+    rt.st32(ix, 0, 0 as u32)
+    rt.st32(ix, 1, 1 as u32)
+    rt.st32(ix, 2, 2 as u32)
+    rt.st32(ix, 3, 0 as u32)
+    rt.st32(ix, 4, 2 as u32)
+    rt.st32(ix, 5, 3 as u32)
+    return (*b).mesh_upload((*b).obj, 1, v, 4, ix, 6)
+}
+
+fn main(start: u64) -> i32 {
+    var fails: i32 = 0
+    let path: str = uniq("vk3150-", ".vkc")
+    fs.remove(path) catch false
+    let clear: u32 = 0xFFE6BE96 as u32
+
+    // run 1: no cache file yet
+    var vb: vk_mc.VkBackend = vk_mc.vkbe_open_cache(160, 90, path)
+    if !vb.ok {
+        io.fmt_print(f"SKIP vkbe_open step={vb.step}\n")
+        return 0
+    }
+    check(&fails, "no file -> CACHE_NONE", vb.life.cache_status == vk_life.CACHE_NONE)
+    check(&fails, "pipelines made with the cache", vb.v.cache != 0)
+    var b: mc_backend.Backend = vk_mc.vkbe_backend(&vb)
+    var ta: mc_texture.Atlas = mc_texture.atlas_default()
+    b.upload_atlas(b.obj, (&ta) as u64)
+    var cam: mc_camera.Camera = mc_camera.camera_new(160, 90)
+    mc_camera.camera_set_pos(&cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&cam, 0.0, 0.0)
+    mc_camera.camera_update(&cam)
+    let h: usize = upload_quad(&b)
+    b.begin(b.obj, (&cam) as u64, clear)
+    let t1: u64 = b.draw(b.obj, h, 0.0, 0.0, 0.0)
+    b.set_pass(b.obj, mc_backend.PASS_TRANS)
+    let t2: u64 = b.draw(b.obj, h, 0.0, 0.0, 0.0)
+    let t2b: u64 = b.draw(b.obj, h, 0.0, 0.0, 0.0)
+    b.set_fade(b.obj, 32, 0)
+    let t3: u64 = b.draw(b.obj, h, 0.0, 0.0, 0.0)
+    b.end(b.obj)
+    let px: u64 = b.present(b.obj)
+    check(&fails, "4 draws, 2 triangles each", t1 == 2 as u64 && t2 == 2 as u64 && t2b == 2 as u64 && t3 == 2 as u64)
+    check(&fails, "3 UBO slices (pass change, fade change; the repeated draw shares one)", vb.nslice == 3)
+    check(&fails, "no UBO slice overflow", vb.ubo_over == 0 as u64)
+    let cov: u64 = covered(px, 160 * 90, clear)
+    check(&fails, "quad visible", cov > 3000 as u64 && cov < 8000 as u64)
+    vk_mc.vkbe_close(&vb) // saves the cache file
+
+    // run 2: file exists -> loaded
+    var vb2: vk_mc.VkBackend = vk_mc.vkbe_open_cache(160, 90, path)
+    check(&fails, "reopen ok", vb2.ok)
+    if vb2.ok {
+        check(&fails, "cache file written + accepted -> CACHE_LOADED", vb2.life.cache_status == vk_life.CACHE_LOADED)
+        var b2: mc_backend.Backend = vk_mc.vkbe_backend(&vb2)
+        b2.upload_atlas(b2.obj, (&ta) as u64)
+        let h2: usize = upload_quad(&b2)
+        b2.begin(b2.obj, (&cam) as u64, clear)
+        b2.draw(b2.obj, h2, 0.0, 0.0, 0.0)
+        b2.end(b2.obj)
+        let p2: u64 = b2.present(b2.obj)
+        check(&fails, "draw with a loaded cache: same coverage", covered(p2, 160 * 90, clear) == cov)
+        // resize: depth + colour + framebuffer + read back are re-created
+        check(&fails, "resize", vk_mc.vkbe_resize(&vb2, 200, 120))
+        var cam2: mc_camera.Camera = mc_camera.camera_new(200, 120)
+        mc_camera.camera_set_pos(&cam2, 8.0, 8.0, 0.0)
+        mc_camera.camera_set_angles(&cam2, 0.0, 0.0)
+        mc_camera.camera_update(&cam2)
+        b2.begin(b2.obj, (&cam2) as u64, clear)
+        let t4: u64 = b2.draw(b2.obj, h2, 0.0, 0.0, 0.0)
+        b2.end(b2.obj)
+        let p3: u64 = b2.present(b2.obj)
+        let cov3: u64 = covered(p3, 200 * 120, clear)
+        check(&fails, "draw after resize (depth image new)", t4 == 2 as u64 && cov3 > 4000 as u64 && cov3 < 12000 as u64)
+        vk_mc.vkbe_close(&vb2)
+    }
+    fs.remove(path) catch false
+    io.fmt_print(f"vk_mc vk2: {fails} failed\n")
+    return fails
+}

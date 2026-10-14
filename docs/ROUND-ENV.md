@@ -138,7 +138,7 @@ With this round, **in the kernel profile, without a collector** — verified wit
 struct Text { p: *mut u8, n: usize }
 
 fn produkt() -> Text {
-    let t: Text = __env_or("OSUM_MARKE_PRODUKT", "OrientOS")
+    let t: Text = __env_or("OSUM_BRAND_PRODUCT", "OrientOS")
     return t
 }
 ```
@@ -146,13 +146,13 @@ fn produkt() -> Text {
 In the app profile the shorter form works, the direct twin of `brand.rs`:
 
 ```firn
-const PRODUKT: str = __env_or("OSUM_MARKE_PRODUKT", "OrientOS")
+const PRODUKT: str = __env_or("OSUM_BRAND_PRODUCT", "OrientOS")
 ```
 
 The build call gets an option added:
 
 ```sh
-OSUM_MARKE_PRODUKT="Xoffi OS" firnc --env-allow=OSUM_MARKE_ kernel/marke.fi …
+OSUM_BRAND_PRODUCT="Xoffi OS" firnc --env-allow=OSUM_BRAND_ kernel/marke.fi …
 ```
 
 With that `tools/marke-einsetzen.py` (192 lines), the `/tmp` copy of the

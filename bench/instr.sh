@@ -38,7 +38,7 @@ else
 fi
 
 # Count the instructions of one program. Empty output = failed.
-zaehle() {
+count_instr() {
     local bin="$1" tag="$2"
     if ! timeout "${INSTR_TIMEOUT:-900}" valgrind --tool=callgrind \
         --callgrind-out-file="$WORK/$tag.cg" "$bin" >/dev/null 2>"$WORK/$tag.log"; then
@@ -61,8 +61,8 @@ for src in "${SOURCES[@]}"; do
         printf '%-14s   BUILD ERROR (new)\n' "$name"
         continue
     fi
-    a=$(zaehle "$WORK/$name.old" "$name.old")
-    n=$(zaehle "$WORK/$name.new" "$name.new")
+    a=$(count_instr "$WORK/$name.old" "$name.old")
+    n=$(count_instr "$WORK/$name.new" "$name.new")
     if [ -z "$a" ] || [ -z "$n" ]; then
         printf '%-14s   NO COUNT (valgrind)\n' "$name"
         continue

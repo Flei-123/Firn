@@ -43,7 +43,7 @@ def symbole(binary):
     return tab
 
 
-def finde(tab, starts, adr):
+def find_symbol(tab, starts, adr):
     k = bisect.bisect_right(starts, adr) - 1
     if k < 0:
         return "???"
@@ -60,7 +60,7 @@ def read_cg(path):
     incl = {}       # id -> Ir (the sum of the calls THERE)
     akt = None
     target = None
-    warte_aufrufkosten = False
+    await_call_cost = False
     with open(path, "r", errors="replace") as f:
         for z in f:
             z = z.rstrip("\n")
@@ -73,12 +73,12 @@ def read_cg(path):
                     names[ident] = name.strip()
                 if kind == "fn":
                     akt = ident
-                    warte_aufrufkosten = False
+                    await_call_cost = False
                 else:
                     target = ident
                 continue
             if z.startswith("calls="):
-                warte_aufrufkosten = True
+                await_call_cost = True
                 continue
             if z[0] in "0123456789+-*":
                 t = z.split()
@@ -88,15 +88,15 @@ def read_cg(path):
                     ir = int(t[1])
                 except ValueError:
                     continue
-                if warte_aufrufkosten:
-                    warte_aufrufkosten = False
+                if await_call_cost:
+                    await_call_cost = False
                     if target is not None:
                         incl[target] = incl.get(target, 0) + ir
                     continue
                 if akt is not None:
                     self_cost[akt] = self_cost.get(akt, 0) + ir
                 continue
-            warte_aufrufkosten = False
+            await_call_cost = False
     return names, self_cost, incl
 
 
@@ -106,7 +106,7 @@ def resolve(names, tab, starts):
     for ident, raw in names.items():
         if raw.startswith("0x"):
             try:
-                aus[ident] = finde(tab, starts, int(raw, 16))
+                aus[ident] = find_symbol(tab, starts, int(raw, 16))
                 continue
             except ValueError:
                 pass

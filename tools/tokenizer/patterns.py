@@ -115,7 +115,7 @@ def main():
 
     patterns = defaultdict(lambda: [0, 0])   # Name -> [Ir, Stellen]
 
-    def zaehle(name, ir):
+    def count_hit(name, ir):
         m = patterns[name]
         m[0] += ir
         m[1] += 1
@@ -126,17 +126,17 @@ def main():
 
         # (1) an unconditional jump directly behind a conditional one -> block layout
         if is_conditional(mn) and nxt is not None and code[nxt][0] == "jmp" and code[nxt][2] == sym:
-            zaehle("jmp direkt hinter jcc (Blocklayout)", kosten.get(nxt, 0))
+            count_hit("jmp direkt hinter jcc (Blocklayout)", kosten.get(nxt, 0))
 
         # (2) a setcc chain instead of a direct jump
         if mn.startswith("set"):
-            kette = [a]
+            chain = [a]
             j = i + 1
             hit = False
             while j < len(addrs) and j <= i + 5:
                 b = addrs[j]
                 mb = code[b][0]
-                kette.append(b)
+                chain.append(b)
                 if mb == "test":
                     if j + 1 < len(addrs) and is_conditional(code[addrs[j + 1]][0]):
                         hit = True
@@ -145,8 +145,8 @@ def main():
                     break
                 j += 1
             if hit:
-                zaehle("setcc-Kette statt direktem Sprung",
-                       sum(kosten.get(x, 0) for x in kette))
+                count_hit("setcc-Kette statt direktem Sprung",
+                       sum(kosten.get(x, 0) for x in chain))
 
         # (3) storing and immediately loading the same cell again
         if mn == "mov" and ops.startswith("%") and "," in ops:
@@ -154,27 +154,27 @@ def main():
             if "(%rbp)" in z and "(" not in q and nxt is not None:
                 m2, o2, _ = code[nxt]
                 if m2 in ("mov", "movzbl", "movzwl", "movslq") and o2.startswith(z + ","):
-                    zaehle("Store+Reload derselben Zelle",
+                    count_hit("Store+Reload derselben Zelle",
                            kosten.get(a, 0) + kosten.get(nxt, 0))
 
         # (4) address arithmetic that could go into the memory operand
         if mn == "lea" and nxt is not None:
             m = re.match(r"^(-?0x[0-9a-f]+)?\((%r[a-z0-9]+)(,(%r[a-z0-9]+),(\d))?\),(%r[a-z0-9]+)$", ops)
             if m and code[nxt][0].startswith("mov") and f"({m.group(6)})" in code[nxt][1]:
-                zaehle("lea + Zugriff (Adressierungsmodus ungenutzt)", kosten.get(a, 0))
+                count_hit("lea + Zugriff (Adressierungsmodus ungenutzt)", kosten.get(a, 0))
 
         # (5) frame management
         if mn in ("push", "pop", "ret"):
-            zaehle("Rahmenverwaltung (push/pop/ret)", kosten.get(a, 0))
+            count_hit("Rahmenverwaltung (push/pop/ret)", kosten.get(a, 0))
         elif mn == "call":
-            zaehle("Rahmenverwaltung (call)", kosten.get(a, 0))
+            count_hit("Rahmenverwaltung (call)", kosten.get(a, 0))
         elif mn == "mov" and ops in ("%rsp,%rbp", "%rbp,%rsp"):
-            zaehle("Rahmenverwaltung (rsp<->rbp)", kosten.get(a, 0))
+            count_hit("Rahmenverwaltung (rsp<->rbp)", kosten.get(a, 0))
         elif mn == "mov" and "," in ops:
             q, z = ops.rsplit(",", 1)
             secured = ("%r12", "%r13", "%r14", "%r15", "%rbx")
             if (q in secured and "(%rbp)" in z) or (z in secured and "(%rbp)" in q):
-                zaehle("Rahmenverwaltung (callee-saved sichern/holen)", kosten.get(a, 0))
+                count_hit("Rahmenverwaltung (callee-saved sichern/holen)", kosten.get(a, 0))
 
     print("\n== patterns (dynamically weighted) ==")
     for name, (ir, n) in sorted(patterns.items(), key=lambda x: -x[1][0]):

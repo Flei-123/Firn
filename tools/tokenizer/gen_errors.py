@@ -71,7 +71,7 @@ def konstante(name):
     return "F_" + name.upper().replace("-", "_")
 
 
-def stuecke(name):
+def pieces(name):
     roh = name.encode("ascii")
     aus = []
     for i in range(0, len(roh), 8):
@@ -84,7 +84,7 @@ def stuecke(name):
 
 
 def main():
-    max_st = max(len(stuecke(c)) for c in CODES)
+    max_st = max(len(pieces(c)) for c in CODES)
     z = []
     z.append("// lib/html/error_codes.fi — Namen der WHATWG-Parse-Fehler (erzeugt).")
     z.append("//")
@@ -117,7 +117,7 @@ def main():
     z.append("// Stueck `i` des Namens von `code`; 0 = Ende des Namens.")
     z.append("fn name_chunk(code: u32, i: usize) -> u64 {")
     for i, c in enumerate(CODES, start=1):
-        st = stuecke(c)
+        st = pieces(c)
         z.append("    if code == %d as u32 {" % i)
         for k, v in enumerate(st):
             z.append("        if i == %d { return 0x%X as u64 }" % (k, v))
