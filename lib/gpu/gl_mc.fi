@@ -47,12 +47,13 @@ export {
     glbe_gl, glbe_renderer, glbe_draws, glbe_tris, glbe_resize, glbe_fbo_texture,
     MODE_LEGACY, MODE_POOL, MODE_MULTI, MODE_INDIRECT,
     glbe_set_mode, glbe_mode, glbe_set_page_verts, glbe_set_upload_budget, glbe_set_filter, glbe_defrag,
-    glbe_max_layers, glbe_layers_lost, glbe_calls, glbe_upload_bytes, glbe_frame_upload_bytes, glbe_staged, glbe_pages, glbe_pool_used_bytes,
+    glbe_max_layers, glbe_layers_lost, glbe_set_layer_limit, glbe_atlas_pages, glbe_calls, glbe_upload_bytes, glbe_frame_upload_bytes, glbe_staged, glbe_pages, glbe_pool_used_bytes,
     glbe_pool_cap_bytes, glbe_pool_frag_permille, glbe_defrags, glbe_reset_stats, glbe_flush_uploads,
     // scene layer (lib/gpu/gl_scene.fi): extra passes around the Backend table, MSAA, resolve
     glbe_x, glbe_near, glbe_rebind, glbe_flush, glbe_bind_draw, glbe_set_msaa, glbe_msaa, glbe_resolve, glbe_width, glbe_height, glbe_camera_rv,
 }
 
+const MAX_PAGES: usize = 4 // atlas pages (texture arrays) the fragment shader can address
 const VS_SRC: str = __include_str("mc_vs.glsl")
 const FS_SRC: str = __include_str("mc_fs.glsl")
 
@@ -105,7 +106,13 @@ struct GlBackend {
     g: gl33.Gl,
     fbo: gl33.Fbo,
     prog: u32,
-    atlas_tex: u32, // texture array, layer = tile - 1
+    atlas_tex: u32, // texture array of atlas page 0: layer = tile - 1 (page p holds tiles p*page_layers .. (p+1)*page_layers - 1)
+    atlas_x: [u32; 3], // texture arrays of atlas pages 1..3 (only when the atlas has more layers than GL_MAX_ARRAY_TEXTURE_LAYERS)
+    n_apages: i32, // atlas pages in use (1..MAX_PAGES)
+    page_layers: i32, // layers per page; the shader splits the tile id with it (u_pagel)
+    limit_set: i32, // > 0: test hook, caps the driver layer limit (glbe_set_layer_limit)
+    l_atlas_x: [i32; 3],
+    l_pagel: i32,
     l_rv: i32,
     l_origin: i32,
     l_atlas: i32,
@@ -189,7 +196,7 @@ struct GlBackend {
 fn empty(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
     return GlBackend { ok: false, step: 0, ctx: c, g: gl33.gl_new(),
         fbo: gl33.Fbo { fbo: 0 as u32, color: 0 as u32, depth: 0 as u32, w: w, h: h },
-        prog: 0 as u32, atlas_tex: 0 as u32, l_rv: 0 - 1, l_origin: 0 - 1, l_atlas: 0 - 1, l_tiles: 0 - 1, l_fog: 0 - 1,
+        prog: 0 as u32, atlas_tex: 0 as u32, atlas_x: [0 as u32; 3], n_apages: 0, page_layers: 1048576, limit_set: 0, l_atlas_x: [0 - 1; 3], l_pagel: 0 - 1, l_rv: 0 - 1, l_origin: 0 - 1, l_atlas: 0 - 1, l_tiles: 0 - 1, l_fog: 0 - 1,
         l_fogc: 0 - 1, l_light: 0 - 1, l_pool: 0 - 1, l_gran: 0 - 1, l_org: 0 - 1, l_filter: 0 - 1, l_trans: 0 - 1, trans_pass: false, near: 0.05,
         w: w, h: h, atile: 16, acols: 16, max_layers: 0, layers_lost: 0, cx: 0.0, cy: 0.0, cz: 0.0, rv: [0.0 as f32; 16],
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0.0, fog_g: 0.0, fog_b: 0.0, day: 256.0, tint_r: 256.0, tint_g: 224.0, tint_b: 176.0, cull: true,
@@ -230,6 +237,10 @@ fn glbe_open_with(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
     gb.l_origin = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_origin")
     gb.l_atlas = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_atlas")
     gb.l_tiles = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_tiles")
+    gb.l_atlas_x[0] = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_atlas1")
+    gb.l_atlas_x[1] = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_atlas2")
+    gb.l_atlas_x[2] = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_atlas3")
+    gb.l_pagel = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_pagel")
     gb.l_fog = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_fog")
     gb.l_fogc = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_fogc")
     gb.l_light = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_light")
@@ -384,6 +395,13 @@ fn apply_filter(gb: *mut GlBackend) {
         magf = gl33.GL_LINEAR
     }
     gl33.gl_tex_array_filter(&(*gb).g, (*gb).atlas_tex, minf, magf, (*gb).aniso)
+    var i: usize = 0
+    while i < 3 {
+        if (*gb).atlas_x[i] != 0 as u32 {
+            gl33.gl_tex_array_filter(&(*gb).g, (*gb).atlas_x[i], minf, magf, (*gb).aniso)
+        }
+        i = i + 1
+    }
 }
 
 // Light uniforms (same meaning as mc_raster.raster_set_light): day 0..256, block light tint per channel 0..256.
@@ -465,9 +483,7 @@ fn glbe_close(gb: *mut GlBackend) {
         if (*gb).ind_buf != 0 as u32 {
             gl33.gl_delete_buffer(&(*gb).g, (*gb).ind_buf)
         }
-        if (*gb).atlas_tex != 0 as u32 {
-            gl33.gl_delete_tex(&(*gb).g, (*gb).atlas_tex)
-        }
+        free_atlas_pages(gb)
         if (*gb).prog != 0 as u32 {
             gl33.gl_delete_program(&(*gb).g, (*gb).prog)
         }
@@ -840,47 +856,35 @@ fn glbe_pool_frag_permille(gb: *mut GlBackend) -> usize {
 
 // ---- Backend table ----------------------------------------------------------------------------------
 
-// Texture array out of the atlas: layer l = tile l + 1 (col = l % cols, row = l / cols), tile x tile texels.
+// Texture array(s) out of the atlas: layer l = tile l + 1 (col = l % cols, row = l / cols), tile x tile texels.
+// GL_MAX_ARRAY_TEXTURE_LAYERS (GL 3.3 only guarantees 256) caps one array: a bigger atlas is split into up to MAX_PAGES arrays of
+// `page_layers` layers each (tile id t - 1 lives in page (t - 1) / page_layers, layer (t - 1) % page_layers; the fragment shader picks
+// the sampler). Only layers beyond MAX_PAGES * limit are lost (glbe_layers_lost; those tiles read garbage).
 fn be_atlas(o: u64, a: u64) {
     let gb: *mut GlBackend = o as *mut GlBackend
     let at: *mut mc_texture.Atlas = a as *mut mc_texture.Atlas
     if (*at).px == 0 {
         return
     }
-    if (*gb).atlas_tex != 0 as u32 {
-        gl33.gl_delete_tex(&(*gb).g, (*gb).atlas_tex)
-        (*gb).atlas_tex = 0 as u32
-    }
+    free_atlas_pages(gb)
     let t: usize = (*at).tile as usize
-    var layers: usize = ((*at).cols as usize) * ((*at).rows as usize)
-    // driver limit: more layers than GL_MAX_ARRAY_TEXTURE_LAYERS would make glTexImage3D fail (a black world). Upload what fits and
-    // report the rest (glbe_layers_lost); a real fallback (second array / atlas pages) is open, mesa llvmpipe allows 2048.
+    let total: usize = ((*at).cols as usize) * ((*at).rows as usize)
     if (*gb).max_layers == 0 {
         (*gb).max_layers = gl33.gl_get_int(&(*gb).g, 0x88FF as u32)
         if (*gb).max_layers < 256 { (*gb).max_layers = 256 }
     }
+    var lim: usize = (*gb).max_layers as usize
+    if (*gb).limit_set > 0 && ((*gb).limit_set as usize) < lim { lim = (*gb).limit_set as usize }
+    var np: usize = 1
+    var pl: usize = total
+    if total > lim {
+        np = (total + lim - 1) / lim
+        pl = lim
+        if np > MAX_PAGES { np = MAX_PAGES }
+    }
     (*gb).layers_lost = 0
-    if layers > ((*gb).max_layers as usize) {
-        (*gb).layers_lost = (layers as i32) - (*gb).max_layers
-        layers = (*gb).max_layers as usize
-    }
-    let row: usize = t * 4
-    let lbytes: usize = t * row
-    let buf: u64 = rt.heap_alloc(layers * lbytes)
-    if buf == 0 {
-        return
-    }
-    let stride: usize = ((*at).w as usize) * 4
-    var l: usize = 0
-    while l < layers {
-        let col: usize = l % ((*at).cols as usize)
-        let rw: usize = l / ((*at).cols as usize)
-        var y: usize = 0
-        while y < t {
-            rt.mem_copy(buf + (l * lbytes + y * row) as u64, (*at).px + ((rw * t + y) * stride + col * row) as u64, row)
-            y = y + 1
-        }
-        l = l + 1
+    if total > np * pl {
+        (*gb).layers_lost = (total - np * pl) as i32
     }
     var minf: u32 = gl33.GL_NEAREST
     var magf: u32 = gl33.GL_NEAREST
@@ -892,10 +896,72 @@ fn be_atlas(o: u64, a: u64) {
     if (*gb).aniso > 1.0 {
         magf = gl33.GL_LINEAR
     }
-    (*gb).atlas_tex = gl33.gl_tex_array_rgba8(&(*gb).g, (*at).tile, (*at).tile, layers as i32, buf, minf, magf, (*gb).aniso)
-    rt.heap_free(buf, layers * lbytes)
+    let row: usize = t * 4
+    let lbytes: usize = t * row
+    let stride: usize = ((*at).w as usize) * 4
+    var pg: usize = 0
+    while pg < np {
+        var layers: usize = total - pg * pl
+        if layers > pl { layers = pl }
+        let buf: u64 = rt.heap_alloc(layers * lbytes)
+        if buf == 0 {
+            return
+        }
+        var l: usize = 0
+        while l < layers {
+            let g: usize = pg * pl + l
+            let col: usize = g % ((*at).cols as usize)
+            let rw: usize = g / ((*at).cols as usize)
+            var y: usize = 0
+            while y < t {
+                rt.mem_copy(buf + (l * lbytes + y * row) as u64, (*at).px + ((rw * t + y) * stride + col * row) as u64, row)
+                y = y + 1
+            }
+            l = l + 1
+        }
+        let id: u32 = gl33.gl_tex_array_rgba8(&(*gb).g, (*at).tile, (*at).tile, layers as i32, buf, minf, magf, (*gb).aniso)
+        rt.heap_free(buf, layers * lbytes)
+        if pg == 0 {
+            (*gb).atlas_tex = id
+        } else {
+            (*gb).atlas_x[pg - 1] = id
+        }
+        pg = pg + 1
+    }
+    (*gb).n_apages = np as i32
+    if np == 1 {
+        (*gb).page_layers = 1048576 // single array: the shader never splits
+    } else {
+        (*gb).page_layers = pl as i32
+    }
     (*gb).atile = (*at).tile
     (*gb).acols = (*at).cols
+}
+
+fn free_atlas_pages(gb: *mut GlBackend) {
+    if (*gb).atlas_tex != 0 as u32 {
+        gl33.gl_delete_tex(&(*gb).g, (*gb).atlas_tex)
+        (*gb).atlas_tex = 0 as u32
+    }
+    var i: usize = 0
+    while i < 3 {
+        if (*gb).atlas_x[i] != 0 as u32 {
+            gl33.gl_delete_tex(&(*gb).g, (*gb).atlas_x[i])
+            (*gb).atlas_x[i] = 0 as u32
+        }
+        i = i + 1
+    }
+    (*gb).n_apages = 0
+}
+
+// Test hook: caps the driver's array layer limit (0 = driver limit) so the multi-page path can be exercised on a driver that allows
+// thousands of layers. Takes effect on the next upload_atlas.
+fn glbe_set_layer_limit(gb: *mut GlBackend, n: i32) {
+    (*gb).limit_set = n
+}
+
+fn glbe_atlas_pages(gb: *mut GlBackend) -> i32 {
+    return (*gb).n_apages
 }
 
 // Returns a free slot index (the table grows by doubling), NONE on failure.
@@ -1182,6 +1248,16 @@ fn bind_state(gb: *mut GlBackend) {
     let g: *mut gl33.Gl = &(*gb).g
     gl33.gl_use(g, (*gb).prog)
     gl33.gl_bind_tex_target(g, 0 as u32, gl33.GL_TEXTURE_2D_ARRAY, (*gb).atlas_tex)
+    var xi: usize = 0
+    while xi < 3 {
+        // pages 1..3 on units 3..5; unused samplers point at page 0 (every sampler must hold an array texture of its type)
+        var xt: u32 = (*gb).atlas_x[xi]
+        if xt == 0 as u32 { xt = (*gb).atlas_tex }
+        gl33.gl_bind_tex_target(g, (3 + xi) as u32, gl33.GL_TEXTURE_2D_ARRAY, xt)
+        gl33.gl_u1i(g, (*gb).l_atlas_x[xi], (3 + xi) as i32)
+        xi = xi + 1
+    }
+    gl33.gl_u1i(g, (*gb).l_pagel, (*gb).page_layers)
     gl33.gl_u1i(g, (*gb).l_atlas, 0)
     gl33.gl_u1i(g, (*gb).l_gran, 1)
     gl33.gl_u1i(g, (*gb).l_org, 2)
