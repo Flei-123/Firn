@@ -1,0 +1,111 @@
+// expect_exit: 0
+// r582: the collector scans a Vec buffer by a pointer-word raster of the
+// element type (words that can never hold a heap pointer are skipped: str.len,
+// small integers, floats, bool, padding). Every word that CAN hold a pointer
+// must still keep its block alive: the octet pointer of a `str`, a `u64` slot
+// (conservative), a `str` inside an array field. The only reference to each
+// block is an interior pointer (base + 5) in a spare element of the buffer;
+// the base itself is stored xor-masked in a Vec[u64] (not a root).
+import std.vec
+import std.rt
+
+const HIDE: u64 = 0x5a5a5a5a5a5a5a5a
+
+// {u32,u32} | str | f64 : words 0 | 1,2 | 3 -> mask 0b0010
+struct Row {
+    a: u32,
+    b: u32,
+    name: str,
+    f: f64,
+}
+
+// str | u64 | str | f32 (+pad): words 0,1 | 2 | 3,4 | 5 -> mask 0b001101
+struct Mix {
+    first: str,
+    word: u64,
+    second: str,
+    g: f32,
+}
+
+// u16 | [str; 2] | bool : words 0 | 1,2,3,4 | 5 -> mask 0b01010 (+ pad)
+struct Pair {
+    tag: u16,
+    both: [str; 2],
+    ok: bool,
+}
+
+fn make() -> str {
+    return "item-" + "0123456789abcdef" + "-x"
+}
+
+// Same size class as `make`, so a freed block is reused by the churn.
+fn churn(rounds: u32) -> u64 {
+    var k: u32 = 0
+    var sum: u64 = 0
+    while k < rounds {
+        let s: str = "junk!" + "0123456789abcdef" + "-y"
+        sum = sum + s.n as u64
+        k = k + 1
+    }
+    return sum
+}
+
+fn check(bases: *mut Vec[u64]) -> bool {
+    var j: usize = 0
+    while j < vec_len[u64](bases) {
+        let base: u64 = vec_at[u64](bases, j) ^ HIDE
+        if rt.ld8(base, 0) != 105 { return false }
+        if rt.ld8(base, 1) != 116 { return false }
+        if rt.ld8(base, 2) != 101 { return false }
+        if rt.ld8(base, 3) != 109 { return false }
+        if rt.ld8(base, 4) != 45 { return false }
+        if rt.ld8(base, 22) != 120 { return false }
+        j = j + 1
+    }
+    return true
+}
+
+// A new block whose only reference is a hidden interior pointer in word
+// `word` of the buffer at `buf`.
+fn hide(buf: u64, word: u64, bases: *mut Vec[u64]) -> bool {
+    let s: str = make()
+    let base: u64 = rt.ld64((&s) as u64, 0)
+    rt.st64(buf, word as usize, base + 5)
+    return vec_push[u64](bases, base ^ HIDE)
+}
+
+fn main() -> i32 {
+    if !gc_init() { return 1 }
+    var bases: Vec[u64] = vec_new[u64]()
+    var vs: Vec[str] = vec_new[str]()
+    var vr: Vec[Row] = vec_new[Row]()
+    var vm: Vec[Mix] = vec_new[Mix]()
+    var vp: Vec[Pair] = vec_new[Pair]()
+    if !vec_reserve[str](&vs, 64) { return 2 }
+    if !vec_reserve[Row](&vr, 64) { return 2 }
+    if !vec_reserve[Mix](&vm, 64) { return 2 }
+    if !vec_reserve[Pair](&vp, 64) { return 2 }
+    let cs: u64 = vec_cap[str](&vs) as u64
+    let cr: u64 = vec_cap[Row](&vr) as u64
+    let cm: u64 = vec_cap[Mix](&vm) as u64
+    let cp: u64 = vec_cap[Pair](&vp) as u64
+    // Vec[str]: octet pointer of the last element
+    if !hide(vec_ptr[str](&vs), cs * 2 - 2, &bases) { return 3 }
+    // Row: word 1 of the last element
+    if !hide(vec_ptr[Row](&vr), cr * 4 - 4 + 1, &bases) { return 4 }
+    // Mix: octet pointer of `first`, the u64 slot, octet pointer of `second`
+    if !hide(vec_ptr[Mix](&vm), cm * 6 - 6, &bases) { return 5 }
+    if !hide(vec_ptr[Mix](&vm), cm * 6 - 6 + 2, &bases) { return 6 }
+    if !hide(vec_ptr[Mix](&vm), cm * 6 - 12 + 3, &bases) { return 7 }
+    // Pair: octet pointers of both[0] and both[1]
+    if !hide(vec_ptr[Pair](&vp), cp * 6 - 6 + 1, &bases) { return 8 }
+    if !hide(vec_ptr[Pair](&vp), cp * 6 - 12 + 3, &bases) { return 9 }
+    var round: u32 = 0
+    while round < 5 {
+        if churn(60000) == 0 { return 10 }
+        gc_collect()
+        if !check(&bases) { return 11 }
+        round = round + 1
+    }
+    return 0
+}
