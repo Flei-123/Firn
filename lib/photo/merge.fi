@@ -23,6 +23,7 @@ import photo.image
 import photo.align
 import photo.noise
 import photo.filter
+import photo.par
 
 export {
     Burst, BURST_MAX,
@@ -96,7 +97,353 @@ fn merge_burst(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, out: *mut
     merge_burst_opts(b, ref_idx, nm, &mo, out, var_plane, wsum)
 }
 
+// Bilinear sample setup shared by the three channels of one position (the same index / weight arithmetic as
+// image.img_sample, so every channel value is bit-identical to calling img_sample per channel).
+struct Bil {
+    i00: i32,
+    i10: i32,
+    i01: i32,
+    i11: i32,
+    ax: f32,
+    ay: f32,
+}
+
+#[inline]
+fn bil_setup(w: i32, h: i32, x: f32, y: f32) -> Bil {
+    var fx: f32 = x
+    var fy: f32 = y
+    if fx < 0.0f { fx = 0.0f }
+    if fy < 0.0f { fy = 0.0f }
+    let mx: f32 = (w - 1) as f32
+    let my: f32 = (h - 1) as f32
+    if fx > mx { fx = mx }
+    if fy > my { fy = my }
+    var x0: i32 = fx as i32
+    var y0: i32 = fy as i32
+    if x0 > w - 2 { x0 = w - 2 }
+    if y0 > h - 2 { y0 = h - 2 }
+    if x0 < 0 { x0 = 0 }
+    if y0 < 0 { y0 = 0 }
+    let ax: f32 = fx - (x0 as f32)
+    let ay: f32 = fy - (y0 as f32)
+    var x1: i32 = x0 + 1
+    var y1: i32 = y0 + 1
+    if x1 >= w { x1 = x0 }
+    if y1 >= h { y1 = y0 }
+    return Bil { i00: y0 * w + x0, i10: y0 * w + x1, i01: y1 * w + x0, i11: y1 * w + x1, ax: ax, ay: ay }
+}
+
+// plane = base address of one channel plane
+#[inline]
+fn bil_get(plane: u64, b: *mut Bil) -> f32 {
+    let a: f32 = *((plane + ((*b).i00 as u64) * (4 as u64)) as *mut f32) * (1.0f - (*b).ax) + *((plane + ((*b).i10 as u64) * (4 as u64)) as *mut f32) * (*b).ax
+    let c: f32 = *((plane + ((*b).i01 as u64) * (4 as u64)) as *mut f32) * (1.0f - (*b).ax) + *((plane + ((*b).i11 as u64) * (4 as u64)) as *mut f32) * (*b).ax
+    return a * (1.0f - (*b).ay) + c * (*b).ay
+}
+
+#[inline]
+fn plane_at(im: *mut image.Image, c: i32) -> u64 {
+    return (*im).px + (c as u64) * ((*im).w as u64) * ((*im).h as u64) * (4 as u64)
+}
+
+struct ClipCtx {
+    im: *mut image.Image,
+    m: *mut image.Image,
+    d: *mut image.Image,
+}
+
+fn clip_mask_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut ClipCtx = ctx as *mut ClipCtx
+    let w: i32 = (*(*k).im).w
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            var v: f32 = 0.0f
+            if image.img_get((*k).im, 0, x, y) > CLIP || image.img_get((*k).im, 1, x, y) > CLIP || image.img_get((*k).im, 2, x, y) > CLIP {
+                v = 1.0f
+            }
+            image.img_set((*k).m, 0, x, y, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn clip_dilate_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut ClipCtx = ctx as *mut ClipCtx
+    let w: i32 = (*(*k).im).w
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            var v: f32 = 0.0f
+            var dy: i32 = -1
+            while dy <= 1 {
+                var dx: i32 = -1
+                while dx <= 1 {
+                    if image.img_getc((*k).m, 0, x + dx, y + dy) > 0.5f { v = 1.0f }
+                    dx = dx + 1
+                }
+                dy = dy + 1
+            }
+            image.img_set((*k).d, 0, x, y, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// 1 channel map: 1 where `is_clipped(im, x, y)` is true, else 0.
+fn clip_map(im: *mut image.Image) -> image.Image {
+    var m: image.Image = image.img_new((*im).w, (*im).h, 1)
+    var d: image.Image = image.img_new((*im).w, (*im).h, 1)
+    var k: ClipCtx = ClipCtx { im: im, m: &m, d: &d }
+    par.rows((*im).h, 16, clip_mask_rows, (&k) as u64)
+    par.rows((*im).h, 16, clip_dilate_rows, (&k) as u64)
+    image.img_free(&m)
+    return d
+}
+
+// Everything the row loops of one merge need.
+struct MergeCtx {
+    rf: *mut image.Image,
+    af: *mut image.Image,
+    acc: *mut image.Image,
+    vnum: *mut image.Image,
+    tmap: *mut image.Image,
+    wmap: *mut image.Image,
+    wsum: *mut image.Image,
+    out: *mut image.Image,
+    var_plane: *mut image.Image,
+    nm: *mut noise.NoiseModel,
+    fl: *mut align.Flow,
+    rclip: *mut image.Image,
+    aclip: *mut image.Image,
+    gr: f32,
+    ga: f32,
+    thr: f32,
+    soft: f32,
+}
+
+fn ref_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut MergeCtx = ctx as *mut MergeCtx
+    let w: i32 = (*(*k).rf).w
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            var wr: f32 = 1.0f
+            if image.img_get((*k).rclip, 0, x, y) > 0.5f { wr = 0.0f }
+            var c: i32 = 0
+            while c < 3 {
+                image.img_set((*k).acc, c, x, y, wr * image.img_get((*k).rf, c, x, y) / (*k).gr)
+                c = c + 1
+            }
+            let vg: f32 = noise.variance((*k).nm, 1, image.img_get((*k).rf, 1, x, y)) / ((*k).gr * (*k).gr)
+            image.img_set((*k).wsum, 0, x, y, wr)
+            image.img_set((*k).vnum, 0, x, y, wr * wr * vg)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// pass 1: normalised squared difference T (mean over channels, expected 1 for pure noise)
+fn pass1_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut MergeCtx = ctx as *mut MergeCtx
+    let w: i32 = (*(*k).rf).w
+    let h: i32 = (*(*k).rf).h
+    let rf: *mut image.Image = (*k).rf
+    let af: *mut image.Image = (*k).af
+    let gr: f32 = (*k).gr
+    let ga: f32 = (*k).ga
+    let ap0: u64 = plane_at(af, 0)
+    let ap1: u64 = plane_at(af, 1)
+    let ap2: u64 = plane_at(af, 2)
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            var dx: f32 = 0.0f
+            var dy: f32 = 0.0f
+            align.flow_at((*k).fl, x as f32, y as f32, &dx, &dy)
+            let sx: f32 = (x as f32) + dx
+            let sy: f32 = (y as f32) + dy
+            var bl: Bil = bil_setup(w, h, sx, sy)
+            var t: f32 = 0.0f
+            var av: f32 = bil_get(ap0, &bl)
+            var rv: f32 = image.img_get(rf, 0, x, y)
+            var d: f32 = av / ga - rv / gr
+            var va: f32 = noise.variance((*k).nm, 0, av) / (ga * ga) + noise.variance((*k).nm, 0, rv) / (gr * gr)
+            t = t + d * d / va
+            av = bil_get(ap1, &bl)
+            rv = image.img_get(rf, 1, x, y)
+            d = av / ga - rv / gr
+            va = noise.variance((*k).nm, 1, av) / (ga * ga) + noise.variance((*k).nm, 1, rv) / (gr * gr)
+            t = t + d * d / va
+            av = bil_get(ap2, &bl)
+            rv = image.img_get(rf, 2, x, y)
+            d = av / ga - rv / gr
+            va = noise.variance((*k).nm, 2, av) / (ga * ga) + noise.variance((*k).nm, 2, rv) / (gr * gr)
+            t = t + d * d / va
+            if image.img_get((*k).rclip, 0, x, y) > 0.5f {
+                t = 0.0f
+            }
+            image.img_set((*k).tmap, 0, x, y, t / 3.0f)
+            // mark clipped alt samples with a huge T
+            if image.img_getc((*k).aclip, 0, (sx + 0.5f) as i32, (sy + 0.5f) as i32) > 0.5f {
+                image.img_set((*k).tmap, 0, x, y, 1.0e6f)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// pass 2: 3x3 mean of T (clipped marks stay huge) -> weight
+fn pass2_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut MergeCtx = ctx as *mut MergeCtx
+    let w: i32 = (*(*k).rf).w
+    let h: i32 = (*(*k).rf).h
+    let tp: u64 = (*(*k).tmap).px
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            var s: f32 = 0.0f
+            var mx: f32 = 0.0f
+            if x >= 1 && x < w - 1 && y >= 1 && y < h - 1 {
+                let c: i32 = y * w + x
+                var r: i32 = -1
+                while r <= 1 {
+                    var q: i32 = c + r * w - 1
+                    var n: i32 = 0
+                    while n < 3 {
+                        let v: f32 = *((tp + (q as u64) * (4 as u64)) as *mut f32)
+                        if v > mx { mx = v }
+                        s = s + v
+                        q = q + 1
+                        n = n + 1
+                    }
+                    r = r + 1
+                }
+            } else {
+                var dy: i32 = -1
+                while dy <= 1 {
+                    var dx: i32 = -1
+                    while dx <= 1 {
+                        let v: f32 = image.img_getc((*k).tmap, 0, x + dx, y + dy)
+                        if v > mx { mx = v }
+                        s = s + v
+                        dx = dx + 1
+                    }
+                    dy = dy + 1
+                }
+            }
+            var tt: f32 = s / 9.0f
+            var wgt: f32 = image.expneg(image.fmaxf(tt - (*k).thr, 0.0f) / (*k).soft)
+            if image.img_get((*k).tmap, 0, x, y) > 1.0e5f { wgt = 0.0f }
+            image.img_set((*k).wmap, 0, x, y, wgt)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// pass 3: accumulate the weighted alternate samples
+fn pass3_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut MergeCtx = ctx as *mut MergeCtx
+    let w: i32 = (*(*k).rf).w
+    let h: i32 = (*(*k).rf).h
+    let af: *mut image.Image = (*k).af
+    let ga: f32 = (*k).ga
+    let gr: f32 = (*k).gr
+    let ap0: u64 = plane_at(af, 0)
+    let ap1: u64 = plane_at(af, 1)
+    let ap2: u64 = plane_at(af, 2)
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            let wm: f32 = image.img_get((*k).wmap, 0, x, y)
+            // the weight is multiplied by rel (> 0) afterwards, so wm == 0 means no contribution at all
+            if wm > 0.0f {
+                var dx: f32 = 0.0f
+                var dy: f32 = 0.0f
+                align.flow_at((*k).fl, x as f32, y as f32, &dx, &dy)
+                let sx: f32 = (x as f32) + dx
+                let sy: f32 = (y as f32) + dy
+                var bl: Bil = bil_setup(w, h, sx, sy)
+                let ag: f32 = bil_get(ap1, &bl)
+                let va: f32 = noise.variance((*k).nm, 1, ag) / (ga * ga)
+                let vr: f32 = noise.variance((*k).nm, 1, image.img_get((*k).rf, 1, x, y)) / (gr * gr)
+                // inverse-variance weight relative to the reference, bounded
+                var rel: f32 = vr / va
+                if rel > 4.0f { rel = 4.0f }
+                let wgt: f32 = wm * rel
+                if wgt > 0.0f {
+                    image.img_set((*k).acc, 0, x, y, image.img_get((*k).acc, 0, x, y) + wgt * bil_get(ap0, &bl) / ga)
+                    image.img_set((*k).acc, 1, x, y, image.img_get((*k).acc, 1, x, y) + wgt * ag / ga)
+                    image.img_set((*k).acc, 2, x, y, image.img_get((*k).acc, 2, x, y) + wgt * bil_get(ap2, &bl) / ga)
+                    image.img_set((*k).wsum, 0, x, y, image.img_get((*k).wsum, 0, x, y) + wgt)
+                    image.img_set((*k).vnum, 0, x, y, image.img_get((*k).vnum, 0, x, y) + wgt * wgt * va)
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn final_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut MergeCtx = ctx as *mut MergeCtx
+    let w: i32 = (*(*k).rf).w
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            let ws: f32 = image.img_get((*k).wsum, 0, x, y)
+            if ws > 1.0e-3f {
+                var c: i32 = 0
+                while c < 3 {
+                    image.img_set((*k).out, c, x, y, image.img_get((*k).acc, c, x, y) / ws)
+                    c = c + 1
+                }
+                image.img_set((*k).var_plane, 0, x, y, image.img_get((*k).vnum, 0, x, y) / (ws * ws))
+            } else {
+                var c: i32 = 0
+                while c < 3 {
+                    image.img_set((*k).out, c, x, y, image.img_get((*k).rf, c, x, y) / (*k).gr)
+                    c = c + 1
+                }
+                image.img_set((*k).var_plane, 0, x, y, noise.variance((*k).nm, 1, image.img_get((*k).rf, 1, x, y)) / ((*k).gr * (*k).gr))
+                image.img_set((*k).wsum, 0, x, y, 1.0f)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+struct NormCtx {
+    la: *mut image.Image,
+    gr: f32,
+    ga: f32,
+}
+
+fn norm_luma_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut NormCtx = ctx as *mut NormCtx
+    var n: u64 = lo
+    while n < hi {
+        let p: *mut f32 = ((*(*k).la).px + n * (4 as u64)) as *mut f32
+        *p = image.fminf(*p * (*k).gr / (*k).ga, 1.0f)
+        n = n + 1
+    }
+}
+
 // Merge the burst around frame `ref_idx`. `out` (3 ch), `var_plane` and `wsum` (1 ch) are created here.
+// Every pass runs its rows through photo.par (disjoint rows, the weights of pass 3 only read pass 2's map).
 fn merge_burst_opts(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, mo: *mut MergeOpts, out: *mut image.Image, var_plane: *mut image.Image, wsum: *mut image.Image) {
     let rf: *mut image.Image = &(*b).frames[ref_idx as usize]
     let w: i32 = (*rf).w
@@ -109,26 +456,14 @@ fn merge_burst_opts(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, mo: 
     var vnum: image.Image = image.img_new(w, h, 1)
     var tmap: image.Image = image.img_new(w, h, 1)
     var wmap: image.Image = image.img_new(w, h, 1)
-
-    // reference contribution
-    var y: i32 = 0
-    while y < h {
-        var x: i32 = 0
-        while x < w {
-            var wr: f32 = 1.0f
-            if is_clipped(rf, x, y) { wr = 0.0f }
-            var c: i32 = 0
-            while c < 3 {
-                image.img_set(&acc, c, x, y, wr * image.img_get(rf, c, x, y) / gr)
-                c = c + 1
-            }
-            let vg: f32 = noise.variance(nm, 1, image.img_get(rf, 1, x, y)) / (gr * gr)
-            image.img_set(wsum, 0, x, y, wr)
-            image.img_set(&vnum, 0, x, y, wr * wr * vg)
-            x = x + 1
-        }
-        y = y + 1
+    var rclip: image.Image = clip_map(rf)
+    var aclip: image.Image = image.img_new(1, 1, 1)
+    var fl: align.Flow = align.Flow { tw: 0, th: 0, dx: 0 as u64, dy: 0 as u64, err: 0 as u64 }
+    var mc: MergeCtx = MergeCtx {
+        rf: rf, af: rf, acc: &acc, vnum: &vnum, tmap: &tmap, wmap: &wmap, wsum: wsum, out: out, var_plane: var_plane, nm: nm,
+        fl: &fl, rclip: &rclip, aclip: &aclip, gr: gr, ga: gr, thr: (*mo).thr, soft: (*mo).soft,
     }
+    par.rows(h, 16, ref_rows, (&mc) as u64)
 
     var lr: image.Image = image.img_luma(rf)
     if (*mo).align_blur > 0.0f {
@@ -149,12 +484,8 @@ fn merge_burst_opts(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, mo: 
         let ga: f32 = (*b).gain[j as usize]
         // alignment on exposure-normalised luma
         var la: image.Image = image.img_luma(af)
-        var n: i32 = 0
-        while n < w * h {
-            let p: *mut f32 = (la.px + (n as u64) * (4 as u64)) as *mut f32
-            *p = image.fminf(*p * gr / ga, 1.0f)
-            n = n + 1
-        }
+        var nc: NormCtx = NormCtx { la: &la, gr: gr, ga: ga }
+        par.rows(w * h, 65536, norm_luma_rows, (&nc) as u64)
         // the reference luma must be exposure-normalised the same way: reference luma is at gain gr already
         if (*mo).align_blur > 0.0f {
             let lb: image.Image = filter.gauss_blur(&la, (*mo).align_blur)
@@ -163,126 +494,22 @@ fn merge_burst_opts(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, mo: 
         }
         var pa: align.Pyr = align.pyr_build(&la)
         image.img_free(&la)
-        var fl: align.Flow = align.align_flow(&pr, &pa)
+        fl = align.align_flow(&pr, &pa)
         align.pyr_free(&pa)
-
-        // pass 1: normalised squared difference T (mean over channels, expected 1 for pure noise)
-        y = 0
-        while y < h {
-            var x: i32 = 0
-            while x < w {
-                var dx: f32 = 0.0f
-                var dy: f32 = 0.0f
-                align.flow_at(&fl, x as f32, y as f32, &dx, &dy)
-                let sx: f32 = (x as f32) + dx
-                let sy: f32 = (y as f32) + dy
-                var t: f32 = 0.0f
-                var c: i32 = 0
-                while c < 3 {
-                    let av: f32 = image.img_sample(af, c, sx, sy)
-                    let rv: f32 = image.img_get(rf, c, x, y)
-                    let d: f32 = av / ga - rv / gr
-                    let va: f32 = noise.variance(nm, c, av) / (ga * ga) + noise.variance(nm, c, rv) / (gr * gr)
-                    t = t + d * d / va
-                    c = c + 1
-                }
-                if is_clipped(rf, x, y) {
-                    t = 0.0f
-                }
-                image.img_set(&tmap, 0, x, y, t / 3.0f)
-                // mark clipped alt samples with a huge T
-                if is_clipped(af, (sx + 0.5f) as i32, (sy + 0.5f) as i32) {
-                    image.img_set(&tmap, 0, x, y, 1.0e6f)
-                }
-                x = x + 1
-            }
-            y = y + 1
-        }
-        // pass 2: 3x3 mean of T (clipped marks stay huge), weight, accumulate
-        y = 0
-        while y < h {
-            var x: i32 = 0
-            while x < w {
-                var s: f32 = 0.0f
-                var mx: f32 = 0.0f
-                var dy: i32 = -1
-                while dy <= 1 {
-                    var dx: i32 = -1
-                    while dx <= 1 {
-                        let v: f32 = image.img_getc(&tmap, 0, x + dx, y + dy)
-                        if v > mx { mx = v }
-                        s = s + v
-                        dx = dx + 1
-                    }
-                    dy = dy + 1
-                }
-                var tt: f32 = s / 9.0f
-                var wgt: f32 = image.expneg(image.fmaxf(tt - (*mo).thr, 0.0f) / (*mo).soft)
-                if image.img_get(&tmap, 0, x, y) > 1.0e5f { wgt = 0.0f }
-                image.img_set(&wmap, 0, x, y, wgt)
-                x = x + 1
-            }
-            y = y + 1
-        }
-        y = 0
-        while y < h {
-            var x: i32 = 0
-            while x < w {
-                var dx: f32 = 0.0f
-                var dy: f32 = 0.0f
-                align.flow_at(&fl, x as f32, y as f32, &dx, &dy)
-                let sx: f32 = (x as f32) + dx
-                let sy: f32 = (y as f32) + dy
-                let ag: f32 = image.img_sample(af, 1, sx, sy)
-                let va: f32 = noise.variance(nm, 1, ag) / (ga * ga)
-                let vr: f32 = noise.variance(nm, 1, image.img_get(rf, 1, x, y)) / (gr * gr)
-                // inverse-variance weight relative to the reference, bounded
-                var rel: f32 = vr / va
-                if rel > 4.0f { rel = 4.0f }
-                let wgt: f32 = image.img_get(&wmap, 0, x, y) * rel
-                if wgt > 0.0f {
-                    var c: i32 = 0
-                    while c < 3 {
-                        image.img_set(&acc, c, x, y, image.img_get(&acc, c, x, y) + wgt * image.img_sample(af, c, sx, sy) / ga)
-                        c = c + 1
-                    }
-                    image.img_set(wsum, 0, x, y, image.img_get(wsum, 0, x, y) + wgt)
-                    image.img_set(&vnum, 0, x, y, image.img_get(&vnum, 0, x, y) + wgt * wgt * va)
-                }
-                x = x + 1
-            }
-            y = y + 1
-        }
+        image.img_free(&aclip)
+        aclip = clip_map(af)
+        mc.af = af
+        mc.ga = ga
+        par.rows(h, 8, pass1_rows, (&mc) as u64)
+        par.rows(h, 8, pass2_rows, (&mc) as u64)
+        par.rows(h, 8, pass3_rows, (&mc) as u64)
         align.flow_free(&fl)
         j = j + 1
     }
     align.pyr_free(&pr)
-
-    y = 0
-    while y < h {
-        var x: i32 = 0
-        while x < w {
-            let ws: f32 = image.img_get(wsum, 0, x, y)
-            if ws > 1.0e-3f {
-                var c: i32 = 0
-                while c < 3 {
-                    image.img_set(out, c, x, y, image.img_get(&acc, c, x, y) / ws)
-                    c = c + 1
-                }
-                image.img_set(var_plane, 0, x, y, image.img_get(&vnum, 0, x, y) / (ws * ws))
-            } else {
-                var c: i32 = 0
-                while c < 3 {
-                    image.img_set(out, c, x, y, image.img_get(rf, c, x, y) / gr)
-                    c = c + 1
-                }
-                image.img_set(var_plane, 0, x, y, noise.variance(nm, 1, image.img_get(rf, 1, x, y)) / (gr * gr))
-                image.img_set(wsum, 0, x, y, 1.0f)
-            }
-            x = x + 1
-        }
-        y = y + 1
-    }
+    par.rows(h, 16, final_rows, (&mc) as u64)
+    image.img_free(&rclip)
+    image.img_free(&aclip)
     image.img_free(&acc)
     image.img_free(&vnum)
     image.img_free(&tmap)
