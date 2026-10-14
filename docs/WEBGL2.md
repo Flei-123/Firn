@@ -134,7 +134,7 @@ calls `glweb_poll_context` (22 frames of `CTX_LOST` in the last run, then exactl
 Headless Chromium under `--virtual-time-budget` never fires `requestAnimationFrame`; `loss.html` drives the loop with a timer-based `requestAnimationFrame`
 shim (same frame function, other clock). A real `requestAnimationFrame` loop was therefore NOT exercised by any test.
 
-**Bug found by gate 141 and fixed:** `glweb.js` returned right after `main` (every wasm program ends in `exit(0)`, thrown as `Exit`), so a program that exports
+**Bug found while writing gate 141 (fixed in parallel on main, same fix):** `glweb.js` returned right after `main` (every wasm program ends in `exit(0)`, thrown as `Exit`), so a program that exports
 `firn_mc_frame` never got its frame loop. Now an `Exit` with code 0 from a module that exports `firn_mc_frame` continues into the loop (the module memory is intact).
 
 **Gamepads (browser Gamepad API)**: `lib/input/webpad.fi` (`input.webpad`). `glweb.js` polls `navigator.getGamepads()` once per frame before `firn_mc_frame`
