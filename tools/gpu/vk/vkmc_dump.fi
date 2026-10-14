@@ -1,0 +1,695 @@
+// tools/gpu/vk/vkmc_dump.fi -- Vulkan voxel back end (lib/mc/vk_mc.fi) against the CPU rasterizer (lib/mc/mc_raster.fi).
+// Same scenes + thresholds as tools/gpu/dump.fi (GL), through the SAME mc_backend.Backend calls on both back ends.
+// Runs on lavapipe (CPU Vulkan) here -- NO real GPU. Entity boxes are not part of it (VK4 r180).
+//   usage: vkmc_dump [outdir]     (outdir: also writes <scene>.cpu.rgba / <scene>.gpu.rgba)
+// Floors are VK-specific where the GL ones are not reached yet (chunk 33.65 / inside 33.03 / water_glass 36.78 vs GL 36.2 / 41.2 / 40.6, r184).
+// Exit 0 = every scene above its threshold, 3 = a threshold failed, 4 = no Vulkan device (SKIP).
+import std.rt
+import std.io
+import std.math
+import std.time
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import gpu.gl33
+import mc.vk_mc
+
+const W: i32 = 320
+const H: i32 = 180
+const TW: i32 = 640
+const TH: i32 = 360
+
+struct Cmp {
+    npx: u64,
+    diff_px: u64, // any channel differs
+    big_px: u64, // max channel difference > 16
+    max_diff: u32,
+    cov_cpu: u64, // pixels that are not the clear colour
+    cov_gpu: u64,
+    cov_mm: u64, // exactly one of the two covered the pixel
+    psnr_x100: u64,
+}
+
+struct Sc {
+    r: mc_raster.Raster,
+    gb: vk_mc.VkBackend,
+    bc: mc_backend.Backend,
+    bg: mc_backend.Backend,
+    cam: mc_camera.Camera,
+    dir: u64, // output directory (NUL terminated) or 0
+    dirn: usize,
+    fails: i32,
+    fade_a: i32, // scene_t: draw the opaque mesh with set_fade(fade_a, fade_inv) (64 = off)
+    fade_inv: i32,
+}
+
+fn print_f2(v: f64) {
+    var x: f64 = v
+    if x < 0.0 { x = 0.0 }
+    let i: i64 = x as i64
+    var f: i64 = ((x - (i as f64)) * 100.0 + 0.5) as i64
+    var ii: i64 = i
+    if f >= 100 as i64 {
+        f = f - 100 as i64
+        ii = ii + 1 as i64
+    }
+    if f < 10 as i64 {
+        io.fmt_print(f"{ii}.0{f}")
+    } else {
+        io.fmt_print(f"{ii}.{f}")
+    }
+}
+
+// ---- atlas for the hand made scenes -----------------------------------------------------------------
+fn put(a: *mut mc_texture.Atlas, tile: u32, x: i32, y: i32, rgba: u32) {
+    let ox: i32 = mc_texture.atlas_tile_x(a, tile)
+    let oy: i32 = mc_texture.atlas_tile_y(a, tile)
+    rt.st32((*a).px, ((oy + y) * (*a).w + ox + x) as usize, rgba)
+}
+
+// tile 1 solid orange, tile 2 four coloured quadrants + white top row + black left column, tile 3 left half transparent
+fn test_atlas() -> mc_texture.Atlas {
+    var a: mc_texture.Atlas = mc_texture.atlas_new(16, 4, 4)
+    var y: i32 = 0
+    while y < 16 {
+        var x: i32 = 0
+        while x < 16 {
+            put(&a, 1 as u32, x, y, mc_texture.pack_pixel(230 as u32, 120 as u32, 40 as u32, 255 as u32))
+            var c: u32 = mc_texture.pack_pixel(220 as u32, 30 as u32, 30 as u32, 255 as u32)
+            if x >= 8 && y < 8 { c = mc_texture.pack_pixel(30 as u32, 200 as u32, 30 as u32, 255 as u32) }
+            if x < 8 && y >= 8 { c = mc_texture.pack_pixel(30 as u32, 60 as u32, 230 as u32, 255 as u32) }
+            if x >= 8 && y >= 8 { c = mc_texture.pack_pixel(240 as u32, 230 as u32, 30 as u32, 255 as u32) }
+            if y == 0 { c = mc_texture.pack_pixel(255 as u32, 255 as u32, 255 as u32, 255 as u32) }
+            if x == 0 { c = mc_texture.pack_pixel(0 as u32, 0 as u32, 0 as u32, 255 as u32) }
+            put(&a, 2 as u32, x, y, c)
+            var al: u32 = 255 as u32
+            if x < 8 { al = 0 as u32 }
+            put(&a, 3 as u32, x, y, mc_texture.pack_pixel(30 as u32, 220 as u32, 220 as u32, al))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return a
+}
+
+// ---- hand made meshes -------------------------------------------------------------------------------
+fn vw0(x: u32, y: u32, z: u32, face: u32, ao: u32) -> u32 {
+    return x | (y << 8 as u32) | (z << 16 as u32) | (face << 24 as u32) | (ao << 27 as u32)
+}
+
+fn vw1(tile: u32, u: u32, v: u32) -> u32 {
+    return tile | (u << 14 as u32) | (v << 19 as u32) | (15 as u32 << 24 as u32) // mc_mesh layout: tile14 | u5 | v5 | sky4 (15 = full daylight) | block4
+}
+
+fn put_vtx(vp: u64, i: usize, w0: u32, w1: u32) {
+    rt.st32(vp, i * 2, w0)
+    rt.st32(vp, i * 2 + 1, w1)
+}
+
+// ---- compare ----------------------------------------------------------------------------------------
+fn compare(a: u64, b: u64, n: usize, clear: u32, out: *mut Cmp) {
+    (*out).npx = n as u64
+    (*out).diff_px = 0 as u64
+    (*out).big_px = 0 as u64
+    (*out).max_diff = 0 as u32
+    (*out).cov_cpu = 0 as u64
+    (*out).cov_gpu = 0 as u64
+    (*out).cov_mm = 0 as u64
+    var sq: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let pa: u32 = rt.ld32(a, i)
+        let pb: u32 = rt.ld32(b, i)
+        var ca: bool = pa != clear
+        var cb: bool = pb != clear
+        if ca { (*out).cov_cpu = (*out).cov_cpu + 1 as u64 }
+        if cb { (*out).cov_gpu = (*out).cov_gpu + 1 as u64 }
+        if ca != cb { (*out).cov_mm = (*out).cov_mm + 1 as u64 }
+        if pa != pb {
+            (*out).diff_px = (*out).diff_px + 1 as u64
+            var mx: u32 = 0 as u32
+            var k: u32 = 0 as u32
+            while k < 4 as u32 {
+                let ba: i32 = ((pa >> (k * 8 as u32)) & 255 as u32) as i32
+                let bb: i32 = ((pb >> (k * 8 as u32)) & 255 as u32) as i32
+                var d: i32 = ba - bb
+                if d < 0 { d = 0 - d }
+                if k < 3 as u32 { sq = sq + (d * d) as f64 }
+                if (d as u32) > mx { mx = d as u32 }
+                k = k + 1 as u32
+            }
+            if mx > (*out).max_diff { (*out).max_diff = mx }
+            if mx > 16 as u32 { (*out).big_px = (*out).big_px + 1 as u64 }
+        }
+        i = i + 1
+    }
+    var psnr: f64 = 99.0
+    if sq > 0.0 {
+        let mse: f64 = sq / ((n as f64) * 3.0)
+        psnr = 10.0 * math.log10(255.0 * 255.0 / mse)
+    }
+    (*out).psnr_x100 = (psnr * 100.0) as u64
+}
+
+fn write_raw(s: *mut Sc, name: str, kind: str, px: u64, n: usize) {
+    if (*s).dir == 0 { return }
+    var path: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&path, (*s).dir, (*s).dirn)
+    rt.buf_push(&path, 47 as u8)
+    rt.buf_push_bytes(&path, name.p as u64, name.n)
+    rt.buf_push(&path, 46 as u8)
+    rt.buf_push_bytes(&path, kind.p as u64, kind.n)
+    rt.buf_push_bytes(&path, ".rgba".p as u64, 5)
+    rt.buf_push(&path, 0 as u8)
+    rt.write_file(rt.buf_ptr(&path), px, n * 4)
+    rt.buf_free(&path)
+}
+
+// One frame on one back end: mesh `verts/idx` drawn `nx` x `nz` times (section step 16 blocks) from (ox, oy, oz).
+fn frame(b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera, clear: u32, h: usize, nx: i32, nz: i32,
+    ox: f64, oy: f64, oz: f64) -> u64 {
+    var tris: u64 = 0 as u64
+    (*b).begin((*b).obj, (cam as u64), clear)
+    var sx: i32 = 0
+    while sx < nx {
+        var sz: i32 = 0
+        while sz < nz {
+            tris = tris + (*b).draw((*b).obj, h, ox + ((sx * 16) as f64), oy, oz + ((sz * 16) as f64))
+            sz = sz + 1
+        }
+        sx = sx + 1
+    }
+    (*b).end((*b).obj)
+    return tris
+}
+
+// Renders a scene on both back ends, compares, prints one line, checks the thresholds.
+fn scene(s: *mut Sc, name: str, verts: u64, nv: usize, idx: u64, ni: usize, nx: i32, nz: i32,
+    ox: f64, oy: f64, oz: f64, fog: bool, clear: u32, min_psnr_x100: u64, max_mm_permille: u64) {
+    mc_camera.camera_update(&(*s).cam)
+    mc_raster.raster_set_fog(&(*s).r, fog, 20.0, 90.0, 150 as u32, 190 as u32, 230 as u32)
+    vk_mc.vkbe_set_fog(&(*s).gb, fog, 20.0, 90.0, 150 as u32, 190 as u32, 230 as u32)
+    let hc: usize = (*s).bc.mesh_upload((*s).bc.obj, 1, verts, nv, idx, ni)
+    let hg: usize = (*s).bg.mesh_upload((*s).bg.obj, 1, verts, nv, idx, ni)
+    let tc: u64 = frame(&(*s).bc, &(*s).cam, clear, hc, nx, nz, ox, oy, oz)
+    let tg: u64 = frame(&(*s).bg, &(*s).cam, clear, hg, nx, nz, ox, oy, oz)
+    let pc: u64 = (*s).bc.present((*s).bc.obj)
+    let pg: u64 = (*s).bg.present((*s).bg.obj)
+    var c: Cmp = Cmp { npx: 0 as u64, diff_px: 0 as u64, big_px: 0 as u64, max_diff: 0 as u32, cov_cpu: 0 as u64,
+        cov_gpu: 0 as u64, cov_mm: 0 as u64, psnr_x100: 0 as u64 }
+    let n: usize = (W as usize) * (H as usize)
+    compare(pc, pg, n, clear, &c)
+    write_raw(s, name, "cpu", pc, n)
+    write_raw(s, name, "gpu", pg, n)
+    (*s).bc.mesh_free((*s).bc.obj, hc)
+    (*s).bg.mesh_free((*s).bg.obj, hg)
+    let mm_permille: u64 = c.cov_mm * 1000 as u64 / c.npx
+    var ok: bool = c.cov_cpu > 0 as u64 && c.cov_gpu > 0 as u64 && tc == tg
+    if c.psnr_x100 < min_psnr_x100 { ok = false }
+    if mm_permille > max_mm_permille { ok = false }
+    io.print("scene ")
+    io.print(name)
+    io.fmt_print(f" tris={tg} cov_cpu={c.cov_cpu} cov_gpu={c.cov_gpu} cov_mismatch={c.cov_mm} ({mm_permille} permille) diff_px={c.diff_px} big_px={c.big_px} max_diff={c.max_diff} psnr=")
+    print_f2((c.psnr_x100 as f64) / 100.0)
+    io.print(" min_psnr=")
+    print_f2((min_psnr_x100 as f64) / 100.0)
+    if ok {
+        io.print(" ok\n")
+    } else {
+        io.print(" FAIL\n")
+        (*s).fails = (*s).fails + 1
+    }
+}
+
+// ---- voxel tables / padded sections (as tools/mc/raster/dump.fi) ----------------------------------------------
+fn tables(t: *mut mc_mesh.MeshTables) {
+    let opaque: u64 = rt.heap_alloc(32768)
+    let tiles: u64 = rt.heap_alloc(32768 * 6 * 2)
+    var i: usize = 0
+    while i < 32768 {
+        rt.st8(opaque, i, 0 as u8)
+        i = i + 1
+    }
+    i = 0
+    while i < 32768 * 6 {
+        rt.st16(tiles, i, 0 as u16)
+        i = i + 1
+    }
+    // 1 grass block (side 4, bottom 2, top 3), 2 test tile, 3 leaves (cutout, not opaque), 4 stone, 5 bricks
+    let g: [u16; 6] = [4 as u16, 4 as u16, 2 as u16, 3 as u16, 4 as u16, 4 as u16]
+    var f: usize = 0
+    while f < 6 {
+        rt.st16(tiles, 1 * 6 + f, g[f])
+        rt.st16(tiles, 2 * 6 + f, 58 as u16)
+        rt.st16(tiles, 3 * 6 + f, 10 as u16)
+        rt.st16(tiles, 4 * 6 + f, 1 as u16)
+        rt.st16(tiles, 5 * 6 + f, 20 as u16)
+        rt.st16(tiles, 6 * 6 + f, 11 as u16)
+        rt.st16(tiles, 7 * 6 + f, 16 as u16)
+        rt.st16(tiles, 8 * 6 + f, 15 as u16)
+        f = f + 1
+    }
+    // 6 water, 7 glass, 8 ice: translucent (bit 1 of the opaque table, mc_mesh.F_TRANS pass)
+    rt.st8(opaque, 6, 2 as u8)
+    rt.st8(opaque, 7, 2 as u8)
+    rt.st8(opaque, 8, 2 as u8)
+    rt.st8(opaque, 1, 1 as u8)
+    rt.st8(opaque, 2, 1 as u8)
+    rt.st8(opaque, 4, 1 as u8)
+    rt.st8(opaque, 5, 1 as u8)
+    (*t).opaque = opaque
+    (*t).tiles = tiles
+}
+
+fn pad_clear_all(pad: u64) {
+    var i: usize = 0
+    while i < 5832 {
+        rt.st16(pad, i, 0 as u16)
+        i = i + 1
+    }
+}
+
+fn pad_set(pad: u64, x: i32, y: i32, z: i32, id: u16) {
+    rt.st16(pad, (((y + 1) * 18 + (z + 1)) * 18 + (x + 1)) as usize, id)
+}
+
+// padded light array (u8 [5832], sky << 4 | block): sky 15 above y >= 5 and falling off below, a block-light emitter at (6, 2, 6)
+fn fill_light(lpad: u64) {
+    var py: i32 = 0
+    while py < 18 {
+        var pz: i32 = 0
+        while pz < 18 {
+            var px: i32 = 0
+            while px < 18 {
+                var sky: i32 = 15
+                if py < 6 { sky = 15 - (6 - py) * 2 - ((px + pz) % 3) }
+                if sky < 0 { sky = 0 }
+                var dx: i32 = px - 7
+                var dy: i32 = py - 3
+                var dz: i32 = pz - 7
+                if dx < 0 { dx = 0 - dx }
+                if dy < 0 { dy = 0 - dy }
+                if dz < 0 { dz = 0 - dz }
+                var bl: i32 = 14 - (dx + dy + dz)
+                if bl < 0 { bl = 0 }
+                rt.st8(lpad, ((py * 18 + pz) * 18 + px) as usize, ((sky << 4) | bl) as u8)
+                px = px + 1
+            }
+            pz = pz + 1
+        }
+        py = py + 1
+    }
+}
+
+// rolling hills like tools/mc/raster/bench.fi plus leaf cut-out cubes and a bricks pillar
+fn fill_hills(pad: u64) {
+    var i: usize = 0
+    while i < 5832 {
+        rt.st16(pad, i, 0 as u16)
+        i = i + 1
+    }
+    var x: i32 = 0
+    while x < 16 {
+        var z: i32 = 0
+        while z < 16 {
+            let h: i32 = 2 + ((x * 7 + z * 13) % 5) / 2
+            var y: i32 = 0
+            while y <= h {
+                var id: u16 = 1 as u16
+                if y < h - 1 { id = 4 as u16 }
+                pad_set(pad, x, y, z, id)
+                y = y + 1
+            }
+            if (x * 5 + z * 3) % 11 == 0 { pad_set(pad, x, h + 1, z, 3 as u16) }
+            z = z + 1
+        }
+        x = x + 1
+    }
+    var py: i32 = 0
+    while py < 9 {
+        pad_set(pad, 7, py, 7, 5 as u16)
+        py = py + 1
+    }
+}
+
+fn median(v: *mut [u64; 32], n: usize) -> u64 {
+    var i: usize = 1
+    while i < n {
+        let k: u64 = (*v)[i]
+        var j: usize = i
+        while j > 0 && (*v)[j - 1] > k {
+            (*v)[j] = (*v)[j - 1]
+            j = j - 1
+        }
+        (*v)[j] = k
+        i = i + 1
+    }
+    return (*v)[n / 2]
+}
+
+// ---- world path: pool / multi draw / budget / defrag must give the SAME pixels as one VAO per section -------------------
+fn fnv(px: u64, n: usize) -> u64 {
+    var h: u64 = 7 as u64
+    var i: usize = 0
+    while i < n {
+        h = (h * 131 as u64 + (rt.ld8(px, i) as u64) + 1 as u64) % 4294967291 as u64
+        i = i + 1
+    }
+    return h
+}
+
+fn frame_t(b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera, clear: u32, ho: usize, ht: usize, recs: u64, n: usize, fa: i32, finv: i32) {
+    (*b).begin((*b).obj, (cam as u64), clear)
+    (*b).set_fade((*b).obj, fa, finv)
+    (*b).draw((*b).obj, ho, 0.0, 0.0, 0.0)
+    (*b).set_fade((*b).obj, 64, 0)
+    if ht != 0 {
+        (*b).set_pass((*b).obj, mc_backend.PASS_TRANS)
+        (*b).draw((*b).obj, ht, 0.0, 0.0, 0.0)
+        (*b).set_pass((*b).obj, mc_backend.PASS_OPAQUE)
+    }
+    if n > 0 { (*b).draw_entities((*b).ent_obj, recs, n) }
+    (*b).end((*b).obj)
+}
+
+// Same comparison as scene(), for a translucent mesh and/or entity boxes. Mesh vertex buffers are uploaded right here (the
+// mesher reuses its buffers), so the caller passes the two meshes' bytes.
+fn scene_t(s: *mut Sc, name: str, ov: u64, onv: usize, oi: u64, oni: usize, tv: u64, tnv: usize, ti: u64, tni: usize,
+    recs: u64, nrec: usize, fog: bool, fs: f64, fe: f64, clear: u32, min_psnr_x100: u64, max_mm_permille: u64) {
+    mc_camera.camera_update(&(*s).cam)
+    mc_raster.raster_set_fog(&(*s).r, fog, fs, fe, 150 as u32, 190 as u32, 230 as u32)
+    vk_mc.vkbe_set_fog(&(*s).gb, fog, fs, fe, 150 as u32, 190 as u32, 230 as u32)
+    let hoc: usize = (*s).bc.mesh_upload((*s).bc.obj, 1, ov, onv, oi, oni)
+    let hog: usize = (*s).bg.mesh_upload((*s).bg.obj, 1, ov, onv, oi, oni)
+    var htc: usize = 0
+    var htg: usize = 0
+    if tnv > 0 {
+        htc = (*s).bc.mesh_upload((*s).bc.obj, 2, tv, tnv, ti, tni)
+        htg = (*s).bg.mesh_upload((*s).bg.obj, 2, tv, tnv, ti, tni)
+    }
+    frame_t(&(*s).bc, &(*s).cam, clear, hoc, htc, recs, nrec, (*s).fade_a, (*s).fade_inv)
+    frame_t(&(*s).bg, &(*s).cam, clear, hog, htg, recs, nrec, (*s).fade_a, (*s).fade_inv)
+    let pc: u64 = (*s).bc.present((*s).bc.obj)
+    let pg: u64 = (*s).bg.present((*s).bg.obj)
+    var c: Cmp = Cmp { npx: 0 as u64, diff_px: 0 as u64, big_px: 0 as u64, max_diff: 0 as u32, cov_cpu: 0 as u64,
+        cov_gpu: 0 as u64, cov_mm: 0 as u64, psnr_x100: 0 as u64 }
+    let n: usize = (W as usize) * (H as usize)
+    compare(pc, pg, n, clear, &c)
+    write_raw(s, name, "cpu", pc, n)
+    write_raw(s, name, "gpu", pg, n)
+    (*s).bc.mesh_free((*s).bc.obj, hoc)
+    (*s).bg.mesh_free((*s).bg.obj, hog)
+    if tnv > 0 {
+        (*s).bc.mesh_free((*s).bc.obj, htc)
+        (*s).bg.mesh_free((*s).bg.obj, htg)
+    }
+    let mm_permille: u64 = c.cov_mm * 1000 as u64 / c.npx
+    var ok: bool = c.cov_cpu > 0 as u64 && c.cov_gpu > 0 as u64
+    if c.psnr_x100 < min_psnr_x100 { ok = false }
+    if mm_permille > max_mm_permille { ok = false }
+    io.print("scene ")
+    io.print(name)
+    io.fmt_print(f" ents={nrec} cov_cpu={c.cov_cpu} cov_gpu={c.cov_gpu} cov_mismatch={c.cov_mm} ({mm_permille} permille) diff_px={c.diff_px} big_px={c.big_px} max_diff={c.max_diff} psnr=")
+    print_f2((c.psnr_x100 as f64) / 100.0)
+    io.print(" min_psnr=")
+    print_f2((min_psnr_x100 as f64) / 100.0)
+    if ok {
+        io.print(" ok\n")
+    } else {
+        io.print(" FAIL\n")
+        (*s).fails = (*s).fails + 1
+    }
+}
+
+fn stf(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (8 as u64)) as *mut f64) = v
+}
+
+fn ent_rec(recs: u64, i: usize, x: f64, y: f64, z: f64, sx: f64, sy: f64, sz: f64, yaw: f64, r: u32, g: u32, b: u32) {
+    let e: u64 = recs + (i * mc_backend.ENT_BYTES) as u64
+    stf(e, 0, x)
+    stf(e, 1, y)
+    stf(e, 2, z)
+    stf(e, 3, sx)
+    stf(e, 4, sy)
+    stf(e, 5, sz)
+    stf(e, 6, math.sin(yaw))
+    stf(e, 7, math.cos(yaw))
+    stf(e, 8, r as f64)
+    stf(e, 9, g as f64)
+    stf(e, 10, b as f64)
+    stf(e, 11, 0.0)
+}
+
+fn main(start: u64) -> i32 {
+    var dir: u64 = 0
+    var dirn: usize = 0
+    if rt.arg_count(start) >= 2 {
+        dir = rt.arg_ptr(start, 1)
+        while rt.ld8(dir, dirn) != 0 as u8 { dirn = dirn + 1 }
+    }
+    var gb: vk_mc.VkBackend = vk_mc.vkbe_open(W, H)
+    if !gb.ok {
+        io.fmt_print(f"no Vulkan device: step={gb.step}\n")
+        return 4
+    }
+    io.print("renderer: ")
+    io.print_c(vk_mc.vkbe_device_name(&gb))
+    io.new_line()
+    var s: Sc = Sc { r: mc_raster.raster_new(W, H), gb: gb, bc: mc_backend.backend_new(), bg: mc_backend.backend_new(),
+        cam: mc_camera.camera_new(W, H), dir: dir, dirn: dirn, fails: 0, fade_a: 64, fade_inv: 0 }
+    s.bc = mc_backend.backend_cpu(&s.r)
+    s.bg = vk_mc.vkbe_backend(&s.gb)
+    var ta: mc_texture.Atlas = test_atlas()
+    s.bc.upload_atlas(s.bc.obj, (&ta) as u64)
+    s.bg.upload_atlas(s.bg.obj, (&ta) as u64)
+    let clear: u32 = 0xFFE6BE96 as u32
+
+    // ---- 1. triangle: AO gradient on a solid tile, camera looks along +z (x grows to the LEFT of the screen)
+    let tv: u64 = rt.heap_alloc(3 * 8)
+    let ti: u64 = rt.heap_alloc(3 * 4)
+    put_vtx(tv, 0, vw0(12 as u32, 3 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    put_vtx(tv, 1, vw0(4 as u32, 3 as u32, 10 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    put_vtx(tv, 2, vw0(8 as u32, 13 as u32, 10 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    rt.st32(ti, 0, 0 as u32)
+    rt.st32(ti, 1, 1 as u32)
+    rt.st32(ti, 2, 2 as u32)
+    mc_camera.camera_set_pos(&s.cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&s.cam, 0.0, 0.0)
+    scene(&s, "triangle", tv, 3, ti, 3, 1, 1, 0.0, 0.0, 0.0, false, clear, 4000 as u64, 5 as u64)
+
+    // ---- 2. textured quad: tile 2 repeated 2 x 2 (u, v in tile repeats), seen at an angle
+    let qv: u64 = rt.heap_alloc(4 * 8)
+    let qi: u64 = rt.heap_alloc(6 * 4)
+    put_vtx(qv, 0, vw0(12 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 0 as u32, 2 as u32))
+    put_vtx(qv, 1, vw0(4 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 2 as u32, 2 as u32))
+    put_vtx(qv, 2, vw0(4 as u32, 14 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 2 as u32, 0 as u32))
+    put_vtx(qv, 3, vw0(12 as u32, 14 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(2 as u32, 0 as u32, 0 as u32))
+    rt.st32(qi, 0, 0 as u32)
+    rt.st32(qi, 1, 1 as u32)
+    rt.st32(qi, 2, 2 as u32)
+    rt.st32(qi, 3, 0 as u32)
+    rt.st32(qi, 4, 2 as u32)
+    rt.st32(qi, 5, 3 as u32)
+    mc_camera.camera_set_pos(&s.cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&s.cam, 0.0, 0.0)
+    scene(&s, "quad", qv, 4, qi, 6, 1, 1, 0.0, 0.0, 0.0, false, clear, 4000 as u64, 5 as u64)
+    mc_camera.camera_set_pos(&s.cam, 14.0, 9.0, 1.0)
+    mc_camera.camera_set_angles(&s.cam, 25.0, 8.0)
+    scene(&s, "quad_angled", qv, 4, qi, 6, 1, 1, 0.0, 0.0, 0.0, false, clear, 4000 as u64, 5 as u64)
+
+    // ---- 3. cut-out quad (tile 3: left half transparent) in front of the clear colour
+    put_vtx(qv, 0, vw0(12 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(3 as u32, 0 as u32, 1 as u32))
+    put_vtx(qv, 1, vw0(4 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(3 as u32, 1 as u32, 1 as u32))
+    put_vtx(qv, 2, vw0(4 as u32, 14 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(3 as u32, 1 as u32, 0 as u32))
+    put_vtx(qv, 3, vw0(12 as u32, 14 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(3 as u32, 0 as u32, 0 as u32))
+    mc_camera.camera_set_pos(&s.cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&s.cam, 0.0, 0.0)
+    scene(&s, "cutout", qv, 4, qi, 6, 1, 1, 0.0, 0.0, 0.0, false, clear, 4000 as u64, 5 as u64)
+
+    // ---- 3b. fog on a flat colour: a long quad receding from the camera (depth 24 .. 40 of the fog range 20 .. 90);
+    // no texture noise, so any error of the fog arithmetic shows up in the PSNR
+    put_vtx(qv, 0, vw0(16 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    put_vtx(qv, 1, vw0(0 as u32, 2 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    put_vtx(qv, 2, vw0(0 as u32, 2 as u32, 26 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    put_vtx(qv, 3, vw0(16 as u32, 2 as u32, 26 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    mc_camera.camera_set_pos(&s.cam, 8.0, 12.0, 0.0 - 14.0)
+    mc_camera.camera_set_angles(&s.cam, 0.0, 22.0)
+    // exact top-left rule for the CPU reference here: the edge expansion (~1/64 px) adds 2 edge pixels the GPU does not have, which is
+    // not what this scene checks (the fog arithmetic on a flat colour), so the floor stays at 75 dB
+    mc_raster.raster_set_edge_expand(&s.r, false)
+    scene(&s, "fog_flat", qv, 4, qi, 6, 1, 1, 0.0, 0.0, 0.0, true, clear, 7500 as u64, 5 as u64)
+    mc_raster.raster_set_edge_expand(&s.r, true)
+
+    // ---- 4. voxel chunk (hills, greedy + AO, atlas_default), 2 x 2 sections, with and without fog
+    var da: mc_texture.Atlas = mc_texture.atlas_default()
+    s.bc.upload_atlas(s.bc.obj, (&da) as u64)
+    s.bg.upload_atlas(s.bg.obj, (&da) as u64)
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    tables(&tb)
+    var m: mc_mesh.Mesher = mc_mesh.mesher_new()
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    fill_hills(pad)
+    mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+    mc_camera.camera_set_pos(&s.cam, 20.0, 12.0, -10.0)
+    mc_camera.camera_set_angles(&s.cam, 10.0, 25.0)
+    scene(&s, "chunk", m.verts, m.nverts as usize, m.idx, m.nidx as usize, 2, 2, 0.0, 0.0, 0.0, false, clear, 3300 as u64, 5 as u64)
+    scene(&s, "chunk_fog", m.verts, m.nverts as usize, m.idx, m.nidx as usize, 2, 2, 0.0, 0.0, 0.0, true, clear, 3400 as u64, 5 as u64)
+    // from inside the field, looking along a row (near clipping, long triangles)
+    mc_camera.camera_set_pos(&s.cam, 8.5, 5.5, 4.0)
+    mc_camera.camera_set_angles(&s.cam, 200.0, 5.0)
+    scene(&s, "chunk_inside", m.verts, m.nverts as usize, m.idx, m.nidx as usize, 3, 3, 0.0, 0.0, 0.0, true, clear, 3200 as u64, 5 as u64)
+    // far from the world origin: the camera-relative origin keeps the f32 vertices exact
+    mc_camera.camera_set_pos(&s.cam, 1000020.0, 12.0, 0.0 - 2000010.0)
+    mc_camera.camera_set_angles(&s.cam, 10.0, 25.0)
+    scene(&s, "chunk_far", m.verts, m.nverts as usize, m.idx, m.nidx as usize, 2, 2, 1000000.0, 0.0, 0.0 - 2000000.0, false, clear, 3300 as u64, 5 as u64)
+
+    // ---- 7. translucent pass + entity boxes (r94): the scenes of tools/mc/raster/dump.fi, GL against CPU. The entity pass is
+    // drawn with the culling of gl_scene OFF (the CPU has none; HiZ culling is checked separately in tools/gpu/mc).
+    {
+        mc_camera.camera_set_lens(&s.cam, 70.0, 0.05, 512.0)
+        pad_clear_all(pad)
+        var tx: i32 = 0
+        while tx < 14 {
+            var tz: i32 = 0
+            while tz < 14 {
+                pad_set(pad, tx, 0, tz, 4 as u16)
+                pad_set(pad, tx, 1, tz, 4 as u16)
+                tz = tz + 1
+            }
+            tx = tx + 1
+        }
+        tx = 2
+        while tx < 9 {
+            var tz: i32 = 3
+            while tz < 10 {
+                pad_set(pad, tx, 1, tz, 6 as u16)
+                tz = tz + 1
+            }
+            tx = tx + 1
+        }
+        pad_set(pad, 5, 1, 5, 4 as u16)
+        pad_set(pad, 5, 2, 5, 4 as u16)
+        pad_set(pad, 12, 2, 4, 5 as u16)
+        pad_set(pad, 12, 3, 4, 5 as u16)
+        pad_set(pad, 11, 2, 4, 7 as u16)
+        pad_set(pad, 11, 3, 4, 7 as u16)
+        pad_set(pad, 11, 2, 7, 8 as u16)
+        var mt: mc_mesh.Mesher = mc_mesh.mesher_new()
+        mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+        mc_mesh.mesh_padded(&mt, pad, &tb, mc_mesh.F_AO | mc_mesh.F_GREEDY | mc_mesh.F_TRANS)
+        mc_camera.camera_set_pos(&s.cam, 4.0, 5.5, 0.0 - 3.0)
+        mc_camera.camera_set_angles(&s.cam, 0.0 - 15.0, 28.0)
+        let recs: u64 = rt.heap_alloc(8 * mc_backend.ENT_BYTES)
+        scene_t(&s, "water_glass", m.verts, m.nverts as usize, m.idx, m.nidx as usize, mt.verts, mt.nverts as usize, mt.idx,
+            mt.nidx as usize, recs, 0, false, 0.0, 1.0, clear, 3600 as u64, 5 as u64)
+        scene_t(&s, "water_glass_fog", m.verts, m.nverts as usize, m.idx, m.nidx as usize, mt.verts, mt.nverts as usize, mt.idx,
+            mt.nidx as usize, recs, 0, true, 4.0, 26.0, 0xFF96BEE6 as u32, 3800 as u64, 5 as u64)
+        // boxes: floor + pillar, five boxes (yaw, fog, one behind the floor, one cut by the near plane)
+        pad_clear_all(pad)
+        tx = 0
+        while tx < 14 {
+            var tz: i32 = 0
+            while tz < 14 {
+                pad_set(pad, tx, 1, tz, 1 as u16)
+                tz = tz + 1
+            }
+            tx = tx + 1
+        }
+        pad_set(pad, 6, 2, 6, 4 as u16)
+        pad_set(pad, 6, 3, 6, 4 as u16)
+        mc_mesh.mesh_padded(&m, pad, &tb, mc_mesh.F_AO | mc_mesh.F_GREEDY)
+        mc_camera.camera_set_pos(&s.cam, 5.0, 4.2, 0.5)
+        mc_camera.camera_set_angles(&s.cam, 12.0, 20.0)
+        // LOD cross-fade screen-door (v2): the same floor + pillar with set_fade(24, 0) and set_fade(24, 1): GL (gl_FragCoord bayer8
+        // in mc_fs.glsl) must keep the same pixels as mc_raster.bayer8
+        s.fade_a = 24
+        s.fade_inv = 0
+        scene_t(&s, "fade_a", m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0, 0, recs, 0, false, 0.0, 1.0,
+            0xFF96BEE6 as u32, 3800 as u64, 5 as u64)
+        s.fade_inv = 1
+        scene_t(&s, "fade_b", m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0, 0, recs, 0, false, 0.0, 1.0,
+            0xFF96BEE6 as u32, 3800 as u64, 5 as u64)
+        s.fade_a = 64
+        s.fade_inv = 0
+        // ---- 8. vertex light (r105/t3): F_LIGHT meshes with a sky / block light gradient, day factor and block tint through
+        // set_light on both back ends; a roof over the pillar throws a shadow
+        tx = 3
+        while tx < 9 {
+            var tz: i32 = 3
+            while tz < 9 {
+                pad_set(pad, tx, 5, tz, 1 as u16)
+                tz = tz + 1
+            }
+            tx = tx + 1
+        }
+        let lpad: u64 = rt.heap_alloc(5832)
+        fill_light(lpad)
+        mc_mesh.mesh_padded_lit(&m, pad, lpad, &tb, mc_mesh.F_AO | mc_mesh.F_GREEDY | mc_mesh.F_LIGHT)
+        mc_camera.camera_set_pos(&s.cam, 5.0, 4.2, 0.5)
+        mc_camera.camera_set_angles(&s.cam, 12.0, 20.0)
+        s.bc.set_light(s.bc.obj, 256, 256, 224, 176)
+        s.bg.set_light(s.bg.obj, 256, 256, 224, 176)
+        scene_t(&s, "lit_day", m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0, 0, recs, 0, false, 0.0, 1.0, clear,
+            3800 as u64, 5 as u64)
+        s.bc.set_light(s.bc.obj, 70, 256, 200, 120)
+        s.bg.set_light(s.bg.obj, 70, 256, 200, 120)
+        scene_t(&s, "lit_night", m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0, 0, recs, 0, false, 0.0, 1.0, clear,
+            3800 as u64, 5 as u64)
+        scene_t(&s, "lit_night_fog", m.verts, m.nverts as usize, m.idx, m.nidx as usize, 0, 0, 0, 0, recs, 0, true, 8.0, 40.0,
+            0xFF96BEE6 as u32, 3800 as u64, 5 as u64)
+        s.bc.set_light(s.bc.obj, 256, 256, 224, 176)
+        s.bg.set_light(s.bg.obj, 256, 256, 224, 176)
+        rt.heap_free(lpad, 5832)
+    }
+
+    vk_mc.vkbe_close(&s.gb)
+    io.fmt_print(f"scenes done, failed={s.fails}\n")
+
+    // ---- timing: 640 x 360, 5 x 5 sections, CPU raster vs Vulkan (lavapipe, with readback), median of 11
+    var r2: mc_raster.Raster = mc_raster.raster_new(TW, TH)
+    var g2: vk_mc.VkBackend = vk_mc.vkbe_open(TW, TH)
+    if g2.ok {
+        var b1: mc_backend.Backend = mc_backend.backend_cpu(&r2)
+        var b2: mc_backend.Backend = vk_mc.vkbe_backend(&g2)
+        b1.upload_atlas(b1.obj, (&da) as u64)
+        b2.upload_atlas(b2.obj, (&da) as u64)
+        let h1: usize = b1.mesh_upload(b1.obj, 1, m.verts, m.nverts as usize, m.idx, m.nidx as usize)
+        let h2: usize = b2.mesh_upload(b2.obj, 1, m.verts, m.nverts as usize, m.idx, m.nidx as usize)
+        var cam: mc_camera.Camera = mc_camera.camera_new(TW, TH)
+        mc_camera.camera_set_pos(&cam, 40.0, 14.0, 20.0)
+        mc_camera.camera_set_angles(&cam, 0.0, 40.0)
+        mc_camera.camera_update(&cam)
+        var tc: [u64; 32] = [0; 32]
+        var tg: [u64; 32] = [0; 32]
+        var tris: u64 = 0 as u64
+        let nfr: usize = 11
+        var f: usize = 0
+        while f < nfr + 2 {
+            let t0: u64 = time.monotonic_ns()
+            tris = frame(&b1, &cam, clear, h1, 5, 5, 0.0, 0.0, 0.0)
+            let t1: u64 = time.monotonic_ns()
+            frame(&b2, &cam, clear, h2, 5, 5, 0.0, 0.0, 0.0)
+            b2.present(b2.obj)
+            let t2: u64 = time.monotonic_ns()
+            if f >= 2 {
+                tc[f - 2] = (t1 - t0) / 1000 as u64
+                tg[f - 2] = (t2 - t1) / 1000 as u64
+            }
+            f = f + 1
+        }
+        io.print("metric time scene640x360 renderer=")
+        io.print_c(vk_mc.vkbe_device_name(&g2))
+        let mc_us: u64 = median(&tc, nfr)
+        let mg_us: u64 = median(&tg, nfr)
+        io.fmt_print(f" frames={nfr} tris_per_frame={tris} cpu_us={mc_us} vk_readback_us={mg_us}\n")
+        vk_mc.vkbe_close(&g2)
+    } else {
+        io.fmt_print(f"no 640x360 Vulkan context: step={g2.step}\n")
+        s.fails = s.fails + 1
+    }
+    if s.fails > 0 { return 3 }
+    return 0
+}

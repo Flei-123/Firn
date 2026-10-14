@@ -50,7 +50,7 @@ if [ -n "$WINE" ] && "$FIRNC" --target=x86_64-windows -o "$D/p.exe" tests/3100_m
     if WINEPREFIX="$D/wp" WINEDEBUG=-all timeout -s KILL 90 "$WINE" "$D/p.exe" 2>/dev/null | tr -d '\r' | grep -q "vk_life pure ok"; then echo "   ok:   pure test 3100 under Wine"; else echo "   FAIL: pure test under Wine"; fail=1; fi
 fi
 if [ -e lib/mc/vk_mc.fi ]; then
-    echo "   NOTE: lib/mc/vk_mc.fi exists, the 9-scene PSNR harness (derive_scenes) is not wired yet -> use tools/gpu/dump.fi logic, see docs/VK-LIFE.md"
+    bash tools/gpu/vk/vkmc_run.sh "$FIRNC" || fail=1
 else
     echo "   NOTE: lib/mc/vk_mc.fi not on this branch: voxel scene PSNR vs mc_raster not run (vkprobe covers flat + gradient triangles only)"
 fi
