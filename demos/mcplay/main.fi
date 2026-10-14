@@ -21,7 +21,8 @@
 //   log:   MCPLAY_LOG=<file> (stdout+stderr into a file; "-" = never; unset = automatic when there is no console)
 //   sound: MCPLAY_SOUNDS=<dir with bank.json + wavs> (default: <exe dir>/sounds, then $HOME/.cache/mcplay/sounds; made by tools/sounds/gen tools/sounds/mc.json <dir>)
 //          FIRN_AUDIO=file:/x.wav|null|device (default device); MCPLAY_AUDIO=0 off; MCPLAY_VOL_<MASTER|BLOCKS|AMBIENT|PLAYERS|HOSTILE|NEUTRAL|MUSIC|UI>=0..100; M = mute
-//   packs: MC_PACKS / MC_PACK_CONFIG / MC_PACK_AUTO (see docs/mc/resourcepacks.md); T = hot reload, animated tiles tick at 20 Hz
+//   packs: MC_PACKS / MC_PACK_CONFIG / MC_PACK_AUTO (see docs/mc/resourcepacks.md); T = hot reload (atlas + pack sounds), animated tiles tick at 20 Hz
+//          MC_PACK_SOUNDS=synth|original|both (default synth; original/both read sounds.json + OGG of the packs, both = synth bank + pack events on top)
 //   MCPLAY_DIG_MS=700  hold time before the "finish digging" packet in survival (there is no hardness table yet)
 //   MCPLAY_PLACE_ID=0  block state id painted locally on a place click (0 = wait for the server's Block Update)
 //   MCPLAY_RUN_S=0     quit after N seconds (tests)       MCPLAY_SHOT=<file.png>  write the last frame as PNG on exit + print its hash
@@ -62,6 +63,7 @@ import mc.mc_blockset
 import mc.mc_play
 import mc.mc_wlight
 import mc.mc_packs
+import mc.mc_packsnd
 import mc.mc_backend
 import mc.mc_inv
 import mc.mc_effect
@@ -816,7 +818,8 @@ fn handle_window(c: *mut Ctx) {
     }
     if (*c).g.use_res && raw.key_pressed(&(*c).rw, SC_T) {
         var be: mc_backend.Backend = cur_be(c)
-        mc_packs.res_on_key(&(*c).g.res, &be, mc_packs.RES_KEY_RELOAD)
+        let nr: i32 = mc_packs.res_on_key(&(*c).g.res, &be, mc_packs.RES_KEY_RELOAD)
+        if nr >= 0 { audio_packs_reload(c) }
     }
     if raw.key_pressed(&(*c).rw, SC_F11 as u32) {
         (*c).n_f11 = (*c).n_f11 + 1
@@ -1230,14 +1233,39 @@ fn bank_load_dir(c: *mut Ctx, dir: *mut rt.Buf) -> i32 {
     return r
 }
 
-// Opens the sink + bank. false = no sound (the game runs on). Called once the Ctx is in place (the engine must not move).
-fn audio_start(c: *mut Ctx) -> bool {
-    sink.sink_close((*c).snk)
-    *(*c).snk = sink.sink_open("mcplay", AUDIO_RATE, 2 as u32)
-    if !sink.sink_is_open((*c).snk) {
-        io.eprint_line("mcplay: no sound output (no PulseAudio? FIRN_AUDIO=null|file:/x.wav works anywhere) -- running silent")
-        return false
+// Sound source: sounds=synth|original|both of the pack manager (config `sounds=` / MC_PACK_SOUNDS); synth when packs are off.
+fn snd_mode(c: *mut Ctx) -> i32 {
+    if !(*c).g.use_res { return mc_packs.SOUNDS_SYNTH }
+    return mc_packs.res_sounds_mode(&(*c).g.res)
+}
+
+// Pack sounds (sounds.json + OGG of the loaded packs) on top of the bank. Used at start and after every pack hot reload (the bank
+// remembers the OGG hashes, so a reload with unchanged files reuses every sample: no leak). Returns the events made, -1 on error.
+fn audio_packs_apply(c: *mut Ctx, mode: i32) -> i32 {
+    let n: i32 = mc_packsnd.packsnd_apply((*c).ma, (*c).bnk, (*c).eng, &(*c).g.res.stack, mode)
+    if n < 0 {
+        io.eprint_line("mcplay: pack sounds: bank error -- keeping the old sounds")
+    } else {
+        say(f"mcplay: pack sounds mode={mode} events={n} samples={engine.engine_sample_count((*c).eng)}\n")
     }
+    return n
+}
+
+// T key: after the packs were re-read, rebuild the pack sound events (no-op for sounds=synth or without sound).
+// Bank loading needs a stopped audio thread (engine rule): stop, apply (unchanged OGG = same sample, changed = old slot), restart.
+fn audio_packs_reload(c: *mut Ctx) {
+    let mode: i32 = snd_mode(c)
+    if !(*c).aud || mode == mc_packs.SOUNDS_SYNTH { return }
+    if (*c).aud_thread { engine.engine_audio_stop((*c).eng) }
+    audio_packs_apply(c, mode)
+    if (*c).aud_thread {
+        (*c).aud_thread = engine.engine_audio_start((*c).eng, (*c).snk, 1024)
+        if !(*c).aud_thread { io.eprint_line("mcplay: audio thread did not restart after the pack reload -- running silent") }
+    }
+}
+
+// Loads our synth bank (search order below). Returns bank.BANK_OK or an error code.
+fn audio_load_synth(c: *mut Ctx) -> i32 {
     // Search order: MCPLAY_SOUNDS (only that), <exe dir>/sounds (the dist package), then the per-user cache dir.
     var r: i32 = bank.BANK_ERR_FILE
     if env.has("MCPLAY_SOUNDS") {
@@ -1275,6 +1303,33 @@ fn audio_start(c: *mut Ctx) -> bool {
             }
             r = bank_load_dir(c, &dir)
             rt.buf_free(&dir)
+        }
+    }
+    return r
+}
+
+// Opens the sink + bank. false = no sound (the game runs on). Called once the Ctx is in place (the engine must not move).
+fn audio_start(c: *mut Ctx) -> bool {
+    sink.sink_close((*c).snk)
+    *(*c).snk = sink.sink_open("mcplay", AUDIO_RATE, 2 as u32)
+    if !sink.sink_is_open((*c).snk) {
+        io.eprint_line("mcplay: no sound output (no PulseAudio? FIRN_AUDIO=null|file:/x.wav works anywhere) -- running silent")
+        return false
+    }
+    let mode: i32 = snd_mode(c)
+    var r: i32 = bank.BANK_ERR_FILE
+    if mode != mc_packs.SOUNDS_ORIGINAL { r = audio_load_synth(c) }
+    if mode != mc_packs.SOUNDS_SYNTH {
+        let n: i32 = audio_packs_apply(c, mode)
+        if mode == mc_packs.SOUNDS_ORIGINAL {
+            if n > 0 {
+                r = bank.BANK_OK
+            } else {
+                io.eprint_line("mcplay: sounds=original but the packs have no usable sounds -- using the synth bank")
+                r = audio_load_synth(c)
+            }
+        } else if r != bank.BANK_OK && n > 0 {
+            r = bank.BANK_OK
         }
     }
     if r != bank.BANK_OK {

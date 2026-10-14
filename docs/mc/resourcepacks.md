@@ -73,3 +73,11 @@ and the range (`supported_formats` number | [a,b] | {min_inclusive,max_inclusive
 ## Effort (rough)
 Done: block tiles + priority (this). Size classes/upscale default + format table: 0.5 d. Animation: 1-2 d. Models/blockstates: 4-6 d.
 OGG + sound.json + mc_audio modes: 3-4 d. UI + persistence: 1-2 d.
+
+### Pack sounds in mcplay (r165)
+* `MC_PACK_SOUNDS=synth|original|both` (env, overrides the config's `sounds=`; needs packs: `MC_PACKS` / `MC_PACK_CONFIG` / `MC_PACK_AUTO`). Default `synth` = nothing changes.
+* `both`: synth bank first, then the pack events on top (event by event). `original`: only the pack events; without a single usable pack sound mcplay warns and falls back to the synth bank.
+* Start: `audio_start` -> `mc_packsnd.packsnd_apply`. Log line: `mcplay: pack sounds mode=<1|2> events=<n> samples=<engine samples>`.
+* **T (hot reload)** re-reads the packs, then rebuilds the pack sounds. With a device sink the audio thread is stopped around the bank load (engine rule) and restarted;
+  unchanged OGG = same sample (hash), changed OGG = takes over its old slot -> the `samples=` number stays equal. Pack events that vanished stay (small).
+* Test: `tools/mc/play/run_packsnd.sh` (server + Xvfb; both/file with a changed-OGG reload, both/device with PulseAudio null sink, original/file).
