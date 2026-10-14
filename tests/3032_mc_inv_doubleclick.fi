@@ -1,0 +1,166 @@
+// expect_exit: 0
+// mc_inv double click (Click Container mode 6, PICKUP_ALL): with a stack in the hand and an EMPTY clicked slot all equal stacks are collected,
+// first the not-full ones, then the full ones; left button walks up, right button down; the result slot is skipped. Legacy (<= 1.16.5) packets
+// report an empty clicked stack for it, and for a shift click the copy of the stack that was moved (empty when the slot was emptied).
+// Exit codes are 8 bit: the failing check (the first failing protocol).
+import std.rt
+import std.bytes
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_sem
+import mc.mc_schema
+import mc.mc_registry
+import mc.mc_inv
+
+fn it(r: *mut mc_registry.Registry, name: str) -> i32 { return mc_registry.reg_item_by_name(r, name.p as u64, name.n) }
+
+fn layout(ver: *mut mc_version.Version, b: *mut bytes.Bytes) -> bool {
+    let id: i32 = mc_version.version_pid(ver, mc_sem.SEM_PLAY_C2S_WINDOW_CLICK)
+    if id < 0 { return false }
+    let sch: u64 = (*ver).schema_of(mc_version.ST_PLAY, mc_version.DIR_C2S, id)
+    if sch == 0 as u64 { return false }
+    bytes.bytes_set_pos(b, 0)
+    var out: rt.Buf = rt.buf_new()
+    let ok: bool = mc_schema.walk(sch, b, &out)
+    rt.buf_free(&out)
+    return ok
+}
+
+// one click, the packet must parse with the schema of the version; returns the number of changed slots (>= 0, only >= 1.17) or -1 / -2.
+// `tail` gets the length of the packet and the last two bytes (legacy packets end with the clicked stack).
+fn click_t(v: *mut mc_inv.Inv, ver: *mut mc_version.Version, slot: i32, button: i32, mode: i32, len: *mut usize, last: *mut i32, last2: *mut i32) -> i32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    if !mc_inv.inv_click_build(v, (*ver).protocol, slot, button, mode, &b) { return 0 - 1 }
+    let ok: bool = layout(ver, &b)
+    var n: i32 = 0
+    if (*ver).protocol >= 756 { n = bytes.bytes_at(&b, 6) as i32 }
+    *len = bytes.bytes_len(&b)
+    *last = bytes.bytes_at(&b, *len - 1) as i32
+    *last2 = bytes.bytes_at(&b, *len - 2) as i32
+    bytes.bytes_free(&b)
+    if !ok { return 0 - 2 }
+    return n
+}
+
+fn click(v: *mut mc_inv.Inv, ver: *mut mc_version.Version, slot: i32, button: i32, mode: i32) -> i32 {
+    var len: usize = 0
+    var l1: i32 = 0
+    var l2: i32 = 0
+    return click_t(v, ver, slot, button, mode, &len, &l1, &l2)
+}
+
+fn fresh(r: *mut mc_registry.Registry) -> mc_inv.Inv {
+    var v: mc_inv.Inv = mc_inv.inv_new()
+    v.state_id = 5
+    mc_inv.inv_use_registry(&v, r)
+    return v
+}
+
+// puts `count` x `item` in the hand (slot 40 is used as the pick-up place)
+fn hold(v: *mut mc_inv.Inv, ver: *mut mc_version.Version, item: i32, count: i32) -> bool {
+    mc_inv.inv_set(v, 44, item, count)
+    if click(v, ver, 44, 0, 0) < 0 { return false }
+    return mc_inv.inv_cursor_item(v) == item && mc_inv.inv_cursor_count(v) == count
+}
+
+fn check(p: i32) -> i32 {
+    var ver: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(p, &ver) { return 100 }
+    var r: mc_registry.Registry = ver.registry_of()
+    if !mc_registry.registry_ok(&r) { return 101 }
+    let stone: i32 = it(&r, "stone")
+    let dirt: i32 = it(&r, "dirt")
+    let pearl: i32 = it(&r, "ender_pearl")
+    if stone < 0 || dirt < 0 || pearl < 0 { return 102 }
+    var v: mc_inv.Inv = fresh(&r)
+
+    // A: ascending: 10 x20 and 13 x30 are taken whole, the full 11 only in the second pass (4 of it)
+    mc_inv.inv_set(&v, 10, stone, 20)
+    mc_inv.inv_set(&v, 11, stone, 64)
+    mc_inv.inv_set(&v, 12, dirt, 5)
+    mc_inv.inv_set(&v, 13, stone, 30)
+    mc_inv.inv_set(&v, 0, stone, 1)
+    if !hold(&v, &ver, stone, 10) { return 1 }
+    var n: i32 = click(&v, &ver, 20, 0, 6)
+    if n < 0 { return 2 }
+    if mc_inv.inv_cursor_count(&v) != 64 || mc_inv.inv_item(&v, 10) != 0 - 1 || mc_inv.inv_item(&v, 13) != 0 - 1 { return 3 }
+    if mc_inv.inv_count(&v, 11) != 60 || mc_inv.inv_item(&v, 12) != dirt || mc_inv.inv_count(&v, 12) != 5 || mc_inv.inv_count(&v, 0) != 1 { return 4 }
+    if p >= 756 && n != 3 { return 5 } // 10, 11, 13 (44 was emptied by the hold, before)
+    // C: the clicked slot is NOT empty: nothing is collected
+    mc_inv.inv_set(&v, 14, stone, 3)
+    if click(&v, &ver, 11, 0, 6) < 0 || mc_inv.inv_cursor_count(&v) != 64 || mc_inv.inv_count(&v, 14) != 3 { return 6 }
+    mc_inv.inv_free(&v)
+
+    // B: left walks up, right walks down (the order decides which stack stays partial)
+    v = fresh(&r)
+    mc_inv.inv_set(&v, 10, stone, 20)
+    mc_inv.inv_set(&v, 13, stone, 30)
+    if !hold(&v, &ver, stone, 50) { return 10 }
+    if click(&v, &ver, 20, 0, 6) < 0 { return 11 }
+    if mc_inv.inv_cursor_count(&v) != 64 || mc_inv.inv_count(&v, 10) != 6 || mc_inv.inv_count(&v, 13) != 30 { return 12 }
+    mc_inv.inv_free(&v)
+    v = fresh(&r)
+    mc_inv.inv_set(&v, 10, stone, 20)
+    mc_inv.inv_set(&v, 13, stone, 30)
+    if !hold(&v, &ver, stone, 50) { return 13 }
+    if click(&v, &ver, 20, 1, 6) < 0 { return 14 }
+    if mc_inv.inv_cursor_count(&v) != 64 || mc_inv.inv_count(&v, 13) != 16 || mc_inv.inv_count(&v, 10) != 20 { return 15 }
+    mc_inv.inv_free(&v)
+
+    // G: limit 16 (ender pearls): 4 in hand, the full stack waits for the second pass
+    v = fresh(&r)
+    mc_inv.inv_set(&v, 15, pearl, 16)
+    mc_inv.inv_set(&v, 16, pearl, 10)
+    if !hold(&v, &ver, pearl, 4) { return 20 }
+    if click(&v, &ver, 20, 0, 6) < 0 { return 21 }
+    if mc_inv.inv_cursor_count(&v) != 16 || mc_inv.inv_item(&v, 16) != 0 - 1 || mc_inv.inv_count(&v, 15) != 14 { return 22 }
+    mc_inv.inv_free(&v)
+
+    // D: empty hand: nothing happens
+    v = fresh(&r)
+    mc_inv.inv_set(&v, 10, stone, 20)
+    if click(&v, &ver, 20, 0, 6) < 0 || mc_inv.inv_count(&v, 10) != 20 || mc_inv.inv_cursor_item(&v) != 0 - 1 { return 30 }
+    mc_inv.inv_free(&v)
+
+    // legacy packet tail: double click -> empty clicked stack (1 byte 0); shift click: emptied slot -> empty, partial move -> the stack copy
+    if p < 756 {
+        v = fresh(&r)
+        mc_inv.inv_set(&v, 10, stone, 20)
+        if !hold(&v, &ver, stone, 10) { return 40 }
+        var len: usize = 0
+        var l1: i32 = 0
+        var l2: i32 = 0
+        if click_t(&v, &ver, 20, 0, 6, &len, &l1, &l2) < 0 { return 41 }
+        if len != 8 || l1 != 0 { return 42 }
+        mc_inv.inv_set(&v, 12, stone, 40)
+        mc_inv.inv_set(&v, 36, stone, 30)
+        if click_t(&v, &ver, 12, 0, 1, &len, &l1, &l2) < 0 { return 43 }
+        if len != 8 || l1 != 0 { return 44 } // fully moved: nothing left in the slot
+        // hotbar: 8 slots with dirt, one with 60 stone -> 4 merge, 1 is left in slot 12 -> reported as the stack of 5 that was moved
+        v.state_id = 5
+        mc_inv.inv_free(&v)
+        v = fresh(&r)
+        var k: i32 = 36
+        while k < 45 { mc_inv.inv_set(&v, k, dirt, 64); k = k + 1 }
+        mc_inv.inv_set(&v, 40, stone, 60)
+        mc_inv.inv_set(&v, 12, stone, 5)
+        if click_t(&v, &ver, 12, 0, 1, &len, &l1, &l2) < 0 { return 45 }
+        if mc_inv.inv_count(&v, 40) != 64 || mc_inv.inv_count(&v, 12) != 1 { return 46 }
+        if l2 != 5 || l1 != 0 { return 47 } // ... count 5, NBT end tag
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    var r: i32 = check(754)
+    if r != 0 { return r }
+    r = check(763)
+    if r != 0 { return r }
+    r = check(769)
+    if r != 0 { return r }
+    r = check(772)
+    if r != 0 { return r }
+    r = check(775)
+    if r != 0 { return r }
+    return 0
+}

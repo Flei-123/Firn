@@ -109,6 +109,37 @@ a,b=cnt(10),cnt(11)
 print("  server inventory: slot10=%d slot11=%d" % (a,b))
 sys.exit(0 if (a,b)==(15,16) else 1)
 PY
+# ---- shift click + drag + double click (MCPLAY_CLICK_TEST2): 64 + 40 stone and 10 dirt given; the prediction must end up exactly where the server is
+MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CLICK_TEST2=1 MCPLAY_RUN_S=22 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player9 > "$W/ct2.out" 2>&1 &
+PP=$!
+sleep 5
+echo "gamemode survival Player9" >&3; echo "give Player9 stone 64" >&3; echo "give Player9 stone 40" >&3; echo "give Player9 dirt 10" >&3
+sleep 12
+echo "data get entity Player9 Inventory" >&3
+sleep 2
+wait $PP
+C2L=$(grep 'mcplay: clicktest2' "$W/ct2.out" | head -1)
+echo "  $C2L"
+C2BAD=$(grep -o ' bad=[0-9]*' "$W/ct2.out" | head -1 | cut -d= -f2)
+[ "${C2BAD:-1}" -eq 0 ] || { echo "  FAIL  clicks2: inv bad=${C2BAD:-?}"; ERR=1; }
+case "$C2L" in *"x40"*"x10"*"x64"*"s12=0"*"s15=0"*"cursor=-1x0"*) ;; *) echo "  FAIL  clicks2: local result $C2L"; ERR=1;; esac
+INV2=$(grep 'Player9 has the following entity data' "$W/server.log" | tail -1)
+python3 - "$INV2" <<'PY' || ERR=1
+import re,sys
+t=sys.argv[1]
+def slot(n):
+    for m in re.finditer(r'\{[^{}]*Slot: %db[^{}]*\}' % n, t):
+        c=re.search(r'(?:Count: |count: )(\d+)', m.group(0))
+        i=re.search(r'(?:id: |id:)"minecraft:(\w+)"', m.group(0))
+        if c and i: return (i.group(1), int(c.group(1)))
+    return None
+got={n: slot(n) for n in (9,10,11,12,13,14,15,36,37,38)}
+print("  server inventory: " + " ".join("%d=%s" % (n, got[n]) for n in sorted(got)))
+want={9:("stone",40),10:("dirt",10),11:("stone",64)}
+ok=all(got[n]==want[n] for n in want) and all(got[n] is None for n in (12,13,14,15,36,37,38))
+sys.exit(0 if ok else 1)
+PY
 echo stop >&3; sleep 1
 [ $ERR -eq 0 ] && echo "RESULT mc-play-inv: ok" || echo "RESULT mc-play-inv: FAIL"
 exit $ERR
