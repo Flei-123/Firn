@@ -1,0 +1,271 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/align.fi -- photo.align: hierarchical tile alignment of burst frames (HDR+ style).
+//
+//     var pr: align.Pyr = align.pyr_build(&luma_ref)          // once per reference
+//     var pa: align.Pyr = align.pyr_build(&luma_alt)
+//     var fl: align.Flow = align.align_flow(&pr, &pa)
+//     align.flow_at(&fl, x, y, &dx, &dy)                      // alt(x + dx, y + dy) ~ ref(x, y)
+//     align.flow_free(&fl); align.pyr_free(&pr)
+//
+// METHOD. Gaussian-ish pyramid (2x2 box, 4 levels). On every level the reference is cut into 16x16 tiles with
+// stride 8; for every tile the best integer shift of the alternate frame is searched in +-3 pixels around the
+// (doubled) shift of the coarser level, with the sum of squared differences. On the finest level the integer
+// minimum is refined to a sub-pixel position by a parabola through the cost of its neighbours (x and y
+// separately, +-0.5 pixel). The result is one (dx, dy) per tile; `flow_at` interpolates it bilinearly between
+// tile centres, so the per-pixel flow field is smooth (no blocking at tile borders).
+// HONEST: pure scalar code, one thread: 256x192 costs ~0.1 s per frame; a 12 MP frame needs lib/jobs over the
+// tile rows and SIMD in `tile_cost` (not done yet). Rotation / perspective is only followed as far as tiles
+// follow it (translation per tile).
+import std.rt
+import photo.image
+
+export {
+    Pyr, Flow,
+    pyr_build, pyr_free, align_flow, flow_at, flow_free, flow_mean_err, TILE, STRIDE, LEVELS,
+}
+
+const TILE: i32 = 16
+const STRIDE: i32 = 8
+const LEVELS: i32 = 4
+const RADIUS: i32 = 3
+
+struct Pyr {
+    n: i32,
+    l: [image.Image; 5],
+}
+
+struct Flow {
+    tw: i32,
+    th: i32,
+    dx: u64,
+    dy: u64,
+    err: u64,
+}
+
+fn zero_image() -> image.Image {
+    return image.Image { w: 0, h: 0, ch: 0, px: 0 as u64 }
+}
+
+// 2x2 box downsample of a 1 channel image (odd borders clamp).
+fn down2(src: *mut image.Image) -> image.Image {
+    let w: i32 = ((*src).w + 1) / 2
+    let h: i32 = ((*src).h + 1) / 2
+    var d: image.Image = image.img_new(w, h, 1)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let s: f32 = image.img_getc(src, 0, 2 * x, 2 * y) + image.img_getc(src, 0, 2 * x + 1, 2 * y) +
+                         image.img_getc(src, 0, 2 * x, 2 * y + 1) + image.img_getc(src, 0, 2 * x + 1, 2 * y + 1)
+            image.img_set(&d, 0, x, y, s * 0.25f)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return d
+}
+
+// The pyramid of a 1 channel (luma) image; level 0 is a copy.
+fn pyr_build(luma: *mut image.Image) -> Pyr {
+    var p: Pyr = Pyr { n: 1, l: [zero_image(); 5] }
+    p.l[0] = image.img_copy(luma)
+    var i: i32 = 1
+    while i < LEVELS {
+        if p.l[(i - 1) as usize].w < 2 * TILE || p.l[(i - 1) as usize].h < 2 * TILE {
+            break
+        }
+        p.l[i as usize] = down2(&p.l[(i - 1) as usize])
+        p.n = i + 1
+        i = i + 1
+    }
+    return p
+}
+
+fn pyr_free(p: *mut Pyr) {
+    var i: i32 = 0
+    while i < (*p).n {
+        image.img_free(&(*p).l[i as usize])
+        i = i + 1
+    }
+    (*p).n = 0
+}
+
+fn tiles_of(n: i32) -> i32 {
+    if n <= TILE { return 1 }
+    return (n - TILE + STRIDE - 1) / STRIDE + 1
+}
+
+fn flow_new(w: i32, h: i32) -> Flow {
+    let tw: i32 = tiles_of(w)
+    let th: i32 = tiles_of(h)
+    let n: usize = (tw as usize) * (th as usize) * 4
+    return Flow { tw: tw, th: th, dx: rt.heap_alloc(n), dy: rt.heap_alloc(n), err: rt.heap_alloc(n) }
+}
+
+fn flow_free(f: *mut Flow) {
+    let n: usize = ((*f).tw as usize) * ((*f).th as usize) * 4
+    if (*f).dx != 0 as u64 {
+        rt.heap_free((*f).dx, n)
+        rt.heap_free((*f).dy, n)
+        rt.heap_free((*f).err, n)
+        (*f).dx = 0 as u64
+    }
+}
+
+#[inline]
+fn fget(p: u64, i: i32) -> f32 {
+    return *((p + (i as u64) * (4 as u64)) as *mut f32)
+}
+
+#[inline]
+fn fput(p: u64, i: i32, v: f32) {
+    *((p + (i as u64) * (4 as u64)) as *mut f32) = v
+}
+
+// Sum of squared differences between the reference tile at (tx, ty) and the alt tile shifted by (sx, sy).
+fn tile_cost(r: *mut image.Image, a: *mut image.Image, tx: i32, ty: i32, sx: i32, sy: i32) -> f32 {
+    var s: f32 = 0.0f
+    var y: i32 = 0
+    while y < TILE {
+        var x: i32 = 0
+        while x < TILE {
+            let d: f32 = image.img_getc(r, 0, tx + x, ty + y) - image.img_getc(a, 0, tx + x + sx, ty + y + sy)
+            s = s + d * d
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return s
+}
+
+// Tile (i, j) top-left corner on a level of size (w, h): clamped so the last tile ends at the border.
+fn tile_origin(i: i32, n: i32) -> i32 {
+    var t: i32 = i * STRIDE
+    if t + TILE > n { t = n - TILE }
+    if t < 0 { t = 0 }
+    return t
+}
+
+// Interpolated flow at pixel (x, y) of the level the flow was built for.
+fn flow_at(f: *mut Flow, x: f32, y: f32, out_dx: *mut f32, out_dy: *mut f32) {
+    // tile centre of tile i is i * STRIDE + TILE / 2 (the clamped last tile is treated like a regular one)
+    var fx: f32 = (x - (TILE as f32) * 0.5f) / (STRIDE as f32)
+    var fy: f32 = (y - (TILE as f32) * 0.5f) / (STRIDE as f32)
+    if fx < 0.0f { fx = 0.0f }
+    if fy < 0.0f { fy = 0.0f }
+    let mx: f32 = ((*f).tw - 1) as f32
+    let my: f32 = ((*f).th - 1) as f32
+    if fx > mx { fx = mx }
+    if fy > my { fy = my }
+    var i0: i32 = fx as i32
+    var j0: i32 = fy as i32
+    var i1: i32 = i0 + 1
+    var j1: i32 = j0 + 1
+    if i1 >= (*f).tw { i1 = i0 }
+    if j1 >= (*f).th { j1 = j0 }
+    let ax: f32 = fx - (i0 as f32)
+    let ay: f32 = fy - (j0 as f32)
+    let w00: f32 = (1.0f - ax) * (1.0f - ay)
+    let w10: f32 = ax * (1.0f - ay)
+    let w01: f32 = (1.0f - ax) * ay
+    let w11: f32 = ax * ay
+    let k00: i32 = j0 * (*f).tw + i0
+    let k10: i32 = j0 * (*f).tw + i1
+    let k01: i32 = j1 * (*f).tw + i0
+    let k11: i32 = j1 * (*f).tw + i1
+    *out_dx = fget((*f).dx, k00) * w00 + fget((*f).dx, k10) * w10 + fget((*f).dx, k01) * w01 + fget((*f).dx, k11) * w11
+    *out_dy = fget((*f).dy, k00) * w00 + fget((*f).dy, k10) * w10 + fget((*f).dy, k01) * w01 + fget((*f).dy, k11) * w11
+}
+
+fn flow_mean_err(f: *mut Flow) -> f32 {
+    var s: f64 = 0.0
+    let n: i32 = (*f).tw * (*f).th
+    var i: i32 = 0
+    while i < n {
+        s = s + (fget((*f).err, i) as f64)
+        i = i + 1
+    }
+    return (s / (n as f64)) as f32
+}
+
+// Parabola vertex offset from three costs at -1, 0, +1 (0 when degenerate), limited to +-0.5.
+fn vertex(cm: f32, c0: f32, cp: f32) -> f32 {
+    let den: f32 = cm - 2.0f * c0 + cp
+    if den < 1.0e-12f { return 0.0f }
+    return image.fclampf((cm - cp) / (2.0f * den), -0.5f, 0.5f)
+}
+
+// Align `alt` to `ref`: alt(x + dx, y + dy) ~ ref(x, y). Result at the finest level, sub-pixel.
+fn align_flow(r: *mut Pyr, a: *mut Pyr) -> Flow {
+    var levels: i32 = (*r).n
+    if (*a).n < levels { levels = (*a).n }
+    var up: Flow = Flow { tw: 0, th: 0, dx: 0 as u64, dy: 0 as u64, err: 0 as u64 }
+    var have_up: bool = false
+    var lv: i32 = levels - 1
+    while lv >= 0 {
+        let ri: *mut image.Image = &(*r).l[lv as usize]
+        let ai: *mut image.Image = &(*a).l[lv as usize]
+        var fl: Flow = flow_new((*ri).w, (*ri).h)
+        var j: i32 = 0
+        while j < fl.th {
+            let ty: i32 = tile_origin(j, (*ri).h)
+            var i: i32 = 0
+            while i < fl.tw {
+                let tx: i32 = tile_origin(i, (*ri).w)
+                var cx: i32 = 0
+                var cy: i32 = 0
+                if have_up {
+                    var ux: f32 = 0.0f
+                    var uy: f32 = 0.0f
+                    flow_at(&up, ((tx + TILE / 2) as f32) * 0.5f, ((ty + TILE / 2) as f32) * 0.5f, &ux, &uy)
+                    cx = (ux * 2.0f + 100000.5f) as i32 - 100000
+                    cy = (uy * 2.0f + 100000.5f) as i32 - 100000
+                }
+                var best: f32 = 1.0e30f
+                var bx: i32 = 0
+                var by: i32 = 0
+                // the zero shift of this level is always a candidate as well (first frame of a still burst)
+                var sy: i32 = -RADIUS
+                while sy <= RADIUS {
+                    var sx: i32 = -RADIUS
+                    while sx <= RADIUS {
+                        let c: f32 = tile_cost(ri, ai, tx, ty, cx + sx, cy + sy)
+                        // slight preference for small shifts keeps flat tiles still
+                        let bias: f32 = c + 1.0e-6f * (((sx * sx + sy * sy) as f32))
+                        if bias < best {
+                            best = bias
+                            bx = cx + sx
+                            by = cy + sy
+                        }
+                        sx = sx + 1
+                    }
+                    sy = sy + 1
+                }
+                var fx: f32 = bx as f32
+                var fy: f32 = by as f32
+                let c0: f32 = tile_cost(ri, ai, tx, ty, bx, by)
+                if lv == 0 {
+                    let cxm: f32 = tile_cost(ri, ai, tx, ty, bx - 1, by)
+                    let cxp: f32 = tile_cost(ri, ai, tx, ty, bx + 1, by)
+                    let cym: f32 = tile_cost(ri, ai, tx, ty, bx, by - 1)
+                    let cyp: f32 = tile_cost(ri, ai, tx, ty, bx, by + 1)
+                    fx = fx + vertex(cxm, c0, cxp)
+                    fy = fy + vertex(cym, c0, cyp)
+                }
+                let k: i32 = j * fl.tw + i
+                fput(fl.dx, k, fx)
+                fput(fl.dy, k, fy)
+                fput(fl.err, k, c0 / ((TILE * TILE) as f32))
+                i = i + 1
+            }
+            j = j + 1
+        }
+        if have_up {
+            flow_free(&up)
+        }
+        up = fl
+        have_up = true
+        lv = lv - 1
+    }
+    return up
+}

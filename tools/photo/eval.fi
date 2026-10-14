@@ -1,0 +1,121 @@
+// tools/photo/eval.fi -- FirnCam photo core measurement: synthetic burst vs single frame vs ideal.
+// Run through tools/photo/run.sh (works in a temp dir, writes PPMs there). Prints `name value` lines.
+import std.io
+import std.rt
+import photo.image
+import photo.meta
+import photo.noise
+import photo.merge
+import photo.synth
+import photo.pipeline
+
+fn pf(name: str, v: f32) {
+    io.print(name)
+    io.print(" ")
+    io.fmt_print_line(io.fmt_f32(io.fmt_new(), v))
+}
+
+fn disp(im: *mut image.Image) -> image.Image {
+    var d: image.Image = image.img_copy(im)
+    image.img_clamp01(&d)
+    image.img_to_srgb(&d)
+    return d
+}
+
+fn main() -> i32 {
+    let w: i32 = 256
+    let h: i32 = 192
+    var scene: image.Image = image.scene_make(w, h)
+    let ts: f32 = 2.0e-3f
+    let to: f32 = 2.0e-5f
+    var rng: image.Rng = image.rng_new(11 as u64)
+    var m: meta.SensorMeta = meta.meta_default()
+    meta.meta_set_noise(&m, 0, ts, to)
+    meta.meta_set_noise(&m, 1, ts, to)
+    meta.meta_set_noise(&m, 2, ts, to)
+    meta.meta_set_noise(&m, 3, ts, to)
+    var mu: meta.SensorMeta = meta.meta_default()      // no metadata: noise is measured
+    var o: pipeline.PipeOpts = pipeline.opts_default()
+
+    // ideal: the pipeline on the noise free HDR scene
+    var ideal: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&ideal)
+    pipeline.process_single_linear(&scene, &m, &o, &ideal)
+
+    // bursts
+    var b8: merge.Burst = merge.burst_new()
+    synth.synth_burst(&scene, 8, 1.0f, ts, to, 3.0f, &rng, &b8)
+    var bb: merge.Burst = merge.burst_new()
+    var r2: image.Rng = image.rng_new(11 as u64)
+    synth.synth_burst(&scene, 8, 1.0f, ts, to, 3.0f, &r2, &bb)
+    merge.burst_add(&bb, synth.synth_frame(&scene, 1.5f, -1.0f, 0.25f, ts, to, &r2), 0.25f)
+
+    // stage metrics in display space against the clamped truth
+    var truth: image.Image = image.img_copy(&scene)
+    image.img_clamp01(&truth)
+    var tdisp: image.Image = disp(&truth)
+    var sdisp: image.Image = disp(&b8.frames[0])
+    pf("stage_single_psnr", image.psnr(&sdisp, &tdisp, 1.0f))
+    pf("stage_single_ssim", image.ssim(&sdisp, &tdisp, 1.0f))
+    var nm: noise.NoiseModel = noise.from_meta(&m)
+    var mg: image.Image = image.img_new(1, 1, 3)
+    var vp: image.Image = image.img_new(1, 1, 1)
+    var ws: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&mg)
+    image.img_free(&vp)
+    image.img_free(&ws)
+    merge.merge_burst(&b8, 0, &nm, &mg, &vp, &ws)
+    var mdisp: image.Image = disp(&mg)
+    pf("stage_merge8_psnr", image.psnr(&mdisp, &tdisp, 1.0f))
+    pf("stage_merge8_ssim", image.ssim(&mdisp, &tdisp, 1.0f))
+    pf("mean_weight_sum", image.img_mean(&ws, 0))
+    var est: noise.NoiseModel = noise.estimate_model(&b8.frames[0])
+    pf("noise_true_S", ts)
+    pf("noise_est_S_g", est.s[1])
+    pf("noise_true_O", to)
+    pf("noise_est_O_g", est.o[1])
+
+    // full pipeline vs ideal (display space)
+    var o1: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&o1)
+    pipeline.process_single_linear(&b8.frames[0], &m, &o, &o1)
+    var o8: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&o8)
+    pipeline.process_burst(&b8, &m, &o, &o8)
+    var o9: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&o9)
+    pipeline.process_burst(&bb, &m, &o, &o9)
+    var oe: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&oe)
+    pipeline.process_burst(&b8, &mu, &o, &oe)
+    var oj: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&oj)
+    var rgba: u64 = rt.heap_alloc((w * h * 4) as usize)
+    var sd2: image.Image = disp(&b8.frames[0])
+    image.img_to_rgba8(&sd2, rgba)
+    pipeline.process_rgba8(rgba, w, h, &o, &oj)
+
+    pf("final_single_psnr", image.psnr(&o1, &ideal, 1.0f))
+    pf("final_single_ssim", image.ssim(&o1, &ideal, 1.0f))
+    pf("final_burst8_psnr", image.psnr(&o8, &ideal, 1.0f))
+    pf("final_burst8_ssim", image.ssim(&o8, &ideal, 1.0f))
+    pf("final_burst8_bracket_psnr", image.psnr(&o9, &ideal, 1.0f))
+    pf("final_burst8_bracket_ssim", image.ssim(&o9, &ideal, 1.0f))
+    pf("final_burst8_nometa_psnr", image.psnr(&oe, &ideal, 1.0f))
+    pf("final_jpeg_only_psnr", image.psnr(&oj, &ideal, 1.0f))
+    pf("sigma_single_in", image.noise_sigma(&b8.frames[0], 1))
+    pf("sigma_ideal_out", image.noise_sigma(&ideal, 1))
+    pf("sigma_single_out", image.noise_sigma(&o1, 1))
+    pf("sigma_burst8_out", image.noise_sigma(&o8, 1))
+    pf("sharp_ideal", image.sharpness(&ideal, 1))
+    pf("sharp_burst8", image.sharpness(&o8, 1))
+    pf("sharp_single", image.sharpness(&o1, 1))
+
+    image.img_write_ppm(&tdisp, "truth.ppm")
+    image.img_write_ppm(&sdisp, "single_raw.ppm")
+    image.img_write_ppm(&ideal, "ideal_final.ppm")
+    image.img_write_ppm(&o1, "single_final.ppm")
+    image.img_write_ppm(&o8, "burst8_final.ppm")
+    image.img_write_ppm(&o9, "burst8_bracket_final.ppm")
+    return 0
+}

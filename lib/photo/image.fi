@@ -1,0 +1,741 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/image.fi -- photo.image: the float image of the photo pipeline (FirnCam).
+//
+//     import photo.image
+//
+//     var im: image.Image = image.img_new(640, 480, 3)     // planar f32, zeroed
+//     image.img_set(&im, 0, 10, 20, 0.5f)                   // channel, x, y, value
+//     let v: f32 = image.img_get(&im, 0, 10, 20)
+//     image.img_free(&im)
+//
+// LAYOUT: planar. Channel `c` starts at `px + c * w * h * 4`, row-major, f32. Colour images have 3 channels
+// (R, G, B), single-plane images (luma, masks, RAW mosaics) have 1. Values are LINEAR light in 0..1 unless a
+// function says "display" (sRGB-encoded). Also here: sRGB transfer functions, RGBA8/YUV/Bayer converters,
+// a PPM writer, a deterministic random generator and the measurements (PSNR, SSIM, noise sigma) that the tests use.
+import std.rt
+import std.fs
+import std.math
+
+export {
+    Image, Rng,
+    img_new, img_free, img_plane, img_get, img_set, img_getc, img_sample, img_copy, img_fill, img_same_size,
+    img_from_rgba8, img_to_rgba8, img_from_yuv420, img_demosaic, img_to_srgb, img_from_srgb,
+    img_luma, img_write_ppm, img_clamp01, img_mean,
+    srgb_encode, srgb_decode, expneg,
+    rng_new, rng_next, rng_uniform, rng_gauss,
+    psnr, ssim, noise_sigma, sharpness, fclampf, fminf, fmaxf, sqrtf,
+    scene_make, shift_image,
+}
+
+struct Image {
+    w: i32,
+    h: i32,
+    ch: i32,
+    px: u64,
+}
+
+fn sqrtf(x: f32) -> f32 {
+    if x <= 0.0f { return 0.0f }
+    return math.sqrt32(x)
+}
+
+fn fminf(a: f32, b: f32) -> f32 {
+    if a < b { return a }
+    return b
+}
+
+fn fmaxf(a: f32, b: f32) -> f32 {
+    if a > b { return a }
+    return b
+}
+
+fn fclampf(x: f32, lo: f32, hi: f32) -> f32 {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// exp(-t) for t >= 0 as (1 - t/16)^16: cheap, smooth, exact enough for weights (error < 2 % for t < 4).
+fn expneg(t: f32) -> f32 {
+    if t >= 15.0f { return 0.0f }
+    var a: f32 = 1.0f - t * 0.0625f
+    a = a * a
+    a = a * a
+    a = a * a
+    a = a * a
+    return a
+}
+
+fn img_new(w: i32, h: i32, ch: i32) -> Image {
+    let n: usize = (w as usize) * (h as usize) * (ch as usize) * 4
+    return Image { w: w, h: h, ch: ch, px: rt.heap_alloc(n) }
+}
+
+fn img_free(im: *mut Image) {
+    if (*im).px != 0 as u64 {
+        rt.heap_free((*im).px, ((*im).w as usize) * ((*im).h as usize) * ((*im).ch as usize) * 4)
+        (*im).px = 0 as u64
+    }
+}
+
+fn img_same_size(a: *mut Image, b: *mut Image) -> bool {
+    return (*a).w == (*b).w && (*a).h == (*b).h
+}
+
+#[inline]
+fn img_plane(im: *mut Image, c: i32) -> u64 {
+    return (*im).px + (c as u64) * ((*im).w as u64) * ((*im).h as u64) * (4 as u64)
+}
+
+#[inline]
+fn img_get(im: *mut Image, c: i32, x: i32, y: i32) -> f32 {
+    return *(((*im).px + (((c * (*im).h + y) * (*im).w + x) as u64) * (4 as u64)) as *mut f32)
+}
+
+#[inline]
+fn img_set(im: *mut Image, c: i32, x: i32, y: i32, v: f32) {
+    *(((*im).px + (((c * (*im).h + y) * (*im).w + x) as u64) * (4 as u64)) as *mut f32) = v
+}
+
+// Read with the coordinates clamped to the border.
+#[inline]
+fn img_getc(im: *mut Image, c: i32, x: i32, y: i32) -> f32 {
+    var xx: i32 = x
+    var yy: i32 = y
+    if xx < 0 { xx = 0 }
+    if yy < 0 { yy = 0 }
+    if xx >= (*im).w { xx = (*im).w - 1 }
+    if yy >= (*im).h { yy = (*im).h - 1 }
+    return img_get(im, c, xx, yy)
+}
+
+// Bilinear sample at a real position (pixel centres at integer coordinates), border clamped.
+fn img_sample(im: *mut Image, c: i32, x: f32, y: f32) -> f32 {
+    var fx: f32 = x
+    var fy: f32 = y
+    if fx < 0.0f { fx = 0.0f }
+    if fy < 0.0f { fy = 0.0f }
+    let mx: f32 = ((*im).w - 1) as f32
+    let my: f32 = ((*im).h - 1) as f32
+    if fx > mx { fx = mx }
+    if fy > my { fy = my }
+    var x0: i32 = fx as i32
+    var y0: i32 = fy as i32
+    if x0 > (*im).w - 2 { x0 = (*im).w - 2 }
+    if y0 > (*im).h - 2 { y0 = (*im).h - 2 }
+    if x0 < 0 { x0 = 0 }
+    if y0 < 0 { y0 = 0 }
+    let ax: f32 = fx - (x0 as f32)
+    let ay: f32 = fy - (y0 as f32)
+    var x1: i32 = x0 + 1
+    var y1: i32 = y0 + 1
+    if x1 >= (*im).w { x1 = x0 }
+    if y1 >= (*im).h { y1 = y0 }
+    let a: f32 = img_get(im, c, x0, y0) * (1.0f - ax) + img_get(im, c, x1, y0) * ax
+    let b: f32 = img_get(im, c, x0, y1) * (1.0f - ax) + img_get(im, c, x1, y1) * ax
+    return a * (1.0f - ay) + b * ay
+}
+
+fn img_copy(src: *mut Image) -> Image {
+    var d: Image = img_new((*src).w, (*src).h, (*src).ch)
+    rt.mem_copy(d.px, (*src).px, ((*src).w as usize) * ((*src).h as usize) * ((*src).ch as usize) * 4)
+    return d
+}
+
+fn img_fill(im: *mut Image, v: f32) {
+    let n: i32 = (*im).w * (*im).h * (*im).ch
+    var i: i32 = 0
+    while i < n {
+        *(((*im).px + (i as u64) * (4 as u64)) as *mut f32) = v
+        i = i + 1
+    }
+}
+
+fn img_clamp01(im: *mut Image) {
+    let n: i32 = (*im).w * (*im).h * (*im).ch
+    var i: i32 = 0
+    while i < n {
+        let p: *mut f32 = ((*im).px + (i as u64) * (4 as u64)) as *mut f32
+        *p = fclampf(*p, 0.0f, 1.0f)
+        i = i + 1
+    }
+}
+
+fn img_mean(im: *mut Image, c: i32) -> f32 {
+    var s: f64 = 0.0
+    let n: i32 = (*im).w * (*im).h
+    var i: i32 = 0
+    let base: u64 = img_plane(im, c)
+    while i < n {
+        s = s + (*((base + (i as u64) * (4 as u64)) as *mut f32)) as f64
+        i = i + 1
+    }
+    return (s / (n as f64)) as f32
+}
+
+// ---------------------------------------------------------------- sRGB transfer
+
+fn srgb_encode(x: f32) -> f32 {
+    if x <= 0.0f { return 0.0f }
+    if x >= 1.0f { return 1.0f }
+    if x <= 0.0031308f { return 12.92f * x }
+    return (1.055 * math.powf(x as f64, 0.4166666666666667) - 0.055) as f32
+}
+
+fn srgb_decode(y: f32) -> f32 {
+    if y <= 0.0f { return 0.0f }
+    if y >= 1.0f { return 1.0f }
+    if y <= 0.04045f { return y / 12.92f }
+    return math.powf((y as f64 + 0.055) / 1.055, 2.4) as f32
+}
+
+fn img_to_srgb(im: *mut Image) {
+    let n: i32 = (*im).w * (*im).h * (*im).ch
+    var i: i32 = 0
+    while i < n {
+        let p: *mut f32 = ((*im).px + (i as u64) * (4 as u64)) as *mut f32
+        *p = srgb_encode(*p)
+        i = i + 1
+    }
+}
+
+fn img_from_srgb(im: *mut Image) {
+    let n: i32 = (*im).w * (*im).h * (*im).ch
+    var i: i32 = 0
+    while i < n {
+        let p: *mut f32 = ((*im).px + (i as u64) * (4 as u64)) as *mut f32
+        *p = srgb_decode(*p)
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------- converters
+
+// RGBA8 octets (display-encoded, row 0 at the top, as lib/jpeg and lib/webp give them) -> 3 channel float image
+// in 0..1 (still sRGB-encoded; call img_from_srgb for linear light).
+fn img_from_rgba8(p: u64, w: i32, h: i32) -> Image {
+    var d: Image = img_new(w, h, 3)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let q: u64 = p + (((y * w + x) * 4) as u64)
+            var c: i32 = 0
+            while c < 3 {
+                img_set(&d, c, x, y, ((*((q + (c as u64)) as *mut u8)) as f32) / 255.0f)
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return d
+}
+
+// 3 channel 0..1 image -> RGBA8 (alpha 255) into `out` (w*h*4 octets). Rounds to nearest.
+fn img_to_rgba8(im: *mut Image, out: u64) {
+    var y: i32 = 0
+    while y < (*im).h {
+        var x: i32 = 0
+        while x < (*im).w {
+            let q: u64 = out + (((y * (*im).w + x) * 4) as u64)
+            var c: i32 = 0
+            while c < 3 {
+                let v: f32 = fclampf(img_get(im, c, x, y), 0.0f, 1.0f) * 255.0f + 0.5f
+                *((q + (c as u64)) as *mut u8) = (v as i32) as u8
+                c = c + 1
+            }
+            *((q + 3 as u64) as *mut u8) = 255 as u8
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// YUV 4:2:0 (planar Y, then U, then V, full-range BT.601 as Camera2 YUV_420_888 delivers it; strides in
+// octets) -> 3 channel float image in 0..1 (display-encoded RGB).
+fn img_from_yuv420(yp: u64, ystride: i32, up: u64, vp: u64, cstride: i32, w: i32, h: i32) -> Image {
+    var d: Image = img_new(w, h, 3)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let yy: f32 = ((*((yp + ((y * ystride + x) as u64)) as *mut u8)) as f32) / 255.0f
+            let cu: f32 = (((*((up + (((y / 2) * cstride + x / 2) as u64)) as *mut u8)) as f32) - 128.0f) / 255.0f
+            let cv: f32 = (((*((vp + (((y / 2) * cstride + x / 2) as u64)) as *mut u8)) as f32) - 128.0f) / 255.0f
+            img_set(&d, 0, x, y, fclampf(yy + 1.402f * cv, 0.0f, 1.0f))
+            img_set(&d, 1, x, y, fclampf(yy - 0.344136f * cu - 0.714136f * cv, 0.0f, 1.0f))
+            img_set(&d, 2, x, y, fclampf(yy + 1.772f * cu, 0.0f, 1.0f))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return d
+}
+
+// Bilinear demosaic of a 1-channel Bayer mosaic (already normalised: black level removed, white level = 1.0)
+// to 3 channels. `cfa` as in photo.meta (0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR; other values: the mosaic is copied
+// to all channels). The `site` of a pixel is (y & 1) * 2 + (x & 1).
+fn img_demosaic(mosaic: *mut Image, cfa: u32) -> Image {
+    let w: i32 = (*mosaic).w
+    let h: i32 = (*mosaic).h
+    var d: Image = img_new(w, h, 3)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            if cfa > 3 as u32 {
+                let v: f32 = img_get(mosaic, 0, x, y)
+                img_set(&d, 0, x, y, v)
+                img_set(&d, 1, x, y, v)
+                img_set(&d, 2, x, y, v)
+                x = x + 1
+                continue
+            }
+            let site: u32 = (((y & 1) * 2 + (x & 1))) as u32
+            var col: u32 = 1 as u32
+            if cfa == 0 as u32 {
+                if site == 0 as u32 { col = 0 as u32 }
+                if site == 3 as u32 { col = 2 as u32 }
+            } else if cfa == 1 as u32 {
+                if site == 1 as u32 { col = 0 as u32 }
+                if site == 2 as u32 { col = 2 as u32 }
+            } else if cfa == 2 as u32 {
+                if site == 2 as u32 { col = 0 as u32 }
+                if site == 1 as u32 { col = 2 as u32 }
+            } else {
+                if site == 3 as u32 { col = 0 as u32 }
+                if site == 0 as u32 { col = 2 as u32 }
+            }
+            var c: i32 = 0
+            while c < 3 {
+                var v: f32 = 0.0f
+                if (c as u32) == col {
+                    v = img_get(mosaic, 0, x, y)
+                } else {
+                    // average the nearest sites of colour c in the 3x3 neighbourhood
+                    var sum: f32 = 0.0f
+                    var cnt: f32 = 0.0f
+                    var dy: i32 = -1
+                    while dy <= 1 {
+                        var dx: i32 = -1
+                        while dx <= 1 {
+                            let xx: i32 = x + dx
+                            let yy: i32 = y + dy
+                            if xx >= 0 && yy >= 0 && xx < w && yy < h {
+                                let s2: u32 = (((yy & 1) * 2 + (xx & 1))) as u32
+                                var c2: u32 = 1 as u32
+                                if cfa == 0 as u32 {
+                                    if s2 == 0 as u32 { c2 = 0 as u32 }
+                                    if s2 == 3 as u32 { c2 = 2 as u32 }
+                                } else if cfa == 1 as u32 {
+                                    if s2 == 1 as u32 { c2 = 0 as u32 }
+                                    if s2 == 2 as u32 { c2 = 2 as u32 }
+                                } else if cfa == 2 as u32 {
+                                    if s2 == 2 as u32 { c2 = 0 as u32 }
+                                    if s2 == 1 as u32 { c2 = 2 as u32 }
+                                } else {
+                                    if s2 == 3 as u32 { c2 = 0 as u32 }
+                                    if s2 == 0 as u32 { c2 = 2 as u32 }
+                                }
+                                if c2 == (c as u32) {
+                                    sum = sum + img_get(mosaic, 0, xx, yy)
+                                    cnt = cnt + 1.0f
+                                }
+                            }
+                            dx = dx + 1
+                        }
+                        dy = dy + 1
+                    }
+                    if cnt > 0.0f { v = sum / cnt }
+                }
+                img_set(&d, c, x, y, v)
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return d
+}
+
+// Rec.709 luma of a 3 channel image (1 channel result; 1 channel input is copied).
+fn img_luma(im: *mut Image) -> Image {
+    var d: Image = img_new((*im).w, (*im).h, 1)
+    var y: i32 = 0
+    while y < (*im).h {
+        var x: i32 = 0
+        while x < (*im).w {
+            if (*im).ch >= 3 {
+                img_set(&d, 0, x, y, 0.2126f * img_get(im, 0, x, y) + 0.7152f * img_get(im, 1, x, y) + 0.0722f * img_get(im, 2, x, y))
+            } else {
+                img_set(&d, 0, x, y, img_get(im, 0, x, y))
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return d
+}
+
+// Binary PPM (P6) of a 3 channel DISPLAY image (already sRGB-encoded, 0..1). Returns false on I/O failure.
+fn img_write_ppm(im: *mut Image, path: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push(&b, 80 as u8)
+    rt.buf_push(&b, 54 as u8)
+    rt.buf_push(&b, 10 as u8)
+    rt.buf_push_dec_i64(&b, (*im).w as i64)
+    rt.buf_push(&b, 32 as u8)
+    rt.buf_push_dec_i64(&b, (*im).h as i64)
+    rt.buf_push(&b, 10 as u8)
+    rt.buf_push(&b, 50 as u8)
+    rt.buf_push(&b, 53 as u8)
+    rt.buf_push(&b, 53 as u8)
+    rt.buf_push(&b, 10 as u8)
+    var y: i32 = 0
+    while y < (*im).h {
+        var x: i32 = 0
+        while x < (*im).w {
+            var c: i32 = 0
+            while c < 3 {
+                var cc: i32 = c
+                if (*im).ch < 3 { cc = 0 }
+                let v: f32 = fclampf(img_get(im, cc, x, y), 0.0f, 1.0f) * 255.0f + 0.5f
+                rt.buf_push(&b, ((v as i32) as u8))
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let r: usize = fs.write_file(path, rt.buf_ptr(&b), rt.buf_len(&b)) catch 0
+    let ok: bool = r == rt.buf_len(&b)
+    rt.buf_free(&b)
+    return ok
+}
+
+// ---------------------------------------------------------------- random
+
+struct Rng {
+    s: u64,
+    spare: f32,
+    has_spare: bool,
+}
+
+fn rng_new(seed: u64) -> Rng {
+    var r: Rng = Rng { s: (seed ^ (11400714819323198485 as u64)) | (1 as u64), spare: 0.0f, has_spare: false }
+    var i: i32 = 0
+    while i < 8 {
+        rng_next(&r)
+        i = i + 1
+    }
+    return r
+}
+
+fn rng_next(r: *mut Rng) -> u64 {
+    var x: u64 = (*r).s
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    (*r).s = x
+    return x
+}
+
+// Uniform in [0, 1).
+fn rng_uniform(r: *mut Rng) -> f32 {
+    return (((rng_next(r) >> 40) as i32) as f32) / 16777216.0f
+}
+
+// Standard normal (Box-Muller on f64 maths, same stream on every target).
+fn rng_gauss(r: *mut Rng) -> f32 {
+    if (*r).has_spare {
+        (*r).has_spare = false
+        return (*r).spare
+    }
+    var u1: f64 = (rng_uniform(r) as f64)
+    if u1 < 1.0e-7 { u1 = 1.0e-7 }
+    let u2: f64 = (rng_uniform(r) as f64)
+    let m: f64 = math.sqrt(-2.0 * math.ln(u1))
+    let a: f64 = 6.283185307179586 * u2
+    (*r).spare = (m * math.sin(a)) as f32
+    (*r).has_spare = true
+    return (m * math.cos(a)) as f32
+}
+
+// ---------------------------------------------------------------- measurements
+
+// PSNR in dB over all channels, peak value `peak` (1.0 for 0..1 images). 99 for identical images.
+fn psnr(a: *mut Image, b: *mut Image, peak: f32) -> f32 {
+    var s: f64 = 0.0
+    let n: i32 = (*a).w * (*a).h * (*a).ch
+    var i: i32 = 0
+    while i < n {
+        let d: f64 = (*(((*a).px + (i as u64) * (4 as u64)) as *mut f32) - *(((*b).px + (i as u64) * (4 as u64)) as *mut f32)) as f64
+        s = s + d * d
+        i = i + 1
+    }
+    let mse: f64 = s / (n as f64)
+    if mse < 1.0e-12 { return 99.0f }
+    return (10.0 * math.log10((peak as f64) * (peak as f64) / mse)) as f32
+}
+
+// Sums of one 7x7 window (a, b, a*a, b*b, a*b) of channel c into out[0..5].
+fn win_sums(a: *mut Image, b: *mut Image, c: i32, x: i32, y: i32, out: *mut f64) {
+    var sa: f64 = 0.0
+    var sb: f64 = 0.0
+    var saa: f64 = 0.0
+    var sbb: f64 = 0.0
+    var sab: f64 = 0.0
+    var dy: i32 = -3
+    while dy <= 3 {
+        var dx: i32 = -3
+        while dx <= 3 {
+            let va: f64 = img_get(a, c, x + dx, y + dy) as f64
+            let vb: f64 = img_get(b, c, x + dx, y + dy) as f64
+            sa = sa + va
+            sb = sb + vb
+            saa = saa + va * va
+            sbb = sbb + vb * vb
+            sab = sab + va * vb
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+    *out = sa
+    *((out as u64 + 8 as u64) as *mut f64) = sb
+    *((out as u64 + 16 as u64) as *mut f64) = saa
+    *((out as u64 + 24 as u64) as *mut f64) = sbb
+    *((out as u64 + 32 as u64) as *mut f64) = sab
+}
+
+// Structural similarity, scikit-image defaults for one channel: 7x7 uniform window, sample covariance,
+// K1 0.01, K2 0.03, valid region only (3 pixel border dropped), mean over the channels. `range` = data range.
+fn ssim(a: *mut Image, b: *mut Image, range: f32) -> f32 {
+    let w: i32 = (*a).w
+    let h: i32 = (*a).h
+    let c1: f64 = (0.01 * (range as f64)) * (0.01 * (range as f64))
+    let c2: f64 = (0.03 * (range as f64)) * (0.03 * (range as f64))
+    var total: f64 = 0.0
+    var cnt: f64 = 0.0
+    var sums: [f64; 5] = [0.0; 5]
+    var c: i32 = 0
+    while c < (*a).ch {
+        var y: i32 = 3
+        while y < h - 3 {
+            var x: i32 = 3
+            while x < w - 3 {
+                win_sums(a, b, c, x, y, &sums[0])
+                let np: f64 = 49.0
+                let ma: f64 = sums[0] / np
+                let mb: f64 = sums[1] / np
+                let cf: f64 = np / (np - 1.0)
+                let va2: f64 = cf * (sums[2] / np - ma * ma)
+                let vb2: f64 = cf * (sums[3] / np - mb * mb)
+                let vab: f64 = cf * (sums[4] / np - ma * mb)
+                total = total + ((2.0 * ma * mb + c1) * (2.0 * vab + c2)) / ((ma * ma + mb * mb + c1) * (va2 + vb2 + c2))
+                cnt = cnt + 1.0
+                x = x + 1
+            }
+            y = y + 1
+        }
+        c = c + 1
+    }
+    return (total / cnt) as f32
+}
+
+// Immerkaer's fast noise sigma estimate of one channel (robust against image structure, in the unit of the data).
+fn noise_sigma(im: *mut Image, c: i32) -> f32 {
+    var s: f64 = 0.0
+    var y: i32 = 1
+    while y < (*im).h - 1 {
+        var x: i32 = 1
+        while x < (*im).w - 1 {
+            let v: f32 = img_get(im, c, x - 1, y - 1) - 2.0f * img_get(im, c, x, y - 1) + img_get(im, c, x + 1, y - 1)
+                - 2.0f * img_get(im, c, x - 1, y) + 4.0f * img_get(im, c, x, y) - 2.0f * img_get(im, c, x + 1, y)
+                + img_get(im, c, x - 1, y + 1) - 2.0f * img_get(im, c, x, y + 1) + img_get(im, c, x + 1, y + 1)
+            if v < 0.0f { s = s - (v as f64) } else { s = s + (v as f64) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let n: f64 = (((*im).w - 2) as f64) * (((*im).h - 2) as f64)
+    return (1.2533141373155003 / 6.0 * s / n) as f32
+}
+
+// Sharpness measure: variance of the 4-neighbour Laplacian of channel 0 (or luma) -- higher = sharper.
+fn sharpness(im: *mut Image, c: i32) -> f32 {
+    var s: f64 = 0.0
+    var s2: f64 = 0.0
+    var n: f64 = 0.0
+    var y: i32 = 1
+    while y < (*im).h - 1 {
+        var x: i32 = 1
+        while x < (*im).w - 1 {
+            let l: f64 = (img_get(im, c, x - 1, y) + img_get(im, c, x + 1, y) + img_get(im, c, x, y - 1) + img_get(im, c, x, y + 1) - 4.0f * img_get(im, c, x, y)) as f64
+            s = s + l
+            s2 = s2 + l * l
+            n = n + 1.0
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let m: f64 = s / n
+    return (s2 / n - m * m) as f32
+}
+
+// ---------------------------------------------------------------- synthetic test scenes
+
+fn hash2(x: i32, y: i32, seed: i32) -> f32 {
+    var h: u64 = ((x as u64) & (65535 as u64)) * (374761393 as u64) + ((y as u64) & (65535 as u64)) * (668265263 as u64) + ((seed as u64) & (65535 as u64)) * (144665 as u64)
+    h = (h ^ (h >> 13)) & (4294967295 as u64)
+    h = (h * (1274126177 as u64)) & (4294967295 as u64)
+    h = h ^ (h >> 16)
+    return ((h & (65535 as u64)) as f32) / 65535.0f
+}
+
+fn vnoise(x: f32, y: f32, seed: i32) -> f32 {
+    let xi: i32 = x as i32
+    let yi: i32 = y as i32
+    let fx: f32 = x - (xi as f32)
+    let fy: f32 = y - (yi as f32)
+    let sx: f32 = fx * fx * (3.0f - 2.0f * fx)
+    let sy: f32 = fy * fy * (3.0f - 2.0f * fy)
+    let a: f32 = hash2(xi, yi, seed) * (1.0f - sx) + hash2(xi + 1, yi, seed) * sx
+    let b: f32 = hash2(xi, yi + 1, seed) * (1.0f - sx) + hash2(xi + 1, yi + 1, seed) * sx
+    return a * (1.0f - sy) + b * sy
+}
+
+// A procedural scene in LINEAR light with a high dynamic range (0.003 .. 2.0): sky gradient with a bright sun
+// (radiance 2.0, clips at 1.0 in a normal exposure), a dark shadowed foreground, coloured discs with soft
+// edges, a resolution test fan (fine stripes) and a textured wall. Deterministic, no files needed.
+fn scene_make(w: i32, h: i32) -> Image {
+    var d: Image = img_new(w, h, 3)
+    let fw: f32 = w as f32
+    let fh: f32 = h as f32
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let u: f32 = (x as f32) / fw
+            let v: f32 = (y as f32) / fh
+            var r: f32 = 0.0f
+            var g: f32 = 0.0f
+            var b: f32 = 0.0f
+            if v < 0.55f {
+                // sky
+                r = 0.18f + 0.25f * v
+                g = 0.32f + 0.2f * v
+                b = 0.75f - 0.2f * v
+                // sun
+                let dx: f32 = u - 0.78f
+                let dy: f32 = v - 0.18f
+                let dd: f32 = dx * dx + dy * dy
+                if dd < 0.004f {
+                    let t: f32 = 1.0f - dd / 0.004f
+                    r = r + 1.8f * t
+                    g = g + 1.7f * t
+                    b = b + 1.4f * t
+                }
+            } else {
+                // ground in shadow with a dim texture
+                let t: f32 = vnoise((x as f32) * 0.35f, (y as f32) * 0.35f, 5)
+                let t2: f32 = vnoise((x as f32) * 0.08f, (y as f32) * 0.08f, 9)
+                r = 0.012f + 0.03f * t2 + 0.015f * t
+                g = 0.010f + 0.025f * t2 + 0.012f * t
+                b = 0.008f + 0.02f * t2 + 0.01f * t
+            }
+            // stripes fan (resolution target) lower left
+            if u < 0.30f && v > 0.58f && v < 0.95f {
+                let ang: f32 = (u - 0.02f) * 90.0f + (v - 0.6f) * 40.0f
+                let fi: i32 = (ang * 0.5f) as i32
+                if (fi & 1) == 0 {
+                    r = 0.55f
+                    g = 0.55f
+                    b = 0.50f
+                } else {
+                    r = 0.04f
+                    g = 0.04f
+                    b = 0.04f
+                }
+            }
+            // discs
+            var k: i32 = 0
+            while k < 4 {
+                var cx: f32 = 0.38f
+                var cy: f32 = 0.72f
+                var rad: f32 = 0.08f
+                var cr: f32 = 0.7f
+                var cg: f32 = 0.12f
+                var cb: f32 = 0.08f
+                if k == 1 {
+                    cx = 0.52f
+                    cy = 0.80f
+                    rad = 0.06f
+                    cr = 0.1f
+                    cg = 0.5f
+                    cb = 0.15f
+                }
+                if k == 2 {
+                    cx = 0.64f
+                    cy = 0.70f
+                    rad = 0.07f
+                    cr = 0.1f
+                    cg = 0.2f
+                    cb = 0.65f
+                }
+                if k == 3 {
+                    cx = 0.22f
+                    cy = 0.30f
+                    rad = 0.09f
+                    cr = 0.45f
+                    cg = 0.4f
+                    cb = 0.35f
+                }
+                let ddx: f32 = (u - cx) * fw / fh
+                let ddy: f32 = v - cy
+                let dist: f32 = (math.sqrt((ddx * ddx + ddy * ddy) as f64)) as f32
+                if dist < rad {
+                    var edge: f32 = (rad - dist) / (0.004f)
+                    if edge > 1.0f { edge = 1.0f }
+                    let sh: f32 = 0.35f + 0.65f * (1.0f - dist / rad)
+                    r = r * (1.0f - edge) + cr * sh * edge
+                    g = g * (1.0f - edge) + cg * sh * edge
+                    b = b * (1.0f - edge) + cb * sh * edge
+                }
+                k = k + 1
+            }
+            // wall texture right bottom
+            if u > 0.72f && v > 0.58f {
+                let t: f32 = vnoise((x as f32) * 0.5f, (y as f32) * 0.5f, 3)
+                r = 0.20f + 0.18f * t
+                g = 0.17f + 0.16f * t
+                b = 0.12f + 0.12f * t
+            }
+            img_set(&d, 0, x, y, r)
+            img_set(&d, 1, x, y, g)
+            img_set(&d, 2, x, y, b)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return d
+}
+
+// Shift an image by (dx, dy) pixels (real numbers, bilinear): out(x, y) = src(x - dx, y - dy).
+fn shift_image(src: *mut Image, dx: f32, dy: f32) -> Image {
+    var d: Image = img_new((*src).w, (*src).h, (*src).ch)
+    var c: i32 = 0
+    while c < (*src).ch {
+        var y: i32 = 0
+        while y < (*src).h {
+            var x: i32 = 0
+            while x < (*src).w {
+                img_set(&d, c, x, y, img_sample(src, c, (x as f32) - dx, (y as f32) - dy))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        c = c + 1
+    }
+    return d
+}
