@@ -1342,8 +1342,8 @@ EXTRA_ALIASES = {
     "entity.zombie.ambient": ["block.note_block.imitate.zombie"],
     "entity.zombie.death": ["block.note_block.imitate.ender_dragon"],
     "entity.zombie.step": [f"entity.{m}.step" for m in ("husk", "zombie_villager", "drowned", "piglin", "wither_skeleton", "iron_golem")],
-    "entity.cow.step": ["entity.pig.step", "entity.sheep.step", "entity.horse.step", "entity.horse.step_wood", "entity.llama.step",
-                        "entity.wolf.step", "entity.hoglin.step", "entity.polar_bear.step", "entity.panda.step", "entity.chicken.step",
+    "entity.cow.step": ["entity.horse.step", "entity.horse.step_wood", "entity.llama.step",
+                        "entity.wolf.step", "entity.hoglin.step", "entity.polar_bear.step", "entity.panda.step",
                         "entity.parrot.step"],
     "entity.spider.step": ["entity.silverfish.step"],
     "block.fire.ambient": ["block.campfire.crackle", "block.furnace.fire_crackle"],
@@ -1361,13 +1361,28 @@ EXTRA_ALIASES = {
 }
 
 
+# ------------------------------------------------------------------------------------------------ mob steps e2 (own voices)
+# pig / sheep / chicken used to alias the cow step. Own seed range 40000+ (explicit, NO ns()), appended at the END of mc() so no earlier
+# recipe changes. Order = order of seeds: only append at the END.
+def mob_steps_e2():
+    o = []
+    # pig: two hard hoof taps (higher and drier than the cow), a little click
+    o.append(perc("entity.pig.step", 40000, 110, nz=[("white", "bp", 1800, 1.6, 14, 0.8, 0), ("pink", "bp", 800, 1.0, 30, 0.6, 0)],
+                  body=(170, 95, 45, 0.7, 0), var=3, peak=-11))
+    # sheep: soft, wool-padded thud, almost no click
+    o.append(perc("entity.sheep.step", 40003, 150, nz=[("brown", "bp", 450, 0.8, 50, 0.9, 0)], body=(95, 55, 65, 0.9, 0), var=3, peak=-13))
+    # chicken: tiny scratch-tap, very short and bright, quiet
+    o.append(perc("entity.chicken.step", 40006, 60, nz=[("white", "bp", 3200, 1.8, 9, 0.8, 0)], body=(420, 260, 18, 0.35, 0), var=2, peak=-16))
+    return o
+
+
 def mc():
     sounds = []
     for mat in MATS:
         for act in ACTS:
             s = block(mat, act)
             sounds.append(s)
-    sounds += ambience() + uisounds() + entities() + effects() + music() + coverage_sounds() + mob_voices() + tier3_sounds()
+    sounds += ambience() + uisounds() + entities() + effects() + music() + coverage_sounds() + mob_voices() + tier3_sounds() + mob_steps_e2()
     byid = {x["id"]: x for x in sounds}
     for sid, names in EXTRA_ALIASES.items():
         byid[sid].setdefault("aliases", []).extend(names)
