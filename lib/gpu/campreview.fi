@@ -1,0 +1,513 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/campreview.fi -- gpu.campreview: THE CAMERA PREVIEW ON THE GPU.
+//
+// ================================================================ WHY
+//
+// The old preview (camera.camera_preview_bgrx + window.image) converted every pixel on the CPU, one
+// scalar loop per frame, and pushed the picture into the window octet by octet. On a phone that is a
+// few frames per second, and the picture was stretched to the screen (no aspect handling). Here the
+// camera's YUV planes go to the GPU as they are (a few MB per frame at most) and ONE shader does
+// YUV -> RGB, the sensor rotation, the mirror and the aspect crop ("cover" like a camera app, or
+// "contain" with black bars). Nothing is converted on the CPU.
+//
+// The module knows nothing of Android or of fUi: it takes the GL table of lib/paint/gl.fi (window.gpu_open
+// fills it on Android) and plain plane addresses (camera.camera_preview_acquire gives them). So it also
+// runs on any other source of YUV 4:2:0 planes.
+//
+// ================================================================ USE
+//
+//   var cp: campreview.CamPreview = campreview.cp_new()
+//   campreview.cp_open(&cp, &api)                          // after window.gpu_open(f, &api); again after gpu_lost
+//   loop:
+//     if camera.camera_preview_acquire(&pf) == 1 {          // the newest camera frame
+//         campreview.cp_upload(&cp, pf.w, pf.h, pf.yp, pf.ys, pf.up, pf.vp, pf.us, pf.vs, pf.ups)
+//         camera.camera_preview_release(&pf)                // the planes are camera memory: release at once
+//     }
+//     let rot = camera.camera_display_rotation(0)           // 0/90/180/270 clockwise; mirror = front lens
+//     // (a) straight onto the screen / the bound framebuffer, box in pixels from the top left:
+//     campreview.cp_draw(&cp, x, y, w, h, surface_h, rot, mirror, true)
+//     // (b) into the preview's own RGBA8 texture, then draw THAT where you like (fUi: lib/fui/camview.fi):
+//     campreview.cp_render(&cp, w, h, rot, mirror, true)    // cp.tex / cp.fb, rows from the bottom
+//
+// Aspect: cover = true crops the picture to fill the box, false letterboxes it. The picture is never
+// stretched. `cp_plan` is the pure part (no GL): it is what the tests check.
+import std.rt
+import paint.gl
+
+export {
+    CamPreview, Plan, cp_rotation, cp_new, cp_open, cp_close, cp_ok, cp_upload, cp_has_frame, cp_plan, cp_map,
+    cp_draw, cp_render, cp_target_ok, cp_error, cp_frame_size,
+}
+
+const GL_RG8: u32 = 33323
+const GL_RG: u32 = 33319
+
+struct CamPreview {
+    api: *mut gl.GlApi,
+    ok: bool,
+    gen: u32,
+    prog: u32,
+    vao: u32,
+    u_y: u32,
+    u_uv: u32,
+    u_v: u32,
+    u_crop: u32,
+    u_m: u32,
+    u_t: u32,
+    u_mode: u32,
+    u_quad: u32,
+    // the frame on the GPU: Y (R8, w x h), UV (RG8 semi-planar, or U as R8 when planar), V (R8, planar only)
+    ty: u32,
+    tuv: u32,
+    tv: u32,
+    fw: i32,
+    fh: i32,
+    planar: bool,
+    vfirst: bool, // semi-planar: the first byte of each pair is V (NV21)
+    have: bool,
+    // the preview's own render target (cp_render)
+    fb: u32,
+    tex: u32,
+    ow: i32,
+    oh: i32,
+    tgen: u32,
+    // counters
+    uploads: u64,
+    draws: u64,
+    bytes: u64,
+    // staging copy of the camera planes (see cp_upload)
+    stage: u64,
+    stage_n: usize,
+    direct: bool,
+}
+
+fn cp_new() -> CamPreview {
+    return CamPreview {
+        api: 0 as u64 as *mut gl.GlApi, ok: false, gen: 0 as u32, prog: 0 as u32, vao: 0 as u32,
+        u_y: 0 as u32, u_uv: 0 as u32, u_v: 0 as u32, u_crop: 0 as u32, u_m: 0 as u32, u_t: 0 as u32,
+        u_mode: 0 as u32, u_quad: 0 as u32, ty: 0 as u32, tuv: 0 as u32, tv: 0 as u32,
+        fw: 0, fh: 0, planar: false, vfirst: false, have: false,
+        fb: 0 as u32, tex: 0 as u32, ow: 0, oh: 0, tgen: 0 as u32,
+        uploads: 0, draws: 0, bytes: 0, stage: 0, stage_n: 0, direct: false,
+    }
+}
+
+fn say(s: str) {
+    rt.write_everything(2, s.p as u64, s.n)
+}
+
+fn vs_src() -> str {
+    return __include_str("campreview_vs.glsl")
+}
+
+fn fs_src() -> str {
+    return __include_str("campreview_fs.glsl")
+}
+
+fn uloc(c: *mut CamPreview, s: str) -> u32 {
+    return (*(*c).api).uniform_location((*c).prog as u64, s.p as u64, s.n) as u32
+}
+
+// Builds the program on the table's GL context. Call again after the context was lost (the old numbers
+// are forgotten, not deleted). False: no program (the caller keeps the CPU preview).
+fn cp_open(c: *mut CamPreview, api: *mut gl.GlApi) -> bool {
+    (*c).api = api
+    (*c).ok = false
+    (*c).gen = (*c).gen + 1 as u32
+    (*c).ty = 0 as u32
+    (*c).tuv = 0 as u32
+    (*c).tv = 0 as u32
+    (*c).fw = 0
+    (*c).fh = 0
+    (*c).have = false
+    (*c).fb = 0 as u32
+    (*c).tex = 0 as u32
+    (*c).ow = 0
+    (*c).oh = 0
+    if !gl.gl_api_ok(api) {
+        return false
+    }
+    let vs: str = vs_src()
+    let fs: str = fs_src()
+    var log: [u8; 512] = [0 as u8; 512]
+    (*c).prog = (*api).program(vs.p as u64, vs.n, fs.p as u64, fs.n, (&log[0]) as u64, 512) as u32
+    if (*c).prog == 0 as u32 {
+        say("campreview: shader did not build: ")
+        rt.write_everything(2, (&log[0]) as u64, 400)
+        say("\n")
+        return false
+    }
+    (*c).vao = (*api).create_vertex_array() as u32
+    (*c).u_y = uloc(c, "u_y")
+    (*c).u_uv = uloc(c, "u_uv")
+    (*c).u_v = uloc(c, "u_v")
+    (*c).u_crop = uloc(c, "u_crop")
+    (*c).u_m = uloc(c, "u_m")
+    (*c).u_t = uloc(c, "u_t")
+    (*c).u_mode = uloc(c, "u_mode")
+    (*c).u_quad = uloc(c, "u_quad")
+    (*c).ok = true
+    return true
+}
+
+fn cp_ok(c: *mut CamPreview) -> bool {
+    return (*c).ok
+}
+
+// A frame has been uploaded and can be drawn.
+fn cp_has_frame(c: *mut CamPreview) -> bool {
+    return (*c).ok && (*c).have
+}
+
+// Size of the uploaded frame (sensor orientation, before rotation).
+fn cp_frame_size(c: *mut CamPreview, w: *mut i32, h: *mut i32) {
+    *w = (*c).fw
+    *h = (*c).fh
+}
+
+// GL error code of the last calls (0 = none). Handy in tests.
+fn cp_error(c: *mut CamPreview) -> u32 {
+    if (*c).api == 0 as u64 as *mut gl.GlApi { return 0 as u32 }
+    return (*(*c).api).get_error() as u32
+}
+
+// Frees the GL objects (when the context is still alive).
+fn cp_close(c: *mut CamPreview) {
+    if !(*c).ok { return }
+    let api: *mut gl.GlApi = (*c).api
+    if (*c).ty != 0 as u32 { (*api).delete_obj(gl.GLK_TEXTURE as u64, (*c).ty as u64) }
+    if (*c).tuv != 0 as u32 { (*api).delete_obj(gl.GLK_TEXTURE as u64, (*c).tuv as u64) }
+    if (*c).tv != 0 as u32 { (*api).delete_obj(gl.GLK_TEXTURE as u64, (*c).tv as u64) }
+    if (*c).fb != 0 as u32 {
+        (*api).delete_obj(gl.GLK_FRAMEBUFFER as u64, (*c).fb as u64)
+        (*api).delete_obj(gl.GLK_TEXTURE as u64, (*c).tex as u64)
+    }
+    if (*c).vao != 0 as u32 { (*api).delete_obj(gl.GLK_VERTEX_ARRAY as u64, (*c).vao as u64) }
+    if (*c).prog != 0 as u32 { (*api).delete_obj(gl.GLK_PROGRAM as u64, (*c).prog as u64) }
+    (*c).ty = 0 as u32
+    (*c).tuv = 0 as u32
+    (*c).tv = 0 as u32
+    (*c).fb = 0 as u32
+    (*c).tex = 0 as u32
+    (*c).prog = 0 as u32
+    (*c).vao = 0 as u32
+    (*c).ok = false
+    (*c).have = false
+    if (*c).stage != 0 {
+        syscall(11, (*c).stage as i64, (*c).stage_n as i64, 0, 0, 0, 0)
+        (*c).stage = 0
+        (*c).stage_n = 0
+    }
+}
+
+// ---------------------------------------------------------------- textures
+
+fn new_tex(c: *mut CamPreview, ifmt: u32, w: i32, h: i32, fmt: u32) -> u32 {
+    let api: *mut gl.GlApi = (*c).api
+    let t: u32 = (*api).create_texture() as u32
+    (*api).active_texture(gl.GL_TEXTURE0 as u64)
+    (*api).bind_texture(gl.GL_TEXTURE_2D as u64, t as u64)
+    (*api).tex_image_2d(gl.GL_TEXTURE_2D as u64, 0, ifmt as u64, w as i64, h as i64, fmt as u64,
+        gl.GL_UNSIGNED_BYTE as u64, 0, 0)
+    (*api).tex_parameteri(gl.GL_TEXTURE_2D as u64, gl.GL_TEXTURE_MIN_FILTER as u64, gl.GL_LINEAR as i64)
+    (*api).tex_parameteri(gl.GL_TEXTURE_2D as u64, gl.GL_TEXTURE_MAG_FILTER as u64, gl.GL_LINEAR as i64)
+    (*api).tex_parameteri(gl.GL_TEXTURE_2D as u64, gl.GL_TEXTURE_WRAP_S as u64, gl.GL_CLAMP_TO_EDGE as i64)
+    (*api).tex_parameteri(gl.GL_TEXTURE_2D as u64, gl.GL_TEXTURE_WRAP_T as u64, gl.GL_CLAMP_TO_EDGE as i64)
+    return t
+}
+
+// One plane of `bpp` octets a pixel (1 = R8, 2 = RG8), w x h pixels, `stride` octets a row, into `t`.
+// One call when the stride is a whole number of pixels, else row by row.
+fn put_plane(c: *mut CamPreview, t: u32, fmt: u32, bpp: i32, w: i32, h: i32, p: u64, stride: i32) {
+    let api: *mut gl.GlApi = (*c).api
+    (*api).active_texture(gl.GL_TEXTURE0 as u64)
+    (*api).bind_texture(gl.GL_TEXTURE_2D as u64, t as u64)
+    if stride % bpp == 0 && stride / bpp >= w {
+        let n: usize = ((h - 1) as usize) * (stride as usize) + (w * bpp) as usize
+        (*api).tex_sub_image_2d(gl.GL_TEXTURE_2D as u64, 0, 0, 0, w as i64, h as i64, fmt as u64,
+            gl.GL_UNSIGNED_BYTE as u64, p, n, (stride / bpp) as i64)
+        return
+    }
+    var y: i32 = 0
+    while y < h {
+        (*api).tex_sub_image_2d(gl.GL_TEXTURE_2D as u64, 0, 0, y as i64, w as i64, 1, fmt as u64,
+            gl.GL_UNSIGNED_BYTE as u64, p + ((y as usize) * (stride as usize)) as u64, (w * bpp) as usize, 0)
+        y = y + 1
+    }
+}
+
+// Puts a YUV_420_888 frame on the GPU. yp/up/vp: plane starts, ys/us/vs: row strides in octets, ups: pixel
+// stride of U/V (1 = planar I420, 2 = interleaved NV12/NV21 as Android hands them out). Textures are made on
+// the first frame and when the size or layout changes. False: unsupported layout or no GL.
+fn cp_upload(c: *mut CamPreview, w: i32, h: i32, yp: u64, ys: i32, up: u64, vp: u64, us: i32, vs: i32,
+    ups: i32) -> bool {
+    if !(*c).ok || w < 2 || h < 2 || yp == 0 || up == 0 || vp == 0 || ys < w { return false }
+    let cw: i32 = (w + 1) / 2
+    let ch: i32 = (h + 1) / 2
+    var planar: bool = false
+    var vfirst: bool = false
+    var base: u64 = up
+    if ups == 1 {
+        planar = true
+    } else if ups == 2 {
+        // interleaved: the two plane starts are one octet apart; the lower one is the first octet of a pair
+        if vp + 1 == up {
+            vfirst = true
+            base = vp
+        } else if up + 1 == vp {
+            base = up
+        } else {
+            return false
+        }
+    } else {
+        return false
+    }
+    let api: *mut gl.GlApi = (*c).api
+    // Staging copy: the planes of an AImage are camera (gralloc) memory. Handing that straight to
+    // glTexSubImage2D made the Android emulator's GLES renderer fail its command checksum (host crash, or
+    // eglSwapBuffers stuck for good); a plain heap copy never did. The copy is ~1.2 MB a frame (about 0.1 ms).
+    // cp.direct = true skips it (tests / hosts with plain memory).
+    var yp2: u64 = yp
+    var up2: u64 = up    // planar: U start; interleaved: start of the first pair
+    var vp2: u64 = vp
+    if !planar { up2 = base }
+    if !(*c).direct {
+        let ny: usize = ((h - 1) as usize) * (ys as usize) + (w as usize)
+        var nu: usize = 0
+        var nv: usize = 0
+        if planar {
+            nu = ((ch - 1) as usize) * (us as usize) + (cw as usize)
+            nv = ((ch - 1) as usize) * (vs as usize) + (cw as usize)
+        } else {
+            nu = ((ch - 1) as usize) * (us as usize) + ((2 * cw) as usize)
+        }
+        let oy: usize = 0
+        let ou: usize = (ny + 63) / 64 * 64
+        let ov: usize = ou + (nu + 63) / 64 * 64
+        let need: usize = ov + nv + 64
+        if (*c).stage_n < need {
+            if (*c).stage != 0 { syscall(11, (*c).stage as i64, (*c).stage_n as i64, 0, 0, 0, 0) }
+            let m: i64 = syscall(9, 0, need as i64, 3, 34, -1, 0)
+            if m <= 0 {
+                (*c).stage = 0
+                (*c).stage_n = 0
+                return false
+            }
+            (*c).stage = m as u64
+            (*c).stage_n = need
+        }
+        rt.mem_copy((*c).stage, yp, ny)
+        yp2 = (*c).stage
+        rt.mem_copy((*c).stage + ou as u64, up2, nu)
+        up2 = (*c).stage + ou as u64
+        if planar {
+            rt.mem_copy((*c).stage + ov as u64, vp, nv)
+            vp2 = (*c).stage + ov as u64
+        }
+    }
+    if (*c).ty == 0 as u32 || (*c).fw != w || (*c).fh != h || (*c).planar != planar {
+        if (*c).ty != 0 as u32 { (*api).delete_obj(gl.GLK_TEXTURE as u64, (*c).ty as u64) }
+        if (*c).tuv != 0 as u32 { (*api).delete_obj(gl.GLK_TEXTURE as u64, (*c).tuv as u64) }
+        if (*c).tv != 0 as u32 { (*api).delete_obj(gl.GLK_TEXTURE as u64, (*c).tv as u64) }
+        (*c).tv = 0 as u32
+        (*c).ty = new_tex(c, gl.GL_R8, w, h, gl.GL_RED)
+        if planar {
+            (*c).tuv = new_tex(c, gl.GL_R8, cw, ch, gl.GL_RED)
+            (*c).tv = new_tex(c, gl.GL_R8, cw, ch, gl.GL_RED)
+        } else {
+            (*c).tuv = new_tex(c, GL_RG8, cw, ch, GL_RG)
+        }
+        (*c).fw = w
+        (*c).fh = h
+        (*c).planar = planar
+    }
+    (*c).vfirst = vfirst
+    put_plane(c, (*c).ty, gl.GL_RED, 1, w, h, yp2, ys)
+    if planar {
+        put_plane(c, (*c).tuv, gl.GL_RED, 1, cw, ch, up2, us)
+        put_plane(c, (*c).tv, gl.GL_RED, 1, cw, ch, vp2, vs)
+    } else {
+        put_plane(c, (*c).tuv, GL_RG, 2, cw, ch, up2, us)
+    }
+    (*c).have = true
+    (*c).uploads = (*c).uploads + 1
+    (*c).bytes = (*c).bytes + (w * h) as u64 + (2 * cw * ch) as u64
+    return true
+}
+
+// ---------------------------------------------------------------- the plan (pure, no GL)
+
+// The clockwise rotation (0/90/180/270) that makes a sensor image upright on a screen turned by `display_deg`
+// (the Surface rotation in degrees, 0 = natural): back/external lens (sensor - display) mod 360, front lens
+// (sensor + display) mod 360 -- the formula of the Android camera guide. Mirror is `front`.
+fn cp_rotation(sensor: i32, display_deg: i32, front: bool) -> i32 {
+    var r: i32 = sensor - display_deg
+    if front { r = sensor + display_deg }
+    r = r % 360
+    if r < 0 { r = r + 360 }
+    return (r / 90) * 90
+}
+
+// How a box on the screen maps onto the sensor image. For a point d = (dx, dy) of the box (0..1, y down):
+//   r = (crop.x + dx * crop.z, crop.y + dy * crop.w)     a point of the ROTATED image (0..1, y down)
+//   s = (m0*r.x + m1*r.y + t0, m2*r.x + m3*r.y + t1)     the point in the SENSOR image (0..1, y down)
+// quad = how much of the target the picture covers (1,1 = all; less = black bars, "contain").
+struct Plan {
+    crop: [f64; 4],
+    m: [f64; 4],
+    t: [f64; 2],
+    quad: [f64; 2],
+    rot: i32,
+}
+
+// iw x ih: sensor image; rot: degrees clockwise that make it upright (any multiple of 90, negative ok);
+// mirror: flip the upright picture left/right (front lens); vw x vh: the box; cover: fill the box and cut
+// the overhang (centred), else fit inside with bars. The picture keeps its aspect either way.
+fn cp_plan(iw: i32, ih: i32, rot: i32, mirror: bool, vw: i32, vh: i32, cover: bool, out: *mut Plan) {
+    var r: i32 = rot % 360
+    if r < 0 { r = r + 360 }
+    r = (r / 90) * 90
+    (*out).rot = r
+    (*out).m = [1.0, 0.0, 0.0, 1.0]
+    (*out).t = [0.0, 0.0]
+    if r == 90 {
+        (*out).m = [0.0, 1.0, 0.0 - 1.0, 0.0]
+        (*out).t = [0.0, 1.0]
+    } else if r == 180 {
+        (*out).m = [0.0 - 1.0, 0.0, 0.0, 0.0 - 1.0]
+        (*out).t = [1.0, 1.0]
+    } else if r == 270 {
+        (*out).m = [0.0, 0.0 - 1.0, 1.0, 0.0]
+        (*out).t = [1.0, 0.0]
+    }
+    var dw: f64 = iw as f64
+    var dh: f64 = ih as f64
+    if r == 90 || r == 270 {
+        dw = ih as f64
+        dh = iw as f64
+    }
+    var ai: f64 = 1.0
+    if dh > 0.0 { ai = dw / dh }
+    var ad: f64 = 1.0
+    if vh > 0 { ad = (vw as f64) / (vh as f64) }
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var cw: f64 = 1.0
+    var ch: f64 = 1.0
+    (*out).quad = [1.0, 1.0]
+    if cover {
+        if ai > ad {
+            cw = ad / ai
+        } else {
+            ch = ai / ad
+        }
+        cx = (1.0 - cw) / 2.0
+        cy = (1.0 - ch) / 2.0
+    } else {
+        if ai > ad {
+            (*out).quad = [1.0, ad / ai]
+        } else {
+            (*out).quad = [ai / ad, 1.0]
+        }
+    }
+    if mirror {
+        (*out).crop = [cx + cw, cy, 0.0 - cw, ch]
+    } else {
+        (*out).crop = [cx, cy, cw, ch]
+    }
+}
+
+// The reference mapping for tests and CPU fallbacks: display point (dx, dy) -> sensor point (0..1).
+fn cp_map(p: *mut Plan, dx: f64, dy: f64, sx: *mut f64, sy: *mut f64) {
+    let rx: f64 = (*p).crop[0] + dx * (*p).crop[2]
+    let ry: f64 = (*p).crop[1] + dy * (*p).crop[3]
+    *sx = (*p).m[0] * rx + (*p).m[1] * ry + (*p).t[0]
+    *sy = (*p).m[2] * rx + (*p).m[3] * ry + (*p).t[1]
+}
+
+// ---------------------------------------------------------------- drawing
+
+fn draw_quad(c: *mut CamPreview, p: *mut Plan) {
+    let api: *mut gl.GlApi = (*c).api
+    (*api).disable(gl.GL_BLEND as u64)
+    (*api).disable(gl.GL_SCISSOR_TEST as u64)
+    (*api).use_program((*c).prog as u64)
+    (*api).bind_vertex_array((*c).vao as u64)
+    (*api).active_texture(gl.GL_TEXTURE0 as u64)
+    (*api).bind_texture(gl.GL_TEXTURE_2D as u64, (*c).ty as u64)
+    (*api).uniform1i((*c).u_y as u64, 0)
+    (*api).active_texture((gl.GL_TEXTURE0 + 1 as u32) as u64)
+    (*api).bind_texture(gl.GL_TEXTURE_2D as u64, (*c).tuv as u64)
+    (*api).uniform1i((*c).u_uv as u64, 1)
+    (*api).active_texture((gl.GL_TEXTURE0 + 2 as u32) as u64)
+    var tv: u32 = (*c).tv
+    if tv == 0 as u32 { tv = (*c).tuv }
+    (*api).bind_texture(gl.GL_TEXTURE_2D as u64, tv as u64)
+    (*api).uniform1i((*c).u_v as u64, 2)
+    (*api).active_texture(gl.GL_TEXTURE0 as u64)
+    (*api).uniform4f((*c).u_crop as u64, (*p).crop[0], (*p).crop[1], (*p).crop[2], (*p).crop[3])
+    (*api).uniform4f((*c).u_m as u64, (*p).m[0], (*p).m[1], (*p).m[2], (*p).m[3])
+    (*api).uniform2f((*c).u_t as u64, (*p).t[0], (*p).t[1])
+    var planar: f64 = 0.0
+    if (*c).planar { planar = 1.0 }
+    var vf: f64 = 0.0
+    if (*c).vfirst { vf = 1.0 }
+    (*api).uniform2f((*c).u_mode as u64, planar, vf)
+    (*api).uniform2f((*c).u_quad as u64, (*p).quad[0], (*p).quad[1])
+    (*api).draw_arrays(gl.GL_TRIANGLE_STRIP as u64, 0, 4)
+    (*c).draws = (*c).draws + 1
+}
+
+// Draws the last uploaded frame into the box (x, y, w, h) -- pixels, from the TOP left of a surface that is
+// `surf_h` rows high -- of the framebuffer that is bound now. Letterbox bars are cleared to black when
+// cover = false. The caller owns the framebuffer, the viewport is set here.
+fn cp_draw(c: *mut CamPreview, x: i32, y: i32, w: i32, h: i32, surf_h: i32, rot: i32, mirror: bool,
+    cover: bool) -> bool {
+    if !cp_has_frame(c) || w <= 0 || h <= 0 { return false }
+    var pl: Plan = Plan { crop: [0.0; 4], m: [0.0; 4], t: [0.0; 2], quad: [1.0; 2], rot: 0 }
+    cp_plan((*c).fw, (*c).fh, rot, mirror, w, h, cover, &pl)
+    let api: *mut gl.GlApi = (*c).api
+    (*api).viewport(x as i64, (surf_h - y - h) as i64, w as i64, h as i64)
+    if !cover {
+        (*api).enable(gl.GL_SCISSOR_TEST as u64)
+        (*api).scissor(x as i64, (surf_h - y - h) as i64, w as i64, h as i64)
+        (*api).clear_color(0.0, 0.0, 0.0, 1.0)
+        (*api).clear(gl.GL_COLOR_BUFFER_BIT as u64)
+        (*api).disable(gl.GL_SCISSOR_TEST as u64)
+    }
+    draw_quad(c, &pl)
+    return true
+}
+
+// Draws the last uploaded frame into the preview's own RGBA8 texture of w x h pixels (made on demand, remade
+// when the size changes or the GL context was reopened). Afterwards (*c).tex is the picture, rows from the
+// BOTTOM like every GL texture, and (*c).fb its framebuffer; the framebuffer binding is left on it, the
+// caller binds its own again.
+fn cp_render(c: *mut CamPreview, w: i32, h: i32, rot: i32, mirror: bool, cover: bool) -> bool {
+    if !cp_has_frame(c) || w <= 0 || h <= 0 { return false }
+    let api: *mut gl.GlApi = (*c).api
+    if (*c).fb == 0 as u32 || (*c).tgen != (*c).gen || (*c).ow != w || (*c).oh != h {
+        if (*c).fb != 0 as u32 && (*c).tgen == (*c).gen {
+            (*api).delete_obj(gl.GLK_FRAMEBUFFER as u64, (*c).fb as u64)
+            (*api).delete_obj(gl.GLK_TEXTURE as u64, (*c).tex as u64)
+        }
+        (*c).tex = new_tex(c, gl.GL_RGBA8, w, h, gl.GL_RGBA)
+        (*c).fb = (*api).create_framebuffer() as u32
+        (*api).bind_framebuffer(gl.GL_FRAMEBUFFER as u64, (*c).fb as u64)
+        (*api).framebuffer_texture_2d(gl.GL_FRAMEBUFFER as u64, gl.GL_COLOR_ATTACHMENT0 as u64,
+            gl.GL_TEXTURE_2D as u64, (*c).tex as u64, 0)
+        (*c).ow = w
+        (*c).oh = h
+        (*c).tgen = (*c).gen
+        if (*api).check_framebuffer_status(gl.GL_FRAMEBUFFER as u64) != gl.GL_FRAMEBUFFER_COMPLETE as u64 {
+            return false
+        }
+    } else {
+        (*api).bind_framebuffer(gl.GL_FRAMEBUFFER as u64, (*c).fb as u64)
+    }
+    return cp_draw(c, 0, 0, w, h, h, rot, mirror, cover)
+}
+
+fn cp_target_ok(c: *mut CamPreview) -> bool {
+    return (*c).fb != 0 as u32 && (*c).tgen == (*c).gen
+}

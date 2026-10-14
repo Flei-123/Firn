@@ -283,7 +283,7 @@ def uisounds():
     return o
 
 
-def voice(sid, seed, dur, f0, f1, wave, form, fq, vib=0.0, noise_amt=0.15, peak=-4, variants=3, pitch_env=None, am=0.0):
+def voice(sid, seed, dur, f0, f1, wave, form, fq, vib=0.0, noise_amt=0.15, peak=-4, variants=3, pitch_env=None, am=0.0, aliases=None):
     """A creature-ish voice: saw / pulse source, pitch glide, one band pass formant, breath noise."""
     nodes = [osc("src", wave, SW(R(f0 * 0.93, f0 * 1.07), R(f1 * 0.93, f1 * 1.07), dur, 0, True), width=0.35)]
     if vib:
@@ -296,7 +296,7 @@ def voice(sid, seed, dur, f0, f1, wave, form, fq, vib=0.0, noise_amt=0.15, peak=
     pts = [[0, 0, 0], [min(30, dur * 0.1), 1, 0], [dur * 0.75, 0.8, 0], [dur, 0, -2]]
     nodes += [{"id": "e", "type": "env", "points": pts}, mix("m2", [("sm", 1.0), ("nf", noise_amt * 3)]),
               gain("o", "m2", "e")]
-    return sound(sid, dur, seed, nodes, "o", variants=variants, peak=peak, fo=max(10, int(dur * 0.08)))
+    return sound(sid, dur, seed, nodes, "o", variants=variants, peak=peak, fo=max(10, int(dur * 0.08)), aliases=aliases)
 
 
 def entities():
@@ -324,13 +324,179 @@ def entities():
     return o
 
 
+# ------------------------------------------------------------------------------------------------ interaction / effect sounds
+# Archetypes (all synthesised): perc = noise bursts + sine body + ringing partials; whoosh = swept band noise; crackle = random
+# grains; door = creak (saw through a band pass) + latch click / thud. Gaps in the id table: tools/mc/audio/coverage.py (tier 1).
+def perc(sid, seed, dur, nz=(), body=None, parts=(), var=2, peak=-4, aliases=None, bus="sfx", fo=None):
+    """nz = [(color, kind, cut, q, decay_ms, gain, at_ms)], body = (f0, f1, decay_ms, gain, at_ms), parts = [(freq, gain, decay_ms, at_ms)]"""
+    nodes, mixin = [], []
+    for i, (color, kind, cut, q, dec, g, at) in enumerate(nz):
+        nodes += [noise("n%d" % i, color), filt("nf%d" % i, kind, "n%d" % i, R(cut * 0.88, cut * 1.12), q),
+                  adsr("ne%d" % i, 0.8, dec, r=3, at=at), gain("ng%d" % i, "nf%d" % i, "ne%d" % i)]
+        mixin.append(("ng%d" % i, g))
+    if body:
+        f0, f1, dec, g, at = body
+        nodes += [osc("bo", "sine", SW(f0, f1, dec * 0.8, -2)), adsr("be", 1.2, dec, r=6, at=at), gain("bg", "bo", "be")]
+        mixin.append(("bg", g))
+    for i, (f, g, dec, at) in enumerate(parts):
+        nodes += [osc("pm%d" % i, "sine", R(f * 0.98, f * 1.02)), adsr("pe%d" % i, 0.5, dec, r=5, at=at), gain("pg%d" % i, "pm%d" % i, "pe%d" % i)]
+        mixin.append(("pg%d" % i, g))
+    nodes.append(mix("o", mixin))
+    return sound(sid, dur, seed, nodes, "o", variants=var, peak=peak, bus=bus, fo=fo or max(6, dur // 10), aliases=aliases)
+
+
+def whoosh(sid, seed, dur, c0, c1, color="white", kind="bp", q=1.0, att=15, var=2, peak=-6, aliases=None, level=1.0, bus="sfx", sub=None):
+    """band noise with a swept cutoff; sub = (f0, f1) adds a sine sweep underneath (explosions, falls)"""
+    nodes = [noise("n", color), filt("nf", kind, "n", SW(c0, c1, dur, 0, True), q),
+             {"id": "e", "type": "env", "points": [[0, 0, 0], [att, 1, 0], [dur * 0.55, 0.7, 0], [dur, 0, -2]]}, gain("ng", "nf", "e")]
+    mixin = [("ng", level)]
+    if sub:
+        nodes += [osc("so", "sine", SW(sub[0], sub[1], dur * 0.8, -2)), adsr("se", 3, dur * 0.4, r=20), gain("sg", "so", "se")]
+        mixin.append(("sg", 0.9))
+    nodes.append(mix("o", mixin))
+    return sound(sid, dur, seed, nodes, "o", variants=var, peak=peak, bus=bus, fo=max(8, dur // 12), aliases=aliases)
+
+
+def crackle(sid, seed, dur, n, cut, color="white", dec=14, var=2, peak=-8, aliases=None, kind="bp", q=1.0, bus="sfx", pitch=None):
+    """n random grains (fixed per recipe seed): fire, bone rattle, crunch, lava pops; pitch = sine blip per grain (bubbles)"""
+    import random
+    rnd = random.Random(seed)
+    pts, ts = [[0, 0, 0]], sorted(rnd.uniform(2, dur - dec * 2 - 4) for _ in range(n))
+    last = 0.0
+    nodes = [noise("n", color), filt("nf", kind, "n", R(cut * 0.8, cut * 1.2), q)]
+    mixin = []
+    for t in ts:
+        t = max(t, last + 3)
+        pts += [[t, 0, 0], [t + 1.5, rnd.uniform(0.4, 1.0), 0], [t + 1.5 + dec, 0, -3]]
+        last = t + 1.5 + dec + 1
+    nodes += [{"id": "e", "type": "env", "points": pts}, gain("ng", "nf", "e")]
+    mixin.append(("ng", 1.0))
+    if pitch:
+        nodes += [osc("po", "sine", SW(pitch, pitch * 2.2, dec * 2, -1)), {"id": "pe", "type": "env", "points": pts}, gain("pg", "po", "pe")]
+        mixin.append(("pg", 0.6))
+    nodes.append(mix("o", mixin))
+    return sound(sid, int(last + 12), seed, nodes, "o", variants=var, peak=peak, bus=bus, fo=12, aliases=aliases)
+
+
+def door(sid, seed, opening, metal=False, dur=360, aliases=None, deep=1.0):
+    """creak + latch click (open) / thud + click (close); metal rings instead of creaking wood"""
+    f0, f1 = (150, 280) if opening else (280, 140)
+    form = 1900 if metal else 650
+    nodes = [osc("cr", "saw", SW(R(f0 * 0.9, f0 * 1.1) if False else f0, f1, dur * 0.55, 0, True)),
+             filt("cf", "bp", "cr", R(form * 0.85, form * 1.15), 6 if metal else 3.5),
+             adsr("ce", 12, dur * 0.4, r=40, at=0 if opening else 10, peak=0.55), gain("cg", "cf", "ce"),
+             noise("kn"), filt("kf", "bp", "kn", 4200 if metal else 2600, 1.8), adsr("ke", 0.4, 9, r=2, at=(dur * 0.6 if opening else dur * 0.5)),
+             gain("kg", "kf", "ke")]
+    mixin = [("cg", 1.0), ("kg", 0.9)]
+    if not opening or not metal:
+        nodes += [osc("tb", "sine", SW(110 * deep, 55 * deep, 70, -2)), adsr("te", 1.5, 70, r=8, at=(dur * 0.5 if not opening else dur * 0.62)),
+                  gain("tg", "tb", "te")]
+        mixin.append(("tg", 0.8 if not opening else 0.3))
+    if metal:
+        for k, (f, g) in enumerate([(820, 0.5), (1330, 0.35)]):
+            nodes += [osc("rp%d" % k, "sine", R(f * 0.98, f * 1.02)), adsr("rq%d" % k, 0.5, 160, r=10, at=(dur * 0.5 if not opening else dur * 0.6)),
+                      gain("rg%d" % k, "rp%d" % k, "rq%d" % k)]
+            mixin.append(("rg%d" % k, g * 0.6))
+    nodes.append(mix("o", mixin))
+    return sound(sid, dur, seed, nodes, "o", variants=2, peak=-5, fo=30, aliases=aliases)
+
+
+def effects():
+    o = []
+    # --- doors, gates, containers
+    for k, (nm, metal, dur, deep, al) in enumerate([
+            ("wooden_door", False, 360, 1.0, []), ("iron_door", True, 420, 0.8, []), ("wooden_trapdoor", False, 300, 1.2, []),
+            ("iron_trapdoor", True, 340, 1.0, []), ("fence_gate", False, 330, 1.1, []), ("chest", False, 380, 0.9, []),
+            ("ender_chest", True, 400, 0.7, []), ("barrel", False, 320, 1.3, []), ("shulker_box", False, 340, 0.8, [])]):
+        for j, act in enumerate(("open", "close")):
+            o.append(door("block.%s.%s" % (nm, act), 8100 + k * 10 + j, act == "open", metal, dur, aliases=al, deep=deep))
+    o.append(perc("block.chest.locked", 8190, 220, nz=[("white", "bp", 2800, 3, 14, 0.7, 0), ("white", "bp", 2300, 3, 14, 0.6, 60)],
+                  body=(180, 110, 50, 0.6, 0), var=2, peak=-6))
+    # --- switches
+    o.append(perc("block.lever.click", 8200, 120, nz=[("white", "bp", 3000, 2, 8, 0.8, 0), ("white", "bp", 2200, 2, 10, 0.6, 35)],
+                  body=(900, 420, 25, 0.5, 0), var=2, peak=-6))
+    for k, (nm, cut, f) in enumerate([("stone_button", 2600, 1100), ("wooden_button", 1800, 760), ("stone_pressure_plate", 1500, 520),
+                                       ("wooden_pressure_plate", 1300, 420)]):
+        for j, act in enumerate(("click_on", "click_off")):
+            sc = 1.0 if j == 0 else 0.8
+            o.append(perc("block.%s.%s" % (nm, act), 8210 + k * 10 + j, 110, nz=[("white", "bp", cut * sc, 1.6, 9, 0.9, 0)],
+                          body=(f * sc, f * sc * 0.5, 30, 0.6, 0), var=2, peak=-7))
+    # --- arrows
+    o.append(whoosh("entity.arrow.shoot", 8300, 260, 900, 2600, "white", "bp", 1.2, att=8, var=2, peak=-6, level=0.5))
+    o[-1]["nodes"] += [osc("tw", "sine", SW(210, 150, 140, -1)), adsr("twe", 0.8, 120, r=20), gain("twg", "tw", "twe"),
+                       mix("o2", [("o", 1.0), ("twg", 0.8)])]
+    o[-1]["out"] = "o2"
+    o.append(perc("entity.arrow.hit", 8310, 140, nz=[("white", "bp", 2000, 1.5, 22, 0.8, 0)], body=(240, 110, 70, 1.0, 0),
+                  parts=[(1300, 0.15, 60, 0)], var=3, peak=-5))
+    o.append(perc("entity.arrow.hit_player", 8320, 260, nz=[("white", "hp", 3500, 0.8, 10, 0.6, 0)], body=(190, 90, 90, 0.9, 0),
+                  parts=[(1650, 0.5, 200, 0), (2480, 0.3, 140, 0)], var=2, peak=-6))
+    # --- mobs
+    o.append(crackle("entity.skeleton.ambient", 8400, 700, 7, 3200, "white", 12, var=3, peak=-8, q=3))
+    o.append(voice("entity.skeleton.hurt", 8401, 260, 330, 220, "pulse", 1200, 6, noise_amt=0.3, variants=2, peak=-5))
+    o.append(crackle("entity.skeleton.death", 8402, 900, 16, 2600, "white", 20, var=2, peak=-6, q=2.5))
+    o.append(perc("entity.skeleton.step", 8403, 120, nz=[("white", "bp", 3300, 3, 14, 0.8, 0)], body=(420, 240, 40, 0.6, 0),
+                  parts=[(1500, 0.3, 40, 0)], var=3, peak=-9))
+    o.append(whoosh("entity.creeper.primed", 8410, 1500, 3200, 5200, "white", "hp", 0.7, att=500, var=1, peak=-8, level=0.9))
+    o.append(voice("entity.creeper.hurt", 8411, 300, 260, 160, "square", 800, 4, noise_amt=0.3, variants=2, peak=-5))
+    o.append(voice("entity.creeper.death", 8412, 700, 210, 70, "square", 700, 4, noise_amt=0.3, variants=2, peak=-5))
+    o.append(crackle("entity.spider.ambient", 8420, 600, 10, 4800, "white", 18, var=3, peak=-9, q=2))
+    o.append(voice("entity.spider.hurt", 8421, 280, 700, 1000, "saw", 1600, 3, noise_amt=0.3, variants=2, peak=-6))
+    o.append(voice("entity.spider.death", 8422, 700, 900, 260, "saw", 1500, 3, noise_amt=0.3, variants=2, peak=-6))
+    o.append(perc("entity.spider.step", 8423, 90, nz=[("white", "bp", 4200, 2, 8, 0.7, 0), ("white", "bp", 3600, 2, 8, 0.5, 18)],
+                  var=3, peak=-12))
+    # --- fire / lava / water
+    o.append(crackle("block.fire.ambient", 8500, 1400, 22, 1800, "pink", 16, var=3, peak=-10, kind="bp", q=0.8))
+    o.append(whoosh("block.fire.extinguish", 8501, 600, 6500, 2500, "white", "bp", 0.7, att=20, var=2, peak=-7, aliases=["entity.generic.extinguish_fire"]))
+    o.append(crackle("block.lava.ambient", 8510, 1500, 8, 400, "brown", 90, var=3, peak=-9, kind="lp", q=0.7, pitch=120))
+    o.append(perc("block.lava.pop", 8511, 200, nz=[("pink", "bp", 900, 1.2, 30, 0.5, 0)], body=(170, 520, 60, 0.9, 0), var=3, peak=-8))
+    o.append(whoosh("block.lava.extinguish", 8512, 700, 5200, 1800, "white", "bp", 0.7, att=25, var=2, peak=-7, sub=(140, 60)))
+    o.append(whoosh("entity.generic.splash", 8520, 450, 4200, 900, "pink", "bp", 0.7, att=10, var=3, peak=-5, aliases=["entity.player.splash"]))
+    o.append(whoosh("entity.player.splash.high_speed", 8521, 650, 3600, 700, "pink", "bp", 0.6, att=8, var=2, peak=-4, sub=(130, 60)))
+    o.append(whoosh("entity.generic.swim", 8522, 380, 700, 1900, "pink", "bp", 1.0, att=60, var=3, peak=-8, aliases=["entity.player.swim"]))
+    o.append(whoosh("entity.generic.burn", 8523, 260, 3800, 2000, "white", "bp", 0.8, att=10, var=2, peak=-7))
+    # --- player + generic entity sounds
+    o.append(voice("entity.player.hurt", 8600, 300, 200, 140, "saw", 650, 4, noise_amt=0.18, variants=3, peak=-5,
+                   aliases=["entity.generic.hurt"]))
+    o.append(voice("entity.player.death", 8601, 900, 190, 55, "saw", 520, 4, vib=0.008, noise_amt=0.2, variants=2, peak=-5,
+                   aliases=["entity.generic.death"]))
+    o.append(voice("entity.player.hurt_on_fire", 8602, 380, 260, 330, "saw", 800, 3, vib=0.03, noise_amt=0.35, variants=2, peak=-6))
+    o.append(voice("entity.player.hurt_freeze", 8603, 380, 300, 240, "saw", 900, 4, vib=0.05, noise_amt=0.25, variants=2, peak=-6))
+    o.append(voice("entity.player.hurt_drown", 8604, 520, 210, 130, "saw", 500, 3, vib=0.04, noise_amt=0.45, variants=2, peak=-6))
+    o.append(voice("entity.player.hurt_sweet_berry_bush", 8605, 220, 280, 200, "saw", 700, 4, noise_amt=0.2, variants=2, peak=-7))
+    o.append(voice("entity.player.burp", 8606, 420, 120, 80, "saw", 380, 3, vib=0.02, noise_amt=0.1, variants=2, peak=-6))
+    o.append(whoosh("entity.player.breath", 8607, 700, 900, 600, "pink", "lp", 0.7, att=250, var=2, peak=-12))
+    o.append(whoosh("entity.player.attack.weak", 8610, 220, 1200, 3200, "white", "bp", 1.0, att=30, var=3, peak=-8))
+    o.append(whoosh("entity.player.attack.strong", 8611, 300, 800, 2400, "white", "bp", 0.9, att=40, var=3, peak=-6, sub=(180, 90)))
+    o.append(whoosh("entity.player.attack.sweep", 8612, 380, 700, 3600, "white", "bp", 0.8, att=100, var=3, peak=-7))
+    o.append(perc("entity.player.attack.crit", 8613, 320, nz=[("white", "hp", 2600, 0.8, 25, 0.9, 0)], body=(260, 110, 110, 1.0, 0),
+                  parts=[(1800, 0.4, 180, 0), (2700, 0.25, 120, 0)], var=2, peak=-4))
+    o.append(perc("entity.player.attack.knockback", 8614, 300, nz=[("pink", "bp", 1200, 1.0, 45, 0.9, 0)], body=(150, 60, 140, 1.2, 0),
+                  var=2, peak=-4))
+    o.append(perc("entity.player.attack.nodamage", 8615, 180, nz=[("pink", "bp", 1500, 1.0, 30, 0.8, 0)], body=(200, 110, 70, 0.6, 0),
+                  var=3, peak=-8))
+    o.append(perc("entity.player.small_fall", 8620, 200, nz=[("pink", "bp", 900, 0.8, 50, 0.8, 0)], body=(110, 55, 100, 1.2, 0), var=2,
+                  peak=-5, aliases=["entity.generic.small_fall"]))
+    o.append(perc("entity.player.big_fall", 8621, 420, nz=[("pink", "bp", 700, 0.8, 90, 1.0, 0), ("white", "bp", 400, 0.8, 120, 0.5, 70)],
+                  body=(90, 38, 220, 1.4, 0), var=2, peak=-3, aliases=["entity.generic.big_fall"]))
+    o.append(crackle("entity.generic.eat", 8630, 420, 6, 2400, "pink", 22, var=3, peak=-8, q=1.2))
+    o.append(crackle("entity.generic.drink", 8631, 460, 3, 350, "brown", 90, var=2, peak=-8, kind="lp", q=0.7, pitch=240))
+    o.append(whoosh("entity.generic.explode", 8632, 1500, 2200, 220, "brown", "lp", 0.7, att=4, var=3, peak=-2, sub=(70, 28)))
+    o.append(perc("entity.item.pickup", 8640, 160, body=(520, 1450, 70, 0.9, 0), parts=[(1900, 0.3, 90, 10)], var=3, peak=-9))
+    o.append(perc("entity.item.break", 8641, 280, nz=[("white", "bp", 2500, 1.2, 40, 0.8, 0), ("white", "bp", 2000, 1.2, 40, 0.6, 50)],
+                  body=(260, 120, 80, 0.7, 0), var=2, peak=-6))
+    o.append(whoosh("entity.tnt.primed", 8650, 1000, 4000, 2000, "white", "hp", 0.7, att=60, var=1, peak=-8))
+    o.append(perc("entity.lightning_bolt.impact", 8651, 900, nz=[("white", "hp", 1800, 0.7, 120, 1.0, 0)], body=(120, 36, 600, 1.2, 0),
+                  var=2, peak=-2))
+    return o
+
+
 def mc():
     sounds = []
     for mat in MATS:
         for act in ACTS:
             s = block(mat, act)
             sounds.append(s)
-    sounds += ambience() + uisounds() + entities() + music()
+    sounds += ambience() + uisounds() + entities() + effects() + music()
     return {"format": "synth-recipe-1", "name": "mc", "rate": 44100, "license": "own", "buses": BUSES_MC, "sounds": sounds}
 
 

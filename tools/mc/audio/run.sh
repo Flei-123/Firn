@@ -64,7 +64,7 @@ if $FIRNC -o "$W/t2" tests/2792_mc_audio_wire.fi 2>"$W/err" && "$W/t2" > "$W/t2.
 else
     echo "  FAIL  tests/2792_mc_audio_wire.fi"; head -10 "$W/err"; grep -v '^ok' "$W/t2.out" | head; ERR=1
 fi
-# synth bank vs sound id table (1.20.1): report gaps, tier 1 = heard constantly (heuristic ranking, see coverage.py); baseline = 650
-python3 -I tools/mc/audio/coverage.py lib/mc/v763/mc_snd_v763.fi tools/sounds/mc.json --top 0 --check --allow 700 | sed 's/^/  /' || ERR=1
+# synth bank vs sound id table (1.20.1): report gaps, tier 1 = heard constantly (heuristic ranking, see coverage.py); baseline = 580
+python3 -I tools/mc/audio/coverage.py lib/mc/v763/mc_snd_v763.fi tools/sounds/mc.json --top 0 --check --allow 600 | sed 's/^/  /' || ERR=1
 [ $ERR -eq 0 ] && echo "RESULT mc-audio: ok" || echo "RESULT mc-audio: FAIL"
 exit $ERR
