@@ -1,0 +1,514 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/gpu/vk_life.fi -- gpu.vk_life: the LIFECYCLE layer on top of gpu.vk (docs/VK-RENDERER.md, roadmap r179):
+//   1. pipeline cache   a VkPipelineCache that lives on disk: load (file wrapper + CRC + Vulkan header validation against the
+//                       CURRENT device: vendor, device id, pipelineCacheUUID, header version), save (atomic), reject stale data
+//   2. swapchain        `frame` wraps vk.sc_frame: window resize, OUT_OF_DATE, SUBOPTIMAL, minimised window (0 x 0), rebuild of the
+//                       swapchain + semaphores, a generation counter + callback for dependent resources (depth, MSAA, ...)
+//   3. device lost      VK_ERROR_DEVICE_LOST is detected (real or injected with vk.inject), reported as LF_DEVICE_LOST, and
+//                       `recover_device` re-creates instance + device + cache (the caller re-creates its own objects)
+//
+//     var l: vk_life.Life = vk_life.life_new()
+//     vk.open(&v, true, true)
+//     vk_life.life_open(&v, &l)                                   // function table, device ids
+//     vk_life.cache_open(&v, &l, "pipes.vkc")                     // BEFORE the first pipeline_new; v.cache is set -> pipelines use it
+//     ... vk.sc_open(&v, &sc, xid, w, h, 0) ...
+//     loop { let st: i32 = vk_life.frame(&v, &l, &sc, &p, &vb, 3, clear, win_w, win_h)
+//            if st == LF_DEVICE_LOST { free own objects; vk_life.recover_device(&v, &l, true, true, "pipes.vkc"); rebuild; } }
+//     vk_life.cache_save(&v, &l, "pipes.vkc"); vk_life.cache_close(&v, &l)
+//
+// Rebuild of dependent resources: `l.sc_gen` is bumped after every swapchain re-creation (compare it with your own copy), and
+// `l.on_rebuild(l.ud, w, h)` is called right after it (default: nothing). Same for `l.on_lost(l.ud)` at device loss.
+// THREADS: main thread only (as gpu.vk). Real hardware: UNTESTED (lavapipe + Xvfb only, which never loses a device by itself:
+// loss is simulated by fault injection, vk.inject).
+
+import std.rt
+import std.fs
+import std.deflate
+import gpu.vk
+
+export {
+    Life, life_new, life_open, life_close, classify, frame, draw_checked, poll_result, surface_recover, recover_device,
+    cache_open, cache_save, cache_close, cache_bytes, cache_header_check, wrap_blob, unwrap_blob, WRAP_HEADER,
+    RES_OK, RES_TIMEOUT, RES_SUBOPTIMAL, RES_OUT_OF_DATE, RES_DEVICE_LOST, RES_SURFACE_LOST, RES_OOM_HOST, RES_OOM_DEVICE,
+    RES_INIT_FAILED,
+    CLS_OK, CLS_SUBOPTIMAL, CLS_OUT_OF_DATE, CLS_DEVICE_LOST, CLS_SURFACE_LOST, CLS_OOM, CLS_TIMEOUT, CLS_OTHER,
+    LF_OK, LF_MINIMIZED, LF_DEVICE_LOST, LF_SURFACE_LOST, LF_ERROR,
+    CACHE_NONE, CACHE_LOADED, CACHE_BAD_FILE, CACHE_BAD_HEADER, CACHE_IO_ERROR, CACHE_CREATE_FAILED,
+    HDR_OK, HDR_SHORT, HDR_SIZE, HDR_VERSION, HDR_VENDOR, HDR_DEVICE, HDR_UUID,
+}
+
+// ---- VkResult values (low 32 bits) --------------------------------------------------------------------------------
+const RES_OK: u64 = 0
+const RES_TIMEOUT: u64 = 2
+const RES_SUBOPTIMAL: u64 = 1000001003 // VK_SUBOPTIMAL_KHR
+const RES_OUT_OF_DATE: u64 = 0xC4653214 // VK_ERROR_OUT_OF_DATE_KHR (-1000001004)
+const RES_DEVICE_LOST: u64 = 0xFFFFFFFC // VK_ERROR_DEVICE_LOST (-4)
+const RES_SURFACE_LOST: u64 = 0xC4653600 // VK_ERROR_SURFACE_LOST_KHR (-1000000000)
+const RES_OOM_HOST: u64 = 0xFFFFFFFF // -1
+const RES_OOM_DEVICE: u64 = 0xFFFFFFFE // -2
+const RES_INIT_FAILED: u64 = 0xFFFFFFFD // -3
+
+const CLS_OK: i32 = 0
+const CLS_SUBOPTIMAL: i32 = 1
+const CLS_OUT_OF_DATE: i32 = 2
+const CLS_DEVICE_LOST: i32 = 3
+const CLS_SURFACE_LOST: i32 = 4
+const CLS_OOM: i32 = 5
+const CLS_TIMEOUT: i32 = 6
+const CLS_OTHER: i32 = 7
+
+// results of `frame`
+const LF_OK: i32 = 0 // a frame was rendered and presented
+const LF_MINIMIZED: i32 = 1 // window size 0: nothing done (call again with the new size)
+const LF_DEVICE_LOST: i32 = 2 // free your objects, recover_device(), re-create them
+const LF_SURFACE_LOST: i32 = 3 // surface_recover()
+const LF_ERROR: i32 = 4
+
+// results of `cache_open`
+const CACHE_NONE: i32 = 0 // no file: empty cache
+const CACHE_LOADED: i32 = 1 // file accepted, the driver got the data
+const CACHE_BAD_FILE: i32 = 2 // wrapper magic / version / length / CRC wrong: empty cache
+const CACHE_BAD_HEADER: i32 = 3 // Vulkan header says another device / driver / version: empty cache
+const CACHE_IO_ERROR: i32 = 4 // the file exists but cannot be read: empty cache
+const CACHE_CREATE_FAILED: i32 = 5 // not even an empty cache could be created (pipelines work, uncached)
+
+// results of `cache_header_check`
+const HDR_OK: i32 = 0
+const HDR_SHORT: i32 = 1
+const HDR_SIZE: i32 = 2
+const HDR_VERSION: i32 = 3
+const HDR_VENDOR: i32 = 4
+const HDR_DEVICE: i32 = 5
+const HDR_UUID: i32 = 6
+
+const WRAP_MAGIC: u32 = 0x43504E46 // "FNPC" little endian
+const WRAP_VERSION: u32 = 1
+const WRAP_HEADER: usize = 16 // magic, version, blob length, crc32 of the blob
+const VK_HEADER_LEN: usize = 32 // u32 size, u32 version, u32 vendor, u32 device, uuid[16]
+
+// own function table (instance proc addr; the entries of gpu.vk are private)
+const L_CREATE_CACHE: usize = 0
+const L_DESTROY_CACHE: usize = 1
+const L_GET_DATA: usize = 2
+const L_PHYS_PROPS: usize = 3
+const L_CREATE_SEM: usize = 4
+const L_DESTROY_SEM: usize = 5
+const L_COUNT: usize = 8
+
+struct Life {
+    ok: bool,
+    ft: u64, // L_COUNT function pointers
+    uuid: u64, // 16 octets: pipelineCacheUUID of the chosen device
+    vendor: u64,
+    device_id: u64,
+    cache: u64, // VkPipelineCache (0 = none)
+    cache_status: i32, // CACHE_*
+    cache_loaded: usize, // octets of driver data accepted from the file
+    cache_saved: usize, // octets written by the last cache_save
+    // swapchain bookkeeping
+    sc_gen: u64, // bumped after every swapchain re-creation (dependent resources: compare with your copy)
+    rebuilds: u64,
+    out_of_date: u64,
+    suboptimal: u64,
+    subopt_streak: u64,
+    need_rebuild: bool,
+    minimized: bool,
+    req_w: i32, // the window size of the last (re)build request
+    req_h: i32,
+    // device loss
+    lost: bool,
+    lost_count: u64,
+    epoch: u64, // bumped by recover_device: handles of an older epoch are invalid
+    last_class: i32, // CLS_* of the last failure
+    // callbacks (ud = your pointer); defaults do nothing
+    ud: u64,
+    on_rebuild: fn(u64, i32, i32),
+    on_lost: fn(u64),
+}
+
+fn nop_rebuild(ud: u64, w: i32, h: i32) {}
+fn nop_lost(ud: u64) {}
+
+fn life_new() -> Life {
+    return Life { ok: false, ft: 0, uuid: 0, vendor: 0, device_id: 0, cache: 0, cache_status: CACHE_NONE, cache_loaded: 0,
+        cache_saved: 0, sc_gen: 0, rebuilds: 0, out_of_date: 0, suboptimal: 0, subopt_streak: 0, need_rebuild: false,
+        minimized: false, req_w: 0, req_h: 0, lost: false, lost_count: 0, epoch: 0, last_class: CLS_OK, ud: 0,
+        on_rebuild: nop_rebuild, on_lost: nop_lost }
+}
+
+// ---- VkResult classification ----------------------------------------------------------------------------------------
+fn classify(r: u64) -> i32 {
+    let x: u64 = r & 0xFFFFFFFF
+    if x == RES_OK { return CLS_OK }
+    if x == RES_SUBOPTIMAL { return CLS_SUBOPTIMAL }
+    if x == RES_OUT_OF_DATE { return CLS_OUT_OF_DATE }
+    if x == RES_DEVICE_LOST { return CLS_DEVICE_LOST }
+    if x == RES_SURFACE_LOST { return CLS_SURFACE_LOST }
+    if x == RES_OOM_HOST || x == RES_OOM_DEVICE { return CLS_OOM }
+    if x == RES_TIMEOUT { return CLS_TIMEOUT }
+    return CLS_OTHER
+}
+
+// ---- setup -----------------------------------------------------------------------------------------------------------
+fn lsym(v: *mut vk.Vk, l: *mut Life, i: usize, name: str) -> bool {
+    (*v).top = 0
+    let p: u64 = vk.call((*v).gipa, (*v).inst, vk.cstr(v, name), 0, 0, 0, 0)
+    rt.st64((*l).ft, i, p)
+    return p != 0
+}
+
+fn lc(l: *mut Life, i: usize, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    return vk.call(rt.ld64((*l).ft, i), a0, a1, a2, a3, a4, a5)
+}
+
+// Resolves the extra entry points and reads the identity of the chosen device (vendor, device id, pipelineCacheUUID).
+// `v` must be open(). Calling it again (after a re-open) is fine.
+fn life_open(v: *mut vk.Vk, l: *mut Life) -> bool {
+    if (*l).ft != 0 { rt.heap_free((*l).ft, L_COUNT * 8) }
+    if (*l).uuid != 0 { rt.heap_free((*l).uuid, 16) }
+    (*l).ok = false
+    (*l).ft = rt.heap_alloc(L_COUNT * 8)
+    (*l).uuid = rt.heap_alloc(16)
+    if (*l).ft == 0 || (*l).uuid == 0 || !(*v).ok {
+        return false
+    }
+    rt.mem_set((*l).ft, 0 as u8, L_COUNT * 8)
+    var good_syms: bool = true
+    if !lsym(v, l, L_CREATE_CACHE, "vkCreatePipelineCache") { good_syms = false }
+    if !lsym(v, l, L_DESTROY_CACHE, "vkDestroyPipelineCache") { good_syms = false }
+    if !lsym(v, l, L_GET_DATA, "vkGetPipelineCacheData") { good_syms = false }
+    if !lsym(v, l, L_PHYS_PROPS, "vkGetPhysicalDeviceProperties") { good_syms = false }
+    if !lsym(v, l, L_CREATE_SEM, "vkCreateSemaphore") { good_syms = false }
+    if !lsym(v, l, L_DESTROY_SEM, "vkDestroySemaphore") { good_syms = false }
+    if !good_syms {
+        return false
+    }
+    (*v).top = 0
+    let props: u64 = vk.sa(v, 1024)
+    lc(l, L_PHYS_PROPS, (*v).phys, props, 0, 0, 0, 0)
+    (*l).vendor = vk.r32(props, 8)
+    (*l).device_id = vk.r32(props, 12)
+    rt.mem_copy((*l).uuid, props + 276, 16) // pipelineCacheUUID
+    (*l).ok = true
+    return true
+}
+
+fn life_close(v: *mut vk.Vk, l: *mut Life) {
+    cache_close(v, l)
+    if (*l).ft != 0 { rt.heap_free((*l).ft, L_COUNT * 8) }
+    if (*l).uuid != 0 { rt.heap_free((*l).uuid, 16) }
+    (*l).ft = 0
+    (*l).uuid = 0
+    (*l).ok = false
+}
+
+// ---- pipeline cache: file wrapper -----------------------------------------------------------------------------------
+fn put32(p: u64, idx: usize, x: u32) {
+    rt.st32(p, idx, x)
+}
+
+// Wraps `n` octets of driver data into `out` (appended): "FNPC", version, length, CRC-32, data. Guards against truncated
+// or damaged files BEFORE a driver parses them.
+fn wrap_blob(blob: u64, n: usize, out: *mut rt.Buf) {
+    let base: usize = (*out).len
+    rt.buf_reserve(out, base + WRAP_HEADER + n)
+    rt.buf_set_len(out, base + WRAP_HEADER + n)
+    let p: u64 = rt.buf_ptr(out) + (base as u64)
+    put32(p, 0, WRAP_MAGIC)
+    put32(p, 1, WRAP_VERSION)
+    put32(p, 2, n as u32)
+    put32(p, 3, deflate.crc32(blob, n))
+    rt.mem_copy(p + (WRAP_HEADER as u64), blob, n)
+}
+
+// Checks a wrapped file of `size` octets at `p`. Returns the length of the driver data (its address is p + WRAP_HEADER) or -1.
+fn unwrap_blob(p: u64, size: usize) -> i64 {
+    if size < WRAP_HEADER { return -1 as i64 }
+    if rt.ld32(p, 0) != WRAP_MAGIC || rt.ld32(p, 1) != WRAP_VERSION { return -1 as i64 }
+    let n: usize = rt.ld32(p, 2) as usize
+    if n + WRAP_HEADER != size { return -1 as i64 }
+    if deflate.crc32(p + (WRAP_HEADER as u64), n) != rt.ld32(p, 3) { return -1 as i64 }
+    return n as i64
+}
+
+// Validates the Vulkan pipeline cache header (spec: VkPipelineCacheHeaderVersionOne) of `n` octets at `p` against this device.
+fn cache_header_check(l: *mut Life, p: u64, n: usize) -> i32 {
+    if n < VK_HEADER_LEN { return HDR_SHORT }
+    let hs: usize = rt.ld32(p, 0) as usize
+    if hs < VK_HEADER_LEN || hs > n { return HDR_SIZE }
+    if rt.ld32(p, 1) != (1 as u32) { return HDR_VERSION }
+    if (rt.ld32(p, 2) as u64) != (*l).vendor { return HDR_VENDOR }
+    if (rt.ld32(p, 3) as u64) != (*l).device_id { return HDR_DEVICE }
+    if !rt.mem_eq(p + 16, (*l).uuid, 16) { return HDR_UUID }
+    return HDR_OK
+}
+
+fn make_cache(v: *mut vk.Vk, l: *mut Life, data: u64, n: usize) -> bool {
+    (*v).top = 0
+    let ci: u64 = vk.sa(v, 40)
+    vk.w32(ci, 0, 17) // PIPELINE_CACHE_CREATE_INFO
+    vk.w64(ci, 24, n as u64)
+    vk.w64(ci, 32, data)
+    let out: u64 = vk.sa(v, 8)
+    if !vk.good(lc(l, L_CREATE_CACHE, (*v).dev, ci, 0, out, 0, 0)) {
+        return false
+    }
+    (*l).cache = vk.r64(out, 0)
+    (*v).cache = (*l).cache
+    return true
+}
+
+// Creates the pipeline cache and sets `v.cache` (every pipeline made afterwards uses it). `path` = "" -> an empty cache without
+// a file. A missing / damaged / foreign file is NOT an error: an empty cache is made and the status says why (CACHE_*).
+fn cache_open(v: *mut vk.Vk, l: *mut Life, path: str) -> i32 {
+    if !(*l).ok || !(*v).ok { return CACHE_CREATE_FAILED }
+    cache_close(v, l)
+    (*l).cache_status = CACHE_NONE
+    (*l).cache_loaded = 0
+    if path.length() > 0 && fs.exists(path) {
+        var b: rt.Buf = rt.buf_new()
+        let got: usize = fs.read_file(path, &b) catch | e | (0)
+        if got == 0 {
+            (*l).cache_status = CACHE_IO_ERROR
+        } else {
+            let n: i64 = unwrap_blob(rt.buf_ptr(&b), rt.buf_len(&b))
+            if n < (0 as i64) {
+                (*l).cache_status = CACHE_BAD_FILE
+            } else if cache_header_check(l, rt.buf_ptr(&b) + (WRAP_HEADER as u64), n as usize) != HDR_OK {
+                (*l).cache_status = CACHE_BAD_HEADER
+            } else {
+                // a fresh copy: the driver wants a plain aligned pointer
+                let copy: u64 = rt.heap_alloc(n as usize)
+                if copy != 0 {
+                    rt.mem_copy(copy, rt.buf_ptr(&b) + (WRAP_HEADER as u64), n as usize)
+                    if make_cache(v, l, copy, n as usize) {
+                        (*l).cache_status = CACHE_LOADED
+                        (*l).cache_loaded = n as usize
+                    }
+                    rt.heap_free(copy, n as usize)
+                }
+            }
+        }
+        rt.buf_free(&b)
+        if (*l).cache != 0 {
+            return (*l).cache_status
+        }
+        if (*l).cache_status == CACHE_LOADED {
+            // the driver refused data that passed our header check: treat like a foreign header
+            (*l).cache_status = CACHE_BAD_HEADER
+        }
+    }
+    if !make_cache(v, l, 0, 0) {
+        (*l).cache_status = CACHE_CREATE_FAILED
+    }
+    return (*l).cache_status
+}
+
+// Size in octets of the driver data currently in the cache (0 = none / failed).
+fn cache_bytes(v: *mut vk.Vk, l: *mut Life) -> usize {
+    if (*l).cache == 0 { return 0 }
+    (*v).top = 0
+    let sz: u64 = vk.sa(v, 8)
+    if !vk.good(lc(l, L_GET_DATA, (*v).dev, (*l).cache, sz, 0, 0, 0)) { return 0 }
+    return vk.r64(sz, 0) as usize
+}
+
+// Writes the cache (wrapped, atomic replace) to `path`. False = no cache, nothing to save, or I/O error.
+fn cache_save(v: *mut vk.Vk, l: *mut Life, path: str) -> bool {
+    if (*l).cache == 0 || path.length() == 0 { return false }
+    let n: usize = cache_bytes(v, l)
+    if n == 0 { return false }
+    let blob: u64 = rt.heap_alloc(n)
+    if blob == 0 { return false }
+    (*v).top = 0
+    let sz: u64 = vk.sa(v, 8)
+    vk.w64(sz, 0, n as u64)
+    let r: u64 = lc(l, L_GET_DATA, (*v).dev, (*l).cache, sz, blob, 0, 0)
+    var ok: bool = false
+    if vk.good(r) || (r & 0xFFFFFFFF) == 5 { // VK_INCOMPLETE: a smaller prefix, still a valid cache header + data
+        let got: usize = vk.r64(sz, 0) as usize
+        if got > 0 && got <= n {
+            var out: rt.Buf = rt.buf_new()
+            wrap_blob(blob, got, &out)
+            let parent: str = fs.path_parent(path)
+            if parent.length() > 0 {
+                let made: bool = fs.mkdir_all(parent) catch false
+            }
+            ok = fs.write_atomic(path, rt.buf_ptr(&out), rt.buf_len(&out)) catch false
+            if ok { (*l).cache_saved = got }
+            rt.buf_free(&out)
+        }
+    }
+    rt.heap_free(blob, n)
+    return ok
+}
+
+fn cache_close(v: *mut vk.Vk, l: *mut Life) {
+    if (*l).cache != 0 && (*v).dev != 0 && (*l).ft != 0 {
+        lc(l, L_DESTROY_CACHE, (*v).dev, (*l).cache, 0, 0, 0, 0)
+    }
+    (*l).cache = 0
+    (*v).cache = 0
+}
+
+// ---- swapchain + device loss -----------------------------------------------------------------------------------------
+fn sem_new(v: *mut vk.Vk, l: *mut Life) -> u64 {
+    (*v).top = 0
+    let si: u64 = vk.sa(v, 24)
+    vk.w32(si, 0, 9) // SEMAPHORE_CREATE_INFO
+    let out: u64 = vk.sa(v, 8)
+    if !vk.good(lc(l, L_CREATE_SEM, (*v).dev, si, 0, out, 0, 0)) { return 0 }
+    return vk.r64(out, 0)
+}
+
+// Idle, new semaphores (a semaphore left signalled / unwaited by a failed acquire or present must not be reused), new
+// swapchain for w x h. On success: sc_gen + 1, on_rebuild called. A failed build leaves `s.ok == false` (frame() retries).
+fn rebuild(v: *mut vk.Vk, l: *mut Life, s: *mut vk.Sc, w: i32, h: i32) -> bool {
+    vk.idle(v)
+    if (*s).sem_acq != 0 { lc(l, L_DESTROY_SEM, (*v).dev, (*s).sem_acq, 0, 0, 0, 0) }
+    if (*s).sem_done != 0 { lc(l, L_DESTROY_SEM, (*v).dev, (*s).sem_done, 0, 0, 0, 0) }
+    (*s).sem_acq = 0
+    (*s).sem_done = 0
+    (*l).req_w = w
+    (*l).req_h = h
+    if !vk.sc_resize(v, s, w, h) {
+        (*s).ok = false
+        return false
+    }
+    (*s).sem_acq = sem_new(v, l)
+    (*s).sem_done = sem_new(v, l)
+    if (*s).sem_acq == 0 || (*s).sem_done == 0 {
+        (*s).ok = false
+        return false
+    }
+    (*s).ok = true
+    (*l).need_rebuild = false
+    (*l).rebuilds = (*l).rebuilds + 1
+    (*l).sc_gen = (*l).sc_gen + 1
+    let cb: fn(u64, i32, i32) = (*l).on_rebuild
+    cb((*l).ud, (*s).w, (*s).h)
+    return true
+}
+
+fn mark_lost(l: *mut Life, cls: i32) -> i32 {
+    (*l).last_class = cls
+    if cls == CLS_DEVICE_LOST {
+        if !(*l).lost {
+            (*l).lost = true
+            (*l).lost_count = (*l).lost_count + 1
+            let cb: fn(u64) = (*l).on_lost
+            cb((*l).ud)
+        }
+        return LF_DEVICE_LOST
+    }
+    if cls == CLS_SURFACE_LOST { return LF_SURFACE_LOST }
+    return LF_ERROR
+}
+
+// Looks at the last VkResult gpu.vk saw (submit / acquire / present) and updates the loss state. Returns CLS_*.
+fn poll_result(v: *mut vk.Vk, l: *mut Life) -> i32 {
+    let cls: i32 = classify((*v).last_res)
+    if cls == CLS_DEVICE_LOST { mark_lost(l, cls) }
+    return cls
+}
+
+// One frame with everything handled: w/h = the CURRENT window size (0 = minimised). Order: loss state, minimised, size change /
+// pending rebuild (suboptimal), sc_frame, OUT_OF_DATE -> rebuild + retry once. Returns LF_*; after LF_OK the frame is presented.
+// If `l.sc_gen` changed during the call, dependent resources have been re-created (or on_rebuild told you).
+fn frame(v: *mut vk.Vk, l: *mut Life, s: *mut vk.Sc, p: *mut vk.Pipe, vb: *mut vk.Buf, nverts: u64, clear: u32, w: i32, h: i32) -> i32 {
+    if (*l).lost { return LF_DEVICE_LOST }
+    if w <= 0 || h <= 0 {
+        (*l).minimized = true
+        return LF_MINIMIZED
+    }
+    if (*l).minimized {
+        (*l).minimized = false
+        (*l).need_rebuild = true
+    }
+    if !(*s).ok || (*l).need_rebuild || w != (*l).req_w || h != (*l).req_h {
+        if (*s).surface == 0 { return LF_ERROR }
+        if !rebuild(v, l, s, w, h) {
+            (*l).last_class = CLS_OTHER
+            return LF_ERROR
+        }
+    }
+    var tries: i32 = 0
+    while tries < 2 {
+        (*v).last_res = 0
+        let r: i32 = vk.sc_frame(v, s, p, vb, nverts, clear)
+        let cls: i32 = classify((*v).last_res)
+        if r == vk.FRAME_OK {
+            if cls == CLS_SUBOPTIMAL {
+                (*l).suboptimal = (*l).suboptimal + 1
+                (*l).subopt_streak = (*l).subopt_streak + 1
+                // the driver may report SUBOPTIMAL forever (e.g. an unsupported transform): rebuild a few times, then live with it
+                if (*l).subopt_streak <= 3 { (*l).need_rebuild = true }
+            } else {
+                (*l).subopt_streak = 0
+            }
+            return LF_OK
+        }
+        if r == vk.FRAME_RESIZE {
+            (*l).out_of_date = (*l).out_of_date + 1
+            if !rebuild(v, l, s, w, h) {
+                (*l).last_class = CLS_OTHER
+                return LF_ERROR
+            }
+            tries = tries + 1
+        } else {
+            return mark_lost(l, cls)
+        }
+    }
+    return LF_ERROR
+}
+
+// vk.draw (offscreen) with loss detection: LF_OK, LF_DEVICE_LOST or LF_ERROR.
+fn draw_checked(v: *mut vk.Vk, l: *mut Life, t: *mut vk.Target, p: *mut vk.Pipe, vb: *mut vk.Buf, nverts: u64, clear: u32) -> i32 {
+    if (*l).lost { return LF_DEVICE_LOST }
+    (*v).last_res = 0
+    if vk.draw(v, t, p, vb, nverts, clear) {
+        return LF_OK
+    }
+    return mark_lost(l, classify((*v).last_res))
+}
+
+// After LF_SURFACE_LOST: drop surface + swapchain and make them again for the same X11 window (device is fine).
+fn surface_recover(v: *mut vk.Vk, l: *mut Life, s: *mut vk.Sc, xid: u64, w: i32, h: i32, mode: i32) -> bool {
+    vk.sc_close(v, s)
+    if !vk.sc_open(v, s, xid, w, h, mode) { return false }
+    (*l).req_w = w
+    (*l).req_h = h
+    (*l).need_rebuild = false
+    (*l).sc_gen = (*l).sc_gen + 1
+    let cb: fn(u64, i32, i32) = (*l).on_rebuild
+    cb((*l).ud, (*s).w, (*s).h)
+    return true
+}
+
+// After LF_DEVICE_LOST (or on request): re-create instance + device (+ pipeline cache from `cache_path`, "" = empty). The CALLER
+// must have destroyed all its own objects (Target, Pipe, Buf, Sc: handles of the old device are invalid; do not call their
+// *_free after this) and creates them again afterwards. Bumps `epoch` and `sc_gen`. False = the machine has no device any more.
+fn recover_device(v: *mut vk.Vk, l: *mut Life, want_surface: bool, allow_cpu: bool, cache_path: str) -> bool {
+    if (*l).cache != 0 && cache_path.length() > 0 && !(*l).lost {
+        cache_save(v, l, cache_path) // best effort; a lost device cannot give its data back, the file of the last save stays
+    }
+    (*l).cache = 0 // the handle dies with the device
+    (*v).cache = 0
+    vk.close(v)
+    vk.release(v)
+    (*v).inj_site = 0
+    if !vk.open(v, want_surface, allow_cpu) {
+        (*l).ok = false
+        return false
+    }
+    if !life_open(v, l) { return false }
+    cache_open(v, l, cache_path)
+    (*l).lost = false
+    (*l).epoch = (*l).epoch + 1
+    (*l).sc_gen = (*l).sc_gen + 1
+    (*l).need_rebuild = false
+    (*l).req_w = 0
+    (*l).req_h = 0
+    (*l).subopt_streak = 0
+    return true
+}
