@@ -1,0 +1,189 @@
+// expect_exit: 0
+// mc.vk_mc swapchain present (r195) on lavapipe + Xvfb (NO real GPU): end() blits the colour image into the swapchain image and presents it.
+// The window content read back from the X server (XGetImage) must equal the read back colour image; same after a window resize, after an injected
+// SUBOPTIMAL present (rebuild before the next frame), an injected OUT_OF_DATE present and an injected OUT_OF_DATE acquire (frame skipped, then fine).
+// SKIP (exit 0) without DISPLAY / Vulkan device.
+import std.rt
+import std.io
+import std.env
+import window.window
+import window.backend
+import gpu.vk
+import gpu.vk_life
+import mc.mc_backend
+import mc.mc_camera
+import mc.mc_texture
+import mc.vk_mc
+
+fn pump(w: *mut window.Window, ms: i64) {
+    window.wait_event(w, ms)
+    var k: u32 = window.next_event(w)
+    var n: i32 = 0
+    while k != window.EV_NONE && n < 10000 {
+        n = n + 1
+        k = window.next_event(w)
+    }
+}
+
+fn set_size(win: *mut window.Window, w: i32, h: i32) -> bool {
+    backend.r_set_size(&(*win).p, w as usize, h as usize)
+    var waited: i32 = 0
+    while (window.width(win) != (w as usize) || window.height(win) != (h as usize)) && waited < 3000 {
+        pump(win, 20)
+        waited = waited + 20
+    }
+    return window.width(win) == (w as usize) && window.height(win) == (h as usize)
+}
+
+fn quad(b: *mut mc_backend.Backend) -> usize {
+    let v: u64 = rt.heap_alloc(4 * 8)
+    let ix: u64 = rt.heap_alloc(6 * 4)
+    var k: usize = 0
+    let xs: [u32; 4] = [12 as u32, 4 as u32, 4 as u32, 12 as u32]
+    let ys: [u32; 4] = [2 as u32, 2 as u32, 14 as u32, 14 as u32]
+    while k < 4 {
+        rt.st32(v, k * 2, xs[k] | (ys[k] << 8 as u32) | (10 as u32 << 16 as u32) | (3 as u32 << 24 as u32))
+        rt.st32(v, k * 2 + 1, 1 as u32)
+        k = k + 1
+    }
+    rt.st32(ix, 0, 0 as u32)
+    rt.st32(ix, 1, 1 as u32)
+    rt.st32(ix, 2, 2 as u32)
+    rt.st32(ix, 3, 0 as u32)
+    rt.st32(ix, 4, 2 as u32)
+    rt.st32(ix, 5, 3 as u32)
+    let h: usize = (*b).mesh_upload((*b).obj, 1, v, 4, ix, 6)
+    rt.heap_free(v, 32)
+    rt.heap_free(ix, 24)
+    return h
+}
+
+// RGB octets that differ between two RGBA buffers (alpha ignored: the X window has none)
+fn diff_rgb(a: u64, b: u64, npx: usize) -> usize {
+    var bad: usize = 0
+    var i: usize = 0
+    while i < npx {
+        var k: usize = 0
+        while k < 3 {
+            if rt.ld8(a, i * 4 + k) != rt.ld8(b, i * 4 + k) { bad = bad + 1 }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return bad
+}
+
+fn covered(px: u64, n: usize, clear: u32) -> u64 {
+    var cov: u64 = 0
+    var i: usize = 0
+    while i < n {
+        if rt.ld32(px, i) != clear { cov = cov + 1 as u64 }
+        i = i + 1
+    }
+    return cov
+}
+
+// one frame, then compare the X window with the read back image; returns the number of differing octets (or 1000000 when no picture)
+fn frame_diff(vb: *mut vk_mc.VkBackend, bk: *mut mc_backend.Backend, cam: *mut mc_camera.Camera, h: usize, w: i32, hh: i32, clear: u32, win: *mut window.Window) -> usize {
+    (*bk).begin((*bk).obj, (cam as u64), clear)
+    (*bk).draw((*bk).obj, h, 0.0, 0.0, 0.0)
+    (*bk).end((*bk).obj)
+    let rb: u64 = (*bk).present((*bk).obj)
+    pump(win, 30)
+    let n: usize = (w as usize) * (hh as usize)
+    let wp: u64 = rt.heap_alloc(n * 4)
+    var d: usize = 1000000
+    if rb != 0 && vk_mc.vkbe_window_pixels(vb, wp) {
+        d = diff_rgb(rb, wp, n)
+    }
+    rt.heap_free(wp, n * 4)
+    return d
+}
+
+fn main(start: u64) -> i32 {
+    if !env.has("DISPLAY") {
+        io.print("SKIP: no DISPLAY\n")
+        return 0
+    }
+    var win: window.Window = window.window_new()
+    if !(window.open_window(&win, 0) && window.make(&win, 160, 90)) {
+        io.print("SKIP: no X11 window\n")
+        return 0
+    }
+    window.title(&win, "vk sc".p as u64, "vk sc".n)
+    window.show_window(&win)
+    pump(&win, 100)
+    let xid: u64 = backend.r_native(&win.p)
+    var vb: vk_mc.VkBackend = vk_mc.vkbe_blank()
+    if !vk_mc.vkbe_open_win(&vb, 160, 90, "", xid, 0) {
+        io.fmt_print(f"SKIP vkbe_open_win step={vb.step}\n")
+        return 0
+    }
+    var fails: i32 = 0
+    if !vk_mc.vkbe_sc_on(&vb) {
+        io.print("FAIL: no swapchain on the window\n")
+        return 1
+    }
+    let clear: u32 = 0xFFE6BE96 as u32
+    var b: mc_backend.Backend = vk_mc.vkbe_backend(&vb)
+    var ta: mc_texture.Atlas = mc_texture.atlas_default()
+    b.upload_atlas(b.obj, (&ta) as u64)
+    var cam: mc_camera.Camera = mc_camera.camera_new(160, 90)
+    mc_camera.camera_set_pos(&cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&cam, 0.0, 0.0)
+    mc_camera.camera_update(&cam)
+    let h: usize = quad(&b)
+    // 1. plain frames: window == readback
+    var d: usize = frame_diff(&vb, &b, &cam, h, 160, 90, clear, &win)
+    d = frame_diff(&vb, &b, &cam, h, 160, 90, clear, &win)
+    io.fmt_print(f"1. window vs readback: diff={d} presents={vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_PRESENTS)} format={vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_FORMAT)}\n")
+    if d != 0 as usize || vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_PRESENTS) < 2 as u64 { fails = fails + 1 }
+    // the picture is not just the clear colour
+    let rb: u64 = b.present(b.obj)
+    let cov: u64 = covered(rb, 160 * 90, clear)
+    io.fmt_print(f"   quad coverage={cov}\n")
+    if cov < 3000 as u64 { fails = fails + 1 }
+    // 2. window resize 160x90 -> 200x120: swapchain + targets follow
+    if !set_size(&win, 200, 120) { io.print("FAIL set_size\n") }
+    pump(&win, 50)
+    if !vk_mc.vkbe_resize(&vb, 200, 120) { fails = fails + 1 }
+    var cam2: mc_camera.Camera = mc_camera.camera_new(200, 120)
+    mc_camera.camera_set_pos(&cam2, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&cam2, 0.0, 0.0)
+    mc_camera.camera_update(&cam2)
+    d = frame_diff(&vb, &b, &cam2, h, 200, 120, clear, &win)
+    d = frame_diff(&vb, &b, &cam2, h, 200, 120, clear, &win)
+    io.fmt_print(f"2. after resize: diff={d} rebuilds={vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_REBUILDS)}\n")
+    if d != 0 as usize || vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_REBUILDS) < 1 as u64 { fails = fails + 1 }
+    // 3. injected SUBOPTIMAL present: the frame counts, the swapchain is rebuilt before the next one
+    let rb0: u64 = vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_REBUILDS)
+    let pr0: u64 = vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_PRESENTS)
+    vk.inject(&vb.v, vk.INJ_PRESENT, vk_life.RES_SUBOPTIMAL)
+    d = frame_diff(&vb, &b, &cam2, h, 200, 120, clear, &win)
+    d = frame_diff(&vb, &b, &cam2, h, 200, 120, clear, &win)
+    io.fmt_print(f"3. suboptimal: diff={d} rebuilds +{vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_REBUILDS) - rb0} presents +{vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_PRESENTS) - pr0} suboptimal={vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_SUBOPTIMAL)}\n")
+    if d != 0 as usize || vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_REBUILDS) != rb0 + 1 as u64 || vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_PRESENTS) != pr0 + 2 as u64 { fails = fails + 1 }
+    // 4. injected OUT_OF_DATE present: that frame is not counted as shown, rebuild, then fine
+    let rb1: u64 = vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_REBUILDS)
+    let sk1: u64 = vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_SKIPS)
+    vk.inject(&vb.v, vk.INJ_PRESENT, vk_life.RES_OUT_OF_DATE)
+    d = frame_diff(&vb, &b, &cam2, h, 200, 120, clear, &win)
+    d = frame_diff(&vb, &b, &cam2, h, 200, 120, clear, &win)
+    io.fmt_print(f"4. out of date (present): diff={d} rebuilds +{vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_REBUILDS) - rb1} skips +{vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_SKIPS) - sk1}\n")
+    if d != 0 as usize || vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_REBUILDS) != rb1 + 1 as u64 || vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_SKIPS) != sk1 + 1 as u64 { fails = fails + 1 }
+    // 5. injected OUT_OF_DATE acquire: nothing is blitted or submitted with semaphores, the frame is skipped, rebuild, then fine
+    let rb2: u64 = vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_REBUILDS)
+    let sk2: u64 = vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_SKIPS)
+    vk.inject(&vb.v, vk.INJ_ACQUIRE, vk_life.RES_OUT_OF_DATE)
+    b.begin(b.obj, (&cam2) as u64, clear)
+    b.draw(b.obj, h, 0.0, 0.0, 0.0)
+    b.end(b.obj)
+    d = frame_diff(&vb, &b, &cam2, h, 200, 120, clear, &win)
+    d = frame_diff(&vb, &b, &cam2, h, 200, 120, clear, &win)
+    io.fmt_print(f"5. out of date (acquire): diff={d} rebuilds +{vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_REBUILDS) - rb2} skips +{vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_SKIPS) - sk2} lost={vk_mc.vkbe_lost(&vb)}\n")
+    if d != 0 as usize || vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_REBUILDS) != rb2 + 1 as u64 || vk_mc.vkbe_sc_stat(&vb, vk_mc.SC_SKIPS) != sk2 + 1 as u64 || vk_mc.vkbe_lost(&vb) { fails = fails + 1 }
+    vk_mc.vkbe_close(&vb)
+    window.close_window(&win)
+    if fails == 0 { io.print("OK\n") } else { io.fmt_print(f"FAILS {fails}\n") }
+    return fails
+}
