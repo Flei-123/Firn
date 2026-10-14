@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/mc/play/run_lod.sh -- mcplay with MCPLAY_LOD (mc_stream + mc_lod rings) against the official 1.20.1 server: Xvfb + server + mcplay + xdotool.
 # Run A: MCPLAY_VIEW=3 MCPLAY_LOD=9 (3 chunks full detail, the rest LOD; the vanilla server sends its own view distance either way), walks 3 s, screenshot.
-# Run B: MCPLAY_VIEW=3 MCPLAY_STREAM=1 (same stream, no LOD): control. Prints `RESULT mc-play-lod: ok`.
+# Run B: MCPLAY_VIEW=3 (stream is the default, no LOD): control + worker pool + window sync (server radius > view + 2). Prints `RESULT mc-play-lod: ok`.
 # Checks: exit 0, frames, A has LOD columns drawn (lod_cols > 0) and LOD triangles, B none, pictures differ.
 # Env: MC_VIEW_SRV (10 = server view distance), FIRNC, MCPLAY_PNG_OUT (copy of the A screenshot). Start it via heavy (java server).
 set -uo pipefail
@@ -64,7 +64,7 @@ run_one() { # name, env...
     sed 's/^/  /' "$W/$name.out" | grep -E "stream|end frames" | tail -3
 }
 run_one A MCPLAY_VIEW=3 MCPLAY_LOD=9
-run_one B MCPLAY_VIEW=3 MCPLAY_STREAM=1
+run_one B MCPLAY_VIEW=3
 num() { grep -o "$2=[0-9]*" "$W/$1.out" | tail -1 | cut -d= -f2; }
 FA=$(num A frames); FB=$(num B frames); CA=$(num A chunks); CB=$(num B chunks)
 LA=$(num A lod_cols); LB=$(num B lod_cols); TA=$(num A lod_tris); TB=$(num B lod_tris)
@@ -73,6 +73,12 @@ echo "  A frames=${FA:-?} chunks=${CA:-?} lod_cols=${LA:-?} lod_tris=${TA:-?}   
 [ "${CA:-0}" -gt 100 ] || { echo "  FAIL  LOD run loaded only ${CA:-0} chunks"; ERR=1; }
 [ "${LA:-0}" -gt 0 ] && [ "${TA:-0}" -gt 0 ] || { echo "  FAIL  no LOD columns drawn in run A"; ERR=1; }
 [ "${LB:-0}" -eq 0 ] || { echo "  FAIL  LOD columns drawn without MCPLAY_LOD (${LB:-?})"; ERR=1; }
+# worker pool + window logic (a2): B has view 3 but the server sends MC_VIEW_SRV chunks -> columns beyond view + 2 leave the stream (window_ops > 0), the pool is up
+WB=$(num B window_ops); KB=$(grep -o " cols=[0-9]*" "$W/B.out" | tail -1 | cut -d= -f2)
+grep -q 'stream workers=3 pool=true' "$W/B.out" || { echo "  FAIL  stream has no mesher pool (workers=3 expected)"; ERR=1; }
+[ "${WB:-0}" -gt 0 ] || { echo "  FAIL  window sync did nothing (window_ops=${WB:-?}) although the server sends more than view+2"; ERR=1; }
+[ "${KB:-9999}" -lt "${CB:-0}" ] || { echo "  FAIL  stream keeps all ${KB:-?} of ${CB:-?} columns"; ERR=1; }
+echo "  B window_ops=${WB:-?} stream_cols=${KB:-?}"
 [ -s "$W/A.png" ] && [ -s "$W/B.png" ] || { echo "  FAIL  no screenshot"; ERR=1; }
 cmp -s "$W/A.png" "$W/B.png" && { echo "  FAIL  LOD picture equals the no-LOD picture"; ERR=1; }
 [ -n "${MCPLAY_PNG_OUT:-}" ] && [ -s "$W/A.png" ] && cp "$W/A.png" "$MCPLAY_PNG_OUT"
