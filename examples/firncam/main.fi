@@ -1,0 +1,346 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/firncam -- FirnCam mini app: preview, shutter, RAW (DNG) switch, lens switch.
+// Everything about the device comes from the CameraCharacteristics (lib/plat/android/camera.fi).
+//   bash tools/android/build.sh examples/firncam/main.fi --camera --name FirnCam --package org.firn.cam
+// The UI is drawn into one BGRX buffer with a tiny built-in bitmap font (the Android window layer has
+// no system text), then shown with window.image.
+import window.window
+import plat.android.camera
+import plat.android.dngwrite
+import photo.meta
+
+static GLYPHS: [u8; 1652] = "0000000000000000000000000000000000181818181818001818000000000064646464000000000000000000000012167f242cfe68480000000010103c78703c1e167e3c101000000070d0d072184e0b0b0e0000000000386430307bcfce6e3f00000000001818181800000000000000000c181818103030101818180c000030101818180808181818103000000000185a3c3c5a18000000000000000000181818fefe18181800000000000000000000000018181830000000000000003c3c0000000000000000000000000000001818000000000006040c0c081810302060400000003c66667e7e6666663c000000000078181818181818187e00000000003c4c060e0c1830607e00000000003c46063c060606463c00000000000c1c3c6c4c7e0c0c0c00000000007c60607c4e06064e3c00000000003c60607c666666663c00000000007e060c0c1c1818303000000000003c66663c666666663c00000000003c6e66666e3e064c380000000000000018180000001818000000000000001818000000181818300000000000021e78e0781e020000000000000000fefe00fefe000000000000000040701e061e704000000000003c06060c181800181800000000003c625ed2b2b2b2d25e621e000000183c3c2c647e6646c300000000007c6666667c6666667c00000000001c326060606060321c00000000007c6e66666666666e7c00000000007e6060607e6060607e00000000007e6060607e6060606000000000001c7260606e6666363e0000000000666666667e6666666600000000007e181818181818187e00000000003c0c0c0c0c0c0c4c7c0000000000666c7c78786c6c6667000000000060606060606060607e0000000000e6e6fefedadac2c2c20000000000666676765e4e4e4e4600000000003c666666666666663c00000000007c666666667c60606000000000003c666666666666663c0e040000007c666666667c6c666700000000003c6260703c0e06463c00000000007e1818181818181818000000000066666666666666663c0000000000c6666666643c3c3c380000000000c3c3dbda5a7e6e66660000000000e6663c3c183c3c66c60000000000c7666e3c381818181800000000007e060e1c183870607e0000"
+
+const FIRST_GLYPH: u32 = 32
+const GLYPH_COUNT: u32 = 59
+
+fn hexv(c: u8) -> u32 {
+    let v: u32 = c as u32
+    if v >= 97 { return v - 87 }
+    return v - 48
+}
+
+fn glyph_row(ch: u32, row: u32) -> u32 {
+    var c: u32 = ch
+    if c >= 97 && c <= 122 { c = c - 32 }
+    if c < FIRST_GLYPH || c >= FIRST_GLYPH + GLYPH_COUNT { c = 63 }
+    let at: usize = (((c - FIRST_GLYPH) * 28 + row * 2) as usize)
+    return hexv(GLYPHS[at]) * 16 + hexv(GLYPHS[at + 1])
+}
+
+fn px_rect(buf: u64, bw: i32, bh: i32, x0: i32, y0: i32, w: i32, h: i32, col: u32) {
+    var y: i32 = y0
+    while y < y0 + h {
+        if y >= 0 && y < bh {
+            var x: i32 = x0
+            while x < x0 + w {
+                if x >= 0 && x < bw {
+                    *((buf + (((y * bw + x) * 4) as u64)) as *mut u32) = col
+                }
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+}
+
+fn draw_text(buf: u64, bw: i32, bh: i32, x0: i32, y0: i32, sc: i32, col: u32, s: str) {
+    var i: usize = 0
+    while i < s.n {
+        let ch: u32 = (*((s.p as u64 + i as u64) as *mut u8)) as u32
+        var row: u32 = 0
+        while row < 14 {
+            let bits: u32 = glyph_row(ch, row)
+            var cx: u32 = 0
+            while cx < 8 {
+                if ((bits >> (7 - cx)) & 1) != 0 {
+                    px_rect(buf, bw, bh, x0 + (i as i32) * 8 * sc + (cx as i32) * sc, y0 + (row as i32) * sc, sc, sc, col)
+                }
+                cx = cx + 1
+            }
+            row = row + 1
+        }
+        i = i + 1
+    }
+}
+
+fn text_w(s: str, sc: i32) -> i32 { return (s.n as i32) * 8 * sc }
+
+// Writes decimal `v` into dst (zero terminated), returns the length.
+fn put_int(dst: u64, v: i64) -> usize {
+    var tmp: [u8; 24] = [0 as u8; 24]
+    var n: usize = 0
+    var x: i64 = v
+    if x < 0 { x = 0 - x }
+    if x == 0 { tmp[0] = 48 as u8; n = 1 }
+    while x > 0 {
+        tmp[n] = (48 + (x % 10)) as u8
+        x = x / 10
+        n = n + 1
+    }
+    var o: usize = 0
+    if v < 0 { *(dst as *mut u8) = 45 as u8; o = 1 }
+    var i: usize = 0
+    while i < n {
+        *((dst + (o + i) as u64) as *mut u8) = tmp[n - 1 - i]
+        i = i + 1
+    }
+    *((dst + (o + n) as u64) as *mut u8) = 0 as u8
+    return o + n
+}
+
+struct App {
+    w: i32,
+    h: i32,
+    scr: u64,
+    prev: u64,
+    pw: i32,
+    ph: i32,
+    nlens: i32,
+    lens: i32,
+    raw_mode: bool,
+    kind: i32,
+    ready: bool,
+    status: [u8; 64],
+    info: camera.CamInfo,
+    shots: i32,
+}
+
+fn set_status(a: *mut App, s: str) {
+    var i: usize = 0
+    while i < s.n && i < 63 {
+        (*a).status[i] = *((s.p as u64 + i as u64) as *mut u8)
+        i = i + 1
+    }
+    (*a).status[i] = 0 as u8
+}
+
+fn status_str(a: *mut App) -> str {
+    var n: usize = 0
+    while n < 63 && (*a).status[n] != 0 as u8 { n = n + 1 }
+    var s: str = ""
+    s.p = (&(*a).status[0]) as u64 as *mut u8
+    s.n = n
+    return s
+}
+
+fn open_lens(a: *mut App, idx: i32) {
+    camera.camera_close()
+    (*a).ready = false
+    if !camera.camera_info(idx, &(*a).info) { set_status(a, "NO INFO"); return }
+    let e: i32 = camera.camera_open(idx)
+    if e != camera.E_OK { set_status(a, "OPEN FAILED"); return }
+    var kind: i32 = camera.KIND_JPEG
+    if (*a).raw_mode && ((*a).info.caps & camera.CAP_RAW) != 0 as u32 && (*a).info.raw_w > 0 {
+        kind = camera.KIND_RAW
+    } else {
+        (*a).raw_mode = false
+    }
+    let s: i32 = camera.camera_start(kind)
+    if s != camera.E_OK { set_status(a, "SESSION FAILED"); return }
+    (*a).kind = camera.camera_kind()
+    (*a).lens = idx
+    (*a).ready = true
+    set_status(a, "READY")
+}
+
+fn stamp() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 0, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0]
+}
+
+fn shoot(a: *mut App) {
+    if !(*a).ready { return }
+    let cap: usize = if (*a).kind == camera.KIND_RAW { ((*a).info.raw_w as usize) * ((*a).info.raw_h as usize) * 2 + 4096 } else { 24 * 1024 * 1024 }
+    let buf: u64 = camera.camera_alloc(cap)
+    if buf == 0 { set_status(a, "NO MEMORY"); return }
+    var fi: camera.FrameInfo = camera.FrameInfo {
+        kind: 0, w: 0, h: 0, offset: 0, size: 0, timestamp: 0, exposure_ns: 0, iso: 0,
+        focus_cmd: 0.0f, focus_res: 0.0f, lens_state: 0, slot: 0, have_result: false,
+    }
+    let n: i32 = camera.camera_capture(1, 0, 0, 0, buf, cap, &fi)
+    if n < 1 {
+        set_status(a, "CAPTURE FAILED")
+        camera.camera_free(buf, cap)
+        return
+    }
+    var name: [u8; 48] = [0 as u8; 48]
+    name[0] = 73 as u8; name[1] = 77 as u8; name[2] = 71 as u8; name[3] = 95 as u8
+    var len: usize = 4 + put_int((&name[0]) as u64 + 4, stamp())
+    (*a).shots = (*a).shots + 1
+    if fi.kind == camera.KIND_RAW {
+        var m: meta.SensorMeta = meta.meta_default()
+        camera.camera_meta(fi.slot, &m)
+        var ex: dngwrite.DngExtra = dngwrite.dng_extra_default()
+        camera.camera_dng_extra(fi.slot, &ex)
+        let dcap: usize = dngwrite.dng_max_size(fi.w as u32, fi.h as u32)
+        let dbuf: u64 = camera.camera_alloc(dcap)
+        if dbuf == 0 { set_status(a, "NO MEMORY"); camera.camera_free(buf, cap); return }
+        let dn: usize = dngwrite.dng_write(dbuf, dcap, buf + fi.offset as u64, fi.w as u32, fi.h as u32, &m, &ex)
+        let ext: str = ".dng"
+        var k: usize = 0
+        while k < 4 { name[len + k] = *((ext.p as u64 + k as u64) as *mut u8); k = k + 1 }
+        let mime: str = "image/x-adobe-dng\0"
+        let r: i32 = if dn > 0 { camera.camera_save(dbuf, dn, (&name[0]) as u64, mime.p as u64) } else { 0 }
+        camera.camera_free(dbuf, dcap)
+        if r == 1 { set_status(a, "SAVED DNG") } else if r == 2 { set_status(a, "SAVED DNG PRIVATE") } else { set_status(a, "SAVE FAILED") }
+    } else if fi.kind == camera.KIND_JPEG {
+        let ext: str = ".jpg"
+        var k: usize = 0
+        while k < 4 { name[len + k] = *((ext.p as u64 + k as u64) as *mut u8); k = k + 1 }
+        let mime: str = "image/jpeg\0"
+        let r: i32 = camera.camera_save(buf + fi.offset as u64, fi.size, (&name[0]) as u64, mime.p as u64)
+        if r == 1 { set_status(a, "SAVED JPG") } else if r == 2 { set_status(a, "SAVED JPG PRIVATE") } else { set_status(a, "SAVE FAILED") }
+    } else {
+        set_status(a, "YUV NOT SAVED")
+    }
+    camera.camera_free(buf, cap)
+}
+
+fn button(a: *mut App, x: i32, y: i32, w: i32, h: i32, bg: u32, label: str, sc: i32) {
+    px_rect((*a).scr, (*a).w, (*a).h, x, y, w, h, bg)
+    draw_text((*a).scr, (*a).w, (*a).h, x + (w - text_w(label, sc)) / 2, y + (h - 14 * sc) / 2, sc, 0xffffff, label)
+}
+
+// Bar geometry shared by drawing and hit test.
+fn bar_top(a: *mut App) -> i32 { return (*a).h - (*a).h / 6 }
+
+fn draw(a: *mut App, f: *mut window.Window) {
+    let w: i32 = (*a).w
+    let h: i32 = (*a).h
+    px_rect((*a).scr, w, h, 0, 0, w, h, 0x101010)
+    let bt: i32 = bar_top(a)
+    if (*a).ready {
+        // newest preview frame, fit into w x (bt)
+        var sw: i32 = 0
+        var sh: i32 = 0
+        camera.camera_stream_size(1, &sw, &sh)
+        var rot: i32 = (*a).info.orientation
+        if (*a).info.facing == 1 { rot = rot } 
+        var dw: i32 = sw
+        var dh: i32 = sh
+        if rot == 90 || rot == 270 { dw = sh; dh = sw }
+        if dw > 0 && dh > 0 {
+            var tw: i32 = w
+            var th: i32 = w * dh / dw
+            if th > bt { th = bt; tw = bt * dw / dh }
+            if tw != (*a).pw || th != (*a).ph {
+                (*a).pw = tw
+                (*a).ph = th
+            }
+            camera.camera_preview_bgrx((*a).prev, tw, th, rot, (*a).info.facing == 0)
+            // copy preview into the screen buffer, centred
+            let ox: i32 = (w - tw) / 2
+            let oy: i32 = (bt - th) / 2
+            var y: i32 = 0
+            while y < th {
+                var x: i32 = 0
+                while x < tw {
+                    *((((*a).scr) + (((oy + y) * w + ox + x) * 4) as u64) as *mut u32) = *((((*a).prev) + ((y * tw + x) * 4) as u64) as *mut u32)
+                    x = x + 1
+                }
+                y = y + 1
+            }
+        }
+    }
+    // status line
+    let sc: i32 = if w >= 900 { 3 } else { 2 }
+    draw_text((*a).scr, w, h, 12, 10, sc, 0xffffff, status_str(a))
+    // lens info line
+    var line: [u8; 48] = [0 as u8; 48]
+    var ln: usize = 0
+    line[0] = 76 as u8; line[1] = 69 as u8; line[2] = 78 as u8; line[3] = 83 as u8; line[4] = 32 as u8
+    ln = 5
+    ln = ln + put_int((&line[0]) as u64 + ln as u64, ((*a).lens + 1) as i64)
+    line[ln] = 47 as u8; ln = ln + 1
+    ln = ln + put_int((&line[0]) as u64 + ln as u64, (*a).nlens as i64)
+    line[ln] = 32 as u8; ln = ln + 1
+    ln = ln + put_int((&line[0]) as u64 + ln as u64, ((*a).info.equiv_mm + 0.5f) as i64)
+    line[ln] = 77 as u8; line[ln + 1] = 77 as u8; ln = ln + 2
+    var ls: str = ""
+    ls.p = (&line[0]) as u64 as *mut u8
+    ls.n = ln
+    draw_text((*a).scr, w, h, 12, 10 + 16 * sc, sc, 0xffd060, ls)
+    // buttons: LENS | RAW | SHOT
+    let by: i32 = bt + 10
+    let bh: i32 = h - bt - 20
+    let bw: i32 = (w - 40) / 3
+    button(a, 10, by, bw, bh, 0x304060, "LENS", sc)
+    var rawcol: u32 = 0x404040
+    if (*a).raw_mode { rawcol = 0x2a8a3a }
+    button(a, 20 + bw, by, bw, bh, rawcol, "RAW", sc)
+    button(a, 30 + 2 * bw, by, bw, bh, 0xb03030, "SHOT", sc)
+    window.image(f, (*a).scr, w as usize, h as usize, 0, 0)
+    window.present(f)
+}
+
+fn hit(a: *mut App, x: i32, y: i32) -> i32 {
+    let bt: i32 = bar_top(a)
+    if y < bt { return 0 }
+    let bw: i32 = ((*a).w - 40) / 3
+    if x < 10 + bw + 5 { return 1 }
+    if x < 20 + 2 * bw + 5 { return 2 }
+    return 3
+}
+
+fn main() -> i32 {
+    var f: window.Window = window.window_new()
+    if !window.open_window(&f, 0) || !window.make(&f, 480, 800) { return 1 }
+    window.show_window(&f)
+    var a: App = App {
+        w: window.width(&f) as i32, h: window.height(&f) as i32, scr: 0, prev: 0, pw: 0, ph: 0,
+        nlens: 0, lens: 0, raw_mode: false, kind: 0, ready: false, status: [0 as u8; 64],
+        info: camera.zero_info(), shots: 0,
+    }
+    a.scr = camera.camera_alloc((a.w * a.h * 4) as usize)
+    a.prev = camera.camera_alloc((a.w * a.h * 4) as usize)
+    if a.scr == 0 || a.prev == 0 { return 2 }
+    set_status(&a, "NO PERMISSION")
+    var asked: bool = false
+    var open: bool = true
+    while open {
+        if !a.ready && a.nlens == 0 {
+            if camera.camera_permission() == 1 {
+                a.nlens = camera.camera_scan()
+                if a.nlens > 0 { open_lens(&a, 0) } else { set_status(&a, "NO CAMERA") }
+            } else if !asked {
+                asked = true
+                camera.camera_request_permission()
+            }
+        }
+        window.wait_event(&f, 30)
+        var k: u32 = window.next_event(&f)
+        while k != window.EV_NONE {
+            if k == window.EV_CLOSED { open = false }
+            if k == window.EV_KEY && window.ev_a(&f) == window.K_ESCAPE { open = false }
+            if k == window.EV_CONFIGURE {
+                let nw: i32 = window.width(&f) as i32
+                let nh: i32 = window.height(&f) as i32
+                if nw != a.w || nh != a.h {
+                    camera.camera_free(a.scr, (a.w * a.h * 4) as usize)
+                    camera.camera_free(a.prev, (a.w * a.h * 4) as usize)
+                    a.w = nw
+                    a.h = nh
+                    a.scr = camera.camera_alloc((nw * nh * 4) as usize)
+                    a.prev = camera.camera_alloc((nw * nh * 4) as usize)
+                }
+            }
+            if k == window.EV_BUTTON && window.ev_a(&f) == window.BTN_LEFT {
+                let z: i32 = hit(&a, window.ev_x(&f) as i32, window.ev_y(&f) as i32)
+                if z == 1 && a.nlens > 0 { open_lens(&a, (a.lens + 1) % a.nlens) }
+                if z == 2 && a.nlens > 0 {
+                    a.raw_mode = !a.raw_mode
+                    open_lens(&a, a.lens)
+                    if !a.raw_mode { } 
+                }
+                if z == 3 { shoot(&a) }
+            }
+            k = window.next_event(&f)
+        }
+        draw(&a, &f)
+    }
+    camera.camera_close()
+    window.close_window(&f)
+    return 0
+}
