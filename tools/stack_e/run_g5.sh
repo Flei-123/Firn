@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # tools/stack_e/run_g5.sh -- G5: `firnc --shared` for the Windows DLL (x86_64-windows, run under Wine) and the aarch64 .so (run under qemu-aarch64).
 # Called by run.sh (gate 134); also usable alone. Wine stages share ~/.wine-firn: never run two at once.
-# NOT covered: a real Windows, a real aarch64 machine, v128 beyond the vector registers next to a struct in a Linux .so (refused), alignment-16 structs.
+# NOT covered: a real Windows, a real aarch64 machine, alignment-16 structs.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
@@ -51,6 +51,10 @@ if command -v wine >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null; t
         "$FIRNC" --shared --target=x86_64-windows --opt-level=$lvl -o "$D/rtn.dll" tools/stack_e/lib_rt.fi || { echo "FAIL dll lib_rt (noattach) $lvl"; rc=1; continue; }
         (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 300 wine hna.exe rtn.dll 2>&1 | tail -1 | grep -q 'ok  host_noattach') && echo "ok  Windows DLL unattached host threads under Wine ($lvl)" || { echo "FAIL DLL unattached host threads (wine, $lvl)"; rc=1; }
     done
+    # r576: stale host-thread stacks that the host re-mapped (no-access / guard / read-write) must not be scanned (VirtualQuery over every region)
+    x86_64-w64-mingw32-gcc -O1 -o "$D/hrm.exe" tools/stack_e/host_remap_win.c || { echo "FAIL mingw host_remap_win"; rc=1; }
+    "$FIRNC" --shared --target=x86_64-windows -o "$D/rtr.dll" tools/stack_e/lib_rt.fi || { echo "FAIL dll lib_rt (remap)"; rc=1; }
+    (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 300 wine hrm.exe rtr.dll 2>&1 | tail -1 | grep -q 'ok  host_remap') && echo "ok  Windows DLL: stale host stacks re-mapped by the host are not scanned" || { echo "FAIL DLL re-mapped stale stack (wine)"; rc=1; }
     # --def: module definition of the exports; dlltool turns it into an import library that links against the DLL
     "$FIRNC" --shared --target=x86_64-windows --def="$D/wdx.def" -o "$D/wd.dll" tools/stack_e/lib_win.fi || { echo "FAIL dll --def"; rc=1; }
     grep -q "^EXPORTS" "$D/wdx.def" && grep -q wd_gc_chains "$D/wdx.def" || { echo "FAIL --def: EXPORTS/wd_gc_chains missing"; rc=1; }
@@ -103,9 +107,13 @@ for tgt in x86_64-linux aarch64-linux; do
         "$FIRNC" --shared --target=$tgt --opt-level=$lvl -o "$D/st2_$tgt.so" tools/stack_e/lib_struct2.fi || { echo "FAIL $tgt .so lib_struct2 $lvl"; rc=1; continue; }
         (cd "$D" && timeout 120 $RUN ./hs2_$tgt ./st2_$tgt.so 2>&1 | grep -q 'host_struct2: all ok') && echo "ok  $tgt .so float aggregates, mixed words, register overflow, results over 8 octets ($lvl)" || { echo "FAIL $tgt .so struct thunks 2 ($lvl)"; rc=1; }
     done
-    # a v128 that finds no vector register next to a struct that needs the thunk is refused with a clear error
-    printf 'struct D24 { x: f64, y: f64, z: f64 }\n#[export_c]\nfn bad_v(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, g: f64, h: f64, x: v128, p: D24) -> u64 { return 0 }\n' > "$D/badv_$tgt.fi"
-    "$FIRNC" --shared --target=$tgt -o "$D/badv_$tgt.so" "$D/badv_$tgt.fi" 2> "$D/errv_$tgt" && { echo "FAIL $tgt .so: v128 beyond the vector registers accepted"; rc=1; } || grep -q 'v128' "$D/errv_$tgt" || { echo "FAIL $tgt .so: v128 error text"; rc=1; }
+    # r577: v128 beyond the vector registers next to a struct that needs the thunk (copied from the C stack / a register to Firn's
+    # stack area, 16 aligned); the C host is the reference
+    $HC -O1 -o "$D/hv_$tgt" tools/stack_e/host_v128struct.c -ldl || { echo "FAIL $tgt gcc host_v128struct"; rc=1; continue; }
+    for lvl in dev-fast release-fast; do
+        "$FIRNC" --shared --target=$tgt --opt-level=$lvl -o "$D/v128st_$tgt.so" tools/stack_e/lib_v128struct.fi || { echo "FAIL $tgt .so lib_v128struct $lvl"; rc=1; continue; }
+        (cd "$D" && timeout 120 $RUN ./hv_$tgt ./v128st_$tgt.so 2>&1 | tail -1 | grep -q 'ok  host_v128struct') && echo "ok  $tgt .so v128 beyond the vector registers next to a struct ($lvl)" || { echo "FAIL $tgt .so v128 + struct ($lvl)"; rc=1; }
+    done
 done
 [ $rc = 0 ] && echo "RESULT g5: ok" || echo "RESULT g5: FAIL"
 exit $rc

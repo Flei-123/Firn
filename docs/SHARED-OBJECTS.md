@@ -88,8 +88,8 @@ class; the thunk gives Firn a 16 octet buffer and loads the registers); a result
 float aggregates (1-4 `f32` or `f64` members, `abi::hfa`; C: one `s`/`d` register per member, Firn: packed eightbyte words; the thunk stages the members into
 memory first), non-HFA structs with float words (C: `x` registers), the closing of the register file when a struct does not fit (C: `NGRN`/`NSRN` = 8,
 the struct goes to the stack), HFAs over 16 octets (`f64` x3 / x4), results: HFA in `s0-s3`/`d0-d3`, up to 16 octets in `x0:x1`, more through `x8` (Firn: hidden
-pointer in `x0`). Not supported (compile error "a v128 parameter finds no vector register"): a `v128` that does not find a vector register in an export that
-needs a thunk; structs with 16-octet alignment do not exist in Firn. Proof: gate 134 -> `run_g5.sh`: `lib_struct_so.fi` + `host_struct_so.c` (shapes without a
+pointer in `x0`). A `v128` that finds no vector register in an export that needs a thunk (r577) is copied to Firn's stack area (16 octets at a 16 octet boundary; the source is the C
+stack or, when Firn ran out of vector registers before C did, a register). Not supported: structs with 16-octet alignment (they do not exist in Firn). Proof: gate 134 -> `run_g5.sh`: `lib_struct_so.fi` + `host_struct_so.c` (shapes without a
 thunk), `lib_struct.fi` + `host_struct.c` (the Win64 test set, now also against gcc System V and aarch64 gcc under qemu) and `lib_struct2.fi` +
 `host_struct2.c` (HFA of 1-4 members, mixed int/float words, 5 / 7 integers then a 16 octet struct, `f64` x7 then a struct, HFAs running out of `d`
 registers, 14 mixed arguments, results of every shape, results next to struct arguments, a result with 7 stack-bound integers), dev-fast + release-fast; the C

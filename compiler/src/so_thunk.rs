@@ -39,8 +39,6 @@ pub fn runtime_asm() -> Result<String, String> {
     Ok(s)
 }
 
-const V128_MSG: &str = "a v128 parameter finds no vector register (take a pointer instead)";
-
 // ------------------------------------------------------------------------------------------------------------ x86-64
 
 /// where a Firn word comes from, as a displacement from `rbp`
@@ -106,11 +104,15 @@ fn sysv_thunk(c_name: &str, sym: &str, params: &[SoKind], ret: &AggRet) -> Resul
             }
             SoKind::V128 => {
                 if nx >= 8 {
-                    return Err(V128_MSG.to_string());
+                    // C: sixteen octets on the stack at a sixteen octet boundary (the area starts 16-aligned at rbp+16)
+                    st = (st + 1) / 2 * 2;
+                    items.push((true, XSrc::Q(stack(st))));
+                    st += 2;
+                } else {
+                    any_q = true;
+                    items.push((true, XSrc::Q(x_park_sse(nx))));
+                    nx += 1;
                 }
-                any_q = true;
-                items.push((true, XSrc::Q(x_park_sse(nx))));
-                nx += 1;
             }
             SoKind::Words { sse, .. } => {
                 let need_i = sse.iter().filter(|x| !**x).count();
@@ -158,13 +160,24 @@ fn sysv_thunk(c_name: &str, sym: &str, params: &[SoKind], ret: &AggRet) -> Resul
             }
             fi += 1;
         } else {
-            if matches!(src, XSrc::Q(_)) {
-                return Err(V128_MSG.to_string());
-            }
             spill.push(*src);
         }
     }
-    let room = (spill.len() * 8 + 15) / 16 * 16;
+    // Firn's outgoing stack area: eight octets per argument, a `v128` takes sixteen at a sixteen octet boundary
+    // (`codegen_x86::stack_offsets`)
+    let mut spill_at: Vec<usize> = Vec::new();
+    let mut at = 0usize;
+    for src in &spill {
+        if matches!(src, XSrc::Q(_)) {
+            at = (at + 15) / 16 * 16;
+            spill_at.push(at);
+            at += 16;
+        } else {
+            spill_at.push(at);
+            at += 8;
+        }
+    }
+    let room = (at + 15) / 16 * 16;
     let mut s = String::new();
     s.push_str(&format!("\n.globl {}\n{}:\n", c_name, c_name));
     s.push_str(&format!("    # System V -> Firn for {} (r558)\n", sym));
@@ -183,9 +196,14 @@ fn sysv_thunk(c_name: &str, sym: &str, params: &[SoKind], ret: &AggRet) -> Resul
         match src {
             XSrc::Mem(o) => s.push_str(&format!("    mov rax, qword ptr {}\n", xm(*o))),
             XSrc::Addr(o) => s.push_str(&format!("    lea rax, {}\n", xm(*o))),
-            XSrc::Q(_) => unreachable!(),
+            XSrc::Q(o) => {
+                // xmm15 is no argument register
+                s.push_str(&format!("    movdqu xmm15, xmmword ptr {}\n", xm(*o)));
+                s.push_str(&format!("    movdqu xmmword ptr [rsp+{}], xmm15\n", spill_at[j]));
+                continue;
+            }
         }
-        s.push_str(&format!("    mov qword ptr [rsp+{}], rax\n", j * 8));
+        s.push_str(&format!("    mov qword ptr [rsp+{}], rax\n", spill_at[j]));
     }
     s.push_str(&loads);
     s.push_str(&format!("    call {}\n", sym));
@@ -317,10 +335,14 @@ fn a64_thunk(c_name: &str, sym: &str, params: &[SoKind], ret: &AggRet) -> Result
             }
             SoKind::V128 => {
                 if c.nsrn >= 8 {
-                    return Err(V128_MSG.to_string());
+                    // AAPCS64: sixteen octets on the stack at a sixteen octet boundary (the area starts 16-aligned at x29+16)
+                    c.st = (c.st + 1) / 2 * 2;
+                    items.push((true, Loc::Incoming(16 + 8 * c.st), Use::Vec));
+                    c.st += 2;
+                } else {
+                    items.push((true, Loc::Local(A_VEC + 16 * c.nsrn as i32), Use::Vec));
+                    c.nsrn += 1;
                 }
-                items.push((true, Loc::Local(A_VEC + 16 * c.nsrn as i32), Use::Vec));
-                c.nsrn += 1;
             }
             SoKind::Words { size, sse, hfa } => {
                 let img = c.image(*size, *hfa);
@@ -348,13 +370,23 @@ fn a64_thunk(c_name: &str, sym: &str, params: &[SoKind], ret: &AggRet) -> Result
             loads.push((format!("x{}", fi), *loc, *u));
             fi += 1;
         } else {
-            if *u == Use::Vec {
-                return Err(V128_MSG.to_string());
-            }
             spill.push((*loc, *u));
         }
     }
-    let room = ((spill.len() * 8 + 15) / 16 * 16) as i32;
+    // Firn's outgoing stack area: eight octets per argument, a `v128` sixteen at a sixteen octet boundary
+    let mut spill_at: Vec<i32> = Vec::new();
+    let mut at = 0i32;
+    for (_, u) in &spill {
+        if *u == Use::Vec {
+            at = (at + 15) / 16 * 16;
+            spill_at.push(at);
+            at += 16;
+        } else {
+            spill_at.push(at);
+            at += 8;
+        }
+    }
+    let room = (at + 15) / 16 * 16;
     let total = room + A_STAGE + 32 * c.stage.len() as i32;
     let total = (total + 15) / 16 * 16;
     if total > 4000 {
@@ -394,12 +426,18 @@ fn a64_thunk(c_name: &str, sym: &str, params: &[SoKind], ret: &AggRet) -> Result
         }
     }
     for (j, (loc, u)) in spill.iter().enumerate() {
+        if *u == Use::Vec {
+            // v16 is no argument register
+            s.push_str(&format!("    ldr q16, {}\n", at(*loc)));
+            s.push_str(&format!("    str q16, [sp, #{}]\n", spill_at[j]));
+            continue;
+        }
         if *u == Use::Addr {
             s.push_str(&addr_of("x9", *loc));
         } else {
             s.push_str(&format!("    ldr x9, {}\n", at(*loc)));
         }
-        s.push_str(&format!("    str x9, [sp, #{}]\n", 8 * j));
+        s.push_str(&format!("    str x9, [sp, #{}]\n", spill_at[j]));
     }
     for (reg, loc, u) in &loads {
         if *u == Use::Addr {
@@ -483,11 +521,28 @@ mod tests {
         assert!(a.contains("mov rdi, qword ptr [rbp-8]") && !a.contains("r10"), "{}", a);
     }
 
+    /// nine `v128` next to a struct that needs the thunk: the ninth comes from the stack (16 aligned) and goes there, too
     #[test]
-    fn sysv_vector_without_a_register_is_refused() {
-        let mut p = vec![SoKind::F64; 8];
-        p.push(SoKind::V128);
-        assert!(sysv_thunk("t", "sym", &p, &AggRet::None).is_err());
+    fn sysv_vector_beyond_xmm7_is_copied_to_the_stack() {
+        let mut p = vec![SoKind::V128; 9];
+        p.push(SoKind::Words { size: 16, sse: vec![true, false], hfa: None });
+        let a = sysv_thunk("t", "sym", &p, &AggRet::None).unwrap();
+        assert!(a.contains("movdqu xmm15, xmmword ptr [rbp+16]
+    movdqu xmmword ptr [rsp+0], xmm15"), "{}", a);
+    }
+
+    /// an integer word before the ninth `v128` pushes it to the next sixteen octet boundary on both sides
+    #[test]
+    fn sysv_vector_on_the_stack_keeps_its_alignment() {
+        let mut p = vec![SoKind::Int; 6];
+        p.push(SoKind::Int);
+        p.extend(vec![SoKind::V128; 9]);
+        let a = sysv_thunk("t", "sym", &p, &AggRet::None).unwrap();
+        // C: the seventh integer sits at rbp+16, the ninth vector at rbp+32; Firn: word at 0, vector at 16
+        assert!(a.contains("mov rax, qword ptr [rbp+16]
+    mov qword ptr [rsp+0], rax"), "{}", a);
+        assert!(a.contains("movdqu xmm15, xmmword ptr [rbp+32]
+    movdqu xmmword ptr [rsp+16], xmm15"), "{}", a);
     }
 
     /// `{f32, f32}`: C wants `s0`, `s1`; Firn takes one packed word in `d0`.
