@@ -71,3 +71,15 @@ r54 (target < 5 ms at sunset) was NOT reached; what was learned (AMD EPYC 7571, 
 * Remaining at sunset (bench scene, rough split): gradient search 66k exact evaluations (sqrt + division each; the number of
   distinct f levels per row is inherent), per-pixel dot products for the glow test ~2 ms, glow pixels ~2.9 ms, discs and fill the rest. Below 5 ms would need
   SIMD or a faster sqrt/div path in the compiler (or giving up bit identity with the plain model), see roadmap r54.
+
+## Approximate mode (`Sky.approx`, r54 / z2)
+`sky.approx = true` (default false = bit exact as above; mcplay sets it unless `MCPLAY_SKY_EXACT=1`) swaps the two costly parts
+of `sky_draw` for approximations that stay within **1 level per channel** of `sky_draw_plain` (tests/2767: 120 random scenes,
+max diff 1, 0.25 % of the pixels differ, PSNR ~78 dB, gate >= 60 dB):
+* gradient index (`sky_f_row_approx`): exact `floor(256 gg)` every 16 columns, linear in between where the second difference of the
+  neighbouring samples is < 1.0, exact per column elsewhere (no row bisection, no monotonicity assumption),
+* glow (`sky_glow_mid_fast`/`sky_glow_v`): ray `d(k) = d0 + k s` is linear in the column; `1/|d|` from an anchor (sqrt + division)
+  and the series `(1-t)^(-1/2)`, t = 1 - |d|^2/|anchor|^2, anchor renewed when t^2 > 0.0025; weight exact every 8 columns, linear in
+  between where the second difference is < 4 (error <= 0.5 level), per pixel near the sun; blend as 2 words (r/b in 16 bit lanes).
+`tools/mc/sky/bench.fi` (640x360, pitch -10 sunset, min of 8 runs, load ~20): sunset exact 7.7-8.3 ms, **approx ~3.0 ms**
+(gradient only without glow: exact 3.5 ms); noon / night exact 2.4 ms.
