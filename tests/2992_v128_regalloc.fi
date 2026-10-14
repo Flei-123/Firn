@@ -1,0 +1,112 @@
+// expect_exit: 0
+// tests/2992_v128_regalloc.fi -- r557: functions with v128 and a few scalar arguments stay on the register
+// allocator path. Covers the vector instructions added to that path (shufps, unpack 64/16, shifts, from_u64
+// constants, sqrt, 32-bit min/max, cmpeq) with operands that alias (a == b, operand in the destination) and a
+// loop-carried constant. Every lane is compared with a scalar reference on the bit patterns.
+import std.rt
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+fn ld(a: u64, i: usize) -> u32 {
+    return *((a + (i * 4) as u64) as *mut u32)
+}
+
+fn add32(a: u32, b: u32) -> u32 {
+    return ((a as u64 + b as u64) & 0xFFFFFFFF as u64) as u32
+}
+
+fn sub32(a: u32, b: u32) -> u32 {
+    return ((a as u64 + 4294967296 as u64 - b as u64) & 0xFFFFFFFF as u64) as u32
+}
+
+fn shl3(a: u32) -> u32 {
+    return (((a as u64) << 3 as u64) & 0xFFFFFFFF as u64) as u32
+}
+
+fn st(a: u64, i: usize, v: u32) {
+    *((a + (i * 4) as u64) as *mut u32) = v
+}
+
+// 4 rows of 4 lanes in, 4 rows out per round: the shape of the MP3 IMDCT prep.
+fn prep(src: u64, dst: u64, rounds: i32, lo: u64, hi: u64) {
+    let mask: v128 = __v128_from_u64(lo, hi)
+    var k: i32 = 0
+    while k < rounds {
+        let base: u64 = src + ((k * 64) as u64)
+        let out: u64 = dst + ((k * 64) as u64)
+        let r0: v128 = __v128_load(base as *u8)
+        let r1: v128 = __v128_load((base + 16) as *u8)
+        let r2: v128 = __v128_load((base + 32) as *u8)
+        let r3: v128 = __v128_load((base + 48) as *u8)
+        let t0: v128 = __v128_shuf_f32(r0, r1, 136)
+        let t1: v128 = __v128_shuf_f32(r0, r1, 221)
+        let u0: v128 = __v128_unpacklo64(r2, r3)
+        let u1: v128 = __v128_unpackhi64(r2, r3)
+        __v128_store(out as *mut u8, __v128_xor(__v128_add32(t0, t1), mask))
+        __v128_store((out + 16) as *mut u8, __v128_shuffle32(__v128_sub32(t0, t1), 27))
+        __v128_store((out + 32) as *mut u8, __v128_xor(__v128_unpacklo16(u0, u1), mask))
+        // aliasing operands: a == b
+        __v128_store((out + 48) as *mut u8, __v128_unpacklo64(__v128_shl32(u1, 3), __v128_shl32(u1, 3)))
+        k = k + 1
+    }
+}
+
+fn main() -> i32 {
+    let a: u64 = rt.heap_alloc(4096)
+    let b: u64 = rt.heap_alloc(4096)
+    var i: usize = 0
+    while i < 128 {
+        st(a, i, ((((i as u64) * 2654435761 as u64) & 0xFFFFFFFF as u64) as u32) ^ 0x5A5A1234 as u32)
+        i = i + 1
+    }
+    let lo: u64 = 0x8000000000000000 as u64
+    let hi: u64 = 0x00000000FFFF0000 as u64
+    prep(a, b, 2, lo, hi)
+    let m0: u32 = 0
+    let m1: u32 = 0x80000000 as u32
+    let m2: u32 = 0xFFFF0000 as u32
+    let m3: u32 = 0
+    var k: usize = 0
+    while k < 2 {
+        let s: usize = k * 16
+        // rows r0..r3 as lane arrays
+        // t0 = (r0[0] r0[2] r1[0] r1[2]) , t1 = (r0[1] r0[3] r1[1] r1[3])
+        let t0a: u32 = ld(a, s + 0)
+        let t0b: u32 = ld(a, s + 2)
+        let t0c: u32 = ld(a, s + 4)
+        let t0d: u32 = ld(a, s + 6)
+        let t1a: u32 = ld(a, s + 1)
+        let t1b: u32 = ld(a, s + 3)
+        let t1c: u32 = ld(a, s + 5)
+        let t1d: u32 = ld(a, s + 7)
+        check(ld(b, s + 0) == (add32(t0a, t1a) ^ m0), 1)
+        check(ld(b, s + 1) == (add32(t0b, t1b) ^ m1), 2)
+        check(ld(b, s + 2) == (add32(t0c, t1c) ^ m2), 3)
+        check(ld(b, s + 3) == (add32(t0d, t1d) ^ m3), 4)
+        // reversed differences
+        check(ld(b, s + 4) == sub32(t0d, t1d), 5)
+        check(ld(b, s + 5) == sub32(t0c, t1c), 6)
+        check(ld(b, s + 6) == sub32(t0b, t1b), 7)
+        check(ld(b, s + 7) == sub32(t0a, t1a), 8)
+        // u0 = (r2[0] r2[1] r3[0] r3[1]) , u1 = (r2[2] r2[3] r3[2] r3[3]); unpacklo16(u0, u1) interleaves 16-bit lanes
+        let u0a: u32 = ld(a, s + 8)
+        let u0b: u32 = ld(a, s + 9)
+        let u1a: u32 = ld(a, s + 10)
+        let u1b: u32 = ld(a, s + 11)
+        check(ld(b, s + 8) == (((u0a & 0xFFFF as u32) | (u1a << 16 as u32)) ^ m0), 9)
+        check(ld(b, s + 9) == (((u0a >> 16 as u32) | (u1a & 0xFFFF0000 as u32)) ^ m1), 10)
+        check(ld(b, s + 10) == (((u0b & 0xFFFF as u32) | (u1b << 16 as u32)) ^ m2), 11)
+        check(ld(b, s + 11) == (((u0b >> 16 as u32) | (u1b & 0xFFFF0000 as u32)) ^ m3), 12)
+        // shl32(u1, 3), low half twice
+        check(ld(b, s + 12) == shl3(u1a), 13)
+        check(ld(b, s + 13) == shl3(u1b), 14)
+        check(ld(b, s + 14) == shl3(u1a), 15)
+        check(ld(b, s + 15) == shl3(u1b), 16)
+        k = k + 1
+    }
+    return 0
+}
