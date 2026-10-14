@@ -210,6 +210,14 @@ class Scene:
             return dy < 0 or (dy == 0 and dx > 0)    # top-left edge: pixels exactly on it belong to the triangle
 
         tl = [inc(e) for e in edges]
+        # edge expansion of the opaque pass (lib/mc/mc_raster.fi): bias = top-left bit + (|dx| + |dy|) // 4, the translucent pass is exact
+        bias = []
+        for k in range(3):
+            (qx, qy), (rx, ry) = edges[k]
+            b = 1 if tl[k] else 0
+            if not self.trans:
+                b += (abs(rx - qx) + abs(ry - qy)) // 4
+            bias.append(b)
         x0 = max(0, min(ax, bx, cx) // 16)
         x1 = min(self.w - 1, max(ax, bx, cx) // 16)
         y0 = max(0, min(ay, by, cy) // 16)
@@ -225,7 +233,7 @@ class Scene:
                 for k in range(3):
                     (qx, qy), (rx, ry) = edges[k]
                     e = (rx - qx) * (py - qy) - (ry - qy) * (px - qx)
-                    if e < 0 or (e == 0 and not tl[k]):
+                    if e + bias[k] <= 0:
                         ok = False
                         break
                     E.append(e)

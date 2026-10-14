@@ -38,7 +38,7 @@ import mc.mc_texture
 
 export {
     Raster, Stats, raster_new, raster_free, raster_clear, raster_set_camera, raster_set_atlas,
-    raster_set_fog, raster_set_cull, raster_set_light, raster_draw_mesh, raster_draw_tri, raster_draw_tri8, VREC, raster_pixel,
+    raster_set_fog, raster_set_cull, raster_set_edge_expand, raster_set_light, raster_draw_mesh, raster_draw_tri, raster_draw_tri8, VREC, raster_pixel,
     raster_hash, raster_hash_hex, raster_write_ppm, raster_write_png, raster_stats_reset,
     face_shade,
     backend_upload_atlas, backend_mesh_upload, backend_mesh_free, backend_begin, backend_draw,
@@ -80,6 +80,7 @@ struct Raster {
     fog_end: f64,
     fog_r: u32, fog_g: u32, fog_b: u32,
     cull: bool,
+    edge_exp: bool, // opaque pass: edges accept pixel centres ~1/64 px outside (default on, see draw_clipped_tri); off = exact top-left rule
     // light (raster_set_light)
     day: i64, // sky light multiplier 0..256
     tint_r: i64, tint_g: i64, tint_b: i64, // block light tint per channel 0..256
@@ -120,7 +121,7 @@ fn raster_new(w: i32, h: i32) -> Raster {
         fx: 0.0, fy: 0.0, fz: 1.0, near: 0.05, hw: 0.0, hh: 0.0, fpx: 1.0, fpy: 1.0,
         apx: 0, atile: 16, acols: 16, aw: 256,
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0 as u32, fog_g: 0 as u32, fog_b: 0 as u32,
-        cull: true, day: 256, tint_r: 256, tint_g: 224, tint_b: 176, trans: false, flat_on: false, flat_rgb: 0 as u32, fade_a: 64, fade_inv: false,
+        cull: true, edge_exp: true, day: 256, tint_r: 256, tint_g: 224, tint_b: 176, trans: false, flat_on: false, flat_rgb: 0 as u32, fade_a: 64, fade_inv: false,
         vbuf: 0, vcap: 0, pa: 0, pb: 0, pc: 0, slots: 0, slot_cap: 0,
         st: Stats { tris_in: 0 as u64, tris_drawn: 0 as u64, tris_culled: 0 as u64, tris_clipped: 0 as u64, pixels: 0 as u64 },
     }
@@ -225,6 +226,11 @@ fn light_factor(s256: i64, bl: i64, tint: i64) -> i64 {
     return LIGHT_MIN + (lum * (256 as i64 - LIGHT_MIN)) / 256 as i64
 }
 
+// Edge expansion of the opaque pass on / off (default on). Off = the exact top-left rule everywhere (coverage unit tests).
+fn raster_set_edge_expand(r: *mut Raster, on: bool) {
+    (*r).edge_exp = on
+}
+
 fn raster_set_cull(r: *mut Raster, on: bool) {
     (*r).cull = on
 }
@@ -267,6 +273,11 @@ fn floor_div(a: i64, b: i64) -> i64 {
 
 // Smallest k >= lo with c + s * k > 0 (c already includes the fill-rule bias). Returns a value above any real hi when
 // no k exists (s == 0 and c <= 0).
+fn iabs64(v: i64) -> i64 {
+    if v < 0 as i64 { return 0 as i64 - v }
+    return v
+}
+
 fn span_lo(lo: i64, c: i64, s: i64) -> i64 {
     if s == 0 as i64 {
         if c > 0 as i64 { return lo }
@@ -407,6 +418,18 @@ fn draw_clipped_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) 
     if e0dy < 0 as i64 || (e0dy == 0 as i64 && e0dx > 0 as i64) { bias0 = 1 }
     if e1dy < 0 as i64 || (e1dy == 0 as i64 && e1dx > 0 as i64) { bias1 = 1 }
     if e2dy < 0 as i64 || (e2dy == 0 as i64 && e2dx > 0 as i64) { bias2 = 1 }
+    // Edge expansion (opaque pass only): each edge also accepts pixel centres up to ~1/4 snap unit (1/64 px) outside of it,
+    // tol = (|dx| + |dy|) / 4 in E units (E = edge length * distance, l1 >= euclid). Neighbouring triangles whose shared vertices
+    // snap one 1/16 px step apart (different section origins, T-junctions of greedy quads, a ray exactly on a block edge) leave a
+    // 1 px see-through slit under the exact top-left rule; with the expansion they overlap instead (the depth test keeps the first).
+    // Measured (tests/2861 C / 2917, LOD flight holes vs full detail): tol 0: 34 / 64..80, l1/4: 6 / 3..6 (best), l1/2: 7 / 5..8,
+    // l1: 13 / 12..15, 3*l1: 37 / 33..42 (a wide band also grows the silhouette of full-detail columns).
+    // The translucent pass keeps the exact top-left rule (an overlap would blend twice). The python reference does the same.
+    if (*r).edge_exp && !(*r).trans {
+        bias0 = bias0 + (iabs64(e0dx) + iabs64(e0dy)) / 4 as i64
+        bias1 = bias1 + (iabs64(e1dx) + iabs64(e1dy)) / 4 as i64
+        bias2 = bias2 + (iabs64(e2dx) + iabs64(e2dy)) / 4 as i64
+    }
     let area2f: f64 = area2 as f64
     let w: usize = (*r).w as usize
     let tsz: i32 = (*r).atile

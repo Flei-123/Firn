@@ -19,7 +19,7 @@ CLEAR = (0x96, 0xBE, 0xE6)  # 0xFFE6BE96 = A B G R
 # gate 133 (scene layer) reuses this script: GATE_WASM / GATE_CLEAR (RRGGBB) / GATE_MIN_SCENES / GATE_LABEL
 WASM = os.environ.get("GATE_WASM", "mcscene.wasm")
 if os.environ.get("GATE_CLEAR"): CLEAR = tuple(int(os.environ["GATE_CLEAR"][i:i + 2], 16) for i in (0, 2, 4))
-MIN_SCENES = int(os.environ.get("GATE_MIN_SCENES", "7"))
+MIN_SCENES = int(os.environ.get("GATE_MIN_SCENES", "9"))
 LABEL = os.environ.get("GATE_LABEL", "webgl2")
 
 s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
