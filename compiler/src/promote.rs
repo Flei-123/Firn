@@ -1383,6 +1383,21 @@ fn analyse(
     if cx.polls_cell(l, blocks, exiting, k) {
         return None;
     }
+    // ... also when a loop NESTED in this one waits on it (the outer loop must not hoist the load either)
+    for m in loops {
+        if m.head == l.head || m.size >= l.size || !l.has(m.head) {
+            continue;
+        }
+        let mb: Vec<usize> = (0..f.blocks.len()).filter(|b| m.has(*b)).collect();
+        let mx: Vec<usize> = mb
+            .iter()
+            .copied()
+            .filter(|&b| f.blocks[b].term.successors().iter().any(|s| !m.has(*s as usize)))
+            .collect();
+        if cx.polls_cell(m, &mb, &mx, k) {
+            return None;
+        }
+    }
     // regions: direct children with any clobber of k
     let mut live = vec![false; n];
     for &b in blocks {
