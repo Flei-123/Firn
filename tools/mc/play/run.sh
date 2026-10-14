@@ -2,14 +2,14 @@
 # tools/mc/play/run.sh -- demos/mcplay end to end: Xvfb + official 1.20.1 server (creative, offline mode) + mcplay + xdotool.
 # Flies/walks ~8 s (W + mouse look), clicks (break + place), quits by MCPLAY_RUN_S, writes a screenshot PNG + hash.
 # Needs Xvfb, xdotool, java, network for the server jar (tools/mcclient/fetch_server.sh). Prints `RESULT mc-play: ok`.
-# Env: MCPLAY_PNG_OUT (copy target of the screenshot), MC_VIEW (4), FIRNC. Start it via heavy in a full run (java server).
+# Env: MCPLAY_PNG_OUT (copy target of the screenshot), MC_VIEW (4), FIRNC, MCPLAY_KEEP_DIR (keep wavs/outs/pngs), MCPLAY_SKIP_GL/AUDIO/PSNR/SURVIVAL=1. Start it via heavy in a full run (java server).
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 export FIRNLIB="$(pwd)/lib"
-W=$(mktemp -d); SRV_PID=""; XV_PID=""
-cleanup() { exec 3>&- 2>/dev/null; [ -n "$XV_PID" ] && kill "$XV_PID" 2>/dev/null; [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null && sleep 1 && kill -9 "$SRV_PID" 2>/dev/null; rm -rf "$W"; }
+W=$(mktemp -d); SRV_PID=""; XV_PID=""; PA_PID=""; REC_PID=""
+cleanup() { exec 3>&- 2>/dev/null; if [ -n "${MCPLAY_KEEP_DIR:-}" ]; then mkdir -p "$MCPLAY_KEEP_DIR"; cp "$W"/*.wav "$W"/*.out "$W"/*.png "$W"/server.log "$MCPLAY_KEEP_DIR"/ 2>/dev/null; fi; [ -n "$XV_PID" ] && kill "$XV_PID" 2>/dev/null; [ -n "$REC_PID" ] && kill "$REC_PID" 2>/dev/null; [ -n "$PA_PID" ] && kill "$PA_PID" 2>/dev/null; [ -n "$SRV_PID" ] && kill "$SRV_PID" 2>/dev/null && sleep 1 && kill -9 "$SRV_PID" 2>/dev/null; rm -rf "$W"; }
 trap cleanup EXIT
 fail() { echo "  FAIL  $1"; echo "RESULT mc-play: FAIL"; exit 1; }
 for t in Xvfb xdotool java; do command -v $t >/dev/null || fail "missing tool: $t"; done
@@ -54,7 +54,7 @@ DN=$((90 + RANDOM % 100))
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
-FIRN_AUDIO="file:$W/day.wav" MCPLAY_RUN_S=12 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/shot.png" \
+FIRN_AUDIO="file:$W/day.wav" MCPLAY_AUDIO_LOG=1 MCPLAY_GIVE="iron_pickaxe:1,stone:64" MCPLAY_RUN_S=12 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/shot.png" \
     "$W/mcplay" 127.0.0.1 "$PORT" Player > "$W/play.out" 2>&1 &
 PP=$!
 sleep 4
@@ -62,8 +62,9 @@ xdotool mousemove 320 180 2>/dev/null
 xdotool mousemove_relative -- 40 5; sleep 0.3
 xdotool keydown w; sleep 3; xdotool keyup w
 xdotool key space; sleep 0.3
-xdotool click 1; sleep 0.5
-xdotool click 3; sleep 0.5
+xdotool click 1; sleep 0.8
+xdotool key 2; sleep 0.3
+xdotool click 3; sleep 0.8
 xdotool key 3; sleep 0.3
 xdotool click 4; sleep 0.3
 xdotool mousemove_relative -- 100 0; sleep 1
@@ -90,14 +91,16 @@ AS=$(grep -o 'sounds=[0-9]*' "$W/play.out" | head -1 | cut -d= -f2); AC=$(grep -
 [ "${AS:-0}" -ge 2 ] || { echo "  FAIL  too few sounds triggered (${AS:-0})"; ERR=1; }
 [ "${AP:-0}" -ge 1 ] || { echo "  FAIL  no voice played (${AP:-0})"; ERR=1; }
 if [ -s "$W/day.wav" ]; then
-    python3 - "$W/day.wav" <<'PY' || ERR=1
-import sys, wave, array
-w = wave.open(sys.argv[1]); n = w.getnframes(); a = array.array('h'); a.frombytes(w.readframes(n))
-peak = max((abs(x) for x in a), default=0)
-print(f"  wav frames={n} rate={w.getframerate()} ch={w.getnchannels()} peak={peak}")
-sys.exit(0 if n > 10000 and peak > 100 else 1)
-PY
+    python3 tools/mc/play/audio_check.py "$W/day.wav" "$W/play.out" --min-events 2 || ERR=1
 else echo "  FAIL  no day.wav"; ERR=1; fi
+# inventory (Set Creative Slot answered by the server: updates seen, none malformed, first hotbar slots filled)
+IU=$(grep -o 'inv updates=[0-9]*' "$W/play.out" | head -1 | cut -d= -f2); IB=$(grep -o ' bad=[0-9]*' "$W/play.out" | head -1 | cut -d= -f2)
+[ "${IU:-0}" -gt 0 ] && [ "${IB:-1}" -eq 0 ] || { echo "  FAIL  inventory updates=${IU:-0} bad=${IB:-?}"; ERR=1; }
+grep -qE 'hotbar=[1-9][0-9]*x[1-9][0-9]*,[1-9][0-9]*x[1-9]' "$W/play.out" || { echo "  FAIL  hotbar not filled: $(grep -o 'hotbar=[^ ]*' "$W/play.out" | head -1)"; ERR=1; }
+# the real actions made their sounds: break + place (server block update) + at least one step, each logged by mc_audio (MCPLAY_AUDIO_LOG)
+grep -qE 'audiolog .* ev=block\.[a-z_]+\.break ' "$W/play.out" || { echo "  FAIL  no block break sound logged"; ERR=1; }
+grep -qE 'audiolog .* ev=block\.[a-z_]+\.place ' "$W/play.out" || echo "  NOTE  no block place sound logged (place needs the server block update in time; open: roadmap r145)"
+grep -qE 'audiolog .* ev=block\.[a-z_]+\.step ' "$W/play.out" || { echo "  FAIL  no footstep sound logged"; ERR=1; }
 echo "  audio bytes=${AB:-?} crc=${AC:-?} sounds=${AS:-?} played=${AP:-?}"
 # second short run at midnight: server time drives the sky (daylight 0) and the picture differs from noon
 echo "time set 18000" >&3; sleep 1
@@ -123,6 +126,75 @@ GF=$(grep -o 'frames=[0-9]*' "$W/gl.out" | head -1 | cut -d= -f2); GC=$(grep -o 
 GH=$(grep -o 'hash=[0-9a-f]*' "$W/gl.out" | head -1)
 echo "  gl frames=${GF:-?} chunks=${GC:-?} $GH"
 if [ -n "${MCPLAY_GL_PNG_OUT:-}" ] && [ -s "$W/gl.png" ]; then cp "$W/gl.png" "$MCPLAY_GL_PNG_OUT"; fi
+fi
+# ---- sound probe: 12 known sounds through the real engine/bank/file sink, found again in the dump (tools/mc/play/audio_check.py)
+if [ "${MCPLAY_SKIP_AUDIO:-0}" != 1 ]; then
+echo "time set day" >&3; sleep 1
+MCPLAY_AMBIENT_DARK=1 MCPLAY_AMBIENT_X=100 MCPLAY_AUDIO_PROBE=1 MCPLAY_AUDIO_LOG=1 FIRN_AUDIO="file:$W/probe.wav" MCPLAY_RUN_S=11 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    timeout 120 "$W/mcplay" 127.0.0.1 "$PORT" Player4 > "$W/probe.out" 2>&1; prc=$?
+[ $prc -eq 0 ] || { echo "  FAIL  probe run exit code $prc"; ERR=1; }
+python3 tools/mc/play/audio_check.py "$W/probe.wav" "$W/probe.out" --probe --ambient --min-events 12 || ERR=1
+fi
+# ---- device sink: FIRN_AUDIO=device through a private PulseAudio daemon with a null sink; the monitor is recorded (parec) and checked
+if [ "${MCPLAY_SKIP_AUDIO:-0}" != 1 ] && [ "${MCPLAY_SKIP_PULSE:-0}" != 1 ] && command -v pulseaudio >/dev/null && command -v parec >/dev/null; then
+PAD="$W/pa"; mkdir -p "$PAD"; chmod 700 "$PAD"
+XDG_RUNTIME_DIR="$PAD" pulseaudio -n --daemonize=no --exit-idle-time=-1 --disallow-exit --log-target=file:"$W/pulse.log" \
+    -L "module-native-protocol-unix socket=$PAD/native auth-anonymous=1" -L "module-null-sink sink_name=mcnull rate=44100 channels=2" >/dev/null 2>&1 & PA_PID=$!
+for i in $(seq 1 20); do [ -S "$PAD/native" ] && break; sleep 0.5; done
+if [ -S "$PAD/native" ]; then
+    export PULSE_SERVER="unix:$PAD/native"
+    parec -d mcnull.monitor --format=s16le --rate=44100 --channels=2 --file-format=wav "$W/dev.wav" 2>/dev/null & REC_PID=$!
+    sleep 1
+    MCPLAY_AUDIO_PROBE=1 FIRN_AUDIO=device MCPLAY_RUN_S=11 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+        timeout 120 "$W/mcplay" 127.0.0.1 "$PORT" Player7 > "$W/dev.out" 2>&1; drc=$?
+    sleep 1; kill "$REC_PID" 2>/dev/null; wait "$REC_PID" 2>/dev/null
+    [ $drc -eq 0 ] || { echo "  FAIL  device run exit code $drc"; ERR=1; }
+    grep -q "no sound output" "$W/dev.out" && { echo "  FAIL  device sink did not open"; ERR=1; }
+    python3 tools/mc/play/audio_check.py "$W/dev.wav" "$W/dev.out" --bursts 9 || ERR=1
+else echo "  FAIL  private pulseaudio did not start: $(tail -2 "$W/pulse.log" 2>/dev/null)"; ERR=1; fi
+unset PULSE_SERVER
+kill "$PA_PID" 2>/dev/null
+fi
+# ---- GL vs CPU picture of the SAME scene in the real play path (water pool, glass wall, tinted glass, backdrop): PSNR
+if [ "${MCPLAY_SKIP_PSNR:-0}" != 1 ]; then
+echo "time set day" >&3; echo "gamerule spawnRadius 0" >&3; sleep 1
+for mode in cpu gl; do
+    PN=Psnr$mode; GLF=0; [ $mode = gl ] && GLF=1
+    MCPLAY_GL=$GLF MCPLAY_VSYNC=0 MCPLAY_AUDIO=0 MCPLAY_RUN_S=16 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/ps_$mode.png" \
+        timeout 180 "$W/mcplay" 127.0.0.1 "$PORT" "$PN" > "$W/ps_$mode.out" 2>&1 &
+    PP=$!
+    sleep 6
+    for cmd in "fill ~-3 ~-3 ~4 ~3 ~0 ~8 stone" "fill ~-2 ~-2 ~5 ~2 ~0 ~7 water" "fill ~-4 ~-2 ~11 ~4 ~4 ~11 glass" "fill ~-1 ~-2 ~9 ~1 ~3 ~9 blue_stained_glass" "fill ~-6 ~-2 ~14 ~6 ~6 ~14 red_wool"; do
+        echo "execute at $PN run $cmd" >&3
+    done
+    sleep 3
+    xdotool mousemove 320 180 2>/dev/null; xdotool mousemove_relative -- 0 25; sleep 4
+    wait $PP; prc=$?
+    [ $prc -eq 0 ] || { echo "  FAIL  $mode picture run exit code $prc"; ERR=1; }
+    echo "  $mode: $(grep -o 'frames=[0-9]*' "$W/ps_$mode.out" | head -1) $(grep -o 'chunks=[0-9]*' "$W/ps_$mode.out" | head -1) $(grep -o 'hash=[0-9a-f]*' "$W/ps_$mode.out" | head -1)"
+done
+if [ -s "$W/ps_cpu.png" ] && [ -s "$W/ps_gl.png" ]; then
+    python3 tools/mc/play/psnr.py "$W/ps_cpu.png" "$W/ps_gl.png" --min-db "${MCPLAY_PSNR_MIN:-30}" --mask 0,0,140,50 --diff "$W/ps_diff.png" || ERR=1
+    if [ -n "${MCPLAY_PSNR_OUT:-}" ]; then cp "$W/ps_cpu.png" "${MCPLAY_PSNR_OUT}_cpu.png"; cp "$W/ps_gl.png" "${MCPLAY_PSNR_OUT}_gl.png"; cp "$W/ps_diff.png" "${MCPLAY_PSNR_OUT}_diff.png"; fi
+else echo "  FAIL  psnr: missing picture"; ERR=1; fi
+fi
+# ---- survival: iron pickaxe from /give, look down, hold the left button -> a block is dug with the table time (mc_dig)
+if [ "${MCPLAY_SKIP_SURVIVAL:-0}" != 1 ]; then
+MCPLAY_AUDIO=0 MCPLAY_RUN_S=14 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    timeout 120 "$W/mcplay" 127.0.0.1 "$PORT" Player6 > "$W/surv.out" 2>&1 &
+PP=$!
+sleep 5
+echo "gamemode survival Player6" >&3; echo "give Player6 iron_pickaxe 1" >&3; echo "give Player6 stone 32" >&3
+sleep 2
+xdotool mousemove 320 180 2>/dev/null; xdotool mousemove_relative -- 0 300; xdotool key 1; sleep 0.5
+xdotool mousedown 1; sleep 4; xdotool mouseup 1; sleep 1
+wait $PP; src=$?
+[ $src -eq 0 ] || { echo "  FAIL  survival run exit code $src"; ERR=1; }
+SD=$(grep -o ' dig=[0-9]*' "$W/surv.out" | head -1 | cut -d= -f2); SMS=$(grep -o 'dig_ms=[0-9]*' "$W/surv.out" | head -1 | cut -d= -f2)
+SU=$(grep -o 'inv updates=[0-9]*' "$W/surv.out" | head -1 | cut -d= -f2); SB=$(grep -o ' bad=[0-9]*' "$W/surv.out" | head -1 | cut -d= -f2)
+echo "  survival dig=${SD:-?} dig_ms=${SMS:-?} inv_updates=${SU:-?} bad=${SB:-?} $(grep -o 'hotbar=[^ ]*' "$W/surv.out" | head -1)"
+[ "${SD:-0}" -ge 1 ] || { echo "  FAIL  survival: nothing dug"; ERR=1; }
+[ "${SU:-0}" -gt 0 ] && [ "${SB:-1}" -eq 0 ] || { echo "  FAIL  survival: inventory updates=${SU:-0} bad=${SB:-?}"; ERR=1; }
 fi
 echo stop >&3; sleep 1
 echo "  day daylight=${DL:-?} night daylight=${ND:-?} night $NH"
