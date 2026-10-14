@@ -83,3 +83,10 @@ max diff 1, 0.25 % of the pixels differ, PSNR ~78 dB, gate >= 60 dB):
   between where the second difference is < 4 (error <= 0.5 level), per pixel near the sun; blend as 2 words (r/b in 16 bit lanes).
 `tools/mc/sky/bench.fi` (640x360, pitch -10 sunset, min of 8 runs, load ~20): sunset exact 7.7-8.3 ms, **approx ~3.0 ms**
 (gradient only without glow: exact 3.5 ms); noon / night exact 2.4 ms.
+
+### Who uses which mode (r161)
+* **mcplay:** approx by default (`MCPLAY_SKY_EXACT=1` = exact).
+* **mcview:** exact by default, because it is the reference of the golden hashes / `tools/mc/view/ref_render.py` (a 1-level change would break them).
+  `MCVIEW_SKY_APPROX=1` switches approx on (opt-in, for speed comparisons with mcplay; hashes then differ).
+* **Perf series (`tools/mc/perf`, MC-PERF.md):** the world frame excludes the sky (begin + world + end), so approx does not change any series number;
+  the sky is measured on its own with `tools/mc/sky/bench.fi` (exact and approx variants both there). No separate bench variant needed.
