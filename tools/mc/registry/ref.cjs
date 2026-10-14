@@ -16,7 +16,11 @@ if (legacy) {
 blocks.sort((a, b) => a.minStateId - b.minStateId)
 const flags = b => (b.boundingBox === 'block' ? 1 : 0) | (b.transparent ? 2 : 0) | (b.diggable ? 4 : 0) |
   (((b.filterLight || 0) & 15) << 4) | (((b.emitLight || 0) & 15) << 8)
+// minecraft-data 1.16.x lists these blocks as hardness 0 (instant) but the game says unbreakable (-1)
+const UNBREAKABLE = new Set(['bedrock', 'barrier', 'light', 'command_block', 'chain_command_block', 'repeating_command_block', 'structure_block',
+  'jigsaw', 'end_portal', 'end_portal_frame', 'end_gateway', 'nether_portal', 'moving_piston'])
 blocks.forEach((b, i) => {
+  if (b.hardness === 0 && UNBREAKABLE.has(b.name)) b.hardness = null
   const hard = (b.hardness === null || b.hardness === undefined || b.hardness < 0) ? -1 : Math.round(b.hardness * 1000)
   out.push(`B ${i} ${b.name} ${b.minStateId} ${b.maxStateId} ${b.defaultState} flags=${flags(b)} hard=${hard} stack=${b.stackSize === undefined ? 64 : b.stackSize} props=${(b.states || []).length}`)
 })

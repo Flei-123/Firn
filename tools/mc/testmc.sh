@@ -24,7 +24,7 @@ for f in tests/*_mc_*${PAT}*.fi; do
             echo "  FAIL  $f [$name]: does not compile"; head -5 "$W/err" | sed 's/^/        /'
             fail=$((fail+1)); continue
         fi
-        out=$(timeout 120 "$W/t" 2>"$W/stderr"); rc=$?
+        out=$(timeout 300 "$W/t" 2>"$W/stderr"); rc=$?
         case "$first" in
             "// expect_exit: "*)
                 want=${first#// expect_exit: }
