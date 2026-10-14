@@ -62,6 +62,8 @@ WANTED = [
     "scissors", "clipboard-paste", "undo-2", "redo-2", "text-select", "minus",
     "square", "minimize-2", "move", "move-diagonal-2", "arrow-up-down",
     "pin-off", "list-checks", "app-window", "power",
+    # a camera app (examples/firncam)
+    "zap", "zap-off", "timer", "timer-off", "grid-3x3", "switch-camera", "camera", "sliders-horizontal", "aperture", "video", "scan", "circle", "flashlight",
 ]
 
 
