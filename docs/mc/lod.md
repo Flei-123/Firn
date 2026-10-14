@@ -49,12 +49,12 @@ against a converged LOD stream, so bulge differences counted as holes). Honest n
 - Cause 2: skirt heights toward a neighbour drawn at ANOTHER bin stopped at the neighbour's binned maximum -> crack between the coarse skirt bottom and the finer neighbour surface.
   `mc_lod.lod_bin_min`: the neighbour arrays hold the exact MINIMUM of each span (never above any representation of the neighbour), so no stale-neighbour-bin bookkeeping is needed.
 - Result: tests/2917 holes 263 -> 80 (mid ring), 658 -> 64 (no mid ring), worst frame 8 px; tests/2861 flight worst 17 -> 3 px, total 79 -> 24 (of 5184 x 70).
-- Remaining holes are 1-px grazing cases (ray exactly on an integer block edge between two quads, also inside full-detail columns): rasterizer edge rounding, not LOD logic.
+- Remaining holes are 1-px grazing cases (ray exactly on an integer block edge between two quads, also inside full-detail columns): rasterizer edge rounding, not LOD logic. -> see "Raster edge expansion" (w3) below.
 - Blending in the sense of an alpha cross-fade needs a per-draw fade in the back end (CPU raster + GL); not built. The pop is reduced by the mid ring (tests/2916/2917: err 11570 -> 10052, pop 2083 -> 1852).
 
 ## Cross-fade (v2, 14.10.)
 Screen-door (ordered dither) fade between two representations of a column, in the CPU raster AND the GL shader with the same Bayer 8x8 formula (`mc_raster.bayer8`, `mc_fs.glsl`).
-- Backend call `set_fade(a, inv)` (mc_backend): following draws keep the pixels with `bayer8(x, y) < a` (inv = 0) or `>= a` (inv = 1); `a >= 64` = off (default). A fading-in and a fading-out mesh with the same `a` and opposite `inv` cover every pixel exactly once (no hole, no double cover). GL flushes the multidraw batch on a change. WebGL (glweb) has no fade (nop: both meshes drawn, depth decides).
+- Backend call `set_fade(a, inv)` (mc_backend): following draws keep the pixels with `bayer8(x, y) < a` (inv = 0) or `>= a` (inv = 1); `a >= 64` = off (default). A fading-in and a fading-out mesh with the same `a` and opposite `inv` cover every pixel exactly once (no hole, no double cover). GL flushes the multidraw batch on a change. WebGL (glweb) has the same fade since w3 (uniform `u_fade`, same bit formula in `glweb_fs.glsl`).
 - Stream: `s.lod_fade_frames` (default 10, 0 = hard switch as before) = length of the fade zone in frames; per column `C_FK` kind, `C_FT` progress 0..256 (`a = ft / 4`).
   - `FK_BIN`: LOD mesh rebuilt (bin change, neighbour change, FIRST mesh of a column shown as LOD): the old mesh (`C_OLH`, own y0/hi) fades out, the new one fades in. A rebuild during a running fade drops the old half-faded mesh.
   - `FK_TOLOD` (mode 0 -> 1): LOD fades in, the still meshed sections fade out (drawn from `lod_draw`, the column already left the cull window), freed when the fade ends.
@@ -64,3 +64,14 @@ Screen-door (ordered dither) fade between two representations of a column, in th
 - Measured (tests/2918, static camera, ring events dist 2->4, 4->2, far bin 4->8, 16 frames each, 96x54): worst frame-to-frame change 57 -> 20 px (-65 %), summed change equal (131 / 131), holes against the pre-event image 156 -> 124. Per-frame change is spread over the fade instead of one frame.
 - GL vs CPU (tools/gpu dump.fi scenes `fade_a` / `fade_b`, a = 24): coverage mismatch 2-3 px of ~12k / ~20k, PSNR 47 / 45 dB (llvmpipe).
 - Trade-off: error against the converged full-detail image is higher while fading (a fading column keeps its old look for `lod_fade_frames` frames).
+
+## Raster edge expansion, glweb fade, water fade (w3, 14.10.)
+- Raster fill rule (lib/mc/mc_raster.fi + python reference tools/mc/raster/ref.py, changed together, byte-identical on all 20+ scenes): the OPAQUE pass accepts pixel centres up to ~1/64 px outside of each edge
+  (`bias += (|dx| + |dy|) / 4` in 1/16-px edge units, on top of the top-left bit). Why: two triangles that share a world edge but snap their vertices one 1/16-px step apart (other section origin,
+  T-junction of a greedy quad, ray exactly on a block edge) left a 1-px slit under the exact rule; now they overlap and the depth test keeps the first. The translucent pass stays exact (an overlap would blend twice).
+- Measured (llvmpipe CPU raster, flight holes against full detail): tests/2861 C worst 2 / total 34 -> worst 1 / total 6; tests/2917 holes 64 (no mid) / 80 (mid) -> 3 / 6, worst frame 8 -> 1. Tolerance sweep (2861 C total / 2917 no-mid): 0: 34 / 64, l1/4: 6 / 3, l1/2: 7 / 5, l1: 13 / 12, 3*l1: 37 / 33 (a wide band grows the silhouette of full-detail columns, so the LOD image has *more* holes against it).
+- NOT zero: the rest are 6 one-pixel skyline differences (LOD silhouette 1 px lower than full detail, 4 clear neighbours in both images) and 1 interior pin hole (tests/2917 x 62 y 38). Skyline differences are LOD geometry (coarse cell top), not rasterization.
+- Side effect: CPU vs GPU coverage mismatch in the WebGL scenes went down (chunk 36 -> 21 px, PSNR 34.2 -> 36.9 dB); the flat fog quad now differs by 2 edge pixels (gate floor 75 -> 45 dB).
+- glweb: `set_fade` implemented (`glweb.fi be_set_fade`, uniform `u_fade = (a, inv, height, 0)`, re-applied at `begin`). Gate scenes `chunk_fade_a` / `chunk_fade_b` (a = 24) in tools/gpu/web/webscene.fi: coverage mismatch 7 / 14 px, PSNR 41 / 39 dB (SwiftShader).
+- Water / glass at FK_TOLOD: the translucent loop follows the cull window; a column that already left it had NO translucent draw, so its far water vanished at the FIRST fade frame (clear pixels at the lake horizon) instead of at the end. `lod_draw_trans` now draws the translucent meshes of the
+  fading-out sections in PASS_TRANS with the same screen-door mask as their opaque mesh (columns in arbitrary order, the fade lasts a few frames). tests/2918 part 2 (lake world, water level 60): worst jump with fade 104 -> 38 px (hard switch 87), holes 306 -> 68 (hard 89), end-of-fade frame 6 px.

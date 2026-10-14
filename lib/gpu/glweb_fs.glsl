@@ -12,6 +12,7 @@ uniform vec2 u_tiles;   // x = tile edge in texels (power of two)
 uniform vec4 u_fog;     // x = 1 fog on, y = start, z = end
 uniform vec3 u_fogc;    // fog colour 0..255
 uniform vec4 u_light;   // x = day (sky light multiplier 0..256), yzw = block light tint per channel 0..256
+uniform vec4 u_fade;    // x = fade a (>= 64 off), y = 1 inverted, z = frame height: screen-door of the LOD cross-fade (mc_raster.bayer8)
 in vec2 v_light;
 in vec3 v_uvao;
 flat in int v_tile;
@@ -24,6 +25,15 @@ void main() {
     int ty = int(floor(v_uvao.y * float(tsz))) & (tsz - 1);
     ivec4 t = ivec4(texelFetch(u_atlas, ivec3(tx, ty, v_tile - 1), 0) * 255.0 + 0.5);
     if (t.a < 128) discard;
+    if (u_fade.x < 63.5) {
+        int px = int(gl_FragCoord.x);
+        int py = int(u_fade.z) - 1 - int(gl_FragCoord.y);
+        int xr = (px ^ py) & 7;
+        int yy = py & 7;
+        int bay = ((xr & 1) << 5) | ((yy & 1) << 4) | ((xr & 2) << 2) | ((yy & 2) << 1) | ((xr & 4) >> 1) | ((yy & 4) >> 2);
+        int fa = int(u_fade.x + 0.5);
+        if (u_fade.y > 0.5 ? bay < fa : bay >= fa) discard;
+    }
     int fq = clamp(int(floor(100.0 + 52.0 * v_uvao.z)), 0, 256);
     int total = (fq * v_fk) >> 8;
     // light: same integer arithmetic as mc_raster.fi (s256 / b256 / per channel factor 24..256)

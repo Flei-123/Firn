@@ -36,10 +36,11 @@ for stage in "" "--no-opt" "--opt-level=dev-fast"; do
         done
     fi
 done
-# counter-check: the fill rule is damaged (every edge counts as "top-left") -> pixels on shared edges are
-# drawn by both triangles / the coverage changes -> the python renderer must see a difference
+# counter-check: the fill rule is damaged (edge expansion of the opaque pass removed, every edge counts as "top-left")
+# -> the coverage of pixel centres next to / on shared edges changes -> the python renderer must see a difference
 mkdir -p "$W/badlib" "$W/bad" && cp -r lib/. "$W/badlib/"
 sed -i 's/if e1dy < 0 as i64 || (e1dy == 0 as i64 \&\& e1dx > 0 as i64) { bias1 = 1 }/bias1 = 1/' "$W/badlib/mc/mc_raster.fi"
+sed -i 's/if (\*r)\.edge_exp \&\& !(\*r)\.trans {/if false {/' "$W/badlib/mc/mc_raster.fi"
 sed -i 's/if e2dy < 0 as i64 || (e2dy == 0 as i64 \&\& e2dx > 0 as i64) { bias2 = 1 }/bias2 = 1/' "$W/badlib/mc/mc_raster.fi"
 if cmp -s lib/mc/mc_raster.fi "$W/badlib/mc/mc_raster.fi"; then
     echo "  FAIL  counter-check: the damage did not apply"; ERR=1
