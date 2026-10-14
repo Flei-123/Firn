@@ -299,7 +299,11 @@ pub(crate) fn label(name: &str) -> String {
         return link;
     }
     if let Some(export) = crate::extfn::export_link_name(name) {
-        return export;
+        // A Windows DLL exports a Win64 THUNK under the bare name (win.rs); the
+        // Firn function itself keeps its internal System V symbol.
+        if !(crate::target::windows() && crate::target::shared()) {
+            return export;
+        }
     }
     crate::modules::symbol(name, None)
 }
@@ -350,7 +354,11 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // over no stack block, `exit` is not a system call, and the standard
     // handles have to be fetched before anything can report an error --
     // `win.rs::start_asm` writes the calls that do it.
-    if !freestanding && crate::target::windows() {
+    if !freestanding && crate::target::windows() && crate::target::shared() {
+        // DLL: the loader calls `DllMain`-style entry; the runtime starts lazily
+        // on the first export call (same as the Linux .so).
+        e.raw(&crate::win::dll_entry_asm(&label(crate::win_seam::INIT_FN)));
+    } else if !freestanding && crate::target::windows() {
         let gc = if crate::gc::runtime_active() {
             Some(label(crate::gc::FN_INIT))
         } else {

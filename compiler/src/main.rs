@@ -1376,14 +1376,17 @@ fn default_output(input: &Path) -> PathBuf {
 /// library never go through the PLT (`-Bsymbolic`).
 fn link_shared(obj: &Path, so: &Path) -> Result<(), i32> {
     let t = target::active();
-    if !matches!(t, target::Target::X86_64) || target::windows() || target::android() {
-        eprintln!("error: --shared builds an x86-64 Linux shared object only");
+    if target::android() || matches!(t, target::Target::Wasm32Browser) {
+        eprintln!("error: --shared builds a Linux .so (x86-64, aarch64) or a Windows DLL (x86_64-windows) only");
         return Err(2);
     }
     let names = extfn::export_names();
     if names.is_empty() {
         eprintln!("error: --shared: no #[export_c] function in the program");
         return Err(2);
+    }
+    if target::windows() {
+        return link_dll(obj, so, &names);
     }
     let ver = so.with_extension("ver");
     let script = format!("{{ global: {}; local: *; }};\n", names.join("; "));
@@ -1406,6 +1409,44 @@ fn link_shared(obj: &Path, so: &Path) -> Result<(), i32> {
     }
     let res = cmd.status();
     let _ = std::fs::remove_file(&ver);
+    match res {
+        Ok(s) if s.success() => Ok(()),
+        Ok(_) => {
+            eprintln!("error: the linker failed");
+            Err(3)
+        }
+        Err(e) => {
+            eprintln!("error: cannot start '{}': {}", t.linker(), e);
+            Err(3)
+        }
+    }
+}
+
+/// `--shared --target=x86_64-windows`: a PE DLL. Exports = the Win64 thunks `win.rs` wrote under the
+/// bare `#[export_c]` names, listed in a `.def` file. Entry = `win::DLL_ENTRY`.
+fn link_dll(obj: &Path, dll: &Path, names: &[String]) -> Result<(), i32> {
+    for (_, c_name, argc, float) in extfn::export_thunk_info() {
+        if float || argc > 6 {
+            eprintln!(
+                "error: --shared (Windows DLL): '{}' has float/vector parameters or more than 6 arguments; \
+                 the Win64 entry thunk moves up to 6 integer/pointer arguments only",
+                c_name
+            );
+            return Err(2);
+        }
+    }
+    let def = dll.with_extension("def");
+    let libname = dll.file_name().and_then(|x| x.to_str()).unwrap_or("firn.dll");
+    let text = format!("LIBRARY \"{}\"\nEXPORTS\n{}\n", libname, names.iter().map(|n| format!("    {}", n)).collect::<Vec<_>>().join("\n"));
+    if let Err(e) = std::fs::write(&def, text.as_bytes()) {
+        eprintln!("error: cannot write '{}': {}", def.display(), e);
+        return Err(2);
+    }
+    let t = target::active();
+    let mut cmd = Command::new(t.linker());
+    cmd.arg("--dll").arg("-e").arg(win::DLL_ENTRY).arg("--subsystem").arg("windows").arg("-o").arg(dll).arg(obj).arg(&def);
+    let res = cmd.status();
+    let _ = std::fs::remove_file(&def);
     match res {
         Ok(s) if s.success() => Ok(()),
         Ok(_) => {
