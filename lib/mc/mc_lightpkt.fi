@@ -20,7 +20,7 @@ import mc.mc_light
 
 export {
     LightData, lightdata_alloc, lightdata_release, lightdata_new, lightdata_free, lightdata_decode_118, lightdata_decode_114, lightdata_apply,
-    lightdata_sky_array, lightdata_block_array, popcount64, nibble_get, lightdata_hash,
+    lightdata_sky_array, lightdata_block_array, popcount64, nibble_get, lightdata_hash, lightdata_merge,
 }
 
 struct LightData {
@@ -262,4 +262,61 @@ fn lightdata_apply(v: *mut mc_light.LightVol, ld: *mut LightData, cell_x0: i32, 
         s = s + 1
     }
     return written
+}
+
+// ---- merging update_light packets into the light state of a column (1.14 - 1.16.5 send light as separate, partial packets)
+
+// New array set = old arrays of the bits NOT touched by the packet + the arrays of the packet. A bit in `sm` (set in the
+// packet) takes the packet array, a bit in `se` (empty in the packet) is dropped. Returns the new heap block (0 when no
+// array is left); `*out_mask` receives the new mask. The caller frees the old block.
+fn merge_arrays(dm: u64, darr: u64, sm: u64, sarr: u64, se: u64, out_mask: *mut u64) -> u64 {
+    let touched: u64 = sm | se
+    let nm: u64 = (dm ^ (dm & touched)) | sm
+    *out_mask = nm
+    let n: usize = popcount64(nm)
+    if n == 0 { return 0 }
+    let out: u64 = rt.heap_alloc(n * 2048)
+    if out == 0 { return 0 }
+    var k: usize = 0
+    var bit: u64 = 0 as u64
+    while bit < 64 as u64 {
+        if ((nm >> bit) & 1 as u64) != 0 as u64 {
+            let below: u64 = (1 as u64 << bit) - 1 as u64
+            var src: u64 = 0
+            if ((sm >> bit) & 1 as u64) != 0 as u64 {
+                src = sarr + (popcount64(sm & below) as u64) * 2048 as u64
+            } else {
+                src = darr + (popcount64(dm & below) as u64) * 2048 as u64
+            }
+            rt.mem_copy(out + (k as u64) * 2048 as u64, src, 2048)
+            k = k + 1
+        }
+        bit = bit + 1 as u64
+    }
+    return out
+}
+
+// Applies the partial packet `src` to the column state `dst` (sky and block separately). The empty masks are kept as the
+// union of what the packets declared empty (a later array for the same bit clears the empty bit). false = out of memory.
+fn lightdata_merge(dst: *mut LightData, src: *mut LightData) -> bool {
+    var nm: u64 = 0 as u64
+    let ns: u64 = merge_arrays((*dst).sky_mask, (*dst).sky, (*src).sky_mask, (*src).sky, (*src).empty_sky, &nm)
+    if ns == 0 && nm != 0 as u64 { return false }
+    var nmb: u64 = 0 as u64
+    let nb: u64 = merge_arrays((*dst).block_mask, (*dst).block, (*src).block_mask, (*src).block, (*src).empty_block, &nmb)
+    if nb == 0 && nmb != 0 as u64 {
+        if ns != 0 { rt.heap_free(ns, popcount64(nm) * 2048) }
+        return false
+    }
+    if (*dst).sky != 0 { rt.heap_free((*dst).sky, (*dst).sky_n * 2048) }
+    if (*dst).block != 0 { rt.heap_free((*dst).block, (*dst).block_n * 2048) }
+    (*dst).sky = ns
+    (*dst).sky_mask = nm
+    (*dst).sky_n = popcount64(nm)
+    (*dst).block = nb
+    (*dst).block_mask = nmb
+    (*dst).block_n = popcount64(nmb)
+    (*dst).empty_sky = ((*dst).empty_sky ^ ((*dst).empty_sky & (*src).sky_mask)) | (*src).empty_sky
+    (*dst).empty_block = ((*dst).empty_block ^ ((*dst).empty_block & (*src).block_mask)) | (*src).empty_block
+    return true
 }
