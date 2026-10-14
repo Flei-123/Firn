@@ -1428,8 +1428,8 @@ fn link_dll(obj: &Path, dll: &Path, names: &[String]) -> Result<(), i32> {
     for (_, c_name, _, unsupported) in extfn::export_thunk_info() {
         if unsupported {
             eprintln!(
-                "error: --shared (Windows DLL): '{}' has a v128 parameter; Win64 passes vectors by hidden pointer, \
-                 take a pointer instead",
+                "error: --shared (Windows DLL): '{}' has a v128 parameter that finds no xmm0-7 register \
+                 (more than 8 float / vector parameters); take a pointer instead",
                 c_name
             );
             return Err(2);
