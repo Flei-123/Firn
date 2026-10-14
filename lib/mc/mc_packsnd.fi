@@ -15,7 +15,9 @@
 //   * Per event at most 16 samples (engine limit); the top pack wins the cut. Files / events are limited by PS_MAX_* AND by the free room
 //     in the engine (2048 samples / events minus what the synth bank already uses). More are skipped and counted, never truncated silently.
 //     An event without a single decodable file is not created.
-//   * volume / pitch of the FIRST entry (of the top-most pack that has the event) is used; "stream" is ignored.
+//   * volume / pitch are PER ENTRY (vanilla): every file keeps its own factors (event volume 1.0 * entry volume, pitch likewise), carried by
+//     the bank as "sample_volume" / "sample_pitch" (parallel to "samples", one value per slot, so a weighted file repeats its factors).
+//     The same file twice = once, the FIRST (top-most) entry's factors win. "stream" is ignored.
 //   * "weight" (default 1, 1..1000): the engine picks uniformly from the max 16 sample slots of an event, so a file gets as many slots
 //     (same sample id repeated) as its weight -- exact while the weights sum to <= 16, above that scaled proportionally (>= 1 slot
 //     each; see acc_slots). All weights 1 = one slot per file = the old behaviour.
@@ -39,7 +41,7 @@ import mc.mc_audio
 import mc.mc_packs
 
 export {
-    packsnd_apply, packsnd_build_text, PackSnd, PS_MAX_EVENTS, PS_MAX_FILES, PS_PER_EVENT, Acc, acc_new, acc_slots, acc_list,
+    packsnd_apply, packsnd_build_text, PackSnd, PS_MAX_EVENTS, PS_MAX_FILES, PS_PER_EVENT, Acc, acc_new, acc_slots, acc_list, acc_list_factors, acc_has_factors,
 }
 
 const PS_MAX_EVENTS: usize = 1600
@@ -170,15 +172,14 @@ struct Ctx {
 struct Acc {
     paths: rt.Buf, // zip paths of the distinct usable files, one per line (duplicate check + output order)
     n: usize,
-    vol: f64,
-    pit: f64,
-    have_opts: bool,
+    vol: [f64; 16], // vanilla "volume" per file (default 1.0, clamped to 0..4 on output)
+    pit: [f64; 16], // vanilla "pitch" per file (default 1.0)
     w: [i32; 16], // vanilla "weight" per file (default 1, clamped to 1..1000)
     cnt: [i32; 16], // slots per file in the event (see acc_slots)
 }
 
 fn acc_new() -> Acc {
-    return Acc { paths: rt.buf_new(), n: 0, vol: 1.0, pit: 1.0, have_opts: false, w: [1; 16], cnt: [1; 16] }
+    return Acc { paths: rt.buf_new(), n: 0, vol: [1.0; 16], pit: [1.0; 16], w: [1; 16], cnt: [1; 16] }
 }
 
 // Weighted pick without engine support: the engine picks uniformly from the (max 16) sample slots of an event, so a file with weight w
@@ -234,6 +235,34 @@ fn acc_list(a: *mut Acc, out: *mut rt.Buf) {
         k = k + 1
         i = e + 1
     }
+}
+
+// Same walk as acc_list, but the per-file factor (volume or pitch) per slot: "1.000,0.500,..." (milli precision).
+fn acc_list_factors(a: *mut Acc, pitch: bool, out: *mut rt.Buf) {
+    var first: bool = true
+    var k: usize = 0
+    while k < (*a).n {
+        var r: i32 = 0
+        while r < (*a).cnt[k] {
+            if !first { rt.buf_push(out, 44 as u8) }
+            first = false
+            if pitch { push_milli(out, (*a).pit[k]) } else { push_milli(out, (*a).vol[k]) }
+            r = r + 1
+        }
+        k = k + 1
+    }
+}
+
+// Any file with a factor other than 1.0?
+fn acc_has_factors(a: *mut Acc, pitch: bool) -> bool {
+    var k: usize = 0
+    while k < (*a).n {
+        var v: f64 = (*a).vol[k]
+        if pitch { v = (*a).pit[k] }
+        if v != 1.0 { return true }
+        k = k + 1
+    }
+    return false
 }
 
 fn file_hash(p: u64, n: usize) -> u64 {
@@ -343,8 +372,9 @@ fn add_entries(c: *mut Ctx, d: *mut json.Json, arr: u32, a: *mut Acc) {
             rt.buf_push_bytes(&(*a).paths, rt.buf_ptr(&path), rt.buf_len(&path))
             rt.buf_push(&(*a).paths, 10 as u8)
             (*a).w[(*a).n] = iw
+            (*a).vol[(*a).n] = iv
+            (*a).pit[(*a).n] = ip
             (*a).n = (*a).n + 1
-            if !(*a).have_opts { (*a).vol = iv; (*a).pit = ip; (*a).have_opts = true }
         }
         rt.buf_free(&path)
     }
@@ -440,13 +470,15 @@ fn packsnd_build_text(s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mu
             acc_slots(&a)
             acc_list(&a, text)
             push_s(text, "]")
-            if a.vol > 0.0 && a.vol != 1.0 {
-                push_s(text, ",\"volume\":")
-                push_milli(text, a.vol)
+            if acc_has_factors(&a, false) {
+                push_s(text, ",\"sample_volume\":[")
+                acc_list_factors(&a, false, text)
+                push_s(text, "]")
             }
-            if a.pit > 0.0 && a.pit != 1.0 {
-                push_s(text, ",\"pitch\":")
-                push_milli(text, a.pit)
+            if acc_has_factors(&a, true) {
+                push_s(text, ",\"sample_pitch\":[")
+                acc_list_factors(&a, true, text)
+                push_s(text, "]")
             }
             push_s(text, "}")
             if is_new { new_events = new_events + 1 }
