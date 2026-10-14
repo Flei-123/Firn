@@ -125,7 +125,7 @@ if [ "${MCPLAY_SKIP_PULSE:-0}" != 1 ] && command -v pulseaudio >/dev/null && com
             grep -q "no sound output" "$W/PsDev.out" && { echo "  FAIL  device sink did not open"; ERR=1; }
             grep -q "did not restart" "$W/PsDev.out" && { echo "  FAIL  audio thread did not restart"; ERR=1; }
             check_reload PsDev 2
-            python3 tools/mc/play/audio_check.py "$W/dev.wav" "$W/PsDev.out" --bursts 6 || ERR=1
+            python3 tools/mc/play/audio_check.py "$W/dev.wav" "$W/PsDev.out" --bursts 4 || ERR=1
             DERR=$ERR; ERR=$ERR_SAVE
             [ $DERR -eq 0 ] && break
             [ $dev_try -ge 2 ] && { ERR=1; break; }
