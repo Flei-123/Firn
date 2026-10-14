@@ -36,6 +36,8 @@ import mc.mc_lightpkt
 import mc.mc_world
 import mc.mc_client
 import mc.mc_dimension
+import mc.mc_flat
+import mc.v340.mc_flat_v340
 import mc.mc_entity
 import mc.mc_schema
 import mc.mc_sem
@@ -195,26 +197,38 @@ struct Stats {
     walk_ok: u64,
     walk_fail: u64,
     chunk_bad: u64,
-    partial: u64, // section-only updates (groundUp = false) that were not stored
+    partial: u64, // section-only updates (groundUp = false) for a column the world does not have (dropped)
+    merged: u64, // section-only updates merged into a stored column (mc_world.world_apply)
     kicked: bool,
     dim: mc_dimension.Dimension, // from the Join Game packet (default: overworld)
     dim_known: bool,
 }
 
+static mut g_flat_tab: u64 = 0 // MC_FLATTEN=1 on 1.12.2: the u16[4096] table (legacy id<<4|meta -> 1.20.1 state), else 0
 static mut g_lk_ok: u64 = 0
 static mut g_lk_bad: u64 = 0
 
 // Stores one decoded column (or counts it as bad / partial). Takes ownership of `p`.
 fn store_chunk(w: *mut mc_world.World, st: *mut Stats, p: u64, ok: bool) {
     let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
-    if ok && (*c).ground_up == 0 {
-        // a legacy section update must be MERGED into its column; this client keeps whole columns only
+    if !ok {
         mc_chunk.chunk_release(p)
+        (*st).chunk_bad = (*st).chunk_bad + 1 as u64
+        return
+    }
+    // a section update (groundUp = false) is merged into its stored column, a whole column replaces
+    // the stored one; world_apply takes ownership of `p` in every case
+    let was_update: bool = (*c).ground_up == 0
+    let r: i32 = mc_world.world_apply(w, p)
+    if r == mc_world.APPLY_MERGED {
+        (*st).merged = (*st).merged + 1 as u64
+        return
+    }
+    if r == mc_world.APPLY_DROPPED {
         (*st).partial = (*st).partial + 1 as u64
         return
     }
-    if !ok || !mc_world.world_put(w, p) {
-        mc_chunk.chunk_release(p)
+    if r != mc_world.APPLY_STORED || was_update {
         (*st).chunk_bad = (*st).chunk_bad + 1 as u64
         return
     }
@@ -237,13 +251,17 @@ fn on_map_chunk(cl: *mut mc_client.Client, sc: *mut mc_chunk.Scratch, w: *mut mc
         return
     }
     let c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
-    let ok: bool = mc_chunk.chunk_decode_for(&(*cl).ver, mc_client.client_body(cl), sc, c, mc_dimension.dim_sections(&(*st).dim)) catch false
+    var ok: bool = mc_chunk.chunk_decode_for(&(*cl).ver, mc_client.client_body(cl), sc, c, mc_dimension.dim_sections(&(*st).dim)) catch false
     if ok && (*cl).ver.chunk_format == mc_version.CF_LEGACY_8 && mc_chunk.chunk_is_unload_legacy8(c) {
         // 1.8 has no unload packet: an empty ground-up column removes the chunk
         mc_world.world_remove(w, (*c).x, (*c).z)
         mc_chunk.chunk_release(p)
         (*st).unloads = (*st).unloads + 1 as u64
         return
+    }
+    if ok && g_flat_tab != 0 {
+        // MC_FLATTEN=1 (1.12.2): legacy id<<4|meta -> 1.20.1 state ids before the column is stored
+        ok = mc_chunk.chunk_remap_blocks(c, sc, g_flat_tab, mc_flat.FLAT_STATES) catch false
     }
     store_chunk(w, st, p, ok)
 }
@@ -410,9 +428,14 @@ fn main(start: u64) -> i32 {
     var world: mc_world.World = mc_world.world_new()
     var sc: mc_chunk.Scratch = mc_chunk.scratch_new()
     if env.has("MC_KEEP_LIGHT") { mc_chunk.scratch_set_keep_light(&sc, true) }
+    var flat: mc_flat.Flat = mc_flat.Flat { tab: 0 }
+    if env.has("MC_FLATTEN") && ver.protocol == 340 {
+        flat = mc_flat_v340.flat_make()
+        if mc_flat.flat_ok(&flat) { g_flat_tab = mc_flat.flat_table(&flat) }
+    }
     var ents: mc_entity.Store = mc_entity.store_new()
     var st: Stats = Stats { t_first_chunk: 0, t_last_chunk: 0, t_join: 0, t_last_packet: 0, chunks: 0, unloads: 0,
-        walk_ok: 0, walk_fail: 0, chunk_bad: 0, partial: 0, kicked: false, dim: mc_dimension.dim_default_overworld(), dim_known: false }
+        walk_ok: 0, walk_fail: 0, chunk_bad: 0, partial: 0, merged: 0, kicked: false, dim: mc_dimension.dim_default_overworld(), dim_known: false }
     mc_codec.wire_timeout(&cl.w, 100)
 
     // ---- online account (optional)
@@ -564,6 +587,8 @@ fn main(start: u64) -> i32 {
     say(f"metric chunk_bad={st.chunk_bad}\n")
     say(f"metric unloads={st.unloads}\n")
     say(f"metric partial_chunks={st.partial}\n")
+    say(f"metric merged_chunks={st.merged}\n")
+    say(f"metric flattened={g_flat_tab != 0}\n")
     say(f"metric entities={mc_entity.store_count(&ents)}\n")
     say(f"metric entity_players={mc_entity.store_player_count(&ents)}\n")
     say(f"metric entity_spawns={ents.spawns}\n")
@@ -578,6 +603,8 @@ fn main(start: u64) -> i32 {
 
     mc_entity.store_free(&ents)
     mc_world.world_free(&world)
+    g_flat_tab = 0
+    mc_flat.flat_free(&flat)
     mc_chunk.scratch_free(&sc)
     mc_client.client_free(&cl)
     // the token must not outlive the run

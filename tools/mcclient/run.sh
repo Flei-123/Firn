@@ -190,6 +190,8 @@ ent_script() { # $1 = number of the join line to wait for; then plays the events
   echo "tp Bot 8.5 70 0.5" >&3; sleep 0.6
   echo "walk 6 0.25 0.125 120" >&4; sleep 1.1
   echo "$EXEC_AT tp @e[type=$PIG] ~ ~3 ~-3" >&3; sleep 0.5
+  # MC_ENT_ROT=1: teleport the pig again WITH a rotation (yaw 90, pitch 30) to check the entity_teleport layout
+  [ "${MC_ENT_ROT:-0}" = 1 ] && { echo "$EXEC_AT tp @e[type=$PIG] ~ ~3 ~-3 90 30" >&3; sleep 0.5; }
   echo "$EXEC_AT summon $CHICKEN ~ ~2 ~-3 {NoAI:1b}" >&3; sleep 0.5
   echo "kill @e[type=$CHICKEN]" >&3; sleep 0.3
 }
@@ -215,6 +217,7 @@ run_ref() { # label [idle_ms]
   [ -n "$spid" ] && wait "$spid"
   [ -s "$W/out/$label.err" ] && { echo "  stderr of $label:"; head -3 "$W/out/$label.err" | sed 's/^/    /'; }
   [ $rc -eq 0 ] || { echo "run.sh: reference client $label failed (rc $rc)" >&2; return 1; }
+  [ -f "$W/out/$label.dump.raw" ] && { echo "  raw packets of $label (MC_RAW_NAMES):"; sed 's/^/    RAW /' "$W/out/$label.dump.raw"; }
   wait_left
 }
 

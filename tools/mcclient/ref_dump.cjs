@@ -28,6 +28,7 @@ const SECTIONS_114 = PROTOCOL >= 751 && PROTOCOL <= 754 // 1.16.2 - 1.16.5: CF_S
 const fs = require('fs')
 const crypto = require('crypto')
 const { EntityTracker } = require('./ref_entities.cjs')
+const RAW_NAMES = process.env.MC_RAW_NAMES ? new Set(process.env.MC_RAW_NAMES.split(',')) : null
 
 // ---------------------------------------------------------------- FNV-1a 64 (two 32-bit halves)
 class Fnv64 {
@@ -252,6 +253,38 @@ function unpackSpanning (longs, bits, count) {
   return out
 }
 
+// ---------------------------------------------------------------- flattening (MC_FLATTEN=1, 1.12.2 only)
+// The legacy table (id << 4 | meta -> 1.20.1 global state id) comes from the INDEPENDENT Node implementation
+// tools/mc/flat/ref_flat.cjs (rules: tools/mcgen/legacy_flat.json), not from the Firn generator output.
+let flatTable = null
+function loadFlatTable () {
+  const cp = require('child_process')
+  const path = require('path')
+  const root = path.join(__dirname, '..')
+  const out = cp.execFileSync(process.execPath, [path.join(root, 'mc', 'flat', 'ref_flat.cjs'), path.join(root, 'mcgen', 'legacy_flat.json')],
+    { encoding: 'utf8', env: process.env, maxBuffer: 1 << 24 })
+  const t = out.split('\n').filter((l) => l.trim() !== '').map((l) => parseInt(l, 10))
+  if (t.length !== 4096 || t.some((v) => !Number.isInteger(v))) throw new Error(`flat table has ${t.length} entries`)
+  return t
+}
+if (process.env.MC_FLATTEN && PROTOCOL === 340) flatTable = loadFlatTable()
+
+// A section update (groundUp = false) is MERGED into the stored column (the Firn client does the same with
+// mc_world.world_apply): the sections named in bitMap replace the stored ones; biomes, heightmaps, block
+// entities and the light hash stay those of the stored column; the light section counters add up.
+// An update for a column that is not stored is dropped (counted in partial_chunks).
+function mergeUpdate (stored, upd, bitMap) {
+  for (let i = 0; i < 16; i++) {
+    if (!(bitMap & (1 << i))) continue
+    const old = stored.sections[i]
+    const ns = upd.sections[i]
+    if (old.biomesHash !== undefined && ns.biomesHash !== undefined) ns.biomesHash = old.biomesHash
+    stored.sections[i] = ns
+  }
+  stored.light.sky += upd.light.sky
+  stored.light.block += upd.light.block
+}
+
 function decodeLegacyColumn (p, hasSky) {
   const r = new Reader(p.chunkData)
   const sections = []
@@ -279,6 +312,7 @@ function decodeLegacyColumn (p, hasSky) {
     for (const b of r.bytes(2048)) f.byte(b)
     blockN++
     if (hasSky) { for (const b of r.bytes(2048)) f.byte(b); skyN++ }
+    if (flatTable) { for (let k = 0; k < 4096; k++) ids[k] = ids[k] < 4096 ? flatTable[ids[k]] : 0 }
     let nonAir = 0
     for (const v of ids) if (v !== 0) nonAir++
     sections.push({ blockCount: nonAir, blocksHash: hashU16(ids), distinct: new Set(ids).size, ids })
@@ -521,6 +555,7 @@ function main () {
       walk_fail: walkFail + chunkErrors,
       num_sections: numSections,
       partial_chunks: partialChunks,
+      merged_chunks: mergedChunks,
       bulk_packets: bulkPackets,
       bulk_columns: bulkColumns,
       trailing_nonzero_chunks: trailingNonZero,
@@ -550,12 +585,14 @@ function main () {
   })
   client.on('packet', (data, meta, buffer, full) => {
     packets++; walkOk++
+    if (RAW_NAMES && RAW_NAMES.has(meta.name) && buffer) fs.appendFileSync(dumpFile + '.raw', `${meta.name} ${buffer.toString('hex')}\n`) // MC_RAW_NAMES=a,b: raw bodies for layout checks
     try { tracker.onPacket(meta.name, data) } catch (e) { entityErrors++; console.error('entity packet ' + meta.name + ': ' + e.message) }
     bytesDec += (full || buffer || Buffer.alloc(0)).length
   })
 
   let hasSky = true
   let partialChunks = 0
+  let mergedChunks = 0
   client.on('login', (p) => {
     m.join_ms = Date.now() - t0
     if (LEGACY_SECTIONS || LEGACY8) {
@@ -598,8 +635,15 @@ function main () {
       return
     }
     try {
-      if ((LEGACY_SECTIONS || SECTIONS_114) && !p.groundUp) { partialChunks++; armIdle(); return } // section-only update: ignored (documented)
       const c = LEGACY_SECTIONS ? decodeLegacyColumn(p, hasSky) : SECTIONS_114 ? decodeChunk114(p) : decodeChunk(p, numSections)
+      if ((LEGACY_SECTIONS || SECTIONS_114) && !p.groundUp) {
+        // section-only update: merged into the stored column (like mc_world.world_apply); unknown column = dropped
+        const stored = chunks.get(`${c.x},${c.z}`)
+        if (!stored) partialChunks++
+        else { mergeUpdate(stored, c, p.bitMap); mergedChunks++ }
+        armIdle()
+        return
+      }
       chunks.set(`${c.x},${c.z}`, c)
     } catch (e) {
       chunkErrors++
