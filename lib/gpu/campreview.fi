@@ -75,6 +75,10 @@ struct CamPreview {
     uploads: u64,
     draws: u64,
     bytes: u64,
+    // staging copy of the camera planes (see cp_upload)
+    stage: u64,
+    stage_n: usize,
+    direct: bool,
 }
 
 fn cp_new() -> CamPreview {
@@ -84,7 +88,7 @@ fn cp_new() -> CamPreview {
         u_mode: 0 as u32, u_quad: 0 as u32, ty: 0 as u32, tuv: 0 as u32, tv: 0 as u32,
         fw: 0, fh: 0, planar: false, vfirst: false, have: false,
         fb: 0 as u32, tex: 0 as u32, ow: 0, oh: 0, tgen: 0 as u32,
-        uploads: 0, draws: 0, bytes: 0,
+        uploads: 0, draws: 0, bytes: 0, stage: 0, stage_n: 0, direct: false,
     }
 }
 
@@ -189,6 +193,11 @@ fn cp_close(c: *mut CamPreview) {
     (*c).vao = 0 as u32
     (*c).ok = false
     (*c).have = false
+    if (*c).stage != 0 {
+        syscall(11, (*c).stage as i64, (*c).stage_n as i64, 0, 0, 0, 0)
+        (*c).stage = 0
+        (*c).stage_n = 0
+    }
 }
 
 // ---------------------------------------------------------------- textures
@@ -254,6 +263,48 @@ fn cp_upload(c: *mut CamPreview, w: i32, h: i32, yp: u64, ys: i32, up: u64, vp: 
         return false
     }
     let api: *mut gl.GlApi = (*c).api
+    // Staging copy: the planes of an AImage are camera (gralloc) memory. Handing that straight to
+    // glTexSubImage2D made the Android emulator's GLES renderer fail its command checksum (host crash, or
+    // eglSwapBuffers stuck for good); a plain heap copy never did. The copy is ~1.2 MB a frame (about 0.1 ms).
+    // cp.direct = true skips it (tests / hosts with plain memory).
+    var yp2: u64 = yp
+    var up2: u64 = up    // planar: U start; interleaved: start of the first pair
+    var vp2: u64 = vp
+    if !planar { up2 = base }
+    if !(*c).direct {
+        let ny: usize = ((h - 1) as usize) * (ys as usize) + (w as usize)
+        var nu: usize = 0
+        var nv: usize = 0
+        if planar {
+            nu = ((ch - 1) as usize) * (us as usize) + (cw as usize)
+            nv = ((ch - 1) as usize) * (vs as usize) + (cw as usize)
+        } else {
+            nu = ((ch - 1) as usize) * (us as usize) + ((2 * cw) as usize)
+        }
+        let oy: usize = 0
+        let ou: usize = (ny + 63) / 64 * 64
+        let ov: usize = ou + (nu + 63) / 64 * 64
+        let need: usize = ov + nv + 64
+        if (*c).stage_n < need {
+            if (*c).stage != 0 { syscall(11, (*c).stage as i64, (*c).stage_n as i64, 0, 0, 0, 0) }
+            let m: i64 = syscall(9, 0, need as i64, 3, 34, -1, 0)
+            if m <= 0 {
+                (*c).stage = 0
+                (*c).stage_n = 0
+                return false
+            }
+            (*c).stage = m as u64
+            (*c).stage_n = need
+        }
+        rt.mem_copy((*c).stage, yp, ny)
+        yp2 = (*c).stage
+        rt.mem_copy((*c).stage + ou as u64, up2, nu)
+        up2 = (*c).stage + ou as u64
+        if planar {
+            rt.mem_copy((*c).stage + ov as u64, vp, nv)
+            vp2 = (*c).stage + ov as u64
+        }
+    }
     if (*c).ty == 0 as u32 || (*c).fw != w || (*c).fh != h || (*c).planar != planar {
         if (*c).ty != 0 as u32 { (*api).delete_obj(gl.GLK_TEXTURE as u64, (*c).ty as u64) }
         if (*c).tuv != 0 as u32 { (*api).delete_obj(gl.GLK_TEXTURE as u64, (*c).tuv as u64) }
@@ -271,12 +322,12 @@ fn cp_upload(c: *mut CamPreview, w: i32, h: i32, yp: u64, ys: i32, up: u64, vp: 
         (*c).planar = planar
     }
     (*c).vfirst = vfirst
-    put_plane(c, (*c).ty, gl.GL_RED, 1, w, h, yp, ys)
+    put_plane(c, (*c).ty, gl.GL_RED, 1, w, h, yp2, ys)
     if planar {
-        put_plane(c, (*c).tuv, gl.GL_RED, 1, cw, ch, up, us)
-        put_plane(c, (*c).tv, gl.GL_RED, 1, cw, ch, vp, vs)
+        put_plane(c, (*c).tuv, gl.GL_RED, 1, cw, ch, up2, us)
+        put_plane(c, (*c).tv, gl.GL_RED, 1, cw, ch, vp2, vs)
     } else {
-        put_plane(c, (*c).tuv, GL_RG, 2, cw, ch, base, us)
+        put_plane(c, (*c).tuv, GL_RG, 2, cw, ch, up2, us)
     }
     (*c).have = true
     (*c).uploads = (*c).uploads + 1
