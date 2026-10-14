@@ -1,0 +1,314 @@
+// tools/mc/vk/lifeprobe.fi -- gpu.vk_life on an X11 swapchain (Xvfb + lavapipe, NOT a GPU): resize, OUT_OF_DATE at acquire and at
+// present, SUBOPTIMAL (+ the streak limit), minimised window, SURFACE_LOST, DEVICE_LOST (all simulated with vk.inject) and the
+// recovery, each time compared with an offscreen render of the same triangle. Exit 0 = ok, 3 = a check failed, 4 = no device / no
+// display (the gate prints SKIP).
+import std.rt
+import std.io
+import std.env
+import window.window
+import window.backend
+import gpu.vk
+import gpu.vk_life
+
+const W: i32 = 320
+const H: i32 = 180
+const CLEAR: u32 = 0xFFE6BE96
+
+struct Probe {
+    fails: i32,
+    rb_calls: i32,
+    rb_w: i32,
+    rb_h: i32,
+    lost_calls: i32,
+}
+
+fn check(pr: *mut Probe, name: str, ok: bool) {
+    if ok {
+        io.print("ok   ")
+    } else {
+        io.print("FAIL ")
+        (*pr).fails = (*pr).fails + 1
+    }
+    io.print(name)
+    io.print("\n")
+}
+
+fn on_rebuild(ud: u64, w: i32, h: i32) {
+    let pr: *mut Probe = ud as *mut Probe
+    (*pr).rb_calls = (*pr).rb_calls + 1
+    (*pr).rb_w = w
+    (*pr).rb_h = h
+}
+
+fn on_lost(ud: u64) {
+    let pr: *mut Probe = ud as *mut Probe
+    (*pr).lost_calls = (*pr).lost_calls + 1
+}
+
+fn putf(p: u64, i: usize, x: f64) {
+    rt.st32(p, i, __bits(x as f32) as u32)
+}
+
+fn fill(vb: *mut vk.Buf) -> bool {
+    let tmp: u64 = rt.heap_alloc(60)
+    let xs: [f64; 3] = [0.0 - 0.8, 0.8, 0.0]
+    let ys: [f64; 3] = [0.7, 0.7, 0.0 - 0.7]
+    var i: usize = 0
+    while i < 3 {
+        putf(tmp, i * 5, xs[i])
+        putf(tmp, i * 5 + 1, ys[i])
+        putf(tmp, i * 5 + 2, 1.0 - (i as f64) * 0.4)
+        putf(tmp, i * 5 + 3, (i as f64) * 0.5)
+        putf(tmp, i * 5 + 4, 0.25)
+        i = i + 1
+    }
+    let ok: bool = vk.buf_write(vb, tmp, 60)
+    rt.heap_free(tmp, 60)
+    return ok
+}
+
+fn pump(w: *mut window.Window, ms: i64) {
+    window.wait_event(w, ms)
+    var k: u32 = window.next_event(w)
+    var n: i32 = 0
+    while k != window.EV_NONE && n < 10000 {
+        n = n + 1
+        k = window.next_event(w)
+    }
+}
+
+fn set_size(win: *mut window.Window, w: i32, h: i32) -> bool {
+    backend.r_set_size(&(*win).p, w as usize, h as usize)
+    var waited: i32 = 0
+    while (window.width(win) != (w as usize) || window.height(win) != (h as usize)) && waited < 3000 {
+        pump(win, 20)
+        waited = waited + 20
+    }
+    return window.width(win) == (w as usize) && window.height(win) == (h as usize)
+}
+
+// number of RGB octets that differ by more than `tol` between two RGBA buffers
+fn diff_count(a: u64, b: u64, npx: usize, tol: i32) -> usize {
+    var bad: usize = 0
+    var i: usize = 0
+    while i < npx {
+        var k: usize = 0
+        var off: bool = false
+        while k < 3 {
+            var d: i32 = (rt.ld8(a, i * 4 + k) as i32) - (rt.ld8(b, i * 4 + k) as i32)
+            if d < 0 { d = 0 - d }
+            if d > tol { off = true }
+            k = k + 1
+        }
+        if off { bad = bad + 1 }
+        i = i + 1
+    }
+    return bad
+}
+
+// the offscreen reference of the triangle at w x h
+fn ref_render(v: *mut vk.Vk, vb: *mut vk.Buf, w: i32, h: i32, out: u64) -> bool {
+    var t: vk.Target = vk.target_new_blank()
+    var p: vk.Pipe = vk.pipe_blank()
+    var ok: bool = vk.target_new(v, &t, w, h) && vk.pipeline_tri(v, &p, t.rpass)
+    if ok { ok = vk.draw(v, &t, &p, vb, 3 as u64, CLEAR) && vk.read_pixels(&t, out) }
+    vk.pipeline_free(v, &p)
+    vk.target_free(v, &t)
+    return ok
+}
+
+// the window now shows the same picture as the offscreen reference at the swapchain size
+fn window_matches(pr: *mut Probe, v: *mut vk.Vk, s: *mut vk.Sc, vb: *mut vk.Buf, name: str) {
+    let npx: usize = ((*s).w as usize) * ((*s).h as usize)
+    let a: u64 = rt.heap_alloc(npx * 4)
+    let b: u64 = rt.heap_alloc(npx * 4)
+    var ok: bool = vk.window_pixels(v, s, a) && ref_render(v, vb, (*s).w, (*s).h, b)
+    var bad: usize = 0
+    if ok { bad = diff_count(a, b, npx, 3) }
+    ok = ok && bad * 100 <= npx // <= 1 % of the pixels off by more than 3
+    io.fmt_print(f"     {(*s).w}x{(*s).h} differing pixels: {bad}\n")
+    check(pr, name, ok)
+    rt.heap_free(a, npx * 4)
+    rt.heap_free(b, npx * 4)
+}
+
+fn frames(v: *mut vk.Vk, l: *mut vk_life.Life, s: *mut vk.Sc, p: *mut vk.Pipe, vb: *mut vk.Buf, win: *mut window.Window, n: i32, w: i32, h: i32) -> i32 {
+    var last: i32 = vk_life.LF_OK
+    var i: i32 = 0
+    while i < n && last == vk_life.LF_OK {
+        pump(win, 2)
+        last = vk_life.frame(v, l, s, p, vb, 3 as u64, CLEAR, w, h)
+        i = i + 1
+    }
+    return last
+}
+
+fn run(pr: *mut Probe, v: *mut vk.Vk, win: *mut window.Window, xid: u64, mode: i32) {
+    (*pr).lost_calls = 0
+    var l: vk_life.Life = vk_life.life_new()
+    l.ud = (pr) as u64
+    l.on_rebuild = on_rebuild
+    l.on_lost = on_lost
+    check(pr, "life_open", vk_life.life_open(v, &l))
+    var vb: vk.Buf = vk.buf_blank()
+    check(pr, "vertex buffer", vk.buf_new(v, &vb, 60) && fill(&vb))
+    var s: vk.Sc = vk.sc_blank()
+    check(pr, "sc_open", vk.sc_open(v, &s, xid, W, H, mode))
+    var p: vk.Pipe = vk.pipe_blank()
+    check(pr, "pipeline", vk.pipeline_tri(v, &p, s.rpass))
+    let ww: i32 = W
+    let wh: i32 = H
+
+    // 1. plain frames
+    check(pr, "4 frames ok", frames(v, &l, &s, &p, &vb, win, 4, ww, wh) == vk_life.LF_OK)
+    check(pr, "first frame built the chain once (req size recorded)", l.rebuilds == 1 && l.req_w == W)
+    window_matches(pr, v, &s, &vb, "window == offscreen at 320x180")
+
+    // 2. real resize: window grows, frame() sees the new size, rebuilds, callback gets the new extent
+    check(pr, "window resized to 400x240", set_size(win, 400, 240))
+    let g0: u64 = l.sc_gen
+    let c0: i32 = (*pr).rb_calls
+    check(pr, "frame after resize -> LF_OK", frames(v, &l, &s, &p, &vb, win, 2, 400, 240) == vk_life.LF_OK)
+    io.fmt_print(f"     sc_gen {g0} -> {l.sc_gen}, swapchain {s.w}x{s.h}, rebuilds={l.rebuilds} out_of_date={l.out_of_date}\n")
+    check(pr, "swapchain follows (400x240), generation bumped", s.w == 400 && s.h == 240 && l.sc_gen > g0)
+    check(pr, "on_rebuild told the new extent", (*pr).rb_calls > c0 && (*pr).rb_w == 400 && (*pr).rb_h == 240)
+    window_matches(pr, v, &s, &vb, "window == offscreen at 400x240")
+
+    // 3. window shrinks but the caller still passes the OLD size: the driver itself must say OUT_OF_DATE (counts, no demand)
+    check(pr, "window back to 320x180", set_size(win, W, H))
+    let g1: u64 = l.sc_gen
+    check(pr, "frame with the stale size -> LF_OK", frames(v, &l, &s, &p, &vb, win, 2, 400, 240) == vk_life.LF_OK)
+    io.fmt_print(f"     driver OUT_OF_DATE seen: {l.out_of_date} (gen {g1} -> {l.sc_gen}, swapchain {s.w}x{s.h})\n")
+    check(pr, "frame with the right size -> LF_OK, chain 320x180", frames(v, &l, &s, &p, &vb, win, 2, W, H) == vk_life.LF_OK && s.w == W && s.h == H)
+    window_matches(pr, v, &s, &vb, "window == offscreen after shrinking")
+
+    // 4. injected OUT_OF_DATE at acquire: rebuild + retry inside ONE frame() call
+    let o0: u64 = l.out_of_date
+    let g2: u64 = l.sc_gen
+    vk.inject(v, vk.INJ_ACQUIRE, vk_life.RES_OUT_OF_DATE)
+    check(pr, "acquire OUT_OF_DATE -> LF_OK", vk_life.frame(v, &l, &s, &p, &vb, 3 as u64, CLEAR, W, H) == vk_life.LF_OK)
+    check(pr, "counted + rebuilt once", l.out_of_date == o0 + 1 && l.sc_gen == g2 + 1)
+    check(pr, "then frames keep working", frames(v, &l, &s, &p, &vb, win, 3, W, H) == vk_life.LF_OK)
+    window_matches(pr, v, &s, &vb, "window == offscreen after acquire OUT_OF_DATE")
+
+    // 5. injected OUT_OF_DATE at present
+    let g3: u64 = l.sc_gen
+    vk.inject(v, vk.INJ_PRESENT, vk_life.RES_OUT_OF_DATE)
+    check(pr, "present OUT_OF_DATE -> LF_OK", vk_life.frame(v, &l, &s, &p, &vb, 3 as u64, CLEAR, W, H) == vk_life.LF_OK)
+    check(pr, "rebuilt once", l.sc_gen == g3 + 1)
+    check(pr, "frames after it", frames(v, &l, &s, &p, &vb, win, 3, W, H) == vk_life.LF_OK)
+
+    // 6. SUBOPTIMAL at present: the frame counts as shown, the chain is rebuilt before the NEXT frame
+    let g4: u64 = l.sc_gen
+    let s0: u64 = l.suboptimal
+    vk.inject(v, vk.INJ_PRESENT, vk_life.RES_SUBOPTIMAL)
+    check(pr, "present SUBOPTIMAL: frame ok", vk_life.frame(v, &l, &s, &p, &vb, 3 as u64, CLEAR, W, H) == vk_life.LF_OK)
+    check(pr, "counted, not yet rebuilt", l.suboptimal == s0 + 1 && l.sc_gen == g4 && l.need_rebuild)
+    check(pr, "next frame rebuilds", vk_life.frame(v, &l, &s, &p, &vb, 3 as u64, CLEAR, W, H) == vk_life.LF_OK && l.sc_gen == g4 + 1 && !l.need_rebuild)
+    // a driver that says SUBOPTIMAL forever must not make us rebuild forever: 3 rebuilds, then it is ignored
+    let g5: u64 = l.sc_gen
+    var k: i32 = 0
+    while k < 8 {
+        vk.inject(v, vk.INJ_PRESENT, vk_life.RES_SUBOPTIMAL)
+        vk_life.frame(v, &l, &s, &p, &vb, 3 as u64, CLEAR, W, H)
+        k = k + 1
+    }
+    io.fmt_print(f"     8 permanent SUBOPTIMAL frames -> {l.sc_gen - g5} rebuilds\n")
+    check(pr, "permanent SUBOPTIMAL rebuilds at most 3 times", l.sc_gen - g5 <= 3 && l.sc_gen - g5 >= 1)
+    check(pr, "a normal frame resets the streak", vk_life.frame(v, &l, &s, &p, &vb, 3 as u64, CLEAR, W, H) == vk_life.LF_OK)
+    check(pr, "frames keep working", frames(v, &l, &s, &p, &vb, win, 2, W, H) == vk_life.LF_OK)
+
+    // 7. minimised: 0 x 0 does nothing on the GPU, restore rebuilds
+    let g6: u64 = l.sc_gen
+    check(pr, "0x0 -> LF_MINIMIZED", vk_life.frame(v, &l, &s, &p, &vb, 3 as u64, CLEAR, 0, 0) == vk_life.LF_MINIMIZED)
+    check(pr, "minimised twice, still nothing built", vk_life.frame(v, &l, &s, &p, &vb, 3 as u64, CLEAR, 0, 0) == vk_life.LF_MINIMIZED && l.sc_gen == g6)
+    check(pr, "restored -> LF_OK + rebuilt", vk_life.frame(v, &l, &s, &p, &vb, 3 as u64, CLEAR, W, H) == vk_life.LF_OK && l.sc_gen == g6 + 1)
+    window_matches(pr, v, &s, &vb, "window == offscreen after restore")
+
+    // 8. surface lost: surface + chain are made again for the same window
+    vk.inject(v, vk.INJ_PRESENT, vk_life.RES_SURFACE_LOST)
+    check(pr, "present SURFACE_LOST -> LF_SURFACE_LOST", vk_life.frame(v, &l, &s, &p, &vb, 3 as u64, CLEAR, W, H) == vk_life.LF_SURFACE_LOST)
+    check(pr, "not a device loss", !l.lost)
+    vk.pipeline_free(v, &p)
+    check(pr, "surface_recover", vk_life.surface_recover(v, &l, &s, xid, W, H, mode))
+    check(pr, "pipeline again", vk.pipeline_tri(v, &p, s.rpass))
+    check(pr, "frames after surface recovery", frames(v, &l, &s, &p, &vb, win, 3, W, H) == vk_life.LF_OK)
+    window_matches(pr, v, &s, &vb, "window == offscreen after surface recovery")
+
+    // 9. device lost at acquire, then at present: sticky, recover, same picture
+    var round: i32 = 0
+    while round < 2 {
+        if round == 0 {
+            vk.inject(v, vk.INJ_ACQUIRE, vk_life.RES_DEVICE_LOST)
+        } else {
+            vk.inject(v, vk.INJ_PRESENT, vk_life.RES_DEVICE_LOST)
+        }
+        let st: i32 = vk_life.frame(v, &l, &s, &p, &vb, 3 as u64, CLEAR, W, H)
+        check(pr, "DEVICE_LOST -> LF_DEVICE_LOST", st == vk_life.LF_DEVICE_LOST && l.lost)
+        check(pr, "stays lost without touching the GPU", vk_life.frame(v, &l, &s, &p, &vb, 3 as u64, CLEAR, W, H) == vk_life.LF_DEVICE_LOST)
+        vk.pipeline_free(v, &p)
+        vk.buf_free(v, &vb)
+        vk.sc_close(v, &s)
+        let ep: u64 = l.epoch
+        check(pr, "recover_device", vk_life.recover_device(v, &l, true, true, ""))
+        check(pr, "epoch bumped, not lost", l.epoch == ep + 1 && !l.lost)
+        s = vk.sc_blank()
+        vb = vk.buf_blank()
+        p = vk.pipe_blank()
+        check(pr, "objects again", vk.sc_open(v, &s, xid, W, H, mode) && vk.buf_new(v, &vb, 60) && fill(&vb) && vk.pipeline_tri(v, &p, s.rpass))
+        check(pr, "frames after device recovery", frames(v, &l, &s, &p, &vb, win, 3, W, H) == vk_life.LF_OK)
+        window_matches(pr, v, &s, &vb, "window == offscreen after device recovery")
+        round = round + 1
+    }
+    check(pr, "on_lost fired once per loss", (*pr).lost_calls == 2 && l.lost_count == 2)
+
+    vk.pipeline_free(v, &p)
+    vk.buf_free(v, &vb)
+    vk.sc_close(v, &s)
+    vk_life.life_close(v, &l)
+}
+
+fn main(start: u64) -> i32 {
+    var v: vk.Vk = vk.vk_new()
+    if !env.has("DISPLAY") {
+        io.print("SKIP: no DISPLAY\n")
+        return 4
+    }
+    if !vk.open(&v, true, true) {
+        io.fmt_print(f"open failed step={v.step}\n")
+        return 4
+    }
+    if !vk.has_swapchain(&v) || !vk.has_surface_ext(&v) {
+        io.print("SKIP: no swapchain / surface extension\n")
+        return 4
+    }
+    var pr: Probe = Probe { fails: 0, rb_calls: 0, rb_w: 0, rb_h: 0, lost_calls: 0 }
+    var win: window.Window = window.window_new()
+    if !(window.open_window(&win, 0) && window.make(&win, W as usize, H as usize)) {
+        io.print("SKIP: no X11 window\n")
+        return 4
+    }
+    window.title(&win, "vk life".p as u64, "vk life".n)
+    window.show_window(&win)
+    pump(&win, 100)
+    let xid: u64 = backend.r_native(&win.p)
+    var mode: i32 = 0
+    while mode < 2 {
+        if mode == 0 { io.print("== surface: xlib\n") } else { io.print("== surface: xcb\n") }
+        // the display connection may have been re-created by a previous round's recover_device (vk.close -> plat_close)
+        run(&pr, &v, &win, xid, mode)
+        if !(v.ok) {
+            io.print("FAIL: Vulkan not open after the round\n")
+            pr.fails = pr.fails + 1
+            mode = 2
+        } else {
+            set_size(&win, W, H)
+            mode = mode + 1
+        }
+    }
+    window.close_window(&win)
+    vk.close(&v)
+    io.fmt_print(f"RESULT fails={pr.fails}\n")
+    if pr.fails == 0 { return 0 }
+    return 3
+}
