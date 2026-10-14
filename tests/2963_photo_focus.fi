@@ -1,0 +1,175 @@
+// expect_out: ok
+// tests/2963_photo_focus.fi -- FirnCam focus stack: 5 frames of the synthetic scene, depth = x / w (a ramp),
+// frame i focused at depth i/4: every pixel is blurred by sigma = 4 * |depth - focus| (blend of pre-blurred
+// copies), each frame has focus breathing (scale 1 + 0.004 * (i - 2) about the centre) and a 0.4 px hand shake.
+// Checks: the stack beats the BEST single frame by > 2 dB PSNR against the sharp scene and stays within 3 dB of the oracle (true-depth frame choice), keeps > 0.15 of the
+// scene's sharpness (the texture is near Nyquist: even the nearest frame is already blurred by up to 0.5 px), the depth map follows the ramp (mean error < 0.15 in depth units), plan_focus returns
+// ascending diopter steps inside the metadata range. Deterministic.
+import std.io
+import std.rt
+import photo.image
+import photo.meta
+import photo.filter
+import photo.merge
+import photo.focus
+
+fn pf(s: str, v: f32) {
+    io.print(s)
+    io.fmt_print_line(io.fmt_f32(io.fmt_new(), v))
+}
+
+fn blur3(im: *mut image.Image, sigma: f32) -> image.Image {
+    var d: image.Image = image.img_new((*im).w, (*im).h, 3)
+    var c: i32 = 0
+    while c < 3 {
+        var pl: image.Image = filter.plane_of(im, c)
+        var bl: image.Image = filter.gauss_blur(&pl, sigma)
+        var y: i32 = 0
+        while y < d.h {
+            var x: i32 = 0
+            while x < d.w {
+                image.img_set(&d, c, x, y, image.img_get(&bl, 0, x, y))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        image.img_free(&pl)
+        image.img_free(&bl)
+        c = c + 1
+    }
+    return d
+}
+
+fn main() -> i32 {
+    let w: i32 = 128
+    let h: i32 = 96
+    var ok: bool = true
+    var scene: image.Image = image.scene_make(w, h)
+    image.img_clamp01(&scene)
+    // add fine texture (a smooth scene has nothing to focus on)
+    var tex: image.Image = image.img_new(w, h, 3)
+    var rng: image.Rng = image.rng_new(9 as u64)
+    var t: i32 = 0
+    while t < w * h * 3 {
+        *((tex.px + (t as u64) * (4 as u64)) as *mut f32) = 0.12f * image.rng_gauss(&rng)
+        t = t + 1
+    }
+    var tb: image.Image = blur3(&tex, 0.7f)
+    t = 0
+    while t < w * h * 3 {
+        let p: *mut f32 = (scene.px + (t as u64) * (4 as u64)) as *mut f32
+        *p = image.fclampf(*p + *((tb.px + (t as u64) * (4 as u64)) as *mut f32) * 1.8f, 0.0f, 1.0f)
+        t = t + 1
+    }
+    image.img_free(&tex)
+    image.img_free(&tb)
+    // blur ladder: sigma 0 (scene), 1, 2, 3, 4
+    var lad: [image.Image; 5] = [image.Image { w: 0, h: 0, ch: 0, px: 0 as u64 }; 5]
+    lad[0] = image.img_copy(&scene)
+    var s: i32 = 1
+    while s < 5 {
+        lad[s as usize] = blur3(&scene, s as f32)
+        s = s + 1
+    }
+    var b: merge.Burst = merge.burst_new()
+    var best: f32 = 0.0f
+    var i: i32 = 0
+    while i < 5 {
+        var f: image.Image = image.img_new(w, h, 3)
+        let sc: f32 = 1.0f + 0.004f * ((i - 2) as f32)
+        let shx: f32 = 0.4f * ((i - 2) as f32) * 0.5f
+        var y: i32 = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                let d: f32 = (x as f32) / (w as f32)
+                var sg: f32 = 4.0f * (d - (i as f32) * 0.25f)
+                if sg < 0.0f { sg = 0.0f - sg }
+                var lo: i32 = sg as i32
+                if lo > 3 { lo = 3 }
+                let fr: f32 = sg - (lo as f32)
+                let sx: f32 = ((x as f32) - (w as f32) * 0.5f) / sc + (w as f32) * 0.5f + shx
+                let sy: f32 = ((y as f32) - (h as f32) * 0.5f) / sc + (h as f32) * 0.5f
+                var c: i32 = 0
+                while c < 3 {
+                    let v: f32 = image.img_sample(&lad[lo as usize], c, sx, sy) * (1.0f - fr) + image.img_sample(&lad[(lo + 1) as usize], c, sx, sy) * fr
+                    image.img_set(&f, c, x, y, v)
+                    c = c + 1
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        let p: f32 = image.psnr(&f, &scene, 1.0f)
+        if p > best { best = p }
+        merge.burst_add(&b, f, 1.0f)
+        i = i + 1
+    }
+    var o: focus.FocusOpts = focus.focus_default()
+    var out: image.Image = image.img_new(1, 1, 3)
+    var dep: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&out)
+    image.img_free(&dep)
+    focus.focus_stack(&b, &o, &out, &dep)
+    let ps: f32 = image.psnr(&out, &scene, 1.0f)
+    pf("best single dB: ", best)
+    pf("stack dB: ", ps)
+    // oracle: per pixel the frame whose focus plane is nearest to the true depth (an upper bound with perfect selection)
+    var orc: image.Image = image.img_new(w, h, 3)
+    var oy: i32 = 0
+    while oy < h {
+        var ox: i32 = 0
+        while ox < w {
+            let fi: i32 = (((ox as f32) / (w as f32)) * 4.0f + 0.5f) as i32
+            var oc: i32 = 0
+            while oc < 3 {
+                image.img_set(&orc, oc, ox, oy, image.img_get(&b.frames[fi as usize], oc, ox, oy))
+                oc = oc + 1
+            }
+            ox = ox + 1
+        }
+        oy = oy + 1
+    }
+    let po: f32 = image.psnr(&orc, &scene, 1.0f)
+    pf("oracle dB: ", po)
+    ok = ps > best + 2.0f && ps > po - 3.0f && ok
+    let sh: f32 = image.sharpness(&out, 1) / image.sharpness(&scene, 1)
+    pf("sharpness vs scene: ", sh)
+    ok = sh > 0.15f && ok
+    var err: f32 = 0.0f
+    var y: i32 = 8
+    while y < h - 8 {
+        var x: i32 = 8
+        while x < w - 8 {
+            var e: f32 = image.img_get(&dep, 0, x, y) * 0.25f - (x as f32) / (w as f32)
+            if e < 0.0f { e = 0.0f - e }
+            err = err + e
+            x = x + 1
+        }
+        y = y + 1
+    }
+    err = err / (((w - 16) * (h - 16)) as f32)
+    pf("depth error: ", err)
+    ok = err < 0.15f && ok
+    // planning
+    var m: meta.SensorMeta = meta.meta_default()
+    meta.meta_set_focus(&m, 10.0f, 0.2f, 1 as u32)
+    m.focal_length = 5.0f
+    m.aperture = 1.8f
+    m.sensor_width = 6.4f
+    var steps: [f32; 16] = [0.0f; 16]
+    let n: i32 = focus.plan_focus(&m, 0.0f, 3.0f, 8, &steps[0])
+    pf("plan steps: ", n as f32)
+    ok = n >= 2 && n <= 8 && steps[0] >= 0.19f && steps[(n - 1) as usize] <= 10.01f && ok
+    var q: i32 = 1
+    while q < n {
+        ok = steps[q as usize] > steps[(q - 1) as usize] && ok
+        q = q + 1
+    }
+    if ok {
+        io.print("ok")
+        io.new_line()
+        return 0
+    }
+    return 1
+}
