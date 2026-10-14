@@ -14,6 +14,7 @@ recipe = json.load(open(recipe_p))
 manifest = json.load(open(outdir + "/manifest.json"))
 rate = recipe.get("rate", 44100)
 sounds = {s["id"]: s for s in recipe["sounds"]}
+QUIET = ("intentionally_empty",)  # silent on purpose (vanilla placeholder event): exempt from the RMS / exact peak checks
 fails = []
 
 
@@ -54,12 +55,13 @@ for f in manifest["files"]:
     pkdb = 20 * np.log10(pk / 32767.0)
     if pkdb > -1.0:
         fail("%s: peak %.2f dBFS > -1" % (name, pkdb))
-    if abs(pkdb - s.get("peak_db", -3.0)) > 0.05:
+    quiet = f["event"] in QUIET
+    if not quiet and abs(pkdb - s.get("peak_db", -3.0)) > 0.05:
         fail("%s: peak %.2f dBFS != recipe %.2f" % (name, pkdb, s.get("peak_db", -3.0)))
     if (np.abs(x) >= 32767).sum() > 0:
         fail(name + ": clipped samples")
     rmsdb = 20 * np.log10(np.sqrt((x / 32768.0) ** 2).mean() + 1e-12) if False else 20 * np.log10(np.sqrt(((x / 32768.0) ** 2).mean()) + 1e-12)
-    if not (-45.0 <= rmsdb <= -9.0):
+    if not quiet and not (-45.0 <= rmsdb <= -9.0):
         fail("%s: RMS %.1f dBFS outside -45..-9" % (name, rmsdb))
     if abs(x.mean()) / 32768.0 > 0.002:
         fail("%s: DC offset %.4f" % (name, x.mean() / 32768.0))
