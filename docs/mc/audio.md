@@ -36,7 +36,7 @@ mc_audio.mca_decode_sound_effect / _entity_sound / _stop_sound + mca_apply_sound
 - M5 `spatial` is an engine flag of the EVENT: an event played at a point is spatial for all later plays.
 - M6 `mca_on_packet` is the client hook; the demos (mcclient/mcview) do not call it yet (no audio device in them).
 - M7 node-minecraft-protocol mis-parses INLINE sound holders (its raw buffer is cut short), so the recorded fixtures only hold registered sounds (mob sounds), stop sounds and world events; inline decoding is covered by the synthetic packets of tests/2766.
-- M8 Not done: `lib/mc/mc_assets.fi` (optional local asset import, `sounds=synth|original|both`), bank cross-check against mc-p4 (missing events list), audio.hub + bank test. Sound packets for the sound source itself (entity position) need the entity in the store.
+- M8 Not done: `lib/mc/mc_assets.fi` (optional local asset import, `sounds=synth|original|both`), bank cross-check against the id table: DONE (z1, tools/mc/audio/coverage.py, docs/audio/SYNTH.md: tier 1 has 0 gaps), audio.hub + bank test. Sound packets for the sound source itself (entity position) need the entity in the store.
 
 ## Sound ids, packets, world events (mc-p5)
 ```
