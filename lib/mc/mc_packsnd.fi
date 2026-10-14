@@ -15,7 +15,10 @@
 //   * Per event at most 16 samples (engine limit); the top pack wins the cut. Files / events are limited by PS_MAX_* AND by the free room
 //     in the engine (2048 samples / events minus what the synth bank already uses). More are skipped and counted, never truncated silently.
 //     An event without a single decodable file is not created.
-//   * volume / pitch of the FIRST entry (of the top-most pack that has the event) is used; weight and stream are ignored.
+//   * volume / pitch of the FIRST entry (of the top-most pack that has the event) is used; "stream" is ignored.
+//   * "weight" (default 1, 1..1000): the engine picks uniformly from the max 16 sample slots of an event, so a file gets as many slots
+//     (same sample id repeated) as its weight -- exact while the weights sum to <= 16, above that scaled proportionally (>= 1 slot
+//     each; see acc_slots). All weights 1 = one slot per file = the old behaviour.
 //   * Bus: "ui.*" -> ui, "music.*" / "music_disc.*" -> music, else sfx. An event of the pack REPLACES the synth event of the same name.
 //   * sounds=synth: nothing is read. sounds=original: only the pack events exist (the caller loads no synth bank).
 //     sounds=both: the caller loads the synth bank first; pack events replace event by event, synth fills the rest.
@@ -36,7 +39,7 @@ import mc.mc_audio
 import mc.mc_packs
 
 export {
-    packsnd_apply, packsnd_build_text, PackSnd, PS_MAX_EVENTS, PS_MAX_FILES, PS_PER_EVENT,
+    packsnd_apply, packsnd_build_text, PackSnd, PS_MAX_EVENTS, PS_MAX_FILES, PS_PER_EVENT, Acc, acc_new, acc_slots, acc_list,
 }
 
 const PS_MAX_EVENTS: usize = 1600
@@ -165,12 +168,72 @@ struct Ctx {
 
 // One event while its lists are merged.
 struct Acc {
-    list: rt.Buf, // JSON string list of the zip paths
-    paths: rt.Buf, // same paths, one per line (duplicate check)
+    paths: rt.Buf, // zip paths of the distinct usable files, one per line (duplicate check + output order)
     n: usize,
     vol: f64,
     pit: f64,
     have_opts: bool,
+    w: [i32; 16], // vanilla "weight" per file (default 1, clamped to 1..1000)
+    cnt: [i32; 16], // slots per file in the event (see acc_slots)
+}
+
+fn acc_new() -> Acc {
+    return Acc { paths: rt.buf_new(), n: 0, vol: 1.0, pit: 1.0, have_opts: false, w: [1; 16], cnt: [1; 16] }
+}
+
+// Weighted pick without engine support: the engine picks uniformly from the (max 16) sample slots of an event, so a file with weight w
+// gets w of the slots (the same sample id several times). Exact while the weights sum to <= 16; above that they are scaled
+// proportionally (rounded, every file keeps at least 1 slot, the biggest give slots back until 16 fit). All weights 1 = 1 slot each.
+fn acc_slots(a: *mut Acc) {
+    var total: i32 = 0
+    var k: usize = 0
+    while k < (*a).n { total = total + (*a).w[k]; k = k + 1 }
+    var sum: i32 = 0
+    k = 0
+    while k < (*a).n {
+        var c: i32 = (*a).w[k]
+        if total > 16 {
+            c = ((*a).w[k] * 16 + total / 2) / total
+            if c < 1 { c = 1 }
+        }
+        (*a).cnt[k] = c
+        sum = sum + c
+        k = k + 1
+    }
+    while sum > 16 {
+        var bi: usize = 0
+        var bc: i32 = 0
+        k = 0
+        while k < (*a).n {
+            if (*a).cnt[k] > bc { bc = (*a).cnt[k]; bi = k }
+            k = k + 1
+        }
+        if bc <= 1 { break }
+        (*a).cnt[bi] = (*a).cnt[bi] - 1
+        sum = sum - 1
+    }
+}
+
+// JSON string list of the event's samples: every file `cnt` times (after acc_slots).
+fn acc_list(a: *mut Acc, out: *mut rt.Buf) {
+    let all: u64 = rt.buf_ptr(&(*a).paths)
+    let tot: usize = rt.buf_len(&(*a).paths)
+    var i: usize = 0
+    var k: usize = 0
+    var first: bool = true
+    while i < tot && k < (*a).n {
+        var e: usize = i
+        while e < tot && rt.ld8(all, e) != 10 as u8 { e = e + 1 }
+        var r: i32 = 0
+        while r < (*a).cnt[k] {
+            if !first { rt.buf_push(out, 44 as u8) }
+            first = false
+            push_json_str(out, all + i as u64, e - i)
+            r = r + 1
+        }
+        k = k + 1
+        i = e + 1
+    }
 }
 
 fn file_hash(p: u64, n: usize) -> u64 {
@@ -239,6 +302,7 @@ fn add_entries(c: *mut Ctx, d: *mut json.Json, arr: u32, a: *mut Acc) {
         var has_name: bool = false
         var iv: f64 = 1.0
         var ip: f64 = 1.0
+        var iw: i32 = 1
         if json.json_kind(d, it) == json.JSON_STRING {
             nm = json.json_string(d, it)
             has_name = true
@@ -257,6 +321,12 @@ fn add_entries(c: *mut Ctx, d: *mut json.Json, arr: u32, a: *mut Acc) {
             if vv != json.JSON_NONE && json.json_kind(d, vv) == json.JSON_NUMBER { iv = json.json_number(d, vv) }
             let pp: u32 = json.json_get(d, it, "pitch".p as u64, 5)
             if pp != json.JSON_NONE && json.json_kind(d, pp) == json.JSON_NUMBER { ip = json.json_number(d, pp) }
+            let ww: u32 = json.json_get(d, it, "weight".p as u64, 6)
+            if ww != json.JSON_NONE && json.json_kind(d, ww) == json.JSON_NUMBER {
+                let wn: f64 = json.json_number(d, ww)
+                if wn >= 1.0 { iw = wn as i32 }
+                if wn > 1000.0 { iw = 1000 }
+            }
         }
         if !has_name { (*c).st.skipped_files = (*c).st.skipped_files + 1; continue }
         var path: rt.Buf = rt.buf_new()
@@ -270,10 +340,9 @@ fn add_entries(c: *mut Ctx, d: *mut json.Json, arr: u32, a: *mut Acc) {
             continue
         }
         if resolve_file(c, &path) {
-            if (*a).n > 0 { rt.buf_push(&(*a).list, 44 as u8) }
-            push_json_str(&(*a).list, rt.buf_ptr(&path), rt.buf_len(&path))
             rt.buf_push_bytes(&(*a).paths, rt.buf_ptr(&path), rt.buf_len(&path))
             rt.buf_push(&(*a).paths, 10 as u8)
+            (*a).w[(*a).n] = iw
             (*a).n = (*a).n + 1
             if !(*a).have_opts { (*a).vol = iv; (*a).pit = ip; (*a).have_opts = true }
         }
@@ -331,7 +400,7 @@ fn packsnd_build_text(s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mu
                 rt.buf_free(&nm)
             }
             if is_new && new_events >= room_events { c.st.skipped_events = c.st.skipped_events + 1; continue } // engine event table full
-            var a: Acc = Acc { list: rt.buf_new(), paths: rt.buf_new(), n: 0, vol: 1.0, pit: 1.0, have_opts: false }
+            var a: Acc = acc_new()
             var pj: usize = pi
             var any_list: bool = false
             while pj < np {
@@ -352,7 +421,6 @@ fn packsnd_build_text(s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mu
             }
             if !any_list || a.n == 0 {
                 c.st.skipped_events = c.st.skipped_events + 1
-                rt.buf_free(&a.list)
                 rt.buf_free(&a.paths)
                 continue
             }
@@ -369,7 +437,8 @@ fn packsnd_build_text(s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mu
                 push_s(text, "\"sfx\"")
             }
             push_s(text, ",\"samples\":[")
-            rt.buf_push_bytes(text, rt.buf_ptr(&a.list), rt.buf_len(&a.list))
+            acc_slots(&a)
+            acc_list(&a, text)
             push_s(text, "]")
             if a.vol > 0.0 && a.vol != 1.0 {
                 push_s(text, ",\"volume\":")
@@ -382,7 +451,6 @@ fn packsnd_build_text(s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mu
             push_s(text, "}")
             if is_new { new_events = new_events + 1 }
             c.st.events = c.st.events + 1
-            rt.buf_free(&a.list)
             rt.buf_free(&a.paths)
         }
         pi = pi + 1

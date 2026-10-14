@@ -2,7 +2,7 @@
 # tools/mc/play/run_packsnd.sh -- mcplay with pack sounds (MC_PACK_SOUNDS=both|original) end to end: Xvfb + official 1.20.1 server + mcplay + xdotool.
 # Runs: (1) both, FILE sink: start + hot reload (key T) with a CHANGED OGG -> sample table must not grow; (2) both, DEVICE sink (private
 # PulseAudio null sink): same, the audio thread is stopped / restarted around the reload; (3) original, FILE sink: only pack events.
-# Prints `RESULT mc-packsnd: ok`. Env: FIRNC, MC_VIEW (3), MCCLIENT_JAR_CACHE, MCPLAY_SKIP_PULSE=1.
+# (4) O key: packs off/on at runtime. Prints `RESULT mc-packsnd: ok`. Env: FIRNC, MC_VIEW (3), MCCLIENT_JAR_CACHE, MCPLAY_SKIP_PULSE=1.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
@@ -79,6 +79,10 @@ run() {
         sleep 9
         cp "$W/q.zip" "$W/cur.zip"
         xdotool mousemove 320 180 2>/dev/null; xdotool key t; sleep 0.5
+    elif [ "$reload" = 2 ]; then
+        # O key twice: packs off (synth bank back), packs on again
+        sleep 9
+        xdotool mousemove 320 180 2>/dev/null; xdotool key o; sleep 1.5; xdotool key o; sleep 0.5
     fi
     wait $pp; return $?
 }
@@ -128,5 +132,18 @@ run PsOrig original "file:$W/orig.wav" 1; rc=$?
 [ $rc -eq 0 ] || { echo "  FAIL  PsOrig exit code $rc"; ERR=1; }
 check_reload PsOrig 1
 if grep -q "no sound bank" "$W/PsOrig.out"; then echo "  FAIL  original: no bank"; ERR=1; fi
+
+# (4) both + FILE sink + O key twice: synth <-> packs, the sample table must not grow, the probe stays complete
+run PsToggle both "file:$W/toggle.wav" 2; rc=$?
+[ $rc -eq 0 ] || { echo "  FAIL  PsToggle exit code $rc"; ERR=1; }
+a=$(grep -n "mcplay: sounds=synth" "$W/PsToggle.out" | head -1 | cut -d: -f1); b=$(grep -n "mcplay: sounds=both" "$W/PsToggle.out" | head -1 | cut -d: -f1)
+if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then echo "  FAIL  PsToggle: expected 'sounds=synth' then 'sounds=both' (got ${a:-none}/${b:-none})"; ERR=1
+else
+    t1=$(field PsToggle 1 samples); t2=$(field PsToggle 2 samples); te=$(field PsToggle 2 events)
+    echo "  PsToggle: samples $t1 -> $t2, events on switch-on ${te:-?}"
+    [ "${te:-0}" -ge 4 ] || { echo "  FAIL  PsToggle: pack sounds did not come back (events ${te:-0})"; ERR=1; }
+    [ "$t1" = "$t2" ] || { echo "  FAIL  PsToggle: sample table grew ($t1 -> $t2)"; ERR=1; }
+fi
+python3 tools/mc/play/audio_check.py "$W/toggle.wav" "$W/PsToggle.out" --probe --min-events 12 || ERR=1
 
 if [ $ERR -eq 0 ]; then echo "RESULT mc-packsnd: ok"; else tail -15 "$W/PsFile.out" | sed 's/^/  /'; echo "RESULT mc-packsnd: FAIL"; exit 1; fi
