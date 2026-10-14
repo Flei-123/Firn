@@ -39,15 +39,17 @@ import gpu.vk_life
 export {
     VkBackend, vkbe_open, vkbe_open_cache, vkbe_on_rebuild, vkbe_close, vkbe_backend, vkbe_set_fog, vkbe_set_light, vkbe_resize, vkbe_device_name, vkbe_is_cpu,
     vkbe_draws, vkbe_tris, vkbe_frames, vkbe_layers_lost, vkbe_in_flight, vkbe_set_readback, vkbe_wait, vkbe_mem_stats,
-    vkbe_live_meshes, vkbe_upload_bytes, vkbe_frame_ms, vkbe_sky, vkbe_tint,
+    vkbe_live_meshes, vkbe_upload_bytes, vkbe_frame_ms, vkbe_sky, vkbe_tint, vkbe_hud,
 }
 
 const NFR: usize = 2 // frames in flight
 const UBO_STRIDE: usize = 512 // one `Frame` slice (320 octets used); >= minUniformBufferOffsetAlignment (256 at most)
 const UBO_SLICES: usize = 256 // slices per frame slot: one per (pass / fade / light) state change
 const UBO_BYTES: u64 = 131072 // UBO_STRIDE * UBO_SLICES
+const DYN_BYTES: u64 = 4194304 // per frame slot: HUD rectangles + entity instances
 const TB_BYTES: u64 = 256 // dummy texel buffers (pool mode off): zero filled
 const PAGEL_SINGLE: u64 = 1073741824 // u_pagel >= 1048576: the whole atlas is ONE array (page 0)
+const HUD_REC_BYTES: usize = 24 // one mc_hud.hud_record rectangle: x0 y0 x1 y1 colour mode (u32 each)
 const MW: usize = 8 // words per mesh slot
 const M_USED: usize = 0
 const M_BUF: usize = 1
@@ -71,6 +73,7 @@ struct FSlot {
     fb: u64,
     ubo: vk_mem.Buf,
     rb: vk_mem.Buf, // read back buffer (w * h * 4)
+    dyn: vk_mem.Buf, // per frame vertex data (HUD runs, entity instances), bump allocated, reset at begin
 }
 
 struct VkBackend {
@@ -99,6 +102,11 @@ struct VkBackend {
     pipe_tr: vk_desc.VPipe,
     pipe_sky: vk_desc.VPipe,
     pipe_tint: vk_desc.VPipe,
+    pipe_hud: vk_desc.VPipe,
+    pipe_hud_inv: vk_desc.VPipe,
+    dyn_top: u64,
+    dyn_over: u64, // allocations that did not fit into DYN_BYTES in one frame
+    inv_on: bool, // U_INVERT of the next bake (HUD invert runs)
     bound: u64, // pipeline currently bound in the recording command buffer (0 = none)
     fs: [FSlot; 2],
     atlas: vk_mem.Img,
@@ -145,14 +153,14 @@ struct VkBackend {
 }
 
 fn fslot_none() -> FSlot {
-    return FSlot { col: vk_mem.img_none(), dep: vk_mem.img_none(), fb: 0, ubo: vk_mem.buf_none(), rb: vk_mem.buf_none() }
+    return FSlot { col: vk_mem.img_none(), dep: vk_mem.img_none(), fb: 0, ubo: vk_mem.buf_none(), rb: vk_mem.buf_none(), dyn: vk_mem.buf_none() }
 }
 
 fn blank() -> VkBackend {
     return VkBackend { ok: false, step: 0, v: vk.vk_new(), x: vk_mem.x_new(),
         fr: vk_frame.Frames { ok: false, pool: 0, n: 0, w: 0, icmd: 0, ifence: 0, serial: 0, done: 0, tpending: false },
         d: vk_desc.desc_none(), life: vk_life.life_new(), cache_path: "", base: 0, nslice: 0, slice_off: 0, ubo_over: 0, dirty: true,
-        gran: vk_mem.buf_none(), org: vk_mem.buf_none(), gran_view: 0, org_view: 0, w: 0, h: 0, rp: 0, playout: 0, pipe_op: vk_desc.vpipe_none(), pipe_tr: vk_desc.vpipe_none(), pipe_sky: vk_desc.vpipe_none(), pipe_tint: vk_desc.vpipe_none(), bound: 0,
+        gran: vk_mem.buf_none(), org: vk_mem.buf_none(), gran_view: 0, org_view: 0, w: 0, h: 0, rp: 0, playout: 0, pipe_op: vk_desc.vpipe_none(), pipe_tr: vk_desc.vpipe_none(), pipe_sky: vk_desc.vpipe_none(), pipe_tint: vk_desc.vpipe_none(), pipe_hud: vk_desc.vpipe_none(), pipe_hud_inv: vk_desc.vpipe_none(), dyn_top: 0, dyn_over: 0, inv_on: false, bound: 0,
         fs: [fslot_none(); 2], atlas: vk_mem.img_none(), tile: 0, layers_lost: 0, meshes: 0, mcap: 0, live: 0, dfr: 0, dcap: 0,
         dn: 0, cur: 0, next: 0, in_frame: false, has_last: false, last: 0, trec: false, readback: true, trans: false,
         cx: 0.0, cy: 0.0, cz: 0.0, fade_a: 64.0, fade_inv: 0.0, day: 256.0, tr: 256.0, tg: 256.0, tb: 256.0, fog_on: false,
@@ -172,6 +180,7 @@ fn targets_free(b: *mut VkBackend) {
         vk_mem.img_free(&(*b).x, &(*b).fs[i].dep)
         vk_mem.buf_free(&(*b).x, &(*b).fs[i].ubo)
         vk_mem.buf_free(&(*b).x, &(*b).fs[i].rb)
+        vk_mem.buf_free(&(*b).x, &(*b).fs[i].dyn)
         i = i + 1
     }
 }
@@ -195,6 +204,10 @@ fn targets_make(b: *mut VkBackend) -> bool {
                 return false
             }
             vk_desc.desc_write_ubo(&(*b).x, &(*b).d, i, (*b).fs[i].ubo.buf, vk_shaders.FRAME_SIZE as u64)
+        }
+        (*b).fs[i].dyn = vk_mem.buf_make(&(*b).x, DYN_BYTES, vk_mem.U_VERTEX, vk_mem.MEM_STAGING)
+        if !(*b).fs[i].dyn.ok {
+            return false
         }
         (*b).fs[i].rb = vk_mem.buf_make(&(*b).x, ((*b).w as u64) * ((*b).h as u64) * 4, vk_mem.U_DST, vk_mem.MEM_STAGING)
         if !(*b).fs[i].rb.ok {
@@ -282,7 +295,19 @@ fn vkbe_open_cache(w: i32, h: i32, cache_path: str) -> VkBackend {
     tsp.depth_op = vk_desc.CMP_GREATER
     tsp.blend = vk_desc.BLEND_MUL
     b.pipe_tint = vk_desc.pipeline_make(&b.x, b.v.cache, b.rp, b.playout, &tsp)
-    if !b.pipe_op.ok || !b.pipe_tr.ok || !b.pipe_sky.ok || !b.pipe_tint.ok {
+    // HUD: one instance per rectangle straight from the mc_hud.hud_record records (24 octets: x0 y0 x1 y1 colour mode), strip of 4; colour
+    // only (alpha untouched), alpha blend or invert (mode 1, U_INVERT)
+    var hsp: vk_desc.PipeSpec = vk_desc.spec_new(vk_shaders.HUD_VS.p as u64, vk_shaders.HUD_VS.n, vk_shaders.HUD_FS.p as u64, vk_shaders.HUD_FS.n)
+    vk_desc.spec_bind(&hsp, HUD_REC_BYTES as u32, true)
+    vk_desc.spec_attr(&hsp, 0 as u32, 0 as u32, vk_desc.FMT_R32G32B32A32_SINT, 0 as u32)
+    vk_desc.spec_attr(&hsp, 1 as u32, 0 as u32, vk_desc.FMT_R32_UINT, 16 as u32)
+    hsp.topo = vk_desc.TOPO_STRIP
+    hsp.wmask = 7 as u32
+    hsp.blend = vk_desc.BLEND_ALPHA
+    b.pipe_hud = vk_desc.pipeline_make(&b.x, b.v.cache, b.rp, b.playout, &hsp)
+    hsp.blend = vk_desc.BLEND_INVERT
+    b.pipe_hud_inv = vk_desc.pipeline_make(&b.x, b.v.cache, b.rp, b.playout, &hsp)
+    if !b.pipe_op.ok || !b.pipe_tr.ok || !b.pipe_sky.ok || !b.pipe_tint.ok || !b.pipe_hud.ok || !b.pipe_hud_inv.ok {
         b.step = 6
         return b
     }
@@ -617,6 +642,8 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     vk_mem.w32(u, vk_shaders.U_FILTER, 0)
     vk_mem.wf(u, vk_shaders.U_H, (*b).h as f64)
     (*b).nslice = 0
+    (*b).dyn_top = 0
+    (*b).inv_on = false
     (*b).dirty = true
     let cmd: u64 = vk_frame.frame_cmd(&(*b).fr, s)
     vk_frame.cmd_begin(&(*b).x, cmd)
@@ -675,6 +702,9 @@ fn bake(b: *mut VkBackend, cmd: u64) {
     var tf: u64 = 0
     if (*b).trans { tf = 1 }
     vk_mem.w32(dst, vk_shaders.U_TRANS, tf)
+    var iv: u64 = 0
+    if (*b).inv_on { iv = 1 }
+    vk_mem.w32(dst, vk_shaders.U_INVERT, iv)
     (*b).x.top = 0
     let ds: u64 = vk_mem.xsa(&(*b).x, 8)
     vk_mem.w64(ds, 0, vk_mem.r64((*b).d.sets, (*b).cur * 8))
@@ -751,6 +781,56 @@ fn vkbe_tint(b: *mut VkBackend, sky: *mut mc_sky.Sky) {
     bake(b, cmd)
     bind_pipe(b, cmd, (*b).pipe_tint.pipe)
     vk_mem.cx(&(*b).x, vk_mem.X_CMD_DRAW, cmd, vk_shaders.SKY_VERTS as u64, 1, 0, 0, 0, 0, 0, 0, 0)
+}
+
+// Bump allocation in the per frame vertex buffer (16 aligned). 0xFFFFFFFFFFFFFFFF = does not fit (counted in dyn_over).
+fn dyn_alloc(b: *mut VkBackend, n: u64) -> u64 {
+    let off: u64 = ((*b).dyn_top + 15 as u64) / 16 as u64 * 16 as u64
+    if off + n > DYN_BYTES {
+        (*b).dyn_over = (*b).dyn_over + 1 as u64
+        return 0xFFFFFFFFFFFFFFFF as u64
+    }
+    (*b).dyn_top = off + n
+    return off
+}
+
+fn bind_dyn_vb(b: *mut VkBackend, cmd: u64, off: u64) {
+    vk_mem.w64((*b).vb, 0, (*b).fs[(*b).cur].dyn.buf)
+    vk_mem.w64((*b).vb, 8, off)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_VB, cmd, 0, 1, (*b).vb, (*b).vb + 8, 0, 0, 0, 0, 0)
+}
+
+// Draws the rectangles recorded by mc_hud.hud_record (6 u32 each: x0 y0 x1 y1 colour mode) over the frame, in the recorded order, one
+// instanced draw per run of equal mode. Call last (after the tint), before b.end.
+fn vkbe_hud(b: *mut VkBackend, rec: *mut rt.Buf) {
+    if !(*b).ok || !(*b).in_frame { return }
+    let n: usize = rt.buf_len(rec) / HUD_REC_BYTES
+    if n == 0 { return }
+    let off: u64 = dyn_alloc(b, (n * HUD_REC_BYTES) as u64)
+    if off == 0xFFFFFFFFFFFFFFFF as u64 { return }
+    let data: u64 = rt.buf_ptr(rec)
+    rt.mem_copy((*b).fs[(*b).cur].dyn.ptr + off, data, n * HUD_REC_BYTES)
+    let cmd: u64 = vk_frame.frame_cmd(&(*b).fr, (*b).cur)
+    var i: usize = 0
+    while i < n {
+        let mode: u32 = rt.ld32(data, i * 6 + 5)
+        var j: usize = i + 1
+        while j < n && rt.ld32(data, j * 6 + 5) == mode {
+            j = j + 1
+        }
+        (*b).inv_on = mode == 1 as u32
+        bake(b, cmd)
+        if (*b).inv_on {
+            bind_pipe(b, cmd, (*b).pipe_hud_inv.pipe)
+        } else {
+            bind_pipe(b, cmd, (*b).pipe_hud.pipe)
+        }
+        bind_dyn_vb(b, cmd, off + (i * HUD_REC_BYTES) as u64)
+        vk_mem.cx(&(*b).x, vk_mem.X_CMD_DRAW, cmd, 4, (j - i) as u64, 0, 0, 0, 0, 0, 0, 0)
+        i = j
+    }
+    (*b).inv_on = false
+    (*b).dirty = true
 }
 
 fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
@@ -922,6 +1002,8 @@ fn vkbe_close(b: *mut VkBackend) {
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_tr)
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_sky)
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_tint)
+        vk_desc.vpipe_free(&(*b).x, &(*b).pipe_hud)
+        vk_desc.vpipe_free(&(*b).x, &(*b).pipe_hud_inv)
         if (*b).playout != 0 {
             vk_mem.cx(&(*b).x, vk_mem.X_DESTROY_PLAYOUT, (*b).x.dev, (*b).playout, 0, 0, 0, 0, 0, 0, 0, 0)
         }
