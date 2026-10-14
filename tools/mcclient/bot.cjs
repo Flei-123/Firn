@@ -83,7 +83,7 @@ client.on('position', (p) => {
   // as the teleport_confirm is rejected ("moved too quickly"), the server re-teleports and the bot answers at once again -> endless loop and
   // the bot never leaves its old position. A short pause lets one server tick pass between the confirm and the move.
   const reply = () => client.write('position_look', mv({ x: pos.x, y: pos.y, z: pos.z, yaw: pos.yaw, pitch: pos.pitch, onGround: false }))
-  if (PROTOCOL <= 756 && PROTOCOL > 47 && ready) setTimeout(reply, 120); else reply()
+  if (PROTOCOL >= 477 && PROTOCOL <= 756 && ready) setTimeout(reply, 120); else reply()
   if (!ready) { ready = true; console.log('ready') }
 })
 
