@@ -79,8 +79,19 @@ use crate::regalloc_a64::{self, RaA64};
 use crate::syscalls;
 use std::collections::HashMap;
 
-/// `--shared` (aarch64 .so): the word that holds the Firn thread block pointer instead of `tpidr_el0`.
-const SHARED_TP: &str = "__firn_thread_ptr";
+/// `--shared` (aarch64 .so): `tpidr_el0` belongs to the HOST (glibc TLS), so the Firn runtime cannot keep its
+/// per-thread block pointer there. Instead the library keeps two words:
+///   * `__firn_tp_base` -- the first thread block ever registered (`arch_prctl(ARCH_SET_FS, p)`): entry 0 of the
+///     thread table = the main thread's block. The table is one mapping of 512-octet entries (`gc.fi` FT_BYTES).
+///   * `__firn_tp_hi`   -- number of entries that may be in use (highest registered index + 1).
+/// `Op::ThreadSelf` is then "which entry's stack range holds `sp`": entries 1.. carry the low end of their stack
+/// (`FT_LO`, offset 272) and its end (`FT_BOTTOM`, offset 40); a stack in none of them is the main thread's.
+const SHARED_TP_BASE: &str = "__firn_tp_base";
+const SHARED_TP_HI: &str = "__firn_tp_hi";
+/// Thread block layout facts this scheme relies on (`lib/gc/gc.fi`; a unit test in `thread.rs` checks them).
+pub(crate) const TCB_BYTES_LOG2: u32 = 9;
+pub(crate) const TCB_LO: u32 = 272;
+pub(crate) const TCB_BOTTOM: u32 = 40;
 
 /// Argument registers of AAPCS64, integer class.
 const ARG_REGS: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
@@ -843,7 +854,10 @@ pub fn emit(m: &Module) -> Result<String, String> {
         e.raw(&crate::simd_a64::auxv_data_asm());
     }
     if crate::target::shared() {
-        e.raw(&format!(".bss\n.balign 8\n{}:\n    .zero 8", SHARED_TP));
+        e.raw(&format!(
+            ".bss\n.balign 8\n{}:\n    .zero 8\n{}:\n    .zero 8",
+            SHARED_TP_BASE, SHARED_TP_HI
+        ));
     }
     e.raw(".section .note.GNU-stack,\"\",%progbits");
     Ok(e.out)
@@ -1514,13 +1528,6 @@ fn emit_inst(
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
             let d = i.dst.ok_or("internal error: spawn without target")?;
-            if crate::target::shared() {
-                // aarch64 `.so`: no Firn threads (the per-thread register belongs to the host).
-                // The spawn "fails" like a refused `clone`: -ENOSYS.
-                e.line("movn x0, #37"); // -38
-                store_dst(e, fr, d, "x0");
-                return Ok(());
-            }
             load_full(e, fr, "x0", *arg);
             load_full(e, fr, "x1", *stack);
             load_full(e, fr, "x2", *ctid);
@@ -1536,10 +1543,36 @@ fn emit_inst(
             // what `__thread_tcb` in lib/gc/gc.fi checks for.
             let d = i.dst.ok_or("internal error: threadself without target")?;
             if crate::target::shared() {
-                // `.so`: `tpidr_el0` belongs to the HOST (glibc TLS). The Firn thread
-                // block pointer lives in a private word of the library instead.
-                e.line(&format!("adrp {}, {}", ADDR, SHARED_TP));
-                e.line(&format!("ldr {}, [{}, :lo12:{}]", A, ADDR, SHARED_TP));
+                // `.so`: `tpidr_el0` belongs to the HOST (glibc TLS). Find the calling thread's block by its
+                // stack range (see SHARED_TP_BASE). Result: the entry whose [FT_LO, FT_BOTTOM) holds `sp`,
+                // else the main thread's block (entry 0), else 0 while nothing is registered.
+                let lp = uniq(e, "tp_loop");
+                let nx = uniq(e, "tp_next");
+                let dn = uniq(e, "tp_done");
+                e.line(&format!("adrp {}, {}", ADDR, SHARED_TP_BASE));
+                e.line(&format!("ldr {}, [{}, :lo12:{}]", A, ADDR, SHARED_TP_BASE));
+                e.line(&format!("cbz {}, {}", A, dn));
+                e.line(&format!("adrp {}, {}", ADDR, SHARED_TP_HI));
+                e.line(&format!("ldr {}, [{}, :lo12:{}]", B, ADDR, SHARED_TP_HI));
+                e.line(&format!("mov {}, sp", C));
+                e.line(&format!("add {}, {}, {}, lsl #{}", B, A, B, TCB_BYTES_LOG2));
+                e.line(&format!("add {}, {}, #{}", T1, A, 1u32 << TCB_BYTES_LOG2));
+                e.raw(&format!("{}:", lp));
+                e.line(&format!("cmp {}, {}", T1, B));
+                e.line(&format!("b.hs {}", dn));
+                e.line(&format!("ldr {}, [{}, #{}]", ADDR, T1, TCB_LO));
+                e.line(&format!("cbz {}, {}", ADDR, nx));
+                e.line(&format!("cmp {}, {}", C, ADDR));
+                e.line(&format!("b.lo {}", nx));
+                e.line(&format!("ldr {}, [{}, #{}]", ADDR, T1, TCB_BOTTOM));
+                e.line(&format!("cmp {}, {}", C, ADDR));
+                e.line(&format!("b.hs {}", nx));
+                e.line(&format!("mov {}, {}", A, T1));
+                e.line(&format!("b {}", dn));
+                e.raw(&format!("{}:", nx));
+                e.line(&format!("add {}, {}, #{}", T1, T1, 1u32 << TCB_BYTES_LOG2));
+                e.line(&format!("b {}", lp));
+                e.raw(&format!("{}:", dn));
             } else {
                 e.line(&format!("mrs {}, tpidr_el0", A));
             }
@@ -1683,6 +1716,20 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
     let given: Vec<Val> = args[1..].to_vec();
     // `arch_prctl(ARCH_SET_FS, p)` is no system call here at all.
     if let syscalls::A64::SetThreadPointer = form {
+        // `arch_prctl(ARCH_GET_FS, &out)`: `out = tpidr_el0` (the HOST's thread pointer in a `.so`; `thread_attach`
+        // uses it to find the end of a host thread's stack frames, see lib/gc/gc.fi).
+        if let Some(v) = fr.consts.get(&given[0]) {
+            if *v as i64 == syscalls::ARCH_GET_FS {
+                load_full(e, fr, A, given[1]);
+                e.line(&format!("mrs {}, tpidr_el0", B));
+                e.line(&format!("str {}, [{}]", B, A));
+                if let Some(d) = i.dst {
+                    e.line(&format!("mov {}, xzr", A));
+                    store_dst(e, fr, d, A);
+                }
+                return Ok(());
+            }
+        }
         match fr.consts.get(&given[0]) {
             Some(v) if *v as i64 == syscalls::ARCH_SET_FS => {}
             _ => {
@@ -1694,8 +1741,35 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
         }
         load_full(e, fr, A, given[1]);
         if crate::target::shared() {
-            e.line(&format!("adrp {}, {}", ADDR, SHARED_TP));
-            e.line(&format!("str {}, [{}, :lo12:{}]", A, ADDR, SHARED_TP));
+            // Register the thread block `p` (see SHARED_TP_BASE): the first one becomes the base, then
+            // `__firn_tp_hi = max(hi, (p - base) / 512 + 1)`. p = 0 (a thread leaving) changes nothing.
+            let dn = uniq(e, "setfs_done");
+            let have = uniq(e, "setfs_have");
+            let retry = uniq(e, "setfs_retry");
+            let skip = uniq(e, "setfs_skip");
+            e.line(&format!("cbz {}, {}", A, dn));
+            e.line(&format!("adrp {}, {}", ADDR, SHARED_TP_BASE));
+            e.line(&format!("add {}, {}, :lo12:{}", ADDR, ADDR, SHARED_TP_BASE));
+            e.line(&format!("ldr {}, [{}]", B, ADDR));
+            e.line(&format!("cbnz {}, {}", B, have));
+            e.line(&format!("str {}, [{}]", A, ADDR));
+            e.line(&format!("mov {}, {}", B, A));
+            e.raw(&format!("{}:", have));
+            e.line(&format!("sub {}, {}, {}", B, A, B));
+            e.line(&format!("lsr {}, {}, #{}", B, B, TCB_BYTES_LOG2));
+            e.line(&format!("add {}, {}, #1", B, B));
+            e.line(&format!("adrp {}, {}", ADDR, SHARED_TP_HI));
+            e.line(&format!("add {}, {}, :lo12:{}", ADDR, ADDR, SHARED_TP_HI));
+            e.raw(&format!("{}:", retry));
+            e.line(&format!("ldaxr {}, [{}]", C, ADDR));
+            e.line(&format!("cmp {}, {}", C, B));
+            e.line(&format!("b.hs {}", skip));
+            e.line(&format!("stlxr {}, {}, [{}]", w(T2), B, ADDR));
+            e.line(&format!("cbnz {}, {}", w(T2), retry));
+            e.line(&format!("b {}", dn));
+            e.raw(&format!("{}:", skip));
+            e.line("clrex");
+            e.raw(&format!("{}:", dn));
         } else {
             e.line(&format!("msr tpidr_el0, {}", A));
         }
