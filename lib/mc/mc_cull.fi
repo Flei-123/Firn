@@ -24,7 +24,7 @@ import mc.mc_camera
 import mc.mc_world
 
 export {
-    Cull, CullStats, CONN_ALL, cull_new, cull_free, cull_conn, cull_pair_bit, cull_connected,
+    Cull, CullStats, CONN_ALL, cull_new, cull_free, cull_conn, cull_conn_ref, cull_pair_bit, cull_connected,
     cull_set, cull_get, cull_remove_column, cull_clear, cull_known, cull_run, cull_run_frustum,
     cull_out_key, cull_out_cx, cull_out_sy, cull_out_cz, cull_pack,
 }
@@ -142,9 +142,175 @@ fn pad_solid(pad: u64, opaque: u64, x: usize, y: usize, z: usize) -> bool {
     return (rt.ld8(opaque, id as usize) & 1 as u8) != 0 as u8 // bit 1 = translucent (mc_mesh.F_TRANS) does not block
 }
 
+// ---- bit parallel flood fill (r186) -------------------------------------------------------------
+// A section is 256 rows (y * 16 + z) of 16 bit masks (bit x). The fill works on whole rows: a row grows by the open bits of
+// its 4 neighbour rows (y -+ 1, z -+ 1) and is then filled along x inside its runs of open cells (carry add upwards,
+// Kogge-Stone smear downwards). Work is proportional to the rows of one component, not to 4096 cells x 6 neighbours.
+// Scratch layout (u16 elements of `scr`): open 0, unvisited 256, reach 512, touched 768, stack 1024; byte flags at 2560.
+const S_OPEN: usize = 0
+const S_UNVIS: usize = 256
+const S_REACH: usize = 512
+const S_TOUCH: usize = 768
+const S_STACK: usize = 1024
+const S_FLAG_BYTE: usize = 2560
+
+// all open cells of the runs of `o` that contain a bit of `r` (r is a subset of o); all values < 2^16
+fn hfill(r: u32, o: u32) -> u32 {
+    let up: u32 = (o & ((o + r) ^ 0x1FFFF as u32)) | r
+    var g: u32 = r
+    var p: u32 = o
+    g = g | (p & (g >> 1 as u32))
+    p = p & (p >> 1 as u32)
+    g = g | (p & (g >> 2 as u32))
+    p = p & (p >> 2 as u32)
+    g = g | (p & (g >> 4 as u32))
+    p = p & (p >> 4 as u32)
+    g = g | (p & (g >> 8 as u32))
+    return up | g
+}
+
+// grow the reach of row n by the bits `src` (already restricted to the open bits of n); push n when it changed
+fn grow_row(scr: u64, n: usize, src: u32, sp: usize) -> usize {
+    let cur: u32 = rt.ld16(scr, S_REACH + n) as u32
+    let add: u32 = src & ((cur ^ 0xFFFF as u32))
+    if add == 0 as u32 { return sp }
+    let nw: u32 = hfill(cur | add, rt.ld16(scr, S_OPEN + n) as u32)
+    rt.st16(scr, S_REACH + n, nw as u16)
+    if rt.ld8(scr, S_FLAG_BYTE + n) == 0 as u8 {
+        rt.st8(scr, S_FLAG_BYTE + n, 1 as u8)
+        rt.st16(scr, S_STACK + sp, n as u16)
+        return sp + 1
+    }
+    return sp
+}
+
 // 15 bit face connectivity of the section in the padded array `pad` (u16 [18^3], mc_mesh layout; only the inner 16^3 is
 // read). `opaque` = MeshTables.opaque. `scr` = 12288 bytes of scratch (any content, one per thread).
 fn cull_conn(pad: u64, opaque: u64, scr: u64) -> u32 {
+    // open masks per row; flags cleared
+    var last_id: u32 = 65536 as u32
+    var last_open: u32 = 0 as u32
+    var any_open: bool = false
+    var row: usize = 0
+    while row < 256 {
+        let y: usize = row >> 4
+        let z: usize = row & 15
+        let rp: usize = ((y + 1) * 18 + (z + 1)) * 18 + 1
+        var bits: u32 = 0 as u32
+        var x: usize = 0
+        // fast path: a row of 16 equal ids (air / stone rows) = 4 unaligned 64 bit loads
+        let rb: u64 = pad + (rp * 2) as u64
+        let w0: u64 = rt.ld64(rb, 0)
+        if w0 == rt.ld64(rb, 1) && w0 == rt.ld64(rb, 2) && w0 == rt.ld64(rb, 3) &&
+            w0 == (w0 & 0xFFFF as u64) * 0x0001000100010001 as u64 {
+            x = 16
+            let id: u16 = (w0 & 0xFFFF as u64) as u16
+            if (id as u32) != last_id {
+                last_id = id as u32
+                last_open = 1 as u32
+                if id < 32768 as u16 {
+                    if (rt.ld8(opaque, id as usize) & 1 as u8) != 0 as u8 { last_open = 0 as u32 }
+                }
+            }
+            if last_open != 0 as u32 { bits = 0xFFFF as u32 }
+        }
+        while x < 16 {
+            let id: u16 = rt.ld16(pad, rp + x)
+            if (id as u32) != last_id {
+                last_id = id as u32
+                last_open = 1 as u32
+                if id < 32768 as u16 {
+                    if (rt.ld8(opaque, id as usize) & 1 as u8) != 0 as u8 { last_open = 0 as u32 }
+                }
+            }
+            bits = bits | (last_open << (x as u32))
+            x = x + 1
+        }
+        if bits != 0 as u32 { any_open = true }
+        rt.st16(scr, S_OPEN + row, bits as u16)
+        rt.st16(scr, S_UNVIS + row, bits as u16)
+        rt.st16(scr, S_REACH + row, 0 as u16)
+        rt.st8(scr, S_FLAG_BYTE + row, 0 as u8)
+        row = row + 1
+    }
+    if !any_open { return 0 as u32 }
+    var conn: u32 = 0 as u32
+    var seed: usize = 0
+    while seed < 256 && conn != CONN_ALL {
+        let uv: u32 = rt.ld16(scr, S_UNVIS + seed) as u32
+        if uv == 0 as u32 {
+            seed = seed + 1
+        } else {
+            let lb: u32 = uv ^ (uv & (uv - 1 as u32))
+            var sp: usize = 0
+            var nt: usize = 0
+            rt.st16(scr, S_TOUCH, seed as u16)
+            nt = 1
+            sp = grow_row(scr, seed, lb, 0)
+            while sp > 0 {
+                sp = sp - 1
+                let i: usize = rt.ld16(scr, S_STACK + sp) as usize
+                rt.st8(scr, S_FLAG_BYTE + i, 0 as u8)
+                let rb: u32 = rt.ld16(scr, S_REACH + i) as u32
+                let y: usize = i >> 4
+                let z: usize = i & 15
+                var k: usize = 0
+                while k < 4 {
+                    var n: usize = i
+                    var ok: bool = true
+                    if k == 0 {
+                        if y == 0 { ok = false } else { n = i - 16 }
+                    } else if k == 1 {
+                        if y == 15 { ok = false } else { n = i + 16 }
+                    } else if k == 2 {
+                        if z == 0 { ok = false } else { n = i - 1 }
+                    } else {
+                        if z == 15 { ok = false } else { n = i + 1 }
+                    }
+                    if ok {
+                        let src: u32 = rb & (rt.ld16(scr, S_OPEN + n) as u32)
+                        if src != 0 as u32 {
+                            let was: u32 = rt.ld16(scr, S_REACH + n) as u32
+                            sp = grow_row(scr, n, src, sp)
+                            if was == 0 as u32 && rt.ld16(scr, S_REACH + n) != 0 as u16 {
+                                rt.st16(scr, S_TOUCH + nt, n as u16)
+                                nt = nt + 1
+                            }
+                        }
+                    }
+                    k = k + 1
+                }
+            }
+            // faces touched by the component; reset reach, remove it from the unvisited rows
+            var mask: u32 = 0 as u32
+            var all: u32 = 0 as u32
+            var q: usize = 0
+            while q < nt {
+                let i: usize = rt.ld16(scr, S_TOUCH + q) as usize
+                let rb: u32 = rt.ld16(scr, S_REACH + i) as u32
+                all = all | rb
+                let y: usize = i >> 4
+                let z: usize = i & 15
+                if y == 0 { mask = mask | 4 as u32 }
+                if y == 15 { mask = mask | 8 as u32 }
+                if z == 0 { mask = mask | 16 as u32 }
+                if z == 15 { mask = mask | 32 as u32 }
+                rt.st16(scr, S_UNVIS + i, ((rt.ld16(scr, S_UNVIS + i) as u32) & (rb ^ 0xFFFF as u32)) as u16)
+                rt.st16(scr, S_REACH + i, 0 as u16)
+                q = q + 1
+            }
+            if (all & 1 as u32) != 0 as u32 { mask = mask | 1 as u32 }
+            if (all & 0x8000 as u32) != 0 as u32 { mask = mask | 2 as u32 }
+            conn = conn | pairs_of(mask)
+        }
+    }
+    return conn
+}
+
+// Reference implementation (cell by cell flood fill, the pre r186 code); the tests compare cull_conn against it.
+// 15 bit face connectivity of the section in the padded array `pad` (u16 [18^3], mc_mesh layout; only the inner 16^3 is
+// read). `opaque` = MeshTables.opaque. `scr` = 12288 bytes of scratch (any content, one per thread).
+fn cull_conn_ref(pad: u64, opaque: u64, scr: u64) -> u32 {
     var i: usize = 0
     while i < 4096 {
         rt.st8(scr, i, 0 as u8)
