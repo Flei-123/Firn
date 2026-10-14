@@ -117,7 +117,6 @@ pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
             | K::Add16
             | K::Sub16
             | K::Packus16
-            | K::Packs32
             | K::MinF32
             | K::MaxF32
             | K::DivF32
@@ -180,7 +179,6 @@ pub(crate) fn two_address_simd(k: crate::simd::SimdKind) -> bool {
             | K::Add16
             | K::Sub16
             | K::Packus16
-            | K::Packs32
             | K::MinF32
             | K::MaxF32
             | K::DivF32
@@ -6251,7 +6249,6 @@ fn emit_inst(
                 | K::Add16
                 | K::Sub16
                 | K::Packus16
-                | K::Packs32
                 | K::MinF32
                 | K::MaxF32
                 | K::DivF32
@@ -6284,7 +6281,6 @@ fn emit_inst(
                         K::Add16 => "paddw",
                         K::Sub16 => "psubw",
                         K::Packus16 => "packuswb",
-                        K::Packs32 => "packssdw",
                         K::MinF32 => "minps",
                         K::MaxF32 => "maxps",
                         K::DivF32 => "divps",
