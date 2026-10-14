@@ -43,6 +43,8 @@ for lvl in dev-fast release-safe release-fast; do
     timeout 120 "$D/hostatt" "$D/librt.so" | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL host_attach C ($lvl)"; rc=1; }
     timeout 120 python3 -I tools/stack_e/host_attach.py "$D/librt.so" || { echo "FAIL host_attach ctypes ($lvl)"; rc=1; }
 done
+# G5: Windows DLL (Wine) and aarch64 .so (qemu): own script, it can run alone
+bash tools/stack_e/run_g5.sh || rc=1
 # the new v128 intrinsics, all stages
 for st in "--opt-level=dev-fast" "--opt-level=release-safe" "--opt-level=release-fast" "--opt-level=release-fast --asm-intern"; do
     "$FIRNC" $st -o "$D/t2860" tests/2860_simd_minmax.fi 2> "$D/err" && "$D/t2860" && echo "ok  tests/2860 $st" || { echo "FAIL tests/2860 $st"; head -3 "$D/err"; rc=1; }

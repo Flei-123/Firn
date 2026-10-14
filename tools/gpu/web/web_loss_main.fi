@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/gpu/web/web_loss_main.fi -- WebGL2 CONTEXT LOSS in the browser (docs/WEBGL2.md section 9, gate 141).
+// The program keeps ONE textured-quad scene on screen through `firn_mc_frame` (requestAnimationFrame, glweb.js). The page
+// (loss.html) takes the context away with WEBGL_lose_context.loseContext() and gives it back with restoreContext().
+// The frame function calls glweb_poll_context: CTX_LOST -> skip frame, CTX_RESTORED -> glweb_recreate has rebuilt program,
+// FBO, atlas and the mesh (CPU copy kept). The frame after the restore must be byte-equal to the frame before the loss.
+// Output lines read by check_loss.py: "frame-before sum=...", "lost-frames=N", "restored sum=... same=1", "context loss ok".
+import std.rt
+import std.io
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import gpu.glweb
+import webscene
+
+static mut P_GW: u64 = 0
+static mut P_BG: u64 = 0
+static mut P_CAM: u64 = 0
+static mut P_SC: u64 = 0
+static mut P_WD: u64 = 0
+static mut G_MESH: u64 = 0
+static mut G_REF: u64 = 0
+static mut G_FRAMES: u64 = 0
+static mut G_LOST_FRAMES: u64 = 0
+static mut G_RESTORES: u64 = 0
+static mut G_DONE: u64 = 0
+
+fn loss_alloc[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+// FNV-1 (32 bit, kept in a u64 so the checked multiply cannot overflow) over the RGBA words of the last frame (the readback that `present` returns).
+fn frame_sum(px: u64, n: usize) -> u64 {
+    var h: u64 = 2166136261 as u64
+    var i: usize = 0
+    while i < n {
+        h = (((h ^ (rt.ld32(px, i) as u64)) & 4294967295 as u64) * 16777619 as u64) & 4294967295 as u64
+        i = i + 1
+    }
+    return h
+}
+
+fn draw_once() -> u64 {
+    let bg: *mut mc_backend.Backend = P_BG as *mut mc_backend.Backend
+    let sc: *mut webscene.Sc = P_SC as *mut webscene.Sc
+    let cam: *mut mc_camera.Camera = P_CAM as *mut mc_camera.Camera
+    webscene.frame(bg, cam, webscene.CLEAR, G_MESH as usize, (*sc).nx, (*sc).nz, (*sc).ox, (*sc).oy, (*sc).oz)
+    glweb.glweb_show(P_GW as *mut glweb.GlWeb)
+    let px: u64 = (*bg).present((*bg).obj)
+    return frame_sum(px, (webscene.W as usize) * (webscene.H as usize))
+}
+
+#[export_c]
+fn firn_mc_frame(ms: f64) -> u32 {
+    if G_DONE != 0 as u64 { return 0 as u32 }
+    G_FRAMES = G_FRAMES + 1 as u64
+    let gw: *mut glweb.GlWeb = P_GW as *mut glweb.GlWeb
+    let st: i32 = glweb.glweb_poll_context(gw)
+    if st == glweb.CTX_LOST {
+        G_LOST_FRAMES = G_LOST_FRAMES + 1 as u64
+        if G_FRAMES > 900 as u64 {
+            io.print("context loss FAIL: no restore within 900 frames\n")
+            G_DONE = 1 as u64
+            return 0 as u32
+        }
+        return 1 as u32
+    }
+    if st == glweb.CTX_RESTORED { G_RESTORES = G_RESTORES + 1 as u64 }
+    let sum: u64 = draw_once()
+    if G_REF == 0 as u64 {
+        G_REF = sum
+        io.fmt_print(f"frame-before sum={sum}\n")
+        return 1 as u32
+    }
+    if G_RESTORES > 0 as u64 {
+        let same: i32 = if sum == G_REF { 1 } else { 0 }
+        io.fmt_print(f"lost-frames={G_LOST_FRAMES} restores={G_RESTORES}\n")
+        io.fmt_print(f"restored sum={sum} same={same}\n")
+        if same == 1 && G_LOST_FRAMES > 0 as u64 && glweb.glweb_error(gw) == 0 { io.print("context loss ok\n") } else { io.print("context loss FAIL\n") }
+        G_DONE = 1 as u64
+        return 0 as u32
+    }
+    if G_FRAMES > 900 as u64 {
+        io.print("context loss FAIL: the page never took the context away\n")
+        G_DONE = 1 as u64
+        return 0 as u32
+    }
+    return 1 as u32
+}
+
+fn main(start: u64) -> i32 {
+    P_GW = loss_alloc[glweb.GlWeb]()
+    P_BG = loss_alloc[mc_backend.Backend]()
+    P_CAM = loss_alloc[mc_camera.Camera]()
+    P_SC = loss_alloc[webscene.Sc]()
+    P_WD = loss_alloc[webscene.World]()
+    *(P_GW as *mut glweb.GlWeb) = glweb.glweb_open(webscene.W, webscene.H)
+    let gw: *mut glweb.GlWeb = P_GW as *mut glweb.GlWeb
+    if !(*gw).ok {
+        io.fmt_print(f"no WebGL2: step={(*gw).step}\n")
+        return 4
+    }
+    *(P_BG as *mut mc_backend.Backend) = glweb.glweb_backend(gw)
+    *(P_WD as *mut webscene.World) = webscene.world_new()
+    *(P_CAM as *mut mc_camera.Camera) = mc_camera.camera_new(webscene.W, webscene.H)
+    *(P_SC as *mut webscene.Sc) = webscene.Sc { atlas: 0, verts: 0, nv: 0, idx: 0, ni: 0, nx: 1, nz: 1, ox: 0.0, oy: 0.0, oz: 0.0,
+        fog: false, min_psnr_x100: 0 as u64 }
+    let bg: *mut mc_backend.Backend = P_BG as *mut mc_backend.Backend
+    let wd: *mut webscene.World = P_WD as *mut webscene.World
+    let sc: *mut webscene.Sc = P_SC as *mut webscene.Sc
+    webscene.scene_setup(wd, 1, P_CAM as *mut mc_camera.Camera, sc)
+    (*bg).upload_atlas((*bg).obj, (&(*wd).ta) as u64)
+    glweb.glweb_keep_meshes(gw, true)
+    G_MESH = (*bg).mesh_upload((*bg).obj, 1, (*sc).verts, (*sc).nv, (*sc).idx, (*sc).ni) as u64
+    io.print("loss test ready\n")
+    return 0
+}
