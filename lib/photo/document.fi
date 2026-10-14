@@ -1,0 +1,690 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/document.fi -- photo.document: document scanner (FirnCam core).
+//
+//     var o: document.DocOpts = document.doc_default()
+//     var q: document.Quad = ...
+//     if document.find_quad(&im, &o, &q) {                       // page corners TL, TR, BR, BL in pixels
+//         var scan: image.Image = ...
+//         document.rectify(&im, &q, &o, &scan)                    // perspective -> flat rectangle (new image)
+//         document.flatten(&scan, &o)                             // shadow removal + paper white balance, in place
+//     }
+//     document.scan_document(&im, &o, &out)                       // all of it; false when no page was found
+//     document.pdf_write(&out, 200.0f, &buf)                      // one page PDF (Flate RGB) into an rt.Buf
+//
+// find_quad: the page is the biggest bright region: luma at working size (longest side `work` px), Gaussian
+// smoothing, Otsu threshold, the largest connected region (4-neighbourhood, flood fill), its corners are the
+// extreme points of x + y and x - y (valid while the page is rotated by less than ~40 degrees, the usual
+// hand held case). Accepts the region when it covers at least `min_area` of the frame.
+// homography4 solves the 8x8 system of four point pairs (Gaussian elimination, f64, partial pivoting).
+// rectify: output size from the mean opposite edge lengths (limited to `out_max` px on the long side); every
+// output pixel is sampled bilinearly from the photo through the homography.
+// flatten: per channel the paper illumination is estimated as the 88th percentile of each block
+// (`shadow_block` * short side, ink strokes are thinner than a block), smoothed and interpolated; dividing by
+// it removes shading, shadows and the paper colour cast (paper = white) in one step; a gentle contrast curve
+// finishes the page. No sensor constant is built in.
+import std.rt
+import std.math
+import std.deflate
+import photo.image
+import photo.filter
+
+export {
+    Quad, DocOpts, doc_default, find_quad, homography4, hmap, rectify, flatten, scan_document, pdf_write,
+}
+
+struct Quad {
+    x: [f32; 4],
+    y: [f32; 4],
+}
+
+struct DocOpts {
+    work: i32,
+    min_area: f32,
+    shadow_block: f32,
+    percentile: f32,
+    contrast: f32,
+    out_max: i32,
+}
+
+fn doc_default() -> DocOpts {
+    return DocOpts { work: 320, min_area: 0.10f, shadow_block: 0.05f, percentile: 0.88f, contrast: 0.35f, out_max: 3000 }
+}
+
+// Solve for H (row major, h33 = 1) with H * (sx, sy, 1) ~ (dx, dy, 1). Returns false when degenerate.
+fn homography4(sx: *mut [f32; 4], sy: *mut [f32; 4], dx: *mut [f32; 4], dy: *mut [f32; 4], hm: *mut [f64; 9]) -> bool {
+    var a: [f64; 72] = [0.0; 72]          // 8 rows x 9 columns (augmented)
+    var i: i32 = 0
+    while i < 4 {
+        let x: f64 = (*sx)[i as usize] as f64
+        let y: f64 = (*sy)[i as usize] as f64
+        let u: f64 = (*dx)[i as usize] as f64
+        let v: f64 = (*dy)[i as usize] as f64
+        let r0: usize = (2 * i) as usize * 9
+        let r1: usize = (2 * i + 1) as usize * 9
+        a[r0 + 0] = x
+        a[r0 + 1] = y
+        a[r0 + 2] = 1.0
+        a[r0 + 6] = 0.0 - u * x
+        a[r0 + 7] = 0.0 - u * y
+        a[r0 + 8] = u
+        a[r1 + 3] = x
+        a[r1 + 4] = y
+        a[r1 + 5] = 1.0
+        a[r1 + 6] = 0.0 - v * x
+        a[r1 + 7] = 0.0 - v * y
+        a[r1 + 8] = v
+        i = i + 1
+    }
+    var col: i32 = 0
+    while col < 8 {
+        var piv: i32 = col
+        var best: f64 = 0.0
+        var r: i32 = col
+        while r < 8 {
+            var t: f64 = a[(r * 9 + col) as usize]
+            if t < 0.0 { t = 0.0 - t }
+            if t > best {
+                best = t
+                piv = r
+            }
+            r = r + 1
+        }
+        if best < 1.0e-12 { return false }
+        if piv != col {
+            var c: i32 = 0
+            while c < 9 {
+                let t: f64 = a[(col * 9 + c) as usize]
+                a[(col * 9 + c) as usize] = a[(piv * 9 + c) as usize]
+                a[(piv * 9 + c) as usize] = t
+                c = c + 1
+            }
+        }
+        let d: f64 = a[(col * 9 + col) as usize]
+        var c2: i32 = 0
+        while c2 < 9 {
+            a[(col * 9 + c2) as usize] = a[(col * 9 + c2) as usize] / d
+            c2 = c2 + 1
+        }
+        r = 0
+        while r < 8 {
+            if r != col {
+                let f: f64 = a[(r * 9 + col) as usize]
+                var c3: i32 = 0
+                while c3 < 9 {
+                    a[(r * 9 + c3) as usize] = a[(r * 9 + c3) as usize] - f * a[(col * 9 + c3) as usize]
+                    c3 = c3 + 1
+                }
+            }
+            r = r + 1
+        }
+        col = col + 1
+    }
+    var k: i32 = 0
+    while k < 8 {
+        (*hm)[k as usize] = a[(k * 9 + 8) as usize]
+        k = k + 1
+    }
+    (*hm)[8] = 1.0
+    return true
+}
+
+fn hmap(hm: *mut [f64; 9], x: f32, y: f32, ox: *mut f32, oy: *mut f32) {
+    let xd: f64 = x as f64
+    let yd: f64 = y as f64
+    let w: f64 = (*hm)[6] * xd + (*hm)[7] * yd + (*hm)[8]
+    *ox = (((*hm)[0] * xd + (*hm)[1] * yd + (*hm)[2]) / w) as f32
+    *oy = (((*hm)[3] * xd + (*hm)[4] * yd + (*hm)[5]) / w) as f32
+}
+
+fn otsu(l: *mut image.Image) -> f32 {
+    var hist: [f32; 64] = [0.0f; 64]
+    let n: i32 = (*l).w * (*l).h
+    var i: i32 = 0
+    while i < n {
+        var b: i32 = (image.fclampf(*(((*l).px + (i as u64) * (4 as u64)) as *mut f32), 0.0f, 0.9999f) * 64.0f) as i32
+        hist[b as usize] = hist[b as usize] + 1.0f
+        i = i + 1
+    }
+    var total: f32 = n as f32
+    var sum_all: f32 = 0.0f
+    i = 0
+    while i < 64 {
+        sum_all = sum_all + (i as f32) * hist[i as usize]
+        i = i + 1
+    }
+    var wb: f32 = 0.0f
+    var sb: f32 = 0.0f
+    var best: f32 = -1.0f
+    var thr: i32 = 32
+    i = 0
+    while i < 64 {
+        wb = wb + hist[i as usize]
+        if wb > 0.0f && wb < total {
+            sb = sb + (i as f32) * hist[i as usize]
+            let m1: f32 = sb / wb
+            let m2: f32 = (sum_all - sb) / (total - wb)
+            let v: f32 = wb * (total - wb) * (m1 - m2) * (m1 - m2)
+            if v > best {
+                best = v
+                thr = i
+            }
+        }
+        i = i + 1
+    }
+    return ((thr + 1) as f32) / 64.0f
+}
+
+fn find_quad(im: *mut image.Image, o: *mut DocOpts, q: *mut Quad) -> bool {
+    var lum: image.Image = image.img_luma(im)
+    var scale: f32 = 1.0f
+    let longest: i32 = if (*im).w > (*im).h { (*im).w } else { (*im).h }
+    if longest > (*o).work { scale = (longest as f32) / ((*o).work as f32) }
+    let w: i32 = (((*im).w as f32) / scale) as i32
+    let h: i32 = (((*im).h as f32) / scale) as i32
+    var small: image.Image = image.img_new(w, h, 1)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            // box average over the source cell
+            let x0: i32 = ((x as f32) * scale) as i32
+            let y0: i32 = ((y as f32) * scale) as i32
+            let x1: i32 = (((x + 1) as f32) * scale) as i32
+            let y1: i32 = (((y + 1) as f32) * scale) as i32
+            var s: f32 = 0.0f
+            var cnt: f32 = 0.0f
+            var yy: i32 = y0
+            while yy < y1 || yy == y0 {
+                var xx: i32 = x0
+                while xx < x1 || xx == x0 {
+                    s = s + image.img_getc(&lum, 0, xx, yy)
+                    cnt = cnt + 1.0f
+                    xx = xx + 1
+                }
+                yy = yy + 1
+            }
+            image.img_set(&small, 0, x, y, s / cnt)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image.img_free(&lum)
+    let sm: image.Image = filter.gauss_blur(&small, 1.5f)
+    image.img_free(&small)
+    small = sm
+    let thr: f32 = otsu(&small)
+    // connected components of "bright", keep the biggest
+    var lab: image.Image = image.img_new(w, h, 1)
+    image.img_fill(&lab, 0.0f)
+    var stack: u64 = rt.heap_alloc((w * h) as usize * 4)
+    var best_n: i32 = 0
+    var best_id: i32 = 0
+    var id: i32 = 0
+    y = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            if image.img_get(&small, 0, x, y) > thr && image.img_get(&lab, 0, x, y) == 0.0f {
+                id = id + 1
+                var sp: i32 = 0
+                *((stack + (sp as u64) * (4 as u64)) as *mut i32) = y * w + x
+                sp = 1
+                image.img_set(&lab, 0, x, y, id as f32)
+                var cnt: i32 = 0
+                while sp > 0 {
+                    sp = sp - 1
+                    let p: i32 = *((stack + (sp as u64) * (4 as u64)) as *mut i32)
+                    let px: i32 = p % w
+                    let py: i32 = p / w
+                    cnt = cnt + 1
+                    var d: i32 = 0
+                    while d < 4 {
+                        var nx: i32 = px
+                        var ny: i32 = py
+                        if d == 0 { nx = px - 1 }
+                        if d == 1 { nx = px + 1 }
+                        if d == 2 { ny = py - 1 }
+                        if d == 3 { ny = py + 1 }
+                        if nx >= 0 && ny >= 0 && nx < w && ny < h {
+                            if image.img_get(&small, 0, nx, ny) > thr && image.img_get(&lab, 0, nx, ny) == 0.0f {
+                                image.img_set(&lab, 0, nx, ny, id as f32)
+                                *((stack + (sp as u64) * (4 as u64)) as *mut i32) = ny * w + nx
+                                sp = sp + 1
+                            }
+                        }
+                        d = d + 1
+                    }
+                }
+                if cnt > best_n {
+                    best_n = cnt
+                    best_id = id
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    rt.heap_free(stack, (w * h) as usize * 4)
+    var found: bool = false
+    if (best_n as f32) >= (*o).min_area * ((w * h) as f32) {
+        found = true
+        var mn: [f32; 4] = [1.0e9f; 4]      // TL: min(x + y), TR: max(x - y), BR: max(x + y), BL: min(x - y)
+        var mx: [f32; 4] = [-1.0e9f; 4]
+        y = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                if image.img_get(&lab, 0, x, y) == (best_id as f32) {
+                    let s: f32 = (x + y) as f32
+                    let d: f32 = (x - y) as f32
+                    if s < mn[0] {
+                        mn[0] = s
+                        (*q).x[0] = x as f32
+                        (*q).y[0] = y as f32
+                    }
+                    if d > mx[1] {
+                        mx[1] = d
+                        (*q).x[1] = x as f32
+                        (*q).y[1] = y as f32
+                    }
+                    if s > mx[2] {
+                        mx[2] = s
+                        (*q).x[2] = x as f32
+                        (*q).y[2] = y as f32
+                    }
+                    if d < mn[3] {
+                        mn[3] = d
+                        (*q).x[3] = x as f32
+                        (*q).y[3] = y as f32
+                    }
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        // sub-pixel corners: fit a line to the region boundary along each of the 4 edges (middle 60 % of the edge,
+        // boundary point = pixel centre + half a pixel towards the outside), intersect neighbouring lines
+        // exterior = non-page pixels connected to the frame border (ink holes inside the page do not count)
+        var ext: image.Image = image.img_new(w, h, 1)
+        image.img_fill(&ext, 0.0f)
+        var st2: u64 = rt.heap_alloc((w * h) as usize * 4)
+        var sp2: i32 = 0
+        var bi: i32 = 0
+        while bi < w * h {
+            let bx0: i32 = bi % w
+            let by0: i32 = bi / w
+            if (bx0 == 0 || by0 == 0 || bx0 == w - 1 || by0 == h - 1) && image.img_get(&lab, 0, bx0, by0) != (best_id as f32) {
+                if image.img_get(&ext, 0, bx0, by0) == 0.0f {
+                    image.img_set(&ext, 0, bx0, by0, 1.0f)
+                    *((st2 + (sp2 as u64) * (4 as u64)) as *mut i32) = bi
+                    sp2 = sp2 + 1
+                }
+            }
+            bi = bi + 1
+        }
+        while sp2 > 0 {
+            sp2 = sp2 - 1
+            let p2: i32 = *((st2 + (sp2 as u64) * (4 as u64)) as *mut i32)
+            let qx2: i32 = p2 % w
+            let qy2: i32 = p2 / w
+            var d2: i32 = 0
+            while d2 < 4 {
+                var nx2: i32 = qx2
+                var ny2: i32 = qy2
+                if d2 == 0 { nx2 = qx2 - 1 }
+                if d2 == 1 { nx2 = qx2 + 1 }
+                if d2 == 2 { ny2 = qy2 - 1 }
+                if d2 == 3 { ny2 = qy2 + 1 }
+                if nx2 >= 0 && ny2 >= 0 && nx2 < w && ny2 < h {
+                    if image.img_get(&lab, 0, nx2, ny2) != (best_id as f32) && image.img_get(&ext, 0, nx2, ny2) == 0.0f {
+                        image.img_set(&ext, 0, nx2, ny2, 1.0f)
+                        *((st2 + (sp2 as u64) * (4 as u64)) as *mut i32) = ny2 * w + nx2
+                        sp2 = sp2 + 1
+                    }
+                }
+                d2 = d2 + 1
+            }
+        }
+        rt.heap_free(st2, (w * h) as usize * 4)
+        var cv: i32 = 0
+        while cv < 4 {
+            (*q).x[cv as usize] = ((*q).x[cv as usize] + 0.5f) * scale
+            (*q).y[cv as usize] = ((*q).y[cv as usize] + 0.5f) * scale
+            cv = cv + 1
+        }
+        var lx: [f64; 4] = [0.0; 4]     // line k: point (px, py) + direction (dx, dy)
+        var ly: [f64; 4] = [0.0; 4]
+        var ldx: [f64; 4] = [0.0; 4]
+        var ldy: [f64; 4] = [0.0; 4]
+        var e: i32 = 0
+        while e < 4 {
+            let a: i32 = e
+            let b: i32 = (e + 1) % 4
+            let ax: f64 = (*q).x[a as usize] as f64
+            let ay: f64 = (*q).y[a as usize] as f64
+            let bx: f64 = (*q).x[b as usize] as f64
+            let by: f64 = (*q).y[b as usize] as f64
+            let ex: f64 = bx - ax
+            let ey: f64 = by - ay
+            let el: f64 = ex * ex + ey * ey
+            var n: f64 = 0.0
+            var sxp: f64 = 0.0
+            var syp: f64 = 0.0
+            var sxx: f64 = 0.0
+            var sxy: f64 = 0.0
+            var syy: f64 = 0.0
+            // two passes: means, then covariance
+            var pass: i32 = 0
+            var mx0: f64 = 0.0
+            var my0: f64 = 0.0
+            while pass < 2 {
+                y = 0
+                while y < h {
+                    var x: i32 = 0
+                    while x < w {
+                        if image.img_get(&lab, 0, x, y) == (best_id as f32) {
+                            var d: i32 = 0
+                            while d < 4 {
+                                var nx: i32 = x
+                                var ny: i32 = y
+                                var ox: f64 = 0.0
+                                var oy: f64 = 0.0
+                                if d == 0 { nx = x - 1
+                                    ox = -0.5 }
+                                if d == 1 { nx = x + 1
+                                    ox = 0.5 }
+                                if d == 2 { ny = y - 1
+                                    oy = -0.5 }
+                                if d == 3 { ny = y + 1
+                                    oy = 0.5 }
+                                // boundary against the exterior only (the frame border itself is not a page edge)
+                                var outside: bool = false
+                                if nx >= 0 && ny >= 0 && nx < w && ny < h {
+                                    if image.img_get(&ext, 0, nx, ny) == 1.0f { outside = true }
+                                }
+                                if outside {
+                                    let bpx: f64 = ((x as f64) + 0.5 + ox) * (scale as f64)
+                                    let bpy: f64 = ((y as f64) + 0.5 + oy) * (scale as f64)
+                                    let t: f64 = ((bpx - ax) * ex + (bpy - ay) * ey) / el
+                                    // distance to the chord
+                                    let cr: f64 = ((bpx - ax) * ey - (bpy - ay) * ex) / math.sqrt(el)
+                                    var cd: f64 = cr
+                                    if cd < 0.0 { cd = 0.0 - cd }
+                                    if t > 0.2 && t < 0.8 && cd < 0.25 * math.sqrt(el) {
+                                        if pass == 0 {
+                                            n = n + 1.0
+                                            sxp = sxp + bpx
+                                            syp = syp + bpy
+                                        } else {
+                                            sxx = sxx + (bpx - mx0) * (bpx - mx0)
+                                            sxy = sxy + (bpx - mx0) * (bpy - my0)
+                                            syy = syy + (bpy - my0) * (bpy - my0)
+                                        }
+                                    }
+                                }
+                                d = d + 1
+                            }
+                        }
+                        x = x + 1
+                    }
+                    y = y + 1
+                }
+                if pass == 0 {
+                    if n < 2.0 { n = 2.0 }
+                    mx0 = sxp / n
+                    my0 = syp / n
+                }
+                pass = pass + 1
+            }
+            // principal direction of the covariance
+            var th: f64 = 0.5 * math.atan2(2.0 * sxy, sxx - syy)
+            lx[e as usize] = mx0
+            ly[e as usize] = my0
+            ldx[e as usize] = math.cos(th)
+            ldy[e as usize] = math.sin(th)
+            e = e + 1
+        }
+        var kk: i32 = 0
+        while kk < 4 {
+            // corner kk = intersection of line (kk + 3) % 4 and line kk
+            let l1: i32 = (kk + 3) % 4
+            let l2: i32 = kk
+            let det: f64 = ldx[l1 as usize] * (0.0 - ldy[l2 as usize]) - ldy[l1 as usize] * (0.0 - ldx[l2 as usize])
+            if det > 1.0e-9 || det < -1.0e-9 {
+                let rx: f64 = lx[l2 as usize] - lx[l1 as usize]
+                let ry: f64 = ly[l2 as usize] - ly[l1 as usize]
+                let t1: f64 = (rx * (0.0 - ldy[l2 as usize]) - ry * (0.0 - ldx[l2 as usize])) / det
+                (*q).x[kk as usize] = (lx[l1 as usize] + t1 * ldx[l1 as usize]) as f32
+                (*q).y[kk as usize] = (ly[l1 as usize] + t1 * ldy[l1 as usize]) as f32
+            } else {
+            }
+            kk = kk + 1
+        }
+        image.img_free(&ext)
+    }
+    image.img_free(&lab)
+    image.img_free(&small)
+    return found
+}
+
+fn dist(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    return image.sqrtf((ax - bx) * (ax - bx) + (ay - by) * (ay - by))
+}
+
+fn rectify(im: *mut image.Image, q: *mut Quad, o: *mut DocOpts, out: *mut image.Image) {
+    var ow: f32 = (dist((*q).x[0], (*q).y[0], (*q).x[1], (*q).y[1]) + dist((*q).x[3], (*q).y[3], (*q).x[2], (*q).y[2])) * 0.5f
+    var oh: f32 = (dist((*q).x[0], (*q).y[0], (*q).x[3], (*q).y[3]) + dist((*q).x[1], (*q).y[1], (*q).x[2], (*q).y[2])) * 0.5f
+    let big: f32 = image.fmaxf(ow, oh)
+    if big > ((*o).out_max as f32) {
+        ow = ow * ((*o).out_max as f32) / big
+        oh = oh * ((*o).out_max as f32) / big
+    }
+    let w: i32 = (ow + 0.5f) as i32
+    let h: i32 = (oh + 0.5f) as i32
+    var rx: [f32; 4] = [0.0f, ow, ow, 0.0f]
+    var ry: [f32; 4] = [0.0f, 0.0f, oh, oh]
+    var hm: [f64; 9] = [0.0; 9]
+    *out = image.img_new(w, h, 3)
+    if !homography4(&rx, &ry, &(*q).x, &(*q).y, &hm) { return }
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            var sx: f32 = 0.0f
+            var sy: f32 = 0.0f
+            hmap(&hm, ((x as f32) + 0.5f) * ow / (w as f32), ((y as f32) + 0.5f) * oh / (h as f32), &sx, &sy)
+            var c: i32 = 0
+            while c < 3 {
+                image.img_set(out, c, x, y, image.img_sample(im, c, sx - 0.5f, sy - 0.5f))
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// percentile of one block of channel c (histogram with 128 bins)
+fn block_pct(im: *mut image.Image, c: i32, x0: i32, y0: i32, x1: i32, y1: i32, pct: f32) -> f32 {
+    var hist: [f32; 128] = [0.0f; 128]
+    var n: f32 = 0.0f
+    var y: i32 = y0
+    while y < y1 {
+        var x: i32 = x0
+        while x < x1 {
+            var b: i32 = (image.fclampf(image.img_get(im, c, x, y), 0.0f, 0.9999f) * 128.0f) as i32
+            hist[b as usize] = hist[b as usize] + 1.0f
+            n = n + 1.0f
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var acc: f32 = 0.0f
+    var i: i32 = 0
+    while i < 128 {
+        acc = acc + hist[i as usize]
+        if acc >= pct * n { return ((i as f32) + 0.5f) / 128.0f }
+        i = i + 1
+    }
+    return 1.0f
+}
+
+fn flatten(im: *mut image.Image, o: *mut DocOpts) {
+    let w: i32 = (*im).w
+    let h: i32 = (*im).h
+    var short: i32 = w
+    if h < short { short = h }
+    var bs: i32 = ((short as f32) * (*o).shadow_block + 0.5f) as i32
+    if bs < 8 { bs = 8 }
+    let gw: i32 = (w + bs - 1) / bs
+    let gh: i32 = (h + bs - 1) / bs
+    var c: i32 = 0
+    while c < 3 {
+        var grid: image.Image = image.img_new(gw, gh, 1)
+        var gy: i32 = 0
+        while gy < gh {
+            var gx: i32 = 0
+            while gx < gw {
+                var x1: i32 = (gx + 1) * bs
+                var y1: i32 = (gy + 1) * bs
+                if x1 > w { x1 = w }
+                if y1 > h { y1 = h }
+                image.img_set(&grid, 0, gx, gy, block_pct(im, c, gx * bs, gy * bs, x1, y1, (*o).percentile))
+                gx = gx + 1
+            }
+            gy = gy + 1
+        }
+        let sm: image.Image = filter.gauss_blur(&grid, 1.0f)
+        image.img_free(&grid)
+        var y: i32 = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                var ill: f32 = image.img_sample(&sm, 0, ((x as f32) + 0.5f) / (bs as f32) - 0.5f, ((y as f32) + 0.5f) / (bs as f32) - 0.5f)
+                if ill < 0.05f { ill = 0.05f }
+                image.img_set(im, c, x, y, image.fclampf(image.img_get(im, c, x, y) / ill, 0.0f, 1.0f))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        image.img_free(&sm)
+        c = c + 1
+    }
+    // contrast: smoothstep blended with the identity; the paper (1.0) stays 1.0
+    var i: i32 = 0
+    while i < w * h * 3 {
+        let p: *mut f32 = ((*im).px + (i as u64) * (4 as u64)) as *mut f32
+        let v: f32 = image.fclampf((*p - 0.08f) / 0.92f, 0.0f, 1.0f)
+        let s: f32 = v * v * (3.0f - 2.0f * v)
+        *p = v + (*o).contrast * (s - v)
+        i = i + 1
+    }
+}
+
+fn scan_document(im: *mut image.Image, o: *mut DocOpts, out: *mut image.Image) -> bool {
+    var q: Quad = Quad { x: [0.0f; 4], y: [0.0f; 4] }
+    if !find_quad(im, o, &q) { return false }
+    rectify(im, &q, o, out)
+    flatten(out, o)
+    return true
+}
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n as usize)
+}
+
+// One page PDF 1.4: the image (display encoded RGB 0..1) as Flate compressed DeviceRGB, page size from `dpi`.
+fn pdf_write(im: *mut image.Image, dpi: f32, buf: *mut rt.Buf) -> bool {
+    let w: i32 = (*im).w
+    let h: i32 = (*im).h
+    let n: usize = (w as usize) * (h as usize) * 3
+    var raw: u64 = rt.heap_alloc(n)
+    var i: usize = 0
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            var c: i32 = 0
+            while c < 3 {
+                *((raw + (i as u64)) as *mut u8) = (image.fclampf(image.img_get(im, c, x, y), 0.0f, 1.0f) * 255.0f + 0.5f) as u8
+                i = i + 1
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var z: rt.Buf = rt.buf_new()
+    let zn: usize = deflate.zlib_compress(raw, n, 6, &z) catch 0
+    rt.heap_free(raw, n)
+    if zn == 0 {
+        rt.buf_free(&z)
+        return false
+    }
+    let pw: i64 = (((w as f32) * 72.0f / dpi) + 0.5f) as i64
+    let ph: i64 = (((h as f32) * 72.0f / dpi) + 0.5f) as i64
+    var off: [usize; 6] = [0 as usize; 6]
+    put(buf, "%PDF-1.4\n")
+    off[1] = rt.buf_len(buf)
+    put(buf, "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+    off[2] = rt.buf_len(buf)
+    put(buf, "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+    off[3] = rt.buf_len(buf)
+    put(buf, "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ")
+    rt.buf_push_dec_i64(buf, pw)
+    put(buf, " ")
+    rt.buf_push_dec_i64(buf, ph)
+    put(buf, "] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>\nendobj\n")
+    off[4] = rt.buf_len(buf)
+    var cs: rt.Buf = rt.buf_new()
+    put(&cs, "q ")
+    rt.buf_push_dec_i64(&cs, pw)
+    put(&cs, " 0 0 ")
+    rt.buf_push_dec_i64(&cs, ph)
+    put(&cs, " 0 0 cm /Im0 Do Q\n")
+    put(buf, "4 0 obj\n<< /Length ")
+    rt.buf_push_dec_u64(buf, rt.buf_len(&cs) as u64)
+    put(buf, " >>\nstream\n")
+    rt.buf_push_bytes(buf, rt.buf_ptr(&cs), rt.buf_len(&cs))
+    put(buf, "endstream\nendobj\n")
+    rt.buf_free(&cs)
+    off[5] = rt.buf_len(buf)
+    put(buf, "5 0 obj\n<< /Type /XObject /Subtype /Image /Width ")
+    rt.buf_push_dec_i64(buf, w as i64)
+    put(buf, " /Height ")
+    rt.buf_push_dec_i64(buf, h as i64)
+    put(buf, " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length ")
+    rt.buf_push_dec_u64(buf, rt.buf_len(&z) as u64)
+    put(buf, " >>\nstream\n")
+    rt.buf_push_bytes(buf, rt.buf_ptr(&z), rt.buf_len(&z))
+    put(buf, "\nendstream\nendobj\n")
+    rt.buf_free(&z)
+    let xref: usize = rt.buf_len(buf)
+    put(buf, "xref\n0 6\n0000000000 65535 f \n")
+    var k: usize = 1
+    while k < 6 {
+        let s: usize = off[k]
+        rt.buf_push_dec_u64(buf, 0 as u64)
+        // zero padded 10 digit offset: push zeros for the missing digits, then the number
+        var digits: usize = 1
+        var t: usize = s
+        while t >= 10 {
+            t = t / 10
+            digits = digits + 1
+        }
+        // buf_push_dec_u64(0) pushed one '0'; add 9 - digits more zeros then the number (replace the first '0')
+        rt.buf_set_len(buf, rt.buf_len(buf) - 1)
+        var pad: usize = 10 - digits
+        while pad > 0 {
+            rt.buf_push(buf, 48 as u8)
+            pad = pad - 1
+        }
+        rt.buf_push_dec_u64(buf, s as u64)
+        put(buf, " 00000 n \n")
+        k = k + 1
+    }
+    put(buf, "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n")
+    rt.buf_push_dec_u64(buf, xref as u64)
+    put(buf, "\n%%EOF\n")
+    return true
+}

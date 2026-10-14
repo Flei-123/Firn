@@ -1,0 +1,359 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/focus.fi -- photo.focus: focus stacking + focus step planning (FirnCam core).
+//
+//     var n: i32 = focus.plan_focus(&meta, 0.2f, 4.0f, 8, &steps[0])  // diopters, far -> near, from SensorMeta
+//     ... shoot one frame per step (every frame is a 3 channel linear/sRGB image, 0..1) ...
+//     var o: focus.FocusOpts = focus.focus_default()
+//     focus.focus_stack(&burst, &o, &out, &depth)     // burst = merge.Burst (gain ignored); out 3 ch, depth 1 ch
+//
+// ALIGNMENT: every frame is warped onto the reference frame (the middle one) with the dense tile flow of
+// photo.align on slightly blurred luma. Focus breathing (scale change of a few 0.1 %) and hand shake are no
+// special case: the per-tile translations ARE the scale / shift / local warp field. The search radius of the
+// pyramid covers several pixels of residual per level, so frames must overlap the way a hand held series does.
+// FUSION: Laplacian pyramid (Burt-Adelson). Per level and pixel every frame gets the weight
+// (E / E_ref)^power, E = Gaussian smoothed |band-pass luma| = local sharpness at that scale; band-pass
+// coefficients are averaged with those weights (soft maximum: no seams, noise of flat regions averages out
+// instead of being picked), the low-pass residual is the plain mean. `depth` = weight-averaged frame index at
+// the finest level (0 .. n-1): a coarse depth map for free (usable as the mask of photo.portrait.bokeh after a
+// threshold).
+// PLANNING: the depth of field in diopters is 2 * N * c / f^2 (c = circle of confusion = sensor width / 1500);
+// steps are spaced 0.85 of it. Without lens fields in the metadata a generic step of 0.8 diopter is used.
+import std.rt
+import photo.image
+import photo.meta
+import photo.align
+import photo.filter
+import photo.merge
+
+export {
+    FocusOpts, focus_default, plan_focus, focus_stack,
+}
+
+const MAXLEV: i32 = 5
+
+struct FocusOpts {
+    ref_idx: i32,
+    power: f32,
+    energy_sigma: f32,
+    align_blur: f32,
+}
+
+fn focus_default() -> FocusOpts {
+    return FocusOpts { ref_idx: -1, power: 4.0f, energy_sigma: 1.5f, align_blur: 1.2f }
+}
+
+// Diopter steps from far_d to near_d (ascending diopters), at most max_n (<= 16). Returns the count.
+fn plan_focus(m: *mut meta.SensorMeta, far_d: f32, near_d: f32, max_n: i32, out: *mut f32) -> i32 {
+    var near: f32 = near_d
+    var far: f32 = far_d
+    if (*m).has_focus {
+        if (*m).min_focus_distance > 0.0f && near > (*m).min_focus_distance { near = (*m).min_focus_distance }
+        if (*m).hyperfocal_distance > 0.0f && far < (*m).hyperfocal_distance { far = (*m).hyperfocal_distance }
+    }
+    if far > near { far = near }
+    var step: f32 = 0.8f
+    if (*m).focal_length > 0.0f && (*m).aperture > 0.0f && (*m).sensor_width > 0.0f {
+        let f: f32 = (*m).focal_length * 0.001f
+        let c: f32 = (*m).sensor_width * 0.001f / 1500.0f
+        step = 0.85f * 2.0f * (*m).aperture * c / (f * f)
+    }
+    var cap: i32 = max_n
+    if cap > 16 { cap = 16 }
+    var n: i32 = (((near - far) / step) + 0.999f) as i32 + 1
+    if n < 1 { n = 1 }
+    if n > cap { n = cap }
+    var i: i32 = 0
+    while i < n {
+        var d: f32 = near
+        if n > 1 { d = far + (near - far) * (i as f32) / ((n - 1) as f32) }
+        *((out as u64 + (i as u64) * (4 as u64)) as *mut f32) = d
+        i = i + 1
+    }
+    return n
+}
+
+struct Lap {
+    n: i32,
+    l: [image.Image; 5],
+}
+
+fn lap_free(p: *mut Lap) {
+    var i: i32 = 0
+    while i < (*p).n {
+        image.img_free(&(*p).l[i as usize])
+        i = i + 1
+    }
+    (*p).n = 0
+}
+
+fn zero_im() -> image.Image {
+    return image.Image { w: 0, h: 0, ch: 0, px: 0 as u64 }
+}
+
+// blur (sigma 1) + 2x subsample of a 3 channel image
+fn down3(src: *mut image.Image) -> image.Image {
+    let w: i32 = ((*src).w + 1) / 2
+    let h: i32 = ((*src).h + 1) / 2
+    var d: image.Image = image.img_new(w, h, 3)
+    var c: i32 = 0
+    while c < 3 {
+        var pl: image.Image = filter.plane_of(src, c)
+        var bl: image.Image = filter.gauss_blur(&pl, 1.0f)
+        var y: i32 = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                image.img_set(&d, c, x, y, image.img_getc(&bl, 0, 2 * x, 2 * y))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        image.img_free(&pl)
+        image.img_free(&bl)
+        c = c + 1
+    }
+    return d
+}
+
+fn up_sample(src: *mut image.Image, c: i32, x: i32, y: i32) -> f32 {
+    return image.img_sample(src, c, ((x as f32) + 0.5f) * 0.5f - 0.5f, ((y as f32) + 0.5f) * 0.5f - 0.5f)
+}
+
+// Laplacian pyramid: l[0..n-2] band-pass, l[n-1] the low-pass residual.
+fn lap_build(im: *mut image.Image, levels: i32) -> Lap {
+    var g: [image.Image; 5] = [zero_im(); 5]
+    g[0] = image.img_copy(im)
+    var n: i32 = 1
+    while n < levels {
+        g[n as usize] = down3(&g[(n - 1) as usize])
+        n = n + 1
+    }
+    var p: Lap = Lap { n: n, l: [zero_im(); 5] }
+    var k: i32 = 0
+    while k < n - 1 {
+        let a: *mut image.Image = &g[k as usize]
+        var d: image.Image = image.img_new((*a).w, (*a).h, 3)
+        var c: i32 = 0
+        while c < 3 {
+            var y: i32 = 0
+            while y < (*a).h {
+                var x: i32 = 0
+                while x < (*a).w {
+                    image.img_set(&d, c, x, y, image.img_get(a, c, x, y) - up_sample(&g[(k + 1) as usize], c, x, y))
+                    x = x + 1
+                }
+                y = y + 1
+            }
+            c = c + 1
+        }
+        p.l[k as usize] = d
+        k = k + 1
+    }
+    p.l[(n - 1) as usize] = g[(n - 1) as usize]
+    k = 0
+    while k < n - 1 {
+        image.img_free(&g[k as usize])
+        k = k + 1
+    }
+    return p
+}
+
+// Gaussian smoothed |luma| of a band-pass level, as sharpness energy.
+fn energy_of(band: *mut image.Image, sigma: f32) -> image.Image {
+    var e: image.Image = image.img_new((*band).w, (*band).h, 1)
+    var y: i32 = 0
+    while y < (*band).h {
+        var x: i32 = 0
+        while x < (*band).w {
+            let l: f32 = 0.299f * image.img_get(band, 0, x, y) + 0.587f * image.img_get(band, 1, x, y) + 0.114f * image.img_get(band, 2, x, y)
+            image.img_set(&e, 0, x, y, image.fmaxf(l, 0.0f - l))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let s: image.Image = filter.gauss_blur(&e, sigma)
+    image.img_free(&e)
+    return s
+}
+
+fn warp_to_ref(af: *mut image.Image, fl: *mut align.Flow) -> image.Image {
+    var d: image.Image = image.img_new((*af).w, (*af).h, 3)
+    var y: i32 = 0
+    while y < (*af).h {
+        var x: i32 = 0
+        while x < (*af).w {
+            var dx: f32 = 0.0f
+            var dy: f32 = 0.0f
+            align.flow_at(fl, x as f32, y as f32, &dx, &dy)
+            var c: i32 = 0
+            while c < 3 {
+                image.img_set(&d, c, x, y, image.img_sample(af, c, (x as f32) + dx, (y as f32) + dy))
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return d
+}
+
+// One level of the reconstruction: weighted band-pass sum / weight (+ the upsampled coarser result).
+fn recon_level(a: *mut image.Image, ws: *mut image.Image, prev: *mut image.Image, has_prev: bool) -> image.Image {
+    var nxt: image.Image = image.img_new((*a).w, (*a).h, 3)
+    var y: i32 = 0
+    while y < (*a).h {
+        var x: i32 = 0
+        while x < (*a).w {
+            let wv: f32 = image.img_get(ws, 0, x, y)
+            var c: i32 = 0
+            while c < 3 {
+                var v: f32 = image.img_get(a, c, x, y) / wv
+                if has_prev { v = v + up_sample(prev, c, x, y) }
+                image.img_set(&nxt, c, x, y, v)
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return nxt
+}
+
+// Add the Laplacian pyramid `lp` of frame `i` to the weighted accumulators.
+fn accumulate_frame(lp: *mut Lap, i: i32, levels: i32, o: *mut FocusOpts, acc: *mut Lap, wsum: *mut Lap, dnum: *mut image.Image) {
+    var k: i32 = 0
+    while k < levels {
+        let band: *mut image.Image = &(*lp).l[k as usize]
+        let bw: i32 = (*band).w
+        let bh: i32 = (*band).h
+        if i == 0 {
+            (*acc).l[k as usize] = image.img_new(bw, bh, 3)
+            (*wsum).l[k as usize] = image.img_new(bw, bh, 1)
+            image.img_fill(&(*acc).l[k as usize], 0.0f)
+            image.img_fill(&(*wsum).l[k as usize], 0.0f)
+        }
+        if k < levels - 1 {
+            var e: image.Image = energy_of(band, (*o).energy_sigma)
+            var y: i32 = 0
+            while y < bh {
+                var x: i32 = 0
+                while x < bw {
+                    let ev: f32 = image.img_get(&e, 0, x, y) * 30.0f + 1.0e-4f
+                    var wt: f32 = ev * ev
+                    if (*o).power > 3.0f { wt = wt * wt }
+                    var c: i32 = 0
+                    while c < 3 {
+                        image.img_set(&(*acc).l[k as usize], c, x, y, image.img_get(&(*acc).l[k as usize], c, x, y) + wt * image.img_get(band, c, x, y))
+                        c = c + 1
+                    }
+                    image.img_set(&(*wsum).l[k as usize], 0, x, y, image.img_get(&(*wsum).l[k as usize], 0, x, y) + wt)
+                    if k == 0 {
+                        image.img_set(dnum, 0, x, y, image.img_get(dnum, 0, x, y) + wt * (i as f32))
+                    }
+                    x = x + 1
+                }
+                y = y + 1
+            }
+            image.img_free(&e)
+        } else {
+            var y: i32 = 0
+            while y < bh {
+                var x: i32 = 0
+                while x < bw {
+                    var c: i32 = 0
+                    while c < 3 {
+                        image.img_set(&(*acc).l[k as usize], c, x, y, image.img_get(&(*acc).l[k as usize], c, x, y) + image.img_get(band, c, x, y))
+                        c = c + 1
+                    }
+                    image.img_set(&(*wsum).l[k as usize], 0, x, y, image.img_get(&(*wsum).l[k as usize], 0, x, y) + 1.0f)
+                    x = x + 1
+                }
+                y = y + 1
+            }
+        }
+        k = k + 1
+    }
+}
+
+// Pyramid depth: halve until the smaller side would drop below 32 pixels (at most MAXLEV levels).
+fn pyr_levels(w: i32, h: i32) -> i32 {
+    var lv: i32 = 1
+    var m: i32 = w
+    if h < m { m = h }
+    while lv < MAXLEV {
+        if m < 32 { break }
+        m = (m + 1) / 2
+        lv = lv + 1
+    }
+    return lv
+}
+
+fn focus_stack(b: *mut merge.Burst, o: *mut FocusOpts, out: *mut image.Image, depth: *mut image.Image) {
+    let n: i32 = (*b).n
+    var r: i32 = (*o).ref_idx
+    if r < 0 || r >= n { r = n / 2 }
+    let w: i32 = (*b).frames[r as usize].w
+    let h: i32 = (*b).frames[r as usize].h
+    let levels: i32 = pyr_levels(w, h)
+    var lr: image.Image = image.img_luma(&(*b).frames[r as usize])
+    if (*o).align_blur > 0.0f {
+        let lb: image.Image = filter.gauss_blur(&lr, (*o).align_blur)
+        image.img_free(&lr)
+        lr = lb
+    }
+    var pr: align.Pyr = align.pyr_build(&lr)
+    image.img_free(&lr)
+    var acc: Lap = Lap { n: levels, l: [zero_im(); 5] }
+    var wsum: Lap = Lap { n: levels, l: [zero_im(); 5] }
+    var dnum: image.Image = image.img_new(w, h, 1)
+    image.img_fill(&dnum, 0.0f)
+    var i: i32 = 0
+    while i < n {
+        var wf: image.Image = image.img_copy(&(*b).frames[i as usize])
+        if i != r {
+            var la: image.Image = image.img_luma(&(*b).frames[i as usize])
+            if (*o).align_blur > 0.0f {
+                let lb: image.Image = filter.gauss_blur(&la, (*o).align_blur)
+                image.img_free(&la)
+                la = lb
+            }
+            var pa: align.Pyr = align.pyr_build(&la)
+            image.img_free(&la)
+            var fl: align.Flow = align.align_flow(&pr, &pa)
+            align.pyr_free(&pa)
+            image.img_free(&wf)
+            wf = warp_to_ref(&(*b).frames[i as usize], &fl)
+            align.flow_free(&fl)
+        }
+        var lp: Lap = lap_build(&wf, levels)
+        image.img_free(&wf)
+        accumulate_frame(&lp, i, levels, o, &acc, &wsum, &dnum)
+        lap_free(&lp)
+        i = i + 1
+    }
+    align.pyr_free(&pr)
+    // normalise and reconstruct from the coarsest level (the result lives in *out while it is built)
+    *out = zero_im()
+    var lv: i32 = levels - 1
+    while lv >= 0 {
+        var has_prev: bool = false
+        if lv < levels - 1 { has_prev = true }
+        var nxt: image.Image = recon_level(&acc.l[lv as usize], &wsum.l[lv as usize], out, has_prev)
+        if has_prev { image.img_free(out) }
+        *out = nxt
+        lv = lv - 1
+    }
+    *depth = image.img_new(w, h, 1)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            image.img_set(depth, 0, x, y, image.img_get(&dnum, 0, x, y) / image.img_get(&wsum.l[0], 0, x, y))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image.img_free(&dnum)
+    lap_free(&acc)
+    lap_free(&wsum)
+}

@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/night.fi -- photo.night: night mode (FirnCam core).
+//
+//     var o: night.NightOpts = night.night_default()
+//     night.night_process(&burst, &meta, &o, &out)     // 8..24 dark frames of the SAME exposure (gain 1)
+//     night.night_single(&frame, &meta, &o, &out)      // same lift + chain on ONE frame (baseline / fallback)
+//
+// Differences to photo.pipeline.process_burst: (1) alignment runs on blurred luma (the tile search must not lock
+// onto noise), (2) the temporal filter is more tolerant (thr / soft larger: with high noise the per-pixel
+// difference statistic is itself noisy), (3) the reference is the frame with the best BLURRED sharpness
+// (plain Laplacian variance would pick the noisiest frame), (4) after the merge the exposure is lifted to a
+// target mean (the variance plane is scaled with the square; `fixed_lift` > 0 overrides the automatic factor), (5) spatial denoise is stronger. The noise model comes from the
+// metadata, else it is measured. No sensor constant is built in.
+import std.rt
+import photo.image
+import photo.meta
+import photo.noise
+import photo.merge
+import photo.filter
+import photo.pipeline
+
+export {
+    NightOpts, night_default, night_process, night_single, night_pick_ref,
+}
+
+struct NightOpts {
+    target: f32,
+    max_lift: f32,
+    denoise: f32,
+    thr: f32,
+    soft: f32,
+    align_blur: f32,
+    ref_idx: i32,
+    fixed_lift: f32,
+    pipe: pipeline.PipeOpts,
+}
+
+fn night_default() -> NightOpts {
+    var p: pipeline.PipeOpts = pipeline.opts_default()
+    p.denoise = 1.5f
+    p.keep = 0.06f
+    p.tone = 1.2f
+    return NightOpts { target: 0.10f, max_lift: 16.0f, denoise: 1.5f, thr: 2.5f, soft: 2.5f, align_blur: 1.6f, ref_idx: -1, fixed_lift: 0.0f, pipe: p }
+}
+
+// Sharpest frame after a Gaussian blur of the luma (noise does not count as sharpness).
+fn night_pick_ref(b: *mut merge.Burst, blur: f32) -> i32 {
+    var best: i32 = 0
+    var bs: f32 = -1.0f
+    var i: i32 = 0
+    while i < (*b).n {
+        var l: image.Image = image.img_luma(&(*b).frames[i as usize])
+        var g: image.Image = filter.gauss_blur(&l, blur)
+        let s: f32 = image.sharpness(&g, 0)
+        image.img_free(&l)
+        image.img_free(&g)
+        if s > bs {
+            bs = s
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn lift_of(lin: *mut image.Image, o: *mut NightOpts) -> f32 {
+    if (*o).fixed_lift > 0.0f { return (*o).fixed_lift }
+    var g: f32 = image.img_mean(lin, 1)
+    if g < 1.0e-5f { g = 1.0e-5f }
+    return image.fclampf((*o).target / g, 1.0f, (*o).max_lift)
+}
+
+fn scale_planes(lin: *mut image.Image, vp: *mut image.Image, k: f32) {
+    var i: i32 = 0
+    let n: i32 = (*lin).w * (*lin).h * (*lin).ch
+    while i < n {
+        let p: *mut f32 = ((*lin).px + (i as u64) * (4 as u64)) as *mut f32
+        *p = *p * k
+        i = i + 1
+    }
+    i = 0
+    let m: i32 = (*vp).w * (*vp).h
+    while i < m {
+        let p: *mut f32 = ((*vp).px + (i as u64) * (4 as u64)) as *mut f32
+        *p = *p * k * k
+        i = i + 1
+    }
+}
+
+fn night_process(b: *mut merge.Burst, m: *mut meta.SensorMeta, o: *mut NightOpts, out: *mut image.Image) {
+    var r: i32 = (*o).ref_idx
+    if r < 0 || r >= (*b).n { r = night_pick_ref(b, (*o).align_blur) }
+    var nm: noise.NoiseModel = noise.from_meta(m)
+    if !(*m).has_noise {
+        nm = noise.estimate_model(&(*b).frames[r as usize])
+    }
+    var mo: merge.MergeOpts = merge.MergeOpts { thr: (*o).thr, soft: (*o).soft, align_blur: (*o).align_blur }
+    var lin: image.Image = image.img_new(1, 1, 3)
+    var vp: image.Image = image.img_new(1, 1, 1)
+    var ws: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&lin)
+    image.img_free(&vp)
+    image.img_free(&ws)
+    merge.merge_burst_opts(b, r, &nm, &mo, &lin, &vp, &ws)
+    image.img_free(&ws)
+    scale_planes(&lin, &vp, lift_of(&lin, o))
+    var p: pipeline.PipeOpts = (*o).pipe
+    p.denoise = (*o).denoise
+    pipeline.finish_chain(&lin, &vp, m, &p, out)
+    image.img_free(&lin)
+    image.img_free(&vp)
+}
+
+fn night_single(im: *mut image.Image, m: *mut meta.SensorMeta, o: *mut NightOpts, out: *mut image.Image) {
+    var nm: noise.NoiseModel = noise.from_meta(m)
+    if !(*m).has_noise {
+        nm = noise.estimate_model(im)
+    }
+    var lin: image.Image = image.img_copy(im)
+    var vp: image.Image = image.img_new((*im).w, (*im).h, 1)
+    var y: i32 = 0
+    while y < (*im).h {
+        var x: i32 = 0
+        while x < (*im).w {
+            image.img_set(&vp, 0, x, y, noise.variance(&nm, 1, image.img_get(im, 1, x, y)))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    scale_planes(&lin, &vp, lift_of(&lin, o))
+    var p: pipeline.PipeOpts = (*o).pipe
+    p.denoise = (*o).denoise
+    pipeline.finish_chain(&lin, &vp, m, &p, out)
+    image.img_free(&lin)
+    image.img_free(&vp)
+}
