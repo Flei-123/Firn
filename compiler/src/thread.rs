@@ -454,5 +454,14 @@ mod win_tests {
             let want = format!("const {}: u64 = {}\n", name, v);
             assert!(gc.contains(&want), "gc.fi does not say `{}`", want.trim());
         }
+        // The aarch64 `.so` finds its thread block by stack range (codegen_a64.rs, SHARED_TP_BASE).
+        for (name, v) in [
+            ("FT_LO", crate::codegen_a64::TCB_LO as u64),
+            ("FT_BOTTOM", crate::codegen_a64::TCB_BOTTOM as u64),
+            ("FT_BYTES", 1u64 << crate::codegen_a64::TCB_BYTES_LOG2),
+        ] {
+            let want = format!("const {}: u64 = {}\n", name, v);
+            assert!(gc.contains(&want), "gc.fi does not say `{}`", want.trim());
+        }
     }
 }

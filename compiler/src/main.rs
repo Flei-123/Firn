@@ -1425,11 +1425,11 @@ fn link_shared(obj: &Path, so: &Path) -> Result<(), i32> {
 /// `--shared --target=x86_64-windows`: a PE DLL. Exports = the Win64 thunks `win.rs` wrote under the
 /// bare `#[export_c]` names, listed in a `.def` file. Entry = `win::DLL_ENTRY`.
 fn link_dll(obj: &Path, dll: &Path, names: &[String]) -> Result<(), i32> {
-    for (_, c_name, argc, float) in extfn::export_thunk_info() {
-        if float || argc > 6 {
+    for (_, c_name, _, unsupported) in extfn::export_thunk_info() {
+        if unsupported {
             eprintln!(
-                "error: --shared (Windows DLL): '{}' has float/vector parameters or more than 6 arguments; \
-                 the Win64 entry thunk moves up to 6 integer/pointer arguments only",
+                "error: --shared (Windows DLL): '{}' has a v128 parameter; Win64 passes vectors by hidden pointer, \
+                 take a pointer instead",
                 c_name
             );
             return Err(2);

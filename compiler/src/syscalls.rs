@@ -80,6 +80,8 @@ pub enum A64 {
 
 /// `ARCH_SET_FS`, the only `arch_prctl` request that is translated.
 pub const ARCH_SET_FS: i64 = 0x1002;
+/// `ARCH_GET_FS`: read side of the same request, translated to `mrs x, tpidr_el0` (aarch64 only).
+pub const ARCH_GET_FS: i64 = 0x1003;
 /// `SIGCHLD` — the flag word that turns `clone` into `fork`.
 pub const SIGCHLD: i64 = 17;
 

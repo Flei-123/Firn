@@ -54,22 +54,35 @@ firnc --shared --target=aarch64-linux  [--header=f.h] -o libfoo.so foo.fi   # aa
 ```
 
 **Windows DLL.** Exports are Win64 entry thunks under the bare `#[export_c]` names (`win.rs::win64_thunk_asm`, the callback-thunk code the other
-way round: `rcx, rdx, r8, r9, stack` -> System V registers, shadow space, callee-saved xmm6-15 kept); the Firn function itself keeps its internal
-symbol. The export list is a temporary `.def`. Entry `__firn_dll_entry` (DllMain shape): on `DLL_PROCESS_ATTACH` it runs the seam init (standard
-handles) only, always returns TRUE. **There is no `_start`, so the collector does NOT start itself** (same as the Linux `.so`): a library that uses
-`gc` types exports an init that calls `gc_init()` (idempotent) and the host calls it once before any other export (`wd_init` in `tools/stack_e/lib_win.fi`).
-Threads and jobs work in a DLL (`tools/stack_e/lib_rt.fi`: heap_alloc, `jobs` with 0 and 3 workers, GC on 4 threads) because the Windows thread block
-lives in the TEB slot, not behind a host register. Limits (compile errors, not miscompiles): up to 6 integer / pointer arguments per export, no
-`f32` / `f64` / `v128` parameters. Return values: integer / pointer in `rax`. Not done: `thread_attach` from host threads of their own (only proven on the
-Linux x86-64 `.so`), floats / by-value structs in exports, a `.lib` import library (use `LoadLibrary` / `GetProcAddress`).
-Proof: gate 134 -> `tools/stack_e/run_g5.sh` (mingw host `host_win.c` under Wine, dev-fast + release-fast, plus the runtime probe, plus a float export
-that must be refused). **Wine only; a real Windows is untested.**
+way round); the Firn function itself keeps its internal symbol. The thunk reads the export's signature and re-places every argument for Firn's
+(System V) convention: Win64 numbers slots by POSITION (slot `i` = `rcx/rdx/r8/r9` for an integer / pointer, `xmm0-3` for `f32` / `f64`, from slot 4 on
+the caller's stack above the 32-octet shadow space), System V counts integers (`rdi rsi rdx rcx r8 r9`) and floats (`xmm0-7`) separately and puts the
+rest on the stack in order of writing. The thunk first parks the four register slots in their own shadow space (so no source is clobbered), loads the
+System V registers from there, copies the overflow to a fresh 16-aligned block and calls; callee-saved `rsi/rdi/xmm6-15` are kept. A float result is in
+`xmm0` in both conventions, an integer one in `rax`. So any number of `i8..i64 / u8..u64 / usize / bool / pointer / f32 / f64` parameters work.
+Entry `__firn_dll_entry` (DllMain shape): on `DLL_PROCESS_ATTACH` it runs the seam init (standard handles) only, always returns TRUE. **There is no
+`_start`, so the collector does NOT start itself** (same as the Linux `.so`): a library that uses `gc` types exports an init that calls `gc_init()`
+(idempotent) and the host calls it once before any other export (`wd_init` in `tools/stack_e/lib_win.fi`). Threads and jobs work in a DLL
+(`tools/stack_e/lib_rt.fi`: heap_alloc, `jobs` with 0 and 3 workers, GC on 4 threads) because the Windows thread block lives in the TEB slot, not behind
+a host register. Limits (compile errors, not miscompiles): no `v128` parameters (Win64 passes vectors by hidden pointer: take a pointer). Not done:
+`thread_attach` from host threads of their own (only proven on the Linux x86-64 `.so` and the aarch64 `.so`), by-value structs in exports, a `.lib`
+import library (use `LoadLibrary` / `GetProcAddress`).
+Proof: gate 134 -> `tools/stack_e/run_g5.sh` (mingw host `host_win.c` under Wine, dev-fast + release-fast, plus the runtime probe, plus
+`host_abi.c` against `lib_abi.fi`: `f64`/`f32` in every slot, 8 integers, 10 doubles, 14 mixed arguments, 9 integers with a float result; the same C host
+runs against the Linux x86-64 `.so` and the aarch64 `.so`, whose native conventions already carry floats and stack arguments). **Wine only; a real Windows
+is untested.**
 
-**aarch64 .so.** Same C ABI (AAPCS64 is already Firn's calling convention), no `_start`, symbols as in the x86-64 `.so` (version script). The one real
-difference is the thread register: Firn keeps the thread block pointer in `tpidr_el0`, which in a `.so` belongs to the HOST (glibc TLS: errno, stack
-protector, locale). In `--shared` builds the pointer lives in a private word of the library (`__firn_thread_ptr`) and **`thread_start` / `jobs` workers
-fail with `-ENOSYS`** (no second thread block can exist). So an aarch64 `.so` is single-threaded for the runtime: GC (stop-the-world with one thread), heap,
-statics, all work; `thread_attach` from several host threads is NOT supported. `__cpu_features()` reads the auxiliary vector that `_start` saves, which a
-`.so` never sees: NEON/crypto code that asks falls back to the baseline. Proof: `host_a64.c` (aarch64-linux-gnu-gcc, `-fstack-protector-all`, checks
-that the host's TLS and `errno` survive the calls) under `qemu-aarch64 -L /usr/aarch64-linux-gnu`, dev-fast + release-fast. **qemu only; a real aarch64
-machine is untested.**
+**aarch64 .so.** Same C ABI (AAPCS64 is already Firn's calling convention: floats in `d0-d7`, more than 8 per class on the stack), no `_start`, symbols
+as in the x86-64 `.so` (version script). The one real difference is the thread register: Firn keeps the thread block pointer in `tpidr_el0`, which in a
+`.so` belongs to the HOST (glibc TLS: errno, stack protector, locale). **Threads now work** with a register-free scheme (`codegen_a64.rs`,
+`SHARED_TP_BASE`): the library keeps two private words, `__firn_tp_base` (the first thread block registered through `arch_prctl(ARCH_SET_FS, p)`, i.e.
+entry 0 of the thread table = the main thread) and `__firn_tp_hi` (highest registered entry + 1, atomic max). `Op::ThreadSelf` scans entries 1..hi for the
+one whose stack range `[FT_LO, FT_BOTTOM)` holds `sp` (`FT_LO` at offset 272 is new in `gc.fi`: `thread_start` sets it to the stack mapping, an attached
+host thread to the base of its stack mapping from `/proc/self/maps`; both are cleared when the stack is released) and falls back to entry 0. So
+`thread_start`, `jobs` workers and `thread_attach` / `thread_host_detach` host threads work like on the x86-64 `.so`. Cost: `ThreadSelf` is a short loop
+(about 8 instructions per live thread) instead of one instruction. `thread_attach` ends the scanned stack range of a host thread at the host's thread pointer (`arch_prctl(ARCH_GET_FS)` = `mrs tpidr_el0`; a pthread keeps its control block above all frames), because the end of a `/proc/self/maps` line can include a neighbouring mapping that later disappears (found by a ~40 % segfault of `host_attach` under qemu). Limits: a host thread that never called `thread_attach` is taken for the main thread
+(the x86-64 `.so` crashes on it instead); code running on a swapped coroutine stack on a non-main thread is not found by its range and falls back to the
+main thread's block; `__cpu_features()` reads the auxiliary vector that `_start` saves, which a `.so` never sees: NEON/crypto code that asks falls back
+to the baseline. Proof: `host_a64.c` (aarch64-linux-gnu-gcc, `-fstack-protector-all`, checks that the host's TLS and `errno` survive the calls), and the
+same `host_rt.c` / `host_attach.c` as the x86-64 gate (Firn threads, jobs with 0/3 workers, GC on 4 threads, 4 attached pthreads in two waves) under
+`qemu-aarch64 -L /usr/aarch64-linux-gnu`, dev-fast + release-fast. **qemu only; a real aarch64 machine is untested.**

@@ -184,11 +184,13 @@ pub fn export_names() -> Vec<String> {
 }
 
 /// Windows DLL (`--shared --target=x86_64-windows`): one Win64 entry thunk per
-/// `#[export_c]` function. `(internal name, C name, argument count, has a float
-/// or non-scalar-by-value parameter)`. The thunk moves `rcx, rdx, r8, r9, stack` to
-/// the System V registers Firn code uses; floats would need a different move, so
-/// the caller rejects them with a clear error.
-pub fn export_thunk_info() -> Vec<(String, String, usize, bool)> {
+/// `#[export_c]` function. `(internal name, C name, parameter classes, unsupported)`.
+/// The classes are `b'i'` (integer / pointer / bool), `b'f'` (`f32`) and `b'd'` (`f64`);
+/// the thunk moves `rcx/rdx/r8/r9 | xmm0-3 | stack` to the System V placement Firn
+/// code uses (integers `rdi..r9`, floats `xmm0-7`, the rest on the stack). `unsupported`
+/// is set for `v128` parameters (Win64 passes those by hidden pointer): the caller
+/// rejects them with a clear error.
+pub fn export_thunk_info() -> Vec<(String, String, Vec<u8>, bool)> {
     let exported: Vec<(String, String)> =
         EXPORTED.with(|e| e.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect());
     SIGS.with(|v| {
@@ -196,15 +198,21 @@ pub fn export_thunk_info() -> Vec<(String, String, usize, bool)> {
             .iter()
             .filter_map(|sig| {
                 let internal = exported.iter().find(|(_, c)| *c == sig.c_name).map(|(k, _)| k.clone())?;
-                let mut float = false;
+                let mut unsupported = false;
+                let mut kinds: Vec<u8> = Vec::new();
                 for (_, ty, _) in &sig.params {
+                    let mut k = b'i';
                     if let TypeExpr::Named(n, _) = ty {
-                        if matches!(n.as_str(), "f32" | "f64" | "v128") {
-                            float = true;
+                        match n.as_str() {
+                            "f32" => k = b'f',
+                            "f64" => k = b'd',
+                            "v128" => unsupported = true,
+                            _ => {}
                         }
                     }
+                    kinds.push(k);
                 }
-                Some((internal, sig.c_name.clone(), sig.params.len(), float))
+                Some((internal, sig.c_name.clone(), kinds, unsupported))
             })
             .collect()
     })

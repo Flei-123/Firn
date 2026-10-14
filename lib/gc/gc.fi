@@ -757,6 +757,16 @@ fn __gc_hex_digit(c: u8) -> i64 {
 }
 
 fn __gc_stack_bottom_maps(sp: u64) -> u64 {
+    return __gc_stack_range_maps(sp, false)
+}
+
+// The LOW end of the mapping `sp` lies in (0 = not found). Used by `thread_attach` (aarch64 `.so`: the
+// thread block is found by stack range, see FT_LO).
+fn __gc_stack_lo_maps(sp: u64) -> u64 {
+    return __gc_stack_range_maps(sp, true)
+}
+
+fn __gc_stack_range_maps(sp: u64, want_lo: bool) -> u64 {
     var path: [u8; 16] = "/proc/self/maps\0"
     let cap: u64 = 262144
     let buffer: u64 = __gc_mmap(cap)
@@ -819,6 +829,9 @@ fn __gc_stack_bottom_maps(sp: u64) -> u64 {
             }
             if st2 > 0 && sp >= of && sp < to {
                 hit = to
+                if want_lo {
+                    hit = of
+                }
             }
         }
         // Skip the rest of the line.
@@ -4184,6 +4197,7 @@ const SYS_ARCH_PRCTL: i64 = 158
 const SYS_FUTEX: i64 = 202
 const SYS_NANOSLEEP: i64 = 35
 const ARCH_SET_FS: i64 = 4098
+const ARCH_GET_FS: i64 = 4099
 // FUTEX_WAIT/FUTEX_WAKE, each with FUTEX_PRIVATE_FLAG (128): the futex
 // belongs to this process only, and the kernel saves itself the mapping onto
 // a global key object.
@@ -4222,6 +4236,11 @@ const FT_ERR: u64 = 256
 // 1 = a HOST thread (a pthread of the program that loaded the shared object) registered by
 // `thread_attach`: it has no stack of ours and its end is `thread_host_detach`, not `__thread_entry`.
 const FT_HOST: u64 = 264
+// Low end of the stack this thread runs on (a Firn thread: the mapping base; an attached host thread: the base of
+// its stack mapping; the main thread and free entries: 0). The aarch64 `.so` has no thread register to spare
+// (`tpidr_el0` is the host's), so `Op::ThreadSelf` finds the calling thread's block by testing `sp` against
+// [FT_LO, FT_BOTTOM) of the entries (compiler/src/codegen_a64.rs). Cleared when the stack is released.
+const FT_LO: u64 = 272
 const FT_BYTES: u64 = 512
 
 // The number of entries of the thread table (the main thread holds entry 0,
@@ -4595,6 +4614,7 @@ fn __gc_threads_scan() {
 fn __thread_slot_free(tcb: u64) {
     let sp: u64 = __gc_ld64(tcb + FT_STACK)
     let n: u64 = __gc_ld64(tcb + FT_STAPELN)
+    __gc_st64(tcb + FT_LO, 0)
     __gc_st64(tcb + FT_STACK, 0)
     __gc_st64(tcb + FT_SP, 0)
     __gc_st64(tcb + FT_BOTTOM, 0)
@@ -4719,6 +4739,7 @@ fn thread_start(kind: u64, arg: u64) -> u64 {
     syscall(GC_SYS_MPROTECT, sp as i64, 4096, 0, 0, 0, 0)
     __gc_st64(tcb + FT_SELF, tcb)
     __gc_st64(tcb + FT_STACK, sp)
+    __gc_st64(tcb + FT_LO, sp)
     __gc_st64(tcb + FT_STAPELN, n)
     __gc_st64(tcb + FT_BOTTOM, sp + n)
     __gc_st64(tcb + FT_SP, sp + n)
@@ -4827,6 +4848,15 @@ fn thread_attach() -> bool {
         __thread_unlock(st + S_TSPERRE)
         return false
     }
+    // The end of a /proc/self/maps line is not always the end of THIS stack: a neighbouring mapping with the same
+    // permissions (a thread stack that is being set up, a heap chunk) is listed as one line, and when it goes away
+    // again the collector would read unmapped memory. A pthread keeps its thread control block (the host's thread
+    // pointer) at the very top of its stack mapping, above every frame: the frames end there.
+    var htp: u64 = 0
+    syscall(SYS_ARCH_PRCTL, ARCH_GET_FS, (&htp) as u64 as i64, 0, 0, 0, 0)
+    if htp > sp && htp < bottom {
+        bottom = htp
+    }
     let tcb: u64 = __thread_slot_new(st)
     if tcb == 0 {
         __thread_unlock(st + S_TSPERRE)
@@ -4834,6 +4864,7 @@ fn thread_attach() -> bool {
     }
     __gc_st64(tcb + FT_SELF, tcb)
     __gc_st64(tcb + FT_STACK, 0)
+    __gc_st64(tcb + FT_LO, __gc_stack_lo_maps(sp))
     __gc_st64(tcb + FT_STAPELN, 0)
     __gc_st64(tcb + FT_BOTTOM, bottom)
     __gc_st64(tcb + FT_SP, sp)
@@ -4897,6 +4928,7 @@ fn thread_host_detach() -> bool {
     __thread_lists_back(tcb)
     __gc_st64(tcb + FT_RES, 0)
     __gc_st64(tcb + FT_HOST, 0)
+    __gc_st64(tcb + FT_LO, 0)
     __gc_st64(tcb + FT_TID, 0)
     __gc_st64(tcb + FT_DETACH, 1)
     syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, 0, 0, 0, 0, 0)

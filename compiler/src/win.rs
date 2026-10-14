@@ -735,11 +735,12 @@ fn thunk_asm(name: &str, argc: u32) -> String {
 /// of `xmm` room keep it 0 -- which is exactly what System V wants at a
 /// `call`.
 fn cb_thunk_asm(sym: &str, argc: u32) -> String {
-    win64_thunk_asm(&cb_thunk(sym), sym, argc)
+    win64_thunk_asm(&cb_thunk(sym), sym, &vec![b'i'; argc as usize])
 }
 
 /// Win64 entry `t` -> System V function `sym` (see `cb_thunk_asm`).
-fn win64_thunk_asm(t: &str, sym: &str, argc: u32) -> String {
+fn win64_thunk_asm(t: &str, sym: &str, kinds: &[u8]) -> String {
+    let argc = kinds.len();
     let mut s = String::new();
     s.push_str(&format!("\n.globl {}\n{}:\n", t, t));
     s.push_str(&format!(
@@ -752,32 +753,60 @@ fn win64_thunk_asm(t: &str, sym: &str, argc: u32) -> String {
     for k in 0..10u32 {
         s.push_str(&format!("    movaps [rsp+{}], xmm{}\n", k * 16, k + 6));
     }
-    // The order destroys nothing: rcx and rdx are read before they are
-    // written, r8 is parked in r10 (scratch in both conventions).
-    if argc >= 3 {
-        s.push_str("    mov r10, r8\n");
+    // Win64 numbers argument slots by POSITION: slot i is rcx/rdx/r8/r9 (integer class) or
+    // xmm0-3 (float class) for i < 4, else the caller's stack at [rbp+16+8*i] (return address
+    // at [rbp+8], the 32-octet shadow space above it). Park the four register slots in their
+    // own shadow space first: after that every argument sits in memory at [rbp+16+8*i] and
+    // the System V placement below can load them in any order without clobbering a source.
+    for (i, k) in kinds.iter().enumerate().take(4) {
+        let home = 16 + 8 * i;
+        let win_int = ["rcx", "rdx", "r8", "r9"];
+        match k {
+            b'f' => s.push_str(&format!("    movss dword ptr [rbp+{}], xmm{}\n", home, i)),
+            b'd' => s.push_str(&format!("    movsd qword ptr [rbp+{}], xmm{}\n", home, i)),
+            _ => s.push_str(&format!("    mov qword ptr [rbp+{}], {}\n", home, win_int[i])),
+        }
     }
-    if argc >= 1 {
-        s.push_str("    mov rdi, rcx\n");
+    // System V placement (what Firn code expects, `codegen_x86::place_args`): integers in
+    // rdi rsi rdx rcx r8 r9, floats in xmm0-7, whatever finds no register of its class on the
+    // stack in order of writing.
+    let sysv_int = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+    let (mut ni, mut nx) = (0usize, 0usize);
+    let mut stack_args: Vec<usize> = Vec::new();
+    let mut loads: Vec<String> = Vec::new();
+    for (i, k) in kinds.iter().enumerate() {
+        let src = 16 + 8 * i;
+        match k {
+            b'f' | b'd' if nx < 8 => {
+                let op = if *k == b'f' { "movss" } else { "movsd" };
+                let w = if *k == b'f' { "dword" } else { "qword" };
+                loads.push(format!("    {} xmm{}, {} ptr [rbp+{}]\n", op, nx, w, src));
+                nx += 1;
+            }
+            b'f' | b'd' => stack_args.push(src),
+            _ if ni < 6 => {
+                loads.push(format!("    mov {}, qword ptr [rbp+{}]\n", sysv_int[ni], src));
+                ni += 1;
+            }
+            _ => stack_args.push(src),
+        }
     }
-    if argc >= 4 {
-        s.push_str("    mov rcx, r9\n");
+    // The stack block keeps the 16-octet alignment the call needs.
+    let stack_room = (stack_args.len() * 8 + 15) / 16 * 16;
+    if stack_room > 0 {
+        s.push_str(&format!("    sub rsp, {}\n", stack_room));
+        for (j, src) in stack_args.iter().enumerate() {
+            s.push_str(&format!("    mov rax, qword ptr [rbp+{}]\n    mov qword ptr [rsp+{}], rax\n", src, j * 8));
+        }
     }
-    if argc >= 2 {
-        s.push_str("    mov rsi, rdx\n");
-    }
-    if argc >= 3 {
-        s.push_str("    mov rdx, r10\n");
-    }
-    // Arguments five and six come off the caller's frame: the return
-    // address is at [rbp+8], the shadow space at [rbp+16..47].
-    if argc >= 5 {
-        s.push_str("    mov r8, qword ptr [rbp+48]\n");
-    }
-    if argc >= 6 {
-        s.push_str("    mov r9, qword ptr [rbp+56]\n");
+    for l in &loads {
+        s.push_str(l);
     }
     s.push_str(&format!("    call {}\n", sym));
+    if stack_room > 0 {
+        s.push_str(&format!("    add rsp, {}\n", stack_room));
+    }
+    // A float result is in xmm0 in both conventions, an integer one in rax.
     for k in 0..10u32 {
         s.push_str(&format!("    movaps xmm{}, [rsp+{}]\n", k + 6, k * 16));
     }
@@ -1027,9 +1056,9 @@ pub fn runtime_asm() -> String {
         s.push_str(&cb_thunk_asm(sym, *argc));
     }
     if crate::target::shared() {
-        for (internal, c_name, argc, _) in crate::extfn::export_thunk_info() {
+        for (internal, c_name, kinds, _) in crate::extfn::export_thunk_info() {
             let target = crate::codegen_x86::label(&internal);
-            s.push_str(&win64_thunk_asm(&c_name, &target, argc as u32));
+            s.push_str(&win64_thunk_asm(&c_name, &target, &kinds));
         }
     }
     if probed() {
@@ -1179,5 +1208,36 @@ mod tests {
         }
         assert_eq!(known("CreateThread"), Some(("KERNEL32.dll", 6)));
         assert_eq!(known("WaitOnAddress").map(|k| k.1), Some(4));
+    }
+
+    #[test]
+    fn the_export_thunk_places_floats_and_stack_arguments_for_system_v() {
+        // (i32, f64, i64, f32, then 9 integers): Win64 slots 0..3 are parked in the shadow space,
+        // the f64 (slot 1) goes to xmm0, the f32 (slot 3) to xmm1, slots 0 and 2 to rdi / rsi.
+        let mut kinds = vec![b'i', b'd', b'i', b'f'];
+        kinds.extend(std::iter::repeat(b'i').take(9));
+        let a = win64_thunk_asm("t", "sym", &kinds);
+        assert!(a.contains("mov qword ptr [rbp+16], rcx"), "{}", a);
+        assert!(a.contains("movsd qword ptr [rbp+24], xmm1"), "{}", a);
+        assert!(a.contains("mov qword ptr [rbp+32], r8"), "{}", a);
+        assert!(a.contains("movss dword ptr [rbp+40], xmm3"), "{}", a);
+        assert!(a.contains("movsd xmm0, qword ptr [rbp+24]"), "{}", a);
+        assert!(a.contains("movss xmm1, dword ptr [rbp+40]"), "{}", a);
+        assert!(a.contains("mov rdi, qword ptr [rbp+16]"), "{}", a);
+        assert!(a.contains("mov rsi, qword ptr [rbp+32]"), "{}", a);
+        // 11 integers in total, 6 in registers: 5 go to the stack -> 40 octets, 48 with alignment
+        assert!(a.contains("sub rsp, 48"), "{}", a);
+        assert!(a.contains("add rsp, 48"), "{}", a);
+        // the last stack word is argument position 12: [rbp+16+8*12]
+        assert!(a.contains("mov rax, qword ptr [rbp+112]"), "{}", a);
+    }
+
+    #[test]
+    fn a_thunk_with_register_only_arguments_needs_no_stack_block() {
+        let a = win64_thunk_asm("t", "sym", &[b'd', b'd', b'i']);
+        assert!(!a.contains("sub rsp, 16\n"), "{}", a);
+        assert!(a.contains("movsd xmm0, qword ptr [rbp+16]"), "{}", a);
+        assert!(a.contains("movsd xmm1, qword ptr [rbp+24]"), "{}", a);
+        assert!(a.contains("mov rdi, qword ptr [rbp+32]"), "{}", a);
     }
 }
