@@ -37,6 +37,17 @@ def have_of(paths):
     return have
 
 
+MATS13 = ["stone", "deepslate", "wood", "gravel", "grass", "sand", "snow", "glass", "wool", "metal", "netherrack", "slime_block", "bone_block"]
+FALLBACK = re.compile(r"^block\.[a-z0-9_]+\.(step|break|place|hit|fall)$")
+
+
+def via_fallback(n, have):
+    """mc_audio.mca_find: a block sound of a type the bank has no recipe for ("block.cherry_wood.step") plays the material event of
+    mca_type_material (always one of the 13 types, default stone), so it IS covered when all 13 material events of that action exist."""
+    m = FALLBACK.match(n)
+    return bool(m) and all("block.%s.%s" % (t, m.group(1)) in have for t in MATS13)
+
+
 def tier(n):
     for r in T1:
         if re.search(r, n):
@@ -61,13 +72,18 @@ def main():
     have = have_of(args[1:])
     miss = {1: [], 2: [], 3: []}
     cnt = {1: 0, 2: 0, 3: 0}
+    nfb = {1: 0, 2: 0, 3: 0}
     for n in names:
         t = tier(n)
         cnt[t] += 1
         if n not in have:
-            miss[t].append(n)
+            if via_fallback(n, have):
+                nfb[t] += 1
+            else:
+                miss[t].append(n)
     for t in (1, 2, 3):
-        print("tier %d: %d events, %d with a synth sound, %d missing" % (t, cnt[t], cnt[t] - len(miss[t]), len(miss[t])))
+        print("tier %d: %d events, %d with a synth sound (%d of them via the block-type fallback), %d missing"
+              % (t, cnt[t], cnt[t] - len(miss[t]), nfb[t], len(miss[t])))
     for t in (1, 2):
         print("missing tier %d (first %d):" % (t, top))
         for n in miss[t][:top]:
