@@ -1,0 +1,404 @@
+// expect_exit: 0
+// tests/3040_mc_chunk_old.fi -- mc_chunk.chunk_decode_114n for the OLD CF_SECTIONS_114 variants:
+//   1.14.4 (498): dense (spanning) longs, dense heightmap (36 longs), 256 biome ints behind the sections
+//   1.15.2 (578): dense longs, dense heightmap, 1024 biome ints as an own field (no count)
+//   1.17.1 (756): no groundUp, bitMap = BitSet (varint count + longs), non-spanning longs, biome varints (count = sections * 64)
+// Every packet is built BY HAND in the wire layout (independent of the decoder) and every block, biome, heightmap
+// value, counter and error path is checked against the values the builder used.
+import std.bytes
+import std.rt
+import std.nbt
+import mc.mc_chunk
+import mc.mc_version
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+// section 0: indirect 5 bit, 20 palette entries (global id = 100 + 7 * index), index = (i * 31 + 7) % 20
+fn idx0(i: usize) -> usize {
+    return (i * 31 + 7) % 20
+}
+
+// section 2: direct global ids (14 bit in 1.14 / 1.15, 15 bit in 1.17)
+fn dir2(i: usize) -> u16 {
+    return ((i * 7919 + 13) % 16000) as u16
+}
+
+// 1.14 column biome (index z*16+x), 1.15 / 1.17 cell biome (index 0..)
+fn bio_col(e: usize) -> u16 {
+    return ((e * 3 + e / 16) % 200) as u16
+}
+
+fn bio_cell(e: usize) -> u16 {
+    return ((e * 5 + e / 64) % 9) as u16
+}
+
+fn value(kind: i32, i: usize) -> u64 {
+    if kind == 0 {
+        return idx0(i) as u64
+    }
+    return dir2(i) as u64
+}
+
+// counted long array of n values with `bits` bits each; dense = entries may span two longs
+fn put_packed(b: *mut bytes.Bytes, n: usize, bits: u32, kind: i32, dense: bool) {
+    var words: usize = 0
+    if dense {
+        words = (n * (bits as usize) + 63) / 64
+    } else {
+        words = (n + 64 / (bits as usize) - 1) / (64 / (bits as usize))
+    }
+    let buf: u64 = rt.heap_alloc(words * 8)
+    var w: usize = 0
+    while w < words {
+        rt.st64(buf, w, 0 as u64)
+        w = w + 1
+    }
+    var i: usize = 0
+    while i < n {
+        let v: u64 = value(kind, i)
+        if dense {
+            let bit: usize = i * (bits as usize)
+            let wi: usize = bit / 64
+            let off: u32 = (bit % 64) as u32
+            rt.st64(buf, wi, rt.ld64(buf, wi) | (v << off))
+            if off as usize + (bits as usize) > 64 {
+                rt.st64(buf, wi + 1, rt.ld64(buf, wi + 1) | (v >> (64 as u32 - off)))
+            }
+        } else {
+            let epl: usize = 64 / (bits as usize)
+            let wi: usize = i / epl
+            rt.st64(buf, wi, rt.ld64(buf, wi) | (v << (((i % epl) as u32) * bits)))
+        }
+        i = i + 1
+    }
+    bytes.put_varint(b, words as i32)
+    w = 0
+    while w < words {
+        bytes.put_u64(b, rt.ld64(buf, w))
+        w = w + 1
+    }
+    rt.heap_free(buf, words * 8)
+}
+
+fn hm_val(i: usize) -> u64 {
+    return ((i * 3 + 64) % 300) as u64
+}
+
+// MOTION_BLOCKING heightmap: dense = 36 longs, else 37 longs with 7 entries each
+fn put_heightmap(body: *mut bytes.Bytes, dense: bool) {
+    nbt.nbt_root_begin(body, 0, 0)
+    var longs: [u64; 40] = [0 as u64; 40]
+    var i: usize = 0
+    while i < 256 {
+        let v: u64 = hm_val(i)
+        if dense {
+            let bit: usize = i * 9
+            let wi: usize = bit / 64
+            let off: u32 = (bit % 64) as u32
+            longs[wi] = longs[wi] | (v << off)
+            if off as usize + 9 > 64 {
+                longs[wi + 1] = longs[wi + 1] | (v >> (64 as u32 - off))
+            }
+        } else {
+            longs[i / 7] = longs[i / 7] | (v << (((i % 7) as u32) * 9 as u32))
+        }
+        i = i + 1
+    }
+    var n: usize = 37
+    if dense {
+        n = 36
+    }
+    nbt.nbt_long_array(body, "MOTION_BLOCKING".p as u64, 15, (&longs[0]) as u64, n)
+    nbt.nbt_end(body)
+}
+
+// sections of chunkData: 0 = indirect 5 bit (palette of `pn` entries), 2 = direct (14 bit dense / 15 bit sparse)
+fn put_sections(cd: *mut bytes.Bytes, dense: bool, pn: i32) {
+    bytes.put_i16(cd, 100 as i16)
+    bytes.put_u8(cd, 5 as u8)
+    bytes.put_varint(cd, pn)
+    var j: i32 = 0
+    while j < pn {
+        bytes.put_varint(cd, 100 + 7 * j)
+        j = j + 1
+    }
+    put_packed(cd, 4096, 5 as u32, 0, dense)
+    bytes.put_i16(cd, 4090 as i16)
+    if dense {
+        bytes.put_u8(cd, 14 as u8)
+        put_packed(cd, 4096, 14 as u32, 1, true)
+    } else {
+        bytes.put_u8(cd, 15 as u8)
+        put_packed(cd, 4096, 15 as u32, 1, false)
+    }
+}
+
+fn put_block_entity(body: *mut bytes.Bytes) {
+    bytes.put_varint(body, 1)
+    nbt.nbt_root_begin(body, 0, 0)
+    nbt.nbt_end(body)
+}
+
+// variant 14 / 15 / 17; gu: groundUp (14 / 15 only); pn: declared palette length of section 0 (20 valid, 19 = index out of range);
+// ns: sections of a 1.17 column
+fn build(body: *mut bytes.Bytes, variant: i32, gu: i32, pn: i32, ns: usize) {
+    bytes.put_i32(body, 0 - 2)
+    bytes.put_i32(body, 5)
+    if variant == 17 {
+        bytes.put_varint(body, 1)
+        bytes.put_i64(body, 5 as i64) // sections 0 and 2
+    } else {
+        bytes.put_u8(body, gu as u8)
+        bytes.put_varint(body, 5)
+    }
+    put_heightmap(body, variant != 17)
+    if variant == 15 && gu != 0 {
+        var e: usize = 0
+        while e < 1024 {
+            bytes.put_i32(body, bio_cell(e) as i32)
+            e = e + 1
+        }
+    }
+    if variant == 17 {
+        bytes.put_varint(body, (ns * 64) as i32)
+        var e: usize = 0
+        while e < ns * 64 {
+            bytes.put_varint(body, bio_cell(e) as i32)
+            e = e + 1
+        }
+    }
+    var cd: bytes.Bytes = bytes.bytes_new()
+    put_sections(&cd, variant != 17, pn)
+    if variant == 14 && gu != 0 {
+        var e: usize = 0
+        while e < 256 {
+            bytes.put_i32(&cd, bio_col(e) as i32)
+            e = e + 1
+        }
+    }
+    bytes.put_varint(body, bytes.bytes_len(&cd) as i32)
+    bytes.put_bytes(body, &cd)
+    bytes.bytes_free(&cd)
+    put_block_entity(body)
+}
+
+fn decode(body: *mut bytes.Bytes, sc: *mut mc_chunk.Scratch, p: *mut u64, protocol: i32, nsec: usize) -> bool {
+    *p = mc_chunk.chunk_alloc()
+    bytes.bytes_set_pos(body, 0)
+    return mc_chunk.chunk_decode_114n(body, sc, (*p) as *mut mc_chunk.Chunk, protocol, nsec) catch false
+}
+
+// checks blocks, counts, heightmap of a decoded column with `ns` sections
+fn check_common(c: *mut mc_chunk.Chunk, dense: bool, ns: usize, base: i32) {
+    check((*c).x == 0 - 2 && (*c).z == 5, base + 1)
+    check((*c).nsec == ns && (*c).nbe == 1 && (*c).ground_up == 1, base + 2)
+    check((*c).sky_n == 0 && (*c).block_n == 0, base + 3)
+    check((*c).light_hash == 14695981039346656037 as u64, base + 4)
+    check((*c).sec_mask == 5, base + 5)
+    check((*c).nhm == 1 && (*c).hm_nlen[0] == 15, base + 6)
+    var hi: usize = 0
+    while hi < 256 {
+        check(rt.ld16((*c).hm_val, hi) == hm_val(hi) as u16, base + 7)
+        hi = hi + 1
+    }
+    var s: usize = 0
+    while s < ns {
+        let sec: *mut mc_chunk.Section = mc_chunk.chunk_section(c, s)
+        var i: usize = 0
+        while i < 4096 {
+            var want: u16 = 0 as u16
+            if s == 0 {
+                want = (100 + 7 * idx0(i)) as u16
+            } else if s == 2 {
+                want = dir2(i)
+            }
+            check(mc_chunk.container_get(&(*sec).blocks, i) == want, base + 8)
+            i = i + 1
+        }
+        if s == 0 {
+            check((*sec).count == 100, base + 9)
+            check(mc_chunk.container_palette_size(&(*sec).blocks) == 20 as u32, base + 10)
+        } else if s == 2 {
+            check((*sec).count == 4090, base + 11)
+        } else {
+            check((*sec).count == 0 && mc_chunk.container_palette_size(&(*sec).blocks) == 1 as u32, base + 12)
+        }
+        s = s + 1
+    }
+}
+
+fn check_cell_biomes(c: *mut mc_chunk.Chunk, ns: usize, base: i32) {
+    var s: usize = 0
+    while s < ns {
+        let sec: *mut mc_chunk.Section = mc_chunk.chunk_section(c, s)
+        var q: usize = 0
+        while q < 64 {
+            check(mc_chunk.container_get(&(*sec).biomes, q) == bio_cell(s * 64 + q), base)
+            q = q + 1
+        }
+        s = s + 1
+    }
+}
+
+fn main(start: u64) -> i32 {
+    var sc: mc_chunk.Scratch = mc_chunk.scratch_new()
+    var p: u64 = 0
+
+    // ---- 1.14.4 (498): biomes are one array per column behind the sections (Chunk.bio), cells take the first column
+    var b14: bytes.Bytes = bytes.bytes_new()
+    build(&b14, 14, 1, 20, 16)
+    check(decode(&b14, &sc, &p, 498, 0), 1)
+    var c: *mut mc_chunk.Chunk = p as *mut mc_chunk.Chunk
+    check_common(c, true, 16, 100)
+    check((*c).bio != 0, 2)
+    var e: usize = 0
+    while e < 256 {
+        check(rt.ld8((*c).bio, e) as u16 == bio_col(e), 3)
+        e = e + 1
+    }
+    var s: usize = 0
+    while s < 16 {
+        let sec: *mut mc_chunk.Section = mc_chunk.chunk_section(c, s)
+        var q: usize = 0
+        while q < 64 {
+            let cx: usize = q % 4
+            let cz: usize = (q / 4) % 4
+            check(mc_chunk.container_get(&(*sec).biomes, q) == bio_col(cz * 4 * 16 + cx * 4), 4)
+            q = q + 1
+        }
+        s = s + 1
+    }
+    mc_chunk.chunk_release(p)
+    // 1.14 protocol 477 (1.14 release) is the same layout
+    check(decode(&b14, &sc, &p, 477, 0), 5)
+    mc_chunk.chunk_release(p)
+    // no ground-up: no biomes at all (bio = 0, cells 0)
+    var b14n: bytes.Bytes = bytes.bytes_new()
+    build(&b14n, 14, 0, 20, 16)
+    check(decode(&b14n, &sc, &p, 498, 0), 6)
+    c = p as *mut mc_chunk.Chunk
+    check((*c).ground_up == 0 && (*c).bio == 0 && (*c).nsec == 16, 7)
+    check(mc_chunk.container_get(&(*mc_chunk.chunk_section(c, 3)).biomes, 9) == 0 as u16, 8)
+    mc_chunk.chunk_release(p)
+    bytes.bytes_free(&b14n)
+
+    // ---- 1.15.2 (578): 1024 biome ints as an own field
+    var b15: bytes.Bytes = bytes.bytes_new()
+    build(&b15, 15, 1, 20, 16)
+    check(decode(&b15, &sc, &p, 578, 0), 10)
+    c = p as *mut mc_chunk.Chunk
+    check_common(c, true, 16, 200)
+    check_cell_biomes(c, 16, 11)
+    check((*c).bio == 0, 12)
+    mc_chunk.chunk_release(p)
+    var b15n: bytes.Bytes = bytes.bytes_new()
+    build(&b15n, 15, 0, 20, 16)
+    check(decode(&b15n, &sc, &p, 573, 0), 13)
+    c = p as *mut mc_chunk.Chunk
+    check((*c).ground_up == 0 && (*c).nsec == 16, 14)
+    check(mc_chunk.container_get(&(*mc_chunk.chunk_section(c, 3)).biomes, 9) == 0 as u16, 15)
+    mc_chunk.chunk_release(p)
+    bytes.bytes_free(&b15n)
+
+    // ---- 1.17.1 (756): BitSet mask, no groundUp, sections from the dimension (nsec), non-spanning longs
+    var b17: bytes.Bytes = bytes.bytes_new()
+    build(&b17, 17, 1, 20, 16)
+    check(decode(&b17, &sc, &p, 756, 16), 20)
+    c = p as *mut mc_chunk.Chunk
+    check_common(c, false, 16, 300)
+    check_cell_biomes(c, 16, 21)
+    mc_chunk.chunk_release(p)
+    check(decode(&b17, &sc, &p, 755, 0), 22) // nsec 0 = 16 sections
+    c = p as *mut mc_chunk.Chunk
+    check((*c).nsec == 16, 23)
+    mc_chunk.chunk_release(p)
+    // a taller dimension (24 sections): 1536 biome entries, the mask stays the same
+    var b17t: bytes.Bytes = bytes.bytes_new()
+    build(&b17t, 17, 1, 20, 24)
+    check(decode(&b17t, &sc, &p, 756, 24), 24)
+    c = p as *mut mc_chunk.Chunk
+    check_common(c, false, 24, 400)
+    check_cell_biomes(c, 24, 25)
+    mc_chunk.chunk_release(p)
+    check(!decode(&b17t, &sc, &p, 756, 16), 26) // 1536 biome entries do not fit 16 sections
+    mc_chunk.chunk_release(p)
+    bytes.bytes_free(&b17t)
+    // a mask bit at or above the section count is refused (bit 2 with only 2 sections)
+    check(!decode(&b17, &sc, &p, 756, 2), 27)
+    mc_chunk.chunk_release(p)
+
+    // ---- protocols outside the four ranges are refused (1.16.0 / 1.16.1 differ, 1.13 / 1.18 are other formats)
+    check(!decode(&b15, &sc, &p, 735, 0), 30)
+    mc_chunk.chunk_release(p)
+    check(!decode(&b15, &sc, &p, 757, 0), 31)
+    mc_chunk.chunk_release(p)
+    check(!decode(&b15, &sc, &p, 404, 0), 32)
+    mc_chunk.chunk_release(p)
+    // a 1.14 body read as 1.15 or 1.17 must not decode
+    check(!decode(&b14, &sc, &p, 578, 0), 33)
+    mc_chunk.chunk_release(p)
+    check(!decode(&b14, &sc, &p, 756, 16), 34)
+    mc_chunk.chunk_release(p)
+
+    // palette index out of range (declared 19 entries, index 19 used), every variant
+    var bad: bytes.Bytes = bytes.bytes_new()
+    build(&bad, 14, 1, 19, 16)
+    check(!decode(&bad, &sc, &p, 498, 0), 40)
+    mc_chunk.chunk_release(p)
+    bytes.bytes_free(&bad)
+    var bad15: bytes.Bytes = bytes.bytes_new()
+    build(&bad15, 15, 1, 19, 16)
+    check(!decode(&bad15, &sc, &p, 578, 0), 41)
+    mc_chunk.chunk_release(p)
+    bytes.bytes_free(&bad15)
+    var bad17: bytes.Bytes = bytes.bytes_new()
+    build(&bad17, 17, 1, 19, 16)
+    check(!decode(&bad17, &sc, &p, 756, 16), 42)
+    mc_chunk.chunk_release(p)
+    bytes.bytes_free(&bad17)
+
+    // one trailing octet: the packet must be consumed exactly
+    bytes.put_u8(&b15, 0 as u8)
+    check(!decode(&b15, &sc, &p, 578, 0), 43)
+    mc_chunk.chunk_release(p)
+    bytes.put_u8(&b17, 0 as u8)
+    check(!decode(&b17, &sc, &p, 756, 16), 44)
+    mc_chunk.chunk_release(p)
+
+    // every truncation is an error, never a crash
+    var variant: i32 = 0
+    while variant < 3 {
+        var full: bytes.Bytes = bytes.bytes_new()
+        var proto: i32 = 498
+        if variant == 0 {
+            build(&full, 14, 1, 20, 16)
+        } else if variant == 1 {
+            build(&full, 15, 1, 20, 16)
+            proto = 578
+        } else {
+            build(&full, 17, 1, 20, 16)
+            proto = 756
+        }
+        let total: usize = bytes.bytes_len(&full)
+        var cut: usize = 0
+        while cut < total {
+            var tr: bytes.Bytes = bytes.Bytes { data: full.data, cap: cut, len: cut, pos: 0, bad: false }
+            let pp: u64 = mc_chunk.chunk_alloc()
+            let r: bool = mc_chunk.chunk_decode_114n(&tr, &sc, pp as *mut mc_chunk.Chunk, proto, 16) catch false
+            check(!r, 50 + variant)
+            mc_chunk.chunk_release(pp)
+            cut = cut + 997
+        }
+        bytes.bytes_free(&full)
+        variant = variant + 1
+    }
+    bytes.bytes_free(&b14)
+    bytes.bytes_free(&b15)
+    bytes.bytes_free(&b17)
+    mc_chunk.scratch_free(&sc)
+    return 0
+}
