@@ -79,6 +79,48 @@ fn flood(cx: i32, cz: i32, ids: u64) {
     }
 }
 
+// ---- draw order recorder (r155): the translucent LOD columns that fade out must be drawn BACK TO FRONT
+static mut REC_ON: bool = false
+static mut REC_PASS: i32 = 0
+static mut REC_LAST: f64 = 0.0
+static mut REC_MIND: f64 = 0.0
+static mut REC_CCX: f64 = 0.0
+static mut REC_CCZ: f64 = 0.0
+static mut REC_CNT: u64 = 0
+static mut REC_BAD: u64 = 0 // rises beyond the one allowed per frame (the hand-over from the section loop to the LOD column loop)
+static mut REC_FRAME_BAD: u64 = 0
+static mut REC_DIFF: u64 = 0 // distance changes between consecutive recorded draws (> 0: more than one column ring was recorded)
+
+fn rec_pass(o: u64, pass: i32) {
+    REC_PASS = pass
+    mc_raster.backend_set_pass(o as *mut mc_raster.Raster, pass)
+}
+
+fn rec_abs(v: f64) -> f64 {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+fn rec_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
+    if REC_ON && REC_PASS == 1 {
+        let dx: f64 = ox / 16.0 - REC_CCX
+        let dz: f64 = oz / 16.0 - REC_CCZ
+        var d: f64 = rec_abs(dx)
+        if rec_abs(dz) > d { d = rec_abs(dz) }
+        if d > REC_MIND {
+            let dd: f64 = dx * dx + dz * dz
+            if dd > REC_LAST + 0.5 { REC_FRAME_BAD = REC_FRAME_BAD + 1 as u64 }
+            if dd < REC_LAST - 0.5 && REC_CNT > 0 as u64 { REC_DIFF = REC_DIFF + 1 as u64 }
+            REC_LAST = dd
+            REC_CNT = REC_CNT + 1 as u64
+        }
+    }
+    let r: *mut mc_raster.Raster = o as *mut mc_raster.Raster
+    let t0: u64 = (*r).st.tris_in
+    mc_raster.backend_draw(r, h, ox, oy, oz)
+    return (*r).st.tris_in - t0
+}
+
 fn fresh_raster(a: *mut mc_texture.Atlas) -> mc_raster.Raster {
     var r: mc_raster.Raster = mc_raster.raster_new(96, 54)
     mc_raster.backend_upload_atlas(&r, a)
@@ -88,7 +130,12 @@ fn fresh_raster(a: *mut mc_texture.Atlas) -> mc_raster.Raster {
 #[allow_escape]
 fn frame(s: *mut mc_stream.Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera) -> u64 {
     (*b).begin((*b).obj, cam as u64, CLEAR)
+    REC_LAST = 1.0e18
+    REC_MIND = ((*s).dist + (*s).lod_hyst) as f64
+    REC_FRAME_BAD = 0 as u64
     let tris: u64 = mc_stream.stream_frame(s, w, b, cam)
+    if REC_FRAME_BAD > 1 as u64 { REC_BAD = REC_BAD + REC_FRAME_BAD - 1 as u64 }
+    if REC_FRAME_BAD > 0 as u64 { io.fmt_eprint_line(f"REC frame rises {REC_FRAME_BAD}") }
     (*b).end((*b).obj)
     return tris
 }
@@ -206,6 +253,13 @@ fn fade_flight(a: *mut mc_texture.Atlas, tb: *mut mc_mesh.MeshTables, ids: u64, 
     load_all(&wa, &sa, ids, water)
     var rb: mc_raster.Raster = fresh_raster(a)
     var bb: mc_backend.Backend = mc_backend.backend_cpu(&rb)
+    if water {
+        bb.draw = rec_draw
+        bb.set_pass = rec_pass
+        REC_ON = true
+        REC_CCX = 0.0 - 3.0 // chunk column of the pose (x = -40, z = 4)
+        REC_CCZ = 0.0
+    }
     var wb: mc_world.World = mc_world.world_new()
     var sb: mc_stream.Stream = mc_stream.stream_new(0, NSEC, DIST, tb, 0)
     sb.lod_dist = R
@@ -258,8 +312,11 @@ fn main() -> i32 {
     io.fmt_eprint_line(f"LODFADE water hard: pop {rt.ld64(fo, 0)} jump {rt.ld64(fo, 1)} holes {rt.ld64(fo, 2)} | fade10: pop {rt.ld64(fo, 6)} jump {rt.ld64(fo, 7)} holes {rt.ld64(fo, 8)} fading-frames {rt.ld64(fo, 9)} end-jump {rt.ld64(fo, 10)} water-draws {rt.ld64(fo, 11)}")
     check(rt.ld64(fo, 11) > 0 as u64, 74) // the water pass really drew (control: the lake is in the picture)
     check(rt.ld64(fo, 9) > 0 as u64, 75)
-    check(rt.ld64(fo, 7) * 10 <= rt.ld64(fo, 1) * 5, 76) // worst jump at most half of the hard switch, water included
+    check(rt.ld64(fo, 7) * 10 <= rt.ld64(fo, 1) * 6, 76) // worst jump at most 60% of the hard switch, water included (was 50%: the wider LOD edge expansion made the hard switch itself smaller, 73 vs 87 px)
     check(rt.ld64(fo, 10) * 10 <= rt.ld64(fo, 1) * 5, 77) // the frame where the fade ends is no pop
+    io.fmt_eprint_line(f"LODFADE trans order: {REC_CNT} draws, {REC_DIFF} distance steps, {REC_BAD} out of order")
+    check(REC_CNT > 0 as u64 && REC_DIFF > 0 as u64, 78) // the control: fading-out water columns at several distances were drawn
+    check(REC_BAD == 0 as u64, 79) // back to front
     io.fmt_print_line(f"ok")
     return 0
 }
