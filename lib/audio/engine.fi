@@ -49,7 +49,7 @@ export {
     engine_set_bus_volume, engine_get_bus_volume, engine_set_bus_mute, engine_get_bus_mute,
     engine_bus_effective_volume,
     engine_add_sample, engine_load_wav, engine_load_mp3, engine_sample_frames, engine_sample_count, engine_event_count,
-    engine_sample_adopt_last, MAX_SAMPLES, MAX_EVENTS,
+    engine_sample_adopt_last, MAX_SAMPLES, MAX_EVENTS, engine_event_set_slot, engine_event_slot_volume, engine_event_slot_pitch, engine_events_clear, engine_param_pool_used, engine_sample_id_pool_used,
     engine_add_event, engine_event_add_sample, engine_event_add_param, engine_event, engine_find_event,
     engine_set_listener, engine_play, engine_play_3d, engine_stop, engine_stop_all, engine_is_playing,
     engine_set_position, engine_set_volume, engine_set_pitch, engine_set_param,
@@ -242,6 +242,7 @@ struct Engine {
     params: u64, n_params: usize,
     curve_x: u64, curve_y: u64, n_curve: usize,
     sample_ids: u64, n_sample_ids: usize,
+    slot_vol: u64, slot_pit: u64, // f32 per sample id slot (parallel to sample_ids): per-entry volume / pitch factor (default 1.0)
     voices: u64, shared: u64,
     free_list: u64, n_free: usize,
     cmds: u64, cmd_head: usize, cmd_tail: usize,
@@ -392,6 +393,7 @@ fn engine_new(rate: u32, max_voices: u32) -> Engine {
         params: alloc_zero[ParamMap](MAX_POOL), n_params: 0,
         curve_x: alloc_zero[f32](MAX_POOL), curve_y: alloc_zero[f32](MAX_POOL), n_curve: 0,
         sample_ids: alloc_zero[i32](MAX_POOL), n_sample_ids: 0,
+        slot_vol: alloc_zero[f32](MAX_POOL), slot_pit: alloc_zero[f32](MAX_POOL),
         voices: alloc_zero[Voice](mv as usize), shared: alloc_zero[Shared](mv as usize),
         free_list: alloc_zero[u32](mv as usize), n_free: 0,
         cmds: alloc_zero[Cmd](CMD_CAP), cmd_head: 0, cmd_tail: 0,
@@ -461,8 +463,7 @@ fn engine_free(e: *mut Engine) {
     }
     i = 0
     while i < (*e).n_params {
-        let pm: *mut ParamMap = at[ParamMap]((*e).params, i)
-        rt.heap_free((*pm).name_p, (*pm).name_n + 1)
+        free_param_name(e, i)
         i = i + 1
     }
     let mv: usize = (*e).max_voices as usize
@@ -476,6 +477,8 @@ fn engine_free(e: *mut Engine) {
     rt.heap_free((*e).curve_x, MAX_POOL * 4)
     rt.heap_free((*e).curve_y, MAX_POOL * 4)
     rt.heap_free((*e).sample_ids, MAX_POOL * 4)
+    rt.heap_free((*e).slot_vol, MAX_POOL * 4)
+    rt.heap_free((*e).slot_pit, MAX_POOL * 4)
     rt.heap_free((*e).voices, bytes_of[Voice](mv))
     rt.heap_free((*e).shared, bytes_of[Shared](mv))
     rt.heap_free((*e).free_list, mv * 4)
@@ -1089,10 +1092,47 @@ fn engine_event_add_sample(e: *mut Engine, ev: i32, sample: i32) -> bool {
         return false
     }
     *at[i32]((*e).sample_ids, (*e).n_sample_ids) = sample
+    stf((*e).slot_vol, (*e).n_sample_ids, 1.0)
+    stf((*e).slot_pit, (*e).n_sample_ids, 1.0)
     (*e).n_sample_ids = (*e).n_sample_ids + 1
     (*d).sample_n = (*d).sample_n + 1 as u32
     return true
 }
+
+// Per-slot factors of the LAST event (slot k = k-th engine_event_add_sample call): a voice that picks this slot plays at
+// event volume * vol and event pitch * pit (vanilla sounds.json: volume / pitch of one entry). Default 1.0 / 1.0.
+fn engine_event_set_slot(e: *mut Engine, ev: i32, k: usize, vol: f32, pit: f32) -> bool {
+    if ev < 0 || ev as usize + 1 != (*e).n_events {
+        return false
+    }
+    let d: *mut EventDef = at[EventDef]((*e).events, ev as usize)
+    if k >= (*d).sample_n as usize {
+        return false
+    }
+    var v: f32 = vol
+    var q: f32 = pit
+    if v < 0.0 { v = 0.0 }
+    if q < 0.01 { q = 0.01 }
+    stf((*e).slot_vol, (*d).sample_first as usize + k, v)
+    stf((*e).slot_pit, (*d).sample_first as usize + k, q)
+    return true
+}
+
+fn engine_event_slot_volume(e: *mut Engine, ev: i32, k: usize) -> f32 {
+    let d: *mut EventDef = engine_event(e, ev)
+    if d as u64 == 0 || k >= (*d).sample_n as usize { return 0.0 }
+    return ldf((*e).slot_vol, (*d).sample_first as usize + k)
+}
+
+fn engine_event_slot_pitch(e: *mut Engine, ev: i32, k: usize) -> f32 {
+    let d: *mut EventDef = engine_event(e, ev)
+    if d as u64 == 0 || k >= (*d).sample_n as usize { return 0.0 }
+    return ldf((*e).slot_pit, (*d).sample_first as usize + k)
+}
+
+// Pool fill levels (tests: a hot reload must not make them grow).
+fn engine_param_pool_used(e: *mut Engine) -> usize { return (*e).n_params }
+fn engine_sample_id_pool_used(e: *mut Engine) -> usize { return (*e).n_sample_ids }
 
 // Parameter with a piecewise linear curve (xs ascending). Only for the LAST event (E4: 8 params, 16 points).
 fn engine_event_add_param(e: *mut Engine, ev: i32, name: str, target: u32, default_value: f32,
@@ -1319,9 +1359,10 @@ fn start_event(e: *mut Engine, event_id: i32, bus: i32, spatial: bool, x: f32, y
         generation = 1 as u32
     }
     let pick: u32 = next_random(e) % (*def).sample_n
-    let sample_id: i32 = *at[i32]((*e).sample_ids, (*def).sample_first as usize + pick as usize)
-    var volume: f32 = (*def).volume * (1.0 + (*def).volume_random * random_bipolar(e))
-    var pitch: f32 = (*def).pitch * (1.0 + (*def).pitch_random * random_bipolar(e))
+    let slot_ix: usize = (*def).sample_first as usize + pick as usize
+    let sample_id: i32 = *at[i32]((*e).sample_ids, slot_ix)
+    var volume: f32 = (*def).volume * (1.0 + (*def).volume_random * random_bipolar(e)) * ldf((*e).slot_vol, slot_ix)
+    var pitch: f32 = (*def).pitch * (1.0 + (*def).pitch_random * random_bipolar(e)) * ldf((*e).slot_pit, slot_ix)
     if volume < 0.0 {
         volume = 0.0
     }
@@ -2051,22 +2092,127 @@ fn engine_event_replace(e: *mut Engine, old: i32) -> bool {
     let dst: *mut EventDef = at[EventDef]((*e).events, old as usize)
     let src: *mut EventDef = at[EventDef]((*e).events, last)
     rt.heap_free((*dst).name_p, (*dst).name_n + 1)
-    // Reload without growth: the new ids sit at the pool tail (the event was just built); when they fit into the old range they are
-    // copied there and the tail is given back, so a hot reload of the same event does not eat the sample id pool.
+    // Reload without growth: the new ids / params sit at the pool tails (the event was just built); when they fit into the old range
+    // they are copied there and the tails are given back, so a hot reload of the same event does not eat the pools.
     var first: u32 = (*src).sample_first
     if (*src).sample_first as usize + (*src).sample_n as usize == (*e).n_sample_ids && (*src).sample_n <= (*dst).sample_n && (*dst).sample_first < (*src).sample_first {
         var k: usize = 0
         while k < (*src).sample_n as usize {
-            *at[i32]((*e).sample_ids, (*dst).sample_first as usize + k) = *at[i32]((*e).sample_ids, (*src).sample_first as usize + k)
+            let di: usize = (*dst).sample_first as usize + k
+            let si: usize = (*src).sample_first as usize + k
+            *at[i32]((*e).sample_ids, di) = *at[i32]((*e).sample_ids, si)
+            stf((*e).slot_vol, di, ldf((*e).slot_vol, si))
+            stf((*e).slot_pit, di, ldf((*e).slot_pit, si))
             k = k + 1
         }
         first = (*dst).sample_first
         (*e).n_sample_ids = (*src).sample_first as usize
     }
+    // params: the old ones are dead (their names are freed); the new ones move into the old range when they fit (maps + curve points)
+    var pfirst: u32 = (*src).param_first
+    if (*src).param_n > 0 as u32 {
+        let sn: usize = (*src).param_n as usize
+        let sp0: usize = (*src).param_first as usize
+        let sc0: usize = (*at[ParamMap]((*e).params, sp0)).curve_first as usize
+        var spts: usize = 0
+        var q: usize = 0
+        while q < sn {
+            spts = spts + (*at[ParamMap]((*e).params, sp0 + q)).curve_n as usize
+            q = q + 1
+        }
+        var dpts: usize = 0
+        q = 0
+        while q < (*dst).param_n as usize {
+            dpts = dpts + (*at[ParamMap]((*e).params, (*dst).param_first as usize + q)).curve_n as usize
+            q = q + 1
+        }
+        let dp0: usize = (*dst).param_first as usize
+        if (*dst).param_n > 0 as u32 && dp0 < sp0 && sp0 + sn == (*e).n_params && sc0 + spts == (*e).n_curve && sn <= (*dst).param_n as usize && spts <= dpts {
+            let dc0: usize = (*at[ParamMap]((*e).params, dp0)).curve_first as usize
+            var j: usize = 0
+            while j < spts {
+                stf((*e).curve_x, dc0 + j, ldf((*e).curve_x, sc0 + j))
+                stf((*e).curve_y, dc0 + j, ldf((*e).curve_y, sc0 + j))
+                j = j + 1
+            }
+            q = 0
+            var off: usize = 0
+            while q < sn {
+                let sm: *mut ParamMap = at[ParamMap]((*e).params, sp0 + q)
+                let dm: *mut ParamMap = at[ParamMap]((*e).params, dp0 + q)
+                rt.heap_free((*dm).name_p, (*dm).name_n + 1) // the old name of that map
+                *dm = *sm
+                (*dm).curve_first = (dc0 + off) as u32
+                off = off + (*sm).curve_n as usize
+                q = q + 1
+            }
+            // old maps beyond the new count: names are freed, they stay as dead entries in the pool
+            while q < (*dst).param_n as usize {
+                let dm: *mut ParamMap = at[ParamMap]((*e).params, dp0 + q)
+                rt.heap_free((*dm).name_p, (*dm).name_n + 1)
+                (*dm).name_p = 0
+                (*dm).name_n = 0
+                (*dm).curve_n = 0 as u32
+                q = q + 1
+            }
+            (*e).n_params = sp0
+            (*e).n_curve = sc0
+            pfirst = (*dst).param_first
+        } else {
+            q = 0
+            while q < (*dst).param_n as usize {
+                free_param_name(e, (*dst).param_first as usize + q)
+                q = q + 1
+            }
+        }
+    } else {
+        var q: usize = 0
+        while q < (*dst).param_n as usize {
+            free_param_name(e, (*dst).param_first as usize + q)
+            q = q + 1
+        }
+    }
     *dst = *src
     (*dst).sample_first = first
+    (*dst).param_first = pfirst
     (*e).n_events = last
     name_index_rebuild(e) // the removed last slot may be in the index
+    return true
+}
+
+fn free_param_name(e: *mut Engine, i: usize) {
+    let pm: *mut ParamMap = at[ParamMap]((*e).params, i)
+    if (*pm).name_p != 0 {
+        rt.heap_free((*pm).name_p, (*pm).name_n + 1)
+        (*pm).name_p = 0
+        (*pm).name_n = 0
+    }
+}
+
+// Drops EVERY event (names, params, id pools) but keeps samples and buses -- for a source switch (mcplay O key: original sounds without the
+// synth events). Refused (false) while the audio thread runs. The caller reloads the events (a bank that remembers its samples by hash
+// finds them again) and must have stopped its voices and forgotten cached event ids.
+fn engine_events_clear(e: *mut Engine) -> bool {
+    if engine_audio_running(e) {
+        return false
+    }
+    var i: usize = 0
+    while i < (*e).n_events {
+        let ev: *mut EventDef = at[EventDef]((*e).events, i)
+        rt.heap_free((*ev).name_p, (*ev).name_n + 1)
+        i = i + 1
+    }
+    i = 0
+    while i < (*e).n_params {
+        free_param_name(e, i)
+        i = i + 1
+    }
+    (*e).n_events = 0
+    (*e).n_params = 0
+    (*e).n_curve = 0
+    (*e).n_sample_ids = 0
+    rt.mem_set((*e).name_tab, 0 as u8, NAME_TAB * 4)
+    engine_stop_all(e, 0.0)
     return true
 }
 

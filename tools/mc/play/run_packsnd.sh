@@ -2,7 +2,7 @@
 # tools/mc/play/run_packsnd.sh -- mcplay with pack sounds (MC_PACK_SOUNDS=both|original) end to end: Xvfb + official 1.20.1 server + mcplay + xdotool.
 # Runs: (1) both, FILE sink: start + hot reload (key T) with a CHANGED OGG -> sample table must not grow; (2) both, DEVICE sink (private
 # PulseAudio null sink): same, the audio thread is stopped / restarted around the reload; (3) original, FILE sink: only pack events.
-# (4) O key: packs off/on at runtime. Prints `RESULT mc-packsnd: ok`. Env: FIRNC, MC_VIEW (3), MCCLIENT_JAR_CACHE, MCPLAY_SKIP_PULSE=1.
+# (4) O key: packs off/on at runtime; (5) original start + O twice = still pack-only (no synth events). Prints `RESULT mc-packsnd: ok`. Env: FIRNC, MC_VIEW (3), MCCLIENT_JAR_CACHE, MCPLAY_SKIP_PULSE=1.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
@@ -145,5 +145,19 @@ else
     [ "$t1" = "$t2" ] || { echo "  FAIL  PsToggle: sample table grew ($t1 -> $t2)"; ERR=1; }
 fi
 python3 tools/mc/play/audio_check.py "$W/toggle.wav" "$W/PsToggle.out" --probe --min-events 12 || ERR=1
+
+# (5) original + FILE sink + O key twice: start without the synth bank, packs off (synth), packs on again = ORIGINAL (the synth events must be
+# gone again: every engine event is a pack event, `total` == `events`)
+run PsOrigToggle original "file:$W/origtoggle.wav" 2; rc=$?
+[ $rc -eq 0 ] || { echo "  FAIL  PsOrigToggle exit code $rc"; ERR=1; }
+a=$(grep -n "mcplay: sounds=synth" "$W/PsOrigToggle.out" | head -1 | cut -d: -f1); b=$(grep -n "mcplay: sounds=original" "$W/PsOrigToggle.out" | head -1 | cut -d: -f1)
+if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then echo "  FAIL  PsOrigToggle: expected 'sounds=synth' then 'sounds=original' (got ${a:-none}/${b:-none})"; ERR=1
+else
+    o1=$(field PsOrigToggle 1 events); ot1=$(field PsOrigToggle 1 total); o2=$(field PsOrigToggle 2 events); ot2=$(field PsOrigToggle 2 total)
+    echo "  PsOrigToggle: events $o1 (total $ot1) -> $o2 (total $ot2)"
+    [ "${o1:-0}" -ge 4 ] && [ "$o1" = "$ot1" ] || { echo "  FAIL  PsOrigToggle: start is not pack-only (events ${o1:-?} total ${ot1:-?})"; ERR=1; }
+    [ "${o2:-0}" -ge 4 ] && [ "$o2" = "$ot2" ] || { echo "  FAIL  PsOrigToggle: original after the toggle still has synth events (events ${o2:-?} total ${ot2:-?})"; ERR=1; }
+fi
+grep -q "did not restart" "$W/PsOrigToggle.out" && { echo "  FAIL  PsOrigToggle: audio thread did not restart"; ERR=1; }
 
 if [ $ERR -eq 0 ]; then echo "RESULT mc-packsnd: ok"; else tail -15 "$W/PsFile.out" | sed 's/^/  /'; echo "RESULT mc-packsnd: FAIL"; exit 1; fi
