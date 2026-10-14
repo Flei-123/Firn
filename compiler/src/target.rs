@@ -188,6 +188,12 @@ pub fn shared() -> bool {
     SHARED.with(|p| p.get())
 }
 
+/// Does the thread pointer register belong to the HOST (a `.so`, or bionic on Android)?
+/// Then the runtime never writes it and finds its thread block by stack range.
+pub fn host_tp() -> bool {
+    shared() || android()
+}
+
 /// Is this compilation position independent?
 pub fn pic() -> bool {
     PIC.with(|p| p.get())

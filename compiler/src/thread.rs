@@ -431,12 +431,13 @@ pub(crate) const ARCH_SET_FS: i64 = 0x1002;
 /// the moment the first thread was started. `gs` is not used by glibc on
 /// x86-64 Linux, so the runtime may own it. Executables (no `--pic`) keep
 /// `fs`: the byte-for-byte code of every normal program stays as it was.
-/// Windows (TEB slot), Android (bionic owns `fs` too, but its own seam
-/// rewrites the call) and aarch64 (`tpidr_el0`) are not affected.
+/// Android x86-64 behaves the same (bionic owns `fs`: replacing it killed every
+/// bionic call of a raw-clone thread and of an attached pthread, and
+/// `thread_host_detach` crashed the app). Windows (TEB slot) and aarch64
+/// (`tpidr_el0`, see `target::host_tp`) are not affected.
 pub(crate) fn use_gs() -> bool {
     crate::target::pic()
         && !crate::target::windows()
-        && !crate::target::android()
         && matches!(crate::target::active(), crate::target::Target::X86_64)
 }
 

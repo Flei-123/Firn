@@ -853,7 +853,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     if auxv {
         e.raw(&crate::simd_a64::auxv_data_asm());
     }
-    if crate::target::shared() {
+    if crate::target::host_tp() {
         e.raw(&format!(
             ".bss\n.balign 8\n{}:\n    .zero 8\n{}:\n    .zero 8",
             SHARED_TP_BASE, SHARED_TP_HI
@@ -1542,7 +1542,7 @@ fn emit_inst(
             // the register is 0 — the same starting value `fs` has, which is
             // what `__thread_tcb` in lib/gc/gc.fi checks for.
             let d = i.dst.ok_or("internal error: threadself without target")?;
-            if crate::target::shared() {
+            if crate::target::host_tp() {
                 // `.so`: `tpidr_el0` belongs to the HOST (glibc TLS). Find the calling thread's block by its
                 // stack range (see SHARED_TP_BASE). Result: the entry whose [FT_LO, FT_BOTTOM) holds `sp`,
                 // else the main thread's block (entry 0), else 0 while nothing is registered.
@@ -1740,7 +1740,7 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
             }
         }
         load_full(e, fr, A, given[1]);
-        if crate::target::shared() {
+        if crate::target::host_tp() {
             // Register the thread block `p` (see SHARED_TP_BASE): the first one becomes the base, then
             // `__firn_tp_hi = max(hi, (p - base) / 512 + 1)`. p = 0 (a thread leaving) changes nothing.
             let dn = uniq(e, "setfs_done");
