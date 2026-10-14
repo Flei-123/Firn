@@ -46,7 +46,7 @@ export {
     CAP_MANUAL_FOCUS, CAP_OIS, CAP_FLASH,
     E_OK, E_PERMISSION, E_NO_CAMERA, E_OPEN, E_SESSION, E_STREAM, E_TIMEOUT, E_UNSUPPORTED, E_STATE, E_SPACE,
     camera_permission, camera_request_permission, camera_scan, camera_info, camera_meta,
-    camera_open, camera_close, camera_start, camera_is_open, camera_kind,
+    camera_open, camera_close, camera_force_physical, camera_start, camera_is_open, camera_kind,
     zero_frame, sizeof_frame, frame_at,
     camera_preview_bgrx, camera_set_auto, camera_set_manual, camera_lock, camera_stream_size,
     camera_best_kind, camera_capture, camera_save, camera_alloc, camera_free,
@@ -410,6 +410,8 @@ const B_REC_OUT: u64 = 336    // u64 ACaptureSessionOutput
 const B_REC_TGT: u64 = 344    // u64 ACameraOutputTarget
 const B_REC_PFD: u64 = 352    // u64 global ref of the ParcelFileDescriptor
 const B_REC_ON: u64 = 360     // i32 1 = recording
+const B_CLOSED: u64 = 368     // i32 session onClosed callbacks
+const B_FORCE_PHYS: u64 = 376 // 40 octets, test hook: stream from this physical id ("" = off)
 const CB_DEV: u64 = 1024      // ACameraDevice_StateCallbacks (24)
 const CB_SESS: u64 = 1056     // ACameraCaptureSession_stateCallbacks (32)
 const CB_CAP: u64 = 1096      // ACameraCaptureSession_captureCallbacks (64)
@@ -969,6 +971,11 @@ fn cb_error(ctx: u64, dev: u64, err: u64, d: u64) {
 }
 
 #[no_gc]
+fn cb_closed(ctx: u64, sess: u64, c: u64, d: u64) {
+    wr32(G_P + B_CLOSED, rd32(G_P + B_CLOSED) + 1)
+}
+
+#[no_gc]
 fn cb_ready(ctx: u64, sess: u64, c: u64, d: u64) {
     wr32(G_P + B_READY, rd32(G_P + B_READY) + 1)
 }
@@ -1051,6 +1058,17 @@ fn camera_kind() -> i32 {
     return rd32(block() + B_KIND)
 }
 
+// Test hook: the next camera_open streams from physical id `pid` (NUL-terminated) of the opened camera, as if
+// that lens were a physical id of a multi camera. 0 clears it. Lets an emulator without a multi camera run the
+// physical-output code path (the session is then refused by the camera service, which must not crash).
+#[no_gc]
+fn camera_force_physical(pid: u64) {
+    let b: u64 = block()
+    if b == 0 { return }
+    wr8(b + B_FORCE_PHYS, 0 as u32)
+    if pid != 0 { copy_str(b + B_FORCE_PHYS, pid, 40) }
+}
+
 // Opens lens `index` of the last camera_scan (a physical id opens its logical camera and streams from
 // that physical camera where the device allows it). Returns E_OK or an E_* code.
 #[no_gc]
@@ -1065,10 +1083,16 @@ fn camera_open(index: i32) -> i32 {
     wr8(b + B_PHYS_ID, 0 as u32)
     wr64(b + B_PHYS_FN, 0)
     let parent: i32 = rd32(open_id + 40)
+    var phys_src: u64 = 0
     if parent >= 0 {
+        phys_src = open_id
+    } else if rd8(b + B_FORCE_PHYS) != 0 as u32 {
+        phys_src = b + B_FORCE_PHYS
+    }
+    if phys_src != 0 {
         // a physical id: open the logical camera, stream from this one
-        copy_str(b + B_PHYS_ID, open_id, 40)
-        open_id = tbl_id(parent)
+        copy_str(b + B_PHYS_ID, phys_src, 40)
+        if parent >= 0 { open_id = tbl_id(parent) }
         let h: u64 = dlopen(t(S_LIBCAM), 2)
         if h != 0 {
             wr64(b + B_PHYS_FN, dlsym(h, t(S_PHYS_FN)) as i64)
@@ -1153,9 +1177,16 @@ fn close_session() {
     if s != 0 {
         let r1: i32 = ACameraCaptureSession_stopRepeating(s)
         let r2: i32 = ACameraCaptureSession_abortCaptures(s)
+        wr32(b + B_CLOSED, 0)
         ACameraCaptureSession_close(s)
         *((b + B_SESS) as *mut u64) = 0
-        wait_ms(50)
+        // buffers go back to the readers only after onClosed: wait for it (up to 1 s) before freeing them
+        var waited: i32 = 0
+        while rd32(b + B_CLOSED) == 0 && waited < 100 {
+            wait_ms(10)
+            waited = waited + 1
+        }
+        wait_ms(20)
     }
     let rq: u64 = *((b + B_PREV_REQ) as *mut u64)
     if rq != 0 {
@@ -1296,6 +1327,20 @@ fn restart_preview(focus: f32) -> i32 {
     return E_OK
 }
 
+// One session output for window `wn` (out parameter `rp`). When a physical id is set the output is bound to
+// that physical camera: ACaptureSessionPhysicalOutput_create(window, const char* physicalId, output**) --
+// THREE arguments (an earlier version passed the id length as a 4th argument and crashed the app on the
+// first lens that is a physical id).
+#[no_gc]
+fn make_output(b: u64, wn: u64, rp: u64) -> bool {
+    let phys: u64 = *((b + B_PHYS_FN) as *mut u64)
+    if phys != 0 && rd8(b + B_PHYS_ID) != 0 as u32 {
+        let st: u64 = jnicall.ruf3(phys, wn, b + B_PHYS_ID, rp) & 4294967295
+        return st == 0 as u64 && *(rp as *mut u64) != 0
+    }
+    return ACaptureSessionOutput_create(wn, rp) == 0 && *(rp as *mut u64) != 0
+}
+
 #[no_gc]
 fn make_stream(b: u64, cont: u64, rd: u64, win: u64, out: u64, tgt: u64, w: i32, h: i32, fmt: i32,
                max_images: i32) -> bool {
@@ -1308,13 +1353,7 @@ fn make_stream(b: u64, cont: u64, rd: u64, win: u64, out: u64, tgt: u64, w: i32,
     let wn: u64 = *(rp as *mut u64)
     *((b + win) as *mut u64) = wn
     wr64(rp, 0)
-    let phys: u64 = *((b + B_PHYS_FN) as *mut u64)
-    if phys != 0 && rd8(b + B_PHYS_ID) != 0 as u32 {
-        let pid: u64 = b + B_PHYS_ID
-        if jnicall.ruf4(phys, wn, length(pid) as u64, pid, rp) != 0 as u64 { return false }
-    } else {
-        if ACaptureSessionOutput_create(wn, rp) != 0 { return false }
-    }
+    if !make_output(b, wn, rp) { return false }
     *((b + out) as *mut u64) = *(rp as *mut u64)
     if ACaptureSessionOutputContainer_add(cont, *((b + out) as *mut u64)) != 0 { return false }
     wr64(rp, 0)
@@ -1326,7 +1365,7 @@ fn make_stream(b: u64, cont: u64, rd: u64, win: u64, out: u64, tgt: u64, w: i32,
 #[no_gc]
 fn init_callbacks(b: u64) {
     *((b + CB_SESS) as *mut u64) = 0
-    *((b + CB_SESS + 8) as *mut u64) = code_of_q(cb_noop)
+    *((b + CB_SESS + 8) as *mut u64) = code_of_q(cb_closed)
     *((b + CB_SESS + 16) as *mut u64) = code_of_q(cb_ready)
     *((b + CB_SESS + 24) as *mut u64) = code_of_q(cb_noop)
     *((b + CB_CAP) as *mut u64) = 0
@@ -2167,7 +2206,7 @@ fn camera_video_start(name: u64) -> i32 {
     }
     let rp: u64 = b + B_SCRATCH + 400
     wr64(rp, 0)
-    if ACaptureSessionOutput_create(win, rp) != 0 {
+    if !make_output(b, win, rp) {
         rec_release(b, false)
         close_session()
         return E_STREAM
