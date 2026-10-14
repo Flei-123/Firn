@@ -100,6 +100,7 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("TlsAlloc", "KERNEL32.dll", 0),
     ("TlsSetValue", "KERNEL32.dll", 2),
     ("TlsGetValue", "KERNEL32.dll", 1),
+    ("VirtualQuery", "KERNEL32.dll", 3),
     ("WaitOnAddress", "API-MS-WIN-CORE-SYNCH-L1-2-0.dll", 4),
     ("WakeByAddressSingle", "API-MS-WIN-CORE-SYNCH-L1-2-0.dll", 1),
     ("WakeByAddressAll", "API-MS-WIN-CORE-SYNCH-L1-2-0.dll", 1),
