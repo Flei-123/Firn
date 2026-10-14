@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # tools/mc/play/run_vk.sh -- mcplay with the Vulkan back end (MCPLAY_GFX=vk, lib/mc/vk_mc.fi) against the REAL 1.20.1 server (Xvfb, offline, creative).
 # lavapipe (Mesa CPU Vulkan) = NO real GPU: this proves wiring + picture parity with the CPU raster, NOT GPU speed. SKIP (exit 0) without a Vulkan device.
-# Same scene (platform + mobs, fixed camera) three times: CPU raster (reference), VK, VK with a SIMULATED device loss (MCPLAY_VK_LOST_AT).
+# Same scene (platform + mobs, fixed camera) four times: CPU raster (reference), VK (swapchain present, r195), VK with a SIMULATED device loss
+# (MCPLAY_VK_LOST_AT; the swapchain is re-created after the recovery), VK with MCPLAY_VK_PRESENT=readback (old path).
 # Checks: no crash / exit 0, `gfx=vk` line, frame counters (mcplay end frames + vk frames), boxes drawn, PSNR(VK, CPU) >= MCPLAY_VK_PSNR_MIN (34),
-# lost run: lost=1 recovered=1 and the same picture afterwards. Env: MC_VIEW (4), FIRNC, MCPLAY_VK_PNG_OUT=<prefix>. Start it via heavy.
+# lost run: lost=1 recovered=1 and the same picture afterwards. Swapchain (vk + vklost): `present=swapchain`, presents >= 30, and at exit the X window
+# content (XGetImage) == the read back colour image of the last frame (window_diff=0, octets); readback run: `present=readback`. Env: MC_VIEW (4), FIRNC, MCPLAY_VK_PNG_OUT=<prefix>. Start it via heavy.
 # Prints `RESULT mc-vk: ok`.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
@@ -58,9 +60,9 @@ for cmd in "fill -20 119 -20 20 120 20 stone" "fill -20 121 -20 20 128 20 air" \
            "summon minecraft:pig -1.5 121 6.5 {NoAI:1b,PersistenceRequired:1b,Tags:[\"ent\"],Rotation:[0f,0f]}" "summon minecraft:cow 3.5 121 9.5 {NoAI:1b,PersistenceRequired:1b,Tags:[\"ent\"],Rotation:[0f,0f]}"; do echo "$cmd" >&3; done
 sleep 2
 LOST_AT=${MCPLAY_VK_LOST_AT:-60}
-shot() { # <name> <gfx cpu|vk> <lost_at>
-    local nm=$1 gfx=$2 la=$3
-    MCPLAY_GFX=$gfx MCPLAY_VK_LOST_AT=$la MCPLAY_AUDIO=0 MCPLAY_RUN_S=12 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/$nm.png" \
+shot() { # <name> <gfx cpu|vk> <lost_at> [extra VAR=value]
+    local nm=$1 gfx=$2 la=$3 ex=${4:-}
+    env $ex MCPLAY_GFX=$gfx MCPLAY_VK_LOST_AT=$la MCPLAY_AUDIO=0 MCPLAY_RUN_S=12 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/$nm.png" \
         timeout 240 "$W/mcplay" 127.0.0.1 "$PORT" "P_$nm" > "$W/$nm.out" 2>&1 &
     local pid=$!
     wait_join "P_$nm" || { echo "  FAIL  $nm never joined"; ERR=1; }
@@ -74,6 +76,7 @@ shot cpu cpu 0
 shot vk vk 0
 if grep -q "gfx=cpu (vk requested" "$W/vk.out"; then echo "  SKIP: no Vulkan device (mcplay fell back to the CPU path)"; echo "RESULT mc-vk: skip"; echo stop >&3; exit 0; fi
 shot vklost vk "$LOST_AT"
+shot vkrb vk 0 MCPLAY_VK_PRESENT=readback
 num() { grep "$2" "$1" | grep -o " $3=[0-9]*" | head -1 | cut -d= -f2; }
 grep -q "mcplay: gfx=vk device=" "$W/vk.out" || { echo "  FAIL  vk run: no gfx=vk line"; ERR=1; }
 grep "mcplay: gfx=vk" "$W/vk.out" | head -1 | sed 's/^/  /'
@@ -87,10 +90,20 @@ BX=$(num "$W/vk.out" "mcplay: entities_draw" boxes)
 LV=$(num "$W/vklost.out" "mcplay: vk frames" lost); LR=$(num "$W/vklost.out" "mcplay: vk frames" recovered); LF=$(num "$W/vklost.out" "mcplay: end" frames)
 [ "${LV:-0}" = 1 ] && [ "${LR:-0}" = 1 ] || { echo "  FAIL  lost run: lost=${LV:-?} recovered=${LR:-?} (expected 1 / 1)"; ERR=1; }
 [ "${LF:-0}" -gt $((LOST_AT + 30)) ] || { echo "  FAIL  lost run: only ${LF:-0} frames (needs > $((LOST_AT + 30)))"; ERR=1; }
+# swapchain present (r195): window == readback at exit, also after the simulated loss (new surface + swapchain on the same window)
+for n in vk vklost; do
+    grep -q "mcplay: vk present=swapchain" "$W/$n.out" || { if grep -q "mcplay: vk present=readback" "$W/$n.out"; then echo "  SKIP-SC $n: no swapchain on this device (readback present)"; else echo "  FAIL  $n: no 'vk present=' line"; ERR=1; fi; continue; }
+    PR=$(num "$W/$n.out" "mcplay: vk present=swapchain" presents); WD=$(num "$W/$n.out" "mcplay: vk present=swapchain" window_diff)
+    [ "${PR:-0}" -ge 30 ] || { echo "  FAIL  $n: swapchain presents ${PR:-0} < 30"; ERR=1; }
+    [ "${WD:-x}" = 0 ] || { echo "  FAIL  $n: window vs readback differ (window_diff=${WD:-?}; -1 = no window pixels)"; ERR=1; }
+    echo "  $n: $(grep -o 'vk present=swapchain.*' "$W/$n.out" | head -1)"
+done
+grep -q "mcplay: vk present=readback" "$W/vkrb.out" || { echo "  FAIL  vkrb: not the readback present path"; ERR=1; }
 echo "  vk: frames=${VF:-?} boxes=${BX:-?}; lost run: lost=${LV:-?} recovered=${LR:-?} frames=${LF:-?}"
 python3 tools/mc/play/psnr.py "$W/cpu.png" "$W/vk.png" --min-db "$PMIN" --mask 0,0,140,50 --diff "$W/diff.png" || ERR=1
 python3 tools/mc/play/psnr.py "$W/cpu.png" "$W/vklost.png" --min-db "$PMIN" --mask 0,0,140,50 || ERR=1
-if [ -n "${MCPLAY_VK_PNG_OUT:-}" ]; then for n in cpu vk vklost; do [ -s "$W/$n.png" ] && cp "$W/$n.png" "${MCPLAY_VK_PNG_OUT}_$n.png"; done; fi
+python3 tools/mc/play/psnr.py "$W/cpu.png" "$W/vkrb.png" --min-db "$PMIN" --mask 0,0,140,50 || ERR=1
+if [ -n "${MCPLAY_VK_PNG_OUT:-}" ]; then for n in cpu vk vklost vkrb; do [ -s "$W/$n.png" ] && cp "$W/$n.png" "${MCPLAY_VK_PNG_OUT}_$n.png"; done; fi
 echo stop >&3; sleep 1
 [ $ERR -eq 0 ] && echo "RESULT mc-vk: ok" || echo "RESULT mc-vk: FAIL"
 exit $ERR

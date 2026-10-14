@@ -44,6 +44,7 @@ import std.env
 import std.core
 import std.math
 import window.window
+import window.backend
 import input.raw
 import mc.mc_codec
 import mc.mc_chunk
@@ -1755,15 +1756,27 @@ fn want_vk_gfx() -> bool {
     return v.length() == 2 && v.chars(0) == 118 as u8 && v.chars(1) == 107 as u8
 }
 
+// MCPLAY_VK_PRESENT=readback: present the read back image through the X11 window instead of a swapchain.
+fn want_vk_readback_present() -> bool {
+    if !env.has("MCPLAY_VK_PRESENT") { return false }
+    let v: str = env.get("MCPLAY_VK_PRESENT")
+    return v.length() == 8 && v.chars(0) == 114 as u8
+}
+
 // Opens the Vulkan back end for the window size w x h and uploads the atlas / resource pack. false = no Vulkan device (the caller keeps the CPU path).
 fn vk_open_be(c: *mut Ctx, w: i32, h: i32) -> bool {
     var cp: str = ""
     if env.has("MCPLAY_VK_CACHE") { cp = env.get("MCPLAY_VK_CACHE") }
-    if !vk_mc.vkbe_open_into(&(*c).vbk, w, h, cp) {
+    // Present through a swapchain on the window (r195) unless MCPLAY_VK_PRESENT=readback (old path: read back -> X11 image). The swapchain needs the
+    // mapped window; without surface support the back end still opens and mcplay presents the read back image.
+    var xid: u64 = 0
+    if !want_vk_readback_present() && (*c).wp != (0 as *mut window.Window) { xid = backend.r_native(&(*(*c).wp).p) }
+    if !vk_mc.vkbe_open_win(&(*c).vbk, w, h, cp, xid, 0) {
         say(f"mcplay: vk back end failed (step {(*c).vbk.step})\n")
         return false
     }
-    vk_mc.vkbe_set_readback(&(*c).vbk, true)
+    // readback (a copy + a wait per frame) only without a swapchain, or when MCPLAY_SHOT needs the last frame
+    vk_mc.vkbe_set_readback(&(*c).vbk, !vk_mc.vkbe_sc_on(&(*c).vbk) || env.has("MCPLAY_SHOT"))
     (*c).be = vk_mc.vkbe_backend(&(*c).vbk)
     if (*c).g.use_res {
         mc_packs.res_reload_upload(&(*c).g.res, &(*c).be)
@@ -1953,6 +1966,7 @@ fn draw_frame(c: *mut Ctx) {
 
 fn present(c: *mut Ctx) {
     if (*c).vk {
+        if vk_mc.vkbe_sc_on(&(*c).vbk) { return } // swapchain: end() already presented
         // read back (RGBA, row 0 = top, waits for the newest frame) -> X11 image
         let px: u64 = (*c).be.present((*c).be.obj)
         if px != 0 as u64 {
@@ -2301,6 +2315,29 @@ fn main(start: u64) -> i32 {
     if c.gl || c.vk {
         let px: u64 = c.be.present(c.be.obj)
         if px != 0 as u64 { rt.mem_copy(c.g.r.color, px, (c.w as usize) * (c.h as usize) * 4) }
+    }
+    if c.vk && vk_mc.vkbe_sc_on(&c.vbk) {
+        // proof of the swapchain path: what the X server shows in the window == the read back colour image of the last frame
+        var wdiff: i64 = 0 - 1
+        let npx: usize = (c.w as usize) * (c.h as usize)
+        let wpx: u64 = rt.heap_alloc(npx * 4)
+        let rpx: u64 = c.be.present(c.be.obj)
+        if rpx != 0 as u64 && vk_mc.vkbe_window_pixels(&c.vbk, wpx) {
+            wdiff = 0
+            var wi: usize = 0
+            while wi < npx {
+                var wk: usize = 0
+                while wk < 3 {
+                    if rt.ld8(rpx, wi * 4 + wk) != rt.ld8(wpx, wi * 4 + wk) { wdiff = wdiff + 1 }
+                    wk = wk + 1
+                }
+                wi = wi + 1
+            }
+        }
+        rt.heap_free(wpx, npx * 4)
+        say(f"mcplay: vk present=swapchain presents={vk_mc.vkbe_sc_stat(&c.vbk, vk_mc.SC_PRESENTS)} skips={vk_mc.vkbe_sc_stat(&c.vbk, vk_mc.SC_SKIPS)} rebuilds={vk_mc.vkbe_sc_stat(&c.vbk, vk_mc.SC_REBUILDS)} out_of_date={vk_mc.vkbe_sc_stat(&c.vbk, vk_mc.SC_OUT_OF_DATE)} suboptimal={vk_mc.vkbe_sc_stat(&c.vbk, vk_mc.SC_SUBOPTIMAL)} format={vk_mc.vkbe_sc_stat(&c.vbk, vk_mc.SC_FORMAT)} window_diff={wdiff} px={npx}\n")
+    } else if c.vk {
+        io.print("mcplay: vk present=readback\n")
     }
     if c.vk {
         say(f"mcplay: vk frames={vk_mc.vkbe_frames(&c.vbk)} draws={vk_mc.vkbe_draws(&c.vbk)} tris={vk_mc.vkbe_tris(&c.vbk)} lost={c.vk_losses} recovered={c.vk_recoveries} ubo_over={c.vbk.ubo_over} dyn_over={c.vbk.dyn_over}\n")
