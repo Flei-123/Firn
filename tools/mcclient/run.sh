@@ -75,6 +75,11 @@ cleanup() {
   if [ -n "$SRV_PID" ] && kill -0 "$SRV_PID" 2>/dev/null; then
     kill "$SRV_PID" 2>/dev/null; sleep 1; kill -9 "$SRV_PID" 2>/dev/null
   fi
+  # MC_KEEP_DIR=<dir>: copy the client outputs (dumps, entity files, raw packets, bot logs) there before the work dir goes
+  if [ -n "${MC_KEEP_DIR:-}" ]; then
+    mkdir -p "$MC_KEEP_DIR" && cp -r "$W/out" "$MC_KEEP_DIR/" 2>/dev/null; cp "$W"/bot.* "$MC_KEEP_DIR/" 2>/dev/null
+    cp "$W/server.log" "$MC_KEEP_DIR/" 2>/dev/null
+  fi
   rm -rf "$W"
 }
 trap cleanup EXIT
