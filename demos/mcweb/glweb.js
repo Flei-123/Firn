@@ -227,16 +227,36 @@
                     const tv = (b) => (g.buttons[b] ? Math.round(g.buttons[b].value * 1000) : 0);
                     const ax = (a) => Math.round(Math.max(-1, Math.min(1, g.axes[a] || 0)) * 1000);
                     x.firn_pad_state(i, m >>> 0, tv(6), tv(7), ax(0), ax(1), ax(2), ax(3));
+                    if (typeof x.firn_pad_rumble_cap === 'function') x.firn_pad_rumble_cap(i, g.vibrationActuator ? 1 : 0);
                     padOn[i] = true;
                 } else if (padOn[i]) {
                     x.firn_pad_gone(i); padOn[i] = false;
                 }
             }
         };
+        // rumble requests of the Firn side (webpad_rumble): played after the frame when the request counter moved
+        const rumbleSeq = [0, 0, 0, 0];
+        const playRumble = () => {
+            if (typeof x.firn_pad_rumble_seq !== 'function' || !navigator.getGamepads) return;
+            const list = navigator.getGamepads();
+            for (let i = 0; i < 4; i++) {
+                const seq = x.firn_pad_rumble_seq(i);
+                if (seq === rumbleSeq[i]) continue;
+                rumbleSeq[i] = seq;
+                const a = list && list[i] && list[i].vibrationActuator;
+                if (!a) continue;
+                const strong = x.firn_pad_rumble_strong(i) / 1000, weak = x.firn_pad_rumble_weak(i) / 1000, ms = x.firn_pad_rumble_ms(i);
+                try {
+                    if (strong === 0 && weak === 0) { if (a.reset) a.reset(); }
+                    else a.playEffect('dual-rumble', { startDelay: 0, duration: ms, weakMagnitude: weak, strongMagnitude: strong });
+                } catch (e) { /* a refused effect is not an error of the program */ }
+            }
+        };
         const tick = guard((ms) => {
             raf = 0;
             pollPads();
             const r = x.firn_mc_frame(ms);
+            playRumble();
             run.frames++;
             if (r !== 0 && !stopped) raf = sched(tick);
             else stop();

@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_dig.fi -- block breaking time (vanilla formula) from generated tables (tools/mcgen/gen_dig.py -> lib/mc/vNNN/mc_dig_vNNN.fi).
+//
+//   dig_open(blob)                                   reader over the generated blob (check dig_ok)
+//   dig_tool_speed(d, block, item)                   mining speed multiplier of the held item on the block (1.0 = bare hand / wrong tool)
+//   dig_can_harvest(d, block, item)                  true when the block drops with this item (no restriction = any item)
+//   dig_ticks(d, block, hardness_milli, item, efficiency, on_ground, in_water)
+//                                                    server ticks (20 Hz) until the block breaks: -1 unbreakable, 0 instant
+//
+// Formula (Java, 1.20.1): speed = tool speed (+ efficiency^2 + 1 when above 1); /5 in water without aqua affinity, /5 in the air;
+// damage per tick = speed / hardness / (30 when the tool may harvest, else 100); the block breaks after ceil(1 / damage) ticks,
+// at once when damage >= 1. hardness comes from the registry (mc_registry.reg_block_hardness_milli). Haste / fatigue are not modelled.
+//
+// BLOB: see tools/mcgen/gen_dig.py (u28 numbers, 4 octets of 7 bits, "FDG1").
+
+import std.rt
+
+export {
+    DigData, dig_open, dig_ok, dig_tool_speed, dig_can_harvest, dig_ticks, dig_material,
+}
+
+struct DigData {
+    blob: u64,
+    nblocks: u32,
+    nmat: u32,
+    matdir_off: u32,
+    blocks_off: u32,
+}
+
+fn num(blob: u64, at: u32) -> u32 {
+    let a: usize = at as usize
+    return ((rt.ld8(blob, a) as u32) << 21) | ((rt.ld8(blob, a + 1) as u32) << 14) | ((rt.ld8(blob, a + 2) as u32) << 7) | (rt.ld8(blob, a + 3) as u32)
+}
+
+fn dig_open(blob: u64) -> DigData {
+    var d: DigData = DigData { blob: blob, nblocks: 0 as u32, nmat: 0 as u32, matdir_off: 0 as u32, blocks_off: 0 as u32 }
+    if blob == 0 || rt.ld8(blob, 0) != 70 as u8 || rt.ld8(blob, 1) != 68 as u8 || rt.ld8(blob, 2) != 71 as u8 || rt.ld8(blob, 3) != 49 as u8 {
+        d.blob = 0
+        return d
+    }
+    d.nblocks = num(blob, 4 as u32)
+    d.nmat = num(blob, 8 as u32)
+    d.matdir_off = num(blob, 12 as u32)
+    d.blocks_off = num(blob, 16 as u32)
+    return d
+}
+
+fn dig_ok(d: *mut DigData) -> bool { return (*d).blob != 0 }
+
+// material index of a block (registry block index), -1 when out of range
+fn dig_material(d: *mut DigData, block: i32) -> i32 {
+    if (*d).blob == 0 || block < 0 || block as u32 >= (*d).nblocks { return 0 - 1 }
+    return num((*d).blob, (*d).blocks_off + (block as u32) * 8 as u32) as i32
+}
+
+fn harvest_off(d: *mut DigData, block: i32) -> u32 {
+    return num((*d).blob, (*d).blocks_off + (block as u32) * 8 as u32 + 4 as u32)
+}
+
+// speed multiplier (x1000 in the table) of `item` on the block's material, 1.0 when the item is not listed
+fn dig_tool_speed(d: *mut DigData, block: i32, item: i32) -> f64 {
+    let m: i32 = dig_material(d, block)
+    if m < 0 || item < 0 { return 1.0 }
+    let rec: u32 = num((*d).blob, (*d).matdir_off + (m as u32) * 4 as u32)
+    let n: u32 = num((*d).blob, rec)
+    var i: u32 = 0 as u32
+    while i < n {
+        if num((*d).blob, rec + 4 as u32 + i * 8 as u32) as i32 == item {
+            return (num((*d).blob, rec + 8 as u32 + i * 8 as u32) as f64) / 1000.0
+        }
+        i = i + 1 as u32
+    }
+    return 1.0
+}
+
+fn dig_can_harvest(d: *mut DigData, block: i32, item: i32) -> bool {
+    if (*d).blob == 0 || block < 0 || block as u32 >= (*d).nblocks { return true }
+    let h: u32 = harvest_off(d, block)
+    if h == 0 as u32 { return true }
+    let n: u32 = num((*d).blob, h)
+    var i: u32 = 0 as u32
+    while i < n {
+        if num((*d).blob, h + 4 as u32 + i * 4 as u32) as i32 == item { return true }
+        i = i + 1 as u32
+    }
+    return false
+}
+
+fn dig_ticks(d: *mut DigData, block: i32, hardness_milli: i32, item: i32, efficiency: i32, on_ground: bool, in_water: bool) -> i32 {
+    if hardness_milli < 0 { return 0 - 1 }
+    if hardness_milli == 0 { return 0 }
+    var speed: f64 = dig_tool_speed(d, block, item)
+    if speed > 1.0 && efficiency > 0 { speed = speed + ((efficiency * efficiency + 1) as f64) }
+    if in_water { speed = speed / 5.0 }
+    if !on_ground { speed = speed / 5.0 }
+    var div: f64 = 100.0
+    if dig_can_harvest(d, block, item) { div = 30.0 }
+    let damage: f64 = speed / ((hardness_milli as f64) / 1000.0) / div
+    if damage >= 1.0 { return 0 }
+    let inv: f64 = 1.0 / damage
+    var t: i32 = inv as i32
+    if (t as f64) < inv { t = t + 1 }
+    return t
+}
