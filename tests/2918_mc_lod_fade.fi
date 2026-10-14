@@ -1,0 +1,218 @@
+// expect_exit: 0
+// tests/2918_mc_lod_fade.fi -- LOD screen-door cross-fade (v2, docs/mc/lod.md "Cross-fade").
+// STATIC camera, a converged stream is hit by three ring events (full detail radius 2 -> 4, 4 -> 2, far LOD
+//    cells 4 -> 8), one stream_frame per frame for 16 frames. Nothing moves, so every changed pixel is a representation switch:
+//    pop = pixels that changed clearly against the previous frame (summed), jump = the worst single frame, holes = clear pixels
+//    that were terrain before the event. Hard switch (lod_fade_frames 0) against the screen-door fade (10 frames): the fade must
+//    cut the worst jump to half or less and add no holes.
+// Numbers go to stderr (LODFADE ...).
+import std.rt
+import std.io
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import mc.mc_terrain
+import mc.mc_render_world
+import mc.mc_stream
+import mc.mc_lod
+
+const NSEC: i32 = 6
+const R: i32 = 9 // loaded columns: -R..R
+const DIST: i32 = 2 // full detail radius
+const CLEAR: u32 = 0xFF3C2814 as u32
+
+fn check(c: bool, code: i32) {
+    if !c {
+        io.fmt_print_line(f"FAIL code {code}")
+        rt.finish(code as i64)
+    }
+}
+
+fn fl(v: f64) -> i32 {
+    var x: i32 = v as i32
+    if (x as f64) > v { x = x - 1 }
+    return x
+}
+
+#[allow_escape]
+fn load_all(w: *mut mc_world.World, s: *mut mc_stream.Stream, ids: u64) {
+    var cz: i32 = 0 - R
+    while cz <= R {
+        var cx: i32 = 0 - R
+        while cx <= R {
+            mc_terrain.terrain_column(cx, cz, NSEC, ids)
+            check(mc_world.world_put(w, mc_render_world.wr_make_chunk(cx, cz, NSEC as usize, ids)), 50)
+            check(mc_stream.stream_chunk_loaded(s, w, cx, cz), 51)
+            cx = cx + 1
+        }
+        cz = cz + 1
+    }
+}
+
+fn fresh_raster(a: *mut mc_texture.Atlas) -> mc_raster.Raster {
+    var r: mc_raster.Raster = mc_raster.raster_new(96, 54)
+    mc_raster.backend_upload_atlas(&r, a)
+    return r
+}
+
+#[allow_escape]
+fn frame(s: *mut mc_stream.Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera) -> u64 {
+    (*b).begin((*b).obj, cam as u64, CLEAR)
+    let tris: u64 = mc_stream.stream_frame(s, w, b, cam)
+    (*b).end((*b).obj)
+    return tris
+}
+
+fn pose(cam: *mut mc_camera.Camera, x: f64, z: f64) {
+    let y: f64 = (mc_terrain.terrain_height(fl(x), fl(z), NSEC) + 8) as f64
+    mc_camera.camera_set_pos(cam, x, y, z)
+    mc_camera.camera_look_at(cam, x + 60.0, y - 6.0, z + 6.0)
+    mc_camera.camera_update(cam)
+}
+
+fn ch_diff(a: u32, b: u32) -> i32 {
+    var d: i32 = 0
+    var sh: u32 = 0 as u32
+    while sh < 24 as u32 {
+        let x: i32 = ((a >> sh) & 255 as u32) as i32
+        let y: i32 = ((b >> sh) & 255 as u32) as i32
+        if x > y { d = d + x - y } else { d = d + y - x }
+        sh = sh + 8 as u32
+    }
+    return d
+}
+
+// pixels that differ clearly (channel sum > 60)
+fn diff_px(a: *mut mc_raster.Raster, b: *mut mc_raster.Raster) -> i32 {
+    var n: i32 = 0
+    var y: i32 = 0
+    while y < 54 {
+        var x: i32 = 0
+        while x < 96 {
+            if ch_diff(mc_raster.raster_pixel(a, x, y), mc_raster.raster_pixel(b, x, y)) > 60 { n = n + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+// pixels that are clear in `a` but not in `b`
+fn holes(a: *mut mc_raster.Raster, b: *mut mc_raster.Raster) -> i32 {
+    var n: i32 = 0
+    var y: i32 = 0
+    while y < 54 {
+        var x: i32 = 0
+        while x < 96 {
+            if mc_raster.raster_pixel(a, x, y) == CLEAR && mc_raster.raster_pixel(b, x, y) != CLEAR { n = n + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+fn copy_img(dst: *mut mc_raster.Raster, src: *mut mc_raster.Raster) {
+    rt.mem_copy((*dst).color, (*src).color, 96 * 54 * 4)
+}
+
+// ring event on a stream with a STATIC camera: 0 = full detail radius 2 -> 4 (LOD -> sections), 1 = 4 -> 2 (sections -> LOD),
+// 2 = far LOD cells 4 -> 8 (LOD mesh replaced)
+fn ring_event(s: *mut mc_stream.Stream, e: i32) {
+    if e == 0 { (*s).dist = 4 }
+    if e == 1 { (*s).dist = DIST }
+    if e == 2 { (*s).lod_bin = 8 }
+}
+
+// N frames after the event, one stream_frame each: out[o..o+4] += pop (pixels changed against the previous frame), jump (worst
+// frame), holes (clear here but terrain in the frame before the event), fading frames (columns x frames with a running fade)
+#[allow_escape]
+fn run_phase(s: *mut mc_stream.Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, r: *mut mc_raster.Raster,
+    cam: *mut mc_camera.Camera, a: *mut mc_texture.Atlas, e: i32, out: u64, o: usize) {
+    var p0: mc_raster.Raster = fresh_raster(a)
+    var pv: mc_raster.Raster = fresh_raster(a)
+    frame(s, w, b, cam)
+    copy_img(&p0, r)
+    copy_img(&pv, r)
+    ring_event(s, e)
+    var f: i32 = 0
+    while f < 16 {
+        mc_stream.stream_flush(s, w, b, cam, 1)
+        frame(s, w, b, cam)
+        let d: i32 = diff_px(r, &pv)
+        rt.st64(out, o, rt.ld64(out, o) + (d as u64))
+        if (d as u64) > rt.ld64(out, o + 1) { rt.st64(out, o + 1, d as u64) }
+        rt.st64(out, o + 2, rt.ld64(out, o + 2) + (holes(r, &p0) as u64))
+        rt.st64(out, o + 3, rt.ld64(out, o + 3) + ((*s).st.lod_fading as u64))
+        copy_img(&pv, r)
+        f = f + 1
+    }
+    mc_stream.stream_flush(s, w, b, cam, 400)
+    mc_raster.raster_free(&p0)
+    mc_raster.raster_free(&pv)
+}
+
+// one static pose, two converged streams (hard switch / fade) hit by the same three ring events one after the other
+// out: per stream 4 values [pop, jump, holes, fading frames], summed over the events
+#[allow_escape]
+fn fade_flight(a: *mut mc_texture.Atlas, tb: *mut mc_mesh.MeshTables, ids: u64, fa: i32, fb: i32, out: u64) {
+    var cam: mc_camera.Camera = mc_camera.camera_new(96, 54)
+    mc_camera.camera_set_lens(&cam, 70.0, 0.05, 900.0)
+    var ra: mc_raster.Raster = fresh_raster(a)
+    var ba: mc_backend.Backend = mc_backend.backend_cpu(&ra)
+    var wa: mc_world.World = mc_world.world_new()
+    var sa: mc_stream.Stream = mc_stream.stream_new(0, NSEC, DIST, tb, 0)
+    sa.lod_dist = R
+    sa.lod_fade_frames = fa
+    sa.nbr_wait = 3 as u32
+    load_all(&wa, &sa, ids)
+    var rb: mc_raster.Raster = fresh_raster(a)
+    var bb: mc_backend.Backend = mc_backend.backend_cpu(&rb)
+    var wb: mc_world.World = mc_world.world_new()
+    var sb: mc_stream.Stream = mc_stream.stream_new(0, NSEC, DIST, tb, 0)
+    sb.lod_dist = R
+    sb.lod_fade_frames = fb
+    sb.nbr_wait = 3 as u32
+    load_all(&wb, &sb, ids)
+    var k: usize = 0
+    while k < 8 {
+        rt.st64(out, k, 0 as u64)
+        k = k + 1
+    }
+    pose(&cam, 0.0 - 40.0, 4.0)
+    mc_stream.stream_flush(&sa, &wa, &ba, &cam, 400)
+    mc_stream.stream_flush(&sb, &wb, &bb, &cam, 400)
+    var e: i32 = 0
+    while e < 3 {
+        run_phase(&sa, &wa, &ba, &ra, &cam, a, e, out, 0)
+        run_phase(&sb, &wb, &bb, &rb, &cam, a, e, out, 4)
+        e = e + 1
+    }
+    mc_stream.stream_free(&sa, &ba)
+    mc_stream.stream_free(&sb, &bb)
+    mc_world.world_free(&wa)
+    mc_world.world_free(&wb)
+    mc_raster.raster_free(&ra)
+    mc_raster.raster_free(&rb)
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_terrain.terrain_tables(&tb)
+    var a: mc_texture.Atlas = mc_texture.atlas_default()
+    let ids: u64 = rt.heap_alloc(NSEC as usize * 4096 * 2)
+    let fo: u64 = rt.heap_alloc(8 * 8)
+    fade_flight(&a, &tb, ids, 0, 10, fo)
+    io.fmt_eprint_line(f"LODFADE hard: pop {rt.ld64(fo, 0)} jump {rt.ld64(fo, 1)} holes {rt.ld64(fo, 2)} | fade10: pop {rt.ld64(fo, 4)} jump {rt.ld64(fo, 5)} holes {rt.ld64(fo, 6)} fading-frames {rt.ld64(fo, 7)} (3 events x 16 frames, 5184 px)")
+    check(rt.ld64(fo, 3) == 0 as u64, 70) // hard switch never fades
+    check(rt.ld64(fo, 7) > 0 as u64, 71) // the fade ran
+    check(rt.ld64(fo, 5) * 10 <= rt.ld64(fo, 1) * 5, 72) // worst jump at most half of the hard switch
+    check(rt.ld64(fo, 6) <= rt.ld64(fo, 2) + 20, 73) // no extra holes from the fade
+    io.fmt_print_line(f"ok")
+    return 0
+}

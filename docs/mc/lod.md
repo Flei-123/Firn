@@ -32,7 +32,7 @@ tests/2861 C (70 frames, 3 submits/frame, loaded server): worst 351 -> 17 px, to
 `stream_drop_far` keeps the whole LOD window (lod_dist + lod_ahead) by itself, whatever `extra` is passed.
 
 ## Open
-- no blending (pop at bin switches), no LOD for water/trees, LOD builds run on the render thread (0.2 ms/column at bin 4, more at bin 1).
+- (blending: see Cross-fade) no LOD for water/trees, LOD builds run on the render thread (0.2 ms/column at bin 4, more at bin 1).
 - remaining flight holes (<= 17 px) come from the build budget (wall clock) at ring switches.
 
 ## Mid ring (r78, 14.10.)
@@ -51,3 +51,16 @@ against a converged LOD stream, so bulge differences counted as holes). Honest n
 - Result: tests/2917 holes 263 -> 80 (mid ring), 658 -> 64 (no mid ring), worst frame 8 px; tests/2861 flight worst 17 -> 3 px, total 79 -> 24 (of 5184 x 70).
 - Remaining holes are 1-px grazing cases (ray exactly on an integer block edge between two quads, also inside full-detail columns): rasterizer edge rounding, not LOD logic.
 - Blending in the sense of an alpha cross-fade needs a per-draw fade in the back end (CPU raster + GL); not built. The pop is reduced by the mid ring (tests/2916/2917: err 11570 -> 10052, pop 2083 -> 1852).
+
+## Cross-fade (v2, 14.10.)
+Screen-door (ordered dither) fade between two representations of a column, in the CPU raster AND the GL shader with the same Bayer 8x8 formula (`mc_raster.bayer8`, `mc_fs.glsl`).
+- Backend call `set_fade(a, inv)` (mc_backend): following draws keep the pixels with `bayer8(x, y) < a` (inv = 0) or `>= a` (inv = 1); `a >= 64` = off (default). A fading-in and a fading-out mesh with the same `a` and opposite `inv` cover every pixel exactly once (no hole, no double cover). GL flushes the multidraw batch on a change. WebGL (glweb) has no fade (nop: both meshes drawn, depth decides).
+- Stream: `s.lod_fade_frames` (default 10, 0 = hard switch as before) = length of the fade zone in frames; per column `C_FK` kind, `C_FT` progress 0..256 (`a = ft / 4`).
+  - `FK_BIN`: LOD mesh rebuilt (bin change, neighbour change, FIRST mesh of a column shown as LOD): the old mesh (`C_OLH`, own y0/hi) fades out, the new one fades in. A rebuild during a running fade drops the old half-faded mesh.
+  - `FK_TOLOD` (mode 0 -> 1): LOD fades in, the still meshed sections fade out (drawn from `lod_draw`, the column already left the cull window), freed when the fade ends.
+  - `FK_TOFULL` (mode 2 -> 0): sections fade in over the LOD mesh, which fades out. Translucent (water/glass) meshes follow the same mask.
+  - Coming back inside `dist` during FK_TOLOD cancels the fade (sections are still there).
+- `stream_flush` waits for `st.lod_fading == 0` (converged = no fade running), `stream_lod_fade` returns the kind. Draws reset the fade to off before the entity pass.
+- Measured (tests/2918, static camera, ring events dist 2->4, 4->2, far bin 4->8, 16 frames each, 96x54): worst frame-to-frame change 57 -> 20 px (-65 %), summed change equal (131 / 131), holes against the pre-event image 156 -> 124. Per-frame change is spread over the fade instead of one frame.
+- GL vs CPU (tools/gpu dump.fi scenes `fade_a` / `fade_b`, a = 24): coverage mismatch 2-3 px of ~12k / ~20k, PSNR 47 / 45 dB (llvmpipe).
+- Trade-off: error against the converged full-detail image is higher while fading (a fading column keeps its old look for `lod_fade_frames` frames).

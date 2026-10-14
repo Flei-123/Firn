@@ -43,6 +43,7 @@ export {
     face_shade,
     backend_upload_atlas, backend_mesh_upload, backend_mesh_free, backend_begin, backend_draw,
     backend_end, backend_present, backend_read_pixels, backend_set_pass, backend_draw_entities, raster_draw_box,
+    backend_set_fade, bayer8,
 }
 
 const SLOT_WORDS: usize = 6
@@ -85,6 +86,8 @@ struct Raster {
     trans: bool, // translucent pass: alpha blend over the colour buffer, depth test but NO depth write, alpha 0 = no write
     flat_on: bool, // flat colour mode (entity boxes): no texel fetch, colour flat_rgb (R | G << 8 | B << 16)
     flat_rgb: u32,
+    fade_a: i32, // LOD cross-fade (backend_set_fade): 64 = off; else a pixel is drawn where bayer8(x, y) < fade_a (fade_inv: >= fade_a)
+    fade_inv: bool,
     // scratch
     vbuf: u64, // f64 [vcap * 8]
     vcap: usize,
@@ -117,7 +120,7 @@ fn raster_new(w: i32, h: i32) -> Raster {
         fx: 0.0, fy: 0.0, fz: 1.0, near: 0.05, hw: 0.0, hh: 0.0, fpx: 1.0, fpy: 1.0,
         apx: 0, atile: 16, acols: 16, aw: 256,
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0 as u32, fog_g: 0 as u32, fog_b: 0 as u32,
-        cull: true, day: 256, tint_r: 256, tint_g: 224, tint_b: 176, trans: false, flat_on: false, flat_rgb: 0 as u32,
+        cull: true, day: 256, tint_r: 256, tint_g: 224, tint_b: 176, trans: false, flat_on: false, flat_rgb: 0 as u32, fade_a: 64, fade_inv: false,
         vbuf: 0, vcap: 0, pa: 0, pb: 0, pc: 0, slots: 0, slot_cap: 0,
         st: Stats { tris_in: 0 as u64, tris_drawn: 0 as u64, tris_culled: 0 as u64, tris_clipped: 0 as u64, pixels: 0 as u64 },
     }
@@ -240,6 +243,13 @@ fn face_shade(face: u32) -> u32 {
 }
 
 // ---- triangle ------------------------------------------------------------------------
+
+// 8x8 ordered-dither (Bayer) threshold 0..63 of a pixel; the GL shader (lib/gpu/gl_mc.fi) uses the same bit formula
+fn bayer8(x: i32, y: i32) -> i32 {
+    let xr: i32 = (x ^ y) & 7
+    let yy: i32 = y & 7
+    return ((xr & 1) << 5) | ((yy & 1) << 4) | ((xr & 2) << 2) | ((yy & 2) << 1) | ((xr & 4) >> 1) | ((yy & 4) >> 2)
+}
 
 fn snap(v: f64) -> i64 {
     return math.floor(v * 16.0 + 0.5) as i64
@@ -464,6 +474,10 @@ fn draw_clipped_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) 
                     let alpha: u32 = tp >> 24 as u32
                     var visible: bool = alpha >= 128 as u32
                     if (*r).trans { visible = alpha >= 1 as u32 }
+                    if visible && (*r).fade_a < 64 {
+                        let bay: i32 = bayer8(x as i32, y as i32)
+                        if (*r).fade_inv { visible = bay >= (*r).fade_a } else { visible = bay < (*r).fade_a }
+                    }
                     if visible {
                         var fq: i64 = math.floor(100.0 + 52.0 * ao) as i64
                         if fq < 0 as i64 { fq = 0 }
@@ -811,6 +825,17 @@ fn backend_read_pixels(r: *mut Raster, out: u64) {
 // PASS_OPAQUE (0) / PASS_TRANS (1): see mc_backend. The translucent pass blends over the colour buffer and keeps the depth.
 fn backend_set_pass(r: *mut Raster, pass: i32) {
     (*r).trans = pass == 1
+}
+
+// LOD cross-fade (docs/mc/lod.md): the following draws keep only the pixels with bayer8(x, y) < a (inv = false) or
+// >= a (inv = true); a >= 64 = off. A fading-in and a fading-out mesh with the same `a` and opposite `inv` tile the
+// screen exactly (screen-door), so there is no hole and no double cover between them.
+fn backend_set_fade(r: *mut Raster, a: i32, inv: bool) {
+    var v: i32 = a
+    if v > 64 { v = 64 }
+    if v < 0 { v = 0 }
+    (*r).fade_a = v
+    (*r).fade_inv = inv
 }
 
 // ---- entity boxes ---------------------------------------------------------------------------
