@@ -301,7 +301,9 @@ pub(crate) fn label(name: &str) -> String {
     if let Some(export) = crate::extfn::export_link_name(name) {
         // A Windows DLL exports a Win64 THUNK under the bare name (win.rs); the
         // Firn function itself keeps its internal System V symbol.
-        if !(crate::target::windows() && crate::target::shared()) {
+        // A Linux .so exports a C-ABI THUNK (so_thunk.rs, r558) under the bare name when the C ABI places a
+        // struct argument / result differently from Firn.
+        if !(crate::target::windows() && crate::target::shared()) && !crate::extfn::so_needs_thunk(name) {
             return export;
         }
     }
@@ -579,6 +581,10 @@ pub fn emit(m: &Module) -> Result<String, String> {
         // PE image needs and nothing that a Linux build would carry.
         e.raw(&crate::win::runtime_asm());
     } else {
+        if crate::target::shared() {
+            e.raw(".text");
+            e.raw(&crate::so_thunk::runtime_asm()?);
+        }
         e.raw(".section .note.GNU-stack,\"\",@progbits");
     }
     if !freestanding && !crate::target::windows() && prune_enabled() {

@@ -155,6 +155,77 @@ pub fn ret_needs_sret(ty: &Type, tcx: &TypeCtx) -> bool {
     is_aggregate(ty) && tcx.size_of(ty) > 8
 }
 
+/// AAPCS64 homogeneous floating-point aggregate: 1..=4 members, all `f32` or all `f64`, tightly packed (§6.4.2).
+/// C passes / returns such a struct in `s`/`d` registers, one member per register; Firn packs it into eightbyte words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hfa {
+    /// members are `f64` (else `f32`)
+    pub double: bool,
+    /// number of members, 1..=4
+    pub n: u32,
+}
+
+impl Hfa {
+    /// octets per member
+    pub fn stride(&self) -> u32 {
+        if self.double { 8 } else { 4 }
+    }
+}
+
+fn hfa_leaves(ty: &Type, tcx: &TypeCtx, base: u64, out: &mut Vec<(u64, Type)>) {
+    if out.len() > 4 {
+        return;
+    }
+    match ty {
+        Type::Struct(i) => {
+            if let Some(s) = tcx.structs.get(*i) {
+                let fields = s.fields.clone();
+                for f in &fields {
+                    hfa_leaves(&f.ty, tcx, base + f.offset, out);
+                }
+            }
+        }
+        Type::Array(e, n) => {
+            let step = tcx.size_of(e);
+            for k in 0..*n {
+                hfa_leaves(e, tcx, base + k * step, out);
+                if out.len() > 4 {
+                    return;
+                }
+            }
+        }
+        _ => out.push((base, ty.clone())),
+    }
+}
+
+/// Is `ty` a homogeneous floating-point aggregate (AAPCS64)?
+pub fn hfa(ty: &Type, tcx: &TypeCtx) -> Option<Hfa> {
+    if !is_aggregate(ty) {
+        return None;
+    }
+    let mut leaves = Vec::new();
+    hfa_leaves(ty, tcx, 0, &mut leaves);
+    if leaves.is_empty() || leaves.len() > 4 {
+        return None;
+    }
+    let double = match leaves[0].1 {
+        Type::F64 => true,
+        Type::F32 => false,
+        _ => return None,
+    };
+    let stride = if double { 8u64 } else { 4 };
+    for (k, (off, t)) in leaves.iter().enumerate() {
+        let ok = if double { *t == Type::F64 } else { *t == Type::F32 };
+        if !ok || *off != k as u64 * stride {
+            return None;
+        }
+    }
+    if tcx.size_of(ty) != leaves.len() as u64 * stride {
+        return None;
+    }
+    Some(Hfa { double, n: leaves.len() as u32 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

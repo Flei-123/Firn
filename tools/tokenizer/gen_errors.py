@@ -64,7 +64,7 @@ CODES = [
 ]
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ZIEL = os.path.join(ROOT, "lib", "html", "error_codes.fi")
+TARGET = os.path.join(ROOT, "lib", "html", "error_codes.fi")
 
 
 def konstante(name):
@@ -126,10 +126,10 @@ def main():
     z.append("    return 0 as u64")
     z.append("}")
     z.append("")
-    with open(ZIEL, "w", encoding="utf-8") as fh:
+    with open(TARGET, "w", encoding="utf-8") as fh:
         fh.write("\n".join(z))
     print("written: %s (%d codes, at most %d pieces)"
-          % (os.path.relpath(ZIEL, ROOT), len(CODES), max_st))
+          % (os.path.relpath(TARGET, ROOT), len(CODES), max_st))
 
 
 if __name__ == "__main__":

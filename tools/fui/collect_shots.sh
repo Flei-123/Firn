@@ -22,14 +22,14 @@ set -e
 cd "$(dirname "$0")/../.."
 W="${W:-/tmp/fui-acceptance}"
 Z="${BELEGE:-$W/belege}"
-ZIEL=".gauntlet-shots"
+TARGET=".gauntlet-shots"
 
 if [ ! -d "$Z" ]; then
     echo "collect_shots: \"$Z\" gibt es nicht."
     echo "Erst malen: sh tools/fui/run.sh --images"
     exit 1
 fi
-mkdir -p "$ZIEL"
+mkdir -p "$TARGET"
 
 # The table: <delivered name without .png>:<painted name without .png>
 BOARD="
@@ -63,14 +63,14 @@ BOARD="
 
 n=0
 for e in $BOARD; do
-    ziel="${e%%:*}"
-    quelle="${e#*:}"
-    if [ ! -r "$Z/$quelle.png" ]; then
-        echo "collect_shots: \"$Z/$quelle.png\" fehlt."
+    target="${e%%:*}"
+    source="${e#*:}"
+    if [ ! -r "$Z/$source.png" ]; then
+        echo "collect_shots: \"$Z/$source.png\" fehlt."
         echo "Der Belegsatz waere unvollstaendig -- Abbruch."
         exit 1
     fi
-    cp "$Z/$quelle.png" "$ZIEL/$ziel.png"
+    cp "$Z/$source.png" "$TARGET/$target.png"
     n=$((n + 1))
 done
-echo "collect_shots: $n Bilder nach $ZIEL uebernommen."
+echo "collect_shots: $n Bilder nach $TARGET uebernommen."

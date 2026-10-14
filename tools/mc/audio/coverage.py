@@ -7,7 +7,7 @@ hears them. The ranking is a documented HEURISTIC (tier by name pattern), not me
           fire, water, weather, UI, arrows, experience, explosions
   tier 2  common mobs (zombie, skeleton, creeper, spider, enderman, cow, pig, sheep, chicken, horse, villager, wolf, cat, bat, slime, ...)
   tier 3  everything else (rare blocks, rare mobs, music discs, goat horns, ...)
---check: exit 1 when a tier 1 event is missing (used by tools/mc/audio/run.sh with the committed baseline of known gaps via --allow N).
+--check: exit 1 when a tier 1 event is missing (or more than --allow2 N tier 2 events, default 0) (used by tools/mc/audio/run.sh with the committed baseline of known gaps via --allow N).
 """
 import json
 import re
@@ -65,6 +65,10 @@ def main():
     if "--top" in sys.argv:
         top = int(sys.argv[sys.argv.index("--top") + 1])
         args = [a for a in args if a != str(top)]
+    allow2 = 0
+    if "--allow2" in sys.argv:
+        allow2 = int(sys.argv[sys.argv.index("--allow2") + 1])
+        args = [a for a in args if a != str(allow2)]
     if "--allow" in sys.argv:
         allow = int(sys.argv[sys.argv.index("--allow") + 1])
         args = [a for a in args if a != str(allow)]
@@ -95,6 +99,9 @@ def main():
         lim = allow if allow is not None else 0
         if len(miss[1]) > lim:
             print("FAIL tier 1 gaps %d > allowed %d" % (len(miss[1]), lim))
+            sys.exit(1)
+        if len(miss[2]) > allow2:
+            print("FAIL tier 2 gaps %d > allowed %d" % (len(miss[2]), allow2))
             sys.exit(1)
     print("coverage ok")
 

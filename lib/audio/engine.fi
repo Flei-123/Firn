@@ -36,6 +36,7 @@
 import std.rt
 import std.math
 import std.str
+import std.hash
 import audio.sink
 import audio.ring
 import std.time
@@ -47,7 +48,8 @@ export {
     engine_new, engine_free, engine_ensure_bus, engine_bus_id,
     engine_set_bus_volume, engine_get_bus_volume, engine_set_bus_mute, engine_get_bus_mute,
     engine_bus_effective_volume,
-    engine_add_sample, engine_load_wav, engine_load_mp3, engine_sample_frames,
+    engine_add_sample, engine_load_wav, engine_load_mp3, engine_sample_frames, engine_sample_count, engine_event_count,
+    engine_sample_adopt_last, MAX_SAMPLES, MAX_EVENTS,
     engine_add_event, engine_event_add_sample, engine_event_add_param, engine_event, engine_find_event,
     engine_set_listener, engine_play, engine_play_3d, engine_stop, engine_stop_all, engine_is_playing,
     engine_set_position, engine_set_volume, engine_set_pitch, engine_set_param,
@@ -66,9 +68,10 @@ export {
 const BLOCK: usize = 128
 const MAX_PARAMS: usize = 8
 const MAX_BUSES: usize = 32
-const MAX_SAMPLES: usize = 512
-const MAX_EVENTS: usize = 512
-const MAX_POOL: usize = 4096
+const MAX_SAMPLES: usize = 2048
+const MAX_EVENTS: usize = 2048
+const MAX_POOL: usize = 16384
+const NAME_TAB: usize = 8192 // event name index (open addressing, i32 = event id + 1, 0 = empty); >= 2 * MAX_EVENTS
 const CMD_CAP: usize = 4096
 const PARAM_VOLUME: u32 = 0
 const PARAM_PITCH: u32 = 1
@@ -233,6 +236,7 @@ struct Engine {
     lock: u64, // address of one word (futex mutex)
     samples: u64, n_samples: usize,
     events: u64, n_events: usize,
+    name_tab: u64, // NAME_TAB * i32, see engine_find_event
     buses: u64, n_buses: usize,
     bus_order: u64, // i32 per bus, deepest first
     params: u64, n_params: usize,
@@ -382,6 +386,7 @@ fn engine_new(rate: u32, max_voices: u32) -> Engine {
         rate: r, max_voices: mv, lock: alloc_zero[u64](1),
         samples: alloc_zero[Sample](MAX_SAMPLES), n_samples: 0,
         events: alloc_zero[EventDef](MAX_EVENTS), n_events: 0,
+        name_tab: alloc_zero[i32](NAME_TAB),
         buses: alloc_zero[Bus](MAX_BUSES), n_buses: 0,
         bus_order: alloc_zero[i32](MAX_BUSES),
         params: alloc_zero[ParamMap](MAX_POOL), n_params: 0,
@@ -464,6 +469,7 @@ fn engine_free(e: *mut Engine) {
     rt.heap_free((*e).lock, 8)
     rt.heap_free((*e).samples, bytes_of[Sample](MAX_SAMPLES))
     rt.heap_free((*e).events, bytes_of[EventDef](MAX_EVENTS))
+    rt.heap_free((*e).name_tab, NAME_TAB * 4)
     rt.heap_free((*e).buses, bytes_of[Bus](MAX_BUSES))
     rt.heap_free((*e).bus_order, MAX_BUSES * 4)
     rt.heap_free((*e).params, bytes_of[ParamMap](MAX_POOL))
@@ -659,6 +665,37 @@ fn engine_sample_frames(e: *mut Engine, id: i32) -> u64 {
         return 0
     }
     return (*at[Sample]((*e).samples, id as usize)).frames
+}
+
+fn engine_sample_count(e: *mut Engine) -> usize {
+    return (*e).n_samples
+}
+
+fn engine_event_count(e: *mut Engine) -> usize {
+    return (*e).n_events
+}
+
+// Hot reload without a leak: the LAST sample (just added) takes over slot `old`; the old PCM is freed and the table shrinks by one,
+// so every event that points at `old` plays the new data. Refused (false) while the audio thread runs (it may read the old PCM),
+// when `old` is the last slot itself or out of range. The caller then keeps the new sample as an extra id.
+fn engine_sample_adopt_last(e: *mut Engine, old: i32) -> bool {
+    if old < 0 || (old as usize) + 1 >= (*e).n_samples || (*e).n_samples == 0 {
+        return false
+    }
+    if engine_audio_running(e) {
+        return false
+    }
+    let last: usize = (*e).n_samples - 1
+    let dst: *mut Sample = at[Sample]((*e).samples, old as usize)
+    let src: *mut Sample = at[Sample]((*e).samples, last)
+    if (*dst).data != 0 {
+        rt.heap_free((*dst).data, ((*dst).frames * (*dst).channels as u64 * 4) as usize)
+    }
+    *dst = *src
+    (*src).data = 0
+    (*src).frames = 0
+    (*e).n_samples = last
+    return true
 }
 
 // Linear sample rate conversion into a fresh buffer (E3). Returns the new frame count; `out` gets the buffer.
@@ -979,6 +1016,7 @@ fn engine_add_event(e: *mut Engine, name: str, bus: i32) -> i32 {
     (*ev).param_first = (*e).n_params as u32
     (*ev).param_n = 0 as u32
     (*e).n_events = i + 1
+    name_index_add(e, i)
     return i as i32
 }
 
@@ -990,14 +1028,53 @@ fn engine_event(e: *mut Engine, id: i32) -> *mut EventDef {
     return at[EventDef]((*e).events, id as usize)
 }
 
-fn engine_find_event(e: *mut Engine, name: str) -> i32 {
+// Name index: open addressing over NAME_TAB slots; the FIRST event of a name wins (same as a front-to-back scan).
+fn name_slot(p: u64, n: usize) -> usize {
+    return (hash.fnv1a64(p, n) % (NAME_TAB as u64)) as usize
+}
+
+fn name_index_add(e: *mut Engine, id: usize) {
+    let ev: *mut EventDef = at[EventDef]((*e).events, id)
+    var k: usize = name_slot((*ev).name_p, (*ev).name_n)
+    var tries: usize = 0
+    while tries < NAME_TAB {
+        let cur: i32 = *at[i32]((*e).name_tab, k)
+        if cur == 0 {
+            *at[i32]((*e).name_tab, k) = (id as i32) + 1
+            return
+        }
+        let o: *mut EventDef = at[EventDef]((*e).events, (cur - 1) as usize)
+        if name_eq((*o).name_p, (*o).name_n, (*ev).name_p, (*ev).name_n) {
+            return // an older event of this name already owns the key
+        }
+        k = (k + 1) % NAME_TAB
+        tries = tries + 1
+    }
+}
+
+fn name_index_rebuild(e: *mut Engine) {
+    rt.mem_set((*e).name_tab, 0 as u8, NAME_TAB * 4)
     var i: usize = 0
     while i < (*e).n_events {
-        let ev: *mut EventDef = at[EventDef]((*e).events, i)
-        if name_eq((*ev).name_p, (*ev).name_n, name.p as u64, name.length()) {
-            return i as i32
-        }
+        name_index_add(e, i)
         i = i + 1
+    }
+}
+
+fn engine_find_event(e: *mut Engine, name: str) -> i32 {
+    var k: usize = name_slot(name.p as u64, name.length())
+    var tries: usize = 0
+    while tries < NAME_TAB {
+        let cur: i32 = *at[i32]((*e).name_tab, k)
+        if cur == 0 {
+            return -1
+        }
+        let ev: *mut EventDef = at[EventDef]((*e).events, (cur - 1) as usize)
+        if name_eq((*ev).name_p, (*ev).name_n, name.p as u64, name.length()) {
+            return cur - 1
+        }
+        k = (k + 1) % NAME_TAB
+        tries = tries + 1
     }
     return -1
 }
@@ -1976,6 +2053,7 @@ fn engine_event_replace(e: *mut Engine, old: i32) -> bool {
     rt.heap_free((*dst).name_p, (*dst).name_n + 1)
     *dst = *src
     (*e).n_events = last
+    name_index_rebuild(e) // the removed last slot may be in the index
     return true
 }
 

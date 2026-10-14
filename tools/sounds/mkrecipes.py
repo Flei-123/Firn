@@ -324,6 +324,133 @@ def entities():
     return o
 
 
+# ------------------------------------------------------------------------------------------------ tier 2 mob voices (r164)
+# One own voice per mob and call (ambient / hurt / death) instead of an alias to a related mob. All of them are the `voice()` archetype
+# (source -> pitch glide -> formant band pass + breath noise); only the numbers differ, so every mob gets its own timbre without a new
+# recipe type. Row = (dur ms, f0 Hz, f1 Hz, wave, formant Hz, formant Q, vibrato, noise). Derived events (_small, _baby, _water, _land,
+# attack) are the same row with a factor (pitch, duration, formant) -- listed in MOB_DERIVED.
+MOB_VOICES = {
+    "husk": {"ambient": (900, 100, 75, "saw", 480, 5, 0.012, 0.3), "hurt": (340, 160, 100, "saw", 600, 4, 0.0, 0.3),
+             "death": (1100, 130, 40, "saw", 440, 4, 0.01, 0.35)},
+    "zombie_villager": {"ambient": (950, 150, 110, "saw", 700, 5, 0.02, 0.15), "hurt": (360, 220, 150, "saw", 800, 4, 0.0, 0.15),
+                        "death": (1100, 190, 70, "saw", 650, 4, 0.012, 0.2)},
+    "drowned": {"ambient": (1000, 95, 70, "saw", 380, 4, 0.02, 0.35), "hurt": (380, 150, 95, "saw", 450, 3, 0.0, 0.35),
+                "death": (1200, 120, 35, "saw", 360, 3, 0.015, 0.4)},
+    "horse": {"ambient": (1100, 330, 220, "saw", 900, 3, 0.03, 0.12), "hurt": (600, 700, 420, "saw", 1300, 3, 0.02, 0.1),
+              "death": (1300, 520, 140, "saw", 1000, 3, 0.03, 0.12)},
+    "donkey": {"ambient": (1300, 260, 520, "saw", 1100, 3, 0.02, 0.1), "hurt": (550, 600, 380, "saw", 1200, 3, 0.02, 0.1),
+               "death": (1200, 480, 120, "saw", 1000, 3, 0.03, 0.1)},
+    "mule": {"ambient": (1200, 240, 420, "saw", 1000, 3, 0.02, 0.1), "hurt": (520, 540, 340, "saw", 1100, 3, 0.02, 0.1),
+             "death": (1150, 430, 110, "saw", 950, 3, 0.03, 0.1)},
+    "llama": {"ambient": (800, 300, 380, "saw", 1500, 3, 0.04, 0.08), "hurt": (400, 520, 300, "saw", 1700, 3, 0.02, 0.08),
+              "death": (900, 420, 130, "saw", 1400, 3, 0.03, 0.1)},
+    "polar_bear": {"ambient": (1300, 90, 70, "saw", 300, 3, 0.01, 0.15), "hurt": (500, 150, 90, "saw", 380, 3, 0.0, 0.18),
+                   "death": (1300, 110, 35, "saw", 320, 3, 0.012, 0.2)},
+    "hoglin": {"ambient": (800, 85, 120, "saw", 360, 4, 0.02, 0.25), "hurt": (400, 160, 85, "saw", 500, 3, 0.0, 0.25),
+               "death": (1000, 120, 40, "saw", 380, 3, 0.015, 0.3)},
+    "sheep": {"ambient": (900, 380, 340, "saw", 1200, 4, 0.08, 0.05), "hurt": (450, 520, 360, "saw", 1300, 4, 0.06, 0.05),
+              "death": (800, 430, 160, "saw", 1100, 4, 0.07, 0.06)},
+    "piglin": {"ambient": (550, 200, 150, "pulse", 700, 4, 0.0, 0.2), "hurt": (400, 330, 200, "pulse", 900, 4, 0.0, 0.18),
+               "death": (800, 260, 70, "pulse", 650, 4, 0.0, 0.2)},
+    "parrot": {"ambient": (350, 900, 1300, "pulse", 2200, 2, 0.04, 0.05), "hurt": (200, 1500, 1000, "pulse", 2500, 2, 0.0, 0.05),
+               "death": (500, 1300, 500, "pulse", 2000, 2, 0.02, 0.05)},
+    "wither_skeleton": {"ambient": (900, 80, 65, "saw", 600, 5, 0.01, 0.25), "hurt": (350, 140, 90, "saw", 750, 5, 0.0, 0.3),
+                        "death": (1000, 110, 45, "saw", 550, 5, 0.01, 0.3)},
+    "silverfish": {"ambient": (200, 1400, 1700, "pulse", 3000, 3, 0.0, 0.3), "hurt": (150, 1800, 1200, "pulse", 3200, 3, 0.0, 0.3),
+                   "death": (350, 1500, 600, "pulse", 2800, 3, 0.0, 0.3)},
+    "bat": {"ambient": (140, 3400, 2600, "pulse", 4500, 4, 0.0, 0.05), "hurt": (160, 3800, 2400, "pulse", 4800, 4, 0.0, 0.05),
+            "death": (300, 3200, 900, "pulse", 4200, 4, 0.0, 0.05)},
+    "bee": {"hurt": (260, 260, 210, "saw", 900, 3, 0.04, 0.2), "death": (500, 280, 90, "saw", 800, 3, 0.05, 0.2)},
+    "blaze": {"ambient": (1100, 120, 160, "saw", 800, 2, 0.02, 0.6), "hurt": (400, 220, 120, "saw", 1100, 2, 0.0, 0.6),
+              "death": (1200, 180, 50, "saw", 700, 2, 0.02, 0.7)},
+    "cat": {"ambient": (700, 560, 880, "saw", 1700, 4, 0.03, 0.08), "hurt": (350, 900, 520, "saw", 2000, 3, 0.0, 0.1),
+            "death": (600, 800, 250, "saw", 1500, 3, 0.02, 0.1)},
+    "ocelot": {"ambient": (600, 480, 700, "saw", 1500, 4, 0.03, 0.1), "hurt": (320, 800, 480, "saw", 1800, 3, 0.0, 0.12),
+               "death": (550, 700, 220, "saw", 1400, 3, 0.02, 0.12)},
+    "cod": {"ambient": (200, 500, 420, "pulse", 1000, 2, 0.0, 0.3), "hurt": (160, 700, 450, "pulse", 1200, 2, 0.0, 0.3),
+            "death": (320, 600, 200, "pulse", 900, 2, 0.0, 0.3)},
+    "salmon": {"ambient": (220, 460, 400, "pulse", 950, 2, 0.0, 0.3), "hurt": (170, 650, 420, "pulse", 1100, 2, 0.0, 0.3),
+               "death": (340, 560, 190, "pulse", 880, 2, 0.0, 0.3)},
+    "dolphin": {"ambient": (500, 2600, 3600, "sine", 3500, 3, 0.04, 0.05), "ambient_water": (600, 2200, 3200, "sine", 3000, 3, 0.05, 0.08),
+                "hurt": (300, 3500, 1800, "sine", 3600, 3, 0.0, 0.05), "death": (700, 3000, 700, "sine", 3000, 3, 0.03, 0.06),
+                "attack": (260, 2800, 3900, "sine", 3800, 3, 0.0, 0.08)},
+    "ender_dragon": {"ambient": (1800, 75, 55, "saw", 280, 2, 0.015, 0.35), "hurt": (800, 130, 65, "saw", 320, 2, 0.0, 0.4),
+                     "death": (2500, 100, 28, "saw", 260, 2, 0.02, 0.45)},
+    "enderman": {"ambient": (900, 110, 240, "saw", 500, 3, 0.05, 0.2), "hurt": (450, 520, 180, "saw", 900, 3, 0.06, 0.3),
+                 "death": (1200, 300, 60, "saw", 620, 3, 0.07, 0.3)},
+    "fox": {"ambient": (350, 700, 1000, "saw", 2000, 4, 0.02, 0.1), "hurt": (250, 1100, 650, "saw", 2400, 3, 0.0, 0.12),
+            "death": (500, 950, 300, "saw", 2000, 3, 0.02, 0.12)},
+    "ghast": {"ambient": (1400, 450, 800, "saw", 1500, 3, 0.05, 0.12), "hurt": (600, 900, 450, "saw", 1700, 3, 0.04, 0.12),
+              "death": (1800, 800, 150, "saw", 1400, 3, 0.06, 0.15)},
+    "guardian": {"ambient": (1200, 130, 95, "pulse", 380, 3, 0.03, 0.25), "ambient_land": (1000, 160, 110, "pulse", 520, 3, 0.02, 0.3),
+                 "attack": (900, 90, 300, "saw", 420, 3, 0.03, 0.2), "hurt": (400, 210, 120, "pulse", 450, 3, 0.0, 0.25),
+                 "hurt_land": (350, 240, 140, "pulse", 560, 3, 0.0, 0.3), "death": (1300, 160, 40, "pulse", 380, 3, 0.02, 0.3),
+                 "death_land": (1100, 180, 60, "pulse", 520, 3, 0.02, 0.35)},
+    "iron_golem": {"hurt": (350, 130, 90, "pulse", 600, 4, 0.0, 0.1), "death": (900, 100, 45, "pulse", 500, 4, 0.0, 0.12),
+                   "attack": (300, 80, 140, "saw", 700, 4, 0.0, 0.15)},
+    "magma_cube": {"hurt": (260, 90, 60, "pulse", 300, 2, 0.0, 0.5), "death": (500, 80, 40, "pulse", 260, 2, 0.0, 0.5)},
+    "panda": {"ambient": (800, 240, 200, "saw", 800, 3, 0.04, 0.1), "hurt": (500, 420, 260, "saw", 1000, 3, 0.03, 0.1),
+              "death": (1000, 340, 90, "saw", 800, 3, 0.05, 0.12)},
+    "phantom": {"ambient": (1200, 280, 380, "saw", 1100, 3, 0.07, 0.3), "hurt": (500, 500, 300, "saw", 1300, 3, 0.05, 0.3),
+                "death": (1200, 420, 90, "saw", 1000, 3, 0.07, 0.35)},
+    "pillager": {"ambient": (800, 160, 130, "saw", 700, 4, 0.02, 0.15), "hurt": (380, 250, 160, "saw", 850, 4, 0.0, 0.15),
+                 "death": (900, 210, 70, "saw", 700, 4, 0.02, 0.18)},
+    "rabbit": {"ambient": (200, 1000, 1200, "pulse", 2300, 3, 0.0, 0.15), "hurt": (200, 1500, 900, "pulse", 2600, 3, 0.0, 0.15),
+               "death": (400, 1300, 400, "pulse", 2200, 3, 0.0, 0.15), "attack": (150, 800, 1600, "pulse", 2600, 3, 0.0, 0.2)},
+    "slime": {"hurt": (240, 220, 140, "pulse", 520, 2, 0.06, 0.2), "death": (450, 200, 80, "pulse", 440, 2, 0.08, 0.2),
+              "attack": (200, 150, 300, "pulse", 560, 2, 0.04, 0.2)},
+    "snow_golem": {"ambient": (500, 360, 300, "pulse", 1100, 3, 0.02, 0.35), "hurt": (250, 500, 320, "pulse", 1300, 3, 0.0, 0.35),
+                   "death": (600, 400, 140, "pulse", 1000, 3, 0.02, 0.4)},
+    "squid": {"ambient": (500, 220, 180, "sine", 600, 2, 0.06, 0.3), "hurt": (280, 340, 220, "sine", 800, 2, 0.04, 0.3),
+              "death": (700, 280, 90, "sine", 600, 2, 0.06, 0.35)},
+    "strider": {"ambient": (500, 1100, 1500, "saw", 2200, 3, 0.05, 0.15), "hurt": (300, 1500, 900, "saw", 2400, 3, 0.0, 0.15),
+                "death": (700, 1300, 350, "saw", 2000, 3, 0.04, 0.18)},
+    "turtle": {"ambient_land": (500, 320, 260, "pulse", 800, 3, 0.04, 0.2), "hurt": (350, 420, 260, "pulse", 900, 3, 0.0, 0.2),
+               "death": (800, 340, 110, "pulse", 750, 3, 0.03, 0.22)},
+    "villager": {"ambient": (500, 200, 240, "pulse", 1000, 3, 0.03, 0.12), "hurt": (350, 300, 200, "pulse", 1200, 3, 0.0, 0.12),
+                 "death": (900, 250, 90, "pulse", 950, 3, 0.03, 0.15)},
+    "witch": {"ambient": (900, 220, 330, "saw", 1300, 3, 0.07, 0.1), "hurt": (500, 420, 260, "saw", 1500, 3, 0.05, 0.1),
+              "death": (1000, 350, 110, "saw", 1200, 3, 0.07, 0.12)},
+    "wither": {"ambient": (1400, 85, 60, "saw", 340, 2, 0.02, 0.4), "hurt": (550, 150, 80, "saw", 420, 2, 0.0, 0.45),
+               "death": (2200, 110, 30, "saw", 300, 2, 0.02, 0.5)},
+    "wolf": {"ambient": (600, 260, 190, "saw", 800, 3, 0.04, 0.12), "hurt": (400, 600, 340, "saw", 1100, 3, 0.02, 0.12),
+             "death": (900, 450, 130, "saw", 900, 3, 0.04, 0.15)},
+}
+# new event -> (mob, call, pitch factor, duration factor, formant factor)
+MOB_DERIVED = {
+    "entity.drowned.ambient_water": ("drowned", "ambient", 0.9, 1.0, 0.55), "entity.drowned.hurt_water": ("drowned", "hurt", 0.9, 1.0, 0.55),
+    "entity.drowned.death_water": ("drowned", "death", 0.9, 1.0, 0.55),
+    "entity.magma_cube.hurt_small": ("magma_cube", "hurt", 1.6, 0.7, 1.2), "entity.magma_cube.death_small": ("magma_cube", "death", 1.6, 0.7, 1.2),
+    "entity.slime.hurt_small": ("slime", "hurt", 1.6, 0.7, 1.2), "entity.slime.death_small": ("slime", "death", 1.6, 0.7, 1.2),
+    "entity.turtle.hurt_baby": ("turtle", "hurt", 1.7, 0.7, 1.3), "entity.turtle.death_baby": ("turtle", "death", 1.7, 0.7, 1.3),
+    "entity.polar_bear.ambient_baby": ("polar_bear", "ambient", 1.8, 0.6, 1.4),
+    "entity.hoglin.attack": ("hoglin", "hurt", 0.8, 0.8, 0.9),
+    "entity.zombie.attack_wooden_door": ("zombie", "hurt", 0.7, 0.8, 0.8), "entity.zombie.attack_iron_door": ("zombie", "hurt", 0.55, 0.9, 1.2),
+}
+
+
+def mob_voices():
+    o = []
+    seed = 12000
+    for mob in sorted(MOB_VOICES):
+        for call in sorted(MOB_VOICES[mob]):
+            dur, f0, f1, wave, form, fq, vib, nz = MOB_VOICES[mob][call]
+            o.append(voice("entity.%s.%s" % (mob, call), seed, dur, f0, f1, wave, form, fq, vib=vib, noise_amt=nz, variants=2))
+            seed += 3
+    base = dict(MOB_VOICES)
+    base["zombie"] = {"hurt": (330, 170, 110, "saw", 650, 4, 0.0, 0.2)}
+    for sid in sorted(MOB_DERIVED):
+        mob, call, pf, df, ff = MOB_DERIVED[sid]
+        dur, f0, f1, wave, form, fq, vib, nz = base[mob][call]
+        o.append(voice(sid, seed, int(dur * df), f0 * pf, f1 * pf, wave, form * ff, fq, vib=vib, noise_amt=nz, variants=2))
+        seed += 3
+    # strider steps (lava: bubbling squelch), tier 2 steps that had no sound at all
+    o.append(perc("entity.strider.step", seed, 150, nz=[("pink", "bp", 1200, 0.9, 30, 0.8, 0)], body=(160, 90, 55, 0.8, 0), var=2, peak=-10))
+    seed += 3
+    o.append(crackle("entity.strider.step_lava", seed, 260, 8, 900, color="pink", dec=18, var=2, peak=-10))
+    return o
+
+
 # ------------------------------------------------------------------------------------------------ interaction / effect sounds
 # Archetypes (all synthesised): perc = noise bursts + sine body + ringing partials; whoosh = swept band noise; crackle = random
 # grains; door = creak (saw through a band pass) + latch click / thud. Gaps in the id table: tools/mc/audio/coverage.py (tier 1).
@@ -666,27 +793,13 @@ EXTRA_ALIASES = {
     "ambient.cave": [b + ".loop" for b in ("ambient.basalt_deltas", "ambient.crimson_forest", "ambient.nether_wastes", "ambient.soul_sand_valley",
                                            "ambient.warped_forest", "ambient.underwater")],
     "ambient.drip": ["ambient.underwater.loop.additions", "ambient.underwater.loop.additions.rare", "ambient.underwater.loop.additions.ultra_rare"],
-    # Tier 2 mob stand-ins: related mobs share the voice (no new samples)
-    "entity.zombie.ambient": ["block.note_block.imitate.zombie"] + [f"entity.{m}.ambient" for m in ("husk", "zombie_villager", "drowned")],
-    "entity.zombie.hurt": [f"entity.{m}.hurt" for m in ("husk", "zombie_villager", "drowned")],
-    "entity.zombie.death": ["block.note_block.imitate.ender_dragon"] + [f"entity.{m}.death" for m in ("husk", "zombie_villager", "drowned")],
+    # Tier 2: ambient / hurt / death of every mob has its own voice (mob_voices()); only steps and note block imitations stay aliases
+    "entity.zombie.ambient": ["block.note_block.imitate.zombie"],
+    "entity.zombie.death": ["block.note_block.imitate.ender_dragon"],
     "entity.zombie.step": [f"entity.{m}.step" for m in ("husk", "zombie_villager", "drowned", "piglin", "wither_skeleton", "iron_golem")],
-    "entity.cow.ambient": [f"entity.{m}.ambient" for m in ("horse", "donkey", "mule", "llama", "polar_bear", "hoglin", "sheep")],
-    "entity.cow.hurt": [f"entity.{m}.hurt" for m in ("horse", "donkey", "mule", "llama", "polar_bear", "hoglin", "sheep")],
-    "entity.cow.death": [f"entity.{m}.death" for m in ("horse", "donkey", "mule", "llama", "polar_bear", "hoglin", "sheep")],
     "entity.cow.step": ["entity.pig.step", "entity.sheep.step", "entity.horse.step", "entity.horse.step_wood", "entity.llama.step",
                         "entity.wolf.step", "entity.hoglin.step", "entity.polar_bear.step", "entity.panda.step", "entity.chicken.step",
                         "entity.parrot.step"],
-    "entity.pig.hurt": ["entity.piglin.hurt"],
-    "entity.pig.death": ["entity.piglin.death"],
-    "entity.chicken.ambient": ["entity.parrot.ambient"],
-    "entity.chicken.hurt": ["entity.parrot.hurt"],
-    "entity.chicken.death": ["entity.parrot.death"],
-    "entity.skeleton.hurt": ["entity.wither_skeleton.hurt"],
-    "entity.skeleton.death": ["entity.wither_skeleton.death"],
-    "entity.spider.ambient": ["entity.silverfish.ambient"],
-    "entity.spider.hurt": ["entity.silverfish.hurt"],
-    "entity.spider.death": ["entity.silverfish.death"],
     "entity.spider.step": ["entity.silverfish.step"],
     "block.fire.ambient": ["block.campfire.crackle", "block.furnace.fire_crackle"],
     "block.wood.place": ["entity.item_frame.place", "entity.painting.place", "entity.leash_knot.place"],
@@ -697,9 +810,9 @@ EXTRA_ALIASES = {
     "entity.lightning_bolt.impact": ["item.trident.thunder"],
     "ui.button.click": ["ui.loom.select_pattern", "ui.stonecutter.select_recipe"],
     "entity.item.pickup": ["ui.loom.take_result", "ui.stonecutter.take_result", "ui.cartography_table.take_result"],
-    "entity.skeleton.ambient": ["block.note_block.imitate.skeleton", "block.note_block.imitate.wither_skeleton", "entity.wither_skeleton.ambient"],
+    "entity.skeleton.ambient": ["block.note_block.imitate.skeleton", "block.note_block.imitate.wither_skeleton"],
     "entity.creeper.hurt": ["block.note_block.imitate.creeper"],
-    "entity.pig.ambient": ["block.note_block.imitate.piglin", "entity.piglin.ambient"],
+    "entity.pig.ambient": ["block.note_block.imitate.piglin"],
 }
 
 
@@ -709,7 +822,7 @@ def mc():
         for act in ACTS:
             s = block(mat, act)
             sounds.append(s)
-    sounds += ambience() + uisounds() + entities() + effects() + music() + coverage_sounds()
+    sounds += ambience() + uisounds() + entities() + effects() + music() + coverage_sounds() + mob_voices()
     byid = {x["id"]: x for x in sounds}
     for sid, names in EXTRA_ALIASES.items():
         byid[sid].setdefault("aliases", []).extend(names)

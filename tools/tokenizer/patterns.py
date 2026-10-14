@@ -60,7 +60,7 @@ def read_dis(path):
 def read_costs(path):
     """addr -> Ir (Selbstkosten)"""
     kosten = defaultdict(int)
-    letzte = 0
+    last = 0
     in_call = False
     for z in open(path, errors="replace"):
         if z.startswith(("calls=", "jump=", "jcnd=")):
@@ -75,10 +75,10 @@ def read_costs(path):
         if p.startswith("0x"):
             a = int(p, 16)
         elif p == "*":
-            a = letzte
+            a = last
         else:
-            a = letzte + int(p)
-        letzte = a
+            a = last + int(p)
+        last = a
         if in_call:
             in_call = False   # the inclusive cost of the call, not the self cost
             continue
@@ -86,11 +86,11 @@ def read_costs(path):
     return kosten
 
 
-def ist_bedingt(mn):
+def is_conditional(mn):
     return mn.startswith("j") and mn != "jmp"
 
 
-def stamm(r):
+def stem(r):
     r = r.lstrip("%")
     fest = {
         "al": "rax", "ax": "rax", "eax": "rax", "bl": "rbx", "bx": "rbx", "ebx": "rbx",
@@ -125,7 +125,7 @@ def main():
         nxt = addrs[i + 1] if i + 1 < len(addrs) else None
 
         # (1) an unconditional jump directly behind a conditional one -> block layout
-        if ist_bedingt(mn) and nxt is not None and code[nxt][0] == "jmp" and code[nxt][2] == sym:
+        if is_conditional(mn) and nxt is not None and code[nxt][0] == "jmp" and code[nxt][2] == sym:
             zaehle("jmp direkt hinter jcc (Blocklayout)", kosten.get(nxt, 0))
 
         # (2) a setcc chain instead of a direct jump
@@ -138,7 +138,7 @@ def main():
                 mb = code[b][0]
                 kette.append(b)
                 if mb == "test":
-                    if j + 1 < len(addrs) and ist_bedingt(code[addrs[j + 1]][0]):
+                    if j + 1 < len(addrs) and is_conditional(code[addrs[j + 1]][0]):
                         hit = True
                     break
                 if mb not in ("movzbl", "movzwl", "mov"):
@@ -172,8 +172,8 @@ def main():
             zaehle("Rahmenverwaltung (rsp<->rbp)", kosten.get(a, 0))
         elif mn == "mov" and "," in ops:
             q, z = ops.rsplit(",", 1)
-            gesichert = ("%r12", "%r13", "%r14", "%r15", "%rbx")
-            if (q in gesichert and "(%rbp)" in z) or (z in gesichert and "(%rbp)" in q):
+            secured = ("%r12", "%r13", "%r14", "%r15", "%rbx")
+            if (q in secured and "(%rbp)" in z) or (z in secured and "(%rbp)" in q):
                 zaehle("Rahmenverwaltung (callee-saved sichern/holen)", kosten.get(a, 0))
 
     print("\n== patterns (dynamically weighted) ==")

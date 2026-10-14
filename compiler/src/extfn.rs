@@ -70,9 +70,9 @@ struct ExportSig {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AggArg {
     /// up to 16 octets: one or two eightbyte words, `sse[k]` = word `k` is of the SSE class
-    Words { size: u32, sse: Vec<bool> },
+    Words { size: u32, sse: Vec<bool>, hfa: Option<crate::abi::Hfa> },
     /// over 16 octets: a pointer to a copy owned by the caller
-    Ref { size: u32 },
+    Ref { size: u32, hfa: Option<crate::abi::Hfa> },
 }
 
 /// How the result of an `#[export_c]` function crosses the Firn boundary.
@@ -82,9 +82,10 @@ pub enum AggRet {
     #[default]
     None,
     /// an aggregate of at most 8 octets: one word in `rax` (`sse` = `xmm0`)
-    Word { size: u32, sse: bool },
-    /// an aggregate over 8 octets: hidden pointer in the first integer register, handed back in `rax`
-    Sret { size: u32 },
+    Word { size: u32, sse: bool, hfa: Option<crate::abi::Hfa> },
+    /// an aggregate over 8 octets: hidden pointer in the first integer register, handed back in `rax`.
+    /// `sse[k]` = eightbyte `k` is of the SSE class (empty over 16 octets).
+    Sret { size: u32, sse: Vec<bool>, hfa: Option<crate::abi::Hfa> },
 }
 
 /// The aggregate part of an export's signature, recorded by lowering (it needs the struct layouts).
@@ -255,7 +256,7 @@ pub fn export_thunk_info() -> Vec<ExportThunk> {
                 for (i, (_, ty, _)) in sig.params.iter().enumerate() {
                     let mut k = WinParam::Int;
                     match abi.args.get(i).cloned().flatten() {
-                        Some(AggArg::Words { size, sse }) => k = WinParam::Agg { size, sse },
+                        Some(AggArg::Words { size, sse, .. }) => k = WinParam::Agg { size, sse },
                         Some(AggArg::Ref { .. }) => {}
                         None => {
                             if let TypeExpr::Named(n, _) = ty {
@@ -272,7 +273,7 @@ pub fn export_thunk_info() -> Vec<ExportThunk> {
                 }
                 let ret = match abi.ret {
                     AggRet::None => WinRet::Plain,
-                    AggRet::Word { size, sse } => WinRet::Word { size, sse },
+                    AggRet::Word { size, sse, .. } => WinRet::Word { size, sse },
                     AggRet::Sret { .. } => WinRet::Sret,
                 };
                 let sse_count: usize = params
@@ -290,75 +291,129 @@ pub fn export_thunk_info() -> Vec<ExportThunk> {
     })
 }
 
-/// Linux `.so` (`--shared`, x86-64 or aarch64): the aggregate shapes whose Firn placement differs from the C ABI of the
-/// platform. Firn takes an aggregate as eightbyte words placed one by one, passes a struct over 16 octets as a pointer
-/// and answers a struct over 8 octets through a hidden pointer. C (System V / AAPCS64) agrees on small integer structs
-/// that fit in the registers; every other shape would silently read the wrong registers, so it is refused here
-/// (the Windows DLL has a Win64 thunk for all of them). Returns one message per offending export.
-pub fn so_abi_errors(a64: bool) -> Vec<String> {
+/// One parameter of an export as the Linux `.so` entry thunk (`so_thunk.rs`) sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SoKind {
+    /// integer, pointer, bool
+    Int,
+    F32,
+    F64,
+    V128,
+    /// a struct of at most 16 octets: Firn eightbyte words (`sse[k]`: word `k` in an SSE register)
+    Words { size: u32, sse: Vec<bool>, hfa: Option<crate::abi::Hfa> },
+    /// a struct over 16 octets: a pointer to a copy on the Firn side
+    Ref { size: u32, hfa: Option<crate::abi::Hfa> },
+}
+
+/// One Linux `.so` entry thunk to write: the C name is the thunk, `internal` the Firn function behind it.
+pub struct SoThunk {
+    pub internal: String,
+    pub c_name: String,
+    pub params: Vec<SoKind>,
+    pub ret: AggRet,
+}
+
+fn so_kinds(sig: &ExportSig, abi: &ExportAbi) -> Vec<SoKind> {
+    sig.params
+        .iter()
+        .enumerate()
+        .map(|(i, (_, ty, _))| match abi.args.get(i).cloned().flatten() {
+            Some(AggArg::Words { size, sse, hfa }) => SoKind::Words { size, sse, hfa },
+            Some(AggArg::Ref { size, hfa }) => SoKind::Ref { size, hfa },
+            None => match ty {
+                TypeExpr::Named(n, _) => match n.as_str() {
+                    "f32" => SoKind::F32,
+                    "f64" => SoKind::F64,
+                    "v128" => SoKind::V128,
+                    _ => SoKind::Int,
+                },
+                _ => SoKind::Int,
+            },
+        })
+        .collect()
+}
+
+/// Does the C ABI of the platform (System V x86-64, AAPCS64) place anything of this export differently from Firn?
+/// Firn takes an aggregate as eightbyte words placed one by one (each word in a register of its class, else the stack),
+/// passes a struct over 16 octets as a pointer and answers a struct over 8 octets through a hidden pointer. C agrees on
+/// small integer structs that fit in the registers; every other shape needs the thunk of `so_thunk.rs`.
+fn so_differs(kinds: &[SoKind], ret: &AggRet, a64: bool) -> bool {
+    let (int_regs, sse_regs) = (if a64 { 8usize } else { 6 }, 8usize);
+    let (mut ni, mut nx) = (0usize, 0usize);
+    match ret {
+        AggRet::Sret { size, .. } => {
+            if a64 || *size <= 16 {
+                return true;
+            }
+            ni = 1;
+        }
+        AggRet::Word { sse: true, hfa, .. } if a64 => {
+            if hfa.map(|h| h.n) != Some(1) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    for k in kinds {
+        match k {
+            SoKind::Ref { hfa, .. } => {
+                if !a64 || hfa.is_some() {
+                    return true;
+                }
+                ni += 1;
+            }
+            SoKind::Words { sse, hfa, .. } => {
+                let (a, b) = (sse.iter().filter(|x| !**x).count(), sse.iter().filter(|x| **x).count());
+                if a64 && b > 0 {
+                    if hfa.map(|h| h.n) == Some(1) && a == 0 {
+                        nx += 1;
+                        continue;
+                    }
+                    return true;
+                }
+                if (ni < int_regs && ni + a > int_regs) || (nx < sse_regs && nx + b > sse_regs) {
+                    return true;
+                }
+                ni += a;
+                nx += b;
+            }
+            SoKind::F32 | SoKind::F64 | SoKind::V128 => nx += 1,
+            SoKind::Int => ni += 1,
+        }
+    }
+    false
+}
+
+/// The exports of a Linux `.so` (`--shared`, x86-64 or aarch64) whose C ABI differs from Firn's: one thunk each.
+pub fn so_thunk_info(a64: bool) -> Vec<SoThunk> {
     let exported: Vec<(String, String)> =
         EXPORTED.with(|e| e.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect());
-    let (int_regs, sse_regs) = (if a64 { 8 } else { 6 }, 8);
-    let mut errs = Vec::new();
+    let mut out = Vec::new();
     SIGS.with(|v| {
         for sig in v.borrow().iter() {
-            let internal = match exported.iter().find(|(_, c)| *c == sig.c_name) {
-                Some((k, _)) => k.clone(),
-                None => continue,
-            };
-            let abi = match ABIS.with(|m| m.borrow().get(&internal).cloned()) {
-                Some(a) => a,
-                None => continue,
-            };
-            let mut why: Vec<String> = Vec::new();
-            let (mut ni, mut nx) = (0usize, 0usize);
-            match &abi.ret {
-                AggRet::Sret { size } => {
-                    if a64 {
-                        why.push(format!("returns a struct of {} octets (AAPCS64: hidden pointer in x8 or x0:x1, Firn: x0)", size));
-                    } else if *size <= 16 {
-                        why.push(format!("returns a struct of {} octets (System V: rax:rdx / xmm0:xmm1, Firn: hidden pointer)", size));
-                    } else {
-                        ni = 1;
-                    }
-                }
-                AggRet::Word { size, sse } if a64 && *sse => {
-                    why.push(format!("returns a struct of {} octets of floats (AAPCS64: s0-s3 / d0-d3, Firn: one d0 word)", size));
-                }
-                _ => {}
-            }
-            for (i, (_, ty, _)) in sig.params.iter().enumerate() {
-                match abi.args.get(i).cloned().flatten() {
-                    Some(AggArg::Ref { size }) => {
-                        why.push(format!("parameter {} is a struct of {} octets (C passes a copy, Firn a pointer)", i + 1, size));
-                    }
-                    Some(AggArg::Words { size, sse }) => {
-                        let (a, b) = (sse.iter().filter(|x| !**x).count(), sse.iter().filter(|x| **x).count());
-                        if a64 && b > 0 {
-                            why.push(format!("parameter {} is a struct of {} octets with floats (AAPCS64 homogeneous float aggregate rules)", i + 1, size));
-                        } else if ni + a > int_regs || nx + b > sse_regs {
-                            why.push(format!("parameter {} is a struct of {} octets that no longer fits the registers (C puts all of it on the stack)", i + 1, size));
-                        } else {
-                            ni += a;
-                            nx += b;
-                        }
-                    }
-                    None => {
-                        let is_f = matches!(ty, TypeExpr::Named(n, _) if matches!(n.as_str(), "f32" | "f64" | "v128"));
-                        if is_f {
-                            nx += 1;
-                        } else {
-                            ni += 1;
-                        }
-                    }
-                }
-            }
-            if !why.is_empty() {
-                errs.push(format!("'{}' {}", sig.c_name, why.join("; ")));
+            let Some(internal) = exported.iter().find(|(_, c)| *c == sig.c_name).map(|(k, _)| k.clone()) else { continue };
+            let Some(abi) = ABIS.with(|m| m.borrow().get(&internal).cloned()) else { continue };
+            let kinds = so_kinds(sig, &abi);
+            if so_differs(&kinds, &abi.ret, a64) {
+                out.push(SoThunk { internal, c_name: sig.c_name.clone(), params: kinds, ret: abi.ret.clone() });
             }
         }
     });
-    errs
+    out
+}
+
+/// Does the export with this internal name get a thunk in a Linux `.so`? Then the Firn function keeps its internal
+/// symbol and the thunk carries the C name (`codegen_x86::label`).
+pub fn so_needs_thunk(internal: &str) -> bool {
+    if !crate::target::shared() || crate::target::windows() || crate::target::android() {
+        return false;
+    }
+    let a64 = matches!(crate::target::active(), crate::target::Target::Aarch64);
+    let Some(abi) = ABIS.with(|m| m.borrow().get(internal).cloned()) else { return false };
+    let Some(c_name) = export_link_name(internal) else { return false };
+    SIGS.with(|v| {
+        v.borrow().iter().find(|s| s.c_name == c_name).map(|sig| so_differs(&so_kinds(sig, &abi), &abi.ret, a64)).unwrap_or(false)
+    })
 }
 
 /// C spelling of a Firn scalar type name, `None` if it is not one.

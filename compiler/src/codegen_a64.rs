@@ -859,6 +859,10 @@ pub fn emit(m: &Module) -> Result<String, String> {
             SHARED_TP_BASE, SHARED_TP_HI
         ));
     }
+    if crate::target::shared() {
+        e.raw(".text");
+        e.raw(&crate::so_thunk::runtime_asm()?);
+    }
     e.raw(".section .note.GNU-stack,\"\",%progbits");
     Ok(e.out)
 }

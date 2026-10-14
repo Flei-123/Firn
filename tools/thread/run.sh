@@ -169,7 +169,7 @@ const L_WITHOUT: u64 = 8
 const L_MUTEX: u64 = 16
 const L_ROUNDS: u64 = 30000
 
-fn seite() -> u64 {
+fn page() -> u64 {
     let r: i64 = syscall(L_SYS_MMAP, 0, 4096, 3, 34, -1, 0)
     if r < 0 {
         return 0
@@ -197,7 +197,7 @@ fn main() -> i32 {
     if !thread_init() {
         return 90
     }
-    let z: u64 = seite()
+    let z: u64 = page()
     if z == 0 {
         return 91
     }

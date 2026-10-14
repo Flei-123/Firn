@@ -25,6 +25,7 @@ a page.
 """
 import hashlib
 import os
+import random
 import re
 import socket
 import ssl
@@ -37,7 +38,9 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 WORK = os.path.join(ROOT, ".tls-work")
-PORT = 44330
+# Random base below the ephemeral range: a fixed base collided with concurrent runs
+# (other worktrees) and made the tests talk to each other's servers.
+PORT = int(os.environ.get("TLS_CHECK_PORT", 0)) or 20000 + random.randrange(0, 9000)
 FAILS = []
 OK = 0
 COUNTER_OK = 0
