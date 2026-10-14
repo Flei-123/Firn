@@ -140,6 +140,45 @@ want={9:("stone",40),10:("dirt",10),11:("stone",64)}
 ok=all(got[n]==want[n] for n in want) and all(got[n] is None for n in (12,13,14,15,36,37,38))
 sys.exit(0 if ok else 1)
 PY
+# ---- chest window (MCPLAY_CHEST_TEST): a chest next to the player (10 stone, 6 dirt, 64 stone); Open Window -> Window Items -> shift click both ways, pick up,
+# drag over four container slots, close; the chest content and the player's hotbar on the server must equal the client's prediction
+MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CHEST_TEST=1 MCPLAY_RUN_S=28 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player10 > "$W/ct3.out" 2>&1 &
+PP=$!
+sleep 5
+echo "gamemode survival Player10" >&3; echo "give Player10 stone 20" >&3; echo "give Player10 dirt 5" >&3
+echo "execute at Player10 run setblock ~1 ~ ~ minecraft:chest" >&3
+sleep 1
+echo "execute at Player10 run item replace block ~1 ~ ~ container.0 with minecraft:stone 10" >&3
+echo "execute at Player10 run item replace block ~1 ~ ~ container.1 with minecraft:dirt 6" >&3
+echo "execute at Player10 run item replace block ~1 ~ ~ container.26 with minecraft:stone 64" >&3
+sleep 17
+echo "execute at Player10 run data get block ~1 ~ ~ Items" >&3
+echo "data get entity Player10 Inventory" >&3
+sleep 2
+wait $PP
+C3L=$(grep 'mcplay: chesttest c1=' "$W/ct3.out" | head -1)
+echo "  $(grep 'mcplay: chesttest open' "$W/ct3.out" | head -1)"; echo "  $C3L"
+C3BAD=$(grep -o ' bad=[0-9]*' "$W/ct3.out" | head -1 | cut -d= -f2)
+[ "${C3BAD:-1}" -eq 0 ] || { echo "  FAIL  chest: inv bad=${C3BAD:-?}"; ERR=1; }
+case "$C3L" in *"c1="*"x11"*"c5="*"x64"*"c10=7 c13=7"*"cursor=-1x0"*) ;; *) echo "  FAIL  chest: local result $C3L"; ERR=1;; esac
+CH=$(grep 'has the following block data' "$W/server.log" | tail -1); PI=$(grep 'Player10 has the following entity data' "$W/server.log" | tail -1)
+python3 - "$CH" "$PI" <<'PY' || ERR=1
+import re,sys
+def slot(t, n):
+    for m in re.finditer(r'\{[^{}]*Slot: %db[^{}]*\}' % n, t):
+        c=re.search(r'(?:Count: |count: )(\d+)', m.group(0))
+        i=re.search(r'(?:id: |id:)"minecraft:(\w+)"', m.group(0))
+        if c and i: return (i.group(1), int(c.group(1)))
+    return None
+ch, pi = sys.argv[1], sys.argv[2]
+got={n: slot(ch, n) for n in (0,1,5,10,11,12,13,26)}
+hot={n: slot(pi, n) for n in (0,1)}
+print("  server chest: " + " ".join("%d=%s" % (n, got[n]) for n in sorted(got)) + " | hotbar: " + " ".join("%d=%s" % (n, hot[n]) for n in sorted(hot)))
+want={1:("dirt",11),5:("stone",64),10:("stone",7),11:("stone",7),12:("stone",7),13:("stone",7)}
+ok=all(got[n]==want[n] for n in want) and got[0] is None and got[26] is None and hot[0]==("stone",2) and hot[1] is None
+sys.exit(0 if ok else 1)
+PY
 echo stop >&3; sleep 1
 [ $ERR -eq 0 ] && echo "RESULT mc-play-inv: ok" || echo "RESULT mc-play-inv: FAIL"
 exit $ERR

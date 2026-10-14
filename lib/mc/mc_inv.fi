@@ -25,6 +25,12 @@
 //   inv_drag_begin/add/end(cl, i, ...)       Drag (mode 5) over several slots (type 0 = split evenly, 1 = one each)
 //   inv_drop_slot(cl, i, slot, all)          Drop (mode 4) of a slot via Click Container
 //   inv_local_drop(i, slot, all)             local part of the "Drop Item" player action (the caller sends the action)
+//   Container windows (chest, shulker box, hopper, dispenser / dropper; window id != 0): inv_on_open_window_v / inv_on_close_window_v track the
+//   open window, its slots live behind the player slots (internal index 46 + k = container slot k; the 36 player slots of the window map to
+//   the internal slots 9..44). Window Items / Set Slot / Click Container of that window are translated (win_to_int / int_to_win), shift click
+//   goes container -> player (reverse) and player -> container (vanilla ChestMenu.quickMoveStack). Other menu types (crafting table, furnace,
+//   anvil, ...) are tracked as "unsupported" (inv_window_slots = -1): their items are ignored and clicks are not sent.
+//   inv_window(i) / inv_window_slots(i) / inv_win_item(i, k) / inv_win_count(i, k) / inv_close_window(cl, i)
 import std.rt
 import std.bytes
 import mc.mc_client
@@ -40,12 +46,16 @@ export {
     inv_eff, inv_held_eff, inv_set_efficiency_id, inv_cursor_item, inv_cursor_count, inv_use_registry, inv_on_set_cursor_v,
     inv_click, inv_click_build, inv_drop_slot, inv_local_drop, inv_set_eff, inv_click_kind, inv_sig, inv_max_stack, inv_cursor_sig,
     inv_set_creative, inv_drag_begin, inv_drag_add, inv_drag_end,
+    INV_CAP, inv_on_open_window_v, inv_on_close_window_v, inv_close_window, inv_local_close, inv_window, inv_window_slots,
+    inv_win_item, inv_win_count, inv_win_to_int, inv_int_to_win, inv_window_size,
 }
 
 const SLOT_CUR: i32 = 1000
 const CLICK_OUTSIDE: i32 = 0 - 999
 
 const INV_SLOTS: usize = 46
+const INV_CAP: usize = 100 // 46 player-window slots + up to 54 container slots
+const CONT0: i32 = 46
 const INV_HOTBAR0: i32 = 36
 const INV_MAIN0: i32 = 9
 
@@ -69,24 +79,27 @@ struct Inv {
     bad: u32,
     qc_status: i32, // drag (quick craft) state: 0 = none, 1 = collecting slots
     qc_type: i32,
-    qc_mask: u64, // dragged-over slots, bit k = slot k
+    qc_mask: u64, // dragged-over slots, bit k = internal slot k (k < 64)
+    qc_hi: u64, // bit k = internal slot 64 + k
+    win: i32, // open window id (0 = the player window)
+    win_n: i32, // container slots of the open window (-1 = a window type we cannot model)
     creative: bool, // drag type 2 (clone) is only valid in creative
 }
 
 fn inv_new() -> Inv {
-    var v: Inv = Inv { ids: rt.heap_alloc(INV_SLOTS * 4), counts: rt.heap_alloc(INV_SLOTS * 4), effs: rt.heap_alloc(INV_SLOTS * 4),
-        sigs: rt.heap_alloc(INV_SLOTS * 4), maxs: rt.heap_alloc(INV_SLOTS * 4), cur_sig: 0, cur_max: 0,
-        cur_id: 0 - 1, cur_count: 0, cur_eff: 0, eff_id: 0 - 1, reg: 0, state_id: 0, action: 1, n_updates: 0 as u32, n_clicks: 0 as u32, bad: 0 as u32, qc_status: 0, qc_type: 0, qc_mask: 0 as u64, creative: false }
+    var v: Inv = Inv { ids: rt.heap_alloc(INV_CAP * 4), counts: rt.heap_alloc(INV_CAP * 4), effs: rt.heap_alloc(INV_CAP * 4),
+        sigs: rt.heap_alloc(INV_CAP * 4), maxs: rt.heap_alloc(INV_CAP * 4), cur_sig: 0, cur_max: 0,
+        cur_id: 0 - 1, cur_count: 0, cur_eff: 0, eff_id: 0 - 1, reg: 0, state_id: 0, action: 1, n_updates: 0 as u32, n_clicks: 0 as u32, bad: 0 as u32, qc_status: 0, qc_type: 0, qc_mask: 0 as u64, qc_hi: 0 as u64, win: 0, win_n: 0, creative: false }
     inv_clear(&v)
     return v
 }
 
 fn inv_free(v: *mut Inv) {
-    rt.heap_free((*v).ids, INV_SLOTS * 4)
-    rt.heap_free((*v).counts, INV_SLOTS * 4)
-    rt.heap_free((*v).effs, INV_SLOTS * 4)
-    rt.heap_free((*v).sigs, INV_SLOTS * 4)
-    rt.heap_free((*v).maxs, INV_SLOTS * 4)
+    rt.heap_free((*v).ids, INV_CAP * 4)
+    rt.heap_free((*v).counts, INV_CAP * 4)
+    rt.heap_free((*v).effs, INV_CAP * 4)
+    rt.heap_free((*v).sigs, INV_CAP * 4)
+    rt.heap_free((*v).maxs, INV_CAP * 4)
     (*v).ids = 0
     (*v).counts = 0
     (*v).effs = 0
@@ -100,25 +113,25 @@ fn inv_cursor_item(v: *mut Inv) -> i32 { return (*v).cur_id }
 fn inv_cursor_count(v: *mut Inv) -> i32 { return (*v).cur_count }
 
 fn inv_eff(v: *mut Inv, slot: i32) -> i32 {
-    if slot < 0 || slot as usize >= INV_SLOTS { return 0 }
+    if slot < 0 || slot as usize >= INV_CAP { return 0 }
     return rt.ld32((*v).effs, slot as usize) as i32
 }
 fn inv_held_eff(v: *mut Inv, k: i32) -> i32 { return inv_eff(v, INV_HOTBAR0 + k) }
 
 // component signature of a stack (0 = no components; equal signatures = same component list, 1.20.5+) and its max_stack_size component (0 = none)
 fn inv_sig(v: *mut Inv, slot: i32) -> i32 {
-    if slot < 0 || slot as usize >= INV_SLOTS { return 0 }
+    if slot < 0 || slot as usize >= INV_CAP { return 0 }
     return rt.ld32((*v).sigs, slot as usize) as i32
 }
 fn inv_max_stack(v: *mut Inv, slot: i32) -> i32 {
-    if slot < 0 || slot as usize >= INV_SLOTS { return 0 }
+    if slot < 0 || slot as usize >= INV_CAP { return 0 }
     return rt.ld32((*v).maxs, slot as usize) as i32
 }
 fn inv_cursor_sig(v: *mut Inv) -> i32 { return (*v).cur_sig }
 
 fn set_extra(v: *mut Inv, slot: i32, sig: i32, mx: i32) {
     if slot == SLOT_CUR { (*v).cur_sig = sig; (*v).cur_max = mx; return }
-    if slot < 0 || slot as usize >= INV_SLOTS { return }
+    if slot < 0 || slot as usize >= INV_CAP { return }
     rt.st32((*v).sigs, slot as usize, sig as u32)
     rt.st32((*v).maxs, slot as usize, mx as u32)
 }
@@ -126,13 +139,13 @@ fn set_extra(v: *mut Inv, slot: i32, sig: i32, mx: i32) {
 // sets the Efficiency level of a slot (SLOT_CUR = the carried stack)
 fn inv_set_eff(v: *mut Inv, slot: i32, lvl: i32) {
     if slot == SLOT_CUR { (*v).cur_eff = lvl; return }
-    if slot < 0 || slot as usize >= INV_SLOTS { return }
+    if slot < 0 || slot as usize >= INV_CAP { return }
     rt.st32((*v).effs, slot as usize, lvl as u32)
 }
 
 fn inv_clear(v: *mut Inv) {
     var i: usize = 0
-    while i < INV_SLOTS {
+    while i < INV_CAP {
         rt.st32((*v).ids, i, 0 as u32)
         rt.st32((*v).counts, i, 0 as u32)
         rt.st32((*v).effs, i, 0 as u32)
@@ -147,6 +160,156 @@ fn inv_clear(v: *mut Inv) {
     (*v).cur_max = 0
     (*v).qc_status = 0
     (*v).qc_mask = 0 as u64
+    (*v).qc_hi = 0 as u64
+    (*v).win = 0
+    (*v).win_n = 0
+}
+
+// ---- container windows: window slot <-> internal slot ----
+
+fn inv_window(v: *mut Inv) -> i32 { return (*v).win }
+fn inv_window_slots(v: *mut Inv) -> i32 { return (*v).win_n }
+
+// number of internal slots in play: 46 (player window) or 46 + container slots
+fn nint(v: *mut Inv) -> i32 {
+    if (*v).win != 0 && (*v).win_n > 0 { return CONT0 + (*v).win_n }
+    return INV_SLOTS as i32
+}
+
+// slots in the open window as the server numbers them (46 for window 0, container slots + 36 otherwise; 0 = unsupported window)
+fn inv_window_size(v: *mut Inv) -> i32 {
+    if (*v).win == 0 { return INV_SLOTS as i32 }
+    if (*v).win_n <= 0 { return 0 }
+    return (*v).win_n + 36
+}
+
+// is the internal slot part of the open window (window 0: all 46; a container: the container slots and the 36 main + hotbar slots)?
+fn in_win(v: *mut Inv, k: i32) -> bool {
+    if k < 0 { return false }
+    if (*v).win == 0 || (*v).win_n <= 0 { return (k as usize) < INV_SLOTS }
+    return (k >= 9 && k < 45) || (k >= CONT0 && k < CONT0 + (*v).win_n)
+}
+
+// window slot number (as in the packets) -> internal slot; -2 = outside the window
+fn inv_win_to_int(v: *mut Inv, ws: i32) -> i32 {
+    if ws < 0 { return 0 - 2 }
+    if (*v).win == 0 || (*v).win_n <= 0 {
+        if (ws as usize) < INV_SLOTS { return ws }
+        return 0 - 2
+    }
+    let n: i32 = (*v).win_n
+    if ws < n { return CONT0 + ws }
+    if ws < n + 36 { return 9 + (ws - n) }
+    return 0 - 2
+}
+
+// internal slot -> window slot number; -2 = not part of the window
+fn inv_int_to_win(v: *mut Inv, k: i32) -> i32 {
+    if !in_win(v, k) { return 0 - 2 }
+    if (*v).win == 0 || (*v).win_n <= 0 { return k }
+    if k >= CONT0 { return k - CONT0 }
+    return (*v).win_n + (k - 9)
+}
+
+// container slot k (0-based) of the open container
+fn inv_win_item(v: *mut Inv, k: i32) -> i32 {
+    if k < 0 || (*v).win_n <= 0 || k >= (*v).win_n { return 0 - 1 }
+    return inv_item(v, CONT0 + k)
+}
+fn inv_win_count(v: *mut Inv, k: i32) -> i32 {
+    if k < 0 || (*v).win_n <= 0 || k >= (*v).win_n { return 0 }
+    return inv_count(v, CONT0 + k)
+}
+
+fn clear_container(v: *mut Inv) {
+    var i: usize = CONT0 as usize
+    while i < INV_CAP {
+        rt.st32((*v).ids, i, 0 as u32)
+        rt.st32((*v).counts, i, 0 as u32)
+        rt.st32((*v).effs, i, 0 as u32)
+        rt.st32((*v).sigs, i, 0 as u32)
+        rt.st32((*v).maxs, i, 0 as u32)
+        i = i + 1
+    }
+}
+
+// forget the open container (server Close Window or local close)
+fn inv_local_close(v: *mut Inv) {
+    (*v).win = 0
+    (*v).win_n = 0
+    clear_container(v)
+    (*v).qc_status = 0
+    (*v).qc_mask = 0 as u64
+    (*v).qc_hi = 0 as u64
+}
+
+// slot count of a menu type id (1.14+ registry): generic_9x1 .. generic_9x6 = 0..5, generic_3x3 = 6; others are not modelled (-1)
+fn menu_slots(typ: i32) -> i32 {
+    if typ >= 0 && typ <= 5 { return 9 * (typ + 1) }
+    if typ == 6 { return 9 }
+    return 0 - 1
+}
+
+fn str_is(p: u64, n: usize, lit: str) -> bool { return n == lit.n && line_is(p, n, lit) }
+
+// Open Window (s2c). 1.14+: varint window id, varint menu type, title. 1.13.2: u8 id, type string, title string, u8 slot count.
+fn inv_on_open_window_v(v: *mut Inv, ver: *mut mc_version.Version, b: *mut bytes.Bytes) -> bool {
+    let protocol: i32 = (*ver).protocol
+    if inv_slot_format(protocol) == 0 { return false }
+    var id: i32 = 0
+    var n: i32 = 0 - 1
+    if protocol >= 477 {
+        id = bytes.get_varint(b) catch (0 - 1)
+        let typ: i32 = bytes.get_varint(b) catch (0 - 1)
+        if id < 0 { (*v).bad = (*v).bad + 1 as u32; return false }
+        n = menu_slots(typ)
+    } else {
+        let id8: u8 = bytes.get_u8(b) catch (255 as u8)
+        id = id8 as i32
+        var tn: usize = 0
+        let tp: u64 = bytes.get_string(b, &tn) catch 0
+        var wn: usize = 0
+        let wp: u64 = bytes.get_string(b, &wn) catch 0
+        let cnt: u8 = bytes.get_u8(b) catch (255 as u8)
+        if tp == 0 || wp == 0 || cnt == 255 as u8 { (*v).bad = (*v).bad + 1 as u32; return false }
+        if str_is(tp, tn, "minecraft:container") || str_is(tp, tn, "minecraft:chest") || str_is(tp, tn, "minecraft:shulker_box")
+            || str_is(tp, tn, "minecraft:hopper") || str_is(tp, tn, "minecraft:dispenser") || str_is(tp, tn, "minecraft:dropper") {
+            if (cnt as i32) > 0 && (cnt as i32) <= 54 { n = cnt as i32 }
+        }
+    }
+    if id == 0 { return false }
+    clear_container(v)
+    (*v).qc_status = 0
+    (*v).qc_mask = 0 as u64
+    (*v).qc_hi = 0 as u64
+    (*v).win = id
+    (*v).win_n = n
+    return true
+}
+
+// Close Window (s2c): u8 id up to 1.21.1, varint id from 1.21.3 (protocol 768)
+fn inv_on_close_window_v(v: *mut Inv, ver: *mut mc_version.Version, b: *mut bytes.Bytes) -> bool {
+    var id: i32 = 0 - 1
+    if (*ver).protocol >= 768 {
+        id = bytes.get_varint(b) catch (0 - 1)
+    } else {
+        let id8: u8 = bytes.get_u8(b) catch (255 as u8)
+        if id8 != 255 as u8 { id = id8 as i32 }
+    }
+    if id < 0 || id != (*v).win { return false }
+    inv_local_close(v)
+    return true
+}
+
+// Close Window (c2s) of the open window, then forget it locally
+fn inv_close_window(cl: *mut mc_client.Client, v: *mut Inv) -> bool {
+    if (*v).win == 0 { return false }
+    var b: bytes.Bytes = bytes.bytes_new()
+    if (*cl).ver.protocol >= 768 { bytes.put_varint(&b, (*v).win) } else { bytes.put_u8(&b, (*v).win as u8) }
+    let ok: bool = mc_client.client_send(cl, mc_version.ST_PLAY, mc_sem.SEM_PLAY_C2S_CLOSE_WINDOW, &b)
+    bytes.bytes_free(&b)
+    inv_local_close(v)
+    return ok
 }
 
 fn inv_slot_format(protocol: i32) -> i32 {
@@ -156,12 +319,12 @@ fn inv_slot_format(protocol: i32) -> i32 {
 }
 
 fn inv_item(v: *mut Inv, slot: i32) -> i32 {
-    if slot < 0 || slot as usize >= INV_SLOTS { return 0 - 1 }
+    if slot < 0 || slot as usize >= INV_CAP { return 0 - 1 }
     return (rt.ld32((*v).ids, slot as usize) as i32) - 1 // stored +1: 0 = empty
 }
 
 fn inv_count(v: *mut Inv, slot: i32) -> i32 {
-    if slot < 0 || slot as usize >= INV_SLOTS { return 0 }
+    if slot < 0 || slot as usize >= INV_CAP { return 0 }
     return rt.ld32((*v).counts, slot as usize) as i32
 }
 
@@ -180,7 +343,7 @@ fn put_slot(v: *mut Inv, slot: i32, item: i32, count: i32) {
         (*v).n_updates = (*v).n_updates + 1 as u32
         return
     }
-    if slot < 0 || slot as usize >= INV_SLOTS { return }
+    if slot < 0 || slot as usize >= INV_CAP { return }
     rt.st32((*v).effs, slot as usize, 0 as u32)
     rt.st32((*v).sigs, slot as usize, 0 as u32)
     rt.st32((*v).maxs, slot as usize, 0 as u32)
@@ -253,7 +416,11 @@ fn put_slot_e(v: *mut Inv, slot: i32, item: i32, count: i32, eff: i32) {
 fn inv_on_window_items(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool {
     if inv_slot_format(protocol) != 1 { return false }
     let wid: u8 = bytes.get_u8(b) catch (255 as u8)
-    if wid != 0 as u8 { return false }
+    var mapw: bool = false
+    if wid != 0 as u8 {
+        if wid == 255 as u8 || wid as i32 != (*v).win || (*v).win_n <= 0 { return false }
+        mapw = true
+    }
     if protocol >= 756 { (*v).state_id = bytes.get_varint(b) catch 0 }
     var n: i32 = 0
     if protocol >= 756 {
@@ -269,7 +436,9 @@ fn inv_on_window_items(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool 
         var cnt: i32 = 0
         var eff: i32 = 0
         if !read_slot(b, protocol, &item, &cnt, &eff) { (*v).bad = (*v).bad + 1 as u32; return false }
-        put_slot_e(v, i, item, cnt, eff)
+        var ti: i32 = i
+        if mapw { ti = inv_win_to_int(v, i) }
+        put_slot_e(v, ti, item, cnt, eff)
         i = i + 1
     }
     if protocol >= 756 {
@@ -286,11 +455,16 @@ fn inv_on_window_items(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool 
 fn inv_on_set_slot(v: *mut Inv, protocol: i32, b: *mut bytes.Bytes) -> bool {
     if inv_slot_format(protocol) != 1 { return false }
     let wid: i8 = bytes.get_i8(b) catch ((0 - 2) as i8)
-    if wid != 0 as i8 && wid != (0 - 1) as i8 { return false }
+    var mapw: bool = false
+    if wid != 0 as i8 && wid != (0 - 1) as i8 {
+        if wid as i32 != (*v).win || (*v).win_n <= 0 { return false }
+        mapw = true
+    }
     if protocol >= 756 { (*v).state_id = bytes.get_varint(b) catch 0 }
     let slot16: i16 = bytes.get_i16(b) catch ((0 - 1) as i16)
     var slot: i32 = slot16 as i32
-    if wid != 0 as i8 {
+    if mapw { slot = inv_win_to_int(v, slot) }
+    if wid == (0 - 1) as i8 {
         // window -1 slot -1 = the carried stack
         if slot != 0 - 1 { return false }
         slot = SLOT_CUR
@@ -395,6 +569,7 @@ fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *m
     var acc_n: i32 = 0
     var acc_mx: i32 = 0
     var n_win_ok: bool = kind == 2
+    var wmap: bool = false
     while pos < total && good {
         var e: usize = pos
         while e < total && rt.ld8(base, e) != 10 as u8 { e = e + 1 }
@@ -409,13 +584,14 @@ fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *m
         var okn: bool = false
         if eq == 8 && line_is(ln, 8, "windowId") {
             let w: i32 = parse_dec(vp, vn, &okn)
-            if !okn { good = false } else if w == 0 { n_win_ok = true } else if kind == 1 && (w == 0 - 1 || w == 255) { n_win_ok = true; win_cur = true } else { good = false }
+            if !okn { good = false } else if w == 0 { n_win_ok = true } else if w == (*v).win && (*v).win_n > 0 && kind != 2 { n_win_ok = true; wmap = true } else if kind == 1 && (w == 0 - 1 || w == 255) { n_win_ok = true; win_cur = true } else { good = false }
         } else if eq == 7 && line_is(ln, 7, "stateId") {
             let st: i32 = parse_dec(vp, vn, &okn)
             if okn { (*v).state_id = st }
         } else if kind == 1 && eq == 4 && line_is(ln, 4, "slot") {
             target = parse_dec(vp, vn, &okn)
             if !okn { good = false }
+            if good && wmap { target = inv_win_to_int(v, target) }
             if good && win_cur {
                 if target != 0 - 1 { good = false } else { target = SLOT_CUR }
             }
@@ -427,7 +603,7 @@ fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *m
                 var q: usize = 6
                 while q < eq && rt.ld8(ln, q) != 93 as u8 { q = q + 1 }
                 let idx: i32 = parse_dec(ln + 6 as u64, q - 6, &okn)
-                if q < eq && okn && q + 1 < eq && rt.ld8(ln, q + 1) == 46 as u8 { tgt = idx; po = q + 2 }
+                if q < eq && okn && q + 1 < eq && rt.ld8(ln, q + 1) == 46 as u8 { tgt = idx; po = q + 2; if wmap { tgt = inv_win_to_int(v, idx) } }
             } else if kind == 0 && line_is(ln, eq, "carriedItem.") {
                 tgt = SLOT_CUR
                 po = 12
@@ -751,7 +927,10 @@ fn quick_move(v: *mut Inv, index: i32, ret: *mut Stk) -> bool {
     var w: Stk = stk_new()
     stk_n(&orig, orig.count, &w)
     var moved: bool = false
-    if index < 9 {
+    if (*v).win != 0 && (*v).win_n > 0 {
+        // ChestMenu / HopperMenu / DispenserMenu.quickMoveStack: container -> player (main + hotbar, from the back), player -> container
+        if index >= CONT0 { moved = move_to(v, &w, 9, 45, true) } else { moved = move_to(v, &w, CONT0, CONT0 + (*v).win_n, false) }
+    } else if index < 9 {
         moved = move_to(v, &w, 9, 45, false)
     } else {
         let eq: i32 = equip_slot(v, orig.item)
@@ -795,7 +974,7 @@ fn shift_click(v: *mut Inv, slot: i32, lg: *mut Stk) -> bool {
 // ClickType.PICKUP_ALL (double click): with a carried stack and a clicked slot that is empty, collect equal stacks from all slots
 // (two passes: not-full stacks first, then full ones). Left button walks the slots up, right button down. The result slot is skipped.
 fn pickup_all(v: *mut Inv, slot: i32, button: i32) -> bool {
-    if slot < 0 || slot as usize >= INV_SLOTS { return false }
+    if !in_win(v, slot) { return false }
     var cu: Stk = stk_new()
     var sl: Stk = stk_new()
     var t: Stk = stk_new()
@@ -804,14 +983,16 @@ fn pickup_all(v: *mut Inv, slot: i32, button: i32) -> bool {
     if cu.item < 0 || cu.count <= 0 { return true }
     if sl.item >= 0 && sl.count > 0 { return true }
     let cmax: i32 = stack_max(v, &cu)
+    let wsz: i32 = inv_window_size(v)
     var first: i32 = 0
     var step: i32 = 1
-    if button != 0 { first = INV_SLOTS as i32 - 1; step = 0 - 1 }
+    if button != 0 { first = wsz - 1; step = 0 - 1 }
     var pass: i32 = 0
     while pass < 2 {
-        var m: i32 = first
-        while m >= 0 && (m as usize) < INV_SLOTS && cu.count < cmax {
-            if m != 0 {
+        var wsn: i32 = first
+        while wsn >= 0 && wsn < wsz && cu.count < cmax {
+            let m: i32 = inv_win_to_int(v, wsn)
+            if m != 0 && m >= 0 {
                 load(v, m, &sl)
                 if same_stack(&sl, &cu) && sl.count <= cmax {
                     if !(pass == 0 && sl.count == stack_max(v, &sl)) {
@@ -823,7 +1004,7 @@ fn pickup_all(v: *mut Inv, slot: i32, button: i32) -> bool {
                     }
                 }
             }
-            m = m + step
+            wsn = wsn + step
         }
         pass = pass + 1
     }
@@ -834,13 +1015,25 @@ fn pickup_all(v: *mut Inv, slot: i32, button: i32) -> bool {
 fn qc_reset(v: *mut Inv) {
     (*v).qc_status = 0
     (*v).qc_mask = 0 as u64
+    (*v).qc_hi = 0 as u64
 }
 
-fn mask_count(m: u64) -> i32 {
+fn mask_has(v: *mut Inv, k: i32) -> bool {
+    if k < 0 || k >= 128 { return false }
+    if k < 64 { return (((*v).qc_mask >> (k as u64)) & 1 as u64) != 0 as u64 }
+    return (((*v).qc_hi >> ((k - 64) as u64)) & 1 as u64) != 0 as u64
+}
+
+fn mask_set(v: *mut Inv, k: i32) {
+    if k < 0 || k >= 128 { return }
+    if k < 64 { (*v).qc_mask = (*v).qc_mask | ((1 as u64) << (k as u64)) } else { (*v).qc_hi = (*v).qc_hi | ((1 as u64) << ((k - 64) as u64)) }
+}
+
+fn mask_count(v: *mut Inv) -> i32 {
     var n: i32 = 0
-    var k: usize = 0
-    while k < INV_SLOTS {
-        if ((m >> (k as u64)) & 1 as u64) != 0 as u64 { n = n + 1 }
+    var k: i32 = 0
+    while k < nint(v) {
+        if mask_has(v, k) { n = n + 1 }
         k = k + 1
     }
     return n
@@ -864,28 +1057,28 @@ fn drag(v: *mut Inv, slot: i32, button: i32) -> bool {
         if typ == 0 || typ == 1 || (typ == 2 && (*v).creative) {
             (*v).qc_status = 1
             (*v).qc_mask = 0 as u64
+            (*v).qc_hi = 0 as u64
         } else { qc_reset(v) }
         return true
     }
     if status == 1 {
-        if slot < 0 || slot as usize >= INV_SLOTS { return true }
+        if !in_win(v, slot) { return true }
         var sl: Stk = stk_new()
         load(v, slot, &sl)
         let free: bool = sl.item < 0 || sl.count <= 0
         let eqv: bool = same_stack(&sl, &cu) && sl.count <= stack_max(v, &cu)
-        if (free || eqv) && may_place(v, slot, &cu) && ((*v).qc_type == 2 || cu.count > mask_count((*v).qc_mask)) {
-            (*v).qc_mask = (*v).qc_mask | ((1 as u64) << (slot as u64))
+        if (free || eqv) && may_place(v, slot, &cu) && ((*v).qc_type == 2 || cu.count > mask_count(v)) {
+            mask_set(v, slot)
         }
         return true
     }
     if status == 2 {
-        let msk: u64 = (*v).qc_mask
         let ty: i32 = (*v).qc_type
-        let n: i32 = mask_count(msk)
+        let n: i32 = mask_count(v)
         if n == 1 {
             var only: i32 = 0 - 1
             var k: i32 = 0
-            while k < INV_SLOTS as i32 { if ((msk >> (k as u64)) & 1 as u64) != 0 as u64 { only = k }; k = k + 1 }
+            while k < nint(v) { if mask_has(v, k) { only = k }; k = k + 1 }
             qc_reset(v)
             var lg0: Stk = stk_new()
             if ty == 0 || ty == 1 { return predict(v, only, ty, 0, &lg0) != 0 }
@@ -897,8 +1090,8 @@ fn drag(v: *mut Inv, slot: i32, button: i32) -> bool {
             var sl2: Stk = stk_new()
             var t: Stk = stk_new()
             var k2: i32 = 0
-            while k2 < INV_SLOTS as i32 {
-                if ((msk >> (k2 as u64)) & 1 as u64) != 0 as u64 {
+            while k2 < nint(v) {
+                if mask_has(v, k2) {
                     load(v, k2, &sl2)
                     let free2: bool = sl2.item < 0 || sl2.count <= 0
                     let eq2: bool = same_stack(&sl2, &cu) && sl2.count <= omax
@@ -955,7 +1148,7 @@ fn predict(v: *mut Inv, slot: i32, button: i32, mode: i32, lg: *mut Stk) -> i32 
         if pickup_all(v, slot, button) { return 2 }
         return 0
     }
-    if slot <= 0 || slot as usize >= INV_SLOTS { return 0 }
+    if slot <= 0 || !in_win(v, slot) { return 0 }
     var sl: Stk = stk_new()
     load(v, slot, &sl)
     if mode == 1 && (button == 0 || button == 1) {
@@ -1024,14 +1217,18 @@ fn inv_click_build(v: *mut Inv, protocol: i32, slot: i32, button: i32, mode: i32
     let kind: i32 = inv_click_kind(protocol)
     if kind == 0 { return false }
     // the stack the client believes is in the slot (legacy packets carry it)
+    if (*v).win != 0 && (*v).win_n <= 0 { return false } // a window we cannot model: do not send blind clicks
+    let wslot: i32 = slot // the number in the packet
+    var islot: i32 = slot // the internal slot of the prediction
+    if (*v).win != 0 && slot >= 0 { islot = inv_win_to_int(v, slot) }
     var ps: Stk = stk_new()
-    if slot >= 0 { load(v, slot, &ps) }
+    if islot >= 0 { load(v, islot, &ps) }
     var pi: i32 = ps.item
     var pc: i32 = ps.count
     // snapshot of all slots (item, count, Efficiency, signature) to find the changed ones afterwards
-    let snap: u64 = rt.heap_alloc(INV_SLOTS * 16)
+    let snap: u64 = rt.heap_alloc(INV_CAP * 16)
     var q: usize = 0
-    while q < INV_SLOTS {
+    while q < INV_CAP {
         rt.st32(snap, q * 4, (inv_item(v, q as i32) + 1) as u32)
         rt.st32(snap, q * 4 + 1, inv_count(v, q as i32) as u32)
         rt.st32(snap, q * 4 + 2, inv_eff(v, q as i32) as u32)
@@ -1039,40 +1236,43 @@ fn inv_click_build(v: *mut Inv, protocol: i32, slot: i32, button: i32, mode: i32
         q = q + 1
     }
     var lg: Stk = stk_new()
-    let pred: i32 = predict(v, slot, button, mode, &lg)
+    let pred: i32 = predict(v, islot, button, mode, &lg)
     if pred == 2 {
         pi = lg.item
         pc = lg.count
     }
     if protocol < 756 {
-        bytes.put_u8(b, 0 as u8)
-        bytes.put_i16(b, slot as i16)
+        bytes.put_u8(b, (*v).win as u8)
+        bytes.put_i16(b, wslot as i16)
         bytes.put_i8(b, button as i8)
         bytes.put_i16(b, (*v).action as i16)
         (*v).action = (*v).action + 1
         bytes.put_i8(b, mode as i8)
         put_click_slot(b, kind, pi, pc)
     } else {
-        if protocol >= 768 { bytes.put_varint(b, 0) } else { bytes.put_u8(b, 0 as u8) }
+        if protocol >= 768 { bytes.put_varint(b, (*v).win) } else { bytes.put_u8(b, (*v).win as u8) }
         bytes.put_varint(b, (*v).state_id)
-        bytes.put_i16(b, slot as i16)
+        bytes.put_i16(b, wslot as i16)
         bytes.put_i8(b, button as i8)
         bytes.put_varint(b, mode)
+        let wsz: i32 = inv_window_size(v)
         var n: i32 = 0
-        var k: usize = 0
-        while k < INV_SLOTS {
-            if pred != 0 && slot_changed(v, snap, k) { n = n + 1 }
-            k = k + 1
+        var ws: i32 = 0
+        while ws < wsz {
+            let ki: i32 = inv_win_to_int(v, ws)
+            if pred != 0 && ki >= 0 && slot_changed(v, snap, ki as usize) { n = n + 1 }
+            ws = ws + 1
         }
         bytes.put_varint(b, n)
-        k = 0
-        while k < INV_SLOTS {
-            if pred != 0 && slot_changed(v, snap, k) { bytes.put_i16(b, k as i16); put_click_slot(b, kind, inv_item(v, k as i32), inv_count(v, k as i32)) }
-            k = k + 1
+        ws = 0
+        while ws < wsz {
+            let ki2: i32 = inv_win_to_int(v, ws)
+            if pred != 0 && ki2 >= 0 && slot_changed(v, snap, ki2 as usize) { bytes.put_i16(b, ws as i16); put_click_slot(b, kind, inv_item(v, ki2), inv_count(v, ki2)) }
+            ws = ws + 1
         }
         put_click_slot(b, kind, (*v).cur_id, (*v).cur_count)
     }
-    rt.heap_free(snap, INV_SLOTS * 16)
+    rt.heap_free(snap, INV_CAP * 16)
     return true
 }
 
