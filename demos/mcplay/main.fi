@@ -8,7 +8,7 @@
 // mouse (click captures again), Alt+F4 / window close quits.
 //
 // Environment (all optional):
-//   MCPLAY_GL=1        GL path (not wired yet: see docs/mc/play.md; the demo then says so and uses the CPU path)
+//   MCPLAY_GL=1        GL path: glwindow (EGL/GLX) + gl_mc/gl_scene back end, frame shown without read back; MCPLAY_VSYNC=0|1 (default 1); CPU stays the default
 //   MCPLAY_VIEW=6      view distance in chunks            MCPLAY_PROTOCOL=763   protocol number
 //   MCPLAY_W / MCPLAY_H window size (default 854x480)     MCPLAY_FULLSCREEN=1   start fullscreen
 //   MCPLAY_FPS=60      frame cap (0 = uncapped)           MCPLAY_VSYNC=1        swap interval for the GL path (CPU path: no-op)
@@ -57,6 +57,11 @@ import mc.mc_play
 import mc.mc_wlight
 import mc.mc_packs
 import mc.mc_backend
+import gpu.glctx
+import gpu.glwindow
+import gpu.gl_mc
+import gpu.gl_scene
+import gpu.glshow
 import mc.mc_audio
 import mc.mc_entity
 import mc.v763.mc_snd_v763
@@ -271,6 +276,13 @@ struct Ctx {
     pl: mc_input.Player,
     rw: raw.Raw,
     win: window.Window,
+    wp: *mut window.Window, // the window in use: &win (CPU) or &gw.win (GL)
+    gl: bool,
+    gw: glwindow.GlWin,
+    gb: gl_mc.GlBackend,
+    gsc: gl_scene.Scene,
+    sh: glshow.Show,
+    be: mc_backend.Backend, // the GL back end table
     pk: mc_input.Pick,
     bg: u64, // BGRX copy of the frame for the window
     w: i32,
@@ -385,7 +397,11 @@ fn on_unload(c: *mut Ctx) {
         cx = second
         cz = first
     }
-    mc_render_world.wr_drop_chunk(&(*c).g.wr, &(*c).g.r, cx, cz)
+    if (*c).gl {
+        mc_render_world.wr_drop_chunk_b(&(*c).g.wr, &(*c).be, cx, cz)
+    } else {
+        mc_render_world.wr_drop_chunk(&(*c).g.wr, &(*c).g.r, cx, cz)
+    }
     if mc_world.world_remove(&(*c).world, cx, cz) {
         (*c).n_unload = (*c).n_unload + 1 as u64
     }
@@ -511,9 +527,9 @@ fn net_drain(c: *mut Ctx, limit: i32) -> bool {
 
 fn grab_mouse(c: *mut Ctx, on: bool) {
     if on {
-        window.cursor_mode(&(*c).win, window.CURSOR_CAPTURED)
+        window.cursor_mode((*c).wp, window.CURSOR_CAPTURED)
     } else {
-        window.cursor_mode(&(*c).win, window.CURSOR_NORMAL)
+        window.cursor_mode((*c).wp, window.CURSOR_NORMAL)
     }
     (*c).grab = on
 }
@@ -522,7 +538,7 @@ fn grab_mouse(c: *mut Ctx, on: bool) {
 // pointer's relative movement is accumulated until the next tick.
 fn pump(c: *mut Ctx) {
     raw.raw_begin(&(*c).rw)
-    var k: u32 = window.next_event(&(*c).win)
+    var k: u32 = window.next_event((*c).wp)
     var guard: i32 = 0
     while k != window.EV_NONE && guard < 20000 {
         guard = guard + 1
@@ -531,12 +547,12 @@ fn pump(c: *mut Ctx) {
         } else if k == window.EV_CLOSED {
             (*c).closed = true
         } else {
-            raw.raw_feed(&(*c).rw, k, window.ev_a(&(*c).win), window.ev_x(&(*c).win), window.ev_y(&(*c).win), window.ev_state(&(*c).win))
+            raw.raw_feed(&(*c).rw, k, window.ev_a((*c).wp), window.ev_x((*c).wp), window.ev_y((*c).wp), window.ev_state((*c).wp))
         }
-        k = window.next_event(&(*c).win)
+        k = window.next_event((*c).wp)
     }
     var d: [i64; 2] = [0; 2]
-    if window.cursor_delta(&(*c).win, (&d[0]) as u64) {
+    if window.cursor_delta((*c).wp, (&d[0]) as u64) {
         if (*c).grab {
             (*c).acc_dx = (*c).acc_dx + (d[0] as f64)
             (*c).acc_dy = (*c).acc_dy + (d[1] as f64)
@@ -555,15 +571,29 @@ fn keys_now(c: *mut Ctx) -> u32 {
     return m
 }
 
+// The back end that holds the meshes and the atlas: GL or the CPU raster.
+fn cur_be(c: *mut Ctx) -> mc_backend.Backend {
+    if (*c).gl { return (*c).be }
+    return mc_backend.backend_cpu(&(*c).g.r)
+}
+
 fn gfx_resize(c: *mut Ctx, w: i32, h: i32) {
-    mc_render_world.wr_clear(&(*c).g.wr, &(*c).g.r)
+    if (*c).gl {
+        mc_render_world.wr_clear_b(&(*c).g.wr, &(*c).be)
+        gl_mc.glbe_resize(&(*c).gb, w, h)
+        (*c).be = gl_mc.glbe_backend(&(*c).gb)
+    } else {
+        mc_render_world.wr_clear(&(*c).g.wr, &(*c).g.r)
+    }
     mc_raster.raster_free(&(*c).g.r)
     (*c).g.r = mc_raster.raster_new(w, h)
-    if (*c).g.use_res {
-        var be: mc_backend.Backend = mc_backend.backend_cpu(&(*c).g.r)
-        mc_packs.res_upload(&(*c).g.res, &be)
-    } else {
-        mc_raster.backend_upload_atlas(&(*c).g.r, &(*c).g.atlas)
+    if !(*c).gl {
+        if (*c).g.use_res {
+            var be: mc_backend.Backend = mc_backend.backend_cpu(&(*c).g.r)
+            mc_packs.res_upload(&(*c).g.res, &be)
+        } else {
+            mc_raster.backend_upload_atlas(&(*c).g.r, &(*c).g.atlas)
+        }
     }
     if (*c).bg != 0 { rt.heap_free((*c).bg, ((*c).w as usize) * ((*c).h as usize) * 4) }
     (*c).bg = rt.heap_alloc((w as usize) * (h as usize) * 4)
@@ -576,8 +606,8 @@ fn gfx_resize(c: *mut Ctx, w: i32, h: i32) {
 fn handle_window(c: *mut Ctx) {
     if (*c).resized {
         (*c).resized = false
-        let nw: i32 = window.width(&(*c).win) as i32
-        let nh: i32 = window.height(&(*c).win) as i32
+        let nw: i32 = window.width((*c).wp) as i32
+        let nh: i32 = window.height((*c).wp) as i32
         if nw >= 64 && nh >= 48 && (nw != (*c).w || nh != (*c).h) {
             gfx_resize(c, nw, nh)
         }
@@ -590,12 +620,12 @@ fn handle_window(c: *mut Ctx) {
         mc_audio.mca_set_muted((*c).ma, (*c).aud_muted)
     }
     if (*c).g.use_res && raw.key_pressed(&(*c).rw, SC_T) {
-        var be: mc_backend.Backend = mc_backend.backend_cpu(&(*c).g.r)
+        var be: mc_backend.Backend = cur_be(c)
         mc_packs.res_on_key(&(*c).g.res, &be, mc_packs.RES_KEY_RELOAD)
     }
     if raw.key_pressed(&(*c).rw, SC_F11 as u32) {
         (*c).fullscreen = !(*c).fullscreen
-        window.fullscreen(&(*c).win, (*c).fullscreen)
+        window.fullscreen((*c).wp, (*c).fullscreen)
     }
 }
 
@@ -643,7 +673,7 @@ fn do_tick(c: *mut Ctx) {
         mc_sky.sky_set_time(&(*c).sky, (*c).day_time, 0)
     }
     if (*c).g.use_res {
-        var be: mc_backend.Backend = mc_backend.backend_cpu(&(*c).g.r)
+        var be: mc_backend.Backend = cur_be(c)
         mc_packs.res_tick(&(*c).g.res, (*c).n_ticks as i64, &be)
     }
 }
@@ -831,7 +861,75 @@ fn audio_stop(c: *mut Ctx) {
 
 // ---- drawing -----------------------------------------------------------------------------------------
 
+// GL frame: same pass order as draw_frame (sky -> world -> selection box -> tint -> HUD), shown by present.
+#[allow_escape]
+fn draw_frame_gl(c: *mut Ctx) {
+    let view: f64 = (*c).view as f64
+    let fog_start: f64 = view * 16.0 * 0.5
+    let fog_end: f64 = view * 16.0 + 8.0
+    let clear: u32 = (255 as u32 << 24 as u32) | (FOG_B << 16 as u32) | (FOG_G << 8 as u32) | FOG_R
+    gl_scene.scene_frame(&(*c).gsc)
+    gl_mc.glbe_set_fog(&(*c).gb, true, fog_start, fog_end, (*c).sky.fr as u32, (*c).sky.fg as u32, (*c).sky.fb as u32)
+    (*c).be.begin((*c).be.obj, ((&(*c).cam) as u64), clear)
+    gl_scene.scene_sky(&(*c).gsc, &(*c).cam, &(*c).sky)
+    if (*c).light { mc_render_world.wr_set_daylight(&(*c).be, (*c).sky.daylight) }
+    if (*c).have_pos {
+        mc_render_world.wr_render_b(&(*c).g.wr, &(*c).world, &(*c).be, &(*c).cam, 0 - 1)
+    }
+    (*c).be.end((*c).be.obj)
+    if (*c).hit {
+        // selection box = 12 thin boxes along the block edges
+        let e: f64 = 0.03
+        let bx: f64 = (*c).pk.x as f64
+        let by: f64 = (*c).pk.y as f64
+        let bz: f64 = (*c).pk.z as f64
+        var i: i32 = 0
+        while i < 4 {
+            var ox: f64 = 0.0
+            var oy: f64 = 0.0
+            if (i & 1) != 0 { ox = 1.0 }
+            if (i & 2) != 0 { oy = 1.0 }
+            var ea: gl_scene.Ent = gl_scene.ent_new(bx + 0.5, by + oy, bz + ox, 1.0 + e, e, e, 0.0, 0 as u32, 0 as u32, 0 as u32)
+            var eb: gl_scene.Ent = gl_scene.ent_new(bx + ox, by + 0.5, bz + oy, e, 1.0 + e, e, 0.0, 0 as u32, 0 as u32, 0 as u32)
+            var ez: gl_scene.Ent = gl_scene.ent_new(bx + ox, by + oy, bz + 0.5, e, e, 1.0 + e, 0.0, 0 as u32, 0 as u32, 0 as u32)
+            gl_scene.scene_ent_add(&(*c).gsc, &ea)
+            gl_scene.scene_ent_add(&(*c).gsc, &eb)
+            gl_scene.scene_ent_add(&(*c).gsc, &ez)
+            i = i + 1
+        }
+    }
+    gl_scene.scene_ent_flush(&(*c).gsc, &(*c).cam)
+    if !(*c).light { gl_scene.scene_tint(&(*c).gsc, &(*c).sky) }
+    var d: mc_hud.HudDebug = mc_hud.hud_debug_new()
+    d.fps = (*c).fps
+    d.x = (*c).pl.x
+    d.y = (*c).pl.y
+    d.z = (*c).pl.z
+    d.yaw = (*c).pl.yaw
+    d.pitch = (*c).pl.pitch
+    d.has_block = (*c).hit
+    if (*c).hit {
+        d.bx = (*c).pk.x
+        d.by = (*c).pk.y
+        d.bz = (*c).pk.z
+        d.id = (*c).pk.id
+        d.nx = (*c).pk.nx
+        d.ny = (*c).pk.ny
+        d.nz = (*c).pk.nz
+    }
+    var rec: rt.Buf = rt.buf_new()
+    mc_hud.hud_record(&rec)
+    mc_hud.hud_frame(&(*c).g.r, mc_hud.hud_scale((*c).w, (*c).h), mc_hud.HUD_CROSSHAIR | mc_hud.HUD_HOTBAR | mc_hud.HUD_DEBUG, (*c).pl.slot, &d)
+    mc_hud.hud_record(0 as *mut rt.Buf)
+    gl_scene.scene_hud(&(*c).gsc, &rec)
+    rt.buf_free(&rec)
+}
+
 fn draw_frame(c: *mut Ctx) {
+    if (*c).gl {
+        draw_frame_gl(c)
+        return
+    }
     let r: *mut mc_raster.Raster = &(*c).g.r
     let view: f64 = (*c).view as f64
     let fog_start: f64 = view * 16.0 * 0.5
@@ -873,9 +971,14 @@ fn draw_frame(c: *mut Ctx) {
 }
 
 fn present(c: *mut Ctx) {
+    if (*c).gl {
+        gl_scene.scene_present_window(&(*c).gsc, &(*c).sh, (*c).w, (*c).h)
+        glwindow.swap(&(*c).gw)
+        return
+    }
     window.to_bgrx((*c).g.r.color, (*c).bg, ((*c).w as usize) * ((*c).h as usize))
-    window.image(&(*c).win, (*c).bg, (*c).w as usize, (*c).h as usize, 0, 0)
-    window.present(&(*c).win)
+    window.image((*c).wp, (*c).bg, (*c).w as usize, (*c).h as usize, 0, 0)
+    window.present((*c).wp)
 }
 
 // ---- main ----------------------------------------------------------------------------------------------
@@ -902,9 +1005,8 @@ fn main(start: u64) -> i32 {
     let fps_cap: i32 = env_int("MCPLAY_FPS", 60)
     let use_res: bool = mc_packs.res_env_wanted()
     let run_s: i32 = env_int("MCPLAY_RUN_S", 0)
-    if env_flag("MCPLAY_GL", false) {
-        io.eprint_line("mcplay: MCPLAY_GL=1 -- the GL path is not wired into this demo yet, using the CPU rasterizer")
-    }
+    let want_gl: bool = env_flag("MCPLAY_GL", false)
+    var gb0: gl_mc.GlBackend = gl_mc.glbe_open_with(glctx.ctx_blank(), 1, 1)
     var ver: mc_version.Version = mc_version.version_empty()
     if !mc_versions.version_by_protocol(proto, &ver) || ver.chunk_format == mc_version.CF_LEGACY_8 {
         io.eprint_line("mcplay: unsupported protocol number")
@@ -931,7 +1033,7 @@ fn main(start: u64) -> i32 {
         sky: mc_sky.sky_new(),
         pl: mc_input.player_new(0.0, 0.0, 0.0),
         rw: raw.raw_new(),
-        win: window.window_new(),
+        win: window.window_new(), wp: 0 as *mut window.Window, gl: false, gw: glwindow.glwindow_new(), gb: gb0, gsc: gl_scene.scene_empty(&gb0), sh: glshow.show_new(), be: mc_backend.backend_new(),
         pk: mc_input.Pick { x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, dist: 0.0, id: 0 },
         bg: 0, w: w0, h: h0, view: view, protocol: proto,
         join: false, have_pos: false, last_tp: 0, grab: false, closed: false, resized: false, fullscreen: false, hit: false,
@@ -971,23 +1073,61 @@ fn main(start: u64) -> i32 {
         say(f"mcplay: login failed ({lr})\n")
         return 5
     }
-    // window (CPU path): full_input BEFORE make so that button releases, motion and raw keys arrive
-    if !window.open_window(&c.win, 0) {
-        io.eprint_line("mcplay: cannot open the display")
-        return 6
+    // window: full_input BEFORE make so that button releases, motion and raw keys arrive
+    if want_gl {
+        var o: glwindow.Opts = glwindow.opts_default()
+        o.vsync = env_int("MCPLAY_VSYNC", 1)
+        o.full_input = true
+        var ok: bool = glwindow.open(&c.gw, w0, h0, "mcplay", o)
+        if !ok && o.vsync != 0 {
+            o.vsync = 0
+            ok = glwindow.open(&c.gw, w0, h0, "mcplay", o)
+        }
+        if !ok {
+            io.eprint_line("mcplay: GL window failed (no EGL/GLX?) -- run without MCPLAY_GL")
+            return 6
+        }
+        c.wp = &c.gw.win
+        window.raw_input(c.wp, true)
+        c.gb = gl_mc.glbe_open_with(glwindow.take_ctx(&c.gw), w0, h0)
+        if !c.gb.ok {
+            io.eprint_line("mcplay: GL back end failed")
+            return 6
+        }
+        c.gsc = gl_scene.scene_open(&c.gb)
+        if !c.gsc.ok || !glshow.show_init(&c.sh, gl_mc.glbe_gl(&c.gb)) {
+            io.eprint_line("mcplay: GL scene layer failed")
+            return 6
+        }
+        c.be = gl_mc.glbe_backend(&c.gb)
+        c.gl = true
+        if c.g.use_res {
+            mc_packs.res_reload_upload(&c.g.res, &c.be)
+        } else {
+            c.be.upload_atlas(c.be.obj, ((&c.g.atlas) as u64))
+        }
+        io.print("mcplay: gl renderer=")
+        io.print_c(gl_mc.glbe_renderer(&c.gb))
+        say(f" api={glwindow.api_name(&c.gw)} vsync={glwindow.swap_interval_get(&c.gw)}\n")
+    } else {
+        c.wp = &c.win
+        if !window.open_window(c.wp, 0) {
+            io.eprint_line("mcplay: cannot open the display")
+            return 6
+        }
+        window.full_input(c.wp, true)
+        if !window.make(c.wp, w0 as usize, h0 as usize) {
+            io.eprint_line("mcplay: cannot create the window")
+            return 6
+        }
+        window.raw_input(c.wp, true)
+        let ttl: str = "mcplay"
+        window.title(c.wp, ttl.p as u64, ttl.n)
+        window.show_window(c.wp)
     }
-    window.full_input(&c.win, true)
-    if !window.make(&c.win, w0 as usize, h0 as usize) {
-        io.eprint_line("mcplay: cannot create the window")
-        return 6
-    }
-    window.raw_input(&c.win, true)
-    let ttl: str = "mcplay"
-    window.title(&c.win, ttl.p as u64, ttl.n)
-    window.show_window(&c.win)
     if env_flag("MCPLAY_FULLSCREEN", false) {
         c.fullscreen = true
-        window.fullscreen(&c.win, true)
+        window.fullscreen(c.wp, true)
     }
     grab_mouse(&c, true)
     c.sent_slot = 0
@@ -1032,7 +1172,7 @@ fn main(start: u64) -> i32 {
         if run_s > 0 && nowm - t_start >= (run_s as u64) * 1000 as u64 { c.closed = true }
         let spent: u64 = now_ns() - f0
         if frame_ns > spent {
-            window.wait_event(&c.win, ((frame_ns - spent) / 1000000 as u64) as i64)
+            window.wait_event(c.wp, ((frame_ns - spent) / 1000000 as u64) as i64)
         }
     }
     audio_stop(&c)
@@ -1040,6 +1180,10 @@ fn main(start: u64) -> i32 {
     say(f"mcplay: light={c.light} region={c.region_done} time_packets={c.n_time} day_time={c.day_time} daylight={c.sky.daylight}\n")
     say(f"mcplay: pos x={c.pl.x as i64} y={c.pl.y as i64} z={c.pl.z as i64} fps={c.fps}\n")
     var rc: i32 = 0
+    if c.gl {
+        let px: u64 = c.be.present(c.be.obj)
+        rt.mem_copy(c.g.r.color, px, (c.w as usize) * (c.h as usize) * 4)
+    }
     if env.has("MCPLAY_SHOT") {
         let sp: str = env.get("MCPLAY_SHOT")
         var pb: rt.Buf = rt.buf_new()
@@ -1056,8 +1200,14 @@ fn main(start: u64) -> i32 {
         rt.heap_free(hb, 64)
         rt.buf_free(&pb)
     }
-    window.close_window(&c.win)
-    mc_render_world.wr_free(&c.g.wr, &c.g.r)
+    if c.gl {
+        mc_render_world.wr_free_b(&c.g.wr, &c.be)
+        gl_scene.scene_close(&c.gsc)
+        gl_mc.glbe_close(&c.gb)
+    } else {
+        mc_render_world.wr_free(&c.g.wr, &c.g.r)
+    }
+    window.close_window(c.wp)
     mc_world.world_free(&c.world)
     mc_chunk.scratch_free(&c.sc)
     mc_client.client_free(&c.cl)
