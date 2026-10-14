@@ -25,6 +25,33 @@ const SETTINGS_OLD = PROTOCOL <= 340
 // 1.21.2+ (768): the movement packets carry `flags` {onGround, horizontalCollision} instead of onGround
 const mv = (o) => (PROTOCOL >= 768 ? Object.assign({}, o, { onGround: undefined, flags: { onGround: !!o.onGround, horizontalCollision: false } }) : o)
 
+// lpVec3 (1.21.9+ low precision vector) is unknown to node-minecraft-protocol 1.54: same reader as in ref_dump.cjs (the value is
+// not used; without it the bot dies on the first entity_velocity / add_entity packet of 1.21.9+ and the entity scenario is empty).
+{
+  const cm = require('minecraft-protocol/src/datatypes/compiler-minecraft')
+  const varintSize = (v) => { v >>>= 0; let n = 1; while (v >= 0x80) { n++; v >>>= 7 } return n }
+  cm.Read.lpVec3 = ['native', (buffer, offset) => {
+    const lowest = buffer.readUInt8(offset)
+    if (lowest === 0) return { value: { lowest, middle: 0, highest: 0, ext: 0 }, size: 1 }
+    const middle = buffer.readUInt8(offset + 1)
+    const highest = buffer.readUInt32BE(offset + 2)
+    let size = 6
+    let ext = 0
+    if ((lowest & 4) !== 0) {
+      let shift = 0
+      let b
+      do { b = buffer.readUInt8(offset + size); size++; ext |= (b & 0x7f) << shift; shift += 7 } while (b & 0x80)
+      ext >>>= 0
+    }
+    return { value: { lowest, middle, highest, ext }, size }
+  }]
+  cm.Write.lpVec3 = ['native', (value, buffer, offset) => {
+    buffer.writeUInt8(value.lowest, offset++)
+    return offset
+  }]
+  cm.SizeOf.lpVec3 = ['native', (value) => (value.lowest === 0 ? 1 : 6 + ((value.lowest & 4) !== 0 ? varintSize(value.ext) : 0))]
+}
+
 const client = mc.createClient({ host, port, username: name, version: NMP, auth: 'offline', viewDistance: '2' })
 let pos = null // { x, y, z, yaw, pitch }
 let ready = false
