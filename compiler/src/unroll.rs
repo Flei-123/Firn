@@ -756,8 +756,29 @@ impl<'a> Reach<'a> {
             return d;
         }
         if ps.len() == 1 {
-            // placeholder against a cycle of single predecessor blocks
-            self.memo.insert((u, d), d);
+            // r531 -- NO placeholder in the memo. It used to hold `d` (the
+            // value of the loop that is gone) while the predecessor was being
+            // resolved; when the walk reached a loop header behind the unrolled
+            // loop, went round that loop and came back to this very block, it
+            // read the placeholder and put the dead `d` on the back edge of the
+            // header phi (an undefined value: dev-fast results changed from
+            // run to run). Every real cycle contains a block with two or more
+            // predecessors, and that block has its phi in the memo BEFORE the
+            // recursion, so the walk ends there. Only a closed chain of
+            // single-predecessor blocks (unreachable code) has no such block.
+            let mut cur = u;
+            let mut steps = 0usize;
+            loop {
+                let q = &self.preds[cur];
+                if q.len() != 1 || self.copy_of.contains_key(&q[0]) {
+                    break;
+                }
+                cur = q[0];
+                steps += 1;
+                if cur == u || steps > self.preds.len() {
+                    return d;
+                }
+            }
             let v = self.at_end(ps[0], d);
             self.memo.insert((u, d), v);
             return v;
