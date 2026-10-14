@@ -9,11 +9,13 @@
 //
 // Environment (all optional):
 //   MCPLAY_GL=1        GL path: glwindow (EGL/GLX) + gl_mc/gl_scene back end, frame shown without read back; MCPLAY_VSYNC=0|1 (default 1); CPU stays the default
+//   MCPLAY_GFX=vk      Vulkan back end (mc.vk_mc: sky, world, entities, tint, HUD in one render pass, frame read back and shown through the X11 window); default = CPU raster.
+//                      lavapipe (CPU Vulkan) when there is no GPU. MCPLAY_VK_CACHE=<file> pipeline cache file; MCPLAY_VK_LOST_AT=<frame> simulates a device loss (tests)
 //   MCPLAY_FACECULL=1  GL: opaque meshes sorted by face direction, a section draws only directions facing the camera (same image; 0 = off)
 //   MCPLAY_VIEW=6      view distance in chunks            MCPLAY_PROTOCOL=763   protocol number
 //   MCPLAY_LOD=<n>     LOD terrain beyond MCPLAY_VIEW up to n chunks (mc_stream + mc_lod, cross-fade at ring changes; asks the server for n chunks); 0 = off (default)
 //   MCPLAY_STREAM=0    old path: mc_render_world (inline meshing) instead of mc_stream. DEFAULT is mc_stream (frustum + cave culling, worker meshing)
-//   MCPLAY_WORKERS=3   mesher threads of the stream (0 = inline on the render thread); default 3 on the CPU path, 0 with MCPLAY_GL=1 (Firn threads + GL dispatch crash, see docs/mc/stream.md)
+//   MCPLAY_WORKERS=3   mesher threads of the stream (0 = inline on the render thread); default 3 on the CPU path, 0 with MCPLAY_GL=1 and MCPLAY_GFX=vk (Firn threads + GL dispatch crash, see docs/mc/stream.md)
 //   MCPLAY_W / MCPLAY_H window size (default 854x480)     MCPLAY_FULLSCREEN=1   start fullscreen
 //   MCPLAY_FPS=60      frame cap (0 = uncapped)           MCPLAY_VSYNC=1        swap interval for the GL path (CPU path: no-op)
 //   MCPLAY_CREATIVE=1  the server is creative: fly allowed and the creative reach (6 blocks)
@@ -75,6 +77,7 @@ import mc.mc_dig_sel
 import gpu.glctx
 import gpu.glwindow
 import gpu.gl_mc
+import mc.vk_mc
 import gpu.gl_scene
 import gpu.glshow
 import mc.mc_audio
@@ -301,6 +304,11 @@ struct Ctx {
     win: window.Window,
     wp: *mut window.Window, // the window in use: &win (CPU) or &gw.win (GL)
     gl: bool,
+    vk: bool, // MCPLAY_GFX=vk: be = the Vulkan back end table (vbk)
+    vbk: vk_mc.VkBackend,
+    vk_lost_at: u64, // MCPLAY_VK_LOST_AT: simulated device loss when n_frames reaches it (0 = off)
+    vk_losses: u64,
+    vk_recoveries: u64,
     gw: glwindow.GlWin,
     gb: gl_mc.GlBackend,
     gsc: gl_scene.Scene,
@@ -590,7 +598,7 @@ fn on_unload(c: *mut Ctx) {
     if (*c).stream_on {
         var sbe: mc_backend.Backend = cur_be(c)
         mc_stream.stream_chunk_unloaded(&(*c).stm, &sbe, cx, cz)
-    } else if (*c).gl {
+    } else if (*c).gl || (*c).vk {
         mc_render_world.wr_drop_chunk_b(&(*c).g.wr, &(*c).be, cx, cz)
     } else {
         mc_render_world.wr_drop_chunk(&(*c).g.wr, &(*c).g.r, cx, cz)
@@ -807,13 +815,17 @@ fn keys_now(c: *mut Ctx) -> u32 {
 
 // The back end that holds the meshes and the atlas: GL or the CPU raster.
 fn cur_be(c: *mut Ctx) -> mc_backend.Backend {
-    if (*c).gl { return (*c).be }
+    if (*c).gl || (*c).vk { return (*c).be }
     return mc_backend.backend_cpu(&(*c).g.r)
 }
 
 fn gfx_resize(c: *mut Ctx, w: i32, h: i32) {
     stream_release(c)
-    if (*c).gl {
+    if (*c).vk {
+        mc_render_world.wr_clear_b(&(*c).g.wr, &(*c).be)
+        let rok: bool = vk_mc.vkbe_resize(&(*c).vbk, w, h)
+        (*c).be = vk_mc.vkbe_backend(&(*c).vbk)
+    } else if (*c).gl {
         mc_render_world.wr_clear_b(&(*c).g.wr, &(*c).be)
         gl_mc.glbe_resize(&(*c).gb, w, h)
         (*c).be = gl_mc.glbe_backend(&(*c).gb)
@@ -822,7 +834,7 @@ fn gfx_resize(c: *mut Ctx, w: i32, h: i32) {
     }
     mc_raster.raster_free(&(*c).g.r)
     (*c).g.r = mc_raster.raster_new(w, h)
-    if !(*c).gl {
+    if !(*c).gl && !(*c).vk {
         if (*c).g.use_res {
             var be: mc_backend.Backend = mc_backend.backend_cpu(&(*c).g.r)
             mc_packs.res_upload(&(*c).g.res, &be)
@@ -1736,7 +1748,153 @@ fn draw_frame_gl(c: *mut Ctx) {
     rt.buf_free(&rec)
 }
 
+// MCPLAY_GFX=vk
+fn want_vk_gfx() -> bool {
+    if !env.has("MCPLAY_GFX") { return false }
+    let v: str = env.get("MCPLAY_GFX")
+    return v.length() == 2 && v.chars(0) == 118 as u8 && v.chars(1) == 107 as u8
+}
+
+// Opens the Vulkan back end for the window size w x h and uploads the atlas / resource pack. false = no Vulkan device (the caller keeps the CPU path).
+fn vk_open_be(c: *mut Ctx, w: i32, h: i32) -> bool {
+    var cp: str = ""
+    if env.has("MCPLAY_VK_CACHE") { cp = env.get("MCPLAY_VK_CACHE") }
+    if !vk_mc.vkbe_open_into(&(*c).vbk, w, h, cp) {
+        say(f"mcplay: vk back end failed (step {(*c).vbk.step})\n")
+        return false
+    }
+    vk_mc.vkbe_set_readback(&(*c).vbk, true)
+    (*c).be = vk_mc.vkbe_backend(&(*c).vbk)
+    if (*c).g.use_res {
+        mc_packs.res_reload_upload(&(*c).g.res, &(*c).be)
+    } else {
+        (*c).be.upload_atlas((*c).be.obj, ((&(*c).g.atlas) as u64))
+    }
+    return true
+}
+
+// A lost device (failed submit or MCPLAY_VK_LOST_AT): free the stream + meshes, close and re-open the back end (cache file reloaded), upload the atlas again,
+// re-announce every loaded column. The window and the world stay. Real device loss is UNTESTED (lavapipe never loses a device): only the simulated path is.
+fn vk_recover(c: *mut Ctx) {
+    (*c).vk_losses = (*c).vk_losses + 1 as u64
+    say(f"mcplay: vk device lost at frame {(*c).n_frames} -- re-opening\n")
+    stream_release(c)
+    mc_render_world.wr_clear_b(&(*c).g.wr, &(*c).be)
+    vk_mc.vkbe_close(&(*c).vbk)
+    if !vk_open_be(c, (*c).w, (*c).h) {
+        io.eprint_line("mcplay: vk recovery failed -- quitting")
+        (*c).closed = true
+        return
+    }
+    if (*c).join { stream_make(c) }
+    (*c).vk_recoveries = (*c).vk_recoveries + 1 as u64
+}
+
+// Vulkan frame: ONE render pass, same order as the GL path: sky, world, entities (+ selection box), tint, HUD; end submits.
+#[allow_escape]
+fn draw_frame_vk(c: *mut Ctx) {
+    let view: f64 = far_view(c) as f64
+    let fog_start: f64 = view * 16.0 * 0.5
+    let fog_end: f64 = view * 16.0 + 8.0
+    let clear: u32 = (255 as u32 << 24 as u32) | (FOG_B << 16 as u32) | (FOG_G << 8 as u32) | FOG_R
+    if (*c).vk_lost_at != 0 as u64 && (*c).n_frames == (*c).vk_lost_at { vk_mc.vkbe_inject_lost(&(*c).vbk) }
+    vk_mc.vkbe_set_fog(&(*c).vbk, true, fog_start, fog_end, (*c).sky.fr as u32, (*c).sky.fg as u32, (*c).sky.fb as u32)
+    (*c).be.begin((*c).be.obj, ((&(*c).cam) as u64), clear)
+    vk_mc.vkbe_sky(&(*c).vbk, &(*c).cam, &(*c).sky)
+    if (*c).light { mc_render_world.wr_set_daylight(&(*c).be, (*c).sky.daylight) }
+    if (*c).have_pos {
+        let ts0: u64 = now_ns()
+        if (*c).stream_on {
+            let tg: u64 = mc_stream.stream_frame(&(*c).stm, &(*c).world, &(*c).be, &(*c).cam)
+        } else {
+            mc_render_world.wr_render_b(&(*c).g.wr, &(*c).world, &(*c).be, &(*c).cam, 0 - 1)
+        }
+        stream_time(c, now_ns() - ts0)
+    }
+    ents_draw(c, &(*c).be)
+    if (*c).hit {
+        // selection box = 12 thin boxes along the block edges (black), same records as the GL scene layer
+        var recs: [f64; 144] = [0.0; 144]
+        let e: f64 = 0.03
+        let bx: f64 = (*c).pk.x as f64
+        let by: f64 = (*c).pk.y as f64
+        let bz: f64 = (*c).pk.z as f64
+        var i: i32 = 0
+        var m: usize = 0
+        while i < 4 {
+            var ox: f64 = 0.0
+            var oy: f64 = 0.0
+            if (i & 1) != 0 { ox = 1.0 }
+            if (i & 2) != 0 { oy = 1.0 }
+            var k: usize = 0
+            while k < 3 {
+                var x: f64 = bx + ox
+                var y: f64 = by + oy
+                var z: f64 = bz + oy
+                var sx: f64 = e
+                var sy: f64 = e
+                var sz: f64 = e
+                if k == 0 { x = bx + 0.5
+                    y = by + oy
+                    z = bz + ox
+                    sx = 1.0 + e }
+                if k == 1 { x = bx + ox
+                    y = by + 0.5
+                    z = bz + oy
+                    sy = 1.0 + e }
+                if k == 2 { x = bx + ox
+                    y = by + oy
+                    z = bz + 0.5
+                    sz = 1.0 + e }
+                let o: usize = m * 12
+                recs[o] = x
+                recs[o + 1] = y
+                recs[o + 2] = z
+                recs[o + 3] = sx
+                recs[o + 4] = sy
+                recs[o + 5] = sz
+                recs[o + 7] = 1.0
+                m = m + 1
+                k = k + 1
+            }
+            i = i + 1
+        }
+        let nb: u64 = (*c).be.draw_entities((*c).be.ent_obj, (&recs[0]) as u64, m)
+    }
+    if !(*c).light { vk_mc.vkbe_tint(&(*c).vbk, &(*c).sky) }
+    var d: mc_hud.HudDebug = mc_hud.hud_debug_new()
+    d.fps = (*c).fps
+    d.x = (*c).pl.x
+    d.y = (*c).pl.y
+    d.z = (*c).pl.z
+    d.yaw = (*c).pl.yaw
+    d.pitch = (*c).pl.pitch
+    d.has_block = (*c).hit
+    if (*c).hit {
+        d.bx = (*c).pk.x
+        d.by = (*c).pk.y
+        d.bz = (*c).pk.z
+        d.id = (*c).pk.id
+        d.nx = (*c).pk.nx
+        d.ny = (*c).pk.ny
+        d.nz = (*c).pk.nz
+    }
+    var rec: rt.Buf = rt.buf_new()
+    mc_hud.hud_record(&rec)
+    mc_hud.hud_frame(&(*c).g.r, mc_hud.hud_scale((*c).w, (*c).h), mc_hud.HUD_CROSSHAIR | mc_hud.HUD_HOTBAR | mc_hud.HUD_DEBUG, (*c).pl.slot, &d)
+    draw_inventory(c, &(*c).g.r)
+    mc_hud.hud_record(0 as *mut rt.Buf)
+    vk_mc.vkbe_hud(&(*c).vbk, &rec)
+    rt.buf_free(&rec)
+    (*c).be.end((*c).be.obj)
+    if vk_mc.vkbe_lost(&(*c).vbk) { vk_recover(c) }
+}
+
 fn draw_frame(c: *mut Ctx) {
+    if (*c).vk {
+        draw_frame_vk(c)
+        return
+    }
     if (*c).gl {
         draw_frame_gl(c)
         return
@@ -1794,6 +1952,16 @@ fn draw_frame(c: *mut Ctx) {
 }
 
 fn present(c: *mut Ctx) {
+    if (*c).vk {
+        // read back (RGBA, row 0 = top, waits for the newest frame) -> X11 image
+        let px: u64 = (*c).be.present((*c).be.obj)
+        if px != 0 as u64 {
+            window.to_bgrx(px, (*c).bg, ((*c).w as usize) * ((*c).h as usize))
+            window.image((*c).wp, (*c).bg, (*c).w as usize, (*c).h as usize, 0, 0)
+        }
+        window.present((*c).wp)
+        return
+    }
     if (*c).gl {
         gl_scene.scene_present_window(&(*c).gsc, &(*c).sh, (*c).w, (*c).h)
         glwindow.swap(&(*c).gw)
@@ -1901,6 +2069,7 @@ fn main(start: u64) -> i32 {
     // -> the GL path meshes inline by default; MCPLAY_WORKERS=<n> forces threads (unsafe with GL)
     var wdef: i32 = 3
     if env_flag("MCPLAY_GL", false) { wdef = 0 }
+    if want_vk_gfx() { wdef = 0 } // same Firn limitation as GL: raw clone threads without glibc TLS crash libvulkan_lvp (docs/mc/stream.md)
     let n_workers: i32 = env_int("MCPLAY_WORKERS", wdef)
     var dummy_tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
     var eng: engine.Engine = engine.engine_new(AUDIO_RATE, 48 as u32)
@@ -1918,7 +2087,7 @@ fn main(start: u64) -> i32 {
         sky: mc_sky.sky_new(),
         pl: mc_input.player_new(0.0, 0.0, 0.0),
         rw: raw.raw_new(),
-        win: window.window_new(), wp: 0 as *mut window.Window, gl: false, gw: glwindow.glwindow_new(), gb: gb0, gsc: gl_scene.scene_empty(&gb0), sh: glshow.show_new(), be: mc_backend.backend_new(),
+        win: window.window_new(), wp: 0 as *mut window.Window, gl: false, vk: false, vbk: vk_mc.vkbe_blank(), vk_lost_at: env_int("MCPLAY_VK_LOST_AT", 0) as u64, vk_losses: 0 as u64, vk_recoveries: 0 as u64, gw: glwindow.glwindow_new(), gb: gb0, gsc: gl_scene.scene_empty(&gb0), sh: glshow.show_new(), be: mc_backend.backend_new(),
         stm: mc_stream.stream_new(0, 1, 1, &dummy_tb, 0 as u64), stream_on: want_stream, stm_live: true, lod: lod_n, pool: jobs.Jobs { blk: 0 }, win_cx: 1000000, win_cz: 1000000, win_n: 0 as u32, n_win: 0 as u64, t_stream: 0 as u64, max_stream: 0 as u64,
         pk: mc_input.Pick { x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, dist: 0.0, id: 0 },
         bg: 0, w: w0, h: h0, view: view, protocol: proto,
@@ -2024,6 +2193,16 @@ fn main(start: u64) -> i32 {
         let ttl: str = "mcplay"
         window.title(c.wp, ttl.p as u64, ttl.n)
         window.show_window(c.wp)
+        if want_vk_gfx() {
+            if vk_open_be(&c, w0, h0) {
+                c.vk = true
+                io.print("mcplay: gfx=vk device=")
+                io.print_c(vk_mc.vkbe_device_name(&c.vbk))
+                say(f" cpu_device={vk_mc.vkbe_is_cpu(&c.vbk)}\n")
+            } else {
+                io.eprint_line("mcplay: gfx=cpu (vk requested but not available)")
+            }
+        }
     }
     if env_flag("MCPLAY_FULLSCREEN", false) {
         c.fullscreen = true
@@ -2119,9 +2298,12 @@ fn main(start: u64) -> i32 {
     }
     say(f"mcplay: pos x={c.pl.x as i64} y={c.pl.y as i64} z={c.pl.z as i64} fps={c.fps}\n")
     var rc: i32 = 0
-    if c.gl {
+    if c.gl || c.vk {
         let px: u64 = c.be.present(c.be.obj)
-        rt.mem_copy(c.g.r.color, px, (c.w as usize) * (c.h as usize) * 4)
+        if px != 0 as u64 { rt.mem_copy(c.g.r.color, px, (c.w as usize) * (c.h as usize) * 4) }
+    }
+    if c.vk {
+        say(f"mcplay: vk frames={vk_mc.vkbe_frames(&c.vbk)} draws={vk_mc.vkbe_draws(&c.vbk)} tris={vk_mc.vkbe_tris(&c.vbk)} lost={c.vk_losses} recovered={c.vk_recoveries} ubo_over={c.vbk.ubo_over} dyn_over={c.vbk.dyn_over}\n")
     }
     if env.has("MCPLAY_SHOT") {
         let sp: str = env.get("MCPLAY_SHOT")
@@ -2147,7 +2329,10 @@ fn main(start: u64) -> i32 {
         stream_release(&c)
     }
     if c.pool.blk != 0 { jobs.destroy(&c.pool) }
-    if c.gl {
+    if c.vk {
+        mc_render_world.wr_free_b(&c.g.wr, &c.be)
+        vk_mc.vkbe_close(&c.vbk)
+    } else if c.gl {
         mc_render_world.wr_free_b(&c.g.wr, &c.be)
         gl_scene.scene_close(&c.gsc)
         gl_mc.glbe_close(&c.gb)

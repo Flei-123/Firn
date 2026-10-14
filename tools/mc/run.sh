@@ -6,7 +6,7 @@
 #     independent reference (python / node / java tools, never Mojang code).
 #     Each prints a line `RESULT <name>: ok` and exits 0 on success.
 #
-# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/)
+# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
@@ -48,6 +48,12 @@ fi
 if [ -z "$ONLY" ] || [ "$ONLY" = ents ]; then
     echo "== mc/ents =="
     bash tools/mc/play/run_ents.sh || ERR=$((ERR+1))
+fi
+# mcplay with the Vulkan back end (MCPLAY_GFX=vk; lavapipe = CPU Vulkan, NO real GPU) against the real server: picture vs CPU raster PSNR >= 34, frame counters,
+# simulated device loss + recovery: ~4 min, needs Xvfb + java; SKIP without a Vulkan device.
+if [ -z "$ONLY" ] || [ "$ONLY" = vkplay ]; then
+    echo "== mc/vkplay =="
+    bash tools/mc/play/run_vk.sh || ERR=$((ERR+1))
 fi
 if [ $ERR -eq 0 ]; then echo "RESULT mc: ok"; else echo "RESULT mc: $ERR failing parts"; fi
 exit $ERR

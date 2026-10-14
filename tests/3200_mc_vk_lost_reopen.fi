@@ -1,0 +1,107 @@
+// expect_exit: 0
+// mc.vk_mc lost-device round trip + in-place re-open + resize on Vulkan (lavapipe, NO real GPU; the loss is SIMULATED with vkbe_inject_lost, lavapipe never loses a device):
+// draw a quad (coverage c1) -> inject loss -> end() marks the back end lost, begin() on a lost back end is a no-op -> close -> vkbe_open_into on the same struct
+// (the way mcplay re-opens) -> upload atlas again -> same quad, same coverage -> vkbe_resize -> the picture has the new size. SKIP (exit 0) without a Vulkan device.
+import std.rt
+import std.io
+import mc.mc_backend
+import mc.mc_camera
+import mc.mc_texture
+import mc.vk_mc
+
+fn quad(b: *mut mc_backend.Backend) -> usize {
+    let v: u64 = rt.heap_alloc(4 * 8)
+    let ix: u64 = rt.heap_alloc(6 * 4)
+    var k: usize = 0
+    let xs: [u32; 4] = [12 as u32, 4 as u32, 4 as u32, 12 as u32]
+    let ys: [u32; 4] = [2 as u32, 2 as u32, 14 as u32, 14 as u32]
+    while k < 4 {
+        rt.st32(v, k * 2, xs[k] | (ys[k] << 8 as u32) | (10 as u32 << 16 as u32) | (3 as u32 << 24 as u32))
+        rt.st32(v, k * 2 + 1, 1 as u32)
+        k = k + 1
+    }
+    rt.st32(ix, 0, 0 as u32)
+    rt.st32(ix, 1, 1 as u32)
+    rt.st32(ix, 2, 2 as u32)
+    rt.st32(ix, 3, 0 as u32)
+    rt.st32(ix, 4, 2 as u32)
+    rt.st32(ix, 5, 3 as u32)
+    let h: usize = (*b).mesh_upload((*b).obj, 1, v, 4, ix, 6)
+    rt.heap_free(v, 32)
+    rt.heap_free(ix, 24)
+    return h
+}
+
+fn covered(px: u64, n: usize, clear: u32) -> u64 {
+    var cov: u64 = 0
+    var i: usize = 0
+    while i < n {
+        if rt.ld32(px, i) != clear { cov = cov + 1 as u64 }
+        i = i + 1
+    }
+    return cov
+}
+
+fn main(start: u64) -> i32 {
+    var vb: vk_mc.VkBackend = vk_mc.vkbe_blank()
+    if !vk_mc.vkbe_open_into(&vb, 160, 90, "") {
+        io.fmt_print(f"SKIP vkbe_open_into step={vb.step}\n")
+        return 0
+    }
+    var fails: i32 = 0
+    let clear: u32 = 0xFFE6BE96 as u32
+    var b: mc_backend.Backend = vk_mc.vkbe_backend(&vb)
+    var ta: mc_texture.Atlas = mc_texture.atlas_default()
+    b.upload_atlas(b.obj, (&ta) as u64)
+    var cam: mc_camera.Camera = mc_camera.camera_new(160, 90)
+    mc_camera.camera_set_pos(&cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&cam, 0.0, 0.0)
+    mc_camera.camera_update(&cam)
+    var h: usize = quad(&b)
+    b.begin(b.obj, (&cam) as u64, clear)
+    let t1: u64 = b.draw(b.obj, h, 0.0, 0.0, 0.0)
+    b.end(b.obj)
+    let c1: u64 = covered(b.present(b.obj), 160 * 90, clear)
+    io.fmt_print(f"first: tris={t1} covered={c1} lost={vk_mc.vkbe_lost(&vb)}\n")
+    if t1 != 2 as u64 || c1 < 3000 as u64 || vk_mc.vkbe_lost(&vb) { fails = fails + 1 }
+    // simulated loss
+    vk_mc.vkbe_inject_lost(&vb)
+    b.begin(b.obj, (&cam) as u64, clear)
+    let t2: u64 = b.draw(b.obj, h, 0.0, 0.0, 0.0)
+    b.end(b.obj)
+    io.fmt_print(f"lost frame: lost={vk_mc.vkbe_lost(&vb)}\n")
+    if !vk_mc.vkbe_lost(&vb) { fails = fails + 1 }
+    b.begin(b.obj, (&cam) as u64, clear) // no-op on a lost back end
+    b.end(b.obj)
+    vk_mc.vkbe_close(&vb)
+    // re-open IN PLACE, atlas + mesh again
+    if !vk_mc.vkbe_open_into(&vb, 160, 90, "") {
+        io.print("FAIL re-open\n")
+        return 1
+    }
+    b = vk_mc.vkbe_backend(&vb)
+    b.upload_atlas(b.obj, (&ta) as u64)
+    h = quad(&b)
+    b.begin(b.obj, (&cam) as u64, clear)
+    let t3: u64 = b.draw(b.obj, h, 0.0, 0.0, 0.0)
+    b.end(b.obj)
+    let c3: u64 = covered(b.present(b.obj), 160 * 90, clear)
+    io.fmt_print(f"after re-open: tris={t3} covered={c3} lost={vk_mc.vkbe_lost(&vb)}\n")
+    if t3 != 2 as u64 || c3 != c1 || vk_mc.vkbe_lost(&vb) { fails = fails + 1 }
+    // resize: the read back picture has the new size (quad coverage grows with the width because the projection keeps the aspect of the camera we pass)
+    if !vk_mc.vkbe_resize(&vb, 200, 120) { fails = fails + 1 }
+    var cam2: mc_camera.Camera = mc_camera.camera_new(200, 120)
+    mc_camera.camera_set_pos(&cam2, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&cam2, 0.0, 0.0)
+    mc_camera.camera_update(&cam2)
+    b.begin(b.obj, (&cam2) as u64, clear)
+    let t4: u64 = b.draw(b.obj, h, 0.0, 0.0, 0.0)
+    b.end(b.obj)
+    let px4: u64 = b.present(b.obj)
+    let c4: u64 = covered(px4, 200 * 120, clear)
+    io.fmt_print(f"after resize 200x120: tris={t4} covered={c4} corner_clear={rt.ld32(px4, 0) == clear}\n")
+    if t4 != 2 as u64 || c4 < 3000 as u64 || rt.ld32(px4, 0) != clear { fails = fails + 1 }
+    vk_mc.vkbe_close(&vb)
+    io.fmt_print(f"vk_mc lost/reopen/resize: {fails} failed\n")
+    return fails
+}
