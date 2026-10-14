@@ -1,0 +1,396 @@
+// expect_exit: 0
+// tests/2937_spirv_quad.fi -- gpu.spirv 2x2 quad (spv_quad_enable / spv_run_quad): OpDPdx/OpDPdy/OpFwidth (fine + coarse) and
+// implicit-LOD lookups (texture, bias, textureProj, textureQueryLod) of tex.frag against an independent f32 reference; the
+// four lanes of a quad run the arith.frag shader exactly like four single invocations.
+import std.rt
+import std.math
+import gpu.spirv
+
+const SH: str = __include_str("../lib/gpu/spv/test/tex.frag.spv")
+const SA: str = __include_str("../lib/gpu/spv/test/arith.frag.spv")
+
+fn check(c: bool, code: i32) {
+    if !c {
+        rt.finish(code as i64)
+    }
+}
+
+// ---- independent reference (plain Firn f32, written from the GL spec; shares no code with gpu.spirv) ----
+// texture 0: RGBA8, 8x8 with levels 8x8, 4x4, 2x2, 1x1; texture 1: RGBA32F 4x4
+
+static mut G_LIN: bool = false
+static mut G_WS: i32 = 2
+static mut G_WT: i32 = 1
+
+fn tex_byte(lvl: i32, x: i32, y: i32, c: i32) -> i32 {
+    return (x * 37 + y * 91 + c * 53 + lvl * 29) % 256
+}
+
+fn tex_f(x: i32, y: i32, c: i32) -> f32 {
+    return ((x * 5 + y * 3 + c * 7) % 16) as f32 / 16.0
+}
+
+fn fill_tex(m: *mut spirv.Spv) {
+    var lvl: i32 = 0
+    var w: i32 = 8
+    while lvl < 4 {
+        let px: u64 = rt.heap_alloc((w * w * 4) as usize)
+        var y: i32 = 0
+        while y < w {
+            var x: i32 = 0
+            while x < w {
+                var c: i32 = 0
+                while c < 4 {
+                    rt.st8(px, ((y * w + x) * 4 + c) as usize, tex_byte(lvl, x, y, c) as u8)
+                    c = c + 1
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        if lvl == 0 {
+            check(spirv.spv_tex_set(m, 0, spirv.SPV_FMT_RGBA8, px, 8, 8), 4)
+        } else {
+            check(spirv.spv_tex_set_level(m, 0, lvl as usize, px, w as usize, w as usize), 5)
+        }
+        w = w / 2
+        lvl = lvl + 1
+    }
+    let fp: u64 = rt.heap_alloc(4 * 4 * 4 * 4)
+    var y: i32 = 0
+    while y < 4 {
+        var x: i32 = 0
+        while x < 4 {
+            var c: i32 = 0
+            while c < 4 {
+                rt.st32(fp, ((y * 4 + x) * 4 + c) as usize, math.math_bits32(tex_f(x, y, c)))
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    check(spirv.spv_tex_set(m, 1, spirv.SPV_FMT_RGBA32F, fp, 4, 4), 6)
+    // binding 0: trilinear, repeat; binding 2: nearest, mirrored repeat in s / clamp in t
+    check(spirv.spv_sampler_set(m, 0, 1, 1, 2, 0, 0), 7)
+    check(spirv.spv_sampler_set(m, 2, 0, 0, 0, 2, 1), 8)
+}
+
+fn fdiv(a: i32, b: i32) -> i32 {
+    var q: i32 = a / b
+    if a % b != 0 && ((a < 0) != (b < 0)) {
+        q = q - 1
+    }
+    return q
+}
+
+// wrapped texel coordinate: repeat 0, clamp 1, mirror 2
+fn r_wrap(i: i32, n: i32, mode: i32) -> i32 {
+    if mode == 0 {
+        return i - fdiv(i, n) * n
+    }
+    if mode == 3 {
+        return i
+    }
+    if mode == 1 {
+        if i < 0 {
+            return 0
+        }
+        if i > n - 1 {
+            return n - 1
+        }
+        return i
+    }
+    let k: i32 = fdiv(i, n)
+    let r: i32 = i - k * n
+    if k % 2 != 0 {
+        return n - 1 - r
+    }
+    return r
+}
+
+fn r_texel(t: i32, lvl: i32, x: i32, y: i32, c: i32, ws: i32, wt: i32) -> f32 {
+    var n: i32 = 4
+    if t == 0 {
+        n = 8 / (1 << (lvl as u32))
+    }
+    if (ws == 3 && (x < 0 || x >= n)) || (wt == 3 && (y < 0 || y >= n)) {
+        return 0.25 + (c as f32) * 0.125
+    }
+    let xx: i32 = r_wrap(x, n, ws)
+    let yy: i32 = r_wrap(y, n, wt)
+    if t == 0 {
+        return tex_byte(lvl, xx, yy, c) as f32 / 255.0
+    }
+    return tex_f(xx, yy, c)
+}
+
+fn r_level(t: i32, lvl: i32, u: f32, v: f32, linear: bool, ox: i32, oy: i32, ws: i32, wt: i32, c: i32) -> f32 {
+    var n: i32 = 4
+    if t == 0 {
+        n = 8 / (1 << (lvl as u32))
+    }
+    let nf: f32 = n as f32
+    if !linear {
+        let i: i32 = math.floor32(u * nf) as i32 + ox
+        let j: i32 = math.floor32(v * nf) as i32 + oy
+        return r_texel(t, lvl, i, j, c, ws, wt)
+    }
+    let x: f32 = u * nf - 0.5
+    let y: f32 = v * nf - 0.5
+    let fx: f32 = math.floor32(x)
+    let fy: f32 = math.floor32(y)
+    let a: f32 = x - fx
+    let b: f32 = y - fy
+    let i0: i32 = fx as i32 + ox
+    let j0: i32 = fy as i32 + oy
+    var s: f32 = 0.0
+    s = s + (1.0 - a) * (1.0 - b) * r_texel(t, lvl, i0, j0, c, ws, wt)
+    s = s + a * (1.0 - b) * r_texel(t, lvl + 0, i0 + 1, j0, c, ws, wt)
+    s = s + (1.0 - a) * b * r_texel(t, lvl, i0, j0 + 1, c, ws, wt)
+    s = s + a * b * r_texel(t, lvl, i0 + 1, j0 + 1, c, ws, wt)
+    return s
+}
+
+// texture 0 with sampler (linear, linear, mip linear, repeat); texture 1 with sampler (nearest, nearest, none, mirror, clamp)
+fn r_lookup(t: i32, u: f32, v: f32, lambda: f32, ox: i32, oy: i32, c: i32) -> f32 {
+    if t == 1 {
+        return r_level(1, 0, u, v, G_LIN, ox, oy, G_WS, G_WT, c)
+    }
+    if !(lambda > 0.0) {
+        return r_level(0, 0, u, v, true, ox, oy, 0, 0, c)
+    }
+    var d: f32 = lambda
+    if d > 3.0 {
+        d = 3.0
+    }
+    let l0f: f32 = math.floor32(d)
+    let fr: f32 = d - l0f
+    let l0: i32 = l0f as i32
+    var l1: i32 = l0 + 1
+    if l1 > 3 {
+        l1 = 3
+    }
+    let a: f32 = r_level(0, l0, u, v, true, ox, oy, 0, 0, c)
+    let b: f32 = r_level(0, l1, u, v, true, ox, oy, 0, 0, c)
+    return (1.0 - fr) * a + fr * b
+}
+
+// LOD of (u, v) gradients on the 8x8 base level
+fn r_lambda(dudx: f32, dvdx: f32, dudy: f32, dvdy: f32) -> f32 {
+    let rx: f32 = math.sqrt32((dudx * 8.0) * (dudx * 8.0) + (dvdx * 8.0) * (dvdx * 8.0))
+    let ry: f32 = math.sqrt32((dudy * 8.0) * (dudy * 8.0) + (dvdy * 8.0) * (dvdy * 8.0))
+    var rho: f32 = rx
+    if ry > rho {
+        rho = ry
+    }
+    if !(rho > 0.0) {
+        return -1000.0
+    }
+    return math.log2(rho as f64) as f32
+}
+
+fn near(a: f32, b: f32) -> bool {
+    var d: f32 = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    var s: f32 = b
+    if s < 0.0 {
+        s = 0.0 - s
+    }
+    return d <= 3.0e-6 * (1.0 + s)
+}
+
+fn out_f(m: *mut spirv.Spv, loc: u32, k: usize) -> f32 {
+    return spirv.spv_mem_get_f32(m, spirv.spv_find_location(m, 3, loc), k)
+}
+
+fn lane_u(l: i32, s: f32) -> f32 {
+    return 0.3 + s * ((l % 2) as f32 * 0.3125 + (l / 2) as f32 * 0.03125)
+}
+
+fn lane_v(l: i32, s: f32) -> f32 {
+    return 0.6 + s * ((l % 2) as f32 * 0.0625 + (l / 2) as f32 * 0.1)
+}
+
+fn lane_lod(l: i32) -> f32 {
+    let x: f32 = (l % 2) as f32
+    let y: f32 = (l / 2) as f32
+    return 0.25 + x + 2.0 * y + 4.0 * x * y
+}
+
+// fine derivative along x (axis 0) or y (axis 1) of the lane value f(l); coarse: top row / left column
+fn der(l: i32, axis: i32, coarse: bool, f: fn(i32) -> f32) -> f32 {
+    var a: i32 = l
+    var b: i32 = l
+    if axis == 0 {
+        if coarse {
+            a = 0
+            b = 1
+        } else if l % 2 == 0 {
+            b = l + 1
+        } else {
+            a = l - 1
+        }
+    } else {
+        if coarse {
+            a = 0
+            b = 2
+        } else if l / 2 == 0 {
+            b = l + 2
+        } else {
+            a = l - 2
+        }
+    }
+    return f(b) - f(a)
+}
+
+static mut SC: f32 = 1.0
+
+fn fu(l: i32) -> f32 {
+    return lane_u(l, SC)
+}
+
+fn fv(l: i32) -> f32 {
+    return lane_v(l, SC)
+}
+
+fn fl(l: i32) -> f32 {
+    return lane_lod(l)
+}
+
+fn main() -> i32 {
+    var m: spirv.Spv = spirv.spv_zero()
+    check(spirv.spv_new(SH.p as u64, SH.n, &m), 1)
+    check(spirv.spv_quad_enable(&m), 2)
+    check(spirv.spv_quad_enable(&m), 2)
+    let ent: u32 = spirv.spv_find_entry(&m, 4)
+    let luv: usize = spirv.spv_find_location(&m, 1, 0)
+    let llod: usize = spirv.spv_find_location(&m, 1, 1)
+    fill_tex(&m)
+    // spv_run on one lane of an enabled quad: no neighbours, so derivatives are 0 and the LOD is a magnification
+    spirv.spv_lane(&m, 2)
+    spirv.spv_mem_set_f32(&m, luv, 0, 0.4)
+    spirv.spv_mem_set_f32(&m, luv, 1, 0.5)
+    check(spirv.spv_run(&m, ent, 100000), 3)
+    check(out_f(&m, 7, 0) == 0.0 && out_f(&m, 9, 1) == 0.0 && near(out_f(&m, 0, 2), r_lookup(0, 0.4, 0.5, -1000.0, 0, 0, 2)), 4)
+    let scales: [f32; 5] = [1.0, 0.01, 3.0, 0.0, 0.5]
+    var si: usize = 0
+    while si < 5 {
+        SC = scales[si]
+        var l: i32 = 0
+        while l < 4 {
+            spirv.spv_lane(&m, l as usize)
+            spirv.spv_mem_set_f32(&m, luv, 0, lane_u(l, SC))
+            spirv.spv_mem_set_f32(&m, luv, 1, lane_v(l, SC))
+            spirv.spv_mem_set_f32(&m, llod, 0, lane_lod(l))
+            l = l + 1
+        }
+        check(spirv.spv_run_quad(&m, ent, 100000), 10)
+        l = 0
+        while l < 4 {
+            spirv.spv_lane(&m, l as usize)
+            let u: f32 = lane_u(l, SC)
+            let v: f32 = lane_v(l, SC)
+            let dudx: f32 = der(l, 0, false, fu)
+            let dvdx: f32 = der(l, 0, false, fv)
+            let dudy: f32 = der(l, 1, false, fu)
+            let dvdy: f32 = der(l, 1, false, fv)
+            let lam: f32 = r_lambda(dudx, dvdx, dudy, dvdy)
+            let base: i32 = 10000 + (si as i32) * 1000 + l * 100
+            // derivatives
+            check(out_f(&m, 7, 0) == dudx && out_f(&m, 7, 1) == dvdx && out_f(&m, 7, 2) == dudy && out_f(&m, 7, 3) == dvdy, base + 1)
+            check(out_f(&m, 8, 0) == der(l, 0, true, fu) && out_f(&m, 8, 1) == der(l, 0, true, fv), base + 2)
+            check(out_f(&m, 8, 2) == der(l, 1, true, fu) && out_f(&m, 8, 3) == der(l, 1, true, fv), base + 3)
+            var fwx: f32 = dudx
+            if fwx < 0.0 {
+                fwx = 0.0 - fwx
+            }
+            var fwy: f32 = dudy
+            if fwy < 0.0 {
+                fwy = 0.0 - fwy
+            }
+            check(out_f(&m, 9, 0) == fwx + fwy, base + 4)
+            check(out_f(&m, 9, 2) == der(l, 0, true, fl) + der(l, 1, true, fl), base + 5)
+            check(out_f(&m, 9, 3) == der(l, 0, false, fl), base + 6)
+            // implicit LOD
+            check(near(out_f(&m, 11, 1), lam), base + 7)
+            var cl: f32 = lam
+            if cl > 3.0 {
+                cl = 3.0
+            }
+            if cl < 0.0 {
+                cl = 0.0
+            }
+            check(near(out_f(&m, 11, 0), cl), base + 8)
+            var c: i32 = 0
+            while c < 4 {
+                let cu: usize = c as usize
+                check(near(out_f(&m, 0, cu), r_lookup(0, u, v, lam, 0, 0, c)), base + 10 + c)
+                check(near(out_f(&m, 1, cu), r_lookup(0, u, v, lane_lod(l), 0, 0, c)), base + 14 + c)
+                check(near(out_f(&m, 5, cu), r_lookup(0, u, v, lam, 1, -1, c) + r_lookup(0, u, v, 0.0, -2, 3, c)), base + 18 + c)
+                check(near(out_f(&m, 6, cu), r_lookup(0, u, v, 1.0, 0, 0, c)), base + 22 + c)
+                check(near(out_f(&m, 10, cu), r_lookup(0, u, v, lam, 0, 0, c) + r_lookup(0, u, v, lam + 0.5, 0, 0, c)), base + 26 + c)
+                check(near(out_f(&m, 4, cu), r_lookup(1, u, v, lam, 0, 0, c)), base + 30 + c)
+                c = c + 1
+            }
+            l = l + 1
+        }
+        si = si + 1
+    }
+    spirv.spv_free(&m)
+
+    // lane isolation: arith.frag in a quad = four single invocations
+    var q: spirv.Spv = spirv.spv_zero()
+    var s: spirv.Spv = spirv.spv_zero()
+    check(spirv.spv_new(SA.p as u64, SA.n, &q), 20)
+    check(spirv.spv_new(SA.p as u64, SA.n, &s), 21)
+    check(spirv.spv_quad_enable(&q), 22)
+    let ea: u32 = spirv.spv_find_entry(&q, 4)
+    let ia: usize = spirv.spv_find_location(&q, 1, 0)
+    let ib: usize = spirv.spv_find_location(&q, 1, 1)
+    let ua: usize = spirv.spv_find_location(&q, 1, 4)
+    var l: i32 = 0
+    while l < 4 {
+        spirv.spv_lane(&q, l as usize)
+        var k: usize = 0
+        while k < 4 {
+            spirv.spv_mem_set_f32(&q, ia, k, (l + 1) as f32 * 1.25 + (k as f32))
+            spirv.spv_mem_set_f32(&q, ib, k, 0.5 - (l as f32) + (k as f32) * 2.0)
+            k = k + 1
+        }
+        spirv.spv_mem_set(&q, ua, 0, 10 + l as u32)
+        spirv.spv_mem_set(&q, ua, 1, 25)
+        l = l + 1
+    }
+    check(spirv.spv_run_quad(&q, ea, 10000), 23)
+    l = 0
+    while l < 4 {
+        var k: usize = 0
+        while k < 4 {
+            spirv.spv_mem_set_f32(&s, ia, k, (l + 1) as f32 * 1.25 + (k as f32))
+            spirv.spv_mem_set_f32(&s, ib, k, 0.5 - (l as f32) + (k as f32) * 2.0)
+            k = k + 1
+        }
+        spirv.spv_mem_set(&s, ua, 0, 10 + l as u32)
+        spirv.spv_mem_set(&s, ua, 1, 25)
+        check(spirv.spv_run(&s, ea, 10000), 24)
+        spirv.spv_lane(&q, l as usize)
+        var o: u32 = 0
+        while o < 6 {
+            let qo: usize = spirv.spv_find_location(&q, 3, o)
+            let so: usize = spirv.spv_find_location(&s, 3, o)
+            k = 0
+            while k < 4 {
+                check(spirv.spv_mem_get(&q, qo, k) == spirv.spv_mem_get(&s, so, k), 30000 + l * 100 + (o as i32) * 4 + (k as i32))
+                k = k + 1
+            }
+            o = o + 1
+        }
+        l = l + 1
+    }
+    spirv.spv_free(&q)
+    spirv.spv_free(&s)
+    return 0
+}
