@@ -1,0 +1,270 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/gpu/vk/vkscene_dump.fi -- the Vulkan scene layer (lib/mc/vk_mc.fi: sky, tint, entities, HUD) against the CPU path (mc_raster + mc_sky +
+// mc_hud). Same pass order on both sides; copy of the idea of tools/gpu/mc/scene.fi (GL). Scenes are added with the features (roadmap r180).
+// lavapipe (CPU renderer), NO real GPU. Exit 0 = all scenes >= 34 dB, 3 = a check failed, 4 = no Vulkan device (the gate prints SKIP).
+import std.rt
+import std.io
+import std.math
+import std.time
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import mc.mc_sky
+import mc.mc_hud
+import mc.vk_mc
+
+const W: i32 = 320
+const H: i32 = 180
+const MIN_PSNR_X100: u64 = 3400
+
+struct Cmp {
+    diff_px: u64,
+    big_px: u64,
+    max_diff: u32,
+    cov_cpu: u64,
+    cov_gpu: u64,
+    psnr_x100: u64,
+}
+
+struct Sc {
+    r: mc_raster.Raster,
+    gb: vk_mc.VkBackend,
+    bc: mc_backend.Backend,
+    bg: mc_backend.Backend,
+    cam: mc_camera.Camera,
+    sky: mc_sky.Sky,
+    fails: i32,
+}
+
+fn print_f2(v: f64) {
+    var x: f64 = v
+    if x < 0.0 { x = 0.0 }
+    let i: i64 = x as i64
+    var f: i64 = ((x - (i as f64)) * 100.0 + 0.5) as i64
+    var ii: i64 = i
+    if f >= 100 as i64 {
+        f = f - 100 as i64
+        ii = ii + 1 as i64
+    }
+    if f < 10 as i64 {
+        io.fmt_print(f"{ii}.0{f}")
+    } else {
+        io.fmt_print(f"{ii}.{f}")
+    }
+}
+
+fn compare(a: u64, b: u64, n: usize, clear: u32, out: *mut Cmp) {
+    (*out).diff_px = 0 as u64
+    (*out).big_px = 0 as u64
+    (*out).max_diff = 0 as u32
+    (*out).cov_cpu = 0 as u64
+    (*out).cov_gpu = 0 as u64
+    var sq: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let pa: u32 = rt.ld32(a, i)
+        let pb: u32 = rt.ld32(b, i)
+        if pa != clear { (*out).cov_cpu = (*out).cov_cpu + 1 as u64 }
+        if pb != clear { (*out).cov_gpu = (*out).cov_gpu + 1 as u64 }
+        if pa != pb {
+            (*out).diff_px = (*out).diff_px + 1 as u64
+            var mx: u32 = 0 as u32
+            var k: u32 = 0 as u32
+            while k < 4 as u32 {
+                let ba: i32 = ((pa >> (k * 8 as u32)) & 255 as u32) as i32
+                let bb: i32 = ((pb >> (k * 8 as u32)) & 255 as u32) as i32
+                var d: i32 = ba - bb
+                if d < 0 { d = 0 - d }
+                if k < 3 as u32 { sq = sq + (d * d) as f64 }
+                if (d as u32) > mx { mx = d as u32 }
+                k = k + 1 as u32
+            }
+            if mx > (*out).max_diff { (*out).max_diff = mx }
+            if mx > 16 as u32 { (*out).big_px = (*out).big_px + 1 as u64 }
+        }
+        i = i + 1
+    }
+    var psnr: f64 = 99.0
+    if sq > 0.0 {
+        let mse: f64 = sq / ((n as f64) * 3.0)
+        psnr = 10.0 * math.log10(255.0 * 255.0 / mse)
+    }
+    (*out).psnr_x100 = (psnr * 100.0) as u64
+}
+
+// tiles: 1 orange (world), 2..5 solid entity colours
+fn scene_atlas() -> mc_texture.Atlas {
+    var a: mc_texture.Atlas = mc_texture.atlas_new(16, 4, 4)
+    var t: u32 = 1 as u32
+    while t <= 5 as u32 {
+        var c: u32 = mc_texture.pack_pixel(230 as u32, 120 as u32, 40 as u32, 255 as u32)
+        if t == 2 as u32 { c = mc_texture.pack_pixel(200 as u32, 80 as u32, 40 as u32, 255 as u32) }
+        if t == 3 as u32 { c = mc_texture.pack_pixel(40 as u32, 160 as u32, 220 as u32, 255 as u32) }
+        if t == 4 as u32 { c = mc_texture.pack_pixel(90 as u32, 200 as u32, 60 as u32, 255 as u32) }
+        if t == 5 as u32 { c = mc_texture.pack_pixel(230 as u32, 230 as u32, 50 as u32, 255 as u32) }
+        let ox: i32 = mc_texture.atlas_tile_x(&a, t)
+        let oy: i32 = mc_texture.atlas_tile_y(&a, t)
+        var y: i32 = 0
+        while y < 16 {
+            var x: i32 = 0
+            while x < 16 {
+                rt.st32(a.px, ((oy + y) * a.w + ox + x) as usize, c)
+                x = x + 1
+            }
+            y = y + 1
+        }
+        t = t + 1 as u32
+    }
+    return a
+}
+
+fn vw0(x: u32, y: u32, z: u32, face: u32, ao: u32) -> u32 {
+    return x | (y << 8 as u32) | (z << 16 as u32) | (face << 24 as u32) | (ao << 27 as u32)
+}
+
+fn vw1(tile: u32, u: u32, v: u32) -> u32 {
+    return tile | (u << 16 as u32) | (v << 24 as u32)
+}
+
+fn put_vtx(vp: u64, i: usize, w0: u32, w1: u32) {
+    rt.st32(vp, i * 2, w0)
+    rt.st32(vp, i * 2 + 1, w1)
+}
+
+fn stf(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (8 as u64)) as *mut f64) = v
+}
+
+// flags: 1 sky, 2 world quad, 4 fog, 8 tint, 16 HUD, 32 entities
+fn frame_cpu(s: *mut Sc, clear: u32, flags: u32) -> u64 {
+    mc_camera.camera_update(&(*s).cam)
+    (*s).bc.begin((*s).bc.obj, ((&(*s).cam) as u64), clear)
+    if (flags & 1 as u32) != 0 as u32 { mc_sky.sky_draw_plain(&(*s).sky, &(*s).r) }
+    if (flags & 2 as u32) != 0 as u32 { (*s).bc.draw((*s).bc.obj, 1, 0.0, 0.0, 0.0) }
+    (*s).bc.end((*s).bc.obj)
+    return (*s).bc.present((*s).bc.obj)
+}
+
+fn frame_gpu(s: *mut Sc, clear: u32, flags: u32) -> u64 {
+    mc_camera.camera_update(&(*s).cam)
+    (*s).bg.begin((*s).bg.obj, ((&(*s).cam) as u64), clear)
+    if (flags & 1 as u32) != 0 as u32 { vk_mc.vkbe_sky(&(*s).gb, &(*s).cam, &(*s).sky) }
+    if (flags & 2 as u32) != 0 as u32 { (*s).bg.draw((*s).bg.obj, 1, 0.0, 0.0, 0.0) }
+    (*s).bg.end((*s).bg.obj)
+    return (*s).bg.present((*s).bg.obj)
+}
+
+fn set_fog(s: *mut Sc, on: bool) {
+    mc_raster.raster_set_fog(&(*s).r, on, 8.0, 40.0, (*s).sky.fr as u32, (*s).sky.fg as u32, (*s).sky.fb as u32)
+    vk_mc.vkbe_set_fog(&(*s).gb, on, 8.0, 40.0, (*s).sky.fr as u32, (*s).sky.fg as u32, (*s).sky.fb as u32)
+}
+
+fn report(s: *mut Sc, name: str, c: *mut Cmp, ok: bool) {
+    io.print("scene ")
+    io.print(name)
+    io.fmt_print(f" cov_cpu={(*c).cov_cpu} cov_gpu={(*c).cov_gpu} diff_px={(*c).diff_px} big_px={(*c).big_px} max_diff={(*c).max_diff} psnr=")
+    print_f2(((*c).psnr_x100 as f64) / 100.0)
+    if ok {
+        io.print(" ok\n")
+    } else {
+        io.print(" FAIL\n")
+        (*s).fails = (*s).fails + 1
+    }
+}
+
+// Renders `flags` on both sides and checks PSNR >= 34 plus (when `need_cov`) that something was drawn.
+fn scene(s: *mut Sc, name: str, clear: u32, flags: u32, need_cov: bool) {
+    let pc: u64 = frame_cpu(s, clear, flags)
+    let pg: u64 = frame_gpu(s, clear, flags)
+    var c: Cmp = Cmp { diff_px: 0 as u64, big_px: 0 as u64, max_diff: 0 as u32, cov_cpu: 0 as u64, cov_gpu: 0 as u64, psnr_x100: 0 as u64 }
+    compare(pc, pg, (W as usize) * (H as usize), clear, &c)
+    var ok: bool = c.psnr_x100 >= MIN_PSNR_X100
+    if need_cov && (c.cov_cpu == 0 as u64 || c.cov_gpu == 0 as u64) { ok = false }
+    report(s, name, &c, ok)
+    mc_timing(s, flags)
+}
+
+// ms per GPU frame of the last scene (median of a few repeats, readback on)
+fn mc_timing(s: *mut Sc, flags: u32) {
+}
+
+fn quad_mesh(s: *mut Sc) -> bool {
+    let qv: u64 = rt.heap_alloc(8 * 8)
+    let qi: u64 = rt.heap_alloc(12 * 4)
+    put_vtx(qv, 0, vw0(14 as u32, 1 as u32, 10 as u32, 3 as u32, 0 as u32), vw1(1 as u32, 0 as u32, 2 as u32))
+    put_vtx(qv, 1, vw0(2 as u32, 1 as u32, 10 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 2 as u32, 2 as u32))
+    put_vtx(qv, 2, vw0(2 as u32, 13 as u32, 10 as u32, 3 as u32, 1 as u32), vw1(1 as u32, 2 as u32, 0 as u32))
+    put_vtx(qv, 3, vw0(14 as u32, 13 as u32, 10 as u32, 3 as u32, 2 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    put_vtx(qv, 4, vw0(14 as u32, 0 as u32, 14 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 0 as u32, 2 as u32))
+    put_vtx(qv, 5, vw0(2 as u32, 0 as u32, 14 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 2 as u32, 2 as u32))
+    put_vtx(qv, 6, vw0(2 as u32, 4 as u32, 14 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 2 as u32, 0 as u32))
+    put_vtx(qv, 7, vw0(14 as u32, 4 as u32, 14 as u32, 3 as u32, 3 as u32), vw1(1 as u32, 0 as u32, 0 as u32))
+    var k: usize = 0
+    while k < 2 {
+        let o: usize = k * 6
+        let b: u32 = (k * 4) as u32
+        rt.st32(qi, o, b)
+        rt.st32(qi, o + 1, b + 1 as u32)
+        rt.st32(qi, o + 2, b + 2 as u32)
+        rt.st32(qi, o + 3, b)
+        rt.st32(qi, o + 4, b + 2 as u32)
+        rt.st32(qi, o + 5, b + 3 as u32)
+        k = k + 1
+    }
+    let hc: usize = (*s).bc.mesh_upload((*s).bc.obj, 1, qv, 8, qi, 12)
+    let hg: usize = (*s).bg.mesh_upload((*s).bg.obj, 1, qv, 8, qi, 12)
+    if hc != 1 || hg != 1 {
+        io.fmt_print(f"unexpected mesh handles {hc} {hg}\n")
+        return false
+    }
+    return true
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var gb: vk_mc.VkBackend = vk_mc.vkbe_open(W, H)
+    if !gb.ok {
+        io.fmt_print(f"no Vulkan device: step={gb.step}\n")
+        return 4
+    }
+    io.print("renderer: ")
+    io.print_c(vk_mc.vkbe_device_name(&gb))
+    io.new_line()
+    var s: Sc = Sc { r: mc_raster.raster_new(W, H), gb: gb, bc: mc_backend.backend_new(), bg: mc_backend.backend_new(),
+        cam: mc_camera.camera_new(W, H), sky: mc_sky.sky_new(), fails: 0 }
+    mc_raster.raster_set_cull(&s.r, false)
+    s.bc = mc_backend.backend_cpu(&s.r)
+    s.bg = vk_mc.vkbe_backend(&s.gb)
+    var ta: mc_texture.Atlas = scene_atlas()
+    s.bc.upload_atlas(s.bc.obj, (&ta) as u64)
+    s.bg.upload_atlas(s.bg.obj, (&ta) as u64)
+    mc_camera.camera_set_pos(&s.cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&s.cam, 0.0, 0.0)
+    s.sky.discs = false
+    if !quad_mesh(&s) { return 3 }
+    let clear: u32 = 0xFF302010 as u32
+
+    set_fog(&s, false)
+    scene(&s, "sky", clear, 1 as u32, true)
+    // sunset: glow + sun / moon discs, looking towards the sun and away from it
+    mc_sky.sky_set_time(&s.sky, 12600 as i64, 0)
+    s.sky.discs = true
+    mc_camera.camera_set_angles(&s.cam, 90.0, 5.0)
+    scene(&s, "sky_sunset_east", clear, 1 as u32, true)
+    mc_camera.camera_set_angles(&s.cam, 270.0, 5.0)
+    scene(&s, "sky_sunset_west", clear, 1 as u32, true)
+    mc_sky.sky_set_time(&s.sky, 18000 as i64, 0)
+    mc_camera.camera_set_angles(&s.cam, 0.0, 40.0)
+    scene(&s, "sky_night_up", clear, 1 as u32, true)
+    mc_sky.sky_set_time(&s.sky, 6000 as i64, 0)
+    s.sky.discs = false
+    mc_camera.camera_set_angles(&s.cam, 0.0, 0.0)
+    vk_mc.vkbe_close(&s.gb)
+    if s.fails != 0 {
+        io.fmt_print(f"RESULT vkscene: FAIL ({s.fails})\n")
+        return 3
+    }
+    io.print("RESULT vkscene: ok\n")
+    return 0
+}
