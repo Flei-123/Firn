@@ -9,19 +9,24 @@
 //   sounds.json = { "<event>": { "replace": bool, "sounds": [ "path" | {"name":"path","volume":v,"pitch":p,"weight":w,"stream":b}, ... ] }, ... }
 //   "path" = assets/minecraft/sounds/<path>.ogg ("ns:path" = assets/<ns>/sounds/<path>.ogg). OGG Vorbis only (audio.load_ogg).
 // Rules (honest):
-//   * Packs are asked top (index 0) to bottom; the FIRST pack that defines an event wins that event completely (vanilla merges the
-//     lists of lower packs unless "replace" -- not done). The OGG file itself is searched in all packs, top first.
-//   * Per event at most 16 samples (engine limit); at most 400 distinct OGG files per apply (engine: 512 samples/events in total).
-//     More are skipped and counted, never truncated silently. An event without a single decodable file is not created.
-//   * volume / pitch of the FIRST entry is used for the event; weight and stream are ignored (all entries are equal choices).
+//   * Vanilla merge: for one event the sound lists of ALL packs are joined (top pack first). A pack with "replace": true cuts off every
+//     pack BELOW it (its own list stays). Same file twice = once. Entries of type "event" (references) are ignored.
+//   * The OGG file itself is searched in all packs, top first.
+//   * Per event at most 16 samples (engine limit); the top pack wins the cut. Files / events are limited by PS_MAX_* AND by the free room
+//     in the engine (2048 samples / events minus what the synth bank already uses). More are skipped and counted, never truncated silently.
+//     An event without a single decodable file is not created.
+//   * volume / pitch of the FIRST entry (of the top-most pack that has the event) is used; weight and stream are ignored.
 //   * Bus: "ui.*" -> ui, "music.*" / "music_disc.*" -> music, else sfx. An event of the pack REPLACES the synth event of the same name.
 //   * sounds=synth: nothing is read. sounds=original: only the pack events exist (the caller loads no synth bank).
 //     sounds=both: the caller loads the synth bank first; pack events replace event by event, synth fills the rest.
-//   * Decoding happens once per file and per apply; a later apply (hot reload) re-decodes (the engine keeps old sample ids; small leak
-//     per reload, bounded by the 512-sample pool -> a reload after many changes may need a fresh engine).
+//   * Hot reload (apply again with the same Bank): every OGG is hashed (FNV-1a over the file bytes) and remembered in the bank under its
+//     zip path. Same hash = the sample id is reused (no decode, no new sample). Changed file = decoded once, then moved into the OLD sample
+//     slot (engine_sample_adopt_last) so the table does not grow; while the audio thread runs the new sample gets a fresh id instead.
+//     Files that left the packs keep their sample (small, bounded by the pool).
 import std.rt
 import std.json
 import std.str
+import std.hash
 import audio.engine
 import audio.bank
 import audio.load_ogg
@@ -31,11 +36,11 @@ import mc.mc_audio
 import mc.mc_packs
 
 export {
-    packsnd_apply, packsnd_build_text, PackSnd, PS_MAX_EVENTS, PS_MAX_FILES,
+    packsnd_apply, packsnd_build_text, PackSnd, PS_MAX_EVENTS, PS_MAX_FILES, PS_PER_EVENT,
 }
 
-const PS_MAX_EVENTS: usize = 400
-const PS_MAX_FILES: usize = 400
+const PS_MAX_EVENTS: usize = 1600
+const PS_MAX_FILES: usize = 1600
 const PS_PER_EVENT: usize = 16
 const SOUNDS_JSON: str = "assets/minecraft/sounds.json"
 
@@ -44,10 +49,13 @@ struct PackSnd {
     files: i32, // OGG files decoded
     skipped_files: i32, // missing / undecodable / over the limit
     skipped_events: i32, // no usable file / over the limit / duplicate
+    reused: i32, // files whose sample was reused from an earlier apply (same hash)
+    replaced: i32, // files that changed since the earlier apply and took over their old sample slot
+    decoded: i32, // files decoded in this apply
 }
 
 fn ps_new() -> PackSnd {
-    return PackSnd { events: 0, files: 0, skipped_files: 0, skipped_events: 0 }
+    return PackSnd { events: 0, files: 0, skipped_files: 0, skipped_events: 0, reused: 0, replaced: 0, decoded: 0 }
 }
 
 fn starts(p: u64, n: usize, pre: str) -> bool {
@@ -145,115 +153,207 @@ fn seen_has(seen: *mut rt.Buf, p: u64, n: usize) -> bool {
     return false
 }
 
-// Reads the sounds.json of every pack, decodes the OGG files into `e`, registers them in `b` (bank_provide, key = zip path) and writes
-// an Aulos bank text with one event per pack event into `text`. Returns the statistics.
-fn packsnd_build_text(s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mut bank.Bank, text: *mut rt.Buf) -> PackSnd {
-    var st: PackSnd = ps_new()
-    var seen: rt.Buf = rt.buf_new()
-    var files: rt.Buf = rt.buf_new() // zip paths already decoded (one per line)
-    push_s(text, "{\"events\":[")
-    var first: bool = true
-    var pi: usize = 0
-    while pi < (*s).n {
-        let sj: i64 = mc_assets.pack_find(&(*s).packs[pi], SOUNDS_JSON)
-        pi = pi + 1
-        if sj < 0 { continue }
-        var raw: rt.Buf = rt.buf_new()
-        let got: usize = zip.zip_extract(&(*s).packs[pi - 1].z, sj as usize, &raw) catch | e2 | (0)
-        var d: json.Json = json.json_new()
-        var ok: bool = false
-        if got > 0 { ok = json.json_parse(&d, rt.buf_ptr(&raw), rt.buf_len(&raw)) catch false }
-        let root: u32 = json.json_root(&d)
-        if !ok || json.json_kind(&d, root) != json.JSON_OBJECT {
-            json.json_free(&d)
-            rt.buf_free(&raw)
+// Everything one apply needs.
+struct Ctx {
+    s: *mut mc_assets.PackStack,
+    e: *mut engine.Engine,
+    b: *mut bank.Bank,
+    st: PackSnd,
+    files: rt.Buf, // zip paths usable in this apply (one per line)
+    room_samples: i32, // free sample slots in the engine at the start
+}
+
+// One event while its lists are merged.
+struct Acc {
+    list: rt.Buf, // JSON string list of the zip paths
+    paths: rt.Buf, // same paths, one per line (duplicate check)
+    n: usize,
+    vol: f64,
+    pit: f64,
+    have_opts: bool,
+}
+
+fn file_hash(p: u64, n: usize) -> u64 {
+    let h: u64 = hash.fnv1a64(p, n)
+    if h == 0 as u64 { return 1 as u64 }
+    return h
+}
+
+// Makes `path` usable: decoded now, reused from an earlier apply (same hash) or moved into its old slot (changed). false = unusable.
+fn resolve_file(c: *mut Ctx, path: *mut rt.Buf) -> bool {
+    let pp: u64 = rt.buf_ptr(path)
+    let pn: usize = rt.buf_len(path)
+    if seen_has(&(*c).files, pp, pn) { return true }
+    if (*c).st.files as usize >= PS_MAX_FILES {
+        (*c).st.skipped_files = (*c).st.skipped_files + 1
+        return false
+    }
+    var og: rt.Buf = rt.buf_new()
+    if !find_ogg((*c).s, path, &og) {
+        rt.buf_free(&og)
+        (*c).st.skipped_files = (*c).st.skipped_files + 1
+        return false
+    }
+    let nm: str = str { p: rt.buf_data(path), n: pn }
+    let h: u64 = file_hash(rt.buf_ptr(&og), rt.buf_len(&og))
+    var ok: bool = false
+    let cached: i32 = bank.bank_cached_id((*c).b, nm, h)
+    if cached >= 0 {
+        (*c).st.reused = (*c).st.reused + 1
+        ok = true
+    } else if (*c).st.decoded >= (*c).room_samples {
+        (*c).st.skipped_files = (*c).st.skipped_files + 1 // engine sample pool is full
+    } else {
+        let id: i32 = load_ogg.ogg_load((*c).e, rt.buf_ptr(&og), rt.buf_len(&og))
+        if id >= 0 {
+            (*c).st.decoded = (*c).st.decoded + 1
+            let old: i32 = bank.bank_provide_hashed((*c).b, nm, h, id)
+            if old >= 0 && old != id && (id as usize) + 1 == engine.engine_sample_count((*c).e) {
+                if engine.engine_sample_adopt_last((*c).e, old) {
+                    bank.bank_provide_hashed((*c).b, nm, h, old)
+                    (*c).st.replaced = (*c).st.replaced + 1
+                }
+            }
+            ok = true
+        } else {
+            (*c).st.skipped_files = (*c).st.skipped_files + 1
+        }
+    }
+    rt.buf_free(&og)
+    if ok {
+        rt.buf_push_bytes(&(*c).files, pp, pn)
+        rt.buf_push(&(*c).files, 10 as u8)
+        (*c).st.files = (*c).st.files + 1
+    }
+    return ok
+}
+
+// Adds the entries of one "sounds" array to the event (top pack first, at most PS_PER_EVENT in total).
+fn add_entries(c: *mut Ctx, d: *mut json.Json, arr: u32, a: *mut Acc) {
+    var k: usize = 0
+    let cnt: usize = json.json_count(d, arr)
+    while k < cnt && (*a).n < PS_PER_EVENT {
+        let it: u32 = json.json_child_at(d, arr, k)
+        k = k + 1
+        var nm: str.Span = str.span_empty()
+        var has_name: bool = false
+        var iv: f64 = 1.0
+        var ip: f64 = 1.0
+        if json.json_kind(d, it) == json.JSON_STRING {
+            nm = json.json_string(d, it)
+            has_name = true
+        } else if json.json_kind(d, it) == json.JSON_OBJECT {
+            let ty: u32 = json.json_get(d, it, "type".p as u64, 4)
+            if ty != json.JSON_NONE && json.json_kind(d, ty) == json.JSON_STRING {
+                let tv: str.Span = json.json_string(d, ty)
+                if tv.n == 5 && rt.mem_eq(tv.p as u64, "event".p as u64, 5) { continue } // reference to another event
+            }
+            let nn: u32 = json.json_get(d, it, "name".p as u64, 4)
+            if nn != json.JSON_NONE && json.json_kind(d, nn) == json.JSON_STRING {
+                nm = json.json_string(d, nn)
+                has_name = true
+            }
+            let vv: u32 = json.json_get(d, it, "volume".p as u64, 6)
+            if vv != json.JSON_NONE && json.json_kind(d, vv) == json.JSON_NUMBER { iv = json.json_number(d, vv) }
+            let pp: u32 = json.json_get(d, it, "pitch".p as u64, 5)
+            if pp != json.JSON_NONE && json.json_kind(d, pp) == json.JSON_NUMBER { ip = json.json_number(d, pp) }
+        }
+        if !has_name { (*c).st.skipped_files = (*c).st.skipped_files + 1; continue }
+        var path: rt.Buf = rt.buf_new()
+        if !sound_path(nm.p as u64, nm.n, &path) {
+            rt.buf_free(&path)
+            (*c).st.skipped_files = (*c).st.skipped_files + 1
             continue
         }
-        var ev: u32 = json.json_child(&d, root)
+        if seen_has(&(*a).paths, rt.buf_ptr(&path), rt.buf_len(&path)) {
+            rt.buf_free(&path)
+            continue
+        }
+        if resolve_file(c, &path) {
+            if (*a).n > 0 { rt.buf_push(&(*a).list, 44 as u8) }
+            push_json_str(&(*a).list, rt.buf_ptr(&path), rt.buf_len(&path))
+            rt.buf_push_bytes(&(*a).paths, rt.buf_ptr(&path), rt.buf_len(&path))
+            rt.buf_push(&(*a).paths, 10 as u8)
+            (*a).n = (*a).n + 1
+            if !(*a).have_opts { (*a).vol = iv; (*a).pit = ip; (*a).have_opts = true }
+        }
+        rt.buf_free(&path)
+    }
+}
+
+// Reads the sounds.json of every pack, decodes the OGG files into `e` (or reuses them), registers them in `b` (bank_provide_hashed, key =
+// zip path) and writes an Aulos bank text with one event per pack event into `text`. Returns the statistics.
+fn packsnd_build_text(s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mut bank.Bank, text: *mut rt.Buf) -> PackSnd {
+    var c: Ctx = Ctx { s: s, e: e, b: b, st: ps_new(), files: rt.buf_new(),
+        room_samples: (engine.MAX_SAMPLES as i32) - (engine.engine_sample_count(e) as i32) }
+    var seen: rt.Buf = rt.buf_new()
+    let room_events: i32 = (engine.MAX_EVENTS as i32) - (engine.engine_event_count(e) as i32)
+    var new_events: i32 = 0
+    // parse every sounds.json once (kept alive until the end: lower packs are read again for each event)
+    var raws: [rt.Buf; 8] = [rt.buf_new(); 8]
+    var docs: [json.Json; 8] = [json.json_new(); 8]
+    var oks: [bool; 8] = [false; 8]
+    var pi: usize = 0
+    while pi < (*s).n && pi < 8 {
+        let sj: i64 = mc_assets.pack_find(&(*s).packs[pi], SOUNDS_JSON)
+        if sj >= 0 {
+            let got: usize = zip.zip_extract(&(*s).packs[pi].z, sj as usize, &raws[pi]) catch | e2 | (0)
+            var ok: bool = false
+            if got > 0 { ok = json.json_parse(&docs[pi], rt.buf_ptr(&raws[pi]), rt.buf_len(&raws[pi])) catch false }
+            if ok && json.json_kind(&docs[pi], json.json_root(&docs[pi])) == json.JSON_OBJECT { oks[pi] = true }
+        }
+        pi = pi + 1
+    }
+    let np: usize = pi
+    push_s(text, "{\"events\":[")
+    var first: bool = true
+    pi = 0
+    while pi < np {
+        if !oks[pi] { pi = pi + 1; continue }
+        let root: u32 = json.json_root(&docs[pi])
+        var ev: u32 = json.json_child(&docs[pi], root)
         while ev != json.JSON_NONE {
-            let key: str.Span = json.json_key(&d, ev)
-            let cur: u32 = ev
-            ev = json.json_next(&d, ev)
+            let key: str.Span = json.json_key(&docs[pi], ev)
+            ev = json.json_next(&docs[pi], ev)
             let kp: u64 = key.p as u64
             let kn: usize = key.n
-            if kn == 0 || kn > 120 { st.skipped_events = st.skipped_events + 1; continue }
-            if seen_has(&seen, kp, kn) { continue } // a higher pack owns the event
-            let arr: u32 = json.json_get(&d, cur, "sounds".p as u64, 6)
-            if arr == json.JSON_NONE || json.json_kind(&d, arr) != json.JSON_ARRAY {
-                st.skipped_events = st.skipped_events + 1
-                continue
+            if kn == 0 || kn > 120 { c.st.skipped_events = c.st.skipped_events + 1; continue }
+            if seen_has(&seen, kp, kn) { continue } // already merged from a higher pack
+            rt.buf_push_bytes(&seen, kp, kn)
+            rt.buf_push(&seen, 10 as u8)
+            if (c.st.events as usize) >= PS_MAX_EVENTS { c.st.skipped_events = c.st.skipped_events + 1; continue }
+            var is_new: bool = true
+            if kn < 200 {
+                var nm: rt.Buf = rt.buf_new()
+                rt.buf_push_bytes(&nm, kp, kn)
+                rt.buf_push(&nm, 0 as u8)
+                is_new = engine.engine_find_event(e, str { p: rt.buf_data(&nm), n: kn }) < 0
+                rt.buf_free(&nm)
             }
-            if (st.events as usize) >= PS_MAX_EVENTS { st.skipped_events = st.skipped_events + 1; continue }
-            // collect usable samples of this event into a temporary list text
-            var list: rt.Buf = rt.buf_new()
-            var nsamp: usize = 0
-            var vol: f64 = 1.0
-            var pit: f64 = 1.0
-            var have_opts: bool = false
-            var k: usize = 0
-            let cnt: usize = json.json_count(&d, arr)
-            while k < cnt && nsamp < PS_PER_EVENT {
-                let it: u32 = json.json_child_at(&d, arr, k)
-                k = k + 1
-                var nm: str.Span = str.span_empty()
-                var has_name: bool = false
-                var iv: f64 = 1.0
-                var ip: f64 = 1.0
-                if json.json_kind(&d, it) == json.JSON_STRING {
-                    nm = json.json_string(&d, it)
-                    has_name = true
-                } else if json.json_kind(&d, it) == json.JSON_OBJECT {
-                    let nn: u32 = json.json_get(&d, it, "name".p as u64, 4)
-                    if nn != json.JSON_NONE && json.json_kind(&d, nn) == json.JSON_STRING {
-                        nm = json.json_string(&d, nn)
-                        has_name = true
-                    }
-                    let vv: u32 = json.json_get(&d, it, "volume".p as u64, 6)
-                    if vv != json.JSON_NONE && json.json_kind(&d, vv) == json.JSON_NUMBER { iv = json.json_number(&d, vv) }
-                    let pp: u32 = json.json_get(&d, it, "pitch".p as u64, 5)
-                    if pp != json.JSON_NONE && json.json_kind(&d, pp) == json.JSON_NUMBER { ip = json.json_number(&d, pp) }
-                }
-                if !has_name { st.skipped_files = st.skipped_files + 1; continue }
-                var path: rt.Buf = rt.buf_new()
-                if !sound_path(nm.p as u64, nm.n, &path) {
-                    rt.buf_free(&path)
-                    st.skipped_files = st.skipped_files + 1
-                    continue
-                }
-                var usable: bool = seen_has(&files, rt.buf_ptr(&path), rt.buf_len(&path))
-                if !usable {
-                    if (st.files as usize) >= PS_MAX_FILES {
-                        st.skipped_files = st.skipped_files + 1
-                    } else {
-                        var og: rt.Buf = rt.buf_new()
-                        if find_ogg(s, &path, &og) {
-                            let id: i32 = load_ogg.ogg_load(e, rt.buf_ptr(&og), rt.buf_len(&og))
-                            if id >= 0 {
-                                bank.bank_provide(b, str { p: rt.buf_data(&path), n: rt.buf_len(&path) }, id)
-                                rt.buf_push_bytes(&files, rt.buf_ptr(&path), rt.buf_len(&path))
-                                rt.buf_push(&files, 10 as u8)
-                                st.files = st.files + 1
-                                usable = true
-                            } else {
-                                st.skipped_files = st.skipped_files + 1
-                            }
-                        } else {
-                            st.skipped_files = st.skipped_files + 1
+            if is_new && new_events >= room_events { c.st.skipped_events = c.st.skipped_events + 1; continue } // engine event table full
+            var a: Acc = Acc { list: rt.buf_new(), paths: rt.buf_new(), n: 0, vol: 1.0, pit: 1.0, have_opts: false }
+            var pj: usize = pi
+            var any_list: bool = false
+            while pj < np {
+                if oks[pj] {
+                    let r2: u32 = json.json_root(&docs[pj])
+                    let obj: u32 = json.json_get(&docs[pj], r2, kp, kn)
+                    if obj != json.JSON_NONE && json.json_kind(&docs[pj], obj) == json.JSON_OBJECT {
+                        let arr: u32 = json.json_get(&docs[pj], obj, "sounds".p as u64, 6)
+                        if arr != json.JSON_NONE && json.json_kind(&docs[pj], arr) == json.JSON_ARRAY {
+                            any_list = true
+                            add_entries(&c, &docs[pj], arr, &a)
                         }
-                        rt.buf_free(&og)
+                        let rp: u32 = json.json_get(&docs[pj], obj, "replace".p as u64, 7)
+                        if rp != json.JSON_NONE && json.json_bool(&docs[pj], rp) { break } // cuts off the packs below
                     }
                 }
-                if usable {
-                    if nsamp > 0 { rt.buf_push(&list, 44 as u8) }
-                    push_json_str(&list, rt.buf_ptr(&path), rt.buf_len(&path))
-                    nsamp = nsamp + 1
-                    if !have_opts { vol = iv; pit = ip; have_opts = true }
-                }
-                rt.buf_free(&path)
+                pj = pj + 1
             }
-            if nsamp == 0 {
-                st.skipped_events = st.skipped_events + 1
-                rt.buf_free(&list)
+            if !any_list || a.n == 0 {
+                c.st.skipped_events = c.st.skipped_events + 1
+                rt.buf_free(&a.list)
+                rt.buf_free(&a.paths)
                 continue
             }
             if !first { rt.buf_push(text, 44 as u8) }
@@ -269,29 +369,34 @@ fn packsnd_build_text(s: *mut mc_assets.PackStack, e: *mut engine.Engine, b: *mu
                 push_s(text, "\"sfx\"")
             }
             push_s(text, ",\"samples\":[")
-            rt.buf_push_bytes(text, rt.buf_ptr(&list), rt.buf_len(&list))
+            rt.buf_push_bytes(text, rt.buf_ptr(&a.list), rt.buf_len(&a.list))
             push_s(text, "]")
-            if vol > 0.0 && vol != 1.0 {
+            if a.vol > 0.0 && a.vol != 1.0 {
                 push_s(text, ",\"volume\":")
-                push_milli(text, vol)
+                push_milli(text, a.vol)
             }
-            if pit > 0.0 && pit != 1.0 {
+            if a.pit > 0.0 && a.pit != 1.0 {
                 push_s(text, ",\"pitch\":")
-                push_milli(text, pit)
+                push_milli(text, a.pit)
             }
             push_s(text, "}")
-            rt.buf_push_bytes(&seen, kp, kn)
-            rt.buf_push(&seen, 10 as u8)
-            st.events = st.events + 1
-            rt.buf_free(&list)
+            if is_new { new_events = new_events + 1 }
+            c.st.events = c.st.events + 1
+            rt.buf_free(&a.list)
+            rt.buf_free(&a.paths)
         }
-        json.json_free(&d)
-        rt.buf_free(&raw)
+        pi = pi + 1
     }
     push_s(text, "]}")
+    var q: usize = 0
+    while q < np {
+        json.json_free(&docs[q])
+        rt.buf_free(&raws[q])
+        q = q + 1
+    }
     rt.buf_free(&seen)
-    rt.buf_free(&files)
-    return st
+    rt.buf_free(&c.files)
+    return c.st
 }
 
 // sounds= mode of the pack manager: SOUNDS_SYNTH (0) does nothing; ORIGINAL (1) and BOTH (2) load the pack events (the caller decides
