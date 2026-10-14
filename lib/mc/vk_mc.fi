@@ -42,8 +42,15 @@ export {
     VkBackend, vkbe_open, vkbe_open_cache, vkbe_on_rebuild, vkbe_close, vkbe_backend, vkbe_set_fog, vkbe_set_light, vkbe_resize, vkbe_device_name, vkbe_is_cpu,
     vkbe_draws, vkbe_tris, vkbe_frames, vkbe_layers_lost, vkbe_in_flight, vkbe_set_readback, vkbe_wait, vkbe_mem_stats,
     vkbe_live_meshes, vkbe_upload_bytes, vkbe_frame_ms, vkbe_sky, vkbe_tint, vkbe_hud, vkbe_blank, vkbe_open_into, vkbe_lost, vkbe_inject_lost,
+    vkbe_open_win, vkbe_sc_on, vkbe_window_pixels, vkbe_sc_stat, SC_PRESENTS, SC_SKIPS, SC_REBUILDS, SC_OUT_OF_DATE, SC_SUBOPTIMAL, SC_FORMAT,
 }
 
+const SC_PRESENTS: i32 = 0 // vkbe_sc_stat selectors
+const SC_SKIPS: i32 = 1 // frames that were rendered but not presented (acquire failed / swapchain not ready)
+const SC_REBUILDS: i32 = 2
+const SC_OUT_OF_DATE: i32 = 3
+const SC_SUBOPTIMAL: i32 = 4
+const SC_FORMAT: i32 = 5 // swapchain VkFormat (44 BGRA8, 37 RGBA8)
 const NFR: usize = 2 // frames in flight
 const UBO_STRIDE: usize = 512 // one `Frame` slice (320 octets used); >= minUniformBufferOffsetAlignment (256 at most)
 const UBO_SLICES: usize = 256 // slices per frame slot: one per (pass / fade / light) state change
@@ -160,6 +167,16 @@ struct VkBackend {
     frame_ns: u64,
     push: u64, // 16 octets scratch for the push constants (origin.xyz + pool)
     vb: u64, // 8 octets: the vertex buffer handle for vkCmdBindVertexBuffers + offset
+    // swapchain present (r195): the colour image is blitted into the swapchain image in end(); readback stays for shots / tests
+    sc: vk.Sc,
+    sc_on: bool, // a swapchain on the window exists and its images accept TRANSFER_DST
+    sc_ready: bool, // false while minimised / a rebuild failed: frames are rendered but not presented
+    sc_xid: u64,
+    sc_mode: i32,
+    sc_gen: u64, // life.sc_gen of the last swapchain the per-slot semaphores were made for
+    sc_surface_lost: bool,
+    sc_presents: u64,
+    sc_skips: u64,
 }
 
 fn fslot_none() -> FSlot {
@@ -175,7 +192,8 @@ fn blank() -> VkBackend {
         dn: 0, cur: 0, next: 0, in_frame: false, has_last: false, last: 0, trec: false, readback: true, lost: false, inject_lost: false, trans: false,
         cx: 0.0, cy: 0.0, cz: 0.0, fade_a: 64.0, fade_inv: 0.0, day: 256.0, tr: 256.0, tg: 256.0, tb: 256.0, fog_on: false,
         fog_start: 20.0, fog_end: 90.0, fog_r: 150.0, fog_g: 190.0, fog_b: 230.0, draws: 0, tris: 0,
-        frames: 0, upload_bytes: 0, t0_ns: 0, frame_ns: 0, push: 0, vb: 0 }
+        frames: 0, upload_bytes: 0, t0_ns: 0, frame_ns: 0, push: 0, vb: 0,
+        sc: vk.sc_blank(), sc_on: false, sc_ready: false, sc_xid: 0, sc_mode: 0, sc_gen: 0, sc_surface_lost: false, sc_presents: 0, sc_skips: 0 }
 }
 
 // The 24 vertices (x y z face as f32, faces -x +x -y +y -z +z) and 36 u16 indices of the unit cube -0.5 .. 0.5 (same order as gl_scene).
@@ -299,11 +317,20 @@ fn vkbe_open(w: i32, h: i32) -> VkBackend {
 // `cache_path` != "": the pipeline cache lives in that file (loaded now when valid for this device, saved by vkbe_close).
 // Opens IN PLACE (the structures keep pointers into `*b`: do not copy a VkBackend after this). false = see `b.step`.
 fn vkbe_open_into(b: *mut VkBackend, w: i32, h: i32, cache_path: str) -> bool {
+    return vkbe_open_win(b, w, h, cache_path, 0, 0)
+}
+
+// Like vkbe_open_into, plus a swapchain on the X11 window `xid` (mode 0 = xlib surface, 1 = xcb) when xid != 0: end() then blits the colour image
+// into the swapchain image and presents it (Present = swapchain, no readback needed). No surface / swapchain / TRANSFER_DST support = the back
+// end still opens, `vkbe_sc_on` is false and the caller presents the read back image as before. The window must exist (and be mapped).
+fn vkbe_open_win(b: *mut VkBackend, w: i32, h: i32, cache_path: str, xid: u64, mode: i32) -> bool {
     *b = blank()
     (*b).w = w
     (*b).h = h
     (*b).cache_path = cache_path
-    if !vk.open(&(*b).v, false, true) {
+    (*b).sc_xid = xid
+    (*b).sc_mode = mode
+    if !vk.open(&(*b).v, xid != 0, true) {
         (*b).step = 1
         return false
     }
@@ -390,7 +417,74 @@ fn vkbe_open_into(b: *mut VkBackend, w: i32, h: i32, cache_path: str) -> bool {
         return false
     }
     (*b).ok = true
+    if xid != 0 { sc_start(b) }
     return true
+}
+
+// Swapchain on the window (see vkbe_open_win). Failure only leaves sc_on false.
+fn sc_start(b: *mut VkBackend) {
+    if !vk.has_swapchain(&(*b).v) || !vk.has_surface_ext(&(*b).v) { return }
+    if !vk.sc_open(&(*b).v, &(*b).sc, (*b).sc_xid, (*b).w, (*b).h, (*b).sc_mode) {
+        vk.sc_close(&(*b).v, &(*b).sc)
+        return
+    }
+    if !(*b).sc.xfer {
+        vk.sc_close(&(*b).v, &(*b).sc)
+        return
+    }
+    (*b).life.req_w = (*b).w
+    (*b).life.req_h = (*b).h
+    (*b).life.need_rebuild = false
+    (*b).sc_gen = (*b).life.sc_gen
+    (*b).sc_on = true
+    (*b).sc_ready = true
+}
+
+// The swapchain needs a rebuild (size change, OUT_OF_DATE, SUBOPTIMAL, surface lost) or came back from minimised: wait for the frames, rebuild
+// through vk_life, re-create the per-slot semaphores (a failed acquire / present may leave one signalled). Sets sc_ready.
+fn sc_resync(b: *mut VkBackend) {
+    vk_frame.frame_wait_all(&(*b).x, &(*b).fr)
+    reap(b)
+    if (*b).sc_surface_lost {
+        (*b).sc_surface_lost = false
+        if !vk_life.surface_recover(&(*b).v, &(*b).life, &(*b).sc, (*b).sc_xid, (*b).w, (*b).h, (*b).sc_mode) {
+            (*b).sc_ready = false
+            return
+        }
+    }
+    let st: i32 = vk_life.sc_sync(&(*b).v, &(*b).life, &(*b).sc, (*b).w, (*b).h)
+    if st == vk_life.LF_OK {
+        if (*b).life.sc_gen != (*b).sc_gen {
+            vk_frame.frame_sems_reset(&(*b).x, &(*b).fr)
+            (*b).sc_gen = (*b).life.sc_gen
+        }
+        (*b).sc_ready = true
+        return
+    }
+    (*b).sc_ready = false
+    if st == vk_life.LF_DEVICE_LOST { (*b).lost = true }
+}
+
+// true when end() presents through a swapchain.
+fn vkbe_sc_on(b: *mut VkBackend) -> bool {
+    return (*b).sc_on
+}
+
+// What the X server shows in the window right now (w*h RGBA octets, waits for the queue first). false without a swapchain.
+fn vkbe_window_pixels(b: *mut VkBackend, out: u64) -> bool {
+    if !(*b).sc_on { return false }
+    return vk.window_pixels(&(*b).v, &(*b).sc, out)
+}
+
+// Swapchain counters (SC_*), 0 without a swapchain.
+fn vkbe_sc_stat(b: *mut VkBackend, which: i32) -> u64 {
+    if which == SC_PRESENTS { return (*b).sc_presents }
+    if which == SC_SKIPS { return (*b).sc_skips }
+    if which == SC_REBUILDS { return (*b).life.rebuilds }
+    if which == SC_OUT_OF_DATE { return (*b).life.out_of_date }
+    if which == SC_SUBOPTIMAL { return (*b).life.suboptimal }
+    if which == SC_FORMAT { return (*b).sc.fmt }
+    return 0
 }
 
 fn vkbe_open_cache(w: i32, h: i32, cache_path: str) -> VkBackend {
@@ -691,6 +785,8 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     if !(*b).ok || (*b).in_frame || (*b).lost {
         return
     }
+    if (*b).sc_on && ((*b).life.need_rebuild || (*b).sc_surface_lost || !(*b).sc_ready) { sc_resync(b) }
+    if (*b).lost { return }
     (*b).t0_ns = (time.monotonic_ns() as u64)
     let s: usize = (*b).next
     (*b).cur = s
@@ -976,6 +1072,29 @@ fn be_set_fade(o: u64, a: i32, inv: i32) {
     (*b).dirty = true
 }
 
+// Records the blit of slot colour image (TRANSFER_SRC, final layout of the render pass) into the acquired swapchain image `img` and leaves it in
+// PRESENT_SRC. Format conversion (RGBA8 -> BGRA8) is done by the blit; sizes may differ (NEAREST).
+fn sc_blit(b: *mut VkBackend, cmd: u64, img: u64) {
+    let s: usize = (*b).cur
+    vk_frame.image_barrier(&(*b).x, cmd, img, 1, 1, vk_frame.LAYOUT_UNDEFINED, vk_frame.LAYOUT_TRANSFER_DST,
+        vk_frame.ST_TRANSFER | vk_frame.ST_COLOR_OUT, vk_frame.ST_TRANSFER, 0, vk_frame.AC_TRANSFER_WRITE)
+    (*b).x.top = 0
+    let r: u64 = vk_mem.xsa(&(*b).x, 80)
+    vk_mem.w32(r, 0, 1) // srcSubresource: COLOR aspect, mip 0, layer 0, 1 layer
+    vk_mem.w32(r, 12, 1)
+    vk_mem.w32(r, 28, (*b).w as u64) // srcOffsets[1]
+    vk_mem.w32(r, 32, (*b).h as u64)
+    vk_mem.w32(r, 36, 1)
+    vk_mem.w32(r, 40, 1) // dstSubresource
+    vk_mem.w32(r, 52, 1)
+    vk_mem.w32(r, 68, (*b).sc.w as u64) // dstOffsets[1]
+    vk_mem.w32(r, 72, (*b).sc.h as u64)
+    vk_mem.w32(r, 76, 1)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BLIT, cmd, (*b).fs[s].col.img, vk_frame.LAYOUT_TRANSFER_SRC, img, vk_frame.LAYOUT_TRANSFER_DST, 1, r, 0, 0, 0)
+    vk_frame.image_barrier(&(*b).x, cmd, img, 1, 1, vk_frame.LAYOUT_TRANSFER_DST, vk_frame.LAYOUT_PRESENT,
+        vk_frame.ST_TRANSFER, vk_frame.ST_BOTTOM, vk_frame.AC_TRANSFER_WRITE, 0)
+}
+
 fn be_end(o: u64) {
     let b: *mut VkBackend = o as *mut VkBackend
     if !(*b).in_frame {
@@ -994,6 +1113,23 @@ fn be_end(o: u64) {
         vk_mem.w32(rg, 52, 1)
         vk_mem.cx(&(*b).x, vk_mem.X_CMD_COPY_I2B, cmd, (*b).fs[s].col.img, vk_frame.LAYOUT_TRANSFER_SRC, (*b).fs[s].rb.buf, 1, rg, 0, 0, 0, 0)
         vk_frame.mem_barrier(&(*b).x, cmd, vk_frame.ST_TRANSFER, vk_frame.ST_HOST, vk_frame.AC_TRANSFER_WRITE, vk_frame.AC_HOST_READ)
+    }
+    // swapchain present: acquire an image (signals the slot's acquire semaphore), blit colour -> swapchain image, to PRESENT_SRC
+    var sc_idx: u64 = 0
+    var sc_go: bool = false
+    if (*b).sc_on && (*b).sc_ready && !(*b).inject_lost {
+        let ra: u64 = vk.sc_acquire(&(*b).v, &(*b).sc, vk_frame.frame_sem_acq(&(*b).fr, s))
+        let cls: i32 = vk_life.sc_note(&(*b).life, ra)
+        if cls == vk_life.CLS_OK || cls == vk_life.CLS_SUBOPTIMAL {
+            sc_go = true
+            sc_idx = (*b).sc.idx
+            sc_blit(b, cmd, vk.sc_image(&(*b).sc, sc_idx))
+        } else if cls == vk_life.CLS_SURFACE_LOST {
+            (*b).sc_surface_lost = true
+        }
+        if !sc_go { (*b).sc_skips = (*b).sc_skips + 1 as u64 }
+    } else if (*b).sc_on {
+        (*b).sc_skips = (*b).sc_skips + 1 as u64
     }
     vk_frame.cmd_end(&(*b).x, cmd)
     var pre: u64 = 0
@@ -1014,12 +1150,31 @@ fn be_end(o: u64) {
         (*b).life.lost_count = (*b).life.lost_count + 1 as u64
         return
     }
-    if !vk_frame.frame_submit(&(*b).x, &(*b).fr, s, pre, 0, 0) {
+    var wsem: u64 = 0
+    var dsem: u64 = 0
+    if sc_go {
+        wsem = vk_frame.frame_sem_acq(&(*b).fr, s)
+        dsem = vk_frame.frame_sem_done(&(*b).fr, s)
+    }
+    if !vk_frame.frame_submit(&(*b).x, &(*b).fr, s, pre, wsem, dsem) {
         (*b).in_frame = false
         (*b).lost = true
         (*b).life.lost = true
         (*b).life.lost_count = (*b).life.lost_count + 1 as u64
         return
+    }
+    if sc_go {
+        let rp: u64 = vk.sc_present(&(*b).v, &(*b).sc, sc_idx, dsem)
+        let pcls: i32 = vk_life.sc_note(&(*b).life, rp)
+        if pcls == vk_life.CLS_DEVICE_LOST {
+            (*b).lost = true
+        } else if pcls == vk_life.CLS_SURFACE_LOST {
+            (*b).sc_surface_lost = true
+        } else if pcls == vk_life.CLS_OK || pcls == vk_life.CLS_SUBOPTIMAL {
+            (*b).sc_presents = (*b).sc_presents + 1 as u64
+        } else {
+            (*b).sc_skips = (*b).sc_skips + 1 as u64 // OUT_OF_DATE: not shown, rebuilt before the next frame
+        }
     }
     (*b).in_frame = false
     (*b).has_last = true
@@ -1114,7 +1269,9 @@ fn vkbe_resize(b: *mut VkBackend, w: i32, h: i32) -> bool {
     (*b).w = w
     (*b).h = h
     (*b).has_last = false
-    return targets_make(b)
+    let ok: bool = targets_make(b)
+    if (*b).sc_on { sc_resync(b) } // new window size: swapchain + per-slot semaphores
+    return ok
 }
 
 // vk_life.Life.on_rebuild adapter: set `l.ud = (address of the VkBackend)` and `l.on_rebuild = vkbe_on_rebuild`; the depth image (and colour,
@@ -1131,6 +1288,8 @@ fn vkbe_close(b: *mut VkBackend) {
         vk_mem.x_idle(&(*b).x)
         (*b).fr.done = (*b).fr.serial
         reap(b)
+        if (*b).sc_on { vk.sc_close(&(*b).v, &(*b).sc) }
+        (*b).sc_on = false
         var s: usize = 0
         while s < (*b).mcap && (*b).meshes != 0 {
             if rt.ld64((*b).meshes, s * MW + M_USED) != 0 {

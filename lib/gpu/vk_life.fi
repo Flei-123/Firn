@@ -27,7 +27,7 @@ import std.deflate
 import gpu.vk
 
 export {
-    Life, life_new, life_open, life_close, classify, frame, draw_checked, poll_result, surface_recover, recover_device,
+    Life, life_new, life_open, life_close, classify, frame, sc_sync, sc_note, draw_checked, poll_result, surface_recover, recover_device,
     cache_open, cache_save, cache_close, cache_bytes, cache_header_check, wrap_blob, unwrap_blob, WRAP_HEADER,
     RES_OK, RES_TIMEOUT, RES_SUBOPTIMAL, RES_OUT_OF_DATE, RES_DEVICE_LOST, RES_SURFACE_LOST, RES_OOM_HOST, RES_OOM_DEVICE,
     RES_INIT_FAILED,
@@ -412,10 +412,10 @@ fn poll_result(v: *mut vk.Vk, l: *mut Life) -> i32 {
     return cls
 }
 
-// One frame with everything handled: w/h = the CURRENT window size (0 = minimised). Order: loss state, minimised, size change /
-// pending rebuild (suboptimal), sc_frame, OUT_OF_DATE -> rebuild + retry once. Returns LF_*; after LF_OK the frame is presented.
-// If `l.sc_gen` changed during the call, dependent resources have been re-created (or on_rebuild told you).
-fn frame(v: *mut vk.Vk, l: *mut Life, s: *mut vk.Sc, p: *mut vk.Pipe, vb: *mut vk.Buf, nverts: u64, clear: u32, w: i32, h: i32) -> i32 {
+// The part of `frame` before the GPU work, for callers that render into their own images and only blit into the swapchain (gpu.vk_mc,
+// r195): loss state, minimised window (LF_MINIMIZED), size change / pending rebuild (OUT_OF_DATE, SUBOPTIMAL seen by sc_note) -> rebuild.
+// LF_OK = the swapchain is ready for a w x h window; `l.sc_gen` changed when it was rebuilt.
+fn sc_sync(v: *mut vk.Vk, l: *mut Life, s: *mut vk.Sc, w: i32, h: i32) -> i32 {
     if (*l).lost { return LF_DEVICE_LOST }
     if w <= 0 || h <= 0 {
         (*l).minimized = true
@@ -432,6 +432,34 @@ fn frame(v: *mut vk.Vk, l: *mut Life, s: *mut vk.Sc, p: *mut vk.Pipe, vb: *mut v
             return LF_ERROR
         }
     }
+    return LF_OK
+}
+
+// Bookkeeping for the VkResult of an acquire / present done by the caller (vk.sc_acquire / vk.sc_present): OUT_OF_DATE and SUBOPTIMAL
+// schedule a rebuild (SUBOPTIMAL at most 3 times in a row, then ignored), DEVICE_LOST marks the loss. Returns CLS_*.
+fn sc_note(l: *mut Life, r: u64) -> i32 {
+    let cls: i32 = classify(r)
+    if cls == CLS_SUBOPTIMAL {
+        (*l).suboptimal = (*l).suboptimal + 1
+        (*l).subopt_streak = (*l).subopt_streak + 1
+        if (*l).subopt_streak <= 3 { (*l).need_rebuild = true }
+    } else if cls == CLS_OUT_OF_DATE {
+        (*l).out_of_date = (*l).out_of_date + 1
+        (*l).need_rebuild = true
+    } else if cls == CLS_OK {
+        (*l).subopt_streak = 0
+    } else if cls == CLS_DEVICE_LOST {
+        mark_lost(l, cls)
+    }
+    return cls
+}
+
+// One frame with everything handled: w/h = the CURRENT window size (0 = minimised). Order: loss state, minimised, size change /
+// pending rebuild (suboptimal), sc_frame, OUT_OF_DATE -> rebuild + retry once. Returns LF_*; after LF_OK the frame is presented.
+// If `l.sc_gen` changed during the call, dependent resources have been re-created (or on_rebuild told you).
+fn frame(v: *mut vk.Vk, l: *mut Life, s: *mut vk.Sc, p: *mut vk.Pipe, vb: *mut vk.Buf, nverts: u64, clear: u32, w: i32, h: i32) -> i32 {
+    let st: i32 = sc_sync(v, l, s, w, h)
+    if st != LF_OK { return st }
     var tries: i32 = 0
     while tries < 2 {
         (*v).last_res = 0
