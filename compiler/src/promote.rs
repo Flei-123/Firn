@@ -1525,7 +1525,15 @@ fn analyse(
         return None;
     }
     // Is it worth it? At least one exact access inside a loop block that
-    // runs every iteration -- given by guard_access. Nothing else to check.
+    // runs every iteration -- given by guard_access.
+    // Every region (a child loop that may clobber the cell) forces a write
+    // back before it and a reload after it, so a cell with no more exact
+    // accesses than regions gains nothing but the rotation and its copies
+    // (l3_huffman count1 loop: two cells, two regions, +0.6 M instructions).
+    // Only measured for two or more regions; one region stays as before.
+    if regions.len() >= 2 && exact.len() <= regions.len() {
+        return None;
+    }
     Some(Plan { live, regions, reads, exact })
 }
 
