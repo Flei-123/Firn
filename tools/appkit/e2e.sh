@@ -55,13 +55,13 @@ if [ "$TARGET" = windows ]; then
     fi
     EXT=.exe
     ART=exe
-    ZIEL=windows-x86_64
+    PLATFORM=windows-x86_64
     export WINEPREFIX=${WINEPREFIX:-/root/.wine-firn} WINEDEBUG=-all
     TARGETFLAGS="--target=x86_64-windows"
 else
     EXT=""
     ART=bin
-    ZIEL=linux-x86_64
+    PLATFORM=linux-x86_64
     TARGETFLAGS=""
 fi
 W=$(mktemp -d "${TMPDIR:-/tmp}/appkit-e2e.XXXXXX")
@@ -125,7 +125,7 @@ ls -la "$W/art" | awk 'NR>1{print "   " $5 " " $9}'
 
 publish() {  # publish <version> [extra add-app options]
     local v=$1; shift
-    $STORE add-app --art $ART --id e2eapp --fassung "$v" --ziel $ZIEL --name "E2E App" \
+    $STORE add-app --art $ART --id e2eapp --fassung "$v" --ziel $PLATFORM --name "E2E App" \
         --aenderungen "release $v: the notes line one
 second line" "$@" "$W/art/app-$v$EXT" >"$W/publish-$v.log" 2>&1 \
         || { echo "publish $v failed"; cat "$W/publish-$v.log"; exit 1; }
@@ -243,13 +243,13 @@ import sys
 sys.path.insert(0, sys.argv[2])
 import eingang as EG
 import katalog as K
-verz = sys.argv[1]
-sk = open(verz + "/schluessel.geheim", "rb").read()
-roh = open(verz + "/index.json", "rb").read()
+tree_dir = sys.argv[1]
+sk = open(tree_dir + "/schluessel.geheim", "rb").read()
+roh = open(tree_dir + "/index.json", "rb").read()
 import json
 rev = json.loads(roh)["revision"]
-e = EG.bauen(verz, roh, rev, -3)       # expired three days ago
-EG.schreiben(verz, e, sk)
+e = EG.bauen(tree_dir, roh, rev, -3)       # expired three days ago
+EG.schreiben(tree_dir, e, sk)
 PY
 out=$(run "$APP" check $THREADMODE)
 expect "an expired entry is refused" "$out" "err=3"
@@ -269,7 +269,7 @@ out=$(run "$APP" check $THREADMODE)
 expect "an older (but signed) catalog is refused (rollback attack)" "$out" "err=3"
 # put the current catalog back by re-publishing the same build
 python3 "$STORE_TOOL" eingang >/dev/null 2>&1
-$STORE add-app --art $ART --id e2eapp --fassung 1.1.1-beta.1 --ziel $ZIEL --kanal beta --immer "$W/art/app-1.1.1-beta.1$EXT" >/dev/null 2>&1
+$STORE add-app --art $ART --id e2eapp --fassung 1.1.1-beta.1 --ziel $PLATFORM --kanal beta --immer "$W/art/app-1.1.1-beta.1$EXT" >/dev/null 2>&1
 
 echo "== 8. channels"
 build 1.0.0 good "$W/art/app-1.0.0-beta$EXT" "$KEY" beta

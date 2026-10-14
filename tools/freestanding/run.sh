@@ -90,9 +90,9 @@ for s in 0 1; do
     [ -z "$undef" ] && ok "firnc$s: NO undefined symbol (other than osum_panic, resolved at link time)" \
                     || { bad "firnc$s: undefined symbols"; echo "$undef" | sed 's/^/        /'; }
     # Every defined symbol belongs to the program itself (prefix _F0./_F1.).
-    fremd=$(nm --defined-only "$f" | awk '{print $3}' | grep -vE "^_F[01]\." || true)
-    [ -z "$fremd" ] && ok "firnc$s: every defined symbol is its own" \
-                    || { bad "firnc$s: foreign symbols"; echo "$fremd" | sed 's/^/        /'; }
+    foreign=$(nm --defined-only "$f" | awk '{print $3}' | grep -vE "^_F[01]\." || true)
+    [ -z "$foreign" ] && ok "firnc$s: every defined symbol is its own" \
+                    || { bad "firnc$s: foreign symbols"; echo "$foreign" | sed 's/^/        /'; }
     if objdump -d "$f" | grep -qE '^\s+[0-9a-f]+:.*\bsyscall\b'; then
         bad "firnc$s: the object file contains a syscall"
     else

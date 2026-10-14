@@ -704,7 +704,7 @@ for f in tools/fui/*_main.fi demos/*/main.fi examples/*/main.fi; do
     fi
 done
 echo "  alle tools/fui/*_main.fi, demos/*/main.fi und examples/*/main.fi uebersetzen  OK"
-fehlt=0
+missing_any=0
 for f in tools/fui/*_main.fi demos/fuidemo/main.fi; do
     n=$(basename "$f" _main.fi)
     case "$f" in
@@ -722,10 +722,10 @@ for f in tools/fui/*_main.fi demos/fuidemo/main.fi; do
     if ! grep -qF "\"\$W/$n\"" "tools/fui/run.sh"; then
         echo "  $f wird in tools/fui/run.sh NICHT gerufen (kein \"\$W/$n\")"
         echo "  -- eine Pruefung, die niemand ruft, ist keine. Haenge sie ein."
-        fehlt=1
+        missing_any=1
     fi
 done
-if [ "$fehlt" != "0" ]; then
+if [ "$missing_any" != "0" ]; then
     exit 1
 fi
 echo "  jede von ihnen wird in diesem Lauf wirklich gerufen       OK"
@@ -741,12 +741,12 @@ echo "  jede von ihnen wird in diesem Lauf wirklich gerufen       OK"
 #
 # Comment lines are exempt: the head of anim.fi MUST be allowed to name the
 # forbidden name in order to forbid it.
-verboten=$(grep -n "math\.\(floor\|ceil\|abs\|fabs\)" lib/fui/*.fi \
+forbidden_hits=$(grep -n "math\.\(floor\|ceil\|abs\|fabs\)" lib/fui/*.fi \
     | grep -v "^[^:]*:[0-9]*: *//" || true)
-if [ -n "$verboten" ]; then
+if [ -n "$forbidden_hits" ]; then
     echo "  in lib/fui/ steht math.floor/ceil/abs -- verboten. Es gilt"
     echo "  matrix.m_floor/m_ceil/m_abs (siehe Kopf von lib/fui/anim.fi):"
-    echo "$verboten"
+    echo "$forbidden_hits"
     exit 1
 fi
 echo "  floor/ceil/abs kommen in lib/fui/ nur aus svg.matrix        OK"
@@ -767,13 +767,13 @@ echo "  floor/ceil/abs kommen in lib/fui/ nur aus svg.matrix        OK"
 # and f64) stay allowed: they do not change when somebody adds a
 # field. Comment lines are exempt, because this text
 # here may name the forbidden form.
-ziffern=$(grep -n -E '\* *[0-9]+\)? *as u64.*as \*mut [a-z_]+\.[A-Z]' \
+digit_hits=$(grep -n -E '\* *[0-9]+\)? *as u64.*as \*mut [a-z_]+\.[A-Z]' \
     demos/*/main.fi tools/fui/*.fi \
     | grep -v "^[^:]*:[0-9]*: *//" || true)
-if [ -n "$ziffern" ]; then
+if [ -n "$digit_hits" ]; then
     echo "  eine Ziffer als Schrittweite ueber eine Struktur --"
     echo "  nimm layout.rect_stride() bzw. sheet.sheet_desc_stride():"
-    echo "$ziffern"
+    echo "$digit_hits"
     exit 1
 fi
 echo "  keine Ziffer als Schrittweite in demos/ und tools/fui/     OK"
@@ -898,25 +898,25 @@ no_look() {
         -e 'sheet\.decl_set_style' -e 'regel(sh' -e 'sheet\.sheet_rule'
 }
 awk '/^fn toolbar_painted\(/{p=1} p{print} p&&/^}$/{exit}' \
-    demos/fuidemo/main.fi > "$W/gemalt.txt"
+    demos/fuidemo/main.fi > "$W/painted_raw.txt"
 sed -n '/>>> TOOLBAR/,/<<< TOOLBAR/p' \
     tools/fui/gallery9_main.fi > "$W/beschrieben.txt"
 sed -n '/>>> BAR RULES/,/<<< BAR RULES/p' \
     tools/fui/gallery9_main.fi >> "$W/beschrieben.txt"
-no_text < "$W/gemalt.txt" > "$W/painted_a.txt"
+no_text < "$W/painted_raw.txt" > "$W/painted_a.txt"
 no_text < "$W/beschrieben.txt" > "$W/beschrieben_a.txt"
 no_look < "$W/painted_a.txt" > "$W/painted_b.txt"
 no_look < "$W/beschrieben_a.txt" > "$W/beschrieben_b.txt"
-gemalt=$(count_code "$W/gemalt.txt")
+painted_raw=$(count_code "$W/painted_raw.txt")
 beschrieben=$(count_code "$W/beschrieben.txt")
 painted_a=$(count_code "$W/painted_a.txt")
 beschrieben_a=$(count_code "$W/beschrieben_a.txt")
 painted_b=$(count_code "$W/painted_b.txt")
 beschrieben_b=$(count_code "$W/beschrieben_b.txt")
-echo "  roh: gemalt $gemalt Zeilen, beschrieben $beschrieben Zeilen"
+echo "  roh: gemalt $painted_raw Zeilen, beschrieben $beschrieben Zeilen"
 echo "  A (ohne Texte): gemalt $painted_a, beschrieben $beschrieben_a"
 echo "  B (ohne Texte und Aussehen): gemalt $painted_b, beschrieben $beschrieben_b"
-if [ "$gemalt" -lt 40 ] || [ "$beschrieben" -lt 30 ]; then
+if [ "$painted_raw" -lt 40 ] || [ "$beschrieben" -lt 30 ]; then
     echo "  FEHLER: eine der beiden Seiten wurde nicht gefunden."
     echo "  Es fehlen die Marken TOOLBAR/BAR RULES in"
     echo "  tools/fui/gallery9_main.fi oder fn toolbar_painted in"
@@ -943,9 +943,9 @@ fi
 # on that day was the SIZE as a style value (style.SF_WIDTH /
 # SF_HEIGHT): bar height and row height now stand in the rule
 # and no longer as a number at every node in the tree.
-if [ $((beschrieben * 2)) -gt "$gemalt" ]; then
+if [ $((beschrieben * 2)) -gt "$painted_raw" ]; then
     echo "  FEHLER: die beschriebene Fassung faellt nicht auf hoechstens"
-    echo "  die Haelfte der gemalten ($beschrieben von $gemalt Zeilen)."
+    echo "  die Haelfte der gemalten ($beschrieben von $painted_raw Zeilen)."
     exit 1
 fi
 # Cut A: with the look on both sides the
@@ -1094,15 +1094,15 @@ if [ "$1" = "--images" ]; then
     # Here the same file is checked ONCE beforehand, so that the run
     # does not fail only after the twentieth section on ten programs
     # in a row and nobody sees the cause.
-    SCHRIFT="${SCHRIFT:-/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf}"
-    if [ ! -r "$SCHRIFT" ]; then
-        echo "  FEHLER: die Schrift \"$SCHRIFT\" ist nicht lesbar."
+    FONT_TTF="${FONT_TTF:-/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf}"
+    if [ ! -r "$FONT_TTF" ]; then
+        echo "  FEHLER: die Schrift \"$FONT_TTF\" ist nicht lesbar."
         echo "  Ohne Schrift entstehen textlose Belege, und ein Beleg"
         echo "  ohne Beschriftung belegt nichts. Installiere DejaVuSans"
-        echo "  oder setze SCHRIFT auf eine vorhandene TTF-Datei."
+        echo "  oder setze FONT_TTF auf eine vorhandene TTF-Datei."
         exit 1
     fi
-    echo "  Schrift gefunden: $SCHRIFT"
+    echo "  Schrift gefunden: $FONT_TTF"
 
     # THE PROOF CHECK. It reads every written PNG BACK IN
     # and re-calculates: dimensions, number of distinct colours, and
@@ -1137,29 +1137,29 @@ if [ "$1" = "--images" ]; then
     # must fit into the width of the proof minus twice 24 points of margin.
     # The width is the SAME number that goes to `beleg` two lines further on
     # -- if it stands wrong once, it is noticed here or there.
-    kette() {
-        "$W/belegpruef" --ketten "$SCHRIFT" "$2" "tools/fui/$1_main.fi"
+    chain_check() {
+        "$W/belegpruef" --ketten "$FONT_TTF" "$2" "tools/fui/$1_main.fi"
     }
     build gallery
-    kette gallery 1200
+    chain_check gallery 1200
     "$W/gallery" "$Z/fui-wave1-light.png" light
     "$W/gallery" "$Z/fui-wave1-dark.png" dark
     beleg "$Z/fui-wave1-light.png" 1200 400 760 200 40 1
     beleg "$Z/fui-wave1-dark.png" 1200 400 760 200 40 1
     build gallery2
-    kette gallery2 1240
+    chain_check gallery2 1240
     "$W/gallery2" "$Z/fui-wave2-light.png" light
     "$W/gallery2" "$Z/fui-wave2-dark.png" dark
     beleg "$Z/fui-wave2-light.png" 1240 700 1180 200 40 1
     beleg "$Z/fui-wave2-dark.png" 1240 700 1180 200 40 1
     build gallery3
-    kette gallery3 1240
+    chain_check gallery3 1240
     "$W/gallery3" "$Z/fui-wave3-light.png" light
     "$W/gallery3" "$Z/fui-wave3-dark.png" dark
     beleg "$Z/fui-wave3-light.png" 1240 700 1320 200 40 0
     beleg "$Z/fui-wave3-dark.png" 1240 700 1320 200 40 0
     build gallery4
-    kette gallery4 1240
+    chain_check gallery4 1240
     "$W/gallery4" "$Z/fui-text-light.png" light
     "$W/gallery4" "$Z/fui-text-dark.png" dark
     beleg "$Z/fui-text-light.png" 1240 600 1180 200 40 1
@@ -1171,7 +1171,7 @@ if [ "$1" = "--images" ]; then
     # THE LUCIDE SET: every icon at 16, 24 and 32 (tools/fui/icons_main.fi)
     "$W/icons" "$Z/fui-icons.png" > /dev/null
     build artshow
-    kette artshow 900
+    chain_check artshow 900
     "$W/artshow" "$Z/fui-bild-svg-hell.png" light
     "$W/artshow" "$Z/fui-bild-svg-dunkel.png" dark
     beleg "$Z/fui-bild-svg-hell.png" 900 400 620 200 40 1
@@ -1181,25 +1181,25 @@ if [ "$1" = "--images" ]; then
     # shadow/glass/colour matrix over a patterned background, and rotated,
     # scaled, skewed tiles.
     build gallery5
-    kette gallery5 1240
+    chain_check gallery5 1240
     "$W/gallery5" "$Z/fui-anim-hell.png" light
     "$W/gallery5" "$Z/fui-anim-dunkel.png" dark
     beleg "$Z/fui-anim-hell.png" 1240 500 764 200 40 1
     beleg "$Z/fui-anim-dunkel.png" 1240 500 764 200 40 1
     build gallery6
-    kette gallery6 1240
+    chain_check gallery6 1240
     "$W/gallery6" "$Z/fui-flex-hell.png" light
     "$W/gallery6" "$Z/fui-flex-dunkel.png" dark
     beleg "$Z/fui-flex-hell.png" 1240 600 880 200 40 1
     beleg "$Z/fui-flex-dunkel.png" 1240 600 880 200 40 1
     build gallery7
-    kette gallery7 1240
+    chain_check gallery7 1240
     "$W/gallery7" "$Z/fui-effekt-hell.png" light
     "$W/gallery7" "$Z/fui-effekt-dunkel.png" dark
     beleg "$Z/fui-effekt-hell.png" 1240 400 700 200 40 1
     beleg "$Z/fui-effekt-dunkel.png" 1240 400 700 200 40 1
     build gallery8
-    kette gallery8 1280
+    chain_check gallery8 1280
     "$W/gallery8" "$Z/fui-transform-hell.png" light
     "$W/gallery8" "$Z/fui-transform-dunkel.png" dark
     beleg "$Z/fui-transform-hell.png" 1280 500 760 200 40 1
@@ -1216,7 +1216,7 @@ if [ "$1" = "--images" ]; then
     # that no text runs out of its box; otherwise it writes no
     # PNG and the run gets stuck on it.
     build gallery9
-    kette gallery9 1240
+    chain_check gallery9 1240
     # The sixth argument lets the same page put its accessibility
     # tree (lib/fui/a11y.fi, a11y_dump) as text beside the image.
     # Section 10 in the program demands that each of the 12
@@ -1240,7 +1240,7 @@ if [ "$1" = "--images" ]; then
     # page re-calculates its own promises once more (no text
     # runs out of its box, no point out of the section). A painted
     # version would have to touch every coordinate for that.
-    kette gallery9 980
+    chain_check gallery9 980
     "$W/gallery9" "$Z/fui-deklarativ-schmal-hell.png" light - 980
     "$W/gallery9" "$Z/fui-deklarativ-schmal-dunkel.png" dark - 980
     beleg "$Z/fui-deklarativ-schmal-hell.png" 980 700 740 200 40 1
@@ -1265,7 +1265,7 @@ if [ "$1" = "--images" ]; then
     # otherwise it writes no PNG. The font is DejaVu Sans, which carries
     # Arabic and Hebrew glyphs including GSUB.
     build gallery10
-    kette gallery10 1000
+    chain_check gallery10 1000
     "$W/gallery10" "$Z/fui-bidi-hell.png" light
     "$W/gallery10" "$Z/fui-bidi-dunkel.png" dark
     beleg "$Z/fui-bidi-hell.png" 1000 500 900 200 40 1
@@ -1281,7 +1281,7 @@ if [ "$1" = "--images" ]; then
     "$W/mdview" "$Z" > /dev/null
     "$W/kit" "$Z" > /dev/null
     build preview
-    kette preview 760
+    chain_check preview 760
     "$W/preview" "$Z/fui-preview-hell.png" light
     "$W/preview" "$Z/fui-preview-dunkel.png" dark
     beleg "$Z/fui-preview-hell.png" 760 200 240 120 40 1
@@ -1297,7 +1297,7 @@ if [ "$1" = "--images" ]; then
     # re-calculates itself that its phases do not overlap,
     # and otherwise ends with an error (set -e aborts the run).
     "$FIRNC" --opt-level=dev -o "$W/fuidemo" demos/fuidemo/main.fi
-    "$W/belegpruef" --ketten "$SCHRIFT" 1000 demos/fuidemo/main.fi
+    "$W/belegpruef" --ketten "$FONT_TTF" 1000 demos/fuidemo/main.fi
     "$W/fuidemo" "$Z/fui-demo-hell.png" light
     "$W/fuidemo" "$Z/fui-demo-dunkel.png" dark
     beleg "$Z/fui-demo-hell.png" 1000 350 500 200 40 0
@@ -1308,7 +1308,7 @@ if [ "$1" = "--images" ]; then
     # selection that stays standing until confirmed. For that it needs
     # a font with CJK GLYPHS in TrueType outlines; DejaVu has
     # none, and a proof of empty boxes proves nothing. If it is missing,
-    # the run has NOT passed -- the same rule as for $SCHRIFT.
+    # the run has NOT passed -- the same rule as for $FONT_TTF.
     # (Noto Sans CJK is no good: CFF outlines, which lib/font/ttf.fi
     # rejects by name.) The program itself checks that every shown
     # character has a glyph, that nothing overlaps and nothing runs out of
@@ -1322,7 +1322,7 @@ if [ "$1" = "--images" ]; then
         exit 1
     fi
     build imebeleg
-    kette imebeleg 1000
+    chain_check imebeleg 1000
     "$W/imebeleg" "$Z/fui-ime-hell.png" light "$FONT_CJK"
     "$W/imebeleg" "$Z/fui-ime-dunkel.png" dark "$FONT_CJK"
     beleg "$Z/fui-ime-hell.png" 1000 400 485 200 40 1

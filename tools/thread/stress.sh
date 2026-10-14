@@ -26,7 +26,7 @@ SECS=${STRESS_SEK:-130}
 THREADS=${STRESS_THREADS:-4}
 LOCAL_LISTS=${STRESS_LOCAL:-0}
 DRIFT=${STRESS_DRIFT_KIB:-1024}
-WORK=$(mktemp -d /tmp/firn-faden-stress.XXXXXX)
+WORK=$(mktemp -d /tmp/firn-thread-stress.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
 if [ ! -x "$FIRNC" ]; then

@@ -43,8 +43,8 @@ fi
 [ -x "$FIRNC" ] || { echo "no compiler"; exit 1; }
 [ -n "$STORE_TOOL" ] || { echo "needs an orientstore tool with 'add-app' (set ORIENTSTORE_TOOL)"; exit 1; }
 case "$TARGET" in
-    windows) EXT=.exe; ART=exe; ZIEL=windows-x86_64; TF="--target=x86_64-windows" ;;
-    linux) EXT=""; ART=bin; ZIEL=linux-x86_64; TF="" ;;
+    windows) EXT=.exe; ART=exe; PLATFORM=windows-x86_64; TF="--target=x86_64-windows" ;;
+    linux) EXT=""; ART=bin; PLATFORM=linux-x86_64; TF="" ;;
     *) echo "target: windows or linux"; exit 2 ;;
 esac
 # APPKIT_KIT_PORT: the test run picks a free port (parallel runs, r479); the shipped kit keeps 18765
@@ -70,7 +70,7 @@ build 1.3.0 hang "$K/app-1.3.0$EXT"
 build 1.1.0 dev "$K/app-1.1.0-dev$EXT"
 
 publish() {   # publish <version> <state dir name>
-    $STORE add-app --art $ART --id e2eapp --fassung "$1" --ziel $ZIEL --name "E2E App" \
+    $STORE add-app --art $ART --id e2eapp --fassung "$1" --ziel $PLATFORM --name "E2E App" \
         --aenderungen "release $1" "$K/app-$1$EXT" >"$W/publish-$1.log" 2>&1 \
         || { echo "publish $1 failed"; cat "$W/publish-$1.log"; exit 1; }
     mkdir -p "$K/state-$2"
