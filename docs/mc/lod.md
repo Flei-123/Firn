@@ -91,7 +91,7 @@ Screen-door (ordered dither) fade between two representations of a column, in th
 - Gate floor `fog_flat` is back to 75 dB: dump.fi renders that scene with `raster_set_edge_expand(false)` (the arithmetic is what it checks), the expansion stays on for all other scenes.
 
 ## Client integration + ring bench (z4, 14.10.)
-- mcplay can draw through mc_stream instead of mc_render_world: `MCPLAY_LOD=<n>` (LOD up to n chunks beyond `MCPLAY_VIEW`, implies the stream) or `MCPLAY_STREAM=1` (stream without LOD, control).
+- mcplay draws through mc_stream by default (a2; `MCPLAY_STREAM=0` = old mc_render_world path): `MCPLAY_LOD=<n>` adds LOD up to n chunks beyond `MCPLAY_VIEW`, `MCPLAY_WORKERS` = mesher threads.
   With LOD the client asks the server for n chunks (`client_send_settings`), `dist` of the stream = MCPLAY_VIEW (full detail), `lod_dist` = n; fog and far plane use n. The stream meshes inline (pool 0, the budgets of mc_stream apply).
   Column unload packets go to `stream_chunk_unloaded`, edits to `stream_mark_block`, the moving light region marks its sections through `stream_mark_section` (`stream_region_follow`). Resize frees the stream before the raster changes and re-announces every loaded column.
   Default stays `mc_render_world` (no behaviour change without the env vars). End line: `mcplay: stream sections=.. lod_cols=.. lod_tris=..`.

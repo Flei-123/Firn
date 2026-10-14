@@ -109,6 +109,7 @@ pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
             | K::Store
             | K::Store64
             | K::Zero
+            | K::FromU64
             | K::UnpackLo32
             | K::UnpackHi32
             | K::UnpackLo8
@@ -129,6 +130,33 @@ pub(crate) fn v128_ra_kind(k: crate::simd::SimdKind) -> bool {
             | K::SubF32
             | K::MulF32
             | K::Shuffle32
+            | K::UnpackLo64
+            | K::UnpackHi64
+            | K::UnpackLo16
+            | K::UnpackHi16
+            | K::Add64
+            | K::Add8
+            | K::Packs32
+            | K::Packus32
+            | K::Packs16
+            | K::MinI16
+            | K::MaxI16
+            | K::MinI32
+            | K::MaxI32
+            | K::CmpEq8
+            | K::CmpEq16
+            | K::MulHi16
+            | K::ShufF32
+            | K::SqrtF32
+            | K::RcpF32
+            | K::RsqrtF32
+            | K::Shl32
+            | K::Shr32
+            | K::Shl64
+            | K::Shr64
+            | K::ShlBytes
+            | K::ShrBytes
+            | K::Srl16
             // ROUND TEMPO 5: convert, compare, combine -- all
             // simple two-operand forms without special rules.
             | K::TruncF32I32
@@ -187,6 +215,30 @@ pub(crate) fn two_address_simd(k: crate::simd::SimdKind) -> bool {
             | K::MulLo32
             | K::AddSatU8
             | K::SubSatU8
+            | K::UnpackLo64
+            | K::UnpackHi64
+            | K::UnpackLo16
+            | K::UnpackHi16
+            | K::Add64
+            | K::Add8
+            | K::Packs32
+            | K::Packus32
+            | K::Packs16
+            | K::MinI16
+            | K::MaxI16
+            | K::MinI32
+            | K::MaxI32
+            | K::CmpEq8
+            | K::CmpEq16
+            | K::MulHi16
+            | K::ShufF32
+            | K::Shl32
+            | K::Shr32
+            | K::Shl64
+            | K::Shr64
+            | K::ShlBytes
+            | K::ShrBytes
+            | K::Srl16
     )
 }
 
@@ -6215,13 +6267,33 @@ fn emit_inst(
                     e.line(&format!("xorps {}, {}", w, w));
                     ra.v_out(e, d, w);
                 }
-                // RUNDE TEMPO 5: die einstelligen Wandlungen.
-                K::TruncF32I32 | K::CvtI32F32 => {
-                    let d = i.dst.ok_or("internal error: conversion without target")?;
-                    let m = if matches!(kind, K::TruncF32I32) {
-                        "cvttps2dq"
+                // R557: a vector built from two 64-bit integers (constants such
+                // as sign masks). Without this the whole function fell back to
+                // the base path. `movq` clears the upper half, so a zero high
+                // word needs no second step; two equal words use one copy.
+                K::FromU64 => {
+                    let d = i.dst.ok_or("internal error: from_u64 without target")?;
+                    let w = ra.v_work(d);
+                    ra.load_full(e, "rax", args[0]);
+                    e.line(&format!("movq {}, rax", w));
+                    if args[1] == args[0] {
+                        e.line(&format!("punpcklqdq {}, {}", w, w));
                     } else {
-                        "cvtdq2ps"
+                        ra.load_full(e, "rax", args[1]);
+                        e.line("movq xmm1, rax");
+                        e.line(&format!("punpcklqdq {}, xmm1", w));
+                    }
+                    ra.v_out(e, d, w);
+                }
+                // RUNDE TEMPO 5: die einstelligen Wandlungen.
+                K::TruncF32I32 | K::CvtI32F32 | K::SqrtF32 | K::RcpF32 | K::RsqrtF32 => {
+                    let d = i.dst.ok_or("internal error: conversion without target")?;
+                    let m = match kind {
+                        K::TruncF32I32 => "cvttps2dq",
+                        K::CvtI32F32 => "cvtdq2ps",
+                        K::SqrtF32 => "sqrtps",
+                        K::RcpF32 => "rcpps",
+                        _ => "rsqrtps",
                     };
                     let sa = ra.v_reg(e, args[0], "xmm1");
                     let w = ra.v_work(d);
@@ -6256,7 +6328,24 @@ fn emit_inst(
                 | K::MaxU8
                 | K::MulLo32
                 | K::AddSatU8
-                | K::SubSatU8 => {
+                | K::SubSatU8
+                | K::UnpackLo64
+                | K::UnpackHi64
+                | K::UnpackLo16
+                | K::UnpackHi16
+                | K::Add64
+                | K::Add8
+                | K::Packs32
+                | K::Packus32
+                | K::Packs16
+                | K::MinI16
+                | K::MaxI16
+                | K::MinI32
+                | K::MaxI32
+                | K::CmpEq8
+                | K::CmpEq16
+                | K::MulHi16
+                | K::ShufF32 => {
                     let d = i.dst.ok_or("internal error: vector arithmetic without target")?;
                     let m = match kind {
                         K::AddF32 => "addps",
@@ -6289,13 +6378,36 @@ fn emit_inst(
                         K::MulLo32 => "pmulld",
                         K::AddSatU8 => "paddusb",
                         K::SubSatU8 => "psubusb",
+                        K::UnpackLo64 => "punpcklqdq",
+                        K::UnpackHi64 => "punpckhqdq",
+                        K::UnpackLo16 => "punpcklwd",
+                        K::UnpackHi16 => "punpckhwd",
+                        K::Add64 => "paddq",
+                        K::Add8 => "paddb",
+                        K::Packs32 => "packssdw",
+                        K::Packus32 => "packusdw",
+                        K::Packs16 => "packsswb",
+                        K::MinI16 => "pminsw",
+                        K::MaxI16 => "pmaxsw",
+                        K::MinI32 => "pminsd",
+                        K::MaxI32 => "pmaxsd",
+                        K::CmpEq8 => "pcmpeqb",
+                        K::CmpEq16 => "pcmpeqw",
+                        K::MulHi16 => "pmulhw",
+                        K::ShufF32 => "shufps",
                         _ => "psubd",
+                    };
+                    // `shufps` carries an 8-bit immediate after the operands.
+                    let tail = if matches!(kind, K::ShufF32) {
+                        format!(", {}", imm)
+                    } else {
+                        String::new()
                     };
                     let w = ra.v_work(d);
                     if crate::target::avx() {
                         let sa = ra.v_reg(e, args[0], "xmm0");
                         let sb = ra.vo(args[1]);
-                        e.line(&format!("v{} {}, {}, {}", m, w, sa, sb));
+                        e.line(&format!("v{} {}, {}, {}{}", m, w, sa, sb, tail));
                         ra.v_out(e, d, w);
                     } else {
                         // If the second operand lies in the destination register, it is
@@ -6307,9 +6419,31 @@ fn emit_inst(
                             ob = "xmm1".to_string();
                         }
                         ra.v_into(e, w, args[0]);
-                        e.line(&format!("{} {}, {}", m, w, ob));
+                        e.line(&format!("{} {}, {}{}", m, w, ob, tail));
                         ra.v_out(e, d, w);
                     }
+                }
+                // In-place shifts by an immediate: `pslld d, imm` shifts `d` itself.
+                K::Shl32 | K::Shr32 | K::Shl64 | K::Shr64 | K::ShlBytes | K::ShrBytes | K::Srl16 => {
+                    let d = i.dst.ok_or("internal error: shift without target")?;
+                    let m = match kind {
+                        K::Shl32 => "pslld",
+                        K::Shr32 => "psrld",
+                        K::Shl64 => "psllq",
+                        K::Shr64 => "psrlq",
+                        K::ShlBytes => "pslldq",
+                        K::Srl16 => "psrlw",
+                        _ => "psrldq",
+                    };
+                    let w = ra.v_work(d);
+                    if crate::target::avx() && !matches!(kind, K::ShlBytes | K::ShrBytes) {
+                        let sa = ra.v_reg(e, args[0], "xmm0");
+                        e.line(&format!("v{} {}, {}, {}", m, w, sa, imm));
+                    } else {
+                        ra.v_into(e, w, args[0]);
+                        e.line(&format!("{} {}, {}", m, w, imm));
+                    }
+                    ra.v_out(e, d, w);
                 }
                 K::Shuffle32 => {
                     let d = i.dst.ok_or("internal error: shuffle without target")?;

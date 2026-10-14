@@ -11,7 +11,8 @@
 //   MCPLAY_GL=1        GL path: glwindow (EGL/GLX) + gl_mc/gl_scene back end, frame shown without read back; MCPLAY_VSYNC=0|1 (default 1); CPU stays the default
 //   MCPLAY_VIEW=6      view distance in chunks            MCPLAY_PROTOCOL=763   protocol number
 //   MCPLAY_LOD=<n>     LOD terrain beyond MCPLAY_VIEW up to n chunks (mc_stream + mc_lod, cross-fade at ring changes; asks the server for n chunks); 0 = off (default)
-//   MCPLAY_STREAM=1    mc_stream instead of mc_render_world for the world (implied by MCPLAY_LOD)
+//   MCPLAY_STREAM=0    old path: mc_render_world (inline meshing) instead of mc_stream. DEFAULT is mc_stream (frustum + cave culling, worker meshing)
+//   MCPLAY_WORKERS=3   mesher threads of the stream (0 = inline on the render thread); default 3 on the CPU path, 0 with MCPLAY_GL=1 (Firn threads + GL dispatch crash, see docs/mc/stream.md)
 //   MCPLAY_W / MCPLAY_H window size (default 854x480)     MCPLAY_FULLSCREEN=1   start fullscreen
 //   MCPLAY_FPS=60      frame cap (0 = uncapped)           MCPLAY_VSYNC=1        swap interval for the GL path (CPU path: no-op)
 //   MCPLAY_CREATIVE=1  the server is creative: fly allowed and the creative reach (6 blocks)
@@ -20,7 +21,8 @@
 //   log:   MCPLAY_LOG=<file> (stdout+stderr into a file; "-" = never; unset = automatic when there is no console)
 //   sound: MCPLAY_SOUNDS=<dir with bank.json + wavs> (default: <exe dir>/sounds, then $HOME/.cache/mcplay/sounds; made by tools/sounds/gen tools/sounds/mc.json <dir>)
 //          FIRN_AUDIO=file:/x.wav|null|device (default device); MCPLAY_AUDIO=0 off; MCPLAY_VOL_<MASTER|BLOCKS|AMBIENT|PLAYERS|HOSTILE|NEUTRAL|MUSIC|UI>=0..100; M = mute
-//   packs: MC_PACKS / MC_PACK_CONFIG / MC_PACK_AUTO (see docs/mc/resourcepacks.md); T = hot reload, animated tiles tick at 20 Hz
+//   packs: MC_PACKS / MC_PACK_CONFIG / MC_PACK_AUTO (see docs/mc/resourcepacks.md); T = hot reload (atlas + pack sounds), animated tiles tick at 20 Hz
+//          MC_PACK_SOUNDS=synth|original|both (default synth; original/both read sounds.json + OGG of the packs, both = synth bank + pack events on top)
 //   MCPLAY_DIG_MS=700  hold time before the "finish digging" packet in survival (there is no hardness table yet)
 //   MCPLAY_PLACE_ID=0  block state id painted locally on a place click (0 = wait for the server's Block Update)
 //   MCPLAY_RUN_S=0     quit after N seconds (tests)       MCPLAY_SHOT=<file.png>  write the last frame as PNG on exit + print its hash
@@ -53,6 +55,7 @@ import mc.mc_texture
 import mc.mc_raster
 import mc.mc_render_world
 import mc.mc_stream
+import jobs.jobs
 import mc.mc_sky
 import mc.mc_input
 import mc.mc_hud
@@ -60,6 +63,7 @@ import mc.mc_blockset
 import mc.mc_play
 import mc.mc_wlight
 import mc.mc_packs
+import mc.mc_packsnd
 import mc.mc_backend
 import mc.mc_inv
 import mc.mc_effect
@@ -81,6 +85,7 @@ import appkit.platform
 // The audio thread (FIRN_AUDIO=device) needs the program's dispatcher.
 fn __thread_work(kind: u64, arg: u64) -> u64 {
     if kind == engine.AUDIO_KIND { return engine.audio_main(arg) }
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
     return 0
 }
 
@@ -292,9 +297,16 @@ struct Ctx {
     gsc: gl_scene.Scene,
     sh: glshow.Show,
     be: mc_backend.Backend, // the GL back end table
-    stm: mc_stream.Stream, // MCPLAY_STREAM / MCPLAY_LOD: the world drawn by mc_stream (inline meshing, LOD rings) instead of g.wr
+    stm: mc_stream.Stream, // the world drawn by mc_stream (worker meshing, LOD rings) instead of g.wr (MCPLAY_STREAM=0)
     stream_on: bool,
     stm_live: bool,
+    pool: jobs.Jobs, // mesher threads of the stream (blk 0 = none: inline)
+    win_cx: i32, // camera column of the last window sync
+    win_cz: i32,
+    win_n: u32, // frames since the last window sync
+    n_win: u64, // columns dropped / announced by the window sync
+    t_stream: u64, // total ns in stream_frame (render thread: cull, submit, upload, draw)
+    max_stream: u64, // longest stream_frame in ns
     lod: i32, // LOD radius in chunks (0 = off)
     pk: mc_input.Pick,
     bg: u64, // BGRX copy of the frame for the window
@@ -403,6 +415,34 @@ fn wire_view(c: *mut Ctx) -> i32 {
 // Fog / far plane distance in chunks.
 fn far_view(c: *mut Ctx) -> i32 { return wire_view(c) }
 
+// Address of the mesher pool for mc_stream (0 = inline).
+fn pool_addr(c: *mut Ctx) -> u64 {
+    if (*c).pool.blk == 0 { return 0 as u64 }
+    return ((&(*c).pool) as *mut jobs.Jobs) as u64
+}
+
+// Window logic for far columns: the server sends its own radius (often > ours), the stream only keeps what can be drawn
+// (view + 2, or the LOD window). Columns that left the window stay in the world and are announced again when the player returns.
+// Runs when the camera column changed, else every 40 frames (cheap: a few hash lookups per loaded chunk).
+fn stream_window_tick(c: *mut Ctx) {
+    if !(*c).stream_on || !(*c).stm_live || !(*c).have_pos { return }
+    (*c).win_n = (*c).win_n + 1 as u32
+    let ccx: i32 = mc_world.block_to_chunk(math.floor((*c).cam.x) as i32)
+    let ccz: i32 = mc_world.block_to_chunk(math.floor((*c).cam.z) as i32)
+    if ccx == (*c).win_cx && ccz == (*c).win_cz && (*c).win_n < 40 as u32 { return }
+    (*c).win_cx = ccx
+    (*c).win_cz = ccz
+    (*c).win_n = 0 as u32
+    var be: mc_backend.Backend = cur_be(c)
+    let n: usize = mc_stream.stream_window_sync(&(*c).stm, &(*c).world, &be, &(*c).cam, 2, 64, 64)
+    (*c).n_win = (*c).n_win + n as u64
+}
+
+fn stream_time(c: *mut Ctx, ns: u64) {
+    (*c).t_stream = (*c).t_stream + ns
+    if ns > (*c).max_stream { (*c).max_stream = ns }
+}
+
 // Frees the stream (its meshes live in the CURRENT back end: call before the back end changes).
 fn stream_release(c: *mut Ctx) {
     if !(*c).stream_on || !(*c).stm_live { return }
@@ -415,8 +455,10 @@ fn stream_release(c: *mut Ctx) {
 fn stream_make(c: *mut Ctx) {
     if !(*c).stream_on { return }
     stream_release(c)
-    (*c).stm = mc_stream.stream_new((*c).dim.min_y, mc_dimension.dim_sections(&(*c).dim) as i32, (*c).view, &(*c).g.tb, 0 as u64)
+    (*c).stm = mc_stream.stream_new((*c).dim.min_y, mc_dimension.dim_sections(&(*c).dim) as i32, (*c).view, &(*c).g.tb, pool_addr(c))
     (*c).stm_live = true
+    (*c).win_cx = 1000000
+    (*c).win_cz = 1000000
     if (*c).lod > (*c).view { (*c).stm.lod_dist = (*c).lod }
     if env_flag("MCPLAY_TRANS", true) {
         mc_stream.stream_set_translucent(&(*c).stm, true, mc_texture.T_WATER, mc_texture.T_ICE, mc_texture.T_GLASS)
@@ -776,7 +818,8 @@ fn handle_window(c: *mut Ctx) {
     }
     if (*c).g.use_res && raw.key_pressed(&(*c).rw, SC_T) {
         var be: mc_backend.Backend = cur_be(c)
-        mc_packs.res_on_key(&(*c).g.res, &be, mc_packs.RES_KEY_RELOAD)
+        let nr: i32 = mc_packs.res_on_key(&(*c).g.res, &be, mc_packs.RES_KEY_RELOAD)
+        if nr >= 0 { audio_packs_reload(c) }
     }
     if raw.key_pressed(&(*c).rw, SC_F11 as u32) {
         (*c).n_f11 = (*c).n_f11 + 1
@@ -1190,14 +1233,39 @@ fn bank_load_dir(c: *mut Ctx, dir: *mut rt.Buf) -> i32 {
     return r
 }
 
-// Opens the sink + bank. false = no sound (the game runs on). Called once the Ctx is in place (the engine must not move).
-fn audio_start(c: *mut Ctx) -> bool {
-    sink.sink_close((*c).snk)
-    *(*c).snk = sink.sink_open("mcplay", AUDIO_RATE, 2 as u32)
-    if !sink.sink_is_open((*c).snk) {
-        io.eprint_line("mcplay: no sound output (no PulseAudio? FIRN_AUDIO=null|file:/x.wav works anywhere) -- running silent")
-        return false
+// Sound source: sounds=synth|original|both of the pack manager (config `sounds=` / MC_PACK_SOUNDS); synth when packs are off.
+fn snd_mode(c: *mut Ctx) -> i32 {
+    if !(*c).g.use_res { return mc_packs.SOUNDS_SYNTH }
+    return mc_packs.res_sounds_mode(&(*c).g.res)
+}
+
+// Pack sounds (sounds.json + OGG of the loaded packs) on top of the bank. Used at start and after every pack hot reload (the bank
+// remembers the OGG hashes, so a reload with unchanged files reuses every sample: no leak). Returns the events made, -1 on error.
+fn audio_packs_apply(c: *mut Ctx, mode: i32) -> i32 {
+    let n: i32 = mc_packsnd.packsnd_apply((*c).ma, (*c).bnk, (*c).eng, &(*c).g.res.stack, mode)
+    if n < 0 {
+        io.eprint_line("mcplay: pack sounds: bank error -- keeping the old sounds")
+    } else {
+        say(f"mcplay: pack sounds mode={mode} events={n} samples={engine.engine_sample_count((*c).eng)}\n")
     }
+    return n
+}
+
+// T key: after the packs were re-read, rebuild the pack sound events (no-op for sounds=synth or without sound).
+// Bank loading needs a stopped audio thread (engine rule): stop, apply (unchanged OGG = same sample, changed = old slot), restart.
+fn audio_packs_reload(c: *mut Ctx) {
+    let mode: i32 = snd_mode(c)
+    if !(*c).aud || mode == mc_packs.SOUNDS_SYNTH { return }
+    if (*c).aud_thread { engine.engine_audio_stop((*c).eng) }
+    audio_packs_apply(c, mode)
+    if (*c).aud_thread {
+        (*c).aud_thread = engine.engine_audio_start((*c).eng, (*c).snk, 1024)
+        if !(*c).aud_thread { io.eprint_line("mcplay: audio thread did not restart after the pack reload -- running silent") }
+    }
+}
+
+// Loads our synth bank (search order below). Returns bank.BANK_OK or an error code.
+fn audio_load_synth(c: *mut Ctx) -> i32 {
     // Search order: MCPLAY_SOUNDS (only that), <exe dir>/sounds (the dist package), then the per-user cache dir.
     var r: i32 = bank.BANK_ERR_FILE
     if env.has("MCPLAY_SOUNDS") {
@@ -1235,6 +1303,33 @@ fn audio_start(c: *mut Ctx) -> bool {
             }
             r = bank_load_dir(c, &dir)
             rt.buf_free(&dir)
+        }
+    }
+    return r
+}
+
+// Opens the sink + bank. false = no sound (the game runs on). Called once the Ctx is in place (the engine must not move).
+fn audio_start(c: *mut Ctx) -> bool {
+    sink.sink_close((*c).snk)
+    *(*c).snk = sink.sink_open("mcplay", AUDIO_RATE, 2 as u32)
+    if !sink.sink_is_open((*c).snk) {
+        io.eprint_line("mcplay: no sound output (no PulseAudio? FIRN_AUDIO=null|file:/x.wav works anywhere) -- running silent")
+        return false
+    }
+    let mode: i32 = snd_mode(c)
+    var r: i32 = bank.BANK_ERR_FILE
+    if mode != mc_packs.SOUNDS_ORIGINAL { r = audio_load_synth(c) }
+    if mode != mc_packs.SOUNDS_SYNTH {
+        let n: i32 = audio_packs_apply(c, mode)
+        if mode == mc_packs.SOUNDS_ORIGINAL {
+            if n > 0 {
+                r = bank.BANK_OK
+            } else {
+                io.eprint_line("mcplay: sounds=original but the packs have no usable sounds -- using the synth bank")
+                r = audio_load_synth(c)
+            }
+        } else if r != bank.BANK_OK && n > 0 {
+            r = bank.BANK_OK
         }
     }
     if r != bank.BANK_OK {
@@ -1354,9 +1449,13 @@ fn draw_frame_gl(c: *mut Ctx) {
     if (*c).light { mc_render_world.wr_set_daylight(&(*c).be, (*c).sky.daylight) }
     if (*c).have_pos {
         if (*c).stream_on {
+            let ts0: u64 = now_ns()
             let tg: u64 = mc_stream.stream_frame(&(*c).stm, &(*c).world, &(*c).be, &(*c).cam)
+            stream_time(c, now_ns() - ts0)
         } else {
+            let ts0: u64 = now_ns()
             mc_render_world.wr_render_b(&(*c).g.wr, &(*c).world, &(*c).be, &(*c).cam, 0 - 1)
+            stream_time(c, now_ns() - ts0)
         }
     }
     (*c).be.end((*c).be.obj)
@@ -1430,9 +1529,13 @@ fn draw_frame(c: *mut Ctx) {
     if (*c).have_pos {
         if (*c).stream_on {
             var sbe: mc_backend.Backend = mc_backend.backend_cpu(r)
+            let ts0: u64 = now_ns()
             let tc: u64 = mc_stream.stream_frame(&(*c).stm, &(*c).world, &sbe, &(*c).cam)
+            stream_time(c, now_ns() - ts0)
         } else {
+            let ts0: u64 = now_ns()
             mc_render_world.wr_render(&(*c).g.wr, &(*c).world, r, &(*c).cam, 0 - 1)
+            stream_time(c, now_ns() - ts0)
         }
     }
     if !(*c).light { mc_sky.sky_tint_frame(&(*c).sky, r) }
@@ -1563,7 +1666,12 @@ fn main(start: u64) -> i32 {
     }
     net.set_no_delay(&conn, true) catch false
     let lod_n: i32 = env_int("MCPLAY_LOD", 0)
-    let want_stream: bool = lod_n > 0 || env_flag("MCPLAY_STREAM", false)
+    let want_stream: bool = lod_n > 0 || env_flag("MCPLAY_STREAM", true)
+    // GL + Firn worker threads: libGLdispatch / dlopen(libEGL) segfault once Firn (clone) threads exist (gdb: _dl_update_slotinfo, GL dispatch TLS)
+    // -> the GL path meshes inline by default; MCPLAY_WORKERS=<n> forces threads (unsafe with GL)
+    var wdef: i32 = 3
+    if env_flag("MCPLAY_GL", false) { wdef = 0 }
+    let n_workers: i32 = env_int("MCPLAY_WORKERS", wdef)
     var dummy_tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
     var eng: engine.Engine = engine.engine_new(AUDIO_RATE, 48 as u32)
     var bnk: bank.Bank = bank.bank_new()
@@ -1581,7 +1689,7 @@ fn main(start: u64) -> i32 {
         pl: mc_input.player_new(0.0, 0.0, 0.0),
         rw: raw.raw_new(),
         win: window.window_new(), wp: 0 as *mut window.Window, gl: false, gw: glwindow.glwindow_new(), gb: gb0, gsc: gl_scene.scene_empty(&gb0), sh: glshow.show_new(), be: mc_backend.backend_new(),
-        stm: mc_stream.stream_new(0, 1, 1, &dummy_tb, 0 as u64), stream_on: want_stream, stm_live: true, lod: lod_n,
+        stm: mc_stream.stream_new(0, 1, 1, &dummy_tb, 0 as u64), stream_on: want_stream, stm_live: true, lod: lod_n, pool: jobs.Jobs { blk: 0 }, win_cx: 1000000, win_cz: 1000000, win_n: 0 as u32, n_win: 0 as u64, t_stream: 0 as u64, max_stream: 0 as u64,
         pk: mc_input.Pick { x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, dist: 0.0, id: 0 },
         bg: 0, w: w0, h: h0, view: view, protocol: proto,
         join: false, have_pos: false, last_tp: 0, grab: false, closed: false, resized: false, fullscreen: false, hit: false,
@@ -1687,6 +1795,11 @@ fn main(start: u64) -> i32 {
         c.fullscreen = true
         window.fullscreen(c.wp, true)
     }
+    // mesher threads AFTER every dlopen (libEGL / libGL / audio): a dlopen of a TLS library once Firn threads exist crashes in glibc _dl_update_slotinfo
+    if c.stream_on && n_workers > 0 {
+        c.pool = jobs.create(n_workers as u64)
+        if c.pool.blk == 0 { io.eprint_line("mcplay: mesher threads did not start -- meshing inline") }
+    }
     grab_mouse(&c, true)
     c.sent_slot = 0
     let t_start: u64 = now_ms()
@@ -1704,6 +1817,7 @@ fn main(start: u64) -> i32 {
         alive = net_drain(&c, 400)
         sync_position(&c)
         light_region_tick(&c)
+        stream_window_tick(&c)
         handle_hotbar(&c)
         let nowm: u64 = now_ms()
         var nt: i32 = 0
@@ -1737,6 +1851,13 @@ fn main(start: u64) -> i32 {
             window.wait_event(c.wp, ((frame_ns - spent) / 1000000 as u64) as i64)
         }
     }
+    if c.stream_on && c.lod == 0 && c.stm_live && c.have_pos && env.has("MCPLAY_SHOT") {
+        // the shot shows the converged picture: let the mesher threads finish, then draw once more
+        var sbe: mc_backend.Backend = cur_be(&c)
+        let nfl: usize = mc_stream.stream_flush(&c.stm, &c.world, &sbe, &c.cam, 200)
+        draw_frame(&c)
+        present(&c)
+    }
     audio_stop(&c)
     say(f"mcplay: end frames={c.n_frames} ticks={c.n_ticks} chunks={c.n_chunks} unloads={c.n_unload} block_updates={c.n_bchange} multi_updates={c.n_mchange} dig={c.n_dig} place={c.n_place} kicked={c.n_kick} alive={alive}\n")
     say(f"mcplay: walk walked_mm={(c.wk.walked * 1000.0) as i64} steps={c.wk.steps} ticks_dropped={tick_dropped}\n")
@@ -1766,10 +1887,14 @@ fn main(start: u64) -> i32 {
         rt.heap_free(hb, 64)
         rt.buf_free(&pb)
     }
+    say(f"mcplay: world_draw mode={c.stream_on} avg_us={c.t_stream / (c.n_frames + 1 as u64) / 1000 as u64} max_us={c.max_stream / 1000 as u64}\n")
     if c.stream_on {
+        let pool_up: bool = c.pool.blk != 0
+        say(f"mcplay: stream workers={n_workers} pool={pool_up} avg_us={c.t_stream / (c.n_frames + 1 as u64) / 1000 as u64} max_us={c.max_stream / 1000 as u64} window_ops={c.n_win} cols={c.stm.clive}\n")
         say(f"mcplay: stream sections={mc_stream.stream_sections(&c.stm)} lod_cols={c.stm.st.lod_cols} lod_tris={c.stm.st.lod_tris} lod_todo={c.stm.st.lod_todo} lod_fading={c.stm.st.lod_fading} lod_us={c.stm.st.lod_us}\n")
         stream_release(&c)
     }
+    if c.pool.blk != 0 { jobs.destroy(&c.pool) }
     if c.gl {
         mc_render_world.wr_free_b(&c.g.wr, &c.be)
         gl_scene.scene_close(&c.gsc)
