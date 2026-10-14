@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
-// examples/firncam -- FirnCam mini app: preview, shutter, RAW (DNG) switch, lens switch.
+// examples/firncam -- FirnCam app: preview, mode bar (PHOTO = auto HDR burst, NIGHT, PORTRAIT, DOC scan + PDF,
+// STACK = focus stack, VIDEO, RAW = DNG), manual sliders (ISO / exposure / focus), lens switch. The processing
+// of a shot (photo.camjob: merge, tone, bokeh, scan, JPEG encode) runs on a job thread with a progress bar;
+// the result goes to MediaStore as JPEG. Modes and sliders only appear when the lens can do them.
 // Everything about the device comes from the CameraCharacteristics (lib/plat/android/camera.fi).
 //   bash tools/android/build.sh examples/firncam/main.fi --camera --name FirnCam --package org.firn.cam
 // The UI is drawn into one BGRX buffer with a tiny built-in bitmap font (the Android window layer has
@@ -8,6 +11,12 @@ import window.window
 import plat.android.camera
 import plat.android.dngwrite
 import photo.meta
+import photo.camjob
+import photo.focus
+import photo.par
+import jobs.jobs
+import std.rt
+import std.math
 
 static GLYPHS: [u8; 1652] = "0000000000000000000000000000000000181818181818001818000000000064646464000000000000000000000012167f242cfe68480000000010103c78703c1e167e3c101000000070d0d072184e0b0b0e0000000000386430307bcfce6e3f00000000001818181800000000000000000c181818103030101818180c000030101818180808181818103000000000185a3c3c5a18000000000000000000181818fefe18181800000000000000000000000018181830000000000000003c3c0000000000000000000000000000001818000000000006040c0c081810302060400000003c66667e7e6666663c000000000078181818181818187e00000000003c4c060e0c1830607e00000000003c46063c060606463c00000000000c1c3c6c4c7e0c0c0c00000000007c60607c4e06064e3c00000000003c60607c666666663c00000000007e060c0c1c1818303000000000003c66663c666666663c00000000003c6e66666e3e064c380000000000000018180000001818000000000000001818000000181818300000000000021e78e0781e020000000000000000fefe00fefe000000000000000040701e061e704000000000003c06060c181800181800000000003c625ed2b2b2b2d25e621e000000183c3c2c647e6646c300000000007c6666667c6666667c00000000001c326060606060321c00000000007c6e66666666666e7c00000000007e6060607e6060607e00000000007e6060607e6060606000000000001c7260606e6666363e0000000000666666667e6666666600000000007e181818181818187e00000000003c0c0c0c0c0c0c4c7c0000000000666c7c78786c6c6667000000000060606060606060607e0000000000e6e6fefedadac2c2c20000000000666676765e4e4e4e4600000000003c666666666666663c00000000007c666666667c60606000000000003c666666666666663c0e040000007c666666667c6c666700000000003c6260703c0e06463c00000000007e1818181818181818000000000066666666666666663c0000000000c6666666643c3c3c380000000000c3c3dbda5a7e6e66660000000000e6663c3c183c3c66c60000000000c7666e3c381818181800000000007e060e1c183870607e0000"
 
@@ -89,6 +98,23 @@ fn put_int(dst: u64, v: i64) -> usize {
     return o + n
 }
 
+const JOB_KIND: u64 = 77
+const BUDGET: usize = 400 * 1024 * 1024    // capture buffer budget of one shot
+
+const M_PHOTO: i32 = 0
+const M_NIGHT: i32 = 1
+const M_PORTRAIT: i32 = 2
+const M_DOC: i32 = 3
+const M_STACK: i32 = 4
+const M_VIDEO: i32 = 5
+const M_RAW: i32 = 6
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+    if kind == JOB_KIND { return camjob.job_entry(arg) }
+    return 0
+}
+
 struct App {
     w: i32,
     h: i32,
@@ -98,13 +124,23 @@ struct App {
     ph: i32,
     nlens: i32,
     lens: i32,
-    raw_mode: bool,
+    mode: i32,
+    manual: bool,
+    sl: [i32; 3],          // slider positions 0..1000: ISO, exposure, focus
+    drag: i32,             // slider row being dragged, -1 none
     kind: i32,
     ready: bool,
     status: [u8; 64],
     info: camera.CamInfo,
     shots: i32,
     recording: bool,
+    job: camjob.Job,
+    busy: bool,
+    th: u64,
+    cbuf: u64,             // capture buffer of the running job
+    ccap: usize,
+    fbuf: u64,             // FrameInfo array of the running job
+    stamp0: i64,
 }
 
 fn set_status(a: *mut App, s: str) {
@@ -125,23 +161,74 @@ fn status_str(a: *mut App) -> str {
     return s
 }
 
+// ---------------------------------------------------------------- what this lens can do
+fn has_raw(a: *mut App) -> bool {
+    return ((*a).info.caps & camera.CAP_RAW) != 0 as u32 && (*a).info.raw_w > 0
+}
+
+fn raw_frame_bytes(a: *mut App) -> usize {
+    return ((*a).info.raw_w as usize) * ((*a).info.raw_h as usize) * 2 + 4096
+}
+
+// RAW bursts only when at least 3 frames fit the budget (huge sensors fall back to JPEG)
+fn raw_burst_ok(a: *mut App) -> bool {
+    return has_raw(a) && raw_frame_bytes(a) * 3 <= BUDGET
+}
+
+fn has_man_sensor(a: *mut App) -> bool {
+    return ((*a).info.caps & camera.CAP_MANUAL_SENSOR) != 0 as u32 && (*a).info.iso_max > 0 && (*a).info.exp_max_ns > 0 as i64
+}
+
+fn has_man_focus(a: *mut App) -> bool {
+    return ((*a).info.caps & camera.CAP_MANUAL_FOCUS) != 0 as u32 && (*a).info.min_focus_d > 0.0f
+}
+
+fn mode_ok(a: *mut App, m: i32) -> bool {
+    if m == M_STACK { return has_man_focus(a) }
+    if m == M_VIDEO { return (*a).info.vid_w > 0 }
+    if m == M_RAW { return has_raw(a) }
+    return true
+}
+
+// visible modes in bar order; returns the count
+fn visible(a: *mut App, out: *mut [i32; 8]) -> i32 {
+    var n: i32 = 0
+    var m: i32 = 0
+    while m <= M_RAW {
+        if mode_ok(a, m) { (*out)[n as usize] = m; n = n + 1 }
+        m = m + 1
+    }
+    return n
+}
+
+fn man_ok(a: *mut App) -> bool {
+    return (has_man_sensor(a) || has_man_focus(a)) && ((*a).mode == M_PHOTO || (*a).mode == M_RAW)
+}
+
+// session kind for the current mode / lens
+fn want_kind(a: *mut App) -> i32 {
+    let m: i32 = (*a).mode
+    if m == M_RAW { if has_raw(a) { return camera.KIND_RAW } else { return camera.KIND_JPEG } }
+    if m == M_VIDEO { return camera.KIND_JPEG }
+    if (*a).manual && m == M_PHOTO { return camera.KIND_JPEG }
+    if raw_burst_ok(a) { return camera.KIND_RAW }
+    return camera.KIND_JPEG
+}
+
 fn open_lens(a: *mut App, idx: i32) {
     camera.camera_close()
     (*a).ready = false
     if !camera.camera_info(idx, &(*a).info) { set_status(a, "NO INFO"); return }
+    (*a).lens = idx
+    if !mode_ok(a, (*a).mode) { (*a).mode = M_PHOTO }
+    if !man_ok(a) { (*a).manual = false }
     let e: i32 = camera.camera_open(idx)
     if e != camera.E_OK { set_status(a, "OPEN FAILED"); return }
-    var kind: i32 = camera.KIND_JPEG
-    if (*a).raw_mode && ((*a).info.caps & camera.CAP_RAW) != 0 as u32 && (*a).info.raw_w > 0 {
-        kind = camera.KIND_RAW
-    } else {
-        (*a).raw_mode = false
-    }
-    let s: i32 = camera.camera_start(kind)
+    let s: i32 = camera.camera_start(want_kind(a))
     if s != camera.E_OK { set_status(a, "SESSION FAILED"); return }
     (*a).kind = camera.camera_kind()
-    (*a).lens = idx
     (*a).ready = true
+    apply_manual(a)
     set_status(a, "READY")
 }
 
@@ -151,24 +238,82 @@ fn stamp() -> i64 {
     return ts[0]
 }
 
-fn shoot(a: *mut App) {
+// ---------------------------------------------------------------- manual sliders
+fn man_iso(a: *mut App) -> i32 {
+    let lo: f64 = if (*a).info.iso_min > 0 { (*a).info.iso_min as f64 } else { 50.0 }
+    let hi: f64 = (*a).info.iso_max as f64
+    return (lo * math.powf(hi / lo, ((*a).sl[0] as f64) / 1000.0) + 0.5) as i32
+}
+
+fn man_exp(a: *mut App) -> i64 {
+    let lo: f64 = (*a).info.exp_min_ns as f64
+    var hi: f64 = (*a).info.exp_max_ns as f64
+    if hi > 500000000.0 { hi = 500000000.0 }
+    if lo <= 0.0 || hi <= lo { return (*a).info.exp_min_ns }
+    return (lo * math.powf(hi / lo, ((*a).sl[1] as f64) / 1000.0)) as i64
+}
+
+fn man_focus(a: *mut App) -> f32 {
+    return (*a).info.min_focus_d * ((*a).sl[2] as f32) / 1000.0f
+}
+
+fn apply_manual(a: *mut App) {
+    if !(*a).ready || !(*a).manual { return }
+    var e: i64 = 0
+    var iso: i32 = 0
+    var fd: f32 = 0.0f - 1.0f
+    if has_man_sensor(a) { e = man_exp(a); iso = man_iso(a) }
+    if has_man_focus(a) { fd = man_focus(a) }
+    camera.camera_set_manual(e, iso, fd)
+}
+
+// rows that exist: 0 ISO, 1 EXP, 2 FOCUS -> packed list; returns the count
+fn rows_of(a: *mut App, out: *mut [i32; 3]) -> i32 {
+    var n: i32 = 0
+    if has_man_sensor(a) { (*out)[0] = 0; (*out)[1] = 1; n = 2 }
+    if has_man_focus(a) { (*out)[n as usize] = 2; n = n + 1 }
+    return n
+}
+
+// ---------------------------------------------------------------- saving names
+fn name_into(dst: u64, prefix: str, ext: str) -> usize {
+    var o: usize = 0
+    var i: usize = 0
+    while i < prefix.n { *((dst + o as u64) as *mut u8) = *((prefix.p as u64 + i as u64) as *mut u8); o = o + 1; i = i + 1 }
+    o = o + put_int(dst + o as u64, stamp())
+    i = 0
+    while i < ext.n { *((dst + o as u64) as *mut u8) = *((ext.p as u64 + i as u64) as *mut u8); o = o + 1; i = i + 1 }
+    *((dst + o as u64) as *mut u8) = 0 as u8
+    return o
+}
+
+fn report(a: *mut App, r: i32, ok_txt: str, priv_txt: str) {
+    if r == 1 { set_status(a, ok_txt) } else if r == 2 { set_status(a, priv_txt) } else { set_status(a, "SAVE FAILED") }
+}
+
+// ---------------------------------------------------------------- plain single shot (RAW -> DNG, JPEG as the camera made it)
+fn shoot_plain(a: *mut App) {
     if !(*a).ready { return }
-    let cap: usize = if (*a).kind == camera.KIND_RAW { ((*a).info.raw_w as usize) * ((*a).info.raw_h as usize) * 2 + 4096 } else { 24 * 1024 * 1024 }
+    let cap: usize = if (*a).kind == camera.KIND_RAW { raw_frame_bytes(a) } else { 24 * 1024 * 1024 }
     let buf: u64 = camera.camera_alloc(cap)
     if buf == 0 { set_status(a, "NO MEMORY"); return }
-    var fi: camera.FrameInfo = camera.FrameInfo {
-        kind: 0, w: 0, h: 0, offset: 0, size: 0, timestamp: 0, exposure_ns: 0, iso: 0,
-        focus_cmd: 0.0f, focus_res: 0.0f, lens_state: 0, slot: 0, have_result: false,
+    var fi: camera.FrameInfo = camera.zero_frame()
+    var exp_l: [i64; 1] = [0 as i64; 1]
+    var foc_l: [f32; 1] = [0.0f; 1]
+    var ep: u64 = 0
+    var fp: u64 = 0
+    var iso: i32 = 0
+    if (*a).manual {
+        if has_man_sensor(a) { exp_l[0] = man_exp(a); iso = man_iso(a); ep = (&exp_l[0]) as u64 }
+        if has_man_focus(a) { foc_l[0] = man_focus(a); fp = (&foc_l[0]) as u64 }
     }
-    let n: i32 = camera.camera_capture(1, 0, 0, 0, buf, cap, &fi)
+    let n: i32 = camera.camera_capture(1, ep, fp, iso, buf, cap, &fi)
     if n < 1 {
         set_status(a, "CAPTURE FAILED")
         camera.camera_free(buf, cap)
         return
     }
     var name: [u8; 48] = [0 as u8; 48]
-    name[0] = 73 as u8; name[1] = 77 as u8; name[2] = 71 as u8; name[3] = 95 as u8
-    var len: usize = 4 + put_int((&name[0]) as u64 + 4, stamp())
     (*a).shots = (*a).shots + 1
     if fi.kind == camera.KIND_RAW {
         var m: meta.SensorMeta = meta.meta_default()
@@ -179,24 +324,178 @@ fn shoot(a: *mut App) {
         let dbuf: u64 = camera.camera_alloc(dcap)
         if dbuf == 0 { set_status(a, "NO MEMORY"); camera.camera_free(buf, cap); return }
         let dn: usize = dngwrite.dng_write(dbuf, dcap, buf + fi.offset as u64, fi.w as u32, fi.h as u32, &m, &ex)
-        let ext: str = ".dng"
-        var k: usize = 0
-        while k < 4 { name[len + k] = *((ext.p as u64 + k as u64) as *mut u8); k = k + 1 }
+        name_into((&name[0]) as u64, "IMG_", ".dng")
         let mime: str = "image/x-adobe-dng\0"
         let r: i32 = if dn > 0 { camera.camera_save(dbuf, dn, (&name[0]) as u64, mime.p as u64) } else { 0 }
         camera.camera_free(dbuf, dcap)
-        if r == 1 { set_status(a, "SAVED DNG") } else if r == 2 { set_status(a, "SAVED DNG PRIVATE") } else { set_status(a, "SAVE FAILED") }
+        report(a, r, "SAVED DNG", "SAVED DNG PRIVATE")
     } else if fi.kind == camera.KIND_JPEG {
-        let ext: str = ".jpg"
-        var k: usize = 0
-        while k < 4 { name[len + k] = *((ext.p as u64 + k as u64) as *mut u8); k = k + 1 }
+        name_into((&name[0]) as u64, "IMG_", ".jpg")
         let mime: str = "image/jpeg\0"
         let r: i32 = camera.camera_save(buf + fi.offset as u64, fi.size, (&name[0]) as u64, mime.p as u64)
-        if r == 1 { set_status(a, "SAVED JPG") } else if r == 2 { set_status(a, "SAVED JPG PRIVATE") } else { set_status(a, "SAVE FAILED") }
+        report(a, r, "SAVED JPG", "SAVED JPG PRIVATE")
     } else {
         set_status(a, "YUV NOT SAVED")
     }
     camera.camera_free(buf, cap)
+}
+
+// ---------------------------------------------------------------- processed shot: capture, then the job thread
+fn exif_orientation(deg: i32) -> i32 {
+    if deg == 90 { return 6 }
+    if deg == 180 { return 3 }
+    if deg == 270 { return 8 }
+    return 1
+}
+
+fn want_frames(a: *mut App, raw: bool, steps: *mut [f32; 16]) -> i32 {
+    let m: i32 = (*a).mode
+    if m == M_PHOTO { return if raw { 6 } else { 4 } }
+    if m == M_NIGHT { return if raw { 10 } else { 6 } }
+    if m == M_PORTRAIT { return 3 }
+    if m == M_DOC { return 2 }
+    // focus stack: steps from the lens' focus range
+    var mt: meta.SensorMeta = meta.meta_default()
+    camera.camera_meta(0 - 1, &mt)
+    return focus.plan_focus(&mt, 0.0f, (*a).info.min_focus_d, 8, &(*steps)[0])
+}
+
+fn start_job(a: *mut App) {
+    if !(*a).ready || (*a).busy { return }
+    let raw: bool = (*a).kind == camera.KIND_RAW
+    let ji: *mut camera.CamInfo = &(*a).info
+    let fb: usize = if raw { raw_frame_bytes(a) } else { (((*ji).jpeg_w as usize) * ((*ji).jpeg_h as usize) * 3) / 4 + 1048576 }
+    var steps: [f32; 16] = [0.0f; 16]
+    var n: i32 = want_frames(a, raw, &steps)
+    while n > 1 && (n as usize) * fb > BUDGET { n = n - 1 }
+    if (*a).mode == M_STACK && n < 2 { set_status(a, "NO FOCUS RANGE"); return }
+    let cap: usize = fb * (n as usize)
+    let buf: u64 = camera.camera_alloc(cap)
+    let fra: u64 = camera.camera_alloc(camera.sizeof_frame() * 16)
+    if buf == 0 || fra == 0 {
+        if buf != 0 { camera.camera_free(buf, cap) }
+        set_status(a, "NO MEMORY")
+        return
+    }
+    set_status(a, "CAPTURING")
+    var base: [u64; 2] = [buf, buf]
+    var first: i32 = 0           // frames in batch 0
+    var total: i32 = 0
+    let fs: usize = camera.sizeof_frame()
+    var fptr: *mut camera.FrameInfo = fra as *mut camera.FrameInfo
+    if (*a).mode == M_STACK {
+        let c: i32 = camera.camera_capture(n, 0, (&steps[0]) as u64, 0, buf, cap, fptr)
+        first = if c > 0 { c } else { 0 }
+        total = first
+    } else {
+        var bracket: bool = false
+        if (*a).mode == M_PHOTO && raw && has_man_sensor(a) && n >= 4 {
+            // learn the auto exposure from one frame, then shoot a bracket around it
+            let c1: i32 = camera.camera_capture(1, 0, 0, 0, buf, cap, fptr)
+            if c1 == 1 && (*fptr).exposure_ns > 0 as i64 && (*fptr).iso > 0 {
+                let used: usize = (*fptr).offset + (*fptr).size
+                let e0: f32 = (*fptr).exposure_ns as f32
+                var el: [i64; 16] = [0 as i64; 16]
+                var fac: [f32; 5] = [0.25f, 1.0f, 1.0f, 0.5f, 1.0f]
+                var i: i32 = 0
+                while i < n - 1 {
+                    var e: i64 = (e0 * fac[(i % 5) as usize]) as i64
+                    if e < (*ji).exp_min_ns { e = (*ji).exp_min_ns }
+                    if e > (*ji).exp_max_ns { e = (*ji).exp_max_ns }
+                    el[i as usize] = e
+                    i = i + 1
+                }
+                let c2: i32 = camera.camera_capture(n - 1, (&el[0]) as u64, 0, (*fptr).iso, buf + used as u64, cap - used,
+                                                   camera.frame_at(fptr, 1))
+                base[1] = buf + used as u64
+                first = 1
+                total = 1 + (if c2 > 0 { c2 } else { 0 })
+                bracket = true
+            } else if c1 == 1 {
+                first = 1
+                total = 1
+                bracket = true
+                // fall through: finish with a plain burst of the rest
+                let used: usize = (*fptr).offset + (*fptr).size
+                let c2: i32 = camera.camera_capture(n - 1, 0, 0, 0, buf + used as u64, cap - used, camera.frame_at(fptr, 1))
+                base[1] = buf + used as u64
+                total = 1 + (if c2 > 0 { c2 } else { 0 })
+            }
+        }
+        if !bracket {
+            let c: i32 = camera.camera_capture(n, 0, 0, 0, buf, cap, fptr)
+            first = if c > 0 { c } else { 0 }
+            total = first
+        }
+    }
+    if total < 1 {
+        set_status(a, "CAPTURE FAILED")
+        camera.camera_free(buf, cap)
+        camera.camera_free(fra, fs * 16)
+        return
+    }
+    camjob.job_free(&(*a).job)
+    (*a).job = camjob.job_new()
+    (*a).job.mode = (*a).mode
+    (*a).job.orientation = exif_orientation((*ji).orientation)
+    var mt: meta.SensorMeta = meta.meta_default()
+    camera.camera_meta((*fptr).slot, &mt)
+    (*a).job.meta = mt
+    var i: i32 = 0
+    while i < total {
+        let f: *mut camera.FrameInfo = camera.frame_at(fptr, i)
+        let b: u64 = if i < first { base[0] } else { base[1] }
+        var kind: i32 = camjob.SHOT_JPEG
+        if (*f).kind == camera.KIND_RAW { kind = camjob.SHOT_RAW }
+        if (*f).kind != camera.KIND_YUV {
+            camjob.job_add_shot(&(*a).job, kind, (*f).w, (*f).h, b + (*f).offset as u64, (*f).size, (*f).exposure_ns, (*f).iso)
+        }
+        i = i + 1
+    }
+    (*a).cbuf = buf
+    (*a).ccap = cap
+    (*a).fbuf = fra
+    (*a).busy = true
+    (*a).th = thread_start(JOB_KIND, (&(*a).job) as u64)
+    if (*a).th == 0 {
+        camjob.job_entry((&(*a).job) as u64)    // no thread: run here
+    }
+    set_status(a, "PROCESSING")
+}
+
+// UI side of a finished job: save, release, report
+fn poll_job(a: *mut App) {
+    if !(*a).busy || !camjob.job_finished(&(*a).job) { return }
+    if (*a).th != 0 { thread_wait((*a).th); (*a).th = 0 }
+    var name: [u8; 48] = [0 as u8; 48]
+    if (*a).job.ok {
+        name_into((&name[0]) as u64, "IMG_", ".jpg")
+        let mime: str = "image/jpeg\0"
+        let r: i32 = camera.camera_save((*a).job.out, (*a).job.out_n, (&name[0]) as u64, mime.p as u64)
+        if (*a).job.have_pdf {
+            var pn: [u8; 48] = [0 as u8; 48]
+            name_into((&pn[0]) as u64, "SCAN_", ".pdf")
+            let pm: str = "application/pdf\0"
+            camera.camera_save_doc(rt.buf_ptr(&(*a).job.pdf), rt.buf_len(&(*a).job.pdf), (&pn[0]) as u64, pm.p as u64)
+        }
+        (*a).shots = (*a).shots + 1
+        report(a, r, "SAVED", "SAVED PRIVATE")
+    } else {
+        set_status(a, "PROCESSING FAILED")
+    }
+    camjob.job_free(&(*a).job)
+    camera.camera_free((*a).cbuf, (*a).ccap)
+    camera.camera_free((*a).fbuf, camera.sizeof_frame() * 16)
+    (*a).cbuf = 0
+    (*a).fbuf = 0
+    (*a).busy = false
+}
+
+fn shoot(a: *mut App) {
+    if (*a).busy { return }
+    let m: i32 = (*a).mode
+    if m == M_RAW || ((*a).manual && m == M_PHOTO) { shoot_plain(a); return }
+    start_job(a)
 }
 
 fn toggle_video(a: *mut App) {
@@ -209,11 +508,7 @@ fn toggle_video(a: *mut App) {
         return
     }
     var name: [u8; 48] = [0 as u8; 48]
-    name[0] = 86 as u8; name[1] = 73 as u8; name[2] = 68 as u8; name[3] = 95 as u8
-    var len: usize = 4 + put_int((&name[0]) as u64 + 4, stamp())
-    let ext: str = ".mp4"
-    var k: usize = 0
-    while k < 4 { name[len + k] = *((ext.p as u64 + k as u64) as *mut u8); k = k + 1 }
+    name_into((&name[0]) as u64, "VID_", ".mp4")
     let r: i32 = camera.camera_video_start((&name[0]) as u64)
     if r == camera.E_OK {
         (*a).recording = true
@@ -224,41 +519,119 @@ fn toggle_video(a: *mut App) {
     }
 }
 
+// ---------------------------------------------------------------- drawing
 fn button(a: *mut App, x: i32, y: i32, w: i32, h: i32, bg: u32, label: str, sc: i32) {
     px_rect((*a).scr, (*a).w, (*a).h, x, y, w, h, bg)
     draw_text((*a).scr, (*a).w, (*a).h, x + (w - text_w(label, sc)) / 2, y + (h - 14 * sc) / 2, sc, 0xffffff, label)
 }
 
-// Bar geometry shared by drawing and hit test.
-fn bar_top(a: *mut App) -> i32 { return (*a).h - (*a).h / 6 }
+fn bar_top(a: *mut App) -> i32 { return (*a).h - (*a).h / 7 }
+
+fn msc(a: *mut App) -> i32 { return if (*a).w >= 900 { 2 } else { 1 } }
+
+fn mode_bar_h(a: *mut App) -> i32 { return 14 * msc(a) + 18 }
+
+fn row_h(a: *mut App) -> i32 { return 14 * msc(a) + 16 }
+
+fn mode_label(m: i32) -> str {
+    if m == M_PHOTO { return "PHOTO" }
+    if m == M_NIGHT { return "NIGHT" }
+    if m == M_PORTRAIT { return "PORTR" }
+    if m == M_DOC { return "DOC" }
+    if m == M_STACK { return "STACK" }
+    if m == M_VIDEO { return "VIDEO" }
+    return "RAW"
+}
+
+// top of the area above the button bar that the preview may use
+fn preview_bottom(a: *mut App) -> i32 {
+    var rows: [i32; 3] = [0; 3]
+    var h: i32 = bar_top(a) - mode_bar_h(a)
+    if (*a).manual { h = h - rows_of(a, &rows) * row_h(a) }
+    return h
+}
+
+fn buf_str(b: *mut [u8; 48], n: usize) -> str {
+    var s: str = ""
+    s.p = (&(*b)[0]) as u64 as *mut u8
+    s.n = n
+    return s
+}
+
+fn put_str(dst: u64, s: str) -> usize {
+    var i: usize = 0
+    while i < s.n { *((dst + i as u64) as *mut u8) = *((s.p as u64 + i as u64) as *mut u8); i = i + 1 }
+    return s.n
+}
+
+fn draw_sliders(a: *mut App, sc: i32) {
+    var rows: [i32; 3] = [0; 3]
+    let nr: i32 = rows_of(a, &rows)
+    let w: i32 = (*a).w
+    let rh: i32 = row_h(a)
+    var y: i32 = bar_top(a) - mode_bar_h(a) - nr * rh
+    var i: i32 = 0
+    while i < nr {
+        let r: i32 = rows[i as usize]
+        px_rect((*a).scr, w, (*a).h, 0, y, w, rh, 0x181818)
+        var line: [u8; 48] = [0 as u8; 48]
+        var ln: usize = 0
+        if r == 0 {
+            ln = put_str((&line[0]) as u64, "ISO ")
+            ln = ln + put_int((&line[0]) as u64 + ln as u64, man_iso(a) as i64)
+        } else if r == 1 {
+            ln = put_str((&line[0]) as u64, "EXP 1/")
+            let e: i64 = man_exp(a)
+            var d: i64 = 1000000000 / (if e > 0 { e } else { 1 })
+            if d < 1 { d = 1 }
+            ln = ln + put_int((&line[0]) as u64 + ln as u64, d)
+        } else {
+            ln = put_str((&line[0]) as u64, "FOCUS ")
+            let fd: f32 = man_focus(a)
+            if fd < 0.05f {
+                ln = ln + put_str((&line[0]) as u64 + ln as u64, "INF")
+            } else {
+                ln = ln + put_int((&line[0]) as u64 + ln as u64, (100.0f / fd) as i64)
+                ln = ln + put_str((&line[0]) as u64 + ln as u64, "CM")
+            }
+        }
+        draw_text((*a).scr, w, (*a).h, 8, y + 8, sc, 0xffd060, buf_str(&line, ln))
+        // track starts right of the label
+        let tx: i32 = 8 + 14 * 8 * sc
+        let tw: i32 = w - tx - 12
+        px_rect((*a).scr, w, (*a).h, tx, y + rh / 2 - 2, tw, 4, 0x606060)
+        let kx: i32 = tx + tw * (*a).sl[r as usize] / 1000
+        px_rect((*a).scr, w, (*a).h, kx - 5, y + 4, 10, rh - 8, 0xe0e0e0)
+        y = y + rh
+        i = i + 1
+    }
+}
 
 fn draw(a: *mut App, f: *mut window.Window) {
     let w: i32 = (*a).w
     let h: i32 = (*a).h
     px_rect((*a).scr, w, h, 0, 0, w, h, 0x101010)
     let bt: i32 = bar_top(a)
+    let pb: i32 = preview_bottom(a)
     if (*a).ready {
-        // newest preview frame, fit into w x (bt)
         var sw: i32 = 0
         var sh: i32 = 0
         camera.camera_stream_size(1, &sw, &sh)
-        var rot: i32 = (*a).info.orientation
-        if (*a).info.facing == 1 { rot = rot } 
+        let rot: i32 = (*a).info.orientation
         var dw: i32 = sw
         var dh: i32 = sh
         if rot == 90 || rot == 270 { dw = sh; dh = sw }
         if dw > 0 && dh > 0 {
             var tw: i32 = w
             var th: i32 = w * dh / dw
-            if th > bt { th = bt; tw = bt * dw / dh }
+            if th > pb { th = pb; tw = pb * dw / dh }
             if tw != (*a).pw || th != (*a).ph {
                 (*a).pw = tw
                 (*a).ph = th
             }
             camera.camera_preview_bgrx((*a).prev, tw, th, rot, (*a).info.facing == 0)
-            // copy preview into the screen buffer, centred
             let ox: i32 = (w - tw) / 2
-            let oy: i32 = (bt - th) / 2
+            let oy: i32 = (pb - th) / 2
             var y: i32 = 0
             while y < th {
                 var x: i32 = 0
@@ -270,59 +643,115 @@ fn draw(a: *mut App, f: *mut window.Window) {
             }
         }
     }
-    // status line
     let sc: i32 = if w >= 900 { 3 } else { 2 }
     draw_text((*a).scr, w, h, 12, 10, sc, 0xffffff, status_str(a))
-    // lens info line
     var line: [u8; 48] = [0 as u8; 48]
-    var ln: usize = 0
-    line[0] = 76 as u8; line[1] = 69 as u8; line[2] = 78 as u8; line[3] = 83 as u8; line[4] = 32 as u8
-    ln = 5
+    var ln: usize = put_str((&line[0]) as u64, "LENS ")
     ln = ln + put_int((&line[0]) as u64 + ln as u64, ((*a).lens + 1) as i64)
     line[ln] = 47 as u8; ln = ln + 1
     ln = ln + put_int((&line[0]) as u64 + ln as u64, (*a).nlens as i64)
     line[ln] = 32 as u8; ln = ln + 1
     ln = ln + put_int((&line[0]) as u64 + ln as u64, ((*a).info.equiv_mm + 0.5f) as i64)
-    line[ln] = 77 as u8; line[ln + 1] = 77 as u8; ln = ln + 2
-    var ls: str = ""
-    ls.p = (&line[0]) as u64 as *mut u8
-    ls.n = ln
-    draw_text((*a).scr, w, h, 12, 10 + 16 * sc, sc, 0xffd060, ls)
-    // buttons: LENS | RAW | SHOT
+    ln = ln + put_str((&line[0]) as u64 + ln as u64, "MM")
+    draw_text((*a).scr, w, h, 12, 10 + 16 * sc, sc, 0xffd060, buf_str(&line, ln))
+    if (*a).busy {
+        let p: i32 = camjob.job_progress(&(*a).job) as i32
+        px_rect((*a).scr, w, h, 12, 10 + 32 * sc, w - 24, 12, 0x404040)
+        px_rect((*a).scr, w, h, 12, 10 + 32 * sc, (w - 24) * p / 100, 12, 0x2a8a3a)
+    }
+    if (*a).manual && (*a).ready { draw_sliders(a, msc(a)) }
+    // mode bar: visible modes + MAN
+    var vis: [i32; 8] = [0; 8]
+    let nv: i32 = visible(a, &vis)
+    var cells: i32 = nv
+    if man_ok(a) { cells = cells + 1 }
+    let mh: i32 = mode_bar_h(a)
+    let my: i32 = bt - mh
+    let cw: i32 = if cells > 0 { w / cells } else { w }
+    var c: i32 = 0
+    while c < cells {
+        var label: str = "MAN"
+        var col: u32 = 0x202020
+        if c < nv {
+            label = mode_label(vis[c as usize])
+            if vis[c as usize] == (*a).mode { col = 0x2a5a8a }
+        } else if (*a).manual {
+            col = 0x2a8a3a
+        }
+        button(a, c * cw + 1, my, cw - 2, mh, col, label, msc(a))
+        c = c + 1
+    }
+    // buttons: LENS | SHOT / REC
     let by: i32 = bt + 10
     let bh: i32 = h - bt - 20
-    let bw: i32 = (w - 50) / 4
+    let bw: i32 = (w - 30) / 3
     button(a, 10, by, bw, bh, 0x304060, "LENS", sc)
-    var rawcol: u32 = 0x404040
-    if (*a).raw_mode { rawcol = 0x2a8a3a }
-    button(a, 20 + bw, by, bw, bh, rawcol, "RAW", sc)
-    var reccol: u32 = 0x604040
-    var reclabel: str = "REC"
-    if (*a).recording { reccol = 0xd01010; reclabel = "STOP" }
-    if (*a).info.vid_w > 0 { button(a, 30 + 2 * bw, by, bw, bh, reccol, reclabel, sc) }
-    button(a, 40 + 3 * bw, by, bw, bh, 0xb03030, "SHOT", sc)
+    var col2: u32 = 0xb03030
+    var lab2: str = "SHOT"
+    if (*a).mode == M_VIDEO {
+        lab2 = "REC"
+        if (*a).recording { col2 = 0xd01010; lab2 = "STOP" }
+    }
+    if (*a).busy { col2 = 0x505050; lab2 = "WAIT" }
+    button(a, 20 + bw, by, w - 30 - bw, bh, col2, lab2, sc)
     window.image(f, (*a).scr, w as usize, h as usize, 0, 0)
     window.present(f)
 }
 
-fn hit(a: *mut App, x: i32, y: i32) -> i32 {
+// hit codes: 1 LENS, 3 action, 20+i mode cell i, 40 MAN, 50+r slider row r (value in *val, 0..1000), 0 nothing
+fn hit(a: *mut App, x: i32, y: i32, val: *mut i32) -> i32 {
     let bt: i32 = bar_top(a)
-    if y < bt { return 0 }
-    let bw: i32 = ((*a).w - 50) / 4
-    if x < 10 + bw + 5 { return 1 }
-    if x < 20 + 2 * bw + 5 { return 2 }
-    if x < 30 + 3 * bw + 5 { return 4 }
-    return 3
+    if y >= bt {
+        if x < 10 + (((*a).w - 30) / 3) + 5 { return 1 }
+        return 3
+    }
+    let mh: i32 = mode_bar_h(a)
+    if y >= bt - mh {
+        var vis: [i32; 8] = [0; 8]
+        let nv: i32 = visible(a, &vis)
+        var cells: i32 = nv
+        if man_ok(a) { cells = cells + 1 }
+        if cells == 0 { return 0 }
+        let c: i32 = x * cells / (*a).w
+        if c < nv { return 20 + c }
+        return 40
+    }
+    if (*a).manual {
+        var rows: [i32; 3] = [0; 3]
+        let nr: i32 = rows_of(a, &rows)
+        let rh: i32 = row_h(a)
+        let top: i32 = bt - mh - nr * rh
+        if y >= top {
+            let i: i32 = (y - top) / rh
+            let tx: i32 = 8 + 14 * 8 * msc(a)
+            let tw: i32 = (*a).w - tx - 12
+            var v: i32 = (x - tx) * 1000 / tw
+            if v < 0 { v = 0 }
+            if v > 1000 { v = 1000 }
+            *val = v
+            return 50 + rows[i as usize]
+        }
+    }
+    return 0
 }
 
+fn set_slider(a: *mut App, row: i32, v: i32) {
+    (*a).sl[row as usize] = v
+    apply_manual(a)
+}
+
+#[allow_escape]
 fn main() -> i32 {
     var f: window.Window = window.window_new()
     if !window.open_window(&f, 0) || !window.make(&f, 480, 800) { return 1 }
+    window.full_input(&f, true)
     window.show_window(&f)
+    par.init(3)
     var a: App = App {
         w: window.width(&f) as i32, h: window.height(&f) as i32, scr: 0, prev: 0, pw: 0, ph: 0,
-        nlens: 0, lens: 0, raw_mode: false, kind: 0, ready: false, status: [0 as u8; 64],
-        info: camera.zero_info(), shots: 0, recording: false,
+        nlens: 0, lens: 0, mode: M_PHOTO, manual: false, sl: [500, 500, 0], drag: 0 - 1, kind: 0, ready: false,
+        status: [0 as u8; 64], info: camera.zero_info(), shots: 0, recording: false,
+        job: camjob.job_new(), busy: false, th: 0, cbuf: 0, ccap: 0, fbuf: 0, stamp0: 0,
     }
     a.scr = camera.camera_alloc((a.w * a.h * 4) as usize)
     a.prev = camera.camera_alloc((a.w * a.h * 4) as usize)
@@ -340,6 +769,7 @@ fn main() -> i32 {
                 camera.camera_request_permission()
             }
         }
+        poll_job(&a)
         window.wait_event(&f, 30)
         var k: u32 = window.next_event(&f)
         while k != window.EV_NONE {
@@ -357,16 +787,40 @@ fn main() -> i32 {
                     a.prev = camera.camera_alloc((nw * nh * 4) as usize)
                 }
             }
+            if k == window.EV_RELEASE { a.drag = 0 - 1 }
+            if k == window.EV_MOTION && a.drag >= 0 {
+                var v: i32 = 0
+                // re-use the hit test on the dragged row's track: keep y inside the row
+                let z: i32 = hit(&a, window.ev_x(&f) as i32, window.ev_y(&f) as i32, &v)
+                if z == 50 + a.drag { set_slider(&a, a.drag, v) }
+            }
             if k == window.EV_BUTTON && window.ev_a(&f) == window.BTN_LEFT {
-                let z: i32 = hit(&a, window.ev_x(&f) as i32, window.ev_y(&f) as i32)
-                if z == 1 && a.nlens > 0 && !a.recording { open_lens(&a, (a.lens + 1) % a.nlens) }
-                if z == 2 && a.nlens > 0 && !a.recording {
-                    a.raw_mode = !a.raw_mode
-                    open_lens(&a, a.lens)
-                    if !a.raw_mode { } 
+                var v: i32 = 0
+                let z: i32 = hit(&a, window.ev_x(&f) as i32, window.ev_y(&f) as i32, &v)
+                if z == 1 && a.nlens > 0 && !a.recording && !a.busy { open_lens(&a, (a.lens + 1) % a.nlens) }
+                if z == 3 && !a.busy {
+                    if a.mode == M_VIDEO { toggle_video(&a) } else if !a.recording { draw(&a, &f); shoot(&a) }
                 }
-                if z == 3 && !a.recording { shoot(&a) }
-                if z == 4 { toggle_video(&a) }
+                if z >= 20 && z < 40 && !a.recording && !a.busy {
+                    var vis: [i32; 8] = [0; 8]
+                    let nv: i32 = visible(&a, &vis)
+                    if z - 20 < nv {
+                        let nm: i32 = vis[(z - 20) as usize]
+                        if nm != a.mode {
+                            a.mode = nm
+                            if !man_ok(&a) { a.manual = false }
+                            open_lens(&a, a.lens)
+                        }
+                    }
+                }
+                if z == 40 && !a.recording && !a.busy {
+                    a.manual = !a.manual
+                    open_lens(&a, a.lens)
+                }
+                if z >= 50 && z < 60 {
+                    a.drag = z - 50
+                    set_slider(&a, z - 50, v)
+                }
             }
             k = window.next_event(&f)
         }
@@ -374,6 +828,7 @@ fn main() -> i32 {
     }
     if a.recording { let okv: bool = camera.camera_video_stop() }
     camera.camera_close()
+    par.shutdown()
     window.close_window(&f)
     return 0
 }
