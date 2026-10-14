@@ -2200,7 +2200,7 @@ else
     grep -E 'FAIL' "$WORK/toctou140.log" | head -12 | sed 's/^/   /' || true
 fi
 
-echo "== 141. WebGL2 context loss + restore in headless Chromium (WEBGL_lose_context; glweb_poll_context CTX_LOST / CTX_RESTORED; frame after restore byte equal to the frame before; rAF frame loop of glweb.js) (tools/gpu/web/run_loss.sh, docs/WEBGL2.md) =="
+echo "== 141. WebGL2 context loss + restore in headless Chromium (WEBGL_lose_context; glweb_poll_context CTX_LOST / CTX_RESTORED; frame after restore byte equal to the frame before; rAF frame loop of glweb.js) + browser gamepad smoke with a faked navigator.getGamepads (tools/gpu/web/run_loss.sh, docs/WEBGL2.md) =="
 # Chromium WebGL2 on SwiftShader only; missing chromium is SKIP. A real GPU reset, Firefox, Safari and mobile are UNTESTED. Frames are timer driven (virtual time never fires rAF).
 FIRNC="$FIRNC" bash tools/gpu/web/run_loss.sh > "$WORK/webglloss141.log" 2>&1 && F141RC=0 || F141RC=$?
 if [ "$F141RC" -eq 0 ]; then
