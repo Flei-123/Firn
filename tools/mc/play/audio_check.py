@@ -141,7 +141,7 @@ def main():
         # at least MIN_WIN long (the later event may then add to it: such an overlapped window only proves "not silent").
         overlap = (z - a) < int(MIN_WIN * rate)
         if overlap:
-            z = min(n, a + int(0.7 * rate))
+            z = min(n, a + int(MIN_WIN * rate))
         win = mono[a:z]
         wpeak = float(np.abs(win).max()) if len(win) else 0.0
         if wpeak < 200:
