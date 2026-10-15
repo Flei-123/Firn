@@ -56,3 +56,10 @@ Measured: input_pick ~2.0 us/call, player_tick ~170 us (256 chunks; linear `worl
   block's state count differs from the 1.20 data (other versions). Not modelled: the random xz offset of bamboo / pointed dripstone, honey / cobweb slowdown.
 * `tools/mc/shapes/run.sh` checks all 1709 table states voxel-exact (1/32), regenerates the table and diffs it, 15 mutation counter-checks. Test `tests/3510_mc_shapes_tab.fi`.
 * r225: tool components hash up to 32 rules with up to 16 block ids each (`TL_RULES` / `TL_IDS` in mc_inv); live set F of `tools/mc/play/run_hash.sh`.
+
+## s15: slowdown blocks + XZ block offsets (r227)
+- `Player.mv` (u8 per block state, `mc_shapes.move_fill`): soul sand / honey block (speed factor 0.4), honey (jump factor 0.5, wall slide), cobweb (stuck 0.25/0.05/0.25), sweet berry bush (stuck 0.8/0.75/0.8). Constants checked against the 26.1 server jar (javap); getSeed identical to 1.20.1.
+- The model has no horizontal inertia, so the speed factor is applied as the steady-state ratio `(1-0.546)/(1-0.546*0.4) = 0.581` (vanilla multiplies the velocity by 0.4 after each move; walking speed on soul sand is therefore 58 % of normal, not 40 %). Stuck: velocity zeroed, move = this tick's acceleration (ground 0.454*speed, air 0.0196 / 0.02548 sprinting) * multiplier; fall distance reset.
+- Honey wall slide (`HoneyBlock.isSlidingDown`): vy = -0.05 after the move, then gravity -> -0.1274 per tick. Not modelled: flying, powder snow, fall damage.
+- Bamboo (max 0.25) and pointed dripstone (max 0.125): shape code | `OFF_A` (0x8000) / `OFF_B` (0x4000); `mc_math.shape_box_at` adds the vanilla offset of the cell (`block_offset`, Mth.getSeed + float32 math).
+- Checks: `tools/mc/input/run.sh` (python reference, 12 `slow_*` scenes bit identical + 5 mutation counters), `tests/3530_mc_input_slowdown.fi`.
