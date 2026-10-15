@@ -47,7 +47,7 @@ export {
     inv_eff, inv_held_eff, inv_set_efficiency_id, inv_cursor_item, inv_cursor_count, inv_use_registry, inv_on_set_cursor_v,
     inv_click, inv_click_build, inv_drop_slot, inv_local_drop, inv_set_eff, inv_click_kind, inv_sig, inv_max_stack, inv_cursor_sig,
     inv_set_enchant_keys, inv_patch_of, inv_hash_off, inv_set_creative, inv_drag_begin, inv_drag_add, inv_drag_end,
-    INV_CAP, inv_on_open_window_v, inv_on_close_window_v, inv_close_window, inv_local_close, inv_window, inv_window_slots,
+    INV_CAP, inv_window_cols, inv_window_title, inv_on_open_window_v, inv_on_close_window_v, inv_close_window, inv_local_close, inv_window, inv_window_slots,
     inv_win_item, inv_win_count, inv_win_to_int, inv_int_to_win, inv_window_size,
 }
 
@@ -56,11 +56,12 @@ const CLICK_OUTSIDE: i32 = 0 - 999
 
 const INV_SLOTS: usize = 46
 // component hash patches of hashed stacks (1.21.5+): scratch of the stack being parsed and the table by stack signature
-const PS_LEN: usize = 48 // [0,8) added types, [8,16) added hashes, [16,24) removed types, [24,32) enchantment key hashes, [32,40) level hashes, 40 n_add, 41 n_rem, 42 n_ench, 43 enchantments seen, 44 pending enchantment id
+const PS_LEN: usize = 64 // 45 lore elements seen, 46 lore state (0 none, 1 collecting, 99 unhashable), [48,64) lore element hashes; [0,8) added types, [8,16) added hashes, [16,24) removed types, [24,32) enchantment key hashes, [32,40) level hashes, 40 n_add, 41 n_rem, 42 n_ench, 43 enchantments seen, 44 pending enchantment id
 const PT_CAP: usize = 64
 const PT_STRIDE: usize = 20 // [0] signature (0 = free), [1] n_add, [2,10) types, [10,18) hashes, [18] n_rem, [19] packed removed types (4 x 8 bit)
 const INV_CAP: usize = 100 // 46 player-window slots + up to 54 container slots
 const CONT0: i32 = 46
+const WIN_TITLE_CAP: usize = 64
 const INV_HOTBAR0: i32 = 36
 const INV_MAIN0: i32 = 9
 
@@ -96,13 +97,16 @@ struct Inv {
     pt_next: i32,
     ek: u64, // borrowed: u32 [ek_n], hash of the registry key string of every minecraft:enchantment entry (index = registry id)
     ek_n: i32,
+    win_cols: i32, // columns of the container grid: 9 (chest, shulker box), 3 (dispenser / dropper), 5 (hopper)
+    win_title: u64, // u8 [WIN_TITLE_CAP], plain text of the Open Window title
+    win_title_n: i32,
 }
 
 fn inv_new() -> Inv {
     var v: Inv = Inv { ids: rt.heap_alloc(INV_CAP * 4), counts: rt.heap_alloc(INV_CAP * 4), effs: rt.heap_alloc(INV_CAP * 4),
         sigs: rt.heap_alloc(INV_CAP * 4), maxs: rt.heap_alloc(INV_CAP * 4), cur_sig: 0, cur_max: 0,
         cur_id: 0 - 1, cur_count: 0, cur_eff: 0, eff_id: 0 - 1, reg: 0, state_id: 0, action: 1, n_updates: 0 as u32, n_srv: 0 as u32, hash_off: false, n_clicks: 0 as u32, bad: 0 as u32, qc_status: 0, qc_type: 0, qc_mask: 0 as u64, qc_hi: 0 as u64, win: 0, win_n: 0, creative: false,
-        pscr: rt.heap_alloc(PS_LEN * 4), ptab: rt.heap_alloc(PT_CAP * PT_STRIDE * 4), pt_next: 0, ek: 0, ek_n: 0 }
+        pscr: rt.heap_alloc(PS_LEN * 4), ptab: rt.heap_alloc(PT_CAP * PT_STRIDE * 4), pt_next: 0, ek: 0, ek_n: 0, win_cols: 9, win_title: rt.heap_alloc(WIN_TITLE_CAP), win_title_n: 0 }
     inv_clear(&v)
     var z: usize = 0
     while z < PT_CAP * PT_STRIDE { rt.st32(v.ptab, z, 0 as u32); z = z + 1 }
@@ -190,6 +194,13 @@ fn inv_clear(v: *mut Inv) {
 
 fn inv_window(v: *mut Inv) -> i32 { return (*v).win }
 fn inv_window_slots(v: *mut Inv) -> i32 { return (*v).win_n }
+fn inv_window_cols(v: *mut Inv) -> i32 { return (*v).win_cols }
+
+// plain text title of the open window (UTF-8 bytes at the returned pointer, length in *n; empty = none)
+fn inv_window_title(v: *mut Inv, n: *mut usize) -> u64 {
+    *n = (*v).win_title_n as usize
+    return (*v).win_title
+}
 
 // number of internal slots in play: 46 (player window) or 46 + container slots
 fn nint(v: *mut Inv) -> i32 {
@@ -258,6 +269,8 @@ fn clear_container(v: *mut Inv) {
 fn inv_local_close(v: *mut Inv) {
     (*v).win = 0
     (*v).win_n = 0
+    (*v).win_cols = 9
+    (*v).win_title_n = 0
     clear_container(v)
     (*v).qc_status = 0
     (*v).qc_mask = 0 as u64
@@ -265,10 +278,103 @@ fn inv_local_close(v: *mut Inv) {
 }
 
 // slot count of a menu type id (1.14+ registry): generic_9x1 .. generic_9x6 = 0..5, generic_3x3 = 6; others are not modelled (-1)
-fn menu_slots(typ: i32) -> i32 {
+fn menu_slots(typ: i32, protocol: i32) -> i32 {
     if typ >= 0 && typ <= 5 { return 9 * (typ + 1) }
     if typ == 6 { return 9 }
+    if typ == menu_hopper(protocol) { return 5 }
+    if typ == menu_shulker(protocol) { return 27 }
     return 0 - 1
+}
+
+// hopper / shulker_box menu type ids: crafter_3x3 (1.20.3, protocol 765) was inserted after generic_3x3
+fn menu_hopper(protocol: i32) -> i32 { if protocol >= 765 { return 16 } else { return 15 } }
+fn menu_shulker(protocol: i32) -> i32 { if protocol >= 765 { return 20 } else { return 19 } }
+
+fn menu_cols(typ: i32, protocol: i32) -> i32 {
+    if typ == 6 { return 3 }
+    if typ == menu_hopper(protocol) { return 5 }
+    return 9
+}
+
+fn title_set(v: *mut Inv, p: u64, n: usize) {
+    var k: usize = n
+    if k > WIN_TITLE_CAP { k = WIN_TITLE_CAP }
+    var i: usize = 0
+    while i < k { rt.st8((*v).win_title, i, rt.ld8(p, i)); i = i + 1 }
+    (*v).win_title_n = k as i32
+}
+
+// translation keys of the container titles the vanilla server sends
+fn title_translate(v: *mut Inv, p: u64, n: usize) {
+    if str_is(p, n, "container.chest") { title_set(v, "Chest".p as u64, "Chest".n) }
+    else if str_is(p, n, "container.chestDouble") { title_set(v, "Large Chest".p as u64, "Large Chest".n) }
+    else if str_is(p, n, "container.hopper") { title_set(v, "Item Hopper".p as u64, "Item Hopper".n) }
+    else if str_is(p, n, "container.dispenser") { title_set(v, "Dispenser".p as u64, "Dispenser".n) }
+    else if str_is(p, n, "container.dropper") { title_set(v, "Dropper".p as u64, "Dropper".n) }
+    else if str_is(p, n, "container.shulkerBox") { title_set(v, "Shulker Box".p as u64, "Shulker Box".n) }
+    else if str_is(p, n, "container.barrel") { title_set(v, "Barrel".p as u64, "Barrel".n) }
+    else if str_is(p, n, "container.enderchest") { title_set(v, "Ender Chest".p as u64, "Ender Chest".n) }
+    else { title_set(v, p, n) }
+}
+
+// the value of `"key":"` in a JSON text (0 = absent); *n = its length (up to the next unescaped quote)
+fn json_str_of(p: u64, n: usize, key: str, out_n: *mut usize) -> u64 {
+    var i: usize = 0
+    while i + key.n + 4 < n {
+        if rt.ld8(p, i) == 34 as u8 && line_is(p + ((i + 1) as u64), key.n, key) && rt.ld8(p, i + 1 + key.n) == 34 as u8 && rt.ld8(p, i + 2 + key.n) == 58 as u8 && rt.ld8(p, i + 3 + key.n) == 34 as u8 {
+            let st: usize = i + 4 + key.n
+            var e: usize = st
+            while e < n && rt.ld8(p, e) != 34 as u8 { if rt.ld8(p, e) == 92 as u8 { e = e + 1 }; e = e + 1 }
+            if e > n { e = n }
+            *out_n = e - st
+            return p + (st as u64)
+        }
+        i = i + 1
+    }
+    *out_n = 0
+    return 0
+}
+
+// title as JSON text (before 1.20.3): a plain JSON string, {"text":...} or {"translate":...}
+fn title_from_json(v: *mut Inv, p: u64, n: usize) {
+    (*v).win_title_n = 0
+    if n >= 2 && rt.ld8(p, 0) == 34 as u8 {
+        var e: usize = 1
+        while e < n && rt.ld8(p, e) != 34 as u8 { e = e + 1 }
+        title_set(v, p + 1 as u64, e - 1)
+        return
+    }
+    var tn: usize = 0
+    let tp: u64 = json_str_of(p, n, "translate", &tn)
+    if tp != 0 { title_translate(v, tp, tn); return }
+    let xp: u64 = json_str_of(p, n, "text", &tn)
+    if xp != 0 { title_set(v, xp, tn) }
+}
+
+// title as network NBT (1.20.3+): a string tag or a compound with `text` / `translate`
+fn title_from_nbt(v: *mut Inv, b: *mut bytes.Bytes) {
+    (*v).win_title_n = 0
+    var d: mc_nbt.Doc = mc_nbt.doc_new()
+    let ok: bool = mc_nbt.doc_parse(&d, b, true, false) catch false
+    if ok {
+        let root: u32 = mc_nbt.doc_root(&d)
+        var tn: usize = 0
+        if mc_nbt.nbt_kind(&d, root) == 8 as u8 {
+            let tp: u64 = mc_nbt.nbt_str(&d, root, &tn)
+            title_set(v, tp, tn)
+        } else if mc_nbt.nbt_kind(&d, root) == 10 as u8 {
+            let tr: u32 = named(&d, root, "translate")
+            let tx: u32 = named(&d, root, "text")
+            if tr != 0 as u32 && mc_nbt.nbt_kind(&d, tr) == 8 as u8 {
+                let tp2: u64 = mc_nbt.nbt_str(&d, tr, &tn)
+                title_translate(v, tp2, tn)
+            } else if tx != 0 as u32 && mc_nbt.nbt_kind(&d, tx) == 8 as u8 {
+                let tp3: u64 = mc_nbt.nbt_str(&d, tx, &tn)
+                title_set(v, tp3, tn)
+            }
+        }
+    }
+    mc_nbt.doc_free(&d)
 }
 
 fn str_is(p: u64, n: usize, lit: str) -> bool { return n == lit.n && line_is(p, n, lit) }
@@ -279,11 +385,20 @@ fn inv_on_open_window_v(v: *mut Inv, ver: *mut mc_version.Version, b: *mut bytes
     if inv_slot_format(protocol) == 0 { return false }
     var id: i32 = 0
     var n: i32 = 0 - 1
+    var cols: i32 = 9
     if protocol >= 477 {
         id = bytes.get_varint(b) catch (0 - 1)
         let typ: i32 = bytes.get_varint(b) catch (0 - 1)
         if id < 0 { (*v).bad = (*v).bad + 1 as u32; return false }
-        n = menu_slots(typ)
+        n = menu_slots(typ, protocol)
+        cols = menu_cols(typ, protocol)
+        if protocol >= 765 {
+            title_from_nbt(v, b)
+        } else {
+            var jn: usize = 0
+            let jp: u64 = bytes.get_string(b, &jn) catch 0
+            if jp != 0 { title_from_json(v, jp, jn) } else { (*v).win_title_n = 0 }
+        }
     } else {
         let id8: u8 = bytes.get_u8(b) catch (255 as u8)
         id = id8 as i32
@@ -297,6 +412,9 @@ fn inv_on_open_window_v(v: *mut Inv, ver: *mut mc_version.Version, b: *mut bytes
         || str_is(tp, tn, "minecraft:hopper") || str_is(tp, tn, "minecraft:dispenser") || str_is(tp, tn, "minecraft:dropper") {
             if (cnt as i32) > 0 && (cnt as i32) <= 54 { n = cnt as i32 }
         }
+        if str_is(tp, tn, "minecraft:hopper") { cols = 5 }
+        if str_is(tp, tn, "minecraft:dispenser") || str_is(tp, tn, "minecraft:dropper") { cols = 3 }
+        title_from_json(v, wp, wn)
     }
     if id == 0 { return false }
     clear_container(v)
@@ -305,6 +423,7 @@ fn inv_on_open_window_v(v: *mut Inv, ver: *mut mc_version.Version, b: *mut bytes
     (*v).qc_hi = 0 as u64
     (*v).win = id
     (*v).win_n = n
+    (*v).win_cols = cols
     return true
 }
 
@@ -543,15 +662,18 @@ fn fnv_bytes(h: u64, p: u64, n: usize) -> u64 {
 
 // ---- component hashes of the hashed stacks (1.21.5+) ------------------------------------------------------------------------
 // data component type ids (minecraft-data SlotComponentType) of the components we can hash; -1 = protocol without hashed stacks.
-// k: 0 max_stack_size, 1 max_damage, 2 damage, 3 unbreakable, 4 custom_name, 5 item_name, 6 rarity, 7 enchantments, 8 repair_cost, 9 enchantment_glint_override
+// k: 0 max_stack_size, 1 max_damage, 2 damage, 3 unbreakable, 4 custom_name, 5 item_name, 6 rarity, 7 enchantments, 8 repair_cost, 9 enchantment_glint_override,
+// 10 lore, 11 custom_data
 fn hc_type(protocol: i32, k: i32) -> i32 {
     if protocol == 770 || protocol == 772 {
         if k == 0 { return 1 } else if k == 1 { return 2 } else if k == 2 { return 3 } else if k == 3 { return 4 } else if k == 4 { return 5 }
-        else if k == 5 { return 6 } else if k == 6 { return 9 } else if k == 7 { return 10 } else if k == 8 { return 16 } else { return 18 }
+        else if k == 5 { return 6 } else if k == 6 { return 9 } else if k == 7 { return 10 } else if k == 8 { return 16 } else if k == 9 { return 18 }
+        else if k == 10 { return 8 } else { return 0 }
     }
     if protocol == 774 || protocol == 775 {
         if k == 0 { return 1 } else if k == 1 { return 2 } else if k == 2 { return 3 } else if k == 3 { return 4 } else if k == 4 { return 6 }
-        else if k == 5 { return 9 } else if k == 6 { return 12 } else if k == 7 { return 13 } else if k == 8 { return 19 } else { return 21 }
+        else if k == 5 { return 9 } else if k == 6 { return 12 } else if k == 7 { return 13 } else if k == 8 { return 19 } else if k == 9 { return 21 }
+        else if k == 10 { return 11 } else { return 0 }
     }
     return 0 - 1
 }
@@ -565,7 +687,7 @@ fn inv_set_enchant_keys(v: *mut Inv, keys: u64, n: i32) {
 
 fn ps_reset(v: *mut Inv) {
     var i: usize = 40
-    while i < 45 { rt.st32((*v).pscr, i, 0 as u32); i = i + 1 }
+    while i < 48 { rt.st32((*v).pscr, i, 0 as u32); i = i + 1 }
 }
 
 fn ps_n(v: *mut Inv, i: usize) -> i32 { return rt.ld32((*v).pscr, i) as i32 }
@@ -596,6 +718,108 @@ fn ps_ench(v: *mut Inv, id: i32, level: i32) {
     rt.st32((*v).pscr, 42, (n + 1) as u32)
 }
 
+// ---- NBT / text component hashing ---------------------------------------------------------------------------------------------
+// custom_data is a CompoundTag: the server converts it NbtOps -> HashOps, so every tag keeps its own type (byte, short, int, long, float, double,
+// string, list, compound = map). A text component (custom_name, item_name, lore lines) is encoded by the component codec straight into the
+// hashing ops, so its boolean style flags are real booleans (not bytes) and `extra` is a list of components.
+// The result is the hash in the low 32 bits; bit 32 set = not hashable (byte / int / long arrays, more than 64 entries).
+const NH_FAIL: u64 = 4294967296
+
+fn nh_key_is(p: u64, n: usize, lit: str) -> bool { return n == lit.n && line_is(p, n, lit) }
+
+fn nh_is_style_flag(p: u64, n: usize) -> bool {
+    return nh_key_is(p, n, "bold") || nh_key_is(p, n, "italic") || nh_key_is(p, n, "underlined") || nh_key_is(p, n, "strikethrough") || nh_key_is(p, n, "obfuscated")
+}
+
+fn nbt_hash(d: *mut mc_nbt.Doc, n: u32, text: bool, as_bool: bool) -> u64 {
+    let k: u8 = mc_nbt.nbt_kind(d, n)
+    if k == 1 as u8 {
+        if as_bool { return mc_hash.hash_bool(mc_nbt.nbt_i64(d, n) != 0) as u64 }
+        return mc_hash.hash_byte(mc_nbt.nbt_i64(d, n) as i32) as u64
+    }
+    if k == 2 as u8 { return mc_hash.hash_short(mc_nbt.nbt_i64(d, n) as i32) as u64 }
+    if k == 3 as u8 { return mc_hash.hash_int(mc_nbt.nbt_i64(d, n) as i32) as u64 }
+    if k == 4 as u8 { return mc_hash.hash_long(mc_nbt.nbt_i64(d, n)) as u64 }
+    if k == 5 as u8 { return mc_hash.hash_float(mc_nbt.nbt_f32(d, n)) as u64 }
+    if k == 6 as u8 { return mc_hash.hash_double(mc_nbt.nbt_f64(d, n)) as u64 }
+    if k == 8 as u8 {
+        var sn: usize = 0
+        let sp: u64 = mc_nbt.nbt_str(d, n, &sn)
+        return mc_hash.hash_string(sp, sn) as u64
+    }
+    if k == 9 as u8 || k == 10 as u8 {
+        let cnt: u32 = mc_nbt.nbt_count(d, n)
+        if cnt > 64 as u32 { return NH_FAIL }
+        let ks: u64 = rt.heap_alloc(256)
+        let vs: u64 = rt.heap_alloc(256)
+        var i: usize = 0
+        var failed: bool = false
+        var e: u32 = mc_nbt.nbt_first(d, n)
+        while e != 0 as u32 && i < 64 {
+            var hv: u64 = 0
+            if k == 10 as u8 {
+                var kn: usize = 0
+                let kp: u64 = mc_nbt.nbt_name(d, e, &kn)
+                rt.st32(ks, i, mc_hash.hash_string(kp, kn))
+                if text && nh_is_style_flag(kp, kn) { hv = nbt_hash(d, e, false, true) }
+                else if text && nh_key_is(kp, kn, "extra") { hv = nbt_hash(d, e, true, false) }
+                else { hv = nbt_hash(d, e, false, false) }
+            } else {
+                hv = nbt_hash(d, e, text, false)
+            }
+            if hv >= NH_FAIL { failed = true }
+            rt.st32(vs, i, (hv & 4294967295) as u32)
+            i = i + 1
+            e = mc_nbt.nbt_next(d, e)
+        }
+        var r: u64 = NH_FAIL
+        if !failed {
+            if k == 10 as u8 { r = mc_hash.hash_map(ks, vs, i) as u64 } else { r = mc_hash.hash_list(vs, i) as u64 }
+        }
+        rt.heap_free(ks, 256)
+        rt.heap_free(vs, 256)
+        return r
+    }
+    return NH_FAIL
+}
+
+// `hex:<network NBT>` (anonymous root: type byte, then the payload) -> hash; false = not hex / not parseable / not hashable
+fn hex_nbt_hash(protocol: i32, vp: u64, vn: usize, text: bool, out: *mut u32) -> bool {
+    if vn < 6 || !line_is(vp, 4, "hex:") || ((vn - 4) % 2) != 0 { return false }
+    let nb: usize = (vn - 4) / 2
+    if hex_byte(vp, 4) == 8 {
+        // a string root (a plain name): type 08, u16 length, the text; mc_nbt only parses compound roots
+        if nb < 3 { return false }
+        let ln: usize = ((hex_byte(vp, 6) << 8) | hex_byte(vp, 8)) as usize
+        if ln + 3 != nb { return false }
+        let sb: u64 = rt.heap_alloc(ln + 1)
+        var k: usize = 0
+        while k < ln { rt.st8(sb, k, hex_byte(vp, 10 + k * 2) as u8); k = k + 1 }
+        (*out) = mc_hash.hash_string(sb, ln)
+        rt.heap_free(sb, ln + 1)
+        return true
+    }
+    var bb: bytes.Bytes = bytes.bytes_new()
+    var i: usize = 0
+    while i < nb {
+        let x: i32 = hex_byte(vp, 4 + i * 2)
+        if x < 0 { bytes.bytes_free(&bb); return false }
+        bytes.put_u8(&bb, x as u8)
+        i = i + 1
+    }
+    bytes.bytes_set_pos(&bb, 0)
+    var d: mc_nbt.Doc = mc_nbt.doc_new()
+    let ok: bool = mc_nbt.doc_parse(&d, &bb, true, false) catch false
+    var good: bool = false
+    if ok {
+        let h: u64 = nbt_hash(&d, mc_nbt.doc_root(&d), text, false)
+        if h < NH_FAIL { (*out) = (h & 4294967295) as u32; good = true }
+    }
+    mc_nbt.doc_free(&d)
+    bytes.bytes_free(&bb)
+    return good
+}
+
 // simple component value `V` (the text of a `components[K].data=V` line) -> hash, by component type; false = type or value not supported
 fn hc_data(protocol: i32, ct: i32, vp: u64, vn: usize, out: *mut u32) -> bool {
     var okn: bool = false
@@ -620,17 +844,11 @@ fn hc_data(protocol: i32, ct: i32, vp: u64, vn: usize, out: *mut u32) -> bool {
         return true
     }
     if ct == hc_type(protocol, 4) || ct == hc_type(protocol, 5) {
-        // anonymous NBT `hex:08 LLLL text`: only a plain string name (a styled name is a compound and stays unhashed)
-        if vn < 12 || !line_is(vp, 4, "hex:") { return false }
-        if hex_byte(vp, 4) != 8 { return false }
-        let ln: i32 = (hex_byte(vp, 6) << 8) | hex_byte(vp, 8)
-        if ln < 0 || (ln as usize) * 2 + 10 != vn || ln > 200 { return false }
-        let sb: u64 = rt.heap_alloc(256)
-        var k: i32 = 0
-        while k < ln { rt.st8(sb, k as usize, hex_byte(vp, 10 + (k as usize) * 2) as u8); k = k + 1 }
-        (*out) = mc_hash.hash_string(sb, ln as usize)
-        rt.heap_free(sb, 256)
-        return true
+        // anonymous NBT text component: a plain string tag or a compound (styled name)
+        return hex_nbt_hash(protocol, vp, vn, true, out)
+    }
+    if ct == hc_type(protocol, 11) {
+        return hex_nbt_hash(protocol, vp, vn, false, out)
     }
     return false
 }
@@ -662,6 +880,7 @@ fn patch_register(v: *mut Inv, protocol: i32, sig: i32) {
         let n: i32 = ps_n(v, 42)
         ps_add(v, hc_type(protocol, 7), mc_hash.hash_map((*v).pscr + 96, (*v).pscr + 128, n as usize))
     }
+    if ps_n(v, 46) == 1 { ps_add(v, hc_type(protocol, 10), mc_hash.hash_list((*v).pscr + 192, ps_n(v, 45) as usize)) }
     var e: usize = PT_CAP
     var i: usize = 0
     while i < PT_CAP { if rt.ld32((*v).ptab, i * PT_STRIDE) == (sig as u32) { e = i }; i = i + 1 }
@@ -851,7 +1070,20 @@ fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *m
                         let rn: usize = fnn - r - 2
                         // hashed stacks (1.21.5+): the value of every component we can hash
                         if hc_type((*ver).protocol, 0) >= 0 && comp_type >= 0 {
-                            if rn == 4 && line_is(rp, 4, "data") {
+                            if comp_type == hc_type((*ver).protocol, 10) && rn == 4 && line_is(rp, 4, "data") && vn >= 2 && rt.ld8(vp, 0) == 35 as u8 {
+                                // lore: `data=#N`, then one `data[i]=hex:<text component>` line per element
+                                rt.st32((*v).pscr, 45, 0 as u32)
+                                var ln_ok: bool = false
+                                let nl: i32 = parse_dec(vp + 1 as u64, vn - 1, &ln_ok)
+                                if ln_ok && nl >= 0 && nl <= 16 { rt.st32((*v).pscr, 46, 1 as u32) } else { rt.st32((*v).pscr, 46, 99 as u32) }
+                            } else if comp_type == hc_type((*ver).protocol, 10) && rn > 6 && line_is(rp, 5, "data[") {
+                                var lh: u32 = 0 as u32
+                                let li: i32 = ps_n(v, 45)
+                                if ps_n(v, 46) == 1 && li < 16 && hex_nbt_hash((*ver).protocol, vp, vn, true, &lh) {
+                                    rt.st32((*v).pscr, 48 + li as usize, lh)
+                                    rt.st32((*v).pscr, 45, (li + 1) as u32)
+                                } else { rt.st32((*v).pscr, 46, 99 as u32) }
+                            } else if rn == 4 && line_is(rp, 4, "data") {
                                 var hv: u32 = 0 as u32
                                 if hc_data((*ver).protocol, comp_type, vp, vn, &hv) { ps_add(v, comp_type, hv) }
                             } else if comp_type == hc_type((*ver).protocol, 7) && rn > 19 && line_is(rp, 19, "data.enchantments[") {

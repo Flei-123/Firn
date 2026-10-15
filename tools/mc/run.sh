@@ -76,5 +76,11 @@ if [ -z "$ONLY" ] || [ "$ONLY" = hashplay ]; then
     bash tools/mc/play/run_hash.sh 1.21.5 || ERR=$((ERR+1))
     bash tools/mc/play/run_hash.sh 1.21.8 || ERR=$((ERR+1))
 fi
+# container windows: title, hopper / dispenser layout, sneak + right click places the block (1.20.1 Entity Action, 1.21.4 Player Input)
+if [ -z "$ONLY" ] || [ "$ONLY" = contplay ]; then
+    echo "== mc/contplay =="
+    bash tools/mc/play/run_cont.sh 1.20.1 || ERR=$((ERR+1))
+    bash tools/mc/play/run_cont.sh 1.21.4 || ERR=$((ERR+1))
+fi
 if [ $ERR -eq 0 ]; then echo "RESULT mc: ok"; else echo "RESULT mc: $ERR failing parts"; fi
 exit $ERR
