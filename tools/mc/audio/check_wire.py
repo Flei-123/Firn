@@ -71,7 +71,7 @@ def main():
                         errs.append("#%d %s offset %s != %s" % (i, nm, got, (dx * 8, dy * 8, dz * 8)))
             else:
                 n_reg += 1
-                s = d["sound"]
+                s = d["sound"] if "sound" in d else d  # <= 1.18.2: soundId sits directly in the packet (no holder)
                 if int(kv["id"]) != s["soundId"]:
                     errs.append("#%d id %s != nmp %s" % (i, kv["id"], s["soundId"]))
                 cat = CATS.index(d["soundCategory"]) if isinstance(d["soundCategory"], str) else d["soundCategory"]
