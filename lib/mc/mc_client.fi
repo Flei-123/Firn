@@ -38,7 +38,7 @@ export {
     client_login_online, client_error_text, client_detail, client_kick_text,
     CL_NO_ACCOUNT, CL_BAD_ENCRYPTION_REQUEST, CL_RSA, CL_SESSION, CL_SECRET, CL_ENC_REJECTED,
     client_new, client_free, client_handshake, client_send, client_login_offline, client_next,
-    client_enchant_efficiency, client_is, client_auto_reply, client_set_pos_reply, client_send_settings, client_body, client_position, client_send_values,
+    client_enchant_efficiency, client_is, client_auto_reply, client_set_pos_reply, client_send_settings, client_body, client_position, client_position_look, client_position_delta, client_note_pos, client_send_values,
     CL_OK, CL_TIMEOUT, CL_CLOSED, CL_BROKEN, CL_TOO_BIG, CL_BAD_PACKET, CL_KICKED,
     CL_ONLINE_MODE, CL_UNEXPECTED, CL_SEND,
 }
@@ -69,9 +69,15 @@ struct Client {
     keepalives: u64,
     detail: i64, // number behind the last CL_RSA / CL_SESSION failure (never a token value)
     pos_set: bool, // a Synchronize Player Position packet was seen
-    pos_x: f64, // the LAST server position (absolute value of that packet), see client_position
+    pos_x: f64, // the player position as the client knows it: the LAST server position (relative flags resolved), see client_position / client_note_pos
     pos_y: f64,
     pos_z: f64,
+    pos_yaw: f32, // same for the look angles (degrees)
+    pos_pitch: f32,
+    pos_flags: i32, // relative flags of the LAST position packet as sent (bit 0 x, 1 y, 2 z, 3 yaw, 4 pitch; 1.21.2+: 5-7 delta x / y / z, 8 rotate delta)
+    pos_dx: f64, // 1.21.2+: the delta movement field of the last packet as sent (0 before); relative when pos_flags bit 5 / 6 / 7 is set
+    pos_dy: f64,
+    pos_dz: f64,
     enchant_eff: i32, // registry id of minecraft:efficiency from the Registry Data (1.21+), -1 = not seen
     pos_reply: bool, // client_auto_reply answers Synchronize Player Position with a position packet too (default); false = Teleport Confirm only (r197)
 }
@@ -92,17 +98,56 @@ fn account_new(token: str, session: *mut mc_auth.SessionClient) -> OnlineAccount
 fn client_new(conn: net.Conn, ver: mc_version.Version) -> Client {
     return Client { w: mc_codec.wire_open(conn), ver: ver, state: mc_version.ST_HANDSHAKE,
         body: bytes.bytes_new(), teleports: 0, keepalives: 0, detail: 0,
-        pos_set: false, pos_x: 0.0, pos_y: 0.0, pos_z: 0.0, enchant_eff: 0 - 1, pos_reply: true }
+        pos_set: false, pos_x: 0.0, pos_y: 0.0, pos_z: 0.0, pos_yaw: 0.0f, pos_pitch: 0.0f,
+        pos_flags: 0, pos_dx: 0.0, pos_dy: 0.0, pos_dz: 0.0, enchant_eff: 0 - 1, pos_reply: true }
 }
 
-// The last position the server sent (Synchronize Player Position, absolute x / y / z as sent; the relative-flag
-// variants of 1.8+ are not applied). false until the first such packet arrived.
+// The last position the server sent (Synchronize Player Position) as an ABSOLUTE position: the relative flags are resolved against the
+// position the client knew before (client_note_pos, else the previous server position). false until the first such packet arrived.
 fn client_position(c: *mut Client, x: *mut f64, y: *mut f64, z: *mut f64) -> bool {
     if !(*c).pos_set { return false }
     *x = (*c).pos_x
     *y = (*c).pos_y
     *z = (*c).pos_z
     return true
+}
+
+// Look angles of the same position (degrees, relative flags resolved).
+fn client_position_look(c: *mut Client, yaw: *mut f32, pitch: *mut f32) -> bool {
+    if !(*c).pos_set { return false }
+    *yaw = (*c).pos_yaw
+    *pitch = (*c).pos_pitch
+    return true
+}
+
+// Relative flags of the last position packet as the server sent them and its delta movement (1.21.2+, else 0); `has` bit 5 / 6 / 7 of the flags
+// means the delta is added to the app's own velocity, not replacing it.
+fn client_position_delta(c: *mut Client, flags: *mut i32, dx: *mut f64, dy: *mut f64, dz: *mut f64) {
+    *flags = (*c).pos_flags
+    *dx = (*c).pos_dx
+    *dy = (*c).pos_dy
+    *dz = (*c).pos_dz
+}
+
+// An app with its own movement (mcplay) tells the client where the player is NOW (call it every game tick before the packets are read):
+// the base a relative Synchronize Player Position is resolved against. Does not touch pos_set / the teleport count.
+fn client_note_pos(c: *mut Client, x: f64, y: f64, z: f64, yaw: f64, pitch: f64) {
+    (*c).pos_x = x
+    (*c).pos_y = y
+    (*c).pos_z = z
+    (*c).pos_yaw = yaw as f32
+    (*c).pos_pitch = pitch as f32
+}
+
+// Resolves the value of a position packet: relative (flag bit set) = old + sent, else the sent value.
+fn rel_f64(flags: i32, bit: i32, old: f64, sent: f64) -> f64 {
+    if (flags & (1 << bit)) != 0 { return old + sent }
+    return sent
+}
+
+fn rel_f32(flags: i32, bit: i32, old: f32, sent: f32) -> f32 {
+    if (flags & (1 << bit)) != 0 { return old + sent }
+    return sent
 }
 
 // The enchantment registry id of "minecraft:efficiency" (1.21+: the id in the enchantments item component is the index in the
@@ -603,6 +648,24 @@ fn field_f32(c: *mut Client, id: i32, name: u64, n: usize, out: *mut f32) -> boo
     return true
 }
 
+// A flags field of 1 octet (i8, <= 1.21.1) or 4 octets (i32 bit set, 1.21.2+); false if the packet has none.
+fn field_flags(c: *mut Client, id: i32, out: *mut i32) -> bool {
+    let sch: u64 = (*c).ver.schema_of(mc_version.ST_PLAY, mc_version.DIR_S2C, id)
+    var off: usize = 0
+    var len: usize = 0
+    if sch == 0 || !mc_schema.field_range(sch, "flags".p as u64, 5, &(*c).body, &off, &len) { return false }
+    var v: bytes.Bytes = bytes.Bytes { data: bytes.bytes_ptr(&(*c).body) + off as u64, cap: len, len: len, pos: 0, bad: false }
+    if len == 1 {
+        *out = (bytes.get_u8(&v) catch 0 as u8) as i32
+        return true
+    }
+    if len == 4 {
+        *out = bytes.get_i32(&v) catch 0
+        return true
+    }
+    return false
+}
+
 // r197: the vanilla server compares a move packet with the position it had at the START of its tick. A position packet that follows the
 // Teleport Confirm within the same server tick (a local client answers within a millisecond) is refused as "moved too quickly", the server
 // teleports the player again, the client answers at once again ... (25 rounds in one tick under load). An app with its own tick loop
@@ -633,6 +696,20 @@ fn client_auto_reply(c: *mut Client, id: i32) -> bool {
         field_f64(c, id, "z".p as u64, 1, &z)
         field_f32(c, id, "yaw".p as u64, 3, &yaw)
         field_f32(c, id, "pitch".p as u64, 5, &pitch)
+        var flags: i32 = 0
+        var sdx: f64 = 0.0
+        var sdy: f64 = 0.0
+        var sdz: f64 = 0.0
+        field_flags(c, id, &flags)
+        field_f64(c, id, "dx".p as u64, 2, &sdx)
+        field_f64(c, id, "dy".p as u64, 2, &sdy)
+        field_f64(c, id, "dz".p as u64, 2, &sdz)
+        // relative flags (teleport command with ~, Essentials-style nudges, vehicles ...): the packet carries OFFSETS for the flagged axes
+        x = rel_f64(flags, 0, (*c).pos_x, x)
+        y = rel_f64(flags, 1, (*c).pos_y, y)
+        z = rel_f64(flags, 2, (*c).pos_z, z)
+        yaw = rel_f32(flags, 3, (*c).pos_yaw, yaw)
+        pitch = rel_f32(flags, 4, (*c).pos_pitch, pitch)
         if has_tid && pid(c, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM) >= 0 {
             // schema driven writer (mc_encode)
             var tv: rt.Buf = rt.buf_new()
@@ -656,6 +733,12 @@ fn client_auto_reply(c: *mut Client, id: i32) -> bool {
         (*c).pos_x = x
         (*c).pos_y = y
         (*c).pos_z = z
+        (*c).pos_yaw = yaw
+        (*c).pos_pitch = pitch
+        (*c).pos_flags = flags
+        (*c).pos_dx = sdx
+        (*c).pos_dy = sdy
+        (*c).pos_dz = sdz
         return true
     }
     if mc_version.version_has(&(*c).ver, mc_version.FLAG_CHUNK_BATCHES) && client_is(c, id, mc_sem.SEM_PLAY_S2C_CHUNK_BATCH_FINISHED) {
