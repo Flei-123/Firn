@@ -1,0 +1,113 @@
+// expect_exit: 0
+// tests/2968_photo_look.fi -- FirnCam normal photo look: a dark room with blown white lights, RAW16 with black level and
+// white balance gains. The picture must stay dark (the median is not lifted to grey), blown lights must come out
+// neutral (no pink / green from the gains), and the working size must follow max_px exactly (a 12 MP RAW keeps its
+// 2048 x 1536 half resolution instead of falling to 1024 x 768 by an integer box factor).
+import std.io
+import std.rt
+import jpeg.jpeg
+import photo.image
+import photo.meta
+import photo.par
+import photo.camjob
+
+fn check(c: bool, msg: str) -> bool {
+    if !c { io.print(msg); io.new_line() }
+    return c
+}
+
+// RGGB mosaic (10 bit, black 64, white 1023) of a dark wall (linear 0.02) with white cards (radiance 5, blown)
+fn make_raw(w: i32, h: i32, dx: i32) -> u64 {
+    let p: u64 = rt.heap_alloc(((w * h) as usize) * 2)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            var v: f32 = 0.02f
+            if x >= 40 + dx && x < 80 + dx && y >= 30 && y < 80 { v = 5.0f }
+            var gain: f32 = 1.0f
+            if (y & 1) == 0 && (x & 1) == 0 { gain = 1.9f }
+            if (y & 1) == 1 && (x & 1) == 1 { gain = 1.7f }
+            var s: f32 = v / gain
+            if s > 1.0f { s = 1.0f }
+            *((p + (((y * w + x) * 2) as u64)) as *mut u16) = (64.0f + s * 959.0f) as u16
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return p
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var ok: bool = true
+    par.init(3)
+    // ---- the size rule
+    var nw: i32 = 0
+    var nh: i32 = 0
+    camjob.fit_size(2048, 1536, 3300000, &nw, &nh)
+    ok = check(nw == 2048 && nh == 1536, "12 MP RAW half size must stay") && ok
+    camjob.fit_size(4096, 3072, 3300000, &nw, &nh)
+    ok = check((nw as i64) * (nh as i64) <= 3300000 && (nw as i64) * (nh as i64) > 3000000, "fit uses the budget") && ok
+    ok = check(nw * 3 == nh * 4 || nw * 3 == nh * 4 + 3 || nw * 3 + 3 == nh * 4 || (nw * 3 - nh * 4 < 8 && nh * 4 - nw * 3 < 8), "fit keeps the aspect") && ok
+    camjob.fit_size(100, 80, 1000000, &nw, &nh)
+    ok = check(nw == 100 && nh == 80, "small image unchanged") && ok
+    // ---- resample keeps the mean
+    var g: image.Image = image.img_new(64, 48, 3)
+    image.img_fill(&g, 0.25f)
+    let r: image.Image = camjob.resample_img(g, 37, 29)
+    ok = check(r.w == 37 && r.h == 29, "resample size") && ok
+    var rr: image.Image = r
+    let mn: f32 = image.img_mean(&rr, 1)
+    ok = check(mn > 0.249f && mn < 0.251f, "resample mean") && ok
+    image.img_free(&rr)
+
+    // ---- the job: dark room, blown lights
+    let W: i32 = 160
+    let H: i32 = 120
+    var j: camjob.Job = camjob.job_new()
+    j.mode = camjob.MODE_PHOTO
+    var k: usize = 0
+    while k < 4 { meta.meta_set_black(&j.meta, k, 64.0f, 1023.0f); k = k + 1 }
+    meta.meta_set_wb(&j.meta, 0, 1.9f)
+    meta.meta_set_wb(&j.meta, 1, 1.0f)
+    meta.meta_set_wb(&j.meta, 2, 1.0f)
+    meta.meta_set_wb(&j.meta, 3, 1.7f)
+    var f: i32 = 0
+    while f < 3 {
+        camjob.job_add_shot(&j, camjob.SHOT_RAW, W, H, make_raw(W, H, f * 2), ((W * H) as usize) * 2, 10000000, 400)
+        f = f + 1
+    }
+    ok = check(camjob.run_job(&j), "job") && ok
+    var dj: jpeg.JpegImage = jpeg.jpeg_image_new()
+    let dok: bool = jpeg.jpeg_decode(j.out, j.out_n, &dj) catch false
+    ok = check(dok, "decode") && ok
+    if dok {
+        let ow: i32 = dj.w as i32
+        let oh: i32 = dj.h as i32
+        ok = check(ow == 80 && oh == 60, "half size output") && ok
+        var im: image.Image = image.img_from_rgba8(rt.buf_ptr(&dj.px), ow, oh)
+        // wall pixel (top left region) and card pixel (the card is at x 40..80, y 30..80 of the mosaic -> 20..40, 15..40)
+        let wr: f32 = image.img_get(&im, 0, 5, 5)
+        let wg: f32 = image.img_get(&im, 1, 5, 5)
+        let wl: f32 = 0.2126f * wr + 0.7152f * wg + 0.0722f * image.img_get(&im, 2, 5, 5)
+        let cr: f32 = image.img_get(&im, 0, 30, 27)
+        let cg: f32 = image.img_get(&im, 1, 30, 27)
+        let cb: f32 = image.img_get(&im, 2, 30, 27)
+        ok = check(wl < 0.30f, "the dark wall must stay dark (not lifted to grey)") && ok
+        ok = check(wl > 0.08f, "the wall is not crushed") && ok
+        ok = check(cg > 0.80f, "the lights stay bright") && ok
+        var d1: f32 = cr - cg
+        if d1 < 0.0f { d1 = 0.0f - d1 }
+        var d2: f32 = cb - cg
+        if d2 < 0.0f { d2 = 0.0f - d2 }
+        ok = check(d1 < 0.06f && d2 < 0.06f, "blown lights must be neutral (no pink / green)") && ok
+        image.img_free(&im)
+    }
+    jpeg.jpeg_image_free(&dj)
+    camjob.job_free(&j)
+    par.shutdown()
+    if ok { io.print("ok") } else { io.print("FAIL") }
+    if ok { return 0 }
+    return 1
+}

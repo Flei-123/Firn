@@ -15,8 +15,11 @@
 // segmentation + bokeh), DOC (page scan + PDF), STACK (focus stack). Fed with RAW16 the work is done in linear
 // light at HALF resolution (one RGGB quad -> one RGB pixel, so 12 MP RAW = 3 MP float); fed with JPEG (the
 // fallback when a device has no RAW / burst) the pictures are decoded, linearised and the same chain runs
-// with the noise measured from the pixels. `max_px` bounds the working size (box downscale, default 3 MP):
-// a burst of 8 then needs ~300 MB instead of > 1 GB. Progress is a plain counter the UI polls.
+// with the noise measured from the pixels. `max_px` bounds the working size (area resample to EXACTLY the size
+// that fits, default 3.3 MP so a 12 MP RAW stays at its half resolution 2048 x 1536 / 2000 x 1500; an integer
+// box factor would have jumped from 3.15 MP to 0.79 MP = 1024 x 768): a burst of 8 then needs ~400 MB.
+// RAW highlights are neutralised per frame BEFORE the merge / white balance (`neutralise_clipped`): a channel
+// at the sensor limit is not scaled up by its white balance gain (that made clipped lights pink / green). Progress is a plain counter the UI polls.
 import std.rt
 import jpeg.jpeg
 import photo.image
@@ -33,7 +36,7 @@ import photo.jpegenc
 export {
     Shot, Job, job_new, job_add_shot, job_free, job_entry, run_job, job_progress, job_finished,
     MODE_PHOTO, MODE_NIGHT, MODE_PORTRAIT, MODE_DOC, MODE_STACK, SHOT_RAW, SHOT_JPEG, MAX_SHOTS,
-    shrink_factor, raw_half,
+    shrink_factor, fit_size, resample_img, neutralise_clipped, raw_half,
 }
 
 const MODE_PHOTO: i32 = 0
@@ -79,7 +82,7 @@ fn job_new() -> Job {
     return Job {
         mode: 0, n: 0,
         shots: [Shot { kind: 0, w: 0, h: 0, ptr: 0, size: 0, exp_ns: 0, iso: 0 }; 16],
-        meta: meta.meta_default(), max_px: 3000000, quality: 92, orientation: 1,
+        meta: meta.meta_default(), max_px: 3300000, quality: 92, orientation: 1,
         out: 0, out_cap: 0, out_n: 0, out_w: 0, out_h: 0, pdf: rt.buf_new(), have_pdf: false,
         progress: 0, done: 0, ok: false,
     }
@@ -115,6 +118,130 @@ fn shrink_factor(w: i32, h: i32, max_px: i32) -> i32 {
     var f: i32 = 1
     while ((w / f) as i64) * ((h / f) as i64) > (max_px as i64) { f = f + 1 }
     return f
+}
+
+// target size of an image w x h that has to fit max_px, same aspect, both sides >= 1 (no change when it fits)
+fn fit_size(w: i32, h: i32, max_px: i32, ow: *mut i32, oh: *mut i32) {
+    *ow = w
+    *oh = h
+    if max_px <= 0 || (w as i64) * (h as i64) <= (max_px as i64) { return }
+    let k: f32 = image.sqrtf((max_px as f32) / ((w as f32) * (h as f32)))
+    var nw: i32 = ((w as f32) * k) as i32
+    var nh: i32 = ((h as f32) * k) as i32
+    while nw > 1 && (nw as i64) * (nh as i64) > (max_px as i64) { nw = nw - 1 }
+    if nw < 1 { nw = 1 }
+    if nh < 1 { nh = 1 }
+    *ow = nw
+    *oh = nh
+}
+
+// separable area-average resample (exact coverage weights, so the downscale neither aliases nor blurs more than
+// the box it needs) of one plane `sp` (w x h) into `dp` (nw x nh)
+fn resample_plane(sp: u64, w: i32, h: i32, dp: u64, nw: i32, nh: i32) {
+    let tmp: u64 = rt.heap_alloc(((nw * h) as usize) * 4)
+    let sx: f32 = (w as f32) / (nw as f32)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < nw {
+            let a: f32 = (x as f32) * sx
+            let b: f32 = a + sx
+            var i0: i32 = a as i32
+            var i1: i32 = b as i32
+            if i1 >= w { i1 = w - 1 }
+            var acc: f32 = 0.0f
+            var i: i32 = i0
+            while i <= i1 {
+                var lo: f32 = i as f32
+                var hi: f32 = lo + 1.0f
+                if lo < a { lo = a }
+                if hi > b { hi = b }
+                if hi > lo { acc = acc + *((sp + (((y * w + i) * 4) as u64)) as *mut f32) * (hi - lo) }
+                i = i + 1
+            }
+            *((tmp + (((y * nw + x) * 4) as u64)) as *mut f32) = acc / sx
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let sy: f32 = (h as f32) / (nh as f32)
+    var yy: i32 = 0
+    while yy < nh {
+        let a: f32 = (yy as f32) * sy
+        let b: f32 = a + sy
+        var i0: i32 = a as i32
+        var i1: i32 = b as i32
+        if i1 >= h { i1 = h - 1 }
+        var x2: i32 = 0
+        while x2 < nw {
+            var acc: f32 = 0.0f
+            var i: i32 = i0
+            while i <= i1 {
+                var lo: f32 = i as f32
+                var hi: f32 = lo + 1.0f
+                if lo < a { lo = a }
+                if hi > b { hi = b }
+                if hi > lo { acc = acc + *((tmp + (((i * nw + x2) * 4) as u64)) as *mut f32) * (hi - lo) }
+                i = i + 1
+            }
+            *((dp + (((yy * nw + x2) * 4) as u64)) as *mut f32) = acc / sy
+            x2 = x2 + 1
+        }
+        yy = yy + 1
+    }
+    rt.heap_free(tmp, ((nw * h) as usize) * 4)
+}
+
+// the image resampled to nw x nh (consumed); same size -> the input
+fn resample_img(im: image.Image, nw: i32, nh: i32) -> image.Image {
+    if nw == im.w && nh == im.h { return im }
+    var src: image.Image = im
+    var d: image.Image = image.img_new(nw, nh, src.ch)
+    var c: i32 = 0
+    while c < src.ch {
+        resample_plane(image.img_plane(&src, c), src.w, src.h, image.img_plane(&d, c), nw, nh)
+        c = c + 1
+    }
+    image.img_free(&src)
+    return d
+}
+
+// A channel at the sensor limit has lost its true value; scaling it by its white balance gain (R and B gains are
+// > 1) turns every blown light pink or green. Per pixel: how close the brightest channel is to the limit
+// (smoothstep 0.90 .. 0.99) blends the pixel to the neutral colour that the gains map to equal channels, at the
+// level of the brightest balanced channel. Colours below 0.90 are untouched. Needs the gains (has_wb).
+fn neutralise_clipped(im: *mut image.Image, m: *mut meta.SensorMeta) {
+    if !(*m).has_wb { return }
+    let gr: f32 = (*m).wb[0]
+    let gg: f32 = 0.5f * ((*m).wb[1] + (*m).wb[2])
+    let gb: f32 = (*m).wb[3]
+    if gr <= 0.0f || gg <= 0.0f || gb <= 0.0f { return }
+    let n: i32 = (*im).w * (*im).h
+    let pr: u64 = image.img_plane(im, 0)
+    let pg: u64 = image.img_plane(im, 1)
+    let pb: u64 = image.img_plane(im, 2)
+    var i: i32 = 0
+    while i < n {
+        let o: u64 = (i as u64) * (4 as u64)
+        let r: f32 = *((pr + o) as *mut f32)
+        let g: f32 = *((pg + o) as *mut f32)
+        let b: f32 = *((pb + o) as *mut f32)
+        var mx: f32 = r
+        if g > mx { mx = g }
+        if b > mx { mx = b }
+        if mx > 0.90f {
+            var t: f32 = (mx - 0.90f) / 0.09f
+            if t > 1.0f { t = 1.0f }
+            let w: f32 = t * t * (3.0f - 2.0f * t)
+            var lvl: f32 = r * gr
+            if g * gg > lvl { lvl = g * gg }
+            if b * gb > lvl { lvl = b * gb }
+            *((pr + o) as *mut f32) = r + w * (lvl / gr - r)
+            *((pg + o) as *mut f32) = g + w * (lvl / gg - g)
+            *((pb + o) as *mut f32) = b + w * (lvl / gb - b)
+        }
+        i = i + 1
+    }
 }
 
 // ---------------------------------------------------------------- RAW16 -> linear RGB at half resolution
@@ -174,37 +301,12 @@ fn raw_half(p: u64, w: i32, h: i32, m: *mut meta.SensorMeta) -> image.Image {
     return c.out
 }
 
-// float image -> box downscaled copy when it is above max_px (the input is consumed), else the input
+// float image -> area resampled copy when it is above max_px (the input is consumed), else the input
 fn shrink_img(im: image.Image, max_px: i32) -> image.Image {
-    let f: i32 = shrink_factor(im.w, im.h, max_px)
-    if f == 1 { return im }
-    var src: image.Image = im
-    var d: image.Image = image.img_new(src.w / f, src.h / f, src.ch)
-    var c: i32 = 0
-    while c < src.ch {
-        var y: i32 = 0
-        while y < d.h {
-            var x: i32 = 0
-            while x < d.w {
-                var s: f32 = 0.0f
-                var dy: i32 = 0
-                while dy < f {
-                    var dx: i32 = 0
-                    while dx < f {
-                        s = s + image.img_get(&src, c, x * f + dx, y * f + dy)
-                        dx = dx + 1
-                    }
-                    dy = dy + 1
-                }
-                image.img_set(&d, c, x, y, s / ((f * f) as f32))
-                x = x + 1
-            }
-            y = y + 1
-        }
-        c = c + 1
-    }
-    image.img_free(&src)
-    return d
+    var nw: i32 = 0
+    var nh: i32 = 0
+    fit_size(im.w, im.h, max_px, &nw, &nh)
+    return resample_img(im, nw, nh)
 }
 
 // JPEG bytes -> linear RGB at <= max_px
@@ -214,7 +316,8 @@ fn jpeg_linear(p: u64, n: usize, max_px: i32) -> image.Image {
     if !ok { return image.img_new(0, 0, 3) }
     let w: i32 = dj.w as i32
     let h: i32 = dj.h as i32
-    let f: i32 = shrink_factor(w, h, max_px)
+    var f: i32 = shrink_factor(w, h, max_px) - 1 // the last integer factor that still keeps >= max_px, exact fit below
+    if f < 1 { f = 1 }
     var d: image.Image = image.img_new(w / f, h / f, 3)
     let base: u64 = rt.buf_ptr(&dj.px)
     var y: i32 = 0
@@ -242,12 +345,13 @@ fn jpeg_linear(p: u64, n: usize, max_px: i32) -> image.Image {
     }
     jpeg.jpeg_image_free(&dj)
     image.img_from_srgb(&d)
-    return d
+    return shrink_img(d, max_px)
 }
 
 fn load_shot(s: *mut Shot, m: *mut meta.SensorMeta, max_px: i32) -> image.Image {
     if (*s).kind == SHOT_RAW {
-        let h: image.Image = raw_half((*s).ptr, (*s).w, (*s).h, m)
+        var h: image.Image = raw_half((*s).ptr, (*s).w, (*s).h, m)
+        neutralise_clipped(&h, m)
         return shrink_img(h, max_px)
     }
     return jpeg_linear((*s).ptr, (*s).size, max_px)
