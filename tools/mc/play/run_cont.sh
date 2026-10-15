@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/mc/play/run_cont.sh [mc_version=1.20.1] -- container windows against an official server: title from Open Window, hopper (5) / dispenser (3x3) layout, sneak + right click on a chest places the held block
+# tools/mc/play/run_cont.sh [mc_version=1.20.1] -- container windows against an official server: title from Open Window, hopper (5) / dispenser (3x3) / shulker box (27) / double chest (54) layout, sneak + right click on a chest places the held block
 
 # Prints `RESULT mc-play-cont: ok|FAIL`. Env as run_inv.sh (FIRNC, JAVA, MC_VIEW, MCPLAY_KEEP_DIR).
 set -uo pipefail
@@ -62,6 +62,7 @@ run_case() {
     sleep 5
     echo "gamemode survival $1" >&3; echo "give $1 stone 32" >&3
     echo "execute at $1 run setblock ~1 ~ ~ minecraft:$2" >&3
+    [ -z "${5:-}" ] || echo "execute at $1 run setblock ~2 ~ ~ minecraft:$5" >&3
     sleep 1
     echo "execute at $1 run item replace block ~1 ~ ~ container.0 with minecraft:dirt 3" >&3
     wait $PP
@@ -77,6 +78,9 @@ run_case ContA chest 1 "$W/a.out"
 run_case ContB chest 0 "$W/b.out"
 run_case ContC hopper 0 "$W/c.out"
 run_case ContD dispenser 0 "$W/d.out"
+run_case ContE shulker_box 0 "$W/e.out"
+# double chest: two chests next to each other (facing north: the left half is the west one), the player clicks the one next to him
+run_case ContF "chest[facing=north,type=left]" 0 "$W/f.out" "chest[facing=north,type=right]"
 if [ "$PROTO" -lt 768 ]; then
     check "sneak+click (block placed, chest stays closed)" "$W/a.out" "sneak=true win=0 " "sneak_packets=1"
     case "$(grep 'mcplay: sneaktest' "$W/a.out" | head -1)" in *"placed=0 "*) echo "  FAIL  sneak: no block appeared above the chest"; ERR=1;; esac
@@ -87,7 +91,9 @@ fi
 check "click (chest opens)" "$W/b.out" "sneak=false " "slots=27 cols=9 title=Chest " "placed=0 "
 check "hopper" "$W/c.out" "slots=5 cols=5 title=Item Hopper "
 check "dispenser" "$W/d.out" "slots=9 cols=3 title=Dispenser "
-for f in a b c d; do
+check "shulker box" "$W/e.out" "slots=27 cols=9 title=Shulker Box "
+check "double chest" "$W/f.out" "slots=54 cols=9 title=Large Chest "
+for f in a b c d e f; do
     BAD=$(grep -o 'bad=[0-9]*' "$W/$f.out" | head -1)
     case "$(grep 'mcplay: sneaktest' "$W/$f.out" | head -1)" in *"win=0 "*) [ $f = a ] || { echo "  FAIL  $f: no window"; ERR=1; };; esac
 done

@@ -516,7 +516,9 @@ function decodeChunk (p, numSections) {
   }
   if (Array.isArray(root)) {
     // 1.21.5+: heightmaps = [{ type: 'motion_blocking', data: [[hi, lo], ...] }, ...] (protodef mapper names)
-    for (const e of root) hm.push({ name: String(e.type).toUpperCase(), hash: hashU16(heightmapValues(e.data)) })
+    // minecraft-data 1.21.5 has no name mapper for the type (numeric id of the Heightmap.Types enum)
+    const HM_NAMES = ['WORLD_SURFACE_WG', 'WORLD_SURFACE', 'OCEAN_FLOOR_WG', 'OCEAN_FLOOR', 'MOTION_BLOCKING', 'MOTION_BLOCKING_NO_LEAVES']
+    for (const e of root) hm.push({ name: /^\d+$/.test(String(e.type)) ? (HM_NAMES[Number(e.type)] || String(e.type)) : String(e.type).toUpperCase(), hash: hashU16(heightmapValues(e.data)) })
   }
   hm.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
   const f = new Fnv64()

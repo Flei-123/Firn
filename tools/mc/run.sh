@@ -44,10 +44,20 @@ if [ -z "$ONLY" ] || [ "$ONLY" = lodplay ]; then
     echo "== mc/lodplay =="
     bash tools/mc/play/run_lod.sh || ERR=$((ERR+1))
 fi
-# entities in the mcplay play path against the real server (live packets + CPU/GL pictures with / without boxes): ~4 min, needs Xvfb + java.
+# entities in the mcplay play path against the real server (live packets + CPU/GL pictures with / without boxes): ~4 min, needs Xvfb + java; plus the rider entity scenario of tools/mcclient/run.sh.
 if [ -z "$ONLY" ] || [ "$ONLY" = ents ]; then
     echo "== mc/ents =="
     bash tools/mc/play/run_ents.sh || ERR=$((ERR+1))
+    # entity scenario of the byte-compare harness WITH the rider part (MC_ENT_RIDER=1: mount a minecart, two teleports with a rider, dismount): Firn vs the reference
+    # client against the real 1.20.1 server, A == A2, B == A, entities EQUAL: ~5 min (45 s settle), needs node + java.
+    echo "== mc/ents rider =="
+    RC=$(mktemp -d)
+    if FIRNLIB="$(pwd)/lib" "$FIRNC" -o "$RC/mcclient" demos/mcclient/main.fi 2>"$RC/err"; then
+        MC_ENT_RIDER=1 MC_VERSION=1.20.1 bash tools/mcclient/run.sh "$RC/mcclient" || ERR=$((ERR+1))
+    else
+        echo "  FAIL  demos/mcclient does not compile"; head -5 "$RC/err"; ERR=$((ERR+1))
+    fi
+    rm -rf "$RC"
 fi
 # mcplay with the Vulkan back end (MCPLAY_GFX=vk; lavapipe = CPU Vulkan, NO real GPU) against the real server: picture vs CPU raster PSNR >= 34, frame counters,
 # simulated device loss + recovery: ~4 min, needs Xvfb + java; SKIP without a Vulkan device.
