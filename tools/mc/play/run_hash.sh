@@ -91,8 +91,10 @@ COMPS_D='food={nutrition:1,saturation:0f},tool={rules:[{blocks:"minecraft:dirt"}
 ATTR_E='{type:"minecraft:attack_damage",slot:"mainhand",id:"test:o",amount:2.5,operation:"add_value"}'
 case "$PROTO" in 770) ;; *) ATTR_E='{type:"minecraft:attack_damage",slot:"mainhand",id:"test:o",amount:2.5,operation:"add_value",display:{type:"override",value:{text:"Over",bold:true,color:"gold"}}},{type:"minecraft:armor",id:"test:p",amount:1.0,operation:"add_value",display:{type:"override",value:"Plain"}}';; esac
 COMPS_E='custom_data={ba:[B;1b,-2b,3b],ia:[I;1,-2,300000],la:[L;1L,-2L],eb:[B;],o:{k:[I;7]}},tool={rules:[{blocks:[],speed:3f},{blocks:["minecraft:dirt"]}]},attribute_modifiers=['"$ATTR_E"']'
-for SET in B C D E; do
-    case $SET in B) COMPS_CUR=$COMPS_B; LBL="NBT comps (custom_data / lore / styled names)";; C) COMPS_CUR=$COMPS_C; LBL="food / tool / attribute_modifiers";; D) COMPS_CUR=$COMPS_D; LBL="omitted defaults (food / tool / attribute_modifiers)";; E) COMPS_CUR=$COMPS_E; LBL="NBT arrays / empty block list / display override";; esac
+# set F (r225): a tool with 10 rules, one of them with 10 block ids (the old limit was 8 / 8)
+COMPS_F='tool={rules:[{blocks:"#minecraft:mineable/pickaxe",speed:8f,correct_for_drops:true},{blocks:"#minecraft:mineable/axe",speed:6f},{blocks:"#minecraft:mineable/shovel",speed:5f},{blocks:"#minecraft:mineable/hoe",speed:4f},{blocks:"#minecraft:leaves",speed:3f},{blocks:"#minecraft:wool",speed:2f},{blocks:"#minecraft:logs",speed:1.5f},{blocks:"#minecraft:planks",speed:7f},{blocks:"#minecraft:sand",speed:9f},{blocks:["minecraft:dirt","minecraft:sand","minecraft:gravel","minecraft:stone","minecraft:cobblestone","minecraft:granite","minecraft:diorite","minecraft:andesite","minecraft:clay","minecraft:glass"],speed:2f,correct_for_drops:true}],default_mining_speed:1.25f}'
+for SET in B C D E F; do
+    case $SET in B) COMPS_CUR=$COMPS_B; LBL="NBT comps (custom_data / lore / styled names)";; C) COMPS_CUR=$COMPS_C; LBL="food / tool / attribute_modifiers";; D) COMPS_CUR=$COMPS_D; LBL="omitted defaults (food / tool / attribute_modifiers)";; E) COMPS_CUR=$COMPS_E; LBL="NBT arrays / empty block list / display override";; F) COMPS_CUR=$COMPS_F; LBL="tool with 10 rules / 10 block ids";; esac
     run_hash "Hash$SET" 0 "$W/h_$SET.out"
     L3=$(grep 'mcplay: hashtest' "$W/h_$SET.out" | head -1)
     echo "  set $SET    : $L3"
