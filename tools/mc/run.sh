@@ -13,6 +13,11 @@ ERR=0
 ONLY=${1:-}
 FIRNC=${FIRNC:-compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
+# r220: a firnc older than r167 makes every GL stage (mcplay MCPLAY_GL=1 with mesher threads) segfault in the first frame
+case " $ONLY " in
+    "  "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" play ")
+        bash tools/mc/check_firnc.sh "$FIRNC" || { echo "RESULT mc: FAIL (stale firnc)"; exit 1; } ;;
+esac
 # every .fi file of the tree must be in the canonical shape of firnfmt (test.sh section 23
 # fails otherwise): format with `build/firnfmt -w <file>`; this builds it into a temp dir.
 if [ -z "$ONLY" ]; then
