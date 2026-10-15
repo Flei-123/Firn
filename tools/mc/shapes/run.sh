@@ -6,7 +6,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../../.."
 FIRNC=${1:-${FIRNC:-compiler/target/release/firnc}}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
-MCDATA=${MCDATA:-/root/firn-vt/tools/mcserver/node_modules/minecraft-data/minecraft-data/data/pc/1.20}
+MCDATA=${MCDATA:-/root/firn/tools/mcserver/node_modules/minecraft-data/minecraft-data/data/pc/1.20}
 [ -f "$MCDATA/blockCollisionShapes.json" ] || { echo "  FAIL  no minecraft-data at $MCDATA"; exit 1; }
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 run() { # libdir out

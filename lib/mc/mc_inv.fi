@@ -757,7 +757,7 @@ fn ps_ench(v: *mut Inv, id: i32, level: i32) {
 // custom_data is a CompoundTag: the server converts it NbtOps -> HashOps, so every tag keeps its own type (byte, short, int, long, float, double,
 // string, list, compound = map). A text component (custom_name, item_name, lore lines) is encoded by the component codec straight into the
 // hashing ops, so its boolean style flags are real booleans (not bytes) and `extra` is a list of components.
-// The result is the hash in the low 32 bits; bit 32 set = not hashable (byte / int / long arrays, more than 64 entries).
+// The result is the hash in the low 32 bits; bit 32 set = not hashable (more than 64 entries in a list / compound).
 const NH_FAIL: u64 = 4294967296
 
 fn nh_key_is(p: u64, n: usize, lit: str) -> bool { return n == lit.n && line_is(p, n, lit) }
@@ -782,6 +782,10 @@ fn nbt_hash(d: *mut mc_nbt.Doc, n: u32, text: bool, as_bool: bool) -> u64 {
         let sp: u64 = mc_nbt.nbt_str(d, n, &sn)
         return mc_hash.hash_string(sp, sn) as u64
     }
+    // arrays: HashOps.createByteList / createIntList / createLongList (own start / end tags, raw little endian payload)
+    if k == 7 as u8 { return mc_hash.hash_byte_array(mc_nbt.nbt_arr_ptr(d, n), mc_nbt.nbt_count(d, n) as usize) as u64 }
+    if k == 11 as u8 { return mc_hash.hash_int_array(mc_nbt.nbt_arr_ptr(d, n), mc_nbt.nbt_count(d, n) as usize) as u64 }
+    if k == 12 as u8 { return mc_hash.hash_long_array(mc_nbt.nbt_arr_ptr(d, n), mc_nbt.nbt_count(d, n) as usize) as u64 }
     if k == 9 as u8 || k == 10 as u8 {
         let cnt: u32 = mc_nbt.nbt_count(d, n)
         if cnt > 64 as u32 { return NH_FAIL }
@@ -906,7 +910,7 @@ fn hex_byte(p: u64, o: usize) -> i32 {
 // kind 1 food: [2] nutrition, [3] saturation bits, [4] can_always_eat, [7] seen mask
 // kind 2 tool: [2] rules, [3] default speed bits, [4] damage per block, [5] can destroy in creative; rule r at 16 + 8r: [0] blocks hash, [1] has speed, [2] speed bits,
 //   [3] has drops flag, [4] drops, [5] blocks form (1 tag, 2 ids), [6] number of ids; id key hashes at 128 + 8r + j; rule hashes end up at 192
-// kind 3 attribute_modifiers: [2] entries; entry e at 16 + 8e: [0] attribute id, [1] id hash, [2] amount lo, [3] amount hi, [4] operation, [5] slot, [6] display; entry hashes at 192
+// kind 3 attribute_modifiers: [2] entries; entry e at 16 + 8e: [0] attribute id, [1] id hash, [2] amount lo, [3] amount hi, [4] operation, [5] slot, [6] display (0 default, 1 hidden, 2 override), [7] override text hash; entry hashes at 192
 fn xs_get(v: *mut Inv, i: usize) -> u32 { return rt.ld32((*v).xscr, i) }
 fn xs_set(v: *mut Inv, i: usize, x: u32) { rt.st32((*v).xscr, i, x) }
 fn xs_ptr(v: *mut Inv, i: usize) -> u64 { return (*v).xscr + ((i * 4) as u64) }
@@ -1020,7 +1024,7 @@ fn xs_line(v: *mut Inv, rp: u64, rn: usize, vp: u64, vn: usize) {
                 if unquote(vp, vn, &ip, &inn) { xs_set(v, base, mc_hash.hash_blocks_tag(ip, inn)); xs_set(v, base + 5, 1 as u32) } else { xs_bad(v) }
             } else if nh_key_is(fp, fn2, "blocks.ids") {
                 let c: i32 = xs_count(vp, vn)
-                if c < 1 || c > 8 { xs_bad(v) } else { xs_set(v, base + 5, 2 as u32); xs_set(v, base + 6, c as u32) }
+                if c < 0 || c > 8 { xs_bad(v) } else { xs_set(v, base + 5, 2 as u32); xs_set(v, base + 6, c as u32) }   // 0 ids = the empty list
             } else if fn2 > 12 && line_is(fp, fn2, "blocks.ids[") {
                 var e2: usize = 0
                 let j: i32 = idx_at(fp, fn2, 10, &e2)
@@ -1061,7 +1065,11 @@ fn xs_line(v: *mut Inv, rp: u64, rn: usize, vp: u64, vn: usize) {
             else if nh_key_is(fp, fn2, "slot") { xs_set(v, base + 5, parse_dec(vp, vn, &ok) as u32); if !ok { xs_bad(v) } }
             else if nh_key_is(fp, fn2, "display.type") {
                 let d: i32 = parse_dec(vp, vn, &ok)
-                if !ok || d > 1 { xs_bad(v) } else { xs_set(v, base + 6, d as u32) }
+                if !ok || d > 2 { xs_bad(v) } else { xs_set(v, base + 6, d as u32) }
+            } else if nh_key_is(fp, fn2, "display.component") {
+                // display override: the text component (anonymous NBT, a plain string or a styled compound)
+                var oh: u32 = 0 as u32
+                if hex_nbt_hash(0, vp, vn, true, &oh) { xs_set(v, base + 7, oh) } else { xs_bad(v) }
             }
         }
     }
@@ -1098,8 +1106,9 @@ fn xs_finish(v: *mut Inv, protocol: i32) {
             var an: usize = 0
             let ap: u64 = mc_attr.attr_name(protocol, xs_get(v, base) as i32, &an)
             if ap == 0 || an == 0 { return }
+            if xs_get(v, base + 6) == (2 as u32) && xs_get(v, base + 7) == (0 as u32) { return }
             let bits: u64 = (xs_get(v, base + 2) as u64) | ((xs_get(v, base + 3) as u64) << 32)
-            xs_set(v, 192 + (x as usize), mc_hash.hash_attr_entry(mc_hash.hash_string(ap, an), xs_get(v, base + 1), bits, xs_get(v, base + 4) as i32, xs_get(v, base + 5) as i32, xs_get(v, base + 6) as i32))
+            xs_set(v, 192 + (x as usize), mc_hash.hash_attr_entry(mc_hash.hash_string(ap, an), xs_get(v, base + 1), bits, xs_get(v, base + 4) as i32, xs_get(v, base + 5) as i32, xs_get(v, base + 6) as i32, xs_get(v, base + 7)))
             x = x + 1
         }
         h = mc_hash.hash_list(xs_ptr(v, 192), ne as usize)

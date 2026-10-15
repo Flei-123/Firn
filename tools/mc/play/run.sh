@@ -55,27 +55,40 @@ DN=$((90 + RANDOM % 100))
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
-FIRN_AUDIO="file:$W/day.wav" MCPLAY_AUDIO_LOG=1 MCPLAY_GIVE="iron_pickaxe:1,stone:64" MCPLAY_RUN_S=18 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/shot.png" \
+# r223: the script waits on the client's SIM time (`progress` lines: ticks, pos, ground, walked_mm), never on the wall clock -- under load (fps 4) a
+# fixed sleep walked nothing / acted before the join. The client ends when the script is done (QUIT_FILE); MCPLAY_RUN_S is only the safety net.
+FIRN_AUDIO="file:$W/day.wav" MCPLAY_AUDIO_LOG=1 MCPLAY_PROGRESS=1 MCPLAY_QUIT_FILE="$W/quit" MCPLAY_GIVE="iron_pickaxe:1,stone:64" MCPLAY_RUN_S=${MCPLAY_DAY_MAX_S:-420} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/shot.png" \
     "$W/mcplay" 127.0.0.1 "$PORT" Player > "$W/play.out" 2>&1 &
 PP=$!
-sleep 4
+# last `progress` field NAME of the day client (empty until the first line)
+wj() { local i; for i in $(seq 1 1200); do grep -q "$1 joined the game" "$W/server.log" 2>/dev/null && return 0; sleep 0.1; done; echo "  WARN  $1 did not join within 120 s"; return 1; }   # r223: wait for the join, not a blind sleep
+prog() { grep -o "progress .*" "$W/play.out" 2>/dev/null | tail -1 | grep -o " $1=[^ ]*" | cut -d= -f2; }
+# wait (wall limit $2 s, default 120) until the client simulated $1 more ticks
+wait_ticks() { local t0 t; t0=$(prog ticks); t0=${t0:-0}; for i in $(seq 1 $(( ${2:-120} * 10 ))); do t=$(prog ticks); [ "${t:-0}" -ge $(( t0 + $1 )) ] && return 0; kill -0 "$PP" 2>/dev/null || return 1; sleep 0.1; done; echo "  WARN  wait_ticks $1 timed out"; return 1; }
+for i in $(seq 1 1200); do grep -q "Player joined the game" "$W/server.log" 2>/dev/null && break; sleep 0.1; done
+for i in $(seq 1 1200); do [ "$(prog pos)" = 1 ] || [ "$(prog pos)" = true ] && [ "$(prog chunks)" -gt 10 ] 2>/dev/null && break; sleep 0.1; done
 # flat stone platform high above the terrain (2 layers, air above): the walk is never blocked by a hill/tree and the place target is a floor block well in
 # front of the player (a block placed inside the player's own hitbox is refused by the server)
 for cmd in "fill -20 119 -20 20 120 20 stone" "fill -20 121 -20 20 128 20 air" "tp Player 0.5 121 0.5"; do echo "$cmd" >&3; done
-sleep 2.5
+# standing on the platform (y 121.000, on ground) before anything else happens
+for i in $(seq 1 600); do [ "$(prog ground)" != 0 ] && [ "$(prog ground)" != false ] && [ "$(prog y_mm)" = 121000 ] && break; sleep 0.1; done
+wait_ticks 5
 xdotool mousemove 320 180 2>/dev/null
-xdotool mousemove_relative -- 40 5; sleep 0.3
-xdotool keydown w; sleep 3; xdotool keyup w; sleep 0.3
-xdotool key space; sleep 0.6
-xdotool mousemove_relative -- 0 230; sleep 0.8
-xdotool click 1; sleep 0.8
-xdotool key 2; sleep 0.3
+xdotool mousemove_relative -- 40 5; wait_ticks 6
+# walk 60 SIM ticks (3 s of game time): 60 ticks * ~0.216 m = ~12.9 m whatever the frame rate
+xdotool keydown w; wait_ticks 60; xdotool keyup w; wait_ticks 6
+xdotool key space; wait_ticks 12
+xdotool mousemove_relative -- 0 230; wait_ticks 16
+xdotool click 1; wait_ticks 16
+xdotool key 2; wait_ticks 6
 [ "${MCPLAY_DEBUG:-0}" = 1 ] && { for q in SelectedItemSlot Inventory abilities; do echo "data get entity Player $q" >&3; done; echo "execute at Player if entity @e[type=!minecraft:player,distance=..12]" >&3; sleep 0.5; }
-xdotool click 3; sleep 0.8
-xdotool key 3; sleep 0.3
-xdotool click 4; sleep 0.3
-xdotool mousemove_relative -- 100 0; sleep 1
+xdotool click 3; wait_ticks 16
+xdotool key 3; wait_ticks 6
+xdotool click 4; wait_ticks 6
+xdotool mousemove_relative -- 100 0; wait_ticks 20
+touch "$W/quit"
 wait $PP; rc=$?
+grep -v "mcplay: progress" "$W/play.out" > "$W/play.clean" && mv "$W/play.clean" "$W/play.out"   # the sim-time progress lines are only for the script above
 sed 's/^/  /' "$W/play.out" | tail -8
 ERR=0
 [ $rc -eq 0 ] || { echo "  FAIL  mcplay exit code $rc"; ERR=1; }
@@ -175,10 +188,10 @@ if [ "${MCPLAY_SKIP_PSNR:-0}" != 1 ]; then
 echo "time set day" >&3; echo "gamerule spawnRadius 0" >&3; sleep 1
 for mode in cpu gl; do
     PN=Psnr$mode; GLF=0; [ $mode = gl ] && GLF=1
-    MCPLAY_GL=$GLF MCPLAY_VSYNC=0 MCPLAY_AUDIO=0 MCPLAY_RUN_S=16 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/ps_$mode.png" \
+    MCPLAY_GL=$GLF MCPLAY_VSYNC=0 MCPLAY_AUDIO=0 MCPLAY_RUN_S=${MCPLAY_PSNR_S:-26} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 MCPLAY_SHOT="$W/ps_$mode.png" \
         timeout 180 "$W/mcplay" 127.0.0.1 "$PORT" "$PN" > "$W/ps_$mode.out" 2>&1 &
     PP=$!
-    sleep 6
+    wj "$PN"; sleep 2
     for cmd in "fill ~-3 ~-3 ~4 ~3 ~0 ~8 stone" "fill ~-2 ~-2 ~5 ~2 ~0 ~7 water" "fill ~-4 ~-2 ~11 ~4 ~4 ~11 glass" "fill ~-1 ~-2 ~9 ~1 ~3 ~9 blue_stained_glass" "fill ~-6 ~-2 ~14 ~6 ~6 ~14 red_wool"; do
         echo "execute at $PN run $cmd" >&3
     done
@@ -195,10 +208,10 @@ else echo "  FAIL  psnr: missing picture"; ERR=1; fi
 fi
 # ---- survival: iron pickaxe from /give, look down, hold the left button -> a block is dug with the table time (mc_dig)
 if [ "${MCPLAY_SKIP_SURVIVAL:-0}" != 1 ]; then
-MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_RUN_S=14 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_RUN_S=${MCPLAY_SURV_S:-24} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 120 "$W/mcplay" 127.0.0.1 "$PORT" Player6 > "$W/surv.out" 2>&1 &
 PP=$!
-sleep 5
+wj Player6; sleep 1
 echo "gamemode survival Player6" >&3; echo "give Player6 iron_pickaxe 1" >&3; echo "give Player6 stone 32" >&3
 sleep 2
 xdotool mousemove 320 180 2>/dev/null; xdotool mousemove_relative -- 0 300; xdotool key 1; sleep 0.5

@@ -87,8 +87,12 @@ COMPS_C='food={nutrition:4,saturation:2.5f,can_always_eat:true},tool={rules:[{bl
 ATTR_D='{type:"minecraft:max_health",slot:"head",id:"test:c",amount:-2.0,operation:"add_multiplied_total"},{type:"minecraft:armor",id:"test:d",amount:1.0,operation:"add_value"}'
 case "$PROTO" in 770) ;; *) ATTR_D="$ATTR_D"',{type:"minecraft:armor_toughness",id:"test:e",amount:3.0,operation:"add_value",display:{type:"hidden"}}';; esac
 COMPS_D='food={nutrition:1,saturation:0f},tool={rules:[{blocks:"minecraft:dirt"}],default_mining_speed:1f,damage_per_block:1},attribute_modifiers=['"$ATTR_D"']'
-for SET in B C D; do
-    case $SET in B) COMPS_CUR=$COMPS_B; LBL="NBT comps (custom_data / lore / styled names)";; C) COMPS_CUR=$COMPS_C; LBL="food / tool / attribute_modifiers";; D) COMPS_CUR=$COMPS_D; LBL="omitted defaults (food / tool / attribute_modifiers)";; esac
+# set E (r207): NBT byte / int / long arrays in custom_data, an EMPTY block list in a tool rule, and (1.21.6+) an attribute display override with a styled text
+ATTR_E='{type:"minecraft:attack_damage",slot:"mainhand",id:"test:o",amount:2.5,operation:"add_value"}'
+case "$PROTO" in 770) ;; *) ATTR_E='{type:"minecraft:attack_damage",slot:"mainhand",id:"test:o",amount:2.5,operation:"add_value",display:{type:"override",value:{text:"Over",bold:true,color:"gold"}}},{type:"minecraft:armor",id:"test:p",amount:1.0,operation:"add_value",display:{type:"override",value:"Plain"}}';; esac
+COMPS_E='custom_data={ba:[B;1b,-2b,3b],ia:[I;1,-2,300000],la:[L;1L,-2L],eb:[B;],o:{k:[I;7]}},tool={rules:[{blocks:[],speed:3f},{blocks:["minecraft:dirt"]}]},attribute_modifiers=['"$ATTR_E"']'
+for SET in B C D E; do
+    case $SET in B) COMPS_CUR=$COMPS_B; LBL="NBT comps (custom_data / lore / styled names)";; C) COMPS_CUR=$COMPS_C; LBL="food / tool / attribute_modifiers";; D) COMPS_CUR=$COMPS_D; LBL="omitted defaults (food / tool / attribute_modifiers)";; E) COMPS_CUR=$COMPS_E; LBL="NBT arrays / empty block list / display override";; esac
     run_hash "Hash$SET" 0 "$W/h_$SET.out"
     L3=$(grep 'mcplay: hashtest' "$W/h_$SET.out" | head -1)
     echo "  set $SET    : $L3"
