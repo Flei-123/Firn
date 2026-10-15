@@ -59,7 +59,7 @@ export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty, sema_widen32,
     // ROUND OWN-3 (moves.fi, twin of compiler/src/moves.rs) -- `drop` and moves.
     sema_mv_reset, sema_mv_drop_set, sema_mv_drop, sema_has_drops,
     sema_mv_moved_set, sema_moved, sema_moved_any,
-    sema_type_has_gc, sema_leave_set, sema_leave, sema_needs_drop, sema_drop_name,
+    sema_type_has_gc, sema_type_raster, sema_leave_set, sema_leave, sema_needs_drop, sema_drop_name,
     sema_fn_index, sema_recv_by_address }
 
 const NONE: u32 = 4294967295
@@ -2977,6 +2977,105 @@ fn tyhas_walk(s: *mut Sema, t: u32, seen: *mut Vec[u32], depth: u32) -> bool {
         f = f + 1
     }
     return false
+}
+
+// r582 (sizeof.rs::type_raster): the pointer-word raster of one `T` element of
+// a `gc_track[T]` buffer. Word k of an element is set in `words` if it may hold
+// a heap pointer (`u64`/`usize`/`i64`/`isize`, raw pointers, `Gc`, `fn`; the
+// octet pointer of a `str`). Small integers, floats, `bool`, `str.len` and
+// padding stay clear. false = give up (a pointer word that is not 8-aligned,
+// an unknown kind).
+fn raster_mark(words: *mut u64, off: u64, size: u64, nwords: u64) -> bool {
+    if off % 8 != 0 {
+        return false
+    }
+    let last: u64 = (off + size + 7) / 8
+    if last > nwords {
+        return false
+    }
+    var w: u64 = off / 8
+    while w < last {
+        *words = (*words) | (1 << w)
+        w = w + 1
+    }
+    return true
+}
+
+fn raster_walk(s: *mut Sema, t: u32, off: u64, words: *mut u64, nwords: u64, depth: u32) -> bool {
+    if depth > 16 {
+        return false
+    }
+    let tt: *mut types.Types = table(s)
+    let k: u32 = types.ty_kind(tt, t)
+    if k == types.K_I8 || k == types.K_I16 || k == types.K_I32 || k == types.K_U8
+    || k == types.K_U16 || k == types.K_U32 || k == types.K_BOOL || k == types.K_F32
+    || k == types.K_F64 || k == types.K_VOID {
+        return true
+    }
+    if k == types.K_I64 || k == types.K_U64 || k == types.K_USIZE || k == types.K_ISIZE
+    || k == types.K_PTR || k == types.K_FN {
+        return raster_mark(words, off, types.size_of(tt, t), nwords)
+    }
+    if k == types.K_ARR {
+        let et: u32 = types.ty_a(tt, t)
+        let es: u64 = types.size_of(tt, et)
+        let n: u64 = types.ty_n(tt, t)
+        var i: u64 = 0
+        while i < n {
+            if !raster_walk(s, et, off + i * es, words, nwords, depth + 1) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if k != types.K_STRUCT {
+        return false
+    }
+    let si: u32 = types.ty_a(tt, t)
+    let is_str: bool = types.st_count(tt) > types.STR_INDEX as usize && si == types.STR_INDEX
+    var f: u32 = 0
+    while f < types.st_flen(tt, si as usize) {
+        let fi: u32 = types.st_foff(tt, si as usize) + f
+        let fty: u32 = types.sf_ty(tt, fi)
+        let foff: u64 = off + types.sf_offset(tt, fi)
+        if is_str {
+            if types.ty_kind(tt, fty) == types.K_PTR {
+                if !raster_mark(words, foff, 8, nwords) {
+                    return false
+                }
+            }
+        } else if !raster_walk(s, fty, foff, words, nwords, depth + 1) {
+            return false
+        }
+        f = f + 1
+    }
+    return true
+}
+
+// 0 = scan every word of the buffer, else `stride_in_words << 32 | mask`.
+fn sema_type_raster(s: *mut Sema, t: u32) -> u64 {
+    let tt: *mut types.Types = table(s)
+    let size: u64 = types.size_of(tt, t)
+    if size == 0 || size % 8 != 0 || size > 256 {
+        return 0
+    }
+    let nwords: u64 = size / 8
+    var mask: u64 = 0
+    if !raster_walk(s, t, 0, &mask, nwords, 0) {
+        return 0
+    }
+    if mask == 0 {
+        return 0
+    }
+    var full: u64 = 4294967295
+    if nwords < 32 {
+        full = (1 << nwords) - 1
+    }
+    if mask == full {
+        return 0
+    }
+    return (nwords << 32) | mask
 }
 
 fn sema_type_has_gc(s: *mut Sema, t: u32) -> bool {

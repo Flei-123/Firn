@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/@android/net/dnsconf.fi -- WHERE THE NAME SERVERS AND THE HOSTS TABLE
+// COME FROM, on Android. `import net.dnsconf` takes this file on the
+// android targets (target::platform_dir, lib/@android/ before lib/); the
+// Linux reference is lib/net/dnsconf.fi, the Windows twin
+// lib/net/dnsconf.windows.fi. Same contract: TEXT in the format of
+// resolv.conf / hosts, false when there is nothing.
+//
+// WHY A FILE OF ITS OWN. Android has no /etc/resolv.conf: a program that
+// reads it gets nothing and the resolver (lib/net/dns.fi, D6) falls back
+// to 1.1.1.1 and 8.8.8.8. That works on an open network, but ignores the
+// resolver of the network the phone is on (a company network that blocks
+// public DNS, a captive portal, the emulator's 10.0.2.3). The sources, in
+// this order:
+//
+//   1. /etc/resolv.conf       (rooted devices, Termux-like chroots)
+//   2. the system properties  net.dns1 .. net.dns4, then
+//                             dhcp.wlan0.dns1 .. 4, dhcp.eth0.dns1 .. 4
+//                             (bionic's __system_property_get)
+//   3. nothing -> false -> the public fallback of dns.fi
+//
+// HONEST
+//   A1 Since Android 8 (API 26) an app cannot read net.dns* any more: the
+//      properties are hidden from it (SELinux), the call returns an empty
+//      value. Then source 3 applies -- the same behaviour as before this
+//      file, never worse. The reliable source on those versions is
+//      ConnectivityManager -> LinkProperties.getDnsServers() through JNI,
+//      which needs a Context and is NOT done here (open item).
+//   A2 Property values that are not a dotted IPv4 address (an IPv6 server,
+//      a name) are skipped; the resolver text only gets what the parser of
+//      dns.fi would accept anyway.
+//   A3 The hosts table is /system/etc/hosts (Android's own, localhost
+//      only on a stock system), then /etc/hosts.
+import std.rt
+
+export { conf_resolv, conf_hosts, prop_ipv4_ok }
+
+// bionic: int __system_property_get(const char *name, char *value);
+// value has room for PROP_VALUE_MAX = 92 octets. Plain C, cannot start a
+// collection.
+#[no_gc]
+#[link_name(__system_property_get)]
+extern fn system_property_get(name: u64, value: u64) -> i32;
+
+const PROP_VALUE_MAX: usize = 92
+
+// "a.b.c.d" with 1-3 digits per octet, each <= 255, and nothing else
+// (no sign, no space, no port): the only form a property is trusted in.
+fn prop_ipv4_ok(p: u64, n: usize) -> bool {
+    var parts: usize = 1
+    var digits: usize = 0
+    var val: u32 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c >= 48 as u8 && c <= 57 as u8 {
+            val = val * 10 as u32 + (c - 48 as u8) as u32
+            digits = digits + 1
+            if digits > 3 || val > 255 as u32 {
+                return false
+            }
+        } else if c == 46 as u8 && digits > 0 {
+            parts = parts + 1
+            digits = 0
+            val = 0 as u32
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return parts == 4 && digits > 0
+}
+
+// One property -> "nameserver <value>\n". `name` is zero terminated.
+fn push_prop(out: *mut rt.Buf, name: u64) -> bool {
+    var val: [u8; 92] = [0 as u8; 92]
+    let n: i32 = system_property_get(name, (&val[0]) as u64)
+    if n <= 0 || n as usize >= PROP_VALUE_MAX {
+        return false
+    }
+    if !prop_ipv4_ok((&val[0]) as u64, n as usize) {
+        return false
+    }
+    var word: [u8; 11] = "nameserver "
+    rt.buf_push_bytes(out, (&word[0]) as u64, 11)
+    rt.buf_push_bytes(out, (&val[0]) as u64, n as usize)
+    rt.buf_push(out, 10 as u8)
+    return true
+}
+
+// "<prefix><k>\0" for k = 1 .. 4 -> push_prop; returns how many were taken.
+fn push_prefix(out: *mut rt.Buf, prefix: u64, plen: usize) -> usize {
+    var name: [u8; 40] = [0 as u8; 40]
+    var i: usize = 0
+    while i < plen && i < 32 {
+        name[i] = rt.ld8(prefix, i)
+        i = i + 1
+    }
+    var taken: usize = 0
+    var k: usize = 1
+    while k <= 4 {
+        name[plen] = (48 + k) as u8
+        name[plen + 1] = 0 as u8
+        if push_prop(out, (&name[0]) as u64) {
+            taken = taken + 1
+        }
+        k = k + 1
+    }
+    return taken
+}
+
+fn conf_resolv(out: *mut rt.Buf) -> bool {
+    var path: [u8; 17] = "/etc/resolv.conf\0"
+    var file: rt.Buf = rt.buf_new()
+    let have: bool = rt.read_file((&path[0]) as u64, &file)
+    if have && file.len > 0 {
+        rt.buf_push_bytes(out, file.ptr, file.len)
+        rt.buf_free(&file)
+        return true
+    }
+    rt.buf_free(&file)
+    var taken: usize = 0
+    var p1: [u8; 7] = "net.dns"
+    taken = push_prefix(out, (&p1[0]) as u64, 7)
+    if taken == 0 {
+        var p2: [u8; 14] = "dhcp.wlan0.dns"
+        taken = push_prefix(out, (&p2[0]) as u64, 14)
+    }
+    if taken == 0 {
+        var p3: [u8; 13] = "dhcp.eth0.dns"
+        taken = push_prefix(out, (&p3[0]) as u64, 13)
+    }
+    return taken > 0
+}
+
+fn conf_hosts(out: *mut rt.Buf) -> bool {
+    var sys: [u8; 18] = "/system/etc/hosts\0"
+    if rt.read_file((&sys[0]) as u64, out) {
+        return true
+    }
+    var path: [u8; 11] = "/etc/hosts\0"
+    return rt.read_file((&path[0]) as u64, out)
+}

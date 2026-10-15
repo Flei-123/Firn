@@ -54,10 +54,22 @@
 #                         and values/ic_launcher_background.xml): compiled with
 #                         aapt2 into the APK, the manifest gets android:icon
 #   --out <file.apk>      (default: build/android/<name>/<name>.apk)
+#   --release             never create a signing key (same as FIRN_RELEASE=1)
 #
 # Environment: FIRNC, FIRNLIB (default: this tree), NDK, SDK, API (29),
 # KEYSTORE (default ~/.firn/android.keystore, created once and KEPT: a new
 # key per build would make every APK a different app to Android).
+# Signing (every APK is signed and VERIFIED, see docs/ANDROID.md "Signing"):
+#   KSALIAS          key alias in the keystore (default firn)
+#   KSPASS           store password; KSPASS_FILE=<file> reads it from the first
+#                    line of a file instead (nothing secret goes into the repo)
+#   KEYPASS          key password (default: the store password);
+#                    KEYPASS_FILE=<file> likewise
+#   FIRN_RELEASE=1   (or --release) a MISSING keystore is an error, never a
+#                    fresh key: a release APK signed with a new key cannot
+#                    update the installed app
+#   EXPECT_CERT_SHA256  hex SHA-256 of the signer certificate the APK must
+#                    carry (pin); without it the check is against the keystore
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 
@@ -70,7 +82,7 @@ SRCDIR=$(dirname "$ENTRY_ABS")
 
 NAME=$(basename "$SRCDIR"); PKG=""; LIB=firnapp; ABI=both
 VCODE=1; VNAME=0.1; OPT=release-safe; ASSETS=""; PERMS=(); EXTRA=""; DEX=""
-PUSH=0; PICK=0; CAMERA=0; ARGSFILE=""
+PUSH=0; PICK=0; CAMERA=0; ARGSFILE=""; RELEASE=${FIRN_RELEASE:-0}
 OUT=""; ICONRES=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -91,6 +103,7 @@ while [ $# -gt 0 ]; do
         --args-file) ARGSFILE=$2; shift 2 ;;
         --icon-res) ICONRES=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
+        --release) RELEASE=1; shift ;;
         *) echo "unknown option $1" >&2; usage ;;
     esac
 done
@@ -106,7 +119,25 @@ API=${API:-29}
 CAMLIBS=""
 if [ $CAMERA -eq 1 ]; then CAMLIBS="-lcamera2ndk -lmediandk"; PERMS+=(android.permission.CAMERA); fi
 KEYSTORE=${KEYSTORE:-$HOME/.firn/android.keystore}
+KSALIAS=${KSALIAS:-firn}
+if [ -n "${KSPASS_FILE:-}" ]; then
+    [ -r "$KSPASS_FILE" ] || { echo "ERROR: KSPASS_FILE not readable: $KSPASS_FILE" >&2; exit 2; }
+    KSPASS=$(head -n1 "$KSPASS_FILE")
+fi
 KSPASS=${KSPASS:-firnstore}
+if [ -n "${KEYPASS_FILE:-}" ]; then
+    [ -r "$KEYPASS_FILE" ] || { echo "ERROR: KEYPASS_FILE not readable: $KEYPASS_FILE" >&2; exit 2; }
+    KEYPASS=$(head -n1 "$KEYPASS_FILE")
+fi
+KEYPASS=${KEYPASS:-$KSPASS}
+# passwords reach keytool/apksigner through the environment (env:NAME), not
+# through argv: argv is visible in `ps`
+export KSPASS KEYPASS
+# fail BEFORE the long compile, not after it
+if [ "$RELEASE" = 1 ] && [ ! -f "$KEYSTORE" ]; then
+    echo "ERROR: release build but no signing key at $KEYSTORE (restore it from the backup, docs/ANDROID.md)" >&2
+    exit 1
+fi
 export FIRNLIB
 
 BUILD=$ROOT/build/android/$SAFE
@@ -254,15 +285,41 @@ with zipfile.ZipFile(apk, "a", zipfile.ZIP_DEFLATED) as z:
             z.write(full, rel, compress_type=kind)
 PY
 "$BT/zipalign" -f -p 4 "$BUILD/raw.apk" "$BUILD/aligned.apk"
-mkdir -p "$(dirname "$KEYSTORE")"
 if [ ! -f "$KEYSTORE" ]; then
-    keytool -genkeypair -keystore "$KEYSTORE" -alias firn \
-        -storepass "$KSPASS" -keypass "$KSPASS" -keyalg RSA -keysize 4096 \
+    if [ "$RELEASE" = 1 ]; then
+        echo "ERROR: release build but no signing key at $KEYSTORE (restore it from the backup, docs/ANDROID.md)" >&2
+        exit 1
+    fi
+    mkdir -p "$(dirname "$KEYSTORE")"
+    keytool -genkeypair -keystore "$KEYSTORE" -alias "$KSALIAS" \
+        -storepass:env KSPASS -keypass:env KEYPASS -keyalg RSA -keysize 4096 \
         -validity 10950 -dname "CN=Firn, O=fleitec" >/dev/null 2>&1
+    chmod 600 "$KEYSTORE"
     echo "  NEW signing key: $KEYSTORE (keep it: updates need the same key)"
 fi
 mkdir -p "$(dirname "$OUT")"
-"$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass "pass:$KSPASS" \
-    --key-pass "pass:$KSPASS" --out "$OUT" "$BUILD/aligned.apk"
+"$BT/apksigner" sign --ks "$KEYSTORE" --ks-key-alias "$KSALIAS" \
+    --ks-pass env:KSPASS --key-pass env:KEYPASS --out "$OUT" "$BUILD/aligned.apk"
 rm -f "$BUILD/raw.apk" "$BUILD/aligned.apk"
+
+# ---- 5. verify the signature -------------------------------------------------
+# The APK must verify (v2 or v3 scheme) and carry the certificate of the
+# keystore (or EXPECT_CERT_SHA256): a build that silently used another key
+# would be an app that cannot update the installed one.
+VERIFY=$("$BT/apksigner" verify --verbose --print-certs "$OUT" 2>&1) || {
+    echo "$VERIFY" >&2; echo "ERROR: apksigner verify failed for $OUT" >&2; exit 1; }
+echo "$VERIFY" | grep -Eq 'scheme \(APK Signature Scheme v[23]\): true' || {
+    echo "$VERIFY" >&2; echo "ERROR: $OUT has neither a v2 nor a v3 signature" >&2; exit 1; }
+APK_CERT=$(echo "$VERIFY" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n1 | tr 'A-F' 'a-f')
+WANT_CERT=${EXPECT_CERT_SHA256:-}
+if [ -z "$WANT_CERT" ]; then
+    WANT_CERT=$(keytool -list -keystore "$KEYSTORE" -alias "$KSALIAS" -storepass:env KSPASS 2>/dev/null \
+        | sed -n 's/.*SHA-256): //p' | head -n1)
+fi
+WANT_CERT=$(echo "$WANT_CERT" | tr -d ':' | tr 'A-F' 'a-f')
+if [ -z "$APK_CERT" ] || [ -z "$WANT_CERT" ] || [ "$APK_CERT" != "$WANT_CERT" ]; then
+    echo "ERROR: signer certificate mismatch (apk '$APK_CERT', expected '$WANT_CERT')" >&2
+    exit 1
+fi
+echo "  signed + verified: cert SHA-256 $APK_CERT"
 echo "done: $OUT ($(stat -c%s "$OUT") octets, package $PKG)"
