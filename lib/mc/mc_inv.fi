@@ -40,6 +40,7 @@ import mc.mc_nbt
 import mc.mc_schema
 import mc.mc_registry
 import mc.mc_hash
+import mc.mc_attr
 
 export {
     Inv, inv_new, inv_free, inv_slot_format, inv_on_window_items, inv_on_set_slot, inv_on_window_items_v, inv_on_set_slot_v, inv_hotbar_item, inv_hotbar_count, inv_held_item,
@@ -57,6 +58,7 @@ const CLICK_OUTSIDE: i32 = 0 - 999
 const INV_SLOTS: usize = 46
 // component hash patches of hashed stacks (1.21.5+): scratch of the stack being parsed and the table by stack signature
 const PS_LEN: usize = 64 // 45 lore elements seen, 46 lore state (0 none, 1 collecting, 99 unhashable), [48,64) lore element hashes; [0,8) added types, [8,16) added hashes, [16,24) removed types, [24,32) enchantment key hashes, [32,40) level hashes, 40 n_add, 41 n_rem, 42 n_ench, 43 enchantments seen, 44 pending enchantment id
+const XS_LEN: usize = 256 // structured component scratch: [0] kind (1 food, 2 tool, 3 attribute_modifiers), [1] unhashable, [6] component type, see xs_line
 const PT_CAP: usize = 64
 const PT_STRIDE: usize = 20 // [0] signature (0 = free), [1] n_add, [2,10) types, [10,18) hashes, [18] n_rem, [19] packed removed types (4 x 8 bit)
 const INV_CAP: usize = 100 // 46 player-window slots + up to 54 container slots
@@ -100,18 +102,22 @@ struct Inv {
     win_cols: i32, // columns of the container grid: 9 (chest, shulker box), 3 (dispenser / dropper), 5 (hopper)
     win_title: u64, // u8 [WIN_TITLE_CAP], plain text of the Open Window title
     win_title_n: i32,
+    win_res: i32, // internal slot of the result slot of the open window (crafting table 0, furnace family 2), -1 = none: never placed into, left to the server
+    xscr: u64, // u32 [XS_LEN], structured component (food / tool / attribute_modifiers) being parsed
 }
 
 fn inv_new() -> Inv {
     var v: Inv = Inv { ids: rt.heap_alloc(INV_CAP * 4), counts: rt.heap_alloc(INV_CAP * 4), effs: rt.heap_alloc(INV_CAP * 4),
         sigs: rt.heap_alloc(INV_CAP * 4), maxs: rt.heap_alloc(INV_CAP * 4), cur_sig: 0, cur_max: 0,
         cur_id: 0 - 1, cur_count: 0, cur_eff: 0, eff_id: 0 - 1, reg: 0, state_id: 0, action: 1, n_updates: 0 as u32, n_srv: 0 as u32, hash_off: false, n_clicks: 0 as u32, bad: 0 as u32, qc_status: 0, qc_type: 0, qc_mask: 0 as u64, qc_hi: 0 as u64, win: 0, win_n: 0, creative: false,
-        pscr: rt.heap_alloc(PS_LEN * 4), ptab: rt.heap_alloc(PT_CAP * PT_STRIDE * 4), pt_next: 0, ek: 0, ek_n: 0, win_cols: 9, win_title: rt.heap_alloc(WIN_TITLE_CAP), win_title_n: 0 }
+        pscr: rt.heap_alloc(PS_LEN * 4), ptab: rt.heap_alloc(PT_CAP * PT_STRIDE * 4), pt_next: 0, ek: 0, ek_n: 0, win_cols: 9, win_title: rt.heap_alloc(WIN_TITLE_CAP), win_title_n: 0, win_res: 0 - 1, xscr: rt.heap_alloc(XS_LEN * 4) }
     inv_clear(&v)
     var z: usize = 0
     while z < PT_CAP * PT_STRIDE { rt.st32(v.ptab, z, 0 as u32); z = z + 1 }
     z = 0
     while z < PS_LEN { rt.st32(v.pscr, z, 0 as u32); z = z + 1 }
+    z = 0
+    while z < XS_LEN { rt.st32(v.xscr, z, 0 as u32); z = z + 1 }
     return v
 }
 
@@ -122,6 +128,8 @@ fn inv_free(v: *mut Inv) {
     rt.heap_free((*v).sigs, INV_CAP * 4)
     rt.heap_free((*v).maxs, INV_CAP * 4)
     rt.heap_free((*v).pscr, PS_LEN * 4)
+    rt.heap_free((*v).xscr, XS_LEN * 4)
+    (*v).xscr = 0
     rt.heap_free((*v).ptab, PT_CAP * PT_STRIDE * 4)
     (*v).pscr = 0
     (*v).ptab = 0
@@ -270,6 +278,7 @@ fn inv_local_close(v: *mut Inv) {
     (*v).win = 0
     (*v).win_n = 0
     (*v).win_cols = 9
+    (*v).win_res = 0 - 1
     (*v).win_title_n = 0
     clear_container(v)
     (*v).qc_status = 0
@@ -283,6 +292,23 @@ fn menu_slots(typ: i32, protocol: i32) -> i32 {
     if typ == 6 { return 9 }
     if typ == menu_hopper(protocol) { return 5 }
     if typ == menu_shulker(protocol) { return 27 }
+    if typ == menu_crafting(protocol) { return 10 }
+    if menu_is_furnace(typ, protocol) { return 3 }
+    return 0 - 1
+}
+
+// crafting table (result 0 + grid 1..9) and the furnace family (furnace, blast furnace, smoker: input 0, fuel 1, result 2): the items are tracked, the result
+// slot takes nothing and is left to the server, shift clicks are not predicted (the per menu quickMoveStack rules are not modelled)
+fn menu_crafting(protocol: i32) -> i32 { if protocol >= 765 { return 12 } else { return 11 } }
+fn menu_is_furnace(typ: i32, protocol: i32) -> bool {
+    var sh: i32 = 0
+    if protocol >= 765 { sh = 1 }
+    return typ == 9 + sh || typ == 13 + sh || typ == 21 + sh
+}
+// container index of the result slot (-1 = none)
+fn menu_result(typ: i32, protocol: i32) -> i32 {
+    if typ == menu_crafting(protocol) { return 0 }
+    if menu_is_furnace(typ, protocol) { return 2 }
     return 0 - 1
 }
 
@@ -293,6 +319,7 @@ fn menu_shulker(protocol: i32) -> i32 { if protocol >= 765 { return 20 } else { 
 fn menu_cols(typ: i32, protocol: i32) -> i32 {
     if typ == 6 { return 3 }
     if typ == menu_hopper(protocol) { return 5 }
+    if typ == menu_crafting(protocol) || menu_is_furnace(typ, protocol) { return 3 }
     return 9
 }
 
@@ -386,12 +413,14 @@ fn inv_on_open_window_v(v: *mut Inv, ver: *mut mc_version.Version, b: *mut bytes
     var id: i32 = 0
     var n: i32 = 0 - 1
     var cols: i32 = 9
+    var res: i32 = 0 - 1
     if protocol >= 477 {
         id = bytes.get_varint(b) catch (0 - 1)
         let typ: i32 = bytes.get_varint(b) catch (0 - 1)
         if id < 0 { (*v).bad = (*v).bad + 1 as u32; return false }
         n = menu_slots(typ, protocol)
         cols = menu_cols(typ, protocol)
+        if n > 0 && menu_result(typ, protocol) >= 0 { res = CONT0 + menu_result(typ, protocol) }
         if protocol >= 765 {
             title_from_nbt(v, b)
         } else {
@@ -424,6 +453,7 @@ fn inv_on_open_window_v(v: *mut Inv, ver: *mut mc_version.Version, b: *mut bytes
     (*v).win = id
     (*v).win_n = n
     (*v).win_cols = cols
+    (*v).win_res = res
     return true
 }
 
@@ -663,17 +693,17 @@ fn fnv_bytes(h: u64, p: u64, n: usize) -> u64 {
 // ---- component hashes of the hashed stacks (1.21.5+) ------------------------------------------------------------------------
 // data component type ids (minecraft-data SlotComponentType) of the components we can hash; -1 = protocol without hashed stacks.
 // k: 0 max_stack_size, 1 max_damage, 2 damage, 3 unbreakable, 4 custom_name, 5 item_name, 6 rarity, 7 enchantments, 8 repair_cost, 9 enchantment_glint_override,
-// 10 lore, 11 custom_data
+// 10 lore, 11 custom_data, 12 attribute_modifiers, 13 tool, 14 food
 fn hc_type(protocol: i32, k: i32) -> i32 {
     if protocol == 770 || protocol == 772 {
         if k == 0 { return 1 } else if k == 1 { return 2 } else if k == 2 { return 3 } else if k == 3 { return 4 } else if k == 4 { return 5 }
         else if k == 5 { return 6 } else if k == 6 { return 9 } else if k == 7 { return 10 } else if k == 8 { return 16 } else if k == 9 { return 18 }
-        else if k == 10 { return 8 } else { return 0 }
+        else if k == 10 { return 8 } else if k == 11 { return 0 } else if k == 12 { return 13 } else if k == 13 { return 25 } else if k == 14 { return 20 } else { return 0 }
     }
     if protocol == 774 || protocol == 775 {
         if k == 0 { return 1 } else if k == 1 { return 2 } else if k == 2 { return 3 } else if k == 3 { return 4 } else if k == 4 { return 6 }
         else if k == 5 { return 9 } else if k == 6 { return 12 } else if k == 7 { return 13 } else if k == 8 { return 19 } else if k == 9 { return 21 }
-        else if k == 10 { return 11 } else { return 0 }
+        else if k == 10 { return 11 } else if k == 11 { return 0 } else if k == 12 { return 16 } else if k == 13 { return 28 } else if k == 14 { return 23 } else { return 0 }
     }
     return 0 - 1
 }
@@ -686,6 +716,7 @@ fn inv_set_enchant_keys(v: *mut Inv, keys: u64, n: i32) {
 }
 
 fn ps_reset(v: *mut Inv) {
+    rt.st32((*v).xscr, 0, 0 as u32)
     var i: usize = 40
     while i < 48 { rt.st32((*v).pscr, i, 0 as u32); i = i + 1 }
 }
@@ -867,6 +898,211 @@ fn hex_byte(p: u64, o: usize) -> i32 {
     return a * 16 + b
 }
 
+// ---- food / tool / attribute_modifiers: the dump lines are collected in `xscr` and hashed when the next component (or the end of the stack) comes ----
+// kind 1 food: [2] nutrition, [3] saturation bits, [4] can_always_eat, [7] seen mask
+// kind 2 tool: [2] rules, [3] default speed bits, [4] damage per block, [5] can destroy in creative; rule r at 16 + 8r: [0] blocks hash, [1] has speed, [2] speed bits,
+//   [3] has drops flag, [4] drops, [5] blocks form (1 tag, 2 ids), [6] number of ids; id key hashes at 128 + 8r + j; rule hashes end up at 192
+// kind 3 attribute_modifiers: [2] entries; entry e at 16 + 8e: [0] attribute id, [1] id hash, [2] amount lo, [3] amount hi, [4] operation, [5] slot, [6] display; entry hashes at 192
+fn xs_get(v: *mut Inv, i: usize) -> u32 { return rt.ld32((*v).xscr, i) }
+fn xs_set(v: *mut Inv, i: usize, x: u32) { rt.st32((*v).xscr, i, x) }
+fn xs_ptr(v: *mut Inv, i: usize) -> u64 { return (*v).xscr + ((i * 4) as u64) }
+fn xs_bad(v: *mut Inv) { xs_set(v, 1, 1 as u32) }
+
+fn xs_clear(v: *mut Inv) {
+    var i: usize = 0
+    while i < XS_LEN { rt.st32((*v).xscr, i, 0 as u32); i = i + 1 }
+}
+
+fn xs_begin(v: *mut Inv, protocol: i32, ct: i32) {
+    xs_clear(v)
+    var kind: u32 = 0 as u32
+    if ct == hc_type(protocol, 12) { kind = 3 as u32 } else if ct == hc_type(protocol, 13) { kind = 2 as u32 } else if ct == hc_type(protocol, 14) { kind = 1 as u32 }
+    if kind == (0 as u32) { return }
+    xs_set(v, 0, kind)
+    xs_set(v, 6, ct as u32)
+    if kind == (2 as u32) { xs_set(v, 3, 1065353216 as u32); xs_set(v, 4, 1 as u32); xs_set(v, 5, 1 as u32) }
+}
+
+// "0x..." -> number
+fn parse_hex(p: u64, n: usize, ok: *mut bool) -> u64 {
+    *ok = n > 2 && rt.ld8(p, 0) == 48 as u8 && rt.ld8(p, 1) == 120 as u8
+    var r: u64 = 0
+    var i: usize = 2
+    while i < n && *ok {
+        let d: i32 = hex_nib(rt.ld8(p, i))
+        if d < 0 { *ok = false } else { r = (r << 4) | (d as u64) }
+        i = i + 1
+    }
+    return r
+}
+
+// `[N]` at p[from]; end = index behind the `]`; -1 when not an index
+fn idx_at(p: u64, n: usize, from: usize, end: *mut usize) -> i32 {
+    if from >= n || rt.ld8(p, from) != 91 as u8 { return 0 - 1 }
+    var q: usize = from + 1
+    while q < n && rt.ld8(p, q) != 93 as u8 { q = q + 1 }
+    if q >= n { return 0 - 1 }
+    var ok: bool = false
+    let x: i32 = parse_dec(p + ((from + 1) as u64), q - from - 1, &ok)
+    if !ok { return 0 - 1 }
+    *end = q + 1
+    return x
+}
+
+// quoted text `"..."` -> inner pointer + length (false = not quoted)
+fn unquote(vp: u64, vn: usize, ip: *mut u64, inn: *mut usize) -> bool {
+    if vn < 2 || rt.ld8(vp, 0) != 34 as u8 || rt.ld8(vp, vn - 1) != 34 as u8 { return false }
+    *ip = vp + 1 as u64
+    *inn = vn - 2
+    return true
+}
+
+fn xs_flag(vp: u64, vn: usize) -> u32 {
+    if vn == 4 && line_is(vp, 4, "true") { return 1 as u32 }
+    return 0 as u32
+}
+
+// `#N` count line
+fn xs_count(vp: u64, vn: usize) -> i32 {
+    var ok: bool = false
+    if vn < 2 || rt.ld8(vp, 0) != 35 as u8 { return 0 - 1 }
+    let c: i32 = parse_dec(vp + 1 as u64, vn - 1, &ok)
+    if !ok { return 0 - 1 }
+    return c
+}
+
+// the key hash "minecraft:<name>" of block `id`; false = unknown
+fn xs_block_key(v: *mut Inv, id: i32, out: *mut u32) -> bool {
+    if (*v).reg == 0 || id < 0 || id >= mc_registry.reg_block_count((*v).reg as *mut mc_registry.Registry) { return false }
+    var n: usize = 0
+    let p: u64 = mc_registry.reg_block_name((*v).reg as *mut mc_registry.Registry, id, &n)
+    if n == 0 { return false }
+    var colon: bool = false
+    var i: usize = 0
+    while i < n { if rt.ld8(p, i) == 58 as u8 { colon = true }; i = i + 1 }
+    if colon { *out = mc_hash.hash_string(p, n); return true }
+    let b: u64 = rt.heap_alloc(n + 12)
+    rt.mem_copy(b, "minecraft:".p as u64, 10)
+    rt.mem_copy(b + 10 as u64, p, n)
+    *out = mc_hash.hash_string(b, n + 10)
+    rt.heap_free(b, n + 12)
+    return true
+}
+
+fn xs_line(v: *mut Inv, rp: u64, rn: usize, vp: u64, vn: usize) {
+    let kind: u32 = xs_get(v, 0)
+    var ok: bool = false
+    if kind == (1 as u32) {
+        if nh_key_is(rp, rn, "data.nutrition") { xs_set(v, 2, parse_dec(vp, vn, &ok) as u32); if !ok { xs_bad(v) } }
+        else if nh_key_is(rp, rn, "data.saturationModifier") { xs_set(v, 3, parse_hex(vp, vn, &ok) as u32); if !ok { xs_bad(v) } }
+        else if nh_key_is(rp, rn, "data.canAlwaysEat") { xs_set(v, 4, xs_flag(vp, vn)) }
+    } else if kind == (2 as u32) {
+        if nh_key_is(rp, rn, "data.rules") {
+            let c: i32 = xs_count(vp, vn)
+            if c < 0 || c > 8 { xs_bad(v) } else { xs_set(v, 2, c as u32) }
+        } else if nh_key_is(rp, rn, "data.defaultMiningSpeed") { xs_set(v, 3, parse_hex(vp, vn, &ok) as u32); if !ok { xs_bad(v) } }
+        else if nh_key_is(rp, rn, "data.damagePerBlock") { xs_set(v, 4, parse_dec(vp, vn, &ok) as u32); if !ok { xs_bad(v) } }
+        else if nh_key_is(rp, rn, "data.canDestroyBlocksInCreative") { xs_set(v, 5, xs_flag(vp, vn)) }
+        else if rn > 12 && line_is(rp, rn, "data.rules[") {
+            var e: usize = 0
+            let r: i32 = idx_at(rp, rn, 10, &e)
+            if r < 0 || r >= 8 || e >= rn || rt.ld8(rp, e) != 46 as u8 { return }
+            let fp: u64 = rp + ((e + 1) as u64)
+            let fn2: usize = rn - e - 1
+            let base: usize = 16 + (r as usize) * 8
+            if nh_key_is(fp, fn2, "blocks.name") {
+                var ip: u64 = 0
+                var inn: usize = 0
+                if unquote(vp, vn, &ip, &inn) { xs_set(v, base, mc_hash.hash_blocks_tag(ip, inn)); xs_set(v, base + 5, 1 as u32) } else { xs_bad(v) }
+            } else if nh_key_is(fp, fn2, "blocks.ids") {
+                let c: i32 = xs_count(vp, vn)
+                if c < 1 || c > 8 { xs_bad(v) } else { xs_set(v, base + 5, 2 as u32); xs_set(v, base + 6, c as u32) }
+            } else if fn2 > 12 && line_is(fp, fn2, "blocks.ids[") {
+                var e2: usize = 0
+                let j: i32 = idx_at(fp, fn2, 10, &e2)
+                let bid: i32 = parse_dec(vp, vn, &ok)
+                var kh: u32 = 0 as u32
+                if j < 0 || j >= 8 || !ok || !xs_block_key(v, bid, &kh) { xs_bad(v) } else { xs_set(v, 128 + (r as usize) * 8 + (j as usize), kh) }
+            } else if nh_key_is(fp, fn2, "speed") {
+                xs_set(v, base + 1, 1 as u32)
+                xs_set(v, base + 2, parse_hex(vp, vn, &ok) as u32)
+                if !ok { xs_bad(v) }
+            } else if nh_key_is(fp, fn2, "correctDropForBlocks") {
+                xs_set(v, base + 3, 1 as u32)
+                xs_set(v, base + 4, xs_flag(vp, vn))
+            }
+        }
+    } else if kind == (3 as u32) {
+        if nh_key_is(rp, rn, "data") {
+            let c: i32 = xs_count(vp, vn)
+            if c < 0 || c > 8 { xs_bad(v) } else { xs_set(v, 2, c as u32) }
+        } else if rn > 6 && line_is(rp, rn, "data[") {
+            var e: usize = 0
+            let x: i32 = idx_at(rp, rn, 4, &e)
+            if x < 0 || x >= 8 || e >= rn || rt.ld8(rp, e) != 46 as u8 { return }
+            let fp: u64 = rp + ((e + 1) as u64)
+            let fn2: usize = rn - e - 1
+            let base: usize = 16 + (x as usize) * 8
+            if nh_key_is(fp, fn2, "typeId") { xs_set(v, base, parse_dec(vp, vn, &ok) as u32); if !ok { xs_bad(v) } }
+            else if nh_key_is(fp, fn2, "name") {
+                var ip: u64 = 0
+                var inn: usize = 0
+                if unquote(vp, vn, &ip, &inn) { xs_set(v, base + 1, mc_hash.hash_string(ip, inn)) } else { xs_bad(v) }
+            } else if nh_key_is(fp, fn2, "value") {
+                let bits: u64 = parse_hex(vp, vn, &ok)
+                if !ok { xs_bad(v) }
+                xs_set(v, base + 2, (bits & 4294967295) as u32)
+                xs_set(v, base + 3, (bits >> 32) as u32)
+            } else if nh_key_is(fp, fn2, "operation") { xs_set(v, base + 4, parse_dec(vp, vn, &ok) as u32); if !ok { xs_bad(v) } }
+            else if nh_key_is(fp, fn2, "slot") { xs_set(v, base + 5, parse_dec(vp, vn, &ok) as u32); if !ok { xs_bad(v) } }
+            else if nh_key_is(fp, fn2, "display.type") {
+                let d: i32 = parse_dec(vp, vn, &ok)
+                if !ok || d > 1 { xs_bad(v) } else { xs_set(v, base + 6, d as u32) }
+            }
+        }
+    }
+}
+
+// hashes the collected component and adds it to the patch
+fn xs_finish(v: *mut Inv, protocol: i32) {
+    let kind: u32 = xs_get(v, 0)
+    if kind == (0 as u32) { return }
+    xs_set(v, 0, 0 as u32)
+    if xs_get(v, 1) != (0 as u32) { return }
+    let ct: i32 = xs_get(v, 6) as i32
+    var h: u32 = 0 as u32
+    if kind == (1 as u32) {
+        h = mc_hash.hash_food(xs_get(v, 2) as i32, xs_get(v, 3), xs_get(v, 4) != (0 as u32))
+    } else if kind == (2 as u32) {
+        let nr: i32 = xs_get(v, 2) as i32
+        var r: i32 = 0
+        while r < nr {
+            let base: usize = 16 + (r as usize) * 8
+            var bh: u32 = xs_get(v, base)
+            let form: u32 = xs_get(v, base + 5)
+            if form == (2 as u32) { bh = mc_hash.hash_blocks_ids(xs_ptr(v, 128 + (r as usize) * 8), xs_get(v, base + 6) as usize) }
+            else if form != (1 as u32) { return }
+            xs_set(v, 192 + (r as usize), mc_hash.hash_tool_rule(bh, xs_get(v, base + 1) != (0 as u32), xs_get(v, base + 2), xs_get(v, base + 3) != (0 as u32), xs_get(v, base + 4) != (0 as u32)))
+            r = r + 1
+        }
+        h = mc_hash.hash_tool(xs_ptr(v, 192), nr as usize, xs_get(v, 3), xs_get(v, 4) as i32, xs_get(v, 5) != (0 as u32))
+    } else {
+        let ne: i32 = xs_get(v, 2) as i32
+        var x: i32 = 0
+        while x < ne {
+            let base: usize = 16 + (x as usize) * 8
+            var an: usize = 0
+            let ap: u64 = mc_attr.attr_name(protocol, xs_get(v, base) as i32, &an)
+            if ap == 0 || an == 0 { return }
+            let bits: u64 = (xs_get(v, base + 2) as u64) | ((xs_get(v, base + 3) as u64) << 32)
+            xs_set(v, 192 + (x as usize), mc_hash.hash_attr_entry(mc_hash.hash_string(ap, an), xs_get(v, base + 1), bits, xs_get(v, base + 4) as i32, xs_get(v, base + 5) as i32, xs_get(v, base + 6) as i32))
+            x = x + 1
+        }
+        h = mc_hash.hash_list(xs_ptr(v, 192), ne as usize)
+    }
+    ps_add(v, ct, h)
+}
+
 // type-only components (no data line): unbreakable = the unit record {} = an empty map
 fn ps_on_type(v: *mut Inv, protocol: i32, ct: i32) {
     if ct == hc_type(protocol, 3) { ps_add(v, ct, mc_hash.hash_map(0, 0, 0)) }
@@ -875,6 +1111,7 @@ fn ps_on_type(v: *mut Inv, protocol: i32, ct: i32) {
 
 // closes the stack being parsed: registers the patch under its signature
 fn patch_register(v: *mut Inv, protocol: i32, sig: i32) {
+    xs_finish(v, protocol)
     if sig == 0 || hc_type(protocol, 0) < 0 { ps_reset(v); return }
     if ps_n(v, 43) != 0 && ps_n(v, 42) != 99 {
         let n: i32 = ps_n(v, 42)
@@ -1070,6 +1307,7 @@ fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *m
                         let rn: usize = fnn - r - 2
                         // hashed stacks (1.21.5+): the value of every component we can hash
                         if hc_type((*ver).protocol, 0) >= 0 && comp_type >= 0 {
+                            if xs_get(v, 0) != (0 as u32) && (comp_type as u32) == xs_get(v, 6) { xs_line(v, rp, rn, vp, vn) }
                             if comp_type == hc_type((*ver).protocol, 10) && rn == 4 && line_is(rp, 4, "data") && vn >= 2 && rt.ld8(vp, 0) == 35 as u8 {
                                 // lore: `data=#N`, then one `data[i]=hex:<text component>` line per element
                                 rt.st32((*v).pscr, 45, 0 as u32)
@@ -1104,9 +1342,11 @@ fn apply_components(v: *mut Inv, ver: *mut mc_version.Version, sem: usize, b: *m
                             }
                         }
                         if rn == 4 && line_is(rp, 4, "type") {
+                            xs_finish(v, (*ver).protocol)
                             comp_type = parse_dec(vp, vn, &okn)
                             if !okn { comp_type = 0 - 1 }
                             if comp_type >= 0 { ps_on_type(v, (*ver).protocol, comp_type) }
+                            if comp_type >= 0 && hc_type((*ver).protocol, 0) >= 0 { xs_begin(v, (*ver).protocol, comp_type) }
                         } else if comp_type == COMP_MAX_STACK && rn == 4 && line_is(rp, 4, "data") {
                             let m: i32 = parse_dec(vp, vn, &okn)
                             if okn && m > 0 && m <= 99 { acc_mx = m }
@@ -1311,7 +1551,7 @@ fn equip_slot(v: *mut Inv, item: i32) -> i32 {
 
 // Slot.mayPlace: the result slot takes nothing, an armour slot only its armour piece
 fn may_place(v: *mut Inv, slot: i32, s: *mut Stk) -> bool {
-    if slot == 0 { return false }
+    if slot == 0 || (slot == (*v).win_res && slot >= 0) { return false }
     if slot >= 5 && slot <= 8 { return equip_slot(v, (*s).item) == slot }
     return true
 }
@@ -1369,7 +1609,7 @@ fn move_to(v: *mut Inv, src: *mut Stk, start: i32, end: i32, reverse: bool) -> b
 // InventoryMenu.quickMoveStack of `index`: `ret` = copy of the stack before the move (item -1 = nothing moved). false = not predictable (result slot).
 fn quick_move(v: *mut Inv, index: i32, ret: *mut Stk) -> bool {
     stk_empty(ret)
-    if index == 0 { return false }
+    if index == 0 || (*v).win_res >= 0 { return false }
     var orig: Stk = stk_new()
     load(v, index, &orig)
     if orig.item < 0 || orig.count <= 0 { return true }
@@ -1441,7 +1681,7 @@ fn pickup_all(v: *mut Inv, slot: i32, button: i32) -> bool {
         var wsn: i32 = first
         while wsn >= 0 && wsn < wsz && cu.count < cmax {
             let m: i32 = inv_win_to_int(v, wsn)
-            if m != 0 && m >= 0 {
+            if m != 0 && m >= 0 && m != (*v).win_res {
                 load(v, m, &sl)
                 if same_stack(&sl, &cu) && sl.count <= cmax {
                     if !(pass == 0 && sl.count == stack_max(v, &sl)) {
@@ -1597,7 +1837,7 @@ fn predict(v: *mut Inv, slot: i32, button: i32, mode: i32, lg: *mut Stk) -> i32 
         if pickup_all(v, slot, button) { return 2 }
         return 0
     }
-    if slot <= 0 || !in_win(v, slot) { return 0 }
+    if slot <= 0 || !in_win(v, slot) || slot == (*v).win_res { return 0 }
     var sl: Stk = stk_new()
     load(v, slot, &sl)
     if mode == 1 && (button == 0 || button == 1) {

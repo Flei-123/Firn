@@ -72,11 +72,25 @@ run_hash() { # $1 = player name, $2 = HASH_OFF, $3 = output file
 }
 run_hash HashOn 0 "$W/h_on.out"
 run_hash HashOff 1 "$W/h_off.out"
-COMPS_CUR=$COMPS_B
-run_hash HashNbt 0 "$W/h_nbt.out"
-L3=$(grep 'mcplay: hashtest' "$W/h_nbt.out" | head -1)
-echo "  nbt comps : $L3"
-case "$L3" in *"comp_pick=0 comp_put=0 plain_pick=0 plain_put=0"*) ;; *) echo "  FAIL  NBT components (custom_data / lore / styled names): the server re-sent slots"; ERR=1;; esac
+# set C: food (can_always_eat), tool (tag rule + 2 block ids + 1 block id, speeds, drops, non-default values), attribute_modifiers (mainhand add_value, any add_multiplied_base,
+# the LAST registry ids to prove the attribute table order)
+COMPS_C='food={nutrition:4,saturation:2.5f,can_always_eat:true},tool={rules:[{blocks:"#minecraft:mineable/pickaxe",speed:8f,correct_for_drops:true},{blocks:["minecraft:dirt","minecraft:sand"],speed:2f},{blocks:"minecraft:stone"}],default_mining_speed:1.5f,damage_per_block:2,can_destroy_blocks_in_creative:false},attribute_modifiers=[{type:"minecraft:attack_damage",slot:"mainhand",id:"test:a",amount:7.5,operation:"add_value"},{type:"minecraft:water_movement_efficiency",id:"test:b",amount:0.25,operation:"add_multiplied_base"}]'
+# set D: the omitted defaults (can_always_eat false, default speed / damage / creative flag, slot any, no speed), other slots and operations
+ATTR_D='{type:"minecraft:max_health",slot:"head",id:"test:c",amount:-2.0,operation:"add_multiplied_total"},{type:"minecraft:armor",id:"test:d",amount:1.0,operation:"add_value"}'
+case "$PROTO" in 770) ;; *) ATTR_D="$ATTR_D"',{type:"minecraft:armor_toughness",id:"test:e",amount:3.0,operation:"add_value",display:{type:"hidden"}}';; esac
+COMPS_D='food={nutrition:1,saturation:0f},tool={rules:[{blocks:"minecraft:dirt"}],default_mining_speed:1f,damage_per_block:1},attribute_modifiers=['"$ATTR_D"']'
+for SET in B C D; do
+    case $SET in B) COMPS_CUR=$COMPS_B; LBL="NBT comps (custom_data / lore / styled names)";; C) COMPS_CUR=$COMPS_C; LBL="food / tool / attribute_modifiers";; D) COMPS_CUR=$COMPS_D; LBL="omitted defaults (food / tool / attribute_modifiers)";; esac
+    run_hash "Hash$SET" 0 "$W/h_$SET.out"
+    L3=$(grep 'mcplay: hashtest' "$W/h_$SET.out" | head -1)
+    echo "  set $SET    : $L3"
+    case "$L3" in *"comp_pick=0 comp_put=0 plain_pick=0 plain_put=0"*) ;; *) echo "  FAIL  set $SET $LBL: the server re-sent slots"; ERR=1;; esac
+    if [ $SET != B ]; then # control: the same stack without hashes must be re-sent (the new components really are on the stack)
+        run_hash "HashOff$SET" 1 "$W/h_off$SET.out"
+        L4=$(grep 'mcplay: hashtest' "$W/h_off$SET.out" | head -1)
+        case "$L4" in *"comp_pick=0 comp_put=0 "*|"") echo "  FAIL  set $SET control: no re-send without hashes ($L4)"; ERR=1;; esac
+    fi
+done
 L1=$(grep 'mcplay: hashtest' "$W/h_on.out" | head -1); L2=$(grep 'mcplay: hashtest' "$W/h_off.out" | head -1)
 echo "  hashes on : $L1"; echo "  hashes off: $L2"
 [ -n "$L1" ] || { echo "  FAIL  no hashtest line (hashes on)"; ERR=1; }
