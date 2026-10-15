@@ -351,7 +351,26 @@ fn find_site_x(
 }
 
 /// Embeds exactly one call site.
-fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
+fn inline_one(m: &mut Module, ci: usize, bi: usize, ii: usize, gi: usize) {
+    inline_one_pooled(m, ci, bi, ii, gi, None)
+}
+
+/// Stack slots the leaf inliner already made in one caller, by (size, align).
+type SlotPool = HashMap<(u64, u64), Vec<Val>>;
+
+/// `pool`: only for LEAF callees (no call inside, so two embedded bodies are
+/// never alive at the same time): the k-th slot of a size/alignment class is
+/// shared by all embedded bodies of the caller instead of growing the frame
+/// by one slot per site. Safe because a body writes its slot before it reads
+/// it (compiler-made parameter spills) and nothing in it can call out.
+fn inline_one_pooled(
+    m: &mut Module,
+    ci: usize,
+    bi: usize,
+    mut ii: usize,
+    gi: usize,
+    mut pool: Option<&mut SlotPool>,
+) {
     let callee = m.funcs[gi].clone();
     let (args, dst, ret_ty, call_loc) = match &m.funcs[ci].blocks[bi].insts[ii] {
         // ROUND 94: the position of the CALL. Everything that belongs to the
@@ -375,9 +394,26 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
     for (k, a) in args.iter().enumerate() {
         valmap.insert(k as Val, *a);
     }
+    let mut used: HashMap<(u64, u64), usize> = HashMap::new();
     for b in &callee.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Alloca { size, align }) = (i.dst, &i.op) {
+                if let Some(pool) = pool.as_deref_mut() {
+                    let key = (*size, *align);
+                    let k = used.entry(key).or_insert(0);
+                    let slots = pool.entry(key).or_default();
+                    if *k < slots.len() {
+                        valmap.insert(d, slots[*k]);
+                        *k += 1;
+                        continue;
+                    }
+                    *k += 1;
+                    let nv = m.funcs[ci].alloca(*size, *align);
+                    slots.push(nv);
+                    valmap.insert(d, nv);
+                    shift += 1;
+                    continue;
+                }
                 let nv = m.funcs[ci].alloca(*size, *align);
                 valmap.insert(d, nv);
                 shift += 1;
@@ -741,11 +777,102 @@ fn trivial_leaf(f: &Func) -> bool {
         })
 }
 
+/// **r591** -- the leaf inliner of `dev-fast`.
+///
+/// `dev-fast` has no size-rule inliner (it makes the call stack unreadable),
+/// so every tiny helper (`str.chars`, `vec_elem_ptr`, `str.length`, the
+/// `rt.ld*`/`st*` accessors) cost a full call: ~17 instructions for `chars`
+/// of which two are the body. Measured on OpenPlan `derive`: 18 M calls of
+/// `str.chars` alone = 0.4 G instructions.
+///
+/// What stays readable: a DEV LEAF calls nothing, is loop free, has at most
+/// parameter-spill allocas (shared by all embedded bodies of one caller) and
+/// contains NOTHING that can trap or print a position -- no
+/// `Checked*` op (a panic stands in the frame of the function whose code
+/// panics, with its backtrace unchanged), no syscall, atomic, barrier, asm,
+/// MMIO or thread op. It is therefore never on a call stack unless the
+/// debugger stops INSIDE it, and no panic message, exit code or backtrace of
+/// a program changes. Every copied instruction keeps the position of the
+/// callee (`inline_one`).
+const MAX_DEV_LEAF_INSTS: usize = 18;
+const MAX_DEV_LEAF_BLOCKS: usize = 4;
+
+fn dev_leaf(f: &Func) -> bool {
+    if !allowed_at_all(f)
+        || f.inline_hint == Some(false)
+        || f.blocks.len() > MAX_DEV_LEAF_BLOCKS
+        || f.inst_count() > MAX_DEV_LEAF_INSTS
+        || !f.no_coalesce.is_empty()
+    {
+        return false;
+    }
+    for b in &f.blocks {
+        // loop free: every edge goes forward (blocks are numbered by position)
+        if b.term.successors().iter().any(|s| *s <= b.id) {
+            return false;
+        }
+        if b.insts.iter().any(|i| !matches!(
+            i.op,
+            Op::Const(_)
+                | Op::Bin(..)
+                | Op::BinWrapSat { .. }
+                | Op::Cmp { .. }
+                | Op::Un(..)
+                | Op::Cast { .. }
+                | Op::Load { .. }
+                | Op::Store { .. }
+                | Op::PtrAdd { .. }
+                | Op::Select { .. }
+                | Op::Alloca { .. }
+                | Op::Phi { .. }
+                | Op::CheckedBin { .. }
+                | Op::CheckedDiv { .. }
+                | Op::CheckedCast { .. }
+                | Op::CheckedIdx { .. }
+        )) {
+            return false;
+        }
+    }
+    true
+}
+
+/// r591 -- one round of the dev-fast leaf inliner. Returns the number of
+/// embeddings and the callers that received one.
+pub fn inline_module_dev_leaves(m: &mut Module) -> (usize, Vec<usize>) {
+    let dbg = std::env::var("FIRNC_INLINE_DEBUG").is_ok();
+    let leaf: Vec<bool> = m.funcs.iter().map(dev_leaf).collect();
+    let mut changed = Vec::new();
+    let loops_only = std::env::var("FIRN_LEAF_ALL").is_err();
+    let n = inline_flagged_leaves_x(m, &leaf, dbg, loops_only, &mut changed);
+    changed.sort();
+    changed.dedup();
+    (n, changed)
+}
+
 /// Phase 1 of the first round: embed every call of a trivial leaf, outside
 /// the budget. Returns the number of embeddings; the callers that received
 /// one are appended to `changed`.
 fn inline_trivial_leaves(m: &mut Module, dbg: bool, changed: &mut Vec<usize>) -> usize {
     let triv: Vec<bool> = m.funcs.iter().map(trivial_leaf).collect();
+    inline_flagged_leaves(m, &triv, dbg, changed)
+}
+
+/// Embeds every call of a function flagged in `triv` (outside the budget; the
+/// callee must be a leaf, so it cannot reach its caller).
+fn inline_flagged_leaves(m: &mut Module, triv: &[bool], dbg: bool, changed: &mut Vec<usize>) -> usize {
+    inline_flagged_leaves_x(m, triv, dbg, false, changed)
+}
+
+/// `loops_only`: only call sites inside a loop of the caller (the sites that
+/// run often); a caller without such a site is not touched and not
+/// re-optimized -- that is what keeps the compile time of `dev-fast` down.
+fn inline_flagged_leaves_x(
+    m: &mut Module,
+    triv: &[bool],
+    dbg: bool,
+    loops_only: bool,
+    changed: &mut Vec<usize>,
+) -> usize {
     if !triv.iter().any(|t| *t) {
         return 0;
     }
@@ -759,6 +886,7 @@ fn inline_trivial_leaves(m: &mut Module, dbg: bool, changed: &mut Vec<usize>) ->
                 continue;
             }
         }
+        let mut pool: SlotPool = HashMap::new();
         // Resume the scan where the last embedding happened: the blocks
         // before it hold no trivial call any more.
         let mut start_b = 0usize;
@@ -770,8 +898,15 @@ fn inline_trivial_leaves(m: &mut Module, dbg: bool, changed: &mut Vec<usize>) ->
             if caller.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
                 break;
             }
+            let hot: Vec<bool> = if loops_only { loop_blocks(caller) } else { Vec::new() };
+            if loops_only && !hot.iter().any(|h| *h) {
+                break;
+            }
             let mut site: Option<(usize, usize, usize)> = None;
             'scan: for bi in start_b..caller.blocks.len() {
+                if loops_only && !hot[bi] {
+                    continue;
+                }
                 for (ii, inst) in caller.blocks[bi].insts.iter().enumerate() {
                     if let Op::Call { name, args } = &inst.op {
                         if let Some(&gi) = idx.get(name) {
@@ -792,7 +927,7 @@ fn inline_trivial_leaves(m: &mut Module, dbg: bool, changed: &mut Vec<usize>) ->
                     if dbg {
                         eprintln!("inline-trivial: {} <- {}", m.funcs[ci].name, m.funcs[gi].name);
                     }
-                    inline_one(m, ci, bi, ii, gi);
+                    inline_one_pooled(m, ci, bi, ii, gi, Some(&mut pool));
                     changed.push(ci);
                     n += 1;
                     start_b = bi;
@@ -1225,6 +1360,50 @@ mod tests {
         let s = g.push(0, FTy::I32, Op::Bin(BinOp::Add, 0, 1));
         g.set_term(0, Term::Ret(Some(s)));
         g
+    }
+
+    fn main_calling(callee: &str) -> Func {
+        let mut f = Func::new("main", vec![], FTy::I32);
+        let a = f.push(0, FTy::I32, Op::Const(2));
+        let b = f.push(0, FTy::I32, Op::Const(40));
+        let r = f.push(0, FTy::I32, Op::Call { name: callee.into(), args: vec![a, b] });
+        f.set_term(0, Term::Ret(Some(r)));
+        f
+    }
+
+    fn calls_in(m: &Module, func: &str) -> usize {
+        let f = m.funcs.iter().find(|f| f.name == func).expect("function");
+        f.blocks.iter().flat_map(|b| b.insts.iter()).filter(|i| matches!(i.op, Op::Call { .. })).count()
+    }
+
+    /// r591: the dev-fast leaf inliner embeds a call-free, loop-free body.
+    #[test]
+    fn dev_leaf_is_embedded() {
+        let mut m = Module::new();
+        m.funcs.push(add_fn());
+        m.funcs.push(main_calling("add"));
+        let (n, changed) = inline_module_dev_leaves(&mut m);
+        assert_eq!(n, 1);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(calls_in(&m, "main"), 0);
+    }
+
+    /// r591: a callee that calls anything is no dev leaf (its frame would
+    /// vanish from a call stack), nor is one that carries `#[no_inline]`.
+    #[test]
+    fn dev_leaf_refuses_callers_and_no_inline() {
+        let mut m = Module::new();
+        let mut g = Func::new("g", vec![FTy::I32, FTy::I32], FTy::I32);
+        let r = g.push(0, FTy::I32, Op::Call { name: "add".into(), args: vec![0, 1] });
+        g.set_term(0, Term::Ret(Some(r)));
+        m.funcs.push(add_fn());
+        m.funcs.push(g);
+        m.funcs.push(main_calling("g"));
+        assert!(!dev_leaf(&m.funcs[1]));
+        let mut h = add_fn();
+        h.inline_hint = Some(false);
+        assert!(!dev_leaf(&h));
+        assert!(dev_leaf(&m.funcs[0]));
     }
 
     #[test]
