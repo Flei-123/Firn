@@ -6,7 +6,7 @@
 #     independent reference (python / node / java tools, never Mojang code).
 #     Each prints a line `RESULT <name>: ok` and exits 0 on success.
 #
-# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay)
+# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
@@ -69,6 +69,12 @@ if [ -z "$ONLY" ] || [ "$ONLY" = ajplay ]; then
     echo "== mc/ajplay =="
     bash tools/mc/play/run_aj.sh || ERR=$((ERR+1))
     MC_VERSION=1.21.4 bash tools/mc/play/run_aj.sh || ERR=$((ERR+1))   # u32 flags + delta (protocol 769)
+fi
+# hashed item stacks (1.21.5+): a stack with six components is picked up / put back, the server must not re-send the slot; control run without hashes: ~4 min each version.
+if [ -z "$ONLY" ] || [ "$ONLY" = hashplay ]; then
+    echo "== mc/hashplay =="
+    bash tools/mc/play/run_hash.sh 1.21.5 || ERR=$((ERR+1))
+    bash tools/mc/play/run_hash.sh 1.21.8 || ERR=$((ERR+1))
 fi
 if [ $ERR -eq 0 ]; then echo "RESULT mc: ok"; else echo "RESULT mc: $ERR failing parts"; fi
 exit $ERR
