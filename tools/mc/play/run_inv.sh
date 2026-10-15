@@ -179,6 +179,53 @@ want={1:("dirt",11),5:("stone",64),10:("stone",7),11:("stone",7),12:("stone",7),
 ok=all(got[n]==want[n] for n in want) and got[0] is None and got[26] is None and hot[0]==("stone",2) and hot[1] is None
 sys.exit(0 if ok else 1)
 PY
+# ---- chest UI (MCPLAY_CHEST_UI): the real panel. mcplay opens the chest with a right click packet and prints the cell centres; xdotool then clicks:
+# shift click container 0 (10 stone) -> hotbar, pick up 64 stone of slot 26 and put it into slot 5, shift click the hotbar dirt -> container slot 1, Esc closes
+MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CHEST_TEST=1 MCPLAY_CHEST_UI=1 MCPLAY_RUN_S=45 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player11 > "$W/ct4.out" 2>&1 &
+PP=$!
+sleep 5
+echo "gamemode survival Player11" >&3; echo "give Player11 stone 20" >&3; echo "give Player11 dirt 5" >&3
+echo "execute at Player11 run setblock ~1 ~ ~ minecraft:chest" >&3
+sleep 1
+echo "execute at Player11 run item replace block ~1 ~ ~ container.0 with minecraft:stone 10" >&3
+echo "execute at Player11 run item replace block ~1 ~ ~ container.1 with minecraft:dirt 6" >&3
+echo "execute at Player11 run item replace block ~1 ~ ~ container.26 with minecraft:stone 64" >&3
+for i in $(seq 1 40); do grep -q 'chestui cell ws=55 ' "$W/ct4.out" 2>/dev/null && break; sleep 1; done
+cell() { grep "chestui cell ws=$1 " "$W/ct4.out" | head -1 | sed -n 's/.* x=\([0-9]*\) y=\([0-9]*\).*/\1 \2/p'; }
+uiclick() { local xy; xy=$(cell "$1"); [ -n "$xy" ] || { echo "  FAIL  chest ui: no cell $1"; ERR=1; return; }; xdotool mousemove $xy; sleep 0.4; xdotool mousedown 1; sleep 0.25; xdotool mouseup 1; sleep 0.6; }
+uishift() { xdotool keydown Shift_L; sleep 0.3; uiclick "$1"; xdotool keyup Shift_L; sleep 0.4; }
+if grep -q 'chestui cell ws=55 ' "$W/ct4.out"; then
+    sleep 1
+    uishift 0; uiclick 26; uiclick 5; uishift 55; sleep 1
+    xdotool key Escape; sleep 1.5
+    echo "execute at Player11 run data get block ~1 ~ ~ Items" >&3
+    echo "data get entity Player11 Inventory" >&3
+    sleep 2
+else
+    echo "  FAIL  chest ui: chest did not open"; ERR=1
+fi
+wait $PP
+C4S=$(grep 'mcplay: chestui state' "$W/ct4.out" | head -1); C4E=$(grep 'mcplay: chestui end' "$W/ct4.out" | head -1)
+echo "  $C4S"; echo "  $C4E"
+case "$C4S" in *"c0=-1"*"c1="*"x11"*"c5="*"x64"*"c26=-1"*"h0="*"x30"*"cursor=-1x0"*) ;; *) echo "  FAIL  chest ui: local state $C4S"; ERR=1;; esac
+case "$C4E" in *"show_inv=false"*"cont_ui=false"*"win=0"*"grab=true"*"bad=0"*) ;; *) echo "  FAIL  chest ui: panel did not close / mouse not captured again: $C4E"; ERR=1;; esac
+CH=$(grep 'has the following block data' "$W/server.log" | tail -1); PI=$(grep 'Player11 has the following entity data' "$W/server.log" | tail -1)
+python3 - "$CH" "$PI" <<'PY' || ERR=1
+import re,sys
+def slot(t, n):
+    for m in re.finditer(r'\{[^{}]*Slot: %db[^{}]*\}' % n, t):
+        c=re.search(r'(?:Count: |count: )(\d+)', m.group(0))
+        i=re.search(r'(?:id: |id:)"minecraft:(\w+)"', m.group(0))
+        if c and i: return (i.group(1), int(c.group(1)))
+    return None
+ch, pi = sys.argv[1], sys.argv[2]
+got={n: slot(ch, n) for n in (0,1,5,26)}
+hot={n: slot(pi, n) for n in (0,1)}
+print("  server chest (ui): " + " ".join("%d=%s" % (n, got[n]) for n in sorted(got)) + " | hotbar: " + " ".join("%d=%s" % (n, hot[n]) for n in sorted(hot)))
+ok=got[0] is None and got[26] is None and got[1]==("dirt",11) and got[5]==("stone",64) and hot[0]==("stone",30) and hot[1] is None
+sys.exit(0 if ok else 1)
+PY
 echo stop >&3; sleep 1
 [ $ERR -eq 0 ] && echo "RESULT mc-play-inv: ok" || echo "RESULT mc-play-inv: FAIL"
 exit $ERR
