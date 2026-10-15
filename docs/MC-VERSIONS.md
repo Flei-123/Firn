@@ -90,10 +90,12 @@ The client picks the version from the protocol number in the server-list ping.
 |---|---|---|---|---|---|
 | **1.8.9** | **47** | yes | yes (448 packets x 4 stages) | `CF_LEGACY_8` **implemented** (`mc_chunk.chunk_decode_legacy8`, `legacy8_bulk_*`) | **yes** (11.10.2026: real 1.8.9 server, dump byte-identical to the reference client, 81 chunks) |
 | **1.12.2** | **340** | yes | yes (500) | `CF_SECTIONS_19` **implemented** (`mc_chunk.chunk_decode_19`) | **yes** (11.10.2026: real 1.12.2 server, dump byte-identical to the reference client, 81 chunks) |
+| **1.16 / 1.16.1** | **735 / 736** | yes | yes (612) | `CF_SECTIONS_114` (ignoreOldData bool, 1024 biome ints, non-spanning longs) | **yes** (15.10.2026: real 1.16 + 1.16.1 servers, byte-identical, 121 chunks, entities equal) |
 | **1.16.5** | **754** | yes | yes (616) | `CF_SECTIONS_114` **implemented** (`mc_chunk.chunk_decode_114`, protocols 751-754) | **yes** (11.10.2026: real 1.16.5 server, dump byte-identical to the reference client, 121 chunks) |
 | **1.14.4** | **498** | yes | n/a | `CF_SECTIONS_114` (dense longs, 256 biome ints behind the sections, `chunk_decode_114n`) | **chunks yes** (14.10.2026: real 1.14.4 server, dump byte-identical to the reference client, 121 chunks, walk_fail 0); entity scenario NOT proven (its commands fail on this version) |
 | **1.15.2** | **578** | yes | n/a | `CF_SECTIONS_114` (dense longs, 1024 biome ints as own field) | **chunks yes** (14.10.2026: real 1.15.2 server, byte-identical, 121 chunks, walk_fail 0); entity scenario NOT proven |
 | **1.17.1** | **756** | yes | n/a | `CF_SECTIONS_114` (BitSet mask, no groundUp, sections from the dimension) | **chunks yes** (14.10.2026: real 1.17.1 server, byte-identical, 121 chunks, walk_fail 0); entity scenario NOT proven |
+| **1.18 / 1.18.1** | **757** | yes | yes (664) | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` | **yes** (15.10.2026: real 1.18 + 1.18.1 servers, byte-identical, entities equal) |
 | **1.18.2** | **758** | yes | yes | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` **implemented** | **yes** (14.10.2026: real 1.18.2 server, dump byte-identical to the reference client, 121 chunks) |
 | **1.19** | **759** | yes | yes | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` **implemented** | **yes** (14.10.2026: real 1.19 server, dump byte-identical to the reference client, 121 chunks, light lines + entities equal) |
 | **1.19.2** | **760** | yes | yes | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` **implemented** | **yes** (14.10.2026: real 1.19.2 server, dump byte-identical to the reference client, 121 chunks, light lines + entities equal) |
@@ -351,3 +353,18 @@ their real values), so it needs no hashes. The server hashes ITS stack the same 
 * The enchantment key hashes come from the Registry Data (`mc_client.client_enchant_keys`, index = registry id).
 * Live proof: `bash tools/mc/play/run_hash.sh [version]` (a pickaxe with six components + a plain stack, pick up / put back). Run 1 must see 0 server
   re-sends, run 2 (`MCPLAY_HASH_OFF=1`, no hashes) must see some, so the check measures something. 1.21.5 / 1.21.8 / 1.21.11 / 26.1 see below.
+* 1.16.0 / 1.16.1: see section 12.
+
+## 12. Round 2026-10-15 (worker mc-s4-versionen-1-18-x-1-19-4-1-16-0): 1.18 / 1.18.1 / 1.16.0 / 1.16.1
+
+* r141 (`chunk_bad=121` on 1.18.2 / 1.19.4) was already fixed on 14.10.2026 (trustEdges bool, section 10); not reproduced, only re-checked.
+* New versions in `tools/mcgen/versions.json`: 1.18 + 1.18.1 (both protocol 757, same wire as 1.18.2: `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES`), 1.16 (735) and
+  1.16.1 (736) (`CF_SECTIONS_114`, flags like 1.16.5, resource pack_format 5). Several game versions may share one protocol: `gen_protocol.py --all` keeps the FIRST key per
+  protocol (1.18 -> v757). nmp has no 1.18 / 1.16.0 / 1.16.1 in `supportedVersions`, but minecraft-data has them and the reference client runs with `MC_NMP=<version>`.
+* 1.16.0 / 1.16.1 chunk wire (`chunk_decode_114n`, `p114_is_16o` 735-736): x, z, groundUp, **ignoreOldData** bool, bitMap varint, heightmaps (sparse, NOT spanning),
+  1024 biome ints without a count (ground-up only), chunkData, block entities. `ref_dump.cjs` takes 735/736 into `SECTIONS_114`. 1.16.2 (751) dropped the bool and made the biomes a varint array.
+* Real servers (`MC_VERSION=<v> heavy bash tools/mcclient/run.sh <client>`), A == A2, B == A, entities EQUAL (3 vs 3), walk_fail 0:
+  1.18.1 checksum e24dc48561e1 (121 chunks), 1.18 d9a4afcdc7ff (97 chunks, the 1.18.0 server sends fewer), 1.16.1 ee18effa76bd (121), 1.16 17f3cc301a6a (121).
+* Gate: `tools/mc/schema/run.sh <firnc> 757 | 735 | 736` ok (664 / 612 / 612 fixtures x 4 stages). Tests: `tests/3040` variant 16 (1.16.1 hand built, error paths);
+  `tests/2745` and `3040` now refuse 734 instead of 735.
+
