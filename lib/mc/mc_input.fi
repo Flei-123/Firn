@@ -66,6 +66,7 @@ struct Player {
     yaw: f64, pitch: f64, // degrees
     vy: f64, // vertical velocity in blocks per tick (ground mode)
     on_ground: bool,
+    fall: f64, // fall distance in blocks (vanilla fallDistance; 0 on the ground), needed by the sneak edge clamp
     flying: bool,
     noclip: bool,
     creative: bool,
@@ -91,7 +92,7 @@ fn input_events_new() -> InputEvents {
 
 fn player_new(x: f64, y: f64, z: f64) -> Player {
     var p: Player = Player {
-        x: x, y: y, z: z, yaw: 0.0, pitch: 0.0, vy: 0.0, on_ground: false, flying: false, noclip: false, creative: false,
+        x: x, y: y, z: z, yaw: 0.0, pitch: 0.0, vy: 0.0, on_ground: false, fall: 0.0, flying: false, noclip: false, creative: false,
         sneaking: false, sprinting: false, autojump: false, sens: 0.5, slot: 0, snap: 0, cls: 0,
     }
     p.snap = rt.heap_alloc((SNAP_N * SNAP_N * SNAP_N) as usize * 2)
@@ -299,6 +300,47 @@ fn move_step(g: *mut mc_math.BlockGrid, b: *mut mc_math.Aabb, dx: f64, dy: f64, 
     }
 }
 
+// ---- sneak edge (vanilla Player.maybeBackOffFromEdge): a sneaking player on the ground does not walk off a ledge. The horizontal move
+// is cut in 0.05 steps while the box moved by (dx, -stepHeight, dz) would collide with nothing (no floor within stepHeight below).
+
+// vanilla Level.noCollision(entity, box.move(dx, dy, dz))
+fn moved_free(g: *mut mc_math.BlockGrid, b: *mut mc_math.Aabb, dx: f64, dy: f64, dz: f64) -> bool {
+    var m: mc_math.Aabb = *b
+    m.x0 = m.x0 + dx
+    m.x1 = m.x1 + dx
+    m.y0 = m.y0 + dy
+    m.y1 = m.y1 + dy
+    m.z0 = m.z0 + dz
+    m.z1 = m.z1 + dz
+    return !mc_math.grid_overlaps(g, &m)
+}
+
+// vanilla Player.isAboveGround: on the ground, or less than stepHeight into a fall with a floor within stepHeight below
+fn above_ground(g: *mut mc_math.BlockGrid, b: *mut mc_math.Aabb, on_ground: bool, fall: f64) -> bool {
+    if on_ground { return true }
+    return fall < STEP_HEIGHT && !moved_free(g, b, 0.0, fall - STEP_HEIGHT, 0.0)
+}
+
+fn edge_shrink(d: f64) -> f64 {
+    if d < 0.05 && d >= -0.05 { return 0.0 }
+    if d > 0.0 { return d - 0.05 }
+    return d + 0.05
+}
+
+// (dx, dz) after the edge clamp: x alone, z alone, then both together (exactly vanilla's three loops).
+fn sneak_edge(g: *mut mc_math.BlockGrid, b: *mut mc_math.Aabb, dx: f64, dz: f64, ox: *mut f64, oz: *mut f64) {
+    var d0: f64 = dx
+    var d1: f64 = dz
+    while d0 != 0.0 && moved_free(g, b, d0, 0.0 - STEP_HEIGHT, 0.0) { d0 = edge_shrink(d0) }
+    while d1 != 0.0 && moved_free(g, b, 0.0, 0.0 - STEP_HEIGHT, d1) { d1 = edge_shrink(d1) }
+    while d0 != 0.0 && d1 != 0.0 && moved_free(g, b, d0, 0.0 - STEP_HEIGHT, d1) {
+        d0 = edge_shrink(d0)
+        d1 = edge_shrink(d1)
+    }
+    *ox = d0
+    *oz = d1
+}
+
 // One game tick (20 Hz): mouse look, key movement, gravity / fly, collision. `w` may be an empty world (everything unloaded =
 // solid, so the player stands still in ground mode; use noclip / flying + noclip for a free camera).
 fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb: *mut InputTables, min_y: i32) {
@@ -355,6 +397,7 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
         (*p).y = (*p).y + dy
         (*p).z = (*p).z + dz
         (*p).on_ground = false
+        (*p).fall = 0.0
         if !(*p).flying { (*p).vy = ((*p).vy - 0.08) * 0.98 }
         return
     }
@@ -365,11 +408,21 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
     if (*p).sneaking { h = 1.5 }
     var b: mc_math.Aabb = mc_math.Aabb { x0: (*p).x - 0.3, y0: (*p).y, z0: (*p).z - 0.3, x1: (*p).x + 0.3, y1: (*p).y + h, z1: (*p).z + 0.3 }
     var res: mc_math.MoveResult = mc_math.MoveResult { dx: 0.0, dy: 0.0, dz: 0.0, hit_x: false, hit_y: false, hit_z: false }
-    move_step(&g, &b, dx, dy, dz, (*p).on_ground && !(*p).flying, &res)
+    var mdx: f64 = dx
+    var mdz: f64 = dz
+    if (*p).sneaking && !(*p).flying && (dx != 0.0 || dz != 0.0) && above_ground(&g, &b, (*p).on_ground, (*p).fall) {
+        sneak_edge(&g, &b, dx, dz, &mdx, &mdz)
+    }
+    move_step(&g, &b, mdx, dy, mdz, (*p).on_ground && !(*p).flying, &res)
     (*p).x = (*p).x + res.dx
     (*p).y = (*p).y + res.dy
     (*p).z = (*p).z + res.dz
     (*p).on_ground = res.hit_y && dy < 0.0
+    if (*p).on_ground || (*p).flying {
+        (*p).fall = 0.0
+    } else if res.dy < 0.0 {
+        (*p).fall = (*p).fall - res.dy
+    }
     var aj: bool = false
     if (*p).autojump && (*p).on_ground && !(*p).sneaking && !(*p).flying && (res.hit_x || res.hit_z) {
         // blocked horizontally on the ground: the intended step, not the part the collision already allowed

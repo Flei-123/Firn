@@ -13,7 +13,13 @@ Pure data: the caller fills `InputEvents` (mouse delta px, key mask `K_FORWARD/B
   No water / ladders. Block shapes: full unit cubes, plus partial shapes (slabs, stairs incl. corner shapes, carpets, snow layers) when the
   `InputTables.solid` entry is 128 + k (`mc_math.shape_box`; `mc_shapes.shapes_fill(&reg, solid, n)` fills them from the registry, mcplay
   does it). Step-up follows vanilla 1.20.1 `Entity.collide` with stepHeight 0.6 (`move_step`): partial blocks up to 0.6 high are walked
-  up without a jump; full blocks (1.0) still need a jump / Auto-Jump. Not modelled: fences, walls, doors, trapdoors, beds, ...
+  up without a jump; full blocks (1.0) still need a jump / Auto-Jump. Since s5 also modelled (codes K_FENCE.. in mc_math): fences / walls /
+  fence gates (1.5 high: no jump clears them), doors, trapdoors (open + top / bottom), beds (slab + legs), chests (single + double halves,
+  trapped / ender). Every state is checked against minecraft-data 1.20 (`bash tools/mc/shapes/run.sh`, exact 1/16 voxels). `grid_move` /
+  `grid_overlaps` scan one cell below the box (tall shapes reach 1.5). Not modelled: glass panes, iron bars, anvils, cauldrons, hoppers, ...
+* Sneak edge (vanilla `maybeBackOffFromEdge`): sneaking (not flying) on the ground, or < 0.6 into a fall with a floor within 0.6, cuts the
+  horizontal move in 0.05 steps (x, then z, then both) while the box moved 0.6 down would touch nothing -> no walking off a ledge; a drop
+  of <= 0.6 is not an edge. `Player.fall` = fall distance (reset on ground / fly / noclip).
 * Pick: `input_pick(world, min_y, tables, o, d, reach, &Pick)` DDA over `mc_world` (one-chunk cache); `InputTables.pick/solid`
   are u8 per block id. Hit = block, entered face normal (0,0,0 if the origin is inside), distance. Reach `player_reach`: 5 / creative 6.
 * Selection box `input_draw_box(raster, x, y, z, rgba)`: 12 edges (+-0.002), near clip, 1/16-pixel snap, integer line stepper,
