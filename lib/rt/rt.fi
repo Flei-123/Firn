@@ -142,10 +142,21 @@ fn cache_release() {
 // the block wiped: every octet of it zero (`len` is a multiple of a page)
 #[no_gc]
 fn wipe(p: u64, len: usize) {
-    var i: usize = 0
-    while i < len / 8 {
-        *((p + i as u64 * 8) as *mut u64) = 0
-        i = i + 1
+    // 64 octets (eight words) per round through a moving pointer: dev-fast has
+    // no inliner, so every step is spelled out, and `len` is a multiple of a
+    // page, so there is no tail.
+    var q: u64 = p
+    let end: u64 = p +% len as u64
+    while q < end {
+        *(q as *mut u64) = 0
+        *((q +% 8) as *mut u64) = 0
+        *((q +% 16) as *mut u64) = 0
+        *((q +% 24) as *mut u64) = 0
+        *((q +% 32) as *mut u64) = 0
+        *((q +% 40) as *mut u64) = 0
+        *((q +% 48) as *mut u64) = 0
+        *((q +% 56) as *mut u64) = 0
+        q = q +% 64
     }
 }
 
@@ -203,12 +214,12 @@ fn heap_free(p: u64, n: usize) {
 }
 
 fn mem_copy(target: u64, source: u64, n: usize) {
-    // r174: 32 octets per round, loads before stores. The old loop did one
-    // word per round with an `i / 8` index and ran at ~0.8 GB/s in
-    // release-fast; this one at ~4 GB/s (8 MiB, measured), within 15 % of
-    // `rep movsb`, and it stays portable (aarch64, wasm32, windows).
-    var i: usize = 0
-    var w: usize = 0
+    // r174: 32 octets per round, loads before stores. r14b: through moving
+    // pointers and direct accesses -- dev-fast has no inliner, so the old
+    // `ld64`/`st64` calls cost about 18 instructions per word.
+    var s: u64 = source
+    var t: u64 = target
+    var left: usize = n
     // Callers (lzma/lz4/zstd match copies) rely on the forward word-by-word
     // semantics for overlapping ranges with target - source >= 8. Four loads
     // before four stores would break that for distances 8..31, so the wide
@@ -217,69 +228,78 @@ fn mem_copy(target: u64, source: u64, n: usize) {
     if target > source && target - source < 32 {
         wide = false
     }
-    while wide && i + 32 <= n {
-        let a: u64 = ld64(source, w)
-        let b: u64 = ld64(source, w + 1)
-        let c: u64 = ld64(source, w + 2)
-        let d: u64 = ld64(source, w + 3)
-        st64(target, w, a)
-        st64(target, w + 1, b)
-        st64(target, w + 2, c)
-        st64(target, w + 3, d)
-        w = w + 4
-        i = i + 32
+    while wide && left >= 32 {
+        let a: u64 = *(s as *mut u64)
+        let b: u64 = *((s +% 8) as *mut u64)
+        let c: u64 = *((s +% 16) as *mut u64)
+        let d: u64 = *((s +% 24) as *mut u64)
+        *(t as *mut u64) = a
+        *((t +% 8) as *mut u64) = b
+        *((t +% 16) as *mut u64) = c
+        *((t +% 24) as *mut u64) = d
+        s = s +% 32
+        t = t +% 32
+        left = left -% 32
     }
-    while i + 8 <= n {
-        st64(target, w, ld64(source, w))
-        w = w + 1
-        i = i + 8
+    while left >= 8 {
+        *(t as *mut u64) = *(s as *mut u64)
+        s = s +% 8
+        t = t +% 8
+        left = left -% 8
     }
-    while i < n {
-        st8(target, i, ld8(source, i))
-        i = i + 1
+    while left > 0 {
+        *(t as *mut u8) = *(s as *mut u8)
+        s = s +% 1
+        t = t +% 1
+        left = left -% 1
     }
 }
 
 fn mem_set(target: u64, value: u8, n: usize) {
     // r174: a word of eight copies of the octet, then word stores.
     let v: u64 = (value as u64) * 72340172838076673
-    var i: usize = 0
-    var w: usize = 0
-    while i + 32 <= n {
-        st64(target, w, v)
-        st64(target, w + 1, v)
-        st64(target, w + 2, v)
-        st64(target, w + 3, v)
-        w = w + 4
-        i = i + 32
+    var t: u64 = target
+    var left: usize = n
+    while left >= 32 {
+        *(t as *mut u64) = v
+        *((t +% 8) as *mut u64) = v
+        *((t +% 16) as *mut u64) = v
+        *((t +% 24) as *mut u64) = v
+        t = t +% 32
+        left = left -% 32
     }
-    while i + 8 <= n {
-        st64(target, w, v)
-        w = w + 1
-        i = i + 8
+    while left >= 8 {
+        *(t as *mut u64) = v
+        t = t +% 8
+        left = left -% 8
     }
-    while i < n {
-        st8(target, i, value)
-        i = i + 1
+    while left > 0 {
+        *(t as *mut u8) = value
+        t = t +% 1
+        left = left -% 1
     }
 }
 
 fn mem_eq(a: u64, b: u64, n: usize) -> bool {
     // r174: word by word, octet by octet for the tail.
-    var i: usize = 0
-    var w: usize = 0
-    while i + 8 <= n {
-        if ld64(a, w) != ld64(b, w) {
+    var x: u64 = a
+    var y: u64 = b
+    var left: usize = n
+    while left >= 8 {
+        if *(x as *mut u64) != *(y as *mut u64) {
             return false
         }
-        w = w + 1
-        i = i + 8
+        x = x +% 8
+        y = y +% 8
+        left = left -% 8
     }
-    while i < n {
-        if ld8(a, i) != ld8(b, i) {
+    while left > 0 {
+        if *(x as *mut u8) != *(y as *mut u8) {
             return false
         }
-        i = i + 1
+        x = x +% 1
+        y = y +% 1
+        left = left -% 1
     }
     return true
 }
