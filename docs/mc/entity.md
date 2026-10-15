@@ -34,13 +34,14 @@ Entity { id, kind (0 object, 1 living, 2 player), type_id, uuid, x y z (f64 bloc
 * Real vanilla servers byte-identical to node-minecraft-protocol: 1.20.1, 1.8.9 (see the report of w10 for 1.21.4).
 
 ## Open
-* 1.21.2+ `entity_teleport` (z3, 14.10.2026): minecraft-data lists the OLD layout (yaw i8); the game layout is id, pos f64x3, delta f64x3,
-  yaw f32, pitch f32, relative flags i32, on ground (= sync_entity_position + flags). `gen_entity.py` OVERRIDES applies it from protocol 768
-  (only while minecraft-data still yields the stale program), `ref_dump.cjs`/`gen.cjs` decode/serialize it the same way, test 2974.
-  NOT proven live: a real 1.21.4 server never sent entity_teleport in any trigger tried (pig /tp with and without rotation, `data merge Pos`,
-  passengers on stand/boat/horse, 40 m teleports, dimension change of the bot, falling block, item frame, crystals ...) -- 1.21.2+ servers
-  send sync_entity_position instead (live proven, byte-identical incl. yaw/pitch f32). The layout rests on the packet structure
-  (position + delta movement + rotation + relatives + on ground), shared with the proven sync packet.
+* 1.21.2+ `entity_teleport` (f8, 15.10.2026) LIVE PROVEN on a real 1.21.4 server: a minecart / boat / horse CARRYING a player, moved by `tp`
+  (`execute at <rider> run tp @e[type=minecart] ~4 ~ ~4`), gets 2 packets in the 64 byte layout id, pos f64x3, delta f64x3, yaw f32, pitch f32,
+  relative flags i32, on ground (the other observer gets none). Flags were 0xff (all relative) and 0 (absolute). Also seen on 1.21.3, 1.21.8
+  (id 0x76), 1.21.11 (0x7b), 26.1 (0x7d) with the same body length. Pig + chicken stack, enderman / shulker (hurt), armor stand, player tp,
+  pearl, item never produce it. Relative flags are applied since f8 (gen_entity.py role R, mc_entity ent_update; bit 0..2 x y z, 3 yaw, 4 pitch);
+  run.sh Firn B == reference A2 on the entity file and both equal the server's `data get entity Pos`. Reference (nmp, stale layout) only sees
+  the first 29 bytes: ref_dump.cjs decodes the whole packet (4th `packet` argument `full`). Probe: `tools/mcclient/probe_tp.sh` (~25 scenarios).
+  Trap: `boat` is no entity type from 1.21.2 (`oak_boat`); nmp `raw` / 3rd packet argument are CUT after the known fields.
 * lpVec3 (1.21.9+) proven live on 1.21.11 + 26.1 (z3): spawn_entity / entity_velocity with Motion [0.5,0.3,-0.2] (6 octets) and
   [8,1,-6] (scale 8 -> bit 2 set, varint extension, 7 octets); decoded values equal the summoned Motion, entity files EQUAL.
 * 1.20.2+: players arrive as spawn_entity; name is resolved by uuid from player_info (cross-check yes, real server only via the bot).

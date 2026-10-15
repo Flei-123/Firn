@@ -11,7 +11,7 @@ A layout is a text program of 2-character tokens (role, type):
 
   role   E entity id           U uuid           T entity/object type      X Y Z absolute position
          x y z relative move   W yaw            P pitch                   G on ground
-         M velocity (type V)   -  skipped field  A array of entity ids (type v), always alone
+         M velocity (type V)   R relative flags (type i)   -  skipped field  A array of entity ids (type v), always alone
   type   v varint  b i8  B u8  s i16  i i32  d f64  f f32  u uuid(16)  o bool  V vec3i16 (6 octets)  L lpVec3 (1.21.9+, skipped only)
 
 Reading stops after the last wanted role: trailing fields (metadata, head pitch, object data)
@@ -88,9 +88,10 @@ def layout_of(proto, names, move):
 # from protocol `since` on, ONLY while minecraft-data still yields the `stale` program (so a fixed minecraft-data
 # is taken as is). Each entry is proven against a real server (tools/mcclient/run.sh with MC_RAW_NAMES, docs/mc/entity.md).
 #   entity_teleport 1.21.2+ (protocol 768+): id, position f64x3, delta movement f64x3, yaw f32, pitch f32,
-#   relative-flags i32, on ground bool (minecraft-data still lists the pre-1.21.2 layout).
+#   relative-flags i32 (role R: bit 0..4 x y z yaw pitch relative), on ground bool (minecraft-data still lists the pre-1.21.2 layout).
+#   LIVE PROVEN 15.10.2026 (real 1.21.4, `tp @e[type=minecart] ~4 ~ ~4` with a player rider: 64 byte body, flags 0xff).
 OVERRIDES = [
-    ("TELEPORT", 768, "EvXdYdZdWbPbGo", "EvXdYdZd-d-d-dWfPf-iGo"),
+    ("TELEPORT", 768, "EvXdYdZdWbPbGo", "EvXdYdZd-d-d-dWfPfRiGo"),
 ]
 
 

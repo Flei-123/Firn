@@ -80,7 +80,8 @@ build() {
 # ---------------------------------------------------------------------------
 echo "== 1. an index outside the array aborts, and both compilers say the same =="
 for src in tools/checkidx/idx_read.fi tools/checkidx/idx_write.fi \
-           tools/checkidx/idx_u8.fi tools/checkidx/idx_nested.fi; do
+           tools/checkidx/idx_u8.fi tools/checkidx/idx_nested.fi \
+           tools/checkidx/idx_mask_oob.fi tools/checkidx/idx_dom_oob.fi; do
     name=$(basename "$src" .fi)
     for lvl in $LEVELS_CHECKED; do
         msg0=""; msg1=""; rc0=0; rc1=0
@@ -229,6 +230,29 @@ uopt=$("$FIRNC" --emit=fir tools/checkidx/loop_var.fi 2>/dev/null | grep -c "che
 if [ "$uopt" -ge 1 ]; then ok; else
     bad "loop_var: $uraw checks before, $uopt after -- an unprovable one was removed"
 fi
+
+# Range proof (rangecheck.rs): masks, remainders and a dominating check of
+# the same index leave NO check; a mask one bit too wide and a dominating
+# check against a LONGER array leave one.
+mraw=$("$FIRNC" --emit=fir-raw tools/checkidx/mask_ok.fi 2>/dev/null | grep -c "checked_idx")
+mopt=$("$FIRNC" --emit=fir tools/checkidx/mask_ok.fi 2>/dev/null | grep -c "checked_idx")
+if [ "$mraw" -lt 1 ]; then
+    bad "mask_ok: lowering did not put a single check in (nothing to prove)"
+elif [ "$mopt" != 0 ]; then
+    bad "mask_ok: $mraw checks before the optimiser, $mopt left after it (expected 0)"
+else
+    ok
+fi
+dopt=$("$FIRNC" --emit=fir tools/checkidx/dom_ok.fi 2>/dev/null | grep -c "checked_idx")
+if [ "$dopt" = 1 ]; then ok; else
+    bad "dom_ok: $dopt checks left, expected exactly 1 (the dominating one)"
+fi
+for src in tools/checkidx/idx_mask_oob.fi tools/checkidx/idx_dom_oob.fi; do
+    kopt=$("$FIRNC" --emit=fir "$src" 2>/dev/null | grep -c "checked_idx")
+    if [ "$kopt" -ge 1 ]; then ok; else
+        bad "$(basename "$src"): the check that must stay was removed"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 echo "== 6. #[panic_handler]: the program ends its own panic =="

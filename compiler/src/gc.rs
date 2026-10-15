@@ -1677,6 +1677,52 @@ mod tests {
         assert_eq!(class_for(4097), 13);
     }
 
+    /// `__gc_class_and_bytes` is written without calls (dev-fast has no
+    /// inliner). Interpret its `if size <= N { return V }` ladder and compare
+    /// with `class_for` / `CLASS_BYTES` for every size.
+    #[test]
+    fn class_and_bytes_matches_the_table() {
+        let start = RUNTIME.find("fn __gc_class_and_bytes(size: u64) -> u64 {").unwrap();
+        let end = start + RUNTIME[start..].find("\n}\n").unwrap();
+        let lines: Vec<&str> = RUNTIME[start..end].lines().skip(1).map(|l| l.trim()).collect();
+        fn run(lines: &[&str], size: u64) -> Option<u64> {
+            let mut i = 0;
+            while i < lines.len() {
+                let l = lines[i];
+                if l.starts_with("//") || l.is_empty() {
+                    i += 1;
+                } else if let Some(rest) = l.strip_prefix("if size <= ") {
+                    let n: u64 = rest.trim_end_matches(" {").parse().unwrap();
+                    let mut depth = 1;
+                    let mut j = i + 1;
+                    while depth > 0 {
+                        if lines[j].ends_with('{') {
+                            depth += 1;
+                        }
+                        if lines[j] == "}" {
+                            depth -= 1;
+                        }
+                        j += 1;
+                    }
+                    if size <= n {
+                        return run(&lines[i + 1..j - 1], size);
+                    }
+                    i = j;
+                } else if let Some(v) = l.strip_prefix("return ") {
+                    return Some(v.parse().unwrap_or(13));
+                } else {
+                    panic!("unexpected line: {}", l);
+                }
+            }
+            None
+        }
+        for size in 0..=5000u64 {
+            let k = class_for(size);
+            let want = if k >= 13 { 13 } else { k as u64 + CLASS_BYTES[k] as u64 * 16 };
+            assert_eq!(run(&lines, size), Some(want), "size {}", size);
+        }
+    }
+
     #[test]
     fn internal_names_are_gc_allocations() {
         assert!(is_gc_alloc_call("gc Node"));

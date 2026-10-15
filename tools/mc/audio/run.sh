@@ -45,10 +45,10 @@ if $FIRNC -o "$W/t" tests/2766_mc_audio.fi 2>"$W/err"; then
 else
     echo "  FAIL  tests/2766_mc_audio.fi does not compile"; head -10 "$W/err"; ERR=1
 fi
-# real server packets (fixtures recorded by tools/mc/audio/sounds_live.sh from vanilla 1.20.1 / 1.21.4): mc_audio's decode must equal
+# real server packets (fixtures recorded by tools/mc/audio/sounds_live.sh from vanilla 1.12.2 / 1.16.5 / 1.20.1 / 1.21.4): mc_audio's decode must equal
 # node-minecraft-protocol's parse (check_wire.py). tests/2792_mc_audio_wire.fi covers the generated id tables + dispatch.
 if $FIRNC -o "$W/pkts" tools/mc/audio/sound_pkts.fi 2>"$W/err"; then
-    for pair in "1.20.1 763" "1.21.4 769"; do
+    for pair in "1.12.2 340" "1.16.5 754" "1.20.1 763" "1.21.4 769"; do
         set -- $pair; fx="tools/mc/audio/fixtures/sounds_${1//./_}.jsonl"
         python3 -I -c 'import json,sys
 for l in open(sys.argv[2]):

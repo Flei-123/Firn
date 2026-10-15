@@ -387,7 +387,10 @@ pub(crate) fn remove_provable_arith_checks(f: &mut Func) -> usize {
         b.insts.iter().any(|i| {
             matches!(
                 i.op,
-                Op::CheckedBin { .. } | Op::CheckedCast { .. } | Op::CheckedDiv { .. }
+                Op::CheckedBin { .. }
+                    | Op::CheckedCast { .. }
+                    | Op::CheckedDiv { .. }
+                    | Op::CheckedIdx { .. }
             )
         })
     });
@@ -397,6 +400,9 @@ pub(crate) fn remove_provable_arith_checks(f: &mut Func) -> usize {
     if f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return 0;
     }
+    // `(block, position, result, index)` of every array index whose check
+    // cannot fire: the result is the index itself, so uses are redirected.
+    let mut idx_hits: Vec<(usize, usize, Val, Val)> = Vec::new();
     let plan: Vec<(usize, usize, Op)> = {
         let ana = Ana::new(f);
         let mut plan = Vec::new();
@@ -413,6 +419,23 @@ pub(crate) fn remove_provable_arith_checks(f: &mut Func) -> usize {
                     continue;
                 }
                 let new = match &inst.op {
+                    // The checked index: when the interval of the index lies
+                    // inside `[0, len-1]` the comparison can never be taken.
+                    // Reads the same intervals as the arithmetic checks, so
+                    // `x & 15`, `x % 16`, `i * 8 + j` under loop guards and
+                    // the like are decided here. A secret index keeps its
+                    // check (SPEC §9.2).
+                    Op::CheckedIdx { idx, len, .. } => {
+                        if f.is_secret(*idx) {
+                            continue;
+                        }
+                        if let (Some(d), Some(r)) = (inst.dst, ana.range(*idx, bi, DEPTH)) {
+                            if r.0 >= 0 && r.1 < *len as i128 {
+                                idx_hits.push((bi, ii, d, *idx));
+                            }
+                        }
+                        continue;
+                    }
                     Op::CheckedBin { op, a, b: rhs, .. } => {
                         if f.is_secret(*a) || f.is_secret(*rhs) {
                             continue;
@@ -471,9 +494,53 @@ pub(crate) fn remove_provable_arith_checks(f: &mut Func) -> usize {
         }
         plan
     };
-    let n = plan.len();
+    let mut n = plan.len();
     for (bi, ii, op) in plan {
         f.blocks[bi].insts[ii].op = op;
+    }
+    // THE SAME INDEX, CHECKED BEFORE. A check of `idx` against `len1` that
+    // dominates a check of the same value against `len2 >= len1` has
+    // already panicked for every index the second one would reject, so the
+    // second can never fire. (`a[i]` then `b[i]`, `len a <= len b`.) The
+    // dominating one may itself be removed by a proof above or by a third
+    // dominating check -- dominance is a strict order, so no cycle can make
+    // two checks justify each other.
+    {
+        let mut sites: Vec<(usize, usize, Val, Val, u64)> = Vec::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                if let (Some(d), Op::CheckedIdx { idx, len, .. }) = (inst.dst, &inst.op) {
+                    if !f.is_secret(*idx) && !idx_hits.iter().any(|h| h.0 == bi && h.1 == ii) {
+                        sites.push((bi, ii, d, *idx, *len));
+                    }
+                }
+            }
+        }
+        if sites.len() > 1 {
+            let dom = crate::mem2reg::dominators(f);
+            let mut extra: Vec<(usize, usize, Val, Val)> = Vec::new();
+            for &(b2, i2, d2, x2, l2) in &sites {
+                let covered = sites.iter().any(|&(b1, i1, _, x1, l1)| {
+                    x1 == x2
+                        && l1 <= l2
+                        && (b1, i1) != (b2, i2)
+                        && ((b1 == b2 && i1 < i2) || (b1 != b2 && dom[b2][b1]))
+                });
+                if covered {
+                    extra.push((b2, i2, d2, x2));
+                }
+            }
+            idx_hits.extend(extra);
+        }
+    }
+    if !idx_hits.is_empty() {
+        let mut map: HashMap<Val, Val> = HashMap::new();
+        for (bi, ii, dst, idx) in idx_hits {
+            f.blocks[bi].insts[ii].op = Op::Const(0);
+            map.insert(dst, idx);
+        }
+        n += map.len();
+        crate::mem2reg::replace_uses(f, &map);
     }
     n
 }
@@ -614,6 +681,69 @@ mod tests {
             },
         );
         f.set_term(0, Term::Ret(Some(q)));
+        assert_eq!(remove_provable_arith_checks(&mut f), 0);
+    }
+
+    fn idx_func(len: u64, mask: i128, rem: bool) -> Func {
+        let mut f = Func::new("t", vec![FTy::U64], FTy::U64);
+        let k = f.push(0, FTy::U64, Op::Const(mask));
+        let r = f.push(0, FTy::U64, Op::Bin(if rem { BinOp::Rem } else { BinOp::And }, 0, k));
+        let c = f.push(0, FTy::U64, Op::CheckedIdx { idx: r, len, msg: "x".into() });
+        f.set_term(0, Term::Ret(Some(c)));
+        f
+    }
+
+    #[test]
+    fn a_masked_index_needs_no_bounds_check() {
+        let mut f = idx_func(16, 15, false);
+        assert_eq!(remove_provable_arith_checks(&mut f), 1);
+        assert!(!f.blocks[0].insts.iter().any(|i| matches!(i.op, Op::CheckedIdx { .. })));
+        // the result was redirected to the index itself
+        assert!(matches!(f.blocks[0].term, Term::Ret(Some(v)) if v == 2));
+    }
+
+    #[test]
+    fn a_remainder_index_needs_no_bounds_check() {
+        let mut f = idx_func(16, 16, true);
+        assert_eq!(remove_provable_arith_checks(&mut f), 1);
+    }
+
+    #[test]
+    fn an_index_one_past_the_end_keeps_its_bounds_check() {
+        let mut f = idx_func(15, 15, false);
+        assert_eq!(remove_provable_arith_checks(&mut f), 0);
+        assert!(matches!(f.blocks[0].insts[2].op, Op::CheckedIdx { .. }));
+        let mut g = idx_func(16, 17, true);
+        assert_eq!(remove_provable_arith_checks(&mut g), 0);
+    }
+
+    #[test]
+    fn a_dominating_check_of_the_same_index_covers_a_longer_array() {
+        let mut f = Func::new("t", vec![FTy::U64], FTy::U64);
+        let a = f.push(0, FTy::U64, Op::CheckedIdx { idx: 0, len: 16, msg: "a".into() });
+        let b = f.push(0, FTy::U64, Op::CheckedIdx { idx: 0, len: 32, msg: "b".into() });
+        let s = f.push(0, FTy::U64, Op::Bin(BinOp::Add, a, b));
+        f.set_term(0, Term::Ret(Some(s)));
+        assert_eq!(remove_provable_arith_checks(&mut f), 1);
+        assert!(matches!(f.blocks[0].insts[0].op, Op::CheckedIdx { len: 16, .. }));
+        assert!(matches!(f.blocks[0].insts[1].op, Op::Const(0)));
+    }
+
+    #[test]
+    fn a_dominating_check_against_a_longer_array_covers_nothing() {
+        let mut f = Func::new("t", vec![FTy::U64], FTy::U64);
+        let a = f.push(0, FTy::U64, Op::CheckedIdx { idx: 0, len: 32, msg: "a".into() });
+        let b = f.push(0, FTy::U64, Op::CheckedIdx { idx: 0, len: 16, msg: "b".into() });
+        let s = f.push(0, FTy::U64, Op::Bin(BinOp::Add, a, b));
+        f.set_term(0, Term::Ret(Some(s)));
+        assert_eq!(remove_provable_arith_checks(&mut f), 0);
+    }
+
+    #[test]
+    fn an_unknown_index_keeps_its_bounds_check() {
+        let mut f = Func::new("t", vec![FTy::U64], FTy::U64);
+        let c = f.push(0, FTy::U64, Op::CheckedIdx { idx: 0, len: 16, msg: "x".into() });
+        f.set_term(0, Term::Ret(Some(c)));
         assert_eq!(remove_provable_arith_checks(&mut f), 0);
     }
 

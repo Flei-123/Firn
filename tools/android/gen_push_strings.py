@@ -102,13 +102,24 @@ S = [
 ("S_SUMMARY_TEXT","Neue Nachrichten"),
 ("S_L_KEYED","notification posted for key"),
 ("S_L_CANCEL","notification cancelled for key"),
+("S_L_TLS","connected (tls, pinned key)"),
+("S_L_TLSFAIL","tls handshake failed"),
+("S_L_V6","relay reached over ipv6"),
 ]
+# German UI texts: the generated comment is English (no-german guard); the text itself stays.
+EN = {
+    "S_CH_PUSH_NAME": "channel name: messages",
+    "S_CH_SVC_NAME": "channel name: connection",
+    "S_SVC_TEXT": "connection to the relay is active",
+    "S_MSG_TITLE": "title: new message",
+    "S_SUMMARY_TEXT": "summary: new messages",
+}
 txt=""; offs=[]; off=0
 for n,v in S:
     offs.append((n,off,v)); txt+=v+"\\0"; off+=len(v.encode())+1
 L=sum(len(v)+1 for _,v in S)
 tab="static TXT: [u8; %d] = \"%s\"\n\n" % (L, txt)
-consts="".join("const %s: usize = %d   // %s\n" % (n,o,v) for n,o,v in offs)
+consts="".join("const %s: usize = %d // %s\n" % (n,o,EN.get(n,v)) for n,o,v in offs)
 P=os.path.join(os.path.dirname(os.path.abspath(__file__)),"../../lib/plat/android/push.fi")
 src=open(P).read()
 a=src.index("// ---- BEGIN GENERATED STRINGS"); a=src.index("\n",a)+1
