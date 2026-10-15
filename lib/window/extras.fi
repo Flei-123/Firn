@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/window/extras.fi -- window.extras: what a small always-on-top tool window needs beyond window.fi
+// (the JARVIS mini chat box is the first user).
+//
+//     import window.window
+//     import window.extras
+//
+//     extras.set_frameless(&w, true)                  // no title bar / border (move it with window.window_drag)
+//     extras.set_topmost(&w, true)                    // always on top
+//     extras.place_corner(&w, extras.CORNER_BR, window.scaled(&w, 16))   // bottom right of the work area
+//     extras.hide(&w) / extras.show(&w)               // withdraw to the background / come back
+//     extras.hotkey_set(&w, 1, window.HK_CTRL | window.HK_ALT, 'j' as u32)   // global, works unfocused
+//     ...
+//     if window.next_event(&w) == window.EV_HOTKEY { ... window.ev_a(&w) == 1 ... }
+//     // after laying out the content (once per frame, after the events):
+//     extras.fit_height(&w, extras.CORNER_BR, margin, content_h, min_h, max_h)
+//
+// All sizes are DEVICE PIXELS (use window.scaled for design points). Positions are SCREEN coordinates of the
+// primary work area (the screen minus taskbar / panels). The functions work on the X11 and the Win32 back end;
+// the other back ends (Android, Osum) do not link this module.
+//
+// HONEST LIMITS
+//   * X11 without a window manager has no frame, no panels and nobody who could refuse: everything is done
+//     directly. With a window manager the request is a request (EWMH / ICCCM); `is_topmost` reads back what the
+//     WM did, so right after `set_topmost` it may still say false for a moment -- the answer is the truth.
+//   * Wayland-only sessions: XWayland ignores topmost and global key grabs; there is no portal here.
+//   * A global hotkey is exclusive: if another program owns the combination `hotkey_set` returns false.
+//   * `fit_height` sets the CLIENT size; the window layer's own EV_CONFIGURE handling re-creates the canvas when
+//     the size really changed, so `window.height` follows with the next `next_event`.
+import std.rt
+import window.window
+import window.backend
+
+export {
+    Rect,
+    set_topmost, is_topmost, hide, show, set_visible, is_visible,
+    set_frameless, is_frameless,
+    work_area, outer_rect, move_to, set_height, place_corner, fit_height, clamp_height,
+    hotkey_set, hotkey_clear,
+    CORNER_TL, CORNER_TR, CORNER_BL, CORNER_BR, CORNER_NONE,
+}
+
+const CORNER_TL: u32 = 0
+const CORNER_TR: u32 = 1
+const CORNER_BL: u32 = 2
+const CORNER_BR: u32 = 3
+// fit_height: keep the top left corner where it is
+const CORNER_NONE: u32 = 4
+
+struct Rect {
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+}
+
+fn rect_from(a: *mut [i64; 4]) -> Rect {
+    return Rect { x: (*a)[0], y: (*a)[1], w: (*a)[2], h: (*a)[3] }
+}
+
+// ---------------------------------------------------------- state
+
+// Keep the window above all others (true) or back in the normal stack (false).
+fn set_topmost(f: *mut window.Window, on: bool) -> bool {
+    return backend.r_set_topmost(&(*f).p, on)
+}
+
+fn is_topmost(f: *mut window.Window) -> bool {
+    return backend.r_is_topmost(&(*f).p)
+}
+
+// Hide = the window disappears (no taskbar entry); show = back on screen, in front.
+fn set_visible(f: *mut window.Window, on: bool) -> bool {
+    return backend.r_set_visible(&(*f).p, on)
+}
+
+fn hide(f: *mut window.Window) -> bool {
+    return backend.r_set_visible(&(*f).p, false)
+}
+
+fn show(f: *mut window.Window) -> bool {
+    return backend.r_set_visible(&(*f).p, true)
+}
+
+fn is_visible(f: *mut window.Window) -> bool {
+    return backend.r_is_visible(&(*f).p)
+}
+
+// No title bar and no border. The client area keeps its size. Dragging is the program's business
+// (window.window_drag from a mouse press on its own header).
+fn set_frameless(f: *mut window.Window, on: bool) -> bool {
+    return backend.r_set_frameless(&(*f).p, on)
+}
+
+fn is_frameless(f: *mut window.Window) -> bool {
+    return backend.r_is_frameless(&(*f).p)
+}
+
+// ------------------------------------------------------- geometry
+
+// The work area (screen minus taskbar / panels) of the primary screen.
+fn work_area(f: *mut window.Window, out: *mut Rect) -> bool {
+    var a: [i64; 4] = [0; 4]
+    if !backend.r_work_area(&(*f).p, (&a[0]) as u64) {
+        return false
+    }
+    *out = rect_from(&a)
+    return true
+}
+
+// The OUTER rectangle (client + frame) in screen coordinates.
+fn outer_rect(f: *mut window.Window, out: *mut Rect) -> bool {
+    var a: [i64; 4] = [0; 4]
+    if !backend.r_outer_rect(&(*f).p, (&a[0]) as u64) {
+        return false
+    }
+    *out = rect_from(&a)
+    return true
+}
+
+// Put the outer top left corner at (x, y).
+fn move_to(f: *mut window.Window, x: i64, y: i64) -> bool {
+    return backend.r_place(&(*f).p, 1 as u32, x, y, 0, 0)
+}
+
+// Set the client height (width stays); EV_CONFIGURE follows.
+fn set_height(f: *mut window.Window, h: usize) -> bool {
+    if h == 0 {
+        return false
+    }
+    return backend.r_place(&(*f).p, 2 as u32, 0, 0, window.width(f), h)
+}
+
+// The outer top left that puts a window of outer size (ow, oh) into `corner` of `wa`, `margin` pixels from the edges.
+fn corner_pos(wa: *mut Rect, corner: u32, margin: i64, ow: i64, oh: i64, px: *mut i64, py: *mut i64) {
+    var x: i64 = (*wa).x + margin
+    var y: i64 = (*wa).y + margin
+    if corner == CORNER_TR || corner == CORNER_BR {
+        x = (*wa).x + (*wa).w - ow - margin
+    }
+    if corner == CORNER_BL || corner == CORNER_BR {
+        y = (*wa).y + (*wa).h - oh - margin
+    }
+    if x < (*wa).x {
+        x = (*wa).x
+    }
+    if y < (*wa).y {
+        y = (*wa).y
+    }
+    *px = x
+    *py = y
+}
+
+// Put the window into `corner` (CORNER_*) of the work area, `margin` pixels from the edges (default feel: 16 design
+// points). Works on the current size.
+fn place_corner(f: *mut window.Window, corner: u32, margin: usize) -> bool {
+    var wa: Rect = Rect { x: 0, y: 0, w: 0, h: 0 }
+    var o: Rect = Rect { x: 0, y: 0, w: 0, h: 0 }
+    if !work_area(f, &wa) || !outer_rect(f, &o) {
+        return false
+    }
+    var x: i64 = 0
+    var y: i64 = 0
+    corner_pos(&wa, corner, margin as i64, o.w, o.h, &x, &y)
+    return move_to(f, x, y)
+}
+
+// The client height a content of `content_h` pixels asks for, kept between min_h and max_h (max_h 0 = as high as the
+// work area allows, minus the frame and the margins). Pure arithmetic: tests and layout code use it too.
+fn clamp_height(content_h: usize, min_h: usize, max_h: usize, avail_h: usize) -> usize {
+    var hi: usize = max_h
+    if hi == 0 || (avail_h > 0 && avail_h < hi) {
+        hi = avail_h
+    }
+    var h: usize = content_h
+    if hi > 0 && h > hi {
+        h = hi
+    }
+    if h < min_h {
+        h = min_h
+    }
+    if h == 0 {
+        h = 1
+    }
+    return h
+}
+
+// AUTO HEIGHT: make the client area `content_h` pixels high (clamped, see clamp_height) and keep the window anchored:
+// with a corner the edge nearest to that corner stays put (a bottom right chat box grows UPWARD), with CORNER_NONE the
+// top left stays. Does nothing (true) when the height is already right. Call once per frame after the events.
+fn fit_height(f: *mut window.Window, corner: u32, margin: usize, content_h: usize, min_h: usize, max_h: usize) -> bool {
+    var wa: Rect = Rect { x: 0, y: 0, w: 0, h: 0 }
+    var o: Rect = Rect { x: 0, y: 0, w: 0, h: 0 }
+    if !work_area(f, &wa) || !outer_rect(f, &o) {
+        return false
+    }
+    let cur_h: usize = window.height(f)
+    let frame_h: i64 = o.h - (cur_h as i64)
+    var avail: usize = 0
+    let room: i64 = wa.h - frame_h - 2 * (margin as i64)
+    if room > 0 {
+        avail = room as usize
+    }
+    let want: usize = clamp_height(content_h, min_h, max_h, avail)
+    if want == cur_h {
+        return true
+    }
+    if corner == CORNER_NONE {
+        return backend.r_place(&(*f).p, 2 as u32, 0, 0, window.width(f), want)
+    }
+    var x: i64 = 0
+    var y: i64 = 0
+    corner_pos(&wa, corner, margin as i64, o.w, (want as i64) + frame_h, &x, &y)
+    return backend.r_place(&(*f).p, 3 as u32, x, y, window.width(f), want)
+}
+
+// -------------------------------------------------------- hotkeys
+
+// Register a GLOBAL hotkey (works while another program has the focus). `id` is yours (reported as ev_a of
+// window.EV_HOTKEY), `mods` = window.HK_* bits, `key` = an ASCII letter / digit or window.HKEY_*. Registering an
+// id again replaces it. At most 8. False: the combination is taken by another program, or the key is unknown.
+fn hotkey_set(f: *mut window.Window, id: u32, mods: u32, key: u32) -> bool {
+    return backend.r_hotkey_set(&(*f).p, id, mods, key)
+}
+
+fn hotkey_clear(f: *mut window.Window, id: u32) -> bool {
+    return backend.r_hotkey_clear(&(*f).p, id)
+}

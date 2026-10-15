@@ -1,0 +1,604 @@
+// expect_exit: 0
+// wasm_skip: opens X11 windows on a private Xvfb (and Win32 windows under Wine); no window layer in WASM
+// tests/3541_window_extras_x11.fi -- lib/window/extras.fi on the X11 back end, against a real X server:
+//
+//   A  clamp_height arithmetic (pure)
+//   B  topmost on/off (set before and after the map), read back from the server and with xprop
+//   C  hide / show (xwininfo says IsUnMapped / IsViewable), frameless (_MOTIF_WM_HINTS)
+//   D  work area, place_corner (all four corners), fit_height (grows upward at a bottom right anchor, clamps)
+//   E  global hotkeys: grab accepted, a second client is refused, release/re-grab, a real key press (xdotool)
+//      arrives as EV_HOTKEY with the id, also with CapsLock/NumLock state ignored by the grab
+//
+// The program starts a private Xvfb (-displayfd) and runs itself as a child twice: without a window manager
+// ("--child") and, when openbox is installed, under it ("--child --wm"). Without Xvfb the test says SKIP.
+// xprop / xwininfo / xdotool are optional: the checks that need one are skipped when it is missing.
+// All messages go to standard error. The same program on Windows is the Win32 half (see tools/window/extras_wine.sh).
+import std.rt
+import std.str
+import std.env
+import std.process
+import std.osinfo
+import std.time
+import window.window
+import window.backend
+import window.extras
+
+static mut failures: i32 = 0
+static mut G_WM: bool = false
+
+fn say(s: str) {
+    syscall(1, 2, s.p as i64, s.length() as i64, 0, 0, 0)
+}
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn ck(cond: bool, name: str) {
+    if !cond {
+        failures = failures + 1
+        say("  FAIL  ")
+        say(name)
+        say("\n")
+    }
+}
+
+fn terr(e: ProcError) -> i32 {
+    return 1000
+}
+
+fn has(b: *mut rt.Buf, s: str) -> bool {
+    let n: usize = s.length()
+    let l: usize = rt.buf_len(b)
+    if n == 0 || l < n {
+        return false
+    }
+    var i: usize = 0
+    while i + n <= l {
+        if rt.mem_eq(rt.buf_ptr(b) + i as u64, s.p as u64, n) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn hexid(b: *mut rt.Buf, v: u64) {
+    rt.buf_push(b, 48 as u8)
+    rt.buf_push(b, 120 as u8)
+    var started: bool = false
+    var sh: i64 = 28
+    while sh >= 0 {
+        let d: u64 = (v >> (sh as u64)) & 15 as u64
+        if d != 0 as u64 || started || sh == 0 {
+            started = true
+            if d < 10 as u64 {
+                rt.buf_push(b, (48 as u64 + d) as u8)
+            } else {
+                rt.buf_push(b, (87 as u64 + d) as u8)
+            }
+        }
+        sh = sh - 4
+    }
+}
+
+static mut have_xprop: i32 = -1
+static mut have_xwininfo: i32 = -1
+static mut have_xdotool: i32 = -1
+
+fn tool_present(name: str) -> bool {
+    var path: rt.Buf = rt.buf_new()
+    let ok: bool = env.find_executable(name, &path)
+    rt.buf_free(&path)
+    return ok
+}
+
+// Run `tool a1 a2 a3` and collect standard output; false when the tool is missing or fails.
+fn tool_out(tool: str, a1: str, a2: str, a3: str, out: *mut rt.Buf) -> bool {
+    var c: process.Command = process.command(tool)
+    process.add_arg(&c, a1)
+    process.add_arg(&c, a2)
+    if a3.length() > 0 {
+        process.add_arg(&c, a3)
+    }
+    var err: rt.Buf = rt.buf_new()
+    let code: i32 = process.run_capture(&c, out, &err, 10000) catch | e | terr(e)
+    process.command_free(&c)
+    rt.buf_free(&err)
+    return code == 0
+}
+
+// xprop -id <win> <prop>  contains `needle`?  -1 = cannot tell (no xprop), 1 yes, 0 no
+fn xprop_has(f: *mut window.Window, prop: str, needle: str) -> i32 {
+    if have_xprop < 0 {
+        if tool_present("xprop") { have_xprop = 1 } else { have_xprop = 0 }
+    }
+    if have_xprop == 0 {
+        return -1
+    }
+    var id: rt.Buf = rt.buf_new()
+    hexid(&id, backend.r_native(&(*f).p))
+    rt.buf_push(&id, 0 as u8)
+    var out: rt.Buf = rt.buf_new()
+    let ok: bool = tool_out("xprop", "-id", str { p: rt.buf_data(&id), n: rt.buf_len(&id) - 1 }, prop, &out)
+    var r: i32 = 0
+    if !ok {
+        r = -1
+    } else if has(&out, needle) {
+        r = 1
+    }
+    rt.buf_free(&id)
+    rt.buf_free(&out)
+    return r
+}
+
+fn xwininfo_has(f: *mut window.Window, needle: str) -> i32 {
+    if have_xwininfo < 0 {
+        if tool_present("xwininfo") { have_xwininfo = 1 } else { have_xwininfo = 0 }
+    }
+    if have_xwininfo == 0 {
+        return -1
+    }
+    var id: rt.Buf = rt.buf_new()
+    hexid(&id, backend.r_native(&(*f).p))
+    rt.buf_push(&id, 0 as u8)
+    var out: rt.Buf = rt.buf_new()
+    let ok: bool = tool_out("xwininfo", "-id", str { p: rt.buf_data(&id), n: rt.buf_len(&id) - 1 }, "", &out)
+    var r: i32 = 0
+    if !ok {
+        r = -1
+    } else if has(&out, needle) {
+        r = 1
+    }
+    rt.buf_free(&id)
+    rt.buf_free(&out)
+    return r
+}
+
+// tri-state check: -1 = tool missing (not counted)
+fn ck3(v: i32, name: str) {
+    if v == 0 {
+        ck(false, name)
+    }
+}
+
+// xwininfo poll: a window manager maps asynchronously
+fn xwininfo_wait(f: *mut window.Window, needle: str) -> i32 {
+    var i: i32 = 0
+    var r: i32 = xwininfo_has(f, needle)
+    while r == 0 && i < 40 {
+        pump(f, 50)
+        r = xwininfo_has(f, needle)
+        i = i + 1
+    }
+    return r
+}
+
+fn dec(b: *mut rt.Buf, v: i64) {
+    if v < 0 {
+        rt.buf_push(b, 45 as u8)
+        rt.buf_push_dec_u64(b, (0 - v) as u64)
+    } else {
+        rt.buf_push_dec_u64(b, v as u64)
+    }
+    rt.buf_push(b, 32 as u8)
+}
+
+fn dump(f: *mut window.Window, tag: str) {
+    var wa: extras.Rect = extras.Rect { x: 0, y: 0, w: 0, h: 0 }
+    var o: extras.Rect = extras.Rect { x: 0, y: 0, w: 0, h: 0 }
+    let a: bool = extras.work_area(f, &wa)
+    let b: bool = extras.outer_rect(f, &o)
+    var s: rt.Buf = rt.buf_new()
+    dec(&s, wa.x)
+    dec(&s, wa.y)
+    dec(&s, wa.w)
+    dec(&s, wa.h)
+    rt.buf_push(&s, 124 as u8)
+    dec(&s, o.x)
+    dec(&s, o.y)
+    dec(&s, o.w)
+    dec(&s, o.h)
+    rt.buf_push(&s, 10 as u8)
+    say(tag)
+    syscall(1, 2, rt.buf_ptr(&s) as i64, rt.buf_len(&s) as i64, 0, 0, 0)
+    rt.buf_free(&s)
+}
+
+fn pump(f: *mut window.Window, ms: i64) {
+    window.wait_event(f, ms)
+    var n: i32 = 0
+    while window.next_event(f) != window.EV_NONE && n < 500 {
+        n = n + 1
+    }
+}
+
+// pump until the hotkey event with `id` comes (or `ms` pass)
+fn wait_hotkey(f: *mut window.Window, id: u32, ms: i64) -> bool {
+    let t0: u64 = time.monotonic_ns()
+    while (time.monotonic_ns() - t0) / 1000000 as u64 < ms as u64 {
+        window.wait_event(f, 50)
+        var n: i32 = 0
+        while n < 200 {
+            let k: u32 = window.next_event(f)
+            if k == window.EV_NONE {
+                break
+            }
+            if k == window.EV_HOTKEY && window.ev_a(f) == id {
+                return true
+            }
+            n = n + 1
+        }
+    }
+    return false
+}
+
+fn wait_topmost(f: *mut window.Window, want: bool) -> bool {
+    var i: i32 = 0
+    while i < 100 {
+        if extras.is_topmost(f) == want {
+            return true
+        }
+        pump(f, 20)
+        i = i + 1
+    }
+    return false
+}
+
+fn wait_height(f: *mut window.Window, h: usize) -> bool {
+    var i: i32 = 0
+    while i < 150 {
+        pump(f, 20)
+        if window.height(f) == h {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// the outer rectangle settles asynchronously under a window manager: poll until it satisfies `corner`
+fn wait_corner(f: *mut window.Window, corner: u32, margin: i64, bottom_edge_only: bool) -> bool {
+    var wa: extras.Rect = extras.Rect { x: 0, y: 0, w: 0, h: 0 }
+    var o: extras.Rect = extras.Rect { x: 0, y: 0, w: 0, h: 0 }
+    var i: i32 = 0
+    while i < 100 {
+        pump(f, 20)
+        if extras.work_area(f, &wa) && extras.outer_rect(f, &o) {
+            var okx: bool = true
+            var oky: bool = true
+            if corner == extras.CORNER_TR || corner == extras.CORNER_BR {
+                okx = o.x + o.w == wa.x + wa.w - margin
+            } else {
+                okx = o.x == wa.x + margin
+            }
+            if corner == extras.CORNER_BL || corner == extras.CORNER_BR {
+                oky = o.y + o.h == wa.y + wa.h - margin
+            } else {
+                oky = o.y == wa.y + margin
+            }
+            if bottom_edge_only {
+                okx = true
+            }
+            if okx && oky {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn part_a() {
+    ck(extras.clamp_height(150, 80, 300, 0) == 150, "clamp: inside")
+    ck(extras.clamp_height(10, 80, 300, 0) == 80, "clamp: min")
+    ck(extras.clamp_height(5000, 80, 300, 0) == 300, "clamp: max")
+    ck(extras.clamp_height(5000, 80, 0, 500) == 500, "clamp: max 0 = available")
+    ck(extras.clamp_height(5000, 80, 300, 200) == 200, "clamp: available below max")
+    ck(extras.clamp_height(0, 0, 0, 0) == 1, "clamp: never zero")
+}
+
+fn open_one(f: *mut window.Window, w: usize, h: usize) -> bool {
+    if !window.open_window(f, 0) {
+        return false
+    }
+    return window.make(f, w, h)
+}
+
+fn part_bcd(f: *mut window.Window) {
+    // ---- B topmost: before the map ...
+    ck(!extras.is_topmost(f), "B: not topmost at the start")
+    ck(extras.set_topmost(f, true), "B: set_topmost before show")
+    ck(window.show_window(f), "show_window")
+    pump(f, 100)
+    ck(wait_topmost(f, true), "B: topmost after show (read back)")
+    ck3(xprop_has(f, "_NET_WM_STATE", "_NET_WM_STATE_ABOVE"), "B: xprop sees _NET_WM_STATE_ABOVE")
+    ck(extras.set_topmost(f, false), "B: set_topmost off")
+    ck(wait_topmost(f, false), "B: not topmost after off")
+    ck(xprop_has(f, "_NET_WM_STATE", "_NET_WM_STATE_ABOVE") != 1, "B: xprop no longer sees ABOVE")
+    ck(extras.set_topmost(f, true), "B: set_topmost on again (mapped)")
+    ck(wait_topmost(f, true), "B: topmost again")
+    // ---- C hide / show
+    ck(extras.is_visible(f), "C: visible after show")
+    ck3(xwininfo_has(f, "IsViewable"), "C: xwininfo IsViewable")
+    ck(extras.hide(f), "C: hide")
+    pump(f, 100)
+    ck(!extras.is_visible(f), "C: not visible after hide")
+    ck3(xwininfo_has(f, "IsUnMapped"), "C: xwininfo IsUnMapped")
+    ck(extras.show(f), "C: show")
+    pump(f, 100)
+    ck(extras.is_visible(f), "C: visible after show again")
+    ck3(xwininfo_wait(f, "IsViewable"), "C: xwininfo IsViewable again")
+    ck(wait_topmost(f, true), "C: topmost survives hide/show")
+    // frameless
+    ck(!extras.is_frameless(f), "C: framed at the start")
+    ck(extras.set_frameless(f, true), "C: set_frameless")
+    ck(extras.is_frameless(f), "C: is_frameless")
+    ck3(xprop_has(f, "_MOTIF_WM_HINTS", "0x2, 0x0, 0x0, 0x0, 0x0"), "C: xprop _MOTIF_WM_HINTS = no decorations")
+    pump(f, 200)
+    // ---- D geometry
+    var wa: extras.Rect = extras.Rect { x: 0, y: 0, w: 0, h: 0 }
+    ck(extras.work_area(f, &wa), "D: work_area")
+    ck(wa.w >= 200 && wa.h >= 100 && wa.w <= 4096 && wa.h <= 4096, "D: work area has a sane size")
+    var corner: u32 = 0
+    while corner < 4 {
+        ck(extras.place_corner(f, corner, 10), "D: place_corner call")
+        ck(wait_corner(f, corner, 10, false), "D: window sits in the corner")
+        corner = corner + 1
+    }
+    // a bottom right anchor grows upward
+    ck(extras.place_corner(f, extras.CORNER_BR, 10), "D: BR")
+    ck(wait_corner(f, extras.CORNER_BR, 10, false), "D: BR reached")
+    ck(extras.fit_height(f, extras.CORNER_BR, 10, 150, 60, 400), "D: fit_height 150")
+    ck(wait_height(f, 150), "D: height is 150")
+    ck(wait_corner(f, extras.CORNER_BR, 10, false), "D: bottom edge stayed after growing")
+    ck3(xwininfo_has(f, "Height: 150"), "D: xwininfo Height: 150")
+    ck(extras.fit_height(f, extras.CORNER_BR, 10, 20, 60, 400), "D: fit_height below min")
+    ck(wait_height(f, 60), "D: clamped to min 60")
+    ck(wait_corner(f, extras.CORNER_BR, 10, false), "D: bottom edge stayed after shrinking")
+    ck(extras.fit_height(f, extras.CORNER_BR, 10, 9000, 60, 400), "D: fit_height above max")
+    ck(wait_height(f, 400), "D: clamped to max 400")
+    ck(extras.fit_height(f, extras.CORNER_BR, 10, 400, 60, 400), "D: fit_height unchanged is ok")
+    ck(extras.fit_height(f, extras.CORNER_NONE, 10, 120, 60, 400), "D: fit_height keep top left")
+    ck(wait_height(f, 120), "D: height 120 (no anchor)")
+    ck(extras.set_height(f, 130), "D: set_height")
+    ck(wait_height(f, 130), "D: height 130")
+    ck(extras.move_to(f, 20, 30), "D: move_to")
+    var o: extras.Rect = extras.Rect { x: 0, y: 0, w: 0, h: 0 }
+    var tries: i32 = 0
+    var at: bool = false
+    while tries < 100 && !at {
+        pump(f, 20)
+        if extras.outer_rect(f, &o) && o.x == 20 && o.y == 30 {
+            at = true
+        }
+        tries = tries + 1
+    }
+    ck(at, "D: move_to put the outer corner at 20,30")
+    // framed again: the frame is part of the outer rectangle, the corner maths still holds
+    ck(extras.set_frameless(f, false), "D: frame back")
+    pump(f, 300)
+    if G_WM {
+        // the window manager re-frames asynchronously: wait until the frame shows in the outer rectangle
+        var settle: i32 = 0
+        var fr: extras.Rect = extras.Rect { x: 0, y: 0, w: 0, h: 0 }
+        while settle < 100 {
+            pump(f, 30)
+            if extras.outer_rect(f, &fr) && fr.h > (window.height(f) as i64) {
+                break
+            }
+            settle = settle + 1
+        }
+        ck(settle < 100, "D: window manager draws the frame again")
+    }
+    ck(extras.place_corner(f, extras.CORNER_BR, 12), "D: BR framed")
+    ck(wait_corner(f, extras.CORNER_BR, 12, false), "D: framed window sits in the corner")
+}
+
+fn part_e(f: *mut window.Window) {
+    ck(extras.hotkey_set(f, 7, window.HK_CTRL | window.HK_ALT, 106 as u32), "E: hotkey_set Ctrl+Alt+J")
+    // a second client (own connection) cannot take the same combination
+    var g: window.Window = window.window_new()
+    ck(open_one(&g, 100, 50), "E: second window")
+    ck(!extras.hotkey_set(&g, 1, window.HK_CTRL | window.HK_ALT, 106 as u32), "E: second client refused (BadAccess)")
+    ck(extras.hotkey_set(&g, 1, window.HK_CTRL | window.HK_ALT, 107 as u32), "E: second client takes another key")
+    ck(!extras.hotkey_set(f, 8, 0 as u32, 0 as u32), "E: unknown key refused")
+    ck(extras.hotkey_clear(f, 7), "E: hotkey_clear")
+    ck(!extras.hotkey_clear(f, 7), "E: clearing twice says false")
+    ck(extras.hotkey_set(&g, 2, window.HK_CTRL | window.HK_ALT, 106 as u32), "E: the freed combination can be taken by the other client")
+    ck(extras.hotkey_clear(&g, 2), "E: other client lets go")
+    ck(extras.hotkey_clear(&g, 1), "E: other client lets go of k")
+    window.close_window(&g)
+    ck(extras.hotkey_set(f, 7, window.HK_CTRL | window.HK_ALT, 106 as u32), "E: grab again")
+    ck(extras.hotkey_set(f, 9, window.HK_SHIFT, window.HKEY_F5), "E: Shift+F5")
+    if have_xdotool < 0 {
+        if tool_present("xdotool") { have_xdotool = 1 } else { have_xdotool = 0 }
+    }
+    if have_xdotool == 0 {
+        say("  note: xdotool missing -- the key press part of E was not run\n")
+        return
+    }
+    var c: process.Command = process.command("sh")
+    process.add_arg(&c, "-c")
+    process.add_arg(&c, "sleep 0.4; xdotool key ctrl+alt+j; sleep 0.3; xdotool key Caps_Lock; xdotool key ctrl+alt+j; xdotool key Caps_Lock; sleep 0.2; xdotool key shift+F5")
+    process.set_stdout(&c, process.STDIO_NULL)
+    process.set_stderr(&c, process.STDIO_NULL)
+    var ch: process.Child = process.spawn(&c) catch | e | process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1, done: false, code: 0, sig: 0, own: true }
+    process.command_free(&c)
+    ck(ch.pid > 0, "E: xdotool started")
+    ck(wait_hotkey(f, 7, 5000), "E: Ctrl+Alt+J arrives as EV_HOTKEY id 7")
+    ck(wait_hotkey(f, 7, 5000), "E: also with CapsLock on")
+    ck(wait_hotkey(f, 9, 5000), "E: Shift+F5 arrives as EV_HOTKEY id 9")
+    if ch.pid > 0 {
+        process.wait_timeout(&ch, 5000)
+        process.kill(&ch)
+        process.wait(&ch)
+        process.close(&ch)
+    }
+    ck(extras.hotkey_clear(f, 7), "E: clear 7")
+    ck(extras.hotkey_clear(f, 9), "E: clear 9")
+}
+
+fn child(wm: bool) {
+    G_WM = wm
+    part_a()
+    var f: window.Window = window.window_new()
+    if !open_one(&f, 240, 120) {
+        ck(false, "open the window")
+        return
+    }
+    part_bcd(&f)
+    part_e(&f)
+    window.close_window(&f)
+}
+
+// Xvfb with a free display number chosen by the server itself (-displayfd)
+fn start_xvfb(xvfb: *mut process.Child) -> i32 {
+    var path: rt.Buf = rt.buf_new()
+    if !env.find_executable("Xvfb", &path) {
+        rt.buf_free(&path)
+        return -1
+    }
+    var c: process.Command = process.command("Xvfb")
+    process.add_arg(&c, "-displayfd")
+    process.add_arg(&c, "1")
+    process.add_arg(&c, "-screen")
+    process.add_arg(&c, "0")
+    process.add_arg(&c, "800x600x24")
+    process.add_arg(&c, "-nolisten")
+    process.add_arg(&c, "tcp")
+    process.set_stdin(&c, process.STDIO_NULL)
+    process.set_stdout(&c, process.STDIO_PIPE)
+    process.set_stderr(&c, process.STDIO_NULL)
+    var ch: process.Child = process.spawn(&c) catch | e | process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1, done: false, code: 0, sig: 0, own: true }
+    process.command_free(&c)
+    rt.buf_free(&path)
+    if ch.pid <= 0 {
+        return -2
+    }
+    *xvfb = ch
+    var line: [u8; 32] = [0 as u8; 32]
+    var have: usize = 0
+    let t0: u64 = time.monotonic_ns()
+    while time.monotonic_ns() - t0 < 15000000000 as u64 {
+        let n: i64 = process.read_out_nb(xvfb, (&line[0]) as u64 + have as u64, 31 - have)
+        if n > 0 {
+            have = have + n as usize
+            var k: usize = 0
+            while k < have {
+                if line[k] == 10 as u8 {
+                    var num: i32 = 0
+                    var j: usize = 0
+                    while j < k {
+                        num = num * 10 + (line[j] as i32 - 48)
+                        j = j + 1
+                    }
+                    return num
+                }
+                k = k + 1
+            }
+        } else if n == 0 {
+            return -3
+        } else {
+            time.sleep_ms(20 as u64)
+        }
+    }
+    return -4
+}
+
+// run this program as a child with DISPLAY set; returns its exit code
+fn run_child(start: u64, disp: i32, wm: bool) -> i32 {
+    var c: process.Command = process.command(arg(start, 0))
+    process.add_arg(&c, "--child")
+    if wm {
+        process.add_arg(&c, "--wm")
+    }
+    var dv: rt.Buf = rt.buf_new()
+    rt.buf_push(&dv, 58 as u8)
+    rt.buf_push_dec_u64(&dv, disp as u64)
+    process.set_env(&c, "DISPLAY", str { p: rt.buf_data(&dv), n: rt.buf_len(&dv) })
+    var out: rt.Buf = rt.buf_new()
+    var err: rt.Buf = rt.buf_new()
+    let code: i32 = process.run_capture(&c, &out, &err, 120000) catch | e | terr(e)
+    process.command_free(&c)
+    if rt.buf_len(&err) > 0 {
+        syscall(1, 2, rt.buf_ptr(&err) as i64, rt.buf_len(&err) as i64, 0, 0, 0)
+    }
+    rt.buf_free(&dv)
+    rt.buf_free(&out)
+    rt.buf_free(&err)
+    return code
+}
+
+fn start_openbox(disp: i32) -> process.Child {
+    var ob: process.Child = process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1, done: false, code: 0, sig: 0, own: true }
+    if !tool_present("openbox") {
+        return ob
+    }
+    var c: process.Command = process.command("openbox")
+    var dv: rt.Buf = rt.buf_new()
+    rt.buf_push(&dv, 58 as u8)
+    rt.buf_push_dec_u64(&dv, disp as u64)
+    process.set_env(&c, "DISPLAY", str { p: rt.buf_data(&dv), n: rt.buf_len(&dv) })
+    process.set_stdout(&c, process.STDIO_NULL)
+    process.set_stderr(&c, process.STDIO_NULL)
+    ob = process.spawn(&c) catch | e | process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1, done: false, code: 0, sig: 0, own: true }
+    process.command_free(&c)
+    rt.buf_free(&dv)
+    time.sleep_ms(1500 as u64)
+    return ob
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) >= 2 && arg(start, 1) == "--child" {
+        var wm: bool = rt.arg_count(start) >= 3 && arg(start, 2) == "--wm"
+        child(wm)
+        if failures == 0 {
+            if wm {
+                say("ok: window extras under a window manager\n")
+            } else {
+                say("ok: window extras without a window manager\n")
+            }
+        }
+        return failures
+    }
+    if osinfo.is_windows() {
+        say("SKIP: the Win32 half runs through tools/window/extras_wine.sh\n")
+        return 0
+    }
+    var xvfb: process.Child = process.Child { pid: 0, h: 0, in_fd: -1, out_fd: -1, err_fd: -1, done: false, code: 0, sig: 0, own: true }
+    let disp: i32 = start_xvfb(&xvfb)
+    if disp < 0 {
+        if xvfb.pid > 0 {
+            process.kill(&xvfb)
+            process.wait(&xvfb)
+            process.close(&xvfb)
+        }
+        say("SKIP: Xvfb is not installed or did not start; the X11 window extras were not run here\n")
+        return 0
+    }
+    var rc: i32 = run_child(start, disp, false)
+    var ob: process.Child = start_openbox(disp)
+    if ob.pid > 0 {
+        let rc2: i32 = run_child(start, disp, true)
+        if rc2 != 0 {
+            rc = rc2
+        }
+        process.terminate(&ob)
+        if !process.wait_timeout(&ob, 3000) {
+            process.kill(&ob)
+            process.wait(&ob)
+        }
+        process.close(&ob)
+    } else {
+        say("  note: openbox missing -- the window manager run was skipped\n")
+    }
+    process.terminate(&xvfb)
+    if !process.wait_timeout(&xvfb, 3000) {
+        process.kill(&xvfb)
+    }
+    process.wait(&xvfb)
+    process.close(&xvfb)
+    return rc
+}
