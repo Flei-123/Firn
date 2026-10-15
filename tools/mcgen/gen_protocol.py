@@ -921,8 +921,12 @@ def main():
         os.makedirs(libdir, exist_ok=True)
         write_sem(os.path.join(libdir, "mc_sem.fi"))
         entries = []
+        seen = set()
         for vkey in want:
             proto, pver, _ = load_protocol(data_dir, vkey)
+            if pver in seen:
+                continue  # several game versions can share one protocol (1.18 / 1.18.1 = 757): first key wins
+            seen.add(pver)
             d = os.path.join(libdir, "v%d" % pver)
             os.makedirs(d, exist_ok=True)
             generate(data_dir, vkey, os.path.join(d, "mc_proto_v%d.fi" % pver))
