@@ -1,0 +1,303 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_hash.fi -- the 32 bit component hashes of the hashed item stacks (Click Container, 1.21.5+, protocol 770+).
+//
+// A hashed stack sends, per data component of the stack's patch, only a CRC32C of the component's value. The value is hashed through a
+// "hashing DynamicOps": every value becomes a tagged byte string, a composite value hashes the 4 byte hashes of its parts:
+//   empty       01
+//   map         02 { key hash, value hash }* 03        entries sorted by (key hash, value hash), both compared as unsigned 32 bit
+//   list        04 { element hash }* 05
+//   byte        06 b            short  07 s (LE)   int  08 i (LE)    long  09 l (LE)
+//   float       0A (raw bits LE)                    double 0B (raw bits LE)
+//   string      0C len (i32 LE, UTF-16 units) utf16le   bool 0D b
+//   byte[]      0E { byte hash }* 0F        int[]  10 { int hash }* 11        long[] 12 { long hash }* 13
+// The final value is the CRC32C (Castagnoli, reflected 0x82F63B78, init/xorout 0xFFFFFFFF) of those bytes; a part hash is fed as its 4 little
+// endian bytes. The server compares the hash with the one of its own stack and re-sends the slot on a mismatch (so a wrong hash is never
+// fatal, it only costs a Set Slot). Verified against a real 1.21.5 server by tools/mc/play/run_inv.sh (hashed click stage).
+// Public layout of the wire format: wiki "Slot data" (hashed format); the algorithm itself is the black-box result of the live stage.
+import std.rt
+import std.bytes
+
+export {
+    crc32c, hash_empty, hash_bool, hash_byte, hash_short, hash_int, hash_long, hash_float, hash_string, hash_list, hash_map, hash_map1,
+    hash_utf16_len, put_le32, HStack, HS_MAX, hstack_empty, hstack_add, hstack_remove, hstack_put, hstack_get,
+}
+
+const TAG_EMPTY: u8 = 1 as u8
+const TAG_MAP_START: u8 = 2 as u8
+const TAG_MAP_END: u8 = 3 as u8
+const TAG_LIST_START: u8 = 4 as u8
+const TAG_LIST_END: u8 = 5 as u8
+const TAG_BYTE: u8 = 6 as u8
+const TAG_SHORT: u8 = 7 as u8
+const TAG_INT: u8 = 8 as u8
+const TAG_LONG: u8 = 9 as u8
+const TAG_FLOAT: u8 = 10 as u8
+const TAG_DOUBLE: u8 = 11 as u8
+const TAG_STRING: u8 = 12 as u8
+const TAG_BOOL: u8 = 13 as u8
+
+const POLY: u64 = 2197175160 // 0x82F63B78
+
+// CRC32C of n bytes at p
+fn crc32c(p: u64, n: usize) -> u32 {
+    var crc: u64 = 4294967295
+    var i: usize = 0
+    while i < n {
+        crc = crc ^ (rt.ld8(p, i) as u64)
+        var k: i32 = 0
+        while k < 8 {
+            if (crc & 1) != 0 { crc = (crc >> 1) ^ POLY } else { crc = crc >> 1 }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return ((crc ^ 4294967295) & 4294967295) as u32
+}
+
+// little endian writers (bytes.put_* are big endian)
+fn put_le32(b: *mut bytes.Bytes, v: u64) {
+    bytes.put_u8(b, (v & 255) as u8)
+    bytes.put_u8(b, ((v >> 8) & 255) as u8)
+    bytes.put_u8(b, ((v >> 16) & 255) as u8)
+    bytes.put_u8(b, ((v >> 24) & 255) as u8)
+}
+
+fn put_le64(b: *mut bytes.Bytes, v: u64) {
+    put_le32(b, v & 4294967295)
+    put_le32(b, (v >> 32) & 4294967295)
+}
+
+fn finish(b: *mut bytes.Bytes) -> u32 {
+    let h: u32 = crc32c(bytes.bytes_ptr(b), bytes.bytes_len(b))
+    bytes.bytes_free(b)
+    return h
+}
+
+fn hash_empty() -> u32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_u8(&b, TAG_EMPTY)
+    return finish(&b)
+}
+
+fn hash_bool(v: bool) -> u32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_u8(&b, TAG_BOOL)
+    if v { bytes.put_u8(&b, 1 as u8) } else { bytes.put_u8(&b, 0 as u8) }
+    return finish(&b)
+}
+
+fn hash_byte(v: i32) -> u32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_u8(&b, TAG_BYTE)
+    bytes.put_u8(&b, ((v as i64) & 255) as u8)
+    return finish(&b)
+}
+
+fn hash_short(v: i32) -> u32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_u8(&b, TAG_SHORT)
+    let u: u64 = ((v as i64) & 65535) as u64
+    bytes.put_u8(&b, (u & 255) as u8)
+    bytes.put_u8(&b, ((u >> 8) & 255) as u8)
+    return finish(&b)
+}
+
+fn hash_int(v: i32) -> u32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_u8(&b, TAG_INT)
+    put_le32(&b, ((v as i64) & 4294967295) as u64)
+    return finish(&b)
+}
+
+fn hash_long(v: i64) -> u32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_u8(&b, TAG_LONG)
+    put_le64(&b, bytes.bits_u64(v))
+    return finish(&b)
+}
+
+// float given as its raw IEEE bits
+fn hash_float(bits: u32) -> u32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_u8(&b, TAG_FLOAT)
+    put_le32(&b, bits as u64)
+    return finish(&b)
+}
+
+// number of UTF-16 code units of the UTF-8 text
+fn hash_utf16_len(p: u64, n: usize) -> i32 {
+    var i: usize = 0
+    var u: i32 = 0
+    while i < n {
+        let c: u32 = rt.ld8(p, i) as u32
+        if c < 128 as u32 { i = i + 1; u = u + 1 }
+        else if c < 224 as u32 { i = i + 2; u = u + 1 }
+        else if c < 240 as u32 { i = i + 3; u = u + 1 }
+        else { i = i + 4; u = u + 2 }
+    }
+    return u
+}
+
+// string: tag, length in UTF-16 units (i32 LE), the UTF-16LE text
+fn hash_string(p: u64, n: usize) -> u32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_u8(&b, TAG_STRING)
+    put_le32(&b, hash_utf16_len(p, n) as u64)
+    var i: usize = 0
+    while i < n {
+        let c0: u64 = rt.ld8(p, i) as u64
+        var cp: u64 = c0
+        var step: usize = 1
+        if c0 >= 240 && i + 3 < n { cp = ((c0 & 7) << 18) | ((rt.ld8(p, i + 1) as u64 & 63) << 12) | ((rt.ld8(p, i + 2) as u64 & 63) << 6) | (rt.ld8(p, i + 3) as u64 & 63); step = 4 }
+        else if c0 >= 224 && i + 2 < n { cp = ((c0 & 15) << 12) | ((rt.ld8(p, i + 1) as u64 & 63) << 6) | (rt.ld8(p, i + 2) as u64 & 63); step = 3 }
+        else if c0 >= 192 && i + 1 < n { cp = ((c0 & 31) << 6) | (rt.ld8(p, i + 1) as u64 & 63); step = 2 }
+        if cp >= 65536 {
+            let w: u64 = cp - 65536
+            let hi: u64 = 55296 + (w >> 10)
+            let lo: u64 = 56320 + (w & 1023)
+            bytes.put_u8(&b, (hi & 255) as u8); bytes.put_u8(&b, ((hi >> 8) & 255) as u8)
+            bytes.put_u8(&b, (lo & 255) as u8); bytes.put_u8(&b, ((lo >> 8) & 255) as u8)
+        } else {
+            bytes.put_u8(&b, (cp & 255) as u8); bytes.put_u8(&b, ((cp >> 8) & 255) as u8)
+        }
+        i = i + step
+    }
+    return finish(&b)
+}
+
+// list of n element hashes (u32 array at hs)
+fn hash_list(hs: u64, n: usize) -> u32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_u8(&b, TAG_LIST_START)
+    var i: usize = 0
+    while i < n {
+        put_le32(&b, rt.ld32(hs, i) as u64)
+        i = i + 1
+    }
+    bytes.put_u8(&b, TAG_LIST_END)
+    return finish(&b)
+}
+
+// map of n entries (key hashes ks, value hashes vs, u32 arrays; sorted here by (key, value) as unsigned numbers; the arrays stay untouched)
+fn hash_map(ks: u64, vs: u64, n: usize) -> u32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_u8(&b, TAG_MAP_START)
+    // selection order without moving the caller's arrays: repeatedly take the smallest entry that is larger than the last taken one
+    var taken: u64 = 0 // bit i = entry i already written (n <= 64)
+    var c: usize = 0
+    while c < n && c < 64 {
+        var best: usize = 64
+        var bk: u64 = 0
+        var bv: u64 = 0
+        var i: usize = 0
+        while i < n && i < 64 {
+            if ((taken >> (i as u64)) & 1) == 0 {
+                let k: u64 = rt.ld32(ks, i) as u64
+                let v: u64 = rt.ld32(vs, i) as u64
+                if best == 64 || k < bk || (k == bk && v < bv) { best = i; bk = k; bv = v }
+            }
+            i = i + 1
+        }
+        if best == 64 { break }
+        taken = taken | (1 << (best as u64))
+        put_le32(&b, bk)
+        put_le32(&b, bv)
+        c = c + 1
+    }
+    bytes.put_u8(&b, TAG_MAP_END)
+    return finish(&b)
+}
+
+// map with a single entry
+fn hash_map1(k: u32, v: u32) -> u32 {
+    var b: bytes.Bytes = bytes.bytes_new()
+    bytes.put_u8(&b, TAG_MAP_START)
+    put_le32(&b, k as u64)
+    put_le32(&b, v as u64)
+    bytes.put_u8(&b, TAG_MAP_END)
+    return finish(&b)
+}
+
+// ---- the hashed stack of the wire ---------------------------------------------------------------------------------------------
+// Click Container (1.21.5+): changed slots and the carried stack are `bool present` + (varint item, varint count, varint n_added +
+// (varint component type, i32 hash)*, varint n_removed + varint component type*). Set Creative Slot keeps the plain (untrusted) stack.
+const HS_MAX: i32 = 8
+
+struct HStack {
+    present: bool,
+    item: i32,
+    count: i32,
+    n_add: i32,
+    add_t: [i32; 8],
+    add_h: [i32; 8],
+    n_rem: i32,
+    rem_t: [i32; 8],
+}
+
+fn hstack_empty() -> HStack {
+    return HStack { present: false, item: 0 - 1, count: 0, n_add: 0, add_t: [0; 8], add_h: [0; 8], n_rem: 0, rem_t: [0; 8] }
+}
+
+fn hstack_add(h: *mut HStack, t: i32, hash: u32) {
+    if (*h).n_add >= HS_MAX { return }
+    (*h).add_t[(*h).n_add as usize] = t
+    (*h).add_h[(*h).n_add as usize] = bytes.bits_i32(hash)
+    (*h).n_add = (*h).n_add + 1
+}
+
+fn hstack_remove(h: *mut HStack, t: i32) {
+    if (*h).n_rem >= HS_MAX { return }
+    (*h).rem_t[(*h).n_rem as usize] = t
+    (*h).n_rem = (*h).n_rem + 1
+}
+
+fn hstack_put(b: *mut bytes.Bytes, h: *mut HStack) {
+    if !(*h).present || (*h).item < 0 || (*h).count <= 0 { bytes.put_bool(b, false); return }
+    bytes.put_bool(b, true)
+    bytes.put_varint(b, (*h).item)
+    bytes.put_varint(b, (*h).count)
+    bytes.put_varint(b, (*h).n_add)
+    var i: i32 = 0
+    while i < (*h).n_add {
+        bytes.put_varint(b, (*h).add_t[i as usize])
+        bytes.put_i32(b, (*h).add_h[i as usize])
+        i = i + 1
+    }
+    bytes.put_varint(b, (*h).n_rem)
+    i = 0
+    while i < (*h).n_rem {
+        bytes.put_varint(b, (*h).rem_t[i as usize])
+        i = i + 1
+    }
+}
+
+// reads one hashed stack; false on a truncated body or more than HS_MAX entries
+fn hstack_get(b: *mut bytes.Bytes, h: *mut HStack) -> bool {
+    (*h) = hstack_empty()
+    let has: bool = bytes.get_bool(b) catch false
+    if !bytes.bytes_ok(b) { return false }
+    if !has { return true }
+    (*h).present = true
+    (*h).item = bytes.get_varint(b) catch (0 - 1)
+    (*h).count = bytes.get_varint(b) catch 0
+    let na: i32 = bytes.get_varint(b) catch (0 - 1)
+    if na < 0 || na > HS_MAX { return false }
+    var i: i32 = 0
+    while i < na {
+        let t: i32 = bytes.get_varint(b) catch (0 - 1)
+        let x: i32 = bytes.get_i32(b) catch 0
+        (*h).add_t[i as usize] = t
+        (*h).add_h[i as usize] = x
+        i = i + 1
+    }
+    (*h).n_add = na
+    let nr: i32 = bytes.get_varint(b) catch (0 - 1)
+    if nr < 0 || nr > HS_MAX { return false }
+    i = 0
+    while i < nr {
+        (*h).rem_t[i as usize] = bytes.get_varint(b) catch (0 - 1)
+        i = i + 1
+    }
+    (*h).n_rem = nr
+    return bytes.bytes_ok(b)
+}

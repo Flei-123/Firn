@@ -105,6 +105,7 @@ The client picks the version from the protocol number in the server-list ping.
 | **1.20.2** | **764** | yes (has the Configuration state) | yes (788) | `CF_CONTAINERS_118` (same, nameless NBT roots) | **yes** (11.10.2026: real 1.20.2 server incl. configuration phase, dump byte-identical, 109 chunks) |
 | **1.21.1** | **767** | yes | yes (904) | `CF_CONTAINERS_118` **verified** | **yes** (11.10.2026: real 1.21.1 server, Known Packs answered, dump byte-identical to the reference, 109 chunks) |
 | **1.21.4** | **769** | yes | yes (948) | `CF_CONTAINERS_118` **verified** | **yes** (11.10.2026: real 1.21.4 server, client information with particle status, dump byte-identical, 117 chunks) |
+| **1.21.5** | **770** | yes | yes | `CF_CONTAINERS_118` + 1.21.5 shape (`FLAG_HM_MAP`) | Firn joins a real 1.21.5 server (15.10.2026, `tools/mc/play/run_hash.sh`: chunks decoded, inventory bad=0). No byte-identical dump: the reference client (node-minecraft-protocol) stops at 1.21.4. |
 | **1.21.8** | **772** | yes | yes (980) | `CF_CONTAINERS_118` + 1.21.5 shape (`FLAG_HM_MAP`) **verified** | **yes** (11.10.2026: real 1.21.8 server, heightmap map + containers without length, dump byte-identical, 117 chunks) |
 | 1.21.11 | 774 | yes | yes (1008) | `CF_CONTAINERS_118` + 1.21.5 shape: Firn joins and decodes all 117 chunks without a decode error, byte equality **proven 14.10.2026** (see below) | **yes** (14.10.2026: real 1.21.11 server, `MC_SETTLE_MS=90000` + `tick freeze`, A == A2, B == A, 117 chunks) |
 | 26.1 | 775 (in minecraft-data) | yes | yes (1028) | `CF_CONTAINERS_118` + 1.21.5 shape + `FLAG_SEC_FLUID` (a second i16 after every block count): layout FOUND 14.10.2026 from raw bytes (see below); Firn decode rule built + unit tested (tests/2931), real-server byte equality **proven 14.10.2026** | **yes** (14.10.2026: real 26.1 server, `MC_SETTLE_MS=90000` + `tick freeze`, A == A2, B == A, 117 chunks incl. the fluid count) |
@@ -334,6 +335,24 @@ the original packet) or drops an update for an unknown column (`APPLY_DROPPED`).
   A == A2 and B == A (full file, C/S/H, L lines), 121 chunks, walk_fail 0. run.sh still ends FAIL(1) because the entity scenario creates too few entities
   (server: "Incorrect argument for command" for some scenario commands on 1.14-1.17) -> entities NOT proven for these versions (open).
 * Tests: `tests/3040_mc_chunk_old.fi` (hand-built packets of all three variants, error and truncation paths); `tests/2745` now refuses 735 instead of 755.
+* NOT covered: 1.16.0 / 1.16.1 (ignoreOldData bool, 1024 biome ints).
+
+## Hashed item stacks (1.21.5+, protocol 770+)
+
+Click Container sends the changed slots and the carried stack as *hashed* stacks: `bool present, varint item, varint count, varint n_added +
+(varint component type, i32 CRC32C)*, varint n_removed + varint type*`. Set Creative Slot keeps the plain *untrusted* stack (components with
+their real values), so it needs no hashes. The server hashes ITS stack the same way and, when the hash differs, re-sends the slot (never a kick).
+
+* `lib/mc/mc_hash.fi`: CRC32C, the tagged hashing ops (empty / bool / byte / short / int / long / float / string (UTF-16LE with length) / list /
+  map (entries sorted by key hash, then value hash, unsigned)) and the wire struct `HStack` (`hstack_put` / `hstack_get`). Test 3300.
+* `lib/mc/mc_inv.fi`: while a Window Items / Set Slot / Set Cursor Item is parsed, the value of every component we can hash is hashed
+  (`hc_data`: max_stack_size, max_damage, damage, repair_cost = int; unbreakable = empty map; custom_name / item_name = plain string name;
+  rarity = enum name; enchantment_glint_override = bool; enchantments = map registry-key-string -> int level). The patch (types + hashes + removed
+  types) is kept per stack signature (`inv_patch_of`), so a stack that is moved, split or swapped keeps its hashes. Anything else (custom_data,
+  lore, attribute_modifiers, styled names, ...) is NOT hashed: the click is still sent, the server then re-sends that slot (a visible resync only).
+* The enchantment key hashes come from the Registry Data (`mc_client.client_enchant_keys`, index = registry id).
+* Live proof: `bash tools/mc/play/run_hash.sh [version]` (a pickaxe with six components + a plain stack, pick up / put back). Run 1 must see 0 server
+  re-sends, run 2 (`MCPLAY_HASH_OFF=1`, no hashes) must see some, so the check measures something. 1.21.5 / 1.21.8 / 1.21.11 / 26.1 see below.
 * 1.16.0 / 1.16.1: see section 12.
 
 ## 12. Round 2026-10-15 (worker mc-s4-versionen-1-18-x-1-19-4-1-16-0): 1.18 / 1.18.1 / 1.16.0 / 1.16.1
