@@ -85,7 +85,7 @@ freestanding code, and an optional incremental garbage collector
 
 ## Libraries
 
-Everything lives under `lib/` and is written in Firn. For writing an application (what exists, where, what proves it) see [docs/APPLICATION_LIBS.md](docs/APPLICATION_LIBS.md); start a new one with `tools/newapp.sh`.
+Everything lives under `lib/` and is written in Firn. **Before writing a new library or helper, read [docs/LIBS.md](docs/LIBS.md) (generated index of every module: purpose, API, platforms, tests) or `rg` in `lib/` -- do not rebuild what exists.** After changing `lib/`, regenerate it with `bash tools/gen_libs_index.sh` (the hygiene gate fails when it is stale). For writing an application (what exists, where, what proves it) see [docs/APPLICATION_LIBS.md](docs/APPLICATION_LIBS.md); start a new one with `tools/newapp.sh`.
 
 | area | modules |
 |---|---|

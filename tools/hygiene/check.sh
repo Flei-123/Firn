@@ -4,6 +4,9 @@
 #      from lib/gc/*.fi (a stale file once broke fixpoint.sh).
 #   2. No NEW duplicate test numbers in tests/ (numbers listed in
 #      tools/hygiene/known_dup_testnums.txt are grandfathered).
+#   3. docs/LIBS.md (the lib/ index) must match lib/ -- stale means a module,
+#      purpose line, export or platform twin changed without regenerating:
+#      run bash tools/gen_libs_index.sh (quick, ~1 s, no heavy needed).
 # Exit 0 = clean, 1 = a guard struck. Usage: bash tools/hygiene/check.sh
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -30,5 +33,9 @@ fi
 # Grandfathered entries that are no longer duplicates should be dropped.
 GONE=$(comm -13 "$T/dups" "$T/known")
 [ -n "$GONE" ] && echo "HYGIENE: note: resolved, remove from known_dup_testnums.txt: $(echo $GONE)"
+
+LIBS_OUT=$(bash tools/gen_libs_index.sh --check 2>&1) || { echo "HYGIENE: $LIBS_OUT"; rc=1; }
+case "$LIBS_OUT" in *note:*) echo "HYGIENE: $LIBS_OUT" ;; esac
+
 [ $rc = 0 ] && echo "HYGIENE: ok"
 exit $rc
