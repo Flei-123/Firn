@@ -1,0 +1,164 @@
+// expect_exit: 0
+// tests/3260_mc_client_pos_relative.fi -- r198+: relative flags of Synchronize Player Position are applied (1.8 = 47, 1.20.1 = 763, 1.21.4 = 769).
+// A real loopback socket: the "server" sends a position packet with flags, the client (which knows its own position via client_note_pos)
+// resolves it. Checks client_position / client_position_look / client_position_delta AND the absolute position packet the client answers with.
+import std.net
+import std.rt
+import std.bytes
+import mc.mc_codec
+import mc.mc_client
+import mc.mc_encode
+import mc.mc_sem
+import mc.mc_version
+import mc.v47.mc_proto_v47
+import mc.v763.mc_proto_v763
+import mc.v769.mc_proto_v769
+
+static mut g_fail: i32 = 0
+
+fn check(ok: bool, msg: str) {
+    if !ok {
+        var o: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&o, "FAIL ".p as u64, 5)
+        rt.buf_push_bytes(&o, msg.p as u64, msg.n)
+        rt.buf_push(&o, 10)
+        rt.write_everything(1, rt.buf_ptr(&o), rt.buf_len(&o))
+        rt.buf_free(&o)
+        g_fail = g_fail + 1
+    }
+}
+
+fn near(a: f64, b: f64) -> bool {
+    var d: f64 = a - b
+    if d < 0.0 { d = 0.0 - d }
+    return d < 0.0001
+}
+
+// server side: one Synchronize Player Position
+fn send_position(sw: *mut mc_codec.Wire, ver: *mut mc_version.Version, flags: i64, x: f64, y: f64, z: f64, yaw: f32, pitch: f32, dy: f64) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_f64(&v, "x", x)
+    mc_encode.vals_f64(&v, "y", y)
+    mc_encode.vals_f64(&v, "z", z)
+    mc_encode.vals_f64(&v, "dx", 0.0)
+    mc_encode.vals_f64(&v, "dy", dy)
+    mc_encode.vals_f64(&v, "dz", 0.0)
+    mc_encode.vals_f32(&v, "yaw", yaw)
+    mc_encode.vals_f32(&v, "pitch", pitch)
+    if (*ver).protocol >= 768 {
+        // 1.21.2+: bitflags (u32), one bool per flag
+        mc_encode.vals_bool(&v, "flags.x", (flags & 1) != 0)
+        mc_encode.vals_bool(&v, "flags.y", (flags & 2) != 0)
+        mc_encode.vals_bool(&v, "flags.z", (flags & 4) != 0)
+        mc_encode.vals_bool(&v, "flags.yaw", (flags & 8) != 0)
+        mc_encode.vals_bool(&v, "flags.pitch", (flags & 16) != 0)
+        mc_encode.vals_bool(&v, "flags.dx", (flags & 32) != 0)
+        mc_encode.vals_bool(&v, "flags.dy", (flags & 64) != 0)
+        mc_encode.vals_bool(&v, "flags.dz", (flags & 128) != 0)
+        mc_encode.vals_bool(&v, "flags.yawDelta", (flags & 256) != 0)
+    } else {
+        mc_encode.vals_i64(&v, "flags", flags)
+    }
+    mc_encode.vals_i64(&v, "teleportId", 5)
+    mc_encode.vals_bool(&v, "dismountVehicle", false)
+    var body: bytes.Bytes = bytes.bytes_new()
+    let id: i32 = mc_version.version_pid(ver, mc_sem.SEM_PLAY_S2C_POSITION)
+    let sch: u64 = (*ver).schema_of(mc_version.ST_PLAY, mc_version.DIR_S2C, id)
+    var ok: bool = sch != 0 && id >= 0
+    if ok { ok = mc_encode.encode_buf(sch, &v, &body, 0 as *mut rt.Buf) }
+    if ok {
+        let n: usize = mc_codec.wire_send_packet(sw, id, &body) catch 0
+        ok = n > 0
+    }
+    bytes.bytes_free(&body)
+    rt.buf_free(&v)
+    return ok
+}
+
+// The client stands at (10, 64, 20) looking yaw 90 / pitch 10. The server sends (1, 2, 3, yaw 30, pitch 5) with `flags`.
+// ax/ay/az/ayaw/apitch = expected absolute result; dy_sent = the delta y the server sends (only 1.21.2+ has the field).
+fn round(label: str, ver: mc_version.Version, flags: i64, ax: f64, ay: f64, az: f64, ayaw: f32, apitch: f32, dy_sent: f64) {
+    var lst: net.Listener = net.listen_tcp(net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8), 0 as u16) catch net.listener_from_fd(0 - 1)
+    let port: u16 = net.listener_port(&lst)
+    var cc: net.Conn = net.connect_tcp(net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8), port) catch net.conn_from_fd(0 - 1)
+    var sc: net.Conn = net.accept(&lst) catch net.conn_from_fd(0 - 1)
+    check(net.listener_is_open(&lst) && net.conn_is_open(&cc) && net.conn_is_open(&sc), label)
+    var v: mc_version.Version = ver
+    var cl: mc_client.Client = mc_client.client_new(cc, ver)
+    var sw: mc_codec.Wire = mc_codec.wire_open(sc)
+    mc_client.client_note_pos(&cl, 10.0, 64.0, 20.0, 90.0, 10.0)
+    check(send_position(&sw, &v, flags, 1.0, 2.0, 3.0, 30.0f, 5.0f, dy_sent), label)
+    mc_codec.wire_timeout(&cl.w, 2000)
+    let id: i32 = mc_client.client_next(&cl)
+    check(id == mc_version.version_pid(&v, mc_sem.SEM_PLAY_S2C_POSITION), label)
+    check(mc_client.client_auto_reply(&cl, id), label)
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var z: f64 = 0.0
+    var yaw: f32 = 0.0f
+    var pitch: f32 = 0.0f
+    check(mc_client.client_position(&cl, &x, &y, &z), label)
+    check(mc_client.client_position_look(&cl, &yaw, &pitch), label)
+    check(near(x, ax) && near(y, ay) && near(z, az), label)
+    check(near(yaw as f64, ayaw as f64) && near(pitch as f64, apitch as f64), label)
+    // the answer on the wire: Teleport Confirm, then the ABSOLUTE position
+    var body: bytes.Bytes = bytes.bytes_new()
+    mc_codec.wire_timeout(&sw, 300)
+    let i1: i32 = mc_codec.wire_read_packet(&sw, &body) catch 0 - 100
+    if i1 == mc_version.version_pid(&v, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM) {
+        let i2: i32 = mc_codec.wire_read_packet(&sw, &body) catch 0 - 100
+        check(i2 == mc_version.version_pid(&v, mc_sem.SEM_PLAY_C2S_POSITION_LOOK), label)
+        let wx: f64 = bytes.get_f64(&body) catch (0.0 - 999.0)
+        let wy: f64 = bytes.get_f64(&body) catch (0.0 - 999.0)
+        let wz: f64 = bytes.get_f64(&body) catch (0.0 - 999.0)
+        check(near(wx, ax) && near(wy, ay) && near(wz, az), label)
+    } else {
+        // 1.8 has no Teleport Confirm: the position packet comes first
+        check(i1 == mc_version.version_pid(&v, mc_sem.SEM_PLAY_C2S_POSITION_LOOK), label)
+        let wx: f64 = bytes.get_f64(&body) catch (0.0 - 999.0)
+        let wy: f64 = bytes.get_f64(&body) catch (0.0 - 999.0)
+        let wz: f64 = bytes.get_f64(&body) catch (0.0 - 999.0)
+        check(near(wx, ax) && near(wy, ay) && near(wz, az), label)
+    }
+    mc_codec.wire_close(&sw)
+    mc_client.client_free(&cl)
+    net.close_listener(&lst)
+}
+
+fn main() -> i32 {
+    // 1.20.1 / 1.8: flags is an i8. bit0 x, bit1 y, bit2 z, bit3 yaw, bit4 pitch
+    round("763 abs", mc_proto_v763.version_make(), 0, 1.0, 2.0, 3.0, 30.0f, 5.0f, 0.0)
+    round("763 rel x", mc_proto_v763.version_make(), 1, 11.0, 2.0, 3.0, 30.0f, 5.0f, 0.0)
+    round("763 rel y", mc_proto_v763.version_make(), 2, 1.0, 66.0, 3.0, 30.0f, 5.0f, 0.0)
+    round("763 rel z", mc_proto_v763.version_make(), 4, 1.0, 2.0, 23.0, 30.0f, 5.0f, 0.0)
+    round("763 rel yaw", mc_proto_v763.version_make(), 8, 1.0, 2.0, 3.0, 120.0f, 5.0f, 0.0)
+    round("763 rel pitch", mc_proto_v763.version_make(), 16, 1.0, 2.0, 3.0, 30.0f, 15.0f, 0.0)
+    round("763 rel all", mc_proto_v763.version_make(), 31, 11.0, 66.0, 23.0, 120.0f, 15.0f, 0.0)
+    round("47 rel y+z", mc_proto_v47.version_make(), 6, 1.0, 66.0, 23.0, 30.0f, 5.0f, 0.0)
+    // 1.21.4: flags is an i32 (+ delta movement fields)
+    round("769 abs", mc_proto_v769.version_make(), 0, 1.0, 2.0, 3.0, 30.0f, 5.0f, 0.0)
+    round("769 rel xyz", mc_proto_v769.version_make(), 7, 11.0, 66.0, 23.0, 30.0f, 5.0f, 0.0)
+    round("769 rel all+delta", mc_proto_v769.version_make(), 31 + 32 + 64 + 128 + 256, 11.0, 66.0, 23.0, 120.0f, 15.0f, 0.5)
+    // delta fields as the app sees them
+    var fl: i32 = 0
+    var dx: f64 = 0.0
+    var dy: f64 = 0.0
+    var dz: f64 = 0.0
+    var lst: net.Listener = net.listen_tcp(net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8), 0 as u16) catch net.listener_from_fd(0 - 1)
+    let port: u16 = net.listener_port(&lst)
+    var cc: net.Conn = net.connect_tcp(net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8), port) catch net.conn_from_fd(0 - 1)
+    var sc: net.Conn = net.accept(&lst) catch net.conn_from_fd(0 - 1)
+    var v: mc_version.Version = mc_proto_v769.version_make()
+    var cl: mc_client.Client = mc_client.client_new(cc, v)
+    var sw: mc_codec.Wire = mc_codec.wire_open(sc)
+    check(send_position(&sw, &v, 64 + 3, 1.0, 2.0, 3.0, 0.0f, 0.0f, 0.25), "769 delta send")
+    mc_codec.wire_timeout(&cl.w, 2000)
+    let id: i32 = mc_client.client_next(&cl)
+    check(mc_client.client_auto_reply(&cl, id), "769 delta reply")
+    mc_client.client_position_delta(&cl, &fl, &dx, &dy, &dz)
+    check(fl == 67 && near(dy, 0.25) && near(dx, 0.0), "769 delta fields")
+    mc_codec.wire_close(&sw)
+    mc_client.client_free(&cl)
+    net.close_listener(&lst)
+    return g_fail
+}

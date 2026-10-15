@@ -6,7 +6,7 @@
 #     independent reference (python / node / java tools, never Mojang code).
 #     Each prints a line `RESULT <name>: ok` and exits 0 on success.
 #
-# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay)
+# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
@@ -63,6 +63,11 @@ fi
 if [ -z "$ONLY" ] || [ "$ONLY" = tpplay ]; then
     echo "== mc/tpplay =="
     bash tools/mc/play/run_tp.sh || ERR=$((ERR+1))
+fi
+# mcplay Auto-Jump (1 block step, option off = stays, MCPLAY_AUTOJUMP=1 = climbs) + relative position flags (`tp @s ~2 ~6 ~`, client == server): ~3 min.
+if [ -z "$ONLY" ] || [ "$ONLY" = ajplay ]; then
+    echo "== mc/ajplay =="
+    bash tools/mc/play/run_aj.sh || ERR=$((ERR+1))
 fi
 if [ $ERR -eq 0 ]; then echo "RESULT mc: ok"; else echo "RESULT mc: $ERR failing parts"; fi
 exit $ERR

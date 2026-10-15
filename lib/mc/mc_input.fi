@@ -7,7 +7,8 @@
 //     sneak 0.0648 (1.295), fly 0.546 (10.92, x2 sprinting), fly up / down 0.375. Diagonals are normalised. Ground: instant
 //     horizontal speed (no inertia), gravity vy = (vy - 0.08) * 0.98, jump 0.42, box 0.6 x 1.8 (sneaking 1.5), eye 1.62 (1.27).
 //     Fly mode (`flying`): no gravity; `noclip` additionally ignores all blocks. Collision: a 9x9x9 snapshot of the world around
-//     the player (unloaded chunks count as solid) + mc_math.grid_move. No step-up, no water / ladders.
+//     the player (unloaded chunks count as solid) + mc_math.grid_move. No water / ladders. Step-up (stepHeight 0.6) never matters on
+//     the full-block grid; the Auto-Jump option (`Player.autojump`, off by default) jumps against a 1 block step (see auto_jump_ok).
 //   * Pick: Amanatides-Woo DDA directly over mc_world (reach 5, creative 6). Hit = block + entered face (normal) + distance.
 //   * Selection box: the 12 edges of the block (+-0.002) as lines (near clipped, 1/16-pixel snapped, integer DDA, depth test
 //     with a small tolerance, no depth write) -- tools/mc/input/ref.py repeats every rule.
@@ -41,6 +42,7 @@ const SPEED_FLY: f64 = 0.546
 const SPEED_FLY_VERT: f64 = 0.375
 const DIAG: f64 = 0.7071067811865476
 const SNAP_N: i32 = 9
+const AUTO_JUMP_HEAD: f64 = 1.25 // jump apex (0.42 start velocity)
 
 struct InputEvents {
     dx: f64, dy: f64, // mouse movement in pixels since the last tick (right / down positive)
@@ -68,6 +70,7 @@ struct Player {
     creative: bool,
     sneaking: bool,
     sprinting: bool,
+    autojump: bool, // vanilla "Auto-Jump" option (default OFF like the Java default): walking against a 1 block step jumps by itself
     sens: f64, // 0..1
     slot: i32, // selected hotbar slot 0..8
     snap: u64, // u16 [9^3] collision snapshot
@@ -88,7 +91,7 @@ fn input_events_new() -> InputEvents {
 fn player_new(x: f64, y: f64, z: f64) -> Player {
     var p: Player = Player {
         x: x, y: y, z: z, yaw: 0.0, pitch: 0.0, vy: 0.0, on_ground: false, flying: false, noclip: false, creative: false,
-        sneaking: false, sprinting: false, sens: 0.5, slot: 0, snap: 0, cls: 0,
+        sneaking: false, sprinting: false, autojump: false, sens: 0.5, slot: 0, snap: 0, cls: 0,
     }
     p.snap = rt.heap_alloc((SNAP_N * SNAP_N * SNAP_N) as usize * 2)
     p.cls = rt.heap_alloc(2)
@@ -207,6 +210,31 @@ fn snapshot(p: *mut Player, v: *mut WorldView, tb: *mut InputTables, out: *mut m
     *out = mc_math.grid_view(ox, oy, oz, SNAP_N, SNAP_N, SNAP_N, (*p).snap, (*p).cls, 2 as u32, false)
 }
 
+// Auto-Jump (vanilla option): true when the player stands on the ground, walks horizontally into an obstacle of at most one block, and a
+// jump (apex 1.25) clears it: the box raised by 1.0 can take the same horizontal step and the box has 1.25 of headroom. Never while
+// sneaking, flying or noclipping (the caller checks those).
+fn auto_jump_ok(g: *mut mc_math.BlockGrid, b: *mut mc_math.Aabb, dx: f64, dz: f64) -> bool {
+    var up: mc_math.Aabb = *b
+    var r1: mc_math.MoveResult = mc_math.MoveResult { dx: 0.0, dy: 0.0, dz: 0.0, hit_x: false, hit_y: false, hit_z: false }
+    mc_math.grid_move(g, &up, 0.0, AUTO_JUMP_HEAD, 0.0, &r1)
+    if r1.dy < AUTO_JUMP_HEAD - 0.000000001 { return false } // ceiling too low for the jump
+    var r2: mc_math.MoveResult = mc_math.MoveResult { dx: 0.0, dy: 0.0, dz: 0.0, hit_x: false, hit_y: false, hit_z: false }
+    var step: mc_math.Aabb = *b
+    step.y0 = step.y0 + 1.0
+    step.y1 = step.y1 + 1.0
+    mc_math.grid_move(g, &step, dx, 0.0, dz, &r2)
+    if r2.hit_x || r2.hit_z { return false }
+    // headroom at the landing spot: the jump apex (1.25) is 0.25 above the step
+    var top: mc_math.Aabb = step
+    top.x0 = top.x0 + r2.dx
+    top.x1 = top.x1 + r2.dx
+    top.z0 = top.z0 + r2.dz
+    top.z1 = top.z1 + r2.dz
+    var r3: mc_math.MoveResult = mc_math.MoveResult { dx: 0.0, dy: 0.0, dz: 0.0, hit_x: false, hit_y: false, hit_z: false }
+    mc_math.grid_move(g, &top, 0.0, AUTO_JUMP_HEAD - 1.0, 0.0, &r3)
+    return r3.dy >= AUTO_JUMP_HEAD - 1.0 - 0.000000001
+}
+
 // One game tick (20 Hz): mouse look, key movement, gravity / fly, collision. `w` may be an empty world (everything unloaded =
 // solid, so the player stands still in ground mode; use noclip / flying + noclip for a free camera).
 fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb: *mut InputTables, min_y: i32) {
@@ -278,11 +306,17 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
     (*p).y = (*p).y + res.dy
     (*p).z = (*p).z + res.dz
     (*p).on_ground = res.hit_y && dy < 0.0
+    var aj: bool = false
+    if (*p).autojump && (*p).on_ground && !(*p).sneaking && !(*p).flying && (res.hit_x || res.hit_z) {
+        // blocked horizontally on the ground: the intended step, not the part the collision already allowed
+        aj = auto_jump_ok(&g, &b, dx, dz)
+    }
     if (*p).flying {
         (*p).vy = 0.0
     } else {
         if res.hit_y { (*p).vy = 0.0 }
         (*p).vy = ((*p).vy - 0.08) * 0.98
+        if aj { (*p).vy = 0.42 } // the jump starts with the next tick, exactly like a pressed Space
     }
 }
 
