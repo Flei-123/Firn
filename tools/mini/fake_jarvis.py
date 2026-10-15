@@ -42,10 +42,10 @@ async def process_request(conn, request):
     u = urlparse(request.path)
     if u.path.startswith("/api/conversations/"):
         if not cookie_ok(request.headers):
-            return reply(401, {"error": "Nicht angemeldet"})
+            return reply(401, {"error": "Not logged in"})
         cid = unquote(u.path[len("/api/conversations/"):])
         if cid not in CONV:
-            return reply(404, {"error": "nicht gefunden"})
+            return reply(404, {"error": "Not found"})
         return reply(200, {"conversation": {"messages": CONV[cid]}, "running": False, "partial": ""})
     if u.path == "/":
         if "websocket" not in request.headers.get("Upgrade", "").lower():
@@ -129,7 +129,7 @@ async def main():
                 out = json.dumps({"username": "justin", "token": TOKEN}).encode()
                 st = "200 OK"
             else:
-                out = json.dumps({"error": "Falscher Benutzername oder Passwort"}).encode()
+                out = json.dumps({"error": "Wrong user name or password"}).encode()
                 st = "401 Unauthorized"
             writer.write(("HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % (st, len(out))).encode() + out)
             await writer.drain(); writer.close(); return
