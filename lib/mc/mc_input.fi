@@ -77,6 +77,9 @@ struct Player {
     slot: i32, // selected hotbar slot 0..8
     snap: u64, // u16 [9^3] collision snapshot
     cls: u64, // u8 [256] class table (0 passable, 1 full cube, 128 + k partial shape k of mc_math.shape_box)
+    mv: u64, // u8 [65536] movement kind per block state (mc_math.MV_*; mc_shapes.move_fill), all 0 = no slowdown blocks
+    stuck: i32, // set by the last move: 0 none, 1 cobweb, 2 sweet berry bush (vanilla stuckSpeedMultiplier), used by the next move
+    sfr: f64, // horizontal speed ratio of the block speed factor at the current position (1.0 = none, see speed_ratio)
 }
 
 struct Pick {
@@ -95,9 +98,10 @@ const CLS_N: usize = 65536
 fn player_new(x: f64, y: f64, z: f64) -> Player {
     var p: Player = Player {
         x: x, y: y, z: z, yaw: 0.0, pitch: 0.0, vy: 0.0, on_ground: false, fall: 0.0, flying: false, noclip: false, creative: false,
-        sneaking: false, sprinting: false, autojump: false, sens: 0.5, slot: 0, snap: 0, cls: 0,
+        sneaking: false, sprinting: false, autojump: false, sens: 0.5, slot: 0, snap: 0, cls: 0, mv: 0, stuck: 0, sfr: 1.0,
     }
     p.snap = rt.heap_alloc((SNAP_N * SNAP_N * SNAP_N) as usize * 2)
+    p.mv = rt.heap_alloc(CLS_N)
     p.cls = rt.heap_alloc(CLS_N * 2) // u16 class table (identity for shape codes >= 128): shape codes go up to 65535
     var k: usize = 0
     while k < CLS_N {
@@ -105,6 +109,7 @@ fn player_new(x: f64, y: f64, z: f64) -> Player {
         if k == 0 { v = 0 as u16 }
         if k >= 128 { v = k as u16 }
         rt.st16(p.cls, k, v)
+        rt.st8(p.mv, k, 0 as u8)
         k = k + 1
     }
     return p
@@ -113,6 +118,8 @@ fn player_new(x: f64, y: f64, z: f64) -> Player {
 fn player_free(p: *mut Player) {
     if (*p).snap != 0 { rt.heap_free((*p).snap, (SNAP_N * SNAP_N * SNAP_N) as usize * 2) }
     if (*p).cls != 0 { rt.heap_free((*p).cls, CLS_N * 2) }
+    if (*p).mv != 0 { rt.heap_free((*p).mv, CLS_N) }
+    (*p).mv = 0
     (*p).snap = 0
     (*p).cls = 0
 }
@@ -302,6 +309,98 @@ fn move_step(g: *mut mc_math.BlockGrid, b: *mut mc_math.Aabb, dx: f64, dy: f64, 
     }
 }
 
+// ---- slowdown blocks (vanilla 1.20.1). Speed factor (Entity.getBlockSpeedFactor): soul sand and honey block 0.4, looked up at the block the feet
+// are in, else the block 0.500001 below the feet; vanilla multiplies the velocity by it after every move. This model has no horizontal inertia
+// (instant speed = the steady state of velocity = velocity * 0.546 + acceleration), so the steady state of velocity = velocity * 0.546 * f + a
+// is used instead: speed_ratio(f) = (1 - 0.546) / (1 - 0.546 * f) = 0.581 for f = 0.4 (NOT 0.4). Jump factor (LivingEntity.getBlockJumpFactor):
+// honey block 0.5 (jump velocity 0.42 * 0.5). Stuck (Entity.makeStuckInBlock, from checkInsideBlocks at the end of a move, used by the next
+// move): cobweb (0.25, 0.05, 0.25), sweet berry bush (0.8, 0.75, 0.8); the whole velocity is zeroed, so the move is only the acceleration of
+// this tick (ground 0.454 * speed, air 0.0196 / sprinting 0.02548) times the multiplier, and the fall distance is reset. Honey block wall slide
+// (HoneyBlock.isSlidingDown / doSlideMovement): in the air, below the block top, falling faster than 0.08, touching the side of a honey
+// block -> vy = -0.05, fall distance reset. Not modelled: flying (no factor / stuck), powder snow, fall damage, sounds.
+const F_GROUND: f64 = 0.546
+const STUCK_WEB_Y: f64 = 0.05000000074505806
+const AIR_ACCEL: f64 = 0.0196
+const AIR_ACCEL_SPRINT: f64 = 0.02548
+const BELOW: f64 = 0.500001
+
+fn speed_ratio(f: f64) -> f64 {
+    return (1.0 - F_GROUND) / (1.0 - F_GROUND * f)
+}
+
+fn kind_at(v: *mut WorldView, mv: u64, x: i32, y: i32, z: i32) -> i32 {
+    let id: i32 = view_id(v, x, y, z)
+    if id < 0 || (id as usize) >= CLS_N { return 0 }
+    return rt.ld8(mv, id as usize) as i32
+}
+
+fn kind_speed(k: i32) -> f64 {
+    if k == mc_math.MV_SOUL_SAND || k == mc_math.MV_HONEY { return 0.4 }
+    return 1.0
+}
+
+fn kind_jump(k: i32) -> f64 {
+    if k == mc_math.MV_HONEY { return 0.5 }
+    return 1.0
+}
+
+// factor of the block the feet are in, else of the block below (jump = false: speed factor, true: jump factor)
+fn block_factor(p: *mut Player, v: *mut WorldView, jump: bool) -> f64 {
+    let fx: i32 = math.floor((*p).x) as i32
+    let fz: i32 = math.floor((*p).z) as i32
+    let k0: i32 = kind_at(v, (*p).mv, fx, math.floor((*p).y) as i32, fz)
+    var f: f64 = kind_speed(k0)
+    if jump { f = kind_jump(k0) }
+    if f != 1.0 { return f }
+    let k1: i32 = kind_at(v, (*p).mv, fx, math.floor((*p).y - BELOW) as i32, fz)
+    if jump { return kind_jump(k1) }
+    return kind_speed(k1)
+}
+
+// vanilla Entity.checkInsideBlocks at the end of a move: cobweb / berry bush set `stuck`, a honey block may start the wall slide
+fn check_inside(p: *mut Player, v: *mut WorldView, h: f64) {
+    let x0: i32 = math.floor((*p).x - 0.3 + 0.0000001) as i32
+    let x1: i32 = math.floor((*p).x + 0.3 - 0.0000001) as i32
+    let y0: i32 = math.floor((*p).y + 0.0000001) as i32
+    let y1: i32 = math.floor((*p).y + h - 0.0000001) as i32
+    let z0: i32 = math.floor((*p).z - 0.3 + 0.0000001) as i32
+    let z1: i32 = math.floor((*p).z + 0.3 - 0.0000001) as i32
+    var cz: i32 = z0
+    while cz <= z1 {
+        var cy: i32 = y0
+        while cy <= y1 {
+            var cx: i32 = x0
+            while cx <= x1 {
+                let k: i32 = kind_at(v, (*p).mv, cx, cy, cz)
+                if k == mc_math.MV_COBWEB {
+                    (*p).stuck = 1
+                    (*p).fall = 0.0
+                } else if k == mc_math.MV_BERRY {
+                    (*p).stuck = 2
+                    (*p).fall = 0.0
+                } else if k == mc_math.MV_HONEY && honey_sliding(p, cx, cy, cz) {
+                    (*p).vy = -0.05
+                    (*p).fall = 0.0
+                }
+                cx = cx + 1
+            }
+            cy = cy + 1
+        }
+        cz = cz + 1
+    }
+}
+
+// vanilla HoneyBlock.isSlidingDown for the honey block at (cx, cy, cz)
+fn honey_sliding(p: *mut Player, cx: i32, cy: i32, cz: i32) -> bool {
+    if (*p).on_ground { return false }
+    if (*p).y > (cy as f64) + 0.9375 - 0.0000001 { return false }
+    if (*p).vy >= -0.08 { return false }
+    let d0: f64 = math.fabs((cx as f64) + 0.5 - (*p).x)
+    let d1: f64 = math.fabs((cz as f64) + 0.5 - (*p).z)
+    let d2: f64 = 0.4375 + 0.3
+    return d0 + 0.0000001 > d2 || d1 + 0.0000001 > d2
+}
+
 // ---- sneak edge (vanilla Player.maybeBackOffFromEdge): a sneaking player on the ground does not walk off a ledge. The horizontal move
 // is cut in 0.05 steps while the box moved by (dx, -stepHeight, dz) would collide with nothing (no floor within stepHeight below).
 
@@ -355,6 +454,7 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
         (*p).slot = mc_world.floor_mod((*p).slot + (*ev).slot_delta, 9)
     }
     player_look(p, (*ev).dx, (*ev).dy)
+    var v: WorldView = view_new(w, min_y)
     let keys: u32 = (*ev).keys
     (*p).sneaking = (keys & K_SNEAK) != 0 as u32
     let fwd: bool = (keys & K_FORWARD) != 0 as u32
@@ -384,15 +484,40 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
     } else if (*p).sprinting {
         speed = SPEED_SPRINT
     }
-    let dx: f64 = wx * speed
-    let dz: f64 = wz * speed
+    var dx: f64 = wx * speed
+    var dz: f64 = wz * speed
     var dy: f64 = 0.0
     if (*p).flying {
         if (keys & K_JUMP) != 0 as u32 { dy = dy + SPEED_FLY_VERT }
         if (keys & K_SNEAK) != 0 as u32 { dy = dy - SPEED_FLY_VERT }
     } else {
-        if (keys & K_JUMP) != 0 as u32 && (*p).on_ground { (*p).vy = 0.42 }
+        if (keys & K_JUMP) != 0 as u32 && (*p).on_ground { (*p).vy = 0.42 * block_factor(p, &v, true) }
         dy = (*p).vy
+    }
+    let stuck: i32 = (*p).stuck
+    (*p).stuck = 0
+    if stuck != 0 && !(*p).flying && !(*p).noclip {
+        // makeStuckInBlock: the velocity is zeroed, only this tick's acceleration moves the player, scaled by the multiplier
+        var ax: f64 = wx * speed * (1.0 - F_GROUND)
+        var az: f64 = wz * speed * (1.0 - F_GROUND)
+        if !(*p).on_ground {
+            var aa: f64 = AIR_ACCEL
+            if (*p).sprinting { aa = AIR_ACCEL_SPRINT }
+            ax = wx * aa
+            az = wz * aa
+        }
+        var mxz: f64 = 0.25
+        var myv: f64 = STUCK_WEB_Y
+        if stuck == 2 {
+            mxz = 0.8
+            myv = 0.75
+        }
+        dx = ax * mxz
+        dz = az * mxz
+        dy = dy * myv
+    } else if !(*p).flying && !(*p).noclip {
+        dx = dx * (*p).sfr
+        dz = dz * (*p).sfr
     }
     if (*p).noclip {
         (*p).x = (*p).x + dx
@@ -403,7 +528,6 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
         if !(*p).flying { (*p).vy = ((*p).vy - 0.08) * 0.98 }
         return
     }
-    var v: WorldView = view_new(w, min_y)
     var g: mc_math.BlockGrid = mc_math.grid_view(0, 0, 0, 0, 0, 0, 0, 0, 0 as u32, false)
     snapshot(p, &v, tb, &g)
     var h: f64 = 1.8
@@ -432,8 +556,12 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
     }
     if (*p).flying {
         (*p).vy = 0.0
+        (*p).sfr = 1.0
     } else {
+        if stuck != 0 { (*p).vy = 0.0 }
         if res.hit_y { (*p).vy = 0.0 }
+        check_inside(p, &v, h)
+        (*p).sfr = speed_ratio(block_factor(p, &v, false))
         (*p).vy = ((*p).vy - 0.08) * 0.98
         if aj { (*p).vy = 0.42 } // the jump starts with the next tick, exactly like a pressed Space
     }

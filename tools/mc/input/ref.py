@@ -172,6 +172,186 @@ def simulate(block, start, yaw, ticks):
     return res
 
 
+# ---------------------------------------------------------------- slowdown blocks (world C of dump.fi)
+# ids: 1 stone, 4 soul sand (14/16), 5 honey (1/16..15/16), 6 cobweb, 7 sweet berry bush, 8 / 9 pane post with XZ offset (max 0.25 / 0.125)
+BOXES_C = {
+    1: [(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)],
+    4: [(0.0, 0.0, 0.0, 1.0, 0.875, 1.0)],
+    5: [(0.0625, 0.0, 0.0625, 0.9375, 0.9375, 0.9375)],
+    8: [(0.4375, 0.0, 0.4375, 0.5625, 1.0, 0.5625)],
+    9: [(0.4375, 0.0, 0.4375, 0.5625, 1.0, 0.5625)],
+}
+OFFSET_MAX = {8: 0.25, 9: 0.125}
+KIND = {4: "sand", 5: "honey", 6: "web", 7: "berry"}
+F_GROUND = 0.546
+STUCK_WEB_Y = 0.05000000074505806
+
+
+def f32(x):
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def s64(v):
+    v &= (1 << 64) - 1
+    return v - (1 << 64) if v >> 63 else v
+
+
+def block_seed(x, y, z):
+    """Mth.getSeed with Java int / long wrap-around"""
+    xm = (x * 3129871) & 0xFFFFFFFF
+    if xm >> 31:
+        xm -= 1 << 32
+    l = s64(xm ^ s64(z * 116129781) ^ y)
+    l = s64(s64(s64(l * l) * 42317861) + s64(l * 11))
+    return l >> 16
+
+
+def block_offset(x, z, mx):
+    sd = block_seed(x, 0, z)
+    a = f32(f32(sd & 15) / f32(15.0))
+    b = f32(f32((sd >> 8) & 15) / f32(15.0))
+    return [max(-mx, min(mx, (v - 0.5) * 0.5)) for v in (a, b)]
+
+
+def boxes_at(block, cx, cy, cz):
+    b = block(cx, cy, cz)
+    if b is None:
+        return [(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)]  # unloaded = solid
+    if b not in BOXES_C:
+        return []
+    out = []
+    for bx in BOXES_C[b]:
+        if b in OFFSET_MAX:
+            ox, oz = block_offset(cx, cz, OFFSET_MAX[b])
+            bx = (bx[0] + ox, bx[1], bx[2] + oz, bx[3] + ox, bx[4], bx[5] + oz)
+        out.append(bx)
+    return out
+
+
+def move_axis_c(block, box, axis, d):
+    lo, hi = box[axis], box[axis + 3]
+    others = [a for a in range(3) if a != axis]
+    rng = []
+    for a in range(3):
+        a0 = box[a] + (min(d, 0.0) if a == axis else 0.0)
+        a1 = box[a + 3] + (max(d, 0.0) if a == axis else 0.0)
+        rng.append(range(math.floor(a0) - 1, math.floor(a1) + 2))
+    out = d
+    for cx in rng[0]:
+        for cy in rng[1]:
+            for cz in rng[2]:
+                c = (cx, cy, cz)
+                for sb in boxes_at(block, cx, cy, cz):
+                    ok = True
+                    for o in others:
+                        if not (box[o] + 1e-9 < c[o] + sb[o + 3] and c[o] + sb[o] + 1e-9 < box[o + 3]):
+                            ok = False
+                    if not ok:
+                        continue
+                    if out > 0.0 and hi <= c[axis] + sb[axis]:
+                        out = min(out, c[axis] + sb[axis] - hi)
+                    elif out < 0.0 and lo >= c[axis] + sb[axis + 3]:
+                        out = max(out, c[axis] + sb[axis + 3] - lo)
+    return out
+
+
+def kind_at(block, mvon, x, y, z):
+    b = block(x, y, z)
+    if not mvon or b is None or b == -2:
+        return ""
+    return KIND.get(b, "")
+
+
+def block_factor(block, mvon, x, y, z, jump):
+    def fac(k):
+        if jump:
+            return 0.5 if k == "honey" else 1.0
+        return 0.4 if k in ("sand", "honey") else 1.0
+    fx, fz = math.floor(x), math.floor(z)
+    f = fac(kind_at(block, mvon, fx, math.floor(y), fz))
+    if f != 1.0:
+        return f
+    return fac(kind_at(block, mvon, fx, math.floor(y - 0.500001), fz))
+
+
+def simulate_slow(block, mvon, start, yaw, ticks):
+    """ground mode with the slowdown rules (no sneak / fly / noclip / step-up needed by the scenes)"""
+    x, y, z = start
+    pitch = 0.0
+    vy = fall = 0.0
+    ground = False
+    stuck = 0
+    sfr = 1.0
+    res = []
+    for t in ticks:
+        dxm, dym, keys, tf, tn, sd = t
+        yaw, pitch = look(yaw, pitch, 0.5, dxm, dym)
+        fwd = bool(keys & 1)
+        sprint = bool(keys & 64) and fwd
+        mx = (1.0 if keys & 8 else 0.0) - (1.0 if keys & 4 else 0.0)
+        mz = (1.0 if fwd else 0.0) - (1.0 if keys & 2 else 0.0)
+        yr = yaw * (math.pi / 180.0)
+        sn, cs = math.sin(yr), math.cos(yr)
+        wx = (0.0 - cs) * mx + (0.0 - sn) * mz
+        wz = (0.0 - sn) * mx + cs * mz
+        if mx != 0.0 and mz != 0.0:
+            wx *= 0.7071067811865476
+            wz *= 0.7071067811865476
+        speed = 0.2806 if sprint else 0.21585
+        dx, dz = wx * speed, wz * speed
+        if (keys & 16) and ground:
+            vy = 0.42 * block_factor(block, mvon, x, y, z, True)
+        dy = vy
+        st = stuck
+        stuck = 0
+        if st:
+            ax, az = wx * speed * (1.0 - F_GROUND), wz * speed * (1.0 - F_GROUND)
+            if not ground:
+                aa = 0.02548 if sprint else 0.0196
+                ax, az = wx * aa, wz * aa
+            mxz, myv = (0.25, STUCK_WEB_Y) if st == 1 else (0.8, 0.75)
+            dx, dz, dy = ax * mxz, az * mxz, dy * myv
+        else:
+            dx, dz = dx * sfr, dz * sfr
+        box = [x - 0.3, y, z - 0.3, x + 0.3, y + 1.8, z + 0.3]
+        my = move_axis_c(block, box, 1, dy)
+        box[1] += my
+        box[4] += my
+        mxx = move_axis_c(block, box, 0, dx)
+        box[0] += mxx
+        box[3] += mxx
+        mzz = move_axis_c(block, box, 2, dz)
+        x, y, z = x + mxx, y + my, z + mzz
+        hit_y = my != dy
+        ground = hit_y and dy < 0.0
+        if ground:
+            fall = 0.0
+        elif my < 0.0:
+            fall = fall - my
+        if st:
+            vy = 0.0
+        if hit_y:
+            vy = 0.0
+        # checkInsideBlocks
+        for cz in range(math.floor(z - 0.3 + 1e-7), math.floor(z + 0.3 - 1e-7) + 1):
+            for cy in range(math.floor(y + 1e-7), math.floor(y + 1.8 - 1e-7) + 1):
+                for cx in range(math.floor(x - 0.3 + 1e-7), math.floor(x + 0.3 - 1e-7) + 1):
+                    k = kind_at(block, mvon, cx, cy, cz)
+                    if k == "web":
+                        stuck, fall = 1, 0.0
+                    elif k == "berry":
+                        stuck, fall = 2, 0.0
+                    elif k == "honey":
+                        if (not ground and y <= cy + 0.9375 - 1e-7 and vy < -0.08
+                                and (abs(cx + 0.5 - x) + 1e-7 > 0.7375 or abs(cz + 0.5 - z) + 1e-7 > 0.7375)):
+                            vy, fall = -0.05, 0.0
+        f = block_factor(block, mvon, x, y, z, False)
+        sfr = (1.0 - F_GROUND) / (1.0 - F_GROUND * f)
+        vy = (vy - 0.08) * 0.98
+        res.append((x, y, z, yaw, pitch, ground, 0))
+    return res
+
+
 # ---------------------------------------------------------------- picking (slab test, brute force)
 def pick(block, o, d, reach, is_pick=None):
     """is_pick: optional predicate on a block id (default: ids 1 and 2, the test worlds)"""
@@ -277,7 +457,7 @@ def main(d):
     lines = [l.split() for l in open(d + "/scenes.txt") if l.strip()]
     bad = 0
     i = 0
-    wa, wb = load_world(d + "/worldA.bin"), load_world(d + "/worldB.bin")
+    wa, wb, wc = load_world(d + "/worldA.bin"), load_world(d + "/worldB.bin"), load_world(d + "/worldC.bin")
     nl = nph = nray = nhit = nbox = 0
     while i < len(lines):
         t = lines[i]
@@ -302,7 +482,10 @@ def main(d):
             rows = lines[i + 1:i + 1 + n]
             i += 1 + n
             ticks = [(f64(r[1]), f64(r[2]), int(r[3]), int(r[4]), int(r[5]), int(r[6]) - OFF) for r in rows]
-            sim = simulate(wa, start, yaw0, ticks)
+            if name.startswith("slow_"):
+                sim = simulate_slow(wc, not name.endswith("_off"), start, yaw0, ticks)
+            else:
+                sim = simulate(wa, start, yaw0, ticks)
             worst = 0.0
             msg = None
             for k, (r, s) in enumerate(zip(rows, sim)):
@@ -378,7 +561,7 @@ def main(d):
             continue
         i += 1
     print("  ok    look: %d sequences bit identical; %d rays (%d hits) vs brute force slab test" % (nl, nray, nhit) if bad == 0 else "  looks/rays: see DIFF above")
-    if nl != 3 or nph != 7 or nray != 600 or nbox != 4 or nhit < 150:
+    if nl != 3 or nph != 19 or nray != 600 or nbox != 4 or nhit < 150:
         bad += 1
         print("  DIFF  scene counts look=%d phys=%d rays=%d (hits %d) box=%d" % (nl, nph, nray, nhit, nbox))
     print("  %d problems" % bad)

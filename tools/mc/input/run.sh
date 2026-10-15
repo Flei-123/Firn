@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tools/mc/input/run.sh -- cross-check of lib/mc/mc_input.fi against an independent python implementation (ref.py):
-# mouse look bit identical, 7 physics scenarios (tolerance 1e-9), 600 pick rays vs a brute force slab test, 4 selection box
+# mouse look bit identical, 7 physics scenarios + 12 slowdown scenes (soul sand, honey, cobweb, berry bush, honey wall slide, XZ block offsets) (tolerance 1e-9), 600 pick rays vs a brute force slab test, 4 selection box
 # framebuffers pixel exact. 3 build stages must agree. Counter-checks: damaged pick normal / gravity / line stepper are detected.
 #
 # Usage: bash tools/mc/input/run.sh [firnc-binary]
@@ -36,10 +36,10 @@ for stage in "" "--no-opt" "--opt-level=dev-fast"; do
 done
 # counter-checks: damaged normals of the picker, damaged gravity of the player, damaged line stepper -- python must see each
 counter() { # name sed-expression
-    local nm=$1 expr=$2
+    local nm=$1 expr=$2 file=${3:-mc_input.fi}
     rm -rf "$W/badlib" "$W/bad"; mkdir -p "$W/badlib" "$W/bad"; cp -r lib/. "$W/badlib/"
-    sed -i "$expr" "$W/badlib/mc/mc_input.fi"
-    if cmp -s lib/mc/mc_input.fi "$W/badlib/mc/mc_input.fi"; then
+    sed -i "$expr" "$W/badlib/mc/$file"
+    if cmp -s "lib/mc/$file" "$W/badlib/mc/$file"; then
         echo "  FAIL  counter-check $nm: the damage did not apply"; ERR=1
     elif FIRNLIB="$W/badlib" $FIRNC -o "$W/dump.bad" tools/mc/input/dump.fi 2>/dev/null && "$W/dump.bad" "$W/bad" 2>/dev/null; then
         if python3 -I tools/mc/input/ref.py "$W/bad" > "$W/bad.txt" 2>&1; then
@@ -54,6 +54,11 @@ counter() { # name sed-expression
 counter "pick normal" 's/nx = 0 - sx/nx = sx/'
 counter "gravity" 's/(\*p).vy - 0.08/(*p).vy - 0.07/g'
 counter "line rounding" 's/floor_div64(2 as i64 \* ddx \* i + n, 2 as i64 \* n)/floor_div64(2 as i64 * ddx * i, 2 as i64 * n)/'
+counter "soul sand speed ratio" 's/return (1.0 - F_GROUND) \/ (1.0 - F_GROUND \* f)/return f/'
+counter "honey jump factor" 's/MV_HONEY { return 0.5 }/MV_HONEY { return 1.0 }/'
+counter "cobweb multiplier" 's/var mxz: f64 = 0.25/var mxz: f64 = 0.5/'
+counter "honey slide speed" 's/(\*p).vy = -0.05/(*p).vy = -0.06/'
+counter "block offset seed" 's/3129871/3129872/' mc_math.fi
 if $FIRNC -o "$W/bench" tools/mc/input/bench.fi 2>"$W/err"; then
     "$W/bench" | sed 's/^/  /'
 else
