@@ -1,0 +1,474 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/stackrig.fi -- photo.stackrig: measurement rig for the FirnCam focus stack on the synthetic TV scene
+// (photo.synthtv). Used by tools/photo/stackeval.fi (measurements) and tests/2969_photo_stack_tv.fi (regression).
+//
+// Chain: RGGB mosaics -> camjob.raw_half + neutralise_clipped (exactly what the app does per frame) ->
+// focus.focus_stack -> pipeline.process_single_linear (colour, denoise, tone map, sRGB, sharpen). The IDEAL is
+// the same chain applied to the sharp, noise free render of the reference geometry (same exposure, same TV
+// flicker phase and video state), so every difference is caused by the stack, not by the display chain.
+// Metrics (display space, 0..1; zones are derived from the ideal):
+//   halo     mean overshoot outside the 5x5 envelope of the ideal luma in the dark zone around the bright TV parts
+//   glow     mean signed luma difference in that zone (positive = a light veil around bright parts)
+//   fringe   mean chroma error ((R-Y), (B-Y)) in the edge zone
+//   p1       1 % luma percentile of the whole image (black point) and wall = mean luma of the dark wall
+//   psnr_*   PSNR per region (tv screen, dark wall, near layer, whole image)
+//   tvsat    mean chroma of the TV screen relative to the ideal (pastel < 1)
+import photo.camjob
+import photo.filter
+import photo.focus
+import photo.image
+import photo.merge
+import photo.meta
+import photo.par
+import photo.pipeline
+import photo.synthtv
+import std.io
+import std.math
+import std.rt
+
+export {
+    Rig, Masks, Res, rig_new, rig_free, half_of, truth_half, chain, masks_of, masks_free, evaluate,
+    burst_of, run_stack, single_res, stack_res, pf,
+}
+
+const MAXF: i32 = 8
+
+struct Rig {
+    cfg: synthtv.TvCfg,
+    n: i32,
+    fp: [synthtv.TvFrame; 8],
+    mos: [u64; 8],
+    m: meta.SensorMeta,
+}
+
+struct Masks {
+    tv: image.Image,
+    wall: image.Image,
+    near: image.Image,
+    zone: image.Image,
+    edge: image.Image,
+}
+
+fn pf(name: str, key: str, v: f32) {
+    io.print(name)
+    io.print(".")
+    io.print(key)
+    io.print(" ")
+    io.fmt_print_line(io.fmt_f32(io.fmt_new(), v))
+}
+
+fn rig_new(sw: i32, sh: i32, n: i32, seed: u64) -> Rig {
+    var cfg: synthtv.TvCfg = synthtv.tv_cfg_default(sw, sh)
+    cfg.n = n
+    var rp: image.Rng = image.rng_new(seed)
+    var rn: image.Rng = image.rng_new(seed + (1000 as u64))
+    let f0: synthtv.TvFrame = synthtv.tv_frame_params(&cfg, 0, &rp)
+    var rg: Rig = Rig { cfg: cfg, n: n, fp: [f0; 8], mos: [0 as u64; 8], m: synthtv.tv_meta(&cfg) }
+    rp = image.rng_new(seed)
+    var i: i32 = 0
+    while i < n {
+        rg.fp[i as usize] = synthtv.tv_frame_params(&rg.cfg, i, &rp)
+        rg.mos[i as usize] = rt.heap_alloc(((sw * sh) as usize) * 2)
+        synthtv.tv_frame_mosaic(&rg.cfg, &rg.fp[i as usize], &rn, rg.mos[i as usize])
+        i = i + 1
+    }
+    return rg
+}
+
+fn half_of(rg: *mut Rig, mos: u64) -> image.Image {
+    var h: image.Image = camjob.raw_half(mos, (*rg).cfg.sw, (*rg).cfg.sh, &(*rg).m)
+    camjob.neutralise_clipped(&h, &(*rg).m)
+    return h
+}
+
+fn truth_half(rg: *mut Rig, i: i32) -> image.Image {
+    let sz: usize = (((*rg).cfg.sw * (*rg).cfg.sh) as usize) * 2
+    let p: u64 = rt.heap_alloc(sz)
+    var rn: image.Rng = image.rng_new(77 as u64)
+    synthtv.tv_truth_mosaic(&(*rg).cfg, &(*rg).fp[i as usize], &rn, p)
+    let h: image.Image = half_of(rg, p)
+    rt.heap_free(p, sz)
+    return h
+}
+
+fn chain(lin: *mut image.Image, m: *mut meta.SensorMeta) -> image.Image {
+    var po: pipeline.PipeOpts = pipeline.opts_default()
+    var out: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&out)
+    pipeline.process_single_linear(lin, m, &po, &out)
+    return out
+}
+
+fn inrect(x: i32, y: i32, w: i32, h: i32, u0: f32, v0: f32, u1: f32, v1: f32) -> bool {
+    let u: f32 = ((x as f32) + 0.5f) / (w as f32)
+    let v: f32 = ((y as f32) + 0.5f) / (h as f32)
+    return u >= u0 && u <= u1 && v >= v0 && v <= v1
+}
+
+// regions from the geometry of the scene (all well inside the objects: a shake of a few pixels does not matter)
+fn masks_of(truth_lin: *mut image.Image, ideal: *mut image.Image) -> Masks {
+    let w: i32 = (*ideal).w
+    let h: i32 = (*ideal).h
+    var mk: Masks = Masks { tv: image.img_new(w, h, 1), wall: image.img_new(w, h, 1), near: image.img_new(w, h, 1), zone: image.img_new(w, h, 1), edge: image.img_new(w, h, 1) }
+    image.img_fill(&mk.tv, 0.0f)
+    image.img_fill(&mk.wall, 0.0f)
+    image.img_fill(&mk.near, 0.0f)
+    image.img_fill(&mk.zone, 0.0f)
+    image.img_fill(&mk.edge, 0.0f)
+    var br: image.Image = image.img_new(w, h, 1)
+    var il: image.Image = image.img_luma(ideal)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            if inrect(x, y, w, h, 0.16f, 0.34f, 0.84f, 0.70f) { image.img_set(&mk.tv, 0, x, y, 1.0f) }
+            if inrect(x, y, w, h, 0.08f, 0.02f, 0.60f, 0.25f) || inrect(x, y, w, h, 0.70f, 0.02f, 0.92f, 0.25f) { image.img_set(&mk.wall, 0, x, y, 1.0f) }
+            if inrect(x, y, w, h, 0.03f, 0.84f, 0.70f, 0.97f) { image.img_set(&mk.near, 0, x, y, 1.0f) }
+            var mx: f32 = image.img_get(truth_lin, 0, x, y)
+            if image.img_get(truth_lin, 1, x, y) > mx { mx = image.img_get(truth_lin, 1, x, y) }
+            if image.img_get(truth_lin, 2, x, y) > mx { mx = image.img_get(truth_lin, 2, x, y) }
+            if mx > 0.5f { image.img_set(&br, 0, x, y, 1.0f) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    y = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            // dark side zone: within 8 px of a bright pixel, itself dark, inside the TV frame
+            if image.img_get(&br, 0, x, y) < 0.5f && inrect(x, y, w, h, 0.11f, 0.29f, 0.89f, 0.73f) {
+                var near: bool = false
+                var dy: i32 = -8
+                while dy <= 8 && !near {
+                    var dx: i32 = -8
+                    while dx <= 8 {
+                        let xx: i32 = x + dx
+                        let yy: i32 = y + dy
+                        if xx >= 0 && yy >= 0 && xx < w && yy < h && image.img_get(&br, 0, xx, yy) > 0.5f { near = true; break }
+                        dx = dx + 1
+                    }
+                    dy = dy + 1
+                }
+                if near { image.img_set(&mk.zone, 0, x, y, 1.0f) }
+            }
+            // edge zone: strong luma gradient of the ideal (3x3 range), dilated by 2
+            var lo: f32 = 9.0f
+            var hi: f32 = -9.0f
+            var ey: i32 = -3
+            while ey <= 3 {
+                var ex: i32 = -3
+                while ex <= 3 {
+                    let xx: i32 = x + ex
+                    let yy: i32 = y + ey
+                    if xx >= 0 && yy >= 0 && xx < w && yy < h {
+                        let v: f32 = image.img_get(&il, 0, xx, yy)
+                        if v < lo { lo = v }
+                        if v > hi { hi = v }
+                    }
+                    ex = ex + 1
+                }
+                ey = ey + 1
+            }
+            if hi - lo > 0.25f { image.img_set(&mk.edge, 0, x, y, 1.0f) }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image.img_free(&br)
+    image.img_free(&il)
+    return mk
+}
+
+fn masks_free(mk: *mut Masks) {
+    image.img_free(&(*mk).tv)
+    image.img_free(&(*mk).wall)
+    image.img_free(&(*mk).near)
+    image.img_free(&(*mk).zone)
+    image.img_free(&(*mk).edge)
+}
+
+fn mask_count(m: *mut image.Image) -> f32 {
+    var s: f32 = 0.0f
+    let n: i32 = (*m).w * (*m).h
+    var i: i32 = 0
+    while i < n {
+        s = s + *(((*m).px + (i as u64) * (4 as u64)) as *mut f32)
+        i = i + 1
+    }
+    return s
+}
+
+fn region_psnr(a: *mut image.Image, b: *mut image.Image, m: *mut image.Image) -> f32 {
+    var s: f64 = 0.0
+    var cnt: f64 = 0.0
+    var y: i32 = 0
+    while y < (*a).h {
+        var x: i32 = 0
+        while x < (*a).w {
+            if image.img_get(m, 0, x, y) > 0.5f {
+                var c: i32 = 0
+                while c < 3 {
+                    let d: f64 = (image.img_get(a, c, x, y) - image.img_get(b, c, x, y)) as f64
+                    s = s + d * d
+                    cnt = cnt + 1.0
+                    c = c + 1
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if cnt < 1.0 { return 0.0f }
+    let mse: f64 = s / cnt
+    if mse < 1.0e-12 { return 99.0f }
+    return (10.0 * math.log10(1.0 / mse)) as f32
+}
+
+fn luma1(im: *mut image.Image, x: i32, y: i32) -> f32 {
+    return 0.2126f * image.img_get(im, 0, x, y) + 0.7152f * image.img_get(im, 1, x, y) + 0.0722f * image.img_get(im, 2, x, y)
+}
+
+// overshoot above / below the 5x5 envelope of the ideal luma, mean over the zone
+fn halo_of(a: *mut image.Image, b: *mut image.Image, zone: *mut image.Image, glow: *mut f32) -> f32 {
+    var s: f32 = 0.0f
+    var g: f32 = 0.0f
+    var cnt: f32 = 0.0f
+    var y: i32 = 0
+    while y < (*a).h {
+        var x: i32 = 0
+        while x < (*a).w {
+            if image.img_get(zone, 0, x, y) > 0.5f {
+                var lo: f32 = 9.0f
+                var hi: f32 = -9.0f
+                var dy: i32 = -2
+                while dy <= 2 {
+                    var dx: i32 = -2
+                    while dx <= 2 {
+                        let xx: i32 = x + dx
+                        let yy: i32 = y + dy
+                        if xx >= 0 && yy >= 0 && xx < (*a).w && yy < (*a).h {
+                            let v: f32 = luma1(b, xx, yy)
+                            if v < lo { lo = v }
+                            if v > hi { hi = v }
+                        }
+                        dx = dx + 1
+                    }
+                    dy = dy + 1
+                }
+                let va: f32 = luma1(a, x, y)
+                if va > hi { s = s + (va - hi) }
+                if va < lo { s = s + (lo - va) }
+                g = g + (va - luma1(b, x, y))
+                cnt = cnt + 1.0f
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if cnt < 1.0f { *glow = 0.0f; return 0.0f }
+    *glow = g / cnt * 100.0f
+    return s / cnt * 100.0f
+}
+
+fn fringe_of(a: *mut image.Image, b: *mut image.Image, edge: *mut image.Image) -> f32 {
+    var s: f32 = 0.0f
+    var cnt: f32 = 0.0f
+    var y: i32 = 0
+    while y < (*a).h {
+        var x: i32 = 0
+        while x < (*a).w {
+            if image.img_get(edge, 0, x, y) > 0.5f {
+                let ya: f32 = luma1(a, x, y)
+                let yb: f32 = luma1(b, x, y)
+                var d1: f32 = (image.img_get(a, 0, x, y) - ya) - (image.img_get(b, 0, x, y) - yb)
+                var d2: f32 = (image.img_get(a, 2, x, y) - ya) - (image.img_get(b, 2, x, y) - yb)
+                if d1 < 0.0f { d1 = 0.0f - d1 }
+                if d2 < 0.0f { d2 = 0.0f - d2 }
+                s = s + d1 + d2
+                cnt = cnt + 1.0f
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if cnt < 1.0f { return 0.0f }
+    return s / cnt * 100.0f
+}
+
+fn mean_chroma(a: *mut image.Image, m: *mut image.Image) -> f32 {
+    var s: f32 = 0.0f
+    var cnt: f32 = 0.0f
+    var y: i32 = 0
+    while y < (*a).h {
+        var x: i32 = 0
+        while x < (*a).w {
+            if image.img_get(m, 0, x, y) > 0.5f {
+                let ya: f32 = luma1(a, x, y)
+                var d1: f32 = image.img_get(a, 0, x, y) - ya
+                var d2: f32 = image.img_get(a, 2, x, y) - ya
+                if d1 < 0.0f { d1 = 0.0f - d1 }
+                if d2 < 0.0f { d2 = 0.0f - d2 }
+                s = s + d1 + d2
+                cnt = cnt + 1.0f
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if cnt < 1.0f { return 0.0f }
+    return s / cnt
+}
+
+fn mean_luma(a: *mut image.Image, m: *mut image.Image) -> f32 {
+    var s: f32 = 0.0f
+    var cnt: f32 = 0.0f
+    var y: i32 = 0
+    while y < (*a).h {
+        var x: i32 = 0
+        while x < (*a).w {
+            if image.img_get(m, 0, x, y) > 0.5f {
+                s = s + luma1(a, x, y)
+                cnt = cnt + 1.0f
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if cnt < 1.0f { return 0.0f }
+    return s / cnt
+}
+
+// 1 % luma percentile (256 bin histogram)
+fn p1_of(a: *mut image.Image) -> f32 {
+    var hist: [i32; 256] = [0; 256]
+    let n: i32 = (*a).w * (*a).h
+    var y: i32 = 0
+    while y < (*a).h {
+        var x: i32 = 0
+        while x < (*a).w {
+            var b: i32 = (luma1(a, x, y) * 255.0f) as i32
+            if b < 0 { b = 0 }
+            if b > 255 { b = 255 }
+            hist[b as usize] = hist[b as usize] + 1
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var acc: i32 = 0
+    var i: i32 = 0
+    while i < 256 {
+        acc = acc + hist[i as usize]
+        if acc * 100 >= n { return (i as f32) / 255.0f }
+        i = i + 1
+    }
+    return 1.0f
+}
+
+struct Res {
+    psnr_all: f32,
+    psnr_tv: f32,
+    psnr_wall: f32,
+    psnr_near: f32,
+    halo: f32,
+    glow: f32,
+    fringe: f32,
+    p1: f32,
+    wall: f32,
+    tvsat: f32,
+    sharp: f32,
+}
+
+fn evaluate(tag: str, out: *mut image.Image, ideal: *mut image.Image, mk: *mut Masks, verbose: bool) -> Res {
+    var all: image.Image = image.img_new((*out).w, (*out).h, 1)
+    image.img_fill(&all, 1.0f)
+    var gl: f32 = 0.0f
+    var r: Res = Res { psnr_all: region_psnr(out, ideal, &all), psnr_tv: region_psnr(out, ideal, &(*mk).tv), psnr_wall: region_psnr(out, ideal, &(*mk).wall), psnr_near: region_psnr(out, ideal, &(*mk).near), halo: 0.0f, glow: 0.0f, fringe: 0.0f, p1: p1_of(out), wall: mean_luma(out, &(*mk).wall), tvsat: 0.0f, sharp: 0.0f }
+    r.halo = halo_of(out, ideal, &(*mk).zone, &gl)
+    r.glow = gl
+    r.fringe = fringe_of(out, ideal, &(*mk).edge)
+    let ci: f32 = mean_chroma(ideal, &(*mk).tv)
+    if ci > 0.0f { r.tvsat = mean_chroma(out, &(*mk).tv) / ci }
+    r.sharp = image.sharpness(out, 1) / image.sharpness(ideal, 1)
+    image.img_free(&all)
+    if verbose {
+        pf(tag, "psnr_all", r.psnr_all)
+        pf(tag, "psnr_tv", r.psnr_tv)
+        pf(tag, "psnr_wall", r.psnr_wall)
+        pf(tag, "psnr_near", r.psnr_near)
+        pf(tag, "halo", r.halo)
+        pf(tag, "glow", r.glow)
+        pf(tag, "fringe", r.fringe)
+        pf(tag, "p1", r.p1)
+        pf(tag, "wall", r.wall)
+        pf(tag, "tvsat", r.tvsat)
+        pf(tag, "sharp", r.sharp)
+    }
+    return r
+}
+
+fn burst_of(rg: *mut Rig) -> merge.Burst {
+    var b: merge.Burst = merge.burst_new()
+    var i: i32 = 0
+    while i < (*rg).n {
+        merge.burst_add(&b, half_of(rg, (*rg).mos[i as usize]), 1.0f)
+        i = i + 1
+    }
+    return b
+}
+
+fn run_stack(rg: *mut Rig, o: *mut focus.FocusOpts) -> image.Image {
+    var b: merge.Burst = burst_of(rg)
+    var st: image.Image = image.img_new(1, 1, 3)
+    var dp: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&st)
+    image.img_free(&dp)
+    focus.focus_stack(&b, o, &st, &dp)
+    image.img_free(&dp)
+    merge.burst_free(&b)
+    let out: image.Image = chain(&st, &(*rg).m)
+    image.img_free(&st)
+    return out
+}
+
+fn rig_free(rg: *mut Rig) {
+    var i: i32 = 0
+    while i < (*rg).n {
+        rt.heap_free((*rg).mos[i as usize], (((*rg).cfg.sw * (*rg).cfg.sh) as usize) * 2)
+        i = i + 1
+    }
+}
+
+// metrics of the plain frame i (no stack) against the sharp render of its own geometry
+fn single_res(rg: *mut Rig, i: i32) -> Res {
+    var tr: image.Image = truth_half(rg, i)
+    var idl: image.Image = chain(&tr, &(*rg).m)
+    var fr: image.Image = half_of(rg, (*rg).mos[i as usize])
+    var fo: image.Image = chain(&fr, &(*rg).m)
+    var mk: Masks = masks_of(&tr, &idl)
+    let r: Res = evaluate("single", &fo, &idl, &mk, false)
+    masks_free(&mk)
+    image.img_free(&tr)
+    image.img_free(&idl)
+    image.img_free(&fr)
+    image.img_free(&fo)
+    return r
+}
+
+// metrics of the stack with options `o` against the ideal of ITS reference frame; *ref_out = that frame
+fn stack_res(rg: *mut Rig, o: *mut focus.FocusOpts, tag: str, verbose: bool, ref_out: *mut i32) -> Res {
+    var bb: merge.Burst = burst_of(rg)
+    let r: i32 = focus.pick_ref(&bb, o)
+    merge.burst_free(&bb)
+    *ref_out = r
+    var tr: image.Image = truth_half(rg, r)
+    var idl: image.Image = chain(&tr, &(*rg).m)
+    var mk: Masks = masks_of(&tr, &idl)
+    var out: image.Image = run_stack(rg, o)
+    let res: Res = evaluate(tag, &out, &idl, &mk, verbose)
+    masks_free(&mk)
+    image.img_free(&tr)
+    image.img_free(&idl)
+    image.img_free(&out)
+    return res
+}
