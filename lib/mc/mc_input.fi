@@ -7,8 +7,8 @@
 //     sneak 0.0648 (1.295), fly 0.546 (10.92, x2 sprinting), fly up / down 0.375. Diagonals are normalised. Ground: instant
 //     horizontal speed (no inertia), gravity vy = (vy - 0.08) * 0.98, jump 0.42, box 0.6 x 1.8 (sneaking 1.5), eye 1.62 (1.27).
 //     Fly mode (`flying`): no gravity; `noclip` additionally ignores all blocks. Collision: a 9x9x9 snapshot of the world around
-//     the player (unloaded chunks count as solid) + mc_math.grid_move. No water / ladders. Step-up (stepHeight 0.6) never matters on
-//     the full-block grid; the Auto-Jump option (`Player.autojump`, off by default) jumps against a 1 block step (see auto_jump_ok).
+//     the player (unloaded chunks count as solid) + mc_math.grid_move. No water / ladders. Step-up (stepHeight 0.6, vanilla Entity.collide, see move_step)
+//     only matters for partial shapes (solid table value 128 + k, see mc_math.shape_box / mc_shapes); the Auto-Jump option (`Player.autojump`, off by default) jumps against a 1 block step (see auto_jump_ok).
 //   * Pick: Amanatides-Woo DDA directly over mc_world (reach 5, creative 6). Hit = block + entered face (normal) + distance.
 //   * Selection box: the 12 edges of the block (+-0.002) as lines (near clipped, 1/16-pixel snapped, integer DDA, depth test
 //     with a small tolerance, no depth write) -- tools/mc/input/ref.py repeats every rule.
@@ -42,6 +42,7 @@ const SPEED_FLY: f64 = 0.546
 const SPEED_FLY_VERT: f64 = 0.375
 const DIAG: f64 = 0.7071067811865476
 const SNAP_N: i32 = 9
+const STEP_HEIGHT: f64 = 0.6 // vanilla stepHeight of the player
 const AUTO_JUMP_HEAD: f64 = 1.25 // jump apex (0.42 start velocity)
 
 struct InputEvents {
@@ -74,7 +75,7 @@ struct Player {
     sens: f64, // 0..1
     slot: i32, // selected hotbar slot 0..8
     snap: u64, // u16 [9^3] collision snapshot
-    cls: u64, // u8 [2] class table (0 passable, 1 solid)
+    cls: u64, // u8 [256] class table (0 passable, 1 full cube, 128 + k partial shape k of mc_math.shape_box)
 }
 
 struct Pick {
@@ -94,15 +95,21 @@ fn player_new(x: f64, y: f64, z: f64) -> Player {
         sneaking: false, sprinting: false, autojump: false, sens: 0.5, slot: 0, snap: 0, cls: 0,
     }
     p.snap = rt.heap_alloc((SNAP_N * SNAP_N * SNAP_N) as usize * 2)
-    p.cls = rt.heap_alloc(2)
-    rt.st8(p.cls, 0, 0 as u8)
-    rt.st8(p.cls, 1, 1 as u8)
+    p.cls = rt.heap_alloc(256)
+    var k: usize = 0
+    while k < 256 {
+        var v: u8 = 1 as u8
+        if k == 0 { v = 0 as u8 }
+        if k >= 128 { v = k as u8 }
+        rt.st8(p.cls, k, v)
+        k = k + 1
+    }
     return p
 }
 
 fn player_free(p: *mut Player) {
     if (*p).snap != 0 { rt.heap_free((*p).snap, (SNAP_N * SNAP_N * SNAP_N) as usize * 2) }
-    if (*p).cls != 0 { rt.heap_free((*p).cls, 2) }
+    if (*p).cls != 0 { rt.heap_free((*p).cls, 256) }
     (*p).snap = 0
     (*p).cls = 0
 }
@@ -199,7 +206,13 @@ fn snapshot(p: *mut Player, v: *mut WorldView, tb: *mut InputTables, out: *mut m
             while x < SNAP_N {
                 let id: i32 = view_id(v, ox + x, oy + y, oz + z)
                 var c: u16 = 0 as u16
-                if id == -1 || table_flag((*tb).solid, (*tb).n, id) { c = 1 as u16 }
+                if id == -1 {
+                    c = 1 as u16
+                } else if id >= 0 && (id as usize) < (*tb).n {
+                    let sv: u8 = rt.ld8((*tb).solid, id as usize)
+                    if sv != 0 as u8 { c = 1 as u16 }
+                    if sv >= 128 as u8 { c = sv as u16 } // partial shape code
+                }
                 rt.st16((*p).snap, ((y * SNAP_N + z) * SNAP_N + x) as usize, c)
                 x = x + 1
             }
@@ -207,7 +220,7 @@ fn snapshot(p: *mut Player, v: *mut WorldView, tb: *mut InputTables, out: *mut m
         }
         y = y + 1
     }
-    *out = mc_math.grid_view(ox, oy, oz, SNAP_N, SNAP_N, SNAP_N, (*p).snap, (*p).cls, 2 as u32, false)
+    *out = mc_math.grid_view(ox, oy, oz, SNAP_N, SNAP_N, SNAP_N, (*p).snap, (*p).cls, 256 as u32, false)
 }
 
 // Auto-Jump (vanilla option): true when the player stands on the ground, walks horizontally into an obstacle of at most one block, and a
@@ -233,6 +246,57 @@ fn auto_jump_ok(g: *mut mc_math.BlockGrid, b: *mut mc_math.Aabb, dx: f64, dz: f6
     var r3: mc_math.MoveResult = mc_math.MoveResult { dx: 0.0, dy: 0.0, dz: 0.0, hit_x: false, hit_y: false, hit_z: false }
     mc_math.grid_move(g, &top, 0.0, AUTO_JUMP_HEAD - 1.0, 0.0, &r3)
     return r3.dy >= AUTO_JUMP_HEAD - 1.0 - 0.000000001
+}
+
+// Vanilla 1.20.1 Entity.collide with stepHeight 0.6: a normal collision move; when that was blocked horizontally and the entity
+// stood on the ground (or just hit the floor moving down), it is retried raised by the step height (once straight up with the box
+// widened towards the move, once as a plain raise), the better horizontal result wins, then the box is lowered back onto the
+// floor. Only partial shapes (slabs, stairs, carpets) can be stepped; a full block (1.0) is above 0.6.
+fn move_step(g: *mut mc_math.BlockGrid, b: *mut mc_math.Aabb, dx: f64, dy: f64, dz: f64, was_ground: bool, out: *mut mc_math.MoveResult) {
+    mc_math.grid_move(g, b, dx, dy, dz, out)
+    let flag3: bool = was_ground || ((*out).hit_y && dy < 0.0)
+    if !flag3 || !((*out).hit_x || (*out).hit_z) { return }
+    var r1: mc_math.MoveResult = mc_math.MoveResult { dx: 0.0, dy: 0.0, dz: 0.0, hit_x: false, hit_y: false, hit_z: false }
+    mc_math.grid_move(g, b, dx, STEP_HEIGHT, dz, &r1)
+    var e: mc_math.Aabb = *b
+    e.x0 = e.x0 + math.fmin(dx, 0.0)
+    e.x1 = e.x1 + math.fmax(dx, 0.0)
+    e.z0 = e.z0 + math.fmin(dz, 0.0)
+    e.z1 = e.z1 + math.fmax(dz, 0.0)
+    var r2: mc_math.MoveResult = mc_math.MoveResult { dx: 0.0, dy: 0.0, dz: 0.0, hit_x: false, hit_y: false, hit_z: false }
+    mc_math.grid_move(g, &e, 0.0, STEP_HEIGHT, 0.0, &r2)
+    var sx: f64 = r1.dx
+    var sy: f64 = r1.dy
+    var sz: f64 = r1.dz
+    if r2.dy < STEP_HEIGHT {
+        var m: mc_math.Aabb = *b
+        m.y0 = m.y0 + r2.dy
+        m.y1 = m.y1 + r2.dy
+        var r3: mc_math.MoveResult = mc_math.MoveResult { dx: 0.0, dy: 0.0, dz: 0.0, hit_x: false, hit_y: false, hit_z: false }
+        mc_math.grid_move(g, &m, dx, 0.0, dz, &r3)
+        if r3.dx * r3.dx + r3.dz * r3.dz > sx * sx + sz * sz {
+            sx = r3.dx
+            sy = r2.dy
+            sz = r3.dz
+        }
+    }
+    if sx * sx + sz * sz > (*out).dx * (*out).dx + (*out).dz * (*out).dz {
+        var m2: mc_math.Aabb = *b
+        m2.x0 = m2.x0 + sx
+        m2.x1 = m2.x1 + sx
+        m2.y0 = m2.y0 + sy
+        m2.y1 = m2.y1 + sy
+        m2.z0 = m2.z0 + sz
+        m2.z1 = m2.z1 + sz
+        var r4: mc_math.MoveResult = mc_math.MoveResult { dx: 0.0, dy: 0.0, dz: 0.0, hit_x: false, hit_y: false, hit_z: false }
+        mc_math.grid_move(g, &m2, 0.0, dy - sy, 0.0, &r4)
+        (*out).dx = sx
+        (*out).dy = sy + r4.dy
+        (*out).dz = sz
+        (*out).hit_x = dx != sx
+        (*out).hit_z = dz != sz
+        (*out).hit_y = dy != (*out).dy
+    }
 }
 
 // One game tick (20 Hz): mouse look, key movement, gravity / fly, collision. `w` may be an empty world (everything unloaded =
@@ -301,7 +365,7 @@ fn player_tick(p: *mut Player, ev: *mut InputEvents, w: *mut mc_world.World, tb:
     if (*p).sneaking { h = 1.5 }
     var b: mc_math.Aabb = mc_math.Aabb { x0: (*p).x - 0.3, y0: (*p).y, z0: (*p).z - 0.3, x1: (*p).x + 0.3, y1: (*p).y + h, z1: (*p).z + 0.3 }
     var res: mc_math.MoveResult = mc_math.MoveResult { dx: 0.0, dy: 0.0, dz: 0.0, hit_x: false, hit_y: false, hit_z: false }
-    mc_math.grid_move(&g, &b, dx, dy, dz, &res)
+    move_step(&g, &b, dx, dy, dz, (*p).on_ground && !(*p).flying, &res)
     (*p).x = (*p).x + res.dx
     (*p).y = (*p).y + res.dy
     (*p).z = (*p).z + res.dz
