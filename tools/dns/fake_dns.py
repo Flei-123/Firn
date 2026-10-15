@@ -10,6 +10,8 @@ Behaviour by name (all under `.test`):
 
   plain.test      A 192.0.2.1 ttl 60
   dual.test       A 192.0.2.7, AAAA 2001:db8::7 (ttl 60)
+  dual6.test      A 192.0.2.7 (dead), AAAA fec0::2 (the host as the Android
+                  emulator sees it over IPv6; tools/android/dns_check.sh)
   chain.test      CNAME mid.test -> end.test (A 192.0.2.2), compressed names
   big.test        UDP: TC, no records.  TCP: eleven A records
   hermetic.test   A 127.0.0.1               (the https test)
@@ -36,9 +38,10 @@ A = {
     'other.test': ['127.0.0.1'],
     'counted.test': ['192.0.2.9'],
     'dual.test': ['192.0.2.7'],
+    'dual6.test': ['192.0.2.7'],
     'relay.test': ['10.0.2.2'],  # the host as the Android emulator sees it (tools/android/dns_check.sh)
 }
-AAAA = {'dual.test': ['2001:db8::7']}
+AAAA = {'dual.test': ['2001:db8::7'], 'dual6.test': ['fec0::2']}
 CNAMES = {'chain.test': 'mid.test', 'mid.test': 'end.test'}
 BIG = ['192.0.2.%d' % (100 + i) for i in range(11)]
 
