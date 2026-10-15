@@ -1,0 +1,536 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/synthtv.fi -- photo.synthtv: a realistic focus-stack test scene (tests and measurements only).
+//
+//     var cfg: synthtv.TvCfg = synthtv.tv_cfg_default(640, 480)
+//     var fp: synthtv.TvFrame = synthtv.tv_frame_params(&cfg, i, &rng)
+//     synthtv.tv_frame_mosaic(&cfg, &fp, &rng, mosaic_ptr)        // RGGB u16 mosaic of frame i (noise, clipping)
+//     var m: meta.SensorMeta = synthtv.tv_meta(&cfg)               // black / white level, WB gains, noise, matrix
+//
+// WHY: the first FirnCam stack test used a smooth synthetic scene with no clipping and no brightness changes, so
+// it never showed what the real phone showed (halos, colour fringes, flat look around a bright TV). This scene is
+// a dark room (wall, table, bed, pillow, a striped sock) with a BRIGHT TV on the wall: dark navy panel, white text
+// bars, four cards that are 5x over the sensor's white level (they clip), a moving "video" region and a rolling
+// brightness band (display flicker). Two depth layers (wall + TV far, bed + pillow + sock near), every frame is
+// focused at another diopter value, so every pixel is blurred by sigma = blur_per_d * |depth - focus|. Per frame:
+// hand shake (translation + rotation), focus breathing, auto-exposure variation, shot + read noise, WB-gain
+// sensitivities (raw = radiance / gain: G clips first, so clipped highlights turn magenta after the white
+// balance unless they are handled), 10-bit black / white level. Deterministic.
+import std.rt
+import std.math
+import photo.image
+import photo.filter
+import photo.meta
+
+export {
+    TvCfg, TvFrame, tv_cfg_default, tv_frame_params, tv_frame_mosaic, tv_meta, tv_truth_mosaic,
+}
+
+struct TvCfg {
+    sw: i32,
+    sh: i32,
+    n: i32,
+    far_d: f32,
+    near_d: f32,
+    step_d: f32,
+    blur_per_d: f32,
+    wb: [f32; 3],
+    black: f32,
+    white: f32,
+    ns: f32,
+    no: f32,
+    shake: f32,
+    rot: f32,
+    breathing: f32,
+    ae_var: f32,
+    flicker: f32,
+    video: bool,
+    tv_gain: f32,
+    expo: f32,
+}
+
+struct TvFrame {
+    dx: f32,
+    dy: f32,
+    rot: f32,
+    scale: f32,
+    expo: f32,
+    focus_d: f32,
+    vshift: f32,
+    vgain: f32,
+    fph: f32,
+}
+
+fn tv_cfg_default(sw: i32, sh: i32) -> TvCfg {
+    return TvCfg {
+        sw: sw, sh: sh, n: 6, far_d: 0.3f, near_d: 1.2f, step_d: 0.7f, blur_per_d: 0.004f * (sw as f32) * 0.5f,
+        wb: [2.0f, 1.0f, 1.6f], black: 64.0f, white: 1023.0f, ns: 1.0e-3f, no: 2.0e-5f,
+        shake: 0.008f * (sw as f32), rot: 0.004f, breathing: 0.003f, ae_var: 0.2f, flicker: 0.25f, video: true,
+        tv_gain: 1.0f, expo: 1.0f,
+    }
+}
+
+fn clamp01(x: f32) -> f32 {
+    return image.fclampf(x, 0.0f, 1.0f)
+}
+
+fn mix(a: f32, b: f32, t: f32) -> f32 {
+    return a + (b - a) * t
+}
+
+fn hash2(x: i32, y: i32, seed: i32) -> f32 {
+    var h: u64 = ((x as u64) & (65535 as u64)) * (374761393 as u64) + ((y as u64) & (65535 as u64)) * (668265263 as u64) + ((seed as u64) & (65535 as u64)) * (144665 as u64)
+    h = (h ^ (h >> 13)) & (4294967295 as u64)
+    h = (h * (1274126177 as u64)) & (4294967295 as u64)
+    h = h ^ (h >> 16)
+    return ((h & (65535 as u64)) as f32) / 65535.0f
+}
+
+fn vnoise(x: f32, y: f32, seed: i32) -> f32 {
+    let xi: i32 = math.floor32(x) as i32
+    let yi: i32 = math.floor32(y) as i32
+    let fx: f32 = x - (xi as f32)
+    let fy: f32 = y - (yi as f32)
+    let sx: f32 = fx * fx * (3.0f - 2.0f * fx)
+    let sy: f32 = fy * fy * (3.0f - 2.0f * fy)
+    let a: f32 = hash2(xi, yi, seed) * (1.0f - sx) + hash2(xi + 1, yi, seed) * sx
+    let b: f32 = hash2(xi, yi + 1, seed) * (1.0f - sx) + hash2(xi + 1, yi + 1, seed) * sx
+    return a * (1.0f - sy) + b * sy
+}
+
+fn sinf(x: f32) -> f32 {
+    return math.sin(x as f64) as f32
+}
+
+fn cosf(x: f32) -> f32 {
+    return math.cos(x as f64) as f32
+}
+
+// coverage of the box [u0, u1] x [v0, v1], edges softened over `e`
+fn box_a(u: f32, v: f32, u0: f32, v0: f32, u1: f32, v1: f32, e: f32) -> f32 {
+    let a: f32 = clamp01((u - u0) / e + 0.5f)
+    let b: f32 = clamp01((u1 - u) / e + 0.5f)
+    let c: f32 = clamp01((v - v0) / e + 0.5f)
+    let d: f32 = clamp01((v1 - v) / e + 0.5f)
+    return a * b * c * d
+}
+
+fn frac(x: f32) -> f32 {
+    return x - math.floor32(x)
+}
+
+// colour of the TV picture at (su, sv) in 0..1 of the screen (radiance, 1.0 = sensor white at exposure 1)
+fn eval_screen(fp: *mut TvFrame, su: f32, sv: f32, e: f32, o: *mut [f32; 3]) {
+    var r: f32 = 0.040f + 0.030f * (1.0f - sv)
+    var g: f32 = 0.046f + 0.030f * (1.0f - sv)
+    var b: f32 = 0.100f + 0.050f * (1.0f - sv)
+    // video region (right, top): blocky teal / green crates that move + a yellow figure; brightness fades
+    let va: f32 = box_a(su, sv, 0.50f, 0.02f, 0.99f, 0.58f, e)
+    if va > 0.0f {
+        let cu: f32 = su * 14.0f + (*fp).vshift
+        let cv: f32 = sv * 9.0f
+        let ci: i32 = math.floor32(cu) as i32
+        let cj: i32 = math.floor32(cv) as i32
+        let hsel: f32 = hash2(ci, cj, 5)
+        let hv: f32 = 0.6f + 0.4f * hash2(ci, cj, 6)
+        var vr: f32 = 0.06f
+        var vg: f32 = 0.45f
+        var vb: f32 = 0.50f
+        if hsel > 0.75f {
+            vr = 0.30f
+            vg = 0.55f
+            vb = 0.25f
+        } else if hsel > 0.5f {
+            vr = 0.55f
+            vg = 0.55f
+            vb = 0.45f
+        } else if hsel > 0.25f {
+            vr = 0.08f
+            vg = 0.35f
+            vb = 0.55f
+        }
+        vr = vr * hv * (*fp).vgain
+        vg = vg * hv * (*fp).vgain
+        vb = vb * hv * (*fp).vgain
+        let fa: f32 = box_a(su, sv, 0.70f, 0.12f, 0.80f, 0.55f, e)
+        vr = mix(vr, 1.4f * (*fp).vgain, fa)
+        vg = mix(vg, 1.0f * (*fp).vgain, fa)
+        vb = mix(vb, 0.15f * (*fp).vgain, fa)
+        r = mix(r, vr, va)
+        g = mix(g, vg, va)
+        b = mix(b, vb, va)
+    }
+    // title block with dark letter stripes + text lines on the left
+    let tb: f32 = box_a(su, sv, 0.04f, 0.05f, 0.17f, 0.14f, e)
+    if tb > 0.0f {
+        var k: f32 = 1.0f
+        if frac(su * 60.0f) < 0.35f { k = 0.2f }
+        r = mix(r, 2.2f * k, tb)
+        g = mix(g, 2.2f * k, tb)
+        b = mix(b, 2.0f * k, tb)
+    }
+    var li: i32 = 0
+    while li < 8 {
+        let sv0: f32 = 0.18f + 0.045f * (li as f32)
+        let ln: f32 = 0.16f + 0.22f * hash2(li, 3, 7)
+        let ta: f32 = box_a(su, sv, 0.04f, sv0, 0.04f + ln, sv0 + 0.026f, e)
+        r = mix(r, 1.4f, ta)
+        g = mix(g, 1.4f, ta)
+        b = mix(b, 1.5f, ta)
+        li = li + 1
+    }
+    // four cards (far above the sensor white): white / warm with a dark label / cream / white
+    var ki: i32 = 0
+    while ki < 4 {
+        let cu0: f32 = 0.04f + 0.115f * (ki as f32)
+        let ca: f32 = box_a(su, sv, cu0, 0.62f, cu0 + 0.10f, 0.97f, e)
+        if ca > 0.0f {
+            var cr: f32 = 5.0f
+            var cg: f32 = 5.0f
+            var cb: f32 = 5.0f
+            if ki == 1 {
+                cr = 4.0f
+                cg = 2.6f
+                cb = 0.9f
+            } else if ki == 2 {
+                cr = 5.0f
+                cg = 4.4f
+                cb = 3.6f
+            } else if ki == 3 {
+                cr = 5.5f
+                cg = 5.2f
+                cb = 5.0f
+            }
+            // the lower part is less bright (still above white at the top, a readable level at the bottom)
+            let low: f32 = clamp01((sv - 0.80f) / 0.12f)
+            cr = mix(cr, cr * 0.25f, low)
+            cg = mix(cg, cg * 0.25f, low)
+            cb = mix(cb, cb * 0.25f, low)
+            if ki == 0 {
+                let sa: f32 = box_a(su, sv, cu0 + 0.040f, 0.66f, cu0 + 0.062f, 0.90f, e)
+                cr = mix(cr, 0.2f, sa)
+                cg = mix(cg, 0.9f, sa)
+                cb = mix(cb, 0.2f, sa)
+            }
+            if ki == 1 {
+                let sa: f32 = box_a(su, sv, cu0 + 0.010f, 0.78f, cu0 + 0.090f, 0.84f, e)
+                cr = mix(cr, 0.3f, sa)
+                cg = mix(cg, 0.05f, sa)
+                cb = mix(cb, 0.05f, sa)
+            }
+            r = mix(r, cr, ca)
+            g = mix(g, cg, ca)
+            b = mix(b, cb, ca)
+        }
+        ki = ki + 1
+    }
+    (*o)[0] = r
+    (*o)[1] = g
+    (*o)[2] = b
+}
+
+// far layer: wall, light fixture, outlet, table, TV bezel + screen
+fn eval_far(cfg: *mut TvCfg, fp: *mut TvFrame, u: f32, v: f32, o: *mut [f32; 3]) {
+    let e: f32 = 1.5f / ((*cfg).sw as f32)
+    let wt: f32 = 0.85f + 0.3f * vnoise(u * 7.0f, v * 7.0f, 3)
+    let wf: f32 = (0.026f - 0.012f * v) * wt
+    var r: f32 = wf * 1.05f
+    var g: f32 = wf * 0.95f
+    var b: f32 = wf * 0.85f
+    let fx: f32 = box_a(u, v, 0.62f, 0.15f, 0.68f, 0.21f, e)
+    r = mix(r, 0.09f, fx)
+    g = mix(g, 0.08f, fx)
+    b = mix(b, 0.06f, fx)
+    let ou: f32 = box_a(u, v, 0.04f, 0.14f, 0.07f, 0.19f, e)
+    r = mix(r, 0.004f, ou)
+    g = mix(g, 0.004f, ou)
+    b = mix(b, 0.004f, ou)
+    let tb: f32 = box_a(u, v, 0.04f, 0.745f, 0.96f, 0.82f, e)
+    let tt: f32 = 0.8f + 0.4f * vnoise(u * 60.0f, v * 60.0f, 4)
+    r = mix(r, 0.006f * tt, tb)
+    g = mix(g, 0.006f * tt, tb)
+    b = mix(b, 0.007f * tt, tb)
+    let bz: f32 = box_a(u, v, 0.105f, 0.285f, 0.895f, 0.735f, e)
+    r = mix(r, 0.004f, bz)
+    g = mix(g, 0.004f, bz)
+    b = mix(b, 0.004f, bz)
+    let sa: f32 = box_a(u, v, 0.12f, 0.30f, 0.88f, 0.72f, e)
+    if sa > 0.0f {
+        var sc: [f32; 3] = [0.0f; 3]
+        eval_screen(fp, (u - 0.12f) / 0.76f, (v - 0.30f) / 0.42f, e / 0.5f, &sc)
+        // display flicker: a rolling brightness band over the screen height
+        let fl: f32 = (1.0f + (*cfg).flicker * sinf(6.2831853f * (v * 2.6f + (*fp).fph))) * (*cfg).tv_gain
+        r = mix(r, sc[0] * fl, sa)
+        g = mix(g, sc[1] * fl, sa)
+        b = mix(b, sc[2] * fl, sa)
+    }
+    (*o)[0] = r
+    (*o)[1] = g
+    (*o)[2] = b
+}
+
+// near layer: returns the coverage, writes the radiance
+fn eval_near(cfg: *mut TvCfg, u: f32, v: f32, o: *mut [f32; 3]) -> f32 {
+    let e: f32 = 1.5f / ((*cfg).sw as f32)
+    var r: f32 = 0.0f
+    var g: f32 = 0.0f
+    var b: f32 = 0.0f
+    var a: f32 = 0.0f
+    // bed sheet: magenta with folds and a fine weave
+    let ba: f32 = clamp01((v - (0.80f - 0.07f * u)) / (2.0f * e) + 0.5f)
+    if ba > 0.0f {
+        let fold: f32 = 1.0f + 0.35f * sinf(6.2831853f * (v * 8.0f + u * 1.5f) + 3.0f * vnoise(u * 5.0f, v * 5.0f, 11))
+        let tex: f32 = 0.85f + 0.3f * vnoise(u * 90.0f, v * 90.0f, 12)
+        r = 0.11f * fold * tex
+        g = 0.012f * fold * tex
+        b = 0.065f * fold * tex
+        a = ba
+    }
+    // pillow
+    let pu: f32 = (u - 0.24f) / 0.19f
+    let pv: f32 = (v - 0.79f) / 0.075f
+    let pa: f32 = clamp01((1.0f - (pu * pu + pv * pv)) * 4.0f + 0.5f)
+    if pa > 0.0f {
+        let pt: f32 = 0.7f + 0.5f * vnoise(u * 40.0f, v * 40.0f, 13)
+        r = mix(r, 0.16f * pt, pa)
+        g = mix(g, 0.15f * pt, pa)
+        b = mix(b, 0.13f * pt, pa)
+        a = a + (1.0f - a) * pa
+    }
+    // leg: a rotated dark blue box
+    let du: f32 = u - 0.22f
+    let dv: f32 = v - 0.93f
+    let lx: f32 = du * 0.9f + dv * 0.43f
+    let ly: f32 = 0.0f - du * 0.43f + dv * 0.9f
+    let la: f32 = box_a(lx, ly, -0.34f, -0.075f, 0.34f, 0.075f, 2.0f * e)
+    if la > 0.0f {
+        let lt: f32 = 0.7f + 0.6f * vnoise(u * 120.0f, v * 120.0f, 14)
+        r = mix(r, 0.006f * lt, la)
+        g = mix(g, 0.010f * lt, la)
+        b = mix(b, 0.030f * lt, la)
+        a = a + (1.0f - a) * la
+    }
+    // striped sock
+    let sk: f32 = box_a(u, v, 0.045f, 0.80f, 0.130f, 0.90f, e)
+    if sk > 0.0f {
+        var sr: f32 = 0.35f
+        var sg: f32 = 0.33f
+        var sb: f32 = 0.30f
+        if frac(v * 38.0f) < 0.5f {
+            sr = 0.30f
+            sg = 0.03f
+            sb = 0.03f
+        }
+        r = mix(r, sr, sk)
+        g = mix(g, sg, sk)
+        b = mix(b, sb, sk)
+        a = a + (1.0f - a) * sk
+    }
+    (*o)[0] = r
+    (*o)[1] = g
+    (*o)[2] = b
+    return a
+}
+
+// frame parameters: a random walk of the hand, AE hunting, focus plane i, video / flicker state
+fn tv_frame_params(cfg: *mut TvCfg, i: i32, rng: *mut image.Rng) -> TvFrame {
+    var f: TvFrame = TvFrame { dx: 0.0f, dy: 0.0f, rot: 0.0f, scale: 1.0f, expo: (*cfg).expo, focus_d: 0.0f, vshift: 0.0f, vgain: 1.0f, fph: 0.0f }
+    if i > 0 {
+        f.dx = (image.rng_uniform(rng) - 0.5f) * 2.0f * (*cfg).shake
+        f.dy = (image.rng_uniform(rng) - 0.5f) * 2.0f * (*cfg).shake
+        f.rot = (image.rng_uniform(rng) - 0.5f) * 2.0f * (*cfg).rot
+    }
+    f.scale = 1.0f + (*cfg).breathing * ((i - (*cfg).n / 2) as f32)
+    f.expo = (*cfg).expo * (1.0f + (*cfg).ae_var * (image.rng_uniform(rng) - 0.5f) * 2.0f)
+    f.focus_d = (*cfg).step_d * (i as f32)
+    if (*cfg).video {
+        f.vshift = 0.9f * (i as f32)
+        f.vgain = 1.0f + 0.25f * (image.rng_uniform(rng) - 0.5f) * 2.0f
+    }
+    f.fph = image.rng_uniform(rng)
+    return f
+}
+
+// the scene of one frame at sensor resolution: far layer, near layer premultiplied, near coverage
+fn render_layers(cfg: *mut TvCfg, fp: *mut TvFrame, far: *mut image.Image, near: *mut image.Image, alpha: *mut image.Image) {
+    let sw: i32 = (*cfg).sw
+    let sh: i32 = (*cfg).sh
+    var y: i32 = 0
+    while y < sh {
+        var x: i32 = 0
+        while x < sw {
+            let u: f32 = ((x as f32) + 0.5f) / (sw as f32)
+            let v: f32 = ((y as f32) + 0.5f) / (sh as f32)
+            var fc: [f32; 3] = [0.0f; 3]
+            eval_far(cfg, fp, u, v, &fc)
+            var nc: [f32; 3] = [0.0f; 3]
+            let na: f32 = eval_near(cfg, u, v, &nc)
+            var c: i32 = 0
+            while c < 3 {
+                image.img_set(far, c, x, y, fc[c as usize])
+                image.img_set(near, c, x, y, nc[c as usize] * na)
+                c = c + 1
+            }
+            image.img_set(alpha, 0, x, y, na)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn blur_planes(im: *mut image.Image, sigma: f32) -> image.Image {
+    if sigma < 0.05f { return image.img_copy(im) }
+    var d: image.Image = image.img_new((*im).w, (*im).h, (*im).ch)
+    var c: i32 = 0
+    while c < (*im).ch {
+        var pl: image.Image = filter.plane_of(im, c)
+        var bl: image.Image = filter.gauss_blur(&pl, sigma)
+        var y: i32 = 0
+        while y < d.h {
+            var x: i32 = 0
+            while x < d.w {
+                image.img_set(&d, c, x, y, image.img_get(&bl, 0, x, y))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        image.img_free(&pl)
+        image.img_free(&bl)
+        c = c + 1
+    }
+    return d
+}
+
+// noise free mosaic radiance (before the exposure / sensitivity) of a frame: defocus, warp. `sharp` = no blur.
+fn compose_frame(cfg: *mut TvCfg, fp: *mut TvFrame, sharp: bool) -> image.Image {
+    let sw: i32 = (*cfg).sw
+    let sh: i32 = (*cfg).sh
+    var far: image.Image = image.img_new(sw, sh, 3)
+    var near: image.Image = image.img_new(sw, sh, 3)
+    var al: image.Image = image.img_new(sw, sh, 1)
+    render_layers(cfg, fp, &far, &near, &al)
+    var sf: f32 = 0.0f
+    var sn: f32 = 0.0f
+    if !sharp {
+        sf = (*cfg).blur_per_d * 2.0f * image.fmaxf((*fp).focus_d - (*cfg).far_d, (*cfg).far_d - (*fp).focus_d)
+        sn = (*cfg).blur_per_d * 2.0f * image.fmaxf((*fp).focus_d - (*cfg).near_d, (*cfg).near_d - (*fp).focus_d)
+        sf = sf + 0.3f
+        sn = sn + 0.3f
+    }
+    var fb: image.Image = blur_planes(&far, sf)
+    var nb: image.Image = blur_planes(&near, sn)
+    var ab: image.Image = blur_planes(&al, sn)
+    var comp: image.Image = image.img_new(sw, sh, 3)
+    var c: i32 = 0
+    while c < 3 {
+        var y: i32 = 0
+        while y < sh {
+            var x: i32 = 0
+            while x < sw {
+                let a: f32 = image.fclampf(image.img_get(&ab, 0, x, y), 0.0f, 1.0f)
+                image.img_set(&comp, c, x, y, image.img_get(&nb, c, x, y) + (1.0f - a) * image.img_get(&fb, c, x, y))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        c = c + 1
+    }
+    image.img_free(&far)
+    image.img_free(&near)
+    image.img_free(&al)
+    image.img_free(&fb)
+    image.img_free(&nb)
+    image.img_free(&ab)
+    // hand: rotation + scale + shift about the centre
+    var wp: image.Image = image.img_new(sw, sh, 3)
+    let cx: f32 = (sw as f32) * 0.5f
+    let cy: f32 = (sh as f32) * 0.5f
+    let cs: f32 = cosf((*fp).rot)
+    let sn2: f32 = sinf((*fp).rot)
+    var y2: i32 = 0
+    while y2 < sh {
+        var x2: i32 = 0
+        while x2 < sw {
+            let px: f32 = ((x2 as f32) - cx) / (*fp).scale
+            let py: f32 = ((y2 as f32) - cy) / (*fp).scale
+            let sx: f32 = cs * px - sn2 * py + cx + (*fp).dx
+            let sy: f32 = sn2 * px + cs * py + cy + (*fp).dy
+            var c2: i32 = 0
+            while c2 < 3 {
+                image.img_set(&wp, c2, x2, y2, image.img_sample(&comp, c2, sx, sy))
+                c2 = c2 + 1
+            }
+            x2 = x2 + 1
+        }
+        y2 = y2 + 1
+    }
+    image.img_free(&comp)
+    return wp
+}
+
+fn cfa_site_color(x: i32, y: i32) -> i32 {
+    if (y & 1) == 0 && (x & 1) == 0 { return 0 }
+    if (y & 1) == 1 && (x & 1) == 1 { return 2 }
+    return 1
+}
+
+fn write_mosaic(cfg: *mut TvCfg, wp: *mut image.Image, expo: f32, noisy: bool, rng: *mut image.Rng, mos: u64) {
+    let sw: i32 = (*cfg).sw
+    let sh: i32 = (*cfg).sh
+    var y: i32 = 0
+    while y < sh {
+        var x: i32 = 0
+        while x < sw {
+            let c: i32 = cfa_site_color(x, y)
+            // raw = radiance * exposure / WB gain (the G channel is the most sensitive one)
+            let x0: f32 = image.img_get(wp, c, x, y) * expo / (*cfg).wb[c as usize]
+            var v: f32 = x0
+            if noisy { v = x0 + image.sqrtf((*cfg).ns * image.fmaxf(x0, 0.0f) + (*cfg).no) * image.rng_gauss(rng) }
+            v = image.fclampf(v, 0.0f, 1.0f)
+            var cnt: f32 = (*cfg).black + v * ((*cfg).white - (*cfg).black) + 0.5f
+            if cnt > (*cfg).white { cnt = (*cfg).white }
+            *((mos + (((y * sw + x) * 2) as u64)) as *mut u16) = (cnt as i32) as u16
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// the RGGB u16 mosaic of one frame (sensor noise, clipping, black / white level)
+fn tv_frame_mosaic(cfg: *mut TvCfg, fp: *mut TvFrame, rng: *mut image.Rng, mos: u64) {
+    var wp: image.Image = compose_frame(cfg, fp, false)
+    write_mosaic(cfg, &wp, (*fp).expo, true, rng, mos)
+    image.img_free(&wp)
+}
+
+// ground truth: the same geometry / content / exposure as frame `fp`, but sharp and noise free
+fn tv_truth_mosaic(cfg: *mut TvCfg, fp: *mut TvFrame, rng: *mut image.Rng, mos: u64) {
+    var wp: image.Image = compose_frame(cfg, fp, true)
+    write_mosaic(cfg, &wp, (*fp).expo, false, rng, mos)
+    image.img_free(&wp)
+}
+
+fn tv_meta(cfg: *mut TvCfg) -> meta.SensorMeta {
+    var m: meta.SensorMeta = meta.meta_default()
+    m.cfa = 0 as u32
+    var i: usize = 0
+    while i < 4 {
+        meta.meta_set_black(&m, i, (*cfg).black, (*cfg).white)
+        meta.meta_set_noise(&m, i, (*cfg).ns, (*cfg).no)
+        i = i + 1
+    }
+    meta.meta_set_wb(&m, 0, (*cfg).wb[0])
+    meta.meta_set_wb(&m, 1, (*cfg).wb[1])
+    meta.meta_set_wb(&m, 2, (*cfg).wb[1])
+    meta.meta_set_wb(&m, 3, (*cfg).wb[2])
+    // DNG ForwardMatrix of an ideal sRGB camera: white balanced camera RGB -> XYZ D50
+    meta.meta_set_forward(&m, 0, 0.4360747f)
+    meta.meta_set_forward(&m, 1, 0.3850649f)
+    meta.meta_set_forward(&m, 2, 0.1430804f)
+    meta.meta_set_forward(&m, 3, 0.2225045f)
+    meta.meta_set_forward(&m, 4, 0.7168786f)
+    meta.meta_set_forward(&m, 5, 0.0606169f)
+    meta.meta_set_forward(&m, 6, 0.0139322f)
+    meta.meta_set_forward(&m, 7, 0.0971045f)
+    meta.meta_set_forward(&m, 8, 0.7141733f)
+    return m
+}
