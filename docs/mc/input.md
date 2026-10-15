@@ -31,3 +31,12 @@ sneak diagonal + hotbar wrap, fly with collision) vs a python re-simulation (err
 brute-force slab test (384 hits: same block, face, distance <= 1e-9); 4 box framebuffers pixel exact (incl. near clip, occlusion);
 3 build stages; 3 counter-checks (pick normal, gravity, line stepper) detected.
 Measured: input_pick ~2.0 us/call, player_tick ~170 us (256 chunks; linear `world_find` dominates).
+
+## s8 (15.10.)
+* The `InputTables.solid` / `BlockGrid.solid` tables are u16 per state now (codes 0, 1..127 full, 128 + k shape k; room for 65407 shapes; the player's
+  class table `Player.cls` has `CLS_N` = 65536 entries). `mc_shapes.shapes_fill` writes u16. New shapes (panes, bars, anvil, cauldron, hopper, low blocks) still to add (r211).
+* Sneak edge live: `bash tools/mc/play/run_edge.sh [MC_VERSION]` -- 5x5 platform 5 blocks up, sneaking W / W+D stops at z <= 5.30 / x >= -2.30, never falls, client == server
+  position, no "moved wrongly"; control without sneak falls. 1.20.1 green (z 5295, x -2295 mm).
+* Sneak packets (measured against real servers, `tools/mcclient/sneak_probe.sh`): <= 1.21.5 Entity Action 0 / 1, 1.21.2+ also Player Input (shift), 1.21.6+ Player Input only.
+  1.21.4+ ignores both until Player Loaded (0x2A on 1.21.4) arrived (or ~3 s passed): `mc_play.send_loaded` after the first chunks.
+
