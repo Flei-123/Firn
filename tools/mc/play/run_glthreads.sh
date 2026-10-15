@@ -50,7 +50,7 @@ export DISPLAY=:$DN
 # llvmpipe spins one rasterizer thread per core (32 here): on a loaded box that starves the frame -> small fixed pool
 export LP_NUM_THREADS=${LP_NUM_THREADS:-4}
 ERR=0
-num() { grep -o "$2=[0-9]*" "$W/$1.out" | tail -1 | cut -d= -f2; }
+num() { grep "^mcplay: end " "$W/$1.out" | grep -o " $2=[0-9]*" | tail -1 | cut -d= -f2; } # only the end line: entities_draw / vk lines also carry frames=
 run_one() { # name, workers
     local name=$1 wk=$2
     MCPLAY_GL=1 MCPLAY_WORKERS=$wk MCPLAY_VSYNC=0 FIRN_AUDIO=null MCPLAY_RUN_S=${GL_RUN_S:-8} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=${GL_W:-640} MCPLAY_H=${GL_H:-360} MCPLAY_SHOT="$W/$name.png" \
