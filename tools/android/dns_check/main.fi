@@ -1,0 +1,192 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/android/dns_check/main.fi -- the DNS resolver INSIDE an Android app
+// (roadmap r86/r74). Driven by tools/android/dns_check.sh; arguments come
+// from assets/args.txt (one per line):  <fake server ip> <port> <name>...
+//
+// Prints to stdout (= stdout.txt in the app's files directory), one line each:
+//
+//   CONF resolv <octets> nameservers=<n>     what lib/@android/net/dnsconf.fi found
+//   CONF hosts <octets>
+//   PROP <text> <0|1>                        prop_ipv4_ok on fixed strings
+//   SERVERS <n>                              resolver_init: configured or fallback
+//   LOCALHOST <addr>                         resolved through the hosts table
+//   FAKE <name> OK <addr> | ERR <variant>    asked at the fake server only
+//   SYS <name> OK <addr> | ERR <variant>     the default resolver (real network)
+//   DONE
+//
+// The program then waits for Escape / Back so that the harness can read the file.
+import std.rt
+import std.net
+import net.dns
+import net.dnsconf
+import window.window
+
+fn say(out: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_push_bytes(out, p, n)
+}
+
+fn nl(out: *mut rt.Buf) {
+    rt.buf_push(out, 10 as u8)
+}
+
+fn parse_u32(p: u64, n: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < n {
+        v = v * 10 as u32 + (rt.ld8(p, i) - 48 as u8) as u32
+        i = i + 1
+    }
+    return v
+}
+
+fn count_nameservers(p: u64, n: usize) -> usize {
+    var word: [u8; 10] = "nameserver"
+    var c: usize = 0
+    var i: usize = 0
+    while i + 10 <= n {
+        var same: bool = true
+        var k: usize = 0
+        while k < 10 {
+            if rt.ld8(p, i + k) != word[k] {
+                same = false
+            }
+            k = k + 1
+        }
+        if same && (i == 0 || rt.ld8(p, i - 1) == 10 as u8) {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+fn prop_line(out: *mut rt.Buf, text: str) {
+    var w: [u8; 5] = "PROP "
+    say(out, (&w[0]) as u64, 5)
+    say(out, text.p as u64, text.n)
+    rt.buf_push(out, 32 as u8)
+    if dnsconf.prop_ipv4_ok(text.p as u64, text.n) {
+        rt.buf_push(out, 49 as u8)
+    } else {
+        rt.buf_push(out, 48 as u8)
+    }
+    nl(out)
+}
+
+fn answer(out: *mut rt.Buf, res: *mut dns.Resolver, tag: str, name: u64, nlen: usize) {
+    var o: dns.Resolved = dns.resolved_new()
+    let ok: bool = dns.dns_resolve(res, name, nlen, dns.T_A, &o) catch false
+    say(out, tag.p as u64, tag.n)
+    rt.buf_push(out, 32 as u8)
+    say(out, name, nlen)
+    if ok && o.n > 0 {
+        var okw: [u8; 4] = " OK "
+        say(out, (&okw[0]) as u64, 4)
+        net.ipv4_text(o.addr[0], out)
+    } else {
+        var er: [u8; 5] = " ERR "
+        say(out, (&er[0]) as u64, 5)
+        dns.dns_err_name(dns.resolver_last_error(res), out)
+    }
+    nl(out)
+}
+
+fn run(start: u64) {
+    var out: rt.Buf = rt.buf_new()
+    // what the Android config module found
+    var conf: rt.Buf = rt.buf_new()
+    let have: bool = dnsconf.conf_resolv(&conf)
+    var w1: [u8; 12] = "CONF resolv "
+    say(&out, (&w1[0]) as u64, 12)
+    rt.buf_push_dec_u64(&out, conf.len as u64)
+    var w2: [u8; 13] = " nameservers="
+    say(&out, (&w2[0]) as u64, 13)
+    rt.buf_push_dec_u64(&out, count_nameservers(conf.ptr, conf.len) as u64)
+    nl(&out)
+    rt.buf_free(&conf)
+    var hosts: rt.Buf = rt.buf_new()
+    let hh: bool = dnsconf.conf_hosts(&hosts)
+    var w3: [u8; 11] = "CONF hosts "
+    say(&out, (&w3[0]) as u64, 11)
+    rt.buf_push_dec_u64(&out, hosts.len as u64)
+    nl(&out)
+    rt.buf_free(&hosts)
+    prop_line(&out, "8.8.8.8")
+    prop_line(&out, "10.0.2.3")
+    prop_line(&out, "256.1.1.1")
+    prop_line(&out, "1.2.3")
+    prop_line(&out, "1.2.3.4.5")
+    prop_line(&out, "1..2.3")
+    prop_line(&out, "a.b.c.d")
+    prop_line(&out, "1.2.3.4x")
+    // the default resolver
+    var res: dns.Resolver = dns.resolver_new()
+    let init: bool = dns.resolver_init(&res)
+    var w4: [u8; 8] = "SERVERS "
+    say(&out, (&w4[0]) as u64, 8)
+    rt.buf_push_dec_u64(&out, dns.resolver_server_count(&res) as u64)
+    nl(&out)
+    var lh: [u8; 9] = "localhost"
+    answer(&out, &res, "LOCALHOST", (&lh[0]) as u64, 9)
+    let argc: usize = rt.arg_count(start)
+    if argc >= 3 {
+        let ip_p: u64 = rt.arg_ptr(start, 1)
+        let ip_n: usize = rt.c_length(ip_p)
+        let port_p: u64 = rt.arg_ptr(start, 2)
+        var ip: u32 = 0
+        var fake: dns.Resolver = dns.resolver_new()
+        let fi: bool = dns.resolver_init(&fake)
+        if dns.dns_parse_ipv4(ip_p, ip_n, &ip) {
+            dns.resolver_clear_servers(&fake)
+            dns.resolver_add_server(&fake, ip)
+            dns.resolver_set_port(&fake, parse_u32(port_p, rt.c_length(port_p)) as u16)
+            dns.resolver_set_timeout(&fake, 1500 as u64)
+            dns.resolver_set_retries(&fake, 1 as u32)
+        }
+        var i: usize = 3
+        while i < argc {
+            let np: u64 = rt.arg_ptr(start, i)
+            let nn: usize = rt.c_length(np)
+            if rt.ld8(np, 0) == 126 as u8 {
+                // "~name": the DEFAULT resolver (real network)
+                answer(&out, &res, "SYS", np + 1 as u64, nn - 1)
+            } else {
+                answer(&out, &fake, "FAKE", np, nn)
+            }
+            i = i + 1
+        }
+        dns.resolver_free(&fake)
+    }
+    var dn: [u8; 5] = "DONE\n"
+    say(&out, (&dn[0]) as u64, 5)
+    rt.write_everything(1, out.ptr, out.len)
+    rt.buf_free(&out)
+    dns.resolver_free(&res)
+}
+
+fn main(start: u64) -> i32 {
+    var f: window.Window = window.window_new()
+    if !window.open_window(&f, 0) {
+        return 1
+    }
+    if !window.make(&f, 360, 640) {
+        return 2
+    }
+    let s: bool = window.show_window(&f)
+    run(start)
+    var runs: bool = true
+    while runs {
+        let w: bool = window.wait_event(&f, -1)
+        var k: u32 = window.next_event(&f)
+        while k != window.EV_NONE {
+            if k == window.EV_CLOSED {
+                runs = false
+            } else if k == window.EV_KEY && window.ev_a(&f) == window.K_ESCAPE {
+                runs = false
+            }
+            k = window.next_event(&f)
+        }
+    }
+    window.close_window(&f)
+    return 0
+}

@@ -44,6 +44,18 @@ if "$FIRNC" -o "$WORK/idn_tool" tools/dns/idn_main.fi 2> "$WORK/i.log"; then
 else
     echo "  FAIL tools/dns/idn_main.fi does not build"; rc=1
 fi
+# lib/net/dnsmini.fi: the #[no_gc] A lookup of the Android push thread (r74),
+# against the same fake server, in three stages
+for STAGE in "opt:" "noopt:--no-opt" "dev:--opt-level=dev-fast"; do
+    NAME=${STAGE%%:*}; OPT=${STAGE#*:}
+    if "$FIRNC" $OPT -o "$WORK/dnsmini_$NAME" lib/net/dnsmini_main.fi 2> "$WORK/m.log"; then
+        python3 tools/dns/mini_check.py "$WORK/dnsmini_$NAME" > "$WORK/mc.log" 2>&1 \
+            || { grep -v "^  ok" "$WORK/mc.log"; rc=1; }
+        tail -1 "$WORK/mc.log"
+    else
+        echo "  FAIL lib/net/dnsmini_main.fi does not build ($NAME)"; grep -v RWX "$WORK/m.log" | head -5; rc=1
+    fi
+done
 echo "== the same checks, dev-fast build =="
 python3 tools/dns/check.py "$WORK/dns_main_dev" "$WORK/http_main_dev" | grep -v "^  OK" || rc=1
 

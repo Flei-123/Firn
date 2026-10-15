@@ -17,6 +17,7 @@ Behaviour by name (all under `.test`):
   nx.test         NXDOMAIN
   fail.test       SERVFAIL
   silent.test     never answers
+  relay.test      A 10.0.2.2 (the emulator's name for the host)
   counted.test    A 192.0.2.9; every question is counted, `Q` on the control
                   line is not needed -- the count is printed to stderr
 Every other name: NXDOMAIN.  Questions are logged on stderr as `Q <name>
@@ -35,6 +36,7 @@ A = {
     'other.test': ['127.0.0.1'],
     'counted.test': ['192.0.2.9'],
     'dual.test': ['192.0.2.7'],
+    'relay.test': ['10.0.2.2'],  # the host as the Android emulator sees it (tools/android/dns_check.sh)
 }
 AAAA = {'dual.test': ['2001:db8::7']}
 CNAMES = {'chain.test': 'mid.test', 'mid.test': 'end.test'}

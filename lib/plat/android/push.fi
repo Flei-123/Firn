@@ -38,7 +38,13 @@
 //
 // ============================================================ LIMITS
 //
-// L1 The relay address is a dotted IPv4 address (no name lookup here yet).
+// L1 The relay is a dotted IPv4 address OR a host name. A name is resolved
+//    on the push thread at EVERY connect (the relay may move; the service
+//    can outlive the program) by lib/net/dnsmini.fi -- IPv4/UDP only, no
+//    cache. Name servers: `push_set_dns` (optional, kept in firn-push.cfg),
+//    else net.dns1..4 (hidden from apps since Android 8), else 8.8.8.8 and
+//    1.1.1.1. A name that does not resolve is a failed connect: retried
+//    every 3 s like an unreachable address.
 // L2 One line = one message, at most 1000 octets, UTF-8. JNI wants MODIFIED
 //    UTF-8: an emoji is handed over as a surrogate pair (utf_sauber).
 // L3 No TLS: the connection is plain TCP. For anything but a test the
@@ -46,8 +52,10 @@
 import android.ndk
 import android.jnicall
 import android.activity
+import net.dnsmini
 
 export {
+    push_set_dns,
     push_start, push_stop, push_notify, push_running, push_keep,
     push_notify_at, push_shown, push_cancel,
     Java_org_firn_FirnService_onStartCommand,
@@ -160,6 +168,9 @@ const S_L_CANCEL: usize = 2132 // notification cancelled for key
 #[no_gc]
 extern fn usleep(us: u32) -> i32;
 #[no_gc]
+#[link_name(__system_property_get)]
+extern fn system_property_get(name: u64, value: u64) -> i32;
+#[no_gc]
 extern fn pthread_create(tid: u64, attr: u64, start: u64, arg: u64) -> i32;
 
 // ------------------------------------------------------- shared state
@@ -169,7 +180,9 @@ const P_PORT: u64 = 64
 const P_TID: u64 = 72
 const P_BYTES: usize = 4096
 
+const P_DNS: u64 = 80 // u64: server (host order) | port << 32; 0 = system
 static mut G_P: u64 = 0
+static mut G_DNS: u64 = 0 // the same value, set by the program before push_start
 static mut G_VM: u64 = 0
 static mut G_SVC: u64 = 0 // global reference to the running service
 static mut G_APP: u64 = 0 // global reference to the application context
@@ -805,6 +818,48 @@ fn push_start(host: u64, port: u32) -> bool {
     }
     content[n] = 10 as u8
     n = n + 1
+    if G_DNS != 0 as u64 && n + 24 <= 96 {
+        // third line: the name server, "a.b.c.d:port"
+        let ds: u32 = (G_DNS & 4294967295 as u64) as u32
+        var sh: u32 = 24 as u32
+        var o: usize = 0
+        while o < 4 {
+            let v: u32 = (ds >> sh) & 255 as u32
+            if v >= 100 as u32 {
+                content[n] = (48 as u32 + v / 100 as u32) as u8
+                n = n + 1
+            }
+            if v >= 10 as u32 {
+                content[n] = (48 as u32 + (v / 10 as u32) % 10 as u32) as u8
+                n = n + 1
+            }
+            content[n] = (48 as u32 + v % 10 as u32) as u8
+            n = n + 1
+            if o < 3 {
+                content[n] = 46 as u8
+                n = n + 1
+                sh = sh - 8 as u32
+            }
+            o = o + 1
+        }
+        content[n] = 58 as u8
+        n = n + 1
+        var dg: [u8; 8] = [0 as u8; 8]
+        var dk: usize = 0
+        var dp: u32 = ((G_DNS >> 32) & 65535 as u64) as u32
+        while dk == 0 || dp > 0 as u32 {
+            dg[dk] = (48 as u32 + dp % 10 as u32) as u8
+            dp = dp / 10 as u32
+            dk = dk + 1
+        }
+        while dk > 0 {
+            dk = dk - 1
+            content[n] = dg[dk]
+            n = n + 1
+        }
+        content[n] = 10 as u8
+        n = n + 1
+    }
     let fd: i64 = syscall(2, (&path[0]) as i64, 577, 384, 0, 0, 0)
     if fd < 0 {
         return false
@@ -913,9 +968,142 @@ fn ipv4(p: u64) -> u32 {
     return parts[0] | (parts[1] << 8) | (parts[2] << 16) | (parts[3] << 24)
 }
 
+// ------------------------------------------------- the relay by name
+
+// net.dns1 .. net.dns4 into `out` (host order); how many. Android 8+ hides
+// them from apps, then this is 0.
+#[no_gc]
+fn system_dns(out: u64) -> usize {
+    var name: [u8; 9] = [0 as u8; 9]
+    name[0] = 110 as u8 // n
+    name[1] = 101 as u8 // e
+    name[2] = 116 as u8 // t
+    name[3] = 46 as u8 // .
+    name[4] = 100 as u8 // d
+    name[5] = 110 as u8 // n
+    name[6] = 115 as u8 // s
+    var val: [u8; 92] = [0 as u8; 92]
+    var got: usize = 0
+    var k: usize = 1
+    while k <= 4 {
+        name[7] = (48 + k) as u8
+        name[8] = 0 as u8
+        val[0] = 0 as u8
+        let n: i32 = system_property_get((&name[0]) as u64, (&val[0]) as u64)
+        if n > 0 {
+            let a: u32 = ipv4((&val[0]) as u64)
+            if a != 0 as u32 {
+                *((out + (got * 4) as u64) as *mut u32) = (a << 24)
+                | ((a & 65280 as u32) << 8) | ((a >> 8) & 65280 as u32)
+                | (a >> 24)
+                got = got + 1
+            }
+        }
+        k = k + 1
+    }
+    return got
+}
+
+// The relay's host name -> an address in sockaddr representation, 0 = none.
+#[no_gc]
+fn resolve_relay() -> u32 {
+    var servers: [u32; 6] = [0; 6]
+    var port: u16 = 53 as u16
+    var count: usize = 0
+    let own: u64 = *((G_P + P_DNS) as *mut u64)
+    if own != 0 as u64 {
+        servers[0] = (own & 4294967295 as u64) as u32
+        port = ((own >> 32) & 65535 as u64) as u16
+        count = 1
+    } else {
+        count = system_dns((&servers[0]) as u64)
+        if count == 0 {
+            servers[0] = 134744072 as u32 // 8.8.8.8
+            servers[1] = 16843009 as u32 // 1.1.1.1
+            count = 2
+        }
+    }
+    return dnsmini.mini_lookup(G_P + P_HOST, length(G_P + P_HOST),
+        (&servers[0]) as u64, count, port, 2000 as u64)
+}
+
+// "a.b.c.d" or "a.b.c.d:port" (ends at 0 or a line feed) -> the server in
+// host order | port << 32 (port 53 when none); 0 = not that.
+#[no_gc]
+fn dns_spec(p: u64, n: usize) -> u64 {
+    var parts: [u32; 4] = [0; 4]
+    var k: usize = 0
+    var digits: usize = 0
+    var i: usize = 0
+    var port: u64 = 0
+    var in_port: bool = false
+    while i < n {
+        let c: u8 = *((p + i as u64) as *mut u8)
+        if c == 0 as u8 || c == 10 as u8 {
+            break
+        }
+        if c >= 48 as u8 && c <= 57 as u8 {
+            if in_port {
+                port = port * 10 + (c - 48 as u8) as u64
+                if port > 65535 {
+                    return 0 as u64
+                }
+            } else {
+                parts[k] = parts[k] * 10 as u32 + (c - 48 as u8) as u32
+                if parts[k] > 255 as u32 {
+                    return 0 as u64
+                }
+            }
+            digits = digits + 1
+        } else if c == 46 as u8 && !in_port && digits > 0 && k < 3 {
+            k = k + 1
+            digits = 0
+        } else if c == 58 as u8 && !in_port && k == 3 && digits > 0 {
+            in_port = true
+            digits = 0
+        } else {
+            return 0 as u64
+        }
+        i = i + 1
+    }
+    if k != 3 || digits == 0 {
+        return 0 as u64
+    }
+    if !in_port {
+        port = 53
+    }
+    if port == 0 {
+        return 0 as u64
+    }
+    let a: u64 = ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) as u64
+    return a | (port << 32)
+}
+
+// Use this name server for the relay's name instead of the system's:
+// `spec` is "a.b.c.d" or "a.b.c.d:port" (zero terminated; port 53 when
+// none). Call BEFORE push_start; it is kept in firn-push.cfg for the
+// restarted service. An empty text or 0 = back to the system's servers.
+// false = not an address (nothing changed).
+#[no_gc]
+fn push_set_dns(spec: u64) -> bool {
+    if spec == 0 || *(spec as *mut u8) == 0 as u8 {
+        G_DNS = 0 as u64
+        return true
+    }
+    let v: u64 = dns_spec(spec, length(spec))
+    if v == 0 as u64 {
+        return false
+    }
+    G_DNS = v
+    return true
+}
+
 #[no_gc]
 fn join() -> i64 {
-    let adr: u32 = ipv4(G_P + P_HOST)
+    var adr: u32 = ipv4(G_P + P_HOST)
+    if adr == 0 as u32 {
+        adr = resolve_relay()
+    }
     let port: u64 = *((G_P + P_PORT) as *mut u64)
     if adr == 0 as u32 || port == 0 || port > 65535 {
         return -1
@@ -1053,6 +1241,16 @@ fn config_read(env: u64, svc: u64) -> bool {
         i = i + 1
     }
     *((b + P_PORT) as *mut u64) = port
+    // optional third line: the name server "a.b.c.d[:port]"
+    *((b + P_DNS) as *mut u64) = 0 as u64
+    while i < n as usize && content[i] != 10 as u8 {
+        i = i + 1
+    }
+    i = i + 1
+    if i < n as usize {
+        *((b + P_DNS) as *mut u64) = dns_spec((&content[0]) as u64 + i as u64,
+            n as usize - i)
+    }
     return port > 0
 }
 

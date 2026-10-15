@@ -18,6 +18,65 @@ links a `.so` that exports only `firn_activity_create`, writes the manifest
 and signs with a key kept in `~/.firn/android.keystore` (keep it: an update
 needs the same key).
 
+## Signing (`tools/android/build.sh`)
+
+Every APK is signed with `apksigner` and then **verified**: the v2 or v3
+signature must check out and the signer certificate (SHA-256) must be the one
+of the keystore -- or of `EXPECT_CERT_SHA256`, a pin you can keep in your
+release script. A mismatch fails the build. The build prints
+`signed + verified: cert SHA-256 <hex>`.
+
+| Variable | Meaning |
+|---|---|
+| `KEYSTORE` | keystore file (default `~/.firn/android.keystore`) |
+| `KSALIAS` | key alias (default `firn`) |
+| `KSPASS` / `KSPASS_FILE` | store password / a file whose first line is it |
+| `KEYPASS` / `KEYPASS_FILE` | key password (default: the store password) |
+| `FIRN_RELEASE=1` or `--release` | a missing keystore is an **error**; without it a missing keystore is created once (debug convenience) |
+| `EXPECT_CERT_SHA256` | the certificate the APK has to carry |
+
+Passwords go to `keytool`/`apksigner` through the environment, never through
+argv. Do not put a password into the repo: set `KSPASS_FILE` to a file with
+mode 600 outside it. The default password of the first-time key is the one
+the build has always used; for a release key choose your own and keep it in
+`KSPASS_FILE`.
+
+### Backup of the signing key
+
+The keystore **is** the identity of every app signed with it: Android installs
+an update only over an APK with the same certificate. Lose the file and
+existing installs can never be updated again (users have to uninstall).
+
+1. Copy the file to at least two places that are not this machine:
+   `install -m 600 ~/.firn/android.keystore /safe/place/android.keystore.$(date +%F)`
+   (an encrypted USB stick, the password manager's file store, an offline
+   disk). Keep the password with it, but **not** in the same place.
+2. Write the fingerprint down (and use it as the pin):
+   `keytool -list -keystore ~/.firn/android.keystore -alias firn`
+   -- `SHA-256` line; or read it from any built APK with
+   `apksigner verify --print-certs app.apk`.
+3. Restore: put the file back at `~/.firn/android.keystore` (mode 600) and
+   build with `--release`; the build verifies the certificate against the
+   pin, so a wrong file is caught before a wrong APK is shipped.
+4. Never commit the keystore or the password; never regenerate the key for a
+   release (`--release` refuses to).
+
+## Names (DNS) on Android
+
+* `import net.dns` works in an Android app as on Linux. The config source is
+  `lib/@android/net/dnsconf.fi` (platform directory, no compiler switch):
+  `/etc/resolv.conf` if it exists, else the properties `net.dns1..4` /
+  `dhcp.wlan0.dns1..4` / `dhcp.eth0.dns1..4`, else the public fallback of
+  `dns.fi` (1.1.1.1, 8.8.8.8). Since Android 8 the properties are hidden from
+  apps, so in practice a phone uses the fallback; asking the network's own
+  resolver needs `ConnectivityManager` through JNI (open).
+* `lib/plat/android/push.fi`: the relay may be a **host name**. The push thread
+  resolves it at every connect with `lib/net/dnsmini.fi` (a `#[no_gc]` A lookup,
+  IPv4/UDP, no cache). `push_set_dns("a.b.c.d[:port]")` before `push_start`
+  picks a name server; it is kept in `firn-push.cfg` (3rd line). No TLS yet.
+* Test: `bash tools/android/dns_check.sh` (emulator; a fake DNS server on the
+  host as 10.0.2.2) and `bash tools/dns/run.sh` (dnsmini on Linux).
+
 ## The pieces
 
 | File | What it does |
