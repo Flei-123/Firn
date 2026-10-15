@@ -72,8 +72,15 @@ class EntityTracker {
         this.count.teleport++
         const e = this.ents.get(p.entityId)
         if (!e) { this.count.miss++; return }
-        e.x = this.pos(p.x); e.y = this.pos(p.y); e.z = this.pos(p.z)
-        if (p.v21) { e.yaw = p.yaw; e.pitch = p.pitch } else { e.yaw = this.angle(p.yaw); e.pitch = this.angle(p.pitch) } // v21: float degrees
+        if (p.v21) {
+          // 1.21.2+: a set flag bit = relative to the known value (float degrees for the angles)
+          const fl = p.flags | 0
+          e.x = (fl & 1) ? e.x + p.x : p.x; e.y = (fl & 2) ? e.y + p.y : p.y; e.z = (fl & 4) ? e.z + p.z : p.z
+          e.yaw = (fl & 8) ? e.yaw + p.yaw : p.yaw; e.pitch = (fl & 16) ? e.pitch + p.pitch : p.pitch
+        } else {
+          e.x = this.pos(p.x); e.y = this.pos(p.y); e.z = this.pos(p.z)
+          e.yaw = this.angle(p.yaw); e.pitch = this.angle(p.pitch)
+        }
         e.ground = !!p.onGround
         return
       }

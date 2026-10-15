@@ -68,6 +68,7 @@ fi
 if [ -z "$ONLY" ] || [ "$ONLY" = ajplay ]; then
     echo "== mc/ajplay =="
     bash tools/mc/play/run_aj.sh || ERR=$((ERR+1))
+    MC_VERSION=1.21.4 bash tools/mc/play/run_aj.sh || ERR=$((ERR+1))   # u32 flags + delta (protocol 769)
 fi
 if [ $ERR -eq 0 ]; then echo "RESULT mc: ok"; else echo "RESULT mc: $ERR failing parts"; fi
 exit $ERR

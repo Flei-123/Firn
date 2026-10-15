@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# tools/mc/play/run_aj.sh -- mcplay Auto-Jump + relative position flags against the official 1.20.1 server (flat world, creative, offline).
+# tools/mc/play/run_aj.sh -- mcplay Auto-Jump + relative position flags against the official server (MC_VERSION, default 1.20.1; 1.21.4 = u32 flags + delta, protocol 769) (flat world, creative, offline).
 # Session A (MCPLAY_AUTOJUMP unset): walks (W) against a 1 block stone step and must STAY below it.
 # Session B (MCPLAY_AUTOJUMP=1): first `execute as <p> at @s run tp @s ~2 ~6 ~` (the server sends relative flags): the client must end at x+2
 #   (server `data get entity` agrees with the client position), then it walks (W) against the step and must climb onto it.
 # Both: no "moved too quickly" / "moved wrongly" in server.log, at most 4 Synchronize Player Position packets (join + tp + tp rel + slack).
-# Env: FIRNC, AJ_RUN_S (50), AJ_KEEP_DIR (copy of outs + server.log, always). Start it via heavy (java server).
+# Env: MC_VERSION (1.20.1|1.21.1|1.21.4|1.21.8|1.21.11|26.1), FIRNC, AJ_RUN_S (50), AJ_KEEP_DIR (copy of outs + server.log, always). Start it via heavy (java server).
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 FIRNC=${FIRNC:-compiler/target/release/firnc}
@@ -17,7 +17,11 @@ trap cleanup EXIT
 fail() { echo "  FAIL  $1"; echo "RESULT mc-play-aj: FAIL"; exit 1; }
 for t in Xvfb xdotool java; do command -v $t >/dev/null || fail "missing tool: $t"; done
 $FIRNC -o "$W/mcplay" demos/mcplay/main.fi 2>"$W/err" || { head -10 "$W/err"; fail "demos/mcplay does not compile"; }
-MCV=1.20.1
+MCV=${MC_VERSION:-1.20.1}
+case "$MCV" in 1.20.1) PROTO=763;; 1.21.1) PROTO=767;; 1.21.4) PROTO=769;; 1.21.8) PROTO=772;; 1.21.11) PROTO=774;; 26.1) PROTO=775;; *) PROTO=${MCPLAY_PROTOCOL:-0};; esac
+[ "$PROTO" != 0 ] || fail "unknown version $MCV (set MCPLAY_PROTOCOL)"
+export MCPLAY_PROTOCOL=$PROTO
+JAVA=${JAVA:-/usr/bin/java}; [ -x /root/tools/jdk25/bin/java ] && case "$MCV" in 1.2[1-9]*|26*) JAVA=/root/tools/jdk25/bin/java ;; esac
 mkdir -p "$W/srv"
 bash tools/mcclient/fetch_server.sh "$W/srv" "$MCV" || fail "server download"
 echo "eula=true" > "$W/srv/eula.txt"
@@ -40,7 +44,7 @@ enable-rcon=false
 enable-query=false
 PROPS
 mkfifo "$W/in"; exec 3<>"$W/in"
-( cd "$W/srv" && exec "${JAVA:-/usr/bin/java}" -Xmx1G -Xms256M -jar server.jar nogui < "$W/in" > "$W/server.log" 2>&1 ) &
+( cd "$W/srv" && exec "$JAVA" -Xmx1G -Xms256M -jar server.jar nogui < "$W/in" > "$W/server.log" 2>&1 ) &
 SRV_PID=$!
 for i in $(seq 1 180); do grep -q 'Done (' "$W/server.log" 2>/dev/null && break; kill -0 "$SRV_PID" 2>/dev/null || break; sleep 1; done
 grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did not start"; }
