@@ -42,7 +42,7 @@ struct FocusOpts {
     base_ref: i32,    // coarsest low-pass from the reference frame (else the mean of all frames)
     norm_expo: i32,   // brightness normalisation of every frame to the reference (global ratio + local gain map)
     consist: i32,     // consistency map against the reference (moving content, flicker, exposure)
-    auto_ref: i32,    // reference = sharpest frame of the middle half (else frame n / 2)
+    auto_ref: i32,    // reference = sharpest frame of the middle half (1), of all frames (2), else frame n / 2
     ref_floor: f32,   // sharpness energy below which the reference wins (noise free units)
     consist_tau: f32, // tolerance factor of the consistency map (1 = 15 % relative difference)
     noise_s: f32,     // noise model of the frames (variance = s * value + o) for the noise floor, 0 = none
@@ -398,27 +398,127 @@ fn apply_gain(im: *mut image.Image, gg: *mut image.Image, f: i32) {
     }
 }
 
-// consistency (0..1) per grid cell: blurred luma of the frame vs the blurred reference, relative difference
-// against a 15 % tolerance: defocus differences stay below it, moving content / flicker / exposure do not
+// mean RGB of f x f blocks (3 channels)
+fn grid_rgb(im: *mut image.Image, f: i32) -> image.Image {
+    let gw: i32 = ((*im).w + f - 1) / f
+    let gh: i32 = ((*im).h + f - 1) / f
+    var g: image.Image = image.img_new(gw, gh, 3)
+    var y: i32 = 0
+    while y < gh {
+        var x: i32 = 0
+        while x < gw {
+            var c: i32 = 0
+            while c < 3 {
+                var s: f32 = 0.0f
+                var n: f32 = 0.0f
+                var yy: i32 = y * f
+                while yy < (y + 1) * f && yy < (*im).h {
+                    var xx: i32 = x * f
+                    while xx < (x + 1) * f && xx < (*im).w {
+                        s = s + image.img_get(im, c, xx, yy)
+                        n = n + 1.0f
+                        xx = xx + 1
+                    }
+                    yy = yy + 1
+                }
+                image.img_set(&g, c, x, y, s / n)
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return g
+}
+
+fn blur3(g: *mut image.Image, sigma: f32) -> image.Image {
+    var out: image.Image = image.img_new((*g).w, (*g).h, 3)
+    var c: i32 = 0
+    while c < 3 {
+        var ch: image.Image = image.img_new((*g).w, (*g).h, 1)
+        var y: i32 = 0
+        while y < (*g).h {
+            var x: i32 = 0
+            while x < (*g).w {
+                image.img_set(&ch, 0, x, y, image.img_get(g, c, x, y))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        let bl: image.Image = filter.gauss_blur(&ch, sigma)
+        y = 0
+        while y < (*g).h {
+            var x: i32 = 0
+            while x < (*g).w {
+                image.img_set(&out, c, x, y, image.img_get(&bl, 0, x, y))
+                x = x + 1
+            }
+            y = y + 1
+        }
+        image.img_free(&ch)
+        image.img_free(&bl)
+        c = c + 1
+    }
+    return out
+}
+
+// Consistency of a frame with the reference on the block grid: 1 = same content (up to 15 % * tau relative
+// difference in ANY colour channel), -> 0 = moving content / flicker / exposure change. Colour channels matter
+// (a video block can change hue at equal luma); the map is eroded by one cell so blends near moving edges are rejected.
 fn consist_grid(gref_c: *mut image.Image, gl: *mut image.Image, tau: f32) -> image.Image {
-    var a: image.Image = filter.gauss_blur(gl, 1.2f)
+    var a: image.Image = blur3(gl, 1.2f)
     var c: image.Image = image.img_new((*gl).w, (*gl).h, 1)
     var y: i32 = 0
     while y < (*gl).h {
         var x: i32 = 0
         while x < (*gl).w {
-            let va: f32 = image.img_get(&a, 0, x, y)
-            let vb: f32 = image.img_get(gref_c, 0, x, y)
-            var d: f32 = va - vb
-            if d < 0.0f { d = 0.0f - d }
-            let t: f32 = d / ((0.003f + 0.15f * 0.5f * (va + vb)) * tau)
+            var t: f32 = 0.0f
+            var ch: i32 = 0
+            while ch < 3 {
+                let va: f32 = image.img_get(&a, ch, x, y)
+                let vb: f32 = image.img_get(gref_c, ch, x, y)
+                var d: f32 = va - vb
+                if d < 0.0f { d = 0.0f - d }
+                let tc: f32 = d / ((0.003f + 0.15f * 0.5f * (va + vb)) * tau)
+                if tc > t { t = tc }
+                ch = ch + 1
+            }
             image.img_set(&c, 0, x, y, image.expneg(t * t))
             x = x + 1
         }
         y = y + 1
     }
     image.img_free(&a)
-    return c
+    // erode: minimum over the 3x3 neighbourhood
+    var e: image.Image = image.img_new((*gl).w, (*gl).h, 1)
+    y = 0
+    while y < (*gl).h {
+        var x: i32 = 0
+        while x < (*gl).w {
+            var m: f32 = 1.0f
+            var dy: i32 = -1
+            while dy <= 1 {
+                var dx: i32 = -1
+                while dx <= 1 {
+                    var xx: i32 = x + dx
+                    var yy: i32 = y + dy
+                    if xx < 0 { xx = 0 }
+                    if yy < 0 { yy = 0 }
+                    if xx >= (*gl).w { xx = (*gl).w - 1 }
+                    if yy >= (*gl).h { yy = (*gl).h - 1 }
+                    let v: f32 = image.img_get(&c, 0, xx, yy)
+                    if v < m { m = v }
+                    dx = dx + 1
+                }
+                dy = dy + 1
+            }
+            image.img_set(&e, 0, x, y, m)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    image.img_free(&c)
+    return e
 }
 
 // sharpest frame of the middle half (relative to its mean brightness), else frame n / 2
@@ -429,7 +529,12 @@ fn pick_ref(b: *mut merge.Burst, o: *mut FocusOpts) -> i32 {
     var best: i32 = n / 2
     var bs: f32 = -1.0f
     var i: i32 = n / 4
-    while i <= n - 1 - n / 4 {
+    var i_end: i32 = n - 1 - n / 4
+    if (*o).auto_ref >= 2 {
+        i = 0
+        i_end = n - 1
+    }
+    while i <= i_end {
         let s: f32 = image.sharpness(&(*b).frames[i as usize], 1)
         let m: f32 = image.img_mean(&(*b).frames[i as usize], 1)
         let rs: f32 = s / (m * m + 1.0e-6f)
@@ -574,9 +679,9 @@ fn focus_stack(b: *mut merge.Burst, o: *mut FocusOpts, out: *mut image.Image, de
     let w: i32 = (*b).frames[r as usize].w
     let h: i32 = (*b).frames[r as usize].h
     let levels: i32 = pyr_levels(w, h)
-    var gf: i32 = w / 80
+    var gf: i32 = w / 160
     if gf < 1 { gf = 1 }
-    if gf > 16 { gf = 16 }
+    if gf > 8 { gf = 8 }
     var lr: image.Image = image.img_luma(&(*b).frames[r as usize])
     if (*o).align_blur > 0.0f {
         let lb: image.Image = filter.gauss_blur(&lr, (*o).align_blur)
@@ -587,7 +692,9 @@ fn focus_stack(b: *mut merge.Burst, o: *mut FocusOpts, out: *mut image.Image, de
     image.img_free(&lr)
     // reference grids: plain luma, blurred for the consistency check
     var gref: image.Image = grid_luma(&(*b).frames[r as usize], gf)
-    var gref_c: image.Image = filter.gauss_blur(&gref, 1.2f)
+    var gref3: image.Image = grid_rgb(&(*b).frames[r as usize], gf)
+    var gref_c: image.Image = blur3(&gref3, 1.2f)
+    image.img_free(&gref3)
     var acc: Lap = Lap { n: levels, l: [zero_im(); 5] }
     var wsum: Lap = Lap { n: levels, l: [zero_im(); 5] }
     var lv0: i32 = 0
@@ -637,7 +744,9 @@ fn focus_stack(b: *mut merge.Burst, o: *mut FocusOpts, out: *mut image.Image, de
             }
             if (*o).consist != 0 {
                 image.img_free(&cg)
-                cg = consist_grid(&gref_c, &gl, (*o).consist_tau)
+                var gl3: image.Image = grid_rgb(&wf, gf)
+                cg = consist_grid(&gref_c, &gl3, (*o).consist_tau)
+                image.img_free(&gl3)
                 has_c = true
             }
         }
