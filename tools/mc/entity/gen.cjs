@@ -168,7 +168,11 @@ while (ok < COUNT) {
       const id = rnd() < 0.1 ? 800000 + ri(0, 9) : live.splice(ri(0, live.length - 1), 1)[0]
       if (id !== undefined) ids.push(id)
     }
-    emit('entity_destroy', { entityIds: ids })
+    if (V.protocol === 755) { // 1.17.0: ONE id per destroy_entity packet (1.17.1 is back to the entity_destroy array)
+      for (const id of ids) emit('destroy_entity', { entityId: id })
+    } else {
+      emit('entity_destroy', { entityIds: ids })
+    }
   } else if (r < 0.85) { // player added
     const u = newUuid()
     const nm = pick(NAMES)
