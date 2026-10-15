@@ -76,7 +76,7 @@ shot cpu cpu 0
 shot vk vk 0
 if grep -q "gfx=cpu (vk requested" "$W/vk.out"; then echo "  SKIP: no Vulkan device (mcplay fell back to the CPU path)"; echo "RESULT mc-vk: skip"; echo stop >&3; exit 0; fi
 shot vklost vk "$LOST_AT"
-shot vkrb vk 0 MCPLAY_VK_PRESENT=readback
+shot vkrb vk 0 "MCPLAY_VK_PRESENT=readback MCPLAY_WORKERS=0"
 num() { grep "$2" "$1" | grep -o " $3=[0-9]*" | head -1 | cut -d= -f2; }
 grep -q "mcplay: gfx=vk device=" "$W/vk.out" || { echo "  FAIL  vk run: no gfx=vk line"; ERR=1; }
 grep "mcplay: gfx=vk" "$W/vk.out" | head -1 | sed 's/^/  /'
@@ -98,6 +98,9 @@ for n in vk vklost; do
     [ "${WD:-x}" = 0 ] || { echo "  FAIL  $n: window vs readback differ (window_diff=${WD:-?}; -1 = no window pixels)"; ERR=1; }
     echo "  $n: $(grep -o 'vk present=swapchain.*' "$W/$n.out" | head -1)"
 done
+# mesher threads (r199): default 3 workers next to libvulkan, the readback run keeps the inline path (workers=0)
+for n in vk vklost; do grep -q "stream workers=3 pool=true" "$W/$n.out" || { echo "  FAIL  $n: no mesher pool (workers=3 expected)"; ERR=1; }; done
+grep -q "stream workers=0" "$W/vkrb.out" || { echo "  FAIL  vkrb: expected inline meshing (workers=0)"; ERR=1; }
 grep -q "mcplay: vk present=readback" "$W/vkrb.out" || { echo "  FAIL  vkrb: not the readback present path"; ERR=1; }
 echo "  vk: frames=${VF:-?} boxes=${BX:-?}; lost run: lost=${LV:-?} recovered=${LR:-?} frames=${LF:-?}"
 python3 tools/mc/play/psnr.py "$W/cpu.png" "$W/vk.png" --min-db "$PMIN" --mask 0,0,140,50 --diff "$W/diff.png" || ERR=1
