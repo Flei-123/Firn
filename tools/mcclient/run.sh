@@ -335,6 +335,7 @@ if [ "$ENT" -eq 1 ] && [ -f "$W/out/A.dump.entities" ]; then
   echo "entity scenario: reference sees $ne entities (A)"
   grep -q 'name=Bot' "$W/out/A.dump.entities" && [ "$ne" -ge 3 ] || { echo "run.sh: entity scenario produced too few entities (bot + pig + armor stand expected): the entity comparison proves nothing"; RESULT=1; }
   grep -E "Unknown|Incorrect|Expected|No entity|Invalid|Could not|Found no|Summoned|Teleported|Killed" "$W/server.log" | sed -E 's/^\[[0-9:]+\] //; s/[0-9]+\.[0-9]+/N/g; s/-?[0-9]+/N/g' | sort | uniq -c | head -14 | sed 's/^/  server: /'
+  grep -A1 -m4 -E "Incorrect argument|Unknown or incomplete" "$W/server.log" | sed 's/^/  server (raw): /'
   [ -n "${MC_ENT_DEBUG:-}" ] && for l in A B A2; do echo "--- $l.entities"; cat "$W/out/$l.dump.entities"; done
 fi
 echo "== metrics =="
