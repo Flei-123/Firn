@@ -67,14 +67,16 @@ rm -f "$GCTMP"
 # Rebuild when .firnc1 is missing OR a source file is younger -- an
 # outdated .firnc1 otherwise measures yesterday's state (round 35).
 if [ ! -x ./.firnc1 ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer ./.firnc1 -print -quit)" ]; then
-    rm -f ./.firnc1
-    "$FIRNC" "$SOURCE" -o ./.firnc1 || { echo "stage 1 failed"; exit 1; }
+    # Build in the private temp dir, then rename atomically (r198): a parallel
+    # run never executes a half-written .firnc1.
+    "$FIRNC" "$SOURCE" -o "$TMPD/firnc1.new" || { echo "stage 1 failed"; exit 1; }
+    mv -f "$TMPD/firnc1.new" ./.firnc1 || { echo "stage 1 failed"; exit 1; }
 fi
 
 # --- stage 2 ---------------------------------------------------------------
-rm -f .firnc2 .firnc2.s .firnc2.o
+F2=$TMPD/firnc2
 t0=$(date +%s%N)
-./.firnc1 "$SOURCE" -o ./.firnc2
+./.firnc1 "$SOURCE" -o "$F2"
 rc2=$?
 t1=$(date +%s%N)
 if [ "$rc2" -ne 0 ]; then
@@ -82,15 +84,15 @@ if [ "$rc2" -ne 0 ]; then
     echo "  3 = not core language * 4 = comptime * 5 = defer * 6 = code generator"
     exit 1
 fi
-if [ ! -x ./.firnc2 ]; then
+if [ ! -x "$F2" ]; then
     echo "STAGE 2: no executable file"
     exit 1
 fi
 
 # --- stage 3 ---------------------------------------------------------------
-rm -f .firnc3 .firnc3.s .firnc3.o
+F3=$TMPD/firnc3
 t2=$(date +%s%N)
-./.firnc2 "$SOURCE" -o ./.firnc3
+"$F2" "$SOURCE" -o "$F3"
 rc3=$?
 t3=$(date +%s%N)
 if [ "$rc3" -ne 0 ]; then
@@ -98,24 +100,24 @@ if [ "$rc3" -ne 0 ]; then
     exit 1
 fi
 
-echo "STAGE 2: $(( (t1 - t0) / 1000000 )) ms   $(wc -c < .firnc2) octets"
-echo "STAGE 3: $(( (t3 - t2) / 1000000 )) ms   $(wc -c < .firnc3) octets"
+echo "STAGE 2: $(( (t1 - t0) / 1000000 )) ms   $(wc -c < "$F2") octets"
+echo "STAGE 3: $(( (t3 - t2) / 1000000 )) ms   $(wc -c < "$F3") octets"
 
 # --- the comparison --------------------------------------------------------
-if ! cmp -s .firnc2.s .firnc3.s; then
+if ! cmp -s "$F2.s" "$F3.s"; then
     echo "NO FIXPOINT: the assembly texts of stage 2 and 3 differ"
-    diff <(head -400 .firnc2.s) <(head -400 .firnc3.s) | head -20
+    diff <(head -400 "$F2.s") <(head -400 "$F3.s") | head -20
     exit 1
 fi
-if ! cmp -s .firnc2 .firnc3; then
+if ! cmp -s "$F2" "$F3"; then
     echo "NO FIXPOINT: the binaries differ (with the same .s)"
     exit 1
 fi
-lines=$(wc -l < .firnc2.s)
+lines=$(wc -l < "$F2.s")
 echo "FIXPOINT:  stage 2 == stage 3, character-identical ($lines lines of assembly)"
 
 # --- the self-compiled compiler over the whole corpus ----------------------
-FIRNC1=./.firnc2 bash tools/self_compare.sh > "$TMPD"/fixpoint_corpus.txt 2>&1
+FIRNC1="$F2" bash tools/self_compare.sh > "$TMPD"/fixpoint_corpus.txt 2>&1
 krc=$?
 sed 's/^/  /' "$TMPD"/fixpoint_corpus.txt
 if [ "$krc" -ne 0 ]; then

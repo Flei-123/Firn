@@ -23,10 +23,35 @@ cd "$(dirname "$0")/.."
 # Module search path (round 39): the std facade for both sides of the comparison.
 export FIRNLIB="$(pwd)/lib"
 
-FIRNC=compiler/target/release/firnc
+FIRNC=${FIRNC:-compiler/target/release/firnc}
 FC1=${FIRNC1:-./.firnc1}
-WORK=.self-work
-mkdir -p "$WORK"
+
+# ROUND r198: a work directory of its own per run (mktemp), removed on exit.
+# It used to be the fixed `.self-work`, so two simultaneous runs in the same
+# tree (fixpoint.sh + a shard, two worktree users) overwrote each other's
+# ref/a.bin/*.out and reported deviations that did not exist.
+# Override: SELF_COMPARE_WORK=<dir> (kept after the run, not deleted).
+if [ -n "${SELF_COMPARE_WORK:-}" ]; then
+    WORK=$SELF_COMPARE_WORK
+    mkdir -p "$WORK"
+else
+    WORK=$(mktemp -d)
+    trap 'rm -rf "$WORK"' EXIT
+fi
+
+# Shard mode: SELF_COMPARE_SHARD=k/N runs only every N-th corpus file
+# (index k of 0..N-1). Run N shards in parallel (each with its own WORK) and
+# add the counters up.
+SHARD_K=0
+SHARD_N=1
+if [ -n "${SELF_COMPARE_SHARD:-}" ]; then
+    SHARD_K=${SELF_COMPARE_SHARD%/*}
+    SHARD_N=${SELF_COMPARE_SHARD#*/}
+    case "$SHARD_K$SHARD_N" in *[!0-9]*|"") echo "bad SELF_COMPARE_SHARD (want k/N)"; exit 2;; esac
+    if [ "$SHARD_N" -lt 1 ] || [ "$SHARD_K" -ge "$SHARD_N" ]; then
+        echo "bad SELF_COMPARE_SHARD (want 0 <= k < N)"; exit 2
+    fi
+fi
 
 # LESSON (round 46, the same trap for the fourth time): NEVER reuse a
 # binary just because it exists. After a merge `.firnc1` is
@@ -43,7 +68,10 @@ if [ -x "$FC1" ]; then
     done < <(find bin lib -name '*.fi' -not -type l)
 fi
 if [ "$rebuild" -eq 1 ]; then
-    "$FIRNC" bin/firnc1.fi -o "$FC1" || exit 1
+    # Build next to the target and rename: the rename is atomic, so a parallel
+    # run never sees (or executes) a half-written compiler.
+    "$FIRNC" bin/firnc1.fi -o "$WORK/firnc1.new" || exit 1
+    mv -f "$WORK/firnc1.new" "$FC1" || exit 1
 fi
 
 same=0
@@ -110,7 +138,8 @@ while IFS= read -r f; do
         different=$((different+1))
         [ -z "$first" ] && first="$f (firnc0: $rref, firnc1: $ra)"
     fi
-done < <(find tests bench -name '*.fi' -not -type l -not -path 'tests/neg/*' -not -path 'tests/lexneg/*' | sort)
+done < <(find tests bench -name '*.fi' -not -type l -not -path 'tests/neg/*' -not -path 'tests/lexneg/*' | sort \
+    | awk -v k="$SHARD_K" -v n="$SHARD_N" 'NR % n == k')
 
 echo "SAME BEHAVIOUR:     $same"
 echo "DIFFERING:          $different"
