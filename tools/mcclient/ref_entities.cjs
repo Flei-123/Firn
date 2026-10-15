@@ -115,6 +115,10 @@ class EntityTracker {
         this.count.destroy++
         for (const id of p.entityIds) this.ents.delete(id)
         return
+      case 'destroy_entity': // 1.17.0 (755) only: ONE entity id per packet (1.17.1 is back to the entity_destroy array)
+        this.count.destroy++
+        this.ents.delete(p.entityId)
+        return
       case 'player_remove':
         for (const u of p.players) this.players.delete(uuidHex(u))
         return
