@@ -8,6 +8,8 @@
 //     --box   selection box (mc_input.input_draw_box) around the block under the crosshair
 //     --hud   crosshair, hotbar and debug lines (mc_hud)
 //     MCVIEW_SKY_APPROX=1 (env): Sky.approx (sunset glow / gradient approximated, <= 1 level, ~2.5x faster at sunset); default exact = the reference
+//     MCVIEW_GFX=vk (env): the frame is drawn through the Vulkan back end (mc.vk_mc) and read back (default cpu; no Vulkan device = cpu with a message).
+//              Not bit equal to the CPU raster (PSNR gate tools/mc/play/run_vkview.sh); run with MCVIEW_WORKERS=0 (stream threads crash libvulkan_lvp).
 //     MCVIEW_STREAM=1 (env): mc_stream with MCVIEW_WORKERS (3) mesher threads draws the world instead of mc_render_world (hash may differ: culling).
 //     --all   all three.   Without flags the image is exactly the plain world render (hash equal to the python renderer).
 //   Frame order: raster_clear -> sky_draw -> sky_set_raster_fog -> world -> sky_tint_frame -> selection box -> HUD.
@@ -62,6 +64,7 @@ import mc.mc_input
 import mc.mc_hud
 import mc.mc_packs
 import mc.mc_backend
+import mc.vk_mc
 
 const DEFAULT_VIEW: i32 = 6
 const DEFAULT_SETTLE_MS: u64 = 3000
@@ -635,6 +638,8 @@ struct Gfx {
     stm_made: bool,
     stm: mc_stream.Stream,
     pool: jobs.Jobs,
+    vk: bool, // MCVIEW_GFX=vk: the frame is drawn through vk_mc (sky, world, box, tint, HUD in one pass) and read back into the raster colour buffer
+    vbk: vk_mc.VkBackend, // opened IN PLACE by gfx_vk_open (never copy a VkBackend after that)
 }
 
 // Resource packs are wanted when MC_PACKS / MC_PACK_CONFIG / MC_PACK_AUTO is set or a --pack=a.zip,b.zip flag is given
@@ -677,7 +682,49 @@ fn gfx_new(w: i32, h: i32, ver: *mut mc_version.Version, min_y: i32, view: i32, 
     var wr: mc_render_world.WorldRender = mc_render_world.wr_new(min_y, view, &tb)
     var dummy_tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
     return Gfx { atlas: atlas, tb: tb, r: r, wr: wr, ok: ok, res: res, use_res: use_res,
-        stm_on: env_flag("MCVIEW_STREAM", false), stm_made: false, stm: mc_stream.stream_new(0, 1, 1, &dummy_tb, 0 as u64), pool: jobs.Jobs { blk: 0 } }
+        stm_on: env_flag("MCVIEW_STREAM", false), stm_made: false, stm: mc_stream.stream_new(0, 1, 1, &dummy_tb, 0 as u64), pool: jobs.Jobs { blk: 0 }, vk: false, vbk: vk_mc.vkbe_blank() }
+}
+
+// The back end that draws: the Vulkan table when MCVIEW_GFX=vk was opened, else the CPU raster.
+fn gfx_be(g: *mut Gfx) -> mc_backend.Backend {
+    if (*g).vk { return vk_mc.vkbe_backend(&(*g).vbk) }
+    return mc_backend.backend_cpu(&(*g).r)
+}
+
+fn want_vk_gfx() -> bool {
+    if !env.has("MCVIEW_GFX") { return false }
+    let v: str = env.get("MCVIEW_GFX")
+    return v.length() == 2 && v.chars(0) == 118 as u8 && v.chars(1) == 107 as u8
+}
+
+// MCVIEW_GFX=vk: opens the Vulkan back end for the image size (offscreen, no swapchain) and uploads the atlas / packs.
+// false = no Vulkan device: the caller keeps the CPU path (message on stderr).
+fn gfx_vk_open(g: *mut Gfx, w: i32, h: i32) -> bool {
+    if !vk_mc.vkbe_open_win(&(*g).vbk, w, h, "", 0 as u64, 0) {
+        io.eprint_line("mcview: gfx=cpu (vk requested but not available)")
+        return false
+    }
+    vk_mc.vkbe_set_readback(&(*g).vbk, true)
+    (*g).vk = true
+    var be: mc_backend.Backend = vk_mc.vkbe_backend(&(*g).vbk)
+    if (*g).use_res {
+        mc_packs.res_reload_upload(&(*g).res, &be)
+    } else {
+        be.upload_atlas(be.obj, ((&(*g).atlas) as u64))
+    }
+    io.print("mcview: gfx=vk device=")
+    io.print_c(vk_mc.vkbe_device_name(&(*g).vbk))
+    say(f" cpu_device={vk_mc.vkbe_is_cpu(&(*g).vbk)}\n")
+    return true
+}
+
+// Frees the world meshes through the Vulkan table, then closes the device (before wr_free).
+fn gfx_vk_close(g: *mut Gfx) {
+    if !(*g).vk { return }
+    var be: mc_backend.Backend = vk_mc.vkbe_backend(&(*g).vbk)
+    mc_render_world.wr_clear_b(&(*g).wr, &be)
+    vk_mc.vkbe_close(&(*g).vbk)
+    (*g).vk = false
 }
 
 // Loads the packs (env + optional --pack list) into the manager and uploads the atlas. Warnings go to stderr.
@@ -693,7 +740,7 @@ fn gfx_packs_load(g: *mut Gfx, protocol: i32, packs_flag: u64) {
 // Hot reload (the live client calls this from its reload key via mc_packs.res_on_key): re-reads the packs, new atlas, upload.
 // Block tile ids do not change, so cached meshes stay valid.
 fn gfx_packs_reload(g: *mut Gfx) -> i32 {
-    var be: mc_backend.Backend = mc_backend.backend_cpu(&(*g).r)
+    var be: mc_backend.Backend = gfx_be(g)
     let n: i32 = mc_packs.res_reload_upload(&(*g).res, &be)
     if mc_packs.res_warn_count(&(*g).res) > 0 {
         let wt: str = mc_packs.res_warn_text(&(*g).res)
@@ -704,7 +751,7 @@ fn gfx_packs_reload(g: *mut Gfx) -> i32 {
 
 // Animated tiles for game tick `tick` (once per game tick in a live client).
 fn gfx_packs_tick(g: *mut Gfx, tick: i64) -> i32 {
-    var be: mc_backend.Backend = mc_backend.backend_cpu(&(*g).r)
+    var be: mc_backend.Backend = gfx_be(g)
     return mc_packs.res_tick(&(*g).res, tick, &be)
 }
 
@@ -732,9 +779,10 @@ fn pick_tables(tb: *mut mc_mesh.MeshTables) -> mc_input.InputTables {
 // meshes until nothing is pending (synchronous, so the picture is complete), later frames only draw.
 #[allow_escape]
 fn stream_world(g: *mut Gfx, w: *mut mc_world.World, cam: *mut mc_camera.Camera, cfg: *mut Cfg) {
-    var be: mc_backend.Backend = mc_backend.backend_cpu(&(*g).r)
+    var be: mc_backend.Backend = gfx_be(g)
     if !(*g).stm_made {
-        let nw: i32 = env_int("MCVIEW_WORKERS", 3)
+        var nw: i32 = env_int("MCVIEW_WORKERS", 3)
+        if (*g).vk { nw = 0 } // raw clone threads crash libvulkan_lvp (like mcplay VK)
         var pa: u64 = 0
         if nw > 0 {
             // lock-free ring pool (r192); MCVIEW_JOBS_LOCKED=1 = old locked queue
@@ -766,16 +814,129 @@ fn stream_world(g: *mut Gfx, w: *mut mc_world.World, cam: *mut mc_camera.Camera,
 // Frees the stream and the mesher threads (before the Gfx goes away).
 fn stream_end(g: *mut Gfx) {
     if !(*g).stm_made { return }
-    var be: mc_backend.Backend = mc_backend.backend_cpu(&(*g).r)
+    var be: mc_backend.Backend = gfx_be(g)
     mc_stream.stream_free(&(*g).stm, &be)
     (*g).stm_made = false
     if (*g).pool.blk != 0 { jobs.destroy(&(*g).pool) }
+}
+
+// Vulkan twin of frame(): same order (sky -> world -> box -> tint -> HUD), one render pass, then the colour image is read back into the raster
+// colour buffer so that PNG / hash / view.rgba stay the same code path. The picture is NOT bit equal to the CPU raster (PSNR gate run_vkview.sh).
+#[allow_escape]
+fn frame_vk(g: *mut Gfx, w: *mut mc_world.World, cam: *mut mc_camera.Camera, cfg: *mut Cfg, sky: *mut mc_sky.Sky,
+    itb: *mut mc_input.InputTables, clear: u32, fog_start: f64, fog_end: f64, fps: i32, pk: *mut mc_input.Pick) -> bool {
+    let post: u32 = (*cfg).post
+    var be: mc_backend.Backend = vk_mc.vkbe_backend(&(*g).vbk)
+    var fr: u32 = FOG_R
+    var fg: u32 = FOG_G
+    var fb: u32 = FOG_B
+    if (post & PF_SKY) != 0 as u32 {
+        fr = (*sky).fr as u32
+        fg = (*sky).fg as u32
+        fb = (*sky).fb as u32
+    }
+    vk_mc.vkbe_set_fog(&(*g).vbk, (*cfg).fog, fog_start, fog_end, fr, fg, fb)
+    be.begin(be.obj, ((cam) as u64), clear)
+    if (post & PF_SKY) != 0 as u32 {
+        vk_mc.vkbe_sky(&(*g).vbk, cam, sky)
+    }
+    if (*g).stm_on {
+        stream_world(g, w, cam, cfg)
+    } else {
+        mc_render_world.wr_render_b(&(*g).wr, w, &be, cam, 0 - 1)
+    }
+    var hit: bool = false
+    if (post & (PF_BOX | PF_HUD)) != 0 as u32 {
+        hit = mc_input.input_pick_camera(w, (*cfg).min_y, itb, cam, (*cfg).reach as f64, pk)
+    }
+    if (post & PF_BOX) != 0 as u32 && hit {
+        // 12 thin boxes along the block edges (the same records as mcplay's VK/GL selection box); black like BOX_RGBA
+        var recs: [f64; 144] = [0.0; 144]
+        let e: f64 = 0.03
+        let bx: f64 = (*pk).x as f64
+        let by: f64 = (*pk).y as f64
+        let bz: f64 = (*pk).z as f64
+        var i: i32 = 0
+        var m: usize = 0
+        while i < 4 {
+            var ox: f64 = 0.0
+            var oy: f64 = 0.0
+            if (i & 1) != 0 { ox = 1.0 }
+            if (i & 2) != 0 { oy = 1.0 }
+            var k: usize = 0
+            while k < 3 {
+                var x: f64 = bx + ox
+                var y: f64 = by + oy
+                var z: f64 = bz + oy
+                var sx: f64 = e
+                var sy: f64 = e
+                var sz: f64 = e
+                if k == 0 { x = bx + 0.5
+                    y = by + oy
+                    z = bz + ox
+                    sx = 1.0 + e }
+                if k == 1 { x = bx + ox
+                    y = by + 0.5
+                    z = bz + oy
+                    sy = 1.0 + e }
+                if k == 2 { x = bx + ox
+                    y = by + oy
+                    z = bz + 0.5
+                    sz = 1.0 + e }
+                let o: usize = m * 12
+                recs[o] = x
+                recs[o + 1] = y
+                recs[o + 2] = z
+                recs[o + 3] = sx
+                recs[o + 4] = sy
+                recs[o + 5] = sz
+                recs[o + 7] = 1.0
+                m = m + 1
+                k = k + 1
+            }
+            i = i + 1
+        }
+        let nb: u64 = be.draw_entities(be.ent_obj, (&recs[0]) as u64, m)
+    }
+    if (post & PF_SKY) != 0 as u32 {
+        vk_mc.vkbe_tint(&(*g).vbk, sky)
+    }
+    var rec: rt.Buf = rt.buf_new()
+    if (post & PF_HUD) != 0 as u32 {
+        var d: mc_hud.HudDebug = mc_hud.hud_debug_new()
+        d.fps = fps
+        d.x = (*cam).x
+        d.y = (*cam).y
+        d.z = (*cam).z
+        d.yaw = (*cfg).yaw
+        d.pitch = (*cfg).pitch
+        d.has_block = hit
+        if hit {
+            d.bx = (*pk).x
+            d.by = (*pk).y
+            d.bz = (*pk).z
+            d.id = (*pk).id
+            d.nx = (*pk).nx
+            d.ny = (*pk).ny
+            d.nz = (*pk).nz
+        }
+        mc_hud.hud_record(&rec)
+        mc_hud.hud_frame(&(*g).r, mc_hud.hud_scale((*cfg).w, (*cfg).h), mc_hud.HUD_CROSSHAIR | mc_hud.HUD_HOTBAR | mc_hud.HUD_DEBUG,
+            (*cfg).slot, &d)
+        mc_hud.hud_record(0 as *mut rt.Buf)
+        vk_mc.vkbe_hud(&(*g).vbk, &rec)
+    }
+    rt.buf_free(&rec)
+    be.end(be.obj)
+    be.read_pixels(be.obj, (*g).r.color)
+    return hit
 }
 
 // One frame in the fixed order: clear -> sky -> sky fog -> world -> light tint -> selection box -> HUD.
 // Returns true when the pick ray hit a block (`pk` is filled then).
 fn frame(g: *mut Gfx, w: *mut mc_world.World, cam: *mut mc_camera.Camera, cfg: *mut Cfg, sky: *mut mc_sky.Sky,
     itb: *mut mc_input.InputTables, clear: u32, fog_start: f64, fog_end: f64, fps: i32, pk: *mut mc_input.Pick) -> bool {
+    if (*g).vk { return frame_vk(g, w, cam, cfg, sky, itb, clear, fog_start, fog_end, fps, pk) }
     let r: *mut mc_raster.Raster = &(*g).r
     let post: u32 = (*cfg).post
     mc_raster.backend_begin(r, cam, clear)
@@ -839,6 +1000,7 @@ fn render(w: *mut mc_world.World, cfg: *mut Cfg, ver: *mut mc_version.Version, d
     mc_camera.camera_set_lens(&cam, 70.0, 0.05, far)
     mc_camera.camera_update(&cam)
 
+    if want_vk_gfx() && !(*g).vk { let vo: bool = gfx_vk_open(g, (*cfg).w, (*cfg).h) }
     let r: *mut mc_raster.Raster = &(*g).r
     let fog_start: f64 = ((*cfg).view as f64) * 16.0 * 0.5
     let fog_end: f64 = ((*cfg).view as f64) * 16.0 + 8.0
@@ -1191,6 +1353,7 @@ fn main_replay(start: u64) -> i32 {
     if use_res { gfx_packs_load(&g, cfg.protocol, pf) }
     let rc: i32 = render(&world, &cfg, &ver, dir, &g)
     stream_end(&g)
+    gfx_vk_close(&g)
     mc_render_world.wr_free(&g.wr, &g.r)
     mc_world.world_free(&world)
     return rc
@@ -1326,6 +1489,7 @@ fn main(start: u64) -> i32 {
         rt.buf_free(&wt)
     }
     stream_end(&g)
+    gfx_vk_close(&g)
     mc_render_world.wr_free(&g.wr, &g.r)
     mc_world.world_free(&world)
     mc_chunk.scratch_free(&sc)

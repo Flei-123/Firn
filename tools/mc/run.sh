@@ -6,7 +6,7 @@
 #     independent reference (python / node / java tools, never Mojang code).
 #     Each prints a line `RESULT <name>: ok` and exits 0 on success.
 #
-# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | tpplay)
+# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
@@ -54,6 +54,10 @@ fi
 if [ -z "$ONLY" ] || [ "$ONLY" = vkplay ]; then
     echo "== mc/vkplay =="
     bash tools/mc/play/run_vk.sh || ERR=$((ERR+1))
+fi
+if [ -z "$ONLY" ] || [ "$ONLY" = vkplay ] || [ "$ONLY" = vkview ]; then
+    echo "== mc/vkview =="
+    bash tools/mc/play/run_vkview.sh || ERR=$((ERR+1))
 fi
 # mcplay WITHOUT fly: /tp into the air, fall, land, walk; no rubber band / "moved too quickly" after the Teleport Confirm (r197): ~2 min, needs Xvfb + xdotool + java.
 if [ -z "$ONLY" ] || [ "$ONLY" = tpplay ]; then
