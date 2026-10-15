@@ -1,0 +1,865 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/jarvisc.fi -- a client for the JARVIS chat server (the small chat
+// box: login, one WebSocket, events). The protocol is the one of
+// public/mini.html of the JARVIS server.
+//
+//     import async.loop
+//     import net.jarvisc
+//
+//     fn on_event(c: *mut jarvisc.Jc, ud: u64, kind: u32, arg: i64) {
+//         if kind == jarvisc.JE_LOGIN && arg == 200 { jarvisc.jc_connect(c) }
+//         if kind == jarvisc.JE_TOKEN { /* jarvisc.jc_text(c) is the next piece */ }
+//     }
+//     let c: *mut jarvisc.Jc = jarvisc.jc_new(&l, on_event, 0)
+//     jarvisc.jc_set_base(c, "https://jarvis.example.org")
+//     jarvisc.jc_login(c, "name", "password")          // -> JE_LOGIN
+//     loop.run(&l)                                       // or fui.looppump + app.run
+//
+// WHAT HAPPENS
+//   login    POST /api/login {username,password} -> {username,token}. The
+//            token is kept and sent as `Cookie: fleitec_session=<token>` (HTTP
+//            and WebSocket). The answer's Set-Cookie is NOT needed. The token
+//            can be stored in std.secret: `jc_save` / `jc_restore` / `jc_forget`
+//            -- the next start logs in with `jc_restore` + `jc_connect`.
+//   socket   wss://host/?role=ui&dev=<id> (ws:// for an http base), reconnect
+//            with backoff, keep-alive. On every open: {"type":"tz"} and the
+//            messages that were written while it was down (a queue; wsc has none).
+//   send     jc_send(text)         {"type":"message", text, cid, jarvisMode, msgId, ...}
+//            jc_stop()             {"type":"stop","cid"}
+//            jc_confirm(allow)     {"type":"confirm_result","id","allow"}   answers JE_CONFIRM
+//            jc_answer(label)      {"type":"ask_result","id","answers":[label]}  answers JE_ASK
+//   history  jc_history(): GET /api/conversations/<cid>?turns=4 -> JE_HIST per
+//            message, then JE_HIST_END (arg 1 = the chat still runs, text = the
+//            partial answer so far).
+//
+// EVENTS: `cb(client, ud, kind, arg)`; the payload is read with jc_text(c)
+// (a fresh copy, you may keep it).
+//   JE_LOGIN      arg = HTTP status (200 = logged in), 0 = no connection
+//   JE_OPEN       the socket is open               JE_CLOSE   arg = close code
+//   JE_NETERR     arg = wsc error code (jc_ws_status = HTTP status of a refused upgrade)
+//   JE_TOKEN      text = a piece of the answer     JE_DONE    the answer is complete
+//   JE_TOOL       text = tool name (mcp__x__ cut)  JE_THINKING
+//   JE_CONVERSATION  text = the new chat's id (stored: jc_cid)
+//   JE_ERROR      text = the server's message      JE_SYSTEM  text
+//   JE_INFO       after (re)connect: arg 1 = our chat runs, 0 = it does not, -1 = no chat yet
+//   JE_USER       text = a message typed on ANOTHER device (own echoes are dropped)
+//   JE_CONFIRM    text = question, jc_id(c) = id   JE_ASK     text = question, jc_options(c) =
+//                 labels one per line (arg 1 = a simple single choice you can answer with jc_answer)
+//   JE_ASK_END    the question went away           JE_FILE    text = file name
+//   JE_HIST       arg 1 = user, 0 = JARVIS, text   JE_HIST_END  arg 1 = running, text = partial
+//   JE_HTTP_ERR   a history request failed; arg = status (401 = log in again,
+//                 404 = the chat is gone, the stored id is dropped)
+//
+// HONEST
+//   J1  Ids of confirm/ask must be strings (the server sends strings).
+//   J2  One login and one history request at a time; a second call while one
+//       is running is refused (false).
+//   J3  The cookie is NOT given the Secure/Domain checks of a browser: the
+//       token goes to whatever base you set. Use https for a real server.
+//   J4  Do not free the client inside its own callback.
+//   J5  jc_save writes the token with std.secret (Windows: Credential
+//       Manager; Linux: an encrypted file, no protection against the same
+//       user, see std.secret S1).
+import std.rt
+import std.str
+import std.json
+import std.secret
+import async.loop
+import async.ahttp
+import async.wsc
+import net.http
+
+export {
+    Jc,
+    JE_LOGIN, JE_OPEN, JE_CLOSE, JE_NETERR, JE_TOKEN, JE_DONE, JE_TOOL, JE_THINKING,
+    JE_CONVERSATION, JE_ERROR, JE_SYSTEM, JE_INFO, JE_USER, JE_CONFIRM, JE_ASK,
+    JE_ASK_END, JE_FILE, JE_HIST, JE_HIST_END, JE_HTTP_ERR,
+    jc_new, jc_free, jc_set_base, jc_set_token, jc_has_token, jc_set_tz, jc_set_dev,
+    jc_add_trust_pem, jc_login, jc_connect, jc_disconnect, jc_is_open,
+    jc_send, jc_stop, jc_confirm, jc_answer, jc_history, jc_new_chat,
+    jc_text, jc_id, jc_options, jc_cid, jc_set_cid, jc_ws_status, jc_user,
+    jc_save, jc_restore, jc_forget, jc_clean,
+}
+
+const JE_LOGIN: u32 = 1
+const JE_OPEN: u32 = 2
+const JE_CLOSE: u32 = 3
+const JE_NETERR: u32 = 4
+const JE_TOKEN: u32 = 5
+const JE_DONE: u32 = 6
+const JE_TOOL: u32 = 7
+const JE_THINKING: u32 = 8
+const JE_CONVERSATION: u32 = 9
+const JE_ERROR: u32 = 10
+const JE_SYSTEM: u32 = 11
+const JE_INFO: u32 = 12
+const JE_USER: u32 = 13
+const JE_CONFIRM: u32 = 14
+const JE_ASK: u32 = 15
+const JE_ASK_END: u32 = 16
+const JE_FILE: u32 = 17
+const JE_HIST: u32 = 18
+const JE_HIST_END: u32 = 19
+const JE_HTTP_ERR: u32 = 20
+
+const COOKIE_NAME: str = "fleitec_session"
+
+struct Jc {
+    l: *mut loop.Loop,
+    cb: fn(*mut Jc, u64, u32, i64),
+    ud: u64,
+    ah: ahttp.AClient,
+    ws: *mut wsc.WsClient,
+    base: rt.Buf, // "http://host:port" or "https://host"
+    token: rt.Buf,
+    user: rt.Buf,
+    cid: rt.Buf,
+    tz: rt.Buf,
+    dev: rt.Buf,
+    last_sent: rt.Buf,
+    text: rt.Buf, // the payload of the event being delivered
+    id: rt.Buf, // id of the open confirm / ask
+    opts: rt.Buf, // options of the open ask, one per line
+    outq: rt.Buf, // [u32 len][bytes] ... messages written while the socket is down
+    req_url: rt.Buf,
+    req_body: rt.Buf,
+    busy_login: bool,
+    busy_hist: bool,
+    started: bool,
+    seq: u64,
+}
+
+fn jc_obj_alloc[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+fn jc_obj_free[T](p: u64) {
+    rt.heap_free(p, size_of[T]())
+}
+
+fn jc_new(l: *mut loop.Loop, cb: fn(*mut Jc, u64, u32, i64), ud: u64) -> *mut Jc {
+    let p: u64 = jc_obj_alloc[Jc]()
+    if p == 0 {
+        return 0 as *mut Jc
+    }
+    let c: *mut Jc = p as *mut Jc
+    *c = Jc { l: l, cb: cb, ud: ud, ah: ahttp.aclient_new(), ws: 0 as *mut wsc.WsClient,
+        base: rt.buf_new(), token: rt.buf_new(), user: rt.buf_new(), cid: rt.buf_new(),
+        tz: rt.buf_new(), dev: rt.buf_new(), last_sent: rt.buf_new(), text: rt.buf_new(),
+        id: rt.buf_new(), opts: rt.buf_new(), outq: rt.buf_new(), req_url: rt.buf_new(),
+        req_body: rt.buf_new(), busy_login: false, busy_hist: false, started: false, seq: 0 }
+    if !ahttp.aclient_init(&(*c).ah, l) {
+        jc_obj_free[Jc](p)
+        return 0 as *mut Jc
+    }
+    put(&(*c).tz, "UTC")
+    put(&(*c).dev, "fmin")
+    return c
+}
+
+fn jc_free(c: *mut Jc) {
+    if (*c).ws as u64 != 0 {
+        wsc.wsc_free((*c).ws)
+    }
+    ahttp.aclient_free(&(*c).ah)
+    rt.buf_free(&(*c).base)
+    rt.buf_free(&(*c).token)
+    rt.buf_free(&(*c).user)
+    rt.buf_free(&(*c).cid)
+    rt.buf_free(&(*c).tz)
+    rt.buf_free(&(*c).dev)
+    rt.buf_free(&(*c).last_sent)
+    rt.buf_free(&(*c).text)
+    rt.buf_free(&(*c).id)
+    rt.buf_free(&(*c).opts)
+    rt.buf_free(&(*c).outq)
+    rt.buf_free(&(*c).req_url)
+    rt.buf_free(&(*c).req_body)
+    jc_obj_free[Jc](c as u64)
+}
+
+// ------------------------------------------------------------------ helpers
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn set(b: *mut rt.Buf, s: str) {
+    rt.buf_clear(b)
+    put(b, s)
+}
+
+fn as_str(b: *mut rt.Buf) -> str {
+    return __str_copy(str { p: (*b).ptr as *mut u8, n: (*b).len })
+}
+
+fn span_is(s: str.Span, lit: str) -> bool {
+    return s.n == lit.n && rt.mem_eq(s.p as u64, lit.p as u64, lit.n)
+}
+
+fn jkey(w: *mut json.JsonWriter, name: str) {
+    json.jw_key(w, name.p as u64, name.n)
+}
+
+fn jstr(w: *mut json.JsonWriter, name: str, v: *mut rt.Buf) {
+    jkey(w, name)
+    json.jw_string(w, (*v).ptr, (*v).len)
+}
+
+// encodeURIComponent for the token (letters, digits and -_.!~*'() stay)
+fn push_cookie_value(b: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        var keep: bool = (ch >= 48 as u8 && ch <= 57 as u8) || (ch >= 65 as u8 && ch <= 90 as u8) || (ch >= 97 as u8 && ch <= 122 as u8)
+        if ch == 45 as u8 || ch == 95 as u8 || ch == 46 as u8 || ch == 33 as u8 || ch == 126 as u8
+        || ch == 42 as u8 || ch == 39 as u8 || ch == 40 as u8 || ch == 41 as u8 {
+            keep = true
+        }
+        if keep {
+            rt.buf_push(b, ch)
+        } else {
+            let hex: str = "0123456789ABCDEF"
+            rt.buf_push(b, 37 as u8)
+            rt.buf_push(b, *(hex.p + (ch >> 4) as usize))
+            rt.buf_push(b, *(hex.p + (ch & 15 as u8) as usize))
+        }
+        i = i + 1
+    }
+}
+
+// "Cookie: fleitec_session=<token>" for the HTTP client, and (once) for the socket
+fn cookie_value(c: *mut Jc, out: *mut rt.Buf) {
+    put(out, COOKIE_NAME)
+    put(out, "=")
+    push_cookie_value(out, (*c).token.ptr, (*c).token.len)
+}
+
+fn apply_cookie_http(c: *mut Jc) {
+    var line: rt.Buf = rt.buf_new()
+    put(&line, "Cookie: ")
+    cookie_value(c, &line)
+    put(&line, "\r\n")
+    http.client_set_headers(ahttp.aclient_http(&(*c).ah), line.ptr, line.len)
+    rt.buf_free(&line)
+}
+
+fn emit(c: *mut Jc, kind: u32, text: str, arg: i64) {
+    set(&(*c).text, text)
+    let f: fn(*mut Jc, u64, u32, i64) = (*c).cb
+    f(c, (*c).ud, kind, arg)
+}
+
+fn emit_span(c: *mut Jc, kind: u32, s: str.Span, arg: i64) {
+    rt.buf_clear(&(*c).text)
+    rt.buf_push_bytes(&(*c).text, s.p as u64, s.n)
+    let f: fn(*mut Jc, u64, u32, i64) = (*c).cb
+    f(c, (*c).ud, kind, arg)
+}
+
+// ---------------------------------------------------------------- accessors
+
+// The payload of the event being delivered (a copy: you may keep it).
+fn jc_text(c: *mut Jc) -> str { return as_str(&(*c).text) }
+fn jc_id(c: *mut Jc) -> str { return as_str(&(*c).id) }
+fn jc_options(c: *mut Jc) -> str { return as_str(&(*c).opts) }
+fn jc_cid(c: *mut Jc) -> str { return as_str(&(*c).cid) }
+fn jc_user(c: *mut Jc) -> str { return as_str(&(*c).user) }
+fn jc_has_token(c: *mut Jc) -> bool { return (*c).token.len > 0 }
+fn jc_is_open(c: *mut Jc) -> bool { return (*c).ws as u64 != 0 && wsc.wsc_is_open((*c).ws) }
+fn jc_ws_status(c: *mut Jc) -> u32 {
+    if (*c).ws as u64 == 0 {
+        return 0
+    }
+    return wsc.wsc_status((*c).ws)
+}
+
+// "https://host[:port]" (no trailing slash needed). The socket uses ws/wss.
+fn jc_set_base(c: *mut Jc, base: str) {
+    var n: usize = base.n
+    while n > 0 && *(base.p + n - 1) == 47 as u8 {
+        n = n - 1
+    }
+    rt.buf_clear(&(*c).base)
+    rt.buf_push_bytes(&(*c).base, base.p as u64, n)
+}
+
+fn jc_set_token(c: *mut Jc, token: str) {
+    set(&(*c).token, token)
+    apply_cookie_http(c)
+}
+
+fn jc_set_tz(c: *mut Jc, tz: str) { set(&(*c).tz, tz) }
+
+// 4..8 characters a-z0-9: shows in the JARVIS device list
+fn jc_set_dev(c: *mut Jc, dev: str) { set(&(*c).dev, dev) }
+
+fn jc_set_cid(c: *mut Jc, cid: str) { set(&(*c).cid, cid) }
+
+// The next message starts a new chat.
+fn jc_new_chat(c: *mut Jc) {
+    rt.buf_clear(&(*c).cid)
+    rt.buf_clear(&(*c).last_sent)
+}
+
+// For servers with a private CA (tests): applies to HTTP and the socket.
+fn jc_add_trust_pem(c: *mut Jc, p: u64, n: usize) {
+    let k: usize = http.client_add_trust_pem(ahttp.aclient_http(&(*c).ah), p, n)
+    if (*c).ws as u64 != 0 {
+        let k2: usize = wsc.wsc_add_trust_pem((*c).ws, p, n)
+    }
+}
+
+// Cut the internal ">STATUS:" line JARVIS appends and trailing blanks.
+fn jc_clean(s: str) -> str {
+    var n: usize = s.n
+    var i: usize = 0
+    while i + 8 <= s.n {
+        if rt.mem_eq(s.p as u64 + i as u64, ">STATUS:".p as u64, 8) && (i == 0 || *(s.p + i - 1) == 10 as u8) {
+            n = i
+            break
+        }
+        i = i + 1
+    }
+    while n > 0 {
+        let ch: u8 = *(s.p + n - 1)
+        if ch == 10 as u8 || ch == 13 as u8 || ch == 32 as u8 || ch == 9 as u8 {
+            n = n - 1
+        } else {
+            break
+        }
+    }
+    return __str_copy(str { p: s.p, n: n })
+}
+
+// -------------------------------------------------------------------- login
+
+fn on_login(r: *mut ahttp.Request, ud: u64) {
+    let c: *mut Jc = ud as *mut Jc
+    (*c).busy_login = false
+    if ahttp.areq_error(r) != 0 {
+        emit(c, JE_LOGIN, "", 0)
+        return
+    }
+    let status: u32 = ahttp.areq_status(r)
+    if status == 200 {
+        var d: json.Json = json.json_new()
+        let ok: bool = json.json_parse(&d, ahttp.areq_body_ptr(r), ahttp.areq_body_len(r)) catch false
+        var got: bool = false
+        if ok && json.json_kind(&d, json.json_root(&d)) == json.JSON_OBJECT {
+            let tk: u32 = json.json_get(&d, json.json_root(&d), "token".p as u64, 5)
+            let un: u32 = json.json_get(&d, json.json_root(&d), "username".p as u64, 8)
+            if tk != json.JSON_NONE && json.json_kind(&d, tk) == json.JSON_STRING {
+                let s: str.Span = json.json_string(&d, tk)
+                rt.buf_clear(&(*c).token)
+                rt.buf_push_bytes(&(*c).token, s.p as u64, s.n)
+                got = true
+            }
+            if un != json.JSON_NONE && json.json_kind(&d, un) == json.JSON_STRING {
+                let s2: str.Span = json.json_string(&d, un)
+                rt.buf_clear(&(*c).user)
+                rt.buf_push_bytes(&(*c).user, s2.p as u64, s2.n)
+            }
+        }
+        json.json_free(&d)
+        if got {
+            apply_cookie_http(c)
+            emit(c, JE_LOGIN, "", 200)
+        } else {
+            emit(c, JE_LOGIN, "", 502)
+        }
+        return
+    }
+    emit(c, JE_LOGIN, "", status as i64)
+}
+
+fn jc_login(c: *mut Jc, user: str, password: str) -> bool {
+    if (*c).busy_login || (*c).base.len == 0 {
+        return false
+    }
+    rt.buf_clear(&(*c).req_url)
+    rt.buf_push_bytes(&(*c).req_url, (*c).base.ptr, (*c).base.len)
+    put(&(*c).req_url, "/api/login")
+    rt.buf_clear(&(*c).req_body)
+    var w: json.JsonWriter = json.jw_new(&(*c).req_body, false)
+    json.jw_begin_object(&w)
+    jkey(&w, "username")
+    json.jw_string(&w, user.p as u64, user.n)
+    jkey(&w, "password")
+    json.jw_string(&w, password.p as u64, password.n)
+    json.jw_end(&w)
+    json.jw_free(&w)
+    http.client_set_headers(ahttp.aclient_http(&(*c).ah), "".p as u64, 0)
+    (*c).busy_login = true
+    let ct: str = "application/json"
+    let r: *mut ahttp.Request = ahttp.aclient_post(&(*c).ah, (*c).req_url.ptr, (*c).req_url.len,
+        (*c).req_body.ptr, (*c).req_body.len, ct.p as u64, ct.n, 15000, on_login, c as u64)
+    if r as u64 == 0 {
+        (*c).busy_login = false
+        return false
+    }
+    return true
+}
+
+// ------------------------------------------------------------------- socket
+
+fn queue_push(c: *mut Jc, p: u64, n: usize) {
+    var hdr: [u8; 4] = [(n & 255) as u8, ((n >> 8) & 255) as u8, ((n >> 16) & 255) as u8, ((n >> 24) & 255) as u8]
+    rt.buf_push_bytes(&(*c).outq, (&hdr[0]) as u64, 4)
+    rt.buf_push_bytes(&(*c).outq, p, n)
+}
+
+fn queue_flush(c: *mut Jc) {
+    var at: usize = 0
+    while at + 4 <= (*c).outq.len {
+        let b0: usize = rt.ld8((*c).outq.ptr, at) as usize
+        let b1: usize = rt.ld8((*c).outq.ptr, at + 1) as usize
+        let b2: usize = rt.ld8((*c).outq.ptr, at + 2) as usize
+        let b3: usize = rt.ld8((*c).outq.ptr, at + 3) as usize
+        let n: usize = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        let ok: bool = wsc.wsc_send_text((*c).ws, (*c).outq.ptr + (at + 4) as u64, n)
+        at = at + 4 + n
+    }
+    rt.buf_clear(&(*c).outq)
+}
+
+fn wsend(c: *mut Jc, b: *mut rt.Buf) {
+    if jc_is_open(c) {
+        let ok: bool = wsc.wsc_send_text((*c).ws, (*b).ptr, (*b).len)
+        return
+    }
+    queue_push(c, (*b).ptr, (*b).len)
+    if !(*c).started {
+        jc_connect(c)
+    }
+}
+
+fn ws_url(c: *mut Jc, out: *mut rt.Buf) {
+    // http -> ws, https -> wss
+    var i: usize = 4
+    put(out, "ws")
+    if (*c).base.len >= 5 && rt.ld8((*c).base.ptr, 4) == 115 as u8 {
+        put(out, "s")
+        i = 5
+    }
+    rt.buf_push_bytes(out, (*c).base.ptr + i as u64, (*c).base.len - i)
+    put(out, "/?role=ui&dev=")
+    rt.buf_push_bytes(out, (*c).dev.ptr, (*c).dev.len)
+}
+
+fn send_tz(c: *mut Jc) {
+    var b: rt.Buf = rt.buf_new()
+    var w: json.JsonWriter = json.jw_new(&b, false)
+    json.jw_begin_object(&w)
+    jkey(&w, "type")
+    json.jw_string(&w, "tz".p as u64, 2)
+    jstr(&w, "tz", &(*c).tz)
+    json.jw_end(&w)
+    json.jw_free(&w)
+    let ok: bool = wsc.wsc_send_text((*c).ws, b.ptr, b.len)
+    rt.buf_free(&b)
+}
+
+fn jc_connect(c: *mut Jc) -> bool {
+    if (*c).base.len < 8 || (*c).token.len == 0 {
+        return false
+    }
+    if (*c).ws as u64 == 0 {
+        let w: *mut wsc.WsClient = wsc.wsc_new((*c).l, on_ws, c as u64)
+        if w as u64 == 0 {
+            return false
+        }
+        (*c).ws = w
+        wsc.wsc_use_system_trust(w)
+        wsc.wsc_set_auto_reconnect(w, true, 500, 15000, 0)
+        wsc.wsc_set_keepalive(w, 20000, 10000)
+        var ck: rt.Buf = rt.buf_new()
+        cookie_value(c, &ck)
+        let okh: bool = wsc.wsc_set_header(w, "Cookie", str { p: ck.ptr as *mut u8, n: ck.len })
+        rt.buf_free(&ck)
+    }
+    var u: rt.Buf = rt.buf_new()
+    ws_url(c, &u)
+    let ok: bool = wsc.wsc_connect((*c).ws, u.ptr, u.len)
+    rt.buf_free(&u)
+    (*c).started = ok
+    return ok
+}
+
+fn jc_disconnect(c: *mut Jc) {
+    (*c).started = false
+    if (*c).ws as u64 != 0 {
+        wsc.wsc_close((*c).ws, 1000)
+    }
+}
+
+fn on_ws(w: *mut wsc.WsClient, ud: u64, kind: u32, arg: u32) {
+    let c: *mut Jc = ud as *mut Jc
+    if kind == wsc.WE_OPEN {
+        send_tz(c)
+        queue_flush(c)
+        emit(c, JE_OPEN, "", 0)
+    } else if kind == wsc.WE_MESSAGE {
+        handle(c, wsc.wsc_msg_ptr(w), wsc.wsc_msg_len(w))
+    } else if kind == wsc.WE_CLOSE {
+        emit(c, JE_CLOSE, "", arg as i64)
+    } else if kind == wsc.WE_ERROR {
+        emit(c, JE_NETERR, "", arg as i64)
+    }
+}
+
+// ----------------------------------------------------------- server events
+
+fn jget_str(d: *mut json.Json, obj: u32, name: str) -> str.Span {
+    let n: u32 = json.json_get(d, obj, name.p as u64, name.n)
+    if n == json.JSON_NONE {
+        return str.span_empty()
+    }
+    return json.json_string(d, n)
+}
+
+// "mcp__server__tool" -> "tool"
+fn tool_short(s: str.Span) -> str.Span {
+    if s.n > 5 && rt.mem_eq(s.p as u64, "mcp__".p as u64, 5) {
+        var i: usize = 5
+        while i + 1 < s.n {
+            if *(s.p + i) == 95 as u8 && *(s.p + i + 1) == 95 as u8 {
+                return str.span((s.p + i + 2), s.n - i - 2)
+            }
+            i = i + 1
+        }
+    }
+    return s
+}
+
+fn handle(c: *mut Jc, p: u64, n: usize) {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, p, n) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return
+    }
+    let o: u32 = json.json_root(&d)
+    let ty: str.Span = jget_str(&d, o, "type")
+    let mc: str.Span = jget_str(&d, o, "cid")
+    if span_is(ty, "info") {
+        var arg: i64 = 0 - 1
+        let run: u32 = json.json_get(&d, o, "running".p as u64, 7)
+        if run != json.JSON_NONE && json.json_kind(&d, run) == json.JSON_ARRAY && (*c).cid.len > 0 {
+            arg = 0
+            var e: u32 = json.json_child(&d, run)
+            while e != json.JSON_NONE {
+                let s: str.Span = json.json_string(&d, e)
+                if s.n == (*c).cid.len && rt.mem_eq(s.p as u64, (*c).cid.ptr, s.n) {
+                    arg = 1
+                }
+                e = json.json_next(&d, e)
+            }
+        }
+        emit(c, JE_INFO, "", arg)
+    } else if span_is(ty, "conversation") {
+        let id: str.Span = jget_str(&d, o, "id")
+        if (*c).cid.len == 0 {
+            rt.buf_push_bytes(&(*c).cid, id.p as u64, id.n)
+        }
+        emit_span(c, JE_CONVERSATION, id, 0)
+    } else if span_is(ty, "confirm_request") {
+        let id2: str.Span = jget_str(&d, o, "id")
+        rt.buf_clear(&(*c).id)
+        rt.buf_push_bytes(&(*c).id, id2.p as u64, id2.n)
+        emit_span(c, JE_CONFIRM, jget_str(&d, o, "prompt"), 0)
+    } else if span_is(ty, "ask_request") {
+        if mc.n == 0 || (mc.n == (*c).cid.len && rt.mem_eq(mc.p as u64, (*c).cid.ptr, mc.n)) {
+            handle_ask(c, &d, o)
+        }
+    } else if span_is(ty, "ask_cancel") || span_is(ty, "ask_answered") {
+        rt.buf_clear(&(*c).id)
+        emit(c, JE_ASK_END, "", 0)
+    } else if mc.n == 0 || (mc.n == (*c).cid.len && rt.mem_eq(mc.p as u64, (*c).cid.ptr, mc.n)) {
+        if span_is(ty, "user") {
+            let t: str.Span = jget_str(&d, o, "text")
+            if t.n == (*c).last_sent.len && rt.mem_eq(t.p as u64, (*c).last_sent.ptr, t.n) {
+                rt.buf_clear(&(*c).last_sent) // my own echo
+            } else {
+                emit_span(c, JE_USER, t, 0)
+            }
+        } else if span_is(ty, "thinking") {
+            emit(c, JE_THINKING, "", 0)
+        } else if span_is(ty, "tool") {
+            emit_span(c, JE_TOOL, tool_short(jget_str(&d, o, "name")), 0)
+        } else if span_is(ty, "token") {
+            emit_span(c, JE_TOKEN, jget_str(&d, o, "content"), 0)
+        } else if span_is(ty, "done") {
+            emit(c, JE_DONE, "", 0)
+        } else if span_is(ty, "error") {
+            emit_span(c, JE_ERROR, jget_str(&d, o, "message"), 0)
+        } else if span_is(ty, "system") {
+            emit_span(c, JE_SYSTEM, jget_str(&d, o, "content"), 0)
+        } else if span_is(ty, "file") {
+            var nm: str.Span = jget_str(&d, o, "name")
+            if nm.n == 0 {
+                nm = jget_str(&d, o, "filename")
+            }
+            emit_span(c, JE_FILE, nm, 0)
+        }
+    }
+    json.json_free(&d)
+}
+
+// {id, question|questions:[{question, options:[str|{label}], multi}]}
+fn handle_ask(c: *mut Jc, d: *mut json.Json, o: u32) {
+    let id: str.Span = jget_str(d, o, "id")
+    rt.buf_clear(&(*c).id)
+    rt.buf_push_bytes(&(*c).id, id.p as u64, id.n)
+    rt.buf_clear(&(*c).opts)
+    var q: str.Span = jget_str(d, o, "question")
+    var optsn: u32 = json.json_get(d, o, "options".p as u64, 7)
+    var multi: bool = false
+    var many: bool = false
+    let qs: u32 = json.json_get(d, o, "questions".p as u64, 9)
+    if qs != json.JSON_NONE && json.json_kind(d, qs) == json.JSON_ARRAY && json.json_count(d, qs) > 0 {
+        let q0: u32 = json.json_child(d, qs)
+        q = jget_str(d, q0, "question")
+        optsn = json.json_get(d, q0, "options".p as u64, 7)
+        let mu: u32 = json.json_get(d, q0, "multi".p as u64, 5)
+        multi = mu != json.JSON_NONE && json.json_bool(d, mu)
+        many = json.json_count(d, qs) > 1
+    }
+    var nopts: usize = 0
+    if optsn != json.JSON_NONE && json.json_kind(d, optsn) == json.JSON_ARRAY {
+        var e: u32 = json.json_child(d, optsn)
+        while e != json.JSON_NONE {
+            var label: str.Span = str.span_empty()
+            if json.json_kind(d, e) == json.JSON_STRING {
+                label = json.json_string(d, e)
+            } else if json.json_kind(d, e) == json.JSON_OBJECT {
+                label = jget_str(d, e, "label")
+                if label.n == 0 {
+                    label = jget_str(d, e, "value")
+                }
+            }
+            if nopts > 0 {
+                rt.buf_push(&(*c).opts, 10 as u8)
+            }
+            rt.buf_push_bytes(&(*c).opts, label.p as u64, label.n)
+            nopts = nopts + 1
+            e = json.json_next(d, e)
+        }
+    }
+    var simple: i64 = 0
+    if nopts > 0 && !multi && !many {
+        simple = 1
+    }
+    emit_span(c, JE_ASK, q, simple)
+}
+
+// ------------------------------------------------------------------ sending
+
+fn jc_send(c: *mut Jc, text: str) {
+    set(&(*c).last_sent, text)
+    (*c).seq = (*c).seq + 1 as u64
+    var b: rt.Buf = rt.buf_new()
+    var w: json.JsonWriter = json.jw_new(&b, false)
+    json.jw_begin_object(&w)
+    jkey(&w, "type")
+    json.jw_string(&w, "message".p as u64, 7)
+    jstr(&w, "tz", &(*c).tz)
+    jkey(&w, "text")
+    json.jw_string(&w, text.p as u64, text.n)
+    jkey(&w, "mode")
+    json.jw_string(&w, "text".p as u64, 4)
+    jkey(&w, "cid")
+    if (*c).cid.len > 0 {
+        json.jw_string(&w, (*c).cid.ptr, (*c).cid.len)
+    } else {
+        json.jw_null(&w)
+    }
+    jkey(&w, "jarvisMode")
+    json.jw_bool(&w, true)
+    jkey(&w, "msgId")
+    var mid: rt.Buf = rt.buf_new()
+    put(&mid, "mini")
+    rt.buf_push_dec_i64(&mid, loop.mono_ms())
+    rt.buf_push(&mid, 95 as u8)
+    rt.buf_push_dec_i64(&mid, (*c).seq as i64)
+    json.jw_string(&w, mid.ptr, mid.len)
+    rt.buf_free(&mid)
+    jkey(&w, "images")
+    json.jw_begin_array(&w)
+    json.jw_end(&w)
+    jkey(&w, "files")
+    json.jw_begin_array(&w)
+    json.jw_end(&w)
+    json.jw_end(&w)
+    json.jw_free(&w)
+    wsend(c, &b)
+    rt.buf_free(&b)
+}
+
+fn jc_stop(c: *mut Jc) {
+    var b: rt.Buf = rt.buf_new()
+    var w: json.JsonWriter = json.jw_new(&b, false)
+    json.jw_begin_object(&w)
+    jkey(&w, "type")
+    json.jw_string(&w, "stop".p as u64, 4)
+    jkey(&w, "cid")
+    if (*c).cid.len > 0 {
+        json.jw_string(&w, (*c).cid.ptr, (*c).cid.len)
+    } else {
+        json.jw_null(&w)
+    }
+    json.jw_end(&w)
+    json.jw_free(&w)
+    wsend(c, &b)
+    rt.buf_free(&b)
+}
+
+// Answer the open JE_CONFIRM.
+fn jc_confirm(c: *mut Jc, allow: bool) {
+    if (*c).id.len == 0 {
+        return
+    }
+    var b: rt.Buf = rt.buf_new()
+    var w: json.JsonWriter = json.jw_new(&b, false)
+    json.jw_begin_object(&w)
+    jkey(&w, "type")
+    json.jw_string(&w, "confirm_result".p as u64, 14)
+    jstr(&w, "id", &(*c).id)
+    jkey(&w, "allow")
+    json.jw_bool(&w, allow)
+    json.jw_end(&w)
+    json.jw_free(&w)
+    wsend(c, &b)
+    rt.buf_free(&b)
+    rt.buf_clear(&(*c).id)
+}
+
+// Answer the open JE_ASK with one of its options.
+fn jc_answer(c: *mut Jc, label: str) {
+    if (*c).id.len == 0 {
+        return
+    }
+    var b: rt.Buf = rt.buf_new()
+    var w: json.JsonWriter = json.jw_new(&b, false)
+    json.jw_begin_object(&w)
+    jkey(&w, "type")
+    json.jw_string(&w, "ask_result".p as u64, 10)
+    jstr(&w, "id", &(*c).id)
+    jkey(&w, "answers")
+    json.jw_begin_array(&w)
+    json.jw_string(&w, label.p as u64, label.n)
+    json.jw_end(&w)
+    json.jw_end(&w)
+    json.jw_free(&w)
+    wsend(c, &b)
+    rt.buf_free(&b)
+    rt.buf_clear(&(*c).id)
+}
+
+// ------------------------------------------------------------------ history
+
+fn on_hist(r: *mut ahttp.Request, ud: u64) {
+    let c: *mut Jc = ud as *mut Jc
+    (*c).busy_hist = false
+    if ahttp.areq_error(r) != 0 {
+        emit(c, JE_HTTP_ERR, "", 0)
+        return
+    }
+    let status: u32 = ahttp.areq_status(r)
+    if status != 200 {
+        if status == 404 {
+            rt.buf_clear(&(*c).cid)
+        }
+        emit(c, JE_HTTP_ERR, "", status as i64)
+        return
+    }
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, ahttp.areq_body_ptr(r), ahttp.areq_body_len(r)) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        emit(c, JE_HTTP_ERR, "", 502)
+        return
+    }
+    let o: u32 = json.json_root(&d)
+    let conv: u32 = json.json_get(&d, o, "conversation".p as u64, 12)
+    if conv != json.JSON_NONE && json.json_kind(&d, conv) == json.JSON_OBJECT {
+        let ms: u32 = json.json_get(&d, conv, "messages".p as u64, 8)
+        if ms != json.JSON_NONE && json.json_kind(&d, ms) == json.JSON_ARRAY {
+            var e: u32 = json.json_child(&d, ms)
+            while e != json.JSON_NONE {
+                let role: str.Span = jget_str(&d, e, "role")
+                let t: str.Span = jget_str(&d, e, "text")
+                if span_is(role, "user") {
+                    emit_span(c, JE_HIST, t, 1)
+                } else if !(span_is(role, "tool") || span_is(role, "thinking") || span_is(role, "sys")
+                || span_is(role, "reminder") || span_is(role, "file") || span_is(role, "ask")) && t.n > 0 {
+                    emit_span(c, JE_HIST, t, 0)
+                }
+                e = json.json_next(&d, e)
+            }
+        }
+    }
+    var running: i64 = 0
+    let rn: u32 = json.json_get(&d, o, "running".p as u64, 7)
+    if rn != json.JSON_NONE && json.json_bool(&d, rn) {
+        running = 1
+    }
+    emit_span(c, JE_HIST_END, jget_str(&d, o, "partial"), running)
+    json.json_free(&d)
+}
+
+fn jc_history(c: *mut Jc) -> bool {
+    if (*c).busy_hist || (*c).cid.len == 0 || (*c).base.len == 0 {
+        return false
+    }
+    rt.buf_clear(&(*c).req_url)
+    rt.buf_push_bytes(&(*c).req_url, (*c).base.ptr, (*c).base.len)
+    put(&(*c).req_url, "/api/conversations/")
+    push_cookie_value(&(*c).req_url, (*c).cid.ptr, (*c).cid.len)
+    put(&(*c).req_url, "?turns=4")
+    (*c).busy_hist = true
+    let r: *mut ahttp.Request = ahttp.aclient_get(&(*c).ah, (*c).req_url.ptr, (*c).req_url.len, 15000, on_hist, c as u64)
+    if r as u64 == 0 {
+        (*c).busy_hist = false
+        return false
+    }
+    return true
+}
+
+// ----------------------------------------------------------- stored login
+
+// Keep base, token and chat id in std.secret under `service`.
+fn jc_save(c: *mut Jc, service: str) -> bool {
+    let b: str = as_str(&(*c).base)
+    let t: str = as_str(&(*c).token)
+    let ok1: bool = secret.secret_set(service, "base", b) catch false
+    let ok2: bool = secret.secret_set(service, "token", t) catch false
+    if (*c).cid.len > 0 {
+        let ok3: bool = secret.secret_set(service, "cid", as_str(&(*c).cid)) catch false
+    }
+    return ok1 && ok2
+}
+
+// Load what jc_save stored. false = nothing (or no keyring): log in again.
+fn jc_restore(c: *mut Jc, service: str) -> bool {
+    let t: str = secret.secret_get(service, "token") catch ""
+    if t.length() == 0 {
+        return false
+    }
+    let b: str = secret.secret_get(service, "base") catch ""
+    if b.length() > 0 {
+        jc_set_base(c, b)
+    }
+    jc_set_token(c, t)
+    let cid: str = secret.secret_get(service, "cid") catch ""
+    if cid.length() > 0 {
+        jc_set_cid(c, cid)
+    }
+    return true
+}
+
+// Log out locally: forget the stored token (the chat id stays).
+fn jc_forget(c: *mut Jc, service: str) {
+    let r: bool = secret.secret_delete(service, "token") catch false
+    rt.buf_clear(&(*c).token)
+}

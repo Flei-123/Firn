@@ -32,7 +32,7 @@ import plat.fuipopup
 import fui.menuview
 
 export {
-    Hooks, hooks_blank, hooks_new, hooks_set_audit, hooks_set_buf, hooks_set_edited, hooks_set_popups, hooks_set_ime, ImeBind, ime_install, run,
+    Hooks, hooks_blank, hooks_new, hooks_set_audit, hooks_set_buf, hooks_set_edited, hooks_set_popups, hooks_set_pump, hooks_set_ime, ImeBind, ime_install, run,
     PLATFORM,
     PLATFORM_LINUX, PLATFORM_WEB,
 }
@@ -85,6 +85,17 @@ struct Hooks {
     ime_del: fn(u64, usize, usize) -> bool,
     ime_confirm: fn(u64),
     ime_spot: fn(u64, *mut [f64; 3]) -> bool,
+    // THE PUMP (roadmap: fUi + network in one thread, lib/fui/looppump.fi): a
+    // second thing the window loop serves besides the window. `pump_fd` is a
+    // descriptor that is readable while the pump has work (async.loop's
+    // loop_fd; -1 = none), `pump_ms` caps the sleep so timers fire (the sleep
+    // the host wants -> the sleep the pump allows), `pump_step` serves it once
+    // and answers true when something happened (the host then repaints).
+    has_pump: bool,
+    pump_ud: u64,
+    pump_fd: fn(u64) -> i32,
+    pump_ms: fn(u64, i64) -> i64,
+    pump_step: fn(u64) -> bool,
 }
 
 // THE INPUT METHOD TABLE (r444b). apphost does NOT import plat.fuitext: that pulls in std.dynlib (libX11), which makes the image a
@@ -130,6 +141,18 @@ fn ime_del_none(ud: u64, before: usize, after: usize) -> bool {
 }
 
 fn ime_spot_none(ud: u64, out: *mut [f64; 3]) -> bool {
+    return false
+}
+
+fn pump_fd_none(ud: u64) -> i32 {
+    return 0 - 1
+}
+
+fn pump_ms_none(ud: u64, ms: i64) -> i64 {
+    return ms
+}
+
+fn pump_step_none(ud: u64) -> bool {
     return false
 }
 
@@ -179,7 +202,8 @@ fn hooks_blank() -> Hooks {
         w: 0, h: 0, audit: audit_none, has_audit: false, buf: buf_none,
         edited: edited_none, popups: popups_none, ime_pre: ime_pre_none,
         ime_commit: ime_commit_none, ime_end: ime_end_none, ime_del: ime_del_none, ime_confirm: ime_end_none,
-        ime_spot: ime_spot_none }
+        ime_spot: ime_spot_none, has_pump: false, pump_ud: 0,
+        pump_fd: pump_fd_none, pump_ms: pump_ms_none, pump_step: pump_step_none }
 }
 
 fn hooks_new(ud: u64, m: *mut theme.Theme, host: *mut fuiwirt.Host,
@@ -194,7 +218,8 @@ fn hooks_new(ud: u64, m: *mut theme.Theme, host: *mut fuiwirt.Host,
         audit: audit_none, has_audit: false, buf: buf_none,
         edited: edited_none, popups: popups_none, ime_pre: ime_pre_none,
         ime_commit: ime_commit_none, ime_end: ime_end_none, ime_del: ime_del_none, ime_confirm: ime_end_none,
-        ime_spot: ime_spot_none }
+        ime_spot: ime_spot_none, has_pump: false, pump_ud: 0,
+        pump_fd: pump_fd_none, pump_ms: pump_ms_none, pump_step: pump_step_none }
 }
 
 fn hooks_set_audit(h: *mut Hooks, f: fn(u64) -> i32) {
@@ -212,6 +237,16 @@ fn hooks_set_edited(h: *mut Hooks, f: fn(u64)) {
 
 fn hooks_set_popups(h: *mut Hooks, f: fn(u64) -> u64) {
     (*h).popups = f
+}
+
+// See `Hooks.pump_*`. Call it before `run`; lib/fui/looppump.fi does it for an
+// async.loop.
+fn hooks_set_pump(h: *mut Hooks, ud: u64, fd: fn(u64) -> i32, ms: fn(u64, i64) -> i64, step: fn(u64) -> bool) {
+    (*h).has_pump = true
+    (*h).pump_ud = ud
+    (*h).pump_fd = fd
+    (*h).pump_ms = ms
+    (*h).pump_step = step
 }
 
 fn hooks_set_ime(h: *mut Hooks, pre: fn(u64, u64, usize, usize) -> bool, commit: fn(u64, u64, usize) -> bool, end: fn(u64),
@@ -371,12 +406,26 @@ fn run(h: *mut Hooks) -> i32 {
     // nothing happens)
     var kbuf: u64 = 0
     while open && !(*h).done((*h).ud) {
-        let ms: i64 = fuiwirt.host_wait_ms(w)
+        var ms: i64 = fuiwirt.host_wait_ms(w)
+        var pump_fd: i32 = 0 - 1
+        if (*h).has_pump {
+            // timers of the pump bound the sleep; its descriptor wakes it
+            ms = (*h).pump_ms((*h).pump_ud, ms)
+            pump_fd = (*h).pump_fd((*h).pump_ud)
+        }
         if ms != 0 {
             var xfd: i32 = 0 - 1
             if ime_up {
                 let fdf: fn() -> i32 = (*ime_tab()).fd
                 xfd = fdf()
+            }
+            if pump_fd >= 0 {
+                if xfd < 0 {
+                    xfd = pump_fd
+                } else if ms < 0 || ms > 10 {
+                    // the window wait watches ONE extra descriptor and the IME has it: look at the pump every 10 ms
+                    ms = 10
+                }
             }
             if ph as u64 != 0 {
                 // the XIM connection is watched too: an IME (ibus ...) commits on it by itself
@@ -386,6 +435,12 @@ fn run(h: *mut Hooks) -> i32 {
                 let hit: i64 = window.wait_any_fd(&wins, 1, xfd, ms)
             } else {
                 let e: bool = window.wait_event(f, ms)
+            }
+        }
+        if (*h).has_pump {
+            // network, timers, posted results: on this thread, between two window turns
+            if (*h).pump_step((*h).pump_ud) {
+                fuiwirt.host_touch(w)
             }
         }
         if ime_up {

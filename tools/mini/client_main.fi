@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/mini/client_main.fi <base-url> -- net.jarvisc against tools/mini/fake_jarvis.py
+// (driven by tools/mini/check.py). A script of events: login refused / accepted,
+// socket, chat, history, other device, confirm, ask, stop, a dropped socket with a
+// queued message, and the stored login (std.secret) used by a second client.
+// Prints "ok <what>" / "FAIL <what>" and "MINI CLIENT OK" at the end.
+import std.rt
+import std.io
+import std.str
+import async.loop
+import net.jarvisc
+
+static mut fails: u32 = 0
+static mut checks: u32 = 0
+static mut step: i32 = 0
+static mut acc_b: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut users_seen: u32 = 0
+static mut hist_n: u32 = 0
+static mut hf_b: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut hl_b: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut opens: u32 = 0
+static mut infos: u32 = 0
+static mut stopped: bool = false
+static mut closes: u32 = 0
+static mut loop_ptr: u64 = 0
+static mut c2_ptr: u64 = 0
+static mut base_ptr: u64 = 0
+static mut base_n: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+    rt.write_everything(1, "\n".p as u64, 1)
+}
+
+fn check(ok: bool, what: str) {
+    checks = checks + 1
+    if ok {
+        say("ok " + what)
+    } else {
+        fails = fails + 1
+        say("FAIL " + what)
+    }
+}
+
+fn finish(l: *mut loop.Loop) {
+    loop.stop(l)
+}
+
+fn on_timeout(l: *mut loop.Loop, ud: u64) {
+    check(false, "finished in time (step " + dec(step as i64) + ")")
+    loop.stop(l)
+}
+
+fn bs(b: *mut rt.Buf) -> str {
+    return __str_copy(str { p: (*b).ptr as *mut u8, n: (*b).len })
+}
+
+fn dec(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    let s: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+fn next(c: *mut jarvisc.Jc, n: i32, msg: str) {
+    step = n
+    rt.buf_clear(&acc_b)
+    jarvisc.jc_send(c, msg)
+}
+
+fn on_second(c: *mut jarvisc.Jc, ud: u64, kind: u32, arg: i64) {
+    if kind == jarvisc.JE_OPEN {
+        check(true, "stored login: second client connects without a login")
+        check(jarvisc.jc_cid(c) == "fake1", "stored login: chat id restored")
+        loop.stop(loop_ptr as *mut loop.Loop)
+    }
+}
+
+fn on_event(c: *mut jarvisc.Jc, ud: u64, kind: u32, arg: i64) {
+    if kind == jarvisc.JE_LOGIN {
+        if step == 0 {
+            check(arg == 401, "wrong password -> 401")
+            check(!jarvisc.jc_has_token(c), "no token after a refused login")
+            step = 1
+            let ok: bool = jarvisc.jc_login(c, "justin", "pw")
+            check(ok, "second login started")
+        } else {
+            check(arg == 200, "login -> 200")
+            check(jarvisc.jc_user(c) == "justin", "user name from the login answer")
+            check(jarvisc.jc_has_token(c), "token kept")
+            step = 2
+            check(jarvisc.jc_connect(c), "connect started")
+        }
+    } else if kind == jarvisc.JE_OPEN {
+        opens = opens + 1
+        if opens == 1 {
+            next(c, 3, "hallo")
+        } else {
+            // second open: the queued message is flushed right after this event
+            check(step == 8, "reconnected after the dropped socket")
+        }
+    } else if kind == jarvisc.JE_INFO {
+        infos = infos + 1
+        if infos == 1 {
+            check(arg == 0 - 1, "info before any chat: -1")
+        } else {
+            check(arg == 0, "info after reconnect: our chat does not run")
+        }
+    } else if kind == jarvisc.JE_CONVERSATION {
+        check(jarvisc.jc_text(c) == "fake1" && jarvisc.jc_cid(c) == "fake1", "conversation id stored")
+    } else if kind == jarvisc.JE_THINKING {
+        check(true, "thinking event")
+    } else if kind == jarvisc.JE_TOOL {
+        check(jarvisc.jc_text(c) == "run_shell", "tool name without mcp__x__")
+    } else if kind == jarvisc.JE_TOKEN {
+        let t: str = jarvisc.jc_text(c)
+        rt.buf_push_bytes(&acc_b, t.p as u64, t.n)
+        if step == 9 && !stopped {
+            stopped = true
+            jarvisc.jc_stop(c)
+        }
+    } else if kind == jarvisc.JE_USER {
+        users_seen = users_seen + 1
+        check(jarvisc.jc_text(c) == "from phone", "message of another device")
+        next(c, 5, "confirm")
+    } else if kind == jarvisc.JE_CONFIRM {
+        check(jarvisc.jc_text(c) == "Run it?" && jarvisc.jc_id(c) == "c1", "confirm request")
+        jarvisc.jc_confirm(c, true)
+    } else if kind == jarvisc.JE_ASK {
+        check(arg == 1 && jarvisc.jc_options(c) == "A\nB" && jarvisc.jc_text(c) == "Which?", "ask request with options")
+        jarvisc.jc_answer(c, "B")
+    } else if kind == jarvisc.JE_HIST {
+        hist_n = hist_n + 1
+        if hist_n == 1 {
+            rt.buf_clear(&hf_b)
+            let t1: str = jarvisc.jc_text(c)
+            rt.buf_push_bytes(&hf_b, t1.p as u64, t1.n)
+            check(arg == 1, "history: first is the user")
+        } else {
+            rt.buf_clear(&hl_b)
+            let t2: str = jarvisc.jc_text(c)
+            rt.buf_push_bytes(&hl_b, t2.p as u64, t2.n)
+        }
+    } else if kind == jarvisc.JE_HIST_END {
+        check(hist_n == 2 && bs(&hf_b) == "hallo", "history: two messages")
+        check(jarvisc.jc_clean(bs(&hl_b)) == "reply to hallo", "history: status line cut")
+        check(arg == 0, "history: not running")
+        next(c, 4, "other")
+    } else if kind == jarvisc.JE_CLOSE {
+        closes = closes + 1
+        if step == 10 {
+            step = 8
+            jarvisc.jc_send(c, "queued")
+        }
+    } else if kind == jarvisc.JE_DONE {
+        if step == 3 {
+            check(bs(&acc_b) == "Hallo hallo\n>STATUS: status=done", "tokens in order")
+            check(jarvisc.jc_clean(bs(&acc_b)) == "Hallo hallo", "status line cut by jc_clean")
+            check(users_seen == 0, "own message echo dropped")
+            step = 30
+            check(jarvisc.jc_history(c), "history request")
+        } else if step == 4 {
+            // wait for the user event of the other device
+        } else if step == 5 {
+            check(bs(&acc_b) == "allow=true", "confirm answered with allow=true")
+            next(c, 6, "ask")
+        } else if step == 6 {
+            check(bs(&acc_b) == "ans=B", "ask answered with B")
+            check(!(users_seen != 1), "only one foreign user message")
+            next(c, 9, "slow")
+        } else if step == 9 {
+            check(stopped, "stop sent while streaming")
+            next(c, 10, "drop")
+        } else if step == 8 {
+            check(bs(&acc_b) == "Hallo queued\n>STATUS: status=done", "queued message delivered after reconnect")
+            check(!(opens < 2), "socket opened twice")
+            check(closes >= 1, "close event seen")
+            check(jarvisc.jc_save(c, "firn-mini-test"), "token stored in std.secret")
+            let c2: *mut jarvisc.Jc = jarvisc.jc_new(loop_ptr as *mut loop.Loop, on_second, 0)
+            c2_ptr = c2 as u64
+            check(jarvisc.jc_restore(c2, "firn-mini-test"), "restore from std.secret")
+            check(jarvisc.jc_connect(c2), "second client connect")
+        }
+    } else if kind == jarvisc.JE_ERROR {
+        check(false, "unexpected error event " + jarvisc.jc_text(c))
+    }
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        return 2
+    }
+    var l: loop.Loop = loop.loop_new()
+    if !loop.loop_init(&l) {
+        return 2
+    }
+    loop_ptr = (&l) as u64
+    let bp: u64 = rt.arg_ptr(start, 1)
+    let base: str = str { p: bp as *mut u8, n: rt.c_length(bp) }
+    let c: *mut jarvisc.Jc = jarvisc.jc_new(&l, on_event, 0)
+    jarvisc.jc_set_base(c, base)
+    jarvisc.jc_set_tz(c, "Europe/Vienna")
+    jarvisc.jc_set_dev(c, "ftst")
+    check(jarvisc.jc_login(c, "justin", "wrong"), "login started")
+    loop.timer_after(&l, 20000, on_timeout, 0)
+    loop.run(&l)
+    if fails == 0 && checks > 20 {
+        say("MINI CLIENT OK " + dec(checks as i64) + " checks")
+        return 0
+    }
+    say("MINI CLIENT FAILED " + dec(fails as i64))
+    return 1
+}
