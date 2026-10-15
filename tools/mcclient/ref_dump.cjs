@@ -41,7 +41,7 @@ const P14 = PROTOCOL >= 477 && PROTOCOL <= 498 // 1.14 - 1.14.4: dense longs, 25
 const P15 = PROTOCOL >= 573 && PROTOCOL <= 578 // 1.15 - 1.15.2: dense longs, 1024 biome ints as an own field
 const P17 = PROTOCOL >= 755 && PROTOCOL <= 756 // 1.17 - 1.17.1: no groundUp, bitMap = BitSet (long array), light masks = long arrays
 const SPAN_114 = P14 || P15
-const SECTIONS_114 = P14 || P15 || (PROTOCOL >= 751 && PROTOCOL <= 756) // CF_SECTIONS_114 (1.14, 1.15, 1.16.2 - 1.17.1)
+const SECTIONS_114 = P14 || P15 || (PROTOCOL >= 735 && PROTOCOL <= 736) || (PROTOCOL >= 751 && PROTOCOL <= 756) // CF_SECTIONS_114 (1.14, 1.15, 1.16 - 1.16.1, 1.16.2 - 1.17.1)
 
 const fs = require('fs')
 const crypto = require('crypto')
