@@ -6,7 +6,7 @@
 #     independent reference (python / node / java tools, never Mojang code).
 #     Each prints a line `RESULT <name>: ok` and exits 0 on success.
 #
-# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay)
+# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | edge)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
@@ -91,6 +91,13 @@ if [ -z "$ONLY" ] || [ "$ONLY" = contplay ]; then
     echo "== mc/contplay =="
     bash tools/mc/play/run_cont.sh 1.20.1 || ERR=$((ERR+1))
     bash tools/mc/play/run_cont.sh 1.21.4 || ERR=$((ERR+1))
+fi
+# sneak edge (maybeBackOffFromEdge): sneaking W / W+D on a platform never walks off, the control run without sneak falls; client == server: ~3 min per version.
+if [ -z "$ONLY" ] || [ "$ONLY" = edge ]; then
+    echo "== mc/edge =="
+    bash tools/mc/play/run_edge.sh || ERR=$((ERR+1))
+    MC_VERSION=1.21.4 bash tools/mc/play/run_edge.sh || ERR=$((ERR+1))
+    MC_VERSION=1.21.8 bash tools/mc/play/run_edge.sh || ERR=$((ERR+1))
 fi
 if [ $ERR -eq 0 ]; then echo "RESULT mc: ok"; else echo "RESULT mc: $ERR failing parts"; fi
 exit $ERR

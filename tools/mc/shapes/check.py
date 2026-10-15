@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """check.py <dump-output> <minecraft-data/data/pc/1.20 dir> -- compares the collision boxes of lib/mc/mc_shapes.fi (dump.fi) with
-minecraft-data blockCollisionShapes for EVERY state of the modelled families, as 1/16 voxel sets (union of boxes).
+minecraft-data blockCollisionShapes for EVERY state of the modelled families (s11: panes, bars, anvils, cauldrons, hoppers, farmland, dirt path, soul sand, mud, honey), as 1/16 voxel sets (union of boxes).
 Prints 'ok <family> <n>' lines, 'MISSING' for states of the families that got no shape, 'DIFF' lines; exit 1 on any difference.
 Informational: block names with a partial (non-cube) shape that mc_shapes does not model."""
 import json, sys
@@ -31,7 +31,10 @@ for line in open(dump):
 fams = [("fence", lambda n: n.endswith("_fence")), ("fence_gate", lambda n: n.endswith("_fence_gate")),
         ("wall", lambda n: n.endswith("_wall")), ("door", lambda n: n.endswith("_door")),
         ("trapdoor", lambda n: n.endswith("_trapdoor")), ("bed", lambda n: n.endswith("_bed")),
-        ("chest", lambda n: n in ("chest", "trapped_chest", "ender_chest"))]
+        ("chest", lambda n: n in ("chest", "trapped_chest", "ender_chest")),
+        ("pane", lambda n: n.endswith("glass_pane") or n == "iron_bars"), ("anvil", lambda n: n.endswith("anvil")),
+        ("cauldron", lambda n: n.endswith("cauldron")), ("hopper", lambda n: n == "hopper"),
+        ("low", lambda n: n in ("farmland", "dirt_path", "soul_sand", "mud", "honey_block"))]
 bad = 0
 cnt = {}
 modelled = set()
@@ -53,7 +56,7 @@ for b in bl:
                 cnt[fam] = cnt.get(fam, 0) + 1
             continue
         code, boxes = got[st]
-        have = vox(boxes) if code != 255 else set()
+        have = vox(boxes) if code != 65535 else set()
         if have != exp:
             bad += 1
             if bad < 30:

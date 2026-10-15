@@ -100,18 +100,21 @@ let ok = 0
 // 1.21.2+ (protocol 768+): minecraft-data still lists the old entity_teleport layout, the game sends
 // id, pos f64x3, delta f64x3, yaw f32, pitch f32, flags i32, on ground = sync_entity_position + an i32 before the last octet
 const TELEPORT_V21 = V.protocol >= 768
+// returns { body, flags }: the random flags are part of the packet AND of the reference parameters (bit 0..2 x y z, 3 yaw, 4 pitch relative)
 function teleportV21Body (params) {
   const sync = Buffer.from(codec.serialize('sync_entity_position', params))
   const flags = Buffer.alloc(4)
-  flags.writeInt32BE(ri(-2147483648, 2147483647), 0)
-  return Buffer.concat([sync.subarray(0, sync.length - 1), flags, sync.subarray(sync.length - 1)])
+  const fl = ri(-2147483648, 2147483647)
+  flags.writeInt32BE(fl, 0)
+  return { body: Buffer.concat([sync.subarray(0, sync.length - 1), flags, sync.subarray(sync.length - 1)]), flags: fl }
 }
 function emit (name, params) {
   let body
   if (name === 'entity_teleport' && TELEPORT_V21) {
     params = build('sync_entity_position', { entityId: params.entityId })
-    body = teleportV21Body(params)
-    params = Object.assign({ v21: true }, params)
+    const t = teleportV21Body(params)
+    body = t.body
+    params = Object.assign({ v21: true, flags: t.flags }, params)
   } else {
     body = codec.serialize(name, params)
   }

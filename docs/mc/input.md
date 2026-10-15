@@ -16,7 +16,7 @@ Pure data: the caller fills `InputEvents` (mouse delta px, key mask `K_FORWARD/B
   up without a jump; full blocks (1.0) still need a jump / Auto-Jump. Since s5 also modelled (codes K_FENCE.. in mc_math): fences / walls /
   fence gates (1.5 high: no jump clears them), doors, trapdoors (open + top / bottom), beds (slab + legs), chests (single + double halves,
   trapped / ender). Every state is checked against minecraft-data 1.20 (`bash tools/mc/shapes/run.sh`, exact 1/16 voxels). `grid_move` /
-  `grid_overlaps` scan one cell below the box (tall shapes reach 1.5). Not modelled: glass panes, iron bars, anvils, cauldrons, hoppers, ...
+  `grid_overlaps` scan one cell below the box (tall shapes reach 1.5). Since s11 also glass panes / iron bars, anvils, cauldrons, hoppers, honey block, farmland / dirt path / soul sand / mud (see s11). Not modelled: see the `info:` line of `tools/mc/shapes/run.sh` (candles, bells, dripleaf, amethyst, ...).
 * Sneak edge (vanilla `maybeBackOffFromEdge`): sneaking (not flying) on the ground, or < 0.6 into a fall with a floor within 0.6, cuts the
   horizontal move in 0.05 steps (x, then z, then both) while the box moved 0.6 down would touch nothing -> no walking off a ledge; a drop
   of <= 0.6 is not an edge. `Player.fall` = fall distance (reset on ground / fly / noclip).
@@ -34,9 +34,18 @@ Measured: input_pick ~2.0 us/call, player_tick ~170 us (256 chunks; linear `worl
 
 ## s8 (15.10.)
 * The `InputTables.solid` / `BlockGrid.solid` tables are u16 per state now (codes 0, 1..127 full, 128 + k shape k; room for 65407 shapes; the player's
-  class table `Player.cls` has `CLS_N` = 65536 entries). `mc_shapes.shapes_fill` writes u16. New shapes (panes, bars, anvil, cauldron, hopper, low blocks) still to add (r211).
+  class table `Player.cls` has `CLS_N` = 65536 entries). `mc_shapes.shapes_fill` writes u16. New shapes: see s11.
 * Sneak edge live: `bash tools/mc/play/run_edge.sh [MC_VERSION]` -- 5x5 platform 5 blocks up, sneaking W / W+D stops at z <= 5.30 / x >= -2.30, never falls, client == server
   position, no "moved wrongly"; control without sneak falls. 1.20.1 green (z 5295, x -2295 mm).
 * Sneak packets (measured against real servers, `tools/mcclient/sneak_probe.sh`): <= 1.21.5 Entity Action 0 / 1, 1.21.2+ also Player Input (shift), 1.21.6+ Player Input only.
   1.21.4+ ignores both until Player Loaded (0x2A on 1.21.4) arrived (or ~3 s passed): `mc_play.send_loaded` after the first chunks.
 
+
+## s11 (15.10.)
+* New shape codes (all checked voxel-exact against minecraft-data 1.20, `bash tools/mc/shapes/run.sh`; 8 mutation counter-checks): `K_PANE + m` glass panes / stained panes / iron bars
+  (16 codes, bits 1 N / 2 S / 4 W / 8 E, m 0 = centre post, 2/16 arms from the edge to 9/16), `K_ANVIL + a` (a 0 = facing north/south, 1 = west/east), `K_CAULDRON` (cauldron, water / lava /
+  powder snow; 15 boxes), `K_HOPPER + f` (down, north, south, west, east), `K_HONEY` (1/16 inset, 15/16 high), `K_LOW + h` (full footprint, h/16 high: farmland / dirt path / grass path 15, soul sand / mud 14).
+  Fixed multi-box shapes are letter tables in `mc_math.shape_box_s11` (`tbl16`: 6 letters per box, 'a' + sixteenths).
+* The "passable" sentinel of `mc_shapes.shape_code_for_state` is `mc_shapes.PASSABLE` = 65535 now (was 255, which would collide with shape codes >= 127).
+* Walking: soul sand (0.875) / farmland (0.9375) are not stepped up (> 0.6), a jump climbs them; panes (1.0) block like walls of one block. Test `tests/3470_mc_shapes_s11.fi`.
+* `bash tools/mc/run.sh edge` = sneak edge gate (`run_edge.sh`) for 1.20.1 / 1.21.4 / 1.21.8 (all green: sneak W max_z 5.295, W+D x -2.295 / z 5.265, control falls).
