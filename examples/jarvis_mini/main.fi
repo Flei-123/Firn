@@ -1,0 +1,269 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_mini/main.fi -- the JARVIS mini chat box in Firn.
+//
+//     jarvis_mini [base-url]        (default https://jarvis.fleitec.com)
+//
+// A small frameless always-on-top window in the bottom right corner of the work area. First start: user name, then
+// password (the session token is kept with std.secret, the next start logs in by itself). Enter sends, Esc hides,
+// Ctrl+Alt+J shows / hides it from anywhere, the top strip drags the window, the window height follows the chat.
+//   net.jarvisc (login, WebSocket, events) + fui.looppump (network and window in ONE thread) + fui.markdownview (the
+//   chat) + window.extras (topmost, corner, frameless, fit height, hotkey). Docs: docs/MINI-NET.md, docs/WINDOW-EXTRAS.md.
+import std.rt
+import async.loop
+import net.jarvisc
+import fui.app
+import fui.looppump
+import fui.render
+import fui.scene
+import fui.widget
+import fui.style
+import fui.editor
+import fui.markdownview
+import markdown.doc
+import plat.fuiwirt
+import window.window
+import window.extras
+
+const SERVICE: str = "jarvis-mini"
+const DRAG_PT: f64 = 24.0
+const MAX_H: usize = 560
+
+static mut G_APP: u64 = 0
+static mut G_JC: u64 = 0
+static mut G_WIN: u64 = 0
+static mut G_MD: u64 = 0
+static mut G_NODE: usize = 0
+static mut G_TITLE: usize = 0
+static mut G_IN: usize = 0
+static mut G_STATUS: usize = 0
+static mut G_STAGE: u32 = 0
+static mut G_FOLLOW: bool = true
+static mut G_ANS_AT: usize = 0
+static mut G_LAST_H: usize = 0
+static mut G_HIST_ASKED: bool = false
+static mut G_CHAT: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_USER: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+
+fn jc() -> *mut jarvisc.Jc { return G_JC as *mut jarvisc.Jc }
+fn win() -> *mut window.Window { return G_WIN as *mut window.Window }
+fn mdv() -> *mut markdownview.MdView { return G_MD as *mut markdownview.MdView }
+fn ui() -> *mut app.App { return G_APP as *mut app.App }
+
+fn status(s: str) { app.set_text(ui(), G_STATUS, s) }
+
+fn dec(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    let s: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+// the chat text changed: parse it again, scroll to the end
+fn chat_changed() {
+    markdownview.mdv_set_markdown(mdv(), str { p: G_CHAT.ptr as *mut u8, n: G_CHAT.len }, doc.opts_default())
+    G_FOLLOW = true
+}
+
+fn chat_add(s: str) {
+    rt.buf_push_bytes(&G_CHAT, s.p as u64, s.n)
+    chat_changed()
+}
+
+fn set_stage(st: u32) {
+    G_STAGE = st
+    app.set_secret(ui(), G_IN, st == 1 as u32)
+    app.set_text(ui(), G_IN, "")
+    if st == 0 as u32 { status("user name:") }
+    if st == 1 as u32 { status("password:") }
+}
+
+// ---- JARVIS events
+fn on_event(c: *mut jarvisc.Jc, ud: u64, kind: u32, arg: i64) {
+    if kind == jarvisc.JE_LOGIN {
+        if arg == 200 {
+            let saved: bool = jarvisc.jc_save(c, SERVICE)
+            status("connecting ...")
+            let ok: bool = jarvisc.jc_connect(c)
+        } else {
+            set_stage(0 as u32)
+            status("login failed (" + dec(arg) + "), user name:")
+        }
+    } else if kind == jarvisc.JE_OPEN {
+        status("online")
+        if !G_HIST_ASKED && jarvisc.jc_cid(c) != "" {
+            G_HIST_ASKED = true
+            let h: bool = jarvisc.jc_history(c)
+        }
+    } else if kind == jarvisc.JE_HTTP_ERR && arg == 401 {
+        jarvisc.jc_forget(c, SERVICE)
+        set_stage(0 as u32)
+    } else if kind == jarvisc.JE_HIST {
+        if arg == 1 {
+            chat_add("**You:** " + jarvisc.jc_text(c) + "\n\n")
+        } else {
+            chat_add("**JARVIS:** " + jarvisc.jc_clean(jarvisc.jc_text(c)) + "\n\n")
+        }
+    } else if kind == jarvisc.JE_TOKEN {
+        chat_add(jarvisc.jc_text(c))
+    } else if kind == jarvisc.JE_THINKING {
+        status("thinking ...")
+    } else if kind == jarvisc.JE_TOOL {
+        status("tool: " + jarvisc.jc_text(c))
+    } else if kind == jarvisc.JE_ERROR {
+        chat_add("\n\n**error:** " + jarvisc.jc_text(c) + "\n\n")
+    } else if kind == jarvisc.JE_DONE {
+        // cut the ">STATUS:" line the server appends to an answer
+        let ans: str = __str_copy(str { p: ((G_CHAT.ptr as u64) + G_ANS_AT as u64) as *mut u8, n: G_CHAT.len - G_ANS_AT })
+        G_CHAT.len = G_ANS_AT
+        chat_add(jarvisc.jc_clean(ans) + "\n\n")
+        status("online")
+    }
+}
+
+// ---- input: Enter sends (or steps through the login), Esc hides
+fn on_key(a: *mut app.App, key: u32, mods: u32) -> bool {
+    if key == editor.KEY_ESC {
+        let h: bool = extras.hide(win())
+        return true
+    }
+    if key != editor.KEY_ENTER {
+        return false
+    }
+    let t: str = __str_copy(app.text(a, G_IN))
+    if t.n == 0 {
+        return true
+    }
+    if G_STAGE == 0 as u32 {
+        rt.buf_clear(&G_USER)
+        rt.buf_push_bytes(&G_USER, t.p as u64, t.n)
+        set_stage(1 as u32)
+    } else if G_STAGE == 1 as u32 {
+        let user: str = __str_copy(str { p: G_USER.ptr as *mut u8, n: G_USER.len })
+        let ok: bool = jarvisc.jc_login(jc(), user, t)
+        set_stage(2 as u32)
+        status("logging in ...")
+    } else {
+        chat_add("**You:** " + t + "\n\n**JARVIS:** ")
+        G_ANS_AT = G_CHAT.len
+        jarvisc.jc_send(jc(), t)
+        app.set_text(a, G_IN, "")
+        status("sent")
+    }
+    return true
+}
+
+// ---- window: the handle, the hotkey, dragging, the wheel
+fn on_opened(ud: u64, w: u64) {
+    G_WIN = w
+    let f: *mut window.Window = win()
+    let b1: bool = extras.set_frameless(f, true)
+    let b2: bool = extras.set_topmost(f, true)
+    let b3: bool = extras.place_corner(f, extras.CORNER_BR, window.scaled(f, 16))
+    let b4: bool = extras.hotkey_set(f, 1 as u32, window.HK_CTRL | window.HK_ALT, 106 as u32) // j
+}
+
+fn on_hotkey(ud: u64, id: u32) {
+    if id != 1 as u32 {
+        return
+    }
+    if extras.is_visible(win()) {
+        let h: bool = extras.hide(win())
+    } else {
+        let s: bool = extras.show(win())
+    }
+}
+
+fn scale() -> f64 {
+    return window.scaled(win(), 1000) as f64 / 1000.0
+}
+
+fn on_pointer(ud: u64, kind: u32, x: f64, y: f64) -> bool {
+    if kind == fuiwirt.HOOK_DOWN && G_WIN != 0 && y < DRAG_PT * scale() {
+        window.window_drag(win())
+    }
+    return false
+}
+
+fn on_wheel(ud: u64, x: f64, y: f64, nx: f64, ny: f64) -> bool {
+    markdownview.mdv_wheel(mdv(), ny * 3.0)
+    return true
+}
+
+// ---- the chat view: a node of its own, painted by markdownview
+fn draw_chat(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let sc: *mut scene.Scene = app.app_scene(ui())
+    let n: usize = scene.scene_node_of(sc, e)
+    let v: *mut markdownview.MdView = mdv()
+    markdownview.mdv_set_rect(v, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n), scene.node_h(sc, n))
+    markdownview.mdv_paint(v, c)
+    if G_FOLLOW {
+        G_FOLLOW = false
+        markdownview.mdv_set_offset(v, markdownview.mdv_content_height(v))
+        markdownview.mdv_paint(v, c)
+    }
+    // the view is as high as its content (min 60, max MAX_H); the window follows
+    if G_WIN == 0 {
+        return
+    }
+    let f: *mut window.Window = win()
+    var want: usize = markdownview.mdv_content_height(v) as usize
+    if want < window.scaled(f, 60) {
+        want = window.scaled(f, 60)
+    }
+    if want > window.scaled(f, MAX_H) {
+        want = window.scaled(f, MAX_H)
+    }
+    if want != G_LAST_H {
+        let old_h: usize = scene.node_h(sc, n) as usize
+        G_LAST_H = want
+        scene.node_set_size(sc, n, scene.node_w(sc, n) / scale(), want as f64 / scale())
+        // chrome = the bottom of the entry plus the same padding as above the title; the view's share changes
+        let chrome: usize = (scene.node_y(sc, G_IN) + scene.node_h(sc, G_IN) + scene.node_y(sc, G_TITLE)) as usize
+        let total: usize = chrome + want - old_h
+        let b: bool = extras.fit_height(f, extras.CORNER_BR, window.scaled(f, 16), total, window.scaled(f, 140), 0)
+    }
+}
+
+// `#[allow_escape]`: loop and view live as long as `app.run`, which is all of main.
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var base: str = "https://jarvis.fleitec.com"
+    if rt.arg_count(start) >= 2 {
+        let bp: u64 = rt.arg_ptr(start, 1)
+        base = str { p: bp as *mut u8, n: rt.c_length(bp) }
+    }
+    var l: loop.Loop = loop.loop_new()
+    if !loop.loop_init(&l) {
+        return 2
+    }
+    var md: markdownview.MdView = markdownview.mdv_new()
+    markdownview.mdv_set_background(&md, style.TOK_BASE)
+    G_MD = (&md) as u64
+    let a: *mut app.App = app.window("JARVIS", 380, 300)
+    G_APP = a as u64
+    G_TITLE = app.label(a, "JARVIS", 13)
+    G_NODE = app.custom(a, widget.KIND_TILE, 360, 140)
+    scene.node_set_draw(app.app_scene(a), G_NODE, 0, draw_chat)
+    G_STATUS = app.label(a, "", 11)
+    G_IN = app.entry(a, "message")
+    app.set_width(a, G_IN, 360)
+    app.on_key(a, on_key)
+    app.set_wheel(a, 0, on_wheel)
+    app.set_motion(a, 0, on_pointer)
+    app.set_window_hooks(a, 0, on_opened, on_hotkey)
+    looppump.attach(a, &l)
+    let c: *mut jarvisc.Jc = jarvisc.jc_new(&l, on_event, 0)
+    G_JC = c as u64
+    jarvisc.jc_set_base(c, base)
+    jarvisc.jc_set_tz(c, "Europe/Vienna")
+    jarvisc.jc_set_dev(c, "firn-mini")
+    if jarvisc.jc_restore(c, SERVICE) {
+        G_STAGE = 2
+        status("connecting ...")
+        let ok: bool = jarvisc.jc_connect(c)
+    } else {
+        set_stage(0 as u32)
+    }
+    return app.run(a)
+}
