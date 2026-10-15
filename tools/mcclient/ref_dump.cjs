@@ -30,8 +30,10 @@ function teleportV21 (buf) {
   const x = buf.readDoubleBE(o); const y = buf.readDoubleBE(o + 8); const z = buf.readDoubleBE(o + 16)
   o += 48 // position + delta movement
   const yaw = buf.readFloatBE(o); const pitch = buf.readFloatBE(o + 4)
-  o += 8 + 4 // + relative flags
-  return { entityId, x, y, z, yaw, pitch, onGround: buf[o] !== 0, v21: true }
+  o += 8
+  const flags = buf.readInt32BE(o) // relative flags: bit 0..4 = x y z yaw pitch are relative
+  o += 4
+  return { entityId, x, y, z, yaw, pitch, flags, onGround: buf[o] !== 0, v21: true }
 }
 const LEGACY_SECTIONS = PROTOCOL <= 340 && PROTOCOL >= 107 // 1.9 - 1.12.2: CF_SECTIONS_19
 const LEGACY8 = PROTOCOL <= 47 // 1.8 - 1.8.9: CF_LEGACY_8 (map_chunk + map_chunk_bulk, unpaletted u16 LE blocks)
@@ -658,10 +660,12 @@ function main () {
   })
   client.on('packet', (data, meta, buffer, full) => {
     packets++; walkOk++
-    if (RAW_NAMES && RAW_NAMES.has(meta.name) && buffer) fs.appendFileSync(dumpFile + '.raw', `${meta.name} ${buffer.toString('hex')}\n`) // MC_RAW_NAMES=a,b: raw bodies for layout checks
+    // `buffer` is cut after the fields minecraft-data knows (a stale layout leaves bytes unread); `full` is the whole packet
+    const whole = (full && buffer && full.length > buffer.length) ? full : buffer
+    if (RAW_NAMES && RAW_NAMES.has(meta.name) && whole) fs.appendFileSync(dumpFile + '.raw', `${meta.name} ${whole.toString('hex')}\n`) // MC_RAW_NAMES=a,b: raw bodies for layout checks
     // minecraft-data lists the pre-1.21.2 entity_teleport layout for 1.21.2+: decode the real one from the raw body
     // (packet id varint, entity id varint, pos f64x3, delta f64x3, yaw f32, pitch f32, flags i32, on ground bool)
-    if (meta.name === 'entity_teleport' && PROTOCOL >= 768 && buffer) data = teleportV21(buffer)
+    if (meta.name === 'entity_teleport' && PROTOCOL >= 768 && whole) data = teleportV21(whole)
     try { tracker.onPacket(meta.name, data) } catch (e) { entityErrors++; console.error('entity packet ' + meta.name + ': ' + e.message) }
     bytesDec += (full || buffer || Buffer.alloc(0)).length
   })
