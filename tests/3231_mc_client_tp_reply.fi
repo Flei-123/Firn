@@ -1,0 +1,107 @@
+// expect_exit: 0
+// tests/3231_mc_client_tp_reply.fi -- r197: client_auto_reply answers a Synchronize Player Position (1.20.1, 763) over a real loopback
+// socket. Default: Teleport Confirm (same id) + a position packet at the server's coordinates. With client_set_pos_reply(false) (mcplay):
+// the Teleport Confirm ONLY -- the vanilla server refuses a move in the same server tick as the confirm ("moved too quickly", a rubber band
+// storm of 25 teleports in one tick under load), so the app sends the position with its next game tick.
+import std.net
+import std.rt
+import std.bytes
+import mc.mc_codec
+import mc.mc_client
+import mc.mc_encode
+import mc.mc_sem
+import mc.mc_version
+import mc.v763.mc_proto_v763
+
+static mut g_fail: i32 = 0
+
+fn check(ok: bool, msg: str) {
+    if !ok {
+        var o: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&o, "FAIL ".p as u64, 5)
+        rt.buf_push_bytes(&o, msg.p as u64, msg.n)
+        rt.buf_push(&o, 10)
+        rt.write_everything(1, rt.buf_ptr(&o), rt.buf_len(&o))
+        rt.buf_free(&o)
+        g_fail = g_fail + 1
+    }
+}
+
+// server side: send one Synchronize Player Position (teleport id `tid`), x/y/z as given
+fn send_position(sw: *mut mc_codec.Wire, ver: *mut mc_version.Version, tid: i64) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    mc_encode.vals_f64(&v, "x", 0.5)
+    mc_encode.vals_f64(&v, "y", 100.0)
+    mc_encode.vals_f64(&v, "z", 0.5)
+    mc_encode.vals_f32(&v, "yaw", 0.0f)
+    mc_encode.vals_f32(&v, "pitch", 0.0f)
+    mc_encode.vals_i64(&v, "flags", 0)
+    mc_encode.vals_i64(&v, "teleportId", tid)
+    mc_encode.vals_bool(&v, "dismountVehicle", false)
+    var body: bytes.Bytes = bytes.bytes_new()
+    let id: i32 = mc_version.version_pid(ver, mc_sem.SEM_PLAY_S2C_POSITION)
+    let sch: u64 = (*ver).schema_of(mc_version.ST_PLAY, mc_version.DIR_S2C, id)
+    var ok: bool = sch != 0 && id >= 0
+    if ok { ok = mc_encode.encode_buf(sch, &v, &body, 0 as *mut rt.Buf) }
+    if ok {
+        let n: usize = mc_codec.wire_send_packet(sw, id, &body) catch 0
+        ok = n > 0
+    }
+    bytes.bytes_free(&body)
+    rt.buf_free(&v)
+    return ok
+}
+
+// one round: the server sends a position packet, the client answers it; returns the C2S packet ids the server sees (confirm, then maybe a move)
+fn round(pos_reply: bool, tid: i64, got_confirm: *mut bool, got_move: *mut bool, confirm_tid: *mut i64) {
+    *got_confirm = false
+    *got_move = false
+    *confirm_tid = 0 - 1
+    var ver: mc_version.Version = mc_proto_v763.version_make()
+    var lst: net.Listener = net.listen_tcp(net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8), 0 as u16) catch net.listener_from_fd(0 - 1)
+    check(net.listener_is_open(&lst), "listen")
+    let port: u16 = net.listener_port(&lst)
+    var cc: net.Conn = net.connect_tcp(net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8), port) catch net.conn_from_fd(0 - 1)
+    check(net.conn_is_open(&cc), "connect")
+    var sc: net.Conn = net.accept(&lst) catch net.conn_from_fd(0 - 1)
+    check(net.conn_is_open(&sc), "accept")
+    var cl: mc_client.Client = mc_client.client_new(cc, ver)
+    mc_client.client_set_pos_reply(&cl, pos_reply)
+    var sw: mc_codec.Wire = mc_codec.wire_open(sc)
+    check(send_position(&sw, &ver, tid), "server sends position")
+    mc_codec.wire_timeout(&cl.w, 2000)
+    let id: i32 = mc_client.client_next(&cl)
+    check(id == mc_version.version_pid(&ver, mc_sem.SEM_PLAY_S2C_POSITION), "client reads the position packet")
+    check(mc_client.client_auto_reply(&cl, id), "auto reply handled")
+    check(cl.teleports == 1 as u64, "teleport counted")
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var z: f64 = 0.0
+    check(mc_client.client_position(&cl, &x, &y, &z) && y == 100.0 && x == 0.5 && z == 0.5, "client_position = server position")
+    var body: bytes.Bytes = bytes.bytes_new()
+    mc_codec.wire_timeout(&sw, 300)
+    let i1: i32 = mc_codec.wire_read_packet(&sw, &body) catch 0 - 100
+    if i1 == mc_version.version_pid(&ver, mc_sem.SEM_PLAY_C2S_TELEPORT_CONFIRM) {
+        *got_confirm = true
+        *confirm_tid = (bytes.get_varint(&body) catch 0 - 2) as i64
+    }
+    let i2: i32 = mc_codec.wire_read_packet(&sw, &body) catch 0 - 100
+    if i2 == mc_version.version_pid(&ver, mc_sem.SEM_PLAY_C2S_POSITION_LOOK) { *got_move = true }
+    mc_codec.wire_close(&sw)
+    mc_client.client_free(&cl)
+    net.close_listener(&lst)
+    // `body` is only a VIEW on the wire buffer: nothing to free
+}
+
+fn main() -> i32 {
+    var c: bool = false
+    var m: bool = false
+    var t: i64 = 0
+    round(true, 7, &c, &m, &t)
+    check(c && t == 7, "default: confirm with the teleport id")
+    check(m, "default: position packet follows the confirm")
+    round(false, 9, &c, &m, &t)
+    check(c && t == 9, "pos_reply off: confirm with the teleport id")
+    check(!m, "pos_reply off: NO position packet in the same breath as the confirm")
+    return g_fail
+}
