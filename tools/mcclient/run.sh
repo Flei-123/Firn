@@ -225,10 +225,20 @@ ent_script() { # $1 = number of the join line to wait for; then plays the events
   echo "$EXEC_AT summon $CHICKEN ~ ~2 ~-3 {NoAI:1b}" >&3; sleep 0.5
   echo "kill @e[type=$CHICKEN]" >&3; sleep 0.3
   if [ "${RIDER:-0}" -eq 1 ]; then
+    # r210: a first-time player spawns at a RANDOM spot near the world spawn, so a fixed ride (+3/+4, then -2/+1) sometimes crossed a chunk
+    # border. The server then sent an extra chunk column only when its generation / sending was fast enough (timing), and the dump (union of
+    # everything sent, unloads ignored) differed between sessions (B +11 chunks). The ride now moves AWAY from the nearer chunk border on both
+    # axes (sx / sz = +1 or -1 from the start position in the server log), so it never leaves the start chunk (max 3 / 5 blocks, border >= 8 away).
+    local sx=1 sz=1 d1x d1z d2x d2z pos
+    pos=$(grep "$NAME\[.*logged in with entity id" "$W/server.log" | sed -n "${n}p" | sed -nE 's/.* at \((-?[0-9.]+), (-?[0-9.]+), (-?[0-9.]+)\).*/\1 \3/p')
+    if [ -n "$pos" ]; then
+      read -r sx sz < <(awk -v p="$pos" 'BEGIN { split(p, a, " "); x = a[1]; z = a[2]; lx = x - 16 * int(x / 16); if (lx < 0) lx += 16; lz = z - 16 * int(z / 16); if (lz < 0) lz += 16; print (lx < 8 ? 1 : -1), (lz < 8 ? 1 : -1) }')
+    fi
+    d1x=$(( 3 * sx )); d1z=$(( 4 * sz )); d2x=$(( -2 * sx )); d2z=$(( sz ))
     echo "$EXEC_AT summon minecart ~ ~ ~" >&3; sleep 0.5
     echo "ride $NAME mount @e[type=minecart,limit=1]" >&3; sleep 0.8
-    echo "$EXEC_AT tp @e[type=minecart] ~3 ~ ~4" >&3; sleep 0.8
-    echo "$EXEC_AT tp @e[type=minecart] ~-2 ~ ~1 90 0" >&3; sleep 0.8
+    echo "$EXEC_AT tp @e[type=minecart] ~$d1x ~ ~$d1z" >&3; sleep 0.8
+    echo "$EXEC_AT tp @e[type=minecart] ~$d2x ~ ~$d2z 90 0" >&3; sleep 0.8
     echo "ride $NAME dismount" >&3; sleep 0.4
     echo "kill @e[type=minecart]" >&3; sleep 0.4
     # back to the start point: the armor stand was summoned 2 blocks west of the dumper's start position

@@ -92,9 +92,10 @@ The client picks the version from the protocol number in the server-list ping.
 | **1.12.2** | **340** | yes | yes (500) | `CF_SECTIONS_19` **implemented** (`mc_chunk.chunk_decode_19`) | **yes** (11.10.2026: real 1.12.2 server, dump byte-identical to the reference client, 81 chunks) |
 | **1.16 / 1.16.1** | **735 / 736** | yes | yes (612) | `CF_SECTIONS_114` (ignoreOldData bool, 1024 biome ints, non-spanning longs) | **yes** (15.10.2026: real 1.16 + 1.16.1 servers, byte-identical, 121 chunks, entities equal) |
 | **1.16.5** | **754** | yes | yes (616) | `CF_SECTIONS_114` **implemented** (`mc_chunk.chunk_decode_114`, protocols 751-754) | **yes** (11.10.2026: real 1.16.5 server, dump byte-identical to the reference client, 121 chunks) |
-| **1.14.4** | **498** | yes | n/a | `CF_SECTIONS_114` (dense longs, 256 biome ints behind the sections, `chunk_decode_114n`) | **chunks yes** (14.10.2026: real 1.14.4 server, dump byte-identical to the reference client, 121 chunks, walk_fail 0); entity scenario NOT proven (its commands fail on this version) |
-| **1.15.2** | **578** | yes | n/a | `CF_SECTIONS_114` (dense longs, 1024 biome ints as own field) | **chunks yes** (14.10.2026: real 1.15.2 server, byte-identical, 121 chunks, walk_fail 0); entity scenario NOT proven |
-| **1.17.1** | **756** | yes | n/a | `CF_SECTIONS_114` (BitSet mask, no groundUp, sections from the dimension) | **chunks yes** (14.10.2026: real 1.17.1 server, byte-identical, 121 chunks, walk_fail 0); entity scenario NOT proven |
+| **1.14.4** | **498** | yes | n/a | `CF_SECTIONS_114` (dense longs, 256 biome ints behind the sections, `chunk_decode_114n`) | **chunks yes** (14.10.2026: real 1.14.4 server, dump byte-identical to the reference client, 121 chunks, walk_fail 0); **entities yes** (15.10.2026: checksum c060ac148e36, entities EQUAL 3 vs 3) |
+| **1.15.2** | **578** | yes | n/a | `CF_SECTIONS_114` (dense longs, 1024 biome ints as own field) | **chunks yes** (14.10.2026: real 1.15.2 server, byte-identical, 121 chunks, walk_fail 0); **entities yes** (15.10.2026: checksum 0d868aa1bd4f, entities EQUAL 3 vs 3) |
+| **1.17 (1.17.0)** | **755** | yes | yes (660) | `CF_SECTIONS_114` (like 1.17.1; NO state id in window packets, destroy = ONE entity id) | **real server yes** (15.10.2026: A == A2, B == A, 121 chunks, checksum 2e260e004201, entities EQUAL 3 vs 3, walk_fail 0) |
+| **1.17.1** | **756** | yes | n/a | `CF_SECTIONS_114` (BitSet mask, no groundUp, sections from the dimension) | **chunks yes** (14.10.2026: real 1.17.1 server, byte-identical, 121 chunks, walk_fail 0); **entities yes** (15.10.2026: checksum 6639bc9b4f14, entities EQUAL 3 vs 3) |
 | **1.18 / 1.18.1** | **757** | yes | yes (664) | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` | **yes** (15.10.2026: real 1.18 + 1.18.1 servers, byte-identical, entities equal) |
 | **1.18.2** | **758** | yes | yes | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` **implemented** | **yes** (14.10.2026: real 1.18.2 server, dump byte-identical to the reference client, 121 chunks) |
 | **1.19** | **759** | yes | yes | `CF_CONTAINERS_118` + `FLAG_TRUST_EDGES` **implemented** | **yes** (14.10.2026: real 1.19 server, dump byte-identical to the reference client, 121 chunks, light lines + entities equal) |
@@ -368,3 +369,18 @@ their real values), so it needs no hashes. The server hashes ITS stack the same 
 * Gate: `tools/mc/schema/run.sh <firnc> 757 | 735 | 736` ok (664 / 612 / 612 fixtures x 4 stages). Tests: `tests/3040` variant 16 (1.16.1 hand built, error paths);
   `tests/2745` and `3040` now refuse 734 instead of 735.
 
+## 13. Round 2026-10-15 (worker mc-s6-versionen-1-17-0-entity-szenar): entity scenario 1.14.4 / 1.15.2 / 1.17.1, 1.17.0, r210
+
+* Entity scenario on old versions: it already works (`BOT_TP` next to the dumper); the "Incorrect argument for command" lines are only the gamerule
+  names that do not exist yet (`doInsomnia`, snake_case names ...) and `No entity was found` is `kill @e[type=item]` with no item. `MC_SETTLE_MS` must stay at the default (45 s):
+  with 20 s the fluids are still moving and A != A2. Real servers, full run, `RESULT: PASS` (A == A2, B == A, entities EQUAL 3 vs 3, 121 chunks):
+  1.14.4 c060ac148e36, 1.15.2 0d868aa1bd4f, 1.17.1 6639bc9b4f14.
+* **1.17.0 (755)** in `versions.json` (`CF_SECTIONS_114`, pack_format 7, nmp "1.17"; `gen_protocol.py --all` -> `lib/mc/v755`, only that dir + layout/versions/blocktex tables changed).
+  Differences to 1.17.1: no state id in Window Items / Set Slot / Click (`mc_inv` already used `protocol >= 756`), and **Destroy Entity (`destroy_entity`) carries ONE entity id**
+  (1.17.1 is back to the `entity_destroy` array). Bug found by the live run: the semantic id `PLAY_S2C_ENTITY_DESTROY` was -1 for 755, so no entity was ever removed.
+  Fix: `semantic.json` also lists `destroy_entity`, `gen_entity.py` emits the layout token `Ev` for it (array = `Av`), `mc_entity.do_destroy(.., single)` reads one id,
+  `ref_entities.cjs` (reference tracker) handles `destroy_entity`. Test `tests/3370_mc_v755.fi` (lookup, layouts, spawn + single destroy). Gate `tools/mc/schema/run.sh <firnc> 755` ok (660 fixtures x 4 stages).
+* **r210 (B has +11 chunks in the rider run), cause found**: a first-time player spawns at a RANDOM spot within the spawn radius, so the fixed ride (+3/+4, then -2/+1) crosses a chunk border in
+  some runs. The server then sends one extra chunk column, but only if its load / send is fast enough while the dumper is away (timing) - and both dumpers keep the UNION of every column
+  that was sent (unload packets ignored by design, `ref_dump.cjs` header). B (fast, no connect delay) got the column (`chunk_packets=131 unloads=22`), A / A2 did not. Fix in
+  `tools/mcclient/run.sh`: the ride moves away from the nearer chunk border on both axes (start position from the server log), so it never leaves the start chunk. `MC_ENT_RIDER=1` is deterministic now.

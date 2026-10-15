@@ -33,7 +33,7 @@ KINDS = [  # (kind constant, semantic name list in minecraft-data, packet fields
     ("REL_MOVE", ["rel_entity_move"]),
     ("MOVE_LOOK", ["entity_move_look"]),
     ("LOOK", ["entity_look"]),
-    ("DESTROY", ["entity_destroy"]),
+    ("DESTROY", ["entity_destroy", "destroy_entity"]),
     ("VELOCITY", ["entity_velocity"]),
     ("SYNC_POSITION", ["sync_entity_position"]),
 ]
@@ -56,6 +56,11 @@ def layout_of(proto, names, move):
             continue
         assert t[0] == "container", n
         fields = t[1]
+        if n == "destroy_entity":
+            # 1.17.0 (protocol 755) only: ONE entity id per packet (1.17.1 went back to the array)
+            assert len(fields) == 1 and fields[0]["name"] == "entityId" and fields[0]["type"] == "varint", \
+                "destroy_entity layout changed: " + json.dumps(fields)
+            return "Ev"
         if n == "entity_destroy":
             f = fields[0]
             ty = f["type"]
