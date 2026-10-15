@@ -16,7 +16,7 @@ Pure data: the caller fills `InputEvents` (mouse delta px, key mask `K_FORWARD/B
   up without a jump; full blocks (1.0) still need a jump / Auto-Jump. Since s5 also modelled (codes K_FENCE.. in mc_math): fences / walls /
   fence gates (1.5 high: no jump clears them), doors, trapdoors (open + top / bottom), beds (slab + legs), chests (single + double halves,
   trapped / ender). Every state is checked against minecraft-data 1.20 (`bash tools/mc/shapes/run.sh`, exact 1/16 voxels). `grid_move` /
-  `grid_overlaps` scan one cell below the box (tall shapes reach 1.5). Since s11 also glass panes / iron bars, anvils, cauldrons, hoppers, honey block, farmland / dirt path / soul sand / mud (see s11). Not modelled: see the `info:` line of `tools/mc/shapes/run.sh` (candles, bells, dripleaf, amethyst, ...).
+  `grid_overlaps` scan one cell below the box (tall shapes reach 1.5). Since s11 also glass panes / iron bars, anvils, cauldrons, hoppers, honey block, farmland / dirt path / soul sand / mud (see s11). Since s14 ALL remaining partial shapes of 1.20 (141 blocks: candles, bell, chain, lanterns, dripleaf, ladder, cactus, pots, heads, piston, ...) come from the generated table (see s14).
 * Sneak edge (vanilla `maybeBackOffFromEdge`): sneaking (not flying) on the ground, or < 0.6 into a fall with a floor within 0.6, cuts the
   horizontal move in 0.05 steps (x, then z, then both) while the box moved 0.6 down would touch nothing -> no walking off a ledge; a drop
   of <= 0.6 is not an edge. `Player.fall` = fall distance (reset on ground / fly / noclip).
@@ -49,3 +49,10 @@ Measured: input_pick ~2.0 us/call, player_tick ~170 us (256 chunks; linear `worl
 * The "passable" sentinel of `mc_shapes.shape_code_for_state` is `mc_shapes.PASSABLE` = 65535 now (was 255, which would collide with shape codes >= 127).
 * Walking: soul sand (0.875) / farmland (0.9375) are not stepped up (> 0.6), a jump climbs them; panes (1.0) block like walls of one block. Test `tests/3470_mc_shapes_s11.fi`.
 * `bash tools/mc/run.sh edge` = sneak edge gate (`run_edge.sh`) for 1.20.1 / 1.21.4 / 1.21.8 (all green: sneak W max_z 5.295, W+D x -2.295 / z 5.265, control falls).
+
+## s14 (15.10.)
+* r222: the remaining 141 blocks with a partial shape are DATA, not rules: `tools/mc/shapes/gen_tab.py <minecraft-data 1.20 dir> lib/mc/mc_shape_data.fi` generates per block one shape index per state (offset inside the block's state range), a pool of 206 distinct shapes
+  (1/32 units, coordinates may leave the cell: piston head, pitcher crop; lily pad / chain / bamboo need 1/32) -> code `128 + K_TAB (200) + pool index`. Lookup `mc_shapes.tab_code` by block name; it is skipped (old table value kept) when the
+  block's state count differs from the 1.20 data (other versions). Not modelled: the random xz offset of bamboo / pointed dripstone, honey / cobweb slowdown.
+* `tools/mc/shapes/run.sh` checks all 1709 table states voxel-exact (1/32), regenerates the table and diffs it, 15 mutation counter-checks. Test `tests/3510_mc_shapes_tab.fi`.
+* r225: tool components hash up to 32 rules with up to 16 block ids each (`TL_RULES` / `TL_IDS` in mc_inv); live set F of `tools/mc/play/run_hash.sh`.

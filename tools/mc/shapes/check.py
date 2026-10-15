@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """check.py <dump-output> <minecraft-data/data/pc/1.20 dir> -- compares the collision boxes of lib/mc/mc_shapes.fi (dump.fi) with
-minecraft-data blockCollisionShapes for EVERY state of the modelled families (s11: panes, bars, anvils, cauldrons, hoppers, farmland, dirt path, soul sand, mud, honey), as 1/16 voxel sets (union of boxes).
+minecraft-data blockCollisionShapes for EVERY state of the modelled families (s11: panes, bars, anvils, cauldrons, hoppers, farmland, dirt path, soul sand, mud, honey), as 1/32 voxel sets (union of boxes).
 Prints 'ok <family> <n>' lines, 'MISSING' for states of the families that got no shape, 'DIFF' lines; exit 1 on any difference.
 Informational: block names with a partial (non-cube) shape that mc_shapes does not model."""
 import json, sys
@@ -9,10 +9,17 @@ cs = json.load(open(d + "/blockCollisionShapes.json"))
 bl = json.load(open(d + "/blocks.json"))
 shapes = cs["shapes"]
 
+_vc = {}
 def vox(boxes):
+    key = tuple(tuple(b) for b in boxes)
+    if key not in _vc:
+        _vc[key] = vox_(boxes)
+    return _vc[key]
+
+def vox_(boxes):
     s = set()
     for b in boxes:
-        x0, y0, z0, x1, y1, z1 = [round(c * 16) for c in b]
+        x0, y0, z0, x1, y1, z1 = [round(c * 32) for c in b]
         for x in range(x0, x1):
             for y in range(y0, y1):
                 for z in range(z0, z1):
@@ -26,7 +33,7 @@ for line in open(dump):
         continue
     st, code, nb = int(t[1]), int(t[2]), int(t[3])
     nums = list(map(int, t[4:]))
-    got[st] = (code, [tuple(c / 16 for c in nums[i * 6:i * 6 + 6]) for i in range(nb)])
+    got[st] = (code, [tuple(c / 32 for c in nums[i * 6:i * 6 + 6]) for i in range(nb)])
 
 fams = [("fence", lambda n: n.endswith("_fence")), ("fence_gate", lambda n: n.endswith("_fence_gate")),
         ("wall", lambda n: n.endswith("_wall")), ("door", lambda n: n.endswith("_door")),
@@ -35,6 +42,19 @@ fams = [("fence", lambda n: n.endswith("_fence")), ("fence_gate", lambda n: n.en
         ("pane", lambda n: n.endswith("glass_pane") or n == "iron_bars"), ("anvil", lambda n: n.endswith("anvil")),
         ("cauldron", lambda n: n.endswith("cauldron")), ("hopper", lambda n: n == "hopper"),
         ("low", lambda n: n in ("farmland", "dirt_path", "soul_sand", "mud", "honey_block"))]
+# s14: every other block with a partial shape comes from the generated table mc_shape_data
+RULE = ("_slab", "_stairs", "_carpet")
+tabnames = set()
+for b in bl:
+    n = b["name"]
+    if n.endswith(RULE) or n == "snow" or any(p(n) for _, p in fams):
+        continue
+    ids = cs["blocks"].get(n)
+    for i in set(ids if isinstance(ids, list) else [ids]):
+        if shapes[str(i)] not in ([], [[0, 0, 0, 1, 1, 1]]):
+            tabnames.add(n)
+            break
+fams.append(("tab", lambda n: n in tabnames))
 bad = 0
 cnt = {}
 modelled = set()
@@ -65,15 +85,9 @@ for b in bl:
             cnt[fam] = cnt.get(fam, 0) + 1
 for f, n in cnt.items():
     print("  ok", f, n, "states")
-extra = set()
-for name, ids in cs["blocks"].items():
-    if name in modelled or name.endswith("_slab") or name.endswith("_stairs") or name.endswith("_carpet") or name == "snow":
-        continue
-    for i in set(ids if isinstance(ids, list) else [ids]):
-        s = shapes[str(i)]
-        if s != [] and s != [[0, 0, 0, 1, 1, 1]]:
-            extra.add(name)
-            break
-print("  info: partial shapes NOT modelled:", len(extra), "blocks e.g.", ", ".join(sorted(extra)[:12]))
+print("  info: tab blocks", len(tabnames))
+if len(tabnames) < 100:
+    bad += 1
+    print("DIFF tab: too few table blocks", len(tabnames))
 print("RESULT mc-shapes-data:", "FAIL" if bad else "ok", bad)
 sys.exit(1 if bad else 0)
