@@ -3,11 +3,20 @@
 # glibc-linked programs) replaces the main thread's fs base when the mesher threads start, so the first Mesa/libGLdispatch TLS access
 # (glBindFramebuffer in the first frame of mcplay MCPLAY_GL=1) is a SIGSEGV. tests/2993 is the probe: it must exit 42.
 # Fix for a stale binary: (cd /root/firn/compiler && cargo build --release) via heavy. Exit 0 = ok, 1 = stale / broken.
+# s12: warns (non-fatal) when the binary is older than the newest compiler/ commit; FIRNC_AUTOBUILD=1 rebuilds a stale /root/firn compiler via heavy and re-probes.
 set -u
 cd "$(dirname "$0")/../.."
 FIRNC=${1:-${FIRNC:-compiler/target/release/firnc}}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+# newest commit touching compiler/ (in /root/firn) vs. the binary's mtime
+CT=$(git -C /root/firn log -1 --format=%ct -- compiler 2>/dev/null || echo 0); BT=$(stat -c %Y "$FIRNC" 2>/dev/null || echo 0)
+if [ "${CT:-0}" -gt "$BT" ]; then
+    echo "  WARN  check_firnc: $FIRNC (built $(date -d @"$BT" +%F\ %T)) is older than the last compiler commit ($(date -d @"$CT" +%F\ %T)): rebuild with heavy bash -c 'cd /root/firn/compiler && cargo build --release'"
+    if [ "${FIRNC_AUTOBUILD:-0}" = 1 ] && [ "$FIRNC" = /root/firn/compiler/target/release/firnc ]; then
+        echo "  FIRNC_AUTOBUILD=1: rebuilding"; /root/jarvis/bin/heavy bash -c "cd /root/firn/compiler && cargo build --release" 2>&1 | tail -2
+    fi
+fi
 if ! FIRNLIB="$(pwd)/lib" "$FIRNC" -o "$D/probe" tests/2993_dynlib_thread_tls.fi 2>"$D/err"; then
     head -5 "$D/err"; echo "  FAIL  check_firnc: probe 2993 does not compile with $FIRNC"; exit 1
 fi

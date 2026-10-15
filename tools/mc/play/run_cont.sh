@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/mc/play/run_cont.sh [mc_version=1.20.1] -- container windows against an official server: title from Open Window, hopper (5) / dispenser (3x3) / shulker box (27) / double chest (54) layout, sneak + right click on a chest places the held block
+# tools/mc/play/run_cont.sh [mc_version=1.20.1] -- container windows against an official server: title from Open Window, hopper (5) / dispenser (3x3) / shulker box (27) / double chest (54) / crafting table (10) / furnace, blast furnace, smoker (3) layout, sneak + right click on a chest places the held block
 
 # Prints `RESULT mc-play-cont: ok|FAIL`. Env as run_inv.sh (FIRNC, JAVA, MC_VIEW, MCPLAY_KEEP_DIR).
 set -uo pipefail
@@ -56,10 +56,11 @@ ERR=0
 # one mcplay run per scenario (MCPLAY_SNEAK_TEST): $1 = player, $2 = block to set next to the player, $3 = force sneaking (0/1), $4 = output file.
 # The script waits for the given stone, right clicks the top face of the block and prints one `sneaktest` line.
 run_case() {
-    MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_SNEAK_TEST=1 MCPLAY_FORCE_SNEAK=$3 MCPLAY_RUN_S=18 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
-        timeout 120 "$W/mcplay" 127.0.0.1 "$PORT" "$1" > "$4" 2>&1 &
+    MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_SNEAK_TEST=1 MCPLAY_FORCE_SNEAK=$3 MCPLAY_RUN_S=${CONT_RUN_S:-30} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+        timeout 170 "$W/mcplay" 127.0.0.1 "$PORT" "$1" > "$4" 2>&1 &
     PP=$!
-    sleep 5
+    for i in $(seq 1 90); do grep -q "$1 joined the game" "$W/server.log" 2>/dev/null && break; sleep 1; done # r217: wait for the join, not a blind sleep
+    sleep 3
     echo "gamemode survival $1" >&3; echo "give $1 stone 32" >&3
     echo "execute at $1 run setblock ~1 ~ ~ minecraft:$2" >&3
     [ -z "${5:-}" ] || echo "execute at $1 run setblock ~2 ~ ~ minecraft:$5" >&3
@@ -81,6 +82,11 @@ run_case ContD dispenser 0 "$W/d.out"
 run_case ContE shulker_box 0 "$W/e.out"
 # double chest: two chests next to each other (facing north: the left half is the west one), the player clicks the one next to him
 run_case ContF "chest[facing=north,type=left]" 0 "$W/f.out" "chest[facing=north,type=right]"
+# r218: crafting table (result + 3x3 grid) and the furnace family (input, fuel, result): window opens with the right layout and title (live, not just unit)
+run_case ContG crafting_table 0 "$W/g.out"
+run_case ContH furnace 0 "$W/h.out"
+run_case ContI blast_furnace 0 "$W/i.out"
+run_case ContJ smoker 0 "$W/j.out"
 # Sneak state: Entity Action up to 1.21.5, Player Input (shift) from 1.21.6 (+ both on 1.21.2 - 1.21.5, like the vanilla client); Player Loaded first (1.21.4+)
 check "sneak+click (block placed, chest stays closed)" "$W/a.out" "sneak=true win=0 " "sneak_packets=1"
 case "$(grep 'mcplay: sneaktest' "$W/a.out" | head -1)" in *"placed=0 "*) echo "  FAIL  sneak: no block appeared above the chest"; ERR=1;; esac
@@ -89,7 +95,11 @@ check "hopper" "$W/c.out" "slots=5 cols=5 title=Item Hopper "
 check "dispenser" "$W/d.out" "slots=9 cols=3 title=Dispenser "
 check "shulker box" "$W/e.out" "slots=27 cols=9 title=Shulker Box "
 check "double chest" "$W/f.out" "slots=54 cols=9 title=Large Chest "
-for f in a b c d e f; do
+check "crafting table" "$W/g.out" "slots=10 cols=3 title=Crafting "
+check "furnace" "$W/h.out" "slots=3 cols=3 title=Furnace "
+check "blast furnace" "$W/i.out" "slots=3 cols=3 title=Blast Furnace "
+check "smoker" "$W/j.out" "slots=3 cols=3 title=Smoker "
+for f in a b c d e f g h i j; do
     BAD=$(grep -o 'bad=[0-9]*' "$W/$f.out" | head -1)
     case "$(grep 'mcplay: sneaktest' "$W/$f.out" | head -1)" in *"win=0 "*) [ $f = a ] || { echo "  FAIL  $f: no window"; ERR=1; };; esac
 done
