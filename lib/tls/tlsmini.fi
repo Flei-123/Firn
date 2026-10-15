@@ -1,0 +1,951 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/tls/tlsmini.fi -- A TLS 1.3 CLIENT IN #[no_gc] CODE, WITH A KEY PIN
+// (roadmap r74: TLS for the push connection of lib/plat/android/push.fi).
+//
+// WHY IT EXISTS. lib/tls/tls.fi is the general client (chains, 1.2, hostnames,
+// non-blocking); it allocates, so it cannot run on the push thread, where
+// the collector must never run (the compiler checks that transitively). This
+// is the smallest TLS that is still honest about who is on the other end:
+// stack buffers, raw system calls, nothing from the heap.
+//
+//   tlsm_handshake(t, fd, sni, sni_len, pin) -> 0 or a TM_* error
+//   tlsm_read(t, out, cap) -> octets (> 0) | 0 = closed by the peer | < 0 error
+//
+// WHO THE PEER IS: a PIN, not a chain. `pin` is the SHA-256 of the server's
+// SubjectPublicKeyInfo (the DER of the public key, the same value as curl's
+// `--pinnedpubkey sha256//...`):
+//
+//   openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der \
+//       | sha256sum
+//
+// The pin survives a renewed certificate as long as the key stays. The
+// handshake still checks CertificateVerify (the peer HOLDS the pinned key)
+// and Finished (the transcript was not touched).
+//
+// HONEST
+//   S1 PIN ONLY. No chain, no validity dates, no host name check, no
+//      revocation: the pin IS the identity. A relay of your own needs
+//      nothing else; for the open web use lib/tls/tls.fi.
+//   S2 ONE SUITE, ONE GROUP, ONE SIGNATURE: TLS_CHACHA20_POLY1305_SHA256
+//      (fast without AES hardware, which phones do have, but the code is
+//      half the size), X25519, ecdsa_secp256r1_sha256. The server needs a
+//      P-256 key. RSA / Ed25519 keys are refused at the handshake.
+//   S3 TLS 1.3 only, no resumption, no 0-RTT, no HelloRetryRequest, no
+//      client certificate. A KeyUpdate from the peer is followed and, when
+//      it asks for one, answered with our own; NewSessionTicket is ignored.
+//   S4 RECEIVE ONLY. The relay speaks, the phone listens: there is no
+//      tlsm_write and no close_notify of our own; closing the socket ends
+//      it. (The peer's close_notify is read and reported as 0.)
+//   S5 A handshake message must fit in HS_MAX octets (12 KB); the
+//      certificate of a relay with a pin is a few hundred octets.
+//   S6 No timeouts of its own: the caller sets SO_RCVTIMEO if it wants one
+//      (tlsm_handshake sets 15 s for the handshake and clears it after).
+// Test: tools/tls/mini_check.py against openssl s_server and python ssl.
+import std.crypto.sha256
+import std.crypto.hmac
+import std.crypto.chacha
+import std.crypto.x25519
+import std.crypto.ecdsa
+
+export { TlsM, tlsm_new, tlsm_handshake, tlsm_read, tlsm_hex_pin,
+    TM_OK, TM_IO, TM_PROTO, TM_PIN, TM_SIG, TM_FINISHED, TM_UNSUPPORTED,
+    TM_ALERT, TM_RANDOM, TM_TOOBIG, TM_AEAD }
+
+const TM_OK: i32 = 0
+const TM_IO: i32 = 1 // socket failed / timeout / closed during the handshake
+const TM_PROTO: i32 = 2 // malformed or unexpected message
+const TM_PIN: i32 = 3 // the server's key is not the pinned one
+const TM_SIG: i32 = 4 // CertificateVerify does not verify
+const TM_FINISHED: i32 = 5 // Finished does not verify
+const TM_UNSUPPORTED: i32 = 6 // key type, suite, HelloRetryRequest, KeyUpdate
+const TM_ALERT: i32 = 7 // the peer sent an alert
+const TM_RANDOM: i32 = 8 // no random octets
+const TM_TOOBIG: i32 = 9 // a message over the buffer
+const TM_AEAD: i32 = 10 // a record did not authenticate
+
+const SYS_RECVFROM: i64 = 45
+const SYS_SENDTO: i64 = 44
+const SYS_SETSOCKOPT: i64 = 54
+const SYS_GETRANDOM: i64 = 318
+const EINTR_NEG: i64 = -4
+const MSG_NOSIGNAL: i64 = 16384
+
+const REC_MAX: usize = 16640 // 5 + 16384 + 256 (RFC 8446 5.2)
+const HS_MAX: usize = 12288
+
+// Labels of the key schedule and the CertificateVerify context, one text.
+static LB: [u8; 122] = "derived\0c hs traffic\0s hs traffic\0c ap traffic\0s ap traffic\0key\0iv\0finished\0TLS 1.3, server CertificateVerify\0traffic upd\0"
+const L_DERIVED: usize = 0 // 7
+const L_CHS: usize = 8 // 12
+const L_SHS: usize = 21 // 12
+const L_CAP: usize = 34 // 12
+const L_SAP: usize = 47 // 12
+const L_KEY: usize = 60 // 3
+const L_IV: usize = 64 // 2
+const L_FINISHED: usize = 67 // 8
+const L_CVTEXT: usize = 76 // 33
+const L_UPD: usize = 110 // 11
+
+// The DER of a P-256 SubjectPublicKeyInfo up to the point (26 octets); the
+// point follows (65 octets, 0x04 first). 91 octets in all.
+static SPKI_HEAD: [u8; 26] = [
+    48 as u8, 89 as u8, 48 as u8, 19 as u8, 6 as u8, 7 as u8, 42 as u8,
+    134 as u8, 72 as u8, 206 as u8, 61 as u8, 2 as u8, 1 as u8, 6 as u8,
+    8 as u8, 42 as u8, 134 as u8, 72 as u8, 206 as u8, 61 as u8, 3 as u8,
+    1 as u8, 7 as u8, 3 as u8, 66 as u8, 0 as u8
+]
+
+struct TlsM {
+    fd: i64,
+    pin: [u8; 32],
+    ckey: [u8; 32],
+    civ: [u8; 12],
+    skey: [u8; 32],
+    siv: [u8; 12],
+    sapp: [u8; 32], // the server's current application traffic secret
+    capp: [u8; 32], // ours
+    cseq: u64,
+    sseq: u64,
+    enc: bool, // records are protected
+    tr: sha256.Sha256, // transcript hash
+    rtype: u8, // outer type of the record in rec
+    rlen: usize, // body length of the record in rec
+    rec: [u8; 16640],
+    ppos: usize, // application data left in rec: from here ...
+    plen: usize, // ... this many octets
+    hsb: [u8; 12288],
+    hlen: usize,
+    qx: [u8; 32],
+    qy: [u8; 32],
+    have_key: bool,
+}
+
+#[no_gc]
+fn tlsm_new() -> TlsM {
+    return TlsM {
+        fd: -1, pin: [0 as u8; 32], ckey: [0 as u8; 32], civ: [0 as u8; 12],
+        skey: [0 as u8; 32], siv: [0 as u8; 12], sapp: [0 as u8; 32], capp: [0 as u8; 32], cseq: 0 as u64,
+        sseq: 0 as u64, enc: false, tr: sha256.sha256_new(), rtype: 0 as u8,
+        rlen: 0, rec: [0 as u8; 16640], ppos: 0, plen: 0,
+        hsb: [0 as u8; 12288], hlen: 0, qx: [0 as u8; 32],
+        qy: [0 as u8; 32], have_key: false }
+}
+
+// ------------------------------------------------------------ small things
+
+#[no_gc]
+fn ld(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+#[no_gc]
+fn st(p: u64, i: usize, v: u8) {
+    *((p + i as u64) as *mut u8) = v
+}
+
+#[no_gc]
+fn cpy(z: u64, q: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        st(z, i, ld(q, i))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn lb(off: usize) -> u64 {
+    return ((&LB[0]) as u64) + off as u64
+}
+
+#[no_gc]
+fn hexval(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as i32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return (c - 97 as u8) as i32 + 10
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return (c - 65 as u8) as i32 + 10
+    }
+    return -1
+}
+
+// 64 hex digits (':' between octets allowed, as `openssl x509 -fingerprint`
+// writes them) -> 32 octets at `out`.
+#[no_gc]
+fn tlsm_hex_pin(p: u64, n: usize, out: u64) -> bool {
+    var got: usize = 0
+    var half: i32 = -1
+    var i: usize = 0
+    while i < n {
+        let c: u8 = ld(p, i)
+        if c == 58 as u8 && half < 0 {
+            i = i + 1
+            continue
+        }
+        let v: i32 = hexval(c)
+        if v < 0 || got >= 32 {
+            return false
+        }
+        if half < 0 {
+            half = v
+        } else {
+            st(out, got, (half * 16 + v) as u8)
+            got = got + 1
+            half = -1
+        }
+        i = i + 1
+    }
+    return got == 32 && half < 0
+}
+
+#[no_gc]
+fn rand_fill(p: u64, n: usize) -> bool {
+    let g: i64 = syscall(SYS_GETRANDOM, p as i64, n as i64, 0, 0, 0, 0)
+    return g == n as i64
+}
+
+#[no_gc]
+fn set_timeout(fd: i64, ms: u64) {
+    var tv: [i64; 2] = [0; 2]
+    tv[0] = (ms / 1000 as u64) as i64
+    tv[1] = (ms % 1000 as u64) as i64 * 1000
+    syscall(SYS_SETSOCKOPT, fd, 1, 20, (&tv[0]) as i64, 16, 0)
+}
+
+#[no_gc]
+fn recv_all(fd: i64, p: u64, n: usize) -> bool {
+    var got: usize = 0
+    var tries: usize = 0
+    while got < n {
+        let r: i64 = syscall(SYS_RECVFROM, fd, (p + got as u64) as i64,
+            (n - got) as i64, 0, 0, 0)
+        if r == EINTR_NEG && tries < 100 {
+            tries = tries + 1
+            continue
+        }
+        if r <= 0 {
+            return false
+        }
+        got = got + r as usize
+    }
+    return true
+}
+
+#[no_gc]
+fn send_all(fd: i64, p: u64, n: usize) -> bool {
+    var done: usize = 0
+    var tries: usize = 0
+    while done < n {
+        let r: i64 = syscall(SYS_SENDTO, fd, (p + done as u64) as i64,
+            (n - done) as i64, MSG_NOSIGNAL, 0, 0)
+        if r == EINTR_NEG && tries < 100 {
+            tries = tries + 1
+            continue
+        }
+        if r <= 0 {
+            return false
+        }
+        done = done + r as usize
+    }
+    return true
+}
+
+// ---------------------------------------------------------- key schedule
+
+// HKDF-Expand-Label (RFC 8446 7.1) for an output of at most 32 octets: one
+// HMAC block, T(1) = HMAC(secret, info | 0x01).
+#[no_gc]
+fn expand_label(secret: u64, label: usize, llen: usize, ctx: u64, clen: usize,
+    out: u64, olen: usize) {
+    var info: [u8; 96] = [0 as u8; 96]
+    info[0] = 0 as u8
+    info[1] = olen as u8
+    info[2] = (6 + llen) as u8
+    info[3] = 116 as u8 // "tls13 "
+    info[4] = 108 as u8
+    info[5] = 115 as u8
+    info[6] = 49 as u8
+    info[7] = 51 as u8
+    info[8] = 32 as u8
+    var at: usize = 9
+    var i: usize = 0
+    while i < llen {
+        info[at + i] = ld(lb(label), i)
+        i = i + 1
+    }
+    at = at + llen
+    info[at] = clen as u8
+    at = at + 1
+    i = 0
+    while i < clen {
+        info[at + i] = ld(ctx, i)
+        i = i + 1
+    }
+    at = at + clen
+    info[at] = 1 as u8
+    at = at + 1
+    var t1: [u8; 32] = [0 as u8; 32]
+    hmac.hmac_sha256(secret, 32, (&info[0]) as u64, at, (&t1[0]) as u64)
+    i = 0
+    while i < olen {
+        st(out, i, t1[i])
+        i = i + 1
+    }
+}
+
+// The transcript hash so far, without disturbing the running state.
+#[no_gc]
+fn th(t: *mut TlsM, out: u64) {
+    var c: sha256.Sha256 = (*t).tr
+    sha256.sha256_final(&c, out)
+}
+
+#[no_gc]
+fn traffic_keys(secret: u64, key: u64, iv: u64) {
+    expand_label(secret, L_KEY, 3, 0 as u64, 0, key, 32)
+    expand_label(secret, L_IV, 2, 0 as u64, 0, iv, 12)
+}
+
+// ------------------------------------------------------------ record layer
+
+// One record into rec: header and body; rtype, rlen set.
+#[no_gc]
+fn read_record(t: *mut TlsM) -> i32 {
+    let rp: u64 = (&(*t).rec[0]) as u64
+    if !recv_all((*t).fd, rp, 5) {
+        return TM_IO
+    }
+    let len: usize = ((*t).rec[3] as usize) << 8 | ((*t).rec[4] as usize)
+    if len > REC_MAX - 5 || len == 0 {
+        return TM_PROTO
+    }
+    if !recv_all((*t).fd, rp + 5 as u64, len) {
+        return TM_IO
+    }
+    (*t).rtype = (*t).rec[0]
+    (*t).rlen = len
+    return TM_OK
+}
+
+#[no_gc]
+fn nonce_of(iv: u64, seq: u64, out: u64) {
+    var i: usize = 0
+    while i < 12 {
+        st(out, i, ld(iv, i))
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        st(out, 11 - i, ld(out, 11 - i) ^ ((seq >> ((i as u64) * 8 as u64)) & 255 as u64) as u8)
+        i = i + 1
+    }
+}
+
+// The protected record in rec -> its plaintext IN PLACE at rec + 5. `inner`
+// is the real content type, `n` the content length. 0 = ok.
+#[no_gc]
+fn open_record(t: *mut TlsM, inner: *mut u8, n: *mut usize) -> i32 {
+    if (*t).rtype != 23 as u8 || (*t).rlen < 17 {
+        return TM_PROTO
+    }
+    var nonce: [u8; 12] = [0 as u8; 12]
+    nonce_of((&(*t).siv[0]) as u64, (*t).sseq, (&nonce[0]) as u64)
+    let rp: u64 = (&(*t).rec[0]) as u64
+    if !chacha.aead_open((&(*t).skey[0]) as u64, (&nonce[0]) as u64, rp, 5,
+        rp + 5 as u64, (*t).rlen, rp + 5 as u64) {
+        return TM_AEAD
+    }
+    (*t).sseq = (*t).sseq + 1 as u64
+    var len: usize = (*t).rlen - 16
+    while len > 0 && (*t).rec[5 + len - 1] == 0 as u8 {
+        len = len - 1
+    }
+    if len == 0 {
+        return TM_PROTO
+    }
+    *inner = (*t).rec[5 + len - 1]
+    *n = len - 1
+    return TM_OK
+}
+
+// ------------------------------------------------------------ handshake
+
+#[no_gc]
+fn put16(p: u64, at: usize, v: usize) {
+    st(p, at, ((v >> 8) & 255) as u8)
+    st(p, at + 1, (v & 255) as u8)
+}
+
+// The ClientHello message (handshake header included) into `m`; its length,
+// 0 = no random octets. `sni` may be 0.
+#[no_gc]
+fn build_hello(m: u64, pub_key: u64, sni: u64, sni_len: usize) -> usize {
+    st(m, 0, 1 as u8)
+    st(m, 4, 3 as u8)
+    st(m, 5, 3 as u8)
+    if !rand_fill(m + 6 as u64, 32) {
+        return 0
+    }
+    st(m, 38, 0 as u8) // empty session id
+    put16(m, 39, 2) // one suite
+    st(m, 41, 19 as u8)
+    st(m, 42, 3 as u8) // 0x1303 TLS_CHACHA20_POLY1305_SHA256
+    st(m, 43, 1 as u8)
+    st(m, 44, 0 as u8) // null compression
+    var at: usize = 47 // the extension block starts here
+    // supported_versions: 1.3
+    put16(m, at, 43)
+    put16(m, at + 2, 3)
+    st(m, at + 4, 2 as u8)
+    put16(m, at + 5, 772)
+    at = at + 7
+    // supported_groups: x25519
+    put16(m, at, 10)
+    put16(m, at + 2, 4)
+    put16(m, at + 4, 2)
+    put16(m, at + 6, 29)
+    at = at + 8
+    // signature_algorithms: ecdsa_secp256r1_sha256
+    put16(m, at, 13)
+    put16(m, at + 2, 4)
+    put16(m, at + 4, 2)
+    put16(m, at + 6, 1027)
+    at = at + 8
+    // key_share: x25519
+    put16(m, at, 51)
+    put16(m, at + 2, 38)
+    put16(m, at + 4, 36)
+    put16(m, at + 6, 29)
+    put16(m, at + 8, 32)
+    cpy(m + (at + 10) as u64, pub_key, 32)
+    at = at + 42
+    if sni != 0 as u64 && sni_len > 0 && sni_len < 200 {
+        put16(m, at, 0)
+        put16(m, at + 2, sni_len + 5)
+        put16(m, at + 4, sni_len + 3)
+        st(m, at + 6, 0 as u8)
+        put16(m, at + 7, sni_len)
+        cpy(m + (at + 9) as u64, sni, sni_len)
+        at = at + 9 + sni_len
+    }
+    put16(m, 45, at - 47) // extensions length
+    let body: usize = at - 4
+    st(m, 1, ((body >> 16) & 255) as u8)
+    put16(m, 2, body & 65535)
+    return at
+}
+
+// ServerHello in the record: checks, key share -> `spub`. 0 = ok.
+#[no_gc]
+fn parse_server_hello(t: *mut TlsM, spub: u64) -> i32 {
+    let n: usize = (*t).rlen
+    let b: u64 = ((&(*t).rec[0]) as u64) + 5 as u64
+    if (*t).rtype != 22 as u8 || n < 48 || ld(b, 0) != 2 as u8 {
+        return TM_PROTO
+    }
+    let mlen: usize = (ld(b, 1) as usize) << 16 | (ld(b, 2) as usize) << 8 | (ld(b, 3) as usize)
+    if mlen + 4 != n {
+        return TM_PROTO
+    }
+    if ld(b, 4) != 3 as u8 || ld(b, 5) != 3 as u8 {
+        return TM_PROTO
+    }
+    // HelloRetryRequest: the magic random of RFC 8446 4.1.3
+    var hrr: [u8; 8] = [207 as u8, 33 as u8, 173 as u8, 116 as u8, 229 as u8, 154 as u8, 97 as u8, 17 as u8]
+    var same: bool = true
+    var i: usize = 0
+    while i < 8 {
+        if ld(b, 6 + i) != hrr[i] {
+            same = false
+        }
+        i = i + 1
+    }
+    if same {
+        return TM_UNSUPPORTED
+    }
+    if ld(b, 38) != 0 as u8 { // we sent an empty session id
+        return TM_PROTO
+    }
+    if ld(b, 39) != 19 as u8 || ld(b, 40) != 3 as u8 || ld(b, 41) != 0 as u8 {
+        return TM_UNSUPPORTED
+    }
+    let elen: usize = (ld(b, 42) as usize) << 8 | (ld(b, 43) as usize)
+    if 44 + elen != n {
+        return TM_PROTO
+    }
+    var at: usize = 44
+    var version: bool = false
+    var share: bool = false
+    while at + 4 <= n {
+        let ty: usize = (ld(b, at) as usize) << 8 | (ld(b, at + 1) as usize)
+        let el: usize = (ld(b, at + 2) as usize) << 8 | (ld(b, at + 3) as usize)
+        at = at + 4
+        if at + el > n {
+            return TM_PROTO
+        }
+        if ty == 43 {
+            if el != 2 || ld(b, at) != 3 as u8 || ld(b, at + 1) != 4 as u8 {
+                return TM_UNSUPPORTED
+            }
+            version = true
+        } else if ty == 51 {
+            if el != 36 || ld(b, at) != 0 as u8 || ld(b, at + 1) != 29 as u8
+            || ld(b, at + 2) != 0 as u8 || ld(b, at + 3) != 32 as u8 {
+                return TM_UNSUPPORTED
+            }
+            cpy(spub, b + (at + 4) as u64, 32)
+            share = true
+        }
+        at = at + el
+    }
+    if !version || !share || at != n {
+        return TM_PROTO
+    }
+    return TM_OK
+}
+
+// The pinned key: find the P-256 point in the leaf certificate, hash the
+// SubjectPublicKeyInfo built around it and compare with the pin.
+// 0 = ok, TM_UNSUPPORTED (no P-256 key), TM_PIN.
+#[no_gc]
+fn check_leaf(t: *mut TlsM, cert: u64, clen: usize) -> i32 {
+    // 06 08 2A 86 48 CE 3D 03 01 07 (prime256v1)  03 42 00 04 <x> <y>
+    var pat: [u8; 14] = [6 as u8, 8 as u8, 42 as u8, 134 as u8, 72 as u8,
+        206 as u8, 61 as u8, 3 as u8, 1 as u8, 7 as u8, 3 as u8, 66 as u8,
+        0 as u8, 4 as u8]
+    var at: usize = 0
+    var found: usize = 0
+    while at + 14 + 64 <= clen && found == 0 {
+        var k: usize = 0
+        while k < 14 && ld(cert, at + k) == pat[k] {
+            k = k + 1
+        }
+        if k == 14 {
+            found = at + 13 // the 0x04 of the point
+        }
+        at = at + 1
+    }
+    if found == 0 {
+        return TM_UNSUPPORTED
+    }
+    var spki: [u8; 91] = [0 as u8; 91]
+    var i: usize = 0
+    while i < 26 {
+        spki[i] = SPKI_HEAD[i]
+        i = i + 1
+    }
+    i = 0
+    while i < 65 {
+        spki[26 + i] = ld(cert, found + i)
+        i = i + 1
+    }
+    var h: [u8; 32] = [0 as u8; 32]
+    sha256.sha256((&spki[0]) as u64, 91, (&h[0]) as u64)
+    if !hmac.hmac_equal((&h[0]) as u64, (&(*t).pin[0]) as u64, 32) {
+        return TM_PIN
+    }
+    cpy((&(*t).qx[0]) as u64, (&spki[27]) as u64, 32)
+    cpy((&(*t).qy[0]) as u64, (&spki[59]) as u64, 32)
+    (*t).have_key = true
+    return TM_OK
+}
+
+// Certificate message at `b` (after the 4 octet header, `n` long).
+#[no_gc]
+fn on_certificate(t: *mut TlsM, b: u64, n: usize) -> i32 {
+    if n < 1 {
+        return TM_PROTO
+    }
+    let cl: usize = ld(b, 0) as usize // certificate_request_context
+    if 1 + cl + 3 > n {
+        return TM_PROTO
+    }
+    var at: usize = 1 + cl
+    let list: usize = (ld(b, at) as usize) << 16 | (ld(b, at + 1) as usize) << 8 | (ld(b, at + 2) as usize)
+    at = at + 3
+    if at + list != n || list < 3 {
+        return TM_PROTO
+    }
+    let dl: usize = (ld(b, at) as usize) << 16 | (ld(b, at + 1) as usize) << 8 | (ld(b, at + 2) as usize)
+    at = at + 3
+    if at + dl > n || dl < 100 {
+        return TM_PROTO
+    }
+    return check_leaf(t, b + at as u64, dl)
+}
+
+// A DER INTEGER at p[at..] -> 32 octets big endian at `out`. The new
+// position, 0 = bad.
+#[no_gc]
+fn der_int32(p: u64, at: usize, n: usize, out: u64) -> usize {
+    if at + 2 > n || ld(p, at) != 2 as u8 {
+        return 0
+    }
+    var len: usize = ld(p, at + 1) as usize
+    var q: usize = at + 2
+    if len == 0 || len > 33 || q + len > n {
+        return 0
+    }
+    while len > 32 {
+        if ld(p, q) != 0 as u8 {
+            return 0
+        }
+        q = q + 1
+        len = len - 1
+    }
+    var i: usize = 0
+    while i < 32 {
+        st(out, i, 0 as u8)
+        i = i + 1
+    }
+    cpy(out + (32 - len) as u64, p + q as u64, len)
+    return q + len
+}
+
+// CertificateVerify message at `b` (n octets); `thash` is the transcript
+// hash up to and including the Certificate.
+#[no_gc]
+fn on_cert_verify(t: *mut TlsM, b: u64, n: usize, thash: u64) -> i32 {
+    if n < 4 || !(*t).have_key {
+        return TM_PROTO
+    }
+    if ld(b, 0) != 4 as u8 || ld(b, 1) != 3 as u8 { // ecdsa_secp256r1_sha256
+        return TM_UNSUPPORTED
+    }
+    let sl: usize = (ld(b, 2) as usize) << 8 | (ld(b, 3) as usize)
+    if 4 + sl != n || sl < 8 || ld(b, 4) != 48 as u8 {
+        return TM_PROTO
+    }
+    // 30 len 02 r 02 s (len is one octet: at most 72 for P-256)
+    if ld(b, 5) as usize != sl - 2 {
+        return TM_PROTO
+    }
+    var r: [u8; 32] = [0 as u8; 32]
+    var s: [u8; 32] = [0 as u8; 32]
+    let a1: usize = der_int32(b + 4 as u64, 2, sl, (&r[0]) as u64)
+    if a1 == 0 {
+        return TM_PROTO
+    }
+    let a2: usize = der_int32(b + 4 as u64, a1, sl, (&s[0]) as u64)
+    if a2 != sl {
+        return TM_PROTO
+    }
+    // 64 x 0x20 | text | 0x00 | transcript hash
+    var content: [u8; 130] = [32 as u8; 130]
+    cpy((&content[0]) as u64 + 64 as u64, lb(L_CVTEXT), 33)
+    content[97] = 0 as u8
+    cpy((&content[0]) as u64 + 98 as u64, thash, 32)
+    var dig: [u8; 32] = [0 as u8; 32]
+    sha256.sha256((&content[0]) as u64, 130, (&dig[0]) as u64)
+    if !ecdsa.ecdsa_verify((&(*t).qx[0]) as u64, (&(*t).qy[0]) as u64,
+        (&r[0]) as u64, (&s[0]) as u64, (&dig[0]) as u64, 32) {
+        return TM_SIG
+    }
+    return TM_OK
+}
+
+// Run the handshake on the connected socket `fd`. `pin` = 32 octets (the
+// SHA-256 of the server's SubjectPublicKeyInfo); `sni` = the host name to
+// announce (0 = none; not for an IP address).
+#[no_gc]
+fn tlsm_handshake(t: *mut TlsM, fd: i64, sni: u64, sni_len: usize, pin: u64) -> i32 {
+    (*t).fd = fd
+    cpy((&(*t).pin[0]) as u64, pin, 32)
+    (*t).tr = sha256.sha256_new()
+    (*t).enc = false
+    (*t).cseq = 0 as u64
+    (*t).sseq = 0 as u64
+    (*t).ppos = 0
+    (*t).plen = 0
+    (*t).hlen = 0
+    (*t).have_key = false
+    set_timeout(fd, 15000 as u64)
+
+    // --- ClientHello
+    var priv_key: [u8; 32] = [0 as u8; 32]
+    var pub_key: [u8; 32] = [0 as u8; 32]
+    if !rand_fill((&priv_key[0]) as u64, 32) {
+        return TM_RANDOM
+    }
+    if !x25519.x25519_keypair((&priv_key[0]) as u64, (&pub_key[0]) as u64) {
+        return TM_RANDOM
+    }
+    var out: [u8; 400] = [0 as u8; 400]
+    let op: u64 = (&out[0]) as u64
+    let hl: usize = build_hello(op + 5 as u64, (&pub_key[0]) as u64, sni, sni_len)
+    if hl == 0 {
+        return TM_RANDOM
+    }
+    st(op, 0, 22 as u8)
+    put16(op, 1, 769) // legacy record version 3.1
+    put16(op, 3, hl)
+    sha256.sha256_update(&(*t).tr, op + 5 as u64, hl)
+    if !send_all(fd, op, 5 + hl) {
+        return TM_IO
+    }
+
+    // --- ServerHello
+    var rc: i32 = read_record(t)
+    while rc == TM_OK && (*t).rtype == 20 as u8 { // a compatibility CCS
+        rc = read_record(t)
+    }
+    if rc != TM_OK {
+        return rc
+    }
+    if (*t).rtype == 21 as u8 {
+        return TM_ALERT
+    }
+    var spub: [u8; 32] = [0 as u8; 32]
+    rc = parse_server_hello(t, (&spub[0]) as u64)
+    if rc != TM_OK {
+        return rc
+    }
+    sha256.sha256_update(&(*t).tr, ((&(*t).rec[0]) as u64) + 5 as u64, (*t).rlen)
+
+    // --- handshake secrets
+    var shared: [u8; 32] = [0 as u8; 32]
+    if !x25519.x25519((&priv_key[0]) as u64, (&spub[0]) as u64, (&shared[0]) as u64) {
+        return TM_PROTO
+    }
+    var zero: [u8; 32] = [0 as u8; 32]
+    var early: [u8; 32] = [0 as u8; 32]
+    var empty: [u8; 32] = [0 as u8; 32]
+    var derived: [u8; 32] = [0 as u8; 32]
+    var hs: [u8; 32] = [0 as u8; 32]
+    var chs: [u8; 32] = [0 as u8; 32]
+    var shs: [u8; 32] = [0 as u8; 32]
+    var master: [u8; 32] = [0 as u8; 32]
+    var thash: [u8; 32] = [0 as u8; 32]
+    hmac.hmac_sha256((&zero[0]) as u64, 32, (&zero[0]) as u64, 32, (&early[0]) as u64)
+    sha256.sha256(0 as u64, 0, (&empty[0]) as u64)
+    expand_label((&early[0]) as u64, L_DERIVED, 7, (&empty[0]) as u64, 32,
+        (&derived[0]) as u64, 32)
+    hmac.hmac_sha256((&derived[0]) as u64, 32, (&shared[0]) as u64, 32, (&hs[0]) as u64)
+    th(t, (&thash[0]) as u64)
+    expand_label((&hs[0]) as u64, L_CHS, 12, (&thash[0]) as u64, 32, (&chs[0]) as u64, 32)
+    expand_label((&hs[0]) as u64, L_SHS, 12, (&thash[0]) as u64, 32, (&shs[0]) as u64, 32)
+    traffic_keys((&shs[0]) as u64, (&(*t).skey[0]) as u64, (&(*t).siv[0]) as u64)
+    traffic_keys((&chs[0]) as u64, (&(*t).ckey[0]) as u64, (&(*t).civ[0]) as u64)
+    expand_label((&hs[0]) as u64, L_DERIVED, 7, (&empty[0]) as u64, 32,
+        (&derived[0]) as u64, 32)
+    hmac.hmac_sha256((&derived[0]) as u64, 32, (&zero[0]) as u64, 32, (&master[0]) as u64)
+    (*t).enc = true
+
+    // --- EncryptedExtensions, Certificate, CertificateVerify, Finished
+    var expect: u8 = 8 as u8
+    var cert_hash: [u8; 32] = [0 as u8; 32]
+    var fin: bool = false
+    while !fin {
+        rc = read_record(t)
+        if rc != TM_OK {
+            return rc
+        }
+        if (*t).rtype == 20 as u8 {
+            continue
+        }
+        if (*t).rtype == 21 as u8 {
+            return TM_ALERT
+        }
+        var inner: u8 = 0 as u8
+        var plen: usize = 0
+        rc = open_record(t, &inner, &plen)
+        if rc != TM_OK {
+            return rc
+        }
+        if inner != 22 as u8 {
+            return TM_PROTO
+        }
+        if (*t).hlen + plen > HS_MAX {
+            return TM_TOOBIG
+        }
+        cpy(((&(*t).hsb[0]) as u64) + (*t).hlen as u64,
+            ((&(*t).rec[0]) as u64) + 5 as u64, plen)
+        (*t).hlen = (*t).hlen + plen
+        var more: bool = true
+        while more && !fin {
+            more = false
+            if (*t).hlen >= 4 {
+                let hb: u64 = (&(*t).hsb[0]) as u64
+                let mty: u8 = ld(hb, 0)
+                let ml: usize = (ld(hb, 1) as usize) << 16 | (ld(hb, 2) as usize) << 8 | (ld(hb, 3) as usize)
+                if 4 + ml > HS_MAX {
+                    return TM_TOOBIG
+                }
+                if 4 + ml <= (*t).hlen {
+                    if mty != expect {
+                        if mty == 13 as u8 {
+                            return TM_UNSUPPORTED
+                        }
+                        return TM_PROTO
+                    }
+                    th(t, (&thash[0]) as u64) // the hash BEFORE this message
+                    if mty == 8 as u8 {
+                        expect = 11 as u8
+                    } else if mty == 11 as u8 {
+                        rc = on_certificate(t, hb + 4 as u64, ml)
+                        if rc != TM_OK {
+                            return rc
+                        }
+                        expect = 15 as u8
+                    } else if mty == 15 as u8 {
+                        // signed over the hash up to the Certificate
+                        rc = on_cert_verify(t, hb + 4 as u64, ml, (&thash[0]) as u64)
+                        if rc != TM_OK {
+                            return rc
+                        }
+                        expect = 20 as u8
+                    } else {
+                        // Finished
+                        if ml != 32 {
+                            return TM_PROTO
+                        }
+                        var fkey: [u8; 32] = [0 as u8; 32]
+                        var want: [u8; 32] = [0 as u8; 32]
+                        expand_label((&shs[0]) as u64, L_FINISHED, 8, 0 as u64, 0,
+                            (&fkey[0]) as u64, 32)
+                        hmac.hmac_sha256((&fkey[0]) as u64, 32, (&thash[0]) as u64, 32,
+                            (&want[0]) as u64)
+                        if !hmac.hmac_equal((&want[0]) as u64, hb + 4 as u64, 32) {
+                            return TM_FINISHED
+                        }
+                        fin = true
+                    }
+                    sha256.sha256_update(&(*t).tr, hb, 4 + ml)
+                    cpy(hb, hb + (4 + ml) as u64, (*t).hlen - 4 - ml)
+                    (*t).hlen = (*t).hlen - 4 - ml
+                    more = true
+                }
+            }
+        }
+        if fin && (*t).hlen != 0 {
+            return TM_PROTO // data after Finished
+        }
+    }
+
+    // --- client Finished (handshake keys), then the application keys
+    th(t, (&thash[0]) as u64)
+    var cfk: [u8; 32] = [0 as u8; 32]
+    var plain: [u8; 37] = [0 as u8; 37]
+    expand_label((&chs[0]) as u64, L_FINISHED, 8, 0 as u64, 0, (&cfk[0]) as u64, 32)
+    plain[0] = 20 as u8
+    plain[3] = 32 as u8
+    hmac.hmac_sha256((&cfk[0]) as u64, 32, (&thash[0]) as u64, 32,
+        ((&plain[0]) as u64) + 4 as u64)
+    plain[36] = 22 as u8 // inner type: handshake
+    var rec: [u8; 58] = [0 as u8; 58]
+    var nonce: [u8; 12] = [0 as u8; 12]
+    rec[0] = 23 as u8
+    rec[1] = 3 as u8
+    rec[2] = 3 as u8
+    rec[3] = 0 as u8
+    rec[4] = 53 as u8 // 37 + 16
+    nonce_of((&(*t).civ[0]) as u64, (*t).cseq, (&nonce[0]) as u64)
+    chacha.aead_seal((&(*t).ckey[0]) as u64, (&nonce[0]) as u64, (&rec[0]) as u64, 5,
+        (&plain[0]) as u64, 37, ((&rec[0]) as u64) + 5 as u64)
+    if !send_all(fd, (&rec[0]) as u64, 58) {
+        return TM_IO
+    }
+    var cap: [u8; 32] = [0 as u8; 32]
+    var sap: [u8; 32] = [0 as u8; 32]
+    expand_label((&master[0]) as u64, L_SAP, 12, (&thash[0]) as u64, 32, (&sap[0]) as u64, 32)
+    expand_label((&master[0]) as u64, L_CAP, 12, (&thash[0]) as u64, 32, (&cap[0]) as u64, 32)
+    cpy((&(*t).sapp[0]) as u64, (&sap[0]) as u64, 32)
+    cpy((&(*t).capp[0]) as u64, (&cap[0]) as u64, 32)
+    traffic_keys((&sap[0]) as u64, (&(*t).skey[0]) as u64, (&(*t).siv[0]) as u64)
+    traffic_keys((&cap[0]) as u64, (&(*t).ckey[0]) as u64, (&(*t).civ[0]) as u64)
+    (*t).sseq = 0 as u64
+    (*t).cseq = 0 as u64
+    set_timeout(fd, 0 as u64)
+    return TM_OK
+}
+
+// Answer a KeyUpdate request (RFC 8446 4.6.3): our own KeyUpdate (no
+// further request) under the OLD client key, then the client key rolls
+// forward.
+#[no_gc]
+fn send_key_update(t: *mut TlsM) -> bool {
+    var plain: [u8; 6] = [24 as u8, 0 as u8, 0 as u8, 1 as u8, 0 as u8, 22 as u8]
+    var rec: [u8; 27] = [0 as u8; 27]
+    var nonce: [u8; 12] = [0 as u8; 12]
+    rec[0] = 23 as u8
+    rec[1] = 3 as u8
+    rec[2] = 3 as u8
+    rec[4] = 22 as u8 // 6 + 16
+    nonce_of((&(*t).civ[0]) as u64, (*t).cseq, (&nonce[0]) as u64)
+    chacha.aead_seal((&(*t).ckey[0]) as u64, (&nonce[0]) as u64, (&rec[0]) as u64, 5,
+        (&plain[0]) as u64, 6, ((&rec[0]) as u64) + 5 as u64)
+    if !send_all((*t).fd, (&rec[0]) as u64, 27) {
+        return false
+    }
+    expand_label((&(*t).capp[0]) as u64, L_UPD, 11, 0 as u64, 0,
+        (&(*t).capp[0]) as u64, 32)
+    traffic_keys((&(*t).capp[0]) as u64, (&(*t).ckey[0]) as u64, (&(*t).civ[0]) as u64)
+    (*t).cseq = 0 as u64
+    return true
+}
+
+// Application data: up to `cap` octets into `out`. > 0 = octets, 0 = the
+// peer closed (close_notify), < 0 = -(TM_* code) / a socket error as -TM_IO.
+#[no_gc]
+fn tlsm_read(t: *mut TlsM, out: u64, cap: usize) -> i64 {
+    while true {
+        if (*t).plen > 0 {
+            var n: usize = (*t).plen
+            if n > cap {
+                n = cap
+            }
+            cpy(out, ((&(*t).rec[0]) as u64) + (5 + (*t).ppos) as u64, n)
+            (*t).ppos = (*t).ppos + n
+            (*t).plen = (*t).plen - n
+            return n as i64
+        }
+        let rc: i32 = read_record(t)
+        if rc != TM_OK {
+            return -(rc as i64)
+        }
+        if (*t).rtype == 20 as u8 {
+            continue
+        }
+        var inner: u8 = 0 as u8
+        var n: usize = 0
+        let oc: i32 = open_record(t, &inner, &n)
+        if oc != TM_OK {
+            return -(oc as i64)
+        }
+        if inner == 23 as u8 {
+            (*t).ppos = 0
+            (*t).plen = n
+        } else if inner == 21 as u8 {
+            // alert: close_notify (level 1, description 0) ends it cleanly
+            if n >= 2 && (*t).rec[6] == 0 as u8 {
+                return 0
+            }
+            return -(TM_ALERT as i64)
+        } else if inner == 22 as u8 {
+            // post-handshake: NewSessionTicket (4) is ignored; KeyUpdate (24)
+            // rolls the server's key forward (RFC 8446 7.2) and is answered
+            // when it asks.
+            if n >= 1 && (*t).rec[5] == 24 as u8 {
+                if n != 5 || (*t).rec[6] != 0 as u8 || (*t).rec[7] != 0 as u8
+                || (*t).rec[8] != 1 as u8 || (*t).rec[9] > 1 as u8 {
+                    return -(TM_PROTO as i64)
+                }
+                expand_label((&(*t).sapp[0]) as u64, L_UPD, 11, 0 as u64, 0,
+                    (&(*t).sapp[0]) as u64, 32)
+                traffic_keys((&(*t).sapp[0]) as u64, (&(*t).skey[0]) as u64,
+                    (&(*t).siv[0]) as u64)
+                (*t).sseq = 0 as u64
+                if (*t).rec[9] == 1 as u8 {
+                    if !send_key_update(t) {
+                        return -(TM_IO as i64)
+                    }
+                }
+            }
+        } else {
+            return -(TM_PROTO as i64)
+        }
+    }
+    return -(TM_PROTO as i64)
+}

@@ -46,10 +46,18 @@ try:
     check("dual-stack name gives its A record", r.get("dual.test"), "OK 192.0.2.7")
     check("NXDOMAIN is no address", r.get("nx.test"), "ERR")
     check("SERVFAIL is no address", r.get("fail.test"), "ERR")
-    check("truncated reply without records is a failure", r.get("big.test"), "ERR")
+    check("truncated reply without records: asked again over TCP -> first A record",
+          r.get("big.test"), "OK 192.0.2.100")
     check("name case does not matter", r.get("PLAIN.test"), "OK 192.0.2.1")
     check("trailing dot", r.get("plain.test."), "OK 192.0.2.1")
     check("empty label is refused locally", r.get("bad..name"), "ERR")
+    r6 = run("6:dual.test", "6:plain.test", "6:nx.test", "6:big.test", "6:DUAL.test", "6:chain.test")
+    check("AAAA record", r6.get("6:dual.test"), "OK 2001:db8:0:0:0:0:0:7")
+    check("AAAA: name has no AAAA record -> ERR", r6.get("6:plain.test"), "ERR")
+    check("AAAA: NXDOMAIN", r6.get("6:nx.test"), "ERR")
+    check("AAAA: TC over UDP, TCP answer without AAAA -> ERR", r6.get("6:big.test"), "ERR")
+    check("AAAA: name case does not matter", r6.get("6:DUAL.test"), "OK 2001:db8:0:0:0:0:0:7")
+    check("AAAA: CNAME chain without AAAA -> ERR", r6.get("6:chain.test"), "ERR")
     long_label = "a" * 64 + ".test"
     check("label of 64 octets refused locally", run(long_label).get(long_label), "ERR")
     t0 = time.time()
@@ -70,6 +78,11 @@ names = [q[1] for q in qs]
 check("the server saw the questions", names.count("plain.test") >= 2, True)
 check("an invalid name never left the machine",
       any(n.startswith("bad") or n.startswith("-x") or n.startswith("a" * 64) for n in names), False)
-check("only type A (1) was asked", sorted({q[2] for q in qs} - {"1", "A"}), [])
+check("only types A (1) and AAAA (28) were asked", sorted({q[2] for q in qs} - {"1", "28"}), [])
+bigs = [(q[2], q[3]) for q in qs if q[1] == "big.test"]
+check("big.test: UDP first, then TCP, for A and AAAA",
+      sorted(set(bigs)), [("1", "tcp"), ("1", "udp"), ("28", "tcp"), ("28", "udp")])
+check("big.test A: one UDP question and one TCP retry",
+      bigs.count(("1", "tcp")) == 1 and bigs.count(("1", "udp")) == 1, True)
 print("mini_check: %d checks, %d failed" % (passed + failed, failed))
 sys.exit(1 if failed else 0)
