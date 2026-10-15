@@ -170,6 +170,88 @@ pub(crate) fn type_has_gc(ck: &Checker, t: &Type) -> bool {
     walk(ck, t, &mut Vec::new(), 0)
 }
 
+/// r582: the pointer-word raster of one `T` element of a `gc_track[T]` buffer.
+/// The collector scans a root buffer conservatively word by word; words that
+/// can never hold a heap pointer (`str.len`, `f32`/`f64`/`bool`/`u8..u32`,
+/// padding) need not be looked at. Result: 0 = scan every word (also for every
+/// type that is not word-aligned, bigger than 32 words, or has no gap), else
+/// `stride_in_words << 32 | mask` (bit k = word k of an element may hold a
+/// pointer). `u64`/`usize`/`i64`/`isize`, raw pointers, `Gc`, `fn` and `v128`
+/// stay conservative: they can carry a heap pointer.
+pub(crate) fn type_raster(ck: &Checker, t: &Type) -> u64 {
+    fn mark(words: &mut [bool], off: u64, size: u64) -> bool {
+        if off % 8 != 0 {
+            return false;
+        }
+        let first = (off / 8) as usize;
+        let last = ((off + size + 7) / 8) as usize;
+        if last > words.len() {
+            return false;
+        }
+        for w in &mut words[first..last] {
+            *w = true;
+        }
+        true
+    }
+    fn walk(ck: &Checker, t: &Type, off: u64, words: &mut [bool], depth: u32) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        match t {
+            Type::I8 | Type::I16 | Type::I32 | Type::U8 | Type::U16 | Type::U32
+            | Type::Bool | Type::F32 | Type::F64 | Type::Void => true,
+            Type::I64 | Type::U64 | Type::Usize | Type::Isize | Type::Ptr { .. }
+            | Type::Fn { .. } | Type::V128 => mark(words, off, ck.tcx.size_of(t)),
+            Type::Array(e, n) => {
+                let es = ck.tcx.size_of(e);
+                for k in 0..*n {
+                    if !walk(ck, e, off + k * es, words, depth + 1) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Type::Struct(i) => {
+                let sd = match ck.tcx.structs.get(*i) {
+                    Some(sd) => sd,
+                    None => return false,
+                };
+                let is_str = crate::strtype::is_str(t);
+                for f in &sd.fields {
+                    if is_str {
+                        // only the octet pointer of a `str`; its length is a count
+                        if f.ty.is_ptr() && !mark(words, off + f.offset, 8) {
+                            return false;
+                        }
+                    } else if !walk(ck, &f.ty, off + f.offset, words, depth + 1) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Type::UntypedInt | Type::Error => false,
+        }
+    }
+    let size = ck.tcx.size_of(t);
+    if size == 0 || size % 8 != 0 || size > 256 {
+        return 0;
+    }
+    let mut words = vec![false; (size / 8) as usize];
+    if !walk(ck, t, 0, &mut words, 0) {
+        return 0;
+    }
+    if words.iter().all(|w| *w) || !words.iter().any(|w| *w) {
+        return 0;
+    }
+    let mut mask: u64 = 0;
+    for (k, w) in words.iter().enumerate() {
+        if *w {
+            mask |= 1 << k;
+        }
+    }
+    ((words.len() as u64) << 32) | mask
+}
+
 /// `// HOOK sizeof` in `sema::call`.
 pub(crate) fn hook_call(
     ck: &mut Checker,
@@ -221,7 +303,12 @@ pub(crate) fn hook_call(
         VALUES.with(|w| w.borrow_mut().insert(name.to_string(), size));
         return Some(Type::Usize);
     }
-    let flag = type_has_gc(ck, &t) as i128;
+    let has = type_has_gc(ck, &t);
+    // r582: bit 0 = holds GC pointers; bits 8.. = the pointer-word raster
+    let mut flag = has as i128;
+    if has && prefix == P_TRACK {
+        flag |= (type_raster(ck, &t) as i128) << 8;
+    }
     VALUES.with(|w| w.borrow_mut().insert(name.to_string(), flag));
     if prefix == P_HASGC {
         return Some(Type::Bool);
@@ -245,7 +332,9 @@ pub(crate) fn lower_hook(
     _span: Span,
 ) -> Option<Option<Option<crate::fir::Val>>> {
     let prefix = prefix_of(name)?;
-    let flag = VALUES.with(|w| w.borrow().get(name).copied()).unwrap_or(0);
+    let packed = VALUES.with(|w| w.borrow().get(name).copied()).unwrap_or(0);
+    let flag = if prefix == P_SIZE { packed } else { packed & 1 };
+    let rast = if prefix == P_TRACK { packed >> 8 } else { 0 };
     if prefix == P_SIZE {
         return Some(Some(Some(lo.constant(crate::fir::FTy::U64, flag))));
     }
@@ -264,6 +353,10 @@ pub(crate) fn lower_hook(
         }
     }
     if flag != 0 && lo.info.fns.contains_key(target) {
+        if prefix == P_TRACK {
+            // r582: the third argument of `gc_root_add` is the raster (0 = all words)
+            vals.push(lo.constant(crate::fir::FTy::U64, rast));
+        }
         lo.push_void(
             crate::fir::FTy::Void,
             crate::fir::Op::Call { name: target.to_string(), args: vals },
