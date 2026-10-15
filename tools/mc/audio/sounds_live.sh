@@ -45,7 +45,18 @@ CAP=$!
 for i in $(seq 1 60); do grep -q '^ready' "$W/cap.log" 2>/dev/null && break; sleep 0.5; done
 grep -q '^ready' "$W/cap.log" || { cat "$W/cap.err" >&2; die "listener did not join"; }
 sleep 3
-c() { echo "$1" >&3; sleep 0.6; }
+# 1.12.x has no "execute at <e> run": old form "execute <e> ~ ~ ~ <cmd>", setblock needs data value + mode, entity ids are CamelCase
+case "$MCV" in 1.12*) OLD=1 ;; *) OLD=0 ;; esac
+c() {
+    local cmd="$1"
+    if [ "$OLD" = 1 ]; then
+        cmd=${cmd//"execute at Listener run "/"execute Listener ~ ~ ~ "}
+        cmd=${cmd//"minecraft:air destroy"/"minecraft:air 0 destroy"}
+        cmd=${cmd//"summon minecraft:pig"/"summon Pig"}
+        cmd=${cmd//"summon minecraft:chicken"/"summon Chicken"}
+    fi
+    echo "$cmd" >&3; sleep 0.6
+}
 c "execute at Listener run playsound minecraft:ambient.cave ambient Listener ~ ~ ~ 1 1 0"
 c "execute at Listener run playsound minecraft:block.stone.break block Listener ~4 ~ ~-2 0.75 0.5 0"
 c "execute at Listener run playsound minecraft:entity.pig.ambient neutral Listener ~ ~ ~ 1 2 0"
