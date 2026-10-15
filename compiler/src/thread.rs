@@ -437,10 +437,19 @@ pub(crate) const ARCH_GET_GS: i64 = 0x1004;
 /// bionic call of a raw-clone thread and of an attached pthread, and
 /// `thread_host_detach` crashed the app). Windows (TEB slot) and aarch64
 /// (`tpidr_el0`, see `target::host_tp`) are not affected.
+///
+/// ALSO yes for an executable that links glibc dynamically (`#[link_lib(c)]`,
+/// i.e. every program that imports `std.dynlib`): there `ld.so` owns `fs`
+/// for the whole process. `thread_init` used to replace the main thread's
+/// `fs` base by the Firn thread block, so the first TLS access of dlopen'ed
+/// code (libGLdispatch `__thread` dispatch table, `_dl_update_slotinfo` in
+/// `dlopen(libEGL)`, errno) read garbage and crashed (MCPLAY_GL=1 with
+/// mesher threads). Fully static executables keep `fs` unchanged.
 pub(crate) fn use_gs() -> bool {
-    crate::target::pic()
-        && !crate::target::windows()
-        && matches!(crate::target::active(), crate::target::Target::X86_64)
+    if crate::target::windows() || !matches!(crate::target::active(), crate::target::Target::X86_64) {
+        return false;
+    }
+    crate::target::pic() || !crate::extfn::link_libs().is_empty()
 }
 
 #[cfg(test)]
