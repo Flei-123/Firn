@@ -537,7 +537,9 @@ impl<'a> Pass<'a> {
             ExprKind::Cast(a, _) => self.value(a),
             // Pointer arithmetic keeps the source; `&a[0] + 3` still points
             // into `a`.
-            ExprKind::Binary(BinOp::Add, a, b) => {
+            // `+%` / `+|` (explicit wrapping / saturating) are the same arithmetic: `rt.st64` indexes with `+%`
+            // and must keep treating its target as derived from the parameter `p`.
+            ExprKind::Binary(BinOp::Add | BinOp::AddWrap | BinOp::AddSat, a, b) => {
                 let mut v = self.value(a);
                 v.unite(self.value(b));
                 v
@@ -546,7 +548,7 @@ impl<'a> Pass<'a> {
             // all -- `(&p.b) as usize - (&p.a) as usize` is how
             // `lib/std/rc.fi` measures the stride of a type. Only
             // `address - number` stays an address.
-            ExprKind::Binary(BinOp::Sub, a, b) => {
+            ExprKind::Binary(BinOp::Sub | BinOp::SubWrap | BinOp::SubSat, a, b) => {
                 if self.value(b).is_empty() {
                     self.value(a)
                 } else {

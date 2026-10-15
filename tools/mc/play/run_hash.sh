@@ -60,11 +60,19 @@ COMPS='damage=5,custom_name="Hi",enchantments={"minecraft:efficiency":5,"minecra
 # set B: the NBT based components (custom_data with every tag type, lore with a plain and a styled line, a styled custom_name, a plain item_name)
 COMPS_B='custom_data={mod:1b,tag:"x",n:[1,2],f:1.5f,d:2.5d,l:7L,s:3s,o:{k:"v"}},lore=["L1",{text:"L2",bold:true,italic:false}],custom_name={text:"N",color:"red",bold:true},item_name="Plain"'
 COMPS_CUR=$COMPS
+# r217: the first login on a cold server (26.1) can take longer than a fixed sleep; commands sent before the player joined ("No entity was found") leave
+# the inventory empty and mcplay never prints a hashtest line. So wait for the join line of the server log instead of a blind sleep.
+wait_join() { # $1 = player name
+    local i
+    for i in $(seq 1 90); do grep -q "$1 joined the game" "$W/server.log" 2>/dev/null && return 0; sleep 1; done
+    echo "  WARN  $1 did not join within 90 s"; return 1
+}
 run_hash() { # $1 = player name, $2 = HASH_OFF, $3 = output file
-    MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_HASH_TEST=1 MCPLAY_HASH_OFF=$2 MCPLAY_RUN_S=16 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
-        timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" "$1" > "$3" 2>&1 &
+    MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_HASH_TEST=1 MCPLAY_HASH_OFF=$2 MCPLAY_RUN_S=${HASH_RUN_S:-34} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+        timeout 190 "$W/mcplay" 127.0.0.1 "$PORT" "$1" > "$3" 2>&1 &
     PP=$!
-    sleep 5
+    wait_join "$1"
+    sleep 3
     echo "gamemode survival $1" >&3; echo "give $1 diamond_pickaxe[$COMPS_CUR] 1" >&3; echo "give $1 stone 32" >&3
     sleep 1
     echo "data get entity $1 Inventory" >&3
