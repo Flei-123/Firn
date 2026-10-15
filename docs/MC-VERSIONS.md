@@ -349,8 +349,12 @@ their real values), so it needs no hashes. The server hashes ITS stack the same 
 * `lib/mc/mc_inv.fi`: while a Window Items / Set Slot / Set Cursor Item is parsed, the value of every component we can hash is hashed
   (`hc_data`: max_stack_size, max_damage, damage, repair_cost = int; unbreakable = empty map; custom_name / item_name = plain string name;
   rarity = enum name; enchantment_glint_override = bool; enchantments = map registry-key-string -> int level). The patch (types + hashes + removed
-  types) is kept per stack signature (`inv_patch_of`), so a stack that is moved, split or swapped keeps its hashes. Anything else (custom_data,
-  lore, attribute_modifiers, styled names, ...) is NOT hashed: the click is still sent, the server then re-sends that slot (a visible resync only).
+  types) is kept per stack signature (`inv_patch_of`), so a stack that is moved, split or swapped keeps its hashes. Round s7 added the NBT based ones: `custom_data` (the NbtOps -> HashOps
+  conversion keeps every tag type: byte / short / int / long / float / double / string, list = list, compound = map), `lore` (list of text components) and
+  styled `custom_name` / `item_name` (compound). A text component is hashed by the component codec straight into the hashing ops, so its style flags
+  (`bold`, `italic`, `underlined`, `strikethrough`, `obfuscated`) are booleans (tag 0D), `extra` is a list of components. At most 8 components per stack
+  are hashed; byte / int / long arrays and compounds with > 64 entries are not (the slot is then re-sent). NOT hashed yet: attribute_modifiers, tool, food,
+  and the rest (a visible resync only). Test 3390 (expected values from an independent Python implementation), live set B of `run_hash.sh`.
 * The enchantment key hashes come from the Registry Data (`mc_client.client_enchant_keys`, index = registry id).
 * Live proof: `bash tools/mc/play/run_hash.sh [version]` (a pickaxe with six components + a plain stack, pick up / put back). Run 1 must see 0 server
   re-sends, run 2 (`MCPLAY_HASH_OFF=1`, no hashes) must see some, so the check measures something. 1.21.5 / 1.21.8 / 1.21.11 / 26.1 see below.

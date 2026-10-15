@@ -57,18 +57,26 @@ ERR=0
 # back (Click Container with hashed stacks) and counts the packets the server answers with. A hash it does not recognise makes it re-send the slot:
 # run 1 (hashes on) must see 0 re-sends, run 2 (MCPLAY_HASH_OFF=1, empty component hashes) must see some -> the check really measures something.
 COMPS='damage=5,custom_name="Hi",enchantments={"minecraft:efficiency":5,"minecraft:unbreaking":2},rarity=epic,enchantment_glint_override=true,unbreakable={}'
+# set B: the NBT based components (custom_data with every tag type, lore with a plain and a styled line, a styled custom_name, a plain item_name)
+COMPS_B='custom_data={mod:1b,tag:"x",n:[1,2],f:1.5f,d:2.5d,l:7L,s:3s,o:{k:"v"}},lore=["L1",{text:"L2",bold:true,italic:false}],custom_name={text:"N",color:"red",bold:true},item_name="Plain"'
+COMPS_CUR=$COMPS
 run_hash() { # $1 = player name, $2 = HASH_OFF, $3 = output file
     MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_HASH_TEST=1 MCPLAY_HASH_OFF=$2 MCPLAY_RUN_S=16 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
         timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" "$1" > "$3" 2>&1 &
     PP=$!
     sleep 5
-    echo "gamemode survival $1" >&3; echo "give $1 diamond_pickaxe[$COMPS] 1" >&3; echo "give $1 stone 32" >&3
+    echo "gamemode survival $1" >&3; echo "give $1 diamond_pickaxe[$COMPS_CUR] 1" >&3; echo "give $1 stone 32" >&3
     sleep 1
     echo "data get entity $1 Inventory" >&3
     wait $PP
 }
 run_hash HashOn 0 "$W/h_on.out"
 run_hash HashOff 1 "$W/h_off.out"
+COMPS_CUR=$COMPS_B
+run_hash HashNbt 0 "$W/h_nbt.out"
+L3=$(grep 'mcplay: hashtest' "$W/h_nbt.out" | head -1)
+echo "  nbt comps : $L3"
+case "$L3" in *"comp_pick=0 comp_put=0 plain_pick=0 plain_put=0"*) ;; *) echo "  FAIL  NBT components (custom_data / lore / styled names): the server re-sent slots"; ERR=1;; esac
 L1=$(grep 'mcplay: hashtest' "$W/h_on.out" | head -1); L2=$(grep 'mcplay: hashtest' "$W/h_off.out" | head -1)
 echo "  hashes on : $L1"; echo "  hashes off: $L2"
 [ -n "$L1" ] || { echo "  FAIL  no hashtest line (hashes on)"; ERR=1; }
