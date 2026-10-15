@@ -10,7 +10,10 @@ Pure data: the caller fills `InputEvents` (mouse delta px, key mask `K_FORWARD/B
   fly up/down 0.375; diagonals x0.7071. Ground: instant horizontal speed (no inertia), jump vy 0.42, then `vy = (vy-0.08)*0.98`.
   Box 0.6 x 1.8 (sneak 1.5), eye 1.62 (sneak 1.27). `flying`: no gravity, collision on; `noclip`: no collision.
 * Collision: 9^3 snapshot of the world around the player (unloaded chunk = solid) + `mc_math.grid_move` (y, x, z order).
-  No step-up, no water / ladders / slabs (full unit cubes only).
+  No water / ladders. Block shapes: full unit cubes, plus partial shapes (slabs, stairs incl. corner shapes, carpets, snow layers) when the
+  `InputTables.solid` entry is 128 + k (`mc_math.shape_box`; `mc_shapes.shapes_fill(&reg, solid, n)` fills them from the registry, mcplay
+  does it). Step-up follows vanilla 1.20.1 `Entity.collide` with stepHeight 0.6 (`move_step`): partial blocks up to 0.6 high are walked
+  up without a jump; full blocks (1.0) still need a jump / Auto-Jump. Not modelled: fences, walls, doors, trapdoors, beds, ...
 * Pick: `input_pick(world, min_y, tables, o, d, reach, &Pick)` DDA over `mc_world` (one-chunk cache); `InputTables.pick/solid`
   are u8 per block id. Hit = block, entered face normal (0,0,0 if the origin is inside), distance. Reach `player_reach`: 5 / creative 6.
 * Selection box `input_draw_box(raster, x, y, z, rgba)`: 12 edges (+-0.002), near clip, 1/16-pixel snap, integer line stepper,

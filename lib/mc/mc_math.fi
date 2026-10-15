@@ -42,7 +42,7 @@ export {
     iv3, iv3_add, iv3_sub, iv3_floor, iv3_chunk, iv3_local,
     aabb_new, aabb_block, aabb_overlap, aabb_union_to, aabb_contains, aabb_offset, aabb_expand,
     ray_aabb,
-    grid_view, grid_id, grid_is_solid, grid_raycast, grid_move,
+    grid_view, grid_id, grid_is_solid, grid_raycast, grid_move, grid_cls, shape_count, shape_box, SHAPE_BASE,
     mat4_identity, mat4_mul, mat4_translation, mat4_scaling, mat4_rotation_x, mat4_rotation_y,
     mat4_rotation_z, mat4_perspective, mat4_look_at, mat4_invert, mat4_transpose,
     mat4_transform_point, mat4_transform_dir, mat4_to_f32,
@@ -461,12 +461,165 @@ fn grid_raycast(g: *mut BlockGrid, ox: f64, oy: f64, oz: f64, dx0: f64, dy0: f64
     return false
 }
 
+// ---- block shapes -------------------------------------------------------------------------------------
+// Solid table value v of a BlockGrid: 0 passable, 1..127 full unit cube, 128 + k = partial shape k:
+//   k 1 bottom slab, 2 top slab, 3 carpet (1/16), 4..9 snow with 2..7 layers (height (k-3)/8),
+//   k = 16 + 20*half + 5*facing + shape: stairs, half 0 bottom / 1 top, facing 0 north (-z) 1 south 2 west (-x) 3 east, the back
+//   (high side) is on the facing side; shape 0 straight, 1 inner_left, 2 inner_right, 3 outer_left, 4 outer_right
+//   (left = counter-clockwise seen from above: north -> west -> south -> east).
+const SHAPE_BASE: i32 = 128
+
+// Cell class used by the collision: 0 none, 1 full cube, 128 + k partial shape k. Outside the grid: full iff outside_solid.
+fn grid_cls(g: *mut BlockGrid, x: i32, y: i32, z: i32) -> i32 {
+    let id: i32 = grid_id(g, x, y, z)
+    if id < 0 {
+        if (*g).outside_solid { return 1 }
+        return 0
+    }
+    if (id as u32) >= (*g).nsolid { return 0 }
+    let v: i32 = rt.ld8((*g).solid, id as usize) as i32
+    if v == 0 { return 0 }
+    if v >= SHAPE_BASE { return v }
+    return 1
+}
+
+fn shape_set(o: *mut Aabb, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) {
+    (*o).x0 = x0
+    (*o).y0 = y0
+    (*o).z0 = z0
+    (*o).x1 = x1
+    (*o).y1 = y1
+    (*o).z1 = z1
+}
+
+// Number of boxes of a cell class (0 for passable).
+fn shape_count(c: i32) -> i32 {
+    if c == 0 { return 0 }
+    if c < SHAPE_BASE + 16 { return 1 }
+    let sh: i32 = (c - SHAPE_BASE - 16) % 5
+    if sh == 1 || sh == 2 { return 3 }
+    return 2
+}
+
+// Box `i` of a cell class in cell-local coordinates (0..1).
+fn shape_box(c: i32, i: i32, o: *mut Aabb) {
+    if c < SHAPE_BASE + 1 {
+        shape_set(o, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+        return
+    }
+    let k: i32 = c - SHAPE_BASE
+    if k < 16 {
+        var h: f64 = 1.0
+        var y0: f64 = 0.0
+        if k == 1 {
+            h = 0.5
+        } else if k == 2 {
+            y0 = 0.5
+        } else if k == 3 {
+            h = 0.0625
+        } else if k >= 4 && k <= 9 {
+            h = ((k - 3) as f64) * 0.125
+        }
+        if k == 2 { shape_set(o, 0.0, y0, 0.0, 1.0, 1.0, 1.0) } else { shape_set(o, 0.0, 0.0, 0.0, 1.0, h, 1.0) }
+        return
+    }
+    let s: i32 = k - 16
+    let sh: i32 = s % 5
+    let f: i32 = (s / 5) % 4
+    let half: i32 = s / 20
+    var by0: f64 = 0.0
+    var by1: f64 = 0.5
+    var uy0: f64 = 0.5
+    var uy1: f64 = 1.0
+    if half == 1 {
+        by0 = 0.5
+        by1 = 1.0
+        uy0 = 0.0
+        uy1 = 0.5
+    }
+    if i == 0 {
+        shape_set(o, 0.0, by0, 0.0, 1.0, by1, 1.0)
+        return
+    }
+    // the facing half; for the outer shapes a quarter: facing side AND the left / right side
+    var fl: i32 = f
+    if sh == 3 || sh == 1 { fl = left_of(f) } else if sh == 4 || sh == 2 { fl = right_of(f) }
+    if i == 1 && (sh == 0 || sh == 1 || sh == 2) {
+        dir_box(o, f, uy0, uy1)
+        return
+    }
+    if sh == 3 || sh == 4 {
+        quarter_box(o, f, fl, uy0, uy1)
+        return
+    }
+    // inner corner, third box: the quarter on the opposite side, towards the left / right
+    quarter_box(o, opposite_of(f), fl, uy0, uy1)
+}
+
+fn left_of(f: i32) -> i32 {
+    if f == 0 { return 2 }
+    if f == 2 { return 1 }
+    if f == 1 { return 3 }
+    return 0
+}
+
+fn right_of(f: i32) -> i32 {
+    if f == 0 { return 3 }
+    if f == 3 { return 1 }
+    if f == 1 { return 2 }
+    return 0
+}
+
+fn opposite_of(f: i32) -> i32 {
+    if f == 0 { return 1 }
+    if f == 1 { return 0 }
+    if f == 2 { return 3 }
+    return 2
+}
+
+// Half block on the side `d` (0 north, 1 south, 2 west, 3 east) between y0 and y1.
+fn dir_box(o: *mut Aabb, d: i32, y0: f64, y1: f64) {
+    if d == 0 {
+        shape_set(o, 0.0, y0, 0.0, 1.0, y1, 0.5)
+    } else if d == 1 {
+        shape_set(o, 0.0, y0, 0.5, 1.0, y1, 1.0)
+    } else if d == 2 {
+        shape_set(o, 0.0, y0, 0.0, 0.5, y1, 1.0)
+    } else {
+        shape_set(o, 0.5, y0, 0.0, 1.0, y1, 1.0)
+    }
+}
+
+// Quarter block on the sides a and b (one of them north / south, the other west / east).
+fn quarter_box(o: *mut Aabb, a: i32, b: i32, y0: f64, y1: f64) {
+    var zd: i32 = a
+    var xd: i32 = b
+    if a >= 2 {
+        zd = b
+        xd = a
+    }
+    var x0: f64 = 0.0
+    var x1: f64 = 0.5
+    if xd == 3 {
+        x0 = 0.5
+        x1 = 1.0
+    }
+    var z0: f64 = 0.0
+    var z1: f64 = 0.5
+    if zd == 1 {
+        z0 = 0.5
+        z1 = 1.0
+    }
+    shape_set(o, x0, y0, z0, x1, y1, z1)
+}
+
 // Moves `box` by (dx, dy, dz) against the solid blocks of the grid, one axis
 // after the other in the order y, x, z (the order vanilla uses for entities),
 // stopping at the first block face on each axis. Blocks the box already
 // overlaps do not block (no push-out). On the two OTHER axes a block counts as
 // overlapping only if it penetrates by more than 1e-9 (so a box that landed
-// on a floor with a rounding error of one ulp can still slide along it). Block shapes are full unit cubes.
+// on a floor with a rounding error of one ulp can still slide along it). Block shapes are full unit
+// cubes unless the solid table value is 128 + k (partial shapes, see shape_box).
 // `box` itself is not changed; `out` gets the distance moved and blocked axes.
 fn grid_move(g: *mut BlockGrid, b: *mut Aabb, dx: f64, dy: f64, dz: f64, out: *mut MoveResult) {
     (*out).dx = 0.0
@@ -489,6 +642,7 @@ fn grid_move(g: *mut BlockGrid, b: *mut Aabb, dx: f64, dy: f64, dz: f64, out: *m
     let ry1: i32 = floor_i(y1 + math.fmax(dy, 0.0))
     let rz0: i32 = floor_i(z0 + math.fmin(dz, 0.0))
     let rz1: i32 = floor_i(z1 + math.fmax(dz, 0.0))
+    var sb: Aabb = Aabb { x0: 0.0, y0: 0.0, z0: 0.0, x1: 1.0, y1: 1.0, z1: 1.0 }
     // axis 1 = y
     var d: f64 = dy
     var cy: i32 = ry0
@@ -497,16 +651,26 @@ fn grid_move(g: *mut BlockGrid, b: *mut Aabb, dx: f64, dy: f64, dz: f64, out: *m
         while cz <= rz1 {
             var cx: i32 = rx0
             while cx <= rx1 {
-                if grid_is_solid(g, cx, cy, cz) {
-                    let bx0: f64 = cx as f64
-                    let bz0: f64 = cz as f64
-                    if x0 + 1e-9 < bx0 + 1.0 && bx0 + 1e-9 < x1 && z0 + 1e-9 < bz0 + 1.0 && bz0 + 1e-9 < z1 {
-                        let by0: f64 = cy as f64
-                        if d > 0.0 && y1 <= by0 {
-                            d = math.fmin(d, by0 - y1)
-                        } else if d < 0.0 && y0 >= by0 + 1.0 {
-                            d = math.fmax(d, by0 + 1.0 - y0)
+                let c: i32 = grid_cls(g, cx, cy, cz)
+                if c != 0 {
+                    let nb: i32 = shape_count(c)
+                    var bi: i32 = 0
+                    while bi < nb {
+                        shape_box(c, bi, &sb)
+                        let bx0: f64 = (cx as f64) + sb.x0
+                        let bx1: f64 = (cx as f64) + sb.x1
+                        let bz0: f64 = (cz as f64) + sb.z0
+                        let bz1: f64 = (cz as f64) + sb.z1
+                        if x0 + 1e-9 < bx1 && bx0 + 1e-9 < x1 && z0 + 1e-9 < bz1 && bz0 + 1e-9 < z1 {
+                            let by0: f64 = (cy as f64) + sb.y0
+                            let by1: f64 = (cy as f64) + sb.y1
+                            if d > 0.0 && y1 <= by0 {
+                                d = math.fmin(d, by0 - y1)
+                            } else if d < 0.0 && y0 >= by1 {
+                                d = math.fmax(d, by1 - y0)
+                            }
                         }
+                        bi = bi + 1
                     }
                 }
                 cx = cx + 1
@@ -527,16 +691,26 @@ fn grid_move(g: *mut BlockGrid, b: *mut Aabb, dx: f64, dy: f64, dz: f64, out: *m
         while cz <= rz1 {
             var cx: i32 = rx0
             while cx <= rx1 {
-                if grid_is_solid(g, cx, cy, cz) {
-                    let by0: f64 = cy as f64
-                    let bz0: f64 = cz as f64
-                    if y0 + 1e-9 < by0 + 1.0 && by0 + 1e-9 < y1 && z0 + 1e-9 < bz0 + 1.0 && bz0 + 1e-9 < z1 {
-                        let bx0: f64 = cx as f64
-                        if d > 0.0 && x1 <= bx0 {
-                            d = math.fmin(d, bx0 - x1)
-                        } else if d < 0.0 && x0 >= bx0 + 1.0 {
-                            d = math.fmax(d, bx0 + 1.0 - x0)
+                let c: i32 = grid_cls(g, cx, cy, cz)
+                if c != 0 {
+                    let nb: i32 = shape_count(c)
+                    var bi: i32 = 0
+                    while bi < nb {
+                        shape_box(c, bi, &sb)
+                        let by0: f64 = (cy as f64) + sb.y0
+                        let by1: f64 = (cy as f64) + sb.y1
+                        let bz0: f64 = (cz as f64) + sb.z0
+                        let bz1: f64 = (cz as f64) + sb.z1
+                        if y0 + 1e-9 < by1 && by0 + 1e-9 < y1 && z0 + 1e-9 < bz1 && bz0 + 1e-9 < z1 {
+                            let bx0: f64 = (cx as f64) + sb.x0
+                            let bx1: f64 = (cx as f64) + sb.x1
+                            if d > 0.0 && x1 <= bx0 {
+                                d = math.fmin(d, bx0 - x1)
+                            } else if d < 0.0 && x0 >= bx1 {
+                                d = math.fmax(d, bx1 - x0)
+                            }
                         }
+                        bi = bi + 1
                     }
                 }
                 cx = cx + 1
@@ -557,16 +731,26 @@ fn grid_move(g: *mut BlockGrid, b: *mut Aabb, dx: f64, dy: f64, dz: f64, out: *m
         while cz <= rz1 {
             var cx: i32 = rx0
             while cx <= rx1 {
-                if grid_is_solid(g, cx, cy, cz) {
-                    let by0: f64 = cy as f64
-                    let bx0: f64 = cx as f64
-                    if y0 + 1e-9 < by0 + 1.0 && by0 + 1e-9 < y1 && x0 + 1e-9 < bx0 + 1.0 && bx0 + 1e-9 < x1 {
-                        let bz0: f64 = cz as f64
-                        if d > 0.0 && z1 <= bz0 {
-                            d = math.fmin(d, bz0 - z1)
-                        } else if d < 0.0 && z0 >= bz0 + 1.0 {
-                            d = math.fmax(d, bz0 + 1.0 - z0)
+                let c: i32 = grid_cls(g, cx, cy, cz)
+                if c != 0 {
+                    let nb: i32 = shape_count(c)
+                    var bi: i32 = 0
+                    while bi < nb {
+                        shape_box(c, bi, &sb)
+                        let by0: f64 = (cy as f64) + sb.y0
+                        let by1: f64 = (cy as f64) + sb.y1
+                        let bx0: f64 = (cx as f64) + sb.x0
+                        let bx1: f64 = (cx as f64) + sb.x1
+                        if y0 + 1e-9 < by1 && by0 + 1e-9 < y1 && x0 + 1e-9 < bx1 && bx0 + 1e-9 < x1 {
+                            let bz0: f64 = (cz as f64) + sb.z0
+                            let bz1: f64 = (cz as f64) + sb.z1
+                            if d > 0.0 && z1 <= bz0 {
+                                d = math.fmin(d, bz0 - z1)
+                            } else if d < 0.0 && z0 >= bz1 {
+                                d = math.fmax(d, bz1 - z0)
+                            }
                         }
+                        bi = bi + 1
                     }
                 }
                 cx = cx + 1

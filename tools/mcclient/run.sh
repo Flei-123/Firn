@@ -32,6 +32,10 @@
 #      MC_ENTITIES        1 (default for a real server) = entity scenario: a second client (bot.cjs) stays online, a script
 #                         summons / teleports / kills NoAI mobs and walks the bot WHILE each dumper is connected; the
 #                         `<dump>.entities` files (Firn vs reference tracker) are compared as well. 0 = off (--mock is always off).
+#      MC_ENT_RIDER       1 = rider scenario at the end of the entity script (1.19.4+, not legacy): Dumper mounts a minecart, the
+#                         minecart is teleported twice (entity_teleport with a player rider), then Dumper dismounts, the minecart is
+#                         killed and Dumper is teleported back to its start point (via the armor stand, which stands 2 blocks west of
+#                         it), so the session ends where it began and A == A2 holds. Idle time defaults to 12000 ms.
 #      MC_VERSION         release to test (default 1.20.1; also 1.12.2, 1.20.2 ...). The protocol number and the
 #                         node-minecraft-protocol version come from tools/mcgen/versions.json; the same value is
 #                         exported to ref_dump.cjs (MC_NMP, MC_PROTOCOL) and passed to the Firn client (arg 7).
@@ -177,6 +181,9 @@ if [ "$ENT" -eq 1 ]; then
   BOT_TP="tp Bot 8.5 70 0.5"
   [ "$PROTO" -ge 477 ] && [ "$PROTO" -le 756 ] && BOT_TP="$EXEC_AT tp Bot ~4 ~1 ~"
   [ "$IDLE" -lt 7000 ] && [ -z "${MC_IDLE_MS:-}" ] && IDLE=7000
+  RIDER=0
+  [ "${MC_ENT_RIDER:-0}" = 1 ] && [ "$LEGACY" -eq 0 ] && [ "$PROTO" -ge 762 ] && RIDER=1
+  [ "$RIDER" -eq 1 ] && [ -z "${MC_IDLE_MS:-}" ] && IDLE=12000
   mkfifo "$W/botin"
   exec 4<>"$W/botin"
   ( exec node "$HERE/bot.cjs" 127.0.0.1 "$PORT" Bot < "$W/botin" > "$W/bot.log" 2> "$W/bot.err" ) &
@@ -217,6 +224,16 @@ ent_script() { # $1 = number of the join line to wait for; then plays the events
   fi
   echo "$EXEC_AT summon $CHICKEN ~ ~2 ~-3 {NoAI:1b}" >&3; sleep 0.5
   echo "kill @e[type=$CHICKEN]" >&3; sleep 0.3
+  if [ "${RIDER:-0}" -eq 1 ]; then
+    echo "$EXEC_AT summon minecart ~ ~ ~" >&3; sleep 0.5
+    echo "ride $NAME mount @e[type=minecart,limit=1]" >&3; sleep 0.8
+    echo "$EXEC_AT tp @e[type=minecart] ~3 ~ ~4" >&3; sleep 0.8
+    echo "$EXEC_AT tp @e[type=minecart] ~-2 ~ ~1 90 0" >&3; sleep 0.8
+    echo "ride $NAME dismount" >&3; sleep 0.4
+    echo "kill @e[type=minecart]" >&3; sleep 0.4
+    # back to the start point: the armor stand was summoned 2 blocks west of the dumper's start position
+    echo "execute at @e[type=$STAND,limit=1] run tp $NAME ~2 ~ ~" >&3; sleep 0.6
+  fi
 }
 
 # wait until the Nth leave line appears so the player position is saved
