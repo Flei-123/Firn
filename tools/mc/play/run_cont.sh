@@ -81,13 +81,9 @@ run_case ContD dispenser 0 "$W/d.out"
 run_case ContE shulker_box 0 "$W/e.out"
 # double chest: two chests next to each other (facing north: the left half is the west one), the player clicks the one next to him
 run_case ContF "chest[facing=north,type=left]" 0 "$W/f.out" "chest[facing=north,type=right]"
-if [ "$PROTO" -lt 768 ]; then
-    check "sneak+click (block placed, chest stays closed)" "$W/a.out" "sneak=true win=0 " "sneak_packets=1"
-    case "$(grep 'mcplay: sneaktest' "$W/a.out" | head -1)" in *"placed=0 "*) echo "  FAIL  sneak: no block appeared above the chest"; ERR=1;; esac
-else
-    # 1.21.2+ Player Input is sent (sneak_packets counts it) but the 1.21.4 server still opens the chest: open item, not checked here
-    echo "  SKIP  sneak+click on protocol $PROTO (Player Input): $(grep 'mcplay: sneaktest' "$W/a.out" | head -1)"
-fi
+# Sneak state: Entity Action up to 1.21.5, Player Input (shift) from 1.21.6 (+ both on 1.21.2 - 1.21.5, like the vanilla client); Player Loaded first (1.21.4+)
+check "sneak+click (block placed, chest stays closed)" "$W/a.out" "sneak=true win=0 " "sneak_packets=1"
+case "$(grep 'mcplay: sneaktest' "$W/a.out" | head -1)" in *"placed=0 "*) echo "  FAIL  sneak: no block appeared above the chest"; ERR=1;; esac
 check "click (chest opens)" "$W/b.out" "sneak=false " "slots=27 cols=9 title=Chest " "placed=0 "
 check "hopper" "$W/c.out" "slots=5 cols=5 title=Item Hopper "
 check "dispenser" "$W/d.out" "slots=9 cols=3 title=Dispenser "
