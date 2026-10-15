@@ -42,7 +42,8 @@ export {
     iv3, iv3_add, iv3_sub, iv3_floor, iv3_chunk, iv3_local,
     aabb_new, aabb_block, aabb_overlap, aabb_union_to, aabb_contains, aabb_offset, aabb_expand,
     ray_aabb,
-    grid_view, grid_id, grid_is_solid, grid_raycast, grid_move, grid_cls, shape_count, shape_box, SHAPE_BASE,
+    grid_view, grid_id, grid_is_solid, grid_raycast, grid_move, grid_cls, grid_overlaps, shape_count, shape_box, SHAPE_BASE, K_FENCE, K_WALL, K_GATE, K_DOOR, K_TRAP, K_BED, K_CHEST,
+    left_of, right_of, opposite_of,
     mat4_identity, mat4_mul, mat4_translation, mat4_scaling, mat4_rotation_x, mat4_rotation_y,
     mat4_rotation_z, mat4_perspective, mat4_look_at, mat4_invert, mat4_transpose,
     mat4_transform_point, mat4_transform_dir, mat4_to_f32,
@@ -467,7 +468,21 @@ fn grid_raycast(g: *mut BlockGrid, ox: f64, oy: f64, oz: f64, dx0: f64, dy0: f64
 //   k = 16 + 20*half + 5*facing + shape: stairs, half 0 bottom / 1 top, facing 0 north (-z) 1 south 2 west (-x) 3 east, the back
 //   (high side) is on the facing side; shape 0 straight, 1 inner_left, 2 inner_right, 3 outer_left, 4 outer_right
 //   (left = counter-clockwise seen from above: north -> west -> south -> east).
+//   k = K_FENCE + m (m 0..15, bits 1 north / 2 south / 4 west / 8 east connected): fence (post + arms, 1.5 high),
+//   k = K_WALL + m (m 0..31, bits as the fence + 16 = up post): wall (post .25..75, arms .3125..6875, 1.5 high),
+//   k = K_GATE + a: closed fence gate, a 0 = thin in z (facing north / south), 1 = thin in x (facing west / east),
+//   k = K_DOOR + d: door, 3/16 thick slab on side d (0 north, 1 south, 2 west, 3 east),
+//   k = K_TRAP + d: open trapdoor, slab on side d; K_TRAP + 4 closed top, K_TRAP + 5 closed bottom (3/16 thick),
+//   k = K_BED + d: bed (slab 3/16..9/16 high + two 3/16 legs at the corners of side d),
+//   k = K_CHEST: chest / trapped chest / ender chest (1/16 inset, 14/16 high); K_CHEST + 1 + d: double chest half connected to side d.
 const SHAPE_BASE: i32 = 128
+const K_FENCE: i32 = 56
+const K_WALL: i32 = 72
+const K_GATE: i32 = 104
+const K_DOOR: i32 = 106
+const K_TRAP: i32 = 110
+const K_BED: i32 = 116
+const K_CHEST: i32 = 120
 
 // Cell class used by the collision: 0 none, 1 full cube, 128 + k partial shape k. Outside the grid: full iff outside_solid.
 fn grid_cls(g: *mut BlockGrid, x: i32, y: i32, z: i32) -> i32 {
@@ -492,13 +507,169 @@ fn shape_set(o: *mut Aabb, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64)
     (*o).z1 = z1
 }
 
+fn bit_of(m: i32, i: i32) -> i32 {
+    var v: i32 = m
+    var j: i32 = 0
+    while j < i {
+        v = v / 2
+        j = j + 1
+    }
+    return v % 2
+}
+
+fn popcount4(m: i32) -> i32 {
+    var n: i32 = 0
+    var i: i32 = 0
+    while i < 4 {
+        if bit_of(m, i) == 1 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
 // Number of boxes of a cell class (0 for passable).
 fn shape_count(c: i32) -> i32 {
     if c == 0 { return 0 }
     if c < SHAPE_BASE + 16 { return 1 }
+    let k: i32 = c - SHAPE_BASE
+    if k >= K_FENCE {
+        if k < K_WALL { return 1 + popcount4(k - K_FENCE) }
+        if k < K_GATE {
+            let m: i32 = k - K_WALL
+            return popcount4(m % 16) + m / 16
+        }
+        if k >= K_BED && k < K_CHEST { return 3 }
+        return 1
+    }
     let sh: i32 = (c - SHAPE_BASE - 16) % 5
     if sh == 1 || sh == 2 { return 3 }
     return 2
+}
+
+// Direction (0 north, 1 south, 2 west, 3 east) of the n-th set bit (n from 0) among the low 4 bits of m.
+fn nth_dir(m: i32, n: i32) -> i32 {
+    var seen: i32 = 0
+    var i: i32 = 0
+    while i < 4 {
+        if bit_of(m, i) == 1 {
+            if seen == n { return i }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Arm of a fence / wall towards side d: lo..hi is the arm width across, `reach` how far it extends past the cell centre.
+fn arm_box(o: *mut Aabb, d: i32, lo: f64, hi: f64, reach: f64, h: f64) {
+    if d == 0 {
+        shape_set(o, lo, 0.0, 0.0, hi, h, reach)
+    } else if d == 1 {
+        shape_set(o, lo, 0.0, 1.0 - reach, hi, h, 1.0)
+    } else if d == 2 {
+        shape_set(o, 0.0, 0.0, lo, reach, h, hi)
+    } else {
+        shape_set(o, 1.0 - reach, 0.0, lo, 1.0, h, hi)
+    }
+}
+
+// Full-height slab of thickness t on side d.
+fn side_slab(o: *mut Aabb, d: i32, t: f64) {
+    if d == 0 {
+        shape_set(o, 0.0, 0.0, 0.0, 1.0, 1.0, t)
+    } else if d == 1 {
+        shape_set(o, 0.0, 0.0, 1.0 - t, 1.0, 1.0, 1.0)
+    } else if d == 2 {
+        shape_set(o, 0.0, 0.0, 0.0, t, 1.0, 1.0)
+    } else {
+        shape_set(o, 1.0 - t, 0.0, 0.0, 1.0, 1.0, 1.0)
+    }
+}
+
+// Boxes of the families k >= K_FENCE (see the table above).
+fn shape_box_ext(k: i32, i: i32, o: *mut Aabb) {
+    if k < K_WALL {
+        // fence: post, then the arms in the order north, south, west, east
+        if i == 0 {
+            shape_set(o, 0.375, 0.0, 0.375, 0.625, 1.5, 0.625)
+            return
+        }
+        arm_box(o, nth_dir(k - K_FENCE, i - 1), 0.375, 0.625, 0.625, 1.5)
+        return
+    }
+    if k < K_GATE {
+        // wall: the post first when `up`, then the arms
+        let m: i32 = k - K_WALL
+        var j: i32 = i
+        if m >= 16 {
+            if i == 0 {
+                shape_set(o, 0.25, 0.0, 0.25, 0.75, 1.5, 0.75)
+                return
+            }
+            j = i - 1
+        }
+        arm_box(o, nth_dir(m % 16, j), 0.3125, 0.6875, 0.6875, 1.5)
+        return
+    }
+    if k < K_DOOR {
+        if k == K_GATE {
+            shape_set(o, 0.0, 0.0, 0.375, 1.0, 1.5, 0.625)
+        } else {
+            shape_set(o, 0.375, 0.0, 0.0, 0.625, 1.5, 1.0)
+        }
+        return
+    }
+    if k < K_TRAP {
+        side_slab(o, k - K_DOOR, 0.1875)
+        return
+    }
+    if k < K_BED {
+        let t: i32 = k - K_TRAP
+        if t < 4 {
+            side_slab(o, t, 0.1875)
+        } else if t == 4 {
+            shape_set(o, 0.0, 0.8125, 0.0, 1.0, 1.0, 1.0)
+        } else {
+            shape_set(o, 0.0, 0.0, 0.0, 1.0, 0.1875, 1.0)
+        }
+        return
+    }
+    if k < K_CHEST {
+        if i == 0 {
+            shape_set(o, 0.0, 0.1875, 0.0, 1.0, 0.5625, 1.0)
+            return
+        }
+        // leg i - 1 (0 / 1) at the corners of side d; legs are 3/16 square and 3/16 high
+        let d: i32 = k - K_BED
+        var lo: f64 = 0.0
+        if i == 2 { lo = 0.8125 }
+        if d == 0 {
+            shape_set(o, lo, 0.0, 0.0, lo + 0.1875, 0.1875, 0.1875)
+        } else if d == 1 {
+            shape_set(o, lo, 0.0, 0.8125, lo + 0.1875, 0.1875, 1.0)
+        } else if d == 2 {
+            shape_set(o, 0.0, 0.0, lo, 0.1875, 0.1875, lo + 0.1875)
+        } else {
+            shape_set(o, 0.8125, 0.0, lo, 1.0, 0.1875, lo + 0.1875)
+        }
+        return
+    }
+    // chest: single, or connected towards side d
+    var x0: f64 = 0.0625
+    var x1: f64 = 0.9375
+    var z0: f64 = 0.0625
+    var z1: f64 = 0.9375
+    let d: i32 = k - K_CHEST - 1
+    if d == 0 {
+        z0 = 0.0
+    } else if d == 1 {
+        z1 = 1.0
+    } else if d == 2 {
+        x0 = 0.0
+    } else if d == 3 {
+        x1 = 1.0
+    }
+    shape_set(o, x0, 0.0, z0, x1, 0.875, z1)
 }
 
 // Box `i` of a cell class in cell-local coordinates (0..1).
@@ -508,6 +679,10 @@ fn shape_box(c: i32, i: i32, o: *mut Aabb) {
         return
     }
     let k: i32 = c - SHAPE_BASE
+    if k >= K_FENCE {
+        shape_box_ext(k, i, o)
+        return
+    }
     if k < 16 {
         var h: f64 = 1.0
         var y0: f64 = 0.0
@@ -613,6 +788,43 @@ fn quarter_box(o: *mut Aabb, a: i32, b: i32, y0: f64, y1: f64) {
     shape_set(o, x0, y0, z0, x1, y1, z1)
 }
 
+// True when `b` shares volume (more than 1e-9 on every axis) with a block shape of the grid (vanilla Level.noCollision == !this).
+// Unloaded cells outside the grid count as solid when the grid says so.
+fn grid_overlaps(g: *mut BlockGrid, b: *mut Aabb) -> bool {
+    let rx0: i32 = floor_i((*b).x0)
+    let rx1: i32 = floor_i((*b).x1)
+    let ry0: i32 = floor_i((*b).y0) - 1 // see grid_move: tall shapes of the cell below
+    let ry1: i32 = floor_i((*b).y1)
+    let rz0: i32 = floor_i((*b).z0)
+    let rz1: i32 = floor_i((*b).z1)
+    var sb: Aabb = Aabb { x0: 0.0, y0: 0.0, z0: 0.0, x1: 1.0, y1: 1.0, z1: 1.0 }
+    var cy: i32 = ry0
+    while cy <= ry1 {
+        var cz: i32 = rz0
+        while cz <= rz1 {
+            var cx: i32 = rx0
+            while cx <= rx1 {
+                let c: i32 = grid_cls(g, cx, cy, cz)
+                let nb: i32 = shape_count(c)
+                var bi: i32 = 0
+                while bi < nb {
+                    shape_box(c, bi, &sb)
+                    if (*b).x0 + 1e-9 < (cx as f64) + sb.x1 && (cx as f64) + sb.x0 + 1e-9 < (*b).x1
+                    && (*b).y0 + 1e-9 < (cy as f64) + sb.y1 && (cy as f64) + sb.y0 + 1e-9 < (*b).y1
+                    && (*b).z0 + 1e-9 < (cz as f64) + sb.z1 && (cz as f64) + sb.z0 + 1e-9 < (*b).z1 {
+                        return true
+                    }
+                    bi = bi + 1
+                }
+                cx = cx + 1
+            }
+            cz = cz + 1
+        }
+        cy = cy + 1
+    }
+    return false
+}
+
 // Moves `box` by (dx, dy, dz) against the solid blocks of the grid, one axis
 // after the other in the order y, x, z (the order vanilla uses for entities),
 // stopping at the first block face on each axis. Blocks the box already
@@ -638,7 +850,8 @@ fn grid_move(g: *mut BlockGrid, b: *mut Aabb, dx: f64, dy: f64, dz: f64, out: *m
     // cell range that can matter: the box swept along the full request
     let rx0: i32 = floor_i(x0 + math.fmin(dx, 0.0))
     let rx1: i32 = floor_i(x1 + math.fmax(dx, 0.0))
-    let ry0: i32 = floor_i(y0 + math.fmin(dy, 0.0))
+    // one cell lower than the box: shapes of the cell below can reach above its top (fence / wall / gate: 1.5)
+    let ry0: i32 = floor_i(y0 + math.fmin(dy, 0.0)) - 1
     let ry1: i32 = floor_i(y1 + math.fmax(dy, 0.0))
     let rz0: i32 = floor_i(z0 + math.fmin(dz, 0.0))
     let rz1: i32 = floor_i(z1 + math.fmax(dz, 0.0))
