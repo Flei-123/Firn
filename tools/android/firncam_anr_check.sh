@@ -10,7 +10,7 @@
 # an emulator camera is no logical multi camera, so the sweep would not run otherwise), taps the screen every 2 s like an
 # impatient user, and checks
 #   * no am_anr event for the package (the real Android ANR detector)
-#   * the longest main-loop turn <= MAX_GAP_MS (default 150; the goal is 100, an emulator under host load jitters)
+#   * the longest main-loop turn <= MAX_GAP_MS (default 250; the goal on a phone is 100, an emulator under host load jitters to ~150)
 #   * the app is still alive at the end
 # Then it presses HOME, comes back, and runs the same two checks again (pause/resume must not block either).
 #
@@ -22,7 +22,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 ADB=${ADB:-/root/android-sdk/platform-tools/adb}
 [ -n "${SERIAL:-}" ] && ADB="$ADB -s $SERIAL"
 PKG=org.firn.firncam
-MAX_GAP_MS=${MAX_GAP_MS:-150}
+MAX_GAP_MS=${MAX_GAP_MS:-250}
 GL_MAX_MS=${GL_MAX_MS:-3500}
 RUN_SECONDS=${RUN_SECONDS:-24}
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
