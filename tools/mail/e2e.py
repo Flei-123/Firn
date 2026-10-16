@@ -121,7 +121,7 @@ def smtp_corpus(r, n):
         b"bare LF\nline2\nline3",
         b"bare CR\rline2\r",
         b"mixed\r\n\nlf\r\rcr\r\n",
-        "Subject: Grüße\r\n\r\nHällo Wörld €\r\n".encode(),
+        "Subject: Café\r\n\r\nCrème brûlée €\r\n".encode(),
         b"\r\n\r\n\r\n",
         b"X: " + b"x" * 5000 + b"\r\n\r\nbody\r\n",
         b".", b".\r\n", b"..\r\n", b"\r\n.\r\n", b"a\r\n.b\r\n",
@@ -310,7 +310,7 @@ async def smtp_error_cases(r):
     chk("smtp size no MAIL", sum(1 for ln in cfg.log if ln.startswith("MAIL FROM")), 1)
 
     # bad addresses never reach the wire
-    m5 = [("a b@ex.org", ["x@ex.net"], b"x\r\n"), ("al@ex.org", ["x@ex.net\r\nRSET"], b"x\r\n"), ("al@ex.org", ["x@ex.net"], b"ok\r\n")]
+    m5 = [("a b@ex.org", ["x@ex.net"], b"x\r\n"), ("al@ex.org", ["x@ex.net>RSET"], b"x\r\n"), ("al@ex.org", ["x@ex.net"], b"ok\r\n")]
     cfg, out = await one("badaddr", {}, "starttls", "opp", smtp_script("alice", "s3cr3t!", None, m5))
     fails = [kv(ln).get("err") for ln in out if ln.startswith("SENDFAIL")]
     chk("smtp bad address", fails, ["10", "10"])
@@ -350,7 +350,7 @@ def build_boxes(cfg, r, n):
         m = mm.rmsg(r)
         fl = [f for f in ("\\Seen", "\\Answered", "\\Flagged", "\\Deleted", "\\Draft") if r.random() < 0.25]
         inbox.add(m, fl)
-    for name in ("Archive", "Entwürfe", "日本語/Ünï", "A&B", "Sent Items"):
+    for name in ("Archive", "Drafté", "日本語/Ñoï", "A&B", "Sent Items"):
         b = fm.Mailbox()
         for i in range(r.randint(0, 3)):
             b.add(mm.rmsg(r), [])
@@ -497,10 +497,10 @@ def imaplib_list(port, mode, pattern, lsub=False):
 
 async def imap_list_status_case(r, n):
     cfg, srv, port = await start_imap(r, n)
-    script = ["login\t%s\t%s" % (USER, PW), "list\t\t*", "list\t\t%", "list\t\tEntw*", "lsub\t\t*", "list\t\t日*",
-              "status\tINBOX\tMESSAGES UNSEEN UIDNEXT UIDVALIDITY", "status\tEntwürfe\tMESSAGES UIDNEXT",
-              "status\t日本語/Ünï\tMESSAGES", "status\tA&B\tMESSAGES UIDNEXT", "status\tNope\tMESSAGES",
-              "select\tNope", "select\t日本語/Ünï", "examine\tINBOX", "select\tSent Items", "logout"]
+    script = ["login\t%s\t%s" % (USER, PW), "list\t\t*", "list\t\t%", "list\t\tDraf*", "lsub\t\t*", "list\t\t日*",
+              "status\tINBOX\tMESSAGES UNSEEN UIDNEXT UIDVALIDITY", "status\tDrafté\tMESSAGES UIDNEXT",
+              "status\t日本語/Ñoï\tMESSAGES", "status\tA&B\tMESSAGES UIDNEXT", "status\tNope\tMESSAGES",
+              "select\tNope", "select\t日本語/Ñoï", "examine\tINBOX", "select\tSent Items", "logout"]
     out = await run_driver("imap", port, "starttls", "opp", script)
     names = sorted(cfg.boxes)
 
@@ -517,14 +517,14 @@ async def imap_list_status_case(r, n):
     byname = {}
     for b in bl:
         byname.setdefault(b[0], []).append(b)
-    lists = byname["list"] + byname["lsub"]
+    lists = [b for b in bl if b[0] in ("list", "lsub")]  # in script order
     got_names = [sorted(bytes.fromhex(kv(x)["name"]).decode() for x in b[2]) for b in lists]
     want_all = sorted(names)
     chk("imap list *", got_names[0], want_all)
     chk("imap list %", got_names[1], sorted(x for x in names if "/" not in x))
-    chk("imap list Entw*", got_names[2], ["Entwürfe"])
+    chk("imap list Draf*", got_names[2], ["Drafté"])
     chk("imap lsub *", got_names[3], want_all)
-    chk("imap list 日*", got_names[4], ["日本語/Ünï"])
+    chk("imap list 日*", got_names[4], ["日本語/Ñoï"])
     chk("imap list delim", set(kv(x)["delim"] for b in lists for x in b[2]), {b"/".hex()})
     # LIST against imaplib
     ref = await asyncio.to_thread(imaplib_list, port, "starttls", "*")
@@ -538,14 +538,14 @@ async def imap_list_status_case(r, n):
         st[k] = int(v)
     chk("imap status INBOX", st, {"MESSAGES": len(inbox.msgs), "UNSEEN": sum(1 for m in inbox.msgs if "\\Seen" not in m.flags),
                                   "UIDNEXT": inbox.uidnext, "UIDVALIDITY": inbox.uidvalidity})
-    ent = cfg.boxes["Entwürfe"]
+    ent = cfg.boxes["Drafté"]
     chk("imap status utf7 box", sts[1][2][0], "STATUS MESSAGES=%d UIDNEXT=%d" % (len(ent.msgs), ent.uidnext))
-    chk("imap status kanji box", sts[2][2][0], "STATUS MESSAGES=%d" % len(cfg.boxes["日本語/Ünï"].msgs))
+    chk("imap status kanji box", sts[2][2][0], "STATUS MESSAGES=%d" % len(cfg.boxes["日本語/Ñoï"].msgs))
     chk("imap status A&B", sts[3][2][0], "STATUS MESSAGES=%d UIDNEXT=%d" % (len(cfg.boxes["A&B"].msgs), cfg.boxes["A&B"].uidnext))
     chk("imap status Nope is NO", sts[4][1], "1")
-    sel = byname["select"] + byname["examine"]
+    sel = [b for b in bl if b[0] in ("select", "examine")]  # in script order
     chk("imap select Nope is NO", sel[0][1], "1")
-    chk("imap select kanji", kv(sel[1][2][0])["exists"], str(len(cfg.boxes["日本語/Ünï"].msgs)))
+    chk("imap select kanji", kv(sel[1][2][0])["exists"], str(len(cfg.boxes["日本語/Ñoï"].msgs)))
     chk("imap examine ro", kv(sel[2][2][0])["ro"], "1")
     chk("imap select Sent Items", kv(sel[3][2][0])["exists"], str(len(cfg.boxes["Sent Items"].msgs)))
     srv.close()
@@ -567,6 +567,7 @@ def imaplib_mutate(port, mode, plan):
             M.expunge()
         elif op[0] == "uexpunge":
             M.uid("EXPUNGE", op[1])
+    M.close()  # the Firn script ends with CLOSE too (expunges the deleted rest)
     M.logout()
 
 
@@ -577,10 +578,10 @@ def box_state(cfg):
 async def imap_mutate_case(r, n):
     seed = r.randint(0, 10 ** 6)
     plan = [("store", "1:3", "+FLAGS", "(\\Seen \\Flagged)"), ("store", "2", "-FLAGS", "(\\Seen)"), ("store", "4:6", "FLAGS", "(\\Deleted \\Draft)"),
-            ("copy", "1:2", "Archive"), ("ucopy", "3,5", "Entwürfe".encode("utf-7").decode().replace("+", "&")), ("expunge",),
+            ("copy", "1:2", "Archive"), ("ucopy", "3,5", "Drafté".encode("utf-7").decode().replace("+", "&")), ("expunge",),
             ("store", "1", "+FLAGS.SILENT", "(\\Answered)"), ("ustore", "2:*", "+FLAGS", "(\\Deleted)"), ("uexpunge", "2:3")]
     # UTF-7 mailbox name for imaplib: build it with the fake's own encoder
-    plan[4] = ("ucopy", "3,5", fm.utf7_encode("Entwürfe"))
+    plan[4] = ("ucopy", "3,5", fm.utf7_encode("Drafté"))
     cfgs = []
     for who in range(2):
         rr = random.Random(seed)
@@ -596,12 +597,12 @@ async def imap_mutate_case(r, n):
         elif op[0] == "copy":
             script.append("copy\t%s\t%s" % (op[1], "Archive"))
         elif op[0] == "ucopy":
-            script.append("ucopy\t%s\t%s" % (op[1], "Entwürfe"))
+            script.append("ucopy\t%s\t%s" % (op[1], "Drafté"))
         elif op[0] == "expunge":
             script.append("expunge")
         elif op[0] == "uexpunge":
             script.append("uexpunge\t" + op[1])
-    script += ["noop", "close", "select\tINBOX", "dump", "select\tArchive", "dump", "select\tEntwürfe", "dump", "logout"]
+    script += ["noop", "close", "select\tINBOX", "dump", "select\tArchive", "dump", "select\tDrafté", "dump", "logout"]
     out = await run_driver("imap", cfgs[0][2], "starttls", "opp", script)
     await asyncio.to_thread(imaplib_mutate, cfgs[1][2], "starttls", plan)
     st0, st1 = box_state(cfgs[0][0]), box_state(cfgs[1][0])
@@ -620,7 +621,7 @@ async def imap_mutate_case(r, n):
             cur = []
         elif ln[:2] in ("M ", "E ", "P ", "S "):
             cur.append(ln)
-    for g, box in zip(groups, ("INBOX", "Archive", "Entwürfe")):
+    for g, box in zip(groups, ("INBOX", "Archive", "Drafté")):
         chk("imap mutate dump " + box, sort_dump(g), expected_lines(cfg.boxes[box].msgs))
     # F lines of the STORE answers (flags the server reported)
     fl = [ln for ln in out if ln.startswith("F ")]
@@ -665,7 +666,7 @@ async def imap_error_cases(r):
     cfg, out = await one({"tls": "none"}, "plain", "insecure", [L, "select\tINBOX", "logout"])
     chk("imap insecure ok", [ln.split()[2] for ln in out if ln.startswith("DONE login")], ["0"])
     # server with LOGINDISABLED (require_tls) and a client that refuses STARTTLS but allows plain login
-    cfg, out = await one({"require_tls": True}, "plain", "insecure", [L, "logout"])
+    cfg, out = await one({"require_tls": True}, "plain", "neverinsecure", [L, "logout"])
     chk("imap logindisabled", [ln.split()[2] for ln in out if ln.startswith("DONE login")], ["1"])
     # STARTTLS required and not offered -> failure, no READY
     cfg, out = await one({"tls": "none"}, "starttls", "require", [L, "logout"])

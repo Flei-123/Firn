@@ -917,6 +917,8 @@ struct Sc {
     upgrading: bool,
     busy: u32,
     closed: bool,
+    dpend: bool,
+    zombie: bool,
 }
 
 fn sc_core(c: *mut Sc) -> *mut Smtp { return &(*c).core }
@@ -944,7 +946,7 @@ fn sc_open(l: *mut loop.Loop, addr: u32, port: u16, mode: u32, host: str, store:
     }
     let c: *mut Sc = p as *mut Sc
     *c = Sc { s: 0 as *mut stream.Stream, core: smtp_new(), cb: cb, ud: ud, mode: mode, store: store,
-        now: now, host: rt.buf_new(), upgrading: false, busy: 0, closed: false }
+        now: now, host: rt.buf_new(), upgrading: false, busy: 0, closed: false, dpend: false, zombie: false }
     push(&(*c).host, host)
     if mode == SM_PLAIN {
         (*c).core.tls_mode = SMTP_NEVER
@@ -1039,14 +1041,35 @@ fn sc_stream_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
         sc_emit(c, SME_CLOSED, arg)
         smtp_free(&(*c).core)
         rt.buf_free(&(*c).host)
-        smtp_obj_free[Sc](ud)
+        if (*c).dpend {
+            (*c).zombie = true // a deferred event is still queued: it frees the object
+        } else {
+            smtp_obj_free[Sc](ud)
+        }
     }
+}
+
+// Events a mail raised without any network round trip (SIZE too big) are
+// delivered from the loop, never from inside sc_send.
+fn sc_deferred(l: *mut loop.Loop, ud: u64) {
+    let c: *mut Sc = ud as *mut Sc
+    (*c).dpend = false
+    if (*c).zombie {
+        smtp_obj_free[Sc](ud)
+        return
+    }
+    sc_after_core(c)
 }
 
 // Queues one mail (see smtp_set_mail). false = bad address / busy; sc_err tells.
 fn sc_send(c: *mut Sc, from: str, rcpts: str, mp: u64, mn: usize) -> bool {
     let ok: bool = smtp_set_mail(&(*c).core, from, rcpts, mp, mn)
     sc_pump(c)
+    if ok && ((*c).core.events & EVF_SENT) != 0 && !(*c).dpend {
+        if loop.defer_call(stream.stream_loop((*c).s), sc_deferred, c as u64) {
+            (*c).dpend = true
+        }
+    }
     return ok
 }
 
