@@ -1,0 +1,414 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/cliphistview.fi -- THE CLIPBOARD HISTORY AS A WINDOW (Win+V look): a list of what was copied; a click on
+// a row puts it back on the clipboard; Pin and Delete per row; keys Up / Down / Enter / Delete / Esc.
+//
+//     import std.cliphist
+//     import fui.app
+//     import fui.cliphistview
+//
+//     var h: cliphist.History = cliphist.hist_new()
+//     var w: cliphist.Watcher = cliphist.watch_new()
+//     let a: *mut app.App = app.window("Clipboard", 360, 420)
+//     cliphistview.view_build(a, &h, &w)                 // before app.run
+//     app.set_window_hooks(a, 0, cliphistview.view_on_opened, cliphistview.view_on_hotkey)
+//     looppump.attach(a, &loop)                          // the watcher's timer runs in the window thread
+//     cliphist.watch_start(&w, &h, &loop, 400)
+//     app.run(a)
+//
+// WHAT IT SHOWS. SLOTS rows (8): the entries in display order (pinned first, then newest first) starting at the
+// scroll offset; each row is a button with the label (first line, `[pin]` / `[img]` / `[html]` marks, `>` on the
+// selected row), a Pin / Unpin button and an X button. Rows without an entry are hidden. A header line says how many
+// entries there are; Clear removes all unpinned ones. The view refreshes itself after every action and when
+// `view_refresh` is called (call it from a loop timer: `view_tick` does it when the history changed).
+//
+// THE HOTKEY. `view_on_opened` registers Ctrl+Shift+V (and Win+V where the system lets a program have it);
+// `view_on_hotkey` shows the window when hidden and hides it when shown. After a click on a row the window hides
+// (`view_set_hide_on_pick`, default true): the next paste of the user brings the text.
+//
+// HONEST
+//   V1  ONE view per process: the click handlers of the app layer carry no data, so the state is a static.
+//   V2  8 rows, scrolled by keys / `view_scroll`; there is no wheel or scroll bar. The scene has room for ~128 nodes,
+//       one row costs 4.
+//   V3  Windows keeps Win+V for its own history: RegisterHotKey fails there and only Ctrl+Shift+V works. The fall-back
+//       is reported by `view_hotkeys()`.
+//   V4  Not a pop-up at the caret and not a "paste for me": it puts the entry on the clipboard; the user pastes.
+import std.rt
+import std.str
+import std.cliphist
+import fui.app
+import fui.scene
+import fui.editor
+import window.window
+import window.extras
+
+export {
+    view_build, view_refresh, view_tick, view_on_opened, view_on_hotkey, view_scroll, view_select, view_hotkeys,
+    view_pick, view_pin, view_delete, view_clear, view_row_text, view_row_visible, view_shown_rows, view_header,
+    view_set_hide_on_pick, view_selected, view_offset, SLOTS, HOTKEY_TOGGLE, HOTKEY_WINV,
+}
+
+const SLOTS: usize = 8
+const HOTKEY_TOGGLE: u32 = 11
+const HOTKEY_WINV: u32 = 12
+
+static mut G_APP: u64 = 0
+static mut G_HIST: u64 = 0
+static mut G_WATCH: u64 = 0
+static mut G_WIN: u64 = 0
+static mut G_OFFSET: usize = 0
+static mut G_SEL: usize = 0
+static mut G_HIDE_ON_PICK: bool = true
+static mut G_HEADER: usize = 0
+static mut G_SEEN_COUNT: usize = 0xFFFFFFFF
+static mut G_SEEN_SUM: u64 = 0
+static mut G_HK_MAIN: bool = false
+static mut G_HK_WINV: bool = false
+static mut G_ROW: [usize; 8] = [0; 8]
+static mut G_PICK: [usize; 8] = [0; 8]
+static mut G_PINB: [usize; 8] = [0; 8]
+static mut G_DELB: [usize; 8] = [0; 8]
+static mut G_CLEAR: usize = 0
+
+fn app_p() -> *mut app.App { return G_APP as *mut app.App }
+fn hist_p() -> *mut cliphist.History { return G_HIST as *mut cliphist.History }
+fn watch_p() -> *mut cliphist.Watcher { return G_WATCH as *mut cliphist.Watcher }
+
+fn no_entry() -> usize { return 0xFFFFFFFF }
+
+// The entry index (in the history) shown in slot `s`, or no_entry().
+fn entry_of_slot(s: usize) -> usize {
+    return cliphist.view_index(hist_p(), G_OFFSET + s)
+}
+
+// A cheap fingerprint of what the list shows, so `view_tick` repaints only on change.
+fn fingerprint() -> u64 {
+    var sum: u64 = 0
+    var i: usize = 0
+    let h: *mut cliphist.History = hist_p()
+    while i < cliphist.count(h) {
+        sum = sum *% 1000003 as u64 +% cliphist.id_of(h, i) +% (cliphist.hash_of(h, i) >> 7)
+        if cliphist.is_pinned(h, i) {
+            sum = sum +% 77 as u64
+        }
+        i = i + 1
+    }
+    return sum
+}
+
+fn view_shown_rows() -> usize {
+    let n: usize = cliphist.count(hist_p())
+    if n <= G_OFFSET {
+        return 0
+    }
+    if n - G_OFFSET > SLOTS {
+        return SLOTS
+    }
+    return n - G_OFFSET
+}
+
+fn set_row(s: usize, label: str, pin_label: str, visible: bool) {
+    let a: *mut app.App = app_p()
+    let sc: *mut scene.Scene = app.app_scene(a)
+    scene.node_set_hidden(sc, G_ROW[s], !visible)
+    if visible {
+        app.set_text(a, G_PICK[s], label)
+        app.set_text(a, G_PINB[s], pin_label)
+    }
+}
+
+// Redraws the rows from the history.
+fn view_refresh() {
+    let a: *mut app.App = app_p()
+    let h: *mut cliphist.History = hist_p()
+    let shown: usize = view_shown_rows()
+    if G_SEL >= cliphist.count(h) && cliphist.count(h) > 0 {
+        G_SEL = cliphist.count(h) - 1
+    }
+    if cliphist.count(h) == 0 {
+        G_SEL = 0
+    }
+    var s: usize = 0
+    while s < SLOTS {
+        if s < shown {
+            let idx: usize = entry_of_slot(s)
+            var b: rt.Buf = rt.buf_new()
+            if G_OFFSET + s == G_SEL {
+                rt.buf_push(&b, 62 as u8) // >
+                rt.buf_push(&b, 32 as u8)
+            }
+            if cliphist.is_pinned(h, idx) {
+                let t: str = "[pin] "
+                rt.buf_push_bytes(&b, t.p as u64, t.length())
+            }
+            let k: u32 = cliphist.kinds(h, idx)
+            if (k & cliphist.KIND_PNG) != 0 as u32 {
+                let t2: str = "[img] "
+                rt.buf_push_bytes(&b, t2.p as u64, t2.length())
+            } else if (k & cliphist.KIND_TEXT) == 0 as u32 && (k & cliphist.KIND_HTML) != 0 as u32 {
+                let t3: str = "[html] "
+                rt.buf_push_bytes(&b, t3.p as u64, t3.length())
+            }
+            cliphist.preview(h, idx, 34, &b)
+            let lab: str = str { p: rt.buf_ptr(&b) as *mut u8, n: rt.buf_len(&b) }
+            var pl: str = "Pin"
+            if cliphist.is_pinned(h, idx) {
+                pl = "Unpin"
+            }
+            set_row(s, lab, pl, true)
+            rt.buf_free(&b)
+        } else {
+            set_row(s, "", "", false)
+        }
+        s = s + 1
+    }
+    var hb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&hb, cliphist.count(h) as u64)
+    let tail: str = " in history"
+    rt.buf_push_bytes(&hb, tail.p as u64, tail.length())
+    app.set_text(a, G_HEADER, str { p: rt.buf_ptr(&hb) as *mut u8, n: rt.buf_len(&hb) })
+    rt.buf_free(&hb)
+    G_SEEN_COUNT = cliphist.count(h)
+    G_SEEN_SUM = fingerprint()
+}
+
+// Call it often (a loop timer, 200 ms): repaints only when the history changed.
+fn view_tick() -> bool {
+    let h: *mut cliphist.History = hist_p()
+    if cliphist.count(h) == G_SEEN_COUNT && fingerprint() == G_SEEN_SUM {
+        return false
+    }
+    view_refresh()
+    return true
+}
+
+fn view_scroll(delta: i64) {
+    let n: usize = cliphist.count(hist_p())
+    var off: i64 = G_OFFSET as i64 + delta
+    if off < 0 {
+        off = 0
+    }
+    var maxoff: i64 = 0
+    if n > SLOTS {
+        maxoff = (n - SLOTS) as i64
+    }
+    if off > maxoff {
+        off = maxoff
+    }
+    G_OFFSET = off as usize
+    view_refresh()
+}
+
+// Selects the k-th entry of the display order (scrolls to show it).
+fn view_select(k: usize) {
+    let n: usize = cliphist.count(hist_p())
+    if n == 0 {
+        return
+    }
+    var kk: usize = k
+    if kk >= n {
+        kk = n - 1
+    }
+    G_SEL = kk
+    if G_SEL < G_OFFSET {
+        G_OFFSET = G_SEL
+    }
+    if G_SEL >= G_OFFSET + SLOTS {
+        G_OFFSET = G_SEL + 1 - SLOTS
+    }
+    view_refresh()
+}
+
+fn view_selected() -> usize { return G_SEL }
+fn view_offset() -> usize { return G_OFFSET }
+fn view_set_hide_on_pick(on: bool) { G_HIDE_ON_PICK = on }
+
+// What the window is told about the hotkeys: bit 0 = Ctrl+Shift+V works, bit 1 = Win+V works.
+fn view_hotkeys() -> u32 {
+    var r: u32 = 0
+    if G_HK_MAIN {
+        r = r | 1
+    }
+    if G_HK_WINV {
+        r = r | 2
+    }
+    return r
+}
+
+fn view_row_visible(s: usize) -> bool {
+    return s < view_shown_rows()
+}
+
+fn view_row_text(s: usize) -> str {
+    return app.text(app_p(), G_PICK[s])
+}
+
+fn view_header() -> str {
+    return app.text(app_p(), G_HEADER)
+}
+
+// Puts the entry of slot `s` back on the clipboard. true = copied.
+fn view_pick(s: usize) -> bool {
+    if s >= view_shown_rows() {
+        return false
+    }
+    let idx: usize = entry_of_slot(s)
+    if idx == no_entry() {
+        return false
+    }
+    let ok: bool = cliphist.watch_paste(watch_p(), idx)
+    G_SEL = 0
+    G_OFFSET = 0
+    view_refresh()
+    if ok && G_HIDE_ON_PICK && G_WIN != 0 as u64 {
+        let hidden: bool = extras.hide(G_WIN as *mut window.Window)
+    }
+    return ok
+}
+
+fn view_pin(s: usize) -> bool {
+    if s >= view_shown_rows() {
+        return false
+    }
+    let h: *mut cliphist.History = hist_p()
+    let idx: usize = entry_of_slot(s)
+    let r: bool = cliphist.pin(h, cliphist.id_of(h, idx), !cliphist.is_pinned(h, idx))
+    view_refresh()
+    return r
+}
+
+fn view_delete(s: usize) -> bool {
+    if s >= view_shown_rows() {
+        return false
+    }
+    let h: *mut cliphist.History = hist_p()
+    let idx: usize = entry_of_slot(s)
+    let r: bool = cliphist.remove(h, cliphist.id_of(h, idx))
+    view_scroll(0)
+    return r
+}
+
+// Removes every unpinned entry.
+fn view_clear() -> usize {
+    let n: usize = cliphist.clear(hist_p(), true)
+    G_OFFSET = 0
+    view_refresh()
+    return n
+}
+
+// ---- the handlers of the app layer carry no data: one small function per slot
+fn pick0(a: *mut app.App) { let r: bool = view_pick(0) }
+fn pick1(a: *mut app.App) { let r: bool = view_pick(1) }
+fn pick2(a: *mut app.App) { let r: bool = view_pick(2) }
+fn pick3(a: *mut app.App) { let r: bool = view_pick(3) }
+fn pick4(a: *mut app.App) { let r: bool = view_pick(4) }
+fn pick5(a: *mut app.App) { let r: bool = view_pick(5) }
+fn pick6(a: *mut app.App) { let r: bool = view_pick(6) }
+fn pick7(a: *mut app.App) { let r: bool = view_pick(7) }
+fn pin0(a: *mut app.App) { let r: bool = view_pin(0) }
+fn pin1(a: *mut app.App) { let r: bool = view_pin(1) }
+fn pin2(a: *mut app.App) { let r: bool = view_pin(2) }
+fn pin3(a: *mut app.App) { let r: bool = view_pin(3) }
+fn pin4(a: *mut app.App) { let r: bool = view_pin(4) }
+fn pin5(a: *mut app.App) { let r: bool = view_pin(5) }
+fn pin6(a: *mut app.App) { let r: bool = view_pin(6) }
+fn pin7(a: *mut app.App) { let r: bool = view_pin(7) }
+fn del0(a: *mut app.App) { let r: bool = view_delete(0) }
+fn del1(a: *mut app.App) { let r: bool = view_delete(1) }
+fn del2(a: *mut app.App) { let r: bool = view_delete(2) }
+fn del3(a: *mut app.App) { let r: bool = view_delete(3) }
+fn del4(a: *mut app.App) { let r: bool = view_delete(4) }
+fn del5(a: *mut app.App) { let r: bool = view_delete(5) }
+fn del6(a: *mut app.App) { let r: bool = view_delete(6) }
+fn del7(a: *mut app.App) { let r: bool = view_delete(7) }
+fn clear_click(a: *mut app.App) { let n: usize = view_clear() }
+
+fn key_hook(a: *mut app.App, key: u32, mods: u32) -> bool {
+    let n: usize = cliphist.count(hist_p())
+    if key == editor.KEY_DOWN {
+        view_select(G_SEL + 1)
+        return true
+    }
+    if key == editor.KEY_UP {
+        if G_SEL > 0 {
+            view_select(G_SEL - 1)
+        }
+        return true
+    }
+    if key == editor.KEY_PGDN {
+        view_select(G_SEL + SLOTS)
+        return true
+    }
+    if key == editor.KEY_PGUP {
+        if G_SEL >= SLOTS {
+            view_select(G_SEL - SLOTS)
+        } else {
+            view_select(0)
+        }
+        return true
+    }
+    if key == editor.KEY_ENTER && n > 0 && G_SEL >= G_OFFSET && G_SEL < G_OFFSET + SLOTS {
+        let r: bool = view_pick(G_SEL - G_OFFSET)
+        return true
+    }
+    if key == editor.KEY_DELETE && n > 0 && G_SEL >= G_OFFSET && G_SEL < G_OFFSET + SLOTS {
+        let r2: bool = view_delete(G_SEL - G_OFFSET)
+        return true
+    }
+    if key == editor.KEY_ESC && G_WIN != 0 as u64 {
+        let h: bool = extras.hide(G_WIN as *mut window.Window)
+        return true
+    }
+    return false
+}
+
+// Builds the widgets in the window `a` (before app.run). The history and the watcher must stay where they are.
+fn view_build(a: *mut app.App, h: *mut cliphist.History, w: *mut cliphist.Watcher) -> bool {
+    G_APP = a as u64
+    G_HIST = h as u64
+    G_WATCH = w as u64
+    G_OFFSET = 0
+    G_SEL = 0
+    (*w).hist = h
+    G_HEADER = app.label(a, "0 in history", 12)
+    let picks: [fn(*mut app.App); 8] = [pick0, pick1, pick2, pick3, pick4, pick5, pick6, pick7]
+    let pins: [fn(*mut app.App); 8] = [pin0, pin1, pin2, pin3, pin4, pin5, pin6, pin7]
+    let dels: [fn(*mut app.App); 8] = [del0, del1, del2, del3, del4, del5, del6, del7]
+    var s: usize = 0
+    while s < SLOTS {
+        G_ROW[s] = app.row(a)
+        G_PICK[s] = app.button(a, "", picks[s])
+        app.set_width(a, G_PICK[s], 230)
+        G_PINB[s] = app.button(a, "Pin", pins[s])
+        G_DELB[s] = app.button(a, "X", dels[s])
+        app.end(a)
+        s = s + 1
+    }
+    G_CLEAR = app.button(a, "Clear", clear_click)
+    app.on_key(a, key_hook)
+    view_refresh()
+    return G_HEADER != app.NONE && G_PICK[SLOTS - 1] != app.NONE
+}
+
+// ---- the window hooks (app.set_window_hooks)
+fn view_on_opened(ud: u64, win: u64) {
+    G_WIN = win
+    let f: *mut window.Window = win as *mut window.Window
+    G_HK_MAIN = extras.hotkey_set(f, HOTKEY_TOGGLE, window.HK_CTRL | window.HK_SHIFT, 118 as u32) // v
+    G_HK_WINV = extras.hotkey_set(f, HOTKEY_WINV, window.HK_SUPER, 118 as u32)
+}
+
+fn view_on_hotkey(ud: u64, id: u32) {
+    if id != HOTKEY_TOGGLE && id != HOTKEY_WINV {
+        return
+    }
+    if G_WIN == 0 as u64 {
+        return
+    }
+    let f: *mut window.Window = G_WIN as *mut window.Window
+    if extras.is_visible(f) {
+        let a: bool = extras.hide(f)
+    } else {
+        view_refresh()
+        let b: bool = extras.show(f)
+    }
+}

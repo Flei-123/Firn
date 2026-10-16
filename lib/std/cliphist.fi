@@ -1,0 +1,948 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/cliphist.fi -- std.cliphist: a clipboard HISTORY (like Win+V): a list of what was copied, with a watcher
+// that fills it from the system clipboard.
+//
+//     import std.cliphist
+//
+//     var h: cliphist.History = cliphist.hist_new()          // limit 25, 4 MiB per entry
+//     cliphist.add(&h, "text", "<b>html</b>", false)          // text, html ("" = none), sensitive?
+//     cliphist.add_png(&h, "", "", png_p, png_n, false)       // an image (PNG file octets)
+//     let i: usize = cliphist.view_index(&h, 0)               // the entry shown first (pinned first, then newest)
+//     cliphist.pin(&h, cliphist.id_of(&h, i), true)
+//     cliphist.remove(&h, id)   cliphist.clear(&h, true)      // true = keep the pinned ones
+//     cliphist.expire(&h, now_ms)                             // drops sensitive entries whose time has come
+//
+//     // fill it from the system clipboard, on an async loop:
+//     var w: cliphist.Watcher = cliphist.watch_new()
+//     cliphist.watch_start(&w, &h, &loop, 400)                // poll every 400 ms
+//     cliphist.watch_paste(&w, idx)                           // put an entry back on the clipboard (+ to the top)
+//     cliphist.watch_stop(&w)
+//
+//     // persistence is OPT-IN and never writes a sensitive entry:
+//     cliphist.persist_enable(&h, "/home/me/.cache/app/clip.hist")   // file mode 0600, written atomically
+//
+// WHAT AN ENTRY IS. Up to three formats of ONE copy: text (UTF-8), html, png. A time stamp (ms since 1970), an id
+// (never reused while the history lives), a pin flag, a sensitive flag.
+//
+// THE RULES
+//   * limit: at most `limit` UNPINNED entries (default 25, `set_limit`); the oldest unpinned one goes first. Pinned
+//     entries are never dropped by the limit, only by `remove` / `clear(false)`.
+//   * duplicates: the same content (text, html and png all equal, checked by a 64 bit hash AND byte for byte) is not
+//     stored twice; the old entry moves to the top and takes the new time. Its pin stays; "sensitive" sticks.
+//   * size: an entry whose formats together exceed `max_entry` octets (default 4 MiB) is refused (add returns 0).
+//   * sensitive: kept in memory only, dropped by `expire` after `sens_ttl` (default 30 s), NEVER written by `save`,
+//     the octets are overwritten with zeros when it goes. `set_sensitive_ttl(h, 0)` = a sensitive entry is not
+//     stored at all. The watcher drops copies flagged by a password manager completely (policy `set_sensitive_keep`
+//     false, the default) or keeps them for the ttl (true).
+//   * persistence: only after `persist_enable`; `persist_flush` writes when something changed. The file is "FCH1",
+//     the entries, a 64 bit checksum; mode 0600; a file that fails the checks loads NOTHING. Not encrypted (B3).
+//
+// HONEST
+//   B1  X11 has no change notice in this window layer (no XFixes): the watcher POLLS. Every tick it asks the owner
+//       for the format list and, if a format is there, for the data. A change token (owner window) saves that
+//       work only on Windows (the clipboard sequence number is exact there). Default interval 400 ms.
+//   B2  Password managers flag secrets by an extra format: KDE's `x-kde-passwordManagerHint` (value "secret"),
+//       Windows' `ExcludeClipboardContentFromMonitorProcessing` and `CanIncludeInClipboardHistory` (value 0). A
+//       manager that sets none of them is not recognised; there is no guessing from the content.
+//   B3  The history file is not encrypted (mode 0600 only). Put it where only the user reads, or do not persist.
+//   B4  HTML on Windows is stored under the registered format "text/html", not the "HTML Format" wrapper Office and
+//       browsers use: HTML copied there is not seen, and HTML offered here is not understood by them.
+//   B5  The watcher needs the window layer (a display). Without one `poll_once` answers false every time.
+//   B6  One thread: the history and the watcher belong to the thread that runs the loop.
+
+import std.rt
+import std.str
+import std.vec
+import std.hash
+import std.fs
+import std.time
+import std.clipboard
+import async.loop
+
+export {
+    Entry, History, Watcher,
+    hist_new, hist_free, set_limit, set_max_entry, set_sensitive_ttl, set_sensitive_keep,
+    count, add, add_png, add_raw, find_index, id_of, pin, remove, clear, expire, touch,
+    view_index, text_of, html_of, png_ptr, png_len, hash_of, time_of, is_pinned, is_sensitive,
+    preview, kinds,
+    serialize, deserialize, persist_enable, persist_disable, persist_flush, save, load,
+    watch_new, watch_start, watch_stop, poll_once, watch_paste,
+    KIND_TEXT, KIND_HTML, KIND_PNG,
+}
+
+const KIND_TEXT: u32 = 1
+const KIND_HTML: u32 = 2
+const KIND_PNG: u32 = 4
+
+const DEFAULT_LIMIT: usize = 25
+const DEFAULT_MAX_ENTRY: usize = 4194304
+const DEFAULT_SENS_TTL_MS: i64 = 30000
+const MAX_FILE_ENTRIES: u32 = 100000
+
+struct Entry {
+    id: u64,
+    hash: u64,
+    time_ms: i64,
+    expires_ms: i64,
+    pinned: bool,
+    sensitive: bool,
+    text: rt.Buf,
+    html: rt.Buf,
+    png: rt.Buf,
+}
+
+struct History {
+    items: Vec[Entry],
+    limit: usize,
+    max_entry: usize,
+    next_id: u64,
+    sens_ttl_ms: i64,
+    sens_keep: bool,
+    path: rt.Buf,
+    persist: bool,
+    dirty: bool,
+    refused_big: u64,
+    refused_sens: u64,
+}
+
+fn hist_new() -> History {
+    return History { items: vec_new[Entry](), limit: DEFAULT_LIMIT, max_entry: DEFAULT_MAX_ENTRY, next_id: 1,
+        sens_ttl_ms: DEFAULT_SENS_TTL_MS, sens_keep: false, path: rt.buf_new(), persist: false, dirty: false,
+        refused_big: 0, refused_sens: 0 }
+}
+
+// Overwrites the octets with zeros, then frees them (a sensitive text must not stay in freed memory).
+fn wipe_buf(b: *mut rt.Buf) {
+    var i: usize = 0
+    let n: usize = rt.buf_len(b)
+    let p: u64 = rt.buf_ptr(b)
+    while i < n {
+        rt.st8(p, i, 0 as u8)
+        i = i + 1
+    }
+    rt.buf_free(b)
+}
+
+fn entry_free(e: *mut Entry) {
+    if (*e).sensitive {
+        wipe_buf(&(*e).text)
+        wipe_buf(&(*e).html)
+        wipe_buf(&(*e).png)
+    } else {
+        rt.buf_free(&(*e).text)
+        rt.buf_free(&(*e).html)
+        rt.buf_free(&(*e).png)
+    }
+}
+
+fn hist_free(h: *mut History) {
+    var i: usize = 0
+    while i < vec_len[Entry](&(*h).items) {
+        entry_free(vec_elem_ptr[Entry](&(*h).items, i))
+        i = i + 1
+    }
+    vec_free[Entry](&(*h).items)
+    rt.buf_free(&(*h).path)
+}
+
+fn set_limit(h: *mut History, n: usize) {
+    (*h).limit = n
+    enforce_limit(h)
+}
+
+fn set_max_entry(h: *mut History, n: usize) {
+    (*h).max_entry = n
+}
+
+// Milliseconds a sensitive entry lives. 0 or less: sensitive entries are not stored at all.
+fn set_sensitive_ttl(h: *mut History, ms: i64) {
+    (*h).sens_ttl_ms = ms
+}
+
+// What the WATCHER does with a copy that a password manager flagged: false = drop it (default), true = keep it for
+// the ttl as a sensitive entry.
+fn set_sensitive_keep(h: *mut History, keep: bool) {
+    (*h).sens_keep = keep
+}
+
+fn count(h: *mut History) -> usize {
+    return vec_len[Entry](&(*h).items)
+}
+
+fn ep(h: *mut History, i: usize) -> *mut Entry {
+    return vec_elem_ptr[Entry](&(*h).items, i)
+}
+
+// ---------------------------------------------------------------- hashing
+
+fn chain(p: u64, n: usize, seed: u64) -> u64 {
+    if n == 0 {
+        return (seed ^ 0x9E3779B97F4A7C15 as u64) *% 0xff51afd7ed558ccd as u64
+    }
+    return hash.xx64_seed(p, n, seed +% n as u64)
+}
+
+fn content_hash(tp: u64, tn: usize, hp: u64, hn: usize, pp: u64, pn: usize) -> u64 {
+    let a: u64 = chain(tp, tn, 1 as u64)
+    let b: u64 = chain(hp, hn, a)
+    return chain(pp, pn, b)
+}
+
+fn same_bytes(a: *mut rt.Buf, p: u64, n: usize) -> bool {
+    if rt.buf_len(a) != n {
+        return false
+    }
+    var i: usize = 0
+    let q: u64 = rt.buf_ptr(a)
+    while i < n {
+        if rt.ld8(q, i) != rt.ld8(p, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- the list
+
+// Removes the entry at index `i` (newest = 0), keeps the order of the rest.
+fn remove_at(h: *mut History, i: usize) {
+    let n: usize = vec_len[Entry](&(*h).items)
+    if i >= n {
+        return
+    }
+    entry_free(ep(h, i))
+    var k: usize = i
+    while k + 1 < n {
+        *ep(h, k) = *ep(h, k + 1)
+        k = k + 1
+    }
+    vec_shorten[Entry](&(*h).items, n - 1)
+    (*h).dirty = true
+}
+
+// Moves the entry at `i` to index 0.
+fn bring_top(h: *mut History, i: usize) {
+    if i == 0 {
+        return
+    }
+    let e: Entry = *ep(h, i)
+    var k: usize = i
+    while k > 0 {
+        *ep(h, k) = *ep(h, k - 1)
+        k = k - 1
+    }
+    *ep(h, 0) = e
+}
+
+fn enforce_limit(h: *mut History) {
+    while true {
+        var unpinned: usize = 0
+        var oldest: usize = 0
+        var any: bool = false
+        var i: usize = 0
+        while i < count(h) {
+            if !(*ep(h, i)).pinned {
+                unpinned = unpinned + 1
+                oldest = i
+                any = true
+            }
+            i = i + 1
+        }
+        if !any || unpinned <= (*h).limit {
+            return
+        }
+        remove_at(h, oldest)
+    }
+}
+
+fn find_index(h: *mut History, id: u64) -> usize {
+    var i: usize = 0
+    while i < count(h) {
+        if (*ep(h, i)).id == id {
+            return i
+        }
+        i = i + 1
+    }
+    return 0xFFFFFFFF as usize
+}
+
+fn bad_index() -> usize {
+    return 0xFFFFFFFF as usize
+}
+
+// Adds one copy of raw octets. Returns the entry id, 0 = refused (empty, too large, sensitive with ttl 0).
+// `t_ms` = its time. A duplicate moves to the top.
+fn add_raw(h: *mut History, tp: u64, tn: usize, hp: u64, hn: usize, pp: u64, pn: usize, sensitive: bool, t_ms: i64) -> u64 {
+    if tn + hn + pn == 0 {
+        return 0 as u64
+    }
+    if tn + hn + pn > (*h).max_entry {
+        (*h).refused_big = (*h).refused_big + 1 as u64
+        return 0 as u64
+    }
+    if sensitive && (*h).sens_ttl_ms <= 0 {
+        (*h).refused_sens = (*h).refused_sens + 1 as u64
+        return 0 as u64
+    }
+    let hv: u64 = content_hash(tp, tn, hp, hn, pp, pn)
+    var i: usize = 0
+    while i < count(h) {
+        let e: *mut Entry = ep(h, i)
+        if (*e).hash == hv && same_bytes(&(*e).text, tp, tn) && same_bytes(&(*e).html, hp, hn) && same_bytes(&(*e).png, pp, pn) {
+            (*e).time_ms = t_ms
+            if sensitive && !(*e).sensitive {
+                (*e).sensitive = true
+            }
+            if (*e).sensitive {
+                (*e).expires_ms = t_ms + (*h).sens_ttl_ms
+            }
+            let id: u64 = (*e).id
+            bring_top(h, i)
+            (*h).dirty = true
+            return id
+        }
+        i = i + 1
+    }
+    var ne: Entry = Entry { id: (*h).next_id, hash: hv, time_ms: t_ms, expires_ms: 0, pinned: false, sensitive: sensitive,
+        text: rt.buf_new(), html: rt.buf_new(), png: rt.buf_new() }
+    (*h).next_id = (*h).next_id + 1 as u64
+    if sensitive {
+        ne.expires_ms = t_ms + (*h).sens_ttl_ms
+    }
+    if tn > 0 {
+        rt.buf_push_bytes(&ne.text, tp, tn)
+    }
+    if hn > 0 {
+        rt.buf_push_bytes(&ne.html, hp, hn)
+    }
+    if pn > 0 {
+        rt.buf_push_bytes(&ne.png, pp, pn)
+    }
+    let id2: u64 = ne.id
+    if !vec_insert[Entry](&(*h).items, 0, ne) {
+        entry_free(&ne)
+        return 0 as u64
+    }
+    (*h).dirty = true
+    enforce_limit(h)
+    return id2
+}
+
+// text + html (either may be ""), at the current time.
+fn add(h: *mut History, text: str, html: str, sensitive: bool) -> u64 {
+    return add_raw(h, text.p as u64, text.length(), html.p as u64, html.length(), 0 as u64, 0, sensitive, time.now_unix_ms())
+}
+
+// text + html + a PNG file (n octets at p).
+fn add_png(h: *mut History, text: str, html: str, png_p: u64, png_n: usize, sensitive: bool) -> u64 {
+    return add_raw(h, text.p as u64, text.length(), html.p as u64, html.length(), png_p, png_n, sensitive, time.now_unix_ms())
+}
+
+fn pin(h: *mut History, id: u64, on: bool) -> bool {
+    let i: usize = find_index(h, id)
+    if i == bad_index() {
+        return false
+    }
+    (*ep(h, i)).pinned = on
+    (*h).dirty = true
+    if !on {
+        enforce_limit(h)
+    }
+    return true
+}
+
+fn remove(h: *mut History, id: u64) -> bool {
+    let i: usize = find_index(h, id)
+    if i == bad_index() {
+        return false
+    }
+    remove_at(h, i)
+    return true
+}
+
+// Empties the history; keep_pinned = the pinned entries stay. Returns how many went.
+fn clear(h: *mut History, keep_pinned: bool) -> usize {
+    var gone: usize = 0
+    var i: usize = count(h)
+    while i > 0 {
+        i = i - 1
+        if !(keep_pinned && (*ep(h, i)).pinned) {
+            remove_at(h, i)
+            gone = gone + 1
+        }
+    }
+    return gone
+}
+
+// Drops the sensitive entries whose time is over. Returns how many went.
+fn expire(h: *mut History, now_ms: i64) -> usize {
+    var gone: usize = 0
+    var i: usize = count(h)
+    while i > 0 {
+        i = i - 1
+        let e: *mut Entry = ep(h, i)
+        if (*e).sensitive && now_ms >= (*e).expires_ms {
+            remove_at(h, i)
+            gone = gone + 1
+        }
+    }
+    return gone
+}
+
+// Moves an entry to the top with the current time (it was just used).
+fn touch(h: *mut History, id: u64, now_ms: i64) -> bool {
+    let i: usize = find_index(h, id)
+    if i == bad_index() {
+        return false
+    }
+    (*ep(h, i)).time_ms = now_ms
+    if (*ep(h, i)).sensitive {
+        (*ep(h, i)).expires_ms = now_ms + (*h).sens_ttl_ms
+    }
+    bring_top(h, i)
+    (*h).dirty = true
+    return true
+}
+
+// ---------------------------------------------------------------- reading entries
+
+// The `k`-th entry in DISPLAY order: all pinned ones first (newest first), then the others (newest first).
+// bad index (0xFFFFFFFF) when k is out of range.
+fn view_index(h: *mut History, k: usize) -> usize {
+    var pinned: usize = 0
+    var i: usize = 0
+    while i < count(h) {
+        if (*ep(h, i)).pinned {
+            pinned = pinned + 1
+        }
+        i = i + 1
+    }
+    var want_pinned: bool = true
+    var skip: usize = k
+    if k >= pinned {
+        want_pinned = false
+        skip = k - pinned
+    }
+    i = 0
+    while i < count(h) {
+        if (*ep(h, i)).pinned == want_pinned {
+            if skip == 0 {
+                return i
+            }
+            skip = skip - 1
+        }
+        i = i + 1
+    }
+    return bad_index()
+}
+
+fn buf_str(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_ptr(b) as *mut u8, n: rt.buf_len(b) }
+}
+
+fn id_of(h: *mut History, i: usize) -> u64 { return (*ep(h, i)).id }
+fn text_of(h: *mut History, i: usize) -> str { return buf_str(&(*ep(h, i)).text) }
+fn html_of(h: *mut History, i: usize) -> str { return buf_str(&(*ep(h, i)).html) }
+fn png_ptr(h: *mut History, i: usize) -> u64 { return rt.buf_ptr(&(*ep(h, i)).png) }
+fn png_len(h: *mut History, i: usize) -> usize { return rt.buf_len(&(*ep(h, i)).png) }
+fn hash_of(h: *mut History, i: usize) -> u64 { return (*ep(h, i)).hash }
+fn time_of(h: *mut History, i: usize) -> i64 { return (*ep(h, i)).time_ms }
+fn is_pinned(h: *mut History, i: usize) -> bool { return (*ep(h, i)).pinned }
+fn is_sensitive(h: *mut History, i: usize) -> bool { return (*ep(h, i)).sensitive }
+
+// Which formats an entry has: KIND_* bits.
+fn kinds(h: *mut History, i: usize) -> u32 {
+    var k: u32 = 0
+    if rt.buf_len(&(*ep(h, i)).text) > 0 {
+        k = k | KIND_TEXT
+    }
+    if rt.buf_len(&(*ep(h, i)).html) > 0 {
+        k = k | KIND_HTML
+    }
+    if rt.buf_len(&(*ep(h, i)).png) > 0 {
+        k = k | KIND_PNG
+    }
+    return k
+}
+
+// A one-line label for a list: the first line of the text (else of the html with tags cut out, else "[image]"),
+// white space squeezed, at most `max_chars` characters (UTF-8 aware, "..." when cut). A sensitive entry shows
+// "[hidden]". APPENDED to `out`.
+fn preview(h: *mut History, i: usize, max_chars: usize, out: *mut rt.Buf) {
+    let e: *mut Entry = ep(h, i)
+    if (*e).sensitive {
+        let s: str = "[hidden]"
+        rt.buf_push_bytes(out, s.p as u64, s.length())
+        return
+    }
+    var p: u64 = rt.buf_ptr(&(*e).text)
+    var n: usize = rt.buf_len(&(*e).text)
+    var tags: bool = false
+    if n == 0 {
+        p = rt.buf_ptr(&(*e).html)
+        n = rt.buf_len(&(*e).html)
+        tags = true
+    }
+    if n == 0 {
+        let s: str = "[image]"
+        rt.buf_push_bytes(out, s.p as u64, s.length())
+        return
+    }
+    var chars: usize = 0
+    var k: usize = 0
+    var in_tag: bool = false
+    var last_space: bool = true
+    var cut: bool = false
+    while k < n {
+        let c: u8 = rt.ld8(p, k)
+        if tags && c == 60 as u8 {
+            in_tag = true
+            k = k + 1
+            continue
+        }
+        if tags && c == 62 as u8 && in_tag {
+            in_tag = false
+            k = k + 1
+            continue
+        }
+        if in_tag {
+            k = k + 1
+            continue
+        }
+        if c == 10 as u8 || c == 13 as u8 || c == 9 as u8 || c == 32 as u8 {
+            if !last_space {
+                rt.buf_push(out, 32 as u8)
+                last_space = true
+                chars = chars + 1
+            }
+            k = k + 1
+            continue
+        }
+        if (c & 0xC0 as u8) != 0x80 as u8 {
+            if chars >= max_chars {
+                cut = true
+                break
+            }
+            chars = chars + 1
+        }
+        rt.buf_push(out, c)
+        last_space = false
+        k = k + 1
+    }
+    if cut {
+        let s: str = "..."
+        rt.buf_push_bytes(out, s.p as u64, s.length())
+    }
+}
+
+// ---------------------------------------------------------------- persistence
+
+fn put32(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(b, ((v >> 24) & 255 as u32) as u8)
+}
+
+fn put64(b: *mut rt.Buf, v: u64) {
+    put32(b, (v & 0xFFFFFFFF as u64) as u32)
+    put32(b, (v >> 32) as% u32)
+}
+
+fn get32(p: u64, at: usize) -> u32 {
+    return (rt.ld8(p, at) as u32) | ((rt.ld8(p, at + 1) as u32) << 8) | ((rt.ld8(p, at + 2) as u32) << 16) | ((rt.ld8(p, at + 3) as u32) << 24)
+}
+
+fn get64(p: u64, at: usize) -> u64 {
+    return (get32(p, at) as u64) | ((get32(p, at + 4) as u64) << 32)
+}
+
+// The history as octets of the file format: "FCH1", count, entries (time, flags, three lengths, data) newest first,
+// a 64 bit checksum. SENSITIVE ENTRIES ARE NOT WRITTEN. APPENDS to `out`; returns how many entries went in.
+fn serialize(h: *mut History, out: *mut rt.Buf) -> usize {
+    let start: usize = rt.buf_len(out)
+    var written: u32 = 0
+    var i: usize = 0
+    while i < count(h) {
+        if !(*ep(h, i)).sensitive {
+            written = written + 1 as u32
+        }
+        i = i + 1
+    }
+    rt.buf_push(out, 70 as u8)
+    rt.buf_push(out, 67 as u8)
+    rt.buf_push(out, 72 as u8)
+    rt.buf_push(out, 49 as u8)
+    put32(out, written)
+    i = 0
+    while i < count(h) {
+        let e: *mut Entry = ep(h, i)
+        if !(*e).sensitive {
+            put64(out, (*e).time_ms as% u64)
+            var fl: u32 = 0
+            if (*e).pinned {
+                fl = 1
+            }
+            put32(out, fl)
+            put32(out, rt.buf_len(&(*e).text) as u32)
+            put32(out, rt.buf_len(&(*e).html) as u32)
+            put32(out, rt.buf_len(&(*e).png) as u32)
+            rt.buf_push_bytes(out, rt.buf_ptr(&(*e).text), rt.buf_len(&(*e).text))
+            rt.buf_push_bytes(out, rt.buf_ptr(&(*e).html), rt.buf_len(&(*e).html))
+            rt.buf_push_bytes(out, rt.buf_ptr(&(*e).png), rt.buf_len(&(*e).png))
+        }
+        i = i + 1
+    }
+    let sum: u64 = hash.xx64(rt.buf_ptr(out) + start as u64, rt.buf_len(out) - start)
+    put64(out, sum)
+    return written as usize
+}
+
+// Checks `n` octets at `p` as a history file. Returns the entry count, or -1 when anything is wrong (magic,
+// checksum, counts, lengths beyond the data or beyond `max_entry`, an entry flagged sensitive, trailing octets).
+fn check_file(h: *mut History, p: u64, n: usize) -> i64 {
+    if n < 16 {
+        return -1
+    }
+    if rt.ld8(p, 0) != 70 as u8 || rt.ld8(p, 1) != 67 as u8 || rt.ld8(p, 2) != 72 as u8 || rt.ld8(p, 3) != 49 as u8 {
+        return -1
+    }
+    if hash.xx64(p, n - 8) != get64(p, n - 8) {
+        return -1
+    }
+    let cnt: u32 = get32(p, 4)
+    if cnt > MAX_FILE_ENTRIES {
+        return -1
+    }
+    var at: usize = 8
+    let end: usize = n - 8
+    var k: u32 = 0
+    while k < cnt {
+        if at + 24 > end {
+            return -1
+        }
+        let fl: u32 = get32(p, at + 8)
+        if (fl & 0xFFFFFFFE as u32) != 0 as u32 {
+            return -1 // an unknown flag, or "sensitive": never accepted from a file
+        }
+        let tl: usize = get32(p, at + 12) as usize
+        let hl: usize = get32(p, at + 16) as usize
+        let pl: usize = get32(p, at + 20) as usize
+        if tl + hl + pl == 0 || tl + hl + pl > (*h).max_entry {
+            return -1
+        }
+        if at + 24 + tl + hl + pl > end {
+            return -1
+        }
+        at = at + 24 + tl + hl + pl
+        k = k + 1 as u32
+    }
+    if at != end {
+        return -1
+    }
+    return cnt as i64
+}
+
+// Loads a history file's octets INTO the history (call it on a fresh history: the file's entries are added through
+// the normal rules, so the newest one of the file ends on top, limit and duplicates apply). A file that fails `check_file` changes nothing. Returns the number added, -1 = refused.
+fn deserialize(h: *mut History, p: u64, n: usize) -> i64 {
+    let cnt: i64 = check_file(h, p, n)
+    if cnt < 0 {
+        return -1
+    }
+    // collect the offsets (newest first in the file), then add oldest first so the newest ends on top
+    var offs: Vec[usize] = vec_new[usize]()
+    var at: usize = 8
+    var k: i64 = 0
+    while k < cnt {
+        vec_push[usize](&offs, at)
+        at = at + 24 + get32(p, at + 12) as usize + get32(p, at + 16) as usize + get32(p, at + 20) as usize
+        k = k + 1
+    }
+    var added: i64 = 0
+    var j: usize = vec_len[usize](&offs)
+    while j > 0 {
+        j = j - 1
+        let o: usize = vec_at[usize](&offs, j)
+        let tl: usize = get32(p, o + 12) as usize
+        let hl: usize = get32(p, o + 16) as usize
+        let pl: usize = get32(p, o + 20) as usize
+        let id: u64 = add_raw(h, p + (o + 24) as u64, tl, p + (o + 24 + tl) as u64, hl, p + (o + 24 + tl + hl) as u64, pl,
+            false, get64(p, o) as% i64)
+        if id != 0 as u64 {
+            added = added + 1
+            if (get32(p, o + 8) & 1 as u32) != 0 as u32 {
+                pin(h, id, true)
+            }
+        }
+    }
+    vec_free[usize](&offs)
+    (*h).dirty = false
+    return added
+}
+
+// Switches persistence ON: from now `persist_flush` writes `path`. Nothing is written by this call. false when
+// the path is empty.
+fn persist_enable(h: *mut History, path: str) -> bool {
+    if path.length() == 0 {
+        return false
+    }
+    rt.buf_clear(&(*h).path)
+    rt.buf_push_bytes(&(*h).path, path.p as u64, path.length())
+    (*h).persist = true
+    (*h).dirty = true
+    return true
+}
+
+// Switches persistence OFF; delete_file = remove the file too.
+fn persist_disable(h: *mut History, delete_file: bool) {
+    if delete_file && rt.buf_len(&(*h).path) > 0 {
+        let r: bool = fs.remove(buf_str(&(*h).path)) catch false
+    }
+    (*h).persist = false
+    rt.buf_clear(&(*h).path)
+}
+
+// Writes the file now (atomically, mode 0600, no sensitive entry). true = written.
+fn save(h: *mut History, path: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    serialize(h, &b)
+    let ok: bool = fs.write_atomic_mode(path, rt.buf_ptr(&b), rt.buf_len(&b), 384 as u32) catch false
+    wipe_buf(&b)
+    return ok
+}
+
+// Reads a history file into `h`. Returns the number of entries added, -1 = missing or refused.
+fn load(h: *mut History, path: str) -> i64 {
+    var b: rt.Buf = rt.buf_new()
+    let got: usize = fs.read_file(path, &b) catch 0xFFFFFFFF
+    var r: i64 = -1
+    if got != 0xFFFFFFFF as usize {
+        r = deserialize(h, rt.buf_ptr(&b), rt.buf_len(&b))
+    }
+    rt.buf_free(&b)
+    return r
+}
+
+// When persistence is on and something changed: write the file. true = written (or nothing to do).
+fn persist_flush(h: *mut History) -> bool {
+    if !(*h).persist || !(*h).dirty {
+        return true
+    }
+    if save(h, buf_str(&(*h).path)) {
+        (*h).dirty = false
+        return true
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- the watcher
+
+struct Watcher {
+    hist: *mut History,
+    lp: *mut loop.Loop,
+    timer: u64,
+    last_token: u64,
+    last_hash: u64,
+    have_hash: bool,
+    interval_ms: i64,
+    polls: u64,
+    captured: u64,
+    skipped_same: u64,
+    running: bool,
+}
+
+fn watch_new() -> Watcher {
+    return Watcher { hist: 0 as *mut History, lp: 0 as *mut loop.Loop, timer: 0, last_token: 0, last_hash: 0,
+        have_hash: false, interval_ms: 400, polls: 0, captured: 0, skipped_same: 0, running: false }
+}
+
+// Does the line list `types` (one format per line) contain `name`, ignoring case?
+fn has_type(types: *mut rt.Buf, name: str) -> bool {
+    let n: usize = rt.buf_len(types)
+    let p: u64 = rt.buf_ptr(types)
+    let m: usize = name.length()
+    if m == 0 || n < m {
+        return false
+    }
+    var i: usize = 0
+    while i + m <= n {
+        var ok: bool = true
+        var j: usize = 0
+        while j < m {
+            var a: u8 = rt.ld8(p, i + j)
+            var b: u8 = name.chars(j)
+            if a >= 65 as u8 && a <= 90 as u8 {
+                a = a + 32 as u8
+            }
+            if b >= 65 as u8 && b <= 90 as u8 {
+                b = b + 32 as u8
+            }
+            if a != b {
+                ok = false
+                break
+            }
+            j = j + 1
+        }
+        if ok {
+            // whole line only
+            let before_ok: bool = i == 0 || rt.ld8(p, i - 1) == 10 as u8
+            let after_ok: bool = i + m == n || rt.ld8(p, i + m) == 10 as u8
+            if before_ok && after_ok {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Is the current copy flagged by a password manager? (B2) `types` = the format list.
+fn flagged_sensitive(types: *mut rt.Buf) -> bool {
+    if has_type(types, "x-kde-passwordManagerHint") {
+        var v: rt.Buf = rt.buf_new()
+        var secret: bool = true
+        if clipboard.paste_format("x-kde-passwordManagerHint", &v) {
+            secret = rt.buf_len(&v) >= 6 && rt.ld8(rt.buf_ptr(&v), 0) == 115 as u8
+        }
+        rt.buf_free(&v)
+        if secret {
+            return true
+        }
+    }
+    if has_type(types, "ExcludeClipboardContentFromMonitorProcessing") {
+        return true
+    }
+    if has_type(types, "CanIncludeInClipboardHistory") {
+        var v2: rt.Buf = rt.buf_new()
+        var no: bool = true
+        if clipboard.paste_format("CanIncludeInClipboardHistory", &v2) {
+            no = rt.buf_len(&v2) >= 1 && rt.ld8(rt.buf_ptr(&v2), 0) == 0 as u8
+        }
+        rt.buf_free(&v2)
+        if no {
+            return true
+        }
+    }
+    return false
+}
+
+// One look at the system clipboard. true = a NEW entry was stored (or an old one moved up).
+// The cheap check first: on Windows an unchanged sequence number ends it. Elsewhere the content is read and its
+// hash compared with the last one seen.
+fn poll_once(w: *mut Watcher) -> bool {
+    (*w).polls = (*w).polls + 1 as u64
+    let tok: u64 = clipboard.change_token()
+    if tok != 0 as u64 && clipboard.token_exact() && tok == (*w).last_token {
+        return false
+    }
+    (*w).last_token = tok
+    var types: rt.Buf = rt.buf_new()
+    let nt: usize = clipboard.types(&types)
+    var text: rt.Buf = rt.buf_new()
+    var html: rt.Buf = rt.buf_new()
+    var png: rt.Buf = rt.buf_new()
+    var got: bool = false
+    var is_text: bool = nt == 0 || has_type(&types, "text/plain;charset=utf-8") || has_type(&types, "text/plain") || has_type(&types, "UTF8_STRING")
+    if is_text {
+        if clipboard.paste_text(&text) {
+            got = true
+        }
+    }
+    if nt > 0 && has_type(&types, "text/html") {
+        if clipboard.paste_html(&html) {
+            got = true
+        }
+    }
+    if nt > 0 && has_type(&types, "image/png") {
+        if clipboard.paste_png(&png) {
+            got = true
+        }
+    }
+    var stored: bool = false
+    if got && rt.buf_len(&text) + rt.buf_len(&html) + rt.buf_len(&png) > 0 {
+        let hv: u64 = content_hash(rt.buf_ptr(&text), rt.buf_len(&text), rt.buf_ptr(&html), rt.buf_len(&html),
+            rt.buf_ptr(&png), rt.buf_len(&png))
+        if (*w).have_hash && hv == (*w).last_hash {
+            (*w).skipped_same = (*w).skipped_same + 1 as u64
+        } else {
+            (*w).last_hash = hv
+            (*w).have_hash = true
+            let sens: bool = flagged_sensitive(&types)
+            if sens && !(*(*w).hist).sens_keep {
+                (*(*w).hist).refused_sens = (*(*w).hist).refused_sens + 1 as u64
+            } else {
+                let id: u64 = add_raw((*w).hist, rt.buf_ptr(&text), rt.buf_len(&text), rt.buf_ptr(&html), rt.buf_len(&html),
+                    rt.buf_ptr(&png), rt.buf_len(&png), sens, time.now_unix_ms())
+                if id != 0 as u64 {
+                    (*w).captured = (*w).captured + 1 as u64
+                    stored = true
+                }
+            }
+        }
+    }
+    wipe_buf(&text)
+    wipe_buf(&html)
+    wipe_buf(&png)
+    rt.buf_free(&types)
+    return stored
+}
+
+fn tick(l: *mut loop.Loop, ud: u64) {
+    let w: *mut Watcher = ud as *mut Watcher
+    let a: bool = poll_once(w)
+    let b: usize = expire((*w).hist, time.now_unix_ms())
+    let c: bool = persist_flush((*w).hist)
+}
+
+// Starts watching: every `interval_ms` (at least 50) on the loop `l`. The Watcher must stay where it is (the timer
+// keeps its address). The first look happens at once, so what is on the clipboard now is taken in.
+fn watch_start(w: *mut Watcher, h: *mut History, l: *mut loop.Loop, interval_ms: i64) -> bool {
+    if (*w).running {
+        return false
+    }
+    var ms: i64 = interval_ms
+    if ms < 50 {
+        ms = 50
+    }
+    (*w).hist = h
+    (*w).lp = l
+    (*w).interval_ms = ms
+    let t: u64 = loop.timer_every(l, ms, tick, w as u64)
+    if t == 0 as u64 {
+        return false
+    }
+    (*w).timer = t
+    (*w).running = true
+    let first: bool = poll_once(w)
+    return true
+}
+
+fn watch_stop(w: *mut Watcher) {
+    if (*w).running {
+        let c: bool = loop.timer_cancel((*w).lp, (*w).timer)
+        (*w).running = false
+        (*w).timer = 0
+    }
+}
+
+// Puts the entry at index `idx` back on the system clipboard (all its formats at once), moves it to the top, and
+// remembers its hash so the watcher does not take it in again as news. false = could not copy.
+fn watch_paste(w: *mut Watcher, idx: usize) -> bool {
+    let h: *mut History = (*w).hist
+    if idx >= count(h) {
+        return false
+    }
+    let e: *mut Entry = ep(h, idx)
+    let ok: bool = clipboard.copy_multi(buf_str(&(*e).text), buf_str(&(*e).html), rt.buf_ptr(&(*e).png), rt.buf_len(&(*e).png))
+    if !ok {
+        return false
+    }
+    (*w).last_hash = (*e).hash
+    (*w).have_hash = true
+    let id: u64 = (*e).id
+    let t: bool = touch(h, id, time.now_unix_ms())
+    (*w).last_token = clipboard.change_token()
+    return true
+}

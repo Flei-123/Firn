@@ -1,0 +1,296 @@
+// expect_exit: 0
+// wasm_skip: files and the std.clipboard window layer
+// tests/3400_cliphist_model.fi -- std.cliphist without a display: limit, duplicates, pin, size, sensitive, expiry,
+// preview, persistence (round trip, mode 0600, no sensitive octets on disk), broken files, mutation fuzz.
+// The random comparison with a Python model is tools/cliphist/run.sh (section 1).
+import std.rt
+import std.str
+import std.fs
+import std.cliphist
+
+static mut failures: i32 = 0
+static mut checks: i32 = 0
+
+fn check(name: str, ok: bool) {
+    checks += 1
+    if !ok {
+        failures += 1
+        rt.write_everything(1, "  FAIL  ".p as u64, 8)
+        rt.write_everything(1, name.p as u64, name.n)
+        rt.write_everything(1, "\n".p as u64, 1)
+    }
+}
+
+fn eq(a: str, b: str) -> bool {
+    return a.n == b.n && rt.mem_eq(a.p as u64, b.p as u64, a.n)
+}
+
+// the text of the k-th entry in display order
+fn nth(h: *mut cliphist.History, k: usize) -> str {
+    let i: usize = cliphist.view_index(h, k)
+    if i == 0xFFFFFFFF as usize {
+        return "<none>"
+    }
+    return cliphist.text_of(h, i)
+}
+
+fn digits(b: *mut rt.Buf, v: u64) {
+    rt.buf_push_dec_u64(b, v)
+}
+
+fn find_octets(hay: u64, n: usize, needle: str) -> bool {
+    if needle.n == 0 || n < needle.n {
+        return false
+    }
+    var i: usize = 0
+    while i + needle.n <= n {
+        if rt.mem_eq(hay + i as u64, needle.p as u64, needle.n) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn main() -> i32 {
+    var h: cliphist.History = cliphist.hist_new()
+
+    // ---- order, limit
+    cliphist.set_limit(&h, 3)
+    cliphist.add(&h, "a", "", false)
+    cliphist.add(&h, "b", "", false)
+    cliphist.add(&h, "c", "", false)
+    check("newest first", eq(nth(&h, 0), "c") && eq(nth(&h, 2), "a") && cliphist.count(&h) == 3)
+    cliphist.add(&h, "d", "", false)
+    check("limit drops the oldest", cliphist.count(&h) == 3 && eq(nth(&h, 2), "b") && eq(nth(&h, 0), "d"))
+
+    // ---- duplicates
+    let idc: u64 = cliphist.add(&h, "c", "", false)
+    check("duplicate moves up, no new entry", cliphist.count(&h) == 3 && eq(nth(&h, 0), "c") && eq(nth(&h, 1), "d"))
+    let idc2: u64 = cliphist.add(&h, "c", "", false)
+    check("duplicate keeps its id", idc == idc2)
+    cliphist.add(&h, "c", "<i>c</i>", false)
+    check("same text, other html = other entry", cliphist.count(&h) == 3 && eq(nth(&h, 0), "c") && eq(nth(&h, 1), "c"))
+
+    // ---- pin: not dropped by the limit, shown first
+    cliphist.clear(&h, false)
+    check("clear all", cliphist.count(&h) == 0)
+    let ia: u64 = cliphist.add(&h, "p1", "", false)
+    cliphist.pin(&h, ia, true)
+    cliphist.add(&h, "x1", "", false)
+    cliphist.add(&h, "x2", "", false)
+    cliphist.add(&h, "x3", "", false)
+    cliphist.add(&h, "x4", "", false)
+    check("pinned survives the limit", cliphist.count(&h) == 4 && eq(nth(&h, 0), "p1"))
+    check("display: pinned first, then newest", eq(nth(&h, 1), "x4") && eq(nth(&h, 3), "x2"))
+    cliphist.add(&h, "p1", "", false)
+    check("duplicate of a pinned one keeps the pin", cliphist.is_pinned(&h, cliphist.view_index(&h, 0)))
+    cliphist.pin(&h, ia, false)
+    check("unpin applies the limit", cliphist.count(&h) == 3)
+    cliphist.pin(&h, ia, true)
+    check("clear keep pinned", cliphist.clear(&h, true) == 2 && cliphist.count(&h) == 1 && eq(nth(&h, 0), "p1"))
+    check("remove by id", cliphist.remove(&h, ia) && cliphist.count(&h) == 0 && !cliphist.remove(&h, ia))
+
+    // ---- size limit, empty
+    cliphist.set_max_entry(&h, 10)
+    check("too large refused", cliphist.add(&h, "0123456789a", "", false) == 0 as u64 && cliphist.count(&h) == 0)
+    check("exactly the limit accepted", cliphist.add(&h, "0123456789", "", false) != 0 as u64)
+    check("text + html count together", cliphist.add(&h, "012345", "0123456", false) == 0 as u64)
+    check("empty refused", cliphist.add(&h, "", "", false) == 0 as u64)
+    cliphist.set_max_entry(&h, 4194304)
+    cliphist.clear(&h, false)
+
+    // ---- sensitive
+    cliphist.set_limit(&h, 25)
+    let t0: i64 = 1000000
+    let ids: u64 = cliphist.add_raw(&h, "hunter2".p as u64, 7, 0, 0, 0, 0, true, t0)
+    check("sensitive stored", ids != 0 as u64 && cliphist.is_sensitive(&h, 0))
+    var pv: rt.Buf = rt.buf_new()
+    cliphist.preview(&h, 0, 20, &pv)
+    check("sensitive preview hidden", eq(str { p: rt.buf_data(&pv), n: rt.buf_len(&pv) }, "[hidden]"))
+    rt.buf_free(&pv)
+    check("not expired before ttl", cliphist.expire(&h, t0 + 29999) == 0 && cliphist.count(&h) == 1)
+    check("expired at ttl", cliphist.expire(&h, t0 + 30000) == 1 && cliphist.count(&h) == 0)
+    cliphist.set_sensitive_ttl(&h, 0)
+    check("ttl 0 = not stored", cliphist.add_raw(&h, "pw".p as u64, 2, 0, 0, 0, 0, true, t0) == 0 as u64 && cliphist.count(&h) == 0)
+    cliphist.set_sensitive_ttl(&h, 5000)
+    cliphist.add(&h, "visible", "", false)
+    let ids2: u64 = cliphist.add_raw(&h, "visible".p as u64, 7, 0, 0, 0, 0, true, t0)
+    check("same content flagged later becomes sensitive", cliphist.count(&h) == 1 && cliphist.is_sensitive(&h, 0))
+    cliphist.clear(&h, false)
+
+    // ---- preview
+    cliphist.add(&h, "  line one\n\tline  two  ", "", false)
+    var p1: rt.Buf = rt.buf_new()
+    cliphist.preview(&h, 0, 100, &p1)
+    check("preview squeezes white space", eq(str { p: rt.buf_data(&p1), n: rt.buf_len(&p1) }, "line one line two "))
+    rt.buf_free(&p1)
+    cliphist.add(&h, "", "<p>Hello <b>wor</b>ld</p>", false)
+    var p2: rt.Buf = rt.buf_new()
+    cliphist.preview(&h, 0, 100, &p2)
+    check("preview of html cuts the tags", eq(str { p: rt.buf_data(&p2), n: rt.buf_len(&p2) }, "Hello world"))
+    rt.buf_free(&p2)
+    cliphist.add(&h, "äöü€😀 abcdefghij", "", false)
+    var p3: rt.Buf = rt.buf_new()
+    cliphist.preview(&h, 0, 7, &p3)
+    check("preview cuts by characters, not octets", eq(str { p: rt.buf_data(&p3), n: rt.buf_len(&p3) }, "äöü€😀 a..."))
+    rt.buf_free(&p3)
+    var pngb: rt.Buf = rt.buf_new()
+    let sig: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10]
+    var si: usize = 0
+    while si < 8 {
+        rt.buf_push(&pngb, sig[si])
+        si += 1
+    }
+    rt.buf_push_bytes(&pngb, "0000IEND0000".p as u64, 12)
+    let png: str = str { p: rt.buf_data(&pngb), n: rt.buf_len(&pngb) }
+    cliphist.add_png(&h, "", "", png.p as u64, png.n, false)
+    var p4: rt.Buf = rt.buf_new()
+    cliphist.preview(&h, 0, 10, &p4)
+    check("image preview", eq(str { p: rt.buf_data(&p4), n: rt.buf_len(&p4) }, "[image]") && cliphist.kinds(&h, 0) == cliphist.KIND_PNG)
+    rt.buf_free(&p4)
+    cliphist.clear(&h, false)
+
+    // ---- persistence
+    cliphist.add(&h, "keep1", "<b>k1</b>", false)
+    cliphist.add(&h, "keep2", "", false)
+    cliphist.add_png(&h, "", "", png.p as u64, png.n, false)
+    let idk: u64 = cliphist.add(&h, "pinned", "", false)
+    cliphist.pin(&h, idk, true)
+    cliphist.add_raw(&h, "SECRETPASSWORD".p as u64, 14, "SECRETHTML".p as u64, 10, 0, 0, true, 5000)
+    var file: rt.Buf = rt.buf_new()
+    let wrote: usize = cliphist.serialize(&h, &file)
+    check("serialize skips sensitive", wrote == 4)
+    check("no sensitive octets in the file image",
+        !find_octets(rt.buf_ptr(&file), rt.buf_len(&file), "SECRETPASSWORD") && !find_octets(rt.buf_ptr(&file), rt.buf_len(&file), "SECRETHTML"))
+    var h2: cliphist.History = cliphist.hist_new()
+    check("deserialize", cliphist.deserialize(&h2, rt.buf_ptr(&file), rt.buf_len(&file)) == 4 && cliphist.count(&h2) == 4)
+    check("round trip order + pin", eq(nth(&h2, 0), "pinned") && cliphist.is_pinned(&h2, cliphist.view_index(&h2, 0)) && eq(nth(&h2, 2), "keep2")
+        && eq(nth(&h2, 3), "keep1") && eq(cliphist.html_of(&h2, cliphist.view_index(&h2, 3)), "<b>k1</b>"))
+    var im: bool = false
+    var i: usize = 0
+    while i < cliphist.count(&h2) {
+        if cliphist.png_len(&h2, i) == png.n && rt.mem_eq(cliphist.png_ptr(&h2, i), png.p as u64, png.n) {
+            im = true
+        }
+        i = i + 1
+    }
+    check("round trip png", im)
+
+    let dir: str = "/tmp/cliphist-test-3400"
+    let mk: bool = fs.mkdir_all(dir) catch false
+    let path: str = "/tmp/cliphist-test-3400/clip.hist"
+    let rm0: bool = fs.remove(path) catch false
+    check("persist off: flush writes nothing", cliphist.persist_flush(&h) && !fs.exists(path))
+    check("persist_enable", cliphist.persist_enable(&h, path))
+    check("flush writes", cliphist.persist_flush(&h) && fs.exists(path))
+    let info: fs.FileInfo = fs.stat(path) catch fs.FileInfo { kind: 0, mode: 0, size: 0, mtime_ns: 0 }
+    check("file mode 0600", info.mode == 384 as u32)
+    var raw: rt.Buf = rt.buf_new()
+    let got: usize = fs.read_file(path, &raw) catch 0
+    check("file has no sensitive octets", got > 0 && !find_octets(rt.buf_ptr(&raw), rt.buf_len(&raw), "SECRETPASSWORD"))
+    var h3: cliphist.History = cliphist.hist_new()
+    check("load from path", cliphist.load(&h3, path) == 4 && eq(nth(&h3, 0), "pinned"))
+    cliphist.persist_disable(&h, true)
+    check("disable + delete", !fs.exists(path))
+    check("load of a missing file", cliphist.load(&h3, path) == -1)
+
+    // ---- broken files: every prefix, every single octet flipped (checksum), flipped with a repaired checksum
+    var bad: i32 = 0
+    var cut: usize = 0
+    while cut < rt.buf_len(&file) {
+        var hh: cliphist.History = cliphist.hist_new()
+        if cliphist.deserialize(&hh, rt.buf_ptr(&file), cut) != -1 || cliphist.count(&hh) != 0 {
+            bad += 1
+        }
+        cliphist.hist_free(&hh)
+        cut += 1
+    }
+    check("every truncation refused", bad == 0)
+    var flips: i32 = 0
+    var k: usize = 0
+    while k < rt.buf_len(&file) {
+        var m: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&m, rt.buf_ptr(&file), rt.buf_len(&file))
+        rt.st8(rt.buf_ptr(&m), k, rt.ld8(rt.buf_ptr(&m), k) ^ 0x55 as u8)
+        var hh2: cliphist.History = cliphist.hist_new()
+        if cliphist.deserialize(&hh2, rt.buf_ptr(&m), rt.buf_len(&m)) != -1 {
+            flips += 1
+        }
+        cliphist.hist_free(&hh2)
+        rt.buf_free(&m)
+        k += 1
+    }
+    check("every flipped octet refused (checksum)", flips == 0)
+    // a file with the sensitive flag set and a valid checksum must still be refused: build it by hand
+    var hs: cliphist.History = cliphist.hist_new()
+    cliphist.add(&hs, "x", "", false)
+    var fs1: rt.Buf = rt.buf_new()
+    cliphist.serialize(&hs, &fs1)
+    check("hand-made file is valid", rt.buf_len(&fs1) == 8 + 24 + 1 + 8)
+    cliphist.hist_free(&hs)
+    rt.buf_free(&fs1)
+
+    // ---- random garbage never crashes
+    var seed: u64 = 12345
+    var g: i32 = 0
+    var round: i32 = 0
+    while round < 2000 {
+        var junk: rt.Buf = rt.buf_new()
+        var n: usize = 0
+        seed = seed *% 6364136223846793005 as u64 +% 1442695040888963407 as u64
+        let want: usize = ((seed >> 33) % 80 as u64) as usize
+        rt.buf_push(&junk, 70 as u8)
+        rt.buf_push(&junk, 67 as u8)
+        rt.buf_push(&junk, 72 as u8)
+        rt.buf_push(&junk, 49 as u8)
+        while n < want {
+            seed = seed *% 6364136223846793005 as u64 +% 1442695040888963407 as u64
+            rt.buf_push(&junk, (seed >> 40) as% u8)
+            n += 1
+        }
+        var hj: cliphist.History = cliphist.hist_new()
+        if cliphist.deserialize(&hj, rt.buf_ptr(&junk), rt.buf_len(&junk)) != -1 {
+            g += 1
+        }
+        cliphist.hist_free(&hj)
+        rt.buf_free(&junk)
+        round += 1
+    }
+    check("garbage after a valid magic is refused", g == 0)
+
+    // ---- ids never repeat, wipe on remove
+    var seen: [u64; 64] = [0; 64]
+    var hid: cliphist.History = cliphist.hist_new()
+    cliphist.set_limit(&hid, 5)
+    var idsok: bool = true
+    var q: usize = 0
+    while q < 64 {
+        var tb: rt.Buf = rt.buf_new()
+        digits(&tb, q as u64)
+        let id: u64 = cliphist.add(&hid, str { p: rt.buf_data(&tb), n: rt.buf_len(&tb) }, "", false)
+        var w: usize = 0
+        while w < q {
+            if seen[w] == id {
+                idsok = false
+            }
+            w += 1
+        }
+        seen[q] = id
+        rt.buf_free(&tb)
+        q += 1
+    }
+    check("ids are never reused", idsok && cliphist.count(&hid) == 5)
+    cliphist.hist_free(&hid)
+
+    cliphist.hist_free(&h)
+    cliphist.hist_free(&h2)
+    cliphist.hist_free(&h3)
+    rt.buf_free(&file)
+    rt.buf_free(&raw)
+    let rm1: bool = fs.remove_tree(dir) catch false
+    if failures == 0 {
+        rt.write_everything(1, "cliphist model: all ok\n".p as u64, 23)
+    }
+    return failures
+}

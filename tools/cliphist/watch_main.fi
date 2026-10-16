@@ -1,0 +1,101 @@
+// tools/cliphist/watch_main.fi -- the watcher and the view against a real X11 clipboard (run.sh starts Xvfb).
+// The program copies through std.clipboard (its own hidden window owns the selection), the watcher takes the copy in
+// through the X11 protocol, then an entry is put back and read again. Exit code = number of failed checks.
+import std.rt
+import std.str
+import std.clipboard
+import std.cliphist
+import async.loop
+import fui.app
+import fui.cliphistview
+
+static mut failures: i32 = 0
+
+fn say(s: str) {
+    rt.write_everything(2, s.p as u64, s.n)
+}
+
+fn ck(name: str, ok: bool) {
+    if !ok {
+        failures += 1
+        say("  FAIL  ")
+        say(name)
+        say("\n")
+    }
+}
+
+fn eq(a: str, b: str) -> bool {
+    return a.n == b.n && rt.mem_eq(a.p as u64, b.p as u64, a.n)
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var h: cliphist.History = cliphist.hist_new()
+    var w: cliphist.Watcher = cliphist.watch_new()
+    w.hist = &h
+    var lp: loop.Loop = loop.loop_new()
+    loop.loop_init(&lp)
+    ck("copy_text", clipboard.copy_text("first copy"))
+    ck("poll takes it", cliphist.poll_once(&w) && cliphist.count(&h) == 1 && eq(cliphist.text_of(&h, 0), "first copy"))
+    ck("same content is not news", !cliphist.poll_once(&w) && cliphist.count(&h) == 1)
+    ck("copy_multi text+html", clipboard.copy_multi("plain two", "<b>two</b>", 0, 0))
+    ck("poll takes both formats", cliphist.poll_once(&w) && cliphist.count(&h) == 2 && eq(cliphist.text_of(&h, 0), "plain two")
+        && eq(cliphist.html_of(&h, 0), "<b>two</b>"))
+    var got: rt.Buf = rt.buf_new()
+    ck("paste_html sees the html", clipboard.paste_html(&got) && eq(str { p: rt.buf_data(&got), n: rt.buf_len(&got) }, "<b>two</b>"))
+    rt.buf_free(&got)
+    ck("copy again the first", clipboard.copy_text("first copy"))
+    ck("old content moves up", cliphist.poll_once(&w) && cliphist.count(&h) == 2 && eq(cliphist.text_of(&h, 0), "first copy"))
+    // put the second entry back
+    ck("watch_paste", cliphist.watch_paste(&w, 1))
+    var back: rt.Buf = rt.buf_new()
+    ck("system clipboard holds the entry", clipboard.paste_text(&back) && eq(str { p: rt.buf_data(&back), n: rt.buf_len(&back) }, "plain two"))
+    rt.buf_free(&back)
+    ck("entry is on top, no duplicate from the watcher", cliphist.count(&h) == 2 && !cliphist.poll_once(&w) && eq(cliphist.text_of(&h, 0), "plain two"))
+    ck("token is not 0 on X11", clipboard.change_token() != 0 as u64)
+    var ty: rt.Buf = rt.buf_new()
+    ck("types lists text/html", clipboard.types(&ty) >= 2)
+    rt.buf_free(&ty)
+    // a sensitive copy flagged by the owner is dropped by default (the format list carries the password hint)
+    ck("a password manager copy", clipboard.copy_text("pw-secret-123") && clipboard.add_format("x-kde-passwordManagerHint", "secret".p as u64, 6))
+    let before_n: usize = cliphist.count(&h)
+    ck("flagged copy is dropped, not stored", !cliphist.poll_once(&w) && cliphist.count(&h) == before_n && h.refused_sens == 1 as u64)
+    h.sens_ttl_ms = 5000
+    cliphist.set_sensitive_keep(&h, true)
+    ck("keep policy: stored as sensitive", clipboard.copy_text("pw-secret-456") && clipboard.add_format("x-kde-passwordManagerHint", "secret".p as u64, 6)
+        && cliphist.poll_once(&w) && cliphist.is_sensitive(&h, 0) && cliphist.count(&h) == before_n + 1)
+    cliphist.set_sensitive_keep(&h, false)
+    ck("expire wipes it", cliphist.expire(&h, 9223372036854775807) == 1 && cliphist.count(&h) == before_n)
+    ck("clear", clipboard.clear())
+    ck("empty clipboard: nothing new", !cliphist.poll_once(&w) && cliphist.count(&h) == 2)
+    // the timer path
+    ck("watch_start", cliphist.watch_start(&w, &h, &lp, 50))
+    ck("copy while watching", clipboard.copy_text("while watching"))
+    var n: i32 = 0
+    while n < 20 && cliphist.count(&h) < 3 {
+        loop.run_once(&lp, 60)
+        n += 1
+    }
+    ck("timer took the copy in", cliphist.count(&h) == 3 && eq(cliphist.text_of(&h, 0), "while watching"))
+    cliphist.watch_stop(&w)
+    // the view
+    let a: *mut app.App = app.window("Clipboard", 360, 420)
+    ck("view_build", cliphistview.view_build(a, &h, &w))
+    ck("header", eq(cliphistview.view_header(), "3 in history"))
+    ck("rows shown", cliphistview.view_shown_rows() == 3 && cliphistview.view_row_visible(2) && !cliphistview.view_row_visible(3))
+    ck("selected row marked", eq(cliphistview.view_row_text(0), "> while watching"))
+    ck("pin row 1", cliphistview.view_pin(1))
+    ck("pinned row first", eq(cliphistview.view_row_text(0), "[pin] plain two") || eq(cliphistview.view_row_text(0), "> [pin] first copy") || cliphist.is_pinned(&h, cliphist.view_index(&h, 0)))
+    cliphistview.view_set_hide_on_pick(false)
+    ck("pick row 2", cliphistview.view_pick(2))
+    var after: rt.Buf = rt.buf_new()
+    ck("pick put it on the system clipboard", clipboard.paste_text(&after) && rt.buf_len(&after) > 0)
+    rt.buf_free(&after)
+    ck("delete row 0", cliphistview.view_delete(0) && cliphist.count(&h) == 2)
+    ck("clear keeps pinned", cliphistview.view_clear() >= 0)
+    cliphist.hist_free(&h)
+    if failures == 0 {
+        say("cliphist watch: all ok\n")
+    }
+    return failures
+}

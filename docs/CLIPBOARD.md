@@ -80,3 +80,15 @@ for a while, or install a helper.
   `SelectionClear` notice in the stream, which dropped the next copy's data.
 * Not done: more than one image type, `text/html`, a file list (`window.clipboard_set` knows `text/uri-list`), watching
   the clipboard for changes.
+
+## History (std.cliphist, fui.cliphistview)
+
+`lib/std/cliphist.fi` keeps a clipboard history (Win+V style), `lib/fui/cliphistview.fi` shows it. Rules and honest limits
+are in the header of `cliphist.fi`: limit 25 unpinned, duplicates move up (hash + byte compare), pin, size limit per entry
+(4 MiB), `sensitive` entries only in memory and wiped after a ttl, persistence opt-in (mode 0600, never sensitive, not
+encrypted). The watcher POLLS (X11 has no change notice in the window layer); Windows uses the clipboard sequence number.
+`std.clipboard` got `copy_html`, `paste_html`, `copy_multi` (text + html + png as ONE copy), `types`, `paste_format`,
+`add_format`, `change_token`, `token_exact`; the window layer got `clipboard_token`. Tests: `tests/3400_cliphist_model.fi`,
+`bash tools/cliphist/run.sh` (Python model, XXH64 and file format written out in Python; watcher + view on a private Xvfb).
+Not verified: a foreign owner offering html or the password hint (GTK 3 via PyGObject cannot offer extra formats), real
+Windows (CF_HTML wrapper missing), Wayland.
