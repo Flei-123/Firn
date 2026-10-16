@@ -1,0 +1,281 @@
+// expect_exit: 0
+// tests/3680_photo_antialias.fi -- photo.antialias + photo.edgemetric (r658): flat / smooth content is untouched bit for bit, the
+// false colour of a Siemens star drops, the stair jitter of a slanted edge drops without losing PSNR, a coloured edge keeps its
+// MTF50 under the chroma cleanup, random images of odd sizes stay finite (fuzz), strength 0 is a no-op, the camera job runs
+// with the option on. Numbers: tools/photo/aaeval.fi.
+import std.io
+import std.rt
+import std.math
+import photo.image
+import photo.meta
+import photo.par
+import photo.demosaic
+import photo.antialias
+import photo.edgemetric
+import photo.camjob
+
+fn check(c: bool, msg: str) -> bool {
+    if !c { io.print(msg); io.new_line() }
+    return c
+}
+
+fn fabs(a: f32) -> f32 {
+    if a < 0.0f { return 0.0f - a }
+    return a
+}
+
+fn demo(raw: u64, w: i32, h: i32) -> image.Image {
+    var black: [f32; 4] = [64.0f, 64.0f, 64.0f, 64.0f]
+    return demosaic.demosaic_u16(raw, w, h, 0, 0, w, h, meta.CFA_RGGB, &black[0], 1023.0f)
+}
+
+fn same(a: *mut image.Image, b: *mut image.Image) -> bool {
+    var c: i32 = 0
+    while c < 3 {
+        var y: i32 = 0
+        while y < (*a).h {
+            var x: i32 = 0
+            while x < (*a).w {
+                if image.img_get(a, c, x, y) != image.img_get(b, c, x, y) { return false }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        c = c + 1
+    }
+    return true
+}
+
+// mean chroma |R-G| + |B-G| over the star disk, PSNR vs the ideal over the disk
+fn star_stats(im: *mut image.Image, ideal: *mut image.Image, n: i32, chroma: *mut f32, psnr: *mut f32) {
+    var cs: f64 = 0.0
+    var mse: f64 = 0.0
+    var cnt: i32 = 0
+    let c0: f32 = (n as f32) * 0.5f
+    var y: i32 = 0
+    while y < n {
+        var x: i32 = 0
+        while x < n {
+            let dx: f32 = (x as f32) + 0.5f - c0
+            let dy: f32 = (y as f32) + 0.5f - c0
+            if dx * dx + dy * dy < 40.0f * 40.0f {
+                cs = cs + ((fabs(image.img_get(im, 0, x, y) - image.img_get(im, 1, x, y)) + fabs(image.img_get(im, 2, x, y) - image.img_get(im, 1, x, y))) as f64)
+                var c: i32 = 0
+                while c < 3 {
+                    let e: f32 = image.img_get(im, c, x, y) - image.img_get(ideal, c, x, y)
+                    mse = mse + ((e * e) as f64)
+                    c = c + 1
+                }
+                cnt = cnt + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    *chroma = (cs / (2.0 * (cnt as f64))) as f32
+    *psnr = (10.0 * math.log10(0.36 / (mse / (3.0 * (cnt as f64))))) as f32
+}
+
+// PSNR in the band |d| < 4 px around the edge
+fn edge_psnr(im: *mut image.Image, ideal: *mut image.Image, e: *mut edgemetric.Edge) -> f32 {
+    var mse: f64 = 0.0
+    var cnt: i32 = 0
+    var y: i32 = (*e).y0
+    while y < (*e).y1 {
+        var x: i32 = (*e).x0
+        while x < (*e).x1 {
+            let d: f32 = ((x as f32) + 0.5f - (*e).cx) * (*e).nx + ((y as f32) + 0.5f - (*e).cy) * (*e).ny
+            if d > -4.0f && d < 4.0f {
+                var c: i32 = 0
+                while c < 3 {
+                    let df: f32 = image.img_get(im, c, x, y) - image.img_get(ideal, c, x, y)
+                    mse = mse + ((df * df) as f64)
+                    cnt = cnt + 1
+                    c = c + 1
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return (10.0 * math.log10(0.36 / (mse / (cnt as f64)))) as f32
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var ok: bool = true
+    par.init(3)
+    var lo: [f32; 3] = [0.1f, 0.1f, 0.1f]
+    var hi: [f32; 3] = [0.7f, 0.7f, 0.7f]
+
+    // ---- flat and smooth content: untouched bit for bit (also across the band borders: 150 rows)
+    var rng: image.Rng = image.rng_new(9 as u64)
+    var ramp: image.Image = image.img_new(40, 150, 3)
+    var yy: i32 = 0
+    while yy < 150 {
+        var xx: i32 = 0
+        while xx < 40 {
+            var c: i32 = 0
+            while c < 3 {
+                image.img_set(&ramp, c, xx, yy, 0.2f + 0.001f * (xx as f32) + 0.0005f * (yy as f32) + 0.05f * (c as f32))
+                c = c + 1
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    var ramp0: image.Image = image.img_copy(&ramp)
+    antialias.aa_apply(&ramp, 1.0f)
+    ok = check(same(&ramp, &ramp0), "smooth ramp changed") && ok
+    image.img_free(&ramp)
+    image.img_free(&ramp0)
+
+    // ---- Siemens star: false colour drops, PSNR vs the ideal does not
+    let n: i32 = 96
+    let sraw: u64 = edgemetric.render_raw(edgemetric.SCENE_STAR, n, n, 0.0f, &lo, &hi)
+    var sideal: image.Image = edgemetric.render_ideal(edgemetric.SCENE_STAR, n, n, 0.0f, &lo, &hi)
+    var s0: image.Image = demo(sraw, n, n)
+    var s1: image.Image = image.img_copy(&s0)
+    antialias.aa_apply(&s1, 1.0f)
+    var ch0: f32 = 0.0f
+    var ps0: f32 = 0.0f
+    var ch1: f32 = 0.0f
+    var ps1: f32 = 0.0f
+    star_stats(&s0, &sideal, n, &ch0, &ps0)
+    star_stats(&s1, &sideal, n, &ch1, &ps1)
+    io.print("star chroma ")
+    io.fmt_print(io.fmt_f32(io.fmt_new(), ch0))
+    io.print(" -> ")
+    io.fmt_print(io.fmt_f32(io.fmt_new(), ch1))
+    io.print("  psnr ")
+    io.fmt_print(io.fmt_f32(io.fmt_new(), ps0))
+    io.print(" -> ")
+    io.fmt_print_line(io.fmt_f32(io.fmt_new(), ps1))
+    ok = check(ch1 < 0.9f * ch0, "star: false colour should drop by >= 10 %") && ok
+    ok = check(ps1 > ps0 - 0.1f, "star: PSNR vs ideal must not drop") && ok
+    image.img_free(&s0)
+    image.img_free(&s1)
+    image.img_free(&sideal)
+    rt.heap_free(sraw, ((n * n) as usize) * 2)
+
+    // ---- slanted gray edges: jitter and PSNR
+    var deg_i: i32 = 0
+    while deg_i < 2 {
+        var deg: f32 = 30.0f
+        if deg_i == 1 { deg = 12.0f }
+        let ang: f32 = deg * 0.017453293f
+        let w: i32 = 112
+        let eraw: u64 = edgemetric.render_raw(edgemetric.SCENE_EDGE, w, w, ang, &lo, &hi)
+        var eideal: image.Image = edgemetric.render_ideal(edgemetric.SCENE_EDGE, w, w, ang, &lo, &hi)
+        var e: edgemetric.Edge = edgemetric.edge_of(w, w, ang)
+        var b: image.Image = demo(eraw, w, w)
+        var a: image.Image = image.img_copy(&b)
+        antialias.aa_apply(&a, 1.0f)
+        let sb: f32 = edgemetric.edge_scatter(&b, 1, &e)
+        let sa: f32 = edgemetric.edge_scatter(&a, 1, &e)
+        let pb: f32 = edge_psnr(&b, &eideal, &e)
+        let pa: f32 = edge_psnr(&a, &eideal, &e)
+        let mb: f32 = edgemetric.edge_mtf50(&b, 1, &e)
+        let ma: f32 = edgemetric.edge_mtf50(&a, 1, &e)
+        io.print("edge ")
+        io.fmt_print(io.fmt_f32(io.fmt_new(), deg))
+        io.print(" scatter ")
+        io.fmt_print(io.fmt_f32(io.fmt_new(), sb))
+        io.print(" -> ")
+        io.fmt_print(io.fmt_f32(io.fmt_new(), sa))
+        io.print("  psnr ")
+        io.fmt_print(io.fmt_f32(io.fmt_new(), pb))
+        io.print(" -> ")
+        io.fmt_print(io.fmt_f32(io.fmt_new(), pa))
+        io.print("  mtf50 ")
+        io.fmt_print(io.fmt_f32(io.fmt_new(), mb))
+        io.print(" -> ")
+        io.fmt_print_line(io.fmt_f32(io.fmt_new(), ma))
+        ok = check(sb > 0.002f, "edge: base scatter measurable") && ok
+        ok = check(sa < sb, "edge: scatter must drop") && ok
+        ok = check(pa > pb - 0.1f, "edge: PSNR vs ideal must not drop") && ok
+        ok = check(ma > 0.9f * mb, "edge: MTF50 loss above 10 %") && ok
+        if deg_i == 0 { ok = check(sa < 0.8f * sb, "edge 30: scatter should drop by >= 20 %") && ok }
+        image.img_free(&a)
+        image.img_free(&b)
+        image.img_free(&eideal)
+        rt.heap_free(eraw, ((w * w) as usize) * 2)
+        deg_i = deg_i + 1
+    }
+
+    // ---- coloured edge: the chroma cleanup keeps the R and B edge response
+    var clo: [f32; 3] = [0.7f, 0.15f, 0.1f]
+    var chi: [f32; 3] = [0.1f, 0.15f, 0.7f]
+    let cang: f32 = 12.0f * 0.017453293f
+    let craw: u64 = edgemetric.render_raw(edgemetric.SCENE_EDGE, 112, 112, cang, &clo, &chi)
+    var ce: edgemetric.Edge = edgemetric.edge_of(112, 112, cang)
+    var cb: image.Image = demo(craw, 112, 112)
+    var ca: image.Image = image.img_copy(&cb)
+    antialias.aa_apply_opts(&ca, 0.0f, 1.0f)
+    var c2: i32 = 0
+    while c2 < 3 {
+        if c2 != 1 {
+            let m0: f32 = edgemetric.edge_mtf50(&cb, c2, &ce)
+            let m1: f32 = edgemetric.edge_mtf50(&ca, c2, &ce)
+            ok = check(m1 > 0.99f * m0 && m1 < 1.01f * m0, "coloured edge: chroma cleanup changed the MTF50") && ok
+        }
+        c2 = c2 + 1
+    }
+    image.img_free(&ca)
+    image.img_free(&cb)
+    rt.heap_free(craw, 112 * 112 * 2)
+
+    // ---- fuzz: random content, odd sizes, strengths 0 / 1 / 3, no NaN
+    var it: i32 = 0
+    var fok: bool = true
+    while it < 40 {
+        var fw: i32 = 2 + ((image.rng_uniform(&rng) * 90.0f) as i32)
+        var fh: i32 = 2 + ((image.rng_uniform(&rng) * 140.0f) as i32)
+        if it < 4 { fw = 2 + it; fh = 2 }
+        var im: image.Image = image.img_new(fw, fh, 3)
+        var k: i32 = 0
+        while k < fw * fh * 3 {
+            *((im.px + ((k * 4) as u64)) as *mut f32) = image.rng_uniform(&rng) * 1.5f - 0.2f
+            k = k + 1
+        }
+        var st: f32 = 1.0f
+        if it % 3 == 0 { st = 3.0f }
+        antialias.aa_apply(&im, st)
+        k = 0
+        while k < fw * fh * 3 {
+            let v: f32 = *((im.px + ((k * 4) as u64)) as *mut f32)
+            if !(v > -50.0f && v < 50.0f) { fok = false }
+            k = k + 1
+        }
+        image.img_free(&im)
+        it = it + 1
+    }
+    ok = check(fok, "fuzz: non finite output") && ok
+    // strength 0 = no-op
+    var z0: image.Image = image.img_new(30, 30, 3)
+    var q: i32 = 0
+    while q < 30 * 30 * 3 {
+        *((z0.px + ((q * 4) as u64)) as *mut f32) = image.rng_uniform(&rng)
+        q = q + 1
+    }
+    var z1: image.Image = image.img_copy(&z0)
+    antialias.aa_apply(&z1, 0.0f)
+    ok = check(same(&z0, &z1), "strength 0 changed the image") && ok
+    image.img_free(&z0)
+    image.img_free(&z1)
+
+    // ---- camera path: the window with the option gives the same size, finite pixels and differs from the plain one
+    var m: meta.SensorMeta = meta.meta_default()
+    var k2: usize = 0
+    while k2 < 4 { meta.meta_set_black(&m, k2, 64.0f, 1023.0f); meta.meta_set_wb(&m, k2, 1.0f); k2 = k2 + 1 }
+    let kraw: u64 = edgemetric.render_raw(edgemetric.SCENE_STAR, 96, 96, 0.0f, &lo, &hi)
+    var pa0: image.Image = camjob.raw_window_a(kraw, 96, 96, &m, 100000, 1.0f, false, 0, 0)
+    var pa1: image.Image = camjob.raw_window_aa(kraw, 96, 96, &m, 100000, 1.0f, false, 0, 0, 1.0f, 1.0f)
+    ok = check(pa0.w == pa1.w && pa0.h == pa1.h && pa0.w == 96, "camjob aa: size") && ok
+    ok = check(!same(&pa0, &pa1), "camjob aa: option without effect") && ok
+    image.img_free(&pa0)
+    image.img_free(&pa1)
+    rt.heap_free(kraw, 96 * 96 * 2)
+    if ok { return 0 }
+    return 1
+}

@@ -1,0 +1,267 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/edgemetric.fi -- photo.edgemetric: slanted-edge measurements on a rendered image with a KNOWN edge (FirnCam tests).
+//
+//     import photo.edgemetric
+//
+//     var e: edgemetric.Edge = edgemetric.edge_new(cx, cy, nx, ny, x0, y0, x1, y1)  // scene coordinates, pixel centre = (x + 0.5, y + 0.5)
+//     let mtf50: f32 = edgemetric.edge_mtf50(&im, 1, &e)       // cycles / px at which the edge response falls to 0.5
+//     let jitter: f32 = edgemetric.edge_scatter(&im, 1, &e)    // aliasing: RMS of (pixel - edge profile) / contrast, |d| <= 2 px
+//
+// Both use the signed distance d of every pixel to the edge line: the pixels are binned by d (4 bins per px, +- 6 px,
+// the oversampled edge spread function, ESF). MTF50 comes from the Hann-windowed derivative of the ESF (a DFT, no
+// sinc correction: only ratios between two renderings of the same edge are meaningful). The scatter is the spread of
+// the single pixels around the (piecewise linear) ESF: a perfectly sampled edge has 0, stair steps and aliasing
+// of a slanted edge give a pixel to pixel jitter at a given distance.
+import std.rt
+import std.math
+import photo.image
+
+export {
+    Edge, edge_new, edge_mtf50, edge_scatter, edge_esf, EDGE_BINS,
+    SCENE_STAR, SCENE_EDGE, scene_t, scene_blur, render_ideal, render_raw, edge_of,
+}
+
+const OS: i32 = 4 // bins per px
+const HW: i32 = 6 // half width in px
+const EDGE_BINS: i32 = 48 // 2 * HW * OS
+
+struct Edge {
+    cx: f32,
+    cy: f32,
+    nx: f32,
+    ny: f32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+}
+
+fn edge_new(cx: f32, cy: f32, nx: f32, ny: f32, x0: i32, y0: i32, x1: i32, y1: i32) -> Edge {
+    return Edge { cx: cx, cy: cy, nx: nx, ny: ny, x0: x0, y0: y0, x1: x1, y1: y1 }
+}
+
+#[inline]
+fn dist(e: *mut Edge, x: i32, y: i32) -> f32 {
+    return (((x as f32) + 0.5f) - (*e).cx) * (*e).nx + (((y as f32) + 0.5f) - (*e).cy) * (*e).ny
+}
+
+// ---- test scenes: a two level pattern t(x, y) in {0, 1} (0.5 outside the star), blurred by a Gaussian lens (sigma 0.5 px,
+// 12 x 12 taps over +- 1.5 px) and sampled at the pixel centres. Channel c of a pixel = lo[c] + t * (hi[c] - lo[c]).
+const SCENE_STAR: i32 = 0 // Siemens star with 48 spokes, radius 0.47 * min(w, h): gray moire inside r < ~30 px
+const SCENE_EDGE: i32 = 1 // straight edge through the centre, normal (cos ang, sin ang): slanted by `ang` from vertical
+
+fn scene_t(kind: i32, w: i32, h: i32, ang: f32, x: f32, y: f32) -> f32 {
+    let cx: f32 = (w as f32) * 0.5f
+    let cy: f32 = (h as f32) * 0.5f
+    if kind == SCENE_STAR {
+        var m: f32 = (w as f32)
+        if (h as f32) < m { m = (h as f32) }
+        let rad: f32 = 0.47f * m
+        let dx: f64 = (x - cx) as f64
+        let dy: f64 = (y - cy) as f64
+        let r: f64 = math.sqrt(dx * dx + dy * dy)
+        if r >= (rad as f64) { return 0.5f }
+        if math.sin(48.0 * math.atan2(dy, dx)) > 0.0 { return 1.0f }
+        return 0.0f
+    }
+    let a: f64 = ang as f64
+    let d: f64 = ((x - cx) as f64) * math.cos(a) + ((y - cy) as f64) * math.sin(a)
+    if d > 0.0 { return 1.0f }
+    return 0.0f
+}
+
+// lens blurred scene value at the pixel centre (px + 0.5, py + 0.5)
+fn scene_blur(kind: i32, w: i32, h: i32, ang: f32, px: i32, py: i32) -> f32 {
+    var acc: f32 = 0.0f
+    var ws: f32 = 0.0f
+    var j: i32 = 0
+    while j < 12 {
+        let oy: f32 = -1.5f + ((j as f32) + 0.5f) * 0.25f
+        var i: i32 = 0
+        while i < 12 {
+            let ox: f32 = -1.5f + ((i as f32) + 0.5f) * 0.25f
+            let wt: f32 = image.expneg((ox * ox + oy * oy) * 2.0f) // exp(-r^2 / (2 * 0.25)) with sigma 0.5
+            acc = acc + wt * scene_t(kind, w, h, ang, (px as f32) + 0.5f + ox, (py as f32) + 0.5f + oy)
+            ws = ws + wt
+            i = i + 1
+        }
+        j = j + 1
+    }
+    return acc / ws
+}
+
+// ideal full RGB image of the scene
+fn render_ideal(kind: i32, w: i32, h: i32, ang: f32, lo: *mut [f32; 3], hi: *mut [f32; 3]) -> image.Image {
+    var im: image.Image = image.img_new(w, h, 3)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let t: f32 = scene_blur(kind, w, h, ang, x, y)
+            var c: i32 = 0
+            while c < 3 {
+                image.img_set(&im, c, x, y, (*lo)[c as usize] + t * ((*hi)[c as usize] - (*lo)[c as usize]))
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return im
+}
+
+// RGGB RAW16 mosaic of the scene (black 64, white 1023, 10 bit, no noise); free with rt.heap_free(p, w * h * 2)
+fn render_raw(kind: i32, w: i32, h: i32, ang: f32, lo: *mut [f32; 3], hi: *mut [f32; 3]) -> u64 {
+    let p: u64 = rt.heap_alloc(((w * h) as usize) * 2)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let t: f32 = scene_blur(kind, w, h, ang, x, y)
+            var c: i32 = 1
+            if (y & 1) == 0 && (x & 1) == 0 { c = 0 }
+            if (y & 1) == 1 && (x & 1) == 1 { c = 2 }
+            let v: f32 = (*lo)[c as usize] + t * ((*hi)[c as usize] - (*lo)[c as usize])
+            *((p + (((y * w + x) * 2) as u64)) as *mut u16) = (64.0f + v * 959.0f + 0.5f) as u16
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return p
+}
+
+// the Edge of SCENE_EDGE (region: 14 px inset from the borders)
+fn edge_of(w: i32, h: i32, ang: f32) -> Edge {
+    return edge_new((w as f32) * 0.5f, (h as f32) * 0.5f, math.cos(ang as f64) as f32, math.sin(ang as f64) as f32, 14, 14, w - 14, h - 14)
+}
+
+// ESF (EDGE_BINS values, bin b centred at d = (b + 0.5) / OS - HW) of channel ch; empty bins are filled by their
+// neighbours. Returns the number of filled bins.
+fn edge_esf(im: *mut image.Image, ch: i32, e: *mut Edge, esf: *mut [f32; 48]) -> i32 {
+    var sum: [f32; 48] = [0.0f; 48]
+    var cnt: [i32; 48] = [0; 48]
+    var y: i32 = (*e).y0
+    while y < (*e).y1 {
+        var x: i32 = (*e).x0
+        while x < (*e).x1 {
+            let d: f32 = dist(e, x, y)
+            let fb: f32 = (d + (HW as f32)) * (OS as f32)
+            if fb >= 0.0f && fb < (EDGE_BINS as f32) {
+                let b: usize = fb as usize
+                sum[b] = sum[b] + image.img_get(im, ch, x, y)
+                cnt[b] = cnt[b] + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var filled: i32 = 0
+    var b: usize = 0
+    while b < 48 {
+        if cnt[b] > 0 { (*esf)[b] = sum[b] / (cnt[b] as f32); filled = filled + 1 } else { (*esf)[b] = -1.0e9f }
+        b = b + 1
+    }
+    // fill gaps: nearest valid on the left, else on the right
+    b = 0
+    while b < 48 {
+        if (*esf)[b] < -1.0e8f {
+            var l: i32 = (b as i32) - 1
+            while l >= 0 && (*esf)[l as usize] < -1.0e8f { l = l - 1 }
+            var r: i32 = (b as i32) + 1
+            while r < 48 && (*esf)[r as usize] < -1.0e8f { r = r + 1 }
+            if l >= 0 && r < 48 {
+                let t: f32 = (((b as i32) - l) as f32) / ((r - l) as f32)
+                (*esf)[b] = (*esf)[l as usize] + t * ((*esf)[r as usize] - (*esf)[l as usize])
+            } else if l >= 0 {
+                (*esf)[b] = (*esf)[l as usize]
+            } else if r < 48 {
+                (*esf)[b] = (*esf)[r as usize]
+            } else {
+                (*esf)[b] = 0.0f
+            }
+        }
+        b = b + 1
+    }
+    return filled
+}
+
+// MTF50 in cycles / px (0.5 when the response never falls below 0.5, 0 on a missing edge)
+fn edge_mtf50(im: *mut image.Image, ch: i32, e: *mut Edge) -> f32 {
+    var esf: [f32; 48] = [0.0f; 48]
+    let filled: i32 = edge_esf(im, ch, e, &esf)
+    if filled < 24 { return 0.0f }
+    var lsf: [f64; 47] = [0.0; 47]
+    var b: usize = 0
+    while b < 47 {
+        let wn: f64 = 0.5 - 0.5 * math.cos(6.283185307179586 * ((b as f64) + 0.5) / 47.0)
+        lsf[b] = ((esf[b + 1] - esf[b]) as f64) * wn
+        b = b + 1
+    }
+    var dc: f64 = 0.0
+    b = 0
+    while b < 47 { dc = dc + lsf[b]; b = b + 1 }
+    if dc > -1.0e-9 && dc < 1.0e-9 { return 0.0f }
+    if dc < 0.0 { dc = 0.0 - dc }
+    var prev_f: f64 = 0.0
+    var prev_m: f64 = 1.0
+    var k: i32 = 1
+    while k <= 250 {
+        let f: f64 = (k as f64) * 0.002
+        var re: f64 = 0.0
+        var imv: f64 = 0.0
+        b = 0
+        while b < 47 {
+            let x: f64 = ((b as f64) + 1.0 - 24.0) / (OS as f64) // bin edge between ESF bins b and b + 1
+            let a: f64 = 6.283185307179586 * f * x
+            re = re + lsf[b] * math.cos(a)
+            imv = imv + lsf[b] * math.sin(a)
+            b = b + 1
+        }
+        let m: f64 = math.sqrt(re * re + imv * imv) / dc
+        if m < 0.5 {
+            let t: f64 = (prev_m - 0.5) / (prev_m - m)
+            return (prev_f + t * (f - prev_f)) as f32
+        }
+        prev_f = f
+        prev_m = m
+        k = k + 1
+    }
+    return 0.5f
+}
+
+// RMS of (pixel - ESF(d)) / contrast over |d| <= 2 px
+fn edge_scatter(im: *mut image.Image, ch: i32, e: *mut Edge) -> f32 {
+    var esf: [f32; 48] = [0.0f; 48]
+    let filled: i32 = edge_esf(im, ch, e, &esf)
+    if filled < 24 { return 0.0f }
+    var contrast: f32 = esf[44] - esf[3]
+    if contrast < 0.0f { contrast = 0.0f - contrast }
+    if contrast < 1.0e-6f { return 0.0f }
+    var acc: f64 = 0.0
+    var n: i32 = 0
+    var y: i32 = (*e).y0
+    while y < (*e).y1 {
+        var x: i32 = (*e).x0
+        while x < (*e).x1 {
+            let d: f32 = dist(e, x, y)
+            if d > -2.0f && d < 2.0f {
+                // piecewise linear ESF between bin centres
+                let fb: f32 = (d + (HW as f32)) * (OS as f32) - 0.5f
+                var b0: i32 = fb as i32
+                if fb < 0.0f { b0 = 0 }
+                if b0 > 46 { b0 = 46 }
+                var t: f32 = fb - (b0 as f32)
+                if t < 0.0f { t = 0.0f }
+                if t > 1.0f { t = 1.0f }
+                let ref: f32 = esf[b0 as usize] + t * (esf[(b0 + 1) as usize] - esf[b0 as usize])
+                let dv: f32 = image.img_get(im, ch, x, y) - ref
+                acc = acc + ((dv * dv) as f64)
+                n = n + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if n == 0 { return 0.0f }
+    return (math.sqrt(acc / (n as f64)) as f32) / contrast
+}

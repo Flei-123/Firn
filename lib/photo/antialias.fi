@@ -1,0 +1,489 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/antialias.fi -- photo.antialias: selective anti-aliasing of a demosaiced linear RGB image (FirnCam), no FXAA.
+//
+//     import photo.antialias
+//
+//     antialias.aa_apply(&rgb, 1.0f)       // in place; strength 0 = untouched, 1 = default, > 1 = stronger
+//
+// Aliasing comes in two kinds and each one has its own detector; everything that is flat or genuinely sharp is
+// left alone (weight 0 -> the pixel is copied bit for bit):
+//   1. False colour / moire: R - G and B - G of a natural image are smooth, at Nyquist-near patterns they flip
+//      sign from pixel to pixel. A pixel whose chroma (R - G, B - G) deviates from the 3x3 median of its
+//      neighbours is pulled to that median by a soft weight (a real coloured edge is a step: the median keeps it).
+//   2. Stair steps on slanted edges: the 3x3 structure tensor of the luma gives the edge direction, its
+//      coherence and the slant (axis aligned edges have no stairs). Only where there IS a coherent slanted edge,
+//      luma and chroma are averaged ALONG the edge (5 taps on the tangent, bilinear), never across it: the
+//      edge profile (MTF across the edge) stays, the stair jitter along it drops. Corners, thin lines, texture
+//      and noise have a low coherence and get weight 0.
+// Memory: bands of BAND rows with PAD rows of context (in place, the context rows above a band are kept in a tail
+// buffer), so a 12 MP frame needs a few MB, not a second frame. Border pixels use clamped neighbours.
+import std.rt
+import std.math
+import photo.image
+import photo.par
+
+export {
+    aa_apply, aa_apply_opts, BAND, PAD,
+}
+
+const BAND: i32 = 64
+const PAD: i32 = 4
+
+// thresholds (linear light, luma 0..1)
+const EDGE_LO: f32 = 0.012f // gradient magnitude (per px) where the edge weight starts
+const EDGE_HI: f32 = 0.045f // ... and where it is full
+const COH_LO: f32 = 0.60f // structure tensor coherence
+const COH_HI: f32 = 0.90f
+const SLANT_LO: f32 = 0.10f // |sin 2 theta| of the edge normal: 0 = axis aligned, 1 = 45 degrees
+const SLANT_HI: f32 = 0.30f
+const STAIR_MAX: f32 = 0.02f // max correction in units of the gradient magnitude (~ 2.5 % of the edge contrast)
+const CHROMA_LO: f32 = 0.006f // |chroma - median| (sum R-G and B-G) where the false colour weight starts
+const CHROMA_HI: f32 = 0.030f
+
+struct AaCtx {
+    im: *mut image.Image,
+    w: i32,
+    h: i32,
+    r0: i32, // first image row of this band
+    rows: i32,
+    bw: i32,
+    strength: f32,
+    chroma_strength: f32,
+    y: u64, // planes of (bw x bh) f32
+    cr: u64,
+    cb: u64,
+    cr2: u64,
+    cb2: u64,
+    gx: u64,
+    gy: u64,
+    tx: u64,
+    ty: u64,
+    wa: u64,
+    mg: u64, // gradient magnitude
+    tail: u64, // 3 x PAD x w f32: ORIGINAL rows r0 - PAD .. r0 - 1 (valid when r0 > 0)
+    ntail: u64,
+}
+
+#[inline]
+fn pl(p: u64, bw: i32, x: i32, y: i32) -> f32 {
+    return *((p + (((y * bw + x) * 4) as u64)) as *mut f32)
+}
+
+#[inline]
+fn pset(p: u64, bw: i32, x: i32, y: i32, v: f32) {
+    *((p + (((y * bw + x) * 4) as u64)) as *mut f32) = v
+}
+
+#[inline]
+fn fabs(a: f32) -> f32 {
+    if a < 0.0f { return 0.0f - a }
+    return a
+}
+
+#[inline]
+fn clampf(v: f32, lim: f32) -> f32 {
+    if v > lim { return lim }
+    if v < 0.0f - lim { return 0.0f - lim }
+    return v
+}
+
+#[inline]
+fn smooth(lo: f32, hi: f32, v: f32) -> f32 {
+    if v <= lo { return 0.0f }
+    if v >= hi { return 1.0f }
+    let t: f32 = (v - lo) / (hi - lo)
+    return t * t * (3.0f - 2.0f * t)
+}
+
+// bilinear read of a band plane; x, y >= 0 and inside
+#[inline]
+fn bs(p: u64, bw: i32, x: f32, y: f32) -> f32 {
+    let xi: i32 = x as i32
+    let yi: i32 = y as i32
+    let fx: f32 = x - (xi as f32)
+    let fy: f32 = y - (yi as f32)
+    let a: f32 = pl(p, bw, xi, yi)
+    let b: f32 = pl(p, bw, xi + 1, yi)
+    let c: f32 = pl(p, bw, xi, yi + 1)
+    let d: f32 = pl(p, bw, xi + 1, yi + 1)
+    return (a + (b - a) * fx) * (1.0f - fy) + (c + (d - c) * fx) * fy
+}
+
+// Catmull-Rom weights for the fraction t
+#[inline]
+fn cr_w(t: f32, k: i32) -> f32 {
+    let t2: f32 = t * t
+    let t3: f32 = t2 * t
+    if k == 0 { return -0.5f * t3 + t2 - 0.5f * t }
+    if k == 1 { return 1.5f * t3 - 2.5f * t2 + 1.0f }
+    if k == 2 { return -1.5f * t3 + 2.0f * t2 + 0.5f * t }
+    return 0.5f * t3 - 0.5f * t2
+}
+
+// bicubic (Catmull-Rom) read of a band plane: keeps the edge profile sharp where the bilinear read would blur it
+fn bc(p: u64, bw: i32, x: f32, y: f32) -> f32 {
+    let xi: i32 = x as i32
+    let yi: i32 = y as i32
+    let fx: f32 = x - (xi as f32)
+    let fy: f32 = y - (yi as f32)
+    var acc: f32 = 0.0f
+    var j: i32 = 0
+    while j < 4 {
+        let wy: f32 = cr_w(fy, j)
+        let yy: i32 = yi + j - 1
+        let row: f32 = cr_w(fx, 0) * pl(p, bw, xi - 1, yy) + cr_w(fx, 1) * pl(p, bw, xi, yy) + cr_w(fx, 2) * pl(p, bw, xi + 1, yy) + cr_w(fx, 3) * pl(p, bw, xi + 2, yy)
+        acc = acc + wy * row
+        j = j + 1
+    }
+    return acc
+}
+
+// ORIGINAL pixel (channel c, image x, image y) with clamped coordinates; rows above the band come from the tail
+fn src(c: *mut AaCtx, ch: i32, x: i32, y: i32) -> f32 {
+    var xx: i32 = x
+    var yy: i32 = y
+    if xx < 0 { xx = 0 }
+    if xx >= (*c).w { xx = (*c).w - 1 }
+    if yy < 0 { yy = 0 }
+    if yy >= (*c).h { yy = (*c).h - 1 }
+    if yy < (*c).r0 {
+        // inside the tail (r0 - PAD .. r0 - 1)
+        let ty: i32 = yy - ((*c).r0 - PAD)
+        return *(((*c).tail + ((((ch * PAD + ty) * (*c).w + xx) * 4) as u64)) as *mut f32)
+    }
+    return image.img_get((*c).im, ch, xx, yy)
+}
+
+// stage 1: Y, chroma of every buffer row (row pointers, clamped column read)
+fn s1_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut AaCtx = ctx as *mut AaCtx
+    let bw: i32 = (*c).bw
+    let w: i32 = (*c).w
+    var by: i32 = lo as i32
+    while by < (hi as i32) {
+        var iy: i32 = (*c).r0 + by - PAD
+        if iy < 0 { iy = 0 }
+        if iy >= (*c).h { iy = (*c).h - 1 }
+        var rp: [u64; 3] = [0 as u64; 3]
+        var ch: i32 = 0
+        while ch < 3 {
+            if iy < (*c).r0 {
+                rp[ch as usize] = (*c).tail + ((((ch * PAD + (iy - ((*c).r0 - PAD))) * w) * 4) as u64)
+            } else {
+                rp[ch as usize] = image.img_plane((*c).im, ch) + (((iy * w) * 4) as u64)
+            }
+            ch = ch + 1
+        }
+        var bx: i32 = 0
+        while bx < bw {
+            var ix: i32 = bx - PAD
+            if ix < 0 { ix = 0 }
+            if ix >= w { ix = w - 1 }
+            let r: f32 = *((rp[0] + ((ix * 4) as u64)) as *mut f32)
+            let g: f32 = *((rp[1] + ((ix * 4) as u64)) as *mut f32)
+            let b: f32 = *((rp[2] + ((ix * 4) as u64)) as *mut f32)
+            pset((*c).y, bw, bx, by, 0.25f * r + 0.5f * g + 0.25f * b)
+            pset((*c).cr, bw, bx, by, r - g)
+            pset((*c).cb, bw, bx, by, b - g)
+            bx = bx + 1
+        }
+        by = by + 1
+    }
+}
+
+// new tail = ORIGINAL rows r0 + rows - PAD .. r0 + rows - 1 (read before the band overwrites them)
+fn tail_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut AaCtx = ctx as *mut AaCtx
+    var t: i32 = lo as i32
+    while t < (hi as i32) {
+        let iy: i32 = (*c).r0 + (*c).rows - PAD + t
+        var ch: i32 = 0
+        while ch < 3 {
+            var x: i32 = 0
+            while x < (*c).w {
+                *(((*c).ntail + ((((ch * PAD + t) * (*c).w + x) * 4) as u64)) as *mut f32) = src(c, ch, x, iy)
+                x = x + 1
+            }
+            ch = ch + 1
+        }
+        t = t + 1
+    }
+}
+
+// median of 9
+fn med9(v: *mut [f32; 9]) -> f32 {
+    var i: usize = 1
+    while i < 9 {
+        let k: f32 = (*v)[i]
+        var j: usize = i
+        while j > 0 && (*v)[j - 1] > k {
+            (*v)[j] = (*v)[j - 1]
+            j = j - 1
+        }
+        (*v)[j] = k
+        i = i + 1
+    }
+    return (*v)[4]
+}
+
+// stage 2: false colour cleanup, margin 1 (the rim keeps the raw chroma, it is only a tap for pixels that are never output)
+fn s2_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut AaCtx = ctx as *mut AaCtx
+    let bw: i32 = (*c).bw
+    var by: i32 = lo as i32
+    while by < (hi as i32) {
+        var bx: i32 = 0
+        while bx < bw {
+            let r0v: f32 = pl((*c).cr, bw, bx, by)
+            let b0v: f32 = pl((*c).cb, bw, bx, by)
+            var nr: f32 = r0v
+            var nb: f32 = b0v
+            var gate: bool = false
+            if bx >= 1 && bx < bw - 1 && by >= 1 && by < (*c).rows + 2 * PAD - 1 {
+                // cheap pre-test: a chroma that is close to the mean of its 4 neighbours is no outlier (skips ~all natural pixels)
+                let m4r: f32 = 0.25f * (pl((*c).cr, bw, bx - 1, by) + pl((*c).cr, bw, bx + 1, by) + pl((*c).cr, bw, bx, by - 1) + pl((*c).cr, bw, bx, by + 1))
+                let m4b: f32 = 0.25f * (pl((*c).cb, bw, bx - 1, by) + pl((*c).cb, bw, bx + 1, by) + pl((*c).cb, bw, bx, by - 1) + pl((*c).cb, bw, bx, by + 1))
+                gate = fabs(r0v - m4r) + fabs(b0v - m4b) > 0.5f * CHROMA_LO
+            }
+            if gate {
+                var va: [f32; 9] = [0.0f; 9]
+                var vb: [f32; 9] = [0.0f; 9]
+                var k: usize = 0
+                var dy: i32 = -1
+                while dy <= 1 {
+                    var dx: i32 = -1
+                    while dx <= 1 {
+                        va[k] = pl((*c).cr, bw, bx + dx, by + dy)
+                        vb[k] = pl((*c).cb, bw, bx + dx, by + dy)
+                        k = k + 1
+                        dx = dx + 1
+                    }
+                    dy = dy + 1
+                }
+                let mr: f32 = med9(&va)
+                let mb: f32 = med9(&vb)
+                let dev: f32 = fabs(r0v - mr) + fabs(b0v - mb)
+                let wgt: f32 = smooth(CHROMA_LO, CHROMA_HI, dev) * (*c).chroma_strength
+                var wc: f32 = wgt
+                if wc > 1.0f { wc = 1.0f }
+                nr = r0v + wc * (mr - r0v)
+                nb = b0v + wc * (mb - b0v)
+            }
+            pset((*c).cr2, bw, bx, by, nr)
+            pset((*c).cb2, bw, bx, by, nb)
+            bx = bx + 1
+        }
+        by = by + 1
+    }
+}
+
+// stage 3a: luma gradient, margin 1
+fn s3a_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut AaCtx = ctx as *mut AaCtx
+    let bw: i32 = (*c).bw
+    let bh: i32 = (*c).rows + 2 * PAD
+    var by: i32 = lo as i32
+    while by < (hi as i32) {
+        var bx: i32 = 1
+        while bx < bw - 1 {
+            var gx: f32 = 0.0f
+            var gy: f32 = 0.0f
+            if by >= 1 && by < bh - 1 {
+                gx = 0.5f * (pl((*c).y, bw, bx + 1, by) - pl((*c).y, bw, bx - 1, by))
+                gy = 0.5f * (pl((*c).y, bw, bx, by + 1) - pl((*c).y, bw, bx, by - 1))
+            }
+            pset((*c).gx, bw, bx, by, gx)
+            pset((*c).gy, bw, bx, by, gy)
+            bx = bx + 1
+        }
+        by = by + 1
+    }
+}
+
+// stage 3b: smoothed structure tensor -> edge tangent + weight, margin 2
+fn s3b_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut AaCtx = ctx as *mut AaCtx
+    let bw: i32 = (*c).bw
+    var by: i32 = lo as i32
+    while by < (hi as i32) {
+        var bx: i32 = 2
+        while bx < bw - 2 && by >= 2 && by < (*c).rows + 2 * PAD - 2 {
+            var jxx: f32 = 0.0f
+            var jxy: f32 = 0.0f
+            var jyy: f32 = 0.0f
+            var dy: i32 = -1
+            while dy <= 1 {
+                var dx: i32 = -1
+                while dx <= 1 {
+                    let gx: f32 = pl((*c).gx, bw, bx + dx, by + dy)
+                    let gy: f32 = pl((*c).gy, bw, bx + dx, by + dy)
+                    jxx = jxx + gx * gx
+                    jxy = jxy + gx * gy
+                    jyy = jyy + gy * gy
+                    dx = dx + 1
+                }
+                dy = dy + 1
+            }
+            jxx = jxx * (1.0f / 9.0f)
+            jxy = jxy * (1.0f / 9.0f)
+            jyy = jyy * (1.0f / 9.0f)
+            let tr: f32 = jxx + jyy
+            let mag: f32 = image.sqrtf(tr)
+            let da: f32 = jxx - jyy
+            let db: f32 = 2.0f * jxy
+            let dd: f32 = image.sqrtf(da * da + db * db) // l1 - l2
+            var coh: f32 = 0.0f
+            if tr > 1.0e-9f { coh = dd / tr }
+            // principal (normal) direction n = (cos t, sin t) with tan 2t = db / da; tangent = (-sin t, cos t)
+            var nx: f32 = 1.0f
+            var ny: f32 = 0.0f
+            if dd > 1.0e-9f {
+                // cos 2t = da / dd, sin 2t = db / dd -> half angle formulas
+                let c2: f32 = da / dd
+                let s2: f32 = db / dd
+                let cx: f32 = image.sqrtf(0.5f * (1.0f + c2))
+                var sy: f32 = image.sqrtf(0.5f * (1.0f - c2))
+                if s2 < 0.0f { sy = 0.0f - sy }
+                nx = cx
+                ny = sy
+            }
+            let sl: f32 = fabs(2.0f * nx * ny)
+            var wgt: f32 = smooth(EDGE_LO, EDGE_HI, mag) * smooth(COH_LO, COH_HI, coh) * smooth(SLANT_LO, SLANT_HI, sl)
+            wgt = wgt * (*c).strength
+            if wgt > 1.0f { wgt = 1.0f }
+            pset((*c).tx, bw, bx, by, 0.0f - ny)
+            pset((*c).ty, bw, bx, by, nx)
+            pset((*c).wa, bw, bx, by, wgt)
+            pset((*c).mg, bw, bx, by, mag)
+            bx = bx + 1
+        }
+        by = by + 1
+    }
+}
+
+// stage 4: along-edge average + write back
+fn s4_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut AaCtx = ctx as *mut AaCtx
+    let bw: i32 = (*c).bw
+    var r: i32 = lo as i32
+    while r < (hi as i32) {
+        let by: i32 = r + PAD
+        let iy: i32 = (*c).r0 + r
+        var x: i32 = 0
+        while x < (*c).w {
+            let bx: i32 = x + PAD
+            let y0: f32 = pl((*c).y, bw, bx, by)
+            let cr0: f32 = pl((*c).cr2, bw, bx, by)
+            let cb0: f32 = pl((*c).cb2, bw, bx, by)
+            var wgt: f32 = 0.0f
+            if (*c).strength > 0.0f { wgt = pl((*c).wa, bw, bx, by) }
+            if wgt <= 0.0f && cr0 == pl((*c).cr, bw, bx, by) && cb0 == pl((*c).cb, bw, bx, by) {
+                x = x + 1
+                continue
+            }
+            var yy: f32 = y0
+            var cr: f32 = cr0
+            var cb: f32 = cb0
+            if wgt > 0.0f {
+                let tx: f32 = pl((*c).tx, bw, bx, by)
+                let ty: f32 = pl((*c).ty, bw, bx, by)
+                let px: f32 = bx as f32
+                let py: f32 = by as f32
+                // 5 taps, weights 1 2 3 2 1 / 9
+                var sy: f32 = 3.0f * y0
+                var sr: f32 = 3.0f * cr0
+                var sb: f32 = 3.0f * cb0
+                var k: i32 = 1
+                while k <= 2 {
+                    let wk: f32 = 3.0f - (k as f32)
+                    let ox: f32 = tx * (k as f32)
+                    let oy: f32 = ty * (k as f32)
+                    sy = sy + wk * (bc((*c).y, bw, px + ox, py + oy) + bc((*c).y, bw, px - ox, py - oy))
+                    sr = sr + wk * (bs((*c).cr2, bw, px + ox, py + oy) + bs((*c).cr2, bw, px - ox, py - oy))
+                    sb = sb + wk * (bs((*c).cb2, bw, px + ox, py + oy) + bs((*c).cb2, bw, px - ox, py - oy))
+                    k = k + 1
+                }
+                let inv: f32 = 1.0f / 9.0f
+                // the correction is limited to what stair jitter can be (a few % of the edge contrast ~ gradient): a larger
+                // difference to the line average is interpolation loss or real structure, not aliasing
+                let lim: f32 = STAIR_MAX * pl((*c).mg, bw, bx, by)
+                yy = y0 + wgt * clampf(sy * inv - y0, lim)
+                cr = cr0 + wgt * clampf(sr * inv - cr0, lim)
+                cb = cb0 + wgt * clampf(sb * inv - cb0, lim)
+            }
+            // Y = 0.25 R + 0.5 G + 0.25 B = G + 0.25 cr + 0.25 cb
+            let g: f32 = yy - 0.25f * cr - 0.25f * cb
+            image.img_set((*c).im, 0, x, iy, g + cr)
+            image.img_set((*c).im, 1, x, iy, g)
+            image.img_set((*c).im, 2, x, iy, g + cb)
+            x = x + 1
+        }
+        r = r + 1
+    }
+}
+
+// In place, strength 1 = default (see the module comment), chroma and edge parts both scaled by `strength`.
+fn aa_apply(im: *mut image.Image, strength: f32) {
+    aa_apply_opts(im, strength, strength)
+}
+
+// edge_strength: stair smoothing along slanted edges (0 = off); chroma_strength: false colour cleanup (0 = off)
+fn aa_apply_opts(im: *mut image.Image, edge_strength: f32, chroma_strength: f32) {
+    if (*im).ch < 3 || (*im).w < 2 || (*im).h < 2 { return }
+    if edge_strength <= 0.0f && chroma_strength <= 0.0f { return }
+    let w: i32 = (*im).w
+    let h: i32 = (*im).h
+    let bw: i32 = w + 2 * PAD
+    let bh: i32 = BAND + 2 * PAD
+    let psz: usize = ((bw * bh) as usize) * 4
+    let tsz: usize = ((3 * PAD * w) as usize) * 4
+    var c: AaCtx = AaCtx {
+        im: im, w: w, h: h, r0: 0, rows: 0, bw: bw, strength: edge_strength, chroma_strength: chroma_strength,
+        y: rt.heap_alloc(psz), cr: rt.heap_alloc(psz), cb: rt.heap_alloc(psz), cr2: rt.heap_alloc(psz),
+        cb2: rt.heap_alloc(psz), gx: rt.heap_alloc(psz), gy: rt.heap_alloc(psz), tx: rt.heap_alloc(psz),
+        ty: rt.heap_alloc(psz), wa: rt.heap_alloc(psz), mg: rt.heap_alloc(psz), tail: rt.heap_alloc(tsz), ntail: rt.heap_alloc(tsz),
+    }
+    if chroma_strength <= 0.0f {
+        // no cleanup stage: the cleaned planes are the raw ones
+        rt.heap_free(c.cr2, psz)
+        rt.heap_free(c.cb2, psz)
+        c.cr2 = c.cr
+        c.cb2 = c.cb
+    }
+    var r0: i32 = 0
+    while r0 < h {
+        var rows: i32 = h - r0
+        if rows > BAND { rows = BAND }
+        c.r0 = r0
+        c.rows = rows
+        let nb: i32 = rows + 2 * PAD
+        par.rows(nb, 8, s1_rows, (&c) as u64)
+        par.rows(PAD, 1, tail_rows, (&c) as u64)
+        if chroma_strength > 0.0f { par.rows(nb, 8, s2_rows, (&c) as u64) }
+        if edge_strength > 0.0f {
+            par.rows(nb, 8, s3a_rows, (&c) as u64)
+            par.rows(nb, 8, s3b_rows, (&c) as u64)
+        }
+        par.rows(rows, 8, s4_rows, (&c) as u64)
+        // new tail becomes the tail of the next band
+        let t: u64 = c.tail
+        c.tail = c.ntail
+        c.ntail = t
+        r0 = r0 + rows
+    }
+    rt.heap_free(c.y, psz)
+    rt.heap_free(c.cr, psz)
+    rt.heap_free(c.cb, psz)
+    if chroma_strength > 0.0f {
+        rt.heap_free(c.cr2, psz)
+        rt.heap_free(c.cb2, psz)
+    }
+    rt.heap_free(c.gx, psz)
+    rt.heap_free(c.gy, psz)
+    rt.heap_free(c.tx, psz)
+    rt.heap_free(c.ty, psz)
+    rt.heap_free(c.wa, psz)
+    rt.heap_free(c.mg, psz)
+    rt.heap_free(c.tail, tsz)
+    rt.heap_free(c.ntail, tsz)
+}

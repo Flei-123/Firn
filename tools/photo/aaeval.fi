@@ -1,0 +1,225 @@
+// tools/photo/aaeval.fi -- FirnCam anti-alias measurement (r658): demosaic only vs demosaic + photo.antialias.
+// Siemens star (colour moire / chroma error / PSNR vs ideal), slanted gray edges at 5 / 12 / 30 degrees and a slanted
+// colour edge (MTF50 + aliasing scatter per channel), speed on a 2048 x 1536 frame. Prints `name value` lines.
+// Run: tools/photo/aaeval.sh [outdir]
+import std.io
+import std.rt
+import std.time
+import std.math
+import photo.image
+import photo.par
+import photo.meta
+import photo.demosaic
+import photo.antialias
+import photo.edgemetric
+
+fn pf(name: str, v: f32) {
+    io.print(name)
+    io.print(" ")
+    io.fmt_print_line(io.fmt_f32(io.fmt_new(), v))
+}
+
+fn fabs(a: f32) -> f32 {
+    if a < 0.0f { return 0.0f - a }
+    return a
+}
+
+// variants: 0 none, 1 both, 2 edge only, 3 chroma only
+fn run_aa(im: *mut image.Image, v: i32, k: f32) {
+    if v == 1 { antialias.aa_apply_opts(im, k, k) }
+    if v == 2 { antialias.aa_apply_opts(im, k, 0.0f) }
+    if v == 3 { antialias.aa_apply_opts(im, 0.0f, k) }
+}
+
+fn vname(v: i32) -> str {
+    if v == 0 { return "base" }
+    if v == 1 { return "aa" }
+    if v == 2 { return "aa_edge" }
+    return "aa_chroma"
+}
+
+fn star(k: f32) {
+    let w: i32 = 192
+    let h: i32 = 192
+    var lo: [f32; 3] = [0.1f, 0.1f, 0.1f]
+    var hi: [f32; 3] = [0.7f, 0.7f, 0.7f]
+    var black: [f32; 4] = [64.0f, 64.0f, 64.0f, 64.0f]
+    let raw: u64 = edgemetric.render_raw(edgemetric.SCENE_STAR, w, h, 0.0f, &lo, &hi)
+    var ideal: image.Image = edgemetric.render_ideal(edgemetric.SCENE_STAR, w, h, 0.0f, &lo, &hi)
+    var v: i32 = 0
+    while v < 4 {
+        var im: image.Image = demosaic.demosaic_u16(raw, w, h, 0, 0, w, h, meta.CFA_RGGB, &black[0], 1023.0f)
+        run_aa(&im, v, k)
+        var chroma: f64 = 0.0
+        var mse: f64 = 0.0
+        var n: i32 = 0
+        var y: i32 = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                let dx: f32 = (x as f32) + 0.5f - 96.0f
+                let dy: f32 = (y as f32) + 0.5f - 96.0f
+                if dx * dx + dy * dy < 80.0f * 80.0f {
+                    let r: f32 = image.img_get(&im, 0, x, y)
+                    let g: f32 = image.img_get(&im, 1, x, y)
+                    let b: f32 = image.img_get(&im, 2, x, y)
+                    chroma = chroma + ((fabs(r - g) + fabs(b - g)) as f64)
+                    var c: i32 = 0
+                    while c < 3 {
+                        let e: f32 = image.img_get(&im, c, x, y) - image.img_get(&ideal, c, x, y)
+                        mse = mse + ((e * e) as f64)
+                        c = c + 1
+                    }
+                    n = n + 1
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        let nm: f64 = (n as f64)
+        io.print("star ")
+        io.print(vname(v))
+        io.print(" chroma ")
+        io.fmt_print_line(io.fmt_f32(io.fmt_new(), (chroma / (2.0 * nm)) as f32))
+        io.print("star ")
+        io.print(vname(v))
+        io.print(" psnr ")
+        io.fmt_print_line(io.fmt_f32(io.fmt_new(), (10.0 * math.log10(0.36 / (mse / (3.0 * nm)))) as f32))
+        image.img_free(&im)
+        v = v + 1
+    }
+    image.img_free(&ideal)
+    rt.heap_free(raw, ((w * h) as usize) * 2)
+}
+
+fn edges(k: f32, deg: f32, colour: bool) {
+    let w: i32 = 160
+    let h: i32 = 160
+    let ang: f32 = deg * 0.017453293f
+    var lo: [f32; 3] = [0.1f, 0.1f, 0.1f]
+    var hi: [f32; 3] = [0.7f, 0.7f, 0.7f]
+    if colour {
+        lo = [0.7f, 0.15f, 0.1f]
+        hi = [0.1f, 0.15f, 0.7f]
+    }
+    var black: [f32; 4] = [64.0f, 64.0f, 64.0f, 64.0f]
+    let raw: u64 = edgemetric.render_raw(edgemetric.SCENE_EDGE, w, h, ang, &lo, &hi)
+    var e: edgemetric.Edge = edgemetric.edge_of(w, h, ang)
+    var ideal: image.Image = edgemetric.render_ideal(edgemetric.SCENE_EDGE, w, h, ang, &lo, &hi)
+    var v: i32 = 0
+    while v < 4 {
+        var im: image.Image = demosaic.demosaic_u16(raw, w, h, 0, 0, w, h, meta.CFA_RGGB, &black[0], 1023.0f)
+        run_aa(&im, v, k)
+        // PSNR vs the ideal image in the band |d| < 4 px around the edge (all channels)
+        var mse: f64 = 0.0
+        var cnt: i32 = 0
+        var yy: i32 = 14
+        while yy < h - 14 {
+            var xx: i32 = 14
+            while xx < w - 14 {
+                let d: f32 = ((xx as f32) + 0.5f - e.cx) * e.nx + ((yy as f32) + 0.5f - e.cy) * e.ny
+                if d > -4.0f && d < 4.0f {
+                    var cc: i32 = 0
+                    while cc < 3 {
+                        let df: f32 = image.img_get(&im, cc, xx, yy) - image.img_get(&ideal, cc, xx, yy)
+                        mse = mse + ((df * df) as f64)
+                        cnt = cnt + 1
+                        cc = cc + 1
+                    }
+                }
+                xx = xx + 1
+            }
+            yy = yy + 1
+        }
+        io.print("edge ")
+        io.fmt_print(io.fmt_f32(io.fmt_new(), deg))
+        io.print("deg")
+        if colour { io.print("c") }
+        io.print(" ")
+        io.print(vname(v))
+        io.print(" psnr ")
+        io.fmt_print_line(io.fmt_f32(io.fmt_new(), (10.0 * math.log10(0.36 / (mse / (cnt as f64)))) as f32))
+        var c: i32 = 0
+        while c < 3 {
+            if colour || c == 1 {
+                io.print("edge")
+                io.print(" ")
+                io.fmt_print(io.fmt_f32(io.fmt_new(), deg))
+                io.print("deg")
+                if colour { io.print("c") }
+                io.print(" ")
+                io.print(vname(v))
+                io.print(" ch")
+                io.fmt_print(io.fmt_f32(io.fmt_new(), c as f32))
+                io.print(" mtf50 ")
+                io.fmt_print(io.fmt_f32(io.fmt_new(), edgemetric.edge_mtf50(&im, c, &e)))
+                io.print(" scatter ")
+                io.fmt_print_line(io.fmt_f32(io.fmt_new(), edgemetric.edge_scatter(&im, c, &e)))
+            }
+            c = c + 1
+        }
+        image.img_free(&im)
+        v = v + 1
+    }
+    image.img_free(&ideal)
+    rt.heap_free(raw, ((w * h) as usize) * 2)
+}
+
+fn speed() {
+    let w: i32 = 2048
+    let h: i32 = 1536
+    var black: [f32; 4] = [64.0f, 64.0f, 64.0f, 64.0f]
+    let raw: u64 = rt.heap_alloc(((w * h) as usize) * 2)
+    var sc: image.Image = image.scene_make(w, h)
+    var rng: image.Rng = image.rng_new(3 as u64)
+    var yy: i32 = 0
+    while yy < h {
+        var xx: i32 = 0
+        while xx < w {
+            var c: i32 = 1
+            if (yy & 1) == 0 && (xx & 1) == 0 { c = 0 }
+            if (yy & 1) == 1 && (xx & 1) == 1 { c = 2 }
+            var v: f32 = image.img_get(&sc, c, xx, yy) + 0.004f * image.rng_gauss(&rng)
+            if v < 0.0f { v = 0.0f }
+            if v > 1.0f { v = 1.0f }
+            *((raw + (((yy * w + xx) * 2) as u64)) as *mut u16) = (64.0f + v * 959.0f) as u16
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    image.img_free(&sc)
+    var t0: u64 = time.monotonic_ns()
+    var im: image.Image = demosaic.demosaic_u16(raw, w, h, 0, 0, w, h, meta.CFA_RGGB, &black[0], 1023.0f)
+    let t_dm: u64 = (time.monotonic_ns() - t0) / 1000000
+    t0 = time.monotonic_ns()
+    antialias.aa_apply(&im, 1.0f)
+    let t_aa: u64 = (time.monotonic_ns() - t0) / 1000000
+    var im2: image.Image = image.img_copy(&im)
+    var im3: image.Image = image.img_copy(&im)
+    t0 = time.monotonic_ns()
+    antialias.aa_apply_opts(&im2, 1.0f, 0.0f)
+    let t_edge: u64 = (time.monotonic_ns() - t0) / 1000000
+    t0 = time.monotonic_ns()
+    antialias.aa_apply_opts(&im3, 0.0f, 1.0f)
+    let t_chroma: u64 = (time.monotonic_ns() - t0) / 1000000
+    image.img_free(&im2)
+    image.img_free(&im3)
+    pf("speed demosaic_ms_3MP", t_dm as f32)
+    pf("speed antialias_ms_3MP", t_aa as f32)
+    pf("speed antialias_edge_only_ms_3MP", t_edge as f32)
+    pf("speed antialias_chroma_only_ms_3MP", t_chroma as f32)
+    image.img_free(&im)
+    rt.heap_free(raw, ((w * h) as usize) * 2)
+}
+
+fn main() -> i32 {
+    par.init(4)
+    var k: f32 = 1.0f
+    star(k)
+    edges(k, 5.0f, false)
+    edges(k, 12.0f, false)
+    edges(k, 30.0f, false)
+    edges(k, 12.0f, true)
+    speed()
+    return 0
+}
