@@ -29,6 +29,7 @@ import jobs.jobs
 import std.rt
 import std.math
 import android.ndk
+import android.activity
 import plat.android.focusplan
 import ui
 
@@ -82,6 +83,9 @@ const P_SAVE: i32 = 6
 const P_ZOOM: i32 = 7
 const P_CHIPS: i32 = 8
 const P_PREVIEW: i32 = 9
+const P_DRAW: i32 = 12
+const P_UI: i32 = 11 // ui layout / input of the main loop
+const P_GL: i32 = 10 // GL context + shaders of the preview (ms on a GPU, seconds on a software GL emulator)
 const GAP_WARN_MS: i64 = 100 // a turn of the main loop longer than this is logged
 
 const M_PHOTO: i32 = 0
@@ -148,7 +152,7 @@ struct App {
     nchip: i32,
     learn_x10: i32, // zoom x10 at which the camera service was seen to switch to another physical lens (0 = none seen)
     learn_lens: i32, // scan index of the lens the sweep ran on
-    swept: bool,
+    swept: bool, // the sweep ran, was cached, or was cancelled: not started again in this run
     sw_n: i32,
     sw_z: [i32; 16], // sweep log: zoom x10, focal x100 mm, crop width, active physical id
     sw_f: [i32; 16],
@@ -162,8 +166,29 @@ struct App {
     zr: f32, // CONTROL_ZOOM_RATIO of the open lens (camera_open resets it to 1; do_zoom sets it again)
     pend_sl: [i32; 3], // slider values asked this turn (-1 = none)
     phase: i32, // what the UI thread is doing right now (P_*), for the loop-gap log
+    ph_t0: i64, // when that section started (ms)
+    slow_ms: i64, // the longest section of this turn so far
+    slow_phase: i32,
     gap_max: i64, // longest gap between two loop turns since the last stats line (ms)
     gap_phase: i32, // phase of that longest gap
+    gap_all: i64, // longest gap since the start
+    bt_state: i32, // BT_*: startup work state machine
+    bt_at: i64, // earliest time (ms) the next startup step may run
+    sw_run: i32, // 1 = the zoom sweep is running
+    sw_stage: i32, // 0 first sample, 1 coarse steps, 2 bisection, 3 back to zoom 1
+    sw_sub: i32, // 0 set the zoom, 1 wait until applied, 2 wait for results
+    sw_z10: i32, // zoom x10 of the current step
+    sw_t0: i64,
+    sw_c0: i64, // result count when the zoom was applied
+    sw_ci: i32,
+    sw_same: i32,
+    sw_diff: i32,
+    sw_guard: i32,
+    cache_hit: bool, // the sweep result came from the cache file
+    dbuf: u64, // camera dump text under construction
+    dn: usize,
+    dstage: i32,
+    didx: i32,
 }
 
 fn set_status(a: *mut App, s: str) {
@@ -233,6 +258,7 @@ fn want_kind(a: *mut App) -> i32 {
 }
 
 fn open_lens(a: *mut App, idx: i32) {
+    sweep_abort(a, false) // the camera is closed below: nothing to restore
     camera.camera_close()
     (*a).ready = false
     if !camera.camera_info(idx, &(*a).info) { set_status(a, "NO INFO"); return }
@@ -525,9 +551,9 @@ fn thread_job_main(arg: u64) -> u64 {
 // UI side of a finished job: save, release, report
 fn poll_job(a: *mut App) {
     if !(*a).busy { return }
-    if (*a).stage == 1 { (*a).phase = P_CAPTURE; step_capture(a); return }
+    if (*a).stage == 1 { mark(a, P_CAPTURE); step_capture(a); return }
     if !camjob.job_finished(&(*a).job) { return }
-    (*a).phase = P_SAVE
+    mark(a, P_SAVE)
     var name: [u8; 48] = [0 as u8; 48]
     if (*a).job.ok {
         name_into((&name[0]) as u64, "IMG_", ".jpg")
@@ -558,12 +584,14 @@ fn plain_shot(a: *mut App) -> bool {
 
 fn shoot(a: *mut App) {
     if (*a).busy { return }
+    sweep_abort(a, true) // a photo at the sweep's zoom would be wrong
     if plain_shot(a) { shoot_plain(a); return }
     start_job(a)
 }
 
 fn toggle_video(a: *mut App) {
     if !(*a).ready || (*a).info.vid_w <= 0 { return }
+    sweep_abort(a, true)
     if (*a).recording {
         let ok: bool = camera.camera_video_stop()
         (*a).recording = false
@@ -726,29 +754,8 @@ fn pow16(sh: i32) -> u32 {
     return r
 }
 
-// Waits until the newest capture result reports zoom ratio z (max 700 ms), then for `frames` more results (max 700 ms).
-fn wait_zoom(z: f32, frames: i64) {
-    var waited: i32 = 0
-    while waited < 700 {
-        let r: f32 = camera.camera_applied_zoom()
-        if r > z * 0.98f && r < z * 1.02f { break }
-        usleep(20000 as u32)
-        waited = waited + 20
-    }
-    let c0: i64 = camera.camera_result_count()
-    waited = 0
-    while waited < 700 && camera.camera_result_count() < c0 + frames {
-        usleep(20000 as u32)
-        waited = waited + 20
-    }
-}
-
-// Sets the zoom ratio z10/10 on the open lens, waits for the service to apply it, and logs what the capture result says
-// (focal length, ACTIVE_PHYSICAL_ID, crop width) into sweep slot `slot`.
-fn sweep_set(a: *mut App, slot: i32, z10: i32) {
-    let z: f32 = (z10 as f32) / 10.0f
-    let e: i32 = camera.camera_set_zoom(z)
-    wait_zoom(z, 8)
+// Logs what the newest capture result says (focal length, ACTIVE_PHYSICAL_ID, crop width) into sweep slot `slot`.
+fn sweep_record(a: *mut App, slot: i32, z10: i32) {
     let sl: usize = slot as usize
     (*a).sw_z[sl] = z10
     (*a).sw_f[sl] = (camera.camera_active_focal() * 100.0f + 0.5f) as i32
@@ -774,52 +781,6 @@ fn sweep_differs(a: *mut App, slot: i32) -> bool {
     return false
 }
 
-// Once per run, on the back logical camera: finds out whether the camera SERVICE switches to another physical lens (a tele
-// that the id list hides) at higher zoom. Steps 1x, 2x, 3x, 5x, 8x; at the first step that shows another lens a bisection
-// down to 0.1x finds the switch zoom (a.learn_x10 -> an optical chip, r641). Restores zoom 1 at the end. ~3 s, blocks the UI.
-fn sweep_zoom(a: *mut App) {
-    if (*a).swept || !(*a).ready { return }
-    (*a).swept = true
-    if !sweep_forced() && ((*a).info.facing != 1 || ((*a).info.caps & camera.CAP_LOGICAL) == 0 as u32) { return }
-    var zmin: f32 = 0.0f
-    var zmax: f32 = 0.0f
-    camera.camera_zoom_range(&zmin, &zmax)
-    if zmax < 2.0f { return }
-    (*a).sw_n = 0
-    sweep_set(a, 0, 10)
-    var coarse: [i32; 6] = [20, 30, 50, 80, 100, 0]
-    var slot: i32 = 1
-    var same_z: i32 = 10
-    var diff_z: i32 = 0
-    var i: usize = 0
-    while coarse[i] > 0 && slot < 14 {
-        if (coarse[i] as f32) > zmax * 10.0f + 0.5f { break }
-        sweep_set(a, slot, coarse[i])
-        if sweep_differs(a, slot) { diff_z = coarse[i]; slot = slot + 1; break }
-        same_z = coarse[i]
-        slot = slot + 1
-        i = i + 1
-    }
-    if diff_z > 0 {
-        var guard: i32 = 0
-        while guard < 6 && slot < 16 {
-            let m: i32 = focusplan.switch_between(same_z, diff_z)
-            if m == 0 { break }
-            sweep_set(a, slot, m)
-            if sweep_differs(a, slot) { diff_z = m } else { same_z = m }
-            slot = slot + 1
-            guard = guard + 1
-        }
-        (*a).learn_x10 = diff_z
-        (*a).learn_lens = (*a).lens
-    }
-    let e: i32 = camera.camera_set_zoom(1.0f)
-    (*a).zr = 1.0f
-    wait_zoom(1.0f, 4)
-    (*a).foc1 = 0.0f
-    (*a).ph1[0] = 0 as u8
-}
-
 // Appends "word=" and a number.
 fn put_kv(dst: u64, k: str, v: i64) -> usize {
     var n: usize = put_str(dst, k)
@@ -827,138 +788,465 @@ fn put_kv(dst: u64, k: str, v: i64) -> usize {
     return n
 }
 
-// Writes what the app sees of the cameras to Download/FirnCam/firncam-cameras<ts>.txt (no adb needed):
+// ---------------------------------------------------------------- startup work, one bounded step per loop turn
+// The main loop is the thread that reads Android's input queue: 5 s without reading a touch event is an ANR. So nothing
+// here sleeps or loops over slow calls. The zoom sweep and the camera dump are state machines that do ONE small step per
+// turn and wait by looking at the clock across turns. A zoom command, a lens change, the shutter or video abort the sweep
+// (sweep_abort) and the user's action wins.
+const BT_IDLE: i32 = 0
+const BT_WAIT: i32 = 1 // the preview settles for BOOT_DELAY_MS, then the sweep starts
+const BT_SWEEP: i32 = 2
+const BT_DUMP: i32 = 3
+const BT_DONE: i32 = 4
+const BOOT_DELAY_MS: i64 = 1200
+const SW_WAIT_MS: i64 = 700 // longest wait for the zoom to be applied / for the results after it
+const DUMP_CAP: usize = 20000
+
+#[link_name(open)]
+extern fn libc_open(path: u64, flags: i32, mode: u32) -> i32;
+#[link_name(read)]
+extern fn libc_read(fd: i32, p: u64, n: usize) -> i64;
+#[link_name(write)]
+extern fn libc_write(fd: i32, p: u64, n: usize) -> i64;
+#[link_name(close)]
+extern fn libc_close(fd: i32) -> i32;
+
+// Result cache of the zoom sweep: <app data dir>/firncam-learned.txt = "<key>|<learned switch zoom x10>\n". The key names the
+// app version and the camera (id, zoom range, focal length, RAW width, number of scan entries): another phone, another
+// camera app version or another zoom range = another key = the sweep runs again. 0 = swept, no tele switch found.
+fn cache_path(dst: u64) -> bool {
+    let d: u64 = activity.activity_data_path()
+    if d == 0 as u64 { return false }
+    var n: usize = 0
+    while n < 400 && *((d + n as u64) as *mut u8) != 0 as u8 {
+        *((dst + n as u64) as *mut u8) = *((d + n as u64) as *mut u8)
+        n = n + 1
+    }
+    n = n + put_str(dst + n as u64, "/firncam-learned.txt")
+    *((dst + n as u64) as *mut u8) = 0 as u8
+    return true
+}
+
+fn cache_key(a: *mut App, dst: u64) -> usize {
+    var zmin: f32 = 0.0f
+    var zmax: f32 = 0.0f
+    camera.camera_zoom_range(&zmin, &zmax)
+    var n: usize = put_str(dst, "firncam-")
+    n = n + put_str(dst + n as u64, "0.8")
+    n = n + put_str(dst + n as u64, " id=")
+    var k: usize = 0
+    while k < 40 && (*a).info.id[k] != 0 as u8 {
+        *((dst + n as u64) as *mut u8) = (*a).info.id[k]
+        n = n + 1
+        k = k + 1
+    }
+    n = n + put_str(dst + n as u64, " z=")
+    n = n + put_f10(dst + n as u64, zmin)
+    n = n + put_str(dst + n as u64, "..")
+    n = n + put_f10(dst + n as u64, zmax)
+    n = n + put_kv(dst + n as u64, " n=", (*a).nlens as i64)
+    n = n + put_str(dst + n as u64, " f=")
+    n = n + put_f10(dst + n as u64, (*a).info.focal_mm)
+    n = n + put_kv(dst + n as u64, " raw=", (*a).info.raw_w as i64)
+    return n
+}
+
+// The learned switch zoom x10 of the cache (0 = none), -1 = no cache for this camera.
+fn cache_load(a: *mut App) -> i32 {
+    var path: [u8; 512] = [0 as u8; 512]
+    if !cache_path((&path[0]) as u64) { return 0 - 1 }
+    let fd: i32 = libc_open((&path[0]) as u64, 0, 0 as u32)
+    if fd < 0 { return 0 - 1 }
+    var buf: [u8; 512] = [0 as u8; 512]
+    let rn: i64 = libc_read(fd, (&buf[0]) as u64, 500)
+    let cl: i32 = libc_close(fd)
+    if rn <= 0 { return 0 - 1 }
+    var key: [u8; 300] = [0 as u8; 300]
+    let kn: usize = cache_key(a, (&key[0]) as u64)
+    let got: usize = rn as usize
+    if kn >= 280 || got < kn + 2 { return 0 - 1 }
+    var i: usize = 0
+    while i < kn {
+        if buf[i] != key[i] { return 0 - 1 }
+        i = i + 1
+    }
+    if buf[kn] != 124 as u8 { return 0 - 1 }
+    var v: i32 = 0
+    var j: usize = kn + 1
+    while j < got && buf[j] >= 48 as u8 && buf[j] <= 57 as u8 {
+        v = v * 10 + (buf[j] as i32) - 48
+        j = j + 1
+    }
+    return v
+}
+
+fn cache_store(a: *mut App) {
+    var path: [u8; 512] = [0 as u8; 512]
+    if !cache_path((&path[0]) as u64) { return }
+    var buf: [u8; 320] = [0 as u8; 320]
+    let p: u64 = (&buf[0]) as u64
+    var n: usize = cache_key(a, p)
+    if n >= 280 { return }
+    *((p + n as u64) as *mut u8) = 124 as u8
+    n = n + 1
+    n = n + put_int(p + n as u64, (*a).learn_x10 as i64)
+    *((p + n as u64) as *mut u8) = 10 as u8
+    n = n + 1
+    let fd: i32 = libc_open((&path[0]) as u64, 577, 420 as u32)
+    if fd < 0 { return }
+    let w: i64 = libc_write(fd, p, n)
+    let cl: i32 = libc_close(fd)
+}
+
+// After the first lens is open: take a cached sweep result when there is one, else plan the sweep and the dump.
+fn boot_begin(a: *mut App, now: i64) {
+    (*a).bt_state = BT_DONE
+    if !(*a).ready { return }
+    var zmin: f32 = 0.0f
+    var zmax: f32 = 0.0f
+    camera.camera_zoom_range(&zmin, &zmax)
+    let eligible: bool = sweep_forced() || ((*a).info.facing == 1 && ((*a).info.caps & camera.CAP_LOGICAL) != 0 as u32)
+    var need: bool = eligible && zmax >= 2.0f
+    var hit: bool = false
+    if need && !sweep_forced() {
+        let c: i32 = cache_load(a)
+        if c >= 0 {
+            hit = true
+            need = false
+            (*a).swept = true
+            (*a).cache_hit = true
+            if c > 0 {
+                (*a).learn_x10 = c
+                (*a).learn_lens = (*a).lens
+            }
+            rebuild_chips(a)
+        }
+    }
+    (*a).bt_at = now + BOOT_DELAY_MS
+    if need { (*a).bt_state = BT_WAIT } else if hit { (*a).bt_state = BT_DONE } else { (*a).bt_state = BT_DUMP }
+}
+
+// One step per loop turn; waits while a photo/video is going on.
+fn boot_tick(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView, now: i64) {
+    let st: i32 = (*a).bt_state
+    if st == BT_IDLE || st == BT_DONE { return }
+    if !(*a).ready || (*a).busy || (*a).recording { return }
+    if now < (*a).bt_at { return }
+    if st == BT_WAIT {
+        sweep_begin(a)
+    } else if st == BT_SWEEP {
+        mark(a, P_SWEEP)
+        sweep_tick(a, u, cv, now)
+    } else {
+        mark(a, P_DUMP)
+        dump_tick(a)
+    }
+}
+
+// ---------------------------------------------------------------- zoom sweep (state machine)
+// Does the camera SERVICE switch to another physical lens (a tele the id list hides) at higher zoom? Steps 1x, 2x, 3x, 5x,
+// 8x, 10x; at the first step that shows another lens a bisection down to 0.1x finds the switch zoom (a.learn_x10 -> an
+// optical chip, r641). Restores zoom 1 at the end and caches the result. A step = set the zoom (sw_sub 0), wait until the
+// result reports it (1), wait for 8 more results (2).
+fn sweep_begin(a: *mut App) {
+    (*a).sw_run = 1
+    (*a).sw_n = 0
+    (*a).sw_stage = 0
+    (*a).sw_z10 = 10
+    (*a).sw_sub = 0
+    (*a).sw_ci = 0
+    (*a).sw_same = 10
+    (*a).sw_diff = 0
+    (*a).sw_guard = 0
+    (*a).bt_state = BT_SWEEP
+    set_status(a, "LENS SCAN")
+}
+
+fn sweep_tick(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView, now: i64) {
+    let z: f32 = ((*a).sw_z10 as f32) / 10.0f
+    if (*a).sw_sub == 0 {
+        let e: i32 = camera.camera_set_zoom(z)
+        if e != camera.E_OK { sweep_finish(a, u, cv, false); return }
+        (*a).sw_sub = 1
+        (*a).sw_t0 = now
+        return
+    }
+    if (*a).sw_sub == 1 {
+        let r: f32 = camera.camera_applied_zoom()
+        if (r > z * 0.98f && r < z * 1.02f) || now - (*a).sw_t0 >= SW_WAIT_MS {
+            (*a).sw_c0 = camera.camera_result_count()
+            (*a).sw_sub = 2
+            (*a).sw_t0 = now
+        }
+        return
+    }
+    var need: i64 = 8
+    if (*a).sw_stage == 3 { need = 4 }
+    if camera.camera_result_count() >= (*a).sw_c0 + need || now - (*a).sw_t0 >= SW_WAIT_MS {
+        sweep_measured(a, u, cv)
+    }
+}
+
+// The zoom of the current step is applied and its results are in: log them and plan the next step.
+fn sweep_measured(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView) {
+    let st: i32 = (*a).sw_stage
+    if st == 3 { sweep_finish(a, u, cv, true); return }
+    let slot: i32 = (*a).sw_n
+    sweep_record(a, slot, (*a).sw_z10)
+    if st == 0 {
+        (*a).sw_stage = 1
+        (*a).sw_ci = 0
+        sweep_next_coarse(a)
+        return
+    }
+    if st == 1 {
+        if sweep_differs(a, slot) {
+            (*a).sw_diff = (*a).sw_z10
+            (*a).sw_guard = 0
+            (*a).sw_stage = 2
+            sweep_next_bisect(a)
+            return
+        }
+        (*a).sw_same = (*a).sw_z10
+        (*a).sw_ci = (*a).sw_ci + 1
+        sweep_next_coarse(a)
+        return
+    }
+    if sweep_differs(a, slot) { (*a).sw_diff = (*a).sw_z10 } else { (*a).sw_same = (*a).sw_z10 }
+    (*a).sw_guard = (*a).sw_guard + 1
+    sweep_next_bisect(a)
+}
+
+fn sweep_next_coarse(a: *mut App) {
+    var coarse: [i32; 5] = [20, 30, 50, 80, 100]
+    var zmin: f32 = 0.0f
+    var zmax: f32 = 0.0f
+    camera.camera_zoom_range(&zmin, &zmax)
+    let ci: i32 = (*a).sw_ci
+    if ci >= 5 || (*a).sw_n >= 14 { sweep_restore(a); return }
+    if (coarse[ci as usize] as f32) > zmax * 10.0f + 0.5f { sweep_restore(a); return }
+    (*a).sw_z10 = coarse[ci as usize]
+    (*a).sw_sub = 0
+}
+
+fn sweep_next_bisect(a: *mut App) {
+    let m: i32 = focusplan.switch_between((*a).sw_same, (*a).sw_diff)
+    if m == 0 || (*a).sw_guard >= 6 || (*a).sw_n >= 16 {
+        (*a).learn_x10 = (*a).sw_diff
+        (*a).learn_lens = (*a).lens
+        sweep_restore(a)
+        return
+    }
+    (*a).sw_z10 = m
+    (*a).sw_sub = 0
+}
+
+fn sweep_restore(a: *mut App) {
+    (*a).sw_stage = 3
+    (*a).sw_z10 = 10
+    (*a).sw_sub = 0
+    (*a).zr = 1.0f
+}
+
+// Done (complete = every step ran): chips with the learned tele, zoom 1 on the screen, result into the cache, dump next.
+fn sweep_finish(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView, complete: bool) {
+    (*a).sw_run = 0
+    (*a).swept = true
+    (*a).foc1 = 0.0f
+    (*a).ph1[0] = 0 as u8
+    rebuild_chips(a)
+    reset_zoom(a, u, cv)
+    if complete { cache_store(a) }
+    (*a).bt_state = BT_DUMP
+    if !(*a).busy { set_status(a, "READY") }
+}
+
+// The user (or the system) wants the camera: stop the sweep now. restore = put the zoom back to 1 (the camera stays open);
+// without it the caller sets the zoom itself (zoom command) or closes the camera (lens change). No retry in this run and
+// no cache entry: the next start sweeps again.
+fn sweep_abort(a: *mut App, restore: bool) {
+    if (*a).bt_state == BT_WAIT {
+        (*a).bt_state = BT_DUMP
+        (*a).swept = true
+        return
+    }
+    if (*a).sw_run == 0 { return }
+    (*a).sw_run = 0
+    (*a).swept = true
+    (*a).foc1 = 0.0f
+    (*a).ph1[0] = 0 as u8
+    (*a).bt_state = BT_DUMP
+    if restore && (*a).ready {
+        let e: i32 = camera.camera_set_zoom(1.0f)
+        (*a).zr = 1.0f
+    }
+    if !(*a).busy { set_status(a, "READY") }
+}
+
+// ---------------------------------------------------------------- camera dump (state machine)
+// Writes what the app sees of the cameras to Download/FirnCam/firncam-cameras<ts>.txt (no adb needed), one step per turn
+// (every getCameraCharacteristics of a vendor camera service can take 50-300 ms), once per cache miss:
 //  cam    every scan entry (public id or physical id of a logical camera): focal lengths (x10 mm), 35 mm equivalents, sizes
 //  probe  getCameraCharacteristics on ids 0..19, listed or not (error codes shown): hidden physical cameras, caps, max-res
 //  sweep  the zoom sweep: focal length / ACTIVE_PHYSICAL_ID / crop width per zoom step (does the service switch to a tele?)
 //  tags   characteristics tags of the sensor / scaler / logical-camera / vendor sections of each scan entry (tag:type:count:value)
 //  open   the zoom range and chip row of the open camera, the learned tele switch
-fn save_cam_dump(a: *mut App) {
-    var buf: [u8; 20000] = [0 as u8; 20000]
-    let p: u64 = (&buf[0]) as u64
-    var n: usize = 0
-    n = n + put_str(p + n as u64, "firncam 0.7 dump\n")
-    var i: i32 = 0
-    var id: [u8; 48] = [0 as u8; 48]
-    while i < (*a).nlens && i < 16 && n < 3400 {
-        let par: i32 = camera.camera_entry_id(i, (&id[0]) as u64)
-        n = n + put_str(p + n as u64, "cam ")
-        n = n + put_int(p + n as u64, i as i64)
-        n = n + put_str(p + n as u64, " id=")
-        var k: usize = 0
-        while k < 40 && id[k] != 0 as u8 { *((p + n as u64) as *mut u8) = id[k]; n = n + 1; k = k + 1 }
-        n = n + put_kv(p + n as u64, " parent=", par as i64)
-        var ci: camera.CamInfo = camera.zero_info()
-        if camera.camera_info(i, &ci) {
-            n = n + put_kv(p + n as u64, " facing=", ci.facing as i64)
-            n = n + put_kv(p + n as u64, " logical=", if (ci.caps & camera.CAP_LOGICAL) != 0 as u32 { 1 } else { 0 })
-            n = n + put_str(p + n as u64, " focal_x10=")
-            n = n + put_f10(p + n as u64, ci.focal_mm)
-            n = n + put_kv(p + n as u64, " nfocal=", ci.focal_count as i64)
-            n = n + put_str(p + n as u64, " equiv_x10=")
-            n = n + put_f10(p + n as u64, ci.equiv_mm)
-            n = n + put_kv(p + n as u64, " preview=", ci.prev_w as i64)
-            n = n + put_kv(p + n as u64, " raw=", ci.raw_w as i64)
-        } else {
-            n = n + put_str(p + n as u64, " UNREADABLE (hidden physical id, no characteristics for apps)")
-        }
-        *((p + n as u64) as *mut u8) = 10 as u8
-        n = n + 1
-        i = i + 1
+fn dump_tick(a: *mut App) {
+    if (*a).dbuf == 0 {
+        (*a).dbuf = camera.camera_alloc(DUMP_CAP)
+        if (*a).dbuf == 0 { (*a).bt_state = BT_DONE; return }
+        (*a).dn = put_str((*a).dbuf, "firncam ")
+        (*a).dn = (*a).dn + put_str((*a).dbuf + (*a).dn as u64, "0.8")
+        (*a).dn = (*a).dn + put_str((*a).dbuf + (*a).dn as u64, " dump\n")
+        (*a).dn = (*a).dn + put_kv((*a).dbuf + (*a).dn as u64, "ui_max_gap_ms_so_far=", (*a).gap_all)
+        (*a).dn = (*a).dn + put_str((*a).dbuf + (*a).dn as u64, "\n")
+        (*a).dstage = 0
+        (*a).didx = 0
+        return
     }
-    // probe every small id number: a physical camera the id list does not show may still answer
-    var pr: [i32; 16] = [0; 16]
-    i = 0
-    while i < 20 && n < 7000 {
-        let rc: i32 = camera.camera_probe_id(i, (&pr[0]) as u64)
-        n = n + put_kv(p + n as u64, "probe id=", i as i64)
-        n = n + put_kv(p + n as u64, " rc=", rc as i64)
-        if rc == 0 {
-            n = n + put_kv(p + n as u64, " facing=", pr[1] as i64)
-            n = n + put_kv(p + n as u64, " hw=", pr[2] as i64)
-            n = n + put_kv(p + n as u64, " caps=", pr[3] as i64)
-            n = n + put_str(p + n as u64, "(1raw 2man 4logical 8ultrahires 16burst)")
-            n = n + put_kv(p + n as u64, " focal_x100=", pr[4] as i64)
-            n = n + put_kv(p + n as u64, " nfocal=", pr[5] as i64)
-            n = n + put_kv(p + n as u64, " jpeg=", pr[6] as i64)
-            n = n + put_kv(p + n as u64, "x", pr[7] as i64)
-            n = n + put_kv(p + n as u64, " raw=", pr[8] as i64)
-            n = n + put_kv(p + n as u64, "x", pr[9] as i64)
-            n = n + put_kv(p + n as u64, " active=", pr[10] as i64)
-            n = n + put_kv(p + n as u64, "x", pr[11] as i64)
-            n = n + put_kv(p + n as u64, " maxres=", pr[12] as i64)
-            n = n + put_kv(p + n as u64, "x", pr[13] as i64)
-            n = n + put_kv(p + n as u64, " sync=", pr[14] as i64)
-            n = n + put_kv(p + n as u64, " physbytes=", pr[15] as i64)
-        }
-        *((p + n as u64) as *mut u8) = 10 as u8
-        n = n + 1
-        i = i + 1
-    }
-    n = n + put_str(p + n as u64, "concurrent_camera_ids: not readable from the NDK (Java-only API)\n")
-    // the zoom sweep
-    i = 0
-    while i < (*a).sw_n && i < 16 {
-        n = n + put_kv(p + n as u64, "sweep z_x10=", (*a).sw_z[i as usize] as i64)
-        n = n + put_kv(p + n as u64, " focal_x100=", (*a).sw_f[i as usize] as i64)
-        n = n + put_str(p + n as u64, " active_phys=")
-        var k: usize = 0
-        while k < 15 && (*a).sw_ph[i as usize][k] != 0 as u8 { *((p + n as u64) as *mut u8) = (*a).sw_ph[i as usize][k]; n = n + 1; k = k + 1 }
-        n = n + put_kv(p + n as u64, " crop_w=", (*a).sw_cw[i as usize] as i64)
-        *((p + n as u64) as *mut u8) = 10 as u8
-        n = n + 1
-        i = i + 1
-    }
-    n = n + put_kv(p + n as u64, "learned_switch_x10=", (*a).learn_x10 as i64)
-    n = n + put_kv(p + n as u64, " on_lens=", (*a).learn_lens as i64)
-    *((p + n as u64) as *mut u8) = 10 as u8
-    n = n + 1
-    // tags of each scan entry: sections 13 scaler, 15 sensor info, 26 logical camera, >= 0x80000000 vendor
-    var tg: [i32; 1024] = [0; 1024]
-    var e: i32 = 0
-    while e < (*a).nlens && e < 8 && n < 18000 {
-        let nt: i32 = camera.camera_tags(e, (&tg[0]) as u64, 256)
-        n = n + put_kv(p + n as u64, "tags cam=", e as i64)
-        n = n + put_kv(p + n as u64, " total=", nt as i64)
-        n = n + put_str(p + n as u64, ":")
-        var j: i32 = 0
-        while j < nt && n < 19500 {
-            let tag: u32 = *((&tg[(j * 4) as usize]) as *mut u32)
-            let sec: u32 = tag / (65536 as u32)
-            if sec == (13 as u32) || sec == (15 as u32) || sec == (26 as u32) || tag >= (2147483648 as u32) {
-                n = n + put_str(p + n as u64, " ")
-                n = n + put_hex(p + n as u64, tag)
-                n = n + put_kv(p + n as u64, ":", tg[(j * 4 + 1) as usize] as i64)
-                n = n + put_kv(p + n as u64, ":", tg[(j * 4 + 2) as usize] as i64)
-                n = n + put_kv(p + n as u64, ":", tg[(j * 4 + 3) as usize] as i64)
+    let p: u64 = (*a).dbuf
+    var n: usize = (*a).dn
+    let ds: i32 = (*a).dstage
+    if ds == 0 {
+        let i: i32 = (*a).didx
+        if i < (*a).nlens && i < 16 && n < 3400 {
+            var id: [u8; 48] = [0 as u8; 48]
+            let par: i32 = camera.camera_entry_id(i, (&id[0]) as u64)
+            n = n + put_str(p + n as u64, "cam ")
+            n = n + put_int(p + n as u64, i as i64)
+            n = n + put_str(p + n as u64, " id=")
+            var k: usize = 0
+            while k < 40 && id[k] != 0 as u8 { *((p + n as u64) as *mut u8) = id[k]; n = n + 1; k = k + 1 }
+            n = n + put_kv(p + n as u64, " parent=", par as i64)
+            var ci: camera.CamInfo = camera.zero_info()
+            if camera.camera_info(i, &ci) {
+                n = n + put_kv(p + n as u64, " facing=", ci.facing as i64)
+                n = n + put_kv(p + n as u64, " logical=", if (ci.caps & camera.CAP_LOGICAL) != 0 as u32 { 1 } else { 0 })
+                n = n + put_str(p + n as u64, " focal_x10=")
+                n = n + put_f10(p + n as u64, ci.focal_mm)
+                n = n + put_kv(p + n as u64, " nfocal=", ci.focal_count as i64)
+                n = n + put_str(p + n as u64, " equiv_x10=")
+                n = n + put_f10(p + n as u64, ci.equiv_mm)
+                n = n + put_kv(p + n as u64, " preview=", ci.prev_w as i64)
+                n = n + put_kv(p + n as u64, " raw=", ci.raw_w as i64)
+            } else {
+                n = n + put_str(p + n as u64, " UNREADABLE (hidden physical id, no characteristics for apps)")
             }
-            j = j + 1
+            *((p + n as u64) as *mut u8) = 10 as u8
+            n = n + 1
+            (*a).didx = i + 1
+        } else {
+            (*a).dstage = 1
+            (*a).didx = 0
+        }
+    } else if ds == 1 {
+        // probe every small id number: a physical camera the id list does not show may still answer
+        let i: i32 = (*a).didx
+        if i < 20 && n < 7000 {
+            var pr: [i32; 16] = [0; 16]
+            let rc: i32 = camera.camera_probe_id(i, (&pr[0]) as u64)
+            n = n + put_kv(p + n as u64, "probe id=", i as i64)
+            n = n + put_kv(p + n as u64, " rc=", rc as i64)
+            if rc == 0 {
+                n = n + put_kv(p + n as u64, " facing=", pr[1] as i64)
+                n = n + put_kv(p + n as u64, " hw=", pr[2] as i64)
+                n = n + put_kv(p + n as u64, " caps=", pr[3] as i64)
+                n = n + put_str(p + n as u64, "(1raw 2man 4logical 8ultrahires 16burst)")
+                n = n + put_kv(p + n as u64, " focal_x100=", pr[4] as i64)
+                n = n + put_kv(p + n as u64, " nfocal=", pr[5] as i64)
+                n = n + put_kv(p + n as u64, " jpeg=", pr[6] as i64)
+                n = n + put_kv(p + n as u64, "x", pr[7] as i64)
+                n = n + put_kv(p + n as u64, " raw=", pr[8] as i64)
+                n = n + put_kv(p + n as u64, "x", pr[9] as i64)
+                n = n + put_kv(p + n as u64, " active=", pr[10] as i64)
+                n = n + put_kv(p + n as u64, "x", pr[11] as i64)
+                n = n + put_kv(p + n as u64, " maxres=", pr[12] as i64)
+                n = n + put_kv(p + n as u64, "x", pr[13] as i64)
+                n = n + put_kv(p + n as u64, " sync=", pr[14] as i64)
+                n = n + put_kv(p + n as u64, " physbytes=", pr[15] as i64)
+            }
+            *((p + n as u64) as *mut u8) = 10 as u8
+            n = n + 1
+            (*a).didx = i + 1
+        } else {
+            n = n + put_str(p + n as u64, "concurrent_camera_ids: not readable from the NDK (Java-only API)\n")
+            // the zoom sweep
+            var i2: i32 = 0
+            while i2 < (*a).sw_n && i2 < 16 {
+                n = n + put_kv(p + n as u64, "sweep z_x10=", (*a).sw_z[i2 as usize] as i64)
+                n = n + put_kv(p + n as u64, " focal_x100=", (*a).sw_f[i2 as usize] as i64)
+                n = n + put_str(p + n as u64, " active_phys=")
+                var k: usize = 0
+                while k < 15 && (*a).sw_ph[i2 as usize][k] != 0 as u8 { *((p + n as u64) as *mut u8) = (*a).sw_ph[i2 as usize][k]; n = n + 1; k = k + 1 }
+                n = n + put_kv(p + n as u64, " crop_w=", (*a).sw_cw[i2 as usize] as i64)
+                *((p + n as u64) as *mut u8) = 10 as u8
+                n = n + 1
+                i2 = i2 + 1
+            }
+            n = n + put_kv(p + n as u64, "learned_switch_x10=", (*a).learn_x10 as i64)
+            n = n + put_kv(p + n as u64, " on_lens=", (*a).learn_lens as i64)
+            n = n + put_kv(p + n as u64, " sweep_cache_hit=", if (*a).cache_hit { 1 } else { 0 })
+            *((p + n as u64) as *mut u8) = 10 as u8
+            n = n + 1
+            (*a).dstage = 2
+            (*a).didx = 0
+        }
+    } else if ds == 2 {
+        // tags of each scan entry: sections 13 scaler, 15 sensor info, 26 logical camera, >= 0x80000000 vendor
+        let e: i32 = (*a).didx
+        if e < (*a).nlens && e < 8 && n < 18000 {
+            var tg: [i32; 1024] = [0; 1024]
+            let nt: i32 = camera.camera_tags(e, (&tg[0]) as u64, 256)
+            n = n + put_kv(p + n as u64, "tags cam=", e as i64)
+            n = n + put_kv(p + n as u64, " total=", nt as i64)
+            n = n + put_str(p + n as u64, ":")
+            var j: i32 = 0
+            while j < nt && n < 19500 {
+                let tag: u32 = *((&tg[(j * 4) as usize]) as *mut u32)
+                let sec: u32 = tag / (65536 as u32)
+                if sec == (13 as u32) || sec == (15 as u32) || sec == (26 as u32) || tag >= (2147483648 as u32) {
+                    n = n + put_str(p + n as u64, " ")
+                    n = n + put_hex(p + n as u64, tag)
+                    n = n + put_kv(p + n as u64, ":", tg[(j * 4 + 1) as usize] as i64)
+                    n = n + put_kv(p + n as u64, ":", tg[(j * 4 + 2) as usize] as i64)
+                    n = n + put_kv(p + n as u64, ":", tg[(j * 4 + 3) as usize] as i64)
+                }
+                j = j + 1
+            }
+            *((p + n as u64) as *mut u8) = 10 as u8
+            n = n + 1
+            (*a).didx = e + 1
+        } else {
+            (*a).dstage = 3
+        }
+    } else {
+        var zmin: f32 = 0.0f
+        var zmax: f32 = 0.0f
+        camera.camera_zoom_range(&zmin, &zmax)
+        n = n + put_kv(p + n as u64, "open lens=", (*a).lens as i64)
+        n = n + put_str(p + n as u64, " zoom_range_x10=")
+        n = n + put_f10(p + n as u64, zmin)
+        n = n + put_str(p + n as u64, "..")
+        n = n + put_f10(p + n as u64, zmax)
+        n = n + put_str(p + n as u64, " chips=")
+        var i: i32 = 0
+        while i < (*a).nchip {
+            n = n + put_int(p + n as u64, (*a).chip_x10[i as usize] as i64)
+            if (*a).chip_opt[i as usize] == 1 { n = n + put_str(p + n as u64, "o ") } else { n = n + put_str(p + n as u64, "d ") }
+            i = i + 1
         }
         *((p + n as u64) as *mut u8) = 10 as u8
         n = n + 1
-        e = e + 1
+        var name: [u8; 48] = [0 as u8; 48]
+        let nn: usize = name_into((&name[0]) as u64, "firncam-cameras", ".txt")
+        let mime: str = "text/plain\0"
+        mark(a, P_SAVE)
+        let r: i32 = camera.camera_save_doc(p, n, (&name[0]) as u64, mime.p as u64)
+        camera.camera_free(p, DUMP_CAP)
+        (*a).dbuf = 0
+        (*a).bt_state = BT_DONE
     }
-    var zmin: f32 = 0.0f
-    var zmax: f32 = 0.0f
-    camera.camera_zoom_range(&zmin, &zmax)
-    n = n + put_kv(p + n as u64, "open lens=", (*a).lens as i64)
-    n = n + put_str(p + n as u64, " zoom_range_x10=")
-    n = n + put_f10(p + n as u64, zmin)
-    n = n + put_str(p + n as u64, "..")
-    n = n + put_f10(p + n as u64, zmax)
-    n = n + put_str(p + n as u64, " chips=")
-    i = 0
-    while i < (*a).nchip {
-        n = n + put_int(p + n as u64, (*a).chip_x10[i as usize] as i64)
-        if (*a).chip_opt[i as usize] == 1 { n = n + put_str(p + n as u64, "o ") } else { n = n + put_str(p + n as u64, "d ") }
-        i = i + 1
-    }
-    *((p + n as u64) as *mut u8) = 10 as u8
-    n = n + 1
-    var name: [u8; 48] = [0 as u8; 48]
-    let nn: usize = name_into((&name[0]) as u64, "firncam-cameras", ".txt")
-    let mime: str = "text/plain\0"
-    let r: i32 = camera.camera_save_doc(p, n, (&name[0]) as u64, mime.p as u64)
+    (*a).dn = n
 }
 
 // ---------------------------------------------------------------- state -> UI
@@ -1098,6 +1386,7 @@ fn do_focus(a: *mut App, fx: f64, fy: f64, pvw: i32, pvh: i32) {
 // Pinch / double tap: zoom in the user scale (1.0 = main lens). The camera zooms (ratio, lens choice); only when
 // it cannot, the preview shader crops digitally. After a real zoom the shader zoom stays at 1.
 fn do_zoom(a: *mut App, cv: *mut camview.CamView, z: f64) {
+    sweep_abort(a, false) // the user's zoom wins; it is applied below
     if !(*a).ready {
         camview.camview_zoom(cv, z)
         return
@@ -1242,15 +1531,27 @@ fn sweep_forced() -> bool {
     return prop_is_one("debug.firncam.sweep\0")
 }
 
+// A new section of the main loop starts: the one that ran so far is timed, and the longest section of the turn is kept
+// (slow_phase) -- the gap log names the section that blocked, not just the last one that started.
+fn mark(a: *mut App, ph: i32) {
+    let t: i64 = fuishell.shell_now_ms()
+    let d: i64 = t - (*a).ph_t0
+    if d > (*a).slow_ms { (*a).slow_ms = d; (*a).slow_phase = (*a).phase }
+    (*a).phase = ph
+    (*a).ph_t0 = t
+}
+
 // One line per main-loop turn that took longer than GAP_WARN_MS: the UI thread was blocked (an input queue that is not
 // read for 5 s is an ANR). phase = what ran (P_*).
-fn log_gap(ms: i64, phase: i32) {
-    var b: [u8; 64] = [0 as u8; 64]
+fn log_gap(ms: i64, phase: i32, phase_ms: i64) {
+    var b: [u8; 96] = [0 as u8; 96]
     let p: u64 = (&b[0]) as u64
     var n: usize = put_str(p, "gap ms=")
     n = n + put_int(p + n as u64, ms)
     n = n + put_str(p + n as u64, " phase=")
     n = n + put_int(p + n as u64, phase as i64)
+    n = n + put_str(p + n as u64, " phase_ms=")
+    n = n + put_int(p + n as u64, phase_ms)
     let tag: str = "firncam\0"
     let r: i32 = log_write(4, tag.p as u64, p)
 }
@@ -1297,7 +1598,8 @@ fn main() -> i32 {
         stage: 0, cap_n: 0, cap_i: 0, cap_at: 0, steps: [0.0f; 16], bs: [0; 16],
         flash: 0, fl_last: 0 - 1, disp: 0, thumb: 0, pthumb: 0, sthumb: 0, tkey: 0, have_thumb: false, have_p: false,
         have_s: false, nframe: 0, lfac: [0 - 1; 16], lmm: [0.0f; 16], main_lens: [0 - 1; 3], chip_idx: [0; 6],
-        phase: 0, gap_max: 0, gap_phase: 0,
+        phase: 0, ph_t0: 0, slow_ms: 0, slow_phase: 0, gap_max: 0, gap_phase: 0, gap_all: 0, bt_state: 0, bt_at: 0, sw_run: 0, sw_stage: 0, sw_sub: 0, sw_z10: 10,
+        sw_t0: 0, sw_c0: 0, sw_ci: 0, sw_same: 10, sw_diff: 0, sw_guard: 0, cache_hit: false, dbuf: 0, dn: 0, dstage: 0, didx: 0,
         chip_x10: [10; 6], chip_opt: [0; 6], foc1: 0.0f, nchip: 0, learn_x10: 0, learn_lens: 0 - 1, swept: false, sw_n: 0, sw_z: [0; 16], sw_f: [0; 16], sw_cw: [0; 16], sw_ph: [[0 as u8; 16]; 16], ph1: [0 as u8; 16], can_flip: false, cpu: 0, cpu_cap: 0, pend_zoom: 0.0 - 1.0, zr: 1.0f, pend_sl: [0 - 1; 3],
     }
     a.thumb = camera.camera_alloc(THUMB_BYTES)
@@ -1317,6 +1619,7 @@ fn main() -> i32 {
     var scan_wait: i64 = 0
     var t_log: i64 = fuishell.shell_now_ms()
     var prev_ms: i64 = 0
+    var n_all: i64 = 0 // frames drawn since the start
     var n_ui: i64 = 0
     var n_cam: i64 = 0
     var pvx: i32 = 0
@@ -1327,31 +1630,32 @@ fn main() -> i32 {
     while open {
         turn = turn + 1
         let now: i64 = fuishell.shell_now_ms()
+        mark(&a, P_IDLE) // closes the section that ran last
         if prev_ms > 0 {
             let gap: i64 = now - prev_ms
-            if gap > a.gap_max { a.gap_max = gap; a.gap_phase = a.phase }
-            if gap >= GAP_WARN_MS { log_gap(gap, a.phase) }
+            if gap > a.gap_max { a.gap_max = gap; a.gap_phase = a.slow_phase }
+            if gap > a.gap_all { a.gap_all = gap }
+            if gap >= GAP_WARN_MS { log_gap(gap, a.slow_phase, a.slow_ms) }
         }
         prev_ms = now
-        a.phase = P_IDLE
-        if !a.ready && a.nlens == 0 && turn >= scan_wait {
+        a.slow_ms = 0
+        a.slow_phase = P_IDLE
+        a.ph_t0 = fuishell.shell_now_ms()
+        // the scan waits for the first frames: they create the GL objects (seconds on a software GL) and a block here would add up
+        if !a.ready && a.nlens == 0 && turn >= scan_wait && n_all >= 4 {
             scan_wait = turn + 60
             if camera.camera_permission() == 1 {
-                a.phase = P_SCAN
+                mark(&a, P_SCAN)
                 a.nlens = camera.camera_scan()
                 if a.nlens > 0 {
                     scan_lenses(&a)
                     let first: i32 = if a.main_lens[1] >= 0 { a.main_lens[1] } else { 0 }
-                    a.phase = P_OPEN
+                    mark(&a, P_OPEN)
                     open_lens(&a, first)
                     reset_zoom(&a, &u, &cv)
-                    a.phase = P_SWEEP
-                    sweep_zoom(&a)
-                    a.phase = P_CHIPS
-                    rebuild_chips(&a)
+                    mark(&a, P_CHIPS)
+                    boot_begin(&a, now)
                     reset_zoom(&a, &u, &cv)
-                    a.phase = P_DUMP
-                    save_cam_dump(&a)
                 } else {
                     set_status(&a, "NO CAMERA")
                 }
@@ -1361,14 +1665,17 @@ fn main() -> i32 {
             }
         }
         poll_job(&a)
+        if n_all >= 6 { boot_tick(&a, &u, &cv, now) }
         if gen != fuishell.shell_gen(&s) {
             // the GPU was (re)started: the preview's GL objects are new
             gen = fuishell.shell_gen(&s)
+            mark(&a, P_GL)
             if fuishell.shell_gpu_on(&s) && !cpu_forced() { let go: bool = camview.camview_open(&cv, fuishell.shell_gl(&s)) }
         }
         if turn % 90 == 0 { a.disp = display_deg() }
 
         // ---- input
+        mark(&a, P_UI)
         sync_ui(&a, &u)
         ui.ui_prepare(&u, fuishell.shell_w(&s) as i32, fuishell.shell_h(&s) as i32, fuishell.shell_dp(&s), now)
         window.wait_event(f, 8)
@@ -1382,6 +1689,7 @@ fn main() -> i32 {
             if k == window.EV_CLOSED { open = false }
             if k == window.EV_KEY && window.ev_a(f) == window.K_ESCAPE { open = false }
             if k == window.EV_CONFIGURE {
+                mark(&a, P_GL) // the GL surface is rebuilt
                 if !fuishell.shell_resize(&s) { return 3 }
                 a.disp = display_deg()
             }
@@ -1400,16 +1708,18 @@ fn main() -> i32 {
         a.pend_sl = [0 - 1; 3]
         var cm: ui.Cmd = ui.Cmd { kind: 0, a: 0, b: 0, f: 0.0, g: 0.0 }
         while ui.ui_take(&u, &cm) {
-            a.phase = P_ZOOM
+            mark(&a, P_ZOOM)
             run_cmd(&a, &u, &cv, &cm, pvw, pvh)
         }
-        if a.pend_zoom > 0.0 { a.phase = P_ZOOM; do_zoom(&a, &cv, a.pend_zoom) }
+        if a.pend_zoom > 0.0 { mark(&a, P_ZOOM); do_zoom(&a, &cv, a.pend_zoom) }
         if a.pend_sl[0] >= 0 || a.pend_sl[1] >= 0 || a.pend_sl[2] >= 0 { apply_manual(&a) }
         // a lens or mode change may have moved the preview rectangle: ask again
         sync_ui(&a, &u)
         ui.ui_preview_rect(&u, &pvx, &pvy, &pvw, &pvh)
 
         // ---- the camera picture
+        // the first frames create the GL objects and compile the shaders (seconds on a software GL, ms on a GPU)
+        if n_all < 4 { mark(&a, P_GL) } else { mark(&a, P_PREVIEW) }
         var mirror: bool = false
         if a.ready {
             mirror = camera.camera_is_front()
@@ -1448,6 +1758,8 @@ fn main() -> i32 {
         }
 
         // ---- draw
+        // glyph atlas / painter shaders are built by the first draws (software GL: seconds) -> counted as GL warm-up
+        if n_all < 30 { mark(&a, P_GL) } else { mark(&a, P_DRAW) }
         fuishell.shell_begin(&s)
         let z: *mut painter.Painter = fuishell.shell_painter(&s)
         painter.painter_clear(z, 0xFF000000 as u32)
@@ -1455,6 +1767,7 @@ fn main() -> i32 {
         ui.ui_draw(&u, z)
         fuishell.shell_end(&s)
         n_ui = n_ui + 1
+        n_all = n_all + 1
         if now - t_log >= 3000 {
             log_stats(n_ui, n_cam, now - t_log, pvw, pvh, rot, camview.camview_on(&cv), a.gap_max, a.gap_phase)
             a.gap_max = 0

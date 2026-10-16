@@ -16,13 +16,14 @@
 #
 #   SERIAL=emulator-5584 bash tools/android/firncam_anr_check.sh            (builds the APK itself, x86_64)
 #   SERIAL=emulator-5584 APK=f.apk bash tools/android/firncam_anr_check.sh   (use a finished x86_64 APK)
-# Environment: ADB, SERIAL, APK, FIRNC, MAX_GAP_MS, RUN_SECONDS (default 24). Exit 0 = pass.
+# Environment: ADB, SERIAL, APK, FIRNC, MAX_GAP_MS, GL_MAX_MS, RUN_SECONDS (default 24). Exit 0 = pass.
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 ADB=${ADB:-/root/android-sdk/platform-tools/adb}
 [ -n "${SERIAL:-}" ] && ADB="$ADB -s $SERIAL"
 PKG=org.firn.firncam
 MAX_GAP_MS=${MAX_GAP_MS:-150}
+GL_MAX_MS=${GL_MAX_MS:-3500}
 RUN_SECONDS=${RUN_SECONDS:-24}
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
 FAIL=0
@@ -56,13 +57,17 @@ phase() { # name: run the app for RUN_SECONDS with taps, then check
     done
     $ADB logcat -d -s firncam:I > "$D/log_$name.txt"
     $ADB logcat -b events -d > "$D/ev_$name.txt"
-    local gap; gap=$(grep -ao 'gap ms=[0-9]*' "$D/log_$name.txt" | sed 's/gap ms=//' | sort -n | tail -1)
-    local mg; mg=$(grep -ao 'max_gap=[0-9]*' "$D/log_$name.txt" | sed 's/max_gap=//' | sort -n | tail -1)
-    local worst=${gap:-0}; [ "${mg:-0}" -gt "$worst" ] && worst=${mg:-0}
+    # phase 10 = GL context + shader compile of the preview: needs the thread that owns the GL context; milliseconds on a
+    # GPU, a few seconds on the software GL of an emulator -> its own, looser limit (GL_MAX_MS, must stay under the 5 s ANR)
+    local worst; worst=$(grep -ao 'gap ms=[0-9]* phase=[0-9]*' "$D/log_$name.txt" | awk '{split($2,a,"=");split($3,b,"="); if (b[2]!=10 && a[2]+0>m) m=a[2]+0} END{print m+0}')
+    local glw; glw=$(grep -ao 'gap ms=[0-9]* phase=10' "$D/log_$name.txt" | awk '{split($2,a,"="); if (a[2]+0>m) m=a[2]+0} END{print m+0}')
+    local mg; mg=$(grep -ao 'max_gap=[0-9]* gap_phase=[0-9]*' "$D/log_$name.txt" | awk '{split($1,a,"=");split($2,b,"="); if (b[2]!=10 && a[2]+0>m) m=a[2]+0} END{print m+0}')
+    [ "$mg" -gt "$worst" ] && worst=$mg
     local lines; lines=$(grep -ac 'ui_fps=' "$D/log_$name.txt")
-    echo "   [$name] stats lines=$lines  longest gap=${worst} ms  (limit $MAX_GAP_MS)"
+    echo "   [$name] stats lines=$lines  longest gap=${worst} ms (limit $MAX_GAP_MS), GL init gap=${glw} ms (limit $GL_MAX_MS)"
     grep -a 'gap ms=' "$D/log_$name.txt" | head -5 | cut -c1-120
     [ "$lines" -ge 2 ] && ok "$name: app runs and logs" || bad "$name: no stats lines (app dead or never ready)"
+    [ "$glw" -le "$GL_MAX_MS" ] && ok "$name: GL init gap <= $GL_MAX_MS ms" || bad "$name: GL init blocked ${glw} ms"
     [ "$worst" -le "$MAX_GAP_MS" ] && ok "$name: UI thread never blocked > $MAX_GAP_MS ms" || bad "$name: UI thread blocked ${worst} ms"
     if grep -a 'am_anr' "$D/ev_$name.txt" | grep -aq "$PKG"; then bad "$name: Android reported an ANR"; else ok "$name: no ANR event"; fi
 }
