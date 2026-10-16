@@ -1,0 +1,339 @@
+// expect_exit: 0
+// tests/3604_cal_fuzz.fi -- cal.content / cal.vcard / cal.ical / cal.rrule on damaged input: seed
+// documents (vCard 2.1 / 3.0 / 4.0, an event with a zone, rules) are mutated at random (cut, flip,
+// insert separators / quotes / control bytes, duplicate, swap) and EVERYTHING is run on them: parse,
+// every accessor, TEXT / structure / media / geo / bday readers, occurrence expansion in a bounded
+// window, write, re-parse. Nothing may crash or hang; after one write the text must be stable
+// (write(parse(write(parse(x)))) == write(parse(x))). Default 1500 mutations; the argument raises it:
+//   tests/3604 <count> <seed>      (tools/cal_cross/run.sh runs 60000 in release-safe)
+import std.rt
+import std.vec
+import cal.civil
+import cal.content
+import cal.vcard
+import cal.ical
+import cal.rrule
+
+static mut failures: i32 = 0
+static mut rng: u64 = 1
+static mut unstable: i32 = 0
+
+fn next_rand() -> u64 {
+    rng = (rng * 1103515245 + 12345) & 2147483647
+    return rng >> 8
+}
+
+fn pick(n: u64) -> u64 {
+    return next_rand() % n
+}
+
+fn bset(b: *mut rt.Buf, i: usize, v: u8) {
+    rt.st8(rt.buf_ptr(b), i, v)
+}
+
+fn seed_text(i: u64) -> str {
+    if i == 0 {
+        return "BEGIN:VCARD\r\nVERSION:2.1\r\nN;CHARSET=ISO-8859-1;ENCODING=QUOTED-PRINTABLE:M=FCller;Hans;;Dr.;\r\nFN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:Hans M=C3=BCller\r\nTEL;WORK;VOICE:+43 1 2345\r\nADR;HOME;ENCODING=QUOTED-PRINTABLE:;;Stra=C3=9Fe 1=0D=0A=\r\nStock 2;Wien;;1010;\r\nPHOTO;ENCODING=BASE64;JPEG:AAECAwQF\r\n BgcICQ==\r\n\r\nEND:VCARD\r\n"
+    }
+    if i == 1 {
+        return "BEGIN:vCard\r\nVERSION:3.0\r\nFN:Frank Dawson\r\nN:Dawson;Frank;;;\r\nORG:Lotus Development Corporation\r\nADR;TYPE=WORK,POSTAL,PARCEL:;;6544 Battleford Drive\r\n ;Raleigh;NC;27613-3502;U.S.A.\r\nTEL;TYPE=VOICE,MSG,WORK:+1-919-676-9515\r\nEMAIL;TYPE=INTERNET,PREF:Frank_Dawson@Lotus.com\r\nBDAY:1996-04-15\r\nGEO:37.386013;-122.082932\r\nNOTE:a\\nb\\, c\\; d\r\nPHOTO;ENCODING=b;TYPE=JPEG:AAECAwQFBgcICQ==\r\nEND:vCard\r\n"
+    }
+    if i == 2 {
+        return "BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Simon Perreault\r\nN:Perreault;Simon;;;ing. jr,M.Sc.\r\nBDAY:--0203\r\nTEL;VALUE=uri;PREF=1;TYPE=\"voice,home\":tel:+1-418-656-9254;ext=102\r\nGEO;TYPE=work:geo:46.772673,-71.282945\r\nPHOTO:data:image/png;base64,AAECAwQFBgcICQ==\r\nKEY;TYPE=work;VALUE=uri:http://www.viagenie.ca/simon.perreault/simon.asc\r\nEND:VCARD\r\n"
+    }
+    if i == 3 {
+        return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:Europe/Vienna\r\nBEGIN:STANDARD\r\nDTSTART:19701025T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nDTSTART:19700329T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nDTSTART;TZID=Europe/Vienna:20261024T230000\r\nDURATION:PT1H30M\r\nRRULE:FREQ=DAILY;UNTIL=20261030T225000Z;BYHOUR=22,23\r\nEXDATE;TZID=Europe/Vienna:20261025T230000\r\nRDATE;VALUE=PERIOD:19970101T180000Z/PT5H30M\r\nSUMMARY:x\\, y\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    }
+    if i == 4 {
+        return "BEGIN:VEVENT\r\nDTSTART;VALUE=DATE:19970714\r\nDTEND;VALUE=DATE:19970716\r\nRRULE:FREQ=MONTHLY;INTERVAL=2;BYDAY=-1FR,2MO;BYSETPOS=1,-1;WKST=SU;COUNT=30\r\nRRULE:FREQ=YEARLY;BYWEEKNO=20,-1;BYDAY=MO;BYYEARDAY=1,100,-5\r\nRRULE:FREQ=SECONDLY;BYSECOND=1,2,3;BYMINUTE=0\r\nEND:VEVENT\r\n"
+    }
+    return "BEGIN:VCARD\r\nVERSION:3.0\r\nitem1.EMAIL;X-Q=\"a^nb^'c\";TYPE=\"home,work\":x@y.z\r\nitem1.X-ABLabel:other\r\nEND:VCARD\r\n"
+}
+
+fn rule_seed(i: u64) -> str {
+    if i == 0 { return "FREQ=WEEKLY;INTERVAL=2;COUNT=10;BYDAY=MO,WE;WKST=SU" }
+    if i == 1 { return "FREQ=MONTHLY;BYDAY=-1FR;BYMONTHDAY=13,-1;BYSETPOS=-1;UNTIL=19980101T000000Z" }
+    if i == 2 { return "FREQ=YEARLY;BYWEEKNO=1,53,-1;BYYEARDAY=366,-366;BYMONTH=2,12" }
+    if i == 3 { return "FREQ=HOURLY;INTERVAL=7;BYHOUR=1,2,3;BYMINUTE=59;BYSECOND=0,59" }
+    return "FREQ=SECONDLY;INTERVAL=99999999;COUNT=3;BYMONTHDAY=31;BYMONTH=2"
+}
+
+fn interesting(i: u64) -> u8 {
+    if i == 0 { return 13 as u8 }
+    if i == 1 { return 10 as u8 }
+    if i == 2 { return 59 as u8 }
+    if i == 3 { return 58 as u8 }
+    if i == 4 { return 44 as u8 }
+    if i == 5 { return 34 as u8 }
+    if i == 6 { return 61 as u8 }
+    if i == 7 { return 92 as u8 }
+    if i == 8 { return 32 as u8 }
+    if i == 9 { return 9 as u8 }
+    if i == 10 { return 94 as u8 }
+    if i == 11 { return 0 as u8 }
+    if i == 12 { return 255 as u8 }
+    if i == 13 { return 84 as u8 }
+    if i == 14 { return 90 as u8 }
+    if i == 15 { return 45 as u8 }
+    if i == 16 { return 46 as u8 }
+    return (48 + (i % 10)) as u8
+}
+
+// seed -> mutated copy in `out`
+fn mutate(seed: str, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, seed.p as u64, seed.n)
+    let ops: u64 = 1 + pick(4)
+    var k: u64 = 0
+    while k < ops {
+        let n: usize = rt.buf_len(out)
+        if n == 0 {
+            rt.buf_push(out, interesting(pick(20)))
+            k = k + 1
+            continue
+        }
+        let op: u64 = pick(7)
+        let at: usize = (pick(n as u64)) as usize
+        if op == 0 {
+            // cut the tail
+            rt.buf_set_len(out, at)
+        } else if op == 1 {
+            // overwrite one byte
+            bset(out, at, interesting(pick(20)))
+        } else if op == 2 {
+            // insert a byte: push then rotate it into place
+            rt.buf_push(out, 0 as u8)
+            var j: usize = rt.buf_len(out) - 1
+            while j > at {
+                bset(out, j, rt.buf_at(out, j - 1))
+                j = j - 1
+            }
+            bset(out, at, interesting(pick(20)))
+        } else if op == 3 {
+            // delete a short range
+            var len: usize = (1 + pick(8)) as usize
+            if at + len > n { len = n - at }
+            var j: usize = at
+            while j + len < n {
+                bset(out, j, rt.buf_at(out, j + len))
+                j = j + 1
+            }
+            rt.buf_set_len(out, n - len)
+        } else if op == 4 {
+            // duplicate a short range at the end
+            var len: usize = (1 + pick(40)) as usize
+            if at + len > n { len = n - at }
+            var j: usize = 0
+            while j < len {
+                rt.buf_push(out, rt.buf_at(out, at + j))
+                j = j + 1
+            }
+        } else if op == 5 {
+            // swap two bytes
+            let b: usize = (pick(n as u64)) as usize
+            let t: u8 = rt.buf_at(out, at)
+            bset(out, at, rt.buf_at(out, b))
+            bset(out, b, t)
+        } else {
+            // a run of one byte
+            var len: u64 = 1 + pick(60)
+            let c: u8 = interesting(pick(20))
+            while len > 0 {
+                rt.buf_push(out, c)
+                len = len - 1
+            }
+        }
+        k = k + 1
+    }
+}
+
+fn touch_prop(d: *mut content.Doc, p: usize, sink: *mut u64) {
+    var b: rt.Buf = rt.buf_new()
+    var m: rt.Buf = rt.buf_new()
+    vcard.text(d, p, &b)
+    var f: usize = 0
+    while f < 9 {
+        vcard.field(d, p, f, &b)
+        *sink = *sink + (vcard.field_item_count(d, p, f) as u64)
+        vcard.field_item(d, p, f, 1, &b)
+        f = f + 1
+    }
+    *sink = *sink + (vcard.item_count(d, p) as u64)
+    vcard.item(d, p, 2, &b)
+    *sink = *sink + (vcard.media(d, p, &b, &m) as u64)
+    var a: i64 = 0
+    var c: i64 = 0
+    var e: i64 = 0
+    if vcard.geo(d, p, &a, &c) { *sink = *sink + 1 }
+    if vcard.bday(d, p, &a, &c, &e) { *sink = *sink + 1 }
+    if vcard.has_type(d, p, "WORK") { *sink = *sink + 1 }
+    if vcard.is_pref(d, p) { *sink = *sink + 1 }
+    let np: usize = content.prop_param_count(d, p)
+    var k: usize = 0
+    while k < np {
+        *sink = *sink + (content.prop_param_name(d, p, k).n as u64) + (content.prop_param_value(d, p, k).n as u64)
+        k = k + 1
+    }
+    var dv: ical.DateVal = ical.DateVal { y: 0, m: 0, d: 0, hh: 0, mm: 0, ss: 0, date_only: false, utc: false }
+    if ical.parse_datetime(content.prop_value(d, p), &dv) { *sink = *sink + 1 }
+    var x: i64 = 0
+    var y: i64 = 0
+    if ical.parse_duration(content.prop_value(d, p), &x) { *sink = *sink + 1 }
+    if ical.parse_period(content.prop_value(d, p), &x, &y) { *sink = *sink + 1 }
+    if ical.parse_offset(content.prop_value(d, p), &x) { *sink = *sink + 1 }
+    rt.buf_free(&b)
+    rt.buf_free(&m)
+}
+
+fn bounded_expand(r: *mut rrule.Rule, start: i64, sink: *mut u64) {
+    var out: Vec[i64] = vec_new[i64]()
+    *sink = *sink + (rrule.expand(r, start, start, start + 40 * 86400, 40, &out) as u64) + (vec_len[i64](&out) as u64)
+    vec_free[i64](&out)
+}
+
+fn run_doc(text: str, sink: *mut u64) {
+    var d: content.Doc = content.doc_new()
+    *sink = *sink + (content.parse(text, &d) as u64)
+    var i: usize = 0
+    while i < content.prop_count(&d) {
+        touch_prop(&d, i, sink)
+        i = i + 1
+    }
+    var c: i64 = vcard.card_first(&d)
+    while c >= 0 {
+        *sink = *sink + (vcard.version(&d, c as usize) as u64)
+        var nm: rt.Buf = rt.buf_new()
+        vcard.display_name(&d, c as usize, &nm)
+        rt.buf_free(&nm)
+        c = vcard.card_next(&d, c)
+    }
+    // every component named VEVENT / VTODO anywhere: start, duration, a bounded expansion
+    var ci: usize = 0
+    while ci < content.comp_count(&d) {
+        let nm: str = content.comp_name(&d, ci)
+        if content.ieq(nm, "VEVENT") || content.ieq(nm, "VTODO") {
+            var s: i64 = 0
+            var date_only: bool = false
+            var utc: bool = false
+            var tz: str = ""
+            if ical.event_start(&d, ci, &s, &date_only, &utc, &tz) {
+                *sink = (*sink + ((ical.event_duration(&d, ci) as u64) & 4294967295)) & 4294967295
+                var occ: Vec[i64] = vec_new[i64]()
+                ical.occurrences(&d, ci, s, s + 40 * 86400, 40, &occ)
+                *sink = *sink + (vec_len[i64](&occ) as u64)
+                vec_free[i64](&occ)
+                var u: i64 = 0
+                if ical.local_to_utc(&d, tz, s, &u) { *sink = *sink + 1 }
+            }
+        }
+        if content.ieq(nm, "VTIMEZONE") {
+            var off: i64 = 0
+            if ical.tz_offset_local(&d, ci, 1700000000, &off) { *sink = *sink + 1 }
+        }
+        ci = ci + 1
+    }
+    // write, re-parse, write again: must be a fixed point after the first round
+    var w1: rt.Buf = rt.buf_new()
+    content.write(&d, &w1)
+    var d2: content.Doc = content.doc_new()
+    content.parse(str { p: rt.buf_data(&w1), n: rt.buf_len(&w1) }, &d2)
+    var w2: rt.Buf = rt.buf_new()
+    content.write(&d2, &w2)
+    var d3: content.Doc = content.doc_new()
+    content.parse(str { p: rt.buf_data(&w2), n: rt.buf_len(&w2) }, &d3)
+    var w3: rt.Buf = rt.buf_new()
+    content.write(&d3, &w3)
+    if !(rt.buf_len(&w2) == rt.buf_len(&w3) && rt.mem_eq(rt.buf_ptr(&w2), rt.buf_ptr(&w3), rt.buf_len(&w2))) {
+        unstable += 1
+        if unstable <= 2 {
+            rt.write_everything(1, "UNSTABLE input:\n".p as u64, 16)
+            rt.write_everything(1, text.p as u64, text.n)
+            rt.write_everything(1, "\n--- first write:\n".p as u64, 18)
+            rt.write_everything(1, rt.buf_ptr(&w2), rt.buf_len(&w2))
+            rt.write_everything(1, "--- second write:\n".p as u64, 18)
+            rt.write_everything(1, rt.buf_ptr(&w3), rt.buf_len(&w3))
+        }
+    }
+    rt.buf_free(&w1)
+    rt.buf_free(&w2)
+    rt.buf_free(&w3)
+    content.doc_free(&d)
+    content.doc_free(&d2)
+    content.doc_free(&d3)
+}
+
+fn run_rule(text: str, sink: *mut u64) {
+    var r: rrule.Rule = rrule.rule_new()
+    let st: u32 = rrule.parse(text, &r)
+    *sink = *sink + (st as u64)
+    if st == rrule.E_OK {
+        var b: rt.Buf = rt.buf_new()
+        rrule.format(&r, &b)
+        // a formatted rule must parse again
+        var r2: rrule.Rule = rrule.rule_new()
+        if rrule.parse(str { p: rt.buf_data(&b), n: rt.buf_len(&b) }, &r2) != rrule.E_OK {
+            failures += 1
+        }
+        rrule.rule_free(&r2)
+        rt.buf_free(&b)
+        bounded_expand(&r, civil.days_from_civil(2026, 10, 16) * 86400 + 9 * 3600, sink)
+        bounded_expand(&r, civil.days_from_civil(1, 1, 1) * 86400, sink)
+        bounded_expand(&r, civil.days_from_civil(9999, 12, 20) * 86400, sink)
+        rrule.until_to_local(&r, 3600)
+    }
+    rrule.rule_free(&r)
+}
+
+fn num_arg(start: u64, i: usize, dflt: u64) -> u64 {
+    if (rt.arg_count(start) as usize) <= i {
+        return dflt
+    }
+    let p: u64 = rt.arg_ptr(start, i)
+    let n: usize = rt.c_length(p)
+    var v: u64 = 0
+    var k: usize = 0
+    while k < n {
+        v = v * 10 + ((rt.ld8(p, k) - 48 as u8) as u64)
+        k = k + 1
+    }
+    return v
+}
+
+fn main(start: u64) -> i32 {
+    let count: u64 = num_arg(start, 1, 1500)
+    rng = num_arg(start, 2, 1) * 2 + 1
+    var sink: u64 = 0
+    var buf: rt.Buf = rt.buf_new()
+    var i: u64 = 0
+    while i < count {
+        if i % 4 == 3 {
+            mutate(rule_seed(pick(5)), &buf)
+            run_rule(str { p: rt.buf_data(&buf), n: rt.buf_len(&buf) }, &sink)
+        } else {
+            mutate(seed_text(pick(6)), &buf)
+            run_doc(str { p: rt.buf_data(&buf), n: rt.buf_len(&buf) }, &sink)
+        }
+        i = i + 1
+    }
+    rt.buf_free(&buf)
+    // the unmutated seeds are clean and stable
+    var s: u64 = 0
+    while s < 6 {
+        run_doc(seed_text(s), &sink)
+        s = s + 1
+    }
+    var line: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&line, "cal fuzz: ".p as u64, 10)
+    rt.buf_push_dec_u64(&line, count)
+    rt.buf_push_bytes(&line, " mutations, unstable writes ".p as u64, 28)
+    rt.buf_push_dec_i64(&line, unstable as i64)
+    rt.buf_push_bytes(&line, ", rule failures ".p as u64, 16)
+    rt.buf_push_dec_i64(&line, failures as i64)
+    rt.buf_push(&line, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&line), rt.buf_len(&line))
+    rt.buf_free(&line)
+    if failures == 0 && unstable == 0 {
+        return 0
+    }
+    return 1
+}

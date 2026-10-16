@@ -1,0 +1,761 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/cal/vcard.fi -- cal.vcard: vCard 2.1, 3.0 and 4.0 (RFC 6350, RFC 2426, vCard 2.1 spec) on top of
+// cal.content: version detection, TYPE / PREF lookup, structured values (N, ADR), TEXT decoding
+// (escapes, 2.1 quoted-printable, CHARSET=ISO-8859-1), PHOTO / LOGO / SOUND / KEY payloads (base64
+// and 4.0 data: URIs), GEO, BDAY and builders for a card you write yourself.
+//
+//     import cal.content
+//     import cal.vcard
+//     var d: content.Doc = content.doc_new()
+//     content.parse(text, &d)
+//     var card: i64 = vcard.card_first(&d)                          // next: vcard.card_next(&d, card)
+//     var ver: u32 = vcard.version(&d, card as usize)               // 21, 30, 40 (0 = unknown)
+//     var n: i64 = content.find_prop(&d, card as usize, "N", -1)
+//     var out: rt.Buf = rt.buf_new()
+//     vcard.field(&d, n as usize, vcard.N_FAMILY, &out)             // one component of N, decoded UTF-8
+//     var tel: i64 = content.find_prop(&d, card as usize, "TEL", -1)
+//     vcard.has_type(&d, tel as usize, "CELL")                      // TYPE=CELL in any of the three notations
+//     vcard.media(&d, photo as usize, &bytes, &mime)                // MEDIA_BINARY / MEDIA_URI / MEDIA_BAD
+//
+//     // building (ver = 21 / 30 / 40)
+//     vcard.begin_card(&d, 30)
+//     vcard.add_text(&d, 30, "FN", "Max Mustermann")
+//     vcard.add_n(&d, 30, "Mustermann", "Max", "", "", "")
+//     vcard.add_adr(&d, 30, "", "", "Hauptstr. 1", "Wien", "", "1010", "Austria"); vcard.add_type(&d, "HOME")
+//     vcard.add_media(&d, 30, "PHOTO", "image/jpeg", bytes_ptr, bytes_len)
+//     vcard.end_card(&d)
+//     content.write(&d, &out)
+//
+// THE THREE VERSIONS differ in the notation, not in the model: TYPE is `TYPE=HOME;TYPE=VOICE`,
+// `TYPE=HOME,VOICE`, `TYPE="home,voice"` or (2.1) the bare `HOME;VOICE`; a photo is `ENCODING=BASE64`
+// (2.1), `ENCODING=b` (3.0) or `data:image/jpeg;base64,...` (4.0). Every reader here accepts all of them.
+//
+// HONEST
+// V1  Bytes, no validation: property names, TYPE values and structure are not checked against the
+//     RFC value lists. A card with a missing VERSION is read as version 0 (everything still works).
+// V2  CHARSET: only ISO-8859-1 / Latin-1 (and windows-1252, approximated as Latin-1) is converted;
+//     other charsets are passed through unchanged. A 2.1 card without CHARSET is taken as it stands.
+// V3  The 2.1 writer puts non-ASCII text and line breaks in quoted-printable with CHARSET=UTF-8; it
+//     folds long base64 values like the other versions and does NOT add the blank line that strict
+//     2.1 readers want after a base64 value (this lib reads files with and without it).
+// V4  Version conversion (2.1 -> 4.0) is not done; read and write are per version.
+// V5  GEO and BDAY give integers: micro-degrees (rounded) and y/m/d (y = 0 when the year is missing).
+// V6  No vCard group semantics (item1.X-ABLabel) beyond what cal.content keeps: the group name.
+
+import std.rt
+import std.vec
+import std.base64
+import cal.civil
+import cal.content
+
+export {
+    V21, V30, V40,
+    N_FAMILY, N_GIVEN, N_ADDITIONAL, N_PREFIX, N_SUFFIX,
+    ADR_POBOX, ADR_EXT, ADR_STREET, ADR_LOCALITY, ADR_REGION, ADR_CODE, ADR_COUNTRY,
+    MEDIA_NONE, MEDIA_BINARY, MEDIA_URI, MEDIA_BAD,
+    card_first, card_next, version, has_type, is_pref, text, field, field_count, field_item_count, field_item,
+    item_count, item, display_name, media, geo, bday,
+    begin_card, end_card, add_text, add_n, add_adr, add_type, add_media, add_geo,
+}
+
+const V21: u32 = 21
+const V30: u32 = 30
+const V40: u32 = 40
+
+const N_FAMILY: usize = 0
+const N_GIVEN: usize = 1
+const N_ADDITIONAL: usize = 2
+const N_PREFIX: usize = 3
+const N_SUFFIX: usize = 4
+
+const ADR_POBOX: usize = 0
+const ADR_EXT: usize = 1
+const ADR_STREET: usize = 2
+const ADR_LOCALITY: usize = 3
+const ADR_REGION: usize = 4
+const ADR_CODE: usize = 5
+const ADR_COUNTRY: usize = 6
+
+const MEDIA_NONE: u32 = 0
+const MEDIA_BINARY: u32 = 1
+const MEDIA_URI: u32 = 2
+const MEDIA_BAD: u32 = 3
+
+fn at(s: str, i: usize) -> u8 {
+    return rt.ld8(s.p as u64, i)
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+fn upper(c: u8) -> u8 {
+    if c >= 97 as u8 && c <= 122 as u8 {
+        return c - 32 as u8
+    }
+    return c
+}
+
+fn of_buf(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn trim(s: str) -> str {
+    var a: usize = 0
+    var b: usize = s.n
+    while a < b && (at(s, a) == 32 as u8 || at(s, a) == 9 as u8 || at(s, a) == 34 as u8) { a = a + 1 }
+    while b > a && (at(s, b - 1) == 32 as u8 || at(s, b - 1) == 9 as u8 || at(s, b - 1) == 34 as u8) { b = b - 1 }
+    return str { p: s.p + a, n: b - a }
+}
+
+// ------------------------------------------------------------------ cards and versions
+
+// The first / next top-level VCARD component; -1 at the end.
+fn card_first(d: *mut content.Doc) -> i64 {
+    return content.find_comp(d, -1, "VCARD", -1)
+}
+
+fn card_next(d: *mut content.Doc, card: i64) -> i64 {
+    return content.find_comp(d, -1, "VCARD", card)
+}
+
+// 21, 30 or 40 from the VERSION property of `card`; 0 when it is missing or something else.
+fn version(d: *mut content.Doc, card: usize) -> u32 {
+    let p: i64 = content.find_prop(d, card, "VERSION", -1)
+    if p < 0 {
+        return 0
+    }
+    let v: str = trim(content.prop_value(d, p as usize))
+    if v.n == 3 && at(v, 1) == 46 as u8 {
+        let a: u8 = at(v, 0)
+        let b: u8 = at(v, 2)
+        if a == 50 as u8 && b == 49 as u8 { return V21 }
+        if a == 51 as u8 && b == 48 as u8 { return V30 }
+        if a == 52 as u8 && b == 48 as u8 { return V40 }
+    }
+    return 0
+}
+
+// ------------------------------------------------------------------ TYPE and PREF
+
+// Is `t` one of the TYPE values of property `p`? Parameters written TYPE=a;TYPE=b, TYPE=a,b,
+// TYPE="a,b" or (2.1) bare are all seen. Case-insensitive.
+fn has_type(d: *mut content.Doc, p: usize, t: str) -> bool {
+    let n: usize = content.prop_param_count(d, p)
+    var k: usize = 0
+    while k < n {
+        if content.ieq(content.prop_param_name(d, p, k), "TYPE") {
+            let v: str = content.prop_param_value(d, p, k)
+            let cnt: usize = content.split_count(v, 44 as u8)
+            var j: usize = 0
+            while j < cnt {
+                if content.ieq(trim(content.split_at(v, 44 as u8, j)), t) {
+                    return true
+                }
+                j = j + 1
+            }
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// Marked as preferred: TYPE=PREF (2.1 / 3.0) or a PREF parameter (4.0).
+fn is_pref(d: *mut content.Doc, p: usize) -> bool {
+    return has_type(d, p, "PREF") || content.has_param(d, p, "PREF")
+}
+
+// ------------------------------------------------------------------ TEXT decoding
+
+fn has_param_value(d: *mut content.Doc, p: usize, name: str, want: str) -> bool {
+    let n: usize = content.prop_param_count(d, p)
+    var k: usize = 0
+    while k < n {
+        if content.ieq(content.prop_param_name(d, p, k), name) && content.ieq(trim(content.prop_param_value(d, p, k)), want) {
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// 2.1 quoted-printable: ENCODING=QUOTED-PRINTABLE or the bare QUOTED-PRINTABLE.
+fn is_qp(d: *mut content.Doc, p: usize) -> bool {
+    let n: usize = content.prop_param_count(d, p)
+    var k: usize = 0
+    while k < n {
+        if content.ieq(trim(content.prop_param_value(d, p, k)), "QUOTED-PRINTABLE") {
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+fn is_latin1(d: *mut content.Doc, p: usize) -> bool {
+    let cs: str = trim(content.param(d, p, "CHARSET"))
+    return content.ieq(cs, "ISO-8859-1") || content.ieq(cs, "ISO8859-1") || content.ieq(cs, "LATIN1") || content.ieq(cs, "LATIN-1") || content.ieq(cs, "WINDOWS-1252") || content.ieq(cs, "CP1252")
+}
+
+// One piece of a value (already split at the structure separators): quoted-printable, charset
+// and TEXT escapes undone, appended to `out` as UTF-8.
+fn decode_part(d: *mut content.Doc, p: usize, raw: str, out: *mut rt.Buf) {
+    var a: rt.Buf = rt.buf_new()
+    if is_qp(d, p) {
+        content.qp_decode(raw, &a)
+    } else {
+        rt.buf_push_bytes(&a, raw.p as u64, raw.n)
+    }
+    var b: rt.Buf = rt.buf_new()
+    if is_latin1(d, p) {
+        var i: usize = 0
+        while i < rt.buf_len(&a) {
+            let c: u8 = rt.buf_at(&a, i)
+            if c >= 128 as u8 {
+                rt.buf_push(&b, 192 as u8 | (c >> 6 as u8))
+                rt.buf_push(&b, 128 as u8 | (c & 63 as u8))
+            } else {
+                rt.buf_push(&b, c)
+            }
+            i = i + 1
+        }
+    } else {
+        rt.buf_push_bytes(&b, rt.buf_ptr(&a), rt.buf_len(&a))
+    }
+    content.text_unescape(of_buf(&b), out)
+    rt.buf_free(&a)
+    rt.buf_free(&b)
+}
+
+// The whole value of a single-valued TEXT property (FN, NOTE, TITLE, ORG without structure, ...).
+fn text(d: *mut content.Doc, p: usize, out: *mut rt.Buf) {
+    decode_part(d, p, content.prop_value(d, p), out)
+}
+
+// Number of `;` separated components (N has 5, ADR 7 when complete).
+fn field_count(d: *mut content.Doc, p: usize) -> usize {
+    return content.split_count(content.prop_value(d, p), 59 as u8)
+}
+
+// Component `idx` (N_FAMILY .., ADR_STREET ..) decoded; nothing is appended when there is no such one.
+fn field(d: *mut content.Doc, p: usize, idx: usize, out: *mut rt.Buf) {
+    if idx >= field_count(d, p) {
+        return
+    }
+    decode_part(d, p, content.split_at(content.prop_value(d, p), 59 as u8, idx), out)
+}
+
+// A component may hold a `,` list (4.0: several given names, several street lines).
+fn field_item_count(d: *mut content.Doc, p: usize, idx: usize) -> usize {
+    if idx >= field_count(d, p) {
+        return 0
+    }
+    return content.split_count(content.split_at(content.prop_value(d, p), 59 as u8, idx), 44 as u8)
+}
+
+fn field_item(d: *mut content.Doc, p: usize, idx: usize, k: usize, out: *mut rt.Buf) {
+    if idx >= field_count(d, p) {
+        return
+    }
+    decode_part(d, p, content.split_at(content.split_at(content.prop_value(d, p), 59 as u8, idx), 44 as u8, k), out)
+}
+
+// `,` separated list values (NICKNAME, CATEGORIES): count and item `k`, decoded.
+fn item_count(d: *mut content.Doc, p: usize) -> usize {
+    return content.split_count(content.prop_value(d, p), 44 as u8)
+}
+
+fn item(d: *mut content.Doc, p: usize, k: usize, out: *mut rt.Buf) {
+    decode_part(d, p, content.split_at(content.prop_value(d, p), 44 as u8, k), out)
+}
+
+// Display order of the N components: prefix, given, additional, family, suffix.
+fn n_order(k: usize) -> usize {
+    if k == 0 { return N_PREFIX }
+    if k == 1 { return N_GIVEN }
+    if k == 2 { return N_ADDITIONAL }
+    if k == 3 { return N_FAMILY }
+    return N_SUFFIX
+}
+
+// What to show for a card: FN, else the N parts "prefix given additional family suffix", else the
+// first ORG component, else the first EMAIL. Appends nothing when the card has none of them.
+fn display_name(d: *mut content.Doc, card: usize, out: *mut rt.Buf) {
+    let f: i64 = content.find_prop(d, card, "FN", -1)
+    if f >= 0 {
+        let before: usize = rt.buf_len(out)
+        text(d, f as usize, out)
+        if rt.buf_len(out) > before {
+            return
+        }
+    }
+    let n: i64 = content.find_prop(d, card, "N", -1)
+    if n >= 0 {
+        var k: usize = 0
+        while k < 5 {
+            var part: rt.Buf = rt.buf_new()
+            field(d, n as usize, n_order(k), &part)
+            if rt.buf_len(&part) > 0 {
+                if rt.buf_len(out) > 0 {
+                    rt.buf_push(out, 32 as u8)
+                }
+                rt.buf_push_bytes(out, rt.buf_ptr(&part), rt.buf_len(&part))
+            }
+            rt.buf_free(&part)
+            k = k + 1
+        }
+        if rt.buf_len(out) > 0 {
+            return
+        }
+    }
+    let o: i64 = content.find_prop(d, card, "ORG", -1)
+    if o >= 0 {
+        field(d, o as usize, 0, out)
+        if rt.buf_len(out) > 0 {
+            return
+        }
+    }
+    let e: i64 = content.find_prop(d, card, "EMAIL", -1)
+    if e >= 0 {
+        text(d, e as usize, out)
+    }
+}
+
+// ------------------------------------------------------------------ binary payloads
+
+fn push_lower(b: *mut rt.Buf, s: str) {
+    var i: usize = 0
+    while i < s.n {
+        rt.buf_push(b, lower(at(s, i)))
+        i = i + 1
+    }
+}
+
+fn percent_decode(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = at(s, i)
+        if c == 37 as u8 && i + 2 < s.n {
+            let h: i32 = content.hex_value(at(s, i + 1))
+            let l: i32 = content.hex_value(at(s, i + 2))
+            if h >= 0 && l >= 0 {
+                rt.buf_push(out, (h * 16 + l) as u8)
+                i = i + 3
+                continue
+            }
+        }
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+}
+
+// The media type from a TYPE value such as JPEG / PNG: "jpeg" for PHOTO / LOGO gets "image/".
+fn mime_from_type(prop: str, t: str, out: *mut rt.Buf) {
+    var k: usize = 0
+    var slash: bool = false
+    while k < t.n {
+        if at(t, k) == 47 as u8 { slash = true }
+        k = k + 1
+    }
+    if !slash && (content.ieq(prop, "PHOTO") || content.ieq(prop, "LOGO")) {
+        push_lower(out, "image/")
+        if content.ieq(t, "JPG") {
+            push_lower(out, "jpeg")
+            return
+        }
+    }
+    push_lower(out, t)
+}
+
+// Reads a PHOTO / LOGO / SOUND / KEY property. MEDIA_BINARY: `bytes` holds the payload, `mime` the
+// media type ("" if unknown). MEDIA_URI: `bytes` holds the URI. MEDIA_BAD: broken base64 / data URI.
+// MEDIA_NONE: the value is empty.
+fn media(d: *mut content.Doc, p: usize, bytes: *mut rt.Buf, mime: *mut rt.Buf) -> u32 {
+    let v: str = trim(content.prop_value(d, p))
+    let name: str = content.prop_name(d, p)
+    if v.n == 0 {
+        return MEDIA_NONE
+    }
+    // a "mediatype" parameter (4.0 with an URI) or a TYPE value
+    var mt: str = trim(content.param(d, p, "MEDIATYPE"))
+    if v.n >= 5 && content.ieq(str { p: v.p, n: 5 }, "data:") {
+        // data:[<mediatype>][;base64],<data>
+        var comma: usize = 5
+        while comma < v.n && at(v, comma) != 44 as u8 {
+            comma = comma + 1
+        }
+        if comma >= v.n {
+            return MEDIA_BAD
+        }
+        let head: str = str { p: v.p + 5, n: comma - 5 }
+        let semi: usize = content.split_count(head, 59 as u8)
+        let first: str = content.split_at(head, 59 as u8, 0)
+        push_lower(mime, first)
+        var b64: bool = false
+        var j: usize = 1
+        while j < semi {
+            if content.ieq(content.split_at(head, 59 as u8, j), "base64") {
+                b64 = true
+            }
+            j = j + 1
+        }
+        let payload: str = str { p: v.p + comma + 1, n: v.n - comma - 1 }
+        if b64 {
+            if !base64.decode(payload.p as u64, payload.n, bytes) {
+                return MEDIA_BAD
+            }
+        } else {
+            percent_decode(payload, bytes)
+        }
+        return MEDIA_BINARY
+    }
+    let enc: str = trim(content.param(d, p, "ENCODING"))
+    if content.ieq(enc, "b") || content.ieq(enc, "BASE64") || content.ieq(enc, "B64") {
+        if mt.n > 0 {
+            push_lower(mime, mt)
+        } else {
+            let t: str = trim(content.param(d, p, "TYPE"))
+            if t.n > 0 {
+                mime_from_type(name, t, mime)
+            }
+        }
+        if !base64.decode(v.p as u64, v.n, bytes) {
+            return MEDIA_BAD
+        }
+        return MEDIA_BINARY
+    }
+    if mt.n > 0 {
+        push_lower(mime, mt)
+    }
+    rt.buf_push_bytes(bytes, v.p as u64, v.n)
+    return MEDIA_URI
+}
+
+// ------------------------------------------------------------------ GEO and BDAY
+
+// Decimal degrees "-122.082932" -> micro-degrees, rounded half away from zero. False on junk.
+fn micro(s0: str, out: *mut i64) -> bool {
+    let s: str = trim(s0)
+    var i: usize = 0
+    var neg: bool = false
+    if i < s.n && (at(s, i) == 45 as u8 || at(s, i) == 43 as u8) {
+        neg = at(s, i) == 45 as u8
+        i = i + 1
+    }
+    var whole: i64 = 0
+    var nd: usize = 0
+    while i < s.n && at(s, i) >= 48 as u8 && at(s, i) <= 57 as u8 {
+        whole = whole * 10 + ((at(s, i) - 48 as u8) as i64)
+        if whole > 1000000 { return false }
+        nd = nd + 1
+        i = i + 1
+    }
+    var frac: i64 = 0
+    var fd: usize = 0
+    var round_up: bool = false
+    if i < s.n && at(s, i) == 46 as u8 {
+        i = i + 1
+        while i < s.n && at(s, i) >= 48 as u8 && at(s, i) <= 57 as u8 {
+            if fd < 6 {
+                frac = frac * 10 + ((at(s, i) - 48 as u8) as i64)
+            } else if fd == 6 {
+                round_up = at(s, i) >= 53 as u8
+            }
+            fd = fd + 1
+            nd = nd + 1
+            i = i + 1
+        }
+    }
+    if i != s.n || nd == 0 {
+        return false
+    }
+    var k: usize = fd
+    while k < 6 {
+        frac = frac * 10
+        k = k + 1
+    }
+    var v: i64 = whole * 1000000 + frac
+    if round_up { v = v + 1 }
+    if neg { v = 0 - v }
+    *out = v
+    return true
+}
+
+// GEO in 3.0 "37.386;-122.082" or 4.0 "geo:37.386,-122.082" -> micro-degrees. False when malformed
+// or out of range (|lat| <= 90, |lon| <= 180).
+fn geo(d: *mut content.Doc, p: usize, lat: *mut i64, lon: *mut i64) -> bool {
+    var v: str = trim(content.prop_value(d, p))
+    if v.n >= 4 && content.ieq(str { p: v.p, n: 4 }, "geo:") {
+        v = str { p: v.p + 4, n: v.n - 4 }
+        // drop ";u=..." parameters
+        let cut: str = content.split_at(v, 59 as u8, 0)
+        v = cut
+        if content.split_count(v, 44 as u8) != 2 { return false }
+        var a: i64 = 0
+        var b: i64 = 0
+        if !micro(content.split_at(v, 44 as u8, 0), &a) || !micro(content.split_at(v, 44 as u8, 1), &b) { return false }
+        if a > 90000000 || a < -90000000 || b > 180000000 || b < -180000000 { return false }
+        *lat = a
+        *lon = b
+        return true
+    }
+    if content.split_count(v, 59 as u8) != 2 { return false }
+    var a: i64 = 0
+    var b: i64 = 0
+    if !micro(content.split_at(v, 59 as u8, 0), &a) || !micro(content.split_at(v, 59 as u8, 1), &b) { return false }
+    if a > 90000000 || a < -90000000 || b > 180000000 || b < -180000000 { return false }
+    *lat = a
+    *lon = b
+    return true
+}
+
+fn digits(s: str, a: usize, n: usize, out: *mut i64) -> bool {
+    if a + n > s.n { return false }
+    var v: i64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = at(s, a + i)
+        if c < 48 as u8 || c > 57 as u8 { return false }
+        v = v * 10 + ((c - 48 as u8) as i64)
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+// BDAY / ANNIVERSARY: 1996-04-15, 19960415, --0415, --04-15, optionally followed by a time.
+// `y` is 0 when the year is missing. False on anything else (also an impossible date).
+fn bday(d: *mut content.Doc, p: usize, y: *mut i64, m: *mut i64, day: *mut i64) -> bool {
+    let v0: str = trim(content.prop_value(d, p))
+    var e: usize = 0
+    while e < v0.n && at(v0, e) != 84 as u8 && at(v0, e) != 116 as u8 { e = e + 1 }
+    let v: str = str { p: v0.p, n: e }
+    var yy: i64 = 0
+    var mm: i64 = 0
+    var dd: i64 = 0
+    var ok: bool = false
+    if v.n == 8 {
+        ok = digits(v, 0, 4, &yy) && digits(v, 4, 2, &mm) && digits(v, 6, 2, &dd)
+    } else if v.n == 10 && at(v, 4) == 45 as u8 && at(v, 7) == 45 as u8 {
+        ok = digits(v, 0, 4, &yy) && digits(v, 5, 2, &mm) && digits(v, 8, 2, &dd)
+    } else if v.n == 6 && at(v, 0) == 45 as u8 && at(v, 1) == 45 as u8 {
+        ok = digits(v, 2, 2, &mm) && digits(v, 4, 2, &dd)
+    } else if v.n == 7 && at(v, 0) == 45 as u8 && at(v, 1) == 45 as u8 && at(v, 4) == 45 as u8 {
+        ok = digits(v, 2, 2, &mm) && digits(v, 5, 2, &dd)
+    }
+    if !ok || mm < 1 || mm > 12 || dd < 1 || dd > 31 {
+        return false
+    }
+    if yy > 0 {
+        if !civil.valid(yy as i32, mm as u32, dd as u32) { return false }
+    } else if !civil.valid(2000, mm as u32, dd as u32) {
+        return false
+    }
+    *y = yy
+    *m = mm
+    *day = dd
+    return true
+}
+
+// ------------------------------------------------------------------ building
+
+fn is_ascii_plain(s: str) -> bool {
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = at(s, i)
+        if c >= 127 as u8 || c < 32 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn hex_digit(v: u8) -> u8 {
+    if v < 10 as u8 { return 48 as u8 + v }
+    return 55 as u8 + v
+}
+
+// 2.1: ";" needs a backslash, "," does not. 3.0 / 4.0: the usual TEXT escapes.
+fn escape_for(ver: u32, s: str, out: *mut rt.Buf) {
+    if ver == V21 {
+        var i: usize = 0
+        while i < s.n {
+            let c: u8 = at(s, i)
+            if c == 59 as u8 || c == 92 as u8 {
+                rt.buf_push(out, 92 as u8)
+            }
+            rt.buf_push(out, c)
+            i = i + 1
+        }
+        return
+    }
+    content.text_escape(s, out)
+}
+
+// Up to seven TEXT pieces of a structured value.
+struct Parts {
+    v0: str,
+    v1: str,
+    v2: str,
+    v3: str,
+    v4: str,
+    v5: str,
+    v6: str,
+    n: usize,
+}
+
+fn part_at(p: *mut Parts, i: usize) -> str {
+    if i == 0 { return (*p).v0 }
+    if i == 1 { return (*p).v1 }
+    if i == 2 { return (*p).v2 }
+    if i == 3 { return (*p).v3 }
+    if i == 4 { return (*p).v4 }
+    if i == 5 { return (*p).v5 }
+    return (*p).v6
+}
+
+// Adds the TEXT pieces joined by ";" as one property value; 2.1 gets quoted-printable + CHARSET=UTF-8
+// when a piece is not plain printable ASCII.
+fn add_joined(d: *mut content.Doc, ver: u32, name: str, parts: *mut Parts) -> i64 {
+    let n: usize = (*parts).n
+    var plain: bool = true
+    var i: usize = 0
+    while i < n {
+        if !is_ascii_plain(part_at(parts, i)) { plain = false }
+        i = i + 1
+    }
+    var b: rt.Buf = rt.buf_new()
+    i = 0
+    while i < n {
+        if i > 0 {
+            rt.buf_push(&b, 59 as u8)
+        }
+        if ver == V21 && !plain {
+            var e: rt.Buf = rt.buf_new()
+            escape_for(ver, part_at(parts, i), &e)
+            content.qp_encode(of_buf(&e), &b)
+            rt.buf_free(&e)
+        } else {
+            escape_for(ver, part_at(parts, i), &b)
+        }
+        i = i + 1
+    }
+    let p: i64 = content.add_prop(d, "", name, of_buf(&b))
+    rt.buf_free(&b)
+    if p >= 0 && ver == V21 && !plain {
+        content.add_param(d, "CHARSET", "UTF-8")
+        content.add_param(d, "ENCODING", "QUOTED-PRINTABLE")
+    }
+    return p
+}
+
+// BEGIN:VCARD + VERSION (ver 21, 30 or 40; anything else is written as 3.0).
+fn begin_card(d: *mut content.Doc, ver: u32) {
+    content.begin(d, "VCARD")
+    if ver == V21 {
+        content.add_prop(d, "", "VERSION", "2.1")
+    } else if ver == V40 {
+        content.add_prop(d, "", "VERSION", "4.0")
+    } else {
+        content.add_prop(d, "", "VERSION", "3.0")
+    }
+}
+
+fn end_card(d: *mut content.Doc) {
+    content.end(d)
+}
+
+// A single-valued TEXT property (FN, NOTE, TITLE, EMAIL, TEL, ...).
+fn add_text(d: *mut content.Doc, ver: u32, name: str, value: str) -> i64 {
+    var parts: Parts = Parts { v0: value, v1: "", v2: "", v3: "", v4: "", v5: "", v6: "", n: 1 }
+    return add_joined(d, ver, name, &parts)
+}
+
+fn add_n(d: *mut content.Doc, ver: u32, family: str, given: str, additional: str, prefix: str, suffix: str) -> i64 {
+    var parts: Parts = Parts { v0: family, v1: given, v2: additional, v3: prefix, v4: suffix, v5: "", v6: "", n: 5 }
+    return add_joined(d, ver, "N", &parts)
+}
+
+fn add_adr(d: *mut content.Doc, ver: u32, pobox: str, ext: str, street: str, locality: str, region: str, code: str, country: str) -> i64 {
+    var parts: Parts = Parts { v0: pobox, v1: ext, v2: street, v3: locality, v4: region, v5: code, v6: country, n: 7 }
+    return add_joined(d, ver, "ADR", &parts)
+}
+
+// Adds a TYPE value to the property added last (TYPE=HOME; write it again for more).
+fn add_type(d: *mut content.Doc, t: str) {
+    content.add_param(d, "TYPE", t)
+}
+
+// GEO from micro-degrees: 3.0 / 2.1 "lat;lon", 4.0 "geo:lat,lon".
+fn add_geo(d: *mut content.Doc, ver: u32, lat: i64, lon: i64) -> i64 {
+    var b: rt.Buf = rt.buf_new()
+    if ver == V40 {
+        rt.buf_push_bytes(&b, "geo:".p as u64, 4)
+    }
+    push_micro(&b, lat)
+    if ver == V40 {
+        rt.buf_push(&b, 44 as u8)
+    } else {
+        rt.buf_push(&b, 59 as u8)
+    }
+    push_micro(&b, lon)
+    let p: i64 = content.add_prop(d, "", "GEO", of_buf(&b))
+    rt.buf_free(&b)
+    return p
+}
+
+fn push_micro(b: *mut rt.Buf, v: i64) {
+    var a: i64 = v
+    if a < 0 {
+        rt.buf_push(b, 45 as u8)
+        a = 0 - a
+    }
+    rt.buf_push_dec_i64(b, a / 1000000)
+    rt.buf_push(b, 46 as u8)
+    let f: i64 = a % 1000000
+    var div: i64 = 100000
+    while div > 0 {
+        rt.buf_push(b, 48 as u8 + (((f / div) % 10) as u8))
+        div = div / 10
+    }
+}
+
+// PHOTO / LOGO / SOUND / KEY with a binary payload: 4.0 data: URI, 3.0 ENCODING=b, 2.1 ENCODING=BASE64
+// (both with TYPE=<subtype in capitals>). `mime` is "image/jpeg" style; "" is written without type.
+fn add_media(d: *mut content.Doc, ver: u32, name: str, mime: str, data: u64, n: usize) -> i64 {
+    var b: rt.Buf = rt.buf_new()
+    if ver == V40 {
+        rt.buf_push_bytes(&b, "data:".p as u64, 5)
+        rt.buf_push_bytes(&b, mime.p as u64, mime.n)
+        rt.buf_push_bytes(&b, ";base64,".p as u64, 8)
+    }
+    base64.encode(data, n, &b)
+    let p: i64 = content.add_prop(d, "", name, of_buf(&b))
+    rt.buf_free(&b)
+    if p >= 0 && ver != V40 {
+        if ver == V21 {
+            content.add_param(d, "ENCODING", "BASE64")
+        } else {
+            content.add_param(d, "ENCODING", "b")
+        }
+        var sub: usize = 0
+        while sub < mime.n && at(mime, sub) != 47 as u8 {
+            sub = sub + 1
+        }
+        if sub < mime.n {
+            var t: rt.Buf = rt.buf_new()
+            var i: usize = sub + 1
+            while i < mime.n {
+                rt.buf_push(&t, upper(at(mime, i)))
+                i = i + 1
+            }
+            content.add_param(d, "TYPE", of_buf(&t))
+            rt.buf_free(&t)
+        }
+    }
+    return p
+}

@@ -48,7 +48,7 @@ export {
     prop_name, prop_group, prop_value, prop_line, prop_param_count, prop_param_name, prop_param_value, param, has_param,
     find_comp, find_prop, error_flags, error_line, name_eq,
     begin, end, add_prop, add_param, set_prop_value,
-    text_escape, text_unescape, split_count, split_at, qp_decode, ieq,
+    text_escape, text_unescape, split_count, split_at, qp_decode, qp_encode, hex_value, ieq,
 }
 
 const NONE: i64 = -1
@@ -261,9 +261,9 @@ fn add_prop_line(d: *mut Doc, group: str, name: str, value: str, line: usize) ->
     let no: usize = stash(d, name.p, name.n)
     let vo: usize = stash(d, value.p, value.n)
     vec_push[Prop](&(*d).props, Prop {
-        group_o: go, group_n: group.n, name_o: no, name_n: name.n, val_o: vo, val_n: value.n, comp: comp, next: -1,
-        first_param: vec_len[Param](&(*d).params), nparams: 0, line: line,
-    })
+            group_o: go, group_n: group.n, name_o: no, name_n: name.n, val_o: vo, val_n: value.n, comp: comp, next: -1,
+            first_param: vec_len[Param](&(*d).params), nparams: 0, line: line,
+        })
     let c: *mut Comp = comp_at(d, comp)
     if (*c).last_prop >= 0 {
         (*prop_at(d, (*c).last_prop as usize)).next = idx as i64
@@ -308,23 +308,59 @@ fn is_ws(c: u8) -> bool {
     return c == 32 as u8 || c == 9 as u8
 }
 
-// Does `ln[0..n)` before its first unquoted ':' mention QUOTED-PRINTABLE?
-fn has_qp(ln: str) -> bool {
-    var i: usize = 0
-    var quoted: bool = false
-    let key: str = "QUOTED-PRINTABLE"
-    while i < ln.n {
-        let c: u8 = at(ln, i)
-        if c == 34 as u8 {
-            quoted = !quoted
+// The octet index of the ':' that ends the name and the parameters of a content line, or ln.n when
+// there is none. ONE grammar for the whole parser: a parameter value is either "quoted" (up to the
+// closing quote; ; : , inside are text) or plain (up to , ; or :); a stray quote inside a plain value
+// is an ordinary octet.
+fn find_colon(ln: str) -> usize {
+    let n: usize = ln.n
+    var k: usize = 0
+    while k < n && at(ln, k) != 59 as u8 && at(ln, k) != 58 as u8 {
+        k = k + 1
+    }
+    while k < n {
+        if at(ln, k) == 58 as u8 {
+            return k
         }
-        if c == 58 as u8 && !quoted {
-            return false
+        // at ';': a parameter
+        k = k + 1
+        while k < n && at(ln, k) != 61 as u8 && at(ln, k) != 59 as u8 && at(ln, k) != 58 as u8 {
+            k = k + 1
         }
-        if !quoted && up(c) == 81 as u8 && i + key.n <= ln.n {
-            if ieq(str { p: ln.p + i, n: key.n }, key) {
-                return true
+        if k < n && at(ln, k) == 61 as u8 {
+            k = k + 1
+            while true {
+                if k < n && at(ln, k) == 34 as u8 {
+                    k = k + 1
+                    while k < n && at(ln, k) != 34 as u8 {
+                        k = k + 1
+                    }
+                    if k < n {
+                        k = k + 1
+                    }
+                }
+                while k < n && at(ln, k) != 44 as u8 && at(ln, k) != 59 as u8 && at(ln, k) != 58 as u8 {
+                    k = k + 1
+                }
+                if k < n && at(ln, k) == 44 as u8 {
+                    k = k + 1
+                    continue
+                }
+                break
             }
+        }
+    }
+    return n
+}
+
+// Does the name / parameter part of the line mention QUOTED-PRINTABLE?
+fn has_qp(ln: str) -> bool {
+    let end: usize = find_colon(ln)
+    let key: str = "QUOTED-PRINTABLE"
+    var i: usize = 0
+    while i + key.n <= end {
+        if up(at(ln, i)) == 81 as u8 && ieq(str { p: ln.p + i, n: key.n }, key) {
+            return true
         }
         i = i + 1
     }
@@ -371,13 +407,14 @@ fn parse_line(d: *mut Doc, ln: str, line_no: usize) {
         }
         i = i + 1
     }
-    if i >= n && true {
+    if i >= n {
         flag(d, E_BAD_LINE, line_no)
         return
     }
     var group: str = ""
     var name: str = str { p: ln.p, n: i }
-    if dot < i {
+    if dot < i && dot > 0 {
+        // (a dot in the first octet is part of the name: an empty group could not be written back)
         group = str { p: ln.p, n: dot }
         name = str { p: ln.p + dot + 1, n: i - dot - 1 }
     }
@@ -385,18 +422,8 @@ fn parse_line(d: *mut Doc, ln: str, line_no: usize) {
         flag(d, E_BAD_LINE, line_no)
         return
     }
-    // find the ':' that ends the parameters (quotes protect), without building anything yet
-    var j: usize = i
-    var quoted: bool = false
-    while j < n {
-        let c: u8 = at(ln, j)
-        if c == 34 as u8 {
-            quoted = !quoted
-        } else if c == 58 as u8 && !quoted {
-            break
-        }
-        j = j + 1
-    }
+    // the ':' that ends the parameters (same grammar as the parameter scan below)
+    let j: usize = find_colon(ln)
     if j >= n {
         flag(d, E_BAD_LINE, line_no)
         return
@@ -497,6 +524,9 @@ fn parse_line(d: *mut Doc, ln: str, line_no: usize) {
 
 // Parses `text` (an iCalendar or vCard stream, any number of top-level components) INTO `d`.
 // Returns the error flags (0 = clean); `d` is always usable.
+// A physical line that starts with SPACE / TAB continues the logical line (one octet dropped); a
+// logical line with QUOTED-PRINTABLE parameters that ends in `=` continues on the next physical
+// line as it stands (soft break, nothing dropped).
 fn parse(text: str, d: *mut Doc) -> u32 {
     let n: usize = text.n
     var i: usize = 0
@@ -504,73 +534,45 @@ fn parse(text: str, d: *mut Doc) -> u32 {
     var start_line: usize = 0
     var have: bool = false
     var qp: bool = false
-    while i <= n {
-        // one physical line [i, e)
+    while i < n {
+        // one physical line [i, e), next one starts at nx
         var e: usize = i
         while e < n && at(text, e) != 10 as u8 && at(text, e) != 13 as u8 {
             e = e + 1
         }
-        if i == n && e == n {
-            break
+        var nx: usize = e
+        if nx < n {
+            if at(text, nx) == 13 as u8 && nx + 1 < n && at(text, nx + 1) == 10 as u8 {
+                nx = nx + 1
+            }
+            nx = nx + 1
         }
         line_no = line_no + 1
-        let first: u8 = 0 as u8
         var cont: bool = false
-        if have && e > i || have && e == i {
-            if e > i && is_ws(at(text, i)) {
+        var drop: usize = 0
+        if have {
+            let blen: usize = rt.buf_len(&(*d).line_buf)
+            if qp && blen > 0 && rt.buf_at(&(*d).line_buf, blen - 1) == 61 as u8 {
                 cont = true
-            }
-        }
-        if have && qp && !cont {
-            // a soft line break of a quoted-printable value
-            cont = rt.buf_len(&(*d).line_buf) > 0 && rt.buf_at(&(*d).line_buf, rt.buf_len(&(*d).line_buf) - 1) == 61 as u8
-            if cont {
-                rt.buf_set_len(&(*d).line_buf, rt.buf_len(&(*d).line_buf) - 1)
-                rt.buf_push_bytes(&(*d).line_buf, text.p as u64 + i as u64, e - i)
-                qp = true
-                // the continuation may itself end with '=': keep qp
-                if e < n {
-                    if at(text, e) == 13 as u8 && e + 1 < n && at(text, e + 1) == 10 as u8 {
-                        e = e + 1
-                    }
-                    e = e + 1
-                }
-                i = e
-                continue
+                rt.buf_set_len(&(*d).line_buf, blen - 1)
+            } else if e > i && is_ws(at(text, i)) {
+                cont = true
+                drop = 1
             }
         }
         if cont {
-            rt.buf_push_bytes(&(*d).line_buf, text.p as u64 + i as u64 + 1, e - i - 1)
+            rt.buf_push_bytes(&(*d).line_buf, text.p as u64 + i as u64 + drop as u64, e - i - drop)
         } else {
-            if have {
-                let ln: str = str { p: rt.buf_data(&(*d).line_buf), n: rt.buf_len(&(*d).line_buf) }
-                if ln.n > 0 {
-                    parse_line(d, ln, start_line)
-                }
-            }
+            flush_line(d, have, start_line)
             rt.buf_clear(&(*d).line_buf)
             rt.buf_push_bytes(&(*d).line_buf, text.p as u64 + i as u64, e - i)
             start_line = line_no
             have = true
             qp = has_qp(str { p: rt.buf_data(&(*d).line_buf), n: rt.buf_len(&(*d).line_buf) })
         }
-        if e < n {
-            if at(text, e) == 13 as u8 && e + 1 < n && at(text, e + 1) == 10 as u8 {
-                e = e + 1
-            }
-            e = e + 1
-        }
-        i = e
-        if first != 0 as u8 {
-            break
-        }
+        i = nx
     }
-    if have {
-        let ln: str = str { p: rt.buf_data(&(*d).line_buf), n: rt.buf_len(&(*d).line_buf) }
-        if ln.n > 0 {
-            parse_line(d, ln, start_line)
-        }
-    }
+    flush_line(d, have, start_line)
     rt.buf_clear(&(*d).line_buf)
     if vec_len[usize](&(*d).open) > 0 {
         flag(d, E_UNCLOSED, line_no)
@@ -579,6 +581,16 @@ fn parse(text: str, d: *mut Doc) -> u32 {
         }
     }
     return (*d).errors
+}
+
+fn flush_line(d: *mut Doc, have: bool, start_line: usize) {
+    if !have {
+        return
+    }
+    let ln: str = str { p: rt.buf_data(&(*d).line_buf), n: rt.buf_len(&(*d).line_buf) }
+    if ln.n > 0 {
+        parse_line(d, ln, start_line)
+    }
 }
 
 // ------------------------------------------------------------------ queries
@@ -977,7 +989,7 @@ fn split_at(s: str, sep: u8, idx: usize) -> str {
     return ""
 }
 
-fn hex_val(c: u8) -> i32 {
+fn hex_value(c: u8) -> i32 {
     if c >= 48 as u8 && c <= 57 as u8 { return (c - 48 as u8) as i32 }
     if c >= 65 as u8 && c <= 70 as u8 { return (c - 55 as u8) as i32 }
     if c >= 97 as u8 && c <= 102 as u8 { return (c - 87 as u8) as i32 }
@@ -989,16 +1001,36 @@ fn qp_decode(s: str, out: *mut rt.Buf) {
     var i: usize = 0
     while i < s.n {
         let c: u8 = at(s, i)
-        if c == 61 as u8 && i + 2 < s.n + 0 && hex_val(at(s, i + 1)) >= 0 && hex_val(at(s, i + 2)) >= 0 {
-            rt.buf_push(out, ((hex_val(at(s, i + 1)) * 16 + hex_val(at(s, i + 2))) as u8))
+        if c == 61 as u8 && i + 2 < s.n && hex_value(at(s, i + 1)) >= 0 && hex_value(at(s, i + 2)) >= 0 {
+            rt.buf_push(out, ((hex_value(at(s, i + 1)) * 16 + hex_value(at(s, i + 2))) as u8))
             i = i + 3
-            continue
-        }
-        if c == 61 as u8 && i + 2 == s.n - 0 && false {
-            i = i + 1
             continue
         }
         rt.buf_push(out, c)
         i = i + 1
     }
+}
+
+// Quoted-printable encoder (vCard 2.1): every octet outside printable ASCII, and "=", becomes =XX
+// (upper-case hex). Line breaks are encoded too (=0D=0A); lines are NOT cut -- the writer folds.
+fn qp_encode(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = at(s, i)
+        if c < 32 as u8 || c > 126 as u8 || c == 61 as u8 {
+            rt.buf_push(out, 61 as u8)
+            rt.buf_push(out, hex_char(c >> 4 as u8))
+            rt.buf_push(out, hex_char(c & 15 as u8))
+        } else {
+            rt.buf_push(out, c)
+        }
+        i = i + 1
+    }
+}
+
+fn hex_char(v: u8) -> u8 {
+    if v < 10 as u8 {
+        return 48 as u8 + v
+    }
+    return 55 as u8 + v
 }

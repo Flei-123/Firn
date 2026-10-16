@@ -1,0 +1,271 @@
+// expect_exit: 0
+// tests/3600_cal_content.fi -- cal.content: unfolding / folding, groups, parameters (quotes, lists,
+// bare, RFC 6868), nested components, error flags, quoted-printable (decode, encode, soft breaks),
+// TEXT escapes, structured splitting and write -> parse stability.
+import std.rt
+import cal.content
+
+static mut failures: i32 = 0
+
+fn check(name: str, ok: bool) {
+    if !ok {
+        failures += 1
+        rt.write_everything(1, "  FAIL  ".p as u64, 8)
+        rt.write_everything(1, name.p as u64, name.n)
+        rt.write_everything(1, "\n".p as u64, 1)
+    }
+}
+
+fn same(b: *mut rt.Buf, want: str) -> bool {
+    return rt.buf_len(b) == want.n && rt.mem_eq(rt.buf_ptr(b), want.p as u64, want.n)
+}
+
+fn eqs(a: str, b: str) -> bool {
+    return a.n == b.n && rt.mem_eq(a.p as u64, b.p as u64, a.n)
+}
+
+fn of(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn written(d: *mut content.Doc) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    content.write(d, &b)
+    return b
+}
+
+fn unfolding() {
+    var d: content.Doc = content.doc_new()
+    // LF only, CR only, CRLF, tab fold, fold of an empty continuation, trailing text without newline
+    let fl: u32 = content.parse("BEGIN:A\nX-LF:one\n two\n\tthree\nX-CR:a\r b\rX-CRLF:c\r\n d\r\nX-EMPTY:e\n \nX-LAST:end\nEND:A", &d)
+    check("unfold clean", fl == 0)
+    let a: i64 = content.find_comp(&d, -1, "A", -1)
+    check("unfold lf", eqs(content.prop_value(&d, content.find_prop(&d, a as usize, "X-LF", -1) as usize), "onetwothree"))
+    check("unfold cr", eqs(content.prop_value(&d, content.find_prop(&d, a as usize, "X-CR", -1) as usize), "ab"))
+    check("unfold crlf", eqs(content.prop_value(&d, content.find_prop(&d, a as usize, "X-CRLF", -1) as usize), "cd"))
+    check("unfold empty continuation", eqs(content.prop_value(&d, content.find_prop(&d, a as usize, "X-EMPTY", -1) as usize), "e"))
+    check("unfold no newline at the end", eqs(content.prop_value(&d, content.find_prop(&d, a as usize, "X-LAST", -1) as usize), "end"))
+    content.doc_free(&d)
+    // a fold may fall between the bytes of a UTF-8 character: the bytes are joined, nothing is lost
+    var d2: content.Doc = content.doc_new()
+    var raw: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&raw, "BEGIN:A\r\nX-U:".p as u64, 13)
+    rt.buf_push(&raw, 195 as u8)
+    rt.buf_push_bytes(&raw, "\r\n ".p as u64, 3)
+    rt.buf_push(&raw, 164 as u8)
+    rt.buf_push_bytes(&raw, "\r\nEND:A\r\n".p as u64, 9)
+    content.parse(of(&raw), &d2)
+    rt.buf_free(&raw)
+    let a2: i64 = content.find_comp(&d2, -1, "A", -1)
+    check("unfold inside UTF-8", eqs(content.prop_value(&d2, content.find_prop(&d2, a2 as usize, "X-U", -1) as usize), "\u{E4}"))
+    content.doc_free(&d2)
+}
+
+fn folding() {
+    // 200 'a' folds into lines of at most 75 octets; the continuation lines start with one space
+    var long: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 200 {
+        rt.buf_push(&long, 97 as u8)
+        i = i + 1
+    }
+    var d: content.Doc = content.doc_new()
+    content.begin(&d, "A")
+    content.add_prop(&d, "", "X-LONG", str { p: rt.buf_data(&long), n: rt.buf_len(&long) })
+    content.end(&d)
+    var out: rt.Buf = written(&d)
+    var run: usize = 0
+    var ok: bool = true
+    var lines: usize = 0
+    var k: usize = 0
+    while k < rt.buf_len(&out) {
+        let c: u8 = rt.buf_at(&out, k)
+        if c == 13 as u8 {
+            if run > 75 { ok = false }
+            lines = lines + 1
+            run = 0
+        } else if c != 10 as u8 {
+            run = run + 1
+        }
+        k = k + 1
+    }
+    check("fold: lines <= 75", ok)
+    check("fold: several lines", lines >= 5)
+    var d2: content.Doc = content.doc_new()
+    content.parse(str { p: rt.buf_data(&out), n: rt.buf_len(&out) }, &d2)
+    let a: i64 = content.find_comp(&d2, -1, "A", -1)
+    check("fold: unfolds to the same value", eqs(content.prop_value(&d2, content.find_prop(&d2, a as usize, "X-LONG", -1) as usize), str { p: rt.buf_data(&long), n: rt.buf_len(&long) }))
+    content.doc_free(&d)
+    content.doc_free(&d2)
+    rt.buf_free(&out)
+    // UTF-8: 100 times U+00E4 (200 octets) never gets cut inside a character
+    var u: rt.Buf = rt.buf_new()
+    i = 0
+    while i < 100 {
+        rt.buf_push(&u, 195 as u8)
+        rt.buf_push(&u, 164 as u8)
+        i = i + 1
+    }
+    var d3: content.Doc = content.doc_new()
+    content.begin(&d3, "A")
+    content.add_prop(&d3, "", "X-U", str { p: rt.buf_data(&u), n: rt.buf_len(&u) })
+    content.end(&d3)
+    var out3: rt.Buf = written(&d3)
+    var cut: bool = false
+    k = 0
+    while k + 2 < rt.buf_len(&out3) {
+        // after "CRLF " must not stand a continuation byte (10xxxxxx)
+        if rt.buf_at(&out3, k) == 13 as u8 && rt.buf_at(&out3, k + 1) == 10 as u8 && rt.buf_at(&out3, k + 2) == 32 as u8 && k + 3 < rt.buf_len(&out3) {
+            if (rt.buf_at(&out3, k + 3) & 192 as u8) == 128 as u8 {
+                cut = true
+            }
+        }
+        k = k + 1
+    }
+    check("fold: never inside UTF-8", !cut)
+    var d4: content.Doc = content.doc_new()
+    content.parse(str { p: rt.buf_data(&out3), n: rt.buf_len(&out3) }, &d4)
+    let a4: i64 = content.find_comp(&d4, -1, "A", -1)
+    check("fold: UTF-8 value intact", eqs(content.prop_value(&d4, content.find_prop(&d4, a4 as usize, "X-U", -1) as usize), str { p: rt.buf_data(&u), n: rt.buf_len(&u) }))
+    content.doc_free(&d3)
+    content.doc_free(&d4)
+    rt.buf_free(&out3)
+    rt.buf_free(&u)
+    rt.buf_free(&long)
+}
+
+fn params() {
+    var d: content.Doc = content.doc_new()
+    let fl: u32 = content.parse("BEGIN:A\r\ng1.TEL;TYPE=work,voice;TYPE=pref;X-Q=\"a;b:c,d\";X-C=\"l1^nl2 ^'q^' ^^\":+1 (555)\r\nTEL;WORK;VOICE;ENCODING=QUOTED-PRINTABLE:v\r\nX-EMPTY;X-P=:v\r\nEND:A\r\n", &d)
+    check("params clean", fl == 0)
+    let a: i64 = content.find_comp(&d, -1, "A", -1)
+    let t: i64 = content.find_prop(&d, a as usize, "TEL", -1)
+    check("group", eqs(content.prop_group(&d, t as usize), "g1") && eqs(content.prop_name(&d, t as usize), "TEL"))
+    check("value with space", eqs(content.prop_value(&d, t as usize), "+1 (555)"))
+    check("param count", content.prop_param_count(&d, t as usize) == 5)
+    check("first TYPE value", eqs(content.param(&d, t as usize, "type"), "work"))
+    check("param values in order", eqs(content.prop_param_value(&d, t as usize, 1), "voice") && eqs(content.prop_param_value(&d, t as usize, 2), "pref"))
+    check("quoted ; : ,", eqs(content.param(&d, t as usize, "X-Q"), "a;b:c,d"))
+    check("RFC 6868 carets", eqs(content.param(&d, t as usize, "X-C"), "l1\nl2 \"q\" ^"))
+    check("has_param", content.has_param(&d, t as usize, "x-q") && !content.has_param(&d, t as usize, "NOPE"))
+    check("missing param is empty", eqs(content.param(&d, t as usize, "NOPE"), ""))
+    let t2: i64 = content.find_prop(&d, a as usize, "TEL", t)
+    check("bare params are TYPE", eqs(content.param(&d, t2 as usize, "TYPE"), "WORK") && eqs(content.prop_param_value(&d, t2 as usize, 1), "VOICE"))
+    let x: i64 = content.find_prop(&d, a as usize, "X-EMPTY", -1)
+    check("empty param value", x >= 0 && eqs(content.param(&d, x as usize, "X-P"), "") && content.has_param(&d, x as usize, "X-P"))
+    // write keeps the notations apart: TYPE=a,b stays a list, TYPE=a;TYPE=b stays two parameters
+    var out: rt.Buf = written(&d)
+    var d2: content.Doc = content.doc_new()
+    content.parse(str { p: rt.buf_data(&out), n: rt.buf_len(&out) }, &d2)
+    var out2: rt.Buf = written(&d2)
+    check("params write stable", rt.buf_len(&out) == rt.buf_len(&out2) && rt.mem_eq(rt.buf_ptr(&out), rt.buf_ptr(&out2), rt.buf_len(&out)))
+    let a2: i64 = content.find_comp(&d2, -1, "A", -1)
+    let t3: i64 = content.find_prop(&d2, a2 as usize, "TEL", -1)
+    check("params survive the write", eqs(content.param(&d2, t3 as usize, "X-Q"), "a;b:c,d") && eqs(content.param(&d2, t3 as usize, "X-C"), "l1\nl2 \"q\" ^") && content.prop_param_count(&d2, t3 as usize) == 5)
+    rt.buf_free(&out)
+    rt.buf_free(&out2)
+    content.doc_free(&d)
+    content.doc_free(&d2)
+}
+
+fn components() {
+    var d: content.Doc = content.doc_new()
+    let fl: u32 = content.parse("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nSUMMARY:a\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nEND:VALARM\r\nEND:VEVENT\r\nBEGIN:vevent\r\nSUMMARY:b\r\nEND:VEVENT\r\nEND:VCALENDAR\r\nBEGIN:VCARD\r\nFN:x\r\nEND:VCARD\r\n", &d)
+    check("nested clean", fl == 0)
+    check("component count", content.comp_count(&d) == 5)
+    check("property count", content.prop_count(&d) == 5)
+    let cal: i64 = content.find_comp(&d, -1, "vcalendar", -1)
+    let card: i64 = content.find_comp(&d, -1, "VCARD", -1)
+    check("two roots", cal >= 0 && card >= 0 && content.comp_parent(&d, cal as usize) < 0)
+    let e1: i64 = content.find_comp(&d, cal, "VEVENT", -1)
+    let e2: i64 = content.find_comp(&d, cal, "VEVENT", e1)
+    check("two events, case-insensitive", e1 >= 0 && e2 >= 0 && e1 != e2 && content.find_comp(&d, cal, "VEVENT", e2) < 0)
+    let al: i64 = content.find_comp(&d, e1, "VALARM", -1)
+    check("alarm belongs to the first event", al >= 0 && content.comp_parent(&d, al as usize) == e1 && content.find_comp(&d, e2, "VALARM", -1) < 0)
+    check("alarm property", eqs(content.prop_value(&d, content.find_prop(&d, al as usize, "ACTION", -1) as usize), "DISPLAY"))
+    check("property belongs to its component", content.prop_comp(&d, content.find_prop(&d, e2 as usize, "SUMMARY", -1) as usize) == e2 as usize)
+    var out: rt.Buf = written(&d)
+    check("nested write stable", same(&out, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nSUMMARY:a\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nEND:VALARM\r\nEND:VEVENT\r\nBEGIN:vevent\r\nSUMMARY:b\r\nEND:vevent\r\nEND:VCALENDAR\r\nBEGIN:VCARD\r\nFN:x\r\nEND:VCARD\r\n"))
+    rt.buf_free(&out)
+    content.doc_free(&d)
+}
+
+fn errors() {
+    var d: content.Doc = content.doc_new()
+    let fl: u32 = content.parse("BEGIN:A\r\nno colon here\r\nX:1\r\nEND:B\r\nEND:A\r\n", &d)
+    check("flags: bad line + mismatch", (fl & content.E_BAD_LINE) != 0 && (fl & content.E_MISMATCH) != 0 && (fl & content.E_UNCLOSED) == 0)
+    check("first error line", content.error_line(&d) == 2)
+    content.doc_free(&d)
+    var d2: content.Doc = content.doc_new()
+    let fl2: u32 = content.parse("BEGIN:A\r\nBEGIN:B\r\nX:1\r\n", &d2)
+    check("flags: unclosed", (fl2 & content.E_UNCLOSED) != 0)
+    check("unclosed components are closed", content.comp_count(&d2) == 2 && content.find_prop(&d2, content.find_comp(&d2, content.find_comp(&d2, -1, "A", -1), "B", -1) as usize, "X", -1) >= 0)
+    content.doc_free(&d2)
+    var d3: content.Doc = content.doc_new()
+    let fl3: u32 = content.parse("ORPHAN:1\r\nBEGIN:A\r\nX:1\r\nEND:A\r\n", &d3)
+    check("flags: orphan", (fl3 & content.E_ORPHAN) != 0 && content.prop_count(&d3) == 1)
+    content.doc_free(&d3)
+    var d4: content.Doc = content.doc_new()
+    check("empty input", content.parse("", &d4) == 0 && content.comp_count(&d4) == 0)
+    check("only newlines", content.parse("\r\n\r\n\n", &d4) == 0 && content.comp_count(&d4) == 0)
+    content.doc_free(&d4)
+    var d5: content.Doc = content.doc_new()
+    check("END closes several levels", (content.parse("BEGIN:A\r\nBEGIN:B\r\nEND:A\r\n", &d5) & content.E_MISMATCH) != 0 && content.comp_count(&d5) == 2)
+    content.doc_free(&d5)
+}
+
+fn quoted_printable() {
+    var d: content.Doc = content.doc_new()
+    // soft breaks join; a leading space on the continuation line is DATA, not a fold; a '=' at the
+    // end of a non-QP line is just text
+    content.parse("BEGIN:A\r\nQP;ENCODING=QUOTED-PRINTABLE:a=\r\n b=\r\n=3D=\r\nc\r\nPLAIN:x=\r\nNEXT:y\r\nEND:A\r\n", &d)
+    let a: i64 = content.find_comp(&d, -1, "A", -1)
+    var b: rt.Buf = rt.buf_new()
+    content.qp_decode(content.prop_value(&d, content.find_prop(&d, a as usize, "QP", -1) as usize), &b)
+    check("qp soft breaks", same(&b, "a b=c"))
+    check("plain '=' at line end", eqs(content.prop_value(&d, content.find_prop(&d, a as usize, "PLAIN", -1) as usize), "x="))
+    check("next line after a plain '='", eqs(content.prop_value(&d, content.find_prop(&d, a as usize, "NEXT", -1) as usize), "y"))
+    rt.buf_clear(&b)
+    content.qp_decode("=C3=a4=3d=4=ZZ=", &b)
+    check("qp decode: lower case, malformed kept", same(&b, "\u{E4}==4=ZZ="))
+    rt.buf_clear(&b)
+    content.qp_encode("a=b \u{E4}\r\n~", &b)
+    check("qp encode", same(&b, "a=3Db =C3=A4=0D=0A~"))
+    var back: rt.Buf = rt.buf_new()
+    content.qp_decode(of(&b), &back)
+    check("qp round trip", same(&back, "a=b \u{E4}\r\n~"))
+    rt.buf_free(&back)
+    rt.buf_free(&b)
+    content.doc_free(&d)
+}
+
+fn text_values() {
+    var b: rt.Buf = rt.buf_new()
+    content.text_escape("a,b;c\\d\ne\r\nf\rg", &b)
+    check("text escape", same(&b, "a\\,b\\;c\\\\d\\ne\\nf\\ng"))
+    var u: rt.Buf = rt.buf_new()
+    content.text_unescape(of(&b), &u)
+    check("text unescape", same(&u, "a,b;c\\d\ne\nf\ng"))
+    rt.buf_clear(&u)
+    content.text_unescape("x\\Ny\\q\\", &u)
+    check("unescape: \\N, unknown escape, lone backslash", same(&u, "x\nyq\\"))
+    check("split count", content.split_count("a;b\\;c;;d", 59 as u8) == 4 && content.split_count("", 59 as u8) == 1)
+    check("split items", eqs(content.split_at("a;b\\;c;;d", 59 as u8, 1), "b\\;c") && eqs(content.split_at("a;b\\;c;;d", 59 as u8, 2), "") && eqs(content.split_at("a;b\\;c;;d", 59 as u8, 3), "d") && eqs(content.split_at("a;b", 59 as u8, 5), ""))
+    rt.buf_free(&u)
+    rt.buf_free(&b)
+}
+
+fn main() -> i32 {
+    unfolding()
+    folding()
+    params()
+    components()
+    errors()
+    quoted_printable()
+    text_values()
+    if failures == 0 {
+        rt.write_everything(1, "ok\n".p as u64, 3)
+        return 0
+    }
+    return 1
+}

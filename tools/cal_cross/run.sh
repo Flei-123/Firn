@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tools/cal_cross/run.sh -- cal.rrule against dateutil.rrule (rule + rruleset cases).
 #   CAL_CASES=1500 CAL_SEEDS="1 2 3 4" bash tools/cal_cross/run.sh      (python3 + dateutil needed)
+#   CAL_FUZZ=40000 CAL_FUZZ_SEEDS="1 2 3"  sets the fuzz size (tests/3604 in release-safe)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
@@ -26,4 +27,11 @@ for stage in --opt-level=release-fast --no-opt --opt-level=dev-fast --opt-level=
   done
 done
 echo "cal_cross: $TOT comparisons, $DIF differences"
+# fuzz on damaged calendars / cards / rules (tests/3604), release-safe so overflow and bounds panics count
+$FIRNC --opt-level=release-safe -o "$W/fuzz" tests/3604_cal_fuzz.fi || { echo "  FAIL compile fuzz"; ERR=1; }
+for s in ${CAL_FUZZ_SEEDS:-1 2 3}; do
+  out=$(timeout 900 "$W/fuzz" ${CAL_FUZZ:-40000} "$s" 2>&1 | tail -1); rc=$?
+  echo "  fuzz seed $s: $out"
+  case "$out" in *"unstable writes 0, rule failures 0") ;; *) ERR=1;; esac
+done
 [ $ERR -eq 0 ] && echo "ALL OK" || { echo "FAILED"; exit 1; }
