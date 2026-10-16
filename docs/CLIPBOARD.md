@@ -92,3 +92,8 @@ encrypted). The watcher POLLS (X11 has no change notice in the window layer); Wi
 `bash tools/cliphist/run.sh` (Python model, XXH64 and file format written out in Python; watcher + view on a private Xvfb).
 Not verified: a foreign owner offering html or the password hint (GTK 3 via PyGObject cannot offer extra formats), real
 Windows (CF_HTML wrapper missing), Wayland.
+
+The app `examples/cliphist/main.fi` (`cliphist_app [history-file]`) puts it together; `cliphistview.view_autorefresh(&loop, 200)`
+makes the rows follow the history. `bash tools/cliphist/app_check.sh` runs it in a real window (Xvfb + openbox + xdotool)
+against FOREIGN owners: Tk (plain text) and python-xlib (`tools/cliphist/xowner.py`: html, the password-manager hint):
+click, Enter, Esc, Ctrl+Shift+V, pin, X, restart, no file without the argument (25 checks).

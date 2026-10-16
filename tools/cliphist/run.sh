@@ -5,6 +5,8 @@
 #      (CLIPHIST_OPS=600 CLIPHIST_SEEDS="1 2 3")
 #   2. the watcher and the view against a real X11 clipboard (private Xvfb): copy, take-in, duplicates, html,
 #      password-manager hint dropped / kept, timer path, view rows, pin, pick, delete
+#   3. examples/cliphist in a real window under Xvfb + openbox (tools/cliphist/app_check.sh): xdotool clicks / keys / hotkey,
+#      foreign owners (Tk, python-xlib with html and the password-manager hint)
 # Exit 0 = 0 differences, 0 failed checks.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -33,5 +35,10 @@ if command -v Xvfb >/dev/null; then
     echo "  $n: $(echo "$out" | tail -1) (exit $code)"; [ $code -eq 0 ] || ERR=1
   done
 else echo "  skip: no Xvfb"; fi
+echo "== 3. the app in a real window (xdotool, foreign Tk / python-xlib owners)"
+for lv in dev-fast release-safe; do
+  out=$(APP_LEVEL=$lv bash tools/cliphist/app_check.sh 2>&1); code=$?
+  echo "  $lv: $(echo "$out" | tail -2 | tr '\n' ' ')"; [ $code -eq 0 ] || { ERR=1; echo "$out" | grep FAIL | head -5; }
+done
 [ $ERR -eq 0 ] && echo "CLIPHIST PASSED" || echo "CLIPHIST FAILED"
 exit $ERR
