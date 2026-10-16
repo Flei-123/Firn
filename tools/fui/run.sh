@@ -571,6 +571,14 @@ build listrow
 "$W/listrow"
 
 echo
+echo "== 18p4. VIRTUAL LIST MODEL (lib/fui/vlist.fi, GAP L5/C6/C7) =="
+# 100000 rows: equal + variable heights (Fenwick prefix sums) against a naive
+# reference, selection against a bool array (20000 random steps), keys, Shift/Ctrl
+# ranges, typeahead, table columns (drag, sort click), 50000-op robustness fuzz.
+build vlist
+"$W/vlist"
+
+echo
 echo "== 18p7. CONTEXT MENUS (lib/fui/action.fi, ctxmenu.fi, menuview.fi, ctxstd.fi, r161) =="
 # ONE system for right click / long press / menu key / Shift+F10:
 #   ctxmenu     actions (id, label catalog, icon, shortcut, enabled/checked/

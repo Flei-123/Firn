@@ -1,0 +1,1086 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/vlist.fi -- THE VIRTUAL LIST MODEL (fUi, GAP-ANALYSE L5 / C6 / C7).
+//
+// ===================================================== WHY IT EXISTS
+//
+// A scene tree holds 128 nodes and a box distributes 64 children
+// (lib/fui/scene.fi), so a list of 24 rows was the end of every file, mail
+// and chat program. The answer is not a bigger tree: the list becomes ONE
+// node, and only the rows that are on the screen are asked for and painted.
+// 100000 rows cost what 25 cost. This file is the part that knows no
+// window: the numbers, the selection, the keys. lib/fui/vlistview.fi paints
+// it, `app.vlist` (lib/fui/app.fi) puts it into a window.
+//
+// ===================================================== WHAT IT KNOWS
+//
+//   * ROW HEIGHTS: all equal (`vl_set_row_height`, no memory at all), or one
+//     per row (`vl_set_heights`, `vl_set_height`): the heights live in a
+//     Fenwick tree of prefix sums, so "top of row i" and "which row is at
+//     y" are O(log n) and a change of one height is O(log n) too.
+//     Heights are kept in 1/64 pixel.
+//   * SCROLLING is lib/fui/viewport.fi (offset, wheel, kinetic run-out, bar
+//     geometry). `vl_reveal(i)` scrolls a row into view, `vl_scroll_to`
+//     puts it at the top / middle / bottom.
+//   * SELECTION: one row, or many (`vl_set_multi`): a click, Ctrl+click
+//     (toggle), Shift+click (range from the anchor), Shift+arrows, Ctrl+A,
+//     Ctrl+arrows (move the focus only), Ctrl+Space. A byte per row.
+//   * KEYS (`vl_key`, codes of lib/fui/editor.fi): Up, Down, PgUp, PgDn,
+//     Home, End, Enter. The answer is a set of RES_* bits, so a window
+//     knows whether to paint again, call the "selection changed" handler or
+//     the "activate" handler.
+//   * TYPEAHEAD (`vl_char`): typing "rep" jumps to the next row whose text
+//     starts with "rep" (any case, ASCII); the buffer is forgotten after
+//     one second. The text comes from the same callback the painter uses.
+//   * COLUMNS (a table): `vl_set_columns`, widths you can drag at the
+//     header's dividers, a click on a header cell names the sort column
+//     (`vl_header_click`; the program sorts its own data and calls
+//     `vl_changed`).
+//
+// ===================================================== THE DATA
+//
+// The rows are NOT stored here (the program owns its data). Firn has no
+// closures, so the source is a named function plus a `ud` number:
+//
+//     fn row_of(ud: u64, index: usize, out: *mut vlist.VRow) {
+//         vlist.vrow_text(out, "name of the row")   // out.col says the column
+//     }
+//
+// The function is called only for visible rows (and by typeahead).
+//
+// ===================================================== UNITS
+//
+// Everything here is in window PIXELS (the caller scales); `vl_set_rect`
+// takes the rectangle of the whole control, header included.
+import std.rt
+import fui.viewport
+import fui.editor
+
+export {
+    Vlist, VRow, vrow_new, vrow_text, vrow_detail, VROW_TEXT, VROW_DETAIL,
+    vl_new, vl_free, vl_set_count, vl_count, vl_set_row_height, vl_row_height,
+    vl_set_heights, vl_set_height, vl_height_of, vl_is_variable, vl_row_top,
+    vl_total, vl_index_at, vl_changed,
+    vl_set_rect, vl_set_header, vl_header_h, vl_first, vl_end, vl_page_rows,
+    vl_viewport, vl_body_y, vl_body_h, vl_zone, vl_hit,
+    vl_set_multi, vl_is_multi, vl_sel_count, vl_is_selected, vl_select_only,
+    vl_select_toggle, vl_select_range, vl_select_all, vl_clear_selection,
+    vl_cur, vl_set_cur, vl_anchor, vl_hover, vl_set_hover,
+    vl_reveal, vl_scroll_to, vl_wheel, vl_scroll_y,
+    vl_click, vl_key, vl_char, vl_typeahead_text,
+    vl_set_columns, vl_columns, vl_set_col_title, vl_col_title, vl_set_col_width, vl_col_width, vl_col_x,
+    vl_col_at, vl_divider_at, vl_col_drag_begin, vl_col_drag, vl_col_drag_end,
+    vl_col_dragging, vl_header_click, vl_sort_col, vl_sort_desc, vl_set_sort,
+    vl_set_type_col,
+    RES_MOVED, RES_SELECT, RES_ACTIVATE, RES_USED,
+    ZONE_NONE, ZONE_HEADER, ZONE_BODY, ZONE_BAR,
+    SCROLL_TOP, SCROLL_MIDDLE, SCROLL_BOTTOM,
+    COL_MAX, COL_MIN_W, NONE,
+}
+
+const NONE: usize = 4294967295
+const COL_MAX: usize = 16
+const COL_MIN_W: f64 = 24.0
+
+// heights are stored in 1/FX pixel
+const FX: f64 = 64.0
+
+// the bits `vl_key`, `vl_click` and `vl_char` answer with
+const RES_MOVED: u32 = 1
+const RES_SELECT: u32 = 2
+const RES_ACTIVATE: u32 = 4
+const RES_USED: u32 = 8
+
+const ZONE_NONE: u32 = 0
+const ZONE_HEADER: u32 = 1
+const ZONE_BODY: u32 = 2
+const ZONE_BAR: u32 = 3
+
+const SCROLL_TOP: u32 = 0
+const SCROLL_MIDDLE: u32 = 1
+const SCROLL_BOTTOM: u32 = 2
+
+const VROW_TEXT: usize = 192
+const VROW_DETAIL: usize = 48
+
+// WHAT THE SOURCE FILLS IN for one row (and one column of it).
+struct VRow {
+    // in: the column asked for (0 in a list)
+    col: usize,
+    // out: the cell text, UTF-8, not zero-terminated
+    text: [u8; 192],
+    n: usize,
+    // out: a Lucide icon id, -1 = none (column 0 only)
+    icon: i64,
+    // out: a second, right aligned, quieter text of a list row (a size ...)
+    detail: [u8; 48],
+    dn: usize,
+    // out: a row that cannot be chosen
+    disabled: bool,
+}
+
+fn vrow_new() -> VRow {
+    return VRow { col: 0, text: [0; 192], n: 0, icon: 0 - 1,
+        detail: [0; 48], dn: 0, disabled: false }
+}
+
+// Put `s` (cut at VROW_TEXT octets) into the cell text.
+fn vrow_text(r: *mut VRow, s: str) {
+    var k: usize = s.n
+    if k > VROW_TEXT {
+        k = VROW_TEXT
+    }
+    var i: usize = 0
+    while i < k {
+        (*r).text[i] = *(((s.p) as u64 + i as u64) as *mut u8)
+        i = i + 1
+    }
+    (*r).n = k
+}
+
+fn vrow_detail(r: *mut VRow, s: str) {
+    var k: usize = s.n
+    if k > VROW_DETAIL {
+        k = VROW_DETAIL
+    }
+    var i: usize = 0
+    while i < k {
+        (*r).detail[i] = *(((s.p) as u64 + i as u64) as *mut u8)
+        i = i + 1
+    }
+    (*r).dn = k
+}
+
+struct Vlist {
+    n: usize,
+    // equal heights (px); used while var_h is false
+    fixed: f64,
+    var_h: bool,
+    // variable heights: u32 per row, and the Fenwick tree (n + 1 u64)
+    hts: u64,
+    fen: u64,
+    hcap: usize,
+    // selection: a byte per row
+    sel: u64,
+    scap: usize,
+    nsel: usize,
+    multi: bool,
+    cur: usize,
+    anchor: usize,
+    hover: usize,
+    // scrolling; the viewport is the BODY (below the header)
+    vp: viewport.Viewport,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    hdr: f64,
+    // columns
+    ncol: usize,
+    colw: [f64; 16],
+    // header texts (pointer + length; a literal or a buffer that lives on)
+    tp: [u64; 16],
+    tl: [usize; 16],
+    sort_col: usize,
+    sort_desc: bool,
+    drag_col: usize,
+    drag_x: f64,
+    drag_w: f64,
+    // typeahead
+    tbuf: [u8; 48],
+    tn: usize,
+    tms: i64,
+    tcol: usize,
+}
+
+fn vl_new() -> Vlist {
+    return Vlist { n: 0, fixed: 24.0, var_h: false, hts: 0, fen: 0, hcap: 0,
+        sel: 0, scap: 0, nsel: 0, multi: false, cur: NONE, anchor: NONE,
+        hover: NONE,
+        vp: viewport.viewport_new(0.0, 0.0, 100.0, 100.0, 100.0, 0.0),
+        x: 0.0, y: 0.0, w: 100.0, h: 100.0, hdr: 0.0,
+        ncol: 0, colw: [0.0; 16], tp: [0; 16], tl: [0; 16], sort_col: NONE, sort_desc: false,
+        drag_col: NONE, drag_x: 0.0, drag_w: 0.0,
+        tbuf: [0; 48], tn: 0, tms: 0, tcol: 0 }
+}
+
+fn vl_free(v: *mut Vlist) {
+    if (*v).hcap > 0 {
+        rt.heap_free((*v).hts, (*v).hcap * 4)
+        rt.heap_free((*v).fen, ((*v).hcap + 1) * 8)
+    }
+    if (*v).scap > 0 {
+        rt.heap_free((*v).sel, (*v).scap)
+    }
+    (*v).hcap = 0
+    (*v).scap = 0
+    (*v).hts = 0
+    (*v).fen = 0
+    (*v).sel = 0
+    (*v).n = 0
+}
+
+fn vl_viewport(v: *mut Vlist) -> *mut viewport.Viewport { return &(*v).vp }
+fn vl_count(v: *mut Vlist) -> usize { return (*v).n }
+fn vl_is_variable(v: *mut Vlist) -> bool { return (*v).var_h }
+fn vl_row_height(v: *mut Vlist) -> f64 { return (*v).fixed }
+fn vl_scroll_y(v: *mut Vlist) -> f64 { return viewport.viewport_off_y(&(*v).vp) }
+
+// ============================================================ HEIGHTS
+
+fn lowbit(j: usize) -> usize {
+    let jj: u64 = j as u64
+    let neg: u64 = (0 as u64) -% jj
+    return (jj & neg) as usize
+}
+
+fn fx_of(h: f64) -> u32 {
+    if h <= 0.0 {
+        return 0 as u32
+    }
+    return (h * FX + 0.5) as u32
+}
+
+// Rebuild the Fenwick tree from the stored heights: O(n).
+fn fen_build(v: *mut Vlist) {
+    let n: usize = (*v).n
+    rt.st64((*v).fen, 0, 0 as u64)
+    var j: usize = 1
+    while j <= n {
+        rt.st64((*v).fen, j, rt.ld32((*v).hts, j - 1) as u64)
+        j = j + 1
+    }
+    j = 1
+    while j <= n {
+        let k: usize = j + lowbit(j)
+        if k <= n {
+            rt.st64((*v).fen, k, rt.ld64((*v).fen, k) +% rt.ld64((*v).fen, j))
+        }
+        j = j + 1
+    }
+}
+
+// Sum of the heights of rows [0, i), in 1/FX px.
+fn fen_prefix(v: *mut Vlist, i: usize) -> u64 {
+    var j: usize = i
+    if j > (*v).n {
+        j = (*v).n
+    }
+    var s: u64 = 0 as u64
+    while j > 0 {
+        s = s +% rt.ld64((*v).fen, j)
+        j = j - lowbit(j)
+    }
+    return s
+}
+
+fn fen_add(v: *mut Vlist, i: usize, delta: u64) {
+    var j: usize = i + 1
+    while j <= (*v).n {
+        rt.st64((*v).fen, j, rt.ld64((*v).fen, j) +% delta)
+        j = j + lowbit(j)
+    }
+}
+
+// Make room for `n` rows in the selection (and, while heights are variable,
+// in the height tables). Selection is cleared by a new count.
+fn vl_set_count(v: *mut Vlist, n: usize) {
+    if n > (*v).scap {
+        if (*v).scap > 0 {
+            rt.heap_free((*v).sel, (*v).scap)
+        }
+        (*v).sel = rt.heap_alloc(n)
+        (*v).scap = n
+    }
+    if (*v).scap > 0 {
+        rt.mem_set((*v).sel, 0 as u8, (*v).scap)
+    }
+    (*v).nsel = 0
+    (*v).n = n
+    if (*v).cur != NONE && (*v).cur >= n {
+        (*v).cur = NONE
+    }
+    if (*v).anchor != NONE && (*v).anchor >= n {
+        (*v).anchor = NONE
+    }
+    (*v).hover = NONE
+    if (*v).var_h {
+        // the old heights do not belong to the new rows: back to equal heights
+        (*v).var_h = false
+    }
+    vl_changed(v)
+}
+
+fn vl_set_row_height(v: *mut Vlist, h: f64) {
+    var x: f64 = h
+    if x < 1.0 {
+        x = 1.0
+    }
+    (*v).fixed = x
+    (*v).var_h = false
+    vl_changed(v)
+}
+
+// One height per row, from `f(ud, index)` (px). O(n) calls, once.
+fn vl_set_heights(v: *mut Vlist, ud: u64, f: fn(u64, usize) -> f64) {
+    let n: usize = (*v).n
+    if n > (*v).hcap {
+        if (*v).hcap > 0 {
+            rt.heap_free((*v).hts, (*v).hcap * 4)
+            rt.heap_free((*v).fen, ((*v).hcap + 1) * 8)
+        }
+        (*v).hts = rt.heap_alloc(n * 4)
+        (*v).fen = rt.heap_alloc((n + 1) * 8)
+        (*v).hcap = n
+    }
+    var i: usize = 0
+    while i < n {
+        rt.st32((*v).hts, i, fx_of(f(ud, i)))
+        i = i + 1
+    }
+    (*v).var_h = true
+    fen_build(v)
+    vl_changed(v)
+}
+
+// Change the height of one row (px). Needs `vl_set_heights` first.
+fn vl_set_height(v: *mut Vlist, i: usize, h: f64) {
+    if !(*v).var_h || i >= (*v).n {
+        return
+    }
+    let old: u32 = rt.ld32((*v).hts, i)
+    let nw: u32 = fx_of(h)
+    if old == nw {
+        return
+    }
+    rt.st32((*v).hts, i, nw)
+    fen_add(v, i, (nw as u64) -% (old as u64))
+    vl_changed(v)
+}
+
+fn vl_height_of(v: *mut Vlist, i: usize) -> f64 {
+    if !(*v).var_h {
+        return (*v).fixed
+    }
+    if i >= (*v).n {
+        return 0.0
+    }
+    return (rt.ld32((*v).hts, i) as f64) / FX
+}
+
+// The top of row `i` in the content (y of row 0 = 0). `i == n` gives the total.
+fn vl_row_top(v: *mut Vlist, i: usize) -> f64 {
+    if !(*v).var_h {
+        return (i as f64) * (*v).fixed
+    }
+    return (fen_prefix(v, i) as f64) / FX
+}
+
+fn vl_total(v: *mut Vlist) -> f64 {
+    return vl_row_top(v, (*v).n)
+}
+
+// The row that holds content y. NONE when y is above 0 or below the last row.
+fn vl_index_at(v: *mut Vlist, y: f64) -> usize {
+    if y < 0.0 || (*v).n == 0 {
+        return NONE
+    }
+    if !(*v).var_h {
+        let k: usize = (y / (*v).fixed) as usize
+        if k >= (*v).n {
+            return NONE
+        }
+        return k
+    }
+    var rem: u64 = (y * FX) as u64
+    var pos: usize = 0
+    var bit: usize = 1
+    while bit * 2 <= (*v).n {
+        bit = bit * 2
+    }
+    while bit > 0 {
+        let np: usize = pos + bit
+        if np <= (*v).n {
+            let f: u64 = rt.ld64((*v).fen, np)
+            if f <= rem {
+                pos = np
+                rem = rem - f
+            }
+        }
+        bit = bit / 2
+    }
+    if pos >= (*v).n {
+        return NONE
+    }
+    return pos
+}
+
+// ============================================================ GEOMETRY
+
+// The rectangle of the whole control (px), header included. Call it every
+// time the node is painted: it re-clamps the scroll offset.
+fn vl_set_rect(v: *mut Vlist, x: f64, y: f64, w: f64, h: f64) {
+    (*v).x = x
+    (*v).y = y
+    (*v).w = w
+    (*v).h = h
+    var bh: f64 = h - (*v).hdr
+    if bh < 0.0 {
+        bh = 0.0
+    }
+    viewport.viewport_set_rect(&(*v).vp, x, y + (*v).hdr, w, bh)
+    vl_changed(v)
+}
+
+// The header height (px); 0 = no header.
+fn vl_set_header(v: *mut Vlist, h: f64) {
+    var x: f64 = h
+    if x < 0.0 {
+        x = 0.0
+    }
+    (*v).hdr = x
+    vl_set_rect(v, (*v).x, (*v).y, (*v).w, (*v).h)
+}
+
+fn vl_header_h(v: *mut Vlist) -> f64 { return (*v).hdr }
+fn vl_body_y(v: *mut Vlist) -> f64 { return (*v).y + (*v).hdr }
+fn vl_body_h(v: *mut Vlist) -> f64 { return viewport.viewport_inner_h(&(*v).vp) }
+
+// The data or the heights changed: tell the viewport how high the content is.
+fn vl_changed(v: *mut Vlist) {
+    // no horizontal content: the body never gets a horizontal bar
+    viewport.viewport_set_content(&(*v).vp, 0.0, vl_total(v))
+}
+
+// The first row that shows (even partly), and one past the last.
+fn vl_first(v: *mut Vlist) -> usize {
+    let k: usize = vl_index_at(v, viewport.viewport_off_y(&(*v).vp))
+    if k == NONE {
+        return (*v).n
+    }
+    return k
+}
+
+fn vl_end(v: *mut Vlist) -> usize {
+    let ih: f64 = viewport.viewport_inner_h(&(*v).vp)
+    if ih <= 0.0 {
+        return vl_first(v)
+    }
+    // a row that starts exactly at the bottom edge does not show
+    let y: f64 = viewport.viewport_off_y(&(*v).vp) + ih - 0.01
+    let k: usize = vl_index_at(v, y)
+    if k == NONE {
+        return (*v).n
+    }
+    if k + 1 > (*v).n {
+        return (*v).n
+    }
+    return k + 1
+}
+
+// About how many rows a page holds.
+fn vl_page_rows(v: *mut Vlist) -> usize {
+    let e: usize = vl_end(v)
+    let f: usize = vl_first(v)
+    if e <= f + 1 {
+        return 1
+    }
+    return e - f - 1
+}
+
+// Which part of the control a window point is in.
+fn vl_zone(v: *mut Vlist, px: f64, py: f64) -> u32 {
+    if px < (*v).x || px >= (*v).x + (*v).w || py < (*v).y || py >= (*v).y + (*v).h {
+        return ZONE_NONE
+    }
+    if py < (*v).y + (*v).hdr {
+        return ZONE_HEADER
+    }
+    if viewport.viewport_bar_hit(&(*v).vp, px, py) != viewport.VP_BAR_NONE {
+        return ZONE_BAR
+    }
+    return ZONE_BODY
+}
+
+// The row under a window point; NONE in the header, on the bar, below the
+// last row.
+fn vl_hit(v: *mut Vlist, px: f64, py: f64) -> usize {
+    if vl_zone(v, px, py) != ZONE_BODY {
+        return NONE
+    }
+    return vl_index_at(v, py - (*v).y - (*v).hdr + viewport.viewport_off_y(&(*v).vp))
+}
+
+// ============================================================ SCROLLING
+
+// Scroll just enough that row `i` shows completely.
+fn vl_reveal(v: *mut Vlist, i: usize) -> bool {
+    if i >= (*v).n {
+        return false
+    }
+    return viewport.viewport_ensure_visible(&(*v).vp, 0.0, vl_row_top(v, i), 1.0,
+        vl_height_of(v, i))
+}
+
+// Put row `i` at the top, the middle or the bottom of the body.
+fn vl_scroll_to(v: *mut Vlist, i: usize, where: u32) {
+    if i >= (*v).n {
+        return
+    }
+    let top: f64 = vl_row_top(v, i)
+    let rh: f64 = vl_height_of(v, i)
+    let ih: f64 = viewport.viewport_inner_h(&(*v).vp)
+    var oy: f64 = top
+    if where == SCROLL_MIDDLE {
+        oy = top - (ih - rh) / 2.0
+    } else if where == SCROLL_BOTTOM {
+        oy = top + rh - ih
+    }
+    viewport.viewport_set_offset(&(*v).vp, viewport.viewport_off_x(&(*v).vp), oy)
+}
+
+// The wheel: `notches` positive = down. The step is the viewport's.
+fn vl_wheel(v: *mut Vlist, notches: f64) {
+    viewport.viewport_wheel(&(*v).vp, 0.0, notches)
+}
+
+// ============================================================ SELECTION
+
+fn vl_set_multi(v: *mut Vlist, on: bool) {
+    (*v).multi = on
+    if !on && (*v).nsel > 1 {
+        let c: usize = (*v).cur
+        vl_clear_selection(v)
+        if c != NONE {
+            vl_select_only(v, c)
+        }
+    }
+}
+
+fn vl_is_multi(v: *mut Vlist) -> bool { return (*v).multi }
+fn vl_sel_count(v: *mut Vlist) -> usize { return (*v).nsel }
+fn vl_cur(v: *mut Vlist) -> usize { return (*v).cur }
+fn vl_anchor(v: *mut Vlist) -> usize { return (*v).anchor }
+fn vl_hover(v: *mut Vlist) -> usize { return (*v).hover }
+
+// Set the hover row; true when it changed.
+fn vl_set_hover(v: *mut Vlist, i: usize) -> bool {
+    var k: usize = i
+    if k >= (*v).n {
+        k = NONE
+    }
+    if k == (*v).hover {
+        return false
+    }
+    (*v).hover = k
+    return true
+}
+
+fn vl_is_selected(v: *mut Vlist, i: usize) -> bool {
+    if i >= (*v).n {
+        return false
+    }
+    return rt.ld8((*v).sel, i) != 0 as u8
+}
+
+fn set_sel(v: *mut Vlist, i: usize, on: bool) {
+    let was: bool = rt.ld8((*v).sel, i) != 0 as u8
+    if was == on {
+        return
+    }
+    if on {
+        rt.st8((*v).sel, i, 1 as u8)
+        (*v).nsel = (*v).nsel + 1
+    } else {
+        rt.st8((*v).sel, i, 0 as u8)
+        (*v).nsel = (*v).nsel - 1
+    }
+}
+
+fn vl_clear_selection(v: *mut Vlist) {
+    if (*v).scap > 0 && (*v).nsel > 0 {
+        rt.mem_set((*v).sel, 0 as u8, (*v).scap)
+    }
+    (*v).nsel = 0
+}
+
+// Choose exactly row `i` (NONE = nothing); it gets the focus and the anchor.
+fn vl_select_only(v: *mut Vlist, i: usize) {
+    vl_clear_selection(v)
+    if i < (*v).n {
+        set_sel(v, i, true)
+        (*v).cur = i
+        (*v).anchor = i
+    } else {
+        (*v).cur = NONE
+        (*v).anchor = NONE
+    }
+}
+
+fn vl_select_toggle(v: *mut Vlist, i: usize) {
+    if i >= (*v).n {
+        return
+    }
+    set_sel(v, i, !vl_is_selected(v, i))
+    (*v).cur = i
+    (*v).anchor = i
+}
+
+// Choose rows a..b (either order) and nothing else; the anchor stays at `a`
+// and the focus goes to `b`.
+fn vl_select_range(v: *mut Vlist, a: usize, b: usize) {
+    if a >= (*v).n || b >= (*v).n {
+        return
+    }
+    var lo: usize = a
+    var hi: usize = b
+    if lo > hi {
+        lo = b
+        hi = a
+    }
+    vl_clear_selection(v)
+    var i: usize = lo
+    while i <= hi {
+        set_sel(v, i, true)
+        i = i + 1
+    }
+    (*v).anchor = a
+    (*v).cur = b
+}
+
+fn vl_select_all(v: *mut Vlist) {
+    if !(*v).multi || (*v).n == 0 {
+        return
+    }
+    var i: usize = 0
+    while i < (*v).n {
+        rt.st8((*v).sel, i, 1 as u8)
+        i = i + 1
+    }
+    (*v).nsel = (*v).n
+    if (*v).cur == NONE {
+        (*v).cur = 0
+    }
+    if (*v).anchor == NONE {
+        (*v).anchor = 0
+    }
+}
+
+// Move the focus without touching the selection.
+fn vl_set_cur(v: *mut Vlist, i: usize) {
+    if i < (*v).n {
+        (*v).cur = i
+    }
+}
+
+fn has_mod(mods: u32, bit: u32) -> bool {
+    return (mods & bit) != 0 as u32
+}
+
+// A click on row `i` (NONE = the empty part). Returns RES_* bits.
+fn vl_click(v: *mut Vlist, i: usize, mods: u32) -> u32 {
+    let before: usize = (*v).nsel
+    let bcur: usize = (*v).cur
+    if i >= (*v).n {
+        if !has_mod(mods, editor.MOD_CTRL) && (*v).nsel > 0 {
+            vl_clear_selection(v)
+            return RES_SELECT | RES_USED
+        }
+        return RES_USED
+    }
+    if (*v).multi && has_mod(mods, editor.MOD_SHIFT) {
+        var a0: usize = (*v).anchor
+        if a0 == NONE {
+            a0 = i
+        }
+        vl_select_range(v, a0, i)
+    } else if (*v).multi && has_mod(mods, editor.MOD_CTRL) {
+        vl_select_toggle(v, i)
+    } else {
+        vl_select_only(v, i)
+    }
+    (*v).tn = 0
+    return RES_SELECT | RES_MOVED | RES_USED
+}
+
+// A key (codes of lib/fui/editor.fi). Returns RES_* bits, 0 = not ours.
+fn vl_key(v: *mut Vlist, key: u32, mods: u32) -> u32 {
+    let n: usize = (*v).n
+    if key == editor.KEY_ENTER {
+        if (*v).cur != NONE {
+            return RES_ACTIVATE | RES_USED
+        }
+        return 0 as u32
+    }
+    if key != editor.KEY_UP && key != editor.KEY_DOWN && key != editor.KEY_PGUP
+    && key != editor.KEY_PGDN && key != editor.KEY_HOME && key != editor.KEY_END {
+        return 0 as u32
+    }
+    if n == 0 {
+        return RES_USED
+    }
+    (*v).tn = 0
+    var t: usize = (*v).cur
+    let last: usize = n - 1
+    if key == editor.KEY_HOME {
+        t = 0
+    } else if key == editor.KEY_END {
+        t = last
+    } else if t == NONE {
+        t = vl_first(v)
+        if t >= n {
+            t = last
+        }
+    } else if key == editor.KEY_UP {
+        if t > 0 {
+            t = t - 1
+        }
+    } else if key == editor.KEY_DOWN {
+        if t < last {
+            t = t + 1
+        }
+    } else if key == editor.KEY_PGDN {
+        var k: usize = vl_index_at(v, vl_row_top(v, t) + viewport.viewport_inner_h(&(*v).vp))
+        if k == NONE {
+            k = last
+        }
+        if k <= t {
+            k = t + 1
+        }
+        if k > last {
+            k = last
+        }
+        t = k
+    } else {
+        var y: f64 = vl_row_top(v, t) - viewport.viewport_inner_h(&(*v).vp)
+        if y < 0.0 {
+            y = 0.0
+        }
+        var k2: usize = vl_index_at(v, y)
+        if k2 == NONE {
+            k2 = 0
+        }
+        if k2 >= t && t > 0 {
+            k2 = t - 1
+        }
+        t = k2
+    }
+    var res: u32 = RES_USED
+    if t != (*v).cur {
+        res = res | RES_MOVED
+    }
+    if (*v).multi && has_mod(mods, editor.MOD_CTRL) {
+        // Ctrl: only the focus moves
+        (*v).cur = t
+    } else if (*v).multi && has_mod(mods, editor.MOD_SHIFT) {
+        var a0: usize = (*v).anchor
+        if a0 == NONE {
+            a0 = t
+        }
+        vl_select_range(v, a0, t)
+        res = res | RES_SELECT
+    } else {
+        let was: bool = vl_is_selected(v, t) && (*v).nsel == 1
+        vl_select_only(v, t)
+        if !was {
+            res = res | RES_SELECT
+        }
+    }
+    let b: bool = vl_reveal(v, t)
+    if b {
+        res = res | RES_MOVED
+    }
+    return res
+}
+
+// ============================================================ TYPEAHEAD
+
+fn lower(b: u8) -> u8 {
+    if b >= 65 as u8 && b <= 90 as u8 {
+        return b + 32 as u8
+    }
+    return b
+}
+
+fn vl_set_type_col(v: *mut Vlist, col: usize) { (*v).tcol = col }
+
+// The text typed so far (for a test or a status line).
+fn vl_typeahead_text(v: *mut Vlist, out: *mut [u8; 48]) -> usize {
+    var i: usize = 0
+    while i < (*v).tn {
+        (*out)[i] = (*v).tbuf[i]
+        i = i + 1
+    }
+    return (*v).tn
+}
+
+fn push_utf8(v: *mut Vlist, cp: u32) -> bool {
+    var need: usize = 1
+    if cp >= (128 as u32) { need = 2 }
+    if cp >= (2048 as u32) { need = 3 }
+    if cp >= (65536 as u32) { need = 4 }
+    if (*v).tn + need > 48 {
+        return false
+    }
+    let t: usize = (*v).tn
+    if need == 1 {
+        (*v).tbuf[t] = cp as u8
+    } else if need == 2 {
+        (*v).tbuf[t] = (192 as u32 | (cp >> 6)) as u8
+        (*v).tbuf[t + 1] = (128 as u32 | (cp & (63 as u32))) as u8
+    } else if need == 3 {
+        (*v).tbuf[t] = (224 as u32 | (cp >> 12)) as u8
+        (*v).tbuf[t + 1] = (128 as u32 | ((cp >> 6) & (63 as u32))) as u8
+        (*v).tbuf[t + 2] = (128 as u32 | (cp & (63 as u32))) as u8
+    } else {
+        (*v).tbuf[t] = (240 as u32 | (cp >> 18)) as u8
+        (*v).tbuf[t + 1] = (128 as u32 | ((cp >> 12) & (63 as u32))) as u8
+        (*v).tbuf[t + 2] = (128 as u32 | ((cp >> 6) & (63 as u32))) as u8
+        (*v).tbuf[t + 3] = (128 as u32 | (cp & (63 as u32))) as u8
+    }
+    (*v).tn = t + need
+    return true
+}
+
+fn starts_with(v: *mut Vlist, r: *mut VRow) -> bool {
+    if (*r).n < (*v).tn {
+        return false
+    }
+    var i: usize = 0
+    while i < (*v).tn {
+        if lower((*r).text[i]) != lower((*v).tbuf[i]) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// A character (a code point) with the modifier bits and the time in ms.
+// Ctrl+A selects all (multi), Ctrl+Space toggles the focused row, a plain
+// Space with nothing typed toggles / chooses it, anything else is typeahead:
+// the next row (after the focus) whose text starts with what was typed. The
+// text of a row comes from `f(ud, index, &row)`. Returns RES_* bits.
+fn vl_char(v: *mut Vlist, cp: u32, mods: u32, ms: i64, ud: u64,
+    f: fn(u64, usize, *mut VRow)) -> u32 {
+    let n: usize = (*v).n
+    if n == 0 {
+        return 0 as u32
+    }
+    if has_mod(mods, editor.MOD_CTRL) {
+        if cp == (97 as u32) || cp == (65 as u32) || cp == (1 as u32) {
+            if (*v).multi {
+                vl_select_all(v)
+                return RES_SELECT | RES_USED
+            }
+            return RES_USED
+        }
+        if cp == (32 as u32) && (*v).multi && (*v).cur != NONE {
+            vl_select_toggle(v, (*v).cur)
+            return RES_SELECT | RES_USED
+        }
+        return 0 as u32
+    }
+    if has_mod(mods, editor.MOD_ALT) || cp < (32 as u32) || cp == (127 as u32) {
+        return 0 as u32
+    }
+    if ms - (*v).tms > 1000 as i64 || ms < (*v).tms {
+        (*v).tn = 0
+    }
+    (*v).tms = ms
+    if cp == (32 as u32) && (*v).tn == 0 {
+        if (*v).cur == NONE {
+            return 0 as u32
+        }
+        if (*v).multi {
+            vl_select_toggle(v, (*v).cur)
+        } else {
+            vl_select_only(v, (*v).cur)
+        }
+        return RES_SELECT | RES_USED
+    }
+    if !push_utf8(v, cp) {
+        return RES_USED
+    }
+    // a longer word keeps the focused row if it still fits; a first letter
+    // starts after the focus (so pressing "a" again walks the "a" rows)
+    var start: usize = 0
+    if (*v).cur != NONE {
+        start = (*v).cur
+        if (*v).tn == 1 {
+            start = (*v).cur + 1
+        }
+    }
+    var r: VRow = vrow_new()
+    var k: usize = 0
+    while k < n {
+        let idx: usize = (start + k) % n
+        r.col = (*v).tcol
+        r.n = 0
+        f(ud, idx, &r)
+        if starts_with(v, &r) && !r.disabled {
+            vl_select_only(v, idx)
+            let b: bool = vl_reveal(v, idx)
+            return RES_SELECT | RES_MOVED | RES_USED
+        }
+        k = k + 1
+    }
+    return RES_USED
+}
+
+// ============================================================ COLUMNS (a table)
+
+// `n` columns (at most COL_MAX), all as wide as the body divided evenly.
+fn vl_set_columns(v: *mut Vlist, n: usize) {
+    var k: usize = n
+    if k > COL_MAX {
+        k = COL_MAX
+    }
+    (*v).ncol = k
+    var i: usize = 0
+    while i < k {
+        if (*v).colw[i] < COL_MIN_W {
+            var w: f64 = (*v).w / (k as f64)
+            if w < COL_MIN_W {
+                w = COL_MIN_W
+            }
+            (*v).colw[i] = w
+        }
+        i = i + 1
+    }
+}
+
+fn vl_columns(v: *mut Vlist) -> usize { return (*v).ncol }
+
+// The header text of column `c`. NOT copied: it has to live as long as the list.
+fn vl_set_col_title(v: *mut Vlist, c: usize, s: str) {
+    if c < (*v).ncol {
+        (*v).tp[c] = s.p as u64
+        (*v).tl[c] = s.n
+    }
+}
+
+fn vl_col_title(v: *mut Vlist, c: usize) -> str {
+    if c >= (*v).ncol {
+        return ""
+    }
+    return str { p: (*v).tp[c] as *mut u8, n: (*v).tl[c] }
+}
+
+fn vl_set_col_width(v: *mut Vlist, c: usize, w: f64) {
+    if c >= (*v).ncol {
+        return
+    }
+    var x: f64 = w
+    if x < COL_MIN_W {
+        x = COL_MIN_W
+    }
+    (*v).colw[c] = x
+}
+
+// The width of column `c`; the LAST column also takes what is left of the
+// body width.
+fn vl_col_width(v: *mut Vlist, c: usize) -> f64 {
+    if c >= (*v).ncol {
+        return 0.0
+    }
+    if c + 1 == (*v).ncol {
+        let rest: f64 = viewport.viewport_inner_w(&(*v).vp) - vl_col_x(v, c)
+        if rest > (*v).colw[c] {
+            return rest
+        }
+    }
+    return (*v).colw[c]
+}
+
+// Left edge of column `c`, relative to the control's left edge.
+fn vl_col_x(v: *mut Vlist, c: usize) -> f64 {
+    var x: f64 = 0.0
+    var i: usize = 0
+    while i < c && i < (*v).ncol {
+        x = x + (*v).colw[i]
+        i = i + 1
+    }
+    return x
+}
+
+// The column at window x; NONE outside.
+fn vl_col_at(v: *mut Vlist, px: f64) -> usize {
+    let rx: f64 = px - (*v).x
+    if rx < 0.0 {
+        return NONE
+    }
+    var i: usize = 0
+    while i < (*v).ncol {
+        let x0: f64 = vl_col_x(v, i)
+        if rx >= x0 && rx < x0 + vl_col_width(v, i) {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// The column whose RIGHT edge is within `grab` px of window x (a divider to
+// drag); NONE if none.
+fn vl_divider_at(v: *mut Vlist, px: f64, grab: f64) -> usize {
+    let rx: f64 = px - (*v).x
+    var i: usize = 0
+    while i < (*v).ncol {
+        let edge: f64 = vl_col_x(v, i) + vl_col_width(v, i)
+        var d: f64 = rx - edge
+        if d < 0.0 {
+            d = 0.0 - d
+        }
+        if d <= grab {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn vl_col_drag_begin(v: *mut Vlist, c: usize, px: f64) {
+    if c >= (*v).ncol {
+        return
+    }
+    (*v).drag_col = c
+    (*v).drag_x = px
+    (*v).drag_w = vl_col_width(v, c)
+}
+
+// True while the width changed.
+fn vl_col_drag(v: *mut Vlist, px: f64) -> bool {
+    if (*v).drag_col == NONE {
+        return false
+    }
+    let old: f64 = (*v).colw[(*v).drag_col]
+    vl_set_col_width(v, (*v).drag_col, (*v).drag_w + (px - (*v).drag_x))
+    return (*v).colw[(*v).drag_col] != old
+}
+
+fn vl_col_drag_end(v: *mut Vlist) { (*v).drag_col = NONE }
+fn vl_col_dragging(v: *mut Vlist) -> bool { return (*v).drag_col != NONE }
+
+fn vl_sort_col(v: *mut Vlist) -> usize { return (*v).sort_col }
+fn vl_sort_desc(v: *mut Vlist) -> bool { return (*v).sort_desc }
+
+fn vl_set_sort(v: *mut Vlist, col: usize, desc: bool) {
+    (*v).sort_col = col
+    (*v).sort_desc = desc
+}
+
+// A click on header cell `c`: the same column flips the direction, another
+// one becomes the sort column (ascending). The program re-sorts its own
+// data, then calls `vl_changed`.
+fn vl_header_click(v: *mut Vlist, c: usize) -> bool {
+    if c >= (*v).ncol {
+        return false
+    }
+    if (*v).sort_col == c {
+        (*v).sort_desc = !(*v).sort_desc
+    } else {
+        (*v).sort_col = c
+        (*v).sort_desc = false
+    }
+    return true
+}
