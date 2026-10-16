@@ -1,0 +1,612 @@
+// expect_exit: 0
+// tests/3322_mail_imap.fi -- mail.imap core (sans-I/O): scripted dialogues, framing byte by byte,
+// literals, ENVELOPE / BODYSTRUCTURE, IDLE, STARTTLS, UTF-7, errors, fuzz.
+// The network glue and the real wire are tools/mail/e2e.sh (fake_mail.py).
+import std.rt
+import std.str
+import mail.imap
+
+static mut failures: i32 = 0
+static mut seed: u64 = 777
+
+fn check(name: str, ok: bool) {
+    if !ok {
+        failures += 1
+        rt.write_everything(1, "  FAIL  ".p as u64, 8)
+        rt.write_everything(1, name.p as u64, name.n)
+        rt.write_everything(1, "\n".p as u64, 1)
+    }
+}
+
+fn rnd() -> u64 {
+    seed = seed *% 6364136223846793005 +% 1442695040888963407
+    return seed >> 33
+}
+
+fn feed(c: *mut imap.Imap, s: str) -> bool {
+    return imap.imap_feed(c, s.p as u64, s.n)
+}
+
+// feeds one octet at a time
+fn feed_slow(c: *mut imap.Imap, s: str) {
+    var i: usize = 0
+    while i < s.n {
+        imap.imap_feed(c, s.p as u64 + i as u64, 1)
+        i += 1
+    }
+}
+
+fn out_is(c: *mut imap.Imap, want: str) -> bool {
+    let n: usize = imap.imap_out_len(c)
+    let ok: bool = n == want.n && rt.mem_eq(imap.imap_out_ptr(c), want.p as u64, want.n)
+    if !ok {
+        rt.write_everything(1, "    got: ".p as u64, 9)
+        rt.write_everything(1, imap.imap_out_ptr(c), n)
+        rt.write_everything(1, "\n".p as u64, 1)
+    }
+    imap.imap_out_consume(c, n)
+    return ok
+}
+
+fn node_eq(c: *mut imap.Imap, n: usize, want: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    let ok: bool = imap.imap_node_text(c, n, &b)
+    let same: bool = ok && rt.buf_len(&b) == want.n && rt.mem_eq(rt.buf_ptr(&b), want.p as u64, want.n)
+    rt.buf_free(&b)
+    return same
+}
+
+fn buf_eq(b: *mut rt.Buf, want: str) -> bool {
+    return rt.buf_len(b) == want.n && rt.mem_eq(rt.buf_ptr(b), want.p as u64, want.n)
+}
+
+// plain session up to the authenticated state
+fn logged_in(c: *mut imap.Imap) {
+    imap.imap_set_insecure_auth(c, true)
+    feed(c, "* OK [CAPABILITY IMAP4rev1 IDLE UIDPLUS] ready\r\n")
+    imap.imap_events(c)
+    imap.imap_login(c, "bob", "pa\"ss")
+    out_is(c, "A0001 LOGIN \"bob\" \"pa\\\"ss\"\r\n")
+    feed(c, "A0001 OK logged in\r\n")
+    imap.imap_events(c)
+}
+
+fn selected(c: *mut imap.Imap) {
+    logged_in(c)
+    imap.imap_select(c, "INBOX", false)
+    out_is(c, "A0002 SELECT \"INBOX\"\r\n")
+    feed(c, "* 3 EXISTS\r\n* 1 RECENT\r\n* OK [UIDVALIDITY 77] v\r\n* OK [UIDNEXT 9] n\r\n* OK [UNSEEN 2] u\r\n* FLAGS (\\Seen \\Deleted)\r\nA0002 OK [READ-WRITE] done\r\n")
+    imap.imap_events(c)
+}
+
+fn test_greeting_login() {
+    var c: imap.Imap = imap.imap_new()
+    check("g state0", imap.imap_state(&c) == imap.IS_GREET)
+    check("g partial", feed(&c, "* OK [CAPABILITY IMAP4rev1 STARTTLS LOGINDIS"))
+    check("g no event", imap.imap_events(&c) == 0)
+    feed(&c, "ABLED] hi there\r\n")
+    check("g event", (imap.imap_events(&c) & imap.IEV_GREETING) != 0)
+    check("g state", imap.imap_state(&c) == imap.IS_NOAUTH)
+    check("g caps", imap.imap_caps(&c) == (imap.ICAP_IMAP4REV1 | imap.ICAP_STARTTLS | imap.ICAP_LOGINDISABLED))
+    check("g text", imap.imap_last_text(&c).n == 8)
+    check("g login insecure", !imap.imap_login(&c, "a", "b") && imap.imap_err(&c) == imap.IERR_AUTH_INSECURE)
+    imap.imap_set_insecure_auth(&c, true)
+    check("g login bad arg", !imap.imap_login(&c, "a", "b\r\nc") && imap.imap_err(&c) == imap.IERR_BAD_ARG)
+    check("g login bad nul", !imap.imap_login(&c, "a", "b\u{0}c") && imap.imap_err(&c) == imap.IERR_BAD_ARG)
+    check("g no leak", imap.imap_out_len(&c) == 0 && !imap.imap_busy(&c))
+    check("g login", imap.imap_login(&c, "u ser", "p\\w"))
+    check("g login out", out_is(&c, "A0001 LOGIN \"u ser\" \"p\\\\w\"\r\n"))
+    check("g busy", imap.imap_busy(&c) && !imap.imap_noop(&c) && imap.imap_err(&c) == imap.IERR_BUSY)
+    feed(&c, "A0001 NO [AUTHENTICATIONFAILED] bad credentials\r\n")
+    check("g no ev", (imap.imap_events(&c) & imap.IEV_DONE) != 0)
+    check("g no res", imap.imap_last_result(&c) == 1 && imap.imap_last_kind(&c) == imap.CK_LOGIN)
+    check("g no code", node_text_is(imap.imap_last_code(&c), "AUTHENTICATIONFAILED"))
+    check("g still noauth", imap.imap_state(&c) == imap.IS_NOAUTH)
+    check("g login2", imap.imap_login(&c, "u", "p"))
+    out_is(&c, "A0002 LOGIN \"u\" \"p\"\r\n")
+    feed(&c, "* CAPABILITY IMAP4rev1 IDLE\r\nA0002 OK [CAPABILITY IMAP4rev1 IDLE MOVE] ok\r\n")
+    check("g auth", imap.imap_state(&c) == imap.IS_AUTH)
+    check("g caps2", imap.imap_caps(&c) == (imap.ICAP_IMAP4REV1 | imap.ICAP_IDLE | imap.ICAP_MOVE))
+    check("g needs sel", !imap.imap_fetch(&c, "1", "(UID)", false) && imap.imap_err(&c) == imap.IERR_STATE)
+    imap.imap_free(&c)
+}
+
+fn node_text_is(a: str, want: str) -> bool {
+    return a.n == want.n && rt.mem_eq(a.p as u64, want.p as u64, want.n)
+}
+
+fn test_preauth_bye() {
+    var c: imap.Imap = imap.imap_new()
+    feed(&c, "* PREAUTH welcome\r\n")
+    check("pa state", imap.imap_state(&c) == imap.IS_AUTH)
+    imap.imap_free(&c)
+    var d: imap.Imap = imap.imap_new()
+    feed(&d, "* BYE go away\r\n")
+    check("bye greet fails", imap.imap_state(&d) == imap.IS_GREET || imap.imap_state(&d) == imap.IS_FAILED)
+    imap.imap_free(&d)
+    var e: imap.Imap = imap.imap_new()
+    feed(&e, "garbage\r\n")
+    check("bad greet", imap.imap_state(&e) == imap.IS_FAILED)
+    imap.imap_free(&e)
+}
+
+fn test_auth_plain() {
+    var c: imap.Imap = imap.imap_new()
+    imap.imap_set_insecure_auth(&c, true)
+    feed(&c, "* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN SASL-IR] x\r\n")
+    check("ap ir", imap.imap_authenticate_plain(&c, "bob", "pw"))
+    // base64 of "\0bob\0pw"
+    check("ap ir out", out_is(&c, "A0001 AUTHENTICATE PLAIN AGJvYgBwdw==\r\n"))
+    feed(&c, "A0001 OK done\r\n")
+    check("ap ir state", imap.imap_state(&c) == imap.IS_AUTH)
+    imap.imap_free(&c)
+    var d: imap.Imap = imap.imap_new()
+    imap.imap_set_insecure_auth(&d, true)
+    feed(&d, "* OK [CAPABILITY IMAP4rev1 AUTH=PLAIN] x\r\n")
+    imap.imap_authenticate_plain(&d, "bob", "pw")
+    check("ap cont first", out_is(&d, "A0001 AUTHENTICATE PLAIN\r\n"))
+    feed(&d, "+ \r\n")
+    check("ap cont out", out_is(&d, "AGJvYgBwdw==\r\n"))
+    feed(&d, "A0001 OK done\r\n")
+    check("ap cont state", imap.imap_state(&d) == imap.IS_AUTH)
+    imap.imap_free(&d)
+}
+
+fn test_select_fetch() {
+    var c: imap.Imap = imap.imap_new()
+    selected(&c)
+    check("s state", imap.imap_state(&c) == imap.IS_SELECTED)
+    check("s exists", imap.imap_exists(&c) == 3 && imap.imap_recent(&c) == 1)
+    check("s uidv", imap.imap_uidvalidity(&c) == 77 && imap.imap_uidnext(&c) == 9 && imap.imap_unseen(&c) == 2)
+    check("s rw", !imap.imap_read_only(&c))
+    check("s fetch", imap.imap_fetch(&c, "1:*", "(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (DATE)])", false))
+    check("s fetch out", out_is(&c, "A0003 FETCH 1:* (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (DATE)])\r\n"))
+    let lit: str = "* 1 FETCH (UID 4 FLAGS (\\Seen $Foo) RFC822.SIZE 120 BODY[HEADER.FIELDS (DATE)] {32}\r\nDate: Mon, 1 Jan 2024 10:00:00\r\n)\r\n"
+    feed_slow(&c, lit)
+    feed(&c, "* 2 FETCH (UID 7 FLAGS () RFC822.SIZE 5)\r\n* 3 FETCH (FLAGS (\\Answered \\Deleted \\Draft \\Flagged))\r\nA0003 OK done\r\n")
+    check("f count", imap.imap_fetch_count(&c) == 3)
+    check("f seq", imap.imap_fetch_seq(&c, 0) == 1 && imap.imap_fetch_seq(&c, 1) == 2 && imap.imap_fetch_seq(&c, 2) == 3)
+    check("f uid", imap.imap_fetch_uid(&c, 0) == 4 && imap.imap_fetch_uid(&c, 1) == 7 && imap.imap_fetch_uid(&c, 2) == 0)
+    check("f size", imap.imap_fetch_size(&c, 0) == 120 && imap.imap_fetch_size(&c, 1) == 5)
+    check("f flags0", imap.imap_fetch_flags(&c, 0) == imap.FL_SEEN)
+    check("f flags1", imap.imap_fetch_flags(&c, 1) == 0)
+    check("f flags2", imap.imap_fetch_flags(&c, 2) == (imap.FL_ANSWERED | imap.FL_DELETED | imap.FL_DRAFT | imap.FL_FLAGGED))
+    check("f kw", imap.imap_node_count(&c, imap.imap_fetch_flags_node(&c, 0)) == 2)
+    var b: rt.Buf = rt.buf_new()
+    check("f body", imap.imap_fetch_body(&c, 0, "HEADER.FIELDS (DATE)", &b) && buf_eq(&b, "Date: Mon, 1 Jan 2024 10:00:00\r\n"))
+    rt.buf_free(&b)
+    check("f missing", imap.imap_fetch_item(&c, 2, "RFC822.SIZE") == imap.NONE)
+    imap.imap_free(&c)
+}
+
+fn test_literal_in_list() {
+    var c: imap.Imap = imap.imap_new()
+    selected(&c)
+    imap.imap_fetch(&c, "1", "(ENVELOPE BODY[1])", false)
+    imap.imap_out_consume(&c, imap.imap_out_len(&c))
+    // a literal that holds CRLF, ")" and a fake tagged line, then more items behind it
+    let body: str = "x)\r\nA0003 OK fake\r\n{5}\r\n"
+    var msg: rt.Buf = rt.buf_new()
+    let head: str = "* 1 FETCH (BODY[1] {"
+    var nbuf: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&nbuf, body.n as u64)
+    rt.buf_push_bytes(&msg, head.p as u64, head.n)
+    rt.buf_push_bytes(&msg, rt.buf_ptr(&nbuf), rt.buf_len(&nbuf))
+    rt.buf_push_bytes(&msg, "}\r\n".p as u64, 3)
+    rt.buf_push_bytes(&msg, body.p as u64, body.n)
+    rt.buf_push_bytes(&msg, " UID 9)\r\nA0003 OK done\r\n".p as u64, 24)
+    var i: usize = 0
+    while i < rt.buf_len(&msg) {
+        imap.imap_feed(&c, rt.buf_ptr(&msg) + i as u64, 1)
+        i += 1
+    }
+    check("l fetch done", imap.imap_last_kind(&c) == imap.CK_FETCH && imap.imap_last_result(&c) == 0)
+    check("l count", imap.imap_fetch_count(&c) == 1)
+    check("l uid", imap.imap_fetch_uid(&c, 0) == 9)
+    var b: rt.Buf = rt.buf_new()
+    check("l body", imap.imap_fetch_body(&c, 0, "1", &b) && buf_eq(&b, body))
+    rt.buf_free(&b)
+    rt.buf_free(&nbuf)
+    rt.buf_free(&msg)
+    imap.imap_free(&c)
+}
+
+fn test_envelope_bs() {
+    var c: imap.Imap = imap.imap_new()
+    selected(&c)
+    imap.imap_fetch(&c, "1", "(ENVELOPE BODYSTRUCTURE)", false)
+    imap.imap_out_consume(&c, imap.imap_out_len(&c))
+    let env: str = "(\"Mon, 1 Jan 2024 10:00:00 +0000\" \"Hi \\\"you\\\"\" ((\"Al Ice\" NIL \"al\" \"ex.org\")) ((\"Al Ice\" NIL \"al\" \"ex.org\")) NIL ((NIL NIL \"bob\" \"ex.net\")(\"B C\" NIL \"cy\" \"ex.net\")) NIL NIL NIL \"<m1@ex.org>\")"
+    let bs: str = "((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"utf-8\") NIL NIL \"7BIT\" 12 1 NIL NIL NIL)((\"TEXT\" \"HTML\" (\"CHARSET\" \"utf-8\") NIL NIL \"QUOTED-PRINTABLE\" 40 2 NIL NIL NIL)(\"IMAGE\" \"PNG\" (\"NAME\" \"a.png\") \"<cid1>\" NIL \"BASE64\" 900 NIL (\"INLINE\" (\"FILENAME\" \"b.png\")) NIL) \"RELATED\" (\"BOUNDARY\" \"zz\") NIL NIL NIL)(\"APPLICATION\" \"PDF\" (\"NAME\" \"x.pdf\") NIL NIL \"BASE64\" 3000 NIL (\"ATTACHMENT\" (\"FILENAME\" \"x.pdf\")) NIL NIL) \"MIXED\" (\"BOUNDARY\" \"yy\") (\"INLINE\" NIL) NIL NIL)"
+    var m: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&m, "* 1 FETCH (ENVELOPE ".p as u64, 19)
+    rt.buf_push_bytes(&m, env.p as u64, env.n)
+    rt.buf_push_bytes(&m, " BODYSTRUCTURE ".p as u64, 15)
+    rt.buf_push_bytes(&m, bs.p as u64, bs.n)
+    rt.buf_push_bytes(&m, ")\r\nA0003 OK ok\r\n".p as u64, 17)
+    imap.imap_feed(&c, rt.buf_ptr(&m), rt.buf_len(&m))
+    rt.buf_free(&m)
+    check("e fetched", imap.imap_fetch_count(&c) == 1 && imap.imap_state(&c) == imap.IS_SELECTED)
+    check("e date", node_eq(&c, imap.imap_env_field(&c, 0, 0), "Mon, 1 Jan 2024 10:00:00 +0000"))
+    check("e subject", node_eq(&c, imap.imap_env_field(&c, 0, 1), "Hi \"you\""))
+    var b: rt.Buf = rt.buf_new()
+    imap.imap_addr_format(&c, imap.imap_env_field(&c, 0, 2), &b)
+    check("e from", buf_eq(&b, "Al Ice <al@ex.org>"))
+    rt.buf_clear(&b)
+    imap.imap_addr_format(&c, imap.imap_env_field(&c, 0, 5), &b)
+    check("e to", buf_eq(&b, "bob@ex.net, B C <cy@ex.net>"))
+    check("e to count", imap.imap_addr_count(&c, imap.imap_env_field(&c, 0, 5)) == 2)
+    check("e cc nil", imap.imap_node_kind(&c, imap.imap_env_field(&c, 0, 6)) == imap.NK_NIL)
+    check("e mid", node_eq(&c, imap.imap_env_field(&c, 0, 9), "<m1@ex.org>"))
+    check("e addr part", node_eq(&c, imap.imap_addr_part(&c, imap.imap_env_field(&c, 0, 5), 1, 2), "cy"))
+    let n: usize = imap.imap_bs_build(&c, 0, "")
+    check("b count", n == 6)
+    // order: 0 mixed, 1 text/plain, 2 related, 3 text/html, 4 image, 5 pdf
+    check("b multi", imap.imap_bs_multi(&c, 0) && !imap.imap_bs_multi(&c, 1) && imap.imap_bs_multi(&c, 2))
+    check("b sub0", node_eq(&c, imap.imap_bs_subtype(&c, 0), "MIXED"))
+    check("b sub2", node_eq(&c, imap.imap_bs_subtype(&c, 2), "RELATED"))
+    check("b boundary", node_eq(&c, imap.imap_bs_param(&c, 0, "boundary"), "yy"))
+    check("b charset", node_eq(&c, imap.imap_bs_param(&c, 1, "CHARSET"), "utf-8"))
+    check("b enc", node_eq(&c, imap.imap_bs_encoding(&c, 3), "QUOTED-PRINTABLE"))
+    check("b size", imap.imap_bs_size(&c, 4) == 900 && imap.imap_bs_size(&c, 0) == 0)
+    check("b cid", node_eq(&c, imap.imap_bs_id(&c, 4), "<cid1>"))
+    check("b fname img", node_eq(&c, imap.imap_bs_filename(&c, 4), "b.png"))
+    check("b fname pdf", node_eq(&c, imap.imap_bs_filename(&c, 5), "x.pdf"))
+    check("b fname none", imap.imap_bs_filename(&c, 1) == imap.NONE)
+    check("b disp pdf", node_eq(&c, imap.imap_node_child(&c, imap.imap_bs_disposition(&c, 5)), "ATTACHMENT"))
+    check("b disp multi", node_eq(&c, imap.imap_node_child(&c, imap.imap_bs_disposition(&c, 0)), "INLINE"))
+    rt.buf_clear(&b)
+    imap.imap_bs_path(&c, 0, &b)
+    check("b path top", buf_eq(&b, ""))
+    rt.buf_clear(&b)
+    imap.imap_bs_path(&c, 1, &b)
+    check("b path 1", buf_eq(&b, "1"))
+    rt.buf_clear(&b)
+    imap.imap_bs_path(&c, 2, &b)
+    check("b path 2", buf_eq(&b, "2"))
+    rt.buf_clear(&b)
+    imap.imap_bs_path(&c, 3, &b)
+    check("b path 2.1", buf_eq(&b, "2.1"))
+    rt.buf_clear(&b)
+    imap.imap_bs_path(&c, 4, &b)
+    check("b path 2.2", buf_eq(&b, "2.2"))
+    rt.buf_clear(&b)
+    imap.imap_bs_path(&c, 5, &b)
+    check("b path 3", buf_eq(&b, "3"))
+    check("b parent", imap.imap_bs_parent(&c, 4) == 2 && imap.imap_bs_parent(&c, 0) == imap.NONE)
+    rt.buf_free(&b)
+    imap.imap_free(&c)
+}
+
+fn test_list_search_status() {
+    var c: imap.Imap = imap.imap_new()
+    logged_in(&c)
+    check("ls list", imap.imap_list(&c, "", "*", false))
+    check("ls list out", out_is(&c, "A0002 LIST \"\" \"*\"\r\n"))
+    feed(&c, "* LIST (\\HasNoChildren) \"/\" INBOX\r\n* LIST (\\Noselect \\HasChildren) \"/\" \"My Stuff\"\r\n* LIST () NIL {3}\r\nA/b\r\nA0002 OK done\r\n")
+    check("ls count", imap.imap_list_count(&c) == 3)
+    check("ls name0", node_eq(&c, imap.imap_list_name(&c, 0), "INBOX"))
+    check("ls name1", node_eq(&c, imap.imap_list_name(&c, 1), "My Stuff"))
+    check("ls name2", node_eq(&c, imap.imap_list_name(&c, 2), "A/b"))
+    check("ls delim", node_eq(&c, imap.imap_list_delim(&c, 0), "/") && imap.imap_node_kind(&c, imap.imap_list_delim(&c, 2)) == imap.NK_NIL)
+    check("ls attrs", imap.imap_node_count(&c, imap.imap_list_attrs(&c, 1)) == 2)
+    check("ls status", imap.imap_status(&c, "INBOX", "(MESSAGES UNSEEN UIDNEXT)"))
+    check("ls status out", out_is(&c, "A0003 STATUS \"INBOX\" (MESSAGES UNSEEN UIDNEXT)\r\n"))
+    feed(&c, "* STATUS \"INBOX\" (MESSAGES 231 UIDNEXT 44292 UNSEEN 3)\r\nA0003 OK done\r\n")
+    check("ls status vals", imap.imap_status_get(&c, "MESSAGES") == 231 && imap.imap_status_get(&c, "UIDNEXT") == 44292 && imap.imap_status_get(&c, "unseen") == 3 && imap.imap_status_get(&c, "RECENT") == 0)
+    check("ls status bad", !imap.imap_status(&c, "INBOX", "(A)\r\nB"))
+    imap.imap_select(&c, "INBOX", true)
+    out_is(&c, "A0004 EXAMINE \"INBOX\"\r\n")
+    feed(&c, "* 4 EXISTS\r\nA0004 OK [READ-ONLY] ok\r\n")
+    check("ls ro", imap.imap_read_only(&c) && imap.imap_state(&c) == imap.IS_SELECTED)
+    check("ls search", imap.imap_search(&c, "UNSEEN FROM \"bob\"", true))
+    check("ls search out", out_is(&c, "A0005 UID SEARCH UNSEEN FROM \"bob\"\r\n"))
+    feed(&c, "* SEARCH 2 84 882\r\nA0005 OK done\r\n")
+    check("ls search n", imap.imap_search_count(&c) == 3 && imap.imap_search_at(&c, 0) == 2 && imap.imap_search_at(&c, 2) == 882)
+    imap.imap_search(&c, "ALL", false)
+    out_is(&c, "A0006 SEARCH ALL\r\n")
+    feed(&c, "* SEARCH\r\nA0006 OK done\r\n")
+    check("ls search empty", imap.imap_search_count(&c) == 0)
+    check("ls store", imap.imap_store(&c, "1:3", "+FLAGS.SILENT", "(\\Deleted)", true))
+    check("ls store out", out_is(&c, "A0007 UID STORE 1:3 +FLAGS.SILENT (\\Deleted)\r\n"))
+    feed(&c, "A0007 OK done\r\n")
+    check("ls expunge", imap.imap_expunge(&c, ""))
+    check("ls expunge out", out_is(&c, "A0008 EXPUNGE\r\n"))
+    feed(&c, "* 3 EXPUNGE\r\n* 3 EXPUNGE\r\nA0008 OK done\r\n")
+    check("ls expunge n", imap.imap_exists(&c) == 2)
+    check("ls uid expunge", imap.imap_expunge(&c, "5,7"))
+    check("ls uid expunge out", out_is(&c, "A0009 UID EXPUNGE 5,7\r\n"))
+    feed(&c, "A0009 OK done\r\n")
+    check("ls copy", imap.imap_copy(&c, "1", "Archive/2024", false))
+    check("ls copy out", out_is(&c, "A0010 COPY 1 \"Archive/2024\"\r\n"))
+    feed(&c, "A0010 OK [COPYUID 1 1 1] done\r\n")
+    check("ls copy code", node_text_is(imap.imap_last_code(&c), "COPYUID"))
+    check("ls close", imap.imap_close(&c))
+    out_is(&c, "A0011 CLOSE\r\n")
+    feed(&c, "A0011 OK done\r\n")
+    check("ls close state", imap.imap_state(&c) == imap.IS_AUTH)
+    check("ls noop", imap.imap_noop(&c))
+    out_is(&c, "A0012 NOOP\r\n")
+    feed(&c, "A0012 OK done\r\n")
+    check("ls raw", imap.imap_raw(&c, "NAMESPACE"))
+    out_is(&c, "A0013 NAMESPACE\r\n")
+    feed(&c, "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\nA0013 OK done\r\n")
+    check("ls raw ok", imap.imap_last_kind(&c) == imap.CK_RAW && imap.imap_last_result(&c) == 0)
+    check("ls logout", imap.imap_logout(&c))
+    out_is(&c, "A0014 LOGOUT\r\n")
+    feed(&c, "* BYE bye\r\nA0014 OK done\r\n")
+    check("ls logout state", imap.imap_state(&c) == imap.IS_LOGOUT)
+    check("ls quit ev", (imap.imap_events(&c) & imap.IEV_QUIT) != 0)
+    imap.imap_eof(&c)
+    check("ls closed", imap.imap_state(&c) == imap.IS_CLOSED)
+    imap.imap_free(&c)
+}
+
+fn test_bad_args() {
+    var c: imap.Imap = imap.imap_new()
+    selected(&c)
+    check("ba select", !imap.imap_select(&c, "a\r\nb", false) && imap.imap_err(&c) == imap.IERR_BAD_ARG)
+    check("ba select no leak", imap.imap_out_len(&c) == 0 && !imap.imap_busy(&c))
+    check("ba fetch crlf", !imap.imap_fetch(&c, "1", "(UID)\r\nA9 DELETE x", false))
+    check("ba fetch brace", !imap.imap_fetch(&c, "1", "BODY[] {5}", false))
+    check("ba fetch empty", !imap.imap_fetch(&c, "", "(UID)", false))
+    check("ba search nul", !imap.imap_search(&c, "ALL\u{0}", false))
+    check("ba store", !imap.imap_store(&c, "1", "+FLAGS\n", "(\\Seen)", false))
+    check("ba copy", !imap.imap_copy(&c, "1", "x\ny", false))
+    check("ba raw", !imap.imap_raw(&c, "NOOP\r\nA2 NOOP"))
+    check("ba raw empty", !imap.imap_raw(&c, ""))
+    check("ba clean", imap.imap_out_len(&c) == 0 && !imap.imap_busy(&c))
+    check("ba ok after", imap.imap_noop(&c))
+    imap.imap_free(&c)
+}
+
+fn test_idle() {
+    var c: imap.Imap = imap.imap_new()
+    selected(&c)
+    check("i idle", imap.imap_idle(&c))
+    check("i out", out_is(&c, "A0003 IDLE\r\n"))
+    feed(&c, "+ idling\r\n")
+    check("i state", imap.imap_state(&c) == imap.IS_IDLE && (imap.imap_events(&c) & imap.IEV_IDLE) != 0)
+    check("i no cmd", !imap.imap_noop(&c))
+    feed(&c, "* 4 EXISTS\r\n* 2 FETCH (FLAGS (\\Seen))\r\n")
+    check("i push", (imap.imap_events(&c) & imap.IEV_PUSH) != 0 && imap.imap_exists(&c) == 4)
+    check("i fetch kept", imap.imap_fetch_count(&c) == 1 && imap.imap_fetch_seq(&c, 0) == 2)
+    check("i done", imap.imap_idle_done(&c))
+    check("i done out", out_is(&c, "DONE\r\n"))
+    feed(&c, "A0003 OK idle terminated\r\n")
+    check("i back", imap.imap_state(&c) == imap.IS_SELECTED && imap.imap_last_kind(&c) == imap.CK_IDLE)
+    check("i noop", imap.imap_noop(&c))
+    imap.imap_free(&c)
+    var d: imap.Imap = imap.imap_new()
+    selected(&d)
+    check("i done state", !imap.imap_idle_done(&d) && imap.imap_err(&d) == imap.IERR_STATE)
+    imap.imap_free(&d)
+}
+
+fn test_starttls() {
+    var c: imap.Imap = imap.imap_new()
+    feed(&c, "* OK [CAPABILITY IMAP4rev1 STARTTLS LOGINDISABLED] hi\r\n")
+    imap.imap_events(&c)
+    check("t starttls", imap.imap_starttls(&c))
+    check("t out", out_is(&c, "A0001 STARTTLS\r\n"))
+    feed(&c, "A0001 OK begin TLS\r\n")
+    check("t ev", (imap.imap_events(&c) & imap.IEV_TLS) != 0 && imap.imap_state(&c) == imap.IS_TLS)
+    check("t no cmd", !imap.imap_noop(&c))
+    imap.imap_tls_done(&c)
+    check("t caps again", out_is(&c, "A0002 CAPABILITY\r\n"))
+    check("t noauth", imap.imap_state(&c) == imap.IS_NOAUTH)
+    feed(&c, "* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\nA0002 OK done\r\n")
+    check("t caps", imap.imap_caps(&c) == (imap.ICAP_IMAP4REV1 | imap.ICAP_PLAIN))
+    check("t login", imap.imap_login(&c, "u", "p"))
+    check("t login out", out_is(&c, "A0003 LOGIN \"u\" \"p\"\r\n"))
+    imap.imap_free(&c)
+    // octets behind the OK = injection
+    var d: imap.Imap = imap.imap_new()
+    feed(&d, "* OK hi\r\n")
+    imap.imap_starttls(&d)
+    imap.imap_out_consume(&d, imap.imap_out_len(&d))
+    feed(&d, "A0001 OK begin TLS\r\n* CAPABILITY EVIL\r\n")
+    check("t inject", imap.imap_state(&d) == imap.IS_FAILED && imap.imap_err(&d) == imap.IERR_PROTO)
+    imap.imap_free(&d)
+    // a second STARTTLS on a secure session
+    var e: imap.Imap = imap.imap_new()
+    imap.imap_set_secure(&e, true)
+    feed(&e, "* OK hi\r\n")
+    check("t twice", !imap.imap_starttls(&e))
+    imap.imap_free(&e)
+}
+
+fn test_errors() {
+    var c: imap.Imap = imap.imap_new()
+    selected(&c)
+    imap.imap_noop(&c)
+    imap.imap_out_consume(&c, imap.imap_out_len(&c))
+    feed(&c, "A9999 OK wrong tag\r\n")
+    check("er wrong tag", imap.imap_state(&c) == imap.IS_FAILED && imap.imap_err(&c) == imap.IERR_PROTO)
+    check("er failed no cmd", !imap.imap_noop(&c))
+    imap.imap_free(&c)
+    var d: imap.Imap = imap.imap_new()
+    selected(&d)
+    feed(&d, "A0003 OK no command running\r\n")
+    check("er no cmd", imap.imap_state(&d) == imap.IS_FAILED)
+    imap.imap_free(&d)
+    var e: imap.Imap = imap.imap_new()
+    selected(&e)
+    imap.imap_fetch(&e, "1", "(UID)", false)
+    feed(&e, "* 1 FETCH (UID \r\n")
+    check("er bad fetch", imap.imap_state(&e) == imap.IS_FAILED)
+    imap.imap_free(&e)
+    var f: imap.Imap = imap.imap_new()
+    selected(&f)
+    imap.imap_noop(&f)
+    imap.imap_eof(&f)
+    check("er eof", imap.imap_state(&f) == imap.IS_FAILED && imap.imap_err(&f) == imap.IERR_CLOSED)
+    imap.imap_free(&f)
+    // NO / BAD answers
+    var g: imap.Imap = imap.imap_new()
+    selected(&g)
+    imap.imap_select(&g, "Nope", false)
+    imap.imap_out_consume(&g, imap.imap_out_len(&g))
+    feed(&g, "A0003 NO [NONEXISTENT] no such mailbox\r\n")
+    check("er select no", imap.imap_last_result(&g) == 1 && imap.imap_state(&g) == imap.IS_AUTH)
+    imap.imap_raw(&g, "FOO")
+    imap.imap_out_consume(&g, imap.imap_out_len(&g))
+    feed(&g, "A0004 BAD unknown command\r\n")
+    check("er bad", imap.imap_last_result(&g) == 2)
+    imap.imap_free(&g)
+    // limits
+    var h: imap.Imap = imap.imap_new()
+    feed(&h, "* OK hi\r\n")
+    var big: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 70000 {
+        rt.buf_push(&big, 120)
+        i += 1
+    }
+    imap.imap_feed(&h, rt.buf_ptr(&big), rt.buf_len(&big))
+    check("er too long", imap.imap_state(&h) == imap.IS_FAILED && imap.imap_err(&h) == imap.IERR_TOO_LONG)
+    rt.buf_free(&big)
+    imap.imap_free(&h)
+    var j: imap.Imap = imap.imap_new()
+    feed(&j, "* OK hi\r\n")
+    feed(&j, "* 1 FETCH (X {999999999}\r\n")
+    check("er big literal", imap.imap_state(&j) == imap.IS_NOAUTH || imap.imap_state(&j) == imap.IS_FAILED)
+    imap.imap_free(&j)
+    var k: imap.Imap = imap.imap_new()
+    selected(&k)
+    imap.imap_fetch(&k, "1", "(UID)", false)
+    var deep: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&deep, "* 1 FETCH (UID ".p as u64, 15)
+    i = 0
+    while i < 200 {
+        rt.buf_push(&deep, 40)
+        i += 1
+    }
+    i = 0
+    while i < 200 {
+        rt.buf_push(&deep, 41)
+        i += 1
+    }
+    rt.buf_push_bytes(&deep, ")\r\n".p as u64, 3)
+    imap.imap_feed(&k, rt.buf_ptr(&deep), rt.buf_len(&deep))
+    check("er deep", imap.imap_state(&k) == imap.IS_FAILED)
+    rt.buf_free(&deep)
+    imap.imap_free(&k)
+}
+
+fn utf7_rt(plain: str, enc: str) -> bool {
+    var a: rt.Buf = rt.buf_new()
+    var b: rt.Buf = rt.buf_new()
+    let e: bool = imap.imap_utf7_encode(plain, &a)
+    let d: bool = imap.imap_utf7_decode(enc, &b)
+    let ok: bool = e && d && buf_eq(&a, enc) && buf_eq(&b, plain)
+    rt.buf_free(&a)
+    rt.buf_free(&b)
+    return ok
+}
+
+fn test_utf7() {
+    check("u7 ascii", utf7_rt("INBOX/Sent", "INBOX/Sent"))
+    check("u7 amp", utf7_rt("Tom & Jerry", "Tom &- Jerry"))
+    check("u7 umlaut", utf7_rt("Entw\u{fc}rfe", "Entw&APw-rfe"))
+    check("u7 rfc", utf7_rt("~peter/mail/\u{53f0}\u{5317}/\u{65e5}\u{672c}\u{8a9e}", "~peter/mail/&U,BTFw-/&ZeVnLIqe-"))
+    check("u7 emoji", utf7_rt("\u{1F600}", "&2D3eAA-"))
+    var b: rt.Buf = rt.buf_new()
+    check("u7 bad", !imap.imap_utf7_decode("&AAA", &b))
+    rt.buf_clear(&b)
+    check("u7 bad raw", !imap.imap_utf7_decode("a\u{e4}", &b))
+    rt.buf_free(&b)
+}
+
+fn rfc_at(s: str, i: usize) -> u32 {
+    return rt.ld8(s.p as u64, i) as u32
+}
+
+fn fuzz(rounds: usize) -> usize {
+    let script: str = "* OK [CAPABILITY IMAP4rev1 IDLE] hi\r\nA0001 OK ok\r\n* 3 EXISTS\r\n* FLAGS (\\Seen)\r\nA0002 OK [READ-WRITE] ok\r\n* 1 FETCH (UID 4 FLAGS (\\Seen) ENVELOPE (\"d\" \"s\" ((\"n\" NIL \"a\" \"h\")) NIL NIL NIL NIL NIL NIL \"<m>\") BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"x\") NIL NIL \"7BIT\" 5 1 NIL NIL NIL) \"MIXED\" (\"BOUNDARY\" \"b\") NIL NIL NIL) BODY[1] {5}\r\nhello)\r\nA0003 OK done\r\n* SEARCH 1 2 3\r\nA0004 OK done\r\n* LIST (\\X) \"/\" \"a\"\r\nA0005 OK done\r\n+ idle\r\n* 4 EXISTS\r\nA0006 OK done\r\n* BYE x\r\nA0007 OK done\r\n"
+    var r: usize = 0
+    var steps: usize = 0
+    while r < rounds {
+        var c: imap.Imap = imap.imap_new()
+        imap.imap_set_insecure_auth(&c, true)
+        var b: rt.Buf = rt.buf_new()
+        var i: usize = 0
+        while i < script.n {
+            var ch: u32 = rfc_at(script, i)
+            let m: u64 = rnd() % 40
+            if m == 0 {
+                ch = (rnd() & 255) as u32
+            } else if m == 1 {
+                ch = 10
+            } else if m == 2 {
+                ch = 40
+            } else if m == 3 {
+                ch = 123
+            }
+            rt.buf_push(&b, ch as u8)
+            i += 1
+        }
+        var pos: usize = 0
+        var step: u32 = 0
+        while pos < rt.buf_len(&b) {
+            var k: usize = (1 + rnd() % 23) as usize
+            if pos + k > rt.buf_len(&b) {
+                k = rt.buf_len(&b) - pos
+            }
+            imap.imap_feed(&c, rt.buf_ptr(&b) + pos as u64, k)
+            let ev: u32 = imap.imap_events(&c)
+            if imap.imap_state(&c) == imap.IS_NOAUTH && !imap.imap_busy(&c) && step == 0 {
+                imap.imap_login(&c, "u", "p")
+                step = 1
+            } else if imap.imap_state(&c) == imap.IS_AUTH && !imap.imap_busy(&c) && step == 1 {
+                imap.imap_select(&c, "INBOX", false)
+                step = 2
+            } else if imap.imap_state(&c) == imap.IS_SELECTED && !imap.imap_busy(&c) && step == 2 {
+                imap.imap_fetch(&c, "1:*", "(UID)", false)
+                step = 3
+            } else if ev == 12345 {
+                step = 9
+            }
+            if imap.imap_fetch_count(&c) > 0 {
+                let e: usize = imap.imap_env_field(&c, 0, 1)
+                let n: usize = imap.imap_bs_build(&c, 0, "")
+                var s: rt.Buf = rt.buf_new()
+                imap.imap_node_text(&c, e, &s)
+                imap.imap_addr_format(&c, imap.imap_env_field(&c, 0, 2), &s)
+                var q: usize = 0
+                while q < n {
+                    imap.imap_bs_path(&c, q, &s)
+                    imap.imap_bs_filename(&c, q)
+                    q += 1
+                }
+                rt.buf_free(&s)
+            }
+            imap.imap_out_consume(&c, imap.imap_out_len(&c))
+            pos += k
+            steps += 1
+        }
+        imap.imap_eof(&c)
+        rt.buf_free(&b)
+        imap.imap_free(&c)
+        r += 1
+    }
+    return steps
+}
+
+fn main() -> i32 {
+    test_greeting_login()
+    test_preauth_bye()
+    test_auth_plain()
+    test_select_fetch()
+    test_literal_in_list()
+    test_envelope_bs()
+    test_list_search_status()
+    test_bad_args()
+    test_idle()
+    test_starttls()
+    test_errors()
+    test_utf7()
+    let steps: usize = fuzz(2000)
+    check("fuzz ran", steps > 20000)
+    return failures
+}
