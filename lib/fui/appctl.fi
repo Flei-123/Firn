@@ -1,0 +1,1229 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/appctl.fi -- THE STANDARD CONTROLS IN THE TEN-LINE APP API.
+//
+// ========================================================= WHY IT EXISTS
+//
+// `fui.app` knew label, button, entry, textarea, list, row and column. A real
+// settings window needs more: check boxes, radio groups, switches, sliders,
+// progress bars, drop-downs, tabs, a menu bar with Alt+letter, tooltips,
+// message / confirm / input dialogs, number boxes and expanders. The painters
+// and the state of all of them exist since wave 2 / 3 (lib/fui/wave2.fi,
+// wave3.fi, kit.fi); what was missing is the door: one call, a named
+// callback, done. This file is that door. It adds NO new look -- every part
+// is drawn by the painter that was there (render / wave2 / kit) and flipped
+// by the host that was there (control.fi: a click or space flips a check box,
+// a drag moves a slider). What this file adds is the glue the host does not
+// do for the app: the change callback, radio groups, tab pages, the popup
+// list of a drop-down, the keyboard (arrows on a slider / radio / tab /
+// number box), the menu bar with Alt+letter mnemonics and shortcuts, the
+// tooltip delay and the modal dialog with its focus trap.
+//
+//     import fui.app
+//     import fui.appctl
+//
+//     fn changed(a: *mut app.App, id: usize) {
+//         // id = the control; appctl.checked(a, id) / appctl.value(a, id) ...
+//     }
+//     fn main() -> i32 {
+//         let a: *mut app.App = app.window("Settings", 480, 420)
+//         let dark: usize = appctl.checkbox(a, "Dark mode", false, changed)
+//         let vol: usize = appctl.slider(a, "Volume", 0, 100, 40, changed)
+//         appctl.tooltip(a, vol, "Output volume")
+//         return app.run(a)
+//     }
+//
+// CALLBACKS are plain functions `fn(a: *mut app.App, id: usize)` -- no
+// closures; the state lives in `static mut` or behind `app.data(a)`. `id` is
+// the node the control was made with. A callback runs when the USER changed a
+// control (mouse, keyboard); `set_*` calls from the program never call it.
+//
+// STRINGS (names, option texts, menu labels) are POINTED AT, not copied: pass
+// literals or text that lives as long as the window.
+//
+// ========================================================= THE LIST
+//
+//   DONE:  checkbox  radio (group)  toggle  slider  progress  spinbox
+//          dropdown (+ dropdown_add)  tabs / tab / tab_page  expander / expander_body
+//   NEXT:  menubar / menu / menu_item (Alt+letter, shortcuts, built on app.action_add and
+//          the ctx menu), tooltip, message / confirm / input (modal, kit.Modal focus trap)
+//          -- roadmap entry "fui.app standard controls, part 2"
+//
+// ========================================================= HONEST
+//
+//   L1  Every control is one or two of the 128 nodes of a window (scene.SCENE_MAX).
+//   L2  48 controls and 96 option / menu entries per window; beyond that an add
+//       returns NONE and changes nothing.
+//   L3  The drop-down list and the dialogs are drawn inside the window (they
+//       cannot reach past its border); a popup menu of the menu bar is the same
+//       (menuview.fi).
+//   L4  A hidden tab page / collapsed expander body keeps a 1 point rest in the
+//       layout (scene bounds are "0 = no limit").
+//   L5  The menu bar does not switch menus on hover while one is open.
+import std.rt
+import fui.app
+import fui.scene
+import fui.widget
+import fui.render
+import fui.style
+import fui.theme
+import fui.painter
+import fui.kit
+import fui.wave2
+import fui.a11y
+import fui.action
+import fui.ctxmenu
+import fui.menuview
+import fui.editor
+import fui.textbuf
+import fui.control
+import plat.fuiwirt
+
+export {
+    checkbox, radio, toggle, slider, progress, spinbox, dropdown, dropdown_add,
+    tabs, tab, tab_page, tabs_end, expander, expander_body,
+    checked, set_checked, value, set_value, selected, set_selected, set_enabled,
+    open_dropdown, dropdown_is_open, expanded, set_expanded, popup_rect,
+    CTL_MAX, OPT_MAX, NONE,
+}
+
+const NONE: usize = 4294967295
+const CTL_MAX: usize = 48
+const OPT_MAX: usize = 96
+const GROUP_MAX: usize = 16
+
+// the kinds of an entry
+const K_CHECK: u32 = 1
+const K_RADIO: u32 = 2
+const K_TOGGLE: u32 = 3
+const K_SLIDER: u32 = 4
+const K_PROGRESS: u32 = 5
+const K_DROP: u32 = 6
+const K_TAB: u32 = 7
+const K_SPIN: u32 = 8
+const K_EXPAND: u32 = 9
+const K_MENU: u32 = 10
+const K_POPUP: u32 = 11
+const K_CTXMAP: u32 = 12
+const K_TIP: u32 = 13
+
+// the answers of a dialog
+const ANS_OK: u32 = 1
+const ANS_CANCEL: u32 = 2
+
+// the dialog kinds
+const D_MSG: u32 = 1
+const D_CONFIRM: u32 = 2
+const D_INPUT: u32 = 3
+
+// the delay before a tooltip shows (ms)
+const TIP_DELAY: i64 = 500
+const SPIN_ZONE_PT: usize = 28
+const INPUT_CAP: usize = 256
+
+// the pointer kinds of the host hook / popup sink
+
+fn cb_none(a: *mut app.App, id: usize) {
+}
+
+struct Ctl {
+    a: *mut app.App,
+    n: usize,
+    kind: [u32; 48],
+    node: [usize; 48],
+    // radio / tab group, tab: the page node, expander: the body node, spin: step
+    aux: [usize; 48],
+    page: [usize; 48],
+    lo: [i64; 48],
+    hi: [i64; 48],
+    last: [i64; 48],
+    cb: [fn(*mut app.App, usize); 48],
+    has_cb: [bool; 48],
+    tip: [str; 48],
+    // option / menu entries of an entry: opts[base .. base + cnt]
+    base: [usize; 48],
+    cnt: [usize; 48],
+    opts: [str; 96],
+    n_opts: usize,
+    macts: [usize; 96],
+    n_macts: usize,
+    groups: usize,
+    // the open drop-down
+    drop_open: bool,
+    drop_ctl: usize,
+    drop_hot: usize,
+    // the tooltip
+    tip_node: usize,
+    tip_since: i64,
+    tip_x: f64,
+    tip_y: f64,
+    // the window size of the last frame (the overlays are placed in it)
+    win_w: f64,
+    win_h: f64,
+    // the dialog
+    dlg: u32,
+    dlg_m: kit.Modal,
+    dlg_title: str,
+    dlg_text: str,
+    dlg_cb: fn(*mut app.App, u32),
+    dlg_ed: editor.Editor,
+    dlg_buf: u64,
+    dlg_hot: usize,
+    // the menu bar row (container) while it is open
+    mbar: bool,
+}
+
+fn dlg_cb_none(a: *mut app.App, ans: u32) {
+}
+
+fn ctl_blank() -> Ctl {
+    return Ctl { a: 0 as u64 as *mut app.App, n: 0, kind: [0 as u32; 48], node: [NONE; 48],
+        aux: [0; 48], page: [NONE; 48], lo: [0; 48], hi: [0; 48], last: [0; 48],
+        cb: [cb_none; 48], has_cb: [false; 48], tip: [""; 48], base: [0; 48], cnt: [0; 48],
+        opts: [""; 96], n_opts: 0, macts: [0; 96], n_macts: 0, groups: 0,
+        drop_open: false, drop_ctl: NONE, drop_hot: NONE,
+        tip_node: NONE, tip_since: 0, tip_x: 0.0, tip_y: 0.0, win_w: 640.0, win_h: 480.0,
+        dlg: 0 as u32, dlg_m: kit.modal_new(), dlg_title: "", dlg_text: "", dlg_cb: dlg_cb_none,
+        dlg_ed: editor.editor_new(), dlg_buf: 0, dlg_hot: NONE, mbar: false }
+}
+
+// ============================================================ THE STATE
+
+// The state of a window, made on first use and plugged into the app.
+fn st(a: *mut app.App) -> *mut Ctl {
+    if app.ctl_ready(a) {
+        return app.ctl_data(a) as *mut Ctl
+    }
+    var probe: [Ctl; 2] = [ctl_blank(); 2]
+    let sz: usize = ((&probe[1]) as usize) - ((&probe[0]) as usize)
+    let p: u64 = rt.heap_alloc(sz)
+    if p == 0 {
+        return 0 as u64 as *mut Ctl
+    }
+    let c: *mut Ctl = p as *mut Ctl
+    *c = ctl_blank()
+    (*c).a = a
+    (*c).dlg_buf = rt.heap_alloc(INPUT_CAP)
+    let ok: bool = editor.editor_init(&(*c).dlg_ed, (*c).dlg_buf, INPUT_CAP)
+    app.set_ctl(a, p, ctl_key, ctl_chr, ctl_ptr, ctl_act, ctl_paint)
+    // the popup sink of the host: ours first (drop-down, dialog), the menu's otherwise.
+    // ctx_view makes the menu state (and installs the menu's own sink) before we override it.
+    let mv: *mut menuview.MenuView = app.ctx_view(a)
+    fuiwirt.host_set_popup(app.app_host(a), p, sink_open, sink_ptr, sink_key, sink_chr,
+        sink_tick, sink_wait)
+    return c
+}
+
+fn sc_of(c: *mut Ctl) -> *mut scene.Scene { return app.app_scene((*c).a) }
+
+fn find(c: *mut Ctl, node: usize) -> usize {
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).node[i] == node && (*c).kind[i] != K_CTXMAP && (*c).kind[i] != K_TIP {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn add_entry(c: *mut Ctl, kind: u32, node: usize) -> usize {
+    if (*c).n >= CTL_MAX {
+        return NONE
+    }
+    let i: usize = (*c).n
+    (*c).n = i + 1
+    (*c).kind[i] = kind
+    (*c).node[i] = node
+    (*c).aux[i] = 0
+    (*c).page[i] = NONE
+    (*c).lo[i] = 0
+    (*c).hi[i] = 0
+    (*c).last[i] = 0
+    (*c).has_cb[i] = false
+    (*c).base[i] = 0
+    (*c).cnt[i] = 0
+    return i
+}
+
+fn set_cb(c: *mut Ctl, i: usize, f: fn(*mut app.App, usize)) {
+    (*c).cb[i] = f
+    (*c).has_cb[i] = true
+}
+
+fn fire(c: *mut Ctl, i: usize) {
+    if (*c).has_cb[i] {
+        let f: fn(*mut app.App, usize) = (*c).cb[i]
+        f((*c).a, (*c).node[i])
+    }
+}
+
+fn touch(c: *mut Ctl) {
+    fuiwirt.host_touch(app.app_host((*c).a))
+}
+
+fn wid(c: *mut Ctl, i: usize) -> *mut widget.Widget {
+    return scene.node_widget(sc_of(c), (*c).node[i])
+}
+
+fn name_node(c: *mut Ctl, node: usize, name: str) {
+    if name.n > 0 {
+        a11y.a11y_set_name(app.ax((*c).a), node, name.p as u64, name.n)
+    }
+}
+
+// ============================================================ CHECK, RADIO, TOGGLE
+
+// A check box with its text. `on_change(a, id)` runs after a click or the space bar.
+fn checkbox(a: *mut app.App, text: str, on: bool, on_change: fn(*mut app.App, usize)) -> usize {
+    return bool_control(a, K_CHECK, widget.KIND_CHECKBOX, text, on, 0, on_change)
+}
+
+// A switch (on / off) with its text.
+fn toggle(a: *mut app.App, text: str, on: bool, on_change: fn(*mut app.App, usize)) -> usize {
+    return bool_control(a, K_TOGGLE, widget.KIND_TOGGLE, text, on, 0, on_change)
+}
+
+// A radio button of the group `group` (any number you pick; the buttons with the same one
+// are exclusive). `on_change` runs for the button that BECAME selected.
+fn radio(a: *mut app.App, group: usize, text: str, on: bool,
+    on_change: fn(*mut app.App, usize)) -> usize {
+    return bool_control(a, K_RADIO, widget.KIND_RADIO, text, on, group, on_change)
+}
+
+fn bool_control(a: *mut app.App, kind: u32, wk: u32, text: str, on: bool, group: usize,
+    f: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 {
+        return NONE
+    }
+    if (*c).n >= CTL_MAX {
+        return NONE
+    }
+    let node: usize = app.node_new(a, wk, text)
+    if node == NONE {
+        return NONE
+    }
+    let i: usize = add_entry(c, kind, node)
+    (*c).aux[i] = group
+    set_cb(c, i, f)
+    var v: i64 = 0
+    if on {
+        v = 1
+    }
+    let e: *mut widget.Widget = scene.node_widget(sc_of(c), node)
+    widget.w_set_value(e, v)
+    widget.w_set_selected(e, on)
+    (*c).last[i] = v
+    if kind == K_RADIO && on {
+        radio_exclusive(c, i)
+    }
+    return node
+}
+
+// make `i` the only selected button of its group (no callback)
+fn radio_exclusive(c: *mut Ctl, i: usize) {
+    var j: usize = 0
+    while j < (*c).n {
+        if j != i && (*c).kind[j] == K_RADIO && (*c).aux[j] == (*c).aux[i] {
+            let e: *mut widget.Widget = wid(c, j)
+            widget.w_set_value(e, 0)
+            widget.w_set_selected(e, false)
+            (*c).last[j] = 0
+        }
+        j = j + 1
+    }
+}
+
+fn checked(a: *mut app.App, id: usize) -> bool {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE {
+        return false
+    }
+    return widget.w_value(wid(c, i)) != 0
+}
+
+fn set_checked(a: *mut app.App, id: usize, on: bool) {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE {
+        return
+    }
+    var v: i64 = 0
+    if on {
+        v = 1
+    }
+    let e: *mut widget.Widget = wid(c, i)
+    widget.w_set_value(e, v)
+    widget.w_set_selected(e, on)
+    (*c).last[i] = v
+    if (*c).kind[i] == K_RADIO && on {
+        radio_exclusive(c, i)
+    }
+    touch(c)
+}
+
+// Enable or disable a control (a disabled one takes neither mouse nor focus).
+fn set_enabled(a: *mut app.App, id: usize, on: bool) {
+    let c: *mut Ctl = st(a)
+    if id >= scene.scene_count(sc_of(c)) {
+        return
+    }
+    widget.w_set_disabled(scene.node_widget(sc_of(c), id), !on)
+    touch(c)
+}
+
+// ============================================================ SLIDER, PROGRESS, SPINBOX
+
+fn permille(v: i64, lo: i64, hi: i64) -> i64 {
+    if hi <= lo {
+        return 0
+    }
+    return control.clamp_i64(((v - lo) * 1000 + (hi - lo) / 2) / (hi - lo), 0, 1000)
+}
+
+fn from_permille(p: i64, lo: i64, hi: i64) -> i64 {
+    return lo + (p * (hi - lo) + 500) / 1000
+}
+
+// A horizontal slider over `lo ..= hi`, starting at `init`; `name` is what a screen reader says.
+// Drag it, or use the arrows / Home / End / Page keys.
+fn slider(a: *mut app.App, name: str, lo: i64, hi: i64, init: i64,
+    on_change: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return NONE
+    }
+    let node: usize = app.custom(a, widget.KIND_SLIDER, 220, 24)
+    if node == NONE {
+        return NONE
+    }
+    let i: usize = add_entry(c, K_SLIDER, node)
+    (*c).lo[i] = lo
+    (*c).hi[i] = hi
+    set_cb(c, i, on_change)
+    let p: i64 = permille(init, lo, hi)
+    widget.w_set_value(scene.node_widget(sc_of(c), node), p)
+    (*c).last[i] = p
+    name_node(c, node, name)
+    return node
+}
+
+// A progress bar over `lo ..= hi`.
+fn progress(a: *mut app.App, name: str, lo: i64, hi: i64, init: i64) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return NONE
+    }
+    let node: usize = app.custom(a, widget.KIND_PROGRESS, 220, 14)
+    if node == NONE {
+        return NONE
+    }
+    let i: usize = add_entry(c, K_PROGRESS, node)
+    (*c).lo[i] = lo
+    (*c).hi[i] = hi
+    let p: i64 = permille(init, lo, hi)
+    widget.w_set_value(scene.node_widget(sc_of(c), node), p)
+    (*c).last[i] = p
+    name_node(c, node, name)
+    return node
+}
+
+// A number box over `lo ..= hi` changing by `step`: "-" and "+" at its ends, Up / Down / Page keys.
+fn spinbox(a: *mut app.App, name: str, lo: i64, hi: i64, step: i64, init: i64,
+    on_change: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return NONE
+    }
+    let node: usize = app.node_new(a, widget.KIND_BUTTON, "0")
+    if node == NONE {
+        return NONE
+    }
+    app.set_width(a, node, 120)
+    let i: usize = add_entry(c, K_SPIN, node)
+    (*c).lo[i] = lo
+    (*c).hi[i] = hi
+    (*c).aux[i] = step as usize
+    set_cb(c, i, on_change)
+    var v: i64 = control.clamp_i64(init, lo, hi)
+    (*c).last[i] = v
+    widget.w_set_value(scene.node_widget(sc_of(c), node), v)
+    app.set_number(a, node, v)
+    scene.node_set_draw(sc_of(c), node, c as u64, draw_spin)
+    name_node(c, node, name)
+    return node
+}
+
+fn spin_step(c: *mut Ctl, i: usize) -> i64 {
+    let s: i64 = (*c).aux[i] as i64
+    if s < 1 {
+        return 1
+    }
+    return s
+}
+
+// move a spin box by `d` (clamped); true when the number changed
+fn spin_move(c: *mut Ctl, i: usize, d: i64) -> bool {
+    let v: i64 = control.clamp_i64((*c).last[i] + d, (*c).lo[i], (*c).hi[i])
+    if v == (*c).last[i] {
+        return false
+    }
+    (*c).last[i] = v
+    widget.w_set_value(wid(c, i), v)
+    app.set_number((*c).a, (*c).node[i], v)
+    fire(c, i)
+    return true
+}
+
+// the "-" and "+" marks of a number box, on top of the button's own picture
+fn draw_spin(ud: u64, rc: *mut render.Ctx, e: *mut widget.Widget) {
+    let zone: f64 = kit.ln(rc, SPIN_ZONE_PT)
+    let size: f64 = kit.ln(rc, 16)
+    let col: u32 = kit.tokc(rc, style.TOK_TEXT)
+    let x0: f64 = widget.w_x(e)
+    let y0: f64 = widget.w_y(e)
+    let h: f64 = widget.w_h(e)
+    let tw: f64 = kit.text_width(rc, size, 400, "-")
+    let t1: f64 = kit.draw_label(rc, x0 + (zone - tw) / 2.0, y0, h, size, 400, col, "-", 0.0)
+    let pw: f64 = kit.text_width(rc, size, 400, "+")
+    let t2: f64 = kit.draw_label(rc, x0 + widget.w_w(e) - zone + (zone - pw) / 2.0, y0, h, size,
+        400, col, "+", 0.0)
+}
+
+// The value of a slider / progress / spin box in ITS units (lo ..= hi).
+fn value(a: *mut app.App, id: usize) -> i64 {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE {
+        return 0
+    }
+    if (*c).kind[i] == K_SPIN {
+        return (*c).last[i]
+    }
+    return from_permille(widget.w_value(wid(c, i)), (*c).lo[i], (*c).hi[i])
+}
+
+fn set_value(a: *mut app.App, id: usize, v: i64) {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE {
+        return
+    }
+    if (*c).kind[i] == K_SPIN {
+        let w: i64 = control.clamp_i64(v, (*c).lo[i], (*c).hi[i])
+        (*c).last[i] = w
+        widget.w_set_value(wid(c, i), w)
+        app.set_number(a, id, w)
+        return
+    }
+    let p: i64 = permille(v, (*c).lo[i], (*c).hi[i])
+    widget.w_set_value(wid(c, i), p)
+    (*c).last[i] = p
+    touch(c)
+}
+
+// ============================================================ DROP-DOWN
+
+// A drop-down list (not editable). Add the entries with `dropdown_add`; the first is chosen.
+// `on_change(a, id)` runs when the user picks another one.
+fn dropdown(a: *mut app.App, name: str, on_change: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return NONE
+    }
+    let node: usize = app.node_new(a, widget.KIND_DROPDOWN, " ")
+    if node == NONE {
+        return NONE
+    }
+    app.set_width(a, node, 180)
+    let i: usize = add_entry(c, K_DROP, node)
+    (*c).base[i] = (*c).n_opts
+    (*c).last[i] = 0
+    set_cb(c, i, on_change)
+    name_node(c, node, name)
+    return node
+}
+
+// Add an entry (its text must outlive the window). false when full.
+fn dropdown_add(a: *mut app.App, id: usize, text: str) -> bool {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE || (*c).kind[i] != K_DROP {
+        return false
+    }
+    // the entries of one drop-down must be the last ones added (they stand in a row of the pool)
+    if (*c).base[i] + (*c).cnt[i] != (*c).n_opts || (*c).n_opts >= OPT_MAX {
+        return false
+    }
+    (*c).opts[(*c).n_opts] = text
+    (*c).n_opts = (*c).n_opts + 1
+    (*c).cnt[i] = (*c).cnt[i] + 1
+    if (*c).cnt[i] == 1 {
+        app.set_text(a, id, text)
+    }
+    return true
+}
+
+// The index chosen in a drop-down / the selected tab (0 ..).
+fn selected(a: *mut app.App, id: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE {
+        return NONE
+    }
+    if (*c).kind[i] == K_DROP {
+        return (*c).last[i] as usize
+    }
+    if (*c).kind[i] == K_TAB {
+        return tab_index(c, i)
+    }
+    return NONE
+}
+
+fn set_selected(a: *mut app.App, id: usize, k: usize) {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE {
+        return
+    }
+    if (*c).kind[i] == K_DROP {
+        drop_choose(c, i, k, false)
+    }
+    if (*c).kind[i] == K_TAB {
+        let t: usize = tab_nth(c, (*c).aux[i], k)
+        if t != NONE {
+            tab_select(c, t)
+        }
+    }
+}
+
+fn drop_choose(c: *mut Ctl, i: usize, k: usize, notify: bool) {
+    if k >= (*c).cnt[i] {
+        return
+    }
+    let changed: bool = (*c).last[i] != k as i64
+    (*c).last[i] = k as i64
+    app.set_text((*c).a, (*c).node[i], (*c).opts[(*c).base[i] + k])
+    if changed && notify {
+        fire(c, i)
+    }
+}
+
+fn open_dropdown(a: *mut app.App, id: usize) -> bool {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE || (*c).kind[i] != K_DROP || (*c).cnt[i] == 0 {
+        return false
+    }
+    (*c).drop_open = true
+    (*c).drop_ctl = i
+    (*c).drop_hot = (*c).last[i] as usize
+    touch(c)
+    return true
+}
+
+fn dropdown_is_open(a: *mut app.App) -> bool {
+    let c: *mut Ctl = st(a)
+    return (*c).drop_open
+}
+
+fn drop_close(c: *mut Ctl) {
+    (*c).drop_open = false
+    touch(c)
+}
+
+// The rectangle of the open list (x, y, w, h) in window pixels; false when none is open.
+fn popup_rect(a: *mut app.App, out: *mut [f64; 4]) -> bool {
+    let c: *mut Ctl = st(a)
+    if !(*c).drop_open {
+        return false
+    }
+    let rc: *mut render.Ctx = app.app_ctx(a)
+    let sc: *mut scene.Scene = sc_of(c)
+    let node: usize = (*c).node[(*c).drop_ctl]
+    let rh: f64 = wave2.menu_item_height(rc)
+    let h: f64 = rh * ((*c).cnt[(*c).drop_ctl] as f64) + kit.ln(rc, 8)
+    var y: f64 = scene.node_y(sc, node) + scene.node_h(sc, node) + kit.ln(rc, 2)
+    if y + h > (*c).win_h {
+        y = scene.node_y(sc, node) - h - kit.ln(rc, 2)
+    }
+    if y < 0.0 {
+        y = 0.0
+    }
+    (*out)[0] = scene.node_x(sc, node)
+    (*out)[1] = y
+    (*out)[2] = scene.node_w(sc, node)
+    (*out)[3] = h
+    return true
+}
+
+fn drop_row_at(c: *mut Ctl, x: f64, y: f64) -> usize {
+    var r: [f64; 4] = [0.0; 4]
+    if !popup_rect((*c).a, &r) {
+        return NONE
+    }
+    if x < r[0] || x >= r[0] + r[2] || y < r[1] || y >= r[1] + r[3] {
+        return NONE
+    }
+    let rc: *mut render.Ctx = app.app_ctx((*c).a)
+    let pad: f64 = kit.ln(rc, 4)
+    let k: f64 = (y - r[1] - pad) / wave2.menu_item_height(rc)
+    if k < 0.0 {
+        return NONE
+    }
+    let row: usize = k as usize
+    if row >= (*c).cnt[(*c).drop_ctl] {
+        return NONE
+    }
+    return row
+}
+
+fn draw_drop(c: *mut Ctl, rc: *mut render.Ctx) {
+    var r: [f64; 4] = [0.0; 4]
+    if !popup_rect((*c).a, &r) {
+        return
+    }
+    var p: widget.Widget = widget.widget_new(widget.KIND_MENU)
+    widget.w_place(&p, r[0], r[1], r[2], r[3])
+    wave2.draw_menu(rc, &p)
+    let i: usize = (*c).drop_ctl
+    let rh: f64 = wave2.menu_item_height(rc)
+    let pad: f64 = kit.ln(rc, 4)
+    var k: usize = 0
+    while k < (*c).cnt[i] {
+        let s: str = (*c).opts[(*c).base[i] + k]
+        var e: widget.Widget = widget.widget_new(widget.KIND_MENU)
+        widget.w_place(&e, r[0] + pad, r[1] + pad + rh * (k as f64), r[2] - 2.0 * pad, rh)
+        widget.w_set_text(&e, s.p as u64, s.n)
+        widget.w_set_hover(&e, k == (*c).drop_hot)
+        wave2.draw_menu_item(rc, &e, (*c).last[i] == k as i64, false)
+        k = k + 1
+    }
+}
+
+// keys while the list is open: Up / Down / Home / End move, Enter / Space choose, Esc closes
+fn drop_key(c: *mut Ctl, key: u32, mods: u32) {
+    let i: usize = (*c).drop_ctl
+    let n: usize = (*c).cnt[i]
+    if key == editor.KEY_UP && (*c).drop_hot > 0 && (*c).drop_hot != NONE {
+        (*c).drop_hot = (*c).drop_hot - 1
+    } else if key == editor.KEY_DOWN && (*c).drop_hot + 1 < n {
+        if (*c).drop_hot == NONE {
+            (*c).drop_hot = 0
+        } else {
+            (*c).drop_hot = (*c).drop_hot + 1
+        }
+    } else if key == editor.KEY_HOME {
+        (*c).drop_hot = 0
+    } else if key == editor.KEY_END {
+        (*c).drop_hot = n - 1
+    } else if key == editor.KEY_ENTER {
+        if (*c).drop_hot != NONE {
+            drop_choose(c, i, (*c).drop_hot, true)
+        }
+        drop_close(c)
+    } else if key == editor.KEY_ESC || key == editor.KEY_TAB {
+        drop_close(c)
+    }
+    touch(c)
+}
+
+// ============================================================ TABS
+
+// Tabs: `tabs` opens the row of the tab buttons, `tab(a, text)` adds one each, `tabs_end`
+// closes the row. The pages follow: `tab_page(a, group)` opens a column for the page of the
+// next tab (close it with app.end). Returns the group (use it for `tab_page`).
+fn tabs(a: *mut app.App) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 {
+        return NONE
+    }
+    let g: usize = (*c).groups
+    (*c).groups = g + 1
+    let r: usize = app.row(a)
+    return g
+}
+
+fn tab(a: *mut app.App, group: usize, text: str, on_change: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return NONE
+    }
+    let node: usize = app.node_new(a, widget.KIND_TAB, text)
+    if node == NONE {
+        return NONE
+    }
+    let i: usize = add_entry(c, K_TAB, node)
+    (*c).aux[i] = group
+    set_cb(c, i, on_change)
+    // the first tab of a group starts selected
+    if tab_nth(c, group, 1) == NONE {
+        widget.w_set_selected(scene.node_widget(sc_of(c), node), true)
+        (*c).last[i] = 1
+    }
+    return node
+}
+
+fn tabs_end(a: *mut app.App) {
+    app.end(a)
+}
+
+// the page of the next tab of the group: a column, close it with app.end
+fn tab_page(a: *mut app.App, group: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 {
+        return NONE
+    }
+    // the first tab without a page gets it
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_TAB && (*c).aux[i] == group && (*c).page[i] == NONE {
+            let p: usize = app.column(a)
+            (*c).page[i] = p
+            page_show(c, i, (*c).last[i] != 0)
+            return p
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn page_show(c: *mut Ctl, i: usize, on: bool) {
+    let p: usize = (*c).page[i]
+    if p == NONE {
+        return
+    }
+    scene.node_set_hidden(sc_of(c), p, !on)
+    if on {
+        scene.node_set_bounds(sc_of(c), p, 0, 0)
+    } else {
+        scene.node_set_bounds(sc_of(c), p, 1, 1)
+    }
+}
+
+// the k-th tab (0 ..) of a group as an entry index, NONE if there is none
+fn tab_nth(c: *mut Ctl, group: usize, k: usize) -> usize {
+    var seen: usize = 0
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_TAB && (*c).aux[i] == group {
+            if seen == k {
+                return i
+            }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn tab_index(c: *mut Ctl, t: usize) -> usize {
+    var seen: usize = 0
+    var i: usize = 0
+    while i < t {
+        if (*c).kind[i] == K_TAB && (*c).aux[i] == (*c).aux[t] {
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return seen
+}
+
+fn tab_count(c: *mut Ctl, group: usize) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_TAB && (*c).aux[i] == group {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// select tab `t` (an entry) and show its page; no callback
+fn tab_select(c: *mut Ctl, t: usize) {
+    var j: usize = 0
+    while j < (*c).n {
+        if (*c).kind[j] == K_TAB && (*c).aux[j] == (*c).aux[t] {
+            let on: bool = j == t
+            widget.w_set_selected(wid(c, j), on)
+            if on {
+                (*c).last[j] = 1
+            } else {
+                (*c).last[j] = 0
+            }
+            page_show(c, j, on)
+        }
+        j = j + 1
+    }
+    touch(c)
+}
+
+// ============================================================ EXPANDER
+
+// A header that shows / hides the body below it. `expander_body` opens the body column (close it
+// with app.end).
+fn expander(a: *mut app.App, title: str, open: bool, on_change: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return NONE
+    }
+    let node: usize = app.node_new(a, widget.KIND_BUTTON, "")
+    if node == NONE {
+        return NONE
+    }
+    let i: usize = add_entry(c, K_EXPAND, node)
+    (*c).tip[i] = title
+    set_cb(c, i, on_change)
+    if open {
+        (*c).last[i] = 1
+    }
+    expander_label(c, i)
+    return node
+}
+
+fn expander_label(c: *mut Ctl, i: usize) {
+    if (*c).last[i] != 0 {
+        app.set_text((*c).a, (*c).node[i], "v ")
+    } else {
+        app.set_text((*c).a, (*c).node[i], "> ")
+    }
+    app.append_text((*c).a, (*c).node[i], (*c).tip[i])
+    a11y.a11y_set_expanded(app.ax((*c).a), (*c).node[i], (*c).last[i] as u32)
+}
+
+fn expander_body(a: *mut app.App, id: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE || (*c).kind[i] != K_EXPAND {
+        return NONE
+    }
+    let p: usize = app.column(a)
+    (*c).page[i] = p
+    body_show(c, i)
+    return p
+}
+
+fn body_show(c: *mut Ctl, i: usize) {
+    let p: usize = (*c).page[i]
+    if p == NONE {
+        return
+    }
+    let on: bool = (*c).last[i] != 0
+    scene.node_set_hidden(sc_of(c), p, !on)
+    if on {
+        scene.node_set_bounds(sc_of(c), p, 0, 0)
+    } else {
+        scene.node_set_bounds(sc_of(c), p, 1, 1)
+    }
+}
+
+fn expanded(a: *mut app.App, id: usize) -> bool {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE {
+        return false
+    }
+    return (*c).last[i] != 0
+}
+
+fn set_expanded(a: *mut app.App, id: usize, on: bool) {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE || (*c).kind[i] != K_EXPAND {
+        return
+    }
+    if on {
+        (*c).last[i] = 1
+    } else {
+        (*c).last[i] = 0
+    }
+    expander_label(c, i)
+    body_show(c, i)
+    touch(c)
+}
+
+// ============================================================ EVENTS
+
+// Compare every control with what was last reported; call back for what the USER changed.
+fn sync(c: *mut Ctl) {
+    var i: usize = 0
+    while i < (*c).n {
+        let k: u32 = (*c).kind[i]
+        if k == K_CHECK || k == K_TOGGLE || k == K_SLIDER {
+            let v: i64 = widget.w_value(wid(c, i))
+            if v != (*c).last[i] {
+                (*c).last[i] = v
+                fire(c, i)
+            }
+        } else if k == K_RADIO {
+            let v2: i64 = widget.w_value(wid(c, i))
+            if v2 != (*c).last[i] {
+                (*c).last[i] = v2
+                if v2 != 0 {
+                    radio_exclusive(c, i)
+                    (*c).last[i] = 1
+                    fire(c, i)
+                }
+            }
+        } else if k == K_TAB {
+            let on: bool = widget.w_is_selected(wid(c, i))
+            if on && (*c).last[i] == 0 {
+                tab_select(c, i)
+                fire(c, i)
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn is_focus_kind(k: u32) -> bool {
+    return k == K_SLIDER || k == K_RADIO || k == K_TAB || k == K_SPIN || k == K_DROP
+}
+
+// move the keyboard focus to a node
+fn focus_node(c: *mut Ctl, node: usize) {
+    let r: u32 = control.panel_set_focus(fuiwirt.host_panel(app.app_host((*c).a)), node)
+}
+
+// the previous (back) / next entry of the same radio group or tab group, wrapping
+fn neighbour(c: *mut Ctl, i: usize, back: bool) -> usize {
+    var j: usize = i
+    var n: usize = 0
+    while n < (*c).n {
+        if back {
+            if j == 0 {
+                j = (*c).n - 1
+            } else {
+                j = j - 1
+            }
+        } else {
+            j = (j + 1) % (*c).n
+        }
+        if (*c).kind[j] == (*c).kind[i] && (*c).aux[j] == (*c).aux[i] {
+            return j
+        }
+        n = n + 1
+    }
+    return i
+}
+
+fn slider_move(c: *mut Ctl, i: usize, v: i64) {
+    let w: i64 = control.clamp_i64(v, (*c).lo[i], (*c).hi[i])
+    let p: i64 = permille(w, (*c).lo[i], (*c).hi[i])
+    if p == (*c).last[i] {
+        return
+    }
+    widget.w_set_value(wid(c, i), p)
+    (*c).last[i] = p
+    fire(c, i)
+}
+
+fn ctl_key(ud: u64, key: u32, mods: u32) -> bool {
+    let c: *mut Ctl = ud as *mut Ctl
+    if (*c).drop_open {
+        drop_key(c, key, mods)
+        return true
+    }
+    if menuview.mv_is_open(app.ctx_view((*c).a) as u64) {
+        return false
+    }
+    let f: usize = app.focus((*c).a)
+    if f == NONE {
+        return false
+    }
+    let i: usize = find(c, f)
+    if i == NONE || !is_focus_kind((*c).kind[i]) {
+        return false
+    }
+    let k: u32 = (*c).kind[i]
+    let up: bool = key == editor.KEY_UP || key == editor.KEY_LEFT
+    let down: bool = key == editor.KEY_DOWN || key == editor.KEY_RIGHT
+    if k == K_SLIDER {
+        let cur: i64 = from_permille((*c).last[i], (*c).lo[i], (*c).hi[i])
+        var big: i64 = ((*c).hi[i] - (*c).lo[i]) / 10
+        if big < 1 {
+            big = 1
+        }
+        if up {
+            slider_move(c, i, cur - 1)
+        } else if down {
+            slider_move(c, i, cur + 1)
+        } else if key == editor.KEY_PGUP {
+            slider_move(c, i, cur + big)
+        } else if key == editor.KEY_PGDN {
+            slider_move(c, i, cur - big)
+        } else if key == editor.KEY_HOME {
+            slider_move(c, i, (*c).lo[i])
+        } else if key == editor.KEY_END {
+            slider_move(c, i, (*c).hi[i])
+        } else {
+            return false
+        }
+        return true
+    }
+    if k == K_SPIN {
+        let st1: i64 = spin_step(c, i)
+        if key == editor.KEY_UP {
+            let m1: bool = spin_move(c, i, st1)
+        } else if key == editor.KEY_DOWN {
+            let m2: bool = spin_move(c, i, 0 - st1)
+        } else if key == editor.KEY_PGUP {
+            let m3: bool = spin_move(c, i, st1 * 10)
+        } else if key == editor.KEY_PGDN {
+            let m4: bool = spin_move(c, i, 0 - st1 * 10)
+        } else if key == editor.KEY_HOME {
+            let m5: bool = spin_move(c, i, (*c).lo[i] - (*c).last[i])
+        } else if key == editor.KEY_END {
+            let m6: bool = spin_move(c, i, (*c).hi[i] - (*c).last[i])
+        } else {
+            return false
+        }
+        return true
+    }
+    if k == K_RADIO || k == K_TAB {
+        if !up && !down {
+            return false
+        }
+        let j: usize = neighbour(c, i, up)
+        if j == i {
+            return true
+        }
+        if k == K_RADIO {
+            widget.w_set_value(wid(c, j), 1)
+            widget.w_set_selected(wid(c, j), true)
+            radio_exclusive(c, j)
+            (*c).last[j] = 1
+        } else {
+            tab_select(c, j)
+        }
+        focus_node(c, (*c).node[j])
+        fire(c, j)
+        return true
+    }
+    if k == K_DROP {
+        if key == editor.KEY_UP && (*c).last[i] > 0 {
+            drop_choose(c, i, ((*c).last[i] - 1) as usize, true)
+            return true
+        }
+        if key == editor.KEY_DOWN {
+            if ((*c).last[i] as usize) + 1 < (*c).cnt[i] {
+                drop_choose(c, i, ((*c).last[i] + 1) as usize, true)
+            }
+            return true
+        }
+    }
+    return false
+}
+
+fn ctl_chr(ud: u64, cp: u32, mods: u32) -> bool {
+    let c: *mut Ctl = ud as *mut Ctl
+    return (*c).drop_open
+}
+
+fn ctl_ptr(ud: u64, kind: u32, x: f64, y: f64) -> bool {
+    let c: *mut Ctl = ud as *mut Ctl
+    sync(c)
+    if kind != fuiwirt.HOOK_DOWN {
+        return false
+    }
+    let node: usize = scene.scene_hit(sc_of(c), x, y)
+    let i: usize = find(c, node)
+    if i == NONE || (*c).kind[i] != K_SPIN {
+        return false
+    }
+    let zone: f64 = kit.ln(app.app_ctx((*c).a), SPIN_ZONE_PT)
+    let nx: f64 = scene.node_x(sc_of(c), node)
+    if x < nx + zone {
+        let m1: bool = spin_move(c, i, 0 - spin_step(c, i))
+    } else if x >= nx + scene.node_w(sc_of(c), node) - zone {
+        let m2: bool = spin_move(c, i, spin_step(c, i))
+    }
+    return true
+}
+
+fn ctl_act(ud: u64, node: usize) {
+    let c: *mut Ctl = ud as *mut Ctl
+    sync(c)
+    let i: usize = find(c, node)
+    if i == NONE {
+        return
+    }
+    if (*c).kind[i] == K_DROP && !(*c).drop_open {
+        let o: bool = open_dropdown((*c).a, node)
+    } else if (*c).kind[i] == K_EXPAND {
+        set_expanded((*c).a, node, (*c).last[i] == 0)
+        fire(c, i)
+    }
+}
+
+fn ctl_paint(ud: u64, rc: *mut render.Ctx, w: usize, h: usize) {
+    let c: *mut Ctl = ud as *mut Ctl
+    (*c).win_w = w as f64
+    (*c).win_h = h as f64
+    if (*c).drop_open {
+        draw_drop(c, rc)
+    }
+}
+
+// ============================================================ THE POPUP SINK
+
+fn mv_of(c: *mut Ctl) -> u64 { return app.ctx_view((*c).a) as u64 }
+
+fn sink_open(ud: u64) -> bool {
+    let c: *mut Ctl = ud as *mut Ctl
+    return (*c).drop_open || menuview.mv_is_open(mv_of(c))
+}
+
+fn sink_ptr(ud: u64, kind: u32, x: f64, y: f64, btn: u32, now: i64) -> u32 {
+    let c: *mut Ctl = ud as *mut Ctl
+    if !(*c).drop_open {
+        return menuview.mv_pointer(mv_of(c), kind, x, y, btn, now)
+    }
+    let row: usize = drop_row_at(c, x, y)
+    if kind == fuiwirt.HOOK_MOVE {
+        if row != NONE {
+            (*c).drop_hot = row
+        }
+    } else if kind == fuiwirt.HOOK_DOWN {
+        if row != NONE {
+            drop_choose(c, (*c).drop_ctl, row, true)
+        }
+        drop_close(c)
+    }
+    return ctxmenu.CR_CONSUMED | ctxmenu.CR_REPAINT
+}
+
+fn sink_key(ud: u64, key: u32, mods: u32, now: i64) -> u32 {
+    let c: *mut Ctl = ud as *mut Ctl
+    if menuview.mv_is_open(mv_of(c)) {
+        return menuview.mv_key(mv_of(c), key, mods, now)
+    }
+    return ctxmenu.CR_CONSUMED
+}
+
+fn sink_chr(ud: u64, cp: u32, mods: u32, now: i64) -> u32 {
+    let c: *mut Ctl = ud as *mut Ctl
+    if menuview.mv_is_open(mv_of(c)) {
+        return menuview.mv_char(mv_of(c), cp, mods, now)
+    }
+    return ctxmenu.CR_CONSUMED
+}
+
+fn sink_tick(ud: u64, now: i64) -> u32 {
+    let c: *mut Ctl = ud as *mut Ctl
+    if menuview.mv_is_open(mv_of(c)) {
+        return menuview.mv_tick(mv_of(c), now)
+    }
+    return 0 as u32
+}
+
+fn sink_wait(ud: u64, now: i64) -> i64 {
+    let c: *mut Ctl = ud as *mut Ctl
+    if menuview.mv_is_open(mv_of(c)) {
+        return menuview.mv_wait(mv_of(c), now)
+    }
+    return fuiwirt.WAIT_FOREVER
+}

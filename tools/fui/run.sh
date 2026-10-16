@@ -1339,6 +1339,14 @@ if [ "$1" = "--images" ]; then
 fi
 
 echo
+echo "== 18q. fui.appctl: THE STANDARD CONTROLS IN fui.app (checkbox, radio, toggle, slider, progress, spinbox, drop-down, tabs, expander) =="
+# lib/fui/appctl.fi: clicks, arrow keys, tab pages, the drop-down list and the accessibility audit,
+# driven through the same entry points the hosts call. Own section (not 19).
+"$FIRNC" --opt-level=dev -o "$W/appctl_example" examples/fui_controls/main.fi
+build appctl
+"$W/appctl"
+
+echo
 echo "== THE INTERACTIVE DIALOGS (roadmap r177, docs/DIALOG.md): message, colour, font, file =="
 # Each script builds its own in-memory test and live driver, runs the checks without a window, the
 # FRAME_MS limit (<= 16 ms) with release-fast, the accessibility audit, and the live test on a private

@@ -104,6 +104,8 @@ export {
     // control wants before anyone else (KEYX_* = keys the hosts forward as codes
     // of their own)
     set_keys, set_wheel, set_motion, KEYX_F5,
+    // lib/fui/appctl.fi: the standard controls plug into the window here
+    set_ctl, node_new, app_ctx, ctl_ready, ctl_data,
     NONE,
     // the side a host and the tests see (lib/@*/fui/apphost.fi,
     // tools/fui/app_main.fi)
@@ -212,6 +214,15 @@ struct App {
     wh_f: fn(u64, f64, f64, f64, f64) -> bool,
     mo_on: bool,
     mo_f: fn(u64, u32, f64, f64) -> bool,
+    // lib/fui/appctl.fi: ONE plug for the standard controls (checkbox, slider, menu bar,
+    // dialogs ...): their key / character / pointer / activation / overlay-paint handlers
+    ctl_on: bool,
+    ctl_ud: u64,
+    ctl_key: fn(u64, u32, u32) -> bool,
+    ctl_chr: fn(u64, u32, u32) -> bool,
+    ctl_ptr: fn(u64, u32, f64, f64) -> bool,
+    ctl_act: fn(u64, usize),
+    ctl_paint: fn(u64, *mut render.Ctx, usize, usize),
 }
 
 fn cb_none(a: *mut App) {
@@ -230,6 +241,9 @@ fn ptr_none(a: *mut App, kind: u32, x: f64, y: f64) -> bool {
 fn kh_key_none(ud: u64, key: u32, mods: u32) -> bool { return false }
 fn wh_none(ud: u64, x: f64, y: f64, nx: f64, ny: f64) -> bool { return false }
 fn mo_none(ud: u64, kind: u32, x: f64, y: f64) -> bool { return false }
+fn mo_none_b(ud: u64, kind: u32, x: f64, y: f64) -> bool { return false }
+fn ctl_act_none(ud: u64, i: usize) {}
+fn ctl_paint_none(ud: u64, c: *mut render.Ctx, w: usize, h: usize) {}
 
 // How big an App is -- measured like lib/plat/web.fi measures a Web:
 // there is no size_of in stage 0, and a written number would be wrong the
@@ -260,7 +274,9 @@ fn app_blank() -> App {
         key_hook: key_none, has_key_hook: false, edit_hook: edit_none,
         has_edit_hook: false, ptr_hook: ptr_none, has_ptr_hook: false, bad: [false; 8],
         kh_on: false, kh_ud: 0, kh_key: kh_key_none, kh_chr: kh_key_none,
-        wh_on: false, wh_f: wh_none, mo_on: false, mo_f: mo_none }
+        wh_on: false, wh_f: wh_none, mo_on: false, mo_f: mo_none,
+        ctl_on: false, ctl_ud: 0, ctl_key: kh_key_none, ctl_chr: kh_key_none, ctl_ptr: mo_none_b,
+        ctl_act: ctl_act_none, ctl_paint: ctl_paint_none }
 }
 
 // ============================================================ ACTIONS AND CONTEXT MENUS (r161)
@@ -961,6 +977,45 @@ fn edit_done(a: *mut App, k: usize) {
     }
 }
 
+// ============================================================ THE PLUG FOR appctl.fi
+//
+// lib/fui/appctl.fi adds the standard controls (checkbox, radio, toggle, slider, progress,
+// drop-down, tabs, menu bar, tooltip, dialogs, number box, expander) on top of this file.
+// It needs five things from here, all additive: a handler each for a key, a character, the
+// raw pointer, an activated node and the overlay paint, a node of a kind with its text, and
+// the render context.
+
+// Plug `ud` in: the handlers hear every event BEFORE the focused text field (key, chr,
+// ptr: true = taken) and `act` hears every activated node AFTER the program's own handler.
+// `paint` runs last in every frame, above the page and its menus.
+fn set_ctl(a: *mut App, ud: u64, key: fn(u64, u32, u32) -> bool, chr: fn(u64, u32, u32) -> bool,
+    ptr: fn(u64, u32, f64, f64) -> bool, act: fn(u64, usize),
+    paint: fn(u64, *mut render.Ctx, usize, usize)) {
+    (*a).ctl_ud = ud
+    (*a).ctl_key = key
+    (*a).ctl_chr = chr
+    (*a).ctl_ptr = ptr
+    (*a).ctl_act = act
+    (*a).ctl_paint = paint
+    (*a).ctl_on = true
+}
+
+// A widget node of kind `kind` (widget.KIND_*) with the text `s` in the current container.
+// Its size is the text's. NONE when the window is full.
+fn node_new(a: *mut App, kind: u32, s: str) -> usize {
+    let i: usize = scene.scene_add(&(*a).sc, parent(a), scene.N_WIDGET)
+    if i == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_widget_kind(&(*a).sc, i, kind)
+    keep_text(a, i, s, 0)
+    return i
+}
+
+fn app_ctx(a: *mut App) -> *mut render.Ctx { return &(*a).c }
+fn ctl_ready(a: *mut App) -> bool { return (*a).ctl_on }
+fn ctl_data(a: *mut App) -> u64 { return (*a).ctl_ud }
+
 // ============================================================ LISTS
 
 // A LIST OF ROWS. The rows after this stand one below the other, until `end`:
@@ -1444,6 +1499,11 @@ fn app_paint(ud: u64, w: usize, h: usize) {
         menuview.mv_set_bounds((*cs).mv, 0.0, 0.0, w as f64, h as f64)
         menuview.mv_draw((*cs).mv, &(*a).c)
     }
+    // the overlays of the standard controls (appctl): a drop-down list, a tooltip, a dialog
+    if (*a).ctl_on {
+        let pf: fn(u64, *mut render.Ctx, usize, usize) = (*a).ctl_paint
+        pf((*a).ctl_ud, &(*a).c, w, h)
+    }
 }
 
 // How many lines `p`/`n` needs at width `w` -- the loop of
@@ -1548,6 +1608,13 @@ fn app_key(ud: u64, key: u32, mods: u32) -> bool {
             return true
         }
     }
+    if (*a).ctl_on {
+        let cf: fn(u64, u32, u32) -> bool = (*a).ctl_key
+        if cf((*a).ctl_ud, key, mods) {
+            fuiwirt.host_touch(&(*a).w)
+            return true
+        }
+    }
     let k: usize = focused_slot(a)
     if k == NONE {
         return shortcut_key(a, key, mods)
@@ -1573,6 +1640,13 @@ fn app_char(ud: u64, cp: u32, mods: u32) -> bool {
     if (*a).kh_on {
         let f: fn(u64, u32, u32) -> bool = (*a).kh_chr
         if f((*a).kh_ud, cp, mods) {
+            fuiwirt.host_touch(&(*a).w)
+            return true
+        }
+    }
+    if (*a).ctl_on {
+        let cf: fn(u64, u32, u32) -> bool = (*a).ctl_chr
+        if cf((*a).ctl_ud, cp, mods) {
             fuiwirt.host_touch(&(*a).w)
             return true
         }
@@ -1640,8 +1714,13 @@ fn app_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
         let mf: fn(u64, u32, f64, f64) -> bool = (*a).mo_f
         extra = mf((*a).kh_ud, kind, x, y)
     }
+    var ctl: bool = false
+    if (*a).ctl_on {
+        let pf2: fn(u64, u32, f64, f64) -> bool = (*a).ctl_ptr
+        ctl = pf2((*a).ctl_ud, kind, x, y)
+    }
     let r: bool = app_hook_text(ud, kind, x, y)
-    return r || heard || extra
+    return r || heard || extra || ctl
 }
 
 fn app_hook_text(ud: u64, kind: u32, x: f64, y: f64) -> bool {
@@ -1777,6 +1856,11 @@ fn app_act(ud: u64, i: usize) {
     if i < scene.SCENE_MAX && (*a).has_cb[i] {
         let f: fn(*mut App) = (*a).cb[i]
         f(a)
+        fuiwirt.host_touch(&(*a).w)
+    }
+    if (*a).ctl_on {
+        let cf: fn(u64, usize) = (*a).ctl_act
+        cf((*a).ctl_ud, i)
         fuiwirt.host_touch(&(*a).w)
     }
 }
