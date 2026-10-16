@@ -86,10 +86,18 @@ struct MergeOpts {
     thr: f32,
     soft: f32,
     align_blur: f32,
+    clip_bound: f32,
+    edge_gate: f32,
 }
 
+// clip_bound (0..1): where the REFERENCE is clipped its value is only a lower bound of the scene. An alternate
+// sample that is clearly DARKER than that bound (flicker, a shifted glyph, a misaligned edge) is rejected instead of
+// being accepted blindly (older versions gave every pixel with a clipped reference the full weight, which
+// punches holes into bright text). edge_gate (0..1): on strong reference edges (thin strokes) the 3x3 MEAN of T
+// dilutes a misalignment with quiet neighbours; the gate switches towards the 3x3 MAXIMUM there, so a ghosting
+// edge gets weight 0 and the sharp reference pixel wins. 0 = old behaviour for both.
 fn merge_default() -> MergeOpts {
-    return MergeOpts { thr: 1.5f, soft: 1.5f, align_blur: 0.0f }
+    return MergeOpts { thr: 1.5f, soft: 1.5f, align_blur: 0.0f, clip_bound: 1.0f, edge_gate: 0.0f }
 }
 
 fn merge_burst(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, out: *mut image.Image, var_plane: *mut image.Image, wsum: *mut image.Image) {
@@ -224,6 +232,9 @@ struct MergeCtx {
     ga: f32,
     thr: f32,
     soft: f32,
+    cb: f32,
+    eg: f32,
+    cmap: *mut image.Image,
 }
 
 fn ref_rows(ctx: u64, lo: u64, hi: u64) {
@@ -247,6 +258,63 @@ fn ref_rows(ctx: u64, lo: u64, hi: u64) {
         }
         y = y + 1
     }
+}
+
+// edge strength of the reference (green, 3x3 range in units of the expected noise sigma) -> gate 0..1
+fn cmap_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut MergeCtx = ctx as *mut MergeCtx
+    let w: i32 = (*(*k).rf).w
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            var mn: f32 = 1.0e9f
+            var mx: f32 = 0.0f - 1.0e9f
+            var dy: i32 = -1
+            while dy <= 1 {
+                var dx: i32 = -1
+                while dx <= 1 {
+                    let v: f32 = image.img_getc((*k).rf, 1, x + dx, y + dy)
+                    if v < mn { mn = v }
+                    if v > mx { mx = v }
+                    dx = dx + 1
+                }
+                dy = dy + 1
+            }
+            let sg: f32 = noise.sigma_of((*k).nm, 1, image.img_get((*k).rf, 1, x, y)) / (*k).gr
+            var e: f32 = ((mx - mn) / (sg + 1.0e-6f) - 6.0f) / 10.0f
+            if e < 0.0f { e = 0.0f }
+            if e > 1.0f { e = 1.0f }
+            image.img_set((*k).cmap, 0, x, y, e * e * (3.0f - 2.0f * e))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// T of a pixel whose reference is clipped: a clipped channel only tells "scene >= bound", so only an alternate
+// sample BELOW the bound counts as a difference (in units of the expected noise); brighter is fine.
+fn clip_bound_t(k: *mut MergeCtx, x: i32, y: i32, ap0: u64, ap1: u64, ap2: u64, bl: *mut Bil) -> f32 {
+    let gr: f32 = (*k).gr
+    let ga: f32 = (*k).ga
+    var t: f32 = 0.0f
+    var c: i32 = 0
+    while c < 3 {
+        let rv: f32 = image.img_get((*k).rf, c, x, y)
+        if rv > CLIP {
+            var ap: u64 = ap0
+            if c == 1 { ap = ap1 }
+            if c == 2 { ap = ap2 }
+            let av: f32 = bil_get(ap, bl)
+            let d: f32 = rv / gr - av / ga
+            if d > 0.0f {
+                let va: f32 = noise.variance((*k).nm, c, av) / (ga * ga) + noise.variance((*k).nm, c, rv) / (gr * gr)
+                t = t + (*k).cb * d * d / va
+            }
+        }
+        c = c + 1
+    }
+    return t
 }
 
 // pass 1: normalised squared difference T (mean over channels, expected 1 for pure noise)
@@ -289,6 +357,10 @@ fn pass1_rows(ctx: u64, lo: u64, hi: u64) {
             t = t + d * d / va
             if image.img_get((*k).rclip, 0, x, y) > 0.5f {
                 t = 0.0f
+                if (*k).cb > 0.0f {
+                    // lower bound test: only channels that are clipped themselves, only samples darker than the bound
+                    t = clip_bound_t(k, x, y, ap0, ap1, ap2, &bl)
+                }
             }
             image.img_set((*k).tmap, 0, x, y, t / 3.0f)
             // mark clipped alt samples with a huge T
@@ -342,6 +414,22 @@ fn pass2_rows(ctx: u64, lo: u64, hi: u64) {
                 }
             }
             var tt: f32 = s / 9.0f
+            if (*k).eg > 0.0f {
+                // max over the real (not clip-marked) neighbours
+                var mr: f32 = 0.0f
+                var ey: i32 = -1
+                while ey <= 1 {
+                    var ex: i32 = -1
+                    while ex <= 1 {
+                        let v: f32 = image.img_getc((*k).tmap, 0, x + ex, y + ey)
+                        if v > mr && v < 1.0e5f { mr = v }
+                        ex = ex + 1
+                    }
+                    ey = ey + 1
+                }
+                let gate: f32 = (*k).eg * image.img_get((*k).cmap, 0, x, y)
+                if mr > tt && tt < 1.0e5f { tt = tt + gate * (mr - tt) }
+            }
             var wgt: f32 = image.expneg(image.fmaxf(tt - (*k).thr, 0.0f) / (*k).soft)
             if image.img_get((*k).tmap, 0, x, y) > 1.0e5f { wgt = 0.0f }
             image.img_set((*k).wmap, 0, x, y, wgt)
@@ -456,14 +544,17 @@ fn merge_burst_opts(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, mo: 
     var vnum: image.Image = image.img_new(w, h, 1)
     var tmap: image.Image = image.img_new(w, h, 1)
     var wmap: image.Image = image.img_new(w, h, 1)
+    var cmap: image.Image = image.img_new(w, h, 1)
     var rclip: image.Image = clip_map(rf)
     var aclip: image.Image = image.img_new(1, 1, 1)
     var fl: align.Flow = align.Flow { tw: 0, th: 0, dx: 0 as u64, dy: 0 as u64, err: 0 as u64 }
     var mc: MergeCtx = MergeCtx {
         rf: rf, af: rf, acc: &acc, vnum: &vnum, tmap: &tmap, wmap: &wmap, wsum: wsum, out: out, var_plane: var_plane, nm: nm,
         fl: &fl, rclip: &rclip, aclip: &aclip, gr: gr, ga: gr, thr: (*mo).thr, soft: (*mo).soft,
+        cb: (*mo).clip_bound, eg: (*mo).edge_gate, cmap: &cmap,
     }
     par.rows(h, 16, ref_rows, (&mc) as u64)
+    if (*mo).edge_gate > 0.0f { par.rows(h, 16, cmap_rows, (&mc) as u64) }
 
     var lr: image.Image = image.img_luma(rf)
     if (*mo).align_blur > 0.0f {
@@ -514,4 +605,5 @@ fn merge_burst_opts(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, mo: 
     image.img_free(&vnum)
     image.img_free(&tmap)
     image.img_free(&wmap)
+    image.img_free(&cmap)
 }

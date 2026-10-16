@@ -26,7 +26,7 @@ import photo.sharpen
 import photo.photocolor
 
 export {
-    PipeOpts, opts_default, raw_to_linear, process_burst, process_single_linear, process_rgba8, pick_reference, finish_chain,
+    PipeOpts, opts_default, raw_to_linear, process_burst, process_single_linear, process_rgba8, pick_reference, pick_reference_c, finish_chain,
 }
 
 struct PipeOpts {
@@ -36,10 +36,11 @@ struct PipeOpts {
     sharpen: f32,
     wb: f32,
     ref_idx: i32,
+    consensus: f32, // > 0: reference choice penalises frames that disagree with the burst consensus (pick_reference_c)
 }
 
 fn opts_default() -> PipeOpts {
-    return PipeOpts { denoise: 1.0f, keep: 0.10f, tone: 1.0f, sharpen: 0.6f, wb: 0.7f, ref_idx: -1 }
+    return PipeOpts { denoise: 1.0f, keep: 0.10f, tone: 1.0f, sharpen: 0.6f, wb: 0.7f, ref_idx: -1, consensus: 4.0f }
 }
 
 // u16 RAW mosaic (stride in samples) -> demosaiced camera RGB, normalised by the black / white level of the
@@ -67,22 +68,139 @@ fn raw_to_linear(p: u64, w: i32, h: i32, stride: i32, m: *mut meta.SensorMeta) -
     return rgb
 }
 
-// Frame closest to gain 1 that is the sharpest (variance of the Laplacian of green).
-fn pick_reference(b: *mut merge.Burst) -> i32 {
+const REF_BLOCK: i32 = 16
+
+// Block means (green, exposure normalised) of frame i on a coarse grid; out must hold bw * bh floats.
+fn block_means(im: *mut image.Image, gain: f32, bw: i32, bh: i32, out: u64) {
+    var by: i32 = 0
+    while by < bh {
+        var bx: i32 = 0
+        while bx < bw {
+            var s: f32 = 0.0f
+            var n: f32 = 0.0f
+            var y: i32 = by * REF_BLOCK
+            while y < (by + 1) * REF_BLOCK && y < (*im).h {
+                var x: i32 = bx * REF_BLOCK
+                while x < (bx + 1) * REF_BLOCK && x < (*im).w {
+                    s = s + image.img_get(im, 1, x, y)
+                    n = n + 1.0f
+                    x = x + 1
+                }
+                y = y + 1
+            }
+            *((out + ((by * bw + bx) as u64) * (4 as u64)) as *mut f32) = s / (n * gain + 1.0e-9f)
+            bx = bx + 1
+        }
+        by = by + 1
+    }
+}
+
+// How far a frame strays from the burst consensus: per coarse block the relative distance of the frame's mean
+// to the MEDIAN over all frames; the result is the mean of the worst 5 % of blocks (a flickering or shifted
+// subtitle zone is a tiny part of the picture, a plain mean would hide it). 0 = agrees everywhere.
+fn consensus_dev(b: *mut merge.Burst, i: i32, bw: i32, bh: i32, grid: u64) -> f32 {
+    let nb: i32 = bw * bh
+    let n: i32 = (*b).n
+    var devs: u64 = rt.heap_alloc((nb as usize) * 4)
+    var col: [f32; 24] = [0.0f; 24]
+    var k: i32 = 0
+    while k < nb {
+        var j: i32 = 0
+        while j < n {
+            col[j as usize] = *((grid + (((j * nb + k) as u64) * (4 as u64))) as *mut f32)
+            j = j + 1
+        }
+        // insertion sort, median
+        var a: i32 = 1
+        while a < n {
+            let v: f32 = col[a as usize]
+            var c: i32 = a - 1
+            while c >= 0 && col[c as usize] > v {
+                col[(c + 1) as usize] = col[c as usize]
+                c = c - 1
+            }
+            col[(c + 1) as usize] = v
+            a = a + 1
+        }
+        let med: f32 = col[(n / 2) as usize]
+        let mine: f32 = *((grid + (((i * nb + k) as u64) * (4 as u64))) as *mut f32)
+        var d: f32 = mine - med
+        if d < 0.0f { d = 0.0f - d }
+        *((devs + (k as u64) * (4 as u64)) as *mut f32) = d / (med + 0.02f)
+        k = k + 1
+    }
+    // mean of the worst 5 % (partial selection by repeated max; nb is small)
+    var top: i32 = nb / 20
+    if top < 1 { top = 1 }
+    var acc: f32 = 0.0f
+    var t: i32 = 0
+    while t < top {
+        var bi: i32 = 0
+        var bv: f32 = 0.0f - 1.0f
+        var q: i32 = 0
+        while q < nb {
+            let v: f32 = *((devs + (q as u64) * (4 as u64)) as *mut f32)
+            if v > bv { bv = v; bi = q }
+            q = q + 1
+        }
+        acc = acc + bv
+        *((devs + (bi as u64) * (4 as u64)) as *mut f32) = 0.0f - 2.0f
+        t = t + 1
+    }
+    rt.heap_free(devs, (nb as usize) * 4)
+    return acc / (top as f32)
+}
+
+// Frame closest to gain 1 that is the sharpest (variance of the Laplacian of green). With consensus > 0 only
+// frames that agree with the burst compete: dev (consensus_dev) must stay within 0.6 / consensus of the best
+// agreeing frame (consensus 4 = 0.15, i.e. 15 % relative brightness difference in the worst 5 % of the blocks). A
+// frame whose local brightness or position (flickering TV subtitles, a moving hand) disagrees with the rest of the
+// burst is a bad reference even if its global sharpness is the best -- everything else is merged towards the
+// reference. consensus 0 = old behaviour.
+fn pick_reference_c(b: *mut merge.Burst, consensus: f32) -> i32 {
     var best: i32 = 0
     var bs: f32 = -1.0f
+    let n: i32 = (*b).n
+    var grid: u64 = 0 as u64
+    var bw: i32 = 0
+    var bh: i32 = 0
+    var dev: [f32; 24] = [0.0f; 24]
+    var dmin: f32 = 0.0f
+    if consensus > 0.0f && n >= 3 && n <= 24 {
+        bw = ((*b).frames[0].w + REF_BLOCK - 1) / REF_BLOCK
+        bh = ((*b).frames[0].h + REF_BLOCK - 1) / REF_BLOCK
+        grid = rt.heap_alloc((n as usize) * ((bw * bh) as usize) * 4)
+        var f: i32 = 0
+        while f < n {
+            block_means(&(*b).frames[f as usize], (*b).gain[f as usize], bw, bh, grid + (((f * bw * bh) as u64) * (4 as u64)))
+            f = f + 1
+        }
+        dmin = 1.0e9f
+        f = 0
+        while f < n {
+            dev[f as usize] = consensus_dev(b, f, bw, bh, grid)
+            if dev[f as usize] < dmin { dmin = dev[f as usize] }
+            f = f + 1
+        }
+    }
     var i: i32 = 0
-    while i < (*b).n {
+    while i < n {
         var g: f32 = (*b).gain[i as usize]
         if g < 1.0f { g = 1.0f / g }
         var s: f32 = image.sharpness(&(*b).frames[i as usize], 1) / (g * g * g * g)
+        if grid != (0 as u64) && dev[i as usize] > dmin + 0.6f / consensus { s = 0.0f - 1.0f }
         if s > bs {
             bs = s
             best = i
         }
         i = i + 1
     }
+    if grid != (0 as u64) { rt.heap_free(grid, (n as usize) * ((bw * bh) as usize) * 4) }
     return best
+}
+
+fn pick_reference(b: *mut merge.Burst) -> i32 {
+    return pick_reference_c(b, 0.0f)
 }
 
 fn finish_chain(lin: *mut image.Image, var_plane: *mut image.Image, m: *mut meta.SensorMeta, o: *mut PipeOpts, out: *mut image.Image) {
@@ -107,7 +225,7 @@ fn finish_chain(lin: *mut image.Image, var_plane: *mut image.Image, m: *mut meta
 // Burst (optionally bracketed). The burst keeps ownership of its frames.
 fn process_burst(b: *mut merge.Burst, m: *mut meta.SensorMeta, o: *mut PipeOpts, out: *mut image.Image) {
     var r: i32 = (*o).ref_idx
-    if r < 0 || r >= (*b).n { r = pick_reference(b) }
+    if r < 0 || r >= (*b).n { r = pick_reference_c(b, (*o).consensus) }
     var nm: noise.NoiseModel = noise.from_meta(m)
     if !(*m).has_noise {
         nm = noise.estimate_model(&(*b).frames[r as usize])

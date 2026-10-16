@@ -1,0 +1,212 @@
+// expect_out: ok
+// tests/3384_photo_ghost_gate.fi -- FirnCam merge gating for bright thin text (TV subtitles).
+// (1) clip_bound: a clipped reference only says "scene >= bound"; an alternate sample far BELOW it (flicker, a
+//     shifted glyph) must not punch a hole into the stroke. Old behaviour (clip_bound 0) is kept reachable.
+// (2) edge_gate: on a strong reference edge a shifted alternate must not blur the edge (leakage is not higher
+//     than without the gate).
+// (3) pick_reference_c: a frame that is the sharpest but disagrees with the burst in a small zone (flicker) is
+//     not chosen when the consensus weight is on; consensus 0 keeps the old choice.
+// (4) calm scene: with every option on a noise-only burst still merges (output close to the mean).
+import std.io
+import std.rt
+import photo.image
+import photo.meta
+import photo.noise
+import photo.merge
+import photo.pipeline
+
+fn model() -> noise.NoiseModel {
+    var m: meta.SensorMeta = meta.meta_default()
+    var k: usize = 0
+    while k < 4 {
+        meta.meta_set_noise(&m, k, 2.0e-3f, 2.0e-5f)
+        k = k + 1
+    }
+    return noise.from_meta(&m)
+}
+
+fn put3(im: *mut image.Image, x: i32, y: i32, v: f32) {
+    var c: i32 = 0
+    while c < 3 {
+        image.img_set(im, c, x, y, v)
+        c = c + 1
+    }
+}
+
+// 64x48 dark panel with bright vertical strokes 3 px wide every 8 px (rows 10..37) at level `lv`, shifted by `sx`
+fn stroke_frame(lv: f32, sx: i32, bg: f32) -> image.Image {
+    var im: image.Image = image.img_new(64, 48, 3)
+    var y: i32 = 0
+    while y < 48 {
+        var x: i32 = 0
+        while x < 64 {
+            var v: f32 = bg
+            if y >= 10 && y < 38 {
+                let m: i32 = ((x - sx - 2) % 8 + 8) % 8
+                if m < 3 { v = lv }
+            }
+            put3(&im, x, y, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return im
+}
+
+fn mopts(cb: f32, eg: f32) -> merge.MergeOpts {
+    var mo: merge.MergeOpts = merge.merge_default()
+    mo.clip_bound = cb
+    mo.edge_gate = eg
+    return mo
+}
+
+// minimum over the stroke cores (middle pixel of every stroke, rows 14..33) of channel 1
+fn core_min(im: *mut image.Image) -> f32 {
+    var mn: f32 = 100.0f
+    var y: i32 = 14
+    while y < 34 {
+        var s: i32 = 0
+        while s < 6 {
+            let x: i32 = 3 + 8 * s
+            let v: f32 = image.img_get(im, 1, x, y)
+            if v < mn { mn = v }
+            s = s + 1
+        }
+        y = y + 1
+    }
+    return mn
+}
+
+fn run_merge(b: *mut merge.Burst, mo: *mut merge.MergeOpts, out: *mut image.Image) {
+    var nm: noise.NoiseModel = model()
+    var vp: image.Image = image.img_new(1, 1, 1)
+    var ws: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&vp)
+    image.img_free(&ws)
+    merge.merge_burst_opts(b, 0, &nm, mo, out, &vp, &ws)
+    image.img_free(&vp)
+    image.img_free(&ws)
+}
+
+fn main() -> i32 {
+    var ok: bool = true
+
+    // (1) clipped reference strokes, alternates: stroke pixels at 0.30 (a flicker low), the same pixel grid
+    var b1: merge.Burst = merge.burst_new()
+    merge.burst_add(&b1, stroke_frame(1.0f, 0, 0.05f), 1.0f)
+    merge.burst_add(&b1, stroke_frame(0.30f, 0, 0.05f), 1.0f)
+    merge.burst_add(&b1, stroke_frame(0.30f, 0, 0.05f), 1.0f)
+    var o_on: image.Image = image.img_new(1, 1, 3)
+    var o_off: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&o_on)
+    image.img_free(&o_off)
+    var mo_on: merge.MergeOpts = mopts(1.0f, 0.0f)
+    var mo_off: merge.MergeOpts = mopts(0.0f, 0.0f)
+    run_merge(&b1, &mo_on, &o_on)
+    run_merge(&b1, &mo_off, &o_off)
+    let c_on: f32 = core_min(&o_on)
+    let c_off: f32 = core_min(&o_off)
+    if !(c_on > 0.9f) { io.print_line("FAIL clip_bound on: stroke core darkened"); ok = false }
+    if !(c_off < 0.6f) { io.print_line("FAIL clip_bound off should show the old hole"); ok = false }
+    // brighter alternates (short exposure recovering the clip) stay accepted
+    var b1b: merge.Burst = merge.burst_new()
+    merge.burst_add(&b1b, stroke_frame(1.0f, 0, 0.05f), 1.0f)
+    merge.burst_add(&b1b, stroke_frame(2.0f, 0, 0.05f), 1.0f)
+    var o_br: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&o_br)
+    run_merge(&b1b, &mo_on, &o_br)
+    ok = core_min(&o_br) > 0.9f && ok
+    image.img_free(&o_on)
+    image.img_free(&o_off)
+    image.img_free(&o_br)
+    merge.burst_free(&b1)
+    merge.burst_free(&b1b)
+
+    // (2) edge gate: dim strokes (0.40, not clipped), alternates shifted by 1 px
+    var b2: merge.Burst = merge.burst_new()
+    merge.burst_add(&b2, stroke_frame(0.40f, 0, 0.05f), 1.0f)
+    merge.burst_add(&b2, stroke_frame(0.40f, 1, 0.05f), 1.0f)
+    merge.burst_add(&b2, stroke_frame(0.40f, 0 - 1, 0.05f), 1.0f)
+    var g0: image.Image = image.img_new(1, 1, 3)
+    var g1: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&g0)
+    image.img_free(&g1)
+    var mg0: merge.MergeOpts = mopts(1.0f, 0.0f)
+    var mg1: merge.MergeOpts = mopts(1.0f, 1.0f)
+    run_merge(&b2, &mg0, &g0)
+    run_merge(&b2, &mg1, &g1)
+    // first pixel after the stroke 2..4 (x = 5, row 20): leakage of the stroke
+    let leak0: f32 = image.img_get(&g0, 1, 5, 20)
+    let leak1: f32 = image.img_get(&g1, 1, 5, 20)
+    if !(leak1 <= leak0 + 0.02f) { io.print_line("FAIL edge gate leaks more than without"); ok = false }
+    if !(core_min(&g1) > 0.3f) { io.print_line("FAIL edge gate damaged the stroke"); ok = false }
+    image.img_free(&g0)
+    image.img_free(&g1)
+    merge.burst_free(&b2)
+
+    // (3) reference choice: frames of a smooth pattern; frame 2 has a bright high-contrast zone (sharpest, but
+    // it disagrees with the other frames there)
+    var b3: merge.Burst = merge.burst_new()
+    var f: i32 = 0
+    while f < 5 {
+        var im: image.Image = image.img_new(96, 64, 3)
+        var y: i32 = 0
+        while y < 64 {
+            var x: i32 = 0
+            while x < 96 {
+                var v: f32 = 0.25f + 0.001f * ((x + 2 * y) % 17) as f32
+                if f == 2 && x >= 40 && x < 56 && y >= 24 && y < 40 {
+                    v = 0.55f
+                    if ((x + y) % 2) == 0 { v = 0.85f }
+                }
+                put3(&im, x, y, v)
+                x = x + 1
+            }
+            y = y + 1
+        }
+        merge.burst_add(&b3, im, 1.0f)
+        f = f + 1
+    }
+    let r0: i32 = pipeline.pick_reference_c(&b3, 0.0f)
+    let r1: i32 = pipeline.pick_reference_c(&b3, 4.0f)
+    if !(r0 == 2) { io.print_line("FAIL sharpness only should pick the odd frame"); ok = false }
+    if !(r1 != 2) { io.print_line("FAIL consensus still picks the odd frame"); ok = false }
+    if !(pipeline.pick_reference(&b3) == r0) { io.print_line("FAIL pick_reference changed"); ok = false }
+    merge.burst_free(&b3)
+
+    // (4) calm burst: every option on, output equals the mean within noise
+    var b4: merge.Burst = merge.burst_new()
+    var rng: image.Rng = image.rng_new(11 as u64)
+    f = 0
+    while f < 6 {
+        var im: image.Image = stroke_frame(0.5f, 0, 0.2f)
+        var y: i32 = 0
+        while y < 48 {
+            var x: i32 = 0
+            while x < 64 {
+                var c: i32 = 0
+                while c < 3 {
+                    image.img_set(&im, c, x, y, image.img_get(&im, c, x, y) + 0.004f * image.rng_gauss(&rng))
+                    c = c + 1
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        merge.burst_add(&b4, im, 1.0f)
+        f = f + 1
+    }
+    var o4: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&o4)
+    var mo4: merge.MergeOpts = mopts(1.0f, 1.0f)
+    run_merge(&b4, &mo4, &o4)
+    let v4: f32 = image.img_get(&o4, 1, 3, 20)
+    if !(v4 > 0.48f && v4 < 0.52f) { io.print_line("FAIL calm burst stroke value"); ok = false }
+    let v5: f32 = image.img_get(&o4, 1, 20, 5)
+    if !(v5 > 0.19f && v5 < 0.21f) { io.print_line("FAIL calm burst background value"); ok = false }
+    image.img_free(&o4)
+    merge.burst_free(&b4)
+
+    if ok { io.print_line("ok") }
+    return 0
+}
