@@ -62,6 +62,7 @@ export {
     camera_focus_at, camera_focus_clear, camera_focus_state, camera_focus_active, camera_af_state_raw, camera_ae_state_raw, camera_result_count, camera_fail_count,
     camera_zoom_range, camera_get_zoom, camera_applied_zoom, camera_set_zoom, camera_zoom_lens, camera_zoom_to, camera_zoom_factor,
     camera_zoom_stops, camera_active_focal, camera_entry_id,
+    camera_result_phys, camera_result_crop, camera_probe_id, camera_tags,
     camera_set_flash, camera_flash_mode, camera_flash_prepare,
 }
 
@@ -260,6 +261,8 @@ extern fn ACameraMetadata_free(md: u64);
 #[no_gc]
 extern fn ACameraMetadata_getConstEntry(md: u64, tag: u32, entry: u64) -> i32;
 #[no_gc]
+extern fn ACameraMetadata_getAllTags(md: u64, n: u64, tags: u64) -> i32;
+#[no_gc]
 extern fn ACameraDevice_close(dev: u64) -> i32;
 #[no_gc]
 extern fn ACameraDevice_createCaptureRequest(dev: u64, template: i32, out: u64) -> i32;
@@ -400,6 +403,8 @@ const T_SENSOR_INFO_WHITE: u32 = 983047
 const T_COLOR_GAINS: u32 = 2
 const T_INFO_HW_LEVEL: u32 = 1376256
 const T_PHYSICAL_IDS: u32 = 1703936
+const T_LOGICAL_SYNC_TYPE: u32 = 1703937 // LOGICAL_MULTI_CAMERA_SENSOR_SYNC_TYPE
+const T_SENSOR_INFO_PIXEL_ARRAY_MAXRES: u32 = 983052 // SENSOR_INFO_PIXEL_ARRAY_SIZE_MAXIMUM_RESOLUTION (API 31)
 
 // ------------------------------------------------------------ the raw block
 // One mmap block: callbacks write into it, API functions read it. Offsets in octets.
@@ -474,6 +479,8 @@ const B_FLASH_USE: u64 = 524 // i32 1 = the still being captured may use the fla
 const B_FLASH_PREP: u64 = 528 // i32 1 = preview runs in flash AE mode (precapture before a flash still)
 const B_CROP: u64 = 532 // 4 x i32 scratch for SCALER_CROP_REGION
 const B_ZOOM_RES: u64 = 548 // f32 zoom ratio the newest capture result reports (0 = none yet)
+const B_ACT_PHYS: u64 = 560 // 16 octets: ACTIVE_PHYSICAL_ID string of the newest capture result ("" = none reported)
+const B_RES_CROP: u64 = 576 // 4 x i32 SCALER_CROP_REGION of the newest capture result (left top width height)
 const B_LAST_URI: u64 = 552 // u64 global ref of the Uri of the newest saved picture (0 = none)
 const CB_DEV: u64 = 1024 // ACameraDevice_StateCallbacks (24)
 const CB_SESS: u64 = 1056 // ACameraCaptureSession_stateCallbacks (32)
@@ -1062,6 +1069,40 @@ fn cb_completed(ctx: u64, sess: u64, req: u64, md: u64) {
     if md_get(md, T_CONTROL_AF_STATE, e) { wr32(b + B_AF_STATE, rd8(e_data(e)) as i32) }
     if md_get(md, T_CONTROL_AE_STATE, e) { wr32(b + B_AE_STATE, rd8(e_data(e)) as i32) }
     if md_get(md, T_CONTROL_ZOOM_RATIO, e) { wrf(b + B_ZOOM_RES, rdf(e_data(e))) }
+    // the active physical lens of a logical camera: the one byte-string entry of the LOGICAL_MULTI_CAMERA section (26)
+    // in the result; and the crop region the service applied
+    wr64(b + B_ACT_PHYS, 0)
+    wr64(b + B_ACT_PHYS + 8, 0)
+    wr32(b + B_SCRATCH + 320, 0)
+    wr64(b + B_SCRATCH + 328, 0)
+    if ACameraMetadata_getAllTags(md, b + B_SCRATCH + 320, b + B_SCRATCH + 328) == 0 {
+        let nt: i32 = rd32(b + B_SCRATCH + 320)
+        let tp: u64 = *((b + B_SCRATCH + 328) as *mut u64)
+        var k: i32 = 0
+        while k < nt && tp != 0 {
+            let tg: u32 = *((tp + (k * 4) as u64) as *mut u32)
+            if tg / (65536 as u32) == (26 as u32) && ACameraMetadata_getConstEntry(md, tg, e) == 0 {
+                let cn: usize = e_count(e)
+                if rd8(e + 4) == 0 as u32 && cn >= 1 && cn <= 15 {
+                    var j: usize = 0
+                    while j < cn {
+                        wr8(b + B_ACT_PHYS + j as u64, rd8(e_data(e) + j as u64))
+                        j = j + 1
+                    }
+                    wr8(b + B_ACT_PHYS + cn as u64, 0 as u32)
+                    break
+                }
+            }
+            k = k + 1
+        }
+    }
+    if md_get(md, T_SCALER_CROP_REGION, e) && e_count(e) >= 4 {
+        var j: usize = 0
+        while j < 4 {
+            wr32(b + B_RES_CROP + (j * 4) as u64, rd32(e_data(e) + (j * 4) as u64))
+            j = j + 1
+        }
+    }
     if md_get(md, T_FLASH_STATE, e) { wr32(b + B_FLASH_STATE, rd8(e_data(e)) as i32) }
     wr64(s + 8, 0)
     if md_get(md, T_SENSOR_EXPOSURE_TIME, e) { wr64(s + 8, rd64(e_data(e))); flags = flags | 1 as u32 }
@@ -1637,6 +1678,8 @@ fn reset_controls(b: u64, md: u64) {
     wr32(b + B_FLASH_USE, 0)
     wr32(b + B_FLASH_PREP, 0)
     wrf(b + B_ZOOM_RES, 0.0f)
+    wr64(b + B_ACT_PHYS, 0)
+    wr64(b + B_ACT_PHYS + 8, 0)
     if md == 0 { return }
     let e: u64 = b + B_SCRATCH + 480
     if md_get(md, T_CONTROL_ZOOM_RATIO_RANGE, e) && e_count(e) >= 2 {
@@ -1938,6 +1981,147 @@ fn camera_active_focal() -> f32 {
     let n: u64 = *((b + B_RES_N) as *mut u64)
     if n == 0 { return 0.0f }
     return rdf(b + RES_BASE + ((n - 1) % RES_COUNT) * RES_SLOT + 28)
+}
+
+// The ACTIVE_PHYSICAL_ID the newest capture result reports, copied (zero terminated) to dst (cap >= 16). Returns its length,
+// 0 = the device reports none (then the focal length in the result is the only hint of a lens switch).
+#[no_gc]
+fn camera_result_phys(dst: u64) -> usize {
+    let b: u64 = block()
+    var n: usize = 0
+    if b != 0 {
+        while n < 15 && rd8(b + B_ACT_PHYS + n as u64) != 0 as u32 {
+            wr8(dst + n as u64, rd8(b + B_ACT_PHYS + n as u64))
+            n = n + 1
+        }
+    }
+    wr8(dst + n as u64, 0 as u32)
+    return n
+}
+
+// SCALER_CROP_REGION (left, top, width, height; i32 x 4) the newest capture result reports.
+#[no_gc]
+fn camera_result_crop(out: u64) {
+    let b: u64 = block()
+    var j: u64 = 0
+    while j < 4 {
+        wr32(out + j * 4, if b != 0 { rd32(b + B_RES_CROP + j * 4) } else { 0 })
+        j = j + 1
+    }
+}
+
+// Probe one camera id by NUMBER (decimal id string "0".."99"), listed or not. out = 16 x i32:
+// [0] camera_status_t of getCameraCharacteristics (0 = readable, else the error, e.g. -10001 / -10002 / -10003)
+// and when readable: [1] facing, [2] hardware level, [3] bits 1 RAW, 2 MANUAL_SENSOR, 4 LOGICAL, 8 ULTRA_HIGH_RESOLUTION_SENSOR,
+// 16 BURST, [4] first focal length x100 mm, [5] focal length count, [6][7] largest JPEG, [8][9] largest RAW16, [10][11] active array,
+// [12][13] PIXEL_ARRAY_SIZE_MAXIMUM_RESOLUTION (0 = absent), [14] LOGICAL_MULTI_CAMERA_SENSOR_SYNC_TYPE (-1 = absent),
+// [15] octets of PHYSICAL_IDS (0 = not a logical camera). Returns [0].
+#[no_gc]
+fn camera_probe_id(num: i32, out: u64) -> i32 {
+    var i: i32 = 0
+    while i < 16 {
+        wr32(out + (i * 4) as u64, 0)
+        i = i + 1
+    }
+    let b: u64 = block()
+    let mgr: u64 = manager()
+    if b == 0 || mgr == 0 || num < 0 || num > 99 {
+        wr32(out, 0 - 999)
+        return 0 - 999
+    }
+    let s: u64 = b + B_SCRATCH + 192
+    if num >= 10 {
+        wr8(s, (48 + num / 10) as u32)
+        wr8(s + 1, (48 + num % 10) as u32)
+        wr8(s + 2, 0 as u32)
+    } else {
+        wr8(s, (48 + num) as u32)
+        wr8(s + 1, 0 as u32)
+    }
+    let op: u64 = b + B_SCRATCH + 64
+    wr64(op, 0)
+    let rc: i32 = ACameraManager_getCameraCharacteristics(mgr, s, op)
+    wr32(out, rc)
+    if rc != 0 { return rc }
+    let md: u64 = *(op as *mut u64)
+    if md == 0 {
+        wr32(out, 0 - 998)
+        return 0 - 998
+    }
+    let e: u64 = b + B_SCRATCH
+    wr32(out + 4, md_u8(md, T_LENS_FACING, 0 - 1))
+    wr32(out + 8, md_u8(md, T_INFO_HW_LEVEL, 0 - 1))
+    var caps: i32 = 0
+    if md_has_u8(md, T_REQUEST_CAPS, 3) { caps = caps | 1 }
+    if md_has_u8(md, T_REQUEST_CAPS, 1) { caps = caps | 2 }
+    if md_has_u8(md, T_REQUEST_CAPS, 11) { caps = caps | 4 }
+    if md_has_u8(md, T_REQUEST_CAPS, 16) { caps = caps | 8 }
+    if md_has_u8(md, T_REQUEST_CAPS, 6) { caps = caps | 16 }
+    wr32(out + 12, caps)
+    if md_get(md, T_LENS_INFO_FOCAL_LENGTHS, e) {
+        wr32(out + 16, (rdf(e_data(e)) * 100.0f + 0.5f) as i32)
+        wr32(out + 20, e_count(e) as i32)
+    }
+    var w: i32 = 0
+    var h: i32 = 0
+    best_size(md, 256, 0, 0.0f, &w, &h)
+    wr32(out + 24, w)
+    wr32(out + 28, h)
+    best_size(md, 32, 0, 0.0f, &w, &h)
+    wr32(out + 32, w)
+    wr32(out + 36, h)
+    if md_get(md, T_SENSOR_INFO_ACTIVE, e) && e_count(e) >= 4 {
+        wr32(out + 40, rd32(e_data(e) + 8))
+        wr32(out + 44, rd32(e_data(e) + 12))
+    }
+    if md_get(md, T_SENSOR_INFO_PIXEL_ARRAY_MAXRES, e) && e_count(e) >= 2 {
+        wr32(out + 48, rd32(e_data(e)))
+        wr32(out + 52, rd32(e_data(e) + 4))
+    }
+    wr32(out + 56, md_u8(md, T_LOGICAL_SYNC_TYPE, 0 - 1))
+    if md_get(md, T_PHYSICAL_IDS, e) { wr32(out + 60, e_count(e) as i32) }
+    ACameraMetadata_free(md)
+    return 0
+}
+
+// All tags of the characteristics of scan entry `index`: out = 4 x i32 per tag: tag (u32 bits), type (0 byte 1 i32 2 float 3 i64
+// 4 double 5 rational), count, first value (byte / i32 as is, float x1000, i64 low half). Returns the number of tags (<= cap).
+// For devices whose tag numbers we do not know by heart (maximum-resolution tables, vendor tags): the dump shows them.
+#[no_gc]
+fn camera_tags(index: i32, out: u64, cap: i32) -> i32 {
+    let b: u64 = block()
+    if b == 0 || index < 0 || index >= rd32(b + B_SCAN_N) { return 0 }
+    let md: u64 = chars_of(tbl_id(index))
+    if md == 0 { return 0 }
+    wr32(b + B_SCRATCH + 320, 0)
+    wr64(b + B_SCRATCH + 328, 0)
+    var n: i32 = 0
+    if ACameraMetadata_getAllTags(md, b + B_SCRATCH + 320, b + B_SCRATCH + 328) == 0 {
+        let nt: i32 = rd32(b + B_SCRATCH + 320)
+        let tp: u64 = *((b + B_SCRATCH + 328) as *mut u64)
+        let e: u64 = b + B_SCRATCH
+        var k: i32 = 0
+        while k < nt && n < cap && tp != 0 {
+            let tg: u32 = *((tp + (k * 4) as u64) as *mut u32)
+            if ACameraMetadata_getConstEntry(md, tg, e) == 0 {
+                let o: u64 = out + (n * 16) as u64
+                *(o as *mut u32) = tg
+                let ty: i32 = rd8(e + 4) as i32
+                wr32(o + 4, ty)
+                wr32(o + 8, e_count(e) as i32)
+                var v: i32 = 0
+                if e_count(e) > 0 {
+                    let d: u64 = e_data(e)
+                    if ty == 0 { v = rd8(d) as i32 } else if ty == 1 { v = rd32(d) } else if ty == 2 { v = (rdf(d) * 1000.0f) as i32 } else if ty == 3 { v = (rd64(d) % 2000000000) as i32 }
+                }
+                wr32(o + 12, v)
+                n = n + 1
+            }
+            k = k + 1
+        }
+    }
+    ACameraMetadata_free(md)
+    return n
 }
 
 // Zoom to `z` (user scale, see camera_zoom_factor): switches the lens when another lens serves it better, then
