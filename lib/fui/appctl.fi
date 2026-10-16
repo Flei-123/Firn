@@ -44,9 +44,10 @@
 //
 //   DONE:  checkbox  radio (group)  toggle  slider  progress  spinbox
 //          dropdown (+ dropdown_add)  tabs / tab / tab_page  expander / expander_body
-//   NEXT:  menubar / menu / menu_item (Alt+letter, shortcuts, built on app.action_add and
-//          the ctx menu), tooltip, message / confirm / input (modal, kit.Modal focus trap)
-//          -- roadmap entry "fui.app standard controls, part 2"
+//          menubar / menu / menu_item / menu_check / menu_sep / menu_shortcut (Alt+letter, Left / Right
+//          between menus; the items are actions of the window), popup_menu + context_menu (right
+//          click, menu key, Shift+F10), tooltip (500 ms delay), message / confirm / input (modal,
+//          kit.Modal focus trap, answers by callback)
 //
 // ========================================================= HONEST
 //
@@ -59,6 +60,10 @@
 //   L4  A hidden tab page / collapsed expander body keeps a 1 point rest in the
 //       layout (scene bounds are "0 = no limit").
 //   L5  The menu bar does not switch menus on hover while one is open.
+//   L6  The dialogs are drawn by the library, not nodes of the scene: a screen reader does not
+//       list their buttons (the window behind is shut off while one is open). One at a time.
+//   L7  The input dialog's field has no mouse caret placement / selection (keys only) and no
+//       IME; a tooltip is one line.
 import std.rt
 import fui.app
 import fui.scene
@@ -83,6 +88,10 @@ export {
     tabs, tab, tab_page, tabs_end, expander, expander_body,
     checked, set_checked, value, set_value, selected, set_selected, set_enabled,
     open_dropdown, dropdown_is_open, expanded, set_expanded, popup_rect,
+    menubar, menubar_end, menu, popup_menu, context_menu, menu_item, menu_check, menu_sep,
+    menu_shortcut, menu_enable, menu_checked, menu_set_checked, open_menu_id, menu_is_open,
+    tooltip, message, confirm, input, dialog_open, dialog_text, dialog_answer,
+    ANS_OK, ANS_CANCEL,
     CTL_MAX, OPT_MAX, NONE,
 }
 
@@ -118,11 +127,22 @@ const D_INPUT: u32 = 3
 // the delay before a tooltip shows (ms)
 const TIP_DELAY: i64 = 500
 const SPIN_ZONE_PT: usize = 28
+const DLG_W_PT: usize = 380
+const BTN_W_PT: usize = 88
+// ids of menus made by popup_menu (no node): MENU_VIRT + entry; SEP_MARK in the menu pool = a line
+const MENU_VIRT: usize = 1000000
+const SEP_MARK: usize = 4294967294
 const INPUT_CAP: usize = 256
 
 // the pointer kinds of the host hook / popup sink
 
 fn cb_none(a: *mut app.App, id: usize) {
+}
+
+// one menu item: the action's data (the pool slot)
+struct Rec {
+    c: *mut Ctl,
+    k: usize,
 }
 
 struct Ctl {
@@ -146,6 +166,11 @@ struct Ctl {
     n_opts: usize,
     macts: [usize; 96],
     n_macts: usize,
+    irec: [Rec; 96],
+    ien: [bool; 96],
+    ichk: [u32; 96],
+    icb: [fn(*mut app.App, usize); 96],
+    mhdr: usize,
     groups: usize,
     // the open drop-down
     drop_open: bool,
@@ -153,6 +178,7 @@ struct Ctl {
     drop_hot: usize,
     // the tooltip
     tip_node: usize,
+    tip_on: bool,
     tip_since: i64,
     tip_x: f64,
     tip_y: f64,
@@ -168,6 +194,7 @@ struct Ctl {
     dlg_ed: editor.Editor,
     dlg_buf: u64,
     dlg_hot: usize,
+    dlg_hclose: bool,
     // the menu bar row (container) while it is open
     mbar: bool,
 }
@@ -180,10 +207,12 @@ fn ctl_blank() -> Ctl {
         aux: [0; 48], page: [NONE; 48], lo: [0; 48], hi: [0; 48], last: [0; 48],
         cb: [cb_none; 48], has_cb: [false; 48], tip: [""; 48], base: [0; 48], cnt: [0; 48],
         opts: [""; 96], n_opts: 0, macts: [0; 96], n_macts: 0, groups: 0,
+        irec: [Rec { c: 0 as u64 as *mut Ctl, k: 0 }; 96], ien: [true; 96], ichk: [0 as u32; 96],
+        icb: [cb_none; 96], mhdr: NONE,
         drop_open: false, drop_ctl: NONE, drop_hot: NONE,
-        tip_node: NONE, tip_since: 0, tip_x: 0.0, tip_y: 0.0, win_w: 640.0, win_h: 480.0,
+        tip_node: NONE, tip_on: false, tip_since: 0, tip_x: 0.0, tip_y: 0.0, win_w: 640.0, win_h: 480.0,
         dlg: 0 as u32, dlg_m: kit.modal_new(), dlg_title: "", dlg_text: "", dlg_cb: dlg_cb_none,
-        dlg_ed: editor.editor_new(), dlg_buf: 0, dlg_hot: NONE, mbar: false }
+        dlg_ed: editor.editor_new(), dlg_buf: 0, dlg_hot: NONE, dlg_hclose: false, mbar: false }
 }
 
 // ============================================================ THE STATE
@@ -210,6 +239,7 @@ fn st(a: *mut app.App) -> *mut Ctl {
     let mv: *mut menuview.MenuView = app.ctx_view(a)
     fuiwirt.host_set_popup(app.app_host(a), p, sink_open, sink_ptr, sink_key, sink_chr,
         sink_tick, sink_wait)
+    fuiwirt.host_set_wake(app.app_host(a), p, wake_tick, wake_wait)
     return c
 }
 
@@ -945,6 +975,846 @@ fn set_expanded(a: *mut app.App, id: usize, on: bool) {
     touch(c)
 }
 
+// ============================================================ MENUS
+
+// A menu bar (a row of headers), menus with items, separators, check items, shortcuts and
+// Alt+letter. The items are ACTIONS of the window's registry (action.fi): the same entry shows its
+// shortcut in the menu and runs from the keyboard, and the popup is the context-menu popup
+// (menuview.fi). Menus are made in this order: menubar, menu, its items, menu, its items ...,
+// menubar_end. The items of one menu must follow it directly (one row of a pool).
+
+// The row that holds the menu headers; close it with `menubar_end`.
+fn menubar(a: *mut app.App) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 {
+        return NONE
+    }
+    let r: usize = app.row(a)
+    (*c).mbar = true
+    return r
+}
+
+fn menubar_end(a: *mut app.App) {
+    app.end(a)
+}
+
+// the label without '&' into `out`; `mn` gets the mnemonic letter (lower case, 0 = none) and
+// `at` its index in the clean text (NONE = none)
+#[allow_escape]
+fn clean_label(raw: str, out: *mut [u8; 64], mn: *mut u32, at: *mut usize) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    *mn = 0 as u32
+    *at = NONE
+    while i < raw.n && n < 63 {
+        let b: u8 = *((raw.p as u64 + i as u64) as *mut u8)
+        if b == 38 as u8 && i + 1 < raw.n {
+            let nx: u8 = *((raw.p as u64 + (i + 1) as u64) as *mut u8)
+            if nx == 38 as u8 {
+                (*out)[n] = 38 as u8
+                n = n + 1
+                i = i + 2
+            } else {
+                if *mn == 0 as u32 {
+                    var lc: u32 = nx as u32
+                    if lc >= 65 as u32 && lc <= 90 as u32 {
+                        lc = lc + 32 as u32
+                    }
+                    *mn = lc
+                    *at = n
+                }
+                i = i + 1
+            }
+        } else {
+            (*out)[n] = b
+            n = n + 1
+            i = i + 1
+        }
+    }
+    return n
+}
+
+// A menu header in the bar ("&File": Alt+F opens it). Returns the header's node (the menu's id).
+#[allow_escape]
+fn menu(a: *mut app.App, label: str) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return NONE
+    }
+    var buf: [u8; 64] = [0 as u8; 64]
+    var mn: u32 = 0 as u32
+    var at: usize = NONE
+    let n: usize = clean_label(label, &buf, &mn, &at)
+    let node: usize = app.node_new(a, widget.KIND_BUTTON, str { p: (&buf[0]) as *mut u8, n: n })
+    if node == NONE {
+        return NONE
+    }
+    let i: usize = add_entry(c, K_MENU, node)
+    (*c).aux[i] = mn as usize
+    (*c).lo[i] = at as i64
+    (*c).base[i] = (*c).n_macts
+    scene.node_set_draw(sc_of(c), node, c as u64, draw_header)
+    let ok: bool = app.on_context(a, node, menu_provider)
+    return node
+}
+
+// A menu without a header: for context_menu or a menu the program opens itself. Returns its id.
+fn popup_menu(a: *mut app.App) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return NONE
+    }
+    let id: usize = MENU_VIRT + (*c).n
+    let i: usize = add_entry(c, K_POPUP, id)
+    (*c).base[i] = (*c).n_macts
+    return id
+}
+
+// Make the menu `m` the context menu of `node` (and everything inside it): right click, the
+// menu key and Shift+F10 open it.
+fn context_menu(a: *mut app.App, node: usize, m: usize) -> bool {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return false
+    }
+    let mi: usize = find(c, m)
+    if mi == NONE || ((*c).kind[mi] != K_MENU && (*c).kind[mi] != K_POPUP) {
+        return false
+    }
+    let i: usize = add_entry(c, K_CTXMAP, node)
+    (*c).aux[i] = mi
+    return app.on_context(a, node, menu_provider)
+}
+
+fn item_run(ud: u64, cx: *mut action.ActCtx) {
+    let r: *mut Rec = ud as *mut Rec
+    let c: *mut Ctl = (*r).c
+    let k: usize = (*r).k
+    if (*c).ichk[k] != 0 as u32 {
+        (*c).ichk[k] = (3 as u32) - (*c).ichk[k]
+    }
+    let f: fn(*mut app.App, usize) = (*c).icb[k]
+    f((*c).a, (*c).macts[k])
+}
+
+fn item_enabled(ud: u64, cx: *mut action.ActCtx) -> bool {
+    let r: *mut Rec = ud as *mut Rec
+    return (*(*r).c).ien[(*r).k]
+}
+
+fn item_check(ud: u64, cx: *mut action.ActCtx) -> u32 {
+    let r: *mut Rec = ud as *mut Rec
+    return (*(*r).c).ichk[(*r).k]
+}
+
+fn item_add(a: *mut app.App, m: usize, id: str, label: str, chk: u32,
+    cb: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 {
+        return NONE
+    }
+    let i: usize = find(c, m)
+    if i == NONE || ((*c).kind[i] != K_MENU && (*c).kind[i] != K_POPUP) {
+        return NONE
+    }
+    // the items of one menu stand in a row of the pool: they must be added right after the menu
+    if (*c).base[i] + (*c).cnt[i] != (*c).n_macts || (*c).n_macts >= OPT_MAX {
+        return NONE
+    }
+    let r: *mut action.Actions = app.actions(a)
+    let k: usize = (*c).n_macts
+    (*c).irec[k] = Rec { c: c, k: k }
+    let act: usize = action.act_add(r, id, label, item_run, (&(*c).irec[k]) as u64)
+    if act == action.ACT_NONE {
+        return NONE
+    }
+    action.act_set_enabled(r, act, item_enabled)
+    if chk != 0 as u32 {
+        action.act_set_check(r, act, item_check)
+    }
+    (*c).macts[k] = act
+    (*c).ichk[k] = chk
+    (*c).ien[k] = true
+    (*c).icb[k] = cb
+    (*c).n_macts = k + 1
+    (*c).cnt[i] = (*c).cnt[i] + 1
+    return act
+}
+
+// An item: `id` is the action's verb (unique in the window), `label` its text ("&Open"; the
+// letter after '&' is the mnemonic). `on_select(a, act)` runs when it is chosen -- by mouse,
+// keyboard, mnemonic or shortcut. Returns the action index (the item's id), NONE when full.
+fn menu_item(a: *mut app.App, m: usize, id: str, label: str,
+    on_select: fn(*mut app.App, usize)) -> usize {
+    return item_add(a, m, id, label, 0 as u32, on_select)
+}
+
+// An item with a tick; choosing it flips the tick, then calls `on_select`.
+fn menu_check(a: *mut app.App, m: usize, id: str, label: str, on: bool,
+    on_select: fn(*mut app.App, usize)) -> usize {
+    var k: u32 = 1 as u32
+    if on {
+        k = 2 as u32
+    }
+    return item_add(a, m, id, label, k, on_select)
+}
+
+// A line between two groups of items.
+fn menu_sep(a: *mut app.App, m: usize) -> bool {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 {
+        return false
+    }
+    let i: usize = find(c, m)
+    if i == NONE || ((*c).kind[i] != K_MENU && (*c).kind[i] != K_POPUP) {
+        return false
+    }
+    if (*c).base[i] + (*c).cnt[i] != (*c).n_macts || (*c).n_macts >= OPT_MAX {
+        return false
+    }
+    (*c).macts[(*c).n_macts] = SEP_MARK
+    (*c).n_macts = (*c).n_macts + 1
+    (*c).cnt[i] = (*c).cnt[i] + 1
+    return true
+}
+
+// The keyboard shortcut of an item: `key` is the capital letter (83 = 'S') or an action.SK_* key,
+// `mods` is action.MOD_CTRL / MOD_SHIFT / MOD_ALT. It is shown in the menu and works anywhere
+// in the window.
+fn menu_shortcut(a: *mut app.App, act: usize, key: u32, mods: u32) {
+    let r: *mut action.Actions = app.actions(a)
+    if act < action.act_count(r) {
+        action.act_set_shortcut(r, act, key, mods)
+    }
+}
+
+fn slot_of_act(c: *mut Ctl, act: usize) -> usize {
+    var k: usize = 0
+    while k < (*c).n_macts {
+        if (*c).macts[k] == act {
+            return k
+        }
+        k = k + 1
+    }
+    return NONE
+}
+
+// Grey an item out (it neither shows as available nor runs).
+fn menu_enable(a: *mut app.App, act: usize, on: bool) {
+    let c: *mut Ctl = st(a)
+    let k: usize = slot_of_act(c, act)
+    if k != NONE {
+        (*c).ien[k] = on
+    }
+}
+
+fn menu_checked(a: *mut app.App, act: usize) -> bool {
+    let c: *mut Ctl = st(a)
+    let k: usize = slot_of_act(c, act)
+    return k != NONE && (*c).ichk[k] == 2 as u32
+}
+
+fn menu_set_checked(a: *mut app.App, act: usize, on: bool) {
+    let c: *mut Ctl = st(a)
+    let k: usize = slot_of_act(c, act)
+    if k != NONE && (*c).ichk[k] != 0 as u32 {
+        if on {
+            (*c).ichk[k] = 2 as u32
+        } else {
+            (*c).ichk[k] = 1 as u32
+        }
+    }
+}
+
+// The provider of a menu: asked when a menu is requested at a node (the header, or a node inside
+// one with a context menu); it puts the items of the nearest menu in.
+fn menu_provider(ud: u64, pc: *mut ctxmenu.ProviderCtx) {
+    let a: *mut app.App = ud as *mut app.App
+    let c: *mut Ctl = st(a)
+    let sc: *mut scene.Scene = sc_of(c)
+    var n: usize = ctxmenu.pc_target(pc)
+    var mi: usize = NONE
+    var guard: usize = 0
+    while n != scene.SCENE_NONE && n < scene.scene_count(sc) && mi == NONE && guard < 64 {
+        var i: usize = 0
+        while i < (*c).n && mi == NONE {
+            if (*c).node[i] == n {
+                if (*c).kind[i] == K_MENU {
+                    mi = i
+                } else if (*c).kind[i] == K_CTXMAP {
+                    mi = (*c).aux[i]
+                }
+            }
+            i = i + 1
+        }
+        n = scene.scene_parent(sc, n)
+        guard = guard + 1
+    }
+    if mi == NONE {
+        return
+    }
+    var g: u32 = 1 as u32
+    var k: usize = 0
+    while k < (*c).cnt[mi] {
+        let slot: usize = (*c).base[mi] + k
+        if (*c).macts[slot] == SEP_MARK {
+            g = g + 1 as u32
+        } else {
+            let e: usize = ctxmenu.pc_add(pc, (*c).macts[slot])
+            ctxmenu.pc_group(pc, e, g)
+        }
+        k = k + 1
+    }
+}
+
+// Open the menu of header entry `i` under its header.
+fn open_menu(c: *mut Ctl, i: usize) -> bool {
+    let a: *mut app.App = (*c).a
+    let sc: *mut scene.Scene = sc_of(c)
+    let node: usize = (*c).node[i]
+    let y0: f64 = scene.node_y(sc, node)
+    let ch: u32 = fuiwirt.host_context(app.app_host(a), action.SRC_API, node,
+        scene.node_x(sc, node), y0 + scene.node_h(sc, node), y0)
+    let open: bool = ctxmenu.ctx_is_open(app.context(a))
+    if open {
+        (*c).mhdr = i
+    }
+    touch(c)
+    return open
+}
+
+// Open the menu of the header `m` from the program (as Alt+letter does).
+fn open_menu_id(a: *mut app.App, m: usize) -> bool {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, m)
+    if i == NONE || (*c).kind[i] != K_MENU {
+        return false
+    }
+    return open_menu(c, i)
+}
+
+// Is a menu of the bar open now?
+fn menu_is_open(a: *mut app.App) -> bool {
+    let c: *mut Ctl = st(a)
+    return menuview.mv_is_open(mv_of(c))
+}
+
+// the header after (or before) `i`, wrapping
+fn header_next(c: *mut Ctl, i: usize, back: bool) -> usize {
+    var j: usize = i
+    var n: usize = 0
+    while n < (*c).n {
+        if back {
+            if j == 0 {
+                j = (*c).n - 1
+            } else {
+                j = j - 1
+            }
+        } else {
+            j = (j + 1) % (*c).n
+        }
+        if (*c).kind[j] == K_MENU {
+            return j
+        }
+        n = n + 1
+    }
+    return i
+}
+
+// the header with the mnemonic `cp` (lower case), NONE if none
+fn header_by_mnemonic(c: *mut Ctl, cp: u32) -> usize {
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_MENU && (*c).aux[i] == cp as usize {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// A header: a quiet text, a rounded fill when the pointer is on it or its menu is open, the
+// mnemonic letter underlined.
+fn draw_header(ud: u64, rc: *mut render.Ctx, e: *mut widget.Widget) {
+    let c: *mut Ctl = ud as *mut Ctl
+    let z: *mut painter.Painter = render.ctx_painter(rc)
+    let i: usize = find(c, scene.scene_node_of(sc_of(c), e))
+    let x0: f64 = widget.w_x(e)
+    let y0: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    var lit: bool = widget.w_is_hover(e)
+    if i != NONE && (*c).mhdr == i && menuview.mv_is_open(mv_of(c)) {
+        lit = true
+    }
+    if lit {
+        painter.round_rect(z, x0, y0 + kit.ln(rc, 2), w, h - kit.ln(rc, 4), kit.ln(rc, 4),
+            kit.tokc(rc, style.TOK_BUTTON_HOVER))
+    }
+    if widget.w_is_focus(e) {
+        kit.focus_ring(rc, x0, y0 + kit.ln(rc, 2), w, h - kit.ln(rc, 4), kit.ln(rc, 4), style.TOK_BASE)
+    }
+    let size: f64 = kit.ln(rc, 14)
+    let col: u32 = kit.tokc(rc, style.TOK_TEXT)
+    let t: str = str { p: widget.w_text(e) as *mut u8, n: widget.w_text_len(e) }
+    let tw: f64 = kit.text_width(rc, size, 400, t)
+    let tx: f64 = x0 + (w - tw) / 2.0
+    let used: f64 = kit.draw_label(rc, tx, y0, h, size, 400, col, t, 0.0)
+    if i != NONE && (*c).lo[i] >= 0 as i64 && ((*c).lo[i] as usize) < t.n {
+        let at: usize = (*c).lo[i] as usize
+        let pre: f64 = kit.text_width(rc, size, 400, str { p: t.p, n: at })
+        let ch: f64 = kit.text_width(rc, size, 400, str { p: (t.p as u64 + at as u64) as *mut u8, n: 1 })
+        let by: f64 = painter.text_baseline_mid(z, y0, h, size)
+        painter.surface(z, tx + pre, by + kit.ln(rc, 2), ch, kit.ln(rc, 1), col)
+    }
+}
+
+
+// Close the open menu and open the next (or previous) header's menu: Left / Right in a menu bar.
+fn menu_switch(c: *mut Ctl, back: bool) -> bool {
+    let i: usize = (*c).mhdr
+    if i == NONE {
+        return false
+    }
+    let j: usize = header_next(c, i, back)
+    if j == i {
+        return true
+    }
+    let r: u32 = ctxmenu.ctx_close(app.context((*c).a), ctxmenu.CLOSE_API)
+    let o: bool = open_menu(c, j)
+    return true
+}
+
+
+// ============================================================ TOOLTIP
+
+// A tooltip for a control (or any node): it shows TIP_DELAY ms after the pointer came to rest on the
+// node (or inside it) and goes away with the next move out of it, click, key or dialog.
+fn tooltip(a: *mut app.App, id: usize, text: str) -> bool {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return false
+    }
+    if id >= scene.scene_count(sc_of(c)) {
+        return false
+    }
+    let i: usize = add_entry(c, K_TIP, id)
+    (*c).tip[i] = text
+    return true
+}
+
+// the tooltip entry of the node or of its nearest ancestor that has one; NONE if none
+fn tip_entry(c: *mut Ctl, node: usize) -> usize {
+    let sc: *mut scene.Scene = sc_of(c)
+    var n: usize = node
+    var guard: usize = 0
+    while n != scene.SCENE_NONE && n < scene.scene_count(sc) && guard < 64 {
+        var i: usize = 0
+        while i < (*c).n {
+            if (*c).kind[i] == K_TIP && (*c).node[i] == n {
+                return i
+            }
+            i = i + 1
+        }
+        n = scene.scene_parent(sc, n)
+        guard = guard + 1
+    }
+    return NONE
+}
+
+// Hide the tooltip and keep it hidden until the pointer enters another node. true = was shown.
+fn tip_hide(c: *mut Ctl) -> bool {
+    let was: bool = (*c).tip_on
+    (*c).tip_on = false
+    (*c).tip_since = 0 - 1
+    return was
+}
+
+// the pointer moved: true when the picture changed (a shown tooltip went away)
+fn tip_move(c: *mut Ctl, x: f64, y: f64) -> bool {
+    let node: usize = scene.scene_hit(sc_of(c), x, y)
+    var i: usize = NONE
+    if node != scene.SCENE_NONE && node < scene.scene_count(sc_of(c)) {
+        i = tip_entry(c, node)
+    }
+    if i == (*c).tip_node {
+        return false
+    }
+    let was: bool = (*c).tip_on
+    (*c).tip_on = false
+    (*c).tip_node = i
+    (*c).tip_since = fuiwirt.host_now(app.app_host((*c).a))
+    return was
+}
+
+fn tip_blocked(c: *mut Ctl) -> bool {
+    return (*c).dlg != 0 as u32 || (*c).drop_open || menuview.mv_is_open(mv_of(c))
+}
+
+// the program timer (fuiwirt.host_set_wake): shows the tooltip after the delay, runs the dialog fade
+fn wake_tick(ud: u64, now: i64) -> bool {
+    let c: *mut Ctl = ud as *mut Ctl
+    if (*c).dlg != 0 as u32 {
+        return kit.modal_animating(&(*c).dlg_m, now)
+    }
+    if (*c).tip_node == NONE || (*c).tip_on || (*c).tip_since < 0 as i64 || tip_blocked(c) {
+        return false
+    }
+    if now - (*c).tip_since >= TIP_DELAY {
+        (*c).tip_on = true
+        return true
+    }
+    return false
+}
+
+fn wake_wait(ud: u64, now: i64) -> i64 {
+    let c: *mut Ctl = ud as *mut Ctl
+    if (*c).dlg != 0 as u32 {
+        if kit.modal_animating(&(*c).dlg_m, now) {
+            return 16
+        }
+        return 0 - 1
+    }
+    if (*c).tip_node == NONE || (*c).tip_on || (*c).tip_since < 0 as i64 || tip_blocked(c) {
+        return 0 - 1
+    }
+    let left: i64 = TIP_DELAY - (now - (*c).tip_since)
+    if left < 1 as i64 {
+        return 1
+    }
+    return left
+}
+
+fn draw_tip(c: *mut Ctl, rc: *mut render.Ctx) {
+    let i: usize = (*c).tip_node
+    if i == NONE || (*c).tip[i].n == 0 {
+        return
+    }
+    let sc: *mut scene.Scene = sc_of(c)
+    let node: usize = (*c).node[i]
+    let s: str = (*c).tip[i]
+    var bw: f64 = 0.0
+    var bh: f64 = 0.0
+    wave2.tooltip_size(rc, s.p as u64, s.n, &bw, &bh)
+    var ox: f64 = 0.0
+    var oy: f64 = 0.0
+    let ny: f64 = scene.node_y(sc, node)
+    wave2.tooltip_place(scene.node_x(sc, node) + scene.node_w(sc, node) / 2.0, ny, bw, bh,
+        (*c).win_w, (*c).win_h, ny, ny + scene.node_h(sc, node), 0.0, 0.0, kit.ln(rc, 4), &ox, &oy)
+    var e: widget.Widget = widget.widget_new(widget.KIND_TOOLTIP)
+    widget.w_place(&e, ox, oy, bw, bh)
+    widget.w_set_text(&e, s.p as u64, s.n)
+    wave2.draw_tooltip(rc, &e)
+}
+
+// ============================================================ DIALOGS
+
+// MODAL DIALOGS drawn inside the window (kit.Modal: scrim, panel, title, close button, focus ring
+// of Tab). `message` has one button (OK), `confirm` OK and Cancel, `input` a text field, OK and
+// Cancel. While one is open nothing behind it gets a key or a click. `on_answer(a, ans)` runs
+// after the dialog is gone with ANS_OK or ANS_CANCEL (Esc, the close button); an input dialog's
+// text is then `dialog_text(a)`. Enter = OK, Esc = cancel, Tab / Left / Right move between the
+// buttons. One dialog at a time: a second call while one is open returns false.
+//
+// The labels of the buttons are in the two functions below (one place for a translation).
+fn tr_ok() -> str { return "OK" }
+fn tr_cancel() -> str { return "Cancel" }
+
+struct DLay {
+    tx: f64, ty: f64, tw: f64, pitch: f64,
+    fx: f64, fy: f64, fw: f64, fh: f64,
+    ox: f64, oy: f64, cx: f64, cy: f64, bw: f64, bh: f64,
+}
+
+fn message(a: *mut app.App, title: str, text: str, on_answer: fn(*mut app.App, u32)) -> bool {
+    return dlg_open(a, D_MSG, title, text, "", on_answer)
+}
+
+fn confirm(a: *mut app.App, title: str, text: str, on_answer: fn(*mut app.App, u32)) -> bool {
+    return dlg_open(a, D_CONFIRM, title, text, "", on_answer)
+}
+
+// `prompt` is the line above the field, `initial` the text in it (selected).
+fn input(a: *mut app.App, title: str, prompt: str, initial: str,
+    on_answer: fn(*mut app.App, u32)) -> bool {
+    return dlg_open(a, D_INPUT, title, prompt, initial, on_answer)
+}
+
+fn dialog_open(a: *mut app.App) -> bool {
+    let c: *mut Ctl = st(a)
+    return (*c).dlg != 0 as u32
+}
+
+// The text of the input dialog (valid until the next change of it).
+fn dialog_text(a: *mut app.App) -> str {
+    let c: *mut Ctl = st(a)
+    let t: *mut textbuf.TextBuf = editor.editor_buf(&(*c).dlg_ed)
+    return str { p: textbuf.tb_ptr(t) as *mut u8, n: textbuf.tb_len(t) }
+}
+
+// Answer the open dialog from the program (as a click on the button would).
+fn dialog_answer(a: *mut app.App, ans: u32) {
+    let c: *mut Ctl = st(a)
+    if (*c).dlg != 0 as u32 {
+        dlg_finish(c, ans)
+    }
+}
+
+fn dlg_line_count(t: str) -> usize {
+    var n: usize = 1
+    var i: usize = 0
+    while i < t.n {
+        if *((t.p as u64 + i as u64) as *mut u8) == 10 as u8 && n < 8 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// the slot of the OK button in the focus ring (the field is slot 0 in an input dialog)
+fn dlg_ok_slot(c: *mut Ctl) -> usize {
+    if (*c).dlg == D_INPUT {
+        return 1
+    }
+    return 0
+}
+
+fn dlg_open(a: *mut app.App, kind: u32, title: str, text: str, init: str,
+    cb: fn(*mut app.App, u32)) -> bool {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).dlg != 0 as u32 {
+        return false
+    }
+    if (*c).drop_open {
+        drop_close(c)
+    }
+    let ctxm: *mut ctxmenu.Ctxm = app.context(a)
+    if ctxmenu.ctx_is_open(ctxm) {
+        let r: u32 = ctxmenu.ctx_close(ctxm, ctxmenu.CLOSE_API)
+    }
+    let hh: bool = tip_hide(c)
+    (*c).dlg = kind
+    (*c).dlg_title = title
+    (*c).dlg_text = text
+    (*c).dlg_cb = cb
+    (*c).dlg_hot = NONE
+    (*c).dlg_hclose = false
+    var h: usize = 8 + 22 * dlg_line_count(text) + 12 + 32 + 16
+    var nf: usize = 1
+    if kind == D_CONFIRM {
+        nf = 2
+    }
+    if kind == D_INPUT {
+        nf = 3
+        h = h + 40
+    }
+    kit.modal_open(&(*c).dlg_m, title, DLG_W_PT, h, nf, fuiwirt.host_now(app.app_host(a)))
+    if kind == D_INPUT {
+        editor.editor_set_text(&(*c).dlg_ed, init.p as u64, init.n)
+        editor.editor_select_all(&(*c).dlg_ed)
+        kit.modal_set_focus(&(*c).dlg_m, 0)
+    } else {
+        kit.modal_set_focus(&(*c).dlg_m, 0)
+    }
+    touch(c)
+    return true
+}
+
+fn dlg_finish(c: *mut Ctl, ans: u32) {
+    let f: fn(*mut app.App, u32) = (*c).dlg_cb
+    (*c).dlg = 0 as u32
+    (*c).dlg_hot = NONE
+    kit.modal_close(&(*c).dlg_m)
+    touch(c)
+    f((*c).a, ans)
+}
+
+fn dlg_layout(c: *mut Ctl, rc: *mut render.Ctx) -> DLay {
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var w: f64 = 0.0
+    var h: f64 = 0.0
+    kit.modal_content_rect(rc, &(*c).dlg_m, (*c).win_w, (*c).win_h, &x, &y, &w, &h)
+    let pitch: f64 = kit.ln(rc, 22)
+    let bw: f64 = kit.ln(rc, BTN_W_PT)
+    let bh: f64 = kit.ln(rc, 32)
+    let ty: f64 = y + kit.ln(rc, 8)
+    let fy: f64 = ty + pitch * (dlg_line_count((*c).dlg_text) as f64) + kit.ln(rc, 8)
+    let by: f64 = y + h - bh
+    let cx: f64 = x + w - bw
+    var ox: f64 = cx
+    if (*c).dlg != D_MSG {
+        ox = cx - kit.ln(rc, 8) - bw
+    }
+    return DLay { tx: x, ty: ty, tw: w, pitch: pitch, fx: x, fy: fy, fw: w, fh: kit.ln(rc, 32),
+        ox: ox, oy: by, cx: cx, cy: by, bw: bw, bh: bh }
+}
+
+fn in_rect(px: f64, py: f64, x: f64, y: f64, w: f64, h: f64) -> bool {
+    return px >= x && px < x + w && py >= y && py < y + h
+}
+
+// what a point is on: ANS_OK / ANS_CANCEL (a button), 3 (the field), 0 (nothing)
+fn dlg_part_at(c: *mut Ctl, x: f64, y: f64) -> u32 {
+    let rc: *mut render.Ctx = app.app_ctx((*c).a)
+    let l: DLay = dlg_layout(c, rc)
+    if in_rect(x, y, l.ox, l.oy, l.bw, l.bh) {
+        return ANS_OK
+    }
+    if (*c).dlg != D_MSG && in_rect(x, y, l.cx, l.cy, l.bw, l.bh) {
+        return ANS_CANCEL
+    }
+    if (*c).dlg == D_INPUT && in_rect(x, y, l.fx, l.fy, l.fw, l.fh) {
+        return 3 as u32
+    }
+    return 0 as u32
+}
+
+fn dlg_esc_answer(c: *mut Ctl) -> u32 {
+    if (*c).dlg == D_MSG {
+        return ANS_OK
+    }
+    return ANS_CANCEL
+}
+
+// The keys of an open dialog; every key is taken (nothing reaches the window behind it).
+fn dlg_key(c: *mut Ctl, key: u32, mods: u32) -> bool {
+    let m: *mut kit.Modal = &(*c).dlg_m
+    let ok_slot: usize = dlg_ok_slot(c)
+    let foc: usize = kit.modal_focus(m)
+    let in_field: bool = (*c).dlg == D_INPUT && foc == 0
+    let r: u32 = kit.modal_key(m, key, mods)
+    if r == kit.MODAL_KEY_CLOSE {
+        dlg_finish(c, dlg_esc_answer(c))
+        return true
+    }
+    if r == kit.MODAL_KEY_FOCUS {
+        touch(c)
+        return true
+    }
+    if r == kit.MODAL_KEY_ACTIVATE {
+        if foc == ok_slot + 1 {
+            dlg_finish(c, ANS_CANCEL)
+        } else {
+            dlg_finish(c, ANS_OK)
+        }
+        return true
+    }
+    if in_field {
+        let er: u32 = editor.editor_key(&(*c).dlg_ed, key, mods)
+        touch(c)
+        return true
+    }
+    // on a button: Left / Right move between the buttons, Space presses the focused one
+    if key == editor.KEY_LEFT || key == editor.KEY_RIGHT {
+        kit.modal_set_focus(m, kit.ring_next(foc, (*m).n_focus, key == editor.KEY_LEFT))
+        touch(c)
+        return true
+    }
+    touch(c)
+    return true
+}
+
+fn dlg_chr(c: *mut Ctl, cp: u32, mods: u32) -> bool {
+    if (*c).dlg == D_INPUT && kit.modal_focus(&(*c).dlg_m) == 0 {
+        let er: u32 = editor.editor_char(&(*c).dlg_ed, cp, mods)
+        touch(c)
+        return true
+    }
+    if cp == 32 as u32 && (*c).dlg != 0 as u32 {
+        let foc: usize = kit.modal_focus(&(*c).dlg_m)
+        if foc == dlg_ok_slot(c) + 1 {
+            dlg_finish(c, ANS_CANCEL)
+        } else {
+            dlg_finish(c, ANS_OK)
+        }
+    }
+    return true
+}
+
+// the pointer while a dialog is open (the popup sink): hover, press on a button / the field / the X
+fn dlg_ptr(c: *mut Ctl, kind: u32, x: f64, y: f64) -> u32 {
+    let rc: *mut render.Ctx = app.app_ctx((*c).a)
+    let hit: u32 = kit.modal_hit(rc, &(*c).dlg_m, (*c).win_w, (*c).win_h, x, y)
+    if kind == fuiwirt.HOOK_MOVE {
+        (*c).dlg_hclose = hit == kit.MODAL_HIT_CLOSE
+        (*c).dlg_hot = NONE
+        let part: u32 = dlg_part_at(c, x, y)
+        if part == ANS_OK || part == ANS_CANCEL {
+            (*c).dlg_hot = part as usize
+        }
+    } else if kind == fuiwirt.HOOK_DOWN {
+        if hit == kit.MODAL_HIT_CLOSE {
+            dlg_finish(c, dlg_esc_answer(c))
+        } else if hit == kit.MODAL_HIT_PANEL {
+            let part2: u32 = dlg_part_at(c, x, y)
+            if part2 == ANS_OK {
+                dlg_finish(c, ANS_OK)
+            } else if part2 == ANS_CANCEL {
+                dlg_finish(c, ANS_CANCEL)
+            } else if part2 == 3 as u32 {
+                kit.modal_set_focus(&(*c).dlg_m, 0)
+                touch(c)
+            }
+        }
+    }
+    touch(c)
+    return ctxmenu.CR_CONSUMED | ctxmenu.CR_REPAINT
+}
+
+fn draw_dlg_button(rc: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, text: str,
+    primary: bool, hot: bool, focus: bool) {
+    var e: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&e, x, y, w, h)
+    widget.w_set_text(&e, text.p as u64, text.n)
+    widget.w_set_hover(&e, hot)
+    widget.w_set_focus(&e, focus)
+    if primary {
+        let s: *mut style.Style = widget.w_style(&e)
+        *s = style.style_set_bg(*s, style.color_token(style.TOK_ACCENT))
+        *s = style.style_set_fg(*s, style.color_token(style.TOK_TEXT_ON_ACCENT))
+    }
+    render.draw_widget(rc, &e)
+}
+
+fn draw_dlg(c: *mut Ctl, rc: *mut render.Ctx) {
+    let now: i64 = fuiwirt.host_now(app.app_host((*c).a))
+    kit.modal_draw(rc, &(*c).dlg_m, (*c).win_w, (*c).win_h, now, (*c).dlg_hclose)
+    let l: DLay = dlg_layout(c, rc)
+    let col: u32 = kit.tokc(rc, style.TOK_TEXT)
+    let t: str = (*c).dlg_text
+    var start: usize = 0
+    var k: usize = 0
+    var i: usize = 0
+    while i <= t.n {
+        if i == t.n || *((t.p as u64 + i as u64) as *mut u8) == 10 as u8 {
+            if k < 8 {
+                let ln1: str = str { p: (t.p as u64 + start as u64) as *mut u8, n: i - start }
+                let used: f64 = kit.draw_label(rc, l.tx, l.ty + l.pitch * (k as f64), l.pitch,
+                    kit.ln(rc, 14), 400, col, ln1, l.tw)
+            }
+            k = k + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    let foc: usize = kit.modal_focus(&(*c).dlg_m)
+    let ok_slot: usize = dlg_ok_slot(c)
+    if (*c).dlg == D_INPUT {
+        var f: widget.Widget = widget.widget_new(widget.KIND_TEXTBOX)
+        widget.w_place(&f, l.fx, l.fy, l.fw, l.fh)
+        widget.w_set_focus(&f, foc == 0)
+        render.draw_textfield(rc, &f, &(*c).dlg_ed, foc == 0)
+    }
+    draw_dlg_button(rc, l.ox, l.oy, l.bw, l.bh, tr_ok(), true, (*c).dlg_hot == ANS_OK as usize,
+        foc == ok_slot)
+    if (*c).dlg != D_MSG {
+        draw_dlg_button(rc, l.cx, l.cy, l.bw, l.bh, tr_cancel(), false,
+            (*c).dlg_hot == ANS_CANCEL as usize, foc == ok_slot + 1)
+    }
+}
+
 // ============================================================ EVENTS
 
 // Compare every control with what was last reported; call back for what the USER changed.
@@ -1023,11 +1893,31 @@ fn slider_move(c: *mut Ctl, i: usize, v: i64) {
 
 fn ctl_key(ud: u64, key: u32, mods: u32) -> bool {
     let c: *mut Ctl = ud as *mut Ctl
+    if (*c).dlg != 0 as u32 {
+        return dlg_key(c, key, mods)
+    }
     if (*c).drop_open {
         drop_key(c, key, mods)
         return true
     }
-    if menuview.mv_is_open(app.ctx_view((*c).a) as u64) {
+    let hid: bool = tip_hide(c)
+    if menuview.mv_is_open(mv_of(c)) {
+        if (*c).mhdr != NONE && (key == editor.KEY_LEFT || key == editor.KEY_RIGHT) {
+            let cm: *mut ctxmenu.Ctxm = app.context((*c).a)
+            let d0: usize = ctxmenu.ctx_depth(cm)
+            if key == editor.KEY_LEFT {
+                if d0 <= 1 {
+                    return menu_switch(c, true)
+                }
+            } else {
+                let now: i64 = fuiwirt.host_now(app.app_host((*c).a))
+                let kr: u32 = menuview.mv_key(mv_of(c), action.SK_RIGHT, mods, now)
+                if ctxmenu.ctx_depth(cm) > d0 {
+                    return true
+                }
+                return menu_switch(c, false)
+            }
+        }
         return false
     }
     let f: usize = app.focus((*c).a)
@@ -1120,14 +2010,40 @@ fn ctl_key(ud: u64, key: u32, mods: u32) -> bool {
 
 fn ctl_chr(ud: u64, cp: u32, mods: u32) -> bool {
     let c: *mut Ctl = ud as *mut Ctl
-    return (*c).drop_open
+    if (*c).dlg != 0 as u32 {
+        return dlg_chr(c, cp, mods)
+    }
+    if (*c).drop_open {
+        return true
+    }
+    if menuview.mv_is_open(mv_of(c)) {
+        return false
+    }
+    // Alt+letter opens the menu whose header has that mnemonic
+    if (mods & editor.MOD_ALT) != 0 as u32 && (mods & editor.MOD_CTRL) == 0 as u32 {
+        var lc: u32 = cp
+        if lc >= 65 as u32 && lc <= 90 as u32 {
+            lc = lc + 32 as u32
+        }
+        let h: usize = header_by_mnemonic(c, lc)
+        if h != NONE {
+            let hh: bool = tip_hide(c)
+            let o: bool = open_menu(c, h)
+            return true
+        }
+    }
+    return false
 }
 
 fn ctl_ptr(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     let c: *mut Ctl = ud as *mut Ctl
     sync(c)
+    if kind == fuiwirt.HOOK_MOVE {
+        return tip_move(c, x, y)
+    }
+    let hid: bool = tip_hide(c)
     if kind != fuiwirt.HOOK_DOWN {
-        return false
+        return hid
     }
     let node: usize = scene.scene_hit(sc_of(c), x, y)
     let i: usize = find(c, node)
@@ -1153,6 +2069,8 @@ fn ctl_act(ud: u64, node: usize) {
     }
     if (*c).kind[i] == K_DROP && !(*c).drop_open {
         let o: bool = open_dropdown((*c).a, node)
+    } else if (*c).kind[i] == K_MENU {
+        let o2: bool = open_menu(c, i)
     } else if (*c).kind[i] == K_EXPAND {
         set_expanded((*c).a, node, (*c).last[i] == 0)
         fire(c, i)
@@ -1166,6 +2084,12 @@ fn ctl_paint(ud: u64, rc: *mut render.Ctx, w: usize, h: usize) {
     if (*c).drop_open {
         draw_drop(c, rc)
     }
+    if (*c).tip_on && !tip_blocked(c) {
+        draw_tip(c, rc)
+    }
+    if (*c).dlg != 0 as u32 {
+        draw_dlg(c, rc)
+    }
 }
 
 // ============================================================ THE POPUP SINK
@@ -1174,11 +2098,14 @@ fn mv_of(c: *mut Ctl) -> u64 { return app.ctx_view((*c).a) as u64 }
 
 fn sink_open(ud: u64) -> bool {
     let c: *mut Ctl = ud as *mut Ctl
-    return (*c).drop_open || menuview.mv_is_open(mv_of(c))
+    return (*c).drop_open || (*c).dlg != 0 as u32 || menuview.mv_is_open(mv_of(c))
 }
 
 fn sink_ptr(ud: u64, kind: u32, x: f64, y: f64, btn: u32, now: i64) -> u32 {
     let c: *mut Ctl = ud as *mut Ctl
+    if (*c).dlg != 0 as u32 {
+        return dlg_ptr(c, kind, x, y)
+    }
     if !(*c).drop_open {
         return menuview.mv_pointer(mv_of(c), kind, x, y, btn, now)
     }
