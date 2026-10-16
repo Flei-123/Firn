@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 // lib/plat/android/focusplan.fi -- pure focus-stack planning (no device access, testable on the host).
-export { focus_plan, tap_region, zoom_crop, zoom_pick }
+export { focus_plan, tap_region, zoom_crop, zoom_pick, zoom_stops }
 
 // Focus positions (diopters) for a focus stack, near to far, as a PURE function of the lens facts:
 // near_d = LENS_INFO_MINIMUM_FOCUS_DISTANCE, far_d = hyperfocal (or 0 = infinity), step_d = how far apart
@@ -140,4 +140,113 @@ fn zoom_pick(equiv: u64, n: i32, ref_idx: i32, zoom: f32, out_ratio: u64) -> i32
     if best < 0 { return 0 - 1 }
     *((out_ratio) as *mut f32) = target / best_e
     return best
+}
+
+// True when a stop within `pct` percent of x10 is already in list[0..nc).
+#[no_gc]
+fn stop_has(list: u64, nc: i32, x10: i32, pct: i32) -> bool {
+    var i: i32 = 0
+    while i < nc {
+        let e: i32 = *((list + ((i * 4) as u64)) as *mut i32)
+        var d: i32 = x10 - e
+        if d < 0 { d = 0 - d }
+        if d * 100 <= pct * e { return true }
+        i = i + 1
+    }
+    return false
+}
+
+#[no_gc]
+fn stop_add(cx: u64, co: u64, cp: u64, nc: i32, x10: i32, opt: i32, prio: i32) -> i32 {
+    if nc >= 32 { return nc }
+    *((cx + ((nc * 4) as u64)) as *mut i32) = x10
+    *((co + ((nc * 4) as u64)) as *mut i32) = opt
+    *((cp + ((nc * 4) as u64)) as *mut i32) = prio
+    return nc + 1
+}
+
+// Zoom preset stops for the chip row (user scale, 1.0 = the main lens `ref_idx`). equiv[0..n) as in zoom_pick;
+// cur_idx = the open lens, whose CONTROL_ZOOM_RATIO range is [zmin, zmax]; extra[0..nx) = more 35 mm equivalents of
+// the same camera (e.g. the focal length list of a logical camera; pass 0, 0 for none). Writes up to cap (<= 8)
+// stops ascending: out_x10[i] = factor x 10, out_opt[i] = 1 when a lens of that factor exists (optical), 0 = a digital
+// crop. Lens factors are always stops (a range below 1 counts as the ultra wide lens); the standard stops 1 2 5 3 8
+// 10 20 fill the rest as far as the zoom range reaches, unless a lens factor is within 20 % of them. Returns the count.
+#[no_gc]
+fn zoom_stops(equiv: u64, n: i32, ref_idx: i32, cur_idx: i32, zmin: f32, zmax: f32, extra: u64, nx: i32, out_x10: u64, out_opt: u64, cap: i32) -> i32 {
+    if cap < 1 || cap > 8 { return 0 }
+    var ref_e: f32 = 0.0f
+    if ref_idx >= 0 && ref_idx < n { ref_e = *((equiv + ((ref_idx * 4) as u64)) as *mut f32) }
+    var f_cur: f32 = 1.0f
+    if ref_e > 0.0f && cur_idx >= 0 && cur_idx < n {
+        let ce: f32 = *((equiv + ((cur_idx * 4) as u64)) as *mut f32)
+        if ce > 0.0f { f_cur = ce / ref_e }
+    }
+    var zlo: f32 = zmin
+    var zhi: f32 = zmax
+    if zlo <= 0.0f { zlo = 1.0f }
+    if zhi < zlo { zhi = zlo }
+    var lo: f32 = zlo * f_cur
+    var hi: f32 = zhi * f_cur
+    var cx: [i32; 32] = [0; 32]
+    var co: [i32; 32] = [0; 32]
+    var cp: [i32; 32] = [0; 32]
+    let px: u64 = (&cx[0]) as u64
+    let po: u64 = (&co[0]) as u64
+    let pp: u64 = (&cp[0]) as u64
+    var nc: i32 = 0
+    var i: i32 = 0
+    // lens factors (the main lens is 1.0 by definition)
+    while i < n + nx {
+        var e: f32 = 0.0f
+        if i < n { e = *((equiv + ((i * 4) as u64)) as *mut f32) } else { e = *((extra + (((i - n) * 4) as u64)) as *mut f32) }
+        if e > 0.0f && ref_e > 0.0f {
+            let f: f32 = e / ref_e
+            let x: i32 = (f * 10.0f + 0.5f) as i32
+            if x >= 1 && !stop_has(px, nc, x, 4) { nc = stop_add(px, po, pp, nc, x, 1, 0) }
+            if f * zhi > hi { hi = f * zhi }
+            if f < lo { lo = f }
+        }
+        i = i + 1
+    }
+    // a zoom range below 1 is a wider lens even when it is not listed on its own
+    if lo < 0.9f {
+        let x: i32 = (lo * 10.0f + 0.5f) as i32
+        if x >= 1 && !stop_has(px, nc, x, 10) { nc = stop_add(px, po, pp, nc, x, 1, 0) }
+    }
+    // standard stops, by priority
+    var std: [i32; 7] = [10, 20, 50, 30, 80, 100, 200]
+    i = 0
+    while i < 7 {
+        let x: i32 = std[i as usize]
+        if (x as f32) >= lo * 10.0f - 0.5f && (x as f32) <= hi * 10.0f + 0.5f && !stop_has(px, nc, x, 20) {
+            nc = stop_add(px, po, pp, nc, x, 0, i + 1)
+        }
+        i = i + 1
+    }
+    // take by priority (lens factors first), then sort ascending
+    var take: [i32; 32] = [0; 32]
+    var got: i32 = 0
+    var pr: i32 = 0
+    while pr <= 7 && got < cap {
+        i = 0
+        while i < nc && got < cap {
+            if cp[i as usize] == pr { take[i as usize] = 1; got = got + 1 }
+            i = i + 1
+        }
+        pr = pr + 1
+    }
+    var m: i32 = 0
+    while m < got {
+        var best: i32 = 0 - 1
+        i = 0
+        while i < nc {
+            if take[i as usize] == 1 && (best < 0 || cx[i as usize] < cx[best as usize]) { best = i }
+            i = i + 1
+        }
+        *((out_x10 + ((m * 4) as u64)) as *mut i32) = cx[best as usize]
+        *((out_opt + ((m * 4) as u64)) as *mut i32) = co[best as usize]
+        take[best as usize] = 2
+        m = m + 1
+    }
+    return got
 }

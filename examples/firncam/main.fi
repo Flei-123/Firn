@@ -127,6 +127,8 @@ struct App {
     main_lens: [i32; 3], // lens nearest 26 mm by facing (0 front, 1 back, 2 external), -1 none
     chip_idx: [i32; 6],
     chip_x10: [i32; 6],
+    chip_opt: [i32; 6], // 1 = a lens of that zoom factor exists (optical), 0 = digital crop
+    foc1: f32, // focal length (mm) the camera reports at zoom 1 (0 = unknown); another value later = the lens switched
     nchip: i32,
     can_flip: bool,
     cpu: u64, // CPU fallback picture (BGRX)
@@ -628,39 +630,92 @@ fn scan_lenses(a: *mut App) {
     (*a).can_flip = (*a).main_lens[0] >= 0 && (*a).main_lens[1] >= 0
 }
 
-// Chips of the lenses that face the same way as the open one: label = equivalent / main lens equivalent.
+// Zoom chips of the open camera: the lens factors (0.6x ultra wide, 1x main, tele when the app can see it) plus digital
+// stops (2x, 5x, ...) as far as the zoom range of the camera reaches. A tap picks the lens / the ratio (C_STOP).
 fn rebuild_chips(a: *mut App) {
     (*a).nchip = 0
-    let fac: i32 = (*a).info.facing
-    if fac < 0 || fac > 2 { return }
-    let mn: i32 = (*a).main_lens[fac as usize]
-    var mm0: f32 = 26.0f
-    if mn >= 0 && (*a).lmm[mn as usize] > 0.0f { mm0 = (*a).lmm[mn as usize] }
+    (*a).foc1 = 0.0f
+    var ox: [i32; 8] = [0; 8]
+    var oo: [i32; 8] = [0; 8]
+    let n: i32 = camera.camera_zoom_stops((&ox[0]) as u64, (&oo[0]) as u64, 6)
     var i: i32 = 0
-    while i < (*a).nlens && i < 16 {
-        if (*a).lfac[i as usize] == fac && (*a).lmm[i as usize] > 0.0f {
-            let x10: i32 = ((*a).lmm[i as usize] / mm0 * 10.0f + 0.5f) as i32
-            var dup: bool = false
-            var k: i32 = 0
-            while k < (*a).nchip {
-                if (*a).chip_x10[k as usize] == x10 { dup = true }
-                k = k + 1
-            }
-            if !dup && (*a).nchip < 6 {
-                // insertion sort by zoom label
-                var p: i32 = (*a).nchip
-                while p > 0 && (*a).chip_x10[(p - 1) as usize] > x10 {
-                    (*a).chip_x10[p as usize] = (*a).chip_x10[(p - 1) as usize]
-                    (*a).chip_idx[p as usize] = (*a).chip_idx[(p - 1) as usize]
-                    p = p - 1
-                }
-                (*a).chip_x10[p as usize] = x10
-                (*a).chip_idx[p as usize] = i
-                (*a).nchip = (*a).nchip + 1
-            }
-        }
+    while i < n && i < 6 {
+        (*a).chip_x10[i as usize] = ox[i as usize]
+        (*a).chip_opt[i as usize] = oo[i as usize]
+        (*a).chip_idx[i as usize] = (*a).lens
         i = i + 1
     }
+    (*a).nchip = i
+}
+
+// ---------------------------------------------------------------- diagnostics
+fn put_f10(dst: u64, v: f32) -> usize {
+    return put_int(dst, ((v * 10.0f) + 0.5f) as i64)
+}
+
+// Writes what the app sees of the cameras to Download/FirnCam/firncam-cameras.txt (no adb needed): every scan entry
+// (public id or physical id of a logical camera), whether its characteristics can be read, focal lengths (x10 mm),
+// 35 mm equivalents (x10 mm), zoom range and chip stops of the open camera.
+fn save_cam_dump(a: *mut App) {
+    var buf: [u8; 4096] = [0 as u8; 4096]
+    let p: u64 = (&buf[0]) as u64
+    var n: usize = 0
+    var i: i32 = 0
+    var id: [u8; 48] = [0 as u8; 48]
+    while i < (*a).nlens && i < 16 && n < 3400 {
+        let par: i32 = camera.camera_entry_id(i, (&id[0]) as u64)
+        n = n + put_str(p + n as u64, "cam ")
+        n = n + put_int(p + n as u64, i as i64)
+        n = n + put_str(p + n as u64, " id=")
+        var k: usize = 0
+        while k < 40 && id[k] != 0 as u8 { *((p + n as u64) as *mut u8) = id[k]; n = n + 1; k = k + 1 }
+        n = n + put_str(p + n as u64, " parent=")
+        n = n + put_int(p + n as u64, par as i64)
+        var ci: camera.CamInfo = camera.zero_info()
+        if camera.camera_info(i, &ci) {
+            n = n + put_str(p + n as u64, " facing=")
+            n = n + put_int(p + n as u64, ci.facing as i64)
+            n = n + put_str(p + n as u64, " logical=")
+            n = n + put_int(p + n as u64, if (ci.caps & camera.CAP_LOGICAL) != 0 as u32 { 1 } else { 0 })
+            n = n + put_str(p + n as u64, " focal_x10=")
+            n = n + put_f10(p + n as u64, ci.focal_mm)
+            n = n + put_str(p + n as u64, " nfocal=")
+            n = n + put_int(p + n as u64, ci.focal_count as i64)
+            n = n + put_str(p + n as u64, " equiv_x10=")
+            n = n + put_f10(p + n as u64, ci.equiv_mm)
+            n = n + put_str(p + n as u64, " preview=")
+            n = n + put_int(p + n as u64, ci.prev_w as i64)
+            n = n + put_str(p + n as u64, " raw=")
+            n = n + put_int(p + n as u64, ci.raw_w as i64)
+        } else {
+            n = n + put_str(p + n as u64, " UNREADABLE (hidden physical id, no characteristics for apps)")
+        }
+        *((p + n as u64) as *mut u8) = 10 as u8
+        n = n + 1
+        i = i + 1
+    }
+    var zmin: f32 = 0.0f
+    var zmax: f32 = 0.0f
+    camera.camera_zoom_range(&zmin, &zmax)
+    n = n + put_str(p + n as u64, "open lens=")
+    n = n + put_int(p + n as u64, (*a).lens as i64)
+    n = n + put_str(p + n as u64, " zoom_range_x10=")
+    n = n + put_f10(p + n as u64, zmin)
+    n = n + put_str(p + n as u64, "..")
+    n = n + put_f10(p + n as u64, zmax)
+    n = n + put_str(p + n as u64, " chips=")
+    i = 0
+    while i < (*a).nchip {
+        n = n + put_int(p + n as u64, (*a).chip_x10[i as usize] as i64)
+        if (*a).chip_opt[i as usize] == 1 { n = n + put_str(p + n as u64, "o ") } else { n = n + put_str(p + n as u64, "d ") }
+        i = i + 1
+    }
+    *((p + n as u64) as *mut u8) = 10 as u8
+    n = n + 1
+    var name: [u8; 48] = [0 as u8; 48]
+    let nn: usize = name_into((&name[0]) as u64, "firncam-cameras", ".txt")
+    let mime: str = "text/plain\0"
+    let r: i32 = camera.camera_save_doc(p, n, (&name[0]) as u64, mime.p as u64)
 }
 
 // ---------------------------------------------------------------- state -> UI
@@ -697,6 +752,24 @@ fn row_text(a: *mut App, kind: i32, dst: *mut [u8; 24]) -> usize {
     return ln
 }
 
+// 0 = at 1x / unknown, 1 = the picture is a digital crop, 2 = another lens serves the zoom (optical). A logical camera
+// that switches its physical lens reports that lens's focal length in every result; the one seen at ratio 1 is the base.
+fn zoom_mode(a: *mut App) -> i32 {
+    if !(*a).ready { return 0 }
+    let f: f32 = camera.camera_active_focal()
+    let r: f32 = camera.camera_get_zoom()
+    if f > 0.0f && (*a).foc1 <= 0.0f && r > 0.98f && r < 1.02f { (*a).foc1 = f }
+    let zf: f32 = camera.camera_zoom_factor()
+    if zf > 0.95f && zf < 1.05f { return 0 }
+    if zf < 0.95f { return 2 }
+    if f > 0.0f && (*a).foc1 > 0.0f {
+        let q: f32 = f / (*a).foc1
+        if q > 1.15f || q < 0.87f { return 2 }
+    }
+    if r <= 1.05f { return 2 }
+    return 1
+}
+
 fn sync_ui(a: *mut App, u: *mut ui.Ui) {
     var vis: [i32; 8] = [0; 8]
     let nv: i32 = visible(a, &vis)
@@ -720,7 +793,8 @@ fn sync_ui(a: *mut App, u: *mut ui.Ui) {
     while i < (*a).nchip {
         (*u).chips[i as usize].idx = (*a).chip_idx[i as usize]
         (*u).chips[i as usize].x10 = (*a).chip_x10[i as usize]
-        (*u).chips[i as usize].sel = (*a).chip_idx[i as usize] == (*a).lens
+        (*u).chips[i as usize].opt = (*a).chip_opt[i as usize]
+        (*u).chips[i as usize].sel = false
         i = i + 1
     }
     (*u).can_flip = (*a).can_flip
@@ -843,6 +917,12 @@ fn run_cmd(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView, c: *mut ui.Cmd,
             open_lens(a, (*c).a)
             reset_zoom(a, u, cv)
         }
+    } else if k == ui.C_STOP {
+        if !(*a).busy {
+            let sz: f64 = ((*c).a as f64) / 10.0
+            do_zoom(a, cv, sz)
+            ui.ui_set_zoom(u, sz)
+        }
     } else if k == ui.C_FLIP {
         if !(*a).recording && !(*a).busy {
             flip_lens(a)
@@ -940,7 +1020,7 @@ fn main() -> i32 {
         stage: 0, cap_n: 0, cap_i: 0, cap_at: 0, steps: [0.0f; 16], bs: [0; 16],
         flash: 0, fl_last: 0 - 1, disp: 0, thumb: 0, pthumb: 0, sthumb: 0, tkey: 0, have_thumb: false, have_p: false,
         have_s: false, nframe: 0, lfac: [0 - 1; 16], lmm: [0.0f; 16], main_lens: [0 - 1; 3], chip_idx: [0; 6],
-        chip_x10: [10; 6], nchip: 0, can_flip: false, cpu: 0, cpu_cap: 0, pend_zoom: 0.0 - 1.0, zr: 1.0f, pend_sl: [0 - 1; 3],
+        chip_x10: [10; 6], chip_opt: [0; 6], foc1: 0.0f, nchip: 0, can_flip: false, cpu: 0, cpu_cap: 0, pend_zoom: 0.0 - 1.0, zr: 1.0f, pend_sl: [0 - 1; 3],
     }
     a.thumb = camera.camera_alloc(THUMB_BYTES)
     a.pthumb = camera.camera_alloc(THUMB_BYTES)
@@ -977,6 +1057,7 @@ fn main() -> i32 {
                     let first: i32 = if a.main_lens[1] >= 0 { a.main_lens[1] } else { 0 }
                     open_lens(&a, first)
                     reset_zoom(&a, &u, &cv)
+                    save_cam_dump(&a)
                 } else {
                     set_status(&a, "NO CAMERA")
                 }
