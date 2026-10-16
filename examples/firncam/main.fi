@@ -71,6 +71,19 @@ extern fn pthread_attr_setstacksize(attr: u64, n: usize) -> i32;
 extern fn pthread_attr_setdetachstate(attr: u64, state: i32) -> i32;
 const BUDGET: usize = 400 * 1024 * 1024 // capture buffer budget of one shot
 
+// phases of the UI thread (see the loop-gap log): what ran when a turn of the main loop took long
+const P_IDLE: i32 = 0
+const P_SCAN: i32 = 1
+const P_OPEN: i32 = 2
+const P_SWEEP: i32 = 3
+const P_DUMP: i32 = 4
+const P_CAPTURE: i32 = 5
+const P_SAVE: i32 = 6
+const P_ZOOM: i32 = 7
+const P_CHIPS: i32 = 8
+const P_PREVIEW: i32 = 9
+const GAP_WARN_MS: i64 = 100 // a turn of the main loop longer than this is logged
+
 const M_PHOTO: i32 = 0
 const M_NIGHT: i32 = 1
 const M_PORTRAIT: i32 = 2
@@ -148,6 +161,9 @@ struct App {
     pend_zoom: f64, // zoom asked this turn (< 0 = none)
     zr: f32, // CONTROL_ZOOM_RATIO of the open lens (camera_open resets it to 1; do_zoom sets it again)
     pend_sl: [i32; 3], // slider values asked this turn (-1 = none)
+    phase: i32, // what the UI thread is doing right now (P_*), for the loop-gap log
+    gap_max: i64, // longest gap between two loop turns since the last stats line (ms)
+    gap_phase: i32, // phase of that longest gap
 }
 
 fn set_status(a: *mut App, s: str) {
@@ -509,8 +525,9 @@ fn thread_job_main(arg: u64) -> u64 {
 // UI side of a finished job: save, release, report
 fn poll_job(a: *mut App) {
     if !(*a).busy { return }
-    if (*a).stage == 1 { step_capture(a); return }
+    if (*a).stage == 1 { (*a).phase = P_CAPTURE; step_capture(a); return }
     if !camjob.job_finished(&(*a).job) { return }
+    (*a).phase = P_SAVE
     var name: [u8; 48] = [0 as u8; 48]
     if (*a).job.ok {
         name_into((&name[0]) as u64, "IMG_", ".jpg")
@@ -763,7 +780,7 @@ fn sweep_differs(a: *mut App, slot: i32) -> bool {
 fn sweep_zoom(a: *mut App) {
     if (*a).swept || !(*a).ready { return }
     (*a).swept = true
-    if (*a).info.facing != 1 || ((*a).info.caps & camera.CAP_LOGICAL) == 0 as u32 { return }
+    if !sweep_forced() && ((*a).info.facing != 1 || ((*a).info.caps & camera.CAP_LOGICAL) == 0 as u32) { return }
     var zmin: f32 = 0.0f
     var zmax: f32 = 0.0f
     camera.camera_zoom_range(&zmin, &zmax)
@@ -1210,14 +1227,36 @@ extern fn sys_prop_get(name: u64, value: u64) -> i32;
 
 // `adb shell setprop debug.firncam.cpu 1` forces the CPU preview path (test of the no-GPU fallback).
 fn cpu_forced() -> bool {
+    return prop_is_one("debug.firncam.cpu\0")
+}
+
+fn prop_is_one(name: str) -> bool {
     var v: [u8; 96] = [0 as u8; 96]
-    let name: str = "debug.firncam.cpu\0"
     let n: i32 = sys_prop_get(name.p as u64, (&v[0]) as u64)
     return n > 0 && v[0] == 49 as u8
 }
 
-fn log_stats(ui_n: i64, cam_n: i64, ms: i64, w: i32, h: i32, rot: i32, gpu: bool) {
-    var b: [u8; 128] = [0 as u8; 128]
+// `adb shell setprop debug.firncam.sweep 1` runs the zoom sweep on any back camera on every start (test of the UI-thread
+// gap gate: an emulator camera is not a logical multi camera, so the sweep would not run there otherwise).
+fn sweep_forced() -> bool {
+    return prop_is_one("debug.firncam.sweep\0")
+}
+
+// One line per main-loop turn that took longer than GAP_WARN_MS: the UI thread was blocked (an input queue that is not
+// read for 5 s is an ANR). phase = what ran (P_*).
+fn log_gap(ms: i64, phase: i32) {
+    var b: [u8; 64] = [0 as u8; 64]
+    let p: u64 = (&b[0]) as u64
+    var n: usize = put_str(p, "gap ms=")
+    n = n + put_int(p + n as u64, ms)
+    n = n + put_str(p + n as u64, " phase=")
+    n = n + put_int(p + n as u64, phase as i64)
+    let tag: str = "firncam\0"
+    let r: i32 = log_write(4, tag.p as u64, p)
+}
+
+fn log_stats(ui_n: i64, cam_n: i64, ms: i64, w: i32, h: i32, rot: i32, gpu: bool, gap_max: i64, gap_phase: i32) {
+    var b: [u8; 160] = [0 as u8; 160]
     let p: u64 = (&b[0]) as u64
     var n: usize = put_str(p, "ui_fps=")
     n = n + put_int(p + n as u64, ui_n * 1000 / ms)
@@ -1230,6 +1269,10 @@ fn log_stats(ui_n: i64, cam_n: i64, ms: i64, w: i32, h: i32, rot: i32, gpu: bool
     n = n + put_str(p + n as u64, " rot=")
     n = n + put_int(p + n as u64, rot as i64)
     if gpu { n = n + put_str(p + n as u64, " gpu") } else { n = n + put_str(p + n as u64, " cpu") }
+    n = n + put_str(p + n as u64, " max_gap=")
+    n = n + put_int(p + n as u64, gap_max)
+    n = n + put_str(p + n as u64, " gap_phase=")
+    n = n + put_int(p + n as u64, gap_phase as i64)
     let tag: str = "firncam\0"
     let r: i32 = log_write(4, tag.p as u64, p)
 }
@@ -1254,6 +1297,7 @@ fn main() -> i32 {
         stage: 0, cap_n: 0, cap_i: 0, cap_at: 0, steps: [0.0f; 16], bs: [0; 16],
         flash: 0, fl_last: 0 - 1, disp: 0, thumb: 0, pthumb: 0, sthumb: 0, tkey: 0, have_thumb: false, have_p: false,
         have_s: false, nframe: 0, lfac: [0 - 1; 16], lmm: [0.0f; 16], main_lens: [0 - 1; 3], chip_idx: [0; 6],
+        phase: 0, gap_max: 0, gap_phase: 0,
         chip_x10: [10; 6], chip_opt: [0; 6], foc1: 0.0f, nchip: 0, learn_x10: 0, learn_lens: 0 - 1, swept: false, sw_n: 0, sw_z: [0; 16], sw_f: [0; 16], sw_cw: [0; 16], sw_ph: [[0 as u8; 16]; 16], ph1: [0 as u8; 16], can_flip: false, cpu: 0, cpu_cap: 0, pend_zoom: 0.0 - 1.0, zr: 1.0f, pend_sl: [0 - 1; 3],
     }
     a.thumb = camera.camera_alloc(THUMB_BYTES)
@@ -1272,6 +1316,7 @@ fn main() -> i32 {
     var turn: i64 = 0
     var scan_wait: i64 = 0
     var t_log: i64 = fuishell.shell_now_ms()
+    var prev_ms: i64 = 0
     var n_ui: i64 = 0
     var n_cam: i64 = 0
     var pvx: i32 = 0
@@ -1282,18 +1327,30 @@ fn main() -> i32 {
     while open {
         turn = turn + 1
         let now: i64 = fuishell.shell_now_ms()
+        if prev_ms > 0 {
+            let gap: i64 = now - prev_ms
+            if gap > a.gap_max { a.gap_max = gap; a.gap_phase = a.phase }
+            if gap >= GAP_WARN_MS { log_gap(gap, a.phase) }
+        }
+        prev_ms = now
+        a.phase = P_IDLE
         if !a.ready && a.nlens == 0 && turn >= scan_wait {
             scan_wait = turn + 60
             if camera.camera_permission() == 1 {
+                a.phase = P_SCAN
                 a.nlens = camera.camera_scan()
                 if a.nlens > 0 {
                     scan_lenses(&a)
                     let first: i32 = if a.main_lens[1] >= 0 { a.main_lens[1] } else { 0 }
+                    a.phase = P_OPEN
                     open_lens(&a, first)
                     reset_zoom(&a, &u, &cv)
+                    a.phase = P_SWEEP
                     sweep_zoom(&a)
+                    a.phase = P_CHIPS
                     rebuild_chips(&a)
                     reset_zoom(&a, &u, &cv)
+                    a.phase = P_DUMP
                     save_cam_dump(&a)
                 } else {
                     set_status(&a, "NO CAMERA")
@@ -1343,9 +1400,10 @@ fn main() -> i32 {
         a.pend_sl = [0 - 1; 3]
         var cm: ui.Cmd = ui.Cmd { kind: 0, a: 0, b: 0, f: 0.0, g: 0.0 }
         while ui.ui_take(&u, &cm) {
+            a.phase = P_ZOOM
             run_cmd(&a, &u, &cv, &cm, pvw, pvh)
         }
-        if a.pend_zoom > 0.0 { do_zoom(&a, &cv, a.pend_zoom) }
+        if a.pend_zoom > 0.0 { a.phase = P_ZOOM; do_zoom(&a, &cv, a.pend_zoom) }
         if a.pend_sl[0] >= 0 || a.pend_sl[1] >= 0 || a.pend_sl[2] >= 0 { apply_manual(&a) }
         // a lens or mode change may have moved the preview rectangle: ask again
         sync_ui(&a, &u)
@@ -1398,7 +1456,8 @@ fn main() -> i32 {
         fuishell.shell_end(&s)
         n_ui = n_ui + 1
         if now - t_log >= 3000 {
-            log_stats(n_ui, n_cam, now - t_log, pvw, pvh, rot, camview.camview_on(&cv))
+            log_stats(n_ui, n_cam, now - t_log, pvw, pvh, rot, camview.camview_on(&cv), a.gap_max, a.gap_phase)
+            a.gap_max = 0
             t_log = now
             n_ui = 0
             n_cam = 0
