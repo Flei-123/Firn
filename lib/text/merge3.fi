@@ -1,0 +1,1392 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/text/merge3.fi -- text.merge3: line-based three-way merge with the exact result of `git merge-file`
+// (conflict markers, zealous refinement, merge / diff3 / zdiff3 style, ours / theirs / union).
+//
+//     import text.merge3
+//     var o: merge3.Opts = merge3.opts_default()
+//     o.name_ours = "ours"            // label after "<<<<<<<"   (empty = no label)
+//     o.name_base = "base"            // label after "|||||||"   (diff3 styles)
+//     o.name_theirs = "theirs"        // label after ">>>>>>>"
+//     o.style = merge3.STYLE_DIFF3    // STYLE_MERGE (default) | STYLE_DIFF3 | STYLE_ZDIFF3
+//     o.favor = merge3.FAVOR_NONE     // FAVOR_OURS | FAVOR_THEIRS | FAVOR_UNION resolve conflicts
+//     var r: merge3.Result = merge3.merge(&o, base_p, base_n, ours_p, ours_n, theirs_p, theirs_n)
+//     // r.out = merged text (rt.Buf), r.conflicts = number of conflict hunks (0 = clean)
+//     merge3.result_free(&r)
+//
+//     merge3.diff_script(ap, an, bp, bn, &script)   // 4 numbers per change: a start, b start, a count, b count
+//
+// The merge is a port of the xdiff library of git (xdl_merge): Myers diff with the same heuristics, the
+// same record clean-up (lines without a partner are dropped first), the same change compaction ("sliding"
+// of change groups), conflict refinement and the same rule that closes small gaps between conflicts.
+// Because the diff result decides which lines conflict, the port keeps all of these steps, so the output is
+// BYTE-IDENTICAL to `git merge-file` (tools/textlibs_cross/merge_cross.py checks that).
+// Origin: xdiff of git / LibXDiff (C) Davide Libenzi, LGPL-2.1-or-later. This file is a re-implementation
+// of the algorithm in Firn; see THIRD_PARTY.md.
+//
+// A "line" is the bytes up to AND INCLUDING its LF; the last line may have no LF. Line ends are compared
+// byte for byte. When a conflict marker has to follow a line without LF, an LF is added (and a CR before it
+// if the surrounding text uses CR LF), as git does.
+//
+// HONEST
+// M1  Only the default diff of git merge-file is ported (Myers with heuristics, no whitespace flags, no
+//     patience / histogram, no indent heuristic): that is what `git merge-file` uses.
+// M2  The result is checked against git for text; binary data (NUL bytes) is merged like text, git refuses it.
+// M3  Everything is in memory; no limit besides memory (git refuses files above 1 GiB).
+import std.rt
+import std.vec
+
+export {
+    Opts, Result,
+    STYLE_MERGE, STYLE_DIFF3, STYLE_ZDIFF3,
+    FAVOR_NONE, FAVOR_OURS, FAVOR_THEIRS, FAVOR_UNION,
+    LEVEL_MINIMAL, LEVEL_EAGER, LEVEL_ZEALOUS, LEVEL_ZEALOUS_ALNUM,
+    opts_default, merge, result_free, diff_script,
+}
+
+const STYLE_MERGE: i64 = 0
+const STYLE_DIFF3: i64 = 1
+const STYLE_ZDIFF3: i64 = 2
+
+const FAVOR_NONE: i64 = 0
+const FAVOR_OURS: i64 = 1
+const FAVOR_THEIRS: i64 = 2
+const FAVOR_UNION: i64 = 3
+
+const LEVEL_MINIMAL: i64 = 0 // every overlapping change is a conflict
+const LEVEL_EAGER: i64 = 1 // overlapping changes conflict unless identical
+const LEVEL_ZEALOUS: i64 = 2 // look for the minimal conflict set inside overlaps
+const LEVEL_ZEALOUS_ALNUM: i64 = 3 // like ZEALOUS, and gaps without letters / digits join conflicts
+
+const DEFAULT_MARKER_SIZE: i64 = 7
+const MAX_COST_MIN: i64 = 256
+const HEUR_MIN_COST: i64 = 256
+const SNAKE_CNT: i64 = 20
+const K_HEUR: i64 = 4
+const KPDIS_RUN: i64 = 4
+const MAX_EQLIMIT: i64 = 1024
+const SIMSCAN_WINDOW: i64 = 100
+const LINE_MAX: i64 = 9223372036854775807
+
+const LF: u8 = 10
+const CR: u8 = 13
+
+struct Opts {
+    name_ours: str,
+    name_base: str,
+    name_theirs: str,
+    style: i64,
+    favor: i64,
+    level: i64,
+    marker_size: i64, // <= 0 means 7
+}
+
+struct Result {
+    out: rt.Buf,
+    conflicts: i64,
+}
+
+fn opts_default() -> Opts {
+    return Opts {
+        name_ours: "", name_base: "", name_theirs: "",
+        style: STYLE_MERGE, favor: FAVOR_NONE, level: LEVEL_ZEALOUS_ALNUM, marker_size: 0,
+    }
+}
+
+fn result_free(r: *mut Result) {
+    rt.buf_free(&(*r).out)
+}
+
+// ------------------------------------------------------------------ small helpers
+
+fn vi(v: *mut Vec[i64], i: i64) -> i64 {
+    return vec_at[i64](v, i as usize)
+}
+
+fn vs(v: *mut Vec[i64], i: i64, x: i64) {
+    vec_set[i64](v, i as usize, x)
+}
+
+fn fill_i(v: *mut Vec[i64], n: usize, x: i64) {
+    vec_clear[i64](v)
+    vec_reserve[i64](v, n)
+    var i: usize = 0
+    while i < n {
+        vec_push[i64](v, x)
+        i = i + 1
+    }
+}
+
+fn b2i(b: bool) -> i64 {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+fn min_i(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn max_i(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn bogosqrt(n0: i64) -> i64 {
+    var n: i64 = n0
+    var i: i64 = 1
+    while n > 0 {
+        i = i * 2
+        n = n >> 2
+    }
+    return i
+}
+
+fn put_str(out: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(out, s.p as u64, s.n)
+}
+
+fn put_fill(out: *mut rt.Buf, c: u8, n: i64) {
+    var i: i64 = 0
+    while i < n {
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+}
+
+fn is_alnum(c: u8) -> bool {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return true
+    }
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return true
+    }
+    return c >= 97 as u8 && c <= 122 as u8
+}
+
+// ------------------------------------------------------------------ one side of a diff (xdfile_t)
+
+struct Side {
+    n: i64, // number of records (lines)
+    ptr: Vec[u64], // address of every record
+    len: Vec[i64], // byte length of every record
+    cls: Vec[i64], // equivalence class of every record (equal lines = equal class)
+    chg: Vec[u8], // n + 2 flags; the flag of record i is chg[i + 1] (chg[0] and chg[n + 1] stay 0)
+    rindex: Vec[i64], // kept record number -> record number
+    ha: Vec[i64], // kept record number -> class
+    nreff: i64,
+    dstart: i64,
+    dend: i64,
+}
+
+fn side_new() -> Side {
+    return Side {
+        n: 0, ptr: vec_new[u64](), len: vec_new[i64](), cls: vec_new[i64](), chg: vec_new[u8](),
+        rindex: vec_new[i64](), ha: vec_new[i64](), nreff: 0, dstart: 0, dend: 0 - 1,
+    }
+}
+
+fn side_free(s: *mut Side) {
+    vec_free[u64](&(*s).ptr)
+    vec_free[i64](&(*s).len)
+    vec_free[i64](&(*s).cls)
+    vec_free[u8](&(*s).chg)
+    vec_free[i64](&(*s).rindex)
+    vec_free[i64](&(*s).ha)
+}
+
+fn side_split(s: *mut Side, p: u64, n: usize) {
+    var start: usize = 0
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) == LF {
+            vec_push[u64](&(*s).ptr, p + start as u64)
+            vec_push[i64](&(*s).len, (i + 1 - start) as i64)
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n {
+        vec_push[u64](&(*s).ptr, p + start as u64)
+        vec_push[i64](&(*s).len, (n - start) as i64)
+    }
+    (*s).n = vec_len[u64](&(*s).ptr) as i64
+}
+
+// the change flag of record i (-1 and n are valid and always 0)
+fn rc(s: *mut Side, i: i64) -> bool {
+    if i < 0 - 1 || i > (*s).n {
+        return false
+    }
+    return vec_at[u8](&(*s).chg, (i + 1) as usize) != 0 as u8
+}
+
+fn rset(s: *mut Side, i: i64, v: bool) {
+    var b: u8 = 0 as u8
+    if v {
+        b = 1 as u8
+    }
+    vec_set[u8](&(*s).chg, (i + 1) as usize, b)
+}
+
+fn rec_ptr(s: *mut Side, i: i64) -> u64 {
+    return vec_at[u64](&(*s).ptr, i as usize)
+}
+
+fn rec_len(s: *mut Side, i: i64) -> i64 {
+    return vec_at[i64](&(*s).len, i as usize)
+}
+
+fn rec_eq(a: *mut Side, i: i64, b: *mut Side, j: i64) -> bool {
+    let n: i64 = rec_len(a, i)
+    return n == rec_len(b, j) && rt.mem_eq(rec_ptr(a, i), rec_ptr(b, j), n as usize)
+}
+
+fn hash_span(p: u64, n: i64) -> u64 {
+    var h: u64 = 14695981039346656037 as u64
+    var i: usize = 0
+    while i < n as usize {
+        h = (h ^ rt.ld8(p, i) as u64) *% 1099511628211 as u64
+        i = i + 1
+    }
+    return h
+}
+
+// ------------------------------------------------------------------ the diff environment (xdfenv_t)
+
+struct Env {
+    a: Side, // the old text (xdf1)
+    b: Side, // the new text (xdf2)
+}
+
+// gives every distinct line an equivalence class; len1 / len2 = how often a class occurs in a / b
+fn classify(e: *mut Env, len1: *mut Vec[i64], len2: *mut Vec[i64]) {
+    let na: i64 = (*e).a.n
+    let nb: i64 = (*e).b.n
+    var cap: usize = 16
+    while cap < (2 * (na + nb) + 2) as usize {
+        cap = cap * 2
+    }
+    var table: Vec[i64] = vec_new[i64]()
+    fill_i(&table, cap, 0)
+    var rp: Vec[u64] = vec_new[u64]()
+    var rn: Vec[i64] = vec_new[i64]()
+    var side: i64 = 0
+    while side < 2 {
+        var s: *mut Side = &(*e).a
+        if side == 1 {
+            s = &(*e).b
+        }
+        vec_clear[i64](&(*s).cls)
+        let cnt: i64 = (*s).n
+        var i: i64 = 0
+        while i < cnt {
+            let p: u64 = rec_ptr(s, i)
+            let n: i64 = rec_len(s, i)
+            var slot: usize = (hash_span(p, n) & (cap - 1) as u64) as usize
+            var id: i64 = 0
+            var found: bool = false
+            while !found {
+                let t: i64 = vec_at[i64](&table, slot)
+                if t == 0 {
+                    id = vec_len[u64](&rp) as i64
+                    vec_push[u64](&rp, p)
+                    vec_push[i64](&rn, n)
+                    vec_push[i64](len1, 0)
+                    vec_push[i64](len2, 0)
+                    vec_set[i64](&table, slot, id + 1)
+                    found = true
+                } else {
+                    let rid: i64 = t - 1
+                    if vec_at[i64](&rn, rid as usize) == n && rt.mem_eq(vec_at[u64](&rp, rid as usize), p, n as usize) {
+                        id = rid
+                        found = true
+                    } else {
+                        slot = (slot + 1) & (cap - 1)
+                    }
+                }
+            }
+            if side == 0 {
+                vs(len1, id, vi(len1, id) + 1)
+            } else {
+                vs(len2, id, vi(len2, id) + 1)
+            }
+            vec_push[i64](&(*s).cls, id)
+            i = i + 1
+        }
+        side = side + 1
+    }
+    vec_free[i64](&table)
+    vec_free[u64](&rp)
+    vec_free[i64](&rn)
+}
+
+// a run of records that either has no partner or has too many, around record i (xdl_clean_mmatch)
+fn clean_mmatch(dis: *mut Vec[u8], i: i64, s0: i64, e0: i64) -> bool {
+    var s: i64 = s0
+    var e: i64 = e0
+    if i - s > SIMSCAN_WINDOW {
+        s = i - SIMSCAN_WINDOW
+    }
+    if e - i > SIMSCAN_WINDOW {
+        e = i + SIMSCAN_WINDOW
+    }
+    var r: i64 = 1
+    var rdis0: i64 = 0
+    var rpdis0: i64 = 1
+    while i - r >= s {
+        let d: u8 = vec_at[u8](dis, (i - r) as usize)
+        if d == 0 as u8 {
+            rdis0 = rdis0 + 1
+        } else if d == 2 as u8 {
+            rpdis0 = rpdis0 + 1
+        } else {
+            break
+        }
+        r = r + 1
+    }
+    if rdis0 == 0 {
+        return false
+    }
+    var rdis1: i64 = 0
+    var rpdis1: i64 = 1
+    r = 1
+    while i + r <= e {
+        let d: u8 = vec_at[u8](dis, (i + r) as usize)
+        if d == 0 as u8 {
+            rdis1 = rdis1 + 1
+        } else if d == 2 as u8 {
+            rpdis1 = rpdis1 + 1
+        } else {
+            break
+        }
+        r = r + 1
+    }
+    if rdis1 == 0 {
+        return false
+    }
+    rdis1 = rdis1 + rdis0
+    rpdis1 = rpdis1 + rpdis0
+    return rpdis1 * KPDIS_RUN < rpdis1 + rdis1
+}
+
+// drops records without a partner on the other side (they are changed for sure) and keeps the rest in
+// rindex / ha (xdl_cleanup_records)
+fn cleanup_side(x: *mut Side, other_len: *mut Vec[i64], mlim: i64, dis: *mut Vec[u8]) {
+    var i: i64 = (*x).dstart
+    while i <= (*x).dend {
+        let nm: i64 = vi(other_len, vec_at[i64](&(*x).cls, i as usize))
+        var d: u8 = 1 as u8
+        if nm == 0 {
+            d = 0 as u8
+        } else if nm >= mlim {
+            d = 2 as u8
+        }
+        vec_set[u8](dis, i as usize, d)
+        i = i + 1
+    }
+    var nreff: i64 = 0
+    i = (*x).dstart
+    while i <= (*x).dend {
+        let d: u8 = vec_at[u8](dis, i as usize)
+        if d == 1 as u8 || (d == 2 as u8 && !clean_mmatch(dis, i, (*x).dstart, (*x).dend)) {
+            vec_push[i64](&(*x).rindex, i)
+            vec_push[i64](&(*x).ha, vec_at[i64](&(*x).cls, i as usize))
+            nreff = nreff + 1
+        } else {
+            rset(x, i, true)
+        }
+        i = i + 1
+    }
+    (*x).nreff = nreff
+}
+
+// splits both texts, classifies the lines, cuts the common head and tail, drops partnerless lines
+fn env_prepare(e: *mut Env, ap: u64, an: usize, bp: u64, bn: usize) {
+    (*e).a = side_new()
+    (*e).b = side_new()
+    side_split(&(*e).a, ap, an)
+    side_split(&(*e).b, bp, bn)
+    var len1: Vec[i64] = vec_new[i64]()
+    var len2: Vec[i64] = vec_new[i64]()
+    classify(e, &len1, &len2)
+    let n1: i64 = (*e).a.n
+    let n2: i64 = (*e).b.n
+    fill_u8(&(*e).a.chg, (n1 + 2) as usize)
+    fill_u8(&(*e).b.chg, (n2 + 2) as usize)
+    // xdl_trim_ends
+    var lim: i64 = min_i(n1, n2)
+    var i: i64 = 0
+    while i < lim && vec_at[i64](&(*e).a.cls, i as usize) == vec_at[i64](&(*e).b.cls, i as usize) {
+        i = i + 1
+    }
+    (*e).a.dstart = i
+    (*e).b.dstart = i
+    lim = lim - i
+    var k: i64 = 0
+    while k < lim && vec_at[i64](&(*e).a.cls, (n1 - 1 - k) as usize) == vec_at[i64](&(*e).b.cls, (n2 - 1 - k) as usize) {
+        k = k + 1
+    }
+    (*e).a.dend = n1 - k - 1
+    (*e).b.dend = n2 - k - 1
+    // xdl_cleanup_records
+    var dis1: Vec[u8] = vec_new[u8]()
+    var dis2: Vec[u8] = vec_new[u8]()
+    fill_u8(&dis1, (n1 + 1) as usize)
+    fill_u8(&dis2, (n2 + 1) as usize)
+    var mlim: i64 = bogosqrt(n1)
+    if mlim > MAX_EQLIMIT {
+        mlim = MAX_EQLIMIT
+    }
+    cleanup_side(&(*e).a, &len2, mlim, &dis1)
+    mlim = bogosqrt(n2)
+    if mlim > MAX_EQLIMIT {
+        mlim = MAX_EQLIMIT
+    }
+    cleanup_side(&(*e).b, &len1, mlim, &dis2)
+    vec_free[u8](&dis1)
+    vec_free[u8](&dis2)
+    vec_free[i64](&len1)
+    vec_free[i64](&len2)
+}
+
+fn fill_u8(v: *mut Vec[u8], n: usize) {
+    vec_clear[u8](v)
+    vec_reserve[u8](v, n)
+    var i: usize = 0
+    while i < n {
+        vec_push[u8](v, 0 as u8)
+        i = i + 1
+    }
+}
+
+fn env_free(e: *mut Env) {
+    side_free(&(*e).a)
+    side_free(&(*e).b)
+}
+
+// ------------------------------------------------------------------ Myers with the xdiff heuristics
+
+struct Cmp {
+    ha1: *mut Vec[i64],
+    ha2: *mut Vec[i64],
+    kvdf: Vec[i64],
+    kvdb: Vec[i64],
+    ofs: i64,
+    mxcost: i64,
+}
+
+struct Split {
+    i1: i64,
+    i2: i64,
+    min_lo: bool,
+    min_hi: bool,
+}
+
+fn kf(c: *mut Cmp, d: i64) -> i64 {
+    return vec_at[i64](&(*c).kvdf, (d + (*c).ofs) as usize)
+}
+
+fn kfs(c: *mut Cmp, d: i64, v: i64) {
+    vec_set[i64](&(*c).kvdf, (d + (*c).ofs) as usize, v)
+}
+
+fn kb(c: *mut Cmp, d: i64) -> i64 {
+    return vec_at[i64](&(*c).kvdb, (d + (*c).ofs) as usize)
+}
+
+fn kbs(c: *mut Cmp, d: i64, v: i64) {
+    vec_set[i64](&(*c).kvdb, (d + (*c).ofs) as usize, v)
+}
+
+// the middle snake of the box (off1, off2, lim1, lim2) (xdl_split)
+fn split(c: *mut Cmp, off1: i64, lim1: i64, off2: i64, lim2: i64, need_min: bool, spl: *mut Split) {
+    let dmin: i64 = off1 - lim2
+    let dmax: i64 = lim1 - off2
+    let fmid: i64 = off1 - off2
+    let bmid: i64 = lim1 - lim2
+    let odd: bool = ((fmid - bmid) & 1) != 0
+    var fmin: i64 = fmid
+    var fmax: i64 = fmid
+    var bmin: i64 = bmid
+    var bmax: i64 = bmid
+    kfs(c, fmid, off1)
+    kbs(c, bmid, lim1)
+    var ec: i64 = 1
+    while true {
+        var got_snake: bool = false
+        if fmin > dmin {
+            fmin = fmin - 1
+            kfs(c, fmin - 1, 0 - 1)
+        } else {
+            fmin = fmin + 1
+        }
+        if fmax < dmax {
+            fmax = fmax + 1
+            kfs(c, fmax + 1, 0 - 1)
+        } else {
+            fmax = fmax - 1
+        }
+        var d: i64 = fmax
+        while d >= fmin {
+            var i1: i64 = 0
+            if kf(c, d - 1) >= kf(c, d + 1) {
+                i1 = kf(c, d - 1) + 1
+            } else {
+                i1 = kf(c, d + 1)
+            }
+            let prev1: i64 = i1
+            var i2: i64 = i1 - d
+            while i1 < lim1 && i2 < lim2 && vi((*c).ha1, i1) == vi((*c).ha2, i2) {
+                i1 = i1 + 1
+                i2 = i2 + 1
+            }
+            if i1 - prev1 > SNAKE_CNT {
+                got_snake = true
+            }
+            kfs(c, d, i1)
+            if odd && bmin <= d && d <= bmax && kb(c, d) <= i1 {
+                (*spl).i1 = i1
+                (*spl).i2 = i2
+                (*spl).min_lo = true
+                (*spl).min_hi = true
+                return
+            }
+            d = d - 2
+        }
+        if bmin > dmin {
+            bmin = bmin - 1
+            kbs(c, bmin - 1, LINE_MAX)
+        } else {
+            bmin = bmin + 1
+        }
+        if bmax < dmax {
+            bmax = bmax + 1
+            kbs(c, bmax + 1, LINE_MAX)
+        } else {
+            bmax = bmax - 1
+        }
+        d = bmax
+        while d >= bmin {
+            var i1: i64 = 0
+            if kb(c, d - 1) < kb(c, d + 1) {
+                i1 = kb(c, d - 1)
+            } else {
+                i1 = kb(c, d + 1) - 1
+            }
+            let prev1: i64 = i1
+            var i2: i64 = i1 - d
+            while i1 > off1 && i2 > off2 && vi((*c).ha1, i1 - 1) == vi((*c).ha2, i2 - 1) {
+                i1 = i1 - 1
+                i2 = i2 - 1
+            }
+            if prev1 - i1 > SNAKE_CNT {
+                got_snake = true
+            }
+            kbs(c, d, i1)
+            if !odd && fmin <= d && d <= fmax && i1 <= kf(c, d) {
+                (*spl).i1 = i1
+                (*spl).i2 = i2
+                (*spl).min_lo = true
+                (*spl).min_hi = true
+                return
+            }
+            d = d - 2
+        }
+        if !need_min {
+            // a good snake and a high cost: look for an "interesting" diagonal and cut the search
+            if got_snake && ec > HEUR_MIN_COST {
+                var best: i64 = 0
+                d = fmax
+                while d >= fmin {
+                    var dd: i64 = fmid - d
+                    if d > fmid {
+                        dd = d - fmid
+                    }
+                    let i1: i64 = kf(c, d)
+                    let i2: i64 = i1 - d
+                    let v: i64 = (i1 - off1) + (i2 - off2) - dd
+                    if v > K_HEUR * ec && v > best && off1 + SNAKE_CNT <= i1 && i1 < lim1 && off2 + SNAKE_CNT <= i2 && i2 < lim2 {
+                        var k: i64 = 1
+                        while vi((*c).ha1, i1 - k) == vi((*c).ha2, i2 - k) {
+                            if k == SNAKE_CNT {
+                                best = v
+                                (*spl).i1 = i1
+                                (*spl).i2 = i2
+                                break
+                            }
+                            k = k + 1
+                        }
+                    }
+                    d = d - 2
+                }
+                if best > 0 {
+                    (*spl).min_lo = true
+                    (*spl).min_hi = false
+                    return
+                }
+                best = 0
+                d = bmax
+                while d >= bmin {
+                    var dd: i64 = bmid - d
+                    if d > bmid {
+                        dd = d - bmid
+                    }
+                    let i1: i64 = kb(c, d)
+                    let i2: i64 = i1 - d
+                    let v: i64 = (lim1 - i1) + (lim2 - i2) - dd
+                    if v > K_HEUR * ec && v > best && off1 < i1 && i1 <= lim1 - SNAKE_CNT && off2 < i2 && i2 <= lim2 - SNAKE_CNT {
+                        var k: i64 = 0
+                        while vi((*c).ha1, i1 + k) == vi((*c).ha2, i2 + k) {
+                            if k == SNAKE_CNT - 1 {
+                                best = v
+                                (*spl).i1 = i1
+                                (*spl).i2 = i2
+                                break
+                            }
+                            k = k + 1
+                        }
+                    }
+                    d = d - 2
+                }
+                if best > 0 {
+                    (*spl).min_lo = false
+                    (*spl).min_hi = true
+                    return
+                }
+            }
+            // enough is enough: take the furthest reaching path
+            if ec >= (*c).mxcost {
+                var fbest: i64 = 0 - 1
+                var fbest1: i64 = 0 - 1
+                d = fmax
+                while d >= fmin {
+                    var i1: i64 = min_i(kf(c, d), lim1)
+                    var i2: i64 = i1 - d
+                    if lim2 < i2 {
+                        i1 = lim2 + d
+                        i2 = lim2
+                    }
+                    if fbest < i1 + i2 {
+                        fbest = i1 + i2
+                        fbest1 = i1
+                    }
+                    d = d - 2
+                }
+                var bbest: i64 = LINE_MAX
+                var bbest1: i64 = LINE_MAX
+                d = bmax
+                while d >= bmin {
+                    var i1: i64 = max_i(off1, kb(c, d))
+                    var i2: i64 = i1 - d
+                    if i2 < off2 {
+                        i1 = off2 + d
+                        i2 = off2
+                    }
+                    if i1 + i2 < bbest {
+                        bbest = i1 + i2
+                        bbest1 = i1
+                    }
+                    d = d - 2
+                }
+                if (lim1 + lim2) - bbest < fbest - (off1 + off2) {
+                    (*spl).i1 = fbest1
+                    (*spl).i2 = fbest - fbest1
+                    (*spl).min_lo = true
+                    (*spl).min_hi = false
+                } else {
+                    (*spl).i1 = bbest1
+                    (*spl).i2 = bbest - bbest1
+                    (*spl).min_lo = false
+                    (*spl).min_hi = true
+                }
+                return
+            }
+        }
+        ec = ec + 1
+    }
+}
+
+// divide and conquer over the boxes; marks the changed records (xdl_recs_cmp, with an explicit stack)
+fn recs_cmp(e: *mut Env, c: *mut Cmp) {
+    var st: Vec[i64] = vec_new[i64]()
+    vec_push[i64](&st, 0)
+    vec_push[i64](&st, (*e).a.nreff)
+    vec_push[i64](&st, 0)
+    vec_push[i64](&st, (*e).b.nreff)
+    vec_push[i64](&st, 0)
+    while vec_len[i64](&st) > 0 {
+        let need_min: bool = vec_pop[i64](&st) != 0
+        var lim2: i64 = vec_pop[i64](&st)
+        var off2: i64 = vec_pop[i64](&st)
+        var lim1: i64 = vec_pop[i64](&st)
+        var off1: i64 = vec_pop[i64](&st)
+        while off1 < lim1 && off2 < lim2 && vi((*c).ha1, off1) == vi((*c).ha2, off2) {
+            off1 = off1 + 1
+            off2 = off2 + 1
+        }
+        while off1 < lim1 && off2 < lim2 && vi((*c).ha1, lim1 - 1) == vi((*c).ha2, lim2 - 1) {
+            lim1 = lim1 - 1
+            lim2 = lim2 - 1
+        }
+        if off1 == lim1 {
+            while off2 < lim2 {
+                rset(&(*e).b, vi(&(*e).b.rindex, off2), true)
+                off2 = off2 + 1
+            }
+        } else if off2 == lim2 {
+            while off1 < lim1 {
+                rset(&(*e).a, vi(&(*e).a.rindex, off1), true)
+                off1 = off1 + 1
+            }
+        } else {
+            var spl: Split = Split { i1: 0, i2: 0, min_lo: false, min_hi: false }
+            split(c, off1, lim1, off2, lim2, need_min, &spl)
+            vec_push[i64](&st, off1)
+            vec_push[i64](&st, spl.i1)
+            vec_push[i64](&st, off2)
+            vec_push[i64](&st, spl.i2)
+            vec_push[i64](&st, b2i(spl.min_lo))
+            vec_push[i64](&st, spl.i1)
+            vec_push[i64](&st, lim1)
+            vec_push[i64](&st, spl.i2)
+            vec_push[i64](&st, lim2)
+            vec_push[i64](&st, b2i(spl.min_hi))
+        }
+    }
+    vec_free[i64](&st)
+}
+
+// the diff of two texts: changed flags on both sides (xdl_do_diff)
+fn do_diff(e: *mut Env, ap: u64, an: usize, bp: u64, bn: usize) {
+    env_prepare(e, ap, an, bp, bn)
+    let ndiags: i64 = (*e).a.nreff + (*e).b.nreff + 3
+    var c: Cmp = Cmp {
+        ha1: &(*e).a.ha, ha2: &(*e).b.ha, kvdf: vec_new[i64](), kvdb: vec_new[i64](),
+        ofs: (*e).b.nreff + 1, mxcost: bogosqrt(ndiags),
+    }
+    if c.mxcost < MAX_COST_MIN {
+        c.mxcost = MAX_COST_MIN
+    }
+    fill_i(&c.kvdf, ndiags as usize, 0)
+    fill_i(&c.kvdb, ndiags as usize, 0)
+    recs_cmp(e, &c)
+    vec_free[i64](&c.kvdf)
+    vec_free[i64](&c.kvdb)
+}
+
+// ------------------------------------------------------------------ change compaction (xdl_change_compact)
+
+struct Grp {
+    start: i64, // first changed record, or the record above which an empty group sits
+    end: i64, // first unchanged record after the group
+}
+
+fn group_init(x: *mut Side, g: *mut Grp) {
+    (*g).start = 0
+    (*g).end = 0
+    while rc(x, (*g).end) {
+        (*g).end = (*g).end + 1
+    }
+}
+
+// true = moved to the next group; false = already at the end
+fn group_next(x: *mut Side, g: *mut Grp) -> bool {
+    if (*g).end == (*x).n {
+        return false
+    }
+    (*g).start = (*g).end + 1
+    (*g).end = (*g).start
+    while rc(x, (*g).end) {
+        (*g).end = (*g).end + 1
+    }
+    return true
+}
+
+fn group_previous(x: *mut Side, g: *mut Grp) -> bool {
+    if (*g).start == 0 {
+        return false
+    }
+    (*g).end = (*g).start - 1
+    (*g).start = (*g).end
+    while rc(x, (*g).start - 1) {
+        (*g).start = (*g).start - 1
+    }
+    return true
+}
+
+fn cls_at(x: *mut Side, i: i64) -> i64 {
+    return vec_at[i64](&(*x).cls, i as usize)
+}
+
+// true = the group slid one line towards the end (and swallowed a following group if it bumped into one)
+fn group_slide_down(x: *mut Side, g: *mut Grp) -> bool {
+    if (*g).end < (*x).n && cls_at(x, (*g).start) == cls_at(x, (*g).end) {
+        rset(x, (*g).start, false)
+        (*g).start = (*g).start + 1
+        rset(x, (*g).end, true)
+        (*g).end = (*g).end + 1
+        while rc(x, (*g).end) {
+            (*g).end = (*g).end + 1
+        }
+        return true
+    }
+    return false
+}
+
+fn group_slide_up(x: *mut Side, g: *mut Grp) -> bool {
+    if (*g).start > 0 && cls_at(x, (*g).start - 1) == cls_at(x, (*g).end - 1) {
+        (*g).start = (*g).start - 1
+        rset(x, (*g).start, true)
+        (*g).end = (*g).end - 1
+        rset(x, (*g).end, false)
+        while rc(x, (*g).start - 1) {
+            (*g).start = (*g).start - 1
+        }
+        return true
+    }
+    return false
+}
+
+// moves change groups of x up and down so that they line up with groups of the other side (git without
+// the indent heuristic, which `git merge-file` does not switch on)
+fn change_compact(x: *mut Side, o: *mut Side) {
+    var g: Grp = Grp { start: 0, end: 0 }
+    var go: Grp = Grp { start: 0, end: 0 }
+    group_init(x, &g)
+    group_init(o, &go)
+    while true {
+        if g.end != g.start {
+            var groupsize: i64 = 0
+            var earliest_end: i64 = 0
+            var end_matching_other: i64 = 0 - 1
+            while true {
+                groupsize = g.end - g.start
+                end_matching_other = 0 - 1
+                while group_slide_up(x, &g) {
+                    group_previous(o, &go)
+                }
+                earliest_end = g.end
+                if go.end > go.start {
+                    end_matching_other = g.end
+                }
+                while group_slide_down(x, &g) {
+                    group_next(o, &go)
+                    if go.end > go.start {
+                        end_matching_other = g.end
+                    }
+                }
+                if groupsize == g.end - g.start {
+                    break
+                }
+            }
+            if g.end != earliest_end && end_matching_other != 0 - 1 {
+                while go.end == go.start {
+                    group_slide_up(x, &g)
+                    group_previous(o, &go)
+                }
+            }
+        }
+        if !group_next(x, &g) {
+            break
+        }
+        group_next(o, &go)
+    }
+}
+
+// the edit script, ascending: 4 numbers per change (a start, b start, a count, b count)
+fn build_script(e: *mut Env, out: *mut Vec[i64]) {
+    vec_clear[i64](out)
+    var tmp: Vec[i64] = vec_new[i64]()
+    var i1: i64 = (*e).a.n
+    var i2: i64 = (*e).b.n
+    while i1 >= 0 || i2 >= 0 {
+        if rc(&(*e).a, i1 - 1) || rc(&(*e).b, i2 - 1) {
+            let l1: i64 = i1
+            while rc(&(*e).a, i1 - 1) {
+                i1 = i1 - 1
+            }
+            let l2: i64 = i2
+            while rc(&(*e).b, i2 - 1) {
+                i2 = i2 - 1
+            }
+            vec_push[i64](&tmp, i1)
+            vec_push[i64](&tmp, i2)
+            vec_push[i64](&tmp, l1 - i1)
+            vec_push[i64](&tmp, l2 - i2)
+        }
+        i1 = i1 - 1
+        i2 = i2 - 1
+    }
+    var k: i64 = (vec_len[i64](&tmp) / 4) as i64
+    while k > 0 {
+        k = k - 1
+        var j: i64 = 0
+        while j < 4 {
+            vec_push[i64](out, vi(&tmp, k * 4 + j))
+            j = j + 1
+        }
+    }
+    vec_free[i64](&tmp)
+}
+
+// a full diff of two texts: Myers, compaction, script. 4 numbers per change.
+fn diff_script(ap: u64, an: usize, bp: u64, bn: usize, out: *mut Vec[i64]) {
+    var e: Env = Env { a: side_new(), b: side_new() }
+    do_diff(&e, ap, an, bp, bn)
+    change_compact(&e.a, &e.b)
+    change_compact(&e.b, &e.a)
+    build_script(&e, out)
+    env_free(&e)
+}
+
+// ------------------------------------------------------------------ the merge (xmerge.c)
+
+// one merge hunk = 7 numbers
+const M_MODE: i64 = 0 // 0 conflict, 1 take ours, 2 take theirs, 3 take both, 4 identical change (skipped)
+const M_I1: i64 = 1 // start in ours
+const M_I2: i64 = 2 // start in theirs
+const M_CHG1: i64 = 3
+const M_CHG2: i64 = 4
+const M_I0: i64 = 5 // start in base
+const M_CHG0: i64 = 6
+const M_W: i64 = 7
+
+fn mg(m: *mut Vec[i64], k: i64, f: i64) -> i64 {
+    return vi(m, k * M_W + f)
+}
+
+fn mset(m: *mut Vec[i64], k: i64, f: i64, v: i64) {
+    vs(m, k * M_W + f, v)
+}
+
+fn mcount(m: *mut Vec[i64]) -> i64 {
+    return (vec_len[i64](m) / 7) as i64
+}
+
+fn mpush(m: *mut Vec[i64], mode: i64, i0: i64, chg0: i64, i1: i64, chg1: i64, i2: i64, chg2: i64) {
+    vec_push[i64](m, mode)
+    vec_push[i64](m, i1)
+    vec_push[i64](m, i2)
+    vec_push[i64](m, chg1)
+    vec_push[i64](m, chg2)
+    vec_push[i64](m, i0)
+    vec_push[i64](m, chg0)
+}
+
+// xdl_append_merge: a hunk that touches or overlaps the previous one is folded into it
+fn append_merge(m: *mut Vec[i64], mode: i64, i0: i64, chg0: i64, i1: i64, chg1: i64, i2: i64, chg2: i64) {
+    let n: i64 = mcount(m)
+    if n > 0 {
+        let k: i64 = n - 1
+        if i1 <= mg(m, k, M_I1) + mg(m, k, M_CHG1) || i2 <= mg(m, k, M_I2) + mg(m, k, M_CHG2) {
+            if mode != mg(m, k, M_MODE) {
+                mset(m, k, M_MODE, 0)
+            }
+            mset(m, k, M_CHG0, i0 + chg0 - mg(m, k, M_I0))
+            mset(m, k, M_CHG1, i1 + chg1 - mg(m, k, M_I1))
+            mset(m, k, M_CHG2, i2 + chg2 - mg(m, k, M_I2))
+            return
+        }
+    }
+    mpush(m, mode, i0, chg0, i1, chg1, i2, chg2)
+}
+
+fn merge_cmp_lines(e1: *mut Env, i1: i64, e2: *mut Env, i2: i64, count: i64) -> bool {
+    var i: i64 = 0
+    while i < count {
+        if !rec_eq(&(*e1).b, i1 + i, &(*e2).b, i2 + i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// -1 / 0 / 1: does the line end in CR LF (the last line without LF borrows from the one before)
+fn is_eol_crlf(f: *mut Side, i: i64) -> i64 {
+    let n: i64 = (*f).n
+    if i < n - 1 {
+        let size: i64 = rec_len(f, i)
+        if size > 1 && rt.ld8(rec_ptr(f, i), (size - 2) as usize) == CR {
+            return 1
+        }
+        return 0
+    }
+    if n == 0 {
+        return 0 - 1
+    }
+    let size: i64 = rec_len(f, i)
+    if size > 0 && rt.ld8(rec_ptr(f, i), (size - 1) as usize) == LF {
+        if size > 1 && rt.ld8(rec_ptr(f, i), (size - 2) as usize) == CR {
+            return 1
+        }
+        return 0
+    }
+    if i == 0 {
+        return 0 - 1
+    }
+    let s2: i64 = rec_len(f, i - 1)
+    if s2 > 1 && rt.ld8(rec_ptr(f, i - 1), (s2 - 2) as usize) == CR {
+        return 1
+    }
+    return 0
+}
+
+fn is_cr_needed(e1: *mut Env, e2: *mut Env, m: *mut Vec[i64], k: i64) -> bool {
+    let i1: i64 = mg(m, k, M_I1)
+    let i2: i64 = mg(m, k, M_I2)
+    var a: i64 = 0
+    if i1 != 0 {
+        a = is_eol_crlf(&(*e1).b, i1 - 1)
+    } else {
+        a = is_eol_crlf(&(*e1).b, 0)
+    }
+    if a != 0 {
+        if i2 != 0 {
+            a = is_eol_crlf(&(*e2).b, i2 - 1)
+        } else {
+            a = is_eol_crlf(&(*e2).b, 0)
+        }
+    }
+    if a != 0 {
+        a = is_eol_crlf(&(*e1).a, 0)
+    }
+    return a > 0
+}
+
+// copies count records from record i of x; add_nl: end with LF (and CR before it) if the last one has none
+fn recs_copy(x: *mut Side, i: i64, count: i64, needs_cr: bool, add_nl: bool, out: *mut rt.Buf) {
+    if count < 1 {
+        return
+    }
+    var k: i64 = 0
+    while k < count {
+        rt.buf_push_bytes(out, rec_ptr(x, i + k), rec_len(x, i + k) as usize)
+        k = k + 1
+    }
+    if add_nl {
+        let last: i64 = i + count - 1
+        let size: i64 = rec_len(x, last)
+        if size == 0 || rt.ld8(rec_ptr(x, last), (size - 1) as usize) != LF {
+            if needs_cr {
+                rt.buf_push(out, CR)
+            }
+            rt.buf_push(out, LF)
+        }
+    }
+}
+
+fn put_marker(out: *mut rt.Buf, c: u8, size: i64, name: str, needs_cr: bool) {
+    put_fill(out, c, size)
+    if name.n > 0 {
+        rt.buf_push(out, 32 as u8)
+        put_str(out, name)
+    }
+    if needs_cr {
+        rt.buf_push(out, CR)
+    }
+    rt.buf_push(out, LF)
+}
+
+fn fill_conflict_hunk(e1: *mut Env, e2: *mut Env, o: *mut Opts, i: i64, m: *mut Vec[i64], k: i64, out: *mut rt.Buf) {
+    let needs_cr: bool = is_cr_needed(e1, e2, m, k)
+    var marker_size: i64 = (*o).marker_size
+    if marker_size <= 0 {
+        marker_size = DEFAULT_MARKER_SIZE
+    }
+    let diff3: bool = (*o).style == STYLE_DIFF3 || (*o).style == STYLE_ZDIFF3
+    recs_copy(&(*e1).b, i, mg(m, k, M_I1) - i, false, false, out)
+    put_marker(out, 60 as u8, marker_size, (*o).name_ours, needs_cr)
+    recs_copy(&(*e1).b, mg(m, k, M_I1), mg(m, k, M_CHG1), needs_cr, true, out)
+    if diff3 {
+        put_marker(out, 124 as u8, marker_size, (*o).name_base, needs_cr)
+        recs_copy(&(*e1).a, mg(m, k, M_I0), mg(m, k, M_CHG0), needs_cr, true, out)
+    }
+    put_marker(out, 61 as u8, marker_size, "", needs_cr)
+    recs_copy(&(*e2).b, mg(m, k, M_I2), mg(m, k, M_CHG2), needs_cr, true, out)
+    put_marker(out, 62 as u8, marker_size, (*o).name_theirs, needs_cr)
+}
+
+fn fill_merge_buffer(e1: *mut Env, e2: *mut Env, o: *mut Opts, m: *mut Vec[i64], out: *mut rt.Buf) {
+    var i: i64 = 0
+    var k: i64 = 0
+    let cnt: i64 = mcount(m)
+    while k < cnt {
+        if (*o).favor != FAVOR_NONE && mg(m, k, M_MODE) == 0 {
+            mset(m, k, M_MODE, (*o).favor)
+        }
+        let mode: i64 = mg(m, k, M_MODE)
+        var take: bool = true
+        if mode == 0 {
+            fill_conflict_hunk(e1, e2, o, i, m, k, out)
+        } else if (mode & 3) != 0 {
+            recs_copy(&(*e1).b, i, mg(m, k, M_I1) - i, false, false, out)
+            if (mode & 1) != 0 {
+                let needs_cr: bool = is_cr_needed(e1, e2, m, k)
+                recs_copy(&(*e1).b, mg(m, k, M_I1), mg(m, k, M_CHG1), needs_cr, (mode & 2) != 0, out)
+            }
+            if (mode & 2) != 0 {
+                recs_copy(&(*e2).b, mg(m, k, M_I2), mg(m, k, M_CHG2), false, false, out)
+            }
+        } else {
+            take = false
+        }
+        if take {
+            i = mg(m, k, M_I1) + mg(m, k, M_CHG1)
+        }
+        k = k + 1
+    }
+    recs_copy(&(*e1).b, i, (*e1).b.n - i, false, false, out)
+}
+
+// zdiff3: only common lines at the start and end of a conflict are moved out of it
+fn refine_zdiff3_conflicts(e1: *mut Env, e2: *mut Env, m: *mut Vec[i64]) {
+    var k: i64 = 0
+    let cnt: i64 = mcount(m)
+    while k < cnt {
+        if mg(m, k, M_MODE) == 0 {
+            while mg(m, k, M_CHG1) != 0 && mg(m, k, M_CHG2) != 0 && rec_eq(&(*e1).b, mg(m, k, M_I1), &(*e2).b, mg(m, k, M_I2)) {
+                mset(m, k, M_CHG1, mg(m, k, M_CHG1) - 1)
+                mset(m, k, M_CHG2, mg(m, k, M_CHG2) - 1)
+                mset(m, k, M_I1, mg(m, k, M_I1) + 1)
+                mset(m, k, M_I2, mg(m, k, M_I2) + 1)
+            }
+            while mg(m, k, M_CHG1) != 0 && mg(m, k, M_CHG2) != 0 && rec_eq(&(*e1).b, mg(m, k, M_I1) + mg(m, k, M_CHG1) - 1, &(*e2).b, mg(m, k, M_I2) + mg(m, k, M_CHG2) - 1) {
+                mset(m, k, M_CHG1, mg(m, k, M_CHG1) - 1)
+                mset(m, k, M_CHG2, mg(m, k, M_CHG2) - 1)
+            }
+        }
+        k = k + 1
+    }
+}
+
+// a conflict is diffed again side against side; only the lines that differ stay in conflict
+fn refine_conflicts(e1: *mut Env, e2: *mut Env, m: *mut Vec[i64]) {
+    var res: Vec[i64] = vec_new[i64]()
+    var k: i64 = 0
+    let cnt: i64 = mcount(m)
+    while k < cnt {
+        let mode: i64 = mg(m, k, M_MODE)
+        let i1: i64 = mg(m, k, M_I1)
+        let i2: i64 = mg(m, k, M_I2)
+        let chg1: i64 = mg(m, k, M_CHG1)
+        let chg2: i64 = mg(m, k, M_CHG2)
+        var keep: bool = true
+        if mode == 0 && chg1 != 0 && chg2 != 0 {
+            let t1: u64 = rec_ptr(&(*e1).b, i1)
+            let t1n: i64 = (rec_ptr(&(*e1).b, i1 + chg1 - 1) + rec_len(&(*e1).b, i1 + chg1 - 1) as u64 - t1) as i64
+            let t2: u64 = rec_ptr(&(*e2).b, i2)
+            let t2n: i64 = (rec_ptr(&(*e2).b, i2 + chg2 - 1) + rec_len(&(*e2).b, i2 + chg2 - 1) as u64 - t2) as i64
+            var xe: Env = Env { a: side_new(), b: side_new() }
+            do_diff(&xe, t1, t1n as usize, t2, t2n as usize)
+            change_compact(&xe.a, &xe.b)
+            change_compact(&xe.b, &xe.a)
+            var scr: Vec[i64] = vec_new[i64]()
+            build_script(&xe, &scr)
+            let sn: i64 = (vec_len[i64](&scr) / 4) as i64
+            if sn == 0 {
+                // the two sides made the same change
+                mset(m, k, M_MODE, 4)
+            } else {
+                keep = false
+                var s: i64 = 0
+                while s < sn {
+                    var md: i64 = 0
+                    mpush(&res, md, mg(m, k, M_I0), mg(m, k, M_CHG0), vi(&scr, s * 4) + i1, vi(&scr, s * 4 + 2), vi(&scr, s * 4 + 1) + i2, vi(&scr, s * 4 + 3))
+                    s = s + 1
+                }
+            }
+            vec_free[i64](&scr)
+            env_free(&xe)
+        }
+        if keep {
+            mpush(&res, mg(m, k, M_MODE), mg(m, k, M_I0), mg(m, k, M_CHG0), mg(m, k, M_I1), mg(m, k, M_CHG1), mg(m, k, M_I2), mg(m, k, M_CHG2))
+        }
+        k = k + 1
+    }
+    vec_clear[i64](m)
+    vec_append[i64](m, &res)
+    vec_free[i64](&res)
+}
+
+fn lines_contain_alnum(e1: *mut Env, i: i64, chg: i64) -> bool {
+    var k: i64 = i
+    while k < i + chg {
+        let p: u64 = rec_ptr(&(*e1).b, k)
+        let n: i64 = rec_len(&(*e1).b, k)
+        var j: i64 = 0
+        while j < n {
+            if is_alnum(rt.ld8(p, j as usize)) {
+                return true
+            }
+            j = j + 1
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// conflicts that are at most 3 lines apart (or apart by lines without letters / digits) become one
+fn simplify_non_conflicts(e1: *mut Env, m: *mut Vec[i64], simplify_if_no_alnum: bool) {
+    var res: Vec[i64] = vec_new[i64]()
+    var k: i64 = 0
+    let cnt: i64 = mcount(m)
+    while k < cnt {
+        let n: i64 = mcount(&res)
+        var joined: bool = false
+        if n > 0 {
+            let l: i64 = n - 1
+            let begin: i64 = mg(&res, l, M_I1) + mg(&res, l, M_CHG1)
+            let end: i64 = mg(m, k, M_I1)
+            if mg(&res, l, M_MODE) == 0 && mg(m, k, M_MODE) == 0 {
+                if !(end - begin > 3 && (!simplify_if_no_alnum || lines_contain_alnum(e1, begin, end - begin))) {
+                    mset(&res, l, M_CHG1, mg(m, k, M_I1) + mg(m, k, M_CHG1) - mg(&res, l, M_I1))
+                    mset(&res, l, M_CHG2, mg(m, k, M_I2) + mg(m, k, M_CHG2) - mg(&res, l, M_I2))
+                    joined = true
+                }
+            }
+        }
+        if !joined {
+            mpush(&res, mg(m, k, M_MODE), mg(m, k, M_I0), mg(m, k, M_CHG0), mg(m, k, M_I1), mg(m, k, M_CHG1), mg(m, k, M_I2), mg(m, k, M_CHG2))
+        }
+        k = k + 1
+    }
+    vec_clear[i64](m)
+    vec_append[i64](m, &res)
+    vec_free[i64](&res)
+}
+
+fn sc(s: *mut Vec[i64], k: i64, f: i64) -> i64 {
+    return vi(s, k * 4 + f)
+}
+
+// the script has i1 (base start), i2 (side start), chg1 (base count), chg2 (side count) per change, as
+// build_script wrote it: a start, b start, a count, b count
+fn do_merge(e1: *mut Env, s1: *mut Vec[i64], e2: *mut Env, s2: *mut Vec[i64], o: *mut Opts, out: *mut rt.Buf) -> i64 {
+    var level: i64 = (*o).level
+    let style: i64 = (*o).style
+    if (style == STYLE_DIFF3 || style == STYLE_ZDIFF3) && LEVEL_EAGER < level {
+        level = LEVEL_EAGER
+    }
+    var m: Vec[i64] = vec_new[i64]()
+    let n1: i64 = (vec_len[i64](s1) / 4) as i64
+    let n2: i64 = (vec_len[i64](s2) / 4) as i64
+    var p1: i64 = 0
+    var p2: i64 = 0
+    // script record fields: 0 = base start, 1 = side start, 2 = base count, 3 = side count
+    while p1 < n1 && p2 < n2 {
+        let a_i1: i64 = sc(s1, p1, 0)
+        let a_i2: i64 = sc(s1, p1, 1)
+        let a_c1: i64 = sc(s1, p1, 2)
+        let a_c2: i64 = sc(s1, p1, 3)
+        let b_i1: i64 = sc(s2, p2, 0)
+        let b_i2: i64 = sc(s2, p2, 1)
+        let b_c1: i64 = sc(s2, p2, 2)
+        let b_c2: i64 = sc(s2, p2, 3)
+        if a_i1 + a_c1 < b_i1 {
+            append_merge(&m, 1, a_i1, a_c1, a_i2, a_c2, b_i2 - b_i1 + a_i1, a_c1)
+            p1 = p1 + 1
+            continue
+        }
+        if b_i1 + b_c1 < a_i1 {
+            append_merge(&m, 2, b_i1, b_c1, a_i2 - a_i1 + b_i1, b_c1, b_i2, b_c2)
+            p2 = p2 + 1
+            continue
+        }
+        if level == LEVEL_MINIMAL || a_i1 != b_i1 || a_c1 != b_c1 || a_c2 != b_c2 || !merge_cmp_lines(e1, a_i2, e2, b_i2, a_c2) {
+            // conflict
+            let off: i64 = a_i1 - b_i1
+            let ffo: i64 = off + a_c1 - b_c1
+            var i0: i64 = a_i1
+            var i1: i64 = a_i2
+            var i2: i64 = b_i2
+            if off > 0 {
+                i0 = i0 - off
+                i1 = i1 - off
+            } else {
+                i2 = i2 + off
+            }
+            var chg0: i64 = a_i1 + a_c1 - i0
+            var chg1: i64 = a_i2 + a_c2 - i1
+            var chg2: i64 = b_i2 + b_c2 - i2
+            if ffo < 0 {
+                chg0 = chg0 - ffo
+                chg1 = chg1 - ffo
+            } else {
+                chg2 = chg2 + ffo
+            }
+            append_merge(&m, 0, i0, chg0, i1, chg1, i2, chg2)
+        }
+        let end1: i64 = a_i1 + a_c1
+        let end2: i64 = b_i1 + b_c1
+        if end1 >= end2 {
+            p2 = p2 + 1
+        }
+        if end2 >= end1 {
+            p1 = p1 + 1
+        }
+    }
+    while p1 < n1 {
+        let a_i1: i64 = sc(s1, p1, 0)
+        append_merge(&m, 1, a_i1, sc(s1, p1, 2), sc(s1, p1, 1), sc(s1, p1, 3), a_i1 + (*e2).b.n - (*e2).a.n, sc(s1, p1, 2))
+        p1 = p1 + 1
+    }
+    while p2 < n2 {
+        let b_i1: i64 = sc(s2, p2, 0)
+        append_merge(&m, 2, b_i1, sc(s2, p2, 2), b_i1 + (*e1).b.n - (*e1).a.n, sc(s2, p2, 2), sc(s2, p2, 1), sc(s2, p2, 3))
+        p2 = p2 + 1
+    }
+    if style == STYLE_ZDIFF3 {
+        refine_zdiff3_conflicts(e1, e2, &m)
+    } else if LEVEL_ZEALOUS <= level {
+        refine_conflicts(e1, e2, &m)
+        simplify_non_conflicts(e1, &m, LEVEL_ZEALOUS < level)
+    }
+    fill_merge_buffer(e1, e2, o, &m, out)
+    var conflicts: i64 = 0
+    var k: i64 = 0
+    let cnt: i64 = mcount(&m)
+    while k < cnt {
+        if mg(&m, k, M_MODE) == 0 {
+            conflicts = conflicts + 1
+        }
+        k = k + 1
+    }
+    vec_free[i64](&m)
+    return conflicts
+}
+
+// Three-way merge of `ours` and `theirs` against their common ancestor `base`.
+fn merge(o: *mut Opts, bp: u64, bn: usize, op: u64, on: usize, tp: u64, tn: usize) -> Result {
+    var r: Result = Result { out: rt.buf_new(), conflicts: 0 }
+    var e1: Env = Env { a: side_new(), b: side_new() }
+    var e2: Env = Env { a: side_new(), b: side_new() }
+    do_diff(&e1, bp, bn, op, on)
+    do_diff(&e2, bp, bn, tp, tn)
+    change_compact(&e1.a, &e1.b)
+    change_compact(&e1.b, &e1.a)
+    change_compact(&e2.a, &e2.b)
+    change_compact(&e2.b, &e2.a)
+    var s1: Vec[i64] = vec_new[i64]()
+    var s2: Vec[i64] = vec_new[i64]()
+    build_script(&e1, &s1)
+    build_script(&e2, &s2)
+    if vec_len[i64](&s1) == 0 {
+        rt.buf_push_bytes(&r.out, tp, tn)
+    } else if vec_len[i64](&s2) == 0 {
+        rt.buf_push_bytes(&r.out, op, on)
+    } else {
+        r.conflicts = do_merge(&e1, &s1, &e2, &s2, o, &r.out)
+    }
+    vec_free[i64](&s1)
+    vec_free[i64](&s2)
+    env_free(&e1)
+    env_free(&e2)
+    return r
+}

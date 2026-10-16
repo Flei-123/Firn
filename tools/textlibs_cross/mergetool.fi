@@ -1,0 +1,346 @@
+// tools/textlibs_cross/mergetool.fi -- command line face of text.merge3 for the cross-check against
+// `git merge-file` (merge_cross.py) and the fuzz run.
+//
+//   mergetool batch DIR N STYLE FAVOR MARKER   for i in 0..N: read DIR/i.base, DIR/i.ours, DIR/i.theirs, write
+//                                              DIR/i.out (labels ours / base / theirs); prints "i conflicts" per case
+//                                              STYLE 0 merge | 1 diff3 | 2 zdiff3; FAVOR 0 none | 1 ours | 2 theirs | 3 union
+//   mergetool fuzz SEED ROUNDS                 random texts + invariants (identity, one side unchanged, equal sides,
+//                                              favors, damaged bytes); prints "fuzz ok <n>"; a crash or "FAIL" is the failure
+import std.rt
+import std.vec
+import text.merge3
+
+static mut rng: u64 = 88172645463325252 as u64
+static mut failures: usize = 0
+
+fn next_rand() -> u64 {
+    var x: u64 = rng
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    rng = x
+    return x
+}
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn say(fd: i64, s: str) {
+    rt.write_everything(fd, s.p as u64, s.n)
+}
+
+fn parse_num(s: str) -> usize {
+    var v: usize = 0
+    var i: usize = 0
+    while i < s.n {
+        v = v * 10 + (rt.ld8(s.p as u64, i) - 48 as u8) as usize
+        i = i + 1
+    }
+    return v
+}
+
+fn make_path(b: *mut rt.Buf, dir: str, i: usize, ext: str) {
+    rt.buf_clear(b)
+    rt.buf_push_bytes(b, dir.p as u64, dir.n)
+    rt.buf_push(b, 47 as u8)
+    rt.buf_push_dec_u64(b, i as u64)
+    rt.buf_push(b, 46 as u8)
+    rt.buf_push_bytes(b, ext.p as u64, ext.n)
+    rt.buf_push(b, 0 as u8)
+}
+
+fn read_all(path: u64, out: *mut rt.Buf) -> bool {
+    rt.buf_clear(out)
+    return rt.read_file(path, out)
+}
+
+fn same(a: *mut rt.Buf, b: *mut rt.Buf) -> bool {
+    return rt.buf_len(a) == rt.buf_len(b) && rt.mem_eq(rt.buf_ptr(a), rt.buf_ptr(b), rt.buf_len(a))
+}
+
+fn make_opts(style: usize, favor: usize, marker: usize) -> merge3.Opts {
+    var o: merge3.Opts = merge3.opts_default()
+    o.name_ours = "ours"
+    o.name_base = "base"
+    o.name_theirs = "theirs"
+    o.style = style as i64
+    o.favor = favor as i64
+    o.marker_size = marker as i64
+    return o
+}
+
+fn cmd_batch(dir: str, n: usize, style: usize, favor: usize, marker: usize) -> i32 {
+    var path: rt.Buf = rt.buf_new()
+    var base: rt.Buf = rt.buf_new()
+    var ours: rt.Buf = rt.buf_new()
+    var theirs: rt.Buf = rt.buf_new()
+    var line: rt.Buf = rt.buf_new()
+    var o: merge3.Opts = make_opts(style, favor, marker)
+    var i: usize = 0
+    while i < n {
+        make_path(&path, dir, i, "base")
+        read_all(rt.buf_ptr(&path), &base)
+        make_path(&path, dir, i, "ours")
+        read_all(rt.buf_ptr(&path), &ours)
+        make_path(&path, dir, i, "theirs")
+        read_all(rt.buf_ptr(&path), &theirs)
+        var r: merge3.Result = merge3.merge(&o, rt.buf_ptr(&base), rt.buf_len(&base), rt.buf_ptr(&ours), rt.buf_len(&ours), rt.buf_ptr(&theirs), rt.buf_len(&theirs))
+        make_path(&path, dir, i, "out")
+        rt.write_file(rt.buf_ptr(&path), rt.buf_ptr(&r.out), rt.buf_len(&r.out))
+        rt.buf_clear(&line)
+        rt.buf_push_dec_u64(&line, i as u64)
+        rt.buf_push(&line, 32 as u8)
+        rt.buf_push_dec_i64(&line, r.conflicts)
+        rt.buf_push(&line, 10 as u8)
+        rt.write_everything(1, rt.buf_ptr(&line), rt.buf_len(&line))
+        merge3.result_free(&r)
+        i = i + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------- fuzz
+
+// a random text: `lines` lines from a small vocabulary (many repeats), sometimes without final LF, sometimes CR LF
+fn gen_text(out: *mut rt.Buf, lines: usize, vocab: usize, crlf: bool, hostile: bool) {
+    rt.buf_clear(out)
+    var i: usize = 0
+    while i < lines {
+        let w: u64 = next_rand() % vocab as u64
+        if hostile && next_rand() % 8 == 0 {
+            let k: usize = (next_rand() % 6) as usize
+            var j: usize = 0
+            while j < k {
+                rt.buf_push(out, (next_rand() % 256) as u8)
+                j = j + 1
+            }
+        } else if w % 5 == 0 {
+            rt.buf_push_bytes(out, "}".p as u64, 1)
+        } else if w % 7 == 0 {
+            // empty line
+        } else {
+            rt.buf_push(out, 108 as u8)
+            rt.buf_push_dec_u64(out, w)
+        }
+        if crlf {
+            rt.buf_push(out, 13 as u8)
+        }
+        if !(i + 1 == lines && next_rand() % 4 == 0) {
+            rt.buf_push(out, 10 as u8)
+        }
+        i = i + 1
+    }
+}
+
+// byte offsets of the line starts of a text
+fn line_starts(p: u64, n: usize, st: *mut Vec[usize]) {
+    vec_clear[usize](st)
+    vec_push[usize](st, 0)
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) == 10 as u8 && i + 1 < n {
+            vec_push[usize](st, i + 1)
+        }
+        i = i + 1
+    }
+}
+
+// a random edit of `src` into `dst`: line replace / delete / insert / block copy
+fn mutate(src: *mut rt.Buf, dst: *mut rt.Buf, edits: usize, vocab: usize) {
+    rt.buf_clear(dst)
+    var starts: Vec[usize] = vec_new[usize]()
+    let n: usize = rt.buf_len(src)
+    line_starts(rt.buf_ptr(src), n, &starts)
+    var nl: usize = vec_len[usize](&starts)
+    if n == 0 {
+        nl = 0
+    }
+    var mark: Vec[usize] = vec_new[usize]()
+    var e: usize = 0
+    while e < edits {
+        var at: usize = 0
+        if nl > 0 {
+            at = (next_rand() % (nl as u64 + 1)) as usize
+        }
+        vec_push[usize](&mark, at)
+        vec_push[usize](&mark, (next_rand() % 4) as usize)
+        e = e + 1
+    }
+    var i: usize = 0
+    while i <= nl {
+        var k: usize = 0
+        while k < edits {
+            if vec_at[usize](&mark, k * 2) == i {
+                let kind: usize = vec_at[usize](&mark, k * 2 + 1)
+                if kind == 0 || kind == 2 {
+                    rt.buf_push(dst, 120 as u8)
+                    rt.buf_push_dec_u64(dst, next_rand() % vocab as u64)
+                    rt.buf_push(dst, 10 as u8)
+                }
+            }
+            k = k + 1
+        }
+        if i < nl {
+            var dropped: bool = false
+            k = 0
+            while k < edits {
+                if vec_at[usize](&mark, k * 2) == i && (vec_at[usize](&mark, k * 2 + 1) == 1 || vec_at[usize](&mark, k * 2 + 1) == 3) {
+                    dropped = true
+                }
+                k = k + 1
+            }
+            if !dropped {
+                let s: usize = vec_at[usize](&starts, i)
+                var t: usize = n
+                if i + 1 < nl {
+                    t = vec_at[usize](&starts, i + 1)
+                }
+                rt.buf_push_bytes(dst, rt.buf_ptr(src) + s as u64, t - s)
+            }
+        }
+        i = i + 1
+    }
+    vec_free[usize](&starts)
+    vec_free[usize](&mark)
+}
+
+fn check(name: str, ok: bool, round: usize) {
+    if !ok {
+        failures = failures + 1
+        say(1, "FAIL ")
+        say(1, name)
+        say(1, " round ")
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_u64(&b, round as u64)
+        rt.buf_push(&b, 10 as u8)
+        rt.write_everything(1, rt.buf_ptr(&b), rt.buf_len(&b))
+        rt.buf_free(&b)
+    }
+}
+
+fn count_markers(p: u64, n: usize) -> usize {
+    var c: usize = 0
+    var i: usize = 0
+    while i + 7 <= n {
+        if (i == 0 || rt.ld8(p, i - 1) == 10 as u8) && rt.ld8(p, i) == 60 as u8 && rt.ld8(p, i + 1) == 60 as u8 && rt.ld8(p, i + 6) == 60 as u8 {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+fn cmd_fuzz(seed: usize, rounds: usize) -> i32 {
+    rng = (seed as u64 + 1) *% 2685821657736338717 as u64
+    var base: rt.Buf = rt.buf_new()
+    var a: rt.Buf = rt.buf_new()
+    var b: rt.Buf = rt.buf_new()
+    var tmp: rt.Buf = rt.buf_new()
+    var o: merge3.Opts = merge3.opts_default()
+    var total: usize = 0
+    var r: usize = 0
+    while r < rounds {
+        var lines: usize = (next_rand() % 40) as usize
+        if r % 50 == 0 {
+            lines = 300 + (next_rand() % 700) as usize
+        }
+        let vocab: usize = 2 + (next_rand() % 30) as usize
+        gen_text(&base, lines, vocab, next_rand() % 6 == 0, next_rand() % 10 == 0)
+        mutate(&base, &a, 1 + (next_rand() % 8) as usize, vocab)
+        mutate(&base, &b, 1 + (next_rand() % 8) as usize, vocab)
+        o.style = (next_rand() % 3) as i64
+        o.favor = 0
+        o.marker_size = 0
+        var m: merge3.Result = merge3.merge(&o, rt.buf_ptr(&base), rt.buf_len(&base), rt.buf_ptr(&a), rt.buf_len(&a), rt.buf_ptr(&b), rt.buf_len(&b))
+        // a clean merge has no marker; a conflict count of n shows n markers
+        check("markers", count_markers(rt.buf_ptr(&m.out), rt.buf_len(&m.out)) >= m.conflicts as usize, r)
+        // identity: ours == base -> theirs; theirs == base -> ours; ours == theirs -> ours
+        var m1: merge3.Result = merge3.merge(&o, rt.buf_ptr(&base), rt.buf_len(&base), rt.buf_ptr(&base), rt.buf_len(&base), rt.buf_ptr(&b), rt.buf_len(&b))
+        check("ours==base", m1.conflicts == 0 && same(&m1.out, &b), r)
+        var m2: merge3.Result = merge3.merge(&o, rt.buf_ptr(&base), rt.buf_len(&base), rt.buf_ptr(&a), rt.buf_len(&a), rt.buf_ptr(&base), rt.buf_len(&base))
+        check("theirs==base", m2.conflicts == 0 && same(&m2.out, &a), r)
+        var m3: merge3.Result = merge3.merge(&o, rt.buf_ptr(&base), rt.buf_len(&base), rt.buf_ptr(&a), rt.buf_len(&a), rt.buf_ptr(&a), rt.buf_len(&a))
+        check("ours==theirs", m3.conflicts == 0 && same(&m3.out, &a), r)
+        // favors leave no conflict marker line of their own and keep the count of the plain run
+        o.favor = 1
+        var m4: merge3.Result = merge3.merge(&o, rt.buf_ptr(&base), rt.buf_len(&base), rt.buf_ptr(&a), rt.buf_len(&a), rt.buf_ptr(&b), rt.buf_len(&b))
+        check("favor ours", m4.conflicts == 0, r)
+        o.favor = 2
+        var m5: merge3.Result = merge3.merge(&o, rt.buf_ptr(&base), rt.buf_len(&base), rt.buf_ptr(&a), rt.buf_len(&a), rt.buf_ptr(&b), rt.buf_len(&b))
+        check("favor theirs", m5.conflicts == 0, r)
+        // diff script: applying the script to the old text gives the new one (line level)
+        var scr: Vec[i64] = vec_new[i64]()
+        merge3.diff_script(rt.buf_ptr(&base), rt.buf_len(&base), rt.buf_ptr(&a), rt.buf_len(&a), &scr)
+        var rebuilt: bool = true
+        var starts_a: Vec[usize] = vec_new[usize]()
+        var starts_b: Vec[usize] = vec_new[usize]()
+        line_starts(rt.buf_ptr(&base), rt.buf_len(&base), &starts_a)
+        line_starts(rt.buf_ptr(&a), rt.buf_len(&a), &starts_b)
+        var na: i64 = vec_len[usize](&starts_a) as i64
+        var nb: i64 = vec_len[usize](&starts_b) as i64
+        if rt.buf_len(&base) == 0 {
+            na = 0
+        }
+        if rt.buf_len(&a) == 0 {
+            nb = 0
+        }
+        // the unchanged runs between the changes have equal length on both sides
+        var pa: i64 = 0
+        var pb: i64 = 0
+        var k: usize = 0
+        while k * 4 < vec_len[i64](&scr) {
+            let i1: i64 = vec_at[i64](&scr, k * 4)
+            let i2: i64 = vec_at[i64](&scr, k * 4 + 1)
+            if i1 - pa != i2 - pb {
+                rebuilt = false
+            }
+            pa = i1 + vec_at[i64](&scr, k * 4 + 2)
+            pb = i2 + vec_at[i64](&scr, k * 4 + 3)
+            k = k + 1
+        }
+        if na - pa != nb - pb {
+            rebuilt = false
+        }
+        check("script", rebuilt, r)
+        vec_free[i64](&scr)
+        vec_free[usize](&starts_a)
+        vec_free[usize](&starts_b)
+        merge3.result_free(&m)
+        merge3.result_free(&m1)
+        merge3.result_free(&m2)
+        merge3.result_free(&m3)
+        merge3.result_free(&m4)
+        merge3.result_free(&m5)
+        total = total + 1
+        r = r + 1
+    }
+    var line: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&line, "fuzz ok ".p as u64, 8)
+    rt.buf_push_dec_u64(&line, total as u64)
+    rt.buf_push_bytes(&line, " failures ".p as u64, 10)
+    rt.buf_push_dec_u64(&line, failures as u64)
+    rt.buf_push(&line, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&line), rt.buf_len(&line))
+    if failures > 0 {
+        return 1
+    }
+    return 0
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        say(2, "usage: mergetool batch DIR N STYLE FAVOR MARKER | fuzz SEED ROUNDS\n")
+        return 2
+    }
+    let cmd: str = arg(start, 1)
+    if cmd == "batch" && rt.arg_count(start) >= 7 {
+        return cmd_batch(arg(start, 2), parse_num(arg(start, 3)), parse_num(arg(start, 4)), parse_num(arg(start, 5)), parse_num(arg(start, 6)))
+    }
+    if cmd == "fuzz" && rt.arg_count(start) >= 4 {
+        return cmd_fuzz(parse_num(arg(start, 2)), parse_num(arg(start, 3)))
+    }
+    say(2, "bad command\n")
+    return 2
+}

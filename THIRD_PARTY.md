@@ -52,3 +52,9 @@ The algorithms of xxHash (BSD-2-Clause, Yann Collet) are re-written in
 `lib/compress/common.fi`. The xz BCJ filters follow the published behaviour of
 liblzma's simple filters (public domain, Lasse Collin). `docs/COMPRESSION.md`
 says what each part was held against.
+
+`lib/text/merge3.fi` re-writes the algorithms of the xdiff library of git
+(Myers diff with its heuristics, record clean-up, change compaction, the
+three-way merge of xmerge.c; LibXDiff, (C) Davide Libenzi, LGPL-2.1-or-later)
+in Firn, so that its output equals `git merge-file` byte for byte. No C source
+is included. `tools/textlibs_cross/` holds the proof against git.

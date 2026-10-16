@@ -23,7 +23,7 @@ tool, work, cases, seed, algo, ctx = sys.argv[1], sys.argv[2], int(sys.argv[3]),
 rnd = random.Random(seed)
 
 VOCAB = ["", "a", "b", "c", "}", "{", "int x;", "return 0;", "  foo();", "\tbar();", "x = 1", "# comment",
-         "café", "üñi", "-- dash", "+ plus", "@@ at", " space", "\\ back", "end"]
+         "café", "x\u00f1i", "-- dash", "+ plus", "@@ at", " space", "\\ back", "end"]
 
 
 def rand_line():
