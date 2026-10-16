@@ -25,12 +25,31 @@ import photo.meta
 import photo.align
 import photo.filter
 import photo.merge
+import photo.par
 
 export {
-    FocusOpts, focus_default, focus_legacy, plan_focus, focus_stack, pick_ref,
+    FocusOpts, focus_default, focus_legacy, plan_focus, focus_stack, pick_ref, fallback_frac, fallback_count, fallback_global_count,
 }
 
 const MAXLEV: i32 = 5
+
+// Statistics of the safety net of the LAST focus_stack call (see `safety_net`): share of the image that fell back to
+// the reference frame, and how many calls (since start) used any fallback / the global one.
+static mut fb_frac: f32 = 0.0f
+static mut fb_calls: i32 = 0
+static mut fb_global: i32 = 0
+
+fn fallback_frac() -> f32 {
+    return fb_frac
+}
+
+fn fallback_count() -> i32 {
+    return fb_calls
+}
+
+fn fallback_global_count() -> i32 {
+    return fb_global
+}
 
 struct FocusOpts {
     ref_idx: i32,
@@ -48,12 +67,19 @@ struct FocusOpts {
     ref_boost: f32, // weight factor of the reference frame (>1: other frames must be clearly sharper to contribute)
     noise_s: f32, // noise model of the frames (variance = s * value + o) for the noise floor, 0 = none
     noise_o: f32,
+    noise_k: f32, // scale of the noise floor that is subtracted from the sharpness energy (calibration of the model)
+    avg_from: i32, // pyramid levels >= this average all consistent frames (noise) instead of picking the sharpest; 99 = off
+    avg_ref_w: f32, // weight of the reference frame in that average (others: their consistency, 0..1)
+    net: i32, // safety net: blend back to the reference frame where the stack is blurrier / deviates (ghost, halo, fringe)
+    net_tol: f32, // tolerance of the low-pass deviation (1 = 20 % relative + noise) before the reference takes over
+    warp_cubic: i32, // frames are warped onto the reference with a Catmull-Rom kernel (1) instead of bilinear (0): keeps detail
 }
 
 fn focus_default() -> FocusOpts {
     return FocusOpts {
         ref_idx: -1, power: 4.0f, energy_sigma: 1.5f, align_blur: 1.2f,
         one_map: 1, base_ref: 1, norm_expo: 1, consist: 1, auto_ref: 2, ref_floor: 0.0f, consist_tau: 0.45f, ref_boost: 4.0f, noise_s: 0.0f, noise_o: 0.0f,
+        noise_k: 1.0f, avg_from: 99, avg_ref_w: 1.0f, net: 1, net_tol: 1.0f, warp_cubic: 0,
     }
 }
 
@@ -65,6 +91,7 @@ fn focus_legacy() -> FocusOpts {
     o.norm_expo = 0
     o.consist = 0
     o.auto_ref = 0
+    o.net = 0
     return o
 }
 
@@ -145,6 +172,29 @@ fn up_sample(src: *mut image.Image, c: i32, x: i32, y: i32) -> f32 {
     return image.img_sample(src, c, ((x as f32) + 0.5f) * 0.5f - 0.5f, ((y as f32) + 0.5f) * 0.5f - 0.5f)
 }
 
+struct LapCtx {
+    a: *mut image.Image,
+    up: *mut image.Image,
+    d: *mut image.Image,
+}
+
+fn lap_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut LapCtx = ctx as *mut LapCtx
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < (*(*k).a).w {
+            var c: i32 = 0
+            while c < 3 {
+                image.img_set((*k).d, c, x, y, image.img_get((*k).a, c, x, y) - up_sample((*k).up, c, x, y))
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
 // Laplacian pyramid: l[0..n-2] band-pass, l[n-1] the low-pass residual.
 fn lap_build(im: *mut image.Image, levels: i32) -> Lap {
     var g: [image.Image; 5] = [zero_im(); 5]
@@ -159,19 +209,8 @@ fn lap_build(im: *mut image.Image, levels: i32) -> Lap {
     while k < n - 1 {
         let a: *mut image.Image = &g[k as usize]
         var d: image.Image = image.img_new((*a).w, (*a).h, 3)
-        var c: i32 = 0
-        while c < 3 {
-            var y: i32 = 0
-            while y < (*a).h {
-                var x: i32 = 0
-                while x < (*a).w {
-                    image.img_set(&d, c, x, y, image.img_get(a, c, x, y) - up_sample(&g[(k + 1) as usize], c, x, y))
-                    x = x + 1
-                }
-                y = y + 1
-            }
-            c = c + 1
-        }
+        var lc: LapCtx = LapCtx { a: a, up: &g[(k + 1) as usize], d: &d }
+        par.rows((*a).h, 8, lap_rows, (&lc) as u64)
         p.l[k as usize] = d
         k = k + 1
     }
@@ -184,64 +223,144 @@ fn lap_build(im: *mut image.Image, levels: i32) -> Lap {
     return p
 }
 
-// Gaussian smoothed |luma| of a band-pass level, as sharpness energy.
-fn energy_of(band: *mut image.Image, sigma: f32) -> image.Image {
-    var e: image.Image = image.img_new((*band).w, (*band).h, 1)
-    var y: i32 = 0
-    while y < (*band).h {
+struct EnergyCtx {
+    band: *mut image.Image,
+    e: *mut image.Image,
+}
+
+fn energy_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut EnergyCtx = ctx as *mut EnergyCtx
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
         var x: i32 = 0
-        while x < (*band).w {
-            let l: f32 = 0.299f * image.img_get(band, 0, x, y) + 0.587f * image.img_get(band, 1, x, y) + 0.114f * image.img_get(band, 2, x, y)
-            image.img_set(&e, 0, x, y, image.fmaxf(l, 0.0f - l))
+        while x < (*(*k).band).w {
+            let l: f32 = 0.299f * image.img_get((*k).band, 0, x, y) + 0.587f * image.img_get((*k).band, 1, x, y) + 0.114f * image.img_get((*k).band, 2, x, y)
+            image.img_set((*k).e, 0, x, y, image.fmaxf(l, 0.0f - l))
             x = x + 1
         }
         y = y + 1
     }
+}
+
+// Gaussian smoothed |luma| of a band-pass level, as sharpness energy.
+fn energy_of(band: *mut image.Image, sigma: f32) -> image.Image {
+    var e: image.Image = image.img_new((*band).w, (*band).h, 1)
+    var k: EnergyCtx = EnergyCtx { band: band, e: &e }
+    par.rows((*band).h, 8, energy_rows, (&k) as u64)
     let s: image.Image = filter.gauss_blur(&e, sigma)
     image.img_free(&e)
     return s
 }
 
-fn warp_to_ref(af: *mut image.Image, fl: *mut align.Flow) -> image.Image {
-    var d: image.Image = image.img_new((*af).w, (*af).h, 3)
-    var y: i32 = 0
-    while y < (*af).h {
+// Catmull-Rom weights for the fraction t
+fn cubic_w(t: f32, w: *mut [f32; 4]) {
+    (*w)[0] = ((0.0f - 0.5f * t + 1.0f) * t - 0.5f) * t
+    (*w)[1] = (1.5f * t - 2.5f) * t * t + 1.0f
+    (*w)[2] = ((0.0f - 1.5f * t + 2.0f) * t + 0.5f) * t
+    (*w)[3] = (0.5f * t - 0.5f) * t * t
+}
+
+fn sample_cubic(im: *mut image.Image, c: i32, x: f32, y: f32) -> f32 {
+    var fx: f32 = x
+    var fy: f32 = y
+    if fx < 0.0f { fx = 0.0f }
+    if fy < 0.0f { fy = 0.0f }
+    let mx: f32 = ((*im).w - 1) as f32
+    let my: f32 = ((*im).h - 1) as f32
+    if fx > mx { fx = mx }
+    if fy > my { fy = my }
+    let x0: i32 = fx as i32
+    let y0: i32 = fy as i32
+    var wx: [f32; 4] = [0.0f; 4]
+    var wy: [f32; 4] = [0.0f; 4]
+    cubic_w(fx - (x0 as f32), &wx)
+    cubic_w(fy - (y0 as f32), &wy)
+    var acc: f32 = 0.0f
+    var j: i32 = 0
+    while j < 4 {
+        var row: f32 = 0.0f
+        var i: i32 = 0
+        while i < 4 {
+            row = row + wx[i as usize] * image.img_getc(im, c, x0 - 1 + i, y0 - 1 + j)
+            i = i + 1
+        }
+        acc = acc + wy[j as usize] * row
+        j = j + 1
+    }
+    return acc
+}
+
+struct WarpCtx {
+    af: *mut image.Image,
+    fl: *mut align.Flow,
+    d: *mut image.Image,
+    cubic: bool,
+}
+
+fn warp_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut WarpCtx = ctx as *mut WarpCtx
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
         var x: i32 = 0
-        while x < (*af).w {
+        while x < (*(*k).d).w {
             var dx: f32 = 0.0f
             var dy: f32 = 0.0f
-            align.flow_at(fl, x as f32, y as f32, &dx, &dy)
+            align.flow_at((*k).fl, x as f32, y as f32, &dx, &dy)
             var c: i32 = 0
             while c < 3 {
-                image.img_set(&d, c, x, y, image.img_sample(af, c, (x as f32) + dx, (y as f32) + dy))
+                if (*k).cubic {
+                    image.img_set((*k).d, c, x, y, sample_cubic((*k).af, c, (x as f32) + dx, (y as f32) + dy))
+                } else {
+                    image.img_set((*k).d, c, x, y, image.img_sample((*k).af, c, (x as f32) + dx, (y as f32) + dy))
+                }
                 c = c + 1
             }
             x = x + 1
         }
         y = y + 1
     }
+}
+
+fn warp_to_ref(af: *mut image.Image, fl: *mut align.Flow, cubic: bool) -> image.Image {
+    var d: image.Image = image.img_new((*af).w, (*af).h, 3)
+    var k: WarpCtx = WarpCtx { af: af, fl: fl, d: &d, cubic: cubic }
+    par.rows((*af).h, 8, warp_rows, (&k) as u64)
     return d
 }
 
 // One level of the reconstruction: weighted band-pass sum / weight (+ the upsampled coarser result).
-fn recon_level(a: *mut image.Image, ws: *mut image.Image, prev: *mut image.Image, has_prev: bool) -> image.Image {
-    var nxt: image.Image = image.img_new((*a).w, (*a).h, 3)
-    var y: i32 = 0
-    while y < (*a).h {
+struct ReconCtx {
+    a: *mut image.Image,
+    ws: *mut image.Image,
+    prev: *mut image.Image,
+    has_prev: bool,
+    nxt: *mut image.Image,
+}
+
+fn recon_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut ReconCtx = ctx as *mut ReconCtx
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
         var x: i32 = 0
-        while x < (*a).w {
-            let wv: f32 = image.img_get(ws, 0, x, y)
+        while x < (*(*k).a).w {
+            let wv: f32 = image.img_get((*k).ws, 0, x, y)
             var c: i32 = 0
             while c < 3 {
-                var v: f32 = image.img_get(a, c, x, y) / wv
-                if has_prev { v = v + up_sample(prev, c, x, y) }
-                image.img_set(&nxt, c, x, y, v)
+                var v: f32 = image.img_get((*k).a, c, x, y) / wv
+                if (*k).has_prev { v = v + up_sample((*k).prev, c, x, y) }
+                image.img_set((*k).nxt, c, x, y, v)
                 c = c + 1
             }
             x = x + 1
         }
         y = y + 1
     }
+}
+
+fn recon_level(a: *mut image.Image, ws: *mut image.Image, prev: *mut image.Image, has_prev: bool) -> image.Image {
+    var nxt: image.Image = image.img_new((*a).w, (*a).h, 3)
+    var k: ReconCtx = ReconCtx { a: a, ws: ws, prev: prev, has_prev: has_prev, nxt: &nxt }
+    par.rows((*a).h, 8, recon_rows, (&k) as u64)
     return nxt
 }
 
@@ -382,21 +501,33 @@ fn scale_img(im: *mut image.Image, g: f32) {
     }
 }
 
-fn apply_gain(im: *mut image.Image, gg: *mut image.Image, f: i32) {
-    var y: i32 = 0
-    while y < (*im).h {
+struct GainCtx {
+    im: *mut image.Image,
+    gg: *mut image.Image,
+    f: i32,
+}
+
+fn gain_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut GainCtx = ctx as *mut GainCtx
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
         var x: i32 = 0
-        while x < (*im).w {
-            let g: f32 = image.img_sample(gg, 0, ((x as f32) + 0.5f) / (f as f32) - 0.5f, ((y as f32) + 0.5f) / (f as f32) - 0.5f)
+        while x < (*(*k).im).w {
+            let g: f32 = image.img_sample((*k).gg, 0, ((x as f32) + 0.5f) / ((*k).f as f32) - 0.5f, ((y as f32) + 0.5f) / ((*k).f as f32) - 0.5f)
             var c: i32 = 0
             while c < 3 {
-                image.img_set(im, c, x, y, image.img_get(im, c, x, y) * g)
+                image.img_set((*k).im, c, x, y, image.img_get((*k).im, c, x, y) * g)
                 c = c + 1
             }
             x = x + 1
         }
         y = y + 1
     }
+}
+
+fn apply_gain(im: *mut image.Image, gg: *mut image.Image, f: i32) {
+    var k: GainCtx = GainCtx { im: im, gg: gg, f: f }
+    par.rows((*im).h, 8, gain_rows, (&k) as u64)
 }
 
 // mean RGB of f x f blocks (3 channels)
@@ -548,6 +679,49 @@ fn pick_ref(b: *mut merge.Burst, o: *mut FocusOpts) -> i32 {
     return best
 }
 
+struct WeightCtx {
+    o: *mut FocusOpts,
+    gl: *mut image.Image,
+    gf: i32,
+    cg: *mut image.Image,
+    has_c: bool,
+    is_ref: bool,
+    sq: bool,
+    e0: *mut image.Image,
+    e1: *mut image.Image,
+    wm: *mut image.Image,
+}
+
+fn weight_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut WeightCtx = ctx as *mut WeightCtx
+    let o: *mut FocusOpts = (*k).o
+    let gf: i32 = (*k).gf
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < (*(*k).wm).w {
+            var s: f32 = image.img_get((*k).e0, 0, x, y) + 2.0f * image.img_sample((*k).e1, 0, ((x as f32) + 0.5f) * 0.5f - 0.5f, ((y as f32) + 0.5f) * 0.5f - 0.5f)
+            if (*o).noise_s > 0.0f || (*o).noise_o > 0.0f {
+                var lum: f32 = image.img_sample((*k).gl, 0, ((x as f32) + 0.5f) / (gf as f32) - 0.5f, ((y as f32) + 0.5f) / (gf as f32) - 0.5f)
+                if lum < 0.0f { lum = 0.0f }
+                s = s - (*o).noise_k * image.sqrtf((*o).noise_s * lum + (*o).noise_o)
+                if s < 0.0f { s = 0.0f }
+            }
+            var ev: f32 = s * 30.0f + 1.0e-3f
+            if (*k).is_ref { ev = ev + 30.0f * (*o).ref_floor }
+            var wt: f32 = ev * ev
+            if (*k).sq { wt = wt * wt }
+            if (*k).is_ref { wt = wt * (*o).ref_boost }
+            if (*k).has_c && !(*k).is_ref {
+                wt = wt * image.img_sample((*k).cg, 0, ((x as f32) + 0.5f) / (gf as f32) - 0.5f, ((y as f32) + 0.5f) / (gf as f32) - 0.5f)
+            }
+            image.img_set((*k).wm, 0, x, y, wt)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
 // weights of one frame for every level (1 channel images, same sizes as the pyramid)
 fn weight_pyr(lp: *mut Lap, levels: i32, o: *mut FocusOpts, gl: *mut image.Image, gf: i32, cg: *mut image.Image, has_c: bool, is_ref: bool) -> Lap {
     var wp: Lap = Lap { n: levels, l: [zero_im(); 5] }
@@ -559,37 +733,36 @@ fn weight_pyr(lp: *mut Lap, levels: i32, o: *mut FocusOpts, gl: *mut image.Image
         var e0: image.Image = energy_of(&(*lp).l[0], (*o).energy_sigma)
         var e1: image.Image = energy_of(&(*lp).l[1], (*o).energy_sigma)
         var wm: image.Image = image.img_new(w0, h0, 1)
-        var y: i32 = 0
-        while y < h0 {
-            var x: i32 = 0
-            while x < w0 {
-                var s: f32 = image.img_get(&e0, 0, x, y) + 2.0f * image.img_sample(&e1, 0, ((x as f32) + 0.5f) * 0.5f - 0.5f, ((y as f32) + 0.5f) * 0.5f - 0.5f)
-                if (*o).noise_s > 0.0f || (*o).noise_o > 0.0f {
-                    var lum: f32 = image.img_sample(gl, 0, ((x as f32) + 0.5f) / (gf as f32) - 0.5f, ((y as f32) + 0.5f) / (gf as f32) - 0.5f)
-                    if lum < 0.0f { lum = 0.0f }
-                    s = s - image.sqrtf((*o).noise_s * lum + (*o).noise_o)
-                    if s < 0.0f { s = 0.0f }
-                }
-                var ev: f32 = s * 30.0f + 1.0e-3f
-                if is_ref { ev = ev + 30.0f * (*o).ref_floor }
-                var wt: f32 = ev * ev
-                if sq { wt = wt * wt }
-                if is_ref { wt = wt * (*o).ref_boost }
-                if has_c && !is_ref {
-                    wt = wt * image.img_sample(cg, 0, ((x as f32) + 0.5f) / (gf as f32) - 0.5f, ((y as f32) + 0.5f) / (gf as f32) - 0.5f)
-                }
-                image.img_set(&wm, 0, x, y, wt)
-                x = x + 1
-            }
-            y = y + 1
-        }
+        var wc: WeightCtx = WeightCtx { o: o, gl: gl, gf: gf, cg: cg, has_c: has_c, is_ref: is_ref, sq: sq, e0: &e0, e1: &e1, wm: &wm }
+        par.rows(h0, 8, weight_rows, (&wc) as u64)
         image.img_free(&e0)
         image.img_free(&e1)
         wp.l[0] = filter.gauss_blur(&wm, 2.0f)
         image.img_free(&wm)
         var k: i32 = 1
         while k < levels {
-            wp.l[k as usize] = down1(&wp.l[(k - 1) as usize])
+            if k >= (*o).avg_from {
+                let wl: *mut image.Image = &(*lp).l[k as usize]
+                var wa: image.Image = image.img_new((*wl).w, (*wl).h, 1)
+                let sc: f32 = (gf as f32) / ((1 << (k as u32)) as f32)
+                var yy: i32 = 0
+                while yy < (*wl).h {
+                    var xx: i32 = 0
+                    while xx < (*wl).w {
+                        var wv: f32 = (*o).avg_ref_w
+                        if !is_ref {
+                            wv = 1.0f
+                            if has_c { wv = image.img_sample(cg, 0, ((xx as f32) + 0.5f) / sc - 0.5f, ((yy as f32) + 0.5f) / sc - 0.5f) }
+                        }
+                        image.img_set(&wa, 0, xx, yy, wv)
+                        xx = xx + 1
+                    }
+                    yy = yy + 1
+                }
+                wp.l[k as usize] = wa
+            } else {
+                wp.l[k as usize] = down1(&wp.l[(k - 1) as usize])
+            }
             k = k + 1
         }
         return wp
@@ -627,37 +800,52 @@ fn weight_pyr(lp: *mut Lap, levels: i32, o: *mut FocusOpts, gl: *mut image.Image
     return wp
 }
 
+struct AccCtx {
+    band: *mut image.Image,
+    wk: *mut image.Image,
+    acc: *mut image.Image,
+    wsum: *mut image.Image,
+    dnum: *mut image.Image,
+    last: bool,
+    first: bool,
+    fi: f32,
+}
+
+fn acc_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut AccCtx = ctx as *mut AccCtx
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < (*(*k).band).w {
+            var wt: f32 = image.img_get((*k).wk, 0, x, y)
+            if (*k).last { wt = 1.0f }
+            var c: i32 = 0
+            while c < 3 {
+                image.img_set((*k).acc, c, x, y, image.img_get((*k).acc, c, x, y) + wt * image.img_get((*k).band, c, x, y))
+                c = c + 1
+            }
+            image.img_set((*k).wsum, 0, x, y, image.img_get((*k).wsum, 0, x, y) + wt)
+            if (*k).first {
+                image.img_set((*k).dnum, 0, x, y, image.img_get((*k).dnum, 0, x, y) + wt * (*k).fi)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
 // Add the Laplacian pyramid `lp` of frame `i` (weights `wp`) to the weighted accumulators.
 fn accumulate_frame(lp: *mut Lap, wp: *mut Lap, i: i32, levels: i32, base_ref: bool, is_ref: bool, acc: *mut Lap, wsum: *mut Lap, dnum: *mut image.Image) {
     var k: i32 = 0
     while k < levels {
         let band: *mut image.Image = &(*lp).l[k as usize]
-        let bw: i32 = (*band).w
-        let bh: i32 = (*band).h
         let last: bool = k == levels - 1
         if last && base_ref && !is_ref {
             k = k + 1
             continue
         }
-        var y: i32 = 0
-        while y < bh {
-            var x: i32 = 0
-            while x < bw {
-                var wt: f32 = image.img_get(&(*wp).l[k as usize], 0, x, y)
-                if last { wt = 1.0f }
-                var c: i32 = 0
-                while c < 3 {
-                    image.img_set(&(*acc).l[k as usize], c, x, y, image.img_get(&(*acc).l[k as usize], c, x, y) + wt * image.img_get(band, c, x, y))
-                    c = c + 1
-                }
-                image.img_set(&(*wsum).l[k as usize], 0, x, y, image.img_get(&(*wsum).l[k as usize], 0, x, y) + wt)
-                if k == 0 {
-                    image.img_set(dnum, 0, x, y, image.img_get(dnum, 0, x, y) + wt * (i as f32))
-                }
-                x = x + 1
-            }
-            y = y + 1
-        }
+        var c: AccCtx = AccCtx { band: band, wk: &(*wp).l[k as usize], acc: &(*acc).l[k as usize], wsum: &(*wsum).l[k as usize], dnum: dnum, last: last, first: k == 0, fi: i as f32 }
+        par.rows((*band).h, 8, acc_rows, (&c) as u64)
         k = k + 1
     }
 }
@@ -673,6 +861,161 @@ fn pyr_levels(w: i32, h: i32) -> i32 {
         lv = lv + 1
     }
     return lv
+}
+
+// ---------------------------------------------------------------- safety net (stack never worse than its reference)
+//
+// The stack is the weighted fusion of aligned frames; when alignment fails (heavy motion), a frame is moving or
+// flickering in a way the consistency map misses, or the fusion simply smears, it can end up WORSE than the single
+// reference frame. No ground truth exists in the app, so the check uses the frames only:
+//   (a) low-pass deviation: |blur(stack) - blur(ref)| per colour channel against 4 % * net_tol of the value + a
+//       noise floor. A good stack keeps the reference's low frequencies (ghosts, halos, colour fringes and a veil
+//       all change them); beyond 2x the tolerance the pixel is taken from the reference.
+//   (b) sharpness: where the reference has real texture (energy > 3x the noise floor) the stack must keep >= 80 %
+//       of its energy (< 60 %: reference). In flat areas the stack must not be NOISIER than the reference (energy
+//       ratio > 1.5: reference); there it is supposed to be smoother.
+// The two confidences are combined (min), smoothed (sigma 2: no seams) and blend stack -> reference per pixel.
+// fallback_frac() = share of pixels with confidence < 0.5; above 60 % the whole frame is the reference
+// (fallback_global_count()).
+
+fn net_energy(im: *mut image.Image) -> image.Image {
+    var l: image.Image = image.img_luma(im)
+    var bl: image.Image = filter.gauss_blur(&l, 1.0f)
+    var e: image.Image = image.img_new((*im).w, (*im).h, 1)
+    var i: i32 = 0
+    let n: i32 = (*im).w * (*im).h
+    while i < n {
+        let a: f32 = *(((l.px) + (i as u64) * (4 as u64)) as *mut f32)
+        let b: f32 = *(((bl.px) + (i as u64) * (4 as u64)) as *mut f32)
+        var d: f32 = a - b
+        if d < 0.0f { d = 0.0f - d }
+        *(((e.px) + (i as u64) * (4 as u64)) as *mut f32) = d
+        i = i + 1
+    }
+    let r: image.Image = filter.gauss_blur(&e, 2.0f)
+    image.img_free(&l)
+    image.img_free(&bl)
+    image.img_free(&e)
+    return r
+}
+
+struct NetCtx {
+    out: *mut image.Image,
+    rf: *mut image.Image,
+    los: *mut image.Image,
+    lor: *mut image.Image,
+    es: *mut image.Image,
+    er: *mut image.Image,
+    lr: *mut image.Image,
+    cm: *mut image.Image,
+    ns: f32,
+    no: f32,
+    tol: f32,
+}
+
+fn net_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut NetCtx = ctx as *mut NetCtx
+    let w: i32 = (*(*k).out).w
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            var lum: f32 = image.img_get((*k).lr, 0, x, y)
+            if lum < 0.0f { lum = 0.0f }
+            let nf: f32 = image.sqrtf((*k).ns * lum + (*k).no)
+            var dev: f32 = 0.0f
+            var ch: i32 = 0
+            while ch < 3 {
+                let a: f32 = image.img_get((*k).los, ch, x, y)
+                let b: f32 = image.img_get((*k).lor, ch, x, y)
+                var d: f32 = a - b
+                if d < 0.0f { d = 0.0f - d }
+                // the low-pass of the reference carries noise of ~ nf / 9 (sigma 2.5); 4 % relative drift is the limit
+                let t: f32 = d / (0.002f + 0.5f * nf + 0.02f * (a + b) * (*k).tol)
+                if t > dev { dev = t }
+                ch = ch + 1
+            }
+            var c1: f32 = 2.0f - dev
+            if c1 < 0.0f { c1 = 0.0f }
+            if c1 > 1.0f { c1 = 1.0f }
+            let er: f32 = image.img_get((*k).er, 0, x, y)
+            let es: f32 = image.img_get((*k).es, 0, x, y)
+            var c2: f32 = 1.0f
+            if er > 3.0f * nf + 1.0e-4f {
+                // textured: the stack must keep the reference's detail
+                c2 = (es / er - 0.6f) / 0.2f
+                if c2 < 0.0f { c2 = 0.0f }
+                if c2 > 1.0f { c2 = 1.0f }
+            } else {
+                // flat: the stack must not be noisier than the reference (fusion that picks noise peaks)
+                c2 = (1.5f - es / (er + 0.5f * nf + 1.0e-5f)) / 0.3f
+                if c2 < 0.0f { c2 = 0.0f }
+                if c2 > 1.0f { c2 = 1.0f }
+            }
+            var c: f32 = c1
+            if c2 < c { c = c2 }
+            image.img_set((*k).cm, 0, x, y, c)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn safety_net(out: *mut image.Image, rf: *mut image.Image, o: *mut FocusOpts) {
+    let w: i32 = (*out).w
+    let h: i32 = (*out).h
+    var los: image.Image = blur3(out, 2.5f)
+    var lor: image.Image = blur3(rf, 2.5f)
+    var es: image.Image = net_energy(out)
+    var er: image.Image = net_energy(rf)
+    var lr: image.Image = image.img_luma(rf)
+    var cm: image.Image = image.img_new(w, h, 1)
+    var k: NetCtx = NetCtx { out: out, rf: rf, los: &los, lor: &lor, es: &es, er: &er, lr: &lr, cm: &cm, ns: (*o).noise_s, no: (*o).noise_o, tol: (*o).net_tol }
+    par.rows(h, 8, net_rows, (&k) as u64)
+    var cb: image.Image = filter.gauss_blur(&cm, 2.0f)
+    var low: i32 = 0
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let c: f32 = image.img_get(&cb, 0, x, y)
+            if c < 0.5f { low = low + 1 }
+            var ch: i32 = 0
+            while ch < 3 {
+                let a: f32 = image.img_get(out, ch, x, y)
+                let b: f32 = image.img_get(rf, ch, x, y)
+                image.img_set(out, ch, x, y, b + (a - b) * c)
+                ch = ch + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    fb_frac = (low as f32) / ((w * h) as f32)
+    if fb_frac > 0.001f { fb_calls = fb_calls + 1 }
+    if fb_frac > 0.6f {
+        fb_global = fb_global + 1
+        y = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                var ch: i32 = 0
+                while ch < 3 {
+                    image.img_set(out, ch, x, y, image.img_get(rf, ch, x, y))
+                    ch = ch + 1
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+    }
+    image.img_free(&los)
+    image.img_free(&lor)
+    image.img_free(&es)
+    image.img_free(&er)
+    image.img_free(&lr)
+    image.img_free(&cm)
+    image.img_free(&cb)
 }
 
 fn focus_stack(b: *mut merge.Burst, o: *mut FocusOpts, out: *mut image.Image, depth: *mut image.Image) {
@@ -727,7 +1070,7 @@ fn focus_stack(b: *mut merge.Burst, o: *mut FocusOpts, out: *mut image.Image, de
             var fl: align.Flow = align.align_flow(&pr, &pa)
             align.pyr_free(&pa)
             image.img_free(&wf)
-            wf = warp_to_ref(&(*b).frames[i as usize], &fl)
+            wf = warp_to_ref(&(*b).frames[i as usize], &fl, (*o).warp_cubic != 0)
             align.flow_free(&fl)
         }
         var gl: image.Image = grid_luma(&wf, gf)
@@ -789,4 +1132,6 @@ fn focus_stack(b: *mut merge.Burst, o: *mut FocusOpts, out: *mut image.Image, de
     image.img_free(&dnum)
     lap_free(&acc)
     lap_free(&wsum)
+    fb_frac = 0.0f
+    if (*o).net != 0 { safety_net(out, &(*b).frames[r as usize], o) }
 }
