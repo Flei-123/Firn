@@ -1,0 +1,1430 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/cal/rrule.fi -- cal.rrule: iCalendar recurrence rules (RFC 5545 section 3.3.10): parse
+// "FREQ=MONTHLY;BYDAY=2TU", write it back, and EXPAND it into occurrences.
+//
+//     import cal.rrule
+//     var r: rrule.Rule = rrule.rule_new()
+//     if rrule.parse("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;COUNT=10", &r) == rrule.E_OK {
+//         var out: Vec[i64] = vec_new[i64]()
+//         rrule.expand(&r, dtstart, 0 - rrule.FAR, rrule.FAR, 1000, &out)   // local seconds
+//         ...
+//     }
+//     rrule.rule_free(&r)
+//
+// TIME IS "LOCAL SECONDS": days since 1970-01-01 * 86400 + second of the day, in the wall clock
+// of DTSTART (floating time). Zone handling (TZID, UTC) belongs to the caller (cal.ical).
+//
+// THE EXPANSION IS PYTHON-DATEUTIL'S. It is the algorithm of `dateutil.rrule.rrule._iter` (year
+// masks, day sets per period, filters, time sets, BYSETPOS, the week number masks with the
+// year-boundary rules), and tools/cal_cross/run.sh holds it against dateutil on thousands of
+// random rules (same occurrence lists, 0 differences). Where RFC 5545 and dateutil disagree,
+// dateutil wins -- it is the de-facto reference.
+//
+// HONEST
+// R1  FREQ YEARLY .. SECONDLY, INTERVAL, COUNT, UNTIL, BYMONTH, BYWEEKNO, BYYEARDAY,
+//     BYMONTHDAY, BYDAY (with the n-th weekday for MONTHLY / YEARLY), BYHOUR, BYMINUTE,
+//     BYSECOND, BYSETPOS, WKST. RSCALE / SKIP (RFC 7529) and unknown X- parts are ignored.
+// R2  BYSECOND 60 (leap second) is refused (range 0..59). Years run from 1 to 9999.
+// R3  UNTIL is compared as local seconds; a UTC "Z" is parsed but not converted (the caller
+//     converts DTSTART and UNTIL to the same clock). A DATE UNTIL means midnight (dateutil).
+// R4  Impossible rules (31 February, ...) end at `max_year` (default 9999) or after
+//     `iter_cap` periods (default 5 000 000): expand then returns S_CAPPED, never hangs.
+// R5  COUNT counts occurrences from DTSTART on, also those before the `from` of a query.
+// R6  DTSTART itself is only an occurrence when the rule produces it (as in dateutil); the
+//     RFC "first instance" rule is applied by cal.ical.
+
+import std.rt
+import std.vec
+import cal.civil
+
+export {
+    Rule, E_OK, E_SYNTAX, E_NO_FREQ, E_RANGE,
+    S_OK, S_BAD_START, S_CAPPED, S_EMPTY_COMBO,
+    YEARLY, MONTHLY, WEEKLY, DAILY, HOURLY, MINUTELY, SECONDLY, FAR,
+    UNTIL_DATE, UNTIL_FLOATING, UNTIL_UTC,
+    rule_new, rule_free, rule_copy, parse, format, expand, expand_set,
+}
+
+const YEARLY: u32 = 0
+const MONTHLY: u32 = 1
+const WEEKLY: u32 = 2
+const DAILY: u32 = 3
+const HOURLY: u32 = 4
+const MINUTELY: u32 = 5
+const SECONDLY: u32 = 6
+
+const E_OK: u32 = 0
+const E_SYNTAX: u32 = 1 // a part without '=', a value that is not a number / date / name
+const E_NO_FREQ: u32 = 2 // no FREQ part
+const E_RANGE: u32 = 3 // a number outside its range (BYMONTH=13, INTERVAL=0, ...)
+
+const S_OK: u32 = 0
+const S_BAD_START: u32 = 1 // DTSTART outside years 1..9999
+const S_CAPPED: u32 = 2 // max_year or iter_cap reached before the rule ended
+const S_EMPTY_COMBO: u32 = 3 // INTERVAL and BYxxx can never match (dateutil: ValueError)
+
+const UNTIL_DATE: u32 = 0
+const UNTIL_FLOATING: u32 = 1
+const UNTIL_UTC: u32 = 2
+
+// An "upper bound" for `expand`: far beyond year 9999.
+const FAR: i64 = 400000000000000
+
+struct Rule {
+    freq: i32, // -1 = not set yet
+    interval: i64,
+    wkst: i32, // 0 = Monday
+    wkst_set: bool,
+    count: i64, // -1 = no COUNT
+    until: i64, // local seconds
+    has_until: bool,
+    until_kind: u32,
+    bysetpos: Vec[i32],
+    bymonth: Vec[i32],
+    byweekno: Vec[i32],
+    byyearday: Vec[i32],
+    bymonthday: Vec[i32],
+    byday_wd: Vec[i32], // weekday 0..6
+    byday_n: Vec[i32], // ordinal of the weekday, 0 = every
+    byhour: Vec[i32],
+    byminute: Vec[i32],
+    bysecond: Vec[i32],
+    max_year: i32,
+    iter_cap: i64,
+}
+
+fn rule_new() -> Rule {
+    return Rule {
+        freq: -1, interval: 1, wkst: 0, wkst_set: false, count: -1, until: 0, has_until: false, until_kind: 1,
+        bysetpos: vec_new[i32](), bymonth: vec_new[i32](), byweekno: vec_new[i32](), byyearday: vec_new[i32](),
+        bymonthday: vec_new[i32](), byday_wd: vec_new[i32](), byday_n: vec_new[i32](), byhour: vec_new[i32](),
+        byminute: vec_new[i32](), bysecond: vec_new[i32](), max_year: 9999, iter_cap: 5000000,
+    }
+}
+
+fn rule_free(r: *mut Rule) {
+    vec_free[i32](&(*r).bysetpos)
+    vec_free[i32](&(*r).bymonth)
+    vec_free[i32](&(*r).byweekno)
+    vec_free[i32](&(*r).byyearday)
+    vec_free[i32](&(*r).bymonthday)
+    vec_free[i32](&(*r).byday_wd)
+    vec_free[i32](&(*r).byday_n)
+    vec_free[i32](&(*r).byhour)
+    vec_free[i32](&(*r).byminute)
+    vec_free[i32](&(*r).bysecond)
+}
+
+fn rule_copy(src: *mut Rule) -> Rule {
+    var d: Rule = rule_new()
+    d.freq = (*src).freq
+    d.interval = (*src).interval
+    d.wkst = (*src).wkst
+    d.wkst_set = (*src).wkst_set
+    d.count = (*src).count
+    d.until = (*src).until
+    d.has_until = (*src).has_until
+    d.until_kind = (*src).until_kind
+    d.max_year = (*src).max_year
+    d.iter_cap = (*src).iter_cap
+    vec_copy[i32](&(*src).bysetpos, &d.bysetpos)
+    vec_copy[i32](&(*src).bymonth, &d.bymonth)
+    vec_copy[i32](&(*src).byweekno, &d.byweekno)
+    vec_copy[i32](&(*src).byyearday, &d.byyearday)
+    vec_copy[i32](&(*src).bymonthday, &d.bymonthday)
+    vec_copy[i32](&(*src).byday_wd, &d.byday_wd)
+    vec_copy[i32](&(*src).byday_n, &d.byday_n)
+    vec_copy[i32](&(*src).byhour, &d.byhour)
+    vec_copy[i32](&(*src).byminute, &d.byminute)
+    vec_copy[i32](&(*src).bysecond, &d.bysecond)
+    return d
+}
+
+// ------------------------------------------------------------------ small helpers
+
+fn vlen(v: *mut Vec[i32]) -> usize {
+    return vec_len[i32](v)
+}
+
+fn vget(v: *mut Vec[i32], i: usize) -> i32 {
+    return vec_at[i32](v, i)
+}
+
+fn vhas(v: *mut Vec[i32], x: i32) -> bool {
+    var i: usize = 0
+    let n: usize = vec_len[i32](v)
+    while i < n {
+        if vec_at[i32](v, i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn sort_uniq(v: *mut Vec[i32]) {
+    vec_sort[i32](v)
+    let n: usize = vec_len[i32](v)
+    if n < 2 {
+        return
+    }
+    var w: usize = 1
+    var i: usize = 1
+    while i < n {
+        if vec_at[i32](v, i) != vec_at[i32](v, w - 1) {
+            vec_set[i32](v, w, vec_at[i32](v, i))
+            w = w + 1
+        }
+        i = i + 1
+    }
+    vec_shorten[i32](v, w)
+}
+
+fn up(c: u8) -> u8 {
+    if c >= 97 as u8 && c <= 122 as u8 {
+        return c - 32 as u8
+    }
+    return c
+}
+
+fn at(s: str, i: usize) -> u8 {
+    return rt.ld8(s.p as u64, i)
+}
+
+// Does s[a..b) equal `lit` ignoring ASCII case?
+fn name_is(s: str, a: usize, b: usize, lit: str) -> bool {
+    if b - a != lit.n {
+        return false
+    }
+    var i: usize = 0
+    while i < lit.n {
+        if up(at(s, a + i)) != up(at(lit, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+// Signed decimal in s[a..b). false on anything else (also on more than 15 digits).
+fn parse_int(s: str, a: usize, b: usize, out: *mut i64) -> bool {
+    var i: usize = a
+    var neg: bool = false
+    if i < b && (at(s, i) == 43 as u8 || at(s, i) == 45 as u8) {
+        neg = at(s, i) == 45 as u8
+        i = i + 1
+    }
+    if i >= b || b - i > 15 {
+        return false
+    }
+    var v: i64 = 0
+    while i < b {
+        let c: u8 = at(s, i)
+        if !is_digit(c) {
+            return false
+        }
+        v = v * 10 + ((c - 48 as u8) as i64)
+        i = i + 1
+    }
+    if neg {
+        v = 0 - v
+    }
+    *out = v
+    return true
+}
+
+fn digits(s: str, a: usize, n: usize, out: *mut i64) -> bool {
+    var v: i64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = at(s, a + i)
+        if !is_digit(c) {
+            return false
+        }
+        v = v * 10 + ((c - 48 as u8) as i64)
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+fn find_byte(s: str, a: usize, b: usize, c: u8) -> usize {
+    var i: usize = a
+    while i < b {
+        if at(s, i) == c {
+            return i
+        }
+        i = i + 1
+    }
+    return b
+}
+
+// "19970902" or "19970902T090000" or "...Z" -> local seconds, kind. false if malformed.
+fn parse_until(s: str, a: usize, b: usize, secs: *mut i64, kind: *mut u32) -> bool {
+    var y: i64 = 0
+    var mo: i64 = 0
+    var d: i64 = 0
+    var h: i64 = 0
+    var mi: i64 = 0
+    var se: i64 = 0
+    if b - a != 8 && b - a != 15 && b - a != 16 {
+        return false
+    }
+    if !digits(s, a, 4, &y) || !digits(s, a + 4, 2, &mo) || !digits(s, a + 6, 2, &d) {
+        return false
+    }
+    var k: u32 = UNTIL_DATE
+    if b - a > 8 {
+        if at(s, a + 8) != 84 as u8 && at(s, a + 8) != 116 as u8 {
+            return false
+        }
+        if !digits(s, a + 9, 2, &h) || !digits(s, a + 11, 2, &mi) || !digits(s, a + 13, 2, &se) {
+            return false
+        }
+        k = UNTIL_FLOATING
+        if b - a == 16 {
+            if up(at(s, a + 15)) != 90 as u8 {
+                return false
+            }
+            k = UNTIL_UTC
+        }
+    }
+    if y < 1 || !civil.valid(y as i32, mo as u32, d as u32) || h > 23 || mi > 59 || se > 59 {
+        return false
+    }
+    *secs = civil.days_from_civil(y as i32, mo as u32, d as u32) * 86400 + h * 3600 + mi * 60 + se
+    *kind = k
+    return true
+}
+
+// A comma list of integers in [lo, hi] (0 refused when `nonzero`) appended to `v`.
+fn parse_list(s: str, a: usize, b: usize, lo: i64, hi: i64, nonzero: bool, v: *mut Vec[i32]) -> u32 {
+    var i: usize = a
+    if a >= b {
+        return E_SYNTAX
+    }
+    while i <= b {
+        var e: usize = find_byte(s, i, b, 44 as u8)
+        var x: i64 = 0
+        if !parse_int(s, i, e, &x) {
+            return E_SYNTAX
+        }
+        if x < lo || x > hi || (nonzero && x == 0) {
+            return E_RANGE
+        }
+        vec_push[i32](v, x as i32)
+        i = e + 1
+    }
+    return E_OK
+}
+
+fn weekday_code(s: str, a: usize) -> i32 {
+    let c1: u8 = up(at(s, a))
+    let c2: u8 = up(at(s, a + 1))
+    if c1 == 77 as u8 && c2 == 79 as u8 { return 0 }
+    if c1 == 84 as u8 && c2 == 85 as u8 { return 1 }
+    if c1 == 87 as u8 && c2 == 69 as u8 { return 2 }
+    if c1 == 84 as u8 && c2 == 72 as u8 { return 3 }
+    if c1 == 70 as u8 && c2 == 82 as u8 { return 4 }
+    if c1 == 83 as u8 && c2 == 65 as u8 { return 5 }
+    if c1 == 83 as u8 && c2 == 85 as u8 { return 6 }
+    return -1
+}
+
+fn parse_byday(s: str, a: usize, b: usize, r: *mut Rule) -> u32 {
+    var i: usize = a
+    if a >= b {
+        return E_SYNTAX
+    }
+    while i <= b {
+        let e: usize = find_byte(s, i, b, 44 as u8)
+        if e - i < 2 {
+            return E_SYNTAX
+        }
+        let wd: i32 = weekday_code(s, e - 2)
+        if wd < 0 {
+            return E_SYNTAX
+        }
+        var n: i64 = 0
+        if e - i > 2 {
+            if !parse_int(s, i, e - 2, &n) {
+                return E_SYNTAX
+            }
+            if n == 0 || n < -53 || n > 53 {
+                return E_RANGE
+            }
+        }
+        vec_push[i32](&(*r).byday_wd, wd)
+        vec_push[i32](&(*r).byday_n, n as i32)
+        i = e + 1
+    }
+    return E_OK
+}
+
+fn apply_part(r: *mut Rule, s: str, na: usize, nb: usize, va: usize, vb: usize) -> u32 {
+    var x: i64 = 0
+    if name_is(s, na, nb, "FREQ") {
+        if name_is(s, va, vb, "YEARLY") { (*r).freq = 0 }
+        else if name_is(s, va, vb, "MONTHLY") { (*r).freq = 1 }
+        else if name_is(s, va, vb, "WEEKLY") { (*r).freq = 2 }
+        else if name_is(s, va, vb, "DAILY") { (*r).freq = 3 }
+        else if name_is(s, va, vb, "HOURLY") { (*r).freq = 4 }
+        else if name_is(s, va, vb, "MINUTELY") { (*r).freq = 5 }
+        else if name_is(s, va, vb, "SECONDLY") { (*r).freq = 6 }
+        else { return E_SYNTAX }
+        return E_OK
+    }
+    if name_is(s, na, nb, "INTERVAL") {
+        if !parse_int(s, va, vb, &x) { return E_SYNTAX }
+        if x < 1 || x > 1000000 { return E_RANGE }
+        (*r).interval = x
+        return E_OK
+    }
+    if name_is(s, na, nb, "COUNT") {
+        if !parse_int(s, va, vb, &x) { return E_SYNTAX }
+        if x < 0 || x > 1000000000 { return E_RANGE }
+        (*r).count = x
+        return E_OK
+    }
+    if name_is(s, na, nb, "UNTIL") {
+        if !parse_until(s, va, vb, &(*r).until, &(*r).until_kind) { return E_SYNTAX }
+        (*r).has_until = true
+        return E_OK
+    }
+    if name_is(s, na, nb, "WKST") {
+        if vb - va != 2 { return E_SYNTAX }
+        let w: i32 = weekday_code(s, va)
+        if w < 0 { return E_SYNTAX }
+        (*r).wkst = w
+        (*r).wkst_set = true
+        return E_OK
+    }
+    if name_is(s, na, nb, "BYMONTH") { return parse_list(s, va, vb, 1, 12, true, &(*r).bymonth) }
+    if name_is(s, na, nb, "BYWEEKNO") { return parse_list(s, va, vb, -53, 53, true, &(*r).byweekno) }
+    if name_is(s, na, nb, "BYYEARDAY") { return parse_list(s, va, vb, -366, 366, true, &(*r).byyearday) }
+    if name_is(s, na, nb, "BYMONTHDAY") { return parse_list(s, va, vb, -31, 31, true, &(*r).bymonthday) }
+    if name_is(s, na, nb, "BYSETPOS") { return parse_list(s, va, vb, -366, 366, true, &(*r).bysetpos) }
+    if name_is(s, na, nb, "BYHOUR") { return parse_list(s, va, vb, 0, 23, false, &(*r).byhour) }
+    if name_is(s, na, nb, "BYMINUTE") { return parse_list(s, va, vb, 0, 59, false, &(*r).byminute) }
+    if name_is(s, na, nb, "BYSECOND") { return parse_list(s, va, vb, 0, 59, false, &(*r).bysecond) }
+    if name_is(s, na, nb, "BYDAY") { return parse_byday(s, va, vb, r) }
+    return E_OK
+}
+
+// Parses the value of an RRULE property ("FREQ=DAILY;COUNT=3"; a leading "RRULE:" is accepted).
+// `r` has to come from rule_new and is filled in (a failed parse leaves it half filled: free it).
+fn parse(text: str, r: *mut Rule) -> u32 {
+    var i: usize = 0
+    let n: usize = text.n
+    if n >= 6 && name_is(text, 0, 6, "RRULE:") {
+        i = 6
+    }
+    while i <= n {
+        let e: usize = find_byte(text, i, n, 59 as u8)
+        if e > i {
+            let eq: usize = find_byte(text, i, e, 61 as u8)
+            if eq >= e {
+                return E_SYNTAX
+            }
+            let code: u32 = apply_part(r, text, i, eq, eq + 1, e)
+            if code != E_OK {
+                return code
+            }
+        }
+        i = e + 1
+    }
+    if (*r).freq < 0 {
+        return E_NO_FREQ
+    }
+    return E_OK
+}
+
+// ------------------------------------------------------------------ writer
+
+fn push_str(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn push_num(b: *mut rt.Buf, v: i64, width: usize) {
+    var tmp: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&tmp, v)
+    var pad: usize = 0
+    if rt.buf_len(&tmp) < width {
+        pad = width - rt.buf_len(&tmp)
+    }
+    while pad > 0 {
+        rt.buf_push(b, 48 as u8)
+        pad = pad - 1
+    }
+    rt.buf_push_bytes(b, rt.buf_ptr(&tmp), rt.buf_len(&tmp))
+    rt.buf_free(&tmp)
+}
+
+fn push_list(b: *mut rt.Buf, name: str, v: *mut Vec[i32]) {
+    if vec_len[i32](v) == 0 {
+        return
+    }
+    rt.buf_push(b, 59 as u8)
+    push_str(b, name)
+    rt.buf_push(b, 61 as u8)
+    var i: usize = 0
+    while i < vec_len[i32](v) {
+        if i > 0 {
+            rt.buf_push(b, 44 as u8)
+        }
+        rt.buf_push_dec_i64(b, vec_at[i32](v, i) as i64)
+        i = i + 1
+    }
+}
+
+fn wd_name(w: i32) -> str {
+    if w == 0 { return "MO" }
+    if w == 1 { return "TU" }
+    if w == 2 { return "WE" }
+    if w == 3 { return "TH" }
+    if w == 4 { return "FR" }
+    if w == 5 { return "SA" }
+    return "SU"
+}
+
+// Appends the canonical text of the rule (parts in the RFC's usual order).
+fn format(r: *mut Rule, out: *mut rt.Buf) {
+    push_str(out, "FREQ=")
+    let f: i32 = (*r).freq
+    if f == 0 { push_str(out, "YEARLY") }
+    else if f == 1 { push_str(out, "MONTHLY") }
+    else if f == 2 { push_str(out, "WEEKLY") }
+    else if f == 3 { push_str(out, "DAILY") }
+    else if f == 4 { push_str(out, "HOURLY") }
+    else if f == 5 { push_str(out, "MINUTELY") }
+    else { push_str(out, "SECONDLY") }
+    if (*r).interval != 1 {
+        push_str(out, ";INTERVAL=")
+        rt.buf_push_dec_i64(out, (*r).interval)
+    }
+    if (*r).count >= 0 {
+        push_str(out, ";COUNT=")
+        rt.buf_push_dec_i64(out, (*r).count)
+    }
+    if (*r).has_until {
+        push_str(out, ";UNTIL=")
+        let days: i64 = civil.floor_div((*r).until, 86400)
+        let sod: i64 = (*r).until - days * 86400
+        let c: civil.Ymd = civil.civil_from_days(days)
+        push_num(out, c.y as i64, 4)
+        push_num(out, c.m as i64, 2)
+        push_num(out, c.d as i64, 2)
+        if (*r).until_kind != UNTIL_DATE {
+            rt.buf_push(out, 84 as u8)
+            push_num(out, sod / 3600, 2)
+            push_num(out, (sod / 60) % 60, 2)
+            push_num(out, sod % 60, 2)
+            if (*r).until_kind == UNTIL_UTC {
+                rt.buf_push(out, 90 as u8)
+            }
+        }
+    }
+    push_list(out, "BYMONTH", &(*r).bymonth)
+    push_list(out, "BYWEEKNO", &(*r).byweekno)
+    push_list(out, "BYYEARDAY", &(*r).byyearday)
+    push_list(out, "BYMONTHDAY", &(*r).bymonthday)
+    if vec_len[i32](&(*r).byday_wd) > 0 {
+        push_str(out, ";BYDAY=")
+        var i: usize = 0
+        while i < vec_len[i32](&(*r).byday_wd) {
+            if i > 0 {
+                rt.buf_push(out, 44 as u8)
+            }
+            let n: i32 = vec_at[i32](&(*r).byday_n, i)
+            if n != 0 {
+                rt.buf_push_dec_i64(out, n as i64)
+            }
+            push_str(out, wd_name(vec_at[i32](&(*r).byday_wd, i)))
+            i = i + 1
+        }
+    }
+    push_list(out, "BYHOUR", &(*r).byhour)
+    push_list(out, "BYMINUTE", &(*r).byminute)
+    push_list(out, "BYSECOND", &(*r).bysecond)
+    push_list(out, "BYSETPOS", &(*r).bysetpos)
+    if (*r).wkst_set {
+        push_str(out, ";WKST=")
+        push_str(out, wd_name((*r).wkst))
+    }
+}
+
+// ------------------------------------------------------------------ expansion
+
+// The rule after dateutil's defaults and normalisation (sorted, unique lists).
+struct Eff {
+    freq: i32,
+    interval: i64,
+    wkst: i64,
+    bysetpos: Vec[i32],
+    bymonth: Vec[i32],
+    byweekno: Vec[i32],
+    byyearday: Vec[i32],
+    bymonthday: Vec[i32], // positive days
+    bynmonthday: Vec[i32], // negative days
+    byweekday: Vec[i32], // plain weekdays
+    bynwd: Vec[i32], // n-th weekday: the weekday ...
+    bynwn: Vec[i32], // ... and its n
+    byhour: Vec[i32],
+    byminute: Vec[i32],
+    bysecond: Vec[i32],
+    timeset: Vec[i32], // seconds of the day, for freq < HOURLY
+}
+
+fn eff_new() -> Eff {
+    return Eff {
+        freq: 0, interval: 1, wkst: 0, bysetpos: vec_new[i32](), bymonth: vec_new[i32](), byweekno: vec_new[i32](),
+        byyearday: vec_new[i32](), bymonthday: vec_new[i32](), bynmonthday: vec_new[i32](), byweekday: vec_new[i32](),
+        bynwd: vec_new[i32](), bynwn: vec_new[i32](), byhour: vec_new[i32](), byminute: vec_new[i32](),
+        bysecond: vec_new[i32](), timeset: vec_new[i32](),
+    }
+}
+
+fn eff_free(e: *mut Eff) {
+    vec_free[i32](&(*e).bysetpos)
+    vec_free[i32](&(*e).bymonth)
+    vec_free[i32](&(*e).byweekno)
+    vec_free[i32](&(*e).byyearday)
+    vec_free[i32](&(*e).bymonthday)
+    vec_free[i32](&(*e).bynmonthday)
+    vec_free[i32](&(*e).byweekday)
+    vec_free[i32](&(*e).bynwd)
+    vec_free[i32](&(*e).bynwn)
+    vec_free[i32](&(*e).byhour)
+    vec_free[i32](&(*e).byminute)
+    vec_free[i32](&(*e).bysecond)
+    vec_free[i32](&(*e).timeset)
+}
+
+fn eff_build(r: *mut Rule, dtstart: i64, e: *mut Eff) {
+    let days: i64 = civil.floor_div(dtstart, 86400)
+    let sod: i64 = dtstart - days * 86400
+    let dt: civil.Ymd = civil.civil_from_days(days)
+    let dtwd: i32 = civil.weekday(days) as i32
+    (*e).freq = (*r).freq
+    (*e).interval = (*r).interval
+    (*e).wkst = (*r).wkst as i64
+    let freq: u32 = (*r).freq as u32
+    vec_copy[i32](&(*r).bysetpos, &(*e).bysetpos)
+    vec_copy[i32](&(*r).bymonth, &(*e).bymonth)
+    vec_copy[i32](&(*r).byweekno, &(*e).byweekno)
+    vec_copy[i32](&(*r).byyearday, &(*e).byyearday)
+    var mday: Vec[i32] = vec_new[i32]()
+    vec_copy[i32](&(*r).bymonthday, &mday)
+    var wd: Vec[i32] = vec_new[i32]()
+    var wdn: Vec[i32] = vec_new[i32]()
+    vec_copy[i32](&(*r).byday_wd, &wd)
+    vec_copy[i32](&(*r).byday_n, &wdn)
+    if vlen(&(*r).byweekno) == 0 && vlen(&(*r).byyearday) == 0 && vlen(&mday) == 0 && vlen(&wd) == 0 {
+        if freq == YEARLY {
+            if vlen(&(*e).bymonth) == 0 {
+                vec_push[i32](&(*e).bymonth, dt.m as i32)
+            }
+            vec_push[i32](&mday, dt.d as i32)
+        } else if freq == MONTHLY {
+            vec_push[i32](&mday, dt.d as i32)
+        } else if freq == WEEKLY {
+            vec_push[i32](&wd, dtwd)
+            vec_push[i32](&wdn, 0)
+        }
+    }
+    sort_uniq(&(*e).bymonth)
+    sort_uniq(&(*e).byweekno)
+    sort_uniq(&(*e).byyearday)
+    sort_uniq(&(*e).bysetpos)
+    var k: usize = 0
+    while k < vlen(&mday) {
+        let x: i32 = vget(&mday, k)
+        if x > 0 && !vhas(&(*e).bymonthday, x) {
+            vec_push[i32](&(*e).bymonthday, x)
+        }
+        if x < 0 && !vhas(&(*e).bynmonthday, x) {
+            vec_push[i32](&(*e).bynmonthday, x)
+        }
+        k = k + 1
+    }
+    sort_uniq(&(*e).bymonthday)
+    sort_uniq(&(*e).bynmonthday)
+    k = 0
+    while k < vlen(&wd) {
+        let w: i32 = vget(&wd, k)
+        let n: i32 = vget(&wdn, k)
+        if n == 0 || freq > MONTHLY {
+            if !vhas(&(*e).byweekday, w) {
+                vec_push[i32](&(*e).byweekday, w)
+            }
+        } else {
+            var dup: bool = false
+            var q: usize = 0
+            while q < vlen(&(*e).bynwd) {
+                if vget(&(*e).bynwd, q) == w && vget(&(*e).bynwn, q) == n {
+                    dup = true
+                }
+                q = q + 1
+            }
+            if !dup {
+                vec_push[i32](&(*e).bynwd, w)
+                vec_push[i32](&(*e).bynwn, n)
+            }
+        }
+        k = k + 1
+    }
+    sort_uniq(&(*e).byweekday)
+    vec_copy[i32](&(*r).byhour, &(*e).byhour)
+    vec_copy[i32](&(*r).byminute, &(*e).byminute)
+    vec_copy[i32](&(*r).bysecond, &(*e).bysecond)
+    if vlen(&(*e).byhour) == 0 && freq < HOURLY {
+        vec_push[i32](&(*e).byhour, (sod / 3600) as i32)
+    }
+    if vlen(&(*e).byminute) == 0 && freq < MINUTELY {
+        vec_push[i32](&(*e).byminute, ((sod / 60) % 60) as i32)
+    }
+    if vlen(&(*e).bysecond) == 0 && freq < SECONDLY {
+        vec_push[i32](&(*e).bysecond, (sod % 60) as i32)
+    }
+    sort_uniq(&(*e).byhour)
+    sort_uniq(&(*e).byminute)
+    sort_uniq(&(*e).bysecond)
+    if freq < HOURLY {
+        var a: usize = 0
+        while a < vlen(&(*e).byhour) {
+            var b: usize = 0
+            while b < vlen(&(*e).byminute) {
+                var c: usize = 0
+                while c < vlen(&(*e).bysecond) {
+                    vec_push[i32](&(*e).timeset, vget(&(*e).byhour, a) * 3600 + vget(&(*e).byminute, b) * 60 + vget(&(*e).bysecond, c))
+                    c = c + 1
+                }
+                b = b + 1
+            }
+            a = a + 1
+        }
+        sort_uniq(&(*e).timeset)
+    }
+    vec_free[i32](&mday)
+    vec_free[i32](&wd)
+    vec_free[i32](&wdn)
+}
+
+// Year tables (dateutil's _iterinfo). Every mask is 7 days longer than the year, for weeks that
+// cross the year boundary.
+struct Ii {
+    lastyear: i32,
+    lastmonth: i32,
+    yearlen: i64,
+    nextyearlen: i64,
+    yearordinal: i64, // civil day of January 1st
+    yearweekday: i64,
+    mmask: Vec[i32],
+    mdaymask: Vec[i32],
+    nmdaymask: Vec[i32],
+    mrange: Vec[i32], // 13 entries: first day index of each month, then the year length
+    wnomask: Vec[u8],
+    has_wno: bool,
+    nwdaymask: Vec[u8],
+    has_nw: bool,
+}
+
+fn ii_new() -> Ii {
+    return Ii {
+        lastyear: -1000000, lastmonth: -1000000, yearlen: 365, nextyearlen: 365, yearordinal: 0, yearweekday: 0,
+        mmask: vec_new[i32](), mdaymask: vec_new[i32](), nmdaymask: vec_new[i32](), mrange: vec_new[i32](),
+        wnomask: vec_new[u8](), has_wno: false, nwdaymask: vec_new[u8](), has_nw: false,
+    }
+}
+
+fn ii_free(ii: *mut Ii) {
+    vec_free[i32](&(*ii).mmask)
+    vec_free[i32](&(*ii).mdaymask)
+    vec_free[i32](&(*ii).nmdaymask)
+    vec_free[i32](&(*ii).mrange)
+    vec_free[u8](&(*ii).wnomask)
+    vec_free[u8](&(*ii).nwdaymask)
+}
+
+fn wdmask(ii: *mut Ii, i: i64) -> i64 {
+    return civil.floor_mod((*ii).yearweekday + i, 7)
+}
+
+fn zero_fill(v: *mut Vec[u8], n: usize) {
+    vec_clear[u8](v)
+    var i: usize = 0
+    while i < n {
+        vec_push[u8](v, 0 as u8)
+        i = i + 1
+    }
+}
+
+fn set_flag(v: *mut Vec[u8], i: i64) {
+    if i >= 0 && (i as usize) < vec_len[u8](v) {
+        vec_set[u8](v, i as usize, 1 as u8)
+    }
+}
+
+fn ii_rebuild(ii: *mut Ii, e: *mut Eff, year: i32, month: i32) {
+    if year != (*ii).lastyear {
+        (*ii).yearlen = civil.days_in_year(year) as i64
+        (*ii).nextyearlen = civil.days_in_year(year + 1) as i64
+        (*ii).yearordinal = civil.days_from_civil(year, 1, 1)
+        (*ii).yearweekday = civil.weekday((*ii).yearordinal) as i64
+        vec_clear[i32](&(*ii).mmask)
+        vec_clear[i32](&(*ii).mdaymask)
+        vec_clear[i32](&(*ii).nmdaymask)
+        vec_clear[i32](&(*ii).mrange)
+        var m: u32 = 1
+        var start: i32 = 0
+        while m <= 12 {
+            vec_push[i32](&(*ii).mrange, start)
+            let dim: u32 = civil.days_in_month(year, m)
+            var d: u32 = 1
+            while d <= dim {
+                vec_push[i32](&(*ii).mmask, m as i32)
+                vec_push[i32](&(*ii).mdaymask, d as i32)
+                vec_push[i32](&(*ii).nmdaymask, (d as i32) - (dim as i32) - 1)
+                d = d + 1
+            }
+            start = start + (dim as i32)
+            m = m + 1
+        }
+        vec_push[i32](&(*ii).mrange, start)
+        var k: i32 = 0
+        while k < 7 {
+            vec_push[i32](&(*ii).mmask, 1)
+            vec_push[i32](&(*ii).mdaymask, k + 1)
+            vec_push[i32](&(*ii).nmdaymask, k - 31)
+            k = k + 1
+        }
+        (*ii).has_wno = vlen(&(*e).byweekno) > 0
+        if (*ii).has_wno {
+            let yl: i64 = (*ii).yearlen
+            zero_fill(&(*ii).wnomask, (yl + 16) as usize)
+            let wkst: i64 = (*e).wkst
+            var no1wkst: i64 = civil.floor_mod(7 - (*ii).yearweekday + wkst, 7)
+            let firstwkst: i64 = no1wkst
+            var wyearlen: i64 = 0
+            if no1wkst >= 4 {
+                no1wkst = 0
+                wyearlen = yl + civil.floor_mod((*ii).yearweekday - wkst, 7)
+            } else {
+                wyearlen = yl - no1wkst
+            }
+            let numweeks: i64 = wyearlen / 7 + (wyearlen % 7) / 4
+            var q: usize = 0
+            while q < vlen(&(*e).byweekno) {
+                var n: i64 = vget(&(*e).byweekno, q) as i64
+                q = q + 1
+                if n < 0 {
+                    n = n + numweeks + 1
+                }
+                if !(0 < n && n <= numweeks) {
+                    continue
+                }
+                var i: i64 = no1wkst
+                if n > 1 {
+                    i = no1wkst + (n - 1) * 7
+                    if no1wkst != firstwkst {
+                        i = i - (7 - firstwkst)
+                    }
+                }
+                var j: i32 = 0
+                while j < 7 {
+                    set_flag(&(*ii).wnomask, i)
+                    i = i + 1
+                    if wdmask(ii, i) == wkst {
+                        break
+                    }
+                    j = j + 1
+                }
+            }
+            if vhas(&(*e).byweekno, 1) {
+                var i: i64 = no1wkst + numweeks * 7
+                if no1wkst != firstwkst {
+                    i = i - (7 - firstwkst)
+                }
+                if i < yl {
+                    var j: i32 = 0
+                    while j < 7 {
+                        set_flag(&(*ii).wnomask, i)
+                        i = i + 1
+                        if wdmask(ii, i) == wkst {
+                            break
+                        }
+                        j = j + 1
+                    }
+                }
+            }
+            if no1wkst != 0 {
+                var lnumweeks: i64 = 0 - 1
+                if !vhas(&(*e).byweekno, -1) {
+                    let lyearweekday: i64 = civil.weekday(civil.days_from_civil(year - 1, 1, 1)) as i64
+                    var lno1wkst: i64 = civil.floor_mod(7 - lyearweekday + wkst, 7)
+                    let lyearlen: i64 = civil.days_in_year(year - 1) as i64
+                    if lno1wkst >= 4 {
+                        lno1wkst = 0
+                        lnumweeks = 52 + ((lyearlen + civil.floor_mod(lyearweekday - wkst, 7)) % 7) / 4
+                    } else {
+                        lnumweeks = 52 + ((yl - no1wkst) % 7) / 4
+                    }
+                }
+                if vhas(&(*e).byweekno, lnumweeks as i32) {
+                    var i: i64 = 0
+                    while i < no1wkst {
+                        set_flag(&(*ii).wnomask, i)
+                        i = i + 1
+                    }
+                }
+            }
+        }
+        (*ii).lastyear = year
+        (*ii).lastmonth = -1000000
+    }
+    if vlen(&(*e).bynwd) > 0 && month != (*ii).lastmonth {
+        var rs: Vec[i32] = vec_new[i32]()
+        var have: bool = false
+        if (*e).freq == 0 {
+            have = true
+            if vlen(&(*e).bymonth) > 0 {
+                var q: usize = 0
+                while q < vlen(&(*e).bymonth) {
+                    let mo: i32 = vget(&(*e).bymonth, q)
+                    vec_push[i32](&rs, vget(&(*ii).mrange, (mo - 1) as usize))
+                    vec_push[i32](&rs, vget(&(*ii).mrange, mo as usize))
+                    q = q + 1
+                }
+            } else {
+                vec_push[i32](&rs, 0)
+                vec_push[i32](&rs, (*ii).yearlen as i32)
+            }
+        } else if (*e).freq == 1 {
+            have = true
+            vec_push[i32](&rs, vget(&(*ii).mrange, (month - 1) as usize))
+            vec_push[i32](&rs, vget(&(*ii).mrange, month as usize))
+        }
+        if have {
+            zero_fill(&(*ii).nwdaymask, (*ii).yearlen as usize)
+            (*ii).has_nw = true
+            var p: usize = 0
+            while p < vlen(&rs) {
+                let first: i64 = vget(&rs, p) as i64
+                let last: i64 = (vget(&rs, p + 1) as i64) - 1
+                p = p + 2
+                var q: usize = 0
+                while q < vlen(&(*e).bynwd) {
+                    let wday: i64 = vget(&(*e).bynwd, q) as i64
+                    let n: i64 = vget(&(*e).bynwn, q) as i64
+                    q = q + 1
+                    var i: i64 = 0
+                    if n < 0 {
+                        i = last + (n + 1) * 7
+                        if i < 0 {
+                            continue
+                        }
+                        i = i - civil.floor_mod(wdmask(ii, i) - wday, 7)
+                    } else {
+                        i = first + (n - 1) * 7
+                        i = i + civil.floor_mod(7 - wdmask(ii, i) + wday, 7)
+                    }
+                    if first <= i && i <= last {
+                        set_flag(&(*ii).nwdaymask, i)
+                    }
+                }
+            }
+        }
+        vec_free[i32](&rs)
+        (*ii).lastmonth = month
+    }
+}
+
+struct Sink {
+    dtstart: i64,
+    from: i64,
+    to: i64,
+    max_n: usize,
+    count: i64,
+    until: i64,
+    has_until: bool,
+    out: *mut Vec[i64],
+}
+
+// 1 = stop.
+fn emit(s: *mut Sink, res: i64) -> u32 {
+    if (*s).has_until && res > (*s).until {
+        return 1
+    }
+    if res >= (*s).dtstart {
+        if (*s).count >= 0 {
+            (*s).count = (*s).count - 1
+            if (*s).count < 0 {
+                return 1
+            }
+        }
+        if res > (*s).to {
+            return 1
+        }
+        if res >= (*s).from {
+            vec_push[i64]((*s).out, res)
+            if vec_len[i64]((*s).out) >= (*s).max_n {
+                return 1
+            }
+        }
+    }
+    return 0
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    var x: i64 = a
+    var y: i64 = b
+    while y != 0 {
+        let t: i64 = x % y
+        x = y
+        y = t
+    }
+    return x
+}
+
+// dateutil's __mod_distance: false if no value of `byxxx` is ever reached.
+fn mod_distance(value: i64, interval: i64, byxxx: *mut Vec[i32], base: i64, acc: *mut i64, outv: *mut i64) -> bool {
+    var v: i64 = value
+    var a: i64 = 0
+    var k: i64 = 1
+    while k <= base {
+        let t: i64 = v + interval
+        a = a + civil.floor_div(t, base)
+        v = civil.floor_mod(t, base)
+        if vhas(byxxx, v as i32) {
+            *acc = a
+            *outv = v
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+fn make_timeset(e: *mut Eff, hour: i64, minute: i64, second: i64, ts: *mut Vec[i32]) {
+    vec_clear[i32](ts)
+    if (*e).freq == 4 {
+        var a: usize = 0
+        while a < vlen(&(*e).byminute) {
+            var b: usize = 0
+            while b < vlen(&(*e).bysecond) {
+                vec_push[i32](ts, (hour * 3600 + (vget(&(*e).byminute, a) as i64) * 60 + (vget(&(*e).bysecond, b) as i64)) as i32)
+                b = b + 1
+            }
+            a = a + 1
+        }
+        sort_uniq(ts)
+    } else if (*e).freq == 5 {
+        var b: usize = 0
+        while b < vlen(&(*e).bysecond) {
+            vec_push[i32](ts, (hour * 3600 + minute * 60 + (vget(&(*e).bysecond, b) as i64)) as i32)
+            b = b + 1
+        }
+        sort_uniq(ts)
+    } else {
+        vec_push[i32](ts, (hour * 3600 + minute * 60 + second) as i32)
+    }
+}
+
+fn day_rejected(ii: *mut Ii, e: *mut Eff, i: i64, wkday_unused: i32) -> bool {
+    let n: i64 = vec_len[i32](&(*ii).mmask) as i64
+    if i < 0 || i >= n {
+        return true
+    }
+    if vlen(&(*e).bymonth) > 0 && !vhas(&(*e).bymonth, vget(&(*ii).mmask, i as usize)) {
+        return true
+    }
+    if vlen(&(*e).byweekno) > 0 && vec_at[u8](&(*ii).wnomask, i as usize) == 0 as u8 {
+        return true
+    }
+    if vlen(&(*e).byweekday) > 0 && !vhas(&(*e).byweekday, wdmask(ii, i) as i32) {
+        return true
+    }
+    if (*ii).has_nw && (i as usize) < vec_len[u8](&(*ii).nwdaymask) && vec_at[u8](&(*ii).nwdaymask, i as usize) == 0 as u8 {
+        return true
+    }
+    if (vlen(&(*e).bymonthday) > 0 || vlen(&(*e).bynmonthday) > 0) {
+        if !vhas(&(*e).bymonthday, vget(&(*ii).mdaymask, i as usize)) && !vhas(&(*e).bynmonthday, vget(&(*ii).nmdaymask, i as usize)) {
+            return true
+        }
+    }
+    if vlen(&(*e).byyearday) > 0 {
+        let yl: i64 = (*ii).yearlen
+        if i < yl {
+            if !vhas(&(*e).byyearday, (i + 1) as i32) && !vhas(&(*e).byyearday, (i - yl) as i32) {
+                return true
+            }
+        } else {
+            if !vhas(&(*e).byyearday, (i + 1 - yl) as i32) && !vhas(&(*e).byyearday, (i - yl - (*ii).nextyearlen) as i32) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// Appends the occurrences of the rule that start at `dtstart` (local seconds) and lie in
+// [from, to], oldest first, at most `max_n` of them, to `out`. Returns S_OK, or S_CAPPED when
+// the rule was cut off by max_year / iter_cap, or S_BAD_START / S_EMPTY_COMBO.
+fn expand(r: *mut Rule, dtstart: i64, from: i64, to: i64, max_n: usize, out: *mut Vec[i64]) -> u32 {
+    if max_n == 0 {
+        return S_OK
+    }
+    let dstart: i64 = civil.floor_div(dtstart, 86400)
+    let c0: civil.Ymd = civil.civil_from_days(dstart)
+    if c0.y < 1 || c0.y > 9999 || (*r).freq < 0 {
+        return S_BAD_START
+    }
+    var e: Eff = eff_new()
+    eff_build(r, dtstart, &e)
+    var ii: Ii = ii_new()
+    var ds: Vec[i32] = vec_new[i32]()
+    var timeset: Vec[i32] = vec_new[i32]()
+    var poslist: Vec[i64] = vec_new[i64]()
+    var sink: Sink = Sink { dtstart: dtstart, from: from, to: to, max_n: max_n, count: (*r).count, until: (*r).until, has_until: (*r).has_until, out: out }
+    var status: u32 = S_OK
+    let freq: i32 = e.freq
+    let interval: i64 = e.interval
+    var year: i64 = c0.y as i64
+    var month: i64 = c0.m as i64
+    var day: i64 = c0.d as i64
+    let sod0: i64 = dtstart - dstart * 86400
+    var hour: i64 = sod0 / 3600
+    var minute: i64 = (sod0 / 60) % 60
+    var second: i64 = sod0 % 60
+    var wd: i64 = civil.weekday(dstart) as i64
+    let maxy: i64 = (*r).max_year as i64
+    ii_rebuild(&ii, &e, year as i32, month as i32)
+    if freq < 4 {
+        vec_copy[i32](&e.timeset, &timeset)
+    } else {
+        if (freq >= 4 && vlen(&e.byhour) > 0 && !vhas(&e.byhour, hour as i32)) || (freq >= 5 && vlen(&e.byminute) > 0 && !vhas(&e.byminute, minute as i32)) || (freq >= 6 && vlen(&e.bysecond) > 0 && !vhas(&e.bysecond, second as i32)) {
+            vec_clear[i32](&timeset)
+        } else {
+            make_timeset(&e, hour, minute, second, &timeset)
+        }
+    }
+    var iters: i64 = 0
+    var done: bool = false
+    while !done {
+        iters = iters + 1
+        if iters > (*r).iter_cap {
+            status = S_CAPPED
+            break
+        }
+        // the day set of this period
+        vec_clear[i32](&ds)
+        if freq == 0 {
+            var i: i64 = 0
+            while i < ii.yearlen {
+                vec_push[i32](&ds, i as i32)
+                i = i + 1
+            }
+        } else if freq == 1 {
+            var i: i32 = vget(&ii.mrange, (month - 1) as usize)
+            let end: i32 = vget(&ii.mrange, month as usize)
+            while i < end {
+                vec_push[i32](&ds, i)
+                i = i + 1
+            }
+        } else if freq == 2 {
+            var i: i64 = civil.days_from_civil(year as i32, month as u32, day as u32) - ii.yearordinal
+            var j: i32 = 0
+            while j < 7 {
+                vec_push[i32](&ds, i as i32)
+                i = i + 1
+                if wdmask(&ii, i) == e.wkst {
+                    break
+                }
+                j = j + 1
+            }
+        } else {
+            let i: i64 = civil.days_from_civil(year as i32, month as u32, day as u32) - ii.yearordinal
+            vec_push[i32](&ds, i as i32)
+        }
+        var filtered: bool = false
+        var k: usize = 0
+        while k < vec_len[i32](&ds) {
+            if day_rejected(&ii, &e, vget(&ds, k) as i64, 0) {
+                vec_set[i32](&ds, k, -1)
+                filtered = true
+            }
+            k = k + 1
+        }
+        // output
+        if vlen(&e.bysetpos) > 0 && vlen(&timeset) > 0 {
+            vec_clear[i64](&poslist)
+            var surv: Vec[i32] = vec_new[i32]()
+            k = 0
+            while k < vec_len[i32](&ds) {
+                if vget(&ds, k) >= 0 {
+                    vec_push[i32](&surv, vget(&ds, k))
+                }
+                k = k + 1
+            }
+            let tl: i64 = vlen(&timeset) as i64
+            var pi: usize = 0
+            while pi < vlen(&e.bysetpos) {
+                let pos: i64 = vget(&e.bysetpos, pi) as i64
+                pi = pi + 1
+                var daypos: i64 = 0
+                var timepos: i64 = 0
+                if pos < 0 {
+                    daypos = civil.floor_div(pos, tl)
+                    timepos = civil.floor_mod(pos, tl)
+                } else {
+                    daypos = civil.floor_div(pos - 1, tl)
+                    timepos = civil.floor_mod(pos - 1, tl)
+                }
+                var didx: i64 = daypos
+                if daypos < 0 {
+                    didx = (vlen(&surv) as i64) + daypos
+                }
+                if didx < 0 || didx >= (vlen(&surv) as i64) {
+                    continue
+                }
+                let res: i64 = (ii.yearordinal + (vget(&surv, didx as usize) as i64)) * 86400 + (vget(&timeset, timepos as usize) as i64)
+                if !vec_contains[i64](&poslist, res) {
+                    vec_push[i64](&poslist, res)
+                }
+            }
+            vec_free[i32](&surv)
+            vec_sort[i64](&poslist)
+            k = 0
+            while k < vec_len[i64](&poslist) {
+                if emit(&sink, vec_at[i64](&poslist, k)) != 0 {
+                    done = true
+                    break
+                }
+                k = k + 1
+            }
+        } else {
+            k = 0
+            while k < vec_len[i32](&ds) && !done {
+                if vget(&ds, k) >= 0 {
+                    let base: i64 = (ii.yearordinal + (vget(&ds, k) as i64)) * 86400
+                    var t: usize = 0
+                    while t < vlen(&timeset) {
+                        if emit(&sink, base + (vget(&timeset, t) as i64)) != 0 {
+                            done = true
+                            break
+                        }
+                        t = t + 1
+                    }
+                }
+                k = k + 1
+            }
+        }
+        if done {
+            break
+        }
+        // next period
+        var fixday: bool = false
+        if freq == 0 {
+            year = year + interval
+            if year > maxy {
+                status = S_CAPPED
+                break
+            }
+            ii_rebuild(&ii, &e, year as i32, month as i32)
+        } else if freq == 1 {
+            month = month + interval
+            if month > 12 {
+                let dv: i64 = month / 12
+                var md: i64 = month % 12
+                year = year + dv
+                if md == 0 {
+                    md = 12
+                    year = year - 1
+                }
+                month = md
+                if year > maxy {
+                    status = S_CAPPED
+                    break
+                }
+            }
+            ii_rebuild(&ii, &e, year as i32, month as i32)
+        } else if freq == 2 {
+            if e.wkst > wd {
+                day = day - (wd + 1 + (6 - e.wkst)) + interval * 7
+            } else {
+                day = day - (wd - e.wkst) + interval * 7
+            }
+            wd = e.wkst
+            fixday = true
+        } else if freq == 3 {
+            day = day + interval
+            fixday = true
+        } else if freq == 4 {
+            if filtered {
+                hour = hour + ((23 - hour) / interval) * interval
+            }
+            var ndays: i64 = 0
+            if vlen(&e.byhour) > 0 {
+                if !mod_distance(hour, interval, &e.byhour, 24, &ndays, &hour) {
+                    status = S_EMPTY_COMBO
+                    break
+                }
+            } else {
+                ndays = civil.floor_div(hour + interval, 24)
+                hour = civil.floor_mod(hour + interval, 24)
+            }
+            if ndays != 0 {
+                day = day + ndays
+                fixday = true
+            }
+            make_timeset(&e, hour, minute, second, &timeset)
+        } else if freq == 5 {
+            if filtered {
+                minute = minute + ((1439 - (hour * 60 + minute)) / interval) * interval
+            }
+            var valid: bool = false
+            let rep: i64 = 1440
+            let lim: i64 = rep / gcd(interval, rep)
+            var j: i64 = 0
+            while j < lim {
+                var nh: i64 = 0
+                if vlen(&e.byminute) > 0 {
+                    if !mod_distance(minute, interval, &e.byminute, 60, &nh, &minute) {
+                        break
+                    }
+                } else {
+                    nh = civil.floor_div(minute + interval, 60)
+                    minute = civil.floor_mod(minute + interval, 60)
+                }
+                let dv: i64 = civil.floor_div(hour + nh, 24)
+                hour = civil.floor_mod(hour + nh, 24)
+                if dv != 0 {
+                    day = day + dv
+                    fixday = true
+                }
+                if vlen(&e.byhour) == 0 || vhas(&e.byhour, hour as i32) {
+                    valid = true
+                    break
+                }
+                j = j + 1
+            }
+            if !valid {
+                status = S_EMPTY_COMBO
+                break
+            }
+            make_timeset(&e, hour, minute, second, &timeset)
+        } else {
+            if filtered {
+                second = second + ((86399 - (hour * 3600 + minute * 60 + second)) / interval) * interval
+            }
+            var valid: bool = false
+            let rep: i64 = 86400
+            let lim: i64 = rep / gcd(interval, rep)
+            var j: i64 = 0
+            while j < lim {
+                var nmin: i64 = 0
+                if vlen(&e.bysecond) > 0 {
+                    if !mod_distance(second, interval, &e.bysecond, 60, &nmin, &second) {
+                        break
+                    }
+                } else {
+                    nmin = civil.floor_div(second + interval, 60)
+                    second = civil.floor_mod(second + interval, 60)
+                }
+                var dv: i64 = civil.floor_div(minute + nmin, 60)
+                minute = civil.floor_mod(minute + nmin, 60)
+                if dv != 0 {
+                    hour = hour + dv
+                    dv = civil.floor_div(hour, 24)
+                    hour = civil.floor_mod(hour, 24)
+                    if dv != 0 {
+                        day = day + dv
+                        fixday = true
+                    }
+                }
+                if (vlen(&e.byhour) == 0 || vhas(&e.byhour, hour as i32)) && (vlen(&e.byminute) == 0 || vhas(&e.byminute, minute as i32)) && (vlen(&e.bysecond) == 0 || vhas(&e.bysecond, second as i32)) {
+                    valid = true
+                    break
+                }
+                j = j + 1
+            }
+            if !valid {
+                status = S_EMPTY_COMBO
+                break
+            }
+            make_timeset(&e, hour, minute, second, &timeset)
+        }
+        if fixday && day > 28 {
+            var dim: i64 = civil.days_in_month(year as i32, month as u32) as i64
+            if day > dim {
+                while day > dim {
+                    day = day - dim
+                    month = month + 1
+                    if month == 13 {
+                        month = 1
+                        year = year + 1
+                        if year > maxy {
+                            status = S_CAPPED
+                            done = true
+                            break
+                        }
+                    }
+                    dim = civil.days_in_month(year as i32, month as u32) as i64
+                }
+                if done {
+                    break
+                }
+                ii_rebuild(&ii, &e, year as i32, month as i32)
+            }
+        }
+    }
+    vec_free[i32](&ds)
+    vec_free[i32](&timeset)
+    vec_free[i64](&poslist)
+    ii_free(&ii)
+    eff_free(&e)
+    return status
+}
+
+// A recurrence SET (RFC 5545 section 3.8.5, dateutil's rruleset): the rule's occurrences plus
+// `rdates`, minus `exdates` (both local seconds, any order, may be empty / null-free vectors).
+// Result sorted, no duplicates, within [from, to], at most max_n. The COUNT of the rule counts
+// the rule's own occurrences only.
+fn expand_set(r: *mut Rule, has_rule: bool, dtstart: i64, rdates: *mut Vec[i64], exdates: *mut Vec[i64], from: i64, to: i64, max_n: usize, out: *mut Vec[i64]) -> u32 {
+    var all: Vec[i64] = vec_new[i64]()
+    var status: u32 = S_OK
+    if has_rule {
+        status = expand(r, dtstart, from, to, max_n + vec_len[i64](exdates), &all)
+    }
+    var i: usize = 0
+    while i < vec_len[i64](rdates) {
+        let x: i64 = vec_at[i64](rdates, i)
+        if x >= from && x <= to {
+            vec_push[i64](&all, x)
+        }
+        i = i + 1
+    }
+    vec_sort[i64](&all)
+    var last: i64 = 0
+    var have_last: bool = false
+    i = 0
+    while i < vec_len[i64](&all) && vec_len[i64](out) < max_n {
+        let x: i64 = vec_at[i64](&all, i)
+        i = i + 1
+        if have_last && x == last {
+            continue
+        }
+        last = x
+        have_last = true
+        if vec_contains[i64](exdates, x) {
+            continue
+        }
+        vec_push[i64](out, x)
+    }
+    vec_free[i64](&all)
+    return status
+}

@@ -1,0 +1,666 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/cal/ical.fi -- cal.ical: iCalendar (RFC 5545) on top of cal.content: DATE / DATE-TIME /
+// DURATION / PERIOD values, VEVENT / VTODO recurrence sets (RRULE + RDATE - EXDATE), VTIMEZONE
+// offsets and builders for a calendar you write yourself.
+//
+//     import cal.content
+//     import cal.ical
+//     var d: content.Doc = content.doc_new()
+//     content.parse(text, &d)                                   // VCALENDAR / VEVENT / VTODO / VALARM / VTIMEZONE
+//     let cal: i64 = content.find_comp(&d, -1, "VCALENDAR", -1)
+//     let ev: i64 = content.find_comp(&d, cal, "VEVENT", -1)
+//     var occ: Vec[i64] = vec_new[i64]()
+//     ical.occurrences(&d, ev as usize, from, to, 500, &occ)    // local seconds, DTSTART included, sorted
+//     var utc: i64 = 0
+//     ical.local_to_utc(&d, "Europe/Vienna", occ[0], &utc)      // through the VTIMEZONE in the file
+//
+//     // writing
+//     content.begin(&d, "VCALENDAR"); ical.add_text(&d, "PRODID", "-//x//y//EN") ...
+//     ical.add_datetime(&d, "DTSTART", v, "Europe/Vienna"); ical.add_rrule(&d, &rule); content.end(&d)
+//     content.write(&d, &out)
+//
+// TIME. A date-time is read as written; "local seconds" = days * 86400 + second of the day (see
+// cal.civil). UTC values end in Z and are flagged `utc`; floating and TZID values are wall clock.
+// `occurrences` returns wall-clock seconds of DTSTART's own clock; `local_to_utc` turns them into
+// UTC through a VTIMEZONE of the same document.
+//
+// HONEST
+// I1  The recurrence set follows RFC 5545 3.8.5: DTSTART is the first instance (also when the rule
+//     does not produce it); RDATE adds, EXDATE removes (DATE exdates remove the whole day); several
+//     RRULE properties are united. RDATE / EXDATE are taken in DTSTART's clock whatever TZID they carry.
+// I2  A UTC UNTIL with a TZID DTSTART is moved into the wall clock by the offset in force at DTSTART.
+// I3  VTIMEZONE: the offset at a wall-clock time is TZOFFSETTO of the observance (STANDARD /
+//     DAYLIGHT) whose latest onset (DTSTART, RRULE, RDATE) is not after it; times inside the gap or
+//     the overlap of a switch are not disambiguated. Unknown TZID -> false (no guess from names).
+// I4  RECURRENCE-ID overrides, VALARM triggers and free-busy are exposed as plain properties
+//     (cal.content); nothing here interprets them.
+
+import std.rt
+import std.vec
+import cal.civil
+import cal.content
+import cal.rrule
+
+export {
+    DateVal, parse_datetime, format_datetime, secs_of, from_secs,
+    parse_duration, format_duration, parse_period, parse_offset,
+    get_prop, event_start, event_duration, occurrences,
+    find_vtimezone, tz_offset_local, local_to_utc,
+    add_text, add_datetime, add_duration, add_rrule, add_raw,
+}
+
+struct DateVal {
+    y: i32,
+    m: u32,
+    d: u32,
+    hh: u32,
+    mm: u32,
+    ss: u32,
+    date_only: bool,
+    utc: bool,
+}
+
+fn at(s: str, i: usize) -> u8 {
+    return rt.ld8(s.p as u64, i)
+}
+
+fn digits(s: str, a: usize, n: usize, out: *mut i64) -> bool {
+    var v: i64 = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = at(s, a + i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return false
+        }
+        v = v * 10 + ((c - 48 as u8) as i64)
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+fn trim(s: str) -> str {
+    var a: usize = 0
+    var b: usize = s.n
+    while a < b && (at(s, a) == 32 as u8 || at(s, a) == 9 as u8) { a = a + 1 }
+    while b > a && (at(s, b - 1) == 32 as u8 || at(s, b - 1) == 9 as u8) { b = b - 1 }
+    return str { p: s.p + a, n: b - a }
+}
+
+// "20261016", "20261016T093000", "20261016T093000Z". false on anything else (also impossible dates).
+fn parse_datetime(s0: str, out: *mut DateVal) -> bool {
+    let s: str = trim(s0)
+    var y: i64 = 0
+    var mo: i64 = 0
+    var d: i64 = 0
+    var h: i64 = 0
+    var mi: i64 = 0
+    var se: i64 = 0
+    if s.n != 8 && s.n != 15 && s.n != 16 {
+        return false
+    }
+    if !digits(s, 0, 4, &y) || !digits(s, 4, 2, &mo) || !digits(s, 6, 2, &d) {
+        return false
+    }
+    if y < 1 || !civil.valid(y as i32, mo as u32, d as u32) {
+        return false
+    }
+    var date_only: bool = true
+    var utc: bool = false
+    if s.n > 8 {
+        date_only = false
+        if at(s, 8) != 84 as u8 && at(s, 8) != 116 as u8 {
+            return false
+        }
+        if !digits(s, 9, 2, &h) || !digits(s, 11, 2, &mi) || !digits(s, 13, 2, &se) {
+            return false
+        }
+        if h > 23 || mi > 59 || se > 59 {
+            return false
+        }
+        if s.n == 16 {
+            if at(s, 15) != 90 as u8 && at(s, 15) != 122 as u8 {
+                return false
+            }
+            utc = true
+        }
+    }
+    *out = DateVal { y: y as i32, m: mo as u32, d: d as u32, hh: h as u32, mm: mi as u32, ss: se as u32, date_only: date_only, utc: utc }
+    return true
+}
+
+fn push_num(b: *mut rt.Buf, v: i64, width: usize) {
+    var tmp: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&tmp, v)
+    var pad: usize = 0
+    if rt.buf_len(&tmp) < width {
+        pad = width - rt.buf_len(&tmp)
+    }
+    while pad > 0 {
+        rt.buf_push(b, 48 as u8)
+        pad = pad - 1
+    }
+    rt.buf_push_bytes(b, rt.buf_ptr(&tmp), rt.buf_len(&tmp))
+    rt.buf_free(&tmp)
+}
+
+fn format_datetime(v: DateVal, out: *mut rt.Buf) {
+    push_num(out, v.y as i64, 4)
+    push_num(out, v.m as i64, 2)
+    push_num(out, v.d as i64, 2)
+    if !v.date_only {
+        rt.buf_push(out, 84 as u8)
+        push_num(out, v.hh as i64, 2)
+        push_num(out, v.mm as i64, 2)
+        push_num(out, v.ss as i64, 2)
+        if v.utc {
+            rt.buf_push(out, 90 as u8)
+        }
+    }
+}
+
+fn secs_of(v: DateVal) -> i64 {
+    return civil.days_from_civil(v.y, v.m, v.d) * 86400 + (v.hh as i64) * 3600 + (v.mm as i64) * 60 + (v.ss as i64)
+}
+
+fn from_secs(secs: i64, date_only: bool, utc: bool) -> DateVal {
+    let days: i64 = civil.floor_div(secs, 86400)
+    let sod: i64 = secs - days * 86400
+    let c: civil.Ymd = civil.civil_from_days(days)
+    return DateVal { y: c.y, m: c.m, d: c.d, hh: (sod / 3600) as u32, mm: ((sod / 60) % 60) as u32, ss: (sod % 60) as u32, date_only: date_only, utc: utc }
+}
+
+// "[+-]P[nW][nD][T[nH][nM][nS]]" -> seconds (signed).
+fn parse_duration(s0: str, out: *mut i64) -> bool {
+    let s: str = trim(s0)
+    var i: usize = 0
+    var neg: bool = false
+    if i < s.n && (at(s, i) == 43 as u8 || at(s, i) == 45 as u8) {
+        neg = at(s, i) == 45 as u8
+        i = i + 1
+    }
+    if i >= s.n || (at(s, i) != 80 as u8 && at(s, i) != 112 as u8) {
+        return false
+    }
+    i = i + 1
+    var total: i64 = 0
+    var in_time: bool = false
+    var any: bool = false
+    while i < s.n {
+        let c: u8 = at(s, i)
+        if c == 84 as u8 || c == 116 as u8 {
+            if in_time {
+                return false
+            }
+            in_time = true
+            i = i + 1
+            continue
+        }
+        var v: i64 = 0
+        var nd: usize = 0
+        while i < s.n && at(s, i) >= 48 as u8 && at(s, i) <= 57 as u8 {
+            if nd >= 12 {
+                return false
+            }
+            v = v * 10 + ((at(s, i) - 48 as u8) as i64)
+            nd = nd + 1
+            i = i + 1
+        }
+        if nd == 0 || i >= s.n {
+            return false
+        }
+        let u: u8 = at(s, i) & 223 as u8
+        i = i + 1
+        if !in_time && u == 87 as u8 {
+            total = total + v * 604800
+        } else if !in_time && u == 68 as u8 {
+            total = total + v * 86400
+        } else if in_time && u == 72 as u8 {
+            total = total + v * 3600
+        } else if in_time && u == 77 as u8 {
+            total = total + v * 60
+        } else if in_time && u == 83 as u8 {
+            total = total + v
+        } else {
+            return false
+        }
+        any = true
+    }
+    if !any {
+        return false
+    }
+    if neg {
+        total = 0 - total
+    }
+    *out = total
+    return true
+}
+
+fn format_duration(secs: i64, out: *mut rt.Buf) {
+    var v: i64 = secs
+    if v < 0 {
+        rt.buf_push(out, 45 as u8)
+        v = 0 - v
+    }
+    rt.buf_push(out, 80 as u8)
+    if v != 0 && v % 604800 == 0 {
+        rt.buf_push_dec_i64(out, v / 604800)
+        rt.buf_push(out, 87 as u8)
+        return
+    }
+    let days: i64 = v / 86400
+    let rest: i64 = v % 86400
+    if days > 0 {
+        rt.buf_push_dec_i64(out, days)
+        rt.buf_push(out, 68 as u8)
+    }
+    if rest > 0 || v == 0 {
+        rt.buf_push(out, 84 as u8)
+        if rest / 3600 > 0 {
+            rt.buf_push_dec_i64(out, rest / 3600)
+            rt.buf_push(out, 72 as u8)
+        }
+        if (rest / 60) % 60 > 0 {
+            rt.buf_push_dec_i64(out, (rest / 60) % 60)
+            rt.buf_push(out, 77 as u8)
+        }
+        if rest % 60 > 0 || v == 0 {
+            rt.buf_push_dec_i64(out, rest % 60)
+            rt.buf_push(out, 83 as u8)
+        }
+    }
+}
+
+// "start/end" or "start/duration" -> the two instants as local seconds.
+fn parse_period(s: str, start: *mut i64, end: *mut i64) -> bool {
+    var k: usize = 0
+    while k < s.n && at(s, k) != 47 as u8 {
+        k = k + 1
+    }
+    if k >= s.n {
+        return false
+    }
+    var a: DateVal = DateVal { y: 1970, m: 1, d: 1, hh: 0, mm: 0, ss: 0, date_only: false, utc: false }
+    if !parse_datetime(str { p: s.p, n: k }, &a) {
+        return false
+    }
+    let rest: str = str { p: s.p + k + 1, n: s.n - k - 1 }
+    *start = secs_of(a)
+    var b: DateVal = DateVal { y: 1970, m: 1, d: 1, hh: 0, mm: 0, ss: 0, date_only: false, utc: false }
+    if parse_datetime(rest, &b) {
+        *end = secs_of(b)
+        return true
+    }
+    var dur: i64 = 0
+    if parse_duration(rest, &dur) {
+        *end = *start + dur
+        return true
+    }
+    return false
+}
+
+// "+0100", "-0530", "+013045" -> seconds.
+fn parse_offset(s0: str, out: *mut i64) -> bool {
+    let s: str = trim(s0)
+    if s.n != 5 && s.n != 7 {
+        return false
+    }
+    if at(s, 0) != 43 as u8 && at(s, 0) != 45 as u8 {
+        return false
+    }
+    var h: i64 = 0
+    var m: i64 = 0
+    var sec: i64 = 0
+    if !digits(s, 1, 2, &h) || !digits(s, 3, 2, &m) {
+        return false
+    }
+    if s.n == 7 && !digits(s, 5, 2, &sec) {
+        return false
+    }
+    var v: i64 = h * 3600 + m * 60 + sec
+    if at(s, 0) == 45 as u8 {
+        v = 0 - v
+    }
+    *out = v
+    return true
+}
+
+// The raw value of the first property `name` of the component, "" if none.
+fn get_prop(d: *mut content.Doc, comp: usize, name: str) -> str {
+    let p: i64 = content.find_prop(d, comp, name, -1)
+    if p < 0 {
+        return ""
+    }
+    return content.prop_value(d, p as usize)
+}
+
+// DTSTART of a component: local seconds, date-only / utc flags and its TZID ("" if none).
+// false if there is none or it is malformed.
+fn event_start(d: *mut content.Doc, comp: usize, secs: *mut i64, date_only: *mut bool, utc: *mut bool, tzid: *mut str) -> bool {
+    let p: i64 = content.find_prop(d, comp, "DTSTART", -1)
+    if p < 0 {
+        return false
+    }
+    var v: DateVal = DateVal { y: 1970, m: 1, d: 1, hh: 0, mm: 0, ss: 0, date_only: false, utc: false }
+    if !parse_datetime(content.prop_value(d, p as usize), &v) {
+        return false
+    }
+    *secs = secs_of(v)
+    *date_only = v.date_only
+    *utc = v.utc
+    *tzid = content.param(d, p as usize, "TZID")
+    return true
+}
+
+// The length of the event in seconds: DTEND - DTSTART, or DURATION, or one day for a DATE start,
+// else 0.
+fn event_duration(d: *mut content.Doc, comp: usize) -> i64 {
+    var s0: i64 = 0
+    var date_only: bool = false
+    var utc: bool = false
+    var tz: str = ""
+    if !event_start(d, comp, &s0, &date_only, &utc, &tz) {
+        return 0
+    }
+    var v: DateVal = DateVal { y: 1970, m: 1, d: 1, hh: 0, mm: 0, ss: 0, date_only: false, utc: false }
+    let pe: i64 = content.find_prop(d, comp, "DTEND", -1)
+    if pe >= 0 && parse_datetime(content.prop_value(d, pe as usize), &v) {
+        return secs_of(v) - s0
+    }
+    let pd: i64 = content.find_prop(d, comp, "DUE", -1)
+    if pd >= 0 && parse_datetime(content.prop_value(d, pd as usize), &v) {
+        return secs_of(v) - s0
+    }
+    var dur: i64 = 0
+    if parse_duration(get_prop(d, comp, "DURATION"), &dur) {
+        return dur
+    }
+    if date_only {
+        return 86400
+    }
+    return 0
+}
+
+// Reads every value of a (comma separated) RDATE / EXDATE property into `out` as local seconds;
+// a DATE value counts as its midnight, a PERIOD as its start.
+fn read_dates(d: *mut content.Doc, p: usize, out: *mut Vec[i64]) {
+    let v: str = content.prop_value(d, p)
+    var a: usize = 0
+    var i: usize = 0
+    while i <= v.n {
+        if i == v.n || at(v, i) == 44 as u8 {
+            let item: str = str { p: v.p + a, n: i - a }
+            var dv: DateVal = DateVal { y: 1970, m: 1, d: 1, hh: 0, mm: 0, ss: 0, date_only: false, utc: false }
+            var s: i64 = 0
+            var e: i64 = 0
+            if parse_datetime(item, &dv) {
+                vec_push[i64](out, secs_of(dv))
+            } else if parse_period(item, &s, &e) {
+                vec_push[i64](out, s)
+            }
+            a = i + 1
+        }
+        i = i + 1
+    }
+}
+
+// The occurrences of a VEVENT / VTODO / VJOURNAL in [from, to] (wall-clock seconds of its DTSTART),
+// at most max_n, sorted, without duplicates; DTSTART counts as the first instance. Returns the
+// rrule status (S_OK = 0) or 100 if the component has no valid DTSTART.
+fn occurrences(d: *mut content.Doc, comp: usize, from: i64, to: i64, max_n: usize, out: *mut Vec[i64]) -> u32 {
+    var s0: i64 = 0
+    var date_only: bool = false
+    var utc: bool = false
+    var tz: str = ""
+    if !event_start(d, comp, &s0, &date_only, &utc, &tz) {
+        return 100
+    }
+    var status: u32 = rrule.S_OK
+    var all: Vec[i64] = vec_new[i64]()
+    var ex: Vec[i64] = vec_new[i64]()
+    var exday: Vec[i64] = vec_new[i64]()
+    vec_push[i64](&all, s0)
+    var p: i64 = content.find_prop(d, comp, "EXDATE", -1)
+    while p >= 0 {
+        let first: usize = vec_len[i64](&ex)
+        read_dates(d, p as usize, &ex)
+        if ieq_value(d, p as usize) {
+            var k: usize = first
+            while k < vec_len[i64](&ex) {
+                vec_push[i64](&exday, civil.floor_div(vec_at[i64](&ex, k), 86400))
+                k = k + 1
+            }
+        }
+        p = content.find_prop(d, comp, "EXDATE", p)
+    }
+    p = content.find_prop(d, comp, "RDATE", -1)
+    while p >= 0 {
+        read_dates(d, p as usize, &all)
+        p = content.find_prop(d, comp, "RDATE", p)
+    }
+    p = content.find_prop(d, comp, "RRULE", -1)
+    while p >= 0 {
+        var r: rrule.Rule = rrule.rule_new()
+        if rrule.parse(content.prop_value(d, p as usize), &r) == rrule.E_OK {
+            if r.has_until && r.until_kind == rrule.UNTIL_UTC && tz.n > 0 {
+                var off: i64 = 0
+                if tz_offset_local_by_name(d, tz, s0, &off) {
+                    r.until = r.until + off
+                }
+            }
+            let st: u32 = rrule.expand(&r, s0, s0, to, max_n + vec_len[i64](&ex) + 1, &all)
+            if st != rrule.S_OK {
+                status = st
+            }
+        }
+        rrule.rule_free(&r)
+        p = content.find_prop(d, comp, "RRULE", p)
+    }
+    vec_sort[i64](&all)
+    var last: i64 = 0
+    var have: bool = false
+    var i: usize = 0
+    while i < vec_len[i64](&all) && vec_len[i64](out) < max_n {
+        let x: i64 = vec_at[i64](&all, i)
+        i = i + 1
+        if have && x == last {
+            continue
+        }
+        last = x
+        have = true
+        if x < from || x > to {
+            continue
+        }
+        if vec_contains[i64](&ex, x) || vec_contains[i64](&exday, civil.floor_div(x, 86400)) && is_day_exdate(d, comp, x) {
+            continue
+        }
+        vec_push[i64](out, x)
+    }
+    vec_free[i64](&all)
+    vec_free[i64](&ex)
+    vec_free[i64](&exday)
+    return status
+}
+
+fn ieq_value(d: *mut content.Doc, p: usize) -> bool {
+    return content.ieq(content.param(d, p, "VALUE"), "DATE")
+}
+
+// Is `x` removed by a DATE-valued EXDATE (a whole day)?
+fn is_day_exdate(d: *mut content.Doc, comp: usize, x: i64) -> bool {
+    var p: i64 = content.find_prop(d, comp, "EXDATE", -1)
+    while p >= 0 {
+        if ieq_value(d, p as usize) {
+            var tmp: Vec[i64] = vec_new[i64]()
+            read_dates(d, p as usize, &tmp)
+            var k: usize = 0
+            var hit: bool = false
+            while k < vec_len[i64](&tmp) {
+                if civil.floor_div(vec_at[i64](&tmp, k), 86400) == civil.floor_div(x, 86400) {
+                    hit = true
+                }
+                k = k + 1
+            }
+            vec_free[i64](&tmp)
+            if hit {
+                return true
+            }
+        }
+        p = content.find_prop(d, comp, "EXDATE", p)
+    }
+    return false
+}
+
+// ------------------------------------------------------------------ VTIMEZONE
+
+// The top-level (or VCALENDAR-level) VTIMEZONE whose TZID is `tzid`; NONE if there is none.
+fn find_vtimezone(d: *mut content.Doc, tzid: str) -> i64 {
+    var cal: i64 = content.comp_first_child(d, -1)
+    while cal >= 0 {
+        var v: i64 = content.find_comp(d, cal, "VTIMEZONE", -1)
+        while v >= 0 {
+            if content.ieq(get_prop(d, v as usize, "TZID"), tzid) {
+                return v
+            }
+            v = content.find_comp(d, cal, "VTIMEZONE", v)
+        }
+        if content.ieq(content.comp_name(d, cal as usize), "VTIMEZONE") && content.ieq(get_prop(d, cal as usize, "TZID"), tzid) {
+            return cal
+        }
+        cal = content.comp_next(d, cal as usize)
+    }
+    return -1
+}
+
+// The UTC offset (seconds) in force at the wall-clock time `local` according to the VTIMEZONE
+// component `vtz`. false if the component has no usable STANDARD / DAYLIGHT part.
+fn tz_offset_local(d: *mut content.Doc, vtz: usize, local: i64, out: *mut i64) -> bool {
+    var best_onset: i64 = 0
+    var best_off: i64 = 0
+    var have_best: bool = false
+    var first_start: i64 = 0
+    var first_from: i64 = 0
+    var have_first: bool = false
+    var c: i64 = content.comp_first_child(d, vtz as i64)
+    while c >= 0 {
+        let nm: str = content.comp_name(d, c as usize)
+        if content.ieq(nm, "STANDARD") || content.ieq(nm, "DAYLIGHT") {
+            var dv: DateVal = DateVal { y: 1970, m: 1, d: 1, hh: 0, mm: 0, ss: 0, date_only: false, utc: false }
+            var to_off: i64 = 0
+            var from_off: i64 = 0
+            if parse_datetime(get_prop(d, c as usize, "DTSTART"), &dv) && parse_offset(get_prop(d, c as usize, "TZOFFSETTO"), &to_off) {
+                let s0: i64 = secs_of(dv)
+                if !parse_offset(get_prop(d, c as usize, "TZOFFSETFROM"), &from_off) {
+                    from_off = to_off
+                }
+                if !have_first || s0 < first_start {
+                    first_start = s0
+                    first_from = from_off
+                    have_first = true
+                }
+                var ons: Vec[i64] = vec_new[i64]()
+                vec_push[i64](&ons, s0)
+                var p: i64 = content.find_prop(d, c as usize, "RDATE", -1)
+                while p >= 0 {
+                    read_dates(d, p as usize, &ons)
+                    p = content.find_prop(d, c as usize, "RDATE", p)
+                }
+                let pr: i64 = content.find_prop(d, c as usize, "RRULE", -1)
+                if pr >= 0 {
+                    var r: rrule.Rule = rrule.rule_new()
+                    if rrule.parse(content.prop_value(d, pr as usize), &r) == rrule.E_OK {
+                        rrule.expand(&r, s0, s0, local, 20000, &ons)
+                    }
+                    rrule.rule_free(&r)
+                }
+                var k: usize = 0
+                while k < vec_len[i64](&ons) {
+                    let o: i64 = vec_at[i64](&ons, k)
+                    if o <= local && (!have_best || o > best_onset) {
+                        best_onset = o
+                        best_off = to_off
+                        have_best = true
+                    }
+                    k = k + 1
+                }
+                vec_free[i64](&ons)
+            }
+        }
+        c = content.comp_next(d, c as usize)
+    }
+    if have_best {
+        *out = best_off
+        return true
+    }
+    if have_first {
+        *out = first_from
+        return true
+    }
+    return false
+}
+
+fn tz_offset_local_by_name(d: *mut content.Doc, tzid: str, local: i64, out: *mut i64) -> bool {
+    let v: i64 = find_vtimezone(d, tzid)
+    if v < 0 {
+        return false
+    }
+    return tz_offset_local(d, v as usize, local, out)
+}
+
+// Wall-clock seconds in zone `tzid` -> UTC seconds, through the VTIMEZONE in the document.
+fn local_to_utc(d: *mut content.Doc, tzid: str, local: i64, out: *mut i64) -> bool {
+    var off: i64 = 0
+    if !tz_offset_local_by_name(d, tzid, local, &off) {
+        return false
+    }
+    *out = local - off
+    return true
+}
+
+// ------------------------------------------------------------------ builders
+
+// Adds a TEXT property (value escaped).
+fn add_text(d: *mut content.Doc, name: str, text: str) -> i64 {
+    var b: rt.Buf = rt.buf_new()
+    content.text_escape(text, &b)
+    let p: i64 = content.add_prop(d, "", name, str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return p
+}
+
+// Adds a property whose value is used as given.
+fn add_raw(d: *mut content.Doc, name: str, value: str) -> i64 {
+    return content.add_prop(d, "", name, value)
+}
+
+// A DATE or DATE-TIME property; a non-empty `tzid` becomes a TZID parameter (not for UTC / DATE).
+fn add_datetime(d: *mut content.Doc, name: str, v: DateVal, tzid: str) -> i64 {
+    var b: rt.Buf = rt.buf_new()
+    format_datetime(v, &b)
+    let p: i64 = content.add_prop(d, "", name, str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    if p >= 0 {
+        if v.date_only {
+            content.add_param(d, "VALUE", "DATE")
+        } else if tzid.n > 0 && !v.utc {
+            content.add_param(d, "TZID", tzid)
+        }
+    }
+    return p
+}
+
+fn add_duration(d: *mut content.Doc, name: str, secs: i64) -> i64 {
+    var b: rt.Buf = rt.buf_new()
+    format_duration(secs, &b)
+    let p: i64 = content.add_prop(d, "", name, str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return p
+}
+
+fn add_rrule(d: *mut content.Doc, r: *mut rrule.Rule) -> i64 {
+    var b: rt.Buf = rt.buf_new()
+    rrule.format(r, &b)
+    let p: i64 = content.add_prop(d, "", "RRULE", str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return p
+}

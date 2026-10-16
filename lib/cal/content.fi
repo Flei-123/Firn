@@ -1,0 +1,1004 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/cal/content.fi -- cal.content: the "content line" format shared by iCalendar (RFC 5545)
+// and vCard (RFC 6350, 2426, 2425; 2.1 in part): line unfolding / folding, groups, parameters,
+// nested BEGIN/END components -- parsed into a flat document and written back.
+//
+//     import cal.content
+//     var d: content.Doc = content.doc_new()
+//     let flags: u32 = content.parse(text, &d)                  // never fails hard; flags say what was odd
+//     var ev: i64 = content.find_comp(&d, -1, "VEVENT", -1)     // first top-level VEVENT ... (-1 = root)
+//     var p: i64 = content.find_prop(&d, ev as usize, "SUMMARY", -1)
+//     content.prop_value(&d, p as usize)                        // raw value (still escaped)
+//     content.param(&d, p as usize, "TZID")                     // first value of a parameter, "" if none
+//     content.write(&d, &out)                                   // CRLF, folded at 75 octets
+//
+//     // building:   begin(&d, "VCALENDAR"); add_prop(&d, "", "VERSION", "2.0"); add_param(&d, "X", "y"); end(&d)
+//
+// MODEL. All text lives in one arena; Comp / Prop / Param records hold offsets. A component knows
+// its parent, children and properties (in file order); `items` keeps the exact order of BEGIN /
+// property / END lines, which is what `write` replays. Property values are RAW: the TEXT escapes of
+// the value type (`\n`, `\,`, `\;`, `\\`) are NOT undone -- `text_unescape` / `text_escape` /
+// `split_at` do that, because only the caller knows the value type.
+//
+// PARAMETERS. `NAME=a,b` and `NAME="x;y","z"` become one Param record per value (the first of a
+// parameter has `first` set, so `TYPE=a;TYPE=b` and `TYPE=a,b` stay different); surrounding quotes
+// are removed (`quoted` remembers them) and RFC 6868 carets are decoded (`^n` newline, `^'` quote,
+// `^^` caret). A bare parameter (`TEL;WORK;VOICE:`, vCard 2.1) is read as TYPE=WORK, TYPE=VOICE with `bare` set.
+//
+// HONEST
+// L1  Bytes, not characters: UTF-8 is carried through unchanged, nothing is validated. Folding
+//     never splits a UTF-8 sequence. CR, LF and CRLF all end a physical line; a following line that
+//     starts with SPACE or TAB continues the previous one (one whitespace octet is dropped).
+// L2  vCard 2.1 quoted-printable: a logical line whose parameters contain QUOTED-PRINTABLE and ends
+//     with `=` continues on the next physical line (soft break). The value is NOT decoded here
+//     (`qp_decode` does it); the writer writes it back as it was read.
+// L3  Names are kept as written (case preserved); every search is case-insensitive.
+// L4  Errors are counted, never fatal: E_BAD_LINE (no ':'), E_UNCLOSED (missing END, closed at the
+//     end of input), E_MISMATCH (END of another component), E_ORPHAN (property outside any component,
+//     dropped). `error_line` is the first physical line that went wrong.
+
+import std.rt
+import std.vec
+
+export {
+    Doc, Comp, Prop, Param, Item, NONE,
+    E_BAD_LINE, E_UNCLOSED, E_MISMATCH, E_ORPHAN,
+    doc_new, doc_free, parse, write,
+    comp_count, prop_count, comp_name, comp_parent, comp_first_child, comp_next, comp_first_prop, prop_next, prop_comp,
+    prop_name, prop_group, prop_value, prop_line, prop_param_count, prop_param_name, prop_param_value, param, has_param,
+    find_comp, find_prop, error_flags, error_line, name_eq,
+    begin, end, add_prop, add_param, set_prop_value,
+    text_escape, text_unescape, split_count, split_at, qp_decode, ieq,
+}
+
+const NONE: i64 = -1
+
+const E_BAD_LINE: u32 = 1
+const E_UNCLOSED: u32 = 2
+const E_MISMATCH: u32 = 4
+const E_ORPHAN: u32 = 8
+
+const K_BEGIN: u8 = 0
+const K_PROP: u8 = 1
+const K_END: u8 = 2
+
+struct Comp {
+    name_o: usize,
+    name_n: usize,
+    parent: i64,
+    first_prop: i64,
+    last_prop: i64,
+    first_child: i64,
+    last_child: i64,
+    next: i64, // next sibling (also among the top-level components)
+}
+
+struct Prop {
+    group_o: usize,
+    group_n: usize,
+    name_o: usize,
+    name_n: usize,
+    val_o: usize,
+    val_n: usize,
+    comp: usize,
+    next: i64,
+    first_param: usize,
+    nparams: usize,
+    line: usize,
+}
+
+struct Param {
+    name_o: usize,
+    name_n: usize,
+    val_o: usize,
+    val_n: usize,
+    first: bool, // first value of its parameter
+    quoted: bool,
+    bare: bool,
+}
+
+struct Item {
+    kind: u8,
+    idx: usize,
+}
+
+struct Doc {
+    arena: rt.Buf,
+    comps: Vec[Comp],
+    props: Vec[Prop],
+    params: Vec[Param],
+    items: Vec[Item],
+    open: Vec[usize], // stack of open components
+    first_root: i64,
+    last_root: i64,
+    errors: u32,
+    err_line: usize,
+    line_buf: rt.Buf,
+}
+
+fn doc_new() -> Doc {
+    return Doc {
+        arena: rt.buf_new(), comps: vec_new[Comp](), props: vec_new[Prop](), params: vec_new[Param](), items: vec_new[Item](),
+        open: vec_new[usize](), first_root: -1, last_root: -1, errors: 0, err_line: 0, line_buf: rt.buf_new(),
+    }
+}
+
+fn doc_free(d: *mut Doc) {
+    rt.buf_free(&(*d).arena)
+    rt.buf_free(&(*d).line_buf)
+    vec_free[Comp](&(*d).comps)
+    vec_free[Prop](&(*d).props)
+    vec_free[Param](&(*d).params)
+    vec_free[Item](&(*d).items)
+    vec_free[usize](&(*d).open)
+}
+
+// ------------------------------------------------------------------ small helpers
+
+fn at(s: str, i: usize) -> u8 {
+    return rt.ld8(s.p as u64, i)
+}
+
+fn up(c: u8) -> u8 {
+    if c >= 97 as u8 && c <= 122 as u8 {
+        return c - 32 as u8
+    }
+    return c
+}
+
+// Equal ignoring ASCII case.
+fn ieq(a: str, b: str) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    var i: usize = 0
+    while i < a.n {
+        if up(at(a, i)) != up(at(b, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn name_eq(a: str, b: str) -> bool {
+    return ieq(a, b)
+}
+
+fn arena_str(d: *mut Doc, o: usize, n: usize) -> str {
+    if n == 0 {
+        return ""
+    }
+    return str { p: rt.buf_data(&(*d).arena) + o, n: n }
+}
+
+fn stash(d: *mut Doc, p: *mut u8, n: usize) -> usize {
+    let o: usize = rt.buf_len(&(*d).arena)
+    rt.buf_push_bytes(&(*d).arena, p as u64, n)
+    return o
+}
+
+fn comp_at(d: *mut Doc, i: usize) -> *mut Comp {
+    return vec_elem_ptr[Comp](&(*d).comps, i)
+}
+
+fn prop_at(d: *mut Doc, i: usize) -> *mut Prop {
+    return vec_elem_ptr[Prop](&(*d).props, i)
+}
+
+fn param_at(d: *mut Doc, i: usize) -> *mut Param {
+    return vec_elem_ptr[Param](&(*d).params, i)
+}
+
+fn flag(d: *mut Doc, f: u32, line: usize) {
+    if (*d).errors == 0 {
+        (*d).err_line = line
+    }
+    (*d).errors = (*d).errors | f
+}
+
+// ------------------------------------------------------------------ building
+
+fn new_comp(d: *mut Doc, name: str) -> usize {
+    let idx: usize = vec_len[Comp](&(*d).comps)
+    var parent: i64 = -1
+    if vec_len[usize](&(*d).open) > 0 {
+        parent = vec_at[usize](&(*d).open, vec_len[usize](&(*d).open) - 1) as i64
+    }
+    let o: usize = stash(d, name.p, name.n)
+    vec_push[Comp](&(*d).comps, Comp { name_o: o, name_n: name.n, parent: parent, first_prop: -1, last_prop: -1, first_child: -1, last_child: -1, next: -1 })
+    if parent >= 0 {
+        let pc: *mut Comp = comp_at(d, parent as usize)
+        if (*pc).last_child >= 0 {
+            (*comp_at(d, (*pc).last_child as usize)).next = idx as i64
+        } else {
+            (*pc).first_child = idx as i64
+        }
+        (*pc).last_child = idx as i64
+    } else {
+        if (*d).last_root >= 0 {
+            (*comp_at(d, (*d).last_root as usize)).next = idx as i64
+        } else {
+            (*d).first_root = idx as i64
+        }
+        (*d).last_root = idx as i64
+    }
+    vec_push[usize](&(*d).open, idx)
+    vec_push[Item](&(*d).items, Item { kind: K_BEGIN, idx: idx })
+    return idx
+}
+
+// Opens a component under the one that is open now (or at the top).
+fn begin(d: *mut Doc, name: str) -> usize {
+    return new_comp(d, name)
+}
+
+// Closes the innermost open component.
+fn end(d: *mut Doc) {
+    let n: usize = vec_len[usize](&(*d).open)
+    if n == 0 {
+        return
+    }
+    let idx: usize = vec_at[usize](&(*d).open, n - 1)
+    vec_shorten[usize](&(*d).open, n - 1)
+    vec_push[Item](&(*d).items, Item { kind: K_END, idx: idx })
+}
+
+// Adds a property to the open component. `value` is stored as given (escape it first with
+// text_escape when it is TEXT). Returns the property index, or NONE outside a component.
+fn add_prop(d: *mut Doc, group: str, name: str, value: str) -> i64 {
+    return add_prop_line(d, group, name, value, 0)
+}
+
+fn add_prop_line(d: *mut Doc, group: str, name: str, value: str, line: usize) -> i64 {
+    let n: usize = vec_len[usize](&(*d).open)
+    if n == 0 {
+        return -1
+    }
+    let comp: usize = vec_at[usize](&(*d).open, n - 1)
+    let idx: usize = vec_len[Prop](&(*d).props)
+    let go: usize = stash(d, group.p, group.n)
+    let no: usize = stash(d, name.p, name.n)
+    let vo: usize = stash(d, value.p, value.n)
+    vec_push[Prop](&(*d).props, Prop {
+        group_o: go, group_n: group.n, name_o: no, name_n: name.n, val_o: vo, val_n: value.n, comp: comp, next: -1,
+        first_param: vec_len[Param](&(*d).params), nparams: 0, line: line,
+    })
+    let c: *mut Comp = comp_at(d, comp)
+    if (*c).last_prop >= 0 {
+        (*prop_at(d, (*c).last_prop as usize)).next = idx as i64
+    } else {
+        (*c).first_prop = idx as i64
+    }
+    (*c).last_prop = idx as i64
+    vec_push[Item](&(*d).items, Item { kind: K_PROP, idx: idx })
+    return idx as i64
+}
+
+// Adds a parameter value to the LAST added property (a new parameter named `name`).
+fn add_param(d: *mut Doc, name: str, value: str) {
+    push_param(d, name, value, true, false, false)
+}
+
+fn push_param(d: *mut Doc, name: str, value: str, first: bool, quoted: bool, bare: bool) {
+    let np: usize = vec_len[Prop](&(*d).props)
+    if np == 0 {
+        return
+    }
+    let p: *mut Prop = prop_at(d, np - 1)
+    // parameters of a property are contiguous: only the newest property may still grow
+    if (*p).first_param + (*p).nparams != vec_len[Param](&(*d).params) {
+        return
+    }
+    let no: usize = stash(d, name.p, name.n)
+    let vo: usize = stash(d, value.p, value.n)
+    vec_push[Param](&(*d).params, Param { name_o: no, name_n: name.n, val_o: vo, val_n: value.n, first: first, quoted: quoted, bare: bare })
+    (*p).nparams = (*p).nparams + 1
+}
+
+fn set_prop_value(d: *mut Doc, p: usize, value: str) {
+    let o: usize = stash(d, value.p, value.n)
+    (*prop_at(d, p)).val_o = o
+    (*prop_at(d, p)).val_n = value.n
+}
+
+// ------------------------------------------------------------------ parsing
+
+fn is_ws(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8
+}
+
+// Does `ln[0..n)` before its first unquoted ':' mention QUOTED-PRINTABLE?
+fn has_qp(ln: str) -> bool {
+    var i: usize = 0
+    var quoted: bool = false
+    let key: str = "QUOTED-PRINTABLE"
+    while i < ln.n {
+        let c: u8 = at(ln, i)
+        if c == 34 as u8 {
+            quoted = !quoted
+        }
+        if c == 58 as u8 && !quoted {
+            return false
+        }
+        if !quoted && up(c) == 81 as u8 && i + key.n <= ln.n {
+            if ieq(str { p: ln.p + i, n: key.n }, key) {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn push_decoded_param(d: *mut Doc, name: str, a: *mut u8, n: usize, first: bool, quoted: bool, bare: bool) {
+    var tmp: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(a as u64, i)
+        if c == 94 as u8 && i + 1 < n {
+            let e: u8 = rt.ld8(a as u64, i + 1)
+            if e == 110 as u8 || e == 78 as u8 {
+                rt.buf_push(&tmp, 10 as u8)
+                i = i + 2
+                continue
+            }
+            if e == 39 as u8 {
+                rt.buf_push(&tmp, 34 as u8)
+                i = i + 2
+                continue
+            }
+            if e == 94 as u8 {
+                rt.buf_push(&tmp, 94 as u8)
+                i = i + 2
+                continue
+            }
+        }
+        rt.buf_push(&tmp, c)
+        i = i + 1
+    }
+    push_param(d, name, str { p: rt.buf_data(&tmp), n: rt.buf_len(&tmp) }, first, quoted, bare)
+    rt.buf_free(&tmp)
+}
+
+fn parse_line(d: *mut Doc, ln: str, line_no: usize) {
+    let n: usize = ln.n
+    var i: usize = 0
+    var dot: usize = n
+    while i < n && at(ln, i) != 59 as u8 && at(ln, i) != 58 as u8 {
+        if at(ln, i) == 46 as u8 && dot == n {
+            dot = i
+        }
+        i = i + 1
+    }
+    if i >= n && true {
+        flag(d, E_BAD_LINE, line_no)
+        return
+    }
+    var group: str = ""
+    var name: str = str { p: ln.p, n: i }
+    if dot < i {
+        group = str { p: ln.p, n: dot }
+        name = str { p: ln.p + dot + 1, n: i - dot - 1 }
+    }
+    if name.n == 0 {
+        flag(d, E_BAD_LINE, line_no)
+        return
+    }
+    // find the ':' that ends the parameters (quotes protect), without building anything yet
+    var j: usize = i
+    var quoted: bool = false
+    while j < n {
+        let c: u8 = at(ln, j)
+        if c == 34 as u8 {
+            quoted = !quoted
+        } else if c == 58 as u8 && !quoted {
+            break
+        }
+        j = j + 1
+    }
+    if j >= n {
+        flag(d, E_BAD_LINE, line_no)
+        return
+    }
+    let value: str = str { p: ln.p + j + 1, n: n - j - 1 }
+    if group.n == 0 && ieq(name, "BEGIN") {
+        var vs: usize = 0
+        var ve: usize = value.n
+        while vs < ve && is_ws(at(value, vs)) { vs = vs + 1 }
+        while ve > vs && is_ws(at(value, ve - 1)) { ve = ve - 1 }
+        new_comp(d, str { p: value.p + vs, n: ve - vs })
+        return
+    }
+    if group.n == 0 && ieq(name, "END") {
+        var vs: usize = 0
+        var ve: usize = value.n
+        while vs < ve && is_ws(at(value, vs)) { vs = vs + 1 }
+        while ve > vs && is_ws(at(value, ve - 1)) { ve = ve - 1 }
+        let want: str = str { p: value.p + vs, n: ve - vs }
+        // close down to the innermost open component with this name
+        var k: i64 = (vec_len[usize](&(*d).open) as i64) - 1
+        var found: i64 = -1
+        while k >= 0 {
+            let ci: usize = vec_at[usize](&(*d).open, k as usize)
+            let c: *mut Comp = comp_at(d, ci)
+            if ieq(arena_str(d, (*c).name_o, (*c).name_n), want) {
+                found = k
+                break
+            }
+            k = k - 1
+        }
+        if found < 0 {
+            flag(d, E_MISMATCH, line_no)
+            return
+        }
+        if (found as usize) + 1 != vec_len[usize](&(*d).open) {
+            flag(d, E_MISMATCH, line_no)
+        }
+        while vec_len[usize](&(*d).open) > (found as usize) {
+            end(d)
+        }
+        return
+    }
+    let pi: i64 = add_prop_line(d, group, name, value, line_no)
+    if pi < 0 {
+        flag(d, E_ORPHAN, line_no)
+        return
+    }
+    // parameters between i and j
+    var k: usize = i
+    while k < j {
+        // at ';'
+        k = k + 1
+        let ps: usize = k
+        while k < j && at(ln, k) != 61 as u8 && at(ln, k) != 59 as u8 {
+            k = k + 1
+        }
+        if k >= j || at(ln, k) == 59 as u8 {
+            // bare parameter (vCard 2.1): TYPE=<text>
+            if k > ps {
+                push_decoded_param(d, "TYPE", ln.p + ps, k - ps, true, false, true)
+            }
+            continue
+        }
+        let pname: str = str { p: ln.p + ps, n: k - ps }
+        k = k + 1
+        var first: bool = true
+        while true {
+            if k < j && at(ln, k) == 34 as u8 {
+                k = k + 1
+                let vs: usize = k
+                while k < j && at(ln, k) != 34 as u8 {
+                    k = k + 1
+                }
+                push_decoded_param(d, pname, ln.p + vs, k - vs, first, true, false)
+                if k < j {
+                    k = k + 1
+                }
+                while k < j && at(ln, k) != 44 as u8 && at(ln, k) != 59 as u8 {
+                    k = k + 1
+                }
+            } else {
+                let vs: usize = k
+                while k < j && at(ln, k) != 44 as u8 && at(ln, k) != 59 as u8 {
+                    k = k + 1
+                }
+                push_decoded_param(d, pname, ln.p + vs, k - vs, first, false, false)
+            }
+            first = false
+            if k < j && at(ln, k) == 44 as u8 {
+                k = k + 1
+                continue
+            }
+            break
+        }
+    }
+}
+
+// Parses `text` (an iCalendar or vCard stream, any number of top-level components) INTO `d`.
+// Returns the error flags (0 = clean); `d` is always usable.
+fn parse(text: str, d: *mut Doc) -> u32 {
+    let n: usize = text.n
+    var i: usize = 0
+    var line_no: usize = 0
+    var start_line: usize = 0
+    var have: bool = false
+    var qp: bool = false
+    while i <= n {
+        // one physical line [i, e)
+        var e: usize = i
+        while e < n && at(text, e) != 10 as u8 && at(text, e) != 13 as u8 {
+            e = e + 1
+        }
+        if i == n && e == n {
+            break
+        }
+        line_no = line_no + 1
+        let first: u8 = 0 as u8
+        var cont: bool = false
+        if have && e > i || have && e == i {
+            if e > i && is_ws(at(text, i)) {
+                cont = true
+            }
+        }
+        if have && qp && !cont {
+            // a soft line break of a quoted-printable value
+            cont = rt.buf_len(&(*d).line_buf) > 0 && rt.buf_at(&(*d).line_buf, rt.buf_len(&(*d).line_buf) - 1) == 61 as u8
+            if cont {
+                rt.buf_set_len(&(*d).line_buf, rt.buf_len(&(*d).line_buf) - 1)
+                rt.buf_push_bytes(&(*d).line_buf, text.p as u64 + i as u64, e - i)
+                qp = true
+                // the continuation may itself end with '=': keep qp
+                if e < n {
+                    if at(text, e) == 13 as u8 && e + 1 < n && at(text, e + 1) == 10 as u8 {
+                        e = e + 1
+                    }
+                    e = e + 1
+                }
+                i = e
+                continue
+            }
+        }
+        if cont {
+            rt.buf_push_bytes(&(*d).line_buf, text.p as u64 + i as u64 + 1, e - i - 1)
+        } else {
+            if have {
+                let ln: str = str { p: rt.buf_data(&(*d).line_buf), n: rt.buf_len(&(*d).line_buf) }
+                if ln.n > 0 {
+                    parse_line(d, ln, start_line)
+                }
+            }
+            rt.buf_clear(&(*d).line_buf)
+            rt.buf_push_bytes(&(*d).line_buf, text.p as u64 + i as u64, e - i)
+            start_line = line_no
+            have = true
+            qp = has_qp(str { p: rt.buf_data(&(*d).line_buf), n: rt.buf_len(&(*d).line_buf) })
+        }
+        if e < n {
+            if at(text, e) == 13 as u8 && e + 1 < n && at(text, e + 1) == 10 as u8 {
+                e = e + 1
+            }
+            e = e + 1
+        }
+        i = e
+        if first != 0 as u8 {
+            break
+        }
+    }
+    if have {
+        let ln: str = str { p: rt.buf_data(&(*d).line_buf), n: rt.buf_len(&(*d).line_buf) }
+        if ln.n > 0 {
+            parse_line(d, ln, start_line)
+        }
+    }
+    rt.buf_clear(&(*d).line_buf)
+    if vec_len[usize](&(*d).open) > 0 {
+        flag(d, E_UNCLOSED, line_no)
+        while vec_len[usize](&(*d).open) > 0 {
+            end(d)
+        }
+    }
+    return (*d).errors
+}
+
+// ------------------------------------------------------------------ queries
+
+fn comp_count(d: *mut Doc) -> usize {
+    return vec_len[Comp](&(*d).comps)
+}
+
+fn prop_count(d: *mut Doc) -> usize {
+    return vec_len[Prop](&(*d).props)
+}
+
+fn error_flags(d: *mut Doc) -> u32 {
+    return (*d).errors
+}
+
+fn error_line(d: *mut Doc) -> usize {
+    return (*d).err_line
+}
+
+fn comp_name(d: *mut Doc, i: usize) -> str {
+    if i >= comp_count(d) { return "" }
+    return arena_str(d, (*comp_at(d, i)).name_o, (*comp_at(d, i)).name_n)
+}
+
+fn comp_parent(d: *mut Doc, i: usize) -> i64 {
+    if i >= comp_count(d) { return -1 }
+    return (*comp_at(d, i)).parent
+}
+
+// Child / top-level component lists: `parent` = -1 means the top level.
+fn comp_first_child(d: *mut Doc, parent: i64) -> i64 {
+    if parent < 0 { return (*d).first_root }
+    if (parent as usize) >= comp_count(d) { return -1 }
+    return (*comp_at(d, parent as usize)).first_child
+}
+
+fn comp_next(d: *mut Doc, i: usize) -> i64 {
+    if i >= comp_count(d) { return -1 }
+    return (*comp_at(d, i)).next
+}
+
+fn comp_first_prop(d: *mut Doc, i: usize) -> i64 {
+    if i >= comp_count(d) { return -1 }
+    return (*comp_at(d, i)).first_prop
+}
+
+fn prop_next(d: *mut Doc, p: usize) -> i64 {
+    if p >= prop_count(d) { return -1 }
+    return (*prop_at(d, p)).next
+}
+
+fn prop_comp(d: *mut Doc, p: usize) -> usize {
+    return (*prop_at(d, p)).comp
+}
+
+fn prop_name(d: *mut Doc, p: usize) -> str {
+    if p >= prop_count(d) { return "" }
+    return arena_str(d, (*prop_at(d, p)).name_o, (*prop_at(d, p)).name_n)
+}
+
+fn prop_group(d: *mut Doc, p: usize) -> str {
+    if p >= prop_count(d) { return "" }
+    return arena_str(d, (*prop_at(d, p)).group_o, (*prop_at(d, p)).group_n)
+}
+
+fn prop_value(d: *mut Doc, p: usize) -> str {
+    if p >= prop_count(d) { return "" }
+    return arena_str(d, (*prop_at(d, p)).val_o, (*prop_at(d, p)).val_n)
+}
+
+// The physical line the property started on (0 for built properties).
+fn prop_line(d: *mut Doc, p: usize) -> usize {
+    if p >= prop_count(d) { return 0 }
+    return (*prop_at(d, p)).line
+}
+
+fn prop_param_count(d: *mut Doc, p: usize) -> usize {
+    if p >= prop_count(d) { return 0 }
+    return (*prop_at(d, p)).nparams
+}
+
+fn prop_param_name(d: *mut Doc, p: usize, k: usize) -> str {
+    if p >= prop_count(d) || k >= (*prop_at(d, p)).nparams { return "" }
+    let q: *mut Param = param_at(d, (*prop_at(d, p)).first_param + k)
+    return arena_str(d, (*q).name_o, (*q).name_n)
+}
+
+fn prop_param_value(d: *mut Doc, p: usize, k: usize) -> str {
+    if p >= prop_count(d) || k >= (*prop_at(d, p)).nparams { return "" }
+    let q: *mut Param = param_at(d, (*prop_at(d, p)).first_param + k)
+    return arena_str(d, (*q).val_o, (*q).val_n)
+}
+
+fn has_param(d: *mut Doc, p: usize, name: str) -> bool {
+    var k: usize = 0
+    while k < prop_param_count(d, p) {
+        if ieq(prop_param_name(d, p, k), name) {
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// The first value of the parameter `name`, "" if there is none.
+fn param(d: *mut Doc, p: usize, name: str) -> str {
+    var k: usize = 0
+    while k < prop_param_count(d, p) {
+        if ieq(prop_param_name(d, p, k), name) {
+            return prop_param_value(d, p, k)
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+// The next component named `name` among the children of `parent` (-1 = top level) after
+// `after` (-1 = from the start). NONE at the end.
+fn find_comp(d: *mut Doc, parent: i64, name: str, after: i64) -> i64 {
+    var c: i64 = comp_first_child(d, parent)
+    if after >= 0 {
+        c = comp_next(d, after as usize)
+    }
+    while c >= 0 {
+        if ieq(comp_name(d, c as usize), name) {
+            return c
+        }
+        c = comp_next(d, c as usize)
+    }
+    return -1
+}
+
+fn find_prop(d: *mut Doc, comp: usize, name: str, after: i64) -> i64 {
+    var p: i64 = comp_first_prop(d, comp)
+    if after >= 0 {
+        p = prop_next(d, after as usize)
+    }
+    while p >= 0 {
+        if ieq(prop_name(d, p as usize), name) {
+            return p
+        }
+        p = prop_next(d, p as usize)
+    }
+    return -1
+}
+
+// ------------------------------------------------------------------ writing
+
+const FOLD_AT: usize = 75
+
+struct Folder {
+    out: *mut rt.Buf,
+    col: usize,
+}
+
+// Writes one octet, folding (CRLF + space) when the line would pass 75 octets. Never splits a
+// UTF-8 sequence: a continuation byte (10xxxxxx) is never the first octet of a new line.
+fn put_fold(f: *mut Folder, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if (*f).col >= FOLD_AT {
+            var cont: bool = (c & 192 as u8) == 128 as u8
+            if cont {
+                // move the pending UTF-8 lead back to the new line
+                var out: *mut rt.Buf = (*f).out
+                var k: usize = rt.buf_len(out)
+                var moved: usize = 0
+                while k > 0 && (rt.buf_at(out, k - 1) & 192 as u8) == 128 as u8 && moved < 4 {
+                    k = k - 1
+                    moved = moved + 1
+                }
+                if k > 0 && moved < 4 && (*f).col > moved + 1 {
+                    // k-1 is the lead byte
+                    var tail: rt.Buf = rt.buf_new()
+                    rt.buf_push_bytes(&tail, rt.buf_ptr(out) + (k - 1) as u64, rt.buf_len(out) - (k - 1))
+                    rt.buf_set_len(out, k - 1)
+                    rt.buf_push(out, 13 as u8)
+                    rt.buf_push(out, 10 as u8)
+                    rt.buf_push(out, 32 as u8)
+                    rt.buf_push_bytes(out, rt.buf_ptr(&tail), rt.buf_len(&tail))
+                    (*f).col = 1 + rt.buf_len(&tail)
+                    rt.buf_free(&tail)
+                    cont = false
+                }
+            }
+            if (*f).col >= FOLD_AT {
+                rt.buf_push((*f).out, 13 as u8)
+                rt.buf_push((*f).out, 10 as u8)
+                rt.buf_push((*f).out, 32 as u8)
+                (*f).col = 1
+            }
+        }
+        rt.buf_push((*f).out, c)
+        (*f).col = (*f).col + 1
+        i = i + 1
+    }
+}
+
+fn put_str(f: *mut Folder, s: str) {
+    put_fold(f, s.p as u64, s.n)
+}
+
+fn put_byte(f: *mut Folder, c: u8) {
+    var t: u8 = c
+    let pt: *mut u8 = &t
+    put_fold(f, pt as u64, 1)
+}
+
+fn need_quote(s: str) -> bool {
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = at(s, i)
+        if c == 59 as u8 || c == 58 as u8 || c == 44 as u8 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn put_param_value(f: *mut Folder, s: str, quoted: bool) {
+    let q: bool = quoted || need_quote(s)
+    if q {
+        put_byte(f, 34 as u8)
+    }
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = at(s, i)
+        if c == 10 as u8 {
+            put_str(f, "^n")
+        } else if c == 13 as u8 {
+            // dropped: ^n stands for a line break
+        } else if c == 34 as u8 {
+            put_str(f, "^'")
+        } else if c == 94 as u8 {
+            put_str(f, "^^")
+        } else {
+            put_byte(f, c)
+        }
+        i = i + 1
+    }
+    if q {
+        put_byte(f, 34 as u8)
+    }
+}
+
+fn write_prop(d: *mut Doc, p: usize, out: *mut rt.Buf) {
+    var f: Folder = Folder { out: out, col: 0 }
+    let pr: *mut Prop = prop_at(d, p)
+    if (*pr).group_n > 0 {
+        put_str(&f, arena_str(d, (*pr).group_o, (*pr).group_n))
+        put_byte(&f, 46 as u8)
+    }
+    put_str(&f, arena_str(d, (*pr).name_o, (*pr).name_n))
+    var k: usize = 0
+    while k < (*pr).nparams {
+        let q: *mut Param = param_at(d, (*pr).first_param + k)
+        if (*q).first {
+            put_byte(&f, 59 as u8)
+            if !(*q).bare {
+                put_str(&f, arena_str(d, (*q).name_o, (*q).name_n))
+                put_byte(&f, 61 as u8)
+            }
+        } else {
+            put_byte(&f, 44 as u8)
+        }
+        if (*q).bare {
+            put_str(&f, arena_str(d, (*q).val_o, (*q).val_n))
+        } else {
+            put_param_value(&f, arena_str(d, (*q).val_o, (*q).val_n), (*q).quoted)
+        }
+        k = k + 1
+    }
+    put_byte(&f, 58 as u8)
+    // a value may hold bare CR / LF only when built by hand: they are written as is, escaped by the caller
+    put_str(&f, arena_str(d, (*pr).val_o, (*pr).val_n))
+    rt.buf_push(out, 13 as u8)
+    rt.buf_push(out, 10 as u8)
+}
+
+// Appends the whole document: BEGIN / properties / END lines in the order they were parsed or built,
+// CRLF line ends, folded at 75 octets.
+fn write(d: *mut Doc, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < vec_len[Item](&(*d).items) {
+        let it: *mut Item = vec_elem_ptr[Item](&(*d).items, i)
+        if (*it).kind == K_PROP {
+            write_prop(d, (*it).idx, out)
+        } else {
+            var f: Folder = Folder { out: out, col: 0 }
+            if (*it).kind == K_BEGIN {
+                put_str(&f, "BEGIN:")
+            } else {
+                put_str(&f, "END:")
+            }
+            put_str(&f, comp_name(d, (*it).idx))
+            rt.buf_push(out, 13 as u8)
+            rt.buf_push(out, 10 as u8)
+        }
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------------ value helpers
+
+// TEXT escaping (RFC 5545 3.3.11 / RFC 6350 3.4): backslash, semicolon and comma get a backslash;
+// a line break (CRLF, LF or CR) becomes `\n`.
+fn text_escape(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = at(s, i)
+        if c == 92 as u8 || c == 59 as u8 || c == 44 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, c)
+        } else if c == 10 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 110 as u8)
+        } else if c == 13 as u8 {
+            rt.buf_push(out, 92 as u8)
+            rt.buf_push(out, 110 as u8)
+            if i + 1 < s.n && at(s, i + 1) == 10 as u8 {
+                i = i + 1
+            }
+        } else {
+            rt.buf_push(out, c)
+        }
+        i = i + 1
+    }
+}
+
+// The inverse: `\n` / `\N` -> LF, `\x` -> x for any other x; a lone trailing backslash is kept.
+fn text_unescape(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = at(s, i)
+        if c == 92 as u8 && i + 1 < s.n {
+            let e: u8 = at(s, i + 1)
+            if e == 110 as u8 || e == 78 as u8 {
+                rt.buf_push(out, 10 as u8)
+            } else {
+                rt.buf_push(out, e)
+            }
+            i = i + 2
+            continue
+        }
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+}
+
+// Number of items of a `sep` separated value (`;` for N / ADR / REQUEST-STATUS, `,` for lists);
+// a backslash protects the next octet. "" has one (empty) item.
+fn split_count(s: str, sep: u8) -> usize {
+    var n: usize = 1
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = at(s, i)
+        if c == 92 as u8 {
+            i = i + 2
+            continue
+        }
+        if c == sep {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Item `idx` of the value, still escaped; "" when there is no such item.
+fn split_at(s: str, sep: u8, idx: usize) -> str {
+    var k: usize = 0
+    var a: usize = 0
+    var i: usize = 0
+    while i <= s.n {
+        var cut: bool = i == s.n
+        if !cut {
+            let c: u8 = at(s, i)
+            if c == 92 as u8 {
+                i = i + 2
+                continue
+            }
+            cut = c == sep
+        }
+        if cut {
+            if k == idx {
+                return str { p: s.p + a, n: i - a }
+            }
+            k = k + 1
+            a = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn hex_val(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 { return (c - 48 as u8) as i32 }
+    if c >= 65 as u8 && c <= 70 as u8 { return (c - 55 as u8) as i32 }
+    if c >= 97 as u8 && c <= 102 as u8 { return (c - 87 as u8) as i32 }
+    return -1
+}
+
+// Quoted-printable (vCard 2.1): `=XX` -> octet; a malformed `=` is kept as it stands.
+fn qp_decode(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = at(s, i)
+        if c == 61 as u8 && i + 2 < s.n + 0 && hex_val(at(s, i + 1)) >= 0 && hex_val(at(s, i + 2)) >= 0 {
+            rt.buf_push(out, ((hex_val(at(s, i + 1)) * 16 + hex_val(at(s, i + 2))) as u8))
+            i = i + 3
+            continue
+        }
+        if c == 61 as u8 && i + 2 == s.n - 0 && false {
+            i = i + 1
+            continue
+        }
+        rt.buf_push(out, c)
+        i = i + 1
+    }
+}
