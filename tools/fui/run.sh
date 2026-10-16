@@ -1347,6 +1347,15 @@ build appctl
 "$W/appctl"
 
 echo
+echo "== 18q3. fui.app VIRTUAL LIST (app.vlist_new, r631) =="
+# A list of 100000 rows and a table in a window: click / Shift / Ctrl, double click, keys, typeahead, wheel,
+# scroll bar, header sort, divider drag, a finger (drag, fling, tap), focus, light + dark pixels, audit, and the
+# frame time of the whole window with 100000 rows (release-fast build, limit 5 ms; goal 2 ms).
+build vlistapp
+"$W/vlistapp"
+"$FIRNC" --opt-level=release-fast -o "$W/vlistapp_fast" tools/fui/vlistapp_main.fi
+"$W/vlistapp_fast" speed
+
 echo "== 18q2. fui.appctl PART 2: MENU BAR, TOOLTIP, DIALOGS =="
 # lib/fui/appctl.fi: Alt+letter, shortcuts, Left / Right between menus, check items, the context menu,
 # the tooltip delay (fuiwirt.host_set_wake), message / confirm / input dialogs and the audit.

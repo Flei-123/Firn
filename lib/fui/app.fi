@@ -88,6 +88,9 @@ import fui.ctxmenu
 import fui.ctxstd
 import fui.menuview
 import fui.apphost
+import fui.vlist
+import fui.vlistview
+import fui.viewport
 
 export {
     App, window, label, button, entry, textarea, lines_of, row, column, end, spacer,
@@ -106,6 +109,10 @@ export {
     set_keys, set_wheel, set_motion, KEYX_F5,
     // lib/fui/appctl.fi: the standard controls plug into the window here
     set_ctl, node_new, app_ctx, ctl_ready, ctl_data,
+    // r631: the virtual list (lib/fui/vlist.fi + vlistview.fi) as a node of the window
+    vlist_new, vlist_set_count, vlist_changed, vlist_model, vlist_selected, vlist_select,
+    vlist_set_row_pt, vlist_on_pick, vlist_on_activate, vlist_on_sort, vlist_moving,
+    VL_MAX,
     NONE,
     // the side a host and the tests see (lib/@*/fui/apphost.fi,
     // tools/fui/app_main.fi)
@@ -135,6 +142,43 @@ const AREA_PAD_PT: usize = 16
 const AREA_CAP: usize = 4096
 // a finger moves this far (pixels) before it is a swipe and no longer a tap
 const TOUCH_SLOP: f64 = 8.0
+// virtual lists in one window (each is ONE scene node, whatever its row count)
+const VL_MAX: usize = 4
+// what the pointer is dragging in a virtual list
+const VD_NONE: u32 = 0
+const VD_BAR: u32 = 1
+const VD_COL: u32 = 2
+const VD_TOUCH: u32 = 3
+// a second click on the same row within this many ms is a double click
+const VL_DBL_MS: i64 = 500
+// a finger slower than this (px per ms) does not fling
+const VL_FLING_MIN: f64 = 0.05
+
+// ONE VIRTUAL LIST of the window (vlist_new): the model, the source of the rows, the three callbacks
+// and the pointer state. The scene node paints through vl_draw with a pointer to this slot as `ud`.
+struct VlSlot {
+    a: u64,
+    node: usize,
+    v: vlist.Vlist,
+    src: fn(u64, usize, *mut vlist.VRow),
+    src_ud: u64,
+    pick: fn(*mut App, usize, usize),
+    act: fn(*mut App, usize, usize),
+    sort: fn(*mut App, usize, usize),
+    // row height in design points (0 = the theme's row height)
+    row_pt: usize,
+    // painted in the last frame: a list on a hidden page keeps a stale rectangle and must not hear the pointer
+    live: bool,
+    drag: u32,
+    last_row: usize,
+    last_ms: i64,
+    t_y0: f64,
+    t_y: f64,
+    t_ms: i64,
+    t_vy: f64,
+    t_moved: bool,
+    t_row: usize,
+}
 
 struct App {
     sc: scene.Scene,
@@ -223,6 +267,9 @@ struct App {
     ctl_ptr: fn(u64, u32, f64, f64) -> bool,
     ctl_act: fn(u64, usize),
     ctl_paint: fn(u64, *mut render.Ctx, usize, usize),
+    // r631: the virtual lists
+    vl: [VlSlot; 4],
+    vl_n: usize,
 }
 
 fn cb_none(a: *mut App) {
@@ -244,6 +291,15 @@ fn mo_none(ud: u64, kind: u32, x: f64, y: f64) -> bool { return false }
 fn mo_none_b(ud: u64, kind: u32, x: f64, y: f64) -> bool { return false }
 fn ctl_act_none(ud: u64, i: usize) {}
 fn ctl_paint_none(ud: u64, c: *mut render.Ctx, w: usize, h: usize) {}
+fn vl_src_none(ud: u64, i: usize, r: *mut vlist.VRow) {}
+fn vl_cb_none(a: *mut App, id: usize, i: usize) {}
+
+fn vslot_blank() -> VlSlot {
+    return VlSlot { a: 0, node: 4294967295, v: vlist.vl_new(), src: vl_src_none, src_ud: 0,
+        pick: vl_cb_none, act: vl_cb_none, sort: vl_cb_none, row_pt: 0, live: false, drag: VD_NONE,
+        last_row: 4294967295, last_ms: 0 - 1000000, t_y0: 0.0, t_y: 0.0, t_ms: 0, t_vy: 0.0,
+        t_moved: false, t_row: 4294967295 }
+}
 
 // How big an App is -- measured like lib/plat/web.fi measures a Web:
 // there is no size_of in stage 0, and a written number would be wrong the
@@ -276,7 +332,8 @@ fn app_blank() -> App {
         kh_on: false, kh_ud: 0, kh_key: kh_key_none, kh_chr: kh_key_none,
         wh_on: false, wh_f: wh_none, mo_on: false, mo_f: mo_none,
         ctl_on: false, ctl_ud: 0, ctl_key: kh_key_none, ctl_chr: kh_key_none, ctl_ptr: mo_none_b,
-        ctl_act: ctl_act_none, ctl_paint: ctl_paint_none }
+        ctl_act: ctl_act_none, ctl_paint: ctl_paint_none,
+        vl: [vslot_blank(); 4], vl_n: 0 }
 }
 
 // ============================================================ ACTIONS AND CONTEXT MENUS (r161)
@@ -1016,6 +1073,441 @@ fn app_ctx(a: *mut App) -> *mut render.Ctx { return &(*a).c }
 fn ctl_ready(a: *mut App) -> bool { return (*a).ctl_on }
 fn ctl_data(a: *mut App) -> u64 { return (*a).ctl_ud }
 
+// ============================================================ VIRTUAL LISTS (r631)
+//
+// A LIST OF 100000 ROWS IN A WINDOW. The list is ONE node of the scene (kind LIST, drawn by
+// lib/fui/vlistview.fi), whatever its row count: only the rows that show are asked for and painted
+// (lib/fui/vlist.fi has the model: heights, scrolling, selection, keys, typeahead, columns).
+//
+//     fn row_of(ud: u64, i: usize, out: *mut vlist.VRow) {
+//         vlist.vrow_text(out, "name of row i")      // out.col says the column of a table
+//     }
+//     fn picked(a: *mut app.App, id: usize, i: usize) { ... }      // selection changed (i = row, NONE = none)
+//     let l: usize = app.vlist_new(a, "Files", 400, 300, 100000, row_of, 0)
+//     app.vlist_on_pick(a, l, picked)
+//
+// The program owns the rows. What this adds to the model is the window: the mouse (click, Ctrl / Shift
+// click, double click, header click = sort, divider drag, scroll bar), the keys and characters of the
+// FOCUSED list (arrows, PgUp / PgDn, Home / End, Enter, Space, typeahead), the wheel, a finger (drag =
+// scroll, lift = fling, tap = click), the focus ring, and the accessibility statements (role LIST, a name).
+// A table: `vlist.vl_set_columns(app.vlist_model(a, l), 3)` and `vl_set_col_title`; the program sorts its
+// own data in the `on_sort` callback and calls `vlist_changed`.
+//
+// HONEST: VL_MAX lists per window; the rows are not nodes of the a11y tree (a screen reader hears the list,
+// its name and the focused row's text is not announced yet); no context menu on a row; the name is POINTED AT.
+
+fn vl_find(a: *mut App, node: usize) -> usize {
+    var k: usize = 0
+    while k < (*a).vl_n {
+        if (*a).vl[k].node == node {
+            return k
+        }
+        k = k + 1
+    }
+    return NONE
+}
+
+fn vl_draw(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let s: *mut VlSlot = ud as *mut VlSlot
+    let a: *mut App = (*s).a as *mut App
+    let v: *mut vlist.Vlist = &(*s).v
+    let rh: f64 = vlistview.vv_row_px(c, (*s).row_pt)
+    if !vlist.vl_is_variable(v) && vlist.vl_row_height(v) != rh {
+        vlist.vl_set_row_height(v, rh)
+    }
+    var hh: f64 = 0.0
+    if vlist.vl_columns(v) > 0 {
+        hh = vlistview.vv_header_px(c)
+    }
+    if vlist.vl_header_h(v) != hh {
+        vlist.vl_set_header(v, hh)
+    }
+    (*s).live = true
+    let moving: bool = vlistview.vv_paint(v, c, e, focus(a) == (*s).node, (*s).src_ud, (*s).src)
+}
+
+// true while a list is still running out (a fling, a wheel tween): the window has to paint again
+fn vlist_moving(a: *mut App) -> bool {
+    var k: usize = 0
+    while k < (*a).vl_n {
+        if viewport.viewport_moving(vlist.vl_viewport(&(*a).vl[k].v)) {
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// the program timer of the window (fuiwirt.host_set_wake); appctl takes it over and calls vlist_moving itself
+fn vl_wake_tick(ud: u64, now: i64) -> bool {
+    return vlist_moving(ud as *mut App)
+}
+
+fn vl_wake_wait(ud: u64, now: i64) -> i64 {
+    if vlist_moving(ud as *mut App) {
+        return 16
+    }
+    return 0 - 1
+}
+
+// A virtual list of `w` x `h` design points in the current container with `n` rows. `src(ud, i, &row)`
+// fills in row i (and column row.col of a table). `name` is the list's accessible name (pointed at, not
+// copied). Returns the node (the id of all vlist_* calls); NONE when the window or VL_MAX is full.
+fn vlist_new(a: *mut App, name: str, w: usize, h: usize, n: usize,
+    src: fn(u64, usize, *mut vlist.VRow), ud: u64) -> usize {
+    if (*a).vl_n >= VL_MAX {
+        return NONE
+    }
+    let i: usize = scene.scene_add(&(*a).sc, parent(a), scene.N_WIDGET)
+    if i == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_widget_kind(&(*a).sc, i, widget.KIND_LIST)
+    scene.node_set_size(&(*a).sc, i, w as f64, h as f64)
+    let k: usize = (*a).vl_n
+    (*a).vl_n = k + 1
+    (*a).vl[k] = vslot_blank()
+    let s: *mut VlSlot = &(*a).vl[k]
+    (*s).a = a as u64
+    (*s).node = i
+    (*s).src = src
+    (*s).src_ud = ud
+    vlist.vl_set_count(&(*s).v, n)
+    scene.node_set_draw(&(*a).sc, i, s as u64, vl_draw)
+    a11y.a11y_set_role(&(*a).ax, i, a11y.ROLE_LIST)
+    if name.n > 0 {
+        a11y.a11y_set_name(&(*a).ax, i, name.p as u64, name.n)
+    }
+    // a window without the standard controls has no timer yet: ours runs the fling out
+    if !(*a).ctl_on {
+        fuiwirt.host_set_wake(&(*a).w, a as u64, vl_wake_tick, vl_wake_wait)
+    }
+    return i
+}
+
+// The model of list `id` (columns, multi-select, heights ...); 0 when `id` is no virtual list.
+fn vlist_model(a: *mut App, id: usize) -> *mut vlist.Vlist {
+    let k: usize = vl_find(a, id)
+    if k == NONE {
+        return 0 as u64 as *mut vlist.Vlist
+    }
+    return &(*a).vl[k].v
+}
+
+// The row count changed (clears the selection).
+fn vlist_set_count(a: *mut App, id: usize, n: usize) {
+    let k: usize = vl_find(a, id)
+    if k == NONE {
+        return
+    }
+    vlist.vl_set_count(&(*a).vl[k].v, n)
+    fuiwirt.host_touch(&(*a).w)
+}
+
+// The rows or their order changed (after a sort, an edit): paint them again.
+fn vlist_changed(a: *mut App, id: usize) {
+    let k: usize = vl_find(a, id)
+    if k == NONE {
+        return
+    }
+    vlist.vl_changed(&(*a).vl[k].v)
+    fuiwirt.host_touch(&(*a).w)
+}
+
+// The row height in design points (0 = the theme's row height).
+fn vlist_set_row_pt(a: *mut App, id: usize, pt: usize) {
+    let k: usize = vl_find(a, id)
+    if k == NONE {
+        return
+    }
+    (*a).vl[k].row_pt = pt
+    fuiwirt.host_touch(&(*a).w)
+}
+
+// The focused row (the chosen one of a single-select list); NONE if none.
+fn vlist_selected(a: *mut App, id: usize) -> usize {
+    let k: usize = vl_find(a, id)
+    if k == NONE {
+        return NONE
+    }
+    return vlist.vl_cur(&(*a).vl[k].v)
+}
+
+// Choose row `i` (NONE = nothing) and scroll it into view. Does not call `on_pick`.
+fn vlist_select(a: *mut App, id: usize, i: usize) {
+    let k: usize = vl_find(a, id)
+    if k == NONE {
+        return
+    }
+    let v: *mut vlist.Vlist = &(*a).vl[k].v
+    if i >= vlist.vl_count(v) {
+        vlist.vl_clear_selection(v)
+    } else {
+        vlist.vl_select_only(v, i)
+        let ok: bool = vlist.vl_reveal(v, i)
+    }
+    fuiwirt.host_touch(&(*a).w)
+}
+
+// `f(a, id, row)` runs when the USER changed the selection (click, arrows, typeahead).
+fn vlist_on_pick(a: *mut App, id: usize, f: fn(*mut App, usize, usize)) {
+    let k: usize = vl_find(a, id)
+    if k != NONE {
+        (*a).vl[k].pick = f
+    }
+}
+
+// `f(a, id, row)` runs on Enter or a double click / double tap on a row.
+fn vlist_on_activate(a: *mut App, id: usize, f: fn(*mut App, usize, usize)) {
+    let k: usize = vl_find(a, id)
+    if k != NONE {
+        (*a).vl[k].act = f
+    }
+}
+
+// `f(a, id, column)` runs when the user clicked a header cell. The sort column and direction are
+// already set in the model (vl_sort_col / vl_sort_desc): sort your data, then `vlist_changed`.
+fn vlist_on_sort(a: *mut App, id: usize, f: fn(*mut App, usize, usize)) {
+    let k: usize = vl_find(a, id)
+    if k != NONE {
+        (*a).vl[k].sort = f
+    }
+}
+
+// What the model answered (RES_* bits) becomes the program's callbacks.
+fn vl_result(a: *mut App, k: usize, r: u32) {
+    let s: *mut VlSlot = &(*a).vl[k]
+    let cur: usize = vlist.vl_cur(&(*s).v)
+    if (r & vlist.RES_MOVED) != 0 as u32 && cur != NONE {
+        let ok: bool = vlist.vl_reveal(&(*s).v, cur)
+    }
+    if (r & vlist.RES_SELECT) != 0 as u32 {
+        let f: fn(*mut App, usize, usize) = (*s).pick
+        f(a, (*s).node, cur)
+    }
+    if (r & vlist.RES_ACTIVATE) != 0 as u32 && cur != NONE {
+        let g: fn(*mut App, usize, usize) = (*s).act
+        g(a, (*s).node, cur)
+    }
+    fuiwirt.host_touch(&(*a).w)
+}
+
+// The focused list hears the key first. true = taken.
+fn vl_key_route(a: *mut App, key: u32, mods: u32) -> bool {
+    if (*a).vl_n == 0 {
+        return false
+    }
+    let k: usize = vl_find(a, focus(a))
+    if k == NONE {
+        return false
+    }
+    let r: u32 = vlist.vl_key(&(*a).vl[k].v, key, mods)
+    if r == 0 as u32 {
+        return false
+    }
+    vl_result(a, k, r)
+    return true
+}
+
+fn vl_char_route(a: *mut App, cp: u32, mods: u32) -> bool {
+    if (*a).vl_n == 0 {
+        return false
+    }
+    let k: usize = vl_find(a, focus(a))
+    if k == NONE {
+        return false
+    }
+    let s: *mut VlSlot = &(*a).vl[k]
+    let r: u32 = vlist.vl_char(&(*s).v, cp, mods, fuiwirt.host_now(&(*a).w), (*s).src_ud, (*s).src)
+    if r == 0 as u32 {
+        return false
+    }
+    vl_result(a, k, r)
+    return true
+}
+
+// A click (or a tap) on row `row`; a second one on the same row within VL_DBL_MS activates it.
+fn vl_click_row(a: *mut App, k: usize, row: usize, mods: u32) {
+    let s: *mut VlSlot = &(*a).vl[k]
+    var r: u32 = vlist.vl_click(&(*s).v, row, mods)
+    let now: i64 = fuiwirt.host_now(&(*a).w)
+    if row != NONE && row == (*s).last_row && now >= (*s).last_ms && now - (*s).last_ms <= VL_DBL_MS {
+        r = r | vlist.RES_ACTIVATE
+        (*s).last_row = NONE
+    } else {
+        (*s).last_row = row
+        (*s).last_ms = now
+    }
+    vl_result(a, k, r)
+}
+
+// The pointer went down in list `k` at (x, y).
+fn vl_down(a: *mut App, k: usize, x: f64, y: f64) -> bool {
+    let s: *mut VlSlot = &(*a).vl[k]
+    let v: *mut vlist.Vlist = &(*s).v
+    let c: *mut render.Ctx = &(*a).c
+    let z: u32 = vlist.vl_zone(v, x, y)
+    if z == vlist.ZONE_BAR {
+        if viewport.viewport_bar_press(c, vlist.vl_viewport(v), x, y) {
+            (*s).drag = VD_BAR
+        }
+        return true
+    }
+    if z == vlist.ZONE_HEADER {
+        let d: usize = vlist.vl_divider_at(v, x, render.len_of(c, 6))
+        if d != NONE {
+            vlist.vl_col_drag_begin(v, d, x)
+            (*s).drag = VD_COL
+            return true
+        }
+        let col: usize = vlist.vl_col_at(v, x)
+        if col != NONE && vlist.vl_header_click(v, col) {
+            let f: fn(*mut App, usize, usize) = (*s).sort
+            f(a, (*s).node, col)
+        }
+        return true
+    }
+    // the body
+    let row: usize = vlist.vl_hit(v, x, y)
+    if fuiwirt.host_pointer_type(&(*a).w) == event.PT_TOUCH {
+        // a finger: a drag scrolls, a tap that did not move clicks (on the lift)
+        viewport.viewport_scroll_by(vlist.vl_viewport(v), 0.0, 0.0)
+        (*s).drag = VD_TOUCH
+        (*s).t_y0 = y
+        (*s).t_y = y
+        (*s).t_ms = fuiwirt.host_now(&(*a).w)
+        (*s).t_vy = 0.0
+        (*s).t_moved = false
+        (*s).t_row = row
+        return true
+    }
+    vl_click_row(a, k, row, fuiwirt.host_mods(&(*a).w))
+    return true
+}
+
+// A finger moved to y: scroll by the distance, keep a smoothed speed (px per ms) for the fling.
+fn vl_pan(a: *mut App, k: usize, y: f64) -> bool {
+    let s: *mut VlSlot = &(*a).vl[k]
+    if !(*s).t_moved {
+        let d: f64 = y - (*s).t_y0
+        if d < TOUCH_SLOP && d > 0.0 - TOUCH_SLOP {
+            return false
+        }
+        (*s).t_moved = true
+    }
+    let now: i64 = fuiwirt.host_now(&(*a).w)
+    var dt: i64 = now - (*s).t_ms
+    if dt < 1 as i64 {
+        dt = 1 as i64
+    }
+    let dy: f64 = y - (*s).t_y
+    let vp: *mut viewport.Viewport = vlist.vl_viewport(&(*s).v)
+    let before: f64 = viewport.viewport_off_y(vp)
+    viewport.viewport_scroll_by(vp, 0.0, 0.0 - dy)
+    (*s).t_vy = (*s).t_vy * 0.5 + ((0.0 - dy) / (dt as f64)) * 0.5
+    (*s).t_y = y
+    (*s).t_ms = now
+    return viewport.viewport_off_y(vp) != before
+}
+
+fn vl_up(a: *mut App, k: usize) -> bool {
+    let s: *mut VlSlot = &(*a).vl[k]
+    let d: u32 = (*s).drag
+    (*s).drag = VD_NONE
+    if d == VD_BAR {
+        viewport.viewport_bar_release(vlist.vl_viewport(&(*s).v))
+        return true
+    }
+    if d == VD_COL {
+        vlist.vl_col_drag_end(&(*s).v)
+        return true
+    }
+    if d == VD_TOUCH {
+        let now: i64 = fuiwirt.host_now(&(*a).w)
+        if !(*s).t_moved {
+            vl_click_row(a, k, (*s).t_row, 0 as u32)
+            return true
+        }
+        var vy: f64 = (*s).t_vy
+        if vy < 0.0 {
+            vy = 0.0 - vy
+        }
+        if now - (*s).t_ms <= 100 as i64 && vy >= VL_FLING_MIN {
+            viewport.viewport_fling(vlist.vl_viewport(&(*s).v), 0.0, (*s).t_vy, now)
+        }
+        return true
+    }
+    return false
+}
+
+// The raw pointer (fuiwirt.HOOK_*) for all virtual lists. true = paint again.
+fn vl_pointer(a: *mut App, kind: u32, x: f64, y: f64) -> bool {
+    var changed: bool = false
+    let c: *mut render.Ctx = &(*a).c
+    var k: usize = 0
+    if kind == fuiwirt.HOOK_DOWN {
+        var hit: usize = NONE
+        while k < (*a).vl_n {
+            (*a).vl[k].drag = VD_NONE
+            if hit == NONE && (*a).vl[k].live && vlist.vl_zone(&(*a).vl[k].v, x, y) != vlist.ZONE_NONE {
+                hit = k
+            }
+            k = k + 1
+        }
+        if hit != NONE {
+            return vl_down(a, hit, x, y)
+        }
+        return false
+    }
+    while k < (*a).vl_n {
+        let s: *mut VlSlot = &(*a).vl[k]
+        let v: *mut vlist.Vlist = &(*s).v
+        if kind == fuiwirt.HOOK_UP {
+            if vl_up(a, k) {
+                changed = true
+            }
+        } else if kind == fuiwirt.HOOK_LEAVE {
+            if vlist.vl_set_hover(v, NONE) {
+                changed = true
+            }
+        } else if kind == fuiwirt.HOOK_MOVE {
+            if (*s).drag == VD_BAR {
+                if viewport.viewport_bar_drag(c, vlist.vl_viewport(v), x, y) {
+                    changed = true
+                }
+            } else if (*s).drag == VD_COL {
+                if vlist.vl_col_drag(v, x) {
+                    changed = true
+                }
+            } else if (*s).drag == VD_TOUCH {
+                if vl_pan(a, k, y) {
+                    changed = true
+                }
+            } else if (*s).live && fuiwirt.host_pointer_type(&(*a).w) != event.PT_TOUCH {
+                if vlist.vl_set_hover(v, vlist.vl_hit(v, x, y)) {
+                    changed = true
+                }
+            }
+        }
+        k = k + 1
+    }
+    return changed
+}
+
+// The wheel over a list scrolls it. true = taken.
+fn vl_wheel_at(a: *mut App, x: f64, y: f64, notches: f64) -> bool {
+    var k: usize = 0
+    while k < (*a).vl_n {
+        let s: *mut VlSlot = &(*a).vl[k]
+        if (*s).live && vlist.vl_zone(&(*s).v, x, y) != vlist.ZONE_NONE {
+            vlist.vl_wheel(&(*s).v, notches)
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
 // ============================================================ LISTS
 
 // A LIST OF ROWS. The rows after this stand one below the other, until `end`:
@@ -1488,6 +1980,11 @@ fn app_paint(ud: u64, w: usize, h: usize) {
     if (*a).quit {
         return
     }
+    var q: usize = 0
+    while q < (*a).vl_n {
+        (*a).vl[q].live = false
+        q = q + 1
+    }
     fit_labels(a, w)
     anim.transreg_new_frame(&(*a).tr)
     scene.scene_run(&(*a).sc, &(*a).c, &(*a).sh, 0.0, 0.0, w as f64,
@@ -1615,6 +2112,9 @@ fn app_key(ud: u64, key: u32, mods: u32) -> bool {
             return true
         }
     }
+    if vl_key_route(a, key, mods) {
+        return true
+    }
     let k: usize = focused_slot(a)
     if k == NONE {
         return shortcut_key(a, key, mods)
@@ -1650,6 +2150,9 @@ fn app_char(ud: u64, cp: u32, mods: u32) -> bool {
             fuiwirt.host_touch(&(*a).w)
             return true
         }
+    }
+    if vl_char_route(a, cp, mods) {
+        return true
     }
     let k: usize = focused_slot(a)
     if k == NONE {
@@ -1719,13 +2222,20 @@ fn app_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
         let pf2: fn(u64, u32, f64, f64) -> bool = (*a).ctl_ptr
         ctl = pf2((*a).ctl_ud, kind, x, y)
     }
+    var vlp: bool = false
+    if (*a).vl_n > 0 && kind != fuiwirt.HOOK_WHEEL {
+        vlp = vl_pointer(a, kind, x, y)
+    }
     let r: bool = app_hook_text(ud, kind, x, y)
-    return r || heard || extra || ctl
+    return r || heard || extra || ctl || vlp
 }
 
 fn app_hook_text(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     let a: *mut App = ud as *mut App
     if kind == fuiwirt.HOOK_WHEEL {
+        if (*a).vl_n > 0 && vl_wheel_at(a, (*a).ptr_x, (*a).ptr_y, y) {
+            return true
+        }
         if (*a).wh_on {
             let wf: fn(u64, f64, f64, f64, f64) -> bool = (*a).wh_f
             if wf((*a).kh_ud, (*a).ptr_x, (*a).ptr_y, x, y) {
