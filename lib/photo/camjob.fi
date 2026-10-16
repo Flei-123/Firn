@@ -35,6 +35,7 @@ import photo.jpegenc
 import photo.demosaic
 import photo.antialias
 import photo.resample
+import photo.sr
 
 export {
     Shot, Job, job_new, job_add_shot, job_free, job_entry, run_job, job_progress, job_finished,
@@ -107,6 +108,9 @@ struct Job {
     aw: i32, // output aspect aw : ah of a RAW burst (0 = the sensor aspect): the centre window of that aspect is used, e.g. 16 : 9
     ah: i32,
     look: f32, // < 0: pipeline default (1, JPEG input 0); else the strength 0..1 of the final look (photo.look)
+    sr: f32, // multi-frame super resolution of a RAW burst (photo.sr): < 0 default (off), 0 off, > 0 on
+    sro: sr.SrOpts, // its parameters
+    sr_vp: f32, // > 0: the SR variance plane (scaled by this) feeds the denoiser; 0: noise measured from the merged picture
     out: u64,
     out_cap: usize,
     out_n: usize,
@@ -123,7 +127,7 @@ fn job_new() -> Job {
     return Job {
         mode: 0, n: 0,
         shots: [Shot { kind: 0, w: 0, h: 0, ptr: 0, size: 0, exp_ns: 0, iso: 0 }; 16],
-        meta: meta.meta_default(), max_px: 3300000, quality: 92, orientation: 1, zoom: 1.0f, raw_mode: 0, aa_edge: 0.0f, aa_chroma: 0.0f, sharpen: 0.0f - 1.0f, denoise: 0.0f - 1.0f, keep: 0.0f - 1.0f, ref_idx: 0 - 1, tone: 0.0f - 1.0f, consensus: 0.0f - 1.0f, flicker: 0.0f - 1.0f, flicker_ref: 0.0f - 1.0f, aw: 0, ah: 0, look: 0.0f - 1.0f,
+        meta: meta.meta_default(), max_px: 3300000, quality: 92, orientation: 1, zoom: 1.0f, raw_mode: 0, aa_edge: 0.0f, aa_chroma: 0.0f, sharpen: 0.0f - 1.0f, denoise: 0.0f - 1.0f, keep: 0.0f - 1.0f, ref_idx: 0 - 1, tone: 0.0f - 1.0f, consensus: 0.0f - 1.0f, flicker: 0.0f - 1.0f, flicker_ref: 0.0f - 1.0f, aw: 0, ah: 0, look: 0.0f - 1.0f, sr: 0.0f - 1.0f, sro: sr.sr_default(), sr_vp: 0.0f,
         out: 0, out_cap: 0, out_n: 0, out_w: 0, out_h: 0, pdf: rt.buf_new(), have_pdf: false,
         progress: 0, done: 0, ok: false,
     }
@@ -539,16 +543,73 @@ fn load_burst(j: *mut Job, b: *mut merge.Burst, bracket: bool) -> bool {
     return (*b).n > 0
 }
 
+// Multi-frame super resolution applies to a RAW burst of equal frames in PHOTO / PORTRAIT mode (no bracket, no quad path).
+fn sr_wanted(j: *mut Job) -> bool {
+    if (*j).sr <= 0.0f { return false }
+    if (*j).n < 2 || (*j).n > sr.SR_MAX { return false }
+    if (*j).mode != MODE_PHOTO && (*j).mode != MODE_PORTRAIT { return false }
+    if (*j).raw_mode == RAW_QUAD { return false }
+    let med: f64 = median_expo(j)
+    var i: i32 = 0
+    while i < (*j).n {
+        let s: *mut Shot = &(*j).shots[i as usize]
+        if (*s).kind != SHOT_RAW || (*s).w != (*j).shots[0].w || (*s).h != (*j).shots[0].h { return false }
+        let e: f64 = expo_of(s)
+        if med > 0.0 && e > 0.0 && (e > med * 1.12 || e < med / 1.12) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// The SR merge of the burst: linear camera RGB at the output size (same geometry as raw_window_a) + green variance plane.
+fn sr_merge_job(j: *mut Job, lin: *mut image.Image, vp: *mut image.Image) -> bool {
+    let w: i32 = (*j).shots[0].w
+    let h: i32 = (*j).shots[0].h
+    var tw: i32 = 0
+    var th: i32 = 0
+    if (*j).aw > 0 && (*j).ah > 0 {
+        var bx: i32 = 0
+        var by: i32 = 0
+        var bw: i32 = 0
+        var bh: i32 = 0
+        aspect_window(w, h, 1.0f, (*j).aw, (*j).ah, &bx, &by, &bw, &bh)
+        fit_size(bw, bh, (*j).max_px, &tw, &th)
+    } else {
+        fit_size(w, h, (*j).max_px, &tw, &th)
+    }
+    var x0: i32 = 0
+    var y0: i32 = 0
+    var cw: i32 = 0
+    var ch: i32 = 0
+    aspect_window(w, h, (*j).zoom, (*j).aw, (*j).ah, &x0, &y0, &cw, &ch)
+    var ptrs: [u64; 24] = [0 as u64; 24]
+    var i: i32 = 0
+    while i < (*j).n {
+        ptrs[i as usize] = (*j).shots[i as usize].ptr
+        i = i + 1
+    }
+    if !sr.sr_burst(&ptrs[0], (*j).n, w, h, &(*j).meta, x0, y0, cw, ch, tw, th, (*j).ref_idx, &(*j).sro, lin, vp) { return false }
+    neutralise_clipped(lin, &(*j).meta)
+    return true
+}
+
 fn run_job(j: *mut Job) -> bool {
     (*j).ok = false
     set_progress(j, 1)
     if (*j).n < 1 { return false }
     let jpeg_in: bool = (*j).shots[0].kind != SHOT_RAW
     var b: merge.Burst = merge.burst_new()
-    if !load_burst(j, &b, (*j).mode == MODE_PHOTO || (*j).mode == MODE_PORTRAIT) {
+    var sr_lin: image.Image = image.img_new(1, 1, 3)
+    var sr_vp: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&sr_lin)
+    image.img_free(&sr_vp)
+    var sr_done: bool = false
+    if sr_wanted(j) { sr_done = sr_merge_job(j, &sr_lin, &sr_vp) }
+    if !sr_done && !load_burst(j, &b, (*j).mode == MODE_PHOTO || (*j).mode == MODE_PORTRAIT) {
         merge.burst_free(&b)
         return false
     }
+    set_progress(j, 40)
     var m: meta.SensorMeta = (*j).meta
     var out: image.Image = image.img_new(1, 1, 3)
     image.img_free(&out)
@@ -564,7 +625,22 @@ fn run_job(j: *mut Job) -> bool {
     if (*j).flicker_ref >= 0.0f { po.flicker_ref = (*j).flicker_ref }
     po.ref_idx = (*j).ref_idx
     let mode: i32 = (*j).mode
-    if mode == MODE_NIGHT {
+    if sr_done {
+        if (*j).sr_vp > 0.0f {
+            var q: i32 = 0
+            let nq: i32 = sr_vp.w * sr_vp.h
+            while q < nq {
+                let pq: *mut f32 = (sr_vp.px + (q as u64) * (4 as u64)) as *mut f32
+                *pq = *pq * (*j).sr_vp
+                q = q + 1
+            }
+            pipeline.finish_chain(&sr_lin, &sr_vp, &m, &po, &out)
+        } else {
+            pipeline.process_single_linear(&sr_lin, &m, &po, &out)
+        }
+        image.img_free(&sr_lin)
+        image.img_free(&sr_vp)
+    } else if mode == MODE_NIGHT {
         var no: night.NightOpts = night.night_default()
         if jpeg_in { no.pipe.sharpen = 0.3f }
         if b.n > 1 {

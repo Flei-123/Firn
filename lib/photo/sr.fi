@@ -1,0 +1,376 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/sr.fi -- photo.sr: multi-frame super resolution straight from the RAW Bayer mosaics (FirnCam).
+//
+//     import photo.sr
+//
+//     var ptrs: [u64; 24] = ...                       // n RAW16 mosaics (all w x h, same CFA, same exposure)
+//     var o: sr.SrOpts = sr.sr_default()
+//     var lin: image.Image = image.img_new(1, 1, 3)    // created by the call: camera RGB, linear, tw x th
+//     var vp: image.Image = image.img_new(1, 1, 1)     // variance of the green channel of `lin`
+//     sr.sr_burst(&ptrs[0], n, w, h, &meta, x0, y0, cw, ch, tw, th, -1, &o, &lin, &vp)
+//
+// The window (x0, y0 even, cw x ch raw pixels) of every frame is resampled to tw x th output pixels, but NOT frame by
+// frame: a frame's demosaic + interpolation loses exactly the detail that the other frames hold between its sample
+// sites. Here every RAW sample is used at its true, sub-pixel position instead.
+// METHOD (handheld multi-frame SR, Wronski et al. 2019, as a gather):
+//   1. reference = the frame with the most fine detail (RAW gradient energy), or the caller's choice;
+//   2. every other frame: demosaic luma -> tile alignment (photo.align, sub-pixel flow) against the reference;
+//   3. per output pixel and colour: all RAW samples of that colour within a radius (green rg, red / blue rc raw px,
+//      scaled up when the output is smaller than the window) around the flow-shifted position, weight (1 - d^2 / R^2)^2;
+//   4. robustness per frame and colour: the frame's weighted mean is compared with the reference estimate (the
+//      demosaiced, resampled reference frame) in units of the expected noise plus a misregistration tolerance
+//      `tol` raw px times the local gradient (edges may differ by sub-pixel error, flat areas may not): frames that
+//      disagree (movers, bad flow) fade out;
+//   5. sum over frames + a small prior `prior` for the reference estimate (fills holes where the samples of one colour
+//      are sparse, e.g. few frames, blown highlights).
+// Clipped RAW samples (>= 97 % of the range) are skipped. Rows run in parallel; every output pixel is independent, so
+// the result is bit-identical for any thread count.
+import std.rt
+import std.io
+import std.time
+import photo.image
+import photo.meta
+import photo.noise
+import photo.align
+import photo.demosaic
+import photo.resample
+import photo.par
+
+export {
+    SrOpts, sr_default, sr_burst, sr_pick_reference, SR_MAX,
+}
+
+const SR_MAX: i32 = 24
+
+struct SrOpts {
+    rg: f32, // kernel radius of green samples in raw pixels
+    rc: f32, // kernel radius of red / blue samples in raw pixels
+    prior: f32, // weight of the reference estimate (a fraction of one frame's kernel mass, ~0.85)
+    tol: f32, // misregistration tolerance in raw pixels (times the local gradient)
+    rej: f32, // robustness threshold T: frames weigh 1 up to T, then fade out
+    nmargin: f32, // factor on the expected noise variance of the frame difference
+}
+
+fn sr_default() -> SrOpts {
+    return SrOpts { rg: 1.35f, rc: 1.9f, prior: 0.12f, tol: 0.6f, rej: 2.0f, nmargin: 2.0f }
+}
+
+struct SrCtx {
+    n: i32,
+    ref_idx: i32,
+    raw: [u64; 24],
+    flows: [align.Flow; 24],
+    rw: i32,
+    rh: i32,
+    x0: i32,
+    y0: i32,
+    tw: i32,
+    th: i32,
+    sx: f32,
+    sy: f32,
+    col: [i32; 4],
+    black: [f32; 4],
+    inv: [f32; 4],
+    clipv: [f32; 4],
+    rad2: [f32; 3],
+    rads: [f32; 3],
+    ns: [f32; 3],
+    no: [f32; 3],
+    prior: f32,
+    tol: f32,
+    rej: f32,
+    nmargin: f32,
+    rref: *mut image.Image,
+    out: *mut image.Image,
+    vp: *mut image.Image,
+}
+
+#[inline]
+fn floori(x: f32) -> i32 {
+    var i: i32 = x as i32
+    if (i as f32) > x { i = i - 1 }
+    return i
+}
+
+// One output pixel: gather the samples of all frames, robust weighted mean per colour.
+fn sr_pixel(k: *mut SrCtx, u: i32, v: i32, px: f32, py: f32) {
+    let n: i32 = (*k).n
+    let rw: i32 = (*k).rw
+    let rh: i32 = (*k).rh
+    // the reference estimate: value, noise variance and misregistration tolerance per colour
+    let rr: *mut image.Image = (*k).rref
+    let um: i32 = max_i(u - 1, 0)
+    let up: i32 = min_i(u + 1, (*k).tw - 1)
+    let vm: i32 = max_i(v - 1, 0)
+    let vq: i32 = min_i(v + 1, (*k).th - 1)
+    var rv: [f32; 3] = [0.0f; 3]
+    var sg: [f32; 3] = [0.0f; 3]
+    var tl: [f32; 3] = [0.0f; 3]
+    var c: i32 = 0
+    while c < 3 {
+        let r0: f32 = image.img_get(rr, c, u, v)
+        let gx: f32 = (image.img_get(rr, c, up, v) - image.img_get(rr, c, um, v)) * 0.5f * (*k).sx
+        let gy: f32 = (image.img_get(rr, c, u, vq) - image.img_get(rr, c, u, vm)) * 0.5f * (*k).sy
+        let tg: f32 = (*k).tol * image.sqrtf(gx * gx + gy * gy)
+        var rp: f32 = r0
+        if rp < 0.0f { rp = 0.0f }
+        rv[c as usize] = r0
+        sg[c as usize] = ((*k).ns[c as usize] * rp + (*k).no[c as usize]) * (*k).nmargin
+        tl[c as usize] = tg * tg + 1.0e-9f
+        c = c + 1
+    }
+    var nsum: [f32; 3] = [0.0f; 3]
+    var dsum: [f32; 3] = [0.0f; 3]
+    var vsum: [f32; 3] = [0.0f; 3]
+    var fi: i32 = 0
+    while fi < n {
+        var dx: f32 = 0.0f
+        var dy: f32 = 0.0f
+        if fi != (*k).ref_idx { align.flow_at(&(*k).flows[fi as usize], px, py, &dx, &dy) }
+        let ax: f32 = px + dx + ((*k).x0 as f32)
+        let ay: f32 = py + dy + ((*k).y0 as f32)
+        let base: u64 = (*k).raw[fi as usize]
+        var fnum: [f32; 3] = [0.0f; 3]
+        var fden: [f32; 3] = [0.0f; 3]
+        var fd2: [f32; 3] = [0.0f; 3]
+        var site: i32 = 0
+        while site < 4 {
+            let pj: i32 = site >> 1
+            let pi: i32 = site & 1
+            let cc: usize = (*k).col[site as usize] as usize
+            let r2: f32 = (*k).rad2[cc]
+            let rad: f32 = (*k).rads[cc]
+            let bl: f32 = (*k).black[site as usize]
+            let iv: f32 = (*k).inv[site as usize]
+            let cl: f32 = (*k).clipv[site as usize]
+            var i0: i32 = floori(ax - rad) + 1
+            var i1: i32 = floori(ax + rad)
+            var j0: i32 = floori(ay - rad) + 1
+            var j1: i32 = floori(ay + rad)
+            if i0 < 0 { i0 = 0 }
+            if j0 < 0 { j0 = 0 }
+            if i1 > rw - 1 { i1 = rw - 1 }
+            if j1 > rh - 1 { j1 = rh - 1 }
+            // first index of the wanted parity (the CFA site of the loop)
+            i0 = i0 + ((i0 ^ pi) & 1)
+            j0 = j0 + ((j0 ^ pj) & 1)
+            var an: f32 = 0.0f
+            var ad: f32 = 0.0f
+            var a2: f32 = 0.0f
+            var j: i32 = j0
+            while j <= j1 {
+                let ddy: f32 = (j as f32) - ay
+                let ddy2: f32 = ddy * ddy
+                let row: u64 = base + (((j * rw) * 2) as u64)
+                var i: i32 = i0
+                while i <= i1 {
+                    let ddx: f32 = (i as f32) - ax
+                    let d2: f32 = ddx * ddx + ddy2
+                    if d2 < r2 {
+                        let rawv: f32 = (*((row + ((i * 2) as u64)) as *mut u16)) as f32
+                        if rawv < cl {
+                            let t: f32 = 1.0f - d2 / r2
+                            let w: f32 = t * t
+                            an = an + w * ((rawv - bl) * iv)
+                            ad = ad + w
+                            a2 = a2 + w * w
+                        }
+                    }
+                    i = i + 2
+                }
+                j = j + 2
+            }
+            fnum[cc] = fnum[cc] + an
+            fden[cc] = fden[cc] + ad
+            fd2[cc] = fd2[cc] + a2
+            site = site + 1
+        }
+        // robustness of this frame per colour against the reference estimate
+        c = 0
+        while c < 3 {
+            let dn: f32 = fden[c as usize]
+            if dn > 1.0e-4f {
+                var r: f32 = 1.0f
+                if fi != (*k).ref_idx {
+                    let neff: f32 = dn * dn / (fd2[c as usize] + 1.0e-9f)
+                    let dd: f32 = fnum[c as usize] / dn - rv[c as usize]
+                    let tt: f32 = (dd * dd) / (sg[c as usize] * (1.0f + 1.0f / neff) + tl[c as usize])
+                    if tt > (*k).rej { r = image.expneg((tt - (*k).rej) / (*k).rej) }
+                }
+                nsum[c as usize] = nsum[c as usize] + r * fnum[c as usize]
+                dsum[c as usize] = dsum[c as usize] + r * dn
+                vsum[c as usize] = vsum[c as usize] + r * r * fd2[c as usize]
+            }
+            c = c + 1
+        }
+        fi = fi + 1
+    }
+    c = 0
+    while c < 3 {
+        let dtot: f32 = dsum[c as usize] + (*k).prior
+        image.img_set((*k).out, c, u, v, (nsum[c as usize] + (*k).prior * rv[c as usize]) / dtot)
+        if c == 1 {
+            image.img_set((*k).vp, 0, u, v, (sg[1] / (*k).nmargin) * (vsum[1] + (*k).prior * (*k).prior * 0.25f) / (dtot * dtot))
+        }
+        c = c + 1
+    }
+}
+
+#[inline]
+fn max_i(a: i32, b: i32) -> i32 {
+    if a < b { return b }
+    return a
+}
+
+#[inline]
+fn min_i(a: i32, b: i32) -> i32 {
+    if a > b { return b }
+    return a
+}
+
+fn sr_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut SrCtx = ctx as *mut SrCtx
+    var v: i32 = lo as i32
+    while v < (hi as i32) {
+        let py: f32 = ((v as f32) + 0.5f) * (*k).sy - 0.5f
+        var u: i32 = 0
+        while u < (*k).tw {
+            let px: f32 = ((u as f32) + 0.5f) * (*k).sx - 0.5f
+            sr_pixel(k, u, v, px, py)
+            u = u + 1
+        }
+        v = v + 1
+    }
+}
+
+// Frame with the most fine detail in the window: summed |p(x + 2) - p(x)| + |p(y + 2) - p(y)| (same colour sites) on a
+// sparse grid. Noise adds the same offset to every frame, a motion blurred frame scores low.
+fn sr_pick_reference(ptrs: *mut u64, n: i32, w: i32, h: i32, x0: i32, y0: i32, cw: i32, ch: i32) -> i32 {
+    var best: i32 = 0
+    var bs: f32 = 0.0f - 1.0f
+    var f: i32 = 0
+    while f < n {
+        let base: u64 = *((ptrs as u64 + ((f as u64) * (8 as u64))) as *mut u64)
+        var s: f32 = 0.0f
+        var y: i32 = y0 + 2
+        while y < y0 + ch - 4 {
+            var x: i32 = x0 + 2
+            while x < x0 + cw - 4 {
+                let a: f32 = (*((base + (((y * w + x) * 2) as u64)) as *mut u16)) as f32
+                let bx: f32 = (*((base + (((y * w + x + 2) * 2) as u64)) as *mut u16)) as f32
+                let by: f32 = (*((base + ((((y + 2) * w + x) * 2) as u64)) as *mut u16)) as f32
+                var dx: f32 = bx - a
+                var dy: f32 = by - a
+                if dx < 0.0f { dx = 0.0f - dx }
+                if dy < 0.0f { dy = 0.0f - dy }
+                s = s + dx + dy
+                x = x + 6
+            }
+            y = y + 6
+        }
+        if s > bs { bs = s; best = f }
+        f = f + 1
+    }
+    return best
+}
+
+// See the header. ref_idx < 0 = automatic. Returns false when the input is unusable (fewer than 2 frames, bad window).
+// `out` (3 channels, tw x th) and `vp` (1 channel) are created here (the caller frees them).
+fn sr_burst(ptrs: *mut u64, n: i32, w: i32, h: i32, m: *mut meta.SensorMeta, x0: i32, y0: i32, cw: i32, ch: i32,
+            tw: i32, th: i32, ref_idx: i32, o: *mut SrOpts, out: *mut image.Image, vp: *mut image.Image) -> bool {
+    if n < 2 || n > SR_MAX { return false }
+    if cw < 32 || ch < 32 || tw < 8 || th < 8 { return false }
+    if x0 < 0 || y0 < 0 || x0 + cw > w || y0 + ch > h || (x0 & 1) != 0 || (y0 & 1) != 0 { return false }
+    let t0: u64 = time.monotonic_ns()
+    var r: i32 = ref_idx
+    if r < 0 || r >= n { r = sr_pick_reference(ptrs, n, w, h, x0, y0, cw, ch) }
+    var black: [f32; 4] = [0.0f; 4]
+    var white: f32 = 65535.0f
+    if (*m).has_black {
+        white = (*m).white_level
+        var i: usize = 0
+        while i < 4 { black[i] = (*m).black[i]; i = i + 1 }
+    }
+    // reference: demosaic at window resolution -> luma pyramid, noise model, estimate at the output size
+    var rgb: image.Image = demosaic.demosaic_u16(*((ptrs as u64 + ((r as u64) * (8 as u64))) as *mut u64), w, h, x0, y0, cw, ch, (*m).cfa, &black[0], white)
+    var nm: noise.NoiseModel = noise.from_meta(m)
+    if !(*m).has_noise { nm = noise.estimate_model(&rgb) }
+    var lum: image.Image = image.img_luma(&rgb)
+    var pref: align.Pyr = align.pyr_build(&lum)
+    image.img_free(&lum)
+    var rref: image.Image = image.img_new(1, 1, 3)
+    image.img_free(&rref)
+    if cw == tw && ch == th {
+        rref = rgb
+    } else {
+        rref = resample.resample(&rgb, 0.0f, 0.0f, cw as f32, ch as f32, tw, th)
+        image.img_free(&rgb)
+    }
+    var k: SrCtx = SrCtx {
+        n: n, ref_idx: r, raw: [0 as u64; 24],
+        flows: [align.Flow { tw: 0, th: 0, dx: 0 as u64, dy: 0 as u64, err: 0 as u64 }; 24],
+        rw: w, rh: h, x0: x0, y0: y0, tw: tw, th: th,
+        sx: (cw as f32) / (tw as f32), sy: (ch as f32) / (th as f32),
+        col: [0; 4], black: black, inv: [0.0f; 4], clipv: [0.0f; 4], rad2: [0.0f; 3], rads: [0.0f; 3],
+        ns: [0.0f; 3], no: [0.0f; 3],
+        prior: (*o).prior, tol: (*o).tol, rej: (*o).rej, nmargin: (*o).nmargin,
+        rref: &rref, out: out, vp: vp,
+    }
+    var i: i32 = 0
+    while i < n {
+        k.raw[i as usize] = *((ptrs as u64 + ((i as u64) * (8 as u64))) as *mut u64)
+        i = i + 1
+    }
+    let t1: u64 = time.monotonic_ns()
+    // alignment of every other frame against the reference
+    i = 0
+    while i < n {
+        if i != r {
+            var arg: image.Image = demosaic.demosaic_u16(k.raw[i as usize], w, h, x0, y0, cw, ch, (*m).cfa, &black[0], white)
+            var al: image.Image = image.img_luma(&arg)
+            image.img_free(&arg)
+            var pa: align.Pyr = align.pyr_build(&al)
+            image.img_free(&al)
+            k.flows[i as usize] = align.align_flow(&pref, &pa)
+            align.pyr_free(&pa)
+        }
+        i = i + 1
+    }
+    align.pyr_free(&pref)
+    let t2: u64 = time.monotonic_ns()
+    // sample constants
+    var s: usize = 0
+    while s < 4 {
+        k.col[s] = meta.cfa_color((*m).cfa, s as u32) as i32
+        k.inv[s] = 1.0f / (white - black[s])
+        k.clipv[s] = black[s] + 0.97f * (white - black[s])
+        s = s + 1
+    }
+    var scx: f32 = k.sx
+    if k.sy > scx { scx = k.sy }
+    if scx < 1.0f { scx = 1.0f }
+    k.rad2[0] = (*o).rc * scx * (*o).rc * scx
+    k.rad2[1] = (*o).rg * scx * (*o).rg * scx
+    k.rad2[2] = k.rad2[0]
+    k.rads[0] = (*o).rc * scx
+    k.rads[1] = (*o).rg * scx
+    k.rads[2] = k.rads[0]
+    var c: usize = 0
+    while c < 3 {
+        k.ns[c] = nm.s[c]
+        k.no[c] = nm.o[c]
+        c = c + 1
+    }
+    *out = image.img_new(tw, th, 3)
+    *vp = image.img_new(tw, th, 1)
+    par.rows(th, 4, sr_rows, (&k) as u64)
+    let t3: u64 = time.monotonic_ns()
+    io.fmt_print_line(io.fmt_u64(io.fmt_u64(io.fmt_u64(io.fmt_new(), (t1 - t0) / (1000000 as u64)), (t2 - t1) / (1000000 as u64)), (t3 - t2) / (1000000 as u64)))
+    i = 0
+    while i < n {
+        if i != r { align.flow_free(&k.flows[i as usize]) }
+        i = i + 1
+    }
+    image.img_free(&rref)
+    return true
+}
