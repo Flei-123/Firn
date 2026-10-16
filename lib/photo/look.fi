@@ -1,0 +1,246 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/look.fi -- photo.look: the final "phone camera" look of a display image (black point, mid tone, colour, clarity).
+//
+//     var o: look.LookOpts = look.look_default()
+//     look.look_apply(&display_image, &o)       // in place: 3 channel sRGB ENCODED image, 0..1
+//     look.look_scaled(1.0f)                    // the defaults scaled by a strength 0..1 (0 = identity)
+//
+// Calibrated against a real pair (Xiaomi 14T Pro system camera vs the FirnCam normal photo of the same dim room):
+// the tone mapped RAW picture had a LIFTED black floor (1st percentile at 52 / 255 -> milky shadows), a bright
+// median (152 vs 76) and weak colour (HSV saturation 0.19 vs 0.34). The look stage fixes this with four steps on the
+// luma Y of the encoded image (hue and chroma ratio of every pixel are kept):
+//   1. black point: Y' = (Y - bp) / (1 - bp), bp = `black` x the 0.3 % percentile (at most 0.08: a dim wall is not black), so true blacks are black;
+//   2. contrast: a blend (`contrast`) of Y' with smoothstep(Y');
+//   3. mid tone: a gamma that moves the median of the picture towards `tmed` by the share `dark` -- only down, a
+//      picture that is darker than `tmed` is not touched (the mood of a dark scene stays);
+//   4. colour: chroma around the new luma is multiplied by `sat`; a pixel that would leave the gamut gets its chroma
+//      reduced until it fits (no clipped neon colours);
+//   5. clarity: a large-radius unsharp mask on luma (`clarity`, box blurred, radius `clarity_r` x the long side) for the
+//      local contrast of the system camera, with a soft limiter.
+// The curve is a 1024 entry table (no pow per pixel); the median of the output is f(median of the input) because
+// the curve is monotone, so one histogram is enough.
+import std.rt
+import std.math
+import photo.image
+import photo.filter
+import photo.par
+
+export {
+    LookOpts, look_default, look_scaled, look_curve, look_apply,
+}
+
+struct LookOpts {
+    black: f32, // share of the 0.3 % percentile that is cut (0 = none)
+    contrast: f32, // smoothstep blend 0..1
+    dark: f32, // share of the way from the median to `tmed` (only downwards)
+    tmed: f32, // target median of the encoded luma
+    sat: f32, // chroma multiplier (1 = none)
+    clarity: f32, // large-radius unsharp amount (0 = none)
+    clarity_r: f32, // blur radius as a share of the long side
+}
+
+fn look_default() -> LookOpts {
+    return LookOpts { black: 1.0f, contrast: 0.2f, dark: 1.0f, tmed: 0.30f, sat: 1.8f, clarity: 0.35f, clarity_r: 0.004f }
+}
+
+// the defaults at strength s (0 = identity, 1 = defaults)
+fn look_scaled(s: f32) -> LookOpts {
+    let d: LookOpts = look_default()
+    return LookOpts { black: d.black * s, contrast: d.contrast * s, dark: d.dark * s, tmed: d.tmed, sat: 1.0f + (d.sat - 1.0f) * s, clarity: d.clarity * s, clarity_r: d.clarity_r }
+}
+
+const LUT_N: i32 = 1024
+
+fn flnf(x: f32) -> f32 {
+    return math.ln(x as f64) as f32
+}
+
+fn fexpf(x: f32) -> f32 {
+    return math.exp(x as f64) as f32
+}
+
+fn smooth(u: f32) -> f32 {
+    return u * u * (3.0f - 2.0f * u)
+}
+
+// the tone curve before the gamma: black point + contrast, y and result in 0..1
+fn base_curve(y: f32, bp: f32, contrast: f32) -> f32 {
+    var u: f32 = (y - bp) / (1.0f - bp)
+    if u < 0.0f { u = 0.0f }
+    if u > 1.0f { u = 1.0f }
+    return u + contrast * (smooth(u) - u)
+}
+
+// histogram percentile q (0..1) of the encoded luma plane
+fn luma_percentile(y: *mut image.Image, q: f32) -> f32 {
+    var hist: [i32; 1024] = [0; 1024]
+    let n: i32 = (*y).w * (*y).h
+    var i: i32 = 0
+    while i < n {
+        var b: i32 = (*(((*y).px + (i as u64) * (4 as u64)) as *mut f32) * 1023.0f) as i32
+        if b < 0 { b = 0 }
+        if b > 1023 { b = 1023 }
+        hist[b as usize] = hist[b as usize] + 1
+        i = i + 1
+    }
+    var target: i32 = ((n as f32) * q) as i32
+    if target < 1 { target = 1 }
+    var acc: i32 = 0
+    var k: i32 = 0
+    while k < 1024 {
+        acc = acc + hist[k as usize]
+        if acc >= target { break }
+        k = k + 1
+    }
+    return ((k as f32) + 0.5f) / 1023.0f
+}
+
+// Fill `lut` (LUT_N floats) with the luma curve for a picture whose luma has the black percentile `p_black` and
+// the median `p_med`. Returns the black point used.
+fn look_curve(o: *mut LookOpts, p_black: f32, p_med: f32, lut: u64) -> f32 {
+    var bp: f32 = (*o).black * p_black
+    if bp > 0.08f { bp = 0.08f }
+    if bp < 0.0f { bp = 0.0f }
+    var g: f32 = 1.0f
+    let m: f32 = base_curve(p_med, bp, (*o).contrast)
+    if m > (*o).tmed && m < 0.999f && (*o).tmed > 0.01f {
+        let target: f32 = m - (*o).dark * (m - (*o).tmed)
+        g = flnf(target) / flnf(m)
+    }
+    var i: i32 = 0
+    while i < LUT_N {
+        let y: f32 = (i as f32) / ((LUT_N - 1) as f32)
+        var v: f32 = base_curve(y, bp, (*o).contrast)
+        if g != 1.0f && v > 0.0f { v = fexpf(g * flnf(v)) }
+        *((lut + (i as u64) * (4 as u64)) as *mut f32) = v
+        i = i + 1
+    }
+    return bp
+}
+
+struct LookCtx {
+    im: *mut image.Image,
+    lut: u64,
+    sat: f32,
+}
+
+fn lut_at(lut: u64, y: f32) -> f32 {
+    var t: f32 = y * ((LUT_N - 1) as f32)
+    if t < 0.0f { t = 0.0f }
+    if t > ((LUT_N - 1) as f32) - 0.001f { t = ((LUT_N - 1) as f32) - 0.001f }
+    let i: i32 = t as i32
+    let f: f32 = t - (i as f32)
+    let a: f32 = *((lut + (i as u64) * (4 as u64)) as *mut f32)
+    let b: f32 = *((lut + ((i + 1) as u64) * (4 as u64)) as *mut f32)
+    return a + (b - a) * f
+}
+
+fn look_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut LookCtx = ctx as *mut LookCtx
+    let im: *mut image.Image = (*k).im
+    let w: i32 = (*im).w
+    var yy: i32 = lo as i32
+    while yy < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            let r: f32 = image.img_get(im, 0, x, yy)
+            let g: f32 = image.img_get(im, 1, x, yy)
+            let b: f32 = image.img_get(im, 2, x, yy)
+            let y0: f32 = 0.2126f * r + 0.7152f * g + 0.0722f * b
+            let y1: f32 = lut_at((*k).lut, y0)
+            // keep the chroma ratio of the pixel (rgb scaled by y1 / y0), then boost the chroma around y1
+            var sc: f32 = 1.0f
+            if y0 > 1.0e-4f { sc = y1 / y0 } else { sc = 0.0f }
+            var cr: f32 = (r * sc - y1) * (*k).sat
+            var cg: f32 = (g * sc - y1) * (*k).sat
+            var cb: f32 = (b * sc - y1) * (*k).sat
+            if y0 <= 1.0e-4f { cr = 0.0f; cg = 0.0f; cb = 0.0f }
+            // fit the chroma into the gamut: y1 + t * c in 0..1 for the largest t <= 1
+            var t: f32 = 1.0f
+            var c: f32 = cr
+            var n: i32 = 0
+            while n < 3 {
+                if n == 1 { c = cg }
+                if n == 2 { c = cb }
+                if c > 1.0e-6f {
+                    let tt: f32 = (1.0f - y1) / c
+                    if tt < t { t = tt }
+                }
+                if c < 0.0f - 1.0e-6f {
+                    let tt: f32 = y1 / (0.0f - c)
+                    if tt < t { t = tt }
+                }
+                n = n + 1
+            }
+            if t < 0.0f { t = 0.0f }
+            image.img_set(im, 0, x, yy, image.fclampf(y1 + cr * t, 0.0f, 1.0f))
+            image.img_set(im, 1, x, yy, image.fclampf(y1 + cg * t, 0.0f, 1.0f))
+            image.img_set(im, 2, x, yy, image.fclampf(y1 + cb * t, 0.0f, 1.0f))
+            x = x + 1
+        }
+        yy = yy + 1
+    }
+}
+
+struct ClarCtx {
+    im: *mut image.Image,
+    y: *mut image.Image,
+    bl: *mut image.Image,
+    amount: f32,
+}
+
+fn clarity_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut ClarCtx = ctx as *mut ClarCtx
+    let im: *mut image.Image = (*k).im
+    let w: i32 = (*im).w
+    var yy: i32 = lo as i32
+    while yy < (hi as i32) {
+        var x: i32 = 0
+        while x < w {
+            var d: f32 = image.img_get((*k).y, 0, x, yy) - image.img_get((*k).bl, 0, x, yy)
+            var ad: f32 = d
+            if ad < 0.0f { ad = 0.0f - ad }
+            d = d / (1.0f + ad / 0.15f)
+            let delta: f32 = (*k).amount * d
+            var c: i32 = 0
+            while c < 3 {
+                image.img_set(im, c, x, yy, image.fclampf(image.img_get(im, c, x, yy) + delta, 0.0f, 1.0f))
+                c = c + 1
+            }
+            x = x + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// large-radius local contrast: two box blurs approximate a Gaussian of sigma ~ r
+fn clarity(im: *mut image.Image, amount: f32, rfrac: f32) {
+    var long_side: i32 = (*im).w
+    if (*im).h > long_side { long_side = (*im).h }
+    var r: i32 = ((long_side as f32) * rfrac) as i32
+    if r < 2 { r = 2 }
+    var y: image.Image = image.img_luma(im)
+    var b1: image.Image = filter.box_blur(&y, r)
+    var b2: image.Image = filter.box_blur(&b1, r)
+    image.img_free(&b1)
+    var k: ClarCtx = ClarCtx { im: im, y: &y, bl: &b2, amount: amount }
+    par.rows((*im).h, 16, clarity_rows, (&k) as u64)
+    image.img_free(&y)
+    image.img_free(&b2)
+}
+
+fn look_apply(im: *mut image.Image, o: *mut LookOpts) {
+    if (*im).ch < 3 || (*im).w < 2 || (*im).h < 2 { return }
+    var y: image.Image = image.img_luma(im)
+    let p_black: f32 = luma_percentile(&y, 0.003f)
+    let p_med: f32 = luma_percentile(&y, 0.5f)
+    image.img_free(&y)
+    let lut: u64 = rt.heap_alloc((LUT_N as usize) * 4)
+    let bp: f32 = look_curve(o, p_black, p_med, lut)
+    var k: LookCtx = LookCtx { im: im, lut: lut, sat: (*o).sat }
+    par.rows((*im).h, 16, look_rows, (&k) as u64)
+    rt.heap_free(lut, (LUT_N as usize) * 4)
+    if (*o).clarity > 0.0f {
+        clarity(im, (*o).clarity, (*o).clarity_r)
+    }
+}
