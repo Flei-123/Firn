@@ -1,0 +1,406 @@
+// expect_exit: 0
+// tests/3321_mail_smtp.fi -- mail.smtp core (sans-I/O): scripted dialogues, errors, dot stuffing, fuzz.
+// The network glue and the real wire are tools/mail/e2e.sh (fake_mail.py).
+import std.rt
+import std.str
+import mail.smtp
+
+static mut failures: i32 = 0
+static mut seed: u64 = 12345
+
+fn check(name: str, ok: bool) {
+    if !ok {
+        failures += 1
+        rt.write_everything(1, "  FAIL  ".p as u64, 8)
+        rt.write_everything(1, name.p as u64, name.n)
+        rt.write_everything(1, "\n".p as u64, 1)
+    }
+}
+
+fn rnd() -> u64 {
+    seed = seed *% 6364136223846793005 +% 1442695040888963407
+    return seed >> 33
+}
+
+fn feed(c: *mut smtp.Smtp, s: str) -> bool {
+    return smtp.smtp_feed(c, s.p as u64, s.n)
+}
+
+// compares the queued output with `want` and consumes it
+fn out_is(c: *mut smtp.Smtp, want: str) -> bool {
+    let n: usize = smtp.smtp_out_len(c)
+    let ok: bool = n == want.n && rt.mem_eq(smtp.smtp_out_ptr(c), want.p as u64, want.n)
+    smtp.smtp_out_consume(c, n)
+    return ok
+}
+
+fn stuffed(src: str, want: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    smtp.smtp_prepare_data(src.p as u64, src.n, &b)
+    let ok: bool = rt.buf_len(&b) == want.n && rt.mem_eq(rt.buf_ptr(&b), want.p as u64, want.n)
+    rt.buf_free(&b)
+    return ok
+}
+
+// a session up to READY (plain, no auth)
+fn ready(c: *mut smtp.Smtp) {
+    smtp.smtp_set_tls(c, smtp.SMTP_NEVER)
+    feed(c, "220 mx ESMTP\r\n")
+    out_is(c, "EHLO localhost\r\n")
+    feed(c, "250-mx\r\n250-SIZE 1000\r\n250-8BITMIME\r\n250 PIPELINING\r\n")
+}
+
+fn test_dots() {
+    check("dot empty", stuffed("", ".\r\n"))
+    check("dot plain", stuffed("a\r\nb", "a\r\nb\r\n.\r\n"))
+    check("dot lf", stuffed("a\nb\n", "a\r\nb\r\n.\r\n"))
+    check("dot cr", stuffed("a\rb", "a\r\nb\r\n.\r\n"))
+    check("dot lead", stuffed(".a\r\n..\r\n.", "..a\r\n...\r\n..\r\n.\r\n"))
+    check("dot mid", stuffed("a.b\r\n\r\n.\r\n", "a.b\r\n\r\n..\r\n.\r\n"))
+    check("dot bare end", stuffed("x\r\n.", "x\r\n..\r\n.\r\n"))
+}
+
+fn test_plain_mail() {
+    var c: smtp.Smtp = smtp.smtp_new()
+    ready(&c)
+    check("p caps", smtp.smtp_caps(&c) == (smtp.CAP_SIZE | smtp.CAP_8BIT | smtp.CAP_PIPELINING))
+    check("p size", smtp.smtp_max_size(&c) == 1000)
+    check("p ready ev", (smtp.smtp_events(&c) & smtp.EVF_READY) != 0)
+    check("p state", smtp.smtp_state(&c) == smtp.ST_READY)
+    let msg: str = "Subject: x\r\n\r\n.hi\r\n"
+    check("p set", smtp.smtp_set_mail(&c, "<a@b.org>", "c@d.org, <e@f.org>;g@h.org", msg.p as u64, msg.n))
+    check("p mail", out_is(&c, "MAIL FROM:<a@b.org> SIZE=23\r\n"))
+    feed(&c, "250 ok\r\n")
+    check("p rcpt1", out_is(&c, "RCPT TO:<c@d.org>\r\n"))
+    feed(&c, "250 ok\r\n")
+    check("p rcpt2", out_is(&c, "RCPT TO:<e@f.org>\r\n"))
+    feed(&c, "550 5.1.1 no such user\r\n")
+    check("p rcpt3", out_is(&c, "RCPT TO:<g@h.org>\r\n"))
+    feed(&c, "251 forwarded\r\n")
+    check("p data", out_is(&c, "DATA\r\n"))
+    feed(&c, "354 go ahead\r\n")
+    check("p body", out_is(&c, "Subject: x\r\n\r\n..hi\r\n.\r\n"))
+    check("p not yet", (smtp.smtp_events(&c) & smtp.EVF_SENT) == 0)
+    feed(&c, "250 2.0.0 queued as 77\r\n")
+    check("p sent", (smtp.smtp_events(&c) & smtp.EVF_SENT) != 0)
+    check("p ok", smtp.smtp_err(&c) == 0 && smtp.smtp_state(&c) == smtp.ST_READY)
+    check("p acc", smtp.smtp_accepted(&c) == 2)
+    check("p rej", smtp.smtp_rejected(&c).n == 12 && rt.mem_eq(smtp.smtp_rejected(&c).p as u64, "e@f.org 550\n".p as u64, 12))
+    check("p text", smtp.smtp_text(&c).n == 19)
+    // a second mail on the same session, null sender, 8-bit body
+    let m2: str = "café\r\n"
+    check("p set2", smtp.smtp_set_mail(&c, "", "x@y.org", m2.p as u64, m2.n))
+    check("p mail2", out_is(&c, "MAIL FROM:<> SIZE=10 BODY=8BITMIME\r\n"))
+    smtp.smtp_quit(&c)
+    check("p quit", out_is(&c, "QUIT\r\n"))
+    smtp.smtp_free(&c)
+}
+
+fn test_quit() {
+    var c: smtp.Smtp = smtp.smtp_new()
+    ready(&c)
+    smtp.smtp_quit(&c)
+    check("q out", out_is(&c, "QUIT\r\n"))
+    feed(&c, "221 bye\r\n")
+    check("q closed", smtp.smtp_state(&c) == smtp.ST_CLOSED && (smtp.smtp_events(&c) & smtp.EVF_QUIT) != 0)
+    smtp.smtp_free(&c)
+}
+
+fn test_starttls_auth() {
+    var c: smtp.Smtp = smtp.smtp_new()
+    smtp.smtp_set_login(&c, "user", "pass")
+    feed(&c, "220 mx\r\n")
+    out_is(&c, "EHLO localhost\r\n")
+    feed(&c, "250-mx\r\n250-STARTTLS\r\n250 AUTH PLAIN LOGIN\r\n")
+    check("t starttls", out_is(&c, "STARTTLS\r\n"))
+    check("t caps seen", (smtp.smtp_caps(&c) & smtp.CAP_STARTTLS) != 0)
+    feed(&c, "220 ready to start TLS\r\n")
+    check("t ev", (smtp.smtp_events(&c) & smtp.EVF_TLS) != 0 && smtp.smtp_state(&c) == smtp.ST_TLS)
+    smtp.smtp_tls_done(&c)
+    check("t ehlo again", out_is(&c, "EHLO localhost\r\n"))
+    check("t caps reset", smtp.smtp_caps(&c) == 0)
+    feed(&c, "250-mx\r\n250 AUTH PLAIN\r\n")
+    check("t auth", out_is(&c, "AUTH PLAIN AHVzZXIAcGFzcw==\r\n"))
+    feed(&c, "235 2.7.0 ok\r\n")
+    check("t ready", smtp.smtp_state(&c) == smtp.ST_READY && smtp.smtp_err(&c) == 0)
+    smtp.smtp_free(&c)
+
+    // AUTH LOGIN, implicit TLS
+    var d: smtp.Smtp = smtp.smtp_new()
+    smtp.smtp_set_secure(&d, true)
+    smtp.smtp_set_login(&d, "user", "pass")
+    feed(&d, "220 mx\r\n")
+    out_is(&d, "EHLO localhost\r\n")
+    feed(&d, "250-mx\r\n250 AUTH LOGIN\r\n")
+    check("l start", out_is(&d, "AUTH LOGIN\r\n"))
+    feed(&d, "334 VXNlcm5hbWU6\r\n")
+    check("l user", out_is(&d, "dXNlcg==\r\n"))
+    feed(&d, "334 UGFzc3dvcmQ6\r\n")
+    check("l pass", out_is(&d, "cGFzcw==\r\n"))
+    feed(&d, "235 ok\r\n")
+    check("l ready", smtp.smtp_state(&d) == smtp.ST_READY)
+    smtp.smtp_free(&d)
+
+    // wrong password
+    var e: smtp.Smtp = smtp.smtp_new()
+    smtp.smtp_set_secure(&e, true)
+    smtp.smtp_set_login(&e, "user", "bad")
+    feed(&e, "220 mx\r\n")
+    out_is(&e, "EHLO localhost\r\n")
+    feed(&e, "250-mx\r\n250 AUTH PLAIN\r\n")
+    out_is(&e, "AUTH PLAIN AHVzZXIAYmFk\r\n")
+    check("a fail", !feed(&e, "535 5.7.8 bad credentials\r\n") && smtp.smtp_err(&e) == smtp.ERR_AUTH_FAILED && smtp.smtp_code(&e) == 535)
+    smtp.smtp_free(&e)
+}
+
+fn test_errors() {
+    // STARTTLS go-ahead with an injected command behind it
+    var c: smtp.Smtp = smtp.smtp_new()
+    feed(&c, "220 mx\r\n")
+    out_is(&c, "EHLO localhost\r\n")
+    feed(&c, "250-mx\r\n250 STARTTLS\r\n")
+    out_is(&c, "STARTTLS\r\n")
+    check("e inject", !feed(&c, "220 go\r\n250 evil\r\n") && smtp.smtp_err(&c) == smtp.ERR_PROTO)
+    smtp.smtp_free(&c)
+
+    // TLS required but not offered
+    var d: smtp.Smtp = smtp.smtp_new()
+    smtp.smtp_set_tls(&d, smtp.SMTP_REQUIRE)
+    feed(&d, "220 mx\r\n")
+    out_is(&d, "EHLO localhost\r\n")
+    check("e req", !feed(&d, "250 mx\r\n") && smtp.smtp_err(&d) == smtp.ERR_TLS_REQUIRED)
+    smtp.smtp_free(&d)
+
+    // STARTTLS refused with REQUIRE and with OPPORTUNISTIC
+    var e: smtp.Smtp = smtp.smtp_new()
+    smtp.smtp_set_tls(&e, smtp.SMTP_REQUIRE)
+    feed(&e, "220 mx\r\n")
+    out_is(&e, "EHLO localhost\r\n")
+    feed(&e, "250-mx\r\n250 STARTTLS\r\n")
+    out_is(&e, "STARTTLS\r\n")
+    check("e req2", !feed(&e, "454 TLS not available\r\n") && smtp.smtp_err(&e) == smtp.ERR_TLS_REQUIRED)
+    smtp.smtp_free(&e)
+    var f: smtp.Smtp = smtp.smtp_new()
+    feed(&f, "220 mx\r\n")
+    out_is(&f, "EHLO localhost\r\n")
+    feed(&f, "250-mx\r\n250 STARTTLS\r\n")
+    out_is(&f, "STARTTLS\r\n")
+    check("e opp", feed(&f, "454 no\r\n") && smtp.smtp_state(&f) == smtp.ST_READY)
+    smtp.smtp_free(&f)
+
+    // password over a plain connection
+    var g: smtp.Smtp = smtp.smtp_new()
+    smtp.smtp_set_tls(&g, smtp.SMTP_NEVER)
+    smtp.smtp_set_login(&g, "u", "p")
+    feed(&g, "220 mx\r\n")
+    out_is(&g, "EHLO localhost\r\n")
+    check("e insecure", !feed(&g, "250-mx\r\n250 AUTH PLAIN\r\n") && smtp.smtp_err(&g) == smtp.ERR_AUTH_INSECURE)
+    smtp.smtp_free(&g)
+
+    // server without AUTH
+    var h: smtp.Smtp = smtp.smtp_new()
+    smtp.smtp_set_secure(&h, true)
+    smtp.smtp_set_login(&h, "u", "p")
+    feed(&h, "220 mx\r\n")
+    out_is(&h, "EHLO localhost\r\n")
+    check("e noauth", !feed(&h, "250 mx\r\n") && smtp.smtp_err(&h) == smtp.ERR_AUTH_UNSUPPORTED)
+    smtp.smtp_free(&h)
+
+    // HELO fallback, greeting refused
+    var i: smtp.Smtp = smtp.smtp_new()
+    smtp.smtp_set_tls(&i, smtp.SMTP_NEVER)
+    feed(&i, "220 old\r\n")
+    out_is(&i, "EHLO localhost\r\n")
+    feed(&i, "502 5.5.2 command not recognized\r\n")
+    check("e helo", out_is(&i, "HELO localhost\r\n"))
+    feed(&i, "250 old\r\n")
+    check("e helo ready", smtp.smtp_state(&i) == smtp.ST_READY && smtp.smtp_caps(&i) == 0)
+    smtp.smtp_free(&i)
+    var j: smtp.Smtp = smtp.smtp_new()
+    check("e greet", !feed(&j, "554 no service\r\n") && smtp.smtp_err(&j) == smtp.ERR_GREETING)
+    smtp.smtp_free(&j)
+    var k: smtp.Smtp = smtp.smtp_new()
+    check("e 421", !feed(&k, "421 shutting down\r\n") && smtp.smtp_err(&k) == smtp.ERR_SERVER_GONE)
+    smtp.smtp_free(&k)
+}
+
+fn test_tx_errors() {
+    let msg: str = "Subject: x\r\n\r\nbody\r\n"
+    // too big
+    var c: smtp.Smtp = smtp.smtp_new()
+    ready(&c)
+    var big: rt.Buf = rt.buf_new()
+    var n: usize = 0
+    while n < 1200 {
+        rt.buf_push(&big, 97)
+        n += 1
+    }
+    check("x big", smtp.smtp_set_mail(&c, "a@b", "c@d", rt.buf_ptr(&big), rt.buf_len(&big)))
+    check("x big ev", smtp.smtp_err(&c) == smtp.ERR_TOO_BIG && smtp.smtp_state(&c) == smtp.ST_READY && smtp.smtp_out_len(&c) == 0)
+    rt.buf_free(&big)
+    smtp.smtp_free(&c)
+
+    // MAIL FROM refused -> RSET -> SENT with error
+    var d: smtp.Smtp = smtp.smtp_new()
+    ready(&d)
+    smtp.smtp_events(&d)
+    smtp.smtp_set_mail(&d, "a@b", "c@d", msg.p as u64, msg.n)
+    out_is(&d, "MAIL FROM:<a@b> SIZE=23\r\n")
+    feed(&d, "553 5.1.8 sender rejected\r\n")
+    check("x rset", out_is(&d, "RSET\r\n"))
+    feed(&d, "250 ok\r\n")
+    check("x from", smtp.smtp_err(&d) == smtp.ERR_REJECT_FROM && (smtp.smtp_events(&d) & smtp.EVF_SENT) != 0 && smtp.smtp_state(&d) == smtp.ST_READY)
+    smtp.smtp_free(&d)
+
+    // every recipient refused
+    var e: smtp.Smtp = smtp.smtp_new()
+    ready(&e)
+    smtp.smtp_set_mail(&e, "a@b", "c@d, e@f", msg.p as u64, msg.n)
+    out_is(&e, "MAIL FROM:<a@b> SIZE=23\r\n")
+    feed(&e, "250 ok\r\n")
+    out_is(&e, "RCPT TO:<c@d>\r\n")
+    feed(&e, "550 no\r\n")
+    out_is(&e, "RCPT TO:<e@f>\r\n")
+    feed(&e, "450 later\r\n")
+    check("x norcpt", out_is(&e, "RSET\r\n"))
+    feed(&e, "250 ok\r\n")
+    check("x norcpt err", smtp.smtp_err(&e) == smtp.ERR_NO_RCPT && smtp.smtp_rejected(&e).n == 16)
+    smtp.smtp_free(&e)
+
+    // DATA refused after the text
+    var f: smtp.Smtp = smtp.smtp_new()
+    ready(&f)
+    smtp.smtp_set_mail(&f, "a@b", "c@d", msg.p as u64, msg.n)
+    out_is(&f, "MAIL FROM:<a@b> SIZE=23\r\n")
+    feed(&f, "250 ok\r\n")
+    out_is(&f, "RCPT TO:<c@d>\r\n")
+    feed(&f, "250 ok\r\n")
+    out_is(&f, "DATA\r\n")
+    feed(&f, "354 go\r\n")
+    out_is(&f, "Subject: x\r\n\r\nbody\r\n.\r\n")
+    feed(&f, "552 5.3.4 message too big\r\n")
+    check("x data rej", smtp.smtp_err(&f) == smtp.ERR_DATA_REJECT && smtp.smtp_code(&f) == 552 && smtp.smtp_state(&f) == smtp.ST_READY)
+    smtp.smtp_free(&f)
+
+    // bad addresses: no command injection
+    var g: smtp.Smtp = smtp.smtp_new()
+    ready(&g)
+    check("x inj1", !smtp.smtp_set_mail(&g, "a@b\r\nRSET", "c@d", msg.p as u64, msg.n))
+    check("x inj2", !smtp.smtp_set_mail(&g, "a@b", "c@d>\r\nDATA", msg.p as u64, msg.n))
+    check("x inj3", !smtp.smtp_set_mail(&g, "a@b", "", msg.p as u64, msg.n))
+    check("x inj4", !smtp.smtp_set_mail(&g, "a b@c", "c@d", msg.p as u64, msg.n))
+    check("x inj none", smtp.smtp_out_len(&g) == 0 && smtp.smtp_err(&g) == smtp.ERR_BAD_ADDRESS)
+    check("x ehlo name", !smtp.smtp_set_ehlo_name(&g, "a b") && smtp.smtp_set_ehlo_name(&g, "[192.0.2.1]"))
+    smtp.smtp_free(&g)
+}
+
+fn test_replies() {
+    var c: smtp.Smtp = smtp.smtp_new()
+    check("r mixed", !feed(&c, "220-a\r\n221 b\r\n") && smtp.smtp_err(&c) == smtp.ERR_PROTO)
+    smtp.smtp_free(&c)
+    var d: smtp.Smtp = smtp.smtp_new()
+    check("r junk", !feed(&d, "hello\r\n") && smtp.smtp_err(&d) == smtp.ERR_PROTO)
+    smtp.smtp_free(&d)
+    var e: smtp.Smtp = smtp.smtp_new()
+    check("r sep", !feed(&e, "220x oops\r\n") && smtp.smtp_err(&e) == smtp.ERR_PROTO)
+    smtp.smtp_free(&e)
+    // split into single bytes, bare LF line ends, a code without text
+    var f: smtp.Smtp = smtp.smtp_new()
+    smtp.smtp_set_tls(&f, smtp.SMTP_NEVER)
+    let s: str = "220-hello\n220 world\n"
+    var i: usize = 0
+    var ok: bool = true
+    while i < s.n {
+        ok = ok && smtp.smtp_feed(&f, s.p as u64 + i as u64, 1)
+        i += 1
+    }
+    check("r bytes", ok && out_is(&f, "EHLO localhost\r\n"))
+    check("r text", smtp.smtp_text(&f).n == 12)
+    feed(&f, "250\r\n")
+    check("r bare code", smtp.smtp_state(&f) == smtp.ST_READY)
+    check("r unasked", !feed(&f, "250 what\r\n") && smtp.smtp_err(&f) == smtp.ERR_PROTO)
+    smtp.smtp_free(&f)
+    // too long
+    var g: smtp.Smtp = smtp.smtp_new()
+    var b: rt.Buf = rt.buf_new()
+    var n: usize = 0
+    while n < 9000 {
+        rt.buf_push(&b, 120)
+        n += 1
+    }
+    check("r long", !smtp.smtp_feed(&g, rt.buf_ptr(&b), rt.buf_len(&b)) && smtp.smtp_err(&g) == smtp.ERR_TOO_LONG)
+    rt.buf_free(&b)
+    smtp.smtp_free(&g)
+    // eof before QUIT
+    var h: smtp.Smtp = smtp.smtp_new()
+    ready(&h)
+    smtp.smtp_eof(&h)
+    check("r eof", smtp.smtp_err(&h) == smtp.ERR_CLOSED)
+    smtp.smtp_free(&h)
+}
+
+// Random server octets (valid-looking transcripts with mutations) in random chunks: no crash.
+fn fuzz(rounds: usize) -> usize {
+    let script: str = "220 mx ESMTP\r\n250-mx\r\n250-SIZE 100000\r\n250-STARTTLS\r\n250-AUTH PLAIN LOGIN\r\n250 8BITMIME\r\n220 go\r\n250-mx\r\n250 AUTH PLAIN LOGIN\r\n334 VXNlcm5hbWU6\r\n334 UGFzc3dvcmQ6\r\n235 ok\r\n250 ok\r\n250 ok\r\n250 ok\r\n354 go\r\n250 queued\r\n221 bye\r\n"
+    let msg: str = "Subject: f\r\n\r\n.x\r\n"
+    var r: usize = 0
+    var steps: usize = 0
+    while r < rounds {
+        var c: smtp.Smtp = smtp.smtp_new()
+        smtp.smtp_set_login(&c, "user", "pass")
+        smtp.smtp_set_insecure_auth(&c, true)
+        smtp.smtp_set_mail(&c, "a@b", "c@d, e@f", msg.p as u64, msg.n)
+        var b: rt.Buf = rt.buf_new()
+        var i: usize = 0
+        while i < script.n {
+            var ch: u32 = rfc_at(script, i)
+            let m: u64 = rnd() % 40
+            if m == 0 {
+                ch = (rnd() & 255) as u32
+            } else if m == 1 {
+                ch = 10
+            } else if m == 2 {
+                ch = 45
+            }
+            rt.buf_push(&b, ch as u8)
+            i += 1
+        }
+        var pos: usize = 0
+        while pos < rt.buf_len(&b) {
+            var k: usize = (1 + rnd() % 23) as usize
+            if pos + k > rt.buf_len(&b) {
+                k = rt.buf_len(&b) - pos
+            }
+            smtp.smtp_feed(&c, rt.buf_ptr(&b) + pos as u64, k)
+            let ev: u32 = smtp.smtp_events(&c)
+            if (ev & smtp.EVF_TLS) != 0 {
+                smtp.smtp_tls_done(&c)
+            }
+            smtp.smtp_out_consume(&c, smtp.smtp_out_len(&c))
+            pos += k
+            steps += 1
+        }
+        smtp.smtp_eof(&c)
+        rt.buf_free(&b)
+        smtp.smtp_free(&c)
+        r += 1
+    }
+    return steps
+}
+
+fn rfc_at(s: str, i: usize) -> u32 {
+    return rt.ld8(s.p as u64, i) as u32
+}
+
+fn main() -> i32 {
+    test_dots()
+    test_plain_mail()
+    test_quit()
+    test_starttls_auth()
+    test_errors()
+    test_tx_errors()
+    test_replies()
+    let steps: usize = fuzz(2000)
+    check("fuzz ran", steps > 10000)
+    return failures
+}

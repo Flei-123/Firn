@@ -1,0 +1,1060 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mail/smtp.fi -- mail.smtp: an SMTP client (RFC 5321, STARTTLS RFC 3207,
+// AUTH RFC 4954, SIZE/8BITMIME/PIPELINING-aware). Two layers in one file:
+//
+//   CORE  `Smtp` is sans-I/O: you feed it the server's octets, it gives you
+//         the octets to send. It owns the whole dialogue (greeting, EHLO/HELO,
+//         STARTTLS, AUTH PLAIN/LOGIN, MAIL/RCPT/DATA, QUIT) and can be driven
+//         from tests with a script.
+//   GLUE  `Sc` runs a core on an `async.stream` (TCP, implicit TLS or STARTTLS
+//         in place) and tells the program in a callback, like net/jarvisc.fi.
+//
+//     import async.loop
+//     import mail.smtp
+//
+//     fn on_event(c: *mut smtp.Sc, ud: u64, kind: u32, arg: i64) {
+//         if kind == smtp.SME_READY {                       // greeted, TLS done, logged in
+//             smtp.sc_send(c, "me@example.org", "you@example.org, her@example.org", msg_p, msg_n)
+//         } else if kind == smtp.SME_SENT {                 // arg 1 = accepted, 0 = refused
+//             smtp.sc_quit(c)                               // smtp.sc_err / sc_code / sc_text say why
+//         } else if kind == smtp.SME_CLOSED { }             // arg = stream CL_* reason; `c` is gone after
+//     }
+//     let c: *mut smtp.Sc = smtp.sc_open(&l, addr, 587, smtp.SM_STARTTLS, "mail.example.org",
+//                                        &store, now_seconds, 30000, on_event, 0)
+//     smtp.sc_set_login(c, "user", "secret")
+//     loop.run(&l)
+//
+// The message is the finished text of mail.rfc822 (`builder_build`); the core
+// normalises line ends to CRLF, doubles leading dots and appends the final dot.
+//
+// WHAT HAPPENS
+//   greeting 220 -> EHLO <name> (a 500..504 answer falls back to HELO) -> the
+//   capability lines (STARTTLS, AUTH PLAIN/LOGIN, SIZE n, 8BITMIME, PIPELINING,
+//   SMTPUTF8) -> STARTTLS when offered and wanted (then EHLO again, the
+//   capabilities of the plain session are thrown away) -> AUTH -> READY.
+//   A transaction is MAIL FROM, one RCPT TO per recipient, DATA, the text, a
+//   final answer. Recipients the server refuses are collected (`smtp_rejected`);
+//   the mail goes out when at least one was accepted.
+//
+// HONEST
+//   M1  One transaction at a time, no pipelining (the capability is read, not used).
+//   M2  The password never goes over a plain connection unless you call
+//       `smtp_set_insecure_auth(true)`: otherwise ERR_AUTH_INSECURE.
+//   M3  STARTTLS: the stream is switched only when nothing is queued or unread;
+//       bytes behind the `220` line of STARTTLS end the session (ERR_PROTO,
+//       the classic injection). With SMTP_REQUIRE a server without STARTTLS is ERR_TLS_REQUIRED
+//       -- no silent downgrade. With SMTP_OPPORTUNISTIC a missing STARTTLS is accepted.
+//   M4  Addresses are ASCII only (no SMTPUTF8 sending); CR, LF, NUL, blanks and
+//       angle brackets inside an address are refused (ERR_BAD_ADDRESS): no command injection.
+//   M5  AUTH: PLAIN and LOGIN only (no CRAM-MD5, no XOAUTH2). A forced mode
+//       is tried even when the server did not list it.
+//   M6  8-bit text goes out as it is, with BODY=8BITMIME only when the server offered it.
+//   M7  Reply lines longer than 8192 octets, more than 200 lines in one reply, or a
+//       line that is not `ddd[ -]text` end the session with ERR_PROTO / ERR_TOO_LONG.
+//   M8  Do not free the client inside its own callback.
+import std.rt
+import std.str
+import std.base64
+import mail.rfc822
+import async.loop
+import async.stream
+import tls.x509
+
+export {
+    Smtp, Sc,
+    ST_GREET, ST_EHLO, ST_HELO, ST_STARTTLS, ST_TLS, ST_AUTH, ST_LOGIN_USER, ST_LOGIN_PASS, ST_READY,
+    ST_MAIL, ST_RCPT, ST_DATA, ST_BODY, ST_RSET, ST_QUIT, ST_CLOSED, ST_FAILED,
+    ERR_NONE, ERR_PROTO, ERR_TLS_REQUIRED, ERR_AUTH_UNSUPPORTED, ERR_AUTH_FAILED, ERR_REJECT_FROM,
+    ERR_NO_RCPT, ERR_DATA_REJECT, ERR_GREETING, ERR_TOO_BIG, ERR_BAD_ADDRESS, ERR_TOO_LONG,
+    ERR_CLOSED, ERR_AUTH_INSECURE, ERR_SERVER_GONE, ERR_REJECT_EHLO, ERR_STATE,
+    CAP_STARTTLS, CAP_PLAIN, CAP_LOGIN, CAP_8BIT, CAP_PIPELINING, CAP_SIZE, CAP_SMTPUTF8,
+    EVF_READY, EVF_SENT, EVF_TLS, EVF_FAILED, EVF_QUIT,
+    SMTP_NEVER, SMTP_OPPORTUNISTIC, SMTP_REQUIRE, AUTH_AUTO, AUTH_PLAIN, AUTH_LOGIN,
+    SM_PLAIN, SM_STARTTLS, SM_TLS, SME_READY, SME_SENT, SME_CLOSED,
+    smtp_new, smtp_free, smtp_set_ehlo_name, smtp_set_login, smtp_set_tls, smtp_set_auth_mode,
+    smtp_set_insecure_auth, smtp_set_secure, smtp_set_mail, smtp_feed, smtp_eof,
+    smtp_out_ptr, smtp_out_len, smtp_out_consume, smtp_events, smtp_tls_done, smtp_quit,
+    smtp_state, smtp_err, smtp_code, smtp_text, smtp_caps, smtp_max_size, smtp_rejected,
+    smtp_accepted, smtp_prepare_data, smtp_is_done,
+    sc_open, sc_set_login, sc_set_tls_mode, sc_set_auth_mode, sc_set_insecure_auth, sc_set_ehlo_name,
+    sc_send, sc_quit, sc_abort, sc_core, sc_err, sc_code, sc_text, sc_rejected, sc_accepted,
+}
+
+const ST_GREET: u32 = 1
+const ST_EHLO: u32 = 2
+const ST_HELO: u32 = 3
+const ST_STARTTLS: u32 = 4
+const ST_TLS: u32 = 5
+const ST_AUTH: u32 = 6
+const ST_LOGIN_USER: u32 = 7
+const ST_LOGIN_PASS: u32 = 8
+const ST_READY: u32 = 9
+const ST_MAIL: u32 = 10
+const ST_RCPT: u32 = 11
+const ST_DATA: u32 = 12
+const ST_BODY: u32 = 13
+const ST_RSET: u32 = 14
+const ST_QUIT: u32 = 15
+const ST_CLOSED: u32 = 16
+const ST_FAILED: u32 = 17
+
+const ERR_NONE: u32 = 0
+const ERR_PROTO: u32 = 1 // an answer that is not SMTP, or an answer in the wrong place
+const ERR_TLS_REQUIRED: u32 = 2
+const ERR_AUTH_UNSUPPORTED: u32 = 3
+const ERR_AUTH_FAILED: u32 = 4
+const ERR_REJECT_FROM: u32 = 5
+const ERR_NO_RCPT: u32 = 6 // every recipient was refused
+const ERR_DATA_REJECT: u32 = 7
+const ERR_GREETING: u32 = 8
+const ERR_TOO_BIG: u32 = 9 // larger than the SIZE the server announced
+const ERR_BAD_ADDRESS: u32 = 10
+const ERR_TOO_LONG: u32 = 11
+const ERR_CLOSED: u32 = 12 // the connection ended before QUIT
+const ERR_AUTH_INSECURE: u32 = 13
+const ERR_SERVER_GONE: u32 = 14 // 421
+const ERR_REJECT_EHLO: u32 = 15
+const ERR_STATE: u32 = 16 // a call that does not fit the state
+
+const CAP_STARTTLS: u32 = 1
+const CAP_PLAIN: u32 = 2
+const CAP_LOGIN: u32 = 4
+const CAP_8BIT: u32 = 8
+const CAP_PIPELINING: u32 = 16
+const CAP_SIZE: u32 = 32
+const CAP_SMTPUTF8: u32 = 64
+
+const EVF_READY: u32 = 1
+const EVF_SENT: u32 = 2
+const EVF_TLS: u32 = 4
+const EVF_FAILED: u32 = 8
+const EVF_QUIT: u32 = 16
+
+const SMTP_NEVER: u32 = 0
+const SMTP_OPPORTUNISTIC: u32 = 1
+const SMTP_REQUIRE: u32 = 2
+const AUTH_AUTO: u32 = 0
+const AUTH_PLAIN: u32 = 1
+const AUTH_LOGIN: u32 = 2
+
+const MAX_LINE: usize = 8192
+const MAX_LINES: u32 = 200
+
+struct Smtp {
+    state: u32,
+    inb: rt.Buf,
+    inpos: usize,
+    out: rt.Buf,
+    outpos: usize,
+    code: u32,
+    text: rt.Buf,
+    pend_code: u32,
+    pend_lines: u32,
+    ehlo_name: rt.Buf,
+    user: rt.Buf,
+    pass: rt.Buf,
+    from: rt.Buf,
+    rcpts: rt.Buf,
+    data: rt.Buf,
+    bad: rt.Buf,
+    caps: u32,
+    max_size: u64,
+    tls_mode: u32,
+    auth_mode: u32,
+    secure: bool,
+    insecure_auth: bool,
+    tried_helo: bool,
+    have_mail: bool,
+    has8: bool,
+    rcpt_pos: usize,
+    rcpt_start: usize,
+    rcpt_end: usize,
+    rcpt_ok: u32,
+    rcpt_bad: u32,
+    err: u32,
+    tx_err: u32,
+    events: u32,
+}
+
+fn bs(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn push(b: *mut rt.Buf, s: str) {
+    if s.n > 0 {
+        rt.buf_push_bytes(b, s.p as u64, s.n)
+    }
+}
+
+fn wipe(b: *mut rt.Buf) {
+    let p: *mut u8 = rt.buf_data(b)
+    var i: usize = 0
+    let n: usize = rt.buf_len(b)
+    while i < n {
+        *(p + i) = 0
+        i += 1
+    }
+    rt.buf_clear(b)
+}
+
+fn smtp_new() -> Smtp {
+    var c: Smtp = Smtp {
+        state: ST_GREET, inb: rt.buf_new(), inpos: 0, out: rt.buf_new(), outpos: 0, code: 0,
+        text: rt.buf_new(), pend_code: 0, pend_lines: 0, ehlo_name: rt.buf_new(), user: rt.buf_new(),
+        pass: rt.buf_new(), from: rt.buf_new(), rcpts: rt.buf_new(), data: rt.buf_new(), bad: rt.buf_new(),
+        caps: 0, max_size: 0, tls_mode: SMTP_OPPORTUNISTIC, auth_mode: AUTH_AUTO, secure: false,
+        insecure_auth: false, tried_helo: false, have_mail: false, has8: false, rcpt_pos: 0,
+        rcpt_start: 0, rcpt_end: 0, rcpt_ok: 0, rcpt_bad: 0, err: 0, tx_err: 0, events: 0,
+    }
+    push(&c.ehlo_name, "localhost")
+    return c
+}
+
+fn smtp_free(c: *mut Smtp) {
+    wipe(&(*c).pass)
+    wipe(&(*c).user)
+    rt.buf_free(&(*c).inb)
+    rt.buf_free(&(*c).out)
+    rt.buf_free(&(*c).text)
+    rt.buf_free(&(*c).ehlo_name)
+    rt.buf_free(&(*c).user)
+    rt.buf_free(&(*c).pass)
+    rt.buf_free(&(*c).from)
+    rt.buf_free(&(*c).rcpts)
+    rt.buf_free(&(*c).data)
+    rt.buf_free(&(*c).bad)
+}
+
+// ---------------------------------------------------------------- settings
+
+fn host_ok(s: str) -> bool {
+    if s.n == 0 || s.n > 255 {
+        return false
+    }
+    var i: usize = 0
+    while i < s.n {
+        let ch: u32 = rfc822.at(s, i)
+        if ch <= 32 || ch >= 127 {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// The name sent in EHLO (a host name or a literal like [192.0.2.1]). Default "localhost".
+fn smtp_set_ehlo_name(c: *mut Smtp, name: str) -> bool {
+    if !host_ok(name) {
+        return false
+    }
+    rt.buf_clear(&(*c).ehlo_name)
+    push(&(*c).ehlo_name, name)
+    return true
+}
+
+fn smtp_set_login(c: *mut Smtp, user: str, pass: str) {
+    wipe(&(*c).user)
+    wipe(&(*c).pass)
+    push(&(*c).user, user)
+    push(&(*c).pass, pass)
+}
+
+fn smtp_set_tls(c: *mut Smtp, mode: u32) {
+    (*c).tls_mode = mode
+}
+
+fn smtp_set_auth_mode(c: *mut Smtp, mode: u32) {
+    (*c).auth_mode = mode
+}
+
+fn smtp_set_insecure_auth(c: *mut Smtp, on: bool) {
+    (*c).insecure_auth = on
+}
+
+// true = the connection is TLS from the first octet (port 465). The glue sets it.
+fn smtp_set_secure(c: *mut Smtp, on: bool) {
+    (*c).secure = on
+}
+
+// ------------------------------------------------------------ state queries
+
+fn smtp_state(c: *mut Smtp) -> u32 { return (*c).state }
+fn smtp_err(c: *mut Smtp) -> u32 { return (*c).err }
+// The last complete reply code, 0 before the first.
+fn smtp_code(c: *mut Smtp) -> u32 { return (*c).code }
+// The text of the last reply, lines separated by \n (code and blank removed).
+fn smtp_text(c: *mut Smtp) -> str { return bs(&(*c).text) }
+fn smtp_caps(c: *mut Smtp) -> u32 { return (*c).caps }
+fn smtp_max_size(c: *mut Smtp) -> u64 { return (*c).max_size }
+// "address code" per line: the recipients the server refused in the last transaction.
+fn smtp_rejected(c: *mut Smtp) -> str { return bs(&(*c).bad) }
+fn smtp_accepted(c: *mut Smtp) -> u32 { return (*c).rcpt_ok }
+// 0 = the last transaction was accepted, else an ERR_* code.
+fn smtp_is_done(c: *mut Smtp) -> bool { return (*c).state == ST_CLOSED || (*c).state == ST_FAILED }
+
+fn smtp_events(c: *mut Smtp) -> u32 {
+    let e: u32 = (*c).events
+    (*c).events = 0
+    return e
+}
+
+fn smtp_out_ptr(c: *mut Smtp) -> u64 { return rt.buf_ptr(&(*c).out) + (*c).outpos as u64 }
+fn smtp_out_len(c: *mut Smtp) -> usize { return rt.buf_len(&(*c).out) - (*c).outpos }
+fn smtp_out_consume(c: *mut Smtp, n: usize) {
+    (*c).outpos += n
+    if (*c).outpos >= rt.buf_len(&(*c).out) {
+        rt.buf_clear(&(*c).out)
+        (*c).outpos = 0
+    }
+}
+
+// ---------------------------------------------------------------- failures
+
+fn fail(c: *mut Smtp, err: u32) {
+    if (*c).state == ST_FAILED || (*c).state == ST_CLOSED {
+        return
+    }
+    if (*c).err == 0 {
+        (*c).err = err
+    }
+    (*c).state = ST_FAILED
+    (*c).events = (*c).events | EVF_FAILED
+    rt.buf_clear(&(*c).out)
+    (*c).outpos = 0
+    wipe(&(*c).pass)
+}
+
+// The connection ended (the glue calls this when the stream closed).
+fn smtp_eof(c: *mut Smtp) {
+    if (*c).state != ST_CLOSED && (*c).state != ST_FAILED {
+        fail(c, ERR_CLOSED)
+    }
+}
+
+// ------------------------------------------------------------- command out
+
+fn cmd(c: *mut Smtp, s: str) {
+    push(&(*c).out, s)
+    push(&(*c).out, "\r\n")
+}
+
+fn cmd2(c: *mut Smtp, a: str, b: str) {
+    push(&(*c).out, a)
+    push(&(*c).out, b)
+    push(&(*c).out, "\r\n")
+}
+
+fn send_ehlo(c: *mut Smtp) {
+    (*c).caps = 0
+    (*c).max_size = 0
+    cmd2(c, "EHLO ", bs(&(*c).ehlo_name))
+    (*c).state = ST_EHLO
+}
+
+// ----------------------------------------------------------- data (the text)
+
+fn push_crlf(b: *mut rt.Buf) {
+    rt.buf_push(b, 13)
+    rt.buf_push(b, 10)
+}
+
+// Message text -> what goes between `DATA` and the end: line ends become CRLF
+// (a lone LF or a lone CR counts as a line end), a line that starts with "."
+// gets a second ".", the text ends with CRLF, then ".\r\n". Returns true when a
+// byte >= 128 was seen.
+fn smtp_prepare_data(p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var i: usize = 0
+    var bol: bool = true
+    var high: bool = false
+    while i < n {
+        let ch: u32 = rt.ld8(p, i) as u32
+        if ch == 13 {
+            push_crlf(out)
+            bol = true
+            if i + 1 < n && (rt.ld8(p, i + 1) as u32) == 10 {
+                i += 1
+            }
+        } else if ch == 10 {
+            push_crlf(out)
+            bol = true
+        } else {
+            if bol && ch == 46 {
+                rt.buf_push(out, 46)
+            }
+            if ch >= 128 {
+                high = true
+            }
+            rt.buf_push(out, ch as u8)
+            bol = false
+        }
+        i += 1
+    }
+    if !bol {
+        push_crlf(out)
+    }
+    rt.buf_push(out, 46)
+    push_crlf(out)
+    return high
+}
+
+fn addr_char_ok(ch: u32) -> bool {
+    return ch > 32 && ch < 127 && ch != 60 && ch != 62
+}
+
+// Splits "a@x, <b@y>; c@z" at , ; blanks and line ends, strips one pair of <>,
+// checks every address, appends them one per line to `out`. false = bad address.
+fn parse_rcpts(list: str, out: *mut rt.Buf) -> bool {
+    var i: usize = 0
+    var count: u32 = 0
+    while i < list.n {
+        let ch: u32 = rfc822.at(list, i)
+        if ch == 44 || ch == 59 || ch == 32 || ch == 9 || ch == 13 || ch == 10 {
+            i += 1
+        } else {
+            var j: usize = i
+            while j < list.n {
+                let d: u32 = rfc822.at(list, j)
+                if d == 44 || d == 59 || d == 32 || d == 9 || d == 13 || d == 10 {
+                    break
+                }
+                j += 1
+            }
+            var a: usize = i
+            var b: usize = j
+            if b - a >= 2 && rfc822.at(list, a) == 60 && rfc822.at(list, b - 1) == 62 {
+                a += 1
+                b -= 1
+            }
+            if b == a || b - a > 254 {
+                return false
+            }
+            var k: usize = a
+            while k < b {
+                if !addr_char_ok(rfc822.at(list, k)) {
+                    return false
+                }
+                k += 1
+            }
+            rt.buf_push_bytes(out, list.p as u64 + a as u64, b - a)
+            rt.buf_push(out, 10)
+            count += 1
+            i = j
+        }
+    }
+    return count > 0
+}
+
+// Queues one mail: `from` ("" = the null sender <>), recipients separated by
+// , ; blank or newline, the finished message text. false = ERR_BAD_ADDRESS /
+// ERR_STATE (no transaction is queued). When the session is READY the MAIL
+// FROM goes out at once, else as soon as it is.
+fn smtp_set_mail(c: *mut Smtp, from: str, rcpts: str, mp: u64, mn: usize) -> bool {
+    if (*c).have_mail || (*c).state == ST_CLOSED || (*c).state == ST_FAILED || (*c).state == ST_QUIT {
+        return false
+    }
+    rt.buf_clear(&(*c).from)
+    rt.buf_clear(&(*c).rcpts)
+    rt.buf_clear(&(*c).data)
+    var f: str = from
+    if f.n >= 2 && rfc822.at(f, 0) == 60 && rfc822.at(f, f.n - 1) == 62 {
+        f = rfc822.view(f, 1, f.n - 1)
+    }
+    var i: usize = 0
+    while i < f.n {
+        if !addr_char_ok(rfc822.at(f, i)) {
+            (*c).err = ERR_BAD_ADDRESS
+            return false
+        }
+        i += 1
+    }
+    if f.n > 254 || !parse_rcpts(rcpts, &(*c).rcpts) {
+        (*c).err = ERR_BAD_ADDRESS
+        return false
+    }
+    push(&(*c).from, f)
+    (*c).has8 = smtp_prepare_data(mp, mn, &(*c).data)
+    (*c).have_mail = true
+    (*c).err = 0
+    if (*c).state == ST_READY {
+        begin_mail(c)
+    }
+    return true
+}
+
+fn u64_str(b: *mut rt.Buf, v: u64) {
+    rt.buf_push_dec_u64(b, v)
+}
+
+fn begin_mail(c: *mut Smtp) {
+    (*c).rcpt_pos = 0
+    (*c).rcpt_ok = 0
+    (*c).rcpt_bad = 0
+    (*c).tx_err = 0
+    rt.buf_clear(&(*c).bad)
+    if (*c).max_size > 0 && (rt.buf_len(&(*c).data) as u64) > (*c).max_size {
+        finish_tx(c, ERR_TOO_BIG)
+        return
+    }
+    push(&(*c).out, "MAIL FROM:<")
+    push(&(*c).out, bs(&(*c).from))
+    push(&(*c).out, ">")
+    if ((*c).caps & CAP_SIZE) != 0 {
+        push(&(*c).out, " SIZE=")
+        u64_str(&(*c).out, rt.buf_len(&(*c).data) as u64)
+    }
+    if (*c).has8 && ((*c).caps & CAP_8BIT) != 0 {
+        push(&(*c).out, " BODY=8BITMIME")
+    }
+    push(&(*c).out, "\r\n")
+    (*c).state = ST_MAIL
+}
+
+fn finish_tx(c: *mut Smtp, err: u32) {
+    (*c).tx_err = err
+    (*c).err = err
+    (*c).have_mail = false
+    (*c).state = ST_READY
+    (*c).events = (*c).events | EVF_SENT
+}
+
+// Gives up the open transaction in an orderly way: RSET, then SENT with `err`.
+fn abort_tx(c: *mut Smtp, err: u32) {
+    (*c).tx_err = err
+    cmd(c, "RSET")
+    (*c).state = ST_RSET
+}
+
+fn send_rcpt(c: *mut Smtp) {
+    let all: str = bs(&(*c).rcpts)
+    var j: usize = (*c).rcpt_pos
+    while j < all.n && rfc822.at(all, j) != 10 {
+        j += 1
+    }
+    (*c).rcpt_start = (*c).rcpt_pos
+    (*c).rcpt_end = j
+    (*c).rcpt_pos = j + 1
+    push(&(*c).out, "RCPT TO:<")
+    push(&(*c).out, rfc822.view(all, (*c).rcpt_start, j))
+    push(&(*c).out, ">\r\n")
+    (*c).state = ST_RCPT
+}
+
+// -------------------------------------------------------------- capabilities
+
+fn parse_caps(c: *mut Smtp) {
+    let t: str = bs(&(*c).text)
+    var pos: usize = 0
+    var first: bool = true
+    while pos < t.n {
+        var e: usize = pos
+        while e < t.n && rfc822.at(t, e) != 10 {
+            e += 1
+        }
+        if !first {
+            let line: str = rfc822.view(t, pos, e)
+            // first word, then the rest
+            var w: usize = 0
+            while w < line.n && rfc822.at(line, w) != 32 {
+                w += 1
+            }
+            let key: str = rfc822.view(line, 0, w)
+            if rfc822.eq_nocase(key, "STARTTLS") {
+                (*c).caps = (*c).caps | CAP_STARTTLS
+            } else if rfc822.eq_nocase(key, "8BITMIME") {
+                (*c).caps = (*c).caps | CAP_8BIT
+            } else if rfc822.eq_nocase(key, "PIPELINING") {
+                (*c).caps = (*c).caps | CAP_PIPELINING
+            } else if rfc822.eq_nocase(key, "SMTPUTF8") {
+                (*c).caps = (*c).caps | CAP_SMTPUTF8
+            } else if rfc822.eq_nocase(key, "SIZE") {
+                (*c).caps = (*c).caps | CAP_SIZE
+                var v: u64 = 0
+                var q: usize = w + 1
+                while q < line.n && rfc822.at(line, q) >= 48 && rfc822.at(line, q) <= 57 && v < 100000000000000 {
+                    v = v * 10 + (rfc822.at(line, q) - 48) as u64
+                    q += 1
+                }
+                (*c).max_size = v
+            } else if rfc822.eq_nocase(key, "AUTH") || rfc822.eq_nocase(key, "AUTH=PLAIN") {
+                // AUTH PLAIN LOGIN ...  (old servers: AUTH=LOGIN)
+                var q2: usize = w + 1
+                if rfc822.eq_nocase(key, "AUTH=PLAIN") {
+                    (*c).caps = (*c).caps | CAP_PLAIN
+                }
+                while q2 < line.n {
+                    var r: usize = q2
+                    while r < line.n && rfc822.at(line, r) != 32 {
+                        r += 1
+                    }
+                    let mech: str = rfc822.view(line, q2, r)
+                    if rfc822.eq_nocase(mech, "PLAIN") {
+                        (*c).caps = (*c).caps | CAP_PLAIN
+                    } else if rfc822.eq_nocase(mech, "LOGIN") {
+                        (*c).caps = (*c).caps | CAP_LOGIN
+                    }
+                    q2 = r + 1
+                }
+            }
+        }
+        first = false
+        pos = e + 1
+    }
+}
+
+// ------------------------------------------------------------------ the flow
+
+fn ready_step(c: *mut Smtp) {
+    if (*c).have_mail {
+        begin_mail(c)
+    } else {
+        (*c).state = ST_READY
+        (*c).events = (*c).events | EVF_READY
+    }
+}
+
+fn b64_line(c: *mut Smtp, p: u64, n: usize) {
+    base64.encode(p, n, &(*c).out)
+    push(&(*c).out, "\r\n")
+}
+
+fn start_auth(c: *mut Smtp) {
+    if rt.buf_len(&(*c).user) == 0 {
+        ready_step(c)
+        return
+    }
+    if !(*c).secure && !(*c).insecure_auth {
+        fail(c, ERR_AUTH_INSECURE)
+        return
+    }
+    var mode: u32 = (*c).auth_mode
+    if mode == AUTH_AUTO {
+        if ((*c).caps & CAP_PLAIN) != 0 {
+            mode = AUTH_PLAIN
+        } else if ((*c).caps & CAP_LOGIN) != 0 {
+            mode = AUTH_LOGIN
+        } else {
+            fail(c, ERR_AUTH_UNSUPPORTED)
+            return
+        }
+    }
+    if mode == AUTH_PLAIN {
+        var t: rt.Buf = rt.buf_new()
+        rt.buf_push(&t, 0)
+        rt.buf_push_bytes(&t, rt.buf_ptr(&(*c).user), rt.buf_len(&(*c).user))
+        rt.buf_push(&t, 0)
+        rt.buf_push_bytes(&t, rt.buf_ptr(&(*c).pass), rt.buf_len(&(*c).pass))
+        push(&(*c).out, "AUTH PLAIN ")
+        b64_line(c, rt.buf_ptr(&t), rt.buf_len(&t))
+        wipe(&t)
+        rt.buf_free(&t)
+        (*c).state = ST_AUTH
+    } else {
+        cmd(c, "AUTH LOGIN")
+        (*c).state = ST_LOGIN_USER
+    }
+}
+
+fn after_ehlo(c: *mut Smtp) {
+    if !(*c).secure && (*c).tls_mode != SMTP_NEVER {
+        if ((*c).caps & CAP_STARTTLS) != 0 {
+            cmd(c, "STARTTLS")
+            (*c).state = ST_STARTTLS
+            return
+        }
+        if (*c).tls_mode == SMTP_REQUIRE {
+            fail(c, ERR_TLS_REQUIRED)
+            return
+        }
+    }
+    start_auth(c)
+}
+
+fn on_reply(c: *mut Smtp) {
+    let code: u32 = (*c).code
+    let st: u32 = (*c).state
+    if code == 421 && st != ST_QUIT {
+        fail(c, ERR_SERVER_GONE)
+        return
+    }
+    if st == ST_GREET {
+        if code == 220 {
+            send_ehlo(c)
+        } else {
+            fail(c, ERR_GREETING)
+        }
+    } else if st == ST_EHLO {
+        if code == 250 {
+            parse_caps(c)
+            after_ehlo(c)
+        } else if code >= 500 && code <= 504 && !(*c).tried_helo {
+            (*c).tried_helo = true
+            cmd2(c, "HELO ", bs(&(*c).ehlo_name))
+            (*c).state = ST_HELO
+        } else {
+            fail(c, ERR_REJECT_EHLO)
+        }
+    } else if st == ST_HELO {
+        if code == 250 {
+            (*c).caps = 0
+            after_ehlo(c)
+        } else {
+            fail(c, ERR_REJECT_EHLO)
+        }
+    } else if st == ST_STARTTLS {
+        if code == 220 {
+            (*c).state = ST_TLS
+            (*c).events = (*c).events | EVF_TLS
+        } else if (*c).tls_mode == SMTP_REQUIRE {
+            fail(c, ERR_TLS_REQUIRED)
+        } else {
+            start_auth(c)
+        }
+    } else if st == ST_AUTH {
+        if code == 235 {
+            ready_step(c)
+        } else {
+            fail(c, ERR_AUTH_FAILED)
+        }
+    } else if st == ST_LOGIN_USER {
+        if code == 334 {
+            b64_line(c, rt.buf_ptr(&(*c).user), rt.buf_len(&(*c).user))
+            (*c).state = ST_LOGIN_PASS
+        } else {
+            fail(c, ERR_AUTH_FAILED)
+        }
+    } else if st == ST_LOGIN_PASS {
+        if code == 334 {
+            b64_line(c, rt.buf_ptr(&(*c).pass), rt.buf_len(&(*c).pass))
+            (*c).state = ST_AUTH
+        } else {
+            fail(c, ERR_AUTH_FAILED)
+        }
+    } else if st == ST_MAIL {
+        if code == 250 {
+            send_rcpt(c)
+        } else {
+            abort_tx(c, ERR_REJECT_FROM)
+        }
+    } else if st == ST_RCPT {
+        if code == 250 || code == 251 {
+            (*c).rcpt_ok += 1
+        } else {
+            (*c).rcpt_bad += 1
+            let all: str = bs(&(*c).rcpts)
+            push(&(*c).bad, rfc822.view(all, (*c).rcpt_start, (*c).rcpt_end))
+            rt.buf_push(&(*c).bad, 32)
+            u64_str(&(*c).bad, code as u64)
+            rt.buf_push(&(*c).bad, 10)
+        }
+        if (*c).rcpt_pos < rt.buf_len(&(*c).rcpts) {
+            send_rcpt(c)
+        } else if (*c).rcpt_ok == 0 {
+            abort_tx(c, ERR_NO_RCPT)
+        } else {
+            cmd(c, "DATA")
+            (*c).state = ST_DATA
+        }
+    } else if st == ST_DATA {
+        if code == 354 {
+            rt.buf_push_bytes(&(*c).out, rt.buf_ptr(&(*c).data), rt.buf_len(&(*c).data))
+            (*c).state = ST_BODY
+        } else {
+            abort_tx(c, ERR_DATA_REJECT)
+        }
+    } else if st == ST_BODY {
+        if code >= 200 && code < 300 {
+            finish_tx(c, 0)
+        } else {
+            finish_tx(c, ERR_DATA_REJECT)
+        }
+    } else if st == ST_RSET {
+        finish_tx(c, (*c).tx_err)
+    } else if st == ST_QUIT {
+        (*c).state = ST_CLOSED
+        (*c).events = (*c).events | EVF_QUIT
+    } else {
+        // an answer nobody asked for
+        fail(c, ERR_PROTO)
+    }
+}
+
+fn digit(ch: u32) -> bool {
+    return ch >= 48 && ch <= 57
+}
+
+// Feeds server octets. false = the session failed (smtp_err says why).
+fn smtp_feed(c: *mut Smtp, p: u64, n: usize) -> bool {
+    if (*c).state == ST_FAILED || (*c).state == ST_CLOSED {
+        return false
+    }
+    rt.buf_push_bytes(&(*c).inb, p, n)
+    while (*c).state != ST_FAILED && (*c).state != ST_CLOSED {
+        let total: usize = rt.buf_len(&(*c).inb)
+        let base: u64 = rt.buf_ptr(&(*c).inb)
+        var e: usize = (*c).inpos
+        while e < total && (rt.ld8(base, e) as u32) != 10 {
+            e += 1
+        }
+        if e >= total {
+            if total - (*c).inpos > MAX_LINE {
+                fail(c, ERR_TOO_LONG)
+            }
+            break
+        }
+        var le: usize = e
+        if le > (*c).inpos && (rt.ld8(base, le - 1) as u32) == 13 {
+            le -= 1
+        }
+        let line: str = str { p: (base + (*c).inpos as u64) as *mut u8, n: le - (*c).inpos }
+        (*c).inpos = e + 1
+        if line.n > MAX_LINE {
+            fail(c, ERR_TOO_LONG)
+            break
+        }
+        if line.n < 3 || !digit(rfc822.at(line, 0)) || !digit(rfc822.at(line, 1)) || !digit(rfc822.at(line, 2)) {
+            fail(c, ERR_PROTO)
+            break
+        }
+        let code: u32 = (rfc822.at(line, 0) - 48) * 100 + (rfc822.at(line, 1) - 48) * 10 + (rfc822.at(line, 2) - 48)
+        var more: bool = false
+        var tstart: usize = 3
+        if line.n > 3 {
+            let sep: u32 = rfc822.at(line, 3)
+            if sep == 45 {
+                more = true
+            } else if sep != 32 {
+                fail(c, ERR_PROTO)
+                break
+            }
+            tstart = 4
+        }
+        if (*c).pend_code != 0 && (*c).pend_code != code {
+            fail(c, ERR_PROTO)
+            break
+        }
+        if (*c).pend_code == 0 {
+            rt.buf_clear(&(*c).text)
+            (*c).pend_lines = 0
+        }
+        (*c).pend_lines += 1
+        if (*c).pend_lines > MAX_LINES {
+            fail(c, ERR_TOO_LONG)
+            break
+        }
+        push(&(*c).text, rfc822.view(line, tstart, line.n))
+        rt.buf_push(&(*c).text, 10)
+        if more {
+            (*c).pend_code = code
+        } else {
+            (*c).pend_code = 0
+            (*c).code = code
+            on_reply(c)
+            if (*c).state == ST_TLS && (*c).inpos < rt.buf_len(&(*c).inb) {
+                // octets behind the go-ahead line were sent in clear text
+                fail(c, ERR_PROTO)
+            }
+        }
+    }
+    // keep memory small: drop what is parsed
+    let rest: usize = rt.buf_len(&(*c).inb) - (*c).inpos
+    if (*c).inpos > 0 {
+        if rest > 0 {
+            rt.mem_copy(rt.buf_ptr(&(*c).inb), rt.buf_ptr(&(*c).inb) + (*c).inpos as u64, rest)
+        }
+        rt.buf_set_len(&(*c).inb, rest)
+        (*c).inpos = 0
+    }
+    return (*c).state != ST_FAILED
+}
+
+// The caller switched the connection to TLS after EVF_TLS: say hello again.
+fn smtp_tls_done(c: *mut Smtp) {
+    if (*c).state != ST_TLS {
+        return
+    }
+    (*c).secure = true
+    send_ehlo(c)
+}
+
+// Ends the session politely (QUIT). Allowed when READY or at the start.
+fn smtp_quit(c: *mut Smtp) {
+    if (*c).state == ST_CLOSED || (*c).state == ST_FAILED || (*c).state == ST_QUIT {
+        return
+    }
+    cmd(c, "QUIT")
+    (*c).state = ST_QUIT
+}
+
+// =============================================================== the glue
+
+const SM_PLAIN: u32 = 0
+const SM_STARTTLS: u32 = 1
+const SM_TLS: u32 = 2
+
+const SME_READY: u32 = 1
+const SME_SENT: u32 = 2
+const SME_CLOSED: u32 = 3
+
+// `size_of` only knows the types of the root file; a generic parameter is
+// substituted first (the same trick as async/stream.fi).
+fn obj_alloc[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+fn obj_free[T](p: u64) {
+    rt.heap_free(p, size_of[T]())
+}
+
+struct Sc {
+    s: *mut stream.Stream,
+    core: Smtp,
+    cb: fn(*mut Sc, u64, u32, i64),
+    ud: u64,
+    mode: u32,
+    store: *mut x509.Store,
+    now: u64,
+    host: rt.Buf,
+    upgrading: bool,
+    busy: u32,
+    closed: bool,
+}
+
+fn sc_core(c: *mut Sc) -> *mut Smtp { return &(*c).core }
+fn sc_err(c: *mut Sc) -> u32 { return (*c).core.err }
+fn sc_code(c: *mut Sc) -> u32 { return (*c).core.code }
+fn sc_text(c: *mut Sc) -> str { return bs(&(*c).core.text) }
+fn sc_rejected(c: *mut Sc) -> str { return bs(&(*c).core.bad) }
+fn sc_accepted(c: *mut Sc) -> u32 { return (*c).core.rcpt_ok }
+fn sc_set_login(c: *mut Sc, user: str, pass: str) { smtp_set_login(&(*c).core, user, pass) }
+fn sc_set_tls_mode(c: *mut Sc, mode: u32) { smtp_set_tls(&(*c).core, mode) }
+fn sc_set_auth_mode(c: *mut Sc, mode: u32) { smtp_set_auth_mode(&(*c).core, mode) }
+fn sc_set_insecure_auth(c: *mut Sc, on: bool) { smtp_set_insecure_auth(&(*c).core, on) }
+fn sc_set_ehlo_name(c: *mut Sc, name: str) -> bool { return smtp_set_ehlo_name(&(*c).core, name) }
+
+// Opens the connection. mode SM_PLAIN (no TLS, unless SM_STARTTLS), SM_STARTTLS
+// (plain, then STARTTLS in place; the policy is `sc_set_tls_mode`, default
+// "use it when offered"; SMTP_REQUIRE makes it mandatory), SM_TLS (TLS from the
+// first octet). `host` is the name the certificate must carry; `store` must
+// outlive the client. Returns 0 when the socket could not be created.
+fn sc_open(l: *mut loop.Loop, addr: u32, port: u16, mode: u32, host: str, store: *mut x509.Store,
+    now: u64, timeout_ms: i64, cb: fn(*mut Sc, u64, u32, i64), ud: u64) -> *mut Sc {
+    let p: u64 = obj_alloc[Sc]()
+    if p == 0 {
+        return 0 as *mut Sc
+    }
+    let c: *mut Sc = p as *mut Sc
+    *c = Sc { s: 0 as *mut stream.Stream, core: smtp_new(), cb: cb, ud: ud, mode: mode, store: store,
+        now: now, host: rt.buf_new(), upgrading: false, busy: 0, closed: false }
+    push(&(*c).host, host)
+    if mode == SM_PLAIN {
+        (*c).core.tls_mode = SMTP_NEVER
+    }
+    var s: *mut stream.Stream = 0 as *mut stream.Stream
+    if mode == SM_TLS {
+        (*c).core.secure = true
+        s = stream.stream_open_tls(l, addr, port, host, store, now, timeout_ms, sc_stream_event, p)
+    } else {
+        s = stream.stream_open(l, addr, port, timeout_ms, sc_stream_event, p)
+    }
+    if s as u64 == 0 {
+        smtp_free(&(*c).core)
+        rt.buf_free(&(*c).host)
+        obj_free[Sc](p)
+        return 0 as *mut Sc
+    }
+    (*c).s = s
+    return c
+}
+
+fn sc_emit(c: *mut Sc, kind: u32, arg: i64) {
+    (*c).busy += 1
+    let f: fn(*mut Sc, u64, u32, i64) = (*c).cb
+    f(c, (*c).ud, kind, arg)
+    (*c).busy -= 1
+}
+
+fn sc_pump(c: *mut Sc) {
+    let n: usize = smtp_out_len(&(*c).core)
+    if n > 0 && !(*c).closed {
+        stream.stream_write((*c).s, smtp_out_ptr(&(*c).core), n)
+        smtp_out_consume(&(*c).core, n)
+    }
+}
+
+fn sc_after_core(c: *mut Sc) {
+    let ev: u32 = smtp_events(&(*c).core)
+    if (ev & EVF_FAILED) != 0 {
+        stream.stream_close((*c).s)
+        return
+    }
+    if (ev & EVF_TLS) != 0 {
+        // the go-ahead came; nothing is queued and nothing unread: switch
+        (*c).upgrading = true
+        let h: str = bs(&(*c).host)
+        if !stream.stream_start_tls((*c).s, h, (*c).store, (*c).now) {
+            (*c).core.err = ERR_TLS_REQUIRED
+            (*c).core.state = ST_FAILED
+            stream.stream_abort((*c).s)
+        }
+        return
+    }
+    sc_pump(c)
+    if (ev & EVF_QUIT) != 0 {
+        stream.stream_close((*c).s)
+        return
+    }
+    if (ev & EVF_SENT) != 0 {
+        var ok: i64 = 0
+        if (*c).core.tx_err == 0 {
+            ok = 1
+        }
+        sc_emit(c, SME_SENT, ok)
+    }
+    if (ev & EVF_READY) != 0 {
+        sc_emit(c, SME_READY, 0)
+    }
+    sc_pump(c)
+}
+
+fn sc_stream_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    let c: *mut Sc = ud as *mut Sc
+    if kind == stream.SE_CONNECTED {
+        if (*c).upgrading {
+            (*c).upgrading = false
+            smtp_tls_done(&(*c).core)
+            sc_pump(c)
+        }
+    } else if kind == stream.SE_DATA {
+        let n: usize = stream.stream_in_len(s)
+        let ok: bool = smtp_feed(&(*c).core, stream.stream_in_ptr(s), n)
+        stream.stream_consume(s, n)
+        if !ok {
+            stream.stream_close(s)
+            return
+        }
+        sc_after_core(c)
+    } else if kind == stream.SE_CLOSED {
+        (*c).closed = true
+        smtp_eof(&(*c).core)
+        sc_emit(c, SME_CLOSED, arg)
+        smtp_free(&(*c).core)
+        rt.buf_free(&(*c).host)
+        obj_free[Sc](ud)
+    }
+}
+
+// Queues one mail (see smtp_set_mail). false = bad address / busy; sc_err tells.
+fn sc_send(c: *mut Sc, from: str, rcpts: str, mp: u64, mn: usize) -> bool {
+    let ok: bool = smtp_set_mail(&(*c).core, from, rcpts, mp, mn)
+    sc_pump(c)
+    return ok
+}
+
+fn sc_quit(c: *mut Sc) {
+    smtp_quit(&(*c).core)
+    sc_pump(c)
+}
+
+fn sc_abort(c: *mut Sc) {
+    stream.stream_abort((*c).s)
+}

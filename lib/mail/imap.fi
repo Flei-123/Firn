@@ -1,0 +1,2446 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mail/imap.fi -- mail.imap: an IMAP4rev1 client (RFC 3501; IDLE 2177,
+// UIDPLUS, SASL-IR 4959, STARTTLS 2595). Two layers in one file:
+//
+//   CORE  `Imap` is sans-I/O: feed it the server's octets, take the octets to
+//         send. It frames responses (lines AND literals {n}), parses them into
+//         a tree of nodes (atoms, quoted strings, literals, NIL, numbers, nested
+//         lists), tracks the state (not authenticated / authenticated /
+//         selected / IDLE / logout) and keeps the results of the running command.
+//   GLUE  `Ic` runs a core on an `async.stream` (TCP, implicit TLS, or STARTTLS
+//         in place, set up for you) and calls back, like mail/smtp.fi.
+//
+//     import async.loop
+//     import mail.imap
+//
+//     fn on_event(c: *mut imap.Ic, ud: u64, kind: u32, arg: i64) {
+//         if kind == imap.IME_READY { imap.ic_login(c, "user", "secret") }       // greeted, TLS done, caps known
+//         else if kind == imap.IME_DONE {                                         // a command finished: arg 0 OK, 1 NO, 2 BAD
+//             let core: *mut imap.Imap = imap.ic_core(c)
+//             if imap.imap_last_kind(core) == imap.CK_LOGIN && arg == 0 { imap.ic_select(c, "INBOX") }
+//             else if imap.imap_last_kind(core) == imap.CK_SELECT && arg == 0 {
+//                 imap.ic_fetch(c, "1:*", "(UID FLAGS ENVELOPE BODYSTRUCTURE)", false)
+//             } else if imap.imap_last_kind(core) == imap.CK_FETCH {
+//                 // imap.imap_fetch_count(core), imap.imap_fetch_item(core, i, "ENVELOPE") -> node, imap.imap_node_text(...)
+//             }
+//         } else if kind == imap.IME_PUSH { /* EXISTS / EXPUNGE / flags while idle */ imap.ic_discard(c) }
+//     }
+//     let c: *mut imap.Ic = imap.ic_open(&l, addr, 143, imap.IM_STARTTLS, "mail.example.org", &store, now, 30000, on_event, 0)
+//
+// THE TREE. Every response of the running command is copied into one buffer
+// and parsed into nodes. A node has a kind (NK_ATOM, NK_QSTR, NK_LIT, NK_NIL,
+// NK_NUM, NK_LIST), `imap_node_text` gives the decoded text (quotes removed,
+// \" and \\ resolved), `imap_node_child` / `imap_node_next` walk lists. The
+// results (FETCH items, LIST entries, SEARCH numbers, STATUS) stay valid until the next
+// command is started or `imap_discard` is called.
+//
+// WHAT IS HERE
+//   commands   CAPABILITY, STARTTLS, LOGIN, AUTHENTICATE PLAIN (with SASL-IR or the continuation),
+//              LIST/LSUB, SELECT/EXAMINE, STATUS, FETCH, SEARCH, STORE, EXPUNGE, UID variants of
+//              FETCH/SEARCH/STORE/EXPUNGE, COPY, NOOP, CLOSE, IDLE/DONE, LOGOUT, `imap_raw`
+//   responses  OK/NO/BAD/BYE/PREAUTH with [codes], CAPABILITY, LIST/LSUB, SEARCH, STATUS, FLAGS,
+//              EXISTS/RECENT/EXPUNGE/FETCH, ENVELOPE, BODYSTRUCTURE (flattened parts + paths),
+//              BODY[section]<partial> values
+//   names      modified UTF-7 for mailbox names (`imap_utf7_encode` / `imap_utf7_decode`)
+//
+// HONEST
+//   I1  One command at a time (no pipelining). IDLE allows only DONE.
+//   I2  Arguments you give as text (mailbox names, search criteria, fetch items) must not contain
+//       CR, LF, NUL or end in "}" -- that would be a literal / a second command (ERR_BAD_ARG).
+//       Mailbox names are quoted for you; give them in modified UTF-7 (`imap_utf7_encode`).
+//   I3  LOGIN with a password that has CR, LF, NUL or bytes >= 128 is refused: use AUTHENTICATE PLAIN.
+//   I4  Plain-text LOGIN is not sent over a plain connection unless `imap_set_insecure_auth(true)`.
+//   I5  STARTTLS: bytes behind the tagged OK are an error (ERR_PROTO); after the switch the
+//       capabilities are read again.
+//   I6  Limits (broken or hostile servers): a line without literal 64 KiB, a literal 256 MiB,
+//       list depth 48, 1.5 M nodes per command: ERR_TOO_LONG / ERR_PROTO, no crash.
+//   I7  Unsolicited FETCH/EXPUNGE are kept with the results until `imap_discard`; a program that never
+//       discards while idling grows its buffer.
+//   I8  Not covered: ESEARCH, CONDSTORE/QRESYNC, NAMESPACE parsing, APPEND, literals sent by the client
+//       (use `imap_raw` for LITERAL+ by hand), UTF8=ACCEPT.
+//   I9  Do not free the client inside its own callback.
+import std.rt
+import std.str
+import std.vec
+import std.base64
+import mail.rfc822
+import async.loop
+import async.stream
+import tls.x509
+
+export {
+    Imap, Ic, Node, FetchRec, ListRec, BsPart,
+    NONE, NK_ATOM, NK_QSTR, NK_LIT, NK_NIL, NK_NUM, NK_LIST,
+    IS_NOAUTH, IS_AUTH, IS_SELECTED, IS_IDLE, IS_TLS, IS_LOGOUT, IS_CLOSED, IS_FAILED, IS_GREET,
+    CK_NONE, CK_GREET, CK_CAPABILITY, CK_STARTTLS, CK_LOGIN, CK_AUTH, CK_LIST, CK_SELECT, CK_STATUS, CK_FETCH,
+    CK_SEARCH, CK_STORE, CK_EXPUNGE, CK_COPY, CK_NOOP, CK_CLOSE, CK_IDLE, CK_LOGOUT, CK_RAW,
+    IERR_NONE, IERR_PROTO, IERR_TOO_LONG, IERR_CLOSED, IERR_BAD_ARG, IERR_STATE, IERR_TLS_REQUIRED,
+    IERR_AUTH_INSECURE, IERR_BYE, IERR_BUSY,
+    ICAP_STARTTLS, ICAP_LOGINDISABLED, ICAP_PLAIN, ICAP_IDLE, ICAP_UIDPLUS, ICAP_SASL_IR, ICAP_LITERAL_PLUS,
+    ICAP_MOVE, ICAP_IMAP4REV1, ICAP_ENABLE, ICAP_UTF8,
+    IEV_DONE, IEV_PUSH, IEV_TLS, IEV_FAILED, IEV_GREETING, IEV_IDLE, IEV_BYE, IEV_QUIT,
+    FL_SEEN, FL_ANSWERED, FL_FLAGGED, FL_DELETED, FL_DRAFT, FL_RECENT,
+    IM_PLAIN, IM_STARTTLS, IM_TLS, IME_READY, IME_DONE, IME_PUSH, IME_IDLE, IME_BYE, IME_CLOSED,
+    imap_new, imap_free, imap_feed, imap_eof, imap_out_ptr, imap_out_len, imap_out_consume, imap_events,
+    imap_state, imap_err, imap_caps, imap_last_kind, imap_last_result, imap_last_text, imap_last_code,
+    imap_exists, imap_recent, imap_uidvalidity, imap_uidnext, imap_unseen, imap_read_only, imap_busy,
+    imap_set_insecure_auth, imap_set_secure, imap_discard, imap_tls_done, imap_caps_text,
+    imap_capability, imap_starttls, imap_login, imap_authenticate_plain, imap_list, imap_select, imap_status,
+    imap_fetch, imap_search, imap_store, imap_expunge, imap_copy, imap_noop, imap_close, imap_idle,
+    imap_idle_done, imap_logout, imap_raw,
+    imap_node_kind, imap_node_child, imap_node_next, imap_node_text, imap_node_view, imap_node_num,
+    imap_node_count, imap_node_is,
+    imap_fetch_count, imap_fetch_seq, imap_fetch_item, imap_fetch_uid, imap_fetch_flags, imap_fetch_size,
+    imap_fetch_flags_node, imap_fetch_body,
+    imap_env_field, imap_addr_count, imap_addr_part, imap_addr_format,
+    imap_bs_build, imap_bs_count, imap_bs_multi, imap_bs_type, imap_bs_subtype, imap_bs_param, imap_bs_encoding,
+    imap_bs_size, imap_bs_path, imap_bs_disposition, imap_bs_filename, imap_bs_parent, imap_bs_id,
+    imap_list_count, imap_list_attrs, imap_list_delim, imap_list_name,
+    imap_search_count, imap_search_at, imap_status_get, imap_utf7_encode, imap_utf7_decode,
+    ic_open, ic_core, ic_login, ic_login_plain, ic_list, ic_select, ic_status, ic_fetch, ic_search, ic_store,
+    ic_expunge, ic_noop, ic_close, ic_idle, ic_idle_done, ic_logout, ic_abort, ic_discard, ic_set_tls_mode,
+    ic_set_insecure_auth, ic_err, ic_raw,
+}
+
+const NONE: usize = 18446744073709551615
+
+const NK_ATOM: u32 = 1
+const NK_QSTR: u32 = 2
+const NK_LIT: u32 = 3
+const NK_NIL: u32 = 4
+const NK_NUM: u32 = 5
+const NK_LIST: u32 = 6
+
+const IS_GREET: u32 = 1
+const IS_NOAUTH: u32 = 2
+const IS_AUTH: u32 = 3
+const IS_SELECTED: u32 = 4
+const IS_IDLE: u32 = 5
+const IS_TLS: u32 = 6 // the STARTTLS OK came: the caller switches the stream
+const IS_LOGOUT: u32 = 7
+const IS_CLOSED: u32 = 8
+const IS_FAILED: u32 = 9
+
+const CK_NONE: u32 = 0
+const CK_GREET: u32 = 1
+const CK_CAPABILITY: u32 = 2
+const CK_STARTTLS: u32 = 3
+const CK_LOGIN: u32 = 4
+const CK_AUTH: u32 = 5
+const CK_LIST: u32 = 6
+const CK_SELECT: u32 = 7
+const CK_STATUS: u32 = 8
+const CK_FETCH: u32 = 9
+const CK_SEARCH: u32 = 10
+const CK_STORE: u32 = 11
+const CK_EXPUNGE: u32 = 12
+const CK_COPY: u32 = 13
+const CK_NOOP: u32 = 14
+const CK_CLOSE: u32 = 15
+const CK_IDLE: u32 = 16
+const CK_LOGOUT: u32 = 17
+const CK_RAW: u32 = 18
+
+const IERR_NONE: u32 = 0
+const IERR_PROTO: u32 = 1
+const IERR_TOO_LONG: u32 = 2
+const IERR_CLOSED: u32 = 3
+const IERR_BAD_ARG: u32 = 4
+const IERR_STATE: u32 = 5
+const IERR_TLS_REQUIRED: u32 = 6
+const IERR_AUTH_INSECURE: u32 = 7
+const IERR_BYE: u32 = 8
+const IERR_BUSY: u32 = 9
+
+const ICAP_STARTTLS: u32 = 1
+const ICAP_LOGINDISABLED: u32 = 2
+const ICAP_PLAIN: u32 = 4
+const ICAP_IDLE: u32 = 8
+const ICAP_UIDPLUS: u32 = 16
+const ICAP_SASL_IR: u32 = 32
+const ICAP_LITERAL_PLUS: u32 = 64
+const ICAP_MOVE: u32 = 128
+const ICAP_IMAP4REV1: u32 = 256
+const ICAP_ENABLE: u32 = 512
+const ICAP_UTF8: u32 = 1024
+
+const IEV_DONE: u32 = 1
+const IEV_PUSH: u32 = 2
+const IEV_TLS: u32 = 4
+const IEV_FAILED: u32 = 8
+const IEV_GREETING: u32 = 16
+const IEV_IDLE: u32 = 32
+const IEV_BYE: u32 = 64
+const IEV_QUIT: u32 = 128
+
+const FL_SEEN: u32 = 1
+const FL_ANSWERED: u32 = 2
+const FL_FLAGGED: u32 = 4
+const FL_DELETED: u32 = 8
+const FL_DRAFT: u32 = 16
+const FL_RECENT: u32 = 32
+
+const MAX_LINE: usize = 65536
+const MAX_LIT: usize = 268435456
+const MAX_DEPTH: u32 = 48
+const MAX_NODES: usize = 1500000
+
+struct Node {
+    kind: u32,
+    a: usize, // offset in `res`
+    b: usize, // length
+    first: usize,
+    next: usize,
+    last: usize,
+    num: u64,
+}
+
+struct FetchRec {
+    seq: u64,
+    root: usize, // the list node "(UID 5 FLAGS (...) ...)"
+}
+
+struct ListRec {
+    attrs: usize,
+    delim: usize,
+    name: usize,
+    lsub: bool,
+}
+
+struct BsPart {
+    node: usize, // the list node of this part
+    parent: usize, // index in the part list, NONE for the top
+    first_child: usize,
+    next: usize,
+    index: u32, // 1-based among its siblings
+    multi: bool,
+    depth: u32,
+}
+
+struct Imap {
+    state: u32,
+    inb: rt.Buf,
+    rs: usize, // start of the response being framed
+    sp: usize, // scan position
+    need: usize, // do not look before this many octets are there
+    out: rt.Buf,
+    outpos: usize,
+    res: rt.Buf,
+    nodes: Vec[Node],
+    fetches: Vec[FetchRec],
+    lists: Vec[ListRec],
+    found: Vec[u64], // SEARCH numbers
+    status_name: usize,
+    status_list: usize,
+    bs: Vec[BsPart],
+    tag_no: u64,
+    tag: rt.Buf,
+    kind: u32, // the running command, CK_NONE = none
+    last_kind: u32,
+    last_result: u32, // 0 OK, 1 NO, 2 BAD
+    last_text: rt.Buf,
+    last_code: rt.Buf, // the [CODE] word of the tagged answer
+    caps: u32,
+    caps_raw: rt.Buf,
+    secure: bool,
+    insecure_auth: bool,
+    sasl_wait: bool, // AUTHENTICATE sent without initial response
+    cred: rt.Buf, // "\0user\0pass" for AUTHENTICATE PLAIN until used
+    exists: u64,
+    recent: u64,
+    uidvalidity: u64,
+    uidnext: u64,
+    unseen: u64,
+    read_only: bool,
+    err: u32,
+    events: u32,
+    bye: bool,
+    preauth: bool,
+    post_tls: bool,
+    scratch: rt.Buf,
+}
+
+fn bs(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn push(b: *mut rt.Buf, s: str) {
+    if s.n > 0 {
+        rt.buf_push_bytes(b, s.p as u64, s.n)
+    }
+}
+
+fn wipe(b: *mut rt.Buf) {
+    let p: *mut u8 = rt.buf_data(b)
+    var i: usize = 0
+    let n: usize = rt.buf_len(b)
+    while i < n {
+        *(p + i) = 0
+        i += 1
+    }
+    rt.buf_clear(b)
+}
+
+fn imap_new() -> Imap {
+    return Imap {
+        state: IS_GREET, inb: rt.buf_new(), rs: 0, sp: 0, need: 0, out: rt.buf_new(), outpos: 0,
+        res: rt.buf_new(), nodes: vec_new[Node](), fetches: vec_new[FetchRec](), lists: vec_new[ListRec](),
+        found: vec_new[u64](), status_name: NONE, status_list: NONE, bs: vec_new[BsPart](), tag_no: 0,
+        tag: rt.buf_new(), kind: CK_GREET, last_kind: CK_NONE, last_result: 0, last_text: rt.buf_new(),
+        last_code: rt.buf_new(), caps: 0, caps_raw: rt.buf_new(), secure: false, insecure_auth: false,
+        sasl_wait: false, cred: rt.buf_new(), exists: 0, recent: 0, uidvalidity: 0, uidnext: 0, unseen: 0,
+        read_only: false, err: 0, events: 0, bye: false, preauth: false, post_tls: false, scratch: rt.buf_new(),
+    }
+}
+
+fn imap_free(c: *mut Imap) {
+    wipe(&(*c).cred)
+    rt.buf_free(&(*c).inb)
+    rt.buf_free(&(*c).out)
+    rt.buf_free(&(*c).res)
+    vec_free[Node](&(*c).nodes)
+    vec_free[FetchRec](&(*c).fetches)
+    vec_free[ListRec](&(*c).lists)
+    vec_free[u64](&(*c).found)
+    vec_free[BsPart](&(*c).bs)
+    rt.buf_free(&(*c).tag)
+    rt.buf_free(&(*c).last_text)
+    rt.buf_free(&(*c).last_code)
+    rt.buf_free(&(*c).caps_raw)
+    rt.buf_free(&(*c).cred)
+    rt.buf_free(&(*c).scratch)
+}
+
+fn imap_state(c: *mut Imap) -> u32 { return (*c).state }
+fn imap_err(c: *mut Imap) -> u32 { return (*c).err }
+fn imap_caps(c: *mut Imap) -> u32 { return (*c).caps }
+fn imap_caps_text(c: *mut Imap) -> str { return bs(&(*c).caps_raw) }
+fn imap_last_kind(c: *mut Imap) -> u32 { return (*c).last_kind }
+// 0 = OK, 1 = NO, 2 = BAD
+fn imap_last_result(c: *mut Imap) -> u32 { return (*c).last_result }
+fn imap_last_text(c: *mut Imap) -> str { return bs(&(*c).last_text) }
+// The first word of the "[CODE ...]" of the last tagged answer ("" = none), e.g. "TRYCREATE".
+fn imap_last_code(c: *mut Imap) -> str { return bs(&(*c).last_code) }
+fn imap_exists(c: *mut Imap) -> u64 { return (*c).exists }
+fn imap_recent(c: *mut Imap) -> u64 { return (*c).recent }
+fn imap_uidvalidity(c: *mut Imap) -> u64 { return (*c).uidvalidity }
+fn imap_uidnext(c: *mut Imap) -> u64 { return (*c).uidnext }
+fn imap_unseen(c: *mut Imap) -> u64 { return (*c).unseen }
+fn imap_read_only(c: *mut Imap) -> bool { return (*c).read_only }
+fn imap_busy(c: *mut Imap) -> bool { return (*c).kind != CK_NONE }
+fn imap_set_insecure_auth(c: *mut Imap, on: bool) { (*c).insecure_auth = on }
+fn imap_set_secure(c: *mut Imap, on: bool) { (*c).secure = on }
+
+fn imap_events(c: *mut Imap) -> u32 {
+    let e: u32 = (*c).events
+    (*c).events = 0
+    return e
+}
+
+fn imap_out_ptr(c: *mut Imap) -> u64 { return rt.buf_ptr(&(*c).out) + (*c).outpos as u64 }
+fn imap_out_len(c: *mut Imap) -> usize { return rt.buf_len(&(*c).out) - (*c).outpos }
+fn imap_out_consume(c: *mut Imap, n: usize) {
+    (*c).outpos += n
+    if (*c).outpos >= rt.buf_len(&(*c).out) {
+        rt.buf_clear(&(*c).out)
+        (*c).outpos = 0
+    }
+}
+
+// Forgets the results of the last command (FETCH items, LIST entries, ...).
+fn imap_discard(c: *mut Imap) {
+    rt.buf_clear(&(*c).res)
+    vec_clear[Node](&(*c).nodes)
+    vec_clear[FetchRec](&(*c).fetches)
+    vec_clear[ListRec](&(*c).lists)
+    vec_clear[u64](&(*c).found)
+    vec_clear[BsPart](&(*c).bs)
+    (*c).status_name = NONE
+    (*c).status_list = NONE
+}
+
+fn fail(c: *mut Imap, err: u32) {
+    if (*c).state == IS_FAILED || (*c).state == IS_CLOSED {
+        return
+    }
+    if (*c).err == 0 {
+        (*c).err = err
+    }
+    (*c).state = IS_FAILED
+    (*c).events = (*c).events | IEV_FAILED
+    rt.buf_clear(&(*c).out)
+    (*c).outpos = 0
+    wipe(&(*c).cred)
+}
+
+// The connection ended.
+fn imap_eof(c: *mut Imap) {
+    if (*c).state == IS_CLOSED || (*c).state == IS_FAILED {
+        return
+    }
+    if (*c).state == IS_LOGOUT || (*c).bye {
+        (*c).state = IS_CLOSED
+        return
+    }
+    fail(c, IERR_CLOSED)
+}
+
+// ----------------------------------------------------------------- the tree
+
+fn byte_at(base: u64, i: usize) -> u32 {
+    return rt.ld8(base, i) as u32
+}
+
+fn new_node(c: *mut Imap, kind: u32, a: usize, b: usize) -> usize {
+    let idx: usize = vec_len[Node](&(*c).nodes)
+    if idx >= MAX_NODES {
+        return NONE
+    }
+    if !vec_push[Node](&(*c).nodes, Node { kind: kind, a: a, b: b, first: NONE, next: NONE, last: NONE, num: 0 }) {
+        return NONE
+    }
+    return idx
+}
+
+fn node_ptr(c: *mut Imap, i: usize) -> *mut Node {
+    return vec_elem_ptr[Node](&(*c).nodes, i)
+}
+
+fn add_child(c: *mut Imap, parent: usize, child: usize) {
+    let pp: *mut Node = node_ptr(c, parent)
+    if (*pp).first == NONE {
+        (*pp).first = child
+    } else {
+        let lp: *mut Node = node_ptr(c, (*pp).last)
+        (*lp).next = child
+    }
+    (*pp).last = child
+}
+
+fn is_digit(ch: u32) -> bool {
+    return ch >= 48 && ch <= 57
+}
+
+fn atom_stop(ch: u32) -> bool {
+    return ch <= 32 || ch == 40 || ch == 41 || ch == 123 || ch == 34
+}
+
+fn skip_sp(base: u64, pos: usize, end: usize) -> usize {
+    var p: usize = pos
+    while p < end && byte_at(base, p) == 32 {
+        p += 1
+    }
+    return p
+}
+
+// Parses ONE value at `pos0` (blanks skipped). Returns its node, `*np` = the
+// position after it; NONE = malformed (limits, unclosed, bad literal).
+fn pz_value(c: *mut Imap, pos0: usize, end: usize, depth: u32, np: *mut usize) -> usize {
+    let base: u64 = rt.buf_ptr(&(*c).res)
+    var pos: usize = skip_sp(base, pos0, end)
+    if pos >= end {
+        return NONE
+    }
+    let ch: u32 = byte_at(base, pos)
+    if ch == 40 {
+        if depth >= MAX_DEPTH {
+            return NONE
+        }
+        let start: usize = pos
+        let ln: usize = new_node(c, NK_LIST, pos, 0)
+        if ln == NONE {
+            return NONE
+        }
+        pos += 1
+        var done: bool = false
+        while !done {
+            pos = skip_sp(base, pos, end)
+            if pos >= end {
+                return NONE
+            }
+            if byte_at(base, pos) == 41 {
+                pos += 1
+                done = true
+            } else {
+                var after: usize = 0
+                let sub: usize = pz_value(c, pos, end, depth + 1, &after)
+                if sub == NONE {
+                    return NONE
+                }
+                add_child(c, ln, sub)
+                pos = after
+            }
+        }
+        let lp: *mut Node = node_ptr(c, ln)
+        (*lp).b = pos - start
+        *np = pos
+        return ln
+    }
+    if ch == 34 {
+        var i: usize = pos + 1
+        var closed: bool = false
+        while i < end && !closed {
+            let d: u32 = byte_at(base, i)
+            if d == 92 {
+                i += 2
+            } else if d == 34 {
+                closed = true
+            } else if d == 13 || d == 10 {
+                return NONE
+            } else {
+                i += 1
+            }
+        }
+        if !closed {
+            return NONE
+        }
+        let qn: usize = new_node(c, NK_QSTR, pos + 1, i - pos - 1)
+        *np = i + 1
+        return qn
+    }
+    if ch == 123 {
+        var i2: usize = pos + 1
+        var n: usize = 0
+        var digits: usize = 0
+        while i2 < end && is_digit(byte_at(base, i2)) && digits < 10 {
+            n = n * 10 + (byte_at(base, i2) - 48) as usize
+            i2 += 1
+            digits += 1
+        }
+        if digits == 0 {
+            return NONE
+        }
+        if i2 < end && byte_at(base, i2) == 43 {
+            i2 += 1
+        }
+        if i2 >= end || byte_at(base, i2) != 125 {
+            return NONE
+        }
+        i2 += 1
+        if i2 < end && byte_at(base, i2) == 13 {
+            i2 += 1
+        }
+        if i2 >= end || byte_at(base, i2) != 10 {
+            return NONE
+        }
+        i2 += 1
+        if n > end - i2 {
+            return NONE
+        }
+        let lit: usize = new_node(c, NK_LIT, i2, n)
+        *np = i2 + n
+        return lit
+    }
+    // atom / number / NIL; a "[...]" section inside the atom may hold blanks
+    var j: usize = pos
+    while j < end && !atom_stop(byte_at(base, j)) {
+        if byte_at(base, j) == 91 {
+            j += 1
+            while j < end && byte_at(base, j) != 93 && byte_at(base, j) != 13 && byte_at(base, j) != 10 {
+                j += 1
+            }
+            if j >= end || byte_at(base, j) != 93 {
+                return NONE
+            }
+        }
+        j += 1
+    }
+    if j == pos {
+        return NONE
+    }
+    let len: usize = j - pos
+    var kind: u32 = NK_ATOM
+    var num: u64 = 0
+    if len == 3 && rfc822.eq_nocase(str { p: (base + pos as u64) as *mut u8, n: 3 }, "NIL") {
+        kind = NK_NIL
+    } else if len <= 19 {
+        var all: bool = true
+        var k: usize = 0
+        while k < len {
+            let dd: u32 = byte_at(base, pos + k)
+            if !is_digit(dd) {
+                all = false
+                break
+            }
+            num = num * 10 + (dd - 48) as u64
+            k += 1
+        }
+        if all {
+            kind = NK_NUM
+        }
+    }
+    let an: usize = new_node(c, kind, pos, len)
+    if an == NONE {
+        return NONE
+    }
+    let ap: *mut Node = node_ptr(c, an)
+    (*ap).num = num
+    *np = j
+    return an
+}
+
+// ---------------------------------------------------------------- node access
+
+fn imap_node_kind(c: *mut Imap, n: usize) -> u32 {
+    if n == NONE {
+        return NK_NIL
+    }
+    return (*node_ptr(c, n)).kind
+}
+
+fn imap_node_child(c: *mut Imap, n: usize) -> usize {
+    if n == NONE {
+        return NONE
+    }
+    return (*node_ptr(c, n)).first
+}
+
+fn imap_node_next(c: *mut Imap, n: usize) -> usize {
+    if n == NONE {
+        return NONE
+    }
+    return (*node_ptr(c, n)).next
+}
+
+fn imap_node_count(c: *mut Imap, n: usize) -> usize {
+    var k: usize = 0
+    var x: usize = imap_node_child(c, n)
+    while x != NONE {
+        k += 1
+        x = imap_node_next(c, x)
+    }
+    return k
+}
+
+fn imap_node_num(c: *mut Imap, n: usize) -> u64 {
+    if n == NONE {
+        return 0
+    }
+    return (*node_ptr(c, n)).num
+}
+
+// The raw octets of an atom / quoted string (escapes NOT resolved) / literal.
+fn imap_node_view(c: *mut Imap, n: usize) -> str {
+    if n == NONE {
+        return str { p: rt.buf_data(&(*c).res), n: 0 }
+    }
+    let np: *mut Node = node_ptr(c, n)
+    if (*np).kind == NK_NIL || (*np).kind == NK_LIST {
+        return str { p: rt.buf_data(&(*c).res), n: 0 }
+    }
+    return str { p: (rt.buf_ptr(&(*c).res) + (*np).a as u64) as *mut u8, n: (*np).b }
+}
+
+// The text of a node appended to `out`: quoted strings are unescaped, NIL and
+// lists give nothing. Returns false for NIL / NONE / a list.
+fn imap_node_text(c: *mut Imap, n: usize, out: *mut rt.Buf) -> bool {
+    if n == NONE {
+        return false
+    }
+    let k: u32 = (*node_ptr(c, n)).kind
+    if k == NK_NIL || k == NK_LIST {
+        return false
+    }
+    let v: str = imap_node_view(c, n)
+    if k != NK_QSTR {
+        push(out, v)
+        return true
+    }
+    var i: usize = 0
+    while i < v.n {
+        let ch: u32 = rfc822.at(v, i)
+        if ch == 92 && i + 1 < v.n {
+            i += 1
+        }
+        rt.buf_push(out, rfc822.at(v, i) as u8)
+        i += 1
+    }
+    return true
+}
+
+// Does node `n` hold exactly `want` (case-insensitive, escapes resolved)?
+fn imap_node_is(c: *mut Imap, n: usize, want: str) -> bool {
+    if n == NONE {
+        return false
+    }
+    rt.buf_clear(&(*c).scratch)
+    if !imap_node_text(c, n, &(*c).scratch) {
+        return false
+    }
+    return rfc822.eq_nocase(bs(&(*c).scratch), want)
+}
+
+// ----------------------------------------------------------------- the output
+
+fn out_str(c: *mut Imap, s: str) {
+    push(&(*c).out, s)
+}
+
+// ----------------------------------------------------------- response handling
+
+fn word_end(base: u64, pos: usize, end: usize) -> usize {
+    var p: usize = pos
+    while p < end && byte_at(base, p) != 32 && byte_at(base, p) != 13 && byte_at(base, p) != 10 {
+        p += 1
+    }
+    return p
+}
+
+fn view_of(base: u64, a: usize, b: usize) -> str {
+    return str { p: (base + a as u64) as *mut u8, n: b - a }
+}
+
+fn parse_u64(s: str) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < s.n && i < 19 && is_digit(rfc822.at(s, i)) {
+        v = v * 10 + (rfc822.at(s, i) - 48) as u64
+        i += 1
+    }
+    return v
+}
+
+fn caps_from_text(c: *mut Imap, t: str) {
+    rt.buf_clear(&(*c).caps_raw)
+    push(&(*c).caps_raw, t)
+    var caps: u32 = 0
+    var pos: usize = 0
+    while pos < t.n {
+        var e: usize = pos
+        while e < t.n && rfc822.at(t, e) != 32 {
+            e += 1
+        }
+        let w: str = rfc822.view(t, pos, e)
+        if rfc822.eq_nocase(w, "STARTTLS") {
+            caps = caps | ICAP_STARTTLS
+        } else if rfc822.eq_nocase(w, "LOGINDISABLED") {
+            caps = caps | ICAP_LOGINDISABLED
+        } else if rfc822.eq_nocase(w, "AUTH=PLAIN") {
+            caps = caps | ICAP_PLAIN
+        } else if rfc822.eq_nocase(w, "IDLE") {
+            caps = caps | ICAP_IDLE
+        } else if rfc822.eq_nocase(w, "UIDPLUS") {
+            caps = caps | ICAP_UIDPLUS
+        } else if rfc822.eq_nocase(w, "SASL-IR") {
+            caps = caps | ICAP_SASL_IR
+        } else if rfc822.eq_nocase(w, "LITERAL+") {
+            caps = caps | ICAP_LITERAL_PLUS
+        } else if rfc822.eq_nocase(w, "MOVE") {
+            caps = caps | ICAP_MOVE
+        } else if rfc822.eq_nocase(w, "IMAP4rev1") {
+            caps = caps | ICAP_IMAP4REV1
+        } else if rfc822.eq_nocase(w, "ENABLE") {
+            caps = caps | ICAP_ENABLE
+        } else if rfc822.eq_nocase(w, "UTF8=ACCEPT") {
+            caps = caps | ICAP_UTF8
+        }
+        pos = e + 1
+    }
+    (*c).caps = caps
+}
+
+// "[CODE args] text" at `pos`: acts on the codes we know, returns the position
+// of the text and writes the code word into `code_out` (may be null-ish: always given).
+fn resp_code(c: *mut Imap, pos: usize, end: usize, code_out: *mut rt.Buf) -> usize {
+    let base: u64 = rt.buf_ptr(&(*c).res)
+    var p: usize = skip_sp(base, pos, end)
+    if p >= end || byte_at(base, p) != 91 {
+        return p
+    }
+    var close: usize = p + 1
+    while close < end && byte_at(base, close) != 93 && byte_at(base, close) != 13 && byte_at(base, close) != 10 {
+        close += 1
+    }
+    if close >= end || byte_at(base, close) != 93 {
+        return p
+    }
+    let inner: str = view_of(base, p + 1, close)
+    var w: usize = 0
+    while w < inner.n && rfc822.at(inner, w) != 32 {
+        w += 1
+    }
+    let code: str = rfc822.view(inner, 0, w)
+    let args: str = rfc822.view(inner, if_lt(w + 1, inner.n), inner.n)
+    push(code_out, code)
+    if rfc822.eq_nocase(code, "CAPABILITY") {
+        caps_from_text(c, args)
+    } else if rfc822.eq_nocase(code, "UIDVALIDITY") {
+        (*c).uidvalidity = parse_u64(args)
+    } else if rfc822.eq_nocase(code, "UIDNEXT") {
+        (*c).uidnext = parse_u64(args)
+    } else if rfc822.eq_nocase(code, "UNSEEN") {
+        (*c).unseen = parse_u64(args)
+    } else if rfc822.eq_nocase(code, "READ-ONLY") {
+        (*c).read_only = true
+    } else if rfc822.eq_nocase(code, "READ-WRITE") {
+        (*c).read_only = false
+    }
+    return skip_sp(base, close + 1, end)
+}
+
+fn if_lt(a: usize, n: usize) -> usize {
+    if a < n {
+        return a
+    }
+    return n
+}
+
+fn trim_end(base: u64, a: usize, e: usize) -> usize {
+    var x: usize = e
+    while x > a && (byte_at(base, x - 1) == 13 || byte_at(base, x - 1) == 10) {
+        x -= 1
+    }
+    return x
+}
+
+fn handle_untagged(c: *mut Imap, q0: usize, q1: usize) {
+    let base: u64 = rt.buf_ptr(&(*c).res)
+    let end: usize = trim_end(base, q0, q1)
+    var pos: usize = skip_sp(base, q0 + 1, end)
+    let w1e: usize = word_end(base, pos, end)
+    let w1: str = view_of(base, pos, w1e)
+    if w1.n == 0 {
+        fail(c, IERR_PROTO)
+        return
+    }
+    if is_digit(rfc822.at(w1, 0)) {
+        let num: u64 = parse_u64(w1)
+        let p2: usize = skip_sp(base, w1e, end)
+        let w2e: usize = word_end(base, p2, end)
+        let w2: str = view_of(base, p2, w2e)
+        if rfc822.eq_nocase(w2, "EXISTS") {
+            (*c).exists = num
+            (*c).events = (*c).events | IEV_PUSH
+        } else if rfc822.eq_nocase(w2, "RECENT") {
+            (*c).recent = num
+            (*c).events = (*c).events | IEV_PUSH
+        } else if rfc822.eq_nocase(w2, "EXPUNGE") {
+            if (*c).exists > 0 {
+                (*c).exists -= 1
+            }
+            (*c).events = (*c).events | IEV_PUSH
+        } else if rfc822.eq_nocase(w2, "FETCH") {
+            var after: usize = 0
+            let root: usize = pz_value(c, w2e, end, 0, &after)
+            if root == NONE || imap_node_kind(c, root) != NK_LIST {
+                fail(c, IERR_PROTO)
+                return
+            }
+            vec_push[FetchRec](&(*c).fetches, FetchRec { seq: num, root: root })
+            (*c).events = (*c).events | IEV_PUSH
+        }
+        return
+    }
+    let after1: usize = skip_sp(base, w1e, end)
+    if rfc822.eq_nocase(w1, "OK") || rfc822.eq_nocase(w1, "NO") || rfc822.eq_nocase(w1, "BAD") || rfc822.eq_nocase(w1, "PREAUTH") || rfc822.eq_nocase(w1, "BYE") {
+        rt.buf_clear(&(*c).scratch)
+        let tp: usize = resp_code(c, after1, end, &(*c).scratch)
+        if rfc822.eq_nocase(w1, "BYE") {
+            (*c).bye = true
+            (*c).events = (*c).events | IEV_BYE
+        } else if (*c).state == IS_GREET && (*c).kind == CK_GREET {
+            if rfc822.eq_nocase(w1, "PREAUTH") {
+                (*c).preauth = true
+                (*c).state = IS_AUTH
+            } else if rfc822.eq_nocase(w1, "OK") {
+                (*c).state = IS_NOAUTH
+            } else {
+                fail(c, IERR_PROTO)
+                return
+            }
+            (*c).kind = CK_NONE
+            (*c).last_kind = CK_GREET
+            (*c).events = (*c).events | IEV_GREETING
+            rt.buf_clear(&(*c).last_text)
+            push(&(*c).last_text, view_of(base, tp, end))
+        }
+        return
+    }
+    if (*c).state == IS_GREET {
+        fail(c, IERR_PROTO)
+        return
+    }
+    if rfc822.eq_nocase(w1, "CAPABILITY") {
+        caps_from_text(c, view_of(base, after1, end))
+    } else if rfc822.eq_nocase(w1, "LIST") || rfc822.eq_nocase(w1, "LSUB") {
+        var p1: usize = 0
+        let attrs: usize = pz_value(c, after1, end, 0, &p1)
+        if attrs == NONE || imap_node_kind(c, attrs) != NK_LIST {
+            fail(c, IERR_PROTO)
+            return
+        }
+        var p3: usize = 0
+        let delim: usize = pz_value(c, p1, end, 0, &p3)
+        if delim == NONE {
+            fail(c, IERR_PROTO)
+            return
+        }
+        var p4: usize = 0
+        let name: usize = pz_value(c, p3, end, 0, &p4)
+        if name == NONE {
+            fail(c, IERR_PROTO)
+            return
+        }
+        vec_push[ListRec](&(*c).lists, ListRec { attrs: attrs, delim: delim, name: name, lsub: rfc822.eq_nocase(w1, "LSUB") })
+    } else if rfc822.eq_nocase(w1, "SEARCH") {
+        var p5: usize = after1
+        var go: bool = true
+        while go {
+            p5 = skip_sp(base, p5, end)
+            if p5 >= end {
+                go = false
+            } else {
+                var nx: usize = 0
+                let nn: usize = pz_value(c, p5, end, 0, &nx)
+                if nn == NONE || imap_node_kind(c, nn) != NK_NUM {
+                    fail(c, IERR_PROTO)
+                    return
+                }
+                vec_push[u64](&(*c).found, imap_node_num(c, nn))
+                p5 = nx
+            }
+        }
+    } else if rfc822.eq_nocase(w1, "STATUS") {
+        var p6: usize = 0
+        let nm: usize = pz_value(c, after1, end, 0, &p6)
+        if nm == NONE {
+            fail(c, IERR_PROTO)
+            return
+        }
+        var p7: usize = 0
+        let lst: usize = pz_value(c, p6, end, 0, &p7)
+        if lst == NONE || imap_node_kind(c, lst) != NK_LIST {
+            fail(c, IERR_PROTO)
+            return
+        }
+        (*c).status_name = nm
+        (*c).status_list = lst
+    }
+    // FLAGS, ENABLED, ID, NAMESPACE, ESEARCH, ...: nothing to keep
+}
+
+fn kind_name_ok(c: *mut Imap, result: u32) {
+    // state changes at the end of a tagged command
+    let k: u32 = (*c).kind
+    if k == CK_LOGIN || k == CK_AUTH {
+        if result == 0 {
+            (*c).state = IS_AUTH
+            wipe(&(*c).cred)
+        }
+    } else if k == CK_SELECT {
+        if result == 0 {
+            (*c).state = IS_SELECTED
+        } else {
+            (*c).state = IS_AUTH
+        }
+    } else if k == CK_CLOSE {
+        if result == 0 {
+            (*c).state = IS_AUTH
+        }
+    } else if k == CK_IDLE {
+        if (*c).state == IS_IDLE {
+            (*c).state = IS_SELECTED
+        }
+    } else if k == CK_LOGOUT {
+        (*c).state = IS_LOGOUT
+    }
+}
+
+fn handle_tagged(c: *mut Imap, q0: usize, q1: usize) {
+    let base: u64 = rt.buf_ptr(&(*c).res)
+    let end: usize = trim_end(base, q0, q1)
+    let te: usize = word_end(base, q0, end)
+    let tag: str = view_of(base, q0, te)
+    if (*c).kind == CK_NONE || (*c).kind == CK_GREET || !rfc822.eq_nocase(tag, bs(&(*c).tag)) {
+        fail(c, IERR_PROTO)
+        return
+    }
+    let p: usize = skip_sp(base, te, end)
+    let we: usize = word_end(base, p, end)
+    let w: str = view_of(base, p, we)
+    var result: u32 = 3
+    if rfc822.eq_nocase(w, "OK") {
+        result = 0
+    } else if rfc822.eq_nocase(w, "NO") {
+        result = 1
+    } else if rfc822.eq_nocase(w, "BAD") {
+        result = 2
+    }
+    if result == 3 {
+        fail(c, IERR_PROTO)
+        return
+    }
+    rt.buf_clear(&(*c).last_code)
+    let tp: usize = resp_code(c, we, end, &(*c).last_code)
+    let base2: u64 = rt.buf_ptr(&(*c).res)
+    rt.buf_clear(&(*c).last_text)
+    push(&(*c).last_text, view_of(base2, tp, end))
+    kind_name_ok(c, result)
+    (*c).last_result = result
+    (*c).last_kind = (*c).kind
+    let done_kind: u32 = (*c).kind
+    (*c).kind = CK_NONE
+    (*c).sasl_wait = false
+    if done_kind == CK_STARTTLS && result == 0 && !(*c).post_tls {
+        if (*c).sp < rt.buf_len(&(*c).inb) {
+            // octets behind the OK were sent in clear text
+            fail(c, IERR_PROTO)
+            return
+        }
+        (*c).state = IS_TLS
+        (*c).events = (*c).events | IEV_TLS
+        return
+    }
+    if done_kind == CK_LOGOUT {
+        (*c).events = (*c).events | IEV_QUIT
+    }
+    (*c).events = (*c).events | IEV_DONE
+}
+
+fn handle_continuation(c: *mut Imap, q0: usize, q1: usize) {
+    if (*c).kind == CK_IDLE && (*c).state != IS_IDLE {
+        (*c).state = IS_IDLE
+        (*c).events = (*c).events | IEV_IDLE
+    } else if (*c).kind == CK_AUTH && (*c).sasl_wait {
+        (*c).sasl_wait = false
+        base64.encode(rt.buf_ptr(&(*c).cred), rt.buf_len(&(*c).cred), &(*c).out)
+        push(&(*c).out, "\r\n")
+        wipe(&(*c).cred)
+    } else {
+        fail(c, IERR_PROTO)
+    }
+}
+
+fn handle_response(c: *mut Imap, r0: usize, r1: usize) {
+    // copy into `res` (nodes refer to it); a leading "* " / "+ " / tag decides
+    let q0: usize = rt.buf_len(&(*c).res)
+    rt.buf_push_bytes(&(*c).res, rt.buf_ptr(&(*c).inb) + r0 as u64, r1 - r0)
+    let first: u32 = byte_at(rt.buf_ptr(&(*c).res), q0)
+    if first == 42 {
+        handle_untagged(c, q0, q0 + (r1 - r0))
+    } else if first == 43 {
+        handle_continuation(c, q0, q0 + (r1 - r0))
+    } else {
+        handle_tagged(c, q0, q0 + (r1 - r0))
+    }
+}
+
+// Feeds server octets. false = the session failed (imap_err says why).
+fn imap_feed(c: *mut Imap, p: u64, n: usize) -> bool {
+    if (*c).state == IS_FAILED || (*c).state == IS_CLOSED {
+        return false
+    }
+    rt.buf_push_bytes(&(*c).inb, p, n)
+    var go: bool = true
+    while go && (*c).state != IS_FAILED && (*c).state != IS_CLOSED && (*c).state != IS_TLS {
+        let total: usize = rt.buf_len(&(*c).inb)
+        let base: u64 = rt.buf_ptr(&(*c).inb)
+        if total < (*c).need || (*c).sp >= total {
+            go = false
+        } else {
+            var e: usize = (*c).sp
+            while e < total && byte_at(base, e) != 10 {
+                e += 1
+            }
+            if e >= total {
+                if total - (*c).sp > MAX_LINE {
+                    fail(c, IERR_TOO_LONG)
+                }
+                (*c).sp = total
+                go = false
+            } else {
+                var le: usize = e
+                if le > (*c).rs && byte_at(base, le - 1) == 13 {
+                    le -= 1
+                }
+                // a literal announcement "{n}" or "{n+}" at the end of the line?
+                var lit: bool = false
+                var litn: usize = 0
+                if le > (*c).rs && byte_at(base, le - 1) == 125 {
+                    var j: usize = le - 1
+                    if j > (*c).rs && byte_at(base, j - 1) == 43 {
+                        j -= 1
+                    }
+                    var digits: usize = 0
+                    var mul: usize = 1
+                    var val: usize = 0
+                    while j > (*c).rs && is_digit(byte_at(base, j - 1)) && digits < 10 {
+                        val = val + (byte_at(base, j - 1) - 48) as usize * mul
+                        mul = mul * 10
+                        digits += 1
+                        j -= 1
+                    }
+                    if digits > 0 && j > (*c).rs && byte_at(base, j - 1) == 123 {
+                        lit = true
+                        litn = val
+                    }
+                }
+                if lit {
+                    if litn > MAX_LIT {
+                        fail(c, IERR_TOO_LONG)
+                    } else {
+                        (*c).need = e + 1 + litn
+                        (*c).sp = e + 1 + litn
+                    }
+                } else {
+                    if e + 1 - (*c).rs > MAX_LIT + MAX_LINE {
+                        fail(c, IERR_TOO_LONG)
+                    } else {
+                        let r0: usize = (*c).rs
+                        (*c).rs = e + 1
+                        (*c).sp = e + 1
+                        (*c).need = 0
+                        handle_response(c, r0, e + 1)
+                    }
+                }
+            }
+        }
+    }
+    // drop what is parsed
+    if (*c).rs > 0 && (*c).state != IS_TLS {
+        let total2: usize = rt.buf_len(&(*c).inb)
+        let rest: usize = total2 - (*c).rs
+        if rest > 0 {
+            rt.mem_copy(rt.buf_ptr(&(*c).inb), rt.buf_ptr(&(*c).inb) + (*c).rs as u64, rest)
+        }
+        rt.buf_set_len(&(*c).inb, rest)
+        (*c).sp = (*c).sp - (*c).rs
+        if (*c).need >= (*c).rs {
+            (*c).need = (*c).need - (*c).rs
+        } else {
+            (*c).need = 0
+        }
+        (*c).rs = 0
+    }
+    return (*c).state != IS_FAILED
+}
+
+// The caller switched the stream to TLS (after IEV_TLS): ask for the capabilities again.
+fn imap_tls_done(c: *mut Imap) {
+    if (*c).state != IS_TLS {
+        return
+    }
+    (*c).secure = true
+    (*c).post_tls = true
+    (*c).state = IS_NOAUTH
+    (*c).caps = 0
+    rt.buf_clear(&(*c).inb)
+    (*c).rs = 0
+    (*c).sp = 0
+    (*c).need = 0
+    (*c).kind = CK_STARTTLS // the command stays "open" until the capabilities are in
+    // an untagged CAPABILITY answer and its tagged OK complete it
+    begin_tag(c)
+    out_str(c, "CAPABILITY\r\n")
+}
+
+// ------------------------------------------------------------------ commands
+
+fn begin_tag(c: *mut Imap) {
+    (*c).tag_no += 1
+    rt.buf_clear(&(*c).tag)
+    push(&(*c).tag, "A")
+    var d: usize = 1000
+    var v: u64 = (*c).tag_no
+    // at least 4 digits
+    while d > 1 && v < d as u64 {
+        rt.buf_push(&(*c).tag, 48)
+        d = d / 10
+    }
+    rt.buf_push_dec_u64(&(*c).tag, v)
+    push(&(*c).out, bs(&(*c).tag))
+    rt.buf_push(&(*c).out, 32)
+}
+
+// Starts a command: false (and imap_err) when another one runs or the state does not fit.
+fn start_cmd(c: *mut Imap, kind: u32, name: str, need_noauth: bool, need_auth: bool, need_sel: bool) -> bool {
+    if (*c).state == IS_FAILED || (*c).state == IS_CLOSED || (*c).state == IS_LOGOUT || (*c).state == IS_TLS {
+        (*c).err = IERR_STATE
+        return false
+    }
+    if (*c).kind != CK_NONE {
+        (*c).err = IERR_BUSY
+        return false
+    }
+    let st: u32 = (*c).state
+    if need_noauth && st != IS_NOAUTH {
+        (*c).err = IERR_STATE
+        return false
+    }
+    if need_auth && st != IS_AUTH && st != IS_SELECTED {
+        (*c).err = IERR_STATE
+        return false
+    }
+    if need_sel && st != IS_SELECTED {
+        (*c).err = IERR_STATE
+        return false
+    }
+    if kind != CK_NONE {
+        imap_discard(c)
+    }
+    (*c).kind = kind
+    begin_tag(c)
+    push(&(*c).out, name)
+    return true
+}
+
+fn end_cmd(c: *mut Imap) {
+    push(&(*c).out, "\r\n")
+}
+
+// A raw argument: no CR, LF, NUL; must not end in "}" (a literal announcement).
+fn raw_ok(s: str) -> bool {
+    var i: usize = 0
+    while i < s.n {
+        let ch: u32 = rfc822.at(s, i)
+        if ch == 13 || ch == 10 || ch == 0 {
+            return false
+        }
+        i += 1
+    }
+    if s.n > 0 && rfc822.at(s, s.n - 1) == 125 {
+        return false
+    }
+    return true
+}
+
+// " <quoted>" with \ and " escaped. false = not representable (CR LF NUL or >= 128).
+fn quote_into(out: *mut rt.Buf, s: str) -> bool {
+    var i: usize = 0
+    while i < s.n {
+        let ch: u32 = rfc822.at(s, i)
+        if ch == 13 || ch == 10 || ch == 0 || ch >= 128 {
+            return false
+        }
+        i += 1
+    }
+    rt.buf_push(out, 32)
+    rt.buf_push(out, 34)
+    i = 0
+    while i < s.n {
+        let ch2: u32 = rfc822.at(s, i)
+        if ch2 == 34 || ch2 == 92 {
+            rt.buf_push(out, 92)
+        }
+        rt.buf_push(out, ch2 as u8)
+        i += 1
+    }
+    rt.buf_push(out, 34)
+    return true
+}
+
+fn bad_arg(c: *mut Imap, mark: usize) -> bool {
+    // roll back the half-written command
+    rt.buf_set_len(&(*c).out, mark)
+    (*c).kind = CK_NONE
+    (*c).err = IERR_BAD_ARG
+    return false
+}
+
+fn imap_capability(c: *mut Imap) -> bool {
+    if !start_cmd(c, CK_CAPABILITY, "CAPABILITY", false, false, false) {
+        return false
+    }
+    end_cmd(c)
+    return true
+}
+
+fn imap_starttls(c: *mut Imap) -> bool {
+    if (*c).secure {
+        (*c).err = IERR_STATE
+        return false
+    }
+    if !start_cmd(c, CK_STARTTLS, "STARTTLS", true, false, false) {
+        return false
+    }
+    end_cmd(c)
+    return true
+}
+
+fn imap_login(c: *mut Imap, user: str, pass: str) -> bool {
+    if !(*c).secure && !(*c).insecure_auth {
+        (*c).err = IERR_AUTH_INSECURE
+        return false
+    }
+    let mark: usize = rt.buf_len(&(*c).out)
+    if !start_cmd(c, CK_LOGIN, "LOGIN", true, false, false) {
+        return false
+    }
+    if !quote_into(&(*c).out, user) || !quote_into(&(*c).out, pass) {
+        wipe(&(*c).out)
+        (*c).outpos = 0
+        (*c).kind = CK_NONE
+        (*c).err = IERR_BAD_ARG
+        return false
+    }
+    end_cmd(c)
+    return true
+}
+
+fn imap_authenticate_plain(c: *mut Imap, user: str, pass: str) -> bool {
+    if !(*c).secure && !(*c).insecure_auth {
+        (*c).err = IERR_AUTH_INSECURE
+        return false
+    }
+    if !start_cmd(c, CK_AUTH, "AUTHENTICATE PLAIN", true, false, false) {
+        return false
+    }
+    wipe(&(*c).cred)
+    rt.buf_push(&(*c).cred, 0)
+    push(&(*c).cred, user)
+    rt.buf_push(&(*c).cred, 0)
+    push(&(*c).cred, pass)
+    if ((*c).caps & ICAP_SASL_IR) != 0 {
+        rt.buf_push(&(*c).out, 32)
+        base64.encode(rt.buf_ptr(&(*c).cred), rt.buf_len(&(*c).cred), &(*c).out)
+        wipe(&(*c).cred)
+    } else {
+        (*c).sasl_wait = true
+    }
+    end_cmd(c)
+    return true
+}
+
+fn imap_list(c: *mut Imap, reference: str, pattern: str, lsub: bool) -> bool {
+    var name: str = "LIST"
+    if lsub {
+        name = "LSUB"
+    }
+    let mark: usize = rt.buf_len(&(*c).out)
+    if !start_cmd(c, CK_LIST, name, false, true, false) {
+        return false
+    }
+    if !quote_into(&(*c).out, reference) || !quote_into(&(*c).out, pattern) {
+        return bad_arg(c, mark)
+    }
+    end_cmd(c)
+    return true
+}
+
+fn imap_select(c: *mut Imap, mailbox: str, read_only: bool) -> bool {
+    var name: str = "SELECT"
+    if read_only {
+        name = "EXAMINE"
+    }
+    let mark: usize = rt.buf_len(&(*c).out)
+    if !start_cmd(c, CK_SELECT, name, false, true, false) {
+        return false
+    }
+    if !quote_into(&(*c).out, mailbox) {
+        return bad_arg(c, mark)
+    }
+    (*c).exists = 0
+    (*c).recent = 0
+    end_cmd(c)
+    return true
+}
+
+// items like "(MESSAGES UNSEEN UIDNEXT)"
+fn imap_status(c: *mut Imap, mailbox: str, items: str) -> bool {
+    let mark: usize = rt.buf_len(&(*c).out)
+    if !start_cmd(c, CK_STATUS, "STATUS", false, true, false) {
+        return false
+    }
+    if !quote_into(&(*c).out, mailbox) || !raw_ok(items) {
+        return bad_arg(c, mark)
+    }
+    rt.buf_push(&(*c).out, 32)
+    push(&(*c).out, items)
+    end_cmd(c)
+    return true
+}
+
+fn with_uid(c: *mut Imap, uid: bool, name: str) -> str {
+    rt.buf_clear(&(*c).scratch)
+    if uid {
+        push(&(*c).scratch, "UID ")
+    }
+    push(&(*c).scratch, name)
+    return bs(&(*c).scratch)
+}
+
+// seqset like "1:*" or "4,7:9"; items like "(UID FLAGS ENVELOPE BODY.PEEK[1])"
+fn imap_fetch(c: *mut Imap, seqset: str, items: str, uid: bool) -> bool {
+    let mark: usize = rt.buf_len(&(*c).out)
+    var nm: rt.Buf = rt.buf_new()
+    if uid {
+        push(&nm, "UID ")
+    }
+    push(&nm, "FETCH ")
+    let ok: bool = start_cmd(c, CK_FETCH, bs(&nm), false, false, true)
+    rt.buf_free(&nm)
+    if !ok {
+        return false
+    }
+    if !raw_ok(seqset) || !raw_ok(items) || seqset.n == 0 || items.n == 0 {
+        return bad_arg(c, mark)
+    }
+    push(&(*c).out, seqset)
+    rt.buf_push(&(*c).out, 32)
+    push(&(*c).out, items)
+    end_cmd(c)
+    return true
+}
+
+// criteria like "UNSEEN SINCE 1-Jan-2026 FROM \"bob\""
+fn imap_search(c: *mut Imap, criteria: str, uid: bool) -> bool {
+    let mark: usize = rt.buf_len(&(*c).out)
+    var nm: rt.Buf = rt.buf_new()
+    if uid {
+        push(&nm, "UID ")
+    }
+    push(&nm, "SEARCH ")
+    let ok: bool = start_cmd(c, CK_SEARCH, bs(&nm), false, false, true)
+    rt.buf_free(&nm)
+    if !ok {
+        return false
+    }
+    if !raw_ok(criteria) || criteria.n == 0 {
+        return bad_arg(c, mark)
+    }
+    push(&(*c).out, criteria)
+    end_cmd(c)
+    return true
+}
+
+// mode "+FLAGS", "-FLAGS" or "FLAGS"; flags like "(\\Seen \\Deleted)"; add ".SILENT" in the mode if wanted
+fn imap_store(c: *mut Imap, seqset: str, mode: str, flags: str, uid: bool) -> bool {
+    let mark: usize = rt.buf_len(&(*c).out)
+    var nm: rt.Buf = rt.buf_new()
+    if uid {
+        push(&nm, "UID ")
+    }
+    push(&nm, "STORE ")
+    let ok: bool = start_cmd(c, CK_STORE, bs(&nm), false, false, true)
+    rt.buf_free(&nm)
+    if !ok {
+        return false
+    }
+    if !raw_ok(seqset) || !raw_ok(mode) || !raw_ok(flags) || seqset.n == 0 || mode.n == 0 {
+        return bad_arg(c, mark)
+    }
+    push(&(*c).out, seqset)
+    rt.buf_push(&(*c).out, 32)
+    push(&(*c).out, mode)
+    rt.buf_push(&(*c).out, 32)
+    push(&(*c).out, flags)
+    end_cmd(c)
+    return true
+}
+
+// EXPUNGE; with a uid set (needs UIDPLUS) UID EXPUNGE <set>
+fn imap_expunge(c: *mut Imap, uidset: str) -> bool {
+    let mark: usize = rt.buf_len(&(*c).out)
+    var name: str = "EXPUNGE"
+    if uidset.n > 0 {
+        name = "UID EXPUNGE "
+    }
+    if !start_cmd(c, CK_EXPUNGE, name, false, false, true) {
+        return false
+    }
+    if uidset.n > 0 {
+        if !raw_ok(uidset) {
+            return bad_arg(c, mark)
+        }
+        push(&(*c).out, uidset)
+    }
+    end_cmd(c)
+    return true
+}
+
+fn imap_copy(c: *mut Imap, seqset: str, mailbox: str, uid: bool) -> bool {
+    let mark: usize = rt.buf_len(&(*c).out)
+    var nm: rt.Buf = rt.buf_new()
+    if uid {
+        push(&nm, "UID ")
+    }
+    push(&nm, "COPY ")
+    let ok: bool = start_cmd(c, CK_COPY, bs(&nm), false, false, true)
+    rt.buf_free(&nm)
+    if !ok {
+        return false
+    }
+    if !raw_ok(seqset) || seqset.n == 0 {
+        return bad_arg(c, mark)
+    }
+    push(&(*c).out, seqset)
+    if !quote_into(&(*c).out, mailbox) {
+        return bad_arg(c, mark)
+    }
+    end_cmd(c)
+    return true
+}
+
+fn imap_noop(c: *mut Imap) -> bool {
+    if !start_cmd(c, CK_NOOP, "NOOP", false, false, false) {
+        return false
+    }
+    end_cmd(c)
+    return true
+}
+
+fn imap_close(c: *mut Imap) -> bool {
+    if !start_cmd(c, CK_CLOSE, "CLOSE", false, false, true) {
+        return false
+    }
+    end_cmd(c)
+    return true
+}
+
+fn imap_idle(c: *mut Imap) -> bool {
+    if !start_cmd(c, CK_IDLE, "IDLE", false, false, true) {
+        return false
+    }
+    end_cmd(c)
+    return true
+}
+
+// Ends IDLE ("DONE"); the tagged OK follows.
+fn imap_idle_done(c: *mut Imap) -> bool {
+    if (*c).state != IS_IDLE {
+        (*c).err = IERR_STATE
+        return false
+    }
+    push(&(*c).out, "DONE\r\n")
+    return true
+}
+
+fn imap_logout(c: *mut Imap) -> bool {
+    if !start_cmd(c, CK_LOGOUT, "LOGOUT", false, false, false) {
+        return false
+    }
+    end_cmd(c)
+    return true
+}
+
+// Any command line (without tag and CRLF); the result lands in the tree as usual.
+fn imap_raw(c: *mut Imap, line: str) -> bool {
+    let mark: usize = rt.buf_len(&(*c).out)
+    if !raw_ok(line) || line.n == 0 {
+        (*c).err = IERR_BAD_ARG
+        return false
+    }
+    if !start_cmd(c, CK_RAW, line, false, false, false) {
+        return false
+    }
+    end_cmd(c)
+    return true
+}
+
+// ------------------------------------------------------------ result access
+
+fn imap_fetch_count(c: *mut Imap) -> usize {
+    return vec_len[FetchRec](&(*c).fetches)
+}
+
+fn imap_fetch_seq(c: *mut Imap, i: usize) -> u64 {
+    let r: *mut FetchRec = vec_elem_ptr[FetchRec](&(*c).fetches, i)
+    if r as u64 == 0 {
+        return 0
+    }
+    return (*r).seq
+}
+
+// The value node of the item `name` ("UID", "FLAGS", "ENVELOPE", "BODYSTRUCTURE",
+// "RFC822.SIZE", "INTERNALDATE", "BODY[1]", "BODY[HEADER.FIELDS (DATE)]", ...) of
+// fetch record `i`; NONE when the server did not send it.
+fn imap_fetch_item(c: *mut Imap, i: usize, name: str) -> usize {
+    let r: *mut FetchRec = vec_elem_ptr[FetchRec](&(*c).fetches, i)
+    if r as u64 == 0 {
+        return NONE
+    }
+    var k: usize = imap_node_child(c, (*r).root)
+    while k != NONE {
+        let v: usize = imap_node_next(c, k)
+        if v == NONE {
+            return NONE
+        }
+        if imap_node_kind(c, k) == NK_ATOM && imap_node_is(c, k, name) {
+            return v
+        }
+        k = imap_node_next(c, v)
+    }
+    return NONE
+}
+
+fn imap_fetch_uid(c: *mut Imap, i: usize) -> u64 {
+    return imap_node_num(c, imap_fetch_item(c, i, "UID"))
+}
+
+fn imap_fetch_size(c: *mut Imap, i: usize) -> u64 {
+    return imap_node_num(c, imap_fetch_item(c, i, "RFC822.SIZE"))
+}
+
+fn imap_fetch_flags_node(c: *mut Imap, i: usize) -> usize {
+    return imap_fetch_item(c, i, "FLAGS")
+}
+
+// FL_* bits of the FLAGS item (keywords like $Forwarded are not in the bits; walk the node for them).
+fn imap_fetch_flags(c: *mut Imap, i: usize) -> u32 {
+    let f: usize = imap_fetch_item(c, i, "FLAGS")
+    var bits: u32 = 0
+    var k: usize = imap_node_child(c, f)
+    while k != NONE {
+        if imap_node_is(c, k, "\\Seen") {
+            bits = bits | FL_SEEN
+        } else if imap_node_is(c, k, "\\Answered") {
+            bits = bits | FL_ANSWERED
+        } else if imap_node_is(c, k, "\\Flagged") {
+            bits = bits | FL_FLAGGED
+        } else if imap_node_is(c, k, "\\Deleted") {
+            bits = bits | FL_DELETED
+        } else if imap_node_is(c, k, "\\Draft") {
+            bits = bits | FL_DRAFT
+        } else if imap_node_is(c, k, "\\Recent") {
+            bits = bits | FL_RECENT
+        }
+        k = imap_node_next(c, k)
+    }
+    return bits
+}
+
+// The text of "BODY[<section>]" (section like "1", "1.MIME", "HEADER", "TEXT", "" for all)
+// appended to `out`. false = not in the answer or NIL.
+fn imap_fetch_body(c: *mut Imap, i: usize, section: str, out: *mut rt.Buf) -> bool {
+    var nm: rt.Buf = rt.buf_new()
+    push(&nm, "BODY[")
+    push(&nm, section)
+    push(&nm, "]")
+    let v: usize = imap_fetch_item(c, i, bs(&nm))
+    rt.buf_free(&nm)
+    return imap_node_text(c, v, out)
+}
+
+fn nth(c: *mut Imap, list: usize, k: usize) -> usize {
+    var x: usize = imap_node_child(c, list)
+    var i: usize = 0
+    while x != NONE && i < k {
+        x = imap_node_next(c, x)
+        i += 1
+    }
+    return x
+}
+
+// ENVELOPE field k of fetch record i: 0 date, 1 subject, 2 from, 3 sender, 4 reply-to,
+// 5 to, 6 cc, 7 bcc, 8 in-reply-to, 9 message-id. Address fields are lists (or NIL).
+fn imap_env_field(c: *mut Imap, i: usize, k: usize) -> usize {
+    let e: usize = imap_fetch_item(c, i, "ENVELOPE")
+    if e == NONE || k > 9 {
+        return NONE
+    }
+    return nth(c, e, k)
+}
+
+fn imap_addr_count(c: *mut Imap, list: usize) -> usize {
+    return imap_node_count(c, list)
+}
+
+// part 0 name, 1 route, 2 mailbox, 3 host of address idx
+fn imap_addr_part(c: *mut Imap, list: usize, idx: usize, part: usize) -> usize {
+    return nth(c, nth(c, list, idx), part)
+}
+
+fn imap_addr_format(c: *mut Imap, list: usize, out: *mut rt.Buf) {
+    let n: usize = imap_node_count(c, list)
+    var i: usize = 0
+    var first: bool = true
+    while i < n {
+        let a: usize = nth(c, list, i)
+        let name: usize = nth(c, a, 0)
+        let mbox: usize = nth(c, a, 2)
+        let host: usize = nth(c, a, 3)
+        if imap_node_kind(c, host) == NK_NIL && imap_node_kind(c, mbox) != NK_NIL {
+            // group start
+            if !first {
+                push(out, ", ")
+            }
+            imap_node_text(c, mbox, out)
+            push(out, ":")
+            first = true
+        } else if imap_node_kind(c, mbox) == NK_NIL {
+            push(out, ";")
+            first = false
+        } else {
+            if !first {
+                push(out, ", ")
+            }
+            if imap_node_kind(c, name) != NK_NIL {
+                imap_node_text(c, name, out)
+                push(out, " <")
+                imap_node_text(c, mbox, out)
+                push(out, "@")
+                imap_node_text(c, host, out)
+                push(out, ">")
+            } else {
+                imap_node_text(c, mbox, out)
+                push(out, "@")
+                imap_node_text(c, host, out)
+            }
+            first = false
+        }
+        i += 1
+    }
+}
+
+// ----------------------------------------------------------- BODYSTRUCTURE
+
+fn bs_walk(c: *mut Imap, node: usize, parent: usize, index: u32, depth: u32) -> usize {
+    let me: usize = vec_len[BsPart](&(*c).bs)
+    if depth > MAX_DEPTH || me >= 100000 {
+        return NONE
+    }
+    let first: usize = imap_node_child(c, node)
+    let multi: bool = imap_node_kind(c, first) == NK_LIST
+    vec_push[BsPart](&(*c).bs, BsPart { node: node, parent: parent, first_child: NONE, next: NONE, index: index,
+        multi: multi, depth: depth })
+    if multi {
+        var k: usize = first
+        var last: usize = NONE
+        var idx: u32 = 1
+        while k != NONE && imap_node_kind(c, k) == NK_LIST {
+            let ch: usize = bs_walk(c, k, me, idx, depth + 1)
+            if ch == NONE {
+                return NONE
+            }
+            let mp: *mut BsPart = vec_elem_ptr[BsPart](&(*c).bs, me)
+            if last == NONE {
+                (*mp).first_child = ch
+            } else {
+                let lp: *mut BsPart = vec_elem_ptr[BsPart](&(*c).bs, last)
+                (*lp).next = ch
+            }
+            last = ch
+            idx += 1
+            k = imap_node_next(c, k)
+        }
+    }
+    return me
+}
+
+// Flattens the BODYSTRUCTURE (or BODY) of fetch record i into numbered parts, in document
+// order; part 0 is the top. Returns the number of parts (0 = none / malformed).
+// message/rfc822 parts are leaves (their inner body is not entered).
+fn imap_bs_build(c: *mut Imap, i: usize, item: str) -> usize {
+    vec_clear[BsPart](&(*c).bs)
+    var nm: str = item
+    if nm.n == 0 {
+        nm = "BODYSTRUCTURE"
+    }
+    var n: usize = imap_fetch_item(c, i, nm)
+    if n == NONE && item.n == 0 {
+        n = imap_fetch_item(c, i, "BODY")
+    }
+    if n == NONE || imap_node_kind(c, n) != NK_LIST {
+        return 0
+    }
+    if bs_walk(c, n, NONE, 1, 0) == NONE {
+        vec_clear[BsPart](&(*c).bs)
+        return 0
+    }
+    return vec_len[BsPart](&(*c).bs)
+}
+
+fn imap_bs_count(c: *mut Imap) -> usize { return vec_len[BsPart](&(*c).bs) }
+
+fn bs_at(c: *mut Imap, k: usize) -> *mut BsPart { return vec_elem_ptr[BsPart](&(*c).bs, k) }
+
+fn imap_bs_multi(c: *mut Imap, k: usize) -> bool { return (*bs_at(c, k)).multi }
+fn imap_bs_parent(c: *mut Imap, k: usize) -> usize { return (*bs_at(c, k)).parent }
+
+// the node after the last child list of a multipart = its subtype
+fn multi_subtype(c: *mut Imap, node: usize) -> usize {
+    var x: usize = imap_node_child(c, node)
+    while x != NONE && imap_node_kind(c, x) == NK_LIST {
+        x = imap_node_next(c, x)
+    }
+    return x
+}
+
+// content type node ("TEXT"; for a multipart there is none: NONE)
+fn imap_bs_type(c: *mut Imap, k: usize) -> usize {
+    let p: *mut BsPart = bs_at(c, k)
+    if (*p).multi {
+        return NONE
+    }
+    return nth(c, (*p).node, 0)
+}
+
+fn imap_bs_subtype(c: *mut Imap, k: usize) -> usize {
+    let p: *mut BsPart = bs_at(c, k)
+    if (*p).multi {
+        return multi_subtype(c, (*p).node)
+    }
+    return nth(c, (*p).node, 1)
+}
+
+fn params_node(c: *mut Imap, k: usize) -> usize {
+    let p: *mut BsPart = bs_at(c, k)
+    if (*p).multi {
+        return imap_node_next(c, multi_subtype(c, (*p).node))
+    }
+    return nth(c, (*p).node, 2)
+}
+
+// the value node of Content-Type parameter `name` ("CHARSET", "BOUNDARY", "NAME")
+fn imap_bs_param(c: *mut Imap, k: usize, name: str) -> usize {
+    let pl: usize = params_node(c, k)
+    var x: usize = imap_node_child(c, pl)
+    while x != NONE {
+        let v: usize = imap_node_next(c, x)
+        if v == NONE {
+            return NONE
+        }
+        if imap_node_is(c, x, name) {
+            return v
+        }
+        x = imap_node_next(c, v)
+    }
+    return NONE
+}
+
+fn imap_bs_id(c: *mut Imap, k: usize) -> usize {
+    let p: *mut BsPart = bs_at(c, k)
+    if (*p).multi {
+        return NONE
+    }
+    return nth(c, (*p).node, 3)
+}
+
+fn imap_bs_encoding(c: *mut Imap, k: usize) -> usize {
+    let p: *mut BsPart = bs_at(c, k)
+    if (*p).multi {
+        return NONE
+    }
+    return nth(c, (*p).node, 5)
+}
+
+// size in octets (0 for a multipart)
+fn imap_bs_size(c: *mut Imap, k: usize) -> u64 {
+    let p: *mut BsPart = bs_at(c, k)
+    if (*p).multi {
+        return 0
+    }
+    return imap_node_num(c, nth(c, (*p).node, 6))
+}
+
+// the disposition list "(ATTACHMENT (FILENAME \"x\"))" or NIL; its first child is the type
+fn imap_bs_disposition(c: *mut Imap, k: usize) -> usize {
+    let p: *mut BsPart = bs_at(c, k)
+    if (*p).multi {
+        return nth(c, (*p).node, imap_node_count(c, (*p).node) - 1 - 0)
+    }
+    // single: text/*: lines(7) md5(8) disp(9); message/rfc822: env body lines md5 disp(11); else md5(7) disp(8)
+    var pos: usize = 8
+    if imap_node_is(c, nth(c, (*p).node, 0), "TEXT") {
+        pos = 9
+    } else if imap_node_is(c, nth(c, (*p).node, 0), "MESSAGE") && imap_node_is(c, nth(c, (*p).node, 1), "RFC822") {
+        pos = 11
+    }
+    return nth(c, (*p).node, pos)
+}
+
+// the file name: disposition FILENAME, else Content-Type NAME; NONE if neither
+fn imap_bs_filename(c: *mut Imap, k: usize) -> usize {
+    let d: usize = imap_bs_disposition(c, k)
+    if imap_node_kind(c, d) == NK_LIST {
+        let pl: usize = nth(c, d, 1)
+        var x: usize = imap_node_child(c, pl)
+        while x != NONE {
+            let v: usize = imap_node_next(c, x)
+            if v == NONE {
+                break
+            }
+            if imap_node_is(c, x, "FILENAME") {
+                return v
+            }
+            x = imap_node_next(c, v)
+        }
+    }
+    return imap_bs_param(c, k, "NAME")
+}
+
+// The IMAP part number ("1", "2.1", ...) appended to `out`; "" for the top multipart
+// (BODY[] = the whole message). A single-part message is "1".
+fn imap_bs_path(c: *mut Imap, k: usize, out: *mut rt.Buf) {
+    let p: *mut BsPart = bs_at(c, k)
+    if (*p).parent == NONE {
+        if !(*p).multi {
+            push(out, "1")
+        }
+        return
+    }
+    let before: usize = rt.buf_len(out)
+    imap_bs_path(c, (*p).parent, out)
+    if rt.buf_len(out) > before {
+        rt.buf_push(out, 46)
+    }
+    rt.buf_push_dec_u64(out, (*p).index as u64)
+}
+
+// ---------------------------------------------------- LIST / SEARCH / STATUS
+
+fn imap_list_count(c: *mut Imap) -> usize { return vec_len[ListRec](&(*c).lists) }
+fn imap_list_attrs(c: *mut Imap, i: usize) -> usize { return (*vec_elem_ptr[ListRec](&(*c).lists, i)).attrs }
+fn imap_list_delim(c: *mut Imap, i: usize) -> usize { return (*vec_elem_ptr[ListRec](&(*c).lists, i)).delim }
+fn imap_list_name(c: *mut Imap, i: usize) -> usize { return (*vec_elem_ptr[ListRec](&(*c).lists, i)).name }
+fn imap_search_count(c: *mut Imap) -> usize { return vec_len[u64](&(*c).found) }
+fn imap_search_at(c: *mut Imap, i: usize) -> u64 {
+    let p: *mut u64 = vec_elem_ptr[u64](&(*c).found, i)
+    if p as u64 == 0 {
+        return 0
+    }
+    return *p
+}
+
+// STATUS answer: the number for `item` ("MESSAGES", "UNSEEN", "UIDNEXT", ...); 0 if absent
+fn imap_status_get(c: *mut Imap, item: str) -> u64 {
+    var x: usize = imap_node_child(c, (*c).status_list)
+    while x != NONE {
+        let v: usize = imap_node_next(c, x)
+        if v == NONE {
+            return 0
+        }
+        if imap_node_is(c, x, item) {
+            return imap_node_num(c, v)
+        }
+        x = imap_node_next(c, v)
+    }
+    return 0
+}
+
+// ---------------------------------------------------- modified UTF-7 (RFC 3501 5.1.3)
+
+fn m64(v: u32) -> u8 {
+    if v < 26 {
+        return (65 + v) as u8
+    }
+    if v < 52 {
+        return (97 + v - 26) as u8
+    }
+    if v < 62 {
+        return (48 + v - 52) as u8
+    }
+    if v == 62 {
+        return 43
+    }
+    return 44
+}
+
+fn m64_val(ch: u32) -> u32 {
+    if ch >= 65 && ch <= 90 {
+        return ch - 65
+    }
+    if ch >= 97 && ch <= 122 {
+        return ch - 97 + 26
+    }
+    if ch >= 48 && ch <= 57 {
+        return ch - 48 + 52
+    }
+    if ch == 43 {
+        return 62
+    }
+    if ch == 44 {
+        return 63
+    }
+    return 255
+}
+
+// Decodes one UTF-8 sequence at i; returns the code point, advances *adv. 0xFFFFFFFF = invalid.
+fn utf8_next(s: str, i: usize, adv: *mut usize) -> u32 {
+    let b0: u32 = rfc822.at(s, i)
+    if b0 < 128 {
+        *adv = 1
+        return b0
+    }
+    var need: usize = 0
+    var cp: u32 = 0
+    if b0 >= 240 && b0 < 248 {
+        need = 3
+        cp = b0 & 7
+    } else if b0 >= 224 {
+        need = 2
+        cp = b0 & 15
+    } else if b0 >= 192 {
+        need = 1
+        cp = b0 & 31
+    } else {
+        *adv = 1
+        return 4294967295
+    }
+    if i + need >= s.n {
+        *adv = 1
+        return 4294967295
+    }
+    var k: usize = 1
+    while k <= need {
+        let b: u32 = rfc822.at(s, i + k)
+        if (b & 192) != 128 {
+            *adv = 1
+            return 4294967295
+        }
+        cp = (cp << 6) | (b & 63)
+        k += 1
+    }
+    *adv = need + 1
+    return cp
+}
+
+// UTF-8 -> the mailbox name as the server wants it. false = invalid UTF-8.
+fn imap_utf7_encode(s: str, out: *mut rt.Buf) -> bool {
+    var i: usize = 0
+    var in_b64: bool = false
+    var acc: u32 = 0
+    var bits: u32 = 0
+    while i < s.n {
+        var adv: usize = 0
+        let cp: u32 = utf8_next(s, i, &adv)
+        if cp == 4294967295 {
+            return false
+        }
+        i += adv
+        if cp >= 32 && cp <= 126 {
+            if in_b64 {
+                if bits > 0 {
+                    rt.buf_push(out, m64((acc << (6 - bits)) & 63))
+                }
+                rt.buf_push(out, 45)
+                in_b64 = false
+                acc = 0
+                bits = 0
+            }
+            rt.buf_push(out, cp as u8)
+            if cp == 38 {
+                rt.buf_push(out, 45)
+            }
+        } else {
+            if !in_b64 {
+                rt.buf_push(out, 38)
+                in_b64 = true
+                acc = 0
+                bits = 0
+            }
+            var units: [u32; 2] = [0; 2]
+            var nu: usize = 1
+            if cp >= 65536 {
+                let v: u32 = cp - 65536
+                units[0] = 55296 + (v >> 10)
+                units[1] = 56320 + (v & 1023)
+                nu = 2
+            } else {
+                units[0] = cp
+            }
+            var u: usize = 0
+            while u < nu {
+                // push 16 bits
+                var t: u32 = 0
+                while t < 2 {
+                    var chunk: u32 = (units[u] >> 8) & 255
+                    if t == 1 {
+                        chunk = units[u] & 255
+                    }
+                    acc = (acc << 8) | chunk
+                    bits += 8
+                    while bits >= 6 {
+                        rt.buf_push(out, m64((acc >> (bits - 6)) & 63))
+                        bits -= 6
+                    }
+                    acc = acc & ((1 << bits) - 1)
+                    t += 1
+                }
+                u += 1
+            }
+        }
+    }
+    if in_b64 {
+        if bits > 0 {
+            rt.buf_push(out, m64((acc << (6 - bits)) & 63))
+        }
+        rt.buf_push(out, 45)
+    }
+    return true
+}
+
+fn push_utf8(out: *mut rt.Buf, cp: u32) {
+    if cp < 128 {
+        rt.buf_push(out, cp as u8)
+    } else if cp < 2048 {
+        rt.buf_push(out, (192 | (cp >> 6)) as u8)
+        rt.buf_push(out, (128 | (cp & 63)) as u8)
+    } else if cp < 65536 {
+        rt.buf_push(out, (224 | (cp >> 12)) as u8)
+        rt.buf_push(out, (128 | ((cp >> 6) & 63)) as u8)
+        rt.buf_push(out, (128 | (cp & 63)) as u8)
+    } else {
+        rt.buf_push(out, (240 | (cp >> 18)) as u8)
+        rt.buf_push(out, (128 | ((cp >> 12) & 63)) as u8)
+        rt.buf_push(out, (128 | ((cp >> 6) & 63)) as u8)
+        rt.buf_push(out, (128 | (cp & 63)) as u8)
+    }
+}
+
+// Mailbox name from the server -> UTF-8. false = malformed (unterminated, odd bits, bad surrogates).
+fn imap_utf7_decode(s: str, out: *mut rt.Buf) -> bool {
+    var i: usize = 0
+    while i < s.n {
+        let ch: u32 = rfc822.at(s, i)
+        if ch != 38 {
+            if ch >= 128 {
+                return false
+            }
+            rt.buf_push(out, ch as u8)
+            i += 1
+        } else if i + 1 < s.n && rfc822.at(s, i + 1) == 45 {
+            rt.buf_push(out, 38)
+            i += 2
+        } else {
+            i += 1
+            var acc: u32 = 0
+            var bits: u32 = 0
+            var hi: u32 = 0
+            var term: bool = false
+            while i < s.n && !term {
+                let d: u32 = rfc822.at(s, i)
+                if d == 45 {
+                    term = true
+                    i += 1
+                } else {
+                    let v: u32 = m64_val(d)
+                    if v == 255 {
+                        return false
+                    }
+                    acc = (acc << 6) | v
+                    bits += 6
+                    if bits >= 16 {
+                        let unit: u32 = (acc >> (bits - 16)) & 65535
+                        bits -= 16
+                        acc = acc & ((1 << bits) - 1)
+                        if hi != 0 {
+                            if unit < 56320 || unit > 57343 {
+                                return false
+                            }
+                            push_utf8(out, 65536 + ((hi - 55296) << 10) + (unit - 56320))
+                            hi = 0
+                        } else if unit >= 55296 && unit <= 56319 {
+                            hi = unit
+                        } else if unit >= 56320 && unit <= 57343 {
+                            return false
+                        } else {
+                            push_utf8(out, unit)
+                        }
+                    }
+                    i += 1
+                }
+            }
+            if !term || hi != 0 || bits >= 6 {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+// =============================================================== the glue
+
+const IM_PLAIN: u32 = 0
+const IM_STARTTLS: u32 = 1
+const IM_TLS: u32 = 2
+
+const IME_READY: u32 = 1
+const IME_DONE: u32 = 2
+const IME_PUSH: u32 = 3
+const IME_IDLE: u32 = 4
+const IME_BYE: u32 = 5
+const IME_CLOSED: u32 = 6
+
+const PH_GREET: u32 = 0
+const PH_CAP: u32 = 1
+const PH_TLS: u32 = 2
+const PH_CAP2: u32 = 3
+const PH_READY: u32 = 4
+
+fn obj_alloc[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+fn obj_free[T](p: u64) {
+    rt.heap_free(p, size_of[T]())
+}
+
+struct Ic {
+    s: *mut stream.Stream,
+    core: Imap,
+    cb: fn(*mut Ic, u64, u32, i64),
+    ud: u64,
+    mode: u32,
+    tls_mode: u32, // 0 never, 1 when offered, 2 required
+    store: *mut x509.Store,
+    now: u64,
+    host: rt.Buf,
+    phase: u32,
+    upgrading: bool,
+    closed: bool,
+}
+
+fn ic_core(c: *mut Ic) -> *mut Imap { return &(*c).core }
+fn ic_err(c: *mut Ic) -> u32 { return (*c).core.err }
+fn ic_set_tls_mode(c: *mut Ic, mode: u32) { (*c).tls_mode = mode }
+fn ic_set_insecure_auth(c: *mut Ic, on: bool) { imap_set_insecure_auth(&(*c).core, on) }
+
+// mode IM_PLAIN (no STARTTLS unless ic_set_tls_mode says so), IM_STARTTLS (use it when offered,
+// default), IM_TLS (TLS from the first octet, port 993). IME_READY comes when the greeting, the
+// capabilities and the TLS switch are done; then log in.
+fn ic_open(l: *mut loop.Loop, addr: u32, port: u16, mode: u32, host: str, store: *mut x509.Store,
+    now: u64, timeout_ms: i64, cb: fn(*mut Ic, u64, u32, i64), ud: u64) -> *mut Ic {
+    let p: u64 = obj_alloc[Ic]()
+    if p == 0 {
+        return 0 as *mut Ic
+    }
+    let c: *mut Ic = p as *mut Ic
+    var tm: u32 = 1
+    if mode == IM_PLAIN {
+        tm = 0
+    }
+    *c = Ic { s: 0 as *mut stream.Stream, core: imap_new(), cb: cb, ud: ud, mode: mode, tls_mode: tm,
+        store: store, now: now, host: rt.buf_new(), phase: PH_GREET, upgrading: false, closed: false }
+    push(&(*c).host, host)
+    var s: *mut stream.Stream = 0 as *mut stream.Stream
+    if mode == IM_TLS {
+        (*c).core.secure = true
+        s = stream.stream_open_tls(l, addr, port, host, store, now, timeout_ms, ic_stream_event, p)
+    } else {
+        s = stream.stream_open(l, addr, port, timeout_ms, ic_stream_event, p)
+    }
+    if s as u64 == 0 {
+        imap_free(&(*c).core)
+        rt.buf_free(&(*c).host)
+        obj_free[Ic](p)
+        return 0 as *mut Ic
+    }
+    (*c).s = s
+    return c
+}
+
+fn ic_emit(c: *mut Ic, kind: u32, arg: i64) {
+    let f: fn(*mut Ic, u64, u32, i64) = (*c).cb
+    f(c, (*c).ud, kind, arg)
+}
+
+fn ic_pump(c: *mut Ic) {
+    let n: usize = imap_out_len(&(*c).core)
+    if n > 0 && !(*c).closed {
+        stream.stream_write((*c).s, imap_out_ptr(&(*c).core), n)
+        imap_out_consume(&(*c).core, n)
+    }
+}
+
+fn ic_fail(c: *mut Ic, err: u32) {
+    if (*c).core.err == 0 {
+        (*c).core.err = err
+    }
+    (*c).core.state = IS_FAILED
+    stream.stream_abort((*c).s)
+}
+
+// capabilities are known: STARTTLS if wanted, else the client is ready
+fn ic_setup_next(c: *mut Ic) {
+    if !(*c).core.secure && (*c).tls_mode != 0 {
+        if ((*c).core.caps & ICAP_STARTTLS) != 0 {
+            (*c).phase = PH_TLS
+            imap_starttls(&(*c).core)
+            ic_pump(c)
+            return
+        }
+        if (*c).tls_mode == 2 {
+            ic_fail(c, IERR_TLS_REQUIRED)
+            return
+        }
+    }
+    (*c).phase = PH_READY
+    var pre: i64 = 0
+    if (*c).core.preauth {
+        pre = 1
+    }
+    ic_emit(c, IME_READY, pre)
+}
+
+fn ic_after_core(c: *mut Ic) {
+    let ev: u32 = imap_events(&(*c).core)
+    if (ev & IEV_FAILED) != 0 {
+        stream.stream_close((*c).s)
+        return
+    }
+    if (ev & IEV_TLS) != 0 {
+        (*c).upgrading = true
+        let h: str = bs(&(*c).host)
+        if !stream.stream_start_tls((*c).s, h, (*c).store, (*c).now) {
+            ic_fail(c, IERR_TLS_REQUIRED)
+        }
+        return
+    }
+    if (ev & IEV_GREETING) != 0 {
+        if (*c).core.preauth {
+            (*c).phase = PH_READY
+            ic_emit(c, IME_READY, 1)
+        } else if (*c).core.caps != 0 {
+            ic_setup_next(c)
+        } else {
+            (*c).phase = PH_CAP
+            imap_capability(&(*c).core)
+            ic_pump(c)
+        }
+        return
+    }
+    if (ev & IEV_DONE) != 0 {
+        if (*c).phase == PH_CAP {
+            if (*c).core.last_result == 0 {
+                ic_setup_next(c)
+            } else {
+                ic_fail(c, IERR_PROTO)
+            }
+        } else if (*c).phase == PH_CAP2 {
+            (*c).phase = PH_READY
+            (*c).core.post_tls = false
+            ic_emit(c, IME_READY, 0)
+        } else {
+            ic_emit(c, IME_DONE, (*c).core.last_result as i64)
+        }
+    } else if (ev & IEV_PUSH) != 0 && ((*c).core.kind == CK_NONE || (*c).core.state == IS_IDLE) && (*c).phase == PH_READY {
+        ic_emit(c, IME_PUSH, 0)
+    }
+    if (ev & IEV_IDLE) != 0 {
+        ic_emit(c, IME_IDLE, 0)
+    }
+    if (ev & IEV_BYE) != 0 {
+        ic_emit(c, IME_BYE, 0)
+    }
+    ic_pump(c)
+    if (ev & IEV_QUIT) != 0 {
+        stream.stream_close((*c).s)
+    }
+}
+
+fn ic_stream_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    let c: *mut Ic = ud as *mut Ic
+    if kind == stream.SE_CONNECTED {
+        if (*c).upgrading {
+            (*c).upgrading = false
+            (*c).phase = PH_CAP2
+            imap_tls_done(&(*c).core)
+            ic_pump(c)
+        }
+    } else if kind == stream.SE_DATA {
+        let n: usize = stream.stream_in_len(s)
+        let ok: bool = imap_feed(&(*c).core, stream.stream_in_ptr(s), n)
+        stream.stream_consume(s, n)
+        if !ok {
+            stream.stream_close(s)
+            return
+        }
+        ic_after_core(c)
+    } else if kind == stream.SE_CLOSED {
+        (*c).closed = true
+        imap_eof(&(*c).core)
+        ic_emit(c, IME_CLOSED, arg)
+        imap_free(&(*c).core)
+        rt.buf_free(&(*c).host)
+        obj_free[Ic](ud)
+    }
+}
+
+fn ic_login(c: *mut Ic, user: str, pass: str) -> bool {
+    let ok: bool = imap_login(&(*c).core, user, pass)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_login_plain(c: *mut Ic, user: str, pass: str) -> bool {
+    let ok: bool = imap_authenticate_plain(&(*c).core, user, pass)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_list(c: *mut Ic, reference: str, pattern: str, lsub: bool) -> bool {
+    let ok: bool = imap_list(&(*c).core, reference, pattern, lsub)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_select(c: *mut Ic, mailbox: str, read_only: bool) -> bool {
+    let ok: bool = imap_select(&(*c).core, mailbox, read_only)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_status(c: *mut Ic, mailbox: str, items: str) -> bool {
+    let ok: bool = imap_status(&(*c).core, mailbox, items)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_fetch(c: *mut Ic, seqset: str, items: str, uid: bool) -> bool {
+    let ok: bool = imap_fetch(&(*c).core, seqset, items, uid)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_search(c: *mut Ic, criteria: str, uid: bool) -> bool {
+    let ok: bool = imap_search(&(*c).core, criteria, uid)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_store(c: *mut Ic, seqset: str, mode: str, flags: str, uid: bool) -> bool {
+    let ok: bool = imap_store(&(*c).core, seqset, mode, flags, uid)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_expunge(c: *mut Ic, uidset: str) -> bool {
+    let ok: bool = imap_expunge(&(*c).core, uidset)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_noop(c: *mut Ic) -> bool {
+    let ok: bool = imap_noop(&(*c).core)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_close(c: *mut Ic) -> bool {
+    let ok: bool = imap_close(&(*c).core)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_idle(c: *mut Ic) -> bool {
+    let ok: bool = imap_idle(&(*c).core)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_idle_done(c: *mut Ic) -> bool {
+    let ok: bool = imap_idle_done(&(*c).core)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_logout(c: *mut Ic) -> bool {
+    let ok: bool = imap_logout(&(*c).core)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_raw(c: *mut Ic, line: str) -> bool {
+    let ok: bool = imap_raw(&(*c).core, line)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_discard(c: *mut Ic) {
+    imap_discard(&(*c).core)
+}
+
+fn ic_abort(c: *mut Ic) {
+    stream.stream_abort((*c).s)
+}
