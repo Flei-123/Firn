@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tools/cal_cross/run.sh -- cal.rrule against dateutil.rrule (rule + rruleset cases).
 #   CAL_CASES=1500 CAL_SEEDS="1 2 3 4" bash tools/cal_cross/run.sh      (python3 + dateutil needed)
+#   CAL_STAGES="--opt-level=dev-fast --opt-level=release-safe"  limits the compiler stages (--no-opt is slow)
 #   CAL_FUZZ=40000 CAL_FUZZ_SEEDS="1 2 3"  sets the fuzz size (tests/3604 in release-safe)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -16,7 +17,7 @@ for s in $SEEDS; do python3 tools/cal_cross/gen.py "$s" "$CASES" "$W/c.$s" > "$W
 wait
 cat "$W"/g.* | sed 's/^/  /'
 ERR=0; TOT=0; DIF=0
-for stage in --opt-level=release-fast --no-opt --opt-level=dev-fast --opt-level=release-safe; do
+for stage in ${CAL_STAGES:-"--opt-level=release-fast --no-opt --opt-level=dev-fast --opt-level=release-safe"}; do
   $FIRNC $stage -o "$W/chk" tools/cal_cross/check.fi || { echo "  FAIL compile $stage"; ERR=1; continue; }
   for s in $SEEDS; do
     out=$("$W/chk" "$W/c.$s" 2>&1); rc=$?
