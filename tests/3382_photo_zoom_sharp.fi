@@ -1,0 +1,177 @@
+// expect_exit: 0
+// tests/3382_photo_zoom_sharp.fi -- FirnCam normal photo + zoom from RAW: zoom_window geometry (even origin / size), the
+// full resolution demosaic path has less colour fringe on a slanted gray edge than the quad binning path and keeps
+// the edge sharp, a 4x zoom shows the centre magnified (edge at the centre stays an edge, output size unchanged).
+import std.io
+import std.rt
+import jpeg.jpeg
+import photo.image
+import photo.meta
+import photo.par
+import photo.camjob
+
+fn check(c: bool, msg: str) -> bool {
+    if !c { io.print(msg); io.new_line() }
+    return c
+}
+
+// RGGB mosaic 256 x 192 of a gray slanted edge: left 0.1, right 0.7, edge at x = 126.7 + y / 16, 1 px wide ramp, 10 bit
+fn make_raw(w: i32, h: i32) -> u64 {
+    let p: u64 = rt.heap_alloc(((w * h) as usize) * 2)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let e: f32 = 126.7f + (y as f32) / 16.0f
+            var t: f32 = ((x as f32) + 0.5f - e) + 0.5f
+            if t < 0.0f { t = 0.0f }
+            if t > 1.0f { t = 1.0f }
+            let v: f32 = 0.1f + 0.6f * t
+            *((p + (((y * w + x) * 2) as u64)) as *mut u16) = (64.0f + v * 959.0f + 0.5f) as u16
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return p
+}
+
+// runs a job, returns the decoded RGBA image (planar float, display encoded) or width 0
+fn run(raw: u64, w: i32, h: i32, mode: i32, zoom: f32, max_px: i32, out_w: *mut i32, out_h: *mut i32) -> image.Image {
+    var j: camjob.Job = camjob.job_new()
+    j.mode = camjob.MODE_PHOTO
+    j.raw_mode = mode
+    j.zoom = zoom
+    j.max_px = max_px
+    var k: usize = 0
+    while k < 4 { meta.meta_set_black(&j.meta, k, 64.0f, 1023.0f); k = k + 1 }
+    k = 0
+    while k < 4 { meta.meta_set_wb(&j.meta, k, 1.0f); k = k + 1 }
+    camjob.job_add_shot(&j, camjob.SHOT_RAW, w, h, raw, ((w * h) as usize) * 2, 10000000, 400)
+    var res: image.Image = image.img_new(1, 1, 3)
+    if camjob.run_job(&j) {
+        var dj: jpeg.JpegImage = jpeg.jpeg_image_new()
+        let dok: bool = jpeg.jpeg_decode(j.out, j.out_n, &dj) catch false
+        if dok {
+            image.img_free(&res)
+            *out_w = dj.w as i32
+            *out_h = dj.h as i32
+            res = image.img_from_rgba8(rt.buf_ptr(&dj.px), dj.w as i32, dj.h as i32)
+        }
+        jpeg.jpeg_image_free(&dj)
+    } else {
+        *out_w = 0
+    }
+    camjob.job_free(&j)
+    return res
+}
+
+// worst chroma (max - min over R, G, B) in the middle rows and the 10-90 % rise width of the luma edge in output pixels
+fn edge_stats(im: *mut image.Image, w: i32, h: i32, rise: *mut f32) -> f32 {
+    var worst: f32 = 0.0f
+    var y: i32 = h / 4
+    while y < h - h / 4 {
+        var x: i32 = 2
+        while x < w - 2 {
+            let r: f32 = image.img_get(im, 0, x, y)
+            let g: f32 = image.img_get(im, 1, x, y)
+            let b: f32 = image.img_get(im, 2, x, y)
+            var mx: f32 = r
+            var mn: f32 = r
+            if g > mx { mx = g }
+            if b > mx { mx = b }
+            if g < mn { mn = g }
+            if b < mn { mn = b }
+            if mx - mn > worst { worst = mx - mn }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    // rise: row-averaged green profile over the middle rows
+    var prof: [f32; 512] = [0.0f; 512]
+    var n: f32 = 0.0f
+    y = h / 3
+    while y < h - h / 3 {
+        var x: i32 = 0
+        while x < w { prof[x as usize] = prof[x as usize] + image.img_get(im, 1, x, y); x = x + 1 }
+        n = n + 1.0f
+        y = y + 1
+    }
+    var lo: f32 = 1.0e9f
+    var hi: f32 = 0.0f - 1.0e9f
+    var x2: i32 = 0
+    while x2 < w {
+        prof[x2 as usize] = prof[x2 as usize] / n
+        if prof[x2 as usize] < lo { lo = prof[x2 as usize] }
+        if prof[x2 as usize] > hi { hi = prof[x2 as usize] }
+        x2 = x2 + 1
+    }
+    // a slanted edge smears the row average over (rows / 16) px: measure inside one row instead (middle row)
+    y = h / 2
+    var a10: f32 = 0.0f - 1.0f
+    var a90: f32 = 0.0f - 1.0f
+    x2 = 1
+    while x2 < w {
+        let v0: f32 = image.img_get(im, 1, x2 - 1, y)
+        let v1: f32 = image.img_get(im, 1, x2, y)
+        let t0: f32 = (v0 - lo) / (hi - lo)
+        let t1: f32 = (v1 - lo) / (hi - lo)
+        if a10 < 0.0f && t1 >= 0.1f { a10 = ((x2 - 1) as f32) + (0.1f - t0) / (t1 - t0 + 1.0e-6f) }
+        if a90 < 0.0f && t1 >= 0.9f { a90 = ((x2 - 1) as f32) + (0.9f - t0) / (t1 - t0 + 1.0e-6f) }
+        x2 = x2 + 1
+    }
+    *rise = a90 - a10
+    return worst
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var ok: bool = true
+    par.init(3)
+    // ---- zoom window geometry
+    var x0: i32 = 0
+    var y0: i32 = 0
+    var cw: i32 = 0
+    var ch: i32 = 0
+    camjob.zoom_window(4096, 3072, 1.0f, &x0, &y0, &cw, &ch)
+    ok = check(x0 == 0 && y0 == 0 && cw == 4096 && ch == 3072, "zoom 1 = whole frame") && ok
+    camjob.zoom_window(4096, 3072, 8.0f, &x0, &y0, &cw, &ch)
+    ok = check(x0 == 1792 && y0 == 1344 && cw == 512 && ch == 384, "zoom 8 = centre 512 x 384") && ok
+    camjob.zoom_window(4000, 3000, 2.5f, &x0, &y0, &cw, &ch)
+    ok = check((x0 & 1) == 0 && (y0 & 1) == 0 && (cw & 1) == 0 && (ch & 1) == 0 && cw == 1600 && ch == 1200, "zoom 2.5 even and centred") && ok
+    camjob.zoom_window(100, 80, 40.0f, &x0, &y0, &cw, &ch)
+    ok = check(cw >= 16 && ch >= 16 && x0 >= 0 && y0 >= 0 && x0 + cw <= 100 && y0 + ch <= 80, "extreme zoom stays inside") && ok
+    camjob.zoom_window(100, 80, 0.3f, &x0, &y0, &cw, &ch)
+    ok = check(cw == 100 && ch == 80, "zoom below 1 = whole frame") && ok
+    // ---- demosaic path vs quad binning on a slanted gray edge, output 128 x 96
+    let W: i32 = 256
+    let H: i32 = 192
+    let raw: u64 = make_raw(W, H)
+    var ow: i32 = 0
+    var oh: i32 = 0
+    var q: image.Image = run(raw, W, H, camjob.RAW_QUAD, 1.0f, 12288, &ow, &oh)
+    ok = check(ow == 128 && oh == 96, "quad output size") && ok
+    var qr: f32 = 0.0f
+    let qc: f32 = edge_stats(&q, ow, oh, &qr)
+    image.img_free(&q)
+    var d: image.Image = run(raw, W, H, camjob.RAW_DEMOSAIC, 1.0f, 12288, &ow, &oh)
+    ok = check(ow == 128 && oh == 96, "demosaic output size") && ok
+    var dr: f32 = 0.0f
+    let dc: f32 = edge_stats(&d, ow, oh, &dr)
+    image.img_free(&d)
+    ok = check(qc > 0.10f, "the quad path shows colour fringes on the slanted edge (control)") && ok
+    ok = check(dc < 0.04f && dc * 4.0f < qc, "demosaic path: colour fringe at most a quarter of the quad path") && ok
+    ok = check(dr < qr * 1.15f && dr < 2.0f, "demosaic path keeps the edge sharp (10-90 % rise)") && ok
+    // ---- 4x zoom: same output size, the edge at the centre still sharp and the colours neutral
+    var z: image.Image = run(raw, W, H, camjob.RAW_DEMOSAIC, 4.0f, 12288, &ow, &oh)
+    ok = check(ow == 128 && oh == 96, "zoom output size") && ok
+    var zr: f32 = 0.0f
+    let zc: f32 = edge_stats(&z, ow, oh, &zr)
+    ok = check(zc < 0.04f, "zoom: neutral edge") && ok
+    ok = check(zr < 4.0f && zr > 0.5f, "zoom: edge stays sharp (rise in output px)") && ok
+    image.img_free(&z)
+    rt.heap_free(raw, ((W * H) as usize) * 2)
+    par.shutdown()
+    if ok { io.print("ok") } else { io.print("FAIL") }
+    if ok { return 0 }
+    return 1
+}

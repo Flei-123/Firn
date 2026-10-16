@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/demosaic.fi -- photo.demosaic: edge directed Bayer demosaic straight from RAW16 (FirnCam).
+//
+//     import photo.demosaic
+//
+//     var black: [f32; 4] = [64.0f, 64.0f, 64.0f, 64.0f]       // per CFA site (y & 1) * 2 + (x & 1)
+//     // whole 4096 x 3072 mosaic -> linear RGB at full resolution:
+//     var rgb: image.Image = demosaic.demosaic_u16(raw, 4096, 3072, 0, 0, 4096, 3072, meta.CFA_RGGB, &black[0], 1023.0f)
+//     // only a window (x0, y0 even), e.g. the centre of an 8x zoom:
+//     var crop: image.Image = demosaic.demosaic_u16(raw, 4096, 3072, 1792, 1344, 512, 384, cfa, &black[0], white)
+//
+// Hamilton-Adams: green is interpolated along the direction with the smaller gradient (horizontal / vertical, the
+// second derivative of the own colour sharpens it), red and blue follow as colour differences to green (along
+// the row / column at green sites, along the smaller diagonal gradient at the other colour). No zipper along
+// slanted edges, no colour fringe like a quad binning (R, G, B of a quad sit at different places). The mosaic is
+// read as u16 with black / white level applied; a 128 row band is processed at a time, so the temporary memory
+// is a few MB, not another frame. Values are linear, may be slightly negative (noise below black), not clamped.
+// The window must start at even coordinates (CFA phase); borders of the sensor are mirrored with parity kept.
+import std.rt
+import photo.image
+import photo.meta
+import photo.par
+
+export {
+    demosaic_u16, BAND,
+}
+
+const BAND: i32 = 128
+const PAD: i32 = 4
+
+struct DmCtx {
+    p: u64,
+    rw: i32,
+    rh: i32,
+    x0: i32,
+    y0: i32,
+    w: i32,
+    h: i32,
+    black: [f32; 4],
+    inv: [f32; 4],
+    col: [i32; 4],
+    by0: i32, // band start (window rows)
+    m: u64, // padded mosaic band: (BAND + 2 PAD) rows x (w + 2 PAD)
+    g: u64, // padded green band, same shape
+    mw: i32,
+    out: *mut image.Image,
+    rows: i32, // rows of this band
+}
+
+// parity preserving mirror into [0, n)
+#[inline]
+fn mirror(v: i32, n: i32) -> i32 {
+    var a: i32 = v
+    if a < 0 { a = 0 - a }
+    if a >= n { a = 2 * (n - 1) - a }
+    if a < 0 { a = 0 }
+    return a
+}
+
+#[inline]
+fn mget(m: u64, mw: i32, x: i32, y: i32) -> f32 {
+    return *((m + ((y * mw + x) * 4) as u64) as *mut f32)
+}
+
+#[inline]
+fn fabs(a: f32) -> f32 {
+    if a < 0.0f { return 0.0f - a }
+    return a
+}
+
+// padded mosaic band: window row r (-PAD .. rows + PAD - 1 relative to the band) -> index r + PAD
+fn fill_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut DmCtx = ctx as *mut DmCtx
+    var r: i32 = lo as i32
+    while r < (hi as i32) {
+        let wy: i32 = (*c).by0 + r - PAD // window row
+        let sy: i32 = mirror((*c).y0 + wy, (*c).rh) // sensor row
+        var x: i32 = 0
+        while x < (*c).mw {
+            let sx: i32 = mirror((*c).x0 + x - PAD, (*c).rw)
+            let site: i32 = ((sy & 1) * 2) + (sx & 1)
+            let raw: f32 = (*(((*c).p + (((sy * (*c).rw + sx) * 2) as u64)) as *mut u16)) as f32
+            *(((*c).m + (((r * (*c).mw + x) * 4) as u64)) as *mut f32) = (raw - (*c).black[site as usize]) * (*c).inv[site as usize]
+            x = x + 1
+        }
+        r = r + 1
+    }
+}
+
+// green everywhere in the padded band except the outer 2 rows / columns (they only feed the neighbours' taps)
+fn green_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut DmCtx = ctx as *mut DmCtx
+    let m: u64 = (*c).m
+    let mw: i32 = (*c).mw
+    var r: i32 = lo as i32
+    while r < (hi as i32) {
+        // r counts band rows 2 .. rows + 2 PAD - 3 (callers pass the shifted range)
+        var x: i32 = 2
+        while x < mw - 2 {
+            let site: i32 = (((r - PAD) & 1) * 2) + ((x - PAD) & 1)
+            let v: f32 = mget(m, mw, x, r)
+            var g: f32 = v
+            if (*c).col[site as usize] != 1 {
+                let l1: f32 = mget(m, mw, x - 1, r)
+                let r1: f32 = mget(m, mw, x + 1, r)
+                let u1: f32 = mget(m, mw, x, r - 1)
+                let d1: f32 = mget(m, mw, x, r + 1)
+                let ch: f32 = 2.0f * v - mget(m, mw, x - 2, r) - mget(m, mw, x + 2, r)
+                let cv: f32 = 2.0f * v - mget(m, mw, x, r - 2) - mget(m, mw, x, r + 2)
+                let dh: f32 = fabs(l1 - r1) + fabs(ch)
+                let dv: f32 = fabs(u1 - d1) + fabs(cv)
+                let gh: f32 = 0.5f * (l1 + r1) + 0.25f * ch
+                let gv: f32 = 0.5f * (u1 + d1) + 0.25f * cv
+                if dh < dv { g = gh } else if dv < dh { g = gv } else { g = 0.5f * (gh + gv) }
+            }
+            *(((*c).g + (((r * mw + x) * 4) as u64)) as *mut f32) = g
+            x = x + 1
+        }
+        r = r + 1
+    }
+}
+
+fn rgb_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut DmCtx = ctx as *mut DmCtx
+    let m: u64 = (*c).m
+    let g: u64 = (*c).g
+    let mw: i32 = (*c).mw
+    let out: *mut image.Image = (*c).out
+    var yy: i32 = lo as i32
+    while yy < (hi as i32) {
+        let r: i32 = yy + PAD // padded band row
+        var x: i32 = 0
+        while x < (*c).w {
+            let px: i32 = x + PAD
+            let site: i32 = ((yy & 1) * 2) + (x & 1)
+            let own: i32 = (*c).col[site as usize]
+            let v: f32 = mget(m, mw, px, r)
+            let gc: f32 = mget(g, mw, px, r)
+            var rr: f32 = 0.0f
+            let gg: f32 = gc
+            var bb: f32 = 0.0f
+            if own == 1 {
+                // green site: red / blue from the row or column neighbours (the one that has that colour)
+                let sx: i32 = (x + 1) & 1
+                let hsite: i32 = ((yy & 1) * 2) + sx
+                let hc: i32 = (*c).col[hsite as usize] // colour of the horizontal neighbours
+                let dh: f32 = 0.5f * ((mget(m, mw, px - 1, r) - mget(g, mw, px - 1, r)) + (mget(m, mw, px + 1, r) - mget(g, mw, px + 1, r)))
+                let dv: f32 = 0.5f * ((mget(m, mw, px, r - 1) - mget(g, mw, px, r - 1)) + (mget(m, mw, px, r + 1) - mget(g, mw, px, r + 1)))
+                if hc == 0 { rr = gc +dh; bb = gc +dv } else { bb = gc +dh; rr = gc +dv }
+            } else {
+                // red or blue site: the other colour from the diagonals (smaller gradient wins)
+                let a: f32 = mget(m, mw, px - 1, r - 1)
+                let b: f32 = mget(m, mw, px + 1, r + 1)
+                let cc: f32 = mget(m, mw, px - 1, r + 1)
+                let d: f32 = mget(m, mw, px + 1, r - 1)
+                let da: f32 = (a - mget(g, mw, px - 1, r - 1)) + (b - mget(g, mw, px + 1, r + 1))
+                let db: f32 = (cc - mget(g, mw, px - 1, r + 1)) + (d - mget(g, mw, px + 1, r - 1))
+                let ga: f32 = fabs(a - b)
+                let gb: f32 = fabs(cc - d)
+                var diff: f32 = 0.25f * (da + db)
+                if ga < gb { diff = 0.5f * da } else if gb < ga { diff = 0.5f * db }
+                if own == 0 { rr = v; bb = gc +diff } else { bb = v; rr = gc +diff }
+            }
+            image.img_set(out, 0, x, (*c).by0 + yy, rr)
+            image.img_set(out, 1, x, (*c).by0 + yy, gg)
+            image.img_set(out, 2, x, (*c).by0 + yy, bb)
+            x = x + 1
+        }
+        yy = yy + 1
+    }
+}
+
+// RAW16 mosaic (rw x rh samples, tightly packed) -> linear RGB of the window (x0, y0, w, h); x0 / y0 even.
+// black: 4 levels per site (y & 1) * 2 + (x & 1); white: the white level (same for all sites).
+fn demosaic_u16(p: u64, rw: i32, rh: i32, x0: i32, y0: i32, w: i32, h: i32, cfa: u32, black: *mut f32, white: f32) -> image.Image {
+    var out: image.Image = image.img_new(w, h, 3)
+    let mw: i32 = w + 2 * PAD
+    let band_rows: i32 = BAND + 2 * PAD
+    let mp: u64 = rt.heap_alloc(((mw * band_rows) as usize) * 4)
+    let gp: u64 = rt.heap_alloc(((mw * band_rows) as usize) * 4)
+    var c: DmCtx = DmCtx {
+        p: p, rw: rw, rh: rh, x0: x0, y0: y0, w: w, h: h,
+        black: [0.0f; 4], inv: [0.0f; 4], col: [0; 4],
+        by0: 0, m: mp, g: gp, mw: mw, out: &out, rows: 0,
+    }
+    var s: usize = 0
+    while s < 4 {
+        c.black[s] = *((black as u64 + ((s * 4) as u64)) as *mut f32)
+        var span: f32 = white - c.black[s]
+        if span < 1.0f { span = 1.0f }
+        c.inv[s] = 1.0f / span
+        c.col[s] = meta.cfa_color(cfa, s as u32) as i32
+        if c.col[s] > 2 { c.col[s] = 1 }
+        s = s + 1
+    }
+    var by0: i32 = 0
+    while by0 < h {
+        var rows: i32 = h - by0
+        if rows > BAND { rows = BAND }
+        c.by0 = by0
+        c.rows = rows
+        // padded rows 0 .. rows + 2 PAD - 1
+        par.rows(rows + 2 * PAD, 8, fill_rows, (&c) as u64)
+        // green for padded rows 2 .. rows + 2 PAD - 3: shift by 2 inside the body through a wrapper range
+        green_band(&c, 2, rows + 2 * PAD - 2)
+        par.rows(rows, 8, rgb_rows, (&c) as u64)
+        by0 = by0 + rows
+    }
+    rt.heap_free(mp, ((mw * band_rows) as usize) * 4)
+    rt.heap_free(gp, ((mw * band_rows) as usize) * 4)
+    return out
+}
+
+struct GBand {
+    c: *mut DmCtx,
+    off: i32,
+}
+
+fn green_shift(ctx: u64, lo: u64, hi: u64) {
+    let b: *mut GBand = ctx as *mut GBand
+    // run green_rows over [lo + off, hi + off) of the same context
+    green_rows((*b).c as u64, lo + ((*b).off as u64), hi + ((*b).off as u64))
+}
+
+fn green_band(c: *mut DmCtx, first: i32, last: i32) {
+    var b: GBand = GBand { c: c, off: first }
+    par.rows(last - first, 8, green_shift, (&b) as u64)
+}

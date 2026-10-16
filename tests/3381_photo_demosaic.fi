@@ -1,0 +1,178 @@
+// expect_exit: 0
+// tests/3381_photo_demosaic.fi -- photo.demosaic (Hamilton-Adams from RAW16): exact on linear ramps for all four CFA
+// orders, a window equals the crop of the full frame (also across the 128 row band borders), no colour zipper on a
+// gray vertical / slanted edge, random windows at the sensor border stay finite (fuzz).
+import std.io
+import std.rt
+import photo.image
+import photo.meta
+import photo.par
+import photo.demosaic
+
+fn check(c: bool, msg: str) -> bool {
+    if !c { io.print(msg); io.new_line() }
+    return c
+}
+
+fn fabs(a: f32) -> f32 {
+    if a < 0.0f { return 0.0f - a }
+    return a
+}
+
+// truth: three linear ramps
+fn truth(c: i32, x: i32, y: i32, w: i32, h: i32) -> f32 {
+    let fx: f32 = (x as f32) / (w as f32)
+    let fy: f32 = (y as f32) / (h as f32)
+    if c == 0 { return 0.15f + 0.60f * fx + 0.10f * fy }
+    if c == 1 { return 0.30f + 0.30f * fx + 0.20f * fy }
+    return 0.65f - 0.40f * fx + 0.05f * fy
+}
+
+// kind 0: ramps; 1: gray vertical step at x = 31.4; 2: gray slanted step; 3: random
+fn make_raw(w: i32, h: i32, cfa: u32, kind: i32, rng: *mut image.Rng) -> u64 {
+    let p: u64 = rt.heap_alloc(((w * h) as usize) * 2)
+    var y: i32 = 0
+    while y < h {
+        var x: i32 = 0
+        while x < w {
+            let site: u32 = (((y & 1) * 2 + (x & 1))) as u32
+            let col: i32 = meta.cfa_color(cfa, site) as i32
+            var v: f32 = 0.0f
+            if kind == 0 { v = truth(col, x, y, w, h) }
+            if kind == 1 || kind == 2 {
+                var e: f32 = 31.4f
+                if kind == 2 { e = 31.4f + (y as f32) / 6.0f }
+                var t: f32 = ((x as f32) + 0.5f - e) + 0.5f
+                if t < 0.0f { t = 0.0f }
+                if t > 1.0f { t = 1.0f }
+                v = 0.1f + 0.7f * t
+            }
+            if kind == 3 { v = image.rng_uniform(rng) }
+            *((p + (((y * w + x) * 2) as u64)) as *mut u16) = (64.0f + v * 959.0f + 0.5f) as u16
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return p
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var ok: bool = true
+    par.init(3)
+    var rng: image.Rng = image.rng_new(5)
+    var black: [f32; 4] = [64.0f, 64.0f, 64.0f, 64.0f]
+    // ---- ramps, every CFA order, size across the band border
+    let W: i32 = 70
+    let H: i32 = 300
+    var cfa: u32 = 0
+    while cfa < 4 {
+        let raw: u64 = make_raw(W, H, cfa, 0, &rng)
+        var im: image.Image = demosaic.demosaic_u16(raw, W, H, 0, 0, W, H, cfa, &black[0], 1023.0f)
+        var worst: f32 = 0.0f
+        var y: i32 = 4
+        while y < H - 4 {
+            var x: i32 = 4
+            while x < W - 4 {
+                var c: i32 = 0
+                while c < 3 {
+                    let e: f32 = fabs(image.img_get(&im, c, x, y) - truth(c, x, y, W, H))
+                    if e > worst { worst = e }
+                    c = c + 1
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        ok = check(worst < 0.004f, "ramp error (HA is exact on linear ramps up to the 10 bit quantisation)") && ok
+        // window = crop of the full frame
+        var wn: image.Image = demosaic.demosaic_u16(raw, W, H, 10, 130, 40, 150, cfa, &black[0], 1023.0f)
+        var wd: f32 = 0.0f
+        var yy: i32 = 0
+        while yy < 150 {
+            var xx: i32 = 0
+            while xx < 40 {
+                var c: i32 = 0
+                while c < 3 {
+                    let e: f32 = fabs(image.img_get(&wn, c, xx, yy) - image.img_get(&im, c, xx + 10, yy + 130))
+                    if e > wd { wd = e }
+                    c = c + 1
+                }
+                xx = xx + 1
+            }
+            yy = yy + 1
+        }
+        ok = check(wd < 1.0e-6f, "window equals the crop of the full frame") && ok
+        image.img_free(&wn)
+        image.img_free(&im)
+        rt.heap_free(raw, ((W * H) as usize) * 2)
+        cfa = cfa + 1
+    }
+    // ---- gray edges: no colour zipper (chroma = max - min over R, G, B)
+    var kind: i32 = 1
+    while kind <= 2 {
+        let raw: u64 = make_raw(64, 64, 0 as u32, kind, &rng)
+        var im: image.Image = demosaic.demosaic_u16(raw, 64, 64, 0, 0, 64, 64, 0 as u32, &black[0], 1023.0f)
+        var worst: f32 = 0.0f
+        var y: i32 = 4
+        while y < 60 {
+            var x: i32 = 4
+            while x < 60 {
+                let r: f32 = image.img_get(&im, 0, x, y)
+                let g: f32 = image.img_get(&im, 1, x, y)
+                let b: f32 = image.img_get(&im, 2, x, y)
+                var mx: f32 = r
+                var mn: f32 = r
+                if g > mx { mx = g }
+                if b > mx { mx = b }
+                if g < mn { mn = g }
+                if b < mn { mn = b }
+                if mx - mn > worst { worst = mx - mn }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        if kind == 1 { ok = check(worst < 0.02f, "vertical gray edge: colour zipper") && ok }
+        if kind == 2 { ok = check(worst < 0.06f, "slanted gray edge: colour zipper") && ok }
+        image.img_free(&im)
+        rt.heap_free(raw, 64 * 64 * 2)
+        kind = kind + 1
+    }
+    // ---- fuzz: random content, windows touching the sensor border, odd sizes
+    let FW: i32 = 53
+    let FH: i32 = 41
+    let fraw: u64 = make_raw(FW, FH, 1 as u32, 3, &rng)
+    var it: i32 = 0
+    var fok: bool = true
+    while it < 60 {
+        let x0: i32 = 2 * ((image.rng_uniform(&rng) * 20.0f) as i32)
+        let y0: i32 = 2 * ((image.rng_uniform(&rng) * 14.0f) as i32)
+        var w: i32 = 1 + ((image.rng_uniform(&rng) * 60.0f) as i32)
+        var h: i32 = 1 + ((image.rng_uniform(&rng) * 50.0f) as i32)
+        if x0 + w > FW { w = FW - x0 }
+        if y0 + h > FH { h = FH - y0 }
+        var im: image.Image = demosaic.demosaic_u16(fraw, FW, FH, x0, y0, w, h, 1 as u32, &black[0], 1023.0f)
+        var y: i32 = 0
+        while y < h {
+            var x: i32 = 0
+            while x < w {
+                var c: i32 = 0
+                while c < 3 {
+                    let v: f32 = image.img_get(&im, c, x, y)
+                    if !(v > 0.0f - 2.0f && v < 3.0f) { fok = false }
+                    c = c + 1
+                }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        image.img_free(&im)
+        it = it + 1
+    }
+    ok = check(fok, "fuzz: finite") && ok
+    rt.heap_free(fraw, ((FW * FH) as usize) * 2)
+    par.shutdown()
+    if ok { io.print("ok") } else { io.print("FAIL") }
+    if ok { return 0 }
+    return 1
+}

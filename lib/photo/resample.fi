@@ -1,0 +1,288 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/photo/resample.fi -- photo.resample: Lanczos-3 resampler with crop, for down- AND upscaling (FirnCam).
+//
+//     import photo.resample
+//
+//     // whole image to 2048 x 1536:
+//     var big: image.Image = resample.resample(&src, 0.0f, 0.0f, src.w as f32, src.h as f32, 2048, 1536)
+//     // 8x digital zoom = the centre 1/8 window, resampled up to the full output size:
+//     var z: image.Image = resample.resample(&src, cx, cy, src.w as f32 / 8.0f, src.h as f32 / 8.0f, 2048, 1536)
+//
+// The window (sx0, sy0, sw, sh) in source pixels (fractions allowed) is mapped onto nw x nh. Separable Lanczos-3;
+// when shrinking the kernel is widened by the scale factor, so the result is band limited (no aliasing, no box
+// blur like a plain average). Ringing guard: every output sample is clamped to the range of the source taps
+// closest to it (|t| < 1 kernel unit), so overshoot at hard edges (no bright / dark halo) is cut, while the sharp
+// transition stays. Works on any number of channels; linear light stays linear. Rows run on the photo.par pool.
+import std.rt
+import std.math
+import photo.image
+import photo.par
+
+export {
+    resample, lanczos3, plan_axis_size,
+}
+
+const TAPS_MAX: i32 = 64
+
+// Lanczos-3 kernel (support |t| < 3)
+fn lanczos3(t: f32) -> f32 {
+    var a: f32 = t
+    if a < 0.0f { a = 0.0f - a }
+    if a >= 3.0f { return 0.0f }
+    if a < 0.0001f { return 1.0f }
+    let pt: f64 = 3.14159265358979 * (a as f64)
+    return ((math.sin(pt) * math.sin(pt / 3.0) * 3.0) / (pt * pt)) as f32
+}
+
+// weights of one axis: for each of the n output positions the first source index, the tap count and the weights
+struct Plan {
+    n: i32,
+    taps: i32,
+    first: u64, // [n] i32
+    cnt: u64, // [n] i32
+    wts: u64, // [n * taps] f32
+    core0: u64, // [n] i32  first tap index (relative) of the clamp core
+    core1: u64, // [n] i32  last tap index (relative, inclusive) of the clamp core
+}
+
+// the taps per output sample for a window of `sw` source px mapped to n outputs
+fn plan_axis_size(sw: f32, n: i32) -> i32 {
+    var fs: f32 = sw / (n as f32)
+    if fs < 1.0f { fs = 1.0f }
+    return ((fs * 6.0f) as i32) + 3
+}
+
+fn floori(x: f32) -> i32 {
+    var i: i32 = x as i32
+    if (i as f32) > x { i = i - 1 }
+    return i
+}
+
+fn plan_new(s0: f32, sw: f32, n: i32, src_n: i32) -> Plan {
+    var fs: f32 = sw / (n as f32)
+    let scale: f32 = fs
+    if fs < 1.0f { fs = 1.0f }
+    let taps: i32 = plan_axis_size(sw, n)
+    var p: Plan = Plan {
+        n: n, taps: taps,
+        first: rt.heap_alloc((n as usize) * 4), cnt: rt.heap_alloc((n as usize) * 4),
+        wts: rt.heap_alloc(((n * taps) as usize) * 4),
+        core0: rt.heap_alloc((n as usize) * 4), core1: rt.heap_alloc((n as usize) * 4),
+    }
+    var i: i32 = 0
+    while i < n {
+        let c: f32 = s0 + ((i as f32) + 0.5f) * scale // centre in source px (pixel centres at +0.5)
+        let lo: i32 = floori(c - 3.0f * fs)
+        var cntv: i32 = ((6.0f * fs) as i32) + 3
+        if cntv > taps { cntv = taps }
+        var sum: f32 = 0.0f
+        var k: i32 = 0
+        var c0: i32 = cntv
+        var c1: i32 = 0 - 1
+        while k < cntv {
+            let t: f32 = (((lo + k) as f32) + 0.5f - c) / fs
+            let wv: f32 = lanczos3(t)
+            *((p.wts + (((i * taps + k) * 4) as u64)) as *mut f32) = wv
+            sum = sum + wv
+            var at: f32 = t
+            if at < 0.0f { at = 0.0f - at }
+            if at < 1.0f {
+                if k < c0 { c0 = k }
+                if k > c1 { c1 = k }
+            }
+            k = k + 1
+        }
+        if c1 < c0 { c0 = 0; c1 = cntv - 1 }
+        k = 0
+        while k < cntv {
+            let a: u64 = p.wts + (((i * taps + k) * 4) as u64)
+            *(a as *mut f32) = *(a as *mut f32) / sum
+            k = k + 1
+        }
+        *((p.first + ((i * 4) as u64)) as *mut i32) = lo
+        *((p.cnt + ((i * 4) as u64)) as *mut i32) = cntv
+        *((p.core0 + ((i * 4) as u64)) as *mut i32) = c0
+        *((p.core1 + ((i * 4) as u64)) as *mut i32) = c1
+        i = i + 1
+    }
+    return p
+}
+
+fn plan_free(p: *mut Plan) {
+    let n: usize = (*p).n as usize
+    rt.heap_free((*p).first, n * 4)
+    rt.heap_free((*p).cnt, n * 4)
+    rt.heap_free((*p).wts, n * ((*p).taps as usize) * 4)
+    rt.heap_free((*p).core0, n * 4)
+    rt.heap_free((*p).core1, n * 4)
+}
+
+#[inline]
+fn pi32(base: u64, i: i32) -> i32 { return *((base + ((i * 4) as u64)) as *mut i32) }
+
+struct HCtx {
+    src: u64, // plane (sw x sh)
+    sw: i32,
+    dst: u64, // plane (nw x rows)
+    plan: *mut Plan,
+    y0: i32, // first source row handled
+}
+
+// horizontal pass: source rows y0 .. -> dst rows (0 ..), one dst row per source row
+fn h_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut HCtx = ctx as *mut HCtx
+    let pl: *mut Plan = (*c).plan
+    let nw: i32 = (*pl).n
+    let taps: i32 = (*pl).taps
+    let sw: i32 = (*c).sw
+    var r: i32 = lo as i32
+    while r < (hi as i32) {
+        let rowp: u64 = (*c).src + ((((*c).y0 + r) * sw * 4) as u64)
+        var x: i32 = 0
+        while x < nw {
+            let f: i32 = pi32((*pl).first, x)
+            let n: i32 = pi32((*pl).cnt, x)
+            let k0: i32 = pi32((*pl).core0, x)
+            let k1: i32 = pi32((*pl).core1, x)
+            let wp: u64 = (*pl).wts + (((x * taps) * 4) as u64)
+            var acc: f32 = 0.0f
+            if f >= 0 && f + n <= sw {
+                let sp: u64 = rowp + ((f * 4) as u64)
+                var k: i32 = 0
+                while k < n {
+                    acc = acc + *((sp + ((k * 4) as u64)) as *mut f32) * *((wp + ((k * 4) as u64)) as *mut f32)
+                    k = k + 1
+                }
+            } else {
+                var k: i32 = 0
+                while k < n {
+                    var si: i32 = f + k
+                    if si < 0 { si = 0 }
+                    if si >= sw { si = sw - 1 }
+                    acc = acc + *((rowp + ((si * 4) as u64)) as *mut f32) * *((wp + ((k * 4) as u64)) as *mut f32)
+                    k = k + 1
+                }
+            }
+            var mn: f32 = 1.0e30f
+            var mx: f32 = 0.0f - 1.0e30f
+            var q: i32 = k0
+            while q <= k1 {
+                var si: i32 = f + q
+                if si < 0 { si = 0 }
+                if si >= sw { si = sw - 1 }
+                let v: f32 = *((rowp + ((si * 4) as u64)) as *mut f32)
+                if v < mn { mn = v }
+                if v > mx { mx = v }
+                q = q + 1
+            }
+            if acc < mn { acc = mn }
+            if acc > mx { acc = mx }
+            *(((*c).dst + ((((r * nw) + x) * 4) as u64)) as *mut f32) = acc
+            x = x + 1
+        }
+        r = r + 1
+    }
+}
+
+struct VCtx {
+    tmp: u64, // plane (nw x trows), row 0 = source row ty0
+    nw: i32,
+    trows: i32,
+    ty0: i32,
+    dst: u64, // plane (nw x nh)
+    plan: *mut Plan,
+}
+
+// vertical pass: the output row is accumulated tap by tap over whole rows (cache friendly)
+fn v_rows(ctx: u64, lo: u64, hi: u64) {
+    let c: *mut VCtx = ctx as *mut VCtx
+    let pl: *mut Plan = (*c).plan
+    let taps: i32 = (*pl).taps
+    let nw: i32 = (*c).nw
+    var y: i32 = lo as i32
+    while y < (hi as i32) {
+        let f: i32 = pi32((*pl).first, y)
+        let n: i32 = pi32((*pl).cnt, y)
+        let k0: i32 = pi32((*pl).core0, y)
+        let k1: i32 = pi32((*pl).core1, y)
+        let drow: u64 = (*c).dst + (((y * nw) * 4) as u64)
+        var x: i32 = 0
+        while x < nw {
+            *((drow + ((x * 4) as u64)) as *mut f32) = 0.0f
+            x = x + 1
+        }
+        var k: i32 = 0
+        while k < n {
+            var si: i32 = f + k - (*c).ty0
+            if si < 0 { si = 0 }
+            if si >= (*c).trows { si = (*c).trows - 1 }
+            let wv: f32 = *(((*pl).wts + (((y * taps + k) * 4) as u64)) as *mut f32)
+            let srow: u64 = (*c).tmp + (((si * nw) * 4) as u64)
+            x = 0
+            while x < nw {
+                let da: u64 = drow + ((x * 4) as u64)
+                *(da as *mut f32) = *(da as *mut f32) + wv * *((srow + ((x * 4) as u64)) as *mut f32)
+                x = x + 1
+            }
+            k = k + 1
+        }
+        x = 0
+        while x < nw {
+            var mn: f32 = 1.0e30f
+            var mx: f32 = 0.0f - 1.0e30f
+            var q: i32 = k0
+            while q <= k1 {
+                var si: i32 = f + q - (*c).ty0
+                if si < 0 { si = 0 }
+                if si >= (*c).trows { si = (*c).trows - 1 }
+                let v: f32 = *(((*c).tmp + ((((si * nw) + x) * 4) as u64)) as *mut f32)
+                if v < mn { mn = v }
+                if v > mx { mx = v }
+                q = q + 1
+            }
+            let da: u64 = drow + ((x * 4) as u64)
+            var acc: f32 = *(da as *mut f32)
+            if acc < mn { acc = mn }
+            if acc > mx { acc = mx }
+            *(da as *mut f32) = acc
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// the window (sx0, sy0, sw, sh) of `src` resampled to nw x nh (new image, `src` is untouched)
+fn resample(src: *mut image.Image, sx0: f32, sy0: f32, sw: f32, sh: f32, nw: i32, nh: i32) -> image.Image {
+    var d: image.Image = image.img_new(nw, nh, (*src).ch)
+    var px: Plan = plan_new(sx0, sw, nw, (*src).w)
+    var py: Plan = plan_new(sy0, sh, nh, (*src).h)
+    // source rows that the vertical taps can touch
+    var ty0: i32 = pi32(py.first, 0)
+    var ty1: i32 = ty0
+    var i: i32 = 0
+    while i < nh {
+        let a: i32 = pi32(py.first, i)
+        let b: i32 = a + pi32(py.cnt, i) - 1
+        if a < ty0 { ty0 = a }
+        if b > ty1 { ty1 = b }
+        i = i + 1
+    }
+    if ty0 < 0 { ty0 = 0 }
+    if ty0 > (*src).h - 1 { ty0 = (*src).h - 1 }
+    if ty1 >= (*src).h { ty1 = (*src).h - 1 }
+    if ty1 < ty0 { ty1 = ty0 }
+    let trows: i32 = ty1 - ty0 + 1
+    let tmp: u64 = rt.heap_alloc(((nw * trows) as usize) * 4)
+    var ch: i32 = 0
+    while ch < (*src).ch {
+        var hc: HCtx = HCtx { src: image.img_plane(src, ch), sw: (*src).w, dst: tmp, plan: &px, y0: ty0 }
+        par.rows(trows, 8, h_rows, (&hc) as u64)
+        var vc: VCtx = VCtx { tmp: tmp, nw: nw, trows: trows, ty0: ty0, dst: image.img_plane(&d, ch), plan: &py }
+        par.rows(nh, 8, v_rows, (&vc) as u64)
+        ch = ch + 1
+    }
+    rt.heap_free(tmp, ((nw * trows) as usize) * 4)
+    plan_free(&px)
+    plan_free(&py)
+    return d
+}

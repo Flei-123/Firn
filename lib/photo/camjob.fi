@@ -32,11 +32,14 @@ import photo.focus
 import photo.document
 import photo.par
 import photo.jpegenc
+import photo.demosaic
+import photo.resample
 
 export {
     Shot, Job, job_new, job_add_shot, job_free, job_entry, run_job, job_progress, job_finished,
     MODE_PHOTO, MODE_NIGHT, MODE_PORTRAIT, MODE_DOC, MODE_STACK, SHOT_RAW, SHOT_JPEG, MAX_SHOTS,
-    shrink_factor, fit_size, resample_img, neutralise_clipped, raw_half,
+    shrink_factor, fit_size, resample_img, neutralise_clipped, raw_half, raw_window, zoom_window,
+    RAW_DEMOSAIC, RAW_QUAD,
 }
 
 const MODE_PHOTO: i32 = 0
@@ -47,6 +50,8 @@ const MODE_STACK: i32 = 4
 const SHOT_RAW: i32 = 1
 const SHOT_JPEG: i32 = 0
 const MAX_SHOTS: i32 = 16
+const RAW_DEMOSAIC: i32 = 0 // full resolution edge directed demosaic, then Lanczos to the output size (default)
+const RAW_QUAD: i32 = 1 // fast legacy: one RGGB quad -> one pixel (half resolution, colour fringes on edges)
 
 struct Shot {
     kind: i32,
@@ -66,6 +71,9 @@ struct Job {
     max_px: i32,
     quality: i32,
     orientation: i32, // EXIF orientation 1..8 written into the JPEG
+    zoom: f32, // digital zoom of a RAW burst: the centre 1/zoom window of the sensor, 1.0 = whole frame
+    raw_mode: i32, // RAW_DEMOSAIC or RAW_QUAD
+    sharpen: f32, // < 0: pipeline default; else the unsharp amount
     out: u64,
     out_cap: usize,
     out_n: usize,
@@ -82,7 +90,7 @@ fn job_new() -> Job {
     return Job {
         mode: 0, n: 0,
         shots: [Shot { kind: 0, w: 0, h: 0, ptr: 0, size: 0, exp_ns: 0, iso: 0 }; 16],
-        meta: meta.meta_default(), max_px: 3300000, quality: 92, orientation: 1,
+        meta: meta.meta_default(), max_px: 3300000, quality: 92, orientation: 1, zoom: 1.0f, raw_mode: 0, sharpen: 0.0f - 1.0f,
         out: 0, out_cap: 0, out_n: 0, out_w: 0, out_h: 0, pdf: rt.buf_new(), have_pdf: false,
         progress: 0, done: 0, ok: false,
     }
@@ -348,13 +356,66 @@ fn jpeg_linear(p: u64, n: usize, max_px: i32) -> image.Image {
     return shrink_img(d, max_px)
 }
 
-fn load_shot(s: *mut Shot, m: *mut meta.SensorMeta, max_px: i32) -> image.Image {
-    if (*s).kind == SHOT_RAW {
-        var h: image.Image = raw_half((*s).ptr, (*s).w, (*s).h, m)
-        neutralise_clipped(&h, m)
-        return shrink_img(h, max_px)
+// the centre window of a w x h frame for a digital zoom (even origin and size so the CFA phase is kept)
+fn zoom_window(w: i32, h: i32, zoom: f32, ox: *mut i32, oy: *mut i32, ow: *mut i32, oh: *mut i32) {
+    var z: f32 = zoom
+    if z < 1.0f { z = 1.0f }
+    var cw: i32 = ((w as f32) / z) as i32
+    var ch: i32 = ((h as f32) / z) as i32
+    cw = cw - (cw & 1)
+    ch = ch - (ch & 1)
+    if cw < 16 { cw = 16 }
+    if ch < 16 { ch = 16 }
+    if cw > w { cw = w - (w & 1) }
+    if ch > h { ch = h - (h & 1) }
+    var x0: i32 = (w - cw) / 2
+    var y0: i32 = (h - ch) / 2
+    x0 = x0 - (x0 & 1)
+    y0 = y0 - (y0 & 1)
+    *ox = x0
+    *oy = y0
+    *ow = cw
+    *oh = ch
+}
+
+// RAW16 mosaic -> linear RGB at the output size (<= max_px): the zoom window is demosaiced at FULL sensor resolution
+// (edge directed, photo.demosaic), blown lights are neutralised, then Lanczos-3 resamples it to the size that
+// fits max_px (down by 2 for a 12 MP frame, up for a zoom). `quad` = the fast half resolution path.
+fn raw_window(p: u64, w: i32, h: i32, m: *mut meta.SensorMeta, max_px: i32, zoom: f32, quad: bool) -> image.Image {
+    var tw: i32 = 0
+    var th: i32 = 0
+    if quad {
+        var hf: image.Image = raw_half(p, w, h, m)
+        neutralise_clipped(&hf, m)
+        return shrink_img(hf, max_px)
     }
-    return jpeg_linear((*s).ptr, (*s).size, max_px)
+    fit_size(w, h, max_px, &tw, &th)
+    var x0: i32 = 0
+    var y0: i32 = 0
+    var cw: i32 = 0
+    var ch: i32 = 0
+    zoom_window(w, h, zoom, &x0, &y0, &cw, &ch)
+    var black: [f32; 4] = [0.0f; 4]
+    var white: f32 = 65535.0f
+    if (*m).has_black {
+        white = (*m).white_level
+        var i: usize = 0
+        while i < 4 { black[i] = (*m).black[i]; i = i + 1 }
+    }
+    var rgb: image.Image = demosaic.demosaic_u16(p, w, h, x0, y0, cw, ch, (*m).cfa, &black[0], white)
+    neutralise_clipped(&rgb, m)
+    if cw == tw && ch == th { return rgb }
+    let d: image.Image = resample.resample(&rgb, 0.0f, 0.0f, cw as f32, ch as f32, tw, th)
+    image.img_free(&rgb)
+    return d
+}
+
+fn load_shot(j: *mut Job, s: *mut Shot) -> image.Image {
+    let m: *mut meta.SensorMeta = &(*j).meta
+    if (*s).kind == SHOT_RAW {
+        return raw_window((*s).ptr, (*s).w, (*s).h, m, (*j).max_px, (*j).zoom, (*j).raw_mode == RAW_QUAD)
+    }
+    return jpeg_linear((*s).ptr, (*s).size, (*j).max_px)
 }
 
 // exposure * iso of a shot as a double, 0 when unknown
@@ -388,7 +449,7 @@ fn load_burst(j: *mut Job, b: *mut merge.Burst, bracket: bool) -> bool {
     var i: i32 = 0
     while i < (*j).n {
         let s: *mut Shot = &(*j).shots[i as usize]
-        let im: image.Image = load_shot(s, &(*j).meta, (*j).max_px)
+        let im: image.Image = load_shot(j, s)
         if im.w < 8 || im.h < 8 { image.img_free(&im); return false }
         var gain: f32 = 1.0f
         if bracket && (*s).kind == SHOT_RAW && med > 0.0 && expo_of(s) > 0.0 { gain = (expo_of(s) / med) as f32 }
@@ -414,6 +475,7 @@ fn run_job(j: *mut Job) -> bool {
     image.img_free(&out)
     var po: pipeline.PipeOpts = pipeline.opts_default()
     if jpeg_in { po.sharpen = 0.3f; po.tone = 0.5f }
+    if (*j).sharpen >= 0.0f { po.sharpen = (*j).sharpen }
     let mode: i32 = (*j).mode
     if mode == MODE_NIGHT {
         var no: night.NightOpts = night.night_default()
