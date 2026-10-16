@@ -1,0 +1,361 @@
+// tools/mail/check.fi -- lib/mail/rfc822.fi against Python's `email` package.
+//
+//     check <cases file> <results file>
+//
+// The cases come from tools/mail/gen.py (`gen`): one line "<kind> <hex input>"
+// (builder cases: a spec line). For every case this program writes one line to
+// the results file: the hex of its answer. `gen.py cmp` compares the results
+// with what Python answered and prints the differences.
+import std.rt
+import std.str
+import std.fs
+import std.vec
+import mail.rfc822
+
+static mut cases: i64 = 0
+
+fn push(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn hexch(v: u32) -> u8 {
+    if v < 10 {
+        return (48 + v) as u8
+    }
+    return (87 + v) as u8
+}
+
+fn push_hex(b: *mut rt.Buf, p: *mut u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let c: u32 = (*(p + i)) as u32
+        rt.buf_push(b, hexch(c >> 4))
+        rt.buf_push(b, hexch(c & 15))
+        i += 1
+    }
+}
+
+fn unhex(c: u32) -> u32 {
+    if c >= 97 {
+        return c - 87
+    }
+    if c >= 65 {
+        return c - 55
+    }
+    return c - 48
+}
+
+fn unhex_into(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i + 1 < s.n {
+        rt.buf_push(out, (unhex(rfc822.at(s, i)) * 16 + unhex(rfc822.at(s, i + 1))) as u8)
+        i += 2
+    }
+}
+
+fn bs(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+fn lower_into(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < s.n {
+        var c: u32 = rfc822.at(s, i)
+        if c >= 65 && c <= 90 {
+            c += 32
+        }
+        rt.buf_push(out, c as u8)
+        i += 1
+    }
+}
+
+fn trim_ws(s: str) -> str {
+    var a: usize = 0
+    var b: usize = s.n
+    while a < b && rfc822.at(s, a) <= 32 {
+        a += 1
+    }
+    while b > a && rfc822.at(s, b - 1) <= 32 {
+        b -= 1
+    }
+    return rfc822.view(s, a, b)
+}
+
+fn dump_message(data: str, out: *mut rt.Buf) {
+    var m: rfc822.Msg = rfc822.msg_parse(data.p as u64, data.n)
+    var first: bool = true
+    var k: usize = 0
+    while k < rfc822.msg_header_count(&m) {
+        if !first {
+            rt.buf_push(out, 10 as u8)
+        }
+        first = false
+        push(out, "H ")
+        push(out, rfc822.msg_header_name(&m, k))
+        push(out, ": ")
+        rfc822.header_unfold(rfc822.msg_header_raw(&m, k), out)
+        k += 1
+    }
+    var pi: usize = 0
+    while pi < rfc822.parts_count(&m) {
+        if !first {
+            rt.buf_push(out, 10 as u8)
+        }
+        first = false
+        push(out, "P ")
+        rt.buf_push_dec_u64(out, rfc822.part_depth(&m, pi) as u64)
+        rt.buf_push(out, 32 as u8)
+        var ty: rt.Buf = rt.buf_new()
+        rfc822.part_ctype(&m, pi, &ty)
+        push(out, bs(&ty))
+        rt.buf_push(out, 32 as u8)
+        var fnm: rt.Buf = rt.buf_new()
+        if rfc822.part_filename(&m, pi, &fnm) {
+            let t: str = trim_ws(bs(&fnm))
+            push_hex(out, t.p, t.n)
+        } else {
+            rt.buf_push(out, 45 as u8)
+        }
+        rt.buf_push(out, 32 as u8)
+        var cs: rt.Buf = rt.buf_new()
+        if rfc822.part_charset(&m, pi, &cs) {
+            lower_into(bs(&cs), out)
+        } else {
+            rt.buf_push(out, 45 as u8)
+        }
+        rt.buf_push(out, 32 as u8)
+        var ce: rt.Buf = rt.buf_new()
+        rfc822.part_cte(&m, pi, &ce)
+        if rt.buf_len(&ce) == 0 {
+            rt.buf_push(out, 45 as u8)
+        } else {
+            push(out, bs(&ce))
+        }
+        rt.buf_push(out, 32 as u8)
+        let t: str = bs(&ty)
+        let multi: bool = rfc822.part_first_child(&m, pi) != rfc822.NONE
+        if multi {
+            rt.buf_push(out, 45 as u8)
+        } else {
+            var body: rt.Buf = rt.buf_new()
+            rfc822.part_decoded(&m, pi, &body)
+            push_hex(out, rt.buf_data(&body), rt.buf_len(&body))
+            rt.buf_free(&body)
+        }
+        rt.buf_free(&ty)
+        rt.buf_free(&fnm)
+        rt.buf_free(&cs)
+        rt.buf_free(&ce)
+        pi += 1
+    }
+    rfc822.msg_free(&m)
+}
+
+fn dump_addresses(data: str, out: *mut rt.Buf) {
+    var al: rfc822.AddrList = rfc822.addr_parse(data)
+    var k: usize = 0
+    while k < rfc822.addr_count(&al) {
+        if k > 0 {
+            rt.buf_push(out, 10 as u8)
+        }
+        let kind: u32 = rfc822.addr_kind(&al, k)
+        if kind == rfc822.AK_MAILBOX {
+            push(out, "M[")
+            push(out, rfc822.addr_name(&al, k))
+            rt.buf_push(out, 124 as u8)
+            push(out, rfc822.addr_spec(&al, k))
+            rt.buf_push(out, 93 as u8)
+        } else if kind == rfc822.AK_GROUP_START {
+            push(out, "G[")
+            push(out, rfc822.addr_name(&al, k))
+            rt.buf_push(out, 58 as u8)
+        } else {
+            rt.buf_push(out, 93 as u8)
+        }
+        k += 1
+    }
+    rfc822.addr_free(&al)
+}
+
+fn dump_date(data: str, out: *mut rt.Buf) {
+    let d: rfc822.Date = rfc822.date_parse(data)
+    if !d.ok {
+        push(out, "ERR")
+        return
+    }
+    rt.buf_push_dec_i64(out, d.year as i64)
+    rt.buf_push(out, 45 as u8)
+    rt.buf_push_dec_u64(out, d.month as u64)
+    rt.buf_push(out, 45 as u8)
+    rt.buf_push_dec_u64(out, d.day as u64)
+    rt.buf_push(out, 32 as u8)
+    rt.buf_push_dec_u64(out, d.hour as u64)
+    rt.buf_push(out, 58 as u8)
+    rt.buf_push_dec_u64(out, d.minute as u64)
+    rt.buf_push(out, 58 as u8)
+    rt.buf_push_dec_u64(out, d.second as u64)
+    rt.buf_push(out, 32 as u8)
+    // Python's parsedate_tz answers 0 for an unknown zone ("-0000")
+    rt.buf_push_dec_i64(out, d.tz_min as i64)
+}
+
+// split "a:b:c" at ':' -> hex decoded pieces into three buffers (missing = empty)
+fn hex_triple(s: str, a: *mut rt.Buf, b: *mut rt.Buf, c: *mut rt.Buf) {
+    var i: usize = 0
+    var part: u32 = 0
+    var st: usize = 0
+    while i <= s.n {
+        if i == s.n || rfc822.at(s, i) == 58 {
+            let piece: str = rfc822.view(s, st, i)
+            if part == 0 {
+                unhex_into(piece, a)
+            } else if part == 1 {
+                unhex_into(piece, b)
+            } else {
+                unhex_into(piece, c)
+            }
+            part += 1
+            st = i + 1
+        }
+        i += 1
+    }
+}
+
+fn dump_build(spec: str, out: *mut rt.Buf) {
+    var b: rfc822.Builder = rfc822.builder_new()
+    rfc822.builder_set_seed(&b, 0x1234abcd, 0x77 + cases as u64)
+    rfc822.builder_set_date(&b, "Fri, 16 Oct 2026 09:19:00 +0200")
+    var i: usize = 0
+    var st: usize = 0
+    while i <= spec.n {
+        if i == spec.n || rfc822.at(spec, i) == 59 {
+            let item: str = rfc822.view(spec, st, i)
+            var e: usize = 0
+            while e < item.n && rfc822.at(item, e) != 61 {
+                e += 1
+            }
+            let key: str = rfc822.view(item, 0, e)
+            let val: str = rfc822.view(item, e + 1, item.n)
+            var x: rt.Buf = rt.buf_new()
+            var y: rt.Buf = rt.buf_new()
+            var z: rt.Buf = rt.buf_new()
+            if key == "from" {
+                hex_triple(val, &x, &y, &z)
+                var f: rt.Buf = rt.buf_new()
+                rfc822.format_address(&f, bs(&x), bs(&y))
+                rfc822.builder_set_from(&b, bs(&f))
+                rt.buf_free(&f)
+            } else if key == "to" {
+                hex_triple(val, &x, &y, &z)
+                var f: rt.Buf = rt.buf_new()
+                rfc822.format_address(&f, bs(&x), bs(&y))
+                rfc822.builder_add_to(&b, bs(&f))
+                rt.buf_free(&f)
+            } else if key == "subject" {
+                unhex_into(val, &x)
+                rfc822.builder_set_subject(&b, bs(&x))
+            } else if key == "text" {
+                unhex_into(val, &x)
+                rfc822.builder_set_text(&b, bs(&x))
+            } else if key == "html" {
+                unhex_into(val, &x)
+                rfc822.builder_set_html(&b, bs(&x))
+            } else if key == "att" {
+                hex_triple(val, &x, &y, &z)
+                rfc822.builder_attach(&b, bs(&x), bs(&y), rt.buf_ptr(&z), rt.buf_len(&z))
+            }
+            rt.buf_free(&x)
+            rt.buf_free(&y)
+            rt.buf_free(&z)
+            st = i + 1
+        }
+        i += 1
+    }
+    rfc822.builder_build(&b, out)
+    rfc822.builder_free(&b)
+}
+
+fn run_case(kind: u32, arg: str, out: *mut rt.Buf) {
+    if kind == 88 {
+        dump_build(arg, out)
+        return
+    }
+    var data: rt.Buf = rt.buf_new()
+    unhex_into(arg, &data)
+    let d: str = bs(&data)
+    if kind == 77 {
+        dump_message(d, out)
+    } else if kind == 65 {
+        dump_addresses(d, out)
+    } else if kind == 87 || kind == 69 {
+        if kind == 87 {
+            rfc822.decode_words(d, out)
+        } else {
+            rfc822.encode_words(d, out)
+        }
+    } else if kind == 68 {
+        dump_date(d, out)
+    } else if kind == 81 {
+        rfc822.qp_decode(d, out)
+    } else if kind == 66 {
+        var tmp: rt.Buf = rt.buf_new()
+        std_b64_decode(d, out)
+        rt.buf_free(&tmp)
+    } else if kind == 70 {
+        rfc822.qp_encode(d, out)
+    } else if kind == 83 {
+        rfc822.b64_encode_lines(d.p as u64, d.n, out)
+    }
+    rt.buf_free(&data)
+}
+
+fn std_b64_decode(d: str, out: *mut rt.Buf) {
+    // decode through the message path: a one-part message with a base64 body
+    var m: rt.Buf = rt.buf_new()
+    push(&m, "Content-Transfer-Encoding: base64\r\n\r\n")
+    push(&m, d)
+    var msg: rfc822.Msg = rfc822.msg_parse(rt.buf_ptr(&m), rt.buf_len(&m))
+    rfc822.part_decoded(&msg, 0, out)
+    rfc822.msg_free(&msg)
+    rt.buf_free(&m)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        push_out_err("usage: check <cases file> <results file>\n")
+        return 2
+    }
+    let a1: u64 = rt.arg_ptr(start, 1)
+    let a2: u64 = rt.arg_ptr(start, 2)
+    let cases_path: str = str { p: a1 as *mut u8, n: rt.c_length(a1) }
+    let res_path: str = str { p: a2 as *mut u8, n: rt.c_length(a2) }
+    var data: rt.Buf = rt.buf_new()
+    fs.read_file(cases_path, &data) catch 0
+    var res: rt.Buf = rt.buf_new()
+    let total: usize = rt.buf_len(&data)
+    let base: *mut u8 = rt.buf_data(&data)
+    var at: usize = 0
+    while at < total {
+        var e: usize = at
+        while e < total && *(base + e) != 10 as u8 {
+            e += 1
+        }
+        let line: str = str { p: base + at, n: e - at }
+        at = e + 1
+        if line.n < 2 {
+            continue
+        }
+        cases += 1
+        var out: rt.Buf = rt.buf_new()
+        run_case(rfc822.at(line, 0), rfc822.view(line, 2, line.n), &out)
+        push_hex(&res, rt.buf_data(&out), rt.buf_len(&out))
+        rt.buf_push(&res, 10 as u8)
+        rt.buf_free(&out)
+    }
+    fs.write_file(res_path, rt.buf_ptr(&res), rt.buf_len(&res)) catch 0
+    return 0
+}
+
+fn push_out_err(s: str) {
+    rt.write_everything(2, s.p as u64, s.n)
+}

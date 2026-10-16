@@ -1,0 +1,2270 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mail/rfc822.fi -- mail.rfc822: Internet messages (RFC 5322) and MIME
+// (RFC 2045-2049, 2231): parse, decode, build.
+//
+//     import mail.rfc822
+//
+//     var m: rfc822.Msg = rfc822.msg_parse(p, n)           // copies the octets
+//     let subject: str = ...; var b: rt.Buf = rt.buf_new()
+//     rfc822.msg_header(&m, 0, "Subject", &b)               // unfolded value of the first Subject
+//     rfc822.decode_words(rfc822.view(...), &b)             // RFC 2047 -> UTF-8
+//     rfc822.parts_count(&m)                                // parts are numbered in document order, 0 = the message
+//     rfc822.part_decoded(&m, k, &b)                        // body after Content-Transfer-Encoding
+//     rfc822.msg_free(&m)
+//
+//     var al: rfc822.AddrList = rfc822.addr_parse(value)    // To:/Cc:/From: values, groups, display names
+//     var d: rfc822.Date = rfc822.date_parse(value)         // RFC 5322 date, obsolete zones, 2 digit years
+//
+//     var mb: rfc822.Builder = rfc822.builder_new()         // text / html / attachments -> a message
+//     rfc822.builder_build(&mb, &out)
+//
+// WHAT IS HERE
+//   headers   split into name/value, folded values stay raw, `header_unfold` removes the folds
+//   words     RFC 2047 encoded-words (B and Q; utf-8, us-ascii, iso-8859-1, iso-8859-15,
+//             windows-1252; other charsets are copied byte for byte), `encode_words` for output
+//   addresses RFC 5322 mailboxes, groups, quoted display names, comments, encoded display names
+//   dates     RFC 5322 date-time (+ obsolete zones, 2-digit years), `date_format`
+//   mime      multipart (nested, boundary lines with trailing blanks), message/rfc822,
+//             Content-Type/-Disposition parameters incl. RFC 2231 (`name*=utf-8''..`, `name*0=`)
+//   cte       base64 (std.base64), quoted-printable (binascii.a2b_qp rules), 7bit/8bit/binary
+//   builder   text, html, alternative, attachments, folding at 78, Message-ID, CRLF
+//
+// The cross-check against Python's `email` package is tools/mail/run.sh.
+//
+// HONEST
+//   R1  Text is bytes. Charsets other than the ones above are NOT converted.
+//   R2  The parser never fails: a broken message gives the best reading
+//       (a line without colon ends the header block, a missing closing boundary
+//       runs to the end). Nothing is validated.
+//   R3  Obsolete address syntax (routes `@a,@b:`) is skipped, not interpreted.
+//   R4  The builder emits utf-8 only; lines are CRLF; no signing, no DKIM.
+//   R5  A Msg owns a COPY of the message; views (`str`) taken from it die with `msg_free`.
+import std.rt
+import std.str
+import std.vec
+import std.base64
+import std.time
+
+export {
+    Msg, Hdr, Part, AddrList, AddrItem, Date, Builder,
+    NONE, AK_MAILBOX, AK_GROUP_START, AK_GROUP_END,
+    at, view, eq_nocase, push_str, header_unfold, qp_decode, qp_encode, b64_encode_lines,
+    charset_to_utf8, decode_words, encode_words, is_ascii,
+    msg_parse, msg_free, msg_header_count, msg_header_name, msg_header_raw, msg_header, msg_header_find,
+    parts_count, part_parent, part_first_child, part_next, part_depth, part_header, part_body,
+    part_ctype, part_param, part_filename, part_decoded, part_charset, part_cte, part_is_multipart,
+    param_get, param_get_value,
+    addr_parse, addr_free, addr_count, addr_kind, addr_name, addr_spec,
+    date_parse, date_format, date_epoch,
+    builder_new, builder_free, builder_set_from, builder_add_to, builder_add_cc, builder_set_subject,
+    builder_set_text, builder_set_html, builder_set_date, builder_set_message_id, builder_add_header,
+    builder_attach, builder_set_seed, builder_build, make_message_id, format_address, pct_encode,
+}
+
+const NONE: usize = 18446744073709551615
+
+// ----------------------------------------------------------------- bytes
+
+fn at(s: str, i: usize) -> u32 {
+    return rt.ld8(s.p as u64, i) as u32
+}
+
+fn view(s: str, a: usize, b: usize) -> str {
+    return str { p: s.p + a, n: b - a }
+}
+
+fn push_str(out: *mut rt.Buf, s: str) {
+    if s.n > 0 {
+        rt.buf_push_bytes(out, s.p as u64, s.n)
+    }
+}
+
+fn push_c(out: *mut rt.Buf, c: u32) {
+    rt.buf_push(out, c as u8)
+}
+
+fn is_wsp(c: u32) -> bool {
+    return c == 32 || c == 9
+}
+
+fn is_ascii(s: str) -> bool {
+    var i: usize = 0
+    while i < s.n {
+        if at(s, i) >= 128 {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+fn lower(c: u32) -> u32 {
+    if c >= 65 && c <= 90 {
+        return c + 32
+    }
+    return c
+}
+
+fn eq_nocase(a: str, b: str) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    var i: usize = 0
+    while i < a.n {
+        if lower(at(a, i)) != lower(at(b, i)) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+fn hexval(c: u32) -> u32 {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    return 255
+}
+
+fn hexchar(v: u32) -> u32 {
+    if v < 10 {
+        return 48 + v
+    }
+    return 55 + v
+}
+
+fn trim(s: str) -> str {
+    var a: usize = 0
+    var b: usize = s.n
+    while a < b && (is_wsp(at(s, a)) || at(s, a) == 13 || at(s, a) == 10) {
+        a += 1
+    }
+    while b > a && (is_wsp(at(s, b - 1)) || at(s, b - 1) == 13 || at(s, b - 1) == 10) {
+        b -= 1
+    }
+    return view(s, a, b)
+}
+
+fn push_utf8(out: *mut rt.Buf, cp: u32) {
+    if cp < 128 {
+        rt.buf_push(out, cp as u8)
+    } else if cp < 2048 {
+        rt.buf_push(out, (192 | (cp >> 6)) as u8)
+        rt.buf_push(out, (128 | (cp & 63)) as u8)
+    } else if cp < 65536 {
+        rt.buf_push(out, (224 | (cp >> 12)) as u8)
+        rt.buf_push(out, (128 | ((cp >> 6) & 63)) as u8)
+        rt.buf_push(out, (128 | (cp & 63)) as u8)
+    } else {
+        rt.buf_push(out, (240 | (cp >> 18)) as u8)
+        rt.buf_push(out, (128 | ((cp >> 12) & 63)) as u8)
+        rt.buf_push(out, (128 | ((cp >> 6) & 63)) as u8)
+        rt.buf_push(out, (128 | (cp & 63)) as u8)
+    }
+}
+
+// --------------------------------------------------------------- folding
+
+// Remove the folds of a header value: a line break right before a blank
+// disappears, the blank stays ("a\r\n b" -> "a b").
+fn header_unfold(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < s.n {
+        let c: u32 = at(s, i)
+        if c == 13 && i + 2 < s.n && at(s, i + 1) == 10 && is_wsp(at(s, i + 2)) {
+            i += 2
+            continue
+        }
+        if c == 10 && i + 1 < s.n && is_wsp(at(s, i + 1)) {
+            i += 1
+            continue
+        }
+        rt.buf_push(out, c as u8)
+        i += 1
+    }
+}
+
+// ------------------------------------------------- transfer encodings
+
+// Quoted-printable decoding with the rules of binascii.a2b_qp (header=False):
+// soft breaks "=\n" and "=\r\n", "==" is one "=", a bad escape stays "=",
+// a trailing "=" is dropped, trailing blanks are kept.
+fn qp_decode(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    let n: usize = s.n
+    while i < n {
+        let c: u32 = at(s, i)
+        if c != 61 {
+            rt.buf_push(out, c as u8)
+            i += 1
+            continue
+        }
+        i += 1
+        if i >= n {
+            break
+        }
+        let d: u32 = at(s, i)
+        if d == 10 || d == 13 {
+            if d != 10 {
+                while i < n && at(s, i) != 10 {
+                    i += 1
+                }
+            }
+            if i < n {
+                i += 1
+            }
+        } else if d == 61 {
+            rt.buf_push(out, 61 as u8)
+            i += 1
+        } else if i + 1 < n && hexval(d) < 16 && hexval(at(s, i + 1)) < 16 {
+            rt.buf_push(out, (hexval(d) * 16 + hexval(at(s, i + 1))) as u8)
+            i += 2
+        } else {
+            rt.buf_push(out, 61 as u8)
+        }
+    }
+}
+
+// Quoted-printable encoding with soft breaks at 76 columns and CRLF line ends.
+// Input line ends (LF or CRLF) become hard breaks; blanks before a break are escaped.
+fn qp_encode(s: str, out: *mut rt.Buf) {
+    var col: usize = 0
+    var i: usize = 0
+    while i < s.n {
+        let c: u32 = at(s, i)
+        if c == 13 && i + 1 < s.n && at(s, i + 1) == 10 {
+            i += 1
+            continue
+        }
+        if c == 10 {
+            rt.buf_push(out, 13 as u8)
+            rt.buf_push(out, 10 as u8)
+            col = 0
+            i += 1
+            continue
+        }
+        var lit: bool = (c >= 33 && c <= 126 && c != 61) || ((c == 32 || c == 9) && i + 1 < s.n && at(s, i + 1) != 10 && at(s, i + 1) != 13)
+        var need: usize = 1
+        if !lit {
+            need = 3
+        }
+        if col + need > 75 {
+            rt.buf_push(out, 61 as u8)
+            rt.buf_push(out, 13 as u8)
+            rt.buf_push(out, 10 as u8)
+            col = 0
+        }
+        if lit {
+            rt.buf_push(out, c as u8)
+        } else {
+            rt.buf_push(out, 61 as u8)
+            rt.buf_push(out, hexchar(c >> 4) as u8)
+            rt.buf_push(out, hexchar(c & 15) as u8)
+        }
+        col += need
+        i += 1
+    }
+}
+
+// Base64 in lines of 76 characters, CRLF after every line (also the last one).
+fn b64_encode_lines(p: u64, n: usize, out: *mut rt.Buf) {
+    var tmp: rt.Buf = rt.buf_new()
+    base64.encode(p, n, &tmp)
+    let total: usize = rt.buf_len(&tmp)
+    var i: usize = 0
+    while i < total {
+        var k: usize = total - i
+        if k > 76 {
+            k = 76
+        }
+        rt.buf_push_bytes(out, rt.buf_ptr(&tmp) + i as u64, k)
+        rt.buf_push(out, 13 as u8)
+        rt.buf_push(out, 10 as u8)
+        i += k
+    }
+    rt.buf_free(&tmp)
+}
+
+// ------------------------------------------------------------ charsets
+
+const CS_UTF8: u32 = 0
+const CS_LATIN1: u32 = 1
+const CS_LATIN9: u32 = 2
+const CS_CP1252: u32 = 3
+const CS_OTHER: u32 = 4
+
+fn charset_id(name: str) -> u32 {
+    var t: str = trim(name)
+    var k: usize = 0
+    while k < t.n && at(t, k) != 42 {
+        k += 1
+    }
+    t = view(t, 0, k)
+    if eq_nocase(t, "utf-8") || eq_nocase(t, "utf8") || eq_nocase(t, "us-ascii") || eq_nocase(t, "ascii") {
+        return CS_UTF8
+    }
+    if eq_nocase(t, "iso-8859-1") || eq_nocase(t, "latin1") || eq_nocase(t, "latin-1") || eq_nocase(t, "iso8859-1") {
+        return CS_LATIN1
+    }
+    if eq_nocase(t, "iso-8859-15") || eq_nocase(t, "latin9") || eq_nocase(t, "iso8859-15") {
+        return CS_LATIN9
+    }
+    if eq_nocase(t, "windows-1252") || eq_nocase(t, "cp1252") {
+        return CS_CP1252
+    }
+    return CS_OTHER
+}
+
+fn cp1252_high(c: u32) -> u32 {
+    // 0x80..0x9F; 0 = undefined (python maps them to U+FFFD with errors=replace)
+    if c == 0x80 { return 0x20AC }
+    if c == 0x82 { return 0x201A }
+    if c == 0x83 { return 0x0192 }
+    if c == 0x84 { return 0x201E }
+    if c == 0x85 { return 0x2026 }
+    if c == 0x86 { return 0x2020 }
+    if c == 0x87 { return 0x2021 }
+    if c == 0x88 { return 0x02C6 }
+    if c == 0x89 { return 0x2030 }
+    if c == 0x8A { return 0x0160 }
+    if c == 0x8B { return 0x2039 }
+    if c == 0x8C { return 0x0152 }
+    if c == 0x8E { return 0x017D }
+    if c == 0x91 { return 0x2018 }
+    if c == 0x92 { return 0x2019 }
+    if c == 0x93 { return 0x201C }
+    if c == 0x94 { return 0x201D }
+    if c == 0x95 { return 0x2022 }
+    if c == 0x96 { return 0x2013 }
+    if c == 0x97 { return 0x2014 }
+    if c == 0x98 { return 0x02DC }
+    if c == 0x99 { return 0x2122 }
+    if c == 0x9A { return 0x0161 }
+    if c == 0x9B { return 0x203A }
+    if c == 0x9C { return 0x0153 }
+    if c == 0x9E { return 0x017E }
+    if c == 0x9F { return 0x0178 }
+    return 0xFFFD
+}
+
+fn latin9_map(c: u32) -> u32 {
+    if c == 0xA4 { return 0x20AC }
+    if c == 0xA6 { return 0x0160 }
+    if c == 0xA8 { return 0x0161 }
+    if c == 0xB4 { return 0x017D }
+    if c == 0xB8 { return 0x017E }
+    if c == 0xBC { return 0x0152 }
+    if c == 0xBD { return 0x0153 }
+    if c == 0xBE { return 0x0178 }
+    return c
+}
+
+// Append the octets `s` of charset `cs` to `out` as UTF-8. Unknown charsets
+// and utf-8 are copied as they are.
+fn charset_to_utf8(cs: str, s: str, out: *mut rt.Buf) {
+    let id: u32 = charset_id(cs)
+    if id == CS_UTF8 || id == CS_OTHER {
+        push_str(out, s)
+        return
+    }
+    var i: usize = 0
+    while i < s.n {
+        let c: u32 = at(s, i)
+        i += 1
+        if c < 128 {
+            rt.buf_push(out, c as u8)
+        } else if id == CS_LATIN1 {
+            push_utf8(out, c)
+        } else if id == CS_LATIN9 {
+            push_utf8(out, latin9_map(c))
+        } else if c >= 0x80 && c <= 0x9F {
+            push_utf8(out, cp1252_high(c))
+        } else {
+            push_utf8(out, c)
+        }
+    }
+}
+
+// -------------------------------------------------------- encoded words
+
+// Find the encoded-word that starts at i (RFC 2047 "=?charset?E?text?=").
+// Returns the end (index after "?=") or NONE. The pieces are views into s.
+fn word_at(s: str, i: usize, cs: *mut str, enc: *mut u32, txt: *mut str) -> usize {
+    if i + 1 >= s.n || at(s, i) != 61 || at(s, i + 1) != 63 {
+        return NONE
+    }
+    var j: usize = i + 2
+    while j < s.n && at(s, j) != 63 {
+        j += 1
+    }
+    if j + 2 >= s.n {
+        return NONE
+    }
+    let c1: usize = j
+    let e: u32 = lower(at(s, j + 1))
+    if (e != 98 && e != 113) || at(s, j + 2) != 63 {
+        return NONE
+    }
+    var k: usize = j + 3
+    while k + 1 < s.n && !(at(s, k) == 63 && at(s, k + 1) == 61) {
+        k += 1
+    }
+    if k + 1 >= s.n {
+        return NONE
+    }
+    *cs = view(s, i + 2, c1)
+    *enc = e
+    *txt = view(s, j + 3, k)
+    return k + 2
+}
+
+// Decode one word payload to raw octets (appended to raw). false: not decodable.
+fn word_payload(enc: u32, txt: str, raw: *mut rt.Buf) -> bool {
+    if enc == 98 {
+        // b64decode with missing padding repaired
+        var t: rt.Buf = rt.buf_new()
+        push_str(&t, txt)
+        while rt.buf_len(&t) % 4 != 0 {
+            rt.buf_push(&t, 61 as u8)
+        }
+        let ok: bool = base64.decode(rt.buf_ptr(&t), rt.buf_len(&t), raw)
+        rt.buf_free(&t)
+        return ok
+    }
+    var i: usize = 0
+    while i < txt.n {
+        let c: u32 = at(txt, i)
+        if c == 95 {
+            rt.buf_push(raw, 32 as u8)
+        } else if c == 61 && i + 2 < txt.n + 0 && hexval(at(txt, i + 1)) < 16 && hexval(at(txt, i + 2)) < 16 {
+            rt.buf_push(raw, (hexval(at(txt, i + 1)) * 16 + hexval(at(txt, i + 2))) as u8)
+            i += 2
+        } else if c == 61 && i + 2 == txt.n - 0 && false {
+            rt.buf_push(raw, 61 as u8)
+        } else {
+            rt.buf_push(raw, c as u8)
+        }
+        i += 1
+    }
+    return true
+}
+
+fn all_wsp(s: str) -> bool {
+    var i: usize = 0
+    while i < s.n {
+        if !is_wsp(at(s, i)) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+// RFC 2047 decoding of an unstructured value (Subject, a display name, ...).
+// The value must already be unfolded. Blanks between two encoded-words are
+// dropped, every other text is kept as it is; the result is UTF-8.
+fn decode_words(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    var lit: usize = 0 // start of the pending literal text
+    var prev_word: bool = false
+    var held: usize = NONE // start of blanks held back between two words
+    while i < s.n {
+        var cs: str = ""
+        var enc: u32 = 0
+        var txt: str = ""
+        let e: usize = word_at(s, i, &cs, &enc, &txt)
+        if e == NONE {
+            i += 1
+            continue
+        }
+        var raw: rt.Buf = rt.buf_new()
+        if !word_payload(enc, txt, &raw) {
+            rt.buf_free(&raw)
+            i += 1
+            continue
+        }
+        // literal text before the word; blanks-only text between two words is dropped
+        let between: str = view(s, lit, i)
+        if !(prev_word && all_wsp(between)) {
+            push_str(out, between)
+        }
+        charset_to_utf8(cs, str { p: rt.buf_data(&raw), n: rt.buf_len(&raw) }, out)
+        rt.buf_free(&raw)
+        prev_word = true
+        i = e
+        lit = e
+    }
+    held = 0
+    push_str(out, view(s, lit, s.n))
+}
+
+// RFC 2047 encoding of UTF-8 text for a header: "=?utf-8?B?...?=" words of at
+// most 75 characters, separated by CRLF + blank (so a header folds there).
+// ASCII-only text is copied as it is. `first_col` is the column already used.
+fn encode_words(s: str, out: *mut rt.Buf) {
+    if is_ascii(s) {
+        push_str(out, s)
+        return
+    }
+    // payload budget: 75 - len("=?utf-8?B?") - len("?=") = 63 -> 45 octets -> 60 base64 characters
+    var i: usize = 0
+    var first: bool = true
+    while i < s.n {
+        var k: usize = s.n - i
+        if k > 42 {
+            k = 42
+        }
+        // do not cut a UTF-8 sequence
+        if i + k < s.n {
+            while k > 0 && (at(s, i + k) & 192) == 128 {
+                k -= 1
+            }
+        }
+        if k == 0 {
+            k = s.n - i
+        }
+        if !first {
+            rt.buf_push(out, 13 as u8)
+            rt.buf_push(out, 10 as u8)
+            rt.buf_push(out, 32 as u8)
+        }
+        first = false
+        push_str(out, "=?utf-8?B?")
+        base64.encode(s.p as u64 + i as u64, k, out)
+        push_str(out, "?=")
+        i += k
+    }
+}
+
+// ------------------------------------------------------------- messages
+
+struct Hdr {
+    noff: usize,
+    nlen: usize,
+    voff: usize,
+    vlen: usize,
+}
+
+struct Part {
+    hoff: usize, // header block
+    hlen: usize,
+    boff: usize, // body
+    blen: usize,
+    first_hdr: usize,
+    nhdr: usize,
+    parent: usize,
+    first_child: usize,
+    last_child: usize,
+    next: usize,
+    depth: u32,
+}
+
+struct Msg {
+    src: rt.Buf,
+    hdrs: Vec[Hdr],
+    parts: Vec[Part],
+}
+
+fn msg_src(m: *mut Msg) -> str {
+    return str { p: rt.buf_data(&(*m).src), n: rt.buf_len(&(*m).src) }
+}
+
+fn msg_free(m: *mut Msg) {
+    rt.buf_free(&(*m).src)
+    vec_free[Hdr](&(*m).hdrs)
+    vec_free[Part](&(*m).parts)
+}
+
+// end of the line that starts at i (index of the LF, or n), and the start of the next line
+fn line_end(s: str, i: usize, limit: usize) -> usize {
+    var j: usize = i
+    while j < limit && at(s, j) != 10 {
+        j += 1
+    }
+    return j
+}
+
+// Parse the header block that starts at `off` (up to `limit`). Appends the
+// headers to m.hdrs, sets the header/body ranges of part `pi`.
+fn parse_header_block(m: *mut Msg, pi: usize, off: usize, limit: usize) {
+    let s: str = msg_src(m)
+    var i: usize = off
+    let first: usize = vec_len[Hdr](&(*m).hdrs)
+    var count: usize = 0
+    var body: usize = limit
+    var have: bool = false
+    var cur: Hdr = Hdr { noff: 0, nlen: 0, voff: 0, vlen: 0 }
+    while i < limit {
+        let le: usize = line_end(s, i, limit)
+        var ce: usize = le
+        if ce > i && at(s, ce - 1) == 13 {
+            ce -= 1
+        }
+        if ce == i {
+            // blank line: the body follows
+            if have {
+                vec_push[Hdr](&(*m).hdrs, cur)
+                count += 1
+                have = false
+            }
+            body = le + 1
+            if body > limit {
+                body = limit
+            }
+            break
+        }
+        if is_wsp(at(s, i)) {
+            if have {
+                cur.vlen = ce - cur.voff
+            }
+            i = le + 1
+            continue
+        }
+        // a header line: name ":" value
+        var k: usize = i
+        while k < ce && at(s, k) != 58 && at(s, k) > 32 && at(s, k) < 127 {
+            k += 1
+        }
+        if k >= ce || at(s, k) != 58 || k == i {
+            // not a header: the body starts here
+            if have {
+                vec_push[Hdr](&(*m).hdrs, cur)
+                count += 1
+                have = false
+            }
+            body = i
+            break
+        }
+        if have {
+            vec_push[Hdr](&(*m).hdrs, cur)
+            count += 1
+        }
+        var v: usize = k + 1
+        while v < ce && is_wsp(at(s, v)) {
+            v += 1
+        }
+        cur = Hdr { noff: i, nlen: k - i, voff: v, vlen: ce - v }
+        have = true
+        i = le + 1
+        if i >= limit {
+            body = limit
+        }
+    }
+    if have {
+        vec_push[Hdr](&(*m).hdrs, cur)
+        count += 1
+        body = limit
+    }
+    let pp: *mut Part = vec_elem_ptr[Part](&(*m).parts, pi)
+    (*pp).hoff = off
+    (*pp).hlen = 0
+    (*pp).first_hdr = first
+    (*pp).nhdr = count
+    (*pp).boff = body
+    (*pp).blen = limit - body
+}
+
+fn part_new(m: *mut Msg, parent: usize, depth: u32) -> usize {
+    let idx: usize = vec_len[Part](&(*m).parts)
+    vec_push[Part](&(*m).parts, Part {
+            hoff: 0, hlen: 0, boff: 0, blen: 0, first_hdr: 0, nhdr: 0, parent: parent,
+            first_child: NONE, last_child: NONE, next: NONE, depth: depth,
+        })
+    if parent != NONE {
+        let pp: *mut Part = vec_elem_ptr[Part](&(*m).parts, parent)
+        if (*pp).last_child != NONE {
+            let lp: *mut Part = vec_elem_ptr[Part](&(*m).parts, (*pp).last_child)
+            (*lp).next = idx
+        } else {
+            (*pp).first_child = idx
+        }
+        (*pp).last_child = idx
+    }
+    return idx
+}
+
+// the unfolded value of the first header `name` of part `pi` (appended to out)
+fn part_header(m: *mut Msg, pi: usize, name: str, out: *mut rt.Buf) -> bool {
+    let pp: *mut Part = vec_elem_ptr[Part](&(*m).parts, pi)
+    let s: str = msg_src(m)
+    var k: usize = 0
+    while k < (*pp).nhdr {
+        let h: *mut Hdr = vec_elem_ptr[Hdr](&(*m).hdrs, (*pp).first_hdr + k)
+        if eq_nocase(view(s, (*h).noff, (*h).noff + (*h).nlen), name) {
+            header_unfold(view(s, (*h).voff, (*h).voff + (*h).vlen), out)
+            return true
+        }
+        k += 1
+    }
+    return false
+}
+
+// Parse the content-type of part `pi`: type/subtype lowercased into `ty`
+fn part_ctype(m: *mut Msg, pi: usize, out: *mut rt.Buf) {
+    var v: rt.Buf = rt.buf_new()
+    if !part_header(m, pi, "content-type", &v) {
+        push_str(out, "text/plain")
+        rt.buf_free(&v)
+        return
+    }
+    let s: str = str { p: rt.buf_data(&v), n: rt.buf_len(&v) }
+    var e: usize = 0
+    while e < s.n && at(s, e) != 59 {
+        e += 1
+    }
+    let t: str = trim(view(s, 0, e))
+    var ok: bool = false
+    var q: usize = 0
+    while q < t.n {
+        if at(t, q) == 47 {
+            ok = true
+        }
+        q += 1
+    }
+    if !ok {
+        push_str(out, "text/plain")
+    } else {
+        q = 0
+        while q < t.n {
+            rt.buf_push(out, lower(at(t, q)) as u8)
+            q += 1
+        }
+    }
+    rt.buf_free(&v)
+}
+
+fn part_is_multipart(m: *mut Msg, pi: usize) -> bool {
+    var t: rt.Buf = rt.buf_new()
+    part_ctype(m, pi, &t)
+    let s: str = str { p: rt.buf_data(&t), n: rt.buf_len(&t) }
+    let r: bool = s.n > 10 && eq_nocase(view(s, 0, 10), "multipart/")
+    rt.buf_free(&t)
+    return r
+}
+
+// a boundary line "--boundary" or "--boundary--" (+ blanks) at the start of
+// line [i, ce): 0 = no, 1 = separator, 2 = closing
+fn boundary_line(s: str, i: usize, ce: usize, b: str) -> u32 {
+    if ce - i < b.n + 2 || at(s, i) != 45 || at(s, i + 1) != 45 {
+        return 0
+    }
+    var k: usize = 0
+    while k < b.n {
+        if at(s, i + 2 + k) != at(b, k) {
+            return 0
+        }
+        k += 1
+    }
+    var j: usize = i + 2 + b.n
+    var r: u32 = 1
+    if j + 1 < ce + 0 && at(s, j) == 45 && at(s, j + 1) == 45 {
+        r = 2
+        j += 2
+    }
+    while j < ce {
+        if !is_wsp(at(s, j)) && at(s, j) != 13 {
+            return 0
+        }
+        j += 1
+    }
+    return r
+}
+
+fn parse_part(m: *mut Msg, pi: usize, off: usize, limit: usize, depth: u32, in_digest: bool) {
+    parse_header_block(m, pi, off, limit)
+    let pp0: *mut Part = vec_elem_ptr[Part](&(*m).parts, pi)
+    var ty: rt.Buf = rt.buf_new()
+    if in_digest && !part_header(m, pi, "content-type", &ty) {
+        push_str(&ty, "message/rfc822")
+    } else {
+        part_ctype(m, pi, &ty)
+    }
+    let t: str = str { p: rt.buf_data(&ty), n: rt.buf_len(&ty) }
+    let boff: usize = (*pp0).boff
+    let bend: usize = boff + (*pp0).blen
+    if t.n > 10 && eq_nocase(view(t, 0, 10), "multipart/") {
+        var cv: rt.Buf = rt.buf_new()
+        var bd: rt.Buf = rt.buf_new()
+        part_header(m, pi, "content-type", &cv)
+        let have: bool = param_get(str { p: rt.buf_data(&cv), n: rt.buf_len(&cv) }, "boundary", &bd)
+        rt.buf_free(&cv)
+        if have && rt.buf_len(&bd) > 0 {
+            let s: str = msg_src(m)
+            let b: str = str { p: rt.buf_data(&bd), n: rt.buf_len(&bd) }
+            let digest: bool = eq_nocase(t, "multipart/digest")
+            var i: usize = boff
+            var start: usize = NONE // body start of the part being collected
+            var done: bool = false
+            var seen_sep: bool = false
+            while i < bend && !done {
+                let le: usize = line_end(s, i, bend)
+                var ce: usize = le
+                if ce > i && at(s, ce - 1) == 13 {
+                    ce -= 1
+                }
+                let bl: u32 = boundary_line(s, i, ce, b)
+                if bl != 0 {
+                    if start != NONE {
+                        // the terminator in front of the boundary line belongs to the boundary
+                        var pe: usize = i
+                        if pe > start {
+                            pe -= 1
+                            if pe > start && at(s, pe - 1) == 13 {
+                                pe -= 1
+                            }
+                        }
+                        let ci: usize = part_new(m, pi, depth + 1)
+                        parse_part(m, ci, start, pe, depth + 1, digest)
+                    }
+                    if bl == 2 {
+                        done = true
+                        if start == NONE && !seen_sep {
+                            // closing boundary before any separator: not a multipart, the
+                            // text before the boundary line is the body (like Python's parser)
+                            let pp1: *mut Part = vec_elem_ptr[Part](&(*m).parts, pi)
+                            (*pp1).blen = i - boff
+                        }
+                        start = NONE
+                    } else {
+                        seen_sep = true
+                        start = le + 1
+                        if start > bend {
+                            start = bend
+                        }
+                    }
+                }
+                i = le + 1
+            }
+            if !done && start != NONE {
+                let ci: usize = part_new(m, pi, depth + 1)
+                parse_part(m, ci, start, bend, depth + 1, digest)
+            }
+        }
+        rt.buf_free(&bd)
+        rt.buf_free(&cv)
+    } else if eq_nocase(t, "message/rfc822") {
+        var ce: rt.Buf = rt.buf_new()
+        part_header(m, pi, "content-transfer-encoding", &ce)
+        let cs: str = trim(str { p: rt.buf_data(&ce), n: rt.buf_len(&ce) })
+        let plain: bool = cs.n == 0 || eq_nocase(cs, "7bit") || eq_nocase(cs, "8bit") || eq_nocase(cs, "binary")
+        rt.buf_free(&ce)
+        if plain {
+            let ci: usize = part_new(m, pi, depth + 1)
+            parse_part(m, ci, boff, bend, depth + 1, false)
+        }
+    }
+    rt.buf_free(&ty)
+}
+
+// Parse a message. The octets are copied into the Msg.
+fn msg_parse(p: u64, n: usize) -> Msg {
+    var m: Msg = Msg { src: rt.buf_new(), hdrs: vec_new[Hdr](), parts: vec_new[Part]() }
+    if n > 0 {
+        rt.buf_push_bytes(&m.src, p, n)
+    }
+    let root: usize = part_new(&m, NONE, 0)
+    parse_part(&m, root, 0, n, 0, false)
+    return m
+}
+
+fn msg_header_count(m: *mut Msg) -> usize {
+    return (*vec_elem_ptr[Part](&(*m).parts, 0)).nhdr
+}
+
+fn msg_header_name(m: *mut Msg, k: usize) -> str {
+    let pp: *mut Part = vec_elem_ptr[Part](&(*m).parts, 0)
+    let h: *mut Hdr = vec_elem_ptr[Hdr](&(*m).hdrs, (*pp).first_hdr + k)
+    return view(msg_src(m), (*h).noff, (*h).noff + (*h).nlen)
+}
+
+fn msg_header_raw(m: *mut Msg, k: usize) -> str {
+    let pp: *mut Part = vec_elem_ptr[Part](&(*m).parts, 0)
+    let h: *mut Hdr = vec_elem_ptr[Hdr](&(*m).hdrs, (*pp).first_hdr + k)
+    return view(msg_src(m), (*h).voff, (*h).voff + (*h).vlen)
+}
+
+// the unfolded value of the first header `name` of the message
+fn msg_header(m: *mut Msg, pi: usize, name: str, out: *mut rt.Buf) -> bool {
+    return part_header(m, pi, name, out)
+}
+
+// index of the first header called `name` (any case) of the message, or NONE
+fn msg_header_find(m: *mut Msg, name: str) -> usize {
+    var k: usize = 0
+    let n: usize = msg_header_count(m)
+    while k < n {
+        if eq_nocase(msg_header_name(m, k), name) {
+            return k
+        }
+        k += 1
+    }
+    return NONE
+}
+
+fn parts_count(m: *mut Msg) -> usize {
+    return vec_len[Part](&(*m).parts)
+}
+
+fn part_parent(m: *mut Msg, k: usize) -> usize {
+    return (*vec_elem_ptr[Part](&(*m).parts, k)).parent
+}
+
+fn part_first_child(m: *mut Msg, k: usize) -> usize {
+    return (*vec_elem_ptr[Part](&(*m).parts, k)).first_child
+}
+
+fn part_next(m: *mut Msg, k: usize) -> usize {
+    return (*vec_elem_ptr[Part](&(*m).parts, k)).next
+}
+
+fn part_depth(m: *mut Msg, k: usize) -> u32 {
+    return (*vec_elem_ptr[Part](&(*m).parts, k)).depth
+}
+
+// the raw body octets of a part (still transfer-encoded)
+fn part_body(m: *mut Msg, k: usize) -> str {
+    let pp: *mut Part = vec_elem_ptr[Part](&(*m).parts, k)
+    return view(msg_src(m), (*pp).boff, (*pp).boff + (*pp).blen)
+}
+
+// lowercased, trimmed Content-Transfer-Encoding ("" if none)
+fn part_cte(m: *mut Msg, k: usize, out: *mut rt.Buf) {
+    var v: rt.Buf = rt.buf_new()
+    if part_header(m, k, "content-transfer-encoding", &v) {
+        let t: str = trim(str { p: rt.buf_data(&v), n: rt.buf_len(&v) })
+        var i: usize = 0
+        while i < t.n {
+            rt.buf_push(out, lower(at(t, i)) as u8)
+            i += 1
+        }
+    }
+    rt.buf_free(&v)
+}
+
+// the body after the Content-Transfer-Encoding; true if it was decoded
+// (false: the octets were copied as they are)
+fn part_decoded(m: *mut Msg, k: usize, out: *mut rt.Buf) -> bool {
+    var ce: rt.Buf = rt.buf_new()
+    part_cte(m, k, &ce)
+    let c: str = str { p: rt.buf_data(&ce), n: rt.buf_len(&ce) }
+    let body: str = part_body(m, k)
+    var ok: bool = true
+    if eq_nocase(c, "base64") {
+        var tmp: rt.Buf = rt.buf_new()
+        if base64.decode(body.p as u64, body.n, &tmp) {
+            rt.buf_push_bytes(out, rt.buf_ptr(&tmp), rt.buf_len(&tmp))
+        } else {
+            push_str(out, body)
+            ok = false
+        }
+        rt.buf_free(&tmp)
+    } else if eq_nocase(c, "quoted-printable") {
+        qp_decode(body, out)
+    } else {
+        push_str(out, body)
+        ok = false
+    }
+    rt.buf_free(&ce)
+    return ok
+}
+
+// ------------------------------------------------- header parameters
+
+// Value of parameter `name` (lowercase) in a Content-Type / Content-Disposition
+// value. Handles quoted strings, RFC 2231 `name*=cs'lang'%XX`, `name*0=`,
+// `name*0*=`. The result is UTF-8 for RFC 2231 values with a known charset,
+// else the octets. false if the parameter is absent.
+fn param_get(v: str, name: str, out: *mut rt.Buf) -> bool {
+    // skip the value itself up to the first ';'
+    var i: usize = 0
+    var q: bool = false
+    var plain: rt.Buf = rt.buf_new()
+    var ext: rt.Buf = rt.buf_new() // RFC 2231 pieces, already percent decoded, in order
+    var ext_cs: rt.Buf = rt.buf_new()
+    var have_plain: bool = false
+    var have_ext: bool = false
+    var next_idx: u32 = 0
+    while i < v.n && at(v, i) != 59 {
+        i += 1
+    }
+    while i < v.n {
+        // at ';'
+        i += 1
+        // parameter name
+        while i < v.n && is_wsp(at(v, i)) {
+            i += 1
+        }
+        let ns: usize = i
+        while i < v.n && at(v, i) != 61 && at(v, i) != 59 {
+            i += 1
+        }
+        if i >= v.n || at(v, i) != 61 {
+            continue
+        }
+        let nm: str = trim(view(v, ns, i))
+        i += 1
+        while i < v.n && is_wsp(at(v, i)) {
+            i += 1
+        }
+        // value: quoted-string or token
+        var raw: rt.Buf = rt.buf_new()
+        var quoted: bool = false
+        if i < v.n && at(v, i) == 34 {
+            quoted = true
+            i += 1
+            while i < v.n && at(v, i) != 34 {
+                if at(v, i) == 92 && i + 1 < v.n {
+                    i += 1
+                }
+                rt.buf_push(&raw, at(v, i) as u8)
+                i += 1
+            }
+            if i < v.n {
+                i += 1
+            }
+            while i < v.n && at(v, i) != 59 {
+                i += 1
+            }
+        } else {
+            let vs: usize = i
+            while i < v.n && at(v, i) != 59 {
+                i += 1
+            }
+            push_str(&raw, trim(view(v, vs, i)))
+        }
+        let rv: str = str { p: rt.buf_data(&raw), n: rt.buf_len(&raw) }
+        // does the name match?  name, name*, name*N, name*N*
+        if nm.n >= name.n && eq_nocase(view(nm, 0, name.n), name) {
+            let rest: str = view(nm, name.n, nm.n)
+            if rest.n == 0 {
+                if !have_plain {
+                    push_str(&plain, rv)
+                    have_plain = true
+                }
+            } else if at(rest, 0) == 42 {
+                // "*" or "*N" or "*N*"
+                var star_end: bool = at(rest, rest.n - 1) == 42
+                var idx: u32 = 0
+                var digits: usize = 0
+                var d: usize = 1
+                while d < rest.n && at(rest, d) >= 48 && at(rest, d) <= 57 {
+                    idx = idx * 10 + (at(rest, d) - 48)
+                    digits += 1
+                    d += 1
+                }
+                var ok: bool = true
+                if digits == 0 && rest.n != 1 {
+                    ok = false
+                }
+                if ok && (digits == 0 || idx == next_idx) {
+                    var data: str = rv
+                    if (digits == 0 || idx == 0) && star_end {
+                        // charset'lang'data
+                        var a: usize = 0
+                        while a < rv.n && at(rv, a) != 39 {
+                            a += 1
+                        }
+                        var b: usize = a + 1
+                        while b < rv.n && at(rv, b) != 39 {
+                            b += 1
+                        }
+                        if a < rv.n && b < rv.n {
+                            push_str(&ext_cs, view(rv, 0, a))
+                            data = view(rv, b + 1, rv.n)
+                        }
+                    }
+                    // percent decode when the piece is extended (star_end) else copy
+                    var t: usize = 0
+                    while t < data.n {
+                        let c: u32 = at(data, t)
+                        if star_end && c == 37 && t + 2 < data.n + 0 + 1 && t + 2 <= data.n - 1 + 0 && hexval(at(data, t + 1)) < 16 && hexval(at(data, t + 2)) < 16 {
+                            rt.buf_push(&ext, (hexval(at(data, t + 1)) * 16 + hexval(at(data, t + 2))) as u8)
+                            t += 3
+                        } else {
+                            rt.buf_push(&ext, c as u8)
+                            t += 1
+                        }
+                    }
+                    have_ext = true
+                    next_idx = idx + 1
+                    if digits == 0 {
+                        next_idx = 1000000
+                    }
+                }
+            }
+        }
+        rt.buf_free(&raw)
+        // loop continues at the next ';'
+    }
+    var found: bool = false
+    if have_ext {
+        let e: str = str { p: rt.buf_data(&ext), n: rt.buf_len(&ext) }
+        if rt.buf_len(&ext_cs) > 0 {
+            charset_to_utf8(str { p: rt.buf_data(&ext_cs), n: rt.buf_len(&ext_cs) }, e, out)
+        } else {
+            push_str(out, e)
+        }
+        found = true
+    } else if have_plain {
+        push_str(out, str { p: rt.buf_data(&plain), n: rt.buf_len(&plain) })
+        found = true
+    }
+    rt.buf_free(&plain)
+    rt.buf_free(&ext)
+    rt.buf_free(&ext_cs)
+    return found
+}
+
+fn param_get_value(v: str, name: str, out: *mut rt.Buf) -> bool {
+    return param_get(v, name, out)
+}
+
+// parameter `name` of header `hdr` of part k
+fn part_param(m: *mut Msg, k: usize, hdr: str, name: str, out: *mut rt.Buf) -> bool {
+    var v: rt.Buf = rt.buf_new()
+    var r: bool = false
+    if part_header(m, k, hdr, &v) {
+        r = param_get(str { p: rt.buf_data(&v), n: rt.buf_len(&v) }, name, out)
+    }
+    rt.buf_free(&v)
+    return r
+}
+
+fn part_charset(m: *mut Msg, k: usize, out: *mut rt.Buf) -> bool {
+    return part_param(m, k, "content-type", "charset", out)
+}
+
+// the file name: Content-Disposition filename, else Content-Type name
+fn part_filename(m: *mut Msg, k: usize, out: *mut rt.Buf) -> bool {
+    if part_param(m, k, "content-disposition", "filename", out) {
+        return true
+    }
+    return part_param(m, k, "content-type", "name", out)
+}
+
+// ------------------------------------------------------------ addresses
+
+const AK_MAILBOX: u32 = 0
+const AK_GROUP_START: u32 = 1
+const AK_GROUP_END: u32 = 2
+
+struct AddrItem {
+    kind: u32,
+    noff: usize,
+    nlen: usize,
+    aoff: usize,
+    alen: usize,
+}
+
+struct AddrList {
+    text: rt.Buf,
+    items: Vec[AddrItem],
+}
+
+fn addr_free(a: *mut AddrList) {
+    rt.buf_free(&(*a).text)
+    vec_free[AddrItem](&(*a).items)
+}
+
+fn addr_count(a: *mut AddrList) -> usize {
+    return vec_len[AddrItem](&(*a).items)
+}
+
+fn addr_kind(a: *mut AddrList, k: usize) -> u32 {
+    return (*vec_elem_ptr[AddrItem](&(*a).items, k)).kind
+}
+
+// display name (UTF-8, decoded); for a group start the group name
+fn addr_name(a: *mut AddrList, k: usize) -> str {
+    let it: *mut AddrItem = vec_elem_ptr[AddrItem](&(*a).items, k)
+    return str { p: rt.buf_data(&(*a).text) + (*it).noff, n: (*it).nlen }
+}
+
+// "local@domain" of a mailbox
+fn addr_spec(a: *mut AddrList, k: usize) -> str {
+    let it: *mut AddrItem = vec_elem_ptr[AddrItem](&(*a).items, k)
+    return str { p: rt.buf_data(&(*a).text) + (*it).aoff, n: (*it).alen }
+}
+
+fn is_atext(c: u32) -> bool {
+    if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c >= 128 {
+        return true
+    }
+    return c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 || c == 42 || c == 43
+    || c == 45 || c == 47 || c == 61 || c == 63 || c == 94 || c == 95 || c == 96 || c == 123
+    || c == 124 || c == 125 || c == 126
+}
+
+// skip blanks, line breaks and (nested) comments
+fn skip_cfws(s: str, i0: usize) -> usize {
+    var i: usize = i0
+    while i < s.n {
+        let c: u32 = at(s, i)
+        if c == 32 || c == 9 || c == 13 || c == 10 {
+            i += 1
+        } else if c == 40 {
+            var depth: u32 = 1
+            i += 1
+            while i < s.n && depth > 0 {
+                let d: u32 = at(s, i)
+                if d == 92 && i + 1 < s.n {
+                    i += 2
+                    continue
+                }
+                if d == 40 {
+                    depth += 1
+                } else if d == 41 {
+                    depth -= 1
+                }
+                i += 1
+            }
+        } else {
+            break
+        }
+    }
+    return i
+}
+
+// at a '"': append the unescaped content, return the index after the closing quote
+fn parse_quoted(s: str, i0: usize, out: *mut rt.Buf) -> usize {
+    var i: usize = i0 + 1
+    while i < s.n && at(s, i) != 34 {
+        if at(s, i) == 92 && i + 1 < s.n {
+            i += 1
+        }
+        if at(s, i) != 13 && at(s, i) != 10 {
+            rt.buf_push(out, at(s, i) as u8)
+        }
+        i += 1
+    }
+    if i < s.n {
+        i += 1
+    }
+    return i
+}
+
+// Display-name words (atoms, quoted-strings, '.'). Returns the index after
+// the last word. Words are joined by one blank; encoded-word atoms are decoded
+// and two of them in a row are joined without a blank.
+fn parse_phrase(s: str, i0: usize, out: *mut rt.Buf) -> usize {
+    var i: usize = i0
+    var end: usize = i0
+    var first: bool = true
+    var prev_enc: bool = false
+    while true {
+        let j: usize = skip_cfws(s, i)
+        if j >= s.n {
+            break
+        }
+        let c: u32 = at(s, j)
+        if c == 34 {
+            if !first {
+                rt.buf_push(out, 32 as u8)
+            }
+            i = parse_quoted(s, j, out)
+            prev_enc = false
+        } else if is_atext(c) || c == 46 {
+            var k: usize = j
+            while k < s.n && (is_atext(at(s, k)) || at(s, k) == 46) {
+                k += 1
+            }
+            let w: str = view(s, j, k)
+            var cs: str = ""
+            var enc: u32 = 0
+            var tx: str = ""
+            let isenc: bool = word_at(w, 0, &cs, &enc, &tx) == w.n
+            if !first && !(isenc && prev_enc) {
+                rt.buf_push(out, 32 as u8)
+            }
+            if isenc {
+                decode_words(w, out)
+            } else {
+                push_str(out, w)
+            }
+            prev_enc = isenc
+            i = k
+        } else {
+            break
+        }
+        first = false
+        end = i
+    }
+    return end
+}
+
+fn atom_ok(s: str) -> bool {
+    // a dot-atom: atext chars separated by single dots
+    if s.n == 0 {
+        return false
+    }
+    var prev_dot: bool = true
+    var i: usize = 0
+    while i < s.n {
+        let c: u32 = at(s, i)
+        if c == 46 {
+            if prev_dot {
+                return false
+            }
+            prev_dot = true
+        } else if is_atext(c) && c < 128 {
+            prev_dot = false
+        } else {
+            return false
+        }
+        i += 1
+    }
+    return !prev_dot
+}
+
+// addr-spec: local-part "@" domain. Appends "local@domain" to out; returns the
+// index after it (or NONE if nothing usable is there).
+fn parse_addr_spec(s: str, i0: usize, out: *mut rt.Buf) -> usize {
+    var local: rt.Buf = rt.buf_new()
+    var i: usize = skip_cfws(s, i0)
+    var any: bool = false
+    var last: usize = i0
+    while i < s.n {
+        let c: u32 = at(s, i)
+        if c == 34 {
+            i = parse_quoted(s, i, &local)
+        } else if is_atext(c) {
+            while i < s.n && is_atext(at(s, i)) {
+                rt.buf_push(&local, at(s, i) as u8)
+                i += 1
+            }
+        } else {
+            break
+        }
+        any = true
+        last = i
+        let j: usize = skip_cfws(s, i)
+        if j < s.n && at(s, j) == 46 {
+            rt.buf_push(&local, 46 as u8)
+            i = skip_cfws(s, j + 1)
+        } else {
+            i = j
+            break
+        }
+    }
+    if !any {
+        rt.buf_free(&local)
+        return NONE
+    }
+    let lstr: str = str { p: rt.buf_data(&local), n: rt.buf_len(&local) }
+    if atom_ok(lstr) {
+        push_str(out, lstr)
+    } else {
+        rt.buf_push(out, 34 as u8)
+        var q: usize = 0
+        while q < lstr.n {
+            let c: u32 = at(lstr, q)
+            if c == 34 || c == 92 {
+                rt.buf_push(out, 92 as u8)
+            }
+            rt.buf_push(out, c as u8)
+            q += 1
+        }
+        rt.buf_push(out, 34 as u8)
+    }
+    rt.buf_free(&local)
+    var end: usize = last
+    if i < s.n && at(s, i) == 64 {
+        rt.buf_push(out, 64 as u8)
+        i = skip_cfws(s, i + 1)
+        if i < s.n && at(s, i) == 91 {
+            while i < s.n && at(s, i) != 93 {
+                if at(s, i) > 32 {
+                    rt.buf_push(out, at(s, i) as u8)
+                }
+                i += 1
+            }
+            if i < s.n {
+                rt.buf_push(out, 93 as u8)
+                i += 1
+            }
+            end = i
+        } else {
+            while i < s.n && (is_atext(at(s, i)) || at(s, i) == 46) {
+                rt.buf_push(out, at(s, i) as u8)
+                i += 1
+            }
+            end = i
+        }
+    }
+    return end
+}
+
+fn addr_emit(a: *mut AddrList, kind: u32, name: str, spec: str) {
+    let noff: usize = rt.buf_len(&(*a).text)
+    push_str(&(*a).text, name)
+    let aoff: usize = rt.buf_len(&(*a).text)
+    push_str(&(*a).text, spec)
+    vec_push[AddrItem](&(*a).items, AddrItem { kind: kind, noff: noff, nlen: name.n, aoff: aoff, alen: spec.n })
+}
+
+// Parse an address-list header value (unfolded).
+fn addr_parse(s: str) -> AddrList {
+    var a: AddrList = AddrList { text: rt.buf_new(), items: vec_new[AddrItem]() }
+    var i: usize = 0
+    var in_group: bool = false
+    while i < s.n {
+        i = skip_cfws(s, i)
+        if i >= s.n {
+            break
+        }
+        let c: u32 = at(s, i)
+        if c == 44 {
+            i += 1
+            continue
+        }
+        if c == 59 {
+            if in_group {
+                addr_emit(&a, AK_GROUP_END, "", "")
+                in_group = false
+            }
+            i += 1
+            continue
+        }
+        var name: rt.Buf = rt.buf_new()
+        let pe: usize = parse_phrase(s, i, &name)
+        var j: usize = skip_cfws(s, pe)
+        let nstr: str = str { p: rt.buf_data(&name), n: rt.buf_len(&name) }
+        if pe > i && j < s.n && at(s, j) == 60 {
+            // name-addr
+            var k: usize = skip_cfws(s, j + 1)
+            // obsolete route "@a,@b:" is skipped
+            if k < s.n && at(s, k) == 64 {
+                while k < s.n && at(s, k) != 58 && at(s, k) != 62 {
+                    k += 1
+                }
+                if k < s.n && at(s, k) == 58 {
+                    k += 1
+                }
+            }
+            var spec: rt.Buf = rt.buf_new()
+            let e: usize = parse_addr_spec(s, k, &spec)
+            if e != NONE {
+                addr_emit(&a, AK_MAILBOX, nstr, str { p: rt.buf_data(&spec), n: rt.buf_len(&spec) })
+                k = e
+            }
+            rt.buf_free(&spec)
+            while k < s.n && at(s, k) != 62 && at(s, k) != 44 {
+                k += 1
+            }
+            if k < s.n && at(s, k) == 62 {
+                k += 1
+            }
+            i = k
+        } else if pe > i && j < s.n && at(s, j) == 58 && !in_group {
+            addr_emit(&a, AK_GROUP_START, nstr, "")
+            in_group = true
+            i = j + 1
+        } else if j < s.n && at(s, j) == 60 && pe == i {
+            // "<addr>" without a name
+            var spec: rt.Buf = rt.buf_new()
+            let e: usize = parse_addr_spec(s, j + 1, &spec)
+            if e != NONE {
+                addr_emit(&a, AK_MAILBOX, "", str { p: rt.buf_data(&spec), n: rt.buf_len(&spec) })
+                j = e
+            }
+            rt.buf_free(&spec)
+            while j < s.n && at(s, j) != 62 && at(s, j) != 44 {
+                j += 1
+            }
+            if j < s.n && at(s, j) == 62 {
+                j += 1
+            }
+            i = j
+        } else {
+            // bare addr-spec
+            var spec: rt.Buf = rt.buf_new()
+            let e: usize = parse_addr_spec(s, i, &spec)
+            if e != NONE {
+                addr_emit(&a, AK_MAILBOX, "", str { p: rt.buf_data(&spec), n: rt.buf_len(&spec) })
+                i = e
+            } else {
+                i += 1
+            }
+            rt.buf_free(&spec)
+        }
+        rt.buf_free(&name)
+    }
+    if in_group {
+        addr_emit(&a, AK_GROUP_END, "", "")
+    }
+    return a
+}
+
+// --------------------------------------------------------------- dates
+
+struct Date {
+    ok: bool,
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    tz_known: bool,
+    tz_min: i32, // offset from UTC in minutes
+}
+
+fn month_index(t: str) -> u32 {
+    let names: str = "janfebmaraprmayjunjulaugsepoctnovdec"
+    let longn: [str; 12] = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
+    var k: u32 = 0
+    while k < 12 {
+        if eq_nocase(t, view(names, (k * 3) as usize, (k * 3 + 3) as usize)) {
+            return k + 1
+        }
+        if eq_nocase(t, longn[k as usize]) {
+            return k + 1
+        }
+        k += 1
+    }
+    return 0
+}
+
+fn is_dayname(t: str) -> bool {
+    let names: str = "monvtuewedthufrisatsun"
+    if t.n != 3 {
+        return false
+    }
+    return eq_nocase(t, "mon") || eq_nocase(t, "tue") || eq_nocase(t, "wed") || eq_nocase(t, "thu")
+    || eq_nocase(t, "fri") || eq_nocase(t, "sat") || eq_nocase(t, "sun")
+}
+
+// decimal number of the whole token; NONE-like -1 if it is not one
+fn parse_int(t: str) -> i64 {
+    if t.n == 0 {
+        return -1
+    }
+    var v: i64 = 0
+    var i: usize = 0
+    var neg: bool = false
+    if at(t, 0) == 43 || at(t, 0) == 45 {
+        neg = at(t, 0) == 45
+        i = 1
+        if t.n == 1 {
+            return -1000000
+        }
+    }
+    while i < t.n {
+        let c: u32 = at(t, i)
+        if c < 48 || c > 57 {
+            return -1000000
+        }
+        v = v * 10 + (c - 48) as i64
+        if v > 100000000 {
+            return -1000000
+        }
+        i += 1
+    }
+    if neg {
+        return -v
+    }
+    return v
+}
+
+fn zone_minutes(t: str, known: *mut bool) -> i32 {
+    *known = true
+    if eq_nocase(t, "UT") || eq_nocase(t, "UTC") || eq_nocase(t, "GMT") || eq_nocase(t, "Z") { return 0 }
+    if eq_nocase(t, "AST") { return -240 }
+    if eq_nocase(t, "ADT") { return -180 }
+    if eq_nocase(t, "EST") { return -300 }
+    if eq_nocase(t, "EDT") { return -240 }
+    if eq_nocase(t, "CST") { return -360 }
+    if eq_nocase(t, "CDT") { return -300 }
+    if eq_nocase(t, "MST") { return -420 }
+    if eq_nocase(t, "MDT") { return -360 }
+    if eq_nocase(t, "PST") { return -480 }
+    if eq_nocase(t, "PDT") { return -420 }
+    let v: i64 = parse_int(t)
+    if v == -1000000 || v == -1 && t.n == 0 {
+        *known = false
+        return 0
+    }
+    if t.n > 0 && at(t, 0) != 43 && at(t, 0) != 45 && (v < 0) {
+        *known = false
+        return 0
+    }
+    var x: i64 = v
+    var sign: i64 = 1
+    if x < 0 {
+        sign = -1
+        x = -x
+    }
+    if x == 0 && at(t, 0) == 45 {
+        *known = false
+        return 0
+    }
+    return (sign * ((x / 100) * 60 + x % 100)) as i32
+}
+
+// Parse an RFC 5322 date-time (the way Python's email.utils.parsedate_tz reads it).
+fn date_parse(s: str) -> Date {
+    var d: Date = Date { ok: false, year: 0, month: 0, day: 0, hour: 0, minute: 0, second: 0, tz_known: false, tz_min: 0 }
+    var tok: [str; 8] = ["", "", "", "", "", "", "", ""]
+    var nt: usize = 0
+    var i: usize = 0
+    while i < s.n && nt < 8 {
+        while i < s.n && (is_wsp(at(s, i)) || at(s, i) == 13 || at(s, i) == 10) {
+            i += 1
+        }
+        let b: usize = i
+        while i < s.n && !(is_wsp(at(s, i)) || at(s, i) == 13 || at(s, i) == 10) {
+            i += 1
+        }
+        if i > b {
+            tok[nt] = view(s, b, i)
+            nt += 1
+        }
+    }
+    if nt == 0 {
+        return d
+    }
+    var first: usize = 0
+    let t0: str = tok[0]
+    if at(t0, t0.n - 1) == 44 || is_dayname(t0) {
+        first = 1
+    } else {
+        var c: usize = t0.n
+        while c > 0 && at(t0, c - 1) != 44 {
+            c -= 1
+        }
+        if c > 0 {
+            tok[0] = view(t0, c, t0.n)
+        }
+    }
+    var data: [str; 8] = ["", "", "", "", "", "", "", ""]
+    var nd: usize = 0
+    var k: usize = first
+    while k < nt {
+        data[nd] = tok[k]
+        nd += 1
+        k += 1
+    }
+    if nd == 4 {
+        let s3: str = data[3]
+        var p: usize = 0
+        while p < s3.n && at(s3, p) != 43 {
+            p += 1
+        }
+        if p == s3.n {
+            p = 0
+            while p < s3.n && at(s3, p) != 45 {
+                p += 1
+            }
+        }
+        if p > 0 && p < s3.n {
+            data[3] = view(s3, 0, p)
+            data[4] = view(s3, p, s3.n)
+        } else {
+            data[4] = ""
+        }
+        nd = 5
+    }
+    if nd < 5 {
+        return d
+    }
+    var dd: str = data[0]
+    var mm: str = data[1]
+    var yy: str = data[2]
+    var tm: str = data[3]
+    var tz: str = data[4]
+    if dd.n == 0 || mm.n == 0 || yy.n == 0 {
+        return d
+    }
+    var mi: u32 = month_index(mm)
+    if mi == 0 {
+        let sw: str = dd
+        dd = mm
+        mm = sw
+        mi = month_index(mm)
+        if mi == 0 {
+            return d
+        }
+    }
+    if at(dd, dd.n - 1) == 44 {
+        dd = view(dd, 0, dd.n - 1)
+    }
+    var colon: usize = 0
+    while colon < yy.n && at(yy, colon) != 58 {
+        colon += 1
+    }
+    if colon > 0 && colon < yy.n {
+        let sw: str = yy
+        yy = tm
+        tm = sw
+    }
+    if yy.n > 0 && at(yy, yy.n - 1) == 44 {
+        yy = view(yy, 0, yy.n - 1)
+    }
+    if yy.n == 0 {
+        return d
+    }
+    if at(yy, 0) < 48 || at(yy, 0) > 57 {
+        let sw: str = yy
+        yy = tz
+        tz = sw
+        if yy.n == 0 {
+            return d
+        }
+    }
+    if tm.n > 0 && at(tm, tm.n - 1) == 44 {
+        tm = view(tm, 0, tm.n - 1)
+    }
+    // hh:mm[:ss]
+    var c1: usize = 0
+    while c1 < tm.n && at(tm, c1) != 58 {
+        c1 += 1
+    }
+    if c1 >= tm.n {
+        return d
+    }
+    var c2: usize = c1 + 1
+    while c2 < tm.n && at(tm, c2) != 58 {
+        c2 += 1
+    }
+    let hh: i64 = parse_int(view(tm, 0, c1))
+    var mn: i64 = 0
+    var ss: i64 = 0
+    if c2 < tm.n {
+        mn = parse_int(view(tm, c1 + 1, c2))
+        ss = parse_int(view(tm, c2 + 1, tm.n))
+    } else {
+        mn = parse_int(view(tm, c1 + 1, tm.n))
+    }
+    var year: i64 = parse_int(yy)
+    let day: i64 = parse_int(dd)
+    if year < 0 || day < 0 || hh < 0 || mn < 0 || ss < 0 {
+        return d
+    }
+    if year < 100 {
+        if year > 68 {
+            year += 1900
+        } else {
+            year += 2000
+        }
+    }
+    var known: bool = false
+    let zm: i32 = zone_minutes(tz, &known)
+    d.ok = true
+    d.year = year as i32
+    d.month = mi
+    d.day = day as u32
+    d.hour = hh as u32
+    d.minute = mn as u32
+    d.second = ss as u32
+    d.tz_known = known
+    d.tz_min = zm
+    return d
+}
+
+// seconds since 1970-01-01 00:00:00 UTC
+fn date_epoch(d: *mut Date) -> i64 {
+    let days: i64 = time.days_from_civil((*d).year, (*d).month, (*d).day)
+    return days * 86400 + ((*d).hour as i64) * 3600 + ((*d).minute as i64) * 60 + (*d).second as i64 - ((*d).tz_min as i64) * 60
+}
+
+fn push_dec2(out: *mut rt.Buf, v: u32) {
+    rt.buf_push(out, (48 + (v / 10) % 10) as u8)
+    rt.buf_push(out, (48 + v % 10) as u8)
+}
+
+// "Fri, 16 Oct 2026 09:19:00 +0200"
+fn date_format(d: *mut Date, out: *mut rt.Buf) {
+    let days: i64 = time.days_from_civil((*d).year, (*d).month, (*d).day)
+    var wd: i64 = (days + 4) % 7
+    if wd < 0 {
+        wd += 7
+    }
+    let dn: str = "SunMonTueWedThuFriSat"
+    let mn: str = "JanFebMarAprMayJunJulAugSepOctNovDec"
+    push_str(out, view(dn, (wd * 3) as usize, (wd * 3 + 3) as usize))
+    push_str(out, ", ")
+    rt.buf_push_dec_u64(out, (*d).day as u64)
+    rt.buf_push(out, 32 as u8)
+    let mi: usize = ((*d).month as usize + 11) % 12
+    push_str(out, view(mn, mi * 3, mi * 3 + 3))
+    rt.buf_push(out, 32 as u8)
+    rt.buf_push_dec_u64(out, (*d).year as u64)
+    rt.buf_push(out, 32 as u8)
+    push_dec2(out, (*d).hour)
+    rt.buf_push(out, 58 as u8)
+    push_dec2(out, (*d).minute)
+    rt.buf_push(out, 58 as u8)
+    push_dec2(out, (*d).second)
+    rt.buf_push(out, 32 as u8)
+    var z: i32 = (*d).tz_min
+    if z < 0 {
+        rt.buf_push(out, 45 as u8)
+        z = -z
+    } else {
+        rt.buf_push(out, 43 as u8)
+    }
+    push_dec2(out, (z / 60) as u32)
+    push_dec2(out, (z % 60) as u32)
+}
+
+// -------------------------------------------------------------- builder
+
+struct Att {
+    name: rt.Buf,
+    ctype: rt.Buf,
+    data: rt.Buf,
+}
+
+struct Builder {
+    from: rt.Buf,
+    to: rt.Buf,
+    cc: rt.Buf,
+    subject: rt.Buf,
+    text: rt.Buf,
+    html: rt.Buf,
+    date: rt.Buf,
+    msgid: rt.Buf,
+    extra: rt.Buf, // finished header lines
+    atts: Vec[Att],
+    seed_a: u64,
+    seed_b: u64,
+}
+
+static mut builder_counter: u64 = 0
+
+fn builder_new() -> Builder {
+    return Builder {
+        from: rt.buf_new(), to: rt.buf_new(), cc: rt.buf_new(), subject: rt.buf_new(),
+        text: rt.buf_new(), html: rt.buf_new(), date: rt.buf_new(), msgid: rt.buf_new(),
+        extra: rt.buf_new(), atts: vec_new[Att](), seed_a: 0, seed_b: 0,
+    }
+}
+
+fn builder_free(b: *mut Builder) {
+    rt.buf_free(&(*b).from)
+    rt.buf_free(&(*b).to)
+    rt.buf_free(&(*b).cc)
+    rt.buf_free(&(*b).subject)
+    rt.buf_free(&(*b).text)
+    rt.buf_free(&(*b).html)
+    rt.buf_free(&(*b).date)
+    rt.buf_free(&(*b).msgid)
+    rt.buf_free(&(*b).extra)
+    var k: usize = 0
+    while k < vec_len[Att](&(*b).atts) {
+        let a: *mut Att = vec_elem_ptr[Att](&(*b).atts, k)
+        rt.buf_free(&(*a).name)
+        rt.buf_free(&(*a).ctype)
+        rt.buf_free(&(*a).data)
+        k += 1
+    }
+    vec_free[Att](&(*b).atts)
+}
+
+fn set_buf(b: *mut rt.Buf, s: str) {
+    rt.buf_clear(b)
+    push_str(b, s)
+}
+
+// the From/To/Cc values are address lists as text: use format_address and ", "
+fn builder_set_from(b: *mut Builder, v: str) { set_buf(&(*b).from, v) }
+
+fn builder_add_to(b: *mut Builder, v: str) {
+    if rt.buf_len(&(*b).to) > 0 {
+        push_str(&(*b).to, ", ")
+    }
+    push_str(&(*b).to, v)
+}
+
+fn builder_add_cc(b: *mut Builder, v: str) {
+    if rt.buf_len(&(*b).cc) > 0 {
+        push_str(&(*b).cc, ", ")
+    }
+    push_str(&(*b).cc, v)
+}
+
+fn builder_set_subject(b: *mut Builder, v: str) { set_buf(&(*b).subject, v) }
+fn builder_set_text(b: *mut Builder, v: str) { set_buf(&(*b).text, v) }
+fn builder_set_html(b: *mut Builder, v: str) { set_buf(&(*b).html, v) }
+fn builder_set_date(b: *mut Builder, v: str) { set_buf(&(*b).date, v) }
+fn builder_set_message_id(b: *mut Builder, v: str) { set_buf(&(*b).msgid, v) }
+
+// an extra header (name, ASCII value); added to the message as it is, folded
+fn builder_add_header(b: *mut Builder, name: str, value: str) {
+    emit_header(&(*b).extra, name, value)
+}
+
+fn builder_set_seed(b: *mut Builder, a: u64, c: u64) {
+    (*b).seed_a = a
+    (*b).seed_b = c
+}
+
+fn builder_attach(b: *mut Builder, name: str, ctype: str, p: u64, n: usize) {
+    var a: Att = Att { name: rt.buf_new(), ctype: rt.buf_new(), data: rt.buf_new() }
+    push_str(&a.name, name)
+    push_str(&a.ctype, ctype)
+    if n > 0 {
+        rt.buf_push_bytes(&a.data, p, n)
+    }
+    vec_push[Att](&(*b).atts, a)
+}
+
+fn crlf(out: *mut rt.Buf) {
+    rt.buf_push(out, 13 as u8)
+    rt.buf_push(out, 10 as u8)
+}
+
+// "Name: value" folded at 78 columns (at blanks; a CRLF+blank inside the value stays)
+fn emit_header(out: *mut rt.Buf, name: str, value: str) {
+    push_str(out, name)
+    push_str(out, ": ")
+    var col: usize = name.n + 2
+    var i: usize = 0
+    var first: bool = true
+    while i < value.n {
+        while i < value.n && at(value, i) == 32 {
+            i += 1
+        }
+        var forced: bool = false
+        if i + 2 < value.n && at(value, i) == 13 && at(value, i + 1) == 10 && at(value, i + 2) == 32 {
+            forced = true
+            i += 3
+        }
+        let b: usize = i
+        while i < value.n && at(value, i) != 32 && at(value, i) != 13 {
+            i += 1
+        }
+        if i == b {
+            if i < value.n && at(value, i) == 13 {
+                i += 1
+            }
+            continue
+        }
+        let tl: usize = i - b
+        if first {
+            col += tl
+        } else if forced || col + 1 + tl > 78 {
+            crlf(out)
+            rt.buf_push(out, 32 as u8)
+            col = 1 + tl
+        } else {
+            rt.buf_push(out, 32 as u8)
+            col += 1 + tl
+        }
+        first = false
+        push_str(out, view(value, b, i))
+    }
+    crlf(out)
+}
+
+// ASCII text only in the header value: others are encoded
+fn encoded_value(v: str, out: *mut rt.Buf) {
+    encode_words(v, out)
+}
+
+fn needs_quote(name: str) -> bool {
+    var i: usize = 0
+    while i < name.n {
+        let c: u32 = at(name, i)
+        if !(is_atext(c) || c == 32) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// "Display Name" <local@domain> as a header fragment (quotes, escapes, or encoded-words)
+fn format_address(out: *mut rt.Buf, name: str, addr: str) {
+    if name.n == 0 {
+        push_str(out, addr)
+        return
+    }
+    if !is_ascii(name) {
+        encode_words(name, out)
+    } else if needs_quote(name) {
+        rt.buf_push(out, 34 as u8)
+        var i: usize = 0
+        while i < name.n {
+            let c: u32 = at(name, i)
+            if c == 34 || c == 92 {
+                rt.buf_push(out, 92 as u8)
+            }
+            rt.buf_push(out, c as u8)
+            i += 1
+        }
+        rt.buf_push(out, 34 as u8)
+    } else {
+        push_str(out, name)
+    }
+    push_str(out, " <")
+    push_str(out, addr)
+    rt.buf_push(out, 62 as u8)
+}
+
+// Message-ID "<hex.hex@domain>" from two numbers (the caller provides the entropy)
+fn make_message_id(out: *mut rt.Buf, domain: str, a: u64, c: u64) {
+    rt.buf_push(out, 60 as u8)
+    rt.buf_push_hex_u64(out, a, 1)
+    rt.buf_push(out, 46 as u8)
+    rt.buf_push_hex_u64(out, c, 1)
+    rt.buf_push(out, 64 as u8)
+    push_str(out, domain)
+    rt.buf_push(out, 62 as u8)
+}
+
+// RFC 2231 / 3986 percent encoding (UTF-8 octets), unreserved kept
+fn pct_encode(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < s.n {
+        let c: u32 = at(s, i)
+        if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95 || c == 126 {
+            rt.buf_push(out, c as u8)
+        } else {
+            rt.buf_push(out, 37 as u8)
+            rt.buf_push(out, hexchar(c >> 4) as u8)
+            rt.buf_push(out, hexchar(c & 15) as u8)
+        }
+        i += 1
+    }
+}
+
+// ;param="value" or ;param*=utf-8''pct
+fn push_param(out: *mut rt.Buf, name: str, v: str) {
+    if is_ascii(v) {
+        push_str(out, "; ")
+        push_str(out, name)
+        push_str(out, "=\"")
+        var i: usize = 0
+        while i < v.n {
+            let c: u32 = at(v, i)
+            if c == 34 || c == 92 {
+                rt.buf_push(out, 92 as u8)
+            }
+            rt.buf_push(out, c as u8)
+            i += 1
+        }
+        rt.buf_push(out, 34 as u8)
+    } else {
+        push_str(out, "; ")
+        push_str(out, name)
+        push_str(out, "*=utf-8''")
+        pct_encode(v, out)
+    }
+}
+
+fn contains(h: str, nd: str) -> bool {
+    if nd.n == 0 || h.n < nd.n {
+        return false
+    }
+    var i: usize = 0
+    while i + nd.n <= h.n {
+        if rt.mem_eq(h.p as u64 + i as u64, nd.p as u64, nd.n) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+fn bstr(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+// a text body part (headers + body); `kind` = "plain" or "html"
+fn emit_text_part(out: *mut rt.Buf, kind: str, body: str) {
+    push_str(out, "Content-Type: text/")
+    push_str(out, kind)
+    push_str(out, "; charset=utf-8\r\n")
+    var long_line: bool = false
+    var run: usize = 0
+    var i: usize = 0
+    while i < body.n {
+        if at(body, i) == 10 {
+            run = 0
+        } else {
+            run += 1
+            if run > 900 {
+                long_line = true
+            }
+        }
+        i += 1
+    }
+    if is_ascii(body) && !long_line {
+        push_str(out, "Content-Transfer-Encoding: 7bit\r\n\r\n")
+        // normalise to CRLF
+        var k: usize = 0
+        while k < body.n {
+            let c: u32 = at(body, k)
+            if c == 13 && k + 1 < body.n && at(body, k + 1) == 10 {
+                k += 1
+                continue
+            }
+            if c == 10 {
+                crlf(out)
+            } else {
+                rt.buf_push(out, c as u8)
+            }
+            k += 1
+        }
+        crlf(out)
+    } else {
+        push_str(out, "Content-Transfer-Encoding: quoted-printable\r\n\r\n")
+        qp_encode(body, out)
+        crlf(out)
+    }
+}
+
+fn make_boundary(b: *mut Builder, salt: u64, out: *mut rt.Buf) {
+    var n: u64 = 0
+    while true {
+        rt.buf_clear(out)
+        push_str(out, "=_firn_")
+        rt.buf_push_hex_u64(out, (*b).seed_a + salt, 1)
+        rt.buf_push(out, 95 as u8)
+        rt.buf_push_hex_u64(out, (*b).seed_b + n, 1)
+        let bs: str = bstr(out)
+        if !contains(bstr(&(*b).text), bs) && !contains(bstr(&(*b).html), bs) {
+            return
+        }
+        n += 1
+    }
+}
+
+// Build the message (CRLF, folded headers, MIME structure) into `out`.
+fn builder_build(b: *mut Builder, out: *mut rt.Buf) {
+    builder_counter += 1
+    if (*b).seed_a == 0 && (*b).seed_b == 0 {
+        (*b).seed_a = time.now_unix_ms() as u64
+        (*b).seed_b = builder_counter
+    }
+    if rt.buf_len(&(*b).date) > 0 {
+        emit_header(out, "Date", bstr(&(*b).date))
+    } else {
+        let ms: i64 = time.now_unix_ms()
+        var d: Date = date_parse("Thu, 01 Jan 1970 00:00:00 +0000")
+        var days: i64 = ms / 86400000
+        let secs: i64 = (ms / 1000) % 86400
+        let cv: time.DateTime = time.civil_from_unix(ms)
+        d.year = cv.year as i32
+        d.month = cv.month as u32
+        d.day = cv.day as u32
+        d.hour = (secs / 3600) as u32
+        d.minute = ((secs / 60) % 60) as u32
+        d.second = (secs % 60) as u32
+        d.tz_min = 0
+        var ds: rt.Buf = rt.buf_new()
+        date_format(&d, &ds)
+        emit_header(out, "Date", bstr(&ds))
+        rt.buf_free(&ds)
+        days = 0
+    }
+    if rt.buf_len(&(*b).from) > 0 {
+        emit_header(out, "From", bstr(&(*b).from))
+    }
+    if rt.buf_len(&(*b).to) > 0 {
+        emit_header(out, "To", bstr(&(*b).to))
+    }
+    if rt.buf_len(&(*b).cc) > 0 {
+        emit_header(out, "Cc", bstr(&(*b).cc))
+    }
+    var sv: rt.Buf = rt.buf_new()
+    encoded_value(bstr(&(*b).subject), &sv)
+    emit_header(out, "Subject", bstr(&sv))
+    rt.buf_free(&sv)
+    if rt.buf_len(&(*b).msgid) > 0 {
+        emit_header(out, "Message-ID", bstr(&(*b).msgid))
+    } else {
+        var mid: rt.Buf = rt.buf_new()
+        var dom: rt.Buf = rt.buf_new()
+        var domain: str = "localhost"
+        // the domain of the From address
+        let f: str = bstr(&(*b).from)
+        var q: usize = f.n
+        while q > 0 && at(f, q - 1) != 64 {
+            q -= 1
+        }
+        if q > 0 {
+            var e: usize = f.n
+            while e > q && !(is_atext(at(f, e - 1)) || at(f, e - 1) == 46) {
+                e -= 1
+            }
+            if e > q {
+                push_str(&dom, view(f, q, e))
+                domain = bstr(&dom)
+            }
+        }
+        make_message_id(&mid, domain, (*b).seed_a, (*b).seed_b)
+        emit_header(out, "Message-ID", bstr(&mid))
+        rt.buf_free(&mid)
+        rt.buf_free(&dom)
+    }
+    push_str(out, "MIME-Version: 1.0\r\n")
+    push_str(out, bstr(&(*b).extra))
+    let natt: usize = vec_len[Att](&(*b).atts)
+    let has_text: bool = rt.buf_len(&(*b).text) > 0 || rt.buf_len(&(*b).html) == 0
+    let has_html: bool = rt.buf_len(&(*b).html) > 0
+    let alt: bool = has_text && has_html
+    var bmix: rt.Buf = rt.buf_new()
+    var balt: rt.Buf = rt.buf_new()
+    make_boundary(b, 1, &bmix)
+    make_boundary(b, 2, &balt)
+    if natt > 0 {
+        push_str(out, "Content-Type: multipart/mixed; boundary=\"")
+        push_str(out, bstr(&bmix))
+        push_str(out, "\"\r\n\r\nThis is a multi-part message in MIME format.\r\n--")
+        push_str(out, bstr(&bmix))
+        crlf(out)
+    }
+    if alt {
+        push_str(out, "Content-Type: multipart/alternative; boundary=\"")
+        push_str(out, bstr(&balt))
+        push_str(out, "\"\r\n\r\n--")
+        push_str(out, bstr(&balt))
+        crlf(out)
+        emit_text_part(out, "plain", bstr(&(*b).text))
+        push_str(out, "--")
+        push_str(out, bstr(&balt))
+        crlf(out)
+        emit_text_part(out, "html", bstr(&(*b).html))
+        push_str(out, "--")
+        push_str(out, bstr(&balt))
+        push_str(out, "--\r\n")
+    } else if has_html {
+        emit_text_part(out, "html", bstr(&(*b).html))
+    } else {
+        emit_text_part(out, "plain", bstr(&(*b).text))
+    }
+    var k: usize = 0
+    while k < natt {
+        let a: *mut Att = vec_elem_ptr[Att](&(*b).atts, k)
+        push_str(out, "--")
+        push_str(out, bstr(&bmix))
+        crlf(out)
+        var ct: str = bstr(&(*a).ctype)
+        if ct.n == 0 {
+            ct = "application/octet-stream"
+        }
+        push_str(out, "Content-Type: ")
+        push_str(out, ct)
+        push_param(out, "name", bstr(&(*a).name))
+        push_str(out, "\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment")
+        push_param(out, "filename", bstr(&(*a).name))
+        push_str(out, "\r\n\r\n")
+        b64_encode_lines(rt.buf_ptr(&(*a).data), rt.buf_len(&(*a).data), out)
+        k += 1
+    }
+    if natt > 0 {
+        push_str(out, "--")
+        push_str(out, bstr(&bmix))
+        push_str(out, "--\r\n")
+    }
+    rt.buf_free(&bmix)
+    rt.buf_free(&balt)
+}

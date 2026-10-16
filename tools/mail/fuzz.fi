@@ -1,0 +1,127 @@
+// tools/mail/fuzz.fi -- robustness of lib/mail/rfc822.fi on damaged input.
+//
+//     fuzz <cases file> <rounds per case>
+//
+// Takes every case of tools/mail/gen.py, damages its bytes (flips, cuts,
+// inserts of delimiters) and feeds all parsers. Built with release-safe: every
+// index and overflow is checked, so any bug is a crash. Exit 0 = no crash.
+import std.rt
+import std.str
+import std.fs
+import mail.rfc822
+
+static mut seed: u64 = 88172645463325252
+static mut runs: i64 = 0
+
+fn rnd() -> u64 {
+    seed = seed ^ (seed << 13)
+    seed = seed ^ (seed >> 7)
+    seed = seed ^ (seed << 17)
+    return seed
+}
+
+fn unhex(c: u32) -> u32 {
+    if c >= 97 {
+        return c - 87
+    }
+    if c >= 65 {
+        return c - 55
+    }
+    return c - 48
+}
+
+fn all_parsers(s: str) {
+    var m: rfc822.Msg = rfc822.msg_parse(s.p as u64, s.n)
+    var k: usize = 0
+    while k < rfc822.parts_count(&m) {
+        var b: rt.Buf = rt.buf_new()
+        rfc822.part_decoded(&m, k, &b)
+        rfc822.part_filename(&m, k, &b)
+        rfc822.part_charset(&m, k, &b)
+        rt.buf_free(&b)
+        k += 1
+    }
+    rfc822.msg_free(&m)
+    var al: rfc822.AddrList = rfc822.addr_parse(s)
+    rfc822.addr_free(&al)
+    var d: rfc822.Date = rfc822.date_parse(s)
+    var o: rt.Buf = rt.buf_new()
+    if d.ok && d.year > 0 && d.year < 10000 && d.month >= 1 && d.month <= 12 {
+        rfc822.date_format(&d, &o)
+    }
+    rfc822.decode_words(s, &o)
+    rfc822.qp_decode(s, &o)
+    rfc822.encode_words(s, &o)
+    rfc822.qp_encode(s, &o)
+    rfc822.param_get(s, "boundary", &o)
+    rt.buf_free(&o)
+    runs += 1
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        return 2
+    }
+    let a1: u64 = rt.arg_ptr(start, 1)
+    let a2: u64 = rt.arg_ptr(start, 2)
+    var rounds: i64 = 0
+    var q: usize = 0
+    while q < rt.c_length(a2) {
+        rounds = rounds * 10 + (rt.ld8(a2, q) as i64 - 48)
+        q += 1
+    }
+    var data: rt.Buf = rt.buf_new()
+    fs.read_file(str { p: a1 as *mut u8, n: rt.c_length(a1) }, &data) catch 0
+    let total: usize = rt.buf_len(&data)
+    let base: *mut u8 = rt.buf_data(&data)
+    var at: usize = 0
+    let delims: str = "<>\"\\;:=?,()[]@\r\n -"
+    while at < total {
+        var e: usize = at
+        while e < total && *(base + e) != 10 as u8 {
+            e += 1
+        }
+        let line: str = str { p: base + at, n: e - at }
+        at = e + 1
+        if line.n < 2 || rfc822.at(line, 0) == 88 {
+            continue
+        }
+        var raw: rt.Buf = rt.buf_new()
+        var i: usize = 2
+        while i + 1 < line.n {
+            rt.buf_push(&raw, (unhex(rfc822.at(line, i)) * 16 + unhex(rfc822.at(line, i + 1))) as u8)
+            i += 2
+        }
+        var r: i64 = 0
+        while r < rounds {
+            var w: rt.Buf = rt.buf_new()
+            rt.buf_push_bytes(&w, rt.buf_ptr(&raw), rt.buf_len(&raw))
+            let nm: u64 = rnd() % 6 + 1
+            var j: u64 = 0
+            while j < nm && rt.buf_len(&w) > 0 {
+                let pos: usize = (rnd() % rt.buf_len(&w) as u64) as usize
+                let kind: u64 = rnd() % 4
+                if kind == 0 {
+                    rt.st8(rt.buf_ptr(&w), pos, (rnd() & 255) as u8)
+                } else if kind == 1 {
+                    rt.st8(rt.buf_ptr(&w), pos, rfc822.at(delims, (rnd() % delims.n as u64) as usize) as u8)
+                } else if kind == 2 {
+                    rt.buf_set_len(&w, pos)
+                } else {
+                    rt.st8(rt.buf_ptr(&w), pos, 0 as u8)
+                }
+                j += 1
+            }
+            all_parsers(str { p: rt.buf_data(&w), n: rt.buf_len(&w) })
+            rt.buf_free(&w)
+            r += 1
+        }
+        rt.buf_free(&raw)
+    }
+    var o: rt.Buf = rt.buf_new()
+    rt.write_everything(1, "mail fuzz: ".p as u64, 11)
+    rt.buf_push_dec_i64(&o, runs)
+    rt.buf_push_bytes(&o, " damaged inputs, 0 crashes\n".p as u64, 27)
+    rt.write_everything(1, rt.buf_ptr(&o), rt.buf_len(&o))
+    return 0
+}
