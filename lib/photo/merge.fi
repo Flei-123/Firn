@@ -27,7 +27,7 @@ import photo.par
 
 export {
     Burst, BURST_MAX,
-    MergeOpts, merge_default, burst_new, burst_add, burst_free, merge_burst, merge_burst_opts, CLIP,
+    MergeOpts, merge_default, burst_new, burst_add, burst_free, merge_burst, merge_burst_opts, refine_reference, CLIP,
 }
 
 const BURST_MAX: i32 = 24
@@ -88,6 +88,7 @@ struct MergeOpts {
     align_blur: f32,
     clip_bound: f32,
     edge_gate: f32,
+    flicker: f32,
 }
 
 // clip_bound (0..1): where the REFERENCE is clipped its value is only a lower bound of the scene. An alternate
@@ -97,7 +98,7 @@ struct MergeOpts {
 // dilutes a misalignment with quiet neighbours; the gate switches towards the 3x3 MAXIMUM there, so a ghosting
 // edge gets weight 0 and the sharp reference pixel wins. 0 = old behaviour for both.
 fn merge_default() -> MergeOpts {
-    return MergeOpts { thr: 1.5f, soft: 1.5f, align_blur: 0.0f, clip_bound: 1.0f, edge_gate: 0.0f }
+    return MergeOpts { thr: 1.5f, soft: 1.5f, align_blur: 0.0f, clip_bound: 1.0f, edge_gate: 0.0f, flicker: 0.0f }
 }
 
 fn merge_burst(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, out: *mut image.Image, var_plane: *mut image.Image, wsum: *mut image.Image) {
@@ -213,6 +214,396 @@ fn clip_map(im: *mut image.Image) -> image.Image {
     return d
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// FLICKER / BANDING COMPENSATION. A TV subtitle strobes, a rolling shutter under 50/100 Hz light paints dark and
+// bright rows: frame j then differs from the others by a LOCAL gain (a constant factor per patch / per row), which
+// a single global exposure gain cannot remove. For every alternate frame the ratio alt / reference is measured on a
+// grid of cells (FL_CX x FL_CY pixels, wide and low: a row band is only a few pixels tall) from flat, unclipped
+// pixels (robust two-pass: first a gain, then only samples that agree with it). The reference counts as 1. For
+// every cell the MEDIAN over all frames (reference included) is the burst CONSENSUS; the multiplier L_j of frame j is
+// its ratio to that consensus. The merge divides each sample by gain_j * L_j, so every frame -- the reference too,
+// which may itself be the flickering one -- is brought to the consensus brightness before the difference test.
+const FL_CX: i32 = 32
+const FL_CY: i32 = 4
+const FL_CAP: i32 = 96
+
+struct GainGrid {
+    n: i32,
+    bw: i32,
+    bh: i32,
+    q: u64, // [n][bh][bw] f32: alt / ref brightness ratio of frame j (reference slot: 1)
+    c: u64, // [n][bh][bw] f32: confidence 0..1 (0 = no usable pixels in the cell)
+    l: u64, // [n][bh][bw] f32: multiplier of frame j relative to the burst consensus
+}
+
+fn gg_new(n: i32, w: i32, h: i32) -> GainGrid {
+    let bw: i32 = (w + FL_CX - 1) / FL_CX
+    let bh: i32 = (h + FL_CY - 1) / FL_CY
+    let cells: usize = (n as usize) * ((bw * bh) as usize)
+    var g: GainGrid = GainGrid { n: n, bw: bw, bh: bh, q: rt.heap_alloc(cells * 4), c: rt.heap_alloc(cells * 4), l: rt.heap_alloc(cells * 4) }
+    var i: usize = 0
+    while i < cells {
+        *((g.q + (i as u64) * (4 as u64)) as *mut f32) = 1.0f
+        *((g.c + (i as u64) * (4 as u64)) as *mut f32) = 0.0f
+        *((g.l + (i as u64) * (4 as u64)) as *mut f32) = 1.0f
+        i = i + 1
+    }
+    return g
+}
+
+fn gg_free(g: *mut GainGrid) {
+    let cells: usize = ((*g).n as usize) * (((*g).bw * (*g).bh) as usize)
+    rt.heap_free((*g).q, cells * 4)
+    rt.heap_free((*g).c, cells * 4)
+    rt.heap_free((*g).l, cells * 4)
+}
+
+#[inline]
+fn gg_get(p: u64, i: i32) -> f32 {
+    return *((p + (i as u64) * (4 as u64)) as *mut f32)
+}
+
+#[inline]
+fn gg_put(p: u64, i: i32, v: f32) {
+    *((p + (i as u64) * (4 as u64)) as *mut f32) = v
+}
+
+struct GainCtx {
+    lr: *mut image.Image,
+    la: *mut image.Image,
+    fl: *mut align.Flow,
+    g: *mut GainGrid,
+    j: i32,
+    nm: *mut noise.NoiseModel,
+    rf: *mut image.Image,
+    af: *mut image.Image,
+}
+
+// A gain error keeps the chromaticity of a pixel (R/G and B/G); a different object or a misaligned edge usually
+// does not. Samples whose colour ratios differ from the reference by more than ~10 % (plus the noise of the ratio)
+// are not used for the gain estimate, so a real local change of the scene is not mistaken for flicker.
+fn chroma_agrees(k: *mut GainCtx, x: i32, y: i32, sx: f32, sy: f32, sg: f32) -> bool {
+    let rg: f32 = image.img_get((*k).rf, 1, x, y)
+    let ag: f32 = image.img_sample((*k).af, 1, sx, sy)
+    if rg < 0.004f || ag < 0.004f { return true }
+    var c: i32 = 0
+    while c < 3 {
+        let rc: f32 = image.img_get((*k).rf, c, x, y)
+        let ac: f32 = image.img_sample((*k).af, c, sx, sy)
+        let qr: f32 = rc / rg
+        var d: f32 = ac / ag - qr
+        if d < 0.0f { d = 0.0f - d }
+        if d > 0.10f * qr + 6.0f * sg / rg * (1.0f + qr) { return false }
+        c = c + 2
+    }
+    return true
+}
+
+// Estimate alt / ref for the cells of block rows [lo, hi) (reference coordinates).
+fn gain_est_rows(ctx: u64, lo: u64, hi: u64) {
+    let k: *mut GainCtx = ctx as *mut GainCtx
+    let g: *mut GainGrid = (*k).g
+    let w: i32 = (*(*k).lr).w
+    let h: i32 = (*(*k).lr).h
+    let base: i32 = (*k).j * (*g).bw * (*g).bh
+    var rvs: [f32; 96] = [0.0f; 96]
+    var avs: [f32; 96] = [0.0f; 96]
+    var cy: i32 = lo as i32
+    while cy < (hi as i32) {
+        var cx: i32 = 0
+        while cx < (*g).bw {
+            let x0: i32 = cx * FL_CX
+            var x1: i32 = x0 + FL_CX
+            if x1 > w { x1 = w }
+            let y0: i32 = cy * FL_CY
+            var y1: i32 = y0 + FL_CY
+            if y1 > h { y1 = h }
+            var n: i32 = 0
+            var y: i32 = y0
+            while y < y1 {
+                var x: i32 = x0 + (y & 1)
+                while x < x1 {
+                    let rv: f32 = image.img_get((*k).lr, 0, x, y)
+                    if rv > 0.008f && rv < 0.90f && n < FL_CAP {
+                        let sg: f32 = noise.sigma_of((*k).nm, 1, rv)
+                        var gx: f32 = image.img_getc((*k).lr, 0, x + 1, y) - image.img_getc((*k).lr, 0, x - 1, y)
+                        var gy: f32 = image.img_getc((*k).lr, 0, x, y + 1) - image.img_getc((*k).lr, 0, x, y - 1)
+                        if gx < 0.0f { gx = 0.0f - gx }
+                        if gy < 0.0f { gy = 0.0f - gy }
+                        if gx + gy < 0.06f * rv + 4.0f * sg {
+                            var dx: f32 = 0.0f
+                            var dy: f32 = 0.0f
+                            align.flow_at((*k).fl, x as f32, y as f32, &dx, &dy)
+                            let av: f32 = image.img_sample((*k).la, 0, (x as f32) + dx, (y as f32) + dy)
+                            if av > 0.008f && av < 0.90f && chroma_agrees(k, x, y, (x as f32) + dx, (y as f32) + dy, sg) {
+                                rvs[n as usize] = rv
+                                avs[n as usize] = av
+                                n = n + 1
+                            }
+                        }
+                    }
+                    x = x + 2
+                }
+                y = y + 1
+            }
+            if n >= 12 {
+                var sr: f32 = 0.0f
+                var sa: f32 = 0.0f
+                var i: i32 = 0
+                while i < n {
+                    sr = sr + rvs[i as usize]
+                    sa = sa + avs[i as usize]
+                    i = i + 1
+                }
+                let g0: f32 = sa / sr
+                var s2r: f32 = 0.0f
+                var s2a: f32 = 0.0f
+                var n2: i32 = 0
+                i = 0
+                while i < n {
+                    let rr: f32 = rvs[i as usize]
+                    var d: f32 = avs[i as usize] - g0 * rr
+                    if d < 0.0f { d = 0.0f - d }
+                    if d <= 0.12f * g0 * rr + 4.0f * noise.sigma_of((*k).nm, 1, rr) {
+                        s2r = s2r + rr
+                        s2a = s2a + avs[i as usize]
+                        n2 = n2 + 1
+                    }
+                    i = i + 1
+                }
+                if n2 >= 10 {
+                    var cf: f32 = (n2 as f32) / (n as f32)
+                    cf = cf * image.fminf(1.0f, (n2 as f32) / 24.0f)
+                    gg_put((*g).q, base + cy * (*g).bw + cx, s2a / s2r)
+                    gg_put((*g).c, base + cy * (*g).bw + cx, cf)
+                }
+            }
+            cx = cx + 1
+        }
+        cy = cy + 1
+    }
+}
+
+// Noise of one cell estimate is about 1-3 %: average each estimate with the same-row neighbours that AGREE with it
+// (within 5 %), so the noise drops but a real step (edge of the flickering zone) stays sharp. Uses `l` as scratch.
+fn gg_smooth(g: *mut GainGrid, j: i32) {
+    let bw: i32 = (*g).bw
+    let bh: i32 = (*g).bh
+    let base: i32 = j * bw * bh
+    var cy: i32 = 0
+    while cy < bh {
+        var cx: i32 = 0
+        while cx < bw {
+            let i: i32 = base + cy * bw + cx
+            let c0: f32 = gg_get((*g).c, i)
+            if c0 > 0.0f {
+                let q0: f32 = gg_get((*g).q, i)
+                var sw: f32 = 0.0f
+                var sq: f32 = 0.0f
+                var d: i32 = -2
+                while d <= 2 {
+                    let xx: i32 = cx + d
+                    if xx >= 0 && xx < bw {
+                        let ii: i32 = base + cy * bw + xx
+                        let cc: f32 = gg_get((*g).c, ii)
+                        let qq: f32 = gg_get((*g).q, ii)
+                        if cc > 0.0f && qq > q0 - 0.05f * q0 && qq < q0 + 0.05f * q0 {
+                            sw = sw + cc
+                            sq = sq + cc * qq
+                        }
+                    }
+                    d = d + 1
+                }
+                gg_put((*g).l, i, sq / sw)
+            }
+            cx = cx + 1
+        }
+        cy = cy + 1
+    }
+    cy = 0
+    while cy < bh {
+        var cx: i32 = 0
+        while cx < bw {
+            let i: i32 = base + cy * bw + cx
+            if gg_get((*g).c, i) > 0.0f { gg_put((*g).q, i, gg_get((*g).l, i)) }
+            cx = cx + 1
+        }
+        cy = cy + 1
+    }
+}
+
+// Fill cells without an estimate from the nearest cells of the same frame: same row first (a band is wide), then
+// the rows above / below. Cells that stay unknown keep ratio 1 and confidence 0.
+fn gg_fill(g: *mut GainGrid, j: i32) {
+    let bw: i32 = (*g).bw
+    let bh: i32 = (*g).bh
+    let base: i32 = j * bw * bh
+    var cy: i32 = 0
+    while cy < bh {
+        var cx: i32 = 0
+        while cx < bw {
+            let i: i32 = base + cy * bw + cx
+            if gg_get((*g).c, i) <= 0.0f {
+                var sw: f32 = 0.0f
+                var sq: f32 = 0.0f
+                var d: i32 = 1
+                while d <= 3 {
+                    var s: i32 = -1
+                    while s <= 1 {
+                        let xx: i32 = cx + s * d
+                        if xx >= 0 && xx < bw {
+                            let ii: i32 = base + cy * bw + xx
+                            let cc: f32 = gg_get((*g).c, ii)
+                            if cc > 0.0f && gg_get((*g).c, ii) <= 1.0f {
+                                let wt: f32 = cc / (d as f32)
+                                sw = sw + wt
+                                sq = sq + wt * gg_get((*g).q, ii)
+                            }
+                        }
+                        s = s + 2
+                    }
+                    d = d + 1
+                }
+                if sw > 0.0f {
+                    gg_put((*g).q, i, sq / sw)
+                    gg_put((*g).c, i, -0.5f) // filled: negative marks "borrowed", used below
+                } else {
+                    d = 1
+                    while d <= 4 && sw <= 0.0f {
+                        var s: i32 = -1
+                        while s <= 1 {
+                            let yy: i32 = cy + s * d
+                            if yy >= 0 && yy < bh {
+                                let ii: i32 = base + yy * bw + cx
+                                let cc: f32 = gg_get((*g).c, ii)
+                                if cc > 0.0f {
+                                    sw = sw + cc
+                                    sq = sq + cc * gg_get((*g).q, ii)
+                                }
+                            }
+                            s = s + 2
+                        }
+                        d = d + 1
+                    }
+                    if sw > 0.0f {
+                        gg_put((*g).q, i, sq / sw)
+                        gg_put((*g).c, i, -0.5f)
+                    }
+                }
+            }
+            cx = cx + 1
+        }
+        cy = cy + 1
+    }
+    // borrowed cells count as known (confidence 0.3) only after the whole frame is filled
+    cy = 0
+    while cy < bh {
+        var cx: i32 = 0
+        while cx < bw {
+            let i: i32 = base + cy * bw + cx
+            if gg_get((*g).c, i) < 0.0f { gg_put((*g).c, i, 0.3f) }
+            cx = cx + 1
+        }
+        cy = cy + 1
+    }
+}
+
+// Consensus + multipliers. strength 0..1 scales the correction (1 = full).
+fn gg_solve(g: *mut GainGrid, ref_idx: i32, strength: f32) {
+    let n: i32 = (*g).n
+    let cells: i32 = (*g).bw * (*g).bh
+    var j: i32 = 0
+    while j < n {
+        if j != ref_idx {
+            gg_smooth(g, j)
+            gg_fill(g, j)
+        }
+        j = j + 1
+    }
+    var v: [f32; 24] = [0.0f; 24]
+    var k: i32 = 0
+    while k < cells {
+        var m: i32 = 0
+        j = 0
+        while j < n {
+            if j == ref_idx {
+                v[m as usize] = 1.0f
+                m = m + 1
+            } else if gg_get((*g).c, j * cells + k) > 0.0f {
+                v[m as usize] = gg_get((*g).q, j * cells + k)
+                m = m + 1
+            }
+            j = j + 1
+        }
+        var cons: f32 = 1.0f
+        if m >= 3 {
+            var a: i32 = 1
+            while a < m {
+                let x: f32 = v[a as usize]
+                var c: i32 = a - 1
+                while c >= 0 && v[c as usize] > x {
+                    v[(c + 1) as usize] = v[c as usize]
+                    c = c - 1
+                }
+                v[(c + 1) as usize] = x
+                a = a + 1
+            }
+            if m % 2 == 1 {
+                cons = v[(m / 2) as usize]
+            } else {
+                cons = 0.5f * (v[(m / 2 - 1) as usize] + v[(m / 2) as usize])
+            }
+        }
+        if cons < 0.5f { cons = 0.5f }
+        if cons > 2.0f { cons = 2.0f }
+        j = 0
+        while j < n {
+            var lj: f32 = 1.0f
+            if j == ref_idx {
+                lj = 1.0f / cons
+            } else if gg_get((*g).c, j * cells + k) > 0.0f {
+                lj = gg_get((*g).q, j * cells + k) / cons
+            }
+            if lj < 0.5f { lj = 0.5f }
+            if lj > 2.0f { lj = 2.0f }
+            // dead band: corrections below the estimate noise (2 %) are not applied, larger ones only by the excess
+            var dl: f32 = lj - 1.0f
+            if dl > 0.02f { dl = dl - 0.02f } else if dl < 0.0f - 0.02f { dl = dl + 0.02f } else { dl = 0.0f }
+            gg_put((*g).l, j * cells + k, 1.0f + strength * dl)
+            j = j + 1
+        }
+        k = k + 1
+    }
+}
+
+// Multiplier of frame j at reference pixel (x, y): bilinear between cell centres.
+fn gg_at(g: *mut GainGrid, j: i32, x: i32, y: i32) -> f32 {
+    let bw: i32 = (*g).bw
+    let bh: i32 = (*g).bh
+    var u: f32 = ((x as f32) + 0.5f) / (FL_CX as f32) - 0.5f
+    var vv: f32 = ((y as f32) + 0.5f) / (FL_CY as f32) - 0.5f
+    if u < 0.0f { u = 0.0f }
+    if vv < 0.0f { vv = 0.0f }
+    var cx: i32 = u as i32
+    var cy: i32 = vv as i32
+    if cx > bw - 2 { cx = bw - 2 }
+    if cy > bh - 2 { cy = bh - 2 }
+    if cx < 0 { cx = 0 }
+    if cy < 0 { cy = 0 }
+    var fx: f32 = u - (cx as f32)
+    var fy: f32 = vv - (cy as f32)
+    if fx > 1.0f { fx = 1.0f }
+    if fy > 1.0f { fy = 1.0f }
+    var cx1: i32 = cx + 1
+    var cy1: i32 = cy + 1
+    if cx1 >= bw { cx1 = cx }
+    if cy1 >= bh { cy1 = cy }
+    let base: i32 = j * bw * bh
+    let a: f32 = gg_get((*g).l, base + cy * bw + cx) * (1.0f - fx) + gg_get((*g).l, base + cy * bw + cx1) * fx
+    let b: f32 = gg_get((*g).l, base + cy1 * bw + cx) * (1.0f - fx) + gg_get((*g).l, base + cy1 * bw + cx1) * fx
+    return a * (1.0f - fy) + b * fy
+}
+
 // Everything the row loops of one merge need.
 struct MergeCtx {
     rf: *mut image.Image,
@@ -235,6 +626,23 @@ struct MergeCtx {
     cb: f32,
     eg: f32,
     cmap: *mut image.Image,
+    gg: *mut GainGrid,
+    jr: i32,
+    ja: i32,
+}
+
+// Effective exposure of the reference / the current alternate at reference pixel (x, y): nominal gain times the
+// flicker multiplier (1 when compensation is off).
+#[inline]
+fn gain_r(k: *mut MergeCtx, x: i32, y: i32) -> f32 {
+    if (*k).gg == (0 as *mut GainGrid) { return (*k).gr }
+    return (*k).gr * gg_at((*k).gg, (*k).jr, x, y)
+}
+
+#[inline]
+fn gain_a(k: *mut MergeCtx, x: i32, y: i32) -> f32 {
+    if (*k).gg == (0 as *mut GainGrid) { return (*k).ga }
+    return (*k).ga * gg_at((*k).gg, (*k).ja, x, y)
 }
 
 fn ref_rows(ctx: u64, lo: u64, hi: u64) {
@@ -246,12 +654,13 @@ fn ref_rows(ctx: u64, lo: u64, hi: u64) {
         while x < w {
             var wr: f32 = 1.0f
             if image.img_get((*k).rclip, 0, x, y) > 0.5f { wr = 0.0f }
+            let grp: f32 = gain_r(k, x, y)
             var c: i32 = 0
             while c < 3 {
-                image.img_set((*k).acc, c, x, y, wr * image.img_get((*k).rf, c, x, y) / (*k).gr)
+                image.img_set((*k).acc, c, x, y, wr * image.img_get((*k).rf, c, x, y) / grp)
                 c = c + 1
             }
-            let vg: f32 = noise.variance((*k).nm, 1, image.img_get((*k).rf, 1, x, y)) / ((*k).gr * (*k).gr)
+            let vg: f32 = noise.variance((*k).nm, 1, image.img_get((*k).rf, 1, x, y)) / (grp * grp)
             image.img_set((*k).wsum, 0, x, y, wr)
             image.img_set((*k).vnum, 0, x, y, wr * wr * vg)
             x = x + 1
@@ -294,9 +703,7 @@ fn cmap_rows(ctx: u64, lo: u64, hi: u64) {
 
 // T of a pixel whose reference is clipped: a clipped channel only tells "scene >= bound", so only an alternate
 // sample BELOW the bound counts as a difference (in units of the expected noise); brighter is fine.
-fn clip_bound_t(k: *mut MergeCtx, x: i32, y: i32, ap0: u64, ap1: u64, ap2: u64, bl: *mut Bil) -> f32 {
-    let gr: f32 = (*k).gr
-    let ga: f32 = (*k).ga
+fn clip_bound_t(k: *mut MergeCtx, x: i32, y: i32, ap0: u64, ap1: u64, ap2: u64, bl: *mut Bil, gr: f32, ga: f32) -> f32 {
     var t: f32 = 0.0f
     var c: i32 = 0
     while c < 3 {
@@ -324,8 +731,6 @@ fn pass1_rows(ctx: u64, lo: u64, hi: u64) {
     let h: i32 = (*(*k).rf).h
     let rf: *mut image.Image = (*k).rf
     let af: *mut image.Image = (*k).af
-    let gr: f32 = (*k).gr
-    let ga: f32 = (*k).ga
     let ap0: u64 = plane_at(af, 0)
     let ap1: u64 = plane_at(af, 1)
     let ap2: u64 = plane_at(af, 2)
@@ -333,6 +738,8 @@ fn pass1_rows(ctx: u64, lo: u64, hi: u64) {
     while y < (hi as i32) {
         var x: i32 = 0
         while x < w {
+            let gr: f32 = gain_r(k, x, y)
+            let ga: f32 = gain_a(k, x, y)
             var dx: f32 = 0.0f
             var dy: f32 = 0.0f
             align.flow_at((*k).fl, x as f32, y as f32, &dx, &dy)
@@ -359,7 +766,7 @@ fn pass1_rows(ctx: u64, lo: u64, hi: u64) {
                 t = 0.0f
                 if (*k).cb > 0.0f {
                     // lower bound test: only channels that are clipped themselves, only samples darker than the bound
-                    t = clip_bound_t(k, x, y, ap0, ap1, ap2, &bl)
+                    t = clip_bound_t(k, x, y, ap0, ap1, ap2, &bl, gr, ga)
                 }
             }
             image.img_set((*k).tmap, 0, x, y, t / 3.0f)
@@ -445,8 +852,6 @@ fn pass3_rows(ctx: u64, lo: u64, hi: u64) {
     let w: i32 = (*(*k).rf).w
     let h: i32 = (*(*k).rf).h
     let af: *mut image.Image = (*k).af
-    let ga: f32 = (*k).ga
-    let gr: f32 = (*k).gr
     let ap0: u64 = plane_at(af, 0)
     let ap1: u64 = plane_at(af, 1)
     let ap2: u64 = plane_at(af, 2)
@@ -457,6 +862,8 @@ fn pass3_rows(ctx: u64, lo: u64, hi: u64) {
             let wm: f32 = image.img_get((*k).wmap, 0, x, y)
             // the weight is multiplied by rel (> 0) afterwards, so wm == 0 means no contribution at all
             if wm > 0.0f {
+                let gr: f32 = gain_r(k, x, y)
+                let ga: f32 = gain_a(k, x, y)
                 var dx: f32 = 0.0f
                 var dy: f32 = 0.0f
                 align.flow_at((*k).fl, x as f32, y as f32, &dx, &dy)
@@ -500,12 +907,13 @@ fn final_rows(ctx: u64, lo: u64, hi: u64) {
                 }
                 image.img_set((*k).var_plane, 0, x, y, image.img_get((*k).vnum, 0, x, y) / (ws * ws))
             } else {
+                let grp: f32 = gain_r(k, x, y)
                 var c: i32 = 0
                 while c < 3 {
-                    image.img_set((*k).out, c, x, y, image.img_get((*k).rf, c, x, y) / (*k).gr)
+                    image.img_set((*k).out, c, x, y, image.img_get((*k).rf, c, x, y) / grp)
                     c = c + 1
                 }
-                image.img_set((*k).var_plane, 0, x, y, noise.variance((*k).nm, 1, image.img_get((*k).rf, 1, x, y)) / ((*k).gr * (*k).gr))
+                image.img_set((*k).var_plane, 0, x, y, noise.variance((*k).nm, 1, image.img_get((*k).rf, 1, x, y)) / (grp * grp))
                 image.img_set((*k).wsum, 0, x, y, 1.0f)
             }
             x = x + 1
@@ -530,6 +938,226 @@ fn norm_luma_rows(ctx: u64, lo: u64, hi: u64) {
     }
 }
 
+// How far frame j strays from the burst consensus brightness: the mean of the worst 5 % of the cells of
+// |L_j - 1| (a flickering subtitle zone or a band is a small part of the picture; a plain mean would hide it).
+fn gg_dev(g: *mut GainGrid, j: i32) -> f32 {
+    let cells: i32 = (*g).bw * (*g).bh
+    var hist: [i32; 128] = [0; 128]
+    var k: i32 = 0
+    while k < cells {
+        var d: f32 = gg_get((*g).l, j * cells + k) - 1.0f
+        if d < 0.0f { d = 0.0f - d }
+        var bin: i32 = (d * 200.0f) as i32
+        if bin > 127 { bin = 127 }
+        hist[bin as usize] = hist[bin as usize] + 1
+        k = k + 1
+    }
+    var top: i32 = cells / 20
+    if top < 1 { top = 1 }
+    var left: i32 = top
+    var acc: f32 = 0.0f
+    var bin: i32 = 127
+    while bin >= 0 && left > 0 {
+        var take: i32 = hist[bin as usize]
+        if take > left { take = left }
+        acc = acc + (take as f32) * ((bin as f32) + 0.5f) / 200.0f
+        left = left - take
+        bin = bin - 1
+    }
+    return acc / (top as f32)
+}
+
+// Median of a tile-displacement array (values in px, histogram with 0.25 px bins over +-32 px).
+fn flow_median(p: u64, nt: i32) -> f32 {
+    var hist: [i32; 256] = [0; 256]
+    var i: i32 = 0
+    while i < nt {
+        let v: f32 = *((p + (i as u64) * (4 as u64)) as *mut f32)
+        var bin: i32 = ((v + 32.0f) * 4.0f) as i32
+        if v < 0.0f - 32.0f { bin = 0 }
+        if bin > 255 { bin = 255 }
+        if bin < 0 { bin = 0 }
+        hist[bin as usize] = hist[bin as usize] + 1
+        i = i + 1
+    }
+    var acc: i32 = 0
+    var b: i32 = 0
+    while b < 256 {
+        acc = acc + hist[b as usize]
+        if acc * 2 >= nt { return ((b as f32) + 0.5f) / 4.0f - 32.0f }
+        b = b + 1
+    }
+    return 0.0f
+}
+
+// Local GEOMETRY deviation of every frame (px). The flows of all alternates (relative to the provisional reference)
+// minus each frame's global shift (hand shake) leave the local displacement of a zone, e.g. a subtitle that sits at a
+// slightly different place in some frames. Per tile the median over the burst is the consensus position; the result for
+// frame j is the mean of the worst 1 % of the tiles of |displacement - consensus|. The reference frame has displacement 0.
+fn geo_devs(fls: *mut [align.Flow; 24], ref_idx: i32, n: i32, out: *mut [f32; 24]) {
+    var k0: usize = 0
+    if ref_idx == 0 { k0 = 1 }
+    let nt: i32 = (*fls)[k0].tw * (*fls)[k0].th
+    var gx: [f32; 24] = [0.0f; 24]
+    var gy: [f32; 24] = [0.0f; 24]
+    var j: i32 = 0
+    while j < n {
+        if j != ref_idx {
+            gx[j as usize] = flow_median((*fls)[j as usize].dx, nt)
+            gy[j as usize] = flow_median((*fls)[j as usize].dy, nt)
+        }
+        j = j + 1
+    }
+    var hist: [i32; 3072] = [0; 3072]
+    var vx: [f32; 24] = [0.0f; 24]
+    var vy: [f32; 24] = [0.0f; 24]
+    var sx: [f32; 24] = [0.0f; 24]
+    var sy: [f32; 24] = [0.0f; 24]
+    var t: i32 = 0
+    while t < nt {
+        j = 0
+        while j < n {
+            var dx: f32 = 0.0f
+            var dy: f32 = 0.0f
+            if j != ref_idx {
+                dx = *(((*fls)[j as usize].dx + (t as u64) * (4 as u64)) as *mut f32) - gx[j as usize]
+                dy = *(((*fls)[j as usize].dy + (t as u64) * (4 as u64)) as *mut f32) - gy[j as usize]
+            }
+            vx[j as usize] = dx
+            vy[j as usize] = dy
+            sx[j as usize] = dx
+            sy[j as usize] = dy
+            j = j + 1
+        }
+        var a: i32 = 1
+        while a < n {
+            let x: f32 = sx[a as usize]
+            let y: f32 = sy[a as usize]
+            var c: i32 = a - 1
+            while c >= 0 && sx[c as usize] > x {
+                sx[(c + 1) as usize] = sx[c as usize]
+                c = c - 1
+            }
+            sx[(c + 1) as usize] = x
+            c = a - 1
+            while c >= 0 && sy[c as usize] > y {
+                sy[(c + 1) as usize] = sy[c as usize]
+                c = c - 1
+            }
+            sy[(c + 1) as usize] = y
+            a = a + 1
+        }
+        let mx: f32 = sx[(n / 2) as usize]
+        let my: f32 = sy[(n / 2) as usize]
+        j = 0
+        while j < n {
+            let ex: f32 = vx[j as usize] - mx
+            let ey: f32 = vy[j as usize] - my
+            var bin: i32 = (image.sqrtf(ex * ex + ey * ey) * 10.0f) as i32
+            if bin > 127 { bin = 127 }
+            hist[(j * 128 + bin) as usize] = hist[(j * 128 + bin) as usize] + 1
+            j = j + 1
+        }
+        t = t + 1
+    }
+    var top: i32 = nt / 100
+    if top < 1 { top = 1 }
+    j = 0
+    while j < n {
+        var left: i32 = top
+        var acc: f32 = 0.0f
+        var bin: i32 = 127
+        while bin >= 0 && left > 0 {
+            var take: i32 = hist[(j * 128 + bin) as usize]
+            if take > left { take = left }
+            acc = acc + (take as f32) * ((bin as f32) + 0.5f) / 10.0f
+            left = left - take
+            bin = bin - 1
+        }
+        (*out)[j as usize] = acc / (top as f32)
+        j = j + 1
+    }
+}
+
+// Reference refinement. `ref_idx` is the provisional reference (pipeline.pick_reference_c: sharpest frame that
+// agrees with the burst on coarse blocks). A frame with row banding or zone flicker can still be the sharpest one
+// and block means cannot see a 4-pixel band. Here every frame gets its flicker deviation from the local consensus
+// (gain grid, same estimate the merge uses); frames within `tol` of the least disturbed one compete, the
+// provisional reference stays if it is among them, else the sharpest of them (per exposure gain ^ 4) wins.
+// Returns the reference to use. Costs one alignment pass; bursts with fewer than 3 frames return ref_idx.
+fn refine_reference(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, tol: f32) -> i32 {
+    let n: i32 = (*b).n
+    if n < 3 || n > BURST_MAX { return ref_idx }
+    let rf: *mut image.Image = &(*b).frames[ref_idx as usize]
+    let w: i32 = (*rf).w
+    let h: i32 = (*rf).h
+    let gr: f32 = (*b).gain[ref_idx as usize]
+    var lr0: image.Image = image.img_luma(rf)
+    var pr: align.Pyr = align.pyr_build(&lr0)
+    var gg: GainGrid = gg_new(n, w, h)
+    var flows: [align.Flow; 24] = [align.Flow { tw: 0, th: 0, dx: 0 as u64, dy: 0 as u64, err: 0 as u64 }; 24]
+    var j: i32 = 0
+    while j < n {
+        if j != ref_idx {
+            let af: *mut image.Image = &(*b).frames[j as usize]
+            var la: image.Image = image.img_luma(af)
+            var nc: NormCtx = NormCtx { la: &la, gr: gr, ga: (*b).gain[j as usize] }
+            par.rows(w * h, 65536, norm_luma_rows, (&nc) as u64)
+            var pa: align.Pyr = align.pyr_build(&la)
+            flows[j as usize] = align.align_flow(&pr, &pa)
+            align.pyr_free(&pa)
+            var gc: GainCtx = GainCtx { lr: &lr0, la: &la, fl: &flows[j as usize], g: &gg, j: j, nm: nm, rf: rf, af: af }
+            par.rows(gg.bh, 8, gain_est_rows, (&gc) as u64)
+            image.img_free(&la)
+        }
+        j = j + 1
+    }
+    align.pyr_free(&pr)
+    image.img_free(&lr0)
+    gg_solve(&gg, ref_idx, 1.0f)
+    var dev: [f32; 24] = [0.0f; 24]
+    var dmin: f32 = 1.0e9f
+    j = 0
+    while j < n {
+        dev[j as usize] = gg_dev(&gg, j)
+        if dev[j as usize] < dmin { dmin = dev[j as usize] }
+        j = j + 1
+    }
+    gg_free(&gg)
+    var geo: [f32; 24] = [0.0f; 24]
+    geo_devs(&flows, ref_idx, n, &geo)
+    j = 0
+    while j < n {
+        if j != ref_idx { align.flow_free(&flows[j as usize]) }
+        j = j + 1
+    }
+    var gmin: f32 = 1.0e9f
+    j = 0
+    while j < n {
+        if geo[j as usize] < gmin { gmin = geo[j as usize] }
+        j = j + 1
+    }
+    // geometry tolerance: 1 px more than the most typical frame
+    let gtol: f32 = 1.0f
+    if dev[ref_idx as usize] <= dmin + tol && geo[ref_idx as usize] <= gmin + gtol { return ref_idx }
+    var best: i32 = ref_idx
+    var bs: f32 = -1.0f
+    j = 0
+    while j < n {
+        if dev[j as usize] <= dmin + tol && geo[j as usize] <= gmin + gtol {
+            var g: f32 = (*b).gain[j as usize]
+            if g < 1.0f { g = 1.0f / g }
+            let sc: f32 = image.sharpness(&(*b).frames[j as usize], 1) / (g * g * g * g)
+            if sc > bs {
+                bs = sc
+                best = j
+            }
+        }
+        j = j + 1
+    }
+    return best
+}
+
 // Merge the burst around frame `ref_idx`. `out` (3 ch), `var_plane` and `wsum` (1 ch) are created here.
 // Every pass runs its rows through photo.par (disjoint rows, the weights of pass 3 only read pass 2's map).
 fn merge_burst_opts(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, mo: *mut MergeOpts, out: *mut image.Image, var_plane: *mut image.Image, wsum: *mut image.Image) {
@@ -551,20 +1179,23 @@ fn merge_burst_opts(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, mo: 
     var mc: MergeCtx = MergeCtx {
         rf: rf, af: rf, acc: &acc, vnum: &vnum, tmap: &tmap, wmap: &wmap, wsum: wsum, out: out, var_plane: var_plane, nm: nm,
         fl: &fl, rclip: &rclip, aclip: &aclip, gr: gr, ga: gr, thr: (*mo).thr, soft: (*mo).soft,
-        cb: (*mo).clip_bound, eg: (*mo).edge_gate, cmap: &cmap,
+        cb: (*mo).clip_bound, eg: (*mo).edge_gate, cmap: &cmap, gg: 0 as *mut GainGrid, jr: ref_idx, ja: 0,
     }
-    par.rows(h, 16, ref_rows, (&mc) as u64)
-    if (*mo).edge_gate > 0.0f { par.rows(h, 16, cmap_rows, (&mc) as u64) }
 
-    var lr: image.Image = image.img_luma(rf)
+    var lr0: image.Image = image.img_luma(rf)
+    var lr: image.Image = lr0
     if (*mo).align_blur > 0.0f {
-        let lb: image.Image = filter.gauss_blur(&lr, (*mo).align_blur)
-        image.img_free(&lr)
-        lr = lb
+        lr = filter.gauss_blur(&lr0, (*mo).align_blur)
     }
     var pr: align.Pyr = align.pyr_build(&lr)
-    image.img_free(&lr)
+    if (*mo).align_blur > 0.0f { image.img_free(&lr) }
 
+    // pass A: one alignment per alternate frame; with flicker compensation also the brightness ratio per cell
+    let use_gain: bool = (*mo).flicker > 0.0f && (*b).n >= 3 && (*b).n <= BURST_MAX
+    var flows: [align.Flow; 24] = [align.Flow { tw: 0, th: 0, dx: 0 as u64, dy: 0 as u64, err: 0 as u64 }; 24]
+    var gg: GainGrid = gg_new(1, 1, 1)
+    gg_free(&gg)
+    if use_gain { gg = gg_new((*b).n, w, h) }
     var j: i32 = 0
     while j < (*b).n {
         if j == ref_idx {
@@ -577,27 +1208,52 @@ fn merge_burst_opts(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, mo: 
         var la: image.Image = image.img_luma(af)
         var nc: NormCtx = NormCtx { la: &la, gr: gr, ga: ga }
         par.rows(w * h, 65536, norm_luma_rows, (&nc) as u64)
-        // the reference luma must be exposure-normalised the same way: reference luma is at gain gr already
+        var lal: image.Image = la
         if (*mo).align_blur > 0.0f {
-            let lb: image.Image = filter.gauss_blur(&la, (*mo).align_blur)
-            image.img_free(&la)
-            la = lb
+            lal = filter.gauss_blur(&la, (*mo).align_blur)
         }
-        var pa: align.Pyr = align.pyr_build(&la)
-        image.img_free(&la)
-        fl = align.align_flow(&pr, &pa)
+        var pa: align.Pyr = align.pyr_build(&lal)
+        if (*mo).align_blur > 0.0f { image.img_free(&lal) }
+        flows[j as usize] = align.align_flow(&pr, &pa)
         align.pyr_free(&pa)
+        if use_gain {
+            var gc: GainCtx = GainCtx { lr: &lr0, la: &la, fl: &flows[j as usize], g: &gg, j: j, nm: nm, rf: rf, af: af }
+            par.rows(gg.bh, 8, gain_est_rows, (&gc) as u64)
+        }
+        image.img_free(&la)
+        j = j + 1
+    }
+    image.img_free(&lr0)
+    align.pyr_free(&pr)
+    if use_gain {
+        gg_solve(&gg, ref_idx, (*mo).flicker)
+        mc.gg = &gg
+        mc.jr = ref_idx
+    }
+    // the reference accumulator (pass 0) needs the multipliers, so it runs after the solve
+    par.rows(h, 16, ref_rows, (&mc) as u64)
+    if (*mo).edge_gate > 0.0f { par.rows(h, 16, cmap_rows, (&mc) as u64) }
+
+    // pass B: merge every alternate frame into the accumulators
+    j = 0
+    while j < (*b).n {
+        if j == ref_idx {
+            j = j + 1
+            continue
+        }
+        let af: *mut image.Image = &(*b).frames[j as usize]
         image.img_free(&aclip)
         aclip = clip_map(af)
         mc.af = af
-        mc.ga = ga
+        mc.ga = (*b).gain[j as usize]
+        mc.ja = j
+        fl = flows[j as usize]
         par.rows(h, 8, pass1_rows, (&mc) as u64)
         par.rows(h, 8, pass2_rows, (&mc) as u64)
         par.rows(h, 8, pass3_rows, (&mc) as u64)
         align.flow_free(&fl)
         j = j + 1
     }
-    align.pyr_free(&pr)
     par.rows(h, 16, final_rows, (&mc) as u64)
     image.img_free(&rclip)
     image.img_free(&aclip)
@@ -606,4 +1262,5 @@ fn merge_burst_opts(b: *mut Burst, ref_idx: i32, nm: *mut noise.NoiseModel, mo: 
     image.img_free(&tmap)
     image.img_free(&wmap)
     image.img_free(&cmap)
+    if use_gain { gg_free(&gg) }
 }
