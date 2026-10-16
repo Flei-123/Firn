@@ -13,6 +13,9 @@
 #   * the longest main-loop turn <= MAX_GAP_MS (default 250; the goal on a phone is 100, an emulator under host load jitters to ~150)
 #   * the app is still alive at the end
 # Then it presses HOME, comes back, and runs the same two checks again (pause/resume must not block either).
+# Part 3 (r655): the shutter, a lens/mode tap during the shot, HOME during a shot, resume. Photo capture, session open/close and
+# the burst merge run on the camera worker thread (log "work op=N stat=S ms=M"): the gate needs >= 2 finished operations and
+# no CAMERA phase (open 2, capture 5, save 6, zoom 7, scan 1, chips 8) of the UI thread longer than CAM_MAX_MS (default 100).
 #
 #   SERIAL=emulator-5584 bash tools/android/firncam_anr_check.sh            (builds the APK itself, x86_64)
 #   SERIAL=emulator-5584 APK=f.apk bash tools/android/firncam_anr_check.sh   (use a finished x86_64 APK)
@@ -25,6 +28,7 @@ PKG=org.firn.firncam
 MAX_GAP_MS=${MAX_GAP_MS:-250}
 GL_MAX_MS=${GL_MAX_MS:-3500}
 RUN_SECONDS=${RUN_SECONDS:-24}
+CAM_MAX_MS=${CAM_MAX_MS:-100}
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
 FAIL=0
 ok()  { echo "   OK      $1"; }
@@ -83,6 +87,36 @@ sleep 3
 $ADB logcat -c; $ADB logcat -b events -c
 $ADB shell am start -n $PKG/android.app.NativeActivity > /dev/null
 phase resume
+
+echo "== 3. shutter, tap during the shot, HOME during the shot, resume =="
+SZ=$($ADB shell wm size | grep -o '[0-9]*x[0-9]*' | tail -1); SW=${SZ%x*}; SH=${SZ#*x}
+tapf() { $ADB shell input tap $(( SW * $1 / 1080 )) $(( SH * $2 / 1920 )); }   # coordinates of a 1080x1920 screen
+$ADB logcat -c; $ADB logcat -b events -c
+$ADB shell am force-stop $PKG
+$ADB shell am start -n $PKG/android.app.NativeActivity > /dev/null
+sleep 14
+tapf 540 1705            # shutter
+sleep 1; tapf 659 1588   # mode tab while the shot runs (ignored or deferred, never a block)
+tapf 425 1503            # zoom chip
+sleep 12                 # the first shot finishes
+tapf 540 1705            # second shot ...
+sleep 2
+$ADB shell input keyevent KEYCODE_HOME   # ... paused in the middle of it
+sleep 5
+$ADB shell am start -n $PKG/android.app.NativeActivity > /dev/null
+sleep 3; tapf 540 1705; sleep 12
+$ADB logcat -d -s firncam:I > "$D/log_shot.txt"
+$ADB logcat -b events -d > "$D/ev_shot.txt"
+camw=$(grep -ao 'gap ms=[0-9]* phase=[0-9]* phase_ms=[0-9]*' "$D/log_shot.txt" | awk '{split($2,a,"=");split($3,b,"="); if ((b[2]==1||b[2]==2||b[2]==5||b[2]==6||b[2]==7||b[2]==8) && a[2]+0>m) m=a[2]+0} END{print m+0}')
+allw=$(grep -ao 'gap ms=[0-9]* phase=[0-9]*' "$D/log_shot.txt" | awk '{split($2,a,"=");split($3,b,"="); if (b[2]!=10 && a[2]+0>m) m=a[2]+0} END{print m+0}')
+nwork=$(grep -ac 'work op=' "$D/log_shot.txt")
+echo "   [shot] worker operations=$nwork  longest camera-phase gap=${camw} ms (limit $CAM_MAX_MS), longest gap=${allw} ms (limit $MAX_GAP_MS)"
+grep -a 'work op=' "$D/log_shot.txt" | cut -c20-90
+[ "$nwork" -ge 2 ] && ok "shot: worker ran >= 2 operations" || bad "shot: worker ran $nwork operations"
+[ "$camw" -le "$CAM_MAX_MS" ] && ok "shot: UI thread camera phases <= $CAM_MAX_MS ms" || bad "shot: UI thread blocked ${camw} ms in a camera phase"
+[ "$allw" -le "$MAX_GAP_MS" ] && ok "shot: UI thread never blocked > $MAX_GAP_MS ms" || bad "shot: UI thread blocked ${allw} ms"
+if grep -a 'am_anr' "$D/ev_shot.txt" | grep -aq "$PKG"; then bad "shot: Android reported an ANR"; else ok "shot: no ANR event"; fi
+$ADB shell pidof $PKG > /dev/null && ok "shot: app alive after the pause" || bad "shot: app died (crash)"
 
 $ADB shell setprop debug.firncam.sweep 0
 $ADB shell am force-stop $PKG

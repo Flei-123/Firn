@@ -88,6 +88,30 @@ const P_UI: i32 = 11 // ui layout / input of the main loop
 const P_GL: i32 = 10 // GL context + shaders of the preview (ms on a GPU, seconds on a software GL emulator)
 const GAP_WARN_MS: i64 = 100 // a turn of the main loop longer than this is logged
 
+// The camera worker thread (r655): everything that blocks without JNI (session open/close, capture waits, DNG/JPEG encoding,
+// burst merge) runs there, ONE operation at a time. JNI calls (permission, MediaStore save, MediaRecorder) stay on the UI
+// thread: on x86-64 ART puts its thread pointer into `gs`, which Firn uses for the thread block of an attached thread. The UI thread posts an operation (wop != W_NONE),
+// keeps drawing, and finishes it (worker_tick) when the worker is done. While wop != W_NONE the camera belongs to the worker:
+// the UI thread only reads the preview, it does not open, close, zoom or re-arm the camera.
+const W_NONE: i32 = 0
+const W_OPEN: i32 = 1 // close + open + session of lens warg (also after a video stop / failed video start)
+const W_SHOT: i32 = 2 // burst capture -> job (merge, encode) -> save
+const W_PLAIN: i32 = 3 // one frame -> (DNG) -> save
+const W_VSTART: i32 = 4
+const W_VSTOP: i32 = 5
+// result of an operation (wstat)
+const WS_OK: i32 = 0
+const WS_NO_INFO: i32 = 1
+const WS_OPEN_FAILED: i32 = 2
+const WS_SESSION_FAILED: i32 = 3
+const WS_NO_MEMORY: i32 = 4
+const WS_CAPTURE_FAILED: i32 = 5
+const WS_ABORTED: i32 = 6
+const WS_PROCESS_FAILED: i32 = 7
+const WS_YUV: i32 = 8
+const WS_VSTART_FAILED: i32 = 9
+const REOPEN_MS: i64 = 1500 // earliest retry of a camera that was lost (app in the background)
+
 const M_PHOTO: i32 = 0
 const M_NIGHT: i32 = 1
 const M_PORTRAIT: i32 = 2
@@ -189,6 +213,34 @@ struct App {
     dn: usize,
     dstage: i32,
     didx: i32,
+    wop: i32, // W_*: the operation the worker thread runs (W_NONE = idle). Set by the UI thread before the post.
+    wdone: u64, // completed operations (the worker adds 1 after each); wdone == wreq = the worker is idle
+    wabort: u64, // 1 = the worker stops the running operation at the next safe point
+    warg: i32, // W_OPEN: the lens index
+    wstat: i32, // WS_*: how the operation ended
+    wsave: i32, // save result (0 failed, 1 MediaStore, 2 private file, -1 nothing saved)
+    wtxt: i32, // what was saved: 0 processed JPEG, 1 camera JPEG, 2 DNG
+    wres: i32, // video start result
+    wseen: i32, // stage the status text shows
+    wt0: i64, // when the operation was posted (ms)
+    o_keep: f32, // zoom ratio to put back after the open (0 = reset to 1x)
+    o_first: bool, // the open is the first one of the run (starts the boot work afterwards)
+    defer_lens: i32, // lens to open after the running shot was aborted (-1 none)
+    lost_at: i64, // when a lost camera was last reopened
+    vok: bool, // video stop result
+    wname: [u8; 48], // file name for the worker (video)
+    pexp: i64, // plain shot: manual exposure / iso / focus snapshot taken at the shutter press
+    piso: i32,
+    pfoc: f32,
+    phave_e: bool,
+    phave_f: bool,
+    pflash: bool,
+    sbuf: u64, // buffers the worker leaves for the UI thread to save (JNI) and free
+    scap: usize,
+    sdbuf: u64,
+    sdcap: usize,
+    sptr: u64,
+    sn: usize,
 }
 
 fn set_status(a: *mut App, s: str) {
@@ -257,26 +309,98 @@ fn want_kind(a: *mut App) -> i32 {
     return camera.KIND_JPEG
 }
 
-fn open_lens(a: *mut App, idx: i32) {
+// The camera belongs to the worker thread while an operation runs: nothing here may touch it.
+fn locked(a: *mut App) -> bool {
+    return (*a).busy || (*a).wop != W_NONE
+}
+
+fn worker_abort(a: *mut App) {
+    __atomic_add((&(*a).wabort) as *mut u64, 1)
+}
+
+fn worker_aborted(a: *mut App) -> bool {
+    return __atomic_add((&(*a).wabort) as *mut u64, 0) != (0 as u64)
+}
+
+// UI side: closes the running camera and opens lens idx on the worker thread (up to a second or more on a phone). The
+// camera is not ready until worker_tick finished it. keep > 0: that zoom ratio is put back afterwards, else zoom 1x.
+fn open_lens_keep(a: *mut App, idx: i32, keep: f32) {
+    if (*a).wop != W_NONE { return }
+    if camera.camera_permission() != 1 { set_status(a, "NO PERMISSION"); return } // JNI: UI thread only (see camera_open_granted)
     sweep_abort(a, false) // the camera is closed below: nothing to restore
-    camera.camera_close()
     (*a).ready = false
-    if !camera.camera_info(idx, &(*a).info) { set_status(a, "NO INFO"); return }
+    (*a).warg = idx
+    (*a).o_keep = keep
+    (*a).wop = W_OPEN
+    set_status(a, "OPENING")
+    worker_post(a)
+}
+
+fn open_lens(a: *mut App, idx: i32) {
+    open_lens_keep(a, idx, 0.0f)
+}
+
+// worker thread: close, open, session, manual/flash controls, zoom chips
+fn work_open(a: *mut App) {
+    let idx: i32 = (*a).warg
+    (*a).wstat = WS_OK
+    thread_blocking_an()
+    camera.camera_close()
+    var ni: camera.CamInfo = camera.zero_info()
+    let got: bool = camera.camera_info(idx, &ni)
+    thread_blocking_out()
+    if !got { (*a).wstat = WS_NO_INFO; return }
+    (*a).info = ni
     (*a).lens = idx
     if !mode_ok(a, (*a).mode) { (*a).mode = M_PHOTO }
     if !man_ok(a) { (*a).manual = false }
-    let e: i32 = camera.camera_open(idx)
-    if e != camera.E_OK { set_status(a, "OPEN FAILED"); return }
-    let s: i32 = camera.camera_start(want_kind(a))
-    if s != camera.E_OK { set_status(a, "SESSION FAILED"); return }
+    thread_blocking_an()
+    let e: i32 = camera.camera_open_granted(idx)
+    thread_blocking_out()
+    if e != camera.E_OK { (*a).wstat = WS_OPEN_FAILED; return }
+    let wk: i32 = want_kind(a)
+    thread_blocking_an()
+    let s: i32 = camera.camera_start(wk)
+    thread_blocking_out()
+    if s != camera.E_OK { (*a).wstat = WS_SESSION_FAILED; return }
     (*a).kind = camera.camera_kind()
     (*a).zr = 1.0f // camera_open reset the zoom
-    (*a).ready = true
     (*a).fl_last = 0 - 1
-    apply_manual(a)
-    let fe: i32 = apply_flash(a)
+    if (*a).manual { apply_manual_now(a) }
+    let fe: i32 = apply_flash_now(a)
     rebuild_chips(a)
-    set_status(a, "READY")
+}
+
+// UI side of an open: hand the camera back
+fn finish_open(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView, now: i64) {
+    let keep: f32 = (*a).o_keep
+    let first: bool = (*a).o_first
+    (*a).o_keep = 0.0f
+    (*a).o_first = false
+    (*a).wop = W_NONE
+    let st: i32 = (*a).wstat
+    if st == WS_OK {
+        (*a).ready = true
+        (*a).lost_at = 0
+        set_status(a, "READY")
+        if keep > 0.0f {
+            let ez: i32 = camera.camera_set_zoom(keep)
+            (*a).zr = keep
+        } else {
+            reset_zoom(a, u, cv)
+        }
+    } else if st == WS_NO_INFO {
+        set_status(a, "NO INFO")
+    } else if st == WS_OPEN_FAILED {
+        set_status(a, "OPEN FAILED")
+    } else {
+        set_status(a, "SESSION FAILED")
+    }
+    if first {
+        mark(a, P_CHIPS)
+        boot_begin(a, now)
+        reset_zoom(a, u, cv)
+    }
 }
 
 fn stamp() -> i64 {
@@ -306,6 +430,10 @@ fn man_focus(a: *mut App) -> f32 {
 
 fn apply_manual(a: *mut App) {
     if !(*a).ready || !(*a).manual { return }
+    apply_manual_now(a)
+}
+
+fn apply_manual_now(a: *mut App) {
     var e: i64 = 0
     var iso: i32 = 0
     var fd: f32 = 0.0f - 1.0f
@@ -340,31 +468,59 @@ fn report(a: *mut App, r: i32, ok_txt: str, priv_txt: str) {
 }
 
 // ---------------------------------------------------------------- plain single shot (RAW -> DNG, JPEG as the camera made it)
-fn shoot_plain(a: *mut App) {
-    if !(*a).ready { return }
+// UI side: snapshot the manual values, post the shot to the worker
+fn start_plain(a: *mut App) {
+    if !(*a).ready || locked(a) { return }
+    (*a).phave_e = false
+    (*a).phave_f = false
+    (*a).piso = 0
+    if (*a).manual {
+        if has_man_sensor(a) { (*a).pexp = man_exp(a); (*a).piso = man_iso(a); (*a).phave_e = true }
+        if has_man_focus(a) { (*a).pfoc = man_focus(a); (*a).phave_f = true }
+    }
+    (*a).pflash = (*a).flash > 0 && ((*a).mode == M_PHOTO || (*a).mode == M_RAW)
+    set_shot_rotation(a)
+    (*a).wabort = 0
+    (*a).wsave = 0 - 1
+    (*a).wstat = WS_OK
+    (*a).wtxt = 0
+    (*a).wseen = 1
+    (*a).wop = W_PLAIN
+    (*a).busy = true
+    set_status(a, "CAPTURING")
+    worker_post(a)
+}
+
+// worker thread: capture one frame, make the DNG when it is RAW, save
+fn work_plain(a: *mut App) {
+    (*a).wstat = WS_OK
+    (*a).wsave = 0 - 1
     let cap: usize = if (*a).kind == camera.KIND_RAW { raw_frame_bytes(a) } else { 24 * 1024 * 1024 }
     let buf: u64 = camera.camera_alloc(cap)
-    if buf == 0 { set_status(a, "NO MEMORY"); return }
+    if buf == 0 { (*a).wstat = WS_NO_MEMORY; return }
     var fi: camera.FrameInfo = camera.zero_frame()
     var exp_l: [i64; 1] = [0 as i64; 1]
     var foc_l: [f32; 1] = [0.0f; 1]
     var ep: u64 = 0
     var fp: u64 = 0
-    var iso: i32 = 0
-    if (*a).manual {
-        if has_man_sensor(a) { exp_l[0] = man_exp(a); iso = man_iso(a); ep = (&exp_l[0]) as u64 }
-        if has_man_focus(a) { foc_l[0] = man_focus(a); fp = (&foc_l[0]) as u64 }
-    }
-    if (*a).flash > 0 && ((*a).mode == M_PHOTO || (*a).mode == M_RAW) { let fp2: i32 = camera.camera_flash_prepare() }
-    set_shot_rotation(a)
+    let iso: i32 = (*a).piso
+    if (*a).phave_e { exp_l[0] = (*a).pexp; ep = (&exp_l[0]) as u64 }
+    if (*a).phave_f { foc_l[0] = (*a).pfoc; fp = (&foc_l[0]) as u64 }
+    if worker_aborted(a) { (*a).wstat = WS_ABORTED; camera.camera_free(buf, cap); return }
+    thread_blocking_an()
+    if (*a).pflash { let fp2: i32 = camera.camera_flash_prepare() }
     let n: i32 = camera.camera_capture(1, ep, fp, iso, buf, cap, &fi)
+    thread_blocking_out()
     if n < 1 {
-        set_status(a, "CAPTURE FAILED")
+        (*a).wstat = WS_CAPTURE_FAILED
         camera.camera_free(buf, cap)
         return
     }
-    var name: [u8; 48] = [0 as u8; 48]
     (*a).shots = (*a).shots + 1
+    (*a).sbuf = buf
+    (*a).scap = cap
+    (*a).sdbuf = 0
+    (*a).sdcap = 0
     if fi.kind == camera.KIND_RAW {
         var m: meta.SensorMeta = meta.meta_default()
         camera.camera_meta(fi.slot, &m)
@@ -372,22 +528,38 @@ fn shoot_plain(a: *mut App) {
         camera.camera_dng_extra(fi.slot, &ex)
         let dcap: usize = dngwrite.dng_max_size(fi.w as u32, fi.h as u32)
         let dbuf: u64 = camera.camera_alloc(dcap)
-        if dbuf == 0 { set_status(a, "NO MEMORY"); camera.camera_free(buf, cap); return }
+        if dbuf == 0 { (*a).wstat = WS_NO_MEMORY; return }
         let dn: usize = dngwrite.dng_write(dbuf, dcap, buf + fi.offset as u64, fi.w as u32, fi.h as u32, &m, &ex)
+        (*a).sdbuf = dbuf
+        (*a).sdcap = dcap
+        (*a).sptr = dbuf
+        (*a).sn = dn
+        (*a).wtxt = 2
+    } else if fi.kind == camera.KIND_JPEG {
+        (*a).sptr = buf + fi.offset as u64
+        (*a).sn = fi.size
+        (*a).wtxt = 1
+    } else {
+        (*a).wstat = WS_YUV
+    }
+}
+
+// UI side: the JNI part of a save (MediaStore) and freeing of the worker's buffers
+fn save_plain_result(a: *mut App) {
+    var name: [u8; 48] = [0 as u8; 48]
+    if (*a).wtxt == 2 {
         name_into((&name[0]) as u64, "IMG_", ".dng")
         let mime: str = "image/x-adobe-dng\0"
-        let r: i32 = if dn > 0 { camera.camera_save(dbuf, dn, (&name[0]) as u64, mime.p as u64) } else { 0 }
-        camera.camera_free(dbuf, dcap)
-        report(a, r, "SAVED DNG", "SAVED DNG PRIVATE")
-    } else if fi.kind == camera.KIND_JPEG {
+        (*a).wsave = if (*a).sn > 0 { camera.camera_save((*a).sptr, (*a).sn, (&name[0]) as u64, mime.p as u64) } else { 0 }
+    } else if (*a).wtxt == 1 {
         name_into((&name[0]) as u64, "IMG_", ".jpg")
         let mime: str = "image/jpeg\0"
-        let r: i32 = camera.camera_save(buf + fi.offset as u64, fi.size, (&name[0]) as u64, mime.p as u64)
-        report(a, r, "SAVED JPG", "SAVED JPG PRIVATE")
-    } else {
-        set_status(a, "YUV NOT SAVED")
+        (*a).wsave = camera.camera_save((*a).sptr, (*a).sn, (&name[0]) as u64, mime.p as u64)
     }
-    camera.camera_free(buf, cap)
+    if (*a).sdbuf != 0 { camera.camera_free((*a).sdbuf, (*a).sdcap) }
+    if (*a).sbuf != 0 { camera.camera_free((*a).sbuf, (*a).scap) }
+    (*a).sdbuf = 0
+    (*a).sbuf = 0
 }
 
 // ---------------------------------------------------------------- processed shot: capture, then the job thread
@@ -414,9 +586,9 @@ fn want_frames(a: *mut App, raw: bool, steps: *mut [f32; 16]) -> i32 {
     return focus.plan_focus(&mt, 0.0f, (*a).info.min_focus_d, 8, &(*steps)[0])
 }
 
-// UI side, step 1: plan the shot, allocate; the frames are taken one per UI iteration (step_capture)
+// UI side: plan the shot, allocate, post it to the worker thread (work_shot takes the frames)
 fn start_job(a: *mut App) {
-    if !(*a).ready || (*a).busy { return }
+    if !(*a).ready || locked(a) { return }
     let raw: bool = (*a).kind == camera.KIND_RAW
     let ji: *mut camera.CamInfo = &(*a).info
     let fb: usize = if raw { raw_frame_bytes(a) } else { (((*ji).jpeg_w as usize) * ((*ji).jpeg_h as usize) * 3) / 4 + 1048576 }
@@ -444,7 +616,15 @@ fn start_job(a: *mut App) {
     (*a).cap_at = 0
     (*a).stage = 1
     (*a).busy = true
+    set_shot_rotation(a)
+    (*a).wabort = 0
+    (*a).wsave = 0 - 1
+    (*a).wstat = WS_OK
+    (*a).wtxt = 0
+    (*a).wseen = 1
+    (*a).wop = W_SHOT
     set_status(a, "CAPTURING")
+    worker_post(a)
 }
 
 fn release_capture(a: *mut App) {
@@ -455,35 +635,56 @@ fn release_capture(a: *mut App) {
     let fe: i32 = apply_flash(a)
 }
 
-// one frame per call (a capture is a few hundred ms; the UI keeps drawing between frames)
-fn step_capture(a: *mut App) {
+// worker thread: the frames of the burst, one camera_capture each (the abort flag is checked between them), then the job
+// (merge + encode, long) and the save. Nothing here runs on the UI thread.
+fn work_shot(a: *mut App) {
+    (*a).wstat = WS_OK
+    (*a).wsave = 0 - 1
     let fptr: *mut camera.FrameInfo = (*a).fbuf as *mut camera.FrameInfo
-    let k: i32 = (*a).cap_i
-    let fk: *mut camera.FrameInfo = camera.frame_at(fptr, k)
-    var fp: u64 = 0
-    if (*a).mode == M_STACK { fp = (&(*a).steps[k as usize]) as u64 }
-    set_shot_rotation(a)
-    let c: i32 = camera.camera_capture(1, 0, fp, 0, (*a).cbuf + (*a).cap_at as u64, (*a).ccap - (*a).cap_at, fk)
-    if c >= 1 {
-        (*a).bs[k as usize] = (*a).cbuf + (*a).cap_at as u64
+    while (*a).cap_i < (*a).cap_n {
+        if worker_aborted(a) { break }
+        let k: i32 = (*a).cap_i
+        let fk: *mut camera.FrameInfo = camera.frame_at(fptr, k)
+        var fp: u64 = 0
+        if (*a).mode == M_STACK { fp = (&(*a).steps[k as usize]) as u64 }
+        let dst: u64 = (*a).cbuf + (*a).cap_at as u64
+        let room: usize = (*a).ccap - (*a).cap_at
+        thread_blocking_an()
+        let c: i32 = camera.camera_capture(1, 0, fp, 0, dst, room, fk)
+        thread_blocking_out()
+        if c < 1 { break }
+        (*a).bs[k as usize] = dst
         (*a).cap_at = (*a).cap_at + (*fk).offset + (*fk).size
         (*a).cap_i = k + 1
         (*a).job.progress = (((k + 1) * 25 / (*a).cap_n) as u64)
     }
-    if c < 1 || (*a).cap_i >= (*a).cap_n {
-        if (*a).cap_i < 1 {
-            release_capture(a)
-            set_status(a, "CAPTURE FAILED")
-            (*a).busy = false
-            (*a).stage = 0
-            return
-        }
-        begin_process(a)
+    if worker_aborted(a) { (*a).wstat = WS_ABORTED; return }
+    if (*a).cap_i < 1 { (*a).wstat = WS_CAPTURE_FAILED; return }
+    fill_job(a)
+    (*a).stage = 2
+    camjob.job_entry((&(*a).job) as u64)
+    if !(*a).job.ok { (*a).wstat = WS_PROCESS_FAILED; return }
+    if worker_aborted(a) { (*a).wstat = WS_ABORTED; return }
+    (*a).wtxt = 0
+    (*a).shots = (*a).shots + 1
+}
+
+// UI side: the JNI part of a burst result
+fn save_job_result(a: *mut App) {
+    var name: [u8; 48] = [0 as u8; 48]
+    name_into((&name[0]) as u64, "IMG_", ".jpg")
+    let mime: str = "image/jpeg\0"
+    (*a).wsave = camera.camera_save((*a).job.out, (*a).job.out_n, (&name[0]) as u64, mime.p as u64)
+    if (*a).job.have_pdf {
+        var pn: [u8; 48] = [0 as u8; 48]
+        name_into((&pn[0]) as u64, "SCAN_", ".pdf")
+        let pm: str = "application/pdf\0"
+        camera.camera_save_doc(rt.buf_ptr(&(*a).job.pdf), rt.buf_len(&(*a).job.pdf), (&pn[0]) as u64, pm.p as u64)
     }
 }
 
-// step 2: hand the frames to the job thread
-fn begin_process(a: *mut App) {
+// the job description from the captured frames (worker thread)
+fn fill_job(a: *mut App) {
     let ji: *mut camera.CamInfo = &(*a).info
     let fptr: *mut camera.FrameInfo = (*a).fbuf as *mut camera.FrameInfo
     (*a).job.mode = (*a).mode
@@ -512,24 +713,22 @@ fn begin_process(a: *mut App) {
         }
         i = i + 1
     }
-    (*a).stage = 2
-    set_status(a, "PROCESSING")
-    if (*a).ttid == 0 {
-        pthread_attr_init((&(*a).tattr[0]) as u64)
-        pthread_attr_setstacksize((&(*a).tattr[0]) as u64, JOB_STACK)
-        pthread_attr_setdetachstate((&(*a).tattr[0]) as u64, 1)
-        let rc: i32 = pthread_create((&(*a).ttid) as u64, (&(*a).tattr[0]) as u64, ndk.code_of_thread(thread_job_main), a as u64)
-        if rc != 0 { (*a).ttid = 0 }
-    }
-    if (*a).ttid == 0 {
-        camjob.job_entry((&(*a).job) as u64) // no thread: run here
-    } else {
-        __atomic_add((&(*a).wreq) as *mut u64, 1)
+}
+
+// ---------------------------------------------------------------- the worker thread
+// The worker is a bionic pthread that attaches to the Firn runtime once (a raw-clone thread of thread_start shares bionic's
+// thread pointer and crashes the app on Android) and never detaches. Between operations it sleeps in host mode (blocked).
+fn worker_dispatch(a: *mut App) {
+    let op: i32 = (*a).wop
+    if op == W_OPEN {
+        work_open(a)
+    } else if op == W_SHOT {
+        work_shot(a)
+    } else if op == W_PLAIN {
+        work_plain(a)
     }
 }
 
-// The job thread lives as long as the app: it attaches to the Firn runtime once and never detaches (leaving a
-// thread that detached crashes the process on Android). Between jobs it sleeps in host mode (counted as blocked).
 fn thread_job_main(arg: u64) -> u64 {
     let a: *mut App = arg as *mut App
     if !thread_attach() { return 0 }
@@ -539,41 +738,128 @@ fn thread_job_main(arg: u64) -> u64 {
         if want != seen {
             seen = want
             thread_blocking_out()
-            camjob.job_entry((&(*a).job) as u64)
+            worker_dispatch(a)
+            __atomic_add((&(*a).wdone) as *mut u64, 1)
             thread_blocking_an()
         } else {
-            usleep(20000 as u32)
+            usleep(10000 as u32)
         }
     }
     return 0
 }
 
-// UI side of a finished job: save, release, report
-fn poll_job(a: *mut App) {
-    if !(*a).busy { return }
-    if (*a).stage == 1 { mark(a, P_CAPTURE); step_capture(a); return }
-    if !camjob.job_finished(&(*a).job) { return }
-    mark(a, P_SAVE)
-    var name: [u8; 48] = [0 as u8; 48]
-    if (*a).job.ok {
-        name_into((&name[0]) as u64, "IMG_", ".jpg")
-        let mime: str = "image/jpeg\0"
-        let r: i32 = camera.camera_save((*a).job.out, (*a).job.out_n, (&name[0]) as u64, mime.p as u64)
-        if (*a).job.have_pdf {
-            var pn: [u8; 48] = [0 as u8; 48]
-            name_into((&pn[0]) as u64, "SCAN_", ".pdf")
-            let pm: str = "application/pdf\0"
-            camera.camera_save_doc(rt.buf_ptr(&(*a).job.pdf), rt.buf_len(&(*a).job.pdf), (&pn[0]) as u64, pm.p as u64)
-        }
-        (*a).shots = (*a).shots + 1
-        report(a, r, "SAVED", "SAVED PRIVATE")
-    } else {
-        set_status(a, "PROCESSING FAILED")
+// UI side: start the operation a.wop on the worker (the thread is created on the first use; without a thread it runs here)
+fn worker_post(a: *mut App) {
+    (*a).wt0 = fuishell.shell_now_ms()
+    if (*a).ttid == 0 {
+        pthread_attr_init((&(*a).tattr[0]) as u64)
+        pthread_attr_setstacksize((&(*a).tattr[0]) as u64, JOB_STACK)
+        pthread_attr_setdetachstate((&(*a).tattr[0]) as u64, 1)
+        let rc: i32 = pthread_create((&(*a).ttid) as u64, (&(*a).tattr[0]) as u64, ndk.code_of_thread(thread_job_main), a as u64)
+        if rc != 0 { (*a).ttid = 0 }
     }
-    camjob.job_free(&(*a).job)
-    release_capture(a)
+    __atomic_add((&(*a).wreq) as *mut u64, 1)
+    if (*a).ttid == 0 {
+        worker_dispatch(a)
+        __atomic_add((&(*a).wdone) as *mut u64, 1)
+    }
+}
+
+fn worker_idle(a: *mut App) -> bool {
+    return __atomic_add((&(*a).wdone) as *mut u64, 0) == __atomic_add((&(*a).wreq) as *mut u64, 0)
+}
+
+// leaving the app: stop the running operation and wait (bounded) so the camera is not closed under it
+fn worker_stop(a: *mut App) {
+    if (*a).wop == W_NONE { return }
+    worker_abort(a)
+    var waited: i32 = 0
+    while !worker_idle(a) && waited < 600 {
+        usleep(20000 as u32)
+        waited = waited + 1
+    }
+}
+
+fn log_work(op: i32, stat: i32, ms: i64) {
+    var b: [u8; 64] = [0 as u8; 64]
+    let p: u64 = (&b[0]) as u64
+    var n: usize = put_str(p, "work op=")
+    n = n + put_int(p + n as u64, op as i64)
+    n = n + put_str(p + n as u64, " stat=")
+    n = n + put_int(p + n as u64, stat as i64)
+    n = n + put_str(p + n as u64, " ms=")
+    n = n + put_int(p + n as u64, ms)
+    let tag: str = "firncam\0"
+    let r: i32 = log_write(4, tag.p as u64, p)
+}
+
+// UI side of a finished shot: report, release, hand the camera back
+fn finish_shot(a: *mut App) {
+    let st: i32 = (*a).wstat
+    let op: i32 = (*a).wop
+    if op == W_PLAIN {
+        if st == WS_OK { save_plain_result(a) } else if (*a).sbuf != 0 {
+            if (*a).sdbuf != 0 { camera.camera_free((*a).sdbuf, (*a).sdcap) }
+            camera.camera_free((*a).sbuf, (*a).scap)
+            (*a).sdbuf = 0
+            (*a).sbuf = 0
+        }
+    } else if st == WS_OK {
+        save_job_result(a)
+    }
+    if st == WS_OK {
+        if (*a).wtxt == 2 {
+            report(a, (*a).wsave, "SAVED DNG", "SAVED DNG PRIVATE")
+        } else if (*a).wtxt == 1 {
+            report(a, (*a).wsave, "SAVED JPG", "SAVED JPG PRIVATE")
+        } else {
+            report(a, (*a).wsave, "SAVED", "SAVED PRIVATE")
+        }
+    } else if st == WS_NO_MEMORY {
+        set_status(a, "NO MEMORY")
+    } else if st == WS_CAPTURE_FAILED {
+        set_status(a, "CAPTURE FAILED")
+    } else if st == WS_ABORTED {
+        set_status(a, "SHOT CANCELLED")
+    } else if st == WS_PROCESS_FAILED {
+        set_status(a, "PROCESSING FAILED")
+    } else if st == WS_YUV {
+        set_status(a, "YUV NOT SAVED")
+    }
+    if op == W_SHOT {
+        camjob.job_free(&(*a).job)
+        release_capture(a)
+    }
     (*a).stage = 0
     (*a).busy = false
+    (*a).wop = W_NONE
+}
+
+// UI side, once per turn: follow the running operation and finish it when the worker is done
+fn worker_tick(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView, now: i64) {
+    if (*a).wop == W_NONE { return }
+    if !worker_idle(a) {
+        if (*a).wop == W_SHOT && (*a).stage != (*a).wseen {
+            (*a).wseen = (*a).stage
+            if (*a).stage == 2 { set_status(a, "PROCESSING") }
+        }
+        return
+    }
+    let op: i32 = (*a).wop
+    log_work(op, (*a).wstat, now - (*a).wt0)
+    if op == W_OPEN {
+        mark(a, P_OPEN)
+        finish_open(a, u, cv, now)
+    } else {
+        mark(a, P_SAVE)
+        finish_shot(a)
+    }
+    // a lens switch asked while a shot ran: the shot was aborted, now the lens opens
+    if (*a).defer_lens >= 0 && (*a).wop == W_NONE {
+        let d: i32 = (*a).defer_lens
+        (*a).defer_lens = 0 - 1
+        open_lens(a, d)
+    }
 }
 
 // plain single frame: RAW -> DNG, manual photo, or a photo with flash (one frame fires the flash)
@@ -583,18 +869,20 @@ fn plain_shot(a: *mut App) -> bool {
 }
 
 fn shoot(a: *mut App) {
-    if (*a).busy { return }
+    if locked(a) { return }
     sweep_abort(a, true) // a photo at the sweep's zoom would be wrong
-    if plain_shot(a) { shoot_plain(a); return }
+    if plain_shot(a) { start_plain(a); return }
     start_job(a)
 }
 
+// video: MediaRecorder is JNI and stays on the UI thread; the session rebuild after it goes to the worker (open_lens)
 fn toggle_video(a: *mut App) {
-    if !(*a).ready || (*a).info.vid_w <= 0 { return }
+    if !(*a).ready || (*a).info.vid_w <= 0 || (*a).wop != W_NONE { return }
     sweep_abort(a, true)
     if (*a).recording {
         let ok: bool = camera.camera_video_stop()
         (*a).recording = false
+        (*a).vok = ok
         open_lens(a, (*a).lens)
         if ok { commit_thumb(a) }
         if ok { set_status(a, "VIDEO SAVED") } else { set_status(a, "VIDEO FAILED") }
@@ -618,6 +906,11 @@ fn toggle_video(a: *mut App) {
 // (photo, RAW); in VIDEO "on" is the torch; every other mode keeps it off.
 fn apply_flash(a: *mut App) -> i32 {
     if !(*a).ready { return camera.E_STATE }
+    return apply_flash_now(a)
+}
+
+// without the ready check: the worker applies the flash while the lens is not yet released to the UI
+fn apply_flash_now(a: *mut App) -> i32 {
     var m: i32 = camera.FLASH_OFF
     let md: i32 = (*a).mode
     if md == M_PHOTO || md == M_RAW {
@@ -1328,8 +1621,9 @@ fn sync_ui(a: *mut App, u: *mut ui.Ui) {
         i = i + 1
     }
     i = 0
-    (*u).nchips = (*a).nchip
-    while i < (*a).nchip {
+    let nch: i32 = if (*a).wop == W_OPEN { 0 } else { (*a).nchip } // the worker rebuilds the chips during an open
+    (*u).nchips = nch
+    while i < nch {
         (*u).chips[i as usize].idx = (*a).chip_idx[i as usize]
         (*u).chips[i as usize].x10 = (*a).chip_x10[i as usize]
         (*u).chips[i as usize].opt = (*a).chip_opt[i as usize]
@@ -1339,7 +1633,7 @@ fn sync_ui(a: *mut App, u: *mut ui.Ui) {
     (*u).can_flip = (*a).can_flip
     (*u).busy = (*a).busy
     (*u).recording = (*a).recording
-    if (*a).busy {
+    if (*a).busy && (*a).wop == W_SHOT {
         (*u).progress = camjob.job_progress(&(*a).job) as i32
     } else {
         (*u).progress = 0
@@ -1387,26 +1681,30 @@ fn do_focus(a: *mut App, fx: f64, fy: f64, pvw: i32, pvh: i32) {
 // it cannot, the preview shader crops digitally. After a real zoom the shader zoom stays at 1.
 fn do_zoom(a: *mut App, cv: *mut camview.CamView, z: f64) {
     sweep_abort(a, false) // the user's zoom wins; it is applied below
-    if !(*a).ready {
+    if !(*a).ready || (*a).wop != W_NONE {
         camview.camview_zoom(cv, z)
         return
     }
     var ratio: f32 = z as f32
+    if locked(a) {
+        camview.camview_zoom(cv, z)
+        return
+    }
     let lens: i32 = camera.camera_zoom_lens(z as f32, &ratio)
     (*a).zr = ratio
-    if lens >= 0 && lens != (*a).lens && lens < 16 && (*a).lfac[lens as usize] == (*a).info.facing && !(*a).recording && !(*a).busy {
-        open_lens(a, lens)
+    if lens >= 0 && lens != (*a).lens && lens < 16 && (*a).lfac[lens as usize] == (*a).info.facing && !(*a).recording {
+        // another lens: the worker opens it, then the ratio is put back
+        open_lens_keep(a, lens, ratio)
+        camview.camview_zoom(cv, 1.0)
+        return
     }
     let e: i32 = camera.camera_set_zoom(ratio)
     if e == camera.E_OK {
         (*a).zr = ratio
         camview.camview_zoom(cv, 1.0)
         // crossing 1.05x changes the still stream kind (RAW burst <-> JPEG): rebuild the session, keep the ratio
-        if (*a).ready && want_kind(a) != (*a).kind && !(*a).recording && !(*a).busy {
-            let keep: f32 = camera.camera_get_zoom()
-            open_lens(a, (*a).lens)
-            let e2: i32 = camera.camera_set_zoom(keep)
-            (*a).zr = keep
+        if (*a).ready && want_kind(a) != (*a).kind && !(*a).recording {
+            open_lens_keep(a, (*a).lens, ratio)
         }
     } else {
         camview.camview_zoom(cv, z)
@@ -1421,7 +1719,7 @@ fn reset_zoom(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView) {
 }
 
 fn change_mode(a: *mut App, nm: i32) {
-    if nm == (*a).mode { return }
+    if nm == (*a).mode || locked(a) { return }
     (*a).mode = nm
     if !man_ok(a) { (*a).manual = false }
     if want_kind(a) != (*a).kind || nm == M_VIDEO || (*a).fl_last > 0 {
@@ -1432,10 +1730,21 @@ fn change_mode(a: *mut App, nm: i32) {
     }
 }
 
+// A lens switch: now when the camera is free; while a shot runs the shot is aborted (no leak: worker_tick releases its
+// buffers) and the lens opens right after it.
+fn request_lens(a: *mut App, idx: i32) {
+    if (*a).wop == W_NONE {
+        open_lens(a, idx)
+    } else if (*a).wop == W_SHOT || (*a).wop == W_PLAIN {
+        (*a).defer_lens = idx
+        worker_abort(a)
+    }
+}
+
 fn flip_lens(a: *mut App) {
     let want: i32 = if (*a).info.facing == 1 { 0 } else { 1 }
     let idx: i32 = (*a).main_lens[want as usize]
-    if idx >= 0 { open_lens(a, idx) }
+    if idx >= 0 { request_lens(a, idx) }
 }
 
 fn run_cmd(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView, c: *mut ui.Cmd, pvw: i32, pvh: i32) {
@@ -1443,34 +1752,36 @@ fn run_cmd(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView, c: *mut ui.Cmd,
     if k == ui.C_SHOT {
         if (*a).mode == M_VIDEO {
             toggle_video(a)
-        } else if !(*a).recording && !(*a).busy {
+        } else if !(*a).recording && !locked(a) {
             snap_thumb(a)
             shoot(a)
         }
     } else if k == ui.C_MODE {
-        if !(*a).recording && !(*a).busy {
+        if !(*a).recording && !locked(a) {
             change_mode(a, (*c).a)
             reset_zoom(a, u, cv)
         }
     } else if k == ui.C_LENS {
-        if !(*a).recording && !(*a).busy && (*c).a >= 0 && (*c).a < (*a).nlens {
-            open_lens(a, (*c).a)
+        if !(*a).recording && (*c).a >= 0 && (*c).a < (*a).nlens {
+            request_lens(a, (*c).a)
             reset_zoom(a, u, cv)
         }
     } else if k == ui.C_STOP {
-        if !(*a).busy {
+        if !locked(a) {
             let sz: f64 = ((*c).a as f64) / 10.0
             do_zoom(a, cv, sz)
             ui.ui_set_zoom(u, sz)
         }
     } else if k == ui.C_FLIP {
-        if !(*a).recording && !(*a).busy {
+        if !(*a).recording {
             flip_lens(a)
             reset_zoom(a, u, cv)
         }
     } else if k == ui.C_FLASH {
         (*a).flash = (*c).a
-        if want_kind(a) != (*a).kind && !(*a).recording && !(*a).busy {
+        if locked(a) {
+            // a shot or an open runs: the flash is applied by the next open / shot
+        } else if want_kind(a) != (*a).kind && !(*a).recording {
             open_lens(a, (*a).lens)
         } else {
             let e: i32 = apply_flash(a)
@@ -1482,7 +1793,7 @@ fn run_cmd(a: *mut App, u: *mut ui.Ui, cv: *mut camview.CamView, c: *mut ui.Cmd,
             }
         }
     } else if k == ui.C_MAN {
-        if !(*a).recording && !(*a).busy && man_ok(a) {
+        if !(*a).recording && !locked(a) && man_ok(a) {
             (*a).manual = !(*a).manual
             if (*a).manual {
                 if want_kind(a) != (*a).kind { open_lens(a, (*a).lens) } else { apply_manual(a) }
@@ -1600,6 +1911,9 @@ fn main() -> i32 {
         have_s: false, nframe: 0, lfac: [0 - 1; 16], lmm: [0.0f; 16], main_lens: [0 - 1; 3], chip_idx: [0; 6],
         phase: 0, ph_t0: 0, slow_ms: 0, slow_phase: 0, gap_max: 0, gap_phase: 0, gap_all: 0, bt_state: 0, bt_at: 0, sw_run: 0, sw_stage: 0, sw_sub: 0, sw_z10: 10,
         sw_t0: 0, sw_c0: 0, sw_ci: 0, sw_same: 10, sw_diff: 0, sw_guard: 0, cache_hit: false, dbuf: 0, dn: 0, dstage: 0, didx: 0,
+        wop: 0, wdone: 0, wabort: 0, warg: 0, wstat: 0, wsave: 0 - 1, wtxt: 0, wres: 0, wseen: 0, wt0: 0, o_keep: 0.0f, o_first: false,
+        defer_lens: 0 - 1, lost_at: 0, vok: false, wname: [0 as u8; 48], pexp: 0, piso: 0, pfoc: 0.0f, phave_e: false, phave_f: false,
+        pflash: false, sbuf: 0, scap: 0, sdbuf: 0, sdcap: 0, sptr: 0, sn: 0,
         chip_x10: [10; 6], chip_opt: [0; 6], foc1: 0.0f, nchip: 0, learn_x10: 0, learn_lens: 0 - 1, swept: false, sw_n: 0, sw_z: [0; 16], sw_f: [0; 16], sw_cw: [0; 16], sw_ph: [[0 as u8; 16]; 16], ph1: [0 as u8; 16], can_flip: false, cpu: 0, cpu_cap: 0, pend_zoom: 0.0 - 1.0, zr: 1.0f, pend_sl: [0 - 1; 3],
     }
     a.thumb = camera.camera_alloc(THUMB_BYTES)
@@ -1651,11 +1965,8 @@ fn main() -> i32 {
                     scan_lenses(&a)
                     let first: i32 = if a.main_lens[1] >= 0 { a.main_lens[1] } else { 0 }
                     mark(&a, P_OPEN)
+                    a.o_first = true // worker_tick starts the boot work when the camera is open
                     open_lens(&a, first)
-                    reset_zoom(&a, &u, &cv)
-                    mark(&a, P_CHIPS)
-                    boot_begin(&a, now)
-                    reset_zoom(&a, &u, &cv)
                 } else {
                     set_status(&a, "NO CAMERA")
                 }
@@ -1664,10 +1975,17 @@ fn main() -> i32 {
                 camera.camera_request_permission()
             }
         }
-        poll_job(&a)
+        worker_tick(&a, &u, &cv, now)
+        // the camera was taken away (app in the background): open it again, at most every REOPEN_MS
+        let gone: bool = (a.ready && !camera.camera_is_open()) || (!a.ready && a.lost_at > 0)
+        if gone && a.wop == W_NONE && !a.recording && now - a.lost_at >= REOPEN_MS {
+            a.lost_at = now
+            open_lens(&a, a.lens)
+        }
         if n_all >= 6 { boot_tick(&a, &u, &cv, now) }
         if gen != fuishell.shell_gen(&s) {
-            // the GPU was (re)started: the preview's GL objects are new
+            // the GPU was (re)started: the surface is new (pause / resume). A running shot is cancelled, not left half done.
+            if a.wop == W_SHOT || a.wop == W_PLAIN { worker_abort(&a) }
             gen = fuishell.shell_gen(&s)
             mark(&a, P_GL)
             if fuishell.shell_gpu_on(&s) && !cpu_forced() { let go: bool = camview.camview_open(&cv, fuishell.shell_gl(&s)) }
@@ -1776,6 +2094,7 @@ fn main() -> i32 {
             n_cam = 0
         }
     }
+    worker_stop(&a)
     if a.recording { let okv: bool = camera.camera_video_stop() }
     camera.camera_close()
     par.shutdown()
