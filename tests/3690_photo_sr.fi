@@ -1,0 +1,315 @@
+// expect_exit: 0
+// tests/3690_photo_sr.fi -- photo.sr: multi-frame super resolution from RAW Bayer mosaics.
+// A synthetic scene (zone plate past the sensor Nyquist, slanted edge, a moving square) is rendered at exact sub-pixel
+// shifts into 6 RGGB mosaics (box aperture, noise). Checks against the exact output-size truth:
+//   (1) static region: SR beats the single frame demosaic + Lanczos by >= 0.8 dB and the burst merge of the
+//       resampled frames (photo.merge) by >= 0.8 dB (zone plate beyond the sensor Nyquist: the merge cannot resolve it);
+//   (2) the moving square leaves no ghost: in its whole track SR is not worse than 1.5x the error of the reference frame
+//       alone (a plain mean of the aligned frames would be far worse);
+//   (3) bit identical result for 0 and 3 pool threads; (4) bad input is refused (1 frame, odd window, window outside);
+//   (5) clipped samples do not leak: a blown block stays at the reference estimate, no NaN anywhere;
+//   (6) camjob with Job.sr (zoom 2) produces a JPEG of the output size.
+import std.io
+import std.rt
+import std.math
+import jobs.jobs
+import photo.image
+import photo.meta
+import photo.noise
+import photo.merge
+import photo.par
+import photo.camjob
+import photo.sr
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+    return 0
+}
+
+fn check(c: bool, msg: str) -> bool {
+    if !c { io.print(msg); io.new_line() }
+    return c
+}
+
+const W: i32 = 112
+const H: i32 = 80
+const NF: i32 = 6
+const SS: i32 = 3
+
+// scene radiance of colour c at the reference-frame position (x, y); frame k has the square moved
+fn scene(x: f32, y: f32, c: i32, k: i32) -> f32 {
+    let mean: f32 = 0.40f - 0.05f * (c as f32)
+    let amp: f32 = 0.20f - 0.04f * (c as f32)
+    var v: f32 = 0.22f + 0.002f * y
+    let px: f32 = x - 74.0f
+    let py: f32 = y - 44.0f
+    let r2: f32 = px * px + py * py
+    if r2 < 900.0f {
+        v = mean + amp * (math.sin((0.063f * r2) as f64) as f32)
+    } else {
+        // slanted edge left of the plate
+        let ex: f32 = 26.0f + 0.08f * (y - 40.0f)
+        if y > 28.0f && x < 40.0f {
+            if x > ex { v = 0.60f } else { v = 0.15f }
+        }
+    }
+    // the moving square: 12 x 12 at (12, 12) + 4 k in x
+    let sx: f32 = 12.0f + 4.0f * (k as f32)
+    if x > sx - 6.0f && x < sx + 6.0f && y > 6.0f && y < 18.0f { v = 0.80f - 0.30f * (c as f32) }
+    return v
+}
+
+// RGGB mosaic of frame k: shift (sx, sy) px, box aperture SS x SS, noise, 10 bit with black level 64
+fn make_frame(k: i32, sx: f32, sy: f32, rng: *mut image.Rng) -> u64 {
+    let p: u64 = rt.heap_alloc(((W * H) as usize) * 2)
+    var j: i32 = 0
+    while j < H {
+        var i: i32 = 0
+        while i < W {
+            var c: i32 = 1
+            if (j & 1) == 0 && (i & 1) == 0 { c = 0 }
+            if (j & 1) == 1 && (i & 1) == 1 { c = 2 }
+            var a: f32 = 0.0f
+            var b: i32 = 0
+            while b < SS {
+                var d: i32 = 0
+                while d < SS {
+                    a = a + scene((i as f32) + (((d as f32) + 0.5f) / (SS as f32)) - 0.5f + sx, (j as f32) + (((b as f32) + 0.5f) / (SS as f32)) - 0.5f + sy, c, k)
+                    d = d + 1
+                }
+                b = b + 1
+            }
+            a = a / ((SS * SS) as f32)
+            var vv: f32 = a + image.sqrtf(2.0e-4f * a + 2.0e-6f) * image.rng_gauss(rng)
+            if vv < 0.0f { vv = 0.0f }
+            if vv > 1.0f { vv = 1.0f }
+            *((p + (((j * W + i) * 2) as u64)) as *mut u16) = (64.0f + vv * 959.0f + 0.5f) as u16
+            i = i + 1
+        }
+        j = j + 1
+    }
+    return p
+}
+
+// exact output size truth of the reference frame: box average over the output pixel (SS x SS samples)
+fn make_truth(tw: i32, th: i32) -> image.Image {
+    var t: image.Image = image.img_new(tw, th, 3)
+    let fx: f32 = (W as f32) / (tw as f32)
+    let fy: f32 = (H as f32) / (th as f32)
+    var c: i32 = 0
+    while c < 3 {
+        var v: i32 = 0
+        while v < th {
+            var u: i32 = 0
+            while u < tw {
+                var a: f32 = 0.0f
+                var b: i32 = 0
+                while b < SS {
+                    var d: i32 = 0
+                    while d < SS {
+                        a = a + scene(((u as f32) + (((d as f32) + 0.5f) / (SS as f32))) * fx - 0.5f, ((v as f32) + (((b as f32) + 0.5f) / (SS as f32))) * fy - 0.5f, c, 0)
+                        d = d + 1
+                    }
+                    b = b + 1
+                }
+                image.img_set(&t, c, u, v, a / ((SS * SS) as f32))
+                u = u + 1
+            }
+            v = v + 1
+        }
+        c = c + 1
+    }
+    return t
+}
+
+// mean squared error over a region (x0..x1, y0..y1 in output pixels), all channels
+fn mse(a: *mut image.Image, t: *mut image.Image, x0: i32, y0: i32, x1: i32, y1: i32) -> f32 {
+    var s: f32 = 0.0f
+    var n: f32 = 0.0f
+    var c: i32 = 0
+    while c < 3 {
+        var y: i32 = y0
+        while y < y1 {
+            var x: i32 = x0
+            while x < x1 {
+                let d: f32 = image.img_get(a, c, x, y) - image.img_get(t, c, x, y)
+                s = s + d * d
+                n = n + 1.0f
+                x = x + 1
+            }
+            y = y + 1
+        }
+        c = c + 1
+    }
+    return s / n
+}
+
+fn db(m: f32) -> f32 {
+    return 10.0f * (math.log10((1.0f / (m + 1.0e-12f)) as f64) as f32)
+}
+
+fn setup_meta(m: *mut meta.SensorMeta) {
+    var k: usize = 0
+    while k < 4 { meta.meta_set_black(m, k, 64.0f, 1023.0f); k = k + 1 }
+}
+
+fn finite_all(im: *mut image.Image) -> bool {
+    var c: i32 = 0
+    while c < (*im).ch {
+        var y: i32 = 0
+        while y < (*im).h {
+            var x: i32 = 0
+            while x < (*im).w {
+                let v: f32 = image.img_get(im, c, x, y)
+                if v != v || v > 1.0e6f || v < 0.0f - 1.0e6f { return false }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        c = c + 1
+    }
+    return true
+}
+
+fn hash_image(im: *mut image.Image) -> u64 {
+    var h: u64 = 2166136261
+    var i: i32 = 0
+    let n: i32 = (*im).w * (*im).h * (*im).ch
+    while i < n {
+        let v: u32 = *(((*im).px + ((i as u64) * (4 as u64))) as *mut u32)
+        h = (h ^ (v as u64)) *% (16777619 as u64)
+        i = i + 1
+    }
+    return h
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var ok: bool = true
+    par.init(3)
+    var rng: image.Rng = image.rng_new(11 as u64)
+    var shx: [f32; 6] = [0.0f, 0.4f, 0.0f - 0.8f, 1.3f, 0.9f, 0.0f - 0.5f]
+    var shy: [f32; 6] = [0.0f, 0.7f, 0.3f, 0.0f - 0.6f, 1.4f, 0.0f - 1.1f]
+    var raw: [u64; 24] = [0 as u64; 24]
+    var k: i32 = 0
+    while k < NF {
+        raw[k as usize] = make_frame(k, shx[k as usize], shy[k as usize], &rng)
+        k = k + 1
+    }
+    var mt: meta.SensorMeta = meta.meta_default()
+    setup_meta(&mt)
+    let tw: i32 = W * 2
+    let th: i32 = H * 2
+    var truth: image.Image = make_truth(tw, th)
+    // ---- SR
+    var o: sr.SrOpts = sr.sr_default()
+    var lin: image.Image = image.img_new(1, 1, 3)
+    var vp: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&lin)
+    image.img_free(&vp)
+    ok = check(sr.sr_burst(&raw[0], NF, W, H, &mt, 0, 0, W, H, tw, th, 0, &o, &lin, &vp), "sr_burst ok") && ok
+    ok = check(lin.w == tw && lin.h == th && vp.w == tw && vp.h == th, "output size") && ok
+    ok = check(finite_all(&lin) && finite_all(&vp), "finite output") && ok
+    // ---- single frame (demosaic + Lanczos) and the burst merge of the resampled frames
+    var single: image.Image = camjob.resample_img(camjob.raw_window(raw[0], W, H, &mt, W * H, 1.0f, false), tw, th)
+    ok = check(single.w == tw && single.h == th, "single size") && ok
+    var b: merge.Burst = merge.burst_new()
+    k = 0
+    while k < NF {
+        merge.burst_add(&b, camjob.resample_img(camjob.raw_window(raw[k as usize], W, H, &mt, W * H, 1.0f, false), tw, th), 1.0f)
+        k = k + 1
+    }
+    var nm: noise.NoiseModel = noise.estimate_model(&b.frames[0])
+    var mg: image.Image = image.img_new(1, 1, 3)
+    var mv: image.Image = image.img_new(1, 1, 1)
+    var mw: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&mg)
+    image.img_free(&mv)
+    image.img_free(&mw)
+    merge.merge_burst(&b, 0, &nm, &mg, &mv, &mw)
+    // static region: right of the square track, away from the border and the edge column
+    let e_sr: f32 = mse(&lin, &truth, 60, 30, tw - 16, th - 16)
+    let e_one: f32 = mse(&single, &truth, 60, 30, tw - 16, th - 16)
+    let e_mg: f32 = mse(&mg, &truth, 60, 30, tw - 16, th - 16)
+    io.print("static region PSNR dB: single "); io.fmt_print_line(io.fmt_f32(io.fmt_new(), db(e_one)))
+    io.print("                       merge  "); io.fmt_print_line(io.fmt_f32(io.fmt_new(), db(e_mg)))
+    io.print("                       sr     "); io.fmt_print_line(io.fmt_f32(io.fmt_new(), db(e_sr)))
+    ok = check(db(e_sr) >= db(e_one) + 0.8f, "sr >= single + 0.8 dB") && ok
+    ok = check(db(e_sr) >= db(e_mg) + 0.8f, "sr >= merge + 0.8 dB") && ok
+    // moving square track: x 12 .. 40 (+- 6) -> output px 12 .. 92, y 12 .. 36
+    let g_sr: f32 = mse(&lin, &truth, 12, 12, 92, 36)
+    let g_one: f32 = mse(&single, &truth, 12, 12, 92, 36)
+    io.print("square track PSNR dB: single "); io.fmt_print_line(io.fmt_f32(io.fmt_new(), db(g_one)))
+    io.print("                      sr     "); io.fmt_print_line(io.fmt_f32(io.fmt_new(), db(g_sr)))
+    ok = check(g_sr <= g_one * 1.5f, "no ghost in the square track") && ok
+    // ---- threads: bit identical for 0 and 3 workers
+    par.init(0)
+    var lin0: image.Image = image.img_new(1, 1, 3)
+    var vp0: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&lin0)
+    image.img_free(&vp0)
+    sr.sr_burst(&raw[0], NF, W, H, &mt, 0, 0, W, H, tw, th, 0, &o, &lin0, &vp0)
+    ok = check(hash_image(&lin0) == hash_image(&lin) && hash_image(&vp0) == hash_image(&vp), "thread count independent") && ok
+    par.init(3)
+    // ---- refusals
+    var l2: image.Image = image.img_new(1, 1, 3)
+    var v2: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&l2)
+    image.img_free(&v2)
+    ok = check(!sr.sr_burst(&raw[0], 1, W, H, &mt, 0, 0, W, H, tw, th, 0, &o, &l2, &v2), "one frame refused") && ok
+    ok = check(!sr.sr_burst(&raw[0], NF, W, H, &mt, 1, 0, W - 2, H, tw, th, 0, &o, &l2, &v2), "odd window origin refused") && ok
+    ok = check(!sr.sr_burst(&raw[0], NF, W, H, &mt, 0, 0, W + 2, H, tw, th, 0, &o, &l2, &v2), "window outside refused") && ok
+    // ---- clipped block: all frames blown in a 16 x 16 block -> no NaN, the block stays at the reference estimate
+    k = 0
+    while k < NF {
+        var jj: i32 = 56
+        while jj < 72 {
+            var ii: i32 = 4
+            while ii < 20 {
+                *((raw[k as usize] + (((jj * W + ii) * 2) as u64)) as *mut u16) = 1023 as u16
+                ii = ii + 1
+            }
+            jj = jj + 1
+        }
+        k = k + 1
+    }
+    var lc: image.Image = image.img_new(1, 1, 3)
+    var vc: image.Image = image.img_new(1, 1, 1)
+    image.img_free(&lc)
+    image.img_free(&vc)
+    ok = check(sr.sr_burst(&raw[0], NF, W, H, &mt, 0, 0, W, H, tw, th, 0, &o, &lc, &vc), "clipped burst ok") && ok
+    ok = check(finite_all(&lc) && finite_all(&vc), "clipped: finite") && ok
+    let cv: f32 = image.img_get(&lc, 1, 24, 128)
+    ok = check(cv > 0.9f && cv < 1.1f, "clipped block stays bright (about the reference estimate)") && ok
+    // ---- camjob: Job.sr gives a JPEG of the SR size
+    var jb: camjob.Job = camjob.job_new()
+    jb.mode = camjob.MODE_PHOTO
+    jb.max_px = W * H
+    jb.zoom = 2.0f
+    jb.sr = 1.0f
+    jb.ref_idx = 0
+    jb.meta = mt
+    k = 0
+    while k < NF {
+        camjob.job_add_shot(&jb, camjob.SHOT_RAW, W, H, raw[k as usize], ((W * H) as usize) * 2, 10000000, 400)
+        k = k + 1
+    }
+    ok = check(camjob.run_job(&jb), "job with sr runs") && ok
+    ok = check(jb.out_w == W && jb.out_h == H && jb.out_n > 500, "job output size") && ok
+    camjob.job_free(&jb)
+    image.img_free(&lc)
+    image.img_free(&vc)
+    image.img_free(&lin)
+    image.img_free(&vp)
+    image.img_free(&lin0)
+    image.img_free(&vp0)
+    image.img_free(&single)
+    image.img_free(&truth)
+    image.img_free(&mg)
+    image.img_free(&mv)
+    image.img_free(&mw)
+    merge.burst_free(&b)
+    par.shutdown()
+    if ok { io.print_line("ok"); return 0 }
+    return 1
+}
