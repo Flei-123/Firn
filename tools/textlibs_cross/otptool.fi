@@ -1,0 +1,181 @@
+// tools/textlibs_cross/otptool.fi -- command line face of auth.otp for the
+// cross-check against Python hmac / hashlib / base64 / urllib (otp_cross.py).
+// Reads lines from stdin, one answer line per input line:
+//
+//   H ALG KEYHEX COUNTER DIGITS            -> the HOTP code (zero padded)
+//   T ALG KEYHEX TIME STEP T0 DIGITS       -> the TOTP code
+//   E HEX                                  -> "BASE32PADDED BASE32UNPADDED"
+//   D TEXT                                 -> hex of the decoded bytes, or ERR
+//   U URI                                  -> "ok KIND ALG DIGITS PERIOD COUNTER SECRETHEX ISSUER|ACCOUNT" or "bad"
+//   B KIND ISSUER ACCOUNT KEYHEX ALG DIGITS PERIOD COUNTER   -> the built URI, then parse(build) agrees: "ok"/"MISMATCH"
+// ALG is 0 (SHA-1), 1 (SHA-256) or 2 (SHA-512).
+import std.rt
+import auth.otp
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn unhex(c: u8) -> u8 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return c - 48 as u8
+    }
+    return c - 87 as u8
+}
+
+fn hex_to_buf(s: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i + 1 < s.n {
+        rt.buf_push(out, unhex(rt.ld8(s.p as u64, i)) * 16 as u8 + unhex(rt.ld8(s.p as u64, i + 1)))
+        i = i + 2
+    }
+}
+
+fn buf_to_hex(p: u64, n: usize, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push_hex_u64(out, rt.ld8(p, i) as u64, 2)
+        i = i + 1
+    }
+}
+
+fn num(s: str) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < s.n {
+        v = v * 10 as u64 + (rt.ld8(s.p as u64, i) - 48 as u8) as u64
+        i = i + 1
+    }
+    return v
+}
+
+// field `k` (0-based) of a line split at single spaces; the last field keeps the rest when `rest`
+fn field(line: str, k: usize, rest: bool) -> str {
+    var start: usize = 0
+    var idx: usize = 0
+    var i: usize = 0
+    while i <= line.n {
+        if i == line.n || (rt.ld8(line.p as u64, i) == 32 as u8 && !(rest && idx == k)) {
+            if idx == k {
+                return str { p: (line.p as u64 + start as u64) as *u8, n: i - start }
+            }
+            idx = idx + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return str { p: line.p, n: 0 }
+}
+
+fn handle(line: str, out: *mut rt.Buf) {
+    let cmd: str = field(line, 0, false)
+    if cmd.n == 0 {
+        rt.buf_push(out, 10 as u8)
+        return
+    }
+    let c: u8 = rt.ld8(cmd.p as u64, 0)
+    var key: rt.Buf = rt.buf_new()
+    if c == 72 as u8 {
+        hex_to_buf(field(line, 2, false), &key)
+        let v: u64 = otp.hotp(num(field(line, 1, false)) as u32, rt.buf_ptr(&key), rt.buf_len(&key), num(field(line, 3, false)), num(field(line, 4, false)) as usize)
+        otp.format_code(v, num(field(line, 4, false)) as usize, out)
+    } else if c == 84 as u8 {
+        hex_to_buf(field(line, 2, false), &key)
+        let v: u64 = otp.totp(num(field(line, 1, false)) as u32, rt.buf_ptr(&key), rt.buf_len(&key), num(field(line, 3, false)), num(field(line, 4, false)), num(field(line, 5, false)), num(field(line, 6, false)) as usize)
+        otp.format_code(v, num(field(line, 6, false)) as usize, out)
+    } else if c == 69 as u8 {
+        hex_to_buf(field(line, 1, false), &key)
+        otp.base32_encode(rt.buf_ptr(&key), rt.buf_len(&key), true, out)
+        rt.buf_push(out, 32 as u8)
+        otp.base32_encode(rt.buf_ptr(&key), rt.buf_len(&key), false, out)
+    } else if c == 68 as u8 {
+        let t: str = field(line, 1, true)
+        if otp.base32_decode(t, &key) {
+            buf_to_hex(rt.buf_ptr(&key), rt.buf_len(&key), out)
+        } else {
+            put(out, "ERR")
+        }
+    } else if c == 85 as u8 {
+        var u: otp.Uri = otp.uri_parse(field(line, 1, true))
+        if u.ok {
+            put(out, "ok ")
+            rt.buf_push_dec_u64(out, u.kind as u64)
+            rt.buf_push(out, 32 as u8)
+            rt.buf_push_dec_u64(out, u.alg as u64)
+            rt.buf_push(out, 32 as u8)
+            rt.buf_push_dec_u64(out, u.digits as u64)
+            rt.buf_push(out, 32 as u8)
+            rt.buf_push_dec_u64(out, u.period)
+            rt.buf_push(out, 32 as u8)
+            rt.buf_push_dec_u64(out, u.counter)
+            rt.buf_push(out, 32 as u8)
+            buf_to_hex(rt.buf_ptr(&u.secret), rt.buf_len(&u.secret), out)
+            rt.buf_push(out, 32 as u8)
+            buf_to_hex(rt.buf_ptr(&u.issuer), rt.buf_len(&u.issuer), out)
+            rt.buf_push(out, 124 as u8)
+            buf_to_hex(rt.buf_ptr(&u.account), rt.buf_len(&u.account), out)
+        } else {
+            put(out, "bad")
+        }
+        otp.uri_free(&u)
+    } else if c == 66 as u8 {
+        // B KIND ISSUER(hex) ACCOUNT(hex) KEYHEX ALG DIGITS PERIOD COUNTER
+        var iss: rt.Buf = rt.buf_new()
+        var acc: rt.Buf = rt.buf_new()
+        hex_to_buf(field(line, 2, false), &iss)
+        hex_to_buf(field(line, 3, false), &acc)
+        hex_to_buf(field(line, 4, false), &key)
+        let kind: u32 = num(field(line, 1, false)) as u32
+        let alg: u32 = num(field(line, 5, false)) as u32
+        let digits: usize = num(field(line, 6, false)) as usize
+        let period: u64 = num(field(line, 7, false))
+        let counter: u64 = num(field(line, 8, false))
+        var uri: rt.Buf = rt.buf_new()
+        let issuer: str = str { p: rt.buf_ptr(&iss) as *u8, n: rt.buf_len(&iss) }
+        let account: str = str { p: rt.buf_ptr(&acc) as *u8, n: rt.buf_len(&acc) }
+        otp.uri_build(kind, issuer, account, rt.buf_ptr(&key), rt.buf_len(&key), alg, digits, period, counter, &uri)
+        rt.buf_push_bytes(out, rt.buf_ptr(&uri), rt.buf_len(&uri))
+        var u: otp.Uri = otp.uri_parse(str { p: rt.buf_ptr(&uri) as *u8, n: rt.buf_len(&uri) })
+        var good: bool = u.ok && u.kind == kind && u.alg == alg && u.digits == digits && rt.buf_len(&u.secret) == rt.buf_len(&key) && rt.mem_eq(rt.buf_ptr(&u.secret), rt.buf_ptr(&key), rt.buf_len(&key))
+        if good {
+            good = rt.buf_len(&u.account) == rt.buf_len(&acc) && rt.mem_eq(rt.buf_ptr(&u.account), rt.buf_ptr(&acc), rt.buf_len(&acc)) && rt.buf_len(&u.issuer) == rt.buf_len(&iss) && rt.mem_eq(rt.buf_ptr(&u.issuer), rt.buf_ptr(&iss), rt.buf_len(&iss))
+        }
+        if good && kind == otp.KIND_TOTP {
+            good = u.period == period
+        }
+        if good && kind == otp.KIND_HOTP {
+            good = u.counter == counter
+        }
+        if good {
+            put(out, " ok")
+        } else {
+            put(out, " MISMATCH")
+        }
+        otp.uri_free(&u)
+        rt.buf_free(&uri)
+        rt.buf_free(&iss)
+        rt.buf_free(&acc)
+    }
+    rt.buf_free(&key)
+    rt.buf_push(out, 10 as u8)
+}
+
+fn main(start: u64) -> i32 {
+    var input: rt.Buf = rt.buf_new()
+    rt.read_stdin(&input)
+    var out: rt.Buf = rt.buf_new()
+    var s: usize = 0
+    let n: usize = rt.buf_len(&input)
+    var i: usize = 0
+    while i <= n {
+        if i == n || rt.ld8(rt.buf_ptr(&input), i) == 10 as u8 {
+            if i > s {
+                handle(str { p: (rt.buf_ptr(&input) + s as u64) as *u8, n: i - s }, &out)
+            }
+            s = i + 1
+        }
+        i = i + 1
+    }
+    rt.write_everything(1, rt.buf_ptr(&out), rt.buf_len(&out))
+    return 0
+}

@@ -1,0 +1,1281 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/text/diff.fi -- text.diff: line diff (Myers, optional patience), unified
+// diff writer AND parser, patch application with offset tolerance and fuzz
+// (like GNU patch), and an in-line word / character diff for display.
+//
+//     import text.diff
+//     var d: diff.Diff = diff.diff_new(ap, an, bp, bn, diff.ALGO_MYERS)   // two byte spans
+//     var out: rt.Buf = rt.buf_new()
+//     diff.write_unified(&d, "a/f.txt", "b/f.txt", 3, &out)               // "--- a/f.txt\n+++ b/f.txt\n@@ ..."
+//     diff.hunk_count(&d, 3)                                               // number of @@ hunks
+//     diff.diff_free(&d)
+//
+//     var p: diff.Patch = diff.parse(pp, pn, 0)                            // one file section of a unified diff
+//     if diff.patch_error(&p) == diff.E_NONE {
+//         var rep: diff.ApplyReport = diff.apply(&p, ap, an, 2, &res)      // fuzz up to 2, result in `res`
+//         ... rep.applied / rep.rejected / rep.max_offset / rep.max_fuzz ...
+//         diff.report_free(&rep)
+//     }
+//     diff.patch_free(&p)
+//
+//     // display: which byte ranges of a / b differ inside one changed line pair
+//     var ra: Vec[usize] = vec_new[usize]()       // pairs (start, len)
+//     var rb: Vec[usize] = vec_new[usize]()
+//     diff.inline_diff(ap, an, bp, bn, diff.INLINE_WORDS, &ra, &rb)
+//
+// A "line" is the bytes up to AND INCLUDING its LF; the last line may have no
+// LF. A last line with and without LF are different lines (as in GNU diff) and
+// the writer emits "\ No newline at end of file" for it.
+//
+// ALGORITHMS. ALGO_MYERS is the O(ND) greedy algorithm with a trace (minimal
+// edit script) after common prefix / suffix are cut off; ALGO_PATIENCE anchors
+// on lines that occur exactly once in both sides (longest increasing run of
+// them), recurses between the anchors and falls back to Myers where there are
+// none. Lines are interned to small integers first, so comparing is one
+// integer compare.
+//
+// HONEST
+// D1  Myers keeps a trace of D*D numbers. Above ~24 million numbers it gives
+//     up on that range and reports its lines as changed: the result is still
+//     a valid diff (patch(a, diff) == b) but not minimal.
+// D2  Hunks are minimal in changed lines; GNU diff may place the same changes
+//     differently (which of equal alternatives is shown). The hunk count and
+//     the number of changed lines can differ on repetitive files.
+// D3  `parse` reads ONE file section. `Patch.consumed` is the offset where it
+//     stopped, so a caller can loop over a multi-file diff. Git extended
+//     headers (rename, mode, binary patches) are not interpreted.
+// D4  `apply` works on one file's text, LF lines only (no CRLF translation),
+//     and does not ignore white space differences. Rejected hunks are
+//     counted and listed (ApplyReport.failed); they are skipped like GNU
+//     patch does, the rest is applied.
+// D5  Everything works on bytes; the inline UTF-8 mode splits at code points
+//     but never validates (a bad byte is a one byte token).
+import std.rt
+import std.vec
+
+export {
+    Seq, Diff, Hunk, HLine, Patch, ApplyReport,
+    ALGO_MYERS, ALGO_PATIENCE, INLINE_CHARS, INLINE_WORDS,
+    E_NONE, E_NO_HUNKS, E_BAD_HEADER, E_BAD_LINE, E_TRUNCATED, E_BAD_COUNT,
+    seq_new, seq_free, seq_len, seq_line, split_lines, split_words, split_chars,
+    intern, lcs,
+    diff_new, diff_free, changed_lines, hunk_count, write_unified,
+    parse, patch_free, patch_error, patch_error_line, patch_hunks, patch_old_name, patch_new_name,
+    apply, report_free, inline_diff,
+}
+
+const ALGO_MYERS: u32 = 0
+const ALGO_PATIENCE: u32 = 1
+const INLINE_CHARS: u32 = 0
+const INLINE_WORDS: u32 = 1
+
+const E_NONE: u32 = 0
+const E_NO_HUNKS: u32 = 1 // no "@@" hunk found
+const E_BAD_HEADER: u32 = 2 // a "@@ -a,b +c,d @@" line that does not parse
+const E_BAD_LINE: u32 = 3 // a hunk body line that starts with something else than ' ', '+', '-', '\'
+const E_TRUNCATED: u32 = 4 // the text ends before the hunk is complete
+const E_BAD_COUNT: u32 = 5 // a hunk body does not fit the counts of its header
+
+const TRACE_LIMIT: usize = 24000000
+const LF: u8 = 10
+
+// ------------------------------------------------------------------ small helpers
+
+fn gi(v: *mut Vec[i64], i: usize) -> i64 {
+    return vec_at[i64](v, i)
+}
+
+fn gu(v: *mut Vec[usize], i: usize) -> usize {
+    return vec_at[usize](v, i)
+}
+
+fn fill_i(v: *mut Vec[i64], n: usize, x: i64) {
+    vec_clear[i64](v)
+    vec_reserve[i64](v, n)
+    var i: usize = 0
+    while i < n {
+        vec_push[i64](v, x)
+        i = i + 1
+    }
+}
+
+fn fill_u(v: *mut Vec[usize], n: usize, x: usize) {
+    vec_clear[usize](v)
+    vec_reserve[usize](v, n)
+    var i: usize = 0
+    while i < n {
+        vec_push[usize](v, x)
+        i = i + 1
+    }
+}
+
+fn put_str(out: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(out, s.p as u64, s.n)
+}
+
+// ------------------------------------------------------------------ sequences of tokens
+
+// A list of byte spans (lines, words, characters) of one text.
+struct Seq {
+    ptr: Vec[u64], // address of every token
+    len: Vec[usize], // byte length of every token
+}
+
+fn seq_new() -> Seq {
+    return Seq { ptr: vec_new[u64](), len: vec_new[usize]() }
+}
+
+fn seq_free(s: *mut Seq) {
+    vec_free[u64](&(*s).ptr)
+    vec_free[usize](&(*s).len)
+}
+
+fn seq_len(s: *mut Seq) -> usize {
+    return vec_len[usize](&(*s).len)
+}
+
+// Address and length of token `i` (0, 0 past the end).
+fn seq_line(s: *mut Seq, i: usize, n: *mut usize) -> u64 {
+    *n = vec_at[usize](&(*s).len, i)
+    return vec_at[u64](&(*s).ptr, i)
+}
+
+fn seq_push(s: *mut Seq, p: u64, n: usize) {
+    vec_push[u64](&(*s).ptr, p)
+    vec_push[usize](&(*s).len, n)
+}
+
+// Lines, each with its LF (the last one may have none).
+fn split_lines(s: *mut Seq, p: u64, n: usize) {
+    var start: usize = 0
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) == LF {
+            seq_push(s, p + start as u64, i + 1 - start)
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n {
+        seq_push(s, p + start as u64, n - start)
+    }
+}
+
+fn is_word_byte(c: u8) -> bool {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return true
+    }
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return true
+    }
+    if c >= 97 as u8 && c <= 122 as u8 {
+        return true
+    }
+    return c == 95 as u8 || c >= 128 as u8
+}
+
+// Words: a run of word bytes (letters, digits, '_', any byte >= 0x80), a run of
+// blanks (space / tab), or one other byte.
+fn split_words(s: *mut Seq, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        var j: usize = i + 1
+        if is_word_byte(c) {
+            while j < n && is_word_byte(rt.ld8(p, j)) {
+                j = j + 1
+            }
+        } else if c == 32 as u8 || c == 9 as u8 {
+            while j < n && (rt.ld8(p, j) == 32 as u8 || rt.ld8(p, j) == 9 as u8) {
+                j = j + 1
+            }
+        }
+        seq_push(s, p + i as u64, j - i)
+        i = j
+    }
+}
+
+// UTF-8 code points; a bad or cut sequence is a one byte token.
+fn split_chars(s: *mut Seq, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        var want: usize = 1
+        if c >= 240 as u8 && c < 248 as u8 {
+            want = 4
+        } else if c >= 224 as u8 {
+            if c < 240 as u8 {
+                want = 3
+            }
+        } else if c >= 194 as u8 {
+            want = 2
+        }
+        var k: usize = 1
+        while k < want {
+            if i + k >= n || (rt.ld8(p, i + k) & 192 as u8) != 128 as u8 {
+                break
+            }
+            k = k + 1
+        }
+        if k < want {
+            k = 1
+        }
+        seq_push(s, p + i as u64, k)
+        i = i + k
+    }
+}
+
+// ------------------------------------------------------------------ interning
+
+fn hash_span(p: u64, n: usize) -> u64 {
+    var h: u64 = 14695981039346656037 as u64
+    var i: usize = 0
+    while i < n {
+        h = (h ^ rt.ld8(p, i) as u64) *% 1099511628211 as u64
+        i = i + 1
+    }
+    return h
+}
+
+// Gives every distinct token an id; equal tokens (same bytes) get the same id.
+// ida / idb get one id per token of a / b. Returns the number of distinct ids.
+fn intern(a: *mut Seq, b: *mut Seq, ida: *mut Vec[usize], idb: *mut Vec[usize]) -> usize {
+    let na: usize = seq_len(a)
+    let nb: usize = seq_len(b)
+    var cap: usize = 16
+    while cap < 2 * (na + nb) + 2 {
+        cap = cap * 2
+    }
+    var table: Vec[usize] = vec_new[usize]()
+    fill_u(&table, cap, 0)
+    var rp: Vec[u64] = vec_new[u64]()
+    var rn: Vec[usize] = vec_new[usize]()
+    vec_clear[usize](ida)
+    vec_clear[usize](idb)
+    var side: usize = 0
+    while side < 2 {
+        var s: *mut Seq = a
+        var ids: *mut Vec[usize] = ida
+        if side == 1 {
+            s = b
+            ids = idb
+        }
+        let cnt: usize = seq_len(s)
+        var i: usize = 0
+        while i < cnt {
+            let p: u64 = vec_at[u64](&(*s).ptr, i)
+            let n: usize = vec_at[usize](&(*s).len, i)
+            var slot: usize = (hash_span(p, n) & (cap - 1) as u64) as usize
+            var id: usize = 0
+            var found: bool = false
+            while !found {
+                let e: usize = gu(&table, slot)
+                if e == 0 {
+                    id = vec_len[u64](&rp)
+                    vec_push[u64](&rp, p)
+                    vec_push[usize](&rn, n)
+                    vec_set[usize](&table, slot, id + 1)
+                    found = true
+                } else {
+                    let rid: usize = e - 1
+                    if vec_at[usize](&rn, rid) == n && rt.mem_eq(vec_at[u64](&rp, rid), p, n) {
+                        id = rid
+                        found = true
+                    } else {
+                        slot = (slot + 1) & (cap - 1)
+                    }
+                }
+            }
+            vec_push[usize](ids, id)
+            i = i + 1
+        }
+        side = side + 1
+    }
+    let total: usize = vec_len[u64](&rp)
+    vec_free[usize](&table)
+    vec_free[u64](&rp)
+    vec_free[usize](&rn)
+    return total
+}
+
+// ------------------------------------------------------------------ LCS (Myers / patience)
+
+struct Lcs {
+    ida: *mut Vec[usize],
+    idb: *mut Vec[usize],
+    matched: *mut Vec[i64], // matched[i] = j: a[i] pairs with b[j]; -1 = none
+    cnta: Vec[usize],
+    cntb: Vec[usize],
+    posb: Vec[usize],
+    patience: bool,
+}
+
+// a-index -> b-index pairing of a longest common subsequence of the id lists.
+// `matched` gets one entry per a token (-1 = not in the common subsequence).
+fn lcs(ida: *mut Vec[usize], idb: *mut Vec[usize], nids: usize, algo: u32, matched: *mut Vec[i64]) {
+    let na: usize = vec_len[usize](ida)
+    let nb: usize = vec_len[usize](idb)
+    fill_i(matched, na, 0 - 1)
+    var c: Lcs = Lcs {
+        ida: ida, idb: idb, matched: matched,
+        cnta: vec_new[usize](), cntb: vec_new[usize](), posb: vec_new[usize](),
+        patience: algo == ALGO_PATIENCE,
+    }
+    if c.patience {
+        fill_u(&c.cnta, nids, 0)
+        fill_u(&c.cntb, nids, 0)
+        fill_u(&c.posb, nids, 0)
+    }
+    range_lcs(&c, 0, na, 0, nb)
+    vec_free[usize](&c.cnta)
+    vec_free[usize](&c.cntb)
+    vec_free[usize](&c.posb)
+}
+
+fn range_lcs(c: *mut Lcs, alo0: usize, ahi0: usize, blo0: usize, bhi0: usize) {
+    var alo: usize = alo0
+    var ahi: usize = ahi0
+    var blo: usize = blo0
+    var bhi: usize = bhi0
+    // common prefix and suffix
+    while alo < ahi && blo < bhi && gu((*c).ida, alo) == gu((*c).idb, blo) {
+        vec_set[i64]((*c).matched, alo, blo as i64)
+        alo = alo + 1
+        blo = blo + 1
+    }
+    while alo < ahi && blo < bhi && gu((*c).ida, ahi - 1) == gu((*c).idb, bhi - 1) {
+        vec_set[i64]((*c).matched, ahi - 1, (bhi - 1) as i64)
+        ahi = ahi - 1
+        bhi = bhi - 1
+    }
+    if alo >= ahi || blo >= bhi {
+        return
+    }
+    if (*c).patience {
+        if patience_range(c, alo, ahi, blo, bhi) {
+            return
+        }
+    }
+    myers_range(c, alo, ahi, blo, bhi)
+}
+
+// Anchors on lines unique on both sides. false = there were none (use Myers).
+fn patience_range(c: *mut Lcs, alo: usize, ahi: usize, blo: usize, bhi: usize) -> bool {
+    var i: usize = alo
+    while i < ahi {
+        let id: usize = gu((*c).ida, i)
+        vec_set[usize](&(*c).cnta, id, gu(&(*c).cnta, id) + 1)
+        i = i + 1
+    }
+    var j: usize = blo
+    while j < bhi {
+        let id: usize = gu((*c).idb, j)
+        vec_set[usize](&(*c).cntb, id, gu(&(*c).cntb, id) + 1)
+        vec_set[usize](&(*c).posb, id, j)
+        j = j + 1
+    }
+    // candidates: (a index, b index) in a order
+    var ca: Vec[usize] = vec_new[usize]()
+    var cb: Vec[usize] = vec_new[usize]()
+    i = alo
+    while i < ahi {
+        let id: usize = gu((*c).ida, i)
+        if gu(&(*c).cnta, id) == 1 && gu(&(*c).cntb, id) == 1 {
+            vec_push[usize](&ca, i)
+            vec_push[usize](&cb, gu(&(*c).posb, id))
+        }
+        i = i + 1
+    }
+    // reset the counters
+    i = alo
+    while i < ahi {
+        vec_set[usize](&(*c).cnta, gu((*c).ida, i), 0)
+        i = i + 1
+    }
+    j = blo
+    while j < bhi {
+        vec_set[usize](&(*c).cntb, gu((*c).idb, j), 0)
+        j = j + 1
+    }
+    let m: usize = vec_len[usize](&ca)
+    if m == 0 {
+        vec_free[usize](&ca)
+        vec_free[usize](&cb)
+        return false
+    }
+    // longest increasing subsequence of cb (patience sorting)
+    var tails: Vec[usize] = vec_new[usize]() // index into cb of the smallest tail of each length
+    var prev: Vec[usize] = vec_new[usize]()
+    fill_u(&prev, m, 18446744073709551615)
+    var k: usize = 0
+    while k < m {
+        let v: usize = gu(&cb, k)
+        var lo: usize = 0
+        var hi: usize = vec_len[usize](&tails)
+        while lo < hi {
+            let mid: usize = (lo + hi) / 2
+            if gu(&cb, gu(&tails, mid)) < v {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        if lo > 0 {
+            vec_set[usize](&prev, k, gu(&tails, lo - 1))
+        }
+        if lo == vec_len[usize](&tails) {
+            vec_push[usize](&tails, k)
+        } else {
+            vec_set[usize](&tails, lo, k)
+        }
+        k = k + 1
+    }
+    var chain: Vec[usize] = vec_new[usize]()
+    var cur: usize = gu(&tails, vec_len[usize](&tails) - 1)
+    while cur != 18446744073709551615 {
+        vec_push[usize](&chain, cur)
+        cur = gu(&prev, cur)
+    }
+    // chain is in reverse order; walk it from the end
+    var pa: usize = alo
+    var pb: usize = blo
+    var q: usize = vec_len[usize](&chain)
+    while q > 0 {
+        q = q - 1
+        let idx: usize = gu(&chain, q)
+        let ai: usize = gu(&ca, idx)
+        let bi: usize = gu(&cb, idx)
+        range_lcs(c, pa, ai, pb, bi)
+        vec_set[i64]((*c).matched, ai, bi as i64)
+        pa = ai + 1
+        pb = bi + 1
+    }
+    range_lcs(c, pa, ahi, pb, bhi)
+    vec_free[usize](&ca)
+    vec_free[usize](&cb)
+    vec_free[usize](&tails)
+    vec_free[usize](&prev)
+    vec_free[usize](&chain)
+    return true
+}
+
+fn myers_range(c: *mut Lcs, alo: usize, ahi: usize, blo: usize, bhi: usize) {
+    let n: i64 = (ahi - alo) as i64
+    let m: i64 = (bhi - blo) as i64
+    let maxd: i64 = n + m
+    let off: i64 = maxd + 1
+    var v: Vec[i64] = vec_new[i64]()
+    fill_i(&v, (2 * maxd + 3) as usize, 0)
+    var trace: Vec[i64] = vec_new[i64]()
+    var d: i64 = 0
+    var found: bool = false
+    var gave_up: bool = false
+    while d <= maxd && !found && !gave_up {
+        var k: i64 = 0 - d
+        while k <= d {
+            var x: i64 = 0
+            if k == 0 - d || (k != d && gi(&v, (off + k - 1) as usize) < gi(&v, (off + k + 1) as usize)) {
+                x = gi(&v, (off + k + 1) as usize)
+            } else {
+                x = gi(&v, (off + k - 1) as usize) + 1
+            }
+            var y: i64 = x - k
+            while x < n && y < m && gu((*c).ida, alo + x as usize) == gu((*c).idb, blo + y as usize) {
+                x = x + 1
+                y = y + 1
+            }
+            vec_set[i64](&v, (off + k) as usize, x)
+            if x >= n && y >= m {
+                found = true
+                break
+            }
+            k = k + 2
+        }
+        if !found {
+            if vec_len[i64](&trace) + (2 * d + 1) as usize > TRACE_LIMIT {
+                gave_up = true
+            } else {
+                k = 0 - d
+                while k <= d {
+                    vec_push[i64](&trace, gi(&v, (off + k) as usize))
+                    k = k + 1
+                }
+                d = d + 1
+            }
+        }
+    }
+    if found {
+        // backtrack
+        var x: i64 = n
+        var y: i64 = m
+        var dd: i64 = d
+        while dd > 0 {
+            let base: i64 = (dd - 1) * (dd - 1) + (dd - 1)
+            let k: i64 = x - y
+            var pk: i64 = 0
+            if k == 0 - dd || (k != dd && gi(&trace, (base + k - 1) as usize) < gi(&trace, (base + k + 1) as usize)) {
+                pk = k + 1
+            } else {
+                pk = k - 1
+            }
+            let px: i64 = gi(&trace, (base + pk) as usize)
+            let py: i64 = px - pk
+            var mx: i64 = px + 1
+            var my: i64 = py
+            if pk == k + 1 {
+                mx = px
+                my = py + 1
+            }
+            while x > mx && y > my {
+                x = x - 1
+                y = y - 1
+                vec_set[i64]((*c).matched, alo + x as usize, (blo as i64 + y))
+            }
+            x = px
+            y = py
+            dd = dd - 1
+        }
+        while x > 0 && y > 0 {
+            x = x - 1
+            y = y - 1
+            vec_set[i64]((*c).matched, alo + x as usize, (blo as i64 + y))
+        }
+    }
+    vec_free[i64](&v)
+    vec_free[i64](&trace)
+}
+
+// ------------------------------------------------------------------ Diff and the unified writer
+
+// Two texts, their lines and the pairing of equal lines.
+struct Diff {
+    ap: u64,
+    an: usize,
+    bp: u64,
+    bn: usize,
+    a: Seq,
+    b: Seq,
+    ida: Vec[usize],
+    idb: Vec[usize],
+    ma: Vec[i64], // line of a -> paired line of b, or -1
+    blocks: Vec[usize], // 4 numbers per change block: a start, a end, b start, b end
+}
+
+fn diff_new(ap: u64, an: usize, bp: u64, bn: usize, algo: u32) -> Diff {
+    var d: Diff = Diff {
+        ap: ap, an: an, bp: bp, bn: bn,
+        a: seq_new(), b: seq_new(),
+        ida: vec_new[usize](), idb: vec_new[usize](),
+        ma: vec_new[i64](), blocks: vec_new[usize](),
+    }
+    split_lines(&d.a, ap, an)
+    split_lines(&d.b, bp, bn)
+    let nids: usize = intern(&d.a, &d.b, &d.ida, &d.idb)
+    lcs(&d.ida, &d.idb, nids, algo, &d.ma)
+    // change blocks
+    let na: usize = seq_len(&d.a)
+    let nb: usize = seq_len(&d.b)
+    var i: usize = 0
+    var j: usize = 0
+    while i < na || j < nb {
+        if i < na && j < nb && gi(&d.ma, i) == j as i64 {
+            i = i + 1
+            j = j + 1
+        } else {
+            let a0: usize = i
+            let b0: usize = j
+            while i < na && gi(&d.ma, i) < 0 {
+                i = i + 1
+            }
+            if i < na {
+                j = gi(&d.ma, i) as usize
+            } else {
+                j = nb
+            }
+            vec_push[usize](&d.blocks, a0)
+            vec_push[usize](&d.blocks, i)
+            vec_push[usize](&d.blocks, b0)
+            vec_push[usize](&d.blocks, j)
+        }
+    }
+    return d
+}
+
+fn diff_free(d: *mut Diff) {
+    seq_free(&(*d).a)
+    seq_free(&(*d).b)
+    vec_free[usize](&(*d).ida)
+    vec_free[usize](&(*d).idb)
+    vec_free[i64](&(*d).ma)
+    vec_free[usize](&(*d).blocks)
+}
+
+// Deleted plus inserted lines (the edit distance).
+fn changed_lines(d: *mut Diff) -> usize {
+    var t: usize = 0
+    var k: usize = 0
+    let nb: usize = vec_len[usize](&(*d).blocks) / 4
+    while k < nb {
+        t = t + (gu(&(*d).blocks, k * 4 + 1) - gu(&(*d).blocks, k * 4)) + (gu(&(*d).blocks, k * 4 + 3) - gu(&(*d).blocks, k * 4 + 2))
+        k = k + 1
+    }
+    return t
+}
+
+// Index of the last change block of the hunk that starts at block `from`.
+fn hunk_end(d: *mut Diff, from: usize, ctx: usize) -> usize {
+    let nb: usize = vec_len[usize](&(*d).blocks) / 4
+    var k: usize = from
+    while k + 1 < nb {
+        let gap: usize = gu(&(*d).blocks, (k + 1) * 4) - gu(&(*d).blocks, k * 4 + 1)
+        if gap > 2 * ctx {
+            break
+        }
+        k = k + 1
+    }
+    return k
+}
+
+fn hunk_count(d: *mut Diff, ctx: usize) -> usize {
+    let nb: usize = vec_len[usize](&(*d).blocks) / 4
+    var k: usize = 0
+    var h: usize = 0
+    while k < nb {
+        k = hunk_end(d, k, ctx) + 1
+        h = h + 1
+    }
+    return h
+}
+
+fn put_range(out: *mut rt.Buf, start0: usize, len: usize) {
+    var s: usize = start0 + 1
+    if len == 0 {
+        s = start0
+    }
+    rt.buf_push_dec_u64(out, s as u64)
+    if len != 1 {
+        rt.buf_push(out, 44 as u8)
+        rt.buf_push_dec_u64(out, len as u64)
+    }
+}
+
+fn put_diff_line(out: *mut rt.Buf, sign: u8, p: u64, n: usize) {
+    rt.buf_push(out, sign)
+    rt.buf_push_bytes(out, p, n)
+    if n == 0 || rt.ld8(p, n - 1) != LF {
+        rt.buf_push(out, LF)
+        put_str(out, "\\ No newline at end of file\n")
+    }
+}
+
+// Appends the unified diff (nothing when the texts are equal). `ctx` lines of
+// context, like `diff -U ctx`.
+fn write_unified(d: *mut Diff, name_a: str, name_b: str, ctx: usize, out: *mut rt.Buf) {
+    let nb: usize = vec_len[usize](&(*d).blocks) / 4
+    if nb == 0 {
+        return
+    }
+    let na_lines: usize = seq_len(&(*d).a)
+    put_str(out, "--- ")
+    put_str(out, name_a)
+    rt.buf_push(out, LF)
+    put_str(out, "+++ ")
+    put_str(out, name_b)
+    rt.buf_push(out, LF)
+    var k: usize = 0
+    var lenp: usize = 0
+    while k < nb {
+        let e: usize = hunk_end(d, k, ctx)
+        let a0: usize = gu(&(*d).blocks, k * 4)
+        let b0: usize = gu(&(*d).blocks, k * 4 + 2)
+        let a1: usize = gu(&(*d).blocks, e * 4 + 1)
+        let b1: usize = gu(&(*d).blocks, e * 4 + 3)
+        var pre: usize = ctx
+        if pre > a0 {
+            pre = a0
+        }
+        var post: usize = ctx
+        if a1 + post > na_lines {
+            post = na_lines - a1
+        }
+        let alo: usize = a0 - pre
+        let ahi: usize = a1 + post
+        let blo: usize = b0 - pre
+        let bhi: usize = b1 + post
+        put_str(out, "@@ -")
+        put_range(out, alo, ahi - alo)
+        put_str(out, " +")
+        put_range(out, blo, bhi - blo)
+        put_str(out, " @@\n")
+        var i: usize = alo
+        var j: usize = blo
+        var bk: usize = k
+        while i < ahi || j < bhi {
+            if bk <= e && i == gu(&(*d).blocks, bk * 4) && j == gu(&(*d).blocks, bk * 4 + 2) {
+                let ae: usize = gu(&(*d).blocks, bk * 4 + 1)
+                let be: usize = gu(&(*d).blocks, bk * 4 + 3)
+                while i < ae {
+                    let p: u64 = seq_line(&(*d).a, i, &lenp)
+                    put_diff_line(out, 45 as u8, p, lenp)
+                    i = i + 1
+                }
+                while j < be {
+                    let p: u64 = seq_line(&(*d).b, j, &lenp)
+                    put_diff_line(out, 43 as u8, p, lenp)
+                    j = j + 1
+                }
+                bk = bk + 1
+            } else {
+                let p: u64 = seq_line(&(*d).a, i, &lenp)
+                put_diff_line(out, 32 as u8, p, lenp)
+                i = i + 1
+                j = j + 1
+            }
+        }
+        k = e + 1
+    }
+}
+
+// ------------------------------------------------------------------ patch parser
+
+// One line of a hunk body. `kind` is ' ', '-' or '+'. The bytes are the line
+// with its LF, without it when a "\ No newline" marker follows.
+struct HLine {
+    kind: u8,
+    off: usize, // offset in the patch text
+    len: usize,
+}
+
+struct Hunk {
+    old_start: usize, // 1-based; for old_len == 0 the line BEFORE the insertion point
+    old_len: usize,
+    new_start: usize,
+    new_len: usize,
+    first: usize, // index of the first line in Patch.lines
+    count: usize,
+}
+
+struct Patch {
+    base: u64, // the patch text (caller keeps it alive)
+    n: usize,
+    hunks: Vec[Hunk],
+    lines: Vec[HLine],
+    old_off: usize, // file names from "--- " / "+++ " (0, 0 = none)
+    old_len: usize,
+    new_off: usize,
+    new_len: usize,
+    err: u32,
+    err_line: usize, // 1-based line of the patch text where parsing failed
+    consumed: usize, // offset where this file section ended
+}
+
+fn patch_free(p: *mut Patch) {
+    vec_free[Hunk](&(*p).hunks)
+    vec_free[HLine](&(*p).lines)
+}
+
+fn patch_error(p: *mut Patch) -> u32 {
+    return (*p).err
+}
+
+fn patch_error_line(p: *mut Patch) -> usize {
+    return (*p).err_line
+}
+
+fn patch_hunks(p: *mut Patch) -> usize {
+    return vec_len[Hunk](&(*p).hunks)
+}
+
+fn patch_old_name(p: *mut Patch) -> str {
+    return str { p: ((*p).base + (*p).old_off as u64) as *u8, n: (*p).old_len }
+}
+
+fn patch_new_name(p: *mut Patch) -> str {
+    return str { p: ((*p).base + (*p).new_off as u64) as *u8, n: (*p).new_len }
+}
+
+// End of the line that starts at `i` (offset just after the LF, or n).
+fn line_end(base: u64, n: usize, i: usize) -> usize {
+    var j: usize = i
+    while j < n && rt.ld8(base, j) != LF {
+        j = j + 1
+    }
+    if j < n {
+        j = j + 1
+    }
+    return j
+}
+
+fn starts_with(base: u64, n: usize, i: usize, s: str) -> bool {
+    if i + s.n > n {
+        return false
+    }
+    return rt.mem_eq(base + i as u64, s.p as u64, s.n)
+}
+
+// Reads a decimal number at `*i`; false when there is none or it has more
+// than 15 digits.
+fn read_num(base: u64, end: usize, i: *mut usize, out: *mut usize) -> bool {
+    var j: usize = *i
+    var v: usize = 0
+    var digits: usize = 0
+    while j < end {
+        let c: u8 = rt.ld8(base, j)
+        if c < 48 as u8 || c > 57 as u8 {
+            break
+        }
+        digits = digits + 1
+        if digits > 15 {
+            return false
+        }
+        v = v * 10 + (c - 48 as u8) as usize
+        j = j + 1
+    }
+    if digits == 0 {
+        return false
+    }
+    *i = j
+    *out = v
+    return true
+}
+
+// "@@ -a[,b] +c[,d] @@"; 0 = ok, else E_BAD_HEADER.
+fn parse_hunk_header(base: u64, s: usize, e: usize, h: *mut Hunk) -> u32 {
+    var i: usize = s + 4
+    var v: usize = 0
+    var l: usize = 1
+    if !read_num(base, e, &i, &v) {
+        return E_BAD_HEADER
+    }
+    (*h).old_start = v
+    if i < e && rt.ld8(base, i) == 44 as u8 {
+        i = i + 1
+        if !read_num(base, e, &i, &l) {
+            return E_BAD_HEADER
+        }
+    }
+    (*h).old_len = l
+    if i + 2 > e || rt.ld8(base, i) != 32 as u8 || rt.ld8(base, i + 1) != 43 as u8 {
+        return E_BAD_HEADER
+    }
+    i = i + 2
+    l = 1
+    if !read_num(base, e, &i, &v) {
+        return E_BAD_HEADER
+    }
+    (*h).new_start = v
+    if i < e && rt.ld8(base, i) == 44 as u8 {
+        i = i + 1
+        if !read_num(base, e, &i, &l) {
+            return E_BAD_HEADER
+        }
+    }
+    (*h).new_len = l
+    if i + 3 > e || rt.ld8(base, i) != 32 as u8 || rt.ld8(base, i + 1) != 64 as u8 || rt.ld8(base, i + 2) != 64 as u8 {
+        return E_BAD_HEADER
+    }
+    return E_NONE
+}
+
+// After "--- " up to TAB or the end of the line.
+fn name_span(base: u64, s: usize, e: usize, off: *mut usize, len: *mut usize) {
+    let i: usize = s + 4
+    var j: usize = i
+    while j < e && rt.ld8(base, j) != 9 as u8 && rt.ld8(base, j) != LF {
+        j = j + 1
+    }
+    *off = i
+    *len = j - i
+}
+
+// Parses the next file section of a unified diff in [p, p+n) beginning at
+// byte offset `start`: optional "--- " / "+++ " lines, then "@@" hunks. Text
+// before the first header is skipped. The result is valid for as long as the
+// caller keeps the text; check `patch_error`.
+fn parse(p: u64, n: usize, start: usize) -> Patch {
+    var pt: Patch = Patch {
+        base: p, n: n, hunks: vec_new[Hunk](), lines: vec_new[HLine](),
+        old_off: 0, old_len: 0, new_off: 0, new_len: 0,
+        err: E_NONE, err_line: 0, consumed: n,
+    }
+    var lineno: usize = 1
+    var q: usize = 0
+    while q < start && q < n {
+        if rt.ld8(p, q) == LF {
+            lineno = lineno + 1
+        }
+        q = q + 1
+    }
+    var i: usize = start
+    // 1. skip to the headers or the first hunk
+    var have_hunk: bool = false
+    var headers_seen: bool = false
+    while i < n && !have_hunk {
+        let e: usize = line_end(p, n, i)
+        if starts_with(p, n, i, "@@ -") {
+            have_hunk = true
+        } else if !headers_seen && starts_with(p, n, i, "--- ") && starts_with(p, n, e, "+++ ") {
+            name_span(p, i, e, &pt.old_off, &pt.old_len)
+            let e2: usize = line_end(p, n, e)
+            name_span(p, e, e2, &pt.new_off, &pt.new_len)
+            headers_seen = true
+            i = e2
+            lineno = lineno + 2
+        } else {
+            i = e
+            lineno = lineno + 1
+        }
+    }
+    if !have_hunk {
+        pt.err = E_NO_HUNKS
+        pt.err_line = lineno
+        return pt
+    }
+    // 2. hunks
+    while i < n {
+        if !starts_with(p, n, i, "@@ -") {
+            break
+        }
+        let e: usize = line_end(p, n, i)
+        var h: Hunk = Hunk { old_start: 0, old_len: 0, new_start: 0, new_len: 0, first: vec_len[HLine](&pt.lines), count: 0 }
+        let he: u32 = parse_hunk_header(p, i, e, &h)
+        if he != E_NONE {
+            pt.err = he
+            pt.err_line = lineno
+            return pt
+        }
+        i = e
+        lineno = lineno + 1
+        var oleft: usize = h.old_len
+        var nleft: usize = h.new_len
+        while oleft > 0 || nleft > 0 {
+            if i >= n {
+                pt.err = E_TRUNCATED
+                pt.err_line = lineno
+                return pt
+            }
+            let le: usize = line_end(p, n, i)
+            let c: u8 = rt.ld8(p, i)
+            var kind: u8 = 0
+            var off: usize = i + 1
+            var len: usize = le - i - 1
+            if c == 32 as u8 || c == 45 as u8 || c == 43 as u8 {
+                kind = c
+            } else if c == LF {
+                kind = 32 as u8 // a context line whose blank got stripped
+                off = i
+                len = 1
+            } else {
+                pt.err = E_BAD_LINE
+                pt.err_line = lineno
+                return pt
+            }
+            if kind == 32 as u8 {
+                if oleft == 0 || nleft == 0 {
+                    pt.err = E_BAD_COUNT
+                    pt.err_line = lineno
+                    return pt
+                }
+                oleft = oleft - 1
+                nleft = nleft - 1
+            } else if kind == 45 as u8 {
+                if oleft == 0 {
+                    pt.err = E_BAD_COUNT
+                    pt.err_line = lineno
+                    return pt
+                }
+                oleft = oleft - 1
+            } else {
+                if nleft == 0 {
+                    pt.err = E_BAD_COUNT
+                    pt.err_line = lineno
+                    return pt
+                }
+                nleft = nleft - 1
+            }
+            i = le
+            lineno = lineno + 1
+            // a "\ No newline at end of file" line belongs to the line before it
+            if i < n && rt.ld8(p, i) == 92 as u8 {
+                if len > 0 && rt.ld8(p, off + len - 1) == LF {
+                    len = len - 1
+                }
+                i = line_end(p, n, i)
+                lineno = lineno + 1
+            }
+            vec_push[HLine](&pt.lines, HLine { kind: kind, off: off, len: len })
+            h.count = h.count + 1
+        }
+        vec_push[Hunk](&pt.hunks, h)
+    }
+    pt.consumed = i
+    return pt
+}
+
+// ------------------------------------------------------------------ apply
+
+struct ApplyReport {
+    applied: usize,
+    rejected: usize,
+    max_fuzz: usize, // largest fuzz any applied hunk needed
+    max_offset: i64, // largest |line offset| of an applied hunk
+    failed: Vec[usize], // indices of the rejected hunks
+}
+
+fn report_free(r: *mut ApplyReport) {
+    vec_free[usize](&(*r).failed)
+}
+
+fn hline_ptr(pt: *mut Patch, idx: usize) -> *mut HLine {
+    return vec_elem_ptr[HLine](&(*pt).lines, idx)
+}
+
+// Does the old side line `hl` equal the file line `li`?
+fn line_equals(pt: *mut Patch, hl: *mut HLine, fl: *mut Seq, li: usize) -> bool {
+    var n: usize = 0
+    let p: u64 = seq_line(fl, li, &n)
+    return n == (*hl).len && rt.mem_eq(p, (*pt).base + (*hl).off as u64, n)
+}
+
+// Applies the patch to the text [ap, ap+an) and appends the result to `out`.
+// Each hunk is searched at its place, then at growing distance (+1, -1, +2,
+// ...), first exact, then with up to `max_fuzz` context lines ignored at each
+// end (GNU patch rules; a hunk with less context at the start / end than at the
+// other end must sit at the start / end of the file).
+fn apply(pt: *mut Patch, ap: u64, an: usize, max_fuzz: usize, out: *mut rt.Buf) -> ApplyReport {
+    var rep: ApplyReport = ApplyReport { applied: 0, rejected: 0, max_fuzz: 0, max_offset: 0, failed: vec_new[usize]() }
+    var fl: Seq = seq_new()
+    split_lines(&fl, ap, an)
+    let nfl: usize = seq_len(&fl)
+    var cursor: usize = 0 // next file line not yet written
+    var shift: i64 = 0 // offset found for the previous hunk (a hint for the next)
+    let nh: usize = vec_len[Hunk](&(*pt).hunks)
+    var hi: usize = 0
+    while hi < nh {
+        let h: *mut Hunk = vec_elem_ptr[Hunk](&(*pt).hunks, hi)
+        // old side lines (indices into pt.lines) and the leading / trailing context
+        var old_idx: Vec[usize] = vec_new[usize]()
+        var t: usize = 0
+        while t < (*h).count {
+            if (*hline_ptr(pt, (*h).first + t)).kind != 43 as u8 {
+                vec_push[usize](&old_idx, (*h).first + t)
+            }
+            t = t + 1
+        }
+        let k: usize = vec_len[usize](&old_idx)
+        // leading / trailing context of the HUNK (the '+' lines are not on the old side)
+        var pre: usize = 0
+        while pre < (*h).count && (*hline_ptr(pt, (*h).first + pre)).kind == 32 as u8 {
+            pre = pre + 1
+        }
+        var suf: usize = 0
+        if pre < (*h).count {
+            while suf < (*h).count && (*hline_ptr(pt, (*h).first + (*h).count - 1 - suf)).kind == 32 as u8 {
+                suf = suf + 1
+            }
+        }
+        var nominal: i64 = (*h).old_start as i64 - 1
+        if (*h).old_len == 0 {
+            nominal = (*h).old_start as i64
+        }
+        var placed: bool = false
+        var f: usize = 0
+        while f <= max_fuzz && !placed {
+            var sp: usize = f
+            if sp > pre {
+                sp = pre
+            }
+            var ss: usize = f
+            if ss > suf {
+                ss = suf
+            }
+            if pre == (*h).count {
+                ss = 0 // all context: only the front is skipped
+            }
+            let m: usize = k - sp - ss // lines that must match
+            // anchoring: less context before than after = at the start of the file
+            var anchor_start: bool = false
+            var anchor_end: bool = false
+            if pre - sp < suf - ss {
+                anchor_start = true
+            }
+            if suf - ss < pre - sp {
+                anchor_end = true
+            }
+            let want: i64 = nominal + shift + sp as i64 // file line where the first compared line should sit
+            var dist: i64 = 0
+            var tries_left: bool = true
+            while tries_left && !placed {
+                var side: i64 = 0
+                while side < 2 && !placed {
+                    var pos: i64 = want + dist
+                    if side == 1 {
+                        pos = want - dist
+                    }
+                    if !(side == 1 && dist == 0) && pos >= 0 && pos + m as i64 <= nfl as i64 {
+                        let startl: i64 = pos - sp as i64
+                        let endl: i64 = pos + m as i64 + ss as i64
+                        var ok: bool = startl >= cursor as i64 && endl <= nfl as i64
+                        if ok && anchor_start && startl != 0 {
+                            ok = false
+                        }
+                        if ok && anchor_end && endl != nfl as i64 {
+                            ok = false
+                        }
+                        var q: usize = 0
+                        while ok && q < m {
+                            let hl: *mut HLine = hline_ptr(pt, gu(&old_idx, sp + q))
+                            if !line_equals(pt, hl, &fl, (pos as usize) + q) {
+                                ok = false
+                            }
+                            q = q + 1
+                        }
+                        if ok {
+                            placed = true
+                            // copy the untouched lines, then the hunk
+                            var li: usize = cursor
+                            var plen: usize = 0
+                            while li < startl as usize {
+                                let lp: u64 = seq_line(&fl, li, &plen)
+                                rt.buf_push_bytes(out, lp, plen)
+                                li = li + 1
+                            }
+                            var oi: usize = startl as usize
+                            t = 0
+                            while t < (*h).count {
+                                let hl: *mut HLine = hline_ptr(pt, (*h).first + t)
+                                if (*hl).kind == 43 as u8 {
+                                    rt.buf_push_bytes(out, (*pt).base + (*hl).off as u64, (*hl).len)
+                                } else {
+                                    if (*hl).kind == 32 as u8 {
+                                        let lp: u64 = seq_line(&fl, oi, &plen)
+                                        rt.buf_push_bytes(out, lp, plen)
+                                    }
+                                    oi = oi + 1
+                                }
+                                t = t + 1
+                            }
+                            cursor = oi
+                            shift = pos - sp as i64 - nominal
+                            var ao: i64 = shift
+                            if ao < 0 {
+                                ao = 0 - ao
+                            }
+                            if ao > rep.max_offset {
+                                rep.max_offset = ao
+                            }
+                            if f > rep.max_fuzz {
+                                rep.max_fuzz = f
+                            }
+                        }
+                    }
+                    side = side + 1
+                }
+                dist = dist + 1
+                if dist > nfl as i64 + 1 {
+                    tries_left = false
+                }
+            }
+            f = f + 1
+        }
+        if placed {
+            rep.applied = rep.applied + 1
+        } else {
+            rep.rejected = rep.rejected + 1
+            vec_push[usize](&rep.failed, hi)
+        }
+        vec_free[usize](&old_idx)
+        hi = hi + 1
+    }
+    var li2: usize = cursor
+    var plen2: usize = 0
+    while li2 < nfl {
+        let lp: u64 = seq_line(&fl, li2, &plen2)
+        rt.buf_push_bytes(out, lp, plen2)
+        li2 = li2 + 1
+    }
+    seq_free(&fl)
+    return rep
+}
+
+// ------------------------------------------------------------------ in-line diff
+
+// Which byte ranges differ between two (short) texts, split into words or
+// UTF-8 characters. ra / rb get (start, len) pairs of the changed ranges of a /
+// b (adjacent changed tokens merged), for highlighting.
+fn inline_diff(ap: u64, an: usize, bp: u64, bn: usize, mode: u32, ra: *mut Vec[usize], rb: *mut Vec[usize]) {
+    var a: Seq = seq_new()
+    var b: Seq = seq_new()
+    if mode == INLINE_WORDS {
+        split_words(&a, ap, an)
+        split_words(&b, bp, bn)
+    } else {
+        split_chars(&a, ap, an)
+        split_chars(&b, bp, bn)
+    }
+    var ida: Vec[usize] = vec_new[usize]()
+    var idb: Vec[usize] = vec_new[usize]()
+    var ma: Vec[i64] = vec_new[i64]()
+    let nids: usize = intern(&a, &b, &ida, &idb)
+    lcs(&ida, &idb, nids, ALGO_MYERS, &ma)
+    let na: usize = seq_len(&a)
+    let nb: usize = seq_len(&b)
+    var usedb: Vec[usize] = vec_new[usize]()
+    fill_u(&usedb, nb, 0)
+    var i: usize = 0
+    while i < na {
+        if gi(&ma, i) >= 0 {
+            vec_set[usize](&usedb, gi(&ma, i) as usize, 1)
+        }
+        i = i + 1
+    }
+    emit_ranges(&a, &ma, ap, ra, true, &usedb)
+    emit_ranges(&b, &ma, bp, rb, false, &usedb)
+    seq_free(&a)
+    seq_free(&b)
+    vec_free[usize](&ida)
+    vec_free[usize](&idb)
+    vec_free[i64](&ma)
+    vec_free[usize](&usedb)
+}
+
+fn emit_ranges(s: *mut Seq, ma: *mut Vec[i64], base: u64, out: *mut Vec[usize], is_a: bool, usedb: *mut Vec[usize]) {
+    let n: usize = seq_len(s)
+    var i: usize = 0
+    var open: bool = false
+    var start: usize = 0
+    var end: usize = 0
+    var plen: usize = 0
+    while i < n {
+        var changed: bool = false
+        if is_a {
+            changed = gi(ma, i) < 0
+        } else {
+            changed = gu(usedb, i) == 0
+        }
+        let p: u64 = seq_line(s, i, &plen)
+        let off: usize = (p - base) as usize
+        if changed {
+            if open && end == off {
+                end = off + plen
+            } else {
+                if open {
+                    vec_push[usize](out, start)
+                    vec_push[usize](out, end - start)
+                }
+                open = true
+                start = off
+                end = off + plen
+            }
+        } else if open {
+            vec_push[usize](out, start)
+            vec_push[usize](out, end - start)
+            open = false
+        }
+        i = i + 1
+    }
+    if open {
+        vec_push[usize](out, start)
+        vec_push[usize](out, end - start)
+    }
+}

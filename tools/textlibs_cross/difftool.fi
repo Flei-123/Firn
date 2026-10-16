@@ -1,0 +1,253 @@
+// tools/textlibs_cross/difftool.fi -- command line face of text.diff for the
+// cross-checks against GNU diff / patch and the fuzz run (diff_run.sh).
+//
+//   difftool batch ALGO CTX DIR N      for i in 0..N: read DIR/i.a, DIR/i.b, write DIR/i.diff (our unified diff),
+//                                      print "i hunks changed selfok" per case; selfok = 1 when
+//                                      apply(parse(diff), a) == b (fuzz 0), else 0
+//   difftool apply FUZZ PATCH OLD      write the patched OLD to stdout; "applied rejected maxfuzz maxoffset" on
+//                                      stderr; exit 0 all applied, 1 some rejected, 2 patch does not parse
+//   difftool fuzz SEED ROUNDS PATCH OLD  damage PATCH ROUNDS times (random byte edits, cuts, line swaps) and
+//                                      parse + apply each; prints "fuzz ok <n> parsed <m>"; a crash is the failure
+import std.rt
+import std.vec
+import text.diff
+
+static mut rng: u64 = 88172645463325252 as u64
+
+fn next_rand() -> u64 {
+    var x: u64 = rng
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    rng = x
+    return x
+}
+
+fn arg(start: u64, i: usize) -> str {
+    let p: u64 = rt.arg_ptr(start, i)
+    return str { p: p as *mut u8, n: rt.c_length(p) }
+}
+
+fn say(fd: i64, s: str) {
+    rt.write_everything(fd, s.p as u64, s.n)
+}
+
+fn parse_num(s: str) -> usize {
+    var v: usize = 0
+    var i: usize = 0
+    while i < s.n {
+        v = v * 10 + (rt.ld8(s.p as u64, i) - 48 as u8) as usize
+        i = i + 1
+    }
+    return v
+}
+
+// path buffer: DIR "/" I "." EXT, null terminated
+fn make_path(b: *mut rt.Buf, dir: str, i: usize, ext: str) {
+    rt.buf_clear(b)
+    rt.buf_push_bytes(b, dir.p as u64, dir.n)
+    rt.buf_push(b, 47 as u8)
+    rt.buf_push_dec_u64(b, i as u64)
+    rt.buf_push(b, 46 as u8)
+    rt.buf_push_bytes(b, ext.p as u64, ext.n)
+    rt.buf_push(b, 0 as u8)
+}
+
+fn read_all(path: u64, out: *mut rt.Buf) -> bool {
+    rt.buf_clear(out)
+    return rt.read_file(path, out)
+}
+
+fn same(a: *mut rt.Buf, b: *mut rt.Buf) -> bool {
+    return rt.buf_len(a) == rt.buf_len(b) && rt.mem_eq(rt.buf_ptr(a), rt.buf_ptr(b), rt.buf_len(a))
+}
+
+fn cmd_batch(algo: u32, ctx: usize, dir: str, n: usize) -> i32 {
+    var path: rt.Buf = rt.buf_new()
+    var a: rt.Buf = rt.buf_new()
+    var b: rt.Buf = rt.buf_new()
+    var out: rt.Buf = rt.buf_new()
+    var res: rt.Buf = rt.buf_new()
+    var line: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < n {
+        make_path(&path, dir, i, "a")
+        read_all(rt.buf_ptr(&path), &a)
+        make_path(&path, dir, i, "b")
+        read_all(rt.buf_ptr(&path), &b)
+        rt.buf_clear(&out)
+        var d: diff.Diff = diff.diff_new(rt.buf_ptr(&a), rt.buf_len(&a), rt.buf_ptr(&b), rt.buf_len(&b), algo)
+        diff.write_unified(&d, "a", "b", ctx, &out)
+        let hunks: usize = diff.hunk_count(&d, ctx)
+        let changed: usize = diff.changed_lines(&d)
+        diff.diff_free(&d)
+        make_path(&path, dir, i, "diff")
+        rt.write_file(rt.buf_ptr(&path), rt.buf_ptr(&out), rt.buf_len(&out))
+        var ok: usize = 0
+        if hunks == 0 {
+            if same(&a, &b) {
+                ok = 1
+            }
+        } else {
+            var p: diff.Patch = diff.parse(rt.buf_ptr(&out), rt.buf_len(&out), 0)
+            if diff.patch_error(&p) == diff.E_NONE {
+                rt.buf_clear(&res)
+                var rep: diff.ApplyReport = diff.apply(&p, rt.buf_ptr(&a), rt.buf_len(&a), 0, &res)
+                if rep.rejected == 0 && same(&res, &b) {
+                    ok = 1
+                }
+                diff.report_free(&rep)
+            }
+            diff.patch_free(&p)
+        }
+        rt.buf_clear(&line)
+        rt.buf_push_dec_u64(&line, i as u64)
+        rt.buf_push(&line, 32 as u8)
+        rt.buf_push_dec_u64(&line, hunks as u64)
+        rt.buf_push(&line, 32 as u8)
+        rt.buf_push_dec_u64(&line, changed as u64)
+        rt.buf_push(&line, 32 as u8)
+        rt.buf_push_dec_u64(&line, ok as u64)
+        rt.buf_push(&line, 10 as u8)
+        rt.write_everything(1, rt.buf_ptr(&line), rt.buf_len(&line))
+        i = i + 1
+    }
+    return 0
+}
+
+fn cmd_apply(fuzz: usize, patch_path: str, old_path: str) -> i32 {
+    var pb: rt.Buf = rt.buf_new()
+    var ob: rt.Buf = rt.buf_new()
+    var res: rt.Buf = rt.buf_new()
+    var pp: rt.Buf = rt.buf_new()
+    var op: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&pp, patch_path.p as u64, patch_path.n)
+    rt.buf_push(&pp, 0 as u8)
+    rt.buf_push_bytes(&op, old_path.p as u64, old_path.n)
+    rt.buf_push(&op, 0 as u8)
+    if !read_all(rt.buf_ptr(&pp), &pb) || !read_all(rt.buf_ptr(&op), &ob) {
+        say(2, "cannot read\n")
+        return 2
+    }
+    var p: diff.Patch = diff.parse(rt.buf_ptr(&pb), rt.buf_len(&pb), 0)
+    if diff.patch_error(&p) != diff.E_NONE {
+        say(2, "parse error\n")
+        return 2
+    }
+    var rep: diff.ApplyReport = diff.apply(&p, rt.buf_ptr(&ob), rt.buf_len(&ob), fuzz, &res)
+    rt.write_everything(1, rt.buf_ptr(&res), rt.buf_len(&res))
+    var line: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&line, rep.applied as u64)
+    rt.buf_push(&line, 32 as u8)
+    rt.buf_push_dec_u64(&line, rep.rejected as u64)
+    rt.buf_push(&line, 32 as u8)
+    rt.buf_push_dec_u64(&line, rep.max_fuzz as u64)
+    rt.buf_push(&line, 32 as u8)
+    rt.buf_push_dec_i64(&line, rep.max_offset)
+    rt.buf_push(&line, 10 as u8)
+    rt.write_everything(2, rt.buf_ptr(&line), rt.buf_len(&line))
+    var rc: i32 = 0
+    if rep.rejected > 0 {
+        rc = 1
+    }
+    return rc
+}
+
+fn cmd_fuzz(seed: usize, rounds: usize, patch_path: str, old_path: str) -> i32 {
+    rng = (seed as u64 + 1) *% 2685821657736338717 as u64
+    var pb: rt.Buf = rt.buf_new()
+    var ob: rt.Buf = rt.buf_new()
+    var pp: rt.Buf = rt.buf_new()
+    var op: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&pp, patch_path.p as u64, patch_path.n)
+    rt.buf_push(&pp, 0 as u8)
+    rt.buf_push_bytes(&op, old_path.p as u64, old_path.n)
+    rt.buf_push(&op, 0 as u8)
+    if !read_all(rt.buf_ptr(&pp), &pb) || !read_all(rt.buf_ptr(&op), &ob) {
+        say(2, "cannot read\n")
+        return 2
+    }
+    let n0: usize = rt.buf_len(&pb)
+    var parsed: usize = 0
+    var r: usize = 0
+    var junk: [u8; 16] = [64, 45, 43, 32, 10, 44, 92, 48, 57, 255, 0, 13, 9, 49, 50, 51]
+    while r < rounds {
+        // damaged copy
+        var m: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&m, rt.buf_ptr(&pb), n0)
+        let edits: usize = 1 + (next_rand() % 6) as usize
+        var e: usize = 0
+        while e < edits && rt.buf_len(&m) > 0 {
+            let len: usize = rt.buf_len(&m)
+            let at: usize = (next_rand() % len as u64) as usize
+            let kind: u64 = next_rand() % 5
+            if kind == 0 {
+                rt.st8(rt.buf_ptr(&m), at, junk[(next_rand() % 16) as usize])
+            } else if kind == 1 {
+                rt.buf_set_len(&m, at) // cut
+            } else if kind == 2 {
+                // delete one byte
+                var q: usize = at
+                while q + 1 < len {
+                    rt.st8(rt.buf_ptr(&m), q, rt.ld8(rt.buf_ptr(&m), q + 1))
+                    q = q + 1
+                }
+                rt.buf_set_len(&m, len - 1)
+            } else if kind == 3 {
+                // duplicate one byte
+                rt.buf_push(&m, junk[(next_rand() % 16) as usize])
+            } else {
+                // overwrite a run with one number
+                let run: usize = (next_rand() % 20) as usize
+                var q: usize = 0
+                while q < run && at + q < len {
+                    rt.st8(rt.buf_ptr(&m), at + q, 57 as u8)
+                    q = q + 1
+                }
+            }
+            e = e + 1
+        }
+        var p: diff.Patch = diff.parse(rt.buf_ptr(&m), rt.buf_len(&m), 0)
+        if diff.patch_error(&p) == diff.E_NONE {
+            parsed = parsed + 1
+            var res: rt.Buf = rt.buf_new()
+            var rep: diff.ApplyReport = diff.apply(&p, rt.buf_ptr(&ob), rt.buf_len(&ob), 2, &res)
+            diff.report_free(&rep)
+            rt.buf_free(&res)
+        }
+        diff.patch_free(&p)
+        rt.buf_free(&m)
+        r = r + 1
+    }
+    var line: rt.Buf = rt.buf_new()
+    put_s(&line, "fuzz ok ")
+    rt.buf_push_dec_u64(&line, rounds as u64)
+    put_s(&line, " parsed ")
+    rt.buf_push_dec_u64(&line, parsed as u64)
+    rt.buf_push(&line, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&line), rt.buf_len(&line))
+    return 0
+}
+
+fn put_s(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        say(2, "usage: difftool batch|apply|fuzz ...\n")
+        return 2
+    }
+    let cmd: str = arg(start, 1)
+    if cmd == "batch" && rt.arg_count(start) >= 6 {
+        return cmd_batch(parse_num(arg(start, 2)) as u32, parse_num(arg(start, 3)), arg(start, 4), parse_num(arg(start, 5)))
+    }
+    if cmd == "apply" && rt.arg_count(start) >= 5 {
+        return cmd_apply(parse_num(arg(start, 2)), arg(start, 3), arg(start, 4))
+    }
+    if cmd == "fuzz" && rt.arg_count(start) >= 6 {
+        return cmd_fuzz(parse_num(arg(start, 2)), parse_num(arg(start, 3)), arg(start, 4), arg(start, 5))
+    }
+    say(2, "bad command\n")
+    return 2
+}

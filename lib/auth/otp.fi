@@ -1,0 +1,613 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/auth/otp.fi -- auth.otp: one time passwords. HOTP (RFC 4226), TOTP
+// (RFC 6238) with SHA-1 / SHA-256 / SHA-512, Base32 (RFC 4648) in and out, and
+// the `otpauth://` key URI (the QR code of an authenticator app) parsed and
+// built.
+//
+//     import auth.otp
+//     var key: rt.Buf = rt.buf_new()
+//     otp.base32_decode("JBSWY3DPEHPK3PXP", &key)                 // the shared secret, as bytes
+//     let code: u64 = otp.totp(otp.ALG_SHA1, rt.buf_ptr(&key), rt.buf_len(&key), now, 30, 0, 6)
+//     var text: rt.Buf = rt.buf_new()
+//     otp.format_code(code, 6, &text)                               // "287082", zero padded
+//     otp.hotp(otp.ALG_SHA256, kp, kn, counter, 8)                  // counter based
+//     let hit: i64 = otp.totp_verify(otp.ALG_SHA1, kp, kn, now, 30, 6, code, 1)   // clock skew +-1 step; offset or -100
+//
+//     var u: otp.Uri = otp.uri_parse("otpauth://totp/Example:alice?secret=JBSWY3DPEHPK3PXP&issuer=Example&digits=8")
+//     if u.ok { ... u.digits, u.period, u.alg, u.kind, u.secret (bytes), u.issuer, u.account ... }
+//     otp.uri_free(&u)
+//     otp.uri_build(otp.KIND_TOTP, "Example", "alice", kp, kn, otp.ALG_SHA1, 6, 30, 0, &out)
+//
+// HONEST
+// O1  Codes are 1 to 10 digits (RFC 4226 asks for at least 6). `hotp` returns
+//     the number; `format_code` pads it with zeros to `digits`.
+// O2  `verify` compares in constant time (hmac_equal on the decimal text).
+//     The caller has to remember the last accepted counter / time step to
+//     refuse a replay; that state is not kept here.
+// O3  HMAC is written out here for all three hashes (std.crypto.hmac has SHA-1
+//     and SHA-256 only); a key longer than the block is hashed first (RFC 2104).
+// O4  Base32 decoding ignores case, spaces, '-' and '=' padding and returns
+//     false on any other character or on a left over bit pattern that cannot
+//     be a valid encoding length (1, 3 or 6 symbols mod 8).
+// O5  The otpauth parser follows the Google Authenticator "Key URI Format":
+//     label "Issuer:account" (percent decoded), parameters secret (required),
+//     issuer, algorithm (SHA1 / SHA256 / SHA512), digits (1-10), period (>= 1),
+//     counter (hotp, required there). The parameter `issuer` wins over the
+//     label prefix. An unknown parameter is ignored.
+import std.rt
+import std.crypto.sha1
+import std.crypto.sha256
+import std.crypto.sha512
+import std.crypto.hmac
+
+export {
+    ALG_SHA1, ALG_SHA256, ALG_SHA512, KIND_TOTP, KIND_HOTP,
+    Uri,
+    base32_encode, base32_decode, hmac_alg, hotp, totp, format_code, hotp_verify, totp_verify,
+    uri_parse, uri_free, uri_build,
+}
+
+const ALG_SHA1: u32 = 0
+const ALG_SHA256: u32 = 1
+const ALG_SHA512: u32 = 2
+const KIND_TOTP: u32 = 0
+const KIND_HOTP: u32 = 1
+
+// ------------------------------------------------------------------ Base32
+
+fn b32_symbol(v: u8) -> u8 {
+    if v < 26 as u8 {
+        return 65 as u8 + v
+    }
+    return 50 as u8 + (v - 26 as u8)
+}
+
+// RFC 4648 Base32 of p[0..n); `pad` appends '=' to a multiple of 8 symbols.
+fn base32_encode(p: u64, n: usize, pad: bool, out: *mut rt.Buf) {
+    var acc: u64 = 0
+    var bits: usize = 0
+    var written: usize = 0
+    var i: usize = 0
+    while i < n {
+        acc = (acc << 8) | rt.ld8(p, i) as u64
+        bits = bits + 8
+        while bits >= 5 {
+            rt.buf_push(out, b32_symbol(((acc >> (bits - 5) as u64) & 31 as u64) as u8))
+            written = written + 1
+            bits = bits - 5
+        }
+        acc = acc & ((1 as u64 << bits as u64) - 1 as u64)
+        i = i + 1
+    }
+    if bits > 0 {
+        rt.buf_push(out, b32_symbol(((acc << (5 - bits) as u64) & 31 as u64) as u8))
+        written = written + 1
+    }
+    if pad {
+        while written % 8 != 0 {
+            rt.buf_push(out, 61 as u8)
+            written = written + 1
+        }
+    }
+}
+
+// 0..31 for a Base32 symbol (either case), 32 = ignorable, 33 = invalid.
+fn b32_value(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c - 65 as u8
+    }
+    if c >= 97 as u8 && c <= 122 as u8 {
+        return c - 97 as u8
+    }
+    if c >= 50 as u8 && c <= 55 as u8 {
+        return 26 as u8 + (c - 50 as u8)
+    }
+    if c == 32 as u8 || c == 45 as u8 || c == 61 as u8 || c == 9 as u8 {
+        return 32 as u8
+    }
+    return 33 as u8
+}
+
+// Appends the decoded bytes. false (and nothing meaningful appended) on a bad
+// character or an impossible length.
+fn base32_decode(s: str, out: *mut rt.Buf) -> bool {
+    var acc: u64 = 0
+    var bits: usize = 0
+    var symbols: usize = 0
+    var i: usize = 0
+    while i < s.n {
+        let v: u8 = b32_value(rt.ld8(s.p as u64, i))
+        if v == 33 as u8 {
+            return false
+        }
+        if v != 32 as u8 {
+            acc = (acc << 5) | v as u64
+            bits = bits + 5
+            symbols = symbols + 1
+            if bits >= 8 {
+                rt.buf_push(out, ((acc >> (bits - 8) as u64) & 255 as u64) as u8)
+                bits = bits - 8
+                acc = acc & ((1 as u64 << bits as u64) - 1 as u64)
+            }
+        }
+        i = i + 1
+    }
+    let r: usize = symbols % 8
+    if r == 1 || r == 3 || r == 6 {
+        return false
+    }
+    return true
+}
+
+// ------------------------------------------------------------------ HMAC for the three hashes
+
+fn hash_block(alg: u32) -> usize {
+    if alg == ALG_SHA512 {
+        return 128
+    }
+    return 64
+}
+
+fn hash_size(alg: u32) -> usize {
+    if alg == ALG_SHA1 {
+        return 20
+    }
+    if alg == ALG_SHA256 {
+        return 32
+    }
+    return 64
+}
+
+// hash(a || b) into out (hash_size bytes)
+fn hash2(alg: u32, a: u64, an: usize, b: u64, bn: usize, out: u64) {
+    if alg == ALG_SHA1 {
+        var s: sha1.Sha1 = sha1.sha1_new()
+        sha1.sha1_update(&s, a, an)
+        sha1.sha1_update(&s, b, bn)
+        sha1.sha1_final(&s, out)
+    } else if alg == ALG_SHA256 {
+        var s: sha256.Sha256 = sha256.sha256_new()
+        sha256.sha256_update(&s, a, an)
+        sha256.sha256_update(&s, b, bn)
+        sha256.sha256_final(&s, out)
+    } else {
+        var s: sha512.Sha512 = sha512.sha512_new()
+        sha512.sha512_update(&s, a, an)
+        sha512.sha512_update(&s, b, bn)
+        sha512.sha512_final(&s, out)
+    }
+}
+
+// HMAC-<alg>(key, msg) into out (20 / 32 / 64 bytes); returns that size.
+fn hmac_alg(alg: u32, key: u64, keylen: usize, msg: u64, msglen: usize, out: u64) -> usize {
+    let bs: usize = hash_block(alg)
+    let hs: usize = hash_size(alg)
+    var k: [u8; 128] = [0; 128]
+    var i: usize = 0
+    if keylen > bs {
+        var kd: [u8; 64] = [0; 64]
+        hash2(alg, key, keylen, key, 0, (&kd[0]) as u64)
+        while i < hs {
+            k[i] = kd[i]
+            i = i + 1
+        }
+    } else {
+        while i < keylen {
+            k[i] = rt.ld8(key, i)
+            i = i + 1
+        }
+    }
+    var ipad: [u8; 128] = [0; 128]
+    var opad: [u8; 128] = [0; 128]
+    i = 0
+    while i < bs {
+        ipad[i] = k[i] ^ 54 as u8
+        opad[i] = k[i] ^ 92 as u8
+        i = i + 1
+    }
+    var inner: [u8; 64] = [0; 64]
+    // inner = H(ipad || msg)
+    hash2(alg, (&ipad[0]) as u64, bs, msg, msglen, (&inner[0]) as u64)
+    hash2(alg, (&opad[0]) as u64, bs, (&inner[0]) as u64, hs, out)
+    return hs
+}
+
+// ------------------------------------------------------------------ HOTP / TOTP
+
+fn pow10(d: usize) -> u64 {
+    var v: u64 = 1
+    var i: usize = 0
+    while i < d {
+        v = v * 10 as u64
+        i = i + 1
+    }
+    return v
+}
+
+// RFC 4226: the `digits` digit number for `counter` (digits 1..10).
+fn hotp(alg: u32, key: u64, keylen: usize, counter: u64, digits: usize) -> u64 {
+    var msg: [u8; 8] = [0; 8]
+    var i: usize = 0
+    while i < 8 {
+        msg[i] = ((counter >> ((7 - i) * 8) as u64) & 255 as u64) as u8
+        i = i + 1
+    }
+    var mac: [u8; 64] = [0; 64]
+    let hs: usize = hmac_alg(alg, key, keylen, (&msg[0]) as u64, 8, (&mac[0]) as u64)
+    let off: usize = (mac[hs - 1] & 15 as u8) as usize
+    let bin: u64 = (((mac[off] & 127 as u8) as u64) << 24) | ((mac[off + 1] as u64) << 16) | ((mac[off + 2] as u64) << 8) | (mac[off + 3] as u64)
+    var d: usize = digits
+    if d > 10 {
+        d = 10
+    }
+    return bin % pow10(d)
+}
+
+// RFC 6238: counter = (time - t0) / step (step >= 1; below t0 the counter is 0).
+fn totp(alg: u32, key: u64, keylen: usize, time: u64, step: u64, t0: u64, digits: usize) -> u64 {
+    var st: u64 = step
+    if st == 0 {
+        st = 30
+    }
+    var c: u64 = 0
+    if time >= t0 {
+        c = (time - t0) / st
+    }
+    return hotp(alg, key, keylen, c, digits)
+}
+
+// Appends `value` as exactly `digits` decimal digits (zero padded).
+fn format_code(value: u64, digits: usize, out: *mut rt.Buf) {
+    var tmp: [u8; 24] = [0; 24]
+    var n: usize = 0
+    var v: u64 = value
+    while v > 0 {
+        tmp[n] = 48 as u8 + (v % 10 as u64) as u8
+        v = v / 10 as u64
+        n = n + 1
+    }
+    var pad: usize = 0
+    if digits > n {
+        pad = digits - n
+    }
+    var i: usize = 0
+    while i < pad {
+        rt.buf_push(out, 48 as u8)
+        i = i + 1
+    }
+    while n > 0 {
+        n = n - 1
+        rt.buf_push(out, tmp[n])
+    }
+}
+
+fn code_equals(value: u64, digits: usize, given: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    format_code(value, digits, &b)
+    var ok: bool = false
+    if rt.buf_len(&b) == given.n {
+        ok = hmac.hmac_equal(rt.buf_ptr(&b), given.p as u64, given.n)
+    }
+    rt.buf_free(&b)
+    return ok
+}
+
+// Checks `code` against counters counter .. counter+window. Returns the
+// offset (0..window) that matched, or -100.
+fn hotp_verify(alg: u32, key: u64, keylen: usize, counter: u64, digits: usize, code: str, window: usize) -> i64 {
+    var w: usize = 0
+    var found: i64 = 0 - 100
+    while w <= window {
+        if found == 0 - 100 && code_equals(hotp(alg, key, keylen, counter + w as u64, digits), digits, code) {
+            found = w as i64
+        }
+        w = w + 1
+    }
+    return found
+}
+
+// Checks `code` against the time steps now-window .. now+window (clock skew).
+// Returns the step offset (-window..window) that matched, or -100.
+fn totp_verify(alg: u32, key: u64, keylen: usize, time: u64, step: u64, digits: usize, code: str, window: usize) -> i64 {
+    var st: u64 = step
+    if st == 0 {
+        st = 30
+    }
+    let c: u64 = time / st
+    var found: i64 = 0 - 100
+    var d: i64 = 0 - window as i64
+    while d <= window as i64 {
+        let cc: i64 = c as i64 + d
+        if found == 0 - 100 && cc >= 0 && code_equals(hotp(alg, key, keylen, cc as u64, digits), digits, code) {
+            found = d
+        }
+        d = d + 1
+    }
+    return found
+}
+
+// ------------------------------------------------------------------ otpauth:// URI
+
+struct Uri {
+    ok: bool,
+    kind: u32, // KIND_TOTP / KIND_HOTP
+    alg: u32,
+    digits: usize,
+    period: u64,
+    counter: u64,
+    secret: rt.Buf, // decoded key bytes
+    issuer: rt.Buf,
+    account: rt.Buf,
+}
+
+fn uri_free(u: *mut Uri) {
+    rt.buf_free(&(*u).secret)
+    rt.buf_free(&(*u).issuer)
+    rt.buf_free(&(*u).account)
+}
+
+fn hexv(c: u8) -> u8 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return c - 48 as u8
+    }
+    if c >= 65 as u8 && c <= 70 as u8 {
+        return c - 55 as u8
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return c - 87 as u8
+    }
+    return 255 as u8
+}
+
+// Percent-decodes s[a..b) ('+' stays '+' in a label; in a value it is a space).
+fn pct_decode(p: u64, a: usize, b: usize, plus_space: bool, out: *mut rt.Buf) {
+    var i: usize = a
+    while i < b {
+        let c: u8 = rt.ld8(p, i)
+        if c == 37 as u8 && i + 2 < b && hexv(rt.ld8(p, i + 1)) != 255 as u8 && hexv(rt.ld8(p, i + 2)) != 255 as u8 {
+            rt.buf_push(out, hexv(rt.ld8(p, i + 1)) * 16 as u8 + hexv(rt.ld8(p, i + 2)))
+            i = i + 3
+        } else {
+            if c == 43 as u8 && plus_space {
+                rt.buf_push(out, 32 as u8)
+            } else {
+                rt.buf_push(out, c)
+            }
+            i = i + 1
+        }
+    }
+}
+
+fn span_eq(p: u64, a: usize, b: usize, s: str) -> bool {
+    if b - a != s.n {
+        return false
+    }
+    var i: usize = 0
+    while i < s.n {
+        var c: u8 = rt.ld8(p, a + i)
+        if c >= 65 as u8 && c <= 90 as u8 {
+            c = c + 32 as u8
+        }
+        if c != rt.ld8(s.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn parse_uint(p: u64, a: usize, b: usize, out: *mut u64) -> bool {
+    if a >= b || b - a > 19 {
+        return false
+    }
+    var v: u64 = 0
+    var i: usize = a
+    while i < b {
+        let c: u8 = rt.ld8(p, i)
+        if c < 48 as u8 || c > 57 as u8 {
+            return false
+        }
+        v = v * 10 as u64 + (c - 48 as u8) as u64
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+// "otpauth://totp/Label?secret=...&..." -> Uri; `ok` is false for anything
+// that is not a valid key URI (see O5). The scheme and type are case-insensitive.
+fn uri_parse(s: str) -> Uri {
+    var u: Uri = Uri {
+        ok: false, kind: KIND_TOTP, alg: ALG_SHA1, digits: 6, period: 30, counter: 0,
+        secret: rt.buf_new(), issuer: rt.buf_new(), account: rt.buf_new(),
+    }
+    let p: u64 = s.p as u64
+    let n: usize = s.n
+    if n < 10 || !span_eq(p, 0, 10, "otpauth://") {
+        return u
+    }
+    var i: usize = 10
+    var j: usize = i
+    while j < n && rt.ld8(p, j) != 47 as u8 {
+        j = j + 1
+    }
+    if span_eq(p, i, j, "totp") {
+        u.kind = KIND_TOTP
+    } else if span_eq(p, i, j, "hotp") {
+        u.kind = KIND_HOTP
+    } else {
+        return u
+    }
+    if j >= n {
+        return u
+    }
+    // label: up to '?'
+    i = j + 1
+    var q: usize = i
+    while q < n && rt.ld8(p, q) != 63 as u8 {
+        q = q + 1
+    }
+    var label: rt.Buf = rt.buf_new()
+    pct_decode(p, i, q, false, &label)
+    var colon: usize = rt.buf_len(&label)
+    var ci: usize = 0
+    while ci < rt.buf_len(&label) {
+        if rt.ld8(rt.buf_ptr(&label), ci) == 58 as u8 {
+            colon = ci
+            break
+        }
+        ci = ci + 1
+    }
+    if colon < rt.buf_len(&label) {
+        rt.buf_push_bytes(&u.issuer, rt.buf_ptr(&label), colon)
+        var st: usize = colon + 1
+        while st < rt.buf_len(&label) && rt.ld8(rt.buf_ptr(&label), st) == 32 as u8 {
+            st = st + 1
+        }
+        rt.buf_push_bytes(&u.account, rt.buf_ptr(&label) + st as u64, rt.buf_len(&label) - st)
+    } else {
+        rt.buf_push_bytes(&u.account, rt.buf_ptr(&label), rt.buf_len(&label))
+    }
+    rt.buf_free(&label)
+    // parameters
+    var have_secret: bool = false
+    var have_counter: bool = false
+    var bad: bool = false
+    if q < n {
+        q = q + 1
+    }
+    while q < n && !bad {
+        var e: usize = q
+        while e < n && rt.ld8(p, e) != 38 as u8 {
+            e = e + 1
+        }
+        var eq: usize = q
+        while eq < e && rt.ld8(p, eq) != 61 as u8 {
+            eq = eq + 1
+        }
+        let vs: usize = if_lt(eq, e)
+        if span_eq(p, q, eq, "secret") {
+            var raw: rt.Buf = rt.buf_new()
+            pct_decode(p, vs, e, true, &raw)
+            rt.buf_clear(&u.secret)
+            let rs: str = str { p: rt.buf_ptr(&raw) as *u8, n: rt.buf_len(&raw) }
+            if base32_decode(rs, &u.secret) && rt.buf_len(&u.secret) > 0 {
+                have_secret = true
+            } else {
+                bad = true
+            }
+            rt.buf_free(&raw)
+        } else if span_eq(p, q, eq, "issuer") {
+            rt.buf_clear(&u.issuer)
+            pct_decode(p, vs, e, true, &u.issuer)
+        } else if span_eq(p, q, eq, "algorithm") {
+            if span_eq(p, vs, e, "sha1") {
+                u.alg = ALG_SHA1
+            } else if span_eq(p, vs, e, "sha256") {
+                u.alg = ALG_SHA256
+            } else if span_eq(p, vs, e, "sha512") {
+                u.alg = ALG_SHA512
+            } else {
+                bad = true
+            }
+        } else if span_eq(p, q, eq, "digits") {
+            var dv: u64 = 0
+            if parse_uint(p, vs, e, &dv) && dv >= 1 && dv <= 10 {
+                u.digits = dv as usize
+            } else {
+                bad = true
+            }
+        } else if span_eq(p, q, eq, "period") {
+            var pv: u64 = 0
+            if parse_uint(p, vs, e, &pv) && pv >= 1 {
+                u.period = pv
+            } else {
+                bad = true
+            }
+        } else if span_eq(p, q, eq, "counter") {
+            var cv: u64 = 0
+            if parse_uint(p, vs, e, &cv) {
+                u.counter = cv
+                have_counter = true
+            } else {
+                bad = true
+            }
+        }
+        q = e + 1
+    }
+    if bad || !have_secret {
+        return u
+    }
+    if u.kind == KIND_HOTP && !have_counter {
+        return u
+    }
+    u.ok = true
+    return u
+}
+
+// index just after '=' (or `e` when there is none)
+fn if_lt(eq: usize, e: usize) -> usize {
+    if eq < e {
+        return eq + 1
+    }
+    return e
+}
+
+fn pct_push(out: *mut rt.Buf, p: u64, n: usize) {
+    var hex: [u8; 16] = [48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 65, 66, 67, 68, 69, 70]
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        let plain: bool = (c >= 48 as u8 && c <= 57 as u8) || (c >= 65 as u8 && c <= 90 as u8) || (c >= 97 as u8 && c <= 122 as u8) || c == 45 as u8 || c == 46 as u8 || c == 95 as u8 || c == 126 as u8
+        if plain {
+            rt.buf_push(out, c)
+        } else {
+            rt.buf_push(out, 37 as u8)
+            rt.buf_push(out, hex[(c >> 4 as u8) as usize])
+            rt.buf_push(out, hex[(c & 15 as u8) as usize])
+        }
+        i = i + 1
+    }
+}
+
+fn push_s(out: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(out, s.p as u64, s.n)
+}
+
+// Appends "otpauth://totp/Issuer:account?secret=...&issuer=...&..." (secret
+// without padding). Counter is written for hotp, period for totp.
+fn uri_build(kind: u32, issuer: str, account: str, key: u64, keylen: usize, alg: u32, digits: usize, period: u64, counter: u64, out: *mut rt.Buf) {
+    push_s(out, "otpauth://")
+    if kind == KIND_HOTP {
+        push_s(out, "hotp/")
+    } else {
+        push_s(out, "totp/")
+    }
+    if issuer.n > 0 {
+        pct_push(out, issuer.p as u64, issuer.n)
+        push_s(out, ":")
+    }
+    pct_push(out, account.p as u64, account.n)
+    push_s(out, "?secret=")
+    base32_encode(key, keylen, false, out)
+    if issuer.n > 0 {
+        push_s(out, "&issuer=")
+        pct_push(out, issuer.p as u64, issuer.n)
+    }
+    if alg == ALG_SHA256 {
+        push_s(out, "&algorithm=SHA256")
+    } else if alg == ALG_SHA512 {
+        push_s(out, "&algorithm=SHA512")
+    } else {
+        push_s(out, "&algorithm=SHA1")
+    }
+    push_s(out, "&digits=")
+    rt.buf_push_dec_u64(out, digits as u64)
+    if kind == KIND_HOTP {
+        push_s(out, "&counter=")
+        rt.buf_push_dec_u64(out, counter)
+    } else {
+        push_s(out, "&period=")
+        rt.buf_push_dec_u64(out, period)
+    }
+}

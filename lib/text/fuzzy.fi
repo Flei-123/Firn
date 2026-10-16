@@ -1,0 +1,631 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/text/fuzzy.fi -- text.fuzzy: fuzzy matching for a command palette or a file
+// search, scored like fzf: the pattern's characters must appear in the text in
+// order (a subsequence); the best placement wins and the matched positions come
+// back for highlighting.
+//
+//     import text.fuzzy
+//     var m: fuzzy.Match = fuzzy.match_new()
+//     if fuzzy.match_text("opfi", "Open File...", fuzzy.CASE_SMART, &m) {
+//         m.score                          // higher = better
+//         fuzzy.match_count(&m)            // matched characters
+//         fuzzy.match_byte(&m, 0)          // byte offset of matched character 0 in the text
+//         fuzzy.match_byte_len(&m, 0)      // its length in bytes (UTF-8)
+//     }
+//     fuzzy.match_free(&m)
+//
+//     var items: Vec[str] = ...            // the candidates
+//     var order: Vec[usize] = vec_new[usize]()
+//     fuzzy.rank("opfi", &items, fuzzy.CASE_SMART, &order)   // indices of the matching items, best first
+//
+// SCORING (the fzf scheme, written as a dynamic programme over the whole
+// pattern, so the BEST placement is found, not the first):
+//   * every matched character 16 points, plus a bonus for its place:
+//     start of a word after white space 10, after '/' ',' ':' ';' '|' 9,
+//     after another non-word character 8, a lower->UPPER step or the first
+//     digit of a number 7; the first pattern character counts its bonus twice;
+//   * characters that follow each other in the text form a chunk: later chunk
+//     members get at least 4 and at least the bonus of the chunk's first
+//     character (a new boundary stronger than that starts a new chunk);
+//   * a gap between matches costs 3 for the first skipped character and 1 for
+//     each further one. Nothing is charged before the first or after the last
+//     match.
+// CASE: CASE_SMART = ignore case unless the pattern has an upper case letter,
+// CASE_IGNORE, CASE_RESPECT.
+// RANK order: higher score first, then shorter text (in characters), then the
+// earlier item.
+//
+// HONEST
+// F1  Case folding covers ASCII, Latin-1, Latin Extended-A, Greek and Cyrillic.
+//     Other scripts match case-sensitively (and are "letters" for the bonus rules).
+// F2  Characters are Unicode code points, not grapheme clusters: a combining
+//     mark is a character of its own. Invalid UTF-8 bytes are one character each.
+// F3  Cost is O(pattern * text * 11) per match; text is capped at 4096
+//     characters (longer texts do not match), the pattern at 256.
+// F4  No fzf query syntax (^ $ ! ' | and space-separated terms); one pattern.
+import std.rt
+import std.vec
+
+export {
+    Match, CASE_SMART, CASE_IGNORE, CASE_RESPECT,
+    match_new, match_free, match_text, match_count, match_pos, match_byte, match_byte_len,
+    score_only, rank,
+}
+
+const CASE_SMART: u32 = 0
+const CASE_IGNORE: u32 = 1
+const CASE_RESPECT: u32 = 2
+
+const MAX_TEXT: usize = 4096
+const MAX_PATTERN: usize = 256
+const NEG: i64 = -1000000000
+const SCORE_MATCH: i64 = 16
+const GAP_START: i64 = 3
+const GAP_EXT: i64 = 1
+const BONUS_BOUNDARY: i64 = 8
+const BONUS_NON_WORD: i64 = 8
+const BONUS_CAMEL: i64 = 7
+const BONUS_CONSECUTIVE: i64 = 4
+const BONUS_WHITE: i64 = 10
+const BONUS_DELIM: i64 = 9
+const FIRST_MULT: i64 = 2
+
+const C_WHITE: u32 = 0
+const C_NONWORD: u32 = 1
+const C_DELIM: u32 = 2
+const C_LOWER: u32 = 3
+const C_UPPER: u32 = 4
+const C_LETTER: u32 = 5
+const C_NUMBER: u32 = 6
+
+struct Match {
+    score: i64,
+    pos: Vec[usize], // character index of every matched pattern character
+    boff: Vec[usize], // byte offset of every matched character in the text
+    blen: Vec[usize], // byte length of every matched character
+}
+
+fn match_new() -> Match {
+    return Match { score: 0, pos: vec_new[usize](), boff: vec_new[usize](), blen: vec_new[usize]() }
+}
+
+fn match_free(m: *mut Match) {
+    vec_free[usize](&(*m).pos)
+    vec_free[usize](&(*m).boff)
+    vec_free[usize](&(*m).blen)
+}
+
+fn match_count(m: *mut Match) -> usize {
+    return vec_len[usize](&(*m).pos)
+}
+
+fn match_pos(m: *mut Match, i: usize) -> usize {
+    return vec_at[usize](&(*m).pos, i)
+}
+
+fn match_byte(m: *mut Match, i: usize) -> usize {
+    return vec_at[usize](&(*m).boff, i)
+}
+
+fn match_byte_len(m: *mut Match, i: usize) -> usize {
+    return vec_at[usize](&(*m).blen, i)
+}
+
+// ------------------------------------------------------------------ characters
+
+// Decodes one code point at byte i of [p, p+n); returns its length (>= 1).
+fn decode(p: u64, n: usize, i: usize, cp: *mut u32) -> usize {
+    let c: u32 = rt.ld8(p, i) as u32
+    if c < 128 {
+        *cp = c
+        return 1
+    }
+    var need: usize = 0
+    var v: u32 = 0
+    var minv: u32 = 0
+    if c >= 194 && c < 224 {
+        need = 1
+        v = c & 31
+        minv = 128
+    } else if c >= 224 && c < 240 {
+        need = 2
+        v = c & 15
+        minv = 2048
+    } else if c >= 240 && c < 245 {
+        need = 3
+        v = c & 7
+        minv = 65536
+    } else {
+        *cp = c + 0xDC00 // a bad byte: a character of its own, never equal to a real one
+        return 1
+    }
+    if i + need >= n {
+        *cp = c + 0xDC00
+        return 1
+    }
+    var k: usize = 1
+    while k <= need {
+        let d: u32 = rt.ld8(p, i + k) as u32
+        if (d & 192) != 128 {
+            *cp = c + 0xDC00
+            return 1
+        }
+        v = (v << 6) | (d & 63)
+        k = k + 1
+    }
+    if v < minv || v > 1114111 || (v >= 55296 && v < 57344) {
+        *cp = c + 0xDC00
+        return 1
+    }
+    *cp = v
+    return need + 1
+}
+
+// The lower case of cp for the scripts of F1 (cp itself when it has none).
+fn to_lower(cp: u32) -> u32 {
+    if cp < 128 {
+        if cp >= 65 && cp <= 90 {
+            return cp + 32
+        }
+        return cp
+    }
+    if cp >= 192 && cp <= 222 && cp != 215 {
+        return cp + 32
+    }
+    if cp >= 256 && cp <= 303 {
+        if cp % 2 == 0 {
+            return cp + 1
+        }
+        return cp
+    }
+    if cp >= 306 && cp <= 311 {
+        if cp % 2 == 0 {
+            return cp + 1
+        }
+        return cp
+    }
+    if cp >= 313 && cp <= 328 {
+        if cp % 2 == 1 {
+            return cp + 1
+        }
+        return cp
+    }
+    if cp >= 330 && cp <= 375 {
+        if cp % 2 == 0 {
+            return cp + 1
+        }
+        return cp
+    }
+    if cp >= 913 && cp <= 939 && cp != 930 {
+        return cp + 32
+    }
+    if cp >= 1040 && cp <= 1071 {
+        return cp + 32
+    }
+    if cp >= 1024 && cp <= 1039 {
+        return cp + 80
+    }
+    return cp
+}
+
+fn is_upper_cp(cp: u32) -> bool {
+    return to_lower(cp) != cp
+}
+
+fn is_lower_cp(cp: u32) -> bool {
+    if cp < 128 {
+        return cp >= 97 && cp <= 122
+    }
+    if cp >= 223 && cp <= 255 && cp != 247 {
+        return true
+    }
+    if is_upper_cp(cp) {
+        return false
+    }
+    if cp >= 257 && cp <= 375 {
+        return true
+    }
+    if cp >= 945 && cp <= 969 {
+        return true
+    }
+    return (cp >= 1072 && cp <= 1119)
+}
+
+fn char_class(cp: u32) -> u32 {
+    if cp < 128 {
+        if cp >= 97 && cp <= 122 {
+            return C_LOWER
+        }
+        if cp >= 65 && cp <= 90 {
+            return C_UPPER
+        }
+        if cp >= 48 && cp <= 57 {
+            return C_NUMBER
+        }
+        if cp == 32 || (cp >= 9 && cp <= 13) {
+            return C_WHITE
+        }
+        if cp == 47 || cp == 44 || cp == 58 || cp == 59 || cp == 124 {
+            return C_DELIM
+        }
+        return C_NONWORD
+    }
+    if cp == 160 || cp == 133 || (cp >= 8192 && cp <= 8202) || cp == 8239 || cp == 12288 {
+        return C_WHITE
+    }
+    if cp == 215 || cp == 247 {
+        return C_NONWORD
+    }
+    if cp >= 0xDC80 && cp <= 0xDCFF {
+        return C_NONWORD // a bad byte
+    }
+    if is_upper_cp(cp) {
+        return C_UPPER
+    }
+    if is_lower_cp(cp) {
+        return C_LOWER
+    }
+    return C_LETTER
+}
+
+fn bonus_for(prev: u32, cur: u32) -> i64 {
+    if cur > C_NONWORD {
+        if prev == C_WHITE {
+            return BONUS_WHITE
+        }
+        if prev == C_DELIM {
+            return BONUS_DELIM
+        }
+        if prev == C_NONWORD {
+            return BONUS_BOUNDARY
+        }
+    }
+    if (prev == C_LOWER && cur == C_UPPER) || (prev != C_NUMBER && cur == C_NUMBER) {
+        return BONUS_CAMEL
+    }
+    if cur == C_NONWORD || cur == C_DELIM {
+        return BONUS_NON_WORD
+    }
+    if cur == C_WHITE {
+        return BONUS_WHITE
+    }
+    return 0
+}
+
+// ------------------------------------------------------------------ the matcher
+
+fn max_i(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// Cell index of state (i, j, c) in the score tables.
+fn cell(n: usize, i: usize, j: usize, c: usize) -> usize {
+    return (i * n + j) * 11 + c
+}
+
+// Core: runes of pattern and text already folded for comparison. Returns the
+// best score or NEG; fills `m` when `want_pos`.
+fn run_dp(pr: *mut Vec[u32], tx: *mut Vec[u32], bonus: *mut Vec[i64], want_pos: bool, m: *mut Match) -> i64 {
+    let pn: usize = vec_len[u32](pr)
+    let n: usize = vec_len[u32](tx)
+    let cells: usize = pn * n * 11
+    var f: Vec[i64] = vec_new[i64]()
+    vec_reserve[i64](&f, cells)
+    var par: Vec[i64] = vec_new[i64]()
+    if want_pos {
+        vec_reserve[i64](&par, cells)
+    }
+    var q: usize = 0
+    while q < cells {
+        vec_push[i64](&f, NEG)
+        if want_pos {
+            vec_push[i64](&par, 0 - 1)
+        }
+        q = q + 1
+    }
+    var i: usize = 0
+    while i < pn {
+        // running best "gap" source for the non-consecutive transition into column j
+        var gval: i64 = NEG
+        var gj: usize = 0
+        var gc: usize = 0
+        var j: usize = 0
+        while j < n {
+            if i > 0 && j >= 2 {
+                // candidate that just became available: from column j-2 (gap cost 3)
+                var bv: i64 = NEG
+                var bc: usize = 0
+                var c: usize = 0
+                while c < 11 {
+                    let v: i64 = vec_at[i64](&f, cell(n, i - 1, j - 2, c))
+                    if v > bv {
+                        bv = v
+                        bc = c
+                    }
+                    c = c + 1
+                }
+                var ng: i64 = NEG
+                if gval > NEG {
+                    ng = gval - GAP_EXT
+                }
+                if bv > NEG && bv - GAP_START >= ng {
+                    gval = bv - GAP_START
+                    gj = j - 2
+                    gc = bc
+                } else {
+                    gval = ng
+                }
+            } else if i > 0 && gval > NEG {
+                gval = gval - GAP_EXT
+            }
+            if vec_at[u32](tx, j) == vec_at[u32](pr, i) {
+                let b: i64 = vec_at[i64](bonus, j)
+                if i == 0 {
+                    vec_set[i64](&f, cell(n, 0, j, b as usize), SCORE_MATCH + b * FIRST_MULT)
+                } else {
+                    // non-consecutive: new chunk
+                    if gval > NEG {
+                        let v: i64 = gval + SCORE_MATCH + b
+                        let at: usize = cell(n, i, j, b as usize)
+                        if v > vec_at[i64](&f, at) {
+                            vec_set[i64](&f, at, v)
+                            if want_pos {
+                                vec_set[i64](&par, at, (gj * 16 + gc) as i64)
+                            }
+                        }
+                    }
+                    // consecutive: from column j-1
+                    if j >= 1 {
+                        var cp: usize = 0
+                        while cp < 11 {
+                            let prev: i64 = vec_at[i64](&f, cell(n, i - 1, j - 1, cp))
+                            if prev > NEG {
+                                var nc: usize = cp
+                                var add: i64 = 0
+                                if b >= BONUS_BOUNDARY && b > cp as i64 {
+                                    nc = b as usize
+                                    add = b
+                                } else {
+                                    add = max_i(b, max_i(BONUS_CONSECUTIVE, cp as i64))
+                                }
+                                let v: i64 = prev + SCORE_MATCH + add
+                                let at: usize = cell(n, i, j, nc)
+                                if v > vec_at[i64](&f, at) {
+                                    vec_set[i64](&f, at, v)
+                                    if want_pos {
+                                        vec_set[i64](&par, at, ((j - 1) * 16 + cp) as i64)
+                                    }
+                                }
+                            }
+                            cp = cp + 1
+                        }
+                    }
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // best final state
+    var best: i64 = NEG
+    var bj: usize = 0
+    var bc2: usize = 0
+    var j2: usize = 0
+    while j2 < n {
+        var c2: usize = 0
+        while c2 < 11 {
+            let v: i64 = vec_at[i64](&f, cell(n, pn - 1, j2, c2))
+            if v > best {
+                best = v
+                bj = j2
+                bc2 = c2
+            }
+            c2 = c2 + 1
+        }
+        j2 = j2 + 1
+    }
+    if want_pos && best > NEG {
+        var k: usize = pn
+        while k > 0 {
+            k = k - 1
+            vec_push[usize](&(*m).pos, bj)
+            let pv: i64 = vec_at[i64](&par, cell(n, k, bj, bc2))
+            if pv >= 0 {
+                bj = (pv / 16) as usize
+                bc2 = (pv % 16) as usize
+            }
+        }
+        vec_invert[usize](&(*m).pos)
+    }
+    vec_free[i64](&f)
+    vec_free[i64](&par)
+    return best
+}
+
+// Prepares the rune lists; false when the pattern is empty or a limit is hit.
+fn prepare(pattern: str, text: str, mode: u32, pr: *mut Vec[u32], tx: *mut Vec[u32], raw: *mut Vec[u32],
+    bonus: *mut Vec[i64], boff: *mut Vec[usize], blen: *mut Vec[usize]) -> bool {
+    var i: usize = 0
+    var cp: u32 = 0
+    var has_upper: bool = false
+    var plen: usize = 0
+    while i < pattern.n {
+        let l: usize = decode(pattern.p as u64, pattern.n, i, &cp)
+        vec_push[u32](pr, cp)
+        if is_upper_cp(cp) {
+            has_upper = true
+        }
+        i = i + l
+        plen = plen + 1
+        if plen > MAX_PATTERN {
+            return false
+        }
+    }
+    var fold: bool = mode == CASE_IGNORE
+    if mode == CASE_SMART {
+        fold = !has_upper
+    }
+    if fold {
+        var k: usize = 0
+        while k < vec_len[u32](pr) {
+            vec_set[u32](pr, k, to_lower(vec_at[u32](pr, k)))
+            k = k + 1
+        }
+    }
+    i = 0
+    var prev_class: u32 = C_WHITE
+    var count: usize = 0
+    while i < text.n {
+        let l: usize = decode(text.p as u64, text.n, i, &cp)
+        vec_push[u32](raw, cp)
+        if fold {
+            vec_push[u32](tx, to_lower(cp))
+        } else {
+            vec_push[u32](tx, cp)
+        }
+        let cl: u32 = char_class(cp)
+        vec_push[i64](bonus, bonus_for(prev_class, cl))
+        prev_class = cl
+        vec_push[usize](boff, i)
+        vec_push[usize](blen, l)
+        i = i + l
+        count = count + 1
+        if count > MAX_TEXT {
+            return false
+        }
+    }
+    return vec_len[u32](pr) > 0
+}
+
+// Greedy test: are the pattern's characters a subsequence of the text?
+fn is_subsequence(pr: *mut Vec[u32], tx: *mut Vec[u32]) -> bool {
+    var i: usize = 0
+    var j: usize = 0
+    let pn: usize = vec_len[u32](pr)
+    let n: usize = vec_len[u32](tx)
+    while i < pn && j < n {
+        if vec_at[u32](pr, i) == vec_at[u32](tx, j) {
+            i = i + 1
+        }
+        j = j + 1
+    }
+    return i == pn
+}
+
+// Fuzzy match of `pattern` in `text`. false = no match (or an empty pattern,
+// or over the limits of F3). On true `m` holds the score and positions.
+fn match_text(pattern: str, text: str, mode: u32, m: *mut Match) -> bool {
+    vec_clear[usize](&(*m).pos)
+    vec_clear[usize](&(*m).boff)
+    vec_clear[usize](&(*m).blen)
+    var pr: Vec[u32] = vec_new[u32]()
+    var tx: Vec[u32] = vec_new[u32]()
+    var raw: Vec[u32] = vec_new[u32]()
+    var bonus: Vec[i64] = vec_new[i64]()
+    var boff: Vec[usize] = vec_new[usize]()
+    var blen: Vec[usize] = vec_new[usize]()
+    var ok: bool = prepare(pattern, text, mode, &pr, &tx, &raw, &bonus, &boff, &blen)
+    if ok {
+        ok = is_subsequence(&pr, &tx)
+    }
+    if ok {
+        let s: i64 = run_dp(&pr, &tx, &bonus, true, m)
+        if s > NEG {
+            (*m).score = s
+            var k: usize = 0
+            while k < vec_len[usize](&(*m).pos) {
+                let at: usize = vec_at[usize](&(*m).pos, k)
+                vec_push[usize](&(*m).boff, vec_at[usize](&boff, at))
+                vec_push[usize](&(*m).blen, vec_at[usize](&blen, at))
+                k = k + 1
+            }
+        } else {
+            ok = false
+        }
+    }
+    vec_free[u32](&pr)
+    vec_free[u32](&tx)
+    vec_free[u32](&raw)
+    vec_free[i64](&bonus)
+    vec_free[usize](&boff)
+    vec_free[usize](&blen)
+    return ok
+}
+
+// Score only (no positions); NEG-like -1000000000 for no match.
+fn score_only(pattern: str, text: str, mode: u32) -> i64 {
+    var pr: Vec[u32] = vec_new[u32]()
+    var tx: Vec[u32] = vec_new[u32]()
+    var raw: Vec[u32] = vec_new[u32]()
+    var bonus: Vec[i64] = vec_new[i64]()
+    var boff: Vec[usize] = vec_new[usize]()
+    var blen: Vec[usize] = vec_new[usize]()
+    var s: i64 = NEG
+    var m: Match = match_new()
+    if prepare(pattern, text, mode, &pr, &tx, &raw, &bonus, &boff, &blen) {
+        if is_subsequence(&pr, &tx) {
+            s = run_dp(&pr, &tx, &bonus, false, &m)
+        }
+    }
+    match_free(&m)
+    vec_free[u32](&pr)
+    vec_free[u32](&tx)
+    vec_free[u32](&raw)
+    vec_free[i64](&bonus)
+    vec_free[usize](&boff)
+    vec_free[usize](&blen)
+    return s
+}
+
+struct Ranked {
+    score: i64,
+    len: usize, // text length in characters
+    idx: usize,
+}
+
+fn ranked_less(a: *Ranked, b: *Ranked) -> bool {
+    if (*a).score != (*b).score {
+        return (*a).score > (*b).score
+    }
+    if (*a).len != (*b).len {
+        return (*a).len < (*b).len
+    }
+    return (*a).idx < (*b).idx
+}
+
+fn char_count(s: str) -> usize {
+    var i: usize = 0
+    var n: usize = 0
+    var cp: u32 = 0
+    while i < s.n {
+        i = i + decode(s.p as u64, s.n, i, &cp)
+        n = n + 1
+    }
+    return n
+}
+
+// Indices of the items that match `pattern`, best first (see RANK in the header).
+fn rank(pattern: str, items: *mut Vec[str], mode: u32, out: *mut Vec[usize]) {
+    vec_clear[usize](out)
+    var list: Vec[Ranked] = vec_new[Ranked]()
+    let cnt: usize = vec_len[str](items)
+    var i: usize = 0
+    while i < cnt {
+        let it: str = *vec_elem_ptr[str](items, i)
+        let s: i64 = score_only(pattern, it, mode)
+        if s > NEG {
+            vec_push[Ranked](&list, Ranked { score: s, len: char_count(it), idx: i })
+        }
+        i = i + 1
+    }
+    vec_sort_by[Ranked](&list, ranked_less)
+    var k: usize = 0
+    while k < vec_len[Ranked](&list) {
+        vec_push[usize](out, (*vec_elem_ptr[Ranked](&list, k)).idx)
+        k = k + 1
+    }
+    vec_free[Ranked](&list)
+}
