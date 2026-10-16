@@ -1347,6 +1347,13 @@ build appctl
 "$W/appctl"
 
 echo
+echo "== 18q2. fui.appctl PART 2: MENU BAR, TOOLTIP, DIALOGS =="
+# lib/fui/appctl.fi: Alt+letter, shortcuts, Left / Right between menus, check items, the context menu,
+# the tooltip delay (fuiwirt.host_set_wake), message / confirm / input dialogs and the audit.
+build appctl2
+"$W/appctl2"
+
+echo
 echo "== THE INTERACTIVE DIALOGS (roadmap r177, docs/DIALOG.md): message, colour, font, file =="
 # Each script builds its own in-memory test and live driver, runs the checks without a window, the
 # FRAME_MS limit (<= 16 ms) with release-fast, the accessibility audit, and the live test on a private
