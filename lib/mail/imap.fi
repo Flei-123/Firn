@@ -97,7 +97,7 @@ export {
     imap_bs_size, imap_bs_path, imap_bs_disposition, imap_bs_filename, imap_bs_parent, imap_bs_id,
     imap_list_count, imap_list_attrs, imap_list_delim, imap_list_name,
     imap_search_count, imap_search_at, imap_status_get, imap_utf7_encode, imap_utf7_decode,
-    ic_open, ic_core, ic_login, ic_login_plain, ic_list, ic_select, ic_status, ic_fetch, ic_search, ic_store,
+    ic_open, ic_core, ic_login, ic_login_plain, ic_list, ic_select, ic_status, ic_fetch, ic_search, ic_store, ic_copy,
     ic_expunge, ic_noop, ic_close, ic_idle, ic_idle_done, ic_logout, ic_abort, ic_discard, ic_set_tls_mode,
     ic_set_insecure_auth, ic_err, ic_raw,
 }
@@ -215,6 +215,7 @@ struct BsPart {
     index: u32, // 1-based among its siblings
     multi: bool,
     depth: u32,
+    inner: bool, // the body of a message/rfc822 part (child of that part)
 }
 
 struct Imap {
@@ -1268,12 +1269,14 @@ fn imap_login(c: *mut Imap, user: str, pass: str) -> bool {
         return false
     }
     if !quote_into(&(*c).out, user) || !quote_into(&(*c).out, pass) {
-        wipe(&(*c).out)
-        (*c).outpos = 0
-        (*c).tag_no -= 1
-        (*c).kind = CK_NONE
-        (*c).err = IERR_BAD_ARG
-        return false
+        // only OUR half-written command goes (other queued output stays); the secret bytes are zeroed first
+        let base: *mut u8 = rt.buf_data(&(*c).out)
+        var z: usize = mark
+        while z < rt.buf_len(&(*c).out) {
+            *(base + z) = 0
+            z += 1
+        }
+        return bad_arg(c, mark)
     }
     end_cmd(c)
     return true
@@ -1686,7 +1689,7 @@ fn imap_addr_format(c: *mut Imap, list: usize, out: *mut rt.Buf) {
 
 // ----------------------------------------------------------- BODYSTRUCTURE
 
-fn bs_walk(c: *mut Imap, node: usize, parent: usize, index: u32, depth: u32) -> usize {
+fn bs_walk(c: *mut Imap, node: usize, parent: usize, index: u32, depth: u32, inner: bool) -> usize {
     let me: usize = vec_len[BsPart](&(*c).bs)
     if depth > MAX_DEPTH || me >= 100000 {
         return NONE
@@ -1694,13 +1697,13 @@ fn bs_walk(c: *mut Imap, node: usize, parent: usize, index: u32, depth: u32) -> 
     let first: usize = imap_node_child(c, node)
     let multi: bool = imap_node_kind(c, first) == NK_LIST
     vec_push[BsPart](&(*c).bs, BsPart { node: node, parent: parent, first_child: NONE, next: NONE, index: index,
-            multi: multi, depth: depth })
+            multi: multi, depth: depth, inner: inner })
     if multi {
         var k: usize = first
         var last: usize = NONE
         var idx: u32 = 1
         while k != NONE && imap_node_kind(c, k) == NK_LIST {
-            let ch: usize = bs_walk(c, k, me, idx, depth + 1)
+            let ch: usize = bs_walk(c, k, me, idx, depth + 1, false)
             if ch == NONE {
                 return NONE
             }
@@ -1715,13 +1718,25 @@ fn bs_walk(c: *mut Imap, node: usize, parent: usize, index: u32, depth: u32) -> 
             idx += 1
             k = imap_node_next(c, k)
         }
+    } else if imap_node_is(c, first, "MESSAGE") && imap_node_is(c, nth(c, node, 1), "RFC822") {
+        // message/rfc822: ... size ENVELOPE BODYSTRUCTURE lines -- the inner body is the only child
+        let body: usize = nth(c, node, 8)
+        if body != NONE && imap_node_kind(c, nth(c, node, 7)) == NK_LIST && imap_node_kind(c, body) == NK_LIST {
+            let ch: usize = bs_walk(c, body, me, 1, depth + 1, true)
+            if ch == NONE {
+                return NONE
+            }
+            let mp: *mut BsPart = vec_elem_ptr[BsPart](&(*c).bs, me)
+            (*mp).first_child = ch
+        }
     }
     return me
 }
 
 // Flattens the BODYSTRUCTURE (or BODY) of fetch record i into numbered parts, in document
 // order; part 0 is the top. Returns the number of parts (0 = none / malformed).
-// message/rfc822 parts are leaves (their inner body is not entered).
+// message/rfc822 parts have the inner body as their only child (path N for an inner multipart,
+// N.1 for an inner single part, children N.k) -- the same numbering BODY[...] uses.
 fn imap_bs_build(c: *mut Imap, i: usize, item: str) -> usize {
     vec_clear[BsPart](&(*c).bs)
     var nm: str = item
@@ -1735,7 +1750,7 @@ fn imap_bs_build(c: *mut Imap, i: usize, item: str) -> usize {
     if n == NONE || imap_node_kind(c, n) != NK_LIST {
         return 0
     }
-    if bs_walk(c, n, NONE, 1, 0) == NONE {
+    if bs_walk(c, n, NONE, 1, 0, false) == NONE {
         vec_clear[BsPart](&(*c).bs)
         return 0
     }
@@ -1870,6 +1885,13 @@ fn imap_bs_path(c: *mut Imap, k: usize, out: *mut rt.Buf) {
     if (*p).parent == NONE {
         if !(*p).multi {
             push(out, "1")
+        }
+        return
+    }
+    if (*p).inner {
+        imap_bs_path(c, (*p).parent, out)
+        if !(*p).multi {
+            push(out, ".1")
         }
         return
     }
@@ -2162,11 +2184,11 @@ const PH_TLS: u32 = 2
 const PH_CAP2: u32 = 3
 const PH_READY: u32 = 4
 
-fn obj_alloc[T]() -> u64 {
+fn imap_obj_alloc[T]() -> u64 {
     return rt.heap_alloc(size_of[T]())
 }
 
-fn obj_free[T](p: u64) {
+fn imap_obj_free[T](p: u64) {
     rt.heap_free(p, size_of[T]())
 }
 
@@ -2195,7 +2217,7 @@ fn ic_set_insecure_auth(c: *mut Ic, on: bool) { imap_set_insecure_auth(&(*c).cor
 // capabilities and the TLS switch are done; then log in.
 fn ic_open(l: *mut loop.Loop, addr: u32, port: u16, mode: u32, host: str, store: *mut x509.Store,
     now: u64, timeout_ms: i64, cb: fn(*mut Ic, u64, u32, i64), ud: u64) -> *mut Ic {
-    let p: u64 = obj_alloc[Ic]()
+    let p: u64 = imap_obj_alloc[Ic]()
     if p == 0 {
         return 0 as *mut Ic
     }
@@ -2217,7 +2239,7 @@ fn ic_open(l: *mut loop.Loop, addr: u32, port: u16, mode: u32, host: str, store:
     if s as u64 == 0 {
         imap_free(&(*c).core)
         rt.buf_free(&(*c).host)
-        obj_free[Ic](p)
+        imap_obj_free[Ic](p)
         return 0 as *mut Ic
     }
     (*c).s = s
@@ -2347,7 +2369,7 @@ fn ic_stream_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
         ic_emit(c, IME_CLOSED, arg)
         imap_free(&(*c).core)
         rt.buf_free(&(*c).host)
-        obj_free[Ic](ud)
+        imap_obj_free[Ic](ud)
     }
 }
 
@@ -2395,6 +2417,12 @@ fn ic_search(c: *mut Ic, criteria: str, uid: bool) -> bool {
 
 fn ic_store(c: *mut Ic, seqset: str, mode: str, flags: str, uid: bool) -> bool {
     let ok: bool = imap_store(&(*c).core, seqset, mode, flags, uid)
+    ic_pump(c)
+    return ok
+}
+
+fn ic_copy(c: *mut Ic, seqset: str, mailbox: str, uid: bool) -> bool {
+    let ok: bool = imap_copy(&(*c).core, seqset, mailbox, uid)
     ic_pump(c)
     return ok
 }

@@ -126,11 +126,20 @@ class Part:
         return self.mime() + self.body()
 
     def walk(self, path="", parent=None):
-        """document order; message/rfc822 is a leaf. yields (path, part, parent)"""
+        """document order, the way a BODYSTRUCTURE lists the parts: yields (path, part, parent).
+        message/rfc822 has its inner body as the only child: path N for an inner multipart (its children
+        are N.k), N.1 for an inner single part."""
         yield path, self, parent
         if self.is_multi():
             for i, c in enumerate(self.children, 1):
                 yield from c.walk((path + "." if path else "") + str(i), self)
+        elif self.inner is not None:
+            r = self.inner.root
+            base = path or "1"
+            yield from r.walk(base if r.is_multi() else base + ".1", self)
+
+    def is_msg(self):
+        return self.typ == "message" and self.sub == "rfc822" and self.inner is not None
 
 
 class Msg:
@@ -154,7 +163,7 @@ class Msg:
         return self.root.body()
 
     def section(self, sec):
-        """octets of BODY[sec] or None. sec: '' HEADER TEXT n n.m n.MIME"""
+        """octets of BODY[sec] or None. sec: '' HEADER TEXT n n.m n.MIME n.HEADER n.TEXT (inner message)"""
         if sec == "":
             return self.raw()
         if sec == "HEADER":
@@ -162,23 +171,42 @@ class Msg:
         if sec == "TEXT":
             return self.text()
         toks = sec.split(".")
-        mime = False
-        if toks[-1] == "MIME":
-            mime = True
-            toks = toks[:-1]
-        if not self.root.is_multi():
-            if toks == ["1"]:
-                return self.root.mime() if mime else self.root.body()
+        tail = None
+        if toks[-1] in ("MIME", "HEADER", "TEXT"):
+            tail = toks.pop()
+        if not toks or not all(t.isdigit() for t in toks):
             return None
-        node = self.root
-        for t in toks:
-            if not t.isdigit() or not node.is_multi():
-                return None
-            k = int(t)
+        node = resolve(self.root, [int(t) for t in toks])
+        if node is None:
+            return None
+        if tail == "MIME":
+            return node.mime()
+        if tail == "HEADER":
+            return node.inner.head() if node.is_msg() else None
+        if tail == "TEXT":
+            return node.inner.text() if node.is_msg() else None
+        return node.body()
+
+
+def resolve(root, toks):
+    """the part addressed by the numbers `toks` inside the message whose root part is `root`"""
+    if not root.is_multi():
+        if toks[0] != 1:
+            return None
+        node, rest = root, toks[1:]
+    else:
+        node, rest = root, toks
+    while rest:
+        if node.is_multi():
+            k = rest[0]
             if k < 1 or k > len(node.children):
                 return None
-            node = node.children[k - 1]
-        return node.mime() if mime else node.body()
+            node, rest = node.children[k - 1], rest[1:]
+        elif node.is_msg():
+            return resolve(node.inner.root, rest)
+        else:
+            return None
+    return node
 
 
 # ---------------------------------------------------------------- random generation
@@ -358,6 +386,9 @@ def dump_expected(msgs, with_bodies=True):
                 if not p.is_multi():
                     ipath = path if path else "1"
                     secs.append((ipath, p.body()))
+                    if p.is_msg():
+                        secs.append((ipath + ".HEADER", p.inner.head()))
+                        secs.append((ipath + ".TEXT", p.inner.text()))
             for name, data in secs:
                 out.append("S %d %s %d %s" % (seq, name, len(data), hashlib.sha1(data).hexdigest()))
     return out

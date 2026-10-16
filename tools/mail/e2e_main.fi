@@ -1,0 +1,1020 @@
+// tools/mail/e2e_main.fi -- end-to-end driver for lib/mail/smtp.fi and lib/mail/imap.fi on async.loop.
+//
+//     e2e_main smtp <port> <mode> <tls> <ca.pem> <host> <script>
+//     e2e_main imap <port> <mode> <tls> <ca.pem> <host> <script>
+//
+//   mode  plain | starttls | tls          (how the connection starts)
+//   tls   never | opp | require           (STARTTLS policy)
+//   host  the name the server certificate must carry
+//   script  a text file, one command per line, fields separated by TAB:
+//     smtp: login U P | authmode auto|plain|login | insecure | ehlo NAME | mail FROM RCPTS FILE
+//     imap: login U P | loginplain U P | list REF PAT | lsub REF PAT | select BOX | examine BOX
+//           status BOX ITEMS | search CRIT | usearch CRIT | store SET MODE FLAGS | ustore ...
+//           copy SET BOX | ucopy ... | expunge | uexpunge SET | noop | close | idle | dump
+//           fetch SET ITEMS [uid] | raw LINE | caps | logout
+//   Mailbox names are UTF-8 here (the driver encodes them as modified UTF-7).
+//
+// Prints one result line per event (the format is read by tools/mail/e2e.py). `dump` prints the same
+// M/E/P/S lines as tools/mail/mailmodel.py `dump_expected`.
+import std.rt
+import std.str
+import std.fs
+import std.vec
+import std.net
+import std.time
+import std.crypto.sha1
+import tls.x509
+import async.loop
+import async.stream
+import mail.rfc822
+import mail.smtp
+import mail.imap
+
+static mut g_loop: u64 = 0
+static mut g_script: u64 = 0
+static mut g_line: u64 = 0
+static mut g_tmp: u64 = 0
+static mut g_tmp2: u64 = 0
+static mut g_plan: u64 = 0
+static mut g_pos: usize = 0
+static mut g_ls: usize = 0
+static mut g_ln: usize = 0
+static mut g_busy: bool = false
+static mut g_quit: bool = false
+static mut g_ended: bool = false
+static mut g_idle: bool = false
+static mut g_idle_done: bool = false
+static mut g_dump_phase: u32 = 0
+static mut g_dump_at: usize = 0
+static mut g_dump_end: usize = 0
+static mut g_dump_seq: u64 = 0
+static mut g_cmd_p: u64 = 0
+static mut g_cmd_n: usize = 0
+static mut g_status_p: u64 = 0
+static mut g_status_n: usize = 0
+
+fn script() -> *mut rt.Buf { return g_script as *mut rt.Buf }
+fn linebuf() -> *mut rt.Buf { return g_line as *mut rt.Buf }
+fn tmpbuf() -> *mut rt.Buf { return g_tmp as *mut rt.Buf }
+fn tmpbuf2() -> *mut rt.Buf { return g_tmp2 as *mut rt.Buf }
+fn planbuf() -> *mut rt.Buf { return g_plan as *mut rt.Buf }
+
+fn bs(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_data(b), n: rt.buf_len(b) }
+}
+
+// ---------------------------------------------------------------- output
+
+fn put(s: str) { rt.buf_push_bytes(linebuf(), s.p as u64, s.n) }
+fn put_u(v: u64) { rt.buf_push_dec_u64(linebuf(), v) }
+fn flush() {
+    let b: *mut rt.Buf = linebuf()
+    rt.buf_push(b, 10)
+    rt.write_everything(1, rt.buf_ptr(b), rt.buf_len(b))
+    rt.buf_clear(b)
+}
+
+fn hexch(v: u32) -> u8 {
+    if v < 10 {
+        return (48 + v) as u8
+    }
+    return (87 + v) as u8
+}
+
+// hex of the octets, "." for none
+fn put_hex_bytes(p: *mut u8, n: usize) {
+    if n == 0 {
+        rt.buf_push(linebuf(), 46)
+        return
+    }
+    var i: usize = 0
+    while i < n {
+        let c: u32 = (*(p + i)) as u32
+        rt.buf_push(linebuf(), hexch(c >> 4))
+        rt.buf_push(linebuf(), hexch(c & 15))
+        i += 1
+    }
+}
+
+fn put_hex_str(s: str) { put_hex_bytes(s.p, s.n) }
+
+fn lower_in_place(b: *mut rt.Buf) {
+    let p: *mut u8 = rt.buf_data(b)
+    var i: usize = 0
+    while i < rt.buf_len(b) {
+        let ch: u32 = (*(p + i)) as u32
+        if ch >= 65 && ch <= 90 {
+            *(p + i) = (ch + 32) as u8
+        }
+        i += 1
+    }
+}
+
+// hex of a node's text; "-" for NIL / none
+fn put_hex_node(core: *mut imap.Imap, n: usize) {
+    let t: *mut rt.Buf = tmpbuf()
+    rt.buf_clear(t)
+    if !imap.imap_node_text(core, n, t) {
+        put("-")
+        return
+    }
+    put_hex_str(bs(t))
+}
+
+fn put_hex_node_lower(core: *mut imap.Imap, n: usize) {
+    let t: *mut rt.Buf = tmpbuf()
+    rt.buf_clear(t)
+    if !imap.imap_node_text(core, n, t) {
+        put("-")
+        return
+    }
+    lower_in_place(t)
+    put_hex_str(bs(t))
+}
+
+fn put_text_node_lower(core: *mut imap.Imap, n: usize) {
+    let t: *mut rt.Buf = tmpbuf()
+    rt.buf_clear(t)
+    if !imap.imap_node_text(core, n, t) {
+        put("-")
+        return
+    }
+    lower_in_place(t)
+    put(bs(t))
+}
+
+fn put_addr_node(core: *mut imap.Imap, n: usize) {
+    if n == imap.NONE || imap.imap_node_kind(core, n) != imap.NK_LIST {
+        put("-")
+        return
+    }
+    let t: *mut rt.Buf = tmpbuf()
+    rt.buf_clear(t)
+    imap.imap_addr_format(core, n, t)
+    put_hex_str(bs(t))
+}
+
+fn put_flags(bits: u32) {
+    var any: bool = false
+    if (bits & imap.FL_SEEN) != 0 {
+        put("\\Seen")
+        any = true
+    }
+    if (bits & imap.FL_ANSWERED) != 0 {
+        if any { put(",") }
+        put("\\Answered")
+        any = true
+    }
+    if (bits & imap.FL_FLAGGED) != 0 {
+        if any { put(",") }
+        put("\\Flagged")
+        any = true
+    }
+    if (bits & imap.FL_DELETED) != 0 {
+        if any { put(",") }
+        put("\\Deleted")
+        any = true
+    }
+    if (bits & imap.FL_DRAFT) != 0 {
+        if any { put(",") }
+        put("\\Draft")
+        any = true
+    }
+    if !any {
+        put("-")
+    }
+}
+
+fn put_sha1(p: *mut u8, n: usize) {
+    var d: [u8; 20] = [0; 20]
+    sha1.sha1(p as u64, n, (&d[0]) as u64)
+    var i: usize = 0
+    while i < 20 {
+        let c: u32 = d[i] as u32
+        rt.buf_push(linebuf(), hexch(c >> 4))
+        rt.buf_push(linebuf(), hexch(c & 15))
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------- script
+
+fn script_next() -> bool {
+    let b: *mut rt.Buf = script()
+    let total: usize = rt.buf_len(b)
+    if g_pos >= total {
+        return false
+    }
+    let base: *mut u8 = rt.buf_data(b)
+    var e: usize = g_pos
+    while e < total && *(base + e) != 10 as u8 {
+        e += 1
+    }
+    g_ls = g_pos
+    g_ln = e - g_pos
+    g_pos = e + 1
+    return true
+}
+
+fn cur_line() -> str {
+    return str { p: rt.buf_data(script()) + g_ls, n: g_ln }
+}
+
+// k-th TAB separated field of a line
+fn field(line: str, k: usize) -> str {
+    var i: usize = 0
+    var f: usize = 0
+    var s: usize = 0
+    while i <= line.n {
+        if i == line.n || rfc822.at(line, i) == 9 {
+            if f == k {
+                return rfc822.view(line, s, i)
+            }
+            f += 1
+            s = i + 1
+        }
+        i += 1
+    }
+    return rfc822.view(line, 0, 0)
+}
+
+fn is(a: str, b: str) -> bool { return rfc822.eq_nocase(a, b) }
+
+fn parse_dec(s: str) -> u64 {
+    var v: u64 = 0
+    var i: usize = 0
+    while i < s.n {
+        let ch: u32 = rfc822.at(s, i)
+        if ch < 48 || ch > 57 {
+            break
+        }
+        v = v * 10 + (ch - 48) as u64
+        i += 1
+    }
+    return v
+}
+
+fn arg_str(start: u64, i: usize) -> str {
+    let a: u64 = rt.arg_ptr(start, i)
+    return str { p: a as *mut u8, n: rt.c_length(a) }
+}
+
+fn now_s() -> u64 {
+    return (time.now_unix_ms() / 1000) as u64
+}
+
+fn t_timeout(l: *mut loop.Loop, ud: u64) {
+    put("TIMEOUT")
+    flush()
+    loop.stop(l)
+}
+
+// =================================================================== SMTP
+
+static mut s_user_p: u64 = 0
+static mut s_user_n: usize = 0
+static mut s_pass_p: u64 = 0
+static mut s_pass_n: usize = 0
+static mut s_have_login: bool = false
+static mut s_auth: u32 = 0
+static mut s_insecure: bool = false
+static mut s_ehlo_p: u64 = 0
+static mut s_ehlo_n: usize = 0
+static mut s_have_ehlo: bool = false
+
+fn smtp_next(c: *mut smtp.Sc) {
+    if g_busy || g_quit {
+        return
+    }
+    while script_next() {
+        let line: str = cur_line()
+        let cmd: str = field(line, 0)
+        if is(cmd, "mail") {
+            var data: rt.Buf = rt.buf_new()
+            fs.read_file(field(line, 3), &data) catch 0
+            let ok: bool = smtp.sc_send(c, field(line, 1), field(line, 2), rt.buf_ptr(&data), rt.buf_len(&data))
+            rt.buf_free(&data)
+            if ok {
+                g_busy = true
+                return
+            }
+            put("SENDFAIL err=")
+            put_u(smtp.sc_err(c) as u64)
+            flush()
+        }
+    }
+    g_quit = true
+    smtp.sc_quit(c)
+}
+
+fn smtp_cb(c: *mut smtp.Sc, ud: u64, kind: u32, arg: i64) {
+    if kind == smtp.SME_READY {
+        put("READY")
+        flush()
+        smtp_next(c)
+    } else if kind == smtp.SME_SENT {
+        g_busy = false
+        put("SENT ok=")
+        put_u(arg as u64)
+        put(" err=")
+        put_u(smtp.sc_err(c) as u64)
+        put(" code=")
+        put_u(smtp.sc_code(c) as u64)
+        put(" acc=")
+        put_u(smtp.sc_accepted(c) as u64)
+        put(" rej=")
+        put_hex_str(smtp.sc_rejected(c))
+        flush()
+        smtp_next(c)
+    } else if kind == smtp.SME_CLOSED {
+        put("CLOSED reason=")
+        put_u(arg as u64)
+        put(" err=")
+        put_u(smtp.sc_err(c) as u64)
+        put(" state=")
+        put_u(smtp.smtp_state(smtp.sc_core(c)) as u64)
+        put(" code=")
+        put_u(smtp.sc_code(c) as u64)
+        flush()
+        loop.stop(g_loop as *mut loop.Loop)
+    }
+}
+
+fn run_smtp(l: *mut loop.Loop, port: u16, mode: str, tlsmode: str, host: str, store: *mut x509.Store) -> i32 {
+    while script_next() {
+        let line: str = cur_line()
+        let cmd: str = field(line, 0)
+        if is(cmd, "login") {
+            let u: str = field(line, 1)
+            let pw: str = field(line, 2)
+            s_user_p = u.p as u64
+            s_user_n = u.n
+            s_pass_p = pw.p as u64
+            s_pass_n = pw.n
+            s_have_login = true
+        } else if is(cmd, "authmode") {
+            let m: str = field(line, 1)
+            if is(m, "plain") {
+                s_auth = smtp.AUTH_PLAIN
+            } else if is(m, "login") {
+                s_auth = smtp.AUTH_LOGIN
+            }
+        } else if is(cmd, "insecure") {
+            s_insecure = true
+        } else if is(cmd, "ehlo") {
+            let eh: str = field(line, 1)
+            s_ehlo_p = eh.p as u64
+            s_ehlo_n = eh.n
+            s_have_ehlo = true
+        }
+    }
+    g_pos = 0
+    var m: u32 = smtp.SM_PLAIN
+    if is(mode, "starttls") {
+        m = smtp.SM_STARTTLS
+    } else if is(mode, "tls") {
+        m = smtp.SM_TLS
+    }
+    let c: *mut smtp.Sc = smtp.sc_open(l, net.ADDR_LOCAL, port, m, host, store, now_s(), 20000, smtp_cb, 0)
+    if c as u64 == 0 {
+        put("OPENFAIL")
+        flush()
+        return 1
+    }
+    var pol: u32 = smtp.SMTP_OPPORTUNISTIC
+    if is(tlsmode, "never") {
+        pol = smtp.SMTP_NEVER
+    } else if is(tlsmode, "require") {
+        pol = smtp.SMTP_REQUIRE
+    }
+    if m != smtp.SM_TLS {
+        smtp.sc_set_tls_mode(c, pol)
+    }
+    if s_have_login {
+        smtp.sc_set_login(c, str { p: s_user_p as *mut u8, n: s_user_n }, str { p: s_pass_p as *mut u8, n: s_pass_n })
+    }
+    smtp.sc_set_auth_mode(c, s_auth)
+    if s_insecure {
+        smtp.sc_set_insecure_auth(c, true)
+    }
+    if s_have_ehlo {
+        smtp.sc_set_ehlo_name(c, str { p: s_ehlo_p as *mut u8, n: s_ehlo_n })
+    }
+    loop.timer_after(l, 60000, t_timeout, 0)
+    loop.run(l)
+    return 0
+}
+
+// =================================================================== IMAP
+
+fn enc_name(s: str) -> str {
+    let t: *mut rt.Buf = tmpbuf2()
+    rt.buf_clear(t)
+    if !imap.imap_utf7_encode(s, t) {
+        return s
+    }
+    return bs(t)
+}
+
+fn set_cmd(s: str) {
+    g_cmd_p = s.p as u64
+    g_cmd_n = s.n
+}
+
+fn cmd_name() -> str { return str { p: g_cmd_p as *mut u8, n: g_cmd_n } }
+
+// starts one script command; true = it is in flight (an IME_DONE will follow)
+fn exec(c: *mut imap.Ic) -> bool {
+    let line: str = cur_line()
+    let cmd: str = field(line, 0)
+    set_cmd(cmd)
+    var ok: bool = false
+    if is(cmd, "login") {
+        ok = imap.ic_login(c, field(line, 1), field(line, 2))
+    } else if is(cmd, "loginplain") {
+        ok = imap.ic_login_plain(c, field(line, 1), field(line, 2))
+    } else if is(cmd, "list") {
+        ok = imap.ic_list(c, field(line, 1), enc_name(field(line, 2)), false)
+    } else if is(cmd, "lsub") {
+        ok = imap.ic_list(c, field(line, 1), enc_name(field(line, 2)), true)
+    } else if is(cmd, "select") {
+        ok = imap.ic_select(c, enc_name(field(line, 1)), false)
+    } else if is(cmd, "examine") {
+        ok = imap.ic_select(c, enc_name(field(line, 1)), true)
+    } else if is(cmd, "status") {
+        let it: str = field(line, 2)
+        g_status_p = it.p as u64
+        g_status_n = it.n
+        let t: *mut rt.Buf = tmpbuf()
+        rt.buf_clear(t)
+        put_into(t, "(")
+        put_into(t, it)
+        put_into(t, ")")
+        ok = imap.ic_status(c, enc_name(field(line, 1)), bs(t))
+    } else if is(cmd, "search") {
+        ok = imap.ic_search(c, field(line, 1), false)
+    } else if is(cmd, "usearch") {
+        ok = imap.ic_search(c, field(line, 1), true)
+    } else if is(cmd, "store") {
+        ok = imap.ic_store(c, field(line, 1), field(line, 2), field(line, 3), false)
+    } else if is(cmd, "ustore") {
+        ok = imap.ic_store(c, field(line, 1), field(line, 2), field(line, 3), true)
+    } else if is(cmd, "copy") {
+        ok = imap.ic_copy(c, field(line, 1), enc_name(field(line, 2)), false)
+    } else if is(cmd, "ucopy") {
+        ok = imap.ic_copy(c, field(line, 1), enc_name(field(line, 2)), true)
+    } else if is(cmd, "expunge") {
+        ok = imap.ic_expunge(c, "")
+    } else if is(cmd, "uexpunge") {
+        ok = imap.ic_expunge(c, field(line, 1))
+    } else if is(cmd, "noop") {
+        ok = imap.ic_noop(c)
+    } else if is(cmd, "close") {
+        ok = imap.ic_close(c)
+    } else if is(cmd, "idle") {
+        g_idle = true
+        g_idle_done = false
+        ok = imap.ic_idle(c)
+    } else if is(cmd, "fetch") {
+        ok = imap.ic_fetch(c, field(line, 1), field(line, 2), is(field(line, 3), "uid"))
+    } else if is(cmd, "raw") {
+        ok = imap.ic_raw(c, field(line, 1))
+    } else if is(cmd, "caps") {
+        put("CAPS ")
+        put_u(imap.imap_caps(imap.ic_core(c)) as u64)
+        put(" ")
+        put(imap.imap_caps_text(imap.ic_core(c)))
+        flush()
+        return false
+    } else if is(cmd, "logout") {
+        g_ended = true
+        ok = imap.ic_logout(c)
+    } else if is(cmd, "dump") {
+        rt.buf_clear(planbuf())
+        g_dump_phase = 1
+        ok = imap.ic_fetch(c, "1:*", "(UID FLAGS RFC822.SIZE ENVELOPE BODYSTRUCTURE BODY.PEEK[] BODY.PEEK[HEADER] BODY.PEEK[TEXT])", false)
+        if !ok {
+            g_dump_phase = 0
+        }
+    } else {
+        put("UNKNOWN ")
+        put(cmd)
+        flush()
+        return false
+    }
+    if !ok {
+        put("ERR ")
+        put(cmd)
+        put(" err=")
+        put_u(imap.ic_err(c) as u64)
+        flush()
+        return false
+    }
+    return true
+}
+
+fn put_into(b: *mut rt.Buf, s: str) { rt.buf_push_bytes(b, s.p as u64, s.n) }
+
+fn run_script(c: *mut imap.Ic) {
+    while script_next() {
+        if exec(c) {
+            return
+        }
+    }
+    if g_ended {
+        return
+    }
+    g_ended = true
+    set_cmd("logout")
+    imap.ic_logout(c)
+}
+
+// ---------------------------------------------------------------- dump
+
+fn dump_phase1(c: *mut imap.Ic) {
+    let core: *mut imap.Imap = imap.ic_core(c)
+    let n: usize = imap.imap_fetch_count(core)
+    var i: usize = 0
+    while i < n {
+        let seq: u64 = imap.imap_fetch_seq(core, i)
+        put("M ")
+        put_u(seq)
+        put(" ")
+        put_u(imap.imap_fetch_uid(core, i))
+        put(" ")
+        put_flags(imap.imap_fetch_flags(core, i))
+        put(" ")
+        put_u(imap.imap_fetch_size(core, i))
+        flush()
+        put("E ")
+        put_u(seq)
+        var k: usize = 0
+        while k < 10 {
+            put(" ")
+            let f: usize = imap.imap_env_field(core, i, k)
+            if k >= 2 && k <= 7 {
+                put_addr_node(core, f)
+            } else {
+                put_hex_node(core, f)
+            }
+            k += 1
+        }
+        flush()
+        // the plan line for phase 2: "<seq> <section> <section> ..."
+        let plan: *mut rt.Buf = planbuf()
+        rt.buf_push_dec_u64(plan, seq)
+        let np: usize = imap.imap_bs_build(core, i, "BODYSTRUCTURE")
+        var p: usize = 0
+        while p < np {
+            var pb: rt.Buf = rt.buf_new()
+            imap.imap_bs_path(core, p, &pb)
+            put("P ")
+            put_u(seq)
+            put(" ")
+            put_u(p as u64)
+            put(" ")
+            if rt.buf_len(&pb) == 0 {
+                put(".")
+            } else {
+                put(bs(&pb))
+            }
+            if imap.imap_bs_multi(core, p) {
+                put(" multipart ")
+                put_text_node_lower(core, imap.imap_bs_subtype(core, p))
+                put(" - 0 - - ")
+                let d: usize = imap.imap_bs_disposition(core, p)
+                if d != imap.NONE && imap.imap_node_kind(core, d) == imap.NK_LIST {
+                    put_hex_node_lower(core, imap.imap_node_child(core, d))
+                } else {
+                    put("-")
+                }
+                put(" ")
+                put_hex_node(core, imap.imap_bs_param(core, p, "BOUNDARY"))
+            } else {
+                put(" ")
+                put_text_node_lower(core, imap.imap_bs_type(core, p))
+                put(" ")
+                put_text_node_lower(core, imap.imap_bs_subtype(core, p))
+                put(" ")
+                put_text_node_lower(core, imap.imap_bs_encoding(core, p))
+                put(" ")
+                put_u(imap.imap_bs_size(core, p))
+                put(" ")
+                put_hex_node(core, imap.imap_bs_filename(core, p))
+                put(" ")
+                put_hex_node(core, imap.imap_bs_id(core, p))
+                put(" ")
+                let d: usize = imap.imap_bs_disposition(core, p)
+                if d != imap.NONE && imap.imap_node_kind(core, d) == imap.NK_LIST {
+                    put_hex_node_lower(core, imap.imap_node_child(core, d))
+                } else {
+                    put("-")
+                }
+                put(" ")
+                put_hex_node(core, imap.imap_bs_param(core, p, "CHARSET"))
+                // sections to fetch in phase 2
+                rt.buf_push(plan, 32)
+                rt.buf_push_bytes(plan, rt.buf_ptr(&pb), rt.buf_len(&pb))
+                if imap.imap_node_is(core, imap.imap_bs_type(core, p), "MESSAGE") && imap.imap_node_is(core, imap.imap_bs_subtype(core, p), "RFC822") {
+                    rt.buf_push(plan, 32)
+                    rt.buf_push_bytes(plan, rt.buf_ptr(&pb), rt.buf_len(&pb))
+                    put_into(plan, ".HEADER ")
+                    rt.buf_push_bytes(plan, rt.buf_ptr(&pb), rt.buf_len(&pb))
+                    put_into(plan, ".TEXT")
+                }
+            }
+            flush()
+            rt.buf_free(&pb)
+            p += 1
+        }
+        rt.buf_push(plan, 10)
+        // the three whole-message sections
+        var s: u32 = 0
+        while s < 3 {
+            var name: str = ""
+            var sec: str = ""
+            if s == 0 {
+                name = "FULL"
+            } else if s == 1 {
+                name = "HEADER"
+                sec = "HEADER"
+            } else {
+                name = "TEXT"
+                sec = "TEXT"
+            }
+            let t: *mut rt.Buf = tmpbuf()
+            rt.buf_clear(t)
+            put("S ")
+            put_u(seq)
+            put(" ")
+            put(name)
+            if imap.imap_fetch_body(core, i, sec, t) {
+                put(" ")
+                put_u(rt.buf_len(t) as u64)
+                put(" ")
+                put_sha1(rt.buf_data(t), rt.buf_len(t))
+            } else {
+                put(" - -")
+            }
+            flush()
+            s += 1
+        }
+        i += 1
+    }
+}
+
+// next plan line -> fetch its sections; at the end the dump is over
+fn dump_next(c: *mut imap.Ic) {
+    let plan: *mut rt.Buf = planbuf()
+    let total: usize = rt.buf_len(plan)
+    if g_dump_at >= total {
+        g_dump_phase = 0
+        put("DUMPEND")
+        flush()
+        set_cmd("dump")
+        put("DONE dump 0")
+        flush()
+        run_script(c)
+        return
+    }
+    let base: *mut u8 = rt.buf_data(plan)
+    var e: usize = g_dump_at
+    while e < total && *(base + e) != 10 as u8 {
+        e += 1
+    }
+    g_dump_end = e
+    let line: str = str { p: base + g_dump_at, n: e - g_dump_at }
+    // first token = seq
+    var sp: usize = 0
+    while sp < line.n && rfc822.at(line, sp) != 32 {
+        sp += 1
+    }
+    let seqs: str = rfc822.view(line, 0, sp)
+    g_dump_seq = parse_dec(seqs)
+    let items: *mut rt.Buf = tmpbuf()
+    rt.buf_clear(items)
+    put_into(items, "(")
+    var first: bool = true
+    var i: usize = sp
+    while i < line.n {
+        while i < line.n && rfc822.at(line, i) == 32 {
+            i += 1
+        }
+        var j: usize = i
+        while j < line.n && rfc822.at(line, j) != 32 {
+            j += 1
+        }
+        if j > i {
+            if !first {
+                rt.buf_push(items, 32)
+            }
+            first = false
+            put_into(items, "BODY.PEEK[")
+            put_into(items, rfc822.view(line, i, j))
+            put_into(items, "]")
+        }
+        i = j
+    }
+    put_into(items, ")")
+    g_dump_phase = 2
+    if !imap.ic_fetch(c, seqs, bs(items), false) {
+        put("ERR dump err=")
+        put_u(imap.ic_err(c) as u64)
+        flush()
+        g_dump_phase = 0
+        run_script(c)
+    }
+}
+
+fn dump_phase2(c: *mut imap.Ic) {
+    let core: *mut imap.Imap = imap.ic_core(c)
+    let plan: *mut rt.Buf = planbuf()
+    let base: *mut u8 = rt.buf_data(plan)
+    let line: str = str { p: base + g_dump_at, n: g_dump_end - g_dump_at }
+    // the fetch record with our seq
+    var rec: usize = 0
+    var have: bool = false
+    var r: usize = 0
+    while r < imap.imap_fetch_count(core) {
+        if imap.imap_fetch_seq(core, r) == g_dump_seq {
+            rec = r
+            have = true
+        }
+        r += 1
+    }
+    var sp: usize = 0
+    while sp < line.n && rfc822.at(line, sp) != 32 {
+        sp += 1
+    }
+    var i: usize = sp
+    while i < line.n {
+        while i < line.n && rfc822.at(line, i) == 32 {
+            i += 1
+        }
+        var j: usize = i
+        while j < line.n && rfc822.at(line, j) != 32 {
+            j += 1
+        }
+        if j > i {
+            let sec: str = rfc822.view(line, i, j)
+            let t: *mut rt.Buf = tmpbuf()
+            rt.buf_clear(t)
+            put("S ")
+            put_u(g_dump_seq)
+            put(" ")
+            put(sec)
+            if have && imap.imap_fetch_body(core, rec, sec, t) {
+                put(" ")
+                put_u(rt.buf_len(t) as u64)
+                put(" ")
+                put_sha1(rt.buf_data(t), rt.buf_len(t))
+            } else {
+                put(" - -")
+            }
+            flush()
+        }
+        i = j
+    }
+    g_dump_at = g_dump_end + 1
+    dump_next(c)
+}
+
+// ---------------------------------------------------------------- events
+
+fn print_done(c: *mut imap.Ic, res: i64) {
+    let core: *mut imap.Imap = imap.ic_core(c)
+    let kind: u32 = imap.imap_last_kind(core)
+    put("DONE ")
+    put(cmd_name())
+    put(" ")
+    put_u(res as u64)
+    put(" ")
+    put(imap.imap_last_code(core))
+    flush()
+    if kind == imap.CK_LIST {
+        let n: usize = imap.imap_list_count(core)
+        var i: usize = 0
+        while i < n {
+            put("LIST attrs=")
+            let a: usize = imap.imap_list_attrs(core, i)
+            var x: usize = imap.imap_node_child(core, a)
+            var any: bool = false
+            while x != imap.NONE {
+                if any { put(",") }
+                let t: *mut rt.Buf = tmpbuf()
+                rt.buf_clear(t)
+                imap.imap_node_text(core, x, t)
+                put(bs(t))
+                any = true
+                x = imap.imap_node_next(core, x)
+            }
+            if !any { put("-") }
+            put(" delim=")
+            put_hex_node(core, imap.imap_list_delim(core, i))
+            put(" name=")
+            let t2: *mut rt.Buf = tmpbuf()
+            rt.buf_clear(t2)
+            imap.imap_node_text(core, imap.imap_list_name(core, i), t2)
+            var dec: rt.Buf = rt.buf_new()
+            if imap.imap_utf7_decode(bs(t2), &dec) {
+                put_hex_str(bs(&dec))
+            } else {
+                put("BAD")
+            }
+            rt.buf_free(&dec)
+            flush()
+            i += 1
+        }
+    } else if kind == imap.CK_SELECT {
+        put("SEL exists=")
+        put_u(imap.imap_exists(core))
+        put(" recent=")
+        put_u(imap.imap_recent(core))
+        put(" uidvalidity=")
+        put_u(imap.imap_uidvalidity(core))
+        put(" uidnext=")
+        put_u(imap.imap_uidnext(core))
+        put(" unseen=")
+        put_u(imap.imap_unseen(core))
+        put(" ro=")
+        if imap.imap_read_only(core) {
+            put("1")
+        } else {
+            put("0")
+        }
+        flush()
+    } else if kind == imap.CK_STATUS {
+        put("STATUS")
+        let items: str = str { p: g_status_p as *mut u8, n: g_status_n }
+        var i: usize = 0
+        while i < items.n {
+            while i < items.n && rfc822.at(items, i) == 32 {
+                i += 1
+            }
+            var j: usize = i
+            while j < items.n && rfc822.at(items, j) != 32 {
+                j += 1
+            }
+            if j > i {
+                let nm: str = rfc822.view(items, i, j)
+                put(" ")
+                put(nm)
+                put("=")
+                put_u(imap.imap_status_get(core, nm))
+            }
+            i = j
+        }
+        flush()
+    } else if kind == imap.CK_SEARCH {
+        put("SEARCH")
+        let n: usize = imap.imap_search_count(core)
+        var i: usize = 0
+        while i < n {
+            put(" ")
+            put_u(imap.imap_search_at(core, i))
+            i += 1
+        }
+        flush()
+    } else if kind == imap.CK_STORE || (kind == imap.CK_FETCH && g_dump_phase == 0) {
+        let n: usize = imap.imap_fetch_count(core)
+        var i: usize = 0
+        while i < n {
+            put("F ")
+            put_u(imap.imap_fetch_seq(core, i))
+            put(" ")
+            put_u(imap.imap_fetch_uid(core, i))
+            put(" ")
+            put_flags(imap.imap_fetch_flags(core, i))
+            put(" ")
+            put_u(imap.imap_fetch_size(core, i))
+            flush()
+            i += 1
+        }
+    } else if kind == imap.CK_EXPUNGE || kind == imap.CK_IDLE {
+        put("EXISTS ")
+        put_u(imap.imap_exists(core))
+        flush()
+    }
+}
+
+fn imap_cb(c: *mut imap.Ic, ud: u64, kind: u32, arg: i64) {
+    if kind == imap.IME_READY {
+        put("READY pre=")
+        put_u(arg as u64)
+        put(" caps=")
+        put_u(imap.imap_caps(imap.ic_core(c)) as u64)
+        flush()
+        run_script(c)
+    } else if kind == imap.IME_DONE {
+        if g_dump_phase == 1 {
+            dump_phase1(c)
+            g_dump_at = 0
+            dump_next(c)
+            return
+        }
+        if g_dump_phase == 2 {
+            dump_phase2(c)
+            return
+        }
+        print_done(c, arg)
+        g_idle = false
+        run_script(c)
+    } else if kind == imap.IME_IDLE {
+        put("IDLING")
+        flush()
+    } else if kind == imap.IME_PUSH {
+        put("PUSH exists=")
+        put_u(imap.imap_exists(imap.ic_core(c)))
+        flush()
+        if g_idle && !g_idle_done {
+            g_idle_done = true
+            imap.ic_idle_done(c)
+        }
+    } else if kind == imap.IME_BYE {
+        put("BYE")
+        flush()
+    } else if kind == imap.IME_CLOSED {
+        put("CLOSED reason=")
+        put_u(arg as u64)
+        put(" err=")
+        put_u(imap.ic_err(c) as u64)
+        put(" state=")
+        put_u(imap.imap_state(imap.ic_core(c)) as u64)
+        flush()
+        loop.stop(g_loop as *mut loop.Loop)
+    }
+}
+
+fn run_imap(l: *mut loop.Loop, port: u16, mode: str, tlsmode: str, host: str, store: *mut x509.Store) -> i32 {
+    var m: u32 = imap.IM_PLAIN
+    if is(mode, "starttls") {
+        m = imap.IM_STARTTLS
+    } else if is(mode, "tls") {
+        m = imap.IM_TLS
+    }
+    let c: *mut imap.Ic = imap.ic_open(l, net.ADDR_LOCAL, port, m, host, store, now_s(), 20000, imap_cb, 0)
+    if c as u64 == 0 {
+        put("OPENFAIL")
+        flush()
+        return 1
+    }
+    var pol: u32 = 1
+    if is(tlsmode, "never") {
+        pol = 0
+    } else if is(tlsmode, "require") {
+        pol = 2
+    }
+    if m != imap.IM_TLS {
+        imap.ic_set_tls_mode(c, pol)
+    }
+    if is(tlsmode, "insecure") {
+        imap.ic_set_insecure_auth(c, true)
+    }
+    loop.timer_after(l, 60000, t_timeout, 0)
+    loop.run(l)
+    return 0
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 8 {
+        rt.write_everything(2, "usage: e2e_main smtp|imap <port> <mode> <tls> <ca.pem> <host> <script>\n".p as u64, 71)
+        return 2
+    }
+    let proto: str = arg_str(start, 1)
+    let port: u16 = parse_dec(arg_str(start, 2)) as u16
+    let mode: str = arg_str(start, 3)
+    let tlsmode: str = arg_str(start, 4)
+    let host: str = arg_str(start, 6)
+    var sbuf: rt.Buf = rt.buf_new()
+    var lbuf: rt.Buf = rt.buf_new()
+    var tbuf: rt.Buf = rt.buf_new()
+    var tbuf2: rt.Buf = rt.buf_new()
+    var pbuf: rt.Buf = rt.buf_new()
+    g_script = (&sbuf) as u64
+    g_line = (&lbuf) as u64
+    g_tmp = (&tbuf) as u64
+    g_tmp2 = (&tbuf2) as u64
+    g_plan = (&pbuf) as u64
+    fs.read_file(arg_str(start, 7), &sbuf) catch 0
+    var pem: rt.Buf = rt.buf_new()
+    fs.read_file(arg_str(start, 5), &pem) catch 0
+    var store: x509.Store = x509.store_new()
+    if x509.store_load_pem(&store, rt.buf_ptr(&pem), rt.buf_len(&pem)) == 0 {
+        put("CAFAIL")
+        flush()
+        return 3
+    }
+    var l: loop.Loop = loop.loop_new()
+    if !loop.loop_init(&l) {
+        return 4
+    }
+    g_loop = (&l) as u64
+    var rc: i32 = 0
+    if is(proto, "smtp") {
+        rc = run_smtp(&l, port, mode, tlsmode, host, &store)
+    } else {
+        rc = run_imap(&l, port, mode, tlsmode, host, &store)
+    }
+    return rc
+}
