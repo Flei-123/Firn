@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_android/jshell.fi -- shared state and helpers of the JARVIS Android app.
+//
+// THE SCREEN CONTRACT (for the screens other chats fill in, roadmap A5):
+//   file     examples/jarvis_android/screen_<name>.fi   (names: chat, leitstand, tasks, devices, settings)
+//   build    fn screen_<name>_build(a: *mut app.App)    called ONCE with the page's column open: add widgets with app.*
+//   refresh  fn screen_<name>_refresh(a: *mut app.App)  called when the tab is shown and every 2 s while it stays visible
+//   shared   jshell.jc() is the JARVIS client (net.jarvisc), jshell.app_ui() the window, jshell.settings() the saved settings.
+// A window has 128 nodes and 8 text fields in total (fui.app limits); the shell uses 5 text fields.
+import std.rt
+import async.loop
+import net.jarvisc
+import fui.app
+import fui.scene
+import fui.flex
+import appkit.update
+import appkit.config
+import window.window
+
+export {
+    set_app, app_ui, set_jc, jc, set_loop, loop_of, set_win, win, set_updater, updater, settings, settings_save,
+    dec, fill, fill_stretch, set_shown, status_line, set_status, cfg_get, cfg_set, theme_mode, set_theme_mode, apply_theme,
+    request_logout, take_logout, SERVICE, DEFAULT_BASE, SCREEN_PAD, TAB_CHAT, TAB_LEITSTAND, TAB_TASKS, TAB_DEVICES, TAB_SETTINGS, TAB_COUNT,
+}
+
+const SERVICE: str = "jarvis-android"
+const DEFAULT_BASE: str = "https://jarvis.fleitec.com"
+const SCREEN_PAD: i64 = 8
+const TAB_CHAT: usize = 0
+const TAB_LEITSTAND: usize = 1
+const TAB_TASKS: usize = 2
+const TAB_DEVICES: usize = 3
+const TAB_SETTINGS: usize = 4
+const TAB_COUNT: usize = 5
+
+static mut G_APP: u64 = 0
+static mut G_JC: u64 = 0
+static mut G_LOOP: u64 = 0
+static mut G_WIN: u64 = 0
+static mut G_UPD: u64 = 0
+static mut G_STATUS: usize = 0
+
+fn set_app(a: *mut app.App) { G_APP = a as u64 }
+fn app_ui() -> *mut app.App { return G_APP as *mut app.App }
+fn set_jc(c: *mut jarvisc.Jc) { G_JC = c as u64 }
+fn jc() -> *mut jarvisc.Jc { return G_JC as *mut jarvisc.Jc }
+fn set_loop(l: *mut loop.Loop) { G_LOOP = l as u64 }
+fn loop_of() -> *mut loop.Loop { return G_LOOP as *mut loop.Loop }
+fn set_win(w: u64) { G_WIN = w }
+fn win() -> *mut window.Window { return G_WIN as *mut window.Window }
+fn set_updater(u: *mut update.Updater) { G_UPD = u as u64 }
+fn updater() -> *mut update.Updater { return G_UPD as *mut update.Updater }
+fn settings() -> *mut config.Config { return update.update_settings(updater()) }
+fn settings_save() { let ok: bool = update.update_save_settings(updater()) }
+
+// the one-line status under the header (connection, thinking, tool name)
+fn status_line(id: usize) { G_STATUS = id }
+fn set_status(s: str) {
+    if G_STATUS != app.NONE {
+        app.set_text(app_ui(), G_STATUS, s)
+    }
+}
+
+fn dec(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    let s: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+// a node fills the room of its container (width: stretch, height: grow)
+fn fill(a: *mut app.App, n: usize) {
+    if n == app.NONE { return }
+    let sc: *mut scene.Scene = app.app_scene(a)
+    scene.node_set_align_self(sc, n, flex.AL_STRETCH)
+    scene.node_set_grow(sc, n, 1, 1)
+}
+
+// a node is as wide as its container, as high as it needs
+fn fill_stretch(a: *mut app.App, n: usize) {
+    if n == app.NONE { return }
+    scene.node_set_align_self(app.app_scene(a), n, flex.AL_STRETCH)
+}
+
+fn cfg_get(key: str, dflt: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    let ok: bool = config.get_str(settings(), key, dflt, &b)
+    let s: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+fn cfg_set(key: str, v: str) {
+    let ok: bool = config.set_str(settings(), key, v)
+    settings_save()
+}
+
+// "system" | "dark" | "light"
+fn theme_mode() -> str { return cfg_get("ui.theme", "system") }
+fn set_theme_mode(m: str) {
+    cfg_set("ui.theme", m)
+    apply_theme()
+}
+
+// the system switch is what the window reports (window.dark); a manual choice wins over it
+fn apply_theme() {
+    let m: str = theme_mode()
+    if m == "dark" {
+        app.set_dark(app_ui(), true)
+    } else if m == "light" {
+        app.set_dark(app_ui(), false)
+    } else if G_WIN != 0 && window.theme_known(win()) {
+        app.set_dark(app_ui(), window.dark(win()))
+    }
+}
+
+// ---- sign-out request: the settings tab sets it, main.fi's tick acts on it (it owns the pages)
+static mut G_LOGOUT: bool = false
+fn request_logout() { G_LOGOUT = true }
+fn take_logout() -> bool {
+    let r: bool = G_LOGOUT
+    G_LOGOUT = false
+    return r
+}
+
+// Show or remove a node. fUi's `hidden` is CSS visibility (the node still takes room), so a removed node also gets a main
+// size limit of 1 px and no growth; shown again it grows like `fill` (grow 1) or not (grow 0).
+fn set_shown(a: *mut app.App, n: usize, shown: bool, grow: i64) {
+    if n == app.NONE { return }
+    let sc: *mut scene.Scene = app.app_scene(a)
+    scene.node_set_hidden(sc, n, !shown)
+    if shown {
+        scene.node_set_flexitem(sc, n, grow, grow, 0, 0)
+    } else {
+        scene.node_set_flexitem(sc, n, 0, 0, 0, 1)
+    }
+}

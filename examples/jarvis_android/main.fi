@@ -1,0 +1,293 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_android/main.fi -- the JARVIS Android app shell (Firn + fUi, native, no WebView).
+//
+//     jarvis_android [base-url]       (default https://jarvis.fleitec.com; on Android args.txt = argv)
+//
+// Login page (server, user, password; the session token is kept with std.secret, the next start signs in by itself) and,
+// after it, five tabs: Chat · Leitstand · Tasks · Devices · Settings. Chat and Settings are here; the other three are
+// placeholder pages (screen_<name>.fi, contract in jshell.fi) that roadmap A5 fills. Network and window run in ONE thread
+// (fui.looppump); the Orient store update (appkit, test channel) is polled from the same 1 s timer.
+// A later "Sign in with Fleitec-ID" plugs into login_submit(LOGIN_FID): appkit/fleitec_login.fi (fid_login/fid_save).
+import std.rt
+import async.loop
+import net.jarvisc
+import fui.app
+import fui.looppump
+import fui.scene
+import fui.editor
+import appkit.appinfo
+import appkit.platform
+import appkit.update
+import appkit.log
+import appkit.crash
+import appkit.util
+import window.window
+import appspec
+import jshell
+import screen_chat
+import screen_leitstand
+import screen_tasks
+import screen_devices
+import screen_settings
+
+const LOGIN_PASSWORD: u32 = 0
+const LOGIN_FID: u32 = 1
+
+static mut G_LOGIN: usize = 0
+static mut G_MAIN: usize = 0
+static mut G_P0: usize = 0
+static mut G_P1: usize = 0
+static mut G_P2: usize = 0
+static mut G_P3: usize = 0
+static mut G_P4: usize = 0
+static mut G_SERVER: usize = 0
+static mut G_USER: usize = 0
+static mut G_PASS: usize = 0
+static mut G_LSTATUS: usize = 0
+static mut G_TAB: usize = 0
+static mut G_TICKS: u64 = 0
+static mut G_LOGGED_IN: bool = false
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    return update.thread_dispatch(kind, arg)
+}
+
+fn page_node(i: usize) -> usize {
+    if i == 0 { return G_P0 }
+    if i == 1 { return G_P1 }
+    if i == 2 { return G_P2 }
+    if i == 3 { return G_P3 }
+    return G_P4
+}
+
+fn refresh_tab(a: *mut app.App, i: usize) {
+    if i == jshell.TAB_CHAT { screen_chat.screen_chat_refresh(a) }
+    else if i == jshell.TAB_LEITSTAND { screen_leitstand.screen_leitstand_refresh(a) }
+    else if i == jshell.TAB_TASKS { screen_tasks.screen_tasks_refresh(a) }
+    else if i == jshell.TAB_DEVICES { screen_devices.screen_devices_refresh(a) }
+    else { screen_settings.screen_settings_refresh(a) }
+}
+
+fn show_tab(a: *mut app.App, i: usize) {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    var k: usize = 0
+    while k < jshell.TAB_COUNT {
+        var grow: i64 = 0
+        if k == jshell.TAB_CHAT { grow = 1 }
+        jshell.set_shown(a, page_node(k), k == i, grow)
+        k = k + 1
+    }
+    G_TAB = i
+    refresh_tab(a, i)
+}
+
+fn tab0(a: *mut app.App) { show_tab(a, 0) }
+fn tab1(a: *mut app.App) { show_tab(a, 1) }
+fn tab2(a: *mut app.App) { show_tab(a, 2) }
+fn tab3(a: *mut app.App) { show_tab(a, 3) }
+fn tab4(a: *mut app.App) { show_tab(a, 4) }
+
+fn show_login(a: *mut app.App, on: bool) {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    jshell.set_shown(a, G_LOGIN, on, 0)
+    jshell.set_shown(a, G_MAIN, !on, 1)
+    G_LOGGED_IN = !on
+}
+
+fn lstatus(s: str) { app.set_text(jshell.app_ui(), G_LSTATUS, s) }
+
+fn login_submit(kind: u32) {
+    let a: *mut app.App = jshell.app_ui()
+    if kind == LOGIN_FID {
+        lstatus("Fleitec-ID sign-in is not available yet")
+        return
+    }
+    let base: str = __str_copy(app.text(a, G_SERVER))
+    let user: str = __str_copy(app.text(a, G_USER))
+    let pw: str = __str_copy(app.text(a, G_PASS))
+    if base.n == 0 || user.n == 0 || pw.n == 0 {
+        lstatus("server, user and password please")
+        return
+    }
+    jarvisc.jc_set_base(jshell.jc(), base)
+    jshell.cfg_set("server.url", base)
+    lstatus("signing in ...")
+    let ok: bool = jarvisc.jc_login(jshell.jc(), user, pw)
+}
+
+fn on_login(a: *mut app.App) { login_submit(LOGIN_PASSWORD) }
+
+fn logout() {
+    let a: *mut app.App = jshell.app_ui()
+    jarvisc.jc_forget(jshell.jc(), jshell.SERVICE)
+    jarvisc.jc_disconnect(jshell.jc())
+    screen_chat.chat_clear()
+    app.set_text(a, G_PASS, "")
+    show_login(a, true)
+    lstatus("signed out")
+}
+
+// ---- JARVIS events: sign-in first, everything else belongs to the chat tab
+fn on_event(c: *mut jarvisc.Jc, ud: u64, kind: u32, arg: i64) {
+    let a: *mut app.App = jshell.app_ui()
+    if kind == jarvisc.JE_LOGIN {
+        if arg == 200 {
+            let saved: bool = jarvisc.jc_save(c, jshell.SERVICE)
+            app.set_text(a, G_PASS, "")
+            show_login(a, false)
+            show_tab(a, 0)
+            jshell.set_status("connecting ...")
+            let ok: bool = jarvisc.jc_connect(c)
+        } else if arg == 0 {
+            lstatus("no connection to the server")
+        } else {
+            lstatus("sign-in failed (" + jshell.dec(arg) + ")")
+        }
+        return
+    }
+    if kind == jarvisc.JE_HTTP_ERR && arg == 401 {
+        jarvisc.jc_forget(c, jshell.SERVICE)
+        show_login(a, true)
+        lstatus("session expired - sign in again")
+        return
+    }
+    screen_chat.screen_chat_event(c, kind, arg)
+}
+
+fn on_key(a: *mut app.App, key: u32, mods: u32) -> bool {
+    if key != editor.KEY_ENTER { return false }
+    if !G_LOGGED_IN {
+        login_submit(LOGIN_PASSWORD)
+        return true
+    }
+    if G_TAB == jshell.TAB_CHAT {
+        return screen_chat.screen_chat_enter(a)
+    }
+    return false
+}
+
+fn opened(ud: u64, w: u64) {
+    jshell.set_win(w)
+    jshell.apply_theme()
+}
+
+fn tick(l: *mut loop.Loop, ud: u64) {
+    let a: *mut app.App = jshell.app_ui()
+    G_TICKS = G_TICKS + 1 as u64
+    let p: bool = update.update_poll(jshell.updater())
+    if G_TICKS == 2 as u64 { jshell.apply_theme() }     // after the window applied the system's choice
+    if jshell.take_logout() { logout() }
+    if G_LOGGED_IN && G_TICKS % 2 as u64 == 0 as u64 { refresh_tab(a, G_TAB) }
+    if G_TICKS == 3 as u64 && update.update_auto_due(jshell.updater()) {
+        let ok: bool = update.update_start(jshell.updater(), update.OP_CHECK, update.RUN_AUTO)
+    }
+    if G_TICKS == 6 as u64 { update.update_mark_healthy(jshell.updater()) }
+}
+
+fn build_ui(a: *mut app.App) {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    // login page
+    G_LOGIN = app.column(a)
+    let t0: usize = app.label(a, "JARVIS", 22)
+    G_SERVER = app.entry(a, "Server")
+    app.set_width(a, G_SERVER, 300)
+    G_USER = app.entry(a, "User")
+    app.set_width(a, G_USER, 300)
+    G_PASS = app.entry(a, "Password")
+    app.set_width(a, G_PASS, 300)
+    app.set_secret(a, G_PASS, true)
+    app.button(a, "Sign in", on_login)
+    G_LSTATUS = app.label(a, "", 12)
+    app.end(a)
+    // main page: header, five tab pages, tab bar
+    G_MAIN = app.column(a)
+    jshell.fill(a, G_MAIN)
+    let h: usize = app.label(a, "JARVIS", 15)
+    let st: usize = app.label(a, "", 11)
+    jshell.status_line(st)
+    G_P0 = app.column(a)
+    jshell.fill(a, G_P0)
+    screen_chat.screen_chat_build(a)
+    app.end(a)
+    G_P1 = app.column(a)
+    screen_leitstand.screen_leitstand_build(a)
+    app.end(a)
+    G_P2 = app.column(a)
+    screen_tasks.screen_tasks_build(a)
+    app.end(a)
+    G_P3 = app.column(a)
+    screen_devices.screen_devices_build(a)
+    app.end(a)
+    G_P4 = app.column(a)
+    screen_settings.screen_settings_build(a)
+    app.end(a)
+    let bar: usize = app.row(a)
+    scene.node_set_gap(sc, bar, 4, 4)
+    app.button(a, "Chat", tab0)
+    app.button(a, "Board", tab1)
+    app.button(a, "Tasks", tab2)
+    app.button(a, "Dev", tab3)
+    app.button(a, "Prefs", tab4)
+    app.end(a)
+    app.end(a)
+    show_login(a, true)
+    var k: usize = 1
+    while k < jshell.TAB_COUNT {
+        jshell.set_shown(a, page_node(k), false, 0)
+        k = k + 1
+    }
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    platform.plat_init(start)
+    if !appinfo.appinfo_init(appspec.spec()) { return 2 }
+    let u: *mut update.Updater = update.update_new()
+    if !update.update_init(u) { return 2 }
+    update.update_boot(u)
+    jshell.set_updater(u)
+    var logdir: rt.Buf = rt.buf_new()
+    platform.plat_dir(platform.DIR_LOG, appinfo.app_id(), appinfo.app_vendor(), &logdir)
+    log.log_open(util.buf_to_str_copy(&logdir), "app", log.LOG_INFO, 524288, 3)
+    rt.buf_free(&logdir)
+    log.log_info("main", "start " + appinfo.app_name() + " " + appinfo.app_version())
+    crash.crash_begin()
+
+    var base: str = jshell.cfg_get("server.url", jshell.DEFAULT_BASE)
+    if rt.arg_count(start) >= 2 {
+        let bp: u64 = rt.arg_ptr(start, 1)
+        base = str { p: bp as *mut u8, n: rt.c_length(bp) }
+    }
+    var l: loop.Loop = loop.loop_new()
+    if !loop.loop_init(&l) { return 2 }
+    jshell.set_loop(&l)
+    let a: *mut app.App = app.window("JARVIS", 360, 640)
+    jshell.set_app(a)
+    let r: usize = app.root(a)
+    scene.node_set_gap(app.app_scene(a), r, 6, 6)
+    scene.node_set_padding(app.app_scene(a), r, 8, 8, 8, 8)
+    build_ui(a)
+    app.set_text(a, G_SERVER, base)
+    app.on_key(a, on_key)
+    app.set_window_hooks(a, 0, opened, hotkey_none)
+    looppump.attach(a, &l)
+    let c: *mut jarvisc.Jc = jarvisc.jc_new(&l, on_event, 0)
+    jshell.set_jc(c)
+    jarvisc.jc_set_base(c, base)
+    jarvisc.jc_set_tz(c, "Europe/Vienna")
+    jarvisc.jc_set_dev(c, "firn-android")
+    if jarvisc.jc_restore(c, jshell.SERVICE) {
+        show_login(a, false)
+        show_tab(a, 0)
+        jshell.set_status("connecting ...")
+        let ok: bool = jarvisc.jc_connect(c)
+    }
+    let th: u64 = loop.timer_every(&l, 1000, tick, 0)
+    let rc: i32 = app.run(a)
+    crash.crash_end()
+    log.log_close()
+    return rc
+}
+
+fn hotkey_none(ud: u64, id: u32) {
+}

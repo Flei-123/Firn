@@ -1,0 +1,241 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_android/screen_chat.fi -- the chat tab: streaming markdown view, input line, new chat, copy, photo.
+//
+// Events come from net.jarvisc (token / done / tool / thinking / error / history); main.fi forwards them to
+// screen_chat_event. The view is fui.markdownview in a custom node: touch pan + fling scroll it, a tap follows a link, a long
+// press selects the word under the finger and shows the Copy button (mdv_copy -> system clipboard). The input line is a
+// fui.app entry: IME (Gboard), caret, selection and copy/paste come from fui.app / lib/android/inputmethod.fi.
+// OPEN (needs A1/A2 on main): conversation list (GET /api/m/conversations), upload of the picked photo.
+import std.rt
+import fui.app
+import fui.render
+import fui.scene
+import fui.widget
+import fui.style
+import fui.event
+import fui.markdownview
+import markdown.doc
+import net.jarvisc
+import window.window
+import jshell
+
+export {
+    screen_chat_build, screen_chat_refresh, screen_chat_event, screen_chat_enter, screen_chat_in_node, chat_clear,
+    chat_view_tick,
+}
+
+static mut G_MD: u64 = 0
+static mut G_NODE: usize = 0
+static mut G_IN: usize = 0
+static mut G_COPY: usize = 0
+static mut G_PHOTO: usize = 0
+static mut G_FOLLOW: bool = true
+static mut G_ANS_AT: usize = 0
+static mut G_HIST_ASKED: bool = false
+static mut G_BUSY: bool = false
+static mut G_PHOTO_N: usize = 0
+static mut G_CHAT: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_PHOTO_BUF: u64 = 0
+
+const PHOTO_CAP: usize = 262144
+
+fn mdv() -> *mut markdownview.MdView { return G_MD as *mut markdownview.MdView }
+
+fn chat_changed() {
+    markdownview.mdv_set_markdown(mdv(), str { p: G_CHAT.ptr as *mut u8, n: G_CHAT.len }, doc.opts_default())
+    G_FOLLOW = true
+}
+
+fn chat_add(s: str) {
+    rt.buf_push_bytes(&G_CHAT, s.p as u64, s.n)
+    chat_changed()
+}
+
+fn chat_clear() {
+    rt.buf_clear(&G_CHAT)
+    chat_changed()
+    G_HIST_ASKED = false
+}
+
+// the markdown view drew itself into the node's rectangle (set in the draw hook)
+fn draw_chat(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let a: *mut app.App = jshell.app_ui()
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let n: usize = scene.scene_node_of(sc, e)
+    let v: *mut markdownview.MdView = mdv()
+    markdownview.mdv_set_rect(v, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n), scene.node_h(sc, n))
+    markdownview.mdv_paint(v, c)
+    if G_FOLLOW {
+        G_FOLLOW = false
+        markdownview.mdv_set_offset(v, markdownview.mdv_content_height(v))
+        markdownview.mdv_paint(v, c)
+    }
+}
+
+fn clip_write(p: u64, n: usize) -> bool {
+    if jshell.win() as u64 == 0 { return false }
+    return window.clipboard_set(jshell.win(), "text/plain", p, n)
+}
+
+// true when the point (window coordinates) lies on the chat view
+fn screen_chat_in_node(x: f64, y: f64) -> bool {
+    let sc: *mut scene.Scene = app.app_scene(jshell.app_ui())
+    return x >= scene.node_x(sc, G_NODE) && x < scene.node_x(sc, G_NODE) + scene.node_w(sc, G_NODE)
+        && y >= scene.node_y(sc, G_NODE) && y < scene.node_y(sc, G_NODE) + scene.node_h(sc, G_NODE)
+}
+
+fn on_touch(ud: u64, e: *mut event.Ev) -> u32 {
+    let a: *mut app.App = ud as *mut app.App
+    let k: u32 = event.ev_kind(e)
+    let v: *mut markdownview.MdView = mdv()
+    if k == event.EV_PAN_MOVE {
+        markdownview.mdv_touch_pan(v, event.ev_dx(e), event.ev_dy(e))
+        return event.H_STOP
+    }
+    if k == event.EV_PAN_END && event.ev_fling(e) {
+        markdownview.mdv_touch_fling(v, event.ev_vx(e), event.ev_vy(e), event.ev_time(e))
+        return event.H_STOP
+    }
+    if k == event.EV_TAP {
+        let t: bool = markdownview.mdv_touch_tap(v, app.app_ctx(a), event.ev_x(e), event.ev_y(e))
+        sel_changed(a)
+        return event.H_STOP
+    }
+    if k == event.EV_LONG_PRESS {
+        let t: bool = markdownview.mdv_touch_long(v, app.app_ctx(a), event.ev_x(e), event.ev_y(e))
+        sel_changed(a)
+        return event.H_STOP
+    }
+    return event.H_GO
+}
+
+// the Copy button is visible while text is selected
+fn sel_changed(a: *mut app.App) {
+    jshell.set_shown(a, G_COPY, markdownview.mdv_has_selection(mdv()), 0)
+}
+
+fn on_copy(a: *mut app.App) {
+    let ok: bool = markdownview.mdv_copy(mdv())
+    markdownview.mdv_clear_selection(mdv())
+    sel_changed(a)
+    jshell.set_status("copied")
+}
+
+fn on_new(a: *mut app.App) {
+    jarvisc.jc_new_chat(jshell.jc())
+    chat_clear()
+    G_PHOTO_N = 0
+    app.set_text(a, G_PHOTO, "")
+    jshell.set_status("new chat")
+}
+
+fn on_attach(a: *mut app.App) {
+    if jshell.win() as u64 == 0 || !window.pick_image(jshell.win()) {
+        jshell.set_status("no photo picker on this system")
+    }
+}
+
+fn send_now(a: *mut app.App) {
+    let t: str = __str_copy(app.text(a, G_IN))
+    if t.n == 0 { return }
+    if G_PHOTO_N > 0 {
+        // the upload goes through lib/net/jarvisapi.fi (A1) and /api/m/* (A2); not on main yet -> say so, keep the text
+        jshell.set_status("photo upload needs jarvisapi (A1/A2) - not sent")
+        return
+    }
+    chat_add("**You:** " + t + "\n\n**JARVIS:** ")
+    G_ANS_AT = G_CHAT.len
+    G_BUSY = true
+    jarvisc.jc_send(jshell.jc(), t)
+    app.set_text(a, G_IN, "")
+    jshell.set_status("sent")
+}
+
+fn on_send(a: *mut app.App) { send_now(a) }
+
+// Enter in the input line sends
+fn screen_chat_enter(a: *mut app.App) -> bool {
+    if app.focus(a) != G_IN { return false }
+    send_now(a)
+    return true
+}
+
+fn screen_chat_build(a: *mut app.App) {
+    var md: markdownview.MdView = markdownview.mdv_new()
+    let box: u64 = rt.heap_alloc(8192)
+    G_MD = box
+    *(box as *mut markdownview.MdView) = md
+    markdownview.mdv_set_background(mdv(), style.TOK_BASE)
+    markdownview.mdv_set_clipboard(mdv(), clip_write)
+    G_PHOTO_BUF = rt.heap_alloc(PHOTO_CAP)
+    app.row(a)
+    app.button(a, "New chat", on_new)
+    G_COPY = app.button(a, "Copy", on_copy)
+    jshell.set_shown(a, G_COPY, false, 0)
+    app.end(a)
+    G_NODE = app.custom(a, widget.KIND_TILE, 340, 300)
+    jshell.fill(a, G_NODE)
+    scene.node_set_draw(app.app_scene(a), G_NODE, 0, draw_chat)
+    let b: bool = app.on(a, G_NODE, event.EV_PAN_ALL | event.ev_bit(event.EV_TAP) | event.ev_bit(event.EV_LONG_PRESS), on_touch)
+    G_PHOTO = app.label(a, "", 11)
+    app.row(a)
+    app.button(a, "+", on_attach)
+    G_IN = app.entry(a, "Message")
+    app.set_width(a, G_IN, 190)
+    app.button(a, "Send", on_send)
+    app.end(a)
+}
+
+// animation + a picked photo, polled from the 2 s tick and from the frame timer
+fn chat_view_tick(now_ms: i64) {
+    let t: bool = markdownview.mdv_tick(mdv(), now_ms)
+}
+
+fn screen_chat_refresh(a: *mut app.App) {
+    if jshell.win() as u64 == 0 { return }
+    let st: i32 = window.pick_poll(jshell.win())
+    if st == 2 {
+        var n: usize = 0
+        var w: usize = 0
+        var h: usize = 0
+        if window.pick_take(jshell.win(), G_PHOTO_BUF, PHOTO_CAP, &n, &w, &h) {
+            G_PHOTO_N = n
+            app.set_text(a, G_PHOTO, "photo " + jshell.dec(w as i64) + "x" + jshell.dec(h as i64) + ", " + jshell.dec((n / 1024) as i64) + " kB")
+        }
+    }
+    sel_changed(a)
+}
+
+// ---- events from net.jarvisc (history, streamed answer, tools)
+fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
+    if kind == jarvisc.JE_OPEN {
+        jshell.set_status("online")
+        if !G_HIST_ASKED && jarvisc.jc_cid(c) != "" {
+            G_HIST_ASKED = true
+            let h: bool = jarvisc.jc_history(c)
+        }
+    } else if kind == jarvisc.JE_CLOSE || kind == jarvisc.JE_NETERR {
+        jshell.set_status("offline - reconnecting")
+    } else if kind == jarvisc.JE_HIST {
+        if arg == 1 {
+            chat_add("**You:** " + jarvisc.jc_text(c) + "\n\n")
+        } else {
+            chat_add("**JARVIS:** " + jarvisc.jc_clean(jarvisc.jc_text(c)) + "\n\n")
+        }
+    } else if kind == jarvisc.JE_TOKEN {
+        chat_add(jarvisc.jc_text(c))
+    } else if kind == jarvisc.JE_THINKING {
+        jshell.set_status("thinking ...")
+    } else if kind == jarvisc.JE_TOOL {
+        jshell.set_status("tool: " + jarvisc.jc_text(c))
+    } else if kind == jarvisc.JE_ERROR {
+        chat_add("\n\n**error:** " + jarvisc.jc_text(c) + "\n\n")
+    } else if kind == jarvisc.JE_DONE {
+        // cut the ">STATUS:" line the server appends to an answer
+        let ans: str = __str_copy(str { p: ((G_CHAT.ptr as u64) + G_ANS_AT as u64) as *mut u8, n: G_CHAT.len - G_ANS_AT })
+        G_CHAT.len = G_ANS_AT
+        chat_add(jarvisc.jc_clean(ans) + "\n\n")
+        G_BUSY = false
+        jshell.set_status("online")
+    }
+}
