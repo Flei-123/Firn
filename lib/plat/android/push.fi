@@ -68,7 +68,7 @@ import net.dnsmini
 import tls.tlsmini
 
 export {
-    push_set_dns, push_set_pin,
+    push_set_dns, push_set_pin, push_set_hello,
     push_start, push_stop, push_notify, push_running, push_keep,
     push_notify_at, push_shown, push_cancel,
     Java_org_firn_FirnService_onStartCommand,
@@ -199,10 +199,14 @@ const P_BYTES: usize = 4096
 const P_DNS: u64 = 80 // u64: server (host order) | port << 32; 0 = system
 const P_TLS: u64 = 88 // u64: 1 = TLS with the pin below
 const P_PIN: u64 = 96 // 32 octets: SHA-256 of the relay's public key
+const P_HELLO: u64 = 128 // zero terminated hello line (without the LF), HELLO_MAX octets
+const HELLO_MAX: usize = 90
 static mut G_P: u64 = 0
 static mut G_DNS: u64 = 0 // the same value, set by the program before push_start
 static mut G_PIN_ON: u64 = 0 // push_set_pin: TLS wanted ...
 static mut G_PIN: [u8; 32] = [0 as u8; 32] // ... with this key
+static mut G_HELLO: [u8; 96] = [0 as u8; 96] // push_set_hello: sent as one line after every connect
+static mut G_HELLO_LEN: usize = 0
 static mut G_VM: u64 = 0
 static mut G_SVC: u64 = 0 // global reference to the running service
 static mut G_APP: u64 = 0 // global reference to the application context
@@ -815,7 +819,7 @@ fn push_start(host: u64, port: u32) -> bool {
     }
     copy((&path[0]) as u64, dir, dn)
     copy((&path[0]) as u64 + dn as u64, t(S_CFG), cn + 1)
-    var content: [u8; 192] = [0 as u8; 192]
+    var content: [u8; 384] = [0 as u8; 384]
     var n: usize = length(host)
     if n > 63 {
         return false
@@ -838,7 +842,7 @@ fn push_start(host: u64, port: u32) -> bool {
     }
     content[n] = 10 as u8
     n = n + 1
-    if (G_DNS != 0 as u64 || G_PIN_ON == 1 as u64) && n + 24 <= 96 {
+    if (G_DNS != 0 as u64 || G_PIN_ON == 1 as u64 || G_HELLO_LEN > 0) && n + 24 <= 96 {
         if G_DNS != 0 as u64 {
             // third line: the name server, "a.b.c.d:port"
             let ds: u32 = (G_DNS & 4294967295 as u64) as u32
@@ -893,6 +897,20 @@ fn push_start(host: u64, port: u32) -> bool {
             content[n + 1] = if lo < 10 as u8 { 48 as u8 + lo } else { 87 as u8 + lo }
             n = n + 2
             pi = pi + 1
+        }
+        content[n] = 10 as u8
+        n = n + 1
+    } else if G_HELLO_LEN > 0 {
+        content[n] = 10 as u8 // empty fourth line: the hello is the fifth
+        n = n + 1
+    }
+    if G_HELLO_LEN > 0 {
+        // fifth line: the hello (e.g. "HELLO <token> 2"), sent after every connect
+        var hi2: usize = 0
+        while hi2 < G_HELLO_LEN {
+            content[n] = G_HELLO[hi2]
+            n = n + 1
+            hi2 = hi2 + 1
         }
         content[n] = 10 as u8
         n = n + 1
@@ -1152,6 +1170,62 @@ fn push_set_dns(spec: u64) -> bool {
     return true
 }
 
+// Send ONE line to the relay right after every connect (TLS handshake done
+// or plain TCP), before any message is read: the way an own relay (e.g. the
+// JARVIS push relay: "HELLO <pushToken> <v>") learns who this device is.
+// `text` is zero terminated, 1..90 octets, no CR/LF; the line feed is added.
+// Call BEFORE push_start; kept in firn-push.cfg (fifth line). An empty text
+// or 0 = no hello again (the default: nothing is sent, as before).
+// false = not a valid line (nothing changed).
+#[no_gc]
+fn push_set_hello(text: u64) -> bool {
+    if text == 0 || *(text as *mut u8) == 0 as u8 {
+        G_HELLO_LEN = 0
+        return true
+    }
+    let n: usize = length(text)
+    if n > HELLO_MAX {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        let c: u8 = *((text + i as u64) as *mut u8)
+        if c == 10 as u8 || c == 13 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        G_HELLO[i] = *((text + i as u64) as *mut u8)
+        i = i + 1
+    }
+    G_HELLO_LEN = n
+    return true
+}
+
+// One line from the relay as a notification. Without a hello (FirnChat and
+// every other client) the title is the fixed "new message" text and the
+// whole line is the text -- unchanged. With a hello the relay speaks the
+// JARVIS line format "<title>: <body>" (docs/ANDROID-APP-API.md): the text
+// before the first ": " (1..120 octets) becomes the title.
+#[no_gc]
+fn show_line(env: u64, q: u64, n: usize) {
+    if *((G_P + P_HELLO) as *mut u8) != 0 as u8 {
+        var k: usize = 1
+        while k + 1 < n && k <= 120 {
+            if *((q + k as u64) as *mut u8) == 58 as u8 && *((q + k as u64 + 1) as *mut u8) == 32 as u8 {
+                var tb: [u8; 128] = [0 as u8; 128]
+                copy((&tb[0]) as u64, q, k)
+                nachricht(env, G_SVC, (&tb[0]) as u64, q + k as u64 + 2 as u64, n - k - 2)
+                return
+            }
+            k = k + 1
+        }
+    }
+    nachricht(env, G_SVC, t(S_MSG_TITLE), q, n)
+}
+
 // A TCP connection (family 2 / 10) to the address in `sa`; 10 s at most.
 // The descriptor, -1 = failed.
 #[no_gc]
@@ -1295,8 +1369,21 @@ fn push_thread(arg: u64) -> u64 {
             } else {
                 log(S_L_CONNECTED)
             }
+            var hello_ok: bool = true
+            if *((G_P + P_HELLO) as *mut u8) != 0 as u8 {
+                // one line "<hello>\n"; a failed write = a lost connection
+                var hl: [u8; 96] = [0 as u8; 96]
+                let hn: usize = length(G_P + P_HELLO)
+                copy((&hl[0]) as u64, G_P + P_HELLO, hn)
+                hl[hn] = 10 as u8
+                if tls {
+                    hello_ok = tlsmini.tlsm_write(&tm, (&hl[0]) as u64, hn + 1)
+                } else {
+                    hello_ok = syscall(44, fd, (&hl[0]) as i64, (hn + 1) as i64, 16384, 0, 0) == (hn + 1) as i64
+                }
+            }
             var n: usize = 0
-            while true {
+            while hello_ok {
                 let r: i64 = relay_read(fd, &tm, tls, pb + n as u64, 1024 - n)
                 if r <= 0 {
                     break
@@ -1307,8 +1394,7 @@ fn push_thread(arg: u64) -> u64 {
                 var i: usize = 0
                 while i < n {
                     if puf[i] == 10 as u8 {
-                        nachricht(env, G_SVC, t(S_MSG_TITLE), pb + a as u64,
-                            i - a)
+                        show_line(env, pb + a as u64, i - a)
                         a = i + 1
                     }
                     i = i + 1
@@ -1318,7 +1404,7 @@ fn push_thread(arg: u64) -> u64 {
                     n = n - a
                 } else if n == 1024 {
                     // a line longer than the buffer: show what there is
-                    nachricht(env, G_SVC, t(S_MSG_TITLE), pb, n)
+                    show_line(env, pb, n)
                     n = 0
                 }
             }
@@ -1366,12 +1452,12 @@ fn config_read(env: u64, svc: u64) -> bool {
     if !ok {
         return false
     }
-    var content: [u8; 256] = [0 as u8; 256]
+    var content: [u8; 384] = [0 as u8; 384]
     let fd: i64 = syscall(2, (&path[0]) as i64, 0, 0, 0, 0, 0)
     if fd < 0 {
         return false
     }
-    let n: i64 = syscall(0, fd, (&content[0]) as i64, 255, 0, 0, 0)
+    let n: i64 = syscall(0, fd, (&content[0]) as i64, 383, 0, 0, 0)
     syscall(3, fd, 0, 0, 0, 0, 0)
     if n <= 0 {
         return false
@@ -1413,6 +1499,21 @@ fn config_read(env: u64, svc: u64) -> bool {
         if tlsmini.tlsm_hex_pin((&content[0]) as u64 + i as u64, pe - i, b + P_PIN) {
             *((b + P_TLS) as *mut u64) = 1 as u64
         }
+    }
+    // optional fifth line: the hello sent after every connect
+    *((b + P_HELLO) as *mut u8) = 0 as u8
+    while i < n as usize && content[i] != 10 as u8 {
+        i = i + 1
+    }
+    i = i + 1
+    if i < n as usize {
+        var hj: usize = 0
+        while i < n as usize && content[i] != 10 as u8 && content[i] != 13 as u8 && hj < HELLO_MAX {
+            *((b + P_HELLO + hj as u64) as *mut u8) = content[i]
+            hj = hj + 1
+            i = i + 1
+        }
+        *((b + P_HELLO + hj as u64) as *mut u8) = 0 as u8
     }
     return port > 0
 }

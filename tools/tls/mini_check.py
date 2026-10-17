@@ -121,8 +121,8 @@ class Server:
         self.sock.close()
 
 
-def run(port, pin, sni=None, timeout=30):
-    args = [tool, "127.0.0.1", str(port), pin] + ([sni] if sni else [])
+def run(port, pin, sni=None, timeout=30, write=None):
+    args = [tool, "127.0.0.1", str(port), pin] + ([sni or "relay.test"] if (sni or write) else []) + ([write] if write else [])
     p = subprocess.run(args, capture_output=True, timeout=timeout)
     err = p.stderr.decode(errors="replace").split()
     return p.returncode, p.stdout, err
@@ -208,6 +208,26 @@ try:
     rc, out, err = run(srv.port, colon)
     check("pin with colons", (rc, out[:6]), (0, b"hello\n"))
     srv.close()
+
+    # 1b. tlsm_write (the hello line of push.fi): three records, then reads still work
+    got = []
+    def echo_reader(conn):
+        buf = b""
+        while buf.count(b"\n") < 3:
+            d = conn.recv(4096)
+            if not d:
+                break
+            buf += d
+        got.append(buf)
+        conn.sendall(b"ack\n")
+        conn.unwrap()
+    for text in ("HELLO " + "0123456789abcdef" * 2 + " 1", "x" * 1023, "\u00e4\u00f6\u00fc \u20ac"):
+        srv = Server(crt, key, echo_reader)
+        rc, out, err = run(srv.port, pin, "relay.test", write=text)
+        want = (text.encode() + b"\n") * 3
+        check("write %d octets: server got three exact lines" % len(text.encode()), got[-1] if got else None, want)
+        check("write: read after write works, exit 0", (rc, out), (0, b"ack\n"))
+        srv.close()
 
     # 2. wrong pin
     srv = Server(crt, key, send_then_close(b"secret\n"))

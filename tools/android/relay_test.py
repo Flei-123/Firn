@@ -18,8 +18,22 @@ lines = args or ["Hallo von Firn - Nachricht 1", "Umlaute: äöü ß", "Nachrich
 srv = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("::" if v6 else "0.0.0.0", port)); srv.listen(4)
 print("relay listening on", port, flush=True)
+def listen(c):
+    # log what the client writes (the hello line of push_set_hello), one line each
+    buf = b""
+    try:
+        while True:
+            d = c.recv(1024)
+            if not d: return
+            buf += d
+            while b"\n" in buf:
+                l, buf = buf.split(b"\n", 1)
+                print("recv", l.decode("utf-8", "replace"), flush=True)
+    except OSError:
+        return
 def serve(c, a):
     print("connected", a, flush=True)
+    threading.Thread(target=listen, args=(c,), daemon=True).start()
     try:
         for l in lines:
             time.sleep(spacing); c.sendall((l + "\n").encode()); print("sent", l, flush=True)
