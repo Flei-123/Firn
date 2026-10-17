@@ -46,6 +46,11 @@ exprs=0
 first=""
 
 while IFS= read -r f; do
+    # r664: `// firnc1_skip: <why>` in the first lines = a stage-0-only feature (not yet in firnc1).
+    if head -n 3 "$f" | grep -q '^// firnc1_skip'; then
+        skipped=$((skipped+1))
+        continue
+    fi
     if ! "$FIRNC" --emit=types "$f" > "$TMPD"/semv_a.txt 2>/dev/null; then
         skipped=$((skipped+1))
         continue

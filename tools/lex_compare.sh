@@ -53,6 +53,11 @@ slow=0
 first=""
 
 while IFS= read -r f; do
+    # r664: `// firnc1_skip: <why>` in the first lines = a stage-0-only feature (not yet in firnc1).
+    if head -n 3 "$f" | grep -q '^// firnc1_skip'; then
+        skipped=$((skipped+1))
+        continue
+    fi
     "$FIRNC" --emit=tokens "$f" > "$TMPD"/lexv_a.txt 2>"$TMPD"/lexv_ae.txt
     # Module fragments (`tests/modules/*.fi`) cannot be compiled
     # separately: `firnc0` already stops in the module resolution, BEFORE the

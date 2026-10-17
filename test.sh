@@ -455,6 +455,17 @@ else
     tail -30 "$WORK/env.log" | sed 's/^/   /' || true
 fi
 
+echo "== 8b3. stdlib found without FIRNLIB (tools/sysroot/run.sh, r664) =="
+# repository / installed / deeper layouts, --print-sysroot, $FIRNLIB wins; firnc1 too if built.
+bash tools/sysroot/run.sh > "$WORK/sysroot.log" 2>&1 && SYSRC=0 || SYSRC=$?
+if [ "$SYSRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/sysroot.log" | sed 's/^/   /' || true
+else
+    bad "tools/sysroot/run.sh failed (see .test-work/sysroot.log)"
+    tail -20 "$WORK/sysroot.log" | sed 's/^/   /' || true
+fi
+
 echo "== 8c. bounds: static dispatch without an indirect call (ROUND 50) =="
 # `fn f[T: I]` calls the interface method DIRECTLY -- proven on the emitted
 # assembly and on the FIR, with `dyn I` as a counter-check, in both compilers.

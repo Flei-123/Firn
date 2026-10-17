@@ -2053,6 +2053,25 @@ constants declared before it, and '+ - * /'"
                 (**e).clone()
             }
             Type::Error => Type::Error,
+            // r664: the hidden counter of `for x in vec` / `for c in str`
+            other
+                if matches!(&idx.kind, ExprKind::Ident(n) if n.starts_with(crate::foreach::HIDDEN))
+                    && crate::foreach::seq_struct(&self.tcx, other).is_some() =>
+            {
+                match crate::foreach::seq_elem(self, other) {
+                    Some(t) => t,
+                    None => {
+                        self.dg.error(
+                            bspan,
+                            format!(
+                                "cannot tell the element type of {}",
+                                self.tcx.name_of(other)
+                            ),
+                        );
+                        Type::Error
+                    }
+                }
+            }
             other => {
                 self.dg.error(
                     bspan,

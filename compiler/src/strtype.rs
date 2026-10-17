@@ -342,6 +342,30 @@ pub(crate) fn hook_binary(
     if !is_str_like(lt) && !is_str_like(rt) {
         return None;
     }
+    // r664: a struct that is not a str on the other side (typically the
+    // `Fmt` builder of an f-string) used to be accepted and gave garbage.
+    if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Add) {
+        for other in [lt, rt] {
+            if matches!(other, Type::Struct(_)) && !is_str_like(other) {
+                let n = ck.tcx.name_of(other);
+                let fmt = n == "Fmt" || n.ends_with("__Fmt");
+                ck.dg.error_note(
+                    span,
+                    if fmt {
+                        "an f-string is a Fmt builder, not a str".to_string()
+                    } else {
+                        format!("operator '{}' on str needs a str on both sides, found {}", op.text(), n)
+                    },
+                    if fmt {
+                        "turn it into a str first: io.fmt_string(f\"...\")"
+                    } else {
+                        "convert the other side to str, or use the functions of std.str"
+                    },
+                );
+                return Some(Type::Error);
+            }
+        }
+    }
     match op {
         BinOp::Eq | BinOp::Ne => {
             need(ck, FN_EQ, op.text(), span);

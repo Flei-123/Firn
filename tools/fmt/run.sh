@@ -46,10 +46,12 @@ note() { echo "  FAIL  $1"; FAIL=$((FAIL + 1)); }
 
 # Every `.fi` file of the project, without the deliberately broken ones in
 # tests/lexneg/ (they do not scan -- that is what they are there for) and
-# without the symbolic links (bin/ points into lib/firnc1/).
+# without the symbolic links (bin/ points into lib/firnc1/), and without
+# `*_fmtskip.fi` (r664: f-strings with nested quotes, which firnfmt's own lexer
+# does not know yet).
 sources() {
     find lib bin tests demos examples bench tools -name '*.fi' -not -type l \
-        -not -path 'tests/lexneg/*' | sort
+        -not -path 'tests/lexneg/*' -not -name '*_fmtskip.fi' | sort
 }
 
 # The same, but WITH the symbolic links: the copy of the tree needs
