@@ -27,15 +27,11 @@ VCODE=$(( ${MA:-0} * 10000 + ${MI:-0} * 100 + ${PA:-0} ))
 mkdir -p "$OUT"
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT
-# the PackageInstaller receiver class of appkit's updater (written by Firn, no Java)
-"$FIRNC" -o "$W/installdex" "$ROOT/tools/appkit/installdex_main.fi"
-"$W/installdex" "$W/classes.dex" firnapp
-printf '<receiver android:name="org.firn.FirnInstall" android:exported="false"/>\n' >"$W/receiver.xml"
 APK="$OUT/jarvis-$VERSION.apk"
 bash "$ROOT/tools/android/build.sh" "$ROOT/examples/jarvis_android/main.fi" --name "JARVIS" --package org.fleitec.jarvis \
     --version-code "$VCODE" --version-name "$VERSION" \
     --permission android.permission.INTERNET \
     --permission android.permission.REQUEST_INSTALL_PACKAGES \
     --permission android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION \
-    --dex "$W/classes.dex" --manifest-extra "$W/receiver.xml" --out "$APK"
+    --install --pick --speech --tts --out "$APK"
 echo "built $APK (versionCode $VCODE, channel $FIRN_APP_CHANNEL)"

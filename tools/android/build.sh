@@ -47,6 +47,9 @@
 #                         from the gallery or the camera): the manifest gets
 #                         the invisible org.firn.FirnPick activity (same
 #                         classes.dex as --push)
+#   --install             the program updates itself through appkit (PackageInstaller): the same
+#                         classes.dex also holds org.firn.FirnInstall, the manifest names it as a receiver
+#                         (push, pick and install can be combined freely)
 #   --speech              the program uses lib/plat/android/speech.fi (AAudio microphone): links libaaudio,
 #                         the manifest gets RECORD_AUDIO
 #   --tts                 the program uses lib/plat/android/tts.fi: the manifest gets <queries> for the TTS
@@ -86,7 +89,7 @@ SRCDIR=$(dirname "$ENTRY_ABS")
 
 NAME=$(basename "$SRCDIR"); PKG=""; LIB=firnapp; ABI=both
 VCODE=1; VNAME=0.1; OPT=release-safe; ASSETS=""; PERMS=(); EXTRA=""; DEX=""
-PUSH=0; PICK=0; CAMERA=0; SPEECH=0; TTS=0; ARGSFILE=""; RELEASE=${FIRN_RELEASE:-0}
+PUSH=0; PICK=0; INSTALL=0; CAMERA=0; SPEECH=0; TTS=0; ARGSFILE=""; RELEASE=${FIRN_RELEASE:-0}
 OUT=""; ICONRES=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -103,6 +106,7 @@ while [ $# -gt 0 ]; do
         --dex) DEX=$2; shift 2 ;;
         --push) PUSH=1; shift ;;
         --pick) PICK=1; shift ;;
+        --install) INSTALL=1; shift ;;
         --camera) CAMERA=1; shift ;;
         --speech) SPEECH=1; shift ;;
         --tts) TTS=1; shift ;;
@@ -189,7 +193,7 @@ case "$ABI" in arm64|both) build_abi arm64-v8a aarch64-android aarch64-linux-gnu
 case "$ABI" in x86_64|both) build_abi x86_64 x86_64-android ld x86_64-linux-android ;; esac
 
 # ---- 3b. the push service: a class written by Firn ------------------------
-if [ $PUSH -eq 1 ] || [ $PICK -eq 1 ]; then
+if [ $PUSH -eq 1 ] || [ $PICK -eq 1 ] || [ $INSTALL -eq 1 ]; then
     SDX=$BUILD/servicedex
     "$FIRNC" -o "$SDX" "$ROOT/tools/android/servicedex_main.fi"
     "$SDX" "$BUILD/classes.dex" "$LIB"
@@ -206,6 +210,9 @@ if [ $PUSH -eq 1 ] || [ $PICK -eq 1 ]; then
             echo '            android:excludeFromRecents="true"'
             echo '            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|uiMode|density" />'
         fi
+        if [ $INSTALL -eq 1 ]; then
+            echo '        <receiver android:name="org.firn.FirnInstall" android:exported="false" />'
+        fi
         [ -n "$EXTRA" ] && cat "$EXTRA"
     } > "$SVCXML"
     EXTRA=$SVCXML
@@ -214,7 +221,7 @@ if [ $PUSH -eq 1 ] || [ $PICK -eq 1 ]; then
             android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING
             android.permission.POST_NOTIFICATIONS)
     fi
-    echo "  classes.dex: $(stat -c%s "$DEX") octets (org.firn.FirnService, org.firn.FirnPick, written by Firn)"
+    echo "  classes.dex: $(stat -c%s "$DEX") octets (org.firn.FirnService, FirnPick, FirnInstall, written by Firn)"
 fi
 
 # ---- 4. manifest, package, sign ------------------------------------------
