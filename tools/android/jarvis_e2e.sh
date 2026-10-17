@@ -5,9 +5,11 @@
 # notification service as the judge.
 #
 #   bash tools/android/jarvis_e2e.sh [apk]          (default: the newest /root/jarvis-android-builds/jarvis-*.apk)
-#   SERIAL=emulator-${EMU_PORT:-5592} ADB_PORT=5041 bash ...     (use a running emulator, do not boot or stop one)
+#   SERIAL=emulator-5594 ADB_PORT=5043 bash ...     (use a running emulator, do not boot or stop one)
+#   AVD=<name> EMU_PORT=<port> ADB_PORT=<port> OUT=<dir> bash ...   (own emulator copy, own adb server)
 #
-# Own AVD copy "a6e" (console port 5592, own adb server on port 5041): other checks that use the shared adb server never see it.
+# Own AVD copy "a7e" (console port 5594, own adb server on port 5043; image google_apis when installed, because that one has a speech
+# engine for section 9, else the plain "default" image and section 9 only notes it): other checks that use the shared adb server never see it.
 # Checks: login, message + streamed reply, Board (projects, a need answered), Tasks (add), conversation list (Chats), photo upload
 # (system picker -> POST /api/m/upload -> text carries the server path), file receive (JE_FILE -> download -> Downloads/Jarvis),
 # push over the HTTPS long poll while the app is in the background (POST /fake/push -> a REAL notification, tap opens the app,
@@ -33,8 +35,8 @@ for t in tesseract python3; do command -v $t >/dev/null || { echo "skip: $t miss
 python3 -c "import websockets, PIL" 2>/dev/null || { echo "skip: python3 websockets/PIL missing"; exit 0; }
 W=$(mktemp -d)
 EMU=""; SRV=""
-ADB_PORT=${ADB_PORT:-5041}
-AVD=${AVD:-a6e}
+ADB_PORT=${ADB_PORT:-5043}
+AVD=${AVD:-a7e}
 ADB0="$SDK/platform-tools/adb -P $ADB_PORT"
 cleanup() {
     [ -n "$SRV" ] && kill $SRV 2>/dev/null
@@ -46,14 +48,15 @@ trap cleanup EXIT
 
 if [ -z "${SERIAL:-}" ]; then
     AVDHOME=${ANDROID_AVD_HOME:-$HOME/.android/avd}
+    IMG=default; [ -d "$SDK/system-images/android-35/google_apis/x86_64" ] && IMG=google_apis
     if [ ! -d "$AVDHOME/$AVD.avd" ]; then # own copy: only the config, a fresh data partition
-        mkdir -p "$AVDHOME/$AVD.avd"; sed "s/firn/$AVD/g" "$AVDHOME/firn.avd/config.ini" >"$AVDHOME/$AVD.avd/config.ini"
+        mkdir -p "$AVDHOME/$AVD.avd"; sed -e "s/firn/$AVD/g" -e "s#android-35/default/#android-35/$IMG/#" -e "s/^tag.id *=.*/tag.id = $IMG/" "$AVDHOME/firn.avd/config.ini" >"$AVDHOME/$AVD.avd/config.ini"
         printf 'avd.ini.encoding=UTF-8\npath=%s/%s.avd\npath.rel=avd/%s.avd\ntarget=android-35\n' "$AVDHOME" "$AVD" "$AVD" >"$AVDHOME/$AVD.ini"
     fi
     $ADB0 start-server >/dev/null 2>&1
-    ANDROID_ADB_SERVER_PORT=$ADB_PORT ANDROID_SDK_ROOT=$SDK ANDROID_AVD_HOME=$AVDHOME "$SDK/emulator/emulator" -avd $AVD -port ${EMU_PORT:-5592} \
+    ANDROID_ADB_SERVER_PORT=$ADB_PORT ANDROID_SDK_ROOT=$SDK ANDROID_AVD_HOME=$AVDHOME "$SDK/emulator/emulator" -avd $AVD -port ${EMU_PORT:-5594} \
         -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data -gpu swiftshader_indirect >"$W/emu.log" 2>&1 & EMU=$!
-    SERIAL=emulator-${EMU_PORT:-5592}
+    SERIAL=emulator-${EMU_PORT:-5594}
 fi
 ADB="$ADB0 -s $SERIAL"
 for _ in $(seq 150); do [ "$($ADB shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break; sleep 3; done

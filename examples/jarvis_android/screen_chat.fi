@@ -8,7 +8,8 @@
 // Voice (lib/plat/voiceio.fi): the Mic button records (tap again to stop), the WAV goes to POST /api/stt through net.jarvisapi and
 // the text lands in the input line; the "Voice" button switches the spoken answer on (every finished answer is read out).
 // Chats button: the conversation list (jdata.refresh_convs, a vlist) replaces the chat view; a tap on a row opens that chat.
-// Photo: "+" picks (up to 3 MB JPEG), Send uploads it (POST /api/m/upload, raw) and then sends the text with the server path of
+// Attachment: "+" shows Photo / File. Photo: the gallery or camera (up to 3 MB JPEG); File: ANY file of the system's file picker
+// (up to 20 MB, name + mime type kept). Send uploads it (POST /api/m/upload, raw) and then sends the text with the server path of
 // the file, so the model can read it. Files the assistant sends (JE_FILE) are fetched (ja_download) and opened (plat.fileio).
 import std.rt
 import fui.app
@@ -54,7 +55,8 @@ static mut G_STT_WAIT: bool = false
 static mut G_REC: bool = false
 static mut G_PHOTO_N: usize = 0
 static mut G_CHAT: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
-static mut G_PHOTO_BUF: u64 = 0
+static mut G_PHOTO_BUF: u64 = 0 // PHOTO_CAP octets; G_FILE_BUF (FILE_CAP) is made at the first file
+static mut G_FILE_BUF: u64 = 0
 static mut G_LIST: usize = 0
 static mut G_LIST_ON: bool = false
 static mut G_LIST_SEEN: u64 = 0
@@ -65,8 +67,14 @@ static mut G_DL_NAME: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_DL_MIME: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_DL_QUEUE: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // waiting files: url \x01 name \x01 mime \n per file
 static mut G_LIMIT_SET: bool = false
+static mut G_ATT_ROW: usize = 0 // the Photo / File buttons under "+"
+static mut G_ATT_KIND: i64 = 0 // what waits in G_PHOTO_BUF: 0 photo, 1 file
+static mut G_PICKING: i64 = -1 // the picker that is open: 0 photo, 1 file, -1 none
+static mut G_ATT_NAME: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_ATT_MIME: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 
 const PHOTO_CAP: usize = 3145728 // the picker hands out JPEGs up to this size (window.pick_set_limit)
+const FILE_CAP: usize = 20971520 // a file up to this size (the limit of POST /api/m/upload); the buffer is made at the first file
 
 fn mdv() -> *mut markdownview.MdView { return G_MD as *mut markdownview.MdView }
 
@@ -243,13 +251,73 @@ fn screen_chat_voice_tick(a: *mut app.App) {
     }
 }
 
+// "+" shows (or hides) the two choices
 fn on_attach(a: *mut app.App) {
+    G_ATT_SHOWN = !G_ATT_SHOWN
+    jshell.set_shown(a, G_ATT_ROW, G_ATT_SHOWN, 0)
+}
+
+static mut G_ATT_SHOWN: bool = false
+
+fn att_hide(a: *mut app.App) {
+    G_ATT_SHOWN = false
+    jshell.set_shown(a, G_ATT_ROW, false, 0)
+}
+
+fn on_photo(a: *mut app.App) {
+    att_hide(a)
+    if G_UPLOADING {
+        jshell.set_status("upload running ...")
+        return
+    }
     if jshell.win() as u64 != 0 && !G_LIMIT_SET {
         G_LIMIT_SET = window.pick_set_limit(jshell.win(), PHOTO_CAP)
     }
     if jshell.win() as u64 == 0 || !window.pick_image(jshell.win()) {
         jshell.set_status("no photo picker on this system")
+        return
     }
+    G_PICKING = 0
+}
+
+fn on_file(a: *mut app.App) {
+    att_hide(a)
+    if G_UPLOADING {
+        jshell.set_status("upload running ...")
+        return
+    }
+    if G_FILE_BUF == 0 { G_FILE_BUF = rt.heap_alloc(FILE_CAP) }
+    if G_FILE_BUF == 0 || jshell.win() as u64 == 0 || !window.pick_file(jshell.win()) {
+        jshell.set_status("no file picker on this system")
+        return
+    }
+    G_PICKING = 1
+}
+
+// the picker answered with a file: octets + "<name>\0<mime>\0"
+fn file_picked(a: *mut app.App) {
+    var n: usize = 0
+    var meta: [u8; 640] = [0 as u8; 640]
+    if !window.pick_file_take(jshell.win(), G_FILE_BUF, FILE_CAP, &n, (&meta[0]) as u64, 640) { return }
+    var nl: usize = 0
+    while nl < 600 && meta[nl] != 0 as u8 { nl = nl + 1 }
+    var ml: usize = 0
+    while nl + 1 + ml < 639 && meta[nl + 1 + ml] != 0 as u8 { ml = ml + 1 }
+    rt.buf_clear(&G_ATT_NAME)
+    if nl == 0 {
+        rt.buf_push_bytes(&G_ATT_NAME, "file".p as u64, 4)
+    } else {
+        rt.buf_push_bytes(&G_ATT_NAME, (&meta[0]) as u64, nl)
+    }
+    rt.buf_clear(&G_ATT_MIME)
+    if ml == 0 {
+        rt.buf_push_bytes(&G_ATT_MIME, "application/octet-stream".p as u64, 24)
+    } else {
+        rt.buf_push_bytes(&G_ATT_MIME, (&meta[nl + 1]) as u64, ml)
+    }
+    G_ATT_KIND = 1
+    G_PHOTO_N = n
+    app.set_text(a, G_PHOTO, "file " + __str_copy(str { p: G_ATT_NAME.ptr as *mut u8, n: G_ATT_NAME.len }) + ", " + jshell.dec((n / 1024) as i64) + " kB")
 }
 
 fn send_now(a: *mut app.App) {
@@ -261,14 +329,21 @@ fn send_now(a: *mut app.App) {
     }
     if G_PHOTO_N > 0 {
         // upload first; the text goes out with the server path when the answer is here (upload_done)
-        let name: str = "photo_" + jshell.dec(time.now_unix_ms()) + ".jpg"
+        var name: str = "photo_" + jshell.dec(time.now_unix_ms()) + ".jpg"
+        var mime: str = "image/jpeg"
+        var buf: u64 = G_PHOTO_BUF
+        if G_ATT_KIND == 1 {
+            name = __str_copy(str { p: G_ATT_NAME.ptr as *mut u8, n: G_ATT_NAME.len })
+            mime = __str_copy(str { p: G_ATT_MIME.ptr as *mut u8, n: G_ATT_MIME.len })
+            buf = G_FILE_BUF
+        }
         rt.buf_clear(&G_PENDING)
         rt.buf_push_bytes(&G_PENDING, t.p as u64, t.n)
-        if jarvisapi.ja_upload(jshell.api(), name, "image/jpeg", G_PHOTO_BUF, G_PHOTO_N, jarvisc.jc_cid(jshell.jc())) {
+        if jarvisapi.ja_upload(jshell.api(), name, mime, buf, G_PHOTO_N, jarvisc.jc_cid(jshell.jc())) {
             G_UPLOADING = true
-            jshell.set_status("uploading photo ...")
+            jshell.set_status("uploading ...")
         } else {
-            jshell.set_status("photo upload not possible")
+            jshell.set_status("upload not possible")
         }
         return
     }
@@ -291,12 +366,14 @@ fn upload_done(x: *mut jarvisapi.Api, status: i64) {
     var up: jarvisapi.Uploaded = jarvisapi.uploaded_new()
     if status != 200 || !jarvisapi.parse_upload(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &up) {
         jarvisapi.uploaded_free(&up)
-        jshell.set_status("photo upload failed (" + jshell.dec(status) + ")")
+        jshell.set_status("upload failed (" + jshell.dec(status) + ")")
         return
     }
     let t: str = __str_copy(str { p: G_PENDING.ptr as *mut u8, n: G_PENDING.len })
-    var full: str = t + "\n\n[photo " + up.name + " (" + jshell.dec(up.size / 1024) + " kB) on the server: " + up.path + "]"
-    if up.path.n == 0 { full = t + "\n\n[photo " + up.name + ": " + up.url + "]" }
+    var kind: str = "photo"
+    if G_ATT_KIND == 1 { kind = "file" }
+    var full: str = t + "\n\n[" + kind + " " + up.name + " (" + jshell.dec(up.size / 1024) + " kB) on the server: " + up.path + "]"
+    if up.path.n == 0 { full = t + "\n\n[" + kind + " " + up.name + ": " + up.url + "]" }
     jarvisapi.uploaded_free(&up)
     G_PHOTO_N = 0
     app.set_text(a, G_PHOTO, "")
@@ -466,6 +543,11 @@ fn screen_chat_build(a: *mut app.App) {
     jlist.pull_install(a)
     jshell.set_shown(a, G_LIST, false, 0)
     G_PHOTO = app.label(a, "", 11)
+    G_ATT_ROW = app.row(a)
+    app.button(a, "Photo", on_photo)
+    app.button(a, "File", on_file)
+    app.end(a)
+    jshell.set_shown(a, G_ATT_ROW, false, 0)
     app.row(a)
     app.button(a, "+", on_attach)
     G_IN = app.entry(a, "Message")
@@ -483,14 +565,28 @@ fn chat_view_tick(now_ms: i64) {
 fn screen_chat_refresh(a: *mut app.App) {
     if jshell.win() as u64 == 0 { return }
     let st: i32 = window.pick_poll(jshell.win())
-    if st == 2 {
+    if st == 2 && G_PICKING == 1 {
+        G_PICKING = -1
+        file_picked(a)
+    } else if st == 2 {
+        G_PICKING = -1
         var n: usize = 0
         var w: usize = 0
         var h: usize = 0
         if window.pick_take(jshell.win(), G_PHOTO_BUF, PHOTO_CAP, &n, &w, &h) {
+            G_ATT_KIND = 0
             G_PHOTO_N = n
             app.set_text(a, G_PHOTO, "photo " + jshell.dec(w as i64) + "x" + jshell.dec(h as i64) + ", " + jshell.dec((n / 1024) as i64) + " kB")
         }
+    } else if st == 4 {
+        if G_PICKING == 1 && window.pick_file_too_big(jshell.win()) {
+            jshell.set_status("file is over 20 MB")
+        } else {
+            jshell.set_status("could not read the file")
+        }
+        G_PICKING = -1
+    } else if st == 3 || st == 0 {
+        if st == 3 { G_PICKING = -1 }
     }
     sel_changed(a)
     if G_LIST_ON && jdata.ver_convs() != G_LIST_SEEN {

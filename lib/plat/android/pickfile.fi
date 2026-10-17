@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/android/pickfile.fi -- ANY FILE FROM THE SYSTEM'S FILE PICKER (documents, downloads, cloud providers), read into memory.
+//
+//     import plat.android.pick      // pick_file_start / pick_file_take (this file is its helper; do not import it from a program)
+//
+//   pick.pick_file_start()                         app thread: opens the system's chooser for ANY openable content (GET_CONTENT, */*)
+//   pick.pick_poll()                               0 nothing asked, 1 open, 2 the file is here (pick_file_take), 3 none chosen, 4 failed
+//   pick.pick_file_take(out, cap, n, meta, mcap)   the octets into out (cap), their count into *n; meta (mcap octets) gets
+//                                                  "<display name>\0<mime type>\0"; false when there is none / it does not fit
+//   pick.pick_file_too_big()                       true once after a file over FILE_MAX (20 MB, the limit of POST /api/m/upload) was refused
+//
+// WHY the same activity as the photo picker: a NativeActivity cannot receive an answer (see pick.fi). The invisible org.firn.FirnPick
+// activity asks and gets the answer; pick.fi calls chooser() / result() of THIS file when the mode is "file" (set by
+// pick_file_start before the activity opens). Everything is #[no_gc] and runs on the main thread; the app thread only reads statics.
+// The octets live in one anonymous mapping (FILE_MAX bytes, created at the first pick, reused): a program that wants to keep the file
+// copies it out with pick_file_take.
+import android.ndk
+import android.jnicall
+
+export { mode_set, mode_file, chooser, result, take, too_big, FILE_MAX }
+
+// ---- BEGIN GENERATED STRINGS (tools/android/gen_pickfile_strings.py) ----
+static TXT: [u8; 929] = "android/content/Intent\0<init>\0(Ljava/lang/String;)V\0android.intent.action.GET_CONTENT\0*/*\0android.intent.category.OPENABLE\0setType\0addCategory\0(Ljava/lang/String;)Landroid/content/Intent;\0createChooser\0(Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;\0File\0startActivityForResult\0(Landroid/content/Intent;I)V\0getData\0()Landroid/net/Uri;\0getContentResolver\0()Landroid/content/ContentResolver;\0openInputStream\0(Landroid/net/Uri;)Ljava/io/InputStream;\0getType\0(Landroid/net/Uri;)Ljava/lang/String;\0query\0(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;\0moveToFirst\0()Z\0getColumnIndex\0(Ljava/lang/String;)I\0getString\0(I)Ljava/lang/String;\0getLastPathSegment\0()Ljava/lang/String;\0close\0()V\0read\0([B)I\0_display_name\0firn-pickfile\0file picker started\0file read\0no file chosen\0file could not be read\0file too large\0file picker failed to open\0"
+
+const C_INTENT: usize = 0   // android/content/Intent
+const N_INIT: usize = 23   // <init>
+const G_S_V: usize = 30   // (Ljava/lang/String;)V
+const S_GET_CONTENT: usize = 52   // android.intent.action.GET_CONTENT
+const S_ANY: usize = 86   // */*
+const S_OPENABLE: usize = 90   // android.intent.category.OPENABLE
+const N_SET_TYPE: usize = 123   // setType
+const N_ADD_CAT: usize = 131   // addCategory
+const G_S_I: usize = 143   // (Ljava/lang/String;)Landroid/content/Intent;
+const N_CHOOSER: usize = 188   // createChooser
+const G_CHOOSER: usize = 202   // (Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;
+const S_TITLE: usize = 277   // File
+const N_START_RESULT: usize = 282   // startActivityForResult
+const G_START_RESULT: usize = 305   // (Landroid/content/Intent;I)V
+const N_GET_DATA: usize = 334   // getData
+const G_GET_DATA: usize = 342   // ()Landroid/net/Uri;
+const N_RESOLVER: usize = 362   // getContentResolver
+const G_RESOLVER: usize = 381   // ()Landroid/content/ContentResolver;
+const N_OPEN_IN: usize = 417   // openInputStream
+const G_OPEN_IN: usize = 433   // (Landroid/net/Uri;)Ljava/io/InputStream;
+const N_GET_TYPE: usize = 474   // getType
+const G_GET_TYPE: usize = 482   // (Landroid/net/Uri;)Ljava/lang/String;
+const N_QUERY: usize = 520   // query
+const G_QUERY: usize = 526   // (Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;
+const N_MOVE_FIRST: usize = 645   // moveToFirst
+const G_Z: usize = 657   // ()Z
+const N_COL_INDEX: usize = 661   // getColumnIndex
+const G_COL_INDEX: usize = 676   // (Ljava/lang/String;)I
+const N_GET_STRING: usize = 698   // getString
+const G_GET_STRING: usize = 708   // (I)Ljava/lang/String;
+const N_LAST_SEG: usize = 730   // getLastPathSegment
+const G_STR: usize = 749   // ()Ljava/lang/String;
+const N_CLOSE: usize = 770   // close
+const G_V: usize = 776   // ()V
+const N_READ: usize = 780   // read
+const G_READ: usize = 785   // ([B)I
+const S_COL_NAME: usize = 791   // _display_name
+const S_TAG: usize = 805   // firn-pickfile
+const L_START: usize = 819   // file picker started
+const L_GOT: usize = 839   // file read
+const L_NONE: usize = 849   // no file chosen
+const L_FAIL: usize = 864   // file could not be read
+const L_BIG: usize = 887   // file too large
+const L_OPEN: usize = 902   // file picker failed to open
+// ---- END GENERATED STRINGS ----
+
+const FILE_MAX: usize = 20971520 // 20 MB, like the server
+const CHUNK: usize = 65536
+const REQ_PICK: i32 = 7
+const RESULT_OK: i32 = -1
+const P_READY: i32 = 2
+const P_NONE: i32 = 3
+const P_FAIL: i32 = 4
+
+static mut G_MODE: bool = false
+static mut G_MAP: u64 = 0
+static mut G_N: usize = 0
+static mut G_BIG: bool = false
+static mut G_META: [u8; 640] = [0; 640] // name\0mime\0
+static mut G_META_N: usize = 0
+
+#[no_gc]
+fn t(i: usize) -> u64 {
+    return ((&TXT[0]) as u64) + i as u64
+}
+
+#[no_gc]
+fn log(i: usize) {
+    ndk.log_write(ndk.LOG_INFO, t(S_TAG), t(i))
+}
+
+#[no_gc]
+fn meth(env: u64, c: u64, n: usize, g: usize) -> u64 {
+    return jnicall.j_method(env, c, t(n), t(g))
+}
+
+#[no_gc]
+fn mode_set(on: bool) { G_MODE = on }
+
+#[no_gc]
+fn mode_file() -> bool { return G_MODE }
+
+#[no_gc]
+fn too_big() -> bool {
+    let b: bool = G_BIG
+    G_BIG = false
+    return b
+}
+
+// o.name() for a method without arguments that answers an object (0 when o is 0)
+#[no_gc]
+fn call0(env: u64, o: u64, n: usize, g: usize) -> u64 {
+    if o == 0 {
+        return 0
+    }
+    let c: u64 = jnicall.j_obj_class(env, o)
+    var a: [u64; 1] = [0; 1]
+    let r: u64 = jnicall.j_obj(env, o, meth(env, c, n, g), (&a[0]) as u64)
+    jnicall.j_del(env, c)
+    return r
+}
+
+#[no_gc]
+fn close_it(env: u64, o: u64) {
+    if o == 0 {
+        return
+    }
+    let c: u64 = jnicall.j_obj_class(env, o)
+    var a: [u64; 1] = [0; 1]
+    let r: bool = jnicall.j_void(env, o, meth(env, c, N_CLOSE, G_V), (&a[0]) as u64)
+    jnicall.j_del(env, c)
+}
+
+// FirnPick.pick() in file mode: the chooser for any openable content. False: Android refused (pick.fi finishes the activity).
+#[no_gc]
+fn chooser(env: u64, pa: u64) -> bool {
+    log(L_START)
+    let ci: u64 = jnicall.j_class(env, t(C_INTENT))
+    var a: [u64; 2] = [0; 2]
+    a[0] = jnicall.j_str(env, t(S_GET_CONTENT))
+    let get: u64 = jnicall.j_new(env, ci, meth(env, ci, N_INIT, G_S_V), (&a[0]) as u64)
+    a[0] = jnicall.j_str(env, t(S_ANY))
+    let r1: u64 = jnicall.j_obj(env, get, meth(env, ci, N_SET_TYPE, G_S_I), (&a[0]) as u64)
+    a[0] = jnicall.j_str(env, t(S_OPENABLE))
+    let r2: u64 = jnicall.j_obj(env, get, meth(env, ci, N_ADD_CAT, G_S_I), (&a[0]) as u64)
+    a[0] = get
+    a[1] = jnicall.j_str(env, t(S_TITLE))
+    let ch: u64 = jnicall.j_sobj(env, ci, jnicall.j_smethod(env, ci, t(N_CHOOSER), t(G_CHOOSER)), (&a[0]) as u64)
+    if ch == 0 {
+        log(L_OPEN)
+        return false
+    }
+    let sc: u64 = jnicall.j_obj_class(env, pa)
+    a[0] = ch
+    a[1] = (REQ_PICK as i64 as u64) & 4294967295
+    let ok: bool = jnicall.j_void(env, pa, meth(env, sc, N_START_RESULT, G_START_RESULT), (&a[0]) as u64)
+    if !ok {
+        log(L_OPEN)
+    }
+    return ok
+}
+
+// a Java String (modified UTF-8) appended zero terminated to G_META; false when it does not fit
+#[no_gc]
+fn meta_put(env: u64, js: u64) -> bool {
+    var n: usize = 0
+    if js != 0 {
+        let ch: u64 = jnicall.j_utf_chars(env, js)
+        if ch != 0 {
+            while *((ch + n as u64) as *mut u8) != 0 as u8 && n < 300 {
+                if G_META_N + n + 2 >= 640 {
+                    break
+                }
+                G_META[G_META_N + n] = *((ch + n as u64) as *mut u8)
+                n = n + 1
+            }
+            jnicall.j_utf_release(env, js, ch)
+        }
+    }
+    G_META[G_META_N + n] = 0 as u8
+    G_META_N = G_META_N + n + 1
+    return true
+}
+
+// the display name of the content (OpenableColumns.DISPLAY_NAME), else the last path segment of the Uri
+#[no_gc]
+fn display_name(env: u64, res: u64, rc: u64, uri: u64) -> u64 {
+    var a: [u64; 5] = [0; 5]
+    a[0] = uri
+    let cur: u64 = jnicall.j_obj(env, res, meth(env, rc, N_QUERY, G_QUERY), (&a[0]) as u64)
+    var name: u64 = 0
+    if cur != 0 {
+        let cc: u64 = jnicall.j_obj_class(env, cur)
+        var b: [u64; 1] = [0; 1]
+        if jnicall.j_bool(env, cur, meth(env, cc, N_MOVE_FIRST, G_Z), (&b[0]) as u64) {
+            b[0] = jnicall.j_str(env, t(S_COL_NAME))
+            let ix: i32 = jnicall.j_int(env, cur, meth(env, cc, N_COL_INDEX, G_COL_INDEX), (&b[0]) as u64)
+            if ix >= 0 {
+                b[0] = (ix as i64 as u64) & 4294967295
+                name = jnicall.j_obj(env, cur, meth(env, cc, N_GET_STRING, G_GET_STRING), (&b[0]) as u64)
+            }
+        }
+        close_it(env, cur)
+    }
+    if name == 0 {
+        name = call0(env, uri, N_LAST_SEG, G_STR)
+    }
+    return name
+}
+
+// FirnPick.onActivityResult in file mode: the octets behind data.getData() into the mapping. Answers P_READY / P_NONE / P_FAIL.
+#[no_gc]
+fn result(env: u64, pa: u64, res: i32, data: u64) -> i32 {
+    G_N = 0
+    G_META_N = 0
+    G_BIG = false
+    if res != RESULT_OK || data == 0 {
+        log(L_NONE)
+        return P_NONE
+    }
+    let uri: u64 = call0(env, data, N_GET_DATA, G_GET_DATA)
+    let rs: u64 = call0(env, pa, N_RESOLVER, G_RESOLVER)
+    if uri == 0 || rs == 0 {
+        log(L_NONE)
+        return P_NONE
+    }
+    if G_MAP == 0 {
+        let m: i64 = syscall(9, 0, FILE_MAX as i64, 3, 34, -1, 0)
+        if m <= 0 {
+            log(L_FAIL)
+            return P_FAIL
+        }
+        G_MAP = m as u64
+    }
+    let rc: u64 = jnicall.j_obj_class(env, rs)
+    var a: [u64; 1] = [0; 1]
+    a[0] = uri
+    let ins: u64 = jnicall.j_obj(env, rs, meth(env, rc, N_OPEN_IN, G_OPEN_IN), (&a[0]) as u64)
+    if ins == 0 {
+        log(L_FAIL)
+        return P_FAIL
+    }
+    let ic: u64 = jnicall.j_obj_class(env, ins)
+    let rd: u64 = meth(env, ic, N_READ, G_READ)
+    let buf: u64 = jnicall.j_new_bytes(env, CHUNK)
+    var total: usize = 0
+    var st: i32 = P_READY
+    while st == P_READY && buf != 0 {
+        a[0] = buf
+        let k: i32 = jnicall.j_int(env, ins, rd, (&a[0]) as u64)
+        if k < 0 {
+            break
+        }
+        if k == 0 {
+            continue
+        }
+        if total + k as usize > FILE_MAX {
+            G_BIG = true
+            st = P_FAIL
+            log(L_BIG)
+        } else if jnicall.j_bytes_get(env, buf, 0, k as usize, G_MAP + total as u64) {
+            total = total + k as usize
+        } else {
+            st = P_FAIL
+        }
+    }
+    close_it(env, ins)
+    if buf == 0 {
+        st = P_FAIL
+    }
+    if st != P_READY || total == 0 {
+        if st == P_READY {
+            st = P_FAIL // an empty file is not uploaded
+        }
+        if st == P_FAIL && !G_BIG {
+            log(L_FAIL)
+        }
+        return st
+    }
+    G_N = total
+    // name and mime for the upload
+    let nm: u64 = display_name(env, rs, rc, uri)
+    let b0: bool = meta_put(env, nm)
+    a[0] = uri
+    let mt: u64 = jnicall.j_obj(env, rs, meth(env, rc, N_GET_TYPE, G_GET_TYPE), (&a[0]) as u64)
+    let b1: bool = meta_put(env, mt)
+    log(L_GOT)
+    return P_READY
+}
+
+// the file into out (cap) and "<name>\0<mime>\0" into meta (mcap); *n = its size. False when it does not fit.
+#[no_gc]
+fn take(out: u64, cap: usize, n: *mut usize, meta: u64, mcap: usize) -> bool {
+    if G_MAP == 0 || G_N == 0 || G_N > cap || G_META_N == 0 || G_META_N > mcap {
+        return false
+    }
+    var i: usize = 0
+    while i < G_N {
+        *((out + i as u64) as *mut u8) = *((G_MAP + i as u64) as *mut u8)
+        i = i + 1
+    }
+    i = 0
+    while i < G_META_N {
+        *((meta + i as u64) as *mut u8) = G_META[i]
+        i = i + 1
+    }
+    *n = G_N
+    G_N = 0
+    return true
+}
