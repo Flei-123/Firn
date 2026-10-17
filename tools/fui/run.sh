@@ -1522,5 +1522,14 @@ else
     echo "  SKIP weight: no Inter-Regular/SemiBold in $IN_DIR"
 fi
 
+# Ecosystem: recorder, ripple, splitter, hot-reload blocks, XRandR, component sheet (W18-E).
+for t in recorder ripple splitter xrandr ecosystem; do
+    build $t
+    "$W/$t" | tail -1
+done
+build hotreload
+mkdir -p "$W/hr-scratch" && rm -f "$W/hr-scratch"/* && "$W/hotreload" "$W/hr-scratch" | tail -1
+rm -rf "$W/hr-scratch"
+
 echo
 echo "ALL CHECKS PASSED."
