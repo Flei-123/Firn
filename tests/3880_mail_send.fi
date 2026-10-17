@@ -1,0 +1,228 @@
+// expect_exit: 0
+// wasm_skip: sockets and threads
+// tests/3880_mail_send.fi -- mail.mail: blocking send against an in-process SMTP sink (thread).
+// Cross-check against Python's email parser: tools/mail_send_cross/.
+import std.rt
+import std.io
+import std.net
+import std.testkit
+import mail.mail
+
+// ------------------------------------------------------------------ sink
+// mode 0 accept everything, 1 refuse RCPT (550), 2 refuse the data (554), 3 garbage greeting, 4 close at once
+static mut g_mode: u64 = 0
+static mut g_port: u64 = 0
+static mut g_data: u64 = 0
+static mut g_cmds: u64 = 0
+static mut g_ready: u64 = 0
+
+fn data_buf() -> *mut rt.Buf { return g_data as *mut rt.Buf }
+fn cmd_buf() -> *mut rt.Buf { return g_cmds as *mut rt.Buf }
+
+fn say(c: *mut net.Conn, t: str) {
+    net.write_all(c, t.p as u64, t.n) catch 0
+}
+
+// one line (without CRLF) from the connection; false at end of input
+fn read_line(c: *mut net.Conn, pend: *mut rt.Buf, line: *mut rt.Buf) -> bool {
+    var tmp: [u8; 512] = [0; 512]
+    while true {
+        let n: usize = rt.buf_len(pend)
+        var i: usize = 0
+        let p: u64 = rt.buf_ptr(pend)
+        while i < n {
+            if rt.ld8(p, i) == 10 as u8 {
+                rt.buf_clear(line)
+                var e: usize = i
+                if e > 0 && rt.ld8(p, e - 1) == 13 as u8 {
+                    e = e - 1
+                }
+                rt.buf_push_bytes(line, p, e)
+                var rest: rt.Buf = rt.buf_new()
+                rt.buf_push_bytes(&rest, p + (i + 1) as u64, n - i - 1)
+                rt.buf_clear(pend)
+                rt.buf_push_bytes(pend, rt.buf_ptr(&rest), rt.buf_len(&rest))
+                rt.buf_free(&rest)
+                return true
+            }
+            i = i + 1
+        }
+        let got: usize = net.read(c, (&tmp[0]) as u64, 512) catch 0
+        if got == 0 {
+            return false
+        }
+        rt.buf_push_bytes(pend, (&tmp[0]) as u64, got)
+    }
+    return false
+}
+
+fn starts(line: *mut rt.Buf, pre: str) -> bool {
+    if rt.buf_len(line) < pre.n {
+        return false
+    }
+    var i: usize = 0
+    while i < pre.n {
+        var a: u8 = rt.ld8(rt.buf_ptr(line), i)
+        if a >= 97 as u8 && a <= 122 as u8 {
+            a = a - 32 as u8
+        }
+        if a != rt.ld8(pre.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn serve_one(c: *mut net.Conn) {
+    let mode: u64 = g_mode
+    if mode == 4 {
+        return
+    }
+    if mode == 3 {
+        say(c, "garbage without a code\r\n")
+        return
+    }
+    say(c, "220 sink ESMTP\r\n")
+    var pend: rt.Buf = rt.buf_new()
+    var line: rt.Buf = rt.buf_new()
+    while read_line(c, &pend, &line) {
+        rt.buf_push_bytes(cmd_buf(), rt.buf_ptr(&line), rt.buf_len(&line))
+        rt.buf_push(cmd_buf(), 10 as u8)
+        if starts(&line, "QUIT") {
+            say(c, "221 bye\r\n")
+            break
+        } else if starts(&line, "EHLO") {
+            say(c, "250-sink\r\n250 8BITMIME\r\n")
+        } else if starts(&line, "RCPT") && mode == 1 {
+            say(c, "550 no such user\r\n")
+        } else if starts(&line, "DATA") {
+            say(c, "354 go on\r\n")
+            rt.buf_clear(data_buf())
+            while read_line(c, &pend, &line) {
+                if rt.buf_len(&line) == 1 && rt.ld8(rt.buf_ptr(&line), 0) == 46 as u8 {
+                    break
+                }
+                var st: usize = 0
+                if rt.buf_len(&line) >= 2 && rt.ld8(rt.buf_ptr(&line), 0) == 46 as u8 {
+                    st = 1
+                }
+                rt.buf_push_bytes(data_buf(), rt.buf_ptr(&line) + st as u64, rt.buf_len(&line) - st)
+                rt.buf_push(data_buf(), 10 as u8)
+            }
+            if mode == 2 {
+                say(c, "554 rejected\r\n")
+            } else {
+                say(c, "250 queued\r\n")
+            }
+        } else {
+            say(c, "250 ok\r\n")
+        }
+    }
+    rt.buf_free(&pend)
+    rt.buf_free(&line)
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    let l: *mut net.Listener = arg as *mut net.Listener
+    var c: net.Conn = net.accept(l) catch net.conn_from_fd(0 - 1)
+    if net.conn_is_open(&c) {
+        serve_one(&c)
+        net.close(&c)
+    }
+    return 0
+}
+
+// runs one send against a fresh sink; returns the result of `body`
+#[allow_escape]
+fn run_case(mode: u64, m: *mut mail.Mail) -> bool {
+    g_mode = mode
+    rt.buf_clear(data_buf())
+    rt.buf_clear(cmd_buf())
+    var lst: net.Listener = net.listen_tcp(net.ADDR_LOCAL, 0 as u16) catch net.listener_from_fd(0 - 1)
+    let port: u16 = net.listener_port(&lst)
+    let th: u64 = thread_start(0, (&lst) as u64)
+    let ok: bool = mail.send("127.0.0.1", port, m)
+    thread_wait(th)
+    net.close_listener(&lst)
+    return ok
+}
+
+fn has(hay: str, needle: str) -> bool {
+    if needle.n > hay.n {
+        return false
+    }
+    var i: usize = 0
+    while i + needle.n <= hay.n {
+        var j: usize = 0
+        while j < needle.n && rt.ld8(hay.p as u64, i + j) == rt.ld8(needle.p as u64, j) {
+            j = j + 1
+        }
+        if j == needle.n {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var data: rt.Buf = rt.buf_new()
+    var cmds_b: rt.Buf = rt.buf_new()
+    g_data = (&data) as u64
+    g_cmds = (&cmds_b) as u64
+
+    // 1. plain mail with an attachment and a dot line
+    var m: mail.Mail = mail.message("alice@example.com", "bob@example.com", "Report", "Hello Bob,\n.dot line\nbye\n")
+    mail.attach(&m, "report.csv", "text/csv", "id,qty\n1,3\n")
+    testkit.check(run_case(0, &m), "send accepted")
+    let got: str = rt.buf_str(data_buf())
+    let cmds: str = rt.buf_str(cmd_buf())
+    testkit.check(has(cmds, "MAIL FROM:<alice@example.com>"), "envelope from")
+    testkit.check(has(cmds, "RCPT TO:<bob@example.com>"), "envelope to")
+    testkit.check(has(got, "Subject: Report"), "subject header")
+    testkit.check(has(got, "To: bob@example.com"), "to header")
+    testkit.check(has(got, "\n.dot line\n"), "leading dot restored")
+    testkit.check(has(got, "report.csv"), "attachment name")
+    testkit.check(has(got, "aWQscXR5CjEsMwo="), "attachment base64")
+    testkit.check(mail.last_error() == 0 as u32, "no error after success")
+    mail.free(&m)
+
+    // 2. two recipients
+    var m2: mail.Mail = mail.message("a@example.com", "x@example.com", "Two", "hi\n")
+    mail.add_to(&m2, "y@example.com")
+    testkit.check(run_case(0, &m2), "two recipients accepted")
+    let cmds2: str = rt.buf_str(cmd_buf())
+    testkit.check(!has(rt.buf_str(data_buf()), "hi\n\n"), "single part: no second line end after the body")
+    testkit.check(has(cmds2, "RCPT TO:<x@example.com>") && has(cmds2, "RCPT TO:<y@example.com>"), "both RCPT lines")
+    mail.free(&m2)
+
+    // 3. refused recipient
+    var m3: mail.Mail = mail.message("a@example.com", "x@example.com", "No", "hi\n")
+    testkit.check(!run_case(1, &m3), "refused recipient fails")
+    testkit.check(mail.last_error() != 0 as u32, "error number set")
+    mail.free(&m3)
+
+    // 4. refused data
+    var m4: mail.Mail = mail.message("a@example.com", "x@example.com", "No", "hi\n")
+    testkit.check(!run_case(2, &m4), "refused data fails")
+    testkit.check(mail.last_code() == 554 as u32, "reply code 554")
+    mail.free(&m4)
+
+    // 5. garbage greeting, closed at once: no crash, false
+    var m5: mail.Mail = mail.message("a@example.com", "x@example.com", "G", "hi\n")
+    testkit.check(!run_case(3, &m5), "garbage greeting fails")
+    testkit.check(!run_case(4, &m5), "closed connection fails")
+    mail.free(&m5)
+
+    // 6. nobody listens / unknown address / bad envelope
+    var m6: mail.Mail = mail.message("a@example.com", "x@example.com", "G", "hi\n")
+    testkit.check(!mail.send("127.0.0.1", 1 as u16, &m6), "refused connect")
+    testkit.check(mail.last_error() != 0 as u32, "refused connect sets an error")
+    mail.free(&m6)
+    var m7: mail.Mail = mail.message("a b@example.com", "x@example.com", "G", "hi\n")
+    testkit.check(!run_case(0, &m7), "bad envelope address is refused")
+    mail.free(&m7)
+    return testkit.finish()
+}

@@ -17,4 +17,8 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 
 
-http.server.ThreadingHTTPServer(("127.0.0.1", int(os.environ["VSPY_PORT"])), H).serve_forever()
+class S(http.server.ThreadingHTTPServer):
+    request_queue_size = 128  # default 5: 20 simultaneous SYNs overflow the accept queue -> 1 s SYN retransmit
+
+
+S(("127.0.0.1", int(os.environ["VSPY_PORT"])), H).serve_forever()

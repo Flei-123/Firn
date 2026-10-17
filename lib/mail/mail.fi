@@ -1,0 +1,297 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mail/mail.fi -- mail: send an e-mail in one blocking call, the `smtplib` + `EmailMessage` of a script.
+//
+//     import mail.mail
+//
+//     var m: mail.Mail = mail.message("alice@example.com", "bob@example.com", "Report", "Hello Bob\n")
+//     mail.attach(&m, "report.csv", "text/csv", "id,qty\n1,3\n")          // MIME base64, any number
+//     if !mail.send("127.0.0.1", 25, &m) { ... mail.last_error() / mail.last_text() ... }
+//     mail.free(&m)
+//
+//     mail.send_login("smtp.example.org", 587, "user", "secret", &m)      // STARTTLS + AUTH
+//
+// `to` may hold several bare addresses separated by commas. The envelope uses the bare
+// addresses; the headers carry whatever you passed (a display name is fine in the
+// header setters of mail.rfc822, but `message()` takes bare addresses for both).
+//
+// Layering: this file is the blocking convenience over mail.smtp (sans-I/O core + async glue)
+// and mail.rfc822 (builder). It runs a private async.loop until the dialogue is over.
+//
+// Connection mode: port 465 = TLS from the first octet, any other port = plain, with
+// STARTTLS when the server offers it (and TLS certificates are checked against the system
+// roots). A login is refused on a plain connection (mail.smtp M2).
+//
+// HONEST
+//   S1  Blocking: the call returns after QUIT or on failure. 30 s inactivity timeout.
+//   S2  Opportunistic STARTTLS: a server that does not offer it gets the mail in clear text.
+//       `send_secure` makes STARTTLS mandatory.
+//   S3  Addresses are ASCII, bare (no `Name <addr>` in the envelope); see mail.smtp M4.
+//   S4  Attachments are held in memory. Message-ID and Date are made by mail.rfc822.
+import std.rt
+import std.str
+import std.fs
+import std.net
+import std.time
+import tls.x509
+import tls.trust
+import net.http
+import async.loop
+import mail.rfc822
+import mail.smtp
+
+export {
+    Mail, message, attach, attach_file, add_to, add_header, free, build,
+    send, send_login, send_secure, send_raw, last_error, last_code, last_text,
+}
+
+struct Mail {
+    b: rfc822.Builder,
+    from: rt.Buf,
+    to: rt.Buf,
+}
+
+struct Job {
+    l: *mut loop.Loop,
+    from_p: u64,
+    from_n: usize,
+    to_p: u64,
+    to_n: usize,
+    msg_p: u64,
+    msg_n: usize,
+    sent: bool,
+    err: u32,
+    code: u32,
+    text: [u8; 256],
+    ntext: usize,
+}
+
+static mut g_err: u32 = 0
+static mut g_code: u32 = 0
+static mut g_text: [u8; 256] = [0; 256]
+static mut g_ntext: usize = 0
+
+// The mail.smtp ERR_* number of the last failed send (0 = no error, 1000 = could not connect/resolve).
+fn last_error() -> u32 { return g_err }
+
+// The last SMTP reply code the server gave (0 when none).
+fn last_code() -> u32 { return g_code }
+
+// The text of the last SMTP reply (a view of an internal buffer, valid until the next send).
+fn last_text() -> str {
+    return str { p: (&g_text[0]) as *mut u8, n: g_ntext }
+}
+
+fn save_text(job: *mut Job, t: str) {
+    var n: usize = t.n
+    if n > 255 {
+        n = 255
+    }
+    var i: usize = 0
+    while i < n {
+        (*job).text[i] = rt.ld8(t.p as u64, i)
+        i = i + 1
+    }
+    (*job).ntext = n
+}
+
+// A message with sender, recipient(s), subject and plain-text body. `from`/`to` are bare addresses.
+fn message(from: str, to: str, subject: str, body: str) -> Mail {
+    var m: Mail = Mail { b: rfc822.builder_new(), from: rt.buf_new(), to: rt.buf_new() }
+    rt.buf_push_bytes(&m.from, from.p as u64, from.n)
+    rt.buf_push_bytes(&m.to, to.p as u64, to.n)
+    rfc822.builder_set_from(&m.b, from)
+    rfc822.builder_add_to(&m.b, to)
+    rfc822.builder_set_subject(&m.b, subject)
+    rfc822.builder_set_text(&m.b, body)
+    return m
+}
+
+// One more recipient (envelope and To header).
+fn add_to(m: *mut Mail, addr: str) {
+    if rt.buf_len(&(*m).to) > 0 {
+        rt.buf_push(&(*m).to, 44 as u8)
+    }
+    rt.buf_push_bytes(&(*m).to, addr.p as u64, addr.n)
+    rfc822.builder_add_to(&(*m).b, addr)
+}
+
+// A custom header, e.g. `mail.add_header(&m, "Reply-To", "x@example.com")`.
+fn add_header(m: *mut Mail, name: str, value: str) {
+    rfc822.builder_add_header(&(*m).b, name, value)
+}
+
+// Attaches `data` as `name` with media type `ctype` (sent base64).
+fn attach(m: *mut Mail, name: str, ctype: str, data: str) {
+    rfc822.builder_attach(&(*m).b, name, ctype, data.p as u64, data.n)
+}
+
+// Attaches the file at `path` under its base name. False when the file cannot be read.
+fn attach_file(m: *mut Mail, path: str, ctype: str) -> bool {
+    var buf: rt.Buf = rt.buf_new()
+    let got: usize = fs.read_file(path, &buf) catch 0
+    let ok: bool = got > 0 || rt.buf_len(&buf) > 0
+    if ok {
+        var at: usize = 0
+        var i: usize = 0
+        while i < path.n {
+            if rt.ld8(path.p as u64, i) == 47 as u8 {
+                at = i + 1
+            }
+            i = i + 1
+        }
+        let name: str = str { p: (path.p as u64 + at as u64) as *mut u8, n: path.n - at }
+        rfc822.builder_attach(&(*m).b, name, ctype, rt.buf_ptr(&buf), rt.buf_len(&buf))
+    }
+    rt.buf_free(&buf)
+    return ok
+}
+
+// The finished message text (CRLF lines) in `out`.
+fn build(m: *mut Mail, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    rfc822.builder_build(&(*m).b, out)
+}
+
+fn free(m: *mut Mail) {
+    rfc822.builder_free(&(*m).b)
+    rt.buf_free(&(*m).from)
+    rt.buf_free(&(*m).to)
+}
+
+fn job_cb(c: *mut smtp.Sc, ud: u64, kind: u32, arg: i64) {
+    let job: *mut Job = ud as *mut Job
+    if kind == smtp.SME_READY {
+        let from: str = str { p: (*job).from_p as *mut u8, n: (*job).from_n }
+        let to: str = str { p: (*job).to_p as *mut u8, n: (*job).to_n }
+        if !smtp.sc_send(c, from, to, (*job).msg_p, (*job).msg_n) {
+            (*job).err = smtp.sc_err(c)
+            smtp.sc_quit(c)
+        }
+    } else if kind == smtp.SME_SENT {
+        (*job).sent = arg == 1
+        (*job).err = smtp.sc_err(c)
+        (*job).code = smtp.sc_code(c)
+        save_text(job, smtp.sc_text(c))
+        smtp.sc_quit(c)
+    } else if kind == smtp.SME_CLOSED {
+        if !(*job).sent && (*job).err == 0 {
+            (*job).err = smtp.sc_err(c)
+            if (*job).err == 0 {
+                (*job).err = 1000 as u32
+            }
+            (*job).code = smtp.sc_code(c)
+            save_text(job, smtp.sc_text(c))
+        }
+        loop.stop((*job).l)
+    }
+}
+
+fn job_abort(l: *mut loop.Loop, ud: u64) {
+    loop.stop(l)
+}
+
+fn finish(job: *mut Job, ok: bool) -> bool {
+    g_err = (*job).err
+    g_code = (*job).code
+    g_ntext = (*job).ntext
+    var i: usize = 0
+    while i < (*job).ntext {
+        g_text[i] = (*job).text[i]
+        i = i + 1
+    }
+    if ok {
+        g_err = 0
+    }
+    return ok
+}
+
+#[allow_escape]
+fn run_job(host: str, port: u16, user: str, pass: str, tls_policy: u32,
+    from: str, to: str, mp: u64, mn: usize) -> bool {
+    var job: Job = Job { l: 0 as *mut loop.Loop, from_p: from.p as u64, from_n: from.n, to_p: to.p as u64,
+        to_n: to.n, msg_p: mp, msg_n: mn, sent: false, err: 0, code: 0, text: [0; 256], ntext: 0 }
+    var hc: http.Client = http.client_new()
+    var addrs: [u32; 8] = [0; 8]
+    var na: usize = 0
+    if http.client_init(&hc) {
+        na = http.addrs_of_host(&hc, host.p as u64, host.n, &addrs)
+        http.client_free(&hc)
+    }
+    if na == 0 {
+        job.err = 1000 as u32
+        return finish(&job, false)
+    }
+    var l: loop.Loop = loop.loop_new()
+    if !loop.loop_init(&l) {
+        job.err = 1000 as u32
+        return finish(&job, false)
+    }
+    job.l = &l
+    var store: x509.Store = x509.store_new()
+    var mode: u32 = smtp.SM_STARTTLS
+    if port == 465 as u16 {
+        mode = smtp.SM_TLS
+    }
+    if mode != smtp.SM_PLAIN {
+        trust.trust_load_system(&store)
+    }
+    let now_s: u64 = (time.now_unix_ms() / 1000) as u64
+    let c: *mut smtp.Sc = smtp.sc_open(&l, addrs[0], port, mode, host, &store, now_s, 30000, job_cb, (&job) as u64)
+    if c as u64 == 0 {
+        job.err = 1000 as u32
+        x509.store_free(&store)
+        loop.loop_free(&l)
+        return finish(&job, false)
+    }
+    if mode != smtp.SM_TLS {
+        smtp.sc_set_tls_mode(c, tls_policy)
+    }
+    if user.n > 0 {
+        smtp.sc_set_login(c, user, pass)
+    }
+    loop.timer_after(&l, 120000, job_abort, 0)
+    loop.run(&l)
+    x509.store_free(&store)
+    loop.loop_free(&l)
+    return finish(&job, job.sent)
+}
+
+// Sends the finished message text (`mp`/`mn`, as made by `build`) from `from` to `to` (bare addresses,
+// comma separated). True when the server accepted it.
+fn send_raw(host: str, port: u16, from: str, to: str, mp: u64, mn: usize) -> bool {
+    return run_job(host, port, "", "", smtp.SMTP_OPPORTUNISTIC, from, to, mp, mn)
+}
+
+// Sends `m` to `host:port` without login.
+fn send(host: str, port: u16, m: *mut Mail) -> bool {
+    var out: rt.Buf = rt.buf_new()
+    build(m, &out)
+    let ok: bool = run_job(host, port, "", "", smtp.SMTP_OPPORTUNISTIC, bs(&(*m).from), bs(&(*m).to),
+        rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+    return ok
+}
+
+// Sends `m` with AUTH PLAIN/LOGIN (needs TLS: port 465 or STARTTLS).
+fn send_login(host: str, port: u16, user: str, pass: str, m: *mut Mail) -> bool {
+    var out: rt.Buf = rt.buf_new()
+    build(m, &out)
+    let ok: bool = run_job(host, port, user, pass, smtp.SMTP_REQUIRE, bs(&(*m).from), bs(&(*m).to),
+        rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+    return ok
+}
+
+// Like `send`, but STARTTLS is mandatory on every port except 465 (which is TLS from the start).
+fn send_secure(host: str, port: u16, m: *mut Mail) -> bool {
+    var out: rt.Buf = rt.buf_new()
+    build(m, &out)
+    let ok: bool = run_job(host, port, "", "", smtp.SMTP_REQUIRE, bs(&(*m).from), bs(&(*m).to),
+        rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+    return ok
+}
+
+fn bs(b: *mut rt.Buf) -> str {
+    return str { p: rt.buf_ptr(b) as *mut u8, n: rt.buf_len(b) }
+}

@@ -94,6 +94,7 @@ export {
     ws_send, ws_send_binary, ws_close, ws_broadcast, ws_count,
     sse_send, sse_count, set_quiet, set_limits,
     requests_served, close_server,
+    SERVE_KIND, serve_background, serve_main, stop_wait, userdata, set_userdata, app_userdata,
 }
 
 const K_FREE: u32 = 0
@@ -109,6 +110,10 @@ const R_SSE: u32 = 4
 const SYS_READ_FROM: i64 = 45 // recvfrom
 const SYS_SEND_TO: i64 = 44 // sendto
 const SYS_CLOSE_FD: i64 = 3
+const SYS_WRITE_FD: i64 = 1
+const SYS_READ_FD: i64 = 0
+const SYS_EVENTFD2: i64 = 290
+const WAKE_CI: usize = 18446744073709551615
 const SYS_POLL_FDS: i64 = 7
 const SYS_SOCKET_NEW: i64 = 41
 const SYS_BIND_ADDR: i64 = 49
@@ -190,6 +195,8 @@ struct App {
     polls: rt.Buf,
     pmap: rt.Buf,
     scratch: rt.Buf,
+    ud: u64, // the program's own pointer/number, see `set_userdata`
+    wake_fd: i32, // eventfd that makes `stop` end a poll at once (-1 = none)
 }
 
 // What a handler sees of one request.
@@ -275,7 +282,7 @@ fn app(port: u16) -> App {
         tick: no_tick, tick_ms: 0, next_tick: 0, max_body: 1048576,
         max_msg: 1048576, idle_ms: 60000, quiet: false, running: false,
         requests: 0, urlbuf: rt.buf_new(), polls: rt.buf_new(), pmap: rt.buf_new(),
-        scratch: rt.buf_new() }
+        scratch: rt.buf_new(), ud: 0, wake_fd: 0 - 1 }
 }
 
 fn add_route(a: *mut App, path: str, kind: u32) -> *mut Route {
@@ -333,7 +340,19 @@ fn set_limits(a: *mut App, max_body: usize, max_msg: usize, max_conn: usize) {
 
 fn requests_served(a: *mut App) -> u64 { return (*a).requests }
 
-fn stop(a: *mut App) { (*a).running = false }
+// Ends `serve`/`run_for`. Callable from another thread; with `serve_background` the poll ends at once.
+fn stop(a: *mut App) {
+    (*a).running = false
+    if (*a).wake_fd >= 0 {
+        var one: [u64; 1] = [1; 1]
+        syscall(SYS_WRITE_FD, (*a).wake_fd as i64, (&one[0]) as i64, 8, 0, 0, 0)
+    }
+}
+
+// Per-app user data: any number or pointer, handed to the handlers: `http.userdata(r)`.
+fn set_userdata(a: *mut App, ud: u64) { (*a).ud = ud }
+fn app_userdata(a: *mut App) -> u64 { return (*a).ud }
+fn userdata(r: *mut Req) -> u64 { return (*(*r).app).ud }
 
 // The pairing token: 16 random octets as 32 hex digits. Returns it.
 fn pair(a: *mut App) -> str {
@@ -643,6 +662,10 @@ fn step(a: *mut App, timeout_ms: i64) -> bool {
     var n: usize = 0
     push_poll(a, (*a).fd, POLLIN, 0)
     n = 1
+    if (*a).wake_fd >= 0 {
+        push_poll(a, (*a).wake_fd, POLLIN, WAKE_CI)
+        n = 2
+    }
     var i: usize = 0
     while i < (*a).max_conn {
         let c: *mut Conn = conn(a, i)
@@ -672,11 +695,16 @@ fn step(a: *mut App, timeout_ms: i64) -> bool {
                     accept_all(a, now)
                 } else {
                     let ci: usize = rt.ld64((*a).pmap.ptr, k) as usize
-                    let c: *mut Conn = conn(a, ci)
-                    if (rev & (POLLIN | POLLHUP | POLLERR)) != 0 {
-                        read_all(a, ci, now)
+                    if ci == WAKE_CI {
+                        var sink: [u64; 1] = [0; 1]
+                        syscall(SYS_READ_FD, (*a).wake_fd as i64, (&sink[0]) as i64, 8, 0, 0, 0)
+                    } else {
+                        let c: *mut Conn = conn(a, ci)
+                        if (rev & (POLLIN | POLLHUP | POLLERR)) != 0 {
+                            read_all(a, ci, now)
+                        }
+                        if (rev & POLLOUT) != 0 { flush(c) }
                     }
-                    if (rev & POLLOUT) != 0 { flush(c) }
                 }
             }
             k = k + 1
@@ -753,6 +781,52 @@ fn serve(a: *mut App) -> i32 {
     return 0
 }
 
+// ------------------------------------------------------------ in the background
+//
+//     fn __thread_work(kind: u64, arg: u64) -> u64 {       // ONE line to wire it (a library cannot define it)
+//         if kind == http.SERVE_KIND { return http.serve_main(arg) }
+//         return 0
+//     }
+//     var app: http.App = http.app(0)
+//     http.listen(&app)                      // port known
+//     let th: u64 = http.serve_background(&app)
+//     ...                                    // talk to it
+//     http.stop_wait(&app, th)               // returns at once: stop() wakes the poll
+//
+// The App must stay alive (a local of `main` is fine) until `stop_wait` has returned.
+const SERVE_KIND: u64 = 1213420118
+
+// The thread body for `SERVE_KIND`: steps the App until `stop`.
+#[allow_escape]
+fn serve_main(arg: u64) -> u64 {
+    let a: *mut App = arg as *mut App
+    while (*a).running {
+        step(a, 1000)
+    }
+    return 0
+}
+
+// Binds (when not yet done) and serves on a new thread. Returns the thread handle for `stop_wait`,
+// 0 when the port is taken or no thread could be started.
+#[allow_escape]
+fn serve_background(a: *mut App) -> u64 {
+    if (*a).wake_fd < 0 {
+        let fd: i64 = syscall(SYS_EVENTFD2, 0, 2048 + 524288, 0, 0, 0, 0)
+        if fd >= 0 {
+            (*a).wake_fd = fd as i32
+        }
+    }
+    if !step(a, 0) { return 0 }
+    return thread_start(SERVE_KIND, a as u64)
+}
+
+// Stops a background server and waits for its thread; the wake-up makes this take microseconds,
+// not up to one poll interval.
+fn stop_wait(a: *mut App, th: u64) {
+    stop(a)
+    thread_wait(th)
+}
+
 // Closes the listening socket and every connection, and gives the connection
 // buffers back: after this the port is free again and the App must not be
 // stepped any more. (A program that serves until it exits never needs this; a
@@ -776,6 +850,10 @@ fn close_server(a: *mut App) {
     if (*a).fd >= 0 {
         syscall(SYS_CLOSE_FD, (*a).fd as i64, 0, 0, 0, 0, 0)
         (*a).fd = 0 - 1
+    }
+    if (*a).wake_fd >= 0 {
+        syscall(SYS_CLOSE_FD, (*a).wake_fd as i64, 0, 0, 0, 0, 0)
+        (*a).wake_fd = 0 - 1
     }
     (*a).running = false
 }

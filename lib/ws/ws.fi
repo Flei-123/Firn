@@ -32,14 +32,17 @@ import std.net
 import std.base64
 import std.crypto.sha1
 import std.crypto.random
+import std.time
 import tls.tls
 import tls.x509
+import tls.trust
+import net.dns
 
 export {
     Frame, Utf8, Client, WsError,
     frame_new, parse_frame, write_frame, unmask, accept_key, close_code_ok,
     utf8_new, utf8_feed, utf8_complete,
-    client_new, connect, connect_tls, send_text, send_binary, send_ping, recv,
+    client_new, connect, connect_tls, connect_url, send_text, send_binary, send_ping, recv,
     close, close_code, is_open, client_free,
     // round ASYNC
     send_fragmented, backoff_ms, close_timeout, send_close_frame,
@@ -414,6 +417,137 @@ fn connect_tls(c: *mut Client, addr: u32, port: u16, host: str, path: str,
     let ok: bool = tls.tls_handshake(&(*c).t) catch false
     if !ok { return WsError::Tls }
     return handshake(c, host, path)
+}
+
+// "ws://host[:port]/path?query" or "wss://..." in one call: the host is a name or an IPv4
+// address (DNS through net.dns), the port defaults to 80 / 443, the path to "/". wss checks the
+// certificate against the system roots and the host name. The Host header carries `host:port`
+// when the port is not the default.
+#[allow_escape]
+fn connect_url(c: *mut Client, url: str) -> WsError!bool {
+    var i: usize = 0
+    var tls_on: bool = false
+    if url.n >= 6 && rt.mem_eq(url.p as u64, "wss://".p as u64, 6) {
+        tls_on = true
+        i = 6
+    } else if url.n >= 5 && rt.mem_eq(url.p as u64, "ws://".p as u64, 5) {
+        i = 5
+    } else {
+        return WsError::Handshake
+    }
+    let hs: usize = i
+    while i < url.n && *(url.p + i) != 47 as u8 && *(url.p + i) != 58 as u8 && *(url.p + i) != 63 as u8 { i = i + 1 }
+    let host: str = str { p: url.p + hs, n: i - hs }
+    var port: u32 = 80
+    if tls_on { port = 443 }
+    var explicit: bool = false
+    if i < url.n && *(url.p + i) == 58 as u8 {
+        i = i + 1
+        port = 0
+        while i < url.n && *(url.p + i) >= 48 as u8 && *(url.p + i) <= 57 as u8 {
+            port = port * 10 + (*(url.p + i) - 48 as u8) as u32
+            i = i + 1
+            if port > 65535 { return WsError::Handshake }
+        }
+        explicit = true
+    }
+    if host.n == 0 || port == 0 { return WsError::Handshake }
+    var pathb: rt.Buf = rt.buf_new()
+    if i >= url.n || *(url.p + i) != 47 as u8 { rt.buf_push(&pathb, 47 as u8) }
+    rt.buf_push_bytes(&pathb, (url.p + i) as u64, url.n - i)
+    var hostb: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&hostb, host.p as u64, host.n)
+    if explicit && ((tls_on && port != 443) || (!tls_on && port != 80)) {
+        rt.buf_push(&hostb, 58 as u8)
+        var dig: [u8; 6] = [0; 6]
+        var nd: usize = 0
+        var v: u32 = port
+        while v > 0 {
+            dig[nd] = (48 + v % 10) as u8
+            nd = nd + 1
+            v = v / 10
+        }
+        while nd > 0 {
+            nd = nd - 1
+            rt.buf_push(&hostb, dig[nd])
+        }
+    }
+    var addr: u32 = 0
+    if !numeric_host(host, &addr) {
+        var res: dns.Resolver = dns.resolver_new()
+        var o: dns.Resolved = dns.resolved_new()
+        let got: bool = dns.resolver_init(&res) && (dns.dns_resolve_a(&res, host.p as u64, host.n, &o) catch false)
+        if !got || o.n == 0 {
+            rt.buf_free(&pathb)
+            rt.buf_free(&hostb)
+            return WsError::Io
+        }
+        addr = o.addr[0]
+    }
+    var err: i64 = 0
+    (*c).conn = net.connect_tcp_err(addr, port as u16, &err) catch net.conn_from_fd(0 - 1)
+    if !net.conn_is_open(&(*c).conn) {
+        rt.buf_free(&pathb)
+        rt.buf_free(&hostb)
+        return WsError::Io
+    }
+    let nd2: bool = net.set_no_delay(&(*c).conn, true) catch false
+    if tls_on {
+        trust.trust_load_system(&(*c).store)
+        let now: u64 = (time.now_unix_ms() / 1000) as u64
+        if !tls.tls_init(&(*c).t, &(*c).conn, &(*c).store, host.p as u64, host.n, now) {
+            rt.buf_free(&pathb)
+            rt.buf_free(&hostb)
+            return WsError::Tls
+        }
+        (*c).secure = true
+        let ok: bool = tls.tls_handshake(&(*c).t) catch false
+        if !ok {
+            rt.buf_free(&pathb)
+            rt.buf_free(&hostb)
+            return WsError::Tls
+        }
+    }
+    let r: bool = handshake(c, str { p: rt.buf_ptr(&hostb) as *mut u8, n: rt.buf_len(&hostb) },
+        str { p: rt.buf_ptr(&pathb) as *mut u8, n: rt.buf_len(&pathb) }) catch false
+    rt.buf_free(&pathb)
+    rt.buf_free(&hostb)
+    if !r { return WsError::Handshake }
+    return true
+}
+
+// "localhost" or a dotted IPv4 address.
+fn numeric_host(h: str, out: *mut u32) -> bool {
+    if h.n == 9 && rt.mem_eq(h.p as u64, "localhost".p as u64, 9) {
+        *out = net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8)
+        return true
+    }
+    var parts: [u32; 4] = [0; 4]
+    var k: usize = 0
+    var v: u32 = 0
+    var digits: usize = 0
+    var i: usize = 0
+    while i < h.n {
+        let ch: u8 = *(h.p + i)
+        if ch == 46 as u8 {
+            if digits == 0 || k >= 3 { return false }
+            parts[k] = v
+            k = k + 1
+            v = 0
+            digits = 0
+        } else if ch >= 48 as u8 && ch <= 57 as u8 {
+            v = v * 10 as u32 + (ch - 48 as u8) as u32
+            digits = digits + 1
+            if v > 255 { return false }
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if k != 3 || digits == 0 { return false }
+    parts[3] = v
+    *out = net.ipv4(parts[0] as u8, parts[1] as u8, parts[2] as u8, parts[3] as u8)
+    return true
 }
 
 fn send_frame(c: *mut Client, op: u32, p: u64, n: usize) -> bool {

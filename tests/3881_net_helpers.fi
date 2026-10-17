@@ -1,0 +1,104 @@
+// expect_exit: 0
+// wasm_skip: sockets and threads
+// tests/3881_net_helpers.fi -- http.server serve_background / stop_wait / userdata,
+// ahttp.get_all (gather), ws.connect_url.
+import std.rt
+import std.io
+import std.net
+import std.vec
+import std.time
+import std.testkit
+import http.server as srv
+import async.ahttp
+import ws.ws
+
+struct Shared {
+    hits: u64,
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == srv.SERVE_KIND { return srv.serve_main(arg) }
+    return 0
+}
+
+fn on_n(r: *mut srv.Req) {
+    let sh: *mut Shared = srv.userdata(r) as *mut Shared
+    (*sh).hits = (*sh).hits + 1
+    if srv.path(r) == "/n/404" {
+        srv.reply(r, 404, "text/plain", "nope")
+    } else {
+        srv.reply(r, 200, "text/plain", "body of " + srv.path(r))
+    }
+}
+
+fn on_echo(w: *mut srv.Ws, msg: str) {
+    srv.ws_send(w, msg)
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var sh: Shared = Shared { hits: 0 }
+    var app: srv.App = srv.app(0)
+    app.addr = net.ADDR_LOCAL
+    srv.set_quiet(&app, true)
+    srv.set_userdata(&app, (&sh) as u64)
+    testkit.check(srv.app_userdata(&app) == (&sh) as u64, "userdata stored")
+    srv.route(&app, "/n/1", on_n)
+    srv.route(&app, "/n/2", on_n)
+    srv.route(&app, "/n/404", on_n)
+    srv.route_ws(&app, "/echo", on_echo)
+    testkit.check(srv.listen(&app), "listen")
+    let th: u64 = srv.serve_background(&app)
+    testkit.check(th != 0 as u64, "background thread started")
+    let base: str = io.fmt_string(f"http://127.0.0.1:{srv.port(&app)}")
+
+    // gather: ok, ok, 404, refused, bad scheme, same url twice
+    var urls: Vec[str] = vec_new[str]()
+    vec_push[str](&urls, base + "/n/1")
+    vec_push[str](&urls, base + "/n/2")
+    vec_push[str](&urls, base + "/n/404")
+    vec_push[str](&urls, "http://127.0.0.1:1/x")
+    vec_push[str](&urls, "ftp://nowhere/")
+    vec_push[str](&urls, base + "/n/1")
+    var res: Vec[ahttp.Got] = vec_new[ahttp.Got]()
+    let ok: usize = ahttp.get_all(&urls, &res, 5000)
+    testkit.check(ok == 4, "four answers")
+    testkit.check(vec_len[ahttp.Got](&res) == 6, "one result per url")
+    let g0: *mut ahttp.Got = vec_elem_ptr[ahttp.Got](&res, 0)
+    let g2: *mut ahttp.Got = vec_elem_ptr[ahttp.Got](&res, 2)
+    let g3: *mut ahttp.Got = vec_elem_ptr[ahttp.Got](&res, 3)
+    let g4: *mut ahttp.Got = vec_elem_ptr[ahttp.Got](&res, 4)
+    let g5: *mut ahttp.Got = vec_elem_ptr[ahttp.Got](&res, 5)
+    testkit.check((*g0).status == 200 as u32 && ahttp.got_body(g0) == "body of /n/1", "first body")
+    testkit.check((*g2).status == 404 as u32, "404 is an answer")
+    testkit.check((*g3).status == 0 as u32 && (*g3).err != 0 as u32, "refused connect: status 0 + error")
+    testkit.check((*g4).status == 0 as u32 && (*g4).err != 0 as u32, "bad scheme: status 0 + error")
+    testkit.check((*g5).status == 200 as u32, "repeated url")
+    testkit.check(sh.hits == 4 as u64, "handler saw user data (4 hits)")
+    ahttp.got_free_all(&res)
+    var none: Vec[str] = vec_new[str]()
+    testkit.check(ahttp.get_all(&none, &res, 1000) == 0, "empty list")
+    ahttp.got_free_all(&res)
+
+    // websocket by URL
+    var c: ws.Client = ws.client_new()
+    let ws_ok: bool = ws.connect_url(&c, io.fmt_string(f"ws://127.0.0.1:{srv.port(&app)}/echo")) catch false
+    testkit.check(ws_ok, "connect_url ws")
+    var msg: rt.Buf = rt.buf_new()
+    ws.send_text(&c, "ping")
+    let got: bool = (ws.recv(&c, &msg) catch 0 as u32) != 0 as u32
+    testkit.check(got && rt.buf_str(&msg) == "ping", "echo over connect_url")
+    ws.close(&c, 1000)
+    var c2: ws.Client = ws.client_new()
+    testkit.check(!(ws.connect_url(&c2, "http://127.0.0.1/") catch false), "wrong scheme refused")
+    testkit.check(!(ws.connect_url(&c2, "ws://127.0.0.1:1/x") catch false), "refused connect")
+    testkit.check(!(ws.connect_url(&c2, "ws://:80/") catch false), "empty host refused")
+    testkit.check(!(ws.connect_url(&c2, "ws://127.0.0.1:99999/") catch false), "port out of range refused")
+
+    // stop returns at once (the poll interval of serve_main is 1 s)
+    let t0: i64 = time.now_unix_ms()
+    srv.stop_wait(&app, th)
+    let dt: i64 = time.now_unix_ms() - t0
+    testkit.check(dt < 400, "stop_wait is instant")
+    return testkit.finish()
+}
