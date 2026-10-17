@@ -451,9 +451,10 @@ def clipboard_text(timeout=3.0):
         d.close()
 
 
-# the window layer's own selection (no xclip helper): a helper leaves a daemon behind that owns the clipboard
-# for the rest of the run and slowed the answers of the drivers after it
-r = Run(1, 3, "msgdlg-live", "Line one\nLine two", env=dict(ENV_LIGHT, FIRN_CLIPBOARD="native"))
+# the default helper path (xclip -in leaves a daemon behind that owns the clipboard). Until r283 that daemon
+# inherited the dialog's X socket (no SOCK_CLOEXEC in net.connect_unix), the X server never saw the
+# connection close and the drivers after it stalled; the socket is CLOEXEC now.
+r = Run(1, 3, "msgdlg-live", "Line one\nLine two", env=dict(ENV_LIGHT))
 if r.win is not None:
     r.focus()
     xdo("key", "ctrl+c")
