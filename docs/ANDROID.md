@@ -228,6 +228,20 @@ pictures), so page and app see the same photos.
   JPEG, 132 kB; camera photo 1200x1600; a red photo sent from another
   account painted in its bubble; Back in the chooser sends nothing.
 
+## Microphone, speech output, share (A3, 17.10.2026)
+
+* `lib/plat/android/speech.fi` -- RECORD_AUDIO permission (JNI) + AAudio capture (16 kHz mono, polled: call
+  `speech_poll()` at least every ~200 ms), WAV in memory (`pcmwav.fi`), level for a meter. Upload to `/api/stt` is
+  the app's job. Build flag `--speech` (`-laaudio` + the permission).
+* `lib/plat/android/tts.fi` -- `android.speech.tts.TextToSpeech` via JNI, no dex class (null init listener, polled).
+  Languages de/en. Build flag `--tts` (`<queries>` for the TTS service, needed from Android 11). The default
+  emulator image has no engine: only the error path (`TTS_ERROR`) is testable there.
+* `lib/plat/android/share.fi` -- save to `Download/<sub>` (MediaStore, API 29+; private file below), ACTION_VIEW,
+  ACTION_SEND (file / text, chooser), open URL, clipboard `clip_read`/`clip_write` (works only while the app has
+  focus). JNI only on the UI thread.
+* Check: `tools/android/voicedemo` + `bash tools/android/voice_check.sh` (emulator API 35 x86_64: 10/10).
+  The program must drain events (`next_event`) or Android raises an ANR on the focus event.
+
 ## Open
 
 * The soft keyboard composes nothing yet (no InputConnection without a dex
