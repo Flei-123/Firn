@@ -879,6 +879,12 @@ for f in lib/fui/*.fi; do
             | grep -q 'Vec\['; then
             continue
         fi
+        # std.str is used through METHOD syntax (`s.length()`, `s.chars(i)`), which
+        # needs the import but never writes "str." -- the same exception as for vec.
+        if [ "$mod" = "str" ] && grep -v -e '^[[:space:]]*//' -e '^import ' "$f" \
+            | grep -qE '\.(length|chars|slice|find|starts_with|ends_with)\('; then
+            continue
+        fi
         if ! grep -v -e '^[[:space:]]*//' -e '^import ' "$f" \
             | grep -q "$mod\.[A-Za-z]"; then
             echo "  $f: import ...$mod, aber kein \"$mod.\" im Modul --"
