@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fleitec_login/fl_provider.fi -- the provider interface of LOGIN-PLAN 2.3, client side.
+//
+//   id       "jarvis" | "xoffi" | "password"         (later "passkey", "idaustria")
+//   kind     KIND_OIDC | KIND_PASSWORD | KIND_DEVICE
+//   caps     CAP_* bit set
+//   status   ST_READY | ST_PLANNED                    (xoffi is PLANNED until its OIDC exists:
+//                                                      begin/finish refuse with detail "planned")
+//   begin    -> Step      (redirect URL | password form | device code)
+//   finish   -> Subject   {provider, sub, attrs, amr, auth_time}   + the Session
+//   refresh  -> L_OK | L_NEED_LOGIN
+//   logout   -> really calls the provider (revocation), then wipes
+//   health   -> L_OK | reason
+//
+// One adapter = one small constructor + this dispatch. `Subject.sub` is the STABLE provider id,
+// never an e-mail or a user name. An adapter knows no accounts and no database.
+//
+//     var p: provider.Provider = provider.provider_jarvis("https://id.fleitec.com", "firnchat", tx)
+//     var st: provider.Step = provider.step_new()
+//     provider.begin(&p, "https://chat.fleitec.com/cb", now, &st)       // st.url
+//     provider.finish(&p, &st, redirected, "", now, &sess, &subj)
+import std.rt
+import std.json
+import std.str
+import fleitec_login.fl_util as u
+import fleitec_login.fl_transport as tp
+import fleitec_login.fl_oidc as oidc
+import fleitec_login.fl_device as device
+import fleitec_login.fl_session as session
+
+export {
+    Provider, Step, Subject,
+    provider_jarvis, provider_xoffi, provider_password, provider_set_ready, subject_empty, step_new,
+    begin, begin_device, finish, finish_device, refresh, logout, health,
+    KIND_OIDC, KIND_PASSWORD, KIND_DEVICE,
+    CAP_REFRESH, CAP_REVOKE, CAP_MFA, CAP_ORG, CAP_GROUPS, CAP_EMAIL_HINT,
+    ST_READY, ST_PLANNED, STEP_REDIRECT, STEP_FORM, STEP_DEVICE,
+}
+
+const KIND_OIDC: i64 = 1
+const KIND_PASSWORD: i64 = 2
+const KIND_DEVICE: i64 = 3
+
+const CAP_REFRESH: i64 = 1
+const CAP_REVOKE: i64 = 2
+const CAP_MFA: i64 = 4
+const CAP_ORG: i64 = 8
+const CAP_GROUPS: i64 = 16
+const CAP_EMAIL_HINT: i64 = 32
+
+const ST_PLANNED: i64 = 0
+const ST_READY: i64 = 1
+
+const STEP_REDIRECT: i64 = 1
+const STEP_FORM: i64 = 2
+const STEP_DEVICE: i64 = 3
+
+struct Provider {
+    id: str,
+    kind: i64,
+    caps: i64,
+    status: i64,
+    client: oidc.Client,
+    login_url: str, // password kind: the broker's JSON login endpoint
+}
+
+struct Step {
+    kind: i64,
+    url: str, // STEP_REDIRECT: send the browser here; STEP_FORM: where the form is posted
+    pending: oidc.Pending,
+    device: device.DeviceAuth,
+}
+
+struct Subject {
+    ok: bool,
+    reason: i64,
+    detail: str,
+    provider: str,
+    iss: str,
+    sub: str,
+    acc: str, // set when the token names a Fleitec account
+    name: str,
+    email_hint: str, // a hint only, never a key
+    org_id: str,
+    org_name: str,
+    groups: str,
+    amr: str,
+    auth_time: i64,
+}
+
+fn step_new() -> Step {
+    return Step { kind: 0, url: "", pending: oidc.pending_new(), device: device.device_new() }
+}
+
+fn subject_empty() -> Subject {
+    return Subject { ok: false, reason: oidc.L_PROTOCOL, detail: "", provider: "", iss: "", sub: "", acc: "",
+        name: "", email_hint: "", org_id: "", org_name: "", groups: "", amr: "", auth_time: 0 }
+}
+
+// Fleitec-ID ("Sign in with JARVIS"): OIDC, EdDSA id_tokens, refresh + revoke, device flow.
+fn provider_jarvis(issuer: str, client_id: str, t: tp.Transport) -> Provider {
+    return Provider { id: "jarvis", kind: KIND_OIDC, caps: CAP_REFRESH | CAP_REVOKE, status: ST_READY,
+        client: oidc.client_new(issuer, client_id, t), login_url: "" }
+}
+
+// XOFFI: OIDC with RS256/ES256 id_tokens (auth.jose); PLANNED until XOFFI ships its provider.
+fn provider_xoffi(issuer: str, client_id: str, t: tp.Transport) -> Provider {
+    var p: Provider = Provider { id: "xoffi", kind: KIND_OIDC,
+        caps: CAP_REFRESH | CAP_REVOKE | CAP_MFA | CAP_ORG | CAP_GROUPS | CAP_EMAIL_HINT, status: ST_PLANNED,
+        client: oidc.client_new(issuer, client_id, t), login_url: "" }
+    oidc.client_set_jose(&p.client, true)
+    oidc.client_set_scope(&p.client, "openid profile email offline_access")
+    return p
+}
+
+// The neutral fallback: name + password posted as JSON to the broker, answer = token set with an id_token.
+fn provider_password(issuer: str, client_id: str, login_url: str, t: tp.Transport) -> Provider {
+    return Provider { id: "password", kind: KIND_PASSWORD, caps: CAP_REFRESH | CAP_REVOKE, status: ST_READY,
+        client: oidc.client_new(issuer, client_id, t), login_url: login_url }
+}
+
+fn provider_set_ready(p: *mut Provider) { (*p).status = ST_READY }
+
+fn subject_of(p: *mut Provider, l: *mut oidc.Login) -> Subject {
+    var s: Subject = subject_empty()
+    s.reason = (*l).reason
+    s.detail = (*l).detail
+    if (*l).reason != oidc.L_OK || !(*l).has_id {
+        return s
+    }
+    s.ok = true
+    s.provider = (*p).id
+    s.iss = (*l).claims.iss
+    s.sub = (*l).claims.sub
+    s.acc = (*l).claims.acc
+    s.name = (*l).claims.name
+    if s.name.length() == 0 { s.name = (*l).claims.preferred_username }
+    s.email_hint = (*l).claims.email
+    s.org_id = (*l).claims.org_id
+    s.org_name = (*l).claims.org_name
+    s.groups = (*l).claims.groups
+    s.amr = (*l).claims.amr
+    s.auth_time = (*l).claims.auth_time
+    return s
+}
+
+fn planned(p: *mut Provider) -> bool { return (*p).status != ST_READY }
+
+// OIDC: the redirect URL. Password: a form step (url = the login endpoint).
+fn begin(p: *mut Provider, redirect_uri: str, now: i64, st: *mut Step) -> i64 {
+    *st = step_new()
+    if planned(p) { return oidc.L_CONFIG }
+    if (*p).kind == KIND_PASSWORD {
+        (*st).kind = STEP_FORM
+        (*st).url = (*p).login_url
+        return oidc.L_OK
+    }
+    (*st).kind = STEP_REDIRECT
+    let rc: i64 = oidc.begin(&(*p).client, redirect_uri, "", now, &(*st).pending)
+    (*st).url = (*st).pending.url
+    return rc
+}
+
+fn begin_device(p: *mut Provider, now: i64, st: *mut Step) -> i64 {
+    *st = step_new()
+    if planned(p) { return oidc.L_CONFIG }
+    (*st).kind = STEP_DEVICE
+    return device.start(&(*p).client, now, &(*st).device)
+}
+
+// OIDC: `input` = the redirected URL, `input2` unused. Password: input = name, input2 = password.
+#[allow_escape]
+fn finish(p: *mut Provider, st: *mut Step, input: str, input2: str, now: i64,
+    s: *mut session.Session, subj: *mut Subject) -> i64 {
+    *subj = subject_empty()
+    if planned(p) {
+        (*subj).detail = "planned"
+        (*subj).reason = oidc.L_CONFIG
+        return oidc.L_CONFIG
+    }
+    var l: oidc.Login = oidc.login_empty()
+    if (*p).kind == KIND_PASSWORD {
+        let body: str = "{\"name\":\"" + u.json_esc(input) + "\",\"password\":\"" + u.json_esc(input2) +
+            "\",\"client_id\":\"" + u.json_esc((*p).client.client_id) + "\"}"
+        var r: tp.HttpResp = tp.post_json(&(*p).client.tx, (*p).login_url, body, "")
+        l = oidc.parse_token_answer(&(*p).client, &r, now, "", true)
+    } else {
+        l = oidc.finish(&(*p).client, &(*st).pending, input, now)
+    }
+    *subj = subject_of(p, &l)
+    if l.reason == oidc.L_OK {
+        *s = session.session_from_login(&l)
+    }
+    return l.reason
+}
+
+#[allow_escape]
+fn finish_device(p: *mut Provider, st: *mut Step, now: i64, s: *mut session.Session, subj: *mut Subject) -> i64 {
+    *subj = subject_empty()
+    if planned(p) {
+        (*subj).reason = oidc.L_CONFIG
+        return oidc.L_CONFIG
+    }
+    let l: oidc.Login = device.poll(&(*p).client, &(*st).device, now)
+    var ll: oidc.Login = l
+    *subj = subject_of(p, &ll)
+    (*subj).reason = l.reason
+    (*subj).detail = l.detail
+    if l.reason == oidc.L_OK {
+        *s = session.session_from_login(&ll)
+    }
+    return l.reason
+}
+
+fn refresh(p: *mut Provider, s: *mut session.Session, now: i64) -> i64 {
+    return session.refresh(&(*p).client, s, now)
+}
+
+fn logout(p: *mut Provider, s: *mut session.Session) -> i64 {
+    return session.logout(&(*p).client, s)
+}
+
+// discovery reachable and the issuer matches: L_OK. A PLANNED provider answers L_CONFIG.
+fn health(p: *mut Provider, now: i64) -> i64 {
+    if planned(p) { return oidc.L_CONFIG }
+    if (*p).kind == KIND_PASSWORD {
+        return oidc.L_OK
+    }
+    return oidc.discover(&(*p).client, now)
+}

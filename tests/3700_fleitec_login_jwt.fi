@@ -1,0 +1,96 @@
+// expect_exit: 0
+// tests/3700_fleitec_login_jwt.fi -- lib/fleitec_login: EdDSA verifier, JWKS cache, legacy HS256,
+// against tests/data/fleitec-login-vectors.json (made by tools/fleitec_login/gen_vectors.py with
+// Python cryptography -- nothing of the Firn code). Exit code = number of the first failing group.
+import std.rt
+import std.io
+import std.json
+import std.str
+import fleitec_login.fl_util as u
+import fleitec_login.fl_jwks as jwks
+import fleitec_login.fl_jwt as jwt
+
+const VECTORS: str = __include_str("data/fleitec-login-vectors.json")
+
+fn node_text(d: *mut json.Json, o: u32, key: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    json.json_write(d, u.jget_node(d, o, key), &b, false)
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+fn fail(group: str, id: str) -> i32 {
+    io.print("FAIL ")
+    io.print(group)
+    io.print(" ")
+    io.print_line_bytes(id.p as u64, id.length())
+    return 1 as i32
+}
+
+fn main() -> i32 {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, VECTORS.p as u64, VECTORS.length()) catch false
+    if !ok { return 90 as i32 }
+    let root: u32 = json.json_root(&d)
+    let now: i64 = u.jget_int(&d, root, "now", 0)
+    var cfg: jwt.IssuerCfg = jwt.cfg_new(u.jget_str(&d, root, "iss"), u.jget_str(&d, root, "aud"))
+    cfg.leeway = u.jget_int(&d, root, "leeway", 30)
+    if jwks.keyset_parse(&cfg.keys, node_text(&d, root, "jwks"), now) != 2 { return 91 as i32 }
+    var bad: i32 = 0 as i32
+    // ---- A: jwt_eddsa
+    var c: u32 = json.json_child(&d, u.jget_node(&d, root, "jwt_eddsa"))
+    var nA: i64 = 0
+    while c != json.JSON_NONE {
+        let id: str = u.jget_str(&d, c, "id")
+        let cl: jwt.Claims = jwt.verify(u.jget_str(&d, c, "token"), &cfg, now)
+        if jwt.reason_name(cl.reason) != u.jget_str(&d, c, "reason") { bad = bad + fail("A reason", id) }
+        if cl.reason == jwt.JWT_OK {
+            if cl.sub != u.jget_str(&d, c, "sub") || cl.uid != u.jget_str(&d, c, "uid") || cl.name != u.jget_str(&d, c, "name") ||
+            cl.acc != u.jget_str(&d, c, "acc") || cl.idp != u.jget_str(&d, c, "idp") { bad = bad + fail("A claims", id) }
+        }
+        nA = nA + 1
+        c = json.json_next(&d, c)
+    }
+    if nA < 40 { return 92 as i32 }
+    // ---- B: legacy HS256 is a separate door
+    let leg: u32 = u.jget_node(&d, root, "legacy_hs256")
+    let secret: str = u.jget_str(&d, leg, "secret")
+    c = json.json_child(&d, u.jget_node(&d, leg, "cases"))
+    while c != json.JSON_NONE {
+        let id2: str = u.jget_str(&d, c, "id")
+        let cl2: jwt.Claims = jwt.verify_legacy_hs256(u.jget_str(&d, c, "token"), secret, "", "", now)
+        if jwt.reason_name(cl2.reason) != u.jget_str(&d, c, "reason") { bad = bad + fail("B legacy", id2) }
+        if cl2.reason == jwt.JWT_OK && (cl2.uid != u.jget_str(&d, c, "uid") || cl2.name != u.jget_str(&d, c, "name")) { bad = bad + fail("B claims", id2) }
+        // the EdDSA door never accepts an HS256 token either
+        c = json.json_next(&d, c)
+    }
+    // ---- C: JWKS rules
+    var junk: jwks.KeySet = jwks.keyset_new(60)
+    if jwks.keyset_parse(&junk, node_text(&d, root, "jwks_junk"), now) != -1 { bad = bad + fail("C", "junk accepted") }
+    var ks: jwks.KeySet = jwks.keyset_new(60)
+    var out32: [u8; 32] = [0; 32]
+    if jwks.keyset_parse(&ks, node_text(&d, root, "jwks_k1_only"), now) != 1 { bad = bad + fail("C", "k1 only") }
+    if jwks.keyset_lookup(&ks, "k1", now, (&out32[0]) as u64) != jwks.JW_FOUND { bad = bad + fail("C", "k1 found") }
+    if jwks.keyset_lookup(&ks, "k2", now, (&out32[0]) as u64) != jwks.JW_UNKNOWN { bad = bad + fail("C", "k2 unknown") }
+    if jwks.keyset_lookup(&ks, "k1", now + 61, (&out32[0]) as u64) != jwks.JW_EXPIRED { bad = bad + fail("C", "cache expires") }
+    // rotation: the new document replaces the old keys
+    if jwks.keyset_parse(&ks, node_text(&d, root, "jwks_k2_only"), now + 100) != 1 { bad = bad + fail("C", "rotate") }
+    if jwks.keyset_lookup(&ks, "k1", now + 100, (&out32[0]) as u64) != jwks.JW_UNKNOWN { bad = bad + fail("C", "k1 retired") }
+    if jwks.keyset_lookup(&ks, "k2", now + 100, (&out32[0]) as u64) != jwks.JW_FOUND { bad = bad + fail("C", "k2 active") }
+    // pinned emergency key survives expiry and rotation
+    let pk1: str = u.jget_str(&d, u.jget_node(&d, root, "pub"), "k1")
+    if !jwks.keyset_pin(&ks, "emergency", pk1) { bad = bad + fail("C", "pin") }
+    if jwks.keyset_lookup(&ks, "emergency", now + 99999, (&out32[0]) as u64) != jwks.JW_FOUND { bad = bad + fail("C", "pin lives") }
+    if jwks.keyset_pin(&ks, "bad", "AAAA") { bad = bad + fail("C", "bad pin accepted") }
+    // ---- D: an expired cache refuses a token with JWT_KEYEXPIRED, a cold cache likewise
+    let c0: jwt.Claims = jwt.verify(u.jget_str(&d, json.json_child(&d, u.jget_node(&d, root, "jwt_eddsa")), "token"), &cfg, now + 700)
+    if c0.reason != jwt.JWT_KEYEXPIRED { bad = bad + fail("D", "keyexpired") }
+    // ---- E: an issuer config without iss/aud refuses every token (misconfiguration, not a pass)
+    var open: jwt.IssuerCfg = jwt.cfg_new("", "")
+    jwks.keyset_parse(&open.keys, node_text(&d, root, "jwks"), now)
+    let c1: jwt.Claims = jwt.verify(u.jget_str(&d, json.json_child(&d, u.jget_node(&d, root, "jwt_eddsa")), "token"), &open, now)
+    if c1.reason == jwt.JWT_OK { bad = bad + fail("E", "empty iss/aud passed") }
+    json.json_free(&d)
+    return bad
+}

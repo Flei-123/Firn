@@ -1,0 +1,441 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fleitec_login/fl_util.fi -- small helpers shared by the fleitec_login modules:
+// base64url, S256, random strings, percent encoding, query strings, JSON field
+// readers, constant time compare, the endpoint rule. No network, no state.
+import std.rt
+import std.json
+import std.str
+import std.time
+import std.base64
+import std.crypto.sha256
+import std.crypto.random
+import net.url
+import fleitec_id.jwt as fjwt
+
+export {
+    now_s, sub, find_char, starts_with, ends_with, ct_eq, lower_ascii,
+    b64u_enc, b64u_dec_buf, b64u_dec_str, sha256_b64u, rand_b64u,
+    pct_enc, pct_dec, kv, join_kv, query_get, query_has, split_query, strip_query,
+    jget_str, jget_int, jget_bool, jget_node, json_esc, endpoint_ok, trim_slash,
+    csv_of_array,
+}
+
+fn now_s() -> i64 {
+    return (time.now_unix_ms() / 1000) as i64
+}
+
+// A copy of s[a .. a+n). Out of range is cut to the string.
+fn sub(s: str, a: usize, n: usize) -> str {
+    let len: usize = s.length()
+    if a >= len {
+        return ""
+    }
+    var m: usize = n
+    if a + m > len {
+        m = len - a
+    }
+    return __str_copy(str { p: (s.p as u64 + a as u64) as *u8, n: m })
+}
+
+// index of the first c at or after `from`, -1 when there is none
+fn find_char(s: str, c: u8, from: usize) -> i64 {
+    var i: usize = from
+    while i < s.length() {
+        if s.chars(i) == c {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn starts_with(s: str, p: str) -> bool {
+    if p.length() > s.length() {
+        return false
+    }
+    return rt.mem_eq(s.p as u64, p.p as u64, p.length())
+}
+
+fn ends_with(s: str, p: str) -> bool {
+    if p.length() > s.length() {
+        return false
+    }
+    return rt.mem_eq(s.p as u64 + (s.length() - p.length()) as u64, p.p as u64, p.length())
+}
+
+// Constant time equality (the length is not secret here, the content is).
+fn ct_eq(a: str, b: str) -> bool {
+    if a.length() != b.length() {
+        return false
+    }
+    var diff: u32 = 0 as u32
+    var i: usize = 0
+    while i < a.length() {
+        diff = diff | ((a.chars(i) ^ b.chars(i)) as u32)
+        i = i + 1
+    }
+    return diff == (0 as u32)
+}
+
+fn lower_ascii(s: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < s.length() {
+        var c: u8 = s.chars(i)
+        if c >= 65 as u8 && c <= 90 as u8 {
+            c = c + 32 as u8
+        }
+        rt.buf_push(&b, c)
+        i = i + 1
+    }
+    let r: str = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return r
+}
+
+// ------------------------------------------------------------ base64url
+
+fn b64u_enc(p: u64, n: usize) -> str {
+    var b: rt.Buf = rt.buf_new()
+    base64.encode_url(p, n, &b)
+    while b.len > 0 && rt.ld8(b.ptr, b.len - 1) == 61 as u8 {
+        rt.buf_set_len(&b, b.len - 1)
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+// Strict base64url (no padding, canonical) appended to `out`. false = refused.
+fn b64u_dec_buf(s: str, out: *mut rt.Buf) -> bool {
+    let n: usize = s.length()
+    if n == 0 {
+        return true
+    }
+    rt.buf_reserve(out, (*out).len + n + 4)
+    if (*out).cap < (*out).len + n + 4 {
+        return false
+    }
+    let k: i64 = fjwt.b64url_decode(s.p as u64, n, (*out).ptr + (*out).len as u64, (*out).cap - (*out).len)
+    if k < 0 {
+        return false
+    }
+    rt.buf_set_len(out, (*out).len + k as usize)
+    return true
+}
+
+// The decoded octets as a string; ok=false when the text is not base64url.
+fn b64u_dec_str(s: str, ok: *mut bool) -> str {
+    var b: rt.Buf = rt.buf_new()
+    *ok = b64u_dec_buf(s, &b)
+    var r: str = ""
+    if *ok {
+        r = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    }
+    rt.buf_free(&b)
+    return r
+}
+
+// RFC 7636 S256: BASE64URL(SHA256(s)).
+fn sha256_b64u(s: str) -> str {
+    var h: [u8; 32] = [0; 32]
+    sha256.sha256(s.p as u64, s.length(), (&h[0]) as u64)
+    return b64u_enc((&h[0]) as u64, 32)
+}
+
+// `nbytes` (max 64) random octets as base64url; "" when no random source works.
+fn rand_b64u(nbytes: usize) -> str {
+    var raw: [u8; 64] = [0; 64]
+    var n: usize = nbytes
+    if n > 64 {
+        n = 64
+    }
+    if !random.random_bytes((&raw[0]) as u64, n) {
+        return ""
+    }
+    return b64u_enc((&raw[0]) as u64, n)
+}
+
+// ------------------------------------------------------------ percent / forms
+
+fn unreserved(c: u8) -> bool {
+    return (c >= 48 as u8 && c <= 57 as u8) || (c >= 65 as u8 && c <= 90 as u8) ||
+    (c >= 97 as u8 && c <= 122 as u8) || c == 45 as u8 || c == 46 as u8 || c == 95 as u8 || c == 126 as u8
+}
+
+fn hexd(v: u8) -> u8 {
+    if v < 10 as u8 {
+        return 48 as u8 + v
+    }
+    return 55 as u8 + v
+}
+
+fn hexv(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 { return (c - 48 as u8) as i32 }
+    if c >= 65 as u8 && c <= 70 as u8 { return (c - 55 as u8) as i32 }
+    if c >= 97 as u8 && c <= 102 as u8 { return (c - 87 as u8) as i32 }
+    return -1
+}
+
+fn pct_enc(s: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < s.length() {
+        let c: u8 = s.chars(i)
+        if unreserved(c) {
+            rt.buf_push(&b, c)
+        } else {
+            rt.buf_push(&b, 37 as u8)
+            rt.buf_push(&b, hexd(c >> 4))
+            rt.buf_push(&b, hexd(c & 15 as u8))
+        }
+        i = i + 1
+    }
+    let r: str = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return r
+}
+
+// '+' is a space (form encoding). A broken %xx gives ok=false.
+fn pct_dec(s: str, ok: *mut bool) -> str {
+    var b: rt.Buf = rt.buf_new()
+    *ok = true
+    var i: usize = 0
+    while i < s.length() {
+        let c: u8 = s.chars(i)
+        if c == 37 as u8 {
+            if i + 2 >= s.length() {
+                *ok = false
+                i = s.length()
+            } else {
+                let h: i32 = hexv(s.chars(i + 1))
+                let l: i32 = hexv(s.chars(i + 2))
+                if h < 0 || l < 0 {
+                    *ok = false
+                    i = s.length()
+                } else {
+                    rt.buf_push(&b, ((h * 16 + l) as u32) as u8)
+                    i = i + 3
+                }
+            }
+        } else if c == 43 as u8 {
+            rt.buf_push(&b, 32 as u8)
+            i = i + 1
+        } else {
+            rt.buf_push(&b, c)
+            i = i + 1
+        }
+    }
+    let r: str = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return r
+}
+
+fn kv(name: str, value: str) -> str {
+    return name + "=" + pct_enc(value)
+}
+
+// "a=1&b=2" from two parts; an empty side is skipped
+fn join_kv(a: str, b: str) -> str {
+    if a.length() == 0 { return b }
+    if b.length() == 0 { return a }
+    return a + "&" + b
+}
+
+// The raw query of a URL ("a=b&c=d" after the first '?', before '#'), "" if none.
+fn split_query(u: str) -> str {
+    let q: i64 = find_char(u, 63 as u8, 0)
+    if q < 0 {
+        return ""
+    }
+    var e: i64 = find_char(u, 35 as u8, q as usize)
+    if e < 0 {
+        e = u.length() as i64
+    }
+    return sub(u, (q + 1) as usize, (e - q - 1) as usize)
+}
+
+// the URL without query and fragment
+fn strip_query(u: str) -> str {
+    var e: usize = u.length()
+    let q: i64 = find_char(u, 63 as u8, 0)
+    if q >= 0 { e = q as usize }
+    let f: i64 = find_char(u, 35 as u8, 0)
+    if f >= 0 && (f as usize) < e { e = f as usize }
+    return sub(u, 0, e)
+}
+
+// First value of `name` in a raw query ("" if missing). Names are compared
+// raw, values are decoded.
+fn query_get(q: str, name: str) -> str {
+    var i: usize = 0
+    let n: usize = q.length()
+    while i <= n {
+        var e: usize = i
+        while e < n && q.chars(e) != 38 as u8 {
+            e = e + 1
+        }
+        var eq: usize = i
+        while eq < e && q.chars(eq) != 61 as u8 {
+            eq = eq + 1
+        }
+        if eq - i == name.length() && rt.mem_eq(q.p as u64 + i as u64, name.p as u64, name.length()) {
+            if eq >= e {
+                return ""
+            }
+            var ok: bool = false
+            let v: str = pct_dec(sub(q, eq + 1, e - eq - 1), &ok)
+            if ok { return v }
+            return ""
+        }
+        i = e + 1
+    }
+    return ""
+}
+
+fn query_has(q: str, name: str) -> bool {
+    var i: usize = 0
+    let n: usize = q.length()
+    while i <= n {
+        var e: usize = i
+        while e < n && q.chars(e) != 38 as u8 {
+            e = e + 1
+        }
+        var eq: usize = i
+        while eq < e && q.chars(eq) != 61 as u8 {
+            eq = eq + 1
+        }
+        if eq - i == name.length() && rt.mem_eq(q.p as u64 + i as u64, name.p as u64, name.length()) {
+            return true
+        }
+        i = e + 1
+    }
+    return false
+}
+
+// ------------------------------------------------------------ JSON readers
+
+fn jget_node(d: *mut json.Json, obj: u32, name: str) -> u32 {
+    if json.json_kind(d, obj) != json.JSON_OBJECT {
+        return json.JSON_NONE
+    }
+    return json.json_get(d, obj, name.p as u64, name.length())
+}
+
+fn jget_str(d: *mut json.Json, obj: u32, name: str) -> str {
+    let nd: u32 = jget_node(d, obj, name)
+    if nd == json.JSON_NONE || json.json_kind(d, nd) != json.JSON_STRING {
+        return ""
+    }
+    let s: str.Span = json.json_string(d, nd)
+    return __str_copy(str { p: s.p, n: s.n })
+}
+
+fn jget_int(d: *mut json.Json, obj: u32, name: str, dflt: i64) -> i64 {
+    let nd: u32 = jget_node(d, obj, name)
+    if nd == json.JSON_NONE || json.json_kind(d, nd) != json.JSON_NUMBER {
+        return dflt
+    }
+    if json.json_is_int(d, nd) {
+        return json.json_int(d, nd)
+    }
+    return json.json_number(d, nd) as i64
+}
+
+fn jget_bool(d: *mut json.Json, obj: u32, name: str, dflt: bool) -> bool {
+    let nd: u32 = jget_node(d, obj, name)
+    if nd == json.JSON_NONE {
+        return dflt
+    }
+    let k: u8 = json.json_kind(d, nd)
+    if k == json.JSON_TRUE { return true }
+    if k == json.JSON_FALSE { return false }
+    return dflt
+}
+
+// the strings of a JSON array (or the one string) joined by commas
+fn csv_of_array(d: *mut json.Json, obj: u32, name: str) -> str {
+    let nd: u32 = jget_node(d, obj, name)
+    if nd == json.JSON_NONE {
+        return ""
+    }
+    var out: str = ""
+    let k: u8 = json.json_kind(d, nd)
+    if k == json.JSON_STRING {
+        let s: str.Span = json.json_string(d, nd)
+        return __str_copy(str { p: s.p, n: s.n })
+    }
+    if k == json.JSON_ARRAY {
+        var c: u32 = json.json_child(d, nd)
+        while c != json.JSON_NONE {
+            if json.json_kind(d, c) == json.JSON_STRING {
+                let s2: str.Span = json.json_string(d, c)
+                if out.length() > 0 {
+                    out = out + ","
+                }
+                out = out + __str_copy(str { p: s2.p, n: s2.n })
+            }
+            c = json.json_next(d, c)
+        }
+    }
+    return out
+}
+
+// escape for a JSON string literal (without the quotes)
+fn json_esc(s: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < s.length() {
+        let c: u8 = s.chars(i)
+        if c == 34 as u8 || c == 92 as u8 {
+            rt.buf_push(&b, 92 as u8)
+            rt.buf_push(&b, c)
+        } else if c < 32 as u8 {
+            rt.buf_push(&b, 92 as u8)
+            rt.buf_push(&b, 117 as u8)
+            rt.buf_push(&b, 48 as u8)
+            rt.buf_push(&b, 48 as u8)
+            rt.buf_push(&b, hexd(c >> 4))
+            rt.buf_push(&b, hexd(c & 15 as u8))
+        } else {
+            rt.buf_push(&b, c)
+        }
+        i = i + 1
+    }
+    let r: str = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return r
+}
+
+// ------------------------------------------------------------ endpoints
+
+// https always; http only for a loopback host (127.0.0.1, localhost) -- the
+// local mock/dev server. No other switch exists.
+fn endpoint_ok(u: str) -> bool {
+    if u.length() < 8 {
+        return false
+    }
+    var pu: url.Url = url.url_new()
+    if !url.url_parse(u.p as u64, u.length(), &pu) {
+        return false
+    }
+    if url.url_is_https(&pu) {
+        return true
+    }
+    if !url.url_is_http(&pu) {
+        return false
+    }
+    let h: u64 = url.url_host_ptr(&pu)
+    let n: usize = url.url_host_len(&pu)
+    var lh: [u8; 9] = "localhost"
+    var l4: [u8; 9] = "127.0.0.1"
+    return url.ci_equal(h, n, (&lh[0]) as u64, 9) || url.ci_equal(h, n, (&l4[0]) as u64, 9)
+}
+
+fn trim_slash(s: str) -> str {
+    var n: usize = s.length()
+    while n > 0 && s.chars(n - 1) == 47 as u8 {
+        n = n - 1
+    }
+    return sub(s, 0, n)
+}

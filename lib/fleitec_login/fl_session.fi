@@ -1,0 +1,208 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fleitec_login/fl_session.fi -- holds access + refresh token of ONE login and keeps it alive.
+//
+//     var s: session.Session = session.session_from_login(&login)
+//     let rc: i64 = session.ensure_fresh(&client, &s, now, 60)   // renews BEFORE the access token runs out
+//     if rc == oidc.L_NEED_LOGIN { ... sign in again ... }
+//
+// ROTATION (the plan's S3): every refresh may hand out a NEW refresh token; the old one is dead the
+// moment the new one arrives and is overwritten at once -- it is never sent again. When the server
+// sends no new refresh token, the old one stays (RFC 6749 section 6). `rotations` counts the swaps.
+// A refresh the server refuses with `invalid_grant` (revoked, expired, or a REUSED old token -- the
+// server then drops the whole family) ends the session: tokens are wiped, state = NEED_LOGIN.
+// A network error changes nothing and is reported as L_NET (try again later).
+// The renewed id_token (if any) must belong to the SAME subject: another `sub` => L_ACCOUNT and the
+// session is NOT updated.
+//
+// Persistence: `to_json`/`from_json` give a text the caller seals (OrientOS `ksiegel`, std.secret).
+// Not thread safe: one Session, one owner (HONEST in README.md).
+import std.rt
+import std.json
+import std.str
+import fleitec_login.fl_util as u
+import fleitec_login.fl_oidc as oidc
+
+export {
+    Session, session_new, session_from_login, due, ensure_fresh, refresh, active, wipe,
+    logout, to_json, from_json,
+    S_ACTIVE, S_NEED_LOGIN, S_EMPTY,
+}
+
+const S_EMPTY: i64 = 0
+const S_ACTIVE: i64 = 1
+const S_NEED_LOGIN: i64 = 2
+
+struct Session {
+    t: oidc.Tokens,
+    sub: str, // the subject (account id / provider sub) the session belongs to
+    iss: str,
+    state: i64,
+    rotations: i64,
+    refreshed_at: i64,
+}
+
+fn session_new() -> Session {
+    return Session { t: oidc.tokens_new(), sub: "", iss: "", state: S_EMPTY, rotations: 0, refreshed_at: 0 }
+}
+
+fn session_from_login(l: *mut oidc.Login) -> Session {
+    var s: Session = session_new()
+    if (*l).reason != oidc.L_OK {
+        return s
+    }
+    s.t = (*l).tokens
+    s.sub = (*l).claims.sub
+    s.iss = (*l).claims.iss
+    s.state = S_ACTIVE
+    s.refreshed_at = (*l).tokens.issued_at
+    return s
+}
+
+fn active(s: *mut Session) -> bool { return (*s).state == S_ACTIVE }
+
+// does the access token run out within `skew` seconds (or is it gone)?
+fn due(s: *mut Session, now: i64, skew: i64) -> bool {
+    if (*s).state != S_ACTIVE {
+        return true
+    }
+    return !oidc.tokens_valid(&(*s).t, now, skew)
+}
+
+fn wipe(s: *mut Session) {
+    (*s).t = oidc.tokens_new()
+    (*s).state = S_NEED_LOGIN
+}
+
+// One refresh now. L_OK, L_NEED_LOGIN (signed out), L_NET/L_HTTP (nothing changed), L_ACCOUNT.
+fn refresh(c: *mut oidc.Client, s: *mut Session, now: i64) -> i64 {
+    if (*s).state != S_ACTIVE {
+        return oidc.L_NEED_LOGIN
+    }
+    if (*s).t.refresh_token.length() == 0 {
+        wipe(s)
+        return oidc.L_NEED_LOGIN
+    }
+    let l: oidc.Login = oidc.token_refresh(c, (*s).t.refresh_token, now)
+    if l.reason == oidc.L_GRANT || l.reason == oidc.L_DENIED {
+        wipe(s)
+        return oidc.L_NEED_LOGIN
+    }
+    if l.reason != oidc.L_OK {
+        return l.reason
+    }
+    if l.has_id && l.claims.sub != (*s).sub {
+        return oidc.L_ACCOUNT
+    }
+    (*s).t.access_token = l.tokens.access_token
+    (*s).t.token_type = l.tokens.token_type
+    (*s).t.expires_at = l.tokens.expires_at
+    (*s).t.issued_at = l.tokens.issued_at
+    if l.tokens.scope.length() > 0 {
+        (*s).t.scope = l.tokens.scope
+    }
+    if l.tokens.id_token.length() > 0 {
+        (*s).t.id_token = l.tokens.id_token
+    }
+    if l.tokens.refresh_token.length() > 0 && l.tokens.refresh_token != (*s).t.refresh_token {
+        (*s).t.refresh_token = l.tokens.refresh_token // the old one is dead from here on
+        (*s).rotations = (*s).rotations + 1
+    }
+    (*s).refreshed_at = now
+    return oidc.L_OK
+}
+
+// Renews when the access token runs out within `skew` seconds. L_OK also when nothing was due.
+fn ensure_fresh(c: *mut oidc.Client, s: *mut Session, now: i64, skew: i64) -> i64 {
+    if (*s).state != S_ACTIVE {
+        return oidc.L_NEED_LOGIN
+    }
+    if !due(s, now, skew) {
+        return oidc.L_OK
+    }
+    return refresh(c, s, now)
+}
+
+// Signs out: revokes the refresh token (and the access token) at the provider when it has an
+// endpoint, ALWAYS wipes the local tokens. Returns the revoke verdict (L_CONFIG = provider has none).
+fn logout(c: *mut oidc.Client, s: *mut Session) -> i64 {
+    var rc: i64 = oidc.L_CONFIG
+    if (*c).revocation_endpoint.length() > 0 {
+        rc = oidc.L_OK
+        if (*s).t.refresh_token.length() > 0 {
+            let r1: i64 = oidc.revoke(c, (*s).t.refresh_token, true)
+            if r1 != oidc.L_OK { rc = r1 }
+        }
+        if (*s).t.access_token.length() > 0 {
+            let r2: i64 = oidc.revoke(c, (*s).t.access_token, false)
+            if r2 != oidc.L_OK && rc == oidc.L_OK { rc = r2 }
+        }
+    }
+    (*s).t = oidc.tokens_new()
+    (*s).state = S_EMPTY
+    return rc
+}
+
+fn to_json(s: *mut Session) -> str {
+    return "{\"v\":1,\"sub\":\"" + u.json_esc((*s).sub) + "\",\"iss\":\"" + u.json_esc((*s).iss) +
+    "\",\"access_token\":\"" + u.json_esc((*s).t.access_token) +
+    "\",\"refresh_token\":\"" + u.json_esc((*s).t.refresh_token) +
+    "\",\"id_token\":\"" + u.json_esc((*s).t.id_token) +
+    "\",\"token_type\":\"" + u.json_esc((*s).t.token_type) +
+    "\",\"scope\":\"" + u.json_esc((*s).t.scope) +
+    "\",\"expires_at\":" + int_text((*s).t.expires_at) +
+    ",\"issued_at\":" + int_text((*s).t.issued_at) +
+    ",\"rotations\":" + int_text((*s).rotations) +
+    ",\"state\":" + int_text((*s).state) + "}"
+}
+
+fn int_text(v: i64) -> str {
+    if v == 0 { return "0" }
+    var neg: bool = v < 0
+    var x: i64 = v
+    if neg { x = 0 - v }
+    var b: rt.Buf = rt.buf_new()
+    var digits: [u8; 24] = [0; 24]
+    var n: usize = 0
+    while x > 0 {
+        digits[n] = (48 + (x % 10)) as u8
+        x = x / 10
+        n = n + 1
+    }
+    if neg { rt.buf_push(&b, 45 as u8) }
+    while n > 0 {
+        n = n - 1
+        rt.buf_push(&b, digits[n])
+    }
+    let r: str = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return r
+}
+
+fn from_json(text: str, s: *mut Session) -> bool {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, text.p as u64, text.length()) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return false
+    }
+    let root: u32 = json.json_root(&d)
+    if u.jget_int(&d, root, "v", 0) != 1 {
+        json.json_free(&d)
+        return false
+    }
+    var n: Session = session_new()
+    n.sub = u.jget_str(&d, root, "sub")
+    n.iss = u.jget_str(&d, root, "iss")
+    n.t.access_token = u.jget_str(&d, root, "access_token")
+    n.t.refresh_token = u.jget_str(&d, root, "refresh_token")
+    n.t.id_token = u.jget_str(&d, root, "id_token")
+    n.t.token_type = u.jget_str(&d, root, "token_type")
+    n.t.scope = u.jget_str(&d, root, "scope")
+    n.t.expires_at = u.jget_int(&d, root, "expires_at", 0)
+    n.t.issued_at = u.jget_int(&d, root, "issued_at", 0)
+    n.rotations = u.jget_int(&d, root, "rotations", 0)
+    n.state = u.jget_int(&d, root, "state", S_EMPTY)
+    json.json_free(&d)
+    *s = n
+    return true
+}

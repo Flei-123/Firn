@@ -1,0 +1,595 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fleitec_login/fl_oidc.fi -- OpenID Connect CLIENT: Authorization Code + PKCE ("Sign in with ...").
+//
+//     var c: oidc.Client = oidc.client_new("https://id.fleitec.com", "firnchat", tx)
+//     oidc.discover(&c, now)                                  // /.well-known/openid-configuration
+//     var p: oidc.Pending = oidc.pending_new()
+//     oidc.begin(&c, "https://chat.fleitec.com/cb", "", now, &p)   // p.url = send the browser there
+//     let l: oidc.Login = oidc.finish(&c, &p, redirected_url, now) // the browser came back
+//     if l.reason == oidc.L_OK { l.claims.sub, l.tokens.access_token ... }
+//
+// No browser, no socket here: `begin` returns the URL, `finish` takes the URL the browser ended up
+// on (the caller owns the redirect receiver -- a web handler, a loopback server, a pasted URL).
+// All HTTP goes through the Transport (fl_transport.fi), so the whole protocol is testable offline.
+//
+// WHAT IS CHECKED (RFC 6749, 7636, 9207, OpenID Connect Core 3.1.3.7)
+//   * discovery: `issuer` equals the configured issuer octet for octet; every endpoint is https
+//     (loopback http for dev); S256 offered if the document says anything about PKCE
+//   * PKCE S256 always: 32 random octets as verifier, the challenge in the URL, the verifier only in
+//     the token request. `state` (24 octets) and `nonce` (24 octets) are random per attempt
+//   * the redirect: `redirect_uri` is compared EXACTLY (scheme, host, path; no prefix match), `state`
+//     in constant time, an `iss` parameter (RFC 9207) must equal the issuer, `error=` is mapped
+//   * ONE USE: a Pending is spent by the first `finish` -- right or wrong. A second call is L_REPLAY
+//     and sends nothing (the server also refuses a code twice: L_GRANT)
+//   * the id_token: signature (EdDSA with the issuer's JWKS, or RS256/ES256 via auth.jose in JOSE mode),
+//     `iss`, `aud` (= client_id; with several audiences `azp` must be ours), `exp`, `nbf`, `nonce`
+//     (code flow: required and equal), `sub`. Unknown `kid` => ONE refetch of the JWKS, then refuse
+//   * `prompt=login`/`max_age=0` requested => `auth_time` must exist and be newer than the attempt
+//     (L_STALE otherwise): linking must prove a FRESH login, not an old session
+//   * token response: `access_token` + `token_type` Bearer; `expires_in` becomes an absolute time
+// NOT here: implicit/hybrid flows, client assertions, DPoP, PAR, userinfo. See README.md.
+import std.rt
+import std.json
+import std.str
+import auth.jose as jose
+import fleitec_login.fl_util as u
+import fleitec_login.fl_transport as tp
+import fleitec_login.fl_jwks as jwks
+import fleitec_login.fl_jwt as jwt
+
+export {
+    Client, Pending, Tokens, Login,
+    client_new, client_set_endpoints, client_set_secret, client_set_scope, client_set_jose, client_set_leeway,
+    pending_new, tokens_new, login_empty,
+    discover, begin, finish, token_refresh, parse_token_answer, revoke, logout_url, verify_id_token, error_login,
+    login_text, tokens_valid, tokens_expires_in,
+    IDM_EDDSA, IDM_JOSE,
+    L_OK, L_NET, L_HTTP, L_PROTOCOL, L_DENIED, L_STATE, L_REDIRECT, L_ISS, L_REPLAY, L_GRANT,
+    L_ID_TOKEN, L_NONCE, L_CONFIG, L_STALE, L_ERROR, L_PENDING, L_SLOW_DOWN, L_EXPIRED, L_NEED_LOGIN, L_ACCOUNT,
+}
+
+const IDM_EDDSA: i64 = 1 // id_tokens are EdDSA (jarvis / Fleitec-ID)
+const IDM_JOSE: i64 = 2 // id_tokens are RS256/ES256 (a foreign OIDC provider such as XOFFI): auth.jose
+
+const L_OK: i64 = 0
+const L_NET: i64 = 1 // no answer (transport) or endpoint refused by the https rule
+const L_HTTP: i64 = 2 // an HTTP status that is no OAuth answer
+const L_PROTOCOL: i64 = 3 // an answer without the shape the RFC demands
+const L_DENIED: i64 = 4 // the user (or the provider) said no (access_denied)
+const L_STATE: i64 = 5 // `state` missing or different
+const L_REDIRECT: i64 = 6 // the redirect URL is not the redirect_uri we sent
+const L_ISS: i64 = 7 // `iss` parameter or discovery issuer is not the configured one
+const L_REPLAY: i64 = 8 // the Pending was already used
+const L_GRANT: i64 = 9 // invalid_grant: code used twice/expired, wrong PKCE verifier, refresh revoked
+const L_ID_TOKEN: i64 = 10 // the id_token was refused (detail = reason name)
+const L_NONCE: i64 = 11
+const L_CONFIG: i64 = 12 // endpoints missing/not https, no S256, bad redirect_uri
+const L_STALE: i64 = 13 // a fresh login was demanded and the provider reports an old one
+const L_ERROR: i64 = 14 // another OAuth error (detail = the error code)
+const L_PENDING: i64 = 15 // device flow: authorization_pending
+const L_SLOW_DOWN: i64 = 16 // device flow: slow_down
+const L_EXPIRED: i64 = 17 // device flow / expired_token
+const L_NEED_LOGIN: i64 = 18 // a session cannot be renewed: sign in again
+const L_ACCOUNT: i64 = 19 // the token belongs to another subject/account than expected
+
+struct Client {
+    issuer: str,
+    client_id: str,
+    client_secret: str, // "" = public client (PKCE only)
+    scope: str,
+    authorization_endpoint: str,
+    token_endpoint: str,
+    device_endpoint: str,
+    jwks_uri: str,
+    revocation_endpoint: str,
+    end_session_endpoint: str,
+    tx: tp.Transport,
+    cfg: jwt.IssuerCfg,
+    id_mode: i64,
+    jose_jwks: str, // JWKS text in JOSE mode
+    discovered: bool,
+}
+
+struct Pending {
+    state: str,
+    nonce: str,
+    verifier: str,
+    redirect_uri: str,
+    url: str,
+    created: i64,
+    fresh: bool, // prompt=login / max_age=0 was demanded
+    used: bool,
+    ok: bool, // begin() filled it
+}
+
+struct Tokens {
+    access_token: str,
+    refresh_token: str,
+    id_token: str,
+    token_type: str,
+    scope: str,
+    expires_at: i64, // 0 = unknown
+    issued_at: i64,
+}
+
+struct Login {
+    reason: i64,
+    detail: str, // server error code / jwt reason name
+    status: i64, // HTTP status of the last request (0 = none)
+    tokens: Tokens,
+    claims: jwt.Claims, // of the id_token (empty when none)
+    has_id: bool,
+}
+
+fn tokens_new() -> Tokens {
+    return Tokens { access_token: "", refresh_token: "", id_token: "", token_type: "", scope: "",
+        expires_at: 0, issued_at: 0 }
+}
+
+fn login_empty() -> Login {
+    return Login { reason: L_PROTOCOL, detail: "", status: 0, tokens: tokens_new(),
+        claims: jwt.claims_empty(), has_id: false }
+}
+
+fn error_login(reason: i64, detail: str) -> Login {
+    var l: Login = login_empty()
+    l.reason = reason
+    l.detail = detail
+    return l
+}
+
+fn pending_new() -> Pending {
+    return Pending { state: "", nonce: "", verifier: "", redirect_uri: "", url: "", created: 0,
+        fresh: false, used: false, ok: false }
+}
+
+fn login_text(code: i64) -> str {
+    if code == L_OK { return "ok" }
+    if code == L_NET { return "net" }
+    if code == L_HTTP { return "http" }
+    if code == L_PROTOCOL { return "protocol" }
+    if code == L_DENIED { return "denied" }
+    if code == L_STATE { return "state" }
+    if code == L_REDIRECT { return "redirect" }
+    if code == L_ISS { return "iss" }
+    if code == L_REPLAY { return "replay" }
+    if code == L_GRANT { return "grant" }
+    if code == L_ID_TOKEN { return "id_token" }
+    if code == L_NONCE { return "nonce" }
+    if code == L_CONFIG { return "config" }
+    if code == L_STALE { return "stale" }
+    if code == L_ERROR { return "error" }
+    if code == L_PENDING { return "pending" }
+    if code == L_SLOW_DOWN { return "slow_down" }
+    if code == L_EXPIRED { return "expired" }
+    if code == L_NEED_LOGIN { return "need_login" }
+    if code == L_ACCOUNT { return "account" }
+    return "unknown"
+}
+
+fn client_new(issuer: str, client_id: str, t: tp.Transport) -> Client {
+    return Client { issuer: issuer, client_id: client_id, client_secret: "", scope: "openid",
+        authorization_endpoint: "", token_endpoint: "", device_endpoint: "", jwks_uri: "",
+        revocation_endpoint: "", end_session_endpoint: "", tx: t,
+        cfg: jwt.cfg_new(issuer, client_id), id_mode: IDM_EDDSA, jose_jwks: "", discovered: false }
+}
+
+fn client_set_endpoints(c: *mut Client, auth: str, token: str, device: str, jwks_uri: str) {
+    (*c).authorization_endpoint = auth
+    (*c).token_endpoint = token
+    (*c).device_endpoint = device
+    (*c).jwks_uri = jwks_uri
+    (*c).discovered = true
+}
+
+fn client_set_secret(c: *mut Client, s: str) { (*c).client_secret = s }
+fn client_set_scope(c: *mut Client, s: str) { (*c).scope = s }
+fn client_set_leeway(c: *mut Client, s: i64) { (*c).cfg.leeway = s }
+fn client_set_jose(c: *mut Client, on: bool) {
+    if on { (*c).id_mode = IDM_JOSE } else { (*c).id_mode = IDM_EDDSA }
+}
+
+fn tokens_valid(t: *mut Tokens, now: i64, skew: i64) -> bool {
+    if (*t).access_token.length() == 0 { return false }
+    if (*t).expires_at == 0 { return true }
+    return now + skew < (*t).expires_at
+}
+
+fn tokens_expires_in(t: *mut Tokens, now: i64) -> i64 {
+    if (*t).expires_at == 0 { return 0 - 1 }
+    return (*t).expires_at - now
+}
+
+// ---------------------------------------------------------------- discovery
+
+fn endpoint_or_empty(d: *mut json.Json, root: u32, name: str) -> str {
+    return u.jget_str(d, root, name)
+}
+
+// GET {issuer}/.well-known/openid-configuration and the JWKS. L_OK or the reason.
+fn discover(c: *mut Client, now: i64) -> i64 {
+    if !u.endpoint_ok((*c).issuer) {
+        return L_CONFIG
+    }
+    let url: str = u.trim_slash((*c).issuer) + "/.well-known/openid-configuration"
+    var r: tp.HttpResp = tp.get(&(*c).tx, url, "")
+    if !r.ok {
+        return L_NET
+    }
+    if r.status != 200 {
+        return L_HTTP
+    }
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, r.body.p as u64, r.body.length()) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return L_PROTOCOL
+    }
+    let root: u32 = json.json_root(&d)
+    var rc: i64 = L_OK
+    if u.jget_str(&d, root, "issuer") != (*c).issuer {
+        rc = L_ISS
+    }
+    let ae: str = endpoint_or_empty(&d, root, "authorization_endpoint")
+    let te: str = endpoint_or_empty(&d, root, "token_endpoint")
+    let ju: str = endpoint_or_empty(&d, root, "jwks_uri")
+    let de: str = endpoint_or_empty(&d, root, "device_authorization_endpoint")
+    let re: str = endpoint_or_empty(&d, root, "revocation_endpoint")
+    let ee: str = endpoint_or_empty(&d, root, "end_session_endpoint")
+    if rc == L_OK {
+        if !u.endpoint_ok(ae) || !u.endpoint_ok(te) || !u.endpoint_ok(ju) {
+            rc = L_CONFIG
+        }
+        if de.length() > 0 && !u.endpoint_ok(de) { rc = L_CONFIG }
+        if re.length() > 0 && !u.endpoint_ok(re) { rc = L_CONFIG }
+        if ee.length() > 0 && !u.endpoint_ok(ee) { rc = L_CONFIG }
+    }
+    if rc == L_OK && u.jget_node(&d, root, "code_challenge_methods_supported") != json.JSON_NONE {
+        let methods: str = u.csv_of_array(&d, root, "code_challenge_methods_supported")
+        if !contains_item(methods, "S256") {
+            rc = L_CONFIG
+        }
+    }
+    json.json_free(&d)
+    if rc != L_OK {
+        return rc
+    }
+    (*c).authorization_endpoint = ae
+    (*c).token_endpoint = te
+    (*c).jwks_uri = ju
+    (*c).device_endpoint = de
+    (*c).revocation_endpoint = re
+    (*c).end_session_endpoint = ee
+    (*c).discovered = true
+    return fetch_keys(c, now)
+}
+
+fn contains_item(csv: str, item: str) -> bool {
+    var start: usize = 0
+    var i: usize = 0
+    while i <= csv.length() {
+        if i == csv.length() || csv.chars(i) == 44 as u8 {
+            if u.sub(csv, start, i - start) == item { return true }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// (Re)loads the signing keys from jwks_uri. L_OK / L_NET / L_PROTOCOL.
+fn fetch_keys(c: *mut Client, now: i64) -> i64 {
+    if (*c).id_mode == IDM_JOSE {
+        let r: tp.HttpResp = tp.get(&(*c).tx, (*c).jwks_uri, "")
+        var rr: tp.HttpResp = r
+        if !rr.ok { return L_NET }
+        if !tp.resp_text_ok(&rr) { return L_HTTP }
+        var test: jose.Jwks = jose.jwks_new()
+        let n: i64 = jose.jwks_parse(&test, r.body)
+        jose.jwks_free(&test)
+        if n <= 0 { return L_PROTOCOL }
+        (*c).jose_jwks = r.body
+        (*c).cfg.keys.fetched_at = now
+        (*c).cfg.keys.last_try = now
+        return L_OK
+    }
+    let jr: i64 = jwks.keyset_refresh(&(*c).cfg.keys, &(*c).tx, (*c).jwks_uri, now)
+    if jr == jwks.JW_OK { return L_OK }
+    if jr == jwks.JW_NET { return L_NET }
+    return L_PROTOCOL
+}
+
+// ---------------------------------------------------------------- begin
+
+// Fills `p` (state, nonce, PKCE, the URL for the browser). `extra` = more raw query parameters,
+// for example "prompt=login&max_age=0" for a FRESH login (linking). L_OK or L_CONFIG.
+fn begin(c: *mut Client, redirect_uri: str, extra: str, now: i64, p: *mut Pending) -> i64 {
+    *p = pending_new()
+    if !(*c).discovered || (*c).authorization_endpoint.length() == 0 || (*c).token_endpoint.length() == 0 {
+        return L_CONFIG
+    }
+    if !u.endpoint_ok((*c).authorization_endpoint) || redirect_uri.length() == 0 ||
+    u.find_char(redirect_uri, 35 as u8, 0) >= 0 {
+        return L_CONFIG
+    }
+    let state: str = u.rand_b64u(24)
+    let nonce: str = u.rand_b64u(24)
+    let verifier: str = u.rand_b64u(32)
+    if state.length() == 0 || nonce.length() == 0 || verifier.length() == 0 {
+        return L_CONFIG
+    }
+    var q: str = u.kv("response_type", "code")
+    q = q + "&" + u.kv("client_id", (*c).client_id)
+    q = q + "&" + u.kv("redirect_uri", redirect_uri)
+    q = q + "&" + u.kv("scope", (*c).scope)
+    q = q + "&" + u.kv("state", state)
+    q = q + "&" + u.kv("nonce", nonce)
+    q = q + "&" + u.kv("code_challenge", u.sha256_b64u(verifier))
+    q = q + "&" + u.kv("code_challenge_method", "S256")
+    q = u.join_kv(q, extra)
+    var sep: str = "?"
+    if u.find_char((*c).authorization_endpoint, 63 as u8, 0) >= 0 {
+        sep = "&"
+    }
+    (*p).state = state
+    (*p).nonce = nonce
+    (*p).verifier = verifier
+    (*p).redirect_uri = redirect_uri
+    (*p).url = (*c).authorization_endpoint + sep + q
+    (*p).created = now
+    (*p).fresh = u.query_get(extra, "prompt") == "login" || u.query_get(extra, "max_age") == "0"
+    (*p).used = false
+    (*p).ok = true
+    return L_OK
+}
+
+// ---------------------------------------------------------------- token endpoint
+
+fn base_form(c: *mut Client) -> str {
+    var f: str = u.kv("client_id", (*c).client_id)
+    if (*c).client_secret.length() > 0 {
+        f = f + "&" + u.kv("client_secret", (*c).client_secret)
+    }
+    return f
+}
+
+fn map_error(code: str) -> i64 {
+    if code == "invalid_grant" { return L_GRANT }
+    if code == "access_denied" || code == "authorization_declined" { return L_DENIED }
+    if code == "authorization_pending" { return L_PENDING }
+    if code == "slow_down" { return L_SLOW_DOWN }
+    if code == "expired_token" || code == "code_expired" { return L_EXPIRED }
+    return L_ERROR
+}
+
+// Checks an id_token. `nonce` "" = not demanded (refresh, device). JWT reasons go to detail.
+#[allow_escape]
+fn verify_id_token(c: *mut Client, token: str, nonce: str, now: i64, out: *mut jwt.Claims) -> Login {
+    var l: Login = login_empty()
+    var rc: i64 = jwt.JWT_OK
+    var cl: jwt.Claims = jwt.claims_empty()
+    if (*c).id_mode == IDM_JOSE {
+        rc = verify_jose(c, token, now, &cl)
+    } else {
+        cl = jwt.verify(token, &(*c).cfg, now)
+        rc = cl.reason
+        if (rc == jwt.JWT_NOKEY || rc == jwt.JWT_KEYEXPIRED) && (*c).jwks_uri.length() > 0 &&
+        jwks.keyset_may_refetch(&(*c).cfg.keys, now) {
+            // rotation: an unknown kid or an expired cache earns ONE refetch, then the verdict stands
+            if fetch_keys(c, now) == L_OK {
+                cl = jwt.verify(token, &(*c).cfg, now)
+                rc = cl.reason
+            }
+        }
+    }
+    if rc != jwt.JWT_OK {
+        l.reason = L_ID_TOKEN
+        l.detail = jwt.reason_name(rc)
+        return l
+    }
+    // several audiences: the authorized party must be us (Core 3.1.3.7 item 4/5)
+    if u.find_char(cl.aud, 44 as u8, 0) >= 0 && cl.azp != (*c).client_id {
+        l.reason = L_ID_TOKEN
+        l.detail = "azp"
+        return l
+    }
+    if nonce.length() > 0 && !u.ct_eq(cl.nonce, nonce) {
+        l.reason = L_NONCE
+        return l
+    }
+    *out = cl
+    l.reason = L_OK
+    l.has_id = true
+    l.claims = cl
+    return l
+}
+
+#[allow_escape]
+fn verify_jose(c: *mut Client, token: str, now: i64, out: *mut jwt.Claims) -> i64 {
+    var keys: jose.Jwks = jose.jwks_new()
+    if jose.jwks_parse(&keys, (*c).jose_jwks) <= 0 {
+        jose.jwks_free(&keys)
+        return jwt.JWT_NOKEY
+    }
+    var t: jose.Jwt = jose.jwt_new()
+    var rc: i64 = jose.jwt_decode(&t, token)
+    if rc == jose.JWT_OK {
+        var pol: jose.Policy = jose.policy((*c).issuer, (*c).client_id)
+        jose.policy_now(&pol, now)
+        jose.policy_leeway(&pol, (*c).cfg.leeway)
+        rc = jose.jwt_check(&t, &keys, &pol)
+        if rc == jose.JWT_OK {
+            rc = jwt.decode_claims(jose.jwt_payload(&t), (*c).issuer, (*c).client_id, (*c).cfg.leeway, now, out)
+        }
+    }
+    jose.jwt_free(&t)
+    jose.jwks_free(&keys)
+    return rc
+}
+
+// Parses a token endpoint answer into a Login. `nonce` demanded in the id_token ("" = not),
+// `need_id` = the answer must carry an id_token.
+fn parse_token_answer(c: *mut Client, r: *mut tp.HttpResp, now: i64, nonce: str, need_id: bool) -> Login {
+    var l: Login = login_empty()
+    if !(*r).ok {
+        l.reason = L_NET
+        return l
+    }
+    l.status = (*r).status
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, (*r).body.p as u64, (*r).body.length()) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        if (*r).status >= 200 && (*r).status < 300 {
+            l.reason = L_PROTOCOL
+        } else {
+            l.reason = L_HTTP
+        }
+        return l
+    }
+    let root: u32 = json.json_root(&d)
+    let err: str = u.jget_str(&d, root, "error")
+    if err.length() > 0 {
+        json.json_free(&d)
+        l.reason = map_error(err)
+        l.detail = err
+        return l
+    }
+    if (*r).status != 200 {
+        json.json_free(&d)
+        l.reason = L_HTTP
+        return l
+    }
+    var t: Tokens = tokens_new()
+    t.access_token = u.jget_str(&d, root, "access_token")
+    t.refresh_token = u.jget_str(&d, root, "refresh_token")
+    t.id_token = u.jget_str(&d, root, "id_token")
+    t.token_type = u.lower_ascii(u.jget_str(&d, root, "token_type"))
+    t.scope = u.jget_str(&d, root, "scope")
+    let ei: i64 = u.jget_int(&d, root, "expires_in", 0)
+    json.json_free(&d)
+    if t.access_token.length() == 0 || t.token_type != "bearer" {
+        l.reason = L_PROTOCOL
+        return l
+    }
+    t.issued_at = now
+    if ei > 0 {
+        t.expires_at = now + ei
+    }
+    l.tokens = t
+    if t.id_token.length() == 0 {
+        if need_id {
+            l.reason = L_ID_TOKEN
+            l.detail = "missing"
+            return l
+        }
+        l.reason = L_OK
+        return l
+    }
+    var cl: jwt.Claims = jwt.claims_empty()
+    let vl: Login = verify_id_token(c, t.id_token, nonce, now, &cl)
+    if vl.reason != L_OK {
+        l.reason = vl.reason
+        l.detail = vl.detail
+        return l
+    }
+    l.reason = L_OK
+    l.claims = cl
+    l.has_id = true
+    return l
+}
+
+// ---------------------------------------------------------------- finish
+
+// The browser came back to `redirected` (the full URL). Spends `p`. See the file head for the checks.
+fn finish(c: *mut Client, p: *mut Pending, redirected: str, now: i64) -> Login {
+    if !(*p).ok {
+        return error_login(L_CONFIG, "no_pending")
+    }
+    if (*p).used {
+        return error_login(L_REPLAY, "")
+    }
+    (*p).used = true // spent whatever happens below
+    if u.strip_query(redirected) != (*p).redirect_uri {
+        return error_login(L_REDIRECT, "")
+    }
+    let q: str = u.split_query(redirected)
+    let st: str = u.query_get(q, "state")
+    if st.length() == 0 || !u.ct_eq(st, (*p).state) {
+        return error_login(L_STATE, "")
+    }
+    let err: str = u.query_get(q, "error")
+    if err.length() > 0 {
+        var m: i64 = map_error(err)
+        if m == L_GRANT || m == L_PENDING || m == L_SLOW_DOWN || m == L_EXPIRED { m = L_ERROR }
+        return error_login(m, err)
+    }
+    if u.query_has(q, "iss") && u.query_get(q, "iss") != (*c).issuer {
+        return error_login(L_ISS, "")
+    }
+    let code: str = u.query_get(q, "code")
+    if code.length() == 0 {
+        return error_login(L_PROTOCOL, "no_code")
+    }
+    var f: str = u.kv("grant_type", "authorization_code")
+    f = f + "&" + u.kv("code", code)
+    f = f + "&" + u.kv("redirect_uri", (*p).redirect_uri)
+    f = f + "&" + u.kv("code_verifier", (*p).verifier)
+    f = f + "&" + base_form(c)
+    var r: tp.HttpResp = tp.post_form(&(*c).tx, (*c).token_endpoint, f, "")
+    var l: Login = parse_token_answer(c, &r, now, (*p).nonce, true)
+    if l.reason != L_OK {
+        return l
+    }
+    if (*p).fresh {
+        if l.claims.auth_time == 0 || l.claims.auth_time + (*c).cfg.leeway < (*p).created {
+            return error_login(L_STALE, "auth_time")
+        }
+    }
+    return l
+}
+
+// ---------------------------------------------------------------- refresh / revoke / logout
+
+// grant_type=refresh_token. The new refresh token (rotation) is in the result; when the server
+// sends none the old one stays valid (RFC 6749 6), the caller keeps it. An id_token, if sent, is checked.
+fn token_refresh(c: *mut Client, refresh_token: str, now: i64) -> Login {
+    if (*c).token_endpoint.length() == 0 || refresh_token.length() == 0 {
+        return error_login(L_CONFIG, "")
+    }
+    var f: str = u.kv("grant_type", "refresh_token")
+    f = f + "&" + u.kv("refresh_token", refresh_token)
+    f = f + "&" + base_form(c)
+    var r: tp.HttpResp = tp.post_form(&(*c).tx, (*c).token_endpoint, f, "")
+    return parse_token_answer(c, &r, now, "", false)
+}
+
+// RFC 7009. `refresh` = revoke the refresh token (else the access token). L_OK also when the
+// provider has no revocation endpoint (nothing to call) is NOT assumed: that is L_CONFIG.
+fn revoke(c: *mut Client, token: str, refresh: bool) -> i64 {
+    if (*c).revocation_endpoint.length() == 0 {
+        return L_CONFIG
+    }
+    var hint: str = "access_token"
+    if refresh { hint = "refresh_token" }
+    var f: str = u.kv("token", token)
+    f = f + "&" + u.kv("token_type_hint", hint)
+    f = f + "&" + base_form(c)
+    var r: tp.HttpResp = tp.post_form(&(*c).tx, (*c).revocation_endpoint, f, "")
+    if !r.ok { return L_NET }
+    if r.status == 200 { return L_OK }
+    return L_HTTP
+}
+
+// RP-initiated logout URL ("" when the provider has none).
+fn logout_url(c: *mut Client, id_token_hint: str, post_logout_redirect: str) -> str {
+    if (*c).end_session_endpoint.length() == 0 {
+        return ""
+    }
+    var q: str = u.kv("client_id", (*c).client_id)
+    if id_token_hint.length() > 0 { q = q + "&" + u.kv("id_token_hint", id_token_hint) }
+    if post_logout_redirect.length() > 0 { q = q + "&" + u.kv("post_logout_redirect_uri", post_logout_redirect) }
+    var sep: str = "?"
+    if u.find_char((*c).end_session_endpoint, 63 as u8, 0) >= 0 { sep = "&" }
+    return (*c).end_session_endpoint + sep + q
+}

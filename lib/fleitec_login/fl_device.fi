@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fleitec_login/fl_device.fi -- RFC 8628 Device Authorization Grant ("log in on your phone").
+//
+//     var da: device.DeviceAuth = device.device_new()
+//     device.start(&client, now, &da)          // show da.user_code and da.verification_uri
+//     loop { sleep(device.wait_secs(&da, now)); let l = device.poll(&client, &da, now) ... }
+//
+// `poll` asks the token endpoint at most once per `interval`; called too early it answers
+// L_PENDING ("too_early") WITHOUT a request. authorization_pending => L_PENDING, `slow_down` =>
+// the interval grows by 5 s (RFC 8628 3.5) and L_SLOW_DOWN is returned, `expired_token` or a
+// local timeout => L_EXPIRED, `access_denied` => L_DENIED. The id_token of the final answer is
+// checked like in the code flow (no nonce in this flow). The loop and the sleeping belong to the
+// caller (a UI thread, OrientOS init) -- this file never blocks.
+import std.rt
+import std.json
+import std.str
+import fleitec_login.fl_util as u
+import fleitec_login.fl_transport as tp
+import fleitec_login.fl_oidc as oidc
+
+export { DeviceAuth, device_new, start, poll, wait_secs, GRANT_DEVICE }
+
+const GRANT_DEVICE: str = "urn:ietf:params:oauth:grant-type:device_code"
+
+struct DeviceAuth {
+    device_code: str,
+    user_code: str,
+    verification_uri: str,
+    verification_uri_complete: str, // "" when the server sends none
+    expires_in: i64,
+    interval: i64, // seconds between polls (grows on slow_down)
+    started: i64,
+    next_poll: i64,
+    ok: bool,
+}
+
+fn device_new() -> DeviceAuth {
+    return DeviceAuth { device_code: "", user_code: "", verification_uri: "", verification_uri_complete: "",
+        expires_in: 0, interval: 5, started: 0, next_poll: 0, ok: false }
+}
+
+// POST the device endpoint. L_OK, L_CONFIG (provider has no device endpoint), L_NET, L_HTTP, L_PROTOCOL.
+fn start(c: *mut oidc.Client, now: i64, da: *mut DeviceAuth) -> i64 {
+    *da = device_new()
+    if (*c).device_endpoint.length() == 0 {
+        return oidc.L_CONFIG
+    }
+    var f: str = u.kv("client_id", (*c).client_id)
+    if (*c).client_secret.length() > 0 { f = f + "&" + u.kv("client_secret", (*c).client_secret) }
+    if (*c).scope.length() > 0 { f = f + "&" + u.kv("scope", (*c).scope) }
+    let r: tp.HttpResp = tp.post_form(&(*c).tx, (*c).device_endpoint, f, "")
+    if !r.ok { return oidc.L_NET }
+    if r.status != 200 { return oidc.L_HTTP }
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, r.body.p as u64, r.body.length()) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return oidc.L_PROTOCOL
+    }
+    let root: u32 = json.json_root(&d)
+    var n: DeviceAuth = device_new()
+    n.device_code = u.jget_str(&d, root, "device_code")
+    n.user_code = u.jget_str(&d, root, "user_code")
+    n.verification_uri = u.jget_str(&d, root, "verification_uri")
+    if n.verification_uri.length() == 0 { n.verification_uri = u.jget_str(&d, root, "verification_url") }
+    n.verification_uri_complete = u.jget_str(&d, root, "verification_uri_complete")
+    n.expires_in = u.jget_int(&d, root, "expires_in", 600)
+    n.interval = u.jget_int(&d, root, "interval", 5)
+    json.json_free(&d)
+    if n.device_code.length() == 0 || n.user_code.length() == 0 || n.verification_uri.length() == 0 {
+        return oidc.L_PROTOCOL
+    }
+    if n.interval < 1 { n.interval = 5 }
+    if n.expires_in < 1 { n.expires_in = 600 }
+    n.started = now
+    n.next_poll = now + n.interval
+    n.ok = true
+    *da = n
+    return oidc.L_OK
+}
+
+// seconds until the next poll is allowed (0 = now)
+fn wait_secs(da: *mut DeviceAuth, now: i64) -> i64 {
+    if now >= (*da).next_poll { return 0 }
+    return (*da).next_poll - now
+}
+
+// One poll. L_OK (tokens in the result), L_PENDING, L_SLOW_DOWN, L_EXPIRED, L_DENIED, L_ERROR, L_NET ...
+fn poll(c: *mut oidc.Client, da: *mut DeviceAuth, now: i64) -> oidc.Login {
+    if !(*da).ok {
+        return oidc.error_login(oidc.L_CONFIG, "no_device_auth")
+    }
+    if now >= (*da).started + (*da).expires_in {
+        (*da).ok = false
+        return oidc.error_login(oidc.L_EXPIRED, "local_timeout")
+    }
+    if now < (*da).next_poll {
+        return oidc.error_login(oidc.L_PENDING, "too_early")
+    }
+    var f: str = u.kv("grant_type", GRANT_DEVICE)
+    f = f + "&" + u.kv("device_code", (*da).device_code)
+    f = f + "&" + u.kv("client_id", (*c).client_id)
+    if (*c).client_secret.length() > 0 { f = f + "&" + u.kv("client_secret", (*c).client_secret) }
+    var r: tp.HttpResp = tp.post_form(&(*c).tx, (*c).token_endpoint, f, "")
+    (*da).next_poll = now + (*da).interval
+    var l: oidc.Login = oidc.parse_token_answer(c, &r, now, "", false)
+    if l.reason == oidc.L_SLOW_DOWN {
+        (*da).interval = (*da).interval + 5
+        (*da).next_poll = now + (*da).interval
+    }
+    if l.reason == oidc.L_EXPIRED || l.reason == oidc.L_DENIED || l.reason == oidc.L_OK {
+        (*da).ok = false // the device code is spent
+    }
+    return l
+}

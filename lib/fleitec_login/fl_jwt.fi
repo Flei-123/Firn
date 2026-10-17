@@ -1,0 +1,342 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fleitec_login/fl_jwt.fi -- the v2 session token of Fleitec-ID (EdDSA) and the legacy HS256 one.
+//
+//     var cfg: jwt.IssuerCfg = jwt.cfg_new("https://id.fleitec.com", "firnchat")
+//     jwks.keyset_parse(&cfg.keys, jwks_text, now)
+//     let c: jwt.Claims = jwt.verify(token, &cfg, now)
+//     if c.reason == jwt.JWT_OK { ... c.sub (account id) c.uid c.name c.acc c.idp ... }
+//
+// THE RULES (docs/FLEITEC-ID.md section 4, unchanged; the Reason names are the shared ones):
+//   1. exactly three parts; 2. strict base64url (no '=', canonical); 3. THE VERIFIER decides the
+//   algorithm: the header must say "EdDSA" -- `none`, `HS256`, `RS256`, anything else is `alg`,
+//   whatever key is around. An HS256 token "signed" with the PUBLIC key as secret is refused the
+//   same way (and `verify` never reads a key as an HMAC secret: there is no code path for it);
+//   `kid` is required and names the key in the issuer's JWKS (no kid, no guessing);
+//   4. the Ed25519 signature is checked by std.crypto.ed25519 (RFC 8032, canonical S);
+//   5. `exp` required, strictly in the future (exp + leeway <= now is `expired`); 6. `nbf` may not
+//   lie in the future (nbf - leeway > now is `nbf`); 7. `iss` and `aud` are MANDATORY here (a v2
+//   verifier without a demanded issuer and audience is a configuration error and refuses every
+//   token): equal octet for octet, `aud` may be a string or an array containing ours;
+//   8. no `sub` => `claims`; 9. claims are read by PARSING, never by searching the text.
+//   Tolerant on purpose: `acc`, `idp`, `uid`, `name`, `sv`, `amr`, `org_*`, `groups`, `email` and any
+//   unknown claim may be missing or odd -- they are copied when they are strings/numbers, else empty.
+//
+// `verify_legacy_hs256` is the old cookie token (alg HS256, shared secret, `uid`), kept in a
+// SEPARATE function with its own entry point: one issuer config never mixes both algorithms.
+import std.rt
+import std.json
+import std.str
+import std.crypto.ed25519
+import fleitec_id.jwt as fjwt
+import fleitec_login.fl_util as u
+import fleitec_login.fl_jwks as jwks
+
+export {
+    IssuerCfg, Claims, cfg_new, claims_empty, verify, verify_legacy_hs256, reason_name, decode_claims,
+    JWT_OK, JWT_MALFORMED, JWT_ALG, JWT_SIG, JWT_EXPIRED, JWT_CLAIMS, JWT_ISS, JWT_AUD, JWT_NBF,
+    JWT_NOKEY, JWT_KEYEXPIRED,
+}
+
+const JWT_OK: i64 = 0
+const JWT_MALFORMED: i64 = 1
+const JWT_ALG: i64 = 2
+const JWT_SIG: i64 = 3
+const JWT_EXPIRED: i64 = 4
+const JWT_CLAIMS: i64 = 5
+const JWT_ISS: i64 = 7
+const JWT_AUD: i64 = 8
+const JWT_NBF: i64 = 9
+const JWT_NOKEY: i64 = 10 // the `kid` is not in the issuer's key set (refetch the JWKS, then try again)
+const JWT_KEYEXPIRED: i64 = 12 // the key cache ran out (refetch the JWKS, then try again)
+
+const TOKEN_MAX: usize = 8192
+
+struct IssuerCfg {
+    iss: str,
+    aud: str,
+    leeway: i64, // seconds of clock skew tolerated (default 30)
+    keys: jwks.KeySet,
+}
+
+struct Claims {
+    reason: i64, // JWT_OK or why not; the other fields are filled on JWT_OK only
+    iss: str,
+    aud: str, // all audiences, comma separated
+    sub: str, // the account id (v2) or the uid (legacy)
+    acc: str,
+    idp: str,
+    uid: str,
+    name: str,
+    preferred_username: str,
+    email: str,
+    org_id: str,
+    org_name: str,
+    groups: str, // comma separated
+    amr: str, // comma separated
+    nonce: str,
+    azp: str,
+    jti: str,
+    kid: str,
+    iat: i64,
+    exp: i64,
+    nbf: i64, // 0 = none
+    auth_time: i64, // 0 = none
+    sv: i64,
+}
+
+fn cfg_new(iss: str, aud: str) -> IssuerCfg {
+    return IssuerCfg { iss: iss, aud: aud, leeway: 30, keys: jwks.keyset_new(600) }
+}
+
+fn claims_empty() -> Claims {
+    return Claims { reason: JWT_MALFORMED, iss: "", aud: "", sub: "", acc: "", idp: "", uid: "",
+        name: "", preferred_username: "", email: "", org_id: "", org_name: "", groups: "", amr: "",
+        nonce: "", azp: "", jti: "", kid: "", iat: 0, exp: 0, nbf: 0, auth_time: 0, sv: 0 }
+}
+
+fn reason_name(code: i64) -> str {
+    if code == JWT_OK { return "ok" }
+    if code == JWT_MALFORMED { return "malformed" }
+    if code == JWT_ALG { return "alg" }
+    if code == JWT_SIG { return "sig" }
+    if code == JWT_EXPIRED { return "expired" }
+    if code == JWT_CLAIMS { return "claims" }
+    if code == JWT_ISS { return "iss" }
+    if code == JWT_AUD { return "aud" }
+    if code == JWT_NBF { return "nbf" }
+    if code == JWT_NOKEY { return "nokey" }
+    if code == JWT_KEYEXPIRED { return "keyexpired" }
+    return "unknown"
+}
+
+// number claim present as a JSON number?
+fn has_num(d: *mut json.Json, obj: u32, name: str) -> bool {
+    let nd: u32 = u.jget_node(d, obj, name)
+    return nd != json.JSON_NONE && json.json_kind(d, nd) == json.JSON_NUMBER
+}
+
+// Does the audience (string or array) contain `want`?
+fn aud_has(d: *mut json.Json, obj: u32, want: str) -> bool {
+    let nd: u32 = u.jget_node(d, obj, "aud")
+    if nd == json.JSON_NONE {
+        return false
+    }
+    let k: u8 = json.json_kind(d, nd)
+    if k == json.JSON_STRING {
+        let s: str.Span = json.json_string(d, nd)
+        return (str { p: s.p, n: s.n }) == want
+    }
+    if k == json.JSON_ARRAY {
+        var c: u32 = json.json_child(d, nd)
+        while c != json.JSON_NONE {
+            if json.json_kind(d, c) == json.JSON_STRING {
+                let s2: str.Span = json.json_string(d, c)
+                if (str { p: s2.p, n: s2.n }) == want { return true }
+            }
+            c = json.json_next(d, c)
+        }
+    }
+    return false
+}
+
+// Copies the claims out of an already parsed payload object (no checks).
+fn read_claims(d: *mut json.Json, obj: u32, out: *mut Claims) {
+    (*out).iss = u.jget_str(d, obj, "iss")
+    (*out).aud = u.csv_of_array(d, obj, "aud")
+    (*out).sub = u.jget_str(d, obj, "sub")
+    (*out).acc = u.jget_str(d, obj, "acc")
+    (*out).idp = u.jget_str(d, obj, "idp")
+    (*out).uid = u.jget_str(d, obj, "uid")
+    (*out).name = u.jget_str(d, obj, "name")
+    (*out).preferred_username = u.jget_str(d, obj, "preferred_username")
+    (*out).email = u.jget_str(d, obj, "email")
+    (*out).org_id = u.jget_str(d, obj, "org_id")
+    (*out).org_name = u.jget_str(d, obj, "org_name")
+    (*out).groups = u.csv_of_array(d, obj, "groups")
+    (*out).amr = u.csv_of_array(d, obj, "amr")
+    (*out).nonce = u.jget_str(d, obj, "nonce")
+    (*out).azp = u.jget_str(d, obj, "azp")
+    (*out).jti = u.jget_str(d, obj, "jti")
+    (*out).iat = u.jget_int(d, obj, "iat", 0)
+    (*out).exp = u.jget_int(d, obj, "exp", 0)
+    (*out).nbf = u.jget_int(d, obj, "nbf", 0)
+    (*out).auth_time = u.jget_int(d, obj, "auth_time", 0)
+    (*out).sv = u.jget_int(d, obj, "sv", 0)
+}
+
+// The time + issuer + audience + subject rules (4.5 - 4.8) on a payload JSON text.
+// `iss`/`aud` must be non-empty. Used by `verify` AFTER the signature and by oidc for id_tokens.
+fn decode_claims(payload: str, iss: str, aud: str, leeway: i64, now: i64, out: *mut Claims) -> i64 {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, payload.p as u64, payload.length()) catch false
+    if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        return JWT_MALFORMED
+    }
+    let root: u32 = json.json_root(&d)
+    var rc: i64 = JWT_OK
+    if !has_num(&d, root, "exp") {
+        rc = JWT_EXPIRED
+    } else if u.jget_int(&d, root, "exp", 0) + leeway <= now {
+        rc = JWT_EXPIRED
+    } else if has_num(&d, root, "nbf") && u.jget_int(&d, root, "nbf", 0) - leeway > now {
+        rc = JWT_NBF
+    } else if iss.length() == 0 || u.jget_str(&d, root, "iss") != iss {
+        rc = JWT_ISS
+    } else if aud.length() == 0 || !aud_has(&d, root, aud) {
+        rc = JWT_AUD
+    } else if u.jget_str(&d, root, "sub").length() == 0 {
+        rc = JWT_CLAIMS
+    }
+    if rc == JWT_OK {
+        read_claims(&d, root, out)
+    }
+    json.json_free(&d)
+    return rc
+}
+
+// Splits "h.p.s" into its three parts. false unless exactly two dots and no empty part.
+fn split3(t: str, h: *mut str, p: *mut str, s: *mut str) -> bool {
+    let d1: i64 = u.find_char(t, 46 as u8, 0)
+    if d1 <= 0 {
+        return false
+    }
+    let d2: i64 = u.find_char(t, 46 as u8, (d1 + 1) as usize)
+    if d2 <= d1 + 1 {
+        return false
+    }
+    if u.find_char(t, 46 as u8, (d2 + 1) as usize) >= 0 {
+        return false
+    }
+    if (d2 + 1) as usize >= t.length() {
+        return false
+    }
+    *h = u.sub(t, 0, d1 as usize)
+    *p = u.sub(t, (d1 + 1) as usize, (d2 - d1 - 1) as usize)
+    *s = u.sub(t, (d2 + 1) as usize, t.length() - (d2 + 1) as usize)
+    return true
+}
+
+// THE CHECK. `now` is unix seconds. Never panics on hostile input; a refusal is `reason != JWT_OK`.
+fn verify(token: str, cfg: *mut IssuerCfg, now: i64) -> Claims {
+    var out: Claims = claims_empty()
+    if token.length() < 8 || token.length() > TOKEN_MAX {
+        return out
+    }
+    var hs: str = ""
+    var ps: str = ""
+    var ss: str = ""
+    if !split3(token, &hs, &ps, &ss) {
+        return out
+    }
+    var okh: bool = false
+    var okp: bool = false
+    var oks: bool = false
+    let hdr: str = u.b64u_dec_str(hs, &okh)
+    let pay: str = u.b64u_dec_str(ps, &okp)
+    var sigb: rt.Buf = rt.buf_new()
+    oks = u.b64u_dec_buf(ss, &sigb)
+    if !okh || !okp || !oks {
+        rt.buf_free(&sigb)
+        return out
+    }
+    // header
+    var d: json.Json = json.json_new()
+    let hok: bool = json.json_parse(&d, hdr.p as u64, hdr.length()) catch false
+    if !hok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
+        json.json_free(&d)
+        rt.buf_free(&sigb)
+        return out
+    }
+    let hroot: u32 = json.json_root(&d)
+    let algn: u32 = u.jget_node(&d, hroot, "alg")
+    if algn == json.JSON_NONE || json.json_kind(&d, algn) != json.JSON_STRING {
+        json.json_free(&d)
+        rt.buf_free(&sigb)
+        return out
+    }
+    let alg: str = u.jget_str(&d, hroot, "alg")
+    let kid: str = u.jget_str(&d, hroot, "kid")
+    json.json_free(&d)
+    if alg != "EdDSA" {
+        rt.buf_free(&sigb)
+        out.reason = JWT_ALG
+        return out
+    }
+    if kid.length() == 0 {
+        rt.buf_free(&sigb)
+        out.reason = JWT_NOKEY
+        return out
+    }
+    var pubk: [u8; 32] = [0; 32]
+    let lk: i64 = jwks.keyset_lookup(&(*cfg).keys, kid, now, (&pubk[0]) as u64)
+    if lk == jwks.JW_EXPIRED {
+        rt.buf_free(&sigb)
+        out.reason = JWT_KEYEXPIRED
+        return out
+    }
+    if lk != jwks.JW_FOUND {
+        rt.buf_free(&sigb)
+        out.reason = JWT_NOKEY
+        return out
+    }
+    if sigb.len != 64 {
+        rt.buf_free(&sigb)
+        out.reason = JWT_SIG
+        return out
+    }
+    var ctx: ed25519.Ctx = ed25519.ctx_new()
+    var sigok: bool = false
+    if ed25519.ctx_init(&ctx) {
+        let signed: str = hs + "." + ps
+        sigok = ed25519.ed25519_verify(&ctx, (&pubk[0]) as u64, signed.p as u64, signed.length(), sigb.ptr)
+    }
+    rt.buf_free(&sigb)
+    if !sigok {
+        out.reason = JWT_SIG
+        return out
+    }
+    var c: Claims = claims_empty()
+    let rc: i64 = decode_claims(pay, (*cfg).iss, (*cfg).aud, (*cfg).leeway, now, &c)
+    if rc != JWT_OK {
+        out.reason = rc
+        return out
+    }
+    c.kid = kid
+    c.reason = JWT_OK
+    return c
+}
+
+// The OLD cookie token: HS256 over "<head>.<payload>" with the shared secret (the OCTETS of the
+// secret, as in docs/FLEITEC-ID.md section 3), `uid` or `sub` required. `iss`/`aud` are checked
+// only when non-empty (the old tokens carry none). The result's `sub` and `uid` are the uid.
+// Reuses lib/fleitec_id/jwt.fi -- the one verifier that already passes the shared vectors.
+fn old_uid(c: *mut fjwt.Claims) -> str {
+    return __str_copy(str { p: fjwt.claims_uid_ptr(c) as *u8, n: fjwt.claims_uid_len(c) })
+}
+
+fn old_name(c: *mut fjwt.Claims) -> str {
+    return __str_copy(str { p: fjwt.claims_name_ptr(c) as *u8, n: fjwt.claims_name_len(c) })
+}
+
+#[allow_escape]
+fn verify_legacy_hs256(token: str, secret: str, iss: str, aud: str, now: i64) -> Claims {
+    var out: Claims = claims_empty()
+    var old: fjwt.Claims = fjwt.claims_zero()
+    let rc: i64 = fjwt.jwt_verify_full(token.p as u64, token.length(), secret.p as u64, secret.length(),
+        now, iss.p as u64, iss.length(), aud.p as u64, aud.length(), &old)
+    if rc != fjwt.JWT_OK {
+        out.reason = rc
+        return out
+    }
+    out.reason = JWT_OK
+    out.uid = old_uid(&old)
+    out.sub = out.uid
+    out.name = old_name(&old)
+    out.iat = fjwt.claims_iat(&old)
+    out.exp = fjwt.claims_exp(&old)
+    out.iss = iss
+    out.aud = aud
+    out.idp = "jarvis"
+    return out
+}

@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fleitec_login/fl_jwks.fi -- the public signing keys of ONE issuer (OKP / Ed25519 only).
+//
+//     var ks: jwks.KeySet = jwks.keyset_new(600)           // cache lives 600 s
+//     jwks.keyset_pin(&ks, "emergency-1", "<base64url x>") // optional, never expires
+//     jwks.keyset_parse(&ks, json_text, now)               // or keyset_refresh(&ks, &tx, url, now)
+//     jwks.keyset_lookup(&ks, kid, now, out32)             // 0 = found
+//
+// RULES
+//   * only `kty=OKP`, `crv=Ed25519`, `x` = exactly 32 octets (strict base64url); a `use` other
+//     than "sig" or an `alg` other than "EdDSA" drops the key; a key without `kid` is dropped
+//     (a token names its key, nobody guesses). Anything else (RSA, EC, oct) is skipped.
+//   * the CACHE EXPIRES: after `ttl` seconds the fetched keys are not used any more
+//     (JW_EXPIRED) -- a verifier that never refreshes must not trust a rotated-away key forever.
+//   * ROTATION: a new document REPLACES the fetched keys as a whole (a retired key vanishes
+//     with the document that stops listing it). The JWKS lists `active` and `next` together,
+//     so a token signed with `next` is accepted the moment the document shows it. A document
+//     with no usable key is refused and the old keys stay.
+//   * PINNED keys (emergency key for devices without network) are kept apart: they survive
+//     refresh and expiry; a pinned kid can never be shadowed by a fetched key of the same kid.
+//   * unknown kid => at most ONE refetch per `min_refetch` seconds (`keyset_may_refetch`), so a
+//     stream of tokens with random kids cannot turn the verifier into a request cannon.
+import std.rt
+import std.json
+import std.str
+import fleitec_login.fl_util as u
+import fleitec_login.fl_transport as tp
+
+export {
+    JwKey, KeySet,
+    keyset_new, keyset_parse, keyset_pin, keyset_lookup, keyset_count, keyset_pinned_count,
+    keyset_may_refetch, keyset_refresh, keyset_expired, keyset_has_kid,
+    JW_FOUND, JW_UNKNOWN, JW_EXPIRED, JW_OK, JW_BAD, JW_NET, JW_MAX_KEYS,
+}
+
+const JW_MAX_KEYS: usize = 8
+const JW_MAX_PINNED: usize = 2
+
+const JW_FOUND: i64 = 0
+const JW_UNKNOWN: i64 = 1 // no key with this kid
+const JW_EXPIRED: i64 = 2 // the kid is not pinned and the cache ran out
+
+const JW_OK: i64 = 0
+const JW_BAD: i64 = 1 // not a JWKS / no usable Ed25519 key in it
+const JW_NET: i64 = 2 // the fetch failed (status, transport)
+
+struct JwKey {
+    kid: str,
+    x: str, // base64url of the 32 octets (validated when stored)
+}
+
+struct KeySet {
+    keys: [JwKey; 8],
+    n: usize,
+    pins: [JwKey; 2],
+    np: usize,
+    ttl: i64, // seconds a fetched document stays usable
+    fetched_at: i64, // 0 = never
+    min_refetch: i64, // seconds between two fetch attempts
+    last_try: i64,
+}
+
+fn key_empty() -> JwKey {
+    return JwKey { kid: "", x: "" }
+}
+
+fn keyset_new(ttl: i64) -> KeySet {
+    return KeySet { keys: [key_empty(); 8], n: 0, pins: [key_empty(); 2], np: 0,
+        ttl: ttl, fetched_at: 0, min_refetch: 30, last_try: 0 - 1000000 }
+}
+
+fn keyset_count(k: *mut KeySet) -> usize { return (*k).n }
+fn keyset_pinned_count(k: *mut KeySet) -> usize { return (*k).np }
+
+fn x_ok(x: str) -> bool {
+    if x.length() != 43 {
+        return false
+    }
+    var b: rt.Buf = rt.buf_new()
+    let ok: bool = u.b64u_dec_buf(x, &b) && b.len == 32
+    rt.buf_free(&b)
+    return ok
+}
+
+// Pins a key that is trusted without any document. false = bad x or no room.
+fn keyset_pin(k: *mut KeySet, kid: str, x: str) -> bool {
+    if kid.length() == 0 || !x_ok(x) || (*k).np >= JW_MAX_PINNED {
+        return false
+    }
+    (*k).pins[(*k).np] = JwKey { kid: kid, x: x }
+    (*k).np = (*k).np + 1
+    return true
+}
+
+fn keyset_expired(k: *mut KeySet, now: i64) -> bool {
+    if (*k).fetched_at == 0 {
+        return true
+    }
+    return now >= (*k).fetched_at + (*k).ttl
+}
+
+// Reads a JWKS document and REPLACES the fetched keys with its Ed25519 keys.
+// Returns the number of keys now held, or -1 (nothing changed) when the text is not a
+// JWKS or has no usable key.
+fn keyset_parse(k: *mut KeySet, text: str, now: i64) -> i64 {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, text.p as u64, text.length()) catch false
+    if !ok {
+        json.json_free(&d)
+        return -1
+    }
+    let root: u32 = json.json_root(&d)
+    let arr: u32 = u.jget_node(&d, root, "keys")
+    if json.json_kind(&d, root) != json.JSON_OBJECT || arr == json.JSON_NONE ||
+    json.json_kind(&d, arr) != json.JSON_ARRAY {
+        json.json_free(&d)
+        return -1
+    }
+    var tmp: [JwKey; 8] = [key_empty(); 8]
+    var nt: usize = 0
+    var c: u32 = json.json_child(&d, arr)
+    while c != json.JSON_NONE {
+        if json.json_kind(&d, c) == json.JSON_OBJECT && nt < JW_MAX_KEYS {
+            let kty: str = u.jget_str(&d, c, "kty")
+            let crv: str = u.jget_str(&d, c, "crv")
+            let kid: str = u.jget_str(&d, c, "kid")
+            let x: str = u.jget_str(&d, c, "x")
+            let use_: str = u.jget_str(&d, c, "use")
+            let alg: str = u.jget_str(&d, c, "alg")
+            var good: bool = kty == "OKP" && crv == "Ed25519" && kid.length() > 0 && x_ok(x)
+            if use_.length() > 0 && use_ != "sig" { good = false }
+            if alg.length() > 0 && alg != "EdDSA" { good = false }
+            // a duplicate kid inside one document: the first one wins, the rest is dropped
+            var i: usize = 0
+            while i < nt {
+                if tmp[i].kid == kid { good = false }
+                i = i + 1
+            }
+            if good {
+                tmp[nt] = JwKey { kid: kid, x: x }
+                nt = nt + 1
+            }
+        }
+        c = json.json_next(&d, c)
+    }
+    json.json_free(&d)
+    if nt == 0 {
+        return -1
+    }
+    var i2: usize = 0
+    while i2 < JW_MAX_KEYS {
+        (*k).keys[i2] = tmp[i2]
+        i2 = i2 + 1
+    }
+    (*k).n = nt
+    (*k).fetched_at = now
+    return nt as i64
+}
+
+fn keyset_has_kid(k: *mut KeySet, kid: str) -> bool {
+    var i: usize = 0
+    while i < (*k).np {
+        if (*k).pins[i].kid == kid { return true }
+        i = i + 1
+    }
+    i = 0
+    while i < (*k).n {
+        if (*k).keys[i].kid == kid { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Finds `kid`, writes its 32 octets to `out`. Pinned keys first (they win and never expire).
+fn keyset_lookup(k: *mut KeySet, kid: str, now: i64, out: u64) -> i64 {
+    var i: usize = 0
+    var hit: str = ""
+    var found: bool = false
+    while i < (*k).np {
+        if (*k).pins[i].kid == kid {
+            hit = (*k).pins[i].x
+            found = true
+        }
+        i = i + 1
+    }
+    if !found {
+        i = 0
+        while i < (*k).n {
+            if (*k).keys[i].kid == kid {
+                if keyset_expired(k, now) {
+                    return JW_EXPIRED
+                }
+                hit = (*k).keys[i].x
+                found = true
+            }
+            i = i + 1
+        }
+    }
+    if !found {
+        if (*k).n > 0 && keyset_expired(k, now) {
+            return JW_EXPIRED
+        }
+        return JW_UNKNOWN
+    }
+    var b: rt.Buf = rt.buf_new()
+    let ok: bool = u.b64u_dec_buf(hit, &b) && b.len == 32
+    if !ok {
+        rt.buf_free(&b)
+        return JW_UNKNOWN
+    }
+    rt.mem_copy(out, b.ptr, 32)
+    rt.buf_free(&b)
+    return JW_FOUND
+}
+
+// true when a fetch is allowed now (not more often than min_refetch)
+fn keyset_may_refetch(k: *mut KeySet, now: i64) -> bool {
+    return now - (*k).last_try >= (*k).min_refetch
+}
+
+// GET the JWKS url and apply it. The attempt is counted even when it fails.
+fn keyset_refresh(k: *mut KeySet, t: *mut tp.Transport, url: str, now: i64) -> i64 {
+    (*k).last_try = now
+    let r: tp.HttpResp = tp.get(t, url, "")
+    var rr: tp.HttpResp = r
+    if !tp.resp_text_ok(&rr) {
+        return JW_NET
+    }
+    if keyset_parse(k, r.body, now) < 0 {
+        return JW_BAD
+    }
+    return JW_OK
+}
