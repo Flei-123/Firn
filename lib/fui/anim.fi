@@ -76,6 +76,7 @@ import fui.style
 import fui.theme
 import fui.widget
 import fui.render
+import fui.damage
 
 export {
     // --- Easings
@@ -119,6 +120,7 @@ export {
     Tween, tween_new, tween_busy, tween_set_ease,
     color_to, value_to,
     chan_f, chan_color, chan_f_w, chan_color_w, CHAN_MAX,
+    chan_bounds, chan_bounds_end, transreg_bounded, transreg_damage,
     fling_pos, fling_vel, fling_total, predict_ahead,
     DUR_HOVER, DUR_PRESS, DUR_FOCUS, DUR_PANEL, FRAME_LEAD_MS,
 }
@@ -1129,6 +1131,16 @@ struct TransReg {
     ch_seen: [i64; 48],
     ch_tw: [Tween; 48],
     ch_n: usize,
+    // W7: where the running work is. `unb` = something is dirty without a
+    // rectangle (a widget transition, a busy mark): paint everything.
+    // Otherwise `dm` holds the rectangles of the busy channels only.
+    unb: u32,
+    dm: damage.Damage,
+    bx0: f64,
+    by0: f64,
+    bx1: f64,
+    by1: f64,
+    has_b: u32,
 }
 
 fn keyer_none(ud: u64, wx: u64) -> u64 {
@@ -1149,6 +1161,8 @@ fn transreg_new() -> TransReg {
         lead: 0, dstate: [0 as i64; 6],
         ch_key: [0 as u64; 48], ch_id: [0 as u32; 48], ch_seen: [0 as i64; 48],
         ch_tw: [tween_new(); 48], ch_n: 0,
+        unb: 0, dm: damage.dmg_new(), bx0: 0.0, by0: 0.0, bx1: 0.0, by1: 0.0,
+        has_b: 0,
     }
 }
 
@@ -1184,6 +1198,8 @@ fn transreg_count(r: *mut TransReg) -> usize { return (*r).n }
 fn transreg_clear(r: *mut TransReg) {
     (*r).n = 0
     (*r).dirty = 0
+    (*r).unb = 0
+    damage.dmg_reset(&(*r).dm)
 }
 fn transreg_dirty(r: *mut TransReg) -> bool { return (*r).dirty != 0 }
 
@@ -1194,6 +1210,19 @@ fn transreg_dirty(r: *mut TransReg) -> bool { return (*r).dirty != 0 }
 // fuiwirt.host_set_transitions).
 fn transreg_new_frame(r: *mut TransReg) {
     (*r).dirty = 0
+    (*r).unb = 0
+    damage.dmg_reset(&(*r).dm)
+}
+
+// W7: true when everything that is running has a named rectangle (only
+// channels with `chan_bounds`): the host adds `transreg_damage` to its own
+// damage instead of repainting the window.
+fn transreg_bounded(r: *mut TransReg) -> bool {
+    return (*r).dirty != 0 && (*r).unb == 0 && !damage.dmg_is_empty(&(*r).dm)
+}
+
+fn transreg_damage(r: *mut TransReg) -> *mut damage.Damage {
+    return &(*r).dm
 }
 
 fn transreg_set_duration(r: *mut TransReg, ms: i64) {
@@ -1350,6 +1379,7 @@ fn transreg_hook(reg: u64, cx: u64, wx: u64, now_ms: i64) -> bool {
     trans_apply(t, e)
     if d {
         (*r).dirty = 1
+        (*r).unb = 1
     }
     return d
 }
@@ -1404,6 +1434,7 @@ fn transreg_set_fluent(r: *mut TransReg) {
 // Ask the host for another frame (a painter running its own motion).
 fn transreg_busy_mark(r: *mut TransReg) {
     (*r).dirty = 1
+    (*r).unb = 1
 }
 
 // ============================================ W3: TWEEN, COLOR_TO, VALUE_TO
@@ -1547,6 +1578,40 @@ fn chan_slot(r: *mut TransReg, now_ms: i64, key: u64, id: u32) -> *mut Tween {
     return &(*r).ch_tw[j]
 }
 
+// A running channel asks for another frame. With bounds named (`chan_bounds`)
+// only that rectangle is dirty; without, the whole window.
+fn chan_mark(r: *mut TransReg) {
+    (*r).dirty = 1
+    if (*r).has_b != 0 as u32 {
+        damage.dmg_add(&(*r).dm, (*r).bx0, (*r).by0, (*r).bx1, (*r).by1)
+    } else {
+        (*r).unb = 1
+    }
+}
+
+// The control about to ask for channels says where it paints (ink rectangle,
+// window pixels). Call `chan_bounds_end` when it is done.
+fn chan_bounds(c: *mut render.Ctx, x0: f64, y0: f64, x1: f64, y1: f64) {
+    let reg: u64 = render.ctx_anim_reg(c)
+    if reg == 0 {
+        return
+    }
+    let r: *mut TransReg = reg as *mut TransReg
+    (*r).bx0 = x0
+    (*r).by0 = y0
+    (*r).bx1 = x1
+    (*r).by1 = y1
+    (*r).has_b = 1 as u32
+}
+
+fn chan_bounds_end(c: *mut render.Ctx) {
+    let reg: u64 = render.ctx_anim_reg(c)
+    if reg == 0 {
+        return
+    }
+    (*(reg as *mut TransReg)).has_b = 0 as u32
+}
+
 fn chan_f(c: *mut render.Ctx, key: u64, id: u32, target: f64, dur_ms: i64) -> f64 {
     let reg: u64 = render.ctx_anim_reg(c)
     if reg == 0 {
@@ -1560,7 +1625,7 @@ fn chan_f(c: *mut render.Ctx, key: u64, id: u32, target: f64, dur_ms: i64) -> f6
     }
     let v: f64 = value_to(s, now, target, dur_ms)
     if tween_busy(s) {
-        (*r).dirty = 1
+        chan_mark(r)
     }
     return v
 }
@@ -1578,7 +1643,7 @@ fn chan_color(c: *mut render.Ctx, key: u64, id: u32, target: u32, dur_ms: i64) -
     }
     let v: u32 = color_to(s, now, target, dur_ms)
     if tween_busy(s) {
-        (*r).dirty = 1
+        chan_mark(r)
     }
     return v
 }
