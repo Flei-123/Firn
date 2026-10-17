@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/pacing.fi -- FRAME PACING: a deadline grid instead of "sleep 16".
+//
+// The old host slept FRAME_MS after every frame (period = paint + 16 ms, so a
+// 10 ms paint ran at 38 fps and jittered with the paint cost) or, while a
+// transition ran, did not sleep at all (100 % CPU, uneven steps). A pacer
+// keeps a DEADLINE for the next frame start and moves it by exactly one
+// refresh period per frame, so the rate is the display's, independent of
+// the paint cost, and nothing accumulates (no drift).
+//
+//     var p: pacing.Pacer = pacing.pacer_new(60)        // or pacer_new_hz
+//     // at the start of a frame (clock = monotonic ms):
+//     pacing.pacer_frame(&p, now_ms)
+//     // before sleeping, while an animation wants the next frame:
+//     let ms: i64 = pacing.pacer_wait(&p, now_ms)       // 0 = paint now
+//
+// IDLE: an event after a long pause gets `pacer_wait` = 0 (no throttling of
+// the first frame -- latency beats rate); the grid restarts from that frame.
+// The clock is integer ms, so a wake-up can be up to 1 ms late; the next
+// deadline is still computed from the grid, so the lateness does not add up.
+//
+// REFRESH RATE: a window system that can tell it passes it to `pacer_set_hz`;
+// the environment variable FUI_REFRESH_HZ is read by the host. 30..240 are
+// accepted, anything else is ignored (60 stays).
+export {
+    Pacer, pacer_new, pacer_set_hz, pacer_hz, pacer_frame, pacer_wait,
+    pacer_period_us, pacer_reset,
+}
+
+struct Pacer {
+    period_us: i64,
+    next_us: i64, // deadline of the next frame start, 0 = none yet
+    started: u32,
+}
+
+fn pacer_new(hz: i64) -> Pacer {
+    var p: Pacer = Pacer { period_us: 16667, next_us: 0, started: 0 as u32 }
+    pacer_set_hz(&p, hz)
+    return p
+}
+
+fn pacer_set_hz(p: *mut Pacer, hz: i64) -> bool {
+    if hz < 30 || hz > 240 {
+        return false
+    }
+    (*p).period_us = 1000000 / hz
+    return true
+}
+
+fn pacer_hz(p: *mut Pacer) -> i64 {
+    return (1000000 + (*p).period_us / 2) / (*p).period_us
+}
+
+fn pacer_period_us(p: *mut Pacer) -> i64 { return (*p).period_us }
+
+fn pacer_reset(p: *mut Pacer) {
+    (*p).next_us = 0
+    (*p).started = 0 as u32
+}
+
+// A frame starts at `now_ms`: move the deadline one period along the grid.
+// More than a period behind (first frame, idle gap, overloaded frame): the
+// grid restarts from now.
+fn pacer_frame(p: *mut Pacer, now_ms: i64) {
+    let now: i64 = now_ms * 1000
+    // first frame, an idle gap or an overloaded frame (more than a period
+    // behind), or an EVENT frame that started well before its slot: the grid
+    // restarts from this frame (an early frame must not eat the slot of the
+    // next one, that would be a 2-period hole)
+    if (*p).started == 0 as u32 || now >= (*p).next_us + (*p).period_us
+    || now < (*p).next_us - (*p).period_us / 4 {
+        (*p).next_us = now + (*p).period_us
+        (*p).started = 1 as u32
+    } else {
+        (*p).next_us = (*p).next_us + (*p).period_us
+    }
+}
+
+// Milliseconds until the next frame may start (rounded up; 0 = now).
+fn pacer_wait(p: *mut Pacer, now_ms: i64) -> i64 {
+    if (*p).started == 0 as u32 {
+        return 0
+    }
+    let d: i64 = (*p).next_us - now_ms * 1000
+    if d <= 0 {
+        return 0
+    }
+    return (d + 999) / 1000
+}

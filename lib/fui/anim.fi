@@ -112,6 +112,15 @@ export {
     transreg_index, transreg_clear, transreg_set_keyer, transreg_key,
     transreg_set_duration, transreg_set_easing, transreg_set_oklab,
     transreg_kind_ok, transreg_dirty, transreg_new_frame, TRANS_MAX,
+    // --- W3 feel: Fluent curves, lead-in, per-state durations, channels
+    easing_fluent_decel, easing_fluent_standard, easing_spring_critical,
+    transreg_set_lead, transreg_set_state_duration, transreg_set_fluent,
+    transreg_busy_mark,
+    Tween, tween_new, tween_busy, tween_set_ease,
+    color_to, value_to,
+    chan_f, chan_color, chan_f_w, chan_color_w, CHAN_MAX,
+    fling_pos, fling_vel, fling_total, predict_ahead,
+    DUR_HOVER, DUR_PRESS, DUR_FOCUS, DUR_PANEL, FRAME_LEAD_MS,
 }
 
 // ================================================================ EASINGS
@@ -208,6 +217,41 @@ fn easing_named(kind: u32) -> Easing {
     }
     return easing_linear()
 }
+
+// WinUI / Fluent curves (the numbers of ControlFastOutSlowInKeySpline and
+// the "standard" curve): decelerate is the one for state changes (hover,
+// press, fade in): it covers ~60 % of the way in the first 20 % of the time,
+// so the eye sees the reaction in the very first frame.
+fn easing_fluent_decel() -> Easing {
+    return easing_bezier_kind(EASE_OUT, 0.0, 0.0, 0.0, 1.0)
+}
+
+fn easing_fluent_standard() -> Easing {
+    return easing_bezier_kind(EASE_IN_OUT, 0.1, 0.9, 0.2, 1.0)
+}
+
+// A spring at CRITICAL damping (no overshoot, fastest settling): c = 2 sqrt(k m).
+fn easing_spring_critical(mass: f64, stiff: f64) -> Easing {
+    var m: f64 = mass
+    if m <= 0.0 {
+        m = 1.0
+    }
+    var k: f64 = stiff
+    if k <= 0.0 {
+        k = 1.0
+    }
+    return easing_spring(m, k, 2.0 * matrix.m_sqrt(k * m))
+}
+
+// Durations of the feel (ms), the numbers of WinUI's motion table: a hover
+// colour 83, a press 50, the focus ring 100, a dialog or menu appearing 167.
+const DUR_HOVER: i64 = 83
+const DUR_PRESS: i64 = 50
+const DUR_FOCUS: i64 = 100
+const DUR_PANEL: i64 = 167
+// One frame at 60 Hz. A transition that starts from rest is back-dated by
+// this much, so the frame that HANDLES the event already shows motion.
+const FRAME_LEAD_MS: i64 = 16
 
 // A Bezier polynomial in one coordinate, with P0 = 0 and P3 = 1.
 fn bez(a1: f64, a2: f64, t: f64) -> f64 {
@@ -667,6 +711,8 @@ struct Transition {
     // makes the surface seem either sluggish or nervous.
     // 0 means "nothing set, take dur_ms".
     dur_state: [i64; 6],
+    // back-dating of a start FROM REST (ms), see FRAME_LEAD_MS; 0 = off
+    lead_ms: i64,
 }
 
 fn trans_new(bg: u32, radius: f64, border: f64, alpha: f64) -> Transition {
@@ -675,7 +721,7 @@ fn trans_new(bg: u32, radius: f64, border: f64, alpha: f64) -> Transition {
         bg_von: bg, bg_bis: bg, rad_von: radius, rad_bis: radius,
         bor_von: border, bor_bis: border, alp_von: alpha, alp_bis: alpha,
         dx_von: 0.0, dx_bis: 0.0, dy_von: 0.0, dy_bis: 0.0,
-        p: 1.0, oklab: 0, dur_state: [0 as i64; 6],
+        p: 1.0, oklab: 0, dur_state: [0 as i64; 6], lead_ms: 0,
     }
 }
 
@@ -743,6 +789,17 @@ fn trans_duration(t: *mut Transition) -> i64 {
 // come from the caller, who fetches them from theme and style.
 fn trans_to_state(t: *mut Transition, now_ms: i64, state: u32, bg: u32,
     radius: f64, border: f64, alpha: f64, dx: f64, dy: f64) {
+    // a start FROM REST that really changes something is back-dated by the
+    // lead, so the frame that handles the event already shows motion; a
+    // start in mid-motion keeps continuity (no jump of the visible value)
+    var lead: i64 = 0
+    if (*t).p >= 0.999 && (*t).lead_ms > 0 {
+        if trans_color(t) != bg || trans_radius(t) != radius
+        || trans_border(t) != border || trans_alpha(t) != alpha
+        || trans_dx(t) != dx || trans_dy(t) != dy {
+            lead = (*t).lead_ms
+        }
+    }
     (*t).bg_von = trans_color(t)
     (*t).rad_von = trans_radius(t)
     (*t).bor_von = trans_border(t)
@@ -756,7 +813,7 @@ fn trans_to_state(t: *mut Transition, now_ms: i64, state: u32, bg: u32,
     (*t).dx_bis = dx
     (*t).dy_bis = dy
     (*t).state = state
-    (*t).t0_ms = now_ms
+    (*t).t0_ms = now_ms - lead
     (*t).p = 0.0
 }
 
@@ -1062,6 +1119,16 @@ struct TransReg {
     kf: fn(u64, u64) -> u64,
     kud: u64,
     has_keyer: u32,
+    // W3: lead-in and per-state durations handed to every new entry
+    lead: i64,
+    dstate: [i64; 6],
+    // W3: the channel registry (chan_f / chan_color): values of controls
+    // that are not widgets with a Transition (knob position, tick progress ...)
+    ch_key: [u64; 48],
+    ch_id: [u32; 48],
+    ch_seen: [i64; 48],
+    ch_tw: [Tween; 48],
+    ch_n: usize,
 }
 
 fn keyer_none(ud: u64, wx: u64) -> u64 {
@@ -1079,6 +1146,9 @@ fn transreg_new() -> TransReg {
         n: 0, seen: [0 as i64; 32], dur: 120, ease: easing_named(EASE_OUT),
         oklab: 0,
         dirty: 0, kf: keyer_none, kud: 0, has_keyer: 0 as u32,
+        lead: 0, dstate: [0 as i64; 6],
+        ch_key: [0 as u64; 48], ch_id: [0 as u32; 48], ch_seen: [0 as i64; 48],
+        ch_tw: [tween_new(); 48], ch_n: 0,
     }
 }
 
@@ -1219,7 +1289,20 @@ fn transreg_index(r: *mut TransReg, c: *mut render.Ctx,
     trans_set_duration(&(*r).t[j], (*r).dur)
     trans_set_easing(&(*r).t[j], (*r).ease)
     trans_set_oklab(&(*r).t[j], (*r).oklab != 0)
+    var si: u32 = 0
+    while si < 6 as u32 {
+        if (*r).dstate[si as usize] > 0 {
+            trans_set_state_duration(&(*r).t[j], si, (*r).dstate[si as usize])
+        }
+        si = si + 1 as u32
+    }
+    (*r).t[j].lead_ms = (*r).lead
     trans_force_widget(&(*r).t[j], c, e, now_ms)
+    // a new entry STANDS on the true values: it is at rest, not at the start
+    // of a run (otherwise it would repaint for a whole duration for nothing,
+    // and a hover in that time would count as mid-motion)
+    (*r).t[j].t0_ms = now_ms - 100000
+    (*r).t[j].p = 1.0
     return j
 }
 
@@ -1277,4 +1360,282 @@ fn transreg_bind(r: *mut TransReg, c: *mut render.Ctx) {
 
 fn transreg_unbind(r: *mut TransReg, c: *mut render.Ctx) {
     render.ctx_unbind_anim(c)
+}
+
+
+// ===================================================== W3: THE FEEL PRESET
+//
+// What the user feels as "fast and smooth" is (1) the reaction in the SAME
+// frame as the event, (2) short Fluent durations with a decelerating curve,
+// (3) a per-state duration (press snaps, release flows back).
+// `transreg_set_fluent` sets all three on a registry; App calls it.
+fn transreg_set_lead(r: *mut TransReg, ms: i64) {
+    if ms < 0 {
+        (*r).lead = 0
+    } else {
+        (*r).lead = ms
+    }
+}
+
+// Duration of ONE target state for every entry made AFTER this call.
+fn transreg_set_state_duration(r: *mut TransReg, state: u32, ms: i64) {
+    if (state as usize) >= style.STATE_COUNT {
+        return
+    }
+    if ms < 0 {
+        (*r).dstate[state as usize] = 0
+    } else {
+        (*r).dstate[state as usize] = ms
+    }
+}
+
+fn transreg_set_fluent(r: *mut TransReg) {
+    (*r).dur = DUR_HOVER
+    (*r).ease = easing_fluent_decel()
+    (*r).lead = FRAME_LEAD_MS
+    (*r).dstate[style.STATE_NORMAL as usize] = DUR_FOCUS
+    (*r).dstate[style.STATE_HOVER as usize] = DUR_HOVER
+    (*r).dstate[style.STATE_ACTIVE as usize] = DUR_PRESS
+    (*r).dstate[style.STATE_FOCUS as usize] = DUR_FOCUS
+    (*r).dstate[style.STATE_DISABLED as usize] = DUR_HOVER
+    (*r).dstate[style.STATE_SELECTED as usize] = DUR_FOCUS
+}
+
+// Ask the host for another frame (a painter running its own motion).
+fn transreg_busy_mark(r: *mut TransReg) {
+    (*r).dirty = 1
+}
+
+// ============================================ W3: TWEEN, COLOR_TO, VALUE_TO
+//
+// ONE small state any control can own (or get from the channel registry):
+// you say every frame WHERE YOU WANT TO BE, it glides there.
+//
+//     var k: anim.Tween = anim.tween_new()
+//     let x: f64 = anim.value_to(&k, now, if on { 1.0 } else { 0.0 }, anim.DUR_FOCUS)
+//     let col: u32 = anim.color_to(&bgt, now, target_color, anim.DUR_HOVER)
+//     if anim.tween_busy(&k) { ... ask for another frame ... }
+//
+// The first call jumps to the target (no start-up animation). A new target
+// starts from the CURRENT visible value (retargeting in mid-motion has no
+// jump). Frame-rate independent: only `now` matters, never the call count.
+struct Tween {
+    f0: f64,
+    f1: f64,
+    c0: u32,
+    c1: u32,
+    t0: i64,
+    dur: i64,
+    p: f64,
+    ease: Easing,
+    init: u32,
+}
+
+fn tween_new() -> Tween {
+    return Tween { f0: 0.0, f1: 0.0, c0: 0 as u32, c1: 0 as u32, t0: 0,
+        dur: 1, p: 1.0, ease: easing_fluent_decel(), init: 0 as u32 }
+}
+
+fn tween_set_ease(s: *mut Tween, e: Easing) { (*s).ease = e }
+fn tween_busy(s: *mut Tween) -> bool { return (*s).p < 1.0 }
+
+fn tween_advance(s: *mut Tween, now_ms: i64) {
+    if (*s).p >= 1.0 {
+        return
+    }
+    let el: i64 = now_ms - (*s).t0
+    if el >= (*s).dur {
+        (*s).p = 1.0
+        return
+    }
+    var roh: f64 = (el as f64) / ((*s).dur as f64)
+    if roh < 0.0 {
+        roh = 0.0
+    }
+    (*s).p = ease_eval(&(*s).ease, roh)
+    if (*s).p >= 1.0 {
+        (*s).p = 0.999999
+    }
+}
+
+fn value_to(s: *mut Tween, now_ms: i64, target: f64, dur_ms: i64) -> f64 {
+    if (*s).init == 0 as u32 {
+        (*s).f0 = target
+        (*s).f1 = target
+        (*s).p = 1.0
+        (*s).init = 1 as u32
+        return target
+    }
+    if target != (*s).f1 {
+        (*s).f0 = lerp((*s).f0, (*s).f1, (*s).p)
+        (*s).f1 = target
+        (*s).t0 = now_ms
+        (*s).dur = dur_ms
+        (*s).p = 0.0
+        if dur_ms < 1 {
+            (*s).p = 1.0
+        }
+    }
+    tween_advance(s, now_ms)
+    return lerp((*s).f0, (*s).f1, (*s).p)
+}
+
+fn color_to(s: *mut Tween, now_ms: i64, target: u32, dur_ms: i64) -> u32 {
+    if (*s).init == 0 as u32 {
+        (*s).c0 = target
+        (*s).c1 = target
+        (*s).p = 1.0
+        (*s).init = 1 as u32
+        return target
+    }
+    if target != (*s).c1 {
+        (*s).c0 = mix_srgb((*s).c0, (*s).c1, (*s).p)
+        (*s).c1 = target
+        (*s).t0 = now_ms
+        (*s).dur = dur_ms
+        (*s).p = 0.0
+        if dur_ms < 1 {
+            (*s).p = 1.0
+        }
+    }
+    tween_advance(s, now_ms)
+    return mix_srgb((*s).c0, (*s).c1, (*s).p)
+}
+
+// ------------------------------------------------ the channels of a Ctx
+//
+// A control that paints from a bare Ctx has no place to keep a Tween. The
+// registry bound to the Ctx keeps one per (key, channel id): `key` = the
+// widget (chan_f_w/chan_color_w use the registry's own key path), `id` = what
+// moves (1 = knob, 2 = check progress, 3 = thumb scale ...; the control picks).
+// While a channel runs, the registry is dirty and the host paints again.
+// Without a bound registry the target is returned at once (no motion).
+const CHAN_MAX: usize = 48
+
+fn chan_slot(r: *mut TransReg, now_ms: i64, key: u64, id: u32) -> *mut Tween {
+    var i: usize = 0
+    while i < (*r).ch_n {
+        if (*r).ch_key[i] == key && (*r).ch_id[i] == id {
+            (*r).ch_seen[i] = now_ms
+            return &(*r).ch_tw[i]
+        }
+        i = i + 1
+    }
+    var j: usize = (*r).ch_n
+    if j >= CHAN_MAX {
+        var oldest: usize = CHAN_MAX
+        var t0: i64 = now_ms - STALE_MS
+        var k: usize = 0
+        while k < CHAN_MAX {
+            if (*r).ch_seen[k] < t0 {
+                t0 = (*r).ch_seen[k]
+                oldest = k
+            }
+            k = k + 1
+        }
+        if oldest >= CHAN_MAX {
+            return 0 as *mut Tween
+        }
+        j = oldest
+    } else {
+        (*r).ch_n = j + 1
+    }
+    (*r).ch_key[j] = key
+    (*r).ch_id[j] = id
+    (*r).ch_seen[j] = now_ms
+    (*r).ch_tw[j] = tween_new()
+    return &(*r).ch_tw[j]
+}
+
+fn chan_f(c: *mut render.Ctx, key: u64, id: u32, target: f64, dur_ms: i64) -> f64 {
+    let reg: u64 = render.ctx_anim_reg(c)
+    if reg == 0 {
+        return target
+    }
+    let r: *mut TransReg = reg as *mut TransReg
+    let now: i64 = render.ctx_time(c)
+    let s: *mut Tween = chan_slot(r, now, key, id)
+    if s as u64 == 0 {
+        return target
+    }
+    let v: f64 = value_to(s, now, target, dur_ms)
+    if tween_busy(s) {
+        (*r).dirty = 1
+    }
+    return v
+}
+
+fn chan_color(c: *mut render.Ctx, key: u64, id: u32, target: u32, dur_ms: i64) -> u32 {
+    let reg: u64 = render.ctx_anim_reg(c)
+    if reg == 0 {
+        return target
+    }
+    let r: *mut TransReg = reg as *mut TransReg
+    let now: i64 = render.ctx_time(c)
+    let s: *mut Tween = chan_slot(r, now, key, id)
+    if s as u64 == 0 {
+        return target
+    }
+    let v: u32 = color_to(s, now, target, dur_ms)
+    if tween_busy(s) {
+        (*r).dirty = 1
+    }
+    return v
+}
+
+fn chan_f_w(c: *mut render.Ctx, e: *mut widget.Widget, id: u32, target: f64, dur_ms: i64) -> f64 {
+    let reg: u64 = render.ctx_anim_reg(c)
+    if reg == 0 {
+        return target
+    }
+    return chan_f(c, transreg_key(reg as *mut TransReg, e), id, target, dur_ms)
+}
+
+fn chan_color_w(c: *mut render.Ctx, e: *mut widget.Widget, id: u32, target: u32, dur_ms: i64) -> u32 {
+    let reg: u64 = render.ctx_anim_reg(c)
+    if reg == 0 {
+        return target
+    }
+    return chan_color(c, transreg_key(reg as *mut TransReg, e), id, target, dur_ms)
+}
+
+// ======================================== W3: FLING AND POINTER PREDICTION
+//
+// Scroll inertia with friction: the velocity decays exponentially,
+// v(t) = v0 e^(-k t), so the position is x0 + v0/k (1 - e^(-k t)) and the
+// total run-out is v0/k. Units: px, ms, k per ms (0.003 = a calm touchpad
+// glide, 0.006 = brisk). Closed form: frame-rate independent by construction.
+fn fling_pos(x0: f64, v0: f64, k: f64, t_ms: f64) -> f64 {
+    if k <= 0.0 {
+        return x0 + v0 * t_ms
+    }
+    return x0 + (v0 / k) * (1.0 - math.exp(0.0 - k * t_ms))
+}
+
+fn fling_vel(v0: f64, k: f64, t_ms: f64) -> f64 {
+    return v0 * math.exp(0.0 - k * t_ms)
+}
+
+fn fling_total(v0: f64, k: f64) -> f64 {
+    if k <= 0.0 {
+        return 0.0
+    }
+    return v0 / k
+}
+
+// Pointer prediction: where will the pointer be `ahead_ms` from now, given
+// its last two samples `dt_ms` apart. The speed is capped (a jump of the
+// device must not fling the prediction across the screen) at 4 px/ms.
+fn predict_ahead(prev: f64, cur: f64, dt_ms: i64, ahead_ms: i64) -> f64 {
+    if dt_ms <= 0 {
+        return cur
+    }
+    var v: f64 = (cur - prev) / (dt_ms as f64)
+    if v > 4.0 {
+        v = 4.0
+    }
+    if v < 0.0 - 4.0 {
+        v = 0.0 - 4.0
+    }
+    return cur + v * (ahead_ms as f64)
 }

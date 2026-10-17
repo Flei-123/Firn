@@ -1,0 +1,498 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/animbench_main.fi -- ANIMATION / FEEL BENCH (fUi W3).
+//
+// Deterministic and headless: a simulated monotonic clock drives the REAL
+// fuiwirt.Host (dirty flag, wait computation, transition registry) and paints
+// into a canvas. Nothing here sleeps; "time" is the integer `t` in ms.
+//
+// What is measured (every number is printed as `METRIC <name> <value>`):
+//   (a) hover latency   frames between the pointer event and the first
+//                       frame in which the painted pixel differs from rest
+//                       (0 = visible in the very frame that handles the event)
+//                       and how much of the hover colour is already shown there
+//   (b) curve           time until the transition has shown 95 % of its colour
+//                       change; ms of the whole run
+//   (c) frame pacing    interval between animation frames (mean / worst
+//                       deviation from 16.67 ms) with a jittering paint cost,
+//                       and the share of the interval spent painting (CPU)
+//   (d) idle            the host asks for NO wakeup once the transition ended
+//
+// Usage: animbench [gate]   -- with `gate` the thresholds below are enforced.
+import std.rt
+import std.math
+import fui.pacing
+import font.metrics
+import paint.canvas
+import fui.theme
+import fui.widget
+import fui.painter
+import fui.render
+import fui.control
+import fui.scene
+import fui.anim
+import plat.fuiwirt
+import plat.sysfont
+
+static mut G_ERRORS: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_int(v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn metric(name: str, v: i64) {
+    say("METRIC ")
+    say(name)
+    say(" ")
+    say_int(v)
+    say("\n")
+}
+
+fn gate(name: str, ok: bool, got: i64, want: str) {
+    say("  GATE ")
+    say(name)
+    if ok {
+        say("  OK   got ")
+    } else {
+        say("  FAIL got ")
+        G_ERRORS = G_ERRORS + 1
+    }
+    say_int(got)
+    say("  want ")
+    say(want)
+    say("\n")
+}
+
+// result slots of one hover run
+static mut R_LAT_FRAMES: i64 = 0 - 1
+static mut R_SHARE0: i64 = 0 // % of the hover colour shown in the event frame
+static mut R_T95: i64 = 0 - 1
+static mut R_FRAMES: i64 = 0
+static mut R_MEAN_X10: i64 = 0
+static mut R_WORST_X10: i64 = 0
+static mut R_BUSY_PCT: i64 = 0
+static mut R_IDLE_WAIT: i64 = 0
+static mut R_REST: i64 = 0
+static mut R_HOVER: i64 = 0
+
+fn red(cv: *mut canvas.Canvas, sc: *mut scene.Scene, i: usize) -> i64 {
+    let p: u32 = canvas.canvas_get(cv, (scene.node_x(sc, i) + 8.0) as usize,
+        (scene.node_y(sc, i) + scene.node_h(sc, i) / 2.0) as usize)
+    return canvas.color_r(p) as i64
+}
+
+fn absi(v: i64) -> i64 {
+    if v < 0 {
+        return 0 - v
+    }
+    return v
+}
+
+// deterministic paint cost 3..9 ms (LCG)
+static mut G_SEED: u64 = 12345
+fn paint_cost() -> i64 {
+    G_SEED = (G_SEED * 1103515245 as u64 + 12345 as u64) & 2147483647 as u64
+    return 3 + ((G_SEED >> 8) % (7 as u64)) as i64
+}
+
+fn apply_config(reg: *mut anim.TransReg) {
+    anim.transreg_set_fluent(reg)
+}
+
+fn painted(w: *mut fuiwirt.Host, end_ms: i64) {
+    fuiwirt.host_painted_at(w, end_ms)
+}
+
+fn paint(cv: *mut canvas.Canvas, sc: *mut scene.Scene, c: *mut render.Ctx,
+    reg: *mut anim.TransReg) {
+    anim.transreg_new_frame(reg)
+    canvas.canvas_clear(cv, (255 as u32 << 24) | 16777215 as u32)
+    scene.scene_draw(sc, c)
+}
+
+// Drive the host after an event that was handled at `t_event` and measure
+// the reaction against `base` (the colour before the event).
+fn phase(w: *mut fuiwirt.Host, cv: *mut canvas.Canvas, sc: *mut scene.Scene,
+    c: *mut render.Ctx, reg: *mut anim.TransReg, b: usize, t_event: i64,
+    base: i64) {
+    R_LAT_FRAMES = 0 - 1
+    R_T95 = 0 - 1
+    R_SHARE0 = 0
+    R_MEAN_X10 = 0
+    R_WORST_X10 = 0
+    R_BUSY_PCT = 0
+    R_IDLE_WAIT = 0
+    var t: i64 = t_event
+    var n: i64 = 0
+    var prev_start: i64 = 0 - 1
+    var sum_iv: i64 = 0
+    var worst: i64 = 0
+    var busy: i64 = 0
+    var span0: i64 = 0
+    var guard: i64 = 0
+    var reds: [i64; 64] = [0; 64]
+    var ts: [i64; 64] = [0; 64]
+    while guard < 60 {
+        guard = guard + 1
+        // a frame starts at t: tick, paint, present
+        fuiwirt.host_tick(w, t)
+        paint(cv, sc, c, reg)
+        let pc: i64 = paint_cost()
+        reds[n as usize] = red(cv, sc, b)
+        ts[n as usize] = t
+        if prev_start >= 0 {
+            let iv: i64 = t - prev_start
+            sum_iv = sum_iv + iv
+            // deviation from 16.667 ms in tenths of a ms
+            let dev: i64 = absi(iv * 10 - 167)
+            if dev > worst {
+                worst = dev
+            }
+            busy = busy + pc
+        } else {
+            span0 = t
+        }
+        prev_start = t
+        n = n + 1
+        t = t + pc
+        painted(w, t)
+        let wt: i64 = fuiwirt.host_wait_ms(w)
+        if wt < 0 {
+            R_IDLE_WAIT = wt
+            break
+        }
+        t = t + wt
+    }
+    R_FRAMES = n
+    let final_red: i64 = reds[(n - 1) as usize]
+    R_HOVER = final_red
+    var i: i64 = 0
+    while i < n {
+        if R_LAT_FRAMES < 0 && reds[i as usize] != base {
+            R_LAT_FRAMES = i
+        }
+        i = i + 1
+    }
+    let total: i64 = final_red - base
+    if total != 0 {
+        R_SHARE0 = ((reds[0] - base) * 100) / total
+        i = 0
+        while i < n {
+            if R_T95 < 0 && absi(reds[i as usize] - base) * 100 >= absi(total) * 95 {
+                R_T95 = ts[i as usize] - t_event
+            }
+            i = i + 1
+        }
+    }
+    if n > 1 {
+        R_MEAN_X10 = (sum_iv * 10) / (n - 1)
+        R_WORST_X10 = worst
+        let span: i64 = ts[(n - 1) as usize] - span0
+        if span > 0 {
+            R_BUSY_PCT = (busy * 100) / span
+        }
+    }
+    LAST_T = t
+}
+
+static mut LAST_T: i64 = 0
+static mut P_LAT: i64 = 0 - 1
+static mut P_T95: i64 = 0 - 1
+static mut P_SHARE0: i64 = 0
+
+#[allow_escape]
+fn hover_run(cfg: u32, sc: *mut scene.Scene, cv: *mut canvas.Canvas,
+    c: *mut render.Ctx) {
+    var reg: anim.TransReg = anim.transreg_new()
+    if cfg == 1 as u32 {
+        apply_config(&reg)
+    }
+    anim.transreg_bind(&reg, c)
+    var w: fuiwirt.Host = fuiwirt.host_new(sc, c)
+    fuiwirt.host_set_transitions(&w, &reg)
+    scene.scene_reset(sc)
+    let root: usize = scene.scene_add(sc, scene.SCENE_NONE, scene.N_BOX)
+    let bt: str = "Alpha"
+    let b: usize = scene.scene_widget(sc, root, widget.KIND_BUTTON, bt.p as u64, bt.n)
+    scene.node_set_size(sc, b, 120.0, 50.0)
+    scene.scene_measure(sc, c)
+    scene.scene_layout(sc, c, 0.0, 0.0, 480.0, 200.0)
+    fuiwirt.host_bind(&w)
+    // frame 0: rest
+    fuiwirt.host_tick(&w, 0)
+    paint(cv, sc, c, &reg)
+    painted(&w, 4)
+    R_REST = red(cv, sc, b)
+    // the pointer arrives 5 ms after that frame -- BETWEEN two frame slots
+    let bx: f64 = scene.node_x(sc, b) + 20.0
+    let by: f64 = scene.node_y(sc, b) + 20.0
+    let ch: u32 = fuiwirt.host_pointer_move(&w, bx, by)
+    phase(&w, cv, sc, c, &reg, b, 5, R_REST)
+    let hov_rest: i64 = R_REST
+    // PRESS, 300 ms later (everything idle): the same measurement
+    let hover_red: i64 = R_HOVER
+    let tp: i64 = LAST_T + 300
+    let sv_lat: i64 = R_LAT_FRAMES
+    let sv_sh: i64 = R_SHARE0
+    let sv_t95: i64 = R_T95
+    let sv_fr: i64 = R_FRAMES
+    let sv_mean: i64 = R_MEAN_X10
+    let sv_worst: i64 = R_WORST_X10
+    let sv_busy: i64 = R_BUSY_PCT
+    let sv_idle: i64 = R_IDLE_WAIT
+    let ch2: u32 = fuiwirt.host_pointer_down(&w, bx, by, fuiwirt.BTN_LEFT)
+    phase(&w, cv, sc, c, &reg, b, tp, hover_red)
+    P_LAT = R_LAT_FRAMES
+    P_T95 = R_T95
+    P_SHARE0 = R_SHARE0
+    R_LAT_FRAMES = sv_lat
+    R_SHARE0 = sv_sh
+    R_T95 = sv_t95
+    R_FRAMES = sv_fr
+    R_MEAN_X10 = sv_mean
+    R_WORST_X10 = sv_worst
+    R_BUSY_PCT = sv_busy
+    R_IDLE_WAIT = sv_idle
+    R_REST = hov_rest
+    anim.transreg_unbind(&reg, c)
+}
+
+fn report(tag: str) {
+    say("== ")
+    say(tag)
+    say("\n")
+    metric("hover_latency_frames", R_LAT_FRAMES)
+    metric("hover_share_in_event_frame_pct", R_SHARE0)
+    metric("hover_t95_ms", R_T95)
+    metric("anim_frames", R_FRAMES)
+    metric("frame_interval_mean_x10", R_MEAN_X10)
+    metric("frame_interval_worst_dev_x10", R_WORST_X10)
+    metric("paint_busy_pct", R_BUSY_PCT)
+    metric("idle_wait", R_IDLE_WAIT)
+    metric("press_latency_frames", P_LAT)
+    metric("press_share_in_event_frame_pct", P_SHARE0)
+    metric("press_t95_ms", P_T95)
+}
+
+fn near(a: f64, b: f64, tol: f64) -> bool {
+    var d: f64 = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d <= tol
+}
+
+fn x1e4(v: f64) -> i64 {
+    return (v * 10000.0) as i64
+}
+
+// (b) curves against their closed form, plus the API pieces of W3
+#[allow_escape]
+fn units(c: *mut render.Ctx) {
+    say("== UNITS (curves, tweens, channels, fling, prediction, pacer)\n")
+    // Fluent decelerate = cubic-bezier(0,0,0,1): x = s^3, y = 3s^2 - 2s^3
+    var e: anim.Easing = anim.easing_fluent_decel()
+    var worst: f64 = 0.0
+    var k: i64 = 1
+    while k < 20 {
+        let x: f64 = (k as f64) / 20.0
+        let want: f64 = 3.0 * math.powf(x, 2.0 / 3.0) - 2.0 * x
+        var d: f64 = anim.ease_eval(&e, x) - want
+        if d < 0.0 {
+            d = 0.0 - d
+        }
+        if d > worst {
+            worst = d
+        }
+        k = k + 1
+    }
+    metric("curve_fluent_decel_max_err_x1e4", x1e4(worst))
+    gate("fluent decelerate matches 3x^(2/3)-2x (err < 0.002)", worst < 0.002, x1e4(worst), "< 20 (x1e-4)")
+    // critical spring: monotone, never above 1, arrives
+    var sp: anim.Easing = anim.easing_spring_critical(1.0, 100.0)
+    var over: f64 = 0.0
+    var last: f64 = 0.0
+    var mono: bool = true
+    k = 0
+    while k <= 100 {
+        let v: f64 = anim.ease_eval(&sp, (k as f64) / 100.0)
+        if v > over {
+            over = v
+        }
+        if v + 0.0000001 < last {
+            mono = false
+        }
+        last = v
+        k = k + 1
+    }
+    gate("critical spring: no overshoot (max <= 1.0)", over <= 1.0 + 0.0000001, x1e4(over), "<= 10000 (x1e-4)")
+    gate("critical spring: monotone", mono, 1, "1")
+    gate("critical spring: settled at the end (> 0.99)", last > 0.99, x1e4(last), "> 9900 (x1e-4)")
+    // value_to: first call jumps, retarget is continuous, frame-rate independent
+    var a: anim.Tween = anim.tween_new()
+    var b: anim.Tween = anim.tween_new()
+    let a0: f64 = anim.value_to(&a, 0, 0.0, 100)
+    let b0: f64 = anim.value_to(&b, 0, 0.0, 100)
+    gate("value_to: first call jumps to the target (no start-up motion)", a0 == 0.0 && !anim.tween_busy(&a), x1e4(a0), "0")
+    var va: f64 = 0.0
+    var vb: f64 = 0.0
+    va = anim.value_to(&a, 10, 1.0, 100)
+    vb = anim.value_to(&b, 10, 1.0, 100)
+    // a is sampled at 60 Hz, b at ~144 Hz, both end at t = 60
+    var t: i64 = 10
+    while t < 60 {
+        t = t + 17
+        if t > 60 {
+            t = 60
+        }
+        va = anim.value_to(&a, t, 1.0, 100)
+    }
+    t = 10
+    while t < 60 {
+        t = t + 7
+        if t > 60 {
+            t = 60
+        }
+        vb = anim.value_to(&b, t, 1.0, 100)
+    }
+    gate("value_to: same value at t=50 ms at 60 Hz and 144 Hz sampling", near(va, vb, 0.000001), x1e4(va - vb), "0")
+    gate("value_to: mid-run value is strictly between 0 and 1", va > 0.2 && va < 0.99, x1e4(va), "2000..9900")
+    // retarget in mid-motion: no jump
+    let before: f64 = anim.value_to(&a, 60, 1.0, 100)
+    let after: f64 = anim.value_to(&a, 60, 0.0, 100)
+    gate("value_to: retarget keeps the visible value (no jump)", near(before, after, 0.000001), x1e4(before - after), "0")
+    let done: f64 = anim.value_to(&a, 400, 0.0, 100)
+    gate("value_to: arrives and stops (not busy)", done == 0.0 && !anim.tween_busy(&a), x1e4(done), "0")
+    // color_to
+    var ct: anim.Tween = anim.tween_new()
+    let c0: u32 = anim.color_to(&ct, 0, 0xFF000000 as u32, 100)
+    let c1: u32 = anim.color_to(&ct, 10, 0xFFFFFFFF as u32, 100)
+    let c2: u32 = anim.color_to(&ct, 40, 0xFFFFFFFF as u32, 100)
+    let c3: u32 = anim.color_to(&ct, 500, 0xFFFFFFFF as u32, 100)
+    gate("color_to: starts at the old colour, passes grey, arrives",
+        c1 == 0xFF000000 as u32 && (c2 & 255 as u32) > 40 as u32 && (c2 & 255 as u32) < 250 as u32 && c3 == 0xFFFFFFFF as u32,
+        (c2 & 255 as u32) as i64, "40..250 in the middle")
+    // channels through a Ctx with a bound registry
+    var reg: anim.TransReg = anim.transreg_new()
+    anim.transreg_bind(&reg, c)
+    render.ctx_set_time(c, 1000)
+    let h0: f64 = anim.chan_f(c, 77, 1 as u32, 0.0, 100)
+    render.ctx_set_time(c, 1100)
+    anim.transreg_new_frame(&reg)
+    let h1: f64 = anim.chan_f(c, 77, 1 as u32, 1.0, 100)
+    let busy1: bool = anim.transreg_dirty(&reg)
+    render.ctx_set_time(c, 1150)
+    anim.transreg_new_frame(&reg)
+    let h2: f64 = anim.chan_f(c, 77, 1 as u32, 1.0, 100)
+    let other: f64 = anim.chan_f(c, 77, 2 as u32, 5.0, 100)
+    render.ctx_set_time(c, 1400)
+    anim.transreg_new_frame(&reg)
+    let h3: f64 = anim.chan_f(c, 77, 1 as u32, 1.0, 100)
+    let busy3: bool = anim.transreg_dirty(&reg)
+    gate("chan_f: rest, run (dirty), arrive (clean); channels are independent",
+        h0 == 0.0 && h1 == 0.0 && busy1 && h2 > 0.5 && h2 < 1.0 && other == 5.0 && h3 == 1.0 && !busy3,
+        x1e4(h2), "h2 in (5000,10000)")
+    anim.transreg_unbind(&reg, c)
+    gate("chan_f without a registry returns the target", anim.chan_f(c, 1, 1 as u32, 3.0, 100) == 3.0, 3, "3")
+    // fling
+    let tot: f64 = anim.fling_total(2.0, 0.003)
+    let far: f64 = anim.fling_pos(100.0, 2.0, 0.003, 5000.0)
+    gate("fling: run-out distance = v0/k (666.7 px at 2 px/ms)", near(tot, 666.6667, 0.01), x1e4(tot), "6666667 (x1e-4)")
+    gate("fling: position converges to x0 + v0/k", near(far, 100.0 + tot, 0.01), x1e4(far), "7666667 (x1e-4)")
+    gate("fling: frame-rate independent (same pos at 100 ms)",
+        near(anim.fling_pos(0.0, 2.0, 0.003, 100.0), anim.fling_pos(0.0, 2.0, 0.003, 100.0), 0.0), 0, "0")
+    gate("fling: velocity decays monotonically", anim.fling_vel(2.0, 0.003, 200.0) < anim.fling_vel(2.0, 0.003, 100.0), 1, "1")
+    // prediction
+    let pr: f64 = anim.predict_ahead(100.0, 116.0, 16, 16)
+    gate("predict_ahead: one frame ahead of a 1 px/ms drag", near(pr, 132.0, 0.0001), x1e4(pr), "1320000 (x1e-4)")
+    gate("predict_ahead: speed capped (huge jump stays within 4 px/ms)", near(anim.predict_ahead(0.0, 5000.0, 1, 16), 5064.0, 0.0001), 0, "5064")
+    // pacer: 120 Hz grid, jitter-free over 120 frames
+    var p: pacing.Pacer = pacing.pacer_new(120)
+    var now: i64 = 0
+    var start0: i64 = 0
+    var n: i64 = 0
+    var maxdev: i64 = 0
+    var prev: i64 = 0 - 1
+    while n < 121 {
+        pacing.pacer_frame(&p, now)
+        if n == 0 {
+            start0 = now
+        }
+        if prev >= 0 {
+            // ideal slot of frame n: n * 8.333 ms; compare the START time
+            let ideal10: i64 = (n * 83333) / 1000
+            let dev: i64 = absi((now - start0) * 10 - ideal10)
+            if dev > maxdev {
+                maxdev = dev
+            }
+        }
+        prev = now
+        n = n + 1
+        now = now + 3
+        now = now + pacing.pacer_wait(&p, now)
+    }
+    metric("pacer_120hz_max_slot_dev_x10", maxdev)
+    gate("pacer 120 Hz: every frame within 1 ms of its slot, no drift", maxdev <= 10, maxdev, "<= 10 (x10 ms)")
+    gate("pacer rejects 20 Hz and 500 Hz", !pacing.pacer_set_hz(&p, 20) && !pacing.pacer_set_hz(&p, 500) && pacing.pacer_hz(&p) == 120, pacing.pacer_hz(&p), "120")
+    gate("pacer 144 Hz accepted", pacing.pacer_set_hz(&p, 144) && pacing.pacer_hz(&p) == 144, pacing.pacer_hz(&p), "144")
+}
+
+fn main(start: u64) -> i32 {
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    if !rt.read_file((&f1[0]) as u64, &fbuf) {
+        say("animbench: no font\n")
+        return 9
+    }
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    *fsp = metrics.fontset_new()
+    if !metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+        return 9
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, 480, 200) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, 480, 200) {
+        return 5
+    }
+    painter.painter_set_font(&z, fsp as u64)
+    var m: theme.Theme = theme.theme_new(true)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let sc: *mut scene.Scene = rt.heap_alloc(1048576) as *mut scene.Scene
+    *sc = scene.scene_new()
+    G_SEED = 12345
+    var gated: bool = false
+    if start != 0 {
+        gated = true
+    }
+    hover_run(0 as u32, sc, &cv, &c)
+    report("classic config (transreg_new defaults: 120 ms ease-out, no lead) on the paced host")
+    G_SEED = 12345
+    hover_run(1 as u32, sc, &cv, &c)
+    report("fluent config (transreg_set_fluent: 83 ms decelerate, 1 frame lead) on the paced host")
+    gate("press snaps: visible in the event frame, 95 % within 50 ms", P_LAT == 0 && P_T95 >= 0 && P_T95 <= 50, P_T95, "<= 50")
+    units(&c)
+    say("== GATES (fluent config)\n")
+    gate("hover visible in the event frame (frames)", R_LAT_FRAMES == 0, R_LAT_FRAMES, "0")
+    gate("share of hover colour in the event frame >= 40 %", R_SHARE0 >= 40, R_SHARE0, ">= 40")
+    gate("95 % of the colour change within 70 ms", R_T95 >= 0 && R_T95 <= 70, R_T95, "<= 70")
+    gate("animation frames track the 60 Hz grid (mean 16.0..17.5 ms)",
+        R_MEAN_X10 >= 160 && R_MEAN_X10 <= 175, R_MEAN_X10, "160..175 (x10 ms)")
+    gate("worst frame-interval deviation <= 2.5 ms", R_WORST_X10 <= 25, R_WORST_X10, "<= 25 (x10 ms)")
+    gate("paint share of the interval < 60 % (not a busy loop)", R_BUSY_PCT < 60, R_BUSY_PCT, "< 60")
+    gate("idle: host asks for no wake-up (WAIT_FOREVER)", R_IDLE_WAIT == 0 - 1, R_IDLE_WAIT, "-1")
+    if G_ERRORS != 0 {
+        say("ANIMBENCH FAILED\n")
+        return 1
+    }
+    say("ANIMBENCH PASSED\n")
+    return 0
+}
