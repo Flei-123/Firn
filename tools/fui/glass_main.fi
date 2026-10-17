@@ -1,0 +1,565 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/glass_main.fi -- GLASS: checks, showcase images and the bench.
+//
+//   glass_main check                         numbers; exit code 1 on a wrong one
+//   glass_main shot <light|dark> <out.png>   the showcase: off / subtle / strong
+//   glass_main blur <dir>                    writes src/box/gauss/pipe PNGs for
+//                                            tools/fui/glass_ref.py (Pillow / numpy)
+//   glass_main bench                         GLASS name=.. us=.. lines (taskset -c N)
+//
+// What `check` pins down:
+//   1. the SWAR box blur gives the same pixels (+-1) as effect.blur_buffer
+//      (the byte-wise one) -- a faster blur that differs is a different blur
+//   2. level OFF returns at once, touches nothing, allocates nothing
+//   3. the cache: same backdrop = hit, changed pixel in the region = cold,
+//      changed pixel OUTSIDE = still a hit, HINT_SAME / HINT_CHANGED obey
+//   4. a flat backdrop stays flat (no dark fringe at the rim or at the
+//      canvas edge) when tint, rim, noise are off
+//   5. the pane is premultiplied (r,g,b <= a), the mask corner stays
+//      untouched, the centre changed, the outside is not touched
+//   6. damage: glass_backdrop_dirty follows the damage rectangle
+import std.rt
+import paint.canvas
+import paint.png
+import html.mem
+import fui.glass
+import fui.effect
+import fui.damage
+
+static mut G_ERRORS: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_i(v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn say_f2(v: f64) {
+    var x: f64 = v
+    if x < 0.0 { x = 0.0 }
+    let whole: i64 = x as i64
+    let frac: i64 = ((x - (whole as f64)) * 100.0 + 0.5) as i64
+    say_i(whole + frac / 100)
+    say(".")
+    let f: i64 = frac % 100
+    if f < 10 { say("0") }
+    say_i(f)
+}
+
+fn expect(name: str, ok: bool, got: i64, want: i64) {
+    say(name)
+    if ok {
+        say("  OK   got ")
+    } else {
+        say("  WRONG got ")
+        G_ERRORS = G_ERRORS + 1
+    }
+    say_i(got)
+    say(" want ")
+    say_i(want)
+    say("\n")
+}
+
+fn now_ns() -> i64 {
+    var ts: [u64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as u64)
+    return (ts[0] as i64) * 1000000000 + (ts[1] as i64)
+}
+
+fn arg_is(p: u64, s: str) -> bool {
+    var i: usize = 0
+    while i < s.n {
+        if rt.ld8(p, i) != rt.ld8(s.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return rt.ld8(p, i) == 0 as u8
+}
+
+fn px_at(cv: *mut canvas.Canvas, x: i64, y: i64) -> u32 {
+    return *((canvas.canvas_pixels(cv) as u64 + ((y * (canvas.canvas_width(cv) as i64) + x) * 4) as u64) as *mut u32)
+}
+
+fn px_set(cv: *mut canvas.Canvas, x: i64, y: i64, v: u32) {
+    *((canvas.canvas_pixels(cv) as u64 + ((y * (canvas.canvas_width(cv) as i64) + x) * 4) as u64) as *mut u32) = v
+}
+
+fn abs_i(v: i64) -> i64 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// ------------------------------------------------------- THE TEST BACKDROP
+// A gradient, saturated discs, stripes, text-like bars and a checker band:
+// everything a blur must visibly smear.
+fn mk(r: i64, g: i64, b: i64) -> u32 {
+    var rr: i64 = r
+    var gg: i64 = g
+    var bb: i64 = b
+    if rr < 0 { rr = 0 }
+    if gg < 0 { gg = 0 }
+    if bb < 0 { bb = 0 }
+    if rr > 255 { rr = 255 }
+    if gg > 255 { gg = 255 }
+    if bb > 255 { bb = 255 }
+    return (rr as u32) | ((gg as u32) << 8) | ((bb as u32) << 16) | (255 as u32) << 24
+}
+
+fn paint_backdrop(cv: *mut canvas.Canvas, dark: bool) {
+    let w: i64 = canvas.canvas_width(cv) as i64
+    let h: i64 = canvas.canvas_height(cv) as i64
+    var y: i64 = 0
+    while y < h {
+        var x: i64 = 0
+        while x < w {
+            var r: i64 = 50 + 170 * x / w
+            var g: i64 = 70 + 110 * y / h
+            var b: i64 = 210 - 130 * x / w
+            // discs
+            var k: i64 = 0
+            while k < 6 {
+                let cx: i64 = (w * (11 + 17 * k)) / 100 + (k * 37) % 50
+                let cy: i64 = (h * (20 + 13 * k)) / 100
+                let rd: i64 = 40 + (k * 13) % 40
+                let dx: i64 = x - cx
+                let dy: i64 = y - cy
+                if dx * dx + dy * dy < rd * rd {
+                    if k % 3 == 0 {
+                        r = 255
+                        g = 200
+                        b = 40
+                    } else if k % 3 == 1 {
+                        r = 240
+                        g = 50
+                        b = 150
+                    } else {
+                        r = 30
+                        g = 220
+                        b = 200
+                    }
+                }
+                k = k + 1
+            }
+            // diagonal stripes
+            if (x + y) % 56 < 5 {
+                r = 250
+                g = 250
+                b = 250
+            }
+            // text-like bars
+            if y % 24 < 9 && y > h / 3 && y < h / 2 {
+                if ((x * 7 + (y / 24) * 131) % 97) < 70 {
+                    r = 20
+                    g = 20
+                    b = 30
+                }
+            }
+            // checker band
+            if y > (h * 3) / 4 {
+                if ((x / 14) + (y / 14)) % 2 == 0 {
+                    r = 255 - r / 2
+                    g = 255 - g / 2
+                    b = 255 - b / 2
+                }
+            }
+            if dark {
+                r = r * 45 / 100
+                g = g * 45 / 100
+                b = b * 50 / 100
+            }
+            px_set(cv, x, y, mk(r, g, b))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn write_png_file(cv: *mut canvas.Canvas, path: u64) -> bool {
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if !png.write_png(cv, &out) {
+        return false
+    }
+    return rt.write_file(path, mem.buf_ptr(&out) as u64, mem.buf_len(&out))
+}
+
+fn path_join(dir: u64, name: str) -> rt.Buf {
+    var pf: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < rt.c_length(dir) {
+        rt.buf_push(&pf, rt.ld8(dir, k))
+        k = k + 1
+    }
+    rt.buf_push(&pf, 47 as u8)
+    rt.buf_push_bytes(&pf, name.p as u64, name.n)
+    rt.buf_push(&pf, 0 as u8)
+    return pf
+}
+
+// ---------------------------------------------------------------- SHOWCASE
+fn do_shot(dark: bool, path: u64) -> i32 {
+    var bg: canvas.Canvas = canvas.canvas_new()
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&bg, 1240, 760) || !canvas.canvas_init(&cv, 1240, 760) {
+        return 3
+    }
+    paint_backdrop(&bg, dark)
+    rt.mem_copy(canvas.canvas_pixels(&cv) as u64, canvas.canvas_pixels(&bg) as u64, 1240 * 760 * 4)
+    var g: glass.Glass = glass.glass_new()
+    var row: i64 = 0
+    while row < 2 {
+        var col: i64 = 0
+        while col < 3 {
+            let x: i64 = 40 + col * 400
+            let y: i64 = 50 + row * 360
+            var kind: usize = glass.KIND_LIQUID
+            var level: usize = glass.GLASS_OFF
+            if row == 0 {
+                level = col as usize
+            } else {
+                if col == 0 {
+                    kind = glass.KIND_ACRYLIC
+                    level = glass.GLASS_SUBTLE
+                } else if col == 1 {
+                    kind = glass.KIND_MICA
+                    level = glass.GLASS_STRONG
+                } else {
+                    kind = glass.KIND_ACRYLIC
+                    level = glass.GLASS_STRONG
+                }
+            }
+            var p: glass.Params = glass.glass_params(kind, level, dark)
+            if !glass.glass_draw_from(&g, &cv, &bg, x, y, 340, 300, 24, &p, 0) {
+                return 4
+            }
+            glass.glass_invalidate(&g)
+            col = col + 1
+        }
+        row = row + 1
+    }
+    if !write_png_file(&cv, path) {
+        return 5
+    }
+    return 0
+}
+
+// --------------------------------------------------------- REFERENCE IMAGES
+fn do_blur(dir: u64) -> i32 {
+    let W: i64 = 256
+    let H: i64 = 192
+    var src: canvas.Canvas = canvas.canvas_new()
+    var box: canvas.Canvas = canvas.canvas_new()
+    var gau: canvas.Canvas = canvas.canvas_new()
+    var pipe: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&src, W as usize, H as usize) ||
+    !canvas.canvas_init(&box, W as usize, H as usize) ||
+    !canvas.canvas_init(&gau, W as usize, H as usize) ||
+    !canvas.canvas_init(&pipe, W as usize, H as usize) {
+        return 3
+    }
+    paint_backdrop(&src, false)
+    rt.mem_copy(canvas.canvas_pixels(&box) as u64, canvas.canvas_pixels(&src) as u64, (W * H * 4) as usize)
+    rt.mem_copy(canvas.canvas_pixels(&gau) as u64, canvas.canvas_pixels(&src) as u64, (W * H * 4) as usize)
+    glass.blur_box(canvas.canvas_pixels(&box), W as usize, H as usize, 3)
+    // sigma of three boxes of width 7: sqrt(3 * 48 / 12)
+    glass.blur_gauss(canvas.canvas_pixels(&gau), W as usize, H as usize, 3.4641016)
+    // the whole pipeline: flog 1, rs 2, nothing else
+    var p: glass.Params = glass.glass_params(glass.KIND_ACRYLIC, 1, false)
+    p.flog = 1
+    p.rs = 2
+    p.tint_a = 0
+    p.sat = 256
+    p.noise = 0
+    p.rim = 0
+    p.glow = 0
+    p.sheen = 0
+    var g: glass.Glass = glass.glass_new()
+    if !glass.glass_draw_from(&g, &pipe, &src, 32, 32, W - 64, H - 64, 0, &p, 0) {
+        return 4
+    }
+    var names: [str; 4] = ["src.png", "box.png", "gauss.png", "pipe.png"]
+    var cvs: [u64; 4] = [0; 4]
+    cvs[0] = (&src) as u64
+    cvs[1] = (&box) as u64
+    cvs[2] = (&gau) as u64
+    cvs[3] = (&pipe) as u64
+    var i: usize = 0
+    while i < 4 {
+        var pf: rt.Buf = path_join(dir, names[i])
+        if !write_png_file(cvs[i] as *mut canvas.Canvas, rt.buf_ptr(&pf)) {
+            return 5
+        }
+        rt.buf_free(&pf)
+        i = i + 1
+    }
+    return 0
+}
+
+// ------------------------------------------------------------------ CHECKS
+fn fill(cv: *mut canvas.Canvas, v: u32) {
+    let n: i64 = (canvas.canvas_width(cv) * canvas.canvas_height(cv)) as i64
+    var i: i64 = 0
+    while i < n {
+        *((canvas.canvas_pixels(cv) as u64 + (i * 4) as u64) as *mut u32) = v
+        i = i + 1
+    }
+}
+
+fn do_check() -> i32 {
+    // ---- 1. SWAR box blur == the byte-wise blur
+    let W: i64 = 70
+    let H: i64 = 45
+    var a: canvas.Canvas = canvas.canvas_new()
+    var b: canvas.Canvas = canvas.canvas_new()
+    var t: canvas.Canvas = canvas.canvas_new()
+    canvas.canvas_init(&a, W as usize, H as usize)
+    canvas.canvas_init(&b, W as usize, H as usize)
+    canvas.canvas_init(&t, W as usize, H as usize)
+    paint_backdrop(&a, false)
+    // some translucent pixels too (premultiplied: rgb <= a)
+    var q: i64 = 0
+    while q < 400 {
+        let v: u32 = (q % 97) as u32
+        px_set(&a, (q * 7) % W, (q * 13) % H, v | (v << 8) | (v << 16) | (((v + 40) as u32) << 24))
+        q = q + 1
+    }
+    rt.mem_copy(canvas.canvas_pixels(&b) as u64, canvas.canvas_pixels(&a) as u64, (W * H * 4) as usize)
+    glass.blur_box(canvas.canvas_pixels(&a), W as usize, H as usize, 3)
+    effect.blur_buffer(canvas.canvas_pixels(&b), canvas.canvas_pixels(&t), W as usize, H as usize, 3)
+    var worst: i64 = 0
+    var i: i64 = 0
+    while i < W * H * 4 {
+        let d: i64 = abs_i((*((canvas.canvas_pixels(&a) as u64 + i as u64) as *mut u8)) as i64 -
+            (*((canvas.canvas_pixels(&b) as u64 + i as u64) as *mut u8)) as i64)
+        if d > worst { worst = d }
+        i = i + 1
+    }
+    expect("1 SWAR box blur vs effect.blur_buffer, worst octet diff <= 3", worst <= 3, worst, 0)
+
+    // ---- 2. OFF costs nothing
+    var bg: canvas.Canvas = canvas.canvas_new()
+    var dst: canvas.Canvas = canvas.canvas_new()
+    canvas.canvas_init(&bg, 640, 480)
+    canvas.canvas_init(&dst, 640, 480)
+    paint_backdrop(&bg, false)
+    rt.mem_copy(canvas.canvas_pixels(&dst) as u64, canvas.canvas_pixels(&bg) as u64, 640 * 480 * 4)
+    var g: glass.Glass = glass.glass_new()
+    var poff: glass.Params = glass.glass_params(glass.KIND_LIQUID, 0, false)
+    let okoff: bool = glass.glass_draw_from(&g, &dst, &bg, 100, 100, 300, 200, 16, &poff, 0)
+    expect("2 level off returns true", okoff, 1, 1)
+    expect("2 level off allocates nothing", glass.glass_alloc_bytes(&g) == 0, glass.glass_alloc_bytes(&g) as i64, 0)
+    expect("2 level off counts no cold run", glass.glass_cold(&g) == 0, glass.glass_cold(&g) as i64, 0)
+
+    // ---- 3. the cache
+    var p: glass.Params = glass.glass_params(glass.KIND_LIQUID, 2, false)
+    glass.glass_draw_from(&g, &dst, &bg, 100, 100, 300, 200, 16, &p, 0)
+    expect("3 first draw is cold", glass.glass_cold(&g) == 1, glass.glass_cold(&g) as i64, 1)
+    glass.glass_draw_from(&g, &dst, &bg, 100, 100, 300, 200, 16, &p, 0)
+    expect("3 same backdrop is a hit", glass.glass_hits(&g) == 1 && glass.glass_cold(&g) == 1,
+        glass.glass_hits(&g) as i64, 1)
+    px_set(&bg, 250, 200, mk(1, 2, 3))
+    glass.glass_draw_from(&g, &dst, &bg, 100, 100, 300, 200, 16, &p, 0)
+    expect("3 a pixel changed behind the pane -> cold", glass.glass_cold(&g) == 2, glass.glass_cold(&g) as i64, 2)
+    px_set(&bg, 630, 470, mk(9, 9, 9))
+    glass.glass_draw_from(&g, &dst, &bg, 100, 100, 300, 200, 16, &p, 0)
+    expect("3 a pixel far outside the region -> still a hit", glass.glass_cold(&g) == 2 && glass.glass_hits(&g) == 2,
+        glass.glass_hits(&g) as i64, 2)
+    px_set(&bg, 250, 200, mk(7, 7, 7))
+    glass.glass_draw_from(&g, &dst, &bg, 100, 100, 300, 200, 16, &p, 2)
+    expect("3 HINT_CHANGED recomputes", glass.glass_cold(&g) == 3, glass.glass_cold(&g) as i64, 3)
+    px_set(&bg, 250, 200, mk(8, 8, 8))
+    glass.glass_draw_from(&g, &dst, &bg, 100, 100, 300, 200, 16, &p, 1)
+    expect("3 HINT_SAME trusts the caller", glass.glass_cold(&g) == 3 && glass.glass_hits(&g) == 3,
+        glass.glass_hits(&g) as i64, 3)
+    glass.glass_draw_from(&g, &dst, &bg, 100, 100, 300, 200, 16, &p, 0)
+    expect("3 the next AUTO notices the change", glass.glass_cold(&g) == 4, glass.glass_cold(&g) as i64, 4)
+    // a different level is a different picture
+    var p1: glass.Params = glass.glass_params(glass.KIND_LIQUID, 1, false)
+    glass.glass_draw_from(&g, &dst, &bg, 100, 100, 300, 200, 16, &p1, 1)
+    expect("3 another level never hits the old pane", glass.glass_cold(&g) == 5, glass.glass_cold(&g) as i64, 5)
+
+    // ---- 5. mask / premultiplied / outside untouched
+    paint_backdrop(&bg, false)
+    rt.mem_copy(canvas.canvas_pixels(&dst) as u64, canvas.canvas_pixels(&bg) as u64, 640 * 480 * 4)
+    glass.glass_invalidate(&g)
+    glass.glass_draw_from(&g, &dst, &bg, 100, 100, 300, 200, 24, &p, 0)
+    expect("5 mask: the corner pixel is untouched", px_at(&dst, 100, 100) == px_at(&bg, 100, 100),
+        px_at(&dst, 100, 100) as i64, px_at(&bg, 100, 100) as i64)
+    expect("5 the centre changed", px_at(&dst, 250, 200) != px_at(&bg, 250, 200), 1, 1)
+    expect("5 outside the pane untouched", px_at(&dst, 99, 150) == px_at(&bg, 99, 150) &&
+        px_at(&dst, 400, 150) == px_at(&bg, 400, 150) && px_at(&dst, 200, 301) == px_at(&bg, 200, 301), 1, 1)
+    var bad: i64 = 0
+    var yy: i64 = 100
+    while yy < 300 {
+        var xx: i64 = 100
+        while xx < 400 {
+            let v: u32 = px_at(&dst, xx, yy)
+            let al: u32 = v >> 24
+            if (v & 255) > al || ((v >> 8) & 255) > al || ((v >> 16) & 255) > al {
+                bad = bad + 1
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    expect("5 premultiplied: no channel above alpha", bad == 0, bad, 0)
+
+    // ---- 4. a flat backdrop stays flat, also at the canvas edge
+    fill(&bg, mk(120, 90, 60))
+    fill(&dst, mk(120, 90, 60))
+    var pf: glass.Params = glass.glass_params(glass.KIND_ACRYLIC, 2, false)
+    pf.tint_a = 0
+    pf.sat = 256
+    pf.noise = 0
+    pf.rim = 0
+    var gf: glass.Glass = glass.glass_new()
+    glass.glass_draw_from(&gf, &dst, &bg, 0, 0, 200, 150, 0, &pf, 0)
+    var dev: i64 = 0
+    yy = 0
+    while yy < 150 {
+        var xx: i64 = 0
+        while xx < 200 {
+            let v: u32 = px_at(&dst, xx, yy)
+            let d1: i64 = abs_i((v & 255) as i64 - 120)
+            let d2: i64 = abs_i(((v >> 8) & 255) as i64 - 90)
+            let d3: i64 = abs_i(((v >> 16) & 255) as i64 - 60)
+            if d1 > dev { dev = d1 }
+            if d2 > dev { dev = d2 }
+            if d3 > dev { dev = d3 }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    expect("4 flat backdrop stays flat at the canvas corner (max dev <= 1)", dev <= 1, dev, 0)
+
+    // ---- 6. damage drives the dirty check
+    var d: damage.Damage = damage.dmg_new()
+    paint_backdrop(&bg, false)
+    glass.glass_invalidate(&g)
+    glass.glass_draw_from(&g, &dst, &bg, 100, 100, 300, 200, 16, &p, 0)
+    damage.dmg_add(&d, 500.0, 400.0, 600.0, 450.0)
+    expect("6 damage far away: backdrop not dirty", !glass.glass_backdrop_dirty(&g, &d, 640, 480), 0, 0)
+    damage.dmg_add(&d, 150.0, 150.0, 160.0, 160.0)
+    expect("6 damage inside: backdrop dirty", glass.glass_backdrop_dirty(&g, &d, 640, 480), 1, 1)
+    damage.dmg_full(&d)
+    expect("6 full damage: backdrop dirty", glass.glass_backdrop_dirty(&g, &d, 640, 480), 1, 1)
+
+    say("GLASS-CHECK errors=")
+    say_i(G_ERRORS as i64)
+    say("\n")
+    if G_ERRORS != 0 {
+        return 1
+    }
+    return 0
+}
+
+// ------------------------------------------------------------------- BENCH
+fn sort_i(a: *mut i64, n: usize) {
+    var i: usize = 1
+    while i < n {
+        var j: usize = i
+        while j > 0 && *((a as u64 + ((j - 1) * 8) as u64) as *mut i64) > *((a as u64 + (j * 8) as u64) as *mut i64) {
+            let x: i64 = *((a as u64 + (j * 8) as u64) as *mut i64)
+            *((a as u64 + (j * 8) as u64) as *mut i64) = *((a as u64 + ((j - 1) * 8) as u64) as *mut i64)
+            *((a as u64 + ((j - 1) * 8) as u64) as *mut i64) = x
+            j = j - 1
+        }
+        i = i + 1
+    }
+}
+
+fn bench_one(label: str, cw: i64, ch: i64, pw: i64, ph: i64, kind: usize, level: usize, hint: usize, cold: bool) {
+    var bg: canvas.Canvas = canvas.canvas_new()
+    var dst: canvas.Canvas = canvas.canvas_new()
+    canvas.canvas_init(&bg, cw as usize, ch as usize)
+    canvas.canvas_init(&dst, cw as usize, ch as usize)
+    paint_backdrop(&bg, false)
+    var g: glass.Glass = glass.glass_new()
+    var p: glass.Params = glass.glass_params(kind, level, false)
+    var x: i64 = (cw - pw) / 2
+    var y: i64 = (ch - ph) / 2
+    // warm up (builds the shape, allocates the scratch)
+    glass.glass_draw_from(&g, &dst, &bg, x, y, pw, ph, 16, &p, 0)
+    var ts: [i64; 15] = [0; 15]
+    var i: usize = 0
+    while i < 15 {
+        var hh: usize = hint
+        if cold { hh = 2 }
+        let t0: i64 = now_ns()
+        glass.glass_draw_from(&g, &dst, &bg, x, y, pw, ph, 16, &p, hh)
+        ts[i] = now_ns() - t0
+        i = i + 1
+    }
+    sort_i(&ts[0], 15)
+    say("GLASS name=")
+    say(label)
+    say(" w=")
+    say_i(pw)
+    say(" h=")
+    say_i(ph)
+    say(" median_us=")
+    say_f2((ts[7] as f64) / 1000.0)
+    say(" min_us=")
+    say_f2((ts[0] as f64) / 1000.0)
+    say(" p_max_us=")
+    say_f2((ts[14] as f64) / 1000.0)
+    say(" hash_us=")
+    say_f2((glass.glass_phase_ns(&g, 0) as f64) / 1000.0)
+    say(" gather_us=")
+    say_f2((glass.glass_phase_ns(&g, 1) as f64) / 1000.0)
+    say(" blur_us=")
+    say_f2((glass.glass_phase_ns(&g, 2) as f64) / 1000.0)
+    say(" compose_us=")
+    say_f2((glass.glass_phase_ns(&g, 3) as f64) / 1000.0)
+    say(" blit_us=")
+    say_f2((glass.glass_phase_ns(&g, 4) as f64) / 1000.0)
+    say(" cold_runs=")
+    say_i(glass.glass_cold(&g) as i64)
+    say("\n")
+    glass.glass_free(&g)
+}
+
+fn do_bench() -> i32 {
+    bench_one("liquid_subtle_cold", 1240, 720, 400, 300, 2, 1, 0, true)
+    bench_one("liquid_strong_cold", 1240, 720, 400, 300, 2, 2, 0, true)
+    bench_one("acrylic_strong_cold", 1240, 720, 400, 300, 0, 2, 0, true)
+    bench_one("mica_strong_cold", 1240, 720, 400, 300, 1, 2, 0, true)
+    bench_one("liquid_strong_hit_hash", 1240, 720, 400, 300, 2, 2, 0, false)
+    bench_one("liquid_strong_hit_same", 1240, 720, 400, 300, 2, 2, 1, false)
+    bench_one("liquid_subtle_hit_hash", 1240, 720, 400, 300, 2, 1, 0, false)
+    bench_one("liquid_subtle_hit_same", 1240, 720, 400, 300, 2, 1, 1, false)
+    bench_one("liquid_subtle_cold", 1240, 720, 1240, 720, 2, 1, 0, true)
+    bench_one("liquid_strong_cold", 1240, 720, 1240, 720, 2, 2, 0, true)
+    bench_one("liquid_subtle_hit_hash", 1240, 720, 1240, 720, 2, 1, 0, false)
+    bench_one("liquid_strong_hit_hash", 1240, 720, 1240, 720, 2, 2, 0, false)
+    bench_one("liquid_strong_hit_same", 1240, 720, 1240, 720, 2, 2, 1, false)
+    return 0
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        say("glass_main check | shot <light|dark> <out.png> | blur <dir> | bench\n")
+        return 2
+    }
+    let cmd: u64 = rt.arg_ptr(start, 1)
+    if arg_is(cmd, "check") {
+        return do_check()
+    }
+    if arg_is(cmd, "bench") {
+        return do_bench()
+    }
+    if arg_is(cmd, "shot") && rt.arg_count(start) >= 4 {
+        return do_shot(arg_is(rt.arg_ptr(start, 2), "dark"), rt.arg_ptr(start, 3))
+    }
+    if arg_is(cmd, "blur") && rt.arg_count(start) >= 3 {
+        return do_blur(rt.arg_ptr(start, 2))
+    }
+    say("glass_main: unknown command\n")
+    return 2
+}

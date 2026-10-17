@@ -259,6 +259,16 @@ build effect
 build blurref
 "$W/blurref"
 
+echo "== 14b. GLASS: SWAR BOX BLUR, CACHE, MASK, LEVELS, BLUR VS REFERENCE GAUSSIAN =="
+# lib/fui/glass.fi: the SWAR blur equals effect.blur_buffer, level off costs
+# nothing, the cache hits/misses exactly when the backdrop changes, a flat
+# backdrop stays flat, and the blur is compared with numpy/Pillow Gaussians.
+"$FIRNC" --opt-level=release-fast -o "$W/glass" tools/fui/glass_main.fi
+"$W/glass" check
+mkdir -p "$W/glassref"
+"$W/glass" blur "$W/glassref"
+python3 -I tools/fui/glass_ref.py "$W/glassref"
+
 echo
 echo "== 15. AFFINE ABBILDUNGEN UND DIE TREFFERPRUEFUNG =="
 # Known point images, the stack, the inverse mapping -- and the

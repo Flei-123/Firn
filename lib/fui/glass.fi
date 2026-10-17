@@ -1,0 +1,1380 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/glass.fi -- GLASS: backdrop blur, acrylic, mica, liquid glass.
+//
+// ========================================================= WHY IT EXISTS
+//
+// effect.fi has a blur that works byte by byte and costs ~100 ms for a
+// dialog (docs/fui-kit.md: that is why the soft shadow is a handful of
+// rounded rectangles). Glass needs a blur EVERY time the background
+// behind a pane changes -- and, much more often, NO blur at all: a hover
+// above the pane must cost nothing. So this file is built around three
+// ideas.
+//
+//   1. THE BLUR IS CHEAP. The region behind the pane is shrunk by 2, 4 or
+//      8 (box mean of f x f pixels), blurred there with three box passes
+//      per direction (running sum, O(1) per pixel), and stretched back
+//      BILINEARLY while the pane is composed. The pixel count falls by
+//      f^2, the radius by f. Every running sum keeps ONE PIXEL IN ONE u64:
+//      four 16 bit lanes (r g b a), so an add or subtract is one machine
+//      instruction for all four channels (SWAR; Firn has no vector type
+//      yet). The division by the window width is two multiplications.
+//   2. THE EXPENSIVE PART IS CACHED. The finished pane (blur + tint +
+//      noise + rim + highlight + refraction, with its anti-aliased
+//      rounded mask) is kept in `Glass.res`. It is recomputed only if the
+//      hash of the backdrop rectangle changes (or the caller says so:
+//      `HINT_CHANGED`) -- a hover, a caret, an animation ABOVE the glass
+//      repaints nothing but a copy of the cached pane. The static part
+//      (mask, overlay, displacement map) depends on size / radius /
+//      level only and is built once per shape.
+//   3. LEVEL 0 IS FREE. `glass_draw*` returns before it touches memory.
+//
+// ================================================================ THE LOOKS
+//
+//   ACRYLIC  blur + saturation + tint + 2-3 % noise, thin rim.
+//   MICA     the same but heavily smoothed (f = 8, wide box) and checked
+//            with a SPARSE hash (1 pixel in 4x4): meant for window
+//            backgrounds that change when the wallpaper does.
+//   LIQUID   "liquid glass": moderate blur, a faint milky tint, a 1 px
+//            bright rim that is stronger on the top/left, a soft inner
+//            highlight on the lit edges and REFRACTION: along the edge the
+//            backdrop is looked up from further OUTSIDE the pane
+//            (displacement map for the rounded rectangle, quadratic
+//            fall-off over the bevel), so the rim bends the background.
+//
+// Levels: GLASS_OFF / GLASS_SUBTLE / GLASS_STRONG, also a theme token
+// (`theme.Shape.glass`, `glass_level_of`).
+//
+// CPU ONLY. A canvas with a GPU context makes `glass_draw*` return false
+// (the caller then paints its flat fallback); a GL shader is NOT written.
+import std.rt
+import paint.canvas
+import fui.theme
+import fui.damage
+
+export {
+    Glass, Params, glass_new, glass_free, glass_invalidate,
+    glass_draw, glass_draw_from, glass_params, glass_level_of,
+    glass_backdrop_dirty, glass_cold, glass_hits, glass_phase_ns, glass_alloc_bytes,
+    blur_box, blur_gauss,
+    GLASS_OFF, GLASS_SUBTLE, GLASS_STRONG,
+    KIND_ACRYLIC, KIND_MICA, KIND_LIQUID,
+    HINT_AUTO, HINT_SAME, HINT_CHANGED,
+}
+
+const GLASS_OFF: usize = 0
+const GLASS_SUBTLE: usize = 1
+const GLASS_STRONG: usize = 2
+const KIND_ACRYLIC: usize = 0
+const KIND_MICA: usize = 1
+const KIND_LIQUID: usize = 2
+// How sure is the caller about the backdrop?
+//   AUTO    unknown -> hash the backdrop rectangle (~0.1 ms for 400x300)
+//   SAME    guaranteed unchanged -> no hash at all (a hover above the pane)
+//   CHANGED guaranteed changed -> recompute without hashing
+const HINT_AUTO: usize = 0
+const HINT_SAME: usize = 1
+const HINT_CHANGED: usize = 2
+
+const LANE: u64 = 0x00FF00FF00FF00FF
+const LANE_H: u64 = 0x0080008000800080
+
+// ---------------------------------------------------------------- RAW MEMORY
+fn ld32(p: u64) -> u32 { return *(p as *mut u32) }
+fn st32(p: u64, v: u32) { *(p as *mut u32) = v }
+fn ld64(p: u64) -> u64 { return *(p as *mut u64) }
+fn st64(p: u64, v: u64) { *(p as *mut u64) = v }
+fn ld8(p: u64) -> u32 { return (*(p as *mut u8)) as u32 }
+fn st8(p: u64, v: u32) { *(p as *mut u8) = v as u8 }
+
+// A growable, zero-initialised block (the heap hands out zeroed pages).
+struct Mem {
+    p: u64,
+    cap: usize,
+}
+
+fn mem_new() -> Mem { return Mem { p: 0, cap: 0 } }
+
+fn mem_need(m: *mut Mem, n: usize) -> bool {
+    if (*m).p != 0 && (*m).cap >= n {
+        return true
+    }
+    if (*m).p != 0 {
+        rt.heap_free((*m).p, (*m).cap)
+        (*m).p = 0
+        (*m).cap = 0
+    }
+    let p: u64 = rt.heap_alloc(n)
+    if p == 0 {
+        return false
+    }
+    (*m).p = p
+    (*m).cap = n
+    return true
+}
+
+fn mem_drop(m: *mut Mem) {
+    if (*m).p != 0 {
+        rt.heap_free((*m).p, (*m).cap)
+    }
+    (*m).p = 0
+    (*m).cap = 0
+}
+
+// ----------------------------------------------------------- THE SWAR LANES
+//
+// A pixel (r g b a, one octet each) -> four 16 bit lanes of one u64 and
+// back. Sums of up to 257 octets still fit a lane.
+fn expand(p: u32) -> u64 {
+    let v: u64 = p as u64
+    let a: u64 = (v | (v << 16)) & 0x0000FFFF0000FFFF
+    return (a | (a << 8)) & LANE
+}
+
+fn compress(v: u64) -> u32 {
+    let a: u64 = (v | (v >> 8)) & 0x0000FFFF0000FFFF
+    return ((a | (a >> 16)) & 0xFFFFFFFF) as u32
+}
+
+// Window sum (four lanes, each <= 65535) -> mean pixel. `inv` = 65536 / n.
+// Two 32 bit halves so that the product cannot cross a lane.
+fn mean_px(s: u64, inv: u64) -> u32 {
+    let e: u64 = (s & 0x0000FFFF0000FFFF) * inv + 0x0000800000008000
+    let o: u64 = ((s >> 16) & 0x0000FFFF0000FFFF) * inv + 0x0000800000008000
+    let x: u64 = ((e >> 16) & 0x000000FF000000FF) |
+    (((o >> 16) & 0x000000FF000000FF) << 8)
+    return ((x | (x >> 16)) & 0xFFFFFFFF) as u32
+}
+
+// lane * m / 255, rounded (lane <= 255, m <= 255)
+fn scale255(x: u64, m: u64) -> u64 {
+    let t: u64 = x * m + LANE_H
+    return ((t + ((t >> 8) & LANE)) >> 8) & LANE
+}
+
+// a * (256 - t) + b * t, >> 8 (lanes <= 255, t <= 256)
+fn lerp_lanes(a: u64, b: u64, t: u64) -> u64 {
+    return ((a * (256 - t) + b * t) >> 8) & LANE
+}
+
+// ------------------------------------------------------------ THE BOX BLUR
+//
+// Horizontal pass with a running sum (SWAR). `src` != `dst`. The edge
+// value continues past the rim.
+fn box_h(src: u64, dst: u64, w: i64, h: i64, r: i64) {
+    let n: i64 = 2 * r + 1
+    let inv: u64 = ((65536 + n / 2) / n) as u64
+    var y: i64 = 0
+    while y < h {
+        let row: u64 = src + (y * w * 4) as u64
+        let out: u64 = dst + (y * w * 4) as u64
+        var sum: u64 = expand(ld32(row)) * ((r + 1) as u64)
+        var j: i64 = 1
+        while j <= r {
+            var q: i64 = j
+            if q > w - 1 { q = w - 1 }
+            sum = sum + expand(ld32(row + (q * 4) as u64))
+            j = j + 1
+        }
+        var x: i64 = 0
+        // left part: the window still reaches past the left edge
+        while x < w {
+            st32(out + (x * 4) as u64, mean_px(sum, inv))
+            var rr: i64 = x + r + 1
+            if rr > w - 1 { rr = w - 1 }
+            var ll: i64 = x - r
+            if ll < 0 { ll = 0 }
+            sum = sum + expand(ld32(row + (rr * 4) as u64)) -
+            expand(ld32(row + (ll * 4) as u64))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// Vertical pass, row by row (cache friendly): one running sum per column.
+// `cols` = w * 8 octets of scratch.
+fn box_v(src: u64, dst: u64, cols: u64, w: i64, h: i64, r: i64) {
+    let n: i64 = 2 * r + 1
+    let inv: u64 = ((65536 + n / 2) / n) as u64
+    let st: i64 = w * 4
+    var x: i64 = 0
+    while x < w {
+        st64(cols + (x * 8) as u64, expand(ld32(src + (x * 4) as u64)) * ((r + 1) as u64))
+        x = x + 1
+    }
+    var j: i64 = 1
+    while j <= r {
+        var q: i64 = j
+        if q > h - 1 { q = h - 1 }
+        let row: u64 = src + (q * st) as u64
+        x = 0
+        while x < w {
+            let c: u64 = cols + (x * 8) as u64
+            st64(c, ld64(c) + expand(ld32(row + (x * 4) as u64)))
+            x = x + 1
+        }
+        j = j + 1
+    }
+    var y: i64 = 0
+    while y < h {
+        var below: i64 = y + r + 1
+        if below > h - 1 { below = h - 1 }
+        var top: i64 = y - r
+        if top < 0 { top = 0 }
+        let rb: u64 = src + (below * st) as u64
+        let rt_: u64 = src + (top * st) as u64
+        let out: u64 = dst + (y * st) as u64
+        x = 0
+        while x < w {
+            let c: u64 = cols + (x * 8) as u64
+            let s: u64 = ld64(c)
+            st32(out + (x * 4) as u64, mean_px(s, inv))
+            st64(c, s + expand(ld32(rb + (x * 4) as u64)) -
+                expand(ld32(rt_ + (x * 4) as u64)))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// THREE box passes per direction ~ a Gaussian (sigma^2 = 3 * ((2r+1)^2 - 1) / 12).
+// `tmp` = w*h*4, `cols` = w*8 octets of scratch. Result in `px`.
+fn blur_box_raw(px: u64, tmp: u64, cols: u64, w: i64, h: i64, r: i64) {
+    if r <= 0 || w <= 0 || h <= 0 {
+        return
+    }
+    var rr: i64 = r
+    if rr > 60 { rr = 60 }
+    box_h(px, tmp, w, h, rr)
+    box_h(tmp, px, w, h, rr)
+    box_h(px, tmp, w, h, rr)
+    box_v(tmp, px, cols, w, h, rr)
+    box_v(px, tmp, cols, w, h, rr)
+    box_v(tmp, px, cols, w, h, rr)
+}
+
+// Public: blur a free-standing premultiplied RGBA buffer (w*h*4). Needs
+// its own scratch (allocated and freed here -- use the Glass for hot paths).
+fn blur_box(px: *mut u8, w: usize, h: usize, r: i64) -> bool {
+    var t: Mem = mem_new()
+    var c: Mem = mem_new()
+    if !mem_need(&t, w * h * 4) || !mem_need(&c, w * 8) {
+        mem_drop(&t)
+        mem_drop(&c)
+        return false
+    }
+    blur_box_raw(px as u64, t.p, c.p, w as i64, h as i64, r)
+    mem_drop(&t)
+    mem_drop(&c)
+    return true
+}
+
+// ------------------------------------------------------- THE TRUE GAUSSIAN
+//
+// Separable, kernel in 16 bit fixed point (weights sum to 65536), the edge
+// value continues. O(taps) per pixel: the reference and the "exact" mode;
+// the box blur above is what the hot path uses.
+fn root(v: f64) -> f64 {
+    if v <= 0.0 {
+        return 0.0
+    }
+    var g: f64 = v
+    if g > 1.0 {
+        g = 1.0
+        var o: f64 = v
+        while o > 4.0 {
+            o = o * 0.25
+            g = g * 2.0
+        }
+        g = g * (0.5 + 0.5 * o)
+    }
+    g = 0.5 * (g + v / g)
+    g = 0.5 * (g + v / g)
+    g = 0.5 * (g + v / g)
+    return g
+}
+
+fn gauss_expf(x: f64) -> f64 {
+    // e^-x for x >= 0 via halving and a Taylor series
+    if x <= 0.0 {
+        return 1.0
+    }
+    var k: i64 = 0
+    var v: f64 = x
+    while v > 0.5 {
+        v = v * 0.5
+        k = k + 1
+    }
+    var t: f64 = 1.0 - v + v * v * 0.5 - v * v * v / 6.0 + v * v * v * v / 24.0 -
+    v * v * v * v * v / 120.0
+    while k > 0 {
+        t = t * t
+        k = k - 1
+    }
+    return t
+}
+
+// Kernel weights for sigma into `wt` (cap 129 entries), returns the radius.
+fn gauss_kernel(sigma: f64, wt: *mut [i64; 129]) -> i64 {
+    var rad: i64 = (sigma * 3.0 + 0.999) as i64
+    if rad < 1 { rad = 1 }
+    if rad > 64 { rad = 64 }
+    var tot: f64 = 0.0
+    var i: i64 = 0 - rad
+    var fw: [f64; 129] = [0.0; 129]
+    while i <= rad {
+        let v: f64 = gauss_expf((i * i) as f64 / (2.0 * sigma * sigma))
+        fw[(i + rad) as usize] = v
+        tot = tot + v
+        i = i + 1
+    }
+    var sum: i64 = 0
+    i = 0
+    while i <= 2 * rad {
+        let q: i64 = (fw[i as usize] / tot * 65536.0 + 0.5) as i64
+        (*wt)[i as usize] = q
+        sum = sum + q
+        i = i + 1
+    }
+    (*wt)[rad as usize] = (*wt)[rad as usize] + (65536 - sum)
+    return rad
+}
+
+fn gauss_pass(src: u64, dst: u64, w: i64, h: i64, rad: i64, wt: *mut [i64; 129], vert: bool) {
+    var y: i64 = 0
+    while y < h {
+        var x: i64 = 0
+        while x < w {
+            var c: i64 = 0
+            while c < 4 {
+                var acc: i64 = 0
+                var k: i64 = 0 - rad
+                while k <= rad {
+                    var sx: i64 = x
+                    var sy: i64 = y
+                    if vert { sy = y + k } else { sx = x + k }
+                    if sx < 0 { sx = 0 }
+                    if sy < 0 { sy = 0 }
+                    if sx > w - 1 { sx = w - 1 }
+                    if sy > h - 1 { sy = h - 1 }
+                    acc = acc + (ld8(src + ((sy * w + sx) * 4 + c) as u64) as i64) * (*wt)[(k + rad) as usize]
+                    k = k + 1
+                }
+                st8(dst + ((y * w + x) * 4 + c) as u64, ((acc + 32768) >> 16) as u32)
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// Public: true Gaussian blur of a premultiplied RGBA buffer, result in `px`.
+fn blur_gauss(px: *mut u8, w: usize, h: usize, sigma: f64) -> bool {
+    if sigma <= 0.0 {
+        return true
+    }
+    var t: Mem = mem_new()
+    if !mem_need(&t, w * h * 4) {
+        return false
+    }
+    var wt: [i64; 129] = [0; 129]
+    let rad: i64 = gauss_kernel(sigma, &wt)
+    gauss_pass(px as u64, t.p, w as i64, h as i64, rad, &wt, false)
+    gauss_pass(t.p, px as u64, w as i64, h as i64, rad, &wt, true)
+    mem_drop(&t)
+    return true
+}
+
+// ------------------------------------------------------------- THE PARAMETERS
+struct Params {
+    kind: usize,
+    level: usize,
+    dark: bool,
+    rs: i64,         // box radius at the SMALL resolution
+    flog: i64,       // the backdrop is shrunk by 1 << flog
+    tint_r: i64,
+    tint_g: i64,
+    tint_b: i64,
+    tint_a: i64,     // 0..255
+    sat: i64,        // 256 = unchanged
+    noise: i64,      // amplitude 0..255 (2-3 % = 5..8)
+    bevel: i64,      // refraction band width in pixels (0 = none)
+    disp: i64,       // maximal displacement in pixels
+    rim: i64,        // 0..255 alpha of the 1 px rim
+    glow: i64,       // 0..255 alpha of the inner highlight
+    sheen: i64,      // 0..255 alpha of the top/left sheen
+    exact: bool,     // true Gaussian instead of three boxes
+    sparse: i64,     // hash stride (1 = every pixel)
+}
+
+fn glass_level_of(m: *mut theme.Theme) -> usize {
+    var l: usize = (*m).fo.glass
+    if l > 2 { l = 2 }
+    return l
+}
+
+fn params_zero() -> Params {
+    return Params { kind: 0, level: 0, dark: false, rs: 1, flog: 0,
+        tint_r: 255, tint_g: 255, tint_b: 255, tint_a: 0, sat: 256, noise: 0,
+        bevel: 0, disp: 0, rim: 0, glow: 0, sheen: 0, exact: false, sparse: 1 }
+}
+
+// The presets. `dark` swaps the tint and calms the highlights.
+fn glass_params(kind: usize, level: usize, dark: bool) -> Params {
+    var p: Params = params_zero()
+    p.kind = kind
+    p.level = level
+    p.dark = dark
+    if level == 0 {
+        return p
+    }
+    let strong: bool = level >= 2
+    if kind == 1 {
+        // MICA: very smooth, sparse hash
+        p.flog = 3
+        p.rs = 4
+        p.tint_a = 80
+        p.sat = 230
+        p.noise = 5
+        p.sparse = 4
+        if strong {
+            p.rs = 8
+            p.tint_a = 125
+            p.sat = 190
+        }
+    } else if kind == 0 {
+        // ACRYLIC
+        p.flog = 1
+        p.rs = 3
+        p.tint_a = 64
+        p.sat = 280
+        p.noise = 7
+        p.rim = 40
+        if strong {
+            p.flog = 2
+            p.rs = 3
+            p.tint_a = 102
+            p.sat = 320
+            p.noise = 8
+            p.rim = 56
+        }
+    } else {
+        // LIQUID glass
+        p.flog = 1
+        p.rs = 3
+        p.tint_a = 34
+        p.sat = 300
+        p.noise = 5
+        p.bevel = 8
+        p.disp = 4
+        p.rim = 150
+        p.glow = 70
+        p.sheen = 22
+        if strong {
+            p.flog = 2
+            p.rs = 3
+            p.tint_a = 46
+            p.sat = 345
+            p.noise = 6
+            p.bevel = 14
+            p.disp = 10
+            p.rim = 190
+            p.glow = 90
+            p.sheen = 34
+        }
+    }
+    if dark {
+        p.tint_r = 14
+        p.tint_g = 18
+        p.tint_b = 26
+        if kind == 1 {
+            p.tint_a = p.tint_a * 11 / 10
+        } else {
+            p.tint_a = p.tint_a * 17 / 10
+        }
+        if p.tint_a > 230 { p.tint_a = 230 }
+        p.rim = p.rim * 6 / 10
+        p.glow = p.glow * 6 / 10
+        p.sheen = p.sheen * 6 / 10
+        p.sat = p.sat * 9 / 10
+    }
+    return p
+}
+
+// Fingerprint of everything that changes the picture (not the backdrop).
+fn params_sig(p: *mut Params) -> u64 {
+    var h: u64 = 1469598103934665603
+    h = (h ^ (*p).kind as u64) *% 1099511628211
+    h = (h ^ (*p).level as u64) *% 1099511628211
+    if (*p).dark { h = (h ^ 7) *% 1099511628211 }
+    h = (h ^ (*p).rs as u64) *% 1099511628211
+    h = (h ^ (*p).flog as u64) *% 1099511628211
+    h = (h ^ (*p).tint_r as u64) *% 1099511628211
+    h = (h ^ (*p).tint_g as u64) *% 1099511628211
+    h = (h ^ (*p).tint_b as u64) *% 1099511628211
+    h = (h ^ (*p).tint_a as u64) *% 1099511628211
+    h = (h ^ (*p).sat as u64) *% 1099511628211
+    h = (h ^ (*p).noise as u64) *% 1099511628211
+    h = (h ^ (*p).bevel as u64) *% 1099511628211
+    h = (h ^ (*p).disp as u64) *% 1099511628211
+    h = (h ^ (*p).rim as u64) *% 1099511628211
+    h = (h ^ (*p).glow as u64) *% 1099511628211
+    h = (h ^ (*p).sheen as u64) *% 1099511628211
+    if (*p).exact { h = (h ^ 11) *% 1099511628211 }
+    return h
+}
+
+// ------------------------------------------------------------------ THE STATE
+struct Glass {
+    // --- the static shape (size / radius / look)
+    shape_ok: bool,
+    sw: i64,
+    sh: i64,
+    srad: i64,
+    ssig: u64,
+    cov: Mem,      // w*h octets: anti-aliased rounded mask
+    ov: Mem,       // w*h pixels: premultiplied overlay (tint, sheen, rim, glow, noise)
+    dxy: Mem,      // w*h pixels: displacement (two i16, 1/16 px), 0 = none
+    span: Mem,     // h * 2 i32: [xa, xb) with cov = 255 and no displacement
+    // --- the finished pane
+    res_ok: bool,
+    res: Mem,      // w*h pixels, premultiplied, mask applied
+    bhash: u64,
+    rsig: u64,
+    // --- the last backdrop rectangle (canvas pixels, for damage checks)
+    bx0: i64,
+    by0: i64,
+    bx1: i64,
+    by1: i64,
+    // --- scratch
+    sm: Mem,       // small backdrop
+    sharp: Mem,    // the same, one step less shrunk and NOT blurred (refraction ring)
+    tmp: Mem,
+    cols: Mem,
+    vrow: Mem,
+    xt: Mem,       // per output column: small index, weight
+    // --- counters
+    cold: usize,
+    hits: usize,
+    // nanoseconds of the last cold run: hash, gather, blur, compose, blit
+    ph: [i64; 5],
+}
+
+fn clock_ns() -> i64 {
+    var ts: [u64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as u64)
+    return (ts[0] as i64) * 1000000000 + (ts[1] as i64)
+}
+
+fn glass_new() -> Glass {
+    return Glass { shape_ok: false, sw: 0, sh: 0, srad: 0, ssig: 0,
+        cov: mem_new(), ov: mem_new(), dxy: mem_new(), span: mem_new(),
+        res_ok: false, res: mem_new(), bhash: 0, rsig: 0,
+        bx0: 0, by0: 0, bx1: 0, by1: 0,
+        sm: mem_new(), sharp: mem_new(), tmp: mem_new(), cols: mem_new(), vrow: mem_new(),
+        xt: mem_new(), cold: 0, hits: 0, ph: [0; 5] }
+}
+
+fn glass_free(g: *mut Glass) {
+    mem_drop(&(*g).cov)
+    mem_drop(&(*g).ov)
+    mem_drop(&(*g).dxy)
+    mem_drop(&(*g).span)
+    mem_drop(&(*g).res)
+    mem_drop(&(*g).sm)
+    mem_drop(&(*g).sharp)
+    mem_drop(&(*g).tmp)
+    mem_drop(&(*g).cols)
+    mem_drop(&(*g).vrow)
+    mem_drop(&(*g).xt)
+    (*g).shape_ok = false
+    (*g).res_ok = false
+}
+
+// Forget the cached pane (a theme change, a new backdrop you know about).
+fn glass_invalidate(g: *mut Glass) {
+    (*g).res_ok = false
+}
+
+fn glass_cold(g: *mut Glass) -> usize { return (*g).cold }
+fn glass_hits(g: *mut Glass) -> usize { return (*g).hits }
+fn glass_phase_ns(g: *mut Glass, i: usize) -> i64 { return (*g).ph[i] }
+
+fn glass_alloc_bytes(g: *mut Glass) -> usize {
+    return (*g).cov.cap + (*g).ov.cap + (*g).dxy.cap + (*g).span.cap + (*g).res.cap +
+    (*g).sm.cap + (*g).sharp.cap + (*g).tmp.cap + (*g).cols.cap + (*g).vrow.cap + (*g).xt.cap
+}
+
+// Did the damage of this frame touch the backdrop of the last pane?
+// (true = recompute; false = `HINT_SAME` is safe.) Full damage or no
+// pane yet -> true.
+fn glass_backdrop_dirty(g: *mut Glass, d: *mut damage.Damage, cw: usize, ch: usize) -> bool {
+    if !(*g).res_ok || damage.dmg_is_full(d) {
+        return true
+    }
+    var rects: [i64; 16] = [0; 16]
+    let n: usize = damage.dmg_rects(d, cw, ch, &rects)
+    var i: usize = 0
+    while i < n {
+        if rects[i * 4] < (*g).bx1 && rects[i * 4 + 2] > (*g).bx0 &&
+        rects[i * 4 + 1] < (*g).by1 && rects[i * 4 + 3] > (*g).by0 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ---------------------------------------------------------- THE STATIC SHAPE
+fn clampf(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn abs_i(v: i64) -> i64 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+fn absf(v: f64) -> f64 {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+fn noise_at(x: i64, y: i64) -> i64 {
+    // 0..1023, a cheap integer hash (fixed pattern, same for every pane)
+    var h: u64 = ((x * 73856093) ^ (y * 19349663)) as u64
+    h = (h ^ (h >> 13)) *% 1274126177
+    h = h ^ (h >> 16)
+    return (h & 1023) as i64
+}
+
+// Build mask, overlay, displacement map and spans for w x h.
+fn shape_build(g: *mut Glass, w: i64, h: i64, radius: i64, p: *mut Params, sig: u64) -> bool {
+    let n: usize = (w * h) as usize
+    if !mem_need(&(*g).cov, n) || !mem_need(&(*g).ov, n * 4) ||
+    !mem_need(&(*g).dxy, n * 4) || !mem_need(&(*g).span, (h * 8) as usize) {
+        return false
+    }
+    var rad: f64 = radius as f64
+    var half_w: f64 = (w as f64) * 0.5
+    var half_h: f64 = (h as f64) * 0.5
+    var small: f64 = half_w
+    if half_h < small { small = half_h }
+    if rad > small { rad = small }
+    if rad < 0.0 { rad = 0.0 }
+    let bevel: f64 = (*p).bevel as f64
+    let disp16: f64 = ((*p).disp * 16) as f64
+    var wg: f64 = 7.0
+    if (*p).level >= 2 { wg = 10.0 }
+    var wide: f64 = bevel
+    if wg > wide { wide = wg }
+    wide = wide + 2.0
+    let ta: f64 = ((*p).tint_a as f64) / 255.0
+    let tr: f64 = ((*p).tint_r as f64) / 255.0
+    let tg: f64 = ((*p).tint_g as f64) / 255.0
+    let tb: f64 = ((*p).tint_b as f64) / 255.0
+    let rimv: f64 = ((*p).rim as f64) / 255.0
+    let glowv: f64 = ((*p).glow as f64) / 255.0
+    let sheenv: f64 = ((*p).sheen as f64) / 255.0
+    var noisev: i64 = (*p).noise
+    let cov: u64 = (*g).cov.p
+    let ov: u64 = (*g).ov.p
+    let dxy: u64 = (*g).dxy.p
+    let sp: u64 = (*g).span.p
+    let fw: f64 = w as f64
+    let fh: f64 = h as f64
+    var y: i64 = 0
+    while y < h {
+        let fy: f64 = (y as f64) + 0.5
+        var xa: i64 = w
+        var xb: i64 = 0
+        var x: i64 = 0
+        while x < w {
+            let fx: f64 = (x as f64) + 0.5
+            let idx: u64 = (y * w + x) as u64
+            // distance to the rounded rectangle
+            let qx: f64 = absf(fx - half_w) - (half_w - rad)
+            let qy: f64 = absf(fy - half_h) - (half_h - rad)
+            var d_in: f64 = 0.0
+            var nx: f64 = 0.0
+            var ny: f64 = 0.0
+            var sgx: f64 = 1.0
+            var sgy: f64 = 1.0
+            if fx < half_w { sgx = 0.0 - 1.0 }
+            if fy < half_h { sgy = 0.0 - 1.0 }
+            if qx > 0.0 && qy > 0.0 {
+                let ln: f64 = root(qx * qx + qy * qy)
+                d_in = rad - ln
+                nx = sgx * qx / ln
+                ny = sgy * qy / ln
+            } else if qx > qy {
+                d_in = rad - qx
+                nx = sgx
+            } else {
+                d_in = rad - qy
+                ny = sgy
+            }
+            // coverage (1 px anti-aliasing)
+            let cv: f64 = clampf(0.5 + d_in, 0.0, 1.0)
+            let c8: i64 = (cv * 255.0 + 0.5) as i64
+            st8(cov + idx, c8 as u32)
+            // --- the overlay, premultiplied: tint first
+            var ca: f64 = ta
+            var cr: f64 = tr * ta
+            var cg: f64 = tg * ta
+            var cb: f64 = tb * ta
+            // sheen: a faint white veil, strongest at the top left
+            if sheenv > 0.0 {
+                let u: f64 = (fx / fw + fy / fh) * 0.5
+                let s: f64 = clampf(1.0 - u * 1.7, 0.0, 1.0)
+                let a: f64 = sheenv * s * s
+                cr = a + cr * (1.0 - a)
+                cg = a + cg * (1.0 - a)
+                cb = a + cb * (1.0 - a)
+                ca = a + ca * (1.0 - a)
+            }
+            var dir: f64 = 0.0
+            if d_in < wide {
+                let l: f64 = 0.0 - (nx + ny) * 0.70710678
+                if l > 0.0 {
+                    dir = l
+                } else {
+                    dir = (0.0 - l) * 0.5
+                }
+            }
+            // inner highlight on the lit edges
+            if glowv > 0.0 && d_in < wg {
+                let t: f64 = clampf(1.0 - d_in / wg, 0.0, 1.0)
+                let a: f64 = glowv * t * t * dir
+                cr = a + cr * (1.0 - a)
+                cg = a + cg * (1.0 - a)
+                cb = a + cb * (1.0 - a)
+                ca = a + ca * (1.0 - a)
+            }
+            // the 1 px rim
+            if rimv > 0.0 && d_in < 3.0 {
+                var t: f64 = 1.0 - absf(d_in - 0.9) / 1.3
+                t = clampf(t, 0.0, 1.0)
+                let a: f64 = rimv * t * (0.25 + 0.75 * dir)
+                cr = a + cr * (1.0 - a)
+                cg = a + cg * (1.0 - a)
+                cb = a + cb * (1.0 - a)
+                ca = a + ca * (1.0 - a)
+            }
+            var a8: i64 = (ca * 255.0 + 0.5) as i64
+            var r8: i64 = (cr * 255.0 + 0.5) as i64
+            var g8: i64 = (cg * 255.0 + 0.5) as i64
+            var b8: i64 = (cb * 255.0 + 0.5) as i64
+            // grain: positive and negative, folded into the premultiplied colour
+            if noisev > 0 {
+                let nz: i64 = (noise_at(x, y) * (2 * noisev + 1)) / 1024 - noisev
+                r8 = r8 + nz
+                g8 = g8 + nz
+                b8 = b8 + nz
+                if r8 < 0 { r8 = 0 }
+                if g8 < 0 { g8 = 0 }
+                if b8 < 0 { b8 = 0 }
+                if r8 > 255 { r8 = 255 }
+                if g8 > 255 { g8 = 255 }
+                if b8 > 255 { b8 = 255 }
+                var mx: i64 = r8
+                if g8 > mx { mx = g8 }
+                if b8 > mx { mx = b8 }
+                if mx > a8 { a8 = mx }
+            }
+            if a8 > 255 { a8 = 255 }
+            if r8 > a8 { r8 = a8 }
+            if g8 > a8 { g8 = a8 }
+            if b8 > a8 { b8 = a8 }
+            st32(ov + idx * 4, (r8 as u32) | ((g8 as u32) << 8) | ((b8 as u32) << 16) |
+                ((a8 as u32) << 24))
+            // --- refraction: look up from further outside, strongest at the rim
+            var dx16: i64 = 0
+            var dy16: i64 = 0
+            if bevel > 0.0 && d_in < bevel {
+                let t: f64 = clampf(1.0 - d_in / bevel, 0.0, 1.0)
+                let m: f64 = disp16 * t * t
+                dx16 = (nx * m) as i64
+                dy16 = (ny * m) as i64
+            }
+            var dpack: u32 = 0
+            if dx16 != 0 || dy16 != 0 {
+                dpack = ((dx16 + 32768) as u32) | (((dy16 + 32768) as u32) << 16)
+            }
+            st32(dxy + idx * 4, dpack)
+            if c8 == 255 && dpack == 0 {
+                if x < xa { xa = x }
+                xb = x + 1
+            }
+            x = x + 1
+        }
+        // the span must be contiguous: shrink it to the longest run
+        // (the interior of a rounded rectangle is one run per row)
+        if xb < xa {
+            xa = 0
+            xb = 0
+        } else {
+            var q: i64 = xa
+            while q < xb {
+                if ld8(cov + (y * w + q) as u64) != 255 || ld32(dxy + ((y * w + q) * 4) as u64) != 0 {
+                    xb = q
+                }
+                q = q + 1
+            }
+        }
+        st32(sp + (y * 8) as u64, xa as u32)
+        st32(sp + (y * 8 + 4) as u64, xb as u32)
+        y = y + 1
+    }
+    (*g).shape_ok = true
+    (*g).sw = w
+    (*g).sh = h
+    (*g).srad = radius
+    (*g).ssig = sig
+    return true
+}
+
+// -------------------------------------------------- THE BACKDROP (SMALL, BLURRED)
+
+// Shrink the region [rx, rx + sw*f) x [ry, ry + sh*f) of `cv` by f into
+// `dst` (sw x sh pixels): box mean of f x f, edge pixels continue.
+fn gather_small(cv: *mut canvas.Canvas, rx: i64, ry: i64, sw: i64, sh: i64, flog: i64, dst: u64) {
+    let cw: i64 = canvas.canvas_width(cv) as i64
+    let ch: i64 = canvas.canvas_height(cv) as i64
+    let base: u64 = canvas.canvas_pixels(cv) as u64
+    let f: i64 = 1 << flog
+    let sft: i64 = 2 * flog
+    var rnd: u64 = 0
+    if sft > 0 {
+        rnd = ((1 << (sft - 1)) as u64) * 0x0001000100010001
+    }
+    let inside: bool = rx >= 0 && ry >= 0 && rx + sw * f <= cw && ry + sh * f <= ch
+    var j: i64 = 0
+    while j < sh {
+        var i: i64 = 0
+        while i < sw {
+            var sum: u64 = 0
+            var yy: i64 = 0
+            while yy < f {
+                var sy: i64 = ry + j * f + yy
+                if !inside {
+                    if sy < 0 { sy = 0 }
+                    if sy > ch - 1 { sy = ch - 1 }
+                }
+                let row: u64 = base + (sy * cw * 4) as u64
+                var xx: i64 = 0
+                while xx < f {
+                    var sx: i64 = rx + i * f + xx
+                    if !inside {
+                        if sx < 0 { sx = 0 }
+                        if sx > cw - 1 { sx = cw - 1 }
+                    }
+                    sum = sum + expand(ld32(row + (sx * 4) as u64))
+                    xx = xx + 1
+                }
+                yy = yy + 1
+            }
+            if sft > 0 {
+                sum = ((sum + rnd) >> (sft as u64)) & LANE
+            }
+            st32(dst + ((j * sw + i) * 4) as u64, compress(sum))
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+
+// Shrink a small buffer by 2 (mean of 2 x 2, edge continues): src sw x sh -> dst dw x dh.
+fn down2(src: u64, sw: i64, sh: i64, dst: u64, dw: i64, dh: i64) {
+    var j: i64 = 0
+    while j < dh {
+        var y0: i64 = 2 * j
+        var y1: i64 = 2 * j + 1
+        if y0 > sh - 1 { y0 = sh - 1 }
+        if y1 > sh - 1 { y1 = sh - 1 }
+        let ra: u64 = src + (y0 * sw * 4) as u64
+        let rb: u64 = src + (y1 * sw * 4) as u64
+        var i: i64 = 0
+        while i < dw {
+            var x0: i64 = 2 * i
+            var x1: i64 = 2 * i + 1
+            if x0 > sw - 1 { x0 = sw - 1 }
+            if x1 > sw - 1 { x1 = sw - 1 }
+            let s4: u64 = expand(ld32(ra + (x0 * 4) as u64)) + expand(ld32(ra + (x1 * 4) as u64)) +
+            expand(ld32(rb + (x0 * 4) as u64)) + expand(ld32(rb + (x1 * 4) as u64)) + 0x0002000200020002
+            st32(dst + ((j * dw + i) * 4) as u64, compress((s4 >> 2) & LANE))
+            i = i + 1
+        }
+        j = j + 1
+    }
+}
+
+// Saturation on the small buffer: out = luma + (c - luma) * sat / 256.
+fn saturate_small(px: u64, n: i64, sat: i64) {
+    if sat == 256 {
+        return
+    }
+    var i: i64 = 0
+    while i < n {
+        let q: u64 = px + (i * 4) as u64
+        let r: i64 = ld8(q) as i64
+        let g: i64 = ld8(q + 1) as i64
+        let b: i64 = ld8(q + 2) as i64
+        let l: i64 = (r * 54 + g * 183 + b * 19) >> 8
+        var r2: i64 = l + (((r - l) * sat) >> 8)
+        var g2: i64 = l + (((g - l) * sat) >> 8)
+        var b2: i64 = l + (((b - l) * sat) >> 8)
+        if r2 < 0 { r2 = 0 }
+        if g2 < 0 { g2 = 0 }
+        if b2 < 0 { b2 = 0 }
+        let a: i64 = ld8(q + 3) as i64
+        if r2 > a { r2 = a }
+        if g2 > a { g2 = a }
+        if b2 > a { b2 = a }
+        st8(q, r2 as u32)
+        st8(q + 1, g2 as u32)
+        st8(q + 2, b2 as u32)
+        i = i + 1
+    }
+}
+
+// Bilinear sample of the small buffer at (T/16, U/16) region pixels
+// (centres of the full-resolution pixels), result as lanes.
+fn sample_small(sm: u64, sw: i64, sh: i64, flog: i64, tx: i64, ty: i64) -> u64 {
+    let sft: i64 = 4 + flog
+    let msk: i64 = (1 << sft) - 1
+    var i0: i64 = tx >> sft
+    var j0: i64 = ty >> sft
+    var fx: i64 = ((tx & msk) << 8) >> sft
+    var fy: i64 = ((ty & msk) << 8) >> sft
+    if tx < 0 { i0 = 0 - 1 }
+    if ty < 0 { j0 = 0 - 1 }
+    if i0 < 0 {
+        i0 = 0
+        fx = 0
+    }
+    if j0 < 0 {
+        j0 = 0
+        fy = 0
+    }
+    if i0 > sw - 2 {
+        i0 = sw - 2
+        fx = 255
+    }
+    if j0 > sh - 2 {
+        j0 = sh - 2
+        fy = 255
+    }
+    let p00: u64 = expand(ld32(sm + ((j0 * sw + i0) * 4) as u64))
+    let p10: u64 = expand(ld32(sm + ((j0 * sw + i0 + 1) * 4) as u64))
+    let p01: u64 = expand(ld32(sm + (((j0 + 1) * sw + i0) * 4) as u64))
+    let p11: u64 = expand(ld32(sm + (((j0 + 1) * sw + i0 + 1) * 4) as u64))
+    let top: u64 = lerp_lanes(p00, p10, fx as u64)
+    let bot: u64 = lerp_lanes(p01, p11, fx as u64)
+    return lerp_lanes(top, bot, fy as u64)
+}
+
+// overlay over backdrop (lanes), no coverage
+fn shade(bl: u64, o: u32) -> u64 {
+    let oa: u64 = (o >> 24) as u64
+    return expand(o) + scale255(bl, 255 - oa)
+}
+
+// Compose the pane into `res`. The small buffer is ready; `pad` is the
+// distance from the pane's top-left to the region's top-left.
+fn compose(g: *mut Glass, w: i64, h: i64, pad: i64, flog: i64, ssw: i64, ssh: i64,
+    flog_s: i64, ssw2: i64, ssh2: i64, disp16: i64) {
+    let f: i64 = 1 << flog
+    let sm: u64 = (*g).sm.p
+    var sharp: u64 = 0
+    if disp16 > 0 {
+        sharp = (*g).sharp.p
+    }
+    let res: u64 = (*g).res.p
+    let ov: u64 = (*g).ov.p
+    let cov: u64 = (*g).cov.p
+    let dxy: u64 = (*g).dxy.p
+    let sp: u64 = (*g).span.p
+    let xt: u64 = (*g).xt.p
+    let vrow: u64 = (*g).vrow.p
+    // column table: small index, weight (8 bit) per output column
+    var x: i64 = 0
+    while x < w {
+        let t2: i64 = 2 * (pad + x) + 1 - f
+        var i0: i64 = t2 / (2 * f)
+        var wx: i64 = ((t2 - i0 * 2 * f) * 256) / (2 * f)
+        if i0 > ssw - 2 {
+            i0 = ssw - 2
+            wx = 255
+        }
+        st32(xt + (x * 8) as u64, i0 as u32)
+        st32(xt + (x * 8 + 4) as u64, wx as u32)
+        x = x + 1
+    }
+    var y: i64 = 0
+    while y < h {
+        // the vertically interpolated small row for this output row
+        let t2: i64 = 2 * (pad + y) + 1 - f
+        var j0: i64 = t2 / (2 * f)
+        var wy: i64 = ((t2 - j0 * 2 * f) * 256) / (2 * f)
+        if j0 > ssh - 2 {
+            j0 = ssh - 2
+            wy = 255
+        }
+        let ra: u64 = sm + ((j0 * ssw) * 4) as u64
+        let rb: u64 = sm + (((j0 + 1) * ssw) * 4) as u64
+        var i: i64 = 0
+        while i < ssw {
+            st64(vrow + (i * 8) as u64, lerp_lanes(expand(ld32(ra + (i * 4) as u64)),
+                expand(ld32(rb + (i * 4) as u64)), wy as u64))
+            i = i + 1
+        }
+        let xa: i64 = ld32(sp + (y * 8) as u64) as i64
+        let xb: i64 = ld32(sp + (y * 8 + 4) as u64) as i64
+        let rowi: i64 = y * w
+        // generic pixels (mask edge, refraction): left part, then right part
+        var seg: i64 = 0
+        while seg < 2 {
+            var s0: i64 = 0
+            var s1: i64 = xa
+            if seg == 1 {
+                s0 = xb
+                s1 = w
+            }
+            if xb <= xa {
+                // no fast run in this row: everything is generic
+                if seg == 0 {
+                    s0 = 0
+                    s1 = w
+                } else {
+                    s0 = 0
+                    s1 = 0
+                }
+            }
+            var px: i64 = s0
+            while px < s1 {
+                let idx: u64 = (rowi + px) as u64
+                let o: u32 = ld32(ov + idx * 4)
+                let dd: u32 = ld32(dxy + idx * 4)
+                var bl: u64 = 0
+                if dd != 0 {
+                    let dx: i64 = ((dd & 0xFFFF) as i64) - 32768
+                    let dy: i64 = ((dd >> 16) as i64) - 32768
+                    let tx: i64 = 16 * (pad + px) + 8 + dx - 8 * f
+                    let ty: i64 = 16 * (pad + y) + 8 + dy - 8 * f
+                    bl = sample_small(sm, ssw, ssh, flog, tx, ty)
+                    if sharp != 0 {
+                        // the rim looks through the glass: less blurred there
+                        let fs: i64 = 1 << flog_s
+                        let tx2: i64 = 16 * (pad + px) + 8 + dx - 8 * fs
+                        let ty2: i64 = 16 * (pad + y) + 8 + dy - 8 * fs
+                        var m: i64 = abs_i(dx)
+                        if abs_i(dy) > m { m = abs_i(dy) }
+                        var mix: i64 = (m * 256) / (disp16 + 1)
+                        if mix > 255 { mix = 255 }
+                        mix = (mix * 220) >> 8
+                        bl = lerp_lanes(bl, sample_small(sharp, ssw2, ssh2, flog_s, tx2, ty2), mix as u64)
+                    }
+                } else {
+                    let i0: u64 = ld32(xt + (px * 8) as u64) as u64
+                    let wx: u64 = ld32(xt + (px * 8 + 4) as u64) as u64
+                    bl = lerp_lanes(ld64(vrow + i0 * 8), ld64(vrow + i0 * 8 + 8), wx)
+                }
+                var v: u64 = shade(bl, o)
+                let c: u64 = ld8(cov + idx) as u64
+                if c != 255 {
+                    v = scale255(v, c)
+                }
+                st32(res + idx * 4, compress(v))
+                px = px + 1
+            }
+            seg = seg + 1
+        }
+        // the fast run
+        var px: i64 = xa
+        while px < xb {
+            let idx: u64 = (rowi + px) as u64
+            let i0: u64 = ld32(xt + (px * 8) as u64) as u64
+            let wx: u64 = ld32(xt + (px * 8 + 4) as u64) as u64
+            let a: u64 = ld64(vrow + i0 * 8)
+            let b: u64 = ld64(vrow + i0 * 8 + 8)
+            let bl: u64 = ((a * (256 - wx) + b * wx) >> 8) & LANE
+            let o: u32 = ld32(ov + idx * 4)
+            let t: u64 = bl * (255 - ((o >> 24) as u64)) + LANE_H
+            let sc: u64 = ((t + ((t >> 8) & LANE)) >> 8) & LANE
+            st32(res + idx * 4, compress(expand(o) + sc))
+            px = px + 1
+        }
+        y = y + 1
+    }
+}
+
+// ---------------------------------------------------------------- THE HASH
+// Fingerprint of a canvas rectangle [x0,x1) x [y0,y1). stride 1: every pixel,
+// two per 64 bit word, four independent chains. stride > 1: sparse.
+fn hash_rect(base: u64, cw: i64, x0: i64, y0: i64, x1: i64, y1: i64, stride: i64) -> u64 {
+    let k: u64 = 0x9E3779B97F4A7C15
+    var a0: u64 = 0x243F6A8885A308D3
+    var a1: u64 = 0x13198A2E03707344
+    var a2: u64 = 0xA4093822299F31D0
+    var a3: u64 = 0x082EFA98EC4E6C89
+    var y: i64 = y0
+    while y < y1 {
+        var p: u64 = base + ((y * cw + x0) * 4) as u64
+        if stride <= 1 {
+            var n: i64 = x1 - x0
+            while n >= 8 {
+                a0 = (a0 ^ ld64(p)) *% k
+                a1 = (a1 ^ ld64(p + 8)) *% k
+                a2 = (a2 ^ ld64(p + 16)) *% k
+                a3 = (a3 ^ ld64(p + 24)) *% k
+                p = p + 32
+                n = n - 8
+            }
+            while n >= 2 {
+                a0 = (a0 ^ ld64(p)) *% k
+                p = p + 8
+                n = n - 2
+            }
+            if n == 1 {
+                a1 = (a1 ^ (ld32(p) as u64)) *% k
+            }
+        } else {
+            var x: i64 = x0
+            while x < x1 {
+                a0 = (a0 ^ (ld32(p) as u64)) *% k
+                p = p + (stride * 4) as u64
+                x = x + stride
+            }
+        }
+        a2 = a2 ^ (a0 >> 29)
+        a3 = a3 ^ (a1 >> 31)
+        y = y + stride
+    }
+    var h: u64 = a0 ^ ((a1 << 13) | (a1 >> 51)) ^ ((a2 << 27) | (a2 >> 37)) ^
+    ((a3 << 41) | (a3 >> 23))
+    h = (h ^ (h >> 33)) *% 0xFF51AFD7ED558CCD
+    return h ^ (h >> 29)
+}
+
+// ------------------------------------------------------------------ THE BLIT
+// The finished pane onto `dst` at (x, y), clipped to the canvas.
+fn blit_res(g: *mut Glass, dst: *mut canvas.Canvas, x: i64, y: i64, w: i64, h: i64) {
+    let cw: i64 = canvas.canvas_width(dst) as i64
+    let ch: i64 = canvas.canvas_height(dst) as i64
+    let base: u64 = canvas.canvas_pixels(dst) as u64
+    let res: u64 = (*g).res.p
+    let sp: u64 = (*g).span.p
+    var yy: i64 = 0
+    while yy < h {
+        let cy: i64 = y + yy
+        if cy >= 0 && cy < ch {
+            var xa: i64 = ld32(sp + (yy * 8) as u64) as i64
+            var xb: i64 = ld32(sp + (yy * 8 + 4) as u64) as i64
+            if xb <= xa {
+                xa = 0
+                xb = 0
+            }
+            // generic pixels: [0, xa) and [xb, w), or the whole row
+            var seg: i64 = 0
+            while seg < 2 {
+                var s0: i64 = 0
+                var s1: i64 = xa
+                if seg == 1 {
+                    s0 = xb
+                    s1 = w
+                }
+                if xb <= xa {
+                    if seg == 0 {
+                        s0 = 0
+                        s1 = w
+                    } else {
+                        s1 = 0
+                    }
+                }
+                var px: i64 = s0
+                while px < s1 {
+                    let cx: i64 = x + px
+                    if cx >= 0 && cx < cw {
+                        let sv: u32 = ld32(res + ((yy * w + px) * 4) as u64)
+                        let sa: u64 = (sv >> 24) as u64
+                        if sa != 0 {
+                            let q: u64 = base + ((cy * cw + cx) * 4) as u64
+                            if sa == 255 {
+                                st32(q, sv)
+                            } else {
+                                let dv: u64 = expand(ld32(q))
+                                st32(q, compress(expand(sv) + scale255(dv, 255 - sa)))
+                            }
+                        }
+                    }
+                    px = px + 1
+                }
+                seg = seg + 1
+            }
+            // the opaque run: one copy
+            if xb > xa {
+                var c0: i64 = x + xa
+                var c1: i64 = x + xb
+                if c0 < 0 { c0 = 0 }
+                if c1 > cw { c1 = cw }
+                if c1 > c0 {
+                    rt.mem_copy(base + ((cy * cw + c0) * 4) as u64,
+                        res + ((yy * w + (c0 - x)) * 4) as u64, ((c1 - c0) * 4) as usize)
+                }
+            }
+        }
+        yy = yy + 1
+    }
+}
+
+// ----------------------------------------------------------------- THE DRAW
+
+// The pane at (x, y) w x h with corner `radius`, the backdrop taken from
+// `src` (compositor: the desktop layer) and the pane painted onto `dst`.
+// `hint`: see HINT_*. Returns false if there is no memory or the canvas
+// belongs to a GPU context (paint a flat fallback then).
+fn glass_draw_from(g: *mut Glass, dst: *mut canvas.Canvas, src: *mut canvas.Canvas,
+    x: i64, y: i64, w: i64, h: i64, radius: i64, p: *mut Params, hint: usize) -> bool {
+    if (*p).level == 0 || w <= 0 || h <= 0 {
+        return true
+    }
+    if canvas.canvas_gpu(dst) != 0 || canvas.canvas_gpu(src) != 0 {
+        return false
+    }
+    if canvas.canvas_ok(dst) == false || canvas.canvas_ok(src) == false {
+        return false
+    }
+    let psig: u64 = params_sig(p)
+    // --- the static shape
+    if !(*g).shape_ok || (*g).sw != w || (*g).sh != h || (*g).srad != radius ||
+    (*g).ssig != psig {
+        if !shape_build(g, w, h, radius, p, psig) {
+            return false
+        }
+        (*g).res_ok = false
+    }
+    let flog: i64 = (*p).flog
+    let f: i64 = 1 << flog
+    let pad: i64 = 2 * (*p).rs * f + (*p).disp + 2 + f
+    // the region must be a whole number of small pixels
+    let ssw: i64 = (w + 2 * pad) / f + 2
+    let ssh: i64 = (h + 2 * pad) / f + 2
+    let rx: i64 = x - pad
+    let ry: i64 = y - pad
+    // --- is the cached pane still right?
+    let cw: i64 = canvas.canvas_width(src) as i64
+    let ch: i64 = canvas.canvas_height(src) as i64
+    var x0: i64 = rx
+    var y0: i64 = ry
+    var x1: i64 = rx + w + 2 * pad
+    var y1: i64 = ry + h + 2 * pad
+    // how far the region reaches over the canvas is part of the picture
+    var clipsig: u64 = 0
+    if x0 < 0 {
+        clipsig = clipsig ^ ((0 - x0) as u64)
+        x0 = 0
+    }
+    if y0 < 0 {
+        clipsig = clipsig ^ (((0 - y0) as u64) << 16)
+        y0 = 0
+    }
+    if x1 > cw {
+        clipsig = clipsig ^ (((x1 - cw) as u64) << 32)
+        x1 = cw
+    }
+    if y1 > ch {
+        clipsig = clipsig ^ (((y1 - ch) as u64) << 48)
+        y1 = ch
+    }
+    var valid: bool = false
+    var hv: u64 = 0
+    let full: u64 = psig ^ (clipsig *% 31)
+    if (*g).res_ok && (*g).rsig == full {
+        if hint == HINT_SAME {
+            valid = true
+        } else if hint == HINT_AUTO {
+            hv = hash_rect(canvas.canvas_pixels(src) as u64, cw, x0, y0, x1, y1, (*p).sparse)
+            valid = hv == (*g).bhash
+        }
+    }
+    if valid {
+        (*g).hits = (*g).hits + 1
+        blit_res(g, dst, x, y, w, h)
+        return true
+    }
+    // --- cold: gather, blur, compose
+    let n: usize = (w * h) as usize
+    if !mem_need(&(*g).res, n * 4) || !mem_need(&(*g).sm, (ssw * ssh * 4) as usize) ||
+    !mem_need(&(*g).tmp, (ssw * ssh * 4) as usize) ||
+    !mem_need(&(*g).cols, (ssw * 8) as usize) ||
+    !mem_need(&(*g).vrow, (ssw * 8) as usize) || !mem_need(&(*g).xt, (w * 8) as usize) {
+        return false
+    }
+    let t0: i64 = clock_ns()
+    if hint != HINT_AUTO || hv == 0 {
+        hv = hash_rect(canvas.canvas_pixels(src) as u64, cw, x0, y0, x1, y1, (*p).sparse)
+    }
+    let t1: i64 = clock_ns()
+    var flog_s: i64 = 0
+    var ssw2: i64 = 0
+    var ssh2: i64 = 0
+    var disp16: i64 = 0
+    if (*p).bevel > 0 && (*p).disp > 0 && flog >= 1 {
+        flog_s = flog - 1
+        let fs: i64 = 1 << flog_s
+        ssw2 = ssw * (f / fs)
+        ssh2 = ssh * (f / fs)
+        disp16 = (*p).disp * 16
+        if !mem_need(&(*g).sharp, (ssw2 * ssh2 * 4) as usize) {
+            return false
+        }
+        gather_small(src, rx, ry, ssw2, ssh2, flog_s, (*g).sharp.p)
+        down2((*g).sharp.p, ssw2, ssh2, (*g).sm.p, ssw, ssh)
+    } else {
+        gather_small(src, rx, ry, ssw, ssh, flog, (*g).sm.p)
+    }
+    let t2: i64 = clock_ns()
+    if (*p).exact {
+        let rsz: f64 = (2 * (*p).rs + 1) as f64
+        blur_gauss((*g).sm.p as *mut u8, ssw as usize, ssh as usize,
+            root(3.0 * (rsz * rsz - 1.0) / 12.0))
+    } else {
+        blur_box_raw((*g).sm.p, (*g).tmp.p, (*g).cols.p, ssw, ssh, (*p).rs)
+    }
+    saturate_small((*g).sm.p, ssw * ssh, (*p).sat)
+    let t3: i64 = clock_ns()
+    compose(g, w, h, pad, flog, ssw, ssh, flog_s, ssw2, ssh2, disp16)
+    let t4: i64 = clock_ns()
+    (*g).ph[0] = t1 - t0
+    (*g).ph[1] = t2 - t1
+    (*g).ph[2] = t3 - t2
+    (*g).ph[3] = t4 - t3
+    (*g).res_ok = true
+    (*g).bhash = hv
+    (*g).rsig = full
+    (*g).bx0 = x0
+    (*g).by0 = y0
+    (*g).bx1 = x1
+    (*g).by1 = y1
+    (*g).cold = (*g).cold + 1
+    blit_res(g, dst, x, y, w, h)
+    (*g).ph[4] = clock_ns() - t4
+    return true
+}
+
+// The common case: the backdrop is what `dst` shows right now. Paint the
+// background of the pane's region BEFORE calling (a repaint of the frame
+// does that anyway); the pane's own pixels from an earlier frame would
+// otherwise count as backdrop.
+fn glass_draw(g: *mut Glass, dst: *mut canvas.Canvas, x: i64, y: i64, w: i64, h: i64,
+    radius: i64, kind: usize, level: usize, dark: bool, hint: usize) -> bool {
+    if level == 0 {
+        return true
+    }
+    var p: Params = glass_params(kind, level, dark)
+    return glass_draw_from(g, dst, dst, x, y, w, h, radius, &p, hint)
+}

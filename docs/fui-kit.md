@@ -93,3 +93,13 @@ grid's scrollbar stays at the right and pointing symbols are not flipped; the a1
 geometry and is not connected to AT-SPI / UIA yet (a screen reader still cannot read the
 window -- the tree is what it will read); touch is tested with synthetic pointer streams, not on a
 phone in this wave.
+
+## Glass (lib/fui/glass.fi)
+
+`glass.glass_draw(g, canvas, x, y, w, h, radius, kind, level, dark, hint)`
+paints backdrop blur (acrylic / mica / liquid glass; level 0 off, 1 subtle,
+2 strong; token `theme.Shape.glass`). CPU only, SWAR box blur on a shrunk
+backdrop, the finished pane is cached until the backdrop hash changes
+(`HINT_SAME` skips even the hash, `glass_backdrop_dirty` reads damage.fi).
+Compositor use: `glass_draw_from(g, dst, src, ...)` with the desktop layer
+as `src`. Checks, showcase and bench: `tools/fui/glass_main.fi`.

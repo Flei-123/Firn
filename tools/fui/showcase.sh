@@ -49,6 +49,12 @@ for g in gallery gallery2 gallery3 gallery4 gallery9; do
     done
 done
 
+# GLASS (lib/fui/glass.fi): off / subtle / strong, liquid + acrylic + mica
+"$FIRNC" --opt-level=release-fast -o "$T/glass" tools/fui/glass_main.fi
+for scheme in light dark; do
+    "$T/glass" shot "$scheme" "$T/img/glass-$scheme.png"
+done
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/
