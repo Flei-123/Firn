@@ -787,7 +787,17 @@ for f in tools/fui/*_main.fi demos/fuidemo/main.fi; do
     # is therefore the string "$W/<name>", with which this script executes a
     # built program, and as a fixed text (-F), so that
     # no special character makes it a pattern.
-    if ! grep -qF "\"\$W/$n\"" "tools/fui/run.sh"; then
+    # A program may also be built and run by a wrapper script (tools/fui/atspi.sh, tools/dialog/*_run.sh);
+    # then the wrapper must name the source file AND run.sh must call the wrapper.
+    called=0
+    if grep -qF "\"\$W/$n\"" "tools/fui/run.sh"; then called=1; fi
+    if [ "$called" = 0 ]; then
+        for wrap in $(grep -lF "tools/fui/${n}_main.fi" tools/fui/*.sh tools/dialog/*.sh 2>/dev/null); do
+            wb=$(basename "$wrap")
+            if [ "$wb" != run.sh ] && grep -qF "$wb" tools/fui/run.sh; then called=1; fi
+        done
+    fi
+    if [ "$called" = 0 ]; then
         echo "  $f wird in tools/fui/run.sh NICHT gerufen (kein \"\$W/$n\")"
         echo "  -- eine Pruefung, die niemand ruft, ist keine. Haenge sie ein."
         missing_any=1
@@ -1427,9 +1437,9 @@ echo "== THE INTERACTIVE DIALOGS (roadmap r177, docs/DIALOG.md): message, colour
 # Each script builds its own in-memory test and live driver, runs the checks without a window, the
 # FRAME_MS limit (<= 16 ms) with release-fast, the accessibility audit, and the live test on a private
 # Xvfb (SKIP when Xvfb / xdotool / xwd / PIL are missing). Last lines: "... PASSED".
-for n in msgdlg colordlg fontdlg; do
-    bash "tools/dialog/${n}_run.sh"
-done
+bash tools/dialog/msgdlg_run.sh
+bash tools/dialog/colordlg_run.sh
+bash tools/dialog/fontdlg_run.sh
 bash tools/dialog/filedlg_run.sh all
 
 echo
