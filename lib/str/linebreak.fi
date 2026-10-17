@@ -1,0 +1,398 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/str/linebreak.fi -- line break opportunities (UAX #14, Unicode 15.0, rules LB2..LB31).
+//
+// The table is `generated/linebreak_tables.fi`, made by `python3 tools/linebreak/gen.py`
+// (LineBreak.txt with LB1 already applied, East_Asian_Width F/W/H, Extended_Pictographic&Cn).
+//
+//   lb_map() -> table         0 = allocation failed (every lookup then says AL)
+//   lb_free(t)
+//   lb_class(t, cp)           the class after LB1 (LB_AL .. LB_B2)
+//   lb_breaks(t, p, n, out)   fills out[0..=n] (n + 1 octets) for the UTF-8 text at `p`:
+//                             out[i] is the decision for the boundary BEFORE octet i:
+//                             0 no break, 1 break allowed, 2 break required (BK/CR/LF/NL, end of text).
+//                             Octets inside a code point and out[0] are 0 (LB2); out[n] is 2 (LB3).
+//
+// No tailoring (no dictionary breaking for Thai/Lao/Khmer: SA letters stay AL, so they do not break).
+import rt.rt
+import str.grapheme
+import generated.linebreak_tables
+
+export {
+    lb_map, lb_free, lb_class, lb_breaks,
+    LB_AL, LB_BA, LB_BB, LB_BK, LB_CB, LB_CL, LB_CM, LB_CP, LB_CR, LB_EB, LB_EM, LB_EX, LB_GL,
+    LB_H2, LB_H3, LB_HL, LB_HY, LB_ID, LB_IN, LB_IS, LB_JL, LB_JT, LB_JV, LB_LF, LB_NL, LB_NS,
+    LB_NU, LB_OP, LB_PO, LB_PR, LB_QU, LB_RI, LB_SP, LB_SY, LB_WJ, LB_ZW, LB_ZWJ, LB_B2,
+}
+
+const LB_AL: u32 = 0
+const LB_BA: u32 = 1
+const LB_BB: u32 = 2
+const LB_BK: u32 = 3
+const LB_CB: u32 = 4
+const LB_CL: u32 = 5
+const LB_CM: u32 = 6
+const LB_CP: u32 = 7
+const LB_CR: u32 = 8
+const LB_EB: u32 = 9
+const LB_EM: u32 = 10
+const LB_EX: u32 = 11
+const LB_GL: u32 = 12
+const LB_H2: u32 = 13
+const LB_H3: u32 = 14
+const LB_HL: u32 = 15
+const LB_HY: u32 = 16
+const LB_ID: u32 = 17
+const LB_IN: u32 = 18
+const LB_IS: u32 = 19
+const LB_JL: u32 = 20
+const LB_JT: u32 = 21
+const LB_JV: u32 = 22
+const LB_LF: u32 = 23
+const LB_NL: u32 = 24
+const LB_NS: u32 = 25
+const LB_NU: u32 = 26
+const LB_OP: u32 = 27
+const LB_PO: u32 = 28
+const LB_PR: u32 = 29
+const LB_QU: u32 = 30
+const LB_RI: u32 = 31
+const LB_SP: u32 = 32
+const LB_SY: u32 = 33
+const LB_WJ: u32 = 34
+const LB_ZW: u32 = 35
+const LB_ZWJ: u32 = 36
+const LB_B2: u32 = 37
+const LB_SOT: u32 = 255
+
+fn lb_map() -> u64 {
+    let t: u64 = rt.heap_alloc(linebreak_tables.BYTES)
+    if t == 0 {
+        return 0
+    }
+    linebreak_tables.load(t as *mut u8)
+    return t
+}
+
+fn lb_free(t: u64) {
+    if t != 0 {
+        rt.heap_free(t, linebreak_tables.BYTES)
+    }
+}
+
+// Packed value: bits 0..5 class, bit 6 East Asian F/W/H, bit 7 ExtPict & unassigned.
+fn lb_value(t: u64, cp: u32) -> u32 {
+    if t == 0 {
+        return 0 as u32
+    }
+    let c: u64 = cp as u64
+    var lo: usize = 0
+    var hi: usize = linebreak_tables.RANGES
+    while lo < hi {
+        let mid: usize = (lo + hi) / 2
+        let r: u64 = rt.ld64(t, mid)
+        let first: u64 = r & 0x1FFFFF
+        let last: u64 = (r >> 21) & 0x1FFFFF
+        if c < first {
+            hi = mid
+        } else if c > last {
+            lo = mid + 1
+        } else {
+            return ((r >> 42) & 255) as u32
+        }
+    }
+    return 0 as u32
+}
+
+fn lb_class(t: u64, cp: u32) -> u32 {
+    return lb_value(t, cp) & 63 as u32
+}
+
+fn is_hard(c: u32) -> bool {
+    return c == LB_BK || c == LB_CR || c == LB_LF || c == LB_NL
+}
+
+fn is_al_hl(c: u32) -> bool {
+    return c == LB_AL || c == LB_HL
+}
+
+fn is_hangul(c: u32) -> bool {
+    return c == LB_JL || c == LB_JV || c == LB_JT || c == LB_H2 || c == LB_H3
+}
+
+// The decision between a (the unit before) and b (the next character); see the
+// rule numbers of UAX #14. Rules that need more than the two classes get their
+// context in: `psp` (the class before a run of spaces that ends in a), `aprev`
+// (the unit before a), `ri` (regional indicators in a row ending in a), `afw`/`bfw`
+// (East Asian F/W/H) and `bext` (the previous unit is an unassigned pictograph).
+fn decide(a: u32, b: u32, psp: u32, aprev: u32, ri: u32, nu: u32, nxt: u32, afw: bool, bfw: bool,
+    aext: bool) -> u8 {
+    // LB8: ZW SP* ÷
+    if a == LB_ZW || (a == LB_SP && psp == LB_ZW) {
+        return 1 as u8
+    }
+    // LB11, LB12, LB12a
+    if a == LB_WJ || b == LB_WJ || a == LB_GL {
+        return 0 as u8
+    }
+    if b == LB_GL && a != LB_SP && a != LB_BA && a != LB_HY {
+        return 0 as u8
+    }
+    // LB13
+    if b == LB_CL || b == LB_CP || b == LB_EX || b == LB_IS || b == LB_SY {
+        return 0 as u8
+    }
+    // LB14 .. LB17 (a, or the class before the spaces that end in a)
+    var s: u32 = a
+    if a == LB_SP {
+        s = psp
+    }
+    if s == LB_OP {
+        return 0 as u8
+    }
+    if s == LB_QU && b == LB_OP {
+        return 0 as u8
+    }
+    if (s == LB_CL || s == LB_CP) && b == LB_NS {
+        return 0 as u8
+    }
+    if s == LB_B2 && b == LB_B2 {
+        return 0 as u8
+    }
+    // LB18
+    if a == LB_SP {
+        return 1 as u8
+    }
+    // LB19, LB20
+    if a == LB_QU || b == LB_QU {
+        return 0 as u8
+    }
+    if a == LB_CB || b == LB_CB {
+        return 1 as u8
+    }
+    // LB21, LB21a, LB21b
+    if b == LB_BA || b == LB_HY || b == LB_NS || a == LB_BB {
+        return 0 as u8
+    }
+    if aprev == LB_HL && (a == LB_HY || a == LB_BA) {
+        return 0 as u8
+    }
+    if a == LB_SY && b == LB_HL {
+        return 0 as u8
+    }
+    // LB22
+    if b == LB_IN {
+        return 0 as u8
+    }
+    // LB23, LB23a, LB24
+    if (is_al_hl(a) && b == LB_NU) || (a == LB_NU && is_al_hl(b)) {
+        return 0 as u8
+    }
+    if a == LB_PR && (b == LB_ID || b == LB_EB || b == LB_EM) {
+        return 0 as u8
+    }
+    if (a == LB_ID || a == LB_EB || a == LB_EM) && b == LB_PO {
+        return 0 as u8
+    }
+    if (a == LB_PR || a == LB_PO) && is_al_hl(b) {
+        return 0 as u8
+    }
+    if is_al_hl(a) && (b == LB_PR || b == LB_PO) {
+        return 0 as u8
+    }
+    // LB25 (the regular-expression form of Unicode 6.1 and later):
+    //   (PR | PO) x (OP | HY)? NU      ( OP | HY ) x NU       NU x (NU | SY | IS)
+    //   NU (NU | SY | IS)* x (NU | SY | IS | CL | CP)
+    //   NU (NU | SY | IS)* (CL | CP)? x (PO | PR)
+    // `nu` = 1 after NU (NU | SY | IS)*, 2 after that and one CL / CP; `nxt` = the
+    // class after b (CM / ZWJ skipped), only looked up for PR / PO before OP / HY.
+    if (a == LB_PR || a == LB_PO) && (b == LB_NU || ((b == LB_OP || b == LB_HY) && nxt == LB_NU)) {
+        return 0 as u8
+    }
+    if (a == LB_OP || a == LB_HY) && b == LB_NU {
+        return 0 as u8
+    }
+    if nu == 1 as u32 && (b == LB_NU || b == LB_SY || b == LB_IS || b == LB_CL || b == LB_CP) {
+        return 0 as u8
+    }
+    if nu >= 1 as u32 && (b == LB_PO || b == LB_PR) {
+        return 0 as u8
+    }
+    // LB26, LB27
+    if a == LB_JL && (b == LB_JL || b == LB_JV || b == LB_H2 || b == LB_H3) {
+        return 0 as u8
+    }
+    if (a == LB_JV || a == LB_H2) && (b == LB_JV || b == LB_JT) {
+        return 0 as u8
+    }
+    if (a == LB_JT || a == LB_H3) && b == LB_JT {
+        return 0 as u8
+    }
+    if is_hangul(a) && b == LB_PO {
+        return 0 as u8
+    }
+    if a == LB_PR && is_hangul(b) {
+        return 0 as u8
+    }
+    // LB28, LB29
+    if is_al_hl(a) && is_al_hl(b) {
+        return 0 as u8
+    }
+    if a == LB_IS && is_al_hl(b) {
+        return 0 as u8
+    }
+    // LB30
+    if (is_al_hl(a) || a == LB_NU) && b == LB_OP && !bfw {
+        return 0 as u8
+    }
+    if a == LB_CP && !afw && (is_al_hl(b) || b == LB_NU) {
+        return 0 as u8
+    }
+    // LB30a: pairs of regional indicators
+    if a == LB_RI && b == LB_RI && ri % 2 == 1 as u32 {
+        return 0 as u8
+    }
+    // LB30b
+    if b == LB_EM && (a == LB_EB || aext) {
+        return 0 as u8
+    }
+    // LB31
+    return 1 as u8
+}
+
+// The class of the first character at or after octet j that is not CM / ZWJ.
+fn peek_class(t: u64, p: u64, n: usize, j: usize) -> u32 {
+    var q: usize = j
+    while q < n {
+        var len: usize = 1
+        let cp: u32 = grapheme.gb_decode(p, n, q, &len)
+        let c: u32 = lb_class(t, cp)
+        if c != LB_CM && c != LB_ZWJ {
+            return c
+        }
+        q = q + len
+    }
+    return LB_SOT
+}
+
+fn lb_breaks(t: u64, p: u64, n: usize, out: u64) {
+    var k: usize = 0
+    while k <= n {
+        rt.st8(out, k, 0 as u8)
+        k = k + 1
+    }
+    if n == 0 {
+        return
+    }
+    var a: u32 = LB_SOT
+    var araw: u32 = LB_SOT
+    var aprev: u32 = LB_SOT
+    var psp: u32 = LB_SOT
+    var ri: u32 = 0 as u32
+    var nu: u32 = 0 as u32
+    var afw: bool = false
+    var aext: bool = false
+    var i: usize = 0
+    while i < n {
+        var len: usize = 1
+        let cp: u32 = grapheme.gb_decode(p, n, i, &len)
+        let v: u32 = lb_value(t, cp)
+        let braw: u32 = v & 63 as u32
+        var b: u32 = braw
+        let bfw: bool = (v & 64 as u32) != 0 as u32
+        let bext: bool = (v & 128 as u32) != 0 as u32
+        if i == 0 {
+            // LB2 (no break at the start); LB10: a first CM/ZWJ is an AL
+            if b == LB_CM || b == LB_ZWJ {
+                b = LB_AL
+            }
+            a = b
+            araw = braw
+            afw = bfw
+            aext = bext
+            if a == LB_RI {
+                ri = 1 as u32
+            }
+            if a == LB_NU {
+                nu = 1 as u32
+            }
+            if a == LB_SP {
+                psp = LB_SOT
+            }
+            i = i + len
+            continue
+        }
+        var d: u8 = 0 as u8
+        var absorb: bool = false
+        if araw == LB_BK {
+            d = 2 as u8
+        } else if araw == LB_CR {
+            if braw == LB_LF {
+                d = 0 as u8
+            } else {
+                d = 2 as u8
+            }
+        } else if araw == LB_LF || araw == LB_NL {
+            d = 2 as u8
+        } else if is_hard(braw) {
+            d = 0 as u8 // LB6
+        } else if braw == LB_SP || braw == LB_ZW {
+            d = 0 as u8 // LB7
+        } else if (a == LB_ZW || (a == LB_SP && psp == LB_ZW)) {
+            d = 1 as u8 // LB8
+        } else if araw == LB_ZWJ {
+            d = 0 as u8 // LB8a
+        } else if (braw == LB_CM || braw == LB_ZWJ) && a != LB_SP && a != LB_ZW {
+            d = 0 as u8 // LB9
+            absorb = true
+        } else {
+            if b == LB_CM || b == LB_ZWJ {
+                b = LB_AL // LB10
+            }
+            var nxt: u32 = LB_SOT
+            if (a == LB_PR || a == LB_PO) && (b == LB_OP || b == LB_HY) {
+                nxt = peek_class(t, p, n, i + len)
+            }
+            d = decide(a, b, psp, aprev, ri, nu, nxt, afw, bfw, aext)
+        }
+        rt.st8(out, i, d)
+        if absorb {
+            araw = braw
+            i = i + len
+            continue
+        }
+        // the new unit starts at i
+        if b == LB_CM || b == LB_ZWJ {
+            b = LB_AL
+        }
+        if b == LB_SP {
+            if a != LB_SP {
+                psp = a
+            }
+        }
+        aprev = a
+        if b == LB_RI {
+            if a == LB_RI {
+                ri = ri + 1 as u32
+            } else {
+                ri = 1 as u32
+            }
+        } else {
+            ri = 0 as u32
+        }
+        if b == LB_NU {
+            nu = 1 as u32
+        } else if nu == 1 as u32 && (b == LB_SY || b == LB_IS) {
+            nu = 1 as u32
+        } else if nu == 1 as u32 && (b == LB_CL || b == LB_CP) {
+            nu = 2 as u32
+        } else {
+            nu = 0 as u32
+        }
+        a = b
+        araw = braw
+        afw = bfw
+        aext = bext
+        i = i + len
+    }
+    rt.st8(out, n, 2 as u8)
+}
