@@ -1,0 +1,1333 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/jarvisapi.fi -- the REST side of the JARVIS client for the native
+// Android app (and any other fUi program): projects, needs, the command
+// center, chats of the workers, tasks, devices, push token, speech to text,
+// file upload / download. Never blocks: every request runs on the event loop
+// (async.ahttp) and answers through ONE callback, like net.jarvisc (which
+// stays the WebSocket chat client; both share the cookie `fleitec_session`).
+//
+//     import async.loop
+//     import net.jarvisapi
+//
+//     fn on_api(a: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
+//         if kind == jarvisapi.AK_PROJECTS && status != 0 {      // 200 live, 203 cached
+//             var p: jarvisapi.Projects = jarvisapi.projects_new()
+//             if jarvisapi.parse_projects(jarvisapi.ja_body_ptr(a), jarvisapi.ja_body_len(a), &p) {
+//                 // p.rows: Vec[ProjectRow], p.rows[i].name ...
+//             }
+//             jarvisapi.projects_free(&p)
+//         }
+//     }
+//     let a: *mut jarvisapi.Api = jarvisapi.ja_new(&l, on_api, 0)
+//     jarvisapi.ja_set_base(a, "https://jarvis.example.org")
+//     jarvisapi.ja_use_jc(a, jc)                 // token + base of a logged in net.jarvisc client
+//     jarvisapi.ja_projects(a)                   // -> AK_PROJECTS
+//     loop.run(&l)
+//
+// THE CALLBACK `cb(api, ud, kind, status)`
+//   kind    AK_* -- which request has finished (the answer of every call carries
+//           the kind of the call; several requests may run at once).
+//   status  the HTTP status (200 ok, 401 log in again, 404 ...); 0 = no
+//           connection / timeout; 502 = the answer is not what the client
+//           expected (the body is not JSON); 203 = NO connection, but the
+//           offline cache (jarvis_cache) had the last good answer -- the body
+//           is that answer, `ja_age_s` is its age.
+//   Inside the callback (only there): ja_body_ptr/len (the raw answer, valid
+//   until the callback returns), ja_key (the id the call was made with: project
+//   id, chat id ...), ja_age_s (-1 live, else the age of a cached answer).
+//   The typed result: parse_xxx(body) fills a struct whose `str` fields are
+//   VIEWS into its own json document -- valid until `xxx_free`, no copy, no GC.
+//   The parsers are plain functions of bytes: you can run them on a cached
+//   file, a test fixture or a fuzz input; a broken input returns false (the
+//   struct stays empty, nothing crashes).
+//
+// THE PATHS (docs/ANDROID-APP-API.md of the JARVIS server is the contract; the
+// defaults are the routes server.js has TODAY). All of them live in ONE table
+// (`ja_set_path(api, JP_*, "/api/m/...")`) so the mobile routes of the server
+// worker can be switched on in one place.
+//
+// THE CACHE. `ja_set_cache(api, &cache)` (net.jarvis_cache): every good GET
+// answer is stored under `<kind>:<key>`; when the same GET later finds no
+// connection, the stored answer is delivered with status 203. Writes (POST)
+// are never cached or replayed.
+//
+// HONEST
+//   A1  The server has no REST route for "add a task" and none for a file
+//       upload (the web UI sends files inside the WebSocket message): `ja_task_add`
+//       POSTs {"action":"add",...} to the tasks path and `ja_upload` POSTs the
+//       raw bytes to JP_UPLOAD (default /api/m/upload). Both are the contract
+//       asked from the server worker (A2); on today's server.js the first is
+//       answered with the list WITHOUT the new task, the second with 404.
+//   A2  One answer is held in memory (limit 32 MiB, ahttp H4); a download is not
+//       streamed to disk.
+//   A3  Names are resolved blocking (ahttp H2), TLS 1.3 only, roots from the
+//       system or `ja_add_trust_pem`.
+//   A4  Do not free the client inside its own callback. The token goes to
+//       whatever base you set; use https for a real server.
+//   A5  Ids in paths are percent-escaped (everything but letters, digits and
+//       -_.~), so an id can not change the path.
+import std.rt
+import std.str
+import std.json
+import std.vec
+import async.loop
+import async.ahttp
+import net.http
+import net.jarvisc
+import net.jarvis_cache
+
+export {
+    Api,
+    AK_LOGIN, AK_ME, AK_PROJECTS, AK_PROJECT, AK_PROJECT_SET, AK_ROADMAP, AK_NEED, AK_CENTER,
+    AK_CONVS, AK_CONV, AK_TASKS, AK_TASK_OP, AK_DEVICES, AK_PUSH, AK_STT, AK_UPLOAD, AK_DOWNLOAD,
+    JP_ME, JP_PROJECTS, JP_CENTER, JP_CONVS, JP_TASKS, JP_DEVICES, JP_PUSH, JP_STT, JP_UPLOAD, JP_LOGIN,
+    ja_new, ja_free, ja_set_base, ja_set_token, ja_has_token, ja_use_jc, ja_set_path, ja_get_path,
+    ja_set_cache, ja_set_timeout, ja_add_trust_pem, ja_user,
+    ja_login, ja_me, ja_projects, ja_project, ja_project_set, ja_roadmap_op, ja_need_answer,
+    ja_center, ja_convs, ja_conv, ja_tasks, ja_task_add, ja_task_complete, ja_task_remove,
+    ja_devices, ja_push_token, ja_stt, ja_upload, ja_download,
+    ja_get, ja_post_json, ja_kind_name,
+    ja_body_ptr, ja_body_len, ja_body, ja_key, ja_age_s, ja_status,
+    Me, ProjectRow, Projects, RoadItem, NeedItem, ChatRef, ProjectFull,
+    WorkerRow, ActRow, Center, ConvRow, Convs, Msg, Conv, TaskRow, Tasks, DeviceRow, Devices,
+    me_new, me_free, parse_me,
+    projects_new, projects_free, parse_projects,
+    pfull_new, pfull_free, parse_project, pfull_option,
+    center_new, center_free, parse_center,
+    convs_new, convs_free, parse_convs,
+    conv_new, conv_free, parse_conv,
+    tasks_new, tasks_free, parse_tasks,
+    devices_new, devices_free, parse_devices,
+    parse_text_field, Uploaded, uploaded_new, uploaded_free, parse_upload,
+}
+
+// ----------------------------------------------------------------- constants
+
+const AK_LOGIN: u32 = 1
+const AK_ME: u32 = 2
+const AK_PROJECTS: u32 = 3
+const AK_PROJECT: u32 = 4
+const AK_PROJECT_SET: u32 = 5 // POST status/next of a project (answer: the project)
+const AK_ROADMAP: u32 = 6 // POST roadmap action (answer: the project)
+const AK_NEED: u32 = 7 // POST answer to a need (answer: the project)
+const AK_CENTER: u32 = 8
+const AK_CONVS: u32 = 9
+const AK_CONV: u32 = 10
+const AK_TASKS: u32 = 11
+const AK_TASK_OP: u32 = 12 // add / complete / remove (answer: the task list)
+const AK_DEVICES: u32 = 13
+const AK_PUSH: u32 = 14
+const AK_STT: u32 = 15
+const AK_UPLOAD: u32 = 16
+const AK_DOWNLOAD: u32 = 17
+
+const JP_LOGIN: u32 = 0
+const JP_ME: u32 = 1
+const JP_PROJECTS: u32 = 2 // prefix: <path>/<id>, <path>/<id>/roadmap, <path>/<id>/needs
+const JP_CENTER: u32 = 3
+const JP_CONVS: u32 = 4 // prefix: <path>/<cid>?turns=N
+const JP_TASKS: u32 = 5
+const JP_DEVICES: u32 = 6
+const JP_PUSH: u32 = 7
+const JP_STT: u32 = 8
+const JP_UPLOAD: u32 = 9
+
+const TIMEOUT_MS: i64 = 20000
+
+struct Paths {
+    login: rt.Buf,
+    me: rt.Buf,
+    projects: rt.Buf,
+    center: rt.Buf,
+    convs: rt.Buf,
+    tasks: rt.Buf,
+    devices: rt.Buf,
+    push: rt.Buf,
+    stt: rt.Buf,
+    upload: rt.Buf,
+}
+
+struct Api {
+    l: *mut loop.Loop,
+    cb: fn(*mut Api, u64, u32, i64),
+    ud: u64,
+    ah: ahttp.AClient,
+    base: rt.Buf,
+    token: rt.Buf,
+    user: rt.Buf,
+    paths: Paths,
+    cache: *mut jarvis_cache.Cache,
+    body: rt.Buf, // the answer being delivered
+    key: rt.Buf, // the key of the call being delivered
+    url: rt.Buf,
+    req: rt.Buf,
+    age: i64,
+    status: i64,
+    timeout_ms: i64,
+}
+
+struct Call {
+    a: *mut Api,
+    kind: u32,
+    post: bool,
+    cacheable: bool, // a good answer is stored; only a GET is replayed from the store
+    key: rt.Buf,
+}
+
+fn obj_alloc[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+fn obj_free[T](p: u64) {
+    rt.heap_free(p, size_of[T]())
+}
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn set(b: *mut rt.Buf, s: str) {
+    rt.buf_clear(b)
+    put(b, s)
+}
+
+fn as_str(b: *mut rt.Buf) -> str {
+    return __str_copy(str { p: (*b).ptr as *mut u8, n: (*b).len })
+}
+
+fn paths_buf(a: *mut Api, which: u32) -> *mut rt.Buf {
+    if which == JP_LOGIN { return &(*a).paths.login }
+    if which == JP_ME { return &(*a).paths.me }
+    if which == JP_PROJECTS { return &(*a).paths.projects }
+    if which == JP_CENTER { return &(*a).paths.center }
+    if which == JP_CONVS { return &(*a).paths.convs }
+    if which == JP_TASKS { return &(*a).paths.tasks }
+    if which == JP_DEVICES { return &(*a).paths.devices }
+    if which == JP_PUSH { return &(*a).paths.push }
+    if which == JP_STT { return &(*a).paths.stt }
+    if which == JP_UPLOAD { return &(*a).paths.upload }
+    return 0 as *mut rt.Buf
+}
+
+// The ONE place with the default routes (server.js today; the mobile routes of
+// docs/ANDROID-APP-API.md are switched on with ja_set_path).
+fn paths_defaults(a: *mut Api) {
+    set(&(*a).paths.login, "/api/login")
+    set(&(*a).paths.me, "/api/me")
+    set(&(*a).paths.projects, "/api/projects")
+    set(&(*a).paths.center, "/api/command-center")
+    set(&(*a).paths.convs, "/api/conversations")
+    set(&(*a).paths.tasks, "/api/tasks")
+    set(&(*a).paths.devices, "/api/remote/devices")
+    set(&(*a).paths.push, "/api/push-token")
+    set(&(*a).paths.stt, "/api/stt")
+    set(&(*a).paths.upload, "/api/m/upload")
+}
+
+fn ja_set_path(a: *mut Api, which: u32, path: str) -> bool {
+    let b: *mut rt.Buf = paths_buf(a, which)
+    if b as u64 == 0 {
+        return false
+    }
+    set(b, path)
+    return true
+}
+
+fn ja_get_path(a: *mut Api, which: u32) -> str {
+    let b: *mut rt.Buf = paths_buf(a, which)
+    if b as u64 == 0 {
+        return ""
+    }
+    return as_str(b)
+}
+
+fn ja_new(l: *mut loop.Loop, cb: fn(*mut Api, u64, u32, i64), ud: u64) -> *mut Api {
+    let p: u64 = obj_alloc[Api]()
+    if p == 0 {
+        return 0 as *mut Api
+    }
+    let a: *mut Api = p as *mut Api
+    *a = Api { l: l, cb: cb, ud: ud, ah: ahttp.aclient_new(), base: rt.buf_new(), token: rt.buf_new(),
+        user: rt.buf_new(),
+        paths: Paths { login: rt.buf_new(), me: rt.buf_new(), projects: rt.buf_new(), center: rt.buf_new(),
+            convs: rt.buf_new(), tasks: rt.buf_new(), devices: rt.buf_new(), push: rt.buf_new(),
+            stt: rt.buf_new(), upload: rt.buf_new() },
+        cache: 0 as *mut jarvis_cache.Cache, body: rt.buf_new(), key: rt.buf_new(), url: rt.buf_new(),
+        req: rt.buf_new(), age: -1, status: 0, timeout_ms: TIMEOUT_MS }
+    if !ahttp.aclient_init(&(*a).ah, l) {
+        obj_free[Api](p)
+        return 0 as *mut Api
+    }
+    paths_defaults(a)
+    return a
+}
+
+fn ja_free(a: *mut Api) {
+    ahttp.aclient_free(&(*a).ah)
+    rt.buf_free(&(*a).base)
+    rt.buf_free(&(*a).token)
+    rt.buf_free(&(*a).user)
+    rt.buf_free(&(*a).paths.login)
+    rt.buf_free(&(*a).paths.me)
+    rt.buf_free(&(*a).paths.projects)
+    rt.buf_free(&(*a).paths.center)
+    rt.buf_free(&(*a).paths.convs)
+    rt.buf_free(&(*a).paths.tasks)
+    rt.buf_free(&(*a).paths.devices)
+    rt.buf_free(&(*a).paths.push)
+    rt.buf_free(&(*a).paths.stt)
+    rt.buf_free(&(*a).paths.upload)
+    rt.buf_free(&(*a).body)
+    rt.buf_free(&(*a).key)
+    rt.buf_free(&(*a).url)
+    rt.buf_free(&(*a).req)
+    obj_free[Api](a as u64)
+}
+
+fn ja_set_base(a: *mut Api, base: str) {
+    var n: usize = base.n
+    while n > 0 && *(base.p + n - 1) == 47 as u8 {
+        n = n - 1
+    }
+    rt.buf_clear(&(*a).base)
+    rt.buf_push_bytes(&(*a).base, base.p as u64, n)
+}
+
+// encodeURIComponent-like escape: letters, digits and -_.~ stay (also the cookie value)
+fn push_escaped(b: *mut rt.Buf, p: u64, n: usize) {
+    let hex: str = "0123456789ABCDEF"
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        let keep: bool = (ch >= 48 as u8 && ch <= 57 as u8) || (ch >= 65 as u8 && ch <= 90 as u8)
+        || (ch >= 97 as u8 && ch <= 122 as u8) || ch == 45 as u8 || ch == 95 as u8
+        || ch == 46 as u8 || ch == 126 as u8
+        if keep {
+            rt.buf_push(b, ch)
+        } else {
+            rt.buf_push(b, 37 as u8)
+            rt.buf_push(b, *(hex.p + (ch >> 4) as usize))
+            rt.buf_push(b, *(hex.p + (ch & 15 as u8) as usize))
+        }
+        i = i + 1
+    }
+}
+
+// `Cookie: fleitec_session=<token>`; the token is escaped like net.jarvisc does
+// (encodeURIComponent keeps !*'() too, the server unescapes both the same way).
+fn apply_cookie(a: *mut Api) {
+    var line: rt.Buf = rt.buf_new()
+    if (*a).token.len > 0 {
+        put(&line, "Cookie: fleitec_session=")
+        let hex: str = "0123456789ABCDEF"
+        var i: usize = 0
+        while i < (*a).token.len {
+            let ch: u8 = rt.ld8((*a).token.ptr, i)
+            var keep: bool = (ch >= 48 as u8 && ch <= 57 as u8) || (ch >= 65 as u8 && ch <= 90 as u8) || (ch >= 97 as u8 && ch <= 122 as u8)
+            if ch == 45 as u8 || ch == 95 as u8 || ch == 46 as u8 || ch == 33 as u8 || ch == 126 as u8
+            || ch == 42 as u8 || ch == 39 as u8 || ch == 40 as u8 || ch == 41 as u8 {
+                keep = true
+            }
+            if keep {
+                rt.buf_push(&line, ch)
+            } else {
+                rt.buf_push(&line, 37 as u8)
+                rt.buf_push(&line, *(hex.p + (ch >> 4) as usize))
+                rt.buf_push(&line, *(hex.p + (ch & 15 as u8) as usize))
+            }
+            i = i + 1
+        }
+        put(&line, "\r\n")
+    }
+    http.client_set_headers(ahttp.aclient_http(&(*a).ah), line.ptr, line.len)
+    rt.buf_free(&line)
+}
+
+fn ja_set_token(a: *mut Api, token: str) {
+    set(&(*a).token, token)
+    apply_cookie(a)
+}
+
+fn ja_has_token(a: *mut Api) -> bool { return (*a).token.len > 0 }
+fn ja_user(a: *mut Api) -> str { return as_str(&(*a).user) }
+
+// Take base and token of a logged in net.jarvisc client (one login for both).
+fn ja_use_jc(a: *mut Api, c: *mut jarvisc.Jc) {
+    ja_set_base(a, jarvisc.jc_base(c))
+    ja_set_token(a, jarvisc.jc_token(c))
+    set(&(*a).user, jarvisc.jc_user(c))
+}
+
+fn ja_set_cache(a: *mut Api, c: *mut jarvis_cache.Cache) { (*a).cache = c }
+fn ja_set_timeout(a: *mut Api, ms: i64) { (*a).timeout_ms = ms }
+
+fn ja_add_trust_pem(a: *mut Api, p: u64, n: usize) {
+    let k: usize = http.client_add_trust_pem(ahttp.aclient_http(&(*a).ah), p, n)
+}
+
+// --------------------------------------------------- accessors in the callback
+
+fn ja_body_ptr(a: *mut Api) -> u64 { return (*a).body.ptr }
+fn ja_body_len(a: *mut Api) -> usize { return (*a).body.len }
+fn ja_body(a: *mut Api) -> str { return as_str(&(*a).body) }
+fn ja_key(a: *mut Api) -> str { return as_str(&(*a).key) }
+fn ja_age_s(a: *mut Api) -> i64 { return (*a).age }
+fn ja_status(a: *mut Api) -> i64 { return (*a).status }
+
+fn ja_kind_name(kind: u32) -> str {
+    if kind == AK_LOGIN { return "login" }
+    if kind == AK_ME { return "me" }
+    if kind == AK_PROJECTS { return "projects" }
+    if kind == AK_PROJECT || kind == AK_PROJECT_SET || kind == AK_ROADMAP || kind == AK_NEED { return "project" }
+    if kind == AK_CENTER { return "center" }
+    if kind == AK_CONVS { return "convs" }
+    if kind == AK_CONV { return "conv" }
+    if kind == AK_TASKS || kind == AK_TASK_OP { return "tasks" }
+    if kind == AK_DEVICES { return "devices" }
+    return "other"
+}
+
+// ------------------------------------------------------------------ requests
+
+fn deliver(a: *mut Api, call: *mut Call, status: i64, age: i64) {
+    (*a).status = status
+    (*a).age = age
+    rt.buf_clear(&(*a).key)
+    rt.buf_push_bytes(&(*a).key, (*call).key.ptr, (*call).key.len)
+    let f: fn(*mut Api, u64, u32, i64) = (*a).cb
+    f(a, (*a).ud, (*call).kind, status)
+}
+
+fn cache_key(call: *mut Call, out: *mut rt.Buf) {
+    put(out, ja_kind_name((*call).kind))
+    put(out, ":")
+    rt.buf_push_bytes(out, (*call).key.ptr, (*call).key.len)
+}
+
+// 200 + {"username","token"} -> keep the token (cookie for every later call); a 200
+// without a token is a 502. Any other status leaves the old token cleared.
+fn login_answer(a: *mut Api, status: i64) -> i64 {
+    rt.buf_clear(&(*a).token)
+    var st: i64 = status
+    if status == 200 {
+        var d: json.Json = json.json_new()
+        var got: bool = false
+        if open_doc(&d, (*a).body.ptr, (*a).body.len) {
+            let o: u32 = json.json_root(&d)
+            let tk: str = gs(&d, o, "token")
+            if tk.n > 0 {
+                put(&(*a).token, tk)
+                set(&(*a).user, gs(&d, o, "username"))
+                got = true
+            }
+        }
+        json.json_free(&d)
+        if !got {
+            st = 502
+        }
+    }
+    apply_cookie(a)
+    return st
+}
+
+// Only a complete JSON document is worth caching (a cut answer would replace a good one).
+fn body_is_json(a: *mut Api) -> bool {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, (*a).body.ptr, (*a).body.len) catch false
+    json.json_free(&d)
+    return ok
+}
+
+fn on_done(r: *mut ahttp.Request, ud: u64) {
+    let call: *mut Call = ud as *mut Call
+    let a: *mut Api = (*call).a
+    var status: i64 = 0
+    if ahttp.areq_error(r) == 0 {
+        status = ahttp.areq_status(r) as i64
+    }
+    rt.buf_clear(&(*a).body)
+    var age: i64 = -1
+    if status > 0 {
+        rt.buf_push_bytes(&(*a).body, ahttp.areq_body_ptr(r), ahttp.areq_body_len(r))
+    }
+    if status == 200 && (*call).cacheable && (*a).cache as u64 != 0 && body_is_json(a) {
+        var ck: rt.Buf = rt.buf_new()
+        cache_key(call, &ck)
+        let ok: bool = jarvis_cache.cache_put((*a).cache, as_str(&ck), (*a).body.ptr, (*a).body.len)
+        rt.buf_free(&ck)
+    }
+    if status == 0 && (*call).cacheable && !(*call).post && (*a).cache as u64 != 0 {
+        var ck2: rt.Buf = rt.buf_new()
+        cache_key(call, &ck2)
+        let ks: str = as_str(&ck2)
+        if jarvis_cache.cache_get((*a).cache, ks, &(*a).body) {
+            status = 203
+            age = jarvis_cache.cache_age_s((*a).cache, ks)
+        }
+        rt.buf_free(&ck2)
+    }
+    if (*call).kind == AK_LOGIN {
+        status = login_answer(a, status)
+    }
+    deliver(a, call, status, age)
+    rt.buf_free(&(*call).key)
+    obj_free[Call](call as u64)
+}
+
+// The core: GET (body_n == 0 && !post) or POST of `body` with `ctype`.
+fn start(a: *mut Api, kind: u32, post: bool, cacheable: bool, url_len: usize, key: str,
+    body: u64, body_n: usize, ctype: str) -> bool {
+    if (*a).base.len == 0 {
+        return false
+    }
+    let p: u64 = obj_alloc[Call]()
+    if p == 0 {
+        return false
+    }
+    let call: *mut Call = p as *mut Call
+    *call = Call { a: a, kind: kind, post: post, cacheable: cacheable, key: rt.buf_new() }
+    put(&(*call).key, key)
+    var r: *mut ahttp.Request = 0 as *mut ahttp.Request
+    if post {
+        r = ahttp.aclient_post(&(*a).ah, (*a).url.ptr, (*a).url.len, body, body_n, ctype.p as u64, ctype.n,
+            (*a).timeout_ms, on_done, p)
+    } else {
+        r = ahttp.aclient_get(&(*a).ah, (*a).url.ptr, (*a).url.len, (*a).timeout_ms, on_done, p)
+    }
+    if r as u64 == 0 {
+        rt.buf_free(&(*call).key)
+        obj_free[Call](p)
+        return false
+    }
+    return true
+}
+
+// url = base + prefix path + optional "/" + escaped id + suffix
+fn make_url(a: *mut Api, which: u32, id: str, suffix: str) {
+    rt.buf_clear(&(*a).url)
+    rt.buf_push_bytes(&(*a).url, (*a).base.ptr, (*a).base.len)
+    let pb: *mut rt.Buf = paths_buf(a, which)
+    rt.buf_push_bytes(&(*a).url, (*pb).ptr, (*pb).len)
+    if id.n > 0 {
+        put(&(*a).url, "/")
+        push_escaped(&(*a).url, id.p as u64, id.n)
+    }
+    put(&(*a).url, suffix)
+}
+
+// Any GET of a configured route (new mobile routes without a new function).
+fn ja_get(a: *mut Api, kind: u32, which: u32, id: str, suffix: str) -> bool {
+    make_url(a, which, id, suffix)
+    return start(a, kind, false, true, 0, id, 0, 0, "")
+}
+
+// Any POST of a JSON object already built in (p, n).
+fn ja_post_json(a: *mut Api, kind: u32, which: u32, id: str, suffix: str, p: u64, n: usize) -> bool {
+    make_url(a, which, id, suffix)
+    // the answers of project / task writes carry the fresh object: keep them as the newest cached copy
+    let keep: bool = kind == AK_PROJECT_SET || kind == AK_ROADMAP || kind == AK_NEED || kind == AK_TASK_OP
+    return start(a, kind, true, keep, 0, id, p, n, "application/json")
+}
+
+fn jkey(w: *mut json.JsonWriter, name: str) {
+    json.jw_key(w, name.p as u64, name.n)
+}
+
+fn jstr(w: *mut json.JsonWriter, name: str, v: str) {
+    jkey(w, name)
+    json.jw_string(w, v.p as u64, v.n)
+}
+
+fn ja_login(a: *mut Api, user: str, password: str) -> bool {
+    // the cookie of an older login must not go with the login itself
+    http.client_set_headers(ahttp.aclient_http(&(*a).ah), "".p as u64, 0)
+    rt.buf_clear(&(*a).req)
+    var w: json.JsonWriter = json.jw_new(&(*a).req, false)
+    json.jw_begin_object(&w)
+    jstr(&w, "username", user)
+    jstr(&w, "password", password)
+    json.jw_end(&w)
+    json.jw_free(&w)
+    make_url(a, JP_LOGIN, "", "")
+    let ok: bool = start(a, AK_LOGIN, true, false, 0, user, (*a).req.ptr, (*a).req.len, "application/json")
+    if !ok {
+        apply_cookie(a)
+    }
+    return ok
+}
+
+fn ja_me(a: *mut Api) -> bool { return ja_get(a, AK_ME, JP_ME, "", "") }
+fn ja_projects(a: *mut Api) -> bool { return ja_get(a, AK_PROJECTS, JP_PROJECTS, "", "") }
+fn ja_project(a: *mut Api, id: str) -> bool { return ja_get(a, AK_PROJECT, JP_PROJECTS, id, "") }
+fn ja_center(a: *mut Api) -> bool { return ja_get(a, AK_CENTER, JP_CENTER, "", "") }
+fn ja_tasks(a: *mut Api) -> bool { return ja_get(a, AK_TASKS, JP_TASKS, "", "") }
+fn ja_devices(a: *mut Api) -> bool { return ja_get(a, AK_DEVICES, JP_DEVICES, "", "") }
+
+// status / next of a project: "" leaves the field alone (-> AK_PROJECT_SET)
+fn ja_project_set(a: *mut Api, id: str, status: str, next: str) -> bool {
+    rt.buf_clear(&(*a).req)
+    var w: json.JsonWriter = json.jw_new(&(*a).req, false)
+    json.jw_begin_object(&w)
+    if status.n > 0 { jstr(&w, "status", status) }
+    if next.n > 0 { jstr(&w, "next", next) }
+    json.jw_end(&w)
+    json.jw_free(&w)
+    return ja_post_json(a, AK_PROJECT_SET, JP_PROJECTS, id, "", (*a).req.ptr, (*a).req.len)
+}
+
+// action = "done" | "undo" | "add" | "edit" | "remove" ; item = roadmap id, or the text for "add" (-> AK_ROADMAP)
+fn ja_roadmap_op(a: *mut Api, id: str, action: str, item: str) -> bool {
+    rt.buf_clear(&(*a).req)
+    var w: json.JsonWriter = json.jw_new(&(*a).req, false)
+    json.jw_begin_object(&w)
+    jstr(&w, "action", action)
+    if action == "add" {
+        jstr(&w, "text", item)
+    } else {
+        jstr(&w, "id", item)
+    }
+    json.jw_end(&w)
+    json.jw_free(&w)
+    return ja_post_json(a, AK_ROADMAP, JP_PROJECTS, id, "/roadmap", (*a).req.ptr, (*a).req.len)
+}
+
+// Answer a need of a project (-> AK_NEED).
+fn ja_need_answer(a: *mut Api, id: str, need_id: str, answer: str) -> bool {
+    rt.buf_clear(&(*a).req)
+    var w: json.JsonWriter = json.jw_new(&(*a).req, false)
+    json.jw_begin_object(&w)
+    jstr(&w, "action", "answer")
+    jstr(&w, "id", need_id)
+    jstr(&w, "answer", answer)
+    json.jw_end(&w)
+    json.jw_free(&w)
+    return ja_post_json(a, AK_NEED, JP_PROJECTS, id, "/needs", (*a).req.ptr, (*a).req.len)
+}
+
+// The chat list; limit 0 = everything (the server's old behaviour).
+fn ja_convs(a: *mut Api, limit: u32, offset: u32) -> bool {
+    var sfx: rt.Buf = rt.buf_new()
+    if limit > 0 {
+        put(&sfx, "?limit=")
+        rt.buf_push_dec_i64(&sfx, limit as i64)
+        put(&sfx, "&offset=")
+        rt.buf_push_dec_i64(&sfx, offset as i64)
+    }
+    make_url(a, JP_CONVS, "", as_str(&sfx))
+    rt.buf_free(&sfx)
+    return start(a, AK_CONVS, false, true, 0, "", 0, 0, "")
+}
+
+// One chat (a worker chat too); turns 0 = all messages, else the last `turns` turns.
+fn ja_conv(a: *mut Api, cid: str, turns: u32) -> bool {
+    var sfx: rt.Buf = rt.buf_new()
+    if turns > 0 {
+        put(&sfx, "?turns=")
+        rt.buf_push_dec_i64(&sfx, turns as i64)
+    }
+    make_url(a, JP_CONVS, cid, as_str(&sfx))
+    rt.buf_free(&sfx)
+    return start(a, AK_CONV, false, true, 0, cid, 0, 0, "")
+}
+
+fn task_op(a: *mut Api, action: str, ref_text: str, due: str, category: str, repeat: str) -> bool {
+    rt.buf_clear(&(*a).req)
+    var w: json.JsonWriter = json.jw_new(&(*a).req, false)
+    json.jw_begin_object(&w)
+    jstr(&w, "action", action)
+    if action == "add" {
+        jstr(&w, "text", ref_text)
+        if due.n > 0 { jstr(&w, "due", due) }
+        if category.n > 0 { jstr(&w, "category", category) }
+        if repeat.n > 0 { jstr(&w, "repeat", repeat) }
+    } else {
+        jstr(&w, "ref", ref_text)
+    }
+    json.jw_end(&w)
+    json.jw_free(&w)
+    return ja_post_json(a, AK_TASK_OP, JP_TASKS, "", "", (*a).req.ptr, (*a).req.len)
+}
+
+// due = ISO time ("2026-10-18T09:00") or ""; repeat = daily|weekly|monthly|yearly or "" (A1 above)
+fn ja_task_add(a: *mut Api, text: str, due: str, category: str, repeat: str) -> bool {
+    return task_op(a, "add", text, due, category, repeat)
+}
+
+fn ja_task_complete(a: *mut Api, ref_id: str) -> bool { return task_op(a, "complete", ref_id, "", "", "") }
+fn ja_task_remove(a: *mut Api, ref_id: str) -> bool { return task_op(a, "remove", ref_id, "", "", "") }
+
+// Register the push token (own relay or FCM) of this phone (-> AK_PUSH).
+fn ja_push_token(a: *mut Api, token: str, platform: str) -> bool {
+    rt.buf_clear(&(*a).req)
+    var w: json.JsonWriter = json.jw_new(&(*a).req, false)
+    json.jw_begin_object(&w)
+    jstr(&w, "token", token)
+    jstr(&w, "platform", platform)
+    json.jw_end(&w)
+    json.jw_free(&w)
+    return ja_post_json(a, AK_PUSH, JP_PUSH, "", "", (*a).req.ptr, (*a).req.len)
+}
+
+// Speech to text: the raw audio octets with their content type (-> AK_STT, body {"text":..}).
+fn ja_stt(a: *mut Api, audio: u64, n: usize, ctype: str, lang: str) -> bool {
+    var sfx: rt.Buf = rt.buf_new()
+    put(&sfx, "?lang=")
+    push_escaped(&sfx, lang.p as u64, lang.n)
+    make_url(a, JP_STT, "", as_str(&sfx))
+    rt.buf_free(&sfx)
+    return start(a, AK_STT, true, false, 0, "", audio, n, ctype)
+}
+
+// Upload a file as raw octets; the name goes in the query (-> AK_UPLOAD). See A1.
+fn ja_upload(a: *mut Api, name: str, mime: str, p: u64, n: usize, cid: str) -> bool {
+    var sfx: rt.Buf = rt.buf_new()
+    put(&sfx, "?name=")
+    push_escaped(&sfx, name.p as u64, name.n)
+    if cid.n > 0 {
+        put(&sfx, "&cid=")
+        push_escaped(&sfx, cid.p as u64, cid.n)
+    }
+    make_url(a, JP_UPLOAD, "", as_str(&sfx))
+    rt.buf_free(&sfx)
+    return start(a, AK_UPLOAD, true, false, 0, name, p, n, mime)
+}
+
+// Fetch a file the server named (`url` from a message: "/file/<uid>/<cid>/<name>" or "/img/...").
+// Only a path of the server is accepted (starts with "/", no "//" start) -> AK_DOWNLOAD.
+fn ja_download(a: *mut Api, url: str) -> bool {
+    if url.n < 2 || *(url.p) != 47 as u8 || *(url.p + 1) == 47 as u8 {
+        return false
+    }
+    rt.buf_clear(&(*a).url)
+    rt.buf_push_bytes(&(*a).url, (*a).base.ptr, (*a).base.len)
+    put(&(*a).url, url)
+    return start(a, AK_DOWNLOAD, false, false, 0, url, 0, 0, "")
+}
+
+// ------------------------------------------------------------------ JSON reads
+
+fn view(s: str.Span) -> str {
+    return str { p: s.p, n: s.n }
+}
+
+// A string member, or "" (missing, null, a number ...).
+fn gs(d: *mut json.Json, o: u32, name: str) -> str {
+    if o == json.JSON_NONE || json.json_kind(d, o) != json.JSON_OBJECT {
+        return ""
+    }
+    let n: u32 = json.json_get(d, o, name.p as u64, name.n)
+    if n == json.JSON_NONE || json.json_kind(d, n) != json.JSON_STRING {
+        return ""
+    }
+    return view(json.json_string(d, n))
+}
+
+fn gi(d: *mut json.Json, o: u32, name: str) -> i64 {
+    if o == json.JSON_NONE || json.json_kind(d, o) != json.JSON_OBJECT {
+        return 0
+    }
+    let n: u32 = json.json_get(d, o, name.p as u64, name.n)
+    if n == json.JSON_NONE || json.json_kind(d, n) != json.JSON_NUMBER {
+        return 0
+    }
+    if json.json_is_int(d, n) {
+        return json.json_int(d, n)
+    }
+    let f: f64 = json.json_number(d, n)
+    if f != f || f > 9.0e18 || f < -9.0e18 {
+        return 0
+    }
+    return f as i64
+}
+
+fn gb(d: *mut json.Json, o: u32, name: str) -> bool {
+    if o == json.JSON_NONE || json.json_kind(d, o) != json.JSON_OBJECT {
+        return false
+    }
+    let n: u32 = json.json_get(d, o, name.p as u64, name.n)
+    return n != json.JSON_NONE && json.json_kind(d, n) == json.JSON_TRUE
+}
+
+// Child node `name` when it has kind `kind`, else JSON_NONE.
+fn gc (d: *mut json.Json, o: u32, name: str, kind: u8) -> u32 {
+    if o == json.JSON_NONE || json.json_kind(d, o) != json.JSON_OBJECT {
+        return json.JSON_NONE
+    }
+    let n: u32 = json.json_get(d, o, name.p as u64, name.n)
+    if n == json.JSON_NONE || json.json_kind(d, n) != kind {
+        return json.JSON_NONE
+    }
+    return n
+}
+
+// Parse the body into `d`; the root must be an object. false = nothing usable.
+fn open_doc(d: *mut json.Json, p: u64, n: usize) -> bool {
+    if p == 0 || n == 0 {
+        return false
+    }
+    let ok: bool = json.json_parse(d, p, n) catch false
+    if !ok || json.json_kind(d, json.json_root(d)) != json.JSON_OBJECT {
+        return false
+    }
+    return true
+}
+
+// One string member of a JSON object body ("text" of the stt answer, "error" of a failed call ...).
+// Returns a COPY ("" when missing or broken).
+fn parse_text_field(p: u64, n: usize, name: str) -> str {
+    var d: json.Json = json.json_new()
+    var out: str = ""
+    if open_doc(&d, p, n) {
+        out = __str_copy(gs(&d, json.json_root(&d), name))
+    }
+    json.json_free(&d)
+    return out
+}
+
+// -------------------------------------------------------------------- results
+
+struct Me {
+    d: json.Json,
+    ok: bool,
+    username: str,
+    admin: bool,
+    device_token: str,
+}
+
+fn me_new() -> Me {
+    return Me { d: json.json_new(), ok: false, username: "", admin: false, device_token: "" }
+}
+
+fn me_free(m: *mut Me) { json.json_free(&(*m).d) }
+
+fn parse_me(p: u64, n: usize, m: *mut Me) -> bool {
+    if !open_doc(&(*m).d, p, n) { return false }
+    let o: u32 = json.json_root(&(*m).d)
+    (*m).username = gs(&(*m).d, o, "username")
+    (*m).admin = gb(&(*m).d, o, "admin")
+    (*m).device_token = gs(&(*m).d, o, "deviceToken")
+    (*m).ok = (*m).username.n > 0
+    return (*m).ok
+}
+
+struct ProjectRow {
+    id: str,
+    name: str,
+    status: str,
+    goal: str,
+    next: str,
+    updated: str,
+    total: i64,
+    done: i64,
+    open: i64,
+    pct: i64,
+    needs: i64,
+}
+
+fn project_row(d: *mut json.Json, o: u32) -> ProjectRow {
+    return ProjectRow { id: gs(d, o, "id"), name: gs(d, o, "name"), status: gs(d, o, "status"),
+        goal: gs(d, o, "goal"), next: gs(d, o, "next"), updated: gs(d, o, "updatedAt"),
+        total: gi(d, o, "total"), done: gi(d, o, "done"), open: gi(d, o, "open"), pct: gi(d, o, "pct"),
+        needs: gi(d, o, "needs") }
+}
+
+struct Projects {
+    d: json.Json,
+    rows: Vec[ProjectRow],
+    stale: i64,
+}
+
+fn projects_new() -> Projects {
+    return Projects { d: json.json_new(), rows: vec_new[ProjectRow](), stale: 0 }
+}
+
+fn projects_free(p: *mut Projects) {
+    vec_free[ProjectRow](&(*p).rows)
+    json.json_free(&(*p).d)
+}
+
+fn parse_projects(p: u64, n: usize, out: *mut Projects) -> bool {
+    if !open_doc(&(*out).d, p, n) { return false }
+    let o: u32 = json.json_root(&(*out).d)
+    let arr: u32 = gc (&(*out).d, o, "projects", json.JSON_ARRAY)
+    if arr == json.JSON_NONE { return false }
+    var e: u32 = json.json_child(&(*out).d, arr)
+    while e != json.JSON_NONE {
+        if json.json_kind(&(*out).d, e) == json.JSON_OBJECT {
+            let ok: bool = vec_push[ProjectRow](&(*out).rows, project_row(&(*out).d, e))
+        }
+        e = json.json_next(&(*out).d, e)
+    }
+    let st: u32 = gc (&(*out).d, o, "stale", json.JSON_ARRAY)
+    if st != json.JSON_NONE {
+        (*out).stale = json.json_count(&(*out).d, st) as i64
+    }
+    return true
+}
+
+struct RoadItem {
+    id: str,
+    text: str,
+    group: str,
+    note: str,
+    done: bool,
+}
+
+struct NeedItem {
+    id: str,
+    text: str,
+    answer: str,
+    cid: str,
+    done: bool,
+    opt0: usize, // first option in ProjectFull.opts
+    nopts: usize,
+}
+
+struct ChatRef {
+    id: str,
+    title: str,
+    running: bool,
+}
+
+struct ProjectFull {
+    d: json.Json,
+    info: ProjectRow,
+    roadmap: Vec[RoadItem],
+    needs: Vec[NeedItem],
+    opts: Vec[str],
+    chats: Vec[ChatRef],
+}
+
+fn pfull_new() -> ProjectFull {
+    return ProjectFull { d: json.json_new(), info: ProjectRow { id: "", name: "", status: "", goal: "", next: "",
+            updated: "", total: 0, done: 0, open: 0, pct: 0, needs: 0 },
+        roadmap: vec_new[RoadItem](), needs: vec_new[NeedItem](), opts: vec_new[str](), chats: vec_new[ChatRef]() }
+}
+
+fn pfull_free(f: *mut ProjectFull) {
+    vec_free[RoadItem](&(*f).roadmap)
+    vec_free[NeedItem](&(*f).needs)
+    vec_free[str](&(*f).opts)
+    vec_free[ChatRef](&(*f).chats)
+    json.json_free(&(*f).d)
+}
+
+// Option `i` of a need ("" when out of range).
+fn pfull_option(f: *mut ProjectFull, need: usize, i: usize) -> str {
+    if need >= vec_len[NeedItem](&(*f).needs) { return "" }
+    let nd: *mut NeedItem = vec_elem_ptr[NeedItem](&(*f).needs, need)
+    if i >= (*nd).nopts { return "" }
+    return *vec_elem_ptr[str](&(*f).opts, (*nd).opt0 + i)
+}
+
+// The answer of GET /api/projects/<id> and of every POST below it: {"project":{...}}.
+fn parse_project(p: u64, n: usize, out: *mut ProjectFull) -> bool {
+    if !open_doc(&(*out).d, p, n) { return false }
+    let d: *mut json.Json = &(*out).d
+    let pr: u32 = gc (d, json.json_root(d), "project", json.JSON_OBJECT)
+    if pr == json.JSON_NONE { return false }
+    (*out).info = project_row(d, pr)
+    let rm: u32 = gc (d, pr, "roadmap", json.JSON_ARRAY)
+    if rm != json.JSON_NONE {
+        var e: u32 = json.json_child(d, rm)
+        while e != json.JSON_NONE {
+            if json.json_kind(d, e) == json.JSON_OBJECT {
+                let ok: bool = vec_push[RoadItem](&(*out).roadmap, RoadItem { id: gs(d, e, "id"), text: gs(d, e, "text"),
+                        group: gs(d, e, "group"), note: gs(d, e, "note"), done: gb(d, e, "done") })
+            }
+            e = json.json_next(d, e)
+        }
+    }
+    // in the full project "needs" is the LIST (the summary's count is overwritten): count the open ones
+    (*out).info.needs = 0
+    let nl: u32 = gc (d, pr, "needs", json.JSON_ARRAY)
+    if nl != json.JSON_NONE {
+        var e2: u32 = json.json_child(d, nl)
+        while e2 != json.JSON_NONE {
+            if json.json_kind(d, e2) == json.JSON_OBJECT {
+                let o0: usize = vec_len[str](&(*out).opts)
+                var k: usize = 0
+                let ol: u32 = gc (d, e2, "options", json.JSON_ARRAY)
+                if ol != json.JSON_NONE {
+                    var oe: u32 = json.json_child(d, ol)
+                    while oe != json.JSON_NONE {
+                        if json.json_kind(d, oe) == json.JSON_STRING {
+                            let ok2: bool = vec_push[str](&(*out).opts, view(json.json_string(d, oe)))
+                            k = k + 1
+                        }
+                        oe = json.json_next(d, oe)
+                    }
+                }
+                if !gb(d, e2, "done") {
+                    (*out).info.needs = (*out).info.needs + 1
+                }
+                let ok3: bool = vec_push[NeedItem](&(*out).needs, NeedItem { id: gs(d, e2, "id"), text: gs(d, e2, "text"),
+                        answer: gs(d, e2, "answer"), cid: gs(d, e2, "cid"), done: gb(d, e2, "done"), opt0: o0, nopts: k })
+            }
+            e2 = json.json_next(d, e2)
+        }
+    }
+    let ch: u32 = gc (d, pr, "chats", json.JSON_ARRAY)
+    if ch != json.JSON_NONE {
+        var e3: u32 = json.json_child(d, ch)
+        while e3 != json.JSON_NONE {
+            if json.json_kind(d, e3) == json.JSON_OBJECT {
+                let ok4: bool = vec_push[ChatRef](&(*out).chats, ChatRef { id: gs(d, e3, "id"), title: gs(d, e3, "title"),
+                        running: gb(d, e3, "running") })
+            }
+            e3 = json.json_next(d, e3)
+        }
+    }
+    return true
+}
+
+struct WorkerRow {
+    id: str,
+    title: str,
+    last: str,
+    partial: str,
+    updated: i64,
+    running: bool,
+}
+
+struct ActRow {
+    cid: str,
+    conv: str,
+    role: str,
+    text: str,
+    at: str,
+}
+
+struct TaskRow {
+    id: str, // the string id, or "" when the server sends a number (then id_n)
+    id_n: i64,
+    text: str,
+    due: str,
+    category: str,
+    repeat: str,
+    done: bool,
+    overdue: bool,
+}
+
+struct Center {
+    d: json.Json,
+    user: str,
+    now: i64,
+    workers: Vec[WorkerRow],
+    activity: Vec[ActRow],
+    tasks: Vec[TaskRow],
+    devices: Vec[str],
+    orch_id: str,
+    orch_title: str,
+    orch_running: bool,
+    other_chats: i64,
+    host: str,
+    cpus: i64,
+    mem_total: i64,
+    mem_free: i64,
+    disk_total: i64,
+    disk_free: i64,
+    uptime: i64,
+    load1: f64,
+    memory_count: i64,
+}
+
+fn center_new() -> Center {
+    return Center { d: json.json_new(), user: "", now: 0, workers: vec_new[WorkerRow](),
+        activity: vec_new[ActRow](), tasks: vec_new[TaskRow](), devices: vec_new[str](), orch_id: "",
+        orch_title: "", orch_running: false, other_chats: 0, host: "", cpus: 0, mem_total: 0, mem_free: 0,
+        disk_total: 0, disk_free: 0, uptime: 0, load1: 0.0, memory_count: 0 }
+}
+
+fn center_free(c: *mut Center) {
+    vec_free[WorkerRow](&(*c).workers)
+    vec_free[ActRow](&(*c).activity)
+    vec_free[TaskRow](&(*c).tasks)
+    vec_free[str](&(*c).devices)
+    json.json_free(&(*c).d)
+}
+
+fn task_row(d: *mut json.Json, e: u32) -> TaskRow {
+    return TaskRow { id: gs(d, e, "id"), id_n: gi(d, e, "id"), text: gs(d, e, "text"), due: gs(d, e, "due"),
+        category: gs(d, e, "category"), repeat: gs(d, e, "repeat"), done: gb(d, e, "done"), overdue: gb(d, e, "overdue") }
+}
+
+fn parse_task_array(d: *mut json.Json, arr: u32, out: *mut Vec[TaskRow]) {
+    var e: u32 = json.json_child(d, arr)
+    while e != json.JSON_NONE {
+        if json.json_kind(d, e) == json.JSON_OBJECT {
+            let ok: bool = vec_push[TaskRow](out, task_row(d, e))
+        }
+        e = json.json_next(d, e)
+    }
+}
+
+fn parse_center(p: u64, n: usize, out: *mut Center) -> bool {
+    if !open_doc(&(*out).d, p, n) { return false }
+    let d: *mut json.Json = &(*out).d
+    let o: u32 = json.json_root(d)
+    (*out).user = gs(d, o, "user")
+    (*out).now = gi(d, o, "now")
+    (*out).other_chats = gi(d, o, "otherChatCount")
+    let ws: u32 = gc (d, o, "workers", json.JSON_ARRAY)
+    if ws != json.JSON_NONE {
+        var e: u32 = json.json_child(d, ws)
+        while e != json.JSON_NONE {
+            if json.json_kind(d, e) == json.JSON_OBJECT {
+                let ok: bool = vec_push[WorkerRow](&(*out).workers, WorkerRow { id: gs(d, e, "id"), title: gs(d, e, "title"),
+                        last: gs(d, e, "last"), partial: gs(d, e, "partial"), updated: gi(d, e, "updatedAt"), running: gb(d, e, "running") })
+            }
+            e = json.json_next(d, e)
+        }
+    }
+    let orch: u32 = gc (d, o, "orchestrator", json.JSON_OBJECT)
+    if orch != json.JSON_NONE {
+        (*out).orch_id = gs(d, orch, "id")
+        (*out).orch_title = gs(d, orch, "title")
+        (*out).orch_running = gb(d, orch, "running")
+    }
+    let ts: u32 = gc (d, o, "tasks", json.JSON_ARRAY)
+    if ts != json.JSON_NONE {
+        parse_task_array(d, ts, &(*out).tasks)
+    }
+    let dv: u32 = gc (d, o, "devices", json.JSON_ARRAY)
+    if dv != json.JSON_NONE {
+        var e2: u32 = json.json_child(d, dv)
+        while e2 != json.JSON_NONE {
+            if json.json_kind(d, e2) == json.JSON_STRING {
+                let ok2: bool = vec_push[str](&(*out).devices, view(json.json_string(d, e2)))
+            }
+            e2 = json.json_next(d, e2)
+        }
+    }
+    let sy: u32 = gc (d, o, "sys", json.JSON_OBJECT)
+    if sy != json.JSON_NONE {
+        (*out).host = gs(d, sy, "host")
+        (*out).cpus = gi(d, sy, "cpus")
+        (*out).mem_total = gi(d, sy, "memTotal")
+        (*out).mem_free = gi(d, sy, "memFree")
+        (*out).uptime = gi(d, sy, "uptime")
+        let ld: u32 = gc (d, sy, "load", json.JSON_ARRAY)
+        if ld != json.JSON_NONE {
+            let f0: u32 = json.json_child(d, ld)
+            if f0 != json.JSON_NONE && json.json_kind(d, f0) == json.JSON_NUMBER {
+                (*out).load1 = json.json_number(d, f0)
+            }
+        }
+        let dk: u32 = gc (d, sy, "disk", json.JSON_OBJECT)
+        if dk != json.JSON_NONE {
+            (*out).disk_total = gi(d, dk, "total")
+            (*out).disk_free = gi(d, dk, "free")
+        }
+    }
+    let mem: u32 = gc (d, o, "memory", json.JSON_OBJECT)
+    if mem != json.JSON_NONE {
+        (*out).memory_count = gi(d, mem, "count")
+    }
+    let ac: u32 = gc (d, o, "activity", json.JSON_ARRAY)
+    if ac != json.JSON_NONE {
+        var e3: u32 = json.json_child(d, ac)
+        while e3 != json.JSON_NONE {
+            if json.json_kind(d, e3) == json.JSON_OBJECT {
+                let ok3: bool = vec_push[ActRow](&(*out).activity, ActRow { cid: gs(d, e3, "cid"), conv: gs(d, e3, "conv"),
+                        role: gs(d, e3, "role"), text: gs(d, e3, "text"), at: gs(d, e3, "at") })
+            }
+            e3 = json.json_next(d, e3)
+        }
+    }
+    return true
+}
+
+struct ConvRow {
+    id: str,
+    title: str,
+    kind: str,
+    updated: i64,
+    fav: bool,
+}
+
+struct Convs {
+    d: json.Json,
+    rows: Vec[ConvRow],
+    total: i64,
+    unchanged: bool,
+}
+
+fn convs_new() -> Convs {
+    return Convs { d: json.json_new(), rows: vec_new[ConvRow](), total: 0, unchanged: false }
+}
+
+fn convs_free(c: *mut Convs) {
+    vec_free[ConvRow](&(*c).rows)
+    json.json_free(&(*c).d)
+}
+
+// {"conversations":[...], "total":N}; the key is `conversations` (list route).
+fn parse_convs(p: u64, n: usize, out: *mut Convs) -> bool {
+    if !open_doc(&(*out).d, p, n) { return false }
+    let d: *mut json.Json = &(*out).d
+    let o: u32 = json.json_root(d)
+    (*out).unchanged = gb(d, o, "unchanged")
+    (*out).total = gi(d, o, "total")
+    let arr: u32 = gc (d, o, "conversations", json.JSON_ARRAY)
+    if arr == json.JSON_NONE { return (*out).unchanged }
+    var e: u32 = json.json_child(d, arr)
+    while e != json.JSON_NONE {
+        if json.json_kind(d, e) == json.JSON_OBJECT {
+            let ok: bool = vec_push[ConvRow](&(*out).rows, ConvRow { id: gs(d, e, "id"), title: gs(d, e, "title"),
+                    kind: gs(d, e, "kind"), updated: gi(d, e, "updatedAt"), fav: gb(d, e, "fav") })
+        }
+        e = json.json_next(d, e)
+    }
+    if (*out).total == 0 {
+        (*out).total = vec_len[ConvRow](&(*out).rows) as i64
+    }
+    return true
+}
+
+struct Msg {
+    role: str,
+    text: str,
+    at: str,
+}
+
+struct Conv {
+    d: json.Json,
+    id: str,
+    title: str,
+    msgs: Vec[Msg],
+    running: bool,
+    partial: str,
+}
+
+fn conv_new() -> Conv {
+    return Conv { d: json.json_new(), id: "", title: "", msgs: vec_new[Msg](), running: false, partial: "" }
+}
+
+fn conv_free(c: *mut Conv) {
+    vec_free[Msg](&(*c).msgs)
+    json.json_free(&(*c).d)
+}
+
+// {"conversation":{"id","title","messages":[{role,text,at}]}, "running":bool, "partial":".."}
+fn parse_conv(p: u64, n: usize, out: *mut Conv) -> bool {
+    if !open_doc(&(*out).d, p, n) { return false }
+    let d: *mut json.Json = &(*out).d
+    let o: u32 = json.json_root(d)
+    (*out).running = gb(d, o, "running")
+    (*out).partial = gs(d, o, "partial")
+    let cv: u32 = gc (d, o, "conversation", json.JSON_OBJECT)
+    if cv == json.JSON_NONE { return false }
+    (*out).id = gs(d, cv, "id")
+    (*out).title = gs(d, cv, "title")
+    let ms: u32 = gc (d, cv, "messages", json.JSON_ARRAY)
+    if ms == json.JSON_NONE { return false }
+    var e: u32 = json.json_child(d, ms)
+    while e != json.JSON_NONE {
+        if json.json_kind(d, e) == json.JSON_OBJECT {
+            let ok: bool = vec_push[Msg](&(*out).msgs, Msg { role: gs(d, e, "role"), text: gs(d, e, "text"), at: gs(d, e, "at") })
+        }
+        e = json.json_next(d, e)
+    }
+    return true
+}
+
+struct Tasks {
+    d: json.Json,
+    rows: Vec[TaskRow],
+}
+
+fn tasks_new() -> Tasks {
+    return Tasks { d: json.json_new(), rows: vec_new[TaskRow]() }
+}
+
+fn tasks_free(t: *mut Tasks) {
+    vec_free[TaskRow](&(*t).rows)
+    json.json_free(&(*t).d)
+}
+
+fn parse_tasks(p: u64, n: usize, out: *mut Tasks) -> bool {
+    if !open_doc(&(*out).d, p, n) { return false }
+    let d: *mut json.Json = &(*out).d
+    let arr: u32 = gc (d, json.json_root(d), "tasks", json.JSON_ARRAY)
+    if arr == json.JSON_NONE { return false }
+    parse_task_array(d, arr, &(*out).rows)
+    return true
+}
+
+struct DeviceRow {
+    name: str,
+    kind: str,
+    online: bool,
+}
+
+struct Devices {
+    d: json.Json,
+    names: Vec[str],
+    rows: Vec[DeviceRow],
+}
+
+fn devices_new() -> Devices {
+    return Devices { d: json.json_new(), names: vec_new[str](), rows: vec_new[DeviceRow]() }
+}
+
+fn devices_free(v: *mut Devices) {
+    vec_free[str](&(*v).names)
+    vec_free[DeviceRow](&(*v).rows)
+    json.json_free(&(*v).d)
+}
+
+// {"devices":["Dell",...], "deviceInfo":[{name,type,online}]}
+fn parse_devices(p: u64, n: usize, out: *mut Devices) -> bool {
+    if !open_doc(&(*out).d, p, n) { return false }
+    let d: *mut json.Json = &(*out).d
+    let o: u32 = json.json_root(d)
+    let dv: u32 = gc (d, o, "devices", json.JSON_ARRAY)
+    if dv == json.JSON_NONE { return false }
+    var e: u32 = json.json_child(d, dv)
+    while e != json.JSON_NONE {
+        if json.json_kind(d, e) == json.JSON_STRING {
+            let ok: bool = vec_push[str](&(*out).names, view(json.json_string(d, e)))
+        }
+        e = json.json_next(d, e)
+    }
+    let di: u32 = gc (d, o, "deviceInfo", json.JSON_ARRAY)
+    if di != json.JSON_NONE {
+        var e2: u32 = json.json_child(d, di)
+        while e2 != json.JSON_NONE {
+            if json.json_kind(d, e2) == json.JSON_OBJECT {
+                let ok2: bool = vec_push[DeviceRow](&(*out).rows, DeviceRow { name: gs(d, e2, "name"), kind: gs(d, e2, "type"),
+                        online: gb(d, e2, "online") })
+            }
+            e2 = json.json_next(d, e2)
+        }
+    }
+    return true
+}
+
+struct Uploaded {
+    d: json.Json,
+    name: str,
+    mime: str,
+    url: str, // the path to give ja_download / to put in a chat message
+    size: i64,
+}
+
+fn uploaded_new() -> Uploaded {
+    return Uploaded { d: json.json_new(), name: "", mime: "", url: "", size: 0 }
+}
+
+fn uploaded_free(u: *mut Uploaded) { json.json_free(&(*u).d) }
+
+// {"file":{"name","size","mime","url"}} -- the answer of JP_UPLOAD (A1).
+fn parse_upload(p: u64, n: usize, out: *mut Uploaded) -> bool {
+    if !open_doc(&(*out).d, p, n) { return false }
+    let d: *mut json.Json = &(*out).d
+    let f: u32 = gc (d, json.json_root(d), "file", json.JSON_OBJECT)
+    if f == json.JSON_NONE { return false }
+    (*out).name = gs(d, f, "name")
+    (*out).mime = gs(d, f, "mime")
+    (*out).url = gs(d, f, "url")
+    (*out).size = gi(d, f, "size")
+    return (*out).url.n > 0
+}

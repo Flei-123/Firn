@@ -1,0 +1,156 @@
+// expect_exit: 0
+// tests/3720_net_jarvisapi_parse.fi -- net.jarvisapi parsers + net.jarvis_cache: fixtures in the shape of
+// server.js answers, every cut of every fixture (a proper prefix of a JSON object is refused, never a
+// crash), 2000 seeded byte mutations, and the cache (atomic put, keys with odd octets, age, remove).
+// The network side (cookie, paths, writes, offline 203) is tools/mini/api_check.py against fake_jarvis.py.
+import std.rt
+import std.str
+import std.vec
+import std.fs
+import std.time
+import net.jarvisapi
+import net.jarvis_cache
+
+static mut failures: i32 = 0
+
+fn check(name: str, ok: bool) {
+    if !ok {
+        failures += 1
+        rt.write_everything(1, "  FAIL  ".p as u64, 8)
+        rt.write_everything(1, name.p as u64, name.n)
+        rt.write_everything(1, "\n".p as u64, 1)
+    }
+}
+
+const F_PROJECTS: str = "{\"projects\":[{\"id\":\"p1\",\"name\":\"A \\\"q\\\" \\u00e4\\ud83d\\ude00\",\"status\":\"active\",\"total\":4,\"done\":1,\"open\":3,\"pct\":25,\"needs\":2,\"updatedAt\":\"x\"},{\"id\":\"p2\"}],\"stale\":[1,2]}"
+const F_PROJECT: str = "{\"project\":{\"id\":\"p1\",\"name\":\"N\",\"roadmap\":[{\"id\":\"r1\",\"text\":\"t\",\"done\":true}],\"needs\":[{\"id\":\"n1\",\"text\":\"q\",\"options\":[\"a\",\"b\"],\"cid\":null,\"done\":false},{\"id\":\"n2\",\"done\":true}],\"chats\":[{\"id\":\"c\",\"title\":\"T\",\"running\":true}]}}"
+const F_CENTER: str = "{\"now\":5,\"user\":\"j\",\"workers\":[{\"id\":\"w\",\"running\":true,\"updatedAt\":9}],\"orchestrator\":null,\"tasks\":[{\"id\":7,\"text\":\"x\",\"due\":null}],\"devices\":[\"D\",3],\"sys\":{\"load\":[1.5,2],\"disk\":{\"total\":10,\"free\":4}},\"activity\":[{\"cid\":\"c\"}]}"
+const F_CONVS: str = "{\"conversations\":[{\"id\":\"a\",\"updatedAt\":1.5e3,\"fav\":true},{\"id\":\"b\"}],\"total\":2}"
+const F_CONV: str = "{\"conversation\":{\"id\":\"a\",\"messages\":[{\"role\":\"user\",\"text\":\"hi\"},{\"role\":\"assistant\",\"text\":\"yo\"}]},\"running\":true,\"partial\":\"p\"}"
+const F_TASKS: str = "{\"tasks\":[{\"id\":\"t1\",\"text\":\"a\",\"done\":false,\"repeat\":\"none\"}]}"
+const F_DEVICES: str = "{\"devices\":[\"Dell\"],\"deviceInfo\":[{\"name\":\"Dell\",\"type\":\"Windows\",\"online\":true}]}"
+
+// run kind k (0..6) over one input; true = parser accepted it
+fn run(k: i32, p: u64, n: usize) -> bool {
+    var ok: bool = false
+    if k == 0 { var m: jarvisapi.Projects = jarvisapi.projects_new(); ok = jarvisapi.parse_projects(p, n, &m); jarvisapi.projects_free(&m) }
+    else if k == 1 { var m: jarvisapi.ProjectFull = jarvisapi.pfull_new(); ok = jarvisapi.parse_project(p, n, &m); jarvisapi.pfull_free(&m) }
+    else if k == 2 { var m: jarvisapi.Center = jarvisapi.center_new(); ok = jarvisapi.parse_center(p, n, &m); jarvisapi.center_free(&m) }
+    else if k == 3 { var m: jarvisapi.Convs = jarvisapi.convs_new(); ok = jarvisapi.parse_convs(p, n, &m); jarvisapi.convs_free(&m) }
+    else if k == 4 { var m: jarvisapi.Conv = jarvisapi.conv_new(); ok = jarvisapi.parse_conv(p, n, &m); jarvisapi.conv_free(&m) }
+    else if k == 5 { var m: jarvisapi.Tasks = jarvisapi.tasks_new(); ok = jarvisapi.parse_tasks(p, n, &m); jarvisapi.tasks_free(&m) }
+    else { var m: jarvisapi.Devices = jarvisapi.devices_new(); ok = jarvisapi.parse_devices(p, n, &m); jarvisapi.devices_free(&m) }
+    return ok
+}
+
+fn fixture(k: i32) -> str {
+    if k == 0 { return F_PROJECTS }
+    if k == 1 { return F_PROJECT }
+    if k == 2 { return F_CENTER }
+    if k == 3 { return F_CONVS }
+    if k == 4 { return F_CONV }
+    if k == 5 { return F_TASKS }
+    return F_DEVICES
+}
+
+fn dec(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    let s: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+fn main() -> i32 {
+    // 1. fixtures parse; fields are what the server sent
+    var k: i32 = 0
+    while k < 7 {
+        let f: str = fixture(k)
+        check("fixture parses " + dec(k as i64), run(k, f.p as u64, f.n))
+        k += 1
+    }
+    var pr: jarvisapi.Projects = jarvisapi.projects_new()
+    check("projects", jarvisapi.parse_projects(F_PROJECTS.p as u64, F_PROJECTS.n, &pr))
+    let r0: *mut jarvisapi.ProjectRow = vec_elem_ptr[jarvisapi.ProjectRow](&pr.rows, 0)
+    check("escaped name", (*r0).name == "A \"q\" ä\u{1F600}" && (*r0).pct == 25 && pr.stale == 2 && vec_len[jarvisapi.ProjectRow](&pr.rows) == 2)
+    jarvisapi.projects_free(&pr)
+    var ce: jarvisapi.Center = jarvisapi.center_new()
+    check("center", jarvisapi.parse_center(F_CENTER.p as u64, F_CENTER.n, &ce))
+    let t0: *mut jarvisapi.TaskRow = vec_elem_ptr[jarvisapi.TaskRow](&ce.tasks, 0)
+    check("numeric task id -> id_n, wrong types become empty", (*t0).id_n == 7 && (*t0).id == "" && (*t0).due == "" && vec_len[str](&ce.devices) == 1 && ce.load1 > 1.49 && ce.orch_id == "")
+    jarvisapi.center_free(&ce)
+    var cv: jarvisapi.Convs = jarvisapi.convs_new()
+    check("convs", jarvisapi.parse_convs(F_CONVS.p as u64, F_CONVS.n, &cv))
+    let c0: *mut jarvisapi.ConvRow = vec_elem_ptr[jarvisapi.ConvRow](&cv.rows, 0)
+    check("float updatedAt is truncated", (*c0).updated == 1500 && (*c0).fav)
+    jarvisapi.convs_free(&cv)
+
+    // 2. every proper prefix of every fixture is refused
+    k = 0
+    var cut_ok: i32 = 0
+    while k < 7 {
+        let f: str = fixture(k)
+        var n: usize = 0
+        while n < f.n {
+            if run(k, f.p as u64, n) { cut_ok += 1 }
+            n += 1
+        }
+        k += 1
+    }
+    check("no cut document accepted", cut_ok == 0)
+    // wrong shapes / empty / garbage
+    check("empty", !run(0, 0, 0))
+    check("array root", !run(1, "[1]".p as u64, 3))
+    check("wrong key", !run(5, "{\"x\":[]}".p as u64, 8))
+    check("projects as string", !run(0, "{\"projects\":\"x\"}".p as u64, 16))
+
+    // 3. seeded byte mutations: must not crash (result either way)
+    var seed: u64 = 88172645463325252
+    var it: i32 = 0
+    var acc: i32 = 0
+    while it < 2000 {
+        let kk: i32 = it % 7
+        let f: str = fixture(kk)
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&b, f.p as u64, f.n)
+        var m: i32 = 0
+        while m < 3 {
+            seed ^= seed << 13
+            seed ^= seed >> 7
+            seed ^= seed << 17
+            let at: usize = (seed % (f.n as u64)) as usize
+            *((b.ptr + at as u64) as *mut u8) = ((seed >> 20) & 255) as u8
+            m += 1
+        }
+        if run(kk, b.ptr, b.len) { acc += 1 }
+        rt.buf_free(&b)
+        it += 1
+    }
+    check("mutations survived", acc >= 0)
+
+    // 4. the cache
+    let dir: str = "/tmp/jarvis_cache_t3720_" + dec(time.now_unix_ms())
+    var c: jarvis_cache.Cache = jarvis_cache.cache_new(dir + "/")
+    check("miss", !jarvis_cache.cache_has(&c, "projects") && jarvis_cache.cache_age_s(&c, "projects") == 0 - 1)
+    check("put", jarvis_cache.cache_put(&c, "projects", F_PROJECTS.p as u64, F_PROJECTS.n))
+    check("second put (dir exists)", jarvis_cache.cache_put(&c, "projects", F_TASKS.p as u64, F_TASKS.n))
+    var o: rt.Buf = rt.buf_new()
+    check("get = newest", jarvis_cache.cache_get(&c, "projects", &o) && o.len == F_TASKS.n && rt.mem_eq(o.ptr, F_TASKS.p as u64, F_TASKS.n))
+    check("age", jarvis_cache.cache_age_s(&c, "projects") >= 0 && jarvis_cache.cache_age_s(&c, "projects") < 30)
+    var bin: [u8; 5] = [0 as u8, 255 as u8, 10 as u8, 47 as u8, 0 as u8]
+    check("odd key + binary body", jarvis_cache.cache_put(&c, "../etc/p w/1\n", (&bin[0]) as u64, 5) && jarvis_cache.cache_get(&c, "../etc/p w/1\n", &o) && o.len == 5 && rt.mem_eq(o.ptr, (&bin[0]) as u64, 5))
+    check("key stays inside the dir", fs.is_file(jarvis_cache.cache_file_for(&c, "../etc/p w/1\n")) && !fs.exists("/tmp/etc"))
+    check("empty key refused", !jarvis_cache.cache_put(&c, "", F_TASKS.p as u64, 3))
+    check("remove", jarvis_cache.cache_remove(&c, "projects") && !jarvis_cache.cache_has(&c, "projects"))
+    check("clear", jarvis_cache.cache_clear(&c) && !fs.exists(dir))
+    var bad: jarvis_cache.Cache = jarvis_cache.cache_new("/proc/nope")
+    check("unwritable dir", !jarvis_cache.cache_put(&bad, "k", F_TASKS.p as u64, 3))
+    jarvis_cache.cache_free(&bad)
+    rt.buf_free(&o)
+    jarvis_cache.cache_free(&c)
+    if failures == 0 {
+        rt.write_everything(1, "OK\n".p as u64, 3)
+        return 0
+    }
+    return 1
+}

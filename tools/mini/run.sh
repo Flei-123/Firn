@@ -14,6 +14,9 @@ rc=0
 "$FIRNC" --opt-level=dev-fast -o "$WORK/pump" tools/mini/pump_main.fi 2>&1 | grep -v RWX
 echo "== 1. jarvisc vs fake server =="
 python3 tools/mini/check.py "$WORK/client" | tail -3 || rc=1
+"$FIRNC" --opt-level=dev-fast -o "$WORK/apiclient" tools/mini/api_main.fi 2>&1 | grep -v RWX
+echo "== 1b. jarvisapi + jarvis_cache vs fake server (REST, offline cache) =="
+python3 tools/mini/api_check.py "$WORK/apiclient" | tail -3 || rc=1
 echo "== 2. window + loop in one thread (Xvfb) =="
 if command -v Xvfb >/dev/null; then
     d=$((200 + RANDOM % 50))

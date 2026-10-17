@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/jarvis_cache.fi -- an offline cache for the JARVIS REST client: the
+// last good answer per key, one file per key in the app data directory.
+//
+//     import net.jarvis_cache
+//
+//     var c: jarvis_cache.Cache = jarvis_cache.cache_new("/data/data/org/files/jcache")
+//     jarvis_cache.cache_put(&c, "projects", body_ptr, body_len)     // atomic
+//     var b: rt.Buf = rt.buf_new()
+//     if jarvis_cache.cache_get(&c, "projects", &b) { ... }          // the last body
+//     let age: i64 = jarvis_cache.cache_age_s(&c, "projects")         // -1 = none
+//
+// The file is written to a temporary name next to the target, synced and
+// renamed (`fs.write_atomic`): a reader sees the old or the new answer, never
+// half of one, and a crash in the middle leaves the old answer. The key may
+// hold any octets: everything outside [A-Za-z0-9._-] becomes `%XX`, so a key
+// can never leave the directory (no `/`, no `..` as a name of its own).
+//
+// HONEST
+//   C1  The age is the file's modification time against the wall clock; a
+//       phone clock that was set back gives a negative age (reported as 0).
+//   C2  No size limit and no expiry: the caller drops keys it no longer wants
+//       (`cache_remove`, `cache_clear`). One answer is held in memory while it
+//       is read or written.
+//   C3  The directory is created on the first `cache_put` (`fs.mkdir_all`);
+//       a directory that cannot be created makes `cache_put` return false.
+import std.rt
+import std.fs
+import std.time
+
+export {
+    Cache,
+    cache_new, cache_free, cache_dir, cache_file_for,
+    cache_put, cache_get, cache_has, cache_age_s, cache_remove, cache_clear,
+}
+
+const SUFFIX: str = ".jc"
+
+struct Cache {
+    dir: rt.Buf,
+}
+
+fn cache_new(dir: str) -> Cache {
+    var c: Cache = Cache { dir: rt.buf_new() }
+    var n: usize = dir.n
+    while n > 1 && *(dir.p + n - 1) == 47 as u8 {
+        n = n - 1
+    }
+    rt.buf_push_bytes(&c.dir, dir.p as u64, n)
+    return c
+}
+
+fn cache_free(c: *mut Cache) {
+    rt.buf_free(&(*c).dir)
+}
+
+fn cache_dir(c: *mut Cache) -> str {
+    return __str_copy(str { p: (*c).dir.ptr as *mut u8, n: (*c).dir.len })
+}
+
+fn is_safe(ch: u8) -> bool {
+    return (ch >= 48 as u8 && ch <= 57 as u8) || (ch >= 65 as u8 && ch <= 90 as u8)
+    || (ch >= 97 as u8 && ch <= 122 as u8) || ch == 45 as u8 || ch == 95 as u8 || ch == 46 as u8
+}
+
+// <dir>/<escaped key>.jc ; the suffix keeps "." and ".." from being file names.
+fn file_into(c: *mut Cache, key: str, out: *mut rt.Buf) {
+    rt.buf_push_bytes(out, (*c).dir.ptr, (*c).dir.len)
+    rt.buf_push(out, 47 as u8)
+    let hex: str = "0123456789ABCDEF"
+    var i: usize = 0
+    while i < key.n {
+        let ch: u8 = *(key.p + i)
+        if is_safe(ch) {
+            rt.buf_push(out, ch)
+        } else {
+            rt.buf_push(out, 37 as u8)
+            rt.buf_push(out, *(hex.p + (ch >> 4) as usize))
+            rt.buf_push(out, *(hex.p + (ch & 15 as u8) as usize))
+        }
+        i = i + 1
+    }
+    rt.buf_push_bytes(out, SUFFIX.p as u64, SUFFIX.n)
+}
+
+fn cache_file_for(c: *mut Cache, key: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    file_into(c, key, &b)
+    let s: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+// Store `n` octets under `key`, atomically. false = the directory or the file
+// could not be written (the old answer, if any, is untouched).
+fn cache_put(c: *mut Cache, key: str, p: u64, n: usize) -> bool {
+    if (*c).dir.len == 0 || key.n == 0 {
+        return false
+    }
+    let d: str = cache_dir(c)
+    if !fs.is_dir(d) {
+        let made: bool = fs.mkdir_all(d) catch false
+        if !fs.is_dir(d) {
+            return false
+        }
+    }
+    let path: str = cache_file_for(c, key)
+    let ok: bool = fs.write_atomic(path, p, n) catch false
+    return ok
+}
+
+// Read the stored answer into `out` (cleared first). false = nothing stored.
+fn cache_get(c: *mut Cache, key: str, out: *mut rt.Buf) -> bool {
+    rt.buf_clear(out)
+    if (*c).dir.len == 0 || key.n == 0 {
+        return false
+    }
+    let path: str = cache_file_for(c, key)
+    let n: usize = fs.read_file(path, out) catch 0
+    if n == 0 {
+        rt.buf_clear(out)
+        return false
+    }
+    return true
+}
+
+fn cache_has(c: *mut Cache, key: str) -> bool {
+    if (*c).dir.len == 0 || key.n == 0 {
+        return false
+    }
+    return fs.is_file(cache_file_for(c, key))
+}
+
+// Seconds since the answer was stored; -1 = there is none.
+fn cache_age_s(c: *mut Cache, key: str) -> i64 {
+    if (*c).dir.len == 0 || key.n == 0 {
+        return -1
+    }
+    let path: str = cache_file_for(c, key)
+    var found: bool = true
+    let fi: fs.FileInfo = fs.stat(path) catch fs.FileInfo { kind: 0 as u8, mode: 0, size: 0, mtime_ns: -1 }
+    if fi.mtime_ns < 0 {
+        found = false
+    }
+    if !found {
+        return -1
+    }
+    let now_ms: i64 = time.now_unix_ms()
+    let age_ms: i64 = now_ms - fi.mtime_ns / 1000000
+    if age_ms < 0 {
+        return 0
+    }
+    return age_ms / 1000
+}
+
+fn cache_remove(c: *mut Cache, key: str) -> bool {
+    if (*c).dir.len == 0 || key.n == 0 {
+        return false
+    }
+    let ok: bool = fs.remove(cache_file_for(c, key)) catch false
+    return ok
+}
+
+// Drop the whole directory (the next cache_put creates it again).
+fn cache_clear(c: *mut Cache) -> bool {
+    if (*c).dir.len == 0 {
+        return false
+    }
+    let ok: bool = fs.remove_tree(cache_dir(c)) catch false
+    return ok
+}

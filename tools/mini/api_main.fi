@@ -1,0 +1,330 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/mini/api_main.fi <base-url> <cache-dir> -- net.jarvisapi (+ net.jarvis_cache) against
+// tools/mini/fake_jarvis.py (driven by tools/mini/api_check.py, which then reads what the
+// SERVER saw). A script of requests, one after the other from the callback: no login -> 401,
+// login, me, projects, project (odd id), roadmap / need / status writes, command center,
+// chats, tasks, devices, push token, stt, upload + download, a cut answer, the offline cache
+// (base switched to a closed port), a stale token, and the cookie shared with net.jarvisc.
+// Prints "ok <what>" / "FAIL <what>" and "API CLIENT OK" at the end.
+import std.rt
+import std.str
+import std.vec
+import async.loop
+import net.jarvisc
+import net.jarvisapi
+import net.jarvis_cache
+
+static mut fails: u32 = 0
+static mut checks: u32 = 0
+static mut step: i32 = 0
+static mut loop_ptr: u64 = 0
+static mut cache_ptr: u64 = 0
+static mut jc_ptr: u64 = 0
+static mut base_ptr: u64 = 0
+static mut base_n: usize = 0
+static mut up_url: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut payload: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+    rt.write_everything(1, "\n".p as u64, 1)
+}
+
+fn check(ok: bool, what: str) {
+    checks = checks + 1
+    if ok {
+        say("ok " + what)
+    } else {
+        fails = fails + 1
+        say("FAIL " + what)
+    }
+}
+
+fn dec(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    let s: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+fn on_timeout(l: *mut loop.Loop, ud: u64) {
+    check(false, "finished in time (step " + dec(step as i64) + ")")
+    loop.stop(l)
+}
+
+fn issue(a: *mut jarvisapi.Api) {
+    let s: i32 = step
+    if s == 0 { check(jarvisapi.ja_me(a), "me before login started") }
+    else if s == 1 { check(jarvisapi.ja_login(a, "justin", "wrong"), "wrong login started") }
+    else if s == 2 { check(jarvisapi.ja_login(a, "justin", "pw"), "login started") }
+    else if s == 3 { check(jarvisapi.ja_me(a), "me started") }
+    else if s == 4 { check(jarvisapi.ja_projects(a), "projects started") }
+    else if s == 5 { check(jarvisapi.ja_project(a, "p1"), "project p1 started") }
+    else if s == 6 { check(jarvisapi.ja_project(a, "p 2/x"), "project with an odd id started") }
+    else if s == 7 { check(jarvisapi.ja_roadmap_op(a, "p1", "done", "r1"), "roadmap done started") }
+    else if s == 8 { check(jarvisapi.ja_need_answer(a, "p1", "n1", "Yes"), "need answer started") }
+    else if s == 9 { check(jarvisapi.ja_project_set(a, "p1", "done", "ship it"), "project set started") }
+    else if s == 10 { check(jarvisapi.ja_roadmap_op(a, "p1", "add", "third \"q\" ä"), "roadmap add started") }
+    else if s == 11 { check(jarvisapi.ja_center(a), "center started") }
+    else if s == 12 { check(jarvisapi.ja_convs(a, 0, 0), "convs started") }
+    else if s == 13 { check(jarvisapi.ja_convs(a, 1, 1), "convs page started") }
+    else if s == 14 { check(jarvisapi.ja_conv(a, "c1", 4), "conv started") }
+    else if s == 15 { check(jarvisapi.ja_tasks(a), "tasks started") }
+    else if s == 16 { check(jarvisapi.ja_task_add(a, "walk", "2026-10-19T08:30", "Private", "weekly"), "task add started") }
+    else if s == 17 { check(jarvisapi.ja_task_complete(a, "t1"), "task complete started") }
+    else if s == 18 { check(jarvisapi.ja_task_remove(a, "walk"), "task remove started") }
+    else if s == 19 { check(jarvisapi.ja_devices(a), "devices started") }
+    else if s == 20 { check(jarvisapi.ja_push_token(a, "tok/1+x", "android"), "push token started") }
+    else if s == 21 { check(jarvisapi.ja_stt(a, "RIFFwav".p as u64, 7, "audio/wav", "de"), "stt started") }
+    else if s == 22 {
+        check(jarvisapi.ja_upload(a, "my file.txt", "application/x-test", payload.ptr, payload.len, "c7"), "upload started")
+    }
+    else if s == 23 { check(jarvisapi.ja_download(a, as_s(&up_url)), "download started") }
+    else if s == 24 { check(jarvisapi.ja_download(a, "/file/u1/c7/none"), "download of a missing file started") }
+    else if s == 25 {
+        check(!jarvisapi.ja_download(a, "http://evil.example/x"), "download refuses a full URL")
+        check(!jarvisapi.ja_download(a, "//evil.example/x"), "download refuses a protocol-relative URL")
+        check(jarvisapi.ja_get(a, jarvisapi.AK_PROJECT, jarvisapi.JP_PROJECTS, "broken", ""), "cut answer started")
+    }
+    else if s == 26 {
+        // offline: a closed port; the cache must answer
+        jarvisapi.ja_set_base(a, "http://127.0.0.1:1")
+        check(jarvisapi.ja_projects(a), "offline projects started")
+    }
+    else if s == 27 { check(jarvisapi.ja_project(a, "p1"), "offline project started") }
+    else if s == 28 { check(jarvisapi.ja_project(a, "never-fetched"), "offline uncached project started") }
+    else if s == 29 { check(jarvisapi.ja_project_set(a, "p1", "active", ""), "offline write started") }
+    else if s == 30 {
+        // back online with a stale token
+        jarvisapi.ja_set_base(a, str { p: base_ptr as *mut u8, n: base_n })
+        jarvisapi.ja_set_token(a, "stale")
+        check(jarvisapi.ja_me(a), "stale token me started")
+    }
+    else if s == 31 {
+        // the cookie of a net.jarvisc client
+        let c: *mut jarvisc.Jc = jc_ptr as *mut jarvisc.Jc
+        jarvisc.jc_set_base(c, str { p: base_ptr as *mut u8, n: base_n })
+        jarvisc.jc_set_token(c, "fake.tok+en=1_x")
+        jarvisapi.ja_use_jc(a, c)
+        check(jarvisapi.ja_me(a), "me with the jarvisc cookie started")
+    }
+    else { loop.stop(loop_ptr as *mut loop.Loop) }
+}
+
+fn as_s(b: *mut rt.Buf) -> str {
+    return __str_copy(str { p: (*b).ptr as *mut u8, n: (*b).len })
+}
+
+fn on_api(a: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
+    let bp: u64 = jarvisapi.ja_body_ptr(a)
+    let bn: usize = jarvisapi.ja_body_len(a)
+    let s: i32 = step
+    if s == 0 {
+        check(kind == jarvisapi.AK_ME && status == 401, "me before login -> 401")
+    } else if s == 1 {
+        check(kind == jarvisapi.AK_LOGIN && status == 401 && !jarvisapi.ja_has_token(a), "wrong password -> 401, no token")
+    } else if s == 2 {
+        check(kind == jarvisapi.AK_LOGIN && status == 200 && jarvisapi.ja_has_token(a), "login -> 200, token kept")
+        check(jarvisapi.ja_user(a) == "justin", "user from the login answer")
+        jarvisapi.ja_set_cache(a, cache_ptr as *mut jarvis_cache.Cache)
+    } else if s == 3 {
+        var m: jarvisapi.Me = jarvisapi.me_new()
+        check(status == 200 && jarvisapi.parse_me(bp, bn, &m), "me parsed")
+        check(m.username == "justin" && m.admin && m.device_token == "dt1", "me fields")
+        jarvisapi.me_free(&m)
+    } else if s == 4 {
+        var p: jarvisapi.Projects = jarvisapi.projects_new()
+        check(status == 200 && jarvisapi.parse_projects(bp, bn, &p), "projects parsed")
+        check(vec_len[jarvisapi.ProjectRow](&p.rows) == 2 && p.stale == 1, "two projects, one stale chat")
+        let r0: *mut jarvisapi.ProjectRow = vec_elem_ptr[jarvisapi.ProjectRow](&p.rows, 0)
+        let r1: *mut jarvisapi.ProjectRow = vec_elem_ptr[jarvisapi.ProjectRow](&p.rows, 1)
+        check((*r0).name == "Jarvis \"A\" ä€😀", "name with quote, umlaut, euro and emoji")
+        check((*r0).total == 2 && (*r0).done == 1 && (*r0).pct == 50 && (*r0).needs == 2, "counts of p1")
+        check((*r0).status == "active" && (*r0).next == "restart" && (*r0).updated == "2026-10-17T18:00:00Z", "status, next, updated")
+        check((*r1).id == "p 2/x" && (*r1).status == "paused", "odd id and second row")
+        jarvisapi.projects_free(&p)
+    } else if s == 5 {
+        var f: jarvisapi.ProjectFull = jarvisapi.pfull_new()
+        check(status == 200 && jarvisapi.parse_project(bp, bn, &f), "project parsed")
+        check(vec_len[jarvisapi.RoadItem](&f.roadmap) == 2 && vec_len[jarvisapi.NeedItem](&f.needs) == 2, "roadmap 2, needs 2")
+        let r1: *mut jarvisapi.RoadItem = vec_elem_ptr[jarvisapi.RoadItem](&f.roadmap, 1)
+        check((*r1).id == "r2" && (*r1).text == "second\nline" && (*r1).done && (*r1).note == "n", "roadmap item with a newline")
+        let n0: *mut jarvisapi.NeedItem = vec_elem_ptr[jarvisapi.NeedItem](&f.needs, 0)
+        check((*n0).nopts == 2 && jarvisapi.pfull_option(&f, 0, 0) == "Yes" && jarvisapi.pfull_option(&f, 0, 1) == "No", "need options")
+        check(jarvisapi.pfull_option(&f, 0, 2) == "" && jarvisapi.pfull_option(&f, 9, 0) == "", "option out of range is empty")
+        check((*n0).cid == "c1" && !(*n0).done, "need chat id and state")
+        let n1: *mut jarvisapi.NeedItem = vec_elem_ptr[jarvisapi.NeedItem](&f.needs, 1)
+        check((*n1).nopts == 0 && (*n1).cid == "", "need without options and null chat")
+        let ch: *mut jarvisapi.ChatRef = vec_elem_ptr[jarvisapi.ChatRef](&f.chats, 0)
+        check(vec_len[jarvisapi.ChatRef](&f.chats) == 1 && (*ch).running && (*ch).title == "worker one", "linked chat")
+        check(jarvisapi.ja_key(a) == "p1", "key is the project id")
+        jarvisapi.pfull_free(&f)
+    } else if s == 6 {
+        var f: jarvisapi.ProjectFull = jarvisapi.pfull_new()
+        check(status == 200 && jarvisapi.parse_project(bp, bn, &f) && f.info.name == "Odd id", "odd id is escaped and found")
+        jarvisapi.pfull_free(&f)
+    } else if s == 7 {
+        var f: jarvisapi.ProjectFull = jarvisapi.pfull_new()
+        check(kind == jarvisapi.AK_ROADMAP && status == 200 && jarvisapi.parse_project(bp, bn, &f), "roadmap answer parsed")
+        let r0: *mut jarvisapi.RoadItem = vec_elem_ptr[jarvisapi.RoadItem](&f.roadmap, 0)
+        check((*r0).done && f.info.done == 2, "r1 is done now")
+        jarvisapi.pfull_free(&f)
+    } else if s == 8 {
+        var f: jarvisapi.ProjectFull = jarvisapi.pfull_new()
+        check(kind == jarvisapi.AK_NEED && jarvisapi.parse_project(bp, bn, &f), "need answer parsed")
+        let n0: *mut jarvisapi.NeedItem = vec_elem_ptr[jarvisapi.NeedItem](&f.needs, 0)
+        check((*n0).done && (*n0).answer == "Yes" && f.info.needs == 1, "need answered")
+        jarvisapi.pfull_free(&f)
+    } else if s == 9 {
+        var f: jarvisapi.ProjectFull = jarvisapi.pfull_new()
+        check(kind == jarvisapi.AK_PROJECT_SET && jarvisapi.parse_project(bp, bn, &f), "project set parsed")
+        check(f.info.status == "done" && f.info.next == "ship it", "status and next changed")
+        jarvisapi.pfull_free(&f)
+    } else if s == 10 {
+        var f: jarvisapi.ProjectFull = jarvisapi.pfull_new()
+        check(jarvisapi.parse_project(bp, bn, &f), "roadmap add parsed")
+        let r2: *mut jarvisapi.RoadItem = vec_elem_ptr[jarvisapi.RoadItem](&f.roadmap, 2)
+        check(vec_len[jarvisapi.RoadItem](&f.roadmap) == 3 && (*r2).text == "third \"q\" ä", "added item with quote and umlaut")
+        jarvisapi.pfull_free(&f)
+    } else if s == 11 {
+        var c: jarvisapi.Center = jarvisapi.center_new()
+        check(status == 200 && jarvisapi.parse_center(bp, bn, &c), "center parsed")
+        check(c.user == "justin" && c.now == 1760000000000 && c.other_chats == 7, "center header")
+        let w0: *mut jarvisapi.WorkerRow = vec_elem_ptr[jarvisapi.WorkerRow](&c.workers, 0)
+        check(vec_len[jarvisapi.WorkerRow](&c.workers) == 1 && (*w0).id == "c1" && (*w0).running && (*w0).partial == "par" && (*w0).updated == 1760000000001, "worker row")
+        check(c.orch_id == "o1" && c.orch_title == "Leitstand" && !c.orch_running, "orchestrator")
+        let t0: *mut jarvisapi.TaskRow = vec_elem_ptr[jarvisapi.TaskRow](&c.tasks, 0)
+        check(vec_len[jarvisapi.TaskRow](&c.tasks) == 1 && (*t0).overdue && (*t0).due == "" && (*t0).category == "", "task with nulls")
+        check(vec_len[str](&c.devices) == 2 && *vec_elem_ptr[str](&c.devices, 1) == "Phone", "device names")
+        check(c.host == "srv" && c.cpus == 4 && c.mem_free == 1000000000 && c.disk_free == 40 && c.uptime == 99 && c.load1 > 0.49 && c.load1 < 0.51, "system numbers")
+        check(c.memory_count == 12 && vec_len[jarvisapi.ActRow](&c.activity) == 1, "memory count and activity")
+        jarvisapi.center_free(&c)
+    } else if s == 12 {
+        var c: jarvisapi.Convs = jarvisapi.convs_new()
+        check(status == 200 && jarvisapi.parse_convs(bp, bn, &c) && vec_len[jarvisapi.ConvRow](&c.rows) == 2 && c.total == 2, "convs parsed")
+        let r0: *mut jarvisapi.ConvRow = vec_elem_ptr[jarvisapi.ConvRow](&c.rows, 0)
+        check((*r0).id == "c1" && (*r0).kind == "worker" && (*r0).fav && (*r0).updated == 1760000000001, "conv row")
+        jarvisapi.convs_free(&c)
+    } else if s == 13 {
+        var c: jarvisapi.Convs = jarvisapi.convs_new()
+        check(jarvisapi.parse_convs(bp, bn, &c) && vec_len[jarvisapi.ConvRow](&c.rows) == 1 && c.total == 2, "second page has one row of two")
+        jarvisapi.convs_free(&c)
+    } else if s == 14 {
+        var c: jarvisapi.Conv = jarvisapi.conv_new()
+        check(status == 200 && jarvisapi.parse_conv(bp, bn, &c) && vec_len[jarvisapi.Msg](&c.msgs) == 2, "conv parsed")
+        let m1: *mut jarvisapi.Msg = vec_elem_ptr[jarvisapi.Msg](&c.msgs, 1)
+        check((*m1).role == "assistant" && (*m1).text == "hello\n>STATUS: status=done" && !c.running, "assistant message")
+        jarvisapi.conv_free(&c)
+    } else if s == 15 {
+        var t: jarvisapi.Tasks = jarvisapi.tasks_new()
+        check(status == 200 && jarvisapi.parse_tasks(bp, bn, &t) && vec_len[jarvisapi.TaskRow](&t.rows) == 1, "tasks parsed")
+        let t0: *mut jarvisapi.TaskRow = vec_elem_ptr[jarvisapi.TaskRow](&t.rows, 0)
+        check((*t0).id == "t1" && (*t0).text == "buy milk" && (*t0).due == "2026-10-18T09:00" && (*t0).repeat == "none" && !(*t0).done, "task fields")
+        jarvisapi.tasks_free(&t)
+    } else if s == 16 {
+        var t: jarvisapi.Tasks = jarvisapi.tasks_new()
+        check(kind == jarvisapi.AK_TASK_OP && jarvisapi.parse_tasks(bp, bn, &t) && vec_len[jarvisapi.TaskRow](&t.rows) == 2, "task added")
+        let t1: *mut jarvisapi.TaskRow = vec_elem_ptr[jarvisapi.TaskRow](&t.rows, 1)
+        check((*t1).text == "walk" && (*t1).repeat == "weekly" && (*t1).category == "Private" && (*t1).due == "2026-10-19T08:30", "new task fields")
+        jarvisapi.tasks_free(&t)
+    } else if s == 17 {
+        var t: jarvisapi.Tasks = jarvisapi.tasks_new()
+        check(jarvisapi.parse_tasks(bp, bn, &t), "task complete parsed")
+        let t0: *mut jarvisapi.TaskRow = vec_elem_ptr[jarvisapi.TaskRow](&t.rows, 0)
+        check((*t0).done, "t1 is done")
+        jarvisapi.tasks_free(&t)
+    } else if s == 18 {
+        var t: jarvisapi.Tasks = jarvisapi.tasks_new()
+        check(jarvisapi.parse_tasks(bp, bn, &t) && vec_len[jarvisapi.TaskRow](&t.rows) == 1, "task removed")
+        jarvisapi.tasks_free(&t)
+    } else if s == 19 {
+        var v: jarvisapi.Devices = jarvisapi.devices_new()
+        check(status == 200 && jarvisapi.parse_devices(bp, bn, &v) && vec_len[str](&v.names) == 2, "devices parsed")
+        let d1: *mut jarvisapi.DeviceRow = vec_elem_ptr[jarvisapi.DeviceRow](&v.rows, 1)
+        check((*d1).name == "Phone" && (*d1).kind == "Android" && !(*d1).online, "device info")
+        jarvisapi.devices_free(&v)
+    } else if s == 20 {
+        check(kind == jarvisapi.AK_PUSH && status == 200, "push token accepted")
+    } else if s == 21 {
+        check(kind == jarvisapi.AK_STT && status == 200, "stt answered")
+        check(jarvisapi.parse_text_field(bp, bn, "text") == "audio 7 bytes audio/wav lang=de", "stt text: octets, content type and language arrived")
+    } else if s == 22 {
+        var u: jarvisapi.Uploaded = jarvisapi.uploaded_new()
+        check(status == 200 && jarvisapi.parse_upload(bp, bn, &u), "upload answer parsed")
+        check(u.name == "my file.txt" && u.size == 300 && u.mime == "application/x-test", "upload name, size and mime")
+        rt.buf_clear(&up_url)
+        rt.buf_push_bytes(&up_url, u.url.p as u64, u.url.n)
+        jarvisapi.uploaded_free(&u)
+    } else if s == 23 {
+        check(kind == jarvisapi.AK_DOWNLOAD && status == 200 && bn == 300, "download size")
+        check(bn == 300 && rt.mem_eq(bp, payload.ptr, 300), "download is byte-identical (all 256 values)")
+    } else if s == 24 {
+        check(status == 404, "missing file -> 404")
+    } else if s == 25 {
+        var f: jarvisapi.ProjectFull = jarvisapi.pfull_new()
+        check(status == 200 && !jarvisapi.parse_project(bp, bn, &f), "a cut answer is refused by the parser, no crash")
+        jarvisapi.pfull_free(&f)
+    } else if s == 26 {
+        var p: jarvisapi.Projects = jarvisapi.projects_new()
+        check(status == 203 && jarvisapi.parse_projects(bp, bn, &p) && vec_len[jarvisapi.ProjectRow](&p.rows) == 2, "offline: cached projects with status 203")
+        check(jarvisapi.ja_age_s(a) >= 0 && jarvisapi.ja_age_s(a) < 60, "offline: cache age is small")
+        jarvisapi.projects_free(&p)
+    } else if s == 27 {
+        var f: jarvisapi.ProjectFull = jarvisapi.pfull_new()
+        check(status == 203 && jarvisapi.parse_project(bp, bn, &f), "offline: cached project p1")
+        check(f.info.status == "done" && vec_len[jarvisapi.RoadItem](&f.roadmap) == 3, "offline: the LAST good answer is what is cached")
+        jarvisapi.pfull_free(&f)
+    } else if s == 28 {
+        check(status == 0 && bn == 0 && jarvisapi.ja_age_s(a) == 0 - 1, "offline without a cache entry -> 0")
+    } else if s == 29 {
+        check(status == 0, "offline write is not answered from the cache")
+    } else if s == 30 {
+        check(kind == jarvisapi.AK_ME && status == 401, "stale token -> 401")
+    } else if s == 31 {
+        var m: jarvisapi.Me = jarvisapi.me_new()
+        check(status == 200 && jarvisapi.parse_me(bp, bn, &m), "the token of a jarvisc client works for REST")
+        jarvisapi.me_free(&m)
+    }
+    step = step + 1
+    issue(a)
+}
+
+fn on_jc(c: *mut jarvisc.Jc, ud: u64, kind: u32, arg: i64) {
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        return 2
+    }
+    var l: loop.Loop = loop.loop_new()
+    if !loop.loop_init(&l) {
+        return 2
+    }
+    loop_ptr = (&l) as u64
+    base_ptr = rt.arg_ptr(start, 1)
+    base_n = rt.c_length(base_ptr)
+    let dp: u64 = rt.arg_ptr(start, 2)
+    var cache: jarvis_cache.Cache = jarvis_cache.cache_new(str { p: dp as *mut u8, n: rt.c_length(dp) })
+    cache_ptr = (&cache) as u64
+    var i: usize = 0
+    while i < 300 {
+        rt.buf_push(&payload, (i & 255) as u8)
+        i = i + 1
+    }
+    let jc: *mut jarvisc.Jc = jarvisc.jc_new(&l, on_jc, 0)
+    jc_ptr = jc as u64
+    let a: *mut jarvisapi.Api = jarvisapi.ja_new(&l, on_api, 0)
+    jarvisapi.ja_set_base(a, str { p: base_ptr as *mut u8, n: base_n })
+    step = 0
+    issue(a)
+    loop.timer_after(&l, 30000, on_timeout, 0)
+    loop.run(&l)
+    if fails == 0 && checks > 60 {
+        say("API CLIENT OK " + dec(checks as i64) + " checks")
+        return 0
+    }
+    say("API CLIENT FAILED " + dec(fails as i64) + " of " + dec(checks as i64))
+    return 1
+}
