@@ -1498,5 +1498,24 @@ bash tools/linebreak/run.sh
 build uax14
 "$W/uax14" /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
 
+# Font fallback chain in the painter (W18, r251).
+build fallback
+EMOJI_TTF=/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf
+if [ ! -f "$EMOJI_TTF" ]; then EMOJI_TTF=""; echo "  SKIP emoji checks: no NotoColorEmoji.ttf"; fi
+"$W/fallback" /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf /usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf $EMOJI_TTF
+
+# LCD subpixel text, opt-in (W18, r256).
+build lcd
+"$W/lcd" /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+
+# Weight faces in the painter (W18, r252). SKIP without the Inter files.
+IN_DIR=/root/osum-wcursor/assets/src
+if [ -f "$IN_DIR/Inter-Regular.ttf" ] && [ -f "$IN_DIR/Inter-SemiBold.ttf" ]; then
+    build weight
+    "$W/weight" "$IN_DIR/Inter-Regular.ttf" "$IN_DIR/Inter-SemiBold.ttf"
+else
+    echo "  SKIP weight: no Inter-Regular/SemiBold in $IN_DIR"
+fi
+
 echo
 echo "ALL CHECKS PASSED."
