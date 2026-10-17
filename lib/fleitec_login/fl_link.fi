@@ -20,6 +20,7 @@
 // logic, not in this file.
 import std.rt
 import std.str
+import std.json
 import fleitec_login.fl_util as u
 import fleitec_login.fl_transport as tp
 import fleitec_login.fl_oidc as oidc
@@ -39,6 +40,7 @@ struct LinkResult {
     groups: str,
     amr: str,
     auth_time: i64,
+    id_token: str, // the RAW id_token: the broker verifies it itself (POST /link/finish), never our word
 }
 
 fn link_begin(c: *mut oidc.Client, redirect_uri: str, now: i64, p: *mut oidc.Pending) -> i64 {
@@ -47,7 +49,7 @@ fn link_begin(c: *mut oidc.Client, redirect_uri: str, now: i64, p: *mut oidc.Pen
 
 fn empty_result(reason: i64, detail: str) -> LinkResult {
     return LinkResult { reason: reason, detail: detail, provider: "", iss: "", sub: "", name: "", email_hint: "",
-        org_id: "", org_name: "", groups: "", amr: "", auth_time: 0 }
+        org_id: "", org_name: "", groups: "", amr: "", auth_time: 0, id_token: "" }
 }
 
 fn link_finish(c: *mut oidc.Client, p: *mut oidc.Pending, redirected: str, provider: str,
@@ -74,17 +76,30 @@ fn link_finish(c: *mut oidc.Client, p: *mut oidc.Pending, redirected: str, provi
     r.groups = l.claims.groups
     r.amr = l.claims.amr
     r.auth_time = l.claims.auth_time
+    r.id_token = l.tokens.id_token
     return r
 }
 
-// POST {provider, sub} to the broker's unlink endpoint with the bearer token. PROPOSED contract
-// (the broker is not built yet): 200 = unlinked; 409 = it is the last identity ("last_identity");
-// 401/403 = sign in again (L_NEED_LOGIN); 404 = nothing to unlink (L_ERROR "not_linked").
+// POST {provider, sub} to the broker's unlink endpoint (fleitec-id: POST /link/unlink) with the bearer
+// token. The broker needs a FRESH login (auth_time within its window) and answers: 200 = unlinked
+// (the session version rises, so the answer carries a NEW access token: it is returned in
+// `tokens.access_token`, "" when the answer has none); 409 = it is the last identity
+// ("last_identity"); 401/403 = sign in again (L_NEED_LOGIN; 403 reauth_required = fresh login
+// missing); 404 = nothing to unlink (L_ERROR "not_linked").
 fn unlink(t: *mut tp.Transport, endpoint: str, access_token: str, provider: str, sub: str) -> oidc.Login {
     var f: str = u.kv("provider", provider) + "&" + u.kv("sub", sub)
     let r: tp.HttpResp = tp.post_form(t, endpoint, f, "Authorization: Bearer " + access_token + "\r\n")
     if !r.ok { return oidc.error_login(oidc.L_NET, "") }
-    if r.status == 200 { return oidc.error_login(oidc.L_OK, "") }
+    if r.status == 200 {
+        var ok: oidc.Login = oidc.error_login(oidc.L_OK, "")
+        var d: json.Json = json.json_new()
+        let parsed: bool = json.json_parse(&d, r.body.p as u64, r.body.length()) catch false
+        if parsed && json.json_kind(&d, json.json_root(&d)) == json.JSON_OBJECT {
+            ok.tokens.access_token = u.jget_str(&d, json.json_root(&d), "access_token")
+        }
+        json.json_free(&d)
+        return ok
+    }
     if r.status == 409 { return oidc.error_login(oidc.L_ERROR, "last_identity") }
     if r.status == 401 || r.status == 403 { return oidc.error_login(oidc.L_NEED_LOGIN, "") }
     if r.status == 404 { return oidc.error_login(oidc.L_ERROR, "not_linked") }
