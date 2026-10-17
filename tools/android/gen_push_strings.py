@@ -70,7 +70,7 @@ S = [
 ("S_CH_SVC","firn_service"),
 ("S_CH_SVC_NAME","Verbindung"),
 ("S_SVC_TITLE","Firn Push"),
-("S_SVC_TEXT","Verbindung zum Relay aktiv"),
+("S_SVC_TEXT","Verbindung aktiv"),
 ("S_MSG_TITLE","Neue Nachricht"),
 ("S_CFG","/firn-push.cfg"),
 ("S_TAG","firn-push"),
@@ -110,7 +110,7 @@ S = [
 EN = {
     "S_CH_PUSH_NAME": "channel name: messages",
     "S_CH_SVC_NAME": "channel name: connection",
-    "S_SVC_TEXT": "connection to the relay is active",
+    "S_SVC_TEXT": "connection is active",
     "S_MSG_TITLE": "title: new message",
     "S_SUMMARY_TEXT": "summary: new messages",
 }
