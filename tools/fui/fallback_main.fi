@@ -1,0 +1,205 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/fallback_main.fi -- the painter's font fallback chain (fUi W18, r251).
+//
+//     fallback <main.ttf> <fallback.ttf> [<colour-emoji.ttf>]
+//
+// The main font has no CJK; the fallback has. Checks: the pick, the advance,
+// that no kerning crosses two faces, and that the picture differs from the
+// one without a fallback (the .notdef box) -- with and without the glyph cache.
+import std.rt
+import paint.canvas
+import font.metrics
+import font.ttf
+import fui.painter
+import fui.glyphcache
+
+const FONTSET_BYTES: usize = 4096
+const CW: usize = 400
+const CH: usize = 80
+const BG: u32 = 0xff202020
+static mut FAILS: usize = 0
+
+fn expect(id: i64, got: i64, want: i64) {
+    if got != want {
+        FAILS = FAILS + 1
+        var t: rt.Buf = rt.buf_new()
+        var a: [u8; 11] = "FAIL check "
+        rt.buf_push_bytes(&t, (&a[0]) as u64, 11)
+        rt.buf_push_dec_i64(&t, id)
+        var b: [u8; 6] = " got  "
+        rt.buf_push_bytes(&t, (&b[0]) as u64, 6)
+        rt.buf_push_dec_i64(&t, got)
+        var c: [u8; 6] = " want "
+        rt.buf_push_bytes(&t, (&c[0]) as u64, 6)
+        rt.buf_push_dec_i64(&t, want)
+        rt.buf_push(&t, 10 as u8)
+        rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+        rt.buf_free(&t)
+    }
+}
+
+fn load_set(path: u64) -> u64 {
+    var fbuf: rt.Buf = rt.buf_new()
+    if !rt.read_file(path, &fbuf) {
+        return 0
+    }
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    *fsp = metrics.fontset_new()
+    if !metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+        return 0
+    }
+    return fsp as u64
+}
+
+// The pixels that differ from the background in columns x0..x1.
+fn ink(cv: *mut canvas.Canvas, x0: usize, x1: usize) -> i64 {
+    var n: i64 = 0
+    var x: usize = x0
+    while x < x1 && x < CW {
+        var y: usize = 0
+        while y < CH {
+            if canvas.canvas_get(cv, x, y) != BG {
+                n = n + 1
+            }
+            y = y + 1
+        }
+        x = x + 1
+    }
+    return n
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 3 {
+        return 2
+    }
+    let m: u64 = load_set(rt.arg_ptr(start, 1))
+    let f: u64 = load_set(rt.arg_ptr(start, 2))
+    if m == 0 || f == 0 {
+        return 3
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, CW, CH) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, CW, CH) {
+        return 5
+    }
+    painter.painter_set_font(&z, m)
+    var r: painter.TextRun = painter.run_new(24.0)
+    var s: [u8; 5] = "a\u{4e2d}b"
+    let sp: u64 = (&s[0]) as u64
+    let cjk: u32 = 0x4e2d as u32
+
+    // 1. without a fallback: the main font draws everything (.notdef)
+    expect(1, // pick none
+        (painter.fb_pick(&z, &r, cjk) == m) as i64, 1)
+    let w0: f64 = painter.run_width(&z, &r, sp, 5)
+    expect(2, // hash none
+        painter.fb_hash(&z) as i64, 0)
+
+    // 2. with it
+    painter.painter_set_fallback(&z, 0, f)
+    expect(3, // pick cjk
+        (painter.fb_pick(&z, &r, cjk) == f) as i64, 1)
+    expect(4, // pick latin
+        (painter.fb_pick(&z, &r, 0x61 as u32) == m) as i64, 1)
+    expect(5, // hash set
+        (painter.fb_hash(&z) != 0) as i64, 1)
+    let w1: f64 = painter.run_width(&z, &r, sp, 5)
+    let want: f64 = metrics.fm_advance(m, 24.0, 0x61 as u32) +
+    metrics.fm_advance(f, 24.0, cjk) + metrics.fm_advance(m, 24.0, 0x62 as u32)
+    // no kerning across two faces: the advance is the plain sum
+    let dw: f64 = w1 - want
+    expect(6, // width = sum of faces
+        (dw > -0.01 && dw < 0.01) as i64, 1)
+    expect(7, // width differs
+        (w1 != w0) as i64, 1)
+    let a0: f64 = painter.advance_of(&z, &r, 0x61 as u32, cjk)
+    let a0w: f64 = metrics.fm_advance(m, 24.0, 0x61 as u32)
+    expect(8, // no kern across
+        (a0 > a0w - 0.01 && a0 < a0w + 0.01) as i64, 1)
+
+    // 3. the picture: ink in the CJK cell, different from the box
+    let cx0: usize = 10 + metrics.fm_advance(m, 24.0, 0x61 as u32) as usize
+    let cx1: usize = cx0 + metrics.fm_advance(f, 24.0, cjk) as usize
+    // with the fallback (glyph cache on)
+    canvas.canvas_clear(&cv, BG)
+    painter.run_draw(&z, &r, 10.0, 50.0, 380.0, 0xffffffff as u32, sp, 5, 0 as u32)
+    let ink_fb: i64 = ink(&cv, cx0, cx1)
+    // with the fallback (cache off)
+    glyphcache.gc_set_budget(0)
+    painter.painter_set_font(&z, m) // same font; cache keys are per call anyway
+    canvas.canvas_clear(&cv, BG)
+    painter.run_draw(&z, &r, 10.0, 51.0, 380.0, 0xffffffff as u32, sp, 5, 0 as u32)
+    let ink_fb2: i64 = ink(&cv, cx0, cx1)
+    glyphcache.gc_set_budget(4194304)
+    // without a fallback: the box
+    painter.painter_set_fallback(&z, 0, 0)
+    canvas.canvas_clear(&cv, BG)
+    painter.run_draw(&z, &r, 10.0, 50.0, 380.0, 0xffffffff as u32, sp, 5, 0 as u32)
+    let ink_box: i64 = ink(&cv, 0, CW)
+    expect(9, // fallback paints ink
+        (ink_fb > 60) as i64, 1)
+    expect(10, // cache off paints ink
+        (ink_fb2 > 60) as i64, 1)
+    expect(11, // cache on/off agree
+        (ink_fb2 * 10 > ink_fb * 8 && ink_fb2 * 8 < ink_fb * 10) as i64, 1)
+    expect(12, // box differs
+        (ink_box > 0) as i64, 1)
+    // 4. colour emoji (r256): a CBDT face as the second fallback
+    if rt.arg_count(start) >= 4 {
+        let e: u64 = load_set(rt.arg_ptr(start, 3))
+        if e == 0 {
+            return 6
+        }
+        painter.painter_set_fallback(&z, 0, f)
+        painter.painter_set_fallback(&z, 1, e)
+        var s2: [u8; 6] = "a\u{1f600}b"
+        let sp2: u64 = (&s2[0]) as u64
+        expect(13, // the emoji comes from the emoji face
+            (painter.fb_pick(&z, &r, 0x1f600 as u32) == e) as i64, 1)
+        let we: f64 = painter.run_width(&z, &r, sp2, 6)
+        expect(14, // it has a width
+            (we > painter.run_width(&z, &r, sp, 5) - 40.0 && we > 20.0) as i64, 1)
+        canvas.canvas_clear(&cv, BG)
+        painter.run_draw(&z, &r, 10.0, 50.0, 380.0, 0xffffffff as u32, sp2, 6, 0 as u32)
+        var colour: i64 = 0
+        var ymin: i64 = 1000
+        var ymax: i64 = 0 - 1
+        var x: usize = 0
+        while x < CW {
+            var y: usize = 0
+            while y < CH {
+                let c: u32 = canvas.canvas_get(&cv, x, y)
+                let c0: u32 = (c >> 16 as u32) & 255 as u32
+                let c1: u32 = (c >> 8 as u32) & 255 as u32
+                let c2: u32 = c & 255 as u32
+                if c0 > c2 + 40 as u32 || c2 > c0 + 40 as u32 || c1 > c0 + 40 as u32 {
+                    colour = colour + 1
+                    if (y as i64) < ymin { ymin = y as i64 }
+                    if (y as i64) > ymax { ymax = y as i64 }
+                }
+                y = y + 1
+            }
+            x = x + 1
+        }
+        expect(15, // coloured pixels (not a gray box or letter)
+            (colour > 100) as i64, 1)
+        expect(17, // the emoji sits on the baseline (y 50), about one em tall
+            (ymin >= 20 && ymax <= 62 && ymax - ymin >= 14) as i64, 1)
+        // clipped: nothing outside the clip rect changes
+        canvas.canvas_clear(&cv, BG)
+        canvas.clip_push_rect(&cv, 0.0, 0.0, 30.0, 80.0)
+        painter.run_draw(&z, &r, 10.0, 50.0, 380.0, 0xffffffff as u32, sp2, 6, 0 as u32)
+        canvas.clip_pop(&cv)
+        expect(16, // no ink right of the clip
+            ink(&cv, 31, CW), 0)
+    }
+    var ok: [u8; 21] = "fallback checks done\n"
+    rt.write_everything(1, (&ok[0]) as u64, 21)
+    if FAILS > 0 {
+        return 1
+    }
+    return 0
+}

@@ -82,6 +82,7 @@ import font.raster
 import font.metrics
 import font.ttf
 import font.gsub
+import font.cbdt
 import str.ucd_bidi
 import fui.theme
 import fui.bidi
@@ -111,6 +112,9 @@ export {
     run_fits_ellipsis, run_draw_ellipsis, ellipsis_w,
     run_line_upto, run_line_count, run_draw_wrapped,
     advance_of, pair_core,
+    painter_set_fallback, painter_fallback, fb_pick, fb_hash, FB_SLOTS,
+    painter_set_weight_face, face_sel, WFACE_SLOTS,
+    painter_set_lcd, painter_lcd,
     // BIDIRECTIONAL TEXT (see "THE BIDI PATH" further down)
     run_set_dir, run_dir, run_caret_x, run_hit, run_para_rtl,
     run_sel_draw, run_is_bidi, BIDI_CAP,
@@ -153,6 +157,14 @@ struct Painter {
     // MORE FACES (29.09.2026): the font sets a style picks with its
     // `font_id` (style.style_set_font(s, id, px)); slot 0 is `fm` itself.
     fslot: [u64; 4],
+    // FALLBACK FACES (r251): font sets tried, in order, for a character the
+    // main font has no glyph for (gid 0). 0 = unused slot.
+    fb: [u64; 3],
+    // WEIGHT FACES (r252): real faces for other weights (Inter 500/600/700 ...).
+    wface: [u64; 4],
+    wface_w: [usize; 4],
+    fb_col: [usize; 3], // 1 per fallback slot that is a colour bitmap face
+    emoji_any: usize, // 1 when a fallback face is a colour bitmap font (CBDT)
 }
 
 #[no_gc]
@@ -161,7 +173,8 @@ fn painter_new() -> Painter {
         cv: 0, ra: raster.raster_new(), rbuf: 0 as *mut u8, rcap: 0,
         scratch: 0 as *mut u8, fm: 0, w: 0, h: 0, ok: 0,
         bt: 0, bx: 0, bn: 0, blev: 0 as u8, bvn: 0,
-        gs: gsub.gsub_new(), gs_fm: 0, fslot: [0 as u64; 4],
+        gs: gsub.gsub_new(), gs_fm: 0, fslot: [0 as u64; 4], fb: [0 as u64; 3],
+        wface: [0 as u64; 4], wface_w: [0 as usize; 4], fb_col: [0 as usize; 3], emoji_any: 0,
     }
 }
 
@@ -265,6 +278,163 @@ fn painter_font_slot(z: *mut Painter, id: usize) -> u64 {
         return (*z).fslot[id]
     }
     return 0
+}
+
+// THE FALLBACK CHAIN (r251). `painter_set_fallback(z, i, fm)` puts a font
+// set into slot 0..FB_SLOTS-1; the main font stays first. For each character
+// `fb_pick` returns the FIRST font set whose cmap has a real glyph (gid != 0);
+// when none has it, the main font (its .notdef box). Advance, kerning and
+// glyph come from the same font set, so measuring and painting agree.
+// Honest limit: the choice is per character, not per grapheme cluster, and
+// the bidi path still uses the main font only.
+const FB_SLOTS: usize = 3
+
+fn painter_set_fallback(z: *mut Painter, i: usize, fm: u64) {
+    if i < FB_SLOTS {
+        (*z).fb[i] = fm
+        var k: usize = 0
+        var any: usize = 0
+        while k < FB_SLOTS {
+            let f: u64 = (*z).fb[k]
+            (*z).fb_col[k] = 0
+            if f != 0 && metrics.fm_present(f) &&
+            cbdt.cbdt_ok(metrics.fontset_font(f)) {
+                any = 1
+                (*z).fb_col[k] = 1
+            }
+            k = k + 1
+        }
+        (*z).emoji_any = any
+    }
+}
+
+fn painter_fallback(z: *mut Painter, i: usize) -> u64 {
+    if i < FB_SLOTS {
+        return (*z).fb[i]
+    }
+    return 0
+}
+
+// WEIGHT FACES (r252). A static font set per weight instead of the faux bold:
+// `painter_set_weight_face(z, i, 600, fm)`. The main font counts as weight
+// 400. A run takes the face with the closest weight (a tie goes to the
+// heavier one above 450, else the lighter one). The faux bold (three passes)
+// stays only when the chosen face is more than 100 lighter than the run --
+// so 700 on a 600 face is NOT thickened again, 700 on a lone 400 face is.
+// Honest limit: static faces only (no fvar/gvar interpolation, r141), and the
+// bidi path keeps the main font.
+const WFACE_SLOTS: usize = 4
+
+fn painter_set_weight_face(z: *mut Painter, i: usize, weight: usize, fm: u64) {
+    if i < WFACE_SLOTS {
+        (*z).wface[i] = fm
+        (*z).wface_w[i] = weight
+    }
+}
+
+// The font set for the run's weight; `out_w` gets that face's weight.
+#[no_gc]
+fn face_sel(z: *mut Painter, r: *mut TextRun, out_w: *mut usize) -> u64 {
+    var best: u64 = (*z).fm
+    var bw: usize = 400
+    if (*z).wface[0] == 0 {
+        *out_w = bw
+        return best
+    }
+    let w: usize = (*r).weight
+    var bd: usize = 0
+    if w > bw {
+        bd = w - bw
+    } else {
+        bd = bw - w
+    }
+    var i: usize = 0
+    while i < WFACE_SLOTS {
+        let f: u64 = (*z).wface[i]
+        if f != 0 && metrics.fm_present(f) {
+            let fw: usize = (*z).wface_w[i]
+            var d: usize = 0
+            if w > fw {
+                d = w - fw
+            } else {
+                d = fw - w
+            }
+            if d < bd || (d == bd && fw > bw && w > 450) {
+                best = f
+                bw = fw
+                bd = d
+            }
+        }
+        i = i + 1
+    }
+    *out_w = bw
+    return best
+}
+
+// The font set that draws `cp` in run `r`: the face of the run's weight, then
+// the main font, then the fallbacks; the first with a real glyph (gid != 0).
+// When none has it, the face itself (its .notdef box).
+#[no_gc]
+fn fb_pick(z: *mut Painter, r: *mut TextRun, cp: u32) -> u64 {
+    if (*z).fb[0] == 0 && (*z).wface[0] == 0 {
+        return (*z).fm
+    }
+    var fw: usize = 400
+    let prim: u64 = face_sel(z, r, &fw)
+    if (*z).fb[0] == 0 || cp < 128 as u32 {
+        return prim
+    }
+    // Pictographs prefer a colour bitmap face over a monochrome outline
+    // (DejaVu has a black U+1F600 too); everything else is "first with a glyph".
+    if (*z).emoji_any != 0 && cp >= 0x1F000 as u32 && cp <= 0x1FAFF as u32 {
+        var j: usize = 0
+        while j < FB_SLOTS {
+            let g: u64 = (*z).fb[j]
+            if g != 0 && (*z).fb_col[j] != 0 && metrics.fm_present(g) &&
+            ttf.font_glyph_for(metrics.fontset_font(g), cp) != 0 as u32 {
+                return g
+            }
+            j = j + 1
+        }
+    }
+    if metrics.fm_present(prim) &&
+    ttf.font_glyph_for(metrics.fontset_font(prim), cp) != 0 as u32 {
+        return prim
+    }
+    if prim != (*z).fm && metrics.fm_present((*z).fm) &&
+    ttf.font_glyph_for(metrics.fontset_font((*z).fm), cp) != 0 as u32 {
+        return (*z).fm
+    }
+    var i: usize = 0
+    while i < FB_SLOTS {
+        let f: u64 = (*z).fb[i]
+        if f != 0 && metrics.fm_present(f) &&
+        ttf.font_glyph_for(metrics.fontset_font(f), cp) != 0 as u32 {
+            return f
+        }
+        i = i + 1
+    }
+    return prim
+}
+
+// A number for the line-cache key: 0 without fallbacks or weight faces, so
+// keys do not change for programs that never set one.
+fn fb_hash(z: *mut Painter) -> u64 {
+    if (*z).fb[0] == 0 && (*z).wface[0] == 0 {
+        return 0
+    }
+    var h: u64 = 14695981039346656037
+    var i: usize = 0
+    while i < FB_SLOTS {
+        h = (h ^ (*z).fb[i]) *% 1099511628211
+        i = i + 1
+    }
+    i = 0
+    while i < WFACE_SLOTS {
+        h = (h ^ (*z).wface[i] ^ (((*z).wface_w[i] as u64) << 48)) *% 1099511628211
+        i = i + 1
+    }
+    return h
 }
 
 // ------------------------------------------------------------- helpers
@@ -1353,7 +1523,11 @@ fn pair_core(z: *mut Painter, r: *mut TextRun, a: u32, b: u32) -> f64 {
     if (*r).kerning == 0 {
         return 0.0
     }
-    return metrics.fm_kern((*z).fm, (*r).size, a, b)
+    let fa: u64 = fb_pick(z, r, a)
+    if fa != fb_pick(z, r, b) {
+        return 0.0 // never kern across two faces
+    }
+    return metrics.fm_kern(fa, (*r).size, a, b)
 }
 
 // HOW FAR THE PEN MOVES AFTER ONE CHARACTER.
@@ -1372,7 +1546,7 @@ fn pair_core(z: *mut Painter, r: *mut TextRun, a: u32, b: u32) -> f64 {
 #[no_gc]
 fn advance_of(z: *mut Painter, r: *mut TextRun, cp: u32,
     nxt: u32) -> f64 {
-    var a: f64 = metrics.fm_advance((*z).fm, (*r).size, cp)
+    var a: f64 = metrics.fm_advance(fb_pick(z, r, cp), (*r).size, cp)
     if cp == 32 as u32 {
         a = a + (*r).word_spacing
     }
@@ -1859,7 +2033,9 @@ fn glyph_into(z: *mut Painter, r: *mut TextRun, f: *mut ttf.Font,
     var k: usize = 0
     var passes: usize = 1
     var step: f64 = 0.0
-    if (*r).weight >= 700 {
+    var fwt: usize = 400
+    let fbase: u64 = face_sel(z, r, &fwt)
+    if (*r).weight >= 700 && (*r).weight > fwt + 100 {
         passes = BOLD_PASSES
         step = (*r).size * BOLD_STEP
     }
@@ -1879,15 +2055,15 @@ fn glyph_into(z: *mut Painter, r: *mut TextRun, f: *mut ttf.Font,
 #[no_gc]
 fn run_into_raster(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
     sx: f64, base_y: f64, dx: f64, dy: f64) {
-    let f: *mut ttf.Font = metrics.fontset_font((*z).fm)
-    let up: f64 = metrics.fm_upem((*z).fm)
-    let sc: f64 = (*r).size / up
     var pen: f64 = sx + dx
     var i: usize = 0
     while i < n {
         var adv: usize = 1
         let cp: u32 = utf8_at(p, n, i, &adv)
         let nx: u32 = next_cp(p, n, i, adv)
+        let fm: u64 = fb_pick(z, r, cp)
+        let f: *mut ttf.Font = metrics.fontset_font(fm)
+        let sc: f64 = (*r).size / metrics.fm_upem(fm)
         let gid: u32 = ttf.font_glyph_for(f, cp)
         glyph_into(z, r, f, gid, pen, base_y + dy, sc)
         pen = pen + advance_of(z, r, cp, nx)
@@ -2059,7 +2235,7 @@ fn run_draw_ltr(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
 // outline and gradient are thereby the same for Arabic as for
 // Latin -- a second set of passes for the bidi path would be
 // exactly the second place that at some point calculates differently.
-fn paint_run(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
+fn paint_run_base(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
     br: f64, col: u32, p: u64, nn: usize, vis: bool) -> f64 {
     // THE WINDOW. It has to hold everything the passes reach into:
     // the shadow offset, the outline width and the shear of an italic.
@@ -2195,6 +2371,300 @@ fn paint_run(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
     return sx + br
 }
 
+// ============================================================ COLOUR EMOJI (r256)
+//
+// A fallback face with CBDT/CBLC bitmaps (Noto Color Emoji) has no outlines:
+// the passes above draw nothing for its glyphs. After them, `emoji_overlay`
+// paints the bitmap of each such character, scaled to the run size
+// (lib/font/cbdt.fi), into the canvas. The destination pixels are copied to a
+// scratch buffer, blended there and written back INSIDE THE CLIP only, so a
+// scrolled list cuts an emoji like it cuts a letter.
+// Limits: CPU path only (not the GPU atlas, not the bidi path), no shadow or
+// outline or gradient on the bitmap, no ZWJ sequence joining (the parts stand
+// side by side), PNG decoded per paint (no bitmap cache yet).
+const EM_SIDE: usize = 256
+static mut G_EM_BUF: u64 = 0
+
+fn emoji_glyph(z: *mut Painter, fm: u64, cp: u32, size: f64, pen: f64,
+    base_y: f64) {
+    if G_EM_BUF == 0 {
+        G_EM_BUF = rt.heap_alloc(EM_SIDE * EM_SIDE * 4)
+        if G_EM_BUF == 0 {
+            return
+        }
+    }
+    let f: *mut ttf.Font = metrics.fontset_font(fm)
+    let k: usize = cbdt.cbdt_pick(f, size)
+    if k == cbdt.CB_NONE {
+        return
+    }
+    let gid: u32 = ttf.font_glyph_for(f, cp)
+    if gid == 0 as u32 {
+        return
+    }
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    let cw: i64 = canvas.canvas_width(cv) as i64
+    let ch: i64 = canvas.canvas_height(cv) as i64
+    let left: i64 = floor_px(pen) as i64 - 4
+    let top: i64 = floor_px(base_y - size * 1.3) as i64 - 2
+    let rw: i64 = (size * 1.6) as i64 + 8
+    let rh: i64 = (size * 1.6) as i64 + 4
+    if rw > EM_SIDE as i64 || rh > EM_SIDE as i64 {
+        return
+    }
+    // the part of the region that may be written: canvas AND clip
+    var ix0: i64 = left
+    var iy0: i64 = top
+    var ix1: i64 = left + rw
+    var iy1: i64 = top + rh
+    let c0: i64 = canvas.clip_x0(cv) as i64
+    let c1: i64 = canvas.clip_x1(cv) as i64
+    let c2: i64 = canvas.clip_y0(cv) as i64
+    let c3: i64 = canvas.clip_y1(cv) as i64
+    if ix0 < c0 { ix0 = c0 }
+    if iy0 < c2 { iy0 = c2 }
+    if ix1 > c1 { ix1 = c1 }
+    if iy1 > c3 { iy1 = c3 }
+    if ix0 < 0 { ix0 = 0 }
+    if iy0 < 0 { iy0 = 0 }
+    if ix1 > cw { ix1 = cw }
+    if iy1 > ch { iy1 = ch }
+    if ix0 >= ix1 || iy0 >= iy1 {
+        return
+    }
+    let dst: u64 = canvas.canvas_pixels(cv) as u64
+    // copy the destination into the scratch buffer (rows outside stay 0)
+    var y: i64 = 0
+    while y < rh {
+        var x: i64 = 0
+        while x < rw {
+            var v: u32 = 0 as u32
+            let gx: i64 = left + x
+            let gy: i64 = top + y
+            if gx >= 0 && gy >= 0 && gx < cw && gy < ch {
+                v = rt.ld32(dst, (gy * cw + gx) as usize)
+            }
+            rt.st32(G_EM_BUF, (y * rw + x) as usize, v)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if !cbdt.cbdt_paint(f, k, gid, size, pen - (left as f64),
+        base_y - (top as f64), G_EM_BUF, rw as i32, rh as i32) {
+        return
+    }
+    y = iy0
+    while y < iy1 {
+        var x: i64 = ix0
+        while x < ix1 {
+            rt.st32(dst, (y * cw + x) as usize,
+                rt.ld32(G_EM_BUF, ((y - top) * rw + (x - left)) as usize))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn emoji_overlay(z: *mut Painter, r: *mut TextRun, sx: f64, p: u64,
+    nn: usize, base_y: f64) {
+    if (*z).emoji_any == 0 {
+        return
+    }
+    if gpu.gpu_of(painter_canvas(z)) as u64 != 0 {
+        return
+    }
+    var pen: f64 = sx
+    var i: usize = 0
+    while i < nn {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, nn, i, &adv)
+        let nx: u32 = next_cp(p, nn, i, adv)
+        if cp >= 0x80 as u32 {
+            let fm: u64 = fb_pick(z, r, cp)
+            if fm != (*z).fm && cbdt.cbdt_ok(metrics.fontset_font(fm)) {
+                emoji_glyph(z, fm, cp, (*r).size, pen, base_y)
+            }
+        }
+        pen = pen + advance_of(z, r, cp, nx)
+        i = i + adv
+    }
+}
+
+// ============================================================ LCD SUBPIXEL TEXT (r256)
+//
+// Opt-in (`painter_set_lcd(true)`, default OFF so every golden stays as it
+// is). A plain run (no shadow/outline/gradient/italic/faux bold) is rastered
+// THREE times as wide, the coverage goes through the FreeType default
+// 5-tap filter [8 77 86 77 8]/256 per subpixel, and each pixel channel is
+// blended with its own coverage (RGB stripe order: R left). The window must
+// fit the raster budget, else the normal grey path paints. Not on the GPU,
+// not in the bidi path, no line cache.
+static mut G_LCD: bool = false
+
+fn painter_set_lcd(on: bool) { G_LCD = on }
+fn painter_lcd() -> bool { return G_LCD }
+
+// 0..1 coverage of subpixel `j` (row start `row`, `n3` cells), 0 outside.
+fn lcd_c(rowp: u64, n3: i64, j: i64) -> f64 {
+    if j < 0 || j >= n3 {
+        return 0.0
+    }
+    var v: f64 = *((rowp + (j * 8) as u64) as *mut f64)
+    if v < 0.0 { v = 0.0 }
+    if v > 1.0 { v = 1.0 }
+    return v
+}
+
+// One segment of the run: characters [i0, i1) starting at `pen0`, `segw` pixels
+// wide (it fits the raster budget three times over).
+fn lcd_seg(z: *mut Painter, r: *mut TextRun, p: u64, nn: usize, i0: usize,
+    i1: usize, pen0: f64, segw: f64, base_y: f64, col: u32) {
+    let sz: f64 = (*r).size
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    let cw: i64 = canvas.canvas_width(cv) as i64
+    let ch: i64 = canvas.canvas_height(cv) as i64
+    let x0: i64 = floor_px(pen0) as i64 - 3
+    let y0: i64 = floor_px(base_y - sz * 1.25) as i64 - 1
+    let wpx: usize = (segw + 8.0) as usize
+    let hpx: usize = (sz * 1.75 + 4.0) as usize
+    if !raster.raster_begin(&(*z).ra, (x0 * 3) as f64, y0 as f64, wpx * 3, hpx) {
+        return
+    }
+    var pen: f64 = pen0
+    var i: usize = i0
+    while i < i1 {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, nn, i, &adv)
+        let nx: u32 = next_cp(p, nn, i, adv)
+        let fm: u64 = fb_pick(z, r, cp)
+        let f: *mut ttf.Font = metrics.fontset_font(fm)
+        let sc: f64 = sz / metrics.fm_upem(fm)
+        let gid: u32 = ttf.font_glyph_for(f, cp)
+        let okg: bool = ttf.outline_at(f, gid, &(*z).ra, pen * 3.0, base_y, sc,
+            3.0, 0.0, 0.0, 1.0, 0.0, 0.0, (*z).scratch, SCRATCH, 0)
+        pen = pen + advance_of(z, r, cp, nx)
+        i = i + adv
+    }
+    raster.raster_finish(&(*z).ra)
+    let mc: u32 = mit_alpha(col)
+    textcurve.tc_apply(&(*z).ra, textcurve.tc_bucket(mc))
+    let n3: i64 = (wpx * 3) as i64
+    let dst: u64 = canvas.canvas_pixels(cv) as u64
+    let sa: f64 = (canvas.color_a(mc) as f64) / 255.0
+    let sr: f64 = canvas.color_r(mc) as f64
+    let sg: f64 = canvas.color_g(mc) as f64
+    let sb: f64 = canvas.color_b(mc) as f64
+    var yy: usize = 0
+    while yy < hpx {
+        let gy: i64 = y0 + yy as i64
+        if gy >= 0 && gy < ch {
+            let rowp: u64 = raster.raster_cov_row(&(*z).ra, yy)
+            var xp: i64 = 0
+            while xp < wpx as i64 {
+                let gx: i64 = x0 + xp
+                if gx >= 0 && gx < cw {
+                    let j: i64 = xp * 3
+                    // quick skip: nothing within reach of the 5-tap filter
+                    let m: f64 = lcd_c(rowp, n3, j - 2) + lcd_c(rowp, n3, j - 1) +
+                    lcd_c(rowp, n3, j) + lcd_c(rowp, n3, j + 1) +
+                    lcd_c(rowp, n3, j + 2) + lcd_c(rowp, n3, j + 3) +
+                    lcd_c(rowp, n3, j + 4)
+                    if m > 0.0 {
+                        var cf: f64 = 1.0
+                        cf = canvas.clip_factor(cv, gx as usize, gy as usize)
+                        var ch3: usize = 0
+                        let q: u64 = dst + ((gy * cw + gx) * 4) as u64
+                        while ch3 < 3 {
+                            let jj: i64 = j + ch3 as i64
+                            let c: f64 = (8.0 * (lcd_c(rowp, n3, jj - 2) +
+                                lcd_c(rowp, n3, jj + 2)) +
+                                77.0 * (lcd_c(rowp, n3, jj - 1) +
+                                lcd_c(rowp, n3, jj + 1)) +
+                                86.0 * lcd_c(rowp, n3, jj)) / 256.0
+                            let a: f64 = c * sa * cf
+                            if a > 0.0 {
+                                var src: f64 = sr
+                                if ch3 == 1 { src = sg }
+                                if ch3 == 2 { src = sb }
+                                let d8: u8 = *((q + ch3 as u64) as *mut u8)
+                                let d: f64 = d8 as f64
+                                var v: f64 = d + (src - d) * a + 0.5
+                                if v > 255.0 { v = 255.0 }
+                                if v < 0.0 { v = 0.0 }
+                                *((q + ch3 as u64) as *mut u8) = v as u8
+                            }
+                            ch3 = ch3 + 1
+                        }
+                    }
+                }
+                xp = xp + 1
+            }
+        }
+        yy = yy + 1
+    }
+}
+
+fn lcd_run_paint(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
+    br: f64, col: u32, p: u64, nn: usize) -> bool {
+    let sz: f64 = (*r).size
+    if sz < 1.0 || sz > 96.0 {
+        return false
+    }
+    let maxw: f64 = ((*z).w / 3) as f64 - 10.0
+    let hpx: usize = (sz * 1.75 + 4.0) as usize
+    if maxw < sz * 2.0 || hpx > (*z).h {
+        return false
+    }
+    var i: usize = 0
+    var pen: f64 = sx
+    while i < nn {
+        let i0: usize = i
+        let pen0: f64 = pen
+        var j: usize = i
+        var pw: f64 = pen
+        while j < nn {
+            var adv: usize = 1
+            let cp: u32 = utf8_at(p, nn, j, &adv)
+            let nx: u32 = next_cp(p, nn, j, adv)
+            let step: f64 = advance_of(z, r, cp, nx)
+            if pw + step - pen0 > maxw && j > i0 {
+                break
+            }
+            pw = pw + step
+            j = j + adv
+        }
+        lcd_seg(z, r, p, nn, i0, j, pen0, pw - pen0, base_y, col)
+        i = j
+        pen = pw
+    }
+    return true
+}
+
+fn paint_run(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
+    br: f64, col: u32, p: u64, nn: usize, vis: bool) -> f64 {
+    if G_LCD && !vis && (*r).sh_on == 0 && (*r).out_on == 0 && (*r).grad_on == 0 &&
+    (*r).slant == 0 && (*r).weight < 700 && nn > 0 &&
+    gpu.gpu_of(painter_canvas(z)) as u64 == 0 {
+        let cvc: *mut canvas.Canvas = painter_canvas(z)
+        if sx + br <= canvas.clip_x0(cvc) || sx >= canvas.clip_x1(cvc) ||
+        base_y + (*r).size * 0.5 <= canvas.clip_y0(cvc) ||
+        base_y - (*r).size * 1.25 >= canvas.clip_y1(cvc) {
+            return sx + br
+        }
+        if lcd_run_paint(z, r, sx, base_y, br, col, p, nn) {
+            if (*z).emoji_any != 0 {
+                emoji_overlay(z, r, sx, p, nn, base_y)
+            }
+            return sx + br
+        }
+    }
+    let e: f64 = paint_run_base(z, r, sx, base_y, br, col, p, nn, vis)
+    if !vis && (*z).emoji_any != 0 {
+        emoji_overlay(z, r, sx, p, nn, base_y)
+    }
+    return e
+}
+
 // ============================================================ TEXT ON THE GPU
 //
 // fUi tempo, stage 2 (lib/fui/gpu.fi). Every glyph is rastered ONCE -- per
@@ -2208,7 +2678,7 @@ fn paint_run(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
 // copies of the run in one raster) and goes up as a mask.
 const GLYPH_KEY: u64 = 1
 
-fn gpu_glyph(g: *mut gpu.Gpu, z: *mut Painter, r: *mut TextRun,
+fn gpu_glyph(g: *mut gpu.Gpu, z: *mut Painter, r: *mut TextRun, fm: u64,
     f: *mut ttf.Font, gid: u32, pen: f64, base_y: f64, sc: f64, col: u32,
     grad: bool, col2: u32, gy0: f64, gy1: f64) {
     var ax: f64 = floor_px(pen)
@@ -2225,7 +2695,7 @@ fn gpu_glyph(g: *mut gpu.Gpu, z: *mut Painter, r: *mut TextRun,
     }
     var k: gpu.AKey = gpu.akey_new()
     k.k[0] = GLYPH_KEY
-    k.k[1] = (*z).fm
+    k.k[1] = fm
     k.k[2] = gid as u64
     k.k[3] = __bits((*r).size)
     var tcb: u64 = 0
@@ -2271,7 +2741,7 @@ fn glyphs_gpu(g: *mut gpu.Gpu, z: *mut Painter, r: *mut TextRun, vis: bool,
         var k: usize = 0
         while k < (*z).bvn {
             let j: usize = br32(z, bo_vis(), k) as usize
-            gpu_glyph(g, z, r, f, br32(z, bo_gid(), j), sx + dx + brf(z, bo_x(), j),
+            gpu_glyph(g, z, r, (*z).fm, f, br32(z, bo_gid(), j), sx + dx + brf(z, bo_x(), j),
                 base_y + dy, sc, col, grad, col2, gy0, gy1)
             k = k + 1
         }
@@ -2283,8 +2753,11 @@ fn glyphs_gpu(g: *mut gpu.Gpu, z: *mut Painter, r: *mut TextRun, vis: bool,
         var adv: usize = 1
         let cp: u32 = utf8_at(p, n, i, &adv)
         let nx: u32 = next_cp(p, n, i, adv)
-        let gid: u32 = ttf.font_glyph_for(f, cp)
-        gpu_glyph(g, z, r, f, gid, pen, base_y + dy, sc, col, grad, col2, gy0, gy1)
+        let fm2: u64 = fb_pick(z, r, cp)
+        let f2: *mut ttf.Font = metrics.fontset_font(fm2)
+        let gid: u32 = ttf.font_glyph_for(f2, cp)
+        gpu_glyph(g, z, r, fm2, f2, gid, pen, base_y + dy,
+            (*r).size / metrics.fm_upem(fm2), col, grad, col2, gy0, gy1)
         pen = pen + advance_of(z, r, cp, nx)
         i = i + adv
     }
@@ -2355,8 +2828,6 @@ fn glyph_line_prepare(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
             return 0
         }
     }
-    let f: *mut ttf.Font = metrics.fontset_font((*z).fm)
-    let sc: f64 = sz / metrics.fm_upem((*z).fm)
     var ay: f64 = floor_px(base_y)
     var qy: i64 = glyphcache.gc_quarter(base_y - ay, 4.0)
     if qy >= 4 {
@@ -2369,7 +2840,6 @@ fn glyph_line_prepare(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
     if ww > (*z).w || wh > (*z).h {
         return 0
     }
-    let k0: u64 = (*z).fm
     let k2: u64 = __bits(sz)
     let k3: u64 = ((*r).weight as u64) | (((*r).slant as u64) << 16)
     var pen: f64 = sx
@@ -2379,6 +2849,9 @@ fn glyph_line_prepare(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
         var adv: usize = 1
         let cp: u32 = utf8_at(p, n, i, &adv)
         let nx: u32 = next_cp(p, n, i, adv)
+        let k0: u64 = fb_pick(z, r, cp)
+        let f: *mut ttf.Font = metrics.fontset_font(k0)
+        let sc: f64 = sz / metrics.fm_upem(k0)
         let gid: u32 = ttf.font_glyph_for(f, cp)
         var ax: f64 = floor_px(pen)
         var q: i64 = glyphcache.gc_quarter(pen - ax, GL_QX)
@@ -2465,7 +2938,7 @@ fn paint_run_kept(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
     let fx: f64 = floor_px(sx)
     let fy: f64 = floor_px(base_y)
     var k: fcache.CKey = fcache.ckey_new(fcache.KIND_TEXT)
-    k.a = (*z).fm
+    k.a = (*z).fm ^ fb_hash(z)
     k.b = __bits(sz)
     k.c = ((*r).weight as u64) | (((*r).slant as u64) << 16) |
     (((*r).kerning as u64) << 24) | (((*r).dir as u64) << 32) |
