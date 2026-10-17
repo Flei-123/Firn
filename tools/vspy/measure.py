@@ -73,15 +73,19 @@ def main():
     tmp = tempfile.mkdtemp(prefix="vspy-")
     exe = os.path.join(tmp, "task")
     t = time.perf_counter()
-    r = subprocess.run([FIRNC, "--opt-level=dev-fast", "-o", exe, fi], capture_output=True, text=True, env=env, cwd=d)
+    flags = open(os.path.join(d, "firnflags")).read().split() if os.path.exists(os.path.join(d, "firnflags")) else []
+    r = subprocess.run([FIRNC, "--opt-level=dev-fast", *flags, "-o", exe, fi], capture_output=True, text=True, env=env, cwd=d)
     comp = (time.perf_counter() - t) * 1000
     if r.returncode != 0:
         print(name + "\tCOMPILE-FAIL\t" + r.stderr[:200].replace("\n", " "))
         return 1
     pyl, fil = count_lines(py, "#"), count_lines(fi, "//")
     pyt, fit = py_tokens(py), fi_tokens(fi)
-    pyr = median_ms(["python3", py], runs, d)
-    fir = median_ms([exe], runs, d)
+    if os.path.exists(os.path.join(d, "norun")):  # a window program: no timing
+        pyr = fir = -1
+    else:
+        pyr = median_ms(["python3", py], runs, d)
+        fir = median_ms([exe], runs, d)
     print("\t".join(str(x) for x in [
         name, pyl, fil, round(fil / pyl, 2), pyt, fit, round(fit / pyt, 2),
         imports(py, "py"), imports(fi, "fi"), round(pyr, 1), round(fir, 1), round(comp)]))
