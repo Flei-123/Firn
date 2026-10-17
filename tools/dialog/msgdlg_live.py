@@ -519,7 +519,10 @@ for name, text in (("empty text", ""), ("umlauts", "ÄÖÜ äöü ß € é"),
     pic(im, "live-odd-%s.png" % name.replace(" ", "-"))
     r.focus()
     xdo("key", "Return")
-    check("%s: shown and answered" % name, result_of(r) == (0, 1))
+    res = r.result()
+    check("%s: shown and answered" % name, res is not None and res[:2] == (0, 1),
+          (res, (r.win.id, r.win.x, r.win.y, r.win.w, r.win.h), xdo("search", "--onlyvisible", "--name", "^msgdlg-live$"),
+           xdo("getwindowfocus")))
 
 # ---------------------------------------------------------------- 7. the driver's other ways out
 env = dict(ENV_LIGHT)
