@@ -36,6 +36,10 @@ bad = 0
 oks = 0
 
 
+def CB_NOT_TEXT(c, path, acc):
+    return "org.a11y.atspi.Text" not in [str(i) for i in c.call(path, acc, "GetInterfaces")]
+
+
 def check(ok, what):
     global bad, oks
     if ok:
@@ -206,6 +210,85 @@ def main():
         check(False, "unknown object gives an error")
     except dbus.DBusException as e:
         check("UnknownObject" in str(e), "unknown object gives UnknownObject")
+
+    # --- events and the Text interface (r219): signals are caught on a second connection
+    from dbus.mainloop.glib import DBusGMainLoop
+    from gi.repository import GLib
+    addr = sys.argv[1]
+    ebus = dbus.bus.BusConnection(addr, mainloop=DBusGMainLoop(set_as_default=False))
+    got = []
+
+    def on_sig(*args, **kw):
+        got.append((str(kw["path"]), str(kw["member"]), args))
+
+    ebus.add_signal_receiver(on_sig, dbus_interface="org.a11y.atspi.Event.Object",
+                             path_keyword="path", member_keyword="member")
+
+    def pump(sec):
+        t = time.time() + sec
+        ctx = GLib.MainContext.default()
+        while time.time() < t:
+            while ctx.iteration(False):
+                pass
+            time.sleep(0.02)
+
+    def seen(path, member, typ=None, d1=None):
+        for pth, mem, a in got:
+            if pth == path and mem == member and (typ is None or str(a[0]) == typ) and (d1 is None or int(a[1]) == d1):
+                return True
+        return False
+
+    pump(0.5)
+    got[:] = []
+    c.call(cb, ACT, "DoAction", 0)
+    pump(0.8)
+    check(seen(cb, "StateChanged", "checked"), "event: StateChanged 'checked' after DoAction on the check box")
+    tbs = [p for k, p in paths.items() if k.startswith("textbox ")]
+    check(len(tbs) == 1, "one text field in the tree")
+    tb = tbs[0]
+    ifs = [str(i) for i in c.call(tb, ACC, "GetInterfaces")]
+    TXT, ETX = "org.a11y.atspi.Text", "org.a11y.atspi.EditableText"
+    check(TXT in ifs and ETX in ifs, "text field offers Text and EditableText")
+    check(CB_NOT_TEXT(c, cb, ACC), "check box does not offer Text")
+    check(int(c.prop(tb, TXT, "CharacterCount")) == 0, "Text: CharacterCount 0 for the empty field")
+    c.call(tb, COMP, "GrabFocus")
+    pump(0.6)
+    check(seen(tb, "StateChanged", "focused", 1), "event: StateChanged 'focused' after GrabFocus")
+    got[:] = []
+    text = u"h\u00e9llo w\u00f6rld"
+    check(bool(c.call(tb, ETX, "InsertText", 0, text, -1)), "EditableText.InsertText")
+    pump(0.8)
+    check(str(c.call(tb, TXT, "GetText", 0, -1)) == text, "Text.GetText(0,-1) returns the text (umlauts)")
+    check(int(c.prop(tb, TXT, "CharacterCount")) == 11, "Text: CharacterCount counts codepoints (11, not 13 bytes)")
+    check(seen(tb, "TextChanged", "insert", 0), "event: TextChanged insert at 0")
+    check(str(c.call(tb, TXT, "GetText", 1, 4)) == u"\u00e9ll", "Text.GetText(1,4) = 'ell' with accent")
+    check(int(c.call(tb, TXT, "GetCharacterAtOffset", 1)) == 0xe9, "Text.GetCharacterAtOffset(1) = e-acute")
+    w = c.call(tb, TXT, "GetStringAtOffset", 8, dbus.UInt32(1))
+    check(str(w[0]) == u"w\u00f6rld" and int(w[1]) == 6 and int(w[2]) == 11, "Text.GetStringAtOffset word at 8 = 'woerld' (6..11)")
+    got[:] = []
+    check(bool(c.call(tb, TXT, "SetCaretOffset", 5)), "Text.SetCaretOffset(5)")
+    pump(0.8)
+    check(int(c.call(tb, TXT, "GetCaretOffset")) == 5 and int(c.prop(tb, TXT, "CaretOffset")) == 5, "Text: caret offset 5")
+    check(seen(tb, "TextCaretMoved", None, 5), "event: TextCaretMoved to 5")
+    got[:] = []
+    check(bool(c.call(tb, TXT, "SetSelection", 0, 1, 4)), "Text.SetSelection(0,1,4)")
+    sel = c.call(tb, TXT, "GetSelection", 0)
+    check(int(c.call(tb, TXT, "GetNSelections")) == 1 and (int(sel[0]), int(sel[1])) == (1, 4), "Text: one selection (1,4)")
+    pump(0.6)
+    check(seen(tb, "TextSelectionChanged"), "event: TextSelectionChanged")
+    got[:] = []
+    check(bool(c.call(tb, ETX, "DeleteText", 0, 6)), "EditableText.DeleteText(0,6)")
+    pump(0.8)
+    check(str(c.call(tb, TXT, "GetText", 0, -1)) == u"w\u00f6rld", "text after DeleteText is 'woerld'")
+    dels = [a for pth, mem, a in got if pth == tb and mem == "TextChanged" and str(a[0]) == "delete"]
+    check(len(dels) == 1 and int(dels[0][1]) == 0 and int(dels[0][2]) == 6 and str(dels[0][3]) == u"h\u00e9llo ",
+          "event: TextChanged delete at 0, length 6, text 'h\u00e9llo '")
+    got[:] = []
+    check(bool(c.call(tb, ETX, "SetTextContents", u"xy")), "EditableText.SetTextContents")
+    pump(0.8)
+    check(seen(tb, "TextChanged", "insert"), "event: TextChanged after SetTextContents")
+    # name / value events: the slider is moved by DoAction? not operable by click centre -> only check no crash
+    check(len(got) > 0 and all(len(a) == 5 for _, _, a in got), "all signals have the 5-field body siiva{sv}")
 
     print("METRIC checks_ok=%d" % oks)
     print("METRIC checks_wrong=%d" % bad)

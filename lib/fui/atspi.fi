@@ -19,11 +19,17 @@
 // org.freedesktop.DBus.Properties and Introspectable.
 //
 // HONEST
-//   T1  NO EVENTS yet: the bridge answers questions, it does not emit
-//       object:state-changed / children-changed signals. A screen reader that caches sees
-//       a change only when it asks again. (Roadmap r19b)
-//   T2  No Text / EditableText interface: a text field is reported with its name and its
-//       state (editable, single line), the caret and the content are not readable via AT-SPI.
+//   T1  EVENTS by POLLING: `bridge_poll` (called once per loop turn by `attach`) compares the live
+//       tree with a per-node record and emits org.a11y.atspi.Event.Object signals (StateChanged,
+//       PropertyChange name/value, ChildrenChanged, TextChanged, TextCaretMoved,
+//       TextSelectionChanged). A change that is undone between two polls is not seen. Children
+//       changes are reported per parent as add/remove of the LAST index; rows of virtual lists
+//       (v<i>_<row>) are not tracked. Text changes of a field that is not focused are reported
+//       as one insert of the whole text.
+//   T2  Text + EditableText for text fields when the bridge knows its app (`bridge_set_app`):
+//       GetText, caret, selection, GetCharacterAtOffset, GetStringAtOffset (char/word, the rest =
+//       the whole line), SetTextContents/InsertText/DeleteText. Offsets are codepoints. Character
+//       extents are the extents of the whole field; no GetOffsetAtPoint, no clipboard methods.
 //   T3  Extents are in WINDOW coordinates (coord type WINDOW) and also answered for SCREEN;
 //       the window's position on the screen is not known to the tree (offset 0,0).
 //   T4  Only the objects the scene has: a node count over the scene's limit is not reachable
@@ -39,12 +45,13 @@ import fui.app
 import plat.fuiwirt
 import fui.control
 import std.env
+import std.hash
 
 export {
     Bridge, bridge_new, bridge_free, bridge_open, bridge_open_address, bridge_is_open,
     bridge_fd, bridge_serve, bridge_set_actions, bridge_calls, bridge_node_total,
     bridge_role_number, bridge_state_bits, attach, enable_from_env, act_click,
-    ATSPI_ROOT_PATH,
+    ATSPI_ROOT_PATH, bridge_poll, bridge_set_app, bridge_events,
 }
 
 const ATSPI_ROOT_PATH: str = "/org/a11y/atspi/accessible/root"
@@ -54,6 +61,8 @@ const IF_COMP: str = "org.a11y.atspi.Component"
 const IF_ACT: str = "org.a11y.atspi.Action"
 const IF_VAL: str = "org.a11y.atspi.Value"
 const IF_APP: str = "org.a11y.atspi.Application"
+const IF_TEXT: str = "org.a11y.atspi.Text"
+const IF_ETEXT: str = "org.a11y.atspi.EditableText"
 const IF_PROPS: str = "org.freedesktop.DBus.Properties"
 const IF_INTRO: str = "org.freedesktop.DBus.Introspectable"
 const NONE: usize = 4294967295
@@ -88,6 +97,16 @@ struct Bridge {
     ud: u64,
     act: fn(u64, usize, usize) -> bool,
     focus: fn(u64, usize) -> bool,
+    // For Text/EditableText and the text events: the *mut app.App (0 = none).
+    app: u64,
+    // Events: the per-node record (heap, SCENE_MAX * 8 words), the signals sent, the text of the
+    // focused field at the last poll.
+    snap: u64,
+    snap_n: usize,
+    primed: bool,
+    events: u64,
+    prev_node: usize,
+    prev_text: rt.Buf,
 }
 
 fn act_none(ud: u64, node: usize, row: usize) -> bool { return false }
@@ -96,10 +115,16 @@ fn focus_none(ud: u64, node: usize) -> bool { return false }
 // `title` stays owned by the caller (like every text in fUi).
 fn bridge_new(sc: *mut scene.Scene, ax: *mut a11y.A11y, title: str) -> Bridge {
     return Bridge { bus: dbus.bus_new(), sc: sc, ax: ax, title: title, open: false,
-        desk_name: [0; 64], desk_n: 0, calls: 0, ud: 0, act: act_none, focus: focus_none }
+        desk_name: [0; 64], desk_n: 0, calls: 0, ud: 0, act: act_none, focus: focus_none,
+        app: 0, snap: 0, snap_n: 0, primed: false, events: 0, prev_node: NONE, prev_text: rt.buf_new() }
 }
 
 fn bridge_free(br: *mut Bridge) {
+    if (*br).snap != 0 {
+        rt.heap_free((*br).snap, scene.SCENE_MAX * SNAP_W * 4)
+        (*br).snap = 0
+    }
+    rt.buf_free(&(*br).prev_text)
     dbus.bus_free(&(*br).bus)
     (*br).open = false
 }
@@ -665,6 +690,10 @@ fn iface_list(br: *mut Bridge, r: Ref, b: *mut rt.Buf) {
         if has_value(br, r) {
             dbus.w_str(b, IF_VAL)
         }
+        if is_text(br, r) {
+            dbus.w_str(b, IF_TEXT)
+            dbus.w_str(b, IF_ETEXT)
+        }
     }
     dbus.w_array_end(b, at, 4)
 }
@@ -754,6 +783,19 @@ fn prop_write(br: *mut Bridge, r: Ref, iface: str, name: str, b: *mut rt.Buf) ->
         } else {
             ok = false
         }
+    } else if iface == IF_TEXT && is_text(br, r) {
+        if name == "CharacterCount" {
+            dbus.w_variant(b, "i")
+            dbus.w_i32(b, text_cp_count(br, r) as i32)
+        } else if name == "CaretOffset" {
+            var c: usize = 0
+            var an: usize = 0
+            text_caret_cp(br, r, &c, &an)
+            dbus.w_variant(b, "i")
+            dbus.w_i32(b, c as i32)
+        } else {
+            ok = false
+        }
     } else if iface == IF_APP && r.kind == K_APP {
         if name == "ToolkitName" {
             dbus.w_variant(b, "s")
@@ -793,6 +835,9 @@ fn prop_name(iface: str, k: usize) -> str {
         if k == 1 { return "MinimumValue" }
         if k == 2 { return "MaximumValue" }
         if k == 3 { return "MinimumIncrement" }
+    } else if iface == IF_TEXT {
+        if k == 0 { return "CharacterCount" }
+        if k == 1 { return "CaretOffset" }
     } else if iface == IF_APP {
         if k == 0 { return "ToolkitName" }
         if k == 1 { return "Version" }
@@ -811,6 +856,9 @@ fn iface_applies(br: *mut Bridge, r: Ref, iface: str) -> bool {
     }
     if iface == IF_APP {
         return r.kind == K_APP
+    }
+    if iface == IF_TEXT {
+        return is_text(br, r)
     }
     return false
 }
@@ -1075,6 +1123,10 @@ fn handle(br: *mut Bridge, m: *mut dbus.Msg) {
         handle_comp(br, m, r)
     } else if iface == IF_ACT {
         handle_act(br, m, r)
+    } else if iface == IF_TEXT && is_text(br, r) {
+        handle_text(br, m, r)
+    } else if iface == IF_ETEXT && is_text(br, r) {
+        handle_etext(br, m, r)
     } else {
         dbus.bus_reply_error(&(*br).bus, m, "org.freedesktop.DBus.Error.UnknownInterface", "unknown interface")
     }
@@ -1113,11 +1165,597 @@ fn bridge_serve(br: *mut Bridge, timeout_ms: i64) -> i32 {
     return served
 }
 
+// ------------------------------------------------------------ Text / EditableText (r219)
+//
+// Offsets in AT-SPI are CODEPOINTS; the editor holds UTF-8 bytes. These helpers convert.
+
+fn is_cont(b: u8) -> bool { return (b & 192 as u8) == 128 as u8 }
+
+fn s_byte(s: str, i: usize) -> u8 { return rt.ld8((s.p) as u64, i) }
+
+fn cp_total(s: str) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < s.n {
+        if !is_cont(s_byte(s, i)) { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// Byte offset of codepoint index `cp` (clamped to the end).
+fn cp_byte(s: str, cp: usize) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < s.n {
+        if !is_cont(s_byte(s, i)) {
+            if n == cp { return i }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return s.n
+}
+
+// Codepoint index of byte offset `b`.
+fn byte_cp(s: str, b: usize) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < s.n && i < b {
+        if !is_cont(s_byte(s, i)) { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn is_ws(b: u8) -> bool { return b == 32 as u8 || b == 9 as u8 || b == 10 as u8 || b == 13 as u8 }
+
+// A text field node of a program (needs bridge_set_app): the Text interfaces apply.
+fn is_text(br: *mut Bridge, r: Ref) -> bool {
+    if (*br).app == 0 || r.kind != K_NODE || !node_ok(br, r.node) {
+        return false
+    }
+    var c: usize = 0
+    var an: usize = 0
+    return app.text_caret((*br).app as *mut app.App, r.node, &c, &an)
+}
+
+fn node_text(br: *mut Bridge, r: Ref) -> str {
+    return app.text((*br).app as *mut app.App, r.node)
+}
+
+fn text_cp_count(br: *mut Bridge, r: Ref) -> usize { return cp_total(node_text(br, r)) }
+
+// caret / anchor as codepoint offsets
+fn text_caret_cp(br: *mut Bridge, r: Ref, caret: *mut usize, anchor: *mut usize) {
+    var c: usize = 0
+    var an: usize = 0
+    *caret = 0
+    *anchor = 0
+    if app.text_caret((*br).app as *mut app.App, r.node, &c, &an) {
+        let s: str = node_text(br, r)
+        *caret = byte_cp(s, c)
+        *anchor = byte_cp(s, an)
+    }
+}
+
+fn put_caret_cp(br: *mut Bridge, r: Ref, anchor_cp: usize, caret_cp: usize) -> bool {
+    let s: str = node_text(br, r)
+    return app.set_text_caret((*br).app as *mut app.App, r.node, cp_byte(s, anchor_cp), cp_byte(s, caret_cp))
+}
+
+// codepoint argument -> clamped index; -1 = the end
+fn cp_arg(s: str, v: i32) -> usize {
+    let tot: usize = cp_total(s)
+    if v < 0 { return tot }
+    if (v as usize) > tot { return tot }
+    return v as usize
+}
+
+fn cp_at(s: str, b: usize) -> i32 {
+    if b >= s.n { return 0 - 1 }
+    let c0: u32 = s_byte(s, b) as u32
+    if c0 < 128 as u32 { return c0 as i32 }
+    var n: usize = 1
+    var v: u32 = 0 as u32
+    if c0 >= 240 as u32 { n = 4; v = c0 & 7 as u32 }
+    else if c0 >= 224 as u32 { n = 3; v = c0 & 15 as u32 }
+    else { n = 2; v = c0 & 31 as u32 }
+    var k: usize = 1
+    while k < n && b + k < s.n {
+        v = (v << (6 as u32)) | ((s_byte(s, b + k) as u32) & 63 as u32)
+        k = k + 1
+    }
+    return v as i32
+}
+
+#[allow_escape]
+fn handle_text(br: *mut Bridge, m: *mut dbus.Msg, r: Ref) {
+    let member: str = (*m).f.member
+    var body: rt.Buf = rt.buf_new()
+    var rd: dbus.Rd = dbus.msg_body(m)
+    let s: str = node_text(br, r)
+    var car: usize = 0
+    var anc: usize = 0
+    text_caret_cp(br, r, &car, &anc)
+    if member == "GetText" {
+        let a0: i32 = dbus.rd_i32(&rd)
+        let a1: i32 = dbus.rd_i32(&rd)
+        let st: usize = cp_arg(s, a0)
+        let en: usize = cp_arg(s, a1)
+        var bs: usize = cp_byte(s, st)
+        var be: usize = cp_byte(s, en)
+        if be < bs { be = bs }
+        w_raw_str(&body, ((s.p) as u64) + (bs as u64), be - bs)
+        dbus.bus_reply(&(*br).bus, m, "s", &body)
+    } else if member == "GetCaretOffset" {
+        dbus.w_i32(&body, car as i32)
+        dbus.bus_reply(&(*br).bus, m, "i", &body)
+    } else if member == "SetCaretOffset" {
+        let o: i32 = dbus.rd_i32(&rd)
+        var ok: bool = false
+        if o >= 0 && (o as usize) <= cp_total(s) {
+            ok = put_caret_cp(br, r, o as usize, o as usize)
+        }
+        dbus.w_bool(&body, ok)
+        dbus.bus_reply(&(*br).bus, m, "b", &body)
+    } else if member == "GetNSelections" {
+        var n: i32 = 0
+        if car != anc { n = 1 }
+        dbus.w_i32(&body, n)
+        dbus.bus_reply(&(*br).bus, m, "i", &body)
+    } else if member == "GetSelection" {
+        let ix: i32 = dbus.rd_i32(&rd)
+        if ix != 0 || car == anc {
+            dbus.bus_reply_error(&(*br).bus, m, "org.freedesktop.DBus.Error.InvalidArgs", "no such selection")
+        } else {
+            dbus.w_struct_begin(&body)
+            var lo: usize = car
+            var hi: usize = anc
+            if anc < car { lo = anc; hi = car }
+            dbus.w_i32(&body, lo as i32)
+            dbus.w_i32(&body, hi as i32)
+            dbus.bus_reply(&(*br).bus, m, "(ii)", &body)
+        }
+    } else if member == "SetSelection" || member == "AddSelection" {
+        var ix: i32 = 0
+        if member == "SetSelection" { ix = dbus.rd_i32(&rd) }
+        let a0: i32 = dbus.rd_i32(&rd)
+        let a1: i32 = dbus.rd_i32(&rd)
+        var ok: bool = false
+        let tot: usize = cp_total(s)
+        if ix == 0 && a0 >= 0 && a1 >= 0 && (a0 as usize) <= tot && (a1 as usize) <= tot {
+            ok = put_caret_cp(br, r, a0 as usize, a1 as usize)
+        }
+        dbus.w_bool(&body, ok)
+        dbus.bus_reply(&(*br).bus, m, "b", &body)
+    } else if member == "RemoveSelection" {
+        let ix: i32 = dbus.rd_i32(&rd)
+        var ok: bool = false
+        if ix == 0 && car != anc { ok = put_caret_cp(br, r, car, car) }
+        dbus.w_bool(&body, ok)
+        dbus.bus_reply(&(*br).bus, m, "b", &body)
+    } else if member == "GetCharacterAtOffset" {
+        let o: i32 = dbus.rd_i32(&rd)
+        var v: i32 = 0 - 1
+        if o >= 0 && (o as usize) < cp_total(s) { v = cp_at(s, cp_byte(s, o as usize)) }
+        dbus.w_i32(&body, v)
+        dbus.bus_reply(&(*br).bus, m, "i", &body)
+    } else if member == "GetStringAtOffset" {
+        // granularity: 0 char, 1 word (with its trailing blanks), 2.. line/sentence/paragraph = whole
+        // text (a text field of fUi is one line)
+        let o: i32 = dbus.rd_i32(&rd)
+        let gr: u32 = dbus.rd_u32(&rd)
+        var b0: usize = 0
+        var b1: usize = s.n
+        if o < 0 || (o as usize) > cp_total(s) {
+            b0 = 0
+            b1 = 0
+        } else if gr == 0 as u32 {
+            b0 = cp_byte(s, o as usize)
+            b1 = cp_byte(s, (o as usize) + 1)
+        } else if gr == 1 as u32 {
+            var p: usize = cp_byte(s, o as usize)
+            if p < s.n && is_ws(s_byte(s, p)) {
+                while p > 0 && is_ws(s_byte(s, p - 1)) { p = p - 1 }
+            }
+            while p > 0 && !is_ws(s_byte(s, p - 1)) { p = p - 1 }
+            b0 = p
+            var q: usize = p
+            while q < s.n && !is_ws(s_byte(s, q)) { q = q + 1 }
+            while q < s.n && is_ws(s_byte(s, q)) { q = q + 1 }
+            b1 = q
+        }
+        dbus.w_struct_begin(&body)
+        w_raw_str(&body, ((s.p) as u64) + (b0 as u64), b1 - b0)
+        dbus.w_i32(&body, byte_cp(s, b0) as i32)
+        dbus.w_i32(&body, byte_cp(s, b1) as i32)
+        dbus.bus_reply(&(*br).bus, m, "(sii)", &body)
+    } else if member == "GetCharacterExtents" || member == "GetRangeExtents" {
+        // coarse: the extents of the whole field
+        var x: i64 = 0
+        var y: i64 = 0
+        var w: i64 = 0
+        var h: i64 = 0
+        extents_of(br, r, &x, &y, &w, &h)
+        dbus.w_struct_begin(&body)
+        dbus.w_i32(&body, x as i32)
+        dbus.w_i32(&body, y as i32)
+        dbus.w_i32(&body, w as i32)
+        dbus.w_i32(&body, h as i32)
+        dbus.bus_reply(&(*br).bus, m, "(iiii)", &body)
+    } else if member == "GetDefaultAttributes" {
+        let at: usize = dbus.w_array_begin(&body, 8)
+        dbus.w_array_end(&body, at, 8)
+        dbus.bus_reply(&(*br).bus, m, "a{ss}", &body)
+    } else if member == "GetAttributes" {
+        dbus.w_struct_begin(&body)
+        let at: usize = dbus.w_array_begin(&body, 8)
+        dbus.w_array_end(&body, at, 8)
+        dbus.w_i32(&body, 0)
+        dbus.w_i32(&body, cp_total(s) as i32)
+        dbus.bus_reply(&(*br).bus, m, "(a{ss}ii)", &body)
+    } else {
+        unknown_method(br, m)
+    }
+    rt.buf_free(&body)
+}
+
+#[allow_escape]
+fn handle_etext(br: *mut Bridge, m: *mut dbus.Msg, r: Ref) {
+    let member: str = (*m).f.member
+    var body: rt.Buf = rt.buf_new()
+    var rd: dbus.Rd = dbus.msg_body(m)
+    let s: str = node_text(br, r)
+    let ro: bool = (a11y.a11y_state((*br).sc, (*br).ax, r.node) & a11y.ST_READONLY) != 0 as u32
+    let a: *mut app.App = (*br).app as *mut app.App
+    var ok: bool = false
+    var known: bool = true
+    if member == "SetTextContents" {
+        let t: str = dbus.rd_str(&rd)
+        if !ro && rd.ok {
+            app.set_text(a, r.node, t)
+            ok = true
+        }
+    } else if member == "InsertText" {
+        let pos: i32 = dbus.rd_i32(&rd)
+        let t: str = dbus.rd_str(&rd)
+        let ln: i32 = dbus.rd_i32(&rd)
+        if !ro && rd.ok && pos >= 0 && (pos as usize) <= cp_total(s) {
+            let at: usize = cp_byte(s, pos as usize)
+            var nb: rt.Buf = rt.buf_new()
+            rt.buf_push_bytes(&nb, (s.p) as u64, at)
+            var tn: usize = t.n
+            if ln >= 0 {
+                let lb: usize = cp_byte(t, ln as usize)
+                if lb < tn { tn = lb }
+            }
+            rt.buf_push_bytes(&nb, (t.p) as u64, tn)
+            rt.buf_push_bytes(&nb, ((s.p) as u64) + (at as u64), s.n - at)
+            app.set_text(a, r.node, str { p: rt.buf_data(&nb), n: rt.buf_len(&nb) })
+            rt.buf_free(&nb)
+            ok = true
+        }
+    } else if member == "DeleteText" {
+        let a0: i32 = dbus.rd_i32(&rd)
+        let a1: i32 = dbus.rd_i32(&rd)
+        if !ro && rd.ok && a0 >= 0 {
+            let st: usize = cp_arg(s, a0)
+            let en: usize = cp_arg(s, a1)
+            if en > st {
+                let b0: usize = cp_byte(s, st)
+                let b1: usize = cp_byte(s, en)
+                var nb: rt.Buf = rt.buf_new()
+                rt.buf_push_bytes(&nb, (s.p) as u64, b0)
+                rt.buf_push_bytes(&nb, ((s.p) as u64) + (b1 as u64), s.n - b1)
+                app.set_text(a, r.node, str { p: rt.buf_data(&nb), n: rt.buf_len(&nb) })
+                rt.buf_free(&nb)
+                ok = true
+            }
+        }
+    } else {
+        known = false
+    }
+    if known {
+        dbus.w_bool(&body, ok)
+        dbus.bus_reply(&(*br).bus, m, "b", &body)
+    } else {
+        unknown_method(br, m)
+    }
+    rt.buf_free(&body)
+}
+
+// ------------------------------------------------------------ events (r219)
+//
+// The bridge keeps a small record per scene node (state bits, name hash, value, child count, text
+// hash, caret, anchor) and `bridge_poll` compares the live tree with it, emitting
+// org.a11y.atspi.Event.Object signals for what changed: StateChanged, PropertyChange (accessible-name,
+// accessible-value), ChildrenChanged, TextChanged, TextCaretMoved, TextSelectionChanged.
+// The first poll only records. Call it once per frame (attach does).
+
+const SNAP_W: usize = 8
+const IF_EVT: str = "org.a11y.atspi.Event.Object"
+
+fn state_name(bit: u32) -> str {
+    if bit == 1 as u32 { return "active" }
+    if bit == 4 as u32 { return "checked" }
+    if bit == 5 as u32 { return "collapsed" }
+    if bit == 7 as u32 { return "editable" }
+    if bit == 8 as u32 { return "enabled" }
+    if bit == 9 as u32 { return "expandable" }
+    if bit == 10 as u32 { return "expanded" }
+    if bit == 11 as u32 { return "focusable" }
+    if bit == 12 as u32 { return "focused" }
+    if bit == 20 as u32 { return "pressed" }
+    if bit == 22 as u32 { return "selectable" }
+    if bit == 23 as u32 { return "selected" }
+    if bit == 24 as u32 { return "sensitive" }
+    if bit == 25 as u32 { return "showing" }
+    if bit == 26 as u32 { return "single-line" }
+    if bit == 30 as u32 { return "visible" }
+    if bit == 32 as u32 { return "indeterminate" }
+    return ""
+}
+
+fn bridge_events(br: *mut Bridge) -> u64 { return (*br).events }
+
+fn bridge_set_app(br: *mut Bridge, a: *mut app.App) { (*br).app = a as u64 }
+
+// Sends one Event.Object signal from the object `r`: the body is "<type>", d1, d2, then the caller's
+// variant (written by `any`), then an empty property dictionary.
+#[allow_escape]
+fn emit_head(br: *mut Bridge, r: Ref, member: str, typ: str, d1: i32, d2: i32, body: *mut rt.Buf) {
+    dbus.w_str(body, typ)
+    dbus.w_i32(body, d1)
+    dbus.w_i32(body, d2)
+}
+
+#[allow_escape]
+fn emit_end(br: *mut Bridge, r: Ref, member: str, body: *mut rt.Buf) {
+    let at: usize = dbus.w_array_begin(body, 8)
+    dbus.w_array_end(body, at, 8)
+    var pt: rt.Buf = rt.buf_new()
+    path_of(r, &pt)
+    let ps: str = str { p: rt.buf_data(&pt), n: rt.buf_len(&pt) }
+    if dbus.bus_signal(&(*br).bus, ps, IF_EVT, member, "siiva{sv}", body) {
+        (*br).events = (*br).events + 1 as u64
+    }
+    rt.buf_free(&pt)
+}
+
+fn emit_state(br: *mut Bridge, r: Ref, bit: u32, on: bool) {
+    let nm: str = state_name(bit)
+    if nm.n == 0 { return }
+    var body: rt.Buf = rt.buf_new()
+    var d1: i32 = 0
+    if on { d1 = 1 }
+    emit_head(br, r, "StateChanged", nm, d1, 0, &body)
+    dbus.w_variant(&body, "i")
+    dbus.w_i32(&body, 0)
+    emit_end(br, r, "StateChanged", &body)
+    rt.buf_free(&body)
+}
+
+#[allow_escape]
+fn emit_name(br: *mut Bridge, r: Ref) {
+    var body: rt.Buf = rt.buf_new()
+    var t: rt.Buf = rt.buf_new()
+    name_into(br, r, &t)
+    emit_head(br, r, "PropertyChange", "accessible-name", 0, 0, &body)
+    dbus.w_variant(&body, "s")
+    w_raw_str(&body, rt.buf_ptr(&t), rt.buf_len(&t))
+    emit_end(br, r, "PropertyChange", &body)
+    rt.buf_free(&t)
+    rt.buf_free(&body)
+}
+
+fn emit_value(br: *mut Bridge, r: Ref) {
+    var body: rt.Buf = rt.buf_new()
+    emit_head(br, r, "PropertyChange", "accessible-value", 0, 0, &body)
+    dbus.w_variant(&body, "d")
+    w_double(&body, a11y.a11y_value((*br).sc, r.node))
+    emit_end(br, r, "PropertyChange", &body)
+    rt.buf_free(&body)
+}
+
+fn emit_children(br: *mut Bridge, r: Ref, was: usize, now: usize) {
+    var body: rt.Buf = rt.buf_new()
+    var add: bool = now > was
+    var ix: usize = was
+    if now > was { ix = now - 1 } else if was > 0 { ix = was - 1 }
+    if add {
+        emit_head(br, r, "ChildrenChanged", "add", ix as i32, 0, &body)
+        dbus.w_variant(&body, "(so)")
+        w_ref(br, &body, kid_at(br, r, ix))
+    } else {
+        emit_head(br, r, "ChildrenChanged", "remove", ix as i32, 0, &body)
+        dbus.w_variant(&body, "(so)")
+        dbus.w_struct_begin(&body)
+        dbus.w_str(&body, "")
+        dbus.w_path(&body, "/org/a11y/atspi/null")
+    }
+    emit_end(br, r, "ChildrenChanged", &body)
+    rt.buf_free(&body)
+}
+
+#[allow_escape]
+fn emit_text(br: *mut Bridge, r: Ref, ins: bool, off: usize, p: u64, nb: usize, ncp: usize) {
+    var body: rt.Buf = rt.buf_new()
+    var typ: str = "delete"
+    if ins { typ = "insert" }
+    emit_head(br, r, "TextChanged", typ, off as i32, ncp as i32, &body)
+    dbus.w_variant(&body, "s")
+    w_raw_str(&body, p, nb)
+    emit_end(br, r, "TextChanged", &body)
+    rt.buf_free(&body)
+}
+
+fn emit_caret(br: *mut Bridge, r: Ref, off: usize) {
+    var body: rt.Buf = rt.buf_new()
+    emit_head(br, r, "TextCaretMoved", "text-caret-moved", off as i32, 0, &body)
+    dbus.w_variant(&body, "i")
+    dbus.w_i32(&body, 0)
+    emit_end(br, r, "TextCaretMoved", &body)
+    rt.buf_free(&body)
+}
+
+fn emit_selection(br: *mut Bridge, r: Ref) {
+    var body: rt.Buf = rt.buf_new()
+    emit_head(br, r, "TextSelectionChanged", "text-selection-changed", 0, 0, &body)
+    dbus.w_variant(&body, "i")
+    dbus.w_i32(&body, 0)
+    emit_end(br, r, "TextSelectionChanged", &body)
+    rt.buf_free(&body)
+}
+
+// What changed in a text between `old` and `new`: a deletion and/or an insertion at the same place
+// (common prefix and suffix, on codepoint boundaries).
+#[allow_escape]
+fn emit_text_diff(br: *mut Bridge, r: Ref, old: str, new: str) {
+    var pb: usize = 0
+    while pb < old.n && pb < new.n && s_byte(old, pb) == s_byte(new, pb) { pb = pb + 1 }
+    while pb > 0 && ((pb < old.n && is_cont(s_byte(old, pb))) || (pb < new.n && is_cont(s_byte(new, pb)))) {
+        pb = pb - 1
+    }
+    var sb: usize = 0
+    while sb + pb < old.n && sb + pb < new.n && s_byte(old, old.n - 1 - sb) == s_byte(new, new.n - 1 - sb) {
+        sb = sb + 1
+    }
+    while sb > 0 && ((old.n - sb < old.n && is_cont(s_byte(old, old.n - sb)))
+        || (new.n - sb < new.n && is_cont(s_byte(new, new.n - sb)))) {
+        sb = sb - 1
+    }
+    let od: usize = old.n - sb - pb
+    let nd: usize = new.n - sb - pb
+    let off: usize = byte_cp(new, pb)
+    if od > 0 {
+        let dp: u64 = ((old.p) as u64) + (pb as u64)
+        emit_text(br, r, false, off, dp, od, cp_total(str { p: (dp as *mut u8), n: od }))
+    }
+    if nd > 0 {
+        let ip: u64 = ((new.p) as u64) + (pb as u64)
+        emit_text(br, r, true, off, ip, nd, cp_total(str { p: (ip as *mut u8), n: nd }))
+    }
+}
+
+// Compare the live tree with the record and emit the signals; returns the number of signals sent.
+// The first call (and every call that finds new nodes) only records. Cheap when nothing changed.
+#[allow_escape]
+fn bridge_poll(br: *mut Bridge) -> usize {
+    if !(*br).open { return 0 }
+    let before: u64 = (*br).events
+    if (*br).snap == 0 {
+        (*br).snap = rt.heap_alloc(scene.SCENE_MAX * SNAP_W * 4)
+        rt.mem_set((*br).snap, 0, scene.SCENE_MAX * SNAP_W * 4)
+        (*br).snap_n = 0
+        (*br).primed = false
+    }
+    var n: usize = scene.scene_count((*br).sc)
+    if n > scene.SCENE_MAX { n = scene.SCENE_MAX }
+    var focus_text: usize = NONE
+    var i: usize = 0
+    while i < n {
+        let r: Ref = Ref { kind: K_NODE, node: i, row: 0 }
+        var lo: u32 = 0 as u32
+        var hi: u32 = 0 as u32
+        bridge_state_bits(br, r, &lo, &hi)
+        var nb: rt.Buf = rt.buf_new()
+        name_into(br, r, &nb)
+        let nh: u32 = hash.fnv1a32(rt.buf_ptr(&nb), rt.buf_len(&nb))
+        rt.buf_free(&nb)
+        var vl: u32 = 0 as u32
+        if has_value(br, r) { vl = a11y.a11y_value((*br).sc, i) as u32 }
+        let kc: u32 = kid_count(br, r) as u32
+        var th: u32 = 0 as u32
+        var cc: u32 = 0 as u32
+        var an: u32 = 0 as u32
+        if is_text(br, r) {
+            let s: str = node_text(br, r)
+            th = hash.fnv1a32((s.p) as u64, s.n)
+            var c1: usize = 0
+            var a1: usize = 0
+            text_caret_cp(br, r, &c1, &a1)
+            cc = c1 as u32
+            an = a1 as u32
+            if (lo & ((1 as u32) << (12 as u32))) != 0 as u32 { focus_text = i }
+        }
+        let q: u64 = (*br).snap + ((i * SNAP_W * 4) as u64)
+        if (*br).primed && i < (*br).snap_n {
+            let olo: u32 = rt.ld32(q, 0)
+            let ohi: u32 = rt.ld32(q, 1)
+            if olo != lo || ohi != hi {
+                var b: u32 = 0 as u32
+                while b < 64 as u32 {
+                    var o1: bool = false
+                    var n1: bool = false
+                    if b < 32 as u32 {
+                        o1 = (olo & ((1 as u32) << b)) != 0 as u32
+                        n1 = (lo & ((1 as u32) << b)) != 0 as u32
+                    } else {
+                        o1 = (ohi & ((1 as u32) << (b - 32 as u32))) != 0 as u32
+                        n1 = (hi & ((1 as u32) << (b - 32 as u32))) != 0 as u32
+                    }
+                    if o1 != n1 { emit_state(br, r, b, n1) }
+                    b = b + 1 as u32
+                }
+            }
+            if rt.ld32(q, 2) != nh { emit_name(br, r) }
+            if rt.ld32(q, 3) != vl { emit_value(br, r) }
+            if rt.ld32(q, 4) != kc { emit_children(br, r, rt.ld32(q, 4) as usize, kc as usize) }
+            if rt.ld32(q, 5) != th {
+                if (*br).prev_node == i {
+                    emit_text_diff(br, r, str { p: rt.buf_data(&(*br).prev_text), n: rt.buf_len(&(*br).prev_text) },
+                        node_text(br, r))
+                } else {
+                    let s2: str = node_text(br, r)
+                    emit_text(br, r, true, 0, (s2.p) as u64, s2.n, cp_total(s2))
+                }
+            }
+            if rt.ld32(q, 6) != cc { emit_caret(br, r, cc as usize) }
+            let oc: u32 = rt.ld32(q, 6)
+            let oa: u32 = rt.ld32(q, 7)
+            let was_sel: bool = oc != oa
+            let is_sel: bool = cc != an
+            if was_sel != is_sel || (is_sel && (oc != cc || oa != an)) {
+                emit_selection(br, r)
+            }
+        }
+        rt.st32(q, 0, lo)
+        rt.st32(q, 1, hi)
+        rt.st32(q, 2, nh)
+        rt.st32(q, 3, vl)
+        rt.st32(q, 4, kc)
+        rt.st32(q, 5, th)
+        rt.st32(q, 6, cc)
+        rt.st32(q, 7, an)
+        i = i + 1
+    }
+    (*br).snap_n = n
+    (*br).primed = true
+    // remember the text of the focused field for the next diff
+    rt.buf_clear(&(*br).prev_text)
+    (*br).prev_node = NONE
+    if focus_text != NONE {
+        let fs: str = node_text(br, Ref { kind: K_NODE, node: focus_text, row: 0 })
+        rt.buf_push_bytes(&(*br).prev_text, (fs.p) as u64, fs.n)
+        (*br).prev_node = focus_text
+    }
+    return ((*br).events - before) as usize
+}
+
 // ---------------------------------------------------- the window loop
 
 fn pump_fd(ud: u64) -> i32 { return bridge_fd(ud as *mut Bridge) }
-fn pump_ms(ud: u64, wanted: i64) -> i64 { return wanted }
-fn pump_step(ud: u64) -> bool { return bridge_serve(ud as *mut Bridge, 0) > 0 }
+// The loop wakes at least every 100 ms so that `bridge_poll` sees changes made without a bus call.
+fn pump_ms(ud: u64, wanted: i64) -> i64 {
+    if wanted < 0 || wanted > 100 { return 100 }
+    return wanted
+}
+fn pump_step(ud: u64) -> bool {
+    let n: i32 = bridge_serve(ud as *mut Bridge, 0)
+    let e: usize = bridge_poll(ud as *mut Bridge)
+    return n > 0 || e > 0
+}
 
 // Serve `br` from the window loop of `a` (like looppump.attach; one pump per window).
 fn attach(a: *mut app.App, br: *mut Bridge) {
@@ -1169,6 +1807,7 @@ fn enable_from_env(a: *mut app.App, title: str) -> bool {
     let br: *mut Bridge = rt.heap_alloc(65536) as *mut Bridge
     *br = bridge_new(app.app_scene(a), app.ax(a), title)
     bridge_set_actions(br, a as u64, act_click, focus_node)
+    bridge_set_app(br, a)
     var ok: bool = false
     if v == "1" {
         ok = bridge_open(br)
