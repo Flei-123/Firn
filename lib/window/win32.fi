@@ -574,6 +574,12 @@ struct Platte {
     stride: usize,
     dpi: usize,
     open: bool,
+    // r172: this window is a menu popup (WS_POPUP | TOPMOST | NOACTIVATE); its pointer
+    // events carry SCREEN coordinates: pop_x/pop_y is where its client area is
+    popup: bool,
+    pop_x: i64,
+    pop_y: i64,
+    pop_cap: bool,
     // the event queue -- it MUST lie here and not above: the window
     // procedure is a callback and reaches only this structure.
     q_kind: [u32; 64],
@@ -674,6 +680,7 @@ fn code_of4(f: fn(u64, u64, u64, u64) -> u64) -> u64 {
 fn surface_new() -> Platte {
     return Platte { dragging: 0, hwnd: 0, hdc_mem: 0, hbm: 0, hbm_old: 0, bits: 0,
         w: 0, h: 0, stride: 0, dpi: 96, open: false,
+        popup: false, pop_x: 0, pop_y: 0, pop_cap: false,
         q_kind: [0; 64], q_a: [0; 64], q_x: [0; 64], q_y: [0; 64],
         q_s: [0; 64], q_head: 0, q_tail: 0,
         dark: false, dark_known: false, gift: 0,
@@ -1426,6 +1433,14 @@ fn wndproc(hwnd: u64, msg: u64, wp: u64, lp: u64) -> u64 {
         (*w).clip_own = false // somebody else copied: what we offered is gone
         return 0 as u64
     }
+    if m == 28 && wp == 0 as u64 && G_POP0 != 0 && !(*w).popup {
+        // WM_ACTIVATEAPP, deactivated: a press far outside every window of ours closes the menu
+        // (fuipopup treats a press outside the menu and the window that way)
+        push_ev(G_POP0 as *mut Platte, window.EV_BUTTON, window.BTN_LEFT, 32000 as u32, 32000 as u32, 0 as u32)
+    }
+    if m == 33 && (*w).popup {
+        return 3 as u64 // WM_MOUSEACTIVATE -> MA_NOACTIVATE: a click on a menu never takes the focus
+    }
     if m == WM_CLOSE {
         push_ev(w, window.EV_CLOSED, 0 as u32, 0 as u32, 0 as u32,
             0 as u32)
@@ -1434,6 +1449,9 @@ fn wndproc(hwnd: u64, msg: u64, wp: u64, lp: u64) -> u64 {
     if m == WM_DESTROY {
         push_ev(w, window.EV_CLOSED, 0 as u32, 0 as u32, 0 as u32,
             0 as u32)
+        if (*w).popup {
+            return 0 as u64 // closing a menu must not end the program
+        }
         PostQuitMessage(0)
         return 0 as u64
     }
@@ -1466,16 +1484,10 @@ fn wndproc(hwnd: u64, msg: u64, wp: u64, lp: u64) -> u64 {
         }
         return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
     }
-    if (m == WM_LBUTTONUP || m == WM_RBUTTONUP || m == WM_MBUTTONUP) && (*w).rawk {
-        let l: i64 = lp as i64
-        var px: i64 = l & 65535
-        var py: i64 = (l >> 16) & 65535
-        if px > 32767 {
-            px = 0
-        }
-        if py > 32767 {
-            py = 0
-        }
+    if (m == WM_LBUTTONUP || m == WM_RBUTTONUP || m == WM_MBUTTONUP) && ((*w).rawk || (*w).popup) {
+        var px: i64 = 0
+        var py: i64 = 0
+        ptr_pos(w, lp, &px, &py)
         var knopf: u32 = window.BTN_LEFT
         if m == WM_RBUTTONUP {
             knopf = window.BTN_RIGHT
@@ -1551,15 +1563,9 @@ fn wndproc(hwnd: u64, msg: u64, wp: u64, lp: u64) -> u64 {
         return 0 as u64
     }
     if m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN {
-        let l: i64 = lp as i64
-        var px: i64 = l & 65535
-        var py: i64 = (l >> 16) & 65535
-        if px > 32767 {
-            px = 0
-        }
-        if py > 32767 {
-            py = 0
-        }
+        var px: i64 = 0
+        var py: i64 = 0
+        ptr_pos(w, lp, &px, &py)
         var knopf: u32 = window.BTN_LEFT
         if m == WM_RBUTTONDOWN {
             knopf = window.BTN_RIGHT
@@ -1575,17 +1581,9 @@ fn wndproc(hwnd: u64, msg: u64, wp: u64, lp: u64) -> u64 {
         if (*w).cur_mode == 2 as u32 {
             return 0 as u64
         }
-        let l: i64 = lp as i64
-        var px: i64 = l & 65535
-        var py: i64 = (l >> 16) & 65535
-        // A negative value arrives as a 65535 complement -- the pointer is
-        // then left of or above the window, so on no button.
-        if px > 32767 {
-            px = 0
-        }
-        if py > 32767 {
-            py = 0
-        }
+        var px: i64 = 0
+        var py: i64 = 0
+        ptr_pos(w, lp, &px, &py)
         push_ev(w, window.EV_MOTION, 0 as u32, px as u32, py as u32,
             state())
         return 0 as u64
@@ -1761,6 +1759,12 @@ fn r_titlebar_colour(w: *mut Platte, rgb: u32, an: bool) {
 // before the window: whoever sets the DPI awareness only afterwards no
 // longer has it, and Windows then stretches the image with the result
 // that on Android was the blurriness -- only this time produced by the system.
+static mut G_CLS_DONE: bool = false
+// the popup that holds the capture (the first level of a menu), 0 = none: the program losing the
+// activation (another program was clicked, the desktop) dismisses it, because SetCapture does not
+// reach clicks on other programs' windows unless a button is already down
+static mut G_POP0: u64 = 0
+
 fn r_open(w: *mut Platte, disp: usize) -> bool {
     // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (HANDLE)-4.
     SetProcessDpiAwarenessContext(0 - 4)
@@ -1779,8 +1783,12 @@ fn r_open(w: *mut Platte, disp: usize) -> bool {
     rt.st64(p, 5, LoadCursorW(0, 32512) as u64)
     // hbrBackground = 0: Windows erases nothing, we cover everything.
     rt.st64(p, 8, (&cls[0]) as u64)
-    if RegisterClassW(p) == 0 {
-        return false
+    // a second window (a menu popup) reuses the class: registering it again fails
+    if !G_CLS_DONE {
+        if RegisterClassW(p) == 0 {
+            return false
+        }
+        G_CLS_DONE = true
     }
     (*w).open = true
     read_theme(w)
@@ -1877,11 +1885,94 @@ fn dib_free(w: *mut Platte) {
 // `false` when Windows does not hand it over -- then the caller's
 // fixed default stands.
 
-// r168: a popup window of the screen's own: not on this back end (yet).
-fn r_popup(p: *mut Platte, sx: usize, sy: usize, w: usize, h: usize, grab: bool) -> bool { return false }
-fn r_popup_place(p: *mut Platte, sx: usize, sy: usize, w: usize, h: usize) -> bool { return false }
-fn r_origin(p: *mut Platte, ox: *mut i64, oy: *mut i64) -> bool { return false }
-fn r_is_popup(p: *mut Platte) -> bool { return false }
+// r168/r172: a POPUP window of the screen's own (a menu level): no frame, above everything,
+// never takes the focus (WS_EX_NOACTIVATE), and the first level holds the pointer (SetCapture), so a
+// click anywhere on the screen reaches it and the menu can close itself. Its pointer events carry SCREEN
+// coordinates (as the X11 popup's do). Keys are not grabbed: the program's window keeps the focus
+// and its key events reach the menu as they always did. Call after `r_open`, instead of `r_make`.
+// WS_EX_TOPMOST 0x8 | WS_EX_TOOLWINDOW 0x80 | WS_EX_NOACTIVATE 0x08000000; WS_POPUP 0x80000000.
+fn r_popup(p: *mut Platte, sx: usize, sy: usize, w: usize, h: usize, grab: bool) -> bool {
+    if !(*p).open || w == 0 || h == 0 {
+        return false
+    }
+    var cls: [u16; 10] = u"FirnFenst\0"
+    var title: [u16; 5] = u"Menu\0"
+    let inst: i64 = GetModuleHandleW(0)
+    let hw: i64 = CreateWindowExW(134217864 + 128, (&cls[0]) as u64, (&title[0]) as u64,
+        2147483648, sx as i64, sy as i64, w as i64, h as i64, 0, 0, inst, 0)
+    if hw == 0 {
+        return false
+    }
+    (*p).hwnd = hw
+    (*p).popup = true
+    (*p).pop_x = sx as i64
+    (*p).pop_y = sy as i64
+    SetWindowLongPtrW(hw, 0 - 21, (p as usize) as i64)
+    let d: i32 = GetDpiForWindow(hw)
+    if d > 0 {
+        (*p).dpi = d as usize
+    }
+    if !dib_make(p, w, h) {
+        return false
+    }
+    // SW_SHOWNOACTIVATE = 4
+    ShowWindow(hw, 4)
+    UpdateWindow(hw)
+    if grab {
+        wx_once()
+        if G_SETCAPT == 0 {
+            return false
+        }
+        wgl.call1(G_SETCAPT, hw as u64)
+        (*p).pop_cap = true
+        G_POP0 = p as u64
+    }
+    return true
+}
+
+fn r_is_popup(p: *mut Platte) -> bool { return (*p).popup }
+
+// Move and resize the popup (HWND_TOPMOST = -1; SWP_NOACTIVATE 0x10); a new size means a new DIB.
+fn r_popup_place(p: *mut Platte, sx: usize, sy: usize, w: usize, h: usize) -> bool {
+    if (*p).hwnd == 0 || !(*p).popup || w == 0 || h == 0 {
+        return false
+    }
+    (*p).pop_x = sx as i64
+    (*p).pop_y = sy as i64
+    if SetWindowPos((*p).hwnd, 0 - 1, sx as i64, sy as i64, w as i64, h as i64, 16) == 0 {
+        return false
+    }
+    if w != (*p).w || h != (*p).h {
+        dib_free(p)
+        if !dib_make(p, w, h) {
+            return false
+        }
+    }
+    return true
+}
+
+// Where the top left corner of the window's inner area is on the screen (ClientToScreen).
+fn r_origin(p: *mut Platte, ox: *mut i64, oy: *mut i64) -> bool {
+    if (*p).hwnd == 0 {
+        return false
+    }
+    if (*p).popup {
+        *ox = (*p).pop_x
+        *oy = (*p).pop_y
+        return true
+    }
+    wx_once()
+    if G_C2S == 0 {
+        return false
+    }
+    var pt: [i32; 2] = [0; 2]
+    if (wgl.call2(G_C2S, (*p).hwnd as u64, (&pt[0]) as u64) & 0xFFFFFFFF) == 0 {
+        return false
+    }
+    *ox = pt[0] as i64
+    *oy = pt[1] as i64
+    return true
+}
 
 fn r_screen(w: *mut Platte, sw: *mut usize, sh: *mut usize) -> bool {
     var r: [i32; 4] = [0; 4]
@@ -2275,12 +2366,22 @@ fn r_close(w: *mut Platte) {
     r_gpu_close(w)
     dib_free(w)
     if (*w).hwnd != 0 {
+        if (*w).pop_cap {
+            ReleaseCapture()
+            (*w).pop_cap = false
+            if G_POP0 == (w as u64) {
+                G_POP0 = 0
+            }
+        }
         if IsWindow((*w).hwnd) != 0 {
             DestroyWindow((*w).hwnd)
         }
         (*w).hwnd = 0
     }
     (*w).open = false
+    if (*w).popup {
+        return // a menu popup owns neither the notification icon nor the process
+    }
     if !G_NT_STAY {
         nt_drop() // the notification icon leaves with the window unless stay_alive asked for it
     }
@@ -2763,6 +2864,7 @@ static mut G_CLIPCUR: u64 = 0
 static mut G_GETCUR: u64 = 0
 static mut G_SETCUR: u64 = 0
 static mut G_C2S: u64 = 0
+static mut G_SETCAPT: u64 = 0
 static mut G_MONFW: u64 = 0
 static mut G_GMI: u64 = 0
 static mut G_RRID: u64 = 0
@@ -2777,6 +2879,7 @@ fn wx_once() {
     G_GETCUR = wgl.dll_sym("user32.dll", "GetCursorPos")
     G_SETCUR = wgl.dll_sym("user32.dll", "SetCursorPos")
     G_C2S = wgl.dll_sym("user32.dll", "ClientToScreen")
+    G_SETCAPT = wgl.dll_sym("user32.dll", "SetCapture")
     G_MONFW = wgl.dll_sym("user32.dll", "MonitorFromWindow")
     G_GMI = wgl.dll_sym("user32.dll", "GetMonitorInfoW")
     G_SHOWCUR = wgl.dll_sym("user32.dll", "ShowCursor")
@@ -3649,4 +3752,29 @@ fn r_hotkey_clear(w: *mut Platte, id: u32) -> bool {
     }
     (*w).hk_n = (*w).hk_n - 1
     return ok != 0
+}
+
+// NOTE: kept at the END of the file on purpose -- a function inserted ahead of `wndproc`
+// makes the Windows build fail to open its window (observed under Wine, 17.10.2026).
+// Pointer position of a mouse message (lParam = client x | y << 16, both signed 16 bit).
+// A normal window: client coordinates, a negative one (pointer left of / above the window) as 0.
+// A popup holding the capture: SCREEN coordinates (its origin added), clamped to >= 0, because the
+// pointer may be anywhere on the screen while the menu is open (as the X11 popup's root coordinates).
+fn ptr_pos(w: *mut Platte, lp: u64, ox: *mut i64, oy: *mut i64) {
+    let l: i64 = lp as i64
+    var px: i64 = l & 65535
+    var py: i64 = (l >> 16) & 65535
+    if (*w).popup {
+        if px > 32767 { px = px - 65536 }
+        if py > 32767 { py = py - 65536 }
+        px = px + (*w).pop_x
+        py = py + (*w).pop_y
+        if px < 0 { px = 0 }
+        if py < 0 { py = 0 }
+    } else {
+        if px > 32767 { px = 0 }
+        if py > 32767 { py = 0 }
+    }
+    *ox = px
+    *oy = py
 }

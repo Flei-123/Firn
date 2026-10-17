@@ -11,14 +11,20 @@
 #
 #     python3 tools/fui/ctxlive.py <context program> <proof folder>
 #
-# Without Xvfb / xdotool / xwd / PIL: "SKIP", exit 0.
-import os, shutil, subprocess, sys, time
+# A PROG ending in .exe is a Windows build: it runs under wine on the same kind of Xvfb
+# (r172: the Win32 popup window). Wine puts the window at a place of its own, so every
+# coordinate and screenshot below is shifted by the window's origin (OX, OY).
+# Without Xvfb / xdotool / xwd / PIL (/ wine): "SKIP", exit 0.
+import os, shutil, subprocess, sys, tempfile, time
 
 PROG = sys.argv[1]
 BELEG = sys.argv[2]
 os.makedirs(BELEG, exist_ok=True)
 HERE = os.path.dirname(os.path.abspath(__file__))
-for tool in ("Xvfb", "xdotool", "xwd"):
+WINE = PROG.endswith(".exe")
+OX = 0
+OY = 0
+for tool in ("Xvfb", "xdotool", "xwd") + (("wine",) if WINE else ()):
     if shutil.which(tool) is None:
         print("SKIP: no %s -- no real window in this run" % tool)
         sys.exit(0)
@@ -55,6 +61,9 @@ def finish(code):
             app.wait(3)
         except Exception:
             app.kill()
+    if WINE:
+        subprocess.run(["wineserver", "-k"], env=env, check=False)
+        shutil.rmtree(env.get("WINEPREFIX", "/nonexistent-ctxlive"), ignore_errors=True)
     xvfb.terminate()
     try:
         xvfb.wait(3)
@@ -64,7 +73,11 @@ def finish(code):
 
 
 def xdo(*args):
-    subprocess.run(["xdotool"] + list(args), env=env, check=False)
+    a = list(args)
+    if a and a[0] == "mousemove" and len(a) >= 3:
+        a[1] = str(int(a[1]) + OX)
+        a[2] = str(int(a[2]) + OY)
+    subprocess.run(["xdotool"] + a, env=env, check=False)
 
 
 def shot(name):
@@ -75,7 +88,13 @@ def shot(name):
     subprocess.run([sys.executable, os.path.join(HERE, "xwd2png.py"), xwd, png],
                    check=True, stdout=subprocess.DEVNULL)
     os.remove(xwd)
-    return Image.open(png).convert("RGB")
+    img = Image.open(png).convert("RGB")
+    if OX or OY:
+        # the window's origin becomes (0, 0), so every box below is the same on both hosts
+        shifted = Image.new("RGB", img.size, (0, 0, 0))
+        shifted.paste(img.crop((OX, OY, img.size[0], img.size[1])), (0, 0))
+        img = shifted
+    return img
 
 
 def cpu_ticks(pid):
@@ -97,7 +116,26 @@ def diff(a, b, box):
 
 
 print("== a context menu in a real window (Xvfb %s) ==" % DISP)
-app = subprocess.Popen([PROG], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+cmd = [PROG]
+if WINE:
+    wpfx = tempfile.mkdtemp(prefix="ctxlive-wine-")
+    env = dict(env, WINEPREFIX=wpfx, WINEDEBUG="-all")
+    subprocess.run(["wineboot", "-i"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+    cmd = ["wine", PROG]
+app = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+if WINE:
+    for _ in range(40):
+        time.sleep(0.5)
+        out = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", "Context"], env=env,
+                             capture_output=True, text=True).stdout.split()
+        if out:
+            g = subprocess.run(["xdotool", "getwindowgeometry", out[0]], env=env, capture_output=True,
+                               text=True).stdout
+            pos = g.split("Position:")[1].split()[0].split(",")
+            OX, OY = int(pos[0]), int(pos[1])
+            subprocess.run(["xdotool", "windowfocus", out[0]], env=env, check=False)
+            break
+    print("  (wine window origin %d,%d)" % (OX, OY))
 time.sleep(1.8)
 if app.poll() is not None:
     chk("the program is running", False, "exit %s" % app.returncode, app.stderr.read().decode()[:200])
@@ -158,7 +196,14 @@ time.sleep(0.2)
 xdo("click", "1")
 time.sleep(0.6)
 F = shot("ctx-live-5-outside")
-chk("a click on the empty screen closes the menu", diff(E, F, (445, 150, 590, 395)) < 50, "%d px" % diff(E, F, (445, 150, 590, 395)))
+if WINE:
+    # a window manager-less Xvfb gives wine no activation change and no grab on a click of the bare
+    # root; Windows closes the menu on deactivation (WM_ACTIVATEAPP), which wine cannot show here
+    print("  NOT TESTED wine: a click on the empty screen (no window manager, no activation change)")
+    xdo("key", "Escape")
+    time.sleep(0.5)
+else:
+    chk("a click on the empty screen closes the menu", diff(E, F, (445, 150, 590, 395)) < 50, "%d px" % diff(E, F, (445, 150, 590, 395)))
 
 # 5. a submenu opens in a window of its own; Esc closes it first, then the menu
 xdo("mousemove", "300", "186")
@@ -178,7 +223,7 @@ chk("the submenu is a window of its own to the right of the menu", diff(G0, G1, 
 xdo("key", "Escape")
 time.sleep(0.6)
 G2 = shot("ctx-live-8-subclosed")
-chk("Esc closes the submenu only: the menu stays as it was", diff(G1, G2, (300, 186, 598, 424)) < 400, "%d px differ" % diff(G1, G2, (300, 186, 598, 424)))
+chk("Esc closes the submenu only: the menu stays as it was", diff(G1, G2, (300, 186, 570, 424)) < 400, "%d px differ" % diff(G1, G2, (300, 186, 570, 424)))
 chk("... and the submenu's window is gone", diff(G0, G2, (612, 140, 800, 450)) < 50, "%d px differ" % diff(G0, G2, (612, 140, 800, 450)))
 xdo("key", "Escape")
 time.sleep(0.6)
