@@ -118,6 +118,7 @@ import fui.query
 import fui.a11y
 import fui.action
 import svg.matrix
+import std.rt
 
 // ============================================================ CONSTANTS
 
@@ -1159,9 +1160,12 @@ fn change_blank() -> Change {
 }
 
 struct Obs {
-    a: [Snap; 128],
+    // the two snapshots live in ONE heap block (2 * scene.SCENE_MAX
+    // entries, mapped on the first observe); `sn_a` / `sn_b` index it
+    a: u64,
     na: usize,
-    b: [Snap; 128],
+    b: u64,
+    ssz: u64,
     nb: usize,
     rs: [Change; 64],
     nr: usize,
@@ -1169,8 +1173,43 @@ struct Obs {
     started: u32,
 }
 
+// The pointer to entry `i` of snapshot A / B. The block is mapped on the
+// first call (zero pages; an entry is always written before it is read);
+// an index past the capacity is clamped to the last entry.
+fn sn_ensure(o: *mut Obs) {
+    if (*o).a != 0 {
+        return
+    }
+    var probe: [Snap; 2] = [snap_blank(); 2]
+    let sz: u64 = (&probe[1]) as u64 - (&probe[0]) as u64
+    let p: u64 = rt.heap_alloc(2 * scene.SCENE_MAX * sz as usize)
+    (*o).ssz = sz
+    (*o).a = p
+    (*o).b = p + (scene.SCENE_MAX as u64) * sz
+}
+
+fn sn_a(o: *mut Obs, i: usize) -> *mut Snap {
+    sn_ensure(o)
+    var k: usize = i
+    if k >= scene.SCENE_MAX {
+        k = scene.SCENE_MAX - 1
+    }
+    let sz: u64 = (*o).ssz
+    return ((o as u64) +% ((*o).a -% (o as u64) +% (k as u64) * sz)) as *mut Snap
+}
+
+fn sn_b(o: *mut Obs, i: usize) -> *mut Snap {
+    sn_ensure(o)
+    var k: usize = i
+    if k >= scene.SCENE_MAX {
+        k = scene.SCENE_MAX - 1
+    }
+    let sz: u64 = (*o).ssz
+    return ((o as u64) +% ((*o).b -% (o as u64) +% (k as u64) * sz)) as *mut Snap
+}
+
 fn obs_new() -> Obs {
-    return Obs { a: [snap_blank(); 128], na: 0, b: [snap_blank(); 128],
+    return Obs { a: 0, na: 0, b: 0, ssz: 0,
         nb: 0, rs: [change_blank(); 64], nr: 0, total: 0,
         started: 0 as u32 }
 }
@@ -1259,7 +1298,7 @@ fn snap_walk(o: *mut Obs, sc: *mut scene.Scene, i: usize, depth: usize) {
         if widget.w_is_focus(e) {
             s.foc = 1 as u32
         }
-        (*o).b[(*o).nb] = s
+        (*sn_b(o, (*o).nb)) = s
         (*o).nb = (*o).nb + 1
     }
     var k: usize = scene.scene_first_child(sc, i)
@@ -1272,7 +1311,7 @@ fn snap_walk(o: *mut Obs, sc: *mut scene.Scene, i: usize, depth: usize) {
 fn find_a(o: *mut Obs, h: u64) -> usize {
     var k: usize = 0
     while k < (*o).na {
-        if (*o).a[k].h == h {
+        if (*sn_a(o, k)).h == h {
             return k
         }
         k = k + 1
@@ -1283,7 +1322,7 @@ fn find_a(o: *mut Obs, h: u64) -> usize {
 fn find_b(o: *mut Obs, h: u64) -> usize {
     var k: usize = 0
     while k < (*o).nb {
-        if (*o).b[k].h == h {
+        if (*sn_b(o, k)).h == h {
             return k
         }
         k = k + 1
@@ -1308,12 +1347,12 @@ fn rank_b(o: *mut Obs) {
         var r: usize = 0
         var j: usize = 0
         while j < k {
-            if (*o).b[j].ph == (*o).b[k].ph && find_a(o, (*o).b[j].h) != NONE {
+            if (*sn_b(o, j)).ph == (*sn_b(o, k)).ph && find_a(o, (*sn_b(o, j)).h) != NONE {
                 r = r + 1
             }
             j = j + 1
         }
-        (*o).b[k].rank = r
+        (*sn_b(o, k)).rank = r
         k = k + 1
     }
 }
@@ -1322,7 +1361,7 @@ fn rank_a_of(o: *mut Obs, k: usize) -> usize {
     var r: usize = 0
     var j: usize = 0
     while j < k {
-        if (*o).a[j].ph == (*o).a[k].ph && find_b(o, (*o).a[j].h) != NONE {
+        if (*sn_a(o, j)).ph == (*sn_a(o, k)).ph && find_b(o, (*sn_a(o, j)).h) != NONE {
             r = r + 1
         }
         j = j + 1
@@ -1342,12 +1381,12 @@ fn obs_observe(o: *mut Obs, sc: *mut scene.Scene) -> usize {
         rank_b(o)
         var k: usize = 0
         while k < (*o).nb {
-            let n: *mut Snap = &(*o).b[k]
+            let n: *mut Snap = &(*sn_b(o, k))
             let f: usize = find_a(o, (*n).h)
             if f == NONE {
                 put_rec(o, MC_ADDED, (*n).h, (*n).node)
             } else {
-                let old: *mut Snap = &(*o).a[f]
+                let old: *mut Snap = &(*sn_a(o, f))
                 if (*n).rank != rank_a_of(o, f) {
                     put_rec(o, MC_MOVED, (*n).h, (*n).node)
                 }
@@ -1370,8 +1409,8 @@ fn obs_observe(o: *mut Obs, sc: *mut scene.Scene) -> usize {
         }
         k = 0
         while k < (*o).na {
-            if find_b(o, (*o).a[k].h) == NONE {
-                put_rec(o, MC_REMOVED, (*o).a[k].h, NONE)
+            if find_b(o, (*sn_a(o, k)).h) == NONE {
+                put_rec(o, MC_REMOVED, (*sn_a(o, k)).h, NONE)
             }
             k = k + 1
         }
@@ -1379,7 +1418,7 @@ fn obs_observe(o: *mut Obs, sc: *mut scene.Scene) -> usize {
     // the new tree becomes the old one
     var c: usize = 0
     while c < (*o).nb {
-        (*o).a[c] = (*o).b[c]
+        (*sn_a(o, c)) = (*sn_b(o, c))
         c = c + 1
     }
     (*o).na = (*o).nb

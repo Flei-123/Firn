@@ -56,7 +56,7 @@
 // a11y_reset -- for the same reason that a new document has
 // new attributes.
 export {
-    A11y, a11y_new, a11y_reset, a11y_limits_ok,
+    A11y, a11y_new, a11y_reset, a11y_free, a11y_limits_ok,
     ROLE_NONE, ROLE_GENERIC, ROLE_TEXT, ROLE_BUTTON, ROLE_CHECKBOX,
     ROLE_RADIO, ROLE_SWITCH, ROLE_SLIDER, ROLE_TEXTBOX, ROLE_PROGRESSBAR,
     ROLE_COMBOBOX, ROLE_LIST, ROLE_LISTITEM, ROLE_TREE, ROLE_TREEITEM,
@@ -92,6 +92,7 @@ import fui.wave2
 import fui.control
 import fui.viewport
 import fui.vlist
+import std.rt
 
 // ======================================================= THE SIZE
 //
@@ -102,7 +103,7 @@ import fui.vlist
 // and the check file calls this bracket. If the tree grows and
 // this number does not grow with it, it is noticed there -- and not only at a
 // button whose name stands behind the field.
-const A11Y_MAX: usize = 128
+const A11Y_MAX: usize = 4096
 
 // ======================================================= THE ROLES
 //
@@ -209,25 +210,77 @@ fn ann_blank() -> Ann {
 }
 
 struct A11y {
-    a: [Ann; 128],
+    // heap blocks (lazy, like the scene nodes): the annotations and the tab
+    // order; `ahi` = how many annotation slots were blanked so far
+    a: u64,
+    asz: u64,
+    ahi: usize,
     // THE TAB ORDER, as numbers of nodes. It is calculated here
     // (tree order, see below) and LENT to the control.Panel
     // -- the panel stays the only place that knows who has
     // the focus.
-    ord: [usize; 128],
+    ord: u64,
     nord: usize,
 }
 
 fn a11y_new() -> A11y {
-    return A11y { a: [ann_blank(); 128], ord: [0; 128], nord: 0 }
+    return A11y { a: 0, asz: 0, ahi: 0, ord: 0, nord: 0 }
+}
+
+// One block holds the tab order (A11Y_MAX numbers) and the annotations
+// (A11Y_MAX slots); the kernel maps zero pages, so a small tree touches
+// little. A slot is blanked the first time it is reached.
+fn ax_ensure(ax: *mut A11y) {
+    if (*ax).a != 0 {
+        return
+    }
+    var probe: [Ann; 2] = [ann_blank(); 2]
+    (*ax).asz = (&probe[1]) as u64 - (&probe[0]) as u64
+    let p: u64 = rt.heap_alloc(A11Y_MAX * 8 + A11Y_MAX * (*ax).asz as usize)
+    (*ax).ord = p
+    (*ax).a = p + (A11Y_MAX * 8) as u64
+    (*ax).ahi = 0
+}
+
+fn an_grow(ax: *mut A11y, k: usize) -> usize {
+    var j: usize = k
+    if j >= A11Y_MAX {
+        j = A11Y_MAX - 1
+    }
+    ax_ensure(ax)
+    while (*ax).ahi <= j {
+        *(((*ax).a + ((*ax).ahi as u64) * (*ax).asz) as *mut Ann) = ann_blank()
+        (*ax).ahi = (*ax).ahi + 1
+    }
+    return j
+}
+
+// The pointer to the annotation of node `i`.
+fn an(ax: *mut A11y, i: usize) -> *mut Ann {
+    var k: usize = i
+    if k >= (*ax).ahi {
+        k = an_grow(ax, k)
+    }
+    return ((ax as u64) +% ((*ax).a -% (ax as u64) +% (k as u64) * (*ax).asz)) as *mut Ann
 }
 
 fn a11y_reset(ax: *mut A11y) {
     var i: usize = 0
-    while i < A11Y_MAX {
-        (*ax).a[i] = ann_blank()
+    while i < (*ax).ahi {
+        *an(ax, i) = ann_blank()
         i = i + 1
     }
+    (*ax).nord = 0
+}
+
+// Give the blocks back; the A11y is empty and usable afterwards.
+fn a11y_free(ax: *mut A11y) {
+    if (*ax).a != 0 {
+        rt.heap_free((*ax).ord, A11Y_MAX * 8 + A11Y_MAX * (*ax).asz as usize)
+    }
+    (*ax).a = 0
+    (*ax).ord = 0
+    (*ax).ahi = 0
     (*ax).nord = 0
 }
 
@@ -327,7 +380,7 @@ fn a11y_set_role(ax: *mut A11y, i: usize, r: u32) {
     if !slot_ok(i) || r >= ROLE_COUNT {
         return
     }
-    (*ax).a[i].role = r
+    (*an(ax, i)).role = r
 }
 
 // THE ROLE OF A NODE, in this order:
@@ -350,8 +403,8 @@ fn a11y_role(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> u32 {
     if i >= scene.scene_count(sc) {
         return ROLE_NONE
     }
-    if slot_ok(i) && (*ax).a[i].role != ROLE_NONE {
-        return (*ax).a[i].role
+    if slot_ok(i) && (*an(ax, i)).role != ROLE_NONE {
+        return (*an(ax, i)).role
     }
     let own: u32 = own_role(sc, i)
     if own != ROLE_TEXT && own != ROLE_GENERIC {
@@ -502,18 +555,18 @@ fn a11y_set_name(ax: *mut A11y, i: usize, p: u64, n: usize) {
     if !slot_ok(i) {
         return
     }
-    (*ax).a[i].np = p
-    (*ax).a[i].nn = n
-    (*ax).a[i].has_name = 1 as u32
+    (*an(ax, i)).np = p
+    (*an(ax, i)).nn = n
+    (*an(ax, i)).has_name = 1 as u32
 }
 
 fn a11y_clear_name(ax: *mut A11y, i: usize) {
     if !slot_ok(i) {
         return
     }
-    (*ax).a[i].np = 0
-    (*ax).a[i].nn = 0
-    (*ax).a[i].has_name = 0 as u32
+    (*an(ax, i)).np = 0
+    (*an(ax, i)).nn = 0
+    (*an(ax, i)).has_name = 0 as u32
 }
 
 // The connected label, via its ID (scene.node_set_id). The
@@ -523,7 +576,7 @@ fn a11y_set_labelled_by(ax: *mut A11y, i: usize, id: u32) {
     if !slot_ok(i) {
         return
     }
-    (*ax).a[i].lby = id
+    (*an(ax, i)).lby = id
 }
 
 // Whether the text on the widget is the NAME. For the text field and the combo box
@@ -550,8 +603,8 @@ fn name_into(sc: *mut scene.Scene, ax: *mut A11y, i: usize,
     }
     let r: u32 = a11y_role(sc, ax, i)
     // 1. ausdruecklich
-    if slot_ok(i) && (*ax).a[i].has_name != 0 as u32 {
-        put_text(o, (*ax).a[i].np, (*ax).a[i].nn)
+    if slot_ok(i) && (*an(ax, i)).has_name != 0 as u32 {
+        put_text(o, (*an(ax, i)).np, (*an(ax, i)).nn)
         if (*o).n > begin {
             return NAME_EXPLICIT
         }
@@ -565,8 +618,8 @@ fn name_into(sc: *mut scene.Scene, ax: *mut A11y, i: usize,
         }
     }
     // 3. the connected label
-    if slot_ok(i) && (*ax).a[i].lby != 0 as u32 {
-        let j: usize = scene.scene_find_id(sc, (*ax).a[i].lby)
+    if slot_ok(i) && (*an(ax, i)).lby != 0 as u32 {
+        let j: usize = scene.scene_find_id(sc, (*an(ax, i)).lby)
         if j != scene.SCENE_NONE && j != i {
             label_text(sc, ax, j, o, 0)
             if (*o).n > begin {
@@ -599,9 +652,9 @@ fn label_text(sc: *mut scene.Scene, ax: *mut A11y, j: usize, o: *mut Out,
         return
     }
     put_gap(o)
-    if slot_ok(j) && (*ax).a[j].has_name != 0 as u32 {
+    if slot_ok(j) && (*an(ax, j)).has_name != 0 as u32 {
         let before: usize = (*o).n
-        put_text(o, (*ax).a[j].np, (*ax).a[j].nn)
+        put_text(o, (*an(ax, j)).np, (*an(ax, j)).nn)
         if (*o).n > before {
             return
         }
@@ -723,7 +776,7 @@ fn a11y_set_expanded(ax: *mut A11y, i: usize, x: u32) {
     if !slot_ok(i) || x > EXP_EXPANDED {
         return
     }
-    (*ax).a[i].exp = x
+    (*an(ax, i)).exp = x
 }
 
 fn a11y_set_readonly(ax: *mut A11y, i: usize, an: bool) {
@@ -731,9 +784,9 @@ fn a11y_set_readonly(ax: *mut A11y, i: usize, an: bool) {
         return
     }
     if an {
-        (*ax).a[i].ro = 1 as u32
+        (*an(ax, i)).ro = 1 as u32
     } else {
-        (*ax).a[i].ro = 0 as u32
+        (*an(ax, i)).ro = 0 as u32
     }
 }
 
@@ -745,9 +798,9 @@ fn a11y_set_toggle(ax: *mut A11y, i: usize, an: bool) {
         return
     }
     if an {
-        (*ax).a[i].toggle = 1 as u32
+        (*an(ax, i)).toggle = 1 as u32
     } else {
-        (*ax).a[i].toggle = 0 as u32
+        (*an(ax, i)).toggle = 0 as u32
     }
 }
 
@@ -783,7 +836,7 @@ fn a11y_state(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> u32 {
         st = st | ST_CHECKED
     }
     if slot_ok(i) {
-        let an: *mut Ann = &(*ax).a[i]
+        let an: *mut Ann = &(*an(ax, i))
         if (*an).toggle != 0 as u32 && v != 0 {
             st = st | ST_PRESSED
         }
@@ -975,7 +1028,8 @@ fn order_walk(sc: *mut scene.Scene, ax: *mut A11y, i: usize, depth: usize) {
         return
     }
     if kind_focusable(sc, i) && (*ax).nord < A11Y_MAX {
-        (*ax).ord[(*ax).nord] = i
+        ax_ensure(ax)
+        *(((*ax).ord + ((*ax).nord as u64) * 8) as *mut usize) = i
         (*ax).nord = (*ax).nord + 1
     }
     var k: usize = scene.scene_first_child(sc, i)
@@ -991,7 +1045,7 @@ fn a11y_order_at(ax: *mut A11y, k: usize) -> usize {
     if k >= (*ax).nord {
         return scene.SCENE_NONE
     }
-    return (*ax).ord[k]
+    return *(((*ax).ord + (k as u64) * 8) as *mut usize)
 }
 
 // HANG THE PANEL ON THE TREE. The widgets of a tree lie in
@@ -1016,7 +1070,8 @@ fn a11y_bind_panel(ax: *mut A11y, pn: *mut control.Panel,
     let a1: u64 = scene.scene_node(sc, 1) as u64
     control.panel_attach_stride(pn, scene.node_widget(sc, 0) as u64,
         scene.scene_count(sc), (a1 - a0) as usize)
-    control.panel_set_order(pn, (&(*ax).ord[0]) as u64, (*ax).nord)
+    ax_ensure(ax)
+    control.panel_set_order(pn, (*ax).ord, (*ax).nord)
 }
 
 // BRING THE FOCUS INTO VIEW. For every viewport in which the node
@@ -1367,9 +1422,9 @@ fn dump_node(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out,
         put(o, 47 as u8)
         put_dec(o, a11y_set_size(sc, ax, i) as i64)
     }
-    if slot_ok(i) && (*ax).a[i].level != 0 as u32 && r == ROLE_HEADING {
+    if slot_ok(i) && (*an(ax, i)).level != 0 as u32 && r == ROLE_HEADING {
         put_lit(o, " level=")
-        put_dec(o, (*ax).a[i].level as i64)
+        put_dec(o, (*an(ax, i)).level as i64)
     }
     let dvor: usize = (*o).n
     put_lit(o, " desc=\"")
@@ -1425,15 +1480,15 @@ fn a11y_set_level(ax: *mut A11y, i: usize, l: u32) {
     if !slot_ok(i) || l > 6 as u32 {
         return
     }
-    (*ax).a[i].level = l
+    (*an(ax, i)).level = l
 }
 
 fn a11y_level(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> u32 {
     if a11y_role(sc, ax, i) != ROLE_HEADING {
         return 0 as u32
     }
-    if slot_ok(i) && (*ax).a[i].level != 0 as u32 {
-        return (*ax).a[i].level
+    if slot_ok(i) && (*an(ax, i)).level != 0 as u32 {
+        return (*an(ax, i)).level
     }
     return 2 as u32
 }
@@ -1447,15 +1502,15 @@ fn a11y_set_description(ax: *mut A11y, i: usize, p: u64, n: usize) {
     if !slot_ok(i) {
         return
     }
-    (*ax).a[i].dp = p
-    (*ax).a[i].dn = n
+    (*an(ax, i)).dp = p
+    (*an(ax, i)).dn = n
 }
 
 fn a11y_set_described_by(ax: *mut A11y, i: usize, id: u32) {
     if !slot_ok(i) {
         return
     }
-    (*ax).a[i].dby = id
+    (*an(ax, i)).dby = id
 }
 
 fn desc_into(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out) -> usize {
@@ -1465,14 +1520,14 @@ fn desc_into(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out) -> usiz
     if i >= scene.scene_count(sc) || !slot_ok(i) {
         return 0
     }
-    if (*ax).a[i].dn > 0 {
-        put_text(o, (*ax).a[i].dp, (*ax).a[i].dn)
+    if (*an(ax, i)).dn > 0 {
+        put_text(o, (*an(ax, i)).dp, (*an(ax, i)).dn)
         if (*o).n > begin {
             return (*o).n - begin
         }
     }
-    if (*ax).a[i].dby != 0 as u32 {
-        let j: usize = scene.scene_find_id(sc, (*ax).a[i].dby)
+    if (*an(ax, i)).dby != 0 as u32 {
+        let j: usize = scene.scene_find_id(sc, (*an(ax, i)).dby)
         if j != scene.SCENE_NONE && j != i {
             label_text(sc, ax, j, o, 0)
         }
@@ -1508,16 +1563,16 @@ fn a11y_bind_vlist(ax: *mut A11y, i: usize, v: *mut vlist.Vlist,
     if !slot_ok(i) {
         return
     }
-    (*ax).a[i].vl = v as u64
-    (*ax).a[i].vsrc = src
-    (*ax).a[i].vud = ud
+    (*an(ax, i)).vl = v as u64
+    (*an(ax, i)).vsrc = src
+    (*an(ax, i)).vud = ud
 }
 
 fn vl_of(ax: *mut A11y, i: usize) -> *mut vlist.Vlist {
-    if !slot_ok(i) || (*ax).a[i].vl == 0 {
+    if !slot_ok(i) || (*an(ax, i)).vl == 0 {
         return 0 as *mut vlist.Vlist
     }
-    return (*ax).a[i].vl as *mut vlist.Vlist
+    return (*an(ax, i)).vl as *mut vlist.Vlist
 }
 
 fn a11y_vrow_first(ax: *mut A11y, i: usize) -> usize {
@@ -1567,8 +1622,8 @@ fn vrow_name_into(ax: *mut A11y, i: usize, row: usize, o: *mut Out) {
     while c < cols {
         var r: vlist.VRow = vlist.vrow_new()
         r.col = c
-        let f: fn(u64, usize, *mut vlist.VRow) = (*ax).a[i].vsrc
-        f((*ax).a[i].vud, row, &r)
+        let f: fn(u64, usize, *mut vlist.VRow) = (*an(ax, i)).vsrc
+        f((*an(ax, i)).vud, row, &r)
         put_gap(o)
         put_text(o, (&r.text[0]) as u64, r.n)
         c = c + 1
@@ -1582,8 +1637,8 @@ fn a11y_vrow_state(sc: *mut scene.Scene, ax: *mut A11y, i: usize, row: usize) ->
         return st
     }
     var r: vlist.VRow = vlist.vrow_new()
-    let f: fn(u64, usize, *mut vlist.VRow) = (*ax).a[i].vsrc
-    f((*ax).a[i].vud, row, &r)
+    let f: fn(u64, usize, *mut vlist.VRow) = (*an(ax, i)).vsrc
+    f((*an(ax, i)).vud, row, &r)
     st = ST_FOCUSABLE
     if r.disabled {
         st = st | ST_DISABLED
@@ -1778,9 +1833,9 @@ fn json_node(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out, depth: 
         put_lit(o, ",\"size\":")
         put_dec(o, a11y_set_size(sc, ax, i) as i64)
     }
-    if slot_ok(i) && (*ax).a[i].level != 0 as u32 && r == ROLE_HEADING {
+    if slot_ok(i) && (*an(ax, i)).level != 0 as u32 && r == ROLE_HEADING {
         put_lit(o, ",\"level\":")
-        put_dec(o, (*ax).a[i].level as i64)
+        put_dec(o, (*an(ax, i)).level as i64)
     }
     let dvor: usize = (*o).n
     put_lit(o, ",\"desc\":\"")

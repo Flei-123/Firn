@@ -55,7 +55,7 @@
 //
 // ========================================================= LIMITS (today)
 //
-//   * 128 nodes per window (scene.SCENE_MAX), 8 text fields, 256 octets
+//   * 4096 nodes per window (scene.SCENE_MAX), 8 text fields, 256 octets
 //     per text; beyond that an add returns NONE and changes nothing.
 //   * One window. A second one is lib/plat/fuiwin.fi's window_step.
 //   * A click into a text field focuses it and puts the caret at the click;
@@ -92,9 +92,14 @@ import fui.apphost
 import fui.vlist
 import fui.vlistview
 import fui.viewport
+import fui.uiimage
+import fui.uisvg
 import paint.canvas
 
 export {
+    node_set_click, node_clear_click,
+    // r145: more containers and display nodes
+    card, groupbox, separator, separator_v, badge, image, icon, open_kind_box,
     App, window, label, button, entry, textarea, lines_of, row, column, end, spacer,
     list, list_item, chosen,
     set_text, append_text, set_number, text, number, quit, run,
@@ -193,12 +198,14 @@ struct App {
     stack: [usize; 16],
     depth: usize,
     // per node: a click handler, and the node's own text
-    cb: [fn(*mut App); 128],
-    has_cb: [bool; 128],
+    // (r102: heap blocks of scene.SCENE_MAX entries, mapped in `window`;
+    // read and written through cb_get/cb_put, hcb_*, tlen_*, wrp_*)
+    cbs: u64,
+    hcbs: u64,
     texts: u64,
-    tlen: [usize; 128],
+    tlens: u64,
     // labels this frame had to wrap (fit_labels)
-    wrapped: [bool; 128],
+    wrps: u64,
     // the text fields: their editor, their node, their hint
     ed: [editor.Editor; 8],
     ed_node: [usize; 8],
@@ -313,6 +320,83 @@ fn app_size() -> usize {
     return ((&probe[1]) as usize) - ((&probe[0]) as usize)
 }
 
+// ====================================================== PER-NODE TABLES
+//
+// The click handler, the own text length and the "wrapped" flag of every
+// node. They were [..; 128] arrays inside the App; now they are heap
+// blocks of scene.SCENE_MAX entries (zero pages: only the used part costs
+// memory). An index past SCENE_MAX reads as "none" and writes nothing.
+fn cb_get(a: *mut App, i: usize) -> fn(*mut App) {
+    if i >= scene.SCENE_MAX || (*a).cbs == 0 {
+        return cb_none
+    }
+    return *(((*a).cbs + (i * 8) as u64) as *mut fn(*mut App))
+}
+
+fn cb_put(a: *mut App, i: usize, f: fn(*mut App)) {
+    if i < scene.SCENE_MAX && (*a).cbs != 0 {
+        *(((*a).cbs + (i * 8) as u64) as *mut fn(*mut App)) = f
+    }
+}
+
+fn hcb_get(a: *mut App, i: usize) -> bool {
+    if i >= scene.SCENE_MAX || (*a).hcbs == 0 {
+        return false
+    }
+    return *(((*a).hcbs + i as u64) as *mut u8) != (0 as u8)
+}
+
+fn hcb_put(a: *mut App, i: usize, v: bool) {
+    if i < scene.SCENE_MAX && (*a).hcbs != 0 {
+        if v {
+            *(((*a).hcbs + i as u64) as *mut u8) = 1 as u8
+        } else {
+            *(((*a).hcbs + i as u64) as *mut u8) = 0 as u8
+        }
+    }
+}
+
+fn tlen_get(a: *mut App, i: usize) -> usize {
+    if i >= scene.SCENE_MAX || (*a).tlens == 0 {
+        return 0
+    }
+    return *(((*a).tlens + (i * 8) as u64) as *mut usize)
+}
+
+fn tlen_put(a: *mut App, i: usize, n: usize) {
+    if i < scene.SCENE_MAX && (*a).tlens != 0 {
+        *(((*a).tlens + (i * 8) as u64) as *mut usize) = n
+    }
+}
+
+fn wrp_get(a: *mut App, i: usize) -> bool {
+    if i >= scene.SCENE_MAX || (*a).wrps == 0 {
+        return false
+    }
+    return *(((*a).wrps + i as u64) as *mut u8) != (0 as u8)
+}
+
+fn wrp_put(a: *mut App, i: usize, v: bool) {
+    if i < scene.SCENE_MAX && (*a).wrps != 0 {
+        if v {
+            *(((*a).wrps + i as u64) as *mut u8) = 1 as u8
+        } else {
+            *(((*a).wrps + i as u64) as *mut u8) = 0 as u8
+        }
+    }
+}
+
+// For library widgets built on the tree (file dialog): attach / remove a
+// click handler of node `i`.
+fn node_set_click(a: *mut App, i: usize, f: fn(*mut App)) {
+    cb_put(a, i, f)
+    hcb_put(a, i, true)
+}
+
+fn node_clear_click(a: *mut App, i: usize) {
+    hcb_put(a, i, false)
+}
+
 fn app_blank() -> App {
     return App { sc: scene.scene_new(), sh: sheet.sheet_new(),
         m: theme.theme_new(false),
@@ -322,8 +406,8 @@ fn app_blank() -> App {
             0 as u64 as *mut render.Ctx),
         hk: apphost.hooks_blank(),
         stack: [0; 16], depth: 0,
-        cb: [cb_none; 128], has_cb: [false; 128], texts: 0,
-        tlen: [0; 128], wrapped: [false; 128],
+        cbs: 0, hcbs: 0, texts: 0,
+        tlens: 0, wrps: 0,
         ed: [editor.editor_new(); 8], ed_node: [NONE; 8], spot: [0.0; 3], spot_ok: false, hint: [""; 8],
         area: [false; 8], lines: [textarea.ta_new(); 8], drag_k: NONE,
         touch_k: NONE, touch_x: 0.0, touch_y: 0.0, touch_moved: false,
@@ -733,6 +817,10 @@ fn window(title: str, w: usize, h: usize) -> *mut App {
     let a: *mut App = p as *mut App
     *a = app_blank()
     (*a).texts = rt.heap_alloc(scene.SCENE_MAX * TEXT_CAP)
+    (*a).cbs = rt.heap_alloc(scene.SCENE_MAX * 8)
+    (*a).hcbs = rt.heap_alloc(scene.SCENE_MAX)
+    (*a).tlens = rt.heap_alloc(scene.SCENE_MAX * 8)
+    (*a).wrps = rt.heap_alloc(scene.SCENE_MAX)
     (*a).ed_bufs = rt.heap_alloc(ENTRIES_MAX * TEXT_CAP)
     (*a).w = fuiwirt.host_new(&(*a).sc, &(*a).c)
     // buttons glide between rest, hover and press; a node's key path (or its
@@ -994,6 +1082,91 @@ fn custom(a: *mut App, kind: u32, w: usize, h: usize) -> usize {
         return NONE
     }
     scene.node_set_widget_kind(&(*a).sc, i, kind)
+    scene.node_set_size(&(*a).sc, i, w as f64, h as f64)
+    return i
+}
+
+// ============================================ MORE NODES AND CONTAINERS (r145)
+//
+// What a window of ten lines still lacked: a card and a group box that hold
+// other widgets, a rule between them, a badge, a picture and an icon. Each is
+// ONE call and ONE node; the painters exist (wave2 / wave3 / uiimage / uisvg).
+
+// A container drawn as a widget of kind `kind` (card, group box): its children
+// stand inside it, until `end`. NONE when the window or the stack is full.
+fn open_kind_box(a: *mut App, kind: u32, dir: u32, pad: i64) -> usize {
+    if (*a).depth >= STACK_MAX {
+        return NONE
+    }
+    let b: usize = scene.scene_add(&(*a).sc, parent(a), scene.N_WIDGET)
+    if b == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_widget_kind(&(*a).sc, b, kind)
+    scene.node_set_flex(&(*a).sc, b, dir, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_gap(&(*a).sc, b, ROW_GAP, ROW_GAP)
+    scene.node_set_padding(&(*a).sc, b, pad, pad, pad, pad)
+    (*a).stack[(*a).depth] = b
+    (*a).depth = (*a).depth + 1
+    return b
+}
+
+// A raised panel with a border; what follows stands in it (a column) until `end`.
+fn card(a: *mut App) -> usize {
+    return open_kind_box(a, widget.KIND_CARD, flex.FLEX_COLUMN, 12)
+}
+
+// A frame with a caption on its top line; what follows stands in it (a column)
+// until `end`. The caption is pointed at, not copied.
+fn groupbox(a: *mut App, title: str) -> usize {
+    let g: usize = open_kind_box(a, widget.KIND_GROUPBOX, flex.FLEX_COLUMN, 14)
+    if g != NONE {
+        keep_text(a, g, title, 0)
+    }
+    return g
+}
+
+// A thin rule across the container (1 point high); `separator_v`: a rule
+// down it (1 point wide).
+fn separator(a: *mut App) -> usize {
+    let i: usize = custom(a, widget.KIND_SEPARATOR, 0, 1)
+    if i != NONE {
+        scene.node_set_align_self(&(*a).sc, i, flex.AL_STRETCH)
+    }
+    return i
+}
+
+fn separator_v(a: *mut App) -> usize {
+    let i: usize = custom(a, widget.KIND_SEPARATOR, 1, 0)
+    if i != NONE {
+        scene.node_set_align_self(&(*a).sc, i, flex.AL_STRETCH)
+    }
+    return i
+}
+
+// A small status pill with the text `s`.
+fn badge(a: *mut App, s: str) -> usize {
+    return node_new(a, widget.KIND_BADGE, s)
+}
+
+// A picture of `w` x `h` design points (the image is not copied).
+fn image(a: *mut App, img: *mut uiimage.Image, w: usize, h: usize) -> usize {
+    let i: usize = scene.scene_add(&(*a).sc, parent(a), scene.N_IMAGE)
+    if i == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_image(&(*a).sc, i, img, w, h)
+    scene.node_set_size(&(*a).sc, i, w as f64, h as f64)
+    return i
+}
+
+// A vector icon of `w` x `h` design points (the icon is not copied).
+fn icon(a: *mut App, ic: *mut uisvg.Icon, w: usize, h: usize) -> usize {
+    let i: usize = scene.scene_add(&(*a).sc, parent(a), scene.N_SVG)
+    if i == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_svg(&(*a).sc, i, ic, w, h)
     scene.node_set_size(&(*a).sc, i, w as f64, h as f64)
     return i
 }
@@ -1589,8 +1762,8 @@ fn list_item(a: *mut App, icon: str, text: str, detail: str, badge: str,
         }
         c = scene.scene_next_sibling(&(*a).sc, c)
     }
-    (*a).cb[z] = on_pick
-    (*a).has_cb[z] = true
+    cb_put(a, z, on_pick)
+    hcb_put(a, z, true)
     a11y.a11y_set_role(&(*a).ax, z, a11y.ROLE_LISTITEM)
     a11y.a11y_set_name(&(*a).ax, z, text.p as u64, text.n)
     return z
@@ -1631,8 +1804,8 @@ fn lists_pick(a: *mut App, key: u32) -> bool {
             let z: usize = listrow.listrow_row_of(&(*a).sc, i, key)
             if z != scene.SCENE_NONE {
                 let ch: bool = listrow.listrow_select(&(*a).sc, i, key)
-                if (*a).has_cb[z] {
-                    let f: fn(*mut App) = (*a).cb[z]
+                if hcb_get(a, z) {
+                    let f: fn(*mut App) = cb_get(a, z)
                     f(a)
                 }
                 return true
@@ -1672,7 +1845,7 @@ fn keep_text(a: *mut App, i: usize, s: str, at: usize) {
     if n > 0 {
         rt.mem_copy(dst + at as u64, s.p as u64, n)
     }
-    (*a).tlen[i] = at + n
+    tlen_put(a, i, at + n)
     scene.node_set_text(&(*a).sc, i, dst, at + n)
 }
 
@@ -1718,8 +1891,8 @@ fn button(a: *mut App, s: str, on_click: fn(*mut App)) -> usize {
     }
     scene.node_set_widget_kind(&(*a).sc, i, widget.KIND_BUTTON)
     keep_text(a, i, s, 0)
-    (*a).cb[i] = on_click
-    (*a).has_cb[i] = true
+    cb_put(a, i, on_click)
+    hcb_put(a, i, true)
     return i
 }
 
@@ -1908,7 +2081,7 @@ fn append_text(a: *mut App, id: usize, s: str) {
     if id >= scene.scene_count(&(*a).sc) || slot_of(a, id) != NONE {
         return
     }
-    keep_text(a, id, s, (*a).tlen[id])
+    keep_text(a, id, s, tlen_get(a, id))
     fuiwirt.host_touch(&(*a).w)
 }
 
@@ -1924,7 +2097,7 @@ fn text(a: *mut App, id: usize) -> str {
         return str { p: textbuf.tb_ptr(t) as *mut u8, n: textbuf.tb_len(t) }
     }
     return str { p: ((*a).texts + (id * TEXT_CAP) as u64) as *mut u8,
-        n: (*a).tlen[id] }
+        n: tlen_get(a, id) }
 }
 
 // The caret and the selection anchor (byte offsets) of a text field; false for a node
@@ -2153,10 +2326,10 @@ fn fit_labels(a: *mut App, w: usize) {
     let n: usize = scene.scene_count(sc)
     var i: usize = 0
     while i < n {
-        if (*a).wrapped[i] {
+        if wrp_get(a, i) {
             scene.node_set_size(sc, i, 0.0, 0.0)
             widget.w_set_text_lines(scene.node_widget(sc, i), 1)
-            (*a).wrapped[i] = false
+            wrp_put(a, i, false)
         }
         i = i + 1
     }
@@ -2184,7 +2357,7 @@ fn fit_labels(a: *mut App, w: usize) {
             let hh: f64 = scene.node_pref_h(sc, i) + ((lines - 1) as f64) * lh
             scene.node_set_size(sc, i, avail / s, hh / s)
             widget.w_set_text_lines(e, lines)
-            (*a).wrapped[i] = true
+            wrp_put(a, i, true)
         }
         i = i + 1
     }
@@ -2478,8 +2651,8 @@ fn app_act(ud: u64, i: usize) {
             }
         }
     }
-    if i < scene.SCENE_MAX && (*a).has_cb[i] {
-        let f: fn(*mut App) = (*a).cb[i]
+    if i < scene.SCENE_MAX && hcb_get(a, i) {
+        let f: fn(*mut App) = cb_get(a, i)
         f(a)
         fuiwirt.host_touch(&(*a).w)
     }
