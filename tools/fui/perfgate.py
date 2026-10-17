@@ -66,6 +66,11 @@ def main():
             if name in ("hover", "press") and v["painted_px"] > 20 * v["ctrl_px"]:
                 print("  painted %d px for a %d px control: dirty rect too big" % (v["painted_px"], v["ctrl_px"]))
                 bad += 1
+            # W6: a hover WITH its transition: every animation frame paints the two
+            # buttons (leaving + entering), never the window
+            if name == "hoveranim" and v["painted_px"] > 4 * v["ctrl_px"]:
+                print("  hoveranim painted %d px per frame for %d px of controls: transition frames repaint too much" % (v["painted_px"], v["ctrl_px"]))
+                bad += 1
             if name == "idle" and v["painted_px"] != 0:
                 print("  idle painted pixels"); bad += 1
     if update:
