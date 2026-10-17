@@ -17,18 +17,29 @@
 //   /etc/ssl/cert.pem                       Alpine (also), macOS, BSD
 //   /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem   RHEL (the real one)
 //
+// When none of them holds a certificate, the DIRECTORY stores are tried
+// (one `<hash>.0` PEM file per root; the first directory that yields at
+// least one certificate wins):
+//
+//   /apex/com.android.conscrypt/cacerts     Android 14+ (updatable, preferred)
+//   /system/etc/security/cacerts            Android (all versions)
+//   /etc/ssl/certs                          Linux with only a hashed directory
+//
 // HONEST
 //   S1 NO ENVIRONMENT. SSL_CERT_FILE / SSL_CERT_DIR are not read; a
 //      program with its own roots calls `client_add_trust_pem` (net.http) or
 //      `x509.store_load_pem` itself.
-//   S2 NO DIRECTORY STORES (/etc/ssl/certs/<hash>.0, Android's
-//      /system/etc/security/cacerts): one bundle file, or nothing.
+//   S2 DIRECTORY STORES are read only after every bundle failed, one
+//      directory level, files only (symlinks are followed by open). An
+//      Android user-installed CA (/data/misc/user/0/cacerts-added) is NOT
+//      read -- the system roots only.
 //   S3 AT MOST 256 ROOTS (x509 MAX_STORE) -- the bundles of today hold
 //      about 140.
 import std.rt
+import std.dir
 import tls.x509
 
-export { trust_load_system }
+export { trust_load_system, trust_load_dir }
 
 fn try_file(store: *mut x509.Store, path: u64) -> usize {
     var buf: rt.Buf = rt.buf_new()
@@ -37,6 +48,29 @@ fn try_file(store: *mut x509.Store, path: u64) -> usize {
         taken = x509.store_load_pem(store, buf.ptr, buf.len)
     }
     rt.buf_free(&buf)
+    return taken
+}
+
+// Every regular file or link of `path` is a PEM (Android `cacerts`); returns how many roots all
+// of them gave.
+fn trust_load_dir(store: *mut x509.Store, path: str) -> usize {
+    var d: dir.Dir = dir.open(path)
+    var taken: usize = 0
+    if dir.is_open(&d) {
+        var base: rt.Buf = rt.buf_new()
+        while dir.next(&d) {
+            if d.kind == dir.KIND_FILE || d.kind == dir.KIND_LINK || d.kind == dir.KIND_UNKNOWN {
+                rt.buf_clear(&base)
+                rt.buf_push_bytes(&base, path.p as u64, path.n)
+                rt.buf_push(&base, 47 as u8)
+                rt.buf_push_bytes(&base, d.name.p as u64, d.name.n)
+                rt.buf_push(&base, 0 as u8)
+                taken = taken + try_file(store, rt.buf_ptr(&base))
+            }
+        }
+        rt.buf_free(&base)
+    }
+    dir.close(&d)
     return taken
 }
 
@@ -58,6 +92,15 @@ fn trust_load_system(store: *mut x509.Store) -> usize {
     }
     if n == 0 {
         n = try_file(store, (&p5[0]) as u64)
+    }
+    if n == 0 {
+        n = trust_load_dir(store, "/apex/com.android.conscrypt/cacerts")
+    }
+    if n == 0 {
+        n = trust_load_dir(store, "/system/etc/security/cacerts")
+    }
+    if n == 0 {
+        n = trust_load_dir(store, "/etc/ssl/certs")
     }
     return n
 }

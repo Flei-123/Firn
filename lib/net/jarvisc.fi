@@ -34,7 +34,13 @@
 //
 // EVENTS: `cb(client, ud, kind, arg)`; the payload is read with jc_text(c)
 // (a fresh copy, you may keep it).
-//   JE_LOGIN      arg = HTTP status (200 = logged in), 0 = no connection
+//   JE_LOGIN      arg = HTTP status (200 = logged in), 0 = no connection -- and WHY:
+//                 jc_net_layer(c) = ahttp.NL_* (1 url, 2 dns, 3 tcp, 4 tls-noroots = no
+//                 trusted roots on this device, 5 tls-cert = certificate refused, 6 tls-other,
+//                 7 timeout, 8 closed, 9 cancelled, 10 other), jc_net_tls(c) = tls error number,
+//                 jc_net_verify(c) = x509 verdict (x509.V_EXPIRED 2, V_NAME 4, V_UNKNOWN_ISSUER 5,
+//                 V_BAD_SIGNATURE 6, ...), jc_net_layer_name(c) = the layer as a word. The same
+//                 three are set before JE_HTTP_ERR arg 0 and JE_NETERR.
 //   JE_OPEN       the socket is open               JE_CLOSE   arg = close code
 //   JE_NETERR     arg = wsc error code (jc_ws_status = HTTP status of a refused upgrade)
 //   JE_TOKEN      text = a piece of the answer     JE_DONE    the answer is complete
@@ -66,6 +72,7 @@ import std.json
 import std.secret
 import async.loop
 import async.ahttp
+import net.jarvisroots
 import async.wsc
 import net.http
 
@@ -77,6 +84,7 @@ export {
     jc_new, jc_free, jc_set_base, jc_set_token, jc_has_token, jc_set_tz, jc_set_dev,
     jc_add_trust_pem, jc_login, jc_connect, jc_disconnect, jc_is_open,
     jc_send, jc_stop, jc_confirm, jc_answer, jc_history, jc_new_chat,
+    jc_set_system_trust, jc_net_layer, jc_net_tls, jc_net_verify, jc_net_layer_name,
     jc_text, jc_id, jc_options, jc_cid, jc_set_cid, jc_ws_status, jc_user, jc_token, jc_base,
     jc_save, jc_restore, jc_forget, jc_clean,
 }
@@ -123,6 +131,10 @@ struct Jc {
     outq: rt.Buf, // [u32 len][bytes] ... messages written while the socket is down
     req_url: rt.Buf,
     req_body: rt.Buf,
+    net_layer: u32, // why the last request / socket failed (ahttp.NL_*), 0 = no failure
+    net_tls: u32, // tls.tls_err_num of that failure (9 = certificate refused)
+    net_verify: u32, // x509 verdict (x509.V_*) when net_layer is tls-cert
+    no_sys: bool, // the system roots are switched off (tests, pinned setups)
     busy_login: bool,
     busy_hist: bool,
     started: bool,
@@ -147,13 +159,14 @@ fn jc_new(l: *mut loop.Loop, cb: fn(*mut Jc, u64, u32, i64), ud: u64) -> *mut Jc
         base: rt.buf_new(), token: rt.buf_new(), user: rt.buf_new(), cid: rt.buf_new(),
         tz: rt.buf_new(), dev: rt.buf_new(), last_sent: rt.buf_new(), text: rt.buf_new(),
         id: rt.buf_new(), opts: rt.buf_new(), outq: rt.buf_new(), req_url: rt.buf_new(),
-        req_body: rt.buf_new(), busy_login: false, busy_hist: false, started: false, seq: 0 }
+        req_body: rt.buf_new(), net_layer: 0, net_tls: 0, net_verify: 0, no_sys: false, busy_login: false, busy_hist: false, started: false, seq: 0 }
     if !ahttp.aclient_init(&(*c).ah, l) {
         jc_obj_free[Jc](p)
         return 0 as *mut Jc
     }
     put(&(*c).tz, "UTC")
     put(&(*c).dev, "fmin")
+    jarvisroots.add_to_http(ahttp.aclient_http(&(*c).ah))
     return c
 }
 
@@ -337,13 +350,53 @@ fn jc_clean(s: str) -> str {
 
 // -------------------------------------------------------------------- login
 
+// Remember WHY a request failed (read with jc_net_layer / jc_net_tls / jc_net_verify).
+fn net_note(c: *mut Jc, r: *mut ahttp.Request) {
+    (*c).net_layer = ahttp.areq_layer(r)
+    (*c).net_tls = ahttp.areq_tls_error(r)
+    (*c).net_verify = ahttp.areq_tls_verify(r)
+}
+
+// The same for a socket error: wsc's WSE_* sorted into the ahttp layers.
+fn net_note_ws(c: *mut Jc, w: *mut wsc.WsClient, code: u32) {
+    var l: u32 = ahttp.NL_OTHER
+    if code == wsc.WSE_URL { l = ahttp.NL_URL }
+    if code == wsc.WSE_RESOLVE { l = ahttp.NL_DNS }
+    if code == wsc.WSE_CONNECT { l = ahttp.NL_TCP }
+    if code == wsc.WSE_NO_ROOTS { l = ahttp.NL_TLS_NOROOTS }
+    if code == wsc.WSE_TIMEOUT { l = ahttp.NL_TIMEOUT }
+    if code == wsc.WSE_IO { l = ahttp.NL_CLOSED }
+    if code == wsc.WSE_TLS {
+        l = ahttp.NL_TLS_OTHER
+        let t: u32 = wsc.wsc_tls_error(w)
+        if t == 9 as u32 || t == 10 as u32 { l = ahttp.NL_TLS_CERT }
+    }
+    (*c).net_layer = l
+    (*c).net_tls = wsc.wsc_tls_error(w)
+    (*c).net_verify = wsc.wsc_tls_verify(w)
+}
+
+// false: ignore the system roots, trust only the embedded Let's Encrypt roots
+// (net.jarvisroots) and what `jc_add_trust_pem` added. Call before the first request.
+fn jc_set_system_trust(c: *mut Jc, on: bool) {
+    (*c).no_sys = !on
+    http.client_set_system_trust(ahttp.aclient_http(&(*c).ah), on)
+}
+
+fn jc_net_layer(c: *mut Jc) -> u32 { return (*c).net_layer }
+fn jc_net_tls(c: *mut Jc) -> u32 { return (*c).net_tls }
+fn jc_net_verify(c: *mut Jc) -> u32 { return (*c).net_verify }
+fn jc_net_layer_name(c: *mut Jc) -> str { return ahttp.areq_layer_name((*c).net_layer) }
+
 fn on_login(r: *mut ahttp.Request, ud: u64) {
     let c: *mut Jc = ud as *mut Jc
     (*c).busy_login = false
     if ahttp.areq_error(r) != 0 {
+        net_note(c, r)
         emit(c, JE_LOGIN, "", 0)
         return
     }
+    (*c).net_layer = 0
     let status: u32 = ahttp.areq_status(r)
     if status == 200 {
         var d: json.Json = json.json_new()
@@ -473,7 +526,10 @@ fn jc_connect(c: *mut Jc) -> bool {
             return false
         }
         (*c).ws = w
-        wsc.wsc_use_system_trust(w)
+        if !(*c).no_sys {
+            wsc.wsc_use_system_trust(w)
+        }
+        jarvisroots.add_to_ws(w)
         wsc.wsc_set_auto_reconnect(w, true, 500, 15000, 0)
         wsc.wsc_set_keepalive(w, 20000, 10000)
         var ck: rt.Buf = rt.buf_new()
@@ -507,6 +563,7 @@ fn on_ws(w: *mut wsc.WsClient, ud: u64, kind: u32, arg: u32) {
     } else if kind == wsc.WE_CLOSE {
         emit(c, JE_CLOSE, "", arg as i64)
     } else if kind == wsc.WE_ERROR {
+        net_note_ws(c, w, arg)
         emit(c, JE_NETERR, "", arg as i64)
     }
 }
@@ -772,6 +829,7 @@ fn on_hist(r: *mut ahttp.Request, ud: u64) {
     let c: *mut Jc = ud as *mut Jc
     (*c).busy_hist = false
     if ahttp.areq_error(r) != 0 {
+        net_note(c, r)
         emit(c, JE_HTTP_ERR, "", 0)
         return
     }
