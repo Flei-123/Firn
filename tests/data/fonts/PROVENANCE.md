@@ -64,3 +64,21 @@ redistribute, including in subsetted form.
 * the PIXELS against a second rasteriser written in Python with a
   completely different algorithm (scanline crossings with a winding
   counter, exact in x, 16 samples per pixel row in y).
+
+## `InterSubset-Regular.ttf` -- 33,660 octets
+
+A **subset of Inter 4.0 Regular** (rsms/inter, release v4.0, `extras/ttf/Inter-Regular.ttf`),
+made on 17 October 2026 (fUi round W2) with fontTools:
+
+```sh
+pyftsubset Inter-Regular.ttf --unicodes=U+0020-007E,U+00A0-017F,U+2013,U+2014,U+2018-201D,U+2026,U+20AC \
+    --layout-features='kern' --no-hinting --drop-tables+=GSUB,GDEF --output-file=InterSubset-Regular.ttf
+```
+
+Why Inter: it is the most common modern UI face and carries NO `kern` table --
+all its pair kerning is in GPOS (lookup type 2, one extension lookup with a
+glyph-pair subtable and a class-pair subtable). That makes it the test for the
+GPOS reader in `lib/font/ttf.fi` (`tools/fui/gposkern_check.py` compares 3000
+pairs with a fontTools walk through the same tables).
+
+Licence: SIL Open Font License 1.1, `LICENSES/Inter-OFL.txt`.

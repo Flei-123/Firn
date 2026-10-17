@@ -184,6 +184,11 @@ def main():
             print("  %2d px: fUi %.3f  ref %.3f  diff %.4f" % (s, got, want, got - want))
             if abs(got - want) > 0.01:
                 fails.append("advance %d px" % s)
+        # ---- kerning in the bidi path
+        bk = on["bidikern"]
+        print("bidi kerning: width('AVATAR To'+alef) - alef - width('AVATAR To') = %d / 1e6 px (must be 0)" % bk)
+        if abs(bk) > 10:
+            fails.append("bidi kerning")
         # ---- time
         print("time (best of %d), 40 chars at 16 px: cold %.0f us, warm %.0f us per line" % (
             a.runs, min(cold) / 1000.0, min(warm) / 1000.0))
