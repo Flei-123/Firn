@@ -1,0 +1,1464 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/gpu_vk.fi -- fUi's GPU on VULKAN (W18-F2): the `paint.gl.GlApi` table filled by Vulkan.
+//
+//     var api: gl.GlApi = gl.gl_api_new()
+//     if gpu_vk.vkgl_api(&api) {                 // loader + device + objects; false = no Vulkan (the CPU painter stays)
+//         gpu.gpu_open(&g, &api) ; gpu.gpu_attach(&g, &canvas) ; ... paint ... ; gpu.gpu_read(...)
+//     }
+//
+// fUi's renderer (lib/fui/gpu.fi) calls ~42 OpenGL ES 3 functions through a table; this file answers them with Vulkan, so the
+// batching, the glyph atlas, the glass passes and the read-back of gpu.fi run UNCHANGED. Decisions (docs/fui-gpu-path.md):
+//   - ONE shader source: the SPIR-V in lib/fui/spv is built from the GLSL ES files of the GLES backend (spv/build.sh).
+//   - Every image stays in layout GENERAL (render pass initial = final = GENERAL, descriptors GENERAL): no layout tracking.
+//   - Every GL operation that touches the GPU (draw, clear, upload, blit, read) is ONE command buffer, submitted and waited
+//     for (vk_frame.imm_begin / imm_submit). Simple and correct; gpu.fi already batches (one instanced draw per batch).
+//   - GL row r of a texture / framebuffer = Vulkan image row r: the viewport needs no flip (NDC y = -1 is memory row 0 in both).
+//   - Program 1 = the big fragment shader, program 2 = the photo shader (told apart by the length of the fragment source).
+//     A uniform location is (program << 8 | slot); a program owns a 160 octet image of the std140 block `P` (see spv/build.sh).
+//   - Blend = premultiplied (ONE, ONE_MINUS_SRC_ALPHA) -- the only blend gpu.fi uses -- or none. Wrap = clamp to edge.
+//   - FB 0 is not a window: a draw to it does nothing; hosts call `gpu.gpu_read` and use their normal CPU present.
+//   - FUI_GPU_FAIL=open  -> `vkgl_api` returns false; FUI_GPU_FAIL=compile -> `program` returns 0 (gpu.gpu_open fails,
+//     the CPU painter keeps running, the frame is bit-equal to a CPU-only run).
+// THREADS: main thread only (like gpu.vk). Struct offsets are x86_64 / Vulkan 1.0 headers.
+import std.rt
+import std.env
+import std.dynlib
+import paint.gl
+import gpu.vk
+import gpu.vk_mem
+import gpu.vk_desc
+import gpu.vk_frame
+
+export { vkgl_api, vkgl_close, vkgl_is_cpu, vkgl_device, vkgl_stats, vkgl_step }
+
+const SPV_VS: str = __include_str("spv/gpu_vk.vert.spv")
+const SPV_FS: str = __include_str("spv/gpu_vk.frag.spv")
+const SPV_FSP: str = __include_str("spv/gpu_vk_photo.frag.spv")
+const GLSL_PHOTO: str = __include_str("gpu_fs_photo.glsl")
+
+const TEX_MAX: usize = 64
+const BUF_MAX: usize = 16
+const FB_MAX: usize = 48
+const UBO_BYTES: usize = 160
+const SCR_BYTES: usize = 8192
+
+const FMT_R8_UNORM: u32 = 9
+const FMT_RGBA8_UNORM: u32 = 37
+const FMT_R32G32_SFLOAT: u32 = 103
+const LAYOUT_GENERAL: u64 = 1
+const IMG_USAGE: u64 = 0x17 // TRANSFER_SRC | TRANSFER_DST | SAMPLED | COLOR_ATTACHMENT
+const ALL_CMDS: u64 = 0x10000
+const MEM_W: u64 = 0x10000
+const MEM_RW: u64 = 0x18000
+
+const GLE_BLEND: u64 = 3042
+const GLE_SCISSOR: u64 = 3089
+const GLE_ARRAY: u64 = 34962
+const GLE_READ_FB: u64 = 36008
+const GLE_DRAW_FB: u64 = 36009
+const GLE_MAG: u64 = 10240
+const GLE_LINEAR: i64 = 9729
+const GLE_COLOR_BIT: u64 = 16384
+const GLE_FB_COMPLETE: u64 = 36053
+const GLE_FB_INCOMPLETE: u64 = 36054
+const GLE_TEXTURE0: u64 = 33984
+
+struct VTex {
+    used: bool,
+    ok: bool,
+    img: vk_mem.Img,
+    w: i32,
+    h: i32,
+    fmt: u32,
+    bpp: usize,
+    linear: bool,
+}
+
+struct VBuf {
+    used: bool,
+    ok: bool,
+    b: vk_mem.Buf,
+    size: usize,
+}
+
+struct VFb {
+    used: bool,
+    ok: bool,
+    tex: u64,
+    fb: u64,
+    w: i32,
+    h: i32,
+}
+
+struct VG {
+    ok: bool,
+    step: i32,
+    v: vk.Vk,
+    x: vk_mem.X,
+    fr: vk_frame.Frames,
+    fn_clear_att: u64,
+    fn_clear_img: u64,
+    rp: u64,
+    dsl: u64,
+    dpool: u64,
+    dset: u64,
+    playout: u64,
+    samp0: u64,
+    samp1: u64,
+    ubo: vk_mem.Buf,
+    stg: vk_mem.Buf,
+    stg_n: usize,
+    scr: u64,
+    top: usize,
+    texs: u64,
+    bufs: u64,
+    fbs: u64,
+    p0n: vk_desc.VPipe,
+    p0b: vk_desc.VPipe,
+    p1n: vk_desc.VPipe,
+    p1b: vk_desc.VPipe,
+    nprog: u64,
+    uni: u64,
+    samp_unit: [i64; 8],
+    cur_prog: u64,
+    cur_tex: [u64; 8],
+    unit: u64,
+    arr_buf: u64,
+    attr_buf: [u64; 9],
+    rfb: u64,
+    dfb: u64,
+    vp_x: i64,
+    vp_y: i64,
+    vp_w: i64,
+    vp_h: i64,
+    sc_x: i64,
+    sc_y: i64,
+    sc_w: i64,
+    sc_h: i64,
+    sc_on: bool,
+    blend_on: bool,
+    cc: [f64; 4],
+    dummy: u64,
+    next_vao: u64,
+    fail_compile: bool,
+    draws: u64,
+    submits: u64,
+    uploads: u64,
+    readbacks: u64,
+}
+
+static mut G_P: u64 = 0
+
+fn gs() -> *mut VG {
+    return G_P as *mut VG
+}
+
+fn vtex_new() -> VTex {
+    return VTex { used: false, ok: false, img: vk_mem.img_none(), w: 0, h: 0, fmt: 0 as u32, bpp: 4, linear: false }
+}
+
+fn vbuf_new() -> VBuf {
+    return VBuf { used: false, ok: false, b: vk_mem.buf_none(), size: 0 }
+}
+
+fn vfb_new() -> VFb {
+    return VFb { used: false, ok: false, tex: 0, fb: 0, w: 0, h: 0 }
+}
+
+fn vg_new() -> VG {
+    return VG {
+        ok: false, step: 0, v: vk.vk_new(), x: vk_mem.x_new(),
+        fr: vk_frame.Frames { ok: false, pool: 0, n: 0, w: 0, icmd: 0, ifence: 0, serial: 0, done: 0, tpending: false },
+        fn_clear_att: 0, fn_clear_img: 0, rp: 0, dsl: 0, dpool: 0, dset: 0, playout: 0, samp0: 0, samp1: 0,
+        ubo: vk_mem.buf_none(), stg: vk_mem.buf_none(), stg_n: 0, scr: 0, top: 0, texs: 0, bufs: 0, fbs: 0,
+        p0n: vk_desc.vpipe_none(), p0b: vk_desc.vpipe_none(), p1n: vk_desc.vpipe_none(), p1b: vk_desc.vpipe_none(),
+        nprog: 0, uni: 0, samp_unit: [0; 8], cur_prog: 0, cur_tex: [0; 8], unit: 0, arr_buf: 0, attr_buf: [0; 9],
+        rfb: 0, dfb: 0, vp_x: 0, vp_y: 0, vp_w: 0, vp_h: 0, sc_x: 0, sc_y: 0, sc_w: 0, sc_h: 0, sc_on: false,
+        blend_on: false, cc: [0.0; 4], dummy: 0, next_vao: 0, fail_compile: false,
+        draws: 0, submits: 0, uploads: 0, readbacks: 0,
+    }
+}
+
+fn tex_at(i: u64) -> *mut VTex {
+    return ((*gs()).texs + i * (size_of[VTex]() as u64)) as *mut VTex
+}
+
+fn buf_at(i: u64) -> *mut VBuf {
+    return ((*gs()).bufs + i * (size_of[VBuf]() as u64)) as *mut VBuf
+}
+
+fn fb_at(i: u64) -> *mut VFb {
+    return ((*gs()).fbs + i * (size_of[VFb]() as u64)) as *mut VFb
+}
+
+// scratch for the structs of one call sequence (zeroed); reset with `(*s).top = 0` at the start of a sequence
+fn sa(n: usize) -> u64 {
+    let s: *mut VG = gs()
+    let m: usize = (n + 15) / 16 * 16
+    if (*s).top + m > SCR_BYTES {
+        (*s).top = 0
+    }
+    let p: u64 = (*s).scr + ((*s).top as u64)
+    rt.mem_set(p, 0 as u8, m)
+    (*s).top = (*s).top + m
+    return p
+}
+
+fn name_is(np: u64, nn: usize, lit: str) -> bool {
+    if nn != lit.length() {
+        return false
+    }
+    var i: usize = 0
+    while i < nn {
+        if rt.ld8(np, i) != lit.chars(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn imin(a: i64, b: i64) -> i64 {
+    if a < b { return a }
+    return b
+}
+
+fn imax(a: i64, b: i64) -> i64 {
+    if a > b { return a }
+    return b
+}
+
+// ---------------------------------------------------------------- command buffers
+
+// A fresh immediate command buffer that starts with a global barrier (everything submitted before is done and visible).
+fn cmd_open() -> u64 {
+    let s: *mut VG = gs()
+    let cmd: u64 = vk_frame.imm_begin(&(*s).x, &(*s).fr)
+    if cmd != 0 {
+        vk_frame.mem_barrier(&(*s).x, cmd, ALL_CMDS, ALL_CMDS, MEM_W, MEM_RW)
+    }
+    return cmd
+}
+
+fn cmd_close() -> bool {
+    let s: *mut VG = gs()
+    (*s).submits = (*s).submits + 1
+    return vk_frame.imm_submit(&(*s).x, &(*s).fr)
+}
+
+// vkCmdClearColorImage(cmd, image, layout, &colour, 1, &range): the image to transparent black
+fn cmd_clear_image(cmd: u64, image: u64) {
+    let s: *mut VG = gs()
+    (*s).top = 0
+    let col: u64 = sa(16)
+    let rg: u64 = sa(20)
+    vk_mem.w32(rg, 0, 1) // aspect colour
+    vk_mem.w32(rg, 8, 1) // level count
+    vk_mem.w32(rg, 16, 1) // layer count
+    var a: [u64; 6] = [0; 6]
+    a[0] = cmd
+    a[1] = image
+    a[2] = LAYOUT_GENERAL
+    a[3] = col
+    a[4] = 1
+    a[5] = rg
+    dynlib.callx((*s).fn_clear_img, "iiiiii", (&a[0]) as u64, false)
+}
+
+// ---------------------------------------------------------------- staging
+
+fn stg_need(n: usize) -> bool {
+    let s: *mut VG = gs()
+    if (*s).stg.ok && (*s).stg_n >= n {
+        return true
+    }
+    if (*s).stg.ok {
+        vk_mem.buf_free(&(*s).x, &(*s).stg)
+    }
+    var sz: usize = 1048576
+    while sz < n {
+        sz = sz * 2
+    }
+    (*s).stg = vk_mem.buf_make(&(*s).x, sz as u64, vk_mem.U_SRC | vk_mem.U_DST, vk_mem.MEM_STAGING)
+    (*s).stg_n = sz
+    return (*s).stg.ok
+}
+
+// ---------------------------------------------------------------- textures
+
+fn tex_release(t: *mut VTex) {
+    let s: *mut VG = gs()
+    if (*t).ok {
+        vk_mem.img_free(&(*s).x, &(*t).img)
+    }
+    (*t).ok = false
+    (*t).w = 0
+    (*t).h = 0
+}
+
+// (Re)creates the image: layout GENERAL, cleared to 0.
+fn tex_make(t: *mut VTex, w: i32, h: i32, fmt: u32, bpp: usize) -> bool {
+    let s: *mut VG = gs()
+    tex_release(t)
+    let img: vk_mem.Img = vk_mem.img_make(&(*s).x, w as u32, h as u32, 1 as u32, fmt, IMG_USAGE, 1 as u64)
+    if !img.ok {
+        return false
+    }
+    (*t).img = img
+    let cmd: u64 = cmd_open()
+    if cmd == 0 {
+        return false
+    }
+    vk_frame.image_barrier(&(*s).x, cmd, img.img, 1, 1, vk_frame.LAYOUT_UNDEFINED, LAYOUT_GENERAL, vk_frame.ST_TOP, ALL_CMDS, 0, MEM_RW)
+    cmd_clear_image(cmd, img.img)
+    if !cmd_close() {
+        return false
+    }
+    (*t).ok = true
+    (*t).w = w
+    (*t).h = h
+    (*t).fmt = fmt
+    (*t).bpp = bpp
+    return true
+}
+
+// rows [y, y+h) x columns [x, x+w) from memory; `rl` = row length in pixels (0 = w)
+fn tex_upload(t: *mut VTex, x: i64, y: i64, w: i64, h: i64, p: u64, rl: i64) -> bool {
+    let s: *mut VG = gs()
+    if !(*t).ok || p == 0 || w <= 0 || h <= 0 {
+        return false
+    }
+    if x < 0 || y < 0 || x + w > (*t).w as i64 || y + h > (*t).h as i64 {
+        return false
+    }
+    let bpp: usize = (*t).bpp
+    let rowb: usize = (w as usize) * bpp
+    var srcrow: usize = rowb
+    if rl > 0 {
+        srcrow = (rl as usize) * bpp
+    }
+    if !stg_need(rowb * (h as usize)) {
+        return false
+    }
+    var r: i64 = 0
+    while r < h {
+        rt.mem_copy((*s).stg.ptr + ((r as usize) * rowb) as u64, p + ((r as usize) * srcrow) as u64, rowb)
+        r = r + 1
+    }
+    let cmd: u64 = cmd_open()
+    if cmd == 0 {
+        return false
+    }
+    (*s).top = 0
+    let rg: u64 = sa(56)
+    vk_mem.w32(rg, 16, 1) // aspect colour
+    vk_mem.w32(rg, 28, 1) // layer count
+    vk_mem.w32(rg, 32, x as u64)
+    vk_mem.w32(rg, 36, y as u64)
+    vk_mem.w32(rg, 44, w as u64)
+    vk_mem.w32(rg, 48, h as u64)
+    vk_mem.w32(rg, 52, 1)
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_COPY_B2I, cmd, (*s).stg.buf, (*t).img.img, LAYOUT_GENERAL, 1, rg, 0, 0, 0, 0)
+    (*s).uploads = (*s).uploads + 1
+    return cmd_close()
+}
+
+fn f_create_texture() -> u64 {
+    let s: *mut VG = gs()
+    var i: u64 = 1
+    while i < TEX_MAX as u64 {
+        let t: *mut VTex = tex_at(i)
+        if !(*t).used {
+            *t = vtex_new()
+            (*t).used = true
+            return i
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn f_bind_texture(target: u64, id: u64) {
+    let s: *mut VG = gs()
+    (*s).cur_tex[(*s).unit as usize] = id
+}
+
+fn f_active_texture(u: u64) {
+    let s: *mut VG = gs()
+    var k: u64 = 0
+    if u >= GLE_TEXTURE0 {
+        k = u - GLE_TEXTURE0
+    }
+    if k > 7 {
+        k = 7
+    }
+    (*s).unit = k
+}
+
+fn f_tex_image_2d(target: u64, level: i64, ifmt: u64, w: i64, h: i64, fmt: u64, ty: u64, p: u64, n: usize) {
+    let s: *mut VG = gs()
+    let id: u64 = (*s).cur_tex[(*s).unit as usize]
+    if id == 0 || id >= TEX_MAX as u64 || w <= 0 || h <= 0 {
+        return
+    }
+    let t: *mut VTex = tex_at(id)
+    if !(*t).used {
+        return
+    }
+    var vf: u32 = FMT_RGBA8_UNORM
+    var bpp: usize = 4
+    if ifmt == gl.GL_R8 as u64 || fmt == gl.GL_RED as u64 {
+        vf = FMT_R8_UNORM
+        bpp = 1
+    }
+    if !((*t).ok && (*t).w == w as i32 && (*t).h == h as i32 && (*t).fmt == vf) {
+        if !tex_make(t, w as i32, h as i32, vf, bpp) {
+            return
+        }
+    }
+    if p != 0 {
+        tex_upload(t, 0, 0, w, h, p, 0)
+    }
+}
+
+fn f_tex_sub_image_2d(target: u64, level: i64, x: i64, y: i64, w: i64, h: i64, fmt: u64, ty: u64, p: u64, n: usize, rl: i64) {
+    let s: *mut VG = gs()
+    let id: u64 = (*s).cur_tex[(*s).unit as usize]
+    if id == 0 || id >= TEX_MAX as u64 {
+        return
+    }
+    tex_upload(tex_at(id), x, y, w, h, p, rl)
+}
+
+fn f_tex_parameteri(target: u64, pname: u64, v: i64) {
+    let s: *mut VG = gs()
+    let id: u64 = (*s).cur_tex[(*s).unit as usize]
+    if id == 0 || id >= TEX_MAX as u64 {
+        return
+    }
+    if pname == GLE_MAG {
+        (*tex_at(id)).linear = v == GLE_LINEAR
+    }
+}
+
+// ---------------------------------------------------------------- framebuffers
+
+fn fb_release(f: *mut VFb) {
+    let s: *mut VG = gs()
+    if (*f).fb != 0 {
+        vk_mem.cx(&(*s).x, vk_mem.X_DESTROY_FB, (*s).x.dev, (*f).fb, 0, 0, 0, 0, 0, 0, 0, 0)
+    }
+    (*f).fb = 0
+    (*f).ok = false
+}
+
+fn f_create_framebuffer() -> u64 {
+    var i: u64 = 1
+    while i < FB_MAX as u64 {
+        let f: *mut VFb = fb_at(i)
+        if !(*f).used {
+            *f = vfb_new()
+            (*f).used = true
+            return i
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn f_bind_framebuffer(target: u64, id: u64) {
+    let s: *mut VG = gs()
+    if target == GLE_READ_FB {
+        (*s).rfb = id
+    } else if target == GLE_DRAW_FB {
+        (*s).dfb = id
+    } else {
+        (*s).rfb = id
+        (*s).dfb = id
+    }
+}
+
+fn f_framebuffer_texture_2d(target: u64, attach: u64, textarget: u64, tex: u64, level: i64) {
+    let s: *mut VG = gs()
+    var id: u64 = (*s).dfb
+    if target == GLE_READ_FB {
+        id = (*s).rfb
+    }
+    if id == 0 || id >= FB_MAX as u64 || tex == 0 || tex >= TEX_MAX as u64 {
+        return
+    }
+    let f: *mut VFb = fb_at(id)
+    let t: *mut VTex = tex_at(tex)
+    if !(*f).used || !(*t).ok {
+        return
+    }
+    fb_release(f)
+    (*s).top = 0
+    let views: u64 = sa(8)
+    vk_mem.w64(views, 0, (*t).img.view)
+    let fi: u64 = sa(64)
+    vk_mem.w32(fi, 0, 37) // FRAMEBUFFER_CREATE_INFO
+    vk_mem.w64(fi, 24, (*s).rp)
+    vk_mem.w32(fi, 32, 1)
+    vk_mem.w64(fi, 40, views)
+    vk_mem.w32(fi, 48, (*t).w as u64)
+    vk_mem.w32(fi, 52, (*t).h as u64)
+    vk_mem.w32(fi, 56, 1)
+    let out: u64 = sa(8)
+    if !vk_mem.good(vk_mem.cx(&(*s).x, vk_mem.X_CREATE_FB, (*s).x.dev, fi, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return
+    }
+    (*f).fb = vk_mem.r64(out, 0)
+    (*f).tex = tex
+    (*f).w = (*t).w
+    (*f).h = (*t).h
+    (*f).ok = true
+}
+
+fn f_check_framebuffer_status(target: u64) -> u64 {
+    let s: *mut VG = gs()
+    var id: u64 = (*s).dfb
+    if target == GLE_READ_FB {
+        id = (*s).rfb
+    }
+    if id == 0 || id >= FB_MAX as u64 {
+        return GLE_FB_INCOMPLETE
+    }
+    if (*fb_at(id)).ok {
+        return GLE_FB_COMPLETE
+    }
+    return GLE_FB_INCOMPLETE
+}
+
+// ---------------------------------------------------------------- buffers, vertex state, uniforms, simple state
+
+fn f_create_buffer() -> u64 {
+    var i: u64 = 1
+    while i < BUF_MAX as u64 {
+        let b: *mut VBuf = buf_at(i)
+        if !(*b).used {
+            *b = vbuf_new()
+            (*b).used = true
+            return i
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn f_bind_buffer(target: u64, id: u64) {
+    let s: *mut VG = gs()
+    if target == GLE_ARRAY {
+        (*s).arr_buf = id
+    }
+}
+
+fn f_buffer_data(target: u64, p: u64, n: usize, usage: u64) {
+    let s: *mut VG = gs()
+    let id: u64 = (*s).arr_buf
+    if id == 0 || id >= BUF_MAX as u64 || n == 0 {
+        return
+    }
+    let b: *mut VBuf = buf_at(id)
+    if !(*b).used {
+        return
+    }
+    if (*b).ok {
+        vk_mem.buf_free(&(*s).x, &(*b).b)
+        (*b).ok = false
+    }
+    (*b).b = vk_mem.buf_make(&(*s).x, n as u64, vk_mem.U_VERTEX | vk_mem.U_DST, vk_mem.MEM_STAGING)
+    if !(*b).b.ok {
+        return
+    }
+    rt.mem_set((*b).b.ptr, 0 as u8, n)
+    if p != 0 {
+        rt.mem_copy((*b).b.ptr, p, n)
+    }
+    (*b).size = n
+    (*b).ok = true
+}
+
+fn f_buffer_sub_data(target: u64, off: usize, p: u64, n: usize) {
+    let s: *mut VG = gs()
+    let id: u64 = (*s).arr_buf
+    if id == 0 || id >= BUF_MAX as u64 || p == 0 {
+        return
+    }
+    let b: *mut VBuf = buf_at(id)
+    if !(*b).ok || off + n > (*b).size {
+        return
+    }
+    rt.mem_copy((*b).b.ptr + off as u64, p, n)
+}
+
+fn f_create_vertex_array() -> u64 {
+    let s: *mut VG = gs()
+    (*s).next_vao = (*s).next_vao + 1
+    return (*s).next_vao
+}
+
+fn f_bind_vertex_array(v: u64) {
+}
+
+fn f_enable_vertex_attrib_array(i: u64) {
+}
+
+// the pipeline's vertex layout is fixed; what counts is which buffer feeds attribute `i`
+fn f_vertex_attrib_pointer(i: u64, size: i64, ty: u64, norm: u64, stride: i64, off: usize) {
+    let s: *mut VG = gs()
+    if i < 9 {
+        (*s).attr_buf[i as usize] = (*s).arr_buf
+    }
+}
+
+fn f_vertex_attrib_divisor(i: u64, d: u64) {
+}
+
+fn f_use_program(p: u64) {
+    (*gs()).cur_prog = p
+}
+
+// (program << 8) | slot: 1 u_size, 2 u_srcsize, 3 u_nspot, 4 u_atlas, 5 u_stream, 6 u_src, 16 + i u_spot[i]
+fn f_uniform_location(p: u64, np: u64, nn: usize) -> u64 {
+    if p == 0 || p > 2 {
+        return 0
+    }
+    var code: u64 = 0
+    if name_is(np, nn, "u_size") {
+        code = 1
+    } else if name_is(np, nn, "u_srcsize") {
+        code = 2
+    } else if name_is(np, nn, "u_nspot") {
+        code = 3
+    } else if name_is(np, nn, "u_atlas") {
+        code = 4
+    } else if name_is(np, nn, "u_stream") {
+        code = 5
+    } else if name_is(np, nn, "u_src") {
+        code = 6
+    } else {
+        var i: u64 = 0
+        while i < 8 {
+            var nm: str = "u_spot[0]"
+            if i == 1 { nm = "u_spot[1]" }
+            if i == 2 { nm = "u_spot[2]" }
+            if i == 3 { nm = "u_spot[3]" }
+            if i == 4 { nm = "u_spot[4]" }
+            if i == 5 { nm = "u_spot[5]" }
+            if i == 6 { nm = "u_spot[6]" }
+            if i == 7 { nm = "u_spot[7]" }
+            if name_is(np, nn, nm) {
+                code = 16 + i
+            }
+            i = i + 1
+        }
+    }
+    if code == 0 {
+        return 0
+    }
+    if p == 2 && (code == 3 || code == 4 || code == 5 || code >= 16) {
+        return 0 // the photo shader has u_size, u_srcsize, u_src only
+    }
+    return (p << 8) | code
+}
+
+fn uni_ptr(loc: u64) -> u64 {
+    let s: *mut VG = gs()
+    let p: u64 = loc >> 8
+    if p == 0 || p > 2 {
+        return 0
+    }
+    return (*s).uni + (p - 1) * (UBO_BYTES as u64)
+}
+
+fn f_uniform1i(loc: u64, v: i64) {
+    let s: *mut VG = gs()
+    let base: u64 = uni_ptr(loc)
+    if base == 0 {
+        return
+    }
+    let code: u64 = loc & 255
+    let pi: usize = ((loc >> 8) - 1) as usize
+    if code == 3 {
+        vk_mem.w32(base, 16, v as u64)
+    } else if code >= 4 && code <= 6 {
+        (*s).samp_unit[pi * 4 + (code - 3) as usize] = v
+    }
+}
+
+fn f_uniform1f(loc: u64, v: f64) {
+}
+
+fn f_uniform2f(loc: u64, a0: f64, b0: f64) {
+    let base: u64 = uni_ptr(loc)
+    if base == 0 {
+        return
+    }
+    let code: u64 = loc & 255
+    if code == 1 {
+        vk_mem.wf(base, 0, a0)
+        vk_mem.wf(base, 4, b0)
+    } else if code == 2 {
+        vk_mem.wf(base, 8, a0)
+        vk_mem.wf(base, 12, b0)
+    }
+}
+
+fn f_uniform4f(loc: u64, a0: f64, b0: f64, c0: f64, d0: f64) {
+    let base: u64 = uni_ptr(loc)
+    if base == 0 {
+        return
+    }
+    let code: u64 = loc & 255
+    if code >= 16 && code < 24 {
+        let o: usize = 32 + ((code - 16) as usize) * 16
+        vk_mem.wf(base, o, a0)
+        vk_mem.wf(base, o + 4, b0)
+        vk_mem.wf(base, o + 8, c0)
+        vk_mem.wf(base, o + 12, d0)
+    }
+}
+
+fn f_viewport(x: i64, y: i64, w: i64, h: i64) {
+    let s: *mut VG = gs()
+    (*s).vp_x = x
+    (*s).vp_y = y
+    (*s).vp_w = w
+    (*s).vp_h = h
+}
+
+fn f_scissor(x: i64, y: i64, w: i64, h: i64) {
+    let s: *mut VG = gs()
+    (*s).sc_x = x
+    (*s).sc_y = y
+    (*s).sc_w = w
+    (*s).sc_h = h
+}
+
+fn f_enable(c: u64) {
+    let s: *mut VG = gs()
+    if c == GLE_BLEND { (*s).blend_on = true }
+    if c == GLE_SCISSOR { (*s).sc_on = true }
+}
+
+fn f_disable(c: u64) {
+    let s: *mut VG = gs()
+    if c == GLE_BLEND { (*s).blend_on = false }
+    if c == GLE_SCISSOR { (*s).sc_on = false }
+}
+
+fn f_blend_func_separate(a0: u64, b0: u64, c0: u64, d0: u64) {
+}
+
+fn f_clear_color(r: f64, g0: f64, b0: f64, a0: f64) {
+    let s: *mut VG = gs()
+    (*s).cc[0] = r
+    (*s).cc[1] = g0
+    (*s).cc[2] = b0
+    (*s).cc[3] = a0
+}
+
+fn f_get_error() -> u64 {
+    return 0
+}
+
+fn f_finish() {
+}
+
+fn f_copy_tex_sub_image_2d(t: u64, l: i64, a0: i64, b0: i64, c0: i64, d0: i64, e0: i64, f0: i64) {
+}
+
+fn f_draw_arrays(m: u64, first: i64, count: i64) {
+    f_draw_arrays_instanced(m, first, count, 1)
+}
+
+// ---------------------------------------------------------------- programs
+
+fn make_pipe(s: *mut VG, vs: str, fs: str, blend: bool) -> vk_desc.VPipe {
+    var sp: vk_desc.PipeSpec = vk_desc.spec_new(vs.p as u64, vs.n, fs.p as u64, fs.n)
+    vk_desc.spec_bind(&sp, 8 as u32, false)
+    vk_desc.spec_bind(&sp, 128 as u32, true)
+    vk_desc.spec_attr(&sp, 0 as u32, 0 as u32, FMT_R32G32_SFLOAT, 0 as u32)
+    var k: u32 = 1 as u32
+    while k <= 8 as u32 {
+        vk_desc.spec_attr(&sp, k, 1 as u32, vk_desc.FMT_R32G32B32A32_SFLOAT, (k - 1 as u32) * 16 as u32)
+        k = k + 1 as u32
+    }
+    sp.topo = vk_desc.TOPO_STRIP
+    if blend {
+        sp.blend = vk_desc.BLEND_PREMUL
+    }
+    return vk_desc.pipeline_make(&(*s).x, (*s).v.cache, (*s).rp, (*s).playout, &sp)
+}
+
+fn say_log(lp: u64, cap: usize, msg: str) {
+    if lp == 0 || cap == 0 {
+        return
+    }
+    var n: usize = msg.length()
+    if n + 1 > cap {
+        n = cap - 1
+    }
+    var i: usize = 0
+    while i < n {
+        rt.st8(lp, i, msg.chars(i))
+        i = i + 1
+    }
+    rt.st8(lp, n, 0 as u8)
+}
+
+fn f_program(vp: u64, vn: usize, fp: u64, fsn: usize, lp: u64, cap: usize) -> u64 {
+    let s: *mut VG = gs()
+    if (*s).fail_compile {
+        say_log(lp, cap, "FUI_GPU_FAIL=compile: the shader build is forced to fail")
+        return 0
+    }
+    if fsn == GLSL_PHOTO.n {
+        (*s).p1n = make_pipe(s, SPV_VS, SPV_FSP, false)
+        (*s).p1b = make_pipe(s, SPV_VS, SPV_FSP, true)
+        if !(*s).p1n.ok || !(*s).p1b.ok {
+            say_log(lp, cap, "vulkan: the photo pipeline did not build")
+            return 0
+        }
+        return 2
+    }
+    (*s).p0n = make_pipe(s, SPV_VS, SPV_FS, false)
+    (*s).p0b = make_pipe(s, SPV_VS, SPV_FS, true)
+    if !(*s).p0n.ok || !(*s).p0b.ok {
+        say_log(lp, cap, "vulkan: the main pipeline did not build")
+        return 0
+    }
+    return 1
+}
+
+// ---------------------------------------------------------------- drawing
+
+fn tex_for_slot(s: *mut VG, pi: usize, slot: usize) -> u64 {
+    var u: i64 = (*s).samp_unit[pi * 4 + slot]
+    if u < 0 || u > 7 {
+        u = 0
+    }
+    let id: u64 = (*s).cur_tex[u as usize]
+    if id == 0 || id >= TEX_MAX as u64 || !(*tex_at(id)).ok {
+        return (*s).dummy
+    }
+    return id
+}
+
+fn write_desc(s: *mut VG, pi: usize) {
+    (*s).top = 0
+    let bi: u64 = sa(24)
+    vk_mem.w64(bi, 0, (*s).ubo.buf)
+    vk_mem.w64(bi, 8, 0)
+    vk_mem.w64(bi, 16, UBO_BYTES as u64)
+    let ii: u64 = sa(24 * 3)
+    var k: usize = 0
+    while k < 3 {
+        let t: *mut VTex = tex_at(tex_for_slot(s, pi, k + 1))
+        var sm: u64 = (*s).samp0
+        if (*t).linear {
+            sm = (*s).samp1
+        }
+        vk_mem.w64(ii, k * 24, sm)
+        vk_mem.w64(ii, k * 24 + 8, (*t).img.view)
+        vk_mem.w32(ii, k * 24 + 16, LAYOUT_GENERAL)
+        k = k + 1
+    }
+    let wr: u64 = sa(64 * 4)
+    vk_mem.w32(wr, 0, 35) // WRITE_DESCRIPTOR_SET
+    vk_mem.w64(wr, 16, (*s).dset)
+    vk_mem.w32(wr, 24, 0)
+    vk_mem.w32(wr, 32, 1)
+    vk_mem.w32(wr, 36, 6) // UNIFORM_BUFFER
+    vk_mem.w64(wr, 48, bi)
+    k = 0
+    while k < 3 {
+        let o: usize = (k + 1) * 64
+        vk_mem.w32(wr, o, 35)
+        vk_mem.w64(wr, o + 16, (*s).dset)
+        vk_mem.w32(wr, o + 24, (k + 1) as u64)
+        vk_mem.w32(wr, o + 32, 1)
+        vk_mem.w32(wr, o + 36, 1) // COMBINED_IMAGE_SAMPLER
+        vk_mem.w64(wr, o + 40, ii + (k * 24) as u64)
+        k = k + 1
+    }
+    vk_mem.cx(&(*s).x, vk_mem.X_UPDATE_DSETS, (*s).x.dev, 4, wr, 0, 0, 0, 0, 0, 0, 0)
+}
+
+// render pass begin (load, no clear) on framebuffer `f`
+fn begin_pass(s: *mut VG, cmd: u64, f: *mut VFb) {
+    (*s).top = 0
+    let bi: u64 = sa(64)
+    vk_mem.w32(bi, 0, 43) // RENDER_PASS_BEGIN_INFO
+    vk_mem.w64(bi, 16, (*s).rp)
+    vk_mem.w64(bi, 24, (*f).fb)
+    vk_mem.w32(bi, 40, (*f).w as u64)
+    vk_mem.w32(bi, 44, (*f).h as u64)
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_BEGIN_RP, cmd, bi, 0, 0, 0, 0, 0, 0, 0, 0)
+}
+
+// the scissor rectangle in image rows, clipped to the framebuffer
+fn scissor_rect(s: *mut VG, f: *mut VFb, out: *mut [i64; 4]) {
+    var x0: i64 = 0
+    var y0: i64 = 0
+    var x1: i64 = (*f).w as i64
+    var y1: i64 = (*f).h as i64
+    if (*s).sc_on {
+        x0 = imax(0, (*s).sc_x)
+        y0 = imax(0, (*s).sc_y)
+        x1 = imin(x1, (*s).sc_x + (*s).sc_w)
+        y1 = imin(y1, (*s).sc_y + (*s).sc_h)
+    }
+    if x1 < x0 { x1 = x0 }
+    if y1 < y0 { y1 = y0 }
+    (*out)[0] = x0
+    (*out)[1] = y0
+    (*out)[2] = x1 - x0
+    (*out)[3] = y1 - y0
+}
+
+fn pipe_handle(s: *mut VG, pi: usize, blend: bool) -> u64 {
+    if pi == 0 {
+        if blend { return (*s).p0b.pipe }
+        return (*s).p0n.pipe
+    }
+    if blend { return (*s).p1b.pipe }
+    return (*s).p1n.pipe
+}
+
+fn f_draw_arrays_instanced(mode: u64, first: i64, count: i64, n: i64) {
+    let s: *mut VG = gs()
+    if !(*s).ok || n <= 0 || count <= 0 || (*s).cur_prog == 0 || (*s).cur_prog > 2 {
+        return
+    }
+    let pi: usize = ((*s).cur_prog - 1) as usize
+    let pipe: u64 = pipe_handle(s, pi, (*s).blend_on)
+    if pipe == 0 || (*s).dfb == 0 || (*s).dfb >= FB_MAX as u64 {
+        return
+    }
+    let f: *mut VFb = fb_at((*s).dfb)
+    if !(*f).ok {
+        return
+    }
+    let b0: *mut VBuf = buf_at((*s).attr_buf[0])
+    let b1: *mut VBuf = buf_at((*s).attr_buf[1])
+    if (*s).attr_buf[0] >= BUF_MAX as u64 || (*s).attr_buf[1] >= BUF_MAX as u64 || !(*b0).ok || !(*b1).ok {
+        return
+    }
+    rt.mem_copy((*s).ubo.ptr, (*s).uni + (pi * UBO_BYTES) as u64, UBO_BYTES)
+    write_desc(s, pi)
+    let cmd: u64 = cmd_open()
+    if cmd == 0 {
+        return
+    }
+    begin_pass(s, cmd, f)
+    (*s).top = 0
+    let vp: u64 = sa(24)
+    vk_mem.wf(vp, 0, (*s).vp_x as f64)
+    vk_mem.wf(vp, 4, (*s).vp_y as f64)
+    vk_mem.wf(vp, 8, (*s).vp_w as f64)
+    vk_mem.wf(vp, 12, (*s).vp_h as f64)
+    vk_mem.wf(vp, 20, 1.0)
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_SET_VP, cmd, 0, 1, vp, 0, 0, 0, 0, 0, 0)
+    var r: [i64; 4] = [0; 4]
+    scissor_rect(s, f, &r)
+    let sc: u64 = sa(16)
+    vk_mem.w32(sc, 0, r[0] as u64)
+    vk_mem.w32(sc, 4, r[1] as u64)
+    vk_mem.w32(sc, 8, r[2] as u64)
+    vk_mem.w32(sc, 12, r[3] as u64)
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_SET_SC, cmd, 0, 1, sc, 0, 0, 0, 0, 0, 0)
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_BIND_PIPE, cmd, 0, pipe, 0, 0, 0, 0, 0, 0, 0)
+    let ds: u64 = sa(8)
+    vk_mem.w64(ds, 0, (*s).dset)
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_BIND_DS, cmd, 0, (*s).playout, 0, 1, ds, 0, 0, 0, 0)
+    let vbs: u64 = sa(32)
+    vk_mem.w64(vbs, 0, (*b0).b.buf)
+    vk_mem.w64(vbs, 8, (*b1).b.buf)
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_BIND_VB, cmd, 0, 2, vbs, vbs + 16, 0, 0, 0, 0, 0)
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_DRAW, cmd, count as u64, n as u64, first as u64, 0, 0, 0, 0, 0, 0)
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_END_RP, cmd, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    cmd_close()
+    (*s).draws = (*s).draws + 1
+}
+
+// clear the colour of the draw framebuffer (inside the scissor when it is on) with the kept clear colour
+fn f_clear(mask: u64) {
+    let s: *mut VG = gs()
+    if (mask & GLE_COLOR_BIT) == 0 || !(*s).ok || (*s).dfb == 0 || (*s).dfb >= FB_MAX as u64 {
+        return
+    }
+    let f: *mut VFb = fb_at((*s).dfb)
+    if !(*f).ok {
+        return
+    }
+    let cmd: u64 = cmd_open()
+    if cmd == 0 {
+        return
+    }
+    begin_pass(s, cmd, f)
+    (*s).top = 0
+    var r: [i64; 4] = [0; 4]
+    scissor_rect(s, f, &r)
+    if r[2] > 0 && r[3] > 0 {
+        let ca: u64 = sa(24)
+        vk_mem.w32(ca, 0, 1) // aspect colour
+        vk_mem.wf(ca, 8, (*s).cc[0])
+        vk_mem.wf(ca, 12, (*s).cc[1])
+        vk_mem.wf(ca, 16, (*s).cc[2])
+        vk_mem.wf(ca, 20, (*s).cc[3])
+        let cr: u64 = sa(24)
+        vk_mem.w32(cr, 0, r[0] as u64)
+        vk_mem.w32(cr, 4, r[1] as u64)
+        vk_mem.w32(cr, 8, r[2] as u64)
+        vk_mem.w32(cr, 12, r[3] as u64)
+        vk_mem.w32(cr, 20, 1) // layer count
+        var a: [u64; 5] = [0; 5]
+        a[0] = cmd
+        a[1] = 1
+        a[2] = ca
+        a[3] = 1
+        a[4] = cr
+        dynlib.callx((*s).fn_clear_att, "iiiii", (&a[0]) as u64, false)
+    }
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_END_RP, cmd, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    cmd_close()
+}
+
+fn f_blit_framebuffer(sx0: i64, sy0: i64, sx1: i64, sy1: i64, dx0: i64, dy0: i64, dx1: i64, dy1: i64, mask: u64, filter: u64) {
+    let s: *mut VG = gs()
+    if !(*s).ok || (*s).rfb == 0 || (*s).dfb == 0 || (*s).rfb >= FB_MAX as u64 || (*s).dfb >= FB_MAX as u64 {
+        return
+    }
+    let rf: *mut VFb = fb_at((*s).rfb)
+    let df: *mut VFb = fb_at((*s).dfb)
+    if !(*rf).ok || !(*df).ok {
+        return
+    }
+    var ax0: i64 = sx0
+    var ay0: i64 = sy0
+    var ax1: i64 = sx1
+    var ay1: i64 = sy1
+    var bx0: i64 = dx0
+    var by0: i64 = dy0
+    var bx1: i64 = dx1
+    var by1: i64 = dy1
+    if (ax1 - ax0) == (bx1 - bx0) && (ay1 - ay0) == (by1 - by0) {
+        // 1:1 copy: clip both rectangles to their images together
+        var ox: i64 = imax(0, imax(0 - ax0, 0 - bx0))
+        var oy: i64 = imax(0, imax(0 - ay0, 0 - by0))
+        ax0 = ax0 + ox
+        bx0 = bx0 + ox
+        ay0 = ay0 + oy
+        by0 = by0 + oy
+        let ex: i64 = imax(0, imax(ax1 - (*rf).w as i64, bx1 - (*df).w as i64))
+        let ey: i64 = imax(0, imax(ay1 - (*rf).h as i64, by1 - (*df).h as i64))
+        ax1 = ax1 - ex
+        bx1 = bx1 - ex
+        ay1 = ay1 - ey
+        by1 = by1 - ey
+    }
+    if ax1 <= ax0 || ay1 <= ay0 || bx1 <= bx0 || by1 <= by0 {
+        return
+    }
+    if ax0 < 0 || ay0 < 0 || ax1 > (*rf).w as i64 || ay1 > (*rf).h as i64 || bx0 < 0 || by0 < 0 || bx1 > (*df).w as i64 || by1 > (*df).h as i64 {
+        return
+    }
+    let cmd: u64 = cmd_open()
+    if cmd == 0 {
+        return
+    }
+    (*s).top = 0
+    let r: u64 = sa(80)
+    vk_mem.w32(r, 0, 1) // src aspect colour
+    vk_mem.w32(r, 12, 1) // src layer count
+    vk_mem.w32(r, 16, ax0 as u64)
+    vk_mem.w32(r, 20, ay0 as u64)
+    vk_mem.w32(r, 28, ax1 as u64)
+    vk_mem.w32(r, 32, ay1 as u64)
+    vk_mem.w32(r, 36, 1)
+    vk_mem.w32(r, 40, 1) // dst aspect colour
+    vk_mem.w32(r, 52, 1) // dst layer count
+    vk_mem.w32(r, 56, bx0 as u64)
+    vk_mem.w32(r, 60, by0 as u64)
+    vk_mem.w32(r, 68, bx1 as u64)
+    vk_mem.w32(r, 72, by1 as u64)
+    vk_mem.w32(r, 76, 1)
+    var fl: u64 = 0
+    if filter == gl.GL_LINEAR as u64 {
+        fl = 1
+    }
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_BLIT, cmd, (*tex_at((*rf).tex)).img.img, LAYOUT_GENERAL, (*tex_at((*df).tex)).img.img,
+        LAYOUT_GENERAL, 1, r, fl, 0, 0)
+    cmd_close()
+}
+
+fn f_read_pixels(x: i64, y: i64, w: i64, h: i64, dst: u64) {
+    let s: *mut VG = gs()
+    if !(*s).ok || dst == 0 || (*s).rfb == 0 || (*s).rfb >= FB_MAX as u64 || w <= 0 || h <= 0 {
+        return
+    }
+    let f: *mut VFb = fb_at((*s).rfb)
+    if !(*f).ok || x < 0 || y < 0 || x + w > (*f).w as i64 || y + h > (*f).h as i64 {
+        return
+    }
+    let n: usize = (w as usize) * (h as usize) * 4
+    if !stg_need(n) {
+        return
+    }
+    let cmd: u64 = cmd_open()
+    if cmd == 0 {
+        return
+    }
+    (*s).top = 0
+    let rg: u64 = sa(56)
+    vk_mem.w32(rg, 16, 1)
+    vk_mem.w32(rg, 28, 1)
+    vk_mem.w32(rg, 32, x as u64)
+    vk_mem.w32(rg, 36, y as u64)
+    vk_mem.w32(rg, 44, w as u64)
+    vk_mem.w32(rg, 48, h as u64)
+    vk_mem.w32(rg, 52, 1)
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_COPY_I2B, cmd, (*tex_at((*f).tex)).img.img, LAYOUT_GENERAL, (*s).stg.buf, 1, rg, 0, 0, 0, 0)
+    vk_frame.mem_barrier(&(*s).x, cmd, vk_frame.ST_TRANSFER, vk_frame.ST_HOST, vk_frame.AC_TRANSFER_WRITE, vk_frame.AC_HOST_READ)
+    if cmd_close() {
+        rt.mem_copy(dst, (*s).stg.ptr, n)
+        (*s).readbacks = (*s).readbacks + 1
+    }
+}
+
+fn f_delete_obj(kind: u64, id: u64) {
+    let s: *mut VG = gs()
+    if id == 0 {
+        return
+    }
+    if kind == gl.GLK_TEXTURE as u64 && id < TEX_MAX as u64 {
+        let t: *mut VTex = tex_at(id)
+        tex_release(t)
+        (*t).used = false
+    } else if kind == gl.GLK_FRAMEBUFFER as u64 && id < FB_MAX as u64 {
+        let f: *mut VFb = fb_at(id)
+        fb_release(f)
+        (*f).used = false
+    } else if kind == gl.GLK_BUFFER as u64 && id < BUF_MAX as u64 {
+        let b: *mut VBuf = buf_at(id)
+        if (*b).ok {
+            vk_mem.buf_free(&(*s).x, &(*b).b)
+        }
+        (*b).ok = false
+        (*b).used = false
+    }
+}
+
+// ---------------------------------------------------------------- opening
+
+fn load_extra(s: *mut VG) -> bool {
+    (*s).x.top = 0
+    var a: [u64; 2] = [0; 2]
+    a[0] = (*s).v.inst
+    a[1] = vk_mem.xcstr(&(*s).x, "vkCmdClearAttachments")
+    (*s).fn_clear_att = dynlib.callx((*s).v.gipa, "ii", (&a[0]) as u64, false)
+    a[1] = vk_mem.xcstr(&(*s).x, "vkCmdClearColorImage")
+    (*s).fn_clear_img = dynlib.callx((*s).v.gipa, "ii", (&a[0]) as u64, false)
+    return (*s).fn_clear_att != 0 && (*s).fn_clear_img != 0
+}
+
+fn make_rpass(s: *mut VG) -> u64 {
+    (*s).top = 0
+    let att: u64 = sa(36)
+    vk_mem.w32(att, 4, FMT_RGBA8_UNORM as u64)
+    vk_mem.w32(att, 8, 1) // samples
+    vk_mem.w32(att, 12, 0) // load LOAD
+    vk_mem.w32(att, 16, 0) // store STORE
+    vk_mem.w32(att, 20, 2) // stencil load DONT_CARE
+    vk_mem.w32(att, 24, 1) // stencil store DONT_CARE
+    vk_mem.w32(att, 28, LAYOUT_GENERAL)
+    vk_mem.w32(att, 32, LAYOUT_GENERAL)
+    let refs: u64 = sa(8)
+    vk_mem.w32(refs, 0, 0)
+    vk_mem.w32(refs, 4, LAYOUT_GENERAL)
+    let sp: u64 = sa(72)
+    vk_mem.w32(sp, 24, 1)
+    vk_mem.w64(sp, 32, refs)
+    let dep: u64 = sa(56)
+    vk_mem.w32(dep, 0, 0xFFFFFFFF)
+    vk_mem.w32(dep, 4, 0)
+    vk_mem.w32(dep, 8, ALL_CMDS)
+    vk_mem.w32(dep, 12, ALL_CMDS)
+    vk_mem.w32(dep, 16, MEM_W)
+    vk_mem.w32(dep, 20, MEM_RW)
+    vk_mem.w32(dep, 28, 0)
+    vk_mem.w32(dep, 32, 0xFFFFFFFF)
+    vk_mem.w32(dep, 36, ALL_CMDS)
+    vk_mem.w32(dep, 40, ALL_CMDS)
+    vk_mem.w32(dep, 44, MEM_W)
+    vk_mem.w32(dep, 48, MEM_RW)
+    let ri: u64 = sa(64)
+    vk_mem.w32(ri, 0, 38) // RENDER_PASS_CREATE_INFO
+    vk_mem.w32(ri, 20, 1)
+    vk_mem.w64(ri, 24, att)
+    vk_mem.w32(ri, 32, 1)
+    vk_mem.w64(ri, 40, sp)
+    vk_mem.w32(ri, 48, 2)
+    vk_mem.w64(ri, 56, dep)
+    let out: u64 = sa(8)
+    if !vk_mem.good(vk_mem.cx(&(*s).x, vk_mem.X_CREATE_RP, (*s).x.dev, ri, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return 0
+    }
+    return vk_mem.r64(out, 0)
+}
+
+// set layout (0 = UBO, 1..3 = combined image samplers), pool, ONE set, pipeline layout
+fn make_layouts(s: *mut VG) -> bool {
+    (*s).top = 0
+    let bd: u64 = sa(24 * 4)
+    var k: usize = 0
+    while k < 4 {
+        vk_mem.w32(bd, k * 24, k as u64)
+        if k == 0 {
+            vk_mem.w32(bd, k * 24 + 4, 6) // UNIFORM_BUFFER
+        } else {
+            vk_mem.w32(bd, k * 24 + 4, 1) // COMBINED_IMAGE_SAMPLER
+        }
+        vk_mem.w32(bd, k * 24 + 8, 1)
+        vk_mem.w32(bd, k * 24 + 12, 0x11) // VERTEX | FRAGMENT
+        k = k + 1
+    }
+    let li: u64 = sa(32)
+    vk_mem.w32(li, 0, 32) // DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+    vk_mem.w32(li, 20, 4)
+    vk_mem.w64(li, 24, bd)
+    var out: u64 = sa(8)
+    if !vk_mem.good(vk_mem.cx(&(*s).x, vk_mem.X_CREATE_DSL, (*s).x.dev, li, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return false
+    }
+    (*s).dsl = vk_mem.r64(out, 0)
+    let ps: u64 = sa(16)
+    vk_mem.w32(ps, 0, 6) // UNIFORM_BUFFER
+    vk_mem.w32(ps, 4, 1)
+    vk_mem.w32(ps, 8, 1) // COMBINED_IMAGE_SAMPLER
+    vk_mem.w32(ps, 12, 3)
+    let pi: u64 = sa(40)
+    vk_mem.w32(pi, 0, 33) // DESCRIPTOR_POOL_CREATE_INFO
+    vk_mem.w32(pi, 20, 1)
+    vk_mem.w32(pi, 24, 2)
+    vk_mem.w64(pi, 32, ps)
+    out = sa(8)
+    if !vk_mem.good(vk_mem.cx(&(*s).x, vk_mem.X_CREATE_DPOOL, (*s).x.dev, pi, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return false
+    }
+    (*s).dpool = vk_mem.r64(out, 0)
+    let lays: u64 = sa(8)
+    vk_mem.w64(lays, 0, (*s).dsl)
+    let ai: u64 = sa(40)
+    vk_mem.w32(ai, 0, 34) // DESCRIPTOR_SET_ALLOCATE_INFO
+    vk_mem.w64(ai, 16, (*s).dpool)
+    vk_mem.w32(ai, 24, 1)
+    vk_mem.w64(ai, 32, lays)
+    out = sa(8)
+    if !vk_mem.good(vk_mem.cx(&(*s).x, vk_mem.X_ALLOC_DSETS, (*s).x.dev, ai, out, 0, 0, 0, 0, 0, 0, 0)) {
+        return false
+    }
+    (*s).dset = vk_mem.r64(out, 0)
+    let sl: u64 = sa(8)
+    vk_mem.w64(sl, 0, (*s).dsl)
+    let pl: u64 = sa(48)
+    vk_mem.w32(pl, 0, 30) // PIPELINE_LAYOUT_CREATE_INFO
+    vk_mem.w32(pl, 20, 1)
+    vk_mem.w64(pl, 24, sl)
+    out = sa(8)
+    if !vk_mem.good(vk_mem.cx(&(*s).x, vk_mem.X_CREATE_PLAYOUT, (*s).x.dev, pl, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return false
+    }
+    (*s).playout = vk_mem.r64(out, 0)
+    return true
+}
+
+fn make_sampler(s: *mut VG, linear: bool) -> u64 {
+    (*s).top = 0
+    let si: u64 = sa(80)
+    var f: u64 = 0
+    if linear {
+        f = 1
+    }
+    vk_mem.w32(si, 0, 31) // SAMPLER_CREATE_INFO
+    vk_mem.w32(si, 20, f)
+    vk_mem.w32(si, 24, f)
+    vk_mem.w32(si, 28, 0)
+    vk_mem.w32(si, 32, 2) // CLAMP_TO_EDGE
+    vk_mem.w32(si, 36, 2)
+    vk_mem.w32(si, 40, 2)
+    vk_mem.wf(si, 68, 0.25)
+    let out: u64 = sa(8)
+    if !vk_mem.good(vk_mem.cx(&(*s).x, vk_mem.X_CREATE_SAMPLER, (*s).x.dev, si, 0, out, 0, 0, 0, 0, 0, 0)) {
+        return 0
+    }
+    return vk_mem.r64(out, 0)
+}
+
+fn open_all(s: *mut VG) -> bool {
+    if !vk.open(&(*s).v, false, true) {
+        (*s).step = 1
+        return false
+    }
+    if !vk_mem.x_open(&(*s).x, &(*s).v) {
+        (*s).step = 2
+        return false
+    }
+    (*s).fr = vk_frame.frames_new(&(*s).x, 1)
+    if !(*s).fr.ok || !load_extra(s) {
+        (*s).step = 3
+        return false
+    }
+    (*s).scr = rt.heap_alloc(SCR_BYTES)
+    (*s).uni = rt.heap_alloc(UBO_BYTES * 2)
+    (*s).texs = rt.heap_alloc(TEX_MAX * size_of[VTex]())
+    (*s).bufs = rt.heap_alloc(BUF_MAX * size_of[VBuf]())
+    (*s).fbs = rt.heap_alloc(FB_MAX * size_of[VFb]())
+    if (*s).scr == 0 || (*s).uni == 0 || (*s).texs == 0 || (*s).bufs == 0 || (*s).fbs == 0 {
+        (*s).step = 4
+        return false
+    }
+    rt.mem_set((*s).uni, 0 as u8, UBO_BYTES * 2)
+    var i: u64 = 0
+    while i < TEX_MAX as u64 {
+        *tex_at(i) = vtex_new()
+        i = i + 1
+    }
+    i = 0
+    while i < BUF_MAX as u64 {
+        *buf_at(i) = vbuf_new()
+        i = i + 1
+    }
+    i = 0
+    while i < FB_MAX as u64 {
+        *fb_at(i) = vfb_new()
+        i = i + 1
+    }
+    (*s).rp = make_rpass(s)
+    if (*s).rp == 0 || !make_layouts(s) {
+        (*s).step = 5
+        return false
+    }
+    (*s).samp0 = make_sampler(s, false)
+    (*s).samp1 = make_sampler(s, true)
+    (*s).ubo = vk_mem.buf_make(&(*s).x, UBO_BYTES as u64, vk_mem.U_UNIFORM, vk_mem.MEM_STAGING)
+    if (*s).samp0 == 0 || (*s).samp1 == 0 || !(*s).ubo.ok {
+        (*s).step = 6
+        return false
+    }
+    // texture 1 = a 1x1 transparent dummy for every unit nothing is bound to
+    (*s).dummy = f_create_texture()
+    if (*s).dummy == 0 || !tex_make(tex_at((*s).dummy), 1, 1, FMT_RGBA8_UNORM, 4) {
+        (*s).step = 7
+        return false
+    }
+    (*s).ok = true
+    return true
+}
+
+// Fills `t` with the Vulkan calls and sets t.ok. False: no Vulkan (or FUI_GPU_FAIL=open) -- the table stays empty.
+fn vkgl_api(t: *mut gl.GlApi) -> bool {
+    *t = gl.gl_api_new()
+    let fail: str = env.get("FUI_GPU_FAIL")
+    if fail == "open" {
+        return false
+    }
+    if G_P == 0 {
+        G_P = rt.heap_alloc(size_of[VG]())
+        if G_P == 0 {
+            return false
+        }
+        *gs() = vg_new()
+        if !open_all(gs()) {
+            return false
+        }
+    }
+    (*gs()).fail_compile = fail == "compile"
+    (*t).program = f_program
+    (*t).use_program = f_use_program
+    (*t).uniform_location = f_uniform_location
+    (*t).uniform1i = f_uniform1i
+    (*t).uniform1f = f_uniform1f
+    (*t).uniform2f = f_uniform2f
+    (*t).uniform4f = f_uniform4f
+    (*t).create_buffer = f_create_buffer
+    (*t).bind_buffer = f_bind_buffer
+    (*t).buffer_data = f_buffer_data
+    (*t).buffer_sub_data = f_buffer_sub_data
+    (*t).create_vertex_array = f_create_vertex_array
+    (*t).bind_vertex_array = f_bind_vertex_array
+    (*t).enable_vertex_attrib_array = f_enable_vertex_attrib_array
+    (*t).vertex_attrib_pointer = f_vertex_attrib_pointer
+    (*t).vertex_attrib_divisor = f_vertex_attrib_divisor
+    (*t).create_texture = f_create_texture
+    (*t).bind_texture = f_bind_texture
+    (*t).active_texture = f_active_texture
+    (*t).tex_image_2d = f_tex_image_2d
+    (*t).tex_sub_image_2d = f_tex_sub_image_2d
+    (*t).tex_parameteri = f_tex_parameteri
+    (*t).create_framebuffer = f_create_framebuffer
+    (*t).bind_framebuffer = f_bind_framebuffer
+    (*t).framebuffer_texture_2d = f_framebuffer_texture_2d
+    (*t).check_framebuffer_status = f_check_framebuffer_status
+    (*t).blit_framebuffer = f_blit_framebuffer
+    (*t).copy_tex_sub_image_2d = f_copy_tex_sub_image_2d
+    (*t).viewport = f_viewport
+    (*t).scissor = f_scissor
+    (*t).enable = f_enable
+    (*t).disable = f_disable
+    (*t).blend_func_separate = f_blend_func_separate
+    (*t).clear_color = f_clear_color
+    (*t).clear = f_clear
+    (*t).draw_arrays = f_draw_arrays
+    (*t).draw_arrays_instanced = f_draw_arrays_instanced
+    (*t).read_pixels = f_read_pixels
+    (*t).delete_obj = f_delete_obj
+    (*t).get_error = f_get_error
+    (*t).finish = f_finish
+    (*t).ok = true
+    return true
+}
+
+// Waits for the device and frees what the table made (the process may also just exit).
+fn vkgl_close() {
+    let s: *mut VG = gs()
+    if G_P == 0 {
+        return
+    }
+    if (*s).x.ok {
+        vk_mem.x_idle(&(*s).x)
+    }
+    (*s).ok = false
+}
+
+fn vkgl_step() -> i32 {
+    if G_P == 0 {
+        return 0
+    }
+    return (*gs()).step
+}
+
+fn vkgl_is_cpu() -> bool {
+    if G_P == 0 || !(*gs()).ok {
+        return false
+    }
+    return vk.is_cpu(&(*gs()).v)
+}
+
+fn vkgl_device() -> u64 {
+    if G_P == 0 || !(*gs()).ok {
+        return 0
+    }
+    return vk.device_name(&(*gs()).v)
+}
+
+// out[0..4] = draws, submits, uploads, read-backs
+fn vkgl_stats(out: *mut u64) {
+    let s: *mut VG = gs()
+    *out = (*s).draws
+    *((out as u64 + 8) as *mut u64) = (*s).submits
+    *((out as u64 + 16) as *mut u64) = (*s).uploads
+    *((out as u64 + 24) as *mut u64) = (*s).readbacks
+}
