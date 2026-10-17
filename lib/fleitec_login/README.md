@@ -13,7 +13,7 @@ Module files carry the prefix `fl_` because Firn module names are global (`jwt` 
 | `fl_jwt` | `verify(token, cfg, now) -> Claims` (EdDSA, kid, iss/aud mandatory, ID section 4 rules); `verify_legacy_hs256` separate |
 | `fl_oidc` | Code+PKCE: `discover`, `begin`, `finish`, `token_refresh`, `revoke`, `logout_url`; id_token EdDSA or (JOSE mode, foreign IdP) RS256/ES256 via `auth.jose` |
 | `fl_device` | RFC 8628 `start`/`poll` (interval, slow_down +5 s, expired, denied) |
-| `fl_link` | `link_begin` (prompt=login, max_age=0), `link_finish` (fresh `auth_time`, expected account), `unlink` (proposed broker contract) |
+| `fl_link` | `link_begin` (prompt=login, max_age=0), `link_finish` (fresh `auth_time`, expected account), `unlink` (broker contract as built: 200 + new `access_token`, 409 last_identity, 401/403 sign in again, 404 not_linked); `LinkResult.id_token` = the RAW id_token for the broker (`POST /link/finish` verifies it itself) |
 | `fl_session` | access+refresh, `ensure_fresh` before expiry, refresh rotation, wipe on `invalid_grant`, JSON (de)serialising |
 | `fl_provider` | provider interface jarvis / xoffi (PLANNED) / password |
 
