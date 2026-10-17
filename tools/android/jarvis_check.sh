@@ -84,6 +84,7 @@ $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null
 for _ in $(seq 40); do [ -n "$($ADB shell pidof $PKG)" ] && break; sleep 1; done
 check "process runs" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
 check "login screen shows" "$(OCR_TRIES=40 wait_ocr 1_login 'Sign in')" 1
+check "process runs" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
 
 # ---- login: the soft keyboard shifts the layout, so each field is left with Back before the next tap
 tap 540 1149 1; check "Gboard shows for the user field" "$(wait_kbd)" 1
@@ -100,14 +101,20 @@ tap $SEND_X $FIELD_Y 1
 check "message 'hello' reached the server" "$(wait_sent hello)" 1
 check "streamed reply visible" "$(wait_ocr 3_reply 'Hallo hello')" 1
 
-# ---- tabs: five different screens, no crash
+# ---- tabs: five different screens, no crash. The tab bar sits right under the content of the placeholder pages (not pinned to
+# the bottom as on the chat page): back to Chat from there is a tap at y=1416. Prefs last, then a restart (the session is saved).
 HASH_CHAT=$(md5sum <"$OUT/3_reply.png" | cut -c1-8)
-n=0; for x in 351 552 736 914 160; do
+n=0; for x in 351 552 736; do
     tap $x $TAB_Y 3; n=$((n+1)); shot tab$n
     h=$(md5sum <"$OUT/tab$n.png" | cut -c1-8)
-    [ $x = 160 ] && check "tab Chat again shows the chat" "$(wait_ocr tab$n 'Hallo hello')" 1 \
-        || check "tab at x=$x differs from the chat" "$([ "$h" != "$HASH_CHAT" ] && echo yes)" yes
+    check "tab at x=$x differs from the chat" "$([ "$h" != "$HASH_CHAT" ] && echo yes)" yes
+    tap 160 1416 3
+    check "tab Chat shows the chat again" "$(wait_ocr tabchat$n 'New chat')" 1
 done
+tap 914 $TAB_Y 3; shot tab4
+check "tab Prefs differs from the chat" "$([ "$(md5sum <"$OUT/tab4.png" | cut -c1-8)" != "$HASH_CHAT" ] && echo yes)" yes
+$ADB shell am force-stop $PKG; $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null
+check "restart signs in by itself (saved session)" "$(OCR_TRIES=30 wait_ocr 7_restart 'New chat')" 1
 
 # ---- keyboard: typing, cursor, selection, copy/paste. Proof = the exact text the server receives.
 tap $FIELD_X $FIELD_Y 1; wait_kbd >/dev/null; $ADB shell input text abd
