@@ -1,0 +1,472 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/html/soup.fi -- html.soup: scraping HTML with a CSS selector, in a few lines.
+//
+// What Python does with BeautifulSoup: `soup = BeautifulSoup(html, "html.parser")`,
+// `soup.select("div.item > a[href]")`, `a.get_text()`, `a["href"]`. This module is
+// the thin layer over the DOM of the browser engine: the SAME HTML5 tokenizer and
+// tree builder (lib/browser/driver.fi, so broken markup is repaired exactly as a
+// browser does it), the SAME selector engine (lib/css/sel.fi) and the DOM access
+// of lib/dom/api.fi. Nothing is parsed or matched here -- this file only turns
+// `str` into what those layers want and their answers back into `str`.
+//
+//     import html.soup
+//
+//     var d: soup.Doc = soup.doc_new()
+//     defer soup.doc_free(&d)
+//     if !soup.parse(&d, page) { return 1 }
+//     let hits: soup.Hits = soup.select(&d, "div.item > a[href]")
+//     var i: usize = 0
+//     while i < soup.count(hits) {
+//         let a: soup.El = soup.at(hits, i)
+//         io.print(soup.text_trim(&d, a), soup.attr(&d, a, "href"))
+//         i = i + 1
+//     }
+//     let one: soup.El = soup.select_one(&d, "h1")      // soup.is_none(one) = no match
+//
+// API:  doc_new, doc_free, parse(&d, html) -> bool,
+//       select / select_one (whole document), select_in / select_one_in (below an element),
+//       count(hits), at(hits, i), is_none(el), selector_ok(&d),
+//       text(&d, el) (textContent), text_trim (ASCII white space cut off both ends),
+//       attr(&d, el, "href") ("" when absent), has_attr, name(&d, el) (tag name, lower case),
+//       parent(el), children(&d, el) (child ELEMENTS), inner_html, outer_html.
+//
+// LIFETIME. Every `str` that comes back is valid until `doc_free` (or until the next
+// `parse` on the same Doc, which also invalidates all El and Hits of the old page).
+// The strings are copied into an arena owned by the Doc; nothing needs freeing by hand.
+//
+// HONEST:
+//  S1 It is the HTML5 parser, not Python's `html.parser`: `<p>a<p>b` is two paragraphs,
+//     `<table>` gets its `<tbody>`, and `<html><head><body>` are always there. bs4 with
+//     "html5lib" does the same; with "html.parser" it does not.
+//  S2 An invalid selector gives an EMPTY result and `selector_ok(&d)` is false (soupsieve
+//     raises). The selector grammar is the one of lib/css/sel.fi (CSS Selectors 4 as far
+//     as it goes there: combinators, attribute operators, :not, :nth-child ...).
+//  S3 The text of `<script>` and `<style>` is part of `text` (textContent), like in the
+//     DOM; bs4's get_text() does the same.
+//  S4 Lone surrogates in the text become U+FFFD, so every returned `str` is valid UTF-8.
+//  S5 No modification of the tree, no namespaces for attributes (`xlink:href` is read as
+//     "href" only if the page is parsed as foreign content; use `attr(el, "href")`).
+//  S6 One page per Doc at a time; the arena is not shrunk until `doc_free`.
+import std.rt
+import html.mem
+import browser.node
+import browser.names
+import browser.driver
+import css.tok
+import css.cv
+import css.sel
+import dom.api
+
+export {
+    Doc, El, Hits,
+    doc_new, doc_free, parse, selector_ok,
+    select, select_one, select_in, select_one_in,
+    count, at, is_none,
+    text, text_trim, attr, has_attr, name, parent, children,
+    inner_html, outer_html,
+}
+
+const CHUNK: usize = 65536
+const BIG: usize = 16384
+
+struct Doc {
+    run: driver.Run,
+    cx: sel.Ctx,
+    tk: tok.Tokens,
+    root: Gc[Node],
+    inited: bool,
+    built: bool,
+    sel_ok: bool,
+    chunks: rt.Buf,
+    cur: u64,
+    cur_cap: usize,
+    cur_used: usize,
+    tmp: rt.Buf,
+}
+
+// An element handle (null = none). Valid until the next `parse` of the Doc.
+struct El {
+    e: Gc[Elem],
+}
+
+// The result of a selector: `count(h)` elements, `at(h, i)` in document order.
+struct Hits {
+    v: Gc[GcVec],
+    n: usize,
+}
+
+fn doc_new() -> Doc {
+    return Doc {
+        run: driver.run_new(),
+        cx: sel.ctx_new(0 as *mut names.Names),
+        tk: tok.tokens_new(),
+        root: gc_null[Node](),
+        inited: false,
+        built: false,
+        sel_ok: true,
+        chunks: rt.buf_new(),
+        cur: 0,
+        cur_cap: 0,
+        cur_used: 0,
+        tmp: rt.buf_new(),
+    }
+}
+
+fn doc_free(d: *mut Doc) {
+    var i: usize = 0
+    let n: usize = rt.buf_len(&(*d).chunks) / 16
+    let base: u64 = rt.buf_ptr(&(*d).chunks)
+    while i < n {
+        rt.heap_free(rt.ld64(base, i * 2), rt.ld64(base, i * 2 + 1) as usize)
+        i = i + 1
+    }
+    rt.buf_free(&(*d).chunks)
+    rt.buf_free(&(*d).tmp)
+    if (*d).inited {
+        driver.run_free(&(*d).run)
+        sel.ctx_free(&(*d).cx)
+        tok.tokens_free(&(*d).tk)
+    }
+    (*d).inited = false
+    (*d).built = false
+    (*d).root = gc_null[Node]()
+    (*d).cur = 0
+    (*d).cur_cap = 0
+    (*d).cur_used = 0
+}
+
+// Parses `page` (UTF-8; broken markup is repaired like a browser does). false = out of
+// memory or an internal parser failure. May be called again: the old page is dropped.
+fn parse(d: *mut Doc, page: str) -> bool {
+    if !gc_init() {
+        return false
+    }
+    if !(*d).inited {
+        if !driver.run_init(&(*d).run) {
+            return false
+        }
+        (*d).cx = sel.ctx_new(driver.run_names(&(*d).run))
+        sel.ctx_init(&(*d).cx)
+        tok.tokens_init(&(*d).tk)
+        (*d).inited = true
+    } else if (*d).built {
+        driver.run_tree_release(&(*d).run)
+        (*d).built = false
+    }
+    (*d).root = gc_null[Node]()
+    driver.run_text_out_bytes(&(*d).run, page.p, page.n)
+    driver.run_context_out_bytes(&(*d).run, 0 as *mut u8, 0)
+    let rc: u32 = driver.run_document_build(&(*d).run)
+    (*d).root = driver.run_document(&(*d).run)
+    (*d).built = true
+    return rc == 0 as u32
+}
+
+// false when the last selector given to select* could not be parsed.
+fn selector_ok(d: *mut Doc) -> bool {
+    return (*d).sel_ok
+}
+
+// ------------------------------------------------------------------ arena
+
+fn chunk_note(d: *mut Doc, p: u64, n: usize) {
+    var i: usize = 0
+    while i < 8 {
+        rt.buf_push(&(*d).chunks, ((p >> (i as u64 * 8)) & 255) as u8)
+        i = i + 1
+    }
+    i = 0
+    while i < 8 {
+        rt.buf_push(&(*d).chunks, ((n as u64 >> (i as u64 * 8)) & 255) as u8)
+        i = i + 1
+    }
+}
+
+// A copy of n bytes at p that lives until doc_free. "" on out of memory.
+fn arena_str(d: *mut Doc, p: u64, n: usize) -> str {
+    if n == 0 {
+        return ""
+    }
+    var dst: u64 = 0
+    if n > BIG {
+        dst = rt.heap_alloc(n)
+        if dst == 0 {
+            return ""
+        }
+        chunk_note(d, dst, n)
+    } else {
+        if (*d).cur == 0 || (*d).cur_used + n > (*d).cur_cap {
+            let c: u64 = rt.heap_alloc(CHUNK)
+            if c == 0 {
+                return ""
+            }
+            chunk_note(d, c, CHUNK)
+            (*d).cur = c
+            (*d).cur_cap = CHUNK
+            (*d).cur_used = 0
+        }
+        dst = (*d).cur + (*d).cur_used as u64
+        (*d).cur_used = (*d).cur_used + n
+    }
+    rt.mem_copy(dst, p, n)
+    return str { p: dst as *mut u8, n: n }
+}
+
+fn tmp_str(d: *mut Doc) -> str {
+    return arena_str(d, rt.buf_ptr(&(*d).tmp), rt.buf_len(&(*d).tmp))
+}
+
+// -------------------------------------------------------------- selectors
+
+fn parse_selector(d: *mut Doc, css: str) -> Gc[Sel] {
+    if !(*d).inited {
+        return gc_null[Sel]()
+    }
+    driver.run_text_out_bytes(&(*d).run, css.p, css.n)
+    tok.tokenize(&(*d).tk, driver.run_text(&(*d).run))
+    var p: cv.Parser = cv.parser_new(&(*d).tk)
+    let values = cv.parse_component_value_list(&p) catch gc_null[Cv]()
+    var scratch: mem.CpBuf = mem.cp_new()
+    mem.cp_init(&scratch)
+    let s: Gc[Sel] = sel.sel_parse(values, driver.run_names(&(*d).run), &scratch)
+    catch gc_null[Sel]()
+    mem.cp_free(&scratch)
+    return s
+}
+
+fn select_from(d: *mut Doc, root: Gc[Node], css: str) -> Hits {
+    var h: Hits = Hits { v: gc_null[GcVec](), n: 0 }
+    let s: Gc[Sel] = parse_selector(d, css)
+    if s == gc_null[Sel]() {
+        (*d).sel_ok = false
+        return h
+    }
+    (*d).sel_ok = true
+    let v = api.dom_query_all(root, s, &(*d).cx) catch gc_null[GcVec]()
+    if v == gc_null[GcVec]() {
+        return h
+    }
+    h.v = v
+    h.n = gcvec_length(v) as usize
+    return h
+}
+
+// All elements of the page that match, in document order.
+fn select(d: *mut Doc, css: str) -> Hits {
+    return select_from(d, (*d).root, css)
+}
+
+// All elements BELOW `el` that match (the selector is matched against the whole page,
+// like soupsieve: `el.select("div a")` may use ancestors above `el`).
+fn select_in(d: *mut Doc, el: El, css: str) -> Hits {
+    if el.e == gc_null[Elem]() {
+        return Hits { v: gc_null[GcVec](), n: 0 }
+    }
+    return select_from(d, el.e, css)
+}
+
+fn select_one(d: *mut Doc, css: str) -> El {
+    let h: Hits = select(d, css)
+    return at(h, 0)
+}
+
+fn select_one_in(d: *mut Doc, el: El, css: str) -> El {
+    let h: Hits = select_in(d, el, css)
+    return at(h, 0)
+}
+
+fn count(h: Hits) -> usize {
+    return h.n
+}
+
+// The i-th hit; a none-element when i is out of range.
+fn at(h: Hits, i: usize) -> El {
+    if i >= h.n {
+        return El { e: gc_null[Elem]() }
+    }
+    return El { e: gcvec_read[Elem](h.v, i as u64) }
+}
+
+fn is_none(el: El) -> bool {
+    return el.e == gc_null[Elem]()
+}
+
+// ------------------------------------------------------------------- text
+
+fn put_utf8(out: *mut rt.Buf, c0: u32) {
+    var c: u32 = c0
+    if (c >= 0xD800 as u32 && c <= 0xDFFF as u32) || c > 0x10FFFF as u32 {
+        c = 0xFFFD as u32
+    }
+    if c < 0x80 as u32 {
+        rt.buf_push(out, c as u8)
+    } else if c < 0x800 as u32 {
+        rt.buf_push(out, (0xC0 as u32 | (c >> 6)) as u8)
+        rt.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    } else if c < 0x10000 as u32 {
+        rt.buf_push(out, (0xE0 as u32 | (c >> 12)) as u8)
+        rt.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+        rt.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    } else {
+        rt.buf_push(out, (0xF0 as u32 | (c >> 18)) as u8)
+        rt.buf_push(out, (0x80 as u32 | ((c >> 12) & 0x3F as u32)) as u8)
+        rt.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+        rt.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    }
+}
+
+fn chain_to_tmp(d: *mut Doc, k: Gc[Chain]) {
+    if k == gc_null[Chain]() {
+        return
+    }
+    var s: Gc[Strand] = k.first
+    while s != gc_null[Strand]() {
+        var i: usize = 0
+        let n: usize = s.len as usize
+        while i < n {
+            put_utf8(&(*d).tmp, s.chars[i])
+            i = i + 1
+        }
+        s = s.next
+    }
+}
+
+// textContent of the element: all text below it, in document order.
+fn text(d: *mut Doc, el: El) -> str {
+    if el.e == gc_null[Elem]() {
+        return ""
+    }
+    rt.buf_clear(&(*d).tmp)
+    let c = api.dom_text_content(el.e) catch gc_null[Chain]()
+    chain_to_tmp(d, c)
+    return tmp_str(d)
+}
+
+fn is_ws(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 10 as u8 || c == 12 as u8 || c == 13 as u8
+}
+
+// `text`, with ASCII white space cut off both ends (Python: `el.get_text().strip()`).
+fn text_trim(d: *mut Doc, el: El) -> str {
+    let t: str = text(d, el)
+    var a: usize = 0
+    var b: usize = t.n
+    while a < b && is_ws(*(t.p + a)) {
+        a = a + 1
+    }
+    while b > a && is_ws(*(t.p + b - 1)) {
+        b = b - 1
+    }
+    return str { p: t.p + a, n: b - a }
+}
+
+// ------------------------------------------------------------- attributes
+
+fn attr_atom(d: *mut Doc, key: str) -> u32 {
+    rt.buf_clear(&(*d).tmp)
+    var i: usize = 0
+    while i < key.n {
+        var c: u8 = *(key.p + i)
+        if c >= 65 as u8 && c <= 90 as u8 {
+            c = c + 32 as u8
+        }
+        rt.buf_push(&(*d).tmp, c)
+        i = i + 1
+    }
+    return names.names_find_bytes(driver.run_names(&(*d).run), rt.buf_data(&(*d).tmp), key.n)
+}
+
+fn attr_chain(d: *mut Doc, el: El, key: str) -> Gc[Chain] {
+    if el.e == gc_null[Elem]() || !(*d).inited {
+        return gc_null[Chain]()
+    }
+    let atom: u32 = attr_atom(d, key)
+    if atom == 0 as u32 {
+        return gc_null[Chain]()
+    }
+    return node.attr_value(el.e, atom, 0 as u32)
+}
+
+fn has_attr(d: *mut Doc, el: El, key: str) -> bool {
+    return attr_chain(d, el, key) != gc_null[Chain]()
+}
+
+// The attribute value ("" when there is none; `has_attr` tells the difference).
+fn attr(d: *mut Doc, el: El, key: str) -> str {
+    let c: Gc[Chain] = attr_chain(d, el, key)
+    rt.buf_clear(&(*d).tmp)
+    chain_to_tmp(d, c)
+    return tmp_str(d)
+}
+
+// The tag name, lower case ("a", "div").
+fn name(d: *mut Doc, el: El) -> str {
+    if el.e == gc_null[Elem]() || !(*d).inited {
+        return ""
+    }
+    let nm: *mut names.Names = driver.run_names(&(*d).run)
+    return arena_str(d, names.names_ptr(nm, el.e.name) as u64, names.names_length(nm, el.e.name))
+}
+
+// ---------------------------------------------------------------- walking
+
+fn parent(el: El) -> El {
+    if el.e == gc_null[Elem]() {
+        return El { e: gc_null[Elem]() }
+    }
+    let p: Gc[Node] = el.e.parent
+    if p == gc_null[Node]() || p.kind != node.K_ELEM {
+        return El { e: gc_null[Elem]() }
+    }
+    return El { e: node.node_as_elem(p) }
+}
+
+// The child ELEMENTS of `el` (text and comments are skipped), as Hits.
+fn children(d: *mut Doc, el: El) -> Hits {
+    var h: Hits = Hits { v: gc_null[GcVec](), n: 0 }
+    if el.e == gc_null[Elem]() {
+        return h
+    }
+    let v = gcvec_new() catch gc_null[GcVec]()
+    if v == gc_null[GcVec]() {
+        return h
+    }
+    var k: Gc[Node] = el.e.first_child
+    while k != gc_null[Node]() {
+        if k.kind == node.K_ELEM {
+            let ok: bool = gcvec_append[Elem](v, node.node_as_elem(k)) catch false
+        }
+        k = k.next
+    }
+    h.v = v
+    h.n = gcvec_length(v) as usize
+    return h
+}
+
+// -------------------------------------------------------------- markup out
+
+// The markup of the children (innerHTML).
+fn inner_html(d: *mut Doc, el: El) -> str {
+    if el.e == gc_null[Elem]() || !(*d).inited {
+        return ""
+    }
+    var b: mem.Buf = mem.buf_new()
+    mem.buf_init(&b)
+    api.dom_inner_html(el.e, driver.run_names(&(*d).run), &b)
+    let r: str = arena_str(d, mem.buf_ptr(&b) as u64, mem.buf_len(&b))
+    mem.buf_free(&b)
+    return r
+}
+
+// The markup of the element itself (outerHTML).
+fn outer_html(d: *mut Doc, el: El) -> str {
+    if el.e == gc_null[Elem]() || !(*d).inited {
+        return ""
+    }
+    var b: mem.Buf = mem.buf_new()
+    mem.buf_init(&b)
+    api.dom_outer_html(el.e, driver.run_names(&(*d).run), &b)
+    let r: str = arena_str(d, mem.buf_ptr(&b) as u64, mem.buf_len(&b))
+    mem.buf_free(&b)
+    return r
+}
