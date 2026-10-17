@@ -10,8 +10,9 @@
 // batching, the glyph atlas, the glass passes and the read-back of gpu.fi run UNCHANGED. Decisions (docs/fui-gpu-path.md):
 //   - ONE shader source: the SPIR-V in lib/fui/spv is built from the GLSL ES files of the GLES backend (spv/build.sh).
 //   - Every image stays in layout GENERAL (render pass initial = final = GENERAL, descriptors GENERAL): no layout tracking.
-//   - Every GL operation that touches the GPU (draw, clear, upload, blit, read) is ONE command buffer, submitted and waited
-//     for (vk_frame.imm_begin / imm_submit). Simple and correct; gpu.fi already batches (one instanced draw per batch).
+//   - ONE COMMAND BUFFER PER FRAME: every GL operation that touches the GPU (draw, clear, upload, blit, read) is APPENDED to the
+//     command buffer that is being recorded; `cmd_flush` submits it and waits ONCE -- at a read-back, at `finish`, before anything
+//     a recorded command still uses is destroyed, and when a per-draw resource runs out (see "command buffers" below).
 //   - GL row r of a texture / framebuffer = Vulkan image row r: the viewport needs no flip (NDC y = -1 is memory row 0 in both).
 //   - Program 1 = the big fragment shader, program 2 = the photo shader (told apart by the length of the fragment source).
 //     A uniform location is (program << 8 | slot); a program owns a 160 octet image of the std140 block `P` (see spv/build.sh).
@@ -40,6 +41,9 @@ const TEX_MAX: usize = 64
 const BUF_MAX: usize = 16
 const FB_MAX: usize = 48
 const UBO_BYTES: usize = 160
+const SET_MAX: usize = 1024 // descriptor sets / uniform slots = draws between two submits
+const UBO_STRIDE: usize = 256 // octets between two uniform slots (minUniformBufferOffsetAlignment is at most 256)
+const RING_K: usize = 8 // a GL_DYNAMIC_DRAW vertex buffer is a ring of RING_K times its size
 const SCR_BYTES: usize = 8192
 
 const FMT_R8_UNORM: u32 = 9
@@ -79,6 +83,11 @@ struct VBuf {
     ok: bool,
     b: vk_mem.Buf,
     size: usize,
+    cap: usize, // octets really allocated: size, or RING_K * size for GL_DYNAMIC_DRAW
+    ring: bool,
+    wr: usize, // ring: where the next buffer_sub_data window starts
+    base: usize, // the window the draws read: where the last buffer_sub_data wrote
+    end: usize, // end of that window (a flush never hands it out again)
 }
 
 struct VFb {
@@ -108,6 +117,11 @@ struct VG {
     ubo: vk_mem.Buf,
     stg: vk_mem.Buf,
     stg_n: usize,
+    stg_off: usize, // staging bump pointer (reset by cmd_flush)
+    rec: u64, // the command buffer being recorded (0 = none)
+    dsets: u64, // SET_MAX descriptor sets (array of handles)
+    set_n: usize, // sets / uniform slots used since the last flush
+    ops: u64,
     scr: u64,
     top: usize,
     texs: u64,
@@ -166,7 +180,7 @@ fn vtex_new() -> VTex {
 }
 
 fn vbuf_new() -> VBuf {
-    return VBuf { used: false, ok: false, b: vk_mem.buf_none(), size: 0 }
+    return VBuf { used: false, ok: false, b: vk_mem.buf_none(), size: 0, cap: 0, ring: false, wr: 0, base: 0, end: 0 }
 }
 
 fn vfb_new() -> VFb {
@@ -178,7 +192,8 @@ fn vg_new() -> VG {
         ok: false, step: 0, v: vk.vk_new(), x: vk_mem.x_new(),
         fr: vk_frame.Frames { ok: false, pool: 0, n: 0, w: 0, icmd: 0, ifence: 0, serial: 0, done: 0, tpending: false },
         fn_clear_att: 0, fn_clear_img: 0, rp: 0, dsl: 0, dpool: 0, dset: 0, playout: 0, samp0: 0, samp1: 0,
-        ubo: vk_mem.buf_none(), stg: vk_mem.buf_none(), stg_n: 0, scr: 0, top: 0, texs: 0, bufs: 0, fbs: 0,
+        ubo: vk_mem.buf_none(), stg: vk_mem.buf_none(), stg_n: 0, stg_off: 0, rec: 0, dsets: 0, set_n: 0, ops: 0,
+        scr: 0, top: 0, texs: 0, bufs: 0, fbs: 0,
         p0n: vk_desc.vpipe_none(), p0b: vk_desc.vpipe_none(), p1n: vk_desc.vpipe_none(), p1b: vk_desc.vpipe_none(),
         nprog: 0, uni: 0, samp_unit: [0; 8], cur_prog: 0, cur_tex: [0; 8], unit: 0, arr_buf: 0, attr_buf: [0; 9],
         rfb: 0, dfb: 0, vp_x: 0, vp_y: 0, vp_w: 0, vp_h: 0, sc_x: 0, sc_y: 0, sc_w: 0, sc_h: 0, sc_on: false,
@@ -238,21 +253,61 @@ fn imax(a: i64, b: i64) -> i64 {
 
 // ---------------------------------------------------------------- command buffers
 
-// A fresh immediate command buffer that starts with a global barrier (everything submitted before is done and visible).
+// ONE COMMAND BUFFER PER FRAME. The first GPU operation after a flush starts recording (`rec`), every later one appends to it, and
+// `cmd_flush` submits and waits once. What makes appending safe (an operation reads its inputs when the buffer RUNS, not when it is
+// recorded):
+//   - every draw owns a descriptor set and a uniform slot (set k reads UBO octets [k * UBO_STRIDE, + UBO_BYTES));
+//   - every upload / read-back owns a staging range (bump allocator, `bufferOffset` of the copy region);
+//   - a GL_DYNAMIC_DRAW buffer is a RING: every buffer_sub_data writes a window of its own and the draw binds the vertex buffer at it
+//     (gpu.fi always updates from octet 0 and draws exactly what it wrote; octets of a ring past the last update are not kept);
+//   - every operation starts with a global memory barrier, a render pass has external dependencies: operations run in order;
+//   - anything a recorded command may still use is destroyed only after `cmd_flush` (texture, framebuffer, buffer, staging regrow).
+// Calls that may flush (`stg_alloc`, the set check of a draw) come BEFORE `cmd_open` in an operation: the handle stays valid.
+
+// The command buffer being recorded (started when none is) with a global barrier first: everything recorded before is done and visible.
 fn cmd_open() -> u64 {
     let s: *mut VG = gs()
-    let cmd: u64 = vk_frame.imm_begin(&(*s).x, &(*s).fr)
-    if cmd != 0 {
-        vk_frame.mem_barrier(&(*s).x, cmd, ALL_CMDS, ALL_CMDS, MEM_W, MEM_RW)
-    } else {
-        (*s).lost = true
-        (*s).ok = false
+    if (*s).lost {
+        return 0
     }
-    return cmd
+    if (*s).rec == 0 {
+        let c: u64 = vk_frame.imm_begin(&(*s).x, &(*s).fr)
+        if c == 0 {
+            (*s).lost = true
+            (*s).ok = false
+            return 0
+        }
+        (*s).rec = c
+    }
+    vk_frame.mem_barrier(&(*s).x, (*s).rec, ALL_CMDS, ALL_CMDS, MEM_W, MEM_RW)
+    (*s).ops = (*s).ops + 1
+    return (*s).rec
 }
 
+// The operation is recorded; nothing is submitted here (see cmd_flush).
 fn cmd_close() -> bool {
+    return !(*gs()).lost
+}
+
+// Submits what is recorded and waits for it; afterwards the sets, uniform slots, staging and rings are free again (a ring keeps the
+// window the next draw may still read). False: the device did not answer -- the GPU is gone for this run (vkgl_alive() is false).
+fn cmd_flush() -> bool {
     let s: *mut VG = gs()
+    if (*s).rec == 0 {
+        return !(*s).lost
+    }
+    (*s).rec = 0
+    (*s).set_n = 0
+    (*s).stg_off = 0
+    var i: u64 = 0
+    while i < BUF_MAX as u64 {
+        let b: *mut VBuf = buf_at(i)
+        (*b).wr = (*b).end
+        i = i + 1
+    }
+    if (*s).lost {
+        return false
+    }
     (*s).submits = (*s).submits + 1
     if vk_frame.imm_submit(&(*s).x, &(*s).fr) {
         return true
@@ -283,21 +338,35 @@ fn cmd_clear_image(cmd: u64, image: u64) {
 
 // ---------------------------------------------------------------- staging
 
-fn stg_need(n: usize) -> bool {
+// `n` octets of the staging buffer for ONE recorded copy (bump allocator, reset by cmd_flush); returns the offset, or -1. Full: the
+// recorded commands run first. May flush -- call it BEFORE cmd_open.
+fn stg_alloc(n: usize) -> i64 {
     let s: *mut VG = gs()
-    if (*s).stg.ok && (*s).stg_n >= n {
-        return true
+    let a: usize = (n + 15) / 16 * 16
+    if (*s).stg.ok && (*s).stg_off + a <= (*s).stg_n {
+        let off: usize = (*s).stg_off
+        (*s).stg_off = off + a
+        return off as i64
     }
-    if (*s).stg.ok {
-        vk_mem.buf_free(&(*s).x, &(*s).stg)
+    if !cmd_flush() {
+        return 0 - 1
     }
-    var sz: usize = 1048576
-    while sz < n {
-        sz = sz * 2
+    if !(*s).stg.ok || (*s).stg_n < a {
+        if (*s).stg.ok {
+            vk_mem.buf_free(&(*s).x, &(*s).stg)
+        }
+        var sz: usize = 1048576
+        while sz < a {
+            sz = sz * 2
+        }
+        (*s).stg = vk_mem.buf_make(&(*s).x, sz as u64, vk_mem.U_SRC | vk_mem.U_DST, vk_mem.MEM_STAGING)
+        (*s).stg_n = sz
+        if !(*s).stg.ok {
+            return 0 - 1
+        }
     }
-    (*s).stg = vk_mem.buf_make(&(*s).x, sz as u64, vk_mem.U_SRC | vk_mem.U_DST, vk_mem.MEM_STAGING)
-    (*s).stg_n = sz
-    return (*s).stg.ok
+    (*s).stg_off = a
+    return 0
 }
 
 // ---------------------------------------------------------------- textures
@@ -305,6 +374,7 @@ fn stg_need(n: usize) -> bool {
 fn tex_release(t: *mut VTex) {
     let s: *mut VG = gs()
     if (*t).ok {
+        cmd_flush() // a recorded command may still use the image
         vk_mem.img_free(&(*s).x, &(*t).img)
     }
     (*t).ok = false
@@ -353,12 +423,13 @@ fn tex_upload(t: *mut VTex, x: i64, y: i64, w: i64, h: i64, p: u64, rl: i64) -> 
     if rl > 0 {
         srcrow = (rl as usize) * bpp
     }
-    if !stg_need(rowb * (h as usize)) {
+    let so: i64 = stg_alloc(rowb * (h as usize))
+    if so < 0 {
         return false
     }
     var r: i64 = 0
     while r < h {
-        rt.mem_copy((*s).stg.ptr + ((r as usize) * rowb) as u64, p + ((r as usize) * srcrow) as u64, rowb)
+        rt.mem_copy((*s).stg.ptr + (so as u64) + ((r as usize) * rowb) as u64, p + ((r as usize) * srcrow) as u64, rowb)
         r = r + 1
     }
     let cmd: u64 = cmd_open()
@@ -367,6 +438,7 @@ fn tex_upload(t: *mut VTex, x: i64, y: i64, w: i64, h: i64, p: u64, rl: i64) -> 
     }
     (*s).top = 0
     let rg: u64 = sa(56)
+    vk_mem.w64(rg, 0, so as u64) // bufferOffset
     vk_mem.w32(rg, 16, 1) // aspect colour
     vk_mem.w32(rg, 28, 1) // layer count
     vk_mem.w32(rg, 32, x as u64)
@@ -462,6 +534,7 @@ fn f_tex_parameteri(target: u64, pname: u64, v: i64) {
 fn fb_release(f: *mut VFb) {
     let s: *mut VG = gs()
     if (*f).fb != 0 {
+        cmd_flush() // a recorded render pass may still use it
         vk_mem.cx(&(*s).x, vk_mem.X_DESTROY_FB, (*s).x.dev, (*f).fb, 0, 0, 0, 0, 0, 0, 0, 0)
     }
     (*f).fb = 0
@@ -580,18 +653,29 @@ fn f_buffer_data(target: u64, p: u64, n: usize, usage: u64) {
         return
     }
     if (*b).ok {
+        cmd_flush() // a recorded draw may still read it
         vk_mem.buf_free(&(*s).x, &(*b).b)
         (*b).ok = false
     }
-    (*b).b = vk_mem.buf_make(&(*s).x, n as u64, vk_mem.U_VERTEX | vk_mem.U_DST, vk_mem.MEM_STAGING)
+    let dyn: bool = usage == (gl.GL_DYNAMIC_DRAW as u64)
+    var cap: usize = n
+    if dyn {
+        cap = n * RING_K
+    }
+    (*b).b = vk_mem.buf_make(&(*s).x, cap as u64, vk_mem.U_VERTEX | vk_mem.U_DST, vk_mem.MEM_STAGING)
     if !(*b).b.ok {
         return
     }
-    rt.mem_set((*b).b.ptr, 0 as u8, n)
+    rt.mem_set((*b).b.ptr, 0 as u8, cap)
     if p != 0 {
         rt.mem_copy((*b).b.ptr, p, n)
     }
     (*b).size = n
+    (*b).cap = cap
+    (*b).ring = dyn
+    (*b).wr = 0
+    (*b).base = 0
+    (*b).end = 0
     (*b).ok = true
 }
 
@@ -605,7 +689,24 @@ fn f_buffer_sub_data(target: u64, off: usize, p: u64, n: usize) {
     if !(*b).ok || off + n > (*b).size {
         return
     }
-    rt.mem_copy((*b).b.ptr + off as u64, p, n)
+    if !(*b).ring {
+        rt.mem_copy((*b).b.ptr + off as u64, p, n)
+        return
+    }
+    // a ring: this update gets a window of its own (the draws recorded so far still read the older ones)
+    let adv: usize = (off + n + 255) / 256 * 256
+    if (*b).wr + adv > (*b).cap {
+        cmd_flush() // nothing recorded reads the ring now, and the new window replaces the old one
+        (*b).wr = 0
+    }
+    let w0: usize = (*b).wr
+    if off > 0 && (*b).base != w0 && ((*b).base + off <= w0 || w0 + off <= (*b).base) {
+        rt.mem_copy((*b).b.ptr + w0 as u64, (*b).b.ptr + (*b).base as u64, off) // keep octets [0, off) of a partial update
+    }
+    rt.mem_copy((*b).b.ptr + (w0 + off) as u64, p, n)
+    (*b).base = w0
+    (*b).end = w0 + adv
+    (*b).wr = w0 + adv
 }
 
 fn f_create_vertex_array() -> u64 {
@@ -780,6 +881,7 @@ fn f_get_error() -> u64 {
 }
 
 fn f_finish() {
+    cmd_flush()
 }
 
 fn f_copy_tex_sub_image_2d(t: u64, l: i64, a0: i64, b0: i64, c0: i64, d0: i64, e0: i64, f0: i64) {
@@ -862,11 +964,13 @@ fn tex_for_slot(s: *mut VG, pi: usize, slot: usize) -> u64 {
     return id
 }
 
-fn write_desc(s: *mut VG, pi: usize) {
+// descriptor set `k` of the pool: binding 0 = its uniform slot, bindings 1..3 = the textures bound now
+fn write_desc(s: *mut VG, pi: usize, k0: usize) {
     (*s).top = 0
+    let dset: u64 = vk_mem.r64((*s).dsets, k0 * 8)
     let bi: u64 = sa(24)
     vk_mem.w64(bi, 0, (*s).ubo.buf)
-    vk_mem.w64(bi, 8, 0)
+    vk_mem.w64(bi, 8, (k0 * UBO_STRIDE) as u64)
     vk_mem.w64(bi, 16, UBO_BYTES as u64)
     let ii: u64 = sa(24 * 3)
     var k: usize = 0
@@ -883,7 +987,7 @@ fn write_desc(s: *mut VG, pi: usize) {
     }
     let wr: u64 = sa(64 * 4)
     vk_mem.w32(wr, 0, 35) // WRITE_DESCRIPTOR_SET
-    vk_mem.w64(wr, 16, (*s).dset)
+    vk_mem.w64(wr, 16, dset)
     vk_mem.w32(wr, 24, 0)
     vk_mem.w32(wr, 32, 1)
     vk_mem.w32(wr, 36, 6) // UNIFORM_BUFFER
@@ -892,7 +996,7 @@ fn write_desc(s: *mut VG, pi: usize) {
     while k < 3 {
         let o: usize = (k + 1) * 64
         vk_mem.w32(wr, o, 35)
-        vk_mem.w64(wr, o + 16, (*s).dset)
+        vk_mem.w64(wr, o + 16, dset)
         vk_mem.w32(wr, o + 24, (k + 1) as u64)
         vk_mem.w32(wr, o + 32, 1)
         vk_mem.w32(wr, o + 36, 1) // COMBINED_IMAGE_SAMPLER
@@ -962,8 +1066,13 @@ fn f_draw_arrays_instanced(mode: u64, first: i64, count: i64, n: i64) {
     if (*s).attr_buf[0] >= BUF_MAX as u64 || (*s).attr_buf[1] >= BUF_MAX as u64 || !(*b0).ok || !(*b1).ok {
         return
     }
-    rt.mem_copy((*s).ubo.ptr, (*s).uni + (pi * UBO_BYTES) as u64, UBO_BYTES)
-    write_desc(s, pi)
+    if (*s).set_n >= SET_MAX {
+        cmd_flush() // out of sets / uniform slots: the recorded draws run first
+    }
+    let k: usize = (*s).set_n
+    (*s).set_n = k + 1
+    rt.mem_copy((*s).ubo.ptr + (k * UBO_STRIDE) as u64, (*s).uni + (pi * UBO_BYTES) as u64, UBO_BYTES)
+    write_desc(s, pi, k)
     let cmd: u64 = cmd_open()
     if cmd == 0 {
         return
@@ -987,11 +1096,13 @@ fn f_draw_arrays_instanced(mode: u64, first: i64, count: i64, n: i64) {
     vk_mem.cx(&(*s).x, vk_mem.X_CMD_SET_SC, cmd, 0, 1, sc, 0, 0, 0, 0, 0, 0)
     vk_mem.cx(&(*s).x, vk_mem.X_CMD_BIND_PIPE, cmd, 0, pipe, 0, 0, 0, 0, 0, 0, 0)
     let ds: u64 = sa(8)
-    vk_mem.w64(ds, 0, (*s).dset)
+    vk_mem.w64(ds, 0, vk_mem.r64((*s).dsets, k * 8))
     vk_mem.cx(&(*s).x, vk_mem.X_CMD_BIND_DS, cmd, 0, (*s).playout, 0, 1, ds, 0, 0, 0, 0)
     let vbs: u64 = sa(32)
     vk_mem.w64(vbs, 0, (*b0).b.buf)
     vk_mem.w64(vbs, 8, (*b1).b.buf)
+    vk_mem.w64(vbs, 16, (*b0).base as u64) // the offsets: the window the last buffer_sub_data wrote
+    vk_mem.w64(vbs, 24, (*b1).base as u64)
     vk_mem.cx(&(*s).x, vk_mem.X_CMD_BIND_VB, cmd, 0, 2, vbs, vbs + 16, 0, 0, 0, 0, 0)
     vk_mem.cx(&(*s).x, vk_mem.X_CMD_DRAW, cmd, count as u64, n as u64, first as u64, 0, 0, 0, 0, 0, 0)
     vk_mem.cx(&(*s).x, vk_mem.X_CMD_END_RP, cmd, 0, 0, 0, 0, 0, 0, 0, 0, 0)
@@ -1125,7 +1236,8 @@ fn f_read_pixels(x: i64, y: i64, w: i64, h: i64, dst: u64) {
         return
     }
     let n: usize = (w as usize) * (h as usize) * 4
-    if !stg_need(n) {
+    let so: i64 = stg_alloc(n)
+    if so < 0 {
         return
     }
     let cmd: u64 = cmd_open()
@@ -1134,6 +1246,7 @@ fn f_read_pixels(x: i64, y: i64, w: i64, h: i64, dst: u64) {
     }
     (*s).top = 0
     let rg: u64 = sa(56)
+    vk_mem.w64(rg, 0, so as u64) // bufferOffset
     vk_mem.w32(rg, 16, 1)
     vk_mem.w32(rg, 28, 1)
     vk_mem.w32(rg, 32, x as u64)
@@ -1143,8 +1256,8 @@ fn f_read_pixels(x: i64, y: i64, w: i64, h: i64, dst: u64) {
     vk_mem.w32(rg, 52, 1)
     vk_mem.cx(&(*s).x, vk_mem.X_CMD_COPY_I2B, cmd, (*tex_at((*f).tex)).img.img, LAYOUT_GENERAL, (*s).stg.buf, 1, rg, 0, 0, 0, 0)
     vk_frame.mem_barrier(&(*s).x, cmd, vk_frame.ST_TRANSFER, vk_frame.ST_HOST, vk_frame.AC_TRANSFER_WRITE, vk_frame.AC_HOST_READ)
-    if cmd_close() {
-        rt.mem_copy(dst, (*s).stg.ptr, n)
+    if cmd_flush() {
+        rt.mem_copy(dst, (*s).stg.ptr + (so as u64), n)
         (*s).readbacks = (*s).readbacks + 1
     }
 }
@@ -1165,6 +1278,7 @@ fn f_delete_obj(kind: u64, id: u64) {
     } else if kind == gl.GLK_BUFFER as u64 && id < BUF_MAX as u64 {
         let b: *mut VBuf = buf_at(id)
         if (*b).ok {
+            cmd_flush() // a recorded draw may still read it
             vk_mem.buf_free(&(*s).x, &(*b).b)
         }
         (*b).ok = false
@@ -1230,7 +1344,7 @@ fn make_rpass(s: *mut VG) -> u64 {
     return vk_mem.r64(out, 0)
 }
 
-// set layout (0 = UBO, 1..3 = combined image samplers), pool, ONE set, pipeline layout
+// set layout (0 = UBO, 1..3 = combined image samplers), pool, SET_MAX sets (one per draw of a command buffer), pipeline layout
 fn make_layouts(s: *mut VG) -> bool {
     (*s).top = 0
     let bd: u64 = sa(24 * 4)
@@ -1257,12 +1371,12 @@ fn make_layouts(s: *mut VG) -> bool {
     (*s).dsl = vk_mem.r64(out, 0)
     let ps: u64 = sa(16)
     vk_mem.w32(ps, 0, 6) // UNIFORM_BUFFER
-    vk_mem.w32(ps, 4, 1)
+    vk_mem.w32(ps, 4, SET_MAX as u64)
     vk_mem.w32(ps, 8, 1) // COMBINED_IMAGE_SAMPLER
-    vk_mem.w32(ps, 12, 3)
+    vk_mem.w32(ps, 12, (SET_MAX * 3) as u64)
     let pi: u64 = sa(40)
     vk_mem.w32(pi, 0, 33) // DESCRIPTOR_POOL_CREATE_INFO
-    vk_mem.w32(pi, 20, 1)
+    vk_mem.w32(pi, 20, SET_MAX as u64)
     vk_mem.w32(pi, 24, 2)
     vk_mem.w64(pi, 32, ps)
     out = sa(8)
@@ -1270,18 +1384,26 @@ fn make_layouts(s: *mut VG) -> bool {
         return false
     }
     (*s).dpool = vk_mem.r64(out, 0)
-    let lays: u64 = sa(8)
-    vk_mem.w64(lays, 0, (*s).dsl)
+    let lays: u64 = rt.heap_alloc(SET_MAX * 8)
+    (*s).dsets = rt.heap_alloc(SET_MAX * 8)
+    if lays == 0 || (*s).dsets == 0 {
+        return false
+    }
+    var li2: usize = 0
+    while li2 < SET_MAX {
+        vk_mem.w64(lays, li2 * 8, (*s).dsl)
+        li2 = li2 + 1
+    }
     let ai: u64 = sa(40)
     vk_mem.w32(ai, 0, 34) // DESCRIPTOR_SET_ALLOCATE_INFO
     vk_mem.w64(ai, 16, (*s).dpool)
-    vk_mem.w32(ai, 24, 1)
+    vk_mem.w32(ai, 24, SET_MAX as u64)
     vk_mem.w64(ai, 32, lays)
-    out = sa(8)
-    if !vk_mem.good(vk_mem.cx(&(*s).x, vk_mem.X_ALLOC_DSETS, (*s).x.dev, ai, out, 0, 0, 0, 0, 0, 0, 0)) {
+    let alloc_ok: bool = vk_mem.good(vk_mem.cx(&(*s).x, vk_mem.X_ALLOC_DSETS, (*s).x.dev, ai, (*s).dsets, 0, 0, 0, 0, 0, 0, 0))
+    rt.heap_free(lays, SET_MAX * 8)
+    if !alloc_ok {
         return false
     }
-    (*s).dset = vk_mem.r64(out, 0)
     let sl: u64 = sa(8)
     vk_mem.w64(sl, 0, (*s).dsl)
     let pl: u64 = sa(48)
@@ -1364,7 +1486,7 @@ fn open_all(s: *mut VG) -> bool {
     }
     (*s).samp0 = make_sampler(s, false)
     (*s).samp1 = make_sampler(s, true)
-    (*s).ubo = vk_mem.buf_make(&(*s).x, UBO_BYTES as u64, vk_mem.U_UNIFORM, vk_mem.MEM_STAGING)
+    (*s).ubo = vk_mem.buf_make(&(*s).x, (SET_MAX * UBO_STRIDE) as u64, vk_mem.U_UNIFORM, vk_mem.MEM_STAGING)
     if (*s).samp0 == 0 || (*s).samp1 == 0 || !(*s).ubo.ok {
         (*s).step = 6
         return false
@@ -1373,6 +1495,10 @@ fn open_all(s: *mut VG) -> bool {
     (*s).dummy = f_create_texture()
     if (*s).dummy == 0 || !tex_make(tex_at((*s).dummy), 1, 1, FMT_RGBA8_UNORM, 4) {
         (*s).step = 7
+        return false
+    }
+    if !cmd_flush() {
+        (*s).step = 8
         return false
     }
     (*s).ok = true
@@ -1449,6 +1575,7 @@ fn vkgl_close() {
     if G_P == 0 {
         return
     }
+    cmd_flush()
     if (*s).x.ok {
         vk_mem.x_idle(&(*s).x)
     }

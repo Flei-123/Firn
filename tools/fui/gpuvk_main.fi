@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
-// tools/fui/gpuvk_main.fi -- fUi on Vulkan, smoke test (W18-F2): clear + rect through lib/fui/gpu.fi on the Vulkan table.
+// tools/fui/gpuvk_main.fi -- fUi on Vulkan, smoke test (W18-F2): clear + rect through lib/fui/gpu.fi on the Vulkan table, then a
+// STRESS run (W18-F3) of the limits of ONE command buffer: more draws than descriptor sets, more instances than the vertex ring
+// holds, more picture bytes than the staging buffer holds -- every cell is checked afterwards.
 //   gpuvk_main        exit 0 = ok, 4 = no Vulkan (SKIP), 3 = wrong pixels
 import std.rt
 import std.io
@@ -10,6 +12,138 @@ import fui.gpu_vk
 
 fn px(cv: *mut canvas.Canvas, x: usize, y: usize) -> u32 {
     return rt.ld32(canvas.canvas_pixels(cv) as u64, y * canvas.canvas_width(cv) + x)
+}
+
+// an opaque ARGB colour per index, and the word the canvas holds for it (RGBA octets, little endian)
+fn cell_argb(i: usize) -> u32 {
+    let r: u32 = ((i * 37 + 11) % 251) as u32
+    let g: u32 = ((i * 91 + 5) % 241) as u32
+    let b: u32 = ((i * 53 + 17) % 239) as u32
+    return (4278190080 as u32) | (r << 16) | (g << 8) | b
+}
+
+fn cell_word(argb: u32) -> u32 {
+    let r: u32 = (argb >> 16) & (255 as u32)
+    let g: u32 = (argb >> 8) & (255 as u32)
+    let b: u32 = argb & (255 as u32)
+    return (4278190080 as u32) | (b << 16) | (g << 8) | r
+}
+
+fn chan_near(a: u32, b: u32, sh: u32) -> bool {
+    let x: i64 = ((a >> sh) & (255 as u32)) as i64
+    let y: i64 = ((b >> sh) & (255 as u32)) as i64
+    return x - y <= 1 && y - x <= 1
+}
+
+fn word_near(a: u32, b: u32) -> bool {
+    return chan_near(a, b, 0 as u32) && chan_near(a, b, 8 as u32) && chan_near(a, b, 16 as u32) && chan_near(a, b, 24 as u32)
+}
+
+// reads the 256x256 canvas back and compares the middle of each of the 64x64 cells (4x4 px) with want[i]
+fn check_cells(g: *mut gpu.Gpu, cv: *mut canvas.Canvas, want: u64, label: str) -> bool {
+    gpu.gpu_read(g, 0, 0, 256, 256, canvas.canvas_pixels(cv) as u64, 256 * 4)
+    var bad: usize = 0
+    var i: usize = 0
+    while i < 4096 {
+        if px(cv, (i % 64) * 4 + 1, (i / 64) * 4 + 1) != rt.ld32(want, i) {
+            bad = bad + 1
+        }
+        i = i + 1
+    }
+    io.fmt_print(f"gpuvk stress {label}: wrong cells={bad}\n")
+    return bad == 0
+}
+
+fn stress(api: *mut gl.GlApi) -> bool {
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, 256, 256) {
+        return false
+    }
+    var g: gpu.Gpu = gpu.gpu_new()
+    if !gpu.gpu_open(&g, api) || !gpu.gpu_attach(&g, &cv) {
+        io.print("gpuvk stress: gpu_open / gpu_attach failed\n")
+        return false
+    }
+    let want: u64 = rt.heap_alloc(4096 * 4)
+    if want == 0 {
+        return false
+    }
+    var ok: bool = true
+    // 1. 4096 draws, one per rect: four times the descriptor sets / uniform slots of a command buffer
+    gpu.gpu_clear(&g, 4278190080 as u32)
+    var i: usize = 0
+    while i < 4096 {
+        let x: f64 = ((i % 64) * 4) as f64
+        let y: f64 = ((i / 64) * 4) as f64
+        gpu.gpu_rect(&g, x, y, x + 4.0, y + 4.0, cell_argb(i))
+        gpu.gpu_flush(&g)
+        rt.st32(want, i, cell_word(cell_argb(i)))
+        i = i + 1
+    }
+    if !check_cells(&g, &cv, want, "4096 draws") {
+        ok = false
+    }
+    // 2. 40 batches of 1000 instances (128 KB each): more than the 4 MB vertex ring, later batches paint over earlier cells
+    var b: usize = 0
+    while b < 40 {
+        var j: usize = 0
+        while j < 1000 {
+            let cell: usize = (b * 1000 + j) % 4096
+            let col: u32 = cell_argb(b * 1000 + j + 7)
+            let x: f64 = ((cell % 64) * 4) as f64
+            let y: f64 = ((cell / 64) * 4) as f64
+            gpu.gpu_rect(&g, x, y, x + 4.0, y + 4.0, col)
+            rt.st32(want, cell, cell_word(col))
+            j = j + 1
+        }
+        gpu.gpu_flush(&g)
+        b = b + 1
+    }
+    if !check_cells(&g, &cv, want, "ring (40 batches)") {
+        ok = false
+    }
+    // 3. 120 pictures: the first is small, so the upload texture is replaced (deleted while draws are recorded) by the 128x128 ones;
+    //    120 x 64 KB is more than the 1 MB staging buffer holds. Picture k covers quadrant k % 4; the last one per quadrant stays.
+    let pic: u64 = rt.heap_alloc(128 * 128 * 4)
+    if pic == 0 {
+        return false
+    }
+    var k: usize = 0
+    while k < 120 {
+        var sz: i32 = 128
+        if k == 0 {
+            sz = 16
+        }
+        let w: u32 = cell_word(cell_argb(1000 + k))
+        var n: usize = 0
+        while n < (sz * sz) as usize {
+            rt.st32(pic, n, w)
+            n = n + 1
+        }
+        let q: usize = k % 4
+        gpu.gpu_draw_image(&g, pic, (sz * 4) as usize, sz, sz, ((q % 2) * 128) as i32, ((q / 2) * 128) as i32)
+        k = k + 1
+    }
+    gpu.gpu_read(&g, 0, 0, 256, 256, canvas.canvas_pixels(&cv) as u64, 256 * 4)
+    var bad: usize = 0
+    var q: usize = 0
+    while q < 4 {
+        let w: u32 = cell_word(cell_argb(1000 + 116 + q))
+        let x0: usize = (q % 2) * 128
+        let y0: usize = (q / 2) * 128
+        if !word_near(px(&cv, x0 + 8, y0 + 8), w) || !word_near(px(&cv, x0 + 100, y0 + 100), w) {
+            bad = bad + 1
+        }
+        q = q + 1
+    }
+    io.fmt_print(f"gpuvk stress pictures (120 x 64 KB): wrong quadrants={bad}\n")
+    if bad != 0 {
+        ok = false
+    }
+    var st: [u64; 4] = [0; 4]
+    gpu_vk.vkgl_stats(&st[0])
+    io.fmt_print(f"gpuvk stress totals: draws={st[0]} submits={st[1]} uploads={st[2]} readbacks={st[3]}\n")
+    return ok
 }
 
 fn main() -> i32 {
@@ -45,5 +179,9 @@ fn main() -> i32 {
     var st: [u64; 4] = [0; 4]
     gpu_vk.vkgl_stats(&st[0])
     io.fmt_print(f"gpuvk: draws={st[0]} submits={st[1]} uploads={st[2]} readbacks={st[3]}\n")
+    if !stress(&api) {
+        io.print("gpuvk: STRESS FAILED\n")
+        return 3
+    }
     return 0
 }
