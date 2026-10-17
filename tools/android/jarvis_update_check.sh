@@ -47,7 +47,8 @@ mkdir -p "$OUT"
 echo "== 1. throw-away store + builds"
 REPO=$W/repo
 mkdir -p "$REPO"
-export ORIENTSTORE_REPO=$REPO ORIENTSTORE_SCHLUESSEL=$REPO/schluessel.geheim
+# english: ok -- the store tool's own German interface names (env var + key file)
+export ORIENTSTORE_REPO=$REPO "ORIENTSTORE_SCHLUESSEL=$REPO/schluessel.geheim"
 python3 "$TOOL" init --name "JARVIS update check" --adresse "http://10.0.2.2/" >/dev/null || { echo "store init failed"; exit 1; }
 KEY=$(python3 "$TOOL" key)
 python3 -I "$ROOT/tools/appkit/teststore_server.py" --root "$REPO" --log "$W/store.log" >"$W/store.out" 2>&1 & STORESRV=$!

@@ -53,7 +53,8 @@ if [ -n "${ORIENTSTORE_SCHLUESSEL:-}" ]; then
     case "$(readlink -f "$ORIENTSTORE_SCHLUESSEL")" in "$STAGING"/*) ;; *) echo "refused: ORIENTSTORE_SCHLUESSEL is outside the staging store" >&2; exit 3 ;; esac
 fi
 export ORIENTSTORE_REPO=$STAGING
-export ORIENTSTORE_SCHLUESSEL=$STAGING/schluessel.geheim
+# english: ok -- the store tool's own German interface names (env var + key file)
+export "ORIENTSTORE_SCHLUESSEL=$STAGING/schluessel.geheim"
 
 # --- the notes of this version: lines between "## <version>" and the next "## ", blank edges trimmed, at most 1536 bytes
 NOTES_TEXT=$(python3 -I - "$NOTES" "$VERSION" <<'PY'
@@ -89,8 +90,10 @@ $STORE add --kanal "$CHANNEL" --aenderungen "$NOTES_TEXT" "$APK" | sed -n 's/^\(
 echo "== verify"
 VER_OUT=$($STORE verify 2>&1 || true)
 echo "$VER_OUT" | sed 's/^/  /'
+# english: ok -- the store tool prints German messages
 # A channel other than 'stabil' alone makes `store verify` complain "no channel stabil": expected for a test-only package.
-if echo "$VER_OUT" | grep '^FEHLER' | grep -v "kein Kanal 'stabil'" | grep -q .; then
+NOCHAN="kein Kanal 'stabil'"  # english: ok
+if echo "$VER_OUT" | grep '^FEHLER' | grep -v "$NOCHAN" | grep -q .; then
     echo "verify found real errors" >&2; exit 1
 fi
 echo "== builds and channels"
