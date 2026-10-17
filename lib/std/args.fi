@@ -1,0 +1,640 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/args.fi -- std.args: command line parsing like Python's argparse
+// (sub commands, long/short options, flags, typed values, defaults, required
+// options, positionals, `--help`), with argparse's own help layout and error
+// texts.
+//
+//     var p: args.Cmd = args.cmd("tool", "item tool")
+//     let add: *mut args.Cmd = args.sub(&p, "add", "add an item")
+//     args.opt(add, "--name", args.STR | args.REQUIRED, "", "item name")
+//     args.opt(add, "--count", args.INT, "1", "how many")
+//     args.opt(add, "-v,--verbose", args.FLAG, "", "verbose output")
+//     let rm: *mut args.Cmd = args.sub(&p, "rm", "remove an item")
+//     args.pos(rm, "id", args.INT, "item id")
+//
+//     var r: args.Result = args.parse_argv(&p, start)    // start = main(start)
+//     if r.status != args.OK { io.print_line(r.text); return r.status }   // text = help or error
+//     if r.cmd == "add" { ... args.get(&r, "name")  args.get_int(&r, "count")  args.is_set(&r, "verbose") }
+//
+// STATUS of a parse: OK (0), HELP (1: `r.text` is the help text, print it
+// and exit 0), ERROR (2: `r.text` is "prog: error: message", print it to
+// stderr and exit 2 -- argparse's exit code).
+//
+// The texts follow Python 3.11's argparse ("options:" heading, `usage:`
+// line, help column at min(longest + 2, 24), "invalid int value: 'x'",
+// "the following arguments are required: --name", "unrecognized
+// arguments: ...", "argument cmd: invalid choice: 'x' (choose from 'a',
+// 'b')"). Proof: tools/args_cross/run.sh compares them with argparse.
+//
+// HONEST
+// A1  No abbreviations of long options (`--verb`), no clustered short flags
+//     (`-vq`), no `--` separator, no `nargs` (one value per option, one word
+//     per positional), no `choices=`, `append`, `count`, mutually exclusive
+//     groups or `type=` other than str/int.
+// A2  An option value that starts with `-` is taken as a value only when it
+//     looks like a number (`-5`), like argparse; `--name=-x` always works.
+// A3  The usage line is never wrapped (argparse wraps at 78 columns); help
+//     texts are not wrapped either.
+// A4  Texts are bytes, the width of a column is counted in bytes.
+import std.rt
+import std.vec
+
+export {
+    Cmd, Spec, Result, cmd, sub, opt, pos, parse_words, parse_argv, parse,
+    get, get_int, is_set, help_text,
+    STR, INT, FLAG, REQUIRED, OK, HELP, ERROR,
+}
+
+const STR: u32 = 1
+const INT: u32 = 2
+const FLAG: u32 = 3
+const REQUIRED: u32 = 16
+const KIND_MASK: u32 = 15
+
+const OK: i32 = 0
+const HELP: i32 = 1
+const ERROR: i32 = 2
+
+struct Spec {
+    names: str, // "-v,--verbose" or "--name"; for a positional the dest
+    long: str,
+    short: str,
+    dest: str,
+    kind: u32,
+    required: bool,
+    positional: bool,
+    def: str,
+    help: str,
+}
+
+struct Cmd {
+    name: str,
+    prog: str,
+    desc: str,
+    help: str,
+    specs: Vec[Spec],
+    subs: Vec[Cmd],
+}
+
+struct Result {
+    status: i32,
+    text: str,
+    cmd: str,
+    keys: Vec[str],
+    vals: Vec[str],
+    rest: Vec[str],
+}
+
+fn cmd(name: str, desc: str) -> Cmd {
+    return Cmd { name: name, prog: name, desc: desc, help: desc, specs: vec_new[Spec](), subs: vec_new[Cmd]() }
+}
+
+// A sub command; the pointer stays valid until the next `sub` on the same parent.
+fn sub(c: *mut Cmd, name: str, help: str) -> *mut Cmd {
+    var s: Cmd = cmd(name, help)
+    s.prog = (*c).prog + " " + name
+    vec_push[Cmd](&(*c).subs, s)
+    return vec_elem_ptr[Cmd](&(*c).subs, vec_len[Cmd](&(*c).subs) - 1)
+}
+
+fn dest_of(long: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < long.length() {
+        let ch: u8 = long.chars(i)
+        if !(ch == 45 && rt.buf_len(&b) == 0) {
+            if ch == 45 {
+                rt.buf_push(&b, 95 as u8)
+            } else {
+                rt.buf_push(&b, ch)
+            }
+        }
+        i = i + 1
+    }
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+// An option. `names`: "--name" or "-n,--name"; `kind`: STR, INT or FLAG,
+// optionally `| REQUIRED`; `def`: default text ("" = none).
+fn opt(c: *mut Cmd, names: str, kind: u32, def: str, help: str) {
+    var short: str = ""
+    var long: str = names
+    let comma: usize = names.find_char(44)
+    if comma < names.length() {
+        short = names.span_part(0, comma)
+        long = names.span_part(comma + 1, names.length() - comma - 1)
+    }
+    var first: str = long
+    if short.length() > 0 {
+        first = short
+    }
+    if !first.starts_with("--") && short.length() == 0 {
+        short = long
+        long = ""
+    }
+    var d: str = ""
+    if long.length() > 0 {
+        d = dest_of(long)
+    } else {
+        d = dest_of(short.span_part(1, short.length() - 1))
+    }
+    let sp: Spec = Spec { names: names, long: long, short: short, dest: d, kind: kind & KIND_MASK,
+        required: (kind & REQUIRED) != 0, positional: false, def: def, help: help }
+    vec_push[Spec](&(*c).specs, sp)
+}
+
+// A positional word (required, in order).
+fn pos(c: *mut Cmd, name: str, kind: u32, help: str) {
+    let sp: Spec = Spec { names: name, long: "", short: "", dest: name, kind: kind & KIND_MASK,
+        required: true, positional: true, def: "", help: help }
+    vec_push[Spec](&(*c).specs, sp)
+}
+
+// ---------------------------------------------------------------- text
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn pad(b: *mut rt.Buf, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, 32 as u8)
+        i = i + 1
+    }
+}
+
+fn upper(s: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < s.length() {
+        var ch: u8 = s.chars(i)
+        if ch >= 97 && ch <= 122 {
+            ch = ch - 32
+        }
+        rt.buf_push(&b, ch)
+        i = i + 1
+    }
+    let r: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return r
+}
+
+fn opt_first(s: *mut Spec) -> str {
+    if (*s).short.length() > 0 {
+        return (*s).short
+    }
+    return (*s).long
+}
+
+fn spec_ptr(c: *mut Cmd, i: usize) -> *mut Spec {
+    return vec_elem_ptr[Spec](&(*c).specs, i)
+}
+
+// "-h, --help", "--name NAME" ...
+fn invocation(s: *mut Spec, b: *mut rt.Buf) {
+    if (*s).positional {
+        put(b, (*s).dest)
+        return
+    }
+    if (*s).kind == FLAG {
+        if (*s).short.length() > 0 && (*s).long.length() > 0 {
+            put(b, (*s).short + ", " + (*s).long)
+        } else {
+            put(b, opt_first(s))
+        }
+        return
+    }
+    let mv: str = upper((*s).dest)
+    if (*s).short.length() > 0 && (*s).long.length() > 0 {
+        put(b, (*s).short + " " + mv + ", " + (*s).long + " " + mv)
+    } else {
+        put(b, opt_first(s) + " " + mv)
+    }
+}
+
+fn subs_choice(c: *mut Cmd) -> str {
+    var b: rt.Buf = rt.buf_new()
+    put(&b, "{")
+    for i in 0..vec_len[Cmd](&(*c).subs) {
+        if i > 0 {
+            put(&b, ",")
+        }
+        put(&b, (*vec_elem_ptr[Cmd](&(*c).subs, i)).name)
+    }
+    put(&b, "}")
+    let r: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return r
+}
+
+fn usage_line(c: *mut Cmd, b: *mut rt.Buf) {
+    put(b, "usage: ")
+    put(b, (*c).prog)
+    put(b, " [-h]")
+    for i in 0..vec_len[Spec](&(*c).specs) {
+        let s: *mut Spec = spec_ptr(c, i)
+        if !(*s).positional {
+            put(b, " ")
+            var one: rt.Buf = rt.buf_new()
+            if (*s).kind == FLAG {
+                put(&one, opt_first(s))
+            } else {
+                put(&one, opt_first(s) + " " + upper((*s).dest))
+            }
+            if (*s).required {
+                put(b, str { p: rt.buf_data(&one), n: rt.buf_len(&one) })
+            } else {
+                put(b, "[")
+                put(b, str { p: rt.buf_data(&one), n: rt.buf_len(&one) })
+                put(b, "]")
+            }
+            rt.buf_free(&one)
+        }
+    }
+    for i in 0..vec_len[Spec](&(*c).specs) {
+        let s: *mut Spec = spec_ptr(c, i)
+        if (*s).positional {
+            put(b, " ")
+            put(b, (*s).dest)
+        }
+    }
+    if vec_len[Cmd](&(*c).subs) > 0 {
+        put(b, " ")
+        put(b, subs_choice(c))
+        put(b, " ...")
+    }
+    put(b, "\n")
+}
+
+// One help line: `indent` spaces, the header, padding to `hp`, the help.
+fn help_row(b: *mut rt.Buf, indent: usize, header: str, text: str, hp: usize) {
+    pad(b, indent)
+    put(b, header)
+    if text.length() == 0 {
+        put(b, "\n")
+        return
+    }
+    if indent + header.length() + 2 <= hp {
+        pad(b, hp - indent - header.length())
+    } else {
+        put(b, "\n")
+        pad(b, hp)
+    }
+    put(b, text)
+    put(b, "\n")
+}
+
+fn inv_str(s: *mut Spec) -> str {
+    var t: rt.Buf = rt.buf_new()
+    invocation(s, &t)
+    let r: str = __str_copy(str { p: rt.buf_data(&t), n: rt.buf_len(&t) })
+    rt.buf_free(&t)
+    return r
+}
+
+// The text of `--help` for this command (Python 3.11 layout).
+fn help_text(c: *mut Cmd) -> str {
+    var b: rt.Buf = rt.buf_new()
+    usage_line(c, &b)
+    if (*c).desc.length() > 0 && (*c).name == (*c).prog {
+        put(&b, "\n")
+        put(&b, (*c).desc)
+        put(&b, "\n")
+    }
+    var maxlen: usize = 12 // "-h, --help" + 2
+    var nsubs: usize = vec_len[Cmd](&(*c).subs)
+    var npos: usize = 0
+    for i in 0..vec_len[Spec](&(*c).specs) {
+        let s: *mut Spec = spec_ptr(c, i)
+        let l: usize = inv_str(s).length() + 2
+        if l > maxlen {
+            maxlen = l
+        }
+        if (*s).positional {
+            npos = npos + 1
+        }
+    }
+    if nsubs > 0 {
+        let l: usize = subs_choice(c).length() + 2
+        if l > maxlen {
+            maxlen = l
+        }
+        for i in 0..nsubs {
+            let l2: usize = (*vec_elem_ptr[Cmd](&(*c).subs, i)).name.length() + 4
+            if l2 > maxlen {
+                maxlen = l2
+            }
+        }
+    }
+    var hp: usize = maxlen + 2
+    if hp > 24 {
+        hp = 24
+    }
+    if npos > 0 || nsubs > 0 {
+        put(&b, "\npositional arguments:\n")
+        for i in 0..vec_len[Spec](&(*c).specs) {
+            let s: *mut Spec = spec_ptr(c, i)
+            if (*s).positional {
+                help_row(&b, 2, (*s).dest, (*s).help, hp)
+            }
+        }
+        if nsubs > 0 {
+            help_row(&b, 2, subs_choice(c), "", hp)
+            for i in 0..nsubs {
+                let sc: *mut Cmd = vec_elem_ptr[Cmd](&(*c).subs, i)
+                help_row(&b, 4, (*sc).name, (*sc).help, hp)
+            }
+        }
+    }
+    put(&b, "\noptions:\n")
+    help_row(&b, 2, "-h, --help", "show this help message and exit", hp)
+    for i in 0..vec_len[Spec](&(*c).specs) {
+        let s: *mut Spec = spec_ptr(c, i)
+        if !(*s).positional {
+            help_row(&b, 2, inv_str(s), (*s).help, hp)
+        }
+    }
+    // no final line feed: the caller prints the text with print_line
+    let r: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) - 1 })
+    rt.buf_free(&b)
+    return r
+}
+
+// ---------------------------------------------------------------- parse
+
+fn fail(r: *mut Result, prog: str, msg: str) {
+    (*r).status = ERROR
+    (*r).text = prog + ": error: " + msg
+}
+
+fn is_int(s: str) -> bool {
+    var i: usize = 0
+    if s.length() > 0 && (s.chars(0) == 45 || s.chars(0) == 43) {
+        i = 1
+    }
+    if i >= s.length() {
+        return false
+    }
+    while i < s.length() {
+        let ch: u8 = s.chars(i)
+        if ch < 48 || ch > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn looks_negative(s: str) -> bool {
+    return s.length() > 1 && s.chars(0) == 45 && s.chars(1) >= 48 && s.chars(1) <= 57
+}
+
+fn find_opt(c: *mut Cmd, w: str) -> *mut Spec {
+    for i in 0..vec_len[Spec](&(*c).specs) {
+        let s: *mut Spec = spec_ptr(c, i)
+        if !(*s).positional && (w == (*s).long || w == (*s).short) && w.length() > 0 {
+            return s
+        }
+    }
+    return 0 as *mut Spec
+}
+
+fn store(r: *mut Result, key: str, val: str) {
+    vec_push[str](&(*r).keys, key)
+    vec_push[str](&(*r).vals, val)
+}
+
+fn word_at(words: *mut Vec[str], i: usize) -> str {
+    return *vec_elem_ptr[str](words, i)
+}
+
+// Parse `words` (without the program name) against `c`.
+fn parse(c: *mut Cmd, words: *mut Vec[str]) -> Result {
+    var r: Result = Result { status: OK, text: "", cmd: "", keys: vec_new[str](), vals: vec_new[str](), rest: vec_new[str]() }
+    parse_into(c, words, 0, &r)
+    if r.status == OK && vec_len[str](&r.rest) > 0 {
+        var b: rt.Buf = rt.buf_new()
+        for i in 0..vec_len[str](&r.rest) {
+            if i > 0 {
+                put(&b, " ")
+            }
+            put(&b, word_at(&r.rest, i))
+        }
+        fail(&r, (*c).prog, "unrecognized arguments: " + __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) }))
+        rt.buf_free(&b)
+    }
+    return r
+}
+
+fn parse_into(c: *mut Cmd, words: *mut Vec[str], from: usize, r: *mut Result) {
+    for d in 0..vec_len[Spec](&(*c).specs) {
+        let ds: *mut Spec = spec_ptr(c, d)
+        if !(*ds).positional && (*ds).kind != FLAG && (*ds).def.length() > 0 {
+            store(r, (*ds).dest, (*ds).def)
+        }
+    }
+    var next_pos: usize = 0
+    var i: usize = from
+    let n: usize = vec_len[str](words)
+    var chosen: bool = false
+    while i < n && (*r).status == OK && !chosen {
+        let w: str = word_at(words, i)
+        i = i + 1
+        if w == "-h" || w == "--help" {
+            (*r).status = HELP
+            (*r).text = help_text(c)
+            return
+        }
+        if w.length() > 1 && w.chars(0) == 45 && !looks_negative(w) {
+            var name: str = w
+            var inline: str = ""
+            var has_inline: bool = false
+            let eq: usize = w.find_char(61)
+            if w.starts_with("--") && eq < w.length() {
+                name = w.span_part(0, eq)
+                inline = w.span_part(eq + 1, w.length() - eq - 1)
+                has_inline = true
+            }
+            let s: *mut Spec = find_opt(c, name)
+            if s as u64 == 0 {
+                vec_push[str](&(*r).rest, w)
+            } else if (*s).kind == FLAG {
+                store(r, (*s).dest, "1")
+            } else {
+                var v: str = inline
+                if !has_inline {
+                    if i < n && (!word_at(words, i).starts_with("-") || looks_negative(word_at(words, i))) {
+                        v = word_at(words, i)
+                        i = i + 1
+                    } else {
+                        fail(r, (*c).prog, "argument " + opt_first(s) + ": expected one argument")
+                        return
+                    }
+                }
+                if (*s).kind == INT && !is_int(v) {
+                    fail(r, (*c).prog, "argument " + opt_first(s) + ": invalid int value: '" + v + "'")
+                    return
+                }
+                store(r, (*s).dest, v)
+            }
+        } else if vec_len[Cmd](&(*c).subs) > 0 && !chosen {
+            var found: *mut Cmd = 0 as *mut Cmd
+            for k in 0..vec_len[Cmd](&(*c).subs) {
+                let sc: *mut Cmd = vec_elem_ptr[Cmd](&(*c).subs, k)
+                if (*sc).name == w {
+                    found = sc
+                }
+            }
+            if found as u64 == 0 {
+                var b: rt.Buf = rt.buf_new()
+                for k in 0..vec_len[Cmd](&(*c).subs) {
+                    if k > 0 {
+                        put(&b, ", ")
+                    }
+                    put(&b, "'" + (*vec_elem_ptr[Cmd](&(*c).subs, k)).name + "'")
+                }
+                fail(r, (*c).prog, "argument cmd: invalid choice: '" + w + "' (choose from " + __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) }) + ")")
+                rt.buf_free(&b)
+                return
+            }
+            (*r).cmd = (*found).name
+            chosen = true
+            parse_into(found, words, i, r)
+            return
+        } else {
+            // next positional
+            var k: usize = 0
+            var seen: usize = 0
+            var target: *mut Spec = 0 as *mut Spec
+            while k < vec_len[Spec](&(*c).specs) {
+                let s: *mut Spec = spec_ptr(c, k)
+                if (*s).positional {
+                    if seen == next_pos {
+                        target = s
+                    }
+                    seen = seen + 1
+                }
+                k = k + 1
+            }
+            if target as u64 == 0 {
+                vec_push[str](&(*r).rest, w)
+            } else {
+                if (*target).kind == INT && !is_int(w) {
+                    fail(r, (*c).prog, "argument " + (*target).dest + ": invalid int value: '" + w + "'")
+                    return
+                }
+                store(r, (*target).dest, w)
+                next_pos = next_pos + 1
+            }
+        }
+    }
+    if (*r).status != OK {
+        return
+    }
+    // required options / positionals / sub command, in declaration order
+    var missing: rt.Buf = rt.buf_new()
+    var nmiss: usize = 0
+    for k in 0..vec_len[Spec](&(*c).specs) {
+        let s: *mut Spec = spec_ptr(c, k)
+        if (*s).required && !has_key(r, (*s).dest) {
+            if nmiss > 0 {
+                put(&missing, ", ")
+            }
+            if (*s).positional {
+                put(&missing, (*s).dest)
+            } else {
+                put(&missing, opt_first(s))
+            }
+            nmiss = nmiss + 1
+        }
+    }
+    if vec_len[Cmd](&(*c).subs) > 0 && !chosen {
+        if nmiss > 0 {
+            put(&missing, ", ")
+        }
+        put(&missing, "cmd")
+        nmiss = nmiss + 1
+    }
+    if nmiss > 0 {
+        fail(r, (*c).prog, "the following arguments are required: " + __str_copy(str { p: rt.buf_data(&missing), n: rt.buf_len(&missing) }))
+    }
+    rt.buf_free(&missing)
+}
+
+fn has_key(r: *mut Result, key: str) -> bool {
+    for i in 0..vec_len[str](&(*r).keys) {
+        if word_at(&(*r).keys, i) == key {
+            return true
+        }
+    }
+    return false
+}
+
+// Split `line` at spaces and parse it (for tests and tools).
+fn parse_words(c: *mut Cmd, line: str) -> Result {
+    var words: Vec[str] = vec_new[str]()
+    var start: usize = 0
+    var i: usize = 0
+    while i <= line.length() {
+        if i == line.length() || line.chars(i) == 32 {
+            if i > start {
+                vec_push[str](&words, line.span_part(start, i - start))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    let r: Result = parse(c, &words)
+    vec_free[str](&words)
+    return r
+}
+
+// The program arguments of `main(start: u64)`, program name excluded.
+fn parse_argv(c: *mut Cmd, start: u64) -> Result {
+    var words: Vec[str] = vec_new[str]()
+    for i in 1..rt.arg_count(start) {
+        let p: u64 = rt.arg_ptr(start, i)
+        vec_push[str](&words, str { p: p as *mut u8, n: rt.c_length(p) })
+    }
+    let r: Result = parse(c, &words)
+    vec_free[str](&words)
+    return r
+}
+
+// The value given for `dest` (the last one), else the default of its option, else "".
+fn get(r: *mut Result, dest: str) -> str {
+    var i: usize = vec_len[str](&(*r).keys)
+    while i > 0 {
+        i = i - 1
+        if word_at(&(*r).keys, i) == dest {
+            return word_at(&(*r).vals, i)
+        }
+    }
+    return ""
+}
+
+fn get_int(r: *mut Result, dest: str) -> i64 {
+    let s: str = get(r, dest)
+    var neg: bool = false
+    var i: usize = 0
+    var v: i64 = 0
+    if s.length() > 0 && (s.chars(0) == 45 || s.chars(0) == 43) {
+        neg = s.chars(0) == 45
+        i = 1
+    }
+    while i < s.length() {
+        v = v * 10 + (s.chars(i) - 48) as i64
+        i = i + 1
+    }
+    if neg {
+        return 0 - v
+    }
+    return v
+}
+
+fn is_set(r: *mut Result, dest: str) -> bool {
+    return has_key(r, dest)
+}

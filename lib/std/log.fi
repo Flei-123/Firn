@@ -1,0 +1,276 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/log.fi -- std.log: leveled logging like Python's `logging`
+// (named loggers with inherited levels, stream and rotating-file handlers,
+// a `%(asctime)s %(levelname)-8s %(name)s: %(message)s` format string).
+//
+//     var lg: log.Logging = log.logging(log.INFO, "%(asctime)s %(levelname)-8s %(name)s: %(message)s")
+//     log.add_stream(&lg, 2, log.WARNING)                       // stderr, warnings and up
+//     log.add_file(&lg, "/var/log/app.log", log.NOTSET, 250, 2)  // rotating: 250 bytes, 2 backups
+//     log.set_level(&lg, "app.db", log.DEBUG)                   // a logger of its own
+//     log.info(&lg, "app", "start")
+//     log.err(&lg, "app.db", "failed")
+//     log.close(&lg)
+//
+// An object, not a global: you hold the `Logging`, pass it around (no hidden
+// state). Level of a logger = its own level, else the nearest ancestor by
+// dotted name ("app.db" -> "app"), else the root level given to `logging`.
+// A handler has a level of its own (NOTSET = take everything). The record
+// goes to EVERY handler (the root's, as with Python's propagation).
+//
+// Rotation is `RotatingFileHandler`'s: before a record is written, if
+// size + len(line) >= max_bytes (max_bytes > 0), `app.log` becomes
+// `app.log.1`, `.1` becomes `.2` ... up to `backups`, the oldest goes away.
+// Format keys: %(asctime)s (local time, "2026-10-17 20:13:08,123"),
+// %(levelname)s (with an optional width: %(levelname)-8s), %(name)s,
+// %(message)s.
+//
+// HONEST
+// L1  No lazy `"x=%d" % args`: build the message first (`io.fmt_string(f"x={x}")`).
+// L2  No exc_info, no filters, no `propagate=False`, no handler per logger,
+//     no per-record `extra`. One format for all handlers.
+// L3  The file is opened per record in append mode and closed again (slow but
+//     robust against a rotation by another process); not safe for two
+//     processes rotating at once.
+// L4  asctime is UTC when the zone file is missing.
+import std.rt
+import std.vec
+import std.fs
+import std.time
+
+export {
+    Logging, Handler, logging, add_stream, add_file, set_level, emit,
+    debug, info, warning, err, critical, close, level_name,
+    NOTSET, DEBUG, INFO, WARNING, ERROR, CRITICAL,
+}
+
+const NOTSET: i32 = 0
+const DEBUG: i32 = 10
+const INFO: i32 = 20
+const WARNING: i32 = 30
+const ERROR: i32 = 40
+const CRITICAL: i32 = 50
+
+struct Handler {
+    fd: i64, // >= 0: a stream (stderr = 2); -1: a file by path
+    path: str,
+    level: i32,
+    max_bytes: u64,
+    backups: u32,
+}
+
+struct Logging {
+    level: i32,
+    fmt: str,
+    handlers: Vec[Handler],
+    names: Vec[str],
+    levels: Vec[i32],
+}
+
+fn logging(level: i32, fmt: str) -> Logging {
+    return Logging { level: level, fmt: fmt, handlers: vec_new[Handler](), names: vec_new[str](), levels: vec_new[i32]() }
+}
+
+fn add_stream(lg: *mut Logging, fd: i64, level: i32) {
+    vec_push[Handler](&(*lg).handlers, Handler { fd: fd, path: "", level: level, max_bytes: 0, backups: 0 })
+}
+
+fn add_file(lg: *mut Logging, path: str, level: i32, max_bytes: u64, backups: u32) {
+    vec_push[Handler](&(*lg).handlers, Handler { fd: -1, path: path, level: level, max_bytes: max_bytes, backups: backups })
+}
+
+fn set_level(lg: *mut Logging, name: str, level: i32) {
+    for i in 0..vec_len[str](&(*lg).names) {
+        if *vec_elem_ptr[str](&(*lg).names, i) == name {
+            *vec_elem_ptr[i32](&(*lg).levels, i) = level
+            return
+        }
+    }
+    vec_push[str](&(*lg).names, name)
+    vec_push[i32](&(*lg).levels, level)
+}
+
+fn level_name(l: i32) -> str {
+    if l >= CRITICAL { return "CRITICAL" }
+    if l >= ERROR { return "ERROR" }
+    if l >= WARNING { return "WARNING" }
+    if l >= INFO { return "INFO" }
+    if l >= DEBUG { return "DEBUG" }
+    return "NOTSET"
+}
+
+// The level that counts for `name`: its own, else the nearest ancestor's, else the root's.
+fn effective(lg: *mut Logging, name: str) -> i32 {
+    var n: str = name
+    while true {
+        for i in 0..vec_len[str](&(*lg).names) {
+            if *vec_elem_ptr[str](&(*lg).names, i) == n {
+                return *vec_elem_ptr[i32](&(*lg).levels, i)
+            }
+        }
+        let dot: usize = n.find_char_back(46)
+        if dot >= n.length() {
+            return (*lg).level
+        }
+        n = n.span_part(0, dot)
+    }
+    return (*lg).level
+}
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn dec(b: *mut rt.Buf, v: u32, width: usize) {
+    var digits: usize = 1
+    var t: u32 = v
+    while t >= 10 {
+        t = t / 10
+        digits = digits + 1
+    }
+    var k: usize = digits
+    while k < width {
+        rt.buf_push(b, 48 as u8)
+        k = k + 1
+    }
+    rt.buf_push_dec_u64(b, v as u64)
+}
+
+fn asctime(b: *mut rt.Buf) {
+    let now: i64 = time.now_unix_ms()
+    let t: time.DateTime = time.local_from_unix(now) catch | e | time.civil_from_unix(now)
+    dec(b, t.year as u32, 4)
+    put(b, "-")
+    dec(b, t.month, 2)
+    put(b, "-")
+    dec(b, t.day, 2)
+    put(b, " ")
+    dec(b, t.hour, 2)
+    put(b, ":")
+    dec(b, t.minute, 2)
+    put(b, ":")
+    dec(b, t.second, 2)
+    put(b, ",")
+    dec(b, t.ms, 3)
+}
+
+// The line (with the final line feed) for one record.
+fn render(fmt: str, level: i32, name: str, msg: str, out: *mut rt.Buf) {
+    var i: usize = 0
+    let n: usize = fmt.length()
+    while i < n {
+        let ch: u8 = fmt.chars(i)
+        if ch == 37 && i + 1 < n && fmt.chars(i + 1) == 40 {
+            let close: usize = fmt.find_char_ab(41, i + 2)
+            if close < n {
+                let key: str = fmt.span_part(i + 2, close - i - 2)
+                var j: usize = close + 1
+                var width: usize = 0
+                var left: bool = false
+                if j < n && fmt.chars(j) == 45 {
+                    left = true
+                    j = j + 1
+                }
+                while j < n && fmt.chars(j) >= 48 && fmt.chars(j) <= 57 {
+                    width = width * 10 + (fmt.chars(j) - 48) as usize
+                    j = j + 1
+                }
+                var text: str = ""
+                if key == "levelname" {
+                    text = level_name(level)
+                } else if key == "name" {
+                    text = name
+                } else if key == "message" {
+                    text = msg
+                }
+                if key == "asctime" {
+                    asctime(out)
+                } else {
+                    put(out, text)
+                    var k: usize = text.length()
+                    while left && k < width {
+                        rt.buf_push(out, 32 as u8)
+                        k = k + 1
+                    }
+                }
+                i = j + 1
+                continue
+            }
+        }
+        rt.buf_push(out, ch)
+        i = i + 1
+    }
+    rt.buf_push(out, 10 as u8)
+}
+
+fn backup_name(path: str, k: u32) -> str {
+    var b: rt.Buf = rt.buf_new()
+    put(&b, path)
+    put(&b, ".")
+    rt.buf_push_dec_u64(&b, k as u64)
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn rotate(path: str, backups: u32) {
+    if backups == 0 {
+        fs.remove(path) catch false
+        return
+    }
+    var k: u32 = backups
+    fs.remove(backup_name(path, k)) catch false
+    while k > 1 {
+        let from: str = backup_name(path, k - 1)
+        if fs.exists(from) {
+            fs.rename(from, backup_name(path, k)) catch false
+        }
+        k = k - 1
+    }
+    fs.rename(path, backup_name(path, 1)) catch false
+}
+
+fn write_file_record(h: *mut Handler, p: u64, n: usize) {
+    if (*h).max_bytes > 0 && fs.exists((*h).path) {
+        let st: fs.FileInfo = fs.stat((*h).path) catch | e | fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0 as u64, mtime_ns: 0 }
+        if st.size + n as u64 >= (*h).max_bytes {
+            rotate((*h).path, (*h).backups)
+        }
+    }
+    let fd: i64 = fs.open_append((*h).path) catch | e | -1
+    if fd >= 0 {
+        fs.write_fd_all(fd, p, n) catch false
+        fs.close_fd(fd)
+    }
+}
+
+// One record to every handler whose level lets it through.
+fn emit(lg: *mut Logging, level: i32, name: str, msg: str) {
+    if level < effective(lg, name) {
+        return
+    }
+    var line: rt.Buf = rt.buf_new()
+    render((*lg).fmt, level, name, msg, &line)
+    for i in 0..vec_len[Handler](&(*lg).handlers) {
+        let h: *mut Handler = vec_elem_ptr[Handler](&(*lg).handlers, i)
+        if level >= (*h).level {
+            if (*h).fd >= 0 {
+                rt.write_everything((*h).fd, rt.buf_ptr(&line), rt.buf_len(&line))
+            } else {
+                write_file_record(h, rt.buf_ptr(&line), rt.buf_len(&line))
+            }
+        }
+    }
+    rt.buf_free(&line)
+}
+
+fn debug(lg: *mut Logging, name: str, msg: str) { emit(lg, DEBUG, name, msg) }
+fn info(lg: *mut Logging, name: str, msg: str) { emit(lg, INFO, name, msg) }
+fn warning(lg: *mut Logging, name: str, msg: str) { emit(lg, WARNING, name, msg) }
+fn err(lg: *mut Logging, name: str, msg: str) { emit(lg, ERROR, name, msg) }
+fn critical(lg: *mut Logging, name: str, msg: str) { emit(lg, CRITICAL, name, msg) }
+
+fn close(lg: *mut Logging) {
+    vec_free[Handler](&(*lg).handlers)
+    vec_free[str](&(*lg).names)
+    vec_free[i32](&(*lg).levels)
+}
