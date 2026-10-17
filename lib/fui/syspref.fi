@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/syspref.fi -- the SYSTEM'S APPEARANCE as fUi sees it: dark mode, accent colour, high contrast
+// (roadmap r150). Pure parsing + the theme hookup; the reading itself is the host's job.
+//
+//     var sp: syspref.SysPref = syspref.syspref_new()
+//     syspref.portal_scheme(1, &sp)                  // xdg-desktop-portal color-scheme: 1 = dark
+//     syspref.accent_from_unit(208, 518, 894, &sp)   // portal accent-color (r,g,b) in per mille
+//     let changed: u32 = syspref.syspref_apply(&theme, &sp, &base_shape)
+//
+// SOURCES, who feeds what:
+//   Linux    org.freedesktop.portal.Settings (org.freedesktop.appearance): color-scheme (u: 0 none,
+//            1 dark, 2 light), accent-color ((ddd), 0..1 each), contrast (u: 0 none, 1 more).
+//            gsettings text: color-scheme 'prefer-dark', accent-color 'blue'.
+//   Windows  HKCU\Software\Microsoft\Windows\DWM\AccentColor (ABGR dword), DwmGetColorizationColor
+//            (ARGB), SystemParametersInfo(SPI_GETHIGHCONTRAST).dwFlags & HCF_HIGHCONTRASTON (1),
+//            AppsUseLightTheme. WM_SETTINGCHANGE "ImmersiveColorSet" (win32.fi) says WHEN to read again.
+// HONEST
+//   S1  No reader is built here: the DBus call (portal) and the Windows registry/SPI calls are the
+//       hosts' glue (roadmap). The parsers and `syspref_apply` are tested (tools/fui/syspref_main.fi).
+//   S2  High contrast applies the built-in "High Contrast" theme (themelist 2, black/white/yellow,
+//       7:1) -- NOT the user's own Windows contrast palette (SystemColors); that is a later step.
+//   S3  Applying to a window that is already running needs a repaint; the caller does that.
+import std.rt
+import fui.theme
+import fui.themefile
+import fui.themelist
+
+export {
+    SysPref, syspref_new, portal_scheme, portal_contrast, scheme_from_text,
+    accent_from_unit, accent_from_abgr, accent_from_argb, accent_from_name, hc_from_flags,
+    syspref_apply, CH_DARK, CH_ACCENT, CH_CONTRAST, HC_THEME,
+}
+
+const CH_DARK: u32 = 1
+const CH_ACCENT: u32 = 2
+const CH_CONTRAST: u32 = 4
+const HC_THEME: usize = 2   // themelist: high-contrast.theme
+
+struct SysPref {
+    dark: bool,
+    dark_known: bool,
+    accent: u32,          // 0xRRGGBB
+    accent_known: bool,
+    contrast: bool,       // high contrast / more contrast wanted
+}
+
+fn syspref_new() -> SysPref {
+    return SysPref { dark: false, dark_known: false, accent: 0, accent_known: false, contrast: false }
+}
+
+// org.freedesktop.appearance color-scheme: 1 = prefer dark, 2 = prefer light, 0 = no preference.
+fn portal_scheme(v: u32, sp: *mut SysPref) {
+    if v == 1 as u32 {
+        (*sp).dark = true
+        (*sp).dark_known = true
+    } else if v == 2 as u32 {
+        (*sp).dark = false
+        (*sp).dark_known = true
+    }
+}
+
+// org.freedesktop.appearance contrast: 1 = more contrast.
+fn portal_contrast(v: u32, sp: *mut SysPref) {
+    (*sp).contrast = v == 1 as u32
+}
+
+fn has(s: str, w: str) -> bool {
+    if w.n > s.n { return false }
+    var i: usize = 0
+    while i + w.n <= s.n {
+        var k: usize = 0
+        while k < w.n && rt.ld8((s.p) as u64, i + k) == rt.ld8((w.p) as u64, k) { k = k + 1 }
+        if k == w.n { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// gsettings text of color-scheme ("'prefer-dark'", "default", "'prefer-light'") or a GTK theme name
+// ("Adwaita-dark"): returns true when it said something.
+fn scheme_from_text(s: str, sp: *mut SysPref) -> bool {
+    if has(s, "prefer-dark") || has(s, "-dark") || has(s, "Dark") {
+        portal_scheme(1 as u32, sp)
+        return true
+    }
+    if has(s, "prefer-light") || has(s, "default") || has(s, "Light") || has(s, "Adwaita") {
+        portal_scheme(2 as u32, sp)
+        return true
+    }
+    return false
+}
+
+fn unit8(v: i64) -> u32 {
+    var x: i64 = v
+    if x < 0 { x = 0 }
+    if x > 1000 { x = 1000 }
+    return ((x * 255 + 500) / 1000) as u32
+}
+
+// portal accent-color: three components 0..1 given in per mille (0..1000).
+fn accent_from_unit(r: i64, g: i64, b: i64, sp: *mut SysPref) {
+    (*sp).accent = (unit8(r) << (16 as u32)) | (unit8(g) << (8 as u32)) | unit8(b)
+    (*sp).accent_known = true
+}
+
+// Windows registry AccentColor / AccentColorMenu: 0xAABBGGRR.
+fn accent_from_abgr(v: u32, sp: *mut SysPref) {
+    let r: u32 = v & 255 as u32
+    let g: u32 = (v >> (8 as u32)) & 255 as u32
+    let b: u32 = (v >> (16 as u32)) & 255 as u32
+    (*sp).accent = (r << (16 as u32)) | (g << (8 as u32)) | b
+    (*sp).accent_known = true
+}
+
+// DwmGetColorizationColor: 0xAARRGGBB.
+fn accent_from_argb(v: u32, sp: *mut SysPref) {
+    (*sp).accent = v & 16777215 as u32
+    (*sp).accent_known = true
+}
+
+// GNOME accent-color names (libadwaita values). false = unknown name.
+fn accent_from_name(s: str, sp: *mut SysPref) -> bool {
+    var c: u32 = 0 as u32
+    if has(s, "blue") { c = 0x3584E4 as u32 }          // 3584E4
+    else if has(s, "teal") { c = 0x2190A4 as u32 }     // 2190A4
+    else if has(s, "green") { c = 0x3A944A as u32 }    // 3A944A
+    else if has(s, "yellow") { c = 0xC88800 as u32 }  // C88800
+    else if has(s, "orange") { c = 0xED5B00 as u32 }  // ED5B00
+    else if has(s, "red") { c = 0xE62D42 as u32 }     // E62D42
+    else if has(s, "pink") { c = 0xD56199 as u32 }    // D56199
+    else if has(s, "purple") { c = 0x9141AC as u32 }   // 9141AC
+    else if has(s, "slate") { c = 0x6F8397 as u32 }    // 6F8397
+    else { return false }
+    (*sp).accent = c
+    (*sp).accent_known = true
+    return true
+}
+
+// SystemParametersInfo(SPI_GETHIGHCONTRAST): HCF_HIGHCONTRASTON = 1.
+fn hc_from_flags(flags: u32, sp: *mut SysPref) {
+    (*sp).contrast = (flags & 1 as u32) != 0 as u32
+}
+
+// Put the preferences on the theme. `base` is the program's normal shape (restored when high contrast
+// ends). Order: base shape, dark/light, accent, and high contrast on top (the built-in theme replaces
+// the colours). Returns CH_* bits for what was applied.
+fn syspref_apply(m: *mut theme.Theme, sp: *mut SysPref, base: *mut theme.Shape) -> u32 {
+    var ch: u32 = 0 as u32
+    theme.theme_set_shape(m, base)
+    if (*sp).dark_known {
+        theme.theme_set_dark(m, (*sp).dark)
+        ch = ch | CH_DARK
+    }
+    if (*sp).accent_known {
+        theme.theme_set_accent(m, (*sp).accent)
+        ch = ch | CH_ACCENT
+    }
+    if (*sp).contrast {
+        var len: usize = 0
+        let p: u64 = themelist.builtin_text(HC_THEME, &len)
+        var tf: themefile.ThemeFile = themefile.themefile_new()
+        if p != 0 && themefile.themefile_apply(m, p, len, &tf) {
+            ch = ch | CH_CONTRAST
+        }
+    }
+    return ch
+}

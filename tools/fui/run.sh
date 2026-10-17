@@ -747,6 +747,11 @@ FIRNC="$FIRNC" sh tools/fui/atspi.sh >"$W/atspi.log" 2>&1
 rc=$?
 tail -n 4 "$W/atspi.log"
 if [ "$rc" != 0 ] && [ "$rc" != 77 ]; then echo "atspi FAILED ($rc)"; exit 1; fi
+# W18c: the UIA model (same tree as the AT-SPI bridge) and the system appearance (dark/accent/high contrast)
+build uia
+"$W/uia" | tail -n 3
+build syspref
+"$W/syspref" | tail -n 3
 build touch
 "$W/touch" | tail -n 3
 build kitrtl
