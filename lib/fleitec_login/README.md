@@ -7,8 +7,9 @@ Module files carry the prefix `fl_` because Firn module names are global (`jwt` 
 |---|---|
 | `fl_util` | base64url, S256, random, percent/query, JSON readers, endpoint rule (https; http only loopback) |
 | `fl_transport` | `Transport{f}`: `fn(*mut HttpReq, *mut HttpResp) -> bool`; every HTTP goes through it (offline tests) |
-| `fl_nethttp` | production transport on `net.http` (TLS, no redirects, 20 s) |
+| `fl_nethttp` | production transport on `net.http` (TLS, no redirects, 20 s; `net_set_timeout(ms)` shortens it) |
 | `fl_jwks` | JWKS (OKP/Ed25519), cache with expiry, rotation, pinned emergency key, refetch rate limit |
+| `fl_cache` | discovery + JWKS cache for a server (own ttl per document, `cache_warm` before expiry, stale-while-error up to `stale_max`, failure brake `min_retry`, unknown-kid brake survives the request; text kept in raw heap, fits a `static mut`) |
 | `fl_jwt` | `verify(token, cfg, now) -> Claims` (EdDSA, kid, iss/aud mandatory, ID section 4 rules); `verify_legacy_hs256` separate |
 | `fl_oidc` | Code+PKCE: `discover`, `begin`, `finish`, `token_refresh`, `revoke`, `logout_url`; id_token EdDSA or (JOSE mode, foreign IdP) RS256/ES256 via `auth.jose` |
 | `fl_device` | RFC 8628 `start`/`poll` (interval, slow_down +5 s, expired, denied) |
@@ -23,7 +24,7 @@ Tests
   Reason names are the shared ones (`kid`, not `nokey`).
 - `tests/3701_fleitec_login_flows.fi`: a MOCK IdP as `fl_transport` (EdDSA id_tokens via `ed25519_sign`): discovery, begin, code flow
   + negatives (state, redirect_uri, iss, PKCE, code twice, replay), id_token negatives (nonce, alg swap, expired, iss, aud, azp, kid,
-  signature), JWKS rotation/refetch brake/expiry, device flow (pending, slow_down, expired, denied), session (refresh rotation, reuse,
+  signature), JWKS rotation/refetch brake/expiry, fl_cache (hit = no network, ttl, warm-up lead, stale-while-error, failure brake, kid brake across requests, rotation absorbed), device flow (pending, slow_down, expired, denied), session (refresh rotation, reuse,
   wipe), link (prompt=login, auth_time, expected account, unlink), provider (jarvis, xoffi planned, password).
 - `tests/manual/fleitec_login_interop.sh` (OPTIONAL, needs node + curl, not in test.sh): the real Node service `fleitec-id` on
   127.0.0.1:8470, curl plays the browser, the Firn library does code flow, refresh rotation, reuse detection and device flow.

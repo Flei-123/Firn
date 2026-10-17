@@ -1,0 +1,240 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fleitec_login/fl_cache.fi -- discovery + JWKS cache for a process that logs many people in.
+//
+//     static mut G_CACHE: cache.Cache = cache.cache_new(3600, 600, 3600, 60, 30)  // or build it once at start
+//     var c: oidc.Client = oidc.client_new(issuer, client_id, tx)   // a fresh client per request is fine
+//     let rc: i64 = cache.cache_prepare(&G_CACHE, &c, now)           // endpoints + keys, usually NO network
+//     ... oidc.begin / oidc.finish(&c, ...) ...
+//     cache.cache_absorb(&G_CACHE, &c, now)                          // learn what a rotation refetch brought
+//     cache.cache_warm(&G_CACHE, &c2, now)                           // from an idle moment: refresh BEFORE expiry
+//
+// WHY: fl_oidc.discover costs two GETs (discovery + JWKS). A web server with one thread that does
+// that in every request blocks everybody for as long as the issuer needs (up to the timeout, twice).
+// With the cache a request pays the network only for what cannot be avoided: the code exchange.
+//
+// RULES
+//   * each document has its own age: `disc_ttl` (the endpoints rarely change) and `jwks_ttl`.
+//     Inside the ttl nothing is fetched. `cache_warm` refetches `lead` seconds BEFORE the ttl ends,
+//     so a request normally never meets an expired document.
+//   * STALE-WHILE-ERROR: when a refetch fails the old document is used for up to `stale_max` more
+//     seconds past its ttl (a restart of the issuer must not lock everybody out). Past that the
+//     cache says L_NET. Keys rotated away can be trusted for ttl + stale_max at most.
+//   * FAILURE BRAKE: after a fetch attempt (good or bad) the next one is made no sooner than
+//     `min_retry` seconds later, so an issuer that is down costs ONE timeout per min_retry, not
+//     one per request. In between a request without a usable document fails at once (fast).
+//   * the unknown-kid refetch of fl_oidc.verify_id_token keeps its brake across requests: the
+//     time of the last JWKS attempt lives here, not in the throw-away client; `cache_absorb`
+//     takes over the document that refetch brought.
+//   * the cached text is kept in raw heap (not on the garbage collected heap), so the cache may
+//     sit in a `static mut` for the life of the process. NOT thread safe: one owner.
+//   * a cache belongs to ONE issuer (`issuer_h`); `cache_prepare` for another issuer drops it.
+import std.rt
+import std.str
+import fleitec_login.fl_util as u
+import fleitec_login.fl_oidc as oidc
+
+export {
+    Cache, cache_new, cache_free, cache_prepare, cache_warm, cache_absorb, cache_due,
+    cache_disc_fresh, cache_jwks_fresh, cache_usable,
+}
+
+struct Cache {
+    issuer_h: u64,
+    disc_p: u64,
+    disc_n: usize,
+    disc_at: i64, // 0 = none
+    disc_try: i64,
+    jwks_p: u64,
+    jwks_n: usize,
+    jwks_at: i64,
+    jwks_try: i64,
+    disc_ttl: i64,
+    jwks_ttl: i64,
+    stale_max: i64,
+    lead: i64,
+    min_retry: i64,
+    fetches: i64, // network fetches made for the cache (discovery + JWKS, good or bad)
+    last_reason: i64, // reason of the last failed fetch, L_OK after a good one
+}
+
+fn cache_new(disc_ttl: i64, jwks_ttl: i64, stale_max: i64, lead: i64, min_retry: i64) -> Cache {
+    return Cache { issuer_h: 0 as u64, disc_p: 0 as u64, disc_n: 0, disc_at: 0, disc_try: 0 - 1000000000,
+        jwks_p: 0 as u64, jwks_n: 0, jwks_at: 0, jwks_try: 0 - 1000000000,
+        disc_ttl: disc_ttl, jwks_ttl: jwks_ttl, stale_max: stale_max, lead: lead, min_retry: min_retry,
+        fetches: 0, last_reason: oidc.L_OK }
+}
+
+fn cache_free(ca: *mut Cache) {
+    rt.heap_free((*ca).disc_p, (*ca).disc_n)
+    rt.heap_free((*ca).jwks_p, (*ca).jwks_n)
+    (*ca).disc_p = 0 as u64
+    (*ca).disc_n = 0
+    (*ca).disc_at = 0
+    (*ca).jwks_p = 0 as u64
+    (*ca).jwks_n = 0
+    (*ca).jwks_at = 0
+}
+
+fn hash_str(s: str) -> u64 {
+    var h: u64 = 14695981039346656037 as u64
+    var i: usize = 0
+    while i < s.length() {
+        h = (h ^ (s.chars(i) as u64)) *% (1099511628211 as u64)
+        i = i + 1
+    }
+    return h
+}
+
+fn keep(pp: *mut u64, pn: *mut usize, body: str) {
+    let n: usize = body.length()
+    let p: u64 = rt.heap_alloc(n)
+    if p == 0 as u64 {
+        return
+    }
+    rt.mem_copy(p, body.p as u64, n)
+    rt.heap_free(*pp, *pn)
+    *pp = p
+    *pn = n
+}
+
+#[allow_escape]
+fn fetch_back(p: u64, n: usize) -> str {
+    if p == 0 as u64 || n == 0 {
+        return ""
+    }
+    return __str_copy(str { p: p as *u8, n: n })
+}
+
+// fresh = inside the ttl; usable = fresh or stale but inside stale_max
+fn fresh_at(at: i64, ttl: i64, now: i64) -> bool {
+    return at != 0 && now < at + ttl
+}
+
+fn usable_at(at: i64, ttl: i64, stale_max: i64, now: i64) -> bool {
+    return at != 0 && now < at + ttl + stale_max
+}
+
+// a fetch is wanted now (nothing held, or expired / inside the lead) AND the brake allows it
+fn fetch_wanted(at: i64, last_try: i64, ttl: i64, lead: i64, min_retry: i64, now: i64, early: bool) -> bool {
+    var need: bool = at == 0
+    if !need {
+        if early {
+            need = now >= at + ttl - lead
+        } else {
+            need = now >= at + ttl
+        }
+    }
+    if !need {
+        return false
+    }
+    return now - last_try >= min_retry
+}
+
+fn cache_disc_fresh(ca: *mut Cache, now: i64) -> bool {
+    return fresh_at((*ca).disc_at, (*ca).disc_ttl, now)
+}
+
+fn cache_jwks_fresh(ca: *mut Cache, now: i64) -> bool {
+    return fresh_at((*ca).jwks_at, (*ca).jwks_ttl, now)
+}
+
+// both documents are held and still within ttl + stale_max
+fn cache_usable(ca: *mut Cache, now: i64) -> bool {
+    return usable_at((*ca).disc_at, (*ca).disc_ttl, (*ca).stale_max, now) &&
+        usable_at((*ca).jwks_at, (*ca).jwks_ttl, (*ca).stale_max, now)
+}
+
+// true when cache_warm would go to the network now (an idle loop asks before it spends time)
+fn cache_due(ca: *mut Cache, now: i64) -> bool {
+    return fetch_wanted((*ca).disc_at, (*ca).disc_try, (*ca).disc_ttl, (*ca).lead, (*ca).min_retry, now, true) ||
+        fetch_wanted((*ca).jwks_at, (*ca).jwks_try, (*ca).jwks_ttl, (*ca).lead, (*ca).min_retry, now, true)
+}
+
+fn sync(ca: *mut Cache, c: *mut oidc.Client, now: i64, early: bool) -> i64 {
+    let h: u64 = hash_str((*c).issuer)
+    if (*ca).issuer_h != h {
+        cache_free(ca)
+        (*ca).disc_try = 0 - 1000000000
+        (*ca).jwks_try = 0 - 1000000000
+        (*ca).issuer_h = h
+    }
+    // ---- discovery
+    if fetch_wanted((*ca).disc_at, (*ca).disc_try, (*ca).disc_ttl, (*ca).lead, (*ca).min_retry, now, early) {
+        (*ca).disc_try = now
+        (*ca).fetches = (*ca).fetches + 1
+        let rc: i64 = oidc.discover_only(c, now)
+        if rc == oidc.L_OK {
+            keep(&(*ca).disc_p, &(*ca).disc_n, (*c).disc_body)
+            (*ca).disc_at = now
+            (*ca).last_reason = oidc.L_OK
+        } else {
+            (*ca).last_reason = rc
+        }
+    }
+    if !usable_at((*ca).disc_at, (*ca).disc_ttl, (*ca).stale_max, now) {
+        if (*ca).last_reason != oidc.L_OK {
+            return (*ca).last_reason
+        }
+        return oidc.L_NET
+    }
+    let drc: i64 = oidc.discover_apply(c, fetch_back((*ca).disc_p, (*ca).disc_n))
+    if drc != oidc.L_OK {
+        return drc
+    }
+    // ---- keys (the endpoint jwks_uri comes from the document above)
+    if fetch_wanted((*ca).jwks_at, (*ca).jwks_try, (*ca).jwks_ttl, (*ca).lead, (*ca).min_retry, now, early) {
+        (*ca).jwks_try = now
+        (*ca).fetches = (*ca).fetches + 1
+        let krc: i64 = oidc.fetch_keys(c, now)
+        if krc == oidc.L_OK {
+            keep(&(*ca).jwks_p, &(*ca).jwks_n, (*c).jwks_body)
+            (*ca).jwks_at = now
+            (*ca).last_reason = oidc.L_OK
+        } else {
+            (*ca).last_reason = krc
+        }
+    }
+    if !usable_at((*ca).jwks_at, (*ca).jwks_ttl, (*ca).stale_max, now) {
+        if (*ca).last_reason != oidc.L_OK {
+            return (*ca).last_reason
+        }
+        return oidc.L_NET
+    }
+    // The client's key set is stamped `now`: the cache owns the expiry, the client must not
+    // second-guess it (a stale document inside stale_max is deliberately kept alive).
+    let arc: i64 = oidc.keys_apply(c, fetch_back((*ca).jwks_p, (*ca).jwks_n), now)
+    if arc != oidc.L_OK {
+        return arc
+    }
+    (*c).cfg.keys.last_try = (*ca).jwks_try // the unknown-kid brake survives the request
+    (*c).jwks_gen = 0
+    return oidc.L_OK
+}
+
+// For a request: fills the client's endpoints and keys. Network only when nothing usable is held
+// (first call, or longer than ttl + stale_max ago) or the ttl has just ended (then a failed
+// refetch falls back on the stale copy). L_OK, or the reason of the failed fetch (L_NET, L_HTTP...).
+fn cache_prepare(ca: *mut Cache, c: *mut oidc.Client, now: i64) -> i64 {
+    return sync(ca, c, now, false)
+}
+
+// For an idle moment: like prepare, but already `lead` seconds before the ttl ends. Use a scratch
+// client. A cheap no-op while nothing is due (ask cache_due first when even that matters).
+fn cache_warm(ca: *mut Cache, c: *mut oidc.Client, now: i64) -> i64 {
+    return sync(ca, c, now, true)
+}
+
+// After the client was used: a refetch inside verify_id_token (unknown kid / rotation) moved the
+// brake and maybe brought a newer document. Take both over.
+fn cache_absorb(ca: *mut Cache, c: *mut oidc.Client, now: i64) {
+    if (*c).cfg.keys.last_try > (*ca).jwks_try {
+        (*ca).jwks_try = (*c).cfg.keys.last_try
+        (*ca).fetches = (*ca).fetches + 1
+    }
+    if (*c).jwks_gen > 0 {
+        keep(&(*ca).jwks_p, &(*ca).jwks_n, (*c).jwks_body)
+        (*ca).jwks_at = (*ca).jwks_try
+        (*ca).last_reason = oidc.L_OK
+        (*c).jwks_gen = 0
+    }
+}

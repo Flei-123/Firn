@@ -5,6 +5,7 @@
 // (rotation + reuse detection) and device codes, and can be told to misbehave (switches in `Idp`).
 // Groups: discovery, begin, code flow + negatives, id_token negatives, JWKS rotation, device flow,
 // session (refresh rotation, wipe), link (prompt=login, auth_time, expected account, unlink), provider.
+// Cache group (fl_cache): discovery + JWKS cache, warm-up, stale-while-error, failure brake, rotation brake across requests.
 // Exit code = number of failed checks (max 100). The live counterpart against the real Node service is
 // tests/manual/fleitec_login_interop.fi (needs `node`; not part of test.sh).
 import std.rt
@@ -17,6 +18,7 @@ import fleitec_login.fl_transport as tp
 import fleitec_login.fl_jwks as jwks
 import fleitec_login.fl_jwt as jwt
 import fleitec_login.fl_oidc as oidc
+import fleitec_login.fl_cache as cache
 import fleitec_login.fl_device as device
 import fleitec_login.fl_session as session
 import fleitec_login.fl_link as link
@@ -866,6 +868,187 @@ fn g_rotation(ip: *mut Idp) -> i32 {
     return bad
 }
 
+// ---------------------------------------------------------------- cache (fl_cache)
+
+// a throw-away client the way a web request builds it, filled from the cache
+fn cclient() -> oidc.Client {
+    var c: oidc.Client = oidc.client_new(ISS, CID, tx())
+    oidc.client_set_scope(&c, "openid profile")
+    return c
+}
+
+// one whole login on a client that was filled by cache_prepare; returns the Login reason
+fn cache_login(ip: *mut Idp, ca: *mut cache.Cache, now: i64) -> i64 {
+    var c: oidc.Client = cclient()
+    (*ip).now = now
+    let pr: i64 = cache.cache_prepare(ca, &c, now)
+    if pr != oidc.L_OK { return 1000 + pr }
+    var p: oidc.Pending = oidc.pending_new()
+    let red: str = start(&c, ip, &p, "", now)
+    let l: oidc.Login = oidc.finish(&c, &p, red, now)
+    cache.cache_absorb(ca, &c, now)
+    return l.reason
+}
+
+fn g_cache(ip: *mut Idp) -> i32 {
+    var bad: i32 = 0 as i32
+    // ---- cold start fetches both documents once; later requests make NO network call
+    reset(ip)
+    var ca: cache.Cache = cache.cache_new(3600, 600, 1000, 60, 30)
+    var c1: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &c1, NOW), oidc.L_OK, "cache: cold prepare")
+    ci(&bad, (*ip).n_disc, 1, "cache: cold = one discovery fetch")
+    ci(&bad, (*ip).n_jwks, 1, "cache: cold = one JWKS fetch")
+    ck(&bad, c1.discovered && c1.token_endpoint == ISS + "/token" && jwks.keyset_has_kid(&c1.cfg.keys, "k1"), "cache: client filled")
+    let n0: i64 = (*ip).n_req
+    var c2: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &c2, NOW + 10), oidc.L_OK, "cache: hit prepare")
+    ci(&bad, (*ip).n_req, n0, "cache: a hit makes no network call")
+    ck(&bad, c2.discovered && c2.authorization_endpoint == ISS + "/authorize" && jwks.keyset_has_kid(&c2.cfg.keys, "k1"), "cache: hit fills the client")
+    ci(&bad, cache_login(ip, &ca, NOW + 20), oidc.L_OK, "cache: whole login on cached documents")
+    ci(&bad, (*ip).n_disc, 1, "cache: login did not rediscover")
+    ci(&bad, (*ip).n_jwks, 1, "cache: login did not refetch keys")
+    ci(&bad, (*ip).n_token, 1, "cache: only the code exchange went out")
+    cache.cache_free(&ca)
+
+    // ---- expiry fetches anew; discovery lives longer than the keys
+    reset(ip)
+    ca = cache.cache_new(3600, 600, 1000, 60, 30)
+    var c3: oidc.Client = cclient()
+    cache.cache_prepare(&ca, &c3, NOW)
+    var c4: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &c4, NOW + 700), oidc.L_OK, "cache: prepare after the key ttl")
+    ci(&bad, (*ip).n_jwks, 2, "cache: expired keys are fetched again")
+    ci(&bad, (*ip).n_disc, 1, "cache: discovery is still fresh (longer ttl)")
+    var c5: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &c5, NOW + 4000), oidc.L_OK, "cache: prepare after both ttls")
+    ci(&bad, (*ip).n_disc, 2, "cache: expired discovery is fetched again")
+    cache.cache_free(&ca)
+
+    // ---- warm-up: refetch `lead` before the end, nothing earlier
+    reset(ip)
+    ca = cache.cache_new(3600, 600, 1000, 60, 30)
+    var c6: oidc.Client = cclient()
+    cache.cache_prepare(&ca, &c6, NOW)
+    ck(&bad, !cache.cache_due(&ca, NOW + 100), "cache: not due at 100 s")
+    var w1: oidc.Client = cclient()
+    cache.cache_warm(&ca, &w1, NOW + 100)
+    ci(&bad, (*ip).n_jwks, 1, "cache: warm at 100 s does nothing")
+    ck(&bad, cache.cache_due(&ca, NOW + 545), "cache: due inside the lead")
+    var w2: oidc.Client = cclient()
+    ci(&bad, cache.cache_warm(&ca, &w2, NOW + 545), oidc.L_OK, "cache: warm inside the lead")
+    ci(&bad, (*ip).n_jwks, 2, "cache: warm refetched the keys")
+    ci(&bad, (*ip).n_disc, 1, "cache: warm left the fresh discovery alone")
+    ck(&bad, cache.cache_jwks_fresh(&ca, NOW + 1100), "cache: new key stamp holds a full ttl")
+    let n1: i64 = (*ip).n_req
+    ci(&bad, cache_login(ip, &ca, NOW + 700), oidc.L_OK, "cache: request after the warm-up")
+    ci(&bad, (*ip).n_req - n1, 1, "cache: ... pays only the code exchange")
+    cache.cache_free(&ca)
+
+    // ---- stale while error + failure brake
+    reset(ip)
+    ca = cache.cache_new(3600, 600, 1000, 60, 30)
+    var c7: oidc.Client = cclient()
+    cache.cache_prepare(&ca, &c7, NOW)
+    (*ip).net_fail = true
+    let n2: i64 = (*ip).n_req
+    var s1: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &s1, NOW + 650), oidc.L_OK, "cache: issuer down, stale keys are used")
+    ci(&bad, (*ip).n_req - n2, 1, "cache: one failed attempt")
+    ck(&bad, jwks.keyset_has_kid(&s1.cfg.keys, "k1") && s1.discovered, "cache: stale client is usable")
+    var s2: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &s2, NOW + 660), oidc.L_OK, "cache: second request while down")
+    ci(&bad, (*ip).n_req - n2, 1, "cache: failure brake, no second attempt within 30 s")
+    var s3: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &s3, NOW + 700), oidc.L_OK, "cache: retry after the brake")
+    ci(&bad, (*ip).n_req - n2, 2, "cache: exactly one more attempt")
+    // past ttl + stale_max the stale copy is dead
+    var s4: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &s4, NOW + 1700), oidc.L_NET, "cache: beyond stale_max = unreachable")
+    ck(&bad, !jwks.keyset_has_kid(&s4.cfg.keys, "k1"), "cache: dead copy is not applied")
+    // the issuer comes back: it recovers by itself
+    (*ip).net_fail = false
+    var s5: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &s5, NOW + 1800), oidc.L_OK, "cache: issuer back, recovered")
+    ck(&bad, jwks.keyset_has_kid(&s5.cfg.keys, "k1"), "cache: keys again")
+    cache.cache_free(&ca)
+
+    // ---- stale keys + a JWKS endpoint answering 500: still log in, not locked out
+    reset(ip)
+    ca = cache.cache_new(3600, 600, 1000, 60, 30)
+    var c8: oidc.Client = cclient()
+    cache.cache_prepare(&ca, &c8, NOW)
+    (*ip).jwks_mode = 0
+    ci(&bad, cache_login(ip, &ca, NOW + 650), oidc.L_OK, "cache: JWKS 500 + stale keys: login works")
+    cache.cache_free(&ca)
+
+    // ---- cold start and the issuer is down: fast failure, ONE attempt per brake window
+    reset(ip)
+    ca = cache.cache_new(3600, 600, 1000, 60, 30)
+    (*ip).net_fail = true
+    var d1: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &d1, NOW), oidc.L_NET, "cache: cold + down")
+    ci(&bad, (*ip).n_req, 1, "cache: cold + down = one attempt")
+    var d2: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &d2, NOW + 5), oidc.L_NET, "cache: cold + down, again")
+    ci(&bad, (*ip).n_req, 1, "cache: fails fast inside the brake window")
+    (*ip).net_fail = false
+    var d3: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &d3, NOW + 31), oidc.L_OK, "cache: after the window it works")
+    ci(&bad, (*ip).n_req, 3, "cache: discovery + JWKS now")
+    // a discovery that lies about the issuer is refused and never cached
+    cache.cache_free(&ca)
+    reset(ip)
+    ca = cache.cache_new(3600, 600, 1000, 60, 30)
+    (*ip).disc_issuer = "https://evil.test"
+    var d4: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &d4, NOW), oidc.L_ISS, "cache: wrong issuer refused")
+    ck(&bad, !cache.cache_usable(&ca, NOW), "cache: nothing kept")
+    cache.cache_free(&ca)
+
+    // ---- unknown kid across requests: exactly ONE refetch, the brake outlives the client
+    reset(ip)
+    ca = cache.cache_new(3600, 600, 1000, 60, 30)
+    var c9: oidc.Client = cclient()
+    cache.cache_prepare(&ca, &c9, NOW)
+    (*ip).tamper = T_KID
+    ci(&bad, cache_login(ip, &ca, NOW + 60), oidc.L_ID_TOKEN, "cache: unknown kid refused")
+    ci(&bad, (*ip).n_jwks, 2, "cache: unknown kid = one refetch")
+    ci(&bad, cache_login(ip, &ca, NOW + 61), oidc.L_ID_TOKEN, "cache: unknown kid again")
+    ci(&bad, (*ip).n_jwks, 2, "cache: brake holds across requests (new client each time)")
+    ci(&bad, cache_login(ip, &ca, NOW + 100), oidc.L_ID_TOKEN, "cache: unknown kid after the brake")
+    ci(&bad, (*ip).n_jwks, 3, "cache: one more refetch after 30 s")
+    cache.cache_free(&ca)
+
+    // ---- rotation: the refetch of one request serves all later ones
+    reset(ip)
+    ca = cache.cache_new(3600, 600, 1000, 60, 30)
+    var c10: oidc.Client = cclient()
+    cache.cache_prepare(&ca, &c10, NOW)
+    (*ip).jwks_mode = 3
+    (*ip).sign_key = 2
+    ci(&bad, cache_login(ip, &ca, NOW + 60), oidc.L_OK, "cache: rotation to k2 handled")
+    ci(&bad, (*ip).n_jwks, 2, "cache: rotation = one refetch")
+    ci(&bad, cache_login(ip, &ca, NOW + 70), oidc.L_OK, "cache: next login, k2 from the cache")
+    ci(&bad, (*ip).n_jwks, 2, "cache: absorbed document served the next request")
+    var c11: oidc.Client = cclient()
+    cache.cache_prepare(&ca, &c11, NOW + 80)
+    ck(&bad, jwks.keyset_has_kid(&c11.cfg.keys, "k2") && !jwks.keyset_has_kid(&c11.cfg.keys, "k1"), "cache: k2 replaced k1 in the cache")
+    cache.cache_free(&ca)
+
+    // ---- a junk JWKS never replaces a good cache
+    reset(ip)
+    ca = cache.cache_new(3600, 600, 1000, 60, 30)
+    var c12: oidc.Client = cclient()
+    cache.cache_prepare(&ca, &c12, NOW)
+    (*ip).jwks_mode = 9
+    var j1: oidc.Client = cclient()
+    ci(&bad, cache.cache_prepare(&ca, &j1, NOW + 650), oidc.L_OK, "cache: junk JWKS, stale copy kept")
+    ck(&bad, jwks.keyset_has_kid(&j1.cfg.keys, "k1"), "cache: junk did not replace the keys")
+    cache.cache_free(&ca)
+    return bad
+}
+
 fn g_device(ip: *mut Idp) -> i32 {
     var bad: i32 = 0 as i32
     reset(ip)
@@ -1215,6 +1398,7 @@ fn main() -> i32 {
     bad = bad + g_code(&idp)
     bad = bad + g_idtoken(&idp)
     bad = bad + g_rotation(&idp)
+    bad = bad + g_cache(&idp)
     bad = bad + g_device(&idp)
     bad = bad + g_session(&idp)
     bad = bad + g_link(&idp)

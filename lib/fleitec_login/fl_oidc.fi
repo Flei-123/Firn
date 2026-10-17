@@ -41,7 +41,7 @@ export {
     Client, Pending, Tokens, Login,
     client_new, client_set_endpoints, client_set_secret, client_set_scope, client_set_jose, client_set_leeway,
     pending_new, tokens_new, login_empty,
-    discover, begin, finish, token_refresh, parse_token_answer, revoke, logout_url, verify_id_token, error_login,
+    discover, discover_only, discover_apply, fetch_keys, keys_apply, begin, finish, token_refresh, parse_token_answer, revoke, logout_url, verify_id_token, error_login,
     login_text, tokens_valid, tokens_expires_in,
     IDM_EDDSA, IDM_JOSE,
     L_OK, L_NET, L_HTTP, L_PROTOCOL, L_DENIED, L_STATE, L_REDIRECT, L_ISS, L_REPLAY, L_GRANT,
@@ -88,6 +88,9 @@ struct Client {
     id_mode: i64,
     jose_jwks: str, // JWKS text in JOSE mode
     discovered: bool,
+    disc_body: str, // the last discovery document that was accepted (for fl_cache)
+    jwks_body: str, // the last JWKS document that was accepted (for fl_cache)
+    jwks_gen: i64, // number of JWKS documents fetched and accepted by this client
 }
 
 struct Pending {
@@ -171,7 +174,8 @@ fn client_new(issuer: str, client_id: str, t: tp.Transport) -> Client {
     return Client { issuer: issuer, client_id: client_id, client_secret: "", scope: "openid",
         authorization_endpoint: "", token_endpoint: "", device_endpoint: "", jwks_uri: "",
         revocation_endpoint: "", end_session_endpoint: "", tx: t,
-        cfg: jwt.cfg_new(issuer, client_id), id_mode: IDM_EDDSA, jose_jwks: "", discovered: false }
+        cfg: jwt.cfg_new(issuer, client_id), id_mode: IDM_EDDSA, jose_jwks: "", discovered: false,
+        disc_body: "", jwks_body: "", jwks_gen: 0 }
 }
 
 fn client_set_endpoints(c: *mut Client, auth: str, token: str, device: str, jwks_uri: str) {
@@ -208,6 +212,16 @@ fn endpoint_or_empty(d: *mut json.Json, root: u32, name: str) -> str {
 
 // GET {issuer}/.well-known/openid-configuration and the JWKS. L_OK or the reason.
 fn discover(c: *mut Client, now: i64) -> i64 {
+    let rc: i64 = discover_only(c, now)
+    if rc != L_OK {
+        return rc
+    }
+    return fetch_keys(c, now)
+}
+
+// Only the discovery document (no JWKS): GET, check, take the endpoints. Remembers the accepted
+// document in `disc_body`, so fl_cache can serve the next requests without the network.
+fn discover_only(c: *mut Client, now: i64) -> i64 {
     if !u.endpoint_ok((*c).issuer) {
         return L_CONFIG
     }
@@ -219,8 +233,22 @@ fn discover(c: *mut Client, now: i64) -> i64 {
     if r.status != 200 {
         return L_HTTP
     }
+    let rc: i64 = discover_apply(c, r.body)
+    if rc == L_OK {
+        (*c).disc_body = r.body
+    }
+    return rc
+}
+
+// The checks of a discovery document that is already in hand (fetched now or kept by fl_cache):
+// issuer octet for octet, every endpoint https (loopback http for dev), S256 if PKCE is mentioned.
+// No network. On success the endpoints are taken; on failure the client is unchanged.
+fn discover_apply(c: *mut Client, body: str) -> i64 {
+    if !u.endpoint_ok((*c).issuer) {
+        return L_CONFIG
+    }
     var d: json.Json = json.json_new()
-    let ok: bool = json.json_parse(&d, r.body.p as u64, r.body.length()) catch false
+    let ok: bool = json.json_parse(&d, body.p as u64, body.length()) catch false
     if !ok || json.json_kind(&d, json.json_root(&d)) != json.JSON_OBJECT {
         json.json_free(&d)
         return L_PROTOCOL
@@ -261,7 +289,7 @@ fn discover(c: *mut Client, now: i64) -> i64 {
     (*c).revocation_endpoint = re
     (*c).end_session_endpoint = ee
     (*c).discovered = true
-    return fetch_keys(c, now)
+    return L_OK
 }
 
 fn contains_item(csv: str, item: str) -> bool {
@@ -277,26 +305,49 @@ fn contains_item(csv: str, item: str) -> bool {
     return false
 }
 
-// (Re)loads the signing keys from jwks_uri. L_OK / L_NET / L_PROTOCOL.
+// (Re)loads the signing keys from jwks_uri. L_OK / L_NET / L_PROTOCOL. The attempt is counted for
+// the refetch brake (jwks.keyset_may_refetch) even when it fails; the accepted document is kept in
+// `jwks_body` and `jwks_gen` counts it, so fl_cache can learn what a verify-time refetch brought.
 fn fetch_keys(c: *mut Client, now: i64) -> i64 {
     if (*c).id_mode == IDM_JOSE {
         let r: tp.HttpResp = tp.get(&(*c).tx, (*c).jwks_uri, "")
         var rr: tp.HttpResp = r
+        (*c).cfg.keys.last_try = now
         if !rr.ok { return L_NET }
         if !tp.resp_text_ok(&rr) { return L_HTTP }
-        var test: jose.Jwks = jose.jwks_new()
-        let n: i64 = jose.jwks_parse(&test, r.body)
-        jose.jwks_free(&test)
-        if n <= 0 { return L_PROTOCOL }
-        (*c).jose_jwks = r.body
-        (*c).cfg.keys.fetched_at = now
-        (*c).cfg.keys.last_try = now
+        let kr: i64 = keys_apply(c, r.body, now)
+        if kr != L_OK { return kr }
+        (*c).jwks_gen = (*c).jwks_gen + 1
         return L_OK
     }
-    let jr: i64 = jwks.keyset_refresh(&(*c).cfg.keys, &(*c).tx, (*c).jwks_uri, now)
-    if jr == jwks.JW_OK { return L_OK }
-    if jr == jwks.JW_NET { return L_NET }
-    return L_PROTOCOL
+    (*c).cfg.keys.last_try = now
+    let r2: tp.HttpResp = tp.get(&(*c).tx, (*c).jwks_uri, "")
+    var rr2: tp.HttpResp = r2
+    if !tp.resp_text_ok(&rr2) { return L_NET }
+    let kr2: i64 = keys_apply(c, r2.body, now)
+    if kr2 != L_OK { return kr2 }
+    (*c).jwks_gen = (*c).jwks_gen + 1
+    return L_OK
+}
+
+// Takes a JWKS document that is already in hand (no network): parse, replace the keys, stamp them
+// with `now`. L_OK, or L_PROTOCOL when the text has no usable key (the old keys stay).
+fn keys_apply(c: *mut Client, body: str, now: i64) -> i64 {
+    if (*c).id_mode == IDM_JOSE {
+        var test: jose.Jwks = jose.jwks_new()
+        let n: i64 = jose.jwks_parse(&test, body)
+        jose.jwks_free(&test)
+        if n <= 0 { return L_PROTOCOL }
+        (*c).jose_jwks = body
+        (*c).cfg.keys.fetched_at = now
+        (*c).jwks_body = body
+        return L_OK
+    }
+    if jwks.keyset_parse(&(*c).cfg.keys, body, now) < 0 {
+        return L_PROTOCOL
+    }
+    (*c).jwks_body = body
+    return L_OK
 }
 
 // ---------------------------------------------------------------- begin
