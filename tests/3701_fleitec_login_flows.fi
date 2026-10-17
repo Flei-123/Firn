@@ -1,0 +1,1224 @@
+// expect_exit: 0
+// tests/3701_fleitec_login_flows.fi -- lib/fleitec_login against a MOCK IDENTITY PROVIDER that lives
+// in this file as a transport function (fl_transport): no socket, no Node. The mock mints EdDSA
+// id_tokens with std.crypto.ed25519 (fixed test seeds), keeps authorization codes, refresh families
+// (rotation + reuse detection) and device codes, and can be told to misbehave (switches in `Idp`).
+// Groups: discovery, begin, code flow + negatives, id_token negatives, JWKS rotation, device flow,
+// session (refresh rotation, wipe), link (prompt=login, auth_time, expected account, unlink), provider.
+// Exit code = number of failed checks (max 100). The live counterpart against the real Node service is
+// tests/manual/fleitec_login_interop.fi (needs `node`; not part of test.sh).
+import std.rt
+import std.io
+import std.json
+import std.str
+import std.crypto.ed25519
+import fleitec_login.fl_util as u
+import fleitec_login.fl_transport as tp
+import fleitec_login.fl_jwks as jwks
+import fleitec_login.fl_jwt as jwt
+import fleitec_login.fl_oidc as oidc
+import fleitec_login.fl_device as device
+import fleitec_login.fl_session as session
+import fleitec_login.fl_link as link
+import fleitec_login.fl_provider as provider
+
+const ISS: str = "https://id.mock.test"
+const CID: str = "firnchat-test"
+const REDIR: str = "https://chat.mock.test/cb"
+const NOW: i64 = 1800000000
+
+// what the mock does to the id_token it mints
+const T_NONE: i64 = 0
+const T_NONCE: i64 = 1 // wrong nonce
+const T_NO_NONCE: i64 = 2 // no nonce claim
+const T_ALG_NONE: i64 = 3 // alg none, empty signature
+const T_ALG_HS256: i64 = 4 // alg HS256
+const T_EXPIRED: i64 = 5
+const T_ISS: i64 = 6
+const T_AUD: i64 = 7
+const T_KID: i64 = 8 // kid k9, not in the JWKS
+const T_BADSIG: i64 = 9
+const T_NO_ID: i64 = 10 // no id_token in the answer
+const T_AZP_BAD: i64 = 11 // two audiences, azp is not us
+const T_AZP_OK: i64 = 12 // two audiences, azp is us
+const T_TOKTYPE: i64 = 13 // token_type "mac"
+
+struct Code {
+    code: str,
+    challenge: str,
+    nonce: str,
+    redirect: str,
+    client: str,
+    used: bool,
+    auth_time: i64,
+}
+
+struct Idp {
+    issuer: str,
+    now: i64,
+    sub: str,
+    // switches
+    jwks_mode: i64, // 0 = HTTP 500, 1 = k1, 2 = k1+k2, 3 = k2, 9 = junk document
+    sign_key: i64, // 1 or 2
+    tamper: i64,
+    net_fail: bool,
+    token_http: i64, // 0 normal, 500 = text/500, 2 = 200 non-JSON, 3 = 400 invalid_request
+    disc_issuer: str, // "" = honest
+    disc_http: bool,
+    disc_pkce: i64, // 0 = absent, 1 = S256 listed, 2 = plain only
+    disc_device: bool,
+    disc_revoke: bool,
+    disc_status: i64, // 0 = 200
+    ign_prompt: bool, // pretends prompt=login was honoured but reports the old auth_time
+    no_auth_time: bool,
+    refresh_mode: i64, // 0 rotate, 1 no new refresh token in the answer
+    refresh_sub: str, // "" = same subject
+    refresh_id: bool, // refresh answers carry an id_token
+    dev_state: i64, // 0 pending, 1 slow_down, 2 approved, 3 denied, 4 expired
+    dev_break: i64, // 1 = no user_code, 2 = HTTP 400
+    unlink_status: i64,
+    // state
+    codes: [Code; 16],
+    ncodes: i64,
+    seq: i64,
+    rt_cur: str,
+    rt_old: [str; 16],
+    n_old: i64,
+    family_dead: bool,
+    revoked: str,
+    // counters
+    n_req: i64,
+    n_token: i64,
+    n_jwks: i64,
+    n_disc: i64,
+    n_dev: i64,
+    n_polls: i64,
+    n_revoke: i64,
+    n_unlink: i64,
+    last_url: str,
+    last_body: str,
+    last_headers: str,
+}
+
+static mut G_IDP: u64 = 0
+
+fn code_empty() -> Code {
+    return Code { code: "", challenge: "", nonce: "", redirect: "", client: "", used: false, auth_time: 0 }
+}
+
+fn idp_new() -> Idp {
+    return Idp { issuer: ISS, now: NOW, sub: "acc_mock1",
+        jwks_mode: 1, sign_key: 1, tamper: 0, net_fail: false, token_http: 0, disc_issuer: "", disc_http: false,
+        disc_pkce: 0, disc_device: true, disc_revoke: true, disc_status: 0, ign_prompt: false, no_auth_time: false,
+        refresh_mode: 0, refresh_sub: "", refresh_id: false, dev_state: 0, dev_break: 0, unlink_status: 0,
+        codes: [code_empty(); 16], ncodes: 0, seq: 0, rt_cur: "", rt_old: ["" ; 16], n_old: 0, family_dead: false,
+        revoked: "", n_req: 0, n_token: 0, n_jwks: 0, n_disc: 0, n_dev: 0, n_polls: 0, n_revoke: 0, n_unlink: 0,
+        last_url: "", last_body: "", last_headers: "" }
+}
+
+// ---------------------------------------------------------------- small helpers
+
+fn itoa(v: i64) -> str {
+    if v == 0 { return "0" }
+    var neg: bool = v < 0
+    var x: i64 = v
+    if neg { x = 0 - v }
+    var b: rt.Buf = rt.buf_new()
+    var digits: [u8; 24] = [0; 24]
+    var n: usize = 0
+    while x > 0 {
+        digits[n] = (48 + (x % 10)) as u8
+        x = x / 10
+        n = n + 1
+    }
+    if neg { rt.buf_push(&b, 45 as u8) }
+    while n > 0 {
+        n = n - 1
+        rt.buf_push(&b, digits[n])
+    }
+    let r: str = __str_copy(str { p: rt.buf_data(&b), n: b.len })
+    rt.buf_free(&b)
+    return r
+}
+
+fn has(h: str, n: str) -> bool {
+    if n.length() == 0 { return true }
+    if n.length() > h.length() { return false }
+    var i: usize = 0
+    while i + n.length() <= h.length() {
+        if rt.mem_eq(h.p as u64 + i as u64, n.p as u64, n.length()) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn out_line(s: str) {
+    io.print_line_bytes(s.p as u64, s.length())
+}
+
+fn ck(bad: *mut i32, ok: bool, name: str) {
+    if !ok {
+        io.print("FAIL ")
+        out_line(name)
+        *bad = *bad + (1 as i32)
+    }
+}
+
+fn ci(bad: *mut i32, got: i64, want: i64, name: str) {
+    if got != want {
+        io.print("FAIL ")
+        io.print(name)
+        io.print(" got=")
+        io.print(itoa(got))
+        io.print(" want=")
+        out_line(itoa(want))
+        *bad = *bad + (1 as i32)
+    }
+}
+
+fn cs(bad: *mut i32, got: str, want: str, name: str) {
+    if got != want {
+        io.print("FAIL ")
+        io.print(name)
+        io.print(" got=")
+        io.print(got)
+        io.print(" want=")
+        out_line(want)
+        *bad = *bad + (1 as i32)
+    }
+}
+
+fn tx() -> tp.Transport {
+    return tp.Transport { f: idp_tx }
+}
+
+fn path_of(url: str) -> str {
+    let s: str = u.strip_query(url)
+    let a: i64 = u.find_char(s, 58 as u8, 0)
+    if a < 0 { return s }
+    let b: i64 = u.find_char(s, 47 as u8, (a + 3) as usize)
+    if b < 0 { return "/" }
+    return u.sub(s, b as usize, s.length() - (b as usize))
+}
+
+fn b64s(s: str) -> str {
+    return u.b64u_enc(s.p as u64, s.length())
+}
+
+// ---------------------------------------------------------------- mock: tokens
+
+fn seed_of(key: i64, buf: *mut [u8; 32]) {
+    var i: usize = 0
+    while i < 32 {
+        (*buf)[i] = key as u8
+        i = i + 1
+    }
+}
+
+fn pub_of(key: i64) -> str {
+    var sd: [u8; 32] = [0; 32]
+    seed_of(key, &sd)
+    var pk: [u8; 32] = [0; 32]
+    var ctx: ed25519.Ctx = ed25519.ctx_new()
+    if !ed25519.ctx_init(&ctx) { return "" }
+    if !ed25519.ed25519_public(&ctx, (&sd[0]) as u64, (&pk[0]) as u64) { return "" }
+    return u.b64u_enc((&pk[0]) as u64, 32)
+}
+
+fn jwk_of(key: i64) -> str {
+    return "{\"kty\":\"OKP\",\"crv\":\"Ed25519\",\"kid\":\"k" + itoa(key) + "\",\"use\":\"sig\",\"alg\":\"EdDSA\",\"x\":\"" + pub_of(key) + "\"}"
+}
+
+// header.payload signed with `key`; badsig flips one bit; alg_none leaves the signature empty
+fn sign_token(header: str, payload: str, key: i64, badsig: bool, empty_sig: bool) -> str {
+    let msg: str = b64s(header) + "." + b64s(payload)
+    if empty_sig { return msg + "." }
+    var sd: [u8; 32] = [0; 32]
+    seed_of(key, &sd)
+    var sig: [u8; 64] = [0; 64]
+    var ctx: ed25519.Ctx = ed25519.ctx_new()
+    if ed25519.ctx_init(&ctx) {
+        ed25519.ed25519_sign(&ctx, (&sd[0]) as u64, msg.p as u64, msg.length(), (&sig[0]) as u64)
+    }
+    if badsig { sig[10] = sig[10] ^ (1 as u8) }
+    return msg + "." + u.b64u_enc((&sig[0]) as u64, 64)
+}
+
+fn mint_id(ip: *mut Idp, nonce: str, auth_time: i64, sub: str) -> str {
+    let t: i64 = (*ip).tamper
+    let now: i64 = (*ip).now
+    var iss: str = (*ip).issuer
+    if t == T_ISS { iss = "https://evil.example" }
+    var aud: str = "\"" + CID + "\""
+    if t == T_AUD { aud = "\"other-client\"" }
+    if t == T_AZP_BAD || t == T_AZP_OK { aud = "[\"" + CID + "\",\"other-client\"]" }
+    var exp: i64 = now + 900
+    var iat: i64 = now
+    if t == T_EXPIRED {
+        exp = now - 1000
+        iat = now - 1900
+    }
+    var n: str = nonce
+    if t == T_NONCE { n = "not-the-nonce-we-sent" }
+    var p: str = "{\"iss\":\"" + iss + "\",\"aud\":" + aud + ",\"sub\":\"" + sub + "\",\"acc\":\"" + sub +
+        "\",\"uid\":\"u_mock\",\"name\":\"Justin\",\"idp\":\"jarvis\",\"iat\":" + itoa(iat) + ",\"nbf\":" + itoa(iat) +
+        ",\"exp\":" + itoa(exp)
+    if n.length() > 0 && t != T_NO_NONCE { p = p + ",\"nonce\":\"" + n + "\"" }
+    if auth_time > 0 { p = p + ",\"auth_time\":" + itoa(auth_time) }
+    if t == T_AZP_BAD { p = p + ",\"azp\":\"other-client\"" }
+    if t == T_AZP_OK { p = p + ",\"azp\":\"" + CID + "\"" }
+    p = p + "}"
+    var kid: str = "k" + itoa((*ip).sign_key)
+    if t == T_KID { kid = "k9" }
+    var alg: str = "EdDSA"
+    if t == T_ALG_NONE { alg = "none" }
+    if t == T_ALG_HS256 { alg = "HS256" }
+    let h: str = "{\"alg\":\"" + alg + "\",\"typ\":\"JWT\",\"kid\":\"" + kid + "\"}"
+    return sign_token(h, p, (*ip).sign_key, t == T_BADSIG, t == T_ALG_NONE)
+}
+
+fn new_family(ip: *mut Idp) -> str {
+    (*ip).seq = (*ip).seq + 1
+    (*ip).rt_cur = "rt_" + itoa((*ip).seq)
+    (*ip).n_old = 0
+    (*ip).family_dead = false
+    return (*ip).rt_cur
+}
+
+fn rotate_family(ip: *mut Idp) -> str {
+    if (*ip).n_old < 16 {
+        (*ip).rt_old[(*ip).n_old as usize] = (*ip).rt_cur
+        (*ip).n_old = (*ip).n_old + 1
+    }
+    (*ip).seq = (*ip).seq + 1
+    (*ip).rt_cur = "rt_" + itoa((*ip).seq)
+    return (*ip).rt_cur
+}
+
+fn token_json(ip: *mut Idp, nonce: str, auth_time: i64, rtk: str, with_id: bool, sub: str) -> str {
+    (*ip).seq = (*ip).seq + 1
+    var tt: str = "Bearer"
+    if (*ip).tamper == T_TOKTYPE { tt = "mac" }
+    var b: str = "{\"access_token\":\"at_" + itoa((*ip).seq) + "\",\"token_type\":\"" + tt +
+        "\",\"expires_in\":900,\"scope\":\"openid profile\""
+    if rtk.length() > 0 { b = b + ",\"refresh_token\":\"" + rtk + "\"" }
+    if with_id && (*ip).tamper != T_NO_ID {
+        b = b + ",\"id_token\":\"" + mint_id(ip, nonce, auth_time, sub) + "\""
+    }
+    return b + "}"
+}
+
+fn reply(rs: *mut tp.HttpResp, status: i64, body: str) {
+    (*rs).status = status
+    (*rs).body = body
+}
+
+fn oauth_error(rs: *mut tp.HttpResp, code: str) {
+    reply(rs, 400, "{\"error\":\"" + code + "\"}")
+}
+
+// ---------------------------------------------------------------- mock: the "browser" at /authorize
+
+// What the user's browser does: the provider checks the request, makes a code, redirects back.
+fn browse(ip: *mut Idp, url: str) -> str {
+    let q: str = u.split_query(url)
+    if u.strip_query(url) != (*ip).issuer + "/authorize" { return "ERR:path" }
+    if u.query_get(q, "response_type") != "code" { return "ERR:response_type" }
+    if u.query_get(q, "client_id") != CID { return "ERR:client" }
+    if u.query_get(q, "redirect_uri") != REDIR { return "ERR:redirect" }
+    if u.query_get(q, "code_challenge_method") != "S256" { return "ERR:method" }
+    if u.query_get(q, "code_challenge").length() < 43 { return "ERR:challenge" }
+    if u.query_get(q, "state").length() == 0 || u.query_get(q, "nonce").length() == 0 { return "ERR:state" }
+    if (*ip).ncodes >= 16 { return "ERR:full" }
+    (*ip).seq = (*ip).seq + 1
+    var c: Code = code_empty()
+    c.code = "code_" + itoa((*ip).seq)
+    c.challenge = u.query_get(q, "code_challenge")
+    c.nonce = u.query_get(q, "nonce")
+    c.redirect = u.query_get(q, "redirect_uri")
+    c.client = u.query_get(q, "client_id")
+    let fresh: bool = (u.query_get(q, "prompt") == "login" || u.query_get(q, "max_age") == "0") && !(*ip).ign_prompt
+    if fresh {
+        c.auth_time = (*ip).now
+    } else {
+        c.auth_time = (*ip).now - 7200
+    }
+    if (*ip).no_auth_time { c.auth_time = 0 }
+    (*ip).codes[(*ip).ncodes as usize] = c
+    (*ip).ncodes = (*ip).ncodes + 1
+    return mkred(REDIR, c.code, u.query_get(q, "state"), (*ip).issuer)
+}
+
+// the URL the browser lands on; code/state/iss "" = leave the parameter out
+fn mkred(base: str, code: str, state: str, iss: str) -> str {
+    var q: str = ""
+    if code.length() > 0 { q = u.join_kv(q, u.kv("code", code)) }
+    if state.length() > 0 { q = u.join_kv(q, u.kv("state", state)) }
+    if iss.length() > 0 { q = u.join_kv(q, u.kv("iss", iss)) }
+    return base + "?" + q
+}
+
+fn code_of(red: str) -> str {
+    return u.query_get(u.split_query(red), "code")
+}
+
+// ---------------------------------------------------------------- mock: the transport
+
+fn jwks_doc(ip: *mut Idp) -> str {
+    let m: i64 = (*ip).jwks_mode
+    if m == 1 { return "{\"keys\":[" + jwk_of(1) + "]}" }
+    if m == 2 { return "{\"keys\":[" + jwk_of(1) + "," + jwk_of(2) + "]}" }
+    if m == 3 { return "{\"keys\":[" + jwk_of(2) + "]}" }
+    return "{\"keys\":[]}"
+}
+
+fn disc_doc(ip: *mut Idp) -> str {
+    let iss: str = (*ip).issuer
+    var shown: str = iss
+    if (*ip).disc_issuer.length() > 0 { shown = (*ip).disc_issuer }
+    var tokep: str = iss + "/token"
+    if (*ip).disc_http { tokep = "http://evil.mock.test/token" }
+    var d: str = "{\"issuer\":\"" + shown + "\",\"authorization_endpoint\":\"" + iss + "/authorize\",\"token_endpoint\":\"" +
+        tokep + "\",\"jwks_uri\":\"" + iss + "/jwks\""
+    if (*ip).disc_device { d = d + ",\"device_authorization_endpoint\":\"" + iss + "/device\"" }
+    if (*ip).disc_revoke {
+        d = d + ",\"revocation_endpoint\":\"" + iss + "/revoke\",\"end_session_endpoint\":\"" + iss + "/logout\""
+    }
+    if (*ip).disc_pkce == 1 { d = d + ",\"code_challenge_methods_supported\":[\"S256\",\"plain\"]" }
+    if (*ip).disc_pkce == 2 { d = d + ",\"code_challenge_methods_supported\":[\"plain\"]" }
+    return d + "}"
+}
+
+fn handle_code_grant(ip: *mut Idp, body: str, rs: *mut tp.HttpResp) {
+    let code: str = u.query_get(body, "code")
+    var idx: i64 = 0 - 1
+    var i: i64 = 0
+    while i < (*ip).ncodes {
+        if (*ip).codes[i as usize].code == code { idx = i }
+        i = i + 1
+    }
+    if idx < 0 {
+        oauth_error(rs, "invalid_grant")
+        return
+    }
+    let c: Code = (*ip).codes[idx as usize]
+    if c.used {
+        (*ip).family_dead = true // RFC 6749 4.1.2: a replayed code kills what it issued
+        oauth_error(rs, "invalid_grant")
+        return
+    }
+    (*ip).codes[idx as usize].used = true
+    if u.query_get(body, "redirect_uri") != c.redirect || u.query_get(body, "client_id") != c.client {
+        oauth_error(rs, "invalid_grant")
+        return
+    }
+    let ver: str = u.query_get(body, "code_verifier")
+    if ver.length() == 0 || u.sha256_b64u(ver) != c.challenge {
+        oauth_error(rs, "invalid_grant")
+        return
+    }
+    let rtk: str = new_family(ip)
+    reply(rs, 200, token_json(ip, c.nonce, c.auth_time, rtk, true, (*ip).sub))
+}
+
+fn handle_refresh(ip: *mut Idp, body: str, rs: *mut tp.HttpResp) {
+    let rtk: str = u.query_get(body, "refresh_token")
+    if (*ip).family_dead {
+        oauth_error(rs, "invalid_grant")
+        return
+    }
+    if rtk != (*ip).rt_cur {
+        var i: i64 = 0
+        while i < (*ip).n_old {
+            if (*ip).rt_old[i as usize] == rtk && rtk.length() > 0 { (*ip).family_dead = true } // reuse: the family dies
+            i = i + 1
+        }
+        oauth_error(rs, "invalid_grant")
+        return
+    }
+    var out_rt: str = ""
+    if (*ip).refresh_mode == 0 { out_rt = rotate_family(ip) }
+    var sub: str = (*ip).sub
+    if (*ip).refresh_sub.length() > 0 { sub = (*ip).refresh_sub }
+    reply(rs, 200, token_json(ip, "", 0, out_rt, (*ip).refresh_id, sub))
+}
+
+fn handle_device_grant(ip: *mut Idp, body: str, rs: *mut tp.HttpResp) {
+    (*ip).n_polls = (*ip).n_polls + 1
+    if u.query_get(body, "device_code") != "dc_1" || u.query_get(body, "client_id") != CID {
+        oauth_error(rs, "invalid_grant")
+        return
+    }
+    let st: i64 = (*ip).dev_state
+    if st == 0 { oauth_error(rs, "authorization_pending") }
+    if st == 1 { oauth_error(rs, "slow_down") }
+    if st == 3 { oauth_error(rs, "access_denied") }
+    if st == 4 { oauth_error(rs, "expired_token") }
+    if st == 2 {
+        let rtk: str = new_family(ip)
+        reply(rs, 200, token_json(ip, "", (*ip).now, rtk, true, (*ip).sub))
+    }
+}
+
+fn idp_tx(rq: *mut tp.HttpReq, rs: *mut tp.HttpResp) -> bool {
+    let ip: *mut Idp = G_IDP as *mut Idp
+    (*ip).n_req = (*ip).n_req + 1
+    (*ip).last_url = (*rq).url
+    (*ip).last_body = (*rq).body
+    (*ip).last_headers = (*rq).headers
+    if (*ip).net_fail { return false }
+    let path: str = path_of((*rq).url)
+    reply(rs, 404, "")
+    if path == "/.well-known/openid-configuration" {
+        (*ip).n_disc = (*ip).n_disc + 1
+        if (*ip).disc_status != 0 {
+            reply(rs, (*ip).disc_status, "")
+        } else {
+            reply(rs, 200, disc_doc(ip))
+        }
+    } else if path == "/jwks" {
+        (*ip).n_jwks = (*ip).n_jwks + 1
+        if (*ip).jwks_mode == 0 {
+            reply(rs, 500, "oops")
+        } else {
+            reply(rs, 200, jwks_doc(ip))
+        }
+    } else if path == "/token" {
+        (*ip).n_token = (*ip).n_token + 1
+        let gt: str = u.query_get((*rq).body, "grant_type")
+        if (*ip).token_http == 500 {
+            reply(rs, 500, "upstream error")
+        } else if (*ip).token_http == 2 {
+            reply(rs, 200, "<html>not json</html>")
+        } else if (*ip).token_http == 3 {
+            oauth_error(rs, "invalid_request")
+        } else if gt == "authorization_code" {
+            handle_code_grant(ip, (*rq).body, rs)
+        } else if gt == "refresh_token" {
+            handle_refresh(ip, (*rq).body, rs)
+        } else if gt == device.GRANT_DEVICE {
+            handle_device_grant(ip, (*rq).body, rs)
+        } else {
+            oauth_error(rs, "unsupported_grant_type")
+        }
+    } else if path == "/device" {
+        (*ip).n_dev = (*ip).n_dev + 1
+        if (*ip).dev_break == 2 {
+            oauth_error(rs, "invalid_client")
+        } else if (*ip).dev_break == 1 {
+            reply(rs, 200, "{\"device_code\":\"dc_1\",\"verification_uri\":\"" + (*ip).issuer + "/device\",\"expires_in\":600}")
+        } else {
+            reply(rs, 200, "{\"device_code\":\"dc_1\",\"user_code\":\"ABCD-EFGH\",\"verification_uri\":\"" + (*ip).issuer +
+                "/device\",\"verification_uri_complete\":\"" + (*ip).issuer + "/device?user_code=ABCD-EFGH\",\"expires_in\":600,\"interval\":5}")
+        }
+    } else if path == "/revoke" {
+        (*ip).n_revoke = (*ip).n_revoke + 1
+        (*ip).revoked = (*ip).revoked + u.query_get((*rq).body, "token") + ","
+        reply(rs, 200, "")
+    } else if path == "/unlink" {
+        (*ip).n_unlink = (*ip).n_unlink + 1
+        var st: i64 = (*ip).unlink_status
+        if st == 0 { st = 200 }
+        reply(rs, st, "{}")
+    } else if path == "/login" {
+        // the password fallback: JSON {name, password, client_id}
+        if has((*rq).body, "\"password\":\"pw-ok\"") && has((*rq).body, "\"client_id\":\"" + CID + "\"") {
+            let rtk: str = new_family(ip)
+            reply(rs, 200, token_json(ip, "", (*ip).now, rtk, true, (*ip).sub))
+        } else {
+            reply(rs, 401, "{\"error\":\"invalid_grant\"}")
+        }
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- scenario helpers
+
+fn reset(ip: *mut Idp) {
+    *ip = idp_new()
+}
+
+fn mkc(ip: *mut Idp) -> oidc.Client {
+    var c: oidc.Client = oidc.client_new(ISS, CID, tx())
+    oidc.client_set_scope(&c, "openid profile")
+    (*ip).now = NOW
+    if oidc.discover(&c, NOW) != oidc.L_OK { out_line("FAIL mkc: discover") }
+    return c
+}
+
+// begin + the browser; returns the URL the browser lands on
+fn start(c: *mut oidc.Client, ip: *mut Idp, p: *mut oidc.Pending, extra: str, now: i64) -> str {
+    oidc.begin(c, REDIR, extra, now, p)
+    return browse(ip, (*p).url)
+}
+
+// ---------------------------------------------------------------- groups
+
+fn g_discovery(ip: *mut Idp) -> i32 {
+    var bad: i32 = 0 as i32
+    reset(ip)
+    var c: oidc.Client = oidc.client_new(ISS, CID, tx())
+    ci(&bad, oidc.discover(&c, NOW), oidc.L_OK, "discover ok")
+    cs(&bad, c.token_endpoint, ISS + "/token", "token endpoint")
+    cs(&bad, c.device_endpoint, ISS + "/device", "device endpoint")
+    cs(&bad, c.revocation_endpoint, ISS + "/revoke", "revocation endpoint")
+    ci(&bad, (*ip).n_jwks, 1, "discovery loads the JWKS once")
+    ck(&bad, c.discovered, "discovered flag")
+    // the issuer in the document is not the configured one
+    reset(ip)
+    (*ip).disc_issuer = "https://other.mock.test"
+    var c2: oidc.Client = oidc.client_new(ISS, CID, tx())
+    ci(&bad, oidc.discover(&c2, NOW), oidc.L_ISS, "discovery issuer mismatch")
+    ck(&bad, !c2.discovered && c2.token_endpoint.length() == 0, "mismatch leaves the client untouched")
+    ci(&bad, (*ip).n_jwks, 0, "mismatch fetches no keys")
+    // an endpoint that is http on a non-loopback host
+    reset(ip)
+    (*ip).disc_http = true
+    var c3: oidc.Client = oidc.client_new(ISS, CID, tx())
+    ci(&bad, oidc.discover(&c3, NOW), oidc.L_CONFIG, "http token endpoint refused")
+    // PKCE: only plain offered / S256 listed
+    reset(ip)
+    (*ip).disc_pkce = 2
+    var c4: oidc.Client = oidc.client_new(ISS, CID, tx())
+    ci(&bad, oidc.discover(&c4, NOW), oidc.L_CONFIG, "plain-only provider refused")
+    reset(ip)
+    (*ip).disc_pkce = 1
+    var c5: oidc.Client = oidc.client_new(ISS, CID, tx())
+    ci(&bad, oidc.discover(&c5, NOW), oidc.L_OK, "S256 listed")
+    // HTTP 404, no answer
+    reset(ip)
+    (*ip).disc_status = 404
+    var c6: oidc.Client = oidc.client_new(ISS, CID, tx())
+    ci(&bad, oidc.discover(&c6, NOW), oidc.L_HTTP, "discovery 404")
+    reset(ip)
+    (*ip).net_fail = true
+    var c7: oidc.Client = oidc.client_new(ISS, CID, tx())
+    ci(&bad, oidc.discover(&c7, NOW), oidc.L_NET, "discovery without answer")
+    // an unusable JWKS document
+    reset(ip)
+    (*ip).jwks_mode = 9
+    var c8: oidc.Client = oidc.client_new(ISS, CID, tx())
+    ci(&bad, oidc.discover(&c8, NOW), oidc.L_PROTOCOL, "junk JWKS")
+    reset(ip)
+    (*ip).jwks_mode = 0
+    var c9: oidc.Client = oidc.client_new(ISS, CID, tx())
+    ci(&bad, oidc.discover(&c9, NOW), oidc.L_NET, "JWKS HTTP 500")
+    // the endpoint rule: http only on loopback; the transport is not even called
+    reset(ip)
+    var c10: oidc.Client = oidc.client_new("http://id.mock.test", CID, tx())
+    ci(&bad, oidc.discover(&c10, NOW), oidc.L_CONFIG, "http issuer on a real host")
+    ci(&bad, (*ip).n_req, 0, "refused before the transport")
+    var tt: tp.Transport = tx()
+    let rr: tp.HttpResp = tp.get(&tt, "http://evil.example/x", "")
+    ck(&bad, !rr.ok && rr.net_err == tp.NE_REFUSED, "transport refuses http://evil.example")
+    ci(&bad, (*ip).n_req, 0, "still no request")
+    reset(ip)
+    (*ip).issuer = "http://127.0.0.1:8470"
+    var c11: oidc.Client = oidc.client_new("http://127.0.0.1:8470", CID, tx())
+    ci(&bad, oidc.discover(&c11, NOW), oidc.L_OK, "loopback http is fine")
+    return bad
+}
+
+fn g_begin(ip: *mut Idp) -> i32 {
+    var bad: i32 = 0 as i32
+    reset(ip)
+    var c: oidc.Client = mkc(ip)
+    var p: oidc.Pending = oidc.pending_new()
+    ci(&bad, oidc.begin(&c, REDIR, "", NOW, &p), oidc.L_OK, "begin")
+    ck(&bad, p.ok && !p.used && !p.fresh, "pending state")
+    ck(&bad, has(p.url, ISS + "/authorize?response_type=code&"), "authorize url")
+    ck(&bad, has(p.url, "client_id=" + CID), "client_id in url")
+    ck(&bad, has(p.url, "redirect_uri=https%3A%2F%2Fchat.mock.test%2Fcb"), "redirect_uri encoded")
+    ck(&bad, has(p.url, "scope=openid%20profile"), "scope")
+    ck(&bad, has(p.url, "code_challenge_method=S256"), "S256")
+    ck(&bad, has(p.url, "code_challenge=" + u.sha256_b64u(p.verifier)), "challenge = S256(verifier)")
+    ck(&bad, !has(p.url, p.verifier), "the verifier is not in the url")
+    ck(&bad, has(p.url, "state=" + p.state) && has(p.url, "nonce=" + p.nonce), "state + nonce in url")
+    ck(&bad, p.state.length() >= 32 && p.nonce.length() >= 32 && p.verifier.length() >= 43, "entropy lengths")
+    var p2: oidc.Pending = oidc.pending_new()
+    oidc.begin(&c, REDIR, "", NOW, &p2)
+    ck(&bad, p.state != p2.state && p.nonce != p2.nonce && p.verifier != p2.verifier, "fresh secrets per attempt")
+    var p3: oidc.Pending = oidc.pending_new()
+    ci(&bad, oidc.begin(&c, REDIR + "#frag", "", NOW, &p3), oidc.L_CONFIG, "fragment in redirect_uri")
+    ck(&bad, !p3.ok, "failed begin leaves no pending")
+    ci(&bad, oidc.begin(&c, "", "", NOW, &p3), oidc.L_CONFIG, "empty redirect_uri")
+    var undiscovered: oidc.Client = oidc.client_new(ISS, CID, tx())
+    ci(&bad, oidc.begin(&undiscovered, REDIR, "", NOW, &p3), oidc.L_CONFIG, "begin without discovery")
+    oidc.begin(&c, REDIR, "prompt=login", NOW, &p3)
+    ck(&bad, p3.fresh, "prompt=login is fresh")
+    oidc.begin(&c, REDIR, "max_age=0", NOW, &p3)
+    ck(&bad, p3.fresh, "max_age=0 is fresh")
+    oidc.begin(&c, REDIR, "prompt=none", NOW, &p3)
+    ck(&bad, !p3.fresh, "prompt=none is not fresh")
+    return bad
+}
+
+fn redirect_case(ip: *mut Idp, base: str) -> i64 {
+    var c: oidc.Client = mkc(ip)
+    var p: oidc.Pending = oidc.pending_new()
+    let red: str = start(&c, ip, &p, "", NOW)
+    let l: oidc.Login = oidc.finish(&c, &p, mkred(base, code_of(red), p.state, ISS), NOW)
+    return l.reason
+}
+
+fn g_code(ip: *mut Idp) -> i32 {
+    var bad: i32 = 0 as i32
+    // ---- happy path
+    reset(ip)
+    var c: oidc.Client = mkc(ip)
+    var p: oidc.Pending = oidc.pending_new()
+    let red: str = start(&c, ip, &p, "", NOW)
+    ck(&bad, has(red, REDIR + "?code=code_"), "browser redirect")
+    var pcopy: oidc.Pending = p // an attacker's copy of the same attempt
+    let l: oidc.Login = oidc.finish(&c, &p, red, NOW)
+    ci(&bad, l.reason, oidc.L_OK, "finish ok")
+    ck(&bad, l.has_id && l.claims.sub == "acc_mock1" && l.claims.acc == "acc_mock1", "claims")
+    cs(&bad, l.claims.nonce, p.nonce, "nonce comes back")
+    ck(&bad, u.starts_with(l.tokens.access_token, "at_") && u.starts_with(l.tokens.refresh_token, "rt_"), "tokens")
+    ci(&bad, l.tokens.expires_at, NOW + 900, "expires_at")
+    cs(&bad, l.tokens.token_type, "bearer", "token_type")
+    ci(&bad, (*ip).n_token, 1, "one token request")
+    ck(&bad, has((*ip).last_body, "grant_type=authorization_code") && has((*ip).last_body, "code_verifier=" + p.verifier), "token request: grant + verifier")
+    ck(&bad, has((*ip).last_body, "redirect_uri=" + u.pct_enc(REDIR)) && has((*ip).last_body, "client_id=" + CID), "token request: redirect_uri + client_id")
+    ck(&bad, !has((*ip).last_body, "client_secret"), "public client sends no secret")
+    // ---- a Pending is spent
+    let l2: oidc.Login = oidc.finish(&c, &p, red, NOW)
+    ci(&bad, l2.reason, oidc.L_REPLAY, "second finish = replay")
+    ci(&bad, (*ip).n_token, 1, "replay sends nothing")
+    // ---- the code twice (copy of the attempt, same verifier): the server refuses and kills the family
+    let l3: oidc.Login = oidc.finish(&c, &pcopy, red, NOW)
+    ci(&bad, l3.reason, oidc.L_GRANT, "code used twice")
+    cs(&bad, l3.detail, "invalid_grant", "code twice: detail")
+    ck(&bad, (*ip).family_dead, "code twice kills the family")
+    // ---- state
+    reset(ip)
+    c = mkc(ip)
+    var ps: oidc.Pending = oidc.pending_new()
+    let rs: str = start(&c, ip, &ps, "", NOW)
+    let lw: oidc.Login = oidc.finish(&c, &ps, mkred(REDIR, code_of(rs), "forged-state", ISS), NOW)
+    ci(&bad, lw.reason, oidc.L_STATE, "wrong state")
+    ci(&bad, (*ip).n_token, 0, "wrong state: nothing sent")
+    ci(&bad, oidc.finish(&c, &ps, rs, NOW).reason, oidc.L_REPLAY, "wrong state still spends the pending")
+    var pm: oidc.Pending = oidc.pending_new()
+    let rm: str = start(&c, ip, &pm, "", NOW)
+    ci(&bad, oidc.finish(&c, &pm, mkred(REDIR, code_of(rm), "", ISS), NOW).reason, oidc.L_STATE, "missing state")
+    // ---- redirect_uri compared exactly
+    ci(&bad, redirect_case(ip, "https://chat.mock.test/cb2"), oidc.L_REDIRECT, "redirect: other path")
+    ci(&bad, redirect_case(ip, "https://evil.mock.test/cb"), oidc.L_REDIRECT, "redirect: other host")
+    ci(&bad, redirect_case(ip, "https://chat.mock.test/cb/"), oidc.L_REDIRECT, "redirect: trailing slash")
+    ci(&bad, redirect_case(ip, "http://chat.mock.test/cb"), oidc.L_REDIRECT, "redirect: other scheme")
+    ci(&bad, redirect_case(ip, "https://chat.mock.test/cb/evil"), oidc.L_REDIRECT, "redirect: prefix match")
+    ci(&bad, redirect_case(ip, REDIR), oidc.L_OK, "redirect: the exact one")
+    // ---- iss parameter (RFC 9207)
+    reset(ip)
+    c = mkc(ip)
+    var pi: oidc.Pending = oidc.pending_new()
+    let ri: str = start(&c, ip, &pi, "", NOW)
+    ci(&bad, oidc.finish(&c, &pi, mkred(REDIR, code_of(ri), pi.state, "https://evil.example"), NOW).reason, oidc.L_ISS, "wrong iss parameter")
+    var pi2: oidc.Pending = oidc.pending_new()
+    let ri2: str = start(&c, ip, &pi2, "", NOW)
+    ci(&bad, oidc.finish(&c, &pi2, mkred(REDIR, code_of(ri2), pi2.state, ""), NOW).reason, oidc.L_OK, "no iss parameter is fine")
+    // ---- error answers in the redirect
+    var pe: oidc.Pending = oidc.pending_new()
+    start(&c, ip, &pe, "", NOW)
+    let ld: oidc.Login = oidc.finish(&c, &pe, REDIR + "?error=access_denied&state=" + u.pct_enc(pe.state), NOW)
+    ci(&bad, ld.reason, oidc.L_DENIED, "access_denied")
+    start(&c, ip, &pe, "", NOW)
+    let le: oidc.Login = oidc.finish(&c, &pe, REDIR + "?error=server_error&state=" + u.pct_enc(pe.state), NOW)
+    ci(&bad, le.reason, oidc.L_ERROR, "server_error")
+    cs(&bad, le.detail, "server_error", "server_error detail")
+    start(&c, ip, &pe, "", NOW)
+    ci(&bad, oidc.finish(&c, &pe, REDIR + "?error=invalid_grant&state=" + u.pct_enc(pe.state), NOW).reason, oidc.L_ERROR, "error=invalid_grant in the redirect is no token grant")
+    start(&c, ip, &pe, "", NOW)
+    ci(&bad, oidc.finish(&c, &pe, REDIR + "?error=access_denied&state=forged", NOW).reason, oidc.L_STATE, "error with wrong state: state first")
+    start(&c, ip, &pe, "", NOW)
+    ci(&bad, oidc.finish(&c, &pe, REDIR + "?state=" + u.pct_enc(pe.state), NOW).reason, oidc.L_PROTOCOL, "no code")
+    var pn: oidc.Pending = oidc.pending_new()
+    ci(&bad, oidc.finish(&c, &pn, red, NOW).reason, oidc.L_CONFIG, "finish without begin")
+    // ---- PKCE: a wrong verifier
+    reset(ip)
+    c = mkc(ip)
+    var pk: oidc.Pending = oidc.pending_new()
+    let rk: str = start(&c, ip, &pk, "", NOW)
+    pk.verifier = "wrong-verifier-wrong-verifier-wrong-verifier-1234"
+    let lk: oidc.Login = oidc.finish(&c, &pk, rk, NOW)
+    ci(&bad, lk.reason, oidc.L_GRANT, "wrong PKCE verifier")
+    cs(&bad, lk.detail, "invalid_grant", "wrong PKCE verifier: detail")
+    // ---- confidential client sends its secret
+    reset(ip)
+    c = mkc(ip)
+    oidc.client_set_secret(&c, "s3cret")
+    var pc: oidc.Pending = oidc.pending_new()
+    let rc: str = start(&c, ip, &pc, "", NOW)
+    ci(&bad, oidc.finish(&c, &pc, rc, NOW).reason, oidc.L_OK, "confidential client")
+    ck(&bad, has((*ip).last_body, "client_secret=s3cret"), "secret in the token request")
+    // ---- token endpoint trouble
+    reset(ip)
+    c = mkc(ip)
+    var pt: oidc.Pending = oidc.pending_new()
+    let rtk: str = start(&c, ip, &pt, "", NOW)
+    (*ip).token_http = 500
+    ci(&bad, oidc.finish(&c, &pt, rtk, NOW).reason, oidc.L_HTTP, "token endpoint 500")
+    (*ip).token_http = 2
+    start(&c, ip, &pt, "", NOW)
+    ci(&bad, oidc.finish(&c, &pt, mkred(REDIR, "x", pt.state, ISS), NOW).reason, oidc.L_PROTOCOL, "200 without JSON")
+    (*ip).token_http = 3
+    start(&c, ip, &pt, "", NOW)
+    let lq: oidc.Login = oidc.finish(&c, &pt, mkred(REDIR, "x", pt.state, ISS), NOW)
+    ci(&bad, lq.reason, oidc.L_ERROR, "invalid_request")
+    cs(&bad, lq.detail, "invalid_request", "invalid_request detail")
+    (*ip).token_http = 0
+    let rn: str = start(&c, ip, &pt, "", NOW)
+    (*ip).net_fail = true
+    ci(&bad, oidc.finish(&c, &pt, rn, NOW).reason, oidc.L_NET, "token endpoint unreachable")
+    return bad
+}
+
+fn id_case(ip: *mut Idp, mode: i64, want: i64, detail: str, name: str) -> i32 {
+    var bad: i32 = 0 as i32
+    reset(ip)
+    (*ip).tamper = mode
+    var c: oidc.Client = mkc(ip)
+    var p: oidc.Pending = oidc.pending_new()
+    let red: str = start(&c, ip, &p, "", NOW)
+    let l: oidc.Login = oidc.finish(&c, &p, red, NOW)
+    ci(&bad, l.reason, want, name)
+    cs(&bad, l.detail, detail, name + " detail")
+    return bad
+}
+
+fn g_idtoken(ip: *mut Idp) -> i32 {
+    var bad: i32 = 0 as i32
+    bad = bad + id_case(ip, T_NONE, oidc.L_OK, "", "id_token: honest")
+    bad = bad + id_case(ip, T_NONCE, oidc.L_NONCE, "", "id_token: wrong nonce")
+    bad = bad + id_case(ip, T_NO_NONCE, oidc.L_NONCE, "", "id_token: no nonce")
+    bad = bad + id_case(ip, T_ALG_NONE, oidc.L_ID_TOKEN, "alg", "id_token: alg none")
+    bad = bad + id_case(ip, T_ALG_HS256, oidc.L_ID_TOKEN, "alg", "id_token: alg swapped to HS256")
+    bad = bad + id_case(ip, T_EXPIRED, oidc.L_ID_TOKEN, "expired", "id_token: expired")
+    bad = bad + id_case(ip, T_ISS, oidc.L_ID_TOKEN, "iss", "id_token: wrong iss")
+    bad = bad + id_case(ip, T_AUD, oidc.L_ID_TOKEN, "aud", "id_token: wrong aud")
+    bad = bad + id_case(ip, T_KID, oidc.L_ID_TOKEN, "kid", "id_token: unknown kid")
+    bad = bad + id_case(ip, T_BADSIG, oidc.L_ID_TOKEN, "sig", "id_token: bad signature")
+    bad = bad + id_case(ip, T_NO_ID, oidc.L_ID_TOKEN, "missing", "id_token: none in the answer")
+    bad = bad + id_case(ip, T_AZP_BAD, oidc.L_ID_TOKEN, "azp", "id_token: two audiences, azp not ours")
+    bad = bad + id_case(ip, T_AZP_OK, oidc.L_OK, "", "id_token: two audiences, azp ours")
+    bad = bad + id_case(ip, T_TOKTYPE, oidc.L_PROTOCOL, "", "token_type mac")
+    return bad
+}
+
+fn g_rotation(ip: *mut Idp) -> i32 {
+    var bad: i32 = 0 as i32
+    // ---- an unknown kid earns exactly ONE refetch, then the brake holds
+    reset(ip)
+    (*ip).tamper = T_KID
+    var c: oidc.Client = mkc(ip)
+    ci(&bad, (*ip).n_jwks, 1, "rotation: discovery fetch")
+    (*ip).now = NOW + 60
+    var p: oidc.Pending = oidc.pending_new()
+    let red: str = start(&c, ip, &p, "", NOW + 60)
+    let l: oidc.Login = oidc.finish(&c, &p, red, NOW + 60)
+    ci(&bad, l.reason, oidc.L_ID_TOKEN, "unknown kid refused")
+    ci(&bad, (*ip).n_jwks, 2, "unknown kid: one refetch")
+    (*ip).now = NOW + 61
+    var p2: oidc.Pending = oidc.pending_new()
+    let red2: str = start(&c, ip, &p2, "", NOW + 61)
+    oidc.finish(&c, &p2, red2, NOW + 61)
+    ci(&bad, (*ip).n_jwks, 2, "refetch brake: no second fetch within 30 s")
+    // ---- the provider rotates to k2: the client learns it by the refetch
+    reset(ip)
+    c = mkc(ip) // keys {k1}
+    (*ip).jwks_mode = 3 // now only k2
+    (*ip).sign_key = 2
+    (*ip).now = NOW + 60
+    var p3: oidc.Pending = oidc.pending_new()
+    let red3: str = start(&c, ip, &p3, "", NOW + 60)
+    let l3: oidc.Login = oidc.finish(&c, &p3, red3, NOW + 60)
+    ci(&bad, l3.reason, oidc.L_OK, "rotation to k2")
+    ci(&bad, (*ip).n_jwks, 2, "rotation: one refetch")
+    ck(&bad, jwks.keyset_has_kid(&c.cfg.keys, "k2") && !jwks.keyset_has_kid(&c.cfg.keys, "k1"), "key set replaced")
+    // the retired key no longer works
+    (*ip).sign_key = 1
+    (*ip).now = NOW + 100
+    var p4: oidc.Pending = oidc.pending_new()
+    let red4: str = start(&c, ip, &p4, "", NOW + 100)
+    let l4: oidc.Login = oidc.finish(&c, &p4, red4, NOW + 100)
+    ci(&bad, l4.reason, oidc.L_ID_TOKEN, "retired key k1")
+    cs(&bad, l4.detail, "kid", "retired key detail")
+    // ---- an expired cache refetches by itself
+    reset(ip)
+    c = mkc(ip)
+    (*ip).now = NOW + 700
+    var p5: oidc.Pending = oidc.pending_new()
+    let red5: str = start(&c, ip, &p5, "", NOW + 700)
+    let l5: oidc.Login = oidc.finish(&c, &p5, red5, NOW + 700)
+    ci(&bad, l5.reason, oidc.L_OK, "expired key cache: refetch then accept")
+    ci(&bad, (*ip).n_jwks, 2, "expired key cache: one fetch")
+    // ---- expired cache and a JWKS endpoint that fails: refuse
+    reset(ip)
+    c = mkc(ip)
+    (*ip).now = NOW + 700
+    (*ip).jwks_mode = 0
+    var p6: oidc.Pending = oidc.pending_new()
+    let red6: str = start(&c, ip, &p6, "", NOW + 700)
+    let l6: oidc.Login = oidc.finish(&c, &p6, red6, NOW + 700)
+    ci(&bad, l6.reason, oidc.L_ID_TOKEN, "expired cache + dead JWKS endpoint")
+    cs(&bad, l6.detail, jwt.reason_name(jwt.JWT_KEYEXPIRED), "expired cache: detail")
+    return bad
+}
+
+fn g_device(ip: *mut Idp) -> i32 {
+    var bad: i32 = 0 as i32
+    reset(ip)
+    var c: oidc.Client = mkc(ip)
+    var da: device.DeviceAuth = device.device_new()
+    ci(&bad, device.start(&c, NOW, &da), oidc.L_OK, "device start")
+    cs(&bad, da.user_code, "ABCD-EFGH", "user_code")
+    cs(&bad, da.verification_uri, ISS + "/device", "verification_uri")
+    ck(&bad, da.ok && da.interval == 5 && da.expires_in == 600, "device interval + expiry")
+    ck(&bad, has((*ip).last_body, "client_id=" + CID) && has((*ip).last_body, "scope=openid%20profile"), "device request body")
+    // too early: no request
+    let e1: oidc.Login = device.poll(&c, &da, NOW + 2)
+    ci(&bad, e1.reason, oidc.L_PENDING, "poll too early")
+    cs(&bad, e1.detail, "too_early", "too early detail")
+    ci(&bad, (*ip).n_polls, 0, "too early sends nothing")
+    ci(&bad, device.wait_secs(&da, NOW + 2), 3, "wait_secs")
+    // pending
+    let e2: oidc.Login = device.poll(&c, &da, NOW + 5)
+    ci(&bad, e2.reason, oidc.L_PENDING, "authorization_pending")
+    cs(&bad, e2.detail, "authorization_pending", "pending detail")
+    ci(&bad, (*ip).n_polls, 1, "one poll sent")
+    ci(&bad, da.interval, 5, "interval unchanged")
+    ck(&bad, has((*ip).last_body, "device_code=dc_1") && has((*ip).last_body, "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"), "poll body")
+    // slow_down: +5 s
+    (*ip).dev_state = 1
+    ci(&bad, device.poll(&c, &da, NOW + 10).reason, oidc.L_SLOW_DOWN, "slow_down")
+    ci(&bad, da.interval, 10, "interval grows by 5")
+    ci(&bad, device.wait_secs(&da, NOW + 10), 10, "wait after slow_down")
+    ci(&bad, device.poll(&c, &da, NOW + 15).reason, oidc.L_PENDING, "old interval is not enough any more")
+    ci(&bad, (*ip).n_polls, 2, "that early poll sent nothing")
+    // approved
+    (*ip).dev_state = 2
+    (*ip).now = NOW + 20
+    let ok: oidc.Login = device.poll(&c, &da, NOW + 20)
+    ci(&bad, ok.reason, oidc.L_OK, "device approved")
+    ck(&bad, ok.has_id && ok.claims.sub == "acc_mock1" && u.starts_with(ok.tokens.refresh_token, "rt_"), "device tokens + id_token")
+    ck(&bad, !da.ok, "device code is spent")
+    let sp: oidc.Login = device.poll(&c, &da, NOW + 40)
+    ci(&bad, sp.reason, oidc.L_CONFIG, "polling a spent device code")
+    cs(&bad, sp.detail, "no_device_auth", "spent detail")
+    // denied
+    (*ip).dev_state = 3
+    device.start(&c, NOW, &da)
+    ci(&bad, device.poll(&c, &da, NOW + 5).reason, oidc.L_DENIED, "access_denied")
+    ck(&bad, !da.ok, "denied: spent")
+    // expired at the server
+    (*ip).dev_state = 4
+    device.start(&c, NOW, &da)
+    let ex: oidc.Login = device.poll(&c, &da, NOW + 5)
+    ci(&bad, ex.reason, oidc.L_EXPIRED, "expired_token")
+    cs(&bad, ex.detail, "expired_token", "expired detail")
+    // local timeout without a request
+    (*ip).dev_state = 0
+    device.start(&c, NOW, &da)
+    let polls: i64 = (*ip).n_polls
+    let lt: oidc.Login = device.poll(&c, &da, NOW + 600)
+    ci(&bad, lt.reason, oidc.L_EXPIRED, "local timeout")
+    cs(&bad, lt.detail, "local_timeout", "local timeout detail")
+    ci(&bad, (*ip).n_polls, polls, "local timeout sends nothing")
+    // start trouble
+    (*ip).dev_break = 2
+    ci(&bad, device.start(&c, NOW, &da), oidc.L_HTTP, "device endpoint 400")
+    ck(&bad, !da.ok, "failed start: no device auth")
+    (*ip).dev_break = 1
+    ci(&bad, device.start(&c, NOW, &da), oidc.L_PROTOCOL, "device answer without user_code")
+    (*ip).dev_break = 0
+    (*ip).net_fail = true
+    ci(&bad, device.start(&c, NOW, &da), oidc.L_NET, "device endpoint unreachable")
+    // a provider without a device endpoint
+    reset(ip)
+    (*ip).disc_device = false
+    var c2: oidc.Client = mkc(ip)
+    ci(&bad, device.start(&c2, NOW, &da), oidc.L_CONFIG, "no device endpoint")
+    // the final id_token is checked
+    reset(ip)
+    (*ip).tamper = T_AUD
+    (*ip).dev_state = 2
+    var c3: oidc.Client = mkc(ip)
+    device.start(&c3, NOW, &da)
+    let ba: oidc.Login = device.poll(&c3, &da, NOW + 5)
+    ci(&bad, ba.reason, oidc.L_ID_TOKEN, "device: wrong aud")
+    cs(&bad, ba.detail, "aud", "device: wrong aud detail")
+    return bad
+}
+
+// a signed-in session (code flow) for the session tests
+fn login(c: *mut oidc.Client, ip: *mut Idp) -> session.Session {
+    var p: oidc.Pending = oidc.pending_new()
+    let red: str = start(c, ip, &p, "", NOW)
+    var l: oidc.Login = oidc.finish(c, &p, red, NOW)
+    if l.reason != oidc.L_OK { out_line("FAIL login helper") }
+    return session.session_from_login(&l)
+}
+
+fn g_session(ip: *mut Idp) -> i32 {
+    var bad: i32 = 0 as i32
+    reset(ip)
+    var c: oidc.Client = mkc(ip)
+    var s: session.Session = login(&c, ip)
+    ck(&bad, s.state == session.S_ACTIVE && session.active(&s) && s.sub == "acc_mock1" && s.iss == ISS, "session from login")
+    ck(&bad, !session.due(&s, NOW + 100, 60), "not due early")
+    ck(&bad, session.due(&s, NOW + 850, 60), "due before expiry")
+    let n0: i64 = (*ip).n_token
+    ci(&bad, session.ensure_fresh(&c, &s, NOW + 100, 60), oidc.L_OK, "ensure_fresh: nothing due")
+    ci(&bad, (*ip).n_token, n0, "ensure_fresh: no request when fresh")
+    // rotation
+    var stolen: session.Session = s // a copy of the session as it is now
+    let old_rt: str = s.t.refresh_token
+    let old_at: str = s.t.access_token
+    (*ip).now = NOW + 850
+    ci(&bad, session.ensure_fresh(&c, &s, NOW + 850, 60), oidc.L_OK, "refresh when due")
+    ck(&bad, s.t.refresh_token != old_rt && s.t.access_token != old_at, "both tokens replaced")
+    ci(&bad, s.rotations, 1, "rotations counted")
+    ci(&bad, s.t.expires_at, NOW + 850 + 900, "new expiry")
+    ci(&bad, s.refreshed_at, NOW + 850, "refreshed_at")
+    ck(&bad, has((*ip).last_body, "grant_type=refresh_token") && has((*ip).last_body, "refresh_token=" + old_rt), "refresh request sent the old token")
+    ck(&bad, session.active(&s), "still active")
+    // a second rotation
+    (*ip).now = NOW + 1700
+    ci(&bad, session.ensure_fresh(&c, &s, NOW + 1700, 60), oidc.L_OK, "second refresh")
+    ci(&bad, s.rotations, 2, "two rotations")
+    // reuse of an old refresh token: the family dies, the thief is wiped, so is the victim's next refresh
+    ci(&bad, session.refresh(&c, &stolen, NOW + 1710), oidc.L_NEED_LOGIN, "reused refresh token")
+    ck(&bad, stolen.state == session.S_NEED_LOGIN && stolen.t.access_token.length() == 0 && stolen.t.refresh_token.length() == 0, "reuse: tokens wiped")
+    ci(&bad, session.refresh(&c, &s, NOW + 1720), oidc.L_NEED_LOGIN, "family is dead for the owner too")
+    ck(&bad, s.state == session.S_NEED_LOGIN && s.t.refresh_token.length() == 0, "owner wiped")
+    let n1: i64 = (*ip).n_token
+    ci(&bad, session.ensure_fresh(&c, &s, NOW + 1800, 60), oidc.L_NEED_LOGIN, "wiped session: ensure_fresh")
+    ci(&bad, (*ip).n_token, n1, "wiped session sends nothing")
+    ck(&bad, session.due(&s, NOW, 60), "wiped session is due")
+    // no rotation: the old refresh token stays
+    reset(ip)
+    c = mkc(ip)
+    s = login(&c, ip)
+    (*ip).refresh_mode = 1
+    let keep: str = s.t.refresh_token
+    (*ip).now = NOW + 850
+    ci(&bad, session.refresh(&c, &s, NOW + 850), oidc.L_OK, "refresh without rotation")
+    cs(&bad, s.t.refresh_token, keep, "refresh token kept")
+    ci(&bad, s.rotations, 0, "no rotation counted")
+    // network and HTTP errors change nothing
+    let at0: str = s.t.access_token
+    (*ip).net_fail = true
+    ci(&bad, session.refresh(&c, &s, NOW + 900), oidc.L_NET, "refresh: no answer")
+    (*ip).net_fail = false
+    ck(&bad, s.state == session.S_ACTIVE && s.t.access_token == at0 && s.t.refresh_token == keep, "no answer: session intact")
+    (*ip).token_http = 500
+    ci(&bad, session.refresh(&c, &s, NOW + 900), oidc.L_HTTP, "refresh: HTTP 500")
+    (*ip).token_http = 0
+    ck(&bad, s.state == session.S_ACTIVE && s.t.access_token == at0, "HTTP 500: session intact")
+    // another subject in the renewed id_token
+    (*ip).refresh_id = true
+    (*ip).refresh_sub = "acc_other"
+    ci(&bad, session.refresh(&c, &s, NOW + 910), oidc.L_ACCOUNT, "refresh: other subject")
+    ck(&bad, s.t.access_token == at0 && s.state == session.S_ACTIVE, "other subject: session not updated")
+    // the same subject: the id_token is taken over
+    (*ip).refresh_sub = ""
+    (*ip).now = NOW + 920
+    ci(&bad, session.refresh(&c, &s, NOW + 920), oidc.L_OK, "refresh: same subject, id_token")
+    ck(&bad, s.t.id_token.length() > 0 && s.t.access_token != at0, "id_token + access token replaced")
+    // json round trip
+    let js: str = session.to_json(&s)
+    var s2: session.Session = session.session_new()
+    ck(&bad, session.from_json(js, &s2), "from_json")
+    ck(&bad, s2.t.access_token == s.t.access_token && s2.t.refresh_token == s.t.refresh_token && s2.t.id_token == s.t.id_token &&
+        s2.sub == s.sub && s2.iss == s.iss && s2.t.expires_at == s.t.expires_at && s2.state == s.state && s2.rotations == s.rotations, "json round trip")
+    ck(&bad, !session.from_json("{\"v\":2}", &s2) && !session.from_json("junk", &s2), "from_json refuses other versions + junk")
+    // an empty refresh token ends the session
+    var s3: session.Session = s
+    s3.t.refresh_token = ""
+    ci(&bad, session.refresh(&c, &s3, NOW + 930), oidc.L_NEED_LOGIN, "no refresh token")
+    ck(&bad, s3.state == session.S_NEED_LOGIN, "no refresh token: wiped")
+    // logout revokes both tokens at the provider and wipes
+    reset(ip)
+    c = mkc(ip)
+    s = login(&c, ip)
+    let rt_l: str = s.t.refresh_token
+    let at_l: str = s.t.access_token
+    ci(&bad, session.logout(&c, &s), oidc.L_OK, "logout")
+    ci(&bad, (*ip).n_revoke, 2, "two revocations")
+    ck(&bad, has((*ip).revoked, rt_l + ",") && has((*ip).revoked, at_l + ","), "both tokens revoked")
+    ck(&bad, s.state == session.S_EMPTY && s.t.access_token.length() == 0 && s.t.refresh_token.length() == 0, "logout wipes")
+    // a provider without a revocation endpoint: wiped anyway, the caller is told
+    reset(ip)
+    (*ip).disc_revoke = false
+    c = mkc(ip)
+    s = login(&c, ip)
+    ci(&bad, session.logout(&c, &s), oidc.L_CONFIG, "logout without revocation endpoint")
+    ck(&bad, s.state == session.S_EMPTY && s.t.refresh_token.length() == 0, "logout wipes anyway")
+    return bad
+}
+
+fn g_link(ip: *mut Idp) -> i32 {
+    var bad: i32 = 0 as i32
+    reset(ip)
+    var c: oidc.Client = mkc(ip)
+    var p: oidc.Pending = oidc.pending_new()
+    ci(&bad, link.link_begin(&c, REDIR, NOW, &p), oidc.L_OK, "link_begin")
+    ck(&bad, p.fresh && has(p.url, "prompt=login") && has(p.url, "max_age=0"), "link: prompt=login + max_age=0")
+    let red: str = browse(ip, p.url)
+    let r: link.LinkResult = link.link_finish(&c, &p, red, "xoffi", "acc_mock1", NOW)
+    ci(&bad, r.reason, oidc.L_OK, "link ok")
+    ck(&bad, r.provider == "xoffi" && r.sub == "acc_mock1" && r.iss == ISS && r.name == "Justin", "link result")
+    ci(&bad, r.auth_time, NOW, "link: auth_time is fresh")
+    // replay
+    ci(&bad, link.link_finish(&c, &p, red, "xoffi", "", NOW).reason, oidc.L_REPLAY, "link: replay")
+    // a different expected account
+    var p2: oidc.Pending = oidc.pending_new()
+    link.link_begin(&c, REDIR, NOW, &p2)
+    ci(&bad, link.link_finish(&c, &p2, browse(ip, p2.url), "xoffi", "acc_other", NOW).reason, oidc.L_ACCOUNT, "link: expected account differs")
+    var p3: oidc.Pending = oidc.pending_new()
+    link.link_begin(&c, REDIR, NOW, &p3)
+    ci(&bad, link.link_finish(&c, &p3, browse(ip, p3.url), "xoffi", "", NOW).reason, oidc.L_OK, "link: no expectation")
+    // the provider ignores prompt=login: an old auth_time is stale
+    (*ip).ign_prompt = true
+    var p4: oidc.Pending = oidc.pending_new()
+    link.link_begin(&c, REDIR, NOW, &p4)
+    let ls: link.LinkResult = link.link_finish(&c, &p4, browse(ip, p4.url), "xoffi", "", NOW)
+    ci(&bad, ls.reason, oidc.L_STALE, "link: stale login")
+    cs(&bad, ls.detail, "auth_time", "link: stale detail")
+    (*ip).ign_prompt = false
+    // no auth_time at all
+    (*ip).no_auth_time = true
+    var p5: oidc.Pending = oidc.pending_new()
+    link.link_begin(&c, REDIR, NOW, &p5)
+    ci(&bad, link.link_finish(&c, &p5, browse(ip, p5.url), "xoffi", "", NOW).reason, oidc.L_STALE, "link: no auth_time")
+    (*ip).no_auth_time = false
+    // a plain login attempt is no link attempt, and stays unspent
+    var p6: oidc.Pending = oidc.pending_new()
+    let r6: str = start(&c, ip, &p6, "", NOW)
+    let ln: link.LinkResult = link.link_finish(&c, &p6, r6, "xoffi", "", NOW)
+    ci(&bad, ln.reason, oidc.L_CONFIG, "link: plain attempt refused")
+    cs(&bad, ln.detail, "not_a_link_attempt", "link: plain attempt detail")
+    ck(&bad, !p6.used, "link: plain attempt not spent")
+    // the user says no
+    var p7: oidc.Pending = oidc.pending_new()
+    link.link_begin(&c, REDIR, NOW, &p7)
+    ci(&bad, link.link_finish(&c, &p7, REDIR + "?error=access_denied&state=" + u.pct_enc(p7.state), "xoffi", "", NOW).reason, oidc.L_DENIED, "link: denied")
+    // unlink contract
+    var t: tp.Transport = tx()
+    let ep: str = ISS + "/unlink"
+    ci(&bad, link.unlink(&t, ep, "tok123", "xoffi", "xoffi-user-42").reason, oidc.L_OK, "unlink 200")
+    ck(&bad, has((*ip).last_headers, "Authorization: Bearer tok123\r\n"), "unlink: bearer header")
+    ck(&bad, has((*ip).last_body, "provider=xoffi") && has((*ip).last_body, "sub=xoffi-user-42"), "unlink: body")
+    (*ip).unlink_status = 409
+    let l409: oidc.Login = link.unlink(&t, ep, "tok123", "xoffi", "s")
+    ck(&bad, l409.reason == oidc.L_ERROR && l409.detail == "last_identity", "unlink 409 = last_identity")
+    (*ip).unlink_status = 401
+    ci(&bad, link.unlink(&t, ep, "tok123", "xoffi", "s").reason, oidc.L_NEED_LOGIN, "unlink 401")
+    (*ip).unlink_status = 403
+    ci(&bad, link.unlink(&t, ep, "tok123", "xoffi", "s").reason, oidc.L_NEED_LOGIN, "unlink 403")
+    (*ip).unlink_status = 404
+    let l404: oidc.Login = link.unlink(&t, ep, "tok123", "xoffi", "s")
+    ck(&bad, l404.reason == oidc.L_ERROR && l404.detail == "not_linked", "unlink 404 = not_linked")
+    (*ip).unlink_status = 500
+    ci(&bad, link.unlink(&t, ep, "tok123", "xoffi", "s").reason, oidc.L_HTTP, "unlink 500")
+    (*ip).unlink_status = 0
+    let nreq: i64 = (*ip).n_req
+    ci(&bad, link.unlink(&t, "http://id.mock.test/unlink", "tok123", "xoffi", "s").reason, oidc.L_NET, "unlink over plain http to a real host")
+    ci(&bad, (*ip).n_req, nreq, "unlink http: refused before the transport")
+    (*ip).net_fail = true
+    ci(&bad, link.unlink(&t, ep, "tok123", "xoffi", "s").reason, oidc.L_NET, "unlink: no answer")
+    return bad
+}
+
+fn g_provider(ip: *mut Idp) -> i32 {
+    var bad: i32 = 0 as i32
+    reset(ip)
+    var pj: provider.Provider = provider.provider_jarvis(ISS, CID, tx())
+    ck(&bad, pj.status == provider.ST_READY && pj.kind == provider.KIND_OIDC && pj.id == "jarvis", "jarvis provider")
+    ck(&bad, (pj.caps & provider.CAP_REFRESH) != 0 && (pj.caps & provider.CAP_REVOKE) != 0, "jarvis caps")
+    ci(&bad, provider.health(&pj, NOW), oidc.L_OK, "health = discovery")
+    var st: provider.Step = provider.step_new()
+    ci(&bad, provider.begin(&pj, REDIR, NOW, &st), oidc.L_OK, "provider begin")
+    ck(&bad, st.kind == provider.STEP_REDIRECT && has(st.url, "/authorize?"), "redirect step")
+    let red: str = browse(ip, st.url)
+    var sess: session.Session = session.session_new()
+    var subj: provider.Subject = provider.subject_empty()
+    ci(&bad, provider.finish(&pj, &st, red, "", NOW, &sess, &subj), oidc.L_OK, "provider finish")
+    ck(&bad, subj.ok && subj.provider == "jarvis" && subj.sub == "acc_mock1" && subj.acc == "acc_mock1" && subj.name == "Justin", "subject")
+    ck(&bad, session.active(&sess) && sess.sub == "acc_mock1", "provider session")
+    (*ip).now = NOW + 850
+    ci(&bad, provider.refresh(&pj, &sess, NOW + 850), oidc.L_OK, "provider refresh")
+    ci(&bad, sess.rotations, 1, "provider refresh rotates")
+    ci(&bad, provider.logout(&pj, &sess), oidc.L_OK, "provider logout")
+    ci(&bad, (*ip).n_revoke, 2, "provider logout revokes")
+    ck(&bad, sess.state == session.S_EMPTY, "provider logout wipes")
+    // a wrong state: no subject, the session stays empty
+    (*ip).now = NOW
+    var st2: provider.Step = provider.step_new()
+    provider.begin(&pj, REDIR, NOW, &st2)
+    let red2: str = browse(ip, st2.url)
+    var sess2: session.Session = session.session_new()
+    var subj2: provider.Subject = provider.subject_empty()
+    ci(&bad, provider.finish(&pj, &st2, mkred(REDIR, code_of(red2), "forged", ISS), "", NOW, &sess2, &subj2), oidc.L_STATE, "provider: wrong state")
+    ck(&bad, !subj2.ok && sess2.state == session.S_EMPTY, "provider: nothing signed in")
+    // device flow through the provider
+    var st3: provider.Step = provider.step_new()
+    ci(&bad, provider.begin_device(&pj, NOW, &st3), oidc.L_OK, "provider begin_device")
+    ck(&bad, st3.kind == provider.STEP_DEVICE && st3.device.user_code == "ABCD-EFGH", "device step")
+    var sess3: session.Session = session.session_new()
+    var subj3: provider.Subject = provider.subject_empty()
+    ci(&bad, provider.finish_device(&pj, &st3, NOW + 5, &sess3, &subj3), oidc.L_PENDING, "provider device: pending")
+    (*ip).dev_state = 2
+    (*ip).now = NOW + 10
+    ci(&bad, provider.finish_device(&pj, &st3, NOW + 10, &sess3, &subj3), oidc.L_OK, "provider device: approved")
+    ck(&bad, subj3.ok && subj3.sub == "acc_mock1" && session.active(&sess3), "provider device: subject + session")
+    // XOFFI is planned: no traffic at all
+    reset(ip)
+    var px: provider.Provider = provider.provider_xoffi(ISS, CID, tx())
+    ck(&bad, px.status == provider.ST_PLANNED && px.id == "xoffi", "xoffi is planned")
+    var sx: provider.Step = provider.step_new()
+    ci(&bad, provider.begin(&px, REDIR, NOW, &sx), oidc.L_CONFIG, "xoffi begin refused")
+    ci(&bad, provider.begin_device(&px, NOW, &sx), oidc.L_CONFIG, "xoffi device refused")
+    var sessx: session.Session = session.session_new()
+    var subjx: provider.Subject = provider.subject_empty()
+    ci(&bad, provider.finish(&px, &sx, "x", "", NOW, &sessx, &subjx), oidc.L_CONFIG, "xoffi finish refused")
+    cs(&bad, subjx.detail, "planned", "xoffi: planned detail")
+    ci(&bad, provider.health(&px, NOW), oidc.L_CONFIG, "xoffi health")
+    ci(&bad, (*ip).n_req, 0, "xoffi: no traffic while planned")
+    provider.provider_set_ready(&px)
+    ck(&bad, px.status == provider.ST_READY, "provider_set_ready")
+    // password fallback
+    reset(ip)
+    var pp: provider.Provider = provider.provider_password(ISS, CID, ISS + "/login", tx())
+    var sp: provider.Step = provider.step_new()
+    ci(&bad, provider.begin(&pp, REDIR, NOW, &sp), oidc.L_OK, "password begin")
+    ck(&bad, sp.kind == provider.STEP_FORM && sp.url == ISS + "/login", "password form step")
+    var sessp: session.Session = session.session_new()
+    var subjp: provider.Subject = provider.subject_empty()
+    ci(&bad, provider.finish(&pp, &sp, "ju\"stin", "wrong", NOW, &sessp, &subjp), oidc.L_GRANT, "password: wrong password")
+    ck(&bad, has((*ip).last_body, "\"name\":\"ju\\\"stin\""), "password: name is JSON-escaped")
+    ck(&bad, !subjp.ok && sessp.state == session.S_EMPTY, "password: nothing signed in")
+    ci(&bad, provider.finish(&pp, &sp, "justin", "pw-ok", NOW, &sessp, &subjp), oidc.L_OK, "password: right password")
+    ck(&bad, subjp.ok && subjp.sub == "acc_mock1" && session.active(&sessp), "password: subject + session")
+    ck(&bad, has((*ip).last_body, "\"password\":\"pw-ok\"") && has((*ip).last_body, "\"client_id\":\"" + CID + "\""), "password: body")
+    return bad
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var idp: Idp = idp_new()
+    G_IDP = (&idp) as u64
+    var bad: i32 = 0 as i32
+    bad = bad + g_discovery(&idp)
+    bad = bad + g_begin(&idp)
+    bad = bad + g_code(&idp)
+    bad = bad + g_idtoken(&idp)
+    bad = bad + g_rotation(&idp)
+    bad = bad + g_device(&idp)
+    bad = bad + g_session(&idp)
+    bad = bad + g_link(&idp)
+    bad = bad + g_provider(&idp)
+    if bad > 100 { return 100 as i32 }
+    return bad
+}

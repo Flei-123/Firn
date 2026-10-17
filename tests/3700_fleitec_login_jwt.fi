@@ -1,7 +1,12 @@
 // expect_exit: 0
 // tests/3700_fleitec_login_jwt.fi -- lib/fleitec_login: EdDSA verifier, JWKS cache, legacy HS256,
 // against tests/data/fleitec-login-vectors.json (made by tools/fleitec_login/gen_vectors.py with
-// Python cryptography -- nothing of the Firn code). Exit code = number of the first failing group.
+// Python cryptography -- nothing of the Firn code) AND against the shared Fleitec-ID vectors
+// tests/data/fleitec-id-vectors_v2.json (copy of JARVIS docs/fleitec-id/vectors_v2.json, the file the Node
+// service fleitec-id passes too; tools/fleitec_login/sync_vectors_v2.sh keeps it equal): groups jwt_eddsa
+// (34 cases) and claims_v2 (7 legacy HS256 + 5 EdDSA), same case ids and reason names. Group F: the JOSE mode
+// (RS256/ES256 id_tokens of a foreign IdP) through oidc.verify_id_token.
+// Exit code = number of failures (90+ = a vector file is unusable).
 import std.rt
 import std.io
 import std.json
@@ -9,8 +14,16 @@ import std.str
 import fleitec_login.fl_util as u
 import fleitec_login.fl_jwks as jwks
 import fleitec_login.fl_jwt as jwt
+import fleitec_login.fl_oidc as oidc
+import fleitec_login.fl_transport as tp
 
 const VECTORS: str = __include_str("data/fleitec-login-vectors.json")
+const SHARED: str = __include_str("data/fleitec-id-vectors_v2.json")
+
+// JOSE mode never calls the network in these cases: the key set is set directly
+fn nop_tx(rq: *mut tp.HttpReq, rs: *mut tp.HttpResp) -> bool {
+    return false
+}
 
 fn node_text(d: *mut json.Json, o: u32, key: str) -> str {
     var b: rt.Buf = rt.buf_new()
@@ -91,6 +104,98 @@ fn main() -> i32 {
     jwks.keyset_parse(&open.keys, node_text(&d, root, "jwks"), now)
     let c1: jwt.Claims = jwt.verify(u.jget_str(&d, json.json_child(&d, u.jget_node(&d, root, "jwt_eddsa")), "token"), &open, now)
     if c1.reason == jwt.JWT_OK { bad = bad + fail("E", "empty iss/aud passed") }
+    // ---- F: JOSE mode (RS256/ES256 id_tokens of a foreign IdP), ids and reasons as in the own file
+    let jo: u32 = u.jget_node(&d, root, "jose")
+    var jc: oidc.Client = oidc.client_new(u.jget_str(&d, jo, "iss"), u.jget_str(&d, jo, "aud"), tp.Transport { f: nop_tx })
+    oidc.client_set_jose(&jc, true)
+    jc.jose_jwks = node_text(&d, jo, "jwks")
+    jc.cfg.leeway = u.jget_int(&d, root, "leeway", 30)
+    c = json.json_child(&d, u.jget_node(&d, jo, "cases"))
+    var nF: i64 = 0
+    while c != json.JSON_NONE {
+        let idf: str = u.jget_str(&d, c, "id")
+        var outc: jwt.Claims = jwt.claims_empty()
+        let lf: oidc.Login = oidc.verify_id_token(&jc, u.jget_str(&d, c, "token"), "", now, &outc)
+        var got: str = "ok"
+        if lf.reason != oidc.L_OK { got = lf.detail }
+        if got != u.jget_str(&d, c, "reason") { bad = bad + fail("F reason", idf) }
+        if lf.reason == oidc.L_OK {
+            if outc.sub != u.jget_str(&d, c, "sub") || outc.org_id != u.jget_str(&d, c, "org_id") ||
+            outc.groups != u.jget_str(&d, c, "groups") || outc.email != u.jget_str(&d, c, "email") { bad = bad + fail("F claims", idf) }
+        }
+        nF = nF + 1
+        c = json.json_next(&d, c)
+    }
+    if nF < 6 { return 93 as i32 }
+    json.json_free(&d)
+    let sh: i32 = shared()
+    if sh != 0 as i32 { return sh + bad }
+    if bad > 100 as i32 { return 100 as i32 }
+    return bad
+}
+
+// ---- G/H: the SHARED vectors (jwt_eddsa, claims_v2) of docs/fleitec-id/vectors_v2.json. Leeway 0 (the
+// Node verifier has none: "expired_exactly_now" must be refused), each case brings its own `now`.
+fn shared() -> i32 {
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, SHARED.p as u64, SHARED.length()) catch false
+    if !ok { return 94 as i32 }
+    let root: u32 = json.json_root(&d)
+    var bad: i32 = 0 as i32
+    let ve: u32 = u.jget_node(&d, u.jget_node(&d, root, "jwt_eddsa"), "verifier")
+    var cfg: jwt.IssuerCfg = jwt.cfg_new(u.jget_str(&d, ve, "iss"), u.jget_str(&d, ve, "aud"))
+    cfg.leeway = 0
+    if jwks.keyset_parse(&cfg.keys, node_text(&d, ve, "jwks"), 1758400000) != 2 { return 95 as i32 }
+    // every reason the file names is a reason of ours (the shared names)
+    var known: i64 = 0
+    var rc0: u32 = json.json_child(&d, u.jget_node(&d, root, "reason_codes"))
+    while rc0 != json.JSON_NONE {
+        known = known + 1
+        rc0 = json.json_next(&d, rc0)
+    }
+    if known != 10 { bad = bad + fail("G", "reason_codes count") }
+    var c: u32 = json.json_child(&d, u.jget_node(&d, u.jget_node(&d, root, "jwt_eddsa"), "cases"))
+    var nG: i64 = 0
+    while c != json.JSON_NONE {
+        let id: str = u.jget_str(&d, c, "id")
+        let cl: jwt.Claims = jwt.verify(u.jget_str(&d, c, "token"), &cfg, u.jget_int(&d, c, "now", 0))
+        if jwt.reason_name(cl.reason) != u.jget_str(&d, c, "expect") { bad = bad + fail("G reason", id) }
+        if cl.reason == jwt.JWT_OK {
+            let ex: u32 = u.jget_node(&d, c, "claims")
+            if cl.sub != u.jget_str(&d, ex, "sub") || cl.uid != u.jget_str(&d, ex, "uid") || cl.name != u.jget_str(&d, ex, "name") ||
+            cl.acc != u.jget_str(&d, ex, "acc") || cl.idp != u.jget_str(&d, ex, "idp") { bad = bad + fail("G claims", id) }
+        }
+        nG = nG + 1
+        c = json.json_next(&d, c)
+    }
+    if nG != 34 { bad = bad + fail("G", "case count") }
+    // claims_v2: legacy HS256 door (mode legacy_hs256) and the EdDSA door (mode eddsa)
+    let cv: u32 = u.jget_node(&d, root, "claims_v2")
+    let secret: str = u.jget_str(&d, u.jget_node(&d, cv, "verifier_legacy"), "secret")
+    var nH: i64 = 0
+    c = json.json_child(&d, u.jget_node(&d, cv, "cases"))
+    while c != json.JSON_NONE {
+        let idh: str = u.jget_str(&d, c, "id")
+        let now2: i64 = u.jget_int(&d, c, "now", 0)
+        let ex2: u32 = u.jget_node(&d, c, "claims")
+        var cl2: jwt.Claims = jwt.claims_empty()
+        if u.jget_str(&d, c, "mode") == "legacy_hs256" {
+            cl2 = jwt.verify_legacy_hs256(u.jget_str(&d, c, "token"), secret, "", "", now2)
+            if cl2.reason == jwt.JWT_OK && (cl2.uid != u.jget_str(&d, ex2, "uid") || cl2.name != u.jget_str(&d, ex2, "name")) {
+                bad = bad + fail("H legacy claims", idh)
+            }
+        } else {
+            cl2 = jwt.verify(u.jget_str(&d, c, "token"), &cfg, now2)
+            if cl2.reason == jwt.JWT_OK && (cl2.sub != u.jget_str(&d, ex2, "sub") || cl2.uid != u.jget_str(&d, ex2, "uid") ||
+            cl2.name != u.jget_str(&d, ex2, "name") || cl2.acc != u.jget_str(&d, ex2, "acc") || cl2.idp != u.jget_str(&d, ex2, "idp")) {
+                bad = bad + fail("H eddsa claims", idh)
+            }
+        }
+        if jwt.reason_name(cl2.reason) != u.jget_str(&d, c, "expect") { bad = bad + fail("H reason", idh) }
+        nH = nH + 1
+        c = json.json_next(&d, c)
+    }
+    if nH != 12 { bad = bad + fail("H", "case count") }
     json.json_free(&d)
     return bad
 }

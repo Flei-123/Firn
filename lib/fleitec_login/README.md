@@ -16,11 +16,20 @@ Module files carry the prefix `fl_` because Firn module names are global (`jwt` 
 | `fl_session` | access+refresh, `ensure_fresh` before expiry, refresh rotation, wipe on `invalid_grant`, JSON (de)serialising |
 | `fl_provider` | provider interface jarvis / xoffi (PLANNED) / password |
 
-Tests: `tests/3700_fleitec_login_jwt.fi` (44 EdDSA vectors, legacy HS256, JWKS rules) against
-`tests/data/fleitec-login-vectors.json` (`tools/fleitec_login/gen_vectors.py`, Python `cryptography`).
+Tests
+- `tests/3700_fleitec_login_jwt.fi`: 44 own EdDSA vectors + the SHARED Fleitec-ID vectors (`tests/data/fleitec-id-vectors_v2.json` =
+  copy of JARVIS `docs/fleitec-id/vectors_v2.json`, same file the Node service passes; `tools/fleitec_login/sync_vectors_v2.sh [--check]`):
+  jwt_eddsa (34), claims_v2 (7 legacy HS256 + 5 EdDSA), legacy HS256, JWKS rules, JOSE group (RS256/ES256 via oidc, 6).
+  Reason names are the shared ones (`kid`, not `nokey`).
+- `tests/3701_fleitec_login_flows.fi`: a MOCK IdP as `fl_transport` (EdDSA id_tokens via `ed25519_sign`): discovery, begin, code flow
+  + negatives (state, redirect_uri, iss, PKCE, code twice, replay), id_token negatives (nonce, alg swap, expired, iss, aud, azp, kid,
+  signature), JWKS rotation/refetch brake/expiry, device flow (pending, slow_down, expired, denied), session (refresh rotation, reuse,
+  wipe), link (prompt=login, auth_time, expected account, unlink), provider (jarvis, xoffi planned, password).
+- `tests/manual/fleitec_login_interop.sh` (OPTIONAL, needs node + curl, not in test.sh): the real Node service `fleitec-id` on
+  127.0.0.1:8470, curl plays the browser, the Firn library does code flow, refresh rotation, reuse detection and device flow.
 
 HONEST
 - Not thread safe (one Session/Client = one owner). Tokens are GC strings, cannot be wiped from memory.
 - No HTTP loop/sleeping: `device.poll` and `session.ensure_fresh` are single steps; the caller schedules.
-- OIDC/device/session/link/provider are written and compile, but have NO mock-IdP test yet (open item).
-- JOSE mode (RS256/ES256) has vectors (`jose` group) but no test yet.
+- JOSE mode is tested with vectors only (verify_id_token); a full JOSE login flow against a mock RS256/ES256 IdP is not.
+- `provider_password.finish` discovers the issuer first (it needs the keys for the id_token).

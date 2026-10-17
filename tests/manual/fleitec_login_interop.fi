@@ -1,0 +1,67 @@
+// MANUAL / OPTIONAL (needs `node`; NOT part of test.sh -- it lives in tests/manual/). Driven by
+// tests/manual/fleitec_login_interop.sh, which starts the real Node service fleitec-id on 127.0.0.1:8470
+// (fake backend), plays the browser with curl and feeds this program line by line on stdin.
+// Protocol (stdout lines "KEY value"; stdin lines answer): code flow -> refresh rotation -> reuse -> device.
+// Everything protocol-related (PKCE, state, nonce, JWKS, id_token, rotation, device) is the Firn library
+// fleitec_login over the real net.http transport -- nothing mocked.
+import std.rt
+import std.io
+import std.str
+import fleitec_login.fl_util as u
+import fleitec_login.fl_transport as tp
+import fleitec_login.fl_nethttp as nethttp
+import fleitec_login.fl_oidc as oidc
+import fleitec_login.fl_device as device
+import fleitec_login.fl_session as session
+
+const ISSUER: str = "http://127.0.0.1:8470"
+const CLIENT: str = "fc_localtest"
+const REDIRECT: str = "http://127.0.0.1:8765/callback"
+
+fn say(k: str, v: str) {
+    io.print(k)
+    io.print(" ")
+    io.print_line_bytes(v.p as u64, v.length())
+}
+
+fn say_login(k: str, l: *mut oidc.Login) {
+    say(k, oidc.login_text((*l).reason) + " " + (*l).detail)
+}
+
+fn main() -> i32 {
+    var c: oidc.Client = oidc.client_new(ISSUER, CLIENT, tp.Transport { f: nethttp.net_transport })
+    oidc.client_set_scope(&c, "openid profile fleitec.account offline_access")
+    let now0: i64 = u.now_s()
+    let dr: i64 = oidc.discover(&c, now0)
+    say("DISCOVER", oidc.login_text(dr))
+    if dr != oidc.L_OK { return 1 as i32 }
+    // ---- code flow
+    var p: oidc.Pending = oidc.pending_new()
+    oidc.begin(&c, REDIRECT, "", now0, &p)
+    say("URL", p.url)
+    let red: str = io.read_line()
+    var l: oidc.Login = oidc.finish(&c, &p, red, u.now_s())
+    say_login("CODEFLOW", &l)
+    if l.reason != oidc.L_OK { return 2 as i32 }
+    say("SUB", l.claims.sub + " acc=" + l.claims.acc + " idp=" + l.claims.idp)
+    var s: session.Session = session.session_from_login(&l)
+    let stolen: session.Session = s
+    // ---- refresh rotation (skew larger than the lifetime forces it)
+    let rc: i64 = session.ensure_fresh(&c, &s, u.now_s(), 100000)
+    say("REFRESH", oidc.login_text(rc))
+    if s.rotations == 1 { say("ROTATED", "yes") } else { say("ROTATED", "no") }
+    // ---- reuse of the old refresh token: the server kills the family
+    var st2: session.Session = stolen
+    say("REUSE", oidc.login_text(session.refresh(&c, &st2, u.now_s())))
+    say("OWNER_AFTER_REUSE", oidc.login_text(session.refresh(&c, &s, u.now_s())))
+    // ---- device flow
+    var da: device.DeviceAuth = device.device_new()
+    let ds: i64 = device.start(&c, u.now_s(), &da)
+    say("DEVICE_START", oidc.login_text(ds))
+    say("USER_CODE", da.user_code)
+    let go: str = io.read_line()
+    var dl: oidc.Login = device.poll(&c, &da, da.started + da.interval + 1)
+    say_login("DEVICE_POLL", &dl)
+    if dl.reason == oidc.L_OK { say("DEVICE_SUB", dl.claims.sub) }
+    return 0 as i32
+}

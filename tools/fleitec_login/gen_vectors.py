@@ -77,9 +77,9 @@ case("valid_basic", mk(base()), "ok", **exp_ok)
 case("valid_next_key_k2", mk(base(), kid="k2", key=K2), "ok", **exp_ok)
 case("valid_aud_array", mk(base(aud=["other", AUD])), "ok", **exp_ok)
 case("valid_minimal", mk({"iss": ISS, "aud": AUD, "sub": "acc_min", "exp": NOW + 5}), "ok",
-     sub="acc_min", uid="", name="", acc="", idp="")
+     sub="acc_min", uid="acc_min", name="", acc="", idp="")  # uid falls back to sub (shared vectors)
 case("valid_odd_claims", mk(base(acc=5, idp=["x"], uid=None, name=7, amr="pwd", groups="notarray", extra={"a": 1})),
-     "ok", sub="acc_7f3a9c", uid="", name="", acc="", idp="")
+     "ok", sub="acc_7f3a9c", uid="acc_7f3a9c", name="", acc="", idp="")
 case("valid_exp_in_leeway", mk(base(exp=NOW - 29)), "ok", **exp_ok)
 case("expired_at_leeway_edge", mk(base(exp=NOW - 30)), "expired")
 case("expired", mk(base(exp=NOW - 3600)), "expired")
@@ -98,15 +98,15 @@ case("aud_array_without_ours", mk(base(aud=["a", "b"])), "aud")
 case("sub_missing", mk(base(sub=None)), "claims")
 case("sub_empty", mk(base(sub="")), "claims")
 case("alg_none_unsigned", mk(base(), alg="none", sig=b"")[:-0 or None] if False else
-     b64u(j({"alg": "none", "typ": "JWT", "kid": "k1"})) + "." + b64u(j(base())) + ".", "malformed")
+     b64u(j({"alg": "none", "typ": "JWT", "kid": "k1"})) + "." + b64u(j(base())) + ".", "alg")  # shared vectors_v2: alg_none -> alg
 case("alg_none_with_sig", mk(base(), alg="none", sig=b"\x00" * 64), "alg")
 case("alg_hs256_public_key_as_secret", None, "alg")  # filled below
 case("alg_rs256_header", mk(base(), alg="RS256"), "alg")
 case("alg_lowercase_eddsa", mk(base(), alg="eddsa"), "alg")
 case("alg_missing", mk(base(), header={"typ": "JWT", "kid": "k1"}), "malformed")
 case("alg_not_string", mk(base(), header={"alg": 1, "kid": "k1"}), "malformed")
-case("kid_unknown", mk(base(), kid="k9"), "nokey")
-case("kid_missing", mk(base(), kid=None), "nokey")
+case("kid_unknown", mk(base(), kid="k9"), "kid")
+case("kid_missing", mk(base(), kid=None), "kid")
 case("payload_tampered", None, "sig")
 case("signed_by_attacker_key", mk(base(), key=ATT), "sig")
 case("signature_63_bytes", mk(base(), sig=K1.sign(b"x")[:63]), "sig")
@@ -203,7 +203,7 @@ jose = {
         {"id": "jose_es256_wrong_aud", "token": es256(dict(jp, aud="other")), "reason": "aud"},
         {"id": "jose_es256_expired", "token": es256(dict(jp, exp=NOW - 1000)), "reason": "expired"},
         {"id": "jose_es256_wrong_iss", "token": es256(dict(jp, iss="https://evil.example")), "reason": "iss"},
-        {"id": "jose_es256_unknown_kid", "token": es256(jp, kid="nope"), "reason": "nokey"},
+        {"id": "jose_es256_unknown_kid", "token": es256(jp, kid="nope"), "reason": "kid"},
         {"id": "jose_eddsa_token_refused", "token": mk(dict(jp)), "reason": "alg"},
     ],
 }
