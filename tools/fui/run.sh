@@ -1531,5 +1531,10 @@ build hotreload
 mkdir -p "$W/hr-scratch" && rm -f "$W/hr-scratch"/* && "$W/hotreload" "$W/hr-scratch" | tail -1
 rm -rf "$W/hr-scratch"
 
+# GPU path on Vulkan (W18-F2/F3): the zoo page CPU vs Vulkan + fallbacks, then the FUI_GPU=1 host switch in a real window (Xvfb).
+# Both print SKIP and succeed without a Vulkan device (or without Xvfb for the second one).
+sh tools/fui/gpuparity.sh
+bash tools/fui/gpuhost.sh
+
 echo
 echo "ALL CHECKS PASSED."

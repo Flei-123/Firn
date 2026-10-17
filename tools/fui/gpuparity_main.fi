@@ -18,6 +18,7 @@
 import std.rt
 import std.io
 import std.env
+import std.time
 import fui.safeout
 import html.mem
 import paint.canvas
@@ -418,6 +419,128 @@ fn run_case(g: *mut gpu.Gpu, fm: u64, dark: bool, text: bool, dir: u64, have_dir
     return ok
 }
 
+// ---------------------------------------------------------------- timing (the `perf` argument)
+
+const BW: usize = 1920
+const BH: usize = 1080
+
+// The zoo page plus big elements on the rest of a 1920x1080 canvas: a large glass panel, cards with shadow, text lines.
+fn page1080(z: *mut painter.Painter) {
+    zoo(z, false, true)
+    let f5: bool = effect.frost_rect(z, 1280.0, 20.0, 600.0, 400.0, 18, 1728053247 as u32)
+    effect.rrect_shadow(z, 1290.0, 450.0, 580.0, 260.0, 24.0, 8.0, 20.0, 1711276032 as u32)
+    effect.rrect_fast(z, 1290.0, 450.0, 580.0, 260.0, 24.0, 4294967295 as u32, 4293258485 as u32)
+    painter.round_rect(z, 1290.0, 740.0, 580.0, 300.0, 24.0, 4282532351 as u32)
+    var k: i64 = 0
+    while k < 16 {
+        say(z, 20.0, 740.0 + (k as f64) * 20.0, 15.0, 4279507503 as u32, "fUi auf der GPU -- Zeile fuer Zeile Text, ÄÖÜ äöü ß 0123456789")
+        k = k + 1
+    }
+}
+
+// ms of one call of `kind` (0 = the 1080p page, 1 = a blur panel 400x300, 2 = a blur panel 1200x700) on `z`
+fn bench_one(z: *mut painter.Painter, kind: i32) {
+    if kind == 0 {
+        page1080(z)
+    } else if kind == 1 {
+        let f: bool = effect.frost_rect(z, 100.0, 100.0, 400.0, 300.0, 18, 1728053247 as u32)
+    } else {
+        let f: bool = effect.frost_rect(z, 100.0, 100.0, 1200.0, 700.0, 18, 1728053247 as u32)
+    }
+}
+
+fn ms_of(t0: u64, t1: u64) -> f64 {
+    return ((t1 - t0) as f64) / 1000000.0
+}
+
+fn pmin(a: f64, b: f64) -> f64 {
+    if b < a { return b }
+    return a
+}
+
+// CPU vs Vulkan on a 1920x1080 canvas. Each case: a background that the effects blur (the page for the blurs), `reps` calls, min of
+// `rounds`. Vulkan numbers = paint + wait (every GL call waits for its fence) and the read-back of the whole canvas; lavapipe is a CPU.
+#[allow_escape]
+fn perf_run(g: *mut gpu.Gpu, fm: u64) -> bool {
+    var cva: canvas.Canvas = canvas.canvas_new()
+    var cvb: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cva, BW, BH) || !canvas.canvas_init(&cvb, BW, BH) {
+        return false
+    }
+    var za: painter.Painter = painter.painter_new()
+    var zb: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&za, &cva, 1200, 120) || !painter.painter_init(&zb, &cvb, 1200, 120) {
+        return false
+    }
+    painter.painter_set_font(&za, fm)
+    painter.painter_set_font(&zb, fm)
+    if !gpu.gpu_attach(g, &cvb) {
+        io.print("gpuparity perf: gpu_attach failed\n")
+        return false
+    }
+    let pb: u64 = canvas.canvas_pixels(&cvb) as u64
+    var kind: i32 = 0
+    while kind < 3 {
+        var reps: i32 = 1
+        if kind > 0 {
+            reps = 10
+        }
+        var bc: f64 = 1000000.0
+        var bg: f64 = 1000000.0
+        var br: f64 = 1000000.0
+        var round: i32 = 0
+        // the first round is a warm-up (pipelines, atlas, glyph cache, the staging buffer grows)
+        while round < 4 {
+            // the background the blur sees: the page itself (kind 0 paints it as the case)
+            if kind > 0 {
+                zoo(&za, false, false)
+                zoo(&zb, false, false)
+                gpu.gpu_finish(g)
+            }
+            let c0: u64 = time.monotonic_ns()
+            var i: i32 = 0
+            while i < reps {
+                bench_one(&za, kind)
+                i = i + 1
+            }
+            let c1: u64 = time.monotonic_ns()
+            let g0: u64 = time.monotonic_ns()
+            i = 0
+            while i < reps {
+                bench_one(&zb, kind)
+                i = i + 1
+            }
+            gpu.gpu_finish(g)
+            let g1: u64 = time.monotonic_ns()
+            gpu.gpu_read(g, 0, 0, BW as i32, BH as i32, pb, BW * 4)
+            let g2: u64 = time.monotonic_ns()
+            if round > 0 {
+                bc = pmin(bc, ms_of(c0, c1) / (reps as f64))
+                bg = pmin(bg, ms_of(g0, g1) / (reps as f64))
+                br = pmin(br, ms_of(g1, g2))
+            }
+            round = round + 1
+        }
+        var nm: str = "page 1920x1080 (zoo + big elements)"
+        if kind == 1 {
+            nm = "blur panel 400x300 r=18 (frost_rect)"
+        } else if kind == 2 {
+            nm = "blur panel 1200x700 r=18 (frost_rect)"
+        }
+        io.fmt_print(f"gpuperf {nm}: cpu={r3(bc)} ms  vulkan_paint={r3(bg)} ms  readback_1080p={r3(br)} ms\n")
+        kind = kind + 1
+    }
+    var vs: [u64; 4] = [0; 4]
+    gpu_vk.vkgl_stats(&vs[0])
+    io.fmt_print(f"gpuperf vulkan totals: draws={vs[0]} submits={vs[1]} uploads={vs[2]} readbacks={vs[3]}\n")
+    gpu.gpu_detach(g, &cvb)
+    painter.painter_free(&za)
+    painter.painter_free(&zb)
+    canvas.canvas_free(&cva)
+    canvas.canvas_free(&cvb)
+    return true
+}
+
 fn main(start: u64) -> i32 {
     var have_dir: bool = false
     var dir: u64 = 0
@@ -460,6 +583,16 @@ fn main(start: u64) -> i32 {
         io.fmt_print(f"gpuparity: Vulkan open, software device (lavapipe-like)={gpu_vk.vkgl_is_cpu()}\n")
     } else {
         io.print("gpuparity: GPU not opened (forced fail) -- fallback run\n")
+    }
+    if perf {
+        if gp as usize == 0 {
+            return 4
+        }
+        io.fmt_print(f"gpuperf: device={gpu_vk.vkgl_device() != 0} software={gpu_vk.vkgl_is_cpu()}\n")
+        if perf_run(gp, fm) {
+            return 0
+        }
+        return 1
     }
     var all: bool = true
     if !run_case(gp, fm, false, false, dir, have_dir, "light-notext") {
