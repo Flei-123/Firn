@@ -171,6 +171,8 @@ export {
     req_xi_select_touch, req_xi_get_selected, xi_mask_has_touch,
     xi_selected_touch, xi_parse_touch, inject_wire, xi_is_touch_begin, xi_core_echo,
     xi_opcode,
+    // r212: XRandR refresh rate as pure functions + the back end call
+    req_randr_query_version, req_randr_get_screen_info, randr_rate_of_reply, r_refresh_hz,
 }
 
 const RD_ERR: usize = 18446744073709551615
@@ -232,6 +234,9 @@ struct Platte {
     // touches are down; `tlast` the server time of the last touch event,
     // to throw away the core pointer events the server emulates from it.
     xi_op: u32,
+    // r212: XRandR. `rr_op` major opcode (0 = none), `rr_hz` refresh rate of the current mode (0 = unknown)
+    rr_op: u32,
+    rr_hz: i64,
     xi_sel: bool,
     tdown: u32,
     tlast: u32,
@@ -356,7 +361,7 @@ fn surface_new() -> Platte {
         a_protocols: 0, a_delete: 0, dpi: 96, dark: false,
         dark_known: false, dark_us: 0, inj: 0, gift: 0, fail: 0,
         spos: 0, ein_n: 0, ein_hook: in_nothing, ein_ud: 0,
-        km: keymap_new(), full: false, xi_op: 0 as u32, xi_sel: false,
+        km: keymap_new(), full: false, xi_op: 0 as u32, rr_op: 0 as u32, rr_hz: 0, xi_sel: false,
         tdown: 0 as u32, tlast: 0 as u32, pq: pointers.pointers_new(),
         rawk: false, pend_on: false, pend_k: 0 as u32, pend_a: 0 as u32, pend_x: 0 as u32, pend_y: 0 as u32, pend_s: 0 as u32,
         cur_mode: 0 as u32, cur_shape: 0 as u32, cur_blank: 0 as u32, cur_glyph: [0 as u32; 8], cur_font: 0 as u32,
@@ -670,6 +675,78 @@ fn fetch_xi(x: *mut Platte) {
     if major > 2 as u32 || (major == 2 as u32 && minor >= 2 as u32) {
         (*x).xi_op = op
     }
+}
+
+// ---- r212: XRandR refresh rate.
+//
+// QueryExtension "RANDR" -> major opcode. RRQueryVersion (minor 0): major, minor (4 octets each).
+// RRGetScreenInfo (minor 5): the root window; the reply (32 octets + rates) holds at octet 20 nSizes,
+// 22 sizeID, 24 rotation, 26 the CURRENT RATE in Hz (CARD16), 28 nRates. That rate is the refresh
+// rate of the active mode of the screen; 0 or implausible values (Xvfb) mean "unknown".
+fn req_randr_query_version(b: *mut rt.Buf, op: u32, major: u32, minor: u32) {
+    rt.buf_push(b, op as u8)
+    rt.buf_push(b, 0 as u8)
+    put16(b, 3 as u32)
+    put32(b, major)
+    put32(b, minor)
+}
+
+fn req_randr_get_screen_info(b: *mut rt.Buf, op: u32, win: u32) {
+    rt.buf_push(b, op as u8)
+    rt.buf_push(b, 5 as u8)
+    put16(b, 2 as u32)
+    put32(b, win)
+}
+
+// The current rate out of an RRGetScreenInfo reply (n octets at p); 0 = none/implausible (30..360 accepted).
+fn randr_rate_of_reply(p: u64, n: usize) -> i64 {
+    if n < 32 || rt.ld8(p, 0) != 1 as u8 {
+        return 0
+    }
+    let hz: i64 = ld16le(p, 26) as i64
+    if hz < 30 || hz > 360 {
+        return 0
+    }
+    return hz
+}
+
+fn fetch_randr(x: *mut Platte) {
+    var name: [u8; 5] = "RANDR"
+    var r: rt.Buf = rt.buf_new()
+    req_query_extension(&r, (&name[0]) as u64, 5)
+    var at: usize = 0
+    let n: usize = question(x, &r, &at)
+    rt.buf_free(&r)
+    if n == 0 {
+        return
+    }
+    let op: u32 = xi_opcode((*x).rb.ptr + at as u64)
+    if op == 0 as u32 {
+        return
+    }
+    var q: rt.Buf = rt.buf_new()
+    req_randr_query_version(&q, op, 1 as u32, 2 as u32)
+    var at2: usize = 0
+    let n2: usize = question(x, &q, &at2)
+    rt.buf_free(&q)
+    if n2 == 0 {
+        return
+    }
+    var g: rt.Buf = rt.buf_new()
+    req_randr_get_screen_info(&g, op, (*x).root)
+    var at3: usize = 0
+    let n3: usize = question(x, &g, &at3)
+    rt.buf_free(&g)
+    if n3 == 0 {
+        return
+    }
+    (*x).rr_op = op
+    (*x).rr_hz = randr_rate_of_reply((*x).rb.ptr + at3 as u64, n3)
+}
+
+// The refresh rate of the screen in Hz, 0 = the server did not tell (then the host keeps 60).
+fn r_refresh_hz(x: *mut Platte) -> i64 {
+    return (*x).rr_hz
 }
 
 // Set the hook. `ud` the host passes through to itself.
@@ -1817,6 +1894,8 @@ fn r_open(x: *mut Platte, disp: usize) -> bool {
     fetch_keymap(x, su.kmin, su.kmax)
     // r112: touch (XInput 2.2), also before the window
     fetch_xi(x)
+    // r212: refresh rate (XRandR), also before the window
+    fetch_randr(x)
     // L4: die Bildpunktdichte.
     (*x).dpi = dpi_bestimmen(x, s_px, s_mm)
     // L5: light or dark.
