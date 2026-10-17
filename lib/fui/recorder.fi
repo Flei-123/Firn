@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/recorder.fi -- EVENT RECORDER + REPLAY (test recorder, r159/r265).
+//
+// Records the events a platform host feeds into a fUi window as plain text and plays them
+// back later, so a UI test is "record once, replay forever, compare one pixel hash".
+//
+//     var r: recorder.Rec = recorder.rec_new()
+//     recorder.rec_move(&r, host, x, y, ms)        // records AND forwards to fuiwirt
+//     recorder.rec_down(&r, host, x, y, btn, ms)
+//     ...
+//     recorder.rec_text(&r)  / rec_text_len(&r)    // the log, one event per line
+//     recorder.replay(text_ptr, text_len, host)    // feeds the same calls into another host
+//     recorder.hash_pixels(px, w, h)               // FNV-1a over the frame
+//
+// LINE FORMAT: `<kind> <x> <y> <arg> <ms>` -- five integers, space separated, `\n` ends a line.
+// Kinds: M move, D down, U up, L leave, C cancel, K key, H char, T tick, F frame marker. Coordinates are
+// whole pixels (the log is for tests; sub-pixel input is rounded toward zero). `#` starts a
+// comment line, blank lines are skipped. A bad line stops the replay and reports its number.
+//
+// The core (`rec_add`, `parse_line`, `dispatch`) knows no window: `replay_with` takes a
+// callback, so tests of other hosts can reuse the format.
+import std.rt
+import plat.fuiwirt
+
+export {
+    Rec, Ev, rec_new, rec_free, rec_clear, rec_count, rec_text, rec_text_len, rec_add,
+    rec_move, rec_down, rec_up, rec_leave, rec_cancel, rec_key, rec_char, rec_tick,
+    parse_line, dispatch, replay, replay_with, hash_pixels, hash_bytes,
+    K_MOVE, K_DOWN, K_UP, K_LEAVE, K_CANCEL, K_KEY, K_CHAR, K_TICK, K_FRAME, rec_frame,
+}
+
+const K_MOVE: u32 = 77   // 'M'
+const K_DOWN: u32 = 68   // 'D'
+const K_UP: u32 = 85     // 'U'
+const K_LEAVE: u32 = 76  // 'L'
+const K_CANCEL: u32 = 67 // 'C'
+const K_KEY: u32 = 75    // 'K'
+const K_CHAR: u32 = 72   // 'H'
+const K_TICK: u32 = 84   // 'T'
+const K_FRAME: u32 = 70  // 'F' a repaint happened here; the host loop repaints (dispatch ignores it)
+
+struct Rec {
+    b: rt.Buf,
+    n: usize,
+}
+
+struct Ev {
+    kind: u32,
+    x: i64,
+    y: i64,
+    arg: i64,
+    ms: i64,
+}
+
+fn rec_new() -> Rec {
+    return Rec { b: rt.buf_new(), n: 0 }
+}
+
+fn rec_free(r: *mut Rec) {
+    rt.buf_free(&(*r).b)
+    (*r).n = 0
+}
+
+fn rec_clear(r: *mut Rec) {
+    rt.buf_clear(&(*r).b)
+    (*r).n = 0
+}
+
+fn rec_count(r: *mut Rec) -> usize { return (*r).n }
+fn rec_text(r: *mut Rec) -> u64 { return rt.buf_ptr(&(*r).b) }
+fn rec_text_len(r: *mut Rec) -> usize { return rt.buf_len(&(*r).b) }
+
+fn known_kind(k: u32) -> bool {
+    return k == K_MOVE || k == K_DOWN || k == K_UP || k == K_LEAVE
+        || k == K_CANCEL || k == K_KEY || k == K_CHAR || k == K_TICK || k == K_FRAME
+}
+
+// appends one line; unknown kinds are refused
+fn rec_add(r: *mut Rec, kind: u32, x: i64, y: i64, arg: i64, ms: i64) -> bool {
+    if !known_kind(kind) {
+        return false
+    }
+    rt.buf_push(&(*r).b, kind as u8)
+    rt.buf_push(&(*r).b, 32 as u8)
+    rt.buf_push_dec_i64(&(*r).b, x)
+    rt.buf_push(&(*r).b, 32 as u8)
+    rt.buf_push_dec_i64(&(*r).b, y)
+    rt.buf_push(&(*r).b, 32 as u8)
+    rt.buf_push_dec_i64(&(*r).b, arg)
+    rt.buf_push(&(*r).b, 32 as u8)
+    rt.buf_push_dec_i64(&(*r).b, ms)
+    rt.buf_push(&(*r).b, 10 as u8)
+    (*r).n = (*r).n + 1
+    return true
+}
+
+// ---- recording wrappers: record, then forward to the host (return value = host change mask)
+
+fn rec_move(r: *mut Rec, w: *mut fuiwirt.Host, x: f64, y: f64, ms: i64) -> u32 {
+    let ok: bool = rec_add(r, K_MOVE, x as i64, y as i64, 0, ms)
+    return fuiwirt.host_pointer_move(w, x, y)
+}
+
+fn rec_down(r: *mut Rec, w: *mut fuiwirt.Host, x: f64, y: f64, btn: u32, ms: i64) -> u32 {
+    let ok: bool = rec_add(r, K_DOWN, x as i64, y as i64, btn as i64, ms)
+    return fuiwirt.host_pointer_down(w, x, y, btn)
+}
+
+fn rec_up(r: *mut Rec, w: *mut fuiwirt.Host, x: f64, y: f64, btn: u32, ms: i64) -> u32 {
+    let ok: bool = rec_add(r, K_UP, x as i64, y as i64, btn as i64, ms)
+    return fuiwirt.host_pointer_up(w, x, y, btn)
+}
+
+fn rec_leave(r: *mut Rec, w: *mut fuiwirt.Host, ms: i64) -> u32 {
+    let ok: bool = rec_add(r, K_LEAVE, 0, 0, 0, ms)
+    return fuiwirt.host_pointer_leave(w)
+}
+
+fn rec_cancel(r: *mut Rec, w: *mut fuiwirt.Host, ms: i64) -> u32 {
+    let ok: bool = rec_add(r, K_CANCEL, 0, 0, 0, ms)
+    return fuiwirt.host_pointer_cancel(w)
+}
+
+// the key mods ride in x, the key code in arg
+fn rec_key(r: *mut Rec, w: *mut fuiwirt.Host, key: u32, mods: u32, ms: i64) -> u32 {
+    let ok: bool = rec_add(r, K_KEY, mods as i64, 0, key as i64, ms)
+    return fuiwirt.host_key(w, key, mods)
+}
+
+fn rec_char(r: *mut Rec, w: *mut fuiwirt.Host, cp: u32, mods: u32, ms: i64) -> u32 {
+    let ok: bool = rec_add(r, K_CHAR, mods as i64, 0, cp as i64, ms)
+    return fuiwirt.host_char(w, cp, mods)
+}
+
+fn rec_tick(r: *mut Rec, w: *mut fuiwirt.Host, ms: i64) {
+    let ok: bool = rec_add(r, K_TICK, 0, 0, 0, ms)
+    fuiwirt.host_tick(w, ms)
+}
+
+// marks "a frame was painted here" (layout/hover depend on it); replay callbacks repaint on it
+fn rec_frame(r: *mut Rec, ms: i64) {
+    let ok: bool = rec_add(r, K_FRAME, 0, 0, 0, ms)
+}
+
+// ---- parsing
+
+fn is_digit(c: u8) -> bool { return c >= 48 as u8 && c <= 57 as u8 }
+
+// Parses one integer at text[i..end) after skipping spaces; advances *pos. false = no number.
+fn parse_int(p: u64, end: usize, pos: *mut usize, out: *mut i64) -> bool {
+    var i: usize = *pos
+    while i < end && rt.ld8(p, i) == 32 as u8 {
+        i = i + 1
+    }
+    var neg: bool = false
+    if i < end && rt.ld8(p, i) == 45 as u8 {
+        neg = true
+        i = i + 1
+    }
+    if i >= end || !is_digit(rt.ld8(p, i)) {
+        return false
+    }
+    var v: i64 = 0
+    while i < end && is_digit(rt.ld8(p, i)) {
+        v = v * 10 + ((rt.ld8(p, i) as i64) - 48)
+        i = i + 1
+    }
+    if neg {
+        v = 0 - v
+    }
+    *pos = i
+    *out = v
+    return true
+}
+
+// Parses the line text[start..end). Returns 0 = blank/comment (skip), 1 = event in *e, 2 = error.
+fn parse_line(p: u64, start: usize, end: usize, e: *mut Ev) -> u32 {
+    var i: usize = start
+    while i < end && rt.ld8(p, i) == 32 as u8 {
+        i = i + 1
+    }
+    if i >= end || rt.ld8(p, i) == 13 as u8 || rt.ld8(p, i) == 35 as u8 {
+        return 0 as u32
+    }
+    let k: u32 = rt.ld8(p, i) as u32
+    if !known_kind(k) {
+        return 2 as u32
+    }
+    i = i + 1
+    var pos: usize = i
+    var x: i64 = 0
+    var y: i64 = 0
+    var a: i64 = 0
+    var t: i64 = 0
+    if !parse_int(p, end, &pos, &x) || !parse_int(p, end, &pos, &y)
+        || !parse_int(p, end, &pos, &a) || !parse_int(p, end, &pos, &t) {
+        return 2 as u32
+    }
+    while pos < end && (rt.ld8(p, pos) == 32 as u8 || rt.ld8(p, pos) == 13 as u8) {
+        pos = pos + 1
+    }
+    if pos != end {
+        return 2 as u32
+    }
+    (*e).kind = k
+    (*e).x = x
+    (*e).y = y
+    (*e).arg = a
+    (*e).ms = t
+    return 1 as u32
+}
+
+// Feeds one event into the host.
+fn dispatch(w: *mut fuiwirt.Host, e: *mut Ev) {
+    let k: u32 = (*e).kind
+    if k == K_MOVE {
+        let c: u32 = fuiwirt.host_pointer_move(w, (*e).x as f64, (*e).y as f64)
+    } else if k == K_DOWN {
+        let c: u32 = fuiwirt.host_pointer_down(w, (*e).x as f64, (*e).y as f64, (*e).arg as u32)
+    } else if k == K_UP {
+        let c: u32 = fuiwirt.host_pointer_up(w, (*e).x as f64, (*e).y as f64, (*e).arg as u32)
+    } else if k == K_LEAVE {
+        let c: u32 = fuiwirt.host_pointer_leave(w)
+    } else if k == K_CANCEL {
+        let c: u32 = fuiwirt.host_pointer_cancel(w)
+    } else if k == K_KEY {
+        let c: u32 = fuiwirt.host_key(w, (*e).arg as u32, (*e).x as u32)
+    } else if k == K_CHAR {
+        let c: u32 = fuiwirt.host_char(w, (*e).arg as u32, (*e).x as u32)
+    } else if k == K_TICK {
+        fuiwirt.host_tick(w, (*e).ms)
+    }
+}
+
+// Plays the text through `f(ud, event)` after each parsed line. Returns the number of events
+// played, or -(line number) on a bad line (lines count from 1).
+fn replay_with(p: u64, n: usize, ud: u64, f: fn(u64, *mut Ev)) -> i64 {
+    var line: i64 = 1
+    var played: i64 = 0
+    var s: usize = 0
+    var e: Ev = Ev { kind: 0 as u32, x: 0, y: 0, arg: 0, ms: 0 }
+    while s < n {
+        var t: usize = s
+        while t < n && rt.ld8(p, t) != 10 as u8 {
+            t = t + 1
+        }
+        let rc: u32 = parse_line(p, s, t, &e)
+        if rc == 2 as u32 {
+            return 0 - line
+        }
+        if rc == 1 as u32 {
+            f(ud, &e)
+            played = played + 1
+        }
+        s = t + 1
+        line = line + 1
+    }
+    return played
+}
+
+fn dispatch_cb(ud: u64, e: *mut Ev) {
+    dispatch(ud as *mut fuiwirt.Host, e)
+}
+
+fn replay(p: u64, n: usize, w: *mut fuiwirt.Host) -> i64 {
+    return replay_with(p, n, w as u64, dispatch_cb)
+}
+
+// ---- pixel hash (FNV-1a, 64 bit)
+
+fn hash_bytes(p: u64, n: usize) -> u64 {
+    var h: u64 = 14695981039346656037
+    var i: usize = 0
+    while i < n {
+        h = (h ^ (rt.ld8(p, i) as u64)) *% 1099511628211
+        i = i + 1
+    }
+    return h
+}
+
+fn hash_pixels(px: *mut u8, w: usize, h: usize) -> u64 {
+    return hash_bytes(px as u64, w * h * 4)
+}

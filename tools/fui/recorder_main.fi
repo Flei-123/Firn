@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/recorder_main.fi -- test for lib/fui/recorder.fi (event log + replay).
+//
+//     recorder_main          runs all checks, prints RECORDER PASSED / FAILED
+//
+// 1. text format: add / parse round trip, comments, blank lines, bad lines (line number)
+// 2. record a seeded random session into app A, replay the log into a fresh app B:
+//    the final frames must be pixel-identical (FNV hash) and the log must be non-trivial
+// 3. the same log replayed twice gives the same hash (determinism)
+import std.rt
+import paint.canvas
+import font.metrics
+import fui.painter
+import fui.editor
+import fui.recorder
+import plat.fuiwirt
+import plat.sysfont
+import fui.app
+import fui.appctl
+
+static mut FAILS: usize = 0
+static mut CHANGES: usize = 0
+static mut FONT: u64 = 0
+static mut RNG: u64 = 1
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_num(v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn check(ok: bool, what: str) {
+    if !ok {
+        FAILS = FAILS + 1
+        say("FAIL: ")
+        say(what)
+        say("\n")
+    }
+}
+
+fn rnd() -> u64 {
+    var x: u64 = RNG
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    RNG = x
+    return x
+}
+
+fn rnd_to(n: u64) -> u64 {
+    return (rnd() >> 11) % n
+}
+
+struct Surface {
+    cv: canvas.Canvas,
+    z: painter.Painter,
+    w: usize,
+    h: usize,
+}
+
+struct Session {
+    a: *mut app.App,
+    s: *mut Surface,
+}
+
+fn changed(a: *mut app.App, id: usize) {
+    CHANGES = CHANGES + 1
+}
+
+fn btn_none(a: *mut app.App) {
+}
+
+fn build() -> Session {
+    let a: *mut app.App = app.window("Rec", 320, 240)
+    let bt: usize = app.button(a, "Save", btn_none)
+    let cbx: usize = appctl.checkbox(a, "Behind", false, changed)
+    let tg: usize = appctl.toggle(a, "Wi-Fi", true, changed)
+    let sl: usize = appctl.slider(a, "Volume", 0, 100, 30, changed)
+    let sb: usize = appctl.spinbox(a, "Count", 0, 50, 1, 5, changed)
+    let en: usize = app.entry(a, "type here")
+    fuiwirt.host_bind(app.app_host(a))
+    let s: *mut Surface = rt.heap_alloc(65536) as *mut Surface
+    (*s).cv = canvas.canvas_new()
+    (*s).z = painter.painter_new()
+    (*s).w = 320
+    (*s).h = 240
+    let ok1: bool = canvas.canvas_init(&(*s).cv, 320, 240)
+    let ok2: bool = painter.painter_init(&(*s).z, &(*s).cv, 320, 240)
+    painter.painter_set_font(&(*s).z, FONT)
+    app.app_attach(a as u64, &(*s).z)
+    return Session { a: a, s: s }
+}
+
+fn frame(k: *mut Session) {
+    app.app_paint((*k).a as u64, (*(*k).s).w, (*(*k).s).h)
+    fuiwirt.host_painted(app.app_host((*k).a))
+    let c: u32 = fuiwirt.host_after_layout(app.app_host((*k).a))
+}
+
+fn take_activated(k: *mut Session) {
+    let w: *mut fuiwirt.Host = app.app_host((*k).a)
+    let i: usize = fuiwirt.host_take_activated(w)
+    if i != fuiwirt.KEINER {
+        app.app_act((*k).a as u64, i)
+    }
+}
+
+fn session_hash(k: *mut Session) -> u64 {
+    frame(k)
+    frame(k)
+    let px: *mut u8 = canvas.canvas_pixels(&(*(*k).s).cv)
+    return recorder.hash_pixels(px, (*(*k).s).w, (*(*k).s).h)
+}
+
+// one random recorded event
+fn one(r: *mut recorder.Rec, k: *mut Session, ms: i64) {
+    let w: *mut fuiwirt.Host = app.app_host((*k).a)
+    let kind: u64 = rnd_to(100)
+    let x: f64 = (rnd_to(360) as f64) - 20.0
+    let y: f64 = (rnd_to(280) as f64) - 20.0
+    if kind < 35 {
+        let c: u32 = recorder.rec_move(r, w, x, y, ms)
+    } else if kind < 50 {
+        let c: u32 = recorder.rec_down(r, w, x, y, fuiwirt.BTN_LEFT, ms)
+    } else if kind < 65 {
+        let c: u32 = recorder.rec_up(r, w, x, y, fuiwirt.BTN_LEFT, ms)
+    } else if kind < 68 {
+        let c: u32 = recorder.rec_leave(r, w, ms)
+    } else if kind < 70 {
+        let c: u32 = recorder.rec_cancel(r, w, ms)
+    } else if kind < 80 {
+        let c: u32 = recorder.rec_key(r, w, (rnd_to(14) as u32) + 1 as u32, rnd_to(4) as u32, ms)
+    } else if kind < 90 {
+        let c: u32 = recorder.rec_char(r, w, (rnd_to(95) as u32) + 32 as u32, 0 as u32, ms)
+    } else {
+        recorder.rec_tick(r, w, ms)
+    }
+    take_activated(k)
+}
+
+fn play_cb(ud: u64, e: *mut recorder.Ev) {
+    let k: *mut Session = ud as *mut Session
+    if (*e).kind == recorder.K_FRAME {
+        frame(k)
+        return
+    }
+    recorder.dispatch(app.app_host((*k).a), e)
+    take_activated(k)
+}
+
+fn check_format() {
+    var r: recorder.Rec = recorder.rec_new()
+    check(recorder.rec_add(&r, recorder.K_MOVE, 10, 0 - 5, 0, 1000), "add move")
+    check(recorder.rec_add(&r, recorder.K_DOWN, 11, 12, 1, 1007), "add down")
+    check(!recorder.rec_add(&r, 90 as u32, 0, 0, 0, 0), "unknown kind refused")
+    check(recorder.rec_count(&r) == 2, "count 2")
+    var e: recorder.Ev = recorder.Ev { kind: 0 as u32, x: 0, y: 0, arg: 0, ms: 0 }
+    let p: u64 = recorder.rec_text(&r)
+    check(recorder.parse_line(p, 0, 14, &e) == 1 as u32, "parse line 1")
+    check(e.kind == recorder.K_MOVE && e.x == 10 && e.y == 0 - 5 && e.ms == 1000, "line 1 values")
+    recorder.rec_free(&r)
+
+    // comments, blank lines, trailing CR
+    let t1: str = "# header\n\nM 1 2 0 5\r\nT 0 0 0 9\n"
+    check(recorder.replay_with(t1.p as u64, t1.n, 0, count_cb) == 2, "comments skipped, 2 events")
+    // bad line number is reported (line 3)
+    let t2: str = "M 1 2 0 5\n# c\nM 1 x 0 5\nT 0 0 0 9\n"
+    check(recorder.replay_with(t2.p as u64, t2.n, 0, count_cb) == 0 - 3, "bad line 3 reported")
+    // missing field, unknown kind, extra field
+    let t3: str = "M 1 2 0\n"
+    check(recorder.replay_with(t3.p as u64, t3.n, 0, count_cb) == 0 - 1, "missing field")
+    let t4: str = "Z 1 2 0 5\n"
+    check(recorder.replay_with(t4.p as u64, t4.n, 0, count_cb) == 0 - 1, "unknown kind")
+    let t5: str = "M 1 2 0 5 6\n"
+    check(recorder.replay_with(t5.p as u64, t5.n, 0, count_cb) == 0 - 1, "extra field")
+    // empty input
+    check(recorder.replay_with(t1.p as u64, 0, 0, count_cb) == 0, "empty log")
+    // hash: stable and sensitive
+    let h1: u64 = recorder.hash_bytes(t1.p as u64, t1.n)
+    let h2: u64 = recorder.hash_bytes(t2.p as u64, t2.n)
+    check(h1 == recorder.hash_bytes(t1.p as u64, t1.n) && h1 != h2, "hash stable and sensitive")
+}
+
+fn count_cb(ud: u64, e: *mut recorder.Ev) {
+}
+
+fn main(start: u64) -> i32 {
+    let fs: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    if !sysfont.sysfont_load(fs) {
+        say("recorder: no font (DejaVu Sans)\n")
+        return 9
+    }
+    FONT = fs as u64
+    check_format()
+
+    RNG = 7 * 2654435761 + 88172645463325252
+    var k1: Session = build()
+    frame(&k1)
+    var r: recorder.Rec = recorder.rec_new()
+    var ms: i64 = 1000
+    var n: usize = 0
+    while n < 600 {
+        one(&r, &k1, ms)
+        ms = ms + 11
+        if n % 7 == 6 {
+            frame(&k1)
+            recorder.rec_frame(&r, ms)
+        }
+        n = n + 1
+    }
+    let ha: u64 = session_hash(&k1)
+    check(recorder.rec_count(&r) == 600 + 85, "events recorded")
+    check(CHANGES > 0, "session changed some controls")
+
+    var k2: Session = build()
+    frame(&k2)
+    let played: i64 = recorder.replay_with(recorder.rec_text(&r), recorder.rec_text_len(&r), (&k2) as u64, play_cb)
+    check(played == 685, "replay played 600 events")
+    let hb: u64 = session_hash(&k2)
+    check(ha == hb, "replay frame is pixel-identical to the recorded one")
+
+    var k3: Session = build()
+    frame(&k3)
+    let played3: i64 = recorder.replay_with(recorder.rec_text(&r), recorder.rec_text_len(&r), (&k3) as u64, play_cb)
+    check(played3 == 685 && session_hash(&k3) == hb, "second replay is deterministic")
+
+    say("RECORDER events=")
+    say_num(recorder.rec_count(&r) as i64)
+    say(" bytes=")
+    say_num(recorder.rec_text_len(&r) as i64)
+    say("\n")
+    recorder.rec_free(&r)
+    if FAILS > 0 {
+        say("RECORDER FAILED\n")
+        return 1
+    }
+    say("RECORDER PASSED\n")
+    return 0
+}
