@@ -1,0 +1,483 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/gpuparity_main.fi -- THE SAME PAGE IN MEMORY AND ON VULKAN (W18-F2).
+//
+//     gpuparity_main [<out dir>] [<font.ttf>]     compare the zoo page (every way fUi draws) CPU vs GPU
+//     gpuparity_main perf [<font.ttf>]           time a 1920x1080 frame on the CPU and on the Vulkan table
+//
+// Each scheme (light, dark) is painted twice: once into a canvas in memory (the reference) and once into a canvas that lies on
+// the GPU (lib/fui/gpu.fi on the Vulkan GlApi table, lib/fui/gpu_vk.fi); the GPU picture is read back and compared per
+// channel. The page is the one of tools/fui/gpuzoo_web.fi (gpucheck.py's page), so a difference points at one drawing call.
+//
+// GATE (docs/fui-gpu-path.md): mean absolute difference over all channels <= 1.0; the page WITHOUT text: largest difference
+// <= 12; the page WITH text (glyphs come from an 8 bit atlas at quarter pixel steps, the CPU rasters them exactly): at most
+// 5 per mille of the pixels differ by more than 32. Both runs must leave the CPU picture untouched.
+//
+// FALLBACK (FUI_GPU_FAIL=open|compile, or a machine without Vulkan): the GPU does not open, the same page is painted by the CPU
+// painter a second time and must equal the first run bit for bit. Exit 0 = held, 1 = broken, 2 = usage / no font, 4 = no
+// Vulkan (SKIP).
+import std.rt
+import std.io
+import std.env
+import fui.safeout
+import html.mem
+import paint.canvas
+import paint.png
+import paint.gl
+import font.metrics
+import fui.gpu
+import fui.gpu_vk
+import fui.painter
+import fui.theme
+import fui.effect
+import fui.icons
+import fui.render
+import fui.transform
+import fui.uiimage
+
+const FONTSET_BYTES: usize = 4096
+const PW: usize = 1240
+const PH: usize = 720
+const NREG: usize = 14
+
+static mut G_PIC: u64 = 0
+
+fn picture() -> uiimage.Image {
+    let w: usize = 48
+    let h: usize = 32
+    if G_PIC == 0 {
+        G_PIC = rt.heap_alloc(w * h * 4)
+        var y: usize = 0
+        while y < h {
+            var x: usize = 0
+            while x < w {
+                let o: u64 = G_PIC + ((y * w + x) * 4) as u64
+                var r: u8 = 40 as u8
+                var g: u8 = 120 as u8
+                var b: u8 = 220 as u8
+                var a: u8 = 255 as u8
+                if ((x / 6) + (y / 6)) % 2 == 1 {
+                    r = 240 as u8
+                    g = 180 as u8
+                    b = 40 as u8
+                }
+                let dx: f64 = (x as f64) - 30.0
+                let dy: f64 = (y as f64) - 14.0
+                let d: f64 = dx * dx + dy * dy
+                if d < 100.0 {
+                    r = 230 as u8
+                    g = 40 as u8
+                    b = 90 as u8
+                    a = (255.0 - d * 2.0) as u8
+                }
+                if x + y < 8 {
+                    a = 0 as u8
+                }
+                *(o as *mut u8) = r
+                *((o + 1) as *mut u8) = g
+                *((o + 2) as *mut u8) = b
+                *((o + 3) as *mut u8) = a
+                x = x + 1
+            }
+            y = y + 1
+        }
+    }
+    return uiimage.image_wrap(G_PIC, w, h, 0)
+}
+
+fn say(z: *mut painter.Painter, x: f64, y: f64, size: f64, col: u32, s: str) {
+    let e: f64 = painter.text(z, x, y, 400.0, size, col, s.p as u64, s.n, painter.TEXT_L)
+}
+
+// The page. `text` false leaves out every glyph (the strict, text free comparison).
+fn zoo(z: *mut painter.Painter, dark: bool, text: bool) {
+    var ground: u32 = 4293783543 as u32 // 0xFFEEF2F7
+    var ink: u32 = 4279507503 as u32 // 0xFF15202F
+    if dark {
+        ground = 4279309597 as u32 // 0xFF12181D
+        ink = 4293651435 as u32 // 0xFFECEFF3
+    }
+    painter.painter_clear(z, ground)
+    var spots: [f64; 16] = [260.0, 120.0, 260.0, 160.0, 0.6, 120.0, 80.0, 240.0,
+        900.0, 420.0, 300.0, 220.0, 0.5, 40.0, 200.0, 160.0]
+    effect.glow_ground(z, 0.0, 0.0, 1240.0, 720.0, ground, 4292335607 as u32,
+        (&spots[0]) as u64, 2)
+    painter.surface(z, 20.0, 20.0, 160.0, 60.0, 4282532351 as u32)
+    painter.round_rect(z, 200.0, 20.0, 160.0, 60.0, 14.0, 4294930176 as u32)
+    painter.round_ring(z, 380.0, 20.0, 160.0, 60.0, 30.0, 3.0, 4278229503 as u32)
+    painter.round_rect_grad(z, 560.0, 20.0, 160.0, 60.0, 20.0, 4294901760 as u32,
+        4278190335 as u32, 1.0, 1.0)
+    if text {
+        say(z, 20.0, 120.0, 18.0, ink, "fUi auf der GPU -- ÄÖÜ äöü ß 0123456789")
+        var r1: painter.TextRun = painter.run_set_shadow(painter.run_plain(22.0), 2.0, 2.0,
+            2147483648 as u32)
+        let a1: str = "Schatten"
+        let e1: f64 = painter.run_draw(z, &r1, 20.0, 160.0, 300.0, ink, a1.p as u64, a1.n,
+            painter.TEXT_L)
+        var r2: painter.TextRun = painter.run_set_outline(painter.run_plain(26.0), 2.0,
+            4294901760 as u32)
+        let a2: str = "Kontur"
+        let e2: f64 = painter.run_draw(z, &r2, 200.0, 160.0, 300.0, 4294967295 as u32,
+            a2.p as u64, a2.n, painter.TEXT_L)
+        var r3: painter.TextRun = painter.run_set_gradient(painter.run_plain(28.0),
+            4278255360 as u32)
+        let a3: str = "Verlauf"
+        let e3: f64 = painter.run_draw(z, &r3, 380.0, 160.0, 300.0, 4294902015 as u32,
+            a3.p as u64, a3.n, painter.TEXT_L)
+    }
+    var k: i64 = 0
+    while k < 12 {
+        icons.icon_stroke(z, k, 20.0 + (k as f64) * 34.0, 190.0, 24.0, ink, 2.0)
+        icons.icon_filled(z, k, 20.0 + (k as f64) * 34.0, 224.0, 16.0 + (k % 3) as f64 * 4.0,
+            4282532351 as u32)
+        k = k + 1
+    }
+    effect.rrect_shadow(z, 40.0, 290.0, 180.0, 70.0, 16.0, 6.0, 14.0, 1711276032 as u32)
+    effect.rrect_fast(z, 40.0, 290.0, 180.0, 70.0, 16.0, 4294967295 as u32,
+        4293258485 as u32)
+    effect.ramp_rect(z, 250.0, 290.0, 180.0, 70.0, 4282532351 as u32, 1 as u32)
+    effect.veil_rect(z, 460.0, 290.0, 180.0, 70.0, 1996488704 as u32)
+    let f1: bool = effect.frost_rect(z, 680.0, 280.0, 240.0, 90.0, 18, 1728053247 as u32)
+    let f2: bool = effect.backdrop_blur(z, 950.0, 280.0, 240.0, 90.0, 18.0, 10,
+        1442840575 as u32)
+    let f3: bool = effect.glass_round(z, 680.0, 390.0, 240.0, 80.0, 20.0, dark)
+    let f4: bool = effect.drop_shadow_round(z, 960.0, 400.0, 200.0, 60.0, 14.0, 0.0,
+        6.0, 8, 2013265920 as u32)
+    painter.round_rect(z, 960.0, 400.0, 200.0, 60.0, 14.0, 4294967295 as u32)
+    var pic: uiimage.Image = picture()
+    uiimage.image_draw_rect(z, &pic, 40.0, 400.0, 96.0, 64.0, 0 as u32)
+    uiimage.image_draw_rect(z, &pic, 150.0, 410.0, 30.0, 20.0, 0 as u32)
+    uiimage.image_draw_rect(z, &pic, 200.0, 400.0, 96.0, 64.0, 4278229503 as u32)
+    var xf: transform.Xform = transform.xf_new()
+    transform.xf_rotate_at(&xf, 18.0, 400.0, 560.0)
+    transform.tf_fill_round_rect(z, &xf, 340.0, 520.0, 140.0, 70.0, 16.0,
+        4282532351 as u32)
+    if text {
+        let tt: str = "gedreht"
+        let e4: f64 = transform.tf_text(z, &xf, 340.0, 630.0, 300.0, 24.0, ink, tt.p as u64,
+            tt.n, painter.TEXT_L)
+    }
+    transform.tf_draw_image(z, &xf, &pic, 520.0, 520.0, 96.0, 64.0, 1.0)
+    transform.tf_fill_quad(z, 700.0, 520.0, 820.0, 540.0, 800.0, 640.0, 690.0, 610.0,
+        4294930176 as u32)
+}
+
+// ---------------------------------------------------------------- comparing
+
+// out[0] sum of |d| over the 4 channels, [1] the largest |d|, [2] pixels with a channel difference over 32, [3] pixels
+fn cmp_region(a: u64, b: u64, w: usize, x0: i64, y0: i64, x1: i64, y1: i64, out: *mut [i64; 4]) {
+    var sum: i64 = 0
+    var mx: i64 = 0
+    var big: i64 = 0
+    var n: i64 = 0
+    var y: i64 = y0
+    while y < y1 {
+        var x: i64 = x0
+        while x < x1 {
+            let o: usize = ((y as usize) * w + (x as usize)) * 4
+            var worst: i64 = 0
+            var c: usize = 0
+            while c < 4 {
+                var d: i64 = (rt.ld8(a, o + c) as i64) - (rt.ld8(b, o + c) as i64)
+                if d < 0 {
+                    d = 0 - d
+                }
+                sum = sum + d
+                if d > worst {
+                    worst = d
+                }
+                c = c + 1
+            }
+            if worst > mx {
+                mx = worst
+            }
+            if worst > 32 {
+                big = big + 1
+            }
+            n = n + 1
+            x = x + 1
+        }
+        y = y + 1
+    }
+    (*out)[0] = sum
+    (*out)[1] = mx
+    (*out)[2] = big
+    (*out)[3] = n
+}
+
+fn r3(v: f64) -> f64 {
+    return ((v * 1000.0 + 0.5) as i64) as f64 / 1000.0
+}
+
+// The regions of the page (x0, y0, x1, y1) -- diagnosis only; the gate looks at the whole picture.
+fn region_set(rg: *mut [i64; 56], names: *mut [str; 14]) {
+    var v: [i64; 56] = [
+        20, 20, 730, 85,    // shapes
+        15, 100, 700, 200,  // text runs
+        15, 186, 440, 250,  // icons
+        20, 275, 240, 380,  // shadow + rrect_fast
+        245, 285, 435, 365, // ramp
+        455, 285, 645, 365, // veil
+        675, 275, 925, 375, // frost
+        945, 275, 1195, 375, // backdrop blur
+        675, 385, 925, 475, // glass round
+        945, 390, 1175, 470, // drop shadow
+        35, 395, 305, 470,  // pictures
+        330, 505, 480, 600, // turned round rect
+        330, 600, 520, 650, // turned text
+        510, 505, 830, 660, // turned picture + quad
+    ]
+    var i: usize = 0
+    while i < 56 {
+        (*rg)[i] = v[i]
+        i = i + 1
+    }
+    (*names)[0] = "shapes"
+    (*names)[1] = "text runs"
+    (*names)[2] = "icons"
+    (*names)[3] = "shadow+fast"
+    (*names)[4] = "ramp"
+    (*names)[5] = "veil"
+    (*names)[6] = "frost"
+    (*names)[7] = "backdrop blur"
+    (*names)[8] = "glass round"
+    (*names)[9] = "drop shadow"
+    (*names)[10] = "pictures"
+    (*names)[11] = "turned rrect"
+    (*names)[12] = "turned text"
+    (*names)[13] = "turned pic/quad"
+}
+
+fn diff_image(a: u64, b: u64, w: usize, h: usize, out: *mut canvas.Canvas) {
+    var y: usize = 0
+    while y < h {
+        var x: usize = 0
+        while x < w {
+            let o: usize = (y * w + x) * 4
+            let op: u64 = canvas.canvas_pixels(out) as u64 + (o as u64)
+            var c: usize = 0
+            while c < 3 {
+                var d: i64 = (rt.ld8(a, o + c) as i64) - (rt.ld8(b, o + c) as i64)
+                if d < 0 {
+                    d = 0 - d
+                }
+                d = d * 8
+                if d > 255 {
+                    d = 255
+                }
+                *((op + (c as u64)) as *mut u8) = d as u8
+                c = c + 1
+            }
+            *((op + 3) as *mut u8) = 255 as u8
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// <dir>/<name> as a NUL ended path in `pf`
+fn join(dir: u64, pre: str, tag: str, pf: *mut rt.Buf) {
+    var k: usize = 0
+    let n: usize = rt.c_length(dir)
+    while k < n {
+        rt.buf_push(pf, rt.ld8(dir, k))
+        k = k + 1
+    }
+    rt.buf_push(pf, 47 as u8)
+    k = 0
+    while k < pre.length() {
+        rt.buf_push(pf, pre.chars(k))
+        k = k + 1
+    }
+    k = 0
+    while k < tag.length() {
+        rt.buf_push(pf, tag.chars(k))
+        k = k + 1
+    }
+    rt.buf_push(pf, 46 as u8)
+    rt.buf_push(pf, 112 as u8)
+    rt.buf_push(pf, 110 as u8)
+    rt.buf_push(pf, 103 as u8)
+    rt.buf_push(pf, 0 as u8)
+}
+
+fn save_png(cv: *mut canvas.Canvas, dir: u64, pre: str, tag: str) -> bool {
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if !png.write_png(cv, &out) {
+        return false
+    }
+    var pf: rt.Buf = rt.buf_new()
+    join(dir, pre, tag, &pf)
+    return safeout.write_file(rt.buf_ptr(&pf), mem.buf_ptr(&out) as u64, mem.buf_len(&out))
+}
+
+fn load_font(path_arg: u64, have_arg: bool) -> u64 {
+    var fbuf: rt.Buf = rt.buf_new()
+    var have: bool = false
+    if have_arg {
+        have = rt.read_file(path_arg, &fbuf)
+    }
+    if !have {
+        var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+        have = rt.read_file((&f1[0]) as u64, &fbuf)
+    }
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 {
+        return 0
+    }
+    *fsp = metrics.fontset_new()
+    if have {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            return fsp as u64
+        }
+    }
+    return 0
+}
+
+// One scheme, one text flag. `g` is null when the GPU does not open (fallback run). Returns false when the gate breaks.
+#[allow_escape]
+fn run_case(g: *mut gpu.Gpu, fm: u64, dark: bool, text: bool, dir: u64, have_dir: bool, tag: str) -> bool {
+    var cva: canvas.Canvas = canvas.canvas_new()
+    var cvb: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cva, PW, PH) || !canvas.canvas_init(&cvb, PW, PH) {
+        return false
+    }
+    var za: painter.Painter = painter.painter_new()
+    var zb: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&za, &cva, 1200, 120) || !painter.painter_init(&zb, &cvb, 1200, 120) {
+        return false
+    }
+    painter.painter_set_font(&za, fm)
+    painter.painter_set_font(&zb, fm)
+    // the reference: in memory
+    zoo(&za, dark, text)
+    let pa: u64 = canvas.canvas_pixels(&cva) as u64
+    let pb: u64 = canvas.canvas_pixels(&cvb) as u64
+    var on_gpu: bool = false
+    if g as usize != 0 {
+        on_gpu = gpu.gpu_attach(g, &cvb)
+    }
+    zoo(&zb, dark, text)
+    if on_gpu {
+        gpu.gpu_read(g, 0, 0, PW as i32, PH as i32, pb, PW * 4)
+        gpu.gpu_detach(g, &cvb)
+    }
+    var tot: [i64; 4] = [0; 4]
+    cmp_region(pa, pb, PW, 0, 0, PW as i64, PH as i64, &tot)
+    let npx: i64 = tot[3]
+    let mean: f64 = (tot[0] as f64) / ((npx * 4) as f64)
+    let share: f64 = (tot[2] as f64) * 1000.0 / (npx as f64)
+    io.fmt_print(f"gpuparity {tag}: gpu={on_gpu} mean={r3(mean)} max={tot[1]} over32={tot[2]} px ({r3(share)} per mille)\n")
+    var ok: bool = true
+    if !on_gpu {
+        // the fallback: the second CPU run must be the first, bit for bit
+        if tot[0] != 0 {
+            ok = false
+        }
+        io.fmt_print(f"gpuparity {tag}: fallback bit-equal={tot[0] == 0}\n")
+    } else {
+        if mean > 1.0 {
+            ok = false
+        }
+        if !text && tot[1] > 12 {
+            ok = false
+        }
+        if text && share > 5.0 {
+            ok = false
+        }
+        var vs: [u64; 4] = [0; 4]
+        gpu_vk.vkgl_stats(&vs[0])
+        io.fmt_print(f"    vulkan so far: draws={vs[0]} submits={vs[1]} uploads={vs[2]} readbacks={vs[3]}\n")
+        // per region (diagnosis)
+        var rg: [i64; 56] = [0; 56]
+        var nm: [str; 14] = ["", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+        region_set(&rg, &nm)
+        var i: usize = 0
+        while i < NREG {
+            var rs: [i64; 4] = [0; 4]
+            cmp_region(pa, pb, PW, rg[i * 4], rg[i * 4 + 1], rg[i * 4 + 2], rg[i * 4 + 3], &rs)
+            let rm: f64 = (rs[0] as f64) / ((rs[3] * 4) as f64)
+            io.fmt_print(f"    {nm[i]}: mean={r3(rm)} max={rs[1]} over32={rs[2]}/{rs[3]}\n")
+            i = i + 1
+        }
+    }
+    if have_dir {
+        let a1: bool = save_png(&cva, dir, "cpu-", tag)
+        let a2: bool = save_png(&cvb, dir, "gpu-", tag)
+        var cd: canvas.Canvas = canvas.canvas_new()
+        if canvas.canvas_init(&cd, PW, PH) {
+            diff_image(pa, pb, PW, PH, &cd)
+            let a3: bool = save_png(&cd, dir, "diff-", tag)
+            canvas.canvas_free(&cd)
+        }
+    }
+    painter.painter_free(&za)
+    painter.painter_free(&zb)
+    canvas.canvas_free(&cva)
+    canvas.canvas_free(&cvb)
+    return ok
+}
+
+fn main(start: u64) -> i32 {
+    var have_dir: bool = false
+    var dir: u64 = 0
+    var font_arg: u64 = 0
+    var have_font: bool = false
+    var perf: bool = false
+    var ai: usize = 1
+    while ai < rt.arg_count(start) {
+        let ap: u64 = rt.arg_ptr(start, ai)
+        if rt.c_length(ap) == 4 && rt.ld8(ap, 0) == 112 as u8 && rt.ld8(ap, 1) == 101 as u8 {
+            perf = true
+        } else if rt.c_length(ap) > 4 && rt.ld8(ap, rt.c_length(ap) - 4) == 46 as u8 {
+            font_arg = ap
+            have_font = true
+        } else {
+            dir = ap
+            have_dir = true
+        }
+        ai = ai + 1
+    }
+    let fm: u64 = load_font(font_arg, have_font)
+    if fm == 0 {
+        io.print("gpuparity: no font found -- no font, no proof\n")
+        return 2
+    }
+    var api: gl.GlApi = gl.gl_api_new()
+    var g: gpu.Gpu = gpu.gpu_new()
+    var forced: bool = env.has("FUI_GPU_FAIL")
+    var opened: bool = false
+    if gpu_vk.vkgl_api(&api) {
+        opened = gpu.gpu_open(&g, &api)
+    }
+    if !opened && !forced {
+        io.fmt_print(f"gpuparity: SKIP, no Vulkan (step={gpu_vk.vkgl_step()})\n")
+        return 4
+    }
+    var gp: *mut gpu.Gpu = 0 as u64 as *mut gpu.Gpu
+    if opened {
+        gp = &g
+        io.fmt_print(f"gpuparity: Vulkan open, software device (lavapipe-like)={gpu_vk.vkgl_is_cpu()}\n")
+    } else {
+        io.print("gpuparity: GPU not opened (forced fail) -- fallback run\n")
+    }
+    var all: bool = true
+    if !run_case(gp, fm, false, false, dir, have_dir, "light-notext") {
+        all = false
+    }
+    if !run_case(gp, fm, true, false, dir, have_dir, "dark-notext") {
+        all = false
+    }
+    if !run_case(gp, fm, false, true, dir, have_dir, "light-text") {
+        all = false
+    }
+    if !run_case(gp, fm, true, true, dir, have_dir, "dark-text") {
+        all = false
+    }
+    if all {
+        io.print("gpuparity: OK\n")
+        return 0
+    }
+    io.print("gpuparity: BROKEN\n")
+    return 1
+}
