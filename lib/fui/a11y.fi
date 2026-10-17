@@ -79,6 +79,11 @@ export {
     a11y_focusable, a11y_order, a11y_order_len, a11y_order_at,
     a11y_bind_panel, a11y_reveal, a11y_tab, a11y_focus_visible,
     a11y_role_name, a11y_dump,
+    // r19/r20 (W5): heading level, description, virtual list rows, JSON export
+    a11y_set_level, a11y_level, a11y_set_description, a11y_set_described_by,
+    a11y_description, a11y_bind_vlist, a11y_vrow_first, a11y_vrow_end,
+    a11y_vrow_total, a11y_vrow_name, a11y_vrow_state, a11y_vrow_rect,
+    a11y_dump_json, a11y_hit, a11y_hit_row,
 }
 
 import fui.widget
@@ -86,6 +91,7 @@ import fui.scene
 import fui.wave2
 import fui.control
 import fui.viewport
+import fui.vlist
 
 // ======================================================= THE SIZE
 //
@@ -179,11 +185,27 @@ struct Ann {
     // A button that latches (aria-pressed). Its state is the VALUE
     // of the widget, 0 = up, otherwise pressed.
     toggle: u32,
+    // r20: heading level 1..6 (aria-level), 0 = not set (a heading then counts as 2).
+    level: u32,
+    // r19: description (aria-description: pointer + length, owned by the caller)
+    // and the description by a connected node (aria-describedby: an ID).
+    dp: u64,
+    dn: usize,
+    dby: u32,
+    // r19: a virtual list bound to this node. Its rows are not nodes of the
+    // tree; the dump and a bridge ask the model for the rows that show.
+    vl: u64,
+    vsrc: fn(u64, usize, *mut vlist.VRow),
+    vud: u64,
 }
+
+fn vsrc_none(ud: u64, i: usize, r: *mut vlist.VRow) {}
 
 fn ann_blank() -> Ann {
     return Ann { role: ROLE_NONE, np: 0, nn: 0, has_name: 0 as u32,
-        lby: 0 as u32, exp: 0 as u32, ro: 0 as u32, toggle: 0 as u32 }
+        lby: 0 as u32, exp: 0 as u32, ro: 0 as u32, toggle: 0 as u32,
+        level: 0 as u32, dp: 0, dn: 0, dby: 0 as u32,
+        vl: 0, vsrc: vsrc_none, vud: 0 }
 }
 
 struct A11y {
@@ -1345,6 +1367,20 @@ fn dump_node(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out,
         put(o, 47 as u8)
         put_dec(o, a11y_set_size(sc, ax, i) as i64)
     }
+    if slot_ok(i) && (*ax).a[i].level != 0 as u32 && r == ROLE_HEADING {
+        put_lit(o, " level=")
+        put_dec(o, (*ax).a[i].level as i64)
+    }
+    let dvor: usize = (*o).n
+    put_lit(o, " desc=\"")
+    (*o).esc = 1 as u32
+    let dn: usize = desc_into(sc, ax, i, o)
+    (*o).esc = 0 as u32
+    if dn == 0 {
+        (*o).n = dvor
+    } else {
+        put(o, 34 as u8)
+    }
     put(o, 32 as u8)
     put(o, 64 as u8)
     put_dec(o, scene.node_x(sc, i) as i64)
@@ -1355,6 +1391,7 @@ fn dump_node(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out,
     put(o, 120 as u8)
     put_dec(o, scene.node_h(sc, i) as i64)
     put(o, 10 as u8)
+    dump_vrows(sc, ax, i, o, depth + 1)
     var c: usize = scene.scene_first_child(sc, i)
     while c != scene.SCENE_NONE {
         dump_node(sc, ax, c, o, depth + 1)
@@ -1374,4 +1411,452 @@ fn a11y_dump(sc: *mut scene.Scene, ax: *mut A11y, p: u64,
         dump_node(sc, ax, r, &o, 0)
     }
     return o.n
+}
+
+// ======================================================================
+// W5: HEADING LEVEL, DESCRIPTION, VIRTUAL LIST ROWS, JSON EXPORT, POINTER PATH
+// ======================================================================
+//
+// HEADING LEVEL (aria-level). 1..6; anything else is ignored. A heading with no
+// level set counts as 2, as on the web -- `a11y_level` says 2, while the text
+// dump writes " level=N" only for an EXPLICIT level (the old lines stay as
+// they were). Every other role has level 0.
+fn a11y_set_level(ax: *mut A11y, i: usize, l: u32) {
+    if !slot_ok(i) || l > 6 as u32 {
+        return
+    }
+    (*ax).a[i].level = l
+}
+
+fn a11y_level(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> u32 {
+    if a11y_role(sc, ax, i) != ROLE_HEADING {
+        return 0 as u32
+    }
+    if slot_ok(i) && (*ax).a[i].level != 0 as u32 {
+        return (*ax).a[i].level
+    }
+    return 2 as u32
+}
+
+// THE DESCRIPTION (aria-description / aria-describedby): the second, longer
+// text a screen reader says AFTER name and role ("Password, edit, at least 8
+// characters"). An explicit text wins; otherwise the node whose ID was
+// named by `a11y_set_described_by` is read like a label (its own text, then
+// its children). The text belongs to the caller, as with the name.
+fn a11y_set_description(ax: *mut A11y, i: usize, p: u64, n: usize) {
+    if !slot_ok(i) {
+        return
+    }
+    (*ax).a[i].dp = p
+    (*ax).a[i].dn = n
+}
+
+fn a11y_set_described_by(ax: *mut A11y, i: usize, id: u32) {
+    if !slot_ok(i) {
+        return
+    }
+    (*ax).a[i].dby = id
+}
+
+fn desc_into(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out) -> usize {
+    (*o).start = (*o).n
+    (*o).pend = 0 as u32
+    let begin: usize = (*o).n
+    if i >= scene.scene_count(sc) || !slot_ok(i) {
+        return 0
+    }
+    if (*ax).a[i].dn > 0 {
+        put_text(o, (*ax).a[i].dp, (*ax).a[i].dn)
+        if (*o).n > begin {
+            return (*o).n - begin
+        }
+    }
+    if (*ax).a[i].dby != 0 as u32 {
+        let j: usize = scene.scene_find_id(sc, (*ax).a[i].dby)
+        if j != scene.SCENE_NONE && j != i {
+            label_text(sc, ax, j, o, 0)
+        }
+    }
+    if (*o).n <= begin {
+        (*o).n = begin
+        (*o).pend = 0 as u32
+        return 0
+    }
+    return (*o).n - begin
+}
+
+// The description into the buffer `p` (length `cap`); returned is the full
+// length, 0 = none.
+fn a11y_description(sc: *mut scene.Scene, ax: *mut A11y, i: usize, p: u64,
+    cap: usize) -> usize {
+    var o: Out = out_new(p, cap)
+    desc_into(sc, ax, i, &o)
+    return o.n
+}
+
+// ---------------------------------------------------- VIRTUAL LIST ROWS
+//
+// A virtual list (lib/fui/vlist.fi) is ONE node; its 100000 rows are no nodes.
+// For a screen reader that is a list without items. So the node can be bound
+// to its model and its row source: the rows that SHOW (vl_first..vl_end) are
+// then reported as virtual `listitem` children -- name from the row text (all
+// columns of a table row joined), pos = row+1 of count, selected / disabled /
+// focused from the model. The rows are asked at the moment of the question
+// (nothing is copied), so the answer can never be older than the picture.
+fn a11y_bind_vlist(ax: *mut A11y, i: usize, v: *mut vlist.Vlist,
+    src: fn(u64, usize, *mut vlist.VRow), ud: u64) {
+    if !slot_ok(i) {
+        return
+    }
+    (*ax).a[i].vl = v as u64
+    (*ax).a[i].vsrc = src
+    (*ax).a[i].vud = ud
+}
+
+fn vl_of(ax: *mut A11y, i: usize) -> *mut vlist.Vlist {
+    if !slot_ok(i) || (*ax).a[i].vl == 0 {
+        return 0 as *mut vlist.Vlist
+    }
+    return (*ax).a[i].vl as *mut vlist.Vlist
+}
+
+fn a11y_vrow_first(ax: *mut A11y, i: usize) -> usize {
+    let v: *mut vlist.Vlist = vl_of(ax, i)
+    if v as u64 == 0 {
+        return 0
+    }
+    return vlist.vl_first(v)
+}
+
+// One past the last row that shows; first == end means no virtual rows.
+fn a11y_vrow_end(ax: *mut A11y, i: usize) -> usize {
+    let v: *mut vlist.Vlist = vl_of(ax, i)
+    if v as u64 == 0 {
+        return 0
+    }
+    return vlist.vl_end(v)
+}
+
+// How many rows the list has in all (the set size of every virtual row).
+fn a11y_vrow_total(ax: *mut A11y, i: usize) -> usize {
+    let v: *mut vlist.Vlist = vl_of(ax, i)
+    if v as u64 == 0 {
+        return 0
+    }
+    return vlist.vl_count(v)
+}
+
+fn a11y_vrow_name(ax: *mut A11y, i: usize, row: usize, p: u64, cap: usize) -> usize {
+    var o: Out = out_new(p, cap)
+    vrow_name_into(ax, i, row, &o)
+    return o.n
+}
+
+fn vrow_name_into(ax: *mut A11y, i: usize, row: usize, o: *mut Out) {
+    let v: *mut vlist.Vlist = vl_of(ax, i)
+    if v as u64 == 0 || row >= vlist.vl_count(v) {
+        return
+    }
+    (*o).start = (*o).n
+    (*o).pend = 0 as u32
+    var cols: usize = vlist.vl_columns(v)
+    if cols == 0 {
+        cols = 1
+    }
+    var c: usize = 0
+    while c < cols {
+        var r: vlist.VRow = vlist.vrow_new()
+        r.col = c
+        let f: fn(u64, usize, *mut vlist.VRow) = (*ax).a[i].vsrc
+        f((*ax).a[i].vud, row, &r)
+        put_gap(o)
+        put_text(o, (&r.text[0]) as u64, r.n)
+        c = c + 1
+    }
+}
+
+fn a11y_vrow_state(sc: *mut scene.Scene, ax: *mut A11y, i: usize, row: usize) -> u32 {
+    let v: *mut vlist.Vlist = vl_of(ax, i)
+    var st: u32 = 0 as u32
+    if v as u64 == 0 || row >= vlist.vl_count(v) {
+        return st
+    }
+    var r: vlist.VRow = vlist.vrow_new()
+    let f: fn(u64, usize, *mut vlist.VRow) = (*ax).a[i].vsrc
+    f((*ax).a[i].vud, row, &r)
+    st = ST_FOCUSABLE
+    if r.disabled {
+        st = st | ST_DISABLED
+    }
+    if vlist.vl_is_selected(v, row) {
+        st = st | ST_SELECTED
+    }
+    if row == vlist.vl_cur(v) && (focus_bits(sc, i) & ST_FOCUSED) != 0 as u32 {
+        st = st | ST_FOCUSED
+    }
+    return st
+}
+
+// The rectangle of a virtual row in whole pixels (x, y, w, h) into out[0..4].
+fn a11y_vrow_rect(sc: *mut scene.Scene, ax: *mut A11y, i: usize, row: usize,
+    out: *mut [i64; 4]) {
+    let v: *mut vlist.Vlist = vl_of(ax, i)
+    if v as u64 == 0 {
+        return
+    }
+    (*out)[0] = scene.node_x(sc, i) as i64
+    (*out)[1] = (vlist.vl_body_y(v) + vlist.vl_row_top(v, row) - vlist.vl_scroll_y(v)) as i64
+    (*out)[2] = scene.node_w(sc, i) as i64
+    (*out)[3] = vlist.vl_height_of(v, row) as i64
+}
+
+// THE POINTER PATH (r20). A click at (px, py) in a described tree: which
+// ACCESSIBLE node is meant? scene_hit finds the deepest node under the point
+// -- often the text inside a button. The answer here is the nearest node on
+// the way up that is operable or focusable (a button, not its label); if
+// there is none, the node scene_hit found. SCENE_NONE = nothing there.
+fn a11y_hit(sc: *mut scene.Scene, ax: *mut A11y, px: f64, py: f64) -> usize {
+    let h: usize = scene.scene_hit(sc, px, py)
+    if h == scene.SCENE_NONE || h >= scene.scene_count(sc) {
+        return scene.SCENE_NONE
+    }
+    var n: usize = h
+    var depth: usize = 0
+    while n != scene.SCENE_NONE && n < scene.scene_count(sc) && depth <= DEPTH_MAX {
+        if role_is_widget(a11y_role(sc, ax, n)) || a11y_focusable(sc, n) {
+            return n
+        }
+        n = scene.scene_parent(sc, n)
+        depth = depth + 1
+    }
+    return h
+}
+
+// Which virtual row of the bound list `i` lies under the point; NONE (the
+// largest usize) if the point is on no row.
+fn a11y_hit_row(ax: *mut A11y, i: usize, px: f64, py: f64) -> usize {
+    let v: *mut vlist.Vlist = vl_of(ax, i)
+    if v as u64 == 0 {
+        return 0 - 1
+    }
+    return vlist.vl_hit(v, px, py)
+}
+
+// ---------------------------------------------------------- JSON EXPORT
+//
+// The same tree as a11y_dump, as JSON -- for a bridge process, for tools and
+// for tests that want to PARSE instead of compare lines. One object per node:
+//
+//   {"role":"button","name":"Save","states":["focusable","focused"],
+//    "value":620,"min":0,"max":1000,"text":"...","pos":3,"size":28,
+//    "level":2,"desc":"...","rect":[x,y,w,h],"children":[ ... ]}
+//
+// "name" is omitted when there is none (the audit counts the operable ones
+// as "!name" in the text form, here as "unnamed":true). "value"/"min"/"max"
+// stand only for range roles, "text" only for text field / combo box (never
+// for a secret), "children" only if there are any. A virtual list's rows come
+// first as children with role listitem and "virtual":true.
+fn put_lit(o: *mut Out, s: str) {
+    put_raw(o, (s.p) as u64, s.n)
+}
+
+fn json_state_list(o: *mut Out, st: u32) {
+    put_lit(o, ",\"states\":[")
+    var first: bool = true
+    var b: u32 = 0 as u32
+    while b < 11 as u32 {
+        let bit: u32 = 1 as u32 << b
+        if (st & bit) != 0 as u32 {
+            if !first {
+                put(o, 44 as u8)
+            }
+            first = false
+            put(o, 34 as u8)
+            if bit == ST_FOCUSABLE { put_lit(o, "focusable") }
+            if bit == ST_FOCUSED { put_lit(o, "focused") }
+            if bit == ST_DISABLED { put_lit(o, "disabled") }
+            if bit == ST_SELECTED { put_lit(o, "selected") }
+            if bit == ST_CHECKED { put_lit(o, "checked") }
+            if bit == ST_MIXED { put_lit(o, "mixed") }
+            if bit == ST_PRESSED { put_lit(o, "pressed") }
+            if bit == ST_EXPANDED { put_lit(o, "expanded") }
+            if bit == ST_COLLAPSED { put_lit(o, "collapsed") }
+            if bit == ST_READONLY { put_lit(o, "readonly") }
+            if bit == ST_SECRET { put_lit(o, "secret") }
+            put(o, 34 as u8)
+        }
+        b = b + 1 as u32
+    }
+    put(o, 93 as u8)
+}
+
+fn json_rect(o: *mut Out, x: i64, y: i64, w: i64, h: i64) {
+    put_lit(o, ",\"rect\":[")
+    put_dec(o, x)
+    put(o, 44 as u8)
+    put_dec(o, y)
+    put(o, 44 as u8)
+    put_dec(o, w)
+    put(o, 44 as u8)
+    put_dec(o, h)
+    put(o, 93 as u8)
+}
+
+fn json_vrows(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out) -> bool {
+    let a: usize = a11y_vrow_first(ax, i)
+    let z: usize = a11y_vrow_end(ax, i)
+    var any: bool = false
+    var row: usize = a
+    while row < z {
+        if any {
+            put(o, 44 as u8)
+        }
+        any = true
+        put_lit(o, "{\"role\":\"listitem\",\"virtual\":true,\"name\":\"")
+        (*o).esc = 1 as u32
+        vrow_name_into(ax, i, row, o)
+        (*o).esc = 0 as u32
+        put(o, 34 as u8)
+        json_state_list(o, a11y_vrow_state(sc, ax, i, row))
+        put_lit(o, ",\"pos\":")
+        put_dec(o, (row + 1) as i64)
+        put_lit(o, ",\"size\":")
+        put_dec(o, a11y_vrow_total(ax, i) as i64)
+        var rc: [i64; 4] = [0; 4]
+        a11y_vrow_rect(sc, ax, i, row, &rc)
+        json_rect(o, rc[0], rc[1], rc[2], rc[3])
+        put(o, 125 as u8)
+        row = row + 1
+    }
+    return any
+}
+
+fn json_node(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out, depth: usize) {
+    if i >= scene.scene_count(sc) || depth > DEPTH_MAX {
+        return
+    }
+    let r: u32 = a11y_role(sc, ax, i)
+    put_lit(o, "{\"role\":\"")
+    put_role(o, r)
+    put(o, 34 as u8)
+    let vor: usize = (*o).n
+    put_lit(o, ",\"name\":\"")
+    (*o).esc = 1 as u32
+    let q: u32 = name_into(sc, ax, i, o)
+    (*o).esc = 0 as u32
+    if q == NAME_NONE {
+        (*o).n = vor
+        if role_is_widget(r) {
+            put_lit(o, ",\"unnamed\":true")
+        }
+    } else {
+        put(o, 34 as u8)
+    }
+    json_state_list(o, a11y_state(sc, ax, i))
+    let e: *mut widget.Widget = scene.node_widget(sc, i)
+    if a11y_has_range(sc, ax, i) {
+        put_lit(o, ",\"value\":")
+        put_dec(o, a11y_value(sc, i))
+        put_lit(o, ",\"min\":")
+        put_dec(o, a11y_min())
+        put_lit(o, ",\"max\":")
+        put_dec(o, a11y_max())
+    }
+    if !own_text_names(r) && !widget.w_is_secret(e) {
+        put_lit(o, ",\"text\":\"")
+        (*o).start = (*o).n
+        (*o).pend = 0 as u32
+        (*o).esc = 1 as u32
+        put_text(o, widget.w_text(e), widget.w_text_len(e))
+        (*o).esc = 0 as u32
+        put(o, 34 as u8)
+    }
+    let pos: usize = a11y_pos(sc, ax, i)
+    if pos > 0 {
+        put_lit(o, ",\"pos\":")
+        put_dec(o, pos as i64)
+        put_lit(o, ",\"size\":")
+        put_dec(o, a11y_set_size(sc, ax, i) as i64)
+    }
+    if slot_ok(i) && (*ax).a[i].level != 0 as u32 && r == ROLE_HEADING {
+        put_lit(o, ",\"level\":")
+        put_dec(o, (*ax).a[i].level as i64)
+    }
+    let dvor: usize = (*o).n
+    put_lit(o, ",\"desc\":\"")
+    (*o).esc = 1 as u32
+    let dn: usize = desc_into(sc, ax, i, o)
+    (*o).esc = 0 as u32
+    if dn == 0 {
+        (*o).n = dvor
+    } else {
+        put(o, 34 as u8)
+    }
+    json_rect(o, scene.node_x(sc, i) as i64, scene.node_y(sc, i) as i64,
+        scene.node_w(sc, i) as i64, scene.node_h(sc, i) as i64)
+    let c0: usize = scene.scene_first_child(sc, i)
+    if c0 != scene.SCENE_NONE || a11y_vrow_end(ax, i) > a11y_vrow_first(ax, i) {
+        put_lit(o, ",\"children\":[")
+        var any: bool = json_vrows(sc, ax, i, o)
+        var c: usize = c0
+        while c != scene.SCENE_NONE {
+            if any {
+                put(o, 44 as u8)
+            }
+            any = true
+            json_node(sc, ax, c, o, depth + 1)
+            c = scene.scene_next_sibling(sc, c)
+        }
+        put(o, 93 as u8)
+    }
+    put(o, 125 as u8)
+}
+
+fn a11y_dump_json(sc: *mut scene.Scene, ax: *mut A11y, p: u64, cap: usize) -> usize {
+    var o: Out = out_new(p, cap)
+    let r: usize = scene.scene_root(sc)
+    if r != scene.SCENE_NONE {
+        json_node(sc, ax, r, &o, 0)
+    }
+    put(&o, 10 as u8)
+    return o.n
+}
+
+// The virtual rows of a bound list as lines, one level below the list:
+//     listitem "Row 7" selected pos=8/100000 virtual @x,y wxh
+fn dump_vrows(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out,
+    depth: usize) {
+    let a: usize = a11y_vrow_first(ax, i)
+    let z: usize = a11y_vrow_end(ax, i)
+    var row: usize = a
+    while row < z {
+        var k: usize = 0
+        while k < depth {
+            put(o, 32 as u8)
+            put(o, 32 as u8)
+            k = k + 1
+        }
+        put_lit(o, "listitem \"")
+        (*o).esc = 1 as u32
+        vrow_name_into(ax, i, row, o)
+        (*o).esc = 0 as u32
+        put(o, 34 as u8)
+        put_flags(o, a11y_vrow_state(sc, ax, i, row))
+        put_lit(o, " pos=")
+        put_dec(o, (row + 1) as i64)
+        put(o, 47 as u8)
+        put_dec(o, a11y_vrow_total(ax, i) as i64)
+        put_lit(o, " virtual @")
+        var rc: [i64; 4] = [0; 4]
+        a11y_vrow_rect(sc, ax, i, row, &rc)
+        put_dec(o, rc[0])
+        put(o, 44 as u8)
+        put_dec(o, rc[1])
+        put(o, 32 as u8)
+        put_dec(o, rc[2])
+        put(o, 120 as u8)
+        put_dec(o, rc[3])
+        put(o, 10 as u8)
+        row = row + 1
+    }
 }
