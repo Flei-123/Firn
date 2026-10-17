@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/textcurve.fi -- THE COVERAGE CURVE OF TEXT (fUi W2, 17.10.2026).
+//
+// ================================================================ WHY
+//
+// The rasteriser gives the EXACT area of a glyph in a pixel (0..1). Blending
+// that area straight into sRGB octets is the cheapest thing and it is
+// wrong in a way every eye sees: sRGB octets are not light. Half covered
+// white on black is NOT half as bright as white, so light text on a dark
+// background comes out thin and spindly, and dark text on white comes out
+// a little heavy. DirectWrite, Skia and FreeType's LCD filters all fix that
+// the same way: they bend the coverage with a small curve that depends on
+// the colour of the TEXT (not on what is behind it -- that is not known at
+// raster time, and the cache keeps coverage without a background).
+//
+// The curve here is the one Skia calls "preblend" (SkMaskGamma):
+//
+//   1. contrast: a' = a + (1 - a) * c * a * lin(dst)      (dark text gets
+//      more, because thin dark stems on white lose the most)
+//   2. blend in LINEAR light between the text luma and its opposite
+//      (dst = 1 - src): out = (a' * src^g + (1 - a') * dst^g) ^ (1/g)
+//   3. read the result back as the coverage that would give `out` when
+//      blended in the octets: (out - dst) / (src - dst)
+//
+// g = 1.8 and c = 0.5 are the DirectWrite defaults. `tc_set(0.0, 0.0)`
+// switches the curve off (coverage stays linear, as before this file).
+//
+// ================================================================ HOW
+//
+// 16 curves, one per luma bucket of the text colour (0 = black ...
+// 15 = white), 256 knots each, linear between the knots. Built on first
+// use. Applied in place to the finished raster of a run, BEFORE the run is
+// kept by the coverage cache -- the cache key carries the bucket, so a
+// cache hit writes back octet for octet what a fresh raster would.
+//
+// No libm (the kernel profile has none): `pow` is exp(y * ln x) by series.
+import std.rt
+import font.raster
+
+export {
+    tc_set, tc_on, tc_gamma, tc_contrast, tc_bucket, tc_apply, tc_value,
+    tc_pow,
+}
+
+const BUCKETS: usize = 16
+const KNOTS: usize = 256
+
+static mut G_G: f64 = 1.8
+static mut G_C: f64 = 0.5
+static mut G_P: u64 = 0 // BUCKETS * (KNOTS + 1) f64
+static mut G_BUILT: bool = false
+
+// natural logarithm, x > 0
+#[no_gc]
+fn tc_ln(x0: f64) -> f64 {
+    var x: f64 = x0
+    var e: f64 = 0.0
+    while x < 0.5 {
+        x = x * 2.0
+        e = e - 1.0
+    }
+    while x > 1.0 {
+        x = x * 0.5
+        e = e + 1.0
+    }
+    // x in [0.5, 1]: ln x = 2 atanh((x-1)/(x+1)), |t| <= 1/3
+    let t: f64 = (x - 1.0) / (x + 1.0)
+    let t2: f64 = t * t
+    var term: f64 = t
+    var sum: f64 = 0.0
+    var k: f64 = 1.0
+    var i: usize = 0
+    while i < 16 {
+        sum = sum + term / k
+        term = term * t2
+        k = k + 2.0
+        i = i + 1
+    }
+    return 2.0 * sum + e * 0.6931471805599453
+}
+
+#[no_gc]
+fn tc_exp(z: f64) -> f64 {
+    // z = n ln2 + r, |r| <= ln2 / 2
+    var n: i64 = 0
+    var r: f64 = z
+    while r > 0.34657359 {
+        r = r - 0.6931471805599453
+        n = n + 1
+    }
+    while r < 0.0 - 0.34657359 {
+        r = r + 0.6931471805599453
+        n = n - 1
+    }
+    var term: f64 = 1.0
+    var sum: f64 = 1.0
+    var i: usize = 1
+    while i < 14 {
+        term = term * r / (i as f64)
+        sum = sum + term
+        i = i + 1
+    }
+    while n > 0 {
+        sum = sum * 2.0
+        n = n - 1
+    }
+    while n < 0 {
+        sum = sum * 0.5
+        n = n + 1
+    }
+    return sum
+}
+
+// x^y for x >= 0
+#[no_gc]
+fn tc_pow(x: f64, y: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0
+    }
+    return tc_exp(y * tc_ln(x))
+}
+
+// One knot: the corrected coverage of raw coverage `a` for a text of luma
+// `src` (0..1, in octet terms).
+#[no_gc]
+fn curve(src: f64, a: f64) -> f64 {
+    let g: f64 = G_G
+    let dst: f64 = 1.0 - src
+    if src - dst > 0.0 - 0.0001 && src - dst < 0.0001 {
+        return a // mid grey: nothing to bend (src == dst)
+    }
+    let lin_dst: f64 = tc_pow(dst, g)
+    let a2: f64 = a + (1.0 - a) * G_C * a * lin_dst
+    let lin: f64 = a2 * tc_pow(src, g) + (1.0 - a2) * lin_dst
+    let out: f64 = tc_pow(lin, 1.0 / g)
+    var v: f64 = (out - dst) / (src - dst)
+    if v < 0.0 {
+        v = 0.0
+    }
+    if v > 1.0 {
+        v = 1.0
+    }
+    return v
+}
+
+fn build() {
+    if G_P == 0 {
+        G_P = rt.heap_alloc(BUCKETS * (KNOTS + 1) * 8)
+    }
+    if G_P == 0 {
+        return
+    }
+    var b: usize = 0
+    while b < BUCKETS {
+        let src: f64 = (b as f64) / ((BUCKETS - 1) as f64)
+        var k: usize = 0
+        while k <= KNOTS {
+            let a: f64 = (k as f64) / (KNOTS as f64)
+            *((G_P + ((b * (KNOTS + 1) + k) * 8) as u64) as *mut f64) = curve(src, a)
+            k = k + 1
+        }
+        b = b + 1
+    }
+    G_BUILT = true
+}
+
+// Set gamma and contrast; gamma <= 0 switches the curve off.
+fn tc_set(g: f64, c: f64) {
+    G_G = g
+    G_C = c
+    G_BUILT = false
+}
+
+fn tc_on() -> bool {
+    return G_G > 0.0
+}
+
+fn tc_gamma() -> f64 { return G_G }
+
+fn tc_contrast() -> f64 { return G_C }
+
+// The curve to use for a text of colour `col` (0xAARRGGBB): 0 when off,
+// else 1 + the luma bucket (so a bucket can sit in a cache key).
+fn tc_bucket(col: u32) -> u64 {
+    if G_G <= 0.0 {
+        return 0
+    }
+    let r: u32 = (col >> 16) & 255 as u32
+    let g: u32 = (col >> 8) & 255 as u32
+    let b: u32 = col & 255 as u32
+    // Rec. 601 luma in octet terms, scaled to 0..15
+    let y: u32 = (r * 299 + g * 587 + b * 114 + 8500) / 17000
+    var k: u32 = y
+    if k > 15 as u32 {
+        k = 15 as u32
+    }
+    return 1 + (k as u64)
+}
+
+// The corrected value of raw coverage `v` in the curve `bucket` (from
+// tc_bucket, not 0).
+#[no_gc]
+fn tc_value(bucket: u64, v: f64) -> f64 {
+    let base: u64 = G_P + (((bucket - 1) as usize) * (KNOTS + 1) * 8) as u64
+    var s: f64 = v * (KNOTS as f64)
+    if s < 0.0 {
+        s = 0.0
+    }
+    if s > (KNOTS as f64) - 0.0001 {
+        s = (KNOTS as f64) - 0.0001
+    }
+    let i: usize = s as usize
+    let f: f64 = s - (i as f64)
+    let a: f64 = *((base + (i * 8) as u64) as *mut f64)
+    let c: f64 = *((base + ((i + 1) * 8) as u64) as *mut f64)
+    return a + (c - a) * f
+}
+
+// Bend the coverage of a FINISHED raster in place (never twice!).
+fn tc_apply(r: *mut raster.Raster, bucket: u64) {
+    if bucket == 0 {
+        return
+    }
+    if !G_BUILT {
+        build()
+    }
+    if G_P == 0 {
+        return
+    }
+    let y0: usize = raster.raster_used_y0(r)
+    let y1: usize = raster.raster_used_y1(r)
+    let x0: usize = raster.raster_used_x0(r)
+    let x1: usize = raster.raster_used_x1(r)
+    var y: usize = y0
+    while y < y1 {
+        let row: u64 = raster.raster_cov_row(r, y)
+        var x: usize = x0
+        while x < x1 {
+            let p: u64 = row + (x * 8) as u64
+            let v: f64 = *(p as *mut f64)
+            if v > 0.0 && v < 0.999999 {
+                *(p as *mut f64) = tc_value(bucket, v)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}

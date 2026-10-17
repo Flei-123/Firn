@@ -1373,4 +1373,18 @@ done
 bash tools/dialog/filedlg_run.sh all
 
 echo
+echo "== TEXT (W2, r13): GPOS pair kerning, the coverage curve, the text bench =="
+# textbench_main paints one line as PNGs and times it; textbench.py compares the pictures with FreeType
+# (Pillow) and fontTools and fails when the numbers leave their corridor. SKIP without python3/Pillow/fontTools.
+build textbench
+mkdir -p "$W/textbench_out"
+"$W/textbench" /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf "$W/textbench_out" | head -3
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import PIL, fontTools, numpy' 2>/dev/null; then
+    FIRNC="$FIRNC" python3 tools/fui/gposkern_check.py
+    FIRNC="$FIRNC" python3 tools/fui/textbench.py --runs 3 --assert
+else
+    echo "  SKIP: no python3 with Pillow, fontTools and numpy"
+fi
+
+echo
 echo "ALL CHECKS PASSED."
