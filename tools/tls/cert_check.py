@@ -19,6 +19,7 @@ refused as EXPIRED when it should have been refused as NAME is a bug that a
 boolean would hide.
 """
 import datetime
+import ipaddress
 import os
 import subprocess
 import sys
@@ -51,7 +52,8 @@ def name(cn):
 
 
 def make(subject, issuer_name, issuer_key, key, *, ca, sans=None,
-         not_before=None, not_after=None, hash_alg=None, critical_junk=False):
+         not_before=None, not_after=None, hash_alg=None, critical_junk=False,
+         ip_sans=None, raw_san=None):
     nb = not_before or (NOW - 30 * DAY)
     na = not_after or (NOW + 300 * DAY)
     b = (x509.CertificateBuilder()
@@ -63,9 +65,18 @@ def make(subject, issuer_name, issuer_key, key, *, ca, sans=None,
          .not_valid_after(na)
          .add_extension(x509.BasicConstraints(ca=ca, path_length=None),
                         critical=True))
-    if sans:
+    if sans or ip_sans:
+        names = [x509.DNSName(s) for s in (sans or [])]
+        names += [x509.IPAddress(ipaddress.ip_address(a))
+                  for a in (ip_sans or [])]
+        b = b.add_extension(x509.SubjectAlternativeName(names),
+                            critical=False)
+    if raw_san is not None:
+        # a subjectAltName written by hand, to get entries that no library
+        # would encode (an iPAddress of 3 or 17 octets)
         b = b.add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(s) for s in sans]),
+            x509.UnrecognizedExtension(
+                x509.ObjectIdentifier("2.5.29.17"), raw_san),
             critical=False)
     if critical_junk:
         # an extension nobody knows, marked critical: RFC 5280 4.2 says the
@@ -83,6 +94,18 @@ def make(subject, issuer_name, issuer_key, key, *, ca, sans=None,
 
 def pem(c):
     return c.public_bytes(serialization.Encoding.PEM).decode()
+
+
+def der_len(n):
+    if n < 128:
+        return bytes([n])
+    return bytes([0x81, n])
+
+
+def raw_san_der(entries):
+    # entries: (tag byte, content) -> DER of the GeneralNames SEQUENCE
+    body = b"".join(bytes([t]) + der_len(len(c)) + c for t, c in entries)
+    return b"\x30" + der_len(len(body)) + body
 
 
 def build_cases():
@@ -128,6 +151,14 @@ def build_cases():
                                             key_size=2048)
         return make(cn, issuer_cert.subject, issuer_key, k, ca=False,
                     sans=sans, **kw), k
+
+    ipk = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    def ipleaf(cn, sans=None, ip_sans=None, raw_san=None):
+        # one key for all the IP cases: the name check comes before the
+        # signature and the key is never what is under test here
+        return make(cn, ir.subject, ir_key, ipk, ca=False, sans=sans,
+                    ip_sans=ip_sans, raw_san=raw_san)
 
     # ------------------------------------------------ the positive cases
     l1, _ = leaf("good.example", ["good.example"], ir, ir_key)
@@ -227,6 +258,126 @@ def build_cases():
     l521b, _ = leaf("under521.example", ["under521.example"], i521, k521)
     add("an intermediate on a curve this round does not have",
         "under521.example", [pem(l521b), pem(i521)], "UNSUPPORTED")
+
+
+    # ------------------------------------- iPAddress SAN (RFC 6125 6.4)
+    v4 = ipleaf("v4.example", ip_sans=["10.9.0.1"])
+    v6 = ipleaf("v6.example", ip_sans=["fd00::1"])
+    for h in ("10.9.0.1",):
+        add("IPv4 in an iPAddress SAN", h, [pem(v4), pem(ir)], "OK")
+    for h in ("10.9.0.2", "10.9.0.10", "10.9.0.11", "110.9.0.1"):
+        add("IPv4, a different address %s" % h, h, [pem(v4), pem(ir)],
+            "NAME")
+    for h in ("fd00::1", "[fd00::1]", "FD00::1", "fd00:0:0:0:0:0:0:1",
+              "fd00:0000:0000:0000:0000:0000:0000:0001", "fd00::0:1"):
+        add("IPv6 in an iPAddress SAN: %s" % h, h, [pem(v6), pem(ir)],
+            "OK")
+    for h in ("fd00::2", "fd00::", "fd01::1", "[fd00::2]", "fd00:1::1",
+              "::fd00:1"):
+        add("IPv6, a different address %s" % h, h, [pem(v6), pem(ir)],
+            "NAME")
+    v4m = ipleaf("v4m.example", ip_sans=["::ffff:10.9.0.1"])
+    add("IPv4-mapped IPv6 SAN, host in the mapped form",
+        "::ffff:10.9.0.1", [pem(v4m), pem(ir)], "OK")
+    add("IPv4-mapped IPv6 SAN, host in hex groups", "::ffff:a09:1",
+        [pem(v4m), pem(ir)], "OK")
+    add("IPv4-mapped IPv6 SAN is not the IPv4 address", "10.9.0.1",
+        [pem(v4m), pem(ir)], "NAME")
+    add("IPv4 SAN is not the IPv4-mapped address", "::ffff:10.9.0.1",
+        [pem(v4), pem(ir)], "NAME")
+    lo = ipleaf("lo.example", ip_sans=["::1", "127.0.0.1"])
+    add("loopback ::1", "::1", [pem(lo), pem(ir)], "OK")
+    add("loopback ::1 in brackets", "[::1]", [pem(lo), pem(ir)], "OK")
+    add("loopback 127.0.0.1", "127.0.0.1", [pem(lo), pem(ir)], "OK")
+    add("the unspecified :: is not ::1", "::", [pem(lo), pem(ir)], "NAME")
+
+    # an IP host against a certificate with dNSName only: refused, even
+    # when the dNSName is the very text of the address (the old workaround)
+    dn = ipleaf("10.9.0.1", sans=["10.9.0.1", "good.example"])
+    add("IP host, only a dNSName of the same text", "10.9.0.1",
+        [pem(dn), pem(ir)], "NAME")
+    dn6 = ipleaf("fd00::1", sans=["fd00::1", "[fd00::1]"])
+    add("IPv6 host, only a dNSName of the same text", "fd00::1",
+        [pem(dn6), pem(ir)], "NAME")
+    add("IPv6 bracket host, only a dNSName", "[fd00::1]",
+        [pem(dn6), pem(ir)], "NAME")
+    wd = ipleaf("wild", sans=["*.0.1", "*.9.0.1", "*.example"])
+    add("IP host, wildcard dNSNames", "10.9.0.1", [pem(wd), pem(ir)],
+        "NAME")
+    # a DNS name against a certificate with iPAddress only: refused
+    add("DNS host, only an iPAddress", "good.example",
+        [pem(v4), pem(ir)], "NAME")
+    add("DNS host that starts with the address", "10.9.0.1.example",
+        [pem(v4), pem(ir)], "NAME")
+    add("DNS host, CN is the name but a SAN exists", "v4.example",
+        [pem(v4), pem(ir)], "NAME")
+    # the common name never names an IP, and no SAN means no IP match
+    cn_ip = ipleaf("10.9.0.1")
+    add("IP host, only the common name", "10.9.0.1",
+        [pem(cn_ip), pem(ir)], "NAME")
+    cn_ip6 = ipleaf("fd00::1")
+    add("IPv6 host, only the common name", "fd00::1",
+        [pem(cn_ip6), pem(ir)], "NAME")
+    cn_dns = ipleaf("good.example")
+    add("DNS host, common name, no SAN (fallback kept)", "good.example",
+        [pem(cn_dns), pem(ir)], "OK")
+    add("IP host, common name is a DNS name", "10.9.0.1",
+        [pem(cn_dns), pem(ir)], "NAME")
+    # a mix
+    mix = ipleaf("mix", sans=["good.example", "*.wild.example"],
+                 ip_sans=["10.9.0.1", "fd00::1", "192.168.1.5"])
+    for h in ("good.example", "a.wild.example", "10.9.0.1", "fd00::1",
+              "[fd00::1]", "192.168.1.5"):
+        add("mixed SAN, %s" % h, h, [pem(mix), pem(ir)], "OK")
+    for h in ("10.9.0.5", "fd00::5", "evil.example", "wild.example",
+              "192.168.1.50"):
+        add("mixed SAN, not %s" % h, h, [pem(mix), pem(ir)], "NAME")
+    # hosts that look like an IP and are not one match nothing
+    badhosts = ["10.9.0", "10.9.0.1.1", "010.9.0.1", "10.9.0.256",
+                "10.9.0.01", "10..9.1", "10.9.0.1.", ".10.9.0.1",
+                "[10.9.0.1]", "[fd00::1", "fd00::1]", "[]", "[good.example]",
+                "fd00::1%eth0", "fd00:::1", "fd00::1::", "1:2:3:4:5:6:7:8:9",
+                "fd00:1", "fd00::g", "fd00::12345", ":fd00::1", "fd00::1:",
+                "::ffff:10.9.0", "::ffff:10.9.0.256"]
+    badcert = ipleaf("bad", sans=badhosts + ["10.9.0", "010.9.0.1"],
+                     ip_sans=["10.9.0.1", "fd00::1"])
+    for h in badhosts:
+        add("malformed IP host %r" % h, h, [pem(badcert), pem(ir)], "NAME")
+    # broken iPAddress entries: wrong length is no hit and no crash
+    for n in (0, 1, 3, 5, 8, 15, 17, 20, 32):
+        junk = raw_san_der([(0x87, bytes(range(1, n + 1)))])
+        jl = ipleaf("junk", raw_san=junk)
+        for h in ("10.9.0.1", "fd00::1", "good.example"):
+            add("iPAddress of %d octets, host %s" % (n, h), h,
+                [pem(jl), pem(ir)], "NAME")
+    # a 4-octet entry holds the first octets of a 16-octet address
+    short = ipleaf("short", raw_san=raw_san_der(
+        [(0x87, bytes([0xfd, 0, 0, 0]))]))
+    add("4 octets of an IPv6 prefix are not the IPv6 host", "fd00::",
+        [pem(short), pem(ir)], "NAME")
+    add("4 octets of an IPv6 prefix, host 253.0.0.0", "253.0.0.0",
+        [pem(short), pem(ir)], "OK")
+    # 16 octets that start like an IPv4 entry
+    long6 = ipleaf("long", raw_san=raw_san_der(
+        [(0x87, bytes([10, 9, 0, 1]) + bytes(12))]))
+    add("16 octets 10.9.0.1:: are not the IPv4 host", "10.9.0.1",
+        [pem(long6), pem(ir)], "NAME")
+    add("16 octets 10.9.0.1:: match their IPv6 form", "a09:1::",
+        [pem(long6), pem(ir)], "OK")
+    # junk entries around a good one do not hide it
+    around = ipleaf("around", raw_san=raw_san_der([
+        (0x87, b"\x01\x02\x03"), (0x82, b""), (0x87, b""),
+        (0x87, bytes([10, 9, 0, 1])), (0x87, b"\x01" * 17)]))
+    add("good iPAddress between broken ones", "10.9.0.1",
+        [pem(around), pem(ir)], "OK")
+    add("empty dNSName does not match an IP", "10.9.0.2",
+        [pem(around), pem(ir)], "NAME")
+    # an iPAddress entry is not looked at for a DNS name even if its
+    # octets happen to spell the name
+    spell = ipleaf("spell", raw_san=raw_san_der(
+        [(0x87, b"abcd"), (0x87, b"a.bc")]))
+    add("DNS host 'a.bc' vs iPAddress octets 'a.bc'", "a.bc",
+        [pem(spell), pem(ir)], "NAME")
 
     add("no certificate at all", "good.example", [], "PARSE")
 

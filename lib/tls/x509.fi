@@ -51,6 +51,13 @@
 // keeps the fallback, because certificates without a SAN still exist on
 // internal networks, and it says so here rather than hiding it.
 //
+// An IP literal as the host (`10.9.0.1`, `::1`, `[fd00::1]`) is the other
+// kind of name: it is compared ONLY with the `iPAddress` entries of the
+// subjectAltName, octet for octet (4 for IPv4, 16 for IPv6), and never with
+// a dNSName or the common name -- and a DNS name never with an iPAddress.
+// A certificate without a SAN does not match an IP at all. A host that
+// looks like an IP literal but is not a valid one matches nothing.
+//
 // ==================================================================== HONEST
 //
 // X1 NO REVOCATION. No CRL, no OCSP, no stapling. A certificate that was
@@ -813,7 +820,252 @@ fn dns_match(base: u64, off: usize, len: usize, host: u64,
     return ci_same(base, off, len, host, 0, hn)
 }
 
+// ------------------------------------------------------------ IP literals
+//
+// RFC 6125 6.4.1 / 6.4.4: a reference identity that is an IP address is
+// compared ONLY with `iPAddress` entries of the subjectAltName (RFC 5280
+// 4.2.1.6: 4 octets for IPv4, 16 for IPv6), byte for byte. It is never
+// compared with a dNSName or the common name, and a DNS name is never
+// compared with an iPAddress entry.
+
+const IP_NONE: usize = 0 // not an IP literal: a DNS name
+const IP_V4: usize = 4
+const IP_V6: usize = 16
+const IP_BAD: usize = 255 // looks like an IP literal, is not a valid one
+
+fn is_digit(ch: u32) -> bool {
+    return ch >= 48 && ch <= 57
+}
+
+fn hex_val(ch: u32) -> u32 {
+    if ch >= 48 && ch <= 57 {
+        return ch - 48
+    }
+    if ch >= 97 && ch <= 102 {
+        return ch - 97 + 10
+    }
+    if ch >= 65 && ch <= 70 {
+        return ch - 65 + 10
+    }
+    return 255
+}
+
+// Dotted decimal over host[off .. off+n): exactly four fields of one to
+// three digits, each <= 255, no leading zero (so "010" is not an octal in
+// disguise). The four octets go to out[at ..].
+fn v4_parse(host: u64, off: usize, n: usize, out: *mut [u8; 16],
+    at: usize) -> bool {
+    var field: usize = 0
+    var digits: usize = 0
+    var val: u32 = 0
+    var first: u32 = 0
+    var i: usize = 0
+    while i <= n {
+        var ch: u32 = 46
+        if i < n {
+            ch = rt.ld8(host, off + i) as u32
+        }
+        if i == n || ch == 46 {
+            if digits == 0 || field >= 4 {
+                return false
+            }
+            (*out)[at + field] = val as u8
+            field = field + 1
+            digits = 0
+            val = 0
+        } else if is_digit(ch) {
+            if digits == 0 {
+                first = ch
+            } else if first == 48 {
+                return false
+            }
+            digits = digits + 1
+            if digits > 3 {
+                return false
+            }
+            val = val * 10 + (ch - 48)
+            if val > 255 {
+                return false
+            }
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return field == 4
+}
+
+// IPv6 text form (RFC 4291 2.2): up to eight groups of one to four hex
+// digits, one `::` at most, an IPv4 tail allowed as the last token. No
+// zone id, no brackets here. The sixteen octets go to out.
+fn v6_parse(host: u64, off: usize, n: usize, out: *mut [u8; 16]) -> bool {
+    var g: [u32; 8] = [0; 8]
+    var ng: usize = 0
+    var gap: usize = 99
+    var i: usize = 0
+    if n < 2 {
+        return false
+    }
+    if rt.ld8(host, off) == 58 as u8 {
+        if rt.ld8(host, off + 1) != 58 as u8 {
+            return false
+        }
+        gap = 0
+        i = 2
+    }
+    while i < n {
+        var j: usize = i
+        var has_dot: bool = false
+        while j < n && rt.ld8(host, off + j) != 58 as u8 {
+            if rt.ld8(host, off + j) == 46 as u8 {
+                has_dot = true
+            }
+            j = j + 1
+        }
+        let tl: usize = j - i
+        if tl == 0 {
+            return false
+        }
+        if has_dot {
+            if j != n || ng > 6 {
+                return false
+            }
+            var q: [u8; 16] = [0; 16]
+            if !v4_parse(host, off + i, tl, &q, 0) {
+                return false
+            }
+            g[ng] = (q[0] as u32) * 256 + (q[1] as u32)
+            g[ng + 1] = (q[2] as u32) * 256 + (q[3] as u32)
+            ng = ng + 2
+        } else {
+            if tl > 4 || ng >= 8 {
+                return false
+            }
+            var v: u32 = 0
+            var k: usize = 0
+            while k < tl {
+                let h: u32 = hex_val(rt.ld8(host, off + i + k) as u32)
+                if h == 255 {
+                    return false
+                }
+                v = v * 16 + h
+                k = k + 1
+            }
+            g[ng] = v
+            ng = ng + 1
+        }
+        if j == n {
+            i = n
+        } else if j + 1 == n {
+            return false // a single trailing colon
+        } else if rt.ld8(host, off + j + 1) == 58 as u8 {
+            if gap != 99 {
+                return false // a second `::`
+            }
+            gap = ng
+            i = j + 2
+        } else {
+            i = j + 1
+        }
+    }
+    if gap == 99 {
+        if ng != 8 {
+            return false
+        }
+    } else if ng > 7 {
+        return false
+    }
+    var o: usize = 0
+    while o < 16 {
+        (*out)[o] = 0 as u8
+        o = o + 1
+    }
+    var a: usize = 0
+    while a < ng {
+        var pos: usize = a
+        if gap != 99 && a >= gap {
+            pos = a + (8 - ng)
+        }
+        (*out)[pos * 2] = (g[a] / 256) as u8
+        (*out)[pos * 2 + 1] = (g[a] % 256) as u8
+        a = a + 1
+    }
+    return true
+}
+
+// What is `host`? IP_V4 / IP_V6 with the octets in `out`, IP_NONE for a
+// DNS name, IP_BAD for something that is an IP literal by shape (digits and
+// dots only, a colon, brackets) but not a valid one -- that matches nothing,
+// not even a dNSName. A bracketed host ("[::1]", the URL form) is accepted.
+fn ip_kind(host: u64, hn: usize, out: *mut [u8; 16]) -> usize {
+    if hn == 0 {
+        return IP_NONE
+    }
+    var off: usize = 0
+    var n: usize = hn
+    var bracket: bool = false
+    if hn >= 2 && rt.ld8(host, 0) == 91 as u8
+    && rt.ld8(host, hn - 1) == 93 as u8 {
+        bracket = true
+        off = 1
+        n = hn - 2
+    }
+    var colon: bool = false
+    var only_num: bool = true
+    var i: usize = 0
+    while i < n {
+        let ch: u32 = rt.ld8(host, off + i) as u32
+        if ch == 58 {
+            colon = true
+        }
+        if !is_digit(ch) && ch != 46 {
+            only_num = false
+        }
+        i = i + 1
+    }
+    if rt.ld8(host, 0) == 91 as u8 || rt.ld8(host, hn - 1) == 93 as u8 {
+        if !bracket || !colon {
+            return IP_BAD // unbalanced brackets, or a bracketed non-IPv6
+        }
+    }
+    if colon {
+        if v6_parse(host, off, n, out) {
+            return IP_V6
+        }
+        return IP_BAD
+    }
+    if only_num {
+        if v4_parse(host, off, n, out, 0) {
+            return IP_V4
+        }
+        return IP_BAD
+    }
+    return IP_NONE
+}
+
+// One iPAddress entry against the reference IP: the length must be exactly
+// 4 or 16 AND the same as the reference, then every octet is compared.
+fn ip_match(base: u64, off: usize, len: usize, ip: *mut [u8; 16],
+    kind: usize) -> bool {
+    if len != kind {
+        return false
+    }
+    var i: usize = 0
+    while i < len {
+        if rt.ld8(base, off + i) != (*ip)[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
 fn cert_name_matches(c: *mut Cert, host: u64, hn: usize) -> bool {
+    var ip: [u8; 16] = [0; 16]
+    let kind: usize = ip_kind(host, hn, &ip)
+    if kind == IP_BAD {
+        return false
+    }
     if (*c).has_san {
         var d: der.Der = der.der_open((*c).base, (*c).san_off, (*c).san_len)
         var list: der.Der = der.der_open((*c).base, 0, 0)
@@ -827,14 +1079,24 @@ fn cert_name_matches(c: *mut Cert, host: u64, hn: usize) -> bool {
             if !der.der_read(&list, &t, &o, &l) {
                 return false
             }
-            // [2] IMPLICIT IA5String = dNSName
-            if t == 130 as u32 {
-                if dns_match((*c).base, o, l, host, hn) {
+            if kind == IP_NONE {
+                // [2] IMPLICIT IA5String = dNSName
+                if t == 130 as u32 {
+                    if dns_match((*c).base, o, l, host, hn) {
+                        return true
+                    }
+                }
+            } else if t == 135 as u32 {
+                // [7] IMPLICIT OCTET STRING = iPAddress
+                if ip_match((*c).base, o, l, &ip, kind) {
                     return true
                 }
             }
         }
         return false
+    }
+    if kind != IP_NONE {
+        return false // the common name never names an IP address
     }
     if (*c).has_cn {
         return dns_match((*c).base, (*c).cn_off, (*c).cn_len, host, hn)
