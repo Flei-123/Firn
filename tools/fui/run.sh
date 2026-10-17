@@ -661,6 +661,12 @@ build anim
 "$W/anim" | tail -n 3
 build kita11y
 "$W/kita11y" | tail -n 3
+# W5: the whole keyboard (Tab/Space/Enter/arrows/Esc), the a11y tree (heading level,
+# description, virtual list rows, JSON, pointer path) and DPI scaling with crisp 1 px edges
+build access
+"$W/access" | tail -n 3
+build dpi
+"$W/dpi" | tail -n 3
 build touch
 "$W/touch" | tail -n 3
 build kitrtl
