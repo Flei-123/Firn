@@ -1,0 +1,152 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/hotreload_main.fi -- test for lib/fui/hotreload.fi (file watcher + state snapshot)
+//
+//     hotreload_main <scratch-dir>      prints HOTRELOAD PASSED / FAILED
+//
+// The scratch directory must exist and be EMPTY and disposable (tools/fui/hotreload.sh makes one with
+// mktemp -d and removes it). Files are written only through fui.safeout.
+import std.rt
+import std.fs
+import fui.safeout
+import fui.hotreload
+
+static mut FAILS: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn check(ok: bool, what: str) {
+    if !ok {
+        FAILS = FAILS + 1
+        say("FAIL: ")
+        say(what)
+        say("\n")
+    }
+}
+
+// dir + "/" + name into b (NUL terminated); returns the str over it (without the NUL)
+fn join(b: *mut rt.Buf, dir: u64, name: str) -> str {
+    rt.buf_clear(b)
+    var n: usize = 0
+    while rt.ld8(dir, n) != 0 as u8 {
+        n = n + 1
+    }
+    rt.buf_push_bytes(b, dir, n)
+    rt.buf_push(b, 47 as u8)
+    rt.buf_push_bytes(b, name.p as u64, name.n)
+    rt.buf_push(b, 0 as u8)
+    return str { p: rt.buf_ptr(b) as *mut u8, n: rt.buf_len(b) - 1 }
+}
+
+fn put(path: str, text: str) {
+    let ok: bool = safeout.write_file(path.p as u64, text.p as u64, text.n)
+}
+
+fn main(start: u64) -> i32 {
+    if rt.arg_count(start) < 2 {
+        say("usage: hotreload_main <scratch-dir>\n")
+        return 2
+    }
+    let dir: u64 = rt.arg_ptr(start, 1)
+    var pb: rt.Buf = rt.buf_new()
+    var pb2: rt.Buf = rt.buf_new()
+
+    // ---- watcher
+    let pa: str = join(&pb, dir, "a.txt")
+    put(pa, "one")
+    var w: hotreload.Watch = hotreload.watch_new()
+    check(hotreload.watch_add(&w, pa), "add a.txt")
+    check(hotreload.watch_scan(&w) == 0, "baseline: no change")
+    put(pa, "two22")
+    check(hotreload.watch_scan(&w) == 0, "first look at a change: not settled yet")
+    check(hotreload.watch_scan(&w) == 1, "second look: settled, reported once")
+    check(hotreload.watch_scan(&w) == 0, "and not again")
+    // still being written: two different looks in a row never settle
+    put(pa, "three333")
+    check(hotreload.watch_scan(&w) == 0, "change A pending")
+    put(pa, "four4444444")
+    check(hotreload.watch_scan(&w) == 0, "change B replaces A, still pending")
+    check(hotreload.watch_scan(&w) == 1, "then settles once")
+    // a file that is not there yet; created later
+    let pc: str = join(&pb2, dir, "later.txt")
+    check(hotreload.watch_add(&w, pc), "add a missing file")
+    check(hotreload.watch_scan(&w) == 0, "missing: no change")
+    put(pc, "x")
+    check(hotreload.watch_scan(&w) == 0, "created: pending")
+    check(hotreload.watch_scan(&w) == 1, "created: settled")
+    // deleted and brought back (editor save by rename)
+    let rm: bool = fs.remove(pc) catch false
+    check(rm, "remove helper file")
+    check(hotreload.watch_scan(&w) == 0 && hotreload.watch_scan(&w) == 0, "deleted: nothing to reload")
+    put(pc, "back again")
+    check(hotreload.watch_scan(&w) == 0 && hotreload.watch_scan(&w) == 1, "came back: one reload")
+    check(hotreload.watch_count(&w) == 2, "two watched")
+
+    // rate limit of watch_poll
+    put(pa, "five")
+    check(hotreload.watch_poll(&w, 10000) == 0, "poll 1 (pending)")
+    check(hotreload.watch_poll(&w, 10100) == 0, "poll inside POLL_MS: skipped")
+    check(hotreload.watch_poll(&w, 10300) == 1, "poll after POLL_MS: settled")
+    hotreload.watch_free(&w)
+
+    // ---- state
+    var st: hotreload.State = hotreload.state_new()
+    check(hotreload.state_set(&st, "list.scroll", 840), "set")
+    check(hotreload.state_set(&st, "list.cur", 0 - 3), "set negative")
+    check(hotreload.state_get(&st, "list.scroll", 7) == 840, "get")
+    check(hotreload.state_get(&st, "nope", 7) == 7, "default for a missing key")
+    check(hotreload.state_has(&st, "list.cur") && !hotreload.state_has(&st, "list"), "has is exact (no prefix match)")
+    check(hotreload.state_set(&st, "list.scroll", 900) && hotreload.state_get(&st, "list.scroll", 0) == 900, "overwrite")
+    check(hotreload.state_count(&st) == 2, "two entries")
+    check(!hotreload.state_set(&st, "", 1), "empty key refused")
+    check(!hotreload.state_set(&st, "a b", 1), "space in key refused")
+    check(!hotreload.state_set(&st, "a=b", 1), "'=' in key refused")
+    check(!hotreload.state_set(&st, "0123456789012345678901234567890123", 1), "key longer than 31 refused")
+    check(hotreload.state_set(&st, "0123456789012345678901234567890", 5), "key of exactly 31 accepted")
+    check(hotreload.state_get(&st, "0123456789012345678901234567890", 0) == 5, "31 octet key found")
+
+    // save / load round trip
+    let ps: str = join(&pb, dir, "app.state")
+    check(hotreload.state_save(&st, ps), "save")
+    var st2: hotreload.State = hotreload.state_new()
+    check(hotreload.state_load(&st2, ps), "load")
+    check(hotreload.state_count(&st2) == 3 && hotreload.state_get(&st2, "list.cur", 0) == 0 - 3, "round trip keeps the values")
+    let pm: str = join(&pb2, dir, "missing.state")
+    check(!hotreload.state_load(&st2, pm), "missing file: false (first run)")
+
+    // parse: comments, CRLF, malformed lines, unknown keys
+    var st3: hotreload.State = hotreload.state_new()
+    let txt: str = "# state\nfocus=4\r\nbad line\nx=\ny=12ab\nz=-9\n=5\nextra.key=1\n"
+    check(hotreload.state_parse(&st3, txt.p as u64, txt.n) == 3, "3 good lines")
+    check(hotreload.state_get(&st3, "focus", 0) == 4 && hotreload.state_get(&st3, "z", 0) == 0 - 9, "values parsed")
+    check(!hotreload.state_has(&st3, "x") && !hotreload.state_has(&st3, "y"), "malformed lines skipped")
+
+    // table full
+    var st4: hotreload.State = hotreload.state_new()
+    var i: i64 = 0
+    var okall: bool = true
+    while i < 64 {
+        var kb: rt.Buf = rt.buf_new()
+        rt.buf_push(&kb, 107 as u8)
+        rt.buf_push_dec_i64(&kb, i)
+        let k: str = str { p: rt.buf_ptr(&kb) as *mut u8, n: rt.buf_len(&kb) }
+        if !hotreload.state_set(&st4, k, i) {
+            okall = false
+        }
+        rt.buf_free(&kb)
+        i = i + 1
+    }
+    check(okall && hotreload.state_count(&st4) == hotreload.STATE_MAX, "64 entries fit")
+    check(!hotreload.state_set(&st4, "overflow", 1), "65th refused")
+    check(hotreload.state_set(&st4, "k5", 55) && hotreload.state_get(&st4, "k5", 0) == 55, "existing key still writable when full")
+
+    rt.buf_free(&pb)
+    rt.buf_free(&pb2)
+    if FAILS > 0 {
+        say("HOTRELOAD FAILED\n")
+        return 1
+    }
+    say("HOTRELOAD PASSED\n")
+    return 0
+}

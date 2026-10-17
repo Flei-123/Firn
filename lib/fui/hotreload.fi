@@ -1,0 +1,322 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/hotreload.fi -- HOT-RELOAD BUILDING BLOCKS: a file watcher and a UI state snapshot (r158/r265).
+//
+// The reload cycle (see tools/fui/hotreload.sh): the watcher sees a changed source file, the dev loop
+// rebuilds, stops the old program and starts the new one; the new one finds the state file the old one
+// kept up to date and puts scroll positions, selections and focus back. So a reload costs one build
+// and loses nothing the user cares about.
+//
+// WATCHER: `watch_add` paths, `watch_poll(&w, now_ms)` -> number of files that changed AND SETTLED.
+//   A change counts only when two polls in a row saw the same (mtime, size): a compiler or editor
+//   that is still writing does not trigger a half-written reload. Polls closer than POLL_MS return 0.
+//
+// STATE: a small key -> i64 table with STABLE keys the app picks ("list.scroll", "list.cur", "focus"),
+//   saved as text `key=value` lines. Unknown keys in a file are kept; a missing key gives the default,
+//   so an app that gained or lost a control still loads an old file.
+//
+//     var st: hotreload.State = hotreload.state_new()
+//     hotreload.state_load(&st, "/tmp/app.state")           // at start: false = first run
+//     let y: i64 = hotreload.state_get(&st, "list.scroll", 0)
+//     hotreload.state_set(&st, "list.scroll", 840)
+//     hotreload.state_save(&st, "/tmp/app.state")           // every N s or on change
+import std.rt
+import std.fs
+
+export {
+    Watch, watch_new, watch_free, watch_add, watch_count, watch_poll, watch_scan,
+    State, state_new, state_set, state_get, state_has, state_count, state_clear,
+    state_parse, state_text, state_save, state_load,
+    POLL_MS, WATCH_MAX, STATE_MAX, KEY_MAX,
+}
+
+const POLL_MS: i64 = 250
+const WATCH_MAX: usize = 16
+const STATE_MAX: usize = 64
+const KEY_MAX: usize = 31
+
+struct Watch {
+    names: rt.Buf,          // paths, NUL separated
+    off: [usize; 16],
+    len: [usize; 16],
+    mt: [i64; 16],          // last settled mtime (ns)
+    sz: [u64; 16],
+    seen_mt: [i64; 16],     // what the previous poll saw
+    seen_sz: [u64; 16],
+    pend: [u32; 16],        // 1 = changed, waiting to settle
+    n: usize,
+    last_ms: i64,
+}
+
+fn watch_new() -> Watch {
+    return Watch {
+        names: rt.buf_new(), off: [0; 16], len: [0; 16], mt: [0; 16], sz: [0 as u64; 16],
+        seen_mt: [0; 16], seen_sz: [0 as u64; 16], pend: [0 as u32; 16], n: 0, last_ms: 0 - 1000000,
+    }
+}
+
+fn watch_free(w: *mut Watch) {
+    rt.buf_free(&(*w).names)
+    (*w).n = 0
+}
+
+fn watch_count(w: *mut Watch) -> usize { return (*w).n }
+
+fn path_of(w: *mut Watch, i: usize) -> str {
+    return str { p: (rt.buf_ptr(&(*w).names) + (*w).off[i] as u64) as *mut u8, n: (*w).len[i] }
+}
+
+// reads (mtime, size) of file i; false = missing
+fn stat_of(w: *mut Watch, i: usize, mt: *mut i64, sz: *mut u64) -> bool {
+    let info: fs.FileInfo = fs.stat(path_of(w, i)) catch fs.FileInfo { kind: 0 as u8, mode: 0 as u32, size: 0 as u64, mtime_ns: 0 - 1 }
+    if info.mtime_ns < 0 {
+        return false
+    }
+    *mt = info.mtime_ns
+    *sz = info.size
+    return true
+}
+
+// Adds a file to watch; its CURRENT state is the baseline (no change is reported for it). false = full.
+fn watch_add(w: *mut Watch, path: str) -> bool {
+    if (*w).n >= WATCH_MAX || path.n == 0 {
+        return false
+    }
+    let i: usize = (*w).n
+    (*w).off[i] = rt.buf_len(&(*w).names)
+    (*w).len[i] = path.n
+    rt.buf_push_bytes(&(*w).names, path.p as u64, path.n)
+    rt.buf_push(&(*w).names, 0 as u8)
+    var mt: i64 = 0 - 1
+    var sz: u64 = 0 as u64
+    let ok: bool = stat_of(w, i, &mt, &sz)
+    (*w).mt[i] = mt
+    (*w).sz[i] = sz
+    (*w).seen_mt[i] = mt
+    (*w).seen_sz[i] = sz
+    (*w).pend[i] = 0 as u32
+    (*w).n = i + 1
+    return true
+}
+
+// One look at every file (no rate limit). Returns how many settled changes it found; the baseline moves.
+fn watch_scan(w: *mut Watch) -> usize {
+    var found: usize = 0
+    var i: usize = 0
+    while i < (*w).n {
+        var mt: i64 = 0 - 1
+        var sz: u64 = 0 as u64
+        let ok: bool = stat_of(w, i, &mt, &sz)
+        // a deleted file reads as mt -1: it settles like any other change (an editor's save-by-rename)
+        if mt == (*w).seen_mt[i] && sz == (*w).seen_sz[i] {
+            // same as the last look: stable
+            if (*w).pend[i] != 0 as u32 {
+                (*w).pend[i] = 0 as u32
+                if mt != (*w).mt[i] || sz != (*w).sz[i] {
+                    (*w).mt[i] = mt
+                    (*w).sz[i] = sz
+                    if ok {
+                        found = found + 1
+                    }
+                }
+            }
+        } else {
+            (*w).seen_mt[i] = mt
+            (*w).seen_sz[i] = sz
+            (*w).pend[i] = 1 as u32
+        }
+        i = i + 1
+    }
+    return found
+}
+
+// Rate-limited scan for a host loop: returns 0 until POLL_MS passed since the last look.
+fn watch_poll(w: *mut Watch, now_ms: i64) -> usize {
+    if now_ms - (*w).last_ms < POLL_MS {
+        return 0
+    }
+    (*w).last_ms = now_ms
+    return watch_scan(w)
+}
+
+// ================================================================ STATE
+
+struct State {
+    keys: [u8; 2048],   // 64 slots of 32 octets, NUL padded
+    vals: [i64; 64],
+    n: usize,
+}
+
+fn state_new() -> State {
+    return State { keys: [0 as u8; 2048], vals: [0; 64], n: 0 }
+}
+
+fn state_clear(s: *mut State) {
+    (*s).n = 0
+}
+
+fn state_count(s: *mut State) -> usize { return (*s).n }
+
+fn key_ok(k: str) -> bool {
+    if k.n == 0 || k.n > KEY_MAX {
+        return false
+    }
+    var i: usize = 0
+    while i < k.n {
+        let c: u8 = k.chars(i)
+        // printable, no '=' and no space
+        if c <= 32 as u8 || c == 61 as u8 || c > 126 as u8 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn slot_is(s: *mut State, i: usize, k: str) -> bool {
+    var j: usize = 0
+    while j < k.n {
+        if (*s).keys[i * 32 + j] != k.chars(j) {
+            return false
+        }
+        j = j + 1
+    }
+    return (*s).keys[i * 32 + k.n] == 0 as u8
+}
+
+fn find(s: *mut State, k: str) -> usize {
+    var i: usize = 0
+    while i < (*s).n {
+        if slot_is(s, i, k) {
+            return i
+        }
+        i = i + 1
+    }
+    return STATE_MAX
+}
+
+fn state_has(s: *mut State, k: str) -> bool {
+    return find(s, k) != STATE_MAX
+}
+
+fn state_get(s: *mut State, k: str, dflt: i64) -> i64 {
+    let i: usize = find(s, k)
+    if i == STATE_MAX {
+        return dflt
+    }
+    return (*s).vals[i]
+}
+
+// false: bad key (empty, > 31 octets, space, '=') or the table is full
+fn state_set(s: *mut State, k: str, v: i64) -> bool {
+    if !key_ok(k) {
+        return false
+    }
+    var i: usize = find(s, k)
+    if i == STATE_MAX {
+        if (*s).n >= STATE_MAX {
+            return false
+        }
+        i = (*s).n
+        (*s).n = i + 1
+        var j: usize = 0
+        while j < 32 {
+            (*s).keys[i * 32 + j] = 0 as u8
+            j = j + 1
+        }
+        j = 0
+        while j < k.n {
+            (*s).keys[i * 32 + j] = k.chars(j)
+            j = j + 1
+        }
+    }
+    (*s).vals[i] = v
+    return true
+}
+
+// `key=value` lines; blank lines and `#` comments are skipped; a malformed line is skipped.
+// Returns the number of entries read.
+fn state_parse(s: *mut State, p: u64, n: usize) -> usize {
+    var got: usize = 0
+    var a: usize = 0
+    while a < n {
+        var e: usize = a
+        while e < n && rt.ld8(p, e) != 10 as u8 {
+            e = e + 1
+        }
+        // find '='
+        var q: usize = a
+        while q < e && rt.ld8(p, q) != 61 as u8 {
+            q = q + 1
+        }
+        if q > a && q < e && rt.ld8(p, a) != 35 as u8 {
+            var neg: bool = false
+            var i: usize = q + 1
+            if i < e && rt.ld8(p, i) == 45 as u8 {
+                neg = true
+                i = i + 1
+            }
+            var v: i64 = 0
+            var digits: usize = 0
+            while i < e && rt.ld8(p, i) >= 48 as u8 && rt.ld8(p, i) <= 57 as u8 {
+                v = v * 10 + ((rt.ld8(p, i) as i64) - 48)
+                digits = digits + 1
+                i = i + 1
+            }
+            if i < e && rt.ld8(p, i) == 13 as u8 {
+                i = i + 1
+            }
+            if digits > 0 && i == e {
+                if neg {
+                    v = 0 - v
+                }
+                let k: str = str { p: (p + a as u64) as *mut u8, n: q - a }
+                if state_set(s, k, v) {
+                    got = got + 1
+                }
+            }
+        }
+        a = e + 1
+    }
+    return got
+}
+
+// appends the table as text to `out`
+fn state_text(s: *mut State, out: *mut rt.Buf) {
+    var i: usize = 0
+    while i < (*s).n {
+        var j: usize = 0
+        while j < 32 && (*s).keys[i * 32 + j] != 0 as u8 {
+            rt.buf_push(out, (*s).keys[i * 32 + j])
+            j = j + 1
+        }
+        rt.buf_push(out, 61 as u8)
+        rt.buf_push_dec_i64(out, (*s).vals[i])
+        rt.buf_push(out, 10 as u8)
+        i = i + 1
+    }
+}
+
+// writes the table to `path` atomically (std.fs.write_atomic: temp file + rename), so a reader never sees half a file
+fn state_save(s: *mut State, path: str) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    state_text(s, &b)
+    let ok: bool = fs.write_atomic(path, rt.buf_ptr(&b), rt.buf_len(&b)) catch false
+    rt.buf_free(&b)
+    return ok
+}
+
+// reads `path` into the table (existing keys are overwritten). false = no such file / nothing read.
+fn state_load(s: *mut State, path: str) -> bool {
+    var cp: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&cp, path.p as u64, path.n)
+    rt.buf_push(&cp, 0 as u8)
+    var data: rt.Buf = rt.buf_new()
+    var ok: bool = rt.read_file(rt.buf_ptr(&cp), &data)
+    var got: usize = 0
+    if ok {
+        got = state_parse(s, rt.buf_ptr(&data), rt.buf_len(&data))
+    }
+    rt.buf_free(&cp)
+    rt.buf_free(&data)
+    return ok && got > 0
+}
