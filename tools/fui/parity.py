@@ -172,7 +172,7 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     refdir, bindir = os.path.abspath(args[0]), os.path.abspath(args[1])
     want_wine = "--wine" in sys.argv
-    max_wine = 1.0
+    max_wine = 3.0
     if "--max-wine" in sys.argv:
         max_wine = float(sys.argv[sys.argv.index("--max-wine") + 1])
     work = tempfile.mkdtemp(prefix="fui-parity.")

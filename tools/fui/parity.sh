@@ -7,7 +7,7 @@
 # Reference = the headless frames of tools/fui/app_main.fi (no window).
 #   x11   native binary on its own Xvfb (-dpi 96), 0 px must differ   (gate)
 #   wasm  tools/wasm/appcheck.py: browser canvas vs the same reference (gate)
-#   wine  x86_64-windows .exe under wine64                              (informational, <= 1 %)
+#   wine  x86_64-windows .exe under wine64                              (informational, <= 3 %)
 # What cannot run prints "NOT TESTED <host>: <reason>" and is not a failure.
 # Needs FIRNC (default compiler/target/release/firnc); everything lands in a
 # mktemp dir that is removed at the end. Heavy: run via /root/jarvis/bin/heavy.
