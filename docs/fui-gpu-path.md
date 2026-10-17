@@ -9,7 +9,7 @@
 - `painter_clear`, `surface`, `round_rect` already branch on `gpu.gpu_of(canvas)`: a canvas with a Gpu is painted by the GPU, else by the CPU.
 
 ## Minimal entry (next steps, smallest first)
-1. `gpu.gpu_probe(api) -> bool`: try to open the system GL (libGL.so.1 / libEGL via dlopen-free loader of `plat.gl`), create a 16x16 target, clear, read back one pixel. Pure yes/no, no window. Test: on a host without GL it returns false and the program continues on the CPU.
+1. `gpu.gpu_probe(api) -> bool`: try to open the system GL (needs a way to load libGL/libEGL: Firn programs are linked statically and have none yet, see the header of `gpu.fi`; first step may be a tiny helper process or a Firn dynamic loader), create a 16x16 target, clear, read back one pixel. Pure yes/no, no window. Test: on a host without GL it returns false and the program continues on the CPU.
 2. Host switch in `apphost`: `FUI_GPU` unset or 0 -> never touch GL. 1 -> probe; true -> `gpu_attach`, false -> CPU (print one line to stderr).
 3. Parity gate `tools/fui/gpuparity.sh`: paint the showcase sheets once on the CPU and once through the GPU path (llvmpipe / Xvfb+GLX is enough), compare per channel; threshold: mean abs diff <= 1.0, max diff <= 12 (AA / blur rounding), glyph pixels excluded until the GPU text path matches the CPU glyph cache. CPU frames stay golden-exact (`showcase.sh`).
 4. Fallback test: force a failing shader (env `FUI_GPU_FAIL=compile`) -> frame must equal the CPU frame bit for bit.
