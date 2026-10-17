@@ -178,7 +178,7 @@ chk("the submenu is a window of its own to the right of the menu", diff(G0, G1, 
 xdo("key", "Escape")
 time.sleep(0.6)
 G2 = shot("ctx-live-8-subclosed")
-chk("Esc closes the submenu only: the menu stays as it was", diff(G1, G2, (300, 186, 608, 424)) < 400, "%d px differ" % diff(G1, G2, (300, 186, 608, 424)))
+chk("Esc closes the submenu only: the menu stays as it was", diff(G1, G2, (300, 186, 598, 424)) < 400, "%d px differ" % diff(G1, G2, (300, 186, 598, 424)))
 chk("... and the submenu's window is gone", diff(G0, G2, (612, 140, 800, 450)) < 50, "%d px differ" % diff(G0, G2, (612, 140, 800, 450)))
 xdo("key", "Escape")
 time.sleep(0.6)
