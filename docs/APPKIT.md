@@ -202,6 +202,14 @@ rolledback, `from`, `to`, `sha`, `started`, `tries`), `rollback.reason`,
 **Channels.** A program follows the channel it was built with
 (`CHANNEL=beta bash build.sh`) or the one in its settings. Hidden/encrypted
 channels of the store format are not implemented in the client.
+`update_status(u)` also carries the **channels the store offers this program on this
+platform** after a check (`status_channels(s)`: names separated by one space, `@platform`
+pointers folded into one name, only channels that give a build; `catalog.catalog_channels`).
+A UI offers a channel switch only when there are two or more; `update_set_channel` makes
+the choice stick. The JARVIS Android app does exactly that (Settings: channel, installed
+and offered version, release notes = the build's `aenderungen`); its signed test-channel
+entries are staged locally by `tools/android/jarvis_release.sh` (never uploaded) and
+`tools/android/jarvis_update_check.sh` checks the whole line on an emulator.
 
 ## 5. Modules in short
 

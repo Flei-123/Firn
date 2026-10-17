@@ -97,6 +97,7 @@ PORT=$(awk '/^PORT/{print $2}' "$W/out")
 for _ in $(seq 150); do [ "$($ADB shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break; sleep 3; done
 [ "$($ADB shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] || { echo "the emulator did not boot"; exit 1; }
 
+read -r SW SH < <($ADB shell wm size | tr -d '\r' | sed -n 's/.*: *\([0-9]*\)x\([0-9]*\).*/\1 \2/p' | tail -1)
 shot() { $ADB exec-out screencap -p >"$OUT/$1.png"; }
 ocr() { tesseract "$OUT/$1.png" stdout 2>/dev/null | tr -s '\n ' ' '; }
 word_at() { python3 -I - "$OUT/$1.png" "$2" "${3:-1}" <<'PY'
@@ -115,6 +116,10 @@ for ln in tsv[1:]:
             break
 PY
 }
+# the channel switch: a focused button defeats OCR of its own text, so it is found by position: the button row sits a fixed
+# distance above "Notifications" (an anchor that is never focused), the switch is the right-hand button (x about 0.66 of the width)
+tap_switch() { local p x y; shot _w; p=$(word_at _w "Notifications"); [ -n "$p" ] || { echo "  (no anchor on the screen)"; return 1; }
+    x=$(( SW * 66 / 100 )); y=$(( ${p#* } - 73 * SH / 2340 )); $ADB shell input tap $x $y; sleep "${1:-2}"; }
 tap_word() { local p; shot _w; p=$(word_at _w "$1" "${2:-1}"); [ -n "$p" ] || { echo "  (no word $1 on the screen)"; return 1; }
     $ADB shell input tap $p; sleep "${3:-1.5}"; }
 wait_ocr() { local i; for i in $(seq ${OCR_TRIES:-12}); do shot "$1"; ocr "$1" | grep -qE "$2" && break; sleep 1.5; done; ocr "$1" | grep -cE "$2"; }
@@ -153,18 +158,21 @@ echo "== 4. channels stabil + test"
 $REL --version 0.2.2 --apk "$W/apk/jarvis-0.2.2.apk" --channel stabil >"$W/rel2.log" 2>&1 || { cat "$W/rel2.log"; exit 1; }
 tap_word "Check" 1 2
 check "switch appears (offers stable)" "$(OCR_TRIES=25 wait_ocr 04_two 'Channel: stable')" 1
-tap_word "Channel:" 2 2
+tap_switch 2
 check "after the switch: channel stable" "$(OCR_TRIES=15 wait_ocr 05_stable 'Channel: stable.*installed 0\.2\.2')" 1
 check "stable channel: up to date" "$(OCR_TRIES=25 wait_ocr 05_stable 'up to date')" 1
 check "stable channel: notes of 0.2.2" "$(wait_ocr 05_stable 'First stable')" 1
-tap_word "Channel:" 2 2
+tap_switch 2
 check "back on test: update offered again" "$(OCR_TRIES=25 wait_ocr 06_back 'update 0\.2\.3 available')" 1
-tap_word "Channel:" 2 2
+tap_switch 2
 check "stable again" "$(OCR_TRIES=15 wait_ocr 07_again 'up to date')" 1
 $ADB shell am force-stop $PKG
 sleep 2
 $ADB shell am start -n $ACT >/dev/null
-sleep 8
+check "login screen after the restart" "$(OCR_TRIES=30 wait_ocr 08_login 'Sign in')" 1
+type_into "User" justin; type_into "Password" pw
+tap_word "Sign" 1 1
+check "chat screen after the second login" "$(OCR_TRIES=30 wait_ocr 08_chat 'Chats')" 1
 tap_word "Prefs" 1 2
 check "the channel choice survives a restart" "$(OCR_TRIES=15 wait_ocr 08_restart 'Channel: stable.*installed 0\.2\.2')" 1
 check "no crash in logcat" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
