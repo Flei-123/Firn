@@ -40,6 +40,34 @@
 // ready for `return testkit.finish()` from `main`.
 //
 // HONEST -- what this does NOT do:
+//
+// MORE (r-vspy-lib2) -- the pytest/unittest conveniences:
+//
+//     assert_ne[T](a, b), assert_lt/le/gt/ge[T](a, b)          // any integer type
+//     testkit.assert_eq_buf(&buf, "0.05")                      // a rt.Buf against text
+//
+//     // subTest: record a failure, keep going, fail ONCE at the end
+//     testkit.sub_eq_i64("12.34", money.parse_cents("12.34"), 1234)
+//     testkit.sub_eq_str("0.05", fmt(5), "0.05")
+//     testkit.sub_end()                                        // panics when any sub_* failed
+//
+//     // parametrised tables: "input=expected" rows, `,` separated
+//     testkit.table_str_i64(money.parse_cents, "12.34=1234,5=500,0.05=5,abc=-1")
+//     testkit.table_i64_i64(add_vat_20, "1000=1200,999=1199,0=0")
+//     testkit.table_i64_str(format_cents, "0=0.00,5=0.05,1234=12.34")   // f(n, &out_buf)
+//     testkit.each_field("a,b,c", ",", visit, ctx)             // visit(field, ctx), context set
+//
+//     // fixtures: one static slot shared by the helper functions of a test
+//     testkit.fixture_set((&prices) as u64)    // needs #[allow_escape] on the setting fn
+//     ...  let p = testkit.fixture() as *mut Prices
+//     testkit.with_dir(body, ctx)           // body(dir, ctx) in a fresh temp dir, removed after
+//
+// ONE-LINE SUMMARY without timings (diffable): script style `finish_named` /
+// `sub_*` print only `ok`/`FAIL` lines and `<n> checks, <m> failed`. The
+// `firnc --test` TAP/JSON runner adds `# us=` timings per case; for a diff
+// against Python run the script style or strip ` # us=NNN` (sed).
+//
+// HONEST -- what this does NOT do:
 //   * The position of a failure is the one of the TEST FUNCTION, not of the
 //     assert line. `firnc --test` takes `file:line:col` from a panic message
 //     of the form `... at file:line:col` and falls back to the `fn`
@@ -63,12 +91,18 @@
 import rt
 import num
 import fsx
+import str
 
 export {
     assert_true, assert_false, fail, context,
     assert_eq_i64, assert_eq_u64, assert_ne_i64, assert_eq, assert_eq_str, assert_eq_bytes,
     assert_near,
     check, check_detail, finish, finish_named, checks_run, checks_failed, reset,
+    // r-vspy-lib2: more asserts, sub-cases, tables, fixtures
+    assert_ne, assert_lt, assert_le, assert_gt, assert_ge, assert_eq_buf, assert_ne_str,
+    sub_true, sub_eq_i64, sub_eq_str, sub_end, sub_failed,
+    each_field, table_str_i64, table_i64_i64, table_i64_str,
+    fixture_set, fixture, with_dir,
 }
 
 const TK_SYS_WRITE: i64 = 1
@@ -535,4 +569,254 @@ fn finish_named(label: str) -> i32 {
         return 1
     }
     return 0
+}
+
+// ------------------------------------------------------- more assertions
+
+fn assert_ne[T: Int](a: T, b: T) {
+    if a != b {
+        return
+    }
+    var m: rt.Buf = rt.buf_new()
+    put(&m, "assert_ne failed: both are ")
+    tk_put_int[T](&m, a)
+    die(&m)
+}
+
+fn tk_cmp_fail[T: Int](op: str, a: T, b: T) {
+    var m: rt.Buf = rt.buf_new()
+    put(&m, "assert_")
+    put(&m, op)
+    put(&m, " failed: left=")
+    tk_put_int[T](&m, a)
+    put(&m, " right=")
+    tk_put_int[T](&m, b)
+    die(&m)
+}
+
+fn assert_lt[T: Int](a: T, b: T) {
+    if a < b {
+        return
+    }
+    tk_cmp_fail[T]("lt", a, b)
+}
+
+fn assert_le[T: Int](a: T, b: T) {
+    if a <= b {
+        return
+    }
+    tk_cmp_fail[T]("le", a, b)
+}
+
+fn assert_gt[T: Int](a: T, b: T) {
+    if a > b {
+        return
+    }
+    tk_cmp_fail[T]("gt", a, b)
+}
+
+fn assert_ge[T: Int](a: T, b: T) {
+    if a >= b {
+        return
+    }
+    tk_cmp_fail[T]("ge", a, b)
+}
+
+fn assert_ne_str(a: str, b: str) {
+    if a.length() != b.length() || (a.length() > 0 && !rt.mem_eq(a.p as u64, b.p as u64, a.length())) {
+        return
+    }
+    var m: rt.Buf = rt.buf_new()
+    put(&m, "assert_ne_str failed: both are \"")
+    put(&m, a)
+    put(&m, "\"")
+    die(&m)
+}
+
+// A `rt.Buf` against text (the usual output of a formatter).
+fn assert_eq_buf(b: *mut rt.Buf, want: str) {
+    assert_eq_bytes(rt.buf_ptr(b), rt.buf_len(b), want.p as u64, want.length())
+}
+
+// -------------------------------------------------- sub-cases (unittest subTest)
+
+static mut tk_sub_bad: usize = 0
+
+fn sub_report(label: str, got: str, want: str) {
+    tk_sub_bad = tk_sub_bad + 1
+    var b: rt.Buf = rt.buf_new()
+    put(&b, "  FAIL  ")
+    put(&b, label)
+    put(&b, ": got ")
+    put(&b, got)
+    put(&b, ", want ")
+    put(&b, want)
+    rt.buf_push(&b, 10 as u8)
+    say(1, &b)
+    rt.buf_free(&b)
+}
+
+// Records a failure labelled `label` and carries on.
+fn sub_true(label: str, ok: bool) {
+    if !ok {
+        sub_report(label, "false", "true")
+    }
+}
+
+fn sub_eq_i64(label: str, got: i64, want: i64) {
+    if got == want {
+        return
+    }
+    var g: rt.Buf = rt.buf_new()
+    var w: rt.Buf = rt.buf_new()
+    put_i64(&g, got)
+    put_i64(&w, want)
+    sub_report(label, str { p: rt.buf_data(&g), n: rt.buf_len(&g) }, str { p: rt.buf_data(&w), n: rt.buf_len(&w) })
+    rt.buf_free(&g)
+    rt.buf_free(&w)
+}
+
+fn sub_eq_str(label: str, got: str, want: str) {
+    if got.length() == want.length() && (got.length() == 0 || rt.mem_eq(got.p as u64, want.p as u64, got.length())) {
+        return
+    }
+    sub_report(label, got, want)
+}
+
+fn sub_failed() -> usize {
+    return tk_sub_bad
+}
+
+// Ends a group of sub-cases: panics when any `sub_*` failed, then resets.
+fn sub_end() {
+    let bad: usize = tk_sub_bad
+    tk_sub_bad = 0
+    if bad > 0 {
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_u64(&b, bad as u64)
+        var m: rt.Buf = rt.buf_new()
+        put(&m, "sub-cases failed: ")
+        put(&m, str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+        rt.buf_free(&b)
+        die(&m)
+    }
+}
+
+// ------------------------------------------------------ tables and fixtures
+
+// Calls visit(field, ctx) for every `sep`-separated field of `list`, with
+// `context(field)` set so a failure names the field.
+fn each_field(list: str, sep: str, visit: fn(str, u64), ctx: u64) {
+    var start: usize = 0
+    var i: usize = 0
+    let n: usize = list.length()
+    let sl: usize = sep.length()
+    while i <= n {
+        var at_sep: bool = false
+        if i == n {
+            at_sep = true
+        } else if sl > 0 && i + sl <= n && rt.mem_eq((list.p as u64) + i as u64, sep.p as u64, sl) {
+            at_sep = true
+        }
+        if at_sep {
+            let f: str = str { p: ((list.p as u64) + start as u64) as *mut u8, n: i - start }
+            context(f)
+            visit(f, ctx)
+            context("")
+            start = i + sl
+            i = i + sl
+            if sl == 0 {
+                i = n + 1
+            }
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+fn tk_split_row(row: str, key: *mut str, want: *mut str) {
+    var i: usize = 0
+    let n: usize = row.length()
+    while i < n && *(((row.p as u64) + i as u64) as *mut u8) != (61 as u8) {
+        i = i + 1
+    }
+    *key = str { p: row.p, n: i }
+    if i < n {
+        *want = str { p: ((row.p as u64) + (i + 1) as u64) as *mut u8, n: n - i - 1 }
+    } else {
+        *want = str { p: row.p, n: 0 }
+    }
+}
+
+fn tk_parse(s: str) -> i64 {
+    let r: num.ParsedI64 = num.parse_i64(str.span(s.p, s.length()))
+    return r.value
+}
+
+static mut tk_tab_fn: u64 = 0
+static mut tk_tab_kind: u64 = 0
+
+fn tk_table_row(row: str, ctx: u64) {
+    var key: str = ""
+    var want: str = ""
+    tk_split_row(row, &key, &want)
+    if tk_tab_kind == 0 {
+        let f: fn(str) -> i64 = tk_tab_fn as fn(str) -> i64
+        sub_eq_i64(row, f(key), tk_parse(want))
+    } else if tk_tab_kind == 1 {
+        let f: fn(i64) -> i64 = tk_tab_fn as fn(i64) -> i64
+        sub_eq_i64(row, f(tk_parse(key)), tk_parse(want))
+    } else {
+        let f: fn(i64, *mut rt.Buf) = tk_tab_fn as fn(i64, *mut rt.Buf)
+        var b: rt.Buf = rt.buf_new()
+        f(tk_parse(key), &b)
+        sub_eq_str(row, str { p: rt.buf_data(&b), n: rt.buf_len(&b) }, want)
+        rt.buf_free(&b)
+    }
+}
+
+fn tk_table(kind: u64, f: u64, rows: str) {
+    tk_tab_fn = f
+    tk_tab_kind = kind
+    each_field(rows, ",", tk_table_row, 0)
+    sub_end()
+}
+
+// Rows "input=expected" separated by `,`; every row is one sub-case named by
+// the row text, all failures are listed and the test fails once at the end.
+fn table_str_i64(f: fn(str) -> i64, rows: str) {
+    tk_table(0, f as u64, rows)
+}
+
+fn table_i64_i64(f: fn(i64) -> i64, rows: str) {
+    tk_table(1, f as u64, rows)
+}
+
+// f(n, &out) writes text into the buffer; the buffer is compared with the
+// expected text of the row.
+fn table_i64_str(f: fn(i64, *mut rt.Buf), rows: str) {
+    tk_table(2, f as u64, rows)
+}
+
+static mut tk_fixture: u64 = 0
+
+// One shared slot for the data of the running test (what `setUp` would build).
+fn fixture_set(p: u64) {
+    tk_fixture = p
+}
+
+fn fixture() -> u64 {
+    return tk_fixture
+}
+
+// Runs body(dir, ctx) inside a fresh temporary directory that is removed
+// afterwards (a failed assertion removes it too, via `fsx.cleanup_all`).
+#[allow_escape]
+fn with_dir(body: fn(str, u64), ctx: u64) {
+    var d: fsx.TempDir = fsx.temp_dir("tk_") catch | e | fsx.TempDir { path: rt.buf_new(), armed: false }
+    if !d.armed {
+        fail("with_dir: cannot create a temporary directory")
+    }
+    body(fsx.temp_dir_path(&d), ctx)
+    fsx.temp_dir_drop(&d)
 }

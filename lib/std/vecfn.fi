@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/vecfn.fi -- the functional part of `std.vec`: sum, map, filter,
+// reduce, slice, each, and an element read that works for ANY element type.
+// Callbacks are plain `fn` values (Firn has no capturing closures); they get a
+// POINTER to the element, like `vec_sort_by` / `vec_all` / `vec_count_where`.
+//
+// Usage (Python on the right):
+//
+//     import std.vec
+//     import std.vecfn
+//
+//     fn sq(e: *i32) -> i32 { return *e * *e }
+//     fn odd(e: *i32) -> bool { return *e % 2 == 1 }
+//     fn plus(acc: i64, e: *i32) -> i64 { return acc + *e as i64 }
+//
+//     vec_sum[i32](&v)                          // sum(v)
+//     vec_map[i32, i32](&v, sq, &out)           // [x * x for x in v]
+//     vec_filter[i32](&v, odd, &out)            // [x for x in v if x % 2]
+//     vec_reduce[i32, i64](&v, 0, plus)         // functools.reduce(...)
+//     vec_slice[i32](&v, 1, 3, &out)            // v[1:3]  (indexes clamp)
+//     vec_get[Point](&pts, 2, &p)               // p = pts[2]  (copy, any T)
+//     vec_item[Point](&pts, 2)                  // same, zeroed when out of range
+//     vec_each[Point](&pts, show, ctx)          // for i, p in enumerate(pts): show(i, &p, ctx)
+//
+// `vec_min`/`vec_max`/`vec_any`/`vec_all`/`vec_count_where`/`vec_sort_by`
+// live in `std.vec`. The outputs are `Vec`s the caller owns (`vec_free`); `map`,
+// `filter` and `slice` APPEND to `out` (call `vec_clear` first for a fresh
+// list). All names are bare because a generic function cannot be called
+// module-qualified.
+import std.rt
+import std.vec
+
+export { vec_sum, vec_product, vec_map, vec_filter, vec_reduce, vec_slice,
+    vec_get, vec_item, vec_each, vec_last_n }
+
+// Sum of the elements (0 for an empty vec). Checked like any `+`.
+fn vec_sum[T](v: *mut Vec[T]) -> T {
+    var acc: T = 0 as T
+    var i: usize = 0
+    let n: usize = vec_len[T](v)
+    while i < n {
+        acc = acc + *vec_elem_ptr[T](v, i)
+        i = i + 1
+    }
+    return acc
+}
+
+// Product of the elements (1 for an empty vec).
+fn vec_product[T](v: *mut Vec[T]) -> T {
+    var acc: T = 1 as T
+    var i: usize = 0
+    let n: usize = vec_len[T](v)
+    while i < n {
+        acc = acc * *vec_elem_ptr[T](v, i)
+        i = i + 1
+    }
+    return acc
+}
+
+// Appends f(&e) of every element to `out`. False when memory ran out.
+fn vec_map[T, U](v: *mut Vec[T], f: fn(*T) -> U, out: *mut Vec[U]) -> bool {
+    var i: usize = 0
+    let n: usize = vec_len[T](v)
+    while i < n {
+        if !vec_push[U](out, f(vec_elem_ptr[T](v, i))) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Appends the elements for which pred(&e) holds, in order.
+fn vec_filter[T](v: *mut Vec[T], pred: fn(*T) -> bool, out: *mut Vec[T]) -> bool {
+    var i: usize = 0
+    let n: usize = vec_len[T](v)
+    while i < n {
+        let e: *mut T = vec_elem_ptr[T](v, i)
+        if pred(e) {
+            if !vec_push[T](out, *e) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Left fold: acc = f(acc, &e) over all elements, starting from `init`.
+fn vec_reduce[T, A](v: *mut Vec[T], init: A, f: fn(A, *T) -> A) -> A {
+    var acc: A = init
+    var i: usize = 0
+    let n: usize = vec_len[T](v)
+    while i < n {
+        acc = f(acc, vec_elem_ptr[T](v, i))
+        i = i + 1
+    }
+    return acc
+}
+
+// Appends v[from..to] (end exclusive); both ends clamp to the length.
+fn vec_slice[T](v: *mut Vec[T], from: usize, to: usize, out: *mut Vec[T]) -> bool {
+    let n: usize = vec_len[T](v)
+    var hi: usize = to
+    if hi > n {
+        hi = n
+    }
+    var i: usize = from
+    while i < hi {
+        if !vec_push[T](out, *vec_elem_ptr[T](v, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The last `k` elements (all of them when k >= len) appended to `out`.
+fn vec_last_n[T](v: *mut Vec[T], k: usize, out: *mut Vec[T]) -> bool {
+    let n: usize = vec_len[T](v)
+    var from: usize = 0
+    if k < n {
+        from = n - k
+    }
+    return vec_slice[T](v, from, n, out)
+}
+
+// Copies element `i` into *out; false (and *out untouched) when out of range.
+// Works for every T -- `vec_at` is limited to scalars.
+fn vec_get[T](v: *mut Vec[T], i: usize, out: *mut T) -> bool {
+    let p: *mut T = vec_elem_ptr[T](v, i)
+    if p == (0 as *mut T) {
+        return false
+    }
+    *out = *p
+    return true
+}
+
+// Element `i` by value for ANY T; past the end it is all zero bytes (the
+// same decision as `vec_at`).
+fn vec_item[T](v: *mut Vec[T], i: usize) -> T {
+    let p: *mut T = vec_elem_ptr[T](v, i)
+    if p != (0 as *mut T) {
+        return *p
+    }
+    // no uninitialised locals in Firn: read a zeroed scratch block
+    let n: usize = size_of[T]()
+    let tmp: u64 = rt.heap_alloc(n + 8)
+    rt.mem_set(tmp, 0 as u8, n + 8)
+    let r: T = *(tmp as *mut T)
+    rt.heap_free(tmp, n + 8)
+    return r
+}
+
+// enumerate: calls f(i, &e, ctx) for every element in order.
+fn vec_each[T](v: *mut Vec[T], f: fn(usize, *T, u64), ctx: u64) {
+    var i: usize = 0
+    let n: usize = vec_len[T](v)
+    while i < n {
+        f(i, vec_elem_ptr[T](v, i), ctx)
+        i = i + 1
+    }
+}

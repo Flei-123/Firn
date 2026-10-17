@@ -16,6 +16,13 @@
 //         return 0
 //     }
 //
+//     // parallel map (results per index, no ctx struct, no raw pointers):
+//     fn size_of_file(i: u64) -> u64 { ... }
+//     var sizes: Vec[u64] = vec_new[u64]()
+//     jobs_map[u64](&j, 100, size_of_file, &sizes)             // sizes[i] = f(i)
+//     jobs_map_into[Digest](&j, 100, digest_of, &digests)       // fn(i, out: *mut Digest)
+//     jobs_map_files[u64](&j, &paths, lines_in_file, &counts)   // fn(p: *str, out: *mut u64)
+//
 //     fn main() -> i32 {
 //         var j: jobs.Jobs = jobs.create(7)             // 7 workers + the caller = 8 threads
 //         jobs.parallel_for(&j, 0, 4096, 16, mesh_chunks, world_addr)
@@ -78,13 +85,14 @@
 //     still comes from chunk-sized descriptors.
 
 import std.rt
+import std.vec
 
 export {
     Jobs, WORKER_KIND,
     create, create_lf, lockfree, destroy, worker_main, worker_count,
     parallel_for, parallel_each,
     group_new, group_free, group_go, group_wait, group_pending,
-    spawn, join, task_done,
+    spawn, join, task_done, jobs_map, jobs_map_into, jobs_map_files,
     executed_by_workers, executed_by_callers,
 }
 
@@ -672,4 +680,83 @@ fn destroy(j: *mut Jobs) {
     }
     rt.heap_free(blk, P_WORDS * 8)
     (*j).blk = 0
+}
+
+// ------------------------------------------------------------ parallel map
+//
+// `map` is the Python `[f(i) for i in range(n)]` / `pool.map(f, items)`:
+// every result lands in its own slot of a `Vec`, so no two items write the
+// same memory and the caller needs neither a context struct nor a raw
+// pointer. Three shapes, because a generic function cannot be handed to the
+// pool as a `fn` value (so the pool calls the user's function through its
+// ADDRESS with a fixed register signature):
+//   jobs_map[T: Scalar]        f(i) -> T       T = integer, bool or pointer (<= 8 bytes)
+//   jobs_map_into[T]           f(i, out: *mut T)   any T (str, struct, f64); f writes *out
+//   jobs_map_files[T]          f(path: *str, out: *mut T) per element of a Vec[str]
+// `out` is CLEARED first and holds `n` elements afterwards (zeroed when
+// `f` leaves its slot untouched). False when memory ran out (out untouched).
+// A `str` / pointer written into a slot by a worker is reachable for the
+// collector through `out` only after the call returns -- keep `out` alive
+// (a local `Vec` is) and do not allocate-heavy inside `f` without `#[no_gc]`
+// concerns of the usual kind (J4).
+
+// The context is 5 words on the heap: f, base, size, kind, items.
+fn jobs_map_body(ctx: u64, lo: u64, hi: u64) {
+    let f: u64 = rt.ld64(ctx, 0)
+    let base: u64 = rt.ld64(ctx, 1)
+    let size: u64 = rt.ld64(ctx, 2)
+    let kind: u64 = rt.ld64(ctx, 3)
+    let items: u64 = rt.ld64(ctx, 4)
+    var i: u64 = lo
+    while i < hi {
+        let slot: u64 = base + i * size
+        if kind == 0 {
+            let g: fn(u64) -> u64 = f as fn(u64) -> u64
+            let r: u64 = g(i)
+            rt.mem_copy(slot, (&r) as u64, size as usize)
+        } else if kind == 1 {
+            let g: fn(u64, u64) = f as fn(u64, u64)
+            g(i, slot)
+        } else {
+            let g: fn(u64, u64) = f as fn(u64, u64)
+            g(items + i * 16, slot)
+        }
+        i = i + 1
+    }
+}
+
+fn jobs_map_run[T](j: *mut Jobs, n: u64, kind: u64, f: u64, items: u64, out: *mut Vec[T]) -> bool {
+    vec_clear[T](out)
+    if n == 0 {
+        return true
+    }
+    if !vec_reserve[T](out, n as usize) {
+        return false
+    }
+    rt.mem_set((*out).ptr, 0 as u8, n as usize * size_of[T]())
+    (*out).len = n as usize
+    let cp: u64 = rt.heap_alloc(40)
+    if cp == 0 {
+        return false
+    }
+    rt.st64(cp, 0, f)
+    rt.st64(cp, 1, (*out).ptr)
+    rt.st64(cp, 2, size_of[T]() as u64)
+    rt.st64(cp, 3, kind)
+    rt.st64(cp, 4, items)
+    parallel_for(j, 0, n, 1, jobs_map_body, cp)
+    rt.heap_free(cp, 40)
+    return true
+}
+
+fn jobs_map[T: Scalar](j: *mut Jobs, n: u64, f: fn(u64) -> T, out: *mut Vec[T]) -> bool {
+    return jobs_map_run[T](j, n, 0, f as u64, 0, out)
+}
+
+fn jobs_map_into[T](j: *mut Jobs, n: u64, f: fn(u64, *mut T), out: *mut Vec[T]) -> bool {
+    return jobs_map_run[T](j, n, 1, f as u64, 0, out)
+}
+
+fn jobs_map_files[T](j: *mut Jobs, paths: *mut Vec[str], f: fn(*str, *mut T), out: *mut Vec[T]) -> bool {
+    return jobs_map_run[T](j, vec_len[str](paths) as u64, 2, f as u64, (*paths).ptr, out)
 }

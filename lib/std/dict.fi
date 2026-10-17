@@ -1,0 +1,351 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/dict.fi -- `Dict[V]`: text keys, insertion-ordered iteration, like a
+// Python `dict` / `collections.Counter`.
+//
+// Usage (word count, the Python `Counter(text.split())` case):
+//
+//     import std.io
+//     import std.dict
+//     import std.str
+//     import std.vec
+//
+//     var d: Dict[i32] = dict_new[i32]()
+//     defer dict_free[i32](&d)
+//     var it = str.divisor_whitespace("to be or not to be")
+//     var w: str = ""
+//     while str.divisor_next(&it, &w) { dict_inc[i32](&d, w, 1) }
+//     var top: Vec[DictItem[i32]] = vec_new[DictItem[i32]]()
+//     dict_top[i32](&d, 2, &top)               // by value desc, then key asc
+//     // -> "be" 2, "to" 2
+//
+// Iteration (insertion order, removed keys are skipped):
+//
+//     var i = dict_first[i32](&d)
+//     while i != dict_end[i32](&d) {
+//         io.fmt_print_line(f"{dict_key[i32](&d, i)} {dict_val[i32](&d, i)}")
+//         i = dict_next[i32](&d, i + 1)
+//     }
+//
+// API (V is any type unless a bound is named; all names are bare, the
+// generic type cannot be written module-qualified):
+//   dict_new[V]() / dict_free / dict_clear / dict_len
+//   dict_set(d, key, v) / dict_has / dict_remove -> bool
+//   dict_get[V: Scalar](d, key) -> V     (0 when missing)
+//   dict_get_or(d, key, default) / dict_get_if(d, key, out) -> bool
+//   dict_inc[V: Int](d, key, delta) -> new value (a missing key starts at 0)
+//   dict_first / dict_next / dict_end / dict_key / dict_val / dict_val_ptr
+//   dict_keys(d, &out Vec[str]) / dict_keys_sorted(d, &out Vec[str])
+//   dict_items(d, &out Vec[DictItem[V]]) / dict_top[V: Int](d, n, &out)
+//
+// Keys are copied into the dict. `dict_key` returns a VIEW that stays valid
+// until the next `dict_set`/`dict_inc`/`dict_remove`/`dict_clear`; the
+// `dict_keys*` / `dict_items` / `dict_top` outputs hold their own copies.
+// Not thread safe. Firn has no destructors: call `dict_free`.
+//
+// Layout: a BMap maps key bytes to an entry number; the entries (key offset,
+// key length, value, live flag) sit in arrays in insertion order, the key
+// bytes in one buffer. A removal marks the entry dead; when more than half of
+// the entries are dead the arrays are compacted (order kept).
+import std.rt
+import std.vec
+import std.map
+import std.str
+
+export { Dict, DictItem, dict_new, dict_free, dict_clear, dict_len,
+    dict_set, dict_has, dict_remove, dict_get, dict_get_or, dict_get_if,
+    dict_inc, dict_first, dict_next, dict_end, dict_key, dict_val,
+    dict_val_ptr, dict_keys, dict_keys_sorted, dict_items, dict_top }
+
+struct Dict[V] {
+    idx: BMap[usize],
+    kbuf: rt.Buf,
+    koff: Vec[usize],
+    klen: Vec[usize],
+    vals: Vec[V],
+    live: Vec[u8],
+    count: usize,
+}
+
+struct DictItem[V] {
+    key: str,
+    val: V,
+}
+
+fn dict_new[V]() -> Dict[V] {
+    return Dict[V] { idx: bmap_new[usize](), kbuf: rt.buf_new(), koff: vec_new[usize](),
+        klen: vec_new[usize](), vals: vec_new[V](), live: vec_new[u8](), count: 0 }
+}
+
+fn dict_free[V](d: *mut Dict[V]) {
+    bmap_free[usize](&(*d).idx)
+    rt.buf_free(&(*d).kbuf)
+    vec_free[usize](&(*d).koff)
+    vec_free[usize](&(*d).klen)
+    vec_free[V](&(*d).vals)
+    vec_free[u8](&(*d).live)
+    (*d).count = 0
+}
+
+fn dict_clear[V](d: *mut Dict[V]) {
+    bmap_clear[usize](&(*d).idx)
+    rt.buf_clear(&(*d).kbuf)
+    vec_clear[usize](&(*d).koff)
+    vec_clear[usize](&(*d).klen)
+    vec_clear[V](&(*d).vals)
+    vec_clear[u8](&(*d).live)
+    (*d).count = 0
+}
+
+// Number of live keys (what Python's `len(d)` says).
+fn dict_len[V](d: *mut Dict[V]) -> usize {
+    return (*d).count
+}
+
+// Entry number of `key`, or `usize` max when missing.
+fn dict_find[V](d: *mut Dict[V], key: str) -> usize {
+    var e: usize = 0
+    if bmap_get_if[usize](&(*d).idx, key.p as u64, key.n, &e) {
+        return e
+    }
+    return 0 -% 1
+}
+
+fn dict_has[V](d: *mut Dict[V], key: str) -> bool {
+    return bmap_has[usize](&(*d).idx, key.p as u64, key.n)
+}
+
+// Appends an entry; the key must not exist yet.
+fn dict_add[V](d: *mut Dict[V], key: str, v: V) -> usize {
+    let e: usize = vec_len[usize](&(*d).koff)
+    vec_push[usize](&(*d).koff, rt.buf_len(&(*d).kbuf))
+    vec_push[usize](&(*d).klen, key.n)
+    rt.buf_push_bytes(&(*d).kbuf, key.p as u64, key.n)
+    vec_push[V](&(*d).vals, v)
+    vec_push[u8](&(*d).live, 1 as u8)
+    bmap_set[usize](&(*d).idx, key.p as u64, key.n, e)
+    (*d).count = (*d).count + 1
+    return e
+}
+
+// Sets `key` to `v`; a new key goes to the end of the iteration order, an
+// existing one keeps its place (Python semantics).
+fn dict_set[V](d: *mut Dict[V], key: str, v: V) {
+    let e: usize = dict_find[V](d, key)
+    if e == 0 -% 1 {
+        dict_add[V](d, key, v)
+    } else {
+        vec_set[V](&(*d).vals, e, v)
+    }
+}
+
+// Pointer to the value of `key`, or null.
+fn dict_val_ptr[V](d: *mut Dict[V], key: str) -> *mut V {
+    let e: usize = dict_find[V](d, key)
+    if e == 0 -% 1 {
+        return 0 as *mut V
+    }
+    return vec_elem_ptr[V](&(*d).vals, e)
+}
+
+fn dict_get[V: Scalar](d: *mut Dict[V], key: str) -> V {
+    let p: *mut V = dict_val_ptr[V](d, key)
+    if p == (0 as *mut V) {
+        return 0 as V
+    }
+    return *p
+}
+
+fn dict_get_or[V](d: *mut Dict[V], key: str, default: V) -> V {
+    let p: *mut V = dict_val_ptr[V](d, key)
+    if p == (0 as *mut V) {
+        return default
+    }
+    return *p
+}
+
+fn dict_get_if[V](d: *mut Dict[V], key: str, out: *mut V) -> bool {
+    let p: *mut V = dict_val_ptr[V](d, key)
+    if p == (0 as *mut V) {
+        return false
+    }
+    *out = *p
+    return true
+}
+
+// `d[key] += delta` with a missing key counting as 0 (Counter / defaultdict
+// semantics). Returns the new value.
+fn dict_inc[V: Int](d: *mut Dict[V], key: str, delta: V) -> V {
+    let p: *mut V = dict_val_ptr[V](d, key)
+    if p == (0 as *mut V) {
+        dict_add[V](d, key, delta)
+        return delta
+    }
+    *p = *p + delta
+    return *p
+}
+
+fn dict_compact[V](d: *mut Dict[V]) {
+    var n: Dict[V] = dict_new[V]()
+    var i: usize = 0
+    let m: usize = vec_len[usize](&(*d).koff)
+    while i < m {
+        if vec_elem_ptr[u8](&(*d).live, i) != (0 as *mut u8) && *vec_elem_ptr[u8](&(*d).live, i) == (1 as u8) {
+            let k: str = dict_key[V](d, i)
+            dict_add[V](&n, k, *vec_elem_ptr[V](&(*d).vals, i))
+        }
+        i = i + 1
+    }
+    dict_free[V](d)
+    *d = n
+}
+
+// Removes `key`; false when it was not there.
+fn dict_remove[V](d: *mut Dict[V], key: str) -> bool {
+    let e: usize = dict_find[V](d, key)
+    if e == 0 -% 1 {
+        return false
+    }
+    bmap_delete[usize](&(*d).idx, key.p as u64, key.n)
+    vec_set[u8](&(*d).live, e, 0 as u8)
+    (*d).count = (*d).count - 1
+    let total: usize = vec_len[usize](&(*d).koff)
+    if total > 16 && (*d).count * 2 < total {
+        dict_compact[V](d)
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- iteration
+
+// First live slot (== dict_end when empty).
+fn dict_first[V](d: *mut Dict[V]) -> usize {
+    return dict_next[V](d, 0)
+}
+
+// The first live slot at or after `i`; `dict_end` when none is left.
+fn dict_next[V](d: *mut Dict[V], i: usize) -> usize {
+    let m: usize = vec_len[usize](&(*d).koff)
+    var k: usize = i
+    while k < m {
+        if *vec_elem_ptr[u8](&(*d).live, k) == (1 as u8) {
+            return k
+        }
+        k = k + 1
+    }
+    return m
+}
+
+fn dict_end[V](d: *mut Dict[V]) -> usize {
+    return vec_len[usize](&(*d).koff)
+}
+
+// VIEW of the key of slot `i` (valid until the next change of the dict).
+fn dict_key[V](d: *mut Dict[V], i: usize) -> str {
+    let off: usize = *vec_elem_ptr[usize](&(*d).koff, i)
+    let n: usize = *vec_elem_ptr[usize](&(*d).klen, i)
+    return str { p: (rt.buf_data(&(*d).kbuf) + off) as *mut u8, n: n }
+}
+
+fn dict_val[V: Scalar](d: *mut Dict[V], i: usize) -> V {
+    return vec_at[V](&(*d).vals, i)
+}
+
+// ------------------------------------------------------------ whole-dict ops
+
+// Keys in insertion order, each a GC-owned copy.
+fn dict_keys[V](d: *mut Dict[V], out: *mut Vec[str]) {
+    var i: usize = dict_first[V](d)
+    while i != dict_end[V](d) {
+        vec_push[str](out, __str_copy(dict_key[V](d, i)))
+        i = dict_next[V](d, i + 1)
+    }
+}
+
+fn dict_str_less(a: *str, b: *str) -> bool {
+    return str.compare(*a, *b) < 0
+}
+
+// Keys in byte order (Python `sorted(d)`).
+fn dict_keys_sorted[V](d: *mut Dict[V], out: *mut Vec[str]) {
+    dict_keys[V](d, out)
+    vec_sort_by[str](out, dict_str_less)
+}
+
+// (key, value) pairs in insertion order, keys copied.
+fn dict_items[V](d: *mut Dict[V], out: *mut Vec[DictItem[V]]) {
+    var i: usize = dict_first[V](d)
+    while i != dict_end[V](d) {
+        vec_push[DictItem[V]](out, DictItem[V] { key: __str_copy(dict_key[V](d, i)),
+                val: *vec_elem_ptr[V](&(*d).vals, i) })
+        i = dict_next[V](d, i + 1)
+    }
+}
+
+fn dict_item_more[V: Int](a: *DictItem[V], b: *DictItem[V]) -> bool {
+    if (*a).val != (*b).val {
+        return (*a).val > (*b).val
+    }
+    return str.compare((*a).key, (*b).key) < 0
+}
+
+// Stable bottom-up merge sort, value descending then key ascending. (A
+// generic function cannot be passed as a `fn` value, so `vec_sort_by` is not
+// usable here.)
+fn dict_sort_items[V: Int](v: *mut Vec[DictItem[V]]) {
+    let n: usize = vec_len[DictItem[V]](v)
+    var tmp: Vec[DictItem[V]] = vec_new[DictItem[V]]()
+    var width: usize = 1
+    while width < n {
+        vec_clear[DictItem[V]](&tmp)
+        var lo: usize = 0
+        while lo < n {
+            var mid: usize = lo + width
+            if mid > n { mid = n }
+            var hi: usize = lo + 2 * width
+            if hi > n { hi = n }
+            var a: usize = lo
+            var b: usize = mid
+            while a < mid && b < hi {
+                if dict_item_more[V](vec_elem_ptr[DictItem[V]](v, b), vec_elem_ptr[DictItem[V]](v, a)) {
+                    vec_push[DictItem[V]](&tmp, *vec_elem_ptr[DictItem[V]](v, b))
+                    b = b + 1
+                } else {
+                    vec_push[DictItem[V]](&tmp, *vec_elem_ptr[DictItem[V]](v, a))
+                    a = a + 1
+                }
+            }
+            while a < mid {
+                vec_push[DictItem[V]](&tmp, *vec_elem_ptr[DictItem[V]](v, a))
+                a = a + 1
+            }
+            while b < hi {
+                vec_push[DictItem[V]](&tmp, *vec_elem_ptr[DictItem[V]](v, b))
+                b = b + 1
+            }
+            lo = lo + 2 * width
+        }
+        var i: usize = 0
+        while i < n {
+            vec_set[DictItem[V]](v, i, *vec_elem_ptr[DictItem[V]](&tmp, i))
+            i = i + 1
+        }
+        width = width * 2
+    }
+    vec_free[DictItem[V]](&tmp)
+}
+
+// The `n` biggest entries, value descending, ties by key ascending -- the
+// same order as Python `sorted(c.items(), key=lambda kv: (-kv[1], kv[0]))[:n]`.
+// `n == 0` returns all entries.
+fn dict_top[V: Int](d: *mut Dict[V], n: usize, out: *mut Vec[DictItem[V]]) {
+    var all: Vec[DictItem[V]] = vec_new[DictItem[V]]()
+    dict_items[V](d, &all)
+    dict_sort_items[V](&all)
+    var i: usize = 0
+    let m: usize = vec_len[DictItem[V]](&all)
+    while i < m && (n == 0 || i < n) {
+        vec_push[DictItem[V]](out, *vec_elem_ptr[DictItem[V]](&all, i))
+        i = i + 1
+    }
+    vec_free[DictItem[V]](&all)
+}
