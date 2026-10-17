@@ -79,7 +79,9 @@ printf 'http://10.0.2.2:%s\n' "$PORT" >"$W/args.txt"
 $ADB push "$W/args.txt" /sdcard/Android/data/$PKG/files/args.txt >/dev/null
 $ADB shell pm grant $PKG android.permission.RECORD_AUDIO >/dev/null 2>&1
 $ADB logcat -c
-$ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null; sleep 5
+sleep 20 # a fresh emulator is still starting its launcher, Gboard and the package manager
+$ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null
+for _ in $(seq 40); do [ -n "$($ADB shell pidof $PKG)" ] && break; sleep 1; done
 check "process runs" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
 check "login screen shows" "$(OCR_TRIES=40 wait_ocr 1_login 'Sign in')" 1
 
