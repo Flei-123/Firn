@@ -1,0 +1,1184 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/atspi.fi -- the AT-SPI bridge (Linux): a window's accessibility tree on the
+// accessibility bus, for Orca and other screen readers (roadmap r19).
+//
+//     import fui.atspi
+//
+//     var br: atspi.Bridge = atspi.bridge_new(app.app_scene(a), app.ax(a), "My app")
+//     if atspi.bridge_open(&br) { ... }          // session bus -> org.a11y.Bus -> a11y bus
+//     // in the program's loop:  atspi.bridge_serve(&br, 0)    (or app.set_pump, see attach)
+//
+// WHAT IT IS. The tree of lib/fui/a11y.fi (roles, names, states, descriptions, the virtual
+// list rows) answered as AT-SPI objects over lib/net/dbus.fi. Every question is answered from
+// the LIVE scene at the moment it comes in (nothing is copied), so an answer is never older
+// than the picture. Objects: `/org/a11y/atspi/accessible/root` (the application, role
+// APPLICATION, one child: the window), `.../n<i>` (scene node i), `.../v<i>_<row>` (the
+// visible row `row` of the virtual list bound to node i).
+// Interfaces: Accessible, Component (extents, hit test, GrabFocus), Action (one action
+// "click" on operable nodes), Value (range roles), Application (the root),
+// org.freedesktop.DBus.Properties and Introspectable.
+//
+// HONEST
+//   T1  NO EVENTS yet: the bridge answers questions, it does not emit
+//       object:state-changed / children-changed signals. A screen reader that caches sees
+//       a change only when it asks again. (Roadmap r19b)
+//   T2  No Text / EditableText interface: a text field is reported with its name and its
+//       state (editable, single line), the caret and the content are not readable via AT-SPI.
+//   T3  Extents are in WINDOW coordinates (coord type WINDOW) and also answered for SCREEN;
+//       the window's position on the screen is not known to the tree (offset 0,0).
+//   T4  Only the objects the scene has: a node count over the scene's limit is not reachable
+//       (scene.SCENE_MAX).
+//   T5  Windows (UIA) is a different bridge (r19c); the roles are the same table.
+//   T6  The registry (at-spi2-registryd) is optional: the bridge tries `Socket.Embed` and goes
+//       on without an answer, so a test with a private bus works without it.
+import std.rt
+import net.dbus
+import fui.scene
+import fui.a11y
+import fui.wave2
+import fui.app
+import plat.fuiwirt
+import fui.control
+import std.env
+
+export {
+    Bridge, bridge_new, bridge_free, bridge_open, bridge_open_address, bridge_is_open,
+    bridge_fd, bridge_serve, bridge_set_actions, bridge_calls, bridge_node_total,
+    bridge_role_number, bridge_state_bits, attach, enable_from_env, act_click,
+    ATSPI_ROOT_PATH,
+}
+
+const ATSPI_ROOT_PATH: str = "/org/a11y/atspi/accessible/root"
+const PFX: str = "/org/a11y/atspi/accessible/"
+const IF_ACC: str = "org.a11y.atspi.Accessible"
+const IF_COMP: str = "org.a11y.atspi.Component"
+const IF_ACT: str = "org.a11y.atspi.Action"
+const IF_VAL: str = "org.a11y.atspi.Value"
+const IF_APP: str = "org.a11y.atspi.Application"
+const IF_PROPS: str = "org.freedesktop.DBus.Properties"
+const IF_INTRO: str = "org.freedesktop.DBus.Introspectable"
+const NONE: usize = 4294967295
+
+const K_NONE: u32 = 0
+const K_APP: u32 = 1
+const K_NODE: u32 = 2
+const K_ROW: u32 = 3
+
+struct Ref {
+    kind: u32,
+    node: usize,
+    row: usize,
+}
+
+fn ref_none() -> Ref {
+    return Ref { kind: K_NONE, node: 0, row: 0 }
+}
+
+struct Bridge {
+    bus: dbus.Bus,
+    sc: *mut scene.Scene,
+    ax: *mut a11y.A11y,
+    title: str,
+    open: bool,
+    // The registry's answer to Socket.Embed: the desktop reference (name, path).
+    desk_name: [u8; 64],
+    desk_n: usize,
+    calls: u64,
+    // The program's hands: DoAction -> act(ud, node, row) (row = NONE for a plain node),
+    // GrabFocus -> focus(ud, node). Both default to "not done".
+    ud: u64,
+    act: fn(u64, usize, usize) -> bool,
+    focus: fn(u64, usize) -> bool,
+}
+
+fn act_none(ud: u64, node: usize, row: usize) -> bool { return false }
+fn focus_none(ud: u64, node: usize) -> bool { return false }
+
+// `title` stays owned by the caller (like every text in fUi).
+fn bridge_new(sc: *mut scene.Scene, ax: *mut a11y.A11y, title: str) -> Bridge {
+    return Bridge { bus: dbus.bus_new(), sc: sc, ax: ax, title: title, open: false,
+        desk_name: [0; 64], desk_n: 0, calls: 0, ud: 0, act: act_none, focus: focus_none }
+}
+
+fn bridge_free(br: *mut Bridge) {
+    dbus.bus_free(&(*br).bus)
+    (*br).open = false
+}
+
+fn bridge_is_open(br: *mut Bridge) -> bool { return (*br).open }
+fn bridge_fd(br: *mut Bridge) -> i32 { return dbus.bus_fd(&(*br).bus) }
+fn bridge_calls(br: *mut Bridge) -> u64 { return (*br).calls }
+
+fn bridge_set_actions(br: *mut Bridge, ud: u64, act: fn(u64, usize, usize) -> bool,
+    focus: fn(u64, usize) -> bool) {
+    (*br).ud = ud
+    (*br).act = act
+    (*br).focus = focus
+}
+
+// ------------------------------------------------------------ connecting
+
+// Embed into the registry (best effort): the answer is the desktop reference.
+fn embed(br: *mut Bridge) {
+    var body: rt.Buf = rt.buf_new()
+    dbus.w_struct_begin(&body)
+    let un: str = dbus.bus_unique_name(&(*br).bus)
+    dbus.w_str(&body, un)
+    dbus.w_path(&body, ATSPI_ROOT_PATH)
+    var f: dbus.Fields = dbus.fields_call("org.a11y.atspi.Registry", ATSPI_ROOT_PATH,
+        "org.a11y.atspi.Socket", "Embed", "(so)")
+    var reply: dbus.Msg = dbus.msg_new()
+    let r: i32 = dbus.bus_call(&(*br).bus, &f, &body, &reply, 500)
+    if r == 0 {
+        var rd: dbus.Rd = dbus.msg_body(&reply)
+        dbus.rd_align(&rd, 8)
+        let s: str = dbus.rd_str(&rd)
+        if rd.ok && s.n < 64 {
+            var k: usize = 0
+            while k < s.n {
+                (*br).desk_name[k] = *(((s.p) as u64 + k as u64) as *mut u8)
+                k = k + 1
+            }
+            (*br).desk_n = s.n
+        }
+    }
+    dbus.msg_free(&reply)
+    rt.buf_free(&body)
+}
+
+// Connect to the accessibility bus the session bus names (org.a11y.Bus.GetAddress).
+fn bridge_open(br: *mut Bridge) -> bool {
+    var sb: dbus.Bus = dbus.bus_new()
+    if !dbus.bus_connect_session(&sb) {
+        dbus.bus_free(&sb)
+        return false
+    }
+    var f: dbus.Fields = dbus.fields_call("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus",
+        "GetAddress", "")
+    var reply: dbus.Msg = dbus.msg_new()
+    let r: i32 = dbus.bus_call(&sb, &f, 0 as *mut rt.Buf, &reply, 2000)
+    var ok: bool = false
+    if r == 0 {
+        var rd: dbus.Rd = dbus.msg_body(&reply)
+        let addr: str = dbus.rd_str(&rd)
+        if rd.ok && addr.n > 0 {
+            ok = bridge_open_address(br, addr)
+        }
+    }
+    dbus.msg_free(&reply)
+    dbus.bus_free(&sb)
+    return ok
+}
+
+// Connect to a bus at an address (a private bus in tests) and take the name of the
+// application. `Embed` into a registry is tried, its absence is no error.
+fn bridge_open_address(br: *mut Bridge, addr: str) -> bool {
+    if !dbus.bus_connect_address(&(*br).bus, addr) {
+        return false
+    }
+    (*br).open = true
+    embed(br)
+    return true
+}
+
+// ---------------------------------------------------------- object paths
+
+fn bytes_eq(p: u64, q: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if *((p + i as u64) as *mut u8) != *((q + i as u64) as *mut u8) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// digits at s[from..]; returns the number, `at` = the index after the digits (NONE = no digit)
+fn read_num(s: str, from: usize, at: *mut usize) -> usize {
+    var i: usize = from
+    var v: usize = 0
+    var go: bool = true
+    while go && i < s.n {
+        let c: u8 = *(((s.p) as u64 + i as u64) as *mut u8)
+        if c >= 48 as u8 && c <= 57 as u8 {
+            v = v * 10 + (c - 48 as u8) as usize
+            i = i + 1
+        } else {
+            go = false
+        }
+    }
+    if i == from {
+        *at = NONE
+    } else {
+        *at = i
+    }
+    return v
+}
+
+fn parse_path(p: str) -> Ref {
+    if p == ATSPI_ROOT_PATH {
+        return Ref { kind: K_APP, node: 0, row: 0 }
+    }
+    if p.n <= PFX.n || !bytes_eq((p.p) as u64, (PFX.p) as u64, PFX.n) {
+        return ref_none()
+    }
+    let c0: u8 = *(((p.p) as u64 + PFX.n as u64) as *mut u8)
+    var at: usize = 0
+    if c0 == 110 as u8 {
+        let v: usize = read_num(p, PFX.n + 1, &at)
+        if at != NONE && at == p.n {
+            return Ref { kind: K_NODE, node: v, row: 0 }
+        }
+    } else if c0 == 118 as u8 {
+        let v: usize = read_num(p, PFX.n + 1, &at)
+        if at != NONE && at < p.n && *(((p.p) as u64 + at as u64) as *mut u8) == 95 as u8 {
+            var at2: usize = 0
+            let r: usize = read_num(p, at + 1, &at2)
+            if at2 != NONE && at2 == p.n {
+                return Ref { kind: K_ROW, node: v, row: r }
+            }
+        }
+    }
+    return ref_none()
+}
+
+fn w_raw_str(b: *mut rt.Buf, p: u64, n: usize) {
+    dbus.w_u32(b, n as u32)
+    rt.buf_push_bytes(b, p, n)
+    rt.buf_push(b, 0 as u8)
+}
+
+fn path_of(r: Ref, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    if r.kind == K_APP {
+        rt.buf_push_bytes(out, (ATSPI_ROOT_PATH.p) as u64, ATSPI_ROOT_PATH.n)
+        return
+    }
+    rt.buf_push_bytes(out, (PFX.p) as u64, PFX.n)
+    if r.kind == K_NODE {
+        rt.buf_push(out, 110 as u8)
+        rt.buf_push_dec_u64(out, r.node as u64)
+    } else {
+        rt.buf_push(out, 118 as u8)
+        rt.buf_push_dec_u64(out, r.node as u64)
+        rt.buf_push(out, 95 as u8)
+        rt.buf_push_dec_u64(out, r.row as u64)
+    }
+}
+
+// (so): the bus name of this application and the path of the object
+fn w_ref(br: *mut Bridge, b: *mut rt.Buf, r: Ref) {
+    dbus.w_struct_begin(b)
+    let un: str = dbus.bus_unique_name(&(*br).bus)
+    dbus.w_str(b, un)
+    var t: rt.Buf = rt.buf_new()
+    path_of(r, &t)
+    w_raw_str(b, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn w_desktop_ref(br: *mut Bridge, b: *mut rt.Buf) {
+    dbus.w_struct_begin(b)
+    if (*br).desk_n > 0 {
+        w_raw_str(b, (&(*br).desk_name[0]) as u64, (*br).desk_n)
+    } else {
+        dbus.w_str(b, "org.a11y.atspi.Registry")
+    }
+    dbus.w_path(b, ATSPI_ROOT_PATH)
+}
+
+// ------------------------------------------------------------- the model
+
+fn node_ok(br: *mut Bridge, i: usize) -> bool {
+    return i < scene.scene_count((*br).sc)
+}
+
+fn valid(br: *mut Bridge, r: Ref) -> bool {
+    if r.kind == K_APP {
+        return true
+    }
+    if r.kind == K_NONE || !node_ok(br, r.node) {
+        return false
+    }
+    if r.kind == K_ROW {
+        return r.row >= a11y.a11y_vrow_first((*br).ax, r.node)
+            && r.row < a11y.a11y_vrow_end((*br).ax, r.node)
+    }
+    return true
+}
+
+fn vrow_n(br: *mut Bridge, i: usize) -> usize {
+    let a: usize = a11y.a11y_vrow_first((*br).ax, i)
+    let z: usize = a11y.a11y_vrow_end((*br).ax, i)
+    if z > a {
+        return z - a
+    }
+    return 0
+}
+
+fn kid_count(br: *mut Bridge, r: Ref) -> usize {
+    if r.kind == K_APP {
+        if scene.scene_root((*br).sc) != scene.SCENE_NONE && scene.scene_count((*br).sc) > 0 {
+            return 1
+        }
+        return 0
+    }
+    if r.kind != K_NODE {
+        return 0
+    }
+    var n: usize = vrow_n(br, r.node)
+    var c: usize = scene.scene_first_child((*br).sc, r.node)
+    while c != scene.SCENE_NONE {
+        n = n + 1
+        c = scene.scene_next_sibling((*br).sc, c)
+    }
+    return n
+}
+
+fn kid_at(br: *mut Bridge, r: Ref, k: usize) -> Ref {
+    if r.kind == K_APP {
+        if k == 0 && kid_count(br, r) == 1 {
+            return Ref { kind: K_NODE, node: scene.scene_root((*br).sc), row: 0 }
+        }
+        return ref_none()
+    }
+    if r.kind != K_NODE {
+        return ref_none()
+    }
+    let vn: usize = vrow_n(br, r.node)
+    if k < vn {
+        return Ref { kind: K_ROW, node: r.node, row: a11y.a11y_vrow_first((*br).ax, r.node) + k }
+    }
+    var j: usize = k - vn
+    var c: usize = scene.scene_first_child((*br).sc, r.node)
+    while c != scene.SCENE_NONE {
+        if j == 0 {
+            return Ref { kind: K_NODE, node: c, row: 0 }
+        }
+        j = j - 1
+        c = scene.scene_next_sibling((*br).sc, c)
+    }
+    return ref_none()
+}
+
+// The parent; kind K_NONE for the application (its parent is the desktop).
+fn parent_of(br: *mut Bridge, r: Ref) -> Ref {
+    if r.kind == K_ROW {
+        return Ref { kind: K_NODE, node: r.node, row: 0 }
+    }
+    if r.kind == K_NODE {
+        let p: usize = scene.scene_parent((*br).sc, r.node)
+        if p == scene.SCENE_NONE || p >= scene.scene_count((*br).sc) {
+            return Ref { kind: K_APP, node: 0, row: 0 }
+        }
+        return Ref { kind: K_NODE, node: p, row: 0 }
+    }
+    return ref_none()
+}
+
+fn index_in_parent(br: *mut Bridge, r: Ref) -> i32 {
+    if r.kind == K_APP {
+        return -1
+    }
+    let p: Ref = parent_of(br, r)
+    if r.kind == K_ROW {
+        return (r.row - a11y.a11y_vrow_first((*br).ax, r.node)) as i32
+    }
+    if p.kind == K_APP {
+        return 0
+    }
+    var k: usize = vrow_n(br, p.node)
+    var c: usize = scene.scene_first_child((*br).sc, p.node)
+    while c != scene.SCENE_NONE {
+        if c == r.node {
+            return k as i32
+        }
+        k = k + 1
+        c = scene.scene_next_sibling((*br).sc, c)
+    }
+    return -1
+}
+
+// How many objects the bridge reaches from the root (application included).
+fn count_from(br: *mut Bridge, r: Ref, depth: usize) -> usize {
+    var n: usize = 1
+    if depth > 40 {
+        return n
+    }
+    let kc: usize = kid_count(br, r)
+    var k: usize = 0
+    while k < kc {
+        n = n + count_from(br, kid_at(br, r, k), depth + 1)
+        k = k + 1
+    }
+    return n
+}
+
+fn bridge_node_total(br: *mut Bridge) -> usize {
+    return count_from(br, Ref { kind: K_APP, node: 0, row: 0 }, 0)
+}
+
+// ----------------------------------------------------------- the roles
+
+// fUi role -> AT-SPI role number (AtspiRole, atspi-constants.h).
+fn atspi_role(r: u32) -> u32 {
+    if r == a11y.ROLE_TEXT { return 29 as u32 }                 // LABEL
+    if r == a11y.ROLE_BUTTON { return 43 as u32 }               // PUSH_BUTTON
+    if r == a11y.ROLE_CHECKBOX { return 7 as u32 }              // CHECK_BOX
+    if r == a11y.ROLE_RADIO { return 44 as u32 }                // RADIO_BUTTON
+    if r == a11y.ROLE_SWITCH { return 62 as u32 }               // TOGGLE_BUTTON
+    if r == a11y.ROLE_SLIDER { return 51 as u32 }               // SLIDER
+    if r == a11y.ROLE_TEXTBOX { return 79 as u32 }              // ENTRY
+    if r == a11y.ROLE_PROGRESSBAR { return 42 as u32 }          // PROGRESS_BAR
+    if r == a11y.ROLE_COMBOBOX { return 11 as u32 }             // COMBO_BOX
+    if r == a11y.ROLE_LIST { return 31 as u32 }                 // LIST
+    if r == a11y.ROLE_LISTITEM { return 32 as u32 }             // LIST_ITEM
+    if r == a11y.ROLE_TREE { return 65 as u32 }                 // TREE
+    if r == a11y.ROLE_TREEITEM { return 91 as u32 }             // TREE_ITEM
+    if r == a11y.ROLE_TABLE { return 55 as u32 }                // TABLE
+    if r == a11y.ROLE_ROW { return 90 as u32 }                  // TABLE_ROW
+    if r == a11y.ROLE_CELL { return 56 as u32 }                 // TABLE_CELL
+    if r == a11y.ROLE_TAB { return 37 as u32 }                  // PAGE_TAB
+    if r == a11y.ROLE_TABPANEL { return 39 as u32 }             // PANEL
+    if r == a11y.ROLE_MENU { return 33 as u32 }                 // MENU
+    if r == a11y.ROLE_MENUITEM { return 35 as u32 }             // MENU_ITEM
+    if r == a11y.ROLE_TOOLBAR { return 63 as u32 }              // TOOL_BAR
+    if r == a11y.ROLE_SCROLLBAR { return 48 as u32 }            // SCROLL_BAR
+    if r == a11y.ROLE_SEPARATOR { return 50 as u32 }            // SEPARATOR
+    if r == a11y.ROLE_GROUP { return 39 as u32 }                // PANEL
+    if r == a11y.ROLE_HEADING { return 83 as u32 }              // HEADING
+    if r == a11y.ROLE_LINK { return 88 as u32 }                 // LINK
+    if r == a11y.ROLE_IMAGE { return 27 as u32 }                // IMAGE
+    if r == a11y.ROLE_TOOLTIP { return 64 as u32 }              // TOOL_TIP
+    if r == a11y.ROLE_STATUS { return 54 as u32 }               // STATUS_BAR
+    if r == a11y.ROLE_MENUITEMCHECKBOX { return 8 as u32 }      // CHECK_MENU_ITEM
+    if r == a11y.ROLE_MENUITEMRADIO { return 45 as u32 }        // RADIO_MENU_ITEM
+    if r == a11y.ROLE_DIALOG { return 16 as u32 }               // DIALOG
+    if r == a11y.ROLE_ALERTDIALOG { return 2 as u32 }           // ALERT
+    return 20 as u32                                            // FILLER (generic)
+}
+
+// The AT-SPI role number of an object (the window's root node is a FRAME).
+fn bridge_role_number(br: *mut Bridge, r: Ref) -> u32 {
+    if r.kind == K_APP {
+        return 75 as u32
+    }
+    if r.kind == K_ROW {
+        return 32 as u32
+    }
+    let fr: u32 = a11y.a11y_role((*br).sc, (*br).ax, r.node)
+    if r.node == scene.scene_root((*br).sc) {
+        if fr == a11y.ROLE_DIALOG || fr == a11y.ROLE_ALERTDIALOG {
+            return atspi_role(fr)
+        }
+        return 23 as u32
+    }
+    if fr == a11y.ROLE_TEXTBOX && a11y.a11y_is_secret((*br).sc, r.node) {
+        return 40 as u32
+    }
+    return atspi_role(fr)
+}
+
+#[allow_escape]
+fn role_name_into(br: *mut Bridge, r: Ref, b: *mut rt.Buf) {
+    if r.kind == K_APP {
+        let an: str = "application"
+        rt.buf_push_bytes(b, (an.p) as u64, an.n)
+        return
+    }
+    if r.kind == K_ROW {
+        let ln: str = "listitem"
+        rt.buf_push_bytes(b, (ln.p) as u64, ln.n)
+        return
+    }
+    var nb: [u8; 32] = [0; 32]
+    let n: usize = a11y.a11y_role_name(a11y.a11y_role((*br).sc, (*br).ax, r.node), (&nb[0]) as u64, 32)
+    rt.buf_push_bytes(b, (&nb[0]) as u64, n)
+}
+
+// ----------------------------------------------------------- the states
+
+fn setbit(lo: *mut u32, hi: *mut u32, n: u32) {
+    if n < 32 as u32 {
+        *lo = *lo | ((1 as u32) << n)
+    } else {
+        *hi = *hi | ((1 as u32) << (n - 32 as u32))
+    }
+}
+
+// AtspiStateType numbers: ACTIVE 1, CHECKED 4, COLLAPSED 5, EDITABLE 7, ENABLED 8, EXPANDABLE 9,
+// EXPANDED 10, FOCUSABLE 11, FOCUSED 12, PRESSED 20, SELECTABLE 22, SELECTED 23, SENSITIVE 24,
+// SHOWING 25, SINGLE_LINE 26, VISIBLE 30, INDETERMINATE 32.
+fn state_from(st: u32, role: u32, lo: *mut u32, hi: *mut u32) {
+    setbit(lo, hi, 25 as u32)
+    setbit(lo, hi, 30 as u32)
+    if (st & a11y.ST_DISABLED) == 0 as u32 {
+        setbit(lo, hi, 8 as u32)
+        setbit(lo, hi, 24 as u32)
+    }
+    if (st & a11y.ST_FOCUSABLE) != 0 as u32 { setbit(lo, hi, 11 as u32) }
+    if (st & a11y.ST_FOCUSED) != 0 as u32 { setbit(lo, hi, 12 as u32) }
+    if (st & a11y.ST_SELECTED) != 0 as u32 {
+        setbit(lo, hi, 23 as u32)
+        setbit(lo, hi, 22 as u32)
+    }
+    if (st & a11y.ST_CHECKED) != 0 as u32 { setbit(lo, hi, 4 as u32) }
+    if (st & a11y.ST_MIXED) != 0 as u32 { setbit(lo, hi, 32 as u32) }
+    if (st & a11y.ST_PRESSED) != 0 as u32 { setbit(lo, hi, 20 as u32) }
+    if (st & a11y.ST_EXPANDED) != 0 as u32 {
+        setbit(lo, hi, 10 as u32)
+        setbit(lo, hi, 9 as u32)
+    }
+    if (st & a11y.ST_COLLAPSED) != 0 as u32 {
+        setbit(lo, hi, 5 as u32)
+        setbit(lo, hi, 9 as u32)
+    }
+    if role == 79 as u32 || role == 40 as u32 {
+        setbit(lo, hi, 26 as u32)
+        if (st & a11y.ST_READONLY) == 0 as u32 { setbit(lo, hi, 7 as u32) }
+    }
+}
+
+fn bridge_state_bits(br: *mut Bridge, r: Ref, lo: *mut u32, hi: *mut u32) {
+    *lo = 0 as u32
+    *hi = 0 as u32
+    if r.kind == K_APP {
+        return
+    }
+    if r.kind == K_ROW {
+        state_from(a11y.a11y_vrow_state((*br).sc, (*br).ax, r.node, r.row), 32 as u32, lo, hi)
+        return
+    }
+    let role: u32 = bridge_role_number(br, r)
+    state_from(a11y.a11y_state((*br).sc, (*br).ax, r.node), role, lo, hi)
+    if r.node == scene.scene_root((*br).sc) {
+        setbit(lo, hi, 1 as u32)
+    }
+}
+
+// ------------------------------------------------------ names and values
+
+#[allow_escape]
+fn name_into(br: *mut Bridge, r: Ref, b: *mut rt.Buf) {
+    var nb: [u8; 512] = [0; 512]
+    var n: usize = 0
+    if r.kind == K_APP {
+        rt.buf_push_bytes(b, ((*br).title.p) as u64, (*br).title.n)
+        return
+    }
+    if r.kind == K_ROW {
+        n = a11y.a11y_vrow_name((*br).ax, r.node, r.row, (&nb[0]) as u64, 512)
+    } else {
+        n = a11y.a11y_name((*br).sc, (*br).ax, r.node, (&nb[0]) as u64, 512)
+        if n == 0 && r.node == scene.scene_root((*br).sc) {
+            rt.buf_push_bytes(b, ((*br).title.p) as u64, (*br).title.n)
+            return
+        }
+    }
+    rt.buf_push_bytes(b, (&nb[0]) as u64, n)
+}
+
+#[allow_escape]
+fn desc_into(br: *mut Bridge, r: Ref, b: *mut rt.Buf) {
+    if r.kind != K_NODE {
+        return
+    }
+    var nb: [u8; 512] = [0; 512]
+    let n: usize = a11y.a11y_description((*br).sc, (*br).ax, r.node, (&nb[0]) as u64, 512)
+    rt.buf_push_bytes(b, (&nb[0]) as u64, n)
+}
+
+fn has_value(br: *mut Bridge, r: Ref) -> bool {
+    return r.kind == K_NODE && a11y.a11y_has_range((*br).sc, (*br).ax, r.node)
+}
+
+fn is_operable(br: *mut Bridge, r: Ref) -> bool {
+    if r.kind == K_ROW {
+        return true
+    }
+    if r.kind != K_NODE {
+        return false
+    }
+    let st: u32 = a11y.a11y_state((*br).sc, (*br).ax, r.node)
+    if (st & a11y.ST_DISABLED) != 0 as u32 {
+        return false
+    }
+    return a11y.role_is_widget(a11y.a11y_role((*br).sc, (*br).ax, r.node))
+}
+
+// An integer as the bits of an IEEE 754 double (the language has no float bit cast).
+fn double_bits(v: i64) -> u64 {
+    if v == 0 {
+        return 0
+    }
+    var neg: bool = false
+    var m: u64 = 0
+    if v < 0 {
+        neg = true
+        m = (0 - v) as u64
+    } else {
+        m = v as u64
+    }
+    var e: u64 = 0
+    var t: u64 = m
+    while t > 1 {
+        t = t / 2
+        e = e + 1
+    }
+    // mantissa: m without its leading bit, shifted so that it fills 52 bits (m < 2^52)
+    var frac: u64 = m - (1 as u64) * pow2(e)
+    frac = frac * pow2(52 - e)
+    var bits: u64 = ((1023 + e) * pow2(52)) + frac
+    if neg {
+        bits = bits + pow2(63)
+    }
+    return bits
+}
+
+fn pow2(n: u64) -> u64 {
+    var r: u64 = 1
+    var k: u64 = 0
+    while k < n {
+        r = r * 2
+        k = k + 1
+    }
+    return r
+}
+
+fn w_double(b: *mut rt.Buf, v: i64) {
+    dbus.w_pad(b, 8)
+    dbus.w_u64(b, double_bits(v))
+}
+
+// ---------------------------------------------------------- interfaces
+
+fn iface_list(br: *mut Bridge, r: Ref, b: *mut rt.Buf) {
+    let at: usize = dbus.w_array_begin(b, 4)
+    dbus.w_str(b, IF_ACC)
+    if r.kind == K_APP {
+        dbus.w_str(b, IF_APP)
+    } else {
+        dbus.w_str(b, IF_COMP)
+        if is_operable(br, r) {
+            dbus.w_str(b, IF_ACT)
+        }
+        if has_value(br, r) {
+            dbus.w_str(b, IF_VAL)
+        }
+    }
+    dbus.w_array_end(b, at, 4)
+}
+
+fn w_str_lit(b: *mut rt.Buf, s: str) {
+    dbus.w_str(b, s)
+}
+
+fn extents_of(br: *mut Bridge, r: Ref, x: *mut i64, y: *mut i64, w: *mut i64, h: *mut i64) {
+    *x = 0
+    *y = 0
+    *w = 0
+    *h = 0
+    if r.kind == K_NODE {
+        *x = scene.node_x((*br).sc, r.node) as i64
+        *y = scene.node_y((*br).sc, r.node) as i64
+        *w = scene.node_w((*br).sc, r.node) as i64
+        *h = scene.node_h((*br).sc, r.node) as i64
+    } else if r.kind == K_ROW {
+        var q: [i64; 4] = [0; 4]
+        a11y.a11y_vrow_rect((*br).sc, (*br).ax, r.node, r.row, &q)
+        *x = q[0]
+        *y = q[1]
+        *w = q[2]
+        *h = q[3]
+    } else if r.kind == K_APP {
+        let root: usize = scene.scene_root((*br).sc)
+        if root != scene.SCENE_NONE && root < scene.scene_count((*br).sc) {
+            *w = scene.node_w((*br).sc, root) as i64
+            *h = scene.node_h((*br).sc, root) as i64
+        }
+    }
+}
+
+// Writes the VALUE of property `name` of `iface` into `b` (as a variant when `var_wrap`).
+// false = no such property.
+fn prop_write(br: *mut Bridge, r: Ref, iface: str, name: str, b: *mut rt.Buf) -> bool {
+    var t: rt.Buf = rt.buf_new()
+    var ok: bool = true
+    if iface == IF_ACC {
+        if name == "Name" {
+            name_into(br, r, &t)
+            dbus.w_variant(b, "s")
+            w_raw_str(b, rt.buf_ptr(&t), rt.buf_len(&t))
+        } else if name == "Description" {
+            desc_into(br, r, &t)
+            dbus.w_variant(b, "s")
+            w_raw_str(b, rt.buf_ptr(&t), rt.buf_len(&t))
+        } else if name == "Parent" {
+            dbus.w_variant(b, "(so)")
+            let p: Ref = parent_of(br, r)
+            if p.kind == K_NONE {
+                w_desktop_ref(br, b)
+            } else {
+                w_ref(br, b, p)
+            }
+        } else if name == "ChildCount" {
+            dbus.w_variant(b, "i")
+            dbus.w_i32(b, kid_count(br, r) as i32)
+        } else if name == "Locale" || name == "AccessibleId" || name == "HelpText" {
+            dbus.w_variant(b, "s")
+            dbus.w_str(b, "")
+        } else {
+            ok = false
+        }
+    } else if iface == IF_ACT {
+        if name == "NActions" {
+            dbus.w_variant(b, "i")
+            if is_operable(br, r) {
+                dbus.w_i32(b, 1)
+            } else {
+                dbus.w_i32(b, 0)
+            }
+        } else {
+            ok = false
+        }
+    } else if iface == IF_VAL && has_value(br, r) {
+        dbus.w_variant(b, "d")
+        if name == "CurrentValue" {
+            w_double(b, a11y.a11y_value((*br).sc, r.node))
+        } else if name == "MinimumValue" {
+            w_double(b, a11y.a11y_min())
+        } else if name == "MaximumValue" {
+            w_double(b, a11y.a11y_max())
+        } else if name == "MinimumIncrement" {
+            w_double(b, 1)
+        } else {
+            ok = false
+        }
+    } else if iface == IF_APP && r.kind == K_APP {
+        if name == "ToolkitName" {
+            dbus.w_variant(b, "s")
+            dbus.w_str(b, "fUi")
+        } else if name == "Version" {
+            dbus.w_variant(b, "s")
+            dbus.w_str(b, "1")
+        } else if name == "AtspiVersion" {
+            dbus.w_variant(b, "s")
+            dbus.w_str(b, "2.1")
+        } else if name == "Id" {
+            dbus.w_variant(b, "i")
+            dbus.w_i32(b, 0)
+        } else {
+            ok = false
+        }
+    } else {
+        ok = false
+    }
+    rt.buf_free(&t)
+    return ok
+}
+
+fn prop_name(iface: str, k: usize) -> str {
+    if iface == IF_ACC {
+        if k == 0 { return "Name" }
+        if k == 1 { return "Description" }
+        if k == 2 { return "Parent" }
+        if k == 3 { return "ChildCount" }
+        if k == 4 { return "Locale" }
+        if k == 5 { return "AccessibleId" }
+        if k == 6 { return "HelpText" }
+    } else if iface == IF_ACT {
+        if k == 0 { return "NActions" }
+    } else if iface == IF_VAL {
+        if k == 0 { return "CurrentValue" }
+        if k == 1 { return "MinimumValue" }
+        if k == 2 { return "MaximumValue" }
+        if k == 3 { return "MinimumIncrement" }
+    } else if iface == IF_APP {
+        if k == 0 { return "ToolkitName" }
+        if k == 1 { return "Version" }
+        if k == 2 { return "AtspiVersion" }
+        if k == 3 { return "Id" }
+    }
+    return ""
+}
+
+fn iface_applies(br: *mut Bridge, r: Ref, iface: str) -> bool {
+    if iface == IF_ACC || iface == IF_ACT {
+        return true
+    }
+    if iface == IF_VAL {
+        return has_value(br, r)
+    }
+    if iface == IF_APP {
+        return r.kind == K_APP
+    }
+    return false
+}
+
+fn handle_props(br: *mut Bridge, m: *mut dbus.Msg, r: Ref) {
+    var rd: dbus.Rd = dbus.msg_body(m)
+    let member: str = (*m).f.member
+    let iface: str = dbus.rd_str(&rd)
+    var body: rt.Buf = rt.buf_new()
+    if member == "Get" {
+        let name: str = dbus.rd_str(&rd)
+        if rd.ok && prop_write(br, r, iface, name, &body) {
+            dbus.bus_reply(&(*br).bus, m, "v", &body)
+        } else {
+            dbus.bus_reply_error(&(*br).bus, m, "org.freedesktop.DBus.Error.UnknownProperty", "unknown property")
+        }
+    } else if member == "GetAll" {
+        let at: usize = dbus.w_array_begin(&body, 8)
+        var k: usize = 0
+        while k < 8 && rd.ok && iface_applies(br, r, iface) {
+            let nm: str = prop_name(iface, k)
+            if nm.n > 0 {
+                dbus.w_struct_begin(&body)
+                dbus.w_str(&body, nm)
+                prop_write(br, r, iface, nm, &body)
+            }
+            k = k + 1
+        }
+        dbus.w_array_end(&body, at, 8)
+        dbus.bus_reply(&(*br).bus, m, "a{sv}", &body)
+    } else {
+        dbus.bus_reply_error(&(*br).bus, m, "org.freedesktop.DBus.Error.PropertyReadOnly", "read only")
+    }
+    rt.buf_free(&body)
+}
+
+fn unknown_method(br: *mut Bridge, m: *mut dbus.Msg) {
+    dbus.bus_reply_error(&(*br).bus, m, "org.freedesktop.DBus.Error.UnknownMethod", "unknown method")
+}
+
+fn handle_acc(br: *mut Bridge, m: *mut dbus.Msg, r: Ref) {
+    let member: str = (*m).f.member
+    var body: rt.Buf = rt.buf_new()
+    var t: rt.Buf = rt.buf_new()
+    if member == "GetChildren" {
+        let at: usize = dbus.w_array_begin(&body, 8)
+        let kc: usize = kid_count(br, r)
+        var k: usize = 0
+        while k < kc {
+            w_ref(br, &body, kid_at(br, r, k))
+            k = k + 1
+        }
+        dbus.w_array_end(&body, at, 8)
+        dbus.bus_reply(&(*br).bus, m, "a(so)", &body)
+    } else if member == "GetChildAtIndex" {
+        var rd: dbus.Rd = dbus.msg_body(m)
+        let ix: i32 = dbus.rd_i32(&rd)
+        var c: Ref = ref_none()
+        if ix >= 0 {
+            c = kid_at(br, r, ix as usize)
+        }
+        if c.kind == K_NONE {
+            dbus.bus_reply_error(&(*br).bus, m, "org.freedesktop.DBus.Error.InvalidArgs", "no such child")
+        } else {
+            w_ref(br, &body, c)
+            dbus.bus_reply(&(*br).bus, m, "(so)", &body)
+        }
+    } else if member == "GetIndexInParent" {
+        dbus.w_i32(&body, index_in_parent(br, r))
+        dbus.bus_reply(&(*br).bus, m, "i", &body)
+    } else if member == "GetRole" {
+        dbus.w_u32(&body, bridge_role_number(br, r))
+        dbus.bus_reply(&(*br).bus, m, "u", &body)
+    } else if member == "GetRoleName" || member == "GetLocalizedRoleName" {
+        role_name_into(br, r, &t)
+        w_raw_str(&body, rt.buf_ptr(&t), rt.buf_len(&t))
+        dbus.bus_reply(&(*br).bus, m, "s", &body)
+    } else if member == "GetState" {
+        var lo: u32 = 0 as u32
+        var hi: u32 = 0 as u32
+        bridge_state_bits(br, r, &lo, &hi)
+        let at: usize = dbus.w_array_begin(&body, 4)
+        dbus.w_u32(&body, lo)
+        dbus.w_u32(&body, hi)
+        dbus.w_array_end(&body, at, 4)
+        dbus.bus_reply(&(*br).bus, m, "au", &body)
+    } else if member == "GetAttributes" {
+        let at: usize = dbus.w_array_begin(&body, 8)
+        dbus.w_struct_begin(&body)
+        dbus.w_str(&body, "toolkit")
+        dbus.w_str(&body, "fUi")
+        if r.kind == K_NODE {
+            let lv: u32 = a11y.a11y_level((*br).sc, (*br).ax, r.node)
+            if bridge_role_number(br, r) == 83 as u32 && lv > 0 as u32 {
+                dbus.w_struct_begin(&body)
+                dbus.w_str(&body, "level")
+                rt.buf_clear(&t)
+                rt.buf_push_dec_u64(&t, lv as u64)
+                w_raw_str(&body, rt.buf_ptr(&t), rt.buf_len(&t))
+            }
+            let pos: usize = a11y.a11y_pos((*br).sc, (*br).ax, r.node)
+            if pos > 0 {
+                dbus.w_struct_begin(&body)
+                dbus.w_str(&body, "posinset")
+                rt.buf_clear(&t)
+                rt.buf_push_dec_u64(&t, pos as u64)
+                w_raw_str(&body, rt.buf_ptr(&t), rt.buf_len(&t))
+                dbus.w_struct_begin(&body)
+                dbus.w_str(&body, "setsize")
+                rt.buf_clear(&t)
+                rt.buf_push_dec_u64(&t, a11y.a11y_set_size((*br).sc, (*br).ax, r.node) as u64)
+                w_raw_str(&body, rt.buf_ptr(&t), rt.buf_len(&t))
+            }
+        }
+        dbus.w_array_end(&body, at, 8)
+        dbus.bus_reply(&(*br).bus, m, "a{ss}", &body)
+    } else if member == "GetApplication" {
+        w_ref(br, &body, Ref { kind: K_APP, node: 0, row: 0 })
+        dbus.bus_reply(&(*br).bus, m, "(so)", &body)
+    } else if member == "GetInterfaces" {
+        iface_list(br, r, &body)
+        dbus.bus_reply(&(*br).bus, m, "as", &body)
+    } else if member == "GetRelationSet" {
+        let at: usize = dbus.w_array_begin(&body, 8)
+        dbus.w_array_end(&body, at, 8)
+        dbus.bus_reply(&(*br).bus, m, "a(ua(so))", &body)
+    } else {
+        unknown_method(br, m)
+    }
+    rt.buf_free(&t)
+    rt.buf_free(&body)
+}
+
+fn handle_comp(br: *mut Bridge, m: *mut dbus.Msg, r: Ref) {
+    let member: str = (*m).f.member
+    var body: rt.Buf = rt.buf_new()
+    var x: i64 = 0
+    var y: i64 = 0
+    var w: i64 = 0
+    var h: i64 = 0
+    extents_of(br, r, &x, &y, &w, &h)
+    if member == "GetExtents" {
+        dbus.w_struct_begin(&body)
+        dbus.w_i32(&body, x as i32)
+        dbus.w_i32(&body, y as i32)
+        dbus.w_i32(&body, w as i32)
+        dbus.w_i32(&body, h as i32)
+        dbus.bus_reply(&(*br).bus, m, "(iiii)", &body)
+    } else if member == "GetPosition" {
+        dbus.w_struct_begin(&body)
+        dbus.w_i32(&body, x as i32)
+        dbus.w_i32(&body, y as i32)
+        dbus.bus_reply(&(*br).bus, m, "(ii)", &body)
+    } else if member == "GetSize" {
+        dbus.w_struct_begin(&body)
+        dbus.w_i32(&body, w as i32)
+        dbus.w_i32(&body, h as i32)
+        dbus.bus_reply(&(*br).bus, m, "(ii)", &body)
+    } else if member == "Contains" {
+        var rd: dbus.Rd = dbus.msg_body(m)
+        let px: i32 = dbus.rd_i32(&rd)
+        let py: i32 = dbus.rd_i32(&rd)
+        let inside: bool = (px as i64) >= x && (px as i64) < x + w && (py as i64) >= y && (py as i64) < y + h
+        dbus.w_bool(&body, inside)
+        dbus.bus_reply(&(*br).bus, m, "b", &body)
+    } else if member == "GetAccessibleAtPoint" {
+        var rd: dbus.Rd = dbus.msg_body(m)
+        let px: i32 = dbus.rd_i32(&rd)
+        let py: i32 = dbus.rd_i32(&rd)
+        let hit: usize = a11y.a11y_hit((*br).sc, (*br).ax, px as f64, py as f64)
+        if hit == scene.SCENE_NONE {
+            w_ref(br, &body, Ref { kind: K_NONE, node: 0, row: 0 })
+        } else {
+            w_ref(br, &body, Ref { kind: K_NODE, node: hit, row: 0 })
+        }
+        dbus.bus_reply(&(*br).bus, m, "(so)", &body)
+    } else if member == "GetLayer" {
+        dbus.w_u32(&body, 3 as u32)
+        dbus.bus_reply(&(*br).bus, m, "u", &body)
+    } else if member == "GetMDIZOrder" {
+        dbus.w_i16(&body, 0 as i16)
+        dbus.bus_reply(&(*br).bus, m, "n", &body)
+    } else if member == "GrabFocus" {
+        var done: bool = false
+        if r.kind == K_NODE {
+            let f: fn(u64, usize) -> bool = (*br).focus
+            done = f((*br).ud, r.node)
+        }
+        dbus.w_bool(&body, done)
+        dbus.bus_reply(&(*br).bus, m, "b", &body)
+    } else {
+        unknown_method(br, m)
+    }
+    rt.buf_free(&body)
+}
+
+fn handle_act(br: *mut Bridge, m: *mut dbus.Msg, r: Ref) {
+    let member: str = (*m).f.member
+    var body: rt.Buf = rt.buf_new()
+    var rd: dbus.Rd = dbus.msg_body(m)
+    let n: i32 = 1
+    if !is_operable(br, r) {
+        dbus.bus_reply_error(&(*br).bus, m, "org.freedesktop.DBus.Error.UnknownMethod", "no actions")
+    } else if member == "GetNActions" {
+        dbus.w_i32(&body, n)
+        dbus.bus_reply(&(*br).bus, m, "i", &body)
+    } else if member == "GetName" || member == "GetLocalizedName" {
+        dbus.w_str(&body, "click")
+        dbus.bus_reply(&(*br).bus, m, "s", &body)
+    } else if member == "GetDescription" || member == "GetKeyBinding" {
+        dbus.w_str(&body, "")
+        dbus.bus_reply(&(*br).bus, m, "s", &body)
+    } else if member == "GetActions" {
+        let at: usize = dbus.w_array_begin(&body, 8)
+        dbus.w_struct_begin(&body)
+        dbus.w_str(&body, "click")
+        dbus.w_str(&body, "")
+        dbus.w_str(&body, "")
+        dbus.w_array_end(&body, at, 8)
+        dbus.bus_reply(&(*br).bus, m, "a(sss)", &body)
+    } else if member == "DoAction" {
+        let ix: i32 = dbus.rd_i32(&rd)
+        var done: bool = false
+        if ix == 0 {
+            let f: fn(u64, usize, usize) -> bool = (*br).act
+            if r.kind == K_ROW {
+                done = f((*br).ud, r.node, r.row)
+            } else {
+                done = f((*br).ud, r.node, NONE)
+            }
+        }
+        dbus.w_bool(&body, done)
+        dbus.bus_reply(&(*br).bus, m, "b", &body)
+    } else {
+        unknown_method(br, m)
+    }
+    rt.buf_free(&body)
+}
+
+fn handle_intro(br: *mut Bridge, m: *mut dbus.Msg, r: Ref) {
+    var body: rt.Buf = rt.buf_new()
+    dbus.w_str(&body, "<node><interface name=\"org.a11y.atspi.Accessible\"/><interface name=\"org.a11y.atspi.Component\"/><interface name=\"org.a11y.atspi.Action\"/><interface name=\"org.a11y.atspi.Value\"/><interface name=\"org.a11y.atspi.Application\"/><interface name=\"org.freedesktop.DBus.Properties\"/></node>")
+    dbus.bus_reply(&(*br).bus, m, "s", &body)
+    rt.buf_free(&body)
+}
+
+fn handle(br: *mut Bridge, m: *mut dbus.Msg) {
+    (*br).calls = (*br).calls + 1 as u64
+    let r: Ref = parse_path((*m).f.path)
+    if r.kind == K_NONE || !valid(br, r) {
+        dbus.bus_reply_error(&(*br).bus, m, "org.freedesktop.DBus.Error.UnknownObject", "no such object")
+        return
+    }
+    let iface: str = (*m).f.iface
+    if iface == IF_PROPS {
+        handle_props(br, m, r)
+    } else if iface == IF_INTRO {
+        handle_intro(br, m, r)
+    } else if iface == IF_ACC {
+        handle_acc(br, m, r)
+    } else if iface == IF_COMP && r.kind != K_APP {
+        handle_comp(br, m, r)
+    } else if iface == IF_ACT {
+        handle_act(br, m, r)
+    } else {
+        dbus.bus_reply_error(&(*br).bus, m, "org.freedesktop.DBus.Error.UnknownInterface", "unknown interface")
+    }
+}
+
+// Serve what has arrived: waits up to `timeout_ms` for the first message, then drains
+// the queue without waiting. Returns the number of calls answered; -1 = connection broken.
+fn bridge_serve(br: *mut Bridge, timeout_ms: i64) -> i32 {
+    if !(*br).open {
+        return -1
+    }
+    var served: i32 = 0
+    var wait: i64 = timeout_ms
+    var m: dbus.Msg = dbus.msg_new()
+    var more: bool = true
+    while more {
+        let r: i32 = dbus.bus_recv(&(*br).bus, &m, wait)
+        wait = 0
+        if r < 0 {
+            dbus.msg_free(&m)
+            return -1
+        }
+        if r == 0 {
+            more = false
+        } else {
+            if dbus.msg_is_call(&m) {
+                handle(br, &m)
+                served = served + 1
+            }
+            if served >= 64 {
+                more = false
+            }
+        }
+    }
+    dbus.msg_free(&m)
+    return served
+}
+
+// ---------------------------------------------------- the window loop
+
+fn pump_fd(ud: u64) -> i32 { return bridge_fd(ud as *mut Bridge) }
+fn pump_ms(ud: u64, wanted: i64) -> i64 { return wanted }
+fn pump_step(ud: u64) -> bool { return bridge_serve(ud as *mut Bridge, 0) > 0 }
+
+// Serve `br` from the window loop of `a` (like looppump.attach; one pump per window).
+fn attach(a: *mut app.App, br: *mut Bridge) {
+    app.set_pump(a, br as u64, pump_fd, pump_ms, pump_step)
+}
+
+// DoAction on a node = a click in its middle through the host's pointer path, exactly what a
+// mouse does (so a check box flips, a button calls back). `ud` is the *mut app.App.
+fn act_click(ud: u64, node: usize, row: usize) -> bool {
+    if row != NONE {
+        return false
+    }
+    let a: *mut app.App = ud as *mut app.App
+    let w: *mut fuiwirt.Host = app.app_host(a)
+    let sc: *mut scene.Scene = app.app_scene(a)
+    if node >= scene.scene_count(sc) {
+        return false
+    }
+    let x: f64 = scene.node_x(sc, node) + scene.node_w(sc, node) / 2.0
+    let y: f64 = scene.node_y(sc, node) + scene.node_h(sc, node) / 2.0
+    let c1: u32 = fuiwirt.host_pointer_move(w, x, y)
+    let c2: u32 = fuiwirt.host_pointer_down(w, x, y, fuiwirt.BTN_LEFT)
+    let c3: u32 = fuiwirt.host_pointer_up(w, x, y, fuiwirt.BTN_LEFT)
+    let i: usize = fuiwirt.host_take_activated(w)
+    if i != fuiwirt.KEINER {
+        app.app_act(a as u64, i)
+    }
+    fuiwirt.host_touch(w)
+    return true
+}
+
+fn focus_node(ud: u64, node: usize) -> bool {
+    let pn: *mut control.Panel = fuiwirt.host_panel(app.app_host(ud as *mut app.App))
+    let r: u32 = control.panel_set_focus(pn, node)
+    fuiwirt.host_touch(app.app_host(ud as *mut app.App))
+    return true
+}
+
+// The one call a program needs: with FUI_ATSPI set in the environment ("1" = the accessibility
+// bus of the session, anything else = a bus address) the window's tree is served on that bus
+// from the window loop. Without the variable nothing happens (no cost). Call before `app.run`.
+// `title` must stay valid while the window runs. The bridge lives as long as the program.
+#[allow_escape]
+fn enable_from_env(a: *mut app.App, title: str) -> bool {
+    let v: str = env.get("FUI_ATSPI")
+    if v.n == 0 {
+        return false
+    }
+    let br: *mut Bridge = rt.heap_alloc(65536) as *mut Bridge
+    *br = bridge_new(app.app_scene(a), app.ax(a), title)
+    bridge_set_actions(br, a as u64, act_click, focus_node)
+    var ok: bool = false
+    if v == "1" {
+        ok = bridge_open(br)
+    } else {
+        ok = bridge_open_address(br, v)
+    }
+    if !ok {
+        return false
+    }
+    attach(a, br)
+    return true
+}
