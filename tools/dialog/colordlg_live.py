@@ -83,6 +83,7 @@ def snap(name=None):
 
 
 WIN = (660, 490)
+FIELD_COL = (238, 238, 238)  # Fluent light: theme.colors_light().field = 0xEEEEEE
 
 
 class Run:
@@ -206,7 +207,7 @@ class Layout:
         while y < H and P[self.sw_x0 + 8, y] == self.bg:
             y += 1
         # (a thin run of border first)
-        while y < H and P[self.sw_x0 + 8, y] != self.bg and not near(P[self.sw_x0 + 8, y], (237, 237, 240), 40):
+        while y < H and P[self.sw_x0 + 8, y] != self.bg and not near(P[self.sw_x0 + 8, y], FIELD_COL, 40):
             y += 1
         self.cu_y0 = y + 2
         # boxes of the button / field colour that are wide enough: the text fields and the buttons
@@ -227,7 +228,7 @@ class Layout:
     def runs(self, P, x0, x1=None):
         """Boxes of the field colour at least 40 px wide and 20 px high: (x0, y0, x1, y1)."""
         x1 = x1 or self.W
-        col = (237, 237, 240)
+        col = FIELD_COL
         found = {}
         for y in range(self.H):
             x = x0

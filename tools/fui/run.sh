@@ -270,6 +270,19 @@ mkdir -p "$W/glassref"
 python3 -I tools/fui/glass_ref.py "$W/glassref"
 
 echo
+echo "== 14c. GLASS ON THE SURFACES: tooltip, title bar, modal, menu (glasspane.fi, theme token glass) =="
+# level 0 (default) creates no pane; level 1/2 flatten a striped backdrop under each surface,
+# a second frame is a cache hit, the theme file key `glass = 2` parses (range 0..2).
+"$FIRNC" --opt-level=dev -o "$W/glasspane" tools/fui/glasspane_main.fi
+"$W/glasspane" check
+"$FIRNC" --opt-level=release-fast -o "$W/glasspane_fast" tools/fui/glasspane_main.fi
+"$W/glasspane_fast" bench
+
+echo "== 14d. FUZZ + SOAK: 100000 random events into a real window, memory stable (fuzz_main.fi) =="
+"$FIRNC" --opt-level=release-fast -o "$W/fuzz" tools/fui/fuzz_main.fi
+"$W/fuzz" 100000 1
+"$W/fuzz" 20000 7
+
 echo "== 15. AFFINE ABBILDUNGEN UND DIE TREFFERPRUEFUNG =="
 # Known point images, the stack, the inverse mapping -- and the
 # click under rotation, which without the inverse mapping goes wide.

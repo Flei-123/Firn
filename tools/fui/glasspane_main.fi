@@ -1,0 +1,393 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/glasspane_main.fi -- GLASS ON THE SURFACES: tooltip, title bar, modal dialog.
+//
+//   glasspane_main check               numbers; exit code 1 on a wrong one
+//   glasspane_main shot <out-dir>      writes glasspane-<level>.png (level 0, 1, 2)
+//   glasspane_main bench               GLASSPANE name=.. us=.. lines (taskset -c N)
+//
+// What `check` pins down (a striped backdrop makes every blur visible):
+//   1. level 0 (the default) allocates nothing: no pane is created, the
+//      tooltip fill is the flat surface colour, the same as before glass
+//   2. level 1 and 2: the pane exists, its stripe contrast is far below
+//      the backdrop's, and the pixels outside the rectangle are untouched
+//   3. the same for the modal dialog (card) and the title bar
+//   4. the second frame is a cache hit (no new cold run)
+//   5. the theme file key `glass = 2` reaches Shape.glass
+import std.rt
+import paint.canvas
+import paint.png
+import html.mem
+import font.metrics
+import fui.theme
+import fui.themefile
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+import fui.wave2
+import fui.kit
+import fui.titlebar
+import fui.glass
+import fui.glasspane
+
+const W: usize = 640
+const H: usize = 360
+const FONTSET_BYTES: usize = 4096
+
+static mut G_ERRORS: usize = 0
+static mut G_CHECKS: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn num(v: i64) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    rt.write_everything(1, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+fn check(ok: bool, name: str, got: i64) {
+    G_CHECKS = G_CHECKS + 1
+    if ok {
+        say("  ok    ")
+        say(name)
+        say("\n")
+    } else {
+        G_ERRORS = G_ERRORS + 1
+        say("  WRONG ")
+        say(name)
+        say("  got ")
+        num(got)
+        say("\n")
+    }
+}
+
+fn clock_ns() -> i64 {
+    var ts: [u64; 2] = [0; 2]
+    syscall(228, 1, (&ts[0]) as u64)
+    return (ts[0] as i64) * 1000000000 + (ts[1] as i64)
+}
+
+fn px(cv: *mut canvas.Canvas, x: usize, y: usize) -> u32 {
+    return canvas.canvas_get(cv, x, y)
+}
+
+fn lum(c: u32) -> i64 {
+    let r: i64 = ((c >> 16) & 255 as u32) as i64
+    let g: i64 = ((c >> 8) & 255 as u32) as i64
+    let b: i64 = (c & 255 as u32) as i64
+    return (r * 299 + g * 587 + b * 114) / 1000
+}
+
+// max - min of the luminance along a row segment
+fn row_contrast(cv: *mut canvas.Canvas, x0: usize, x1: usize, y: usize) -> i64 {
+    var lo: i64 = 255
+    var hi: i64 = 0
+    var x: usize = x0
+    while x < x1 {
+        let l: i64 = lum(px(cv, x, y))
+        if l < lo { lo = l }
+        if l > hi { hi = l }
+        x = x + 1
+    }
+    return hi - lo
+}
+
+// vertical stripes, 5 px wide, dark blue / light yellow: a blur flattens them
+fn backdrop(cv: *mut canvas.Canvas) {
+    var y: usize = 0
+    while y < H {
+        var x: usize = 0
+        while x < W {
+            var col: u32 = 0xFF1F3A8A as u32
+            if (x / 5) % 2 == 1 {
+                col = 0xFFF2D675 as u32
+            }
+            canvas.canvas_set_raw(cv, x, y, col)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+fn load_font() -> u64 {
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    let have: bool = rt.read_file((&f1[0]) as u64, &fbuf)
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 || !have {
+        return 0
+    }
+    *fsp = metrics.fontset_new()
+    if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+        return fsp as u64
+    }
+    return 0
+}
+
+struct Rig {
+    cv: canvas.Canvas,
+    z: painter.Painter,
+    m: theme.Theme,
+}
+
+fn rig_init(r: *mut Rig, fm: u64, dark: bool, level: usize) -> bool {
+    (*r).cv = canvas.canvas_new()
+    if !canvas.canvas_init(&(*r).cv, W, H) {
+        return false
+    }
+    (*r).z = painter.painter_new()
+    if !painter.painter_init(&(*r).z, &(*r).cv, W, H) {
+        return false
+    }
+    painter.painter_set_font(&(*r).z, fm)
+    (*r).m = theme.theme_new(dark)
+    (*theme.theme_shape(&(*r).m)).glass = level
+    return true
+}
+
+// One frame of everything but the modal: title bar on top, a tooltip below.
+fn frame_bars(r: *mut Rig, c: *mut render.Ctx) {
+    backdrop(&(*r).cv)
+    draw_bars(c)
+}
+
+fn draw_bars(c: *mut render.Ctx) {
+    titlebar.titlebar_draw(c, 20.0, 20.0, 600.0, "Glass", true, false, 0 as u32, 0 as u32)
+    var e: widget.Widget = widget.widget_new(widget.KIND_TOOLTIP)
+    widget.w_place(&e, 60.0, 120.0, 220.0, 36.0)
+    var t: [u8; 11] = "Save a copy"
+    widget.w_set_text(&e, (&t[0]) as u64, 11)
+    wave2.draw_tooltip(c, &e)
+}
+
+fn frame_modal(r: *mut Rig, c: *mut render.Ctx, mo: *mut kit.Modal) {
+    backdrop(&(*r).cv)
+    draw_modal(c, mo)
+}
+
+fn draw_modal(c: *mut render.Ctx, mo: *mut kit.Modal) {
+    kit.modal_draw(c, mo, 640.0, 360.0, 1000 as i64, false)
+}
+
+#[allow_escape]
+fn run_level(fm: u64, dark: bool, level: usize, dir: u64) {
+    var r: Rig = rig_init_zero()
+    if !rig_init(&r, fm, dark, level) {
+        check(false, "rig init", 0)
+        return
+    }
+    var c: render.Ctx = render.ctx_new(&r.m, &r.z)
+    glasspane.pane_free_all()
+    // ---- tooltip + title bar
+    frame_bars(&r, &c)
+    let cold1: usize = glasspane.pane_cold(glasspane.SLOT_TIP)
+    let cold_t1: usize = glasspane.pane_cold(glasspane.SLOT_TITLE)
+    // backdrop contrast far from the panes
+    let c_back: i64 = row_contrast(&r.cv, 400, 440, 300)
+    // inside the tooltip, left of the text (x 66..78 are padding)
+    let c_tip: i64 = row_contrast(&r.cv, 64, 72, 126)
+    // title bar: a stretch far from the caption buttons and from the title text
+    let c_bar: i64 = row_contrast(&r.cv, 300, 380, 24)
+    // pixels just outside the tooltip on the far (left) side are the backdrop
+    let out_ok: bool = px(&r.cv, 20, 138) == 0xFF1F3A8A as u32 || px(&r.cv, 20, 138) == 0xFFF2D675 as u32
+    if level == 0 {
+        check(cold1 == 0 && cold_t1 == 0, "level 0: no pane is created (tooltip, title bar)", cold1 as i64)
+        check(c_tip == 0, "level 0: the tooltip fill is flat", c_tip)
+        check(glasspane.pane_active(&c) == 0, "level 0: pane_active == 0", glasspane.pane_active(&c) as i64)
+    } else {
+        check(cold1 >= 1 && cold_t1 >= 1, "glass: tooltip and title bar panes exist", (cold1 + cold_t1) as i64)
+        check(c_back > 100, "the backdrop is striped (contrast > 100)", c_back)
+        check(c_tip < c_back / 3, "tooltip: stripe contrast < 1/3 of the backdrop", c_tip)
+        check(c_bar < c_back / 3, "title bar: stripe contrast < 1/3 of the backdrop", c_bar)
+        check(out_ok, "pixels outside the tooltip are untouched", px(&r.cv, 20, 138) as i64)
+        // a second identical frame is a cache hit
+        frame_bars(&r, &c)
+        check(glasspane.pane_cold(glasspane.SLOT_TIP) == cold1, "second frame: tooltip pane is a cache hit",
+            glasspane.pane_cold(glasspane.SLOT_TIP) as i64)
+        check(glasspane.pane_hits(glasspane.SLOT_TIP) >= 1, "second frame: hit counted", glasspane.pane_hits(glasspane.SLOT_TIP) as i64)
+    }
+    if dir != 0 {
+        frame_bars(&r, &c)
+        write_shot(&r.cv, dir, level, 0)
+    }
+    // ---- modal
+    var mo: kit.Modal = kit.modal_new()
+    kit.modal_open(&mo, "Delete profile", 360, 160, 3, 0 as i64)
+    frame_modal(&r, &c, &mo)
+    var px0: f64 = 0.0
+    var py0: f64 = 0.0
+    var pw0: f64 = 0.0
+    var ph0: f64 = 0.0
+    kit.modal_rect(&c, &mo, 640.0, 360.0, &px0, &py0, &pw0, &ph0)
+    // a stretch inside the card, below the title row, left of the content
+    let cx0: usize = (px0 as usize) + 6
+    let cy: usize = (py0 as usize) + (ph0 as usize) - 8
+    let c_card: i64 = row_contrast(&r.cv, cx0, cx0 + 80, cy)
+    if level == 0 {
+        check(glasspane.pane_cold(glasspane.SLOT_MODAL) == 0, "level 0: no modal pane", 0)
+        check(c_card == 0, "level 0: the card is flat", c_card)
+    } else {
+        check(glasspane.pane_cold(glasspane.SLOT_MODAL) >= 1, "glass: the modal pane exists", 0)
+        check(c_card < 60, "modal card: stripe contrast < 60 (scrim + blur)", c_card)
+    }
+    if dir != 0 {
+        write_shot(&r.cv, dir, level, 1)
+    }
+    glasspane.pane_free_all()
+}
+
+fn rig_init_zero() -> Rig {
+    return Rig { cv: canvas.canvas_new(), z: painter.painter_new(), m: theme.theme_new(false) }
+}
+
+fn write_shot(cv: *mut canvas.Canvas, dir: u64, level: usize, part: usize) {
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if !png.write_png(cv, &out) {
+        return
+    }
+    var pf: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < rt.c_length(dir) {
+        rt.buf_push(&pf, rt.ld8(dir, k))
+        k = k + 1
+    }
+    var nm: [u8; 20] = "/glasspane-0-a.png\0\0"
+    nm[11] = (48 + level) as u8
+    nm[13] = (97 + part) as u8
+    rt.buf_push_bytes(&pf, (&nm[0]) as u64, 18)
+    rt.buf_push(&pf, 0 as u8)
+    rt.write_file(rt.buf_ptr(&pf), mem.buf_ptr(&out) as u64, mem.buf_len(&out))
+}
+
+fn check_themefile() {
+    var t: theme.Theme = theme.theme_new(true)
+    var src: [u8; 19] = "name = G\nglass = 2\n"
+    var r: themefile.ThemeFile = themefile.themefile_new()
+    let ok: bool = themefile.themefile_apply(&t, (&src[0]) as u64, 19, &r)
+    check(ok, "themefile: 'glass = 2' parses", 0)
+    check((*theme.theme_shape(&t)).glass == 2, "themefile: Shape.glass == 2", (*theme.theme_shape(&t)).glass as i64)
+    var src2: [u8; 10] = "glass = 3\n"
+    var t2: theme.Theme = theme.theme_new(true)
+    let ok2: bool = themefile.themefile_apply(&t2, (&src2[0]) as u64, 10, &r)
+    check(!ok2, "themefile: 'glass = 3' is refused (range 0..2)", 0)
+}
+
+#[allow_escape]
+fn bench(fm: u64) {
+    var r: Rig = rig_init_zero()
+    if !rig_init(&r, fm, true, 2) {
+        return
+    }
+    var c: render.Ctx = render.ctx_new(&r.m, &r.z)
+    var mo: kit.Modal = kit.modal_new()
+    kit.modal_open(&mo, "Delete profile", 360, 160, 3, 0 as i64)
+    var lvl: usize = 0
+    while lvl < 3 {
+        (*theme.theme_shape(&r.m)).glass = lvl
+        glasspane.pane_free_all()
+        // the backdrop is painted OUTSIDE the timed part; only the surfaces are timed
+        backdrop(&r.cv)
+        var t0: i64 = clock_ns()
+        draw_bars(&c)
+        var t1: i64 = clock_ns()
+        say("GLASSPANE name=bars-cold-l")
+        num(lvl as i64)
+        say(" us=")
+        num((t1 - t0) / 1000)
+        say("\n")
+        var best: i64 = 1000000000
+        var i: usize = 0
+        while i < 15 {
+            backdrop(&r.cv)
+            t0 = clock_ns()
+            draw_bars(&c)
+            t1 = clock_ns()
+            if t1 - t0 < best { best = t1 - t0 }
+            i = i + 1
+        }
+        say("GLASSPANE name=bars-warm-l")
+        num(lvl as i64)
+        say(" us=")
+        num(best / 1000)
+        say("\n")
+        glasspane.pane_free_all()
+        backdrop(&r.cv)
+        t0 = clock_ns()
+        draw_modal(&c, &mo)
+        t1 = clock_ns()
+        say("GLASSPANE name=modal-cold-l")
+        num(lvl as i64)
+        say(" us=")
+        num((t1 - t0) / 1000)
+        say("\n")
+        best = 1000000000
+        i = 0
+        while i < 15 {
+            backdrop(&r.cv)
+            t0 = clock_ns()
+            draw_modal(&c, &mo)
+            t1 = clock_ns()
+            if t1 - t0 < best { best = t1 - t0 }
+            i = i + 1
+        }
+        say("GLASSPANE name=modal-warm-l")
+        num(lvl as i64)
+        say(" us=")
+        num(best / 1000)
+        say(" cold=")
+        num(glasspane.pane_cold(glasspane.SLOT_MODAL) as i64)
+        say(" hits=")
+        num(glasspane.pane_hits(glasspane.SLOT_MODAL) as i64)
+        say("\n")
+        lvl = lvl + 1
+    }
+}
+
+fn main(start: u64) -> i32 {
+    let argc: usize = rt.arg_count(start)
+    if argc < 2 {
+        say("glasspane_main check | shot <dir> | bench\n")
+        return 2
+    }
+    let fm: u64 = load_font()
+    if fm == 0 {
+        say("no font\n")
+        return 3
+    }
+    let a1: u64 = rt.arg_ptr(start, 1)
+    if rt.c_length(a1) == 5 && rt.ld8(a1, 0) == 99 as u8 {
+        var lvl: usize = 0
+        while lvl < 3 {
+            run_level(fm, false, lvl, 0)
+            run_level(fm, true, lvl, 0)
+            lvl = lvl + 1
+        }
+        check_themefile()
+        say("checks ")
+        num(G_CHECKS as i64)
+        say(", wrong ")
+        num(G_ERRORS as i64)
+        say("\n")
+        if G_ERRORS == 0 {
+            say("GLASSPANE PASSED\n")
+            return 0
+        }
+        say("GLASSPANE FAILED\n")
+        return 1
+    }
+    if rt.c_length(a1) == 4 && rt.ld8(a1, 0) == 115 as u8 && argc >= 3 {
+        let dir: u64 = rt.arg_ptr(start, 2)
+        var lvl: usize = 0
+        while lvl < 3 {
+            run_level(fm, false, lvl, dir)
+            lvl = lvl + 1
+        }
+        return 0
+    }
+    bench(fm)
+    return 0
+}

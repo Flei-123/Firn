@@ -55,6 +55,10 @@ for scheme in light dark; do
     "$T/glass" shot "$scheme" "$T/img/glass-$scheme.png"
 done
 
+# GLASS ON THE SURFACES (lib/fui/glasspane.fi): title bar + tooltip (a), modal (b), levels 0/1/2
+"$FIRNC" --opt-level=dev -o "$T/glasspane" tools/fui/glasspane_main.fi
+"$T/glasspane" shot "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/

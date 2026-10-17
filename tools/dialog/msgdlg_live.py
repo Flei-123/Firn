@@ -121,6 +121,21 @@ class Win:
         return self.x + x, self.y + y
 
 
+def biggest(ids):
+    """The largest window among the ids (a window of the run before may still be on screen)."""
+    best = None
+    for i in ids:
+        try:
+            w = Win(i)
+        except (IndexError, ValueError):
+            continue
+        if best is None or w.w * w.h > best.w * best.h:
+            best = w
+    if best is None:
+        raise IndexError("no window")
+    return best
+
+
 class Run:
     """One message box: the driver process and its window."""
 
@@ -139,7 +154,17 @@ class Run:
             if ids:
                 time.sleep(0.9)                      # let it paint (the focus, the settle frame)
                 try:
-                    self.win = Win(ids[-1])
+                    w = biggest(ids)
+                    # a loaded machine maps the window at a first size and resizes it a moment later:
+                    # take the geometry only once it has been the same for two reads
+                    for _ in range(20):
+                        time.sleep(0.4)
+                        w2 = biggest(xdo("search", "--onlyvisible", "--name", "^%s$" % title).split() or ids)
+                        same = (w2.w, w2.h, w2.x, w2.y) == (w.w, w.h, w.x, w.y)
+                        w = w2
+                        if same:
+                            break
+                    self.win = w
                 except (IndexError, ValueError):     # a window that closed between the search and the question
                     time.sleep(0.2)
             else:
