@@ -7,7 +7,9 @@
 // fui.app entry: IME (Gboard), caret, selection and copy/paste come from fui.app / lib/android/inputmethod.fi.
 // Voice (lib/plat/voiceio.fi): the Mic button records (tap again to stop), the WAV goes to POST /api/stt through net.jarvisapi and
 // the text lands in the input line; the "Voice" button switches the spoken answer on (every finished answer is read out).
-// OPEN: conversation list (GET /api/m/conversations) as a drawer, upload of the picked photo.
+// Chats button: the conversation list (jdata.refresh_convs, a vlist) replaces the chat view; a tap on a row opens that chat.
+// Photo: "+" picks (up to 3 MB JPEG), Send uploads it (POST /api/m/upload, raw) and then sends the text with the server path of
+// the file, so the model can read it. Files the assistant sends (JE_FILE) are fetched (ja_download) and opened (plat.fileio).
 import std.rt
 import fui.app
 import fui.render
@@ -20,9 +22,15 @@ import markdown.doc
 import net.jarvisc
 import net.jarvisapi
 import plat.voiceio
+import plat.fileio
+import fui.vlist
+import std.vec
+import std.time
 import window.window
 import jshell
 import jpush
+import jdata
+import jlist
 
 export {
     screen_chat_build, screen_chat_refresh, screen_chat_event, screen_chat_api, screen_chat_voice_tick, screen_chat_enter, screen_chat_in_node, chat_clear,
@@ -46,8 +54,18 @@ static mut G_REC: bool = false
 static mut G_PHOTO_N: usize = 0
 static mut G_CHAT: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_PHOTO_BUF: u64 = 0
+static mut G_LIST: usize = 0
+static mut G_LIST_ON: bool = false
+static mut G_LIST_SEEN: u64 = 0
+static mut G_UPLOADING: bool = false
+static mut G_PENDING: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the text waiting for its upload
+static mut G_DL_BUSY: bool = false
+static mut G_DL_NAME: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_DL_MIME: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_DL_QUEUE: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // waiting files: url \x01 name \x01 mime \n per file
+static mut G_LIMIT_SET: bool = false
 
-const PHOTO_CAP: usize = 262144
+const PHOTO_CAP: usize = 3145728 // the picker hands out JPEGs up to this size (window.pick_set_limit)
 
 fn mdv() -> *mut markdownview.MdView { return G_MD as *mut markdownview.MdView }
 
@@ -134,6 +152,7 @@ fn on_copy(a: *mut app.App) {
 fn on_new(a: *mut app.App) {
     jarvisc.jc_new_chat(jshell.jc())
     chat_clear()
+    show_list(a, false)
     G_PHOTO_N = 0
     app.set_text(a, G_PHOTO, "")
     jshell.set_status("new chat")
@@ -185,6 +204,14 @@ fn screen_chat_api(x: *mut jarvisapi.Api, kind: u32, status: i64) {
         jpush.on_api(x, status)
         return
     }
+    if kind == jarvisapi.AK_UPLOAD {
+        upload_done(x, status)
+        return
+    }
+    if kind == jarvisapi.AK_DOWNLOAD {
+        download_done(x, status)
+        return
+    }
     if kind != jarvisapi.AK_STT { return }
     G_STT_WAIT = false
     voiceio.vio_mic_free()
@@ -216,6 +243,9 @@ fn screen_chat_voice_tick(a: *mut app.App) {
 }
 
 fn on_attach(a: *mut app.App) {
+    if jshell.win() as u64 != 0 && !G_LIMIT_SET {
+        G_LIMIT_SET = window.pick_set_limit(jshell.win(), PHOTO_CAP)
+    }
     if jshell.win() as u64 == 0 || !window.pick_image(jshell.win()) {
         jshell.set_status("no photo picker on this system")
     }
@@ -224,17 +254,165 @@ fn on_attach(a: *mut app.App) {
 fn send_now(a: *mut app.App) {
     let t: str = __str_copy(app.text(a, G_IN))
     if t.n == 0 { return }
-    if G_PHOTO_N > 0 {
-        // the upload goes through lib/net/jarvisapi.fi (A1) and /api/m/* (A2); not on main yet -> say so, keep the text
-        jshell.set_status("photo upload needs jarvisapi (A1/A2) - not sent")
+    if G_UPLOADING {
+        jshell.set_status("upload running ...")
         return
     }
+    if G_PHOTO_N > 0 {
+        // upload first; the text goes out with the server path when the answer is here (upload_done)
+        let name: str = "photo_" + jshell.dec(time.now_unix_ms()) + ".jpg"
+        rt.buf_clear(&G_PENDING)
+        rt.buf_push_bytes(&G_PENDING, t.p as u64, t.n)
+        if jarvisapi.ja_upload(jshell.api(), name, "image/jpeg", G_PHOTO_BUF, G_PHOTO_N, jarvisc.jc_cid(jshell.jc())) {
+            G_UPLOADING = true
+            jshell.set_status("uploading photo ...")
+        } else {
+            jshell.set_status("photo upload not possible")
+        }
+        return
+    }
+    send_text(a, t)
+}
+
+fn send_text(a: *mut app.App, t: str) {
     chat_add("**You:** " + t + "\n\n**JARVIS:** ")
     G_ANS_AT = G_CHAT.len
     G_BUSY = true
     jarvisc.jc_send(jshell.jc(), t)
     app.set_text(a, G_IN, "")
     jshell.set_status("sent")
+}
+
+// the upload answered: put the server file into the message so the model finds it (docs/ANDROID-APP-API.md, POST /api/m/upload)
+fn upload_done(x: *mut jarvisapi.Api, status: i64) {
+    let a: *mut app.App = jshell.app_ui()
+    G_UPLOADING = false
+    var up: jarvisapi.Uploaded = jarvisapi.uploaded_new()
+    if status != 200 || !jarvisapi.parse_upload(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &up) {
+        jarvisapi.uploaded_free(&up)
+        jshell.set_status("photo upload failed (" + jshell.dec(status) + ")")
+        return
+    }
+    let t: str = __str_copy(str { p: G_PENDING.ptr as *mut u8, n: G_PENDING.len })
+    var full: str = t + "\n\n[photo " + up.name + " (" + jshell.dec(up.size / 1024) + " kB) on the server: " + up.path + "]"
+    if up.path.n == 0 { full = t + "\n\n[photo " + up.name + ": " + up.url + "]" }
+    jarvisapi.uploaded_free(&up)
+    G_PHOTO_N = 0
+    app.set_text(a, G_PHOTO, "")
+    send_text(a, full)
+}
+
+// ---- files from the assistant: ja_download -> plat.fileio (save into Downloads/Jarvis, open in another app)
+fn start_download(url: str, name: str, mime: str) {
+    rt.buf_clear(&G_DL_NAME)
+    rt.buf_push_bytes(&G_DL_NAME, name.p as u64, name.n)
+    rt.buf_clear(&G_DL_MIME)
+    rt.buf_push_bytes(&G_DL_MIME, mime.p as u64, mime.n)
+    if jarvisapi.ja_download(jshell.api(), url) {
+        G_DL_BUSY = true
+        jshell.set_status("receiving " + name + " ...")
+    } else {
+        jshell.set_status("file link not usable: " + name)
+        next_download()
+    }
+}
+
+fn queue_download(url: str, name: str, mime: str) {
+    if url.n == 0 { return }
+    if !G_DL_BUSY {
+        start_download(url, name, mime)
+        return
+    }
+    rt.buf_push_bytes(&G_DL_QUEUE, url.p as u64, url.n)
+    rt.buf_push(&G_DL_QUEUE, 1 as u8)
+    rt.buf_push_bytes(&G_DL_QUEUE, name.p as u64, name.n)
+    rt.buf_push(&G_DL_QUEUE, 1 as u8)
+    rt.buf_push_bytes(&G_DL_QUEUE, mime.p as u64, mime.n)
+    rt.buf_push(&G_DL_QUEUE, 10 as u8)
+}
+
+// the first queued file (a line "url \x01 name \x01 mime") starts, the rest stays
+fn next_download() {
+    G_DL_BUSY = false
+    if G_DL_QUEUE.len == 0 { return }
+    let q: str = __str_copy(str { p: G_DL_QUEUE.ptr as *mut u8, n: G_DL_QUEUE.len })
+    var end: usize = 0
+    while end < q.n && *((q.p as u64 + end as u64) as *mut u8) != 10 as u8 { end = end + 1 }
+    var f1: usize = 0
+    while f1 < end && *((q.p as u64 + f1 as u64) as *mut u8) != 1 as u8 { f1 = f1 + 1 }
+    var f2: usize = f1 + 1
+    while f2 < end && *((q.p as u64 + f2 as u64) as *mut u8) != 1 as u8 { f2 = f2 + 1 }
+    rt.buf_clear(&G_DL_QUEUE)
+    if end + 1 < q.n { rt.buf_push_bytes(&G_DL_QUEUE, q.p as u64 + end as u64 + 1 as u64, q.n - end - 1) }
+    if f2 >= end { return }
+    start_download(str { p: q.p, n: f1 }, str { p: (q.p as u64 + f1 as u64 + 1 as u64) as *mut u8, n: f2 - f1 - 1 },
+        str { p: (q.p as u64 + f2 as u64 + 1 as u64) as *mut u8, n: end - f2 - 1 })
+}
+
+fn download_done(x: *mut jarvisapi.Api, status: i64) {
+    let name: str = __str_copy(str { p: G_DL_NAME.ptr as *mut u8, n: G_DL_NAME.len })
+    let mime: str = __str_copy(str { p: G_DL_MIME.ptr as *mut u8, n: G_DL_MIME.len })
+    if status == 200 && jarvisapi.ja_body_len(x) > 0 {
+        if fileio.fio_open(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), name, mime) {
+            jshell.set_status("opened " + name + " (saved in Downloads/Jarvis)")
+        } else {
+            jshell.set_status("received " + name + " but could not open it")
+        }
+    } else {
+        jshell.set_status("file " + name + " failed (" + jshell.dec(status) + ")")
+    }
+    next_download()
+}
+
+// ---- conversation list
+fn conv_count() -> usize {
+    if !jdata.has_convs() { return 0 }
+    return vec_len[jarvisapi.ConvRow](&(*jdata.convs()).rows)
+}
+
+fn conv_at(i: usize) -> *mut jarvisapi.ConvRow {
+    return vec_elem_ptr[jarvisapi.ConvRow](&(*jdata.convs()).rows, i)
+}
+
+fn conv_rows(ud: u64, i: usize, out: *mut vlist.VRow) {
+    if i >= conv_count() { return }
+    let c: *mut jarvisapi.ConvRow = conv_at(i)
+    if (*c).fav { jlist.put(out, "* ") }
+    if (*c).kind == "worker" { jlist.put(out, "[w] ") }
+    jlist.put(out, (*c).title)
+}
+
+fn show_list(a: *mut app.App, on: bool) {
+    G_LIST_ON = on
+    jshell.set_shown(a, G_LIST, on, 1)
+    jshell.set_shown(a, G_NODE, !on, 1)
+    if on {
+        jdata.refresh_convs(true)
+        jshell.set_status("choose a chat")
+    }
+}
+
+fn on_chats(a: *mut app.App) { show_list(a, !G_LIST_ON) }
+
+// a tap on a row: this chat is the current one, its last turns load
+fn on_conv_pick(a: *mut app.App, id: usize, row: usize) {
+    if row >= conv_count() { return }
+    let c: *mut jarvisapi.ConvRow = conv_at(row)
+    let cid: str = __str_copy((*c).id)
+    if cid.n == 0 { return }
+    jarvisc.jc_set_cid(jshell.jc(), cid)
+    let saved: bool = jarvisc.jc_save(jshell.jc(), jshell.SERVICE)
+    chat_clear()
+    G_PHOTO_N = 0
+    app.set_text(a, G_PHOTO, "")
+    show_list(a, false)
+    G_HIST_ASKED = true
+    let h: bool = jarvisc.jc_history(jshell.jc())
+    jshell.set_status("opening " + __str_copy((*c).title))
+}
+
+fn on_conv_reload(a: *mut app.App) {
+    jdata.refresh_convs(true)
 }
 
 fn on_send(a: *mut app.App) { send_now(a) }
@@ -255,7 +433,8 @@ fn screen_chat_build(a: *mut app.App) {
     markdownview.mdv_set_clipboard(mdv(), clip_write)
     G_PHOTO_BUF = rt.heap_alloc(PHOTO_CAP)
     app.row(a)
-    app.button(a, "New chat", on_new)
+    app.button(a, "New", on_new)
+    app.button(a, "Chats", on_chats)
     G_VOICE_BTN = app.button(a, "Voice off", on_voice)
     G_COPY = app.button(a, "Copy", on_copy)
     jshell.set_shown(a, G_COPY, false, 0)
@@ -264,6 +443,13 @@ fn screen_chat_build(a: *mut app.App) {
     jshell.fill(a, G_NODE)
     scene.node_set_draw(app.app_scene(a), G_NODE, 0, draw_chat)
     let b: bool = app.on(a, G_NODE, event.EV_PAN_ALL | event.ev_bit(event.EV_TAP) | event.ev_bit(event.EV_LONG_PRESS), on_touch)
+    G_LIST = app.vlist_new(a, "Chats", 340, 300, 0, conv_rows, 0)
+    jshell.fill(a, G_LIST)
+    app.vlist_set_row_pt(a, G_LIST, jlist.ROW_PT)
+    app.vlist_on_pick(a, G_LIST, on_conv_pick)
+    jlist.pull_add(G_LIST, on_conv_reload)
+    jlist.pull_install(a)
+    jshell.set_shown(a, G_LIST, false, 0)
     G_PHOTO = app.label(a, "", 11)
     app.row(a)
     app.button(a, "+", on_attach)
@@ -292,6 +478,11 @@ fn screen_chat_refresh(a: *mut app.App) {
         }
     }
     sel_changed(a)
+    if G_LIST_ON && jdata.ver_convs() != G_LIST_SEEN {
+        G_LIST_SEEN = jdata.ver_convs()
+        app.vlist_set_count(a, G_LIST, conv_count())
+        app.vlist_changed(a, G_LIST)
+    }
 }
 
 // ---- events from net.jarvisc (history, streamed answer, tools)
@@ -320,6 +511,10 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
         jshell.set_status("thinking ...")
     } else if kind == jarvisc.JE_TOOL {
         jshell.set_status("tool: " + jarvisc.jc_text(c))
+    } else if kind == jarvisc.JE_FILE {
+        let fname: str = __str_copy(jarvisc.jc_text(c))
+        chat_add("**file:** " + fname + "\n\n")
+        queue_download(__str_copy(jarvisc.jc_id(c)), fname, __str_copy(jarvisc.jc_options(c)))
     } else if kind == jarvisc.JE_ERROR {
         chat_add("\n\n**error:** " + jarvisc.jc_text(c) + "\n\n")
     } else if kind == jarvisc.JE_DONE {

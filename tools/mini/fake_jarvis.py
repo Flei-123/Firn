@@ -15,6 +15,9 @@
 # as {"type":"rest",...}): /api/me, /api/projects[/<id>[/roadmap|/needs]], /api/command-center,
 # /api/conversations (list), /api/tasks, /api/remote/devices, /api/push-token, /api/stt,
 # /api/m/upload (raw body), /file/<uid>/<cid>/<name>, /api/projects/broken (cut JSON).
+# Push: GET /api/m/push/poll?since=N&wait=S is a real long poll (wait capped by FAKE_POLL_MAX, default 5 s); a test injects an event
+# with POST /fake/push {"title","body","cid","type"} (no login) -> {"id": N}. Event ids start at 1000 (FAKE_EVENT_BASE).
+# Text "file" in a chat message -> the server sends a file event (report.txt) that the client fetches over /file/.
 import asyncio, json, os, sys, time
 from urllib.parse import unquote, urlparse, parse_qs, quote
 from http import HTTPStatus
@@ -74,6 +77,8 @@ PROJECTS = {
 }
 TASKS = [{"id": "t1", "text": "buy milk", "due": "2026-10-18T09:00", "category": "Private", "repeat": "none", "done": False, "created": 1}]
 FILES = {}     # disk name -> bytes
+EVENTS = []    # push events (poll feed)
+EVSEQ = int(os.environ.get("FAKE_EVENT_BASE", "1000"))
 tseq = 1
 
 def pstats(p):
@@ -274,6 +279,10 @@ async def handler(ws):
                 await send(ws, {"type": "ask_request", "id": "a1", "cid": cid, "question": "Which?", "options": ["A", {"label": "B"}]})
                 r = json.loads(await ws.recv()); LOG.write(json.dumps(r) + "\n")
                 await send(ws, {"type": "token", "cid": cid, "content": "ans=%s" % r["answers"][0]})
+            elif text == "file":
+                FILES["report.txt"] = b"hello report from the fake server\n"
+                await send(ws, {"type": "token", "cid": cid, "content": "Here is the file."})
+                await send(ws, {"type": "file", "cid": cid, "name": "report.txt", "url": "/file/u1/%s/report.txt" % cid, "mime": "text/plain"})
             elif text == "slow":
                 while True:
                     await send(ws, {"type": "token", "cid": cid, "content": "."})
@@ -319,6 +328,38 @@ async def main():
                 out = json.dumps({"error": "Wrong user name or password"}).encode()
                 st = "401 Unauthorized"
             writer.write(("HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % (st, len(out))).encode() + out)
+            await writer.drain(); writer.close(); return
+        if method == "POST" and path == "/fake/push":
+            global EVSEQ
+            try:
+                j = json.loads(body)
+            except Exception:
+                j = {}
+            EVSEQ += 1
+            EVENTS.append({"id": EVSEQ, "type": j.get("type", "other"), "title": j.get("title", "JARVIS"), "body": j.get("body", ""),
+                           "cid": j.get("cid"), "at": int(time.time() * 1000)})
+            out = json.dumps({"id": EVSEQ}).encode()
+            writer.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(out)).encode() + out)
+            await writer.drain(); writer.close(); return
+        if method == "GET" and path.startswith("/api/m/push/poll"):
+            pq = parse_qs(urlparse(path).query)
+            since = int(pq.get("since", ["0"])[0] or 0)
+            wait = min(int(pq.get("wait", ["0"])[0] or 0), int(os.environ.get("FAKE_POLL_MAX", "5")))
+            cookie_ok_ = any(c.strip().partition("=")[0] == "fleitec_session" and unquote(c.strip().partition("=")[2]) == TOKEN
+                             for c in hdr.get("cookie", "").split(";"))
+            LOG.write(json.dumps({"type": "rest", "method": "GET", "path": path, "auth": cookie_ok_}) + "\n")
+            if not cookie_ok_:
+                out = b'{"error":"Not logged in"}'
+                writer.write(("HTTP/1.1 401 X\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(out)).encode() + out)
+                await writer.drain(); writer.close(); return
+            t0 = time.time()
+            while True:
+                have = [e for e in EVENTS if e["id"] > since]
+                if have or time.time() - t0 >= wait:
+                    break
+                await asyncio.sleep(0.1)
+            out = json.dumps({"events": have, "last": have[-1]["id"] if have else since}).encode()
+            writer.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(out)).encode() + out)
             await writer.drain(); writer.close(); return
         rr = rest(method, path, hdr, body)
         if rr is not None:

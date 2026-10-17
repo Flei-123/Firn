@@ -1,37 +1,65 @@
 // SPDX-License-Identifier: MPL-2.0
-// examples/jarvis_android/jpush.fi -- push notifications of the JARVIS app: register this phone at the server
-// (POST /api/m/push/register, docs/ANDROID-APP-API.md section 2) and start the relay connection (plat.pushio: foreground service,
-// own TCP relay, no Firebase) with the hello line "HELLO <pushToken> 1".
+// examples/jarvis_android/jpush.fi -- push notifications of the JARVIS app, ONLY over HTTPS on port 443 (no TCP relay, no clear
+// text token): the phone asks the server in a LONG POLL (GET /api/m/push/poll?since=N&wait=25, docs/ANDROID-APP-API.md section 2)
+// with its session cookie over TLS, and shows ONE notification per event (plat.pushio). A foreground service without a relay
+// connection (pio_keep) keeps the process alive while the window is away, so the poll goes on in the background.
 //
-// setup() runs once per start after the chat connection is open; the answer arrives in on_api (called from screen_chat_api).
-// An older server answers 404 -> no push (state PS_NONE, said in the status line). A relay with TLS needs a key pin that
-// plat.pushio does not take yet -> not started (state PS_TLS). The Android notification permission is asked by the first start.
+// setup() runs once per start after the chat connection is open: POST /api/m/push/register (an older server answers 404 -> no push,
+// state PS_NONE). The push token of that answer is NOT used: the TCP relay (port 7781, hello line with the token in clear text) is
+// never started. tick() (1 s) keeps ONE poll open; an error retries after RETRY_MS. The last event id is kept in the settings
+// ("push.since") so a restart shows what came in meanwhile (the server keeps 12 h); the very first start only learns the id.
 import std.rt
+import std.time
+import std.vec
 import net.jarvisapi
 import plat.pushio
 import appkit.log
 import jshell
 
-export { setup, on_api, stop, state, state_text, PS_IDLE, PS_ASKED, PS_ON, PS_NONE, PS_TLS, PS_FAILED }
+export { setup, on_api, stop, state, state_text, tick, polling, events_seen, PS_IDLE, PS_ASKED, PS_ON, PS_NONE, PS_TLS, PS_FAILED }
 
 const PS_IDLE: i64 = 0
 const PS_ASKED: i64 = 1
 const PS_ON: i64 = 2
 const PS_NONE: i64 = 3 // the server has no push registration (older version)
-const PS_TLS: i64 = 4
+const PS_TLS: i64 = 4 // kept for the settings screen; the relay is not used any more
 const PS_FAILED: i64 = 5
 
+const WAIT_S: i64 = 25
+const POLL_TIMEOUT_MS: i64 = 70000
+const RETRY_MS: i64 = 5000
+
 static mut G_STATE: i64 = 0
+static mut G_POLL: u64 = 0 // the Api of the long poll (it is open almost all the time, so it has its own)
+static mut G_INFLIGHT: bool = false
+static mut G_RETRY_AT: i64 = 0
+static mut G_SINCE: i64 = 0
+static mut G_LEARN: bool = false // no stored id yet: the first answer only sets the id
+static mut G_SEEN: i64 = 0 // events turned into notifications (for the end-to-end check and the settings page)
 
 fn state() -> i64 { return G_STATE }
+fn polling() -> bool { return G_STATE == PS_ON }
+fn events_seen() -> i64 { return G_SEEN }
 
 fn state_text() -> str {
     if G_STATE == PS_IDLE { return "push: not started" }
     if G_STATE == PS_ASKED { return "push: registering ..." }
-    if G_STATE == PS_ON { return "push: on" }
+    if G_STATE == PS_ON { return "push: on (HTTPS 443, " + jshell.dec(G_SEEN) + " seen)" }
     if G_STATE == PS_NONE { return "push: the server has no push route yet" }
-    if G_STATE == PS_TLS { return "push: relay wants TLS (not supported yet)" }
+    if G_STATE == PS_TLS { return "push: relay not used (HTTPS only)" }
     return "push: failed"
+}
+
+fn parse_dec(s: str) -> i64 {
+    var v: i64 = 0
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = *((s.p as u64 + i as u64) as *mut u8)
+        if c < 48 as u8 || c > 57 as u8 { return 0 }
+        v = v * 10 + (c as i64 - 48)
+        i = i + 1
+    }
+    return v
 }
 
 // once per start (and again after sign-out / sign-in)
@@ -45,6 +73,83 @@ fn setup() {
 fn stop() {
     pushio.pio_stop()
     G_STATE = PS_IDLE
+    G_SINCE = 0
+}
+
+fn poll_api() -> *mut jarvisapi.Api {
+    if G_POLL == 0 {
+        let x: *mut jarvisapi.Api = jarvisapi.ja_new(jshell.loop_of(), on_poll, 0)
+        jarvisapi.ja_set_timeout(x, POLL_TIMEOUT_MS)
+        G_POLL = x as u64
+    }
+    return G_POLL as *mut jarvisapi.Api
+}
+
+fn ask() {
+    if G_STATE != PS_ON || G_INFLIGHT { return }
+    let x: *mut jarvisapi.Api = poll_api()
+    jarvisapi.ja_use_jc(x, jshell.jc()) // token and base can change with a new sign-in
+    var wait: i64 = WAIT_S
+    if G_LEARN { wait = 0 }
+    if jarvisapi.ja_push_poll(x, G_SINCE, wait) {
+        G_INFLIGHT = true
+    } else {
+        G_RETRY_AT = time.now_unix_ms() + RETRY_MS
+    }
+}
+
+// 1 s, from main.fi: keeps exactly one poll open
+fn tick() {
+    if G_STATE != PS_ON || G_INFLIGHT { return }
+    if time.now_unix_ms() < G_RETRY_AT { return }
+    ask()
+}
+
+fn show(e: *mut jarvisapi.PushEvent) {
+    var title: str = (*e).title
+    if title.n == 0 { title = "JARVIS" }
+    if pushio.pio_notify(title, (*e).body) {
+        G_SEEN = G_SEEN + 1
+    }
+}
+
+// the answer of the long poll
+fn on_poll(x: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
+    G_INFLIGHT = false
+    if kind != jarvisapi.AK_PUSH_POLL { return }
+    if G_STATE != PS_ON { return }
+    if status != 200 {
+        // 401: the session is dead (the chat connection shows the sign-in page); anything else: the net is down
+        G_RETRY_AT = time.now_unix_ms() + RETRY_MS
+        return
+    }
+    var ev: jarvisapi.PushEvents = jarvisapi.pushevents_new()
+    if !jarvisapi.parse_push_events(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &ev) {
+        jarvisapi.pushevents_free(&ev)
+        G_RETRY_AT = time.now_unix_ms() + RETRY_MS
+        return
+    }
+    let n: usize = vec_len[jarvisapi.PushEvent](&ev.rows)
+    var i: usize = 0
+    while i < n {
+        let e: *mut jarvisapi.PushEvent = vec_elem_ptr[jarvisapi.PushEvent](&ev.rows, i)
+        if !G_LEARN && (*e).id > G_SINCE { show(e) }
+        i = i + 1
+    }
+    var last: i64 = ev.last
+    if n > 0 {
+        let l: *mut jarvisapi.PushEvent = vec_elem_ptr[jarvisapi.PushEvent](&ev.rows, n - 1)
+        if (*l).id > last { last = (*l).id }
+    }
+    jarvisapi.pushevents_free(&ev)
+    G_LEARN = false
+    if last != G_SINCE {
+        G_SINCE = last
+        jshell.cfg_set("push.since", jshell.dec(last))
+        jshell.settings_save()
+    }
+    // a quiet poll (nothing new) went through the whole wait: ask again at once; a fast answer must not spin
+    G_RETRY_AT = time.now_unix_ms() + 200
 }
 
 // the answer of ja_push_register (AK_PUSH_REG)
@@ -52,19 +157,15 @@ fn on_api(x: *mut jarvisapi.Api, status: i64) {
     if G_STATE != PS_ASKED { return }
     if status == 404 { G_STATE = PS_NONE; return }
     if status != 200 { G_STATE = PS_FAILED; return }
-    var r: jarvisapi.PushReg = jarvisapi.pushreg_new()
-    if !jarvisapi.parse_push_register(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &r) {
-        jarvisapi.pushreg_free(&r)
+    // a service without a relay connection keeps the process; the poll itself is tick() above
+    if !pushio.pio_keep() {
         G_STATE = PS_FAILED
         return
     }
-    if r.tls {
-        G_STATE = PS_TLS
-    } else if r.hello && pushio.pio_start(r.host, r.port, "HELLO " + r.token + " 1") {
-        G_STATE = PS_ON
-        log.log_info("push", "relay " + r.host + ":" + jshell.dec(r.port) + " started")
-    } else {
-        G_STATE = PS_FAILED
-    }
-    jarvisapi.pushreg_free(&r)
+    G_SINCE = parse_dec(jshell.cfg_get("push.since", ""))
+    G_LEARN = G_SINCE == 0
+    G_RETRY_AT = 0
+    G_STATE = PS_ON
+    log.log_info("push", "long poll over HTTPS started, since " + jshell.dec(G_SINCE))
+    ask()
 }

@@ -33,5 +33,5 @@ bash "$ROOT/tools/android/build.sh" "$ROOT/examples/jarvis_android/main.fi" --na
     --permission android.permission.INTERNET \
     --permission android.permission.REQUEST_INSTALL_PACKAGES \
     --permission android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION \
-    --install --pick --speech --tts --out "$APK"
+    --install --push --pick --speech --tts --out "$APK"
 echo "built $APK (versionCode $VCODE, channel $FIRN_APP_CHANNEL)"

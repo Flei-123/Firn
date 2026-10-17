@@ -79,13 +79,14 @@ import net.jarvis_cache
 export {
     Api,
     AK_LOGIN, AK_ME, AK_PROJECTS, AK_PROJECT, AK_PROJECT_SET, AK_ROADMAP, AK_NEED, AK_CENTER,
-    AK_CONVS, AK_CONV, AK_TASKS, AK_TASK_OP, AK_DEVICES, AK_PUSH, AK_STT, AK_UPLOAD, AK_DOWNLOAD, AK_PING, AK_PUSH_REG, AK_PUSH_TEST,
+    AK_CONVS, AK_CONV, AK_TASKS, AK_TASK_OP, AK_DEVICES, AK_PUSH, AK_STT, AK_UPLOAD, AK_DOWNLOAD, AK_PING, AK_PUSH_REG, AK_PUSH_TEST, AK_PUSH_POLL,
     JP_ME, JP_PROJECTS, JP_CENTER, JP_CONVS, JP_TASKS, JP_DEVICES, JP_PUSH, JP_STT, JP_UPLOAD, JP_LOGIN,
     ja_new, ja_free, ja_set_base, ja_set_token, ja_has_token, ja_use_jc, ja_set_path, ja_get_path,
     ja_set_cache, ja_set_timeout, ja_add_trust_pem, ja_user,
     ja_login, ja_me, ja_projects, ja_project, ja_project_set, ja_roadmap_op, ja_need_answer,
     ja_center, ja_convs, ja_conv, ja_tasks, ja_task_add, ja_task_complete, ja_task_remove,
-    ja_devices, ja_push_token, ja_stt, ja_set_mobile, ja_is_mobile, ja_ping, ja_push_register, ja_push_test,
+    ja_devices, ja_push_token, ja_stt, ja_set_mobile, ja_is_mobile, ja_ping, ja_push_register, ja_push_test, ja_push_poll,
+    PushEvent, PushEvents, pushevents_new, pushevents_free, parse_push_events,
     PushReg, pushreg_new, pushreg_free, parse_push_register, ja_upload, ja_download,
     ja_get, ja_post_json, ja_kind_name,
     ja_body_ptr, ja_body_len, ja_body, ja_key, ja_age_s, ja_status,
@@ -124,6 +125,7 @@ const AK_DOWNLOAD: u32 = 17
 const AK_PING: u32 = 18 // GET /api/m/ping: does the server have the mobile routes?
 const AK_PUSH_REG: u32 = 19 // POST /api/m/push/register (answer: pushToken + relay)
 const AK_PUSH_TEST: u32 = 20 // POST /api/m/push/test
+const AK_PUSH_POLL: u32 = 21 // GET /api/m/push/poll?since=N&wait=S (long poll over HTTPS 443, parse_push_events)
 
 const JP_LOGIN: u32 = 0
 const JP_ME: u32 = 1
@@ -751,6 +753,39 @@ fn ja_push_register(a: *mut Api, device: str, platform: str) -> bool {
 // A test push to this account (-> AK_PUSH_TEST, body {"ok":true,"sent":N}).
 fn ja_push_test(a: *mut Api) -> bool {
     return post_abs(a, AK_PUSH_TEST, "/api/m/push/test", "", 0, 0)
+}
+
+// The push long poll (the HTTPS-443 way to get push events without the relay port): holds up to `wait_s` (max 55) seconds on the
+// server until an event with id > since exists -> AK_PUSH_POLL, body {"events":[..],"last":N} (parse_push_events). The Api's timeout
+// must be longer than wait_s (ja_set_timeout), and this call belongs on an Api of its own (it is open for most of the time).
+fn ja_push_poll(a: *mut Api, since: i64, wait_s: i64) -> bool {
+    rt.buf_clear(&(*a).url)
+    rt.buf_push_bytes(&(*a).url, (*a).base.ptr, (*a).base.len)
+    put(&(*a).url, "/api/m/push/poll?since=")
+    put_i64(&(*a).url, since)
+    put(&(*a).url, "&wait=")
+    put_i64(&(*a).url, wait_s)
+    return start(a, AK_PUSH_POLL, false, false, 0, "", 0, 0, "")
+}
+
+fn put_i64(b: *mut rt.Buf, v: i64) {
+    var tmp: [u8; 24] = [0; 24]
+    var k: usize = 0
+    var x: i64 = v
+    if x < 0 { x = 0 }
+    if x == 0 {
+        tmp[0] = 48 as u8
+        k = 1
+    }
+    while x > 0 && k < 22 {
+        tmp[k] = (48 + (x % 10)) as u8
+        x = x / 10
+        k = k + 1
+    }
+    while k > 0 {
+        k = k - 1
+        rt.buf_push(b, tmp[k])
+    }
 }
 
 // Speech to text: the raw audio octets with their content type (-> AK_STT, body {"text":..}).
@@ -1465,4 +1500,49 @@ fn parse_push_register(p: u64, n: usize, out: *mut PushReg) -> bool {
     (*out).tls = gb(d, rl, "tls")
     (*out).hello = gb(d, rl, "hello")
     return (*out).token.n > 0
+}
+
+// ------------------------------------------------------------------ push events (long poll)
+
+struct PushEvent {
+    id: i64,
+    kind: str, // reminder|done|ask|need|workflow|stuck|test|other
+    title: str,
+    body: str,
+    cid: str, // "" = none
+    at: i64,
+}
+
+struct PushEvents {
+    d: json.Json,
+    rows: Vec[PushEvent],
+    last: i64,
+}
+
+fn pushevents_new() -> PushEvents {
+    return PushEvents { d: json.json_new(), rows: vec_new[PushEvent](), last: 0 }
+}
+
+fn pushevents_free(e: *mut PushEvents) {
+    vec_free[PushEvent](&(*e).rows)
+    json.json_free(&(*e).d)
+}
+
+// {"events":[{"id","type","title","body","cid","at"}],"last":N} -- the answer of AK_PUSH_POLL.
+fn parse_push_events(p: u64, n: usize, out: *mut PushEvents) -> bool {
+    if !open_doc(&(*out).d, p, n) { return false }
+    let d: *mut json.Json = &(*out).d
+    let o: u32 = json.json_root(d)
+    (*out).last = gi(d, o, "last")
+    let arr: u32 = gc (d, o, "events", json.JSON_ARRAY)
+    if arr == json.JSON_NONE { return false }
+    var e: u32 = json.json_child(d, arr)
+    while e != json.JSON_NONE {
+        if json.json_kind(d, e) == json.JSON_OBJECT {
+            let ok: bool = vec_push[PushEvent](&(*out).rows, PushEvent { id: gi(d, e, "id"), kind: gs(d, e, "type"),
+                    title: gs(d, e, "title"), body: gs(d, e, "body"), cid: gs(d, e, "cid"), at: gi(d, e, "at") })
+        }
+        e = json.json_next(d, e)
+    }
+    return true
 }
