@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/damage.fi -- DIRTY RECTANGLES: paint and present only what changed.
+//
+// A hover must never repaint the whole window. The host collects the
+// rectangle of the widgets that changed (ink bounds: the widget plus the
+// reach of its shadow and focus ring), the page is painted under a clip of
+// exactly that rectangle (scene.fi culls every subtree outside the clip,
+// painter.fi rasters no shape outside it) and only that rectangle goes to
+// the screen (window.image with an offset).
+//
+// A Damage is a rectangle in pixels or "everything". It only ever GROWS
+// until the frame is painted (dmg_reset): a second event in the same frame
+// widens it, any event that cannot name its rectangle makes it "full".
+//
+// Also here: the colour swap RGBA -> BGRX for a sub rectangle, two pixels
+// per 64-bit word (the old per-byte loop was the biggest single cost of a
+// CPU present).
+import std.rt
+
+export {
+    Damage, dmg_new, dmg_reset, dmg_full, dmg_add, dmg_is_full, dmg_is_empty,
+    dmg_clamp, dmg_rects, dmg_area, DMG_MAX, to_bgrx_rect, to_bgrx_words,
+}
+
+const DMG_MAX: usize = 4
+
+struct Damage {
+    x0: [f64; 4],
+    y0: [f64; 4],
+    x1: [f64; 4],
+    y1: [f64; 4],
+    n: usize,
+    full: bool,
+}
+
+fn dmg_new() -> Damage {
+    return Damage { x0: [0.0; 4], y0: [0.0; 4], x1: [0.0; 4], y1: [0.0; 4], n: 0, full: false }
+}
+
+fn dmg_reset(d: *mut Damage) {
+    (*d).n = 0
+    (*d).full = false
+}
+
+// Something changed that cannot be bounded: paint everything.
+fn dmg_full(d: *mut Damage) {
+    (*d).full = true
+}
+
+fn dmg_is_full(d: *mut Damage) -> bool { return (*d).full }
+fn dmg_is_empty(d: *mut Damage) -> bool { return !(*d).full && (*d).n == 0 }
+
+fn touches(d: *mut Damage, k: usize, x0: f64, y0: f64, x1: f64, y1: f64) -> bool {
+    return !(x1 < (*d).x0[k] || x0 > (*d).x1[k] || y1 < (*d).y0[k] || y0 > (*d).y1[k])
+}
+
+// Widen the damage by the rectangle (x0, y0)-(x1, y1). Rectangles that touch
+// are joined; at most DMG_MAX stay apart (more: all become their bounding
+// box). Two far-apart buttons are two small rectangles, not one big one.
+fn dmg_add(d: *mut Damage, x0: f64, y0: f64, x1: f64, y1: f64) {
+    if x1 <= x0 || y1 <= y0 {
+        return
+    }
+    var ax0: f64 = x0
+    var ay0: f64 = y0
+    var ax1: f64 = x1
+    var ay1: f64 = y1
+    // absorb every rectangle the new one touches (repeat: a grown one may
+    // now touch another)
+    var again: bool = true
+    while again {
+        again = false
+        var k: usize = 0
+        while k < (*d).n {
+            if touches(d, k, ax0, ay0, ax1, ay1) {
+                if (*d).x0[k] < ax0 { ax0 = (*d).x0[k] }
+                if (*d).y0[k] < ay0 { ay0 = (*d).y0[k] }
+                if (*d).x1[k] > ax1 { ax1 = (*d).x1[k] }
+                if (*d).y1[k] > ay1 { ay1 = (*d).y1[k] }
+                // remove k (move the last into its place)
+                let last: usize = (*d).n - 1
+                (*d).x0[k] = (*d).x0[last]
+                (*d).y0[k] = (*d).y0[last]
+                (*d).x1[k] = (*d).x1[last]
+                (*d).y1[k] = (*d).y1[last]
+                (*d).n = last
+                again = true
+            } else {
+                k = k + 1
+            }
+        }
+    }
+    if (*d).n >= DMG_MAX {
+        // too many: everything becomes one bounding box
+        var k: usize = 0
+        while k < (*d).n {
+            if (*d).x0[k] < ax0 { ax0 = (*d).x0[k] }
+            if (*d).y0[k] < ay0 { ay0 = (*d).y0[k] }
+            if (*d).x1[k] > ax1 { ax1 = (*d).x1[k] }
+            if (*d).y1[k] > ay1 { ay1 = (*d).y1[k] }
+            k = k + 1
+        }
+        (*d).n = 0
+    }
+    let n: usize = (*d).n
+    (*d).x0[n] = ax0
+    (*d).y0[n] = ay0
+    (*d).x1[n] = ax1
+    (*d).y1[n] = ay1
+    (*d).n = n + 1
+}
+
+// The damage as whole-pixel rectangles clipped to a w x h canvas, rounded
+// OUTWARDS (a soft edge reaches into the next pixel). out holds x0, y0, x1,
+// y1 per rectangle (x1/y1 exclusive). Returns how many; 0 = paint everything
+// (full, nothing noted, or all rectangles outside the canvas).
+fn dmg_rects(d: *mut Damage, w: usize, h: usize, out: *mut [i64; 16]) -> usize {
+    if (*d).full || (*d).n == 0 {
+        return 0
+    }
+    var m: usize = 0
+    var k: usize = 0
+    while k < (*d).n {
+        var x0: f64 = (*d).x0[k]
+        var y0: f64 = (*d).y0[k]
+        var x1: f64 = (*d).x1[k]
+        var y1: f64 = (*d).y1[k]
+        if x0 < 0.0 { x0 = 0.0 }
+        if y0 < 0.0 { y0 = 0.0 }
+        if x1 > (w as f64) { x1 = w as f64 }
+        if y1 > (h as f64) { y1 = h as f64 }
+        if x1 > x0 && y1 > y0 {
+            var ix1: i64 = x1 as i64
+            var iy1: i64 = y1 as i64
+            if (ix1 as f64) < x1 { ix1 = ix1 + 1 }
+            if (iy1 as f64) < y1 { iy1 = iy1 + 1 }
+            (*out)[m * 4] = x0 as i64
+            (*out)[m * 4 + 1] = y0 as i64
+            (*out)[m * 4 + 2] = ix1
+            (*out)[m * 4 + 3] = iy1
+            m = m + 1
+        }
+        k = k + 1
+    }
+    return m
+}
+
+// One rectangle: the bounding box of all of them (callers with one window
+// image per frame). False = paint everything.
+fn dmg_clamp(d: *mut Damage, w: usize, h: usize, out: *mut [i64; 4]) -> bool {
+    var rs: [i64; 16] = [0; 16]
+    let m: usize = dmg_rects(d, w, h, &rs)
+    if m == 0 {
+        return false
+    }
+    var x0: i64 = rs[0]
+    var y0: i64 = rs[1]
+    var x1: i64 = rs[2]
+    var y1: i64 = rs[3]
+    var k: usize = 1
+    while k < m {
+        if rs[k * 4] < x0 { x0 = rs[k * 4] }
+        if rs[k * 4 + 1] < y0 { y0 = rs[k * 4 + 1] }
+        if rs[k * 4 + 2] > x1 { x1 = rs[k * 4 + 2] }
+        if rs[k * 4 + 3] > y1 { y1 = rs[k * 4 + 3] }
+        k = k + 1
+    }
+    (*out)[0] = x0
+    (*out)[1] = y0
+    (*out)[2] = x1
+    (*out)[3] = y1
+    return true
+}
+
+fn dmg_area(r: *mut [i64; 4]) -> usize {
+    return (((*r)[2] - (*r)[0]) * ((*r)[3] - (*r)[1])) as usize
+}
+
+// RGBA (canvas order) -> BGRX (X server, Windows DIB) for `n` pixels, two at
+// a time: one 64-bit load, three masked shifts, one store. src and dst are
+// 4-byte aligned; an odd last pixel is done on its own.
+fn to_bgrx_words(src: u64, dst: u64, n: usize) {
+    let mg: u64 = 0x0000FF000000FF00
+    let mr: u64 = 0x000000FF000000FF
+    let mb: u64 = 0x00FF000000FF0000
+    var i: usize = 0
+    let pairs: usize = n / 2
+    var s: u64 = src
+    var d: u64 = dst
+    while i < pairs {
+        let q: u64 = *(s as *mut u64)
+        *(d as *mut u64) = ((q >> 16) & mr) | (q & mg) | ((q << 16) & mb)
+        s = s + 8
+        d = d + 8
+        i = i + 1
+    }
+    if (n & 1) != 0 {
+        let p: u32 = *(s as *mut u32)
+        *(d as *mut u32) = ((p >> 16) & 0xFF) | (p & 0xFF00) | ((p & 0xFF) << 16)
+    }
+}
+
+// The rectangle r (pixels) of a canvas `stride` pixels wide, converted into
+// the TIGHT buffer `dst` (rect width x rect height). This is what
+// window.image(f, dst, rw, rh, x0, y0) takes.
+fn to_bgrx_rect(src: u64, stride: usize, r: *mut [i64; 4], dst: u64) {
+    let rw: usize = ((*r)[2] - (*r)[0]) as usize
+    let rh: usize = ((*r)[3] - (*r)[1]) as usize
+    var y: usize = 0
+    while y < rh {
+        let so: u64 = src + ((((*r)[1] as usize + y) * stride + (*r)[0] as usize) * 4) as u64
+        to_bgrx_words(so, dst + (y * rw * 4) as u64, rw)
+        y = y + 1
+    }
+}

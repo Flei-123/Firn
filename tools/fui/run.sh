@@ -442,6 +442,17 @@ echo "== 18j. fUi TEMPO: DER DECKUNGS-CACHE UND DER CLIP AENDERN KEIN OKTETT =="
 "$W/tempo" 1240 5
 
 echo
+echo "== 18j2. fUi PERFORMANCE: PARTIAL REPAINT = SAME PIXELS, AND THE GATE =="
+# tools/fui/perfbench_main.fi: 400 random events, each painted partially
+# (dirty rectangles, lib/fui/damage.fi) and then in full -- the same pixels;
+# then tools/fui/perfgate.py against tools/fui/perf_baseline.json (>20 % worse
+# than the baseline, measured relative to a reference loop, fails).
+"$FIRNC" --opt-level=release-fast -o "$W/perfbench" tools/fui/perfbench_main.fi
+"$W/perfbench" 1240 720 21 verify
+"$W/perfbench" 1920 1080 21 verify
+python3 tools/fui/perfgate.py "$W/perfbench"
+
+echo
 echo "== 18k. SCHMELZGRUPPE: FORMEN VERSCHMELZEN, WENN SIE SICH NAEHERN =="
 # lib/fui/merge.fi (prototype r68): far apart the same octets as
 # the plain union, at k/2 the gap is ink, the tiles

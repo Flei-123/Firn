@@ -1,0 +1,686 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/perfbench_main.fi -- THE PERFORMANCE BENCH OF fUi (CPU raster, headless).
+//
+//   perfbench [width height [rounds [mode]]]      mode: full | damage
+//
+// One full page (a 100000-row virtual list, a grid of buttons, labels) is
+// driven through the SAME steps a window takes per frame: the event, the
+// layout, the paint, the colour swap RGBA -> BGRX (what window.image gets).
+// The X server round trip itself is not part of it (no display needed).
+//
+// Scenarios, each timed `rounds` times (default 21) after 3 warm-ups:
+//   hover   pointer moves from one button to another, input -> picture
+//   press   pointer button goes down on a button, input -> picture
+//   scroll  the 100000-row list scrolls three rows, input -> picture
+//   drag    a window layer (640x480) moves over the desktop: a whole present
+//   resize  the window changes size: canvas, layout, paint, swap
+//   idle    nothing happened: the frame loop must do NO work
+//
+// Output, one line per scenario (the gate tools/fui/perfgate.py reads it):
+//   PERF name=hover w=1240 h=720 median_us=.. p99_us=.. ref_us=.. norm=..
+//        painted_px=.. ctrl_px=..
+// `norm` = median / ref (a fixed integer + memory loop measured in the same
+// process), which is what the gate compares: stable under load.
+import std.rt
+import paint.canvas
+import font.metrics
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.viewport
+import fui.sheet
+import fui.scene
+import fui.widget
+import fui.flex
+import fui.vlist
+import fui.vlistview
+import fui.layer
+import fui.damage
+import plat.fuiwirt
+
+const NBTN: usize = 24
+static mut HOP_A: usize = 6
+static mut HOP_B: usize = 7
+static mut UNSTABLE: usize = 0
+static mut PARTS: usize = 0
+static mut T_LAY: i64 = 0
+static mut T_DRAW: i64 = 0
+static mut T_CONV: i64 = 0
+
+struct Page {
+    m: theme.Theme,
+    z: painter.Painter,
+    cv: canvas.Canvas,
+    c: render.Ctx,
+    sh: sheet.Sheet,
+    sc: scene.Scene,
+    host: fuiwirt.Host,
+    w: usize,
+    h: usize,
+    root: usize,
+    list: usize,
+    btn: [usize; 24],
+    v: vlist.Vlist,
+    bgrx: u64,
+    desk: layer.Bake,
+    win: layer.Bake,
+    dmg: damage.Damage,
+    font: u64,
+    painted_px: usize,
+}
+
+fn now_us() -> i64 {
+    var ts: [u64; 2] = [0; 2]
+    // SYS_clock_gettime = 228, CLOCK_MONOTONIC = 1
+    syscall(228, 1, (&ts[0]) as u64)
+    return (ts[0] as i64) * 1000000 + (ts[1] as i64) / 1000
+}
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_i(v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn say_f3(v: f64) {
+    // three decimals
+    var x: f64 = v
+    if x < 0.0 {
+        x = 0.0
+    }
+    let whole: i64 = x as i64
+    let frac: i64 = ((x - (whole as f64)) * 1000.0 + 0.5) as i64
+    say_i(whole + frac / 1000)
+    say(".")
+    let f: i64 = frac % 1000
+    if f < 100 { say("0") }
+    if f < 10 { say("0") }
+    say_i(f)
+}
+
+fn arg_num(p: u64) -> usize {
+    var v: usize = 0
+    var i: usize = 0
+    while rt.ld8(p, i) >= 48 as u8 && rt.ld8(p, i) <= 57 as u8 {
+        v = v * 10 + ((rt.ld8(p, i) - 48 as u8) as usize)
+        i = i + 1
+    }
+    return v
+}
+
+fn arg_is(p: u64, s: str) -> bool {
+    var i: usize = 0
+    while i < s.n {
+        if rt.ld8(p, i) != rt.ld8(s.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return rt.ld8(p, i) == 0 as u8
+}
+
+fn sort_i(a: *mut i64, n: usize) {
+    var i: usize = 1
+    while i < n {
+        var j: usize = i
+        while j > 0 && *((a as u64 + ((j - 1) * 8) as u64) as *mut i64) > *((a as u64 + (j * 8) as u64) as *mut i64) {
+            let x: i64 = *((a as u64 + (j * 8) as u64) as *mut i64)
+            *((a as u64 + (j * 8) as u64) as *mut i64) = *((a as u64 + ((j - 1) * 8) as u64) as *mut i64)
+            *((a as u64 + ((j - 1) * 8) as u64) as *mut i64) = x
+            j = j - 1
+        }
+        i = i + 1
+    }
+}
+
+// THE REFERENCE: a fixed integer loop plus a 4 MiB copy -- the same work
+// every run, so the ratio median / ref survives a loaded machine.
+fn reference_us() -> i64 {
+    let buf: u64 = rt.heap_alloc(4194304 * 2)
+    var best: i64 = 0 - 1
+    var r: usize = 0
+    while r < 7 {
+        let a: i64 = now_us()
+        var x: u64 = 88172645463325252
+        var i: usize = 0
+        while i < 2000000 {
+            x = x ^ (x << 13)
+            x = x ^ (x >> 7)
+            x = x ^ (x << 17)
+            i = i + 1
+        }
+        rt.mem_copy(buf + 4194304, buf, 4194304)
+        *(buf as *mut u64) = x
+        let t: i64 = now_us() - a
+        if best < 0 || t < best {
+            best = t
+        }
+        r = r + 1
+    }
+    return best
+}
+
+// ---------------------------------------------------------------- the page
+
+fn put_dec(r: *mut vlist.VRow, v: usize) {
+    var tmp: [u8; 20] = [0; 20]
+    var k: usize = 0
+    var x: usize = v
+    if x == 0 {
+        tmp[0] = 48 as u8
+        k = 1
+    }
+    while x > 0 {
+        tmp[k] = (48 + (x % 10)) as u8
+        x = x / 10
+        k = k + 1
+    }
+    var n: usize = (*r).n
+    var j: usize = k
+    while j > 0 {
+        j = j - 1
+        (*r).text[n] = tmp[j]
+        n = n + 1
+    }
+    (*r).n = n
+}
+
+fn row_of(ud: u64, i: usize, out: *mut vlist.VRow) {
+    vlist.vrow_text(out, "item ")
+    put_dec(out, i)
+}
+
+fn list_draw(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let p: *mut Page = ud as *mut Page
+    let v: *mut vlist.Vlist = &(*p).v
+    let rh: f64 = vlistview.vv_row_px(c, 0)
+    if vlist.vl_row_height(v) != rh {
+        vlist.vl_set_row_height(v, rh)
+    }
+    let mv: bool = vlistview.vv_paint(v, c, e, false, ud, row_of)
+}
+
+fn setup_canvas(p: *mut Page, w: usize, h: usize) -> bool {
+    (*p).w = w
+    (*p).h = h
+    (*p).z = painter.painter_new()
+    (*p).cv = canvas.canvas_new()
+    if !canvas.canvas_init(&(*p).cv, w, h) || !painter.painter_init(&(*p).z, &(*p).cv, w, h) {
+        return false
+    }
+    painter.painter_set_font(&(*p).z, (*p).font)
+    (*p).c = render.ctx_new(&(*p).m, &(*p).z)
+    (*p).bgrx = rt.heap_alloc(w * h * 4 + 64)
+    return true
+}
+
+fn page_new(w: usize, h: usize, font: u64) -> *mut Page {
+    let p: *mut Page = rt.heap_alloc(16 << 20) as *mut Page
+    (*p).font = font
+    (*p).m = theme.theme_new(true)
+    if !setup_canvas(p, w, h) {
+        return 0 as u64 as *mut Page
+    }
+    (*p).sh = sheet.sheet_new()
+    (*p).sc = scene.scene_new()
+    (*p).v = vlist.vl_new()
+    vlist.vl_set_count(&(*p).v, 100000)
+    (*p).dmg = damage.dmg_new()
+    (*p).root = scene.scene_box(&(*p).sc, scene.SCENE_NONE, 0 as u32,
+        flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_START)
+    scene.node_set_gap(&(*p).sc, (*p).root, 16, 16)
+    scene.node_set_padding(&(*p).sc, (*p).root, 12, 12, 12, 12)
+    (*p).list = scene.scene_add(&(*p).sc, (*p).root, scene.N_WIDGET)
+    scene.node_set_widget_kind(&(*p).sc, (*p).list, widget.KIND_LIST)
+    scene.node_set_draw(&(*p).sc, (*p).list, p as u64, list_draw)
+    let col: usize = scene.scene_box(&(*p).sc, (*p).root, 0 as u32,
+        flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_START)
+    scene.node_set_gap(&(*p).sc, col, 10, 10)
+    let t: usize = scene.scene_widget(&(*p).sc, col, widget.KIND_LABEL, "Settings".p as u64, 8)
+    var r: usize = 0
+    var k: usize = 0
+    while r < 6 {
+        let rowb: usize = scene.scene_box(&(*p).sc, col, 0 as u32,
+            flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_START)
+        scene.node_set_gap(&(*p).sc, rowb, 10, 10)
+        var q: usize = 0
+        while q < 4 {
+            let b: usize = scene.scene_widget(&(*p).sc, rowb, widget.KIND_BUTTON, "Apply".p as u64, 5)
+            scene.node_set_size(&(*p).sc, b, 120.0, 36.0)
+            (*p).btn[k] = b
+            k = k + 1
+            q = q + 1
+        }
+        r = r + 1
+    }
+    let sl: usize = scene.scene_widget(&(*p).sc, col, widget.KIND_SLIDER, "".p as u64, 0)
+    scene.node_set_size(&(*p).sc, sl, 540.0, 28.0)
+    let pr: usize = scene.scene_widget(&(*p).sc, col, widget.KIND_PROGRESS, "".p as u64, 0)
+    scene.node_set_size(&(*p).sc, pr, 540.0, 16.0)
+    scene.node_set_size(&(*p).sc, (*p).list, (w as f64) * 0.42, (h as f64) - 24.0)
+    (*p).host = fuiwirt.host_new(&(*p).sc, &(*p).c)
+    (*p).desk = layer.bake_new()
+    (*p).win = layer.bake_new()
+    return p
+}
+
+fn page_layout(p: *mut Page) {
+    scene.scene_style(&(*p).sc, &(*p).sh)
+    scene.scene_measure(&(*p).sc, &(*p).c)
+    scene.scene_layout(&(*p).sc, &(*p).c, 0.0, 0.0, (*p).w as f64, (*p).h as f64)
+    fuiwirt.host_bind(&(*p).host)
+}
+
+fn base_of(p: *mut Page) -> u32 {
+    return theme.opaque(render.color_of(&(*p).c, style.color_token(style.TOK_BASE)))
+}
+
+// ONE WINDOW FRAME, the way app_paint + fuiwin do it. `part` = paint and
+// swap only the rectangle r (mode damage); otherwise the whole window.
+// Returns the pixels painted.
+fn frame_full(p: *mut Page) -> usize {
+    canvas.canvas_clear(&(*p).cv, base_of(p))
+    scene.scene_run(&(*p).sc, &(*p).c, &(*p).sh, 0.0, 0.0, (*p).w as f64, (*p).h as f64)
+    damage.to_bgrx_words(canvas.canvas_pixels(&(*p).cv) as u64, (*p).bgrx, (*p).w * (*p).h)
+    fuiwirt.host_painted(&(*p).host)
+    return (*p).w * (*p).h
+}
+
+fn frame_part(p: *mut Page, rs: *mut [i64; 16], m: usize) -> usize {
+    let cvp: *mut canvas.Canvas = &(*p).cv
+    let ta: i64 = now_us()
+    let stable: bool = scene.scene_layout_stable(&(*p).sc, &(*p).c, &(*p).sh, 0.0, 0.0, (*p).w as f64, (*p).h as f64)
+    T_LAY = T_LAY + (now_us() - ta)
+    if !stable {
+        // the layout moved something: the rectangles are not enough
+        UNSTABLE = UNSTABLE + 1
+        canvas.canvas_clear(cvp, base_of(p))
+        scene.scene_draw(&(*p).sc, &(*p).c)
+        damage.to_bgrx_words(canvas.canvas_pixels(cvp) as u64, (*p).bgrx, (*p).w * (*p).h)
+        fuiwirt.host_painted(&(*p).host)
+        return (*p).w * (*p).h
+    }
+    PARTS = PARTS + 1
+    var px: usize = 0
+    var k: usize = 0
+    while k < m {
+        var r: [i64; 4] = [(*rs)[k * 4], (*rs)[k * 4 + 1], (*rs)[k * 4 + 2], (*rs)[k * 4 + 3]]
+        let pushed: bool = canvas.clip_push_rect(cvp, r[0] as f64, r[1] as f64,
+            r[2] as f64, r[3] as f64)
+        canvas.canvas_fill_rect(cvp, r[0] as f64, r[1] as f64, r[2] as f64,
+            r[3] as f64, base_of(p))
+        let tb: i64 = now_us()
+        scene.scene_draw(&(*p).sc, &(*p).c)
+        T_DRAW = T_DRAW + (now_us() - tb)
+        if pushed {
+            canvas.clip_pop(cvp)
+        }
+        // each rectangle goes to the screen on its own (window.image at x0, y0)
+        let tc: i64 = now_us()
+        damage.to_bgrx_rect(canvas.canvas_pixels(cvp) as u64, (*p).w, &r, (*p).bgrx)
+        T_CONV = T_CONV + (now_us() - tc)
+        px = px + damage.dmg_area(&r)
+        k = k + 1
+    }
+    fuiwirt.host_painted(&(*p).host)
+    return px
+}
+
+// the frame as the window loop runs it: nothing dirty = nothing at all
+fn frame(p: *mut Page, damaged: bool) -> usize {
+    if !fuiwirt.host_dirty(&(*p).host) {
+        return 0
+    }
+    if damaged {
+        var rs: [i64; 16] = [0; 16]
+        let m: usize = fuiwirt.host_damage_rects(&(*p).host, (*p).w, (*p).h, &rs)
+        if m > 0 {
+            return frame_part(p, &rs, m)
+        }
+    }
+    return frame_full(p)
+}
+
+fn report(name: str, p: *mut Page, t: *mut i64, n: usize, refus: i64, painted: usize, ctrl: usize) {
+    sort_i(t, n)
+    let med: i64 = *((t as u64 + ((n / 2) * 8) as u64) as *mut i64)
+    var i99: usize = (n * 99) / 100
+    if i99 >= n { i99 = n - 1 }
+    let p99: i64 = *((t as u64 + (i99 * 8) as u64) as *mut i64)
+    say("PERF name=")
+    say(name)
+    say(" w=")
+    say_i((*p).w as i64)
+    say(" h=")
+    say_i((*p).h as i64)
+    say(" median_us=")
+    say_i(med)
+    say(" p99_us=")
+    say_i(p99)
+    say(" ref_us=")
+    say_i(refus)
+    say(" norm=")
+    say_f3((med as f64) / (refus as f64))
+    say(" painted_px=")
+    say_i(painted as i64)
+    say(" ctrl_px=")
+    say_i(ctrl as i64)
+    say(" part_frames=")
+    say_i(PARTS as i64)
+    say(" full_by_layout=")
+    say_i(UNSTABLE as i64)
+    say(" t_layout_us=")
+    say_i(T_LAY / ((PARTS + 1) as i64))
+    say(" t_draw_us=")
+    say_i(T_DRAW / ((PARTS + 1) as i64))
+    say(" t_conv_us=")
+    say_i(T_CONV / ((PARTS + 1) as i64))
+    T_LAY = 0
+    T_DRAW = 0
+    T_CONV = 0
+    PARTS = 0
+    UNSTABLE = 0
+    say("\n")
+}
+
+fn btn_cx(p: *mut Page, k: usize) -> f64 {
+    return scene.node_x(&(*p).sc, (*p).btn[k]) + scene.node_w(&(*p).sc, (*p).btn[k]) / 2.0
+}
+
+fn btn_cy(p: *mut Page, k: usize) -> f64 {
+    return scene.node_y(&(*p).sc, (*p).btn[k]) + scene.node_h(&(*p).sc, (*p).btn[k]) / 2.0
+}
+
+fn ctrl_area(p: *mut Page, k: usize) -> usize {
+    return (scene.node_w(&(*p).sc, (*p).btn[k]) * scene.node_h(&(*p).sc, (*p).btn[k])) as usize
+}
+
+fn settle(p: *mut Page, damaged: bool) {
+    // paint the pending state once, whatever it needs
+    fuiwirt.host_touch(&(*p).host)
+    let u: usize = frame_full(p)
+}
+
+fn bench_hover(p: *mut Page, rounds: usize, refus: i64, damaged: bool) {
+    var t: [i64; 64] = [0; 64]
+    var painted: usize = 0
+    settle(p, damaged)
+    // park the pointer on button 0, then hop 0 -> 9 -> 0 ...
+    let c0: u32 = fuiwirt.host_pointer_move(&(*p).host, btn_cx(p, HOP_B), btn_cy(p, HOP_B))
+    let u: usize = frame(p, damaged)
+    var i: usize = 0
+    while i < rounds + 3 {
+        var k: usize = HOP_A
+        if (i & 1) == 1 { k = HOP_B }
+        let a: i64 = now_us()
+        let c: u32 = fuiwirt.host_pointer_move(&(*p).host, btn_cx(p, k), btn_cy(p, k))
+        painted = frame(p, damaged)
+        let b: i64 = now_us()
+        if i >= 3 { t[i - 3] = b - a }
+        i = i + 1
+    }
+    report("hover", p, &t[0], rounds, refus, painted, ctrl_area(p, 0))
+}
+
+fn bench_press(p: *mut Page, rounds: usize, refus: i64, damaged: bool) {
+    var t: [i64; 64] = [0; 64]
+    var painted: usize = 0
+    settle(p, damaged)
+    let c0: u32 = fuiwirt.host_pointer_move(&(*p).host, btn_cx(p, 5), btn_cy(p, 5))
+    let u: usize = frame(p, damaged)
+    var i: usize = 0
+    while i < rounds + 3 {
+        let a: i64 = now_us()
+        let c: u32 = fuiwirt.host_pointer_down(&(*p).host, btn_cx(p, 5), btn_cy(p, 5), fuiwirt.BTN_LEFT)
+        painted = frame(p, damaged)
+        let b: i64 = now_us()
+        if i >= 3 { t[i - 3] = b - a }
+        // release OUTSIDE the button (no activation), come back
+        let d: u32 = fuiwirt.host_pointer_up(&(*p).host, 2.0, 2.0, fuiwirt.BTN_LEFT)
+        let e: usize = frame(p, damaged)
+        let f: u32 = fuiwirt.host_pointer_move(&(*p).host, btn_cx(p, 5), btn_cy(p, 5))
+        let g: usize = frame(p, damaged)
+        i = i + 1
+    }
+    report("press", p, &t[0], rounds, refus, painted, ctrl_area(p, 5))
+}
+
+fn bench_scroll(p: *mut Page, rounds: usize, refus: i64, damaged: bool) {
+    var t: [i64; 64] = [0; 64]
+    var painted: usize = 0
+    settle(p, damaged)
+    let vp: *mut viewport.Viewport = vlist.vl_viewport(&(*p).v)
+    var off: f64 = 100000.0
+    var i: usize = 0
+    while i < rounds + 3 {
+        off = off + 72.0
+        let a: i64 = now_us()
+        viewport.viewport_set_offset(vp, 0.0, off)
+        fuiwirt.host_touch_rect(&(*p).host, scene.node_x(&(*p).sc, (*p).list),
+            scene.node_y(&(*p).sc, (*p).list),
+            scene.node_x(&(*p).sc, (*p).list) + scene.node_w(&(*p).sc, (*p).list),
+            scene.node_y(&(*p).sc, (*p).list) + scene.node_h(&(*p).sc, (*p).list))
+        painted = frame(p, damaged)
+        let b: i64 = now_us()
+        if i >= 3 { t[i - 3] = b - a }
+        i = i + 1
+    }
+    report("scroll", p, &t[0], rounds, refus, painted,
+        (scene.node_w(&(*p).sc, (*p).list) * scene.node_h(&(*p).sc, (*p).list)) as usize)
+}
+
+// A WINDOW DRAGGED over the desktop: the desktop and the window are layers
+// (layer.Bake), every frame copies the desktop under the old and new place
+// and lays the window layer at the new place. Full = the whole screen.
+fn bench_drag(p: *mut Page, rounds: usize, refus: i64, damaged: bool) {
+    var t: [i64; 64] = [0; 64]
+    var painted: usize = 0
+    let ww: usize = 640
+    let wh: usize = 480
+    let ok1: bool = layer.bake_start(&(*p).desk, (*p).w, (*p).h, 1 as u64, base_of(p), &(*p).z)
+    let ok2: bool = layer.bake_start(&(*p).win, ww, wh, 2 as u64, 4281545523 as u32, &(*p).z)
+    canvas.canvas_fill_rect(layer.bake_canvas(&(*p).win), 0.0, 0.0, 640.0, 40.0, 4283782485 as u32)
+    var ox: usize = 100
+    var oy: usize = 80
+    var i: usize = 0
+    while i < rounds + 3 {
+        let nx: usize = ox + 14
+        let ny: usize = oy + 6
+        let a: i64 = now_us()
+        // damage = old rect + new rect (one bounding box)
+        var r: [i64; 4] = [0; 4]
+        r[0] = ox as i64
+        r[1] = oy as i64
+        r[2] = (nx + ww) as i64
+        r[3] = (ny + wh) as i64
+        if !damaged {
+            r[0] = 0
+            r[1] = 0
+            r[2] = (*p).w as i64
+            r[3] = (*p).h as i64
+        }
+        // desktop under the damage: rows copied from the bake
+        let dst: u64 = canvas.canvas_pixels(&(*p).cv) as u64
+        let src: u64 = canvas.canvas_pixels(layer.bake_canvas(&(*p).desk)) as u64
+        var y: i64 = r[1]
+        while y < r[3] {
+            let off: u64 = (((y as usize) * (*p).w + (r[0] as usize)) * 4) as u64
+            rt.mem_copy(dst + off, src + off, ((r[2] - r[0]) as usize) * 4)
+            y = y + 1
+        }
+        // the window layer at the new place (opaque rows)
+        let ws: u64 = canvas.canvas_pixels(layer.bake_canvas(&(*p).win)) as u64
+        var wy: usize = 0
+        while wy < wh {
+            rt.mem_copy(dst + (((ny + wy) * (*p).w + nx) * 4) as u64, ws + (wy * ww * 4) as u64, ww * 4)
+            wy = wy + 1
+        }
+        damage.to_bgrx_rect(dst, (*p).w, &r, (*p).bgrx)
+        painted = damage.dmg_area(&r)
+        let b: i64 = now_us()
+        if i >= 3 { t[i - 3] = b - a }
+        ox = nx
+        oy = ny
+        if ox > 400 { ox = 100 }
+        if oy > 200 { oy = 80 }
+        i = i + 1
+    }
+    report("drag", p, &t[0], rounds, refus, painted, ww * wh)
+}
+
+fn bench_resize(p: *mut Page, rounds: usize, refus: i64, damaged: bool) {
+    var t: [i64; 64] = [0; 64]
+    let w0: usize = (*p).w
+    let h0: usize = (*p).h
+    var i: usize = 0
+    while i < rounds + 3 {
+        var w: usize = w0
+        var h: usize = h0
+        if (i & 1) == 1 {
+            w = w0 - 40
+            h = h0 - 30
+        }
+        let a: i64 = now_us()
+        canvas.canvas_free(&(*p).cv)
+        (*p).w = w
+        (*p).h = h
+        let ok: bool = canvas.canvas_init(&(*p).cv, w, h)
+        let ok2: bool = painter.painter_init(&(*p).z, &(*p).cv, w, h)
+        painter.painter_set_font(&(*p).z, (*p).font)
+        scene.node_set_size(&(*p).sc, (*p).list, (w as f64) * 0.42, (h as f64) - 24.0)
+        fuiwirt.host_resize(&(*p).host)
+        let u: usize = frame_full(p)
+        let b: i64 = now_us()
+        if i >= 3 { t[i - 3] = b - a }
+        i = i + 1
+    }
+    report("resize", p, &t[0], rounds, refus, (*p).w * (*p).h, (*p).w * (*p).h)
+}
+
+fn bench_idle(p: *mut Page, rounds: usize, refus: i64, damaged: bool) {
+    var t: [i64; 64] = [0; 64]
+    settle(p, damaged)
+    var painted: usize = 0
+    var i: usize = 0
+    while i < rounds + 3 {
+        let a: i64 = now_us()
+        // what the window loop does with no event: tick, ask dirty, paint if so
+        fuiwirt.host_tick(&(*p).host, 1000 + (i as i64) * 16)
+        painted = painted + frame(p, damaged)
+        let b: i64 = now_us()
+        if i >= 3 { t[i - 3] = b - a }
+        i = i + 1
+    }
+    report("idle", p, &t[0], rounds, refus, painted, 0)
+}
+
+// CORRECTNESS: a partial repaint must give the SAME PIXELS as a full one.
+// 400 random events (moves, presses, releases, scrolls); after each one the
+// frame is painted partially, the canvas is copied, then the whole window is
+// painted again and compared.
+fn verify(p: *mut Page) -> usize {
+    settle(p, true)
+    let n: usize = (*p).w * (*p).h * 4
+    let snap: u64 = rt.heap_alloc(n)
+    var seed: u64 = 0x2545F4914F6CDD1D
+    let vp: *mut viewport.Viewport = vlist.vl_viewport(&(*p).v)
+    var off: f64 = 5000.0
+    var bad: usize = 0
+    var partial: usize = 0
+    var i: usize = 0
+    while i < 400 {
+        seed = seed ^ (seed << 13)
+        seed = seed ^ (seed >> 7)
+        seed = seed ^ (seed << 17)
+        let op: u64 = (seed >> 8) % 6
+        let kb: usize = ((seed >> 20) % (NBTN as u64)) as usize
+        if op == 0 || op == 1 {
+            let c: u32 = fuiwirt.host_pointer_move(&(*p).host, btn_cx(p, kb), btn_cy(p, kb))
+        } else if op == 2 {
+            let c: u32 = fuiwirt.host_pointer_move(&(*p).host, ((seed >> 30) % 1200) as f64, ((seed >> 44) % 700) as f64)
+        } else if op == 3 {
+            let c: u32 = fuiwirt.host_pointer_down(&(*p).host, btn_cx(p, kb), btn_cy(p, kb), fuiwirt.BTN_LEFT)
+        } else if op == 4 {
+            let c: u32 = fuiwirt.host_pointer_up(&(*p).host, ((seed >> 30) % 1200) as f64, ((seed >> 44) % 700) as f64, fuiwirt.BTN_LEFT)
+        } else {
+            off = off + 48.0
+            viewport.viewport_set_offset(vp, 0.0, off)
+            fuiwirt.host_touch_rect(&(*p).host, scene.node_x(&(*p).sc, (*p).list),
+                scene.node_y(&(*p).sc, (*p).list),
+                scene.node_x(&(*p).sc, (*p).list) + scene.node_w(&(*p).sc, (*p).list),
+                scene.node_y(&(*p).sc, (*p).list) + scene.node_h(&(*p).sc, (*p).list))
+        }
+        let px: usize = frame(p, true)
+        if px != 0 && px < (*p).w * (*p).h { partial = partial + 1 }
+        rt.mem_copy(snap, canvas.canvas_pixels(&(*p).cv) as u64, n)
+        fuiwirt.host_touch(&(*p).host)
+        let q: usize = frame_full(p)
+        if !rt.mem_eq(snap, canvas.canvas_pixels(&(*p).cv) as u64, n) {
+            bad = bad + 1
+        }
+        i = i + 1
+    }
+    say("VERIFY events=400 partial_frames=")
+    say_i(partial as i64)
+    say(" mismatches=")
+    say_i(bad as i64)
+    say("\n")
+    return bad
+}
+
+fn main(start: u64) -> i32 {
+    var width: usize = 1240
+    var height: usize = 720
+    var rounds: usize = 21
+    var damaged: bool = false
+    if rt.arg_count(start) >= 3 {
+        width = arg_num(rt.arg_ptr(start, 1))
+        height = arg_num(rt.arg_ptr(start, 2))
+    }
+    if rt.arg_count(start) >= 4 {
+        rounds = arg_num(rt.arg_ptr(start, 3))
+    }
+    if rt.arg_count(start) >= 5 {
+        damaged = arg_is(rt.arg_ptr(start, 4), "damage")
+    }
+    if rt.arg_count(start) >= 7 {
+        HOP_A = arg_num(rt.arg_ptr(start, 5))
+        HOP_B = arg_num(rt.arg_ptr(start, 6))
+    }
+    if rounds > 60 { rounds = 60 }
+    if rounds < 5 { rounds = 5 }
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    if !rt.read_file((&f1[0]) as u64, &fbuf) {
+        say("perfbench: no font\n")
+        return 9
+    }
+    let fsp: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    *fsp = metrics.fontset_new()
+    if !metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+        return 9
+    }
+    let p: *mut Page = page_new(width, height, fsp as u64)
+    if p as u64 == 0 {
+        return 4
+    }
+    page_layout(p)
+    if rt.arg_count(start) >= 5 && arg_is(rt.arg_ptr(start, 4), "verify") {
+        if verify(p) != 0 { return 1 }
+        return 0
+    }
+    let refus: i64 = reference_us()
+    bench_hover(p, rounds, refus, damaged)
+    bench_press(p, rounds, refus, damaged)
+    bench_scroll(p, rounds, refus, damaged)
+    bench_drag(p, rounds, refus, damaged)
+    bench_idle(p, rounds, refus, damaged)
+    bench_resize(p, rounds, refus, damaged)
+    return 0
+}
