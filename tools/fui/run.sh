@@ -574,6 +574,11 @@ build animbench
 tail -n 40 "$W/animbench.out"
 
 echo
+echo "== W7. GLIDE: toggle/check/radio/slider/scrollbar channels, overscroll, dirty rect =="
+build glide
+"$W/glide"
+
+echo
 echo "== 18g. ORPHANED TRANSITION ENTRIES ARE GIVEN BACK (r115) =="
 # a full registry hands the slot of an entry nobody asked for during 2 s to a
 # newcomer; counter-checks: nothing stale = refused, ten live widgets keep theirs
