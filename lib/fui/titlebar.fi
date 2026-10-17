@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/titlebar.fi -- THE WINDOWS 11 TITLE BAR.
+//
+// One strip, 32 high, over the full width of a window the app draws its
+// own frame for:
+//
+//   [ title 12 px ................................ [_] [ ] [X] ]
+//
+// Metrics (design points, Windows 11 / Fluent 2):
+//   bar 32 high        title 12 px, 12 from the left edge
+//   caption buttons 46 x 32 (minimize, maximize / restore, close)
+//   glyphs 10 x 10, 1 point stroke
+//   hover:   minimize / maximize get the subtle hover face,
+//            close gets the Windows red (#C42B1C) with a white glyph
+//   pressed: one step further (close #B22A1B)
+//   active / inactive: an inactive window dims the title and the glyphs
+//            and lifts the bar a little towards the surface colour
+//   drag area: everything left of the caption buttons
+//
+// WHAT THIS DOES NOT DO: it moves no window. `titlebar_hit` says which
+// part is under the pointer; the host starts a move / resize / close from
+// that (the same split as ctxmenu: this file paints and answers questions,
+// the platform layer acts).
+import fui.style
+import fui.theme
+import fui.painter
+import fui.widget
+import fui.render
+import fui.icons
+import fui.lucide
+
+const TB_H: usize = 32
+const TB_BTN_W: usize = 46
+const TB_TITLE_PX: usize = 12
+const TB_TITLE_PAD: usize = 12
+const TB_GLYPH: usize = 10
+
+// What is under a point (titlebar_hit) and what is hovered / pressed.
+const TB_NONE: u32 = 0
+const TB_MIN: u32 = 1
+const TB_MAX: u32 = 2
+const TB_CLOSE: u32 = 3
+const TB_DRAG: u32 = 4
+
+// The red of the close button, the same in the light and the dark scheme.
+const TB_RED: u32 = 0xFFC42B1C as u32
+const TB_RED_PRESSED: u32 = 0xFFB22A1B as u32
+const TB_WHITE: u32 = 0xFFFFFFFF as u32
+
+fn titlebar_height(c: *mut render.Ctx) -> f64 {
+    return render.len_of(c, TB_H)
+}
+
+// The rectangle of a caption button in a bar at (x, y) of width w.
+// Order from the right: close, maximize, minimize. False for any other part.
+fn titlebar_button_rect(c: *mut render.Ctx, x: f64, y: f64, w: f64,
+    part: u32, ox: *mut f64, oy: *mut f64, ow: *mut f64, oh: *mut f64) -> bool {
+    var slot: usize = 0
+    if part == TB_CLOSE {
+        slot = 1
+    } else if part == TB_MAX {
+        slot = 2
+    } else if part == TB_MIN {
+        slot = 3
+    } else {
+        return false
+    }
+    let bw: f64 = render.len_of(c, TB_BTN_W)
+    *ox = x + w - bw * (slot as f64)
+    *oy = y
+    *ow = bw
+    *oh = titlebar_height(c)
+    return true
+}
+
+// Which part of the bar is at (px, py)? TB_NONE outside the bar.
+fn titlebar_hit(c: *mut render.Ctx, x: f64, y: f64, w: f64,
+    px: f64, py: f64) -> u32 {
+    if px < x || px >= x + w || py < y || py >= y + titlebar_height(c) {
+        return TB_NONE
+    }
+    var part: u32 = TB_MIN
+    while part <= TB_CLOSE {
+        var bx: f64 = 0.0
+        var by: f64 = 0.0
+        var bw: f64 = 0.0
+        var bh: f64 = 0.0
+        if titlebar_button_rect(c, x, y, w, part, &bx, &by, &bw, &bh) {
+            if px >= bx && px < bx + bw {
+                return part
+            }
+        }
+        part = part + 1 as u32
+    }
+    return TB_DRAG
+}
+
+// The ground of the bar: the page colour while the window is active, a
+// step towards the surface while it is not (Windows lifts the Mica).
+fn titlebar_ground(c: *mut render.Ctx, active: bool) -> u32 {
+    let m: *mut theme.Theme = render.ctx_theme(c)
+    var tk: u32 = style.TOK_BASE
+    if !active {
+        tk = style.TOK_SURFACE
+    }
+    return theme.opaque(theme.color_from_token(m, tk))
+}
+
+fn tok(c: *mut render.Ctx, t: u32) -> u32 {
+    return theme.opaque(theme.color_from_token(render.ctx_theme(c), t))
+}
+
+// One 1 point stroke glyph, centred in a button at (bx, by, bw, bh).
+fn paint_glyph(c: *mut render.Ctx, part: u32, maximized: bool, bx: f64,
+    by: f64, bw: f64, bh: f64, col: u32, ground: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let g: f64 = render.len_of(c, TB_GLYPH)
+    let one: f64 = render.len_of(c, 1)
+    let gx: f64 = ((bx + (bw - g) / 2.0 + 0.5) as i64) as f64
+    let gy: f64 = ((by + (bh - g) / 2.0 + 0.5) as i64) as f64
+    if part == TB_MIN {
+        painter.surface(z, gx, gy + g / 2.0, g, one, col)
+        return
+    }
+    if part == TB_MAX {
+        if !maximized {
+            painter.round_ring(z, gx, gy, g, g, one, one, col)
+            return
+        }
+        // restore: the back square peeks out top right of the front one
+        let s: f64 = g - 2.0 * one
+        painter.round_ring(z, gx + 2.0 * one, gy, s, s, one, one, col)
+        painter.round_rect(z, gx, gy + 2.0 * one, s, s, one, ground)
+        painter.round_ring(z, gx, gy + 2.0 * one, s, s, one, one, col)
+        return
+    }
+    // close: the cross of the icon set. Its strokes span half of the icon
+    // box (6..18 of 24) and the round caps add the stroke width, so a box of
+    // 1.6 x the glyph paints a cross that measures 10 points.
+    let ib: f64 = g * 1.6
+    icons.icon_stroke(z, lucide.X, gx - (ib - g) / 2.0, gy - (ib - g) / 2.0, ib,
+        col, icons.STROKE_DEFAULT)
+}
+
+// One caption button: its face (hover / pressed) and its glyph.
+fn paint_caption(c: *mut render.Ctx, part: u32, maximized: bool, active: bool,
+    state: u32, bx: f64, by: f64, bw: f64, bh: f64, ground: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var glyph: u32 = tok(c, style.TOK_TEXT)
+    if !active {
+        glyph = tok(c, style.TOK_TEXT_MUTED)
+    }
+    var face: u32 = ground
+    // state: 0 rest, 1 hover, 2 pressed
+    if state == 1 as u32 {
+        if part == TB_CLOSE {
+            face = TB_RED
+            glyph = TB_WHITE
+        } else {
+            face = tok(c, style.TOK_BUTTON_HOVER)
+            glyph = tok(c, style.TOK_TEXT)
+        }
+    } else if state == 2 as u32 {
+        if part == TB_CLOSE {
+            face = TB_RED_PRESSED
+            glyph = TB_WHITE
+        } else {
+            face = tok(c, style.TOK_BUTTON_ACTIVE)
+            glyph = tok(c, style.TOK_TEXT)
+        }
+    }
+    if face != ground {
+        painter.surface(z, bx, by, bw, bh, face)
+    }
+    paint_glyph(c, part, maximized, bx, by, bw, bh, glyph, face)
+}
+
+// The whole bar at (x, y), width w. `hover` is the part under the pointer
+// (TB_NONE / TB_MIN / TB_MAX / TB_CLOSE), `pressed` the part held down.
+// `title` is cut to the free space left of the caption buttons.
+fn titlebar_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, title: str,
+    active: bool, maximized: bool, hover: u32, pressed: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let h: f64 = titlebar_height(c)
+    let ground: u32 = titlebar_ground(c, active)
+    painter.surface(z, x, y, w, h, ground)
+
+    var part: u32 = TB_MIN
+    while part <= TB_CLOSE {
+        var bx: f64 = 0.0
+        var by: f64 = 0.0
+        var bw: f64 = 0.0
+        var bh: f64 = 0.0
+        if titlebar_button_rect(c, x, y, w, part, &bx, &by, &bw, &bh) {
+            var st: u32 = 0 as u32
+            if pressed == part {
+                st = 2 as u32
+            } else if hover == part && pressed == TB_NONE {
+                st = 1 as u32
+            }
+            paint_caption(c, part, maximized, active, st, bx, by, bw, bh, ground)
+        }
+        part = part + 1 as u32
+    }
+
+    if title.n > 0 {
+        let pad: f64 = render.len_of(c, TB_TITLE_PAD)
+        var cx: f64 = 0.0
+        var cy: f64 = 0.0
+        var cw: f64 = 0.0
+        var ch: f64 = 0.0
+        titlebar_button_rect(c, x, y, w, TB_MIN, &cx, &cy, &cw, &ch)
+        // a style colour (token), not a resolved one: the label resolves it
+        var fg: u32 = style.color_token(style.TOK_TEXT)
+        if !active {
+            fg = style.color_token(style.TOK_TEXT_MUTED)
+        }
+        var l: widget.Widget = widget.widget_new(widget.KIND_LABEL)
+        widget.w_place(&l, x + pad, y, cx - x - pad - pad / 2.0, h)
+        widget.w_set_text(&l, title.p as u64, title.n)
+        let s: *mut style.Style = widget.w_style(&l)
+        *s = style.style_set_pad(*s, 0, 0)
+        *s = style.style_set_fg(*s, fg)
+        *s = style.style_set_align(*s, style.ALIGN_LEFT)
+        *s = style.style_set_font(*s, 0, TB_TITLE_PX)
+        render.draw_text(c, &l)
+    }
+}
