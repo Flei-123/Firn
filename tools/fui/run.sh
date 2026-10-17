@@ -719,6 +719,9 @@ build anim
 "$W/anim" | tail -n 3
 build kita11y
 "$W/kita11y" | tail -n 3
+# W16: mnemonics (Alt+letter, '&'), Tab order end to end, shortcut management
+build w16
+"$W/w16" | tail -n 3
 # W5: the whole keyboard (Tab/Space/Enter/arrows/Esc), the a11y tree (heading level,
 # description, virtual list rows, JSON, pointer path) and DPI scaling with crisp 1 px edges
 build access
