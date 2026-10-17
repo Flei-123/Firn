@@ -17,7 +17,7 @@ APK=${1:-$ROOT/build/android/firn_voice/firn_voice.apk}
 PASS=0; FAIL=0
 check() { if [ "$2" = "$3" ]; then echo "  OK    $1 (got $2)"; PASS=$((PASS+1));
           else echo "  FAIL  $1 (got '$2', want '$3')"; FAIL=$((FAIL+1)); fi; }
-atleast() { if [ "$2" -ge "$3" ] 2>/dev/null; then echo "  OK    $1 (got $2)"; PASS=$((PASS+1));
+at_least() { if [ "$2" -ge "$3" ] 2>/dev/null; then echo "  OK    $1 (got $2)"; PASS=$((PASS+1));
             else echo "  FAIL  $1 (got '$2', want >= $3)"; FAIL=$((FAIL+1)); fi; }
 OUT=/sdcard/Android/data/$PKG/files/stdout.txt
 
@@ -29,13 +29,13 @@ $ADB shell rm -f /sdcard/Download/Voice/voice01.wav "$OUT"
 $ADB logcat -c
 $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null; sleep 6
 DLG=$($ADB shell dumpsys activity activities | grep -c 'GrantPermissionsActivity')
-atleast "permission dialog (GrantPermissionsActivity) visible" "$DLG" 1
+at_least "permission dialog (GrantPermissionsActivity) visible" "$DLG" 1
 $ADB shell pm grant $PKG android.permission.RECORD_AUDIO
 sleep 40
 S=$($ADB shell cat "$OUT" 2>/dev/null | tr -d '\r')
 echo "$S" | head -20
 OCT=$(echo "$S" | sed -n 's/^recorded octets=\([0-9]*\).*/\1/p')
-atleast "recorded octets" "${OCT:-0}" 20000
+at_least "recorded octets" "${OCT:-0}" 20000
 check "WAV saved to Downloads" "$(echo "$S" | grep -c '^saved=1')" 1
 check "file exists" "$($ADB shell ls /sdcard/Download/Voice/voice01.wav 2>/dev/null | grep -c voice01.wav)" 1
 check "VIEW intent started" "$(echo "$S" | grep -c '^view=1')" 1
