@@ -1475,5 +1475,10 @@ else
     echo "  SKIP: no python3 with Pillow, fontTools and numpy"
 fi
 
+# UAX #14 line breaking: LineBreakTest.txt 100 % (lib/str/linebreak.fi) and the painter's use of it.
+bash tools/linebreak/run.sh
+build uax14
+"$W/uax14" /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+
 echo
 echo "ALL CHECKS PASSED."
