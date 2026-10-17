@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MPL-2.0
+# tools/firn/firn -- ONE front door for the Firn tool chain (prototype, shell).
+#
+#   firn run   [--no-cache] x.fi [args]   compile once (cached), run  (= firn-run)
+#   firn build x.fi|DIR [-o out] [opts]   firnc; a DIR with firn.package builds with --package
+#   firn check x.fi                       parse + type check only (no as/ld, ~0.2 s)
+#   firn test  [x.fi...]                  firnc --test (TAP); default: tests/*.fi or test_*.fi
+#   firn fmt   [-c|-w] x.fi...            firnfmt (built once into the cache from tools/fmt)
+#   firn new   NAME [--lib]               project skeleton: firn.package, src/main.fi, tests/
+#   firn repl                             incremental compile-and-run REPL (`firn repl --help`)
+#   firn eval  'expr'                     print the value of one expression (int/str/float/bool)
+#   firn cache clean                      empty the firn-run cache
+#   firn doctor                           show which compiler/lib/formatter are used
+#
+# Environment: FIRN_ROOT (repo with compiler/ lib/ tools/), FIRNC, FIRNLIB, FIRNFMT,
+#              FIRN_OPT (run: default dev-fast), FIRN_CACHE.
+# Why a script: docs/SCRIPTS.md section 4 sketches a Firn `firn` driver; this is the
+# shell stand-in that makes the sub-commands usable today. firnc does not find the
+# standard library on its own (no sysroot lookup), so the driver always sets FIRNLIB.
+set -u
+
+SELF=$(readlink -f "$0")
+HERE=$(dirname "$SELF")
+FIRN_ROOT=${FIRN_ROOT:-$(cd "$HERE/../.." && pwd)}
+
+if [ -z "${FIRNC:-}" ]; then
+    for c in "$FIRN_ROOT/compiler/target/release/firnc" /root/firn/compiler/target/release/firnc; do
+        [ -x "$c" ] && { FIRNC=$c; break; }
+    done
+    [ -z "${FIRNC:-}" ] && FIRNC=$(command -v firnc || true)
+fi
+[ -x "${FIRNC:-/nonexistent}" ] || { echo "firn: no compiler (set FIRNC)" >&2; exit 125; }
+if [ -z "${FIRNLIB:-}" ] && [ -d "$FIRN_ROOT/lib" ]; then FIRNLIB=$FIRN_ROOT/lib; fi
+export FIRNC FIRNLIB="${FIRNLIB:-}"
+CACHE=${FIRN_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/firn-run}
+RUN=$FIRN_ROOT/tools/script_port/firn-run
+
+die() { echo "firn: $*" >&2; exit 125; }
+
+firnfmt_bin() {
+    if [ -n "${FIRNFMT:-}" ]; then echo "$FIRNFMT"; return; fi
+    local bin="$CACHE/firnfmt-bin" src="$FIRN_ROOT/tools/fmt/firnfmt.fi"
+    [ -f "$src" ] || die "no firnfmt source (set FIRNFMT)"
+    if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ] || [ "$FIRNC" -nt "$bin" ]; then
+        mkdir -p "$CACHE"
+        (cd "$FIRN_ROOT/tools/fmt" && "$FIRNC" firnfmt.fi -o "$bin.tmp.$$" >/dev/null 2>&1) \
+            && mv "$bin.tmp.$$" "$bin" || { rm -f "$bin.tmp.$$"; die "cannot build firnfmt"; }
+    fi
+    echo "$bin"
+}
+
+usage() { sed -n '2,/^set -u/{/^set -u/d;s/^# \{0,1\}//;p}' "$SELF"; }
+
+# ---------------------------------------------------------------- repl / eval
+# State: imports (std.io + std.rt + user), decls (top-level items), body (statements of main).
+# Every input is appended, the whole program is compiled and run (firn-run caches the build:
+# an unchanged program costs ~4 ms), and only the output BEYOND what the previous run printed
+# is shown. Side effects of earlier lines are replayed but not displayed; programs that read
+# stdin or the clock are therefore not stable in this REPL.
+repl_build() { # $1 = work dir, $2 = extra statement (not saved)
+    {
+        cat "$1/imports.fi"
+        cat "$1/decls.fi"
+        echo "fn main() -> i32 {"
+        cat "$1/body.fi"
+        printf '%s\n' "${2:-}"
+        echo "    return 0"
+        echo "}"
+    } > "$1/prog.fi"
+}
+repl_exec() { # $1 = work dir; returns 125 when the program does not compile
+    FIRN_CACHE="$CACHE" "$RUN" "$1/prog.fi" > "$1/out.txt" 2> "$1/err.txt"
+    [ $? -eq 125 ] && return 125
+    return 0
+}
+repl_show_new() {
+    local old new
+    old=$(cat "$1/outlen"); new=$(wc -c < "$1/out.txt")
+    [ "$new" -gt "$old" ] && tail -c +$((old + 1)) "$1/out.txt"
+    echo "$new" > "$1/outlen"
+}
+repl_try() { # $1 = work dir, $2 = kind (import|decl|stmt|expr|any), $3 = text
+    local W=$1 kind=$2 text=$3
+    if [ "$kind" = any ]; then
+        repl_try "$W" expr "$text" > "$W/any.out" 2> "$W/any.err" && { cat "$W/any.out"; return 0; }
+        repl_try "$W" stmt "$text" && return 0
+        cat "$W/any.out" "$W/any.err"; return 1
+    fi
+    cp "$W/body.fi" "$W/save.b"; cp "$W/decls.fi" "$W/save.d"; cp "$W/imports.fi" "$W/save.i"
+    case $kind in
+    import) printf '%s\n' "$text" >> "$W/imports.fi"; repl_build "$W" ;;
+    decl)   printf '%s\n' "$text" >> "$W/decls.fi"; repl_build "$W" ;;
+    stmt)   printf '    %s\n' "$text" >> "$W/body.fi"; repl_build "$W" ;;
+    expr)   repl_build "$W" "    io.fmt_print_line(f\"{$text}\")" ;;
+    esac
+    if repl_exec "$W"; then repl_show_new "$W"; return 0; fi
+    cp "$W/save.b" "$W/body.fi"; cp "$W/save.d" "$W/decls.fi"; cp "$W/save.i" "$W/imports.fi"
+    sed -n '1,6p' "$W/err.txt" | sed "s#$W/##"
+    return 1
+}
+repl_classify() {
+    case $1 in
+    import\ *) echo import ;;
+    fn\ *|struct\ *|enum\ *|const\ *|error\ *|interface\ *|impl\ *|type\ *|"#["*) echo decl ;;
+    let\ *|var\ *|defer\ *|if\ *|while\ *|for\ *|match\ *|return\ *|*" = "*) echo stmt ;;
+    *) echo any ;; # an expression, or a call used as a statement: tried as an expression first
+    esac
+}
+repl_balanced() { # 0 when every opening bracket is closed
+    local o c
+    o=$(printf '%s' "$1" | tr -cd '{([' | wc -c); c=$(printf '%s' "$1" | tr -cd '})]' | wc -c)
+    [ "$o" -le "$c" ]
+}
+repl_reset() {
+    printf 'import std.io\nimport std.rt\n' > "$1/imports.fi"; : > "$1/decls.fi"; : > "$1/body.fi"
+    echo 0 > "$1/outlen"; : > "$1/out.txt"; repl_build "$1"
+}
+cmd_repl() {
+    local W; W=$(mktemp -d "${TMPDIR:-/tmp}/firn-repl.XXXXXX"); trap "rm -rf '$W'" EXIT
+    repl_reset "$W"
+    case ${1:-} in
+    --help)
+        echo "firn repl: type statements (let x = 1), items (fn/struct/import ...) or an expression (x + 1)."
+        echo "  :show  program so far   :undo  drop last input   :reset   :q"
+        echo "  Limits: 'let' of an existing name fails (use 'var'); no stdin; every line re-runs the program."
+        return 0 ;;
+    --eval) repl_try "$W" "$(repl_classify "$2")" "$2"; return $? ;;
+    esac
+    local line buf n hist=0
+    while true; do
+        printf 'firn> ' >&2
+        IFS= read -r line || break
+        buf=$line
+        while ! repl_balanced "$buf"; do printf '  ... ' >&2; IFS= read -r line || break; buf="$buf"$'\n'"$line"; done
+        [ -z "${buf// }" ] && continue
+        case $buf in
+        :q|:quit|:exit) break ;;
+        :show) cat "$W/prog.fi"; continue ;;
+        :reset) repl_reset "$W"; hist=0; continue ;;
+        :undo)
+            if [ $hist -gt 0 ]; then
+                cp "$W/snap.$hist.b" "$W/body.fi"; cp "$W/snap.$hist.d" "$W/decls.fi"; cp "$W/snap.$hist.i" "$W/imports.fi"
+                hist=$((hist - 1)); repl_build "$W"; repl_exec "$W"; wc -c < "$W/out.txt" > "$W/outlen"
+            fi
+            continue ;;
+        esac
+        n=$((hist + 1)); cp "$W/body.fi" "$W/snap.$n.b"; cp "$W/decls.fi" "$W/snap.$n.d"; cp "$W/imports.fi" "$W/snap.$n.i"
+        repl_try "$W" "$(repl_classify "$buf")" "$buf" && hist=$n
+    done
+}
+
+# ---------------------------------------------------------------- new
+cmd_new() {
+    local name="" lib=0 a
+    for a in "$@"; do case $a in --lib) lib=1 ;; *) name=$a ;; esac; done
+    [ -n "$name" ] || die "usage: firn new NAME [--lib]"
+    case $name in [A-Za-z_]*) ;; *) die "package name must start with a letter or _" ;; esac
+    [ -e "$name" ] && die "'$name' already exists"
+    mkdir -p "$name/src" "$name/tests"
+    if [ $lib = 1 ]; then
+        printf '# %s -- a library package (no start: others import it via needs).\npackage  %s\nversion  0.1.0\nsource   src\n' "$name" "$name" > "$name/firn.package"
+        printf '// %s.fi -- library module.\nfn add(a: i32, b: i32) -> i32 {\n    return a + b\n}\n' "$name" > "$name/src/$name.fi"
+    else
+        printf '# %s -- a program.  Dependencies: needs NAME ../path [version]\npackage  %s\nversion  0.1.0\nstart    src/main.fi\nsource   src\n' "$name" "$name" > "$name/firn.package"
+        printf 'import std.io\n\nfn main() -> i32 {\n    io.print_line("hello from %s")\n    return 0\n}\n' "$name" > "$name/src/main.fi"
+    fi
+    printf 'import std.testkit\n\n#[test]\nfn it_adds() {\n    testkit.assert_eq_i64(1 + 1, 2)\n}\n' > "$name/tests/basic.fi"
+    printf '# build output\n/%s\n*.o\n*.s\n' "$name" > "$name/.gitignore"
+    echo "created $name/ -- cd $name && firn build . && ./$name ; firn test tests/basic.fi ; firn fmt -c src/*.fi"
+}
+
+# ---------------------------------------------------------------- main
+sub=${1:-help}; [ $# -gt 0 ] && shift
+case $sub in
+run)    [ -x "$RUN" ] || die "firn-run missing: $RUN"; exec "$RUN" "$@" ;;
+build)
+    [ $# -ge 1 ] || die "usage: firn build x.fi|DIR [-o out] [firnc options]"
+    t=$1; shift
+    if [ -d "$t" ]; then exec "$FIRNC" --package "$t" "$@"; else exec "$FIRNC" "$t" "$@"; fi ;;
+check)  [ $# -ge 1 ] || die "usage: firn check x.fi"; exec "$FIRNC" --emit=fir-raw "$1" -o /dev/null > /dev/null ;;
+test)
+    if [ $# -eq 0 ]; then set -- $(ls tests/*.fi test_*.fi 2>/dev/null); fi
+    [ $# -ge 1 ] || die "no test files (tests/*.fi or test_*.fi)"
+    rc=0; for f in "$@"; do "$FIRNC" --test --format=tap "$f" || rc=1; done; exit $rc ;;
+fmt)    exec "$(firnfmt_bin)" "$@" ;;
+new)    cmd_new "$@" ;;
+repl)   cmd_repl "$@" ;;
+eval)   [ $# -ge 1 ] || die "usage: firn eval 'expr'"; cmd_repl --eval "$1" ;;
+cache)  case ${1:-} in clean) exec "$RUN" --clean ;; *) die "usage: firn cache clean" ;; esac ;;
+doctor) echo "root   $FIRN_ROOT"; echo "firnc  $FIRNC ($("$FIRNC" --version 2>&1 | head -1))"; echo "lib    ${FIRNLIB:-<unset>}"
+        echo "run    $RUN"; echo "cache  $CACHE"; echo "fmt    $(firnfmt_bin 2>&1)" ;;
+help|-h|--help) usage ;;
+*)      echo "firn: unknown command '$sub'" >&2; usage >&2; exit 125 ;;
+esac
