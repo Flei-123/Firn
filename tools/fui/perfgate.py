@@ -11,14 +11,54 @@ scenario is more than 20 % worse (plus a small absolute floor for the
 sub-millisecond scenarios). Also fails when a scenario misses its goal in
 ms (goal_ms, measured on the unloaded reference machine via ref_ms).
 --update rewrites the baseline from this run.
+
+PINNING: a busy shared machine makes the 1920x1080 scenarios wobble even with
+the reference-loop normalisation (a run on a loaded server once reported
+scroll 2.79 against a baseline of 1.85, pinned on an idle core 1.57-1.67). The
+gate therefore pins itself (and the bench it starts) to the idlest core and
+its hyper-thread sibling, chosen from a 1 s sample of /proc/stat. Set
+FUI_PERF_CPU=<n> to force a core, FUI_PERF_CPU=none to not pin.
 """
-import json, os, re, subprocess, sys
+import json, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.join(HERE, "perf_baseline.json")
 SIZES = [(1240, 720), (1920, 1080)]
 TOL = 1.20
 FLOOR = 0.03
+
+def _busy():
+    d = {}
+    for line in open("/proc/stat"):
+        if line.startswith("cpu") and line[3].isdigit():
+            f = [int(x) for x in line.split()[1:]]
+            d[int(line.split()[0][3:])] = (f[3] + f[4], sum(f))
+    return d
+
+def pin():
+    want = os.environ.get("FUI_PERF_CPU", "")
+    if want == "none" or not hasattr(os, "sched_setaffinity"):
+        return None
+    if want:
+        cpus = {int(want)}
+    else:
+        a = _busy()
+        time.sleep(1.0)
+        b = _busy()
+        use = {c: 1.0 - (b[c][0] - a[c][0]) / max(1, b[c][1] - a[c][1]) for c in a}
+        best = None
+        for c in a:
+            try:
+                sib = open("/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list" % c).read()
+                sib = {int(x) for x in sib.replace("-", ",").split(",")}
+            except OSError:
+                sib = {c}
+            load = max(use.get(x, 1.0) for x in sib)
+            if best is None or load < best[0]:
+                best = (load, c)
+        cpus = {best[1]}
+    os.sched_setaffinity(0, cpus)
+    return sorted(cpus)
 
 def run(binary, w, h):
     best = {}
@@ -41,6 +81,7 @@ def run(binary, w, h):
 def main():
     binary = sys.argv[1]
     update = "--update" in sys.argv
+    print("pinned to cpu %s, load %s" % (pin(), open("/proc/loadavg").read().split()[0]))
     base = json.load(open(BASE)) if os.path.exists(BASE) else {"sizes": {}}
     bad = 0
     for (w, h) in SIZES:
