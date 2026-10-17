@@ -471,7 +471,7 @@ echo "== 18j2. fUi PERFORMANCE: PARTIAL REPAINT = SAME PIXELS, AND THE GATE =="
 pg_ok=0
 for pg_try in 1 2 3; do
     if python3 tools/fui/perfgate.py "$W/perfbench"; then pg_ok=1; break; fi
-    echo "  perfgate attempt $pg_try failed"
+    echo "  perfgate attempt $pg_try failed"; sleep 20
 done
 [ "$pg_ok" = 1 ] || exit 1
 
