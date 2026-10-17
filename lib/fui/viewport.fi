@@ -68,6 +68,8 @@ export {
     viewport_needs_h, viewport_needs_v,
     viewport_scroll_by, viewport_wheel, viewport_key,
     viewport_fling, viewport_tick, viewport_moving,
+    viewport_set_overscroll, viewport_pull, viewport_over_x, viewport_over_y,
+    VP_OVER_K, VP_OVER_C,
     viewport_share_h, viewport_share_v,
     viewport_value_h, viewport_value_v,
     viewport_bar_rect_v, viewport_bar_rect_h,
@@ -123,6 +125,12 @@ const VP_FLING_K: f64 = 0.0035
 const VP_FLING_MIN: f64 = 0.05
 // Smooth wheel / touchpad: time constant (ms) of the glide to the target.
 const VP_SMOOTH_TAU: f64 = 60.0
+// Overscroll spring: x'' = -K x - C x' (per ms). K gives a ~300 ms period,
+// C = 0.6 of critical damping: one small, soft overshoot, then rest.
+const VP_OVER_K: f64 = 0.0004
+const VP_OVER_C: f64 = 0.024
+const VP_OVER_MAX_FRAC: f64 = 0.3
+const VP_OVER_FLICK: f64 = 0.25
 
 // WHICH BAR IS MEANT. The same kind of number as the eight
 // movements above: the caller gets a direction back and
@@ -177,6 +185,18 @@ struct Viewport {
     drag: u32,
     tombstone: f64,
     tombstone_off: f64,
+    // W7: OVERSCROLL (rubber band). Off by default (`os_en`). The content
+    // is drawn `os` pixels beyond its end (positive = past the max edge,
+    // negative = before the start) and a spring pulls it back; `ov` is the
+    // spring velocity in px/ms. Layout of the logic (ox/oy, hit tests via
+    // the clamped offset) never sees it.
+    os_en: u32,
+    osx: f64,
+    osy: f64,
+    ovx: f64,
+    ovy: f64,
+    os_t: i64,
+    os_pull_t: i64,
 }
 
 fn viewport_new(x: f64, y: f64, w: f64, h: f64, cw: f64,
@@ -188,7 +208,9 @@ fn viewport_new(x: f64, y: f64, w: f64, h: f64, cw: f64,
         fx_on: 0 as u32, fy_on: 0 as u32,
         fl_ox: 0.0, fl_oy: 0.0, fl_vx: 0.0, fl_vy: 0.0, fl_t0: 0, fr_on: 0 as u32,
         sm_x: 0.0, sm_y: 0.0, sm_t: 0, sm_on: 0 as u32,
-        drag: VP_BAR_NONE, tombstone: 0.0, tombstone_off: 0.0 }
+        drag: VP_BAR_NONE, tombstone: 0.0, tombstone_off: 0.0,
+        os_en: 0 as u32, osx: 0.0, osy: 0.0, ovx: 0.0, ovy: 0.0, os_t: 0 - 1,
+        os_pull_t: 0 - 1000000 }
 }
 
 fn viewport_set_rect(v: *mut Viewport, x: f64, y: f64, w: f64, h: f64) {
@@ -472,9 +494,66 @@ fn viewport_scroll_smooth(v: *mut Viewport, dx: f64, dy: f64, now_ms: i64) {
     (*v).sm_on = 1 as u32
 }
 
+// A fling reached an end with speed `sp` (px/ms): a part of it goes into the
+// spring so the content runs a little past the edge and comes back.
+fn inject_over(v: *mut Viewport, horiz: bool, sp: f64, at_max: bool, now_ms: i64) {
+    var a: f64 = sp
+    if a < 0.0 { a = 0.0 - a }
+    var vel: f64 = a * VP_OVER_FLICK
+    if vel > 1.2 { vel = 1.2 }
+    if !at_max { vel = 0.0 - vel }
+    if horiz {
+        (*v).ovx = vel
+    } else {
+        (*v).ovy = vel
+    }
+    (*v).os_t = now_ms
+}
+
+fn over_active(v: *mut Viewport) -> bool {
+    return (*v).os_en != 0 as u32 && ((*v).osx != 0.0 || (*v).osy != 0.0 || (*v).ovx != 0.0 || (*v).ovy != 0.0)
+}
+
+// One spring axis, 2 ms sub-steps (semi-implicit Euler: stable and dt
+// independent enough for a 4..40 ms frame).
+fn spring_axis(os: *mut f64, ov: *mut f64, dt: f64) {
+    var left: f64 = dt
+    while left > 0.0 {
+        var h: f64 = 2.0
+        if left < h { h = left }
+        let a: f64 = 0.0 - VP_OVER_K * (*os) - VP_OVER_C * (*ov)
+        *ov = *ov + a * h
+        *os = *os + (*ov) * h
+        left = left - h
+    }
+    var ao: f64 = *os
+    if ao < 0.0 { ao = 0.0 - ao }
+    var av: f64 = *ov
+    if av < 0.0 { av = 0.0 - av }
+    if ao < 0.1 && av < 0.005 {
+        *os = 0.0
+        *ov = 0.0
+    }
+}
+
 // The clock. Returns whether the offset has changed.
 fn viewport_tick(v: *mut Viewport, now_ms: i64) -> bool {
     var geaendert: bool = false
+    if over_active(v) && drag_idle(v) {
+        // a pull holds the band for 60 ms after its last event
+        if now_ms - (*v).os_pull_t >= 60 {
+            var dt: f64 = 16.0
+            if (*v).os_t >= 0 {
+                dt = (now_ms - (*v).os_t) as f64
+            }
+            if dt > 50.0 { dt = 50.0 }
+            if dt < 0.0 { dt = 0.0 }
+            (*v).os_t = now_ms
+            spring_axis(&(*v).osx, &(*v).ovx, dt)
+            spring_axis(&(*v).osy, &(*v).ovy, dt)
+            geaendert = true
+        }
+    }
     if (*v).fx_on != 0 as u32 {
         let n: f64 = anim.anim_value(&(*v).fx, now_ms)
         if n != (*v).ox {
@@ -508,6 +587,9 @@ fn viewport_tick(v: *mut Viewport, now_ms: i64) -> bool {
             if sp < 0.0 { sp = 0.0 - sp }
             let mx: f64 = viewport_max_x(v)
             if n <= 0.0 || n >= mx {
+                if (*v).os_en != 0 as u32 && mx > 0.0 {
+                    inject_over(v, true, anim.fling_vel((*v).fl_vx, VP_FLING_K, dt), n >= mx, now_ms)
+                }
                 if n < 0.0 { n = 0.0 }
                 if n > mx { n = mx }
                 (*v).fr_on = (*v).fr_on & 2 as u32
@@ -522,6 +604,9 @@ fn viewport_tick(v: *mut Viewport, now_ms: i64) -> bool {
             if sp2 < 0.0 { sp2 = 0.0 - sp2 }
             let my: f64 = viewport_max_y(v)
             if n2 <= 0.0 || n2 >= my {
+                if (*v).os_en != 0 as u32 && my > 0.0 {
+                    inject_over(v, false, anim.fling_vel((*v).fl_vy, VP_FLING_K, dt), n2 >= my, now_ms)
+                }
                 if n2 < 0.0 { n2 = 0.0 }
                 if n2 > my { n2 = my }
                 (*v).fr_on = (*v).fr_on & 1 as u32
@@ -562,7 +647,14 @@ fn viewport_tick(v: *mut Viewport, now_ms: i64) -> bool {
     return geaendert
 }
 
+fn drag_idle(v: *mut Viewport) -> bool {
+    return (*v).drag == VP_BAR_NONE
+}
+
 fn viewport_moving(v: *mut Viewport) -> bool {
+    if over_active(v) {
+        return true
+    }
     return (*v).fx_on != 0 as u32 || (*v).fy_on != 0 as u32 || (*v).fr_on != 0 as u32 || (*v).sm_on != 0 as u32
 }
 
@@ -643,8 +735,66 @@ fn viewport_bar_rect_h(v: *mut Viewport, x: *mut f64, y: *mut f64,
 // ======================================================================
 // THE CONTENT AND THE POINT IN IT
 // ======================================================================
-fn viewport_content_x(v: *mut Viewport) -> f64 { return (*v).x - (*v).ox }
-fn viewport_content_y(v: *mut Viewport) -> f64 { return (*v).y - (*v).oy }
+fn viewport_content_x(v: *mut Viewport) -> f64 { return (*v).x - (*v).ox - (*v).osx }
+fn viewport_content_y(v: *mut Viewport) -> f64 { return (*v).y - (*v).oy - (*v).osy }
+
+// Overscroll on/off (default off: a list stops dead at its ends).
+fn viewport_set_overscroll(v: *mut Viewport, on: bool) {
+    (*v).os_en = 0 as u32
+    if on {
+        (*v).os_en = 1 as u32
+    } else {
+        (*v).osx = 0.0
+        (*v).osy = 0.0
+        (*v).ovx = 0.0
+        (*v).ovy = 0.0
+    }
+}
+
+// How far the content stands beyond its end right now (px; + = past the max
+// edge, - = before the start; 0 = at rest).
+fn viewport_over_x(v: *mut Viewport) -> f64 { return (*v).osx }
+fn viewport_over_y(v: *mut Viewport) -> f64 { return (*v).osy }
+
+// The pointer / touchpad pulls by (dx, dy) while the content already stands
+// at an end: the content follows with growing resistance (rubber band) and
+// springs back by itself once the pulling stops (viewport_tick).
+fn pull_axis(os: f64, d: f64, at_start: bool, at_end: bool, lim: f64) -> f64 {
+    var r: f64 = os
+    if (d < 0.0 && at_start) || (d > 0.0 && at_end) || (os != 0.0 && ((os < 0.0 && d < 0.0) || (os > 0.0 && d > 0.0))) {
+        var a: f64 = os
+        if a < 0.0 { a = 0.0 - a }
+        var k: f64 = 1.0 - a / lim
+        if k < 0.0 { k = 0.0 }
+        r = os + d * k * 0.5
+    } else if os != 0.0 {
+        r = os + d
+        if (os > 0.0 && r < 0.0) || (os < 0.0 && r > 0.0) { r = 0.0 }
+    }
+    if r > lim { r = lim }
+    if r < 0.0 - lim { r = 0.0 - lim }
+    return r
+}
+
+fn viewport_pull(v: *mut Viewport, dx: f64, dy: f64, now_ms: i64) {
+    if (*v).os_en == 0 as u32 {
+        return
+    }
+    let mx: f64 = viewport_max_x(v)
+    let my: f64 = viewport_max_y(v)
+    let limx: f64 = (*v).w * VP_OVER_MAX_FRAC
+    let limy: f64 = (*v).h * VP_OVER_MAX_FRAC
+    if dx != 0.0 && mx > 0.0 {
+        (*v).osx = pull_axis((*v).osx, dx, (*v).ox <= 0.0, (*v).ox >= mx, limx)
+        (*v).ovx = 0.0
+    }
+    if dy != 0.0 && my > 0.0 {
+        (*v).osy = pull_axis((*v).osy, dy, (*v).oy <= 0.0, (*v).oy >= my, limy)
+        (*v).ovy = 0.0
+    }
+    (*v).os_pull_t = now_ms
+    (*v).os_t = 0 - 1
+}
 
 // Does a window point lie in the viewport, and where does it lie IN THE CONTENT?
 // `cx`/`cy` are content coordinates (0,0 = start of the content).
