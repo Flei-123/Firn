@@ -1,0 +1,175 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/gpuhost_main.fi -- the fUi window host with FUI_GPU=1 (lib/plat/fuiwinvk.fi) against the CPU painter, on X11.
+//
+//     FUI_GPU=1 gpuhost [frames] [width] [height] [hold: x100 ms on screen after READY]
+//
+// The program always calls fuiwinvk.window_use_env: FUI_GPU unset -> CPU painter, FUI_GPU=1 -> fUi painted on Vulkan, the canvas
+// read back, the normal CPU present (FUI_GPU_FAIL=open|compile|lost test the fallback). It prints
+//   * path=...    what really paints (cpu | vulkan-readback), and the device
+//   * gpu=...     the same again after the first frames (FUI_GPU_FAIL=lost flips it to false at the 3rd frame)
+//   * canvas.rgba the last canvas (RGBA, top row first) is written into the working directory (canvas2.rgba after a resize)
+//   * READY       printed once the first frames are on the screen; the program then waits (tools/fui/gpuhost.sh takes an X shot)
+//   * bench       `frames` forced repaints (host_touch + window_step): us per frame, including painting
+import std.rt
+import std.io
+import std.fs
+import paint.canvas
+import std.time
+import font.metrics
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.scene
+import fui.sheet
+import fui.flex
+import fui.widget
+import window.window
+import plat.fuiwirt
+import plat.fuiwin
+import plat.fuiwinvk
+import plat.sysfont
+
+struct App {
+    sc: scene.Scene,
+    sh: sheet.Sheet,
+    m: theme.Theme,
+    c: render.Ctx,
+    w: fuiwirt.Host,
+    close: usize,
+    quit: bool,
+}
+
+fn paint(ud: u64, fx: *mut fuiwin.Window) {
+    let a: *mut App = ud as *mut App
+    let f: *mut theme.Colors = theme.theme_colors(&(*a).m)
+    painter.painter_clear(fuiwin.window_painter(fx), theme.opaque((*f).base))
+    scene.scene_run(&(*a).sc, &(*a).c, &(*a).sh, 0.0, 0.0,
+        fuiwin.window_w(fx) as f64, fuiwin.window_h(fx) as f64)
+}
+
+fn act(ud: u64, fx: *mut fuiwin.Window, node: usize) {
+    let a: *mut App = ud as *mut App
+    if node == (*a).close {
+        (*a).quit = true
+    }
+}
+
+fn arg_num(start: u64, i: usize, dflt: i64) -> i64 {
+    if rt.arg_count(start) <= i {
+        return dflt
+    }
+    let p: u64 = rt.arg_ptr(start, i)
+    var v: i64 = 0
+    var k: usize = 0
+    while rt.ld8(p, k) != 0 as u8 {
+        v = v * 10 + (rt.ld8(p, k) as i64 - 48)
+        k = k + 1
+    }
+    return v
+}
+
+fn main(start: u64) -> i32 {
+    let frames: i64 = arg_num(start, 1, 200)
+    let bw: i64 = arg_num(start, 2, 640)
+    let bh: i64 = arg_num(start, 3, 400)
+    let hold: i64 = arg_num(start, 4, 40)
+    let fset: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    if !sysfont.sysfont_load(fset) {
+        return 9
+    }
+    var fx: fuiwin.Window = fuiwin.window_new()
+    fuiwin.window_set_font(&fx, fset as u64)
+    let asked: bool = fuiwinvk.window_use_env(&fx)
+    var a: App = App { sc: scene.scene_new(), sh: sheet.sheet_new(),
+        m: theme.theme_new(false),
+        c: render.ctx_new(0 as u64 as *mut theme.Theme,
+            0 as u64 as *mut painter.Painter),
+        w: fuiwirt.host_new(0 as u64 as *mut scene.Scene,
+            0 as u64 as *mut render.Ctx),
+        close: 0, quit: false }
+    a.c = render.ctx_new(&a.m, fuiwin.window_painter(&fx))
+    a.w = fuiwirt.host_new(&a.sc, &a.c)
+    let root: usize = scene.scene_box(&a.sc, scene.SCENE_NONE, 0 as u32,
+        flex.FLEX_COLUMN, flex.JUSTIFY_CENTER, flex.AL_CENTER)
+    scene.node_set_gap(&a.sc, root, 20, 0)
+    let label: usize = scene.scene_add(&a.sc, root, scene.N_TEXT)
+    let msg: str = "Hello, this is a test window!"
+    scene.node_set_text(&a.sc, label, msg.p as u64, msg.n)
+    scene.node_set_id(&a.sc, label, 1 as u32)
+    let r: usize = sheet.sheet_rule(&a.sh, sheet.sel_id(1 as u32),
+        style.style_set_font(style.style_new(), 0, 16))
+    let cl: str = "Close"
+    a.close = scene.scene_widget(&a.sc, root, widget.KIND_BUTTON, cl.p as u64,
+        cl.n)
+    fuiwirt.host_bind(&a.w)
+    let t: str = "fUi on Vulkan"
+    if !fuiwin.window_open(&fx, &a.w, &a.m, 0, bw as usize, bh as usize, t.p as u64, t.n) {
+        io.print("open failed\n")
+        return 1
+    }
+    if fuiwin.window_gpu_readback(&fx) {
+        io.print("path=vulkan-readback software=")
+        if fuiwinvk.is_software() { io.print("true") } else { io.print("false") }
+        io.print(" device=")
+        io.print_c(fuiwinvk.device_name())
+        io.print("\n")
+    } else if asked {
+        io.print("path=cpu (FUI_GPU=1 asked, the provider said no: fallback)\n")
+    } else {
+        io.print("path=cpu\n")
+    }
+    // first frames
+    var guard: i32 = 0
+    while fuiwin.window_images(&fx) < 1 as u64 && guard < 100 && !a.quit {
+        let e: bool = window.wait_event(fuiwin.window_window(&fx), 50)
+        if !fuiwin.window_step(&fx, &a.w, &a.m, paint, act, (&a) as u64) {
+            a.quit = true
+        }
+        guard = guard + 1
+    }
+    // four more full repaints (the device-lost test fakes the loss at the 3rd frame; the dump below must come after it)
+    var forced: i32 = 0
+    while forced < 4 && !a.quit {
+        fuiwirt.host_touch(&a.w)
+        if !fuiwin.window_step(&fx, &a.w, &a.m, paint, act, (&a) as u64) {
+            a.quit = true
+        }
+        forced = forced + 1
+    }
+    let sz: usize = fuiwin.window_w(&fx) * fuiwin.window_h(&fx) * 4
+    let wr: usize = fs.write_file("canvas.rgba", canvas.canvas_pixels(fuiwin.window_canvas(&fx)) as u64, sz) catch 0
+    io.fmt_print(f"size={fuiwin.window_w(&fx)}x{fuiwin.window_h(&fx)} images={fuiwin.window_images(&fx)} gpu={fuiwin.window_gpu(&fx)} readback={fuiwin.window_gpu_readback(&fx)} dumped={wr}\n")
+    io.print("READY\n")
+    // keep the window up for the screenshot
+    var t4: i64 = 0
+    while t4 < hold && !a.quit {
+        let e2: bool = window.wait_event(fuiwin.window_window(&fx), 100)
+        if !fuiwin.window_step(&fx, &a.w, &a.m, paint, act, (&a) as u64) {
+            a.quit = true
+        }
+        t4 = t4 + 1
+    }
+    // after the screenshot the script resized the window (xdotool): the canvas is new, dump it again for the second compare
+    let sz2: usize = fuiwin.window_w(&fx) * fuiwin.window_h(&fx) * 4
+    let wr2: usize = fs.write_file("canvas2.rgba", canvas.canvas_pixels(fuiwin.window_canvas(&fx)) as u64, sz2) catch 0
+    io.fmt_print(f"size2={fuiwin.window_w(&fx)}x{fuiwin.window_h(&fx)} gpu={fuiwin.window_gpu(&fx)} dumped2={wr2}\n")
+    // bench: forced repaints
+    let b0: u64 = time.monotonic_ns()
+    var n: i64 = 0
+    while n < frames && !a.quit {
+        fuiwirt.host_touch(&a.w)
+        if !fuiwin.window_step(&fx, &a.w, &a.m, paint, act, (&a) as u64) {
+            a.quit = true
+        }
+        n = n + 1
+    }
+    let b1: u64 = time.monotonic_ns()
+    if n > 0 {
+        let us: u64 = (b1 - b0) / 1000 as u64 / (n as u64)
+        io.fmt_print(f"bench frames={n} us_per_frame={us} gpu={fuiwin.window_gpu(&fx)}\n")
+    }
+    fuiwin.window_close(&fx)
+    io.print("DONE\n")
+    return 0
+}

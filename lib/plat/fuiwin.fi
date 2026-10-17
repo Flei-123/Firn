@@ -59,6 +59,8 @@ export {
     window_use_pointers,
     // r422: a present hook (lib/plat/fuiwingl.fi: the canvas goes through an OpenGL window instead of PutImage)
     window_set_present, window_clear_present, window_present_hooked,
+    // W18-F3: the GPU PROVIDER (lib/plat/fuiwinvk.fi: fUi painted on Vulkan, read back, shown by the CPU present)
+    window_set_gpu_provider, window_gpu_readback,
 }
 
 struct Window {
@@ -101,6 +103,14 @@ struct Window {
     pres_on: bool,
     pres_ud: u64,
     pres: fn(u64, u64, usize, usize) -> bool,
+    // THE GPU PROVIDER (window_set_gpu_provider): for a window that has no GPU of its own (X11, Windows, Osum) a provider
+    // fills the GL table (lib/plat/fuiwinvk.fi: Vulkan); then fUi paints on the GPU, the canvas is read back and the
+    // normal CPU present shows it (`gpu_rb`). prov_ok asks whether the device is still alive, prov_close lets it go.
+    prov_on: bool,
+    prov_open: fn(*mut gl.GlApi) -> bool,
+    prov_ok: fn() -> bool,
+    prov_close: fn(),
+    gpu_rb: bool,
 }
 
 fn hook_none(ud: u64, kind: u32, a: u32, st: u32, x: f64, y: f64) -> bool {
@@ -109,6 +119,35 @@ fn hook_none(ud: u64, kind: u32, a: u32, st: u32, x: f64, y: f64) -> bool {
 
 fn pres_none(ud: u64, px: u64, w: usize, h: usize) -> bool {
     return false
+}
+
+fn prov_open_none(api: *mut gl.GlApi) -> bool {
+    return false
+}
+
+fn prov_ok_none() -> bool {
+    return false
+}
+
+fn prov_close_none() {
+}
+
+// THE GPU PROVIDER (W18-F3). Call BEFORE window_open (like window_set_gpu). `open(table)` fills the GL table of
+// lib/paint/gl.fi and says whether it worked, `alive()` says whether the device still answers (asked after every frame),
+// `close()` lets it go. The window asks for it only when the window layer has no GPU of its own (`window.gpu_open` false)
+// and `window_set_gpu(fx, false)` was not called. Whatever fails -- no device, shader, canvas target, a frame later --
+// the window paints on the CPU as if nothing had been set (a full repaint follows). The provider is a function pointer
+// on purpose: importing std.dynlib here would make EVERY fUi program a dynamically linked ELF (OrientOS has no libc).
+fn window_set_gpu_provider(fx: *mut Window, open: fn(*mut gl.GlApi) -> bool, alive: fn() -> bool, close: fn()) {
+    (*fx).prov_on = true
+    (*fx).prov_open = open
+    (*fx).prov_ok = alive
+    (*fx).prov_close = close
+}
+
+// True while the window paints on a provider's GPU and brings the canvas to the screen by read-back + CPU present.
+fn window_gpu_readback(fx: *mut Window) -> bool {
+    return (*fx).gpu_an && (*fx).gpu_rb
 }
 
 // THE PRESENT HOOK (r422). `f(ud, pixels, w, h)` gets the finished canvas (RGBA octets, top row first, packed
@@ -192,7 +231,8 @@ fn window_new() -> Window {
         full: false, log: false, images: 0, last_px: 0, open: false, esc_zu: true,
         gpu_will: true, gpu_an: false, gl: gl.gl_api_new(), gp: gpu.gpu_new(),
         hook_on: false, hook_ud: 0, hook: hook_none, real: false, rmouse: false, pdown: 0,
-        pres_on: false, pres_ud: 0, pres: pres_none }
+        pres_on: false, pres_ud: 0, pres: pres_none,
+        prov_on: false, prov_open: prov_open_none, prov_ok: prov_ok_none, prov_close: prov_close_none, gpu_rb: false }
 }
 
 // ============================================================ ON THE GPU
@@ -215,10 +255,13 @@ fn window_gpu(fx: *mut Window) -> bool {
 
 fn gpu_start(fx: *mut Window) {
     (*fx).gpu_an = false
+    (*fx).gpu_rb = false
     if !(*fx).gpu_will || (*fx).cap == 0 {
         return
     }
     if !window.gpu_open(&(*fx).f, (&(*fx).gl) as u64) {
+        // the window has no GPU of its own (X11, Windows, Osum): a provider (FUI_GPU=1, Vulkan) may paint for it
+        gpu_start_provider(fx)
         return
     }
     if !gpu.gpu_open(&(*fx).gp, &(*fx).gl) {
@@ -230,6 +273,45 @@ fn gpu_start(fx: *mut Window) {
     (*fx).gpu_an = true
     var nm: [u8; 3] = "gpu"
     line(fx, (&nm[0]) as u64, 3, 1, (*fx).w as i64, (*fx).h as i64, 0)
+}
+
+// The provider route: fill the table, open fUi's renderer on it, put the canvas on the GPU. Any "no" leaves the CPU painter
+// in charge (the table is empty again, nothing is attached).
+fn gpu_start_provider(fx: *mut Window) {
+    if !(*fx).prov_on {
+        return
+    }
+    let api: *mut gl.GlApi = &(*fx).gl
+    if !(*fx).prov_open(api) {
+        *api = gl.gl_api_new()
+        return
+    }
+    if !gpu.gpu_open(&(*fx).gp, api) {
+        *api = gl.gl_api_new()
+        return
+    }
+    if !gpu.gpu_attach(&(*fx).gp, &(*fx).cv) {
+        *api = gl.gl_api_new()
+        return
+    }
+    (*fx).gpu_an = true
+    (*fx).gpu_rb = true
+    var nm: [u8; 3] = "gpu"
+    line(fx, (&nm[0]) as u64, 3, 2, (*fx).w as i64, (*fx).h as i64, 0)
+}
+
+// The provider's GPU is gone (a frame failed, the canvas could not be put on it again): back to the CPU painter for the rest of
+// the run. The canvas keeps its memory, so the next full repaint is an ordinary CPU frame.
+fn gpu_drop(fx: *mut Window) {
+    if !(*fx).gpu_an {
+        return
+    }
+    gpu.gpu_detach(&(*fx).gp, &(*fx).cv)
+    (*fx).gpu_an = false
+    (*fx).gpu_rb = false
+    (*fx).prov_on = false
+    var nm: [u8; 3] = "gpu"
+    line(fx, (&nm[0]) as u64, 3, 0, (*fx).w as i64, (*fx).h as i64, 0)
 }
 
 // Write accesses that bypassed the GPU (canvas.fi counts them):
@@ -299,6 +381,7 @@ fn flaechen(fx: *mut Window, w: usize, h: usize) -> bool {
     // the new canvas back onto the GPU (a target of the new size)
     if (*fx).gpu_an && !gpu.gpu_attach(&(*fx).gp, &(*fx).cv) {
         (*fx).gpu_an = false
+        (*fx).gpu_rb = false
     }
     return true
 }
@@ -469,8 +552,13 @@ fn window_close(fx: *mut Window) {
     window_clear_present(fx)
     if (*fx).gpu_an {
         gpu.gpu_detach(&(*fx).gp, &(*fx).cv)
-        window.gpu_close(&(*fx).f)
+        if (*fx).gpu_rb {
+            (*fx).prov_close()
+        } else {
+            window.gpu_close(&(*fx).f)
+        }
         (*fx).gpu_an = false
+        (*fx).gpu_rb = false
     }
     if (*fx).cap > 0 {
         painter.painter_free(&(*fx).z)
@@ -724,7 +812,26 @@ fn window_step(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
         var q2: i64 = q0
         var q3: i64 = q0
         var q1: i64 = q0
-        if (*fx).gpu_an {
+        if (*fx).gpu_an && (*fx).gpu_rb {
+            // ON A PROVIDER'S GPU (Vulkan): paint there, read the whole canvas back, then the ordinary CPU present
+            gpu.gpu_frame_begin(&(*fx).gp, (*fx).w as i32, (*fx).h as i32)
+            times(ud, fx)
+            q1 = now_ms()
+            gpu.gpu_read(&(*fx).gp, 0, 0, (*fx).w as i32, (*fx).h as i32, canvas.canvas_pixels(&(*fx).cv) as u64, (*fx).w * 4)
+            hash_report(fx)
+            if !(*fx).prov_ok() {
+                // the device failed during this frame: the read-back is not a picture. CPU for good, this frame is painted again
+                gpu_drop(fx)
+                times(ud, fx)
+                q1 = now_ms()
+            }
+            fuiwirt.rgba_to_bgrx(canvas.canvas_pixels(&(*fx).cv) as u64, (*fx).bgrx, (*fx).w * (*fx).h)
+            q2 = now_ms()
+            let okg: bool = window.image(f, (*fx).bgrx, (*fx).w, (*fx).h, 0, 0)
+            let okp: bool = window.present(f)
+            (*fx).last_px = ((*fx).w * (*fx).h) as i64
+            q3 = now_ms()
+        } else if (*fx).gpu_an {
             // ON THE GPU: paint, one copy onto the screen, swap
             var pl: [u64; 4] = [0; 4]
             window.gpu_place(f, (&pl[0]) as u64)

@@ -29,7 +29,7 @@ import gpu.vk_mem
 import gpu.vk_desc
 import gpu.vk_frame
 
-export { vkgl_api, vkgl_close, vkgl_is_cpu, vkgl_device, vkgl_stats, vkgl_step }
+export { vkgl_api, vkgl_close, vkgl_is_cpu, vkgl_device, vkgl_stats, vkgl_step, vkgl_alive }
 
 const SPV_VS: str = __include_str("spv/gpu_vk.vert.spv")
 const SPV_FS: str = __include_str("spv/gpu_vk.frag.spv")
@@ -141,6 +141,9 @@ struct VG {
     dummy: u64,
     next_vao: u64,
     fail_compile: bool,
+    // a command buffer could not be submitted / waited for (or FUI_GPU_FAIL=lost): every later call does nothing, vkgl_alive() is false
+    lost: bool,
+    fail_lost: bool,
     draws: u64,
     submits: u64,
     uploads: u64,
@@ -179,7 +182,7 @@ fn vg_new() -> VG {
         p0n: vk_desc.vpipe_none(), p0b: vk_desc.vpipe_none(), p1n: vk_desc.vpipe_none(), p1b: vk_desc.vpipe_none(),
         nprog: 0, uni: 0, samp_unit: [0; 8], cur_prog: 0, cur_tex: [0; 8], unit: 0, arr_buf: 0, attr_buf: [0; 9],
         rfb: 0, dfb: 0, vp_x: 0, vp_y: 0, vp_w: 0, vp_h: 0, sc_x: 0, sc_y: 0, sc_w: 0, sc_h: 0, sc_on: false,
-        blend_on: false, cc: [0.0; 4], dummy: 0, next_vao: 0, fail_compile: false,
+        blend_on: false, cc: [0.0; 4], dummy: 0, next_vao: 0, fail_compile: false, lost: false, fail_lost: false,
         draws: 0, submits: 0, uploads: 0, readbacks: 0,
     }
 }
@@ -241,6 +244,9 @@ fn cmd_open() -> u64 {
     let cmd: u64 = vk_frame.imm_begin(&(*s).x, &(*s).fr)
     if cmd != 0 {
         vk_frame.mem_barrier(&(*s).x, cmd, ALL_CMDS, ALL_CMDS, MEM_W, MEM_RW)
+    } else {
+        (*s).lost = true
+        (*s).ok = false
     }
     return cmd
 }
@@ -248,7 +254,12 @@ fn cmd_open() -> u64 {
 fn cmd_close() -> bool {
     let s: *mut VG = gs()
     (*s).submits = (*s).submits + 1
-    return vk_frame.imm_submit(&(*s).x, &(*s).fr)
+    if vk_frame.imm_submit(&(*s).x, &(*s).fr) {
+        return true
+    }
+    (*s).lost = true
+    (*s).ok = false
+    return false
 }
 
 // vkCmdClearColorImage(cmd, image, layout, &colour, 1, &range): the image to transparent black
@@ -1101,6 +1112,11 @@ fn f_blit_framebuffer(sx0: i64, sy0: i64, sx1: i64, sy1: i64, dx0: i64, dy0: i64
 
 fn f_read_pixels(x: i64, y: i64, w: i64, h: i64, dst: u64) {
     let s: *mut VG = gs()
+    if (*s).fail_lost && (*s).readbacks >= 2 && !(*s).lost {
+        // FUI_GPU_FAIL=lost: the device "disappears" at the 3rd read-back (a fallback test)
+        (*s).lost = true
+        (*s).ok = false
+    }
     if !(*s).ok || dst == 0 || (*s).rfb == 0 || (*s).rfb >= FB_MAX as u64 || w <= 0 || h <= 0 {
         return
     }
@@ -1381,6 +1397,7 @@ fn vkgl_api(t: *mut gl.GlApi) -> bool {
         }
     }
     (*gs()).fail_compile = fail == "compile"
+    (*gs()).fail_lost = fail == "lost"
     (*t).program = f_program
     (*t).use_program = f_use_program
     (*t).uniform_location = f_uniform_location
@@ -1436,6 +1453,14 @@ fn vkgl_close() {
         vk_mem.x_idle(&(*s).x)
     }
     (*s).ok = false
+}
+
+// True while the device answers: false after a failed submit / wait (and, to test the fallback, from the 3rd read-back on with FUI_GPU_FAIL=lost).
+fn vkgl_alive() -> bool {
+    if G_P == 0 {
+        return false
+    }
+    return (*gs()).ok && !(*gs()).lost
 }
 
 fn vkgl_step() -> i32 {
