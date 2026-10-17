@@ -114,6 +114,14 @@ build themefile
 "$W/themefile" --builtin
 
 echo
+echo "== 2c. THE FLUENT MEASURES (tools/fui/fluent_main.fi) =="
+# Every standard control is painted and MEASURED in pixels against the
+# Windows 11 / Fluent 2 target (button 32, radius 4, toggle 40x20,
+# slider track 4, scrollbar 2 -> 6, menu row 32 ...). Zero deviations.
+build fluent
+"$W/fluent"
+
+echo
 echo "== 3. THE CLOSE CROSS =="
 build capicon
 "$W/capicon"
