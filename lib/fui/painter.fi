@@ -87,6 +87,7 @@ import fui.theme
 import fui.bidi
 import fui.shape
 import fui.fcache
+import fui.glyphcache
 import fui.textcurve
 import fui.gpu
 
@@ -2069,10 +2070,17 @@ fn paint_run(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
     // ---- THE KEPT PICTURE (lib/fui/fcache.fi): a plain run -- one pass,
     // one colour, left to right -- is rastered once and then only written
     // back, wherever it stands at a whole-pixel offset.
-    if !vis && (*r).sh_on == 0 && (*r).out_on == 0 && (*r).grad_on == 0 &&
-    fcache.fc_on() {
-        if paint_run_kept(z, r, sx, base_y, wl, wt, ww, wh, col, p, nn) {
-            return sx + br
+    if !vis && (*r).sh_on == 0 && (*r).out_on == 0 && (*r).grad_on == 0 {
+        if fcache.fc_on() {
+            if paint_run_kept(z, r, sx, base_y, wl, wt, ww, wh, col, p, nn) {
+                return sx + br
+            }
+        } else if glyphcache.gc_on() {
+            // no kept lines, but kept glyphs (lib/fui/glyphcache.fi)
+            if glyph_run_paint(z, r, sx, base_y, wl, wt, ww, wh, col, p, nn,
+            true, 0 as u64 as *mut fcache.CKey) {
+                return sx + br
+            }
         }
     }
     if !raster_window(z, wl, wt, ww, wh, (*r).size, &wx, &wy) {
@@ -2260,6 +2268,118 @@ fn paint_run_gpu(g: *mut gpu.Gpu, z: *mut Painter, r: *mut TextRun, sx: f64,
         0 as u32, 0.0, 0.0)
 }
 
+// ============================================================ KEPT GLYPHS
+//
+// A plain run from the glyph cache (lib/fui/glyphcache.fi): pass 1 makes sure
+// every glyph of the run is kept (rastering the missing ones, one window
+// each), pass 2 composes them into the window of the line, which then goes
+// through the same curve and write-back as a rastered line.
+const GL_MAX: usize = 256
+const GL_MAX_SIZE: f64 = 96.0
+const GL_QX: f64 = 8.0 // x steps per pixel
+const GL_QXI: i64 = 8
+static mut G_GL_BUF: u64 = 0 // GL_MAX blocks (u64) and GL_MAX anchors (i64)
+
+fn glyph_line_prepare(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
+    sx: f64, base_y: f64, ay_out: *mut i64) -> usize {
+    let sz: f64 = (*r).size
+    if sz > GL_MAX_SIZE || sz < 1.0 || n > GL_MAX {
+        return 0
+    }
+    if G_GL_BUF == 0 {
+        G_GL_BUF = rt.heap_alloc(GL_MAX * 16)
+        if G_GL_BUF == 0 {
+            return 0
+        }
+    }
+    let f: *mut ttf.Font = metrics.fontset_font((*z).fm)
+    let sc: f64 = sz / metrics.fm_upem((*z).fm)
+    var ay: f64 = floor_px(base_y)
+    var qy: i64 = glyphcache.gc_quarter(base_y - ay, 4.0)
+    if qy >= 4 {
+        qy = 0
+        ay = ay + 1.0
+    }
+    *ay_out = ay as i64
+    var ww: usize = (sz * 4.0 + 6.0) as usize
+    var wh: usize = (sz * 3.0 + 6.0) as usize
+    if ww > (*z).w || wh > (*z).h {
+        return 0
+    }
+    let k0: u64 = (*z).fm
+    let k2: u64 = __bits(sz)
+    let k3: u64 = ((*r).weight as u64) | (((*r).slant as u64) << 16)
+    var pen: f64 = sx
+    var cnt: usize = 0
+    var i: usize = 0
+    while i < n {
+        var adv: usize = 1
+        let cp: u32 = utf8_at(p, n, i, &adv)
+        let nx: u32 = next_cp(p, n, i, adv)
+        let gid: u32 = ttf.font_glyph_for(f, cp)
+        var ax: f64 = floor_px(pen)
+        var q: i64 = glyphcache.gc_quarter(pen - ax, GL_QX)
+        if q >= GL_QXI {
+            q = 0
+            ax = ax + 1.0
+        }
+        let k4: u64 = (q as u64) | ((qy as u64) << 8)
+        var e: u64 = glyphcache.gc_find(k0, gid as u64, k2, k3, k4)
+        if e == 0 {
+            let wox: f64 = floor_px(ax - sz - 2.0)
+            let woy: f64 = floor_px(ay - 2.0 * sz - 2.0)
+            if !raster.raster_begin(&(*z).ra, wox, woy, ww, wh) {
+                return 0
+            }
+            glyph_into(z, r, f, gid, ax + (q as f64) / GL_QX,
+                ay + (qy as f64) * 0.25, sc)
+            raster.raster_finish(&(*z).ra)
+            e = glyphcache.gc_put(k0, gid as u64, k2, k3, k4, &(*z).ra,
+                wox as i64, woy as i64, ax as i64, ay as i64)
+            if e == 0 {
+                return 0
+            }
+        }
+        *((G_GL_BUF + (cnt * 8) as u64) as *mut u64) = e
+        *((G_GL_BUF + (GL_MAX * 8 + cnt * 8) as u64) as *mut i64) = ax as i64
+        cnt = cnt + 1
+        pen = pen + advance_of(z, r, cp, nx)
+        i = i + adv
+    }
+    return cnt
+}
+
+// True when the run was painted here. `k` (or null): the line cache key
+// the finished coverage is kept under.
+fn glyph_run_paint(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
+    wl: f64, wt: f64, ww: f64, wh: f64, col: u32, p: u64, nn: usize,
+    cut: bool, k: *mut fcache.CKey) -> bool {
+    var ay: i64 = 0
+    let cnt: usize = glyph_line_prepare(z, r, p, nn, sx, base_y, &ay)
+    if cnt == 0 {
+        return false
+    }
+    var wx: f64 = 0.0
+    var wy: f64 = 0.0
+    if !raster_window_at(z, wl, wt, ww, wh, (*r).size, &wx, &wy, cut) {
+        return false
+    }
+    var j: usize = 0
+    while j < cnt {
+        glyphcache.gc_compose(*((G_GL_BUF + (j * 8) as u64) as *mut u64),
+            &(*z).ra, wx as i64, wy as i64,
+            *((G_GL_BUF + (GL_MAX * 8 + j * 8) as u64) as *mut i64), ay)
+        j = j + 1
+    }
+    textcurve.tc_apply(&(*z).ra, textcurve.tc_bucket(mit_alpha(col)))
+    if k as u64 != 0 {
+        fcache.fc_store(k, p, nn, &(*z).ra, wx, wy, floor_px(sx) as i64,
+            floor_px(base_y) as i64)
+    }
+    flush_raster(z, wx, wy, col)
+    return true
+}
+
 // A PLAIN RUN THROUGH THE CACHE. True when it was painted here (from
 // the cache, or rastered and kept); false sends the caller the old way --
 // the window would be cut by the canvas edge, or it does not fit into the
@@ -2303,6 +2423,12 @@ fn paint_run_kept(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
     if x1 <= canvas.clip_x0(cv) || x0 >= canvas.clip_x1(cv) ||
     y1 <= canvas.clip_y0(cv) || y0 >= canvas.clip_y1(cv) {
         return true
+    }
+    if glyphcache.gc_on() {
+        if glyph_run_paint(z, r, sx, base_y, wl, wt, ww, wh, col, p, nn,
+        false, &k) {
+            return true
+        }
     }
     var wx: f64 = 0.0
     var wy: f64 = 0.0

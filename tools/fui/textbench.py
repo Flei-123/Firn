@@ -139,12 +139,13 @@ def main():
     try:
         exe = build(tmp)
         on = off = None
-        cold, warm = [], []
+        cold, warm, glyph = [], [], []
         for i in range(a.runs):
             on = run(exe, a.font, os.path.join(tmp, "on"), False)
             off = run(exe, a.font, os.path.join(tmp, "off"), True)
             cold.append(min(on["ns_cold"], off["ns_cold"]))
             warm.append(min(on["ns_warm"], off["ns_warm"]))
+            glyph.append(min(on["ns_glyph"], off["ns_glyph"]))
         fails = []
         # ---- fidelity (curve off, black on white)
         print("fidelity (curve off, black on white): coverage vs FreeType 16x reference")
@@ -192,7 +193,12 @@ def main():
         # ---- time
         print("time (best of %d), 40 chars at 16 px: cold %.0f us, warm %.0f us per line" % (
             a.runs, min(cold) / 1000.0, min(warm) / 1000.0))
-        print("RESULT cold_us=%.1f warm_us=%.1f" % (min(cold) / 1000.0, min(warm) / 1000.0))
+        print("glyph cache (new line of known glyphs, no kept lines): %.0f us per line (cold/glyph = %.2fx)" % (
+            min(glyph) / 1000.0, min(cold) / max(1.0, min(glyph))))
+        print("RESULT cold_us=%.1f warm_us=%.1f glyph_us=%.1f" % (
+            min(cold) / 1000.0, min(warm) / 1000.0, min(glyph) / 1000.0))
+        if min(glyph) * 1.5 > min(cold):
+            fails.append("glyph cache is not >= 1.5x faster than cold")
         if a.check:
             if fails:
                 print("TEXTBENCH FAILED: " + ", ".join(fails))

@@ -1,0 +1,248 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/glyphcache.fi -- THE GLYPH CACHE (fUi W14, 17.10.2026).
+//
+// `fcache.fi` keeps whole LINES. A line that was never painted before (a
+// new chat message, a counter, a changing label) still pays for every glyph:
+// outline, edges, accumulate, finish -- about 9 us per glyph at 16 px. But
+// the glyphs themselves repeat all the time. So the finished coverage of ONE
+// glyph is kept, per font, glyph id, size, weight, slant and SUBPIXEL STEP
+// of its position (x: 1/8 px, y: 1/4 px), as 8-bit coverage. A line is then composed
+// from the kept glyphs into the rasteriser's window (`gc_compose`), and
+// goes on through the unchanged write-back (curve, `canvas_fill_raster`).
+//
+// WHAT CHANGES against rastering the whole line: the pen of every glyph is
+// rounded to 1/8 px in x (1/4 px in y),
+// coverage to 1/255, and two glyphs that touch the same pixel combine as
+// a + b - a*b instead of one accumulator sum. Measured against FreeType
+// in tools/fui/textbench.py; switch off with `gc_set_budget(0)`.
+//
+// Memory: one allocation per glyph, a hash table of chains. When the budget
+// is full the WHOLE cache is dropped and refills from what is painted next
+// (a glyph set is small; a clock sweep would cost more than it saves).
+import std.rt
+import font.raster
+
+export {
+    gc_on, gc_set_budget, gc_budget, gc_used, gc_count, gc_hits, gc_misses,
+    gc_find, gc_put, gc_compose, gc_clear, gc_quarter,
+}
+
+const BUCKETS: usize = 2048
+
+// block layout (words)
+const G_NEXT: u64 = 0
+const G_HASH: u64 = 8
+const G_K0: u64 = 16 // font set
+const G_K1: u64 = 24 // gid
+const G_K2: u64 = 32 // size bits
+const G_K3: u64 = 40 // weight | slant << 16
+const G_K4: u64 = 48 // qx | qy << 8
+const G_BW: u64 = 56
+const G_BH: u64 = 64
+const G_OX: u64 = 72 // i64, from the whole-pixel anchor
+const G_OY: u64 = 80
+const G_SIZE: u64 = 88
+const G_HDR: u64 = 96
+
+static mut G_TABLE: u64 = 0
+static mut G_BUDGET: usize = 4194304 // 4 MiB
+static mut G_USED: usize = 0
+static mut G_COUNT: usize = 0
+static mut G_HITS: u64 = 0
+static mut G_MISSES: u64 = 0
+
+fn ld(p: u64, off: u64) -> u64 { return *((p + off) as *mut u64) }
+fn st(p: u64, off: u64, v: u64) { *((p + off) as *mut u64) = v }
+
+fn gc_on() -> bool { return G_BUDGET > 0 }
+fn gc_budget() -> usize { return G_BUDGET }
+fn gc_used() -> usize { return G_USED }
+fn gc_count() -> usize { return G_COUNT }
+fn gc_hits() -> u64 { return G_HITS }
+fn gc_misses() -> u64 { return G_MISSES }
+
+// 0 switches the cache off and gives back what it held.
+fn gc_set_budget(n: usize) {
+    G_BUDGET = n
+    if n == 0 {
+        gc_clear()
+    }
+}
+
+// A position in 1/`steps` pixels: `frac` in [0, 1) -> 0..steps (steps = carry).
+fn gc_quarter(frac: f64, steps: f64) -> i64 {
+    return (frac * steps + 0.5) as i64
+}
+
+fn gc_clear() {
+    if G_TABLE == 0 {
+        return
+    }
+    var i: usize = 0
+    while i < BUCKETS {
+        var e: u64 = ld(G_TABLE, (i * 8) as u64)
+        while e != 0 {
+            let nx: u64 = ld(e, G_NEXT)
+            rt.heap_free(e, ld(e, G_SIZE) as usize)
+            e = nx
+        }
+        st(G_TABLE, (i * 8) as u64, 0)
+        i = i + 1
+    }
+    G_USED = 0
+    G_COUNT = 0
+}
+
+fn hash_of(k0: u64, k1: u64, k2: u64, k3: u64, k4: u64) -> u64 {
+    let pr: u64 = 1099511628211
+    var h: u64 = 14695981039346656037
+    h = (h ^ k0) *% pr
+    h = (h ^ k1) *% pr
+    h = (h ^ k2) *% pr
+    h = (h ^ k3) *% pr
+    h = (h ^ k4) *% pr
+    h = h ^ (h >> 29)
+    return h
+}
+
+// The kept glyph, 0 when there is none.
+fn gc_find(k0: u64, k1: u64, k2: u64, k3: u64, k4: u64) -> u64 {
+    if G_TABLE == 0 {
+        return 0
+    }
+    let h: u64 = hash_of(k0, k1, k2, k3, k4)
+    var e: u64 = ld(G_TABLE, (h % (BUCKETS as u64)) * 8)
+    while e != 0 {
+        if ld(e, G_HASH) == h && ld(e, G_K0) == k0 && ld(e, G_K1) == k1 &&
+        ld(e, G_K2) == k2 && ld(e, G_K3) == k3 && ld(e, G_K4) == k4 {
+            G_HITS = G_HITS + 1
+            return e
+        }
+        e = ld(e, G_NEXT)
+    }
+    G_MISSES = G_MISSES + 1
+    return 0
+}
+
+// Keep the FINISHED coverage in `ra` (window origin (wx, wy) on the canvas)
+// as the glyph of this key, relative to the anchor (ax, ay). Returns the
+// block, 0 when memory is short.
+fn gc_put(k0: u64, k1: u64, k2: u64, k3: u64, k4: u64,
+    ra: *mut raster.Raster, wx: i64, wy: i64, ax: i64, ay: i64) -> u64 {
+    if G_BUDGET == 0 {
+        return 0
+    }
+    if G_TABLE == 0 {
+        G_TABLE = rt.heap_alloc(BUCKETS * 8)
+        if G_TABLE == 0 {
+            return 0
+        }
+        var i: usize = 0
+        while i < BUCKETS {
+            st(G_TABLE, (i * 8) as u64, 0)
+            i = i + 1
+        }
+    }
+    let x0: usize = raster.raster_used_x0(ra)
+    let x1: usize = raster.raster_used_x1(ra)
+    let y0: usize = raster.raster_used_y0(ra)
+    let y1: usize = raster.raster_used_y1(ra)
+    var bw: usize = 0
+    var bh: usize = 0
+    if x1 > x0 && y1 > y0 {
+        bw = x1 - x0
+        bh = y1 - y0
+    }
+    let size: usize = (G_HDR as usize) + bw * bh
+    if G_USED + size > G_BUDGET {
+        gc_clear()
+    }
+    let e: u64 = rt.heap_alloc(size)
+    if e == 0 {
+        return 0
+    }
+    let h: u64 = hash_of(k0, k1, k2, k3, k4)
+    st(e, G_HASH, h)
+    st(e, G_K0, k0)
+    st(e, G_K1, k1)
+    st(e, G_K2, k2)
+    st(e, G_K3, k3)
+    st(e, G_K4, k4)
+    st(e, G_BW, bw as u64)
+    st(e, G_BH, bh as u64)
+    st(e, G_OX, (wx + (x0 as i64) - ax) as% u64)
+    st(e, G_OY, (wy + (y0 as i64) - ay) as% u64)
+    st(e, G_SIZE, size as u64)
+    let cov: u64 = e + G_HDR
+    var y: usize = 0
+    while y < bh {
+        let row: u64 = raster.raster_cov_row(ra, y0 + y) + (x0 * 8) as u64
+        var x: usize = 0
+        while x < bw {
+            let v: f64 = *((row + (x * 8) as u64) as *mut f64)
+            var q: i64 = (v * 255.0 + 0.5) as i64
+            if q > 255 { q = 255 }
+            if q < 0 { q = 0 }
+            *((cov + (y * bw + x) as u64) as *mut u8) = q as u8
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let slot: u64 = G_TABLE + (h % (BUCKETS as u64)) * 8
+    st(e, G_NEXT, *(slot as *mut u64))
+    *(slot as *mut u64) = e
+    G_USED = G_USED + size
+    G_COUNT = G_COUNT + 1
+    return e
+}
+
+// Compose the kept glyph `e`, anchored at the canvas pixel (ax, ay), into the
+// window of `ra` whose top left corner is the canvas pixel (wx, wy). Cells
+// outside the window are skipped. a + b - a*b where glyphs overlap.
+fn gc_compose(e: u64, ra: *mut raster.Raster, wx: i64, wy: i64, ax: i64, ay: i64) {
+    let bw: usize = ld(e, G_BW) as usize
+    let bh: usize = ld(e, G_BH) as usize
+    if bw == 0 || bh == 0 {
+        return
+    }
+    let px: i64 = ax + (ld(e, G_OX) as% i64) - wx // block corner in window cells
+    let py: i64 = ay + (ld(e, G_OY) as% i64) - wy
+    let rw: i64 = raster.raster_width(ra) as i64
+    let rh: i64 = raster.raster_height(ra) as i64
+    var cx0: i64 = 0
+    var cy0: i64 = 0
+    var cx1: i64 = bw as i64
+    var cy1: i64 = bh as i64
+    if px < 0 { cx0 = 0 - px }
+    if py < 0 { cy0 = 0 - py }
+    if px + cx1 > rw { cx1 = rw - px }
+    if py + cy1 > rh { cy1 = rh - py }
+    if cx1 <= cx0 || cy1 <= cy0 {
+        return
+    }
+    let cov: u64 = e + G_HDR
+    var y: i64 = cy0
+    while y < cy1 {
+        let row: u64 = raster.raster_cov_row(ra, (py + y) as usize) + (((px + cx0) as usize) * 8) as u64
+        let src: u64 = cov + ((y as usize) * bw + (cx0 as usize)) as u64
+        var x: usize = 0
+        let n: usize = (cx1 - cx0) as usize
+        while x < n {
+            let q: u8 = *((src + x as u64) as *mut u8)
+            if q != 0 as u8 {
+                let a: f64 = (q as f64) * 0.00392156862745098
+                let p: u64 = row + (x * 8) as u64
+                let b: f64 = *(p as *mut f64)
+                if b == 0.0 {
+                    *(p as *mut f64) = a
+                } else {
+                    *(p as *mut f64) = b + a - b * a
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    raster.raster_mark(ra, (px + cx0) as usize, (py + cy0) as usize,
+        (px + cx1) as usize, (py + cy1) as usize)
+}
