@@ -76,7 +76,7 @@ export {
     host_set_router, host_router, host_pointer, host_pointer_cancel,
     PE_DOWN, PE_MOVE, PE_UP, PE_CANCEL, PE_LEAVE,
     host_resize, host_expose, host_set_scale, host_touch,
-    host_tick, host_set_transitions, host_painted_at, host_set_refresh_hz, host_set_smooth_wheel, host_set_overscroll, host_refresh_hz, host_pointer_type, host_wait_ms, host_dirty, host_painted, host_frames,
+    host_tick, host_set_transitions, host_painted_at, host_set_refresh_hz, host_set_smooth_wheel, host_set_overscroll, host_pointer_x, host_pointer_y, host_refresh_hz, host_pointer_type, host_wait_ms, host_dirty, host_painted, host_frames,
     host_after_layout, host_take_activated, host_panel,
     host_kbd_viewport, host_chars, host_focus,
     host_set_hook, HOOK_MOVE, HOOK_LEAVE, HOOK_DOWN, HOOK_UP, HOOK_WHEEL,
@@ -220,6 +220,14 @@ struct Host {
     // the wheel glides instead of jumping (the window host switches it on)
     smooth_wheel: bool,
     overscroll: bool,
+    // W7: 1000 Hz mice. More than MOVE_BURST moves within one loop turn
+    // (same host_tick time) are coalesced: only the last position is kept
+    // and applied at the next tick.
+    mv_turn: i64,
+    mv_n: usize,
+    mv_pend: bool,
+    mv_x: f64,
+    mv_y: f64,
 }
 
 fn cx_none(ud: u64, target: usize, x: f64, y: f64, ay: f64, source: u32, mods: u32) -> bool {
@@ -427,7 +435,8 @@ fn host_new(sc: *mut scene.Scene, c: *mut render.Ctx) -> Host {
         pop_key: pop_key_none, pop_chr: pop_key_none, pop_tick: pop_tick_none,
         pop_wait: pop_wait_none, pop_note: pop_note_none, has_pop: 0 as u32,
         wake_ud: 0, wake_tick: wake_tick_none, wake_wait: wake_wait_none, has_wake: 0 as u32,
-        pace: pacing.pacer_new(60), pnow: 0, paced_dirty: false, smooth_wheel: false, overscroll: false }
+        pace: pacing.pacer_new(60), pnow: 0, paced_dirty: false, smooth_wheel: false, overscroll: false,
+        mv_turn: 0 - 1, mv_n: 0, mv_pend: false, mv_x: 0.0, mv_y: 0.0 }
 }
 
 // Hang the panel on the tree. Call AFTER building the tree, and
@@ -530,7 +539,38 @@ fn host_touch(w: *mut Host) {
 
 // ------------------------------------------------------------ the pointer
 
+const MOVE_BURST: usize = 6
+
+// Where the pointer was last processed (not a swallowed burst move).
+fn host_pointer_x(w: *mut Host) -> f64 { return (*w).px }
+fn host_pointer_y(w: *mut Host) -> f64 { return (*w).py }
+
 fn host_pointer_move(w: *mut Host, x: f64, y: f64) -> u32 {
+    if (*w).now == (*w).mv_turn {
+        (*w).mv_n = (*w).mv_n + 1
+        if (*w).mv_n > MOVE_BURST {
+            (*w).mv_pend = true
+            (*w).mv_x = x
+            (*w).mv_y = y
+            return control.CH_NONE
+        }
+    } else {
+        (*w).mv_turn = (*w).now
+        (*w).mv_n = 1
+    }
+    (*w).mv_pend = false
+    return pointer_move_now(w, x, y)
+}
+
+// Moves swallowed by the burst limit: the last one is applied now.
+fn flush_pending_move(w: *mut Host) {
+    if (*w).mv_pend {
+        (*w).mv_pend = false
+        let c: u32 = pointer_move_now(w, (*w).mv_x, (*w).mv_y)
+    }
+}
+
+fn pointer_move_now(w: *mut Host, x: f64, y: f64) -> u32 {
     (*w).px = x
     (*w).py = y
     (*w).inside = true
@@ -984,6 +1024,7 @@ fn host_set_scale(w: *mut Host, m: *mut theme.Theme, promille: usize) {
 fn host_tick(w: *mut Host, ms: i64) {
     (*w).now = ms
     (*w).pnow = ms
+    flush_pending_move(w)
     if host_popup_open(w) {
         let ft: fn(u64, i64) -> u32 = (*w).pop_tick
         let pr: u32 = ft((*w).pop_ud, ms)
@@ -1066,6 +1107,9 @@ fn host_wait_ms(w: *mut Host) -> i64 {
 }
 
 fn host_wait_base(w: *mut Host) -> i64 {
+    if (*w).mv_pend {
+        return 0
+    }
     if (*w).dirty {
         // an event made it dirty: paint NOW (latency beats rate); a running
         // animation made it dirty: wait for the next slot of the refresh grid
