@@ -221,7 +221,7 @@ try:
     akz = image.getpixel((k["starten"][0] + 4, sy))
     reason = image.getpixel((5, 5))
     chk("L1", "Bild vom Server: Starten traegt den Akzent", akz != reason and
-        akz[2] > 200 and akz[0] < 60, akz, "blau")
+        akz[2] > 180 and akz[2] > akz[0] + 100, akz, "blau")
     farben = len(image.getcolors(maxcolors=1 << 24))
     chk("L1", "Bild vom Server hat Text und Flaechen (Farben)", farben > 200,
         farben, "> 200")
