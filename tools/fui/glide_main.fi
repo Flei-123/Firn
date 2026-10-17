@@ -1,0 +1,266 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/glide_main.fi -- W7 / r205: toggle, checkbox, radio, slider core
+// and scrollbar GLIDE between their states (anim channels), and only their
+// own rectangle is dirty while they do.
+//
+// A simulated clock drives a Ctx with a bound registry; everything is
+// measured from painted pixels:
+//   * toggle: thumb centroid (0 = left end, 1 = right end) at 0 / 40 / 83 /
+//     200 ms after the value flips -- starts at 0, passes through the
+//     middle, arrives at 1, never overshoots;
+//   * checkbox: tick ink (sum of channel differences against a clean box
+//     pixel) grows 0 -> partial -> full and shrinks back;
+//   * slider core: accent area grows with hover, not at once;
+//   * scrollbar: thumb thickness 2 -> 6 px over time;
+//   * dirty: while a channel runs the registry is bounded (no unnamed work),
+//     its rectangle is far smaller than the canvas, and it is clean when
+//     the motion has arrived;
+//   * a static ctx without a registry paints the target at once.
+import std.rt
+import paint.canvas
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+import fui.wave2
+import fui.anim
+import fui.damage
+
+const W: usize = 360
+const H: usize = 260
+
+static mut G_ERRORS: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_int(v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn check(name: str, ok: bool, got: i64, want: i64) {
+    say("  ")
+    say(name)
+    var k: usize = name.n
+    while k < 62 {
+        say(" ")
+        k = k + 1
+    }
+    if ok {
+        say("OK    got ")
+    } else {
+        say("WRONG got ")
+        G_ERRORS = G_ERRORS + 1
+    }
+    say_int(got)
+    say(" want ")
+    say_int(want)
+    say("\n")
+}
+
+fn chan_diff(a: u32, b: u32) -> i64 {
+    var d: i64 = 0
+    var sh: u32 = 0 as u32
+    while sh < 24 as u32 {
+        let x: i64 = ((a >> sh) & 255 as u32) as i64
+        let y: i64 = ((b >> sh) & 255 as u32) as i64
+        if x > y { d = d + x - y } else { d = d + y - x }
+        sh = sh + 8 as u32
+    }
+    return d
+}
+
+fn px(cv: *mut canvas.Canvas, x: usize, y: usize) -> u32 {
+    return canvas.canvas_get(cv, x, y) & 16777215 as u32
+}
+
+// Thumb centroid of the toggle at (x, y, w, h) as 0..1000 of the travel.
+fn thumb_pos(cv: *mut canvas.Canvas, x: usize, y: usize, w: usize, h: usize) -> i64 {
+    let ym: usize = y + h / 2
+    let yr: usize = y + 4
+    var sw: i64 = 0
+    var sx: i64 = 0
+    var cx: usize = x + 4
+    let cend: usize = x + w - 4
+    while cx <= cend {
+        let d: i64 = chan_diff(px(cv, cx, ym), px(cv, cx, yr))
+        sw = sw + d
+        sx = sx + d * (cx as i64)
+        cx = cx + 1
+    }
+    if sw == 0 {
+        return 0 - 1
+    }
+    // centroid -> 0..1000 of the thumb-centre travel (x + h/2 .. x + w - h/2)
+    let cen: i64 = (sx * 1000) / sw
+    return ((cen - ((x + h / 2) as i64) * 1000) * 1000) / (((w - h) as i64) * 1000)
+}
+
+// Tick ink inside a box: differences to the clean pixel left of the tick.
+fn tick_ink(cv: *mut canvas.Canvas, bx: usize, by: usize, d: usize) -> i64 {
+    let rf: u32 = px(cv, bx + 2, by + d / 2)
+    var s: i64 = 0
+    var yy: usize = by + 3
+    while yy < by + d - 3 {
+        var xx: usize = bx + 4
+        while xx < bx + d - 3 {
+            s = s + chan_diff(px(cv, xx, yy), rf)
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    return s
+}
+
+// Pixels close to `col` in a rectangle.
+fn count_near(cv: *mut canvas.Canvas, x0: usize, y0: usize, w: usize, h: usize,
+    col: u32) -> i64 {
+    var n: i64 = 0
+    var yy: usize = y0
+    while yy < y0 + h {
+        var xx: usize = x0
+        while xx < x0 + w {
+            if chan_diff(px(cv, xx, yy), col) < 40 {
+                n = n + 1
+            }
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    return n
+}
+
+fn frame(cv: *mut canvas.Canvas, m: *mut theme.Theme, c: *mut render.Ctx,
+    reg: *mut anim.TransReg, ms: i64, ws: *mut [widget.Widget; 5]) {
+    canvas.canvas_clear(cv, theme.opaque((*theme.theme_colors(m)).base))
+    render.ctx_set_time(c, ms)
+    anim.transreg_new_frame(reg)
+    var k: usize = 0
+    while k < 5 {
+        wave2.draw_any(c, &(*ws)[k])
+        k = k + 1
+    }
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, W, H) {
+        return 4
+    }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, W, 200) {
+        return 5
+    }
+    var m: theme.Theme = theme.theme_new(true)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    var reg: anim.TransReg = anim.transreg_new()
+    anim.transreg_bind(&reg, &c)
+
+    var ws: [widget.Widget; 5] = [widget.widget_new(widget.KIND_TOGGLE); 5]
+    ws[0] = widget.widget_new(widget.KIND_TOGGLE)
+    widget.w_place(&ws[0], 20.0, 20.0, 200.0, 32.0)
+    ws[1] = widget.widget_new(widget.KIND_CHECKBOX)
+    widget.w_place(&ws[1], 20.0, 70.0, 200.0, 32.0)
+    ws[2] = widget.widget_new(widget.KIND_SLIDER)
+    widget.w_place(&ws[2], 20.0, 120.0, 200.0, 32.0)
+    widget.w_set_value(&ws[2], 500)
+    ws[3] = widget.widget_new(widget.KIND_SCROLLBAR)
+    widget.w_place(&ws[3], 300.0, 20.0, 12.0, 200.0)
+    widget.w_set_value(&ws[3], 300)
+    widget.w_set_pref(&ws[3], 12.0, 300.0)
+    ws[4] = widget.widget_new(widget.KIND_RADIO)
+    widget.w_place(&ws[4], 20.0, 180.0, 200.0, 32.0)
+
+    // ---- rest
+    frame(&cv, &m, &c, &reg, 1000, &ws)
+    let tg0: i64 = thumb_pos(&cv, 20, 26, 40, 20)
+    let ink_rest: i64 = tick_ink(&cv, 20, 76, 20)
+    let acc: u32 = (*theme.theme_colors(&m)).accent & 16777215 as u32
+    let core_rest: i64 = count_near(&cv, 108, 124, 24, 24, acc)
+    let sb_rest: i64 = count_near(&cv, 296, 70, 20, 30, px(&cv, 306, 90))
+    check("toggle rests at the left end", tg0 > 0 - 60 && tg0 < 60, tg0, 0)
+    check("registry is clean at rest", !anim.transreg_dirty(&reg), 0, 0)
+
+    // ---- everything flips / hovers at t=1000
+    widget.w_set_value(&ws[0], 1)
+    widget.w_set_value(&ws[1], 1)
+    widget.w_set_value(&ws[4], 1)
+    widget.w_set_hover(&ws[2], true)
+    widget.w_set_hover(&ws[3], true)
+    frame(&cv, &m, &c, &reg, 1000, &ws)
+    let tg_a: i64 = thumb_pos(&cv, 20, 26, 40, 20)
+    check("toggle at flip time (t=0) is still at the left", tg_a < 80, tg_a, 0)
+    check("registry is busy while the channels run", anim.transreg_dirty(&reg), 1, 1)
+    check("only channels run: the dirty work has a rectangle",
+        anim.transreg_bounded(&reg), 1, 1)
+
+    frame(&cv, &m, &c, &reg, 1040, &ws)
+    let tg_b: i64 = thumb_pos(&cv, 20, 26, 40, 20)
+    let ink_b: i64 = tick_ink(&cv, 20, 76, 20)
+    let core_c: i64 = count_near(&cv, 108, 124, 24, 24, acc)
+    let sb_b: i64 = count_near(&cv, 296, 70, 20, 30, px(&cv, 306, 90))
+    frame(&cv, &m, &c, &reg, 1083, &ws)
+    let tg_c: i64 = thumb_pos(&cv, 20, 26, 40, 20)
+    let ink_c: i64 = tick_ink(&cv, 20, 76, 20)
+    var dm: [i64; 4] = [0; 4]
+    let bd: bool = damage.dmg_clamp(anim.transreg_damage(&reg), W, H, &dm)
+    var area: usize = 0
+    if bd {
+        area = damage.dmg_area(&dm)
+    }
+    check("the dirty rectangle exists and is smaller than the canvas",
+        bd && area < W * H, area as i64, (W * H) as i64)
+    frame(&cv, &m, &c, &reg, 1200, &ws)
+    let tg_d: i64 = thumb_pos(&cv, 20, 26, 40, 20)
+    let ink_d: i64 = tick_ink(&cv, 20, 76, 20)
+    let core_d: i64 = count_near(&cv, 108, 124, 24, 24, acc)
+    let sb_d: i64 = count_near(&cv, 296, 70, 20, 30, px(&cv, 306, 90))
+    check("toggle: thumb is on its way at 40 ms", tg_b > tg_a && tg_b < 900, tg_b, 500)
+    check("toggle: further at 83 ms", tg_c > tg_b, tg_c, tg_b)
+    check("toggle arrives at the right end", tg_d > 940 && tg_d <= 1000, tg_d, 1000)
+    check("checkbox: no tick at rest", ink_rest < 50, ink_rest, 0)
+    check("checkbox: tick is writing itself at 40 ms", ink_b > ink_rest, ink_b, 1)
+    check("checkbox: more tick at 83 ms", ink_c > ink_b, ink_c, ink_b)
+    check("checkbox: full tick at the end", ink_d > ink_c, ink_d, ink_c)
+    check("slider core is not at its end size at 40 ms", core_c != core_d, core_c, core_d)
+    check("slider core swells on hover", core_d > core_rest, core_d, core_rest)
+    check("registry is clean once everything arrived", !anim.transreg_dirty(&reg), 0, 0)
+
+    // ---- back off: tick shrinks again
+    widget.w_set_value(&ws[1], 0)
+    frame(&cv, &m, &c, &reg, 1300, &ws)
+    frame(&cv, &m, &c, &reg, 1340, &ws)
+    let ink_e: i64 = tick_ink(&cv, 20, 76, 20)
+    check("checkbox: tick shrinks on the way back", ink_e < ink_d && ink_e > 0, ink_e, ink_d)
+    frame(&cv, &m, &c, &reg, 1500, &ws)
+    let ink_f: i64 = tick_ink(&cv, 20, 76, 20)
+    check("checkbox: tick gone at the end", ink_f < 50, ink_f, 0)
+
+    // ---- scrollbar: 2 -> 6 px (the hover flip happened at t=1000)
+    check("scrollbar: thin at rest, thick after hover", sb_d > sb_rest * 2, sb_d, sb_rest)
+    check("scrollbar: halfway thick at 40 ms", sb_b > sb_rest && sb_b < sb_d, sb_b, sb_d)
+
+    // ---- no registry: the target at once
+    anim.transreg_unbind(&reg, &c)
+    widget.w_set_value(&ws[0], 0)
+    canvas.canvas_clear(&cv, theme.opaque((*theme.theme_colors(&m)).base))
+    wave2.draw_any(&c, &ws[0])
+    let tg_s: i64 = thumb_pos(&cv, 20, 26, 40, 20)
+    check("without a registry the target is painted at once", tg_s > 0 - 60 && tg_s < 60, tg_s, 0)
+
+    say("\n")
+    if G_ERRORS == 0 {
+        say("GLIDE PASSED.\n")
+        return 0
+    }
+    say("GLIDE FAILED: ")
+    say_int(G_ERRORS as i64)
+    say("\n")
+    return 1
+}
