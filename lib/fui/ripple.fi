@@ -1,0 +1,230 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/ripple.fi -- RIPPLE (Material-style press wave), time based on lib/fui/anim.
+//
+// A press starts a circle at the pointer that grows to the farthest corner of the control
+// (Fluent "decelerate" curve, EXPAND_MS); the release starts a fade-out (FADE_MS). The state is a few
+// timestamps, so it does not depend on the frame rate: the same moment gives the same circle
+// at 30 and at 144 Hz. At most RIPPLES slots; a fifth press replaces the oldest one.
+//
+//     var rp: ripple.Ripples = ripple.ripples_new()
+//     ripple.press(&rp, now_ms, px, py, x, y, w, h)       // pointer down on the control rect
+//     ripple.release(&rp, now_ms)                         // pointer up / cancel
+//     ripple.paint(z, &rp, now_ms, x, y, w, h, corner, argb)   // inside the control's paint
+//     if ripple.busy(&rp, now_ms) { /* ask for the next frame */ }
+//
+// The paint clips to the control rect and fills a circle; `argb` carries the colour AND the peak
+// alpha (alpha 0 is treated as the default PEAK_ALPHA). OFF SWITCH: `set_enabled(&rp, false)`
+// (hosts read FUI_NO_RIPPLE) -- then `press` records nothing and `paint` draws nothing.
+import paint.canvas
+import fui.painter
+import fui.anim
+
+export {
+    Ripples, ripples_new, set_enabled, enabled, press, release, paint, busy, count, clear,
+    radius_at, alpha_at, max_radius, RIPPLES, EXPAND_MS, FADE_MS, PEAK_ALPHA,
+}
+
+const RIPPLES: usize = 4
+const EXPAND_MS: i64 = 450
+const FADE_MS: i64 = 300
+const PEAK_ALPHA: u32 = 40 // of 255, about 16 %
+
+struct Ripples {
+    on: u32,
+    used: [u32; 4],
+    t0: [i64; 4],       // press time
+    t1: [i64; 4],       // release time, -1 = still held
+    cx: [f64; 4],       // centre
+    cy: [f64; 4],
+    rmax: [f64; 4],     // final radius
+    ease: anim.Easing,
+}
+
+fn ripples_new() -> Ripples {
+    return Ripples {
+        on: 1 as u32,
+        used: [0 as u32, 0 as u32, 0 as u32, 0 as u32],
+        t0: [0, 0, 0, 0],
+        t1: [0 - 1, 0 - 1, 0 - 1, 0 - 1],
+        cx: [0.0, 0.0, 0.0, 0.0],
+        cy: [0.0, 0.0, 0.0, 0.0],
+        rmax: [0.0, 0.0, 0.0, 0.0],
+        ease: anim.easing_fluent_decel(),
+    }
+}
+
+fn set_enabled(rp: *mut Ripples, on: bool) {
+    if on {
+        (*rp).on = 1 as u32
+    } else {
+        (*rp).on = 0 as u32
+        clear(rp)
+    }
+}
+
+fn enabled(rp: *mut Ripples) -> bool { return (*rp).on != 0 as u32 }
+
+fn clear(rp: *mut Ripples) {
+    var i: usize = 0
+    while i < RIPPLES {
+        (*rp).used[i] = 0 as u32
+        i = i + 1
+    }
+}
+
+fn sqrt_f(v: f64) -> f64 {
+    if v <= 0.0 {
+        return 0.0
+    }
+    var x: f64 = v
+    if x < 1.0 {
+        x = 1.0
+    }
+    var i: usize = 0
+    while i < 24 {
+        x = 0.5 * (x + v / x)
+        i = i + 1
+    }
+    return x
+}
+
+// distance from (px,py) to the farthest corner of the rect
+fn max_radius(px: f64, py: f64, x: f64, y: f64, w: f64, h: f64) -> f64 {
+    var dx: f64 = px - x
+    if x + w - px > dx {
+        dx = x + w - px
+    }
+    var dy: f64 = py - y
+    if y + h - py > dy {
+        dy = y + h - py
+    }
+    return sqrt_f(dx * dx + dy * dy)
+}
+
+fn finished(rp: *mut Ripples, i: usize, now: i64) -> bool {
+    if (*rp).used[i] == 0 as u32 {
+        return true
+    }
+    let t1: i64 = (*rp).t1[i]
+    return t1 >= 0 && now - t1 >= FADE_MS && now - (*rp).t0[i] >= EXPAND_MS
+}
+
+// Starts a ripple at the pointer (px,py) on the control rect (x,y,w,h). Returns the slot or RIPPLES.
+fn press(rp: *mut Ripples, now: i64, px: f64, py: f64, x: f64, y: f64, w: f64, h: f64) -> usize {
+    if (*rp).on == 0 as u32 {
+        return RIPPLES
+    }
+    // slot: a free or finished one, else the oldest
+    var slot: usize = RIPPLES
+    var i: usize = 0
+    while i < RIPPLES {
+        if finished(rp, i, now) {
+            slot = i
+            i = RIPPLES
+        } else {
+            i = i + 1
+        }
+    }
+    if slot == RIPPLES {
+        slot = 0
+        i = 1
+        while i < RIPPLES {
+            if (*rp).t0[i] < (*rp).t0[slot] {
+                slot = i
+            }
+            i = i + 1
+        }
+    }
+    (*rp).used[slot] = 1 as u32
+    (*rp).t0[slot] = now
+    (*rp).t1[slot] = 0 - 1
+    (*rp).cx[slot] = px
+    (*rp).cy[slot] = py
+    (*rp).rmax[slot] = max_radius(px, py, x, y, w, h)
+    return slot
+}
+
+// release: every still-held ripple starts to fade
+fn release(rp: *mut Ripples, now: i64) {
+    var i: usize = 0
+    while i < RIPPLES {
+        if (*rp).used[i] != 0 as u32 && (*rp).t1[i] < 0 {
+            (*rp).t1[i] = now
+        }
+        i = i + 1
+    }
+}
+
+fn radius_at(rp: *mut Ripples, i: usize, now: i64) -> f64 {
+    if (*rp).used[i] == 0 as u32 {
+        return 0.0
+    }
+    let p: f64 = ((now - (*rp).t0[i]) as f64) / (EXPAND_MS as f64)
+    return (*rp).rmax[i] * anim.ease_eval(&(*rp).ease, p)
+}
+
+// peak factor 0..1: 1 while held, then falls linearly to 0 over FADE_MS
+fn alpha_at(rp: *mut Ripples, i: usize, now: i64) -> f64 {
+    if (*rp).used[i] == 0 as u32 {
+        return 0.0
+    }
+    let t1: i64 = (*rp).t1[i]
+    if t1 < 0 || now <= t1 {
+        return 1.0
+    }
+    let f: f64 = 1.0 - ((now - t1) as f64) / (FADE_MS as f64)
+    if f < 0.0 {
+        return 0.0
+    }
+    return f
+}
+
+fn count(rp: *mut Ripples, now: i64) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < RIPPLES {
+        if !finished(rp, i, now) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// true while a frame is still needed (a held press, a growing or a fading circle)
+fn busy(rp: *mut Ripples, now: i64) -> bool {
+    return count(rp, now) > 0
+}
+
+// Paints all live ripples over the control rect. `corner` > 0: the circle is clipped to the rect only,
+// so a circle may tint the very corner pixels of a rounded control; keep the alpha low.
+fn paint(z: *mut painter.Painter, rp: *mut Ripples, now: i64, x: f64, y: f64, w: f64, h: f64,
+    corner: f64, argb: u32) {
+    if (*rp).on == 0 as u32 || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    var peak: u32 = (argb >> 24) & 255 as u32
+    if peak == 0 as u32 {
+        peak = PEAK_ALPHA
+    }
+    let cv: *mut canvas.Canvas = painter.painter_canvas(z)
+    var pushed: bool = false
+    var i: usize = 0
+    while i < RIPPLES {
+        if !finished(rp, i, now) {
+            let a: u32 = ((peak as f64) * alpha_at(rp, i, now)) as u32
+            let r: f64 = radius_at(rp, i, now)
+            if a > 0 as u32 && r > 0.5 {
+                if !pushed {
+                    pushed = canvas.clip_push_rect(cv, x, y, x + w, y + h)
+                }
+                let col: u32 = (a << 24) | (argb & 16777215 as u32)
+                painter.round_rect(z, (*rp).cx[i] - r, (*rp).cy[i] - r, 2.0 * r, 2.0 * r, r, col)
+            }
+        }
+        i = i + 1
+    }
+    if pushed {
+        canvas.clip_pop(cv)
+    }
+}
