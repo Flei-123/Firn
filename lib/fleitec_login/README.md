@@ -7,7 +7,7 @@ Module files carry the prefix `fl_` because Firn module names are global (`jwt` 
 |---|---|
 | `fl_util` | base64url, S256, random, percent/query, JSON readers, endpoint rule (https; http only loopback) |
 | `fl_transport` | `Transport{f}`: `fn(*mut HttpReq, *mut HttpResp) -> bool`; every HTTP goes through it (offline tests) |
-| `fl_nethttp` | production transport on `net.http` (TLS, no redirects, 20 s; `net_set_timeout(ms)` shortens it) |
+| `fl_nethttp` | production transport on `net.http` (TLS, no redirects, 20 s; `net_set_timeout(ms)` shortens it; `net_add_trust_pem(p, n)` adds the operator's own root CAs to the system roots, the chain check is never off) |
 | `fl_jwks` | JWKS (OKP/Ed25519), cache with expiry, rotation, pinned emergency key, refetch rate limit |
 | `fl_cache` | discovery + JWKS cache for a server (own ttl per document, `cache_warm` before expiry, stale-while-error up to `stale_max`, failure brake `min_retry`, unknown-kid brake survives the request; text kept in raw heap, fits a `static mut`) |
 | `fl_jwt` | `verify(token, cfg, now) -> Claims` (EdDSA, kid, iss/aud mandatory, ID section 4 rules); `verify_legacy_hs256` separate |
