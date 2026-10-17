@@ -1,0 +1,259 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/regex/pyre.fi -- Python `re` style calls on top of regex.regex:
+// findall, finditer, sub/subn with Python replacement syntax, split, search,
+// match, escape. The engine is regex.regex (linear time, no backreferences);
+// this file only adds the loops and the replacement template that every
+// Python script writes.
+//
+// Usage:
+//
+//     import regex.regex
+//     import regex.pyre
+//     import std.vec
+//
+//     var re: regex.Regex = pyre.compile("[\\w.]+@[\\w.]+\\.[a-z]{2,}", 0)   // re.compile(p)
+//     var found: Vec[str] = vec_new[str]()
+//     pyre.findall(&re, text, &found)                       // re.findall(p, text)
+//     var it: pyre.Finditer = pyre.finditer_new(&re, text)  // re.finditer(p, text)
+//     var m: regex.Match = regex.match_new()
+//     while pyre.finditer_next(&it, &m) {
+//         let who: str = regex.match_group_text(&m, text, 1)
+//     }
+//     pyre.finditer_free(&it)
+//     let t: str = pyre.sub(&re, "\\3.\\2.\\1", text)        // re.sub(p, r"\3.\2.\1", text)
+//
+// DIFFERENCES FROM PYTHON (honest list):
+//   * findall answers group 0, or group 1 when the pattern has groups (Python
+//     answers tuples for 2+ groups: use finditer + match_group_text instead).
+//     The answers are VIEWS into the searched text.
+//   * After an EMPTY match the search moves on by one character, so a pattern
+//     like `|a` on "a" finds "", "" where Python 3.7+ finds "", "a", "".
+//     Patterns that cannot match empty (or `x*` style) agree with Python.
+//   * \w \d \s \b are ASCII (RE2); Python's are Unicode. No backreferences.
+//   * sub has no `count` argument and no function replacement.
+//   * Replacement template: \1..\99, \g<1>, \g<name>, \\ \n \t \r \f \v \a;
+//     an unknown escape stays as written. A group that did not take part is empty.
+//
+// Cross-check against Python `re`: tools/pystr_cross/run.sh.
+import std.io
+import std.rt
+import std.vec
+import regex.regex
+
+export {
+    compile, Finditer, finditer_new, finditer_next, finditer_free,
+    findall, sub, subn, split, search, match_start, escape,
+}
+
+// Python `re.compile(p, flags)` (flags: regex.REGEX_ICASE / REGEX_MULTILINE /
+// REGEX_DOTALL). A bad pattern is a programmer error: the message goes to
+// stderr and the answer is a regex that never matches (use
+// regex.regex_compile for the error value). Free it with regex.regex_free.
+fn compile(pattern: str, flags: u32) -> regex.Regex {
+    let r: regex.Regex = regex.regex_compile(pattern, flags) catch | e | (bad_pattern(pattern))
+    return r
+}
+
+fn bad_pattern(pattern: str) -> regex.Regex {
+    io.eprint("pyre.compile: bad pattern: ")
+    io.eprint_line(pattern)
+    return regex.regex_compile("(?!)", 0 as u32) catch | e | (bad_pattern(pattern))
+}
+
+struct Finditer {
+    mt: regex.Matcher,
+    s: str,
+    pos: usize,
+}
+
+fn finditer_new(r: *mut regex.Regex, s: str) -> Finditer {
+    return Finditer { mt: regex.matcher_new(r), s: s, pos: 0 }
+}
+
+fn finditer_free(it: *mut Finditer) {
+    regex.matcher_free(&(*it).mt)
+    (*it).pos = (*it).s.n + 1
+}
+
+// The next non-overlapping match in `m` (`match_group_text(m, s, g)` reads its
+// groups); false at the end.
+fn finditer_next(it: *mut Finditer, m: *mut regex.Match) -> bool {
+    if (*it).pos > (*it).s.n { return false }
+    if !regex.matcher_find(&(*it).mt, (*it).s, (*it).pos, m) {
+        (*it).pos = (*it).s.n + 1
+        return false
+    }
+    let a: usize = (*m).start as usize
+    let b: usize = (*m).end as usize
+    if b > a {
+        (*it).pos = b
+    } else if b >= (*it).s.n {
+        (*it).pos = (*it).s.n + 1
+    } else {
+        // empty match: step over one UTF-8 character
+        var q: usize = b + 1
+        while q < (*it).s.n && *((*it).s.p + q) >= 128 as u8 && *((*it).s.p + q) < 192 as u8 {
+            q = q + 1
+        }
+        (*it).pos = q
+    }
+    return true
+}
+
+fn group_view(m: *mut regex.Match, s: str, g: u32) -> str {
+    return regex.match_group_text(m, s, g)
+}
+
+// Python `re.findall(p, s)` for patterns with at most one group; `out` is cleared.
+fn findall(r: *mut regex.Regex, s: str, out: *mut Vec[str]) {
+    vec_clear[str](out)
+    var g: u32 = 0
+    if regex.regex_group_count(r) > 1 { g = 1 }
+    var it: Finditer = finditer_new(r, s)
+    var m: regex.Match = regex.match_new()
+    while finditer_next(&it, &m) {
+        vec_push[str](out, group_view(&m, s, g))
+    }
+    finditer_free(&it)
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+// Python replacement template -> regex.regex_replace_all template.
+fn translate(repl: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < repl.n {
+        let c: u8 = *(repl.p + i)
+        if c == 36 as u8 {
+            rt.buf_push(&b, 36 as u8)
+            rt.buf_push(&b, 36 as u8)
+            i = i + 1
+            continue
+        }
+        if c != 92 as u8 || i + 1 >= repl.n {
+            rt.buf_push(&b, c)
+            i = i + 1
+            continue
+        }
+        let d: u8 = *(repl.p + i + 1)
+        if is_digit(d) {
+            var j: usize = i + 1
+            var num: u32 = 0
+            var k: usize = 0
+            while j < repl.n && k < 2 && is_digit(*(repl.p + j)) {
+                num = num * 10 + ((*(repl.p + j)) - 48 as u8) as u32
+                j = j + 1
+                k = k + 1
+            }
+            rt.buf_push(&b, 36 as u8)
+            rt.buf_push(&b, 123 as u8)
+            rt.buf_push_dec_u64(&b, num as u64)
+            rt.buf_push(&b, 125 as u8)
+            i = j
+        } else if d == 103 as u8 && i + 2 < repl.n && *(repl.p + i + 2) == 60 as u8 {
+            var j: usize = i + 3
+            while j < repl.n && *(repl.p + j) != 62 as u8 { j = j + 1 }
+            if j >= repl.n {
+                rt.buf_push(&b, c)
+                i = i + 1
+            } else {
+                rt.buf_push(&b, 36 as u8)
+                rt.buf_push(&b, 123 as u8)
+                rt.buf_push_bytes(&b, repl.p as u64 + (i + 3) as u64, j - (i + 3))
+                rt.buf_push(&b, 125 as u8)
+                i = j + 1
+            }
+        } else {
+            var e: u8 = d
+            if d == 110 as u8 { e = 10 as u8 }
+            else if d == 116 as u8 { e = 9 as u8 }
+            else if d == 114 as u8 { e = 13 as u8 }
+            else if d == 102 as u8 { e = 12 as u8 }
+            else if d == 118 as u8 { e = 11 as u8 }
+            else if d == 97 as u8 { e = 7 as u8 }
+            if e == d && d != 92 as u8 { rt.buf_push(&b, c) }
+            rt.buf_push(&b, e)
+            i = i + 2
+        }
+    }
+    let t: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return t
+}
+
+// Python `re.sub(p, repl, s)` (every match, `repl` in Python syntax).
+fn sub(r: *mut regex.Regex, repl: str, s: str) -> str {
+    return regex.regex_replace_all(r, s, translate(repl))
+}
+
+// `sub` and the number of matches in `n`.
+fn subn(r: *mut regex.Regex, repl: str, s: str, n: *mut usize) -> str {
+    var cnt: usize = 0
+    var it: Finditer = finditer_new(r, s)
+    var m: regex.Match = regex.match_new()
+    while finditer_next(&it, &m) { cnt = cnt + 1 }
+    finditer_free(&it)
+    *n = cnt
+    return sub(r, repl, s)
+}
+
+// Python `re.split(p, s)`: the text between matches, plus the groups that took
+// part. Patterns that can match the empty text are not supported (answer
+// differs from Python 3.7+). Pieces are views into `s`.
+fn split(r: *mut regex.Regex, s: str, out: *mut Vec[str]) {
+    vec_clear[str](out)
+    let ng: u32 = regex.regex_group_count(r)
+    var it: Finditer = finditer_new(r, s)
+    var m: regex.Match = regex.match_new()
+    var last: usize = 0
+    while finditer_next(&it, &m) {
+        let a: usize = m.start as usize
+        let b: usize = m.end as usize
+        if b == a { continue }
+        vec_push[str](out, str { p: s.p + last, n: a - last })
+        var g: u32 = 1
+        while g < ng {
+            var gs: usize = 0
+            var ge: usize = 0
+            if regex.match_group(&m, g, &gs, &ge) { vec_push[str](out, str { p: s.p + gs, n: ge - gs }) }
+            g = g + 1
+        }
+        last = b
+    }
+    finditer_free(&it)
+    vec_push[str](out, str { p: s.p + last, n: s.n - last })
+}
+
+// Python `re.search`: leftmost match anywhere.
+fn search(r: *mut regex.Regex, s: str, m: *mut regex.Match) -> bool {
+    return regex.regex_find(r, s, 0, m)
+}
+
+// Python `re.match`: a match that starts at the beginning of `s`.
+fn match_start(r: *mut regex.Regex, s: str, m: *mut regex.Match) -> bool {
+    if !regex.regex_find(r, s, 0, m) { return false }
+    return (*m).start == 0
+}
+
+// Python `re.escape` (3.7+: only the special characters get a backslash).
+fn escape(s: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = *(s.p + i)
+        let special: bool = c == 40 as u8 || c == 41 as u8 || c == 91 as u8 || c == 93 as u8
+        || c == 123 as u8 || c == 125 as u8 || c == 63 as u8 || c == 42 as u8
+        || c == 43 as u8 || c == 45 as u8 || c == 124 as u8 || c == 94 as u8
+        || c == 36 as u8 || c == 92 as u8 || c == 46 as u8 || c == 38 as u8
+        || c == 126 as u8 || c == 35 as u8 || c == 32 as u8 || (c >= 9 as u8 && c <= 13 as u8)
+        if special { rt.buf_push(&b, 92 as u8) }
+        rt.buf_push(&b, c)
+        i = i + 1
+    }
+    let t: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return t
+}

@@ -1,0 +1,650 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/pystr.fi -- Python-like string methods on `str`: lower/upper, strip,
+// split/join, replace, find/count, startswith/endswith, ljust/rjust/center/zfill,
+// isdigit/isalpha/... Every function takes plain `str` values, so a string
+// literal, a file's text and a regex group all work the same way.
+//
+// Usage (the Python `str` methods in one place):
+//
+//     import std.pystr
+//     import std.vec
+//
+//     let low: str = pystr.lower("Hello World")                 // "hello world"
+//     var parts: Vec[str] = vec_new[str]()
+//     defer vec_free[str](&parts)
+//     pystr.split("a,b,,c", ",", &parts)                        // "a" "b" "" "c"
+//     let back: str = pystr.join(&parts, "-")                   // "a-b--c"
+//     pystr.split_ws("  one  two\tthree\n", &parts)             // "one" "two" "three"
+//     pystr.strip("  x  ")                                      // "x"
+//     pystr.replace("aXbXc", "X", "--")                         // "a--b--c"
+//     pystr.startswith("firn", "fi") && pystr.count("banana", "an") == 2
+//     pystr.rjust("7", 3, 48)                                   // "007"   (fill = octet)
+//     pystr.title("hello wORLD")                                // "Hello World"
+//
+// WHAT IS A VIEW AND WHAT IS A COPY. strip/lstrip/rstrip, split*, splitlines
+// answer VIEWS into the argument (no allocation, valid as long as the source
+// text lives; `text.dup` makes a copy). lower/upper/capitalize/title/swapcase/
+// replace/join/repeat/ljust/rjust/center/zfill answer a NEW GC string; the
+// argument is never changed.
+//
+// ASCII OR UNICODE. Text is UTF-8. Where Python's answer depends only on the
+// text's structure, it is code point exact: strip/split_ws/splitlines/isspace
+// use Python's whitespace set (incl. U+0085, U+00A0, U+2000..U+200A, U+3000),
+// replace/count/find/startswith/split work on UTF-8 octets (same result as
+// Python on the code points), ljust/rjust/center/zfill count code points.
+// Case and character classes are ASCII only: lower/upper/capitalize/title/
+// swapcase leave non-ASCII letters unchanged, isalpha/isdigit/isalnum/isupper/
+// islower are false for non-ASCII. Invalid UTF-8 never traps: a stray octet is
+// one character that is no whitespace and no letter.
+// find/rfind answer an OCTET offset (-1 when absent), like
+// `s.encode().find(sub.encode())` in Python.
+//
+// Cross-check against Python: tools/pystr_cross/run.sh (random strings).
+import std.io
+import std.rt
+import std.vec
+import std.str
+
+export {
+    lower, upper, capitalize, title, swapcase,
+    strip, lstrip, rstrip, strip_chars, lstrip_chars, rstrip_chars,
+    split, split_n, split_ws, splitlines,
+    join, replace, replace_n, repeat,
+    startswith, endswith, contains, count, find, rfind,
+    ljust, rjust, center, zfill,
+    isdigit, isalpha, isalnum, isspace, isupper, islower, isascii,
+    char_len, sorted_set, read_text,
+}
+
+fn owned(b: *mut rt.Buf) -> str {
+    let s: str = __str_copy(str { p: rt.buf_data(b), n: rt.buf_len(b) })
+    rt.buf_free(b)
+    return s
+}
+
+fn put(b: *mut rt.Buf, s: str) {
+    if s.n > 0 { rt.buf_push_bytes(b, s.p as u64, s.n) }
+}
+
+fn view(s: str, from: usize, to: usize) -> str {
+    return str { p: s.p + from, n: to - from }
+}
+
+// Python `open(path).read()`: the whole file as a GC string ("" when it cannot
+// be read).
+fn read_text(path: str) -> str {
+    var t: io.Text = io.read_file_text(path)
+    let s: str = __str_copy(str { p: rt.buf_data(&t.b), n: rt.buf_len(&t.b) })
+    rt.buf_free(&t.b)
+    return s
+}
+
+// ------------------------------------------------------------ code points
+
+// The code point at octet `i` and its length in `len`. A malformed sequence
+// is one octet that answers 0xFFFFFFFF.
+fn cp_at(s: str, i: usize, len: *mut usize) -> u32 {
+    let b0: u32 = (*(s.p + i)) as u32
+    *len = 1
+    if b0 < 128 { return b0 }
+    var need: usize = 0
+    var cp: u32 = 0
+    if b0 >= 194 && b0 <= 223 {
+        need = 1
+        cp = b0 - 192
+    } else if b0 >= 224 && b0 <= 239 {
+        need = 2
+        cp = b0 - 224
+    } else if b0 >= 240 && b0 <= 244 {
+        need = 3
+        cp = b0 - 240
+    } else {
+        return 4294967295
+    }
+    if i + need >= s.n { return 4294967295 }
+    var k: usize = 1
+    while k <= need {
+        let c: u32 = (*(s.p + i + k)) as u32
+        if c < 128 || c > 191 { return 4294967295 }
+        cp = cp * 64 + (c - 128)
+        k = k + 1
+    }
+    if need == 2 && (cp < 2048 || (cp >= 55296 && cp <= 57343)) { return 4294967295 }
+    if need == 3 && (cp < 65536 || cp > 1114111) { return 4294967295 }
+    *len = need + 1
+    return cp
+}
+
+// The code point that ENDS at octet `end` (exclusive); its start in `from`.
+fn cp_before(s: str, end: usize, from: *mut usize) -> u32 {
+    var st: usize = end - 1
+    var back: usize = 0
+    while st > 0 && back < 3 && *(s.p + st) >= 128 as u8 && *(s.p + st) < 192 as u8 {
+        st = st - 1
+        back = back + 1
+    }
+    var len: usize = 0
+    let cp: u32 = cp_at(s, st, &len)
+    if st + len == end {
+        *from = st
+        return cp
+    }
+    *from = end - 1
+    return 4294967295
+}
+
+fn is_space_cp(c: u32) -> bool {
+    if c == 32 || (c >= 9 && c <= 13) || (c >= 28 && c <= 31) { return true }
+    if c < 133 { return false }
+    return c == 133 || c == 160 || c == 5760 || (c >= 8192 && c <= 8202)
+    || c == 8232 || c == 8233 || c == 8239 || c == 8287 || c == 12288
+}
+
+// Number of code points (a stray octet counts as one).
+fn char_len(s: str) -> usize {
+    var i: usize = 0
+    var n: usize = 0
+    var len: usize = 0
+    while i < s.n {
+        cp_at(s, i, &len)
+        i = i + len
+        n = n + 1
+    }
+    return n
+}
+
+// ------------------------------------------------------------------ case
+
+fn map_ascii(s: str, mode: u32) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    var cased_before: bool = false
+    var first: bool = true
+    while i < s.n {
+        var c: u8 = *(s.p + i)
+        let up: bool = c >= 65 as u8 && c <= 90 as u8
+        let lo: bool = c >= 97 as u8 && c <= 122 as u8
+        if mode == 0 {
+            if up { c = c + 32 as u8 }
+        } else if mode == 1 {
+            if lo { c = c - 32 as u8 }
+        } else if mode == 2 {
+            // capitalize: first octet upper, the rest lower
+            if first {
+                if lo { c = c - 32 as u8 }
+            } else if up {
+                c = c + 32 as u8
+            }
+        } else if mode == 3 {
+            // title: a letter after a non-letter is upper, after a letter lower
+            if up || lo {
+                if cased_before {
+                    if up { c = c + 32 as u8 }
+                } else if lo {
+                    c = c - 32 as u8
+                }
+                cased_before = true
+            } else {
+                cased_before = false
+            }
+        } else {
+            if up {
+                c = c + 32 as u8
+            } else if lo {
+                c = c - 32 as u8
+            }
+        }
+        first = false
+        rt.buf_push(&b, c)
+        i = i + 1
+    }
+    return owned(&b)
+}
+
+fn lower(s: str) -> str { return map_ascii(s, 0) }
+fn upper(s: str) -> str { return map_ascii(s, 1) }
+fn capitalize(s: str) -> str { return map_ascii(s, 2) }
+fn title(s: str) -> str { return map_ascii(s, 3) }
+fn swapcase(s: str) -> str { return map_ascii(s, 4) }
+
+// ----------------------------------------------------------------- strip
+
+fn lstrip(s: str) -> str {
+    var i: usize = 0
+    var len: usize = 0
+    while i < s.n {
+        if !is_space_cp(cp_at(s, i, &len)) { break }
+        i = i + len
+    }
+    return view(s, i, s.n)
+}
+
+fn rstrip(s: str) -> str {
+    var e: usize = s.n
+    var from: usize = 0
+    while e > 0 {
+        if !is_space_cp(cp_before(s, e, &from)) { break }
+        e = from
+    }
+    return view(s, 0, e)
+}
+
+fn strip(s: str) -> str {
+    return rstrip(lstrip(s))
+}
+
+fn in_set(cp: u32, set: str) -> bool {
+    var i: usize = 0
+    var len: usize = 0
+    while i < set.n {
+        if cp_at(set, i, &len) == cp { return true }
+        i = i + len
+    }
+    return false
+}
+
+// Python `s.lstrip(chars)`: every leading character that is in `set`.
+fn lstrip_chars(s: str, set: str) -> str {
+    var i: usize = 0
+    var len: usize = 0
+    while i < s.n {
+        if !in_set(cp_at(s, i, &len), set) { break }
+        i = i + len
+    }
+    return view(s, i, s.n)
+}
+
+fn rstrip_chars(s: str, set: str) -> str {
+    var e: usize = s.n
+    var from: usize = 0
+    while e > 0 {
+        if !in_set(cp_before(s, e, &from), set) { break }
+        e = from
+    }
+    return view(s, 0, e)
+}
+
+fn strip_chars(s: str, set: str) -> str {
+    return rstrip_chars(lstrip_chars(s, set), set)
+}
+
+// ---------------------------------------------------------------- search
+
+fn match_at(s: str, i: usize, part: str) -> bool {
+    if i + part.n > s.n { return false }
+    var k: usize = 0
+    while k < part.n {
+        if *(s.p + i + k) != *(part.p + k) { return false }
+        k = k + 1
+    }
+    return true
+}
+
+fn startswith(s: str, part: str) -> bool {
+    return match_at(s, 0, part)
+}
+
+fn endswith(s: str, part: str) -> bool {
+    if part.n > s.n { return false }
+    return match_at(s, s.n - part.n, part)
+}
+
+// Octet offset of the first `part` at or after octet `from`, or -1.
+fn find_from(s: str, part: str, from: usize) -> i64 {
+    if part.n == 0 {
+        if from <= s.n { return from as i64 }
+        return -1
+    }
+    if part.n > s.n { return -1 }
+    let last: usize = s.n - part.n
+    let c0: u8 = *part.p
+    var i: usize = from
+    while i <= last {
+        if *(s.p + i) == c0 && match_at(s, i, part) { return i as i64 }
+        i = i + 1
+    }
+    return -1
+}
+
+fn find(s: str, part: str) -> i64 {
+    return find_from(s, part, 0)
+}
+
+fn rfind(s: str, part: str) -> i64 {
+    if part.n > s.n { return -1 }
+    var i: usize = s.n - part.n
+    while true {
+        if match_at(s, i, part) { return i as i64 }
+        if i == 0 { break }
+        i = i - 1
+    }
+    return -1
+}
+
+fn contains(s: str, part: str) -> bool {
+    return find_from(s, part, 0) >= 0
+}
+
+// Non-overlapping occurrences; an empty `part` counts len(s)+1 (code points).
+fn count(s: str, part: str) -> usize {
+    if part.n == 0 { return char_len(s) + 1 }
+    var n: usize = 0
+    var i: usize = 0
+    while true {
+        let f: i64 = find_from(s, part, i)
+        if f < 0 { break }
+        n = n + 1
+        i = f as usize + part.n
+    }
+    return n
+}
+
+// ------------------------------------------------------- split and join
+
+// Python `s.split(sep, maxsplit)`; maxsplit < 0 = unlimited. `out` is
+// cleared; the pieces are views into `s`. An empty `sep` gives `s` whole.
+fn split_n(s: str, sep: str, maxsplit: i64, out: *mut Vec[str]) {
+    vec_clear[str](out)
+    if sep.n == 0 {
+        vec_push[str](out, s)
+        return
+    }
+    var start: usize = 0
+    var done: i64 = 0
+    while maxsplit < 0 || done < maxsplit {
+        let f: i64 = find_from(s, sep, start)
+        if f < 0 { break }
+        vec_push[str](out, view(s, start, f as usize))
+        start = f as usize + sep.n
+        done = done + 1
+    }
+    vec_push[str](out, view(s, start, s.n))
+}
+
+fn split(s: str, sep: str, out: *mut Vec[str]) {
+    split_n(s, sep, -1, out)
+}
+
+// Python `s.split()`: runs of whitespace separate, no empty pieces.
+fn split_ws(s: str, out: *mut Vec[str]) {
+    vec_clear[str](out)
+    var i: usize = 0
+    var len: usize = 0
+    var start: usize = 0
+    var inword: bool = false
+    while i < s.n {
+        let sp: bool = is_space_cp(cp_at(s, i, &len))
+        if sp {
+            if inword {
+                vec_push[str](out, view(s, start, i))
+                inword = false
+            }
+        } else if !inword {
+            inword = true
+            start = i
+        }
+        i = i + len
+    }
+    if inword { vec_push[str](out, view(s, start, s.n)) }
+}
+
+// Python `s.splitlines()` (no line ends kept): \n \r \r\n \v \f \x1c-\x1e
+// U+0085 U+2028 U+2029.
+fn splitlines(s: str, out: *mut Vec[str]) {
+    vec_clear[str](out)
+    var i: usize = 0
+    var len: usize = 0
+    var start: usize = 0
+    while i < s.n {
+        let c: u32 = cp_at(s, i, &len)
+        let brk: bool = c == 10 || c == 13 || c == 11 || c == 12 || (c >= 28 && c <= 30)
+        || c == 133 || c == 8232 || c == 8233
+        if brk {
+            vec_push[str](out, view(s, start, i))
+            i = i + len
+            if c == 13 && i < s.n && *(s.p + i) == 10 as u8 { i = i + 1 }
+            start = i
+        } else {
+            i = i + len
+        }
+    }
+    if start < s.n { vec_push[str](out, view(s, start, s.n)) }
+}
+
+// Python `sep.join(parts)`.
+fn join(parts: *mut Vec[str], sep: str) -> str {
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = vec_len[str](parts)
+    var i: usize = 0
+    while i < n {
+        if i > 0 { put(&b, sep) }
+        let p: *mut str = vec_elem_ptr[str](parts, i)
+        put(&b, *p)
+        i = i + 1
+    }
+    return owned(&b)
+}
+
+// Python `s.replace(old, new, count)`; count < 0 = all. An empty `old`
+// inserts `new` between the code points and at both ends.
+fn replace_n(s: str, old: str, new: str, count: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var done: i64 = 0
+    var i: usize = 0
+    var len: usize = 0
+    if old.n == 0 {
+        while true {
+            if count >= 0 && done >= count { break }
+            put(&b, new)
+            done = done + 1
+            if i >= s.n { break }
+            cp_at(s, i, &len)
+            rt.buf_push_bytes(&b, s.p as u64 + i as u64, len)
+            i = i + len
+        }
+        if i < s.n { rt.buf_push_bytes(&b, s.p as u64 + i as u64, s.n - i) }
+        return owned(&b)
+    }
+    while count < 0 || done < count {
+        let f: i64 = find_from(s, old, i)
+        if f < 0 { break }
+        rt.buf_push_bytes(&b, s.p as u64 + i as u64, f as usize - i)
+        put(&b, new)
+        i = f as usize + old.n
+        done = done + 1
+    }
+    if i < s.n { rt.buf_push_bytes(&b, s.p as u64 + i as u64, s.n - i) }
+    return owned(&b)
+}
+
+fn replace(s: str, old: str, new: str) -> str {
+    return replace_n(s, old, new, -1)
+}
+
+// Python `s * n`.
+fn repeat(s: str, n: usize) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < n {
+        put(&b, s)
+        i = i + 1
+    }
+    return owned(&b)
+}
+
+// ------------------------------------------------------------- justify
+
+fn pad(b: *mut rt.Buf, n: usize, fill: u8) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, fill)
+        i = i + 1
+    }
+}
+
+// `fill` is one octet (an ASCII character), e.g. 32 or 48.
+fn ljust(s: str, width: usize, fill: u8) -> str {
+    var b: rt.Buf = rt.buf_new()
+    put(&b, s)
+    let n: usize = char_len(s)
+    if width > n { pad(&b, width - n, fill) }
+    return owned(&b)
+}
+
+fn rjust(s: str, width: usize, fill: u8) -> str {
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = char_len(s)
+    if width > n { pad(&b, width - n, fill) }
+    put(&b, s)
+    return owned(&b)
+}
+
+// Python `s.center(width, fill)`: the odd extra pad goes left when width is odd.
+fn center(s: str, width: usize, fill: u8) -> str {
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = char_len(s)
+    if width > n {
+        let total: usize = width - n
+        let left: usize = total / 2 + (total & width & 1)
+        pad(&b, left, fill)
+        put(&b, s)
+        pad(&b, total - left, fill)
+    } else {
+        put(&b, s)
+    }
+    return owned(&b)
+}
+
+// Python `s.zfill(width)`: zeros after a leading sign.
+fn zfill(s: str, width: usize) -> str {
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = char_len(s)
+    var from: usize = 0
+    if s.n > 0 && (*s.p == 43 as u8 || *s.p == 45 as u8) {
+        rt.buf_push(&b, *s.p)
+        from = 1
+    }
+    if width > n { pad(&b, width - n, 48 as u8) }
+    put(&b, view(s, from, s.n))
+    return owned(&b)
+}
+
+// -------------------------------------------------------------- classes
+
+fn isdigit(s: str) -> bool {
+    if s.n == 0 { return false }
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = *(s.p + i)
+        if c < 48 as u8 || c > 57 as u8 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn isalpha(s: str) -> bool {
+    if s.n == 0 { return false }
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = *(s.p + i)
+        if !((c >= 65 as u8 && c <= 90 as u8) || (c >= 97 as u8 && c <= 122 as u8)) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn isalnum(s: str) -> bool {
+    if s.n == 0 { return false }
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = *(s.p + i)
+        if !((c >= 65 as u8 && c <= 90 as u8) || (c >= 97 as u8 && c <= 122 as u8)
+            || (c >= 48 as u8 && c <= 57 as u8)) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn isspace(s: str) -> bool {
+    if s.n == 0 { return false }
+    var i: usize = 0
+    var len: usize = 0
+    while i < s.n {
+        if !is_space_cp(cp_at(s, i, &len)) { return false }
+        i = i + len
+    }
+    return true
+}
+
+fn isascii(s: str) -> bool {
+    var i: usize = 0
+    while i < s.n {
+        if *(s.p + i) >= 128 as u8 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// At least one cased (ASCII) letter and no letter of the other case.
+fn isupper(s: str) -> bool {
+    var seen: bool = false
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = *(s.p + i)
+        if c >= 97 as u8 && c <= 122 as u8 { return false }
+        if c >= 65 as u8 && c <= 90 as u8 { seen = true }
+        i = i + 1
+    }
+    return seen
+}
+
+fn islower(s: str) -> bool {
+    var seen: bool = false
+    var i: usize = 0
+    while i < s.n {
+        let c: u8 = *(s.p + i)
+        if c >= 65 as u8 && c <= 90 as u8 { return false }
+        if c >= 97 as u8 && c <= 122 as u8 { seen = true }
+        i = i + 1
+    }
+    return seen
+}
+
+// ------------------------------------------------------------------ sets
+
+fn str_less(a: *str, b: *str) -> bool {
+    let x: str = *a
+    let y: str = *b
+    var i: usize = 0
+    while i < x.n && i < y.n {
+        let cx: u8 = *(x.p + i)
+        let cy: u8 = *(y.p + i)
+        if cx != cy { return cx < cy }
+        i = i + 1
+    }
+    return x.n < y.n
+}
+
+// Python `sorted(set(items))`, in place: octet-wise ascending (= code point
+// order for UTF-8), duplicates removed.
+fn sorted_set(v: *mut Vec[str]) {
+    vec_sort_by[str](v, str_less)
+    let n: usize = vec_len[str](v)
+    if n < 2 { return }
+    var out: Vec[str] = vec_new[str]()
+    var i: usize = 0
+    while i < n {
+        let cur: str = *vec_elem_ptr[str](v, i)
+        if i == 0 || !(cur == *vec_elem_ptr[str](&out, vec_len[str](&out) - 1)) {
+            vec_push[str](&out, cur)
+        }
+        i = i + 1
+    }
+    vec_clear[str](v)
+    i = 0
+    while i < vec_len[str](&out) {
+        vec_push[str](v, *vec_elem_ptr[str](&out, i))
+        i = i + 1
+    }
+    vec_free[str](&out)
+}
