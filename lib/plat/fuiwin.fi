@@ -38,6 +38,7 @@ import fui.gpu
 import window.window
 import window.pointers
 import plat.fuiwirt
+import fui.recorder
 import fui.damage
 import fui.event
 
@@ -52,6 +53,7 @@ export {
     window_clip_read, window_clip_write,
     // OpenPlan LIB-005: more than one window
     window_step, window_wait_many, window_wait_many_fd,
+    rec_attach, rec_detach,
     // fUi app layer (lib/fui/app.fi): keys and characters for a text field
     // first, and Escape that does not close the window
     window_set_input_hook, window_set_escape_closes,
@@ -356,6 +358,47 @@ fn now_ms() -> i64 {
     return ts[0] * 1000 + ts[1] / 1000000
 }
 
+// RECORDER HOOK (opt-in, r265): while a recorder is attached (apphost: FUI_RECORD=<file>) the plain mouse, key and char
+// paths of `window_step` go through the rec_* wrappers, which log the event and forward it to the host unchanged.
+// Touch records and the routed pointer path are not logged (the log format knows M/D/U/L/C/K/H/T only).
+static mut G_REC: u64 = 0
+
+#[allow_escape]
+fn rec_attach(r: *mut recorder.Rec) { G_REC = r as u64 }
+fn rec_detach() { G_REC = 0 }
+
+fn fw_move(w: *mut fuiwirt.Host, x: f64, y: f64) -> u32 {
+    if G_REC != 0 as u64 { return recorder.rec_move(G_REC as *mut recorder.Rec, w, x, y, now_ms()) }
+    return fuiwirt.host_pointer_move(w, x, y)
+}
+fn fw_down(w: *mut fuiwirt.Host, x: f64, y: f64, b: u32) -> u32 {
+    if G_REC != 0 as u64 { return recorder.rec_down(G_REC as *mut recorder.Rec, w, x, y, b, now_ms()) }
+    return fuiwirt.host_pointer_down(w, x, y, b)
+}
+fn fw_up(w: *mut fuiwirt.Host, x: f64, y: f64, b: u32) -> u32 {
+    if G_REC != 0 as u64 { return recorder.rec_up(G_REC as *mut recorder.Rec, w, x, y, b, now_ms()) }
+    return fuiwirt.host_pointer_up(w, x, y, b)
+}
+fn fw_leave(w: *mut fuiwirt.Host) -> u32 {
+    if G_REC != 0 as u64 { return recorder.rec_leave(G_REC as *mut recorder.Rec, w, now_ms()) }
+    return fuiwirt.host_pointer_leave(w)
+}
+fn fw_key(w: *mut fuiwirt.Host, k: u32, mods: u32) -> u32 {
+    if G_REC != 0 as u64 { return recorder.rec_key(G_REC as *mut recorder.Rec, w, k, mods, now_ms()) }
+    return fuiwirt.host_key(w, k, mods)
+}
+fn fw_char(w: *mut fuiwirt.Host, cp: u32, mods: u32) -> u32 {
+    if G_REC != 0 as u64 { return recorder.rec_char(G_REC as *mut recorder.Rec, w, cp, mods, now_ms()) }
+    return fuiwirt.host_char(w, cp, mods)
+}
+fn fw_tick(w: *mut fuiwirt.Host) {
+    if G_REC != 0 as u64 {
+        recorder.rec_tick(G_REC as *mut recorder.Rec, w, now_ms())
+        return
+    }
+    fuiwirt.host_tick(w, now_ms())
+}
+
 // Canvas, painter and BGRX buffer for `w` x `h` -- new, not stretched.
 fn flaechen(fx: *mut Window, w: usize, h: usize) -> bool {
     if (*fx).cap > 0 {
@@ -637,11 +680,11 @@ fn fork(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
     if fuiwirt.host_popup_open(w) {
         if k == window.EV_KEY {
             let tp: u32 = taste(a)
-            let cp: u32 = fuiwirt.host_key(w, tp, s)
+            let cp: u32 = fw_key(w, tp, s)
             return true
         }
         if k == window.EV_CHAR {
-            let cq: u32 = fuiwirt.host_char(w, a, s)
+            let cq: u32 = fw_char(w, a, s)
             return true
         }
     }
@@ -686,13 +729,13 @@ fn fork(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
         if (*fx).rmouse {
             // the fingers come as records; a hovering mouse still moves
             if (*fx).pdown == 0 {
-                let c: u32 = fuiwirt.host_pointer_move(w, x, y)
+                let c: u32 = fw_move(w, x, y)
             }
         } else if routed {
             let c: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_MOVE, 1 as u32,
                 event.PT_MOUSE, true, x, y, now_ms())
         } else {
-            let c: u32 = fuiwirt.host_pointer_move(w, x, y)
+            let c: u32 = fw_move(w, x, y)
         }
     } else if k == window.EV_LEAVE {
         if (*fx).rmouse {
@@ -701,7 +744,7 @@ fn fork(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
             let c: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_LEAVE, 1 as u32,
                 event.PT_MOUSE, true, x, y, now_ms())
         } else {
-            let c: u32 = fuiwirt.host_pointer_leave(w)
+            let c: u32 = fw_leave(w)
         }
     } else if k == window.EV_BUTTON {
         if a == fuiwirt.BTN_LEFT && (*fx).rmouse {
@@ -714,11 +757,11 @@ fn fork(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
                     event.PT_MOUSE, true, x, y, now_ms())
             }
         } else {
-            let c: u32 = fuiwirt.host_pointer_down(w, x, y, a)
+            let c: u32 = fw_down(w, x, y, a)
             // Without release from the back end a click is the press
             // alone -- honestly worse, but operable.
             if !(*fx).full && a == fuiwirt.BTN_LEFT {
-                let c2: u32 = fuiwirt.host_pointer_up(w, x, y, a)
+                let c2: u32 = fw_up(w, x, y, a)
             }
         }
     } else if k == window.EV_RELEASE {
@@ -728,7 +771,7 @@ fn fork(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
             let c: u32 = fuiwirt.host_pointer(w, fuiwirt.PE_UP, 1 as u32,
                 event.PT_MOUSE, true, x, y, now_ms())
         } else {
-            let c: u32 = fuiwirt.host_pointer_up(w, x, y, a)
+            let c: u32 = fw_up(w, x, y, a)
         }
     } else if k == window.EV_KEY {
         if a == window.K_ESCAPE && (*fx).esc_zu {
@@ -736,10 +779,10 @@ fn fork(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
         }
         let t: u32 = taste(a)
         if t != 0 as u32 {
-            let c: u32 = fuiwirt.host_key(w, t, s)
+            let c: u32 = fw_key(w, t, s)
         }
     } else if k == window.EV_CHAR {
-        let c: u32 = fuiwirt.host_char(w, a, s)
+        let c: u32 = fw_char(w, a, s)
     } else if k == window.EV_THEME {
         theme.theme_set_dark(m, window.dark(f))
         fuiwirt.host_touch(w)
@@ -800,7 +843,7 @@ fn window_step(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
     if akt != fuiwirt.KEINER {
         aktion(ud, fx, akt)
     }
-    fuiwirt.host_tick(w, now_ms())
+    fw_tick(w)
     if fuiwirt.host_dirty(w) {
         // A partial repaint builds on the canvas of the last frame, which
         // only the plain CPU path keeps: on the GPU and with a present hook
