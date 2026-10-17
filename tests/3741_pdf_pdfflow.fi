@@ -1,0 +1,218 @@
+// expect_exit: 0
+// pdf.pdfflow: wrap, page breaks, tables, JPEG pass-through, sticky error. The comparison with
+// poppler (pdftotext/pdfimages/pdfinfo) is tools/pdfflow_cross/check.sh.
+import std.rt
+import std.fs
+import std.testkit
+import pdf.pdf
+import pdf.pdfflow
+
+fn find(b: *mut rt.Buf, p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i + n <= rt.buf_len(b) {
+        if rt.ld8(rt.buf_ptr(b), i) == rt.ld8(p, 0) && rt.mem_eq(rt.buf_ptr(b) + i as u64, p, n) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn lines_text(n: usize) -> rt.Buf {
+    var b: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < n {
+        rt.buf_push_dec_u64(&b, i as u64)
+        let t: str = ": a line of the report\n"
+        rt.buf_push_bytes(&b, t.p as u64, t.n)
+        i = i + 1
+    }
+    return b
+}
+
+fn font() -> rt.Buf {
+    var f: rt.Buf = rt.buf_new()
+    fs.read_file("tests/data/fonts/FirnSans.ttf", &f) catch 0
+    return f
+}
+
+#[test]
+fn paragraph_breaks_over_pages() {
+    var f: rt.Buf = font()
+    var t: rt.Buf = lines_text(120)
+    var out: rt.Buf = rt.buf_new()
+    var fl: pdfflow.Flow = pdfflow.flow_new(&out, rt.buf_ptr(&f), rt.buf_len(&f), "t")
+    pdfflow.paragraph(&fl, str { p: rt.buf_data(&t), n: rt.buf_len(&t) })
+    let n: usize = pdfflow.finish(&fl)
+    testkit.assert_true(n > 1000 && n == rt.buf_len(&out), "bytes written")
+    testkit.assert_eq_i64(pdfflow.page_count(&fl) as i64, 3)
+    testkit.assert_true(find(&out, "%PDF-".p as u64, 5) && find(&out, "%%EOF".p as u64, 5), "file frame")
+    pdfflow.free(&fl)
+    rt.buf_free(&out)
+    rt.buf_free(&t)
+    rt.buf_free(&f)
+}
+
+#[test]
+fn long_text_wraps_to_more_lines_than_one() {
+    var f: rt.Buf = font()
+    var out: rt.Buf = rt.buf_new()
+    var fl: pdfflow.Flow = pdfflow.flow_new(&out, rt.buf_ptr(&f), rt.buf_len(&f), "t")
+    pdfflow.paragraph(&fl, "short")
+    let y1: f64 = pdfflow.cursor_y(&fl)
+    pdfflow.paragraph(&fl, "Firn compiles to small native programs and ships its own libraries for images, documents, networking and user interfaces. This report was written by one short program without any third party package.")
+    let y2: f64 = pdfflow.cursor_y(&fl)
+    // one line is 5.24 mm: the second paragraph is 3 lines (see the vs_python task 12)
+    testkit.assert_near(y2 - y1, 3.0 * 11.0 * 0.35277777777777775 * 1.35 + 11.0 * 0.35277777777777775 * 1.35 * 0.4, 0.01)
+    testkit.assert_true(pdfflow.ok(&fl), "ok")
+    pdfflow.free(&fl)
+    rt.buf_free(&out)
+    rt.buf_free(&f)
+}
+
+#[test]
+fn table_breaks_between_rows() {
+    var f: rt.Buf = font()
+    var out: rt.Buf = rt.buf_new()
+    var fl: pdfflow.Flow = pdfflow.flow_new(&out, rt.buf_ptr(&f), rt.buf_len(&f), "t")
+    var d: rt.Buf = rt.buf_new()
+    let head: str = "Name,Qty;"
+    rt.buf_push_bytes(&d, head.p as u64, head.n)
+    var i: usize = 0
+    while i < 100 {
+        rt.buf_push_dec_u64(&d, i as u64)
+        let t: str = ",a cell that is long enough to wrap inside its narrow column when it has to;"
+        rt.buf_push_bytes(&d, t.p as u64, t.n)
+        i = i + 1
+    }
+    pdfflow.table(&fl, str { p: rt.buf_data(&d), n: rt.buf_len(&d) }, ";", ",", true)
+    testkit.assert_true(pdfflow.finish(&fl) > 0, "finish")
+    testkit.assert_true(pdfflow.page_count(&fl) >= 3, "several pages")
+    pdfflow.free(&fl)
+    rt.buf_free(&d)
+    rt.buf_free(&out)
+    rt.buf_free(&f)
+}
+
+#[test]
+fn jpeg_goes_in_unchanged() {
+    var f: rt.Buf = font()
+    var j: rt.Buf = rt.buf_new()
+    fs.read_file("tests/data/jpeg/base420.jpg", &j) catch 0
+    var g: rt.Buf = rt.buf_new()
+    fs.read_file("tests/data/jpeg/gray.jpg", &g) catch 0
+    var out: rt.Buf = rt.buf_new()
+    var fl: pdfflow.Flow = pdfflow.flow_new(&out, rt.buf_ptr(&f), rt.buf_len(&f), "t")
+    pdfflow.image_jpeg(&fl, rt.buf_ptr(&j), rt.buf_len(&j), 60.0)
+    pdfflow.image_jpeg(&fl, rt.buf_ptr(&g), rt.buf_len(&g), 40.0)
+    testkit.assert_true(fl.img_w > 0 && fl.img_h > 0, "size read from the file")
+    testkit.assert_true(pdfflow.finish(&fl) > 0, "finish")
+    testkit.assert_true(find(&out, rt.buf_ptr(&j), rt.buf_len(&j)), "colour file octets inside")
+    testkit.assert_true(find(&out, rt.buf_ptr(&g), rt.buf_len(&g)), "grey file octets inside")
+    testkit.assert_true(find(&out, "/DCTDecode".p as u64, 10) && find(&out, "/DeviceGray".p as u64, 11), "filter + space")
+    pdfflow.free(&fl)
+    rt.buf_free(&out)
+    rt.buf_free(&j)
+    rt.buf_free(&g)
+    rt.buf_free(&f)
+}
+
+#[test]
+fn errors_are_sticky() {
+    var f: rt.Buf = font()
+    var out: rt.Buf = rt.buf_new()
+    // CMYK is refused, text is not an image: first failure sticks, finish gives 0
+    var c: rt.Buf = rt.buf_new()
+    fs.read_file("tests/data/jpeg/cmyk.jpg", &c) catch 0
+    var fl: pdfflow.Flow = pdfflow.flow_new(&out, rt.buf_ptr(&f), rt.buf_len(&f), "t")
+    pdfflow.paragraph(&fl, "before")
+    pdfflow.image_jpeg(&fl, rt.buf_ptr(&c), rt.buf_len(&c), 50.0)
+    testkit.assert_false(pdfflow.ok(&fl), "failed after the CMYK file")
+    pdfflow.paragraph(&fl, "after")
+    testkit.assert_eq_i64(pdfflow.finish(&fl) as i64, 0)
+    pdfflow.free(&fl)
+    // not a font
+    var o2: rt.Buf = rt.buf_new()
+    var bad: pdfflow.Flow = pdfflow.flow_new(&o2, rt.buf_ptr(&c), 100, "t")
+    pdfflow.paragraph(&bad, "x")
+    testkit.assert_false(pdfflow.ok(&bad), "bad font")
+    testkit.assert_eq_i64(pdfflow.finish(&bad) as i64, 0)
+    pdfflow.free(&bad)
+    // nothing drawn
+    var o3: rt.Buf = rt.buf_new()
+    var empty: pdfflow.Flow = pdfflow.flow_new(&o3, rt.buf_ptr(&f), rt.buf_len(&f), "t")
+    testkit.assert_eq_i64(pdfflow.finish(&empty) as i64, 0)
+    pdfflow.free(&empty)
+    rt.buf_free(&o2)
+    rt.buf_free(&o3)
+    rt.buf_free(&out)
+    rt.buf_free(&c)
+    rt.buf_free(&f)
+}
+
+#[test]
+fn same_calls_same_octets() {
+    var f: rt.Buf = font()
+    var a: rt.Buf = rt.buf_new()
+    var b: rt.Buf = rt.buf_new()
+    var k: usize = 0
+    while k < 2 {
+        var out: *mut rt.Buf = &a
+        if k == 1 {
+            out = &b
+        }
+        var fl: pdfflow.Flow = pdfflow.flow_new(out, rt.buf_ptr(&f), rt.buf_len(&f), "t")
+        fl.footer = true
+        pdfflow.heading(&fl, "Title")
+        pdfflow.paragraph(&fl, "one two three")
+        pdfflow.table(&fl, "a,b;c,d", ";", ",", true)
+        pdfflow.finish(&fl)
+        pdfflow.free(&fl)
+        k = k + 1
+    }
+    testkit.assert_true(rt.buf_len(&a) > 0 && rt.buf_len(&a) == rt.buf_len(&b), "same length")
+    testkit.assert_true(rt.mem_eq(rt.buf_ptr(&a), rt.buf_ptr(&b), rt.buf_len(&a)), "same octets")
+    rt.buf_free(&a)
+    rt.buf_free(&b)
+    rt.buf_free(&f)
+}
+
+#[test]
+fn jpeg_frame_reads_the_header_and_refuses_junk() {
+    var j: rt.Buf = rt.buf_new()
+    fs.read_file("tests/data/jpeg/exif6.jpg", &j) catch 0
+    var w: u32 = 0
+    var h: u32 = 0
+    var c: u32 = 0
+    testkit.assert_true(pdf.jpeg_frame(rt.buf_ptr(&j), rt.buf_len(&j), &w, &h, &c), "frame")
+    testkit.assert_true(w > 0 && h > 0 && c == 3, "numbers")
+    testkit.assert_false(pdf.jpeg_frame("not a jpeg at all".p as u64, 17, &w, &h, &c), "junk")
+    testkit.assert_false(pdf.jpeg_frame(rt.buf_ptr(&j), 10, &w, &h, &c), "cut off")
+    var out: rt.Buf = rt.buf_new()
+    var d: pdf.Pdf = pdf.pdf_new(&out, pdf.pdf_options_default())
+    let no_page: bool = pdf.pdf_image_jpeg(&d, rt.buf_ptr(&j), rt.buf_len(&j), 0.0, 0.0, 10.0, 10.0) catch false
+    testkit.assert_false(no_page, "no page open")
+    pdf.pdf_free(&d)
+    rt.buf_free(&out)
+    rt.buf_free(&j)
+}
+
+#[test]
+fn a_word_wider_than_the_line_is_cut() {
+    var f: rt.Buf = font()
+    var out: rt.Buf = rt.buf_new()
+    var fl: pdfflow.Flow = pdfflow.flow_new(&out, rt.buf_ptr(&f), rt.buf_len(&f), "t")
+    var w: rt.Buf = rt.buf_new()
+    var i: usize = 0
+    while i < 300 {
+        rt.buf_push(&w, 120 as u8)
+        i = i + 1
+    }
+    pdfflow.paragraph(&fl, str { p: rt.buf_data(&w), n: rt.buf_len(&w) })
+    testkit.assert_true(pdfflow.cursor_y(&fl) > 18.0 + 3.0 * 5.2, "several lines")
+    testkit.assert_true(pdfflow.finish(&fl) > 0, "finish")
+    pdfflow.free(&fl)
+    rt.buf_free(&w)
+    rt.buf_free(&out)
+    rt.buf_free(&f)
+}

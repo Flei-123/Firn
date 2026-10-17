@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/paint/draw.fi -- paint.draw: draw shapes into a picture and save it (Pillow's ImageDraw, small).
+//
+//     import paint.draw
+//     var d: draw.Draw = draw.new(160, 120, draw.rgb(20, 20, 40))
+//     draw.rect(&d, 10.0, 90.0, 30.0, 6.0, draw.rgb(230, 230, 230))
+//     draw.circle(&d, 80.0, 40.0, 5.0, draw.rgb(255, 200, 0))
+//     draw.line(&d, 0.0, 0.0, 159.0, 119.0, 1.5, draw.rgb(255, 255, 255))
+//     draw.save(&d, "out.png")                      // .png or .ppm by extension
+//     draw.free(&d)
+//
+// Everything is antialiased (lib/fui/painter.fi, lib/paint/stroke.fi over lib/font/raster.fi);
+// positions and sizes are f64 pixels, colours 0xAARRGGBB (`rgb`, `rgba`). `rect(x, y, w, h)` takes a
+// size, not a second corner. A shape that is partly or wholly outside is clipped. Every call is
+// harmless on a Draw that failed to allocate (`ok` is false): nothing is drawn, `save` returns false.
+// Not here: text (it needs a font: lib/fui/painter.fi `text` with a painter font), ellipses, polygons.
+import std.rt
+import std.fs
+import html.mem
+import paint.canvas
+import paint.png
+import paint.stroke
+import font.raster
+import fui.painter
+
+export {
+    Draw, new, free, ok, width, height, rgb, rgba, clear,
+    rect, rect_outline, rounded, circle, circle_outline, line,
+    pixel, save, save_png, save_ppm,
+}
+
+struct Draw {
+    cv: canvas.Canvas,
+    z: painter.Painter,
+    w: usize,
+    h: usize,
+    good: bool,
+}
+
+fn rgb(r: u32, g: u32, b: u32) -> u32 {
+    return canvas.color_of(255, r, g, b)
+}
+
+fn rgba(r: u32, g: u32, b: u32, a: u32) -> u32 {
+    return canvas.color_of(a, r, g, b)
+}
+
+// A w x h picture filled with `bg`.
+#[allow_escape]
+fn new(w: usize, h: usize, bg: u32) -> Draw {
+    var d: Draw = Draw { cv: canvas.canvas_new(), z: painter.painter_new(), w: w, h: h, good: false }
+    if w == 0 || h == 0 || (w as u64) * (h as u64) > 67108864 {
+        return d
+    }
+    if !canvas.canvas_init(&d.cv, w, h) {
+        return d
+    }
+    d.good = painter.painter_init(&d.z, &d.cv, w, h)
+    if d.good {
+        canvas.canvas_clear(&d.cv, bg)
+    }
+    return d
+}
+
+fn free(d: *mut Draw) {
+    painter.painter_free(&(*d).z)
+    canvas.canvas_free(&(*d).cv)
+    (*d).good = false
+}
+
+fn ok(d: *mut Draw) -> bool {
+    return (*d).good
+}
+
+fn width(d: *mut Draw) -> usize {
+    return (*d).w
+}
+
+fn height(d: *mut Draw) -> usize {
+    return (*d).h
+}
+
+// A Draw is a value that may move: point the painter at its canvas before every use.
+fn bind(d: *mut Draw) -> bool {
+    if !(*d).good {
+        return false
+    }
+    painter.painter_swap_canvas(&(*d).z, &(*d).cv)
+    return true
+}
+
+fn clear(d: *mut Draw, col: u32) {
+    if bind(d) {
+        canvas.canvas_clear(&(*d).cv, col)
+    }
+}
+
+// Filled rectangle x, y, w, h.
+fn rect(d: *mut Draw, x: f64, y: f64, w: f64, h: f64, col: u32) {
+    if bind(d) {
+        painter.round_rect(&(*d).z, x, y, w, h, 0.0, col)
+    }
+}
+
+// Rectangle outline, `st` pixels thick, inside x, y, w, h.
+fn rect_outline(d: *mut Draw, x: f64, y: f64, w: f64, h: f64, st: f64, col: u32) {
+    if bind(d) {
+        painter.round_ring(&(*d).z, x, y, w, h, 0.0, st, col)
+    }
+}
+
+fn rounded(d: *mut Draw, x: f64, y: f64, w: f64, h: f64, r: f64, col: u32) {
+    if bind(d) {
+        painter.round_rect(&(*d).z, x, y, w, h, r, col)
+    }
+}
+
+fn circle(d: *mut Draw, cx: f64, cy: f64, r: f64, col: u32) {
+    if bind(d) {
+        painter.round_rect(&(*d).z, cx - r, cy - r, 2.0 * r, 2.0 * r, r, col)
+    }
+}
+
+fn circle_outline(d: *mut Draw, cx: f64, cy: f64, r: f64, st: f64, col: u32) {
+    if bind(d) {
+        painter.round_ring(&(*d).z, cx - r, cy - r, 2.0 * r, 2.0 * r, r, st, col)
+    }
+}
+
+// A line of `width` pixels with round ends.
+fn line(d: *mut Draw, x0: f64, y0: f64, x1: f64, y1: f64, width: f64, col: u32) {
+    if !bind(d) || width <= 0.0 {
+        return
+    }
+    var s: stroke.Stroke = stroke.stroke_new()
+    stroke.stroke_set_width(&s, width)
+    stroke.stroke_set_cap(&s, stroke.CAP_ROUND)
+    let ra: *mut raster.Raster = &(*d).z.ra
+    if raster.raster_begin(ra, 0.0, 0.0, (*d).w, (*d).h) {
+        stroke.stroke_line(&s, ra, x0, y0, x1, y1)
+        raster.raster_finish(ra)
+        painter.painter_fill_raster(&(*d).z, ra, 0, 0, col)
+    }
+}
+
+// The pixel as 0xAARRGGBB, PREMULTIPLIED (the canvas' own form; opaque pictures are the same
+// either way); 0 outside.
+fn pixel(d: *mut Draw, x: usize, y: usize) -> u32 {
+    if !(*d).good || x >= (*d).w || y >= (*d).h {
+        return 0 as u32
+    }
+    return canvas.canvas_get(&(*d).cv, x, y)
+}
+
+fn write_buf(b: *mut mem.Buf, path: str) -> bool {
+    let n: usize = fs.write_file(path, mem.buf_ptr(b) as u64, mem.buf_len(b)) catch 0
+    return n == mem.buf_len(b) && n > 0
+}
+
+fn save_png(d: *mut Draw, path: str) -> bool {
+    if !(*d).good {
+        return false
+    }
+    var b: mem.Buf = mem.buf_new()
+    var good: bool = png.write_png(&(*d).cv, &b)
+    if good {
+        good = write_buf(&b, path)
+    }
+    mem.buf_free(&b)
+    return good
+}
+
+// P6; alpha is put on white.
+fn save_ppm(d: *mut Draw, path: str) -> bool {
+    if !(*d).good {
+        return false
+    }
+    var b: mem.Buf = mem.buf_new()
+    png.write_ppm(&(*d).cv, &b)
+    let good: bool = write_buf(&b, path)
+    mem.buf_free(&b)
+    return good
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+fn has_ext(path: str, ext: str) -> bool {
+    if path.n < ext.n {
+        return false
+    }
+    var i: usize = 0
+    while i < ext.n {
+        if lower(rt.ld8(path.p as u64, path.n - ext.n + i)) != rt.ld8(ext.p as u64, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Writes the picture; the format comes from the extension (.png or .ppm).
+fn save(d: *mut Draw, path: str) -> bool {
+    if has_ext(path, ".png") {
+        return save_png(d, path)
+    }
+    if has_ext(path, ".ppm") {
+        return save_ppm(d, path)
+    }
+    return false
+}

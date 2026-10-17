@@ -1,0 +1,462 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/pdf/pdfflow.fi -- pdf.pdfflow: a document that FLOWS, on top of lib/pdf/pdf.fi.
+//
+//     import pdf.pdfflow
+//     var out: rt.Buf = rt.buf_new()
+//     var fl: pdfflow.Flow = pdfflow.flow_new(&out, rt.buf_ptr(&font), rt.buf_len(&font), "Quarterly Report")
+//     pdfflow.heading(&fl, "Quarterly Report")
+//     pdfflow.paragraph(&fl, "A long text is wrapped at the page width ...")
+//     pdfflow.table(&fl, "Fruit,Weight;Apple,120;Banana,150", ";", ",", true)   // first row = header
+//     pdfflow.image_jpeg(&fl, jpeg_ptr, jpeg_len, 84.0)                          // 84 mm wide, file octets as they are
+//     pdfflow.page_break(&fl)
+//     pdfflow.paragraph(&fl, "Page two.")
+//     if pdfflow.finish(&fl) == 0 { /* something went wrong somewhere */ }
+//     pdfflow.free(&fl)
+//
+// (Named `pdfflow`, not `flow`: module names are flat and `flow` is lib/layout/flow.fi.)
+//
+// WHAT IT DOES. The caller says WHAT comes next; the cursor, the word wrap
+// (greedy, by the measured width of the embedded TrueType font), the table
+// grid (equal columns, cells wrapped, one row never split) and the PAGE
+// BREAKS (a paragraph breaks between lines, a table between rows, an image
+// moves whole to the next page) are done here. A4 portrait, 18 mm margins,
+// 11 pt body text, line height 1.35 -- all fields of `Flow` the caller may
+// change before the first call that draws (page_w, page_h, margin, size).
+//
+// STICKY ERROR. Every call returns nothing; the first failure (font not a
+// TrueType file, a broken image, out of memory) is remembered in the Flow and
+// all later calls do nothing. `ok(&fl)` asks, `finish` returns 0 then. So a
+// script does not catch every call -- it checks once at the end.
+//
+// UNITS are millimetres from the top left, font sizes in points, like lib/pdf.
+// `fl.img_w` / `fl.img_h` are the pixel size of the last image placed.
+// `fl.footer = true` prints the page number (centred) at the foot of every page.
+// ONE FONT: heading and table header use the same face at another size (header
+// cells get a grey background); bold/italic need a second font file and are
+// not here.
+// TEXT: a '\n' in a paragraph ends the line; several spaces stay as they are.
+import std.rt
+import pdf.pdf
+
+export {
+    Flow, flow_new, free, ok, finish, heading, paragraph, space, page_break,
+    table, table_row, image_jpeg, image_rgba, cursor_y, page_count,
+}
+
+const PT_MM: f64 = 0.35277777777777775 // millimetres per point
+const LEAD: f64 = 1.35 // line height / font size
+const PAD: f64 = 2.0 // table cell padding, mm
+
+struct Flow {
+    doc: pdf.Pdf,
+    font: u32,
+    page_w: f64,
+    page_h: f64,
+    margin: f64,
+    size: f64, // body text, points
+    footer: bool,
+    y: f64, // cursor, mm from the top of the page
+    in_page: bool,
+    failed: bool,
+    finished: bool,
+    img_w: u32, // pixel size of the last image placed (0 = none yet)
+    img_h: u32,
+}
+
+fn flow_new(out: *mut rt.Buf, font_data: u64, font_len: usize, title: str) -> Flow {
+    var o: pdf.PdfOptions = pdf.pdf_options_default()
+    o.title = title
+    var fl: Flow = Flow { doc: pdf.pdf_new(out, o), font: 0, page_w: 210.0, page_h: 297.0, margin: 18.0,
+        size: 11.0, footer: false, y: 0.0, in_page: false, failed: false, finished: false, img_w: 0, img_h: 0 }
+    fl.font = pdf.pdf_font_load(&fl.doc, font_data, font_len) catch 0 as u32
+    // pdf_font_load answers 0 for the first font as well: probe with a measure instead
+    if pdf.pdf_text_width(&fl.doc, fl.font, 10.0, "M") <= 0.0 {
+        fl.failed = true
+    }
+    return fl
+}
+
+fn free(fl: *mut Flow) {
+    pdf.pdf_free(&(*fl).doc)
+}
+
+fn ok(fl: *mut Flow) -> bool {
+    return !(*fl).failed
+}
+
+fn page_count(fl: *mut Flow) -> usize {
+    return pdf.pdf_page_count(&(*fl).doc)
+}
+
+// y of the cursor on the current page, mm from the top.
+fn cursor_y(fl: *mut Flow) -> f64 {
+    return (*fl).y
+}
+
+fn bottom(fl: *mut Flow) -> f64 {
+    return (*fl).page_h - (*fl).margin
+}
+
+fn line_h(size: f64) -> f64 {
+    return size * PT_MM * LEAD
+}
+
+fn end_page(fl: *mut Flow) {
+    if !(*fl).in_page {
+        return
+    }
+    if (*fl).footer && !(*fl).failed {
+        var b: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_u64(&b, pdf.pdf_page_count(&(*fl).doc) as u64)
+        let s: str = str { p: rt.buf_data(&b), n: rt.buf_len(&b) }
+        let w: f64 = pdf.pdf_text_width(&(*fl).doc, (*fl).font, 9.0, s)
+        pdf.pdf_fill_rgb(&(*fl).doc, 0.4, 0.4, 0.4)
+        let good: bool = pdf.pdf_text(&(*fl).doc, (*fl).font, 9.0, ((*fl).page_w - w) / 2.0,
+            (*fl).page_h - (*fl).margin / 2.0, s) catch false
+        if !good {
+            (*fl).failed = true
+        }
+        rt.buf_free(&b)
+    }
+    pdf.pdf_page_end(&(*fl).doc)
+    (*fl).in_page = false
+}
+
+fn start_page(fl: *mut Flow) {
+    pdf.pdf_page_begin(&(*fl).doc, (*fl).page_w, (*fl).page_h)
+    pdf.pdf_fill_rgb(&(*fl).doc, 0.0, 0.0, 0.0)
+    pdf.pdf_stroke_rgb(&(*fl).doc, 0.0, 0.0, 0.0)
+    pdf.pdf_line_width(&(*fl).doc, 0.25)
+    (*fl).in_page = true
+    (*fl).y = (*fl).margin
+}
+
+// Makes room for `need` mm: starts the first page, or breaks to a new one
+// when the block does not fit below the cursor (and the page is not empty).
+fn room(fl: *mut Flow, need: f64) {
+    if !(*fl).in_page {
+        start_page(fl)
+    }
+    if (*fl).y + need > bottom(fl) && (*fl).y > (*fl).margin + 0.01 {
+        end_page(fl)
+        start_page(fl)
+    }
+}
+
+fn page_break(fl: *mut Flow) {
+    if (*fl).failed || (*fl).finished {
+        return
+    }
+    if !(*fl).in_page {
+        start_page(fl)
+    }
+    end_page(fl)
+    start_page(fl)
+}
+
+// Vertical gap, mm.
+fn space(fl: *mut Flow, mm: f64) {
+    if (*fl).failed || (*fl).finished {
+        return
+    }
+    room(fl, mm)
+    (*fl).y = (*fl).y + mm
+}
+
+fn put_line(fl: *mut Flow, size: f64, x: f64, y: f64, s: str) {
+    if s.n == 0 {
+        return
+    }
+    let good: bool = pdf.pdf_text(&(*fl).doc, (*fl).font, size, x, y, s) catch false
+    if !good {
+        (*fl).failed = true
+    }
+}
+
+fn piece(s: str, from: usize, to: usize) -> str {
+    return str { p: s.p + from, n: to - from }
+}
+
+// The next line of the greedy word wrap of `s`, from octet `pos`: the line is
+// s[ls..le], `np` is where the next one starts. false when no text is left.
+// A line ends at the last word that still fits `width` mm or at a '\n'; a word
+// wider than the line is cut at the last character that fits.
+fn next_line(fl: *mut Flow, s: str, pos: usize, width: f64, size: f64, ls: *mut usize, le: *mut usize,
+    np: *mut usize) -> bool {
+    var i: usize = pos
+    while i < s.n && *(s.p + i) == 32 as u8 {
+        i = i + 1
+    }
+    if i >= s.n {
+        return false
+    }
+    *ls = i
+    *le = i
+    var p: usize = i
+    while p < s.n {
+        if *(s.p + p) == 10 as u8 {
+            *np = p + 1
+            return true
+        }
+        var ws: usize = p
+        while ws < s.n && *(s.p + ws) == 32 as u8 {
+            ws = ws + 1
+        }
+        var we: usize = ws
+        while we < s.n && *(s.p + we) != 32 as u8 && *(s.p + we) != 10 as u8 {
+            we = we + 1
+        }
+        if we == ws {
+            // only spaces up to a newline or the end
+            p = ws
+            if ws >= s.n {
+                break
+            }
+            continue
+        }
+        if *le == *ls && pdf.pdf_text_width(&(*fl).doc, (*fl).font, size, piece(s, *ls, we)) > width {
+            // a word wider than the line: cut it at the last character that fits (at least one)
+            var best: usize = *ls
+            var q: usize = *ls + 1
+            while q <= we {
+                let cb: u8 = *(s.p + q)
+                if q == we || ((cb as u32) & 192) != 128 {
+                    if best == *ls || pdf.pdf_text_width(&(*fl).doc, (*fl).font, size, piece(s, *ls, q)) <= width {
+                        best = q
+                    } else {
+                        break
+                    }
+                }
+                q = q + 1
+            }
+            *le = best
+            *np = best
+            return true
+        }
+        if *le > *ls && pdf.pdf_text_width(&(*fl).doc, (*fl).font, size, piece(s, *ls, we)) > width {
+            *np = ws
+            return true
+        }
+        *le = we
+        p = we
+    }
+    *np = s.n
+    return true
+}
+
+// Lays `s` out into `width` mm; with `draw` the lines are written from x, the first
+// one's top at y0. Returns the NUMBER OF LINES.
+fn wrap(fl: *mut Flow, s: str, width: f64, size: f64, x: f64, y0: f64, draw: bool) -> usize {
+    var lines: usize = 0
+    var pos: usize = 0
+    var ls: usize = 0
+    var le: usize = 0
+    var np: usize = 0
+    while next_line(fl, s, pos, width, size, &ls, &le, &np) {
+        if draw {
+            put_line(fl, size, x, y0 + size * PT_MM + (lines as f64) * line_h(size), piece(s, ls, le))
+        }
+        lines = lines + 1
+        pos = np
+    }
+    return lines
+}
+
+// A paragraph: wrapped at the text width, broken over pages between lines.
+fn paragraph(fl: *mut Flow, s: str) {
+    if (*fl).failed || (*fl).finished {
+        return
+    }
+    let width: f64 = (*fl).page_w - 2.0 * (*fl).margin
+    let size: f64 = (*fl).size
+    var pos: usize = 0
+    var ls: usize = 0
+    var le: usize = 0
+    var np: usize = 0
+    while !(*fl).failed && next_line(fl, s, pos, width, size, &ls, &le, &np) {
+        room(fl, line_h(size))
+        put_line(fl, size, (*fl).margin, (*fl).y + size * PT_MM, piece(s, ls, le))
+        (*fl).y = (*fl).y + line_h(size)
+        pos = np
+    }
+    (*fl).y = (*fl).y + line_h(size) * 0.4
+}
+
+// A heading: 1.6 x the body size, with space above and below.
+fn heading(fl: *mut Flow, s: str) {
+    if (*fl).failed || (*fl).finished {
+        return
+    }
+    let size: f64 = (*fl).size * 1.6
+    let width: f64 = (*fl).page_w - 2.0 * (*fl).margin
+    let n: usize = wrap(fl, s, width, size, 0.0, 0.0, false)
+    room(fl, (n as f64) * line_h(size) + line_h(size) * 0.5)
+    wrap(fl, s, width, size, (*fl).margin, (*fl).y, true)
+    (*fl).y = (*fl).y + (n as f64) * line_h(size) + line_h(size) * 0.4
+}
+
+fn count_cols(line: str, sep: str) -> usize {
+    var n: usize = 1
+    var i: usize = 0
+    while i + sep.n <= line.n && sep.n > 0 {
+        var same: bool = true
+        var j: usize = 0
+        while j < sep.n {
+            if *(line.p + i + j) != *(sep.p + j) {
+                same = false
+            }
+            j = j + 1
+        }
+        if same {
+            n = n + 1
+            i = i + sep.n
+        } else {
+            i = i + 1
+        }
+    }
+    return n
+}
+
+fn field_of(line: str, sep: str, k: usize) -> str {
+    // text.field without the import: split at the k-th `sep`
+    var start: usize = 0
+    var idx: usize = 0
+    var i: usize = 0
+    while i + sep.n <= line.n && sep.n > 0 {
+        var same: bool = true
+        var j: usize = 0
+        while j < sep.n {
+            if *(line.p + i + j) != *(sep.p + j) {
+                same = false
+            }
+            j = j + 1
+        }
+        if same {
+            if idx == k {
+                return piece(line, start, i)
+            }
+            idx = idx + 1
+            i = i + sep.n
+            start = i
+        } else {
+            i = i + 1
+        }
+    }
+    if idx == k {
+        return piece(line, start, line.n)
+    }
+    return ""
+}
+
+// One table row: the cells of `line` split at `sep`, equal columns over the
+// text width, each cell wrapped; a header row gets a grey background.
+fn table_row(fl: *mut Flow, line: str, sep: str, header: bool) {
+    if (*fl).failed || (*fl).finished {
+        return
+    }
+    let cols: usize = count_cols(line, sep)
+    let width: f64 = (*fl).page_w - 2.0 * (*fl).margin
+    let cw: f64 = width / (cols as f64)
+    let size: f64 = (*fl).size
+    var most: usize = 1
+    var k: usize = 0
+    while k < cols {
+        let n: usize = wrap(fl, field_of(line, sep, k), cw - 2.0 * PAD, size, 0.0, 0.0, false)
+        if n > most {
+            most = n
+        }
+        k = k + 1
+    }
+    let rh: f64 = (most as f64) * line_h(size) + 2.0 * PAD - 1.0
+    room(fl, rh)
+    k = 0
+    while k < cols && !(*fl).failed {
+        let x: f64 = (*fl).margin + (k as f64) * cw
+        pdf.pdf_rect(&(*fl).doc, x, (*fl).y, cw, rh)
+        if header {
+            pdf.pdf_fill_rgb(&(*fl).doc, 0.88, 0.88, 0.88)
+            pdf.pdf_fill_stroke(&(*fl).doc)
+            pdf.pdf_fill_rgb(&(*fl).doc, 0.0, 0.0, 0.0)
+        } else {
+            pdf.pdf_stroke(&(*fl).doc)
+        }
+        wrap(fl, field_of(line, sep, k), cw - 2.0 * PAD, size, x + PAD, (*fl).y + PAD - 0.8, true)
+        k = k + 1
+    }
+    (*fl).y = (*fl).y + rh
+}
+
+// A whole table: rows split at `row_sep`, cells at `col_sep`; `header` makes the first row a header.
+fn table(fl: *mut Flow, data: str, row_sep: str, col_sep: str, header: bool) {
+    var r: usize = 0
+    while true {
+        let line: str = field_of(data, row_sep, r)
+        if line.n == 0 {
+            break
+        }
+        table_row(fl, line, col_sep, header && r == 0)
+        r = r + 1
+    }
+    space(fl, 3.0)
+}
+
+// A JPEG file placed AS IT IS (pdf.pdf_image_jpeg, DCTDecode), `w_mm` wide, height from the file's
+// proportions; moves to the next page when it does not fit below the cursor.
+fn image_jpeg(fl: *mut Flow, data: u64, n: usize, w_mm: f64) {
+    if (*fl).failed || (*fl).finished {
+        return
+    }
+    var w: u32 = 0
+    var h: u32 = 0
+    var c: u32 = 0
+    if !pdf.jpeg_frame(data, n, &w, &h, &c) || w == 0 || h == 0 {
+        (*fl).failed = true
+        return
+    }
+    let h_mm: f64 = w_mm * (h as f64) / (w as f64)
+    room(fl, h_mm)
+    (*fl).img_w = w
+    (*fl).img_h = h
+    let good: bool = pdf.pdf_image_jpeg(&(*fl).doc, data, n, (*fl).margin, (*fl).y, w_mm, h_mm) catch false
+    if !good {
+        (*fl).failed = true
+        return
+    }
+    (*fl).y = (*fl).y + h_mm + 3.0
+}
+
+// `w * h` straight RGBA pixels (re-encoded by lib/pdf), `w_mm` wide.
+fn image_rgba(fl: *mut Flow, px: u64, w: u32, h: u32, w_mm: f64) {
+    if (*fl).failed || (*fl).finished {
+        return
+    }
+    if w == 0 || h == 0 || px == 0 {
+        (*fl).failed = true
+        return
+    }
+    let h_mm: f64 = w_mm * (h as f64) / (w as f64)
+    room(fl, h_mm)
+    (*fl).img_w = w
+    (*fl).img_h = h
+    let good: bool = pdf.pdf_image_rgba(&(*fl).doc, px, w, h, (*fl).margin, (*fl).y, w_mm, h_mm) catch false
+    if !good {
+        (*fl).failed = true
+        return
+    }
+    (*fl).y = (*fl).y + h_mm + 3.0
+}
+
+// Closes the last page and writes the PDF into the buffer given to `flow_new`.
+// Returns the number of octets written, 0 when anything failed (or nothing was drawn).
+fn finish(fl: *mut Flow) -> usize {
+    if (*fl).finished {
+        return 0
+    }
+    end_page(fl)
+    (*fl).finished = true
+    if (*fl).failed || pdf.pdf_page_count(&(*fl).doc) == 0 {
+        return 0
+    }
+    let n: usize = pdf.pdf_finish(&(*fl).doc) catch 0
+    return n
+}
