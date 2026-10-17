@@ -1,19 +1,248 @@
 // SPDX-License-Identifier: MPL-2.0
-// examples/jarvis_android/screen_leitstand.fi -- PLACEHOLDER for the "Leitstand (project command center)" tab (roadmap A5 fills it).
-//
-// Contract (see jshell.fi): screen_leitstand_build(a) runs once with this tab's column open, screen_leitstand_refresh(a) runs when
-// the tab is shown and every 2 s while it stays visible. Data comes from lib/net/jarvisapi.fi (A1) over /api/m/* (A2).
+// examples/jarvis_android/screen_leitstand.fi -- the "Board" tab (project command center). Three modes on ONE virtual list:
+//   Projects  every project with its roadmap stand (done / total, %), open needs; tap = details in the reader
+//   Needs     open questions; tap = details + answer buttons (screen_needs.fi)
+//   Workers   the orchestrator chat and the worker chats of /api/command-center; tap = the chat as Markdown (screen_workerchat.fi)
+// Above the list: a one-line server summary (host, load, memory, disk) and the "stand" hint ("Live" / "Offline - as of 5 min ago").
+// Pull-to-refresh on the list forces all requests; everything else refreshes at most every 15 s (jdata). Offline: the cache answers.
+import std.rt
+import std.vec
 import fui.app
+import fui.vlist
+import net.jarvisapi
 import jshell
+import jdata
+import jlist
+import screen_needs
+import screen_workerchat
 
 export { screen_leitstand_build, screen_leitstand_refresh }
 
-static mut G_INFO: usize = 0
+const MODE_PROJECTS: usize = 0
+const MODE_NEEDS: usize = 1
+const MODE_WORKERS: usize = 2
+
+static mut G_MODE: usize = 0
+static mut G_LIST: usize = 0
+static mut G_STAND: usize = 0
+static mut G_SUM: usize = 0
+static mut G_B_PROJ: usize = 0
+static mut G_B_NEEDS: usize = 0
+static mut G_B_WORK: usize = 0
+static mut G_SEEN_PROJ: u64 = 0
+static mut G_SEEN_NEEDS: u64 = 0
+static mut G_SEEN_CENTER: u64 = 0
+static mut G_SEEN_STAND: u64 = 0
+static mut G_SEEN_MODE: usize = 99
+static mut G_MD: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+
+// the worker rows: row 0 = the orchestrator chat when there is one
+fn worker_count() -> usize {
+    if !jdata.has_center() { return 0 }
+    var n: usize = vec_len[jarvisapi.WorkerRow](&(*jdata.center()).workers)
+    if (*jdata.center()).orch_id.n > 0 { n = n + 1 }
+    return n
+}
+
+fn worker_at(i: usize) -> *mut jarvisapi.WorkerRow {
+    var k: usize = i
+    if (*jdata.center()).orch_id.n > 0 { k = i - 1 }
+    return vec_elem_ptr[jarvisapi.WorkerRow](&(*jdata.center()).workers, k)
+}
+
+fn project_count() -> usize {
+    if !jdata.has_projects() { return 0 }
+    return vec_len[jarvisapi.ProjectRow](&(*jdata.projects()).rows)
+}
+
+fn project_at(i: usize) -> *mut jarvisapi.ProjectRow {
+    return vec_elem_ptr[jarvisapi.ProjectRow](&(*jdata.projects()).rows, i)
+}
+
+fn list_count() -> usize {
+    if G_MODE == MODE_PROJECTS { return project_count() }
+    if G_MODE == MODE_NEEDS { return screen_needs.needs_count() }
+    return worker_count()
+}
+
+fn rows(ud: u64, i: usize, out: *mut vlist.VRow) {
+    if G_MODE == MODE_PROJECTS {
+        if i >= project_count() { return }
+        let p: *mut jarvisapi.ProjectRow = project_at(i)
+        jlist.put(out, (*p).name)
+        jlist.put(out, "  ")
+        jlist.put_dec(out, (*p).pct)
+        jlist.put(out, "%")
+        if (*p).needs > 0 {
+            jlist.put(out, "  ?")
+            jlist.put_dec(out, (*p).needs)
+        }
+    } else if G_MODE == MODE_NEEDS {
+        screen_needs.needs_row(i, out)
+    } else {
+        if i >= worker_count() { return }
+        if i == 0 && (*jdata.center()).orch_id.n > 0 {
+            jlist.put(out, "# ")
+            jlist.put(out, (*jdata.center()).orch_title)
+            return
+        }
+        let w: *mut jarvisapi.WorkerRow = worker_at(i)
+        if (*w).running { jlist.put(out, "> ") } else { jlist.put(out, "  ") }
+        jlist.put(out, (*w).title)
+    }
+}
+
+fn put(s: str) { rt.buf_push_bytes(&G_MD, s.p as u64, s.n) }
+
+fn project_detail(i: usize) {
+    rt.buf_clear(&G_MD)
+    if i >= project_count() { put("_select a project_") }
+    else {
+        let p: *mut jarvisapi.ProjectRow = project_at(i)
+        put("## ")
+        put((*p).name)
+        put("\n\n**Status:** ")
+        put((*p).status)
+        put("  \n**Roadmap:** ")
+        put(jshell.dec((*p).done))
+        put(" / ")
+        put(jshell.dec((*p).total))
+        put(" (")
+        put(jshell.dec((*p).pct))
+        put("%), open ")
+        put(jshell.dec((*p).open))
+        put("  \n**Open needs:** ")
+        put(jshell.dec((*p).needs))
+        if (*p).goal.n > 0 {
+            put("\n\n**Goal:** ")
+            put((*p).goal)
+        }
+        if (*p).next.n > 0 {
+            put("\n\n**Next:** ")
+            put((*p).next)
+        }
+        if (*p).updated.n > 0 {
+            put("\n\n_updated ")
+            put((*p).updated)
+            put("_")
+        }
+    }
+    screen_workerchat.wc_show_text(str { p: G_MD.ptr as *mut u8, n: G_MD.len })
+}
+
+fn picked(a: *mut app.App, id: usize, row: usize) {
+    if G_MODE == MODE_PROJECTS {
+        project_detail(row)
+    } else if G_MODE == MODE_NEEDS {
+        screen_needs.needs_select(a, row)
+    } else if row < worker_count() {
+        if row == 0 && (*jdata.center()).orch_id.n > 0 {
+            screen_workerchat.wc_show_chat((*jdata.center()).orch_id, (*jdata.center()).orch_title)
+        } else {
+            let w: *mut jarvisapi.WorkerRow = worker_at(row)
+            screen_workerchat.wc_show_chat((*w).id, (*w).title)
+        }
+    }
+}
+
+fn redraw(a: *mut app.App) {
+    app.vlist_set_count(a, G_LIST, list_count())
+    app.vlist_changed(a, G_LIST)
+}
+
+fn mode_texts(a: *mut app.App) {
+    app.set_text(a, G_B_PROJ, "Projects (" + jshell.dec(project_count() as i64) + ")")
+    app.set_text(a, G_B_NEEDS, "Needs (" + jshell.dec(screen_needs.needs_count() as i64) + ")")
+    app.set_text(a, G_B_WORK, "Workers (" + jshell.dec(worker_count() as i64) + ")")
+}
+
+fn set_mode(a: *mut app.App, m: usize) {
+    G_MODE = m
+    G_SEEN_MODE = m
+    screen_needs.needs_show(a, m == MODE_NEEDS)
+    if m == MODE_PROJECTS { screen_workerchat.wc_show_text("_select a project_") }
+    else if m == MODE_NEEDS { screen_workerchat.wc_show_text("_select a need to answer it_") }
+    else { screen_workerchat.wc_show_text("_select a worker to read its chat_") }
+    redraw(a)
+    mode_texts(a)
+    screen_leitstand_refresh(a)
+}
+
+fn on_projects(a: *mut app.App) { set_mode(a, MODE_PROJECTS) }
+fn on_needs(a: *mut app.App) { set_mode(a, MODE_NEEDS) }
+fn on_workers(a: *mut app.App) { set_mode(a, MODE_WORKERS) }
+
+fn force_all() {
+    jdata.refresh_center(true)
+    jdata.refresh_projects(true)
+    screen_workerchat.wc_force()
+    jdata.set_note("refreshing ...")
+}
+
+fn on_pull(a: *mut app.App) { force_all() }
+fn on_reload(a: *mut app.App) { force_all() }
 
 fn screen_leitstand_build(a: *mut app.App) {
-    let t: usize = app.label(a, "Leitstand (project command center)", 16)
-    G_INFO = app.label(a, "coming soon", 12)
+    app.row(a)
+    G_B_PROJ = app.button(a, "Projects", on_projects)
+    G_B_NEEDS = app.button(a, "Needs", on_needs)
+    G_B_WORK = app.button(a, "Workers", on_workers)
+    app.end(a)
+    app.row(a)
+    G_STAND = app.label(a, "Loading ...", 11)
+    app.button(a, "Reload", on_reload)
+    app.end(a)
+    G_SUM = app.label(a, "", 11)
+    G_LIST = app.vlist_new(a, "Board", 340, 120, 0, rows, 0)
+    jshell.fill_stretch(a, G_LIST)
+    app.vlist_set_row_pt(a, G_LIST, jlist.ROW_PT)
+    app.vlist_on_pick(a, G_LIST, picked)
+    jlist.pull_add(G_LIST, on_pull)
+    jlist.pull_install(a)
+    screen_needs.needs_build(a)
+    screen_workerchat.wc_build(a)
+}
+
+fn summary() -> str {
+    if !jdata.has_center() { return "" }
+    let c: *mut jarvisapi.Center = jdata.center()
+    var s: str = (*c).host + "  load " + jshell.dec(((*c).load1 * 10.0) as i64 / 10)
+    if (*c).load1 < 10.0 { s = s + "." + jshell.dec(((*c).load1 * 10.0) as i64 % 10) }
+    if (*c).mem_total > 0 { s = s + "  RAM " + jshell.dec((*c).mem_free * 100 / (*c).mem_total) + "%" }
+    if (*c).disk_total > 0 { s = s + "  disk " + jshell.dec((*c).disk_free * 100 / (*c).disk_total) + "% free" }
+    return s
+}
+
+fn stand_slot() -> usize {
+    if G_MODE == MODE_WORKERS { return jdata.K_CENTER }
+    if G_MODE == MODE_NEEDS { return jdata.K_NEED }
+    return jdata.K_PROJECTS
 }
 
 fn screen_leitstand_refresh(a: *mut app.App) {
+    jdata.refresh_projects(false)
+    jdata.refresh_center(false)
+    screen_workerchat.wc_refresh()
+    var changed: bool = false
+    if jdata.ver_projects() != G_SEEN_PROJ { G_SEEN_PROJ = jdata.ver_projects(); changed = true }
+    if jdata.ver_needs() != G_SEEN_NEEDS {
+        G_SEEN_NEEDS = jdata.ver_needs()
+        changed = true
+        screen_needs.needs_sync(a)
+    }
+    if jdata.ver_center() != G_SEEN_CENTER {
+        G_SEEN_CENTER = jdata.ver_center()
+        changed = true
+        app.set_text(a, G_SUM, summary())
+    }
+    if changed {
+        redraw(a)
+        mode_texts(a)
+    }
+    if jdata.ver_stand() != G_SEEN_STAND || changed {
+        G_SEEN_STAND = jdata.ver_stand()
+        var s: str = jdata.stand_text(stand_slot())
+        if jdata.status_note().n > 0 { s = s + "  -  " + jdata.status_note() }
+        app.set_text(a, G_STAND, s)
+    }
 }

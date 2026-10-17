@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_android/screen_workerchat.fi -- the read-only Markdown reader of the Leitstand tab. It shows either a fixed text
+// (details of a project or a need) or a chat (a worker chat: GET conversation, last 30 turns, role-labelled, streaming `partial`
+// at the end). Touch: pan + fling scroll. Not a tab of its own: screen_leitstand.fi builds it into its page.
+//
+//     wc_build(a)            once, with the Leitstand column open (adds ONE custom node that grows)
+//     wc_show_text(md)       fixed Markdown
+//     wc_show_chat(cid)      load + show a chat; wc_refresh() redraws it when a newer answer arrived
+import std.rt
+import std.vec
+import fui.app
+import fui.render
+import fui.scene
+import fui.widget
+import fui.style
+import fui.event
+import fui.markdownview
+import markdown.doc
+import net.jarvisc
+import net.jarvisapi
+import jshell
+import jdata
+
+export { wc_build, wc_show_text, wc_show_chat, wc_refresh, wc_force, wc_title, wc_cid, wc_is_chat }
+
+static mut G_MD: u64 = 0
+static mut G_NODE: usize = 0
+static mut G_FOLLOW: bool = false
+static mut G_IS_CHAT: bool = false
+static mut G_SEEN: u64 = 0
+static mut G_BUF: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_CID: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_TITLE: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+
+fn mdv() -> *mut markdownview.MdView { return G_MD as *mut markdownview.MdView }
+fn wc_is_chat() -> bool { return G_IS_CHAT }
+fn wc_cid() -> str { return str { p: G_CID.ptr as *mut u8, n: G_CID.len } }
+fn wc_title() -> str { return str { p: G_TITLE.ptr as *mut u8, n: G_TITLE.len } }
+
+fn draw_node(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let a: *mut app.App = jshell.app_ui()
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let n: usize = scene.scene_node_of(sc, e)
+    let v: *mut markdownview.MdView = mdv()
+    markdownview.mdv_set_rect(v, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n), scene.node_h(sc, n))
+    markdownview.mdv_paint(v, c)
+    if G_FOLLOW {
+        G_FOLLOW = false
+        markdownview.mdv_set_offset(v, markdownview.mdv_content_height(v))
+        markdownview.mdv_paint(v, c)
+    }
+}
+
+fn on_touch(ud: u64, e: *mut event.Ev) -> u32 {
+    let a: *mut app.App = ud as *mut app.App
+    let k: u32 = event.ev_kind(e)
+    let v: *mut markdownview.MdView = mdv()
+    if k == event.EV_PAN_MOVE {
+        markdownview.mdv_touch_pan(v, event.ev_dx(e), event.ev_dy(e))
+        return event.H_STOP
+    }
+    if k == event.EV_PAN_END && event.ev_fling(e) {
+        markdownview.mdv_touch_fling(v, event.ev_vx(e), event.ev_vy(e), event.ev_time(e))
+        return event.H_STOP
+    }
+    if k == event.EV_TAP {
+        let t: bool = markdownview.mdv_touch_tap(v, app.app_ctx(a), event.ev_x(e), event.ev_y(e))
+        return event.H_STOP
+    }
+    return event.H_GO
+}
+
+fn wc_build(a: *mut app.App) {
+    var md: markdownview.MdView = markdownview.mdv_new()
+    let box: u64 = rt.heap_alloc(8192)
+    G_MD = box
+    *(box as *mut markdownview.MdView) = md
+    markdownview.mdv_set_background(mdv(), style.TOK_BASE)
+    G_NODE = app.custom(a, widget.KIND_TILE, 340, 120)
+    jshell.fill_stretch(a, G_NODE)
+    scene.node_set_draw(app.app_scene(a), G_NODE, 0, draw_node)
+    let b: bool = app.on(a, G_NODE, event.EV_PAN_ALL | event.ev_bit(event.EV_TAP), on_touch)
+}
+
+fn set_markdown(follow: bool) {
+    markdownview.mdv_set_markdown(mdv(), str { p: G_BUF.ptr as *mut u8, n: G_BUF.len }, doc.opts_default())
+    G_FOLLOW = follow
+}
+
+fn put(s: str) { rt.buf_push_bytes(&G_BUF, s.p as u64, s.n) }
+
+fn wc_show_text(md: str) {
+    G_IS_CHAT = false
+    rt.buf_clear(&G_BUF)
+    put(md)
+    set_markdown(false)
+}
+
+// text of a chat answer without the ">STATUS:" line the server appends
+fn put_answer(s: str) {
+    put(jarvisc.jc_clean(s))
+}
+
+fn render_chat() {
+    let c: *mut jarvisapi.Conv = jdata.conv()
+    rt.buf_clear(&G_BUF)
+    if !jdata.has_conv() || jdata.conv_cid() != wc_cid() {
+        put("_loading ..._")
+        set_markdown(false)
+        return
+    }
+    let n: usize = vec_len[jarvisapi.Msg](&(*c).msgs)
+    if n == 0 { put("_no messages_\n\n") }
+    var i: usize = 0
+    while i < n {
+        let m: *mut jarvisapi.Msg = vec_elem_ptr[jarvisapi.Msg](&(*c).msgs, i)
+        if (*m).role == "user" {
+            put("**You:** ")
+            put((*m).text)
+        } else {
+            put("**JARVIS:** ")
+            put_answer((*m).text)
+        }
+        put("\n\n")
+        i = i + 1
+    }
+    if (*c).running {
+        put("**JARVIS (running):** ")
+        put_answer((*c).partial)
+        put("\n\n")
+    }
+    set_markdown(true)
+}
+
+fn wc_show_chat(cid: str, title: str) {
+    if cid.n == 0 { return }
+    let same: bool = G_IS_CHAT && cid == wc_cid()
+    G_IS_CHAT = true
+    if !same {
+        rt.buf_clear(&G_CID)
+        rt.buf_push_bytes(&G_CID, cid.p as u64, cid.n)
+        rt.buf_clear(&G_TITLE)
+        rt.buf_push_bytes(&G_TITLE, title.p as u64, title.n)
+        G_SEEN = 0 as u64
+        render_chat()
+    }
+    jdata.load_chat(cid, false)
+}
+
+// called from the 2 s refresh: new data -> redraw; the chat is asked again when it is running (throttled in jdata)
+fn wc_refresh() {
+    if !G_IS_CHAT { return }
+    if jdata.ver_conv() != G_SEEN {
+        G_SEEN = jdata.ver_conv()
+        render_chat()
+    }
+    jdata.load_chat(wc_cid(), false)
+}
+
+fn wc_force() {
+    if G_IS_CHAT { jdata.load_chat(wc_cid(), true) }
+}

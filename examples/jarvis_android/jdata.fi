@@ -1,0 +1,501 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_android/jdata.fi -- the data side of the JARVIS app screens (roadmap A5): ONE net.jarvisapi client with the
+// offline cache (net.jarvis_cache), the last good answer of every kind kept parsed, and a version counter per kind.
+//
+// A screen never gets a callback: its screen_<name>_refresh (every 2 s while visible) compares the version it drew last with
+// `ver_*()` and redraws when it changed. Requests are throttled (`REFRESH_MS`) unless forced (pull-to-refresh, a button).
+// Strings inside the parsed structs are VIEWS into their json documents: valid until the next answer of the same kind replaces
+// them, which happens on the UI thread (looppump), never in the middle of a frame.
+//
+// NEEDS: the server has no "all open needs" route on today's main (A2 adds /api/m/needs). The aggregate is built from
+// /api/projects (needs counter) + /api/projects/<id> for every project with open needs, one after the other, into a second
+// pool that replaces the shown one when the cycle ends (no flicker). Switching to /api/m/* later = `ja_set_path` calls in `api()`.
+import std.rt
+import std.vec
+import std.time
+import async.loop
+import net.jarvisc
+import net.jarvisapi
+import net.jarvis_cache
+import appkit.appinfo
+import appkit.platform
+import appkit.util
+import jshell
+
+export {
+    Ref, NeedRec, api, ensure, refresh_projects, refresh_center, refresh_tasks, refresh_devices, load_chat,
+    answer_need, task_add, task_complete, task_remove, forget_all,
+    ver_projects, ver_needs, ver_center, ver_tasks, ver_devices, ver_conv, ver_stand,
+    projects, has_projects, center, has_center, tasks, has_tasks, devices, has_devices, conv, has_conv, conv_cid,
+    needs_count, need_at, need_str, need_option, cycle_running,
+    stand_text, status_note, set_note,
+    K_PROJECTS, K_CENTER, K_TASKS, K_DEVICES, K_CONV, K_NEED, K_COUNT,
+}
+
+const REFRESH_MS: i64 = 15000
+const NEED_OPTS: usize = 4
+// the stand slots (not the AK_* numbers, which go to 17)
+const K_PROJECTS: usize = 0
+const K_CENTER: usize = 1
+const K_TASKS: usize = 2
+const K_DEVICES: usize = 3
+const K_CONV: usize = 4
+const K_NEED: usize = 5
+const K_COUNT: usize = 6
+
+// a piece of a pool buffer (offset + length): safe against the pool growing
+struct Ref {
+    off: usize,
+    n: usize,
+}
+
+struct NeedRec {
+    proj_id: Ref,
+    proj: Ref,
+    id: Ref,
+    text: Ref,
+    cid: Ref,
+    nopts: usize,
+    o0: Ref,
+    o1: Ref,
+    o2: Ref,
+    o3: Ref,
+}
+
+struct NeedSet {
+    v: Vec[NeedRec],
+    pool: rt.Buf,
+}
+
+static mut G_API: u64 = 0
+static mut G_CACHE: u64 = 0
+static mut G_PROJ: u64 = 0
+static mut G_CENTER: u64 = 0
+static mut G_TASKS: u64 = 0
+static mut G_DEV: u64 = 0
+static mut G_CONV: u64 = 0
+static mut G_SET_CUR: u64 = 0
+static mut G_SET_NEW: u64 = 0
+static mut G_QUEUE: u64 = 0
+static mut G_HAS_PROJ: bool = false
+static mut G_HAS_CENTER: bool = false
+static mut G_HAS_TASKS: bool = false
+static mut G_HAS_DEV: bool = false
+static mut G_HAS_CONV: bool = false
+static mut G_Q_AT: usize = 0
+static mut G_CYCLE: bool = false
+static mut G_V_PROJ: u64 = 0
+static mut G_V_NEEDS: u64 = 0
+static mut G_V_CENTER: u64 = 0
+static mut G_V_TASKS: u64 = 0
+static mut G_V_DEV: u64 = 0
+static mut G_V_CONV: u64 = 0
+static mut G_V_STAND: u64 = 0
+static mut G_LAST: [i64; 6] = [0; 6]
+static mut G_STATUS: [i64; 6] = [0; 6]
+static mut G_AGE: [i64; 6] = [0; 6]
+static mut G_NOTE: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_CID: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_STAND_BUF: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+
+fn ver_projects() -> u64 { return G_V_PROJ }
+fn ver_needs() -> u64 { return G_V_NEEDS }
+fn ver_center() -> u64 { return G_V_CENTER }
+fn ver_tasks() -> u64 { return G_V_TASKS }
+fn ver_devices() -> u64 { return G_V_DEV }
+fn ver_conv() -> u64 { return G_V_CONV }
+fn ver_stand() -> u64 { return G_V_STAND }
+
+fn projects() -> *mut jarvisapi.Projects { return G_PROJ as *mut jarvisapi.Projects }
+fn center() -> *mut jarvisapi.Center { return G_CENTER as *mut jarvisapi.Center }
+fn tasks() -> *mut jarvisapi.Tasks { return G_TASKS as *mut jarvisapi.Tasks }
+fn devices() -> *mut jarvisapi.Devices { return G_DEV as *mut jarvisapi.Devices }
+fn conv() -> *mut jarvisapi.Conv { return G_CONV as *mut jarvisapi.Conv }
+fn has_projects() -> bool { return G_HAS_PROJ }
+fn has_center() -> bool { return G_HAS_CENTER }
+fn has_tasks() -> bool { return G_HAS_TASKS }
+fn has_devices() -> bool { return G_HAS_DEV }
+fn has_conv() -> bool { return G_HAS_CONV }
+fn conv_cid() -> str { return str { p: G_CID.ptr as *mut u8, n: G_CID.len } }
+fn cycle_running() -> bool { return G_CYCLE }
+
+fn set_cur() -> *mut NeedSet { return G_SET_CUR as *mut NeedSet }
+fn set_new() -> *mut NeedSet { return G_SET_NEW as *mut NeedSet }
+
+fn alloc_set() -> u64 {
+    let p: u64 = rt.heap_alloc(128)
+    *(p as *mut NeedSet) = NeedSet { v: vec_new[NeedRec](), pool: rt.buf_new() }
+    return p
+}
+
+fn pool_add(s: *mut NeedSet, t: str) -> Ref {
+    let off: usize = (*s).pool.len
+    rt.buf_push_bytes(&(*s).pool, t.p as u64, t.n)
+    return Ref { off: off, n: t.n }
+}
+
+fn pool_str(s: *mut NeedSet, r: Ref) -> str {
+    return str { p: ((*s).pool.ptr + r.off as u64) as *mut u8, n: r.n }
+}
+
+fn clear_set(s: *mut NeedSet) {
+    vec_clear[NeedRec](&(*s).v)
+    rt.buf_clear(&(*s).pool)
+}
+
+// ------------------------------------------------------------------ accessors for the shown needs
+fn needs_count() -> usize {
+    if G_SET_CUR == 0 { return 0 }
+    return vec_len[NeedRec](&(*set_cur()).v)
+}
+
+fn need_at(i: usize) -> *mut NeedRec { return vec_elem_ptr[NeedRec](&(*set_cur()).v, i) }
+
+// which: 0 project id, 1 project name, 2 need id, 3 text, 4 chat id
+fn need_str(i: usize, which: usize) -> str {
+    if i >= needs_count() { return "" }
+    let n: *mut NeedRec = need_at(i)
+    var r: Ref = (*n).proj_id
+    if which == 1 { r = (*n).proj }
+    else if which == 2 { r = (*n).id }
+    else if which == 3 { r = (*n).text }
+    else if which == 4 { r = (*n).cid }
+    return pool_str(set_cur(), r)
+}
+
+fn need_option(i: usize, k: usize) -> str {
+    if i >= needs_count() { return "" }
+    let n: *mut NeedRec = need_at(i)
+    if k >= (*n).nopts { return "" }
+    var r: Ref = (*n).o0
+    if k == 1 { r = (*n).o1 }
+    else if k == 2 { r = (*n).o2 }
+    else if k == 3 { r = (*n).o3 }
+    return pool_str(set_cur(), r)
+}
+
+// ------------------------------------------------------------------ the client
+fn stand_note(kind: usize, status: i64, age: i64) {
+    G_STATUS[kind] = status
+    G_AGE[kind] = age
+    // a good list answer ends the "refreshing ..." hint of the pull
+    if (kind == K_PROJECTS || kind == K_CENTER || kind == K_DEVICES) && (status == 200 || status == 203) { rt.buf_clear(&G_NOTE) }
+    G_V_STAND = G_V_STAND + 1 as u64
+}
+
+fn on_api(a: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
+    let p: u64 = jarvisapi.ja_body_ptr(a)
+    let n: usize = jarvisapi.ja_body_len(a)
+    let age: i64 = jarvisapi.ja_age_s(a)
+    let good: bool = status == 200 || status == 203
+    if kind == jarvisapi.AK_PROJECTS {
+        stand_note(K_PROJECTS, status, age)
+        if good { take_projects(p, n) } else { end_cycle(false) }
+    } else if kind == jarvisapi.AK_PROJECT {
+        stand_note(K_NEED, status, age)
+        if good { take_project_needs(p, n) }
+        next_project()
+    } else if kind == jarvisapi.AK_NEED {
+        stand_note(K_NEED, status, age)
+        if status == 200 {
+            set_note("answer sent")
+            refresh_projects(true)
+        } else {
+            set_note("answer failed (" + jshell.dec(status) + ")")
+        }
+    } else if kind == jarvisapi.AK_CENTER {
+        stand_note(K_CENTER, status, age)
+        if good { take_center(p, n) }
+    } else if kind == jarvisapi.AK_TASKS {
+        stand_note(K_TASKS, status, age)
+        if good { take_tasks(p, n) }
+    } else if kind == jarvisapi.AK_TASK_OP {
+        stand_note(K_TASKS, status, age)
+        if status == 200 {
+            take_tasks(p, n)
+            set_note("task saved")
+        } else {
+            set_note("task action failed (" + jshell.dec(status) + ")")
+        }
+    } else if kind == jarvisapi.AK_DEVICES {
+        stand_note(K_DEVICES, status, age)
+        if good { take_devices(p, n) }
+    } else if kind == jarvisapi.AK_CONV {
+        stand_note(K_CONV, status, age)
+        if good { take_conv(p, n) }
+    }
+}
+
+fn ensure_init() {
+    if G_API != 0 { return }
+    G_PROJ = rt.heap_alloc(256)
+    G_CENTER = rt.heap_alloc(512)
+    G_TASKS = rt.heap_alloc(256)
+    G_DEV = rt.heap_alloc(256)
+    G_CONV = rt.heap_alloc(256)
+    G_SET_CUR = alloc_set()
+    G_SET_NEW = alloc_set()
+    G_QUEUE = alloc_set()
+    var dir: rt.Buf = rt.buf_new()
+    let ok: bool = platform.plat_dir(platform.DIR_CACHE, appinfo.app_id(), appinfo.app_vendor(), &dir)
+    let base: str = util.buf_to_str_copy(&dir)
+    rt.buf_free(&dir)
+    G_CACHE = rt.heap_alloc(256)
+    *(G_CACHE as *mut jarvis_cache.Cache) = jarvis_cache.cache_new(base + "/api")
+    let a: *mut jarvisapi.Api = jarvisapi.ja_new(jshell.loop_of(), on_api, 0)
+    jarvisapi.ja_set_cache(a, G_CACHE as *mut jarvis_cache.Cache)
+    G_API = a as u64
+}
+
+fn api() -> *mut jarvisapi.Api {
+    ensure_init()
+    return G_API as *mut jarvisapi.Api
+}
+
+// token + base of the signed-in chat client (it can change after a new sign-in)
+fn ensure() -> *mut jarvisapi.Api {
+    let a: *mut jarvisapi.Api = api()
+    jarvisapi.ja_use_jc(a, jshell.jc())
+    return a
+}
+
+// sign-out: the next user must not see this user's answers
+fn forget_all() {
+    ensure_init()
+    let c: bool = jarvis_cache.cache_clear(G_CACHE as *mut jarvis_cache.Cache)
+    clear_set(set_cur())
+    clear_set(set_new())
+    G_V_NEEDS = G_V_NEEDS + 1 as u64
+    G_HAS_PROJ = false
+    G_HAS_CENTER = false
+    G_HAS_TASKS = false
+    G_HAS_DEV = false
+    G_HAS_CONV = false
+    G_V_PROJ = G_V_PROJ + 1 as u64
+    G_V_CENTER = G_V_CENTER + 1 as u64
+    G_V_TASKS = G_V_TASKS + 1 as u64
+    G_V_DEV = G_V_DEV + 1 as u64
+    G_V_CONV = G_V_CONV + 1 as u64
+}
+
+// ------------------------------------------------------------------ taking answers (the old struct is freed on success)
+fn take_projects(p: u64, n: usize) {
+    var t: jarvisapi.Projects = jarvisapi.projects_new()
+    if !jarvisapi.parse_projects(p, n, &t) {
+        jarvisapi.projects_free(&t)
+        end_cycle(false)
+        return
+    }
+    if G_HAS_PROJ { jarvisapi.projects_free(projects()) }
+    *projects() = t
+    G_HAS_PROJ = true
+    G_V_PROJ = G_V_PROJ + 1 as u64
+    // the needs cycle: one request per project with open needs
+    clear_set(set_new())
+    clear_set(vq())
+    var i: usize = 0
+    let cnt: usize = vec_len[jarvisapi.ProjectRow](&(*projects()).rows)
+    while i < cnt {
+        let r: *mut jarvisapi.ProjectRow = vec_elem_ptr[jarvisapi.ProjectRow](&(*projects()).rows, i)
+        if (*r).needs > 0 {
+            let id: Ref = pool_add(vq(), (*r).id)
+            var rec: NeedRec = blank_need()
+            rec.proj_id = id
+            let ok: bool = vec_push[NeedRec](&(*vq()).v, rec)
+        }
+        i = i + 1
+    }
+    G_Q_AT = 0
+    G_CYCLE = true
+    next_project()
+}
+
+fn vq() -> *mut NeedSet { return G_QUEUE as *mut NeedSet }
+fn nref() -> Ref { return Ref { off: 0, n: 0 } }
+fn blank_need() -> NeedRec {
+    return NeedRec { proj_id: nref(), proj: nref(), id: nref(), text: nref(), cid: nref(), nopts: 0,
+        o0: nref(), o1: nref(), o2: nref(), o3: nref() }
+}
+
+// ask for the next project of the queue, or finish the cycle
+fn next_project() {
+    if !G_CYCLE { return }
+    if G_Q_AT >= vec_len[NeedRec](&(*vq()).v) {
+        end_cycle(true)
+        return
+    }
+    let rec: *mut NeedRec = vec_elem_ptr[NeedRec](&(*vq()).v, G_Q_AT)
+    G_Q_AT = G_Q_AT + 1
+    let id: str = __str_copy(pool_str(vq(), (*rec).proj_id))
+    let ok: bool = jarvisapi.ja_project(ensure(), id)
+    if !ok { next_project() }
+}
+
+// ok: the new set replaces the shown one (swap); not ok: keep what is shown
+fn end_cycle(ok: bool) {
+    G_CYCLE = false
+    if !ok { return }
+    let t: u64 = G_SET_CUR
+    G_SET_CUR = G_SET_NEW
+    G_SET_NEW = t
+    clear_set(set_new())
+    G_V_NEEDS = G_V_NEEDS + 1 as u64
+}
+
+fn take_project_needs(p: u64, n: usize) {
+    var f: jarvisapi.ProjectFull = jarvisapi.pfull_new()
+    if jarvisapi.parse_project(p, n, &f) {
+        let s: *mut NeedSet = set_new()
+        let cnt: usize = vec_len[jarvisapi.NeedItem](&f.needs)
+        var i: usize = 0
+        while i < cnt {
+            let it: *mut jarvisapi.NeedItem = vec_elem_ptr[jarvisapi.NeedItem](&f.needs, i)
+            if !(*it).done {
+                var rec: NeedRec = blank_need()
+                rec.proj_id = pool_add(s, f.info.id)
+                rec.proj = pool_add(s, f.info.name)
+                rec.id = pool_add(s, (*it).id)
+                rec.text = pool_add(s, (*it).text)
+                rec.cid = pool_add(s, (*it).cid)
+                var k: usize = (*it).nopts
+                if k > NEED_OPTS { k = NEED_OPTS }
+                rec.nopts = k
+                if k > 0 { rec.o0 = pool_add(s, jarvisapi.pfull_option(&f, i, 0)) }
+                if k > 1 { rec.o1 = pool_add(s, jarvisapi.pfull_option(&f, i, 1)) }
+                if k > 2 { rec.o2 = pool_add(s, jarvisapi.pfull_option(&f, i, 2)) }
+                if k > 3 { rec.o3 = pool_add(s, jarvisapi.pfull_option(&f, i, 3)) }
+                let ok: bool = vec_push[NeedRec](&(*s).v, rec)
+            }
+            i = i + 1
+        }
+    }
+    jarvisapi.pfull_free(&f)
+}
+
+fn take_center(p: u64, n: usize) {
+    var t: jarvisapi.Center = jarvisapi.center_new()
+    if !jarvisapi.parse_center(p, n, &t) {
+        jarvisapi.center_free(&t)
+        return
+    }
+    if G_HAS_CENTER { jarvisapi.center_free(center()) }
+    *center() = t
+    G_HAS_CENTER = true
+    G_V_CENTER = G_V_CENTER + 1 as u64
+}
+
+fn take_tasks(p: u64, n: usize) {
+    var t: jarvisapi.Tasks = jarvisapi.tasks_new()
+    if !jarvisapi.parse_tasks(p, n, &t) {
+        jarvisapi.tasks_free(&t)
+        return
+    }
+    if G_HAS_TASKS { jarvisapi.tasks_free(tasks()) }
+    *tasks() = t
+    G_HAS_TASKS = true
+    G_V_TASKS = G_V_TASKS + 1 as u64
+}
+
+fn take_devices(p: u64, n: usize) {
+    var t: jarvisapi.Devices = jarvisapi.devices_new()
+    if !jarvisapi.parse_devices(p, n, &t) {
+        jarvisapi.devices_free(&t)
+        return
+    }
+    if G_HAS_DEV { jarvisapi.devices_free(devices()) }
+    *devices() = t
+    G_HAS_DEV = true
+    G_V_DEV = G_V_DEV + 1 as u64
+}
+
+fn take_conv(p: u64, n: usize) {
+    var t: jarvisapi.Conv = jarvisapi.conv_new()
+    if !jarvisapi.parse_conv(p, n, &t) {
+        jarvisapi.conv_free(&t)
+        return
+    }
+    if G_HAS_CONV { jarvisapi.conv_free(conv()) }
+    *conv() = t
+    G_HAS_CONV = true
+    G_V_CONV = G_V_CONV + 1 as u64
+}
+
+// ------------------------------------------------------------------ requests (throttled unless `force`)
+fn due(slot: usize, force: bool) -> bool {
+    let now: i64 = time.now_unix_ms()
+    if !force && now - G_LAST[slot] < REFRESH_MS { return false }
+    G_LAST[slot] = now
+    return true
+}
+
+fn refresh_projects(force: bool) {
+    if G_CYCLE && !force { return }
+    if !due(K_PROJECTS, force) { return }
+    let ok: bool = jarvisapi.ja_projects(ensure())
+}
+
+fn refresh_center(force: bool) {
+    if !due(K_CENTER, force) { return }
+    let ok: bool = jarvisapi.ja_center(ensure())
+}
+
+fn refresh_tasks(force: bool) {
+    if !due(K_TASKS, force) { return }
+    let ok: bool = jarvisapi.ja_tasks(ensure())
+}
+
+fn refresh_devices(force: bool) {
+    if !due(K_DEVICES, force) { return }
+    let ok: bool = jarvisapi.ja_devices(ensure())
+}
+
+// the last 30 turns of a chat (a worker chat too)
+fn load_chat(cid: str, force: bool) {
+    if cid.n == 0 { return }
+    var same: bool = cid == conv_cid()
+    if !same {
+        rt.buf_clear(&G_CID)
+        rt.buf_push_bytes(&G_CID, cid.p as u64, cid.n)
+    }
+    if !same || force { G_LAST[K_CONV] = 0 }
+    if !due(K_CONV, force || !same) { return }
+    let ok: bool = jarvisapi.ja_conv(ensure(), cid, 30)
+}
+
+fn answer_need(i: usize, answer: str) -> bool {
+    if i >= needs_count() || answer.n == 0 { return false }
+    let pid: str = __str_copy(need_str(i, 0))
+    let nid: str = __str_copy(need_str(i, 2))
+    return jarvisapi.ja_need_answer(ensure(), pid, nid, answer)
+}
+
+fn task_add(text: str, due_iso: str) -> bool {
+    return jarvisapi.ja_task_add(ensure(), text, due_iso, "", "")
+}
+fn task_complete(ref_id: str) -> bool { return jarvisapi.ja_task_complete(ensure(), ref_id) }
+fn task_remove(ref_id: str) -> bool { return jarvisapi.ja_task_remove(ensure(), ref_id) }
+
+// ------------------------------------------------------------------ the "stand" hint
+fn set_note(s: str) {
+    rt.buf_clear(&G_NOTE)
+    rt.buf_push_bytes(&G_NOTE, s.p as u64, s.n)
+    G_V_STAND = G_V_STAND + 1 as u64
+}
+fn status_note() -> str { return str { p: G_NOTE.ptr as *mut u8, n: G_NOTE.len } }
+
+// "Live" | "Offline - as of 5 min ago" | "No connection" | "Session expired" | "Error 500" | "Loading ..."
+fn stand_text(slot: usize) -> str {
+    let st: i64 = G_STATUS[slot]
+    if st == 0 && G_LAST[slot] == 0 { return "Loading ..." }
+    if st == 200 { return "Live" }
+    if st == 203 {
+        let age: i64 = G_AGE[slot]
+        if age < 90 { return "Offline - as of " + jshell.dec(age) + " s ago" }
+        if age < 5400 { return "Offline - as of " + jshell.dec(age / 60) + " min ago" }
+        if age < 172800 { return "Offline - as of " + jshell.dec(age / 3600) + " h ago" }
+        return "Offline - as of " + jshell.dec(age / 86400) + " d ago"
+    }
+    if st == 0 { return "No connection" }
+    if st == 401 { return "Session expired - sign in again" }
+    return "Error " + jshell.dec(st)
+}
