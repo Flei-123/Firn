@@ -62,6 +62,25 @@ def median_ms(cmd, runs, cwd, env=None):
     return statistics.median(ts)
 
 
+def start_server(d):
+    """Start <d>/server.py (the test harness) on a free port; env VSPY_PORT carries it."""
+    import socket
+    sk = socket.socket()
+    sk.bind(("127.0.0.1", 0))
+    port = sk.getsockname()[1]
+    sk.close()
+    env = dict(os.environ, VSPY_PORT=str(port))
+    proc = subprocess.Popen(["python3", os.path.join(d, "server.py")], env=env, cwd=d)
+    for _ in range(100):
+        try:
+            socket.create_connection(("127.0.0.1", port), 0.2).close()
+            return proc, port
+        except OSError:
+            time.sleep(0.05)
+    proc.kill()
+    raise SystemExit("server.py did not come up")
+
+
 def main():
     d = os.path.abspath(sys.argv[1])
     runs = 5
@@ -81,11 +100,20 @@ def main():
         return 1
     pyl, fil = count_lines(py, "#"), count_lines(fi, "//")
     pyt, fit = py_tokens(py), fi_tokens(fi)
-    if os.path.exists(os.path.join(d, "norun")):  # a window program: no timing
-        pyr = fir = -1
-    else:
-        pyr = median_ms(["python3", py], runs, d)
-        fir = median_ms([exe], runs, d)
+    srv = None
+    renv = None
+    if os.path.exists(os.path.join(d, "server.py")):
+        srv, port = start_server(d)
+        renv = dict(os.environ, VSPY_PORT=str(port))
+    try:
+        if os.path.exists(os.path.join(d, "norun")):  # a window program: no timing
+            pyr = fir = -1
+        else:
+            pyr = median_ms(["python3", py], runs, d, renv)
+            fir = median_ms([exe], runs, d, renv)
+    finally:
+        if srv:
+            srv.kill()
     print("\t".join(str(x) for x in [
         name, pyl, fil, round(fil / pyl, 2), pyt, fit, round(fit / pyt, 2),
         imports(py, "py"), imports(fi, "fi"), round(pyr, 1), round(fir, 1), round(comp)]))
