@@ -1,0 +1,639 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/android/share.fi -- FILES AND TEXT OUT OF THE APP: save to Downloads, open, share, clipboard.
+//
+//     import plat.android.share
+//
+//   share.share_save(data, n, "report.pdf\0".p, "application/pdf\0".p, 0)   // 1 = in Downloads, 2 = private file, 0 = failed
+//   share.share_view_last()                         // ACTION_VIEW on the file just saved (another app opens it)
+//   share.share_send_last("Send report")            // ACTION_SEND + chooser for the file just saved
+//   share.share_send_text(p, n, "Share")            // ACTION_SEND text/plain (UTF-8 p[0, n))
+//   share.share_open_url("https://...\0".p)         // ACTION_VIEW on a link (browser)
+//   share.clip_write(p, n)  /  share.clip_read(p, cap) -> n     // the system clipboard, UTF-8 text
+//
+// ================================================================= WHERE FILES GO
+//
+// MediaStore.Downloads (Android 10+, API 29): the file appears in the Files app under Download/<sub> and needs
+// NO storage permission for what we write ourselves. `sub` is an optional sub folder name (a C string, "Jarvis")
+// or 0 for Download itself. A name that exists gets a number from Android ("report (1).pdf"). Below API 29 --
+// and when MediaStore refuses -- the file is written into the app's working directory (result 2, the app can
+// still send it with its own means). The Uri of the last saved file is kept (global reference) so that
+// view / send need no path: Android's content Uri + FLAG_GRANT_READ_URI_PERMISSION give the other app
+// access to exactly that file, no FileProvider and no extra manifest entry.
+//
+// ================================================================= THE CLIPBOARD
+//
+// lib/window/android.fi leaves the system clipboard unconnected (fUi then copies inside the app only). The
+// two functions here have exactly the signatures of editor.editor_set_clipboard(read, write):
+//     editor.editor_set_clipboard(&ed, share.clip_read, share.clip_write)
+// Android 10+ lets only the focused app READ the clipboard (clip_read answers 0 otherwise). Text goes through
+// UTF-16 (plat.android.jtext), so emoji are safe under CheckJNI. Limit 65536 UTF-16 units; longer text is
+// refused (false), never cut silently.
+//
+// ================================================================= THREADS
+//
+// All #[no_gc]; JNI on the program's own thread only (never on an attached worker thread).
+import android.ndk
+import android.jnicall
+import android.activity
+import plat.android.jtext
+
+export {
+    share_save, share_view_last, share_send_last, share_send_text, share_open_url, share_last_ok,
+    clip_write, clip_read, clip_has,
+}
+
+// ---- BEGIN GENERATED STRINGS (tools/android/gen_plat3_strings.py) ----
+static TXT: [u8; 1695] = "firn-share\0android/content/Intent\0android/content/ContentValues\0android/provider/MediaStore$Downloads\0android/net/Uri\0android/content/ClipboardManager\0android/content/ClipData\0<init>\0()V\0(Ljava/lang/String;)V\0(Ljava/lang/String;Landroid/net/Uri;)V\0put\0(Ljava/lang/String;Ljava/lang/String;)V\0_display_name\0mime_type\0relative_path\0Download\0EXTERNAL_CONTENT_URI\0Landroid/net/Uri;\0getContentResolver\0()Landroid/content/ContentResolver;\0insert\0(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;\0openFileDescriptor\0(Landroid/net/Uri;Ljava/lang/String;)Landroid/os/ParcelFileDescriptor;\0w\0detachFd\0()I\0startActivity\0(Landroid/content/Intent;)V\0setFlags\0(I)Landroid/content/Intent;\0setType\0(Ljava/lang/String;)Landroid/content/Intent;\0setDataAndType\0(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;\0putExtra\0(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;\0(Ljava/lang/String;Ljava/lang/CharSequence;)Landroid/content/Intent;\0android.intent.extra.STREAM\0android.intent.extra.TEXT\0android.intent.action.VIEW\0android.intent.action.SEND\0text/plain\0createChooser\0(Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;\0parse\0(Ljava/lang/String;)Landroid/net/Uri;\0getSystemService\0(Ljava/lang/String;)Ljava/lang/Object;\0clipboard\0newPlainText\0(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;\0setPrimaryClip\0(Landroid/content/ClipData;)V\0getPrimaryClip\0()Landroid/content/ClipData;\0getItemCount\0getItemAt\0(I)Landroid/content/ClipData$Item;\0android/content/ClipData$Item\0coerceToText\0(Landroid/content/Context;)Ljava/lang/CharSequence;\0java/lang/CharSequence\0toString\0()Ljava/lang/String;\0firn\0hasPrimaryClip\0()Z\0"
+
+const S_TAG: usize = 0 // firn-share
+const C_INTENT: usize = 11 // android/content/Intent
+const C_VALUES: usize = 34 // android/content/ContentValues
+const C_DOWNLOADS: usize = 64 // android/provider/MediaStore$Downloads
+const C_URI: usize = 102 // android/net/Uri
+const C_CLIPBOARD: usize = 118 // android/content/ClipboardManager
+const C_CLIP: usize = 151 // android/content/ClipData
+const N_INIT: usize = 176 // <init>
+const G_V: usize = 183 // ()V
+const G_INTENT_S: usize = 187 // (Ljava/lang/String;)V
+const G_INTENT_SU: usize = 209 // (Ljava/lang/String;Landroid/net/Uri;)V
+const N_PUT: usize = 248 // put
+const G_PUT_SS: usize = 252 // (Ljava/lang/String;Ljava/lang/String;)V
+const S_DISPLAY: usize = 292 // _display_name
+const S_MIME: usize = 306 // mime_type
+const S_RELPATH: usize = 316 // relative_path
+const S_DOWNLOAD: usize = 330 // Download
+const N_EXT: usize = 339 // EXTERNAL_CONTENT_URI
+const G_URI: usize = 360 // Landroid/net/Uri;
+const N_RESOLVER: usize = 378 // getContentResolver
+const G_RESOLVER: usize = 397 // ()Landroid/content/ContentResolver;
+const N_INSERT: usize = 433 // insert
+const G_INSERT: usize = 440 // (Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;
+const N_OPEN_FD: usize = 508 // openFileDescriptor
+const G_OPEN_FD: usize = 527 // (Landroid/net/Uri;Ljava/lang/String;)Landroid/os/ParcelFileDescriptor;
+const S_W: usize = 598 // w
+const N_DETACH: usize = 600 // detachFd
+const G_VI: usize = 609 // ()I
+const N_START: usize = 613 // startActivity
+const G_START: usize = 627 // (Landroid/content/Intent;)V
+const N_SET_FLAGS: usize = 655 // setFlags
+const G_SET_FLAGS: usize = 664 // (I)Landroid/content/Intent;
+const N_SET_TYPE: usize = 692 // setType
+const G_SET_TYPE: usize = 700 // (Ljava/lang/String;)Landroid/content/Intent;
+const N_SET_DT: usize = 745 // setDataAndType
+const G_SET_DT: usize = 760 // (Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;
+const N_PUT_EXTRA: usize = 822 // putExtra
+const G_PUT_PARC: usize = 831 // (Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;
+const G_PUT_STR: usize = 899 // (Ljava/lang/String;Ljava/lang/CharSequence;)Landroid/content/Intent;
+const S_EXTRA_STREAM: usize = 968 // android.intent.extra.STREAM
+const S_EXTRA_TEXT: usize = 996 // android.intent.extra.TEXT
+const S_ACTION_VIEW: usize = 1022 // android.intent.action.VIEW
+const S_ACTION_SEND: usize = 1049 // android.intent.action.SEND
+const S_TEXT_PLAIN: usize = 1076 // text/plain
+const N_CHOOSER: usize = 1087 // createChooser
+const G_CHOOSER: usize = 1101 // (Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;
+const N_PARSE: usize = 1176 // parse
+const G_PARSE: usize = 1182 // (Ljava/lang/String;)Landroid/net/Uri;
+const N_GET_SERVICE: usize = 1220 // getSystemService
+const G_GET_SERVICE: usize = 1237 // (Ljava/lang/String;)Ljava/lang/Object;
+const S_CLIPBOARD: usize = 1276 // clipboard
+const N_NEW_PLAIN: usize = 1286 // newPlainText
+const G_NEW_PLAIN: usize = 1299 // (Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;
+const N_SET_PRIMARY: usize = 1376 // setPrimaryClip
+const G_SET_PRIMARY: usize = 1391 // (Landroid/content/ClipData;)V
+const N_GET_PRIMARY: usize = 1421 // getPrimaryClip
+const G_GET_PRIMARY: usize = 1436 // ()Landroid/content/ClipData;
+const N_ITEM_COUNT: usize = 1465 // getItemCount
+const N_ITEM_AT: usize = 1478 // getItemAt
+const G_ITEM_AT: usize = 1488 // (I)Landroid/content/ClipData$Item;
+const C_ITEM: usize = 1523 // android/content/ClipData$Item
+const N_COERCE: usize = 1553 // coerceToText
+const G_COERCE: usize = 1566 // (Landroid/content/Context;)Ljava/lang/CharSequence;
+const C_CHARSEQ: usize = 1618 // java/lang/CharSequence
+const N_TOSTRING: usize = 1641 // toString
+const G_TOSTRING: usize = 1650 // ()Ljava/lang/String;
+const S_LABEL: usize = 1671 // firn
+const N_HAS_CLIP: usize = 1676 // hasPrimaryClip
+const G_Z: usize = 1691 // ()Z
+// ---- END GENERATED STRINGS ----
+
+const FLAG_NEW_TASK: u64 = 268435456
+const FLAG_GRANT_READ: u64 = 1
+const TEXT_UNITS: usize = 65536
+
+static mut G_LAST: u64 = 0 // global reference: the Uri of the file saved last
+static mut G_MIME: [u8; 128] = [0; 128]
+static mut G_BUF: [u8; 131072] = [0; 131072] // UTF-16 scratch for strings handed to Java
+static mut G_REL: [u8; 256] = [0; 256]
+
+#[no_gc]
+fn t(i: usize) -> u64 {
+    return ((&TXT[0]) as u64) + i as u64
+}
+
+#[no_gc]
+fn jni_ctx(ctx_out: *mut u64) -> u64 {
+    let act: u64 = activity.activity_pointer()
+    if act == 0 {
+        return 0
+    }
+    *ctx_out = ndk.peek64(act + 24)
+    return jnicall.j_env(ndk.peek64(act + 8))
+}
+
+#[no_gc]
+fn cstr_len(p: u64) -> usize {
+    var n: usize = 0
+    while *((p + n as u64) as *mut u8) != 0 as u8 { n = n + 1 }
+    return n
+}
+
+// A Java String from UTF-8 p[0, n) through UTF-16 (0 = too long or Java refused).
+#[no_gc]
+fn jstr8(env: u64, p: u64, n: usize) -> u64 {
+    if jtext.utf8_units(p, n) > TEXT_UNITS { return 0 }
+    let u: usize = jtext.utf8_to_units(p, n, (&G_BUF[0]) as u64, TEXT_UNITS)
+    return jnicall.j_new_string16(env, (&G_BUF[0]) as u64, u)
+}
+
+#[no_gc]
+fn jstr_c(env: u64, p: u64) -> u64 {
+    return jstr8(env, p, cstr_len(p))
+}
+
+// ------------------------------------------------------------ saving
+// Writes `n` octets as `name` (C string, UTF-8) with MIME type `mime` (C string) into Download[/sub].
+// 1 = saved in Downloads (its Uri is remembered), 2 = private file in the working directory, 0 = failed.
+#[no_gc]
+fn share_save(data: u64, n: usize, name: u64, mime: u64, sub: u64) -> i32 {
+    if data == 0 || n == 0 || name == 0 || mime == 0 { return 0 }
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    let act: u64 = activity.activity_pointer()
+    if env != 0 && ctx != 0 && ndk.peek32(act + ndk.ACT_SDK_VERSION) >= 29 {
+        if save_downloads(env, ctx, data, n, name, mime, sub) { return 1 }
+    }
+    let fd: i64 = syscall(2, name as i64, 577, 420, 0, 0, 0)
+    if fd < 0 { return 0 }
+    var off: usize = 0
+    while off < n {
+        let w: i64 = syscall(1, fd, (data + off as u64) as i64, (n - off) as i64, 0, 0, 0)
+        if w <= 0 { break }
+        off = off + w as usize
+    }
+    syscall(3, fd, 0, 0, 0, 0, 0)
+    if off == n { return 2 }
+    return 0
+}
+
+#[no_gc]
+fn rel_path(sub: u64) -> usize {
+    // "Download" or "Download/<sub>" (sub: letters, digits, space, - _ . only; anything else becomes _)
+    var i: usize = 0
+    var w: usize = 0
+    while i < 8 {
+        G_REL[w] = *((t(S_DOWNLOAD) + i as u64) as *mut u8)
+        w = w + 1
+        i = i + 1
+    }
+    if sub != 0 && *(sub as *mut u8) != 0 as u8 {
+        G_REL[w] = 47 as u8
+        w = w + 1
+        var k: usize = 0
+        while k < 100 {
+            let c: u8 = *((sub + k as u64) as *mut u8)
+            if c == 0 as u8 { break }
+            var ok: bool = (c >= 48 as u8 && c <= 57 as u8) || (c >= 65 as u8 && c <= 90 as u8) || (c >= 97 as u8 && c <= 122 as u8)
+            if c == 32 as u8 || c == 45 as u8 || c == 95 as u8 || c == 46 as u8 { ok = true }
+            if ok { G_REL[w] = c } else { G_REL[w] = 95 as u8 }
+            w = w + 1
+            k = k + 1
+        }
+    }
+    G_REL[w] = 0 as u8
+    return w
+}
+
+#[no_gc]
+fn save_downloads(env: u64, ctx: u64, data: u64, n: usize, name: u64, mime: u64, sub: u64) -> bool {
+    let cc: u64 = jnicall.j_obj_class(env, ctx)
+    var a: [u64; 3] = [0; 3]
+    let resolver: u64 = jnicall.j_obj(env, ctx, jnicall.j_method(env, cc, t(N_RESOLVER), t(G_RESOLVER)), (&a[0]) as u64)
+    jnicall.j_del(env, cc)
+    if resolver == 0 { return false }
+    let vc: u64 = jnicall.j_class(env, t(C_VALUES))
+    let values: u64 = jnicall.j_new(env, vc, jnicall.j_method(env, vc, t(N_INIT), t(G_V)), (&a[0]) as u64)
+    if values == 0 { return false }
+    let pm: u64 = jnicall.j_method(env, vc, t(N_PUT), t(G_PUT_SS))
+    jnicall.j_del(env, vc)
+    let rl: usize = rel_path(sub)
+    let k1: u64 = jnicall.j_str(env, t(S_DISPLAY))
+    let v1: u64 = jstr_c(env, name)
+    a[0] = k1
+    a[1] = v1
+    let o1: bool = jnicall.j_void(env, values, pm, (&a[0]) as u64)
+    jnicall.j_del(env, k1)
+    jnicall.j_del(env, v1)
+    let k2: u64 = jnicall.j_str(env, t(S_MIME))
+    let v2: u64 = jnicall.j_str(env, mime)
+    a[0] = k2
+    a[1] = v2
+    let o2: bool = jnicall.j_void(env, values, pm, (&a[0]) as u64)
+    jnicall.j_del(env, k2)
+    jnicall.j_del(env, v2)
+    let k3: u64 = jnicall.j_str(env, t(S_RELPATH))
+    let v3: u64 = jnicall.j_str(env, (&G_REL[0]) as u64)
+    a[0] = k3
+    a[1] = v3
+    let o3: bool = jnicall.j_void(env, values, pm, (&a[0]) as u64)
+    jnicall.j_del(env, k3)
+    jnicall.j_del(env, v3)
+    if !o1 || !o2 || !o3 { return false }
+    let mc: u64 = jnicall.j_class(env, t(C_DOWNLOADS))
+    let base: u64 = jnicall.j_sfield_obj(env, mc, t(N_EXT), t(G_URI))
+    jnicall.j_del(env, mc)
+    if base == 0 { return false }
+    let rc: u64 = jnicall.j_obj_class(env, resolver)
+    a[0] = base
+    a[1] = values
+    let uri: u64 = jnicall.j_obj(env, resolver, jnicall.j_method(env, rc, t(N_INSERT), t(G_INSERT)), (&a[0]) as u64)
+    jnicall.j_del(env, base)
+    jnicall.j_del(env, values)
+    if uri == 0 {
+        jnicall.j_del(env, rc)
+        jnicall.j_del(env, resolver)
+        return false
+    }
+    a[0] = uri
+    a[1] = jnicall.j_str(env, t(S_W))
+    let pfd: u64 = jnicall.j_obj(env, resolver, jnicall.j_method(env, rc, t(N_OPEN_FD), t(G_OPEN_FD)), (&a[0]) as u64)
+    jnicall.j_del(env, a[1])
+    jnicall.j_del(env, rc)
+    jnicall.j_del(env, resolver)
+    if pfd == 0 {
+        jnicall.j_del(env, uri)
+        return false
+    }
+    let pc: u64 = jnicall.j_obj_class(env, pfd)
+    var z: [u64; 1] = [0]
+    let fd: i32 = jnicall.j_int(env, pfd, jnicall.j_method(env, pc, t(N_DETACH), t(G_VI)), (&z[0]) as u64)
+    jnicall.j_del(env, pc)
+    jnicall.j_del(env, pfd)
+    if fd < 0 {
+        jnicall.j_del(env, uri)
+        return false
+    }
+    var off: usize = 0
+    while off < n {
+        let w: i64 = syscall(1, fd as i64, (data + off as u64) as i64, (n - off) as i64, 0, 0, 0)
+        if w <= 0 { break }
+        off = off + w as usize
+    }
+    syscall(3, fd as i64, 0, 0, 0, 0, 0)
+    if off != n {
+        jnicall.j_del(env, uri)
+        return false
+    }
+    if G_LAST != 0 { jnicall.j_del_global(env, G_LAST) }
+    G_LAST = jnicall.j_global(env, uri)
+    jnicall.j_del(env, uri)
+    var m: usize = 0
+    while m < 127 {
+        let c: u8 = *((mime + m as u64) as *mut u8)
+        G_MIME[m] = c
+        if c == 0 as u8 { break }
+        m = m + 1
+    }
+    G_MIME[127] = 0 as u8
+    return true
+}
+
+// true when a file saved by share_save is waiting to be opened / shared
+#[no_gc]
+fn share_last_ok() -> bool { return G_LAST != 0 }
+
+// ------------------------------------------------------------ intents
+#[no_gc]
+fn start_intent(env: u64, ctx: u64, it: u64) -> bool {
+    let cc: u64 = jnicall.j_obj_class(env, ctx)
+    var a: [u64; 1] = [0]
+    a[0] = it
+    let ok: bool = jnicall.j_void(env, ctx, jnicall.j_method(env, cc, t(N_START), t(G_START)), (&a[0]) as u64)
+    jnicall.j_del(env, cc)
+    return ok
+}
+
+#[no_gc]
+fn set_flags(env: u64, it: u64, flags: u64) -> bool {
+    let ic: u64 = jnicall.j_obj_class(env, it)
+    var a: [u64; 1] = [0]
+    a[0] = flags
+    let r: u64 = jnicall.j_obj(env, it, jnicall.j_method(env, ic, t(N_SET_FLAGS), t(G_SET_FLAGS)), (&a[0]) as u64)
+    jnicall.j_del(env, ic)
+    if r == 0 { return false }
+    jnicall.j_del(env, r)
+    return true
+}
+
+// Opens the file saved last in the app that handles its type (ACTION_VIEW). false = nothing saved, or no
+// app can open this type (the call then fails with ActivityNotFound, which is caught).
+#[no_gc]
+fn share_view_last() -> bool {
+    if G_LAST == 0 { return false }
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 || ctx == 0 { return false }
+    let ic: u64 = jnicall.j_class(env, t(C_INTENT))
+    var a: [u64; 2] = [0; 2]
+    a[0] = jnicall.j_str(env, t(S_ACTION_VIEW))
+    let it: u64 = jnicall.j_new(env, ic, jnicall.j_method(env, ic, t(N_INIT), t(G_INTENT_S)), (&a[0]) as u64)
+    jnicall.j_del(env, a[0])
+    if it == 0 {
+        jnicall.j_del(env, ic)
+        return false
+    }
+    a[0] = G_LAST
+    a[1] = jnicall.j_str(env, (&G_MIME[0]) as u64)
+    let r: u64 = jnicall.j_obj(env, it, jnicall.j_method(env, ic, t(N_SET_DT), t(G_SET_DT)), (&a[0]) as u64)
+    jnicall.j_del(env, a[1])
+    jnicall.j_del(env, ic)
+    if r == 0 {
+        jnicall.j_del(env, it)
+        return false
+    }
+    jnicall.j_del(env, r)
+    if !set_flags(env, it, FLAG_NEW_TASK | FLAG_GRANT_READ) {
+        jnicall.j_del(env, it)
+        return false
+    }
+    let ok: bool = start_intent(env, ctx, it)
+    jnicall.j_del(env, it)
+    return ok
+}
+
+// wraps `inner` in the system's share sheet with `title` (UTF-8 C string); starts it
+#[no_gc]
+fn start_chooser(env: u64, ctx: u64, inner: u64, title: u64) -> bool {
+    let ic: u64 = jnicall.j_class(env, t(C_INTENT))
+    var a: [u64; 2] = [0; 2]
+    var ts: u64 = 0
+    if title != 0 { ts = jstr_c(env, title) }
+    a[0] = inner
+    a[1] = ts
+    let ch: u64 = jnicall.j_sobj(env, ic, jnicall.j_smethod(env, ic, t(N_CHOOSER), t(G_CHOOSER)), (&a[0]) as u64)
+    jnicall.j_del(env, ic)
+    if ts != 0 { jnicall.j_del(env, ts) }
+    if ch == 0 { return false }
+    if !set_flags(env, ch, FLAG_NEW_TASK) {
+        jnicall.j_del(env, ch)
+        return false
+    }
+    let ok: bool = start_intent(env, ctx, ch)
+    jnicall.j_del(env, ch)
+    return ok
+}
+
+#[no_gc]
+fn new_send(env: u64) -> u64 {
+    let ic: u64 = jnicall.j_class(env, t(C_INTENT))
+    var a: [u64; 1] = [0]
+    a[0] = jnicall.j_str(env, t(S_ACTION_SEND))
+    let it: u64 = jnicall.j_new(env, ic, jnicall.j_method(env, ic, t(N_INIT), t(G_INTENT_S)), (&a[0]) as u64)
+    jnicall.j_del(env, a[0])
+    jnicall.j_del(env, ic)
+    return it
+}
+
+#[no_gc]
+fn set_type(env: u64, it: u64, mime: u64) -> bool {
+    let ic: u64 = jnicall.j_obj_class(env, it)
+    var a: [u64; 1] = [0]
+    a[0] = jnicall.j_str(env, mime)
+    let r: u64 = jnicall.j_obj(env, it, jnicall.j_method(env, ic, t(N_SET_TYPE), t(G_SET_TYPE)), (&a[0]) as u64)
+    jnicall.j_del(env, a[0])
+    jnicall.j_del(env, ic)
+    if r == 0 { return false }
+    jnicall.j_del(env, r)
+    return true
+}
+
+// Shares the file saved last (ACTION_SEND, EXTRA_STREAM) through the share sheet. title: C string or 0.
+#[no_gc]
+fn share_send_last(title: u64) -> bool {
+    if G_LAST == 0 { return false }
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 || ctx == 0 { return false }
+    let it: u64 = new_send(env)
+    if it == 0 { return false }
+    if !set_type(env, it, (&G_MIME[0]) as u64) {
+        jnicall.j_del(env, it)
+        return false
+    }
+    let ic: u64 = jnicall.j_obj_class(env, it)
+    var a: [u64; 2] = [0; 2]
+    a[0] = jnicall.j_str(env, t(S_EXTRA_STREAM))
+    a[1] = G_LAST
+    let r: u64 = jnicall.j_obj(env, it, jnicall.j_method(env, ic, t(N_PUT_EXTRA), t(G_PUT_PARC)), (&a[0]) as u64)
+    jnicall.j_del(env, a[0])
+    jnicall.j_del(env, ic)
+    if r == 0 {
+        jnicall.j_del(env, it)
+        return false
+    }
+    jnicall.j_del(env, r)
+    if !set_flags(env, it, FLAG_GRANT_READ) {
+        jnicall.j_del(env, it)
+        return false
+    }
+    let ok: bool = start_chooser(env, ctx, it, title)
+    jnicall.j_del(env, it)
+    return ok
+}
+
+// Shares plain text (UTF-8 p[0, n)) through the share sheet.
+#[no_gc]
+fn share_send_text(p: u64, n: usize, title: u64) -> bool {
+    if p == 0 || n == 0 { return false }
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 || ctx == 0 { return false }
+    let it: u64 = new_send(env)
+    if it == 0 { return false }
+    if !set_type(env, it, t(S_TEXT_PLAIN)) {
+        jnicall.j_del(env, it)
+        return false
+    }
+    let txt: u64 = jstr8(env, p, n)
+    if txt == 0 {
+        jnicall.j_del(env, it)
+        return false
+    }
+    let ic: u64 = jnicall.j_obj_class(env, it)
+    var a: [u64; 2] = [0; 2]
+    a[0] = jnicall.j_str(env, t(S_EXTRA_TEXT))
+    a[1] = txt
+    let r: u64 = jnicall.j_obj(env, it, jnicall.j_method(env, ic, t(N_PUT_EXTRA), t(G_PUT_STR)), (&a[0]) as u64)
+    jnicall.j_del(env, a[0])
+    jnicall.j_del(env, txt)
+    jnicall.j_del(env, ic)
+    if r == 0 {
+        jnicall.j_del(env, it)
+        return false
+    }
+    jnicall.j_del(env, r)
+    let ok: bool = start_chooser(env, ctx, it, title)
+    jnicall.j_del(env, it)
+    return ok
+}
+
+// Opens a link (ACTION_VIEW on the Uri parsed from `url`, a C string) in the browser.
+#[no_gc]
+fn share_open_url(url: u64) -> bool {
+    if url == 0 { return false }
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 || ctx == 0 { return false }
+    let uc: u64 = jnicall.j_class(env, t(C_URI))
+    var a: [u64; 2] = [0; 2]
+    a[0] = jstr_c(env, url)
+    let uri: u64 = jnicall.j_sobj(env, uc, jnicall.j_smethod(env, uc, t(N_PARSE), t(G_PARSE)), (&a[0]) as u64)
+    jnicall.j_del(env, a[0])
+    jnicall.j_del(env, uc)
+    if uri == 0 { return false }
+    let ic: u64 = jnicall.j_class(env, t(C_INTENT))
+    a[0] = jnicall.j_str(env, t(S_ACTION_VIEW))
+    a[1] = uri
+    let it: u64 = jnicall.j_new(env, ic, jnicall.j_method(env, ic, t(N_INIT), t(G_INTENT_SU)), (&a[0]) as u64)
+    jnicall.j_del(env, a[0])
+    jnicall.j_del(env, ic)
+    jnicall.j_del(env, uri)
+    if it == 0 { return false }
+    if !set_flags(env, it, FLAG_NEW_TASK) {
+        jnicall.j_del(env, it)
+        return false
+    }
+    let ok: bool = start_intent(env, ctx, it)
+    jnicall.j_del(env, it)
+    return ok
+}
+
+// ------------------------------------------------------------ clipboard
+// the ClipboardManager (local ref) or 0
+#[no_gc]
+fn clip_manager(env: u64, ctx: u64) -> u64 {
+    let cc: u64 = jnicall.j_obj_class(env, ctx)
+    var a: [u64; 1] = [0]
+    a[0] = jnicall.j_str(env, t(S_CLIPBOARD))
+    let cm: u64 = jnicall.j_obj(env, ctx, jnicall.j_method(env, cc, t(N_GET_SERVICE), t(G_GET_SERVICE)), (&a[0]) as u64)
+    jnicall.j_del(env, a[0])
+    jnicall.j_del(env, cc)
+    return cm
+}
+
+// Puts UTF-8 text p[0, n) on the system clipboard. true = done.
+#[no_gc]
+fn clip_write(p: u64, n: usize) -> bool {
+    if p == 0 || n == 0 { return false }
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 || ctx == 0 { return false }
+    let txt: u64 = jstr8(env, p, n)
+    if txt == 0 { return false }
+    let cm: u64 = clip_manager(env, ctx)
+    if cm == 0 {
+        jnicall.j_del(env, txt)
+        return false
+    }
+    let kc: u64 = jnicall.j_class(env, t(C_CLIP))
+    var a: [u64; 2] = [0; 2]
+    a[0] = jnicall.j_str(env, t(S_LABEL))
+    a[1] = txt
+    let clip: u64 = jnicall.j_sobj(env, kc, jnicall.j_smethod(env, kc, t(N_NEW_PLAIN), t(G_NEW_PLAIN)), (&a[0]) as u64)
+    jnicall.j_del(env, a[0])
+    jnicall.j_del(env, kc)
+    jnicall.j_del(env, txt)
+    if clip == 0 {
+        jnicall.j_del(env, cm)
+        return false
+    }
+    let mc: u64 = jnicall.j_obj_class(env, cm)
+    a[0] = clip
+    let ok: bool = jnicall.j_void(env, cm, jnicall.j_method(env, mc, t(N_SET_PRIMARY), t(G_SET_PRIMARY)), (&a[0]) as u64)
+    jnicall.j_del(env, mc)
+    jnicall.j_del(env, clip)
+    jnicall.j_del(env, cm)
+    return ok
+}
+
+// the primary clip (local ref) or 0
+#[no_gc]
+fn primary_clip(env: u64, cm: u64) -> u64 {
+    let mc: u64 = jnicall.j_obj_class(env, cm)
+    var a: [u64; 1] = [0]
+    let clip: u64 = jnicall.j_obj(env, cm, jnicall.j_method(env, mc, t(N_GET_PRIMARY), t(G_GET_PRIMARY)), (&a[0]) as u64)
+    jnicall.j_del(env, mc)
+    return clip
+}
+
+// true when the clipboard holds something
+#[no_gc]
+fn clip_has() -> bool {
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 || ctx == 0 { return false }
+    let cm: u64 = clip_manager(env, ctx)
+    if cm == 0 { return false }
+    let mc: u64 = jnicall.j_obj_class(env, cm)
+    var a: [u64; 1] = [0]
+    let has: bool = jnicall.j_bool(env, cm, jnicall.j_method(env, mc, t(N_HAS_CLIP), t(G_Z)), (&a[0]) as u64)
+    jnicall.j_del(env, mc)
+    jnicall.j_del(env, cm)
+    return has
+}
+
+// Copies the clipboard text (UTF-8) into p[0, cap); returns the octets written (0 = empty, not allowed to
+// read, or no text). Never splits a character at the end.
+#[no_gc]
+fn clip_read(p: u64, cap: usize) -> usize {
+    if p == 0 || cap == 0 { return 0 }
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 || ctx == 0 { return 0 }
+    let cm: u64 = clip_manager(env, ctx)
+    if cm == 0 { return 0 }
+    let clip: u64 = primary_clip(env, cm)
+    jnicall.j_del(env, cm)
+    if clip == 0 { return 0 }
+    let kc: u64 = jnicall.j_obj_class(env, clip)
+    var a: [u64; 1] = [0]
+    let cnt: i32 = jnicall.j_int(env, clip, jnicall.j_method(env, kc, t(N_ITEM_COUNT), t(G_VI)), (&a[0]) as u64)
+    if cnt < 1 {
+        jnicall.j_del(env, kc)
+        jnicall.j_del(env, clip)
+        return 0
+    }
+    a[0] = 0
+    let item: u64 = jnicall.j_obj(env, clip, jnicall.j_method(env, kc, t(N_ITEM_AT), t(G_ITEM_AT)), (&a[0]) as u64)
+    jnicall.j_del(env, kc)
+    jnicall.j_del(env, clip)
+    if item == 0 { return 0 }
+    let ik: u64 = jnicall.j_obj_class(env, item)
+    a[0] = ctx
+    let cs: u64 = jnicall.j_obj(env, item, jnicall.j_method(env, ik, t(N_COERCE), t(G_COERCE)), (&a[0]) as u64)
+    jnicall.j_del(env, ik)
+    jnicall.j_del(env, item)
+    if cs == 0 { return 0 }
+    let sc: u64 = jnicall.j_obj_class(env, cs)
+    a[0] = 0
+    let s: u64 = jnicall.j_obj(env, cs, jnicall.j_method(env, sc, t(N_TOSTRING), t(G_TOSTRING)), (&a[0]) as u64)
+    jnicall.j_del(env, sc)
+    jnicall.j_del(env, cs)
+    if s == 0 { return 0 }
+    let units: usize = jnicall.j_string_len(env, s)
+    let chars: u64 = jnicall.j_string_chars(env, s)
+    var w: usize = 0
+    if chars != 0 && units > 0 { w = jtext.units_to_utf8(chars, units, p, cap) }
+    jnicall.j_string_release(env, s, chars)
+    jnicall.j_del(env, s)
+    return w
+}

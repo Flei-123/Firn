@@ -1,0 +1,91 @@
+// expect_out: ok
+// tests/3710_pcmwav.fi -- plat.android.pcmwav: WAV header write + parse round trip, odd chunks, truncation,
+// peak / rms / level curve / meter. tools/android/pcmwav_cross.sh checks the same bytes against Python's wave.
+import std.io
+import plat.android.pcmwav
+
+fn put16(p: u64, i: usize, v: i32) {
+    let u: u32 = (v & 65535) as u32
+    *((p + (i * 2) as u64) as *mut u8) = (u & 255 as u32) as u8
+    *((p + (i * 2) as u64 + 1 as u64) as *mut u8) = (u >> 8 as u32) as u8
+}
+
+fn main() -> i32 {
+    var buf: [u8; 512] = [0 as u8; 512]
+    let p: u64 = (&buf[0]) as u64
+    // 100 samples of a ramp including the extremes
+    var i: usize = 0
+    while i < 100 {
+        put16(p + 44 as u64, i, (i as i32) * 655 - 32768)
+        i = i + 1
+    }
+    pcmwav.wav_header(p, 16000 as u32, 1 as u32, 200)
+    if pcmwav.wav_total(200) != 244 { io.print("total"); return 1 }
+    var info: pcmwav.WavInfo = pcmwav.WavInfo { rate: 0 as u32, channels: 0 as u32, bits: 0 as u32, data_at: 0, data_len: 0 }
+    if !pcmwav.wav_parse(p, 244, &info) { io.print("parse"); return 2 }
+    if info.rate != 16000 as u32 || info.channels != 1 as u32 || info.bits != 16 as u32 { io.print("fmt"); return 3 }
+    if info.data_at != 44 || info.data_len != 200 { io.print("data"); return 4 }
+    // truncated file: the data chunk is cut to what is there
+    if !pcmwav.wav_parse(p, 144, &info) || info.data_len != 100 { io.print("cut"); return 5 }
+    // header only / garbage / too short
+    if pcmwav.wav_parse(p, 11, &info) { io.print("short"); return 6 }
+    if pcmwav.wav_parse(p, 12, &info) { io.print("nochunk"); return 7 }
+    var junk: [u8; 64] = [7 as u8; 64]
+    if pcmwav.wav_parse((&junk[0]) as u64, 64, &info) { io.print("junk"); return 8 }
+    // stereo 48 kHz header fields
+    pcmwav.wav_header(p, 48000 as u32, 2 as u32, 400)
+    if !pcmwav.wav_parse(p, 444, &info) || info.channels != 2 as u32 || info.rate != 48000 as u32 { io.print("stereo"); return 9 }
+    let byte_rate: u32 = (*((p + 28 as u64) as *mut u8)) as u32 | ((*((p + 29 as u64) as *mut u8)) as u32) << 8 as u32
+    | ((*((p + 30 as u64) as *mut u8)) as u32) << 16 as u32
+    if byte_rate != 192000 as u32 { io.print("byte rate"); return 10 }
+    // an extra chunk (odd length, padded) before "data" is skipped
+    // layout: 36 header bytes up to "data"; insert LIST(3) at 36: id, len 3, 3 bytes + pad = 12 bytes -> data at 48
+    var y: [u8; 128] = [0 as u8; 128]
+    let yp: u64 = (&y[0]) as u64
+    pcmwav.wav_header(yp, 8000 as u32, 1 as u32, 4)
+    var j: usize = 0
+    while j < 8 { *((yp + 48 as u64 + j as u64) as *mut u8) = *((yp + 36 as u64 + j as u64) as *mut u8); j = j + 1 }
+    *((yp + 36 as u64) as *mut u8) = 76 as u8
+    *((yp + 37 as u64) as *mut u8) = 73 as u8
+    *((yp + 38 as u64) as *mut u8) = 83 as u8
+    *((yp + 39 as u64) as *mut u8) = 84 as u8
+    *((yp + 40 as u64) as *mut u8) = 3 as u8
+    *((yp + 41 as u64) as *mut u8) = 0 as u8
+    *((yp + 42 as u64) as *mut u8) = 0 as u8
+    *((yp + 43 as u64) as *mut u8) = 0 as u8
+    if !pcmwav.wav_parse(yp, 60, &info) || info.data_at != 56 || info.data_len != 4 { io.print("list chunk"); return 11 }
+    // peak / rms
+    if pcmwav.pcm16_peak(p + 44 as u64, 0) != 0 { io.print("peak0"); return 12 }
+    put16(p + 44 as u64, 0, 0 - 32768)
+    if pcmwav.pcm16_peak(p + 44 as u64, 100) != 32768 { io.print("peak min"); return 13 }
+    put16(p + 44 as u64, 0, 32767)
+    put16(p + 44 as u64, 1, 0 - 40)
+    put16(p + 44 as u64, 2, 0)
+    put16(p + 44 as u64, 3, 0)
+    if pcmwav.pcm16_peak(p + 44 as u64, 4) != 32767 { io.print("peak max"); return 14 }
+    // rms of a constant signal is the constant, of a square wave +-1000 it is 1000
+    var c: usize = 0
+    while c < 50 { put16(p + 44 as u64, c, if c % 2 == 0 { 1000 } else { 0 - 1000 }); c = c + 1 }
+    if pcmwav.pcm16_rms(p + 44 as u64, 50) != 1000 { io.print("rms square"); return 15 }
+    if pcmwav.pcm16_rms(p + 44 as u64, 0) != 0 { io.print("rms0"); return 16 }
+    // level curve: monotone, 0 -> 0, full scale -> 1000
+    if pcmwav.level_permille(0) != 0 || pcmwav.level_permille(32768) != 1000 { io.print("level ends"); return 17 }
+    var last: i32 = 0
+    var v: i32 = 0
+    while v <= 32768 {
+        let l: i32 = pcmwav.level_permille(v)
+        if l < last { io.print("level monotone"); return 18 }
+        last = l
+        v = v + 97
+    }
+    // meter: attack is immediate, release is slow but reaches 0
+    var m: pcmwav.Meter = pcmwav.meter_new()
+    if pcmwav.meter_update(&m, 800) != 800 { io.print("attack"); return 19 }
+    let r1: i32 = pcmwav.meter_update(&m, 0)
+    if r1 >= 800 || r1 <= 600 { io.print("release"); return 20 }
+    var n: i32 = 0
+    while n < 200 { pcmwav.meter_update(&m, 0); n = n + 1 }
+    if pcmwav.meter_update(&m, 0) != 0 { io.print("meter zero"); return 21 }
+    io.print("ok")
+    return 0
+}

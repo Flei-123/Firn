@@ -47,6 +47,10 @@
 #                         from the gallery or the camera): the manifest gets
 #                         the invisible org.firn.FirnPick activity (same
 #                         classes.dex as --push)
+#   --speech              the program uses lib/plat/android/speech.fi (AAudio microphone): links libaaudio,
+#                         the manifest gets RECORD_AUDIO
+#   --tts                 the program uses lib/plat/android/tts.fi: the manifest gets <queries> for the TTS
+#                         service (Android 11+ hides the engines without it)
 #   --camera              the program uses lib/plat/android/camera.fi (NDK Camera2): links
 #                         libcamera2ndk + libmediandk, the manifest gets CAMERA
 #   --icon-res <dir>      launcher icon resources (tools/pack/icons.fi makes them:
@@ -82,7 +86,7 @@ SRCDIR=$(dirname "$ENTRY_ABS")
 
 NAME=$(basename "$SRCDIR"); PKG=""; LIB=firnapp; ABI=both
 VCODE=1; VNAME=0.1; OPT=release-safe; ASSETS=""; PERMS=(); EXTRA=""; DEX=""
-PUSH=0; PICK=0; CAMERA=0; ARGSFILE=""; RELEASE=${FIRN_RELEASE:-0}
+PUSH=0; PICK=0; CAMERA=0; SPEECH=0; TTS=0; ARGSFILE=""; RELEASE=${FIRN_RELEASE:-0}
 OUT=""; ICONRES=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -100,6 +104,8 @@ while [ $# -gt 0 ]; do
         --push) PUSH=1; shift ;;
         --pick) PICK=1; shift ;;
         --camera) CAMERA=1; shift ;;
+        --speech) SPEECH=1; shift ;;
+        --tts) TTS=1; shift ;;
         --args-file) ARGSFILE=$2; shift 2 ;;
         --icon-res) ICONRES=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
@@ -118,6 +124,7 @@ BT=${BUILDTOOLS:-$SDK/build-tools/35.0.0}
 API=${API:-29}
 CAMLIBS=""
 if [ $CAMERA -eq 1 ]; then CAMLIBS="-lcamera2ndk -lmediandk"; PERMS+=(android.permission.CAMERA); fi
+if [ $SPEECH -eq 1 ]; then CAMLIBS="$CAMLIBS -laaudio"; PERMS+=(android.permission.RECORD_AUDIO); fi
 KEYSTORE=${KEYSTORE:-$HOME/.firn/android.keystore}
 KSALIAS=${KSALIAS:-firn}
 if [ -n "${KSPASS_FILE:-}" ]; then
@@ -225,6 +232,9 @@ EOF
     for p in ${PERMS[@]+"${PERMS[@]}"}; do
         echo "    <uses-permission android:name=\"$p\" />"
     done
+    if [ $TTS -eq 1 ]; then
+        echo '    <queries><intent><action android:name="android.intent.action.TTS_SERVICE" /></intent></queries>'
+    fi
     ICONATTR=""
     [ -n "$ICONRES" ] && ICONATTR='android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round"'
     cat <<EOF

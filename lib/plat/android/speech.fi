@@ -1,0 +1,446 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/android/speech.fi -- THE MICROPHONE: RECORD_AUDIO permission, AAudio capture, a WAV for the app.
+//
+//     import plat.android.speech
+//
+//   if speech.speech_permission() != 1 { speech.speech_request_permission() }   // async: poll the permission
+//   let e: i32 = speech.speech_start(60000)       // up to 60 s of 16 kHz mono PCM16; E_OK or an E_* code
+//   ... every frame, on the program's thread:
+//   speech.speech_poll()                          // moves what the microphone delivered into the buffer
+//   speech.speech_level()                         // 0..1000 for a level bar (RMS, fast attack, slow release)
+//   ... when the user lets go:
+//   let n: usize = speech.speech_stop()           // PCM octets recorded
+//   let wav: u64 = speech.speech_wav()            // pointer to a COMPLETE WAV (44 octet header + PCM) ...
+//   let len: usize = speech.speech_wav_len()      // ... of this many octets. The app uploads it (POST /api/stt).
+//   speech.speech_free()                          // gives the buffer back
+//
+// ================================================================= WHY THE NDK (AAudio), NOT AudioRecord
+//
+// AudioRecord is Java: reading it from Firn means a JNI call per chunk plus a Java byte[] copy, and its
+// blocking read must never run on the UI thread. AAudio (libaaudio, API 26+) is a C API: the samples land
+// straight in OUR memory, and `AAudioStream_read` with a timeout of 0 never blocks. JNI is used only for the
+// two things the NDK does not have: the runtime permission check and its request dialog.
+//
+// ================================================================= THREADS
+//
+// Everything is #[no_gc]. JNI (the permission functions) only on the program's own thread -- the one that
+// runs `main` -- never on an attached worker thread (x86-64 ART sets `gs` at the JNI attach -> segfault in a
+// worker). speech_poll/stop/start touch no JNI and could run anywhere, but keep ONE thread for the lot: the
+// state is plain memory. Poll at least every ~200 ms; the stream's own buffer is asked for 2 s, but a
+// device may grant less -- a stalled app then loses samples (xruns are counted: speech_xruns()).
+//
+// ================================================================= WHAT IS HONEST
+//
+// The rate, channel count and format are READ BACK from the opened stream, not assumed: the WAV header
+// carries what the device really delivers (normally the requested 16 kHz mono; the system resamples). A
+// device that will not deliver 16 bit PCM gives E_FORMAT. The emulator's microphone is virtual: it delivers
+// silence (or the host's microphone if the emulator was started with audio input), so a check there proves
+// the permission flow, the stream and the buffer, not speech.
+//
+// Build: tools/android/build.sh ... --speech   (links libaaudio, manifest gets RECORD_AUDIO)
+import android.ndk
+import android.jnicall
+import android.activity
+import plat.android.pcmwav
+
+export {
+    E_OK, E_PERMISSION, E_BUSY, E_OPEN, E_START, E_MEMORY, E_FORMAT, E_ARGS,
+    SP_IDLE, SP_RECORDING, SP_STOPPED, SP_ERROR,
+    speech_permission, speech_request_permission, speech_start, speech_poll, speech_stop, speech_cancel,
+    speech_state, speech_level, speech_peak, speech_bytes, speech_rate, speech_channels, speech_ms,
+    speech_full, speech_xruns, speech_wav, speech_wav_len, speech_free, speech_error_text, speech_last_aaudio,
+}
+
+const E_OK: i32 = 0
+const E_PERMISSION: i32 = 1
+const E_BUSY: i32 = 2
+const E_OPEN: i32 = 3
+const E_START: i32 = 4
+const E_MEMORY: i32 = 5
+const E_FORMAT: i32 = 6
+const E_ARGS: i32 = 7
+
+const SP_IDLE: i32 = 0
+const SP_RECORDING: i32 = 1
+const SP_STOPPED: i32 = 2
+const SP_ERROR: i32 = 3
+
+const RATE_WANTED: i32 = 16000
+const REQUEST_CODE: i32 = 22
+const MAX_MS: i32 = 600000
+const READ_FRAMES: i32 = 4096
+
+// aaudio.h values
+const AAUDIO_DIRECTION_INPUT: i32 = 1
+const AAUDIO_FORMAT_PCM_I16: i32 = 1
+const AAUDIO_SHARING_SHARED: i32 = 1
+const AAUDIO_INPUT_PRESET_VOICE_RECOGNITION: i32 = 6
+
+#[no_gc]
+extern fn AAudio_createStreamBuilder(out: u64) -> i32;
+#[no_gc]
+extern fn AAudioStreamBuilder_setDirection(b: u64, d: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_setSampleRate(b: u64, r: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_setChannelCount(b: u64, c: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_setFormat(b: u64, f: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_setSharingMode(b: u64, m: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_setInputPreset(b: u64, p: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_setBufferCapacityInFrames(b: u64, n: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_openStream(b: u64, out: u64) -> i32;
+#[no_gc]
+extern fn AAudioStreamBuilder_delete(b: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_requestStart(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_requestStop(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_close(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_read(s: u64, buf: u64, frames: i32, timeout_ns: i64) -> i32;
+#[no_gc]
+extern fn AAudioStream_getSampleRate(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_getChannelCount(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_getFormat(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_getXRunCount(s: u64) -> i32;
+
+// ---- BEGIN GENERATED STRINGS (tools/android/gen_plat3_strings.py) ----
+static TXT: [u8; 312] = "firn-speech\0android.permission.RECORD_AUDIO\0java/lang/String\0checkSelfPermission\0(Ljava/lang/String;)I\0requestPermissions\0([Ljava/lang/String;I)V\0microphone stream opened\0microphone stream could not be opened\0microphone stream could not be started\0microphone stopped\0recording buffer full\0microphone read failed\0"
+
+const S_TAG: usize = 0 // firn-speech
+const S_PERM: usize = 12 // android.permission.RECORD_AUDIO
+const C_STRING: usize = 44 // java/lang/String
+const N_CHECK_PERM: usize = 61 // checkSelfPermission
+const G_CHECK_PERM: usize = 81 // (Ljava/lang/String;)I
+const N_REQ_PERM: usize = 103 // requestPermissions
+const G_REQ_PERM: usize = 122 // ([Ljava/lang/String;I)V
+const L_OPEN: usize = 146 // microphone stream opened
+const L_OPEN_FAIL: usize = 171 // microphone stream could not be opened
+const L_START_FAIL: usize = 209 // microphone stream could not be started
+const L_STOP: usize = 248 // microphone stopped
+const L_FULL: usize = 267 // recording buffer full
+const L_READ_FAIL: usize = 289 // microphone read failed
+// ---- END GENERATED STRINGS ----
+
+static mut G_STREAM: u64 = 0
+static mut G_STATE: i32 = 0
+static mut G_BASE: u64 = 0 // mmap block: 44 octets of WAV header, then the PCM
+static mut G_MAP: usize = 0 // octets mapped
+static mut G_CAP: usize = 0 // PCM octets that fit
+static mut G_N: usize = 0 // PCM octets recorded
+static mut G_RATE: i32 = 0
+static mut G_CH: i32 = 0
+static mut G_LEVEL: i32 = 0
+static mut G_PEAK: i32 = 0
+static mut G_XRUNS: i32 = 0
+static mut G_FULL: bool = false
+static mut G_AA: i32 = 0 // last AAudio result code that was not OK
+static mut G_METER: i32 = 0
+
+#[no_gc]
+fn t(i: usize) -> u64 {
+    return ((&TXT[0]) as u64) + i as u64
+}
+
+#[no_gc]
+fn log(i: usize) {
+    ndk.log_write(ndk.LOG_INFO, t(S_TAG), t(i))
+}
+
+// ------------------------------------------------------------ permission (JNI, program's thread only)
+#[no_gc]
+fn jni_ctx(ctx_out: *mut u64) -> u64 {
+    let act: u64 = activity.activity_pointer()
+    if act == 0 {
+        return 0
+    }
+    *ctx_out = ndk.peek64(act + 24)
+    return jnicall.j_env(ndk.peek64(act + 8))
+}
+
+// 1 granted, 0 not (yet) granted, -1 no activity / JNI.
+#[no_gc]
+fn speech_permission() -> i32 {
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 || ctx == 0 { return 0 - 1 }
+    let act: u64 = activity.activity_pointer()
+    if ndk.peek32(act + ndk.ACT_SDK_VERSION) < 23 { return 1 }
+    let cc: u64 = jnicall.j_obj_class(env, ctx)
+    let ps: u64 = jnicall.j_str(env, t(S_PERM))
+    var a: [u64; 2] = [0; 2]
+    a[0] = ps
+    let g: i32 = jnicall.j_int(env, ctx,
+        jnicall.j_method(env, cc, t(N_CHECK_PERM), t(G_CHECK_PERM)), (&a[0]) as u64)
+    jnicall.j_del(env, ps)
+    jnicall.j_del(env, cc)
+    if g == 0 { return 1 }
+    return 0
+}
+
+// Shows the system dialog for RECORD_AUDIO (asynchronous: poll speech_permission()). A permission the user
+// denied twice is not asked again by Android -- the call is then answered at once with "denied".
+#[no_gc]
+fn speech_request_permission() -> bool {
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 || ctx == 0 { return false }
+    let cc: u64 = jnicall.j_obj_class(env, ctx)
+    let ps: u64 = jnicall.j_str(env, t(S_PERM))
+    let sc: u64 = jnicall.j_class(env, t(C_STRING))
+    let arr: u64 = jnicall.j_array1(env, sc, ps)
+    var a: [u64; 2] = [0; 2]
+    a[0] = arr
+    a[1] = REQUEST_CODE as u64
+    let ok: bool = jnicall.j_void(env, ctx,
+        jnicall.j_method(env, cc, t(N_REQ_PERM), t(G_REQ_PERM)), (&a[0]) as u64)
+    jnicall.j_del(env, arr)
+    jnicall.j_del(env, sc)
+    jnicall.j_del(env, ps)
+    jnicall.j_del(env, cc)
+    return ok
+}
+
+// ------------------------------------------------------------ buffer
+#[no_gc]
+fn buffer_free() {
+    if G_BASE != 0 {
+        let r: i64 = syscall(11, G_BASE as i64, G_MAP as i64, 0, 0, 0, 0)
+    }
+    G_BASE = 0
+    G_MAP = 0
+    G_CAP = 0
+    G_N = 0
+}
+
+#[no_gc]
+fn buffer_alloc(pcm_bytes: usize) -> bool {
+    buffer_free()
+    let total: usize = pcmwav.WAV_HEADER_SIZE + pcm_bytes
+    let r: i64 = syscall(9, 0, total as i64, 3, 34, -1, 0)
+    if r <= 0 { return false }
+    G_BASE = r as u64
+    G_MAP = total
+    G_CAP = pcm_bytes
+    G_N = 0
+    return true
+}
+
+#[no_gc]
+fn pcm_ptr() -> u64 {
+    return G_BASE + pcmwav.WAV_HEADER_SIZE as u64
+}
+
+// ------------------------------------------------------------ recording
+// Opens the microphone and starts recording for at most `max_ms` milliseconds (1000..600000). Returns E_OK or
+// E_PERMISSION / E_BUSY / E_OPEN / E_START / E_MEMORY / E_FORMAT / E_ARGS. A previous recording is dropped.
+#[no_gc]
+fn speech_start(max_ms: i32) -> i32 {
+    if max_ms < 1000 || max_ms > MAX_MS { return E_ARGS }
+    if G_STATE == SP_RECORDING { return E_BUSY }
+    if speech_permission() != 1 { return E_PERMISSION }
+    G_STATE = SP_IDLE
+    G_FULL = false
+    G_LEVEL = 0
+    G_PEAK = 0
+    G_METER = 0
+    G_XRUNS = 0
+    G_AA = 0
+    var bp: [u64; 1] = [0]
+    let r0: i32 = AAudio_createStreamBuilder((&bp[0]) as u64)
+    if r0 != 0 || bp[0] == 0 {
+        G_AA = r0
+        log(L_OPEN_FAIL)
+        return E_OPEN
+    }
+    let b: u64 = bp[0]
+    AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_INPUT)
+    AAudioStreamBuilder_setSampleRate(b, RATE_WANTED)
+    AAudioStreamBuilder_setChannelCount(b, 1)
+    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16)
+    AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_SHARED)
+    AAudioStreamBuilder_setInputPreset(b, AAUDIO_INPUT_PRESET_VOICE_RECOGNITION)
+    AAudioStreamBuilder_setBufferCapacityInFrames(b, RATE_WANTED * 2)
+    var sp: [u64; 1] = [0]
+    let r1: i32 = AAudioStreamBuilder_openStream(b, (&sp[0]) as u64)
+    let rd: i32 = AAudioStreamBuilder_delete(b)
+    if r1 != 0 || sp[0] == 0 {
+        G_AA = r1
+        log(L_OPEN_FAIL)
+        return E_OPEN
+    }
+    let s: u64 = sp[0]
+    let rate: i32 = AAudioStream_getSampleRate(s)
+    let ch: i32 = AAudioStream_getChannelCount(s)
+    if AAudioStream_getFormat(s) != AAUDIO_FORMAT_PCM_I16 || rate <= 0 || ch <= 0 || ch > 2 {
+        let rc: i32 = AAudioStream_close(s)
+        return E_FORMAT
+    }
+    let frames_max: i64 = ((rate as i64) * (max_ms as i64)) / 1000
+    let bytes: usize = (frames_max as usize) * (ch as usize) * 2
+    if !buffer_alloc(bytes) {
+        let rc: i32 = AAudioStream_close(s)
+        return E_MEMORY
+    }
+    let r2: i32 = AAudioStream_requestStart(s)
+    if r2 != 0 {
+        G_AA = r2
+        let rc: i32 = AAudioStream_close(s)
+        log(L_START_FAIL)
+        return E_START
+    }
+    G_STREAM = s
+    G_RATE = rate
+    G_CH = ch
+    G_STATE = SP_RECORDING
+    log(L_OPEN)
+    return E_OK
+}
+
+#[no_gc]
+fn stream_close() {
+    if G_STREAM != 0 {
+        G_XRUNS = AAudioStream_getXRunCount(G_STREAM)
+        let a: i32 = AAudioStream_requestStop(G_STREAM)
+        let b: i32 = AAudioStream_close(G_STREAM)
+        G_STREAM = 0
+    }
+}
+
+// Moves what the microphone has delivered into the buffer (never blocks). Returns the state. When the buffer
+// is full the recording stops by itself (speech_full() tells).
+#[no_gc]
+fn speech_poll() -> i32 {
+    if G_STATE != SP_RECORDING || G_STREAM == 0 { return G_STATE }
+    let fsize: usize = (G_CH as usize) * 2
+    var rounds: i32 = 0
+    var got_any: bool = false
+    while rounds < 64 {
+        rounds = rounds + 1
+        let space: usize = (G_CAP - G_N) / fsize
+        if space == 0 {
+            G_FULL = true
+            stream_close()
+            G_STATE = SP_STOPPED
+            log(L_FULL)
+            return G_STATE
+        }
+        var want: i32 = READ_FRAMES
+        if (want as usize) > space { want = space as i32 }
+        let at: u64 = pcm_ptr() + G_N as u64
+        let n: i32 = AAudioStream_read(G_STREAM, at, want, 0)
+        if n < 0 {
+            G_AA = n
+            stream_close()
+            G_STATE = SP_ERROR
+            log(L_READ_FAIL)
+            return G_STATE
+        }
+        if n == 0 { break }
+        got_any = true
+        let samples: usize = (n as usize) * (G_CH as usize)
+        G_N = G_N + samples * 2
+        let rms: i32 = pcmwav.pcm16_rms(at, samples)
+        let pk: i32 = pcmwav.pcm16_peak(at, samples)
+        var m: pcmwav.Meter = pcmwav.Meter { value: G_METER }
+        G_LEVEL = pcmwav.meter_update(&m, pcmwav.level_permille(rms))
+        G_METER = m.value
+        G_PEAK = pcmwav.level_permille(pk)
+    }
+    return G_STATE
+}
+
+// Ends the recording (drains what is left, closes the microphone). Returns the PCM octets recorded.
+#[no_gc]
+fn speech_stop() -> usize {
+    if G_STATE == SP_RECORDING {
+        let s: i32 = speech_poll()
+        if G_STATE == SP_RECORDING {
+            stream_close()
+            G_STATE = SP_STOPPED
+            log(L_STOP)
+        }
+    }
+    return G_N
+}
+
+// Stops and throws the recording away.
+#[no_gc]
+fn speech_cancel() {
+    if G_STATE == SP_RECORDING { stream_close() }
+    buffer_free()
+    G_STATE = SP_IDLE
+    G_LEVEL = 0
+    G_PEAK = 0
+    G_METER = 0
+}
+
+#[no_gc]
+fn speech_free() {
+    speech_cancel()
+}
+
+#[no_gc]
+fn speech_state() -> i32 { return G_STATE }
+#[no_gc]
+fn speech_level() -> i32 { return G_LEVEL }
+#[no_gc]
+fn speech_peak() -> i32 { return G_PEAK }
+#[no_gc]
+fn speech_bytes() -> usize { return G_N }
+#[no_gc]
+fn speech_rate() -> i32 { return G_RATE }
+#[no_gc]
+fn speech_channels() -> i32 { return G_CH }
+#[no_gc]
+fn speech_full() -> bool { return G_FULL }
+#[no_gc]
+fn speech_xruns() -> i32 {
+    if G_STREAM != 0 { return AAudioStream_getXRunCount(G_STREAM) }
+    return G_XRUNS
+}
+#[no_gc]
+fn speech_last_aaudio() -> i32 { return G_AA }
+
+// Recorded time in milliseconds.
+#[no_gc]
+fn speech_ms() -> i32 {
+    if G_RATE <= 0 || G_CH <= 0 { return 0 }
+    return ((G_N / ((G_CH as usize) * 2)) as i64 * 1000 / (G_RATE as i64)) as i32
+}
+
+// The finished recording as ONE contiguous WAV (header written in place, no copy). Valid after speech_stop()
+// until the next speech_start / speech_free. 0 when there is nothing.
+#[no_gc]
+fn speech_wav() -> u64 {
+    if G_BASE == 0 || G_N == 0 || G_STATE == SP_RECORDING { return 0 }
+    pcmwav.wav_header(G_BASE, G_RATE as u32, G_CH as u32, G_N)
+    return G_BASE
+}
+
+#[no_gc]
+fn speech_wav_len() -> usize {
+    if G_BASE == 0 || G_N == 0 || G_STATE == SP_RECORDING { return 0 }
+    return pcmwav.wav_total(G_N)
+}
+
+fn speech_error_text(e: i32) -> str {
+    if e == E_OK { return "ok" }
+    if e == E_PERMISSION { return "microphone permission missing" }
+    if e == E_BUSY { return "already recording" }
+    if e == E_OPEN { return "microphone could not be opened" }
+    if e == E_START { return "microphone could not be started" }
+    if e == E_MEMORY { return "no memory for the recording" }
+    if e == E_FORMAT { return "device does not deliver 16 bit PCM" }
+    if e == E_ARGS { return "bad length (1000..600000 ms)" }
+    return "unknown error"
+}

@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/android/pcmwav.fi -- PCM16 HELPERS FOR THE MICROPHONE LIB: a WAV header, a WAV reader and level meters.
+//
+//     import plat.android.pcmwav
+//
+// Pure Firn, no device access, so it runs (and is tested) on the host; lib/plat/android/speech.fi uses it for
+// the recording it hands to the app (the app uploads that WAV, e.g. to /api/stt).
+//
+//   pcmwav.wav_total(data_bytes)                      44 + data_bytes
+//   pcmwav.wav_header(out, rate, channels, data_bytes)   44 octets at `out` (RIFF/WAVE, fmt 16 bit PCM, data)
+//   pcmwav.wav_parse(p, n, &info) -> bool             rate, channels, bits, data offset/length of a PCM WAV
+//   pcmwav.pcm16_peak(p, samples) -> 0..32768         largest |sample| (little endian signed 16 bit)
+//   pcmwav.pcm16_rms(p, samples) -> 0..32768          root mean square
+//   pcmwav.level_permille(peak) -> 0..1000            for a bar on screen (square root curve: quiet speech is visible)
+//   pcmwav.meter_update(&m, permille) -> permille     fast attack, slow release (a level bar that does not flicker)
+//
+// All functions are #[no_gc]: they may run on any thread.
+export {
+    WavInfo, Meter, WAV_HEADER_SIZE,
+    wav_total, wav_header, wav_parse,
+    pcm16_peak, pcm16_rms, level_permille, meter_new, meter_update,
+}
+
+const WAV_HEADER_SIZE: usize = 44
+
+struct WavInfo {
+    rate: u32,
+    channels: u32,
+    bits: u32,
+    data_at: usize,
+    data_len: usize,
+}
+
+struct Meter {
+    value: i32,
+}
+
+#[no_gc]
+fn st8(p: u64, at: usize, v: u32) {
+    *((p + at as u64) as *mut u8) = (v & 255 as u32) as u8
+}
+
+#[no_gc]
+fn st16(p: u64, at: usize, v: u32) {
+    st8(p, at, v)
+    st8(p, at + 1, v >> 8 as u32)
+}
+
+#[no_gc]
+fn st32(p: u64, at: usize, v: u32) {
+    st16(p, at, v & 65535 as u32)
+    st16(p, at + 2, v >> 16 as u32)
+}
+
+#[no_gc]
+fn ld8(p: u64, at: usize) -> u32 {
+    return (*((p + at as u64) as *mut u8)) as u32
+}
+
+#[no_gc]
+fn ld16(p: u64, at: usize) -> u32 {
+    return ld8(p, at) | (ld8(p, at + 1) << 8 as u32)
+}
+
+#[no_gc]
+fn ld32(p: u64, at: usize) -> u32 {
+    return ld16(p, at) | (ld16(p, at + 2) << 16 as u32)
+}
+
+#[no_gc]
+fn put_tag(p: u64, at: usize, a: u32, b: u32, c: u32, d: u32) {
+    st8(p, at, a)
+    st8(p, at + 1, b)
+    st8(p, at + 2, c)
+    st8(p, at + 3, d)
+}
+
+#[no_gc]
+fn wav_total(data_bytes: usize) -> usize {
+    return WAV_HEADER_SIZE + data_bytes
+}
+
+// Writes the 44 octet header of a 16 bit PCM WAV with `data_bytes` octets of samples behind it.
+// data_bytes is clamped so that the 32 bit RIFF size cannot overflow.
+#[no_gc]
+fn wav_header(out: u64, rate: u32, channels: u32, data_bytes: usize) {
+    var n: usize = data_bytes
+    if n > 4294967000 as usize { n = 4294967000 as usize }
+    let ch: u32 = if channels == 0 as u32 { 1 as u32 } else { channels }
+    let block: u32 = ch * 2 as u32
+    put_tag(out, 0, 82 as u32, 73 as u32, 70 as u32, 70 as u32) // RIFF
+    st32(out, 4, (36 + n) as u32)
+    put_tag(out, 8, 87 as u32, 65 as u32, 86 as u32, 69 as u32) // WAVE
+    put_tag(out, 12, 102 as u32, 109 as u32, 116 as u32, 32 as u32) // "fmt "
+    st32(out, 16, 16 as u32)
+    st16(out, 20, 1 as u32) // PCM
+    st16(out, 22, ch)
+    st32(out, 24, rate)
+    st32(out, 28, rate * block)
+    st16(out, 32, block)
+    st16(out, 34, 16 as u32)
+    put_tag(out, 36, 100 as u32, 97 as u32, 116 as u32, 97 as u32) // data
+    st32(out, 40, n as u32)
+}
+
+// Reads a PCM WAV: walks the chunks (any extra chunk before "data" is skipped), accepts 8/16/24/32 bit PCM
+// headers but reports them as they are. false = not a RIFF/WAVE file, no fmt or no data chunk, or truncated
+// header. A data chunk that claims more than the file holds is cut to what is there.
+#[no_gc]
+fn wav_parse(p: u64, n: usize, info: *mut WavInfo) -> bool {
+    if p == 0 || n < 12 { return false }
+    if ld32(p, 0) != 1179011410 as u32 { return false } // "RIFF"
+    if ld32(p, 8) != 1163280727 as u32 { return false } // "WAVE"
+    var at: usize = 12
+    var have_fmt: bool = false
+    var rate: u32 = 0 as u32
+    var ch: u32 = 0 as u32
+    var bits: u32 = 0 as u32
+    while at + 8 <= n {
+        let id: u32 = ld32(p, at)
+        let len: usize = ld32(p, at + 4) as usize
+        let body: usize = at + 8
+        if id == 544501094 as u32 { // "fmt "
+            if len < 16 || body + 16 > n { return false }
+            if ld16(p, body) != 1 as u32 { return false }
+            ch = ld16(p, body + 2)
+            rate = ld32(p, body + 4)
+            bits = ld16(p, body + 14)
+            have_fmt = true
+        } else if id == 1635017060 as u32 { // "data"
+            if !have_fmt { return false }
+            var dl: usize = len
+            if body + dl > n { dl = n - body }
+            (*info).rate = rate
+            (*info).channels = ch
+            (*info).bits = bits
+            (*info).data_at = body
+            (*info).data_len = dl
+            return true
+        }
+        // chunks are padded to an even size
+        let next: usize = body + len + (len & 1)
+        if next <= at { return false }
+        at = next
+    }
+    return false
+}
+
+#[no_gc]
+fn sample16(p: u64, i: usize) -> i32 {
+    let u: u32 = ld16(p, i * 2)
+    var s: i32 = u as i32
+    if s >= 32768 { s = s - 65536 }
+    return s
+}
+
+// Largest absolute sample value of `samples` signed 16 bit little endian samples (0..32768).
+#[no_gc]
+fn pcm16_peak(p: u64, samples: usize) -> i32 {
+    var m: i32 = 0
+    var i: usize = 0
+    while i < samples {
+        var s: i32 = sample16(p, i)
+        if s < 0 { s = 0 - s }
+        if s > m { m = s }
+        i = i + 1
+    }
+    return m
+}
+
+// Root mean square of the samples (0..32768), integer square root of the mean of squares.
+#[no_gc]
+fn pcm16_rms(p: u64, samples: usize) -> i32 {
+    if samples == 0 { return 0 }
+    var sum: u64 = 0 as u64
+    var i: usize = 0
+    while i < samples {
+        let s: i64 = sample16(p, i) as i64
+        sum = sum + (s * s) as u64
+        i = i + 1
+    }
+    let mean: u64 = sum / (samples as u64)
+    // integer square root (Newton), mean < 2^30
+    var x: u64 = mean
+    if x == 0 as u64 { return 0 }
+    var y: u64 = (x + 1 as u64) / 2 as u64
+    while y < x {
+        x = y
+        y = (x + mean / x) / 2 as u64
+    }
+    return x as i32
+}
+
+// 0..32768 -> 0..1000 with a square root curve (about 30 dB of range become visible).
+#[no_gc]
+fn level_permille(v: i32) -> i32 {
+    if v <= 0 { return 0 }
+    var x: i64 = v as i64
+    if x > 32768 { x = 32768 }
+    // sqrt(v / 32768) * 1000 = sqrt(v * 1000000 / 32768)
+    let target: u64 = ((x * 1000000) / 32768) as u64
+    var r: u64 = target
+    if r == 0 as u64 { return 0 }
+    var y: u64 = (r + 1 as u64) / 2 as u64
+    while y < r {
+        r = y
+        y = (r + target / r) / 2 as u64
+    }
+    var out: i32 = r as i32
+    if out > 1000 { out = 1000 }
+    return out
+}
+
+#[no_gc]
+fn meter_new() -> Meter {
+    return Meter { value: 0 }
+}
+
+// Fast attack, slow release: the bar jumps up with the signal and falls by 1/8 of the gap per update.
+#[no_gc]
+fn meter_update(m: *mut Meter, permille: i32) -> i32 {
+    var v: i32 = (*m).value
+    if permille >= v {
+        v = permille
+    } else {
+        v = v - (v - permille + 7) / 8
+    }
+    if v < 0 { v = 0 }
+    if v > 1000 { v = 1000 }
+    (*m).value = v
+    return v
+}

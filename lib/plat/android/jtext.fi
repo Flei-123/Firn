@@ -1,0 +1,187 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/android/jtext.fi -- UTF-8 <-> UTF-16 FOR JNI STRINGS, #[no_gc], into caller buffers (no heap).
+//
+//     import plat.android.jtext
+//
+// Why: JNI's NewStringUTF wants MODIFIED UTF-8 (no 4 octet sequences); with CheckJNI a chat text with an
+// emoji aborts the process. NewString takes UTF-16 units and has no such trap, so share.fi / tts.fi hand
+// Java the UTF-16 made here, and read clipboard text back through the reverse function.
+//
+//   jtext.utf8_units(p, n) -> usize                      UTF-16 units needed for the UTF-8 text
+//   jtext.utf8_to_units(p, n, out, cap_units) -> usize   units written (never more than cap, never half a pair)
+//   jtext.units_utf8_len(u, units) -> usize              octets needed
+//   jtext.units_to_utf8(u, units, out, cap) -> usize     octets written (never more than cap, never half a char)
+//
+// Bad input never crashes: an invalid or truncated UTF-8 sequence (overlong, surrogate, > U+10FFFF) becomes
+// U+FFFD and consumes ONE octet; a lone UTF-16 surrogate becomes U+FFFD. `u` / `out` point at u16 units
+// (2 octets, little endian, any alignment).
+export {
+    utf8_units, utf8_to_units, units_utf8_len, units_to_utf8,
+}
+
+#[no_gc]
+fn ld8(p: u64, at: usize) -> u32 {
+    return (*((p + at as u64) as *mut u8)) as u32
+}
+
+#[no_gc]
+fn unit(p: u64, i: usize) -> u32 {
+    return ld8(p, i * 2) | (ld8(p, i * 2 + 1) << 8 as u32)
+}
+
+#[no_gc]
+fn put_unit(p: u64, i: usize, v: u32) {
+    *((p + (i * 2) as u64) as *mut u8) = (v & 255 as u32) as u8
+    *((p + (i * 2) as u64 + 1 as u64) as *mut u8) = ((v >> 8 as u32) & 255 as u32) as u8
+}
+
+// Decodes one code point at p[at..n). Writes its octet length to *len; invalid -> 0xFFFD with length 1.
+#[no_gc]
+fn decode8(p: u64, n: usize, at: usize, len: *mut usize) -> u32 {
+    let b0: u32 = ld8(p, at)
+    *len = 1
+    if b0 < 128 as u32 { return b0 }
+    var need: usize = 0
+    var cp: u32 = 0 as u32
+    var min: u32 = 0 as u32
+    if b0 >= 194 as u32 && b0 <= 223 as u32 {
+        need = 1
+        cp = b0 & 31 as u32
+        min = 128 as u32
+    } else if b0 >= 224 as u32 && b0 <= 239 as u32 {
+        need = 2
+        cp = b0 & 15 as u32
+        min = 2048 as u32
+    } else if b0 >= 240 as u32 && b0 <= 244 as u32 {
+        need = 3
+        cp = b0 & 7 as u32
+        min = 65536 as u32
+    } else {
+        return 65533 as u32
+    }
+    // the continuation octets p[at+1 ..= at+need] must exist
+    if at + need >= n { return 65533 as u32 }
+    var k: usize = 1
+    while k <= need {
+        let b: u32 = ld8(p, at + k)
+        if (b & 192 as u32) != 128 as u32 { return 65533 as u32 }
+        cp = (cp << 6 as u32) | (b & 63 as u32)
+        k = k + 1
+    }
+    if cp < min { return 65533 as u32 }
+    if cp >= 55296 as u32 && cp <= 57343 as u32 { return 65533 as u32 }
+    if cp > 1114111 as u32 { return 65533 as u32 }
+    *len = need + 1
+    return cp
+}
+
+#[no_gc]
+fn utf8_units(p: u64, n: usize) -> usize {
+    var at: usize = 0
+    var units: usize = 0
+    while at < n {
+        var l: usize = 1
+        let cp: u32 = decode8(p, n, at, &l)
+        units = units + (if cp >= 65536 as u32 { 2 } else { 1 })
+        at = at + l
+    }
+    return units
+}
+
+#[no_gc]
+fn utf8_to_units(p: u64, n: usize, out: u64, cap_units: usize) -> usize {
+    var at: usize = 0
+    var w: usize = 0
+    while at < n {
+        var l: usize = 1
+        let cp: u32 = decode8(p, n, at, &l)
+        if cp >= 65536 as u32 {
+            if w + 2 > cap_units { return w }
+            let v: u32 = cp - 65536 as u32
+            put_unit(out, w, 55296 as u32 + (v >> 10 as u32))
+            put_unit(out, w + 1, 56320 as u32 + (v & 1023 as u32))
+            w = w + 2
+        } else {
+            if w + 1 > cap_units { return w }
+            put_unit(out, w, cp)
+            w = w + 1
+        }
+        at = at + l
+    }
+    return w
+}
+
+// Decodes the code point at unit i; *used = 1 or 2 units. Lone surrogate -> U+FFFD.
+#[no_gc]
+fn decode16(u: u64, units: usize, i: usize, used: *mut usize) -> u32 {
+    let a: u32 = unit(u, i)
+    *used = 1
+    if a >= 55296 as u32 && a <= 56319 as u32 {
+        if i + 1 < units {
+            let b: u32 = unit(u, i + 1)
+            if b >= 56320 as u32 && b <= 57343 as u32 {
+                *used = 2
+                return 65536 as u32 + ((a - 55296 as u32) << 10 as u32) + (b - 56320 as u32)
+            }
+        }
+        return 65533 as u32
+    }
+    if a >= 56320 as u32 && a <= 57343 as u32 { return 65533 as u32 }
+    return a
+}
+
+#[no_gc]
+fn octets_of(cp: u32) -> usize {
+    if cp < 128 as u32 { return 1 }
+    if cp < 2048 as u32 { return 2 }
+    if cp < 65536 as u32 { return 3 }
+    return 4
+}
+
+#[no_gc]
+fn units_utf8_len(u: u64, units: usize) -> usize {
+    var i: usize = 0
+    var n: usize = 0
+    while i < units {
+        var used: usize = 1
+        let cp: u32 = decode16(u, units, i, &used)
+        n = n + octets_of(cp)
+        i = i + used
+    }
+    return n
+}
+
+#[no_gc]
+fn put8(p: u64, at: usize, v: u32) {
+    *((p + at as u64) as *mut u8) = (v & 255 as u32) as u8
+}
+
+#[no_gc]
+fn units_to_utf8(u: u64, units: usize, out: u64, cap: usize) -> usize {
+    var i: usize = 0
+    var w: usize = 0
+    while i < units {
+        var used: usize = 1
+        let cp: u32 = decode16(u, units, i, &used)
+        let k: usize = octets_of(cp)
+        if w + k > cap { return w }
+        if k == 1 {
+            put8(out, w, cp)
+        } else if k == 2 {
+            put8(out, w, 192 as u32 | (cp >> 6 as u32))
+            put8(out, w + 1, 128 as u32 | (cp & 63 as u32))
+        } else if k == 3 {
+            put8(out, w, 224 as u32 | (cp >> 12 as u32))
+            put8(out, w + 1, 128 as u32 | ((cp >> 6 as u32) & 63 as u32))
+            put8(out, w + 2, 128 as u32 | (cp & 63 as u32))
+        } else {
+            put8(out, w, 240 as u32 | (cp >> 18 as u32))
+            put8(out, w + 1, 128 as u32 | ((cp >> 12 as u32) & 63 as u32))
+            put8(out, w + 2, 128 as u32 | ((cp >> 6 as u32) & 63 as u32))
+            put8(out, w + 3, 128 as u32 | (cp & 63 as u32))
+        }
+        w = w + k
+        i = i + used
+    }
+    return w
+}

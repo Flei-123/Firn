@@ -1,0 +1,395 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/android/tts.fi -- SPEECH OUTPUT: android.speech.tts.TextToSpeech from Firn (speak / stop / done).
+//
+//     import plat.android.tts
+//
+//   tts.tts_start()                                   // binds the engine (idempotent; first call takes ~0.2-2 s)
+//   tts.tts_speak(text, n, "de")                      // UTF-8 text p[0, n), language tag "de" / "en" / "de-AT"
+//   ... every frame, on the program's thread:
+//   let s: i32 = tts.tts_poll()                       // TTS_WAIT -> TTS_SPEAKING -> TTS_DONE (or TTS_ERROR)
+//   tts.tts_stop()                                    // cut the speech
+//   tts.tts_shutdown()                                // give the engine back (when the screen goes away)
+//
+//   tts.tts_engines() -> i32       engines installed (-1 = could not ask); 0 = nobody can speak on this device
+//   tts.tts_lang_result() -> i32   what setLanguage said: 0/1/2 available, -1 missing data, -2 not supported
+//   tts.tts_elapsed_ms() -> i32    time from tts_speak until the poll saw TTS_DONE
+//   tts.tts_set_rate(r)            1.0 normal, 0.5 half, 2.0 double speed (applies to the next utterance)
+//
+// ================================================================= NO CLASS IN classes.dex
+//
+// TextToSpeech wants an OnInitListener and an UtteranceProgressListener -- Java interfaces, i.e. classes in
+// classes.dex. This lib needs none: the engine is created with a null init listener (the class allows it),
+// and instead of waiting for onInit the poll TRIES: `setLanguage` / `speak` answer an error code until the
+// service connection exists, so tts_poll repeats them (every poll, for at most 5 s) and the first
+// successful `speak` ends the wait. "Done" is `isSpeaking()` turning false, polled -- no onDone callback.
+//
+// WHAT THAT CANNOT SEE: an engine that accepts the text and then fails (voice data missing) looks like a
+// very short utterance. tts_lang_result() and tts_elapsed_ms() are the clues; the app can show them.
+//
+// ================================================================= TEXT
+//
+// The text is handed to Java as UTF-16 (plat.android.jtext), never through NewStringUTF: with CheckJNI an
+// emoji in a chat answer would abort the process. Texts up to 32768 UTF-16 units are fed to the engine in
+// chunks of at most 3500 units (the engine refuses more than 4000 per call), cut at a line end, a sentence
+// end or a blank where possible.
+//
+// ================================================================= THREADS
+//
+// All #[no_gc]. JNI on the program's own thread only (never on an attached worker thread).
+//
+// Build: tools/android/build.sh ... --tts   (manifest <queries> for the TTS service: Android 11+ hides
+// the engines from an app without it)
+import android.ndk
+import android.jnicall
+import android.activity
+import plat.android.jtext
+
+export {
+    TTS_NONE, TTS_IDLE, TTS_WAIT, TTS_SPEAKING, TTS_DONE, TTS_ERROR,
+    tts_start, tts_speak, tts_poll, tts_stop, tts_shutdown, tts_state, tts_engines,
+    tts_lang_result, tts_elapsed_ms, tts_set_rate,
+}
+
+const TTS_NONE: i32 = 0 // no engine object yet
+const TTS_IDLE: i32 = 1 // engine object exists, nothing to say
+const TTS_WAIT: i32 = 2 // text is queued here, waiting for the engine's service connection
+const TTS_SPEAKING: i32 = 3
+const TTS_DONE: i32 = 4 // the last text was spoken to its end
+const TTS_ERROR: i32 = 5 // no engine answered within 5 s, or the text could not be handed over
+
+const WAIT_MS: i64 = 5000
+const LANG_GRACE_MS: i64 = 2500
+const MAX_UNITS: usize = 32768
+const CHUNK_UNITS: usize = 3500
+const QUEUE_ADD: u64 = 1
+const QUEUE_FLUSH: u64 = 0
+
+// ---- BEGIN GENERATED STRINGS (tools/android/gen_plat3_strings.py) ----
+static TXT: [u8; 519] = "firn-tts\0android/speech/tts/TextToSpeech\0java/util/Locale\0java/lang/String\0<init>\0(Landroid/content/Context;Landroid/speech/tts/TextToSpeech$OnInitListener;)V\0forLanguageTag\0(Ljava/lang/String;)Ljava/util/Locale;\0speak\0(Ljava/lang/CharSequence;ILandroid/os/Bundle;Ljava/lang/String;)I\0stop\0()I\0shutdown\0()V\0isSpeaking\0()Z\0setLanguage\0(Ljava/util/Locale;)I\0setSpeechRate\0(F)I\0getEngines\0()Ljava/util/List;\0java/util/List\0size\0engine requested\0engine ready, speaking\0no engine answered in time\0finished speaking\0firn-utt\0"
+
+const S_TAG: usize = 0 // firn-tts
+const C_TTS: usize = 9 // android/speech/tts/TextToSpeech
+const C_LOCALE: usize = 41 // java/util/Locale
+const C_STRING: usize = 58 // java/lang/String
+const N_INIT: usize = 75 // <init>
+const G_TTS_INIT: usize = 82 // (Landroid/content/Context;Landroid/speech/tts/TextToSpeech$OnInitListener;)V
+const N_FOR_TAG: usize = 159 // forLanguageTag
+const G_FOR_TAG: usize = 174 // (Ljava/lang/String;)Ljava/util/Locale;
+const N_SPEAK: usize = 213 // speak
+const G_SPEAK: usize = 219 // (Ljava/lang/CharSequence;ILandroid/os/Bundle;Ljava/lang/String;)I
+const N_STOP: usize = 285 // stop
+const G_I: usize = 290 // ()I
+const N_SHUTDOWN: usize = 294 // shutdown
+const G_V: usize = 303 // ()V
+const N_IS_SPEAKING: usize = 307 // isSpeaking
+const G_Z: usize = 318 // ()Z
+const N_SET_LANG: usize = 322 // setLanguage
+const G_SET_LANG: usize = 334 // (Ljava/util/Locale;)I
+const N_SET_RATE: usize = 356 // setSpeechRate
+const G_SET_RATE: usize = 370 // (F)I
+const N_GET_ENGINES: usize = 375 // getEngines
+const G_GET_ENGINES: usize = 386 // ()Ljava/util/List;
+const C_LIST: usize = 405 // java/util/List
+const N_SIZE: usize = 420 // size
+const L_START: usize = 425 // engine requested
+const L_READY: usize = 442 // engine ready, speaking
+const L_NOENGINE: usize = 465 // no engine answered in time
+const L_DONE: usize = 492 // finished speaking
+const S_UTT: usize = 510 // firn-utt
+// ---- END GENERATED STRINGS ----
+
+static mut G_TTS: u64 = 0 // global reference to the TextToSpeech object
+static mut G_STATE: i32 = 0
+static mut G_TXT: [u8; 65536] = [0; 65536] // the pending text, UTF-16 units
+static mut G_TLEN: usize = 0
+static mut G_LANG: [u8; 24] = [0; 24]
+static mut G_T0: i64 = 0
+static mut G_T1: i64 = 0
+static mut G_TDONE: i64 = 0
+static mut G_LANG_RES: i32 = 0 - 2
+static mut G_RATE: f32 = 1.0f
+static mut G_RATE_SET: bool = false
+
+#[no_gc]
+fn t(i: usize) -> u64 {
+    return ((&TXT[0]) as u64) + i as u64
+}
+
+#[no_gc]
+fn log(i: usize) {
+    ndk.log_write(ndk.LOG_INFO, t(S_TAG), t(i))
+}
+
+#[no_gc]
+fn now_ms() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    let r: i64 = syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000 + ts[1] / 1000000
+}
+
+#[no_gc]
+fn jni_ctx(ctx_out: *mut u64) -> u64 {
+    let act: u64 = activity.activity_pointer()
+    if act == 0 {
+        return 0
+    }
+    *ctx_out = ndk.peek64(act + 24)
+    return jnicall.j_env(ndk.peek64(act + 8))
+}
+
+#[no_gc]
+fn int_arg(v: i32) -> u64 {
+    return (v as i64 as u64) & 4294967295
+}
+
+// ------------------------------------------------------------ the engine
+// Creates the TextToSpeech object (idempotent). false = no activity / JNI, or the constructor threw.
+#[no_gc]
+fn tts_start() -> bool {
+    if G_TTS != 0 { return true }
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 || ctx == 0 { return false }
+    let c: u64 = jnicall.j_class(env, t(C_TTS))
+    if c == 0 { return false }
+    var a: [u64; 2] = [0; 2]
+    a[0] = ctx
+    a[1] = 0
+    let o: u64 = jnicall.j_new(env, c, jnicall.j_method(env, c, t(N_INIT), t(G_TTS_INIT)), (&a[0]) as u64)
+    jnicall.j_del(env, c)
+    if o == 0 { return false }
+    G_TTS = jnicall.j_global(env, o)
+    jnicall.j_del(env, o)
+    if G_TTS == 0 { return false }
+    G_STATE = TTS_IDLE
+    G_RATE_SET = false
+    log(L_START)
+    return true
+}
+
+// Installed engines (PackageManager query, needs the manifest <queries> on Android 11+). -1 = could not ask.
+#[no_gc]
+fn tts_engines() -> i32 {
+    if !tts_start() { return 0 - 1 }
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 { return 0 - 1 }
+    let c: u64 = jnicall.j_obj_class(env, G_TTS)
+    var a: [u64; 1] = [0]
+    let list: u64 = jnicall.j_obj(env, G_TTS, jnicall.j_method(env, c, t(N_GET_ENGINES), t(G_GET_ENGINES)), (&a[0]) as u64)
+    jnicall.j_del(env, c)
+    if list == 0 { return 0 - 1 }
+    let lc: u64 = jnicall.j_obj_class(env, list)
+    let n: i32 = jnicall.j_int(env, list, jnicall.j_method(env, lc, t(N_SIZE), t(G_I)), (&a[0]) as u64)
+    jnicall.j_del(env, lc)
+    jnicall.j_del(env, list)
+    return n
+}
+
+// Speech rate for the next utterance: 1.0 normal. Clamped to 0.25 .. 4.0.
+#[no_gc]
+fn tts_set_rate(r: f32) {
+    var x: f32 = r
+    if x < 0.25f { x = 0.25f }
+    if x > 4.0f { x = 4.0f }
+    G_RATE = x
+    G_RATE_SET = false
+}
+
+// Queues UTF-8 text p[0, n) with a language tag (a C string: "de", "en", "de-AT"; 0 = the device default).
+// The speech starts when the engine is connected (tts_poll). false = nothing to say, too long, or no engine object.
+#[no_gc]
+fn tts_speak(p: u64, n: usize, lang: u64) -> bool {
+    if p == 0 || n == 0 { return false }
+    if jtext.utf8_units(p, n) > MAX_UNITS { return false }
+    if !tts_start() { return false }
+    if G_STATE == TTS_SPEAKING { let s: bool = tts_stop() }
+    G_TLEN = jtext.utf8_to_units(p, n, (&G_TXT[0]) as u64, MAX_UNITS)
+    var i: usize = 0
+    while i < 23 {
+        var c: u8 = 0 as u8
+        if lang != 0 { c = *((lang + i as u64) as *mut u8) }
+        G_LANG[i] = c
+        if c == 0 as u8 { break }
+        i = i + 1
+    }
+    G_LANG[23] = 0 as u8
+    G_LANG_RES = 0 - 2
+    G_T0 = now_ms()
+    G_STATE = TTS_WAIT
+    return true
+}
+
+#[no_gc]
+fn unit_at(i: usize) -> u32 {
+    return (*((((&G_TXT[0]) as u64) + (i * 2) as u64) as *mut u8)) as u32
+    | ((*((((&G_TXT[0]) as u64) + (i * 2) as u64 + 1 as u64) as *mut u8)) as u32) << 8 as u32
+}
+
+// End of the next chunk starting at `at`: at most CHUNK_UNITS, cut after a line end / sentence end / blank
+// found in the last 300 units, never between the halves of a surrogate pair.
+#[no_gc]
+fn chunk_end(at: usize) -> usize {
+    if G_TLEN - at <= CHUNK_UNITS { return G_TLEN }
+    var e: usize = at + CHUNK_UNITS
+    var k: usize = e
+    let low: usize = e - 300
+    while k > low {
+        let u: u32 = unit_at(k - 1)
+        if u == 10 as u32 || u == 46 as u32 || u == 33 as u32 || u == 63 as u32 || u == 32 as u32 {
+            e = k
+            break
+        }
+        k = k - 1
+    }
+    let last: u32 = unit_at(e - 1)
+    if last >= 55296 as u32 && last <= 56319 as u32 { e = e - 1 }
+    return e
+}
+
+// one speak call for units [a, b); queue = QUEUE_FLUSH / QUEUE_ADD. Returns the engine's code (0 = queued).
+#[no_gc]
+fn speak_range(env: u64, a: usize, b: usize, queue: u64) -> i32 {
+    let s: u64 = jnicall.j_new_string16(env, ((&G_TXT[0]) as u64) + (a * 2) as u64, b - a)
+    if s == 0 { return 0 - 1 }
+    let utt: u64 = jnicall.j_str(env, t(S_UTT))
+    let c: u64 = jnicall.j_obj_class(env, G_TTS)
+    var args: [u64; 4] = [0; 4]
+    args[0] = s
+    args[1] = queue
+    args[2] = 0
+    args[3] = utt
+    let r: i32 = jnicall.j_int(env, G_TTS, jnicall.j_method(env, c, t(N_SPEAK), t(G_SPEAK)), (&args[0]) as u64)
+    jnicall.j_del(env, c)
+    jnicall.j_del(env, utt)
+    jnicall.j_del(env, s)
+    return r
+}
+
+#[no_gc]
+fn set_language(env: u64) -> i32 {
+    var tag: u64 = (&G_LANG[0]) as u64
+    if G_LANG[0] == 0 as u8 { return 0 }
+    let lc: u64 = jnicall.j_class(env, t(C_LOCALE))
+    var a: [u64; 2] = [0; 2]
+    a[0] = jnicall.j_str(env, tag)
+    let loc: u64 = jnicall.j_sobj(env, lc, jnicall.j_smethod(env, lc, t(N_FOR_TAG), t(G_FOR_TAG)), (&a[0]) as u64)
+    jnicall.j_del(env, a[0])
+    jnicall.j_del(env, lc)
+    if loc == 0 { return 0 - 2 }
+    let c: u64 = jnicall.j_obj_class(env, G_TTS)
+    a[0] = loc
+    let r: i32 = jnicall.j_int(env, G_TTS, jnicall.j_method(env, c, t(N_SET_LANG), t(G_SET_LANG)), (&a[0]) as u64)
+    jnicall.j_del(env, c)
+    jnicall.j_del(env, loc)
+    return r
+}
+
+#[no_gc]
+fn apply_rate(env: u64) {
+    if G_RATE_SET { return }
+    let c: u64 = jnicall.j_obj_class(env, G_TTS)
+    var a: [u64; 2] = [0; 2]
+    var f: [f32; 2] = [0.0f; 2]
+    f[0] = G_RATE
+    a[0] = (*((&f[0]) as *mut u32)) as u64
+    let r: i32 = jnicall.j_int(env, G_TTS, jnicall.j_method(env, c, t(N_SET_RATE), t(G_SET_RATE)), (&a[0]) as u64)
+    jnicall.j_del(env, c)
+    if r == 0 { G_RATE_SET = true }
+}
+
+// Drives the state machine; call it every frame on the program's thread. Returns the state.
+#[no_gc]
+fn tts_poll() -> i32 {
+    if G_STATE != TTS_WAIT && G_STATE != TTS_SPEAKING { return G_STATE }
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 || G_TTS == 0 {
+        G_STATE = TTS_ERROR
+        return G_STATE
+    }
+    let now: i64 = now_ms()
+    if G_STATE == TTS_WAIT {
+        if now - G_T0 > WAIT_MS {
+            G_STATE = TTS_ERROR
+            log(L_NOENGINE)
+            return G_STATE
+        }
+        // setLanguage answers -2 both for "not connected yet" and "language not supported": give the
+        // connection a grace period, then speak in the engine's default language.
+        let lr: i32 = set_language(env)
+        G_LANG_RES = lr
+        if lr < 0 && now - G_T0 < LANG_GRACE_MS { return G_STATE }
+        apply_rate(env)
+        let e1: usize = chunk_end(0)
+        let r: i32 = speak_range(env, 0, e1, QUEUE_FLUSH)
+        if r != 0 { return G_STATE }
+        var at: usize = e1
+        var ok: bool = true
+        while at < G_TLEN && ok {
+            let e: usize = chunk_end(at)
+            ok = speak_range(env, at, e, QUEUE_ADD) == 0
+            at = e
+        }
+        G_T1 = now
+        G_STATE = TTS_SPEAKING
+        log(L_READY)
+        return G_STATE
+    }
+    // TTS_SPEAKING: isSpeaking() is true from the moment speak() returned until the queue is empty. 250 ms
+    // of grace so that a lagging service state is not mistaken for the end.
+    let c: u64 = jnicall.j_obj_class(env, G_TTS)
+    var a: [u64; 1] = [0]
+    let sp: bool = jnicall.j_bool(env, G_TTS, jnicall.j_method(env, c, t(N_IS_SPEAKING), t(G_Z)), (&a[0]) as u64)
+    jnicall.j_del(env, c)
+    if !sp && now - G_T1 > 250 {
+        G_TDONE = now
+        G_STATE = TTS_DONE
+        log(L_DONE)
+    }
+    return G_STATE
+}
+
+// Cuts the speech and drops queued text. false = no engine object.
+#[no_gc]
+fn tts_stop() -> bool {
+    G_TLEN = 0
+    if G_TTS == 0 { return false }
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env == 0 { return false }
+    let c: u64 = jnicall.j_obj_class(env, G_TTS)
+    var a: [u64; 1] = [0]
+    let r: i32 = jnicall.j_int(env, G_TTS, jnicall.j_method(env, c, t(N_STOP), t(G_I)), (&a[0]) as u64)
+    jnicall.j_del(env, c)
+    G_STATE = TTS_IDLE
+    return r == 0
+}
+
+// Releases the engine (unbinds the service). A later tts_start() makes a new one.
+#[no_gc]
+fn tts_shutdown() {
+    if G_TTS == 0 { return }
+    var ctx: u64 = 0
+    let env: u64 = jni_ctx(&ctx)
+    if env != 0 {
+        let c: u64 = jnicall.j_obj_class(env, G_TTS)
+        var a: [u64; 1] = [0]
+        let ok: bool = jnicall.j_void(env, G_TTS, jnicall.j_method(env, c, t(N_SHUTDOWN), t(G_V)), (&a[0]) as u64)
+        jnicall.j_del(env, c)
+        jnicall.j_del_global(env, G_TTS)
+    }
+    G_TTS = 0
+    G_STATE = TTS_NONE
+    G_TLEN = 0
+}
+
+#[no_gc]
+fn tts_state() -> i32 { return G_STATE }
+#[no_gc]
+fn tts_lang_result() -> i32 { return G_LANG_RES }
+#[no_gc]
+fn tts_elapsed_ms() -> i32 {
+    if G_STATE != TTS_DONE { return 0 }
+    return (G_TDONE - G_T0) as i32
+}

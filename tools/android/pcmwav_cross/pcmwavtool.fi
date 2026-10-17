@@ -1,0 +1,142 @@
+// tools/android/pcmwav_cross/pcmwavtool.fi -- command line face of plat.android.pcmwav for the cross-check
+// against Python's wave module (pcmwav_cross.py). stdin, one command per line, data as lower case hex:
+//
+//   H <rate> <channels> <data_bytes>   -> hex of the 44 octet header
+//   S <hex pcm16>                      -> "<peak> <rms> <level of peak> <level of rms>"
+//   P <hex file>                       -> "OK <rate> <channels> <bits> <data_at> <data_len>" or "NO"
+//   U <hex utf8>                       -> "<units> <hex utf16le>"   (plat.android.jtext)
+//   V <hex utf16le>                    -> "<octets> <hex utf8>"
+import std.rt
+import plat.android.pcmwav
+import plat.android.jtext
+
+fn hexval(c: u8) -> i32 {
+    if c >= 48 as u8 && c <= 57 as u8 { return (c - 48 as u8) as i32 }
+    if c >= 97 as u8 && c <= 102 as u8 { return (c - 87 as u8) as i32 }
+    return 0 - 1
+}
+
+fn dec(line: str, at: *mut usize) -> u64 {
+    var i: usize = *at
+    while i < line.n && rt.ld8(line.p as u64, i) == 32 as u8 { i = i + 1 }
+    var v: u64 = 0 as u64
+    while i < line.n && rt.ld8(line.p as u64, i) >= 48 as u8 && rt.ld8(line.p as u64, i) <= 57 as u8 {
+        v = v * 10 as u64 + (rt.ld8(line.p as u64, i) - 48 as u8) as u64
+        i = i + 1
+    }
+    *at = i
+    return v
+}
+
+fn push_hex(out: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let b: u8 = rt.ld8(p, i)
+        let hi: u8 = b >> 4 as u8
+        let lo: u8 = b & 15 as u8
+        rt.buf_push(out, if hi < 10 as u8 { 48 as u8 + hi } else { 87 as u8 + hi })
+        rt.buf_push(out, if lo < 10 as u8 { 48 as u8 + lo } else { 87 as u8 + lo })
+        i = i + 1
+    }
+}
+
+// decodes the hex after position `at` into `bin`
+fn unhex(line: str, at: usize, bin: *mut rt.Buf) {
+    var i: usize = at
+    while i < line.n && rt.ld8(line.p as u64, i) == 32 as u8 { i = i + 1 }
+    while i + 1 < line.n {
+        let h: i32 = hexval(rt.ld8(line.p as u64, i))
+        let l: i32 = hexval(rt.ld8(line.p as u64, i + 1))
+        if h < 0 || l < 0 { break }
+        rt.buf_push(bin, (h * 16 + l) as u8)
+        i = i + 2
+    }
+}
+
+fn handle(line: str, out: *mut rt.Buf) {
+    let c: u8 = rt.ld8(line.p as u64, 0)
+    var at: usize = 1
+    if c == 72 as u8 {
+        let rate: u64 = dec(line, &at)
+        let ch: u64 = dec(line, &at)
+        let nb: u64 = dec(line, &at)
+        var h: [u8; 44] = [0 as u8; 44]
+        pcmwav.wav_header((&h[0]) as u64, rate as u32, ch as u32, nb as usize)
+        push_hex(out, (&h[0]) as u64, 44)
+    } else if c == 83 as u8 {
+        var bin: rt.Buf = rt.buf_new()
+        unhex(line, 1, &bin)
+        let ns: usize = rt.buf_len(&bin) / 2
+        let pk: i32 = pcmwav.pcm16_peak(rt.buf_ptr(&bin), ns)
+        let rm: i32 = pcmwav.pcm16_rms(rt.buf_ptr(&bin), ns)
+        rt.buf_push_dec_i64(out, pk as i64)
+        rt.buf_push(out, 32 as u8)
+        rt.buf_push_dec_i64(out, rm as i64)
+        rt.buf_push(out, 32 as u8)
+        rt.buf_push_dec_i64(out, pcmwav.level_permille(pk) as i64)
+        rt.buf_push(out, 32 as u8)
+        rt.buf_push_dec_i64(out, pcmwav.level_permille(rm) as i64)
+    } else if c == 80 as u8 {
+        var bin: rt.Buf = rt.buf_new()
+        unhex(line, 1, &bin)
+        var info: pcmwav.WavInfo = pcmwav.WavInfo { rate: 0 as u32, channels: 0 as u32, bits: 0 as u32, data_at: 0, data_len: 0 }
+        if pcmwav.wav_parse(rt.buf_ptr(&bin), rt.buf_len(&bin), &info) {
+            rt.buf_push_bytes(out, "OK ".p as u64, 3)
+            rt.buf_push_dec_u64(out, info.rate as u64)
+            rt.buf_push(out, 32 as u8)
+            rt.buf_push_dec_u64(out, info.channels as u64)
+            rt.buf_push(out, 32 as u8)
+            rt.buf_push_dec_u64(out, info.bits as u64)
+            rt.buf_push(out, 32 as u8)
+            rt.buf_push_dec_u64(out, info.data_at as u64)
+            rt.buf_push(out, 32 as u8)
+            rt.buf_push_dec_u64(out, info.data_len as u64)
+        } else {
+            rt.buf_push_bytes(out, "NO".p as u64, 2)
+        }
+    } else if c == 85 as u8 {
+        var bin: rt.Buf = rt.buf_new()
+        unhex(line, 1, &bin)
+        let units: usize = jtext.utf8_units(rt.buf_ptr(&bin), rt.buf_len(&bin))
+        var tmp: rt.Buf = rt.buf_new()
+        var z: usize = 0
+        while z < units * 2 + 2 { rt.buf_push(&tmp, 0 as u8); z = z + 1 }
+        let w: usize = jtext.utf8_to_units(rt.buf_ptr(&bin), rt.buf_len(&bin), rt.buf_ptr(&tmp), units)
+        rt.buf_push_dec_u64(out, w as u64)
+        rt.buf_push(out, 32 as u8)
+        push_hex(out, rt.buf_ptr(&tmp), w * 2)
+    } else if c == 86 as u8 {
+        var bin: rt.Buf = rt.buf_new()
+        unhex(line, 1, &bin)
+        let units: usize = rt.buf_len(&bin) / 2
+        let need: usize = jtext.units_utf8_len(rt.buf_ptr(&bin), units)
+        var tmp: rt.Buf = rt.buf_new()
+        var z: usize = 0
+        while z < need + 2 { rt.buf_push(&tmp, 0 as u8); z = z + 1 }
+        let w: usize = jtext.units_to_utf8(rt.buf_ptr(&bin), units, rt.buf_ptr(&tmp), need)
+        rt.buf_push_dec_u64(out, w as u64)
+        rt.buf_push(out, 32 as u8)
+        push_hex(out, rt.buf_ptr(&tmp), w)
+    }
+    rt.buf_push(out, 10 as u8)
+}
+
+fn main(start: u64) -> i32 {
+    var input: rt.Buf = rt.buf_new()
+    rt.read_stdin(&input)
+    var out: rt.Buf = rt.buf_new()
+    var s: usize = 0
+    let n: usize = rt.buf_len(&input)
+    var i: usize = 0
+    while i <= n {
+        if i == n || rt.ld8(rt.buf_ptr(&input), i) == 10 as u8 {
+            if i > s {
+                handle(str { p: (rt.buf_ptr(&input) + s as u64) as *u8, n: i - s }, &out)
+            }
+            s = i + 1
+        }
+        i = i + 1
+    }
+    rt.write_everything(1, rt.buf_ptr(&out), rt.buf_len(&out))
+    return 0
+}
