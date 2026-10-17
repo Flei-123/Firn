@@ -549,6 +549,15 @@ build animkey
 "$W/animkey"
 
 echo
+echo "== 18o4. ANIMATION FEEL BENCH (W3): hover latency, curves, frame pacing, idle, fling =="
+# tools/fui/animbench_main.fi: a simulated monotonic clock drives the real Host. Gates: hover/press
+# visible in the very frame that handles the event, Fluent durations (83/50 ms), frames on the
+# refresh grid with 0 % busy loop, idle asks for no wake-up, friction fling, smooth wheel, Tween API.
+build animbench
+"$W/animbench" > "$W/animbench.out" || { tail -n 40 "$W/animbench.out"; exit 1; }
+tail -n 40 "$W/animbench.out"
+
+echo
 echo "== 18g. ORPHANED TRANSITION ENTRIES ARE GIVEN BACK (r115) =="
 # a full registry hands the slot of an entry nobody asked for during 2 s to a
 # newcomer; counter-checks: nothing stale = refused, ten live widgets keep theirs

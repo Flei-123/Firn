@@ -29,9 +29,12 @@
 //      offset. Both go as `pref` and `value` to
 //      wave2.draw_scrollbar -- the length of the thumb is calculated by
 //      wave2.scrollbar_thumb, and as the ONLY place.
-//   4. IT RUNS OUT SOFTLY. Kinetic scrolling is a perfectly normal
-//      anim.Animation with EASE_OUT on the offset. There is
-//      no second time calculation here: the milliseconds come in from outside
+//   4. IT RUNS OUT SOFTLY. Kinetic scrolling is a FRICTION fling: the
+//      velocity decays exponentially, v(t) = v0 e^(-k t), and the offset is
+//      the closed form (anim.fling_pos) -- frame-rate independent, it needs
+//      no state but the start, and it ends where v0/k says (not after a
+//      fixed time, so a hard flick travels further than a soft one, as on
+//      a phone). The milliseconds come in from outside
 //      (render.ctx_time), as everywhere else in fUi.
 //   5. IT LETS ITS BARS BE GRASPED. `viewport_bar_hit` says
 //      which bar lies under the pointer, `viewport_bar_press`
@@ -82,9 +85,11 @@ export {
     viewport_draw_bars,
     VP_UP, VP_DOWN, VP_LEFT, VP_RIGHT,
     VP_PAGE_UP, VP_PAGE_DOWN, VP_HOME, VP_END,
-    VP_STEP, VP_WHEEL_STEP, VP_FLING_MS,
+    VP_STEP, VP_WHEEL_STEP, VP_FLING_MS, VP_FLING_K, VP_FLING_MIN, VP_SMOOTH_TAU,
+    viewport_scroll_smooth,
 }
 
+import std.math
 import paint.canvas
 import fui.layout
 import fui.widget
@@ -115,6 +120,13 @@ const VP_STEP: f64 = 24.0
 const VP_WHEEL_STEP: f64 = 72.0
 // How long the kinetic run-out lasts.
 const VP_FLING_MS: i64 = 420
+// Friction of the fling (per ms): 0.0035 = a 2 px/ms flick glides ~570 px.
+const VP_FLING_K: f64 = 0.0035
+// Below this speed (px/ms) the fling is over (under one pixel per frame).
+const VP_FLING_MIN: f64 = 0.05
+// Smooth wheel / touchpad: the offset chases its target with this time
+// constant (ms); ~60 ms feels immediate and still glides.
+const VP_SMOOTH_TAU: f64 = 60.0
 
 // WHICH BAR IS MEANT. The same kind of number as the eight
 // movements above: the caller gets a direction back and
@@ -147,11 +159,19 @@ struct Viewport {
     // exactly that was not to be seen in proofs 23 to 26. The
     // bars are painted AFTER the clip and therefore stay whole.
     pad: f64,
-    // The kinetic run-out -- two perfectly normal tweens.
-    fx: anim.Animation,
-    fy: anim.Animation,
+    // The kinetic run-out: start offset, start velocity (px/ms), start time.
+    fl_ox: f64,
+    fl_oy: f64,
+    fl_vx: f64,
+    fl_vy: f64,
+    fl_t0: i64,
     fx_on: u32,
     fy_on: u32,
+    // Smooth wheel: the offset chases (sm_x, sm_y); sm_t = last tick.
+    sm_x: f64,
+    sm_y: f64,
+    sm_t: i64,
+    sm_on: u32,
     // Dragging a bar: which direction, where it was grasped
     // and which offset applied at that moment.
     drag: u32,
@@ -163,9 +183,9 @@ fn viewport_new(x: f64, y: f64, w: f64, h: f64, cw: f64,
     ch: f64) -> Viewport {
     return Viewport { x: x, y: y, w: w, h: h, cw: cw, ch: ch,
         ox: 0.0, oy: 0.0, bar: 12, pad: 0.0,
-        fx: anim.anim_new(0, 1, 0.0, 0.0, anim.easing_linear()),
-        fy: anim.anim_new(0, 1, 0.0, 0.0, anim.easing_linear()),
+        fl_ox: 0.0, fl_oy: 0.0, fl_vx: 0.0, fl_vy: 0.0, fl_t0: 0,
         fx_on: 0 as u32, fy_on: 0 as u32,
+        sm_x: 0.0, sm_y: 0.0, sm_t: 0, sm_on: 0 as u32,
         drag: VP_BAR_NONE, tombstone: 0.0, tombstone_off: 0.0 }
 }
 
@@ -320,6 +340,7 @@ fn clamp_offset(v: *mut Viewport) {
 fn fling_stop(v: *mut Viewport) {
     (*v).fx_on = 0 as u32
     (*v).fy_on = 0 as u32
+    (*v).sm_on = 0 as u32
 }
 
 fn viewport_set_offset(v: *mut Viewport, ox: f64, oy: f64) {
@@ -372,59 +393,128 @@ fn viewport_key(v: *mut Viewport, key: u32) -> bool {
 }
 
 // THE SOFT RUN-OUT. `vx`/`vy` are velocities in pixels per
-// millisecond -- as a pointer device delivers them. From that becomes a
-// TARGET, and the way there is a tween with EASE_OUT: fast at the
-// start, calm at the end. Half the duration as a factor is the distance
-// that a uniformly braked movement covers.
+// millisecond -- as a pointer device delivers them. The offset then follows
+// the friction closed form of anim.fling_pos until the speed is below
+// VP_FLING_MIN or an edge is hit (an edge stops that axis dead; there is
+// no overscroll bounce).
 fn viewport_fling(v: *mut Viewport, vx: f64, vy: f64, now_ms: i64) {
-    let strecke: f64 = (VP_FLING_MS as f64) / 2.0
-    var zx: f64 = (*v).ox + vx * strecke
-    var zy: f64 = (*v).oy + vy * strecke
-    if zx < 0.0 { zx = 0.0 }
-    if zy < 0.0 { zy = 0.0 }
+    (*v).fl_ox = (*v).ox
+    (*v).fl_oy = (*v).oy
+    (*v).fl_vx = vx
+    (*v).fl_vy = vy
+    (*v).fl_t0 = now_ms
+    (*v).sm_on = 0 as u32
+    (*v).fx_on = 0 as u32
+    (*v).fy_on = 0 as u32
+    if vx >= VP_FLING_MIN || vx <= 0.0 - VP_FLING_MIN {
+        (*v).fx_on = 1 as u32
+    }
+    if vy >= VP_FLING_MIN || vy <= 0.0 - VP_FLING_MIN {
+        (*v).fy_on = 1 as u32
+    }
+}
+
+// SMOOTH WHEEL / TOUCHPAD. Instead of jumping by the notch, the offset
+// chases a target that the notches push: dt-correct exponential approach,
+// o += (target - o) * (1 - e^(-dt/tau)). Several notches in a row add up
+// to one longer glide (the target moves on), reversing the direction is
+// immediate (the target is just behind the offset again).
+fn viewport_scroll_smooth(v: *mut Viewport, dx: f64, dy: f64, now_ms: i64) {
+    var tx: f64 = (*v).ox
+    var ty: f64 = (*v).oy
+    var t0: i64 = 0 - 1
+    if (*v).sm_on != 0 as u32 {
+        tx = (*v).sm_x
+        ty = (*v).sm_y
+        t0 = (*v).sm_t
+    }
+    fling_stop(v)
+    tx = tx + dx
+    ty = ty + dy
+    if tx < 0.0 { tx = 0.0 }
+    if ty < 0.0 { ty = 0.0 }
     let mx: f64 = viewport_max_x(v)
     let my: f64 = viewport_max_y(v)
-    if zx > mx { zx = mx }
-    if zy > my { zy = my }
-    (*v).fx = anim.anim_new(now_ms, VP_FLING_MS, (*v).ox, zx,
-        anim.easing_named(anim.EASE_OUT))
-    (*v).fy = anim.anim_new(now_ms, VP_FLING_MS, (*v).oy, zy,
-        anim.easing_named(anim.EASE_OUT))
-    (*v).fx_on = 1 as u32
-    (*v).fy_on = 1 as u32
+    if tx > mx { tx = mx }
+    if ty > my { ty = my }
+    (*v).sm_x = tx
+    (*v).sm_y = ty
+    // a fresh glide has no previous tick: -1 makes the first tick use one
+    // nominal frame (16 ms) instead of the idle time since the last event
+    (*v).sm_t = t0
+    (*v).sm_on = 1 as u32
 }
 
 // The clock. Returns whether the offset has changed.
 fn viewport_tick(v: *mut Viewport, now_ms: i64) -> bool {
     var geaendert: bool = false
-    if (*v).fx_on != 0 as u32 {
-        let n: f64 = anim.anim_value(&(*v).fx, now_ms)
-        if n != (*v).ox {
+    let before_x: f64 = (*v).ox
+    let before_y: f64 = (*v).oy
+    if (*v).fx_on != 0 as u32 || (*v).fy_on != 0 as u32 {
+        var dt: f64 = (now_ms - (*v).fl_t0) as f64
+        if dt < 0.0 {
+            dt = 0.0
+        }
+        if (*v).fx_on != 0 as u32 {
+            var n: f64 = anim.fling_pos((*v).fl_ox, (*v).fl_vx, VP_FLING_K, dt)
+            var sp: f64 = anim.fling_vel((*v).fl_vx, VP_FLING_K, dt)
+            if sp < 0.0 { sp = 0.0 - sp }
+            let mx: f64 = viewport_max_x(v)
+            if n <= 0.0 || n >= mx {
+                if n < 0.0 { n = 0.0 }
+                if n > mx { n = mx }
+                (*v).fx_on = 0 as u32
+            } else if sp < VP_FLING_MIN {
+                (*v).fx_on = 0 as u32
+            }
             (*v).ox = n
-            geaendert = true
         }
-        if anim.anim_done(&(*v).fx, now_ms) {
-            (*v).fx_on = 0 as u32
+        if (*v).fy_on != 0 as u32 {
+            var n2: f64 = anim.fling_pos((*v).fl_oy, (*v).fl_vy, VP_FLING_K, dt)
+            var sp2: f64 = anim.fling_vel((*v).fl_vy, VP_FLING_K, dt)
+            if sp2 < 0.0 { sp2 = 0.0 - sp2 }
+            let my: f64 = viewport_max_y(v)
+            if n2 <= 0.0 || n2 >= my {
+                if n2 < 0.0 { n2 = 0.0 }
+                if n2 > my { n2 = my }
+                (*v).fy_on = 0 as u32
+            } else if sp2 < VP_FLING_MIN {
+                (*v).fy_on = 0 as u32
+            }
+            (*v).oy = n2
         }
     }
-    if (*v).fy_on != 0 as u32 {
-        let n: f64 = anim.anim_value(&(*v).fy, now_ms)
-        if n != (*v).oy {
-            (*v).oy = n
-            geaendert = true
+    if (*v).sm_on != 0 as u32 {
+        var sdt: f64 = (now_ms - (*v).sm_t) as f64
+        if (*v).sm_t < 0 {
+            sdt = 16.0
         }
-        if anim.anim_done(&(*v).fy, now_ms) {
-            (*v).fy_on = 0 as u32
+        if sdt < 0.0 {
+            sdt = 0.0
+        }
+        (*v).sm_t = now_ms
+        let f: f64 = 1.0 - math.exp(0.0 - sdt / VP_SMOOTH_TAU)
+        (*v).ox = (*v).ox + ((*v).sm_x - (*v).ox) * f
+        (*v).oy = (*v).oy + ((*v).sm_y - (*v).oy) * f
+        var gx: f64 = (*v).sm_x - (*v).ox
+        var gy: f64 = (*v).sm_y - (*v).oy
+        if gx < 0.0 { gx = 0.0 - gx }
+        if gy < 0.0 { gy = 0.0 - gy }
+        if gx < 0.25 && gy < 0.25 {
+            (*v).ox = (*v).sm_x
+            (*v).oy = (*v).sm_y
+            (*v).sm_on = 0 as u32
         }
     }
-    if geaendert {
+    if (*v).ox != before_x || (*v).oy != before_y {
+        geaendert = true
         clamp_offset(v)
     }
     return geaendert
 }
 
 fn viewport_moving(v: *mut Viewport) -> bool {
-    return (*v).fx_on != 0 as u32 || (*v).fy_on != 0 as u32
+    return (*v).fx_on != 0 as u32 || (*v).fy_on != 0 as u32 || (*v).sm_on != 0 as u32
 }
 
 // ======================================================================
