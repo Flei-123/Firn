@@ -122,6 +122,14 @@ build fluent
 "$W/fluent"
 
 echo
+echo "== 2d. THE SHOWCASE: EVERY CONTROL, LIGHT AND DARK, DIFFED AGAINST THE GOLDENS =="
+# tools/fui/showcase.sh paints gallery / gallery2 / gallery3 / gallery4 /
+# gallery9 in both schemes and prints ONE number per image: the share
+# of differing pixels against tools/fui/golden/ (limit 0.5 %). A
+# deliberate design change: `sh tools/fui/showcase.sh --update`.
+FIRNC="$FIRNC" sh tools/fui/showcase.sh
+
+echo
 echo "== 3. THE CLOSE CROSS =="
 build capicon
 "$W/capicon"
