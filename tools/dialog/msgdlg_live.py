@@ -88,11 +88,11 @@ def shot():
     return Image.open(p).convert("RGB")
 
 
-# ---- the colours of the two built-in sets (lib/fui/theme.fi), 0xRRGGBB
-LIGHT = dict(base=0xF4F4F6, raised=0xFFFFFF, button=0xEDEDF0, hover=0xDFDFE2, accent=0x0060DF, warning=0x715100,
-             error=0xC50042, text=0x15141B)
-DARK = dict(base=0x1C1B22, raised=0x37373F, button=0x42414D, hover=0x52525E, accent=0x0A84FF, warning=0xFFBD4F,
-            error=0xFF5C5C, text=0xFBFBFE)
+# ---- the colours of the two built-in sets (lib/fui/theme.fi colors_light / colors_dark, Fluent), 0xRRGGBB
+LIGHT = dict(base=0xF3F3F3, raised=0xFFFFFF, button=0xEEEEEE, hover=0xE6E6E6, accent=0x0067C0, warning=0x9D5D00,
+             error=0xA4262C, text=0x1B1B1B)
+DARK = dict(base=0x202020, raised=0x303030, button=0x3A3A3A, hover=0x454545, accent=0x4CC2FF, warning=0xFCE100,
+            error=0xFF99A4, text=0xFFFFFF)
 
 
 def rgb(v):
