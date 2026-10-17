@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/fluent_main.fi -- THE MEASURE TEST AGAINST THE FLUENT TARGET.
+//
+// Paints every standard control onto a plain canvas, MEASURES its size
+// in pixels (not from a constant: from the foreign pixels that really
+// landed on the canvas) and compares it with the Windows 11 / Fluent 2
+// target size. The last line is `DEVIATIONS: <n>`; the goal is 0.
+//
+//     fluent_main [<font.ttf>]        exit code 1 if there is a deviation
+//
+// Target sizes (design points at 100 %):
+//   button 32 high, radius 4 (controls) / 8 (overlays)   text field 32
+//   toggle 40 x 20      checkbox 20 x 20      radio 20 x 20
+//   slider track 4, thumb 20      scrollbar thumb 2 idle -> 6 hover
+//   menu row 32         type scale 12 / 14 / 20 / 28 / 40     4 px grid
+import std.rt
+import paint.canvas
+import font.metrics
+import fui.theme
+import fui.style
+import fui.widget
+import fui.painter
+import fui.render
+import fui.wave2
+import fui.layout
+
+const FONTSET_BYTES: usize = 4096
+const W: usize = 400
+const H: usize = 160
+
+static mut DEV: usize = 0
+static mut TOTAL: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_num(v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+// One measurement: name, what was measured, what Fluent wants.
+fn check(name: str, got: i64, want: i64) {
+    TOTAL = TOTAL + 1
+    if got == want {
+        say("  ok    ")
+    } else {
+        say("  DEV   ")
+        DEV = DEV + 1
+    }
+    say(name)
+    say("  got ")
+    say_num(got)
+    say("  want ")
+    say_num(want)
+    say("\n")
+}
+
+fn b2i(b: bool) -> i64 {
+    if b { return 1 }
+    return 0
+}
+
+fn px(cv: *mut canvas.Canvas, x: usize, y: usize) -> u32 {
+    return canvas.canvas_get(cv, x, y) & 0x00FFFFFF as u32
+}
+
+fn clear(cv: *mut canvas.Canvas, m: *mut theme.Theme) {
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    canvas.canvas_clear(cv, theme.opaque((*f).base))
+}
+
+// The extent of everything that is not the page colour inside a box:
+// out[0]=left out[1]=top out[2]=right(excl) out[3]=bottom(excl).
+fn ink_box(cv: *mut canvas.Canvas, bg: u32, x0: usize, y0: usize,
+    x1: usize, y1: usize, out: *mut [i64; 4]) -> bool {
+    var l: i64 = 1000000
+    var t: i64 = 1000000
+    var r: i64 = -1
+    var b: i64 = -1
+    var y: usize = y0
+    while y < y1 {
+        var x: usize = x0
+        while x < x1 {
+            if px(cv, x, y) != bg {
+                if (x as i64) < l { l = x as i64 }
+                if (y as i64) < t { t = y as i64 }
+                if (x as i64) + 1 > r { r = (x as i64) + 1 }
+                if (y as i64) + 1 > b { b = (y as i64) + 1 }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    (*out)[0] = l
+    (*out)[1] = t
+    (*out)[2] = r
+    (*out)[3] = b
+    return r >= 0
+}
+
+// Height of the foreign run that crosses the row/column at (x, ymid).
+fn run_v(cv: *mut canvas.Canvas, bg: u32, x: usize, y0: usize,
+    y1: usize) -> i64 {
+    var n: i64 = 0
+    var y: usize = y0
+    while y < y1 {
+        if px(cv, x, y) != bg { n = n + 1 }
+        y = y + 1
+    }
+    return n
+}
+
+fn run_h(cv: *mut canvas.Canvas, bg: u32, y: usize, x0: usize,
+    x1: usize) -> i64 {
+    var n: i64 = 0
+    var x: usize = x0
+    while x < x1 {
+        if px(cv, x, y) != bg { n = n + 1 }
+        x = x + 1
+    }
+    return n
+}
+
+// Pixels of exactly one colour in a row (the thumb inside a hover track).
+fn run_col(cv: *mut canvas.Canvas, col: u32, y: usize, x0: usize,
+    x1: usize) -> i64 {
+    var n: i64 = 0
+    var x: usize = x0
+    while x < x1 {
+        if px(cv, x, y) == col { n = n + 1 }
+        x = x + 1
+    }
+    return n
+}
+
+fn main(start: u64) -> i32 {
+    var fbuf: rt.Buf = rt.buf_new()
+    var f1: [u8; 48] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf\0"
+    let have: bool = rt.read_file((&f1[0]) as u64, &fbuf)
+    let fsp: *mut metrics.FontSet =
+    rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+    if fsp as usize == 0 { return 3 }
+    *fsp = metrics.fontset_new()
+    var fm: u64 = 0
+    if have {
+        if metrics.fontset_load(fsp, fbuf.ptr as *mut u8, fbuf.len) {
+            fm = fsp as u64
+        }
+    }
+    var cv: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cv, W, H) { return 4 }
+    var z: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&z, &cv, W, H) { return 5 }
+    painter.painter_set_font(&z, fm)
+
+    var bx: [i64; 4] = [0; 4]
+    var m: theme.Theme = theme.theme_new(false)
+    var c: render.Ctx = render.ctx_new(&m, &z)
+    let f: *mut theme.Colors = theme.theme_colors(&m)
+    let fo: *mut theme.Shape = theme.theme_shape(&m)
+    let bg: u32 = (*f).base
+
+    say("-- theme tokens (design points)\n")
+    check("radius button", (*fo).r_button as i64, 4)
+    check("radius field", (*fo).r_field as i64, 4)
+    check("radius panel/card", (*fo).r_panel as i64, 8)
+    check("radius window/overlay", (*fo).r_window as i64, 8)
+    check("control height", (*fo).ctrl_h as i64, 32)
+    check("menu / list row", (*fo).row as i64, 32)
+    check("body font", (*fo).font as i64, 14)
+    check("spacing xs", (*fo).sp_xs as i64, 4)
+    check("spacing s", (*fo).sp_s as i64, 8)
+    check("spacing m", (*fo).sp_m as i64, 16)
+    check("spacing l", (*fo).sp_l as i64, 24)
+    check("menu_item_height px", wave2.menu_item_height(&c) as i64, 32)
+
+    say("-- pixels\n")
+    // TOGGLE: place a 200x32 widget at 20,20, no label.
+    var tg: widget.Widget = widget.widget_new(widget.KIND_TOGGLE)
+    widget.w_place(&tg, 20.0, 20.0, 200.0, 32.0)
+    clear(&cv, &m)
+    wave2.draw_any(&c, &tg)
+    ink_box(&cv, bg, 0, 0, W, H, &bx)
+    check("toggle width", bx[2] - bx[0], 40)
+    check("toggle height", bx[3] - bx[1], 20)
+
+    var cb: widget.Widget = widget.widget_new(widget.KIND_CHECKBOX)
+    widget.w_place(&cb, 20.0, 20.0, 200.0, 32.0)
+    clear(&cv, &m)
+    wave2.draw_any(&c, &cb)
+    ink_box(&cv, bg, 0, 0, W, H, &bx)
+    check("checkbox width", bx[2] - bx[0], 20)
+    check("checkbox height", bx[3] - bx[1], 20)
+
+    var rd: widget.Widget = widget.widget_new(widget.KIND_RADIO)
+    widget.w_place(&rd, 20.0, 20.0, 200.0, 32.0)
+    clear(&cv, &m)
+    wave2.draw_any(&c, &rd)
+    ink_box(&cv, bg, 0, 0, W, H, &bx)
+    check("radio width", bx[2] - bx[0], 20)
+    check("radio height", bx[3] - bx[1], 20)
+
+    // SLIDER: horizontal 200 x 32 at 20,20, value 0.
+    var sl: widget.Widget = widget.widget_new(widget.KIND_SLIDER)
+    widget.w_place(&sl, 20.0, 20.0, 200.0, 32.0)
+    widget.w_set_value(&sl, 0)
+    clear(&cv, &m)
+    wave2.draw_any(&c, &sl)
+    check("slider track thickness", run_v(&cv, bg, 20 + 100, 0, H), 4)
+    check("slider thumb diameter", run_v(&cv, bg, 20 + 16, 0, H), 20)
+
+    // SCROLLBAR: vertical 12 x 120 at 20,20.
+    var sb: widget.Widget = widget.widget_new(widget.KIND_SCROLLBAR)
+    widget.w_place(&sb, 20.0, 20.0, 12.0, 120.0)
+    widget.w_set_value(&sb, 0)
+    clear(&cv, &m)
+    wave2.draw_any(&c, &sb)
+    check("scrollbar thumb idle", run_h(&cv, bg, 20 + 30, 0, W), 2)
+    widget.w_set_hover(&sb, true)
+    clear(&cv, &m)
+    wave2.draw_any(&c, &sb)
+    check("scrollbar thumb hover", run_col(&cv, (*f).text_muted, 20 + 30, 0, W), 6)
+
+    // BUTTON + TEXT FIELD: height as placed must stay what is painted
+    // (no stray ring / shadow outside the box).
+    var bt: widget.Widget = widget.widget_new(widget.KIND_BUTTON)
+    widget.w_place(&bt, 20.0, 20.0, 120.0, 32.0)
+    clear(&cv, &m)
+    render.draw_widget(&c, &bt)
+    ink_box(&cv, bg, 0, 0, W, H, &bx)
+    check("button painted height", bx[3] - bx[1], 32)
+    // corner: radius 4 leaves the very corner pixel as page colour
+    check("button corner rounded", b2i(px(&cv, 20, 20) == bg), 1)
+
+    var tf: widget.Widget = widget.widget_new(widget.KIND_TEXTBOX)
+    widget.w_place(&tf, 20.0, 20.0, 200.0, 32.0)
+    clear(&cv, &m)
+    render.draw_widget(&c, &tf)
+    ink_box(&cv, bg, 0, 0, W, H, &bx)
+    check("field painted height", bx[3] - bx[1], 32)
+    // Focus: Fluent draws a 2 px accent line at the BOTTOM only.
+    widget.w_set_focus(&tf, true)
+    clear(&cv, &m)
+    render.draw_widget(&c, &tf)
+    check("field focus underline (accent px in bottom row)",
+        b2i(px(&cv, 20 + 100, 20 + 31) == (*f).accent), 1)
+    check("field focus: no accent on top edge",
+        b2i(px(&cv, 20 + 100, 20) != (*f).accent), 1)
+
+    say("DEVIATIONS: ")
+    say_num(DEV as i64)
+    say(" of ")
+    say_num(TOTAL as i64)
+    say("\n")
+    if DEV > 0 { return 1 }
+    return 0
+}
