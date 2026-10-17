@@ -1492,6 +1492,9 @@ echo
 echo "== TEXT (W2, r13): GPOS pair kerning, the coverage curve, the text bench =="
 # textbench_main paints one line as PNGs and times it; textbench.py compares the pictures with FreeType
 # (Pillow) and fontTools and fails when the numbers leave their corridor. SKIP without python3/Pillow/fontTools.
+# r281: the first paint of a line (cold) must equal every later one (warm), also at the canvas edge
+build coldwarm
+"$W/coldwarm" /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
 build textbench
 mkdir -p "$W/textbench_out"
 "$W/textbench" /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf "$W/textbench_out" | head -3
