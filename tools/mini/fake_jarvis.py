@@ -15,7 +15,7 @@
 # as {"type":"rest",...}): /api/me, /api/projects[/<id>[/roadmap|/needs]], /api/command-center,
 # /api/conversations (list), /api/tasks, /api/remote/devices, /api/push-token, /api/stt,
 # /api/m/upload (raw body), /file/<uid>/<cid>/<name>, /api/projects/broken (cut JSON).
-import asyncio, json, sys, time
+import asyncio, json, os, sys, time
 from urllib.parse import unquote, urlparse, parse_qs, quote
 from http import HTTPStatus
 from websockets.asyncio.server import serve
@@ -95,7 +95,7 @@ def rest(method, rawpath, hdr, body):
     q = parse_qs(u.query)
     if not (path in ("/api/me", "/api/projects", "/api/command-center", "/api/conversations", "/api/tasks",
                      "/api/remote/devices", "/api/push-token", "/api/stt", "/api/m/upload")
-            or path.startswith("/api/projects/") or path.startswith("/file/")):
+            or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")):
         return None
     jtype = hdr.get("content-type")
     entry = {"type": "rest", "method": method, "path": rawpath, "ctype": jtype, "n": len(body)}
@@ -109,8 +109,58 @@ def rest(method, rawpath, hdr, body):
         entry["json"] = j
     LOG.write(json.dumps(entry) + "\n")
     def out(st, obj): return (st, json.dumps(obj).encode(), "application/json")
+    if path.startswith("/api/m/") and path != "/api/m/upload" and os.environ.get("FAKE_NO_MOBILE"):
+        return out(404, {"error": "Not found"})  # an older server without the mobile routes
+    if path == "/api/m/ping":
+        return out(200, {"ok": True, "api": 1, "time": 1760726400000, "push": {"tcp": True, "host": "127.0.0.1", "port": 7781, "poll": True}})
     if not ok:
         return out(401, {"error": "Not logged in"})
+    if path.startswith("/api/m/") and path != "/api/m/upload":
+        mp = path[len("/api/m/"):]
+        if mp == "projects" and method == "GET":
+            return out(200, {"projects": [psummary(p) for p in PROJECTS.values()]})
+        if mp.startswith("projects/") and method == "GET":
+            p = PROJECTS.get(unquote(mp[len("projects/"):]))
+            return out(200, {"project": pfull(p)}) if p else out(404, {"error": "No project"})
+        if mp == "needs/answer" and method == "POST" and j:
+            for p in PROJECTS.values():
+                if j.get("project") in (p["id"], p.get("name")):
+                    for n in p["needs"]:
+                        if n["id"] == j.get("id") and not n.get("done"):
+                            n["done"] = True; n["answer"] = j.get("answer", "")
+                            return out(200, {"ok": True})
+            return out(400, {"error": "Need not found or already done."})
+        if mp == "tasks" and method == "GET":
+            return out(200, {"tasks": TASKS})
+        if mp == "tasks" and method == "POST" and j and j.get("text"):
+            tseq += 1
+            t = {"id": "t%d" % tseq, "text": j["text"], "due": j.get("due"), "category": j.get("category"),
+                 "repeat": j.get("repeat") or "none", "done": False, "created": tseq}
+            TASKS.append(t)
+            return out(200, {"task": t})
+        if mp in ("tasks/done", "tasks/remove") and method == "POST" and j:
+            for t in TASKS:
+                if t["id"] == j.get("id") and mp == "tasks/done": t["done"] = True
+            if mp == "tasks/remove":
+                TASKS[:] = [t for t in TASKS if t["id"] != j.get("id")]
+            return out(200, {"ok": True})
+        if mp == "devices":
+            return out(200, {"devices": [{"name": "Dell", "type": "Windows", "online": True}, {"name": "Phone", "type": "Android", "online": False}]})
+        if mp == "chats" and method == "GET":
+            return out(200, {"total": 2, "chats": [{"id": "c1", "title": "worker one", "kind": "worker", "updatedAt": 1760000000001, "running": True, "fav": True, "parent": None},
+                                                    {"id": "o1", "title": "Leitstand", "kind": "orchestrator", "updatedAt": 5, "running": False, "fav": False, "parent": None}]})
+        if mp.startswith("chats/") and method == "GET":
+            cid = unquote(mp[len("chats/"):])
+            if cid not in CONV:
+                return out(404, {"error": "Not found"})
+            return out(200, {"chat": {"id": cid, "title": "worker one", "kind": "worker", "running": False, "partial": "", "beat": None},
+                             "first": 0, "hasMore": False,
+                             "messages": [dict(m, i=i, at=1760000000000 + i) for i, m in enumerate(CONV[cid])]})
+        if mp == "push/register" and method == "POST":
+            return out(200, {"pushToken": "00112233445566778899aabbccddeeff", "relay": {"host": "127.0.0.1", "port": 7781, "tls": False, "pin": None, "hello": True, "sni": None}, "poll": "/api/m/push/poll"})
+        if mp == "push/test" and method == "POST":
+            return out(200, {"ok": True, "sent": 1})
+        return out(404, {"error": "Not found"})
     if path == "/api/me":
         return out(200, {"username": "justin", "admin": True, "deviceToken": "dt1", "settings": {}})
     if path == "/api/projects" and method == "GET":
@@ -184,7 +234,7 @@ def rest(method, rawpath, hdr, body):
         name = q.get("name", ["file"])[0]
         disk = "ab12cd34ef56_" + name
         FILES[disk] = body
-        return out(200, {"file": {"name": name, "size": len(body), "mime": jtype, "url": "/file/u1/%s/%s" % (q.get("cid", ["c0"])[0], quote(disk))}})
+        return out(200, {"file": {"name": name, "size": len(body), "mime": jtype, "url": "/file/u1/%s/%s" % (q.get("cid", ["c0"])[0], quote(disk)), "path": "/srv/uploads/u1/%s/%s" % (q.get("cid", ["mobile"])[0], disk)}})
     if path.startswith("/file/"):
         disk = unquote(path.split("/")[-1])
         if disk not in FILES:

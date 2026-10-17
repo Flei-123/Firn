@@ -3,6 +3,7 @@
 # tools/android/jarvis_screens_check.sh -- the Leitstand/Needs/Tasks/Devices screens of the JARVIS app on Linux (Xvfb + openbox)
 # against tools/mini/fake_jarvis.py: login, Board (projects, needs answer, worker chat), Tasks (add, done), Dev.
 # Passes when the fake server saw the need answer, the task add and the task complete (the worker chat is only visible in the PNG). PNGs: SHOTS=<dir>.
+# FAKE_NO_MOBILE=1 plays an older server (no /api/m/*): the app must fall back to the old routes. Default: the mobile routes are used.
 # Tap positions are for the 480x800 root with the 360x640 window at +52+74 (pixel layout of fui.app).
 set -uo pipefail
 cd "$(dirname "$0")/../.."
@@ -37,7 +38,19 @@ click 130 220; sleep 0.5; click 137 555; sleep 3; shot tasks_done
 click 320 714; sleep 4; shot devices
 FAIL=0
 chk() { if grep -q "$2" "$W/server.log"; then echo "  ok   $1"; else echo "  FAIL $1"; FAIL=$((FAIL + 1)); fi; }
-chk "need answer posted" '"action": "answer", "id": "n1", "answer": "Yes"'
-chk "task add posted" '"action": "add", "text": "call dad", "due": "2026-10-19T08:00"'
-chk "task complete posted" '"action": "complete"'
+if [ -n "${FAKE_NO_MOBILE:-}" ]; then
+  # an older server: /api/m/ping answers 404, the app keeps the old routes
+  chk "ping asked" '"path": "/api/m/ping"'
+  chk "need answer posted (old route)" '"action": "answer", "id": "n1", "answer": "Yes"'
+  chk "task add posted (old route)" '"action": "add", "text": "call dad", "due": "2026-10-19T08:00"'
+  chk "task complete posted (old route)" '"action": "complete"'
+  ! grep -q '"path": "/api/m/tasks' "$W/server.log" && echo "  ok   no mobile task route used" || { echo "  FAIL mobile route used on an old server"; FAIL=$((FAIL + 1)); }
+else
+  chk "ping asked" '"path": "/api/m/ping"'
+  chk "need answer posted (mobile)" '"path": "/api/m/needs/answer".*"project": "p1", "id": "n1", "answer": "Yes"'
+  chk "task add posted (mobile)" '"path": "/api/m/tasks".*"text": "call dad", "due": "2026-10-19T08:00"'
+  chk "task complete posted (mobile)" '"path": "/api/m/tasks/done"'
+  chk "projects over mobile route" '"path": "/api/m/projects"'
+  chk "devices over mobile route" '"path": "/api/m/devices"'
+fi
 [ $FAIL -eq 0 ] && echo "JARVIS SCREENS PASSED" || { echo "JARVIS SCREENS FAILED"; exit 1; }

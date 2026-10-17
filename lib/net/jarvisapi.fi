@@ -79,13 +79,14 @@ import net.jarvis_cache
 export {
     Api,
     AK_LOGIN, AK_ME, AK_PROJECTS, AK_PROJECT, AK_PROJECT_SET, AK_ROADMAP, AK_NEED, AK_CENTER,
-    AK_CONVS, AK_CONV, AK_TASKS, AK_TASK_OP, AK_DEVICES, AK_PUSH, AK_STT, AK_UPLOAD, AK_DOWNLOAD,
+    AK_CONVS, AK_CONV, AK_TASKS, AK_TASK_OP, AK_DEVICES, AK_PUSH, AK_STT, AK_UPLOAD, AK_DOWNLOAD, AK_PING, AK_PUSH_REG, AK_PUSH_TEST,
     JP_ME, JP_PROJECTS, JP_CENTER, JP_CONVS, JP_TASKS, JP_DEVICES, JP_PUSH, JP_STT, JP_UPLOAD, JP_LOGIN,
     ja_new, ja_free, ja_set_base, ja_set_token, ja_has_token, ja_use_jc, ja_set_path, ja_get_path,
     ja_set_cache, ja_set_timeout, ja_add_trust_pem, ja_user,
     ja_login, ja_me, ja_projects, ja_project, ja_project_set, ja_roadmap_op, ja_need_answer,
     ja_center, ja_convs, ja_conv, ja_tasks, ja_task_add, ja_task_complete, ja_task_remove,
-    ja_devices, ja_push_token, ja_stt, ja_upload, ja_download,
+    ja_devices, ja_push_token, ja_stt, ja_set_mobile, ja_is_mobile, ja_ping, ja_push_register, ja_push_test,
+    PushReg, pushreg_new, pushreg_free, parse_push_register, ja_upload, ja_download,
     ja_get, ja_post_json, ja_kind_name,
     ja_body_ptr, ja_body_len, ja_body, ja_key, ja_age_s, ja_status,
     Me, ProjectRow, Projects, RoadItem, NeedItem, ChatRef, ProjectFull,
@@ -120,6 +121,9 @@ const AK_PUSH: u32 = 14
 const AK_STT: u32 = 15
 const AK_UPLOAD: u32 = 16
 const AK_DOWNLOAD: u32 = 17
+const AK_PING: u32 = 18 // GET /api/m/ping: does the server have the mobile routes?
+const AK_PUSH_REG: u32 = 19 // POST /api/m/push/register (answer: pushToken + relay)
+const AK_PUSH_TEST: u32 = 20 // POST /api/m/push/test
 
 const JP_LOGIN: u32 = 0
 const JP_ME: u32 = 1
@@ -164,6 +168,7 @@ struct Api {
     age: i64,
     status: i64,
     timeout_ms: i64,
+    mobile: bool, // the /api/m/* routes (docs/ANDROID-APP-API.md) are switched on, see ja_set_mobile
 }
 
 struct Call {
@@ -241,6 +246,23 @@ fn ja_get_path(a: *mut Api, which: u32) -> str {
     return as_str(b)
 }
 
+// Switch between the routes of the old server.js and the mobile routes `/api/m/*` (docs/ANDROID-APP-API.md): projects, chats,
+// tasks, devices, push registration and the three writes (need answer, task add / done / remove) change; the command center
+// has no mobile twin and keeps its route. The parsers read both shapes. Call it after `ja_ping` answered 200.
+fn ja_set_mobile(a: *mut Api, on: bool) {
+    paths_defaults(a)
+    (*a).mobile = on
+    if on {
+        set(&(*a).paths.projects, "/api/m/projects")
+        set(&(*a).paths.convs, "/api/m/chats")
+        set(&(*a).paths.tasks, "/api/m/tasks")
+        set(&(*a).paths.devices, "/api/m/devices")
+        set(&(*a).paths.push, "/api/m/push/register")
+    }
+}
+
+fn ja_is_mobile(a: *mut Api) -> bool { return (*a).mobile }
+
 fn ja_new(l: *mut loop.Loop, cb: fn(*mut Api, u64, u32, i64), ud: u64) -> *mut Api {
     let p: u64 = obj_alloc[Api]()
     if p == 0 {
@@ -253,7 +275,7 @@ fn ja_new(l: *mut loop.Loop, cb: fn(*mut Api, u64, u32, i64), ud: u64) -> *mut A
             convs: rt.buf_new(), tasks: rt.buf_new(), devices: rt.buf_new(), push: rt.buf_new(),
             stt: rt.buf_new(), upload: rt.buf_new() },
         cache: 0 as *mut jarvis_cache.Cache, body: rt.buf_new(), key: rt.buf_new(), url: rt.buf_new(),
-        req: rt.buf_new(), age: -1, status: 0, timeout_ms: TIMEOUT_MS }
+        req: rt.buf_new(), age: -1, status: 0, timeout_ms: TIMEOUT_MS, mobile: false }
     if !ahttp.aclient_init(&(*a).ah, l) {
         obj_free[Api](p)
         return 0 as *mut Api
@@ -525,7 +547,9 @@ fn ja_get(a: *mut Api, kind: u32, which: u32, id: str, suffix: str) -> bool {
 fn ja_post_json(a: *mut Api, kind: u32, which: u32, id: str, suffix: str, p: u64, n: usize) -> bool {
     make_url(a, which, id, suffix)
     // the answers of project / task writes carry the fresh object: keep them as the newest cached copy
-    let keep: bool = kind == AK_PROJECT_SET || kind == AK_ROADMAP || kind == AK_NEED || kind == AK_TASK_OP
+    var keep: bool = kind == AK_PROJECT_SET || kind == AK_ROADMAP || kind == AK_NEED || kind == AK_TASK_OP
+    // mobile writes answer {"ok":true}, not the fresh object: never replace a cached list with that
+    if (*a).mobile && (kind == AK_NEED || kind == AK_TASK_OP) { keep = false }
     return start(a, kind, true, keep, 0, id, p, n, "application/json")
 }
 
@@ -596,6 +620,14 @@ fn ja_need_answer(a: *mut Api, id: str, need_id: str, answer: str) -> bool {
     rt.buf_clear(&(*a).req)
     var w: json.JsonWriter = json.jw_new(&(*a).req, false)
     json.jw_begin_object(&w)
+    if (*a).mobile {
+        jstr(&w, "project", id)
+        jstr(&w, "id", need_id)
+        jstr(&w, "answer", answer)
+        json.jw_end(&w)
+        json.jw_free(&w)
+        return post_abs(a, AK_NEED, "/api/m/needs/answer", id, (*a).req.ptr, (*a).req.len)
+    }
     jstr(&w, "action", "answer")
     jstr(&w, "id", need_id)
     jstr(&w, "answer", answer)
@@ -621,7 +653,10 @@ fn ja_convs(a: *mut Api, limit: u32, offset: u32) -> bool {
 // One chat (a worker chat too); turns 0 = all messages, else the last `turns` turns.
 fn ja_conv(a: *mut Api, cid: str, turns: u32) -> bool {
     var sfx: rt.Buf = rt.buf_new()
-    if turns > 0 {
+    if turns > 0 && (*a).mobile {
+        put(&sfx, "?limit=")
+        rt.buf_push_dec_i64(&sfx, turns as i64)
+    } else if turns > 0 {
         put(&sfx, "?turns=")
         rt.buf_push_dec_i64(&sfx, turns as i64)
     }
@@ -634,6 +669,23 @@ fn task_op(a: *mut Api, action: str, ref_text: str, due: str, category: str, rep
     rt.buf_clear(&(*a).req)
     var w: json.JsonWriter = json.jw_new(&(*a).req, false)
     json.jw_begin_object(&w)
+    if (*a).mobile {
+        // POST /api/m/tasks {text,due,category,repeat} | /api/m/tasks/done {id} | /api/m/tasks/remove {id}
+        if action == "add" {
+            jstr(&w, "text", ref_text)
+            if due.n > 0 { jstr(&w, "due", due) }
+            if category.n > 0 { jstr(&w, "category", category) }
+            if repeat.n > 0 { jstr(&w, "repeat", repeat) }
+        } else {
+            jstr(&w, "id", ref_text)
+        }
+        json.jw_end(&w)
+        json.jw_free(&w)
+        var sfx: str = ""
+        if action == "complete" { sfx = "/done" }
+        if action == "remove" { sfx = "/remove" }
+        return ja_post_json(a, AK_TASK_OP, JP_TASKS, "", sfx, (*a).req.ptr, (*a).req.len)
+    }
     jstr(&w, "action", action)
     if action == "add" {
         jstr(&w, "text", ref_text)
@@ -666,6 +718,39 @@ fn ja_push_token(a: *mut Api, token: str, platform: str) -> bool {
     json.jw_end(&w)
     json.jw_free(&w)
     return ja_post_json(a, AK_PUSH, JP_PUSH, "", "", (*a).req.ptr, (*a).req.len)
+}
+
+// POST a JSON object to an absolute server path (not in the path table).
+fn post_abs(a: *mut Api, kind: u32, path: str, key: str, p: u64, n: usize) -> bool {
+    rt.buf_clear(&(*a).url)
+    rt.buf_push_bytes(&(*a).url, (*a).base.ptr, (*a).base.len)
+    put(&(*a).url, path)
+    return start(a, kind, true, false, 0, key, p, n, "application/json")
+}
+
+// Does the server have the mobile routes? GET /api/m/ping needs no login: 200 yes, 404 an older server -> AK_PING.
+fn ja_ping(a: *mut Api) -> bool {
+    rt.buf_clear(&(*a).url)
+    rt.buf_push_bytes(&(*a).url, (*a).base.ptr, (*a).base.len)
+    put(&(*a).url, "/api/m/ping")
+    return start(a, AK_PING, false, false, 0, "", 0, 0, "")
+}
+
+// Register this phone for push: the answer (parse_push_register) has the token for the relay hello line (-> AK_PUSH_REG).
+fn ja_push_register(a: *mut Api, device: str, platform: str) -> bool {
+    rt.buf_clear(&(*a).req)
+    var w: json.JsonWriter = json.jw_new(&(*a).req, false)
+    json.jw_begin_object(&w)
+    jstr(&w, "device", device)
+    jstr(&w, "platform", platform)
+    json.jw_end(&w)
+    json.jw_free(&w)
+    return post_abs(a, AK_PUSH_REG, "/api/m/push/register", "", (*a).req.ptr, (*a).req.len)
+}
+
+// A test push to this account (-> AK_PUSH_TEST, body {"ok":true,"sent":N}).
+fn ja_push_test(a: *mut Api) -> bool {
+    return post_abs(a, AK_PUSH_TEST, "/api/m/push/test", "", 0, 0)
 }
 
 // Speech to text: the raw audio octets with their content type (-> AK_STT, body {"text":..}).
@@ -1169,7 +1254,8 @@ fn parse_convs(p: u64, n: usize, out: *mut Convs) -> bool {
     let o: u32 = json.json_root(d)
     (*out).unchanged = gb(d, o, "unchanged")
     (*out).total = gi(d, o, "total")
-    let arr: u32 = gc (d, o, "conversations", json.JSON_ARRAY)
+    var arr: u32 = gc (d, o, "conversations", json.JSON_ARRAY)
+    if arr == json.JSON_NONE { arr = gc (d, o, "chats", json.JSON_ARRAY) } // /api/m/chats
     if arr == json.JSON_NONE { return (*out).unchanged }
     var e: u32 = json.json_child(d, arr)
     while e != json.JSON_NONE {
@@ -1217,10 +1303,21 @@ fn parse_conv(p: u64, n: usize, out: *mut Conv) -> bool {
     (*out).running = gb(d, o, "running")
     (*out).partial = gs(d, o, "partial")
     let cv: u32 = gc (d, o, "conversation", json.JSON_OBJECT)
-    if cv == json.JSON_NONE { return false }
-    (*out).id = gs(d, cv, "id")
-    (*out).title = gs(d, cv, "title")
-    let ms: u32 = gc (d, cv, "messages", json.JSON_ARRAY)
+    var ms: u32 = json.JSON_NONE
+    if cv != json.JSON_NONE {
+        (*out).id = gs(d, cv, "id")
+        (*out).title = gs(d, cv, "title")
+        ms = gc (d, cv, "messages", json.JSON_ARRAY)
+    } else {
+        // /api/m/chats/<cid>: {"chat":{id,title,running,partial},"messages":[...]}
+        let ch: u32 = gc (d, o, "chat", json.JSON_OBJECT)
+        if ch == json.JSON_NONE { return false }
+        (*out).id = gs(d, ch, "id")
+        (*out).title = gs(d, ch, "title")
+        (*out).running = gb(d, ch, "running")
+        (*out).partial = gs(d, ch, "partial")
+        ms = gc (d, o, "messages", json.JSON_ARRAY)
+    }
     if ms == json.JSON_NONE { return false }
     var e: u32 = json.json_child(d, ms)
     while e != json.JSON_NONE {
@@ -1288,6 +1385,11 @@ fn parse_devices(p: u64, n: usize, out: *mut Devices) -> bool {
     while e != json.JSON_NONE {
         if json.json_kind(d, e) == json.JSON_STRING {
             let ok: bool = vec_push[str](&(*out).names, view(json.json_string(d, e)))
+        } else if json.json_kind(d, e) == json.JSON_OBJECT {
+            // /api/m/devices: [{name,type,online}]
+            let nm: str = gs(d, e, "name")
+            let ok1: bool = vec_push[str](&(*out).names, nm)
+            let ok2: bool = vec_push[DeviceRow](&(*out).rows, DeviceRow { name: nm, kind: gs(d, e, "type"), online: gb(d, e, "online") })
         }
         e = json.json_next(d, e)
     }
@@ -1310,11 +1412,12 @@ struct Uploaded {
     name: str,
     mime: str,
     url: str, // the path to give ja_download / to put in a chat message
+    path: str, // the file's path ON THE SERVER: name it in the next chat message so the model can read it
     size: i64,
 }
 
 fn uploaded_new() -> Uploaded {
-    return Uploaded { d: json.json_new(), name: "", mime: "", url: "", size: 0 }
+    return Uploaded { d: json.json_new(), name: "", mime: "", url: "", path: "", size: 0 }
 }
 
 fn uploaded_free(u: *mut Uploaded) { json.json_free(&(*u).d) }
@@ -1328,6 +1431,38 @@ fn parse_upload(p: u64, n: usize, out: *mut Uploaded) -> bool {
     (*out).name = gs(d, f, "name")
     (*out).mime = gs(d, f, "mime")
     (*out).url = gs(d, f, "url")
+    (*out).path = gs(d, f, "path")
     (*out).size = gi(d, f, "size")
     return (*out).url.n > 0
+}
+
+// ------------------------------------------------------------------ push registration
+
+struct PushReg {
+    d: json.Json,
+    token: str, // the secret for the relay hello line: "HELLO <token> 1"
+    host: str,
+    port: i64,
+    tls: bool,
+    hello: bool,
+}
+
+fn pushreg_new() -> PushReg {
+    return PushReg { d: json.json_new(), token: "", host: "", port: 0, tls: false, hello: false }
+}
+
+fn pushreg_free(r: *mut PushReg) { json.json_free(&(*r).d) }
+
+// {"pushToken":"..","relay":{"host","port","tls","hello"},"poll":".."} -- the answer of AK_PUSH_REG.
+fn parse_push_register(p: u64, n: usize, out: *mut PushReg) -> bool {
+    if !open_doc(&(*out).d, p, n) { return false }
+    let d: *mut json.Json = &(*out).d
+    let o: u32 = json.json_root(d)
+    (*out).token = gs(d, o, "pushToken")
+    let rl: u32 = gc (d, o, "relay", json.JSON_OBJECT)
+    (*out).host = gs(d, rl, "host")
+    (*out).port = gi(d, rl, "port")
+    (*out).tls = gb(d, rl, "tls")
+    (*out).hello = gb(d, rl, "hello")
+    return (*out).token.n > 0
 }

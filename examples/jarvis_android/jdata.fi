@@ -24,15 +24,18 @@ import jshell
 
 export {
     Ref, NeedRec, api, ensure, refresh_projects, refresh_center, refresh_tasks, refresh_devices, load_chat,
+    refresh_convs, convs, has_convs, ver_convs,
     answer_need, task_add, task_complete, task_remove, forget_all,
     ver_projects, ver_needs, ver_center, ver_tasks, ver_devices, ver_conv, ver_stand,
     projects, has_projects, center, has_center, tasks, has_tasks, devices, has_devices, conv, has_conv, conv_cid,
     needs_count, need_at, need_str, need_option, cycle_running,
-    stand_text, status_note, set_note,
-    K_PROJECTS, K_CENTER, K_TASKS, K_DEVICES, K_CONV, K_NEED, K_COUNT,
+    stand_text, status_note, set_note, is_mobile, mobile_state,
+    K_PROJECTS, K_CENTER, K_TASKS, K_DEVICES, K_CONV, K_NEED, K_CONVS, K_COUNT,
 }
 
 const REFRESH_MS: i64 = 15000
+const PROBE_RETRY_MS: i64 = 300000 // an older server is asked again after 5 min (it may have been restarted since)
+const PROBE_LOST_MS: i64 = 5000 // no connection: ask again soon
 const NEED_OPTS: usize = 4
 // the stand slots (not the AK_* numbers, which go to 17)
 const K_PROJECTS: usize = 0
@@ -41,7 +44,8 @@ const K_TASKS: usize = 2
 const K_DEVICES: usize = 3
 const K_CONV: usize = 4
 const K_NEED: usize = 5
-const K_COUNT: usize = 6
+const K_CONVS: usize = 6
+const K_COUNT: usize = 7
 
 // a piece of a pool buffer (offset + length): safe against the pool growing
 struct Ref {
@@ -68,6 +72,10 @@ struct NeedSet {
 }
 
 static mut G_API: u64 = 0
+// mobile routes: 0 = not asked / no answer yet, 1 = /api/m/* is live, 2 = the server answered 404 (older server.js)
+static mut G_MOBILE: i64 = 0
+static mut G_PROBE_AT: i64 = 0
+static mut G_PROBING: bool = false
 static mut G_CACHE: u64 = 0
 static mut G_PROJ: u64 = 0
 static mut G_CENTER: u64 = 0
@@ -91,9 +99,12 @@ static mut G_V_TASKS: u64 = 0
 static mut G_V_DEV: u64 = 0
 static mut G_V_CONV: u64 = 0
 static mut G_V_STAND: u64 = 0
-static mut G_LAST: [i64; 6] = [0; 6]
-static mut G_STATUS: [i64; 6] = [0; 6]
-static mut G_AGE: [i64; 6] = [0; 6]
+static mut G_LAST: [i64; 7] = [0; 7]
+static mut G_STATUS: [i64; 7] = [0; 7]
+static mut G_AGE: [i64; 7] = [0; 7]
+static mut G_CONVS: u64 = 0
+static mut G_HAS_CONVS: bool = false
+static mut G_V_CONVS: u64 = 0
 static mut G_NOTE: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_CID: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_STAND_BUF: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
@@ -104,6 +115,9 @@ fn ver_center() -> u64 { return G_V_CENTER }
 fn ver_tasks() -> u64 { return G_V_TASKS }
 fn ver_devices() -> u64 { return G_V_DEV }
 fn ver_conv() -> u64 { return G_V_CONV }
+fn ver_convs() -> u64 { return G_V_CONVS }
+fn convs() -> *mut jarvisapi.Convs { return G_CONVS as *mut jarvisapi.Convs }
+fn has_convs() -> bool { return G_HAS_CONVS }
 fn ver_stand() -> u64 { return G_V_STAND }
 
 fn projects() -> *mut jarvisapi.Projects { return G_PROJ as *mut jarvisapi.Projects }
@@ -188,7 +202,9 @@ fn on_api(a: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
     let n: usize = jarvisapi.ja_body_len(a)
     let age: i64 = jarvisapi.ja_age_s(a)
     let good: bool = status == 200 || status == 203
-    if kind == jarvisapi.AK_PROJECTS {
+    if kind == jarvisapi.AK_PING {
+        take_ping(a, status)
+    } else if kind == jarvisapi.AK_PROJECTS {
         stand_note(K_PROJECTS, status, age)
         if good { take_projects(p, n) } else { end_cycle(false) }
     } else if kind == jarvisapi.AK_PROJECT {
@@ -212,7 +228,8 @@ fn on_api(a: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
     } else if kind == jarvisapi.AK_TASK_OP {
         stand_note(K_TASKS, status, age)
         if status == 200 {
-            take_tasks(p, n)
+            // the old route answers the new list; the mobile route answers {"ok":true} / {"task":..}: ask again
+            if jarvisapi.ja_is_mobile(a) { refresh_tasks(true) } else { take_tasks(p, n) }
             set_note("task saved")
         } else {
             set_note("task action failed (" + jshell.dec(status) + ")")
@@ -220,6 +237,9 @@ fn on_api(a: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
     } else if kind == jarvisapi.AK_DEVICES {
         stand_note(K_DEVICES, status, age)
         if good { take_devices(p, n) }
+    } else if kind == jarvisapi.AK_CONVS {
+        stand_note(K_CONVS, status, age)
+        if good { take_convs(p, n) }
     } else if kind == jarvisapi.AK_CONV {
         stand_note(K_CONV, status, age)
         if good { take_conv(p, n) }
@@ -233,6 +253,7 @@ fn ensure_init() {
     G_TASKS = rt.heap_alloc(256)
     G_DEV = rt.heap_alloc(256)
     G_CONV = rt.heap_alloc(256)
+    G_CONVS = rt.heap_alloc(256)
     G_SET_CUR = alloc_set()
     G_SET_NEW = alloc_set()
     G_QUEUE = alloc_set()
@@ -256,7 +277,44 @@ fn api() -> *mut jarvisapi.Api {
 fn ensure() -> *mut jarvisapi.Api {
     let a: *mut jarvisapi.Api = api()
     jarvisapi.ja_use_jc(a, jshell.jc())
+    probe(a)
     return a
+}
+
+// Ask once whether the server has /api/m/* (GET /api/m/ping); until it says yes the old routes are used, so an older
+// server keeps working and a restarted one switches over by itself (asked again every PROBE_RETRY_MS).
+fn probe(a: *mut jarvisapi.Api) {
+    if G_MOBILE == 1 || G_PROBING { return }
+    let now: i64 = time.now_unix_ms()
+    if G_PROBE_AT != 0 && now < G_PROBE_AT { return }
+    G_PROBING = true
+    if !jarvisapi.ja_ping(a) {
+        G_PROBING = false
+        G_PROBE_AT = now + PROBE_LOST_MS
+    }
+}
+
+fn is_mobile() -> bool { return G_MOBILE == 1 }
+fn mobile_state() -> i64 { return G_MOBILE }
+
+fn take_ping(a: *mut jarvisapi.Api, status: i64) {
+    G_PROBING = false
+    let now: i64 = time.now_unix_ms()
+    if status == 200 {
+        jarvisapi.ja_set_mobile(a, true)
+        G_MOBILE = 1
+        // everything is asked again over the new routes
+        var i: usize = 0
+        while i < K_COUNT {
+            G_LAST[i] = 0
+            i = i + 1
+        }
+    } else if status == 0 {
+        G_PROBE_AT = now + PROBE_LOST_MS
+    } else {
+        G_MOBILE = 2
+        G_PROBE_AT = now + PROBE_RETRY_MS
+    }
 }
 
 // sign-out: the next user must not see this user's answers
@@ -271,6 +329,8 @@ fn forget_all() {
     G_HAS_TASKS = false
     G_HAS_DEV = false
     G_HAS_CONV = false
+    G_HAS_CONVS = false
+    G_V_CONVS = G_V_CONVS + 1 as u64
     G_V_PROJ = G_V_PROJ + 1 as u64
     G_V_CENTER = G_V_CENTER + 1 as u64
     G_V_TASKS = G_V_TASKS + 1 as u64
@@ -408,6 +468,18 @@ fn take_devices(p: u64, n: usize) {
     G_V_DEV = G_V_DEV + 1 as u64
 }
 
+fn take_convs(p: u64, n: usize) {
+    var t: jarvisapi.Convs = jarvisapi.convs_new()
+    if !jarvisapi.parse_convs(p, n, &t) {
+        jarvisapi.convs_free(&t)
+        return
+    }
+    if G_HAS_CONVS { jarvisapi.convs_free(convs()) }
+    *convs() = t
+    G_HAS_CONVS = true
+    G_V_CONVS = G_V_CONVS + 1 as u64
+}
+
 fn take_conv(p: u64, n: usize) {
     var t: jarvisapi.Conv = jarvisapi.conv_new()
     if !jarvisapi.parse_conv(p, n, &t) {
@@ -442,6 +514,12 @@ fn refresh_center(force: bool) {
 fn refresh_tasks(force: bool) {
     if !due(K_TASKS, force) { return }
     let ok: bool = jarvisapi.ja_tasks(ensure())
+}
+
+// the chat list for the chat tab's drawer (newest 40)
+fn refresh_convs(force: bool) {
+    if !due(K_CONVS, force) { return }
+    let ok: bool = jarvisapi.ja_convs(ensure(), 40, 0)
 }
 
 fn refresh_devices(force: bool) {
