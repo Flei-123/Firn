@@ -1,0 +1,395 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/splitter.fi -- SPLITTER: a draggable divider between two panes (r240).
+//
+// Pure state + geometry, no scene dependency, so an app, the scene tree or a dock can drive it.
+// The RATIO (permille of the space left after the bar) is the truth: a window resize keeps the
+// proportion, a drag or key press sets a new ratio, the minimum sizes always win.
+//
+//     var s: splitter.Splitter = splitter.splitter_new(false, 300)   // side by side, 30 % left
+//     splitter.set_limits(&s, 80, 120)                               // min first / second pane (px)
+//     splitter.layout(&s, x, y, w, h)
+//     splitter.pane_a(&s, &r)  splitter.bar(&s, &r)  splitter.pane_b(&s, &r)   // r: [i64; 4] = x y w h
+//     splitter.down(&s, px, py) / move(&s, px, py) / up(&s) / cancel(&s)       // pointer
+//     splitter.key(&s, key, mods)                                              // keyboard
+//     splitter.draw(z, &s, theme_colours...)                                   // bar + grip
+//
+// KEYBOARD (when the splitter is focused): the two arrows that run ALONG the divider's normal
+// (Left/Right for side by side, Up/Down for stacked) move it by STEP px (Shift = 10x, Ctrl = 1 px);
+// Home / End jump to the minimum / maximum; Enter restores the start ratio; Esc during a drag
+// puts it back where the drag began. RTL: side by side panes are mirrored (first pane on the right)
+// and Left/Right swap their meaning, so the arrow always moves the bar toward where it points.
+// A11Y: role "separator", value now / min / max in permille (`value_now`, `value_min`, `value_max`),
+// orientation of the divider LINE is the opposite of the layout (`aria_horizontal`).
+import fui.editor
+import fui.painter
+
+export {
+    Splitter, splitter_new, set_limits, set_bar, set_rtl, set_step, set_ratio, ratio,
+    layout, pane_a, pane_b, bar, hit, down, move, up, cancel, key,
+    dragging, hovered, set_focus, cursor, value_now, value_min, value_max, aria_horizontal,
+    draw, CURSOR_DEFAULT, CURSOR_EW, CURSOR_NS,
+}
+
+const CURSOR_DEFAULT: u32 = 0
+const CURSOR_EW: u32 = 1 // resize left-right
+const CURSOR_NS: u32 = 2 // resize up-down
+
+struct Splitter {
+    vertical: u32,  // 0 = panes side by side, 1 = stacked
+    rtl: u32,
+    pm: i64,        // ratio, permille of (length - bar), 0..1000
+    pm0: i64,       // the start ratio (Enter restores it)
+    min_a: i64,
+    min_b: i64,
+    bar_px: i64,
+    grab: i64,      // extra hit margin on both sides of the bar
+    step: i64,
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+    pos: i64,       // first pane size after clamping
+    drag: u32,
+    off: i64,       // pointer offset inside the bar when the drag began
+    pm_drag0: i64,  // ratio at drag start (Esc)
+    hover: u32,
+    focus: u32,
+}
+
+fn splitter_new(vertical: bool, ratio_pm: i64) -> Splitter {
+    var v: u32 = 0 as u32
+    if vertical {
+        v = 1 as u32
+    }
+    var p: i64 = ratio_pm
+    if p < 0 {
+        p = 0
+    }
+    if p > 1000 {
+        p = 1000
+    }
+    return Splitter { vertical: v, rtl: 0 as u32, pm: p, pm0: p, min_a: 40, min_b: 40, bar_px: 6, grab: 3,
+        step: 16, x: 0, y: 0, w: 0, h: 0, pos: 0, drag: 0 as u32, off: 0, pm_drag0: p,
+        hover: 0 as u32, focus: 0 as u32 }
+}
+
+fn set_limits(s: *mut Splitter, min_a: i64, min_b: i64) {
+    (*s).min_a = max_i(0, min_a)
+    (*s).min_b = max_i(0, min_b)
+    relayout(s)
+}
+
+fn set_bar(s: *mut Splitter, bar_px: i64, grab: i64) {
+    (*s).bar_px = max_i(1, bar_px)
+    (*s).grab = max_i(0, grab)
+    relayout(s)
+}
+
+fn set_rtl(s: *mut Splitter, rtl: bool) {
+    if rtl {
+        (*s).rtl = 1 as u32
+    } else {
+        (*s).rtl = 0 as u32
+    }
+}
+
+fn set_step(s: *mut Splitter, px: i64) { (*s).step = max_i(1, px) }
+fn set_focus(s: *mut Splitter, on: bool) {
+    if on {
+        (*s).focus = 1 as u32
+    } else {
+        (*s).focus = 0 as u32
+    }
+}
+
+fn max_i(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn clamp_i(v: i64, lo: i64, hi: i64) -> i64 {
+    if hi < lo {
+        return lo
+    }
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn along(s: *mut Splitter) -> i64 {
+    if (*s).vertical != 0 as u32 {
+        return (*s).h
+    }
+    return (*s).w
+}
+
+// space the two panes share
+fn avail(s: *mut Splitter) -> i64 {
+    return max_i(0, along(s) - (*s).bar_px)
+}
+
+// smallest / largest first-pane size; when the minimums do not fit, the room is split in their proportion
+fn lo_px(s: *mut Splitter) -> i64 {
+    let a: i64 = avail(s)
+    if (*s).min_a + (*s).min_b > a {
+        if (*s).min_a + (*s).min_b == 0 {
+            return 0
+        }
+        return a * (*s).min_a / ((*s).min_a + (*s).min_b)
+    }
+    return (*s).min_a
+}
+
+fn hi_px(s: *mut Splitter) -> i64 {
+    let a: i64 = avail(s)
+    if (*s).min_a + (*s).min_b > a {
+        return lo_px(s)
+    }
+    return a - (*s).min_b
+}
+
+fn relayout(s: *mut Splitter) {
+    let a: i64 = avail(s)
+    (*s).pos = clamp_i(a * (*s).pm / 1000, lo_px(s), hi_px(s))
+}
+
+fn set_pos_px(s: *mut Splitter, px: i64) {
+    let a: i64 = avail(s)
+    let p: i64 = clamp_i(px, lo_px(s), hi_px(s))
+    (*s).pos = p
+    if a > 0 {
+        (*s).pm = (p * 1000 + a / 2) / a
+    }
+}
+
+fn set_ratio(s: *mut Splitter, pm: i64) {
+    (*s).pm = clamp_i(pm, 0, 1000)
+    relayout(s)
+}
+
+fn ratio(s: *mut Splitter) -> i64 { return (*s).pm }
+
+fn layout(s: *mut Splitter, x: i64, y: i64, w: i64, h: i64) {
+    (*s).x = x
+    (*s).y = y
+    (*s).w = max_i(0, w)
+    (*s).h = max_i(0, h)
+    relayout(s)
+}
+
+fn mirrored(s: *mut Splitter) -> bool {
+    return (*s).rtl != 0 as u32 && (*s).vertical == 0 as u32
+}
+
+// first pane = a, second = b; out = x y w h
+fn pane_a(s: *mut Splitter, out: *mut [i64; 4]) {
+    if (*s).vertical != 0 as u32 {
+        *out = [(*s).x, (*s).y, (*s).w, (*s).pos]
+    } else if mirrored(s) {
+        *out = [(*s).x + (*s).w - (*s).pos, (*s).y, (*s).pos, (*s).h]
+    } else {
+        *out = [(*s).x, (*s).y, (*s).pos, (*s).h]
+    }
+}
+
+fn bar(s: *mut Splitter, out: *mut [i64; 4]) {
+    if (*s).vertical != 0 as u32 {
+        *out = [(*s).x, (*s).y + (*s).pos, (*s).w, (*s).bar_px]
+    } else if mirrored(s) {
+        *out = [(*s).x + (*s).w - (*s).pos - (*s).bar_px, (*s).y, (*s).bar_px, (*s).h]
+    } else {
+        *out = [(*s).x + (*s).pos, (*s).y, (*s).bar_px, (*s).h]
+    }
+}
+
+fn pane_b(s: *mut Splitter, out: *mut [i64; 4]) {
+    let rest: i64 = along(s) - (*s).pos - (*s).bar_px
+    if (*s).vertical != 0 as u32 {
+        *out = [(*s).x, (*s).y + (*s).pos + (*s).bar_px, (*s).w, rest]
+    } else if mirrored(s) {
+        *out = [(*s).x, (*s).y, rest, (*s).h]
+    } else {
+        *out = [(*s).x + (*s).pos + (*s).bar_px, (*s).y, rest, (*s).h]
+    }
+}
+
+// is (px,py) on the bar or within the grab margin?
+fn hit(s: *mut Splitter, px: i64, py: i64) -> bool {
+    var r: [i64; 4] = [0, 0, 0, 0]
+    bar(s, &r)
+    var g: i64 = (*s).grab
+    if (*s).vertical != 0 as u32 {
+        return px >= r[0] && px < r[0] + r[2] && py >= r[1] - g && py < r[1] + r[3] + g
+    }
+    return px >= r[0] - g && px < r[0] + r[2] + g && py >= r[1] && py < r[1] + r[3]
+}
+
+// the coordinate of the pointer that matters for the divider, from the first pane's own edge
+fn dist_from_first_edge(s: *mut Splitter, px: i64, py: i64) -> i64 {
+    if (*s).vertical != 0 as u32 {
+        return py - (*s).y
+    }
+    if mirrored(s) {
+        return ((*s).x + (*s).w) - px
+    }
+    return px - (*s).x
+}
+
+fn down(s: *mut Splitter, px: i64, py: i64) -> bool {
+    if !hit(s, px, py) {
+        return false
+    }
+    (*s).drag = 1 as u32
+    (*s).pm_drag0 = (*s).pm
+    // offset of the grab inside the bar: where along the bar did the pointer take it?
+    (*s).off = dist_from_first_edge(s, px, py) - (*s).pos
+    return true
+}
+
+// pointer motion: returns true if the divider moved (while dragging); also tracks hover
+fn move(s: *mut Splitter, px: i64, py: i64) -> bool {
+    if (*s).drag == 0 as u32 {
+        (*s).hover = 0 as u32
+        if hit(s, px, py) {
+            (*s).hover = 1 as u32
+        }
+        return false
+    }
+    let before: i64 = (*s).pos
+    set_pos_px(s, dist_from_first_edge(s, px, py) - (*s).off)
+    return (*s).pos != before
+}
+
+fn up(s: *mut Splitter) {
+    (*s).drag = 0 as u32
+}
+
+// abort a drag: the divider goes back to where the drag began
+fn cancel(s: *mut Splitter) {
+    if (*s).drag != 0 as u32 {
+        (*s).pm = (*s).pm_drag0
+        (*s).drag = 0 as u32
+        relayout(s)
+    }
+}
+
+fn dragging(s: *mut Splitter) -> bool { return (*s).drag != 0 as u32 }
+fn hovered(s: *mut Splitter) -> bool { return (*s).hover != 0 as u32 }
+
+fn cursor(s: *mut Splitter) -> u32 {
+    if (*s).hover == 0 as u32 && (*s).drag == 0 as u32 {
+        return CURSOR_DEFAULT
+    }
+    if (*s).vertical != 0 as u32 {
+        return CURSOR_NS
+    }
+    return CURSOR_EW
+}
+
+// Keyboard. Returns true if the key was used. `+1` moves the first pane larger.
+fn key(s: *mut Splitter, k: u32, mods: u32) -> bool {
+    if (*s).drag != 0 as u32 {
+        if k == editor.KEY_ESC {
+            cancel(s)
+            return true
+        }
+        return false
+    }
+    if k == editor.KEY_HOME {
+        set_pos_px(s, lo_px(s))
+        return true
+    }
+    if k == editor.KEY_END {
+        set_pos_px(s, hi_px(s))
+        return true
+    }
+    if k == editor.KEY_ENTER {
+        set_ratio(s, (*s).pm0)
+        return true
+    }
+    var dir: i64 = 0
+    if (*s).vertical != 0 as u32 {
+        if k == editor.KEY_UP {
+            dir = 0 - 1
+        } else if k == editor.KEY_DOWN {
+            dir = 1
+        }
+    } else {
+        // visually Left moves the bar left; in a mirrored layout that makes the first pane larger
+        var l: i64 = 0 - 1
+        var r: i64 = 1
+        if mirrored(s) {
+            l = 1
+            r = 0 - 1
+        }
+        if k == editor.KEY_LEFT {
+            dir = l
+        } else if k == editor.KEY_RIGHT {
+            dir = r
+        }
+    }
+    if dir == 0 {
+        return false
+    }
+    var st: i64 = (*s).step
+    if mods & editor.MOD_SHIFT != 0 as u32 {
+        st = st * 10
+    }
+    if mods & editor.MOD_CTRL != 0 as u32 {
+        st = 1
+    }
+    set_pos_px(s, (*s).pos + dir * st)
+    return true
+}
+
+// ---- accessibility values (role separator): permille now / min / max
+fn value_now(s: *mut Splitter) -> i64 { return (*s).pm }
+
+fn value_min(s: *mut Splitter) -> i64 {
+    let a: i64 = avail(s)
+    if a <= 0 {
+        return 0
+    }
+    return lo_px(s) * 1000 / a
+}
+
+fn value_max(s: *mut Splitter) -> i64 {
+    let a: i64 = avail(s)
+    if a <= 0 {
+        return 1000
+    }
+    return hi_px(s) * 1000 / a
+}
+
+// The line of the divider runs horizontally when the panes are stacked (ARIA orientation of a separator)
+fn aria_horizontal(s: *mut Splitter) -> bool { return (*s).vertical != 0 as u32 }
+
+// Paints the bar (hover/drag/focus tint) and a short grip of three dots in the middle.
+fn draw(z: *mut painter.Painter, s: *mut Splitter, col: u32, col_hover: u32, col_active: u32, col_grip: u32) {
+    var r: [i64; 4] = [0, 0, 0, 0]
+    bar(s, &r)
+    var c: u32 = col
+    if (*s).drag != 0 as u32 {
+        c = col_active
+    } else if (*s).hover != 0 as u32 || (*s).focus != 0 as u32 {
+        c = col_hover
+    }
+    painter.surface(z, r[0] as f64, r[1] as f64, r[2] as f64, r[3] as f64, c)
+    let cx: f64 = (r[0] as f64) + (r[2] as f64) / 2.0
+    let cy: f64 = (r[1] as f64) + (r[3] as f64) / 2.0
+    var i: i64 = 0 - 1
+    while i <= 1 {
+        if (*s).vertical != 0 as u32 {
+            painter.round_rect(z, cx + (i * 8) as f64 - 1.0, cy - 1.0, 2.0, 2.0, 1.0, col_grip)
+        } else {
+            painter.round_rect(z, cx - 1.0, cy + (i * 8) as f64 - 1.0, 2.0, 2.0, 1.0, col_grip)
+        }
+        i = i + 1
+    }
+}
