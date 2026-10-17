@@ -146,15 +146,15 @@ base = im.getpixel((600, 600))
 dark = base[0] < 128
 print("  (the window is %s)" % ("dark" if dark else "light"))
 if dark:
-    BASE, SURF, RAISED, ACCENT = rgb(0x1C1B22), rgb(0x2B2A33), rgb(0x37373F), rgb(0x1BD96A)
+    BASE, SURF, RAISED, ACCENT = rgb(0x202020), rgb(0x282828), rgb(0x303030), rgb(0x1BD96A)  # Fluent dark (theme.colors_dark)
 else:
-    BASE, SURF, RAISED, ACCENT = rgb(0xF4F4F6), rgb(0xF9F9FB), rgb(0xFFFFFF), rgb(0x1BD96A)
+    BASE, SURF, RAISED, ACCENT = rgb(0xF3F3F3), rgb(0xF9F9F9), rgb(0xFFFFFF), rgb(0x1BD96A)  # Fluent light
 chk("the sidebar has the surface colour", near(im.getpixel((100, 600)), SURF), im.getpixel((100, 600)), SURF)
 chk("the page has the base colour", near(im.getpixel((600, 600)), BASE), im.getpixel((600, 600)), BASE)
 chk("the primary button (Play) is the launcher accent", count(im, (278, 86, 360, 116), ACCENT) > 1500)
 chk("the active nav item has the accent mark on the left edge", count(im, (0, 50, 6, 80), ACCENT, 40) > 40)
 pr = im.getpixel((400, 341))
-chk("the failed progress bar (64 %) is filled in the error colour (red)", pr[0] > 180 and pr[1] < 140 and pr[2] < 140, pr, "reddish")
+chk("the failed progress bar (64 %) is filled in the error colour (red)", pr[0] > 180 and pr[0] - pr[1] > 60 and pr[0] - pr[2] > 60, pr, "reddish")
 pt = im.getpixel((900, 341))
 chk("and its track is the button colour right of the fill", pt != pr and abs(pt[0] - pt[1]) < 20, pt, "grey")
 
