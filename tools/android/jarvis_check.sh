@@ -61,6 +61,11 @@ read -r SW SH < <($ADB shell wm size | tr -d '\r' | sed -n 's/.*: *\([0-9]*\)x\(
 tap() { $ADB shell input tap $(( $1 * SW / 1080 )) $(( $2 * SH / 2340 )); sleep "${3:-1.5}"; }
 shot() { $ADB exec-out screencap -p >"$OUT/$1.png"; }
 ocr() { tesseract "$OUT/$1.png" stdout 2>/dev/null | tr -s '\n ' ' '; }
+# focused buttons (blue border) defeat full-page OCR: crop the region, scale x3, read one line
+ocr_crop() { python3 -I -c "import sys
+from PIL import Image
+im=Image.open(sys.argv[1]).convert('L').crop(tuple(map(int,sys.argv[2:6])))
+im.resize((im.width*3,im.height*3)).save(sys.argv[6])" "$OUT/$1.png" "$2" "$3" "$4" "$5" "$OUT/$1_crop.png" && tesseract "$OUT/$1_crop.png" stdout --psm 7 2>/dev/null | tr -s '\n ' ' '; }
 kbd() { $ADB shell dumpsys input_method | grep -c 'mInputShown=true'; }
 # a loaded host makes the first tap slow (the app builds its IME classes: seconds): wait, do not assume
 wait_kbd() { for _ in $(seq 20); do [ "$(kbd)" = 1 ] && break; sleep 1; done; kbd; }
@@ -142,7 +147,7 @@ sleep 2; tap $MIC_X $FIELD_Y 1
 for _ in $(seq 15); do grep -q '/api/stt' "$SLOG" && break; sleep 1; done
 check "recording uploaded as audio/wav to /api/stt" "$(grep -c '"path": "/api/stt?lang=de", "ctype": "audio/wav"' "$SLOG")" 1
 check "transcription lands in the input line" "$(wait_ocr 5_heard 'audio')" 1
-tap $VOICE_X $VOICE_Y 2; shot 6_voice; check "voice switch shows 'Voice on'" "$(ocr 6_voice | grep -ci 'oice on')" 1
+tap $VOICE_X $VOICE_Y 2; shot 6_voice; check "voice switch shows 'Voice on'" "$(ocr_crop 6_voice 520 330 800 450 | grep -ci 'oice on')" 1
 check "app alive after mic + voice" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
 
 check "no crash in logcat" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
