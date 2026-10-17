@@ -121,21 +121,6 @@ class Win:
         return self.x + x, self.y + y
 
 
-def biggest(ids):
-    """The largest window among the ids (a window of the run before may still be on screen)."""
-    best = None
-    for i in ids:
-        try:
-            w = Win(i)
-        except (IndexError, ValueError):
-            continue
-        if best is None or w.w * w.h > best.w * best.h:
-            best = w
-    if best is None:
-        raise IndexError("no window")
-    return best
-
-
 class Run:
     """One message box: the driver process and its window."""
 
@@ -154,12 +139,12 @@ class Run:
             if ids:
                 time.sleep(0.9)                      # let it paint (the focus, the settle frame)
                 try:
-                    w = biggest(ids)
+                    w = Win(ids[-1])
                     # a loaded machine maps the window at a first size and resizes it a moment later:
                     # take the geometry only once it has been the same for two reads
                     for _ in range(20):
                         time.sleep(0.4)
-                        w2 = biggest(xdo("search", "--onlyvisible", "--name", "^%s$" % title).split() or ids)
+                        w2 = Win(ids[-1])
                         same = (w2.w, w2.h, w2.x, w2.y) == (w.w, w.h, w.x, w.y)
                         w = w2
                         if same:
@@ -477,6 +462,22 @@ else:
 LONG = "\n".join("Line %d: the quick brown fox jumps over the lazy dog." % i for i in range(1, 61))
 r = Run(2, 0, "msgdlg-live", LONG)
 if r.win is not None:
+    # a loaded machine can hand over the first small size of the window: wait until it is the tall one
+    for _ in range(25):
+        if r.win.h >= 300:
+            break
+        time.sleep(0.4)
+        ids = xdo("search", "--onlyvisible", "--name", "^msgdlg-live$").split()
+        best = None
+        for i in ids:
+            try:
+                cand = Win(i)
+            except (IndexError, ValueError):
+                continue
+            if best is None or cand.w * cand.h > best.w * best.h:
+                best = cand
+        if best is not None:
+            r.win = best
     w = r.win
     top = r.shot()
     pic(top, "live-long-top.png")
