@@ -420,28 +420,40 @@ else:
 
 # ---------------------------------------------------------------- 4. Ctrl+C puts "title\ntext" on the clipboard
 def clipboard_text(timeout=3.0):
+    # the helper window and its X connection are closed again on every path: a test that leaves
+    # clients behind changes how the later drivers behave (their Return stayed unanswered)
     d = display.Display(DISP)
-    root = d.screen().root
-    w = root.create_window(0, 0, 1, 1, 0, d.screen().root_depth, X.InputOutput, X.CopyFromParent)
-    clip = d.intern_atom("CLIPBOARD")
-    utf8 = d.intern_atom("UTF8_STRING")
-    prop = d.intern_atom("MSGDLG_TEST_SEL")
-    w.convert_selection(clip, utf8, prop, X.CurrentTime)
-    d.flush()
-    end = time.time() + timeout
-    while time.time() < end:
-        while d.pending_events():
-            e = d.next_event()
-            if e.type == X.SelectionNotify:
-                if e.property == X.NONE:
-                    return None
-                r = w.get_full_property(prop, X.AnyPropertyType)
-                return bytes(r.value).decode("utf-8", "replace") if r is not None else None
-        time.sleep(0.05)
-    return None
+    try:
+        root = d.screen().root
+        w = root.create_window(0, 0, 1, 1, 0, d.screen().root_depth, X.InputOutput, X.CopyFromParent)
+        clip = d.intern_atom("CLIPBOARD")
+        utf8 = d.intern_atom("UTF8_STRING")
+        prop = d.intern_atom("MSGDLG_TEST_SEL")
+        w.convert_selection(clip, utf8, prop, X.CurrentTime)
+        d.flush()
+        end = time.time() + timeout
+        while time.time() < end:
+            while d.pending_events():
+                e = d.next_event()
+                if e.type == X.SelectionNotify:
+                    if e.property == X.NONE:
+                        return None
+                    r = w.get_full_property(prop, X.AnyPropertyType)
+                    return bytes(r.value).decode("utf-8", "replace") if r is not None else None
+            time.sleep(0.05)
+        return None
+    finally:
+        try:
+            w.destroy()
+            d.flush()
+        except Exception:
+            pass
+        d.close()
 
 
-r = Run(1, 3, "msgdlg-live", "Line one\nLine two")
+# the window layer's own selection (no xclip helper): a helper leaves a daemon behind that owns the clipboard
+# for the rest of the run and slowed the answers of the drivers after it
+r = Run(1, 3, "msgdlg-live", "Line one\nLine two", env=dict(ENV_LIGHT, FIRN_CLIPBOARD="native"))
 if r.win is not None:
     r.focus()
     xdo("key", "ctrl+c")
@@ -519,7 +531,10 @@ for name, text in (("empty text", ""), ("umlauts", "ÄÖÜ äöü ß € é"),
     pic(im, "live-odd-%s.png" % name.replace(" ", "-"))
     r.focus()
     xdo("key", "Return")
-    check("%s: shown and answered" % name, result_of(r) == (0, 1))
+    res = r.result()
+    check("%s: shown and answered" % name, res is not None and res[:2] == (0, 1),
+          (res, (r.win.id, r.win.x, r.win.y, r.win.w, r.win.h), xdo("search", "--onlyvisible", "--name", "^msgdlg-live$"),
+           xdo("getwindowfocus")))
 
 # ---------------------------------------------------------------- 7. the driver's other ways out
 env = dict(ENV_LIGHT)

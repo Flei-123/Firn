@@ -26,6 +26,7 @@ BASE = os.path.join(HERE, "perf_baseline.json")
 SIZES = [(1240, 720), (1920, 1080)]
 TOL = 1.20
 FLOOR = 0.03
+RUNS = 5   # best of 5: a loaded shared server wobbles scroll/resize more than 20 % in 3 runs
 
 def _busy():
     d = {}
@@ -62,7 +63,7 @@ def pin():
 
 def run(binary, w, h):
     best = {}
-    for _ in range(3):
+    for _ in range(RUNS):
         out = subprocess.run([binary, str(w), str(h), "21", "damage"],
                              capture_output=True, text=True, check=True).stdout
         for line in out.splitlines():
@@ -90,6 +91,19 @@ def main():
         ref = base["sizes"].setdefault(key, {})
         for name, v in got.items():
             b = ref.get(name)
+            # painted-pixel rules do not need a baseline (hoveranim has none)
+            if not update:
+                # hover/press must stay near the control area
+                if name in ("hover", "press") and v["painted_px"] > 20 * v["ctrl_px"]:
+                    print("  painted %d px for a %d px control: dirty rect too big" % (v["painted_px"], v["ctrl_px"]))
+                    bad += 1
+                # W6: a hover WITH its transition: every animation frame paints the two
+                # buttons (leaving + entering), never the window
+                if name == "hoveranim" and v["painted_px"] > 4 * v["ctrl_px"]:
+                    print("  hoveranim painted %d px per frame for %d px of controls: transition frames repaint too much" % (v["painted_px"], v["ctrl_px"]))
+                    bad += 1
+                if name == "idle" and v["painted_px"] != 0:
+                    print("  idle painted pixels"); bad += 1
             if update or b is None:
                 keep = (b or {}).get("before_norm")
                 ref[name] = {"norm": v["norm"], "median_us": v["median_us"],
@@ -103,17 +117,6 @@ def main():
                   (key, name, v["norm"], b["norm"], limit, v["median_us"], "ok" if ok else "REGRESSION"))
             if not ok:
                 bad += 1
-            # hover/press must stay near the control area
-            if name in ("hover", "press") and v["painted_px"] > 20 * v["ctrl_px"]:
-                print("  painted %d px for a %d px control: dirty rect too big" % (v["painted_px"], v["ctrl_px"]))
-                bad += 1
-            # W6: a hover WITH its transition: every animation frame paints the two
-            # buttons (leaving + entering), never the window
-            if name == "hoveranim" and v["painted_px"] > 4 * v["ctrl_px"]:
-                print("  hoveranim painted %d px per frame for %d px of controls: transition frames repaint too much" % (v["painted_px"], v["ctrl_px"]))
-                bad += 1
-            if name == "idle" and v["painted_px"] != 0:
-                print("  idle painted pixels"); bad += 1
     if update:
         json.dump(base, open(BASE, "w"), indent=1, sort_keys=True)
         print("baseline written")
