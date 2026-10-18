@@ -106,7 +106,7 @@ export {
     chips, chip_add, chip_count, chip_selected, chip_changed, chip_was_removed, skeleton, skeleton_on,
     chart, chart_set, pager, pager_page, pager_show,
     sheet_setup, sheet_snaps, sheet_dismiss, sheet_on_pointer, sheet_show, sheet_hide, sheet_snap, sheet_visible,
-    sheet_height, sheet_body, sheet_handle,
+    sheet_height, sheet_body, sheet_handle, sheet_node, sheet_describe, sheet_item, sheet_item_rect,
     propgrid, propgrid_event, propgrid_row, propgrid_selected, propgrid_select, propgrid_top, propgrid_set_top,
     propgrid_label_pm, propgrid_inline, propgrid_cell, propgrid_row_rect, propgrid_editing, propgrid_edit_text,
     propgrid_commit, propgrid_cancel, propgrid_refresh, PGE_COMMIT,
@@ -231,6 +231,16 @@ struct Ctl {
     sh_bptr: fn(*mut app.App, u32, f64, f64),
     sh_kb: bool,
     sh_ms: i64,
+    // the accessible side of the sheet: the description (a heap copy), the item nodes below the marker with
+    // their rectangles in points relative to the body (x, y, w, h)
+    sh_desc: u64,
+    sh_dn: usize,
+    sh_ni: usize,
+    sh_it: [usize; 8],
+    sh_ir: [f64; 32],
+    sh_irole: [u32; 8],
+    sh_iname: [str; 8],
+    sh_name: str,
     w6_drag: usize,
     pg_ed: editor.Editor,
     pg_buf: u64,
@@ -255,7 +265,7 @@ fn ctl_blank() -> Ctl {
         dlg: 0 as u32, dlg_m: kit.modal_new(), dlg_title: "", dlg_text: "", dlg_cb: dlg_cb_none,
         dlg_ed: editor.editor_new(), dlg_buf: 0, dlg_hot: NONE, dlg_hclose: false, mbar: false, w5_drag: NONE,
         sh: wave6.sheet_new(true), sh_on: false, sh_node: NONE, sh_body: sh_body_none, sh_bptr: sh_bptr_none,
-        sh_kb: false, sh_ms: 0, w6_drag: NONE, pg_ed: editor.editor_new(), pg_buf: 0, pg_edit_i: NONE,
+        sh_kb: false, sh_ms: 0, sh_desc: 0, sh_dn: 0, sh_ni: 0, sh_it: [NONE; 8], sh_ir: [0.0; 32], sh_irole: [0 as u32; 8], sh_iname: [""; 8], sh_name: "", w6_drag: NONE, pg_ed: editor.editor_new(), pg_buf: 0, pg_edit_i: NONE,
         pg_edit_row: NONE, px: 0.0, py: 0.0 }
 }
 
@@ -286,6 +296,7 @@ fn st(a: *mut app.App) -> *mut Ctl {
     fuiwirt.host_set_popup(app.app_host(a), p, sink_open, sink_ptr, sink_key, sink_chr,
         sink_tick, sink_wait)
     fuiwirt.host_set_wake(app.app_host(a), p, wake_tick, wake_wait)
+    fuiwirt.host_set_shield(app.app_host(a), p, sh_shield)
     return c
 }
 
@@ -2190,6 +2201,13 @@ fn ctl_ptr(ud: u64, kind: u32, x: f64, y: f64) -> bool {
         return false
     }
     if sh_visible(c) && !(*c).sh.modal {
+        // the host keeps a press / move over the panel from the page (the shield); the same events must not
+        // reach the controls behind it here either (tooltip, split, ripple, wave 5/6 pointer)
+        if fuiwirt.host_shielded(app.app_host((*c).a)) {
+            let hid0: bool = tip_hide(c)
+            let used0: bool = sh_ptr(c, kind, x, y)
+            return true
+        }
         if sh_ptr(c, kind, x, y) {
             return true
         }
@@ -3373,10 +3391,12 @@ fn w5_busy(c: *mut Ctl) -> bool {
 // the selection scroll the rows; the divider between the columns drags. The screen reader gets the node as a
 // tree whose description is the selected row ("label, value").
 //
-// HONEST (wave 6): the rows array must outlive the window (GC heap, or `#[allow_escape]` on main); the sheet is the
-// library's drawing, not a scene node (the marker node carries the dialog role and name; a screen reader does not
-// list the body); a NON-modal sheet leaves the page behind the panel clickable (only the panel's own hits are
-// taken); the inline editor has no mouse caret / selection (keys only) and no IME; a grid has at most 64 rows.
+// HONEST (wave 6): the rows array must outlive the window (GC heap, or `#[allow_escape]` on main); the sheet's
+// content is the program's drawing: the screen reader gets the marker node (dialog, panel rectangle, name),
+// `sheet_describe` and up to 8 `sheet_item` nodes -- not the pixels of the body; a NON-modal sheet owns the pixels
+// of its panel (the host's pointer shield keeps presses, moves, the wheel and right clicks over it from the page),
+// the page outside the panel stays live; the inline editor has no mouse caret / selection (keys only) and no
+// IME; a grid has at most 64 rows.
 const K_PGRID: u32 = 21
 const K_SHEET: u32 = 22
 const PG_ROWS_MAX: usize = 64
@@ -3426,9 +3446,66 @@ fn sh_blocking(c: *mut Ctl) -> bool {
     return (*c).sh_on && (*c).sh.modal && ((*c).sh.cur != kit.NONE || (*c).sh.drag)
 }
 
+// The marker node and its items follow the panel: hidden when closed, else the node takes the rectangle of the
+// panel (window pixels) and the items theirs inside the body, so AT-SPI / UIA bounds and hit points are true.
+// The layout puts them back to zero size on every scene_layout; the next paint / tick writes them again.
 fn sh_sync_marker(c: *mut Ctl) {
-    if (*c).sh_node != NONE {
-        scene.node_set_hidden(sc_of(c), (*c).sh_node, !wave6.sheet_is_open(&(*c).sh))
+    if (*c).sh_node == NONE {
+        return
+    }
+    let sc: *mut scene.Scene = sc_of(c)
+    let open: bool = wave6.sheet_is_open(&(*c).sh)
+    scene.node_set_hidden(sc, (*c).sh_node, !open)
+    // a closed sheet is not listed: role and name are taken back (a hidden node still shows in the a11y tree)
+    let ax: *mut a11y.A11y = app.ax((*c).a)
+    if open {
+        a11y.a11y_set_role(ax, (*c).sh_node, a11y.ROLE_DIALOG)
+        name_node(c, (*c).sh_node, (*c).sh_name)
+        a11y.a11y_set_description(ax, (*c).sh_node, (*c).sh_desc, (*c).sh_dn)
+    } else {
+        a11y.a11y_set_role(ax, (*c).sh_node, a11y.ROLE_NONE)
+        a11y.a11y_clear_name(ax, (*c).sh_node)
+        a11y.a11y_set_description(ax, (*c).sh_node, 0, 0)
+    }
+    var k: usize = 0
+    while k < (*c).sh_ni {
+        scene.node_set_hidden(sc, (*c).sh_it[k], !open)
+        if open {
+            a11y.a11y_set_role(ax, (*c).sh_it[k], (*c).sh_irole[k])
+            name_node(c, (*c).sh_it[k], (*c).sh_iname[k])
+        } else {
+            a11y.a11y_set_role(ax, (*c).sh_it[k], a11y.ROLE_NONE)
+            a11y.a11y_clear_name(ax, (*c).sh_it[k])
+        }
+        k = k + 1
+    }
+    if !open {
+        return
+    }
+    let rc: *mut render.Ctx = app.app_ctx((*c).a)
+    var pr: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
+    if wave6.sheet_panel_rect(rc, &(*c).sh, 0.0, 0.0, (*c).win_w, (*c).win_h, &pr) {
+        let nm: *mut scene.Node = scene.nd(sc, (*c).sh_node)
+        (*nm).x = pr[0]
+        (*nm).y = pr[1]
+        (*nm).w = pr[2]
+        (*nm).h = pr[3]
+    }
+    var br: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
+    let has_body: bool = wave6.sheet_body_rect(rc, &(*c).sh, 0.0, 0.0, (*c).win_w, (*c).win_h, &br)
+    k = 0
+    while k < (*c).sh_ni {
+        let ni: *mut scene.Node = scene.nd(sc, (*c).sh_it[k])
+        if has_body {
+            (*ni).x = br[0] + kit.ln(rc, (*c).sh_ir[k * 4] as usize)
+            (*ni).y = br[1] + kit.ln(rc, (*c).sh_ir[k * 4 + 1] as usize)
+            (*ni).w = kit.ln(rc, (*c).sh_ir[k * 4 + 2] as usize)
+            (*ni).h = kit.ln(rc, (*c).sh_ir[k * 4 + 3] as usize)
+        } else {
+            (*ni).w = 0.0
+            (*ni).h = 0.0
+        }
+        k = k + 1
     }
 }
 
@@ -3451,8 +3528,7 @@ fn sheet_setup(a: *mut app.App, name: str, modal: bool, body: fn(*mut app.App, *
     (*c).sh_on = true
     (*c).sh_node = node
     (*c).sh_body = body
-    a11y.a11y_set_role(app.ax(a), node, a11y.ROLE_DIALOG)
-    name_node(c, node, name)
+    (*c).sh_name = name
     sh_sync_marker(c)
     return true
 }
@@ -3538,6 +3614,90 @@ fn sheet_handle(a: *mut app.App, out: *mut [f64; 4]) -> bool {
         return false
     }
     return wave6.sheet_handle_rect(app.app_ctx(a), &(*c).sh, 0.0, 0.0, (*c).win_w, (*c).win_h, out)
+}
+
+// ---- the accessible side: node, description, items
+//
+// The sheet is ONE scene node (role dialog, name) that takes the rectangle of the panel while it is open (hidden
+// when closed), so the tree dump, AT-SPI and UIA list it with true bounds. What the body shows is painted by the
+// program, so it tells the screen reader: `sheet_describe` = the text it says after name and role (copied), and
+// `sheet_item(a, role, name, x, y, w, h)` = up to 8 child nodes inside the body (points relative to the body's
+// top-left; the name stays with the caller). Items follow the panel and are hidden with it.
+
+// the scene node of the sheet (NONE before sheet_setup)
+fn sheet_node(a: *mut app.App) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || !(*c).sh_on {
+        return NONE
+    }
+    return (*c).sh_node
+}
+
+fn sheet_describe(a: *mut app.App, text: str) {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || !(*c).sh_on {
+        return
+    }
+    if (*c).sh_desc == 0 as u64 {
+        (*c).sh_desc = rt.heap_alloc(256)
+    }
+    var n: usize = text.n
+    if n > 256 {
+        n = 256
+    }
+    var k: usize = 0
+    let d: *mut u8 = (*c).sh_desc as *mut u8
+    while k < n {
+        *(d + k) = *((text.p as *mut u8) + k)
+        k = k + 1
+    }
+    (*c).sh_dn = n
+    sh_sync_marker(c)
+}
+
+// A part of the body for the screen reader. Returns its index (0..7) or NONE. Rect in points inside the body.
+fn sheet_item(a: *mut app.App, role: u32, name: str, x: usize, y: usize, w: usize, h: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || !(*c).sh_on || (*c).sh_ni >= 8 {
+        return NONE
+    }
+    let sc: *mut scene.Scene = sc_of(c)
+    let node: usize = scene.scene_add(sc, (*c).sh_node, scene.N_WIDGET)
+    if node == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_widget_kind(sc, node, widget.KIND_NONE)
+    scene.node_set_size(sc, node, 0.0, 0.0)
+    (*scene.nd(sc, node)).no_fill = 1 as u32
+    let k: usize = (*c).sh_ni
+    (*c).sh_irole[k] = role
+    (*c).sh_iname[k] = name
+    (*c).sh_it[k] = node
+    (*c).sh_ni = k + 1
+    sheet_item_rect(a, k, x, y, w, h)
+    return k
+}
+
+fn sheet_item_rect(a: *mut app.App, k: usize, x: usize, y: usize, w: usize, h: usize) {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || !(*c).sh_on || k >= (*c).sh_ni {
+        return
+    }
+    (*c).sh_ir[k * 4] = x as f64
+    (*c).sh_ir[k * 4 + 1] = y as f64
+    (*c).sh_ir[k * 4 + 2] = w as f64
+    (*c).sh_ir[k * 4 + 3] = h as f64
+    sh_sync_marker(c)
+}
+
+// the pointer shield of the host: a NON-modal sheet owns the pixels of its panel (handle + body), the page
+// behind does not hear them. The modal one shuts the whole window off through the popup sink instead.
+fn sh_shield(ud: u64, x: f64, y: f64) -> bool {
+    let c: *mut Ctl = ud as *mut Ctl
+    if !sh_visible(c) || (*c).sh.modal {
+        return false
+    }
+    return wave6.sheet_hit(app.app_ctx((*c).a), &(*c).sh, 0.0, 0.0, (*c).win_w, (*c).win_h, x, y) != wave6.SH_NONE
 }
 
 // tell the program once when the USER changed where the sheet rests
@@ -3641,12 +3801,16 @@ fn sh_key(c: *mut Ctl, key: u32) -> bool {
 
 fn draw_sheet(c: *mut Ctl, rc: *mut render.Ctx) {
     if !sh_visible(c) {
+        if (*c).sh_on {
+            sh_sync_marker(c)
+        }
         return
     }
     var stt: u32 = 0 as u32
     if (*c).sh_kb && (*c).sh.cur != kit.NONE {
         stt = kit.ST_FOCUS
     }
+    sh_sync_marker(c)
     wave6.sheet_draw(rc, &(*c).sh, 0.0, 0.0, (*c).win_w, (*c).win_h, stt)
     var r: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
     if wave6.sheet_body_begin(rc, &(*c).sh, 0.0, 0.0, (*c).win_w, (*c).win_h, &r) {
