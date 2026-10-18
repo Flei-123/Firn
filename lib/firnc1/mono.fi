@@ -35,7 +35,7 @@ import iface
 import lamsugar
 
 export { Gen, gen_new, gen_free, gen_upfront, gen_is_fn, gen_is_struct,
-    gen_depth_on, gen_depth_off, gen_in_template,
+    gen_depth_on, gen_depth_off, gen_in_template, gen_closure_template,
     gen_bound, gen_tp_start, gen_tp_add, gen_tp_duplicate,
     gen_tp_bound_add, gen_if_set,
     gen_fn_template, gen_struct_template, gen_instance,
@@ -82,6 +82,10 @@ struct Gen {
     fv_name: Vec[u32], fv_toff: Vec[u32], fv_tlen: Vec[u32],
     fv_poff: Vec[u32], fv_plen: Vec[u32], fv_ret: Vec[u32], fv_body: Vec[u32],
 
+    // r727: closure functions that sit inside a template body (the parser hands
+    // them over instead of `fn_add`); every instance copies them under a fresh name
+    cv_name: Vec[u32], cv_poff: Vec[u32], cv_plen: Vec[u32], cv_ret: Vec[u32], cv_body: Vec[u32],
+
     // struct templates
     sv_name: Vec[u32], sv_toff: Vec[u32], sv_tlen: Vec[u32],
     sv_foff: Vec[u32], sv_flen: Vec[u32],
@@ -124,6 +128,8 @@ fn gen_new(b: u64, it: u64) -> Gen {
         fv_name: vec_new[u32](), fv_toff: vec_new[u32](), fv_tlen: vec_new[u32](),
         fv_poff: vec_new[u32](), fv_plen: vec_new[u32](), fv_ret: vec_new[u32](),
         fv_body: vec_new[u32](),
+        cv_name: vec_new[u32](), cv_poff: vec_new[u32](), cv_plen: vec_new[u32](),
+        cv_ret: vec_new[u32](), cv_body: vec_new[u32](),
         sv_name: vec_new[u32](), sv_toff: vec_new[u32](), sv_tlen: vec_new[u32](),
         sv_foff: vec_new[u32](), sv_flen: vec_new[u32](),
         iv_name: vec_new[u32](), iv_base: vec_new[u32](),
@@ -153,6 +159,11 @@ fn gen_free(g: *mut Gen) {
     vec_free[u32](&(*g).fv_plen)
     vec_free[u32](&(*g).fv_ret)
     vec_free[u32](&(*g).fv_body)
+    vec_free[u32](&(*g).cv_name)
+    vec_free[u32](&(*g).cv_poff)
+    vec_free[u32](&(*g).cv_plen)
+    vec_free[u32](&(*g).cv_ret)
+    vec_free[u32](&(*g).cv_body)
     vec_free[u32](&(*g).sv_name)
     vec_free[u32](&(*g).sv_toff)
     vec_free[u32](&(*g).sv_tlen)
@@ -206,6 +217,61 @@ fn gen_generated(g: *mut Gen) -> usize { return (*g).generated }
 fn gen_depth_on(g: *mut Gen) { (*g).depth = (*g).depth + 1 }
 fn gen_depth_off(g: *mut Gen) { (*g).depth = (*g).depth - 1 }
 fn gen_in_template(g: *mut Gen) -> bool { return (*g).depth > 0 }
+
+// r727: a closure function parsed inside a template body (`plen` includes the env parameter).
+fn gen_closure_template(g: *mut Gen, name: u32, poff: u32, plen: u32, ret: u32, body: u32) {
+    vec_push[u32](&(*g).cv_name, name)
+    vec_push[u32](&(*g).cv_poff, poff)
+    vec_push[u32](&(*g).cv_plen, plen)
+    vec_push[u32](&(*g).cv_ret, ret)
+    vec_push[u32](&(*g).cv_body, body)
+}
+
+fn closure_template_find(g: *mut Gen, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).cv_name) {
+        if vec_at[u32](&(*g).cv_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// A closure literal inside a template instance: its own copy of the function (types
+// substituted, fresh name `__closure#N`) -- twin of mono.rs FRESH_LAMBDA.
+fn copy_lambda(g: *mut Gen, e: u32, ci: u32) -> u32 {
+    let b: *mut ast.Tree = gtree(g)
+    let old_off: u32 = vec_at[u32](&(*g).cv_poff, ci as usize)
+    let plen: u32 = vec_at[u32](&(*g).cv_plen, ci as usize)
+    let new_off: u32 = ast.param_start(b)
+    var k: u32 = 0
+    while k < plen {
+        let pidx: u32 = ast.param_add(b, ast.param_name(b, old_off + k),
+            subst_ty(g, ast.param_ty(b, old_off + k)))
+        ast.param_pos_set(b, pidx, ast.param_pos(b, old_off + k))
+        k = k + 1
+    }
+    let old_ret: u32 = vec_at[u32](&(*g).cv_ret, ci as usize)
+    let ret: u32 = subst_ty(g, old_ret)
+    let body: u32 = copy_block(g, vec_at[u32](&(*g).cv_body, ci as usize))
+    let it: *mut intern.Interner = gnames(g)
+    rt.buf_clear(&(*g).scratch)
+    var cw: [u8; 10] = "__closure#"
+    rt.buf_push_bytes(&(*g).scratch, (&cw[0]) as u64, 10)
+    rt.buf_push_dec_u64(&(*g).scratch, ast.fn_count(b) as u64)
+    let cname: u32 = intern.intern_number(it, rt.buf_ptr(&(*g).scratch),
+        rt.buf_len(&(*g).scratch)) as u32
+    ast.fn_add(b, cname, new_off, plen, ret, body, 0, 0, 0, 0, 0, 0, 0)
+    // e_number: keep the heap bit and the LAM_* marks, new result type node
+    var num: u64 = ast.e_number(b, e)
+    var keep: u64 = num & 1
+    keep = keep | (num & 8070450532247928832)
+    if ret != ast.NOTHING {
+        keep = keep | ((ret as u64 + 1) << 1)
+    }
+    return ast.expr_new(b, ast.E_LAMBDA, cname, new_off, plen - 1, keep)
+}
 
 // ---------------------------------------------------------------- prescan
 //
@@ -1107,6 +1173,13 @@ fn copy_expr_inner(g: *mut Gen, e: u32) -> u32 {
     if a == ast.E_TEXT {
         let inner: u32 = copy_expr(g, ast.e_a(b, e))
         return ast.expr_new(b, a, inner, ast.e_b(b, e), 0, 0)
+    }
+    if a == ast.E_LAMBDA {
+        let ci: u32 = closure_template_find(g, ast.e_a(b, e))
+        if ci != NONE {
+            return copy_lambda(g, e, ci)
+        }
+        return ast.expr_new(b, a, ast.e_a(b, e), ast.e_b(b, e), ast.e_c(b, e), ast.e_number(b, e))
     }
     // E_AWDH
     let value: u32 = copy_expr(g, ast.e_a(b, e))

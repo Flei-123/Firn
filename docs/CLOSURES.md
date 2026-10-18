@@ -71,5 +71,10 @@ let c: fn(i32) -> i32 = try gc |x| x + n                       // capturing form
   type: error "cannot infer the types of this lambda here". Afterwards the lambda is exactly `fn(x: T) -> R { .. }`
   -- same lowering as before, capture by value, no stack closures yet.
 * firnc1 (`lib/firnc1/lamsugar.fi` + `lambda_sugar` in parser.fi) mirrors: arguments of plain calls (also behind `try`)
-  and `let`/`var` with a declared type. Not mirrored (stage 0 only): method calls, struct fields, `return`.
+  and `let`/`var` with a declared type, `return` (the parser stores the result type in the `S_RET` statement) and
+  struct literal fields. Not mirrored (stage 0 only): method-call arguments.
+* A closure inside a template body: firnc1 parks the closure function in `Gen` (`gen_closure_template`) instead
+  of the function table; every instance gets its own copy (`copy_lambda` in mono.fi, fresh `__closure#N`).
+  `-> AllocError!T` on a generic fn is a separate firnc1 gap (not closure related).
+* firnfmt: `|x, y|` stays tight (`lambda_open`/`lambda_close` in tools/fmt/fmt.fi); binary `a | b` is unchanged.
 * Stack/non-escaping closures (`local fn`) are still only a design (section above).
