@@ -99,7 +99,7 @@ applog() { $ADB shell "cat \$(ls -t \$(find /data/data/$PKG /sdcard/Android/data
 wait_update_check() { local i L; [ "${WAIT_UPDATE:-1}" = 1 ] || return 0
     for i in $(seq 45); do sleep 2; L=$(applog)
         if echo "$L" | grep -q 'update: checking'; then echo "$L" | grep 'update: ' | grep -vq 'checking' && break
-        elif [ $i -ge 8 ] && echo "$L" | grep -q 'main: start'; then break; fi
+        elif [ $i -ge 25 ] && echo "$L" | grep -q 'main: start'; then break; fi
     done; note "update check settled after about $((i*2)) s"; }
 alive() { [ -n "$($ADB shell pidof $PKG | tr -d '\r')" ] && echo yes || echo no; }
 fatal_lines() { { $ADB logcat -b crash -d; $ADB logcat -b main,system -d -s AndroidRuntime:E ActivityManager:I DEBUG:I libc:F 2>/dev/null; } \
