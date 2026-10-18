@@ -1636,10 +1636,16 @@ NOT supported: `{x!r}`, `#` on floats (kept point), fill outside the BMP, `f` of
 `i: usize` and a copy `x` of the element; `for (x, y) in zip(a, b) { }` walks to the
 SHORTER length. Both desugar like `for x in v` (`foreach.rs::build_pair`, firnc1
 `for_pair`): `for __each#N in 0..len { let i = __each#N; let x = v[__each#N]; .. }`.
-`v`/`a`/`b` can be a Vec, array or str and must be a place without calls. Other tuple
-patterns in `for` are an error ("a tuple pattern in 'for' needs enumerate(v) or
-zip(a, b)"). `break`/`continue` work. Proof: `tests/3921_for_enumerate_zip.fi`,
-`tests/neg/for_pair_*.fi`.
+`v`/`a`/`b` can be a Vec, array or str and must be a place without calls. **r708:** any
+tuple pattern works too: `for (a, b) in vec_of_tuples { }`, `for (x, y, z) in v`, `_`,
+nested `for (i, (a, b)) in enumerate(v)` / `for (a, (b, c)) in v` -- the element is
+taken apart like `let (a, b) = e` (hidden `__tup#k#n`, the size is checked). Without
+`enumerate`/`zip` the whole pattern belongs to the element. `break`/`continue` work.
+Proof: `tests/3921_for_enumerate_zip.fi`, `tests/3980`, `tests/3981`, `tests/neg/for_*.fi`.
+**f-string `{x!r}` (r708):** `{s!r}` shows a str like Python's `repr` (single quotes, double
+quotes if the text holds `'` but no `"`, `\\ \n \r \t \xNN` escapes); numbers and bool are
+unchanged; `{s!r:>8}` / `{s!r:<8s}` take a spec (no other type), `{x!s}` is a no-op.
+Proof: `tests/3982_fstring_repr.fi`, `tools/fmtspec_cross` (0 diffs vs Python).
 
 **r664 (stdlib without `$FIRNLIB`).** Step 4 of the import search looks at
 `<exe dir>/../lib`, then `../../lib`, then `../../../lib` (installed layout,
