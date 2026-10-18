@@ -32,7 +32,7 @@ export {
     Dd, dd_new, dd_source, dd_target, dd_pointer, dd_key, dd_char, dd_draw, dd_tick, dd_busy, dd_cancel,
     dd_set_ghost, move_index, dd_is_source, dd_total_gaps, dd_on_start, dd_on_drop, dd_edge_active, dd_keyboard,
     dd_r_effect, dd_r_source, dd_r_row, dd_r_target, dd_r_gap, dd_r_zone, dd_r_trow, dd_drops, dd_active,
-    DD_MAX,
+    DD_MAX, dd_hint, dd_hint_text,
 }
 
 const NONE: usize = 4294967295
@@ -97,6 +97,9 @@ struct Dd {
     // the keyboard way: the node that was grabbed and the description buffer of its announcement
     kb_node: usize,
     kb_desc: u64,
+    hint_n: usize, // nodes that carry a hint (source / target text for a screen reader)
+    hint_node: [usize; 16],
+    hint_buf: u64, // 16 x 160 bytes, the a11y tree points into it
 }
 
 fn dd_cb_none(a: *mut app.App, node: usize) {
@@ -108,7 +111,7 @@ fn dd_blank() -> Dd {
         src: NONE, s_row: NONE, tgt: NONE, t_gap: 0, t_zone: dnd.SLOT_BEFORE, t_row: NONE, edge: 0, px: 0.0, py: 0.0,
         on_start: dd_cb_none, on_drop: dd_cb_none, ghost: [0 as u8; 48], ghost_n: 0,
         r_eff: dnd.OP_NONE, r_src: NONE, r_row: NONE, r_tgt: NONE, r_gap: 0, r_zone: dnd.SLOT_BEFORE, r_trow: NONE,
-        drops: 0, kb_node: NONE, kb_desc: 0 }
+        drops: 0, kb_node: NONE, kb_desc: 0, hint_n: 0, hint_node: [NONE; 16], hint_buf: 0 }
 }
 
 fn dd_new() -> *mut Dd {
@@ -121,6 +124,7 @@ fn dd_new() -> *mut Dd {
     let dd: *mut Dd = p as *mut Dd
     *dd = dd_blank()
     (*dd).kb_desc = rt.heap_alloc(96)
+    (*dd).hint_buf = rt.heap_alloc(16 * 160)
     return dd
 }
 
@@ -172,6 +176,127 @@ fn dd_set_ghost(dd: *mut Dd, t: str) {
         i = i + 1
     }
     (*dd).ghost_n = n
+}
+
+fn tr_h_drag() -> str { return uistr.t("wave10.h_drag", "Draggable") }
+fn tr_h_drop() -> str { return uistr.t("wave10.h_drop", "Drop target") }
+fn tr_h_grab() -> str { return uistr.t("wave10.h_grab", "Ctrl+Space grabs.") }
+fn tr_k_text() -> str { return uistr.t("wave10.k_text", "text") }
+fn tr_k_row() -> str { return uistr.t("wave10.k_row", "rows") }
+fn tr_k_file() -> str { return uistr.t("wave10.k_file", "files") }
+fn tr_k_tab() -> str { return uistr.t("wave10.k_tab", "tabs") }
+fn tr_k_custom() -> str { return uistr.t("wave10.k_custom", "items") }
+fn tr_o_move() -> str { return uistr.t("wave10.o_move", "move") }
+fn tr_o_copy() -> str { return uistr.t("wave10.o_copy", "copy") }
+fn tr_o_link() -> str { return uistr.t("wave10.o_link", "link") }
+fn tr_h_into() -> str { return uistr.t("wave10.h_into", "onto rows too") }
+
+// Appends `s` at `at` (a buffer of `cap` bytes); returns the new length.
+fn cat_cap(buf: u64, at: usize, cap: usize, s: str) -> usize {
+    var n: usize = at
+    var i: usize = 0
+    while i < s.n && n < cap {
+        *((buf + n as u64) as *mut u8) = *((s.p as u64 + i as u64) as *mut u8)
+        n = n + 1
+        i = i + 1
+    }
+    return n
+}
+
+// "rows, tabs (move, copy)": the kinds and the operations as words. Returns the new length.
+fn cat_kinds_ops(buf: u64, at: usize, cap: usize, kinds: u32, ops: u32) -> usize {
+    var n: usize = at
+    var first: bool = true
+    var k: u32 = 1 as u32
+    while k <= 16 as u32 {
+        if (kinds & k) != 0 as u32 {
+            if !first { n = cat_cap(buf, n, cap, ", ") }
+            first = false
+            var w: str = tr_k_custom()
+            if k == dnd.KIND_TEXT { w = tr_k_text() }
+            if k == dnd.KIND_ROW { w = tr_k_row() }
+            if k == dnd.KIND_FILE { w = tr_k_file() }
+            if k == dnd.KIND_TAB { w = tr_k_tab() }
+            n = cat_cap(buf, n, cap, w)
+        }
+        k = k * 2 as u32
+    }
+    n = cat_cap(buf, n, cap, " (")
+    first = true
+    if (ops & dnd.OP_MOVE) != 0 as u32 {
+        n = cat_cap(buf, n, cap, tr_o_move())
+        first = false
+    }
+    if (ops & dnd.OP_COPY) != 0 as u32 {
+        if !first { n = cat_cap(buf, n, cap, ", ") }
+        n = cat_cap(buf, n, cap, tr_o_copy())
+        first = false
+    }
+    if (ops & dnd.OP_LINK) != 0 as u32 {
+        if !first { n = cat_cap(buf, n, cap, ", ") }
+        n = cat_cap(buf, n, cap, tr_o_link())
+    }
+    return cat_cap(buf, n, cap, ")")
+}
+
+// The hint of `node` as text in `buf` (cap bytes): "Draggable: rows (move, copy). Ctrl+Space grabs. Drop target:
+// rows (move). 0 = the node is neither a source nor a target.
+fn dd_hint_text(dd: *mut Dd, node: usize, buf: u64, cap: usize) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < (*dd).ns {
+        if (*dd).s_node[i] == node {
+            n = cat_cap(buf, n, cap, tr_h_drag())
+            n = cat_cap(buf, n, cap, ": ")
+            n = cat_kinds_ops(buf, n, cap, (*dd).s_kind[i], (*dd).s_ops[i])
+            n = cat_cap(buf, n, cap, ". ")
+            n = cat_cap(buf, n, cap, tr_h_grab())
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < (*dd).nt {
+        if (*dd).t_node[i] == node {
+            if n > 0 { n = cat_cap(buf, n, cap, " ") }
+            n = cat_cap(buf, n, cap, tr_h_drop())
+            n = cat_cap(buf, n, cap, ": ")
+            n = cat_kinds_ops(buf, n, cap, (*dd).t_kinds[i], (*dd).t_ops[i])
+            if (*dd).t_tree[i] {
+                n = cat_cap(buf, n, cap, ", ")
+                n = cat_cap(buf, n, cap, tr_h_into())
+            }
+            n = cat_cap(buf, n, cap, ".")
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Writes (or rewrites) the hint of `node` into the a11y tree as its description. Called when a source / target is
+// registered and when a keyboard grab ends (the grab text replaced it meanwhile).
+fn dd_hint(a: *mut app.App, dd: *mut Dd, node: usize) {
+    if (*dd).hint_buf == 0 || node == NONE {
+        return
+    }
+    var slot: usize = NONE
+    var i: usize = 0
+    while i < (*dd).hint_n {
+        if (*dd).hint_node[i] == node {
+            slot = i
+        }
+        i = i + 1
+    }
+    if slot == NONE {
+        if (*dd).hint_n >= 16 {
+            return
+        }
+        slot = (*dd).hint_n
+        (*dd).hint_node[slot] = node
+        (*dd).hint_n = slot + 1
+    }
+    let buf: u64 = (*dd).hint_buf + (slot * 160) as u64
+    let n: usize = dd_hint_text(dd, node, buf, 160)
+    a11y.a11y_set_description(app.ax(a), node, buf, n)
 }
 
 fn tr_item() -> str { return uistr.t("wave10.item", "Item") }
@@ -564,7 +689,7 @@ fn dd_key(a: *mut app.App, dd: *mut Dd, key: u32, mods: u32) -> u32 {
         let node: usize = (*dd).kb_node
         dd_cancel(dd)
         if node != NONE {
-            a11y.a11y_set_description(app.ax(a), node, 0, 0)
+            dd_hint(a, dd, node)
         }
         return 1
     }
@@ -585,7 +710,7 @@ fn dd_key(a: *mut app.App, dd: *mut Dd, key: u32, mods: u32) -> u32 {
         let eff: u32 = dnd.kbd_drop(d)
         dd_finish(a, dd, eff)
         if node2 != NONE {
-            a11y.a11y_set_description(app.ax(a), node2, 0, 0)
+            dd_hint(a, dd, node2)
         }
         return 2
     }

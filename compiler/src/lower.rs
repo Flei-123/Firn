@@ -1421,6 +1421,10 @@ impl<'a> Lower<'a> {
                 if crate::foreach::is_vec_slice(&self.info.tcx, &self.info.fns, name, &rt, args.len()) {
                     return crate::foreach::lower_vec_slice(self, args, dest, span);
                 }
+                // HOOK vsugar (r738)
+                if let Some(k) = crate::foreach::vec_sugar(&self.info.tcx, &self.info.fns, name, &rt, args.len()) {
+                    return crate::foreach::lower_vec_sugar(self, k, args, dest, span);
+                }
             }
         }
         // HOOK impl: `x.m(a)` appears as `"method m"` in the tree. The

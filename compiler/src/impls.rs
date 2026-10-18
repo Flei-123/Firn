@@ -733,6 +733,30 @@ pub(crate) fn hook_call(
     if crate::foreach::is_vec_slice(&ck.tcx, &ck.fns, name, &et, args.len()) {
         return Some(crate::foreach::check_vec_slice(ck, et, args));
     }
+    // HOOK vsugar (r738): `v[a:b:c]`, `v.copy()`, `v[a:b] = w` on a `Vec[T]`
+    if let Some(k) = crate::foreach::vec_sugar(&ck.tcx, &ck.fns, name, &et, args.len()) {
+        return Some(crate::foreach::check_vec_sugar(ck, k, et, args));
+    }
+    // r738: a step slice / slice assignment on `str`/`Span` -- say what to use instead
+    if let Some(m) = method_name(name) {
+        if (m == crate::parser::SLICE_STEP || m == crate::parser::SLICE_ASSIGN)
+            && crate::foreach::seq_struct(&ck.tcx, &et)
+                .map(|i| crate::strtype::is_str_like(&Type::Struct(i)))
+                .unwrap_or(false)
+            && target_of(&ck.tcx, &ck.fns, m, &et).is_none()
+        {
+            for a in &args[1..] {
+                ck.type_out_expr(a);
+            }
+            let msg = if m == crate::parser::SLICE_STEP {
+                "a step slice 's[a:b:c]' of a string is a library call: use std.pystr 'pystr.slice_step(s, a, b, c)'"
+            } else {
+                "a string is immutable: 's[a:b] = e' is only defined for Vec"
+            };
+            ck.dg.error(nspan, msg.to_string());
+            return Some(Type::Error);
+        }
+    }
     let (prefixes, is_ptr) = match receiver_prefixes(&ck.tcx, &et) {
         Some(x) => x,
         None => {
