@@ -38,6 +38,11 @@ for _ in $(seq 200); do
   sleep 3
 done
 echo "boot done, abilist: $($ADB shell getprop ro.product.cpu.abilist | tr -d '\r')"
+# wait for emulator network (DNS) so the net scenario can reach the internet
+for _ in $(seq 30); do
+  $ADB shell ping -c1 -W2 example.com >/dev/null 2>&1 && { echo "emulator net ok"; break; }
+  sleep 2
+done
 $ADB shell settings put global window_animation_scale 0 >/dev/null
 $ADB shell settings put global transition_animation_scale 0 >/dev/null
 $ADB shell settings put global animator_duration_scale 1 >/dev/null
@@ -50,6 +55,7 @@ if [ "$ABI" = arm64-v8a ]; then $ADB install --abi arm64-v8a -r "$APK" || $ADB i
 # scenario name | wait seconds | am start extras
 scenario() {
   local name=$1 wait=$2; shift 2
+  if [ -n "${ONLY:-}" ] && ! [[ $name =~ $ONLY ]]; then return; fi
   $ADB shell am force-stop $PKG; sleep 1
   $ADB logcat -c
   $ADB shell am start -W -n $PKG/.MainActivity "$@" | grep -E "TotalTime|WaitTime" | tr '\n' ' '; echo
@@ -64,8 +70,8 @@ scenario list-autoscroll 14 --es tab list --es theme dark --ei autoscroll 1
 scenario lab-anim-dark 13 --es tab lab --es lab anim --es theme dark
 scenario lab-anim-light 6 --es tab lab --es lab anim --es theme light
 scenario lab-text-dark 6 --es tab lab --es lab text --es theme dark
-scenario lab-net-dark 12 --es tab lab --es lab net --es theme dark --ez autorun true
-scenario lab-cpu-dark 150 --es tab lab --es lab cpu --es theme dark --ez autorun true
+scenario lab-net-dark 30 --es tab lab --es lab net --es theme dark --ez autorun true
+scenario lab-cpu-dark ${CPU_WAIT:-150} --es tab lab --es lab cpu --es theme dark --ez autorun true
 scenario settings-dark 6 --es tab settings --es theme dark
 scenario settings-light 6 --es tab settings --es theme light
 

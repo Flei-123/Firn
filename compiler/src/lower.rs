@@ -378,6 +378,9 @@ impl<'a> Lower<'a> {
     }
 
     pub(crate) fn constant(&mut self, ty: FTy, v: i128) -> Val {
+        // r783: the literal `9223372036854775808` (operand of `-9223372036854775808`
+        // as i64) is stored wrapped, as the i64 it is: the same text firnc1 prints.
+        let v = if ty == FTy::I64 { v as i64 as i128 } else { v };
         self.push(ty, Op::Const(v))
     }
 
