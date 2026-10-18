@@ -33,6 +33,9 @@
 #   --assets <dir>        packed uncompressed into assets/
 #   --permission <name>   uses-permission, repeatable (android.permission.X)
 #   --manifest-extra <f>  XML inserted into <application> (services, ...)
+#                         (with --push/--pick/--install the launcher activity is org.firn.FirnMain, launchMode singleTop:
+#                         onNewIntent keeps the intent of a notification tap while the app is open; an
+#                         activity-alias keeps the component name android.app.NativeActivity working)
 #   --dex <file>          classes.dex to ship (then hasCode="true")
 #   --args-file <file>    default arguments (one per line) the app starts
 #                         with, shipped as assets/args.txt; a file args.txt
@@ -89,7 +92,7 @@ SRCDIR=$(dirname "$ENTRY_ABS")
 
 NAME=$(basename "$SRCDIR"); PKG=""; LIB=firnapp; ABI=both
 VCODE=1; VNAME=0.1; OPT=release-safe; ASSETS=""; PERMS=(); EXTRA=""; DEX=""
-PUSH=0; PICK=0; INSTALL=0; CAMERA=0; SPEECH=0; TTS=0; ARGSFILE=""; RELEASE=${FIRN_RELEASE:-0}
+OWNDEX=0; PUSH=0; PICK=0; INSTALL=0; CAMERA=0; SPEECH=0; TTS=0; ARGSFILE=""; RELEASE=${FIRN_RELEASE:-0}
 OUT=""; ICONRES=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -198,6 +201,7 @@ if [ $PUSH -eq 1 ] || [ $PICK -eq 1 ] || [ $INSTALL -eq 1 ]; then
     "$FIRNC" -o "$SDX" "$ROOT/tools/android/servicedex_main.fi"
     "$SDX" "$BUILD/classes.dex" "$LIB"
     DEX=$BUILD/classes.dex
+    OWNDEX=1
     SVCXML=$BUILD/service.xml
     {
         if [ $PUSH -eq 1 ]; then
@@ -221,10 +225,14 @@ if [ $PUSH -eq 1 ] || [ $PICK -eq 1 ] || [ $INSTALL -eq 1 ]; then
             android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING
             android.permission.POST_NOTIFICATIONS)
     fi
-    echo "  classes.dex: $(stat -c%s "$DEX") octets (org.firn.FirnService, FirnPick, FirnInstall, written by Firn)"
+    echo "  classes.dex: $(stat -c%s "$DEX") octets (org.firn.FirnService, FirnMain, FirnPick, FirnInstall, written by Firn)"
 fi
 
 # ---- 4. manifest, package, sign ------------------------------------------
+# With our own dex the launcher activity is org.firn.FirnMain (singleTop + onNewIntent: a tap on a notification while
+# the app is open reaches the app); without it the plain NativeActivity.
+MAINACT=android.app.NativeActivity; LAUNCHMODE=""
+if [ $OWNDEX -eq 1 ]; then MAINACT=org.firn.FirnMain; LAUNCHMODE='android:launchMode="singleTop"'; fi
 HASCODE=false
 [ -n "$DEX" ] && HASCODE=true
 MAN=$BUILD/AndroidManifest.xml
@@ -247,8 +255,8 @@ EOF
     cat <<EOF
     <application android:label="$NAME" android:hasCode="$HASCODE" $ICONATTR
         android:extractNativeLibs="true">
-        <activity android:name="android.app.NativeActivity"
-            android:label="$NAME" android:exported="true"
+        <activity android:name="$MAINACT"
+            android:label="$NAME" android:exported="true" $LAUNCHMODE
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|uiMode|density">
             <meta-data android:name="android.app.lib_name" android:value="$LIB" />
@@ -259,6 +267,14 @@ EOF
             </intent-filter>
         </activity>
 EOF
+    if [ $OWNDEX -eq 1 ]; then
+        # the old component name keeps working (am start -n pkg/android.app.NativeActivity)
+        # (NativeActivity reads lib_name/func_name from the component of the START intent: the alias, so it carries them too)
+        echo '        <activity-alias android:name="android.app.NativeActivity" android:targetActivity="org.firn.FirnMain" android:exported="true">'
+        echo "            <meta-data android:name=\"android.app.lib_name\" android:value=\"$LIB\" />"
+        echo '            <meta-data android:name="android.app.func_name" android:value="firn_activity_create" />'
+        echo '        </activity-alias>'
+    fi
     [ -n "$EXTRA" ] && cat "$EXTRA"
     echo "    </application>"
     echo "</manifest>"

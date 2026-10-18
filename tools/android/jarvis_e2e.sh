@@ -5,7 +5,7 @@
 # notification service as the judge.
 #
 #   bash tools/android/jarvis_e2e.sh [apk]          (default: the newest /root/jarvis-android-builds/jarvis-*.apk)
-#   STRICT_FRONT=1 bash ...   (a tap on a notification while the app is open must switch the chat; today a known gap)
+#   STRICT_FRONT=0 bash ...   (only note, not fail, when a tap on a notification while the app is open does not switch the chat; default 1)
 #   SERIAL=emulator-5594 ADB_PORT=5043 bash ...     (use a running emulator, do not boot or stop one)
 #   AVD=<name> EMU_PORT=<port> ADB_PORT=<port> OUT=<dir> bash ...   (own emulator copy, own adb server)
 #
@@ -16,7 +16,7 @@
 # fake server's upload_body line carries the sha256 of the exact octets), file receive (JE_FILE -> download -> Downloads/Jarvis),
 # push over the HTTPS long poll while the app is in the background (POST /fake/push -> a REAL notification, tap opens the app,
 # the chat; two chats c1/c2 -> two notifications, each tap opens its own chat), the service text is neutral, the frame time of the app (paint microseconds per frame, <= 16 ms is the 60 Hz budget),
-# push while the app is IN FRONT (notification still posted, no chat switch by the push itself; a tap there is a KNOWN GAP, see STRICT_FRONT),
+# push while the app is IN FRONT (notification still posted, no chat switch by the push itself; a tap there switches the chat through onNewIntent of org.firn.FirnMain, see STRICT_FRONT),
 # push WITHOUT a chat id (unkeyed notification next to keyed ones, a tap opens no unrelated chat),
 # voice output (status text, no crash) and, on the google_apis image, with the REAL speech engine (logcat firn-tts: engine requested ->
 # engine ready, speaking -> finished speaking), no crash.
@@ -310,12 +310,13 @@ echo "  tap the notification of c1 while the app is open"
 tap_note "Front c1"
 check "front tap: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
 shot 12b_front_after_tap
-# KNOWN GAP: a tap on a notification while the window is already in front brings no new intent to the activity (a standard launch mode,
-# no onNewIntent in NativeActivity) and the window never "comes back", so the chat does not switch. STRICT_FRONT=1 makes it a failure.
+# A tap on a notification while the window is already in front: org.firn.FirnMain (launchMode singleTop) gets onNewIntent, keeps the
+# intent (setIntent), the app reads the chat id from it within a second. STRICT_FRONT=0 turns a failure into a note.
 FRONT_C1=$(OCR_TRIES=10 wait_ocr 12b_front_after_tap 'You: hi\|JARVIS: hello')
-if [ "${STRICT_FRONT:-0}" = 1 ]; then check "front tap: the chat of the notification is on screen (c1: 'hi / hello')" "$FRONT_C1" 1
+if [ "${STRICT_FRONT:-1}" = 1 ]; then check "front tap: the chat of the notification is on screen (c1: 'hi / hello')" "$FRONT_C1" 1
 elif [ "$FRONT_C1" = 1 ]; then echo "  OK    front tap: the chat of the notification is on screen (c1: 'hi / hello')"; PASS=$((PASS+1))
-else note "KNOWN GAP: a tap while the app is open does not switch to the chat of the notification (c2 stays on screen)"; fi
+else note "a tap while the app is open does not switch to the chat of the notification (c2 stays on screen)"; fi
+check "front tap: the app log says the chat came from the intent" "$(app_log | grep 'tap opens chat c1 (intent)' | tail -1 | wc -l)" 1
 CHAT_BEFORE="$(ocr 12b_front_after_tap | grep -c 'second question\|second answer')$(ocr 12b_front_after_tap | grep -c 'JARVIS: hello')" # c2 / c1 history on screen
 check "front tap: the notification is gone (auto-cancel)" "$(note_lines | grep -c 'Front c1')" 0
 
