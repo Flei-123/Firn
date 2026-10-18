@@ -97,6 +97,13 @@ ocr_crop() { python3 -I -c "import sys
 from PIL import Image
 im=Image.open(sys.argv[1]).convert('L').crop(tuple(map(int,sys.argv[2:6])))
 im.resize((im.width*3,im.height*3)).save(sys.argv[6])" "$OUT/$1.png" "$2" "$3" "$4" "$5" "$OUT/$1_crop.png" && tesseract "$OUT/$1_crop.png" stdout --psm 7 2>/dev/null | tr -s '\n ' ' '; }
+# the app logs "geom: tab=N ... bar_visible=0/1" every 5 s: the tab bar must lie inside the window on that tab (a42)
+bar_check() { # name tab-number ; waits for a geom line of that tab that is newer than the call
+    local i n0 L; n0=$(app_log | grep -c "geom.*tab=$2 ")
+    for i in $(seq 8); do [ "$(app_log | grep -c "geom.*tab=$2 ")" -gt "$n0" ] && break; sleep 1.5; done
+    L=$(app_log | grep "geom.*tab=$2 " | tail -1)
+    check "tab bar visible on $1" "$(echo "$L" | grep -c 'bar_visible=1')" 1
+}
 kbd() { $ADB shell dumpsys input_method | grep -c 'mInputShown=true'; }
 # BACK only while the keyboard is up: without it BACK leaves the app (a slow host shows the keyboard seconds late)
 wait_kbd_up() { local i; for i in $(seq 12); do [ "$(kbd)" = 1 ] && return 0; sleep 1; done; return 1; }
@@ -168,6 +175,7 @@ check "streamed reply visible" "$(OCR_TRIES=15 wait_ocr 03_reply 'Hallo hello')"
 # ---- 2. Board: projects, a need answered; Tasks: add ---------------------------------------------------------------------
 echo "== 2. Board and Tasks"
 tap_word "Board" 1 4
+bar_check Board 1
 check "the mobile routes were asked for (ping)" "$(wait_log '"path": "/api/m/ping"' 15 | awk '{print ($1>0)?"yes":"no"}')" yes
 check "Board lists the project" "$(OCR_TRIES=15 wait_ocr 04_board 'Jarvis')" 1
 shot 04_board
@@ -178,12 +186,21 @@ tap_word 'Merge\?' 1 2; shot 05b_need_answers
 tap_word "Yes" 1 3
 check "need answered over /api/m/needs/answer" "$(wait_log '"path": "/api/m/needs/answer".*"answer": "Yes"' 10)" 1
 tap_word "Aufgaben" 1 4
+bar_check Tasks 2
 check "Tasks list shows the task" "$(OCR_TRIES=15 wait_ocr 06_tasks 'milk')" 1
 type_into "Neue|Aufgabe|Text" "callmum" && tap_word "Hinzuf.{1,2}gen" 1 3
 check "task added over /api/m/tasks" "$(wait_log '"path": "/api/m/tasks".*callmum' 10 | awk '{print ($1>0)?"yes":"no"}')" yes
 # the two remaining tab pages, only photographed (design review)
 tap_word "Ger.te" 1 3; shot 06b_devices
+bar_check Devices 3
 tap_px 965 $TAB_Y 3; shot 06c_more # More tab by place: OCR does not find the small word
+bar_check More 4
+# swipe on More (touch pan): with many projects / a small window the page must scroll; the app logs "pan" lines
+SW_X=$((SW / 2)); SW_Y1=$((SH * 70 / 100)); SW_Y2=$((SH * 30 / 100))
+$ADB shell input swipe $SW_X $SW_Y1 $SW_X $SW_Y2 400; sleep 1.5; shot 06d_more_scrolled
+check "More receives the touch pan (app log 'pan: more end')" "$(app_log | grep -c 'pan.*more end' | awk '{print ($1>0)?"yes":"no"}')" yes
+cmp -s "$OUT/06c_more.png" "$OUT/06d_more_scrolled.png" && note "More did not move after the swipe (content may fit the window)" || echo "  (More content moved after the swipe)"
+bar_check "More after swipe" 4
 [ "${E2E_STOP:-}" = tabs ] && { echo "stopped after the tab pages (E2E_STOP=tabs): $PASS ok, $FAIL failed"; exit 0; }
 # the Chat tab by place (the word is too small for OCR on the More page, and a miss would leave the next taps on that page: Logout!)
 tap_px 106 $TAB_Y 2
