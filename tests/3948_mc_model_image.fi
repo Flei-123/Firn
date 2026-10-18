@@ -1,0 +1,357 @@
+// expect_exit: 0
+// tests/3948_mc_model_image.fi -- end to end picture of pack models: four stairs (all four facings, rotated with uvlock) go through
+// mc_render_world.wr_render -> ms_mesh -> MESH_MODEL -> raster_draw_models and are compared pixel by pixel with an independent ray caster
+// over the baked quads (mc_model.blockstate_bake, double sided). The texture has four different quadrant colours (red / green top, blue /
+// yellow bottom), so a mirrored or turned UV changes the class of many pixels; a wrongly wound quad is back face culled and leaves a hole.
+// Four views (+x+y+z, -x+y-z, +x-y-z, -x-y+z) see all six face directions. Packs are built in-process from own pixels (no Mojang file).
+import std.rt
+import std.core
+import std.math
+import std.io
+import zip.zip
+import pack.icons
+import mc.mc_assets
+import mc.mc_texture
+import mc.mc_texext
+import mc.mc_mesh
+import mc.mc_model
+import mc.mc_model_ref
+import mc.mc_model_mesh
+import mc.mc_registry
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_camera
+import mc.mc_math
+import mc.mc_raster
+import mc.mc_render_world
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+const W: i32 = 192
+const H: i32 = 144
+const QW: usize = 20 // f64 per oracle quad: x[4] y[4] z[4] u[4] v[4]
+
+fn ldd(p: u64, i: usize) -> f64 {
+    return *((p + (i as u64) * (8 as u64)) as *mut f64)
+}
+
+fn stf(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (8 as u64)) as *mut f64) = v
+}
+
+// 16 x 16 PNG: top left red, top right green, bottom left blue, bottom right yellow
+fn mk_png(out: *mut rt.Buf) -> bool {
+    let px: u64 = rt.heap_alloc(16 * 16 * 4)
+    var y: usize = 0
+    while y < 16 {
+        var x: usize = 0
+        while x < 16 {
+            let i: usize = (y * 16 + x) * 4
+            var r: u8 = 0 as u8
+            var g: u8 = 0 as u8
+            var b: u8 = 0 as u8
+            if y < 8 && x < 8 { r = 255 as u8 }
+            if y < 8 && x >= 8 { g = 255 as u8 }
+            if y >= 8 && x < 8 { b = 255 as u8 }
+            if y >= 8 && x >= 8 {
+                r = 255 as u8
+                g = 255 as u8
+            }
+            rt.st8(px, i, r)
+            rt.st8(px, i + 1, g)
+            rt.st8(px, i + 2, b)
+            rt.st8(px, i + 3, 255 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let ok: bool = icons.png_encode(px, 16, 16, out)
+    rt.heap_free(px, 16 * 16 * 4)
+    return ok
+}
+
+fn add(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    var ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn build_pack(st: *mut mc_assets.PackStack) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    var w: zip.ZipWriter = zip.zip_writer_new(&b)
+    if !add(&w, "pack.mcmeta", META) { return false }
+    var p: rt.Buf = rt.buf_new()
+    if !mk_png(&p) { return false }
+    var ok: bool = zip.zip_add(&w, "assets/minecraft/textures/block/oak_planks.png", rt.buf_ptr(&p), rt.buf_len(&p), true) catch | e | (false)
+    rt.buf_free(&p)
+    if !ok { return false }
+    if !add(&w, "assets/minecraft/models/block/ms_img_stairs.json",
+        "{\"parent\":\"block/stairs\",\"textures\":{\"bottom\":\"block/oak_planks\",\"top\":\"block/oak_planks\",\"side\":\"block/oak_planks\"}}") { return false }
+    if !add(&w, "assets/minecraft/blockstates/oak_stairs.json",
+        "{\"variants\":{\"facing=east,half=bottom,shape=straight\":{\"model\":\"block/ms_img_stairs\"},\"facing=south,half=bottom,shape=straight\":{\"model\":\"block/ms_img_stairs\",\"y\":90,\"uvlock\":true},\"facing=west,half=bottom,shape=straight\":{\"model\":\"block/ms_img_stairs\",\"y\":180,\"uvlock\":true},\"facing=north,half=bottom,shape=straight\":{\"model\":\"block/ms_img_stairs\",\"y\":270,\"uvlock\":true}}}") { return false }
+    var n: usize = zip.zip_finish(&w) catch | e | (0)
+    zip.zip_writer_free(&w)
+    if n == 0 { return false }
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pk, rt.buf_ptr(&b), rt.buf_len(&b)) != mc_assets.ASSET_OK { return false }
+    rt.buf_free(&b)
+    return mc_assets.stack_push(st, &pk) == mc_assets.ASSET_OK
+}
+
+fn has(b: *mut rt.Buf, s: str) -> bool {
+    let n: usize = rt.buf_len(b)
+    let sl: usize = s.length()
+    if sl > n { return false }
+    var i: usize = 0
+    while i + sl <= n {
+        if rt.mem_eq(rt.buf_ptr(b) + (i as u64), s.p as u64, sl) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// state id of oak_stairs with the given facing (half bottom, shape straight, not waterlogged); -1 = not found
+fn stairs_state(reg: *mut mc_registry.Registry, blk: i32, facing: str) -> i32 {
+    let lo: i32 = mc_registry.reg_block_min_state(reg, blk)
+    let hi: i32 = mc_registry.reg_block_max_state(reg, blk)
+    var s: i32 = lo
+    while s <= hi {
+        var t: rt.Buf = rt.buf_new()
+        if mc_registry.reg_state_text(reg, s, &t) {
+            if has(&t, facing) && has(&t, "half=bottom") && has(&t, "shape=straight") && has(&t, "waterlogged=false") {
+                rt.buf_free(&t)
+                return s
+            }
+        }
+        rt.buf_free(&t)
+        s = s + 1
+    }
+    return 0 - 1
+}
+
+// ---- oracle: ray caster over the baked quads (world coordinates), double sided ----------------------------
+
+fn ray_tri(ox: f64, oy: f64, oz: f64, dx: f64, dy: f64, dz: f64,
+    ax: f64, ay: f64, az: f64, bx: f64, by: f64, bz: f64, cx: f64, cy: f64, cz: f64, out: u64) -> bool {
+    let e1x: f64 = bx - ax
+    let e1y: f64 = by - ay
+    let e1z: f64 = bz - az
+    let e2x: f64 = cx - ax
+    let e2y: f64 = cy - ay
+    let e2z: f64 = cz - az
+    let px: f64 = dy * e2z - dz * e2y
+    let py: f64 = dz * e2x - dx * e2z
+    let pz: f64 = dx * e2y - dy * e2x
+    let det: f64 = e1x * px + e1y * py + e1z * pz
+    if math.fabs(det) < 1.0e-12 { return false }
+    let inv: f64 = 1.0 / det
+    let tx: f64 = ox - ax
+    let ty: f64 = oy - ay
+    let tz: f64 = oz - az
+    let u: f64 = (tx * px + ty * py + tz * pz) * inv
+    if u < 0.0 - 1.0e-9 || u > 1.0 + 1.0e-9 { return false }
+    let qx: f64 = ty * e1z - tz * e1y
+    let qy: f64 = tz * e1x - tx * e1z
+    let qz: f64 = tx * e1y - ty * e1x
+    let v: f64 = (dx * qx + dy * qy + dz * qz) * inv
+    if v < 0.0 - 1.0e-9 || u + v > 1.0 + 1.0e-9 { return false }
+    let t: f64 = (e2x * qx + e2y * qy + e2z * qz) * inv
+    if t <= 1.0e-6 { return false }
+    stf(out, 0, t)
+    stf(out, 1, u)
+    stf(out, 2, v)
+    return true
+}
+
+// colour class: 0 = background, else 1 + bit mask of the channels above half of the brightest one
+fn cls(c: u32) -> i32 {
+    let r: i32 = (c & (255 as u32)) as i32
+    let g: i32 = ((c >> (8 as u32)) & (255 as u32)) as i32
+    let b: i32 = ((c >> (16 as u32)) & (255 as u32)) as i32
+    var m: i32 = r
+    if g > m { m = g }
+    if b > m { m = b }
+    if m < 48 { return 0 }
+    var k: i32 = 1
+    if r * 2 > m { k = k + 1 }
+    if g * 2 > m { k = k + 2 }
+    if b * 2 > m { k = k + 4 }
+    return k
+}
+
+// class of the nearest textured hit on the ray (0 = none). tex = 16 x 16 u32 texels, q = nq oracle quads, sc = 3 f64 scratch
+fn oracle(q: u64, nq: usize, tex: u64, ox: f64, oy: f64, oz: f64, dx: f64, dy: f64, dz: f64, sc: u64) -> i32 {
+    var best: f64 = 1.0e30
+    var out: i32 = 0
+    var i: usize = 0
+    while i < nq {
+        let b: usize = i * QW
+        var k: usize = 0
+        while k < 2 {
+            var ia: usize = 0
+            var ib: usize = 1
+            var ic: usize = 2
+            if k == 1 {
+                ib = 2
+                ic = 3
+            }
+            if ray_tri(ox, oy, oz, dx, dy, dz, ldd(q, b + ia), ldd(q, b + 4 + ia), ldd(q, b + 8 + ia),
+                ldd(q, b + ib), ldd(q, b + 4 + ib), ldd(q, b + 8 + ib), ldd(q, b + ic), ldd(q, b + 4 + ic), ldd(q, b + 8 + ic), sc) {
+                let t: f64 = ldd(sc, 0)
+                let u: f64 = ldd(sc, 1)
+                let v: f64 = ldd(sc, 2)
+                if t < best {
+                    let w0: f64 = 1.0 - u - v
+                    let uu: f64 = w0 * ldd(q, b + 12 + ia) + u * ldd(q, b + 12 + ib) + v * ldd(q, b + 12 + ic)
+                    let vv: f64 = w0 * ldd(q, b + 16 + ia) + u * ldd(q, b + 16 + ib) + v * ldd(q, b + 16 + ic)
+                    var tx: i64 = math.floor(uu) as i64
+                    var ty: i64 = math.floor(vv) as i64
+                    if tx < 0 { tx = 0 }
+                    if ty < 0 { ty = 0 }
+                    if tx > 15 { tx = 15 }
+                    if ty > 15 { ty = 15 }
+                    let c: u32 = rt.ld32(tex, (ty as usize) * 16 + (tx as usize))
+                    if ((c >> (24 as u32)) & (255 as u32)) > (0 as u32) {
+                        best = t
+                        out = cls(c)
+                    }
+                }
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn main() -> i32 {
+    var v: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(763, &v) { return 1 }
+    var reg: mc_registry.Registry = v.registry_of()
+    if !mc_registry.registry_ok(&reg) { return 2 }
+    var st: mc_assets.PackStack = mc_assets.stack_new()
+    if !build_pack(&st) { return 3 }
+
+    // atlas with the pack pixels, cube tables, model set
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_texture.tex_alloc_tables(&tb)
+    var ex: mc_texext.TexExt = mc_texext.texext_new()
+    mc_texext.tex_build_tables_ext(&reg, &tb, &ex)
+    var atlas: mc_texture.Atlas = mc_texext.texext_atlas_new(16, &ex)
+    var an: mc_assets.AnimSet = mc_assets.animset_new()
+    if mc_assets.assets_apply_ext(&st, &atlas, &ex, &an) < 1 { return 4 }
+    var ms: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(&reg, &st, &ex)
+
+    // four stairs: facing east / south / west / north (padded section cell == world block)
+    let blk: i32 = mc_registry.reg_block_by_name(&reg, "oak_stairs".p as u64, 10)
+    if blk < 0 { return 5 }
+    var names: [str; 4] = ["facing=east", "facing=south", "facing=west", "facing=north"]
+    var sid: [i32; 4] = [0; 4]
+    var bx: [i32; 4] = [8, 12, 8, 12]
+    var bz: [i32; 4] = [8, 8, 12, 12]
+    let by: i32 = 8
+    let ids: u64 = rt.heap_alloc(2 * 4096 * 2)
+    var i: usize = 0
+    while i < 8192 {
+        rt.st16(ids, i, 0 as u16)
+        i = i + 1
+    }
+    i = 0
+    while i < 4 {
+        sid[i] = stairs_state(&reg, blk, names[i])
+        if sid[i] < 0 { return 6 }
+        rt.st16(ids, ((by * 16 + bz[i]) * 16 + bx[i]) as usize, sid[i] as u16)
+        if mc_model_mesh.ms_kind(&ms, sid[i] as u16) != mc_model_mesh.K_MODEL { return 7 }
+        i = i + 1
+    }
+    var w: mc_world.World = mc_world.world_new()
+    if !mc_world.world_put(&w, mc_render_world.wr_make_chunk(0, 0, 2, ids)) { return 8 }
+    let min_y: i32 = 0 - 64
+
+    // oracle quads in world coordinates + the texture pixels
+    let oq: u64 = rt.heap_alloc(4 * 16 * QW * 8)
+    var noq: usize = 0
+    var tex: rt.Buf = rt.buf_new()
+    i = 0
+    while i < 4 {
+        var bk: mc_model.Baked = mc_model.baked_new()
+        let state: str = "oak_stairs[" + names[i] + ",half=bottom,shape=straight,waterlogged=false]"
+        var key: str = names[i] + ",half=bottom,shape=straight,waterlogged=false"
+        let n: i32 = mc_model.blockstate_bake(&st, "oak_stairs", key, 0 as u32, &bk)
+        if n != 11 { return 9 }
+        if i == 0 { mc_model_ref.baked_load_textures(&st, &bk, 16, &tex) }
+        var qi: usize = 0
+        while qi < mc_model.baked_count(&bk) {
+            if mc_model.baked_f(&bk, qi, mc_model.W_TEX) > 0.5 { return 10 } // a single texture
+            var k: usize = 0
+            while k < 4 {
+                stf(oq, noq * QW + k, mc_model.baked_f(&bk, qi, mc_model.X0 + k) + (bx[i] as f64))
+                stf(oq, noq * QW + 4 + k, mc_model.baked_f(&bk, qi, mc_model.Y0 + k) + ((min_y + by) as f64))
+                stf(oq, noq * QW + 8 + k, mc_model.baked_f(&bk, qi, mc_model.Z0 + k) + (bz[i] as f64))
+                stf(oq, noq * QW + 12 + k, mc_model.baked_f(&bk, qi, mc_model.U0 + k))
+                stf(oq, noq * QW + 16 + k, mc_model.baked_f(&bk, qi, mc_model.V0 + k))
+                k = k + 1
+            }
+            noq = noq + 1
+            qi = qi + 1
+        }
+        mc_model.baked_free(&bk)
+        i = i + 1
+    }
+    if noq != 44 { return 11 }
+
+    var r: mc_raster.Raster = mc_raster.raster_new(W, H)
+    mc_raster.backend_upload_atlas(&r, &atlas)
+    var wr: mc_render_world.WorldRender = mc_render_world.wr_new(min_y, 8, &tb)
+    mc_render_world.wr_set_models(&wr, (&ms) as u64)
+    var cam: mc_camera.Camera = mc_camera.camera_new(W, H)
+    mc_camera.camera_set_lens(&cam, 40.0, 0.05, 200.0)
+    let sc: u64 = rt.heap_alloc(3 * 8)
+    let cxw: f64 = 10.5
+    let cyw: f64 = ((min_y + by) as f64) + 0.4
+    let czw: f64 = 10.5
+    var sx: [f64; 4] = [1.0, 0.0 - 1.0, 1.0, 0.0 - 1.0]
+    var sy: [f64; 4] = [1.0, 1.0, 0.0 - 1.0, 0.0 - 1.0]
+    var sz: [f64; 4] = [1.0, 0.0 - 1.0, 0.0 - 1.0, 1.0]
+    var total_cov: i32 = 0
+    var total_bad: i32 = 0
+    var vw: usize = 0
+    while vw < 4 {
+        mc_camera.camera_set_pos(&cam, cxw + sx[vw] * 9.0, cyw + sy[vw] * 7.0, czw + sz[vw] * 9.0)
+        mc_camera.camera_look_at(&cam, cxw, cyw, czw)
+        mc_camera.camera_update(&cam)
+        mc_raster.backend_begin(&r, &cam, 0xFF000000 as u32)
+        mc_render_world.wr_render(&wr, &w, &r, &cam, 0 - 1)
+        var cov: i32 = 0
+        var bad: i32 = 0
+        var holes: i32 = 0
+        var py: i32 = 0
+        while py < H {
+            var px: i32 = 0
+            while px < W {
+                var o: mc_math.Vec3 = mc_math.v3(0.0, 0.0, 0.0)
+                var d: mc_math.Vec3 = mc_math.v3(0.0, 0.0, 0.0)
+                mc_camera.camera_pick_ray(&cam, (px as f64) + 0.5, (py as f64) + 0.5, &o, &d)
+                let want: i32 = oracle(oq, noq, rt.buf_ptr(&tex), o.x, o.y, o.z, d.x, d.y, d.z, sc)
+                let got: i32 = cls(rt.ld32(r.color, (py * W + px) as usize))
+                if want > 0 { cov = cov + 1 }
+                if want != got {
+                    bad = bad + 1
+                    if got == 0 { holes = holes + 1 }
+                }
+                px = px + 1
+            }
+            py = py + 1
+        }
+        io.fmt_print(f"view {vw}: covered {cov} mismatch {bad} (holes {holes}) meshed {wr.st.meshed} tris_culled {r.st.tris_culled}\n")
+        if cov < 800 { return 20 + (vw as i32) }
+        total_cov = total_cov + cov
+        total_bad = total_bad + bad
+        vw = vw + 1
+    }
+    io.fmt_print(f"total: covered {total_cov} mismatch {total_bad}\n")
+    // edges / texel borders may differ by a pixel; a wrong winding or UV changes whole faces (hundreds of pixels)
+    if total_bad * 100 > total_cov * 2 { return 30 }
+    mc_model_mesh.ms_free(&ms)
+    return 0
+}

@@ -6,7 +6,7 @@
 #     independent reference (python / node / java tools, never Mojang code).
 #     Each prints a line `RESULT <name>: ok` and exits 0 on success.
 #
-# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | sessplay | edge)
+# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | sessplay | edge | modelplay)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
@@ -15,7 +15,7 @@ FIRNC=${FIRNC:-compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 # r220: a firnc older than r167 makes every GL stage (mcplay MCPLAY_GL=1 with mesher threads) segfault in the first frame
 case " $ONLY " in
-    "  "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" sessplay "|" play ")
+    "  "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" sessplay "|" modelplay "|" play ")
         bash tools/mc/check_firnc.sh "$FIRNC" || { echo "RESULT mc: FAIL (stale firnc)"; exit 1; } ;;
 esac
 # every .fi file of the tree must be in the canonical shape of firnfmt (test.sh section 23
@@ -48,6 +48,11 @@ fi
 if [ -z "$ONLY" ] || [ "$ONLY" = lodplay ]; then
     echo "== mc/lodplay =="
     bash tools/mc/play/run_lod.sh || ERR=$((ERR+1))
+fi
+# mcplay with pack models (MCPLAY_MODELS=1, mc_model_mesh: stairs from baked quads, own fixture pack, T reload) against the real server, flat world: ~3 min, needs Xvfb + xdotool + java.
+if [ -z "$ONLY" ] || [ "$ONLY" = modelplay ]; then
+    echo "== mc/modelplay =="
+    bash tools/mc/play/run_models.sh || ERR=$((ERR+1))
 fi
 # entities in the mcplay play path against the real server (live packets + CPU/GL pictures with / without boxes): ~4 min, needs Xvfb + java; plus the rider entity scenario of tools/mcclient/run.sh.
 if [ -z "$ONLY" ] || [ "$ONLY" = ents ]; then
