@@ -6,7 +6,7 @@ Usage: table.py [--md | --json | --stats]"""
 import glob, json, os, re, statistics, sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-CHRONO = ["net", "data", "sys", "media", "lang", "data2", "media2", "lib2", "net2", "text", "fnc", "text2"]
+CHRONO = ["net", "data", "sys", "media", "lang", "data2", "media2", "lib2", "net2", "text", "fnc", "text2", "meas2"]
 
 
 def rank(path):

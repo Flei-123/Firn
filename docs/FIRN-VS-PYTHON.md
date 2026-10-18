@@ -32,34 +32,34 @@ Python reference notes: 11 uses Pillow (installed), 13 and 08 use stdlib only (`
 
 | Task | Py lines | Firn lines first pass | Firn lines now | Factor now | Py tokens | Firn tokens | Factor | Py imports | Firn imports | Py run ms | Firn run ms | Firn compile ms |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 01_http_json_api | 43 | 58 | 57 | 1.33 | 345 | 569 | 1.65 | 5 | 6 | 217.6 | 9.4 | 8168 |
-| 02_csv_json_report | 21 | 105 | 100 | 4.76 | 242 | 1012 | 4.18 | 3 | 9 | 168.3 | 3.1 | 2135 |
-| 03_find_rename | 33 | 78 | 60 | 1.82 | 401 | 535 | 1.33 | 1 | 5 | 175.0 | 37.3 | 2194 |
-| 04_regex_text | 20 | 58 | 58 | 2.9 | 230 | 631 | 2.74 | 2 | 7 | 171.1 | 8.8 | 2615 |
-| 05_download_extract | 16 | 37 | 37 | 2.31 | 183 | 402 | 2.2 | 1 | 8 | 166.6 | 16.6 | 6560 |
-| 06_sqlite_query | 15 | 35 | 35 | 2.33 | 79 | 327 | 4.14 | 1 | 6 | 64.8 | 4.0 | 3972 |
-| 07_send_mail | 12 | 11 | 11 | 0.92 | 87 | 83 | 0.95 | 3 | 3 | 164.8 | 16.9 | 4657 |
-| 08_web_scraper | 38 | 27 | 27 | 0.71 | 329 | 278 | 0.84 | 1 | 4 | 64.8 | 6.0 | 3413 |
-| 09_cli_args | 31 | 32 | 32 | 1.03 | 244 | 336 | 1.38 | 1 | 2 | 64.7 | 3.5 | 773 |
-| 10_async_client | 10 | 26 | 18 | 1.8 | 89 | 143 | 1.61 | 3 | 4 | 316.0 | 64.5 | 4301 |
-| 11_image_resize_convert | 8 | 24 | 11 | 1.38 | 73 | 99 | 1.36 | 1 | 2 | 165.4 | 32.4 | 3873 |
-| 12_pdf_create | 55 | 71 | 25 | 0.45 | 546 | 248 | 0.45 | 2 | 4 | 64.8 | 8.1 | 1599 |
-| 13_markdown_to_html | 63 | 11 | 11 | 0.17 | 618 | 90 | 0.15 | 2 | 4 | 65.5 | 1.9 | 1408 |
-| 14_timer_scheduler | 25 | 43 | 43 | 1.72 | 202 | 342 | 1.69 | 1 | 2 | 516.6 | 415.5 | 603 |
-| 15_parallel_map_files | 17 | 68 | 64 | 3.76 | 168 | 540 | 3.21 | 2 | 7 | 164.9 | 64.4 | 1019 |
-| 16_fui_list_button | 14 | 26 | 26 | 1.86 | 114 | 279 | 2.45 | 1 | 3 | -1 | -1 | 11231 |
-| 17_websocket_chat | 24 | 21 | 20 | 0.83 | 217 | 166 | 0.76 | 3 | 4 | 64.8 | 3.9 | 3602 |
-| 18_logging | 25 | 41 | 41 | 1.64 | 234 | 359 | 1.53 | 1 | 5 | 165.4 | 4.2 | 895 |
-| 19_tests | 41 | 96 | 50 | 1.22 | 555 | 501 | 0.9 | 3 | 4 | 114.5 | 3.8 | 1088 |
-| 20_canvas_game | 33 | 67 | 56 | 1.7 | 385 | 409 | 1.06 | 0 | 2 | 64.3 | 3.8 | 2774 |
+| 01_http_json_api | 43 | 58 | 57 | 1.33 | 345 | 569 | 1.65 | 5 | 6 | 114.3 | 3.6 | 3652 |
+| 02_csv_json_report | 21 | 105 | 71 | 3.38 | 242 | 791 | 3.27 | 3 | 11 | 64.6 | 3.8 | 936 |
+| 03_find_rename | 33 | 78 | 50 | 1.52 | 401 | 499 | 1.24 | 1 | 5 | 64.1 | 7.7 | 937 |
+| 04_regex_text | 20 | 58 | 58 | 2.9 | 230 | 631 | 2.74 | 2 | 7 | 31.9 | 3.5 | 893 |
+| 05_download_extract | 16 | 37 | 37 | 2.31 | 183 | 402 | 2.2 | 1 | 8 | 114.7 | 7.9 | 4257 |
+| 06_sqlite_query | 15 | 35 | 35 | 2.33 | 79 | 327 | 4.14 | 1 | 6 | 32.3 | 3.6 | 3778 |
+| 07_send_mail | 12 | 11 | 11 | 0.92 | 87 | 83 | 0.95 | 3 | 3 | 114.6 | 16.2 | 3557 |
+| 08_web_scraper | 38 | 27 | 27 | 0.71 | 329 | 278 | 0.84 | 1 | 4 | 64.3 | 3.5 | 2436 |
+| 09_cli_args | 31 | 32 | 32 | 1.03 | 244 | 336 | 1.38 | 1 | 2 | 64.1 | 3.5 | 668 |
+| 10_async_client | 10 | 26 | 18 | 1.8 | 89 | 143 | 1.61 | 3 | 4 | 165.1 | 64.4 | 3236 |
+| 11_image_resize_convert | 8 | 24 | 11 | 1.38 | 73 | 99 | 1.36 | 1 | 2 | 164.3 | 31.9 | 2848 |
+| 12_pdf_create | 55 | 71 | 25 | 0.45 | 546 | 248 | 0.45 | 2 | 4 | 64.2 | 8.0 | 1396 |
+| 13_markdown_to_html | 63 | 11 | 11 | 0.17 | 618 | 90 | 0.15 | 2 | 4 | 64.1 | 1.3 | 878 |
+| 14_timer_scheduler | 25 | 43 | 43 | 1.72 | 202 | 342 | 1.69 | 1 | 2 | 515.7 | 415.1 | 667 |
+| 15_parallel_map_files | 17 | 68 | 61 | 3.59 | 168 | 539 | 3.21 | 2 | 8 | 114.3 | 64.1 | 1119 |
+| 16_fui_list_button | 14 | 26 | 26 | 1.86 | 114 | 279 | 2.45 | 1 | 3 | -1 | -1 | 6557 |
+| 17_websocket_chat | 24 | 21 | 20 | 0.83 | 217 | 166 | 0.76 | 3 | 4 | 64.2 | 3.7 | 1912 |
+| 18_logging | 25 | 41 | 38 | 1.52 | 234 | 315 | 1.35 | 1 | 5 | 64.3 | 3.7 | 1038 |
+| 19_tests | 41 | 96 | 50 | 1.22 | 555 | 501 | 0.9 | 3 | 4 | 64.5 | 3.6 | 804 |
+| 20_canvas_game | 33 | 67 | 56 | 1.7 | 385 | 409 | 1.06 | 0 | 2 | 64.3 | 3.5 | 2257 |
 | p01_dataclass_sort | 10 | 20 | 20 | 2.0 | 74 | 216 | 2.92 | 1 | 2 | 51.2 | 0.8 | 572 |
 | p02_wordcount | 8 | 43 | 25 | 3.12 | 80 | 236 | 2.95 | 1 | 4 | 25.2 | 1.0 | 736 |
 | p03_parse_errors | 7 | 15 | 15 | 2.14 | 37 | 89 | 2.41 | 0 | 2 | 34.3 | 0.6 | 524 |
 
-Re-measured 18.10.2026 (vspy-text, 3 runs, host load 36-46: Py ms inflated; line/token numbers exact). Median unchanged 1.67.
-Shrink expected from open features (notes only, no rewrite): 02/15 default+named args; 04 (58 lines) enumerate + f-string format specs (`{w:<10}`), `Counter`-like dict_top already used; 09/18 named args; 03 enumerate.
+Re-measured 18.10.2026 (meas2, 5 runs, host load ~16-20: ms are still noisy; line/token numbers exact). Median 1.67 -> 1.52.
+Rewritten with the new features (output identical to expect.txt): 02 (100->74, f-string specs, Vec+vec_sort_by instead of arrays/insertion sort), 03 (60->50, `{i:02}`, string tables), 15 (64->61, pystr.count, `{i:02}`), 18 (41->38, named arg, infof, pystr.read_text). 04 (58) and 09 (32) were already on std.pystr/pyre/defaults; nothing left to cut without new libs (04: finditer loop; 09: args setup is 1:1 with argparse).
 
-Summary (`table.py --stats`): `tasks=20 median_factor_now=1.67 median_factor_first=1.94 le1.5_now=9 le1.5_first=7`.
+Summary (`table.py --stats`): `tasks=20 median_factor_now=1.52 median_factor_first=1.94 le1.5_now=9 le1.5_first=7`.
 Live numbers: `python3 tools/vspy/table.py` (reads `examples/vs_python/**/results_*.tsv`).
 Ratios < 1 = Firn shorter. "first pass" = first working Firn version with the libs that existed on 2026-10-17 morning; "now" = after this round's libs.
 Run times: Firn programs run 5-100x faster than `python3` (start 1-4 ms vs 25-45 ms + imports); exception: 14 (timer test is wall-clock bound). Task 10 first looked 5x slower (1278 ms vs 233 ms): the cause was the Python test server (listen backlog 5 -> SYN retransmit), not Firn; fixed in the harness: 61 ms vs 174 ms.
@@ -203,10 +203,10 @@ Compile time (cold, `dev-fast`): hello 10 ms, any program importing `std.io` 0.5
 
 ## 8. Next steps
 
-1. **Language ergonomics first** (biggest lever for the 2-5x tasks): G02 `for x in vec` and G03/G04 default + named args are done (r664); next G22 (enumerate / tuple patterns), G21 (format spec -> `str`), G26 (`main` with `try`), G25 (qualified generics -> libs can use proper names).
+1. **Language ergonomics first** (biggest lever for the 2-5x tasks): G02 `for x in vec`, G03/G04 default + named args (r664/r704), G21 f-string specs (r665/r699), G22 enumerate/zip (r666), G25 `mod.fn[T]` (r701) are done; open: `mod.Type[T]` + generic fns as values, tuple patterns in `for`, G26 (`main` with `try`), G25 (qualified generics -> libs can use proper names).
 2. **Compile speed** (G33): reachability pruning before optimizer/codegen. It makes cold script start and any REPL ~10x faster and is the precondition for G34.
 3. **Packages** (G35): git URL + rev pin in `firn.lock`, `firn add/vendor`. Needed before a community lib ecosystem is possible.
 4. **Option[T] / closures / derive** (G23, G24, G27): large (L), but they decide whether Firn code reads like Python for data-processing code. Needs a design decision per item (SPEC currently says no operator overloading, no generic enums).
-5. **Re-run this study** after each block: `python3 tools/vspy/measure.py examples/vs_python/<task>` + `python3 tools/vspy/table.py`. Target: median line factor <= 1.5 (now ~1.7), no task above 3x.
+5. **Re-run this study** after each block: `python3 tools/vspy/measure.py examples/vs_python/<task>` + `python3 tools/vspy/table.py`. Target: median line factor <= 1.5 (now 1.52), no task above 3x (open: 02 3.4, 15 3.6, 04 2.9, p02 3.1).
 
 Roadmap items: see ROADMAP in the JARVIS project (group "Python-Niveau"), one item per gap above.
