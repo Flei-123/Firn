@@ -36,10 +36,6 @@ vec4 grad_page(int pg, vec3 c, vec2 dx, vec2 dy) {
     return textureGrad(u_atlas3, c, dx, dy);
 }
 void main() {
-    // r266: undo the r265 tie bias (vertices moved 1/256 px) for the interpolated attributes: g(y) = f(y + e) => f = g - e * dFdy (Vulkan window y is down)
-    vec3 uvao = v_uvao - 0.00390625 * dFdy(v_uvao);
-    vec2 lightv = v_light - 0.00390625 * dFdy(v_light);
-    float depthv = v_depth - 0.00390625 * dFdy(v_depth);
     int tsz = int(u_tiles.x);
     ivec4 t;
     int tl = v_tile - 1;
@@ -49,16 +45,16 @@ void main() {
         tl = tl - pg * u_pagel;
     }
     if (u_filter == 0) {
-        int tx = int(floor(uvao.x * float(tsz))) & (tsz - 1);
-        int ty = int(floor(uvao.y * float(tsz))) & (tsz - 1);
+        int tx = int(floor(v_uvao.x * float(tsz))) & (tsz - 1);
+        int ty = int(floor(v_uvao.y * float(tsz))) & (tsz - 1);
         t = ivec4(fetch_page(pg, ivec3(tx, ty, tl)) * 255.0 + 0.5);
         if (u_trans == 0 ? t.a < 128 : t.a < 1) discard;
     } else {
-        vec2 gdx = dFdx(uvao.xy);
-        vec2 gdy = dFdy(uvao.xy);
+        vec2 gdx = dFdx(v_uvao.xy);
+        vec2 gdy = dFdy(v_uvao.xy);
         vec4 s;
-        if (u_pagel >= 1048576) s = texture(u_atlas, vec3(uvao.xy, float(tl)));
-        else s = grad_page(pg, vec3(uvao.xy, float(tl)), gdx, gdy);
+        if (u_pagel >= 1048576) s = texture(u_atlas, vec3(v_uvao.xy, float(tl)));
+        else s = grad_page(pg, vec3(v_uvao.xy, float(tl)), gdx, gdy);
         if (u_trans == 0 ? s.a < 0.5 : s.a < 0.004) discard;
         t = ivec4(s * 255.0 + 0.5);
     }
@@ -72,17 +68,17 @@ void main() {
         int fa = int(u_fade.x + 0.5);
         if (u_fade.y > 0.5 ? bay < fa : bay >= fa) discard;
     }
-    int fq = clamp(int(floor(100.0 + 52.0 * uvao.z)), 0, 256);
+    int fq = clamp(int(floor(100.0 + 52.0 * v_uvao.z)), 0, 256);
     int total = (fq * v_fk) >> 8;
     // light: same integer arithmetic as mc_raster.fi (s256 / b256 / per channel factor 24..256)
-    int s256 = clamp(int(floor(lightv.x * u_light.x / 15.0 + 0.5)), 0, 256);
-    int b256 = clamp(int(floor(lightv.y * 256.0 / 15.0 + 0.5)), 0, 256);
+    int s256 = clamp(int(floor(v_light.x * u_light.x / 15.0 + 0.5)), 0, 256);
+    int b256 = clamp(int(floor(v_light.y * 256.0 / 15.0 + 0.5)), 0, 256);
     ivec3 lum = max(ivec3(s256), (b256 * ivec3(u_light.yzw)) >> 8);
     ivec3 lf = 24 + ((lum * 232) >> 8);
     ivec3 tot = (total * lf) >> 8;
     ivec3 c = (t.rgb * tot) >> 8;
     if (u_fog.x > 0.5) {
-        float tt = clamp((depthv - u_fog.y) / (u_fog.z - u_fog.y), 0.0, 1.0);
+        float tt = clamp((v_depth - u_fog.y) / (u_fog.z - u_fog.y), 0.0, 1.0);
         int f = int(floor(tt * 256.0));
         c = (c * (256 - f) + ivec3(u_fogc) * f) >> 8;
     }

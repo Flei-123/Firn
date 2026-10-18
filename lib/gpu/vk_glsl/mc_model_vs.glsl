@@ -28,7 +28,6 @@ void main() {
         vec2 hs = vec2(u_fade.w, u_fade.z) * 0.5;
         vec2 ndc = gl_Position.xy / gl_Position.w;
         vec2 sc = floor(vec2(hs.x + ndc.x * hs.x, hs.y - ndc.y * hs.y) * 16.0 + 0.5) * 0.0625;
-        sc.y -= 0.00390625;
         gl_Position.xy = vec2((sc.x - hs.x) / hs.x, (hs.y - sc.y) / hs.y) * gl_Position.w;
     }
     gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;
