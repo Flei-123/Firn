@@ -1371,21 +1371,46 @@ mod tests {
         f
     }
 
+    /// Like `main_calling`, but the call sits in a loop (block 1 loops on
+    /// itself): the dev-fast leaf inliner only touches such call sites.
+    fn main_calling_in_loop(callee: &str) -> Func {
+        let mut f = Func::new("main", vec![], FTy::I32);
+        let a = f.push(0, FTy::I32, Op::Const(2));
+        let b = f.push(0, FTy::I32, Op::Const(40));
+        let l = f.add_block();
+        let x = f.add_block();
+        f.set_term(0, Term::Br(l));
+        let r = f.push(l, FTy::I32, Op::Call { name: callee.into(), args: vec![a, b] });
+        f.set_term(l, Term::BrCond { cond: r, then_bb: l, else_bb: x });
+        f.set_term(x, Term::Ret(Some(r)));
+        f
+    }
+
     fn calls_in(m: &Module, func: &str) -> usize {
         let f = m.funcs.iter().find(|f| f.name == func).expect("function");
         f.blocks.iter().flat_map(|b| b.insts.iter()).filter(|i| matches!(i.op, Op::Call { .. })).count()
     }
 
-    /// r591: the dev-fast leaf inliner embeds a call-free, loop-free body.
+    /// r591: the dev-fast leaf inliner embeds a call-free, loop-free body
+    /// when the call site is inside a loop of the caller, and leaves a call
+    /// outside every loop alone.
     #[test]
     fn dev_leaf_is_embedded() {
         let mut m = Module::new();
         m.funcs.push(add_fn());
-        m.funcs.push(main_calling("add"));
+        m.funcs.push(main_calling_in_loop("add"));
         let (n, changed) = inline_module_dev_leaves(&mut m);
         assert_eq!(n, 1);
         assert_eq!(changed.len(), 1);
         assert_eq!(calls_in(&m, "main"), 0);
+
+        let mut m = Module::new();
+        m.funcs.push(add_fn());
+        m.funcs.push(main_calling("add"));
+        let (n, changed) = inline_module_dev_leaves(&mut m);
+        assert_eq!(n, 0);
+        assert!(changed.is_empty());
+        assert_eq!(calls_in(&m, "main"), 1);
     }
 
     /// r591: a callee that calls anything is no dev leaf (its frame would
