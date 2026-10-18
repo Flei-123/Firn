@@ -25,8 +25,14 @@ signature of the method the receiver type reaches. A call that sits inside the
 arguments of another pending call is seen one round later (loop in `main.rs`);
 what stays unresolved is an error "needs default or named arguments but its
 receiver type is unknown". The defaults stay on the declarations until nothing
-is pending. firnc1 does NOT have this (it still reports "exists on several
-types"); tests that need it carry `// firnc1_skip:`. `impl I for T` methods
+is pending. firnc1 does the same inside the type checker (r717): `mono.fi`
+`dargs_run` leaves such a call (and keeps the defaults), `sema.fi`
+`methods_call` knows the receiver type and calls `late_defaults` (named
+arguments in order, missing tail = `copy_default`, new nodes get a type slot via
+`grow_nodes`); nested calls need no second round; `sema_run` drops the defaults
+at its end. firnc1 is more lenient than firnc0 for a plain call with too few
+arguments on such a method (it fills the defaults instead of an error).
+`impl I for T` methods
 take no defaults (the signature must equal the interface). firnc1 also checks
 "default must be a constant" (error counted, no text). Consts inside defaults of
 a module function are renamed with the module (`modules.rs`).
