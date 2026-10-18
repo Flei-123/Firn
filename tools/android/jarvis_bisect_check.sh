@@ -43,6 +43,10 @@ for _ in $(seq 1 120); do
 done
 [ "$($ADB shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] || { echo "the emulator did not boot"; exit 1; }
 sleep 5
+# google_apis images allow adbd as root: then the shell may kill -9 / kill -SEGV the app (the signal proof needs it)
+echo "adb root: $($ADB root 2>&1 | tr -d '\r' | head -1)"; sleep 3
+$ADB wait-for-device; sleep 3
+echo "shell uid: $($ADB shell id -u | tr -d '\r')"
 echo "emulator up: $($ADB shell getprop ro.product.cpu.abilist | tr -d '\r')"
 
 TOTAL_FAIL=0
@@ -67,8 +71,8 @@ crash_page() { # apk pkg abi
     # run 2: killed hard before the first frame; run 3 shows the report
     $ADB shell am force-stop "$pkg"; sleep 1
     start_app "$pkg"; sleep 1
-    local pid; pid=$($ADB shell pidof "$pkg" | tr -d '\r')
-    [ -n "$pid" ] && $ADB shell kill -9 "$pid"
+    local pid
+    $ADB shell am force-stop "$pkg"
     sleep 2
     start_app "$pkg"; sleep 9
     expect_text "$tag-early-kill-page" 'last start|crashed|startup stages'
@@ -76,7 +80,7 @@ crash_page() { # apk pkg abi
     $ADB shell am force-stop "$pkg"; sleep 1
     start_app "$pkg"; sleep 10
     pid=$($ADB shell pidof "$pkg" | tr -d '\r')
-    $ADB shell kill -SEGV "$pid"; sleep 1
+    $ADB shell "kill -SEGV $pid 2>/dev/null || su 0 kill -SEGV $pid 2>/dev/null || echo no-kill-permission"; sleep 1
     $ADB shell am force-stop "$pkg"; sleep 1
     start_app "$pkg"; sleep 9
     expect_text "$tag-signal-page" 'signal 11|signal dump|pc_off|base 0x'
