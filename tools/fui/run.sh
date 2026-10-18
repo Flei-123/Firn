@@ -785,6 +785,9 @@ build appw6
 # appw8: editable combobox in the ten-line API (typing filters, Down/Up/Enter/Esc, click, shield, a11y rows, wheel, focus)
 build appw8
 "$W/appw8" | tail -n 3 | grep -q "APPW8 PASSED"
+# appw9: window size class in the ten-line API (classes, hysteresis, callback once per change, columns)
+build appw9
+"$W/appw9" | tail -n 3 | grep -q "APPW9 PASSED"
 # W16: mnemonics (Alt+letter, '&'), Tab order end to end, shortcut management
 build w16
 "$W/w16" | tail -n 3
