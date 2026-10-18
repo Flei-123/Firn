@@ -298,15 +298,13 @@ pub(crate) fn emit_checked_bin(
     let bad = format!(".Lchksite{}", uid);
     // The two originals have to survive the operation: the message names
     // them. x11/x13 are scratch of the A64 backend and hold no FIR value.
-    // r454: a 64-bit `+`/`-` does not copy them on the hot path: `b` is not touched by the operation and `a` is recovered
-    // from the wrapped result inside the panic arm (`a = r - b` / `a = r + b`, exact modulo 2^64).
-    let recover64 = bits == 64 && op != BinOp::Mul;
-    if !recover64 {
+    // 64-bit add/sub: the originals are recomputed in the panic block (a = result -/+ b, exact modulo 2^64),
+    // so the hot path needs no copies.
+    let recompute = bits == 64 && matches!(op, BinOp::Add | BinOp::Sub);
+    if !recompute {
         e.line(&format!("mov x11, {}", A));
         e.line(&format!("mov x13, {}", B));
     }
-    // The shape `b.<cond> bad` / `b ok` / `bad:` is what cold_checks (codegen_a64) parks out of the hot path.
-    let skip: String;
     if bits == 64 && op == BinOp::Mul {
         // 64 bits: the upper half decides. Signed overflow means the high
         // word is not the sign extension of the low one, unsigned means it
@@ -316,20 +314,18 @@ pub(crate) fn emit_checked_bin(
             e.line(&format!("smulh {}, {}, {}", U, A, B));
             e.line(&format!("mul {}, {}, {}", A, A, B));
             e.line(&format!("cmp {}, {}, asr #63", U, A));
-            skip = format!("b.ne {}", bad);
+            e.line(&format!("b.ne {}", bad));
         } else {
             e.line(&format!("umulh {}, {}, {}", U, A, B));
             e.line(&format!("mul {}, {}, {}", A, A, B));
-            skip = format!("cbnz {}, {}", U, bad);
+            e.line(&format!("cbnz {}, {}", U, bad));
         }
     } else if bits == 32 && op == BinOp::Mul {
         // Two 32-bit operands, each already extended to 64: their 64-bit
         // product is EXACT, so the question is a range question and needs
         // no flag at all.
         e.line(&format!("mul {}, {}, {}", A, A, B));
-        extend_to(e, T, A, ty);
-        e.line(&format!("cmp {}, {}", A, T));
-        skip = format!("b.ne {}", bad);
+        range_check(e, ty, &bad);
     } else if bits >= 32 {
         let (aw, bw) = (rw(A, bits), rw(B, bits));
         match op {
@@ -348,7 +344,7 @@ pub(crate) fn emit_checked_bin(
         } else {
             "cs"
         };
-        skip = format!("b.{} {}", cond, bad);
+        e.line(&format!("b.{} {}", cond, bad));
     } else {
         // 8 and 16 bits: A64 has no arithmetic at those widths and
         // therefore no flags for them. Two values that fit into 8 or 16
@@ -366,23 +362,28 @@ pub(crate) fn emit_checked_bin(
         // its sign extension differ in the upper half for a reason that
         // has nothing to do with overflow.
         e.line(&format!("sxtw {}, {}", A, wn(A)));
-        extend_to(e, T, A, ty);
-        e.line(&format!("cmp {}, {}", A, T));
-        skip = format!("b.ne {}", bad);
+        range_check(e, ty, &bad);
     }
-    e.line(&skip);
     e.line(&format!("b {}", ok));
     e.raw(&format!("{}:", bad));
-    if recover64 {
-        if op == BinOp::Add {
-            e.line(&format!("sub x11, {}, {}", A, B));
-        } else {
-            e.line(&format!("add x11, {}, {}", A, B));
-        }
+    if recompute {
+        let inv = if op == BinOp::Add { "sub" } else { "add" };
+        e.line(&format!("{} x11, {}, {}", inv, A, B));
         e.line(&format!("mov x13, {}", B));
     }
     trampoline_jump(e, panic_code_of(op), &label, msg.len(), "x11", "x13", !ty.signed());
     e.raw(&format!("{}:", ok));
+}
+
+/// `x9` cut to `ty` and read back: differs from `x9` exactly when the
+/// value does not fit. Branches to `bad` in that case.
+fn range_check(e: &mut Emitter, ty: FTy, bad: &str) {
+    if ty.bits() >= 64 {
+        return;
+    }
+    extend_to(e, T, A, ty);
+    e.line(&format!("cmp {}, {}", A, T));
+    e.line(&format!("b.ne {}", bad));
 }
 
 /// Emits `/` and `%`, CHECKED: division by zero, and for a signed type the
