@@ -29,17 +29,18 @@ import mc.mc_backend
 import mc.mc_cull
 import mc.mc_lod
 import mc.mc_wlight
+import mc.mc_model_mesh
 
 export {
     Stream, StreamStats, stream_new, stream_free, stream_chunk_loaded, stream_chunk_unloaded, stream_drop_far,
     stream_mark_block, stream_frame, stream_flush, stream_pending, stream_sections, stream_lod_mode, stream_lod_fade, stream_lod_bin, stream_lod_handle, stream_set_translucent, STREAM_NREC,
-    stream_set_light, stream_set_daylight, stream_mark_section, stream_light_sync, stream_has_column, stream_window_sync,
+    stream_set_light, stream_set_models, stream_set_daylight, stream_mark_section, stream_light_sync, stream_has_column, stream_window_sync,
 }
 
 const STREAM_NREC: usize = 64
 const NSLOT: usize = 32
 const SLOT_WORDS: usize = 8 // busy, pad, mask, verts, idx, scratch, lpad
-const EW: usize = 8 // section entry: key, handle, state, seq, job, quads, flags, translucent handle (0 = none)
+const EW: usize = 10 // section entry: key, handle, state, seq, job, quads, flags, translucent handle (0 = none), model quad handle, translucent model quad handle
 const CW: usize = 16 // column entry: key, chunk, frame, state, then the LOD words (C_*)
 const C_MODE: usize = 4 // 0 full detail, 1 LOD (sections not meshed / not drawn), 2 LOD drawn while the sections mesh
 const C_LH: usize = 5 // back end handle of the LOD mesh (0 = none / nothing visible)
@@ -57,7 +58,7 @@ const FK_BIN: u64 = 1 // LOD mesh replaced: the new one fades in, the old one (C
 const FK_TOFULL: u64 = 2 // mode 0 again: the sections fade in, the LOD mesh fades out
 const FK_TOLOD: u64 = 3 // mode 1: the LOD mesh fades in, the sections (still meshed) fade out, freed when done
 const LOD_MAXQ: usize = 64 // build candidates per frame
-const REC_WORDS: usize = 46
+const REC_WORDS: usize = 50
 const ST_EMPTY: u64 = 0
 const ST_CLEAN: u64 = 1
 const ST_DIRTY: u64 = 2
@@ -82,6 +83,10 @@ const R_TIDX: usize = 16
 const R_TNI: usize = 17
 const R_SNAP: usize = 18 // 0 = pad filled / nothing to do, 1 = fill pending, 2 = a thread is filling it (snap_ensure)
 const R_PTR: usize = 19 // 27 section pointers of the snapshot (taken on the render thread, read by whoever fills the pad)
+const R_MV: usize = 46 // model quads (stream_set_models): heap block of R_MN * MQ_WORDS f64 (0 = none)
+const R_MN: usize = 47
+const R_MTV: usize = 48 // translucent model quads (same layout)
+const R_MTN: usize = 49
 
 struct StreamStats {
     visible: u32, // sections in the draw list
@@ -166,6 +171,7 @@ struct Stream {
     lncand: usize,
     light: bool, // light on: snapshots carry a light pad (stream_set_light)
     wl: u64, // *mut mc_wlight.WorldLight (region volume + tables; its nsec must equal the stream's)
+    models: u64, // *mut mc_model_mesh.ModelSet or 0 (stream_set_models; CPU back end only)
 }
 
 fn now_ns() -> u64 {
@@ -190,7 +196,7 @@ fn stream_new(min_y: i32, nsec: i32, dist: i32, t: *mut mc_mesh.MeshTables, pool
         tbl: 0, cap: 0, used: 0, live: 0, ctbl: 0, ccap: 0, cused: 0, clive: 0, pend: 0, npend: 0, pcap: 0,
         recs: 0, slots: 0, sp: 0, rr: 0, cull: mc_cull.cull_new(min_y, nsec), st: zero_stats(),
         trans_tab: 0, src_opaque: 0, lod_dist: 0, lod_hyst: 1, lod_bin_near: 1, lod_bin: 4, lod_bin_mid: 2, lod_mid_w: 5, lod_bin_far: 8, lod_far_at: 24, lod_fade_frames: 10, lod_ahead: 2, lod_budget_us: 1500 as u64,
-        lodm: mc_mesh.mesher_new(), lsc: rt.heap_alloc(4096), lcand: rt.heap_alloc(LOD_MAXQ * 8), lncand: 0, light: false, wl: 0 }
+        lodm: mc_mesh.mesher_new(), lsc: rt.heap_alloc(4096), lcand: rt.heap_alloc(LOD_MAXQ * 8), lncand: 0, light: false, wl: 0, models: 0 }
     s.recs = rt.heap_alloc(STREAM_NREC * REC_WORDS * 8)
     var i: usize = 0
     while i < STREAM_NREC * REC_WORDS {
@@ -285,8 +291,14 @@ fn free_sec_meshes(s: *mut Stream, b: *mut mc_backend.Backend, slot: usize) {
     if h != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, h) }
     let ht: usize = rt.ld64((*s).tbl, slot * EW + 7) as usize
     if ht != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, ht) }
+    let hm: usize = rt.ld64((*s).tbl, slot * EW + 8) as usize
+    if hm != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, hm) }
+    let hmt: usize = rt.ld64((*s).tbl, slot * EW + 9) as usize
+    if hmt != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, hmt) }
     rt.st64((*s).tbl, slot * EW + 1, 0 as u64)
     rt.st64((*s).tbl, slot * EW + 7, 0 as u64)
+    rt.st64((*s).tbl, slot * EW + 8, 0 as u64)
+    rt.st64((*s).tbl, slot * EW + 9, 0 as u64)
 }
 
 fn free_result(recs: u64, r: usize) {
@@ -298,6 +310,14 @@ fn free_result(recs: u64, r: usize) {
     if tv != 0 { rt.heap_free(tv, (rt.ld64(recs, r * REC_WORDS + R_TNV) as usize) * 8) }
     let tix: u64 = rt.ld64(recs, r * REC_WORDS + R_TIDX)
     if tix != 0 { rt.heap_free(tix, (rt.ld64(recs, r * REC_WORDS + R_TNI) as usize) * 4) }
+    let mv: u64 = rt.ld64(recs, r * REC_WORDS + R_MV)
+    if mv != 0 { rt.heap_free(mv, (rt.ld64(recs, r * REC_WORDS + R_MN) as usize) * mc_model_mesh.MQ_WORDS * 8) }
+    let mtv: u64 = rt.ld64(recs, r * REC_WORDS + R_MTV)
+    if mtv != 0 { rt.heap_free(mtv, (rt.ld64(recs, r * REC_WORDS + R_MTN) as usize) * mc_model_mesh.MQ_WORDS * 8) }
+    rt.st64(recs, r * REC_WORDS + R_MV, 0 as u64)
+    rt.st64(recs, r * REC_WORDS + R_MN, 0 as u64)
+    rt.st64(recs, r * REC_WORDS + R_MTV, 0 as u64)
+    rt.st64(recs, r * REC_WORDS + R_MTN, 0 as u64)
     rt.st64(recs, r * REC_WORDS + R_TVERTS, 0 as u64)
     rt.st64(recs, r * REC_WORDS + R_TIDX, 0 as u64)
     rt.st64(recs, r * REC_WORDS + R_TNV, 0 as u64)
@@ -394,6 +414,8 @@ fn sec_entry(s: *mut Stream, key: u64) -> usize {
     rt.st64((*s).tbl, slot * EW + 5, 0 as u64)
     rt.st64((*s).tbl, slot * EW + 6, 0 as u64)
     rt.st64((*s).tbl, slot * EW + 7, 0 as u64)
+    rt.st64((*s).tbl, slot * EW + 8, 0 as u64)
+    rt.st64((*s).tbl, slot * EW + 9, 0 as u64)
     (*s).used = (*s).used + 1
     (*s).live = (*s).live + 1
     pend_add(s, slot)
@@ -706,6 +728,22 @@ fn stream_set_light(s: *mut Stream, on: bool, wl: u64) {
     }
 }
 
+// Resource pack models on / off (`ms` = a mc_model_mesh.ModelSet, or 0): sections are meshed with their model quads too (CPU back end only; the
+// mesh jobs of all workers share the ModelSet, its bake is locked). Call before the columns load; with columns already loaded they are all remeshed.
+// After a pack reload: stream_flush, mc_model_mesh.ms_reset, stream_set_models again (no job may run while the ModelSet is reset).
+fn stream_set_models(s: *mut Stream, ms: u64) {
+    (*s).models = ms
+    var i: usize = 0
+    while i < (*s).ccap {
+        let st: u64 = rt.ld64((*s).ctbl, i * CW + 3)
+        if st != 0 as u64 && st != ST_TOMB {
+            let k: u64 = rt.ld64((*s).ctbl, i * CW)
+            mark_column(s, key_cx(k), key_cz(k))
+        }
+        i = i + 1
+    }
+}
+
 // Day/night: light uniform of the back end (mc_sky.daylight 0..256), the block light tint stays warm. No remesh needed.
 fn stream_set_daylight(s: *mut Stream, b: *mut mc_backend.Backend, day: i32) {
     (*b).set_light((*b).obj, day, 256, 224, 176)
@@ -801,6 +839,10 @@ fn mesh_one(s: *mut Stream, r: usize) {
         verts: rt.ld64((*s).slots, sb + 3), idx: rt.ld64((*s).slots, sb + 4),
         nverts: 0 as u32, nidx: 0 as u32, nquads: 0 as u32, nfaces: 0 as u32 }
     let pad: u64 = rt.ld64(recs, r * REC_WORDS + R_PAD)
+    if (*s).models != 0 {
+        // model states leave the cube mesher (the same answer for every section, so concurrent writers write the same values)
+        mc_model_mesh.ms_prepare((*s).models as *mut mc_model_mesh.ModelSet, pad, &(*s).tables)
+    }
     if rt.ld64(recs, r * REC_WORDS + R_LIT) != 0 as u64 {
         mc_mesh.mesh_padded_lit(&m, pad, rt.ld64(recs, r * REC_WORDS + R_LPAD), &(*s).tables, (*s).flags | mc_mesh.F_LIGHT)
     } else {
@@ -835,6 +877,41 @@ fn mesh_one(s: *mut Stream, r: usize) {
             tni = m.nidx
         }
     }
+    // model quads (opaque + translucent) of the same snapshot
+    var mverts: u64 = 0
+    var mnq: usize = 0
+    var mtverts: u64 = 0
+    var mtnq: usize = 0
+    if (*s).models != 0 {
+        var mb: rt.Buf = rt.buf_new()
+        var mbt: rt.Buf = rt.buf_new()
+        var lp: u64 = 0
+        if rt.ld64(recs, r * REC_WORDS + R_LIT) != 0 as u64 { lp = rt.ld64(recs, r * REC_WORDS + R_LPAD) }
+        let mkey: u64 = rt.ld64(recs, r * REC_WORDS + R_KEY)
+        mnq = mc_model_mesh.ms_mesh_split((*s).models as *mut mc_model_mesh.ModelSet, pad, lp, &(*s).tables, key_cx(mkey) * 16,
+            (*s).min_y + key_sy(mkey) * 16, key_cz(mkey) * 16, &mb, &mbt)
+        mtnq = rt.buf_len(&mbt) / (mc_model_mesh.MQ_WORDS * 8)
+        if (*s).trans_tab == 0 && mtnq > 0 {
+            // no translucent pass: drawn cut out with the opaque quads
+            rt.buf_push_bytes(&mb, rt.buf_ptr(&mbt), rt.buf_len(&mbt))
+            mnq = mnq + mtnq
+            mtnq = 0
+        }
+        if mnq > 0 {
+            mverts = rt.heap_alloc(mnq * mc_model_mesh.MQ_WORDS * 8)
+            rt.mem_copy(mverts, rt.buf_ptr(&mb), mnq * mc_model_mesh.MQ_WORDS * 8)
+        }
+        if mtnq > 0 {
+            mtverts = rt.heap_alloc(mtnq * mc_model_mesh.MQ_WORDS * 8)
+            rt.mem_copy(mtverts, rt.buf_ptr(&mbt), mtnq * mc_model_mesh.MQ_WORDS * 8)
+        }
+        rt.buf_free(&mb)
+        rt.buf_free(&mbt)
+    }
+    rt.st64(recs, r * REC_WORDS + R_MV, mverts)
+    rt.st64(recs, r * REC_WORDS + R_MN, mnq as u64)
+    rt.st64(recs, r * REC_WORDS + R_MTV, mtverts)
+    rt.st64(recs, r * REC_WORDS + R_MTN, mtnq as u64)
     rt.st64(recs, r * REC_WORDS + R_VERTS, verts)
     rt.st64(recs, r * REC_WORDS + R_NV, nv0 as u64)
     rt.st64(recs, r * REC_WORDS + R_IDX, idx)
@@ -843,7 +920,7 @@ fn mesh_one(s: *mut Stream, r: usize) {
     rt.st64(recs, r * REC_WORDS + R_TNV, tnv as u64)
     rt.st64(recs, r * REC_WORDS + R_TIDX, tidx)
     rt.st64(recs, r * REC_WORDS + R_TNI, tni as u64)
-    rt.st64(recs, r * REC_WORDS + R_NQ, nq as u64)
+    rt.st64(recs, r * REC_WORDS + R_NQ, (nq as u64) + (mnq as u64) + (mtnq as u64))
     rt.st64(recs, r * REC_WORDS + R_CONN, conn as u64)
     rt.st64(recs, r * REC_WORDS + R_NS, now_ns() - t0)
     release_slot((*s).slots, si)
@@ -892,7 +969,15 @@ fn cancel_rec(s: *mut Stream, r: usize) {
 
 // ---- snapshot --------------------------------------------------------------------------------------------
 
+// a state the ModelSet draws from quads (resolved already): the cube tables may have had its faces removed, it still has something to draw
+fn is_model(s: *mut Stream, id: u16) -> bool {
+    if (*s).models == 0 || id >= 32768 as u16 { return false }
+    let ms: *mut mc_model_mesh.ModelSet = (*s).models as *mut mc_model_mesh.ModelSet
+    return rt.ld8((*ms).kind, id as usize) == mc_model_mesh.K_MODEL
+}
+
 fn is_invisible(s: *mut Stream, id: u16) -> bool {
+    if is_model(s, id) { return false }
     var f: usize = 0
     while f < 6 {
         if rt.ld16((*s).tables.tiles, (id as usize) * 6 + f) != 0 as u16 { return false }
@@ -903,6 +988,7 @@ fn is_invisible(s: *mut Stream, id: u16) -> bool {
 
 fn id_opaque(s: *mut Stream, id: u16) -> bool {
     if id >= 32768 as u16 { return false }
+    if is_model(s, id) { return false }
     return (rt.ld8((*s).tables.opaque, id as usize) & 1 as u8) != 0 as u8
 }
 
@@ -1206,6 +1292,29 @@ fn consume(s: *mut Stream, b: *mut mc_backend.Backend, deadline_ns: u64) {
                 (*b).mesh_class((*b).obj, mc_backend.MESH_OPAQUE)
                 (*s).st.upload_bytes = (*s).st.upload_bytes + (tnv * 8 + tni * 4) as u64
             }
+            let oldm: usize = rt.ld64((*s).tbl, slot * EW + 8) as usize
+            if oldm != 0 { (*b).mesh_free((*b).obj, oldm) }
+            let oldmt: usize = rt.ld64((*s).tbl, slot * EW + 9) as usize
+            if oldmt != 0 { (*b).mesh_free((*b).obj, oldmt) }
+            var hm: usize = 0
+            var hmt: usize = 0
+            var mdummy: u32 = 0 as u32
+            let mn: usize = rt.ld64((*s).recs, r * REC_WORDS + R_MN) as usize
+            if mn > 0 && !lodcol {
+                (*b).mesh_class((*b).obj, mc_backend.MESH_MODEL)
+                hm = (*b).mesh_upload((*b).obj, key, rt.ld64((*s).recs, r * REC_WORDS + R_MV), mn * mc_model_mesh.MQ_WORDS, (&mdummy) as u64, 1)
+                (*b).mesh_class((*b).obj, mc_backend.MESH_OPAQUE)
+                (*s).st.upload_bytes = (*s).st.upload_bytes + (mn * mc_model_mesh.MQ_WORDS * 8) as u64
+            }
+            let mtn: usize = rt.ld64((*s).recs, r * REC_WORDS + R_MTN) as usize
+            if mtn > 0 && !lodcol {
+                (*b).mesh_class((*b).obj, mc_backend.MESH_MODEL_T)
+                hmt = (*b).mesh_upload((*b).obj, key, rt.ld64((*s).recs, r * REC_WORDS + R_MTV), mtn * mc_model_mesh.MQ_WORDS, (&mdummy) as u64, 1)
+                (*b).mesh_class((*b).obj, mc_backend.MESH_OPAQUE)
+                (*s).st.upload_bytes = (*s).st.upload_bytes + (mtn * mc_model_mesh.MQ_WORDS * 8) as u64
+            }
+            rt.st64((*s).tbl, slot * EW + 8, hm as u64)
+            rt.st64((*s).tbl, slot * EW + 9, hmt as u64)
             rt.st64((*s).tbl, slot * EW + 1, h as u64)
             rt.st64((*s).tbl, slot * EW + 7, ht as u64)
             rt.st64((*s).tbl, slot * EW + 5, rt.ld64((*s).recs, r * REC_WORDS + R_NQ))
@@ -1376,6 +1485,13 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
                     (key_cz(key) * 16) as f64)
                 drawn = drawn + 1 as u32
             }
+            let hmd: usize = rt.ld64((*s).tbl, (e as usize) * EW + 8) as usize
+            if hmd != 0 {
+                fade_apply(b, ifk, inf >> 16 as u64, false)
+                tris = tris + (*b).draw((*b).obj, hmd, (key_cx(key) * 16) as f64, ((*s).min_y + key_sy(key) * 16) as f64,
+                    (key_cz(key) * 16) as f64)
+                if h == 0 { drawn = drawn + 1 as u32 }
+            }
         }
     }
     fade_off(b)
@@ -1400,6 +1516,12 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
                     tris = tris + (*b).draw((*b).obj, th, (key_cx(tkey) * 16) as f64, ((*s).min_y + key_sy(tkey) * 16) as f64,
                         (key_cz(tkey) * 16) as f64)
                     (*s).st.drawn_trans = (*s).st.drawn_trans + 1 as u32
+                }
+                let thm: usize = rt.ld64((*s).tbl, (te as usize) * EW + 9) as usize
+                if thm != 0 {
+                    fade_apply(b, tfk, tinf >> 16 as u64, false)
+                    tris = tris + (*b).draw((*b).obj, thm, (key_cx(tkey) * 16) as f64, ((*s).min_y + key_sy(tkey) * 16) as f64,
+                        (key_cz(tkey) * 16) as f64)
                 }
             }
         }

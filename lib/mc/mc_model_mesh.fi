@@ -21,7 +21,11 @@
 // the same names assets_apply_ext loads from the packs). A texture without an extended tile is NOT drawn (counted in ms.unmapped).
 // CULL: a quad with a cullface is dropped when the neighbour cell in that direction is opaque (tables.opaque bit 0) or unknown (not loaded).
 // LIGHT: sky / block nibble of the cell in FRONT of a culled-face quad (the neighbour), else of the cell itself; no light array = sky 15 / block 0.
-// NOT done: biome tint (tintindex), ambient occlusion, smooth light per corner, translucency (alpha < 128 texels are cut out), GL / VK back ends.
+// TINT (r236): a quad with a tintindex gets a colour by block class (grass / foliage / water / birch / spruce / lily pad / redstone wire; defaults =
+// the plains colours, ms_set_tint changes them; there is NO per position biome blend: the cube path has no biome colours either).
+// AO (r236): per corner 0..3 like the cube mesher (3 = open) for quads that lie flat on a cell face (dir 0..5); other quads stay 3.
+// TRANSLUCENCY (r236): quads of glass / ice / slime / honey states go to the second stream (ms_mesh_split `out_t`, MESH_MODEL_T); the rest is cut out
+// at alpha 128. NOT done: smooth light per corner, per position biome tint, GL / VK back ends.
 import std.rt
 import std.core
 import std.math
@@ -32,12 +36,13 @@ import mc.mc_texext
 import mc.mc_mesh
 
 export {
-    ModelSet, ms_new, ms_blank, ms_reset, ms_free, ms_prepare, ms_patch_opaque, ms_mesh, ms_state_parts, ms_kind, ms_resolve, ms_tex_tile, ms_quad_count,
+    ModelSet, ms_new, ms_blank, ms_reset, ms_free, ms_set_tint, ms_prepare, ms_patch_opaque, ms_mesh, ms_mesh_split, ms_state_parts, ms_kind, ms_resolve, ms_tex_tile, ms_quad_count,
     MQ_WORDS, K_UNKNOWN, K_PLAIN, K_MODEL, NVAR,
 }
 
-const MQ_WORDS: usize = 24 // output quad: x0..3 y0..3 z0..3 (block units, section relative), u0..3 v0..3 (tile units), tile, shade 0..256, sky, block
-const PQ_WORDS: usize = 26 // prepared quad: the same 24 (unit block coordinates) + 24 = cullface (-1 / 0..5), 25 unused
+const MQ_WORDS: usize = 30 // output quad: x0..3 y0..3 z0..3 (block units, section relative), u0..3 v0..3 (tile units), tile, shade 0..256, sky, block, tint (R | G << 8 | B << 16, -1 none), flags (bit 0 translucent), ao0..3
+const PQ_WORDS: usize = 30 // prepared quad: the first 24 as above (unit block coordinates), 24 cullface (-1 / 0..5), 25 direction (-1 / 0..5), 26 tint class (-1 none), 27 translucent, 28 flat on its face (ao), 29 unused
+const NTINT: usize = 8
 const NSTATE_MAX: usize = 32768
 const NVAR: usize = 4
 const NTEX: usize = 256
@@ -59,11 +64,16 @@ struct ModelSet {
     ntex: usize,
     nmodel: usize, // model states resolved so far
     unmapped: usize, // quads dropped because their texture has no atlas tile
+    lk: u64, // heap word: spin lock of the lazy bake (mesh jobs of several threads share one ModelSet)
+    tint: [u32; 8], // 0xRRGGBB per tint class: 0 grass 1 foliage 2 water 3 birch 4 spruce 5 lily pad 6 redstone wire
 }
 
 fn ms_new(reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack, ex: *mut mc_texext.TexExt) -> ModelSet {
     var m: ModelSet = ModelSet { reg: reg, st: st, ex: ex, kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0,
-        nmodel: 0, unmapped: 0 }
+        nmodel: 0, unmapped: 0, lk: 0,
+        tint: [0x91BD59 as u32, 0x77AB2F as u32, 0x3F76E4 as u32, 0x80A755 as u32, 0x619961 as u32, 0x208030 as u32, 0x4B0000 as u32, 0xFFFFFF as u32] }
+    m.lk = rt.heap_alloc(8)
+    rt.st64(m.lk, 0, 0 as u64)
     m.kind = rt.heap_alloc(NSTATE_MAX)
     m.weighted = rt.heap_alloc(NSTATE_MAX)
     rt.mem_set(m.kind, 0 as u8, NSTATE_MAX)
@@ -85,7 +95,8 @@ fn ms_new(reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack, ex: *mut
 // A ModelSet without tables (nothing allocated, ms_free is a no-op): placeholder for a struct field until ms_new runs.
 fn ms_blank() -> ModelSet {
     return ModelSet { reg: 0 as u64 as *mut mc_registry.Registry, st: 0 as u64 as *mut mc_assets.PackStack, ex: 0 as u64 as *mut mc_texext.TexExt,
-        kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0, nmodel: 0, unmapped: 0 }
+        kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0, nmodel: 0, unmapped: 0, lk: 0,
+        tint: [0 as u32; 8] }
 }
 
 // Forgets everything that was baked (same registry / pack stack / texture table pointers): after a pack reload the models and the texture ->
@@ -94,8 +105,23 @@ fn ms_reset(m: *mut ModelSet) {
     let reg: *mut mc_registry.Registry = (*m).reg
     let st: *mut mc_assets.PackStack = (*m).st
     let ex: *mut mc_texext.TexExt = (*m).ex
+    let tn: [u32; 8] = (*m).tint
     ms_free(m)
     *m = ms_new(reg, st, ex)
+    (*m).tint = tn
+}
+
+// Colour 0xRRGGBB of a tint class (0 grass 1 foliage 2 water 3 birch 4 spruce 5 lily pad 6 redstone wire). Call before meshing (or follow with a remesh).
+fn ms_set_tint(m: *mut ModelSet, cls: usize, rgb: u32) {
+    if cls < NTINT { (*m).tint[cls] = rgb }
+}
+
+fn ms_lock(m: *mut ModelSet) {
+    while __atomic_swap((*m).lk as *mut u64, 0 as u64, 1 as u64) != 0 as u64 { }
+}
+
+fn ms_unlock(m: *mut ModelSet) {
+    __atomic_swap((*m).lk as *mut u64, 1 as u64, 0 as u64)
 }
 
 fn ms_free(m: *mut ModelSet) {
@@ -116,6 +142,7 @@ fn ms_free(m: *mut ModelSet) {
     rt.heap_free((*m).qcnt, NSTATE_MAX * NVAR * 4)
     rt.heap_free((*m).tnames, NTEX * 64)
     rt.heap_free((*m).ttiles, NTEX * 4)
+    rt.heap_free((*m).lk, 8)
 }
 
 // ---- state string -------------------------------------------------------------------------------
@@ -258,6 +285,62 @@ fn shade_of(dir: i32, shade: bool) -> f64 {
     return 204.0
 }
 
+// 1.0 when the four corners of prepared quad `o` of `buf` all lie on the cell face `dir` (0 down 1 up 2 north 3 south 4 west 5 east) - the quad
+// is then lit like a cube face (ao from the cells in front of it), else 0.0.
+fn flat_on_face(buf: u64, o: usize, dir: i32) -> f64 {
+    if dir < 0 || dir > 5 { return 0.0 }
+    var axis: usize = 0
+    if dir == 0 || dir == 1 { axis = 1 }
+    if dir == 2 || dir == 3 { axis = 2 }
+    var want: f64 = 0.0
+    if dir % 2 == 1 { want = 1.0 }
+    var c: usize = 0
+    while c < 4 {
+        let v: f64 = math.math_f64(rt.ld64(buf, o * PQ_WORDS + axis * 4 + c))
+        if fabs(v - want) > 0.0001 { return 0.0 }
+        c = c + 1
+    }
+    return 1.0
+}
+
+// byte search: does `h` (n bytes) contain the ASCII text `w`?
+fn bytes_has(h: u64, n: usize, w: str) -> bool {
+    let wl: usize = w.length()
+    if wl > n { return false }
+    var i: usize = 0
+    while i + wl <= n {
+        if rt.mem_eq(h + (i as u64), w.p as u64, wl) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn bytes_ends(h: u64, n: usize, w: str) -> bool {
+    let wl: usize = w.length()
+    if wl > n { return false }
+    return rt.mem_eq(h + ((n - wl) as u64), w.p as u64, wl)
+}
+
+// Tint class of a block by its registry name (see the header); only used for quads that carry a tintindex.
+fn tint_class(h: u64, n: usize) -> i32 {
+    if bytes_has(h, n, "birch_leaves") { return 3 }
+    if bytes_has(h, n, "spruce_leaves") { return 4 }
+    if bytes_has(h, n, "leaves") || bytes_has(h, n, "vine") { return 1 }
+    if bytes_has(h, n, "water") || bytes_has(h, n, "bubble_column") { return 2 }
+    if bytes_has(h, n, "lily_pad") { return 5 }
+    if bytes_has(h, n, "redstone_wire") { return 6 }
+    return 0
+}
+
+// Translucent render class by block name: glass (all colours, panes), ice, frosted ice, slime, honey. Everything else is cut out at alpha 128.
+fn is_translucent_name(h: u64, n: usize) -> bool {
+    if bytes_has(h, n, "glass") || bytes_has(h, n, "slime_block") || bytes_has(h, n, "honey_block") { return true }
+    if bytes_ends(h, n, "frosted_ice") { return true }
+    if n == 3 && rt.mem_eq(h, "ice".p as u64, 3) { return true }
+    if n >= 4 && bytes_ends(h, n, ":ice") { return true }
+    return false
+}
+
 // Bakes state `s` for variant `v` (0..NVAR-1). Sets kind / weighted on v == 0. Returns the quad count (0 = nothing usable).
 fn bake_state(m: *mut ModelSet, s: usize, v: usize) -> u32 {
     var name: rt.Buf = rt.buf_new()
@@ -283,15 +366,11 @@ fn bake_state(m: *mut ModelSet, s: usize, v: usize) -> u32 {
     let nq: i32 = mc_model.blockstate_bake((*m).st, bname, pstr, seed, &b)
     var model: bool = false
     if nq > 0 && !is_unit_cube(&b) { model = true }
-    if v == 0 {
-        if model {
-            rt.st8((*m).kind, s, K_MODEL)
-            (*m).nmodel = (*m).nmodel + 1
-        } else {
-            rt.st8((*m).kind, s, K_PLAIN)
-        }
-    }
+    if v == 0 && !model { rt.st8((*m).kind, s, K_PLAIN) }
     if model {
+        let tcls: i32 = tint_class(rt.buf_ptr(&name), rt.buf_len(&name))
+        var trn: f64 = 0.0
+        if is_translucent_name(rt.buf_ptr(&name), rt.buf_len(&name)) { trn = 1.0 }
         let total: usize = mc_model.baked_count(&b)
         let buf: u64 = rt.heap_alloc(total * PQ_WORDS * 8)
         var tiles: [u32; 48] = [0 as u32; 48]
@@ -326,7 +405,13 @@ fn bake_state(m: *mut ModelSet, s: usize, v: usize) -> u32 {
                 rt.st64(buf, o * PQ_WORDS + 22, math.math_bits(15.0))
                 rt.st64(buf, o * PQ_WORDS + 23, math.math_bits(0.0))
                 rt.st64(buf, o * PQ_WORDS + 24, math.math_bits(mc_model.baked_f(&b, i, mc_model.W_CULL)))
-                rt.st64(buf, o * PQ_WORDS + 25, math.math_bits(0.0))
+                rt.st64(buf, o * PQ_WORDS + 25, math.math_bits(dir as f64))
+                var tc: f64 = 0.0 - 1.0
+                if mc_model.baked_f(&b, i, mc_model.W_TINT) >= 0.0 { tc = tcls as f64 }
+                rt.st64(buf, o * PQ_WORDS + 26, math.math_bits(tc))
+                rt.st64(buf, o * PQ_WORDS + 27, math.math_bits(trn))
+                rt.st64(buf, o * PQ_WORDS + 28, math.math_bits(flat_on_face(buf, o, dir)))
+                rt.st64(buf, o * PQ_WORDS + 29, math.math_bits(0.0))
                 o = o + 1
             }
             i = i + 1
@@ -345,17 +430,26 @@ fn bake_state(m: *mut ModelSet, s: usize, v: usize) -> u32 {
             rt.st64((*m).qptr, s * NVAR + v, buf)
         }
     }
+    // published last: a thread that sees K_MODEL without the lock finds the quads (the counts are taken under the lock in ms_resolve)
+    if v == 0 && model {
+        rt.st8((*m).kind, s, K_MODEL)
+        (*m).nmodel = (*m).nmodel + 1
+    }
     mc_model.baked_free(&b)
     rt.buf_free(&name)
     rt.buf_free(&props)
     return cnt
 }
 
-// Kind of state `id` (bakes variant 0 on first use). Ids past the table and the mesher's UNKNOWN id are plain.
+// Kind of state `id` (bakes variant 0 on first use; thread safe: the bake runs under the ModelSet lock). Ids past the table and the mesher's UNKNOWN
+// id are plain.
 fn ms_kind(m: *mut ModelSet, id: u16) -> u8 {
     let s: usize = id as usize
     if s >= NSTATE_MAX || id == mc_mesh.UNKNOWN_ID { return K_PLAIN }
     var k: u8 = rt.ld8((*m).kind, s)
+    if k != K_UNKNOWN { return k }
+    ms_lock(m)
+    k = rt.ld8((*m).kind, s)
     if k == K_UNKNOWN {
         let c: u32 = bake_state(m, s, 0)
         rt.st32((*m).qcnt, s * NVAR, c)
@@ -370,10 +464,11 @@ fn ms_kind(m: *mut ModelSet, id: u16) -> u8 {
             }
         }
     }
+    ms_unlock(m)
     return k
 }
 
-// Prepared quads of (state, variant): pointer + count. Bakes a weighted variant on demand.
+// Prepared quads of (state, variant): pointer + count. Bakes a weighted variant on demand (under the lock).
 fn ms_resolve(m: *mut ModelSet, id: u16, v: usize, cnt: *mut u32) -> u64 {
     *cnt = 0 as u32
     if ms_kind(m, id) != K_MODEL { return 0 }
@@ -382,8 +477,13 @@ fn ms_resolve(m: *mut ModelSet, id: u16, v: usize, cnt: *mut u32) -> u64 {
     if vv >= NVAR { vv = 0 }
     var c: u32 = rt.ld32((*m).qcnt, s * NVAR + vv)
     if c == UNBAKED {
-        c = bake_state(m, s, vv)
-        rt.st32((*m).qcnt, s * NVAR + vv, c)
+        ms_lock(m)
+        c = rt.ld32((*m).qcnt, s * NVAR + vv)
+        if c == UNBAKED {
+            c = bake_state(m, s, vv)
+            rt.st32((*m).qcnt, s * NVAR + vv, c)
+        }
+        ms_unlock(m)
     }
     *cnt = c
     return rt.ld64((*m).qptr, s * NVAR + vv)
@@ -433,11 +533,79 @@ fn stq(out: *mut rt.Buf, w: usize, v: f64) {
     if w == 0 { return }
 }
 
-// Model quads of the section. pad = u16 [18^3], lpad = u8 [18^3] (sky << 4 | block) or 0, t = the cube tables (opaque bit 0 culls), (wx, wy, wz) = world
-// position of the section's block (0, 0, 0) (the weighted-variant seed uses world block positions). Appends MQ_WORDS f64 per quad to `out`
-// (cleared first). Returns the quad count.
+// 1 when the cell at padded index `i` + (dx, dy, dz) is opaque (tables.opaque bit 0) - the AO occluder test. Unknown / not loaded cells do not occlude.
+fn occludes(pad: u64, t: *mut mc_mesh.MeshTables, i: usize, dx: i32, dy: i32, dz: i32) -> i32 {
+    let ni: i32 = (i as i32) + dy * 324 + dz * 18 + dx
+    if ni < 0 || ni >= 5832 { return 0 }
+    let nid: u16 = rt.ld16(pad, ni as usize)
+    if nid == mc_mesh.UNKNOWN_ID || (nid as usize) >= 32768 { return 0 }
+    if (rt.ld8((*t).opaque, nid as usize) & (1 as u8)) != (0 as u8) { return 1 }
+    return 0
+}
+
+// AO of one corner of a quad lying on cell face `dir` (same rule as the cube mesher: both sides solid = 0, else 3 - sides - corner). (px, py, pz) =
+// the corner in unit block coordinates; the two tangent axes pick the side by which half of the face the corner is in.
+fn corner_ao(pad: u64, t: *mut mc_mesh.MeshTables, i: usize, dir: i32, px: f64, py: f64, pz: f64) -> f64 {
+    var nx: i32 = 0
+    var ny: i32 = 0
+    var nz: i32 = 0
+    var sg: i32 = 0 - 1
+    if dir % 2 == 1 { sg = 1 }
+    var a1x: i32 = 0
+    var a1y: i32 = 0
+    var a1z: i32 = 0
+    var a2x: i32 = 0
+    var a2y: i32 = 0
+    var a2z: i32 = 0
+    var p1: f64 = 0.0
+    var p2: f64 = 0.0
+    if dir == 0 || dir == 1 {
+        ny = sg
+        a1x = 1
+        a2z = 1
+        p1 = px
+        p2 = pz
+    } else if dir == 2 || dir == 3 {
+        nz = sg
+        a1x = 1
+        a2y = 1
+        p1 = px
+        p2 = py
+    } else {
+        nx = sg
+        a1y = 1
+        a2z = 1
+        p1 = py
+        p2 = pz
+    }
+    var s1: i32 = 0 - 1
+    var s2: i32 = 0 - 1
+    if p1 >= 0.5 { s1 = 1 }
+    if p2 >= 0.5 { s2 = 1 }
+    let sa: i32 = occludes(pad, t, i, nx + s1 * a1x, ny + s1 * a1y, nz + s1 * a1z)
+    let sb: i32 = occludes(pad, t, i, nx + s2 * a2x, ny + s2 * a2y, nz + s2 * a2z)
+    if sa == 1 && sb == 1 { return 0.0 }
+    let sc: i32 = occludes(pad, t, i, nx + s1 * a1x + s2 * a2x, ny + s1 * a1y + s2 * a2y, nz + s1 * a1z + s2 * a2z)
+    return (3 - sa - sb - sc) as f64
+}
+
+// Model quads of the section, all in `out` (opaque first, then the translucent ones). See ms_mesh_split.
 fn ms_mesh(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.MeshTables, wx: i32, wy: i32, wz: i32, out: *mut rt.Buf) -> usize {
+    var tb: rt.Buf = rt.buf_new()
+    let n0: usize = ms_mesh_split(m, pad, lpad, t, wx, wy, wz, out, &tb)
+    rt.buf_push_bytes(out, rt.buf_ptr(&tb), rt.buf_len(&tb))
+    let n: usize = n0 + rt.buf_len(&tb) / (MQ_WORDS * 8)
+    rt.buf_free(&tb)
+    return n
+}
+
+// Model quads of the section. pad = u16 [18^3], lpad = u8 [18^3] (sky << 4 | block) or 0, t = the cube tables (opaque bit 0 culls and occludes AO),
+// (wx, wy, wz) = world position of the section's block (0, 0, 0) (the weighted-variant seed uses world block positions). Appends MQ_WORDS f64 per
+// quad to `out` (cleared first); translucent quads (glass, ice ...) go to `out_t` (cleared too). Returns the opaque quad count; the translucent
+// count is rt.buf_len(out_t) / (MQ_WORDS * 8). Tint, flags and AO: see MQ_WORDS.
+fn ms_mesh_split(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.MeshTables, wx: i32, wy: i32, wz: i32, out: *mut rt.Buf, out_t: *mut rt.Buf) -> usize {
     rt.buf_clear(out)
+    rt.buf_clear(out_t)
     var nq: usize = 0
     var y: i32 = 0
     while y < 16 {
@@ -481,31 +649,61 @@ fn ms_mesh(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.MeshTables, wx
                             sky = (lv >> (4 as u8)) as f64
                             blk = (lv & (15 as u8)) as f64
                         }
+                        var dst: *mut rt.Buf = out
+                        var trn: bool = false
+                        if math.math_f64(rt.ld64(q, i * PQ_WORDS + 27)) > 0.5 {
+                            dst = out_t
+                            trn = true
+                        }
                         var c: usize = 0
                         while c < 4 {
-                            stq(out, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + c)) + ((x - 1) as f64))
+                            stq(dst, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + c)) + ((x - 1) as f64))
                             c = c + 1
                         }
                         c = 0
                         while c < 4 {
-                            stq(out, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 4 + c)) + (y as f64))
+                            stq(dst, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 4 + c)) + (y as f64))
                             c = c + 1
                         }
                         c = 0
                         while c < 4 {
-                            stq(out, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 8 + c)) + (z as f64))
+                            stq(dst, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 8 + c)) + (z as f64))
                             c = c + 1
                         }
                         c = 0
                         while c < 8 {
-                            stq(out, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 12 + c)))
+                            stq(dst, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 12 + c)))
                             c = c + 1
                         }
-                        stq(out, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 20)))
-                        stq(out, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 21)))
-                        stq(out, 1, sky)
-                        stq(out, 1, blk)
-                        nq = nq + 1
+                        stq(dst, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 20)))
+                        stq(dst, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 21)))
+                        stq(dst, 1, sky)
+                        stq(dst, 1, blk)
+                        // tint
+                        let tcls: i32 = math.math_f64(rt.ld64(q, i * PQ_WORDS + 26)) as i32
+                        var tv: f64 = 0.0 - 1.0
+                        if tcls >= 0 && (tcls as usize) < NTINT {
+                            let rgb: u32 = (*m).tint[tcls as usize]
+                            tv = (((rgb >> (16 as u32)) & (255 as u32)) | (rgb & (65280 as u32)) | ((rgb & (255 as u32)) << (16 as u32))) as f64
+                        }
+                        stq(dst, 1, tv)
+                        var fl: f64 = 0.0
+                        if trn { fl = 1.0 }
+                        stq(dst, 1, fl)
+                        // ambient occlusion per corner
+                        let flat: bool = math.math_f64(rt.ld64(q, i * PQ_WORDS + 28)) > 0.5
+                        let dir: i32 = math.math_f64(rt.ld64(q, i * PQ_WORDS + 25)) as i32
+                        c = 0
+                        while c < 4 {
+                            var ao: f64 = 3.0
+                            if flat {
+                                ao = corner_ao(pad, t, pi, dir, math.math_f64(rt.ld64(q, i * PQ_WORDS + c)), math.math_f64(rt.ld64(q, i * PQ_WORDS + 4 + c)),
+                                    math.math_f64(rt.ld64(q, i * PQ_WORDS + 8 + c)))
+                            }
+                            stq(dst, 1, ao)
+                            c = c + 1
+                        }
+                        if !trn { nq = nq + 1 }
                     }
                     i = i + 1
                 }
