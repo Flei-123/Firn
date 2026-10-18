@@ -48,6 +48,8 @@
 //          between menus; the items are actions of the window), popup_menu + context_menu (right
 //          click, menu key, Shift+F10), tooltip (500 ms delay), message / confirm / input (modal,
 //          kit.Modal focus trap, answers by callback)
+//   WAVE 5 (r45): rating  segmented (+ segment_add)  chips (+ chip_add)  skeleton  chart (+ chart_set)  pager --
+//          see the section WAVE 5 CONTROLS at the end of this file
 //
 // ========================================================= HONEST
 //
@@ -77,6 +79,7 @@ import fui.style
 import fui.painter
 import fui.kit
 import fui.wave2
+import fui.wave5
 import fui.a11y
 import fui.action
 import fui.ctxmenu
@@ -95,6 +98,9 @@ export {
     menu_shortcut, menu_enable, menu_checked, menu_set_checked, open_menu_id, menu_is_open,
     tooltip, tooltip_shown, message, confirm, input, dialog_open, dialog_text, dialog_answer,
     dialog_rect,
+    rating, rating_value, set_rating_value, segmented, segment_add, segmented_selected, set_segmented_selected,
+    chips, chip_add, chip_count, chip_selected, chip_changed, chip_was_removed, skeleton, skeleton_on,
+    chart, chart_set, pager, pager_page, pager_show,
     ripple_on, split_begin, split_mid, split_end, split_ratio, split_set_ratio, split_limits, split_hovered, split_dragging,
     ANS_OK, ANS_CANCEL,
     CTL_MAX, OPT_MAX, NONE,
@@ -206,6 +212,8 @@ struct Ctl {
     dlg_hclose: bool,
     // the menu bar row (container) while it is open
     mbar: bool,
+    // the wave 5 entry whose pager is being dragged
+    w5_drag: usize,
 }
 
 fn dlg_cb_none(a: *mut app.App, ans: u32) {
@@ -221,7 +229,7 @@ fn ctl_blank() -> Ctl {
         drop_open: false, drop_ctl: NONE, drop_hot: NONE,
         tip_node: NONE, tip_on: false, tip_since: 0, rp: ripple.ripples_new(), rp_node: NONE, tip_x: 0.0, tip_y: 0.0, win_w: 640.0, win_h: 480.0,
         dlg: 0 as u32, dlg_m: kit.modal_new(), dlg_title: "", dlg_text: "", dlg_cb: dlg_cb_none,
-        dlg_ed: editor.editor_new(), dlg_buf: 0, dlg_hot: NONE, dlg_hclose: false, mbar: false }
+        dlg_ed: editor.editor_new(), dlg_buf: 0, dlg_hot: NONE, dlg_hclose: false, mbar: false, w5_drag: NONE }
 }
 
 // ============================================================ THE STATE
@@ -1470,6 +1478,9 @@ fn wake_tick(ud: u64, now: i64) -> bool {
     if ripple.busy(&(*c).rp, now) {
         return true
     }
+    if w5_tick(c, now) {
+        return true
+    }
     // a virtual list (app.vlist_new) running out after a fling or a wheel turn: paint every tick
     if app.vlist_moving((*c).a) {
         return true
@@ -1490,6 +1501,9 @@ fn wake_tick(ud: u64, now: i64) -> bool {
 fn wake_wait(ud: u64, now: i64) -> i64 {
     let c: *mut Ctl = ud as *mut Ctl
     if ripple.busy(&(*c).rp, now) {
+        return 16
+    }
+    if w5_busy(c) {
         return 16
     }
     if app.vlist_moving((*c).a) {
@@ -1905,6 +1919,7 @@ fn sync(c: *mut Ctl) {
 
 fn is_focus_kind(k: u32) -> bool {
     return k == K_SLIDER || k == K_RADIO || k == K_TAB || k == K_SPIN || k == K_DROP
+        || k == K_RATING || k == K_SEG || k == K_CHIPS || k == K_PAGER
 }
 
 // move the keyboard focus to a node
@@ -1985,6 +2000,9 @@ fn ctl_key(ud: u64, key: u32, mods: u32) -> bool {
     let k: u32 = (*c).kind[i]
     let up: bool = key == editor.KEY_UP || key == editor.KEY_LEFT
     let down: bool = key == editor.KEY_DOWN || key == editor.KEY_RIGHT
+    if is_w5_kind(k) {
+        return w5_key(c, i, key)
+    }
     if k == K_SLIDER {
         let cur: i64 = from_permille((*c).last[i], (*c).lo[i], (*c).hi[i])
         var big: i64 = ((*c).hi[i] - (*c).lo[i]) / 10
@@ -2096,17 +2114,19 @@ fn ctl_ptr(ud: u64, kind: u32, x: f64, y: f64) -> bool {
         return true
     }
     ripple_ptr(c, kind, x, y)
+    let w5r: bool = w5_ptr(c, kind, x, y)
     if kind == fuiwirt.HOOK_MOVE {
-        return tip_move(c, x, y)
+        let tm: bool = tip_move(c, x, y)
+        return tm || w5r
     }
     let hid: bool = tip_hide(c)
     if kind != fuiwirt.HOOK_DOWN {
-        return hid
+        return hid || w5r
     }
     let node: usize = scene.scene_hit(sc_of(c), x, y)
     let i: usize = find(c, node)
     if i == NONE || (*c).kind[i] != K_SPIN {
-        return false
+        return w5r
     }
     let zone: f64 = kit.ln(app.app_ctx((*c).a), SPIN_ZONE_PT)
     let nx: f64 = scene.node_x(sc_of(c), node)
@@ -2125,7 +2145,9 @@ fn ctl_act(ud: u64, node: usize) {
     if i == NONE {
         return
     }
-    if (*c).kind[i] == K_DROP && !(*c).drop_open {
+    if is_w5_kind((*c).kind[i]) {
+        w5_act(c, i)
+    } else if (*c).kind[i] == K_DROP && !(*c).drop_open {
         let o: bool = open_dropdown((*c).a, node)
     } else if (*c).kind[i] == K_MENU {
         let o2: bool = open_menu(c, i)
@@ -2431,6 +2453,10 @@ fn ripple_ptr(c: *mut Ctl, kind: u32, x: f64, y: f64) {
         if widget.w_kind(scene.node_widget(sc, n)) != widget.KIND_BUTTON {
             return
         }
+        let wi: usize = find(c, n)
+        if wi != NONE && is_w5_kind((*c).kind[wi]) {
+            return
+        }
         (*c).rp_node = n
         let s: usize = ripple.press(&(*c).rp, now, x, y, scene.node_x(sc, n), scene.node_y(sc, n),
             scene.node_w(sc, n), scene.node_h(sc, n))
@@ -2517,4 +2543,710 @@ fn sink_wait(ud: u64, now: i64) -> i64 {
         return menuview.mv_wait(mv_of(c), now)
     }
     return fuiwirt.WAIT_FOREVER
+}
+
+// ============================================================ WAVE 5 CONTROLS (r45 wiring)
+//
+// The controls of lib/fui/wave5.fi as nodes of the ten-line API. Each is ONE focusable node (a button without
+// surface: `no_fill`) whose painter is the wave5 painter; the state (value, hover, chips, data) lives in a heap
+// `W5` that the entry points at (`aux`). The geometry of hit tests is the one of the painters (wave5.*_hit).
+//
+//     let r: usize = appctl.rating(a, "Quality", 5, true, 7, changed)      // 3.5 stars of 5
+//     let s: usize = appctl.segmented(a, "View", 240, changed)
+//     appctl.segment_add(a, s, "Day"); appctl.segment_add(a, s, "Week")
+//     let t: usize = appctl.chips(a, "Tags", 320, 72, changed)
+//     appctl.chip_add(a, t, "rust", true)
+//     let k: usize = appctl.skeleton(a, 240, 60, 3)                           // 3 lines of placeholder
+//     let g: usize = appctl.chart(a, "Load", wave5.CH_AREA, 240, 80)
+//     appctl.chart_set(a, g, &vals[0], n)
+//     let p: usize = appctl.pager(a, "Pages", 3, 320, 180, draw_page, changed)
+//
+// The callback runs when the USER changed the control; `*_changed` tells which chip. A skeleton shimmers while
+// it is on (theme motion 0 or `skeleton_on(a, id, false)` = still). The pager asks `draw_page(a, rc, page, x, y,
+// w, h)` for the pages that are visible (clip is set); drag, arrows, dots, keys and the glide are the library's.
+
+const K_RATING: u32 = 15
+const K_SEG: u32 = 16
+const K_CHIPS: u32 = 17
+const K_SKEL: u32 = 18
+const K_CHART: u32 = 19
+const K_PAGER: u32 = 20
+const W5_MAX: usize = 8
+const W5_VALS: usize = 128
+
+fn pg_draw_none(a: *mut app.App, rc: *mut render.Ctx, page: usize, x: f64, y: f64, w: f64, h: f64) {
+}
+
+struct W5 {
+    max: usize,
+    spp: usize,
+    val: usize,
+    hover: usize,
+    hpart: u32,
+    n: usize,
+    sel: usize,
+    fch: usize,
+    chg: usize,
+    chg_rm: bool,
+    chips: [wave5.Chip; 8],
+    segs: [wave5.Seg; 8],
+    vals: [f64; 128],
+    nv: usize,
+    ckind: u32,
+    lines: usize,
+    on: bool,
+    phase: i64,
+    last_ms: i64,
+    pg: wave5.Pager,
+    pdraw: fn(*mut app.App, *mut render.Ctx, usize, f64, f64, f64, f64),
+}
+
+fn w5_blank() -> W5 {
+    return W5 { max: 0, spp: 1, val: 0, hover: kit.NONE, hpart: 0 as u32, n: 0, sel: 0, fch: kit.NONE, chg: 0,
+        chg_rm: false,
+        chips: [wave5.Chip { label: "", icon: kit.ICON_NONE, selected: false, close: false }; 8],
+        segs: [wave5.Seg { label: "", icon: kit.ICON_NONE }; 8],
+        vals: [0.0; 128], nv: 0, ckind: 0 as u32, lines: 0, on: true, phase: 0, last_ms: 0,
+        pg: wave5.pager_new(0), pdraw: pg_draw_none }
+}
+
+fn w5_of(c: *mut Ctl, i: usize) -> *mut W5 {
+    return (*c).aux[i] as *mut W5
+}
+
+fn is_w5_kind(k: u32) -> bool {
+    return k >= K_RATING && k <= K_PAGER
+}
+
+// one node + one entry; `name` is spoken, `role` the screen reader role
+fn w5_make(a: *mut app.App, kind: u32, wpt: usize, hpt: usize, name: str, role: u32,
+    on_change: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return NONE
+    }
+    let p: u64 = rt.heap_alloc(8192)
+    if p == 0 {
+        return NONE
+    }
+    *(p as *mut W5) = w5_blank()
+    let focusable: bool = kind == K_RATING || kind == K_SEG || kind == K_CHIPS || kind == K_PAGER
+    var wk: u32 = widget.KIND_NONE
+    if focusable {
+        wk = widget.KIND_BUTTON
+    }
+    let node: usize = app.custom(a, wk, wpt, hpt)
+    if node == NONE {
+        return NONE
+    }
+    (*scene.nd(sc_of(c), node)).no_fill = 1 as u32
+    let i: usize = add_entry(c, kind, node)
+    (*c).aux[i] = p as usize
+    set_cb(c, i, on_change)
+    scene.node_set_draw(sc_of(c), node, c as u64, w5_draw)
+    a11y.a11y_set_role(app.ax(a), node, role)
+    name_node(c, node, name)
+    return node
+}
+
+fn w5_idx(a: *mut app.App, id: usize, kind: u32) -> usize {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE || (*c).kind[i] != kind {
+        return NONE
+    }
+    return i
+}
+
+fn rating(a: *mut app.App, name: str, max: usize, half: bool, init: usize,
+    on_change: fn(*mut app.App, usize)) -> usize {
+    if max == 0 || max > 10 {
+        return NONE
+    }
+    let node: usize = w5_make(a, K_RATING, max * 28, 32, name, a11y.ROLE_SLIDER, on_change)
+    if node == NONE {
+        return NONE
+    }
+    let c: *mut Ctl = st(a)
+    let w: *mut W5 = w5_of(c, find(c, node))
+    (*w).max = max
+    (*w).spp = 1
+    if half {
+        (*w).spp = 2
+    }
+    (*w).val = init
+    if (*w).val > max * (*w).spp {
+        (*w).val = max * (*w).spp
+    }
+    rating_sync(c, find(c, node))
+    return node
+}
+
+fn rating_sync(c: *mut Ctl, i: usize) {
+    let w: *mut W5 = w5_of(c, i)
+    var pm: i64 = 0
+    if (*w).max > 0 {
+        pm = ((*w).val * 1000 / ((*w).max * (*w).spp)) as i64
+    }
+    widget.w_set_value(wid(c, i), pm)
+}
+
+// The rating in steps (half stars count 1; whole stars count `spp`): 0 .. max * (2 if half stars else 1).
+fn rating_value(a: *mut app.App, id: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_RATING)
+    if i == NONE { return 0 }
+    return (*w5_of(c, i)).val
+}
+
+fn set_rating_value(a: *mut app.App, id: usize, v: usize) {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_RATING)
+    if i == NONE { return }
+    let w: *mut W5 = w5_of(c, i)
+    var x: usize = v
+    if x > (*w).max * (*w).spp {
+        x = (*w).max * (*w).spp
+    }
+    (*w).val = x
+    rating_sync(c, i)
+    touch(c)
+}
+
+fn segmented(a: *mut app.App, name: str, wpt: usize, on_change: fn(*mut app.App, usize)) -> usize {
+    let node: usize = w5_make(a, K_SEG, wpt, 32, name, a11y.ROLE_GROUP, on_change)
+    if node == NONE {
+        return NONE
+    }
+    let c: *mut Ctl = st(a)
+    (*w5_of(c, find(c, node))).sel = kit.NONE
+    return node
+}
+
+fn segment_add(a: *mut app.App, id: usize, text: str) -> bool {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_SEG)
+    if i == NONE { return false }
+    let w: *mut W5 = w5_of(c, i)
+    if (*w).n >= W5_MAX { return false }
+    let s: *mut wave5.Seg = wave5.seg_at(&(*w).segs[0], (*w).n)
+    (*s).label = text
+    (*w).n = (*w).n + 1
+    if (*w).sel == kit.NONE {
+        (*w).sel = 0
+    }
+    return true
+}
+
+// The selected segment (0 based), or the count when none.
+fn segmented_selected(a: *mut app.App, id: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_SEG)
+    if i == NONE { return 0 }
+    return (*w5_of(c, i)).sel
+}
+
+fn set_segmented_selected(a: *mut app.App, id: usize, k: usize) {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_SEG)
+    if i == NONE { return }
+    let w: *mut W5 = w5_of(c, i)
+    if k < (*w).n {
+        (*w).sel = k
+        touch(c)
+    }
+}
+
+fn chips(a: *mut app.App, name: str, wpt: usize, hpt: usize, on_change: fn(*mut app.App, usize)) -> usize {
+    let node: usize = w5_make(a, K_CHIPS, wpt, hpt, name, a11y.ROLE_GROUP, on_change)
+    if node == NONE {
+        return NONE
+    }
+    let c: *mut Ctl = st(a)
+    (*w5_of(c, find(c, node))).fch = 0
+    return node
+}
+
+fn chip_add(a: *mut app.App, id: usize, text: str, closable: bool) -> bool {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_CHIPS)
+    if i == NONE { return false }
+    let w: *mut W5 = w5_of(c, i)
+    if (*w).n >= W5_MAX { return false }
+    let ch: *mut wave5.Chip = wave5.chip_at(&(*w).chips[0], (*w).n)
+    (*ch).label = text
+    (*ch).selected = false
+    (*ch).close = closable
+    (*w).n = (*w).n + 1
+    touch(c)
+    return true
+}
+
+fn chip_count(a: *mut app.App, id: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_CHIPS)
+    if i == NONE { return 0 }
+    return (*w5_of(c, i)).n
+}
+
+fn chip_selected(a: *mut app.App, id: usize, k: usize) -> bool {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_CHIPS)
+    if i == NONE { return false }
+    let w: *mut W5 = w5_of(c, i)
+    if k >= (*w).n { return false }
+    return (*wave5.chip_at(&(*w).chips[0], k)).selected
+}
+
+// The chip that caused the last callback, and whether it was removed (it is gone from the list then).
+fn chip_changed(a: *mut app.App, id: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_CHIPS)
+    if i == NONE { return 0 }
+    return (*w5_of(c, i)).chg
+}
+
+fn chip_was_removed(a: *mut app.App, id: usize) -> bool {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_CHIPS)
+    if i == NONE { return false }
+    return (*w5_of(c, i)).chg_rm
+}
+
+fn chip_remove_at(w: *mut W5, k: usize) {
+    var j: usize = k
+    while j + 1 < (*w).n {
+        *wave5.chip_at(&(*w).chips[0], j) = *wave5.chip_at(&(*w).chips[0], j + 1)
+        j = j + 1
+    }
+    if (*w).n > 0 {
+        (*w).n = (*w).n - 1
+    }
+    if (*w).fch >= (*w).n && (*w).n > 0 {
+        (*w).fch = (*w).n - 1
+    }
+    (*w).hover = kit.NONE
+}
+
+fn skeleton(a: *mut app.App, wpt: usize, hpt: usize, lines: usize) -> usize {
+    let node: usize = w5_make(a, K_SKEL, wpt, hpt, "Loading", a11y.ROLE_PROGRESSBAR, cb_none)
+    if node == NONE {
+        return NONE
+    }
+    let c: *mut Ctl = st(a)
+    (*w5_of(c, find(c, node))).lines = lines
+    return node
+}
+
+// A skeleton shimmers while `on`; off = the still placeholder (also what a theme with motion 0 gets).
+fn skeleton_on(a: *mut app.App, id: usize, on: bool) {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_SKEL)
+    if i == NONE { return }
+    (*w5_of(c, i)).on = on
+    touch(c)
+}
+
+fn chart(a: *mut app.App, name: str, kind: u32, wpt: usize, hpt: usize) -> usize {
+    let node: usize = w5_make(a, K_CHART, wpt, hpt, name, a11y.ROLE_IMAGE, cb_none)
+    if node == NONE {
+        return NONE
+    }
+    let c: *mut Ctl = st(a)
+    (*w5_of(c, find(c, node))).ckind = kind
+    return node
+}
+
+// Sets the data (more than 128 values are decimated: means for lines, peaks for bars).
+fn chart_set(a: *mut app.App, id: usize, vals: *mut f64, n: usize) {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_CHART)
+    if i == NONE { return }
+    let w: *mut W5 = w5_of(c, i)
+    if n <= W5_VALS {
+        var k: usize = 0
+        while k < n {
+            (*w).vals[k] = *((vals as u64 + (k * 8) as u64) as *mut f64)
+            k = k + 1
+        }
+        (*w).nv = n
+    } else {
+        var tmp: [f64; 512] = [0.0; 512]
+        let m: usize = wave5.chart_decimate(vals, n, W5_VALS, (*w).ckind == wave5.CH_BARS, &tmp)
+        var k2: usize = 0
+        while k2 < m && k2 < W5_VALS {
+            (*w).vals[k2] = tmp[k2]
+            k2 = k2 + 1
+        }
+        (*w).nv = m
+    }
+    touch(c)
+}
+
+fn pager(a: *mut app.App, name: str, pages: usize, wpt: usize, hpt: usize,
+    draw_page: fn(*mut app.App, *mut render.Ctx, usize, f64, f64, f64, f64),
+    on_change: fn(*mut app.App, usize)) -> usize {
+    let node: usize = w5_make(a, K_PAGER, wpt, hpt, name, a11y.ROLE_GROUP, on_change)
+    if node == NONE {
+        return NONE
+    }
+    let c: *mut Ctl = st(a)
+    let w: *mut W5 = w5_of(c, find(c, node))
+    (*w).pg = wave5.pager_new(pages)
+    (*w).pdraw = draw_page
+    return node
+}
+
+fn pager_page(a: *mut app.App, id: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_PAGER)
+    if i == NONE { return 0 }
+    return (*w5_of(c, i)).pg.cur
+}
+
+fn pager_show(a: *mut app.App, id: usize, k: usize) {
+    let c: *mut Ctl = st(a)
+    let i: usize = w5_idx(a, id, K_PAGER)
+    if i == NONE { return }
+    let w: *mut W5 = w5_of(c, i)
+    wave5.pager_goto(&(*w).pg, k)
+    (*w).sel = (*w).pg.cur
+    touch(c)
+}
+
+// the page changed by the user (key, arrow, dot, swipe): tell the program once
+fn pager_notify(c: *mut Ctl, i: usize) {
+    let w: *mut W5 = w5_of(c, i)
+    if (*w).pg.cur != (*w).sel {
+        (*w).sel = (*w).pg.cur
+        fire(c, i)
+    }
+}
+
+fn motion_of(c: *mut Ctl) -> i64 {
+    return (*theme.theme_shape(render.ctx_theme(app.app_ctx((*c).a)))).motion as i64
+}
+
+fn w5_draw(ud: u64, rc: *mut render.Ctx, e: *mut widget.Widget) {
+    let c: *mut Ctl = ud as *mut Ctl
+    var i: usize = 0
+    while i < (*c).n {
+        if is_w5_kind((*c).kind[i]) && wid(c, i) == e {
+            break
+        }
+        i = i + 1
+    }
+    if i >= (*c).n {
+        return
+    }
+    let w: *mut W5 = w5_of(c, i)
+    let k: u32 = (*c).kind[i]
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let wd: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let focused: bool = app.focus((*c).a) == (*c).node[i]
+    var stt: u32 = 0 as u32
+    if focused {
+        stt = stt | kit.ST_FOCUS
+    }
+    if widget.w_is_disabled(e) {
+        stt = stt | kit.ST_DISABLED
+    }
+    if k == K_RATING {
+        wave5.rating_draw(rc, x, y, (*w).max, (*w).spp, (*w).val, (*w).hover, stt)
+    } else if k == K_SEG {
+        wave5.seg_draw(rc, &(*w).segs[0], (*w).n, (*w).sel, (*w).hover, focused, x, y, wd)
+    } else if k == K_CHIPS {
+        var fc: usize = kit.NONE
+        if focused {
+            fc = (*w).fch
+        }
+        wave5.chips_draw(rc, &(*w).chips[0], (*w).n, (*w).hover, (*w).hpart, fc, x, y, wd)
+    } else if k == K_SKEL {
+        var ph: i64 = (*w).phase
+        if !(*w).on {
+            ph = 0 - 1
+        }
+        if (*w).lines > 0 {
+            let used: f64 = wave5.skeleton_lines(rc, x, y, wd, (*w).lines, ph)
+        } else {
+            wave5.skeleton_draw(rc, x, y, wd, h, 8, ph)
+        }
+    } else if k == K_CHART {
+        wave5.chart_draw(rc, x, y, wd, h, &(*w).vals[0], (*w).nv, (*w).ckind, (*w).hover)
+    } else if k == K_PAGER {
+        let f: fn(*mut app.App, *mut render.Ctx, usize, f64, f64, f64, f64) = (*w).pdraw
+        if wave5.pager_begin(rc, x, y, wd, h) {
+            var j: usize = 0
+            while j < (*w).pg.n {
+                let px: f64 = wave5.pager_page_x(&(*w).pg, j, x, wd)
+                if px < x + wd && px + wd > x {
+                    f((*c).a, rc, j, px, y, wd, h)
+                }
+                j = j + 1
+            }
+            wave5.pager_end(rc)
+        }
+        wave5.pager_nav_draw(rc, &(*w).pg, x, y, wd, h, (*w).hpart)
+        if focused {
+            kit.focus_ring(rc, x, y, wd, h, kit.ln(rc, 8), style.TOK_BASE)
+        }
+    }
+}
+
+// The hover of entry `i` for a pointer at (x, y); true when it changed.
+fn w5_hover(c: *mut Ctl, i: usize, x: f64, y: f64) -> bool {
+    let w: *mut W5 = w5_of(c, i)
+    let rc: *mut render.Ctx = app.app_ctx((*c).a)
+    let sc: *mut scene.Scene = sc_of(c)
+    let nd: usize = (*c).node[i]
+    let nx: f64 = scene.node_x(sc, nd)
+    let ny: f64 = scene.node_y(sc, nd)
+    let nw: f64 = scene.node_w(sc, nd)
+    let nh: f64 = scene.node_h(sc, nd)
+    let k: u32 = (*c).kind[i]
+    var hv: usize = kit.NONE
+    var hp: u32 = 0 as u32
+    if k == K_RATING {
+        let s: usize = wave5.rating_hit(rc, nx, ny, (*w).max, (*w).spp, x, y)
+        if s > 0 {
+            hv = s
+        }
+    } else if k == K_SEG {
+        hv = wave5.seg_hit(rc, (*w).n, nx, ny, nw, x, y)
+    } else if k == K_CHIPS {
+        var part: u32 = 0 as u32
+        hv = wave5.chips_hit(rc, &(*w).chips[0], (*w).n, nx, ny, nw, x, y, &part)
+        hp = part
+    } else if k == K_CHART {
+        hv = wave5.chart_hit(rc, nx, ny, nw, nh, (*w).nv, x, y)
+    } else if k == K_PAGER {
+        hp = wave5.pager_nav_hit(rc, &(*w).pg, nx, ny, nw, nh, x, y)
+    }
+    if hv == (*w).hover && hp == (*w).hpart {
+        return false
+    }
+    (*w).hover = hv
+    (*w).hpart = hp
+    return true
+}
+
+fn w5_clear_hover(c: *mut Ctl, keep: usize) -> bool {
+    var ch: bool = false
+    var i: usize = 0
+    while i < (*c).n {
+        if is_w5_kind((*c).kind[i]) && i != keep {
+            let w: *mut W5 = w5_of(c, i)
+            if (*w).hover != kit.NONE || (*w).hpart != 0 as u32 {
+                (*w).hover = kit.NONE
+                (*w).hpart = 0 as u32
+                ch = true
+            }
+        }
+        i = i + 1
+    }
+    return ch
+}
+
+// pointer events for the wave 5 nodes; true = repaint
+fn w5_ptr(c: *mut Ctl, kind: u32, x: f64, y: f64) -> bool {
+    let now: i64 = fuiwirt.host_now(app.app_host((*c).a))
+    let sc: *mut scene.Scene = sc_of(c)
+    if (*c).w5_drag != NONE {
+        let di: usize = (*c).w5_drag
+        let dw: *mut W5 = w5_of(c, di)
+        if kind == fuiwirt.HOOK_MOVE {
+            wave5.pager_drag_move(&(*dw).pg, x, scene.node_w(sc, (*c).node[di]), now)
+            return true
+        }
+        if kind == fuiwirt.HOOK_UP || kind == fuiwirt.HOOK_LEAVE {
+            wave5.pager_drag_end(&(*dw).pg)
+            (*c).w5_drag = NONE
+            pager_notify(c, di)
+            return true
+        }
+    }
+    if kind == fuiwirt.HOOK_LEAVE {
+        return w5_clear_hover(c, NONE)
+    }
+    var node: usize = scene.scene_hit(sc, x, y)
+    var i: usize = NONE
+    if node != NONE && node < scene.scene_count(sc) {
+        i = find(c, node)
+    }
+    if i != NONE && !is_w5_kind((*c).kind[i]) {
+        i = NONE
+    }
+    var ch: bool = w5_clear_hover(c, i)
+    if i == NONE {
+        return ch
+    }
+    if w5_hover(c, i, x, y) {
+        ch = true
+    }
+    if kind != fuiwirt.HOOK_DOWN {
+        return ch
+    }
+    let w: *mut W5 = w5_of(c, i)
+    let k: u32 = (*c).kind[i]
+    if k == K_RATING {
+        if (*w).hover != kit.NONE && (*w).hover != (*w).val {
+            (*w).val = (*w).hover
+            rating_sync(c, i)
+            fire(c, i)
+        }
+    } else if k == K_SEG {
+        if (*w).hover != kit.NONE && (*w).hover != (*w).sel {
+            (*w).sel = (*w).hover
+            fire(c, i)
+        }
+    } else if k == K_CHIPS {
+        if (*w).hover != kit.NONE {
+            let hk: usize = (*w).hover
+            (*w).fch = hk
+            (*w).chg = hk
+            if (*w).hpart == wave5.CHIP_PART_CLOSE {
+                (*w).chg_rm = true
+                chip_remove_at(w, hk)
+            } else {
+                (*w).chg_rm = false
+                let cc: *mut wave5.Chip = wave5.chip_at(&(*w).chips[0], hk)
+                (*cc).selected = !(*cc).selected
+            }
+            fire(c, i)
+        }
+    } else if k == K_PAGER {
+        if (*w).hpart == wave5.PG_PREV {
+            wave5.pager_prev(&(*w).pg)
+            pager_notify(c, i)
+        } else if (*w).hpart == wave5.PG_NEXT {
+            wave5.pager_next(&(*w).pg)
+            pager_notify(c, i)
+        } else if (*w).hpart >= wave5.PG_DOT {
+            wave5.pager_goto(&(*w).pg, ((*w).hpart - wave5.PG_DOT) as usize)
+            pager_notify(c, i)
+        } else {
+            wave5.pager_drag_begin(&(*w).pg, x, now)
+            (*c).w5_drag = i
+        }
+    }
+    touch(c)
+    return true
+}
+
+// keys of the focused wave 5 node; true = used
+fn w5_key(c: *mut Ctl, i: usize, key: u32) -> bool {
+    let w: *mut W5 = w5_of(c, i)
+    let k: u32 = (*c).kind[i]
+    if k == K_RATING {
+        let v: usize = wave5.rating_key((*w).max, (*w).spp, (*w).val, key)
+        if v == (*w).val {
+            return false
+        }
+        (*w).val = v
+        rating_sync(c, i)
+        fire(c, i)
+        return true
+    }
+    if k == K_SEG {
+        let s: usize = wave5.seg_key((*w).n, (*w).sel, key)
+        if s == (*w).sel || s >= (*w).n {
+            return false
+        }
+        (*w).sel = s
+        fire(c, i)
+        return true
+    }
+    if k == K_CHIPS {
+        if (*w).n == 0 {
+            return false
+        }
+        if wave5.chip_wants_remove(key) {
+            let fk: usize = (*w).fch
+            if fk < (*w).n && (*wave5.chip_at(&(*w).chips[0], fk)).close {
+                (*w).chg = fk
+                (*w).chg_rm = true
+                chip_remove_at(w, fk)
+                fire(c, i)
+                return true
+            }
+            return false
+        }
+        let f2: usize = wave5.chips_key((*w).n, (*w).fch, key)
+        if f2 == (*w).fch || f2 >= (*w).n {
+            return false
+        }
+        (*w).fch = f2
+        return true
+    }
+    if k == K_PAGER {
+        if wave5.pager_key(&(*w).pg, key) {
+            pager_notify(c, i)
+            return true
+        }
+        return false
+    }
+    return false
+}
+
+// Space / Enter on a chip toggles it
+fn w5_act(c: *mut Ctl, i: usize) {
+    if (*c).kind[i] != K_CHIPS {
+        return
+    }
+    let w: *mut W5 = w5_of(c, i)
+    if (*w).fch >= (*w).n {
+        return
+    }
+    let cc: *mut wave5.Chip = wave5.chip_at(&(*w).chips[0], (*w).fch)
+    (*cc).selected = !(*cc).selected
+    (*w).chg = (*w).fch
+    (*w).chg_rm = false
+    fire(c, i)
+}
+
+// the timer: glide of the pagers, phase of the shimmers; true = repaint
+fn w5_tick(c: *mut Ctl, now: i64) -> bool {
+    var any: bool = false
+    var i: usize = 0
+    while i < (*c).n {
+        let k: u32 = (*c).kind[i]
+        if k == K_PAGER || k == K_SKEL {
+            let w: *mut W5 = w5_of(c, i)
+            var dt: i64 = 0
+            if (*w).last_ms != 0 {
+                dt = now - (*w).last_ms
+            }
+            (*w).last_ms = now
+            if k == K_PAGER {
+                if wave5.pager_animating(&(*w).pg) {
+                    let moving: bool = wave5.pager_tick(&(*w).pg, dt, motion_of(c))
+                    any = true
+                } else {
+                    (*w).last_ms = 0
+                }
+            } else if (*w).on && motion_of(c) > 0 && !scene.node_hidden(sc_of(c), (*c).node[i]) {
+                (*w).phase = wave5.shim_step((*w).phase, dt)
+                any = true
+            }
+        }
+        i = i + 1
+    }
+    return any
+}
+
+fn w5_busy(c: *mut Ctl) -> bool {
+    var i: usize = 0
+    while i < (*c).n {
+        let k: u32 = (*c).kind[i]
+        if k == K_PAGER && wave5.pager_animating(&(*w5_of(c, i)).pg) {
+            return true
+        }
+        if k == K_SKEL && (*w5_of(c, i)).on && !scene.node_hidden(sc_of(c), (*c).node[i]) && motion_of(c) > 0 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
 }
