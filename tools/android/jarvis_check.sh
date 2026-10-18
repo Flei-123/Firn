@@ -134,11 +134,11 @@ check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 
 # ---- message + streamed reply
 # right after the login the connection is still being built ("offline - reconnecting"): a message sent before it is up is lost
 # the green "online" pill (outline, small) is lost by full-page OCR: crop the header corner, scale x3, read the line
-online_pill() { local i; for i in $(seq 30); do shot 2b_online
+online_pill() { local i n=${1:-2b_online}; for i in $(seq 30); do shot $n
         python3 -I -c "import sys
 from PIL import Image
 im=Image.open(sys.argv[1]).convert('L').crop((820,140,1080,240))
-im.resize((im.width*3,im.height*3)).save(sys.argv[2])" "$OUT/2b_online.png" "$W/pill.png"
+im.resize((im.width*3,im.height*3)).save(sys.argv[2])" "$OUT/$n.png" "$W/pill.png"
         tesseract "$W/pill.png" stdout --psm 7 2>/dev/null | grep -qi 'online' && { echo 1; return; }; sleep 1.5; done; echo 0; }
 check "online after the login" "$(online_pill)" 1
 tap $FIELD_X $FIELD_Y 1; check "Gboard shows for the message field" "$(wait_kbd)" 1; $ADB shell input text hello; sleep 1
@@ -165,7 +165,7 @@ if [ "$(OCR_TRIES=25 wait_ocr 7_restart 'Chats')" = 1 ]; then echo "  NOTE  rest
 fi
 
 # after the restart the connection is rebuilt ("offline - reconnecting"): a message sent before it is up is not delivered
-check "online again after the restart" "$(OCR_TRIES=30 wait_ocr 8b_online 'online')" 1
+check "online again after the restart" "$(online_pill 8b_online)" 1 # the pill is small and outlined: full-page OCR misses it, the crop of the header corner reads it (as after the login)
 
 # ---- keyboard: typing, cursor, selection, copy/paste. Proof = the exact text the server receives.
 tap $FIELD_X $FIELD_Y 1; wait_kbd >/dev/null; sleep 2; $ADB shell input text abd; sleep 1 # a loaded host reorders fast key events: one step per second

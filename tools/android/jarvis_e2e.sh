@@ -330,6 +330,7 @@ elif [ "$FRONT_C1" = 1 ]; then echo "  OK    front tap: the chat of the notifica
 else note "a tap while the app is open does not switch to the chat of the notification (c2 stays on screen)"; fi
 app_log >"$OUT/app_front.log" 2>/dev/null # kept as proof (tap opens chat ..., slot states)
 check "front tap: the app log says the chat was opened by this tap (intent or status bar)" "$(( $(app_log | grep -c 'tap opens chat c1') - TAPS_BEFORE ))" 1
+if [ -n "${STOP_AFTER_FRONT:-}" ]; then app_log >"$OUT/app_front.log"; $ADB logcat -d >"$OUT/logcat.txt"; echo "STOP_AFTER_FRONT: passed $PASS failed $FAIL"; exit 0; fi
 CHAT_BEFORE="$(ocr 12b_front_after_tap | grep -c 'second question\|second answer')$(ocr 12b_front_after_tap | grep -c 'hello')" # c2 / c1 history on screen
 check "front tap: the notification is gone (auto-cancel)" "$(note_lines | grep -c 'Front c1')" 0
 
