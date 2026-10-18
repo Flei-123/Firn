@@ -1,0 +1,501 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_model_mesh.fi -- mesher side of the resource pack models (r230 / r231): block state id -> state string -> baked quads (mc_model)
+// -> atlas tiles, face culling and light -> one model quad stream per 16^3 section. OPT-IN (mcplay: MCPLAY_MODELS=1); without a ModelSet the
+// whole mesher path is unchanged.
+//
+//     var ms: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(&registry, &pack_stack, &texext)
+//     mc_model_mesh.ms_prepare(&ms, pad, &tables)             // resolve every state of the padded section; models leave the cube mesher
+//     ... normal mesh_padded(pad, tables) ...                 // model blocks have no faces there any more
+//     let nq: usize = mc_model_mesh.ms_mesh(&ms, pad, lpad, &tables, wx, wy, wz, &out)    // out = rt.Buf of nq * MQ_WORDS f64
+//     b.mesh_class(b.obj, MESH_MODEL); b.mesh_upload(b.obj, key, buf, nq * MQ_WORDS, dummy_idx, 1)      // CPU back end only
+//
+// WHICH BLOCKS: a state is a MODEL state when a pack (or the own built-in parents) gives it a blockstate with quads that are NOT exactly a unit
+// cube (stairs, slabs, plants, fences ...). Unit cubes, states without blockstate and states without any usable quad stay with the greedy cube
+// mesher (their tiles/textures come from the extended tile tables). So an empty PackStack changes nothing.
+//
+// STATE STRING (r231): reg_state_text gives "name[prop=value,...]" in registry order; ms_state_parts splits it into the block name and the
+// "prop=value,..." list that blockstate_select expects (any order is fine there). Pre-flattening versions have no props -> "".
+// SEED (r231): weighted variants are picked per block POSITION (mc_model.seed_from_pos). A state is baked for NVAR (4) seeds only when its blockstate
+// really has a weighted list; otherwise all four share one bake.
+// TEXTURES: model texture name ("block/oak_planks", "minecraft:block/x") -> atlas tile through the extended tile candidate names (mc_texext,
+// the same names assets_apply_ext loads from the packs). A texture without an extended tile is NOT drawn (counted in ms.unmapped).
+// CULL: a quad with a cullface is dropped when the neighbour cell in that direction is opaque (tables.opaque bit 0) or unknown (not loaded).
+// LIGHT: sky / block nibble of the cell in FRONT of a culled-face quad (the neighbour), else of the cell itself; no light array = sky 15 / block 0.
+// NOT done: biome tint (tintindex), ambient occlusion, smooth light per corner, translucency (alpha < 128 texels are cut out), GL / VK back ends.
+import std.rt
+import std.core
+import std.math
+import mc.mc_model
+import mc.mc_assets
+import mc.mc_registry
+import mc.mc_texext
+import mc.mc_mesh
+
+export {
+    ModelSet, ms_new, ms_free, ms_prepare, ms_patch_opaque, ms_mesh, ms_state_parts, ms_kind, ms_resolve, ms_tex_tile, ms_quad_count,
+    MQ_WORDS, K_UNKNOWN, K_PLAIN, K_MODEL, NVAR,
+}
+
+const MQ_WORDS: usize = 24 // output quad: x0..3 y0..3 z0..3 (block units, section relative), u0..3 v0..3 (tile units), tile, shade 0..256, sky, block
+const PQ_WORDS: usize = 26 // prepared quad: the same 24 (unit block coordinates) + 24 = cullface (-1 / 0..5), 25 unused
+const NSTATE_MAX: usize = 32768
+const NVAR: usize = 4
+const NTEX: usize = 256
+const K_UNKNOWN: u8 = 0
+const K_PLAIN: u8 = 1 // cube mesher
+const K_MODEL: u8 = 2
+const UNBAKED: u32 = 4294967295 as u32
+
+struct ModelSet {
+    reg: *mut mc_registry.Registry,
+    st: *mut mc_assets.PackStack,
+    ex: *mut mc_texext.TexExt,
+    kind: u64, // u8 [NSTATE_MAX]
+    weighted: u64, // u8 [NSTATE_MAX]
+    qptr: u64, // u64 [NSTATE_MAX * NVAR] prepared quads (PQ_WORDS f64 each)
+    qcnt: u64, // u32 [NSTATE_MAX * NVAR], UNBAKED until baked
+    tnames: u64, // u8 [NTEX * 64] texture names (zero terminated)
+    ttiles: u64, // u32 [NTEX]
+    ntex: usize,
+    nmodel: usize, // model states resolved so far
+    unmapped: usize, // quads dropped because their texture has no atlas tile
+}
+
+fn ms_new(reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack, ex: *mut mc_texext.TexExt) -> ModelSet {
+    var m: ModelSet = ModelSet { reg: reg, st: st, ex: ex, kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0,
+        nmodel: 0, unmapped: 0 }
+    m.kind = rt.heap_alloc(NSTATE_MAX)
+    m.weighted = rt.heap_alloc(NSTATE_MAX)
+    rt.mem_set(m.kind, 0 as u8, NSTATE_MAX)
+    rt.mem_set(m.weighted, 0 as u8, NSTATE_MAX)
+    m.qptr = rt.heap_alloc(NSTATE_MAX * NVAR * 8)
+    m.qcnt = rt.heap_alloc(NSTATE_MAX * NVAR * 4)
+    var i: usize = 0
+    while i < NSTATE_MAX * NVAR {
+        rt.st64(m.qptr, i, 0 as u64)
+        rt.st32(m.qcnt, i, UNBAKED)
+        i = i + 1
+    }
+    m.tnames = rt.heap_alloc(NTEX * 64)
+    m.ttiles = rt.heap_alloc(NTEX * 4)
+    rt.mem_set(m.tnames, 0 as u8, NTEX * 64)
+    return m
+}
+
+fn ms_free(m: *mut ModelSet) {
+    var i: usize = 0
+    while i < NSTATE_MAX * NVAR {
+        let c: u32 = rt.ld32((*m).qcnt, i)
+        let p: u64 = rt.ld64((*m).qptr, i)
+        // variants of a non-weighted state share the pointer of variant 0: only the slot that owns it frees it
+        if c != UNBAKED && c > 0 as u32 && p != 0 && (i % NVAR == 0 || rt.ld8((*m).weighted, i / NVAR) != 0 as u8) {
+            rt.heap_free(p, (c as usize) * PQ_WORDS * 8)
+        }
+        i = i + 1
+    }
+    rt.heap_free((*m).kind, NSTATE_MAX)
+    rt.heap_free((*m).weighted, NSTATE_MAX)
+    rt.heap_free((*m).qptr, NSTATE_MAX * NVAR * 8)
+    rt.heap_free((*m).qcnt, NSTATE_MAX * NVAR * 4)
+    rt.heap_free((*m).tnames, NTEX * 64)
+    rt.heap_free((*m).ttiles, NTEX * 4)
+}
+
+// ---- state string -------------------------------------------------------------------------------
+
+// Splits "name[a=b,c=d]" (reg_state_text) of `state` into name and "a=b,c=d" (both appended to the cleared buffers). false = unknown state.
+fn ms_state_parts(reg: *mut mc_registry.Registry, state: i32, name: *mut rt.Buf, props: *mut rt.Buf) -> bool {
+    var full: rt.Buf = rt.buf_new()
+    rt.buf_clear(name)
+    rt.buf_clear(props)
+    if !mc_registry.reg_state_text(reg, state, &full) {
+        rt.buf_free(&full)
+        return false
+    }
+    let p: u64 = rt.buf_ptr(&full)
+    let n: usize = rt.buf_len(&full)
+    var i: usize = 0
+    while i < n && rt.ld8(p, i) != (91 as u8) { i = i + 1 }
+    rt.buf_push_bytes(name, p, i)
+    if i < n {
+        var e: usize = n
+        if rt.ld8(p, n - 1) == (93 as u8) { e = n - 1 }
+        if e > i + 1 { rt.buf_push_bytes(props, p + ((i + 1) as u64), e - i - 1) }
+    }
+    rt.buf_free(&full)
+    return true
+}
+
+// ---- texture name -> atlas tile -------------------------------------------------------------------
+
+// "minecraft:block/oak_planks" / "block/oak_planks" -> the extended tile whose candidate file name is "oak_planks"; 0 = none.
+fn ms_tex_tile(m: *mut ModelSet, nm: *mut mc_model.Name) -> u32 {
+    // cache
+    var t: usize = 0
+    while t < (*m).ntex {
+        var same: bool = true
+        var i: usize = 0
+        while i <= (*nm).n && i < 64 {
+            if rt.ld8((*m).tnames, t * 64 + i) != (*nm).b[i] { same = false }
+            i = i + 1
+        }
+        if same { return rt.ld32((*m).ttiles, t) }
+        t = t + 1
+    }
+    // strip "minecraft:" and the folder ("block/" / "blocks/")
+    var s: usize = 0
+    if (*nm).n > 10 && rt.mem_eq(mc_model.name_ptr(nm), "minecraft:".p as u64, 10) { s = 10 }
+    var k: usize = s
+    var base: usize = s
+    while k < (*nm).n {
+        if (*nm).b[k] == (47 as u8) { base = k + 1 }
+        k = k + 1
+    }
+    var tile: u32 = 0 as u32
+    if base < (*nm).n {
+        let np: u64 = mc_model.name_ptr(nm) + (base as u64)
+        let nl: usize = (*nm).n - base
+        var i: usize = 0
+        while i < mc_texext.texext_count((*m).ex) && tile == 0 as u32 {
+            var c: usize = 0
+            var cp: u64 = 0
+            var cl: usize = 0
+            while tile == 0 as u32 && mc_texext.texext_cand((*m).ex, i, c, &cp, &cl) {
+                if cl == nl && rt.mem_eq(cp, np, nl) { tile = mc_texext.texext_tile_id(i) }
+                c = c + 1
+            }
+            i = i + 1
+        }
+    }
+    if (*m).ntex < NTEX {
+        var i: usize = 0
+        while i <= (*nm).n && i < 64 {
+            rt.st8((*m).tnames, (*m).ntex * 64 + i, (*nm).b[i])
+            i = i + 1
+        }
+        rt.st32((*m).ttiles, (*m).ntex, tile)
+        (*m).ntex = (*m).ntex + 1
+    }
+    return tile
+}
+
+// ---- classify + prepare -----------------------------------------------------------------------------
+
+fn fabs(v: f64) -> f64 {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+// Exactly six quads, each covering one whole face of the unit cube, all six directions: the cube mesher does that better (greedy, AO).
+fn is_unit_cube(b: *mut mc_model.Baked) -> bool {
+    if mc_model.baked_count(b) != 6 { return false }
+    var seen: u32 = 0 as u32
+    var i: usize = 0
+    while i < 6 {
+        var mn: [f64; 3] = [1000.0; 3]
+        var mx: [f64; 3] = [0.0 - 1000.0; 3]
+        var c: usize = 0
+        while c < 4 {
+            let x: f64 = mc_model.baked_f(b, i, mc_model.X0 + c)
+            let y: f64 = mc_model.baked_f(b, i, mc_model.Y0 + c)
+            let z: f64 = mc_model.baked_f(b, i, mc_model.Z0 + c)
+            if x < mn[0] { mn[0] = x }
+            if x > mx[0] { mx[0] = x }
+            if y < mn[1] { mn[1] = y }
+            if y > mx[1] { mx[1] = y }
+            if z < mn[2] { mn[2] = z }
+            if z > mx[2] { mx[2] = z }
+            c = c + 1
+        }
+        var flat: i32 = 0 - 1
+        var a: usize = 0
+        while a < 3 {
+            if fabs(mx[a] - mn[a]) < 0.0001 {
+                if flat >= 0 { return false }
+                flat = a as i32
+                if !(fabs(mn[a]) < 0.0001 || fabs(mn[a] - 1.0) < 0.0001) { return false }
+            } else {
+                if !(fabs(mn[a]) < 0.0001 && fabs(mx[a] - 1.0) < 0.0001) { return false }
+            }
+            a = a + 1
+        }
+        if flat < 0 { return false }
+        var side: i32 = 0
+        if fabs(mn[flat as usize] - 1.0) < 0.0001 { side = 1 }
+        // direction index 0 down, 1 up, 2 north, 3 south, 4 west, 5 east
+        var dir: i32 = 0
+        if flat == 1 { dir = side }
+        if flat == 2 { dir = 2 + side }
+        if flat == 0 { dir = 4 + side }
+        seen = seen | ((1 as u32) << (dir as u32))
+        i = i + 1
+    }
+    return seen == 63 as u32
+}
+
+fn shade_of(dir: i32, shade: bool) -> f64 {
+    if !shade { return 256.0 }
+    if dir == 0 { return 128.0 }
+    if dir == 1 { return 256.0 }
+    if dir == 2 || dir == 3 { return 153.0 }
+    return 204.0
+}
+
+// Bakes state `s` for variant `v` (0..NVAR-1). Sets kind / weighted on v == 0. Returns the quad count (0 = nothing usable).
+fn bake_state(m: *mut ModelSet, s: usize, v: usize) -> u32 {
+    var name: rt.Buf = rt.buf_new()
+    var props: rt.Buf = rt.buf_new()
+    var cnt: u32 = 0 as u32
+    if !ms_state_parts((*m).reg, s as i32, &name, &props) {
+        rt.buf_free(&name)
+        rt.buf_free(&props)
+        if v == 0 { rt.st8((*m).kind, s, K_PLAIN) }
+        return 0 as u32
+    }
+    let bname: str = str { p: rt.buf_ptr(&name) as *mut u8, n: rt.buf_len(&name) }
+    let pstr: str = str { p: rt.buf_ptr(&props) as *mut u8, n: rt.buf_len(&props) }
+    // distinct seeds with distinct residues for every weight total
+    var seed: u32 = (v as u32) * (2654435761 as u32 / 4 as u32) + (v as u32)
+    if v == 0 { seed = 0 as u32 }
+    if v == 0 {
+        var sel: mc_model.Selection = mc_model.selection_new()
+        let nsel: i32 = mc_model.blockstate_select((*m).st, bname, pstr, seed, &sel)
+        if nsel > 0 && sel.weighted { rt.st8((*m).weighted, s, 1 as u8) }
+    }
+    var b: mc_model.Baked = mc_model.baked_new()
+    let nq: i32 = mc_model.blockstate_bake((*m).st, bname, pstr, seed, &b)
+    var model: bool = false
+    if nq > 0 && !is_unit_cube(&b) { model = true }
+    if v == 0 {
+        if model {
+            rt.st8((*m).kind, s, K_MODEL)
+            (*m).nmodel = (*m).nmodel + 1
+        } else {
+            rt.st8((*m).kind, s, K_PLAIN)
+        }
+    }
+    if model {
+        let total: usize = mc_model.baked_count(&b)
+        let buf: u64 = rt.heap_alloc(total * PQ_WORDS * 8)
+        var tiles: [u32; 48] = [0 as u32; 48]
+        var ti: usize = 0
+        while ti < mc_model.baked_tex_count(&b) && ti < 48 {
+            var tn: mc_model.Name = mc_model.name_new()
+            if mc_model.baked_tex_name(&b, ti, &tn) { tiles[ti] = ms_tex_tile(m, &tn) }
+            ti = ti + 1
+        }
+        var i: usize = 0
+        var o: usize = 0
+        while i < total {
+            let ti2: usize = mc_model.baked_f(&b, i, mc_model.W_TEX) as usize
+            var tile: u32 = 0 as u32
+            if ti2 < 48 { tile = tiles[ti2] }
+            if tile == 0 as u32 {
+                (*m).unmapped = (*m).unmapped + 1
+            } else {
+                var c: usize = 0
+                while c < 4 {
+                    rt.st64(buf, o * PQ_WORDS + c, math.math_bits(mc_model.baked_f(&b, i, mc_model.X0 + c)))
+                    rt.st64(buf, o * PQ_WORDS + 4 + c, math.math_bits(mc_model.baked_f(&b, i, mc_model.Y0 + c)))
+                    rt.st64(buf, o * PQ_WORDS + 8 + c, math.math_bits(mc_model.baked_f(&b, i, mc_model.Z0 + c)))
+                    rt.st64(buf, o * PQ_WORDS + 12 + c, math.math_bits(mc_model.baked_f(&b, i, mc_model.U0 + c) / 16.0))
+                    rt.st64(buf, o * PQ_WORDS + 16 + c, math.math_bits(mc_model.baked_f(&b, i, mc_model.V0 + c) / 16.0))
+                    c = c + 1
+                }
+                let dir: i32 = mc_model.baked_f(&b, i, mc_model.W_DIR) as i32
+                let sh: bool = mc_model.baked_f(&b, i, mc_model.W_SHADE) > 0.5
+                rt.st64(buf, o * PQ_WORDS + 20, math.math_bits(tile as f64))
+                rt.st64(buf, o * PQ_WORDS + 21, math.math_bits(shade_of(dir, sh)))
+                rt.st64(buf, o * PQ_WORDS + 22, math.math_bits(15.0))
+                rt.st64(buf, o * PQ_WORDS + 23, math.math_bits(0.0))
+                rt.st64(buf, o * PQ_WORDS + 24, math.math_bits(mc_model.baked_f(&b, i, mc_model.W_CULL)))
+                rt.st64(buf, o * PQ_WORDS + 25, math.math_bits(0.0))
+                o = o + 1
+            }
+            i = i + 1
+        }
+        cnt = o as u32
+        // keep the exact allocation size: ms_free frees count * PQ_WORDS * 8, so shrink the logical size to o
+        if o == 0 {
+            rt.heap_free(buf, total * PQ_WORDS * 8)
+            rt.st64((*m).qptr, s * NVAR + v, 0 as u64)
+        } else if o < total {
+            let nb: u64 = rt.heap_alloc(o * PQ_WORDS * 8)
+            rt.mem_copy(nb, buf, o * PQ_WORDS * 8)
+            rt.heap_free(buf, total * PQ_WORDS * 8)
+            rt.st64((*m).qptr, s * NVAR + v, nb)
+        } else {
+            rt.st64((*m).qptr, s * NVAR + v, buf)
+        }
+    }
+    mc_model.baked_free(&b)
+    rt.buf_free(&name)
+    rt.buf_free(&props)
+    return cnt
+}
+
+// Kind of state `id` (bakes variant 0 on first use). Ids past the table and the mesher's UNKNOWN id are plain.
+fn ms_kind(m: *mut ModelSet, id: u16) -> u8 {
+    let s: usize = id as usize
+    if s >= NSTATE_MAX || id == mc_mesh.UNKNOWN_ID { return K_PLAIN }
+    var k: u8 = rt.ld8((*m).kind, s)
+    if k == K_UNKNOWN {
+        let c: u32 = bake_state(m, s, 0)
+        rt.st32((*m).qcnt, s * NVAR, c)
+        k = rt.ld8((*m).kind, s)
+        // a non weighted state shares its single bake with the other variants
+        if k == K_MODEL && rt.ld8((*m).weighted, s) == 0 as u8 {
+            var v: usize = 1
+            while v < NVAR {
+                rt.st64((*m).qptr, s * NVAR + v, rt.ld64((*m).qptr, s * NVAR))
+                rt.st32((*m).qcnt, s * NVAR + v, c)
+                v = v + 1
+            }
+        }
+    }
+    return k
+}
+
+// Prepared quads of (state, variant): pointer + count. Bakes a weighted variant on demand.
+fn ms_resolve(m: *mut ModelSet, id: u16, v: usize, cnt: *mut u32) -> u64 {
+    *cnt = 0 as u32
+    if ms_kind(m, id) != K_MODEL { return 0 }
+    let s: usize = id as usize
+    var vv: usize = v
+    if vv >= NVAR { vv = 0 }
+    var c: u32 = rt.ld32((*m).qcnt, s * NVAR + vv)
+    if c == UNBAKED {
+        c = bake_state(m, s, vv)
+        rt.st32((*m).qcnt, s * NVAR + vv, c)
+    }
+    *cnt = c
+    return rt.ld64((*m).qptr, s * NVAR + vv)
+}
+
+fn ms_quad_count(m: *mut ModelSet, id: u16) -> usize {
+    var c: u32 = 0 as u32
+    let p: u64 = ms_resolve(m, id, 0, &c)
+    if p == 0 { return 0 }
+    return c as usize
+}
+
+// Resolves every state of the padded section (18^3 u16) and removes the model states from the cube mesher's tables: no faces (tiles 0) and not
+// opaque. Call BEFORE the cube meshing of the section (and of every section whose padded shell shows the state: the pad of the section includes it).
+fn ms_prepare(m: *mut ModelSet, pad: u64, t: *mut mc_mesh.MeshTables) {
+    var i: usize = 0
+    while i < 5832 {
+        let id: u16 = rt.ld16(pad, i)
+        i = i + 1
+        let s: usize = id as usize
+        if s >= NSTATE_MAX || id == mc_mesh.UNKNOWN_ID { continue }
+        if ms_kind(m, id) == K_MODEL {
+            var f: usize = 0
+            while f < 6 {
+                rt.st16((*t).tiles, s * 6 + f, 0 as u16)
+                f = f + 1
+            }
+            rt.st8((*t).opaque, s, 0 as u8)
+        }
+    }
+}
+
+// The same opaque-bit removal for a second opaque table (the caller's original while a private translucent copy is in use).
+fn ms_patch_opaque(m: *mut ModelSet, opaque: u64) {
+    var s: usize = 0
+    while s < NSTATE_MAX {
+        if rt.ld8((*m).kind, s) == K_MODEL { rt.st8(opaque, s, 0 as u8) }
+        s = s + 1
+    }
+}
+
+// ---- mesh -------------------------------------------------------------------------------------------
+
+fn stq(out: *mut rt.Buf, w: usize, v: f64) {
+    var bits: u64 = math.math_bits(v)
+    rt.buf_push_bytes(out, (&bits) as u64, 8)
+    if w == 0 { return }
+}
+
+// Model quads of the section. pad = u16 [18^3], lpad = u8 [18^3] (sky << 4 | block) or 0, t = the cube tables (opaque bit 0 culls), (wx, wy, wz) = world
+// position of the section's block (0, 0, 0) (the weighted-variant seed uses world block positions). Appends MQ_WORDS f64 per quad to `out`
+// (cleared first). Returns the quad count.
+fn ms_mesh(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.MeshTables, wx: i32, wy: i32, wz: i32, out: *mut rt.Buf) -> usize {
+    rt.buf_clear(out)
+    var nq: usize = 0
+    var y: i32 = 0
+    while y < 16 {
+        var z: i32 = 0
+        while z < 16 {
+            var x: i32 = 0
+            while x < 16 {
+                let pi: usize = (((y + 1) * 18 + (z + 1)) * 18 + (x + 1)) as usize
+                let id: u16 = rt.ld16(pad, pi)
+                x = x + 1
+                if (id as usize) >= NSTATE_MAX || id == mc_mesh.UNKNOWN_ID { continue }
+                if rt.ld8((*m).kind, id as usize) == K_PLAIN { continue }
+                var v: usize = 0
+                if rt.ld8((*m).weighted, id as usize) != 0 as u8 {
+                    v = (mc_model.seed_from_pos(wx + x - 1, wy + y, wz + z) % (NVAR as u32)) as usize
+                }
+                var cnt: u32 = 0 as u32
+                let q: u64 = ms_resolve(m, id, v, &cnt)
+                if q == 0 { continue }
+                var i: usize = 0
+                while i < (cnt as usize) {
+                    let cull: i32 = math.math_f64(rt.ld64(q, i * PQ_WORDS + 24)) as i32
+                    var lc: usize = pi
+                    var skip: bool = false
+                    if cull >= 0 {
+                        let dv: mc_model.V3 = mc_model.dir_vec(cull as usize)
+                        let ni: usize = (((y + 1 + (dv.y as i32)) * 18 + (z + 1 + (dv.z as i32))) * 18 + (x - 1 + 1 + (dv.x as i32))) as usize
+                        let nid: u16 = rt.ld16(pad, ni)
+                        if nid == mc_mesh.UNKNOWN_ID {
+                            skip = true
+                        } else if ((nid as usize) < 32768) && (rt.ld8((*t).opaque, nid as usize) & (1 as u8)) != (0 as u8) {
+                            skip = true
+                        }
+                        lc = ni
+                    }
+                    if !skip {
+                        var sky: f64 = 15.0
+                        var blk: f64 = 0.0
+                        if lpad != 0 {
+                            let lv: u8 = rt.ld8(lpad, lc)
+                            sky = (lv >> (4 as u8)) as f64
+                            blk = (lv & (15 as u8)) as f64
+                        }
+                        var c: usize = 0
+                        while c < 4 {
+                            stq(out, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + c)) + ((x - 1) as f64))
+                            c = c + 1
+                        }
+                        c = 0
+                        while c < 4 {
+                            stq(out, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 4 + c)) + (y as f64))
+                            c = c + 1
+                        }
+                        c = 0
+                        while c < 4 {
+                            stq(out, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 8 + c)) + (z as f64))
+                            c = c + 1
+                        }
+                        c = 0
+                        while c < 8 {
+                            stq(out, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 12 + c)))
+                            c = c + 1
+                        }
+                        stq(out, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 20)))
+                        stq(out, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 21)))
+                        stq(out, 1, sky)
+                        stq(out, 1, blk)
+                        nq = nq + 1
+                    }
+                    i = i + 1
+                }
+            }
+            z = z + 1
+        }
+        y = y + 1
+    }
+    return nq
+}
