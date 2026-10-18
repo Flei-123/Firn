@@ -1151,7 +1151,12 @@ fn fn_instantiate(g: *mut Gen, ii: u32) {
     while k < plen {
         let pn: u32 = ast.param_name(b, old_off + k)
         let pt: u32 = subst_ty(g, ast.param_ty(b, old_off + k))
-        ast.param_add(b, pn, pt)
+        let pidx: u32 = ast.param_add(b, pn, pt)
+        // r704: the default is copied too (it may name the type parameter)
+        let dd: u32 = ast.param_def(b, old_off + k)
+        if dd != ast.NOTHING {
+            ast.param_def_set(b, pidx, copy_expr(g, dd))
+        }
         k = k + 1
     }
     var ret: u32 = ast.NOTHING
@@ -1296,13 +1301,43 @@ fn dargs_run(g: *mut Gen) {
         vec_set[u32](&fmap, ast.fn_name(b, f) as usize, f as u32)
         f = f + 1
     }
+    // r704: methods by key `"method " ++ <bare name>` (the receiver type is
+    // not known here); `mdef` = some method has a default.
+    var mkey: Vec[u32] = vec_new[u32]()
+    var mdef: bool = false
+    f = 0
+    while f < nf {
+        let kk: u32 = dargs_method_key(g, f as u32)
+        vec_push[u32](&mkey, kk)
+        if kk != NONE {
+            let po: u32 = ast.fn_poff(b, f)
+            var q2: u32 = 0
+            while q2 < ast.fn_plen(b, f) {
+                if ast.param_def(b, po + q2) != ast.NOTHING {
+                    mdef = true
+                }
+                q2 = q2 + 1
+            }
+        }
+        f = f + 1
+    }
+    // a default must be a constant expression
+    k = 0
+    while k < np {
+        let dv: u32 = ast.param_def(b, k as u32)
+        if dv != ast.NOTHING && !dargs_is_const(b, dv) {
+            (*g).err = (*g).err + 1
+        }
+        k = k + 1
+    }
     var e: usize = 0
     while e < total {
         if ast.e_kind(b, e as u32) == ast.E_CALL && ast.e_number(b, e as u32) == 0 {
-            dargs_call(g, e as u32, &fmap)
+            dargs_call(g, e as u32, &fmap, &mkey, mdef)
         }
         e = e + 1
     }
+    vec_free[u32](&mkey)
     vec_free[u32](&fmap)
     // the defaults are consumed: later printers must not show them
     var q: usize = 0
@@ -1312,7 +1347,137 @@ fn dargs_run(g: *mut Gen) {
     }
 }
 
-fn dargs_call(g: *mut Gen, e: u32, fmap: *mut Vec[u32]) {
+// The method key of function `f`: its first parameter is `self`; the key is
+// the interned `"method " ++ <name after the last "__">`. NONE otherwise.
+fn dargs_method_key(g: *mut Gen, f: u32) -> u32 {
+    let b: *mut ast.Tree = gtree(g)
+    if ast.fn_plen(b, f as usize) == 0 {
+        return NONE
+    }
+    let it: *mut intern.Interner = gnames(g)
+    var sw: [u8; 4] = "self"
+    if !intern.intern_equal(it, ast.param_name(b, ast.fn_poff(b, f as usize)), (&sw[0]) as u64, 4) {
+        return NONE
+    }
+    let nr: u32 = ast.fn_name(b, f as usize)
+    let len: usize = intern.intern_length(it, nr)
+    let ptr: u64 = intern.intern_ptr(it, nr)
+    var cut: usize = len
+    var i: usize = 0
+    while i + 1 < len {
+        if *((ptr + (i as u64)) as *u8) == 95 as u8 && *((ptr + (i as u64) + 1) as *u8) == 95 as u8 {
+            cut = i + 2
+        }
+        i = i + 1
+    }
+    if cut >= len {
+        return NONE
+    }
+    rt.buf_clear(&(*g).scratch)
+    var w: [u8; 7] = "method "
+    rt.buf_push_bytes(&(*g).scratch, (&w[0]) as u64, 7)
+    rt.buf_push_bytes(&(*g).scratch, ptr + (cut as u64), len - cut)
+    return intern.intern_number(it, rt.buf_ptr(&(*g).scratch), rt.buf_len(&(*g).scratch)) as u32
+}
+
+// Literals, `const` names, unary - ! ~, binary operators and casts.
+fn dargs_is_const(b: *mut ast.Tree, e: u32) -> bool {
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_INT || a == ast.E_FLOAT || a == ast.E_FLOAT32 || a == ast.E_BOOL || a == ast.E_TEXT {
+        return true
+    }
+    if a == ast.E_ID {
+        var i: usize = 0
+        while i < ast.const_count(b) {
+            if ast.const_name(b, i) == ast.e_a(b, e) {
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+    if a == ast.E_UN {
+        let op: u32 = ast.e_a(b, e)
+        if op == 0 || op == 1 || op == 4 {
+            return dargs_is_const(b, ast.e_b(b, e))
+        }
+        return false
+    }
+    if a == ast.E_BIN {
+        return dargs_is_const(b, ast.e_b(b, e)) && dargs_is_const(b, ast.e_c(b, e))
+    }
+    if a == ast.E_AS {
+        return dargs_is_const(b, ast.e_a(b, e))
+    }
+    return false
+}
+
+// Twin of `pick_method` in compiler/src/dargs.rs. Yields the function number,
+// or NONE - 1 (leave the call to the type checker), or NONE - 2 (ambiguous).
+fn dargs_pick(g: *mut Gen, mkey: *mut Vec[u32], name: u32, nargs: u32, has_named: bool) -> u32 {
+    let b: *mut ast.Tree = gtree(g)
+    let nf: usize = vec_len[u32](mkey)
+    var first: u32 = NONE
+    var count: u32 = 0
+    var exact: bool = false
+    var longer: bool = false
+    var plain: bool = true
+    var f: usize = 0
+    while f < nf {
+        if vec_at[u32](mkey, f) == name {
+            let plen: u32 = ast.fn_plen(b, f)
+            if first == NONE {
+                first = f as u32
+            } else {
+                // same parameter names as the first?
+                if plen != ast.fn_plen(b, first as usize) {
+                    plain = false
+                } else {
+                    var j: u32 = 0
+                    while j < plen {
+                        if ast.param_name(b, ast.fn_poff(b, f) + j) != ast.param_name(b, ast.fn_poff(b, first as usize) + j) {
+                            plain = false
+                        }
+                        j = j + 1
+                    }
+                }
+            }
+            var j2: u32 = 0
+            while j2 < plen {
+                if ast.param_def(b, ast.fn_poff(b, f) + j2) != ast.NOTHING {
+                    plain = false
+                }
+                j2 = j2 + 1
+            }
+            if plen == nargs {
+                exact = true
+            }
+            if plen > nargs {
+                longer = true
+            }
+            count = count + 1
+        }
+        f = f + 1
+    }
+    if first == NONE {
+        return NONE
+    }
+    if count == 1 {
+        return first
+    }
+    if !has_named && exact {
+        return NONE - 1
+    }
+    if plain {
+        return first
+    }
+    if has_named || longer {
+        return NONE - 2
+    }
+    return NONE - 1
+}
+
+fn dargs_call(g: *mut Gen, e: u32, fmap: *mut Vec[u32], mkey: *mut Vec[u32], mdef: bool) {
     let b: *mut ast.Tree = gtree(g)
     let off: u32 = ast.e_b(b, e)
     let cnt: u32 = ast.e_c(b, e)
@@ -1335,6 +1500,21 @@ fn dargs_call(g: *mut Gen, e: u32, fmap: *mut Vec[u32]) {
     var fi: u32 = NONE
     if (name as usize) < vec_len[u32](fmap) {
         fi = vec_at[u32](fmap, name as usize)
+    }
+    if fi == NONE && (mdef || has_named) {
+        // r704: `x.m(..)` -- a method call
+        var mw: [u8; 7] = "method "
+        if intern.intern_prefix(gnames(g), name, (&mw[0]) as u64, 7) {
+            let pk: u32 = dargs_pick(g, mkey, name, cnt, has_named)
+            if pk == NONE - 1 {
+                return
+            }
+            if pk == NONE - 2 {
+                (*g).err = (*g).err + 1
+                return
+            }
+            fi = pk
+        }
     }
     if fi == NONE {
         if has_named {

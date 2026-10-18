@@ -220,7 +220,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
         // One broken method aborts the WHOLE block. Otherwise the actual
         // message is followed by a cascade of consequential errors, and the
         // first one — the only one that explains anything — drowns in it.
-        if !method(p, prog, &ty, tsp) {
+        if !method(p, prog, &ty, tsp, is_for) {
             p.recovering = false;
             p.sync_item();
             return;
@@ -236,7 +236,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
 
 /// One method: `fn name(<receiver>[, param…]) [-> T] { … }`.
 /// `false` = aborted, the surrounding `impl` block is discarded.
-fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
+fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span, is_for: bool) -> bool {
     let start = p.bump(); // 'fn'
     let name = match p.ident("after 'fn' in an impl block") {
         Some((n, _)) => n,
@@ -268,7 +268,11 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
     let mut params = vec![slf];
     let mut ref_params = std::mem::take(&mut p.ref_params);
     if p.eat(&TokKind::Comma) {
+        // r704: methods may have defaults, except in `impl I for T` (the
+        // signature has to equal the interface).
+        p.allow_defaults = !is_for;
         let (more, refs) = p.params_ref();
+        p.allow_defaults = false;
         params.extend(more);
         ref_params.extend(refs);
     }

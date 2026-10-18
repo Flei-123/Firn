@@ -442,7 +442,9 @@ impl<'a> Parser<'a> {
             self.sync_item();
             return None;
         }
+        self.allow_defaults = true; // r704: generic templates may have defaults
         let (params, ref_params) = self.params_ref();
+        self.allow_defaults = false;
         self.close(TokKind::RParen, "after the parameter list");
         self.recovering = false;
         let ret = if self.eat(&TokKind::Arrow) {

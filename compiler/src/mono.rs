@@ -177,6 +177,11 @@ fn expand_fn(
     decl.name = mangled.to_string();
     for p in decl.params.iter_mut() {
         p.ty = subst_ty(&p.ty, &map, queue);
+        // r704: a default may name the type parameter (`b: T = 3 as T`)
+        if let Some(d) = p.default.as_mut() {
+            subst_expr(d, &map, queue);
+            renumber_expr(d, next_id);
+        }
     }
     if let Some(r) = decl.ret.as_mut() {
         *r = subst_ty(r, &map, queue);

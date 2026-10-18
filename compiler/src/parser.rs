@@ -1983,7 +1983,7 @@ compute it",
                 if !self.allow_defaults {
                     self.dg.error(
                         eq,
-                        "default values are only allowed on plain functions (not on extern fn, methods, generic templates, closures or function types)",
+                        "default values are only allowed on plain functions, templates and methods (not on extern fn, `impl I for T` methods, closures or function types)",
                     );
                 } else if refk != 0 {
                     self.dg.error(eq, "a reference parameter cannot have a default value");

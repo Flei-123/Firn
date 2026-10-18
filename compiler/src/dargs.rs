@@ -27,6 +27,7 @@ use crate::ast::*;
 use crate::diag::{did_you_mean, nearest, Diags, Span};
 use std::collections::{HashMap, HashSet};
 
+#[derive(Clone)]
 struct Sig {
     names: Vec<String>,
     defaults: Vec<Option<Expr>>,
@@ -34,6 +35,9 @@ struct Sig {
 
 struct Cx<'a> {
     sigs: &'a HashMap<String, Sig>,
+    /// r704: the methods by bare method name (`x.m(..)` does not know the
+    /// receiver type here): every function whose first parameter is `self`.
+    msigs: &'a HashMap<String, Vec<Sig>>,
     next: u32,
     dg: &'a mut Diags,
 }
@@ -41,6 +45,7 @@ struct Cx<'a> {
 /// Rewrites every call of `prog` in place.
 pub fn apply(prog: &mut Program, dg: &mut Diags) {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
+    let mut msigs: HashMap<String, Vec<Sig>> = HashMap::new();
     let consts: HashSet<String> = prog.consts.iter().map(|c| c.name.clone()).collect();
     for f in &prog.funcs {
         for p in &f.params {
@@ -48,15 +53,18 @@ pub fn apply(prog: &mut Program, dg: &mut Diags) {
                 check_const(d, &consts, dg);
             }
         }
-        sigs.insert(
-            f.name.clone(),
-            Sig {
-                names: f.params.iter().map(|p| p.name.clone()).collect(),
-                defaults: f.params.iter().map(|p| p.default.clone()).collect(),
-            },
-        );
+        let sig = Sig {
+            names: f.params.iter().map(|p| p.name.clone()).collect(),
+            defaults: f.params.iter().map(|p| p.default.clone()).collect(),
+        };
+        if f.params.first().map_or(false, |p| p.name == "self") {
+            if let Some(i) = f.name.rfind("__") {
+                msigs.entry(f.name[i + 2..].to_string()).or_default().push(sig.clone());
+            }
+        }
+        sigs.insert(f.name.clone(), sig);
     }
-    let mut cx = Cx { sigs: &sigs, next: prog.expr_count, dg };
+    let mut cx = Cx { sigs: &sigs, msigs: &msigs, next: prog.expr_count, dg };
     for f in prog.funcs.iter_mut() {
         block(&mut cx, &mut f.body);
         // The defaults themselves stay on the declaration; nothing reads them
@@ -195,7 +203,25 @@ fn call(cx: &mut Cx, e: &mut Expr) {
         expr(cx, a);
     }
     let has_named = args.iter().any(|a| matches!(a.kind, ExprKind::Named(..)));
-    let sig = match cx.sigs.get(&name) {
+    let sig_opt: Option<&Sig> = match crate::impls::method_name(&name) {
+        Some(m) => match cx.msigs.get(m) {
+            Some(v) => match pick_method(v, args.len(), has_named) {
+                Pick::One(s) => Some(s),
+                Pick::Unchanged => return,
+                Pick::Ambiguous => {
+                    cx.dg.error_note(
+                        call_span,
+                        format!("the method '{}' needs default or named arguments but exists on several types", m),
+                        "the receiver type is not known here: give those methods the same parameters and defaults, or pass every argument",
+                    );
+                    return;
+                }
+            },
+            None => None,
+        },
+        None => cx.sigs.get(&name),
+    };
+    let sig = match sig_opt {
         Some(s) => s,
         None => {
             if has_named {
@@ -307,7 +333,40 @@ fn call(cx: &mut Cx, e: &mut Expr) {
     }
 }
 
+enum Pick<'a> {
+    One(&'a Sig),
+    /// A candidate takes the call as written: leave it to the type checker.
+    Unchanged,
+    Ambiguous,
+}
+
+/// Which method signature a call `x.m(..)` (receiver counted as argument)
+/// uses when the receiver type is not known here: one candidate is it; several
+/// are only accepted when a candidate takes the call as written, or when
+/// none has a default and all have the same parameter names (named only).
+/// Twin: `pick_method` in lib/firnc1/mono.fi.
+fn pick_method<'a>(v: &'a [Sig], nargs: usize, has_named: bool) -> Pick<'a> {
+    let first = &v[0];
+    if v.len() == 1 {
+        return Pick::One(first);
+    }
+    if !has_named && v.iter().any(|s| s.names.len() == nargs) {
+        return Pick::Unchanged;
+    }
+    let plain = v.iter().all(|s| s.names == first.names && s.defaults.iter().all(|d| d.is_none()));
+    if plain {
+        return Pick::One(first);
+    }
+    if has_named || v.iter().any(|s| s.names.len() > nargs) {
+        return Pick::Ambiguous;
+    }
+    Pick::Unchanged
+}
+
 /// The source spelling of a mangled name (`mod__f` -> `mod.f`).
 fn pretty(n: &str) -> String {
+    if let Some(m) = crate::impls::method_name(n) {
+        return m.to_string();
+    }
     n.replacen("__", ".", 1)
 }
