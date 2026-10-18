@@ -56,7 +56,7 @@ srv = S(("127.0.0.1", 0), H)
 port = srv.server_address[1]
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 
-WORDS = ["alpha", "beta", ".", "..", ".x", "line", "gamma delta", "café", "über", "x" * 90, "", "tab\there", "-- ", "From me"]
+WORDS = ["alpha", "beta", ".", "..", ".x", "line", "gamma delta", "café", "über", "x" * 90, "", "tab\there", "-- ", "From me"]  # english: ok
 
 
 def text(n):
@@ -69,7 +69,7 @@ tmp = tempfile.mkdtemp()
 for case in range(N):
     frm = f"s{case}@example.com"
     to = [f"r{case}a@example.org"] + ([f"r{case}b@example.org"] if rnd.random() < 0.3 else [])
-    subject = rnd.choice(["Report", "Hello World", "café über", "x" * 100 + " tail", "Re: a, b; c"]) + f" {case}"
+    subject = rnd.choice(["Report", "Hello World", "café über", "x" * 100 + " tail", "Re: a, b; c"]) + f" {case}"  # english: ok
     body = text(rnd.randint(1, 12))
     atts = []
     for k in range(rnd.choice([0, 0, 1, 2])):

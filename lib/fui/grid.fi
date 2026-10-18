@@ -1,0 +1,1232 @@
+profile kernel
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/grid.fi -- GRID TRACKS, AS CSS MEANS IT.
+//
+// ========================================================= WHY IT EXISTS
+//
+// layout.fi has a `Grid` with equal cells, flex.fi distributes ONE axis.
+// A form with a label column and a field column, a dashboard with a
+// sidebar that is exactly 240 wide and a body that takes the rest, a
+// photo wall with `repeat(3, 1fr)` -- none of that is a stack and none of
+// it is equal cells. It is a TRACK problem: columns and rows have sizes
+// of their own (px / auto / fr / minmax), items sit on several tracks
+// (spans), and items without a position flow into the next free cell.
+//
+// ==================================================== IT REPLACES NOTHING
+//
+// layout.fi and flex.fi STAY. Same `Rect`, same measuring protocol (the
+// caller holds the arrays and passes the measured sizes in), same
+// INTEGER pixels. fr is PER MILLE (1000 = 1fr), like grow/shrink in
+// flex.fi. lib/fui/scene.fi fills the items from the measured children
+// and writes the rectangles back; this file calculates only.
+//
+// ======================================================= WHY IN THE KERNEL
+//
+// `profile kernel`, like layout.fi and flex.fi: a layout only calculates.
+//
+// ================================================== THE TRACK SIZES
+//
+// Every track is `minmax(min, max)`:
+//
+//     px(v)     = minmax(v px, v px)
+//     auto      = minmax(auto, auto)   as large as its items need
+//     fr(f)     = minmax(auto, f fr)   takes the REST by its factor
+//     minmax()  any pair; min is px or auto, max is px, auto or fr
+//
+// The solver follows css-grid-1, 12 in these steps:
+//
+//   1. START      base = min (px, or 0 for auto), limit = max (px) or
+//                 "infinite" (auto / fr).
+//   2. ITEMS      items of span 1 first, then 2, 3 ...: an item raises
+//                 the base of auto-min tracks to its MINIMUM and the limit
+//                 of auto-max tracks to its PREFERRED size. An item that
+//                 spans several tracks shares the missing part out (over
+//                 flexible tracks: by their factor).
+//   3. MAXIMISE   free space (definite container) raises bases up to the
+//                 limits, equally, without anybody passing its limit.
+//   4. FR         the rest goes to the fr tracks BY THEIR FACTOR. A track
+//                 whose base is larger than its share is taken OUT (it
+//                 keeps its base) and the others share what is left --
+//                 the same redistribution as the clamping in flex.fi.
+//                 The remainder of the integer division is handed out one
+//                 pixel at a time from the front, so the sum is EXACT.
+//   5. STRETCH    if no fr track took the rest, it is shared by the
+//                 `auto`-max tracks (justify-content: normal = stretch).
+//   6. CONTENT    what is still free is distributed by justify/align-
+//                 content (start/end/center/between/around/evenly).
+//
+// An INDEFINITE container (measuring) skips 3-6: auto tracks take their
+// limit, an fr track takes the largest "item / factor" that any of its
+// items needs.
+//
+// ================================================== PLACING THE ITEMS
+//
+// Explicit cells (col, row >= 0) stay where they are. Items with only a
+// row get the first free column in it, items with only a column the first
+// free row, all others flow (row-major, or column-major with FLOW_COLUMN)
+// -- `sparse` by default (the cursor never goes back), `dense` fills
+// holes. A flow that runs out of explicit tracks makes IMPLICIT tracks of
+// the `auto_col` / `auto_row` kind. Column flow is the row flow on the
+// transposed grid -- one algorithm.
+//
+// ============================================================== RTL
+//
+// `rtl` mirrors the COLUMN axis: column 0 sits at the right edge, the flow
+// still goes "forward" (= to the left), and `AL_START` means the right
+// side of the cell. The mirroring is done at the very end, on the finished
+// rectangles, so every rule above stays the same.
+//
+// LIMITS (fixed arrays, no allocator): 32 tracks per axis (16 of them
+// explicit), 64 items. More is clamped to the last track, never written
+// behind an array.
+import fui.layout
+import fui.flex
+
+export {
+    TK_PX, TK_AUTO, TK_FR,
+    GC_STRETCH, GC_START, GC_END, GC_CENTER, GC_BETWEEN, GC_AROUND,
+    GC_EVENLY,
+    FLOW_ROW, FLOW_COLUMN,
+    GRID_TR, GRID_EXPL, GRID_ITEMS,
+    Track, tk_px, tk_auto, tk_fr, tk_minmax, tk_minfr,
+    GridItem, grid_item, gitem_place, gitem_align, gitem_min,
+    gitem_fixed,
+    GridSpec, grid_spec_new, gs_add_col, gs_add_row, gs_set_gap,
+    gs_set_padding, gs_set_flow, gs_set_rtl, gs_set_content,
+    gs_set_items, gs_set_auto, gs_hash,
+    grid_item_stride,
+    grid_place, grid_tracks, grid_layout, grid_measure,
+    grid_col_count, grid_row_count,
+}
+
+// ============================================================ THE VALUES
+const TK_PX: u32 = 0
+const TK_AUTO: u32 = 1
+const TK_FR: u32 = 2
+
+const GC_STRETCH: u32 = 0
+const GC_START: u32 = 1
+const GC_END: u32 = 2
+const GC_CENTER: u32 = 3
+const GC_BETWEEN: u32 = 4
+const GC_AROUND: u32 = 5
+const GC_EVENLY: u32 = 6
+
+const FLOW_ROW: u32 = 0
+const FLOW_COLUMN: u32 = 1
+
+const GRID_TR: usize = 32
+const GRID_EXPL: usize = 16
+const GRID_ITEMS: usize = 64
+
+// "no limit" for a growth limit
+const INF: i64 = 1000000000000
+
+// ============================================================ A TRACK
+struct Track {
+    min_k: u32, // TK_PX or TK_AUTO
+    min_v: i64,
+    max_k: u32, // TK_PX, TK_AUTO or TK_FR
+    max_v: i64, // px, or the factor in thousandths for TK_FR
+}
+
+fn tk_px(v: i64) -> Track {
+    return Track { min_k: TK_PX, min_v: v, max_k: TK_PX, max_v: v }
+}
+
+fn tk_auto() -> Track {
+    return Track { min_k: TK_AUTO, min_v: 0, max_k: TK_AUTO, max_v: 0 }
+}
+
+// f in thousandths: 1000 = 1fr
+fn tk_fr(f: i64) -> Track {
+    return Track { min_k: TK_AUTO, min_v: 0, max_k: TK_FR, max_v: f }
+}
+
+fn tk_minmax(min_k: u32, min_v: i64, max_k: u32, max_v: i64) -> Track {
+    return Track { min_k: min_k, min_v: min_v, max_k: max_k, max_v: max_v }
+}
+
+// minmax(<min_px>px, <f>fr) -- the usual "at least this wide, then share"
+fn tk_minfr(min_px: i64, f: i64) -> Track {
+    return Track { min_k: TK_PX, min_v: min_px, max_k: TK_FR, max_v: f }
+}
+
+// ============================================================ AN ITEM
+//
+// A VALUE like FlexItem: the grid distributes things that are not
+// widgets too. `col`/`row` are 0-based, -1 = place automatically.
+struct GridItem {
+    col: i64,
+    row: i64,
+    cspan: i64,
+    rspan: i64,
+    w: i64, // preferred width  (max-content contribution)
+    h: i64,
+    min_w: i64, // minimum contribution
+    min_h: i64,
+    ax: u32, // justify-self (flex.AL_*), AL_AUTO = what the container says
+    ay: u32, // align-self
+    fixed_x: u32, // 1 = the item has a size of its own: stretch keeps it
+    fixed_y: u32,
+}
+
+fn grid_item(w: i64, h: i64) -> GridItem {
+    return GridItem { col: 0 - 1, row: 0 - 1, cspan: 1, rspan: 1,
+        w: w, h: h, min_w: w, min_h: h, ax: flex.AL_AUTO, ay: flex.AL_AUTO,
+        fixed_x: 0 as u32, fixed_y: 0 as u32 }
+}
+
+fn gitem_place(k: *mut GridItem, col: i64, row: i64, cspan: i64,
+    rspan: i64) {
+    (*k).col = col
+    (*k).row = row
+    (*k).cspan = cspan
+    (*k).rspan = rspan
+}
+
+fn gitem_align(k: *mut GridItem, ax: u32, ay: u32) {
+    (*k).ax = ax
+    (*k).ay = ay
+}
+
+fn gitem_min(k: *mut GridItem, min_w: i64, min_h: i64) {
+    (*k).min_w = min_w
+    (*k).min_h = min_h
+}
+
+fn gitem_fixed(k: *mut GridItem, fx: bool, fy: bool) {
+    (*k).fixed_x = 0 as u32
+    (*k).fixed_y = 0 as u32
+    if fx {
+        (*k).fixed_x = 1 as u32
+    }
+    if fy {
+        (*k).fixed_y = 1 as u32
+    }
+}
+
+// The stride of a GridItem in the array: MEASURED, like flex_item_stride.
+fn grid_item_stride() -> usize {
+    var probe: [GridItem; 2] = [grid_item(0, 0); 2]
+    return ((&probe[1]) as u64 - (&probe[0]) as u64) as usize
+}
+
+fn item_at(k: *mut GridItem, i: usize) -> *mut GridItem {
+    return (k as u64 + (i * grid_item_stride()) as u64) as *mut GridItem
+}
+
+// ========================================================= THE CONTAINER
+struct GridSpec {
+    cols: [Track; 16],
+    rows: [Track; 16],
+    ncols: usize,
+    nrows: usize,
+    auto_col: Track,
+    auto_row: Track,
+    gap_x: i64, // between columns
+    gap_y: i64, // between rows
+    pad_l: i64,
+    pad_t: i64,
+    pad_r: i64,
+    pad_b: i64,
+    flow: u32,
+    dense: u32,
+    rtl: u32,
+    justify: u32, // GC_*, the columns inside the box
+    align_c: u32, // GC_*, the rows inside the box
+    items_x: u32, // flex.AL_*, default for justify-self
+    items_y: u32,
+}
+
+fn grid_spec_new() -> GridSpec {
+    return GridSpec { cols: [tk_auto(); 16], rows: [tk_auto(); 16],
+        ncols: 0, nrows: 0, auto_col: tk_auto(), auto_row: tk_auto(),
+        gap_x: 0, gap_y: 0, pad_l: 0, pad_t: 0, pad_r: 0, pad_b: 0,
+        flow: FLOW_ROW, dense: 0 as u32, rtl: 0 as u32,
+        justify: GC_STRETCH, align_c: GC_STRETCH,
+        items_x: flex.AL_STRETCH, items_y: flex.AL_STRETCH }
+}
+
+// false = the 17th explicit track (not stored)
+fn gs_add_col(s: *mut GridSpec, t: Track) -> bool {
+    if (*s).ncols >= GRID_EXPL {
+        return false
+    }
+    (*s).cols[(*s).ncols] = t
+    (*s).ncols = (*s).ncols + 1
+    return true
+}
+
+fn gs_add_row(s: *mut GridSpec, t: Track) -> bool {
+    if (*s).nrows >= GRID_EXPL {
+        return false
+    }
+    (*s).rows[(*s).nrows] = t
+    (*s).nrows = (*s).nrows + 1
+    return true
+}
+
+fn gs_set_gap(s: *mut GridSpec, x: i64, y: i64) {
+    (*s).gap_x = x
+    (*s).gap_y = y
+}
+
+fn gs_set_padding(s: *mut GridSpec, l: i64, t: i64, r: i64, b: i64) {
+    (*s).pad_l = l
+    (*s).pad_t = t
+    (*s).pad_r = r
+    (*s).pad_b = b
+}
+
+fn gs_set_flow(s: *mut GridSpec, flow: u32, dense: bool) {
+    (*s).flow = flow
+    (*s).dense = 0 as u32
+    if dense {
+        (*s).dense = 1 as u32
+    }
+}
+
+fn gs_set_rtl(s: *mut GridSpec, rtl: bool) {
+    (*s).rtl = 0 as u32
+    if rtl {
+        (*s).rtl = 1 as u32
+    }
+}
+
+fn gs_set_content(s: *mut GridSpec, justify: u32, align_c: u32) {
+    (*s).justify = justify
+    (*s).align_c = align_c
+}
+
+fn gs_set_items(s: *mut GridSpec, ax: u32, ay: u32) {
+    (*s).items_x = ax
+    (*s).items_y = ay
+}
+
+// grid-auto-columns / grid-auto-rows: the kind of the implicit tracks
+fn gs_set_auto(s: *mut GridSpec, col: Track, row: Track) {
+    (*s).auto_col = col
+    (*s).auto_row = row
+}
+
+fn hm(h: u64, v: u64) -> u64 {
+    return (h ^ v) *% 0x100000001B3 +% 0x9E3779B9
+}
+
+fn hm_track(h: u64, t: *mut Track) -> u64 {
+    var x: u64 = hm(h, (*t).min_k as u64)
+    x = hm(x, (*t).min_v as u64)
+    x = hm(x, (*t).max_k as u64)
+    return hm(x, (*t).max_v as u64)
+}
+
+// Everything the sizes depend on, as ONE number (for the scene's memo).
+fn gs_hash(s: *mut GridSpec) -> u64 {
+    var h: u64 = 0xCBF29CE484222325
+    h = hm(h, (*s).ncols as u64)
+    h = hm(h, (*s).nrows as u64)
+    var i: usize = 0
+    while i < (*s).ncols {
+        h = hm_track(h, &(*s).cols[i])
+        i = i + 1
+    }
+    i = 0
+    while i < (*s).nrows {
+        h = hm_track(h, &(*s).rows[i])
+        i = i + 1
+    }
+    h = hm_track(h, &(*s).auto_col)
+    h = hm_track(h, &(*s).auto_row)
+    h = hm(h, (*s).gap_x as u64)
+    h = hm(h, (*s).gap_y as u64)
+    h = hm(h, (*s).pad_l as u64)
+    h = hm(h, (*s).pad_t as u64)
+    h = hm(h, (*s).pad_r as u64)
+    h = hm(h, (*s).pad_b as u64)
+    h = hm(h, (*s).flow as u64)
+    h = hm(h, (*s).dense as u64)
+    h = hm(h, (*s).rtl as u64)
+    h = hm(h, (*s).justify as u64)
+    h = hm(h, (*s).align_c as u64)
+    h = hm(h, (*s).items_x as u64)
+    h = hm(h, (*s).items_y as u64)
+    return h
+}
+
+// ---------------------------------------------------------------- helpers
+fn ld(p: *mut i64, i: usize) -> i64 {
+    return *((p as u64 + (i * 8) as u64) as *mut i64)
+}
+
+fn st(p: *mut i64, i: usize, v: i64) {
+    *((p as u64 + (i * 8) as u64) as *mut i64) = v
+}
+
+fn imax(a: i64, b: i64) -> i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn imin(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// ============================================================= PLACING
+//
+// occupancy: one byte per cell, 32 x 32. Index r * 32 + c.
+fn occ_free(occ: *mut u8, r: i64, c: i64, rs: i64, cs: i64) -> bool {
+    var y: i64 = r
+    while y < r + rs && y < 32 {
+        var x: i64 = c
+        while x < c + cs && x < 32 {
+            if *((occ as u64 + (y * 32 + x) as u64) as *mut u8) != (0 as u8) {
+                return false
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return true
+}
+
+fn occ_mark(occ: *mut u8, r: i64, c: i64, rs: i64, cs: i64) {
+    var y: i64 = r
+    while y < r + rs && y < 32 {
+        var x: i64 = c
+        while x < c + cs && x < 32 {
+            *((occ as u64 + (y * 32 + x) as u64) as *mut u8) = 1 as u8
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// Places all items. pc/pr/pcs/prs (n entries each) get the 0-based cell
+// and the span of every item; *tc / *tr the number of columns / rows the
+// grid ends up with (explicit or implicit, at most 32).
+fn grid_place(s: *mut GridSpec, k: *mut GridItem, n: usize, pc: *mut i64,
+    pr: *mut i64, pcs: *mut i64, prs: *mut i64, tc: *mut usize,
+    tr: *mut usize) {
+    var occ: [u8; 1024] = [0; 1024]
+    let tp: bool = (*s).flow == FLOW_COLUMN
+    // fixed dimension W (the one the flow wraps at), in the flow's terms
+    var wfix: i64 = (*s).ncols as i64
+    if tp {
+        wfix = (*s).nrows as i64
+    }
+    // 1. read the items (transposed for column flow), clamp the spans
+    var i: usize = 0
+    var wmax: i64 = wfix
+    while i < n {
+        let it: *mut GridItem = item_at(k, i)
+        var c: i64 = (*it).col
+        var r: i64 = (*it).row
+        var cs: i64 = imax((*it).cspan, 1)
+        var rs: i64 = imax((*it).rspan, 1)
+        if tp {
+            let t1: i64 = c
+            c = r
+            r = t1
+            let t2: i64 = cs
+            cs = rs
+            rs = t2
+        }
+        cs = imin(cs, 32)
+        rs = imin(rs, 32)
+        if c >= 0 && c + cs > 32 {
+            c = 32 - cs
+        }
+        if r >= 0 && r + rs > 32 {
+            r = 32 - rs
+        }
+        if c >= 0 && c + cs > wmax {
+            wmax = c + cs
+        }
+        if cs > wmax {
+            wmax = cs
+        }
+        st(pc, i, c)
+        st(pr, i, r)
+        st(pcs, i, cs)
+        st(prs, i, rs)
+        i = i + 1
+    }
+    if wmax < 1 {
+        wmax = 1
+    }
+    // 2. both definite
+    i = 0
+    while i < n {
+        if ld(pc, i) >= 0 && ld(pr, i) >= 0 {
+            occ_mark((&occ[0]) as *mut u8, ld(pr, i), ld(pc, i),
+                ld(prs, i), ld(pcs, i))
+        }
+        i = i + 1
+    }
+    // 3. row definite, column automatic: first free column in that row,
+    // past the ones this step put there before (sparse)
+    var rowcur: [i64; 32] = [0; 32]
+    i = 0
+    while i < n {
+        if ld(pc, i) < 0 && ld(pr, i) >= 0 {
+            let r: i64 = ld(pr, i)
+            let cs: i64 = ld(pcs, i)
+            let rs: i64 = ld(prs, i)
+            var c: i64 = 0
+            if (*s).dense == (0 as u32) {
+                c = rowcur[r as usize]
+            }
+            while c + cs <= 32 && !occ_free((&occ[0]) as *mut u8, r, c, rs, cs) {
+                c = c + 1
+            }
+            if c + cs > 32 {
+                c = 32 - cs
+            }
+            st(pc, i, c)
+            occ_mark((&occ[0]) as *mut u8, r, c, rs, cs)
+            rowcur[r as usize] = c + cs
+            if c + cs > wmax {
+                wmax = c + cs
+            }
+        }
+        i = i + 1
+    }
+    // 4. the flow
+    var cr: i64 = 0
+    var cc: i64 = 0
+    i = 0
+    while i < n {
+        if ld(pr, i) < 0 {
+            let cs: i64 = ld(pcs, i)
+            let rs: i64 = ld(prs, i)
+            if (*s).dense != (0 as u32) {
+                cr = 0
+                cc = 0
+            }
+            if ld(pc, i) >= 0 {
+                // column definite: go down to the first free row
+                let c: i64 = ld(pc, i)
+                if c < cc {
+                    cr = cr + 1
+                }
+                cc = c
+                while cr + rs <= 32 &&
+                !occ_free((&occ[0]) as *mut u8, cr, c, rs, cs) {
+                    cr = cr + 1
+                }
+                if cr + rs > 32 {
+                    cr = 32 - rs
+                }
+                st(pr, i, cr)
+                occ_mark((&occ[0]) as *mut u8, cr, c, rs, cs)
+            } else {
+                // both automatic: forward from the cursor
+                var guard: i64 = 0
+                var placed: bool = false
+                while !placed && guard < 2048 {
+                    if cc + cs > wmax {
+                        cc = 0
+                        cr = cr + 1
+                    }
+                    if cr + rs > 32 {
+                        cr = 32 - rs
+                        placed = true
+                    } else if occ_free((&occ[0]) as *mut u8, cr, cc, rs, cs) {
+                        placed = true
+                    } else {
+                        cc = cc + 1
+                    }
+                    guard = guard + 1
+                }
+                st(pc, i, cc)
+                st(pr, i, cr)
+                occ_mark((&occ[0]) as *mut u8, cr, cc, rs, cs)
+            }
+        }
+        i = i + 1
+    }
+    // 5. back to the real axes, count the tracks
+    var wn: i64 = wmax
+    var hn: i64 = 0
+    i = 0
+    while i < n {
+        let e: i64 = ld(pr, i) + ld(prs, i)
+        if e > hn {
+            hn = e
+        }
+        if ld(pc, i) + ld(pcs, i) > wn {
+            wn = ld(pc, i) + ld(pcs, i)
+        }
+        if tp {
+            let a: i64 = ld(pc, i)
+            st(pc, i, ld(pr, i))
+            st(pr, i, a)
+            let b: i64 = ld(pcs, i)
+            st(pcs, i, ld(prs, i))
+            st(prs, i, b)
+        }
+        i = i + 1
+    }
+    var nc: i64 = wn
+    var nr: i64 = hn
+    if tp {
+        nc = hn
+        nr = wn
+    }
+    nc = imax(nc, (*s).ncols as i64)
+    nr = imax(nr, (*s).nrows as i64)
+    *tc = imin(nc, 32) as usize
+    *tr = imin(nr, 32) as usize
+    if *tc < 1 {
+        *tc = 1
+    }
+    if *tr < 1 {
+        *tr = 1
+    }
+}
+
+fn grid_col_count(s: *mut GridSpec, k: *mut GridItem, n: usize) -> usize {
+    var pc: [i64; 64] = [0; 64]
+    var pr: [i64; 64] = [0; 64]
+    var pcs: [i64; 64] = [0; 64]
+    var prs: [i64; 64] = [0; 64]
+    var tc: usize = 0
+    var tr: usize = 0
+    grid_place(s, k, n, (&pc[0]) as *mut i64, (&pr[0]) as *mut i64,
+        (&pcs[0]) as *mut i64, (&prs[0]) as *mut i64, &tc, &tr)
+    return tc
+}
+
+fn grid_row_count(s: *mut GridSpec, k: *mut GridItem, n: usize) -> usize {
+    var pc: [i64; 64] = [0; 64]
+    var pr: [i64; 64] = [0; 64]
+    var pcs: [i64; 64] = [0; 64]
+    var prs: [i64; 64] = [0; 64]
+    var tc: usize = 0
+    var tr: usize = 0
+    grid_place(s, k, n, (&pc[0]) as *mut i64, (&pr[0]) as *mut i64,
+        (&pcs[0]) as *mut i64, (&prs[0]) as *mut i64, &tc, &tr)
+    return tr
+}
+
+// ======================================================== THE TRACK SIZES
+//
+// One axis. kmin/vmin/kmax/vmax: the track definitions (t entries),
+// st/sp/mn/mx: start track, span, minimum and preferred contribution of
+// every item (n entries). avail < 0 = indefinite. `stretch` = the stretch
+// step (5) is on. Writes the sizes into `size` (t entries).
+fn solve_axis(t: usize, kmin: *mut i64, vmin: *mut i64, kmax: *mut i64,
+    vmax: *mut i64, n: usize, ist: *mut i64, isp: *mut i64, imn: *mut i64,
+    imx: *mut i64, gap: i64, avail: i64, stretch: bool, size: *mut i64) {
+    var base: [i64; 32] = [0; 32]
+    var lim: [i64; 32] = [0; 32]
+    var j: usize = 0
+    while j < t {
+        if ld(kmin, j) == (TK_PX as i64) {
+            base[j] = imax(ld(vmin, j), 0)
+        }
+        if ld(kmax, j) == (TK_PX as i64) {
+            lim[j] = imax(ld(vmax, j), base[j])
+        } else {
+            lim[j] = INF
+        }
+        j = j + 1
+    }
+    // ---- 2. the items, span by span
+    var span: i64 = 1
+    while span <= (t as i64) {
+        var q: usize = 0
+        while q < n {
+            if ld(isp, q) == span {
+                let a: usize = ld(ist, q) as usize
+                let e: usize = a + (span as usize)
+                let gaps: i64 = (span - 1) * gap
+                var hasflex: bool = false
+                var sumb: i64 = 0
+                var suml: i64 = 0
+                var cnt_min: i64 = 0
+                var cnt_max: i64 = 0
+                var sumf: i64 = 0
+                j = a
+                while j < e {
+                    sumb = sumb + base[j]
+                    if lim[j] == INF {
+                        suml = suml + base[j]
+                    } else {
+                        suml = suml + lim[j]
+                    }
+                    if ld(kmax, j) == (TK_FR as i64) {
+                        hasflex = true
+                        sumf = sumf + ld(vmax, j)
+                    }
+                    if ld(kmin, j) == (TK_AUTO as i64) {
+                        cnt_min = cnt_min + 1
+                    }
+                    if ld(kmax, j) == (TK_AUTO as i64) {
+                        cnt_max = cnt_max + 1
+                    }
+                    j = j + 1
+                }
+                if span == 1 {
+                    if ld(kmin, a) == (TK_AUTO as i64) {
+                        base[a] = imax(base[a], ld(imn, q))
+                    }
+                    if ld(kmax, a) == (TK_AUTO as i64) {
+                        if lim[a] == INF {
+                            lim[a] = ld(imx, q)
+                        } else {
+                            lim[a] = imax(lim[a], ld(imx, q))
+                        }
+                    }
+                } else if hasflex {
+                    // over a flexible track: only the flexible ones grow,
+                    // by their factor
+                    var extra: i64 = ld(imn, q) - sumb - gaps
+                    if extra > 0 && sumf > 0 {
+                        var left: i64 = extra
+                        j = a
+                        while j < e {
+                            if ld(kmax, j) == (TK_FR as i64) {
+                                let sh: i64 = extra * ld(vmax, j) / sumf
+                                base[j] = base[j] + sh
+                                left = left - sh
+                            }
+                            j = j + 1
+                        }
+                        j = a
+                        while j < e && left > 0 {
+                            if ld(kmax, j) == (TK_FR as i64) {
+                                base[j] = base[j] + 1
+                                left = left - 1
+                            }
+                            j = j + 1
+                        }
+                    }
+                } else {
+                    // minimum: over the auto-min tracks, equally
+                    let extra: i64 = ld(imn, q) - sumb - gaps
+                    if extra > 0 && cnt_min > 0 {
+                        var left: i64 = extra - (extra / cnt_min) * cnt_min
+                        let sh: i64 = extra / cnt_min
+                        j = a
+                        while j < e {
+                            if ld(kmin, j) == (TK_AUTO as i64) {
+                                base[j] = base[j] + sh
+                                if left > 0 {
+                                    base[j] = base[j] + 1
+                                    left = left - 1
+                                }
+                            }
+                            j = j + 1
+                        }
+                    }
+                    // preferred: over the auto-max tracks, equally. The
+                    // limits are summed AFTER the bases rose above.
+                    suml = 0
+                    j = a
+                    while j < e {
+                        if lim[j] == INF || lim[j] < base[j] {
+                            suml = suml + base[j]
+                        } else {
+                            suml = suml + lim[j]
+                        }
+                        j = j + 1
+                    }
+                    let extra2: i64 = ld(imx, q) - suml - gaps
+                    if extra2 > 0 && cnt_max > 0 {
+                        var left2: i64 = extra2 - (extra2 / cnt_max) * cnt_max
+                        let sh2: i64 = extra2 / cnt_max
+                        j = a
+                        while j < e {
+                            if ld(kmax, j) == (TK_AUTO as i64) {
+                                var cur: i64 = lim[j]
+                                if cur == INF {
+                                    cur = base[j]
+                                }
+                                lim[j] = cur + sh2
+                                if left2 > 0 {
+                                    lim[j] = lim[j] + 1
+                                    left2 = left2 - 1
+                                }
+                            }
+                            j = j + 1
+                        }
+                    }
+                }
+            }
+            q = q + 1
+        }
+        span = span + 1
+    }
+    // a limit that stayed infinite (no item), or that lies below the base
+    j = 0
+    while j < t {
+        if lim[j] == INF || lim[j] < base[j] {
+            lim[j] = base[j]
+        }
+        j = j + 1
+    }
+    var gaps_all: i64 = 0
+    if t > 1 {
+        gaps_all = gap * ((t - 1) as i64)
+    }
+    var sz: [i64; 32] = [0; 32]
+    j = 0
+    while j < t {
+        sz[j] = base[j]
+        j = j + 1
+    }
+    if avail >= 0 {
+        // ---- 3. maximise tracks
+        var free: i64 = avail - gaps_all
+        j = 0
+        while j < t {
+            free = free - sz[j]
+            j = j + 1
+        }
+        var rounds: i64 = 0
+        while free > 0 && rounds < 64 {
+            var cnt: i64 = 0
+            j = 0
+            while j < t {
+                if ld(kmax, j) != (TK_FR as i64) && sz[j] < lim[j] {
+                    cnt = cnt + 1
+                }
+                j = j + 1
+            }
+            if cnt == 0 {
+                break
+            }
+            var share: i64 = free / cnt
+            if share == 0 {
+                share = 1
+            }
+            j = 0
+            while j < t && free > 0 {
+                if ld(kmax, j) != (TK_FR as i64) && sz[j] < lim[j] {
+                    let g: i64 = imin(imin(share, lim[j] - sz[j]), free)
+                    sz[j] = sz[j] + g
+                    free = free - g
+                }
+                j = j + 1
+            }
+            rounds = rounds + 1
+        }
+        // ---- 4. the fr tracks
+        var any_fr: bool = false
+        var nonflex: i64 = 0
+        j = 0
+        while j < t {
+            if ld(kmax, j) == (TK_FR as i64) && ld(vmax, j) > 0 {
+                any_fr = true
+            } else {
+                nonflex = nonflex + sz[j]
+            }
+            j = j + 1
+        }
+        if any_fr {
+            var active: [i64; 32] = [0; 32]
+            j = 0
+            while j < t {
+                if ld(kmax, j) == (TK_FR as i64) && ld(vmax, j) > 0 {
+                    active[j] = 1
+                }
+                j = j + 1
+            }
+            var leftover: i64 = avail - gaps_all - nonflex
+            var denom: i64 = 1000
+            var lspace: i64 = 0
+            var again: bool = true
+            var guard: i64 = 0
+            while again && guard < 40 {
+                again = false
+                var sf: i64 = 0
+                var fixed: i64 = 0
+                j = 0
+                while j < t {
+                    if ld(kmax, j) == (TK_FR as i64) && ld(vmax, j) > 0 {
+                        if active[j] == 1 {
+                            sf = sf + ld(vmax, j)
+                        } else {
+                            fixed = fixed + sz[j]
+                        }
+                    }
+                    j = j + 1
+                }
+                denom = imax(sf, 1000)
+                lspace = imax(leftover - fixed, 0)
+                j = 0
+                while j < t {
+                    if active[j] == 1 &&
+                    sz[j] * denom > ld(vmax, j) * lspace {
+                        active[j] = 0
+                        again = true
+                    }
+                    j = j + 1
+                }
+                guard = guard + 1
+            }
+            var sf2: i64 = 0
+            j = 0
+            while j < t {
+                if active[j] == 1 {
+                    sf2 = sf2 + ld(vmax, j)
+                }
+                j = j + 1
+            }
+            var used: i64 = 0
+            j = 0
+            while j < t {
+                if active[j] == 1 {
+                    sz[j] = ld(vmax, j) * lspace / denom
+                    used = used + sz[j]
+                }
+                j = j + 1
+            }
+            if sf2 >= 1000 {
+                var rem: i64 = lspace - used
+                j = 0
+                while j < t && rem > 0 {
+                    if active[j] == 1 {
+                        sz[j] = sz[j] + 1
+                        rem = rem - 1
+                    }
+                    j = j + 1
+                }
+            }
+        } else if stretch {
+            // ---- 5. stretch the auto tracks
+            var free2: i64 = avail - gaps_all
+            var cnt2: i64 = 0
+            j = 0
+            while j < t {
+                free2 = free2 - sz[j]
+                if ld(kmax, j) == (TK_AUTO as i64) {
+                    cnt2 = cnt2 + 1
+                }
+                j = j + 1
+            }
+            if free2 > 0 && cnt2 > 0 {
+                let sh: i64 = free2 / cnt2
+                var rest: i64 = free2 - sh * cnt2
+                j = 0
+                while j < t {
+                    if ld(kmax, j) == (TK_AUTO as i64) {
+                        sz[j] = sz[j] + sh
+                        if rest > 0 {
+                            sz[j] = sz[j] + 1
+                            rest = rest - 1
+                        }
+                    }
+                    j = j + 1
+                }
+            }
+        }
+    } else {
+        // indefinite: the limits, and the fr tracks by what their items need
+        j = 0
+        while j < t {
+            if ld(kmax, j) != (TK_FR as i64) {
+                sz[j] = lim[j]
+            }
+            j = j + 1
+        }
+        var per: i64 = 0 // px per 1.0 fr, rounded up
+        j = 0
+        while j < t {
+            if ld(kmax, j) == (TK_FR as i64) && ld(vmax, j) > 0 {
+                let f: i64 = imax(ld(vmax, j), 1)
+                per = imax(per, (base[j] * 1000 + f - 1) / f)
+            }
+            j = j + 1
+        }
+        var q2: usize = 0
+        while q2 < n {
+            let a: usize = ld(ist, q2) as usize
+            let e: usize = a + (ld(isp, q2) as usize)
+            var sumf: i64 = 0
+            var sumn: i64 = 0
+            j = a
+            while j < e {
+                if ld(kmax, j) == (TK_FR as i64) && ld(vmax, j) > 0 {
+                    sumf = sumf + ld(vmax, j)
+                } else {
+                    sumn = sumn + sz[j]
+                }
+                j = j + 1
+            }
+            if sumf > 0 {
+                let need: i64 = ld(imx, q2) - sumn - (ld(isp, q2) - 1) * gap
+                let d: i64 = imax(sumf, 1000)
+                if need > 0 {
+                    per = imax(per, (need * 1000 + d - 1) / d)
+                }
+            }
+            q2 = q2 + 1
+        }
+        j = 0
+        while j < t {
+            if ld(kmax, j) == (TK_FR as i64) {
+                sz[j] = imax(base[j], (ld(vmax, j) * per + 999) / 1000)
+            }
+            j = j + 1
+        }
+    }
+    j = 0
+    while j < t {
+        st(size, j, sz[j])
+        j = j + 1
+    }
+}
+
+// Where the air goes (justify/align-content): start offset and extra gap.
+fn content_start(mode: u32, free: i64, n: usize) -> i64 {
+    if free <= 0 {
+        return 0
+    }
+    if mode == GC_END {
+        return free
+    }
+    if mode == GC_CENTER {
+        return free / 2
+    }
+    if mode == GC_AROUND && n > 0 {
+        return free / ((n * 2) as i64)
+    }
+    if mode == GC_EVENLY {
+        return free / ((n + 1) as i64)
+    }
+    return 0
+}
+
+fn content_extra(mode: u32, free: i64, n: usize) -> i64 {
+    if free <= 0 {
+        return 0
+    }
+    if mode == GC_BETWEEN && n > 1 {
+        return free / ((n - 1) as i64)
+    }
+    if mode == GC_AROUND && n > 0 {
+        return free / (n as i64)
+    }
+    if mode == GC_EVENLY {
+        return free / ((n + 1) as i64)
+    }
+    return 0
+}
+
+// Sizes both axes. avail_w / avail_h < 0 = indefinite. Fills xs / ys
+// (32 entries each) and the placement arrays.
+fn grid_tracks(s: *mut GridSpec, k: *mut GridItem, n: usize,
+    avail_w: i64, avail_h: i64, pc: *mut i64, pr: *mut i64, pcs: *mut i64,
+    prs: *mut i64, xs: *mut i64, ys: *mut i64, tc: *mut usize,
+    tr: *mut usize) {
+    grid_place(s, k, n, pc, pr, pcs, prs, tc, tr)
+    var kmin: [i64; 32] = [0; 32]
+    var vmin: [i64; 32] = [0; 32]
+    var kmax: [i64; 32] = [0; 32]
+    var vmax: [i64; 32] = [0; 32]
+    var imn: [i64; 64] = [0; 64]
+    var imx: [i64; 64] = [0; 64]
+    var j: usize = 0
+    while j < *tc {
+        var tk: Track = (*s).auto_col
+        if j < (*s).ncols {
+            tk = (*s).cols[j]
+        }
+        kmin[j] = tk.min_k as i64
+        vmin[j] = tk.min_v
+        kmax[j] = tk.max_k as i64
+        vmax[j] = tk.max_v
+        j = j + 1
+    }
+    var i: usize = 0
+    while i < n {
+        imn[i] = (*item_at(k, i)).min_w
+        imx[i] = (*item_at(k, i)).w
+        i = i + 1
+    }
+    solve_axis(*tc, (&kmin[0]) as *mut i64, (&vmin[0]) as *mut i64,
+        (&kmax[0]) as *mut i64, (&vmax[0]) as *mut i64, n, pc, pcs,
+        (&imn[0]) as *mut i64, (&imx[0]) as *mut i64, (*s).gap_x, avail_w,
+        (*s).justify == GC_STRETCH, xs)
+    j = 0
+    while j < *tr {
+        var tk: Track = (*s).auto_row
+        if j < (*s).nrows {
+            tk = (*s).rows[j]
+        }
+        kmin[j] = tk.min_k as i64
+        vmin[j] = tk.min_v
+        kmax[j] = tk.max_k as i64
+        vmax[j] = tk.max_v
+        j = j + 1
+    }
+    i = 0
+    while i < n {
+        imn[i] = (*item_at(k, i)).min_h
+        imx[i] = (*item_at(k, i)).h
+        i = i + 1
+    }
+    solve_axis(*tr, (&kmin[0]) as *mut i64, (&vmin[0]) as *mut i64,
+        (&kmax[0]) as *mut i64, (&vmax[0]) as *mut i64, n, pr, prs,
+        (&imn[0]) as *mut i64, (&imx[0]) as *mut i64, (*s).gap_y, avail_h,
+        (*s).align_c == GC_STRETCH, ys)
+}
+
+// What the container needs when nothing is given to it (max-content):
+// the track sizes plus gaps plus inner margin.
+fn grid_measure(s: *mut GridSpec, k: *mut GridItem, n: usize,
+    out_w: *mut i64, out_h: *mut i64) {
+    var pc: [i64; 64] = [0; 64]
+    var pr: [i64; 64] = [0; 64]
+    var pcs: [i64; 64] = [0; 64]
+    var prs: [i64; 64] = [0; 64]
+    var xs: [i64; 32] = [0; 32]
+    var ys: [i64; 32] = [0; 32]
+    var tc: usize = 0
+    var tr: usize = 0
+    grid_tracks(s, k, n, 0 - 1, 0 - 1, (&pc[0]) as *mut i64,
+        (&pr[0]) as *mut i64, (&pcs[0]) as *mut i64, (&prs[0]) as *mut i64,
+        (&xs[0]) as *mut i64, (&ys[0]) as *mut i64, &tc, &tr)
+    var w: i64 = (*s).pad_l + (*s).pad_r
+    var h: i64 = (*s).pad_t + (*s).pad_b
+    var j: usize = 0
+    while j < tc {
+        w = w + xs[j]
+        j = j + 1
+    }
+    j = 0
+    while j < tr {
+        h = h + ys[j]
+        j = j + 1
+    }
+    if tc > 1 {
+        w = w + (*s).gap_x * ((tc - 1) as i64)
+    }
+    if tr > 1 {
+        h = h + (*s).gap_y * ((tr - 1) as i64)
+    }
+    *out_w = w
+    *out_h = h
+}
+
+// Places every item in its cell. `out` gets n rectangles (32 octets each,
+// like layout.Rect). The finished rectangles are mirrored for rtl.
+fn grid_layout(s: *mut GridSpec, space: layout.Rect, k: *mut GridItem,
+    n: usize, out: *mut layout.Rect) {
+    if n == 0 {
+        return
+    }
+    let inner: layout.Rect = layout.rect_shrink(space, (*s).pad_l,
+        (*s).pad_t, (*s).pad_r, (*s).pad_b)
+    var pc: [i64; 64] = [0; 64]
+    var pr: [i64; 64] = [0; 64]
+    var pcs: [i64; 64] = [0; 64]
+    var prs: [i64; 64] = [0; 64]
+    var xs: [i64; 32] = [0; 32]
+    var ys: [i64; 32] = [0; 32]
+    var tc: usize = 0
+    var tr: usize = 0
+    grid_tracks(s, k, n, inner.w, inner.h, (&pc[0]) as *mut i64,
+        (&pr[0]) as *mut i64, (&pcs[0]) as *mut i64, (&prs[0]) as *mut i64,
+        (&xs[0]) as *mut i64, (&ys[0]) as *mut i64, &tc, &tr)
+    // the track positions, with the content distribution
+    var xp: [i64; 32] = [0; 32]
+    var yp: [i64; 32] = [0; 32]
+    var sumx: i64 = 0
+    var sumy: i64 = 0
+    var j: usize = 0
+    while j < tc {
+        sumx = sumx + xs[j]
+        j = j + 1
+    }
+    j = 0
+    while j < tr {
+        sumy = sumy + ys[j]
+        j = j + 1
+    }
+    let free_x: i64 = inner.w - sumx - (*s).gap_x * ((tc - 1) as i64)
+    let free_y: i64 = inner.h - sumy - (*s).gap_y * ((tr - 1) as i64)
+    var run: i64 = inner.x + content_start((*s).justify, free_x, tc)
+    let ex: i64 = content_extra((*s).justify, free_x, tc)
+    j = 0
+    while j < tc {
+        xp[j] = run
+        run = run + xs[j] + (*s).gap_x + ex
+        j = j + 1
+    }
+    run = inner.y + content_start((*s).align_c, free_y, tr)
+    let ey: i64 = content_extra((*s).align_c, free_y, tr)
+    j = 0
+    while j < tr {
+        yp[j] = run
+        run = run + ys[j] + (*s).gap_y + ey
+        j = j + 1
+    }
+    var i: usize = 0
+    while i < n {
+        let it: *mut GridItem = item_at(k, i)
+        let c0: usize = ld((&pc[0]) as *mut i64, i) as usize
+        let r0: usize = ld((&pr[0]) as *mut i64, i) as usize
+        let cs: usize = ld((&pcs[0]) as *mut i64, i) as usize
+        let rs: usize = ld((&prs[0]) as *mut i64, i) as usize
+        var cw: i64 = 0
+        j = c0
+        while j < c0 + cs && j < tc {
+            cw = cw + xs[j]
+            j = j + 1
+        }
+        var ch: i64 = 0
+        j = r0
+        while j < r0 + rs && j < tr {
+            ch = ch + ys[j]
+            j = j + 1
+        }
+        // the cell spans the gaps INSIDE the span, plus the extra air
+        if cs > 1 {
+            cw = cw + ((*s).gap_x + ex) * ((cs - 1) as i64)
+        }
+        if rs > 1 {
+            ch = ch + ((*s).gap_y + ey) * ((rs - 1) as i64)
+        }
+        var ax: u32 = (*it).ax
+        if ax == flex.AL_AUTO {
+            ax = (*s).items_x
+        }
+        var ay: u32 = (*it).ay
+        if ay == flex.AL_AUTO {
+            ay = (*s).items_y
+        }
+        var w: i64 = (*it).w
+        var x: i64 = xp[c0]
+        if ax == flex.AL_STRETCH && (*it).fixed_x == (0 as u32) {
+            w = cw
+        } else if ax == flex.AL_END {
+            x = x + cw - w
+        } else if ax == flex.AL_CENTER {
+            x = x + (cw - w) / 2
+        }
+        var h: i64 = (*it).h
+        var y: i64 = yp[r0]
+        if ay == flex.AL_STRETCH && (*it).fixed_y == (0 as u32) {
+            h = ch
+        } else if ay == flex.AL_END {
+            y = y + ch - h
+        } else if ay == flex.AL_CENTER {
+            y = y + (ch - h) / 2
+        }
+        if (*s).rtl != (0 as u32) {
+            x = inner.x + inner.w - (x - inner.x) - w
+        }
+        *((out as u64 + (i * 32) as u64) as *mut layout.Rect) =
+        layout.rect_new(x, y, w, h)
+        i = i + 1
+    }
+}

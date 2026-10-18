@@ -45,7 +45,7 @@ try:
     if body("POST", "/api/projects/p1/roadmap") != {"action": "done", "id": "r1"}:
         fail("roadmap done body: %r" % body("POST", "/api/projects/p1/roadmap"))
     rm = [m.get("json") for m in seen("POST", "/api/projects/p1/roadmap")]
-    if {"action": "add", "text": "third \"q\" ä"} not in rm:
+    if {"action": "add", "text": "third \"q\" ä"} not in rm:  # english: ok
         fail("roadmap add body keeps quote + umlaut: %r" % rm)
     if body("POST", "/api/projects/p1/needs") != {"action": "answer", "id": "n1", "answer": "Yes"}:
         fail("need answer body: %r" % body("POST", "/api/projects/p1/needs"))

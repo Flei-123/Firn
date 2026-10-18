@@ -83,7 +83,9 @@ fi
     -o "$W/style.o" lib/fui/style.fi
 "$FIRNC" --profile=kernel $NONE_T -c \
     -o "$W/layout.o" lib/fui/layout.fi
-for o in core style layout; do
+"$FIRNC" --profile=kernel $NONE_T -c \
+    -o "$W/grid.o" lib/fui/grid.fi
+for o in core style layout grid; do
     n=$(objdump -d "$W/$o.o" | grep -c syscall || true)
     if [ "$n" != "0" ]; then
         echo "  $o.o: $n syscall instructions -- forbidden in the core"
@@ -239,6 +241,12 @@ echo "== 13. FLEX-LAYOUT AM PIXEL =="
 # at the right edge.
 build flex
 "$W/flex"
+# W28-c: GRID TRACKS (lib/fui/grid.fi): px/auto/fr/minmax, spans, gaps, auto-placement,
+# RTL -- bare numbers (grid) and the wiring in the scene tree (gridnode)
+build grid
+"$W/grid" | tail -n 3
+build gridnode
+"$W/gridnode" | tail -n 3
 
 echo
 echo "== 14. UNSCHAERFE, SCHATTEN, FARBMATRIX =="
@@ -764,6 +772,10 @@ build splitnode
 # wave6: bottom sheet + property grid (geometry, hits, keys, drag, a11y twins)
 build wave6
 "$W/wave6" | tail -n 3
+# appw7: range slider + window timelines in the ten-line API (press/drag/keys, dt-based clock, reduced motion)
+build appw7
+"$W/appw7" | tail -n 3
+
 # appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
 build appw6
 "$W/appw6" | tail -n 3
@@ -807,6 +819,9 @@ build uistr
 "$W/uistr" | tail -n 3
 build dnd
 "$W/dnd" | tail -n 3
+# W28-d: wave 8 (spinner, time picker, breadcrumb, info bar, stepper) + models (accordion, toolbar overflow, cell edit, insets, density, text scale) + shortcut capture
+build wave8
+"$W/wave8" | tail -n 3
 python3 tools/fui/uistr_audit.py
 build touch
 "$W/touch" | tail -n 3

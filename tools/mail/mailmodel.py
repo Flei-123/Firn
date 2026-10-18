@@ -213,7 +213,7 @@ def resolve(root, toks):
 
 WORDS = ["alpha", "beta", "gamma", "delta", "mail", "test", "report", "lunch", "invoice", "hello",
          "world", "plan", "draft", "q3", "meeting", "x", "notes"]
-NAMES = ["Al Ice", "Bob", "Carol D.", "Dave \"D\" Doe", "Smith, Jo", "Zoe", "Ünal Çelik", "A\\B", "Eve"]
+NAMES = ["Al Ice", "Bob", "Carol D.", "Dave \"D\" Doe", "Smith, Jo", "Zoe", "Ünal Çelik", "A\\B", "Eve"]  # english: ok
 HOSTS = ["ex.org", "ex.net", "mail.example.com", "localhost", "a-b.io"]
 MBOX = ["al", "bob", "carol.d", "dave", "jo+tag", "zoe_x", "eve"]
 
@@ -243,7 +243,7 @@ def rtext(r, utf8=False):
     for _ in range(r.randint(0, 6)):
         ln = " ".join(rword(r) for _ in range(r.randint(0, 9)))
         if utf8 and r.random() < 0.3:
-            ln += " äöü€"
+            ln += " äöü€"  # english: ok
         lines.append(ln)
     return "\r\n".join(lines).encode("utf-8") + (b"\r\n" if lines and r.random() < 0.7 else b"")
 

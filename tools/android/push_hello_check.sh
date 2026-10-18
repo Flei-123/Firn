@@ -40,18 +40,18 @@ $ADB shell cmd notification cancel_all $PKG >/dev/null 2>&1 || true
 printf '10.0.2.2\n%s\n-\n-\n%s\n' "$PORT" "$HELLO" > "$W/args.txt"
 $ADB shell mkdir -p $D
 $ADB push "$W/args.txt" $D/args.txt >/dev/null
-relay "Anruf $T: Opa holen" "ohne Titel $T"
+relay "Call $T: pick up Grandpa" "no title $T"
 $ADB logcat -c
 $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null; sleep 10
 check "relay got the hello line" "$(grep -c "^recv $HELLO\$" "$W/relay.log")" 1
-check "title split: title" "$(note_has title "Anruf $T")" 1
-check "title split: text" "$(note_has text "Opa holen")" 1
-check "no ': ' -> whole line as text" "$(note_has text "ohne Titel $T")" 1
+check "title split: title" "$(note_has title "Call $T")" 1
+check "title split: text" "$(note_has text "pick up Grandpa")" 1
+check "no ': ' -> whole line as text" "$(note_has text "no title $T")" 1
 # reconnect: a new connection must say hello again
-relay "zwei $T: nach Neustart"
+relay "two $T: after restart"
 sleep 12
 check "hello again after reconnect" "$(grep -c "^recv $HELLO\$" "$W/relay.log")" 2
-check "line after reconnect" "$(note_has text "nach Neustart")" 1
+check "line after reconnect" "$(note_has text "after restart")" 1
 check "no crash" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|panic|ANR in '$PKG)" 0
 echo "ANDROID PUSH HELLO: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]

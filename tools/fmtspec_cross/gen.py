@@ -10,7 +10,7 @@ seed, n, out_fi, out_exp = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.
 rnd = random.Random(seed)
 FILLS = ["", "*", "-", "x", "0", "#", "_", ".", "中", "ä", "€"]
 ALIGN = ["", "<", ">", "^"]
-STRS = ["", "a", "ab", "hello", "hällo", "中文", "x y z", "0123456789"]
+STRS = ["", "a", "ab", "hello", "hällo", "中文", "x y z", "0123456789"]  # english: ok
 # r708: texts for the `!r` cases (quotes and backslashes change the repr)
 REPR_STRS = STRS + ["it's", 'say "hi"', 'both \' and "', "a\\b", "tab\there", "line\nbreak"]
 

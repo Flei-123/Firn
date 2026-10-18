@@ -3328,10 +3328,19 @@ constants declared before it, and '+ - * /'"
                 // only without reporting and without writing (impls.rs)
                 if let Some(m) = crate::impls::method_name(name) {
                     let et = args.first().and_then(|a| self.probe_d(a, d + 1))?;
+                    if m == crate::impls::CALL_VALUE {
+                        return match et {
+                            Type::Fn { ret, .. } => Some(*ret),
+                            _ => None,
+                        };
+                    }
                     // HOOK iface: on a `dyn I` the type sits in the
                     // interface, not in the function table (iface.rs)
                     if let Some(iname) = crate::impls::dyn_interface(&self.tcx, &et) {
                         return crate::iface::ret_of(&iname, m);
+                    }
+                    if crate::foreach::is_vec_slice(&self.tcx, &self.fns, name, &et, args.len()) {
+                        return crate::foreach::seq_struct(&self.tcx, &et).map(Type::Struct);
                     }
                     if let Some((full, _)) =
                         crate::impls::target_of(&self.tcx, &self.fns, m, &et)

@@ -67,7 +67,7 @@ async def process_request(conn, request):
 
 # ------------------------------------------------------------------ REST (app client)
 PROJECTS = {
-    "p1": {"id": "p1", "name": "Jarvis \"A\" ä€\U0001F600", "status": "active", "goal": "assistant", "next": "restart",
+    "p1": {"id": "p1", "name": "Jarvis \"A\" ä€\U0001F600", "status": "active", "goal": "assistant", "next": "restart",  # english: ok
            "updatedAt": "2026-10-17T18:00:00Z",
            "roadmap": [{"id": "r1", "text": "first", "group": "Git", "done": False, "note": ""},
                        {"id": "r2", "text": "second\nline", "group": "", "done": True, "note": "n"}],

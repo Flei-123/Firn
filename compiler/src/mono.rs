@@ -287,6 +287,10 @@ fn subst_name(
         if let Some(t) = map.get(n) {
             return Some(with_span(t, sp));
         }
+        // r733: error union `E!T` inside a template (`-> AllocError!T`).
+        if let Some(new) = crate::errors::pending_derive(n, |inner| subst_ty(inner, map, queue)) {
+            return Some(TypeExpr::Named(new, sp));
+        }
         // Round 53: `Gc[T]` and `GcWeak[T]` WITHIN ONE TEMPLATE.
         //
         // The parser turns those into the names `__gc#p:T` and `__gc#w:T`

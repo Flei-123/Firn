@@ -77,6 +77,10 @@ export {
     node_set_image, node_set_svg, node_set_art_align,
     node_set_flex, node_set_gap, node_set_padding, node_set_space,
     node_set_wrap, node_set_flexitem, node_set_hidden, node_hidden,
+    node_set_grid, node_is_grid, node_grid_col, node_grid_row,
+    node_grid_gap, node_grid_padding, node_grid_flow, node_grid_content,
+    node_grid_items, node_grid_auto, node_grid_rtl, node_set_cell,
+    node_set_cell_align, node_grid_spec, grid_pool_slot,
     scene_draw_subtree,
     node_set_opacity, node_set_offset, node_set_live, node_live,
     node_set_text_wrap, node_text_lines, node_set_text_reserve, scene_set_view, scene_view,
@@ -108,6 +112,7 @@ import fui.widget
 import fui.control
 import fui.layout
 import fui.flex
+import fui.grid
 import fui.render
 import fui.transform
 import fui.wave3
@@ -231,6 +236,14 @@ struct Node {
     d: sheet.Decl,
     // The box, if this node distributes children.
     fb: flex.FlexBox,
+    // 1 = this box is a GRID (node_set_grid): its spec lives in the scene's
+    // grid pool at the node's own slot, and its children sit in cells.
+    grid: u32,
+    // The cell of THIS node in its parent grid, packed (node_set_cell):
+    // bits 0-15 column + 1 (0 = automatic), 16-31 row + 1, 32-39 column
+    // span, 40-47 row span (0 = 1), 48-55 justify-self, 56-63 align-self
+    // (flex.AL_*, 0 = what the grid says). All zero = the default cell.
+    cell: u64,
     // What this node says about itself to its parent.
     grow: i64,
     shrink: i64,
@@ -373,6 +386,11 @@ struct Scene {
     culled: usize,
     // the measure memo (scene_attach_memo), *mut Memo; 0 = none
     memo: u64,
+    // THE GRID POOL: one GridSpec per node slot, mapped on the first
+    // node_set_grid (zero pages, so only grid nodes cost memory). `gsz` is
+    // the byte size of one spec (measured). scene_free gives it back.
+    gpool: u64,
+    gsz: u64,
 }
 
 fn node_blank() -> Node {
@@ -381,7 +399,7 @@ fn node_blank() -> Node {
         parent: SCENE_NONE, first: SCENE_NONE, last: SCENE_NONE,
         next: SCENE_NONE, nkids: 0,
         e: widget.widget_new(widget.KIND_NONE), d: sheet.decl_new(),
-        fb: flex.flexbox_new(flex.FLEX_COLUMN),
+        fb: flex.flexbox_new(flex.FLEX_COLUMN), grid: 0 as u32, cell: 0,
         grow: 0, shrink: 1000, basis: 0 - 1,
         min_main: 0, max_main: 0, align_self: flex.AL_AUTO,
         fix_w: 0.0, fix_h: 0.0,
@@ -399,7 +417,7 @@ fn scene_new() -> Scene {
     return Scene { nodes: 0, nsz: 0, hi: 0, n: 0, root: SCENE_NONE,
         phase: PHASE_BUILD, drift: 0, kidof: 0, depthof: 0, nodeof: 0,
         xfof: 0, limof: 0, view_w: 0, dmode: 0 as u32, reflows: 0,
-        cull: 1 as u32, culled: 0, memo: 0 }
+        cull: 1 as u32, culled: 0, memo: 0, gpool: 0, gsz: 0 }
 }
 
 fn scene_reset(sc: *mut Scene) {
@@ -564,6 +582,10 @@ fn scene_free(sc: *mut Scene) {
     }
     (*sc).nodes = 0
     (*sc).hi = 0
+    if (*sc).gpool != 0 {
+        rt.heap_free((*sc).gpool, SCENE_MAX * (*sc).gsz as usize)
+    }
+    (*sc).gpool = 0
     scene_reset(sc)
 }
 
@@ -856,6 +878,164 @@ fn node_set_space(sc: *mut Scene, i: usize, l: i64, t: i64, r: i64,
     b: i64, gap_main: i64, gap_cross: i64) {
     node_set_padding(sc, i, l, t, r, b)
     node_set_gap(sc, i, gap_main, gap_cross)
+}
+
+// ================================================ A GRID (lib/fui/grid.fi)
+//
+// A box can distribute its children not on ONE axis (flex) but on TRACKS:
+// `node_set_grid` turns the node into a grid, `node_grid_col/_row` append
+// tracks (grid.tk_px / tk_auto / tk_fr / tk_minmax), `node_set_cell` puts a
+// child on a cell and span (or leaves it to the auto-placement). The
+// calculation is grid.fi's and ONLY there; this module fills the items from
+// the measured children and writes the rectangles back -- the same split as
+// for flex.fi. The spec of a grid node lives in the scene's grid pool at the
+// node's own slot, so the node itself stays small.
+fn grid_pool_slot(sc: *mut Scene, i: usize) -> *mut grid.GridSpec {
+    return ((sc as u64) +% ((*sc).gpool -% (sc as u64) +% (i as u64) * (*sc).gsz)) as *mut grid.GridSpec
+}
+
+fn grid_pool_ensure(sc: *mut Scene) -> bool {
+    if (*sc).gpool != 0 {
+        return true
+    }
+    var probe: [grid.GridSpec; 2] = [grid.grid_spec_new(); 2]
+    let sz: u64 = (&probe[1]) as u64 - (&probe[0]) as u64
+    let p: u64 = rt.heap_alloc(SCENE_MAX * sz as usize)
+    if p == 0 {
+        return false
+    }
+    (*sc).gsz = sz
+    (*sc).gpool = p
+    return true
+}
+
+// Turn node `i` into a grid with no tracks yet. false = no memory.
+fn node_set_grid(sc: *mut Scene, i: usize) -> bool {
+    if i >= (*sc).n || i >= SCENE_MAX || !grid_pool_ensure(sc) {
+        return false
+    }
+    *grid_pool_slot(sc, i) = grid.grid_spec_new()
+    (*nd(sc, i)).grid = 1 as u32
+    return true
+}
+
+fn node_is_grid(sc: *mut Scene, i: usize) -> bool {
+    if i >= (*sc).n {
+        return false
+    }
+    return (*nd(sc, i)).grid != (0 as u32)
+}
+
+// The spec of a grid node (0 if the node is no grid) -- for tests and tools.
+fn node_grid_spec(sc: *mut Scene, i: usize) -> *mut grid.GridSpec {
+    if !node_is_grid(sc, i) {
+        return 0 as *mut grid.GridSpec
+    }
+    return grid_pool_slot(sc, i)
+}
+
+// Track sizes are DESIGN points (grid.tk_px(240) is 240 at scale 1000).
+fn node_grid_col(sc: *mut Scene, i: usize, t: grid.Track) -> bool {
+    if !node_is_grid(sc, i) {
+        return false
+    }
+    return grid.gs_add_col(grid_pool_slot(sc, i), t)
+}
+
+fn node_grid_row(sc: *mut Scene, i: usize, t: grid.Track) -> bool {
+    if !node_is_grid(sc, i) {
+        return false
+    }
+    return grid.gs_add_row(grid_pool_slot(sc, i), t)
+}
+
+fn node_grid_gap(sc: *mut Scene, i: usize, x: i64, y: i64) {
+    if node_is_grid(sc, i) {
+        grid.gs_set_gap(grid_pool_slot(sc, i), x, y)
+    }
+}
+
+fn node_grid_padding(sc: *mut Scene, i: usize, l: i64, t: i64, r: i64,
+    b: i64) {
+    if node_is_grid(sc, i) {
+        grid.gs_set_padding(grid_pool_slot(sc, i), l, t, r, b)
+    }
+}
+
+fn node_grid_flow(sc: *mut Scene, i: usize, flow: u32, dense: bool) {
+    if node_is_grid(sc, i) {
+        grid.gs_set_flow(grid_pool_slot(sc, i), flow, dense)
+    }
+}
+
+// justify-content / align-content (grid.GC_*)
+fn node_grid_content(sc: *mut Scene, i: usize, justify: u32, align_c: u32) {
+    if node_is_grid(sc, i) {
+        grid.gs_set_content(grid_pool_slot(sc, i), justify, align_c)
+    }
+}
+
+// justify-items / align-items (flex.AL_*)
+fn node_grid_items(sc: *mut Scene, i: usize, ax: u32, ay: u32) {
+    if node_is_grid(sc, i) {
+        grid.gs_set_items(grid_pool_slot(sc, i), ax, ay)
+    }
+}
+
+// grid-auto-columns / grid-auto-rows
+fn node_grid_auto(sc: *mut Scene, i: usize, col: grid.Track, row: grid.Track) {
+    if node_is_grid(sc, i) {
+        grid.gs_set_auto(grid_pool_slot(sc, i), col, row)
+    }
+}
+
+// right-to-left: column 0 on the right
+fn node_grid_rtl(sc: *mut Scene, i: usize, rtl: bool) {
+    if node_is_grid(sc, i) {
+        grid.gs_set_rtl(grid_pool_slot(sc, i), rtl)
+    }
+}
+
+// The cell of a CHILD: column/row 0-based, -1 = automatic; spans >= 1.
+fn node_set_cell(sc: *mut Scene, i: usize, col: i64, row: i64, cspan: i64,
+    rspan: i64) {
+    if i >= (*sc).n {
+        return
+    }
+    var c: u64 = 0
+    if col >= 0 && col < 65535 {
+        c = (col + 1) as u64
+    }
+    var r: u64 = 0
+    if row >= 0 && row < 65535 {
+        r = (row + 1) as u64
+    }
+    var cs: u64 = 1
+    if cspan > 1 {
+        cs = cspan as u64
+        if cs > 32 {
+            cs = 32
+        }
+    }
+    var rs: u64 = 1
+    if rspan > 1 {
+        rs = rspan as u64
+        if rs > 32 {
+            rs = 32
+        }
+    }
+    let keep: u64 = (*nd(sc, i)).cell & 0xFFFF000000000000
+    (*nd(sc, i)).cell = keep | c | (r << 16) | (cs << 32) | (rs << 40)
+}
+
+// justify-self / align-self of a child inside its cell (flex.AL_*, AL_AUTO =
+// what the grid says).
+fn node_set_cell_align(sc: *mut Scene, i: usize, ax: u32, ay: u32) {
+    if i >= (*sc).n {
+        return
+    }
+    let keep: u64 = (*nd(sc, i)).cell & 0x0000FFFFFFFFFFFF
+    (*nd(sc, i)).cell = keep | ((ax as u64 & 255) << 48) | ((ay as u64 & 255) << 56)
 }
 
 fn node_set_wrap(sc: *mut Scene, i: usize, w: u32) {
@@ -1311,6 +1491,9 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
         let bk: u64 = box_key(sc, i)
         if bk != 0 && memo_box_get(sc, i, bk, &pw, &ph) {
             // pw/ph came from the memo
+        } else if (*nd).grid != (0 as u32) {
+            measure_grid(sc, c, i, &pw, &ph)
+            memo_box_put(sc, i, bk, pw, ph)
         } else {
             var items: [flex.FlexItem; 64] = [flex.flex_item(0, 0); 64]
             let n: usize = fill_items(sc, c, i, &items[0])
@@ -1420,7 +1603,11 @@ fn para_widths(sc: *mut Scene, c: *mut render.Ctx) -> bool {
         if (*nd).wrap > 0 && (*nd).nkids == 0 && (*nd).fix_w <= 0.0 {
             var a: f64 = (*nd).w
             let p: usize = (*nd).parent
-            if p != SCENE_NONE && !flex.flex_is_row(&(*nd(sc, p)).fb) {
+            var in_col: bool = false
+            if p != SCENE_NONE && (*nd(sc, p)).grid == (0 as u32) {
+                in_col = !flex.flex_is_row(&(*nd(sc, p)).fb)
+            }
+            if in_col {
                 var fb: flex.FlexBox = box_px(c, &(*nd(sc, p)).fb)
                 let inner: f64 = (*nd(sc, p)).w - (fb.pad_l as f64)
                 -(fb.pad_r as f64)
@@ -1530,6 +1717,121 @@ fn box_px(c: *mut render.Ctx, fb: *mut flex.FlexBox) -> flex.FlexBox {
     b.pad_r = render.len_signed(c, b.pad_r) as i64
     b.pad_b = render.len_signed(c, b.pad_b) as i64
     return b
+}
+
+// THE GRID, AS grid.fi IS TO SEE IT: tracks, gaps and inner margin in
+// pixels (design points through render.len_signed, like box_px).
+fn gs_px(c: *mut render.Ctx, g: *mut grid.GridSpec) -> grid.GridSpec {
+    var b: grid.GridSpec = *g
+    var j: usize = 0
+    while j < b.ncols {
+        b.cols[j] = track_px(c, b.cols[j])
+        j = j + 1
+    }
+    j = 0
+    while j < b.nrows {
+        b.rows[j] = track_px(c, b.rows[j])
+        j = j + 1
+    }
+    b.auto_col = track_px(c, b.auto_col)
+    b.auto_row = track_px(c, b.auto_row)
+    b.gap_x = render.len_signed(c, b.gap_x) as i64
+    b.gap_y = render.len_signed(c, b.gap_y) as i64
+    b.pad_l = render.len_signed(c, b.pad_l) as i64
+    b.pad_t = render.len_signed(c, b.pad_t) as i64
+    b.pad_r = render.len_signed(c, b.pad_r) as i64
+    b.pad_b = render.len_signed(c, b.pad_b) as i64
+    return b
+}
+
+fn track_px(c: *mut render.Ctx, t: grid.Track) -> grid.Track {
+    var r: grid.Track = t
+    if r.min_k == grid.TK_PX {
+        r.min_v = render.len_signed(c, r.min_v) as i64
+    }
+    if r.max_k == grid.TK_PX {
+        r.max_v = render.len_signed(c, r.max_v) as i64
+    }
+    return r
+}
+
+// The GridItems from the measured children of grid node `i`: the measured
+// size is both the preferred and (except for a paragraph, which may shrink)
+// the minimum size; a child with a size of its own (node_set_size or a
+// width/height rule) is not stretched.
+fn fill_grid_items(sc: *mut Scene, i: usize, items: *mut grid.GridItem) -> usize {
+    let nd: *mut Node = &(*nd(sc, i))
+    var c: usize = (*nd).first
+    var n: usize = 0
+    while c != SCENE_NONE && n < KIDS_MAX {
+        let kid: *mut Node = &(*nd(sc, c))
+        var it: grid.GridItem = grid.grid_item(flex.flex_px((*kid).pw),
+            flex.flex_px((*kid).ph))
+        if (*kid).wrap > 0 {
+            it.min_w = 0
+        }
+        let cl: u64 = (*kid).cell
+        var cc: i64 = (cl & 0xFFFF) as i64
+        var rr: i64 = ((cl >> 16) & 0xFFFF) as i64
+        var cs: i64 = ((cl >> 32) & 255) as i64
+        var rs: i64 = ((cl >> 40) & 255) as i64
+        if cs < 1 {
+            cs = 1
+        }
+        if rs < 1 {
+            rs = 1
+        }
+        grid.gitem_place(&it, cc - 1, rr - 1, cs, rs)
+        grid.gitem_align(&it, ((cl >> 48) & 255) as u32,
+            ((cl >> 56) & 255) as u32)
+        let st: *mut style.Style = widget.w_style(&(*kid).e)
+        grid.gitem_fixed(&it, (*kid).fix_w > 0.0 || style.style_has_width(st),
+            (*kid).fix_h > 0.0 || style.style_has_height(st))
+        *((items as u64 + (n * grid.grid_item_stride()) as u64)
+            as *mut grid.GridItem) = it
+        n = n + 1
+        c = (*kid).next
+    }
+    if c != SCENE_NONE {
+        (*sc).kidof = (*sc).kidof + 1
+    }
+    return n
+}
+
+// MEASURING a grid box (max-content): the tracks at their content size.
+fn measure_grid(sc: *mut Scene, c: *mut render.Ctx, i: usize, pw: *mut f64,
+    ph: *mut f64) {
+    var items: [grid.GridItem; 64] = [grid.grid_item(0, 0); 64]
+    let n: usize = fill_grid_items(sc, i, &items[0])
+    var g: grid.GridSpec = gs_px(c, grid_pool_slot(sc, i))
+    var w: i64 = 0
+    var h: i64 = 0
+    grid.grid_measure(&g, &items[0], n, &w, &h)
+    *pw = w as f64
+    *ph = h as f64
+}
+
+// ARRANGING the children of a grid box in the rectangle (ox, oy, iw, ih).
+fn layout_grid(sc: *mut Scene, c: *mut render.Ctx, i: usize, ox: f64,
+    oy: f64, iw: f64, ih: f64) {
+    let nd: *mut Node = &(*nd(sc, i))
+    var items: [grid.GridItem; 64] = [grid.grid_item(0, 0); 64]
+    let n: usize = fill_grid_items(sc, i, &items[0])
+    var out: [layout.Rect; 64] = [layout.rect_new(0, 0, 0, 0); 64]
+    var g: grid.GridSpec = gs_px(c, grid_pool_slot(sc, i))
+    grid.grid_layout(&g,
+        layout.rect_new(ox as i64, oy as i64, iw as i64, ih as i64),
+        &items[0], n, &out[0])
+    var k: usize = (*nd).first
+    var j: usize = 0
+    while k != SCENE_NONE && j < n {
+        layout_node(sc, c, k, layout.rect_x(&out[j]) as f64,
+            layout.rect_y(&out[j]) as f64,
+            layout.rect_w(&out[j]) as f64,
+            layout.rect_h(&out[j]) as f64)
+        k = (*nd(sc, k)).next
+        j = j + 1
+    }
 }
 
 // ======================================================================
@@ -1822,10 +2124,14 @@ fn box_key(sc: *mut Scene, i: usize) -> u64 {
     h = mix(h, (*fb).pad_b as u64)
     h = mix_f64(h, (*nd).fix_w)
     h = mix_f64(h, (*nd).fix_h)
+    if (*nd).grid != (0 as u32) {
+        h = mix(h, grid.gs_hash(grid_pool_slot(sc, i)))
+    }
     var k: usize = (*nd).first
     while k != SCENE_NONE {
         let kid: *mut Node = &(*nd(sc, k))
         h = mix(h, k as u64)
+        h = mix(h, (*kid).cell)
         h = mix_f64(h, (*kid).pw)
         h = mix_f64(h, (*kid).ph)
         h = mix(h, (*kid).basis as u64)
@@ -1992,6 +2298,10 @@ fn layout_node(sc: *mut Scene, c: *mut render.Ctx, i: usize, x: f64,
         (*slot).ah = h
     }
     if (*nd).nkids == 0 {
+        return
+    }
+    if (*nd).grid != (0 as u32) {
+        layout_grid(sc, c, i, ox, oy, iw, ih)
         return
     }
     var items: [flex.FlexItem; 64] = [flex.flex_item(0, 0); 64]

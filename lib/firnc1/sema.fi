@@ -42,7 +42,7 @@ import escape
 import moves
 
 export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty, sema_widen32,
-    sema_is_seq, sema_hidden_idx,
+    sema_is_seq, sema_hidden_idx, sema_vec_slice, sema_seq_elem,
     sema_types, sema_ty_count, sema_needs_comptime, sema_const_value,
     // ROUND FIRN-ENV (compiler/src/env.rs) -- `const` with a text.
     sema_const_text_len, sema_const_text_ptr,
@@ -1107,6 +1107,13 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
             if et == NONE {
                 return NONE
             }
+            // r728: `E(args)` -- E is an expression of function type
+            if is_call_value(names(s), intern.intern_ab(names(s), ast.e_a(b, e), 7)) {
+                if types.ty_kind(table(s), et) == types.K_FN {
+                    return types.ty_a(table(s), et)
+                }
+                return NONE
+            }
             let sn: u32 = recv_struct(s, et)
             if sn == NONE {
                 return NONE
@@ -1890,6 +1897,39 @@ fn hidden_each_idx(s: *mut Sema, idx: u32) -> bool {
 // loop counter): the element type, else NONE.
 fn sema_is_seq(s: *mut Sema, bt: u32) -> bool { return seq_elem(s, bt) != NONE }
 fn sema_hidden_idx(s: *mut Sema, idx: u32) -> bool { return hidden_each_idx(s, idx) }
+fn sema_seq_elem(s: *mut Sema, bt: u32) -> u32 { return seq_elem(s, bt) }
+
+// r728 (foreach.rs::is_vec_slice): is `name` the sugar call `"method slice"`
+// on a Vec[T] (value or pointer; a str-shaped view has its own `slice`)?
+// The result is a non-owning VIEW (Vec with cap = 0).
+fn sema_vec_slice(s: *mut Sema, name: u32, bt: u32) -> bool {
+    if !is_method_call(names(s), name) {
+        return false
+    }
+    var w: [u8; 5] = "slice"
+    if intern.intern_ab(names(s), name, 7) != intern.intern_number(names(s), (&w[0]) as u64, 5) as u32 {
+        return false
+    }
+    var t: u32 = bt
+    if types.ty_kind(table(s), t) == types.K_PTR {
+        t = types.ty_a(table(s), t)
+    }
+    if types.ty_kind(table(s), t) != types.K_STRUCT {
+        return false
+    }
+    if types.str_like(table(s), t) {
+        return false
+    }
+    return seq_elem(s, t) != NONE
+}
+
+// The Vec type of a slice call: the struct itself, never the pointer.
+fn vec_slice_ty(s: *mut Sema, bt: u32) -> u32 {
+    if types.ty_kind(table(s), bt) == types.K_PTR {
+        return types.ty_a(table(s), bt)
+    }
+    return bt
+}
 
 fn seq_index_elem(s: *mut Sema, bt: u32, idx: u32) -> u32 {
     var t: u32 = bt
@@ -2835,6 +2875,44 @@ fn late_defaults(s: *mut Sema, e: u32, f: u32) -> bool {
     return true
 }
 
+// r728: is this the hidden method name `__call` (callee expression)?
+fn is_call_value(it: *mut intern.Interner, m: u32) -> bool {
+    var w: [u8; 6] = "__call"
+    return intern.intern_number(it, (&w[0]) as u64, 6) as u32 == m
+}
+
+// Checks the arguments (child 1..) of the call `e` against the function type
+// `fv` -- the receiver (child 0) is only the place the value is read from --
+// and yields the result type. Shared by round 68 (field) and r728 (callee).
+fn fn_value_args(s: *mut Sema, e: u32, fv: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    var k: u32 = 1
+    let plen3: u32 = types.fn_ty_len(table(s), fv)
+    if cnt - 1 != plen3 {
+        complain(s)
+    }
+    while k < cnt {
+        let arg3: u32 = ast.child_at(b, off + k)
+        if k - 1 < plen3 {
+            let pt3: u32 = types.fn_ty_param(table(s), fv, k - 1)
+            if has_fe(s) && coerce_check(s, arg3, pt3) {
+                k = k + 1
+                continue
+            }
+            let t3: u32 = expr(s, arg3, pt3)
+            if !types.compatible(table(s), t3, pt3) {
+                complain(s)
+            }
+        } else {
+            infer(s, arg3)
+        }
+        k = k + 1
+    }
+    return types.ty_a(table(s), fv)
+}
+
 fn methods_call(s: *mut Sema, e: u32) -> u32 {
     let b: *mut ast.Tree = tree(s)
     var off: u32 = ast.e_b(b, e)
@@ -2853,6 +2931,27 @@ fn methods_call(s: *mut Sema, e: u32) -> u32 {
             k = k + 1
         }
         return (*s).t_error
+    }
+    // r728 (impls.rs HOOK callidx): `E(args)` -- E is an expression of
+    // function type; the receiver IS the callee.
+    if is_call_value(names(s), m) {
+        if types.ty_kind(table(s), et) == types.K_FN {
+            return fn_value_args(s, e, et)
+        }
+        while k < cnt {
+            infer(s, ast.child_at(b, off + k))
+            k = k + 1
+        }
+        complain(s)
+        return (*s).t_error
+    }
+    // r728 (impls.rs HOOK vslice): `v[a:b]` on a Vec[T] -- a view.
+    if cnt == 3 && sema_vec_slice(s, ast.e_a(b, e), et) {
+        while k < cnt {
+            expr(s, ast.child_at(b, off + k), (*s).t_i64)
+            k = k + 1
+        }
+        return vec_slice_ty(s, et)
     }
     let sn: u32 = recv_struct(s, et)
     if sn == NONE {
@@ -2879,28 +2978,7 @@ fn methods_call(s: *mut Sema, e: u32) -> u32 {
         // only the place the value is read from and is NOT passed on.
         let fv: u32 = field_fn_ty(s, et, m)
         if fv != NONE {
-            let plen3: u32 = types.fn_ty_len(table(s), fv)
-            if cnt - 1 != plen3 {
-                complain(s)
-            }
-            while k < cnt {
-                let arg3: u32 = ast.child_at(b, off + k)
-                if k - 1 < plen3 {
-                    let pt3: u32 = types.fn_ty_param(table(s), fv, k - 1)
-                    if has_fe(s) && coerce_check(s, arg3, pt3) {
-                        k = k + 1
-                        continue
-                    }
-                    let t3: u32 = expr(s, arg3, pt3)
-                    if !types.compatible(table(s), t3, pt3) {
-                        complain(s)
-                    }
-                } else {
-                    infer(s, arg3)
-                }
-                k = k + 1
-            }
-            return types.ty_a(table(s), fv)
+            return fn_value_args(s, e, fv)
         }
         while k < cnt {
             infer(s, ast.child_at(b, off + k))

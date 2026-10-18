@@ -37,7 +37,7 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Knotenkapazität des Baums (SCENE_MAX 128, KIDS_MAX 64) | **teilweise** | lib/fui/scene.fi:166/171; r102 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P0 (r102) | App mit 5000 Knoten: Bau+Malen ≤ 16 ms |
 | RTL-Spiegelung | **vorhanden** | kit.kit_set_rtl; tools/fui/kitrtl_main.fi | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✗ | - | kitrtl_main |
 | Layout-Animation (Umordnen gleitet) | **fehlt** | r149 | ~ | ✓ | ✓ | ✗ | ✓ | ✓ | ~ | ✗ | P2 (r149) | - |
-| Safe-Area/Insets (Notch, Tastatur, Systemleisten) | **fehlt** | grep inset/safe_area in window/plat: nichts | ~ | ✓ | ~ | ✗ | ✓ | ✓ | ~ | ✗ | P2 | Android-Emulator: Feld bleibt über Tastatur sichtbar |
+| Safe-Area/Insets (Notch, Tastatur, Systemleisten) | **teilweise** | lib/fui/wave8m.fi: Insets (max/add/start/end, RTL), insets_lift (Feld ueber Tastatur); Host-Leser fehlen | ~ | ✓ | ~ | ✗ | ✓ | ✓ | ~ | ✗ | P2 | Android-Emulator: Feld bleibt über Tastatur sichtbar |
 | Inkrementelles Layout (Schmutzbits, Memo) | **vorhanden** | scene.fi memo; r100/r109 (1009 Knoten 0.9 ms) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | - | Baumarbeit ≤ 2 ms |
 
 ### Widgets
@@ -47,7 +47,7 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Button (primary/secondary/subtle), Label, Link | **vorhanden** | wave2.button_variant; kit.button_draw; richtext (Link-IDs) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | fluent_main (58 Maße) |
 | Checkbox, Radio, Toggle (animiert) | **vorhanden** | wave2.draw_checkbox/radio/toggle; appctl.checkbox/toggle/radio | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | glide_main |
 | Slider, Progress (bestimmt) | **vorhanden** | wave2.draw_slider/progress; kit.progress_draw | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | fluent_main |
-| Busy-Ring/Spinner, unbestimmter Fortschritt als Widget | **teilweise** | kit.fi-Kommentar 'indeterminate sweep'; kein Ring | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P2 | animbench: Idle-Ring 60 Hz ohne Voll-Dirty |
+| Busy-Ring/Spinner, unbestimmter Fortschritt als Widget | **teilweise** | **vorhanden-Modell** wave8.spinner_* (12 Punkte, Reduced-Motion = ruhiger Ring), wave8_main | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P2 | animbench: Idle-Ring 60 Hz ohne Voll-Dirty |
 | Range-Slider (2 Griffe), NumberBox/Spinbox | **teilweise** | appctl.spinbox da; Range-Slider fehlt (r146) | ~ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ~ | P2 (r146) | - |
 | Einzeiliges Textfeld (Auswahl, Undo, Passwort, Secret-Schutz) | **vorhanden** | lib/fui/editor.fi; textbuf.fi; r99/r108 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | editor_main |
 | Mehrzeiliges Textfeld | **teilweise** | lib/fui/textarea.fi (LINES_MAX 2048); r127 (Shift+Klick, bidi-Cursor, >100 KB) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P1 (r127) | textarea_main + 1 MB Text ≤ 16 ms/Frame |
@@ -56,21 +56,21 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Liste einfach (Tastatur Auf/Ab/Enter, Mehrfachauswahl, Umbenennen) | **teilweise** | listrow.fi, wave3.draw_list; vlist hat Tastatur, Szenenbaum nicht (r134) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P0 (r134) | listrow_main: Tastatur + Strg/Umschalt-Auswahl |
 | Tabs/TabBar/Pivot | **vorhanden** | appctl.tabs; kit.tabbar_draw; wave2.draw_tab | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | kit_main |
 | NavigationView/Sidebar (Kollaps, Hamburger) | **teilweise** | kit.nav_* (Seitenleiste); kein Kollaps/Hamburger | ~ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✗ | P2 | kit_main: 3 Breitenstufen |
-| Expander/Accordion | **teilweise** | appctl.expander (einzeln); Gruppe 'nur einer offen' fehlt | ~ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✓ | P2 | - |
+| Expander/Accordion | **teilweise** | appctl.expander (einzeln); wave8m.Accordion (exklusiv/frei, Tasten, 64 Abschnitte); noch nicht in appctl | ~ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✓ | P2 | - |
 | Splitter (ziehbarer Trenner) | **vorhanden** | lib/fui/splitter.fi; splitter_main, splitnode_main; appctl.split_* | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P1 (neu) | Zug/Tastatur/a11y-separator-Test, Mindestgrößen |
 | Docking (Panels andocken, Layout speichern) | **teilweise** | lib/fuishell/dock.fi (875 Z., JSON-Layout); nicht in fui.app | ✓ | ✓ | ✗ | ✗ | ~ | ✗ | ✗ | ~ | P2 | dock-Layout round-trip Test |
-| Stepper/Wizard, Breadcrumb | **teilweise** | Breadcrumb nur in filedlg.fi; kein Stepper | ~ | ~ | ~ | ✗ | ~ | ✗ | ✗ | ✗ | P3 | - |
+| Stepper/Wizard, Breadcrumb | **teilweise** | wave8.Crumbs (Faltung in "...", Fokuslauf, RTL) + wave8.Steps (Stepper, Tasten, RTL); wave8_main; nicht in appctl/a11y | ~ | ~ | ~ | ✗ | ~ | ✗ | ✗ | ✗ | P3 | - |
 | Rating, Chips/Tags, Carousel/PageView, Segmented, Skeleton/Shimmer | **vorhanden** | lib/fui/wave5.fi; wave5_main, appw5_main (Carousel/Pager, Segmented, Skeleton) | ~ | ✓ | ✓ | ~ | ✓ | ✓ | ~ | ✗ | P2 (r45) | - |
 | Badge, Avatar, Card/Tile, Kachelraster | **vorhanden** | kit.draw_badge/avatar_draw/grid_*; wave3.draw_card | ~ | ✓ | ✓ | ✗ | ✓ | ✓ | ~ | ✗ | - | kit_main |
 | DatePicker/Calendar | **vorhanden** | wave3.draw_datepicker (Monat/Jahr); kein Bereich | ✓ | ✓ | ✓ | ✓ | ~ | ✓ | ✓ | ~ | - | wave3-Prüfung |
-| TimePicker, Bereichs-Datum | **fehlt** | nicht gefunden; r146 | ✓ | ✓ | ✓ | ~ | ✓ | ✓ | ✓ | ✗ | P2 (r146) | - |
+| TimePicker, Bereichs-Datum | **teilweise** | wave8.Time (24h/12h, Pfeile/Home/End/Ziffern/Rad, Hit, Zeichnen); Bereichs-Datum fehlt | ✓ | ✓ | ✓ | ~ | ✓ | ✓ | ✓ | ✗ | P2 (r146) | - |
 | ColorPicker (Feld+Regler+Hex) | **vorhanden** | lib/fui/colordlg.fi; wave3.draw_colorpicker | ✓ | ~ | ✓ | ✓ | ~ | ✓ | ✗ | ✓ | - | colordlg_main |
 | TreeView (Tastatur, Drag-Umordnen, Lazy-Load) | **teilweise** | wave3.draw_tree; vlist-Baum; Tastatur/Lazy unbelegt | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P1 (r145) | Baum 100k Knoten lazy ≤ 16 ms |
-| TableView/DataGrid (Sortieren, Spaltenbreite) | **teilweise** | vlist: Sortierpfeil/Spalten ziehen; Zelle bearbeiten, Spalten umordnen, Fixierung fehlen | ✓ | ~ | ✓ | ~ | ~ | ✓ | ✗ | ~ | P1 (r146) | vlist_main + Zell-Edit-Test |
+| TableView/DataGrid (Sortieren, Spaltenbreite) | **teilweise** | vlist: Sortierpfeil/Spalten ziehen; wave8m.CellEdit (Cursor, Enter/F2/Tippen, Tab, Esc, Nur-Lese-Spalten; Modell, noch nicht in vlistview); Spalten umordnen, Fixierung fehlen | ✓ | ~ | ✓ | ~ | ~ | ✓ | ✗ | ~ | P1 (r146) | vlist_main + Zell-Edit-Test |
 | Property-Grid/Inspector-Form | **vorhanden** | lib/fui/wave6.fi; wave6_main, appctl.propgrid | ~ | ✗ | ~ | ✗ | ✗ | ✗ | ✗ | ~ | P3 | - |
-| Toolbar/CommandBar/Menüleiste (mit Überlauf) | **teilweise** | wave2.draw_toolbar/menubar; appctl.menubar; kein Überlauf-Chevron | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P2 | - |
+| Toolbar/CommandBar/Menüleiste (mit Überlauf) | **teilweise** | wave2.draw_toolbar/menubar; appctl.menubar; wave8m.Toolbar (toolbar_fit: Prioritaet, Chevron-Platz; Modell, Zeichnen offen) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P2 | - |
 | Tooltip/Flyout/Popover/TeachingTip | **teilweise** | wave2.tooltip; fuipopup.fi (X11-Toplevel); Flyout/Popover fehlen; r175 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P1 (r175) | Popup ragt über Fensterrand, 3 Backends |
-| Modaler Dialog, Toast, InfoBar | **teilweise** | kit.modal_*/toasts_*; msgdlg.fi; InfoBar fehlt | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P2 | kit_main |
+| Modaler Dialog, Toast, InfoBar | **teilweise** | kit.modal_*/toasts_*; msgdlg.fi; wave8.InfoBar (4 Schweregrade, Aktion, Schliessen, RTL, 3:1-Kontrast) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P2 | kit_main |
 | Bottom-Sheet/Drawer | **vorhanden** | lib/fui/wave6.fi; appctl.sheet_* | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P2 | - |
 | Markdown-/RichText-Ansicht, QR-Code, Kamera-Vorschau, Syntaxfarben | **vorhanden** | markdownview.fi (2289 Z.), richtext.fi, qrview.fi, camview.fi, syntaxcolor.fi | ~ | ~ | ~ | ✗ | ~ | ~ | ✗ | ~ | - | mdview_main, richtext_main, qrview_main |
 | Editierbarer RichText (WYSIWYG) | **fehlt** | richtext.fi nur Anzeige | ✓ | ~ | ✓ | ~ | ~ | ✓ | ✗ | ✗ | P3 | - |
@@ -123,7 +123,7 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Fluent-Preset (Radien, Dichte, Schatten, Maße) | **vorhanden** | theme.shape_fluent; fluent_main (58 Maße, 0 Abw.) | ~ | ✓ | ✓ | ~ | ✓ | ✓ | ~ | ✗ | - | fluent_main |
 | System-Akzent/Dark-Mode live folgen | **teilweise** | lib/fui/syspref.fi (Parser+Theme-Anbindung, syspref_main); Host-Leser (DBus/Registry) fehlen (r150) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P1 (r150) | Systemwechsel → Frame in ≤ 1 s |
 | High-Contrast des OS erkennen (Forced Colors) | **teilweise** | lib/fui/syspref.fi hc_from_flags/portal_contrast -> Theme 7:1; Host-Leser fehlen | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | P1 (r150) | Windows-Kontrastmodus → Theme gewechselt |
-| Dichte compact/comfortable | **teilweise** | theme_set_scale, 3 Shapes; kein Dichte-Schalter | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P2 | - |
+| Dichte compact/comfortable | **teilweise** | theme_set_scale, 3 Shapes; wave8m.density_* (compact 80 %, Touch bleibt comfortable); nicht im Theme verdrahtet | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P2 | - |
 | Mica/Acrylic/Blur-Behind | **fehlt** | r151; In-Fenster-Glas effect.fi (~100 ms/Dialog) | ~ | ~ | ✓ | ✗ | ~ | ✓ | ~ | ✗ | P2 (r151) | Blur ≤ 8 ms @1240x720 |
 | Icons (Lucide 93 + SVG) / Fluent-Icons | **teilweise** | icons.fi, lucide.fi; Fluent/Material-Satz fehlt | ✓ | ~ | ✓ | ✓ | ✓ | ✓ | ~ | ✗ | P2 | - |
 | Design-Tokens exportieren (css/json/rs) | **fehlt** | r161 | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | P2 (r161) | Drift-Prüfung 0 Abweichungen |
@@ -139,7 +139,7 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | ARIA-Spiegel (Web) | **fehlt** | r103 | ~ | ✓ | ✗ | ✗ | ~ | ✗ | ~ | ✓ | P1 (r103) | axe-core 0 Verstöße auf Galerie |
 | Tastaturbedienung: Tab-Ring, Fokusmodell, Mnemonics, Shortcut-Registry | **teilweise** | control.fi; action.fi (Kürzel, act_mnemonic); r143, r221 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P1 (r143, r221) | Alle Kit-Controls ohne Maus bedienbar (Skript) |
 | Fokusring, Kontrast-Audit im Build | **vorhanden** | kit.focus_ring; contrast_main; themefile | ~ | ~ | ~ | ~ | ~ | ~ | ✗ | ✗ | - | contrast_main |
-| Textskalierung nach System-Einstellung | **fehlt** | nicht gefunden | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✗ | P2 | - |
+| Textskalierung nach System-Einstellung | **teilweise** | wave8m.textscale_* (85-200 %, 2,5-%-Raster); Host-Leser fehlen | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✗ | P2 | - |
 | Voll-Zugriff A11Y_MAX/SCENE_MAX 128 | **teilweise** | a11y.fi:105; r222 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P1 (r222) | Brücke zeigt 2000 Knoten |
 
 ### Eingabe, Drag&Drop, Zwischenablage
@@ -174,7 +174,7 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Kontextmenü (Provider-Kette, Untermenüs, Plugins, Bus) | **vorhanden** | ctxmenu.fi; menuview.fi; ctxstd.fi; docs/CONTEXT-MENUS.md | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ~ | - | ctxmenu_main |
 | Menüleiste | **vorhanden** | appctl.menubar; wave2.draw_menubar | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | menuview_main |
 | Popups als eigene Toplevel-Fenster | **teilweise** | lib/plat/fuipopup.fi X11 fertig; Win32/OrientOS offen (r172), Dropdown/Tooltip/Toast (r175) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P0 (r172, r175) | Menü über Fensterrand auf allen 3 Desktop-Hosts |
-| Shortcut-Management (Konflikte, Rebinding-UI) | **teilweise** | action.fi Registry; keine Konfliktprüfung/UI (r143) | ✓ | ✓ | ✓ | ✓ | ~ | ✓ | ~ | ~ | P2 (r143) | - |
+| Shortcut-Management (Konflikte, Rebinding-UI) | **teilweise** | action.fi Registry; act_conflict/act_rebind (w16_main) + keycapture.fi (Aufnahme-Zustandsmaschine); Settings-UI fehlt | ✓ | ✓ | ✓ | ✓ | ~ | ✓ | ~ | ~ | P2 (r143) | - |
 | Fensterleiste/Titelleiste eigene (Drag/Min/Max/Close) | **teilweise** | lib/fui/titlebar.fi; Hosts nicht verdrahtet (r229) | ~ | ~ | ✓ | ~ | ~ | ~ | ~ | ~ | P1 (r229) | Drag/Max/Close auf X11+Win32 |
 
 ### Grafik/Canvas
@@ -325,3 +325,7 @@ Neu in main (alles reine Modelle mit Prüfprogramm in `tools/fui/run.sh`, Gerüs
 * Veraltete Zeilen nachgezogen: UAX #14, Fuzz, Recorder, Splitter, wave5/6, Syspref (Stand W25).
 
 **Offen:** Verdrahtung in Szenenbaum/`fui.app` (Grid-Spuren r148, Combobox-Popup r146, Timeline-Widgets r149, DnD-Hosts r144), Host-Leser für System-Einstellungen, Arabisch in `uistr`.
+
+## W28-d (18.10.2026): Wave 8 + Modelle
+* `lib/fui/wave8.fi`: Spinner, TimePicker, Breadcrumb, InfoBar, Stepper (Sofortmodus, ein Geometrie-Pfad, Theme-Tokens, RTL); `lib/fui/wave8m.fi`: Accordion, Toolbar-Ueberlauf, Tabellen-Zellbearbeitung, Insets, Dichte, Textskalierung; `lib/fui/keycapture.fi`: Tastenkuerzel aufnehmen (Konflikt/Ersetzen). Test `tools/fui/wave8_main.fi` (227 Checks, hell+dunkel), in `run.sh`.
+* **Offen (r45-Rest):** appctl-/a11y-(kita11y)-Anbindung der wave8-Elemente, Golden fuer wave8, Host-Leser (Insets, Textskalierung), Bereichs-Datum, Zeichnen des Toolbar-Chevrons, Cell-Edit in vlistview.

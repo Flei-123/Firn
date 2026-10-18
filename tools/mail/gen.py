@@ -406,7 +406,7 @@ def gen_qp_case(r):
 def gen_x_spec(r):
     atts = []
     for _ in range(r.randint(0, 3)):
-        atts.append((word(r, 6) + r.choice([".txt", ".png", " x.bin", "ä.pdf", "中.zip"]),
+        atts.append((word(r, 6) + r.choice([".txt", ".png", " x.bin", "ä.pdf", "中.zip"]),  # english: ok
                      r.choice(["application/octet-stream", "image/png", "application/pdf", ""]),
                      rand_bytes(r, r.randint(0, 300))))
     to = [(gen_display_plain(r), local_part(r) + "@" + domain(r)) for _ in range(r.randint(1, 3))]
