@@ -18,9 +18,9 @@ main (bae77570d + this branch). Design reasoning is in `docs/ROUND58.md`; this p
    (root table, `pin`/`unpin`). Test `tests/2869_async_closure_pin.fi`, mutation `tools/net/pin_mutation.sh`
    (pin removed -> segfault, exit 139). Manual unpin: leaks if forgotten.
 2. ~~Closure literal inside a generic function is refused~~ -- FIXED r716 (firnc0): every instance gets its own
-   closure ids (`mono.rs`, test 4042). firnc1 mirror still open.
+   closure ids (`mono.rs`, test 4042). firnc1 mirror: `gen_closure_template`/`copy_lambda` (done).
 3. ~~`Vec[fn(..)]`~~ already works on main (test 4043).
-4. `s.f(1)` on a struct FIELD is a call since round 68 (tests/1238); `v[i](1)` on an array/Vec element still needs a local first (OPEN: needs a call node with a callee EXPRESSION in sema + lower, both compilers).
+4. ~~`v[i](1)` on an array/Vec element~~ -- FIXED r728 (`Call("method __call", [callee, args])`, both compilers; tests 4150-4154).
 5. Captures larger than one word; mutation of captured state needs an explicit `*mut` / `Gc[Cell]`.
 6. No self-recursion of a literal -- by design: a literal has no name; recurse through a named `fn` (or pass the function itself as a parameter).
 
@@ -86,3 +86,20 @@ in front of the statement; `!__q#L_C.has` does `return opt_none[U]()` (the enclo
 lambda expression body, `defer`, `else if` condition, a fn that does not return an Option. Operands of all `?` in
 a statement run in source order before the rest of the statement. firnc0 `parser.rs::question_op`, firnc1
 `parser.fi::question_op` + `mono.option_none_name`.
+
+## Generic functions as values (r718)
+```
+let f = id[i32]                          // instance of a generic fn = ordinary fn value
+apply(id[i32], 3)                        // as an argument
+let o = Ops { f: dbl[i32] }              // struct field
+fn via[T](v: T) -> T { return apply_g[T](id[T], v) }   // inside a template: T is substituted per instance
+let s = option.opt_some[i32]             // module qualified
+```
+* `name[Targs]` NOT followed by `(` is the mangled instance name as a plain identifier (`sema_generic.rs::hook_generic_call`,
+  firnc1 `parser.fi` postfix loop). The instance is queued like for a call, so the value is a normal named function:
+  one-word static record, `==` works, no allocation.
+* Inside a template body `mono.rs::subst_expr` (firnc1: `copy_expr_inner` -> `inst_rewrite`) substitutes the type
+  parameters of such an identifier.
+* Type arguments may be fn types: `pass[fn(i32) -> i32](inc)`, `Holder[fn(i32) -> i32]{..}`.
+* NOT done: inference from the expected `fn` type (`apply(id, 4)` is an error with a hint to write `id[i32]`);
+  methods as values (`x.m` without a call). Tests 4280, 4282 (neg 4281).

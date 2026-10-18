@@ -436,7 +436,12 @@ fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
             subst_expr(b, map, queue);
         }
         ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::FloatF32(_) | ExprKind::Bool(_) => {}
-        ExprKind::Ident(_) => {}
+        // r718: `id[T]` as a value is the Ident of the mangled instance.
+        ExprKind::Ident(name) => {
+            if instantiation(name).is_some() {
+                *name = subst_call_name(name, sp, map, queue);
+            }
+        }
         // ROUND 70: the text literal carries its array literal inside.
         ExprKind::Text(_, inner) => subst_expr(inner, map, queue),
         // Round 58: a closure inside a template is refused by

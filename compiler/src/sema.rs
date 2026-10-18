@@ -1343,6 +1343,10 @@ constants declared before it, and '+ - * /'"
 
     /// Round 64 -- the suggestion for a misspelled value name.
     pub(crate) fn value_hint(&self, name: &str) -> Option<String> {
+        // r718: a generic function needs its type arguments to be a value.
+        if crate::sema_generic::is_generic_fn(name) {
+            return Some(format!("'{}' is a generic function: write the type arguments, e.g. '{}[i32]'", name, name));
+        }
         let all = self.value_names();
         crate::diag::nearest(name, all.iter().map(|s| s.as_str()))
             .map(|n| crate::diag::did_you_mean(&n))
