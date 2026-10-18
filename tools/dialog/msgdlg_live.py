@@ -538,8 +538,12 @@ for name, text in (("empty text", ""), ("umlauts", "ÄÖÜ äöü ß € é"),
            xdo("getwindowfocus")))
 
 # ---------------------------------------------------------------- 7. the driver's other ways out
-env = dict(ENV_LIGHT)
-env.pop("DISPLAY")
+# DISPLAY must name a server that is not there: unset means display 0, and a busy machine has one
+# (a foreign Xvfb :0 made the driver open its window there and wait for ever)
+nodisp = 7000
+while os.path.exists("/tmp/.X11-unix/X%d" % nodisp):
+    nodisp += 1
+env = dict(ENV_LIGHT, DISPLAY=":%d" % nodisp)
 p = subprocess.run([DRIVER, "1", "3", "t", "x"], env=env, capture_output=True, text=True, timeout=20)
 check("no display: rc 12, the answer untouched", "RESULT 12 0" in p.stdout, (p.stdout, p.stderr))
 env = dict(ENV_LIGHT, FUI_AUDIT="1")
