@@ -39,6 +39,10 @@ void main() {
         vec2 hs = vec2(u_fade.w, u_fade.z) * 0.5;
         vec2 ndc = gl_Position.xy / gl_Position.w;
         vec2 sc = floor(vec2(hs.x + ndc.x * hs.x, hs.y - ndc.y * hs.y) * 16.0 + 0.5) * 0.0625;
+        // r265 tie bias: llvmpipe (GL, y-up FBO) resolves exact ties (pixel centre on an edge) the other way than the CPU raster / lavapipe (top-left). All
+        // vertices move up by 1/256 px (llvmpipe sub-pixel grid): ties then fall the CPU way. Measured lodseam S (settled shot): GL vs exact CPU 27.4 -> 36.5 dB.
+        // Only the vertices at a pixel centre line (16 * y mod 16 == 8) give 31.1 dB, so diagonal ties matter too.
+        sc.y -= 0.00390625;
         gl_Position.xy = vec2((sc.x - hs.x) / hs.x, (hs.y - sc.y) / hs.y) * gl_Position.w;
     }
     v_uvao = vec3(float((w1 >> 14) & 31u), float((w1 >> 19) & 31u), float((w0 >> 27) & 3u));
