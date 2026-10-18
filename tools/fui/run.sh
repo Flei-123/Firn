@@ -1540,10 +1540,21 @@ else
 fi
 
 # Ecosystem: recorder, ripple, splitter, hot-reload blocks, XRandR, component sheet (W18-E).
-for t in recorder ripple splitter xrandr ecosystem; do
-    build $t
-    "$W/$t" | tail -1
-done
+# One explicit line per program: section 19 looks for the literal "$W/<name>" (a loop variable does not count).
+build recorder; "$W/recorder" | tail -1
+build ripple; "$W/ripple" | tail -1
+build splitter; "$W/splitter" | tail -1
+build xrandr; "$W/xrandr" | tail -1
+build ecosystem; "$W/ecosystem" check | tail -1
+# rechook: the program is built here, the live run (private Xvfb + xdotool, SKIP without them) is the script.
+build rechook; test -x "$W/rechook"
+bash tools/fui/rechook.sh | tail -1
+# gpu_probe: exit 0 = Vulkan device works, 4 = no loader/device (SKIP), anything else fails.
+build gpu_probe
+gp_rc=0
+"$W/gpu_probe" >"$W/gpu_probe.log" 2>&1 || gp_rc=$?
+tail -1 "$W/gpu_probe.log"
+[ "$gp_rc" = 0 ] || [ "$gp_rc" = 4 ] || { echo "gpu_probe FAILED rc=$gp_rc"; exit 1; }
 build hotreload
 mkdir -p "$W/hr-scratch" && rm -f "$W/hr-scratch"/* && "$W/hotreload" "$W/hr-scratch" | tail -1
 rm -rf "$W/hr-scratch"
