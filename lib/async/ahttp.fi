@@ -61,11 +61,12 @@
 // H1  ONE REQUEST, ONE CONNECTION. Every request sends `Connection: close`
 //     and opens its own socket; there is no keep-alive pool and no
 //     pipelining. 1000 requests are 1000 handshakes.
-// H2  NAMES ARE RESOLVED BLOCKING (lib/net/dns.fi, UDP with a timeout,
-//     TTL cache): the first lookup of a name stalls the loop for its
-//     duration. Numeric addresses and `localhost` never block. Only the
-//     first address of an answer is tried, then the next ones in order when
-//     the connect fails.
+// H2  NAMES ARE RESOLVED ON THE LOOP (lib/async/adns.fi: non-blocking UDP, the
+//     TTL cache of lib/net/dns.fi): a lookup never stalls the loop, phase
+//     P_RESOLVE. Cached, numeric and `localhost` names are answered at once.
+//     Only when adns cannot start (no IPv4 name server, no socket) the old
+//     blocking lookup is used. Only the first address of an answer is tried,
+//     then the next ones in order when the connect fails.
 // H3  NO RESPONSE CACHE and no conditional requests; that stays in the
 //     blocking client. Cookies and redirects are handled.
 // H4  THE BODY IS HELD IN MEMORY (limit `BODY_MAX` = 32 MiB, `areq_set_max_body`
@@ -81,6 +82,7 @@ import std.net
 import net.url
 import net.http
 import net.dns
+import async.adns
 import tls.x509
 import tls.trust
 import async.loop
@@ -117,6 +119,7 @@ const AE_TIMEOUT: u32 = 100
 const AE_CANCELLED: u32 = 101
 
 const P_CONNECT: u32 = 1
+const P_RESOLVE: u32 = 10
 const P_HEAD: u32 = 2
 const P_BODY_LEN: u32 = 3
 const P_CHUNK_SIZE: u32 = 4
@@ -165,6 +168,7 @@ struct Request {
     gone: bool, // freed or being freed: ignore late events
     defer_pending: bool, // deferred_fail will still look at this request
     busy: u32,
+    dq: *mut adns.AQuery, // the DNS lookup in flight (phase P_RESOLVE), else 0
 }
 
 // `size_of` needs a generic parameter outside the root file (see stream.fi).
@@ -319,7 +323,8 @@ fn aclient_request(a: *mut AClient, method: u64, nm: usize, u: u64, n: usize,
         tlserr: 0, tlsverify: 0, hops: 0, timeout_ms: timeout_ms, deadline_timer: 0,
         t0: loop.mono_ms(), t_end: 0, scan: 0, remaining: 0, maxbody: http.BODY_MAX,
         addrs: [0; 8], naddr: 0, iaddr: 0, port: 0 as u16, secure: false,
-        is_tls_done: false, gone: false, defer_pending: false, busy: 0 }
+        is_tls_done: false, gone: false, defer_pending: false, busy: 0,
+        dq: 0 as *mut adns.AQuery }
     rt.buf_push_bytes(&(*rq).meth, method, nm)
     rt.buf_push_bytes(&(*rq).body, body, nb)
     rt.buf_push_bytes(&(*rq).ctype, ctype, nct)
@@ -372,14 +377,65 @@ fn begin(rq: *mut Request) -> bool {
     }
     (*rq).secure = url.url_is_https(&(*rq).cur)
     (*rq).port = url.url_port(&(*rq).cur)
-    (*rq).naddr = http.addrs_of_host(&(*a).c, url.url_host_ptr(&(*rq).cur),
-        url.url_host_len(&(*rq).cur), &(*rq).addrs)
+    // H2: a name is looked up on the loop (async.adns), never blocking it.
+    let hp: u64 = url.url_host_ptr(&(*rq).cur)
+    let hn: usize = url.url_host_len(&(*rq).cur)
+    let res: *mut dns.Resolver = http.client_resolver(&(*a).c)
+    var o: dns.Resolved = dns.resolved_new()
+    let k: u32 = adns.adns_local(res, hp, hn, &o)
+    if k == dns.LOCAL_HIT {
+        take_addrs(rq, &o)
+    } else if k == dns.LOCAL_FAIL {
+        (*rq).err = 4
+        return false
+    } else {
+        (*rq).phase = P_RESOLVE
+        (*rq).dq = adns.adns_start((*a).l, res, hp, hn, on_dns, rq as u64)
+        if (*rq).dq as u64 != 0 {
+            return true // the callback goes on with connect_next
+        }
+        // could not start (no IPv4 server, no socket): the blocking way
+        (*rq).naddr = http.addrs_of_host(&(*a).c, hp, hn, &(*rq).addrs)
+    }
     if (*rq).naddr == 0 {
         (*rq).err = 4
         return false
     }
     (*rq).iaddr = 0
     return connect_next(rq)
+}
+
+fn take_addrs(rq: *mut Request, o: *mut dns.Resolved) {
+    var i: usize = 0
+    while i < (*o).n && i < 8 {
+        (*rq).addrs[i] = (*o).addr[i]
+        i = i + 1
+    }
+    (*rq).naddr = i
+}
+
+// The lookup of begin() is over (called from the loop).
+fn on_dns(ud: u64, ok: bool, o: *mut dns.Resolved) {
+    let rq: *mut Request = ud as *mut Request
+    (*rq).dq = 0 as *mut adns.AQuery
+    if (*rq).gone || (*rq).phase != P_RESOLVE {
+        return
+    }
+    (*rq).busy = (*rq).busy + 1
+    if !ok || (*o).n == 0 {
+        (*rq).err = 4
+        finish(rq)
+    } else {
+        take_addrs(rq, o)
+        (*rq).iaddr = 0
+        if !connect_next(rq) {
+            finish(rq)
+        }
+    }
+    (*rq).busy = (*rq).busy - 1
+    if (*rq).busy == 0 && (*rq).gone && !(*rq).defer_pending {
+        release(rq)
+    }
 }
 
 fn connect_next(rq: *mut Request) -> bool {
@@ -922,6 +978,10 @@ fn finish(rq: *mut Request) {
     (*rq).phase = P_DONE
     (*rq).t_end = loop.mono_ms()
     let a: *mut AClient = (*rq).a
+    if (*rq).dq as u64 != 0 {
+        adns.adns_cancel((*rq).dq)
+        (*rq).dq = 0 as *mut adns.AQuery
+    }
     if (*rq).deadline_timer != 0 {
         loop.timer_cancel((*a).l, (*rq).deadline_timer)
         (*rq).deadline_timer = 0
@@ -955,6 +1015,10 @@ fn areq_cancel(rq: *mut Request) {
     }
     let a: *mut AClient = (*rq).a
     (*rq).phase = P_DONE
+    if (*rq).dq as u64 != 0 {
+        adns.adns_cancel((*rq).dq)
+        (*rq).dq = 0 as *mut adns.AQuery
+    }
     if (*rq).deadline_timer != 0 {
         loop.timer_cancel((*a).l, (*rq).deadline_timer)
         (*rq).deadline_timer = 0
