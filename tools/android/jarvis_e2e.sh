@@ -288,6 +288,9 @@ tap_note "Second"
 check "tap: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
 shot 09_after_tap
 check "tap: the chat of the event is on screen (its history 'hi / hello')" "$(OCR_TRIES=10 wait_ocr 09_after_tap 'hello')" 1
+# r141: the header pill "Oeffne den Chat der Benachrichtigung" goes away once the history is in (status back to online)
+sleep 3; shot 09_pill
+check "tap: the header pill 'opening the chat' is gone after the history" "$(ocr 09_pill | grep -ci 'ffne den Chat')" 0
 echo "  tap the notification of c2"
 $ADB shell input keyevent KEYCODE_HOME; sleep 3
 tap_note "Chat two again"
