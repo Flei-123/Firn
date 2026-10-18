@@ -420,12 +420,16 @@ impl<'a> Ana<'a> {
     /// a loop body counts: it is clean only if no instruction of it writes.
     /// Reaching the entry without passing `from` means `from` does not
     /// dominate `to`: no answer.
-    fn clean_between(&self, from: (usize, usize), to: (usize, usize)) -> bool {
-        // phis and copies are register moves, they write no memory
+    fn clean_between(&self, from: (usize, usize), to: (usize, usize), len_addr: Val) -> bool {
+        // phis and copies are register moves, they write no memory; an
+        // element store of the very Vec whose length word this is cannot
+        // reach that word either (`elem_store_of`)
         let writes = |b: usize, lo: usize, hi: usize| -> bool {
-            self.f.blocks[b].insts[lo..hi]
-                .iter()
-                .any(|i| !matches!(i.op, Op::Phi { .. } | Op::Copy { .. }) && crate::opt::writes_memory(&i.op))
+            self.f.blocks[b].insts[lo..hi].iter().any(|i| {
+                !matches!(i.op, Op::Phi { .. } | Op::Copy { .. })
+                    && crate::opt::writes_memory(&i.op)
+                    && !self.elem_store_of(&i.op, len_addr)
+            })
         };
         let (fb, fi) = from;
         let (tb, ti) = to;
@@ -504,7 +508,67 @@ impl<'a> Ana<'a> {
             (Some(x), Some(y)) => (*x, *y),
             _ => return false,
         };
-        self.clean_between(sa, sb) || self.clean_between(sb, sa)
+        self.clean_between(sa, sb, pa) || self.clean_between(sb, sa, pa)
+    }
+
+    /// `addr` as a base value plus a constant byte offset.
+    fn base_off(&self, addr: Val) -> (Val, i128) {
+        if let Some(Op::PtrAdd { base, off }) = self.op_of(addr) {
+            if let Some(Op::Const(c)) = self.op_of(*off) {
+                return (*base, *c);
+            }
+        }
+        (addr, 0)
+    }
+
+    /// r759: `op` is the store of one ELEMENT of the `Vec` whose length word
+    /// is at `len_addr`: it writes `data + idx * size` where `data` is the
+    /// pointer word of that same header (the word right before the length,
+    /// layout `{ptr, len, cap}`) and `idx` is the result of a `CheckedIdxV`
+    /// against that same length word. Such a store lies inside the buffer
+    /// (the index was checked) and a buffer never contains its own header,
+    /// so the length word is not touched. Any other store (a raw pointer, a
+    /// field, a call, a push) is a write as before.
+    fn elem_store_of(&self, op: &Op, len_addr: Val) -> bool {
+        let dst = match op {
+            Op::Store { addr, .. } => *addr,
+            Op::CopyMem { dst, .. } => *dst,
+            _ => return false,
+        };
+        let (hb, hk) = self.base_off(len_addr);
+        let (ptr_addr, off) = match self.op_of(dst) {
+            Some(Op::PtrAdd { base, off }) => (*base, *off),
+            _ => return false,
+        };
+        // data pointer: a load of the word at `len - 8` of the same header
+        let word = match self.op_of(ptr_addr) {
+            Some(Op::Load { addr }) => *addr,
+            _ => return false,
+        };
+        let (wb, wk) = self.base_off(word);
+        if wb != hb || wk != hk - 8 {
+            return false;
+        }
+        // the offset: `idx` or `idx * c`, `idx` a checked index of this length
+        let idx = match self.op_of(off) {
+            Some(Op::Bin(BinOp::Mul, a, b)) => {
+                if matches!(self.op_of(*b), Some(Op::Const(_))) {
+                    *a
+                } else if matches!(self.op_of(*a), Some(Op::Const(_))) {
+                    *b
+                } else {
+                    return false;
+                }
+            }
+            _ => off,
+        };
+        match self.op_of(idx) {
+            Some(Op::CheckedIdxV { len, .. }) => match self.op_of(*len) {
+                Some(Op::Load { addr }) => self.addr_eq(*addr, len_addr),
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// `x <= y` for two unsigned values, structurally.
@@ -587,6 +651,191 @@ impl<'a> Ana<'a> {
                 }
             }
             return true;
+        }
+        false
+    }
+
+    // ---------------------------------------------------------------- r760 --
+    // The SIGNED index. `v[i]` with `i: i32/i64` lowers to
+    //     s   = sext(i)                       (i64)
+    //     idx = s + (len & (s >> 63))         (Python's negative index)
+    //     checked_idxv idx, len
+    // For `s >= 0` the mask is zero and `idx == s`. So the proof is two
+    // facts about `s`: `0 <= s` and `s < len`, the second one read from a
+    // SIGNED guard `s < n` where `n` is `len` converted to the same type
+    // (`n > 0` then means `n <= len`, also for the narrowing conversion).
+
+    /// `x` is the signed index value `x` with `0 <= x < len`, as the first
+    /// operand of the Python-negative-path add; returns `x`.
+    fn signed_index_base(&self, idx: Val, len: Val) -> Option<Val> {
+        let (s, m) = match self.op_of(idx)? {
+            Op::Bin(BinOp::Add, a, b) => (*a, *b),
+            _ => return None,
+        };
+        let (l2, sh) = match self.op_of(m)? {
+            Op::Bin(BinOp::And, a, b) => {
+                if matches!(self.op_of(*b), Some(Op::Bin(BinOp::Shr, ..))) {
+                    (*a, *b)
+                } else {
+                    (*b, *a)
+                }
+            }
+            _ => return None,
+        };
+        match self.op_of(sh)? {
+            Op::Bin(BinOp::Shr, x, c)
+                if *x == s && self.f.val_ty(s) == FTy::I64 && matches!(self.op_of(*c), Some(Op::Const(63))) => {}
+            _ => return None,
+        }
+        if !self.same_len(l2, len) {
+            return None;
+        }
+        // `s` is a sign extension of a narrower signed value, or the i64 itself
+        Some(match self.op_of(s) {
+            Some(Op::Cast { src, from }) if matches!(from, FTy::I8 | FTy::I16 | FTy::I32) => *src,
+            _ => s,
+        })
+    }
+
+    /// `n` is `len` converted to the type of the guard (`cast u64 -> T`).
+    fn is_len_cast(&self, n: Val, l: Val) -> bool {
+        match self.op_of(n) {
+            Some(Op::Cast { src, from: FTy::U64 }) | Some(Op::CheckedCast { src, from: FTy::U64, .. }) => {
+                self.same_len(*src, l)
+            }
+            _ => false,
+        }
+    }
+
+    /// `0 <= x` and `x < len` (signed `x`), `x` read at the end of block
+    /// `at` (plus the branch `ex` of the edge). `assume` holds loop phis that
+    /// are being proved right now: they stand for BOTH facts (induction on
+    /// the iterations: each value that reaches the phi is proved from the
+    /// guard of its own edge, plus the facts about the phi itself).
+    fn sless(&self, x: Val, l: Val, at: usize, ex: Option<(Val, bool)>, depth: u32, assume: &mut Vec<Val>) -> bool {
+        if assume.contains(&x) {
+            return true;
+        }
+        let ty = self.f.val_ty(x);
+        if !matches!(ty, FTy::I8 | FTy::I16 | FTy::I32 | FTy::I64) {
+            return false;
+        }
+        let incoming = match self.op_of(x) {
+            Some(Op::Phi { incoming }) => incoming,
+            _ => return self.snonneg(x, l, at, &[], assume) && self.sbelow(x, l, at, ex),
+        };
+        if depth == 0 || incoming.is_empty() || incoming.len() > 4 {
+            return false;
+        }
+        let (home, _) = match self.site.get(&x) {
+            Some(s) => *s,
+            None => return false,
+        };
+        let n = self.f.blocks.len();
+        // (A) the guard holds HERE (`while i < n` at the head) and every
+        // operand of the phi is a non-negative constant or `phi + c`
+        if self.sbelow(x, l, at, ex)
+            && incoming.iter().all(|&(pb, val)| (pb as usize) < n && self.snonneg(val, l, pb as usize, &[x], assume))
+        {
+            return true;
+        }
+        // (B) the guard sits on the edges (a rotated loop): every operand is
+        // proved on its own edge, the phi itself is assumed
+        assume.push(x);
+        let mut ok = true;
+        for &(pb, val) in incoming.iter() {
+            let pb = pb as usize;
+            if pb >= n {
+                ok = false;
+                break;
+            }
+            let ex = match self.f.blocks[pb].term {
+                Term::BrCond { cond, then_bb, else_bb }
+                    if then_bb != else_bb && (then_bb as usize == home) != (else_bb as usize == home) =>
+                {
+                    Some((cond, then_bb as usize == home))
+                }
+                _ => None,
+            };
+            if !self.sless(val, l, pb, ex, depth - 1, assume) {
+                ok = false;
+                break;
+            }
+        }
+        assume.pop();
+        ok
+    }
+
+    /// `0 <= x`: an interval, a constant, or `a + c` of a non-negative `a`.
+    /// `nn` are values assumed `>= 0`, `both` values assumed `>= 0` AND
+    /// `< len` (see `sless`).
+    fn snonneg(&self, x: Val, l: Val, at: usize, nn: &[Val], both: &[Val]) -> bool {
+        let _ = at;
+        if nn.contains(&x) || both.contains(&x) {
+            return true;
+        }
+        let site = match self.site.get(&x) {
+            Some(s) => s.0,
+            None => return false,
+        };
+        if matches!(self.range(x, site, DEPTH), Some(r) if r.0 >= 0) {
+            return true;
+        }
+        let (a, b, checked) = match self.op_of(x) {
+            Some(Op::CheckedBin { op: BinOp::Add, a, b, .. }) => (*a, *b, true),
+            Some(Op::Bin(BinOp::Add, a, b)) => (*a, *b, false),
+            _ => return false,
+        };
+        let c = match self.op_of(b) {
+            Some(Op::Const(c)) if *c >= 0 => *c,
+            _ => return false,
+        };
+        let a_nonneg = nn.contains(&a)
+            || both.contains(&a)
+            || matches!(self.site.get(&a), Some(&(sb, _)) if matches!(self.range(a, sb, DEPTH), Some(r) if r.0 >= 0));
+        if !a_nonneg {
+            return false;
+        }
+        // A plain add may wrap. `a + 1` cannot while `a < n` (`n` is a value
+        // of the type, at most its maximum): `a` is below `len` by the guard
+        // in force at the add, or by the induction of `sless` (`both`).
+        checked || (c == 1 && (both.contains(&a) || self.sbelow(a, l, site, None)))
+    }
+
+    /// `x < len` from a signed guard `x < n`, `n = len as T`, in force at the
+    /// end of block `at`.
+    fn sbelow(&self, x: Val, l: Val, at: usize, ex: Option<(Val, bool)>) -> bool {
+        let ty = self.f.val_ty(x);
+        let mut facts: Vec<(Val, bool)> = self.facts.get(at).cloned().unwrap_or_default();
+        if let Some(e) = ex {
+            if !facts.iter().any(|(c, _)| *c == e.0) {
+                facts.push(e);
+            }
+        }
+        let cst = |v: Val| -> Option<i128> {
+            match self.op_of(v) {
+                Some(Op::Const(c)) => Some(*c),
+                _ => None,
+            }
+        };
+        for (cond, truth) in &facts {
+            let (op, cty, a, b) = match self.cmps.get(cond) {
+                Some(c) => *c,
+                None => continue,
+            };
+            if cty != ty {
+                continue;
+            }
+            let op = if *truth { op } else { invert(op) };
+            let (lo, hi) = match op {
+                CmpOp::Lt => (a, b),
+                CmpOp::Gt => (b, a),
+                _ => continue,
+            };
+            let lo_ok = lo == x || matches!((cst(x), cst(lo)), (Some(p), Some(q)) if p <= q);
+            if lo_ok && self.is_len_cast(hi, l) {
+                return true;
+            }
         }
         false
     }
@@ -771,7 +1020,11 @@ pub(crate) fn remove_provable_arith_checks(f: &mut Func) -> usize {
                             continue;
                         }
                         if let Some(d) = inst.dst {
-                            if f.val_ty(*idx) == FTy::U64 && ana.less(*idx, *len, bi, None, DEPTH) {
+                            if f.val_ty(*idx) == FTy::U64
+                                && (ana.less(*idx, *len, bi, None, DEPTH)
+                                    || matches!(ana.signed_index_base(*idx, *len),
+                                        Some(sv) if ana.sless(sv, *len, bi, None, DEPTH, &mut Vec::new())))
+                            {
                                 idx_hits.push((bi, ii, d, *idx));
                             }
                         }
@@ -1260,5 +1513,60 @@ mod tests {
     fn a_store_between_the_two_length_reads_keeps_the_check() {
         let mut f = vec_func(true);
         assert_eq!(remove_provable_arith_checks(&mut f), 0);
+    }
+
+    /// `if i < len { v[i] = 1; v[i] }`: an element store of the same Vec
+    /// sits between the length reads (r759). `raw` makes the store go
+    /// through a pointer that is not the data word of the header.
+    fn elem_store_func(raw: bool) -> Func {
+        let mut f = Func::new("t", vec![FTy::Ptr, FTy::U64, FTy::Ptr], FTy::U64);
+        let off = f.new_val_pub(FTy::I64);
+        let a = f.new_val_pub(FTy::Ptr);
+        let l1 = f.new_val_pub(FTy::U64);
+        let c = f.new_val_pub(FTy::Bool);
+        let d = f.new_val_pub(FTy::Ptr);
+        let l0 = f.new_val_pub(FTy::U64);
+        let i0 = f.new_val_pub(FTy::U64);
+        let q = f.new_val_pub(FTy::Ptr);
+        let l2 = f.new_val_pub(FTy::U64);
+        let ix = f.new_val_pub(FTy::U64);
+        let base = if raw { 2 } else { d };
+        let mut tail = vec![];
+        if !raw {
+            tail.push(Inst::new(Some(d), FTy::Ptr, Op::Load { addr: 0 }));
+        }
+        tail.push(Inst::new(Some(l0), FTy::U64, Op::Load { addr: a }));
+        tail.push(Inst::new(Some(i0), FTy::U64, Op::CheckedIdxV { idx: 1, len: l0, msg: "x".into() }));
+        tail.push(Inst::new(Some(q), FTy::Ptr, Op::PtrAdd { base, off: i0 }));
+        tail.push(Inst::new(None, FTy::U64, Op::Store { addr: q, val: 1 }));
+        tail.push(Inst::new(Some(l2), FTy::U64, Op::Load { addr: a }));
+        tail.push(Inst::new(Some(ix), FTy::U64, Op::CheckedIdxV { idx: 1, len: l2, msg: "x".into() }));
+        f.blocks = vec![
+            Block {
+                id: 0,
+                insts: vec![
+                    Inst::new(Some(off), FTy::I64, Op::Const(8)),
+                    Inst::new(Some(a), FTy::Ptr, Op::PtrAdd { base: 0, off }),
+                    Inst::new(Some(l1), FTy::U64, Op::Load { addr: a }),
+                    Inst::new(Some(c), FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: FTy::U64, a: 1, b: l1 }),
+                ],
+                term: Term::BrCond { cond: c, then_bb: 1, else_bb: 2 },
+            },
+            Block { id: 1, insts: tail, term: Term::Ret(Some(ix)) },
+            Block { id: 2, insts: vec![], term: Term::Ret(Some(1)) },
+        ];
+        f
+    }
+
+    #[test]
+    fn an_element_store_of_the_same_vec_keeps_the_length_clean() {
+        let mut f = elem_store_func(false);
+        assert_eq!(remove_provable_arith_checks(&mut f), 2);
+    }
+
+    #[test]
+    fn a_store_through_another_pointer_keeps_the_check() {
+        let mut f = elem_store_func(true);
+        assert_eq!(remove_provable_arith_checks(&mut f), 1);
     }
 }
