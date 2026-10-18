@@ -72,6 +72,7 @@ mod ivsr;
 mod addrsink;
 mod escape;
 mod foreach;
+mod collsugar;
 mod dargs;
 mod lambda;
 mod moves;
