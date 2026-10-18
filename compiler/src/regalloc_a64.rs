@@ -64,6 +64,15 @@ use std::collections::HashMap;
 /// register save of `emit_gc_addr` — see the header.
 pub(crate) const A64_POOL: [&str; 6] = ["x19", "x20", "x21", "x22", "x23", "x24"];
 
+/// ROUND FREG -- the floating point registers handed out: `d8`-`d15`. AAPCS64
+/// keeps the LOW 64 bits of `v8`-`v15` across a call, which is exactly what an
+/// `f64` (or an `f32` in the low half) needs. Like the integer pool there is
+/// no crossing analysis: every call of this backend leaves them alone, and
+/// nothing in the runtime text or in `simd_a64` touches `v8`-`v15` (the vector
+/// scratch is `v16`-`v21`). Floats are never pointers, so the collector does
+/// not care where they sit.
+pub(crate) const A64_FPOOL: [&str; 8] = ["d8", "d9", "d10", "d11", "d12", "d13", "d14", "d15"];
+
 /// The result of the allocation. Empty (`!on`) means: everything as before.
 #[derive(Default)]
 pub(crate) struct RaA64 {
@@ -73,6 +82,11 @@ pub(crate) struct RaA64 {
     pub cells: HashMap<Val, (&'static str, FTy)>,
     /// which registers the prologue has to save (sorted, as in `A64_POOL`)
     pub saved: Vec<&'static str>,
+    /// ROUND FREG -- `f32`/`f64` value -> (its `d` register, is it an `f32`).
+    /// An `f32` uses the low half of the same register (`s8` for `d8`).
+    pub fregs: HashMap<Val, (&'static str, bool)>,
+    /// the `d` registers the prologue has to save (sorted, as in `A64_FPOOL`)
+    pub fsaved: Vec<&'static str>,
     /// ROUND BILLIG, THE FINDING WITH THE COLLECTOR -- per `Op::GcAddr
     /// { regs: true }` (value of the target as the key) the registers of
     /// `saved` that hold NOTHING ALIVE there any more. `emit_gc_addr` writes
@@ -147,6 +161,13 @@ impl RaA64 {
             None => &[],
         }
     }
+    /// ROUND FREG -- the `d` register of a float value and whether it is an `f32`.
+    pub fn freg(&self, v: Val) -> Option<(&'static str, bool)> {
+        if !self.on {
+            return None;
+        }
+        self.fregs.get(&v).copied()
+    }
     /// The constant a value is, if it is one that gets rebuilt.
     pub fn imm(&self, v: Val) -> Option<i64> {
         if !self.on {
@@ -203,6 +224,49 @@ fn integral(t: FTy) -> bool {
 /// value here. Kept as a function so the reason is written down once.
 fn needs_frame_slot(f: &Func, v: Val) -> bool {
     f.is_secret(v)
+}
+
+/// The Poletto/Sarkar scan, once for each register class. Returns the register
+/// of every interval (or `None` = stays in the frame) and the registers used.
+fn linear_scan(ivs: &[Iv], pool: &[&'static str]) -> (Vec<Option<&'static str>>, Vec<&'static str>) {
+    let mut free: Vec<&'static str> = pool.to_vec();
+    let mut active: Vec<(usize, &'static str, usize)> = Vec::new(); // (end, reg, index in ivs)
+    let mut got: Vec<Option<&'static str>> = vec![None; ivs.len()];
+    let mut used: Vec<&'static str> = Vec::new();
+
+    for k in 0..ivs.len() {
+        // expire
+        active.retain(|&(e, r, _)| {
+            if e < ivs[k].start {
+                free.push(r);
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(r) = free.pop() {
+            got[k] = Some(r);
+            if !used.contains(&r) {
+                used.push(r);
+            }
+            active.push((ivs[k].end, r, k));
+            active.sort_by_key(|&(e, _, _)| e);
+            continue;
+        }
+        // full: the interval that ends LAST is the candidate for the stack --
+        // but only if the newcomer is worth more (uses, weighted by loop
+        // depth). Otherwise the newcomer goes to the stack.
+        if let Some(&(le, lr, li)) = active.last() {
+            if le > ivs[k].end && ivs[k].weight > ivs[li].weight {
+                got[li] = None;
+                got[k] = Some(lr);
+                active.pop();
+                active.push((ivs[k].end, lr, k));
+                active.sort_by_key(|&(e, _, _)| e);
+            }
+        }
+    }
+    (got, used)
 }
 
 pub(crate) fn allocate(f: &Func) -> RaA64 {
@@ -389,11 +453,27 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
             is_cell: true,
         });
     }
-    if ivs.is_empty() {
+    // ROUND FREG -- the float intervals. Same weights, same scan, the pool
+    // is `d8`-`d15`. `FIRN_A64_NO_FREGS=1` switches it off for bisecting.
+    let mut fivs: Vec<Iv> = Vec::new();
+    if std::env::var_os("FIRN_A64_NO_FREGS").is_none() {
+        for v in 0..nv {
+            let vv = v as Val;
+            if start[v] == usize::MAX || needs_frame_slot(f, vv) {
+                continue;
+            }
+            if !matches!(f.val_types.get(v), Some(FTy::F32) | Some(FTy::F64)) {
+                continue;
+            }
+            fivs.push(Iv { val: vv, start: start[v], end: end[v], weight: weight[v], is_cell: false });
+        }
+    }
+    if ivs.is_empty() && fivs.is_empty() {
         ra.on = !ra.remat.is_empty();
         return ra;
     }
     ivs.sort_by_key(|i| (i.start, i.end, i.val));
+    fivs.sort_by_key(|i| (i.start, i.end, i.val));
 
     // ---- the linear scan ----------------------------------------------
     //
@@ -404,43 +484,8 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
         ra.on = !ra.remat.is_empty();
         return ra;
     }
-    let mut free: Vec<&'static str> = A64_POOL.to_vec();
-    let mut active: Vec<(usize, &'static str, usize)> = Vec::new(); // (end, reg, index in ivs)
-    let mut got: Vec<Option<&'static str>> = vec![None; ivs.len()];
-    let mut used: Vec<&'static str> = Vec::new();
-
-    for k in 0..ivs.len() {
-        // expire
-        active.retain(|&(e, r, _)| {
-            if e < ivs[k].start {
-                free.push(r);
-                false
-            } else {
-                true
-            }
-        });
-        if let Some(r) = free.pop() {
-            got[k] = Some(r);
-            if !used.contains(&r) {
-                used.push(r);
-            }
-            active.push((ivs[k].end, r, k));
-            active.sort_by_key(|&(e, _, _)| e);
-            continue;
-        }
-        // full: the interval that ends LAST is the candidate for the stack —
-        // but only if the newcomer is worth more (uses, weighted by loop
-        // depth). Otherwise the newcomer goes to the stack.
-        if let Some(&(le, lr, li)) = active.last() {
-            if le > ivs[k].end && ivs[k].weight > ivs[li].weight {
-                got[li] = None;
-                got[k] = Some(lr);
-                active.pop();
-                active.push((ivs[k].end, lr, k));
-                active.sort_by_key(|&(e, _, _)| e);
-            }
-        }
-    }
+    let (got, used) = linear_scan(&ivs, &A64_POOL);
+    let (fgot, fused) = linear_scan(&fivs, &A64_FPOOL);
 
     for (k, iv) in ivs.iter().enumerate() {
         if let Some(r) = got[k] {
@@ -452,10 +497,17 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
             }
         }
     }
-    if ra.regs.is_empty() && ra.cells.is_empty() && ra.remat.is_empty() {
+    for (k, iv) in fivs.iter().enumerate() {
+        if let Some(r) = fgot[k] {
+            let single = f.val_types.get(iv.val as usize) == Some(&FTy::F32);
+            ra.fregs.insert(iv.val, (r, single));
+        }
+    }
+    if ra.regs.is_empty() && ra.cells.is_empty() && ra.remat.is_empty() && ra.fregs.is_empty() {
         return ra;
     }
     ra.saved = A64_POOL.iter().copied().filter(|r| used.contains(r)).collect();
+    ra.fsaved = A64_FPOOL.iter().copied().filter(|r| fused.contains(r)).collect();
 
     // ---- the save points -------------------------------------------------
     // For every `Op::GcAddr { regs: true }`: which register of `saved` holds

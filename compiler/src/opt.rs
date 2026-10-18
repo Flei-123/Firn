@@ -804,6 +804,13 @@ enum Key {
     /// TEMPO 15: a load from an immutable `static` (`.rodata` never changes)
     RoLoad(u8, Val),
     RoVLoad(Val),
+    /// r797: a checked operation (the result type, the operator, both operands). A copy that is dominated
+    /// by an identical one can never trap on its own: the dominating copy would have trapped first.
+    CBin(u8, u8, Val, Val),
+    CCast(u8, u8, Val),
+    CIdx(Val, u64),
+    CIdxV(Val, Val),
+    CDiv(u8, u8, Val, Val),
 }
 
 /// Number of a FIR type (fir::FTy does not derive `Hash`).
@@ -878,6 +885,13 @@ fn key_of(i: &crate::fir::Inst, ro: &HashMap<Val, u64>) -> Option<Key> {
         Op::Const(c) => Some(Key::Const(tyk(i.ty), *c)),
         Op::Bin(o, a, b) => Some(Key::Bin(tyk(i.ty), bink(*o), *a, *b)),
         Op::Cmp { op, ty, a, b } => Some(Key::Cmp(tyk(*ty), cmpk(*op), *a, *b)),
+        // r797: checked ops are functions of their operands too; only the (dominated) duplicate is dropped, the
+        // first copy keeps its check and its message.
+        Op::CheckedBin { op, a, b, .. } => Some(Key::CBin(tyk(i.ty), bink(*op), *a, *b)),
+        Op::CheckedCast { src, from, .. } => Some(Key::CCast(tyk(i.ty), tyk(*from), *src)),
+        Op::CheckedIdx { idx, len, .. } => Some(Key::CIdx(*idx, *len)),
+        Op::CheckedIdxV { idx, len, .. } => Some(Key::CIdxV(*idx, *len)),
+        Op::CheckedDiv { op, a, b, .. } => Some(Key::CDiv(tyk(i.ty), bink(*op), *a, *b)),
         Op::Un(o, a) => Some(Key::Un(tyk(i.ty), unk(*o), *a)),
         Op::Cast { src, from } => Some(Key::Cast(tyk(i.ty), tyk(*from), *src)),
         Op::PtrAdd { base, off } => Some(Key::PtrAdd(*base, *off)),
@@ -899,6 +913,7 @@ fn cse(f: &mut Func) -> usize {
     let ro = crate::licm::rodata_addrs(f);
     let mut avail: HashMap<Key, Vec<(usize, Val)>> = HashMap::new();
     let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut kill: Vec<(usize, usize)> = Vec::new();
     for bi in 0..n {
         for ii in 0..f.blocks[bi].insts.len() {
             let inst = &f.blocks[bi].insts[ii];
@@ -925,6 +940,17 @@ fn cse(f: &mut Func) -> usize {
             match hit {
                 Some(ov) => {
                     map.insert(d, ov);
+                    // r797: DCE keeps checked ops (they may trap), so the dominated duplicate is deleted here
+                    if matches!(
+                        f.blocks[bi].insts[ii].op,
+                        Op::CheckedBin { .. }
+                            | Op::CheckedCast { .. }
+                            | Op::CheckedIdx { .. }
+                            | Op::CheckedIdxV { .. }
+                            | Op::CheckedDiv { .. }
+                    ) {
+                        kill.push((bi, ii));
+                    }
                 }
                 None => e.push((bi, d)),
             }
@@ -935,6 +961,10 @@ fn cse(f: &mut Func) -> usize {
     }
     let cnt = map.len();
     crate::mem2reg::replace_uses(f, &map);
+    // delete back to front so the indices of the remaining instructions stay valid
+    for &(bi, ii) in kill.iter().rev() {
+        f.blocks[bi].insts.remove(ii);
+    }
     cnt
 }
 

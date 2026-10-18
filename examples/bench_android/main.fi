@@ -10,6 +10,7 @@ import std.rt
 import std.time
 import async.loop
 import async.ahttp
+import tls.tls
 import fui.gpu
 import fui.app
 import fui.appctl
@@ -80,6 +81,7 @@ static mut G_TOGGLE: usize = 0
 static mut G_SEG: usize = 0
 static mut G_RADIO: [usize; 3] = [0; 3]
 static mut G_SPIN_RULE: usize = 0
+static mut G_SPIN_NODE: usize = 0
 static mut G_FPS: usize = 0
 static mut G_FRAMEL: usize = 0
 static mut G_NET: [usize; 4] = [0; 4]
@@ -99,6 +101,7 @@ static mut G_WIN_T0: i64 = 0
 static mut G_AHP: u64 = 0
 static mut G_NET_RUN: bool = false
 static mut G_NET_STEP: usize = 0
+static mut G_CPU_LOGGED: i64 = 0
 static mut G_CPU_SEEN: i32 = 0
 static mut G_TICKS: u64 = 0
 
@@ -407,6 +410,17 @@ fn want16() -> bool {
     return false
 }
 
+// r426: anim and autoscroll tick at HALF the display period (4 ms at 120 Hz), so every paced frame has fresh state; a fixed 16 ms timer
+// capped the app at 62 fps on a 120 Hz phone. The CPU run keeps its 16 ms (8 ms slices, see bcpu.fi).
+fn tick_ms() -> i64 {
+    if bcpu.cpu_running() { return 16 }
+    let hz: i64 = app.refresh_hz(app_of())
+    if hz < 30 { return 16 }
+    var ms: i64 = 500 / hz
+    if ms < 1 { ms = 1 }
+    return ms
+}
+
 fn sync_timer() {
     let w: bool = want16()
     let l: *mut loop.Loop = G_LOOP as *mut loop.Loop
@@ -415,7 +429,7 @@ fn sync_timer() {
         G_WIN_T0 = G_FPS_T0
         G_FPS_N0 = 0
         app.frame_stats_reset()
-        G_T16 = loop.timer_every(l, 16, tick16, 0)
+        G_T16 = loop.timer_every(l, tick_ms(), tick16, 0)
     } else if !w && G_T16 != 0 as u64 {
         let c: bool = loop.timer_cancel(l, G_T16)
         G_T16 = 0 as u64
@@ -575,7 +589,9 @@ fn net_done(r: *mut ahttp.Request, ud: u64) {
     blog.log("BENCH", "net status=" + dec(st) + " bytes=" + dec(nb as i64) + " ms=" + dec(ms))
     blog.log("BENCH", "net_detail trust_ms=" + dec(ahttp.ahttp_trust_ms()) + " roots=" + dec(ahttp.ahttp_trust_roots() as i64)
         + " pre_ms=" + dec(ahttp.ahttp_pre_ms()) + " open_call_ms=" + dec(ahttp.ahttp_open_call_ms()) + " ready_ms=" + dec(ahttp.ahttp_ready_ms())
-        + " reused=" + dec(ahttp_reused_n(r)))
+        + " reused=" + dec(ahttp_reused_n(r))
+        + " ks_ms=" + dec(tls.tls_stage_ms(0)) + " kx_ms=" + dec(tls.tls_stage_ms(1)) + " chain_ms=" + dec(tls.tls_stage_ms(2))
+        + " cv_ms=" + dec(tls.tls_stage_ms(3)) + " steps=" + dec(tls.tls_stage_ms(5)))
     G_NET_RUN = false
 }
 
@@ -605,6 +621,7 @@ fn cpu_labels(a: *mut app.App) {
 fn cpu_begin(a: *mut app.App) {
     if bcpu.cpu_running() { return }
     G_CPU_SEEN = 0 - 1
+    G_CPU_LOGGED = 0
     bcpu.cpu_start()
     cpu_labels(a)
     sync_timer()
@@ -616,13 +633,15 @@ fn on_run(a: *mut app.App) { cpu_begin(a) }
 fn __thread_work(kind: u64, arg: u64) -> u64 { return bcpu.work(kind, arg) }
 
 fn cpu_tick(a: *mut app.App) {
-    if !bcpu.cpu_running() { return }
+    // r823: the finish must be seen AFTER the last kernel ended (cpu_running is false then), exactly once
+    if !bcpu.cpu_running() && !(bcpu.cpu_finished() && G_CPU_LOGGED == 0) { return }
     // the benchmark runs on a worker thread (bcpu.fi); the UI thread only polls. A safepoint per tick lets a collection that
-    // the worker started proceed (the thread is parked in ALooper_pollOnce, not announced as blocked)
+    // the worker started proceed
     thread_safepoint()
     let more: bool = bcpu.cpu_step(0 as u64)
     cpu_labels(a)
     if !more && bcpu.cpu_finished() {
+        G_CPU_LOGGED = 1
         blog.log("BENCH", "cpu primes=" + dec(bcpu.cpu_wall_ms(0)) + ":" + dec(bcpu.cpu_sum(0)) + " sort=" + dec(bcpu.cpu_wall_ms(1)) + ":" + dec(bcpu.cpu_sum(1)) +
             " mandel=" + dec(bcpu.cpu_wall_ms(2)) + ":" + dec(bcpu.cpu_sum(2)))
         blog.log("BENCH", "cpu2 " + bcpu.cpu_log_line(3, 9))
@@ -638,6 +657,8 @@ fn cpu_tick(a: *mut app.App) {
 fn anim_tick(a: *mut app.App, now: i64) {
     let deg: f64 = ((now % 2000) as f64) * 0.18
     sheet.decl_set_rotate(sheet.sheet_decl(&(*a).sh, G_SPIN_RULE), deg)
+    // r444: repaint only the square the spinner turns in (the fps label below repaints everything once a second)
+    app.touch_rotated(a, G_SPIN_NODE)
     let el: i64 = now - G_FPS_T0
     if el >= 1000 {
         let n: i64 = app.frame_stat(app.FS_FRAMES)
@@ -646,11 +667,16 @@ fn anim_tick(a: *mut app.App, now: i64) {
         G_FPS_T0 = now
         app.set_text(a, G_FRAMEL, "frame ms p95: " + dec2(app.frame_stat(app.FS_IV_P95_US) / 10) + " max: " + dec2(app.frame_stat(app.FS_IV_MAX_US) / 10))
     }
+    fps_window(now, "anim")
+}
+
+// r426: every 5 s one BENCH line with the frame rate, the interval p95 / max and the PAINT time (avg / max, frames over 16 ms)
+fn fps_window(now: i64, what: str) {
     let w: i64 = now - G_WIN_T0
     if w >= 5000 {
         let n2: i64 = app.frame_stat(app.FS_FRAMES)
         let avg10: i64 = n2 * 10000 / w
-        blog.log("BENCH", "fps avg=" + dec2(avg10 * 10) + " p95_ms=" + dec2(app.frame_stat(app.FS_IV_P95_US) / 10) + " max_ms=" + dec2(app.frame_stat(app.FS_IV_MAX_US) / 10) + " frames=" + dec(n2))
+        blog.log("BENCH", "fps " + what + " avg=" + dec2(avg10 * 10) + " p95_ms=" + dec2(app.frame_stat(app.FS_IV_P95_US) / 10) + " max_ms=" + dec2(app.frame_stat(app.FS_IV_MAX_US) / 10) + " frames=" + dec(n2) + " paint_avg_us=" + dec(app.frame_stat(app.FS_AVG_US)) + " paint_max_us=" + dec(app.frame_stat(app.FS_MAX_US)) + " paint_slow=" + dec(app.frame_stat(app.FS_SLOW)) + " hz=" + dec(app.refresh_hz(app_of())))
         app.frame_stats_reset()
         G_FPS_N0 = 0
         G_FPS_T0 = now
@@ -679,6 +705,7 @@ fn scroll_tick(a: *mut app.App, now: i64) {
     }
     viewport.viewport_set_offset(vp, 0.0, G_AS_POS)
     app.vlist_changed(a, G_LIST)
+    fps_window(now, "scroll")
 }
 
 fn tick16(l: *mut loop.Loop, ud: u64) {
@@ -811,6 +838,7 @@ fn build_ui(a: *mut app.App) {
     let bx: usize = app.spacer(a, 160, 160)
     cls(a, bx, K_BOX)
     cls(a, bx, K_SPIN)
+    G_SPIN_NODE = bx
     G_FPS = app.label(a, "fps: --", 0)
     cls(a, G_FPS, K_BIG)
     G_FRAMEL = app.label(a, "frame ms p95: -- max: --", 0)

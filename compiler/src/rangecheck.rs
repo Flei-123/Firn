@@ -225,6 +225,12 @@ struct Ana<'a> {
     facts: Vec<Vec<(Val, bool)>>,
     /// predecessors per block (for the memory-clean chain walk)
     preds: Vec<Vec<usize>>,
+    /// r797: `dom[b][a]` = block `a` dominates block `b` (empty when the function is too big)
+    dom: Vec<Vec<bool>>,
+    /// r797: what a CHECK that did not trap proves about its operand, with the block of the check: a checked
+    /// conversion proves the source fits the target type, a checked `x * c` proves `x <= MAX / c`. The fact holds in
+    /// every block the check's block strictly dominates (the check ran on the way in, on the same SSA value).
+    chk: HashMap<Val, Vec<(usize, Range)>>,
 }
 
 /// The conditions that must hold in a block.
@@ -290,7 +296,51 @@ impl<'a> Ana<'a> {
             }
         }
         let preds = crate::mem2reg::preds(f);
-        Ana { f, site, cmps, facts: facts_per_block(f, &preds), preds }
+        let mut chk: HashMap<Val, Vec<(usize, Range)>> = HashMap::new();
+        let mut dom = Vec::new();
+        if f.blocks.len() <= 512 && f.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i) {
+            dom = crate::mem2reg::dominators(f);
+            let const_fact = |x: Val| -> Option<i128> {
+                let (b, i) = site.get(&x)?;
+                match &f.blocks[*b].insts[*i].op {
+                    Op::Const(c) => Some(*c),
+                    _ => None,
+                }
+            };
+            for (bi, b) in f.blocks.iter().enumerate() {
+                for i in b.insts.iter() {
+                    match &i.op {
+                        Op::CheckedCast { src, .. } => {
+                            if let Some(r) = ty_range(i.ty) {
+                                chk.entry(*src).or_default().push((bi, r));
+                            }
+                        }
+                        Op::CheckedBin { op: BinOp::Mul, a, b: rhs, .. } => {
+                            let (x, c) = match (const_fact(*a), const_fact(*rhs)) {
+                                (None, Some(c)) => (*a, c),
+                                (Some(c), None) => (*rhs, c),
+                                _ => continue,
+                            };
+                            let tr = match ty_range(i.ty) {
+                                Some(t) if c > 0 => t,
+                                _ => continue,
+                            };
+                            let lim = tr.1 / c;
+                            let r: Range = if tr.0 == 0 { (0, lim) } else { (-lim, lim) };
+                            chk.entry(x).or_default().push((bi, r));
+                            // a checked conversion is the identity on a value that fits: the source obeys the bound too
+                            if let Some((sb, si)) = site.get(&x) {
+                                if let Op::CheckedCast { src, .. } = &f.blocks[*sb].insts[*si].op {
+                                    chk.entry(*src).or_default().push((bi, r));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ana { f, site, cmps, facts: facts_per_block(f, &preds), preds, dom, chk }
     }
 
     fn op_of(&self, v: Val) -> Option<&'a Op> {
@@ -337,6 +387,15 @@ impl<'a> Ana<'a> {
         if use_facts || ex.is_some() {
             if let Some(s) = self.from_facts(v, at, t, depth, ex, use_facts) {
                 r = meet(r, s);
+            }
+        }
+        if use_facts {
+            if let Some(list) = self.chk.get(&v) {
+                for &(cb, cr) in list {
+                    if cb != at && self.dom.get(at).map(|row| row[cb]).unwrap_or(false) {
+                        r = meet(r, cr);
+                    }
+                }
             }
         }
         if r.0 > r.1 {

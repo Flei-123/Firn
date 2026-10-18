@@ -1,0 +1,258 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/vdso.fi -- std.vdso: `clock_gettime` WITHOUT a system call.
+//
+// The kernel maps a small ELF image, the vDSO, into every Linux and Android
+// process. Its `clock_gettime` answers from a page the kernel keeps up to
+// date, so a clock read costs ~30 ns instead of the 400+ ns of a real system
+// call (std.time `monotonic_ns` / `now_unix_ns` / `now_unix_ms`).
+//
+//     import vdso
+//     var ts: [i64; 2] = [0; 2]
+//     vdso.clock_gettime(1, (&ts[0]) as u64)   // same contract as syscall 228
+//
+// The image is found ONCE, at the first read: `AT_SYSINFO_EHDR` out of
+// /proc/self/auxv (works in a static binary and inside an Android app
+// process alike; no libc), then the dynamic symbol table of that image
+// (DT_HASH gives the number of symbols; without it the symbols are counted
+// from the distance between .dynsym and .dynstr). The function is
+// `__vdso_clock_gettime` on x86-64 and `__kernel_clock_gettime` on AArch64.
+//
+// WHENEVER anything is missing -- no /proc, a kernel without a vDSO, an
+// image of another machine, no such symbol, a clock the vDSO refuses with
+// -ENOSYS -- the real system call answers instead, exactly as before. The
+// answer is the same either way.
+//
+// The browser (lib/@web/std/vdso.fi) and Windows (lib/std/vdso.windows.fi)
+// have twins that always make the system call (the host's clock there).
+//
+// THREADS: the lookup may run twice at once in two threads; both find the
+// same address and store the same word.
+
+export { clock_gettime, active }
+
+const VD_SYS_OPEN: i64 = 2
+const VD_SYS_READ: i64 = 0
+const VD_SYS_CLOSE: i64 = 3
+const VD_SYS_CLOCK_GETTIME: i64 = 228
+const VD_ENOSYS: i64 = -38
+const VD_AT_SYSINFO_EHDR: u64 = 33
+const VD_EM_X86_64: u64 = 62
+const VD_EM_AARCH64: u64 = 183
+
+// 0 = not looked for yet, 1 = there is none, otherwise the code address of
+// the function. The word is also the CELL a Firn `fn` value points at: a `fn`
+// value is the address of a record whose word 0 is the code address, and the
+// call passes the record as one more last argument, which both System V and
+// AAPCS64 let a function ignore.
+static mut VD_CELL: u64 = 0
+
+fn vd_b(a: u64) -> u64 {
+    return (*(a as *mut u8)) as u64
+}
+
+fn vd_h(a: u64) -> u64 {
+    return (*(a as *mut u16)) as u64
+}
+
+fn vd_w(a: u64) -> u64 {
+    return (*(a as *mut u32)) as u64
+}
+
+fn vd_q(a: u64) -> u64 {
+    return *(a as *mut u64)
+}
+
+// Is the zero terminated name at `p` the wanted one? `machine` picks it.
+fn vd_is_name(p: u64, machine: u64) -> bool {
+    if machine == VD_EM_X86_64 {
+        var want: [u8; 21] = "__vdso_clock_gettime\0"
+        var i: u64 = 0
+        while i < 21 {
+            if vd_b(p + i) != (want[i as usize] as u64) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    var want2: [u8; 23] = "__kernel_clock_gettime\0"
+    var j: u64 = 0
+    while j < 23 {
+        if vd_b(p + j) != (want2[j as usize] as u64) {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+// The base address of the vDSO from /proc/self/auxv, or 0.
+fn vd_base() -> u64 {
+    var path: [u8; 16] = "/proc/self/auxv\0"
+    var buf: [u64; 128] = [0; 128]
+    let fd: i64 = syscall(VD_SYS_OPEN, (&path) as u64 as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        return 0
+    }
+    var len: u64 = 0
+    var more: bool = true
+    while more {
+        let n: i64 = syscall(VD_SYS_READ, fd, ((&buf) as u64 + len) as i64, (1024 - len) as i64, 0, 0, 0)
+        if n <= 0 {
+            more = false
+        } else {
+            len = len + n as u64
+            if len >= 1024 {
+                more = false
+            }
+        }
+    }
+    syscall(VD_SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    var base: u64 = 0
+    var i: u64 = 0
+    while i + 16 <= len {
+        let t: u64 = buf[(i / 8) as usize]
+        let v: u64 = buf[(i / 8 + 1) as usize]
+        if t == 0 {
+            break
+        }
+        if t == VD_AT_SYSINFO_EHDR {
+            base = v
+        }
+        i = i + 16
+    }
+    if (base & 4095) != 0 {
+        return 0
+    }
+    return base
+}
+
+// The code address of the clock function, or 1 = there is none here.
+fn vd_find() -> u64 {
+    let base: u64 = vd_base()
+    if base == 0 {
+        return 1
+    }
+    // ELF64, little endian, a machine whose function name is known: the
+    // name alone would not tell another machine's image from this one.
+    if vd_w(base) != 1179403647 {
+        return 1
+    }
+    if vd_b(base + 4) != 2 || vd_b(base + 5) != 1 {
+        return 1
+    }
+    let machine: u64 = vd_h(base + 18)
+    if machine != VD_EM_X86_64 && machine != VD_EM_AARCH64 {
+        return 1
+    }
+    let phoff: u64 = vd_q(base + 32)
+    let phentsize: u64 = vd_h(base + 54)
+    let phnum: u64 = vd_h(base + 56)
+    if phentsize != 56 || phnum == 0 || phnum > 32 || phoff > 4096 {
+        return 1
+    }
+    var load_off: u64 = 0
+    var have_load: bool = false
+    var dynp: u64 = 0
+    var k: u64 = 0
+    while k < phnum {
+        let ph: u64 = base + phoff + k * phentsize
+        let pt: u64 = vd_w(ph)
+        if pt == 1 && !have_load {
+            have_load = true
+            load_off = base + vd_q(ph + 8) - vd_q(ph + 16)
+        }
+        if pt == 2 {
+            dynp = base + vd_q(ph + 8)
+        }
+        k = k + 1
+    }
+    if !have_load || dynp == 0 {
+        return 1
+    }
+    var symtab: u64 = 0
+    var strtab: u64 = 0
+    var hash: u64 = 0
+    var d: u64 = dynp
+    var guard: u64 = 0
+    while guard < 64 {
+        let tag: u64 = vd_q(d)
+        if tag == 0 {
+            break
+        }
+        let val: u64 = vd_q(d + 8)
+        if tag == 4 {
+            hash = load_off + val
+        }
+        if tag == 5 {
+            strtab = load_off + val
+        }
+        if tag == 6 {
+            symtab = load_off + val
+        }
+        d = d + 16
+        guard = guard + 1
+    }
+    if symtab == 0 || strtab == 0 {
+        return 1
+    }
+    var nsym: u64 = 0
+    if hash != 0 {
+        nsym = vd_w(hash + 4)
+    } else if strtab > symtab {
+        nsym = (strtab - symtab) / 24
+    }
+    var s: u64 = 0
+    while s < nsym && s < 256 {
+        let sy: u64 = symtab + s * 24
+        // STT_FUNC, defined (st_shndx != SHN_UNDEF), the right name
+        if (vd_b(sy + 4) & 15) == 2 && vd_h(sy + 6) != 0 && vd_is_name(strtab + vd_w(sy), machine) {
+            let code: u64 = load_off + vd_q(sy + 8)
+            if code > 1 {
+                return code
+            }
+        }
+        s = s + 1
+    }
+    return 1
+}
+
+struct VdCall { f: fn(i64, u64) -> i64 }
+
+// Calls the function whose record is `cell` (the address of VD_CELL).
+fn vd_call(cell: u64, clock: i64, ts: u64) -> i64 {
+    var holder: [u64; 1] = [0; 1]
+    holder[0] = cell
+    let h: *mut VdCall = (&holder[0]) as *mut VdCall
+    let f: fn(i64, u64) -> i64 = (*h).f
+    return f(clock, ts)
+}
+
+// Reads clock `clock` (0 realtime, 1 monotonic, ...) into the two words at
+// `ts` (seconds, nanoseconds). 0 on success, -errno otherwise -- the
+// contract of the system call 228.
+fn clock_gettime(clock: i64, ts: u64) -> i64 {
+    var code: u64 = VD_CELL
+    if code == 0 {
+        code = vd_find()
+        VD_CELL = code
+    }
+    if code > 1 {
+        let r: i64 = vd_call((&VD_CELL) as u64, clock, ts)
+        if r != VD_ENOSYS {
+            return r
+        }
+    }
+    return syscall(VD_SYS_CLOCK_GETTIME, clock, ts as i64, 0, 0, 0, 0)
+}
+
+// True when the clock is read from the vDSO (no system call), false when
+// every read is the real system call.
+fn active() -> bool {
+    var code: u64 = VD_CELL
+    if code == 0 {
+        code = vd_find()
+        VD_CELL = code
+    }
+    return code > 1
+}
