@@ -67,22 +67,7 @@ PORT=$(awk '/^PORT/{print $2}' "$W/out")
 # ---- helpers (OCR + touch, as in jarvis_e2e.sh) --------------------------------------------------------------------------------
 shot() { $ADB exec-out screencap -p >"$OUT/$1.png"; }
 ocr() { tesseract "$OUT/$1.png" stdout 2>/dev/null | tr -s '\n ' ' '; }
-word_at() { python3 -I - "$OUT/$1.png" "$2" "${3:-1}" <<'EOF'
-import re, subprocess, sys
-png, rx, nth = sys.argv[1], sys.argv[2], int(sys.argv[3])
-tsv = subprocess.run(["tesseract", png, "stdout", "--psm", "11", "tsv"], capture_output=True, text=True).stdout.splitlines()
-hit = 0
-for ln in tsv[1:]:
-    f = ln.split("\t")
-    if len(f) < 12 or not f[11].strip():
-        continue
-    if re.fullmatch(rx, f[11].strip()):
-        hit += 1
-        if hit == nth:
-            print(int(f[6]) + int(f[8]) // 2, int(f[7]) + int(f[9]) // 2)
-            break
-EOF
-}
+word_at() { python3 -I "$(dirname "${BASH_SOURCE[0]}")/ocr_words.py" "$OUT/$1.png" "$2" "${3:-1}"; }
 tap_word() { local p; shot _w; p=$(word_at _w "$1" "${2:-1}"); [ -n "$p" ] || { echo "  (no word $1 on the screen)"; return 1; }
     $ADB shell input tap $p; sleep "${3:-1.5}"; }
 wait_ocr() { local i; for i in $(seq ${OCR_TRIES:-12}); do shot "$1"; ocr "$1" | grep -q -E "$2" && break; sleep 1.5; done; ocr "$1" | grep -c -E "$2"; }
@@ -125,10 +110,10 @@ run_variant() { # abi:perm:density:font
     local n0; n0=$(grep -c '"type": "info_sent"' "$SLOG")
     $ADB shell monkey -p $PKG -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
     wait_update_check
-    check "$tag: sign-in page" "$(OCR_TRIES=30 wait_ocr ${tag}_01 'Sign in')" 1
-    type_into "Username" justin; type_into "Password" pw; tap_word "Sign" 1 1
-    check "$tag: notice page or main view after the sign-in" "$(OCR_TRIES=20 wait_ocr ${tag}_02 'Continue|Chats')" 1
-    tap_word "Continue" 1 3 && echo "  (notice page: Continue)"
+    check "$tag: sign-in page" "$(OCR_TRIES=30 wait_ocr ${tag}_01 'Passwort')" 1
+    type_into "Benutzername" justin; type_into "Passwort" pw; tap_word "Anmelden" 1 1
+    check "$tag: notice page or main view after the sign-in" "$(OCR_TRIES=20 wait_ocr ${tag}_02 'Weiter|Chats|Benachrichtigungen')" 1 # english: ok
+    tap_word "Weiter" 1 3 && echo "  (notice page: Weiter)"
     # the system permission dialog (perm=allow|deny): answer it like a person would
     if [ "$perm" != granted ]; then
         local ans=permission_allow_button; [ "$perm" = deny ] && ans=permission_deny_button
@@ -141,22 +126,37 @@ run_variant() { # abi:perm:density:font
     check "$tag: process alive 10 s after the sign-in" "$(alive)" yes
     check "$tag: the big WS info reached the app (server sent it)" "$([ "$(grep -c '"type": "info_sent"' "$SLOG")" -gt "$n0" ] && echo yes || echo no)" yes
     shot ${tag}_04
-    check "$tag: main view on screen" "$(ocr ${tag}_04 | grep -c -E 'Chats|Board|Tasks|Message')" 1
+    check "$tag: main view on screen" "$(ocr ${tag}_04 | grep -c -E 'Chats|Board|Aufgaben|Nachricht')" 1
     # walk through the tabs, open a big chat
     tap_word "Chats" 1 3; shot ${tag}_05
     check "$tag: alive after the Chats tab" "$(alive)" yes
     p=$(word_at ${tag}_05 'worker|Gr.*|task'); [ -n "$p" ] && { $ADB shell input tap $p; sleep 4; }
     shot ${tag}_06
     check "$tag: alive after opening a chat" "$(alive)" yes
-    for t in Board Tasks; do tap_word "$t" 1 2.5; done
+    for t in Board Aufgaben; do tap_word "$t" 1 2.5; done
     sleep 3
     check "$tag: alive after the tabs" "$(alive)" yes
+    # BAD NETWORK (REST only; the WebSocket stays up): the lists must say WHY ("No connection - <reason>") and the app log must name the
+    # reason (a bare "No connection" was the 0.2.17 complaint); when the network is back they must load again BY THEMSELVES (backoff retry
+    # + chat socket open), without a tap on Reload. A slow network (4 s per answer) must not end in "No connection" either.
+    curl -s -m 5 -X POST "http://127.0.0.1:$PORT/fake/net" -d '{"drop":1000000}' >/dev/null
+    tap_word "Aufgaben" 1 1; tap_word "Neu laden" 1 1 2>/dev/null
+    check "$tag: REST dropped: the screen names the reason" "$(OCR_TRIES=20 wait_ocr ${tag}_08 'Keine Verbindung|Offline.*Stand')" 1 # english: ok
+    note "reason on screen: $(ocr ${tag}_08 | grep -oE '(Keine Verbindung|Offline.*Stand)[^|]{0,60}' | head -1)" # english: ok
+    check "$tag: REST dropped: app log has the failure line with the reason" "$(applog | grep -E 'net:? .*(connection closed|network error|timeout|server unreachable|no DNS)' | head -1 | wc -l)" 1
+    curl -s -m 5 -X POST "http://127.0.0.1:$PORT/fake/net" -d '{"drop":0,"delay_ms":4000}' >/dev/null
+    # the "Live" hint is hidden when the list is fresh: recovered = the task is there and no Offline / No-connection hint is left
+    local rec=0 q offpat='Offline|Keine Verbindung' # english: ok
+    for q in $(seq 30); do shot ${tag}_09; if ! ocr ${tag}_09 | grep -qE "$offpat" && ocr ${tag}_09 | grep -q 'milk'; then rec=1; break; fi; sleep 1.5; done
+    check "$tag: network back (slow, 4 s): the list recovers alone" "$rec" 1
+    check "$tag: no ANR/crash while the REST was bad" "$(alive)" yes
+    curl -s -m 5 -X POST "http://127.0.0.1:$PORT/fake/net" -d '{"drop":0,"delay_ms":0}' >/dev/null
     # the store check (async since 0.2.9) starts after 30 s of calm: keep tapping like a hasty person until it is done, nothing may freeze
     local k=0 L2=""
     while [ $k -lt 40 ]; do
         L2=$(applog); echo "$L2" | grep -q 'update: pass .* done after' && break
         echo "$L2" | grep -q 'update: .*ERROR\|update: This program' && break
-        for t in Chats Board Tasks; do tap_word "$t" 1 0.6; done
+        for t in Chats Board Aufgaben; do tap_word "$t" 1 0.6; done
         k=$((k+1))
     done
     echo "  store check: $(echo "$L2" | grep -E 'update: (store check|pass|checking)' | tr '\n' '|' | cut -c1-400)"

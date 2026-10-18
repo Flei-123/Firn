@@ -5,7 +5,7 @@
 #
 #   SERIAL=emulator-5590 bash tools/android/jarvis_check.sh [apk]
 #
-# Login (since A9): fixed server, fields 'Username or e-mail' / 'Password', 'Sign in', then the notice page 'Continue': all found
+# Login (since A9): fixed server, fields 'Username or e-mail' / 'Password', 'Anmelden', then the notice page 'Weiter': all found
 # by words (tesseract positions), no fixed login coordinates. Chat page: 'New' 'Chats' 'Voice' buttons, tabs Chat/Board/Tasks/Devices/More.
 #
 # Own AVD copy "a4b" (NOT the shared "firn" one, NOT port 5584): without SERIAL the script boots it on console port 5590 and
@@ -84,30 +84,15 @@ wait_ocr() { local i; for i in $(seq ${OCR_TRIES:-12}); do shot "$1"; ocr "$1" |
 # BACK only while the keyboard is up: without it BACK leaves the app (a slow host shows the keyboard seconds late)
 hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; fi; sleep 1; }
 # the centre (pixels) of the n-th word matching a regex in the screenshot $1; empty when there is none
-word_at() { python3 -I - "$OUT/$1.png" "$2" "${3:-1}" <<'PYEOF'
-import re, subprocess, sys
-png, rx, nth = sys.argv[1], sys.argv[2], int(sys.argv[3])
-tsv = subprocess.run(["tesseract", png, "stdout", "--psm", "11", "tsv"], capture_output=True, text=True).stdout.splitlines()
-hit = 0
-for ln in tsv[1:]:
-    f = ln.split("\t")
-    if len(f) < 12 or not f[11].strip():
-        continue
-    if re.fullmatch(rx, f[11].strip()):
-        hit += 1
-        if hit == nth:
-            print(int(f[6]) + int(f[8]) // 2, int(f[7]) + int(f[9]) // 2)
-            break
-PYEOF
-}
+word_at() { python3 -I "$(dirname "${BASH_SOURCE[0]}")/ocr_words.py" "$OUT/$1.png" "$2" "${3:-1}"; }
 # touch the n-th word matching a regex ($1); returns 1 when the word is not on the screen
 tap_word() { local p; shot _w; p=$(word_at _w "$1" "${2:-1}"); [ -n "$p" ] || { echo "  (no word $1 on the screen)"; return 1; }
     $ADB shell input tap $p; sleep "${3:-1.5}"; }
 # type into the field whose hint is $1, then leave the keyboard
 type_into() { tap_word "$1" 1 1.5 || return 1; wait_kbd >/dev/null; $ADB shell input text "$2"; sleep 1; hide_kbd; }
 # the sign-in page: user, password, "Sign in", then the notice page ("Continue") that follows the first sign-in
-login() { type_into "Username" justin; type_into "Password" pw; tap_word "Sign" 1 1
-    if [ "$(OCR_TRIES=20 wait_ocr _notice 'Continue')" = 1 ]; then tap_word "Continue" 1 3; fi; }
+login() { type_into "Benutzername" justin; type_into "Passwort" pw; tap_word "Anmelden" 1 1
+    if [ "$(OCR_TRIES=20 wait_ocr _notice 'Weiter')" = 1 ]; then tap_word "Weiter" 1 3; fi; }
 # chat page (1080x2340, web-like composer with icon buttons): message field (418,1911), mic (790,1911), send (960,1911), "Voice" chip (450,380)
 if [ "$($ADB shell settings get secure navigation_mode 2>/dev/null | tr -d '\r')" = 2 ]; then FIELD_Y=1911; else FIELD_Y=1845; fi
 FIELD_X=418; SEND_X=960; MIC_X=790; VOICE_X=450; VOICE_Y=380
@@ -125,16 +110,16 @@ sleep 20 # a fresh emulator is still starting its launcher, Gboard and the packa
 dismiss_anr
 $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null
 for _ in $(seq 40); do [ -n "$($ADB shell pidof $PKG)" ] && break; sleep 1; done
-check "login screen shows" "$(OCR_TRIES=40 wait_ocr 1_login 'Sign in')" 1
+check "login screen shows" "$(OCR_TRIES=40 wait_ocr 1_login 'Passwort')" 1
 check "process runs" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
 
 # ---- login: found by words; the soft keyboard shifts the layout, so each field is left with Back before the next tap
-tap_word "Username" 1 1; check "Gboard shows for the user field" "$(wait_kbd)" 1
+tap_word "Benutzername" 1 1; check "Gboard shows for the user field" "$(wait_kbd)" 1
 $ADB shell input text justin; hide_kbd
-type_into "Password" pw
-tap_word "Sign" 1 1
-check "the notice page shows after the first sign-in" "$(OCR_TRIES=20 wait_ocr 1b_notice 'Continue')" 1
-tap_word "Continue" 1 3
+type_into "Passwort" pw
+tap_word "Anmelden" 1 1
+check "the notice page shows after the first sign-in" "$(OCR_TRIES=20 wait_ocr 1b_notice 'Weiter')" 1
+tap_word "Weiter" 1 3
 check "chat screen after login" "$(OCR_TRIES=30 wait_ocr 2_chat 'Chats')" 1
 check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 1
 
@@ -157,7 +142,7 @@ check "streamed reply visible" "$(wait_ocr 3_reply 'Hallo hello')" 1
 # ---- tabs: five different screens, no crash. The bar (Chat Board Tasks Devices More) is found by words; "Chat" brings the chat back.
 # Then a restart (the session is saved).
 HASH_CHAT=$(md5sum <"$OUT/3_reply.png" | cut -c1-8)
-n=0; for w in Board Tasks Devices More; do
+n=0; for w in Board Aufgaben "Ger.te" "Me[h]r"; do
     tap_word "$w" 1 3; n=$((n+1)); shot tab$n
     h=$(md5sum <"$OUT/tab$n.png" | cut -c1-8)
     check "tab $w differs from the chat" "$([ "$h" != "$HASH_CHAT" ] && echo yes)" yes
@@ -191,12 +176,12 @@ sleep 1; hide_kbd; tap $SEND_X $FIELD_Y 1
 check "select all + copy + paste -> 'copyme'" "$(wait_sent copyme 1)" 1
 
 # ---- mic button (speech.fi -> WAV -> POST /api/stt -> text in the input line) and the voice-output switch (tts.fi)
-tap $MIC_X $FIELD_Y 3; check "mic button starts recording" "$(wait_ocr 4_rec 'tap Stop')" 1
+tap $MIC_X $FIELD_Y 3; check "mic button starts recording" "$(wait_ocr 4_rec 'Stopp tippen')" 1
 sleep 2; tap $MIC_X $FIELD_Y 1
 for _ in $(seq 15); do grep -q '/api/stt' "$SLOG" && break; sleep 1; done
 check "recording uploaded as audio/wav to /api/stt" "$(grep -c '"path": "/api/stt?lang=de", "ctype": "audio/wav"' "$SLOG")" 1
 check "transcription lands in the input line" "$(wait_ocr 5_heard 'audio')" 1
-tap_word "Voice" 1 2; shot 6_voice; check "voice switch shows 'Voice on'" "$(ocr_crop 6_voice 330 320 660 440 | grep -ci 'oice on')" 1 # same word tap + crop as jarvis_e2e.sh (the A21 design moved the chip row; the old fixed pixels hit nothing)
+tap_word "Sprache" 1 2; shot 6_voice; check "voice switch shows 'Voice on'" "$(ocr_crop 6_voice 330 320 660 440 | grep -ci 'prache an')" 1 # same word tap + crop as jarvis_e2e.sh (the A21 design moved the chip row; the old fixed pixels hit nothing)
 check "app alive after mic + voice" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
 
 check "no crash in logcat" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0

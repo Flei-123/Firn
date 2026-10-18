@@ -33,7 +33,7 @@ Python reference notes: 11 uses Pillow (installed), 13 and 08 use stdlib only (`
 | Task | Py lines | Firn lines first pass | Firn lines now | Factor now | Py tokens | Firn tokens | Factor | Py imports | Firn imports | Py run ms | Firn run ms | Firn compile ms |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | 01_http_json_api | 43 | 58 | 57 | 1.33 | 345 | 569 | 1.65 | 5 | 6 | 114.3 | 3.6 | 3652 |
-| 02_csv_json_report | 21 | 105 | 71 | 3.38 | 242 | 791 | 3.27 | 3 | 11 | 64.6 | 3.8 | 936 |
+| 02_csv_json_report | 21 | 105 | 70 | 3.33 | 242 | 745 | 3.08 | 3 | 13 | 31.9 | 3.5 | 918 |
 | 03_find_rename | 33 | 78 | 50 | 1.52 | 401 | 499 | 1.24 | 1 | 5 | 64.1 | 7.7 | 937 |
 | 04_regex_text | 20 | 58 | 58 | 2.9 | 230 | 631 | 2.74 | 2 | 7 | 31.9 | 3.5 | 893 |
 | 05_download_extract | 16 | 37 | 37 | 2.31 | 183 | 402 | 2.2 | 1 | 8 | 114.7 | 7.9 | 4257 |
@@ -46,7 +46,7 @@ Python reference notes: 11 uses Pillow (installed), 13 and 08 use stdlib only (`
 | 12_pdf_create | 55 | 71 | 25 | 0.45 | 546 | 248 | 0.45 | 2 | 4 | 64.2 | 8.0 | 1396 |
 | 13_markdown_to_html | 63 | 11 | 11 | 0.17 | 618 | 90 | 0.15 | 2 | 4 | 64.1 | 1.3 | 878 |
 | 14_timer_scheduler | 25 | 43 | 43 | 1.72 | 202 | 342 | 1.69 | 1 | 2 | 515.7 | 415.1 | 667 |
-| 15_parallel_map_files | 17 | 68 | 61 | 3.59 | 168 | 539 | 3.21 | 2 | 8 | 114.3 | 64.1 | 1119 |
+| 15_parallel_map_files | 17 | 68 | 59 | 3.47 | 168 | 508 | 3.02 | 2 | 9 | 114.2 | 63.8 | 1066 |
 | 16_fui_list_button | 14 | 26 | 26 | 1.86 | 114 | 279 | 2.45 | 1 | 3 | -1 | -1 | 6557 |
 | 17_websocket_chat | 24 | 21 | 20 | 0.83 | 217 | 166 | 0.76 | 3 | 4 | 64.2 | 3.7 | 1912 |
 | 18_logging | 25 | 41 | 38 | 1.52 | 234 | 315 | 1.35 | 1 | 5 | 64.3 | 3.7 | 1038 |
@@ -58,6 +58,8 @@ Python reference notes: 11 uses Pillow (installed), 13 and 08 use stdlib only (`
 
 Re-measured 18.10.2026 (meas2, 5 runs, host load ~16-20: ms are still noisy; line/token numbers exact). Median 1.67 -> 1.52.
 Rewritten with the new features (output identical to expect.txt): 02 (100->71, f-string specs, Vec+vec_sort_by instead of arrays/insertion sort), 03 (60->50, `{i:02}`, string tables), 15 (64->61, pystr.count, `{i:02}`), 18 (41->38, named arg, infof, pystr.read_text). 04 (58) and 09 (32) were already on std.pystr/pyre/defaults; nothing left to cut without new libs (04: finditer loop; 09: args setup is 1:1 with argparse).
+
+Re-measured 18.10.2026 (r737, tasks 02 + 15 only, 5 runs, host load 6.4-6.8 = quiet; output identical to expect.txt): 02 71->70 lines, 15 61->59 lines (after std.pycoll / jobs.pmap); run ms now trustworthy (02: py 31.9 / firn 3.5; 15: py 114.2 / firn 63.8). Median unchanged 1.52; 02 and 15 stay > 3x.
 
 Summary (`table.py --stats`): `tasks=20 median_factor_now=1.52 median_factor_first=1.94 le1.5_now=9 le1.5_first=7`.
 Live numbers: `python3 tools/vspy/table.py` (reads `examples/vs_python/**/results_*.tsv`).
@@ -207,7 +209,7 @@ Compile time (cold, `dev-fast`): hello 10 ms, any program importing `std.io` 0.5
 2. **Compile speed** (G33): reachability pruning before optimizer/codegen. It makes cold script start and any REPL ~10x faster and is the precondition for G34.
 3. **Packages** (G35): git URL + rev pin in `firn.lock`, `firn add/vendor`. Needed before a community lib ecosystem is possible.
 4. **Option[T] / closures / derive** (G23, G24, G27): large (L), but they decide whether Firn code reads like Python for data-processing code. Needs a design decision per item (SPEC currently says no operator overloading, no generic enums).
-5. **Re-run this study** after each block: `python3 tools/vspy/measure.py examples/vs_python/<task>` + `python3 tools/vspy/table.py`. Target: median line factor <= 1.5 (now 1.52), no task above 3x (open: 02 3.4, 15 3.6, 04 2.9, p02 3.1).
+5. **Re-run this study** after each block: `python3 tools/vspy/measure.py examples/vs_python/<task>` + `python3 tools/vspy/table.py`. Target: median line factor <= 1.5 (now 1.52), no task above 3x (open: 02 3.3, 15 3.5, 04 2.9, p02 3.1).
 
 Roadmap items: see ROADMAP in the JARVIS project (group "Python-Niveau"), one item per gap above.
 

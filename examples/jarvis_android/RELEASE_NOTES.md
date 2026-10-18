@@ -4,6 +4,10 @@ One section per version, newest first: `## <version>`, then short bullet lines (
 `tools/android/jarvis_release.sh` puts the section of the released version into the signed
 store entry (field `aenderungen`, at most 1536 bytes); the app shows it in Settings.
 
+## 0.2.18
+- "No connection" now says why (timeout, server unreachable, certificate, ...) and a list that is still loading says "Loading".
+- Lists load one or two at a time and retry by themselves (3 s, 6 s, 12 s); when the chat socket opens they load at once.
+
 ## 0.2.5
 - A tap on a notification while the app is open now switches to the chat of that notification.
 - A notification without a chat id no longer opens an unrelated chat.

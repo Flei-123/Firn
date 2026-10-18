@@ -74,28 +74,16 @@ for _ in $(seq 50); do grep -q '^PORT' "$W/out" && break; sleep 0.1; done
 PORT=$(awk '/^PORT/{print $2}' "$W/out")
 SLOG=$W/server.log
 
+# pixel-comparison runs: WM_SIZE=1339x2974 WM_DENSITY=520 (emulator only) gives the 412x915 dp of the web references
+[ -n "${WM_SIZE:-}" ] && $ADB shell wm size "$WM_SIZE" >/dev/null 2>&1
+[ -n "${WM_DENSITY:-}" ] && $ADB shell wm density "$WM_DENSITY" >/dev/null 2>&1
 read -r SW SH < <($ADB shell wm size | tr -d '\r' | sed -n 's/.*: *\([0-9]*\)x\([0-9]*\).*/\1 \2/p' | tail -1)
 shot() { $ADB exec-out screencap -p >"$OUT/$1.png"; }
 ocr() { tesseract "$OUT/$1.png" stdout 2>/dev/null | tr -s '\n ' ' '; }
 # the centre (pixels) of the n-th word matching a regex in the screenshot $1; empty when there is none
-word_at() { python3 -I - "$OUT/$1.png" "$2" "${3:-1}" <<'EOF'
-import re, subprocess, sys
-png, rx, nth = sys.argv[1], sys.argv[2], int(sys.argv[3])
-tsv = subprocess.run(["tesseract", png, "stdout", "--psm", "11", "tsv"], capture_output=True, text=True).stdout.splitlines()
-hit = 0
-for ln in tsv[1:]:
-    f = ln.split("\t")
-    if len(f) < 12 or not f[11].strip():
-        continue
-    if re.fullmatch(rx, f[11].strip()):
-        hit += 1
-        if hit == nth:
-            print(int(f[6]) + int(f[8]) // 2, int(f[7]) + int(f[9]) // 2)
-            break
-EOF
-}
+word_at() { python3 -I "$(dirname "${BASH_SOURCE[0]}")/ocr_words.py" "$OUT/$1.png" "$2" "${3:-1}"; }
 # touch the n-th word matching a regex ($1); fails (returns 1) when the word is not on the screen
-tap_word() { local p; shot _w; p=$(word_at _w "$1" "${2:-1}"); [ -n "$p" ] || { echo "  (no word $1 on the screen)"; return 1; }
+tap_word() { local p; shot _w; p=$(word_at _w "$1" "${2:-1}"); [ -n "$p" ] || { echo "  (no word $1 on the screen)"; cp "$OUT/_w.png" "$OUT/nf_$(echo "$1" | tr -cd A-Za-z).png"; return 1; }
     $ADB shell input tap $p; sleep "${3:-1.5}"; }
 wait_ocr() { local i; for i in $(seq ${OCR_TRIES:-12}); do shot "$1"; ocr "$1" | grep -q "$2" && break; sleep 1.5; done; ocr "$1" | grep -c "$2"; }
 wait_log() { local i; for i in $(seq ${2:-20}); do grep -q "$1" "$SLOG" && break; sleep 1; done; grep -c "$1" "$SLOG"; }
@@ -157,14 +145,14 @@ $ADB logcat -c
 sleep 15
 $ADB shell am start -n $ACT >/dev/null
 for _ in $(seq 40); do [ -n "$($ADB shell pidof $PKG)" ] && break; sleep 1; done
-check "login screen shows" "$(OCR_TRIES=40 wait_ocr 01_login 'Sign in')" 1
+check "login screen shows" "$(OCR_TRIES=40 wait_ocr 01_login 'Passwort')" 1
 
 # ---- 1. login + chat ---------------------------------------------------------------------------------------------------------
 echo "== 1. login, message, streamed reply"
-type_into "Username" justin; type_into "Password" pw
-tap_word "Sign" 1 1
-check "the notification notice page shows after the first sign-in" "$(OCR_TRIES=20 wait_ocr 01b_notice 'Continue')" 1
-tap_word "Continue" 1 3
+type_into "Benutzername" justin; type_into "Passwort" pw
+tap_word "Anmelden" 1 1
+check "the notification notice page shows after the first sign-in" "$(OCR_TRIES=20 wait_ocr 01b_notice 'Weiter\|Benachrichtigungen')" 1 # english: ok
+tap_word "Weiter" 1 3
 check "chat screen after login" "$(OCR_TRIES=30 wait_ocr 02_chat 'Chats')" 1
 check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 1
 send_text hello
@@ -184,15 +172,16 @@ check "Needs list shows the question" "$(OCR_TRIES=10 wait_ocr 05_needs 'Merge')
 tap_word 'Merge\?' 1 2; shot 05b_need_answers
 tap_word "Yes" 1 3
 check "need answered over /api/m/needs/answer" "$(wait_log '"path": "/api/m/needs/answer".*"answer": "Yes"' 10)" 1
-tap_word "Tasks" 1 4
+tap_word "Aufgaben" 1 4
 check "Tasks list shows the task" "$(OCR_TRIES=15 wait_ocr 06_tasks 'milk')" 1
-type_into "Task|New|Add|Text" "callmum" && tap_word "Add" 1 3
+type_into "Neue|Aufgabe|Text" "callmum" && tap_word "Hinzuf.{1,2}gen" 1 3
 check "task added over /api/m/tasks" "$(wait_log '"path": "/api/m/tasks".*callmum' 10 | awk '{print ($1>0)?"yes":"no"}')" yes
 # the two remaining tab pages, only photographed (design review)
-tap_word "Devices" 1 3; shot 06b_devices
+tap_word "Ger.te" 1 3; shot 06b_devices
 tap_px 965 $TAB_Y 3; shot 06c_more # More tab by place: OCR does not find the small word
 [ "${E2E_STOP:-}" = tabs ] && { echo "stopped after the tab pages (E2E_STOP=tabs): $PASS ok, $FAIL failed"; exit 0; }
-tap_word "Chat" 1 2
+# the Chat tab by place (the word is too small for OCR on the More page, and a miss would leave the next taps on that page: Logout!)
+tap_px 106 $TAB_Y 2
 
 # ---- 3. conversation list ----------------------------------------------------------------------------------------------------
 echo "== 3. conversation list"
@@ -202,9 +191,9 @@ check "list shows a chat" "$(OCR_TRIES=10 wait_ocr 07_convs 'hello\|worker\|hi')
 
 # ---- 4. photo upload ---------------------------------------------------------------------------------------------------------
 echo "== 4. photo upload"
-tap_word "New" 1 2
+tap_word "Neu" 1 2
 tap_plus
-tap_word "Photo" 1 4 # "+" shows the two choices (Photo / File)
+tap_word "Foto|Photo" 1 4 # "+" shows the two choices (Photo / File)
 U=$(ui)
 check "the system's picker opens" "$(echo "$U" | grep -cE '(text|content-desc)="(Media picker|Photos|Files|Gallery|Camera|Recent|Photo taken)' | awk '{print ($1>0)?"yes":"no"}')" yes
 P0=$($ADB shell pidof $PKG)
@@ -213,7 +202,7 @@ tap_ui "Media picker" || true
 for _ in 1 2 3 4 5 6; do tap_ui "Photo taken" && break; sleep 3; done || note "no photo in the picker"
 sleep 10
 check "the app survives the picker (same process)" "$($ADB shell pidof $PKG)" "$P0"
-check "the photo waits in the input line" "$(OCR_TRIES=15 wait_ocr 08_photo 'photo ')" 1
+check "the photo waits in the input line" "$(OCR_TRIES=15 wait_ocr 08_photo 'Foto ')" 1
 send_text "see"
 check "upload reached the server (POST /api/m/upload)" "$(wait_log '"path": "/api/m/upload' 20 | awk '{print ($1>0)?"yes":"no"}')" yes
 check "the text carries the server path of the photo" "$(wait_log '"text": ".*/srv/uploads/' 15 | awk '{print ($1>0)?"yes":"no"}')" yes
@@ -230,7 +219,7 @@ $ADB shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file
 SHA_DOC=$(cat "$W/e2e_doc.sha")
 UP0=$(grep -c '"type": "upload_body"' "$SLOG")
 tap_plus
-tap_word "File" 1 4 # "+" shows the two choices (Photo / File)
+tap_word "D[a]tei|File" 1 4 # "+" shows the two choices (Photo / File)
 FOUND=no
 for _ in 1 2 3 4 5 6; do
     tap_ui "jarvis_e2e_doc" && { FOUND=yes; break; }
@@ -244,7 +233,7 @@ fi
 check "the document picker lists the file" "$FOUND" yes
 sleep 8
 check "the app survives the file picker (same process)" "$($ADB shell pidof $PKG)" "$P0"
-check "the file waits in the input line (name + size)" "$(OCR_TRIES=15 wait_ocr 08b_file 'file jarvis_e2e_doc')" 1
+check "the file waits in the input line (name + size)" "$(OCR_TRIES=15 wait_ocr 08b_file 'Datei jarvis_e2e_doc')" 1 # english: ok
 send_text "doc"
 check "file upload reached the server (a new upload_body line)" "$(for _ in $(seq 25); do [ "$(grep -c '"type": "upload_body"' "$SLOG")" -gt "$UP0" ] && echo yes && break; sleep 1; done)" yes
 check "the server got exactly the octets of the file (sha256)" "$(grep '"type": "upload_body"' "$SLOG" | tail -1 | grep -c "\"sha256\": \"$SHA_DOC\"")" 1
@@ -267,7 +256,7 @@ if sys.argv[3] != '-': ev['cid'] = sys.argv[3]  # '-' = an event without a chat 
 r = urllib.request.Request('http://127.0.0.1:$PORT/fake/push', json.dumps(ev).encode(), {'Content-Type': 'application/json'})
 print(urllib.request.urlopen(r).read().decode())" "$1" "$2" "${3:-c1}" >/dev/null; }
 sleep 8 # the first poll only learns the last event id
-tap_word "New" 1 2 # an empty chat: the history of the event's chat must show up after the tap
+tap_word "Neu" 1 2 # an empty chat: the history of the event's chat must show up after the tap
 $ADB shell input keyevent KEYCODE_HOME; sleep 3
 check "the app is in the background" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 0
 push "Worker done" "Merge finished äö"
@@ -366,7 +355,7 @@ check "no cid tap: no crash so far" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|
 echo "== 7. frame time"
 # scroll the chat and open tabs so that frames are painted, then read the app's own frame lines
 for _ in 1 2 3; do $ADB shell input swipe 540 900 540 1500 150; $ADB shell input swipe 540 1500 540 900 150; done
-tap_word "Board" 1 3; tap_word "Chat" 1 3
+tap_word "Board" 1 3; tap_px 106 $TAB_Y 3 # the Chat tab by place (the word "Chat" also sits in the header pill)
 sleep 7
 FL=$(app_log | grep ' frames: ' | tail -20)
 check "frame lines in the app log" "$(echo "$FL" | grep -c 'n=' | awk '{print ($1>0)?"yes":"no"}')" yes
@@ -385,8 +374,8 @@ if n:
 
 # ---- 8. voice output without an engine -------------------------------------------------------------------------------------
 echo "== 8. voice output"
-tap_word "Voice" 1 2; shot 10_voice
-check "Voice switch shows 'Voice on'" "$(ocr_crop 10_voice 330 320 660 440 | grep -ci 'oice on')" 1
+tap_word "Sprache" 1 2; shot 10_voice
+check "Voice switch shows 'Sprache an'" "$(ocr_crop 10_voice 330 320 660 440 | grep -ci 'prache an')" 1
 send_text "voicetest"
 check "the app lives after a spoken answer" "$(OCR_TRIES=12 wait_ocr 11_say 'Hallo voicetest')" 1
 check "app alive after voice output" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
@@ -401,7 +390,7 @@ check "tts: the engine was asked (log 'engine requested')" "$($ADB logcat -d | g
 check "tts: the engine took the text (log 'engine ready, speaking')" "$($ADB logcat -d | grep -c 'firn-tts: engine ready, speaking')" 1
 check "tts: the speech ended (log 'finished speaking')" "$($ADB logcat -d | grep -c 'firn-tts: finished speaking')" 1
 check "tts: no timeout ('no engine answered in time')" "$($ADB logcat -d | grep -c 'firn-tts: no engine answered')" 0
-check "tts: the status line did not complain" "$(ocr 11_say | grep -c 'voice output not possible')" 0
+check "tts: the status line did not complain" "$(ocr 11_say | grep -c 'Sprachausgabe nicht möglich')" 0 # english: ok
 
 check "no crash in logcat" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
 $ADB shell am force-stop $PKG

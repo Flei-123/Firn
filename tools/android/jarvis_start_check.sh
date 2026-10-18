@@ -40,7 +40,7 @@ run_case() { # name, then the start command
         local ok=no t
         for t in 1 2 3 4; do # the page may still be drawing or an emulator dialog may pop up late: look again
             $ADB exec-out screencap -p >"$W/shot.png" 2>/dev/null
-            tesseract "$W/shot.png" - 2>/dev/null | grep -q -i -E 'sign in|anmelden' && { ok=yes; break; }
+            tesseract "$W/shot.png" - 2>/dev/null | grep -q -i -E 'sign in|anmelden|passwort|benutzername' && { ok=yes; break; }
             dismiss_anr; sleep 2
         done
         check "$name: sign-in page on screen" "$ok" yes

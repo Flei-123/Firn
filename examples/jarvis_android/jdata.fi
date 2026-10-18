@@ -13,6 +13,7 @@
 import std.rt
 import std.vec
 import std.time
+import std.fs
 import async.loop
 import net.jarvisc
 import net.jarvisapi
@@ -39,6 +40,13 @@ const REFRESH_MS: i64 = 15000
 const PROBE_RETRY_MS: i64 = 300000 // an older server is asked again after 5 min (it may have been restarted since)
 const PROBE_LOST_MS: i64 = 5000 // no connection: ask again soon
 const NEED_OPTS: usize = 4
+const MAX_FLIGHT: i64 = 2 // GET requests on the wire at once: every request is a FULL TLS handshake (no keep-alive, no resumption) on the ONE
+// thread of the window, so six at once finish together late and run into the timeout on a phone (host: 8 at once = 2.4 s, a phone is slower)
+const HOLD_PING_MS: i64 = 6000 // the first GETs wait this long for the /api/m/ping answer (then they go out on the old routes)
+const RETRY_FIRST_MS: i64 = 3000 // a failed slot is asked again after 3 s, 6 s, 12 s, then every REFRESH_MS
+const NET_TIMEOUT_MS: i64 = 30000 // mobile networks: longer than the library default (20 s)
+const NET_NOT_SENT: i64 = 0 - 1 // stand status: the request could not even be started
+const NETLOG_CAP: usize = 3000
 // the stand slots (not the AK_* numbers, which go to 17)
 const K_PROJECTS: usize = 0
 const K_CENTER: usize = 1
@@ -102,6 +110,18 @@ static mut G_V_DEV: u64 = 0
 static mut G_V_CONV: u64 = 0
 static mut G_V_STAND: u64 = 0
 static mut G_LAST: [i64; 7] = [0; 7]
+static mut G_FAILED: [i64; 7] = [0; 7] // 1 = the last answer of the slot was a failure (status 0 / not sent), see stand_text
+static mut G_FAILS: [i64; 7] = [0; 7] // failures in a row: backoff
+static mut G_WHY_LAYER: [i64; 7] = [0; 7] // ahttp.NL_* of the last failure
+static mut G_WHY_TLS: [i64; 7] = [0; 7]
+static mut G_WHY_VER: [i64; 7] = [0; 7]
+static mut G_WHY_MS: [i64; 7] = [0; 7]
+static mut G_WANT: i64 = 0 // bit per slot: a GET is wanted and waits for a free place (pump)
+static mut G_FLIGHT: i64 = 0 // requests of the jdata client on the wire
+static mut G_PING_AT: i64 = 0 // when the last /api/m/ping went out
+static mut G_WS_OPEN: bool = false
+static mut G_NETLOG: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_NETLOG_PATH: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_STATUS: [i64; 7] = [0; 7]
 static mut G_AGE: [i64; 7] = [0; 7]
 static mut G_CONVS: u64 = 0
@@ -191,15 +211,86 @@ fn need_option(i: usize, k: usize) -> str {
 }
 
 // ------------------------------------------------------------------ the client
+// the layer / tls error / certificate verdict / milliseconds of the answer being delivered (set at the top of on_api)
+static mut G_CUR_LAYER: i64 = 0
+static mut G_CUR_TLS: i64 = 0
+static mut G_CUR_VER: i64 = 0
+static mut G_CUR_MS: i64 = 0
+static mut G_REQ_LOGGED: i64 = 0
+static mut G_CUR_REUSED: bool = false
+
+fn slot_name(slot: usize) -> str {
+    if slot == K_PROJECTS { return "projects" }
+    if slot == K_CENTER { return "center" }
+    if slot == K_TASKS { return "tasks" }
+    if slot == K_DEVICES { return "devices" }
+    if slot == K_CONV { return "chat" }
+    if slot == K_NEED { return "needs" }
+    return "chats"
+}
+
+// one line of the short network history (kept in memory, written to <state>/net_last.txt; jcrash adds it to the report)
+fn netlog_add(line: str) {
+    if G_NETLOG_PATH.len == 0 { return }
+    if G_NETLOG.len > NETLOG_CAP {
+        // drop the older half at a line start
+        var cut: usize = NETLOG_CAP / 2
+        while cut < G_NETLOG.len && rt.ld8(G_NETLOG.ptr, cut) != 10 as u8 { cut = cut + 1 }
+        cut = cut + 1
+        var rest: rt.Buf = rt.buf_new()
+        if cut < G_NETLOG.len { rt.buf_push_bytes(&rest, G_NETLOG.ptr + cut as u64, G_NETLOG.len - cut) }
+        rt.buf_clear(&G_NETLOG)
+        rt.buf_push_bytes(&G_NETLOG, rest.ptr, rest.len)
+        rt.buf_free(&rest)
+    }
+    rt.buf_push_bytes(&G_NETLOG, line.p as u64, line.n)
+    rt.buf_push(&G_NETLOG, 10 as u8)
+    let w: usize = fs.write_file(str { p: G_NETLOG_PATH.ptr as *mut u8, n: G_NETLOG_PATH.len }, G_NETLOG.ptr, G_NETLOG.len) catch 0
+}
+
 fn stand_note(kind: usize, status: i64, age: i64) {
     G_STATUS[kind] = status
     G_AGE[kind] = age
+    if status == 0 || status == NET_NOT_SENT || status == 203 {
+        // a failure (203 = the failure was covered by the cache): keep WHY and back off
+        G_FAILED[kind] = 1
+        if status != 203 { G_FAILS[kind] = G_FAILS[kind] + 1 }
+        if status == NET_NOT_SENT {
+            G_WHY_LAYER[kind] = 0
+            G_WHY_MS[kind] = 0
+        } else {
+            G_WHY_LAYER[kind] = G_CUR_LAYER
+            G_WHY_TLS[kind] = G_CUR_TLS
+            G_WHY_VER[kind] = G_CUR_VER
+            G_WHY_MS[kind] = G_CUR_MS
+        }
+        let line: str = slot_name(kind) + " " + jshell.dec(status) + " " + why_log(kind) + " after " + jshell.dec(G_WHY_MS[kind]) + " ms (fail " + jshell.dec(G_FAILS[kind]) + ", mobile " + jshell.dec(G_MOBILE) + ")"
+        log.log_warn("net", line)
+        netlog_add(jshell.dec(time.now_unix_ms() / 1000) + " " + line)
+    } else {
+        if G_FAILED[kind] == 1 && status == 200 { netlog_add(jshell.dec(time.now_unix_ms() / 1000) + " " + slot_name(kind) + " ok again after " + jshell.dec(G_FAILS[kind]) + " failures, " + jshell.dec(G_CUR_MS) + " ms") }
+        G_FAILED[kind] = 0
+        G_FAILS[kind] = 0
+        if G_CUR_MS > 4000 { log.log_warn("net", slot_name(kind) + " answered " + jshell.dec(status) + " but slowly: " + jshell.dec(G_CUR_MS) + " ms") }
+        if G_REQ_LOGGED < 600 {
+            G_REQ_LOGGED = G_REQ_LOGGED + 1
+            var rs: str = "new connection"
+            if G_CUR_REUSED { rs = "kept connection" }
+            log.log_info("net", slot_name(kind) + " " + jshell.dec(status) + " in " + jshell.dec(G_CUR_MS) + " ms (" + rs + ")")
+        }
+    }
     // a good list answer ends the "refreshing ..." hint of the pull
     if (kind == K_PROJECTS || kind == K_CENTER || kind == K_DEVICES) && (status == 200 || status == 203) { rt.buf_clear(&G_NOTE) }
     G_V_STAND = G_V_STAND + 1 as u64
 }
 
 fn on_api(a: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
+    if G_FLIGHT > 0 { G_FLIGHT = G_FLIGHT - 1 }
+    G_CUR_LAYER = jarvisapi.ja_net_layer(a) as i64
+    G_CUR_TLS = jarvisapi.ja_net_tls(a) as i64
+    G_CUR_VER = jarvisapi.ja_net_verify(a) as i64
+    G_CUR_MS = jarvisapi.ja_net_ms(a)
+    G_CUR_REUSED = jarvisapi.ja_net_reused(a)
     let p: u64 = jarvisapi.ja_body_ptr(a)
     let n: usize = jarvisapi.ja_body_len(a)
     let age: i64 = jarvisapi.ja_age_s(a)
@@ -246,6 +337,8 @@ fn on_api(a: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
         stand_note(K_CONV, status, age)
         if good { take_conv(p, n) }
     }
+    // a place on the wire is free again: the next wanted GET goes out (after the answer was taken, never inside the parse)
+    pump()
 }
 
 // ---- loop lag meter: the window and the network share ONE thread, so anything that blocks it (a blocking name lookup, a big parse, the
@@ -287,6 +380,14 @@ fn ensure_init() {
     *(G_CACHE as *mut jarvis_cache.Cache) = jarvis_cache.cache_new(base + "/api")
     let a: *mut jarvisapi.Api = jarvisapi.ja_new(jshell.loop_of(), on_api, 0)
     jarvisapi.ja_set_cache(a, G_CACHE as *mut jarvis_cache.Cache)
+    jarvisapi.ja_set_timeout(a, NET_TIMEOUT_MS)
+    var sd: rt.Buf = rt.buf_new()
+    if platform.plat_dir(platform.DIR_STATE, appinfo.app_id(), appinfo.app_vendor(), &sd) {
+        rt.buf_push_bytes(&G_NETLOG_PATH, sd.ptr, sd.len)
+        let tail: str = "/net_last.txt"
+        rt.buf_push_bytes(&G_NETLOG_PATH, tail.p as u64, tail.n)
+    }
+    rt.buf_free(&sd)
     G_API = a as u64
     let lt: u64 = loop.timer_every(jshell.loop_of(), LAG_PERIOD_MS, lag_tick, 0)
 }
@@ -311,9 +412,12 @@ fn probe(a: *mut jarvisapi.Api) {
     let now: i64 = time.now_unix_ms()
     if G_PROBE_AT != 0 && now < G_PROBE_AT { return }
     G_PROBING = true
+    G_PING_AT = now
     if !jarvisapi.ja_ping(a) {
         G_PROBING = false
         G_PROBE_AT = now + PROBE_LOST_MS
+    } else {
+        G_FLIGHT = G_FLIGHT + 1
     }
 }
 
@@ -326,10 +430,11 @@ fn take_ping(a: *mut jarvisapi.Api, status: i64) {
     if status == 200 {
         jarvisapi.ja_set_mobile(a, true)
         G_MOBILE = 1
-        // everything is asked again over the new routes
+        // what has no good answer yet is asked over the new routes (a slot that already answered is not asked twice: every
+        // request is a full TLS handshake)
         var i: usize = 0
         while i < K_COUNT {
-            G_LAST[i] = 0
+            if G_STATUS[i] != 200 { G_LAST[i] = 0 }
             i = i + 1
         }
     } else if status == 0 {
@@ -411,6 +516,7 @@ fn next_project() {
     G_Q_AT = G_Q_AT + 1
     let id: str = __str_copy(pool_str(vq(), (*rec).proj_id))
     let ok: bool = jarvisapi.ja_project(ensure(), id)
+    if ok { G_FLIGHT = G_FLIGHT + 1 }
     if !ok { next_project() }
 }
 
@@ -516,38 +622,116 @@ fn take_conv(p: u64, n: usize) {
 }
 
 // ------------------------------------------------------------------ requests (throttled unless `force`)
+// ONE gate for every GET of the screens: refresh_* only says "this slot is wanted"; pump() sends at most MAX_FLIGHT at once, in the order
+// of the slot numbers, and the first ones wait a moment for the /api/m/ping answer. A failed slot is asked again with a backoff.
+
+// the milliseconds until a slot may be asked again on its own (not forced)
+fn interval(slot: usize) -> i64 {
+    var f: i64 = G_FAILS[slot]
+    if f <= 0 { return REFRESH_MS }
+    var v: i64 = RETRY_FIRST_MS
+    while f > 1 && v < REFRESH_MS {
+        v = v * 2
+        f = f - 1
+    }
+    if v > REFRESH_MS { v = REFRESH_MS }
+    return v
+}
+
+// The chat socket just opened = the network works: whatever has no good answer is asked now, without waiting for the backoff.
+fn watch_ws() {
+    let c: *mut jarvisc.Jc = jshell.jc()
+    if c as u64 == 0 { return }
+    let open: bool = jarvisc.jc_is_open(c)
+    if open && !G_WS_OPEN {
+        var i: usize = 0
+        while i < K_COUNT {
+            if G_STATUS[i] != 200 {
+                G_LAST[i] = 0
+                G_FAILS[i] = 0
+            }
+            i = i + 1
+        }
+        log.log_info("net", "chat socket open: slots without a good answer are asked now")
+    }
+    G_WS_OPEN = open
+    // wanted GETs that waited for the ping (HOLD_PING_MS) go out even when no screen asks again
+    pump()
+}
+
 fn due(slot: usize, force: bool) -> bool {
+    watch_ws()
     let now: i64 = time.now_unix_ms()
-    if !force && now - G_LAST[slot] < REFRESH_MS { return false }
+    if !force && now - G_LAST[slot] < interval(slot) { return false }
     G_LAST[slot] = now
     return true
+}
+
+fn want(slot: usize) {
+    G_WANT = G_WANT | (1 << slot as i64)
+    pump()
+}
+
+// send one wanted GET; false = it could not even be started (-> "No connection - request not sent", not a silent "Loading")
+fn issue(slot: usize) -> bool {
+    let a: *mut jarvisapi.Api = ensure()
+    var ok: bool = false
+    if slot == K_PROJECTS { ok = jarvisapi.ja_projects(a) }
+    else if slot == K_CENTER { ok = jarvisapi.ja_center(a) }
+    else if slot == K_TASKS { ok = jarvisapi.ja_tasks(a) }
+    else if slot == K_DEVICES { ok = jarvisapi.ja_devices(a) }
+    else if slot == K_CONVS { ok = jarvisapi.ja_convs(a, 40, 0) }
+    else if slot == K_CONV { ok = jarvisapi.ja_conv(a, conv_cid(), 30) }
+    if ok { G_FLIGHT = G_FLIGHT + 1 }
+    return ok
+}
+
+fn pump() {
+    if G_WANT == 0 { return }
+    // ensure(): token + base of the chat client, and the one-time ping (probe) goes out BEFORE the GETs
+    let ap: *mut jarvisapi.Api = ensure()
+    // the very first GETs wait for the ping answer (which route set the server has), at most HOLD_PING_MS
+    if G_PROBING && time.now_unix_ms() - G_PING_AT < HOLD_PING_MS { return }
+    while G_WANT != 0 && G_FLIGHT < MAX_FLIGHT {
+        var slot: usize = 0
+        while slot < K_COUNT && (G_WANT & (1 << slot as i64)) == 0 { slot = slot + 1 }
+        if slot >= K_COUNT {
+            G_WANT = 0
+            return
+        }
+        G_WANT = G_WANT & (0 - 1 - (1 << slot as i64))
+        if !issue(slot) {
+            G_CUR_LAYER = 0
+            stand_note(slot, NET_NOT_SENT, 0 - 1)
+        }
+    }
 }
 
 fn refresh_projects(force: bool) {
     if G_CYCLE && !force { return }
     if !due(K_PROJECTS, force) { return }
-    let ok: bool = jarvisapi.ja_projects(ensure())
+    want(K_PROJECTS)
 }
 
 fn refresh_center(force: bool) {
     if !due(K_CENTER, force) { return }
-    let ok: bool = jarvisapi.ja_center(ensure())
+    want(K_CENTER)
 }
 
 fn refresh_tasks(force: bool) {
     if !due(K_TASKS, force) { return }
-    let ok: bool = jarvisapi.ja_tasks(ensure())
+    want(K_TASKS)
 }
 
 // the chat list for the chat tab's drawer (newest 40)
 fn refresh_convs(force: bool) {
     if !due(K_CONVS, force) { return }
-    let ok: bool = jarvisapi.ja_convs(ensure(), 40, 0)
+    want(K_CONVS)
 }
 
 fn refresh_devices(force: bool) {
     if !due(K_DEVICES, force) { return }
-    let ok: bool = jarvisapi.ja_devices(ensure())
+    want(K_DEVICES)
 }
 
 // the last 30 turns of a chat (a worker chat too)
@@ -560,21 +744,27 @@ fn load_chat(cid: str, force: bool) {
     }
     if !same || force { G_LAST[K_CONV] = 0 }
     if !due(K_CONV, force || !same) { return }
-    let ok: bool = jarvisapi.ja_conv(ensure(), cid, 30)
+    want(K_CONV)
 }
 
 fn answer_need(i: usize, answer: str) -> bool {
     if i >= needs_count() || answer.n == 0 { return false }
     let pid: str = __str_copy(need_str(i, 0))
     let nid: str = __str_copy(need_str(i, 2))
-    return jarvisapi.ja_need_answer(ensure(), pid, nid, answer)
+    let ok: bool = jarvisapi.ja_need_answer(ensure(), pid, nid, answer)
+    if ok { G_FLIGHT = G_FLIGHT + 1 }
+    return ok
 }
 
-fn task_add(text: str, due_iso: str) -> bool {
-    return jarvisapi.ja_task_add(ensure(), text, due_iso, "", "")
+fn counted(ok: bool) -> bool {
+    if ok { G_FLIGHT = G_FLIGHT + 1 }
+    return ok
 }
-fn task_complete(ref_id: str) -> bool { return jarvisapi.ja_task_complete(ensure(), ref_id) }
-fn task_remove(ref_id: str) -> bool { return jarvisapi.ja_task_remove(ensure(), ref_id) }
+fn task_add(text: str, due_iso: str) -> bool {
+    return counted(jarvisapi.ja_task_add(ensure(), text, due_iso, "", ""))
+}
+fn task_complete(ref_id: str) -> bool { return counted(jarvisapi.ja_task_complete(ensure(), ref_id)) }
+fn task_remove(ref_id: str) -> bool { return counted(jarvisapi.ja_task_remove(ensure(), ref_id)) }
 
 // ------------------------------------------------------------------ the "stand" hint
 fn set_note(s: str) {
@@ -584,22 +774,56 @@ fn set_note(s: str) {
 }
 fn status_note() -> str { return str { p: G_NOTE.ptr as *mut u8, n: G_NOTE.len } }
 
+// the reason of the last failure of a slot, in English (log lines)
+fn why_log(slot: usize) -> str {
+    if G_STATUS[slot] == NET_NOT_SENT { return "request not sent" }
+    let l: i64 = G_WHY_LAYER[slot]
+    if l == 1 { return "bad address" }
+    if l == 2 { return "no DNS answer" }
+    if l == 3 { return "server unreachable" }
+    if l == 4 { return "no trusted roots on this device" }
+    if l == 5 { return "certificate refused (tls " + jshell.dec(G_WHY_TLS[slot]) + ", check " + jshell.dec(G_WHY_VER[slot]) + ")" }
+    if l == 6 { return "TLS error " + jshell.dec(G_WHY_TLS[slot]) }
+    if l == 7 { return "timeout after " + jshell.dec(G_WHY_MS[slot] / 1000) + " s" }
+    if l == 8 { return "connection closed" }
+    if l == 9 { return "cancelled" }
+    return "network error"
+}
+
+// the reason of the last failure of a slot, for the user (German)
+fn why_text(slot: usize) -> str {
+    if G_STATUS[slot] == NET_NOT_SENT { return jtexts.t("why.notsent") }
+    let l: i64 = G_WHY_LAYER[slot]
+    if l == 1 { return jtexts.t("why.addr") }
+    if l == 2 { return jtexts.t("why.dns") }
+    if l == 3 { return jtexts.t("why.unreach") }
+    if l == 4 { return jtexts.t("why.roots") }
+    if l == 5 { return jtexts.t1("why.cert", "value", jshell.dec(G_WHY_TLS[slot]) + "/" + jshell.dec(G_WHY_VER[slot])) }
+    if l == 6 { return jtexts.t1("why.tls", "value", jshell.dec(G_WHY_TLS[slot])) }
+    if l == 7 { return jtexts.t1("why.timeout", "value", jshell.dec(G_WHY_MS[slot] / 1000)) }
+    if l == 8 { return jtexts.t("why.closed") }
+    if l == 9 { return jtexts.t("why.cancel") }
+    return jtexts.t("why.net")
+}
+
 // "Live" | "Offline - as of 5 min ago" | "No connection" | "Session expired" | "Error 500" | "Loading ..."
 // true when the slot's last answer came live from the server (no hint line needed)
 fn stand_live(slot: usize) -> bool { return G_STATUS[slot] == 200 }
 
 fn stand_text(slot: usize) -> str {
     let st: i64 = G_STATUS[slot]
-    if st == 0 && G_LAST[slot] == 0 { return jtexts.t("ls.loading") }
+    // 0 = no answer yet: "Loading" (a request that is only on its way is NOT a lost connection); a failure is G_FAILED
+    if st == 0 && G_FAILED[slot] == 0 { return jtexts.t("ls.loading") }
     if st == 200 { return jtexts.t("ls.live") }
     if st == 203 {
         let age: i64 = G_AGE[slot]
-        if age < 90 { return jtexts.t1("ls.off-s", "value", jshell.dec(age)) }
-        if age < 5400 { return jtexts.t1("ls.off-m", "value", jshell.dec(age / 60)) }
-        if age < 172800 { return jtexts.t1("ls.off-h", "value", jshell.dec(age / 3600)) }
-        return jtexts.t1("ls.off-d", "value", jshell.dec(age / 86400))
+        var ago: str = jtexts.t1("ls.off-d", "value", jshell.dec(age / 86400))
+        if age < 90 { ago = jtexts.t1("ls.off-s", "value", jshell.dec(age)) }
+        else if age < 5400 { ago = jtexts.t1("ls.off-m", "value", jshell.dec(age / 60)) }
+        else if age < 172800 { ago = jtexts.t1("ls.off-h", "value", jshell.dec(age / 3600)) }
+        return ago + " (" + why_text(slot) + ")"
     }
-    if st == 0 { return jtexts.t("ls.none") }
+    if st == 0 || st == NET_NOT_SENT { return jtexts.t("ls.none") + " - " + why_text(slot) }
     if st == 401 { return jtexts.t("ls.expired") }
     return jtexts.t1("ls.error", "value", jshell.dec(st))
 }
