@@ -1,0 +1,328 @@
+// expect_exit: 0
+// tests/4114_mc_water_height.fi -- r267 water height model (vanilla LiquidBlockRenderer): own height = amount / 9 (source 8/9 = 0.889, level 1..7 = (8 - level) / 9, falling = 8/9), top corners = weighted average of the 4 cells around the corner (cells at >= 0.8 weigh 10), water under water = 1.0, side faces shorten their V with the corner height, water next to water is culled.
+import std.rt
+import std.core
+import std.math
+import std.io
+import zip.zip
+import pack.icons
+import mc.mc_assets
+import mc.mc_texture
+import mc.mc_texext
+import mc.mc_mesh
+import mc.mc_model
+import mc.mc_model_mesh
+import mc.mc_registry
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_chunk
+import mc.mc_biome_zoom
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+
+// 16 x 16 solid colour PNG
+fn png_solid(r: u8, g: u8, b: u8, a: u8, out: *mut rt.Buf) -> bool {
+    let px: u64 = rt.heap_alloc(16 * 16 * 4)
+    var i: usize = 0
+    while i < 256 {
+        rt.st8(px, i * 4, r)
+        rt.st8(px, i * 4 + 1, g)
+        rt.st8(px, i * 4 + 2, b)
+        rt.st8(px, i * 4 + 3, a)
+        i = i + 1
+    }
+    let ok: bool = icons.png_encode(px, 16, 16, out)
+    rt.heap_free(px, 16 * 16 * 4)
+    return ok
+}
+
+fn add_text(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    var ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn add_png(w: *mut zip.ZipWriter, name: str, r: u8, g: u8, b: u8, a: u8) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    if !png_solid(r, g, b, a, &p) { return false }
+    var ok: bool = zip.zip_add(w, name, rt.buf_ptr(&p), rt.buf_len(&p), true) catch | e | (false)
+    rt.buf_free(&p)
+    return ok
+}
+
+// blockstate of a block without properties: one model for every state
+fn add_state(w: *mut zip.ZipWriter, block: str, model: str) -> bool {
+    return add_text(w, "assets/minecraft/blockstates/" + block + ".json", "{\"variants\":{\"\":{\"model\":\"" + model + "\"}}}")
+}
+
+// a model with ONE up face covering the whole top of the cell (flat on the cell face: AO applies), texture `tex`, optional tintindex 0
+fn add_up_model(w: *mut zip.ZipWriter, name: str, tex: str, tinted: bool) -> bool {
+    var tn: str = ""
+    if tinted { tn = ",\"tintindex\":0" }
+    return add_text(w, "assets/minecraft/models/block/" + name + ".json",
+        "{\"textures\":{\"t\":\"block/" + tex + "\"},\"elements\":[{\"from\":[0,0,0],\"to\":[16,16,16],\"faces\":{\"up\":{\"uv\":[0,0,16,16],\"texture\":\"#t\"" + tn + "}}}]}")
+}
+
+fn open_pack(b: *mut rt.Buf, w: *mut zip.ZipWriter, st: *mut mc_assets.PackStack) -> bool {
+    var n: usize = zip.zip_finish(w) catch | e | (0)
+    zip.zip_writer_free(w)
+    if n == 0 { return false }
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pk, rt.buf_ptr(b), rt.buf_len(b)) != mc_assets.ASSET_OK { return false }
+    rt.buf_free(b)
+    return mc_assets.stack_push(st, &pk) == mc_assets.ASSET_OK
+}
+
+fn sid(reg: *mut mc_registry.Registry, name: str) -> i32 {
+    let blk: i32 = mc_registry.reg_block_by_name(reg, name.p as u64, name.length())
+    if blk < 0 { return 0 - 1 }
+    return mc_registry.reg_block_min_state(reg, blk)
+}
+
+// cell (x, y, z) of section 0 (a 16 x 16 x 16 u16 array per section, 2 sections)
+fn put(ids: u64, x: i32, y: i32, z: i32, state: i32) {
+    rt.st16(ids, ((y * 16 + z) * 16 + x) as usize, state as u16)
+}
+
+fn new_ids() -> u64 {
+    let ids: u64 = rt.heap_alloc(2 * 4096 * 2)
+    var i: usize = 0
+    while i < 8192 {
+        rt.st16(ids, i, 0 as u16)
+        i = i + 1
+    }
+    return ids
+}
+
+fn chan(c: u32, k: i32) -> i32 {
+    return ((c >> ((k * 8) as u32)) & (255 as u32)) as i32
+}
+
+fn iabs(v: i32) -> i32 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// everything a scene needs, rebuilt per scene
+struct Scene {
+    tb: mc_mesh.MeshTables,
+    ex: mc_texext.TexExt,
+    atlas: mc_texture.Atlas,
+    an: mc_assets.AnimSet,
+}
+
+fn scene_init(sc: *mut Scene, reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack) -> bool {
+    (*sc).tb = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_texture.tex_alloc_tables(&(*sc).tb)
+    (*sc).ex = mc_texext.texext_new()
+    mc_texext.tex_build_tables_ext(reg, &(*sc).tb, &(*sc).ex)
+    (*sc).atlas = mc_texext.texext_atlas_new(16, &(*sc).ex)
+    (*sc).an = mc_assets.animset_new()
+    return mc_assets.assets_apply_ext(st, &(*sc).atlas, &(*sc).ex, &(*sc).an) >= 1
+}
+
+fn near(a: f64, b: f64) -> bool {
+    var d: f64 = a - b
+    if d < 0.0 { d = 0.0 - d }
+    return d < 0.0005
+}
+
+// meshes the pad; returns the quad count (opaque + translucent); quads are read from `outt` (the pack water texture has alpha 180) then `out`
+fn mesh(ms: *mut mc_model_mesh.ModelSet, pad: u64, tb: *mut mc_mesh.MeshTables, out: *mut rt.Buf, outt: *mut rt.Buf) -> usize {
+    let nq: usize = mc_model_mesh.ms_mesh_split_bio(ms, pad, 0, tb, 0, 0, 0, out, outt, 0)
+    return nq + rt.buf_len(outt) / 240
+}
+
+fn qw(outt: *mut rt.Buf, k: usize, w: usize) -> f64 {
+    return math.math_f64(rt.ld64(rt.buf_ptr(outt) + ((k * 240) as u64), w))
+}
+
+fn clear_pad(pad: u64) {
+    var i: usize = 0
+    while i < 5832 {
+        rt.st16(pad, i, 0 as u16)
+        i = i + 1
+    }
+}
+
+fn setp(pad: u64, x: i32, y: i32, z: i32, s: i32) {
+    rt.st16(pad, (((y + 1) * 18 + (z + 1)) * 18 + (x + 1)) as usize, s as u16)
+}
+
+// the top (shade 256) quad of the buffer: max y over its 4 corners and min y; returns count of up quads
+fn top_range(outt: *mut rt.Buf, n: usize, lo: *mut f64, hi: *mut f64) -> i32 {
+    var cnt: i32 = 0
+    var k: usize = 0
+    *lo = 99.0
+    *hi = 0.0 - 99.0
+    while k < n {
+        if qw(outt, k, 21) > 255.0 && qw(outt, k, 21) < 257.0 {
+            cnt = cnt + 1
+            var c: usize = 4
+            while c < 8 {
+                let yv: f64 = qw(outt, k, c)
+                if yv < *lo { *lo = yv }
+                if yv > *hi { *hi = yv }
+                c = c + 1
+            }
+        }
+        k = k + 1
+    }
+    return cnt
+}
+
+fn main() -> i32 {
+    var v: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(763, &v) { return 1 }
+    var reg: mc_registry.Registry = v.registry_of()
+    if !mc_registry.registry_ok(&reg) { return 2 }
+    var stk: mc_assets.PackStack = mc_assets.stack_new()
+    {
+        var b: rt.Buf = rt.buf_new()
+        var w: zip.ZipWriter = zip.zip_writer_new(&b)
+        if !add_text(&w, "pack.mcmeta", META) { return 3 }
+        if !add_png(&w, "assets/minecraft/textures/block/water_still.png", 60 as u8, 100 as u8, 200 as u8, 180 as u8) { return 3 }
+        if !open_pack(&b, &w, &stk) { return 3 }
+    }
+    var ex0: mc_texext.TexExt = mc_texext.texext_new()
+    var sc: Scene = Scene { tb: mc_mesh.MeshTables { opaque: 0, tiles: 0 }, ex: mc_texext.texext_new(), atlas: mc_texext.texext_atlas_new(16, &ex0), an: mc_assets.animset_new() }
+    if !scene_init(&sc, &reg, &stk) { return 4 }
+    var ms: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(&reg, &stk, &sc.ex)
+    mc_model_mesh.ms_set_atlas(&ms, &sc.atlas)
+    let s0: i32 = sid(&reg, "water")
+    let s_stone: i32 = sid(&reg, "stone")
+    if s0 < 0 || s_stone < 0 { return 5 }
+    mc_model_mesh.ms_set_water_tint(&ms, true)
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    var out: rt.Buf = rt.buf_new()
+    var outt: rt.Buf = rt.buf_new()
+    var lo: f64 = 0.0
+    var hi: f64 = 0.0
+
+    // A: isolated source: 6 quads; top corners all (8/9 * 10) / 12 = 0.7407 (air neighbours weigh 1 with height 0)
+    clear_pad(pad)
+    setp(pad, 8, 8, 8, s0)
+    mc_model_mesh.ms_prepare(&ms, pad, &sc.tb)
+    var n: usize = mesh(&ms, pad, &sc.tb, &out, &outt)
+    if n != 6 { return 10 }
+    if top_range(&outt, n, &lo, &hi) != 1 { return 11 }
+    if !near(lo, 8.0 + 0.74074) || !near(hi, 8.0 + 0.74074) { return 12 }
+    // side faces: the top V is shortened by (1 - corner height) = 0.7407 -> V of the top vertices 0.2593
+    var sides: i32 = 0
+    var k: usize = 0
+    while k < n {
+        let sh: f64 = qw(&outt, k, 21)
+        if sh > 150.0 && sh < 210.0 {
+            sides = sides + 1
+            var c: usize = 0
+            var vmin: f64 = 9.0
+            var vmax: f64 = 0.0 - 9.0
+            while c < 4 {
+                let vv: f64 = qw(&outt, k, 16 + c)
+                if vv < vmin { vmin = vv }
+                if vv > vmax { vmax = vv }
+                c = c + 1
+            }
+            if !near(vmin, 0.25926) || !near(vmax, 1.0) { return 13 }
+        }
+        k = k + 1
+    }
+    if sides != 4 { return 14 }
+
+    // B: levels (own height only matters for a lone block): level 1 = 7/9 -> (0.7778) / 3 = 0.2593, level 7 = 1/9 -> 0.0370, falling level 8..15 = 8/9 -> 0.7407
+    var lv: i32 = 1
+    while lv < 16 {
+        var want: f64 = 0.74074
+        if lv == 1 { want = 0.25926 }
+        if lv == 7 { want = 0.03704 }
+        if lv == 4 { want = 0.14815 } // 4/9 / 3
+        if lv == 2 || lv == 3 || lv == 5 || lv == 6 {
+            want = ((8.0 - (lv as f64)) / 9.0) / 3.0
+        }
+        clear_pad(pad)
+        setp(pad, 8, 8, 8, s0 + lv)
+        mc_model_mesh.ms_prepare(&ms, pad, &sc.tb)
+        n = mesh(&ms, pad, &sc.tb, &out, &outt)
+        if n != 6 { return 20 }
+        if top_range(&outt, n, &lo, &hi) != 1 { return 21 }
+        if !near(lo, 8.0 + want) || !near(hi, 8.0 + want) { return 22 + lv }
+        lv = lv + 1
+    }
+
+    // C: 3 x 3 source plate: centre top is flat at 8/9 = 0.8889; the rim corner (x = 6 outer) is lower; inner faces between water are culled
+    clear_pad(pad)
+    var zz: i32 = 7
+    while zz <= 9 {
+        var xx: i32 = 7
+        while xx <= 9 {
+            setp(pad, xx, 8, zz, s0)
+            xx = xx + 1
+        }
+        zz = zz + 1
+    }
+    mc_model_mesh.ms_prepare(&ms, pad, &sc.tb)
+    n = mesh(&ms, pad, &sc.tb, &out, &outt)
+    // 9 up + 9 down + 12 outer sides
+    if n != 30 { return 40 }
+    // the centre cell's up quad: all 4 corners 0.8889
+    var found: bool = false
+    k = 0
+    while k < n {
+        if qw(&outt, k, 21) > 255.0 && qw(&outt, k, 21) < 257.0 {
+            let cx0: f64 = qw(&outt, k, 0)
+            let cz0: f64 = qw(&outt, k, 8)
+            if near(cx0, 8.0) && near(cz0, 8.0) {
+                found = true
+                var c: usize = 4
+                while c < 8 {
+                    if !near(qw(&outt, k, c), 8.0 + 0.88889) { return 41 }
+                    c = c + 1
+                }
+            }
+        }
+        k = k + 1
+    }
+    if !found { return 42 }
+
+    // D: water on water: the lower cell is full height (1.0) at the top, its up face is culled, the upper one is a normal source
+    clear_pad(pad)
+    setp(pad, 8, 8, 8, s0)
+    setp(pad, 8, 9, 8, s0)
+    mc_model_mesh.ms_prepare(&ms, pad, &sc.tb)
+    n = mesh(&ms, pad, &sc.tb, &out, &outt)
+    // lower: 4 sides + down (up culled); upper: 4 sides + up (down culled) = 10
+    if n != 10 { return 50 }
+    if top_range(&outt, n, &lo, &hi) != 1 { return 51 }
+    if !near(lo, 9.0 + 0.74074) { return 52 }
+    // lower side quads reach exactly y = 9.0
+    var top9: i32 = 0
+    k = 0
+    while k < n {
+        var c: usize = 4
+        while c < 8 {
+            if near(qw(&outt, k, c), 9.0) { top9 = top9 + 1 }
+            c = c + 1
+        }
+        k = k + 1
+    }
+    // lower sides: 2 top vertices each = 8; upper sides have bottom vertices at 9.0 (the other 8 words of the upper sides at y = 9) -> 16
+    if top9 != 16 { return 53 }
+
+    // E: stone next to a source: solid neighbours are not weighed (-1), so corner touching only stone / own height: (0.8889 * 10 + 0) / 11 for one air neighbour
+    clear_pad(pad)
+    setp(pad, 8, 8, 8, s0)
+    setp(pad, 7, 8, 8, s_stone)
+    setp(pad, 7, 8, 7, s_stone)
+    setp(pad, 7, 8, 9, s_stone)
+    mc_model_mesh.ms_prepare(&ms, pad, &sc.tb)
+    n = mesh(&ms, pad, &sc.tb, &out, &outt)
+    // west side culled (stone): 5 quads
+    if n != 5 { return 60 }
+    // corner (x0, z0): h2 (north, air) 0, h3 (west, stone) -1: h2 > 0 || h3 > 0 false -> own (8.889, w10) + h3 skipped + h2 (0, w1) = 8.889 / 11 = 0.8081
+    if top_range(&outt, n, &lo, &hi) != 1 { return 61 }
+    if !near(lo, 8.0 + 0.74074) { return 62 } // east corners keep 0.7407 (two air neighbours)
+    if !near(hi, 8.0 + 0.80808) { return 63 }
+
+    mc_model_mesh.ms_free(&ms)
+    rt.heap_free(pad, 5832 * 2)
+    return 0
+}

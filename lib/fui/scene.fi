@@ -91,6 +91,7 @@ export {
     memo_style_hits, memo_style_misses, memo_box_hits, memo_box_misses,
     memo_layout_hits, memo_layout_misses,
     node_set_grow, node_set_base, node_set_bounds, node_set_align_self,
+    node_set_strict, node_set_margin, node_set_minmax, node_set_fill, node_set_aspect,
     node_set_size, node_set_viewport, node_viewport, node_set_merge,
     node_set_draw, node_style, node_decl, scene_ink_rect, scene_geom_hash, scene_layout_stable,
     node_pref_w, node_pref_h, node_x, node_y, node_w, node_h,
@@ -328,6 +329,25 @@ struct Node {
     bx1: f64,
     by1: f64,
     bxf: u32,
+    // ---- 18.10.2026: CSS-style layout extras (lib/fui/lay.fi). All zero = off,
+    // and a tree that never sets them lays out exactly as before.
+    // strict: this BOX lays its children out the CSS way (a child with an
+    // explicit cross size is not stretched; the automatic minimum of a fixed
+    // child is min(content, fixed)).
+    strict: u32,
+    fill: u32, // bit 0 = fill_w (explicit width ignored on stretch), bit 1 = fill_h
+    mg_l: i64, // margin, design points
+    mg_t: i64,
+    mg_r: i64,
+    mg_b: i64,
+    mn_w: i64, // min/max width/height, design points, 0 = none
+    mx_w: i64,
+    mn_h: i64,
+    mx_h: i64,
+    asp_w: i64, // aspect ratio (height = width * asp_h / asp_w), 0 = none
+    asp_h: i64,
+    nat_w: f64, // the measured size BEFORE any fixed size
+    nat_h: f64,
 }
 
 // The painter that a node has as long as nobody gives it one. It
@@ -411,6 +431,9 @@ fn node_blank() -> Node {
         wrap: 0, avail: 0.0 - 1.0, lines: 1, res_p: 0, res_n: 0,
         ink: 0.0 - 1.0, bx0: 0.0, by0: 0.0, bx1: 0.0, by1: 0.0,
         bxf: 0 as u32,
+        strict: 0 as u32, fill: 0 as u32, mg_l: 0, mg_t: 0, mg_r: 0, mg_b: 0,
+        mn_w: 0, mx_w: 0, mn_h: 0, mx_h: 0, asp_w: 0, asp_h: 0,
+        nat_w: 0.0, nat_h: 0.0,
     }
 }
 
@@ -1147,6 +1170,55 @@ fn node_set_align_self(sc: *mut Scene, i: usize, a: u32) {
     (*nd(sc, i)).align_self = a
 }
 
+// ---- CSS extras (lib/fui/lay.fi). Plain setters; the arithmetic is in
+// fill_items / lay_adjust below and in flex.fi.
+fn node_set_strict(sc: *mut Scene, i: usize, on: bool) {
+    if i >= (*sc).n {
+        return
+    }
+    if on {
+        (*nd(sc, i)).strict = 1 as u32
+    } else {
+        (*nd(sc, i)).strict = 0 as u32
+    }
+}
+
+fn node_set_margin(sc: *mut Scene, i: usize, l: i64, t: i64, r: i64, b: i64) {
+    if i >= (*sc).n {
+        return
+    }
+    (*nd(sc, i)).mg_l = l
+    (*nd(sc, i)).mg_t = t
+    (*nd(sc, i)).mg_r = r
+    (*nd(sc, i)).mg_b = b
+}
+
+fn node_set_minmax(sc: *mut Scene, i: usize, min_w: i64, max_w: i64,
+    min_h: i64, max_h: i64) {
+    if i >= (*sc).n {
+        return
+    }
+    (*nd(sc, i)).mn_w = min_w
+    (*nd(sc, i)).mx_w = max_w
+    (*nd(sc, i)).mn_h = min_h
+    (*nd(sc, i)).mx_h = max_h
+}
+
+fn node_set_fill(sc: *mut Scene, i: usize, bits: u32) {
+    if i >= (*sc).n {
+        return
+    }
+    (*nd(sc, i)).fill = bits
+}
+
+fn node_set_aspect(sc: *mut Scene, i: usize, w: i64, h: i64) {
+    if i >= (*sc).n {
+        return
+    }
+    (*nd(sc, i)).asp_w = w
+    (*nd(sc, i)).asp_h = h
+}
+
 // HIDDEN (29.09.2026): the node and everything under it is laid out as
 // always but neither painted nor hit -- CSS `visibility: hidden`. What a
 // page does with it (examples/codehub): paint the still part of a picture
@@ -1521,7 +1593,12 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
         if (*nd).res_n > 0 {
             widget.w_set_text(&(*nd).e, (*nd).res_p, (*nd).res_n)
         }
-        if !memo_get(sc, c, i, &pw, &ph) {
+        if (*nd).kind == N_BOX && (*nd).parent != SCENE_NONE
+            && (*nd(sc, (*nd).parent)).strict != (0 as u32) {
+            // an EMPTY block in a CSS-style box has no size of its own (a div)
+            pw = 0.0
+            ph = 0.0
+        } else if !memo_get(sc, c, i, &pw, &ph) {
             render.pref_of(c, &(*nd).e, &pw, &ph)
             if (*nd).wrap > 0 && widget.w_text_len(&(*nd).e) != 0 {
                 measure_para(sc, c, i, &pw, &ph)
@@ -1557,6 +1634,12 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
             var fixed_main: f64 = (*nd).fix_h
             if line {
                 fixed_main = (*nd).fix_w
+            }
+            // a wrapping CSS-style row measures its height at the width the
+            // last layout gave it (reflow, like a paragraph)
+            if line && (*nd).strict != (0 as u32) && fb.wrap != flex.WRAP_NONE
+                && fixed_main <= 0.0 && (*nd).avail > 0.0 {
+                fixed_main = (*nd).avail
             }
             if fixed_main > 0.0 {
                 q = flex.flex_measure_cross_wrap(&fb, &items[0], n,
@@ -1598,6 +1681,8 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     // way of calculating for the scale, at scale 1000
     // `len_of(n) == n` and every previous picture stays pixel for pixel
     // the same.
+    (*nd).nat_w = pw
+    (*nd).nat_h = ph
     let st: *mut style.Style = widget.w_style(&(*nd).e)
     if style.style_has_width(st) {
         pw = render.len_of(c, style.style_width(st))
@@ -1610,6 +1695,9 @@ fn measure_node(sc: *mut Scene, c: *mut render.Ctx, i: usize) {
     }
     if (*nd).fix_h > 0.0 {
         ph = px_of(c, (*nd).fix_h)
+    }
+    if (*nd).asp_w > 0 && (*nd).asp_h > 0 && (*nd).fix_h <= 0.0 && pw > 0.0 {
+        ph = (((pw as i64) * (*nd).asp_h / (*nd).asp_w) as f64)
     }
     (*nd).pw = pw
     (*nd).ph = ph
@@ -1647,6 +1735,17 @@ fn para_widths(sc: *mut Scene, c: *mut render.Ctx) -> bool {
     var i: usize = 0
     while i < (*sc).n {
         let nd: *mut Node = &(*nd(sc, i))
+        if (*nd).strict != (0 as u32) && (*nd).nkids > 0 && (*nd).fb.wrap != flex.WRAP_NONE
+            && flex.flex_is_row(&(*nd).fb) && (*nd).fix_w <= 0.0 {
+            var dw: f64 = (*nd).w - (*nd).avail
+            if dw < 0.0 {
+                dw = 0.0 - dw
+            }
+            if (*nd).avail < 0.0 || dw > 0.5 {
+                (*nd).avail = (*nd).w
+                changed = true
+            }
+        }
         if (*nd).wrap > 0 && (*nd).nkids == 0 && (*nd).fix_w <= 0.0 {
             var a: f64 = (*nd).w
             let p: usize = (*nd).parent
@@ -1720,6 +1819,9 @@ fn fill_items(sc: *mut Scene, cx: *mut render.Ctx, i: usize,
         if (*kid).wrap > 0 && line && (*kid).min_main == 0 {
             it.min_main = 0
         }
+        if (*nd).strict != (0 as u32) || kid_extras(kid) {
+            item_extras(cx, nd, kid, &it, line)
+        }
         // The same rule as for the chain above: the stride of a
         // FlexItem is known by flex.fi, not by this module.
         *((items as u64 + (n * flex.flex_item_stride()) as u64)
@@ -1737,6 +1839,157 @@ fn fill_items(sc: *mut Scene, cx: *mut render.Ctx, i: usize,
         (*sc).kidof = (*sc).kidof + 1
     }
     return n
+}
+
+
+// ======================================================================
+// CSS EXTRAS (lib/fui/lay.fi): margins, min/max, strict stretch, aspect
+// ======================================================================
+//
+// Margins are done by INFLATION: the flex item is made bigger by the margins
+// (basis, cross, bounds), flex.fi distributes as always, and `lay_adjust`
+// shrinks the finished rectangle by the margins again. Free space, grow and
+// stretch come out as in CSS. (Known difference: CSS scales the shrink share
+// by the size WITHOUT margins, flex.fi by the inflated size -- only visible
+// with margins AND shrinking children together.)
+fn kid_extras(kid: *mut Node) -> bool {
+    return (*kid).mg_l != 0 || (*kid).mg_t != 0 || (*kid).mg_r != 0
+        || (*kid).mg_b != 0 || (*kid).mn_w != 0 || (*kid).mx_w != 0
+        || (*kid).mn_h != 0 || (*kid).mx_h != 0 || (*kid).asp_w != 0
+}
+
+fn has_fixed(kid: *mut Node, horiz: bool) -> bool {
+    let st: *mut style.Style = widget.w_style(&(*kid).e)
+    if horiz {
+        return (*kid).fix_w > 0.0 || style.style_has_width(st)
+    }
+    return (*kid).fix_h > 0.0 || style.style_has_height(st)
+}
+
+fn min_i64(a: i64, b: i64) -> i64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn item_extras(cx: *mut render.Ctx, par: *mut Node, kid: *mut Node,
+    it: *mut flex.FlexItem, line: bool) {
+    let strict: bool = (*par).strict != (0 as u32)
+    var fixed_main: bool = has_fixed(kid, line)
+    var fixed_cross: bool = has_fixed(kid, !line)
+    var fill_main: bool = ((*kid).fill & 1) != (0 as u32)
+    var fill_cross: bool = ((*kid).fill & 2) != (0 as u32)
+    if !line {
+        fill_main = ((*kid).fill & 2) != (0 as u32)
+        fill_cross = ((*kid).fill & 1) != (0 as u32)
+    }
+    var mn_m: i64 = (*kid).mn_h
+    var mx_m: i64 = (*kid).mx_h
+    var mn_c: i64 = (*kid).mn_w
+    var mx_c: i64 = (*kid).mx_w
+    var nat: f64 = (*kid).nat_h
+    var pref: f64 = (*kid).ph
+    if line {
+        mn_m = (*kid).mn_w
+        mx_m = (*kid).mx_w
+        mn_c = (*kid).mn_h
+        mx_c = (*kid).mx_h
+        nat = (*kid).nat_w
+        pref = (*kid).pw
+    }
+    if strict {
+        // css-flexbox-1 4.5: the automatic minimum is min(content, specified)
+        var mm: i64 = flex.flex_px(nat)
+        if fill_main {
+            mm = 0
+        } else if fixed_main {
+            mm = min_i64(mm, flex.flex_px(pref))
+        }
+        if (*kid).wrap > 0 && line {
+            mm = 0
+        }
+        (*it).min_main = mm
+        var al: u32 = (*it).align
+        if al == flex.AL_AUTO {
+            al = (*par).fb.align_items
+        }
+        if al == flex.AL_STRETCH && fixed_cross && !fill_cross {
+            (*it).align = flex.AL_START
+        }
+    }
+    if mn_m > 0 {
+        (*it).min_main = render.len_signed(cx, mn_m) as i64
+    }
+    if mx_m > 0 {
+        (*it).max_main = render.len_signed(cx, mx_m) as i64
+    }
+    // the cross size of the item (what makes the line high) obeys min/max too
+    if mn_c > 0 && (*it).cross < render.len_signed(cx, mn_c) as i64 {
+        (*it).cross = render.len_signed(cx, mn_c) as i64
+    }
+    if mx_c > 0 && (*it).cross > render.len_signed(cx, mx_c) as i64 {
+        (*it).cross = render.len_signed(cx, mx_c) as i64
+    }
+    var ml: i64 = render.len_signed(cx, (*kid).mg_l) as i64
+    var mt: i64 = render.len_signed(cx, (*kid).mg_t) as i64
+    var mr: i64 = render.len_signed(cx, (*kid).mg_r) as i64
+    var mb: i64 = render.len_signed(cx, (*kid).mg_b) as i64
+    var mm_: i64 = mt + mb
+    var mc_: i64 = ml + mr
+    if line {
+        mm_ = ml + mr
+        mc_ = mt + mb
+    }
+    (*it).basis = (*it).basis + mm_
+    (*it).mgn = mm_
+    (*it).cross = (*it).cross + mc_
+    (*it).min_main = (*it).min_main + mm_
+    if (*it).max_main > 0 {
+        (*it).max_main = (*it).max_main + mm_
+    }
+}
+
+fn clamp_i(v: f64, lo: f64, hi: f64) -> f64 {
+    var r: f64 = v
+    if hi > 0.0 && r > hi {
+        r = hi
+    }
+    if lo > 0.0 && r < lo {
+        r = lo
+    }
+    return r
+}
+
+// The finished rectangle of a child, shrunk by its margins and clamped by
+// its min/max (and given its aspect ratio).
+fn lay_adjust(cx: *mut render.Ctx, kid: *mut Node, x: *mut f64, y: *mut f64,
+    w: *mut f64, h: *mut f64) {
+    let ml: f64 = render.len_signed(cx, (*kid).mg_l) as f64
+    let mt: f64 = render.len_signed(cx, (*kid).mg_t) as f64
+    let mr: f64 = render.len_signed(cx, (*kid).mg_r) as f64
+    let mb: f64 = render.len_signed(cx, (*kid).mg_b) as f64
+    var nx: f64 = *x + ml
+    var ny: f64 = *y + mt
+    var nw: f64 = *w - ml - mr
+    var nh: f64 = *h - mt - mb
+    if nw < 0.0 {
+        nw = 0.0
+    }
+    if nh < 0.0 {
+        nh = 0.0
+    }
+    nw = clamp_i(nw, render.len_signed(cx, (*kid).mn_w) as f64,
+        render.len_signed(cx, (*kid).mx_w) as f64)
+    if (*kid).asp_w > 0 && (*kid).asp_h > 0 && (*kid).fix_h <= 0.0 {
+        nh = (((nw as i64) * (*kid).asp_h / (*kid).asp_w) as f64)
+    }
+    nh = clamp_i(nh, render.len_signed(cx, (*kid).mn_h) as f64,
+        render.len_signed(cx, (*kid).mx_h) as f64)
+    *x = nx
+    *y = ny
+    *w = nw
+    *h = nh
 }
 
 // A FIXED SIZE INTO PIXELS. `node_set_size` takes a
@@ -2171,6 +2424,12 @@ fn box_key(sc: *mut Scene, i: usize) -> u64 {
     h = mix(h, (*fb).pad_b as u64)
     h = mix_f64(h, (*nd).fix_w)
     h = mix_f64(h, (*nd).fix_h)
+    if (*nd).strict != (0 as u32) {
+        h = mix(h, 0x57C1)
+        if (*fb).wrap != flex.WRAP_NONE {
+            h = mix_f64(h, (*nd).avail)
+        }
+    }
     if (*nd).grid != (0 as u32) {
         h = mix(h, grid.gs_hash(grid_pool_slot(sc, i)))
     }
@@ -2188,6 +2447,19 @@ fn box_key(sc: *mut Scene, i: usize) -> u64 {
         h = mix(h, (*kid).max_main as u64)
         h = mix(h, (*kid).align_self as u64)
         h = mix(h, (*kid).wrap as u64)
+        if kid_extras(kid) || (*kid).fill != (0 as u32) {
+            h = mix(h, (*kid).mg_l as u64)
+            h = mix(h, (*kid).mg_t as u64)
+            h = mix(h, (*kid).mg_r as u64)
+            h = mix(h, (*kid).mg_b as u64)
+            h = mix(h, (*kid).mn_w as u64)
+            h = mix(h, (*kid).mx_w as u64)
+            h = mix(h, (*kid).mn_h as u64)
+            h = mix(h, (*kid).mx_h as u64)
+            h = mix(h, (*kid).asp_w as u64)
+            h = mix(h, (*kid).asp_h as u64)
+            h = mix(h, (*kid).fill as u64)
+        }
         h = mix(h, (*ms(m, k)).lk)
         k = (*kid).next
     }
@@ -2363,10 +2635,14 @@ fn layout_node(sc: *mut Scene, c: *mut render.Ctx, i: usize, x: f64,
     var k: usize = (*nd).first
     var j: usize = 0
     while k != SCENE_NONE && j < n {
-        layout_node(sc, c, k, layout.rect_x(&out[j]) as f64,
-            layout.rect_y(&out[j]) as f64,
-            layout.rect_w(&out[j]) as f64,
-            layout.rect_h(&out[j]) as f64)
+        var rx: f64 = layout.rect_x(&out[j]) as f64
+        var ry: f64 = layout.rect_y(&out[j]) as f64
+        var rw: f64 = layout.rect_w(&out[j]) as f64
+        var rh: f64 = layout.rect_h(&out[j]) as f64
+        if kid_extras(&(*nd(sc, k))) {
+            lay_adjust(c, &(*nd(sc, k)), &rx, &ry, &rw, &rh)
+        }
+        layout_node(sc, c, k, rx, ry, rw, rh)
         k = (*nd(sc, k)).next
         j = j + 1
     }

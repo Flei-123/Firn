@@ -1,0 +1,221 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/@android/plat/javaexc.fi -- the Android side of lib/plat/javaexc.fi: an uncaught exception on ANY Java thread leaves its stack
+// trace in a file, then the process dies the way it always did.
+//
+// A Java exception never reaches lib/@android/plat/sigdump.fi (no signal) and the logcat of the next start only keeps a few hundred
+// lines; the crash page needs the trace itself. The handler is the class org.firn.FirnCrash (tools/android/servicedex_main.fi), which
+// the dex writer makes a subclass of java.lang.ThreadGroup: a ThreadGroup IS a Thread.UncaughtExceptionHandler, so the class needs no
+// interface list. Its one native method `uncaughtException(Thread, Throwable)` is Java_org_firn_FirnCrash_uncaughtException below:
+//
+//     public class FirnCrash extends ThreadGroup {
+//         public native void uncaughtException(Thread t, Throwable e);   // 1. write file, 2. hand on to the previous default handler
+//     }
+//
+// WHY THE PREVIOUS HANDLER IS CALLED: Android's own default handler (KillApplicationHandler) logs "FATAL EXCEPTION" and kills the
+// process; without it the app would live on with a dead thread.
+//
+// All of it is #[no_gc]: the handler runs on whatever Java thread died, never on the Firn loop. Static buffers, write(2), JNI only.
+// The class is found through the ACTIVITY'S class loader (FindClass from a native thread only sees the system loader).
+//
+//   je_install(path)    app thread, once: opens the file (append), loads FirnCrash, makes one, sets it as the default handler
+//   je_test_throw()     test hook (args.txt word `javaexc`): starts a org.firn.FirnBoom thread; its native run() throws a RuntimeException
+import std.rt
+import std.fs
+import android.ndk
+import android.activity
+import android.jnicall
+
+export { je_install, je_available, je_test_throw, Java_org_firn_FirnCrash_uncaughtException, Java_org_firn_FirnBoom_run }
+
+#[no_gc]
+extern fn write(fd: i32, buf: u64, n: usize) -> i64;
+
+static mut G_FD: i64 = -1
+static mut G_BUSY: i64 = 0
+static mut G_PREV: u64 = 0
+static mut G_SELF: u64 = 0
+static mut G_LOADER: u64 = 0
+
+fn je_available() -> bool { return true }
+
+#[no_gc]
+fn out_cstr(p: u64) {
+    if p == 0 || G_FD < 0 { return }
+    var n: usize = 0
+    while rt.ld8(p, n) != 0 as u8 { n = n + 1 }
+    if n > 0 {
+        let w: i64 = write(G_FD as i32, p, n)
+    }
+}
+
+#[no_gc]
+fn out_lit(p: u64, n: usize) {
+    if G_FD < 0 { return }
+    let w: i64 = write(G_FD as i32, p, n)
+}
+
+// the stack trace of `thw` and the name of `thr` into the file
+#[no_gc]
+fn dump(env: u64, thr: u64, thw: u64) {
+    var s_head: [u8; _] = "java exception\nthread: "
+    var s_nl: [u8; _] = "\n"
+    var c_thr: [u8; _] = "java/lang/Thread\0"
+    var n_name: [u8; _] = "getName\0"
+    var s_str: [u8; _] = "()Ljava/lang/String;\0"
+    var c_log: [u8; _] = "android/util/Log\0"
+    var n_trace: [u8; _] = "getStackTraceString\0"
+    var s_trace: [u8; _] = "(Ljava/lang/Throwable;)Ljava/lang/String;\0"
+    out_lit((&s_head[0]) as u64, 23)
+    let kt: u64 = jnicall.j_class(env, (&c_thr[0]) as u64)
+    let nm: u64 = jnicall.j_obj(env, thr, jnicall.j_method(env, kt, (&n_name[0]) as u64, (&s_str[0]) as u64), 0)
+    let nc: u64 = jnicall.j_utf_chars(env, nm)
+    out_cstr(nc)
+    jnicall.j_utf_release(env, nm, nc)
+    out_lit((&s_nl[0]) as u64, 1)
+    var a: [u64; 1] = [0; 1]
+    a[0] = thw
+    let kl: u64 = jnicall.j_class(env, (&c_log[0]) as u64)
+    let tr: u64 = jnicall.j_sobj(env, kl, jnicall.j_smethod(env, kl, (&n_trace[0]) as u64, (&s_trace[0]) as u64), (&a[0]) as u64)
+    let tc: u64 = jnicall.j_utf_chars(env, tr)
+    out_cstr(tc)
+    jnicall.j_utf_release(env, tr, tc)
+    out_lit((&s_nl[0]) as u64, 1)
+}
+
+// the previous default handler gets the exception as if we had never been there (it logs and kills the process)
+#[no_gc]
+fn chain(env: u64, thr: u64, thw: u64) {
+    if G_PREV == 0 { return }
+    var n_unc: [u8; _] = "uncaughtException\0"
+    var s_unc: [u8; _] = "(Ljava/lang/Thread;Ljava/lang/Throwable;)V\0"
+    var a: [u64; 2] = [0; 2]
+    a[0] = thr
+    a[1] = thw
+    let k: u64 = jnicall.j_obj_class(env, G_PREV)
+    let m: u64 = jnicall.j_method(env, k, (&n_unc[0]) as u64, (&s_unc[0]) as u64)
+    let ok: bool = jnicall.j_void(env, G_PREV, m, (&a[0]) as u64)
+}
+
+// FirnCrash.uncaughtException(thread, throwable)
+#[export_c]
+#[no_gc]
+fn Java_org_firn_FirnCrash_uncaughtException(env: u64, this: u64, thr: u64, thw: u64) {
+    if G_BUSY == 0 && G_FD >= 0 {
+        G_BUSY = 1
+        dump(env, thr, thw)
+        G_BUSY = 0
+    }
+    chain(env, thr, thw)
+}
+
+// FirnBoom.run(): the test hook's thread body -- throws, and nobody catches it
+#[export_c]
+#[no_gc]
+fn Java_org_firn_FirnBoom_run(env: u64, this: u64) {
+    var c_rt: [u8; _] = "java/lang/RuntimeException\0"
+    var s_msg: [u8; _] = "firn test exception (javaexc hook)\0"
+    let k: u64 = jnicall.j_class(env, (&c_rt[0]) as u64)
+    let t: bool = jnicall.j_throw_new(env, k, (&s_msg[0]) as u64)
+}
+
+// the app's JNI environment and the class loader of the app (0 when there is no activity yet)
+#[no_gc]
+fn loader_of(envp: *mut u64) -> u64 {
+    if G_LOADER != 0 {
+        let a0: u64 = activity.activity_pointer()
+        if a0 == 0 { return 0 }
+        let e0: u64 = jnicall.j_env(ndk.peek64(a0 + 8))
+        *envp = e0
+        return G_LOADER
+    }
+    var c_ctx: [u8; _] = "android/content/Context\0"
+    var n_gcl: [u8; _] = "getClassLoader\0"
+    var s_gcl: [u8; _] = "()Ljava/lang/ClassLoader;\0"
+    let act: u64 = activity.activity_pointer()
+    if act == 0 { return 0 }
+    let env: u64 = jnicall.j_env(ndk.peek64(act + 8))
+    let ctx: u64 = ndk.peek64(act + 24)
+    if env == 0 || ctx == 0 { return 0 }
+    let kc: u64 = jnicall.j_class(env, (&c_ctx[0]) as u64)
+    let ld: u64 = jnicall.j_obj(env, ctx, jnicall.j_method(env, kc, (&n_gcl[0]) as u64, (&s_gcl[0]) as u64), 0)
+    if ld == 0 { return 0 }
+    G_LOADER = jnicall.j_global(env, ld)
+    jnicall.j_del(env, ld)
+    *envp = env
+    return G_LOADER
+}
+
+// ClassLoader.loadClass(name) with a dotted name; 0 when the app has no such class (an older APK)
+#[no_gc]
+fn load_class(env: u64, loader: u64, dotted: u64) -> u64 {
+    var c_cl: [u8; _] = "java/lang/ClassLoader\0"
+    var n_lc: [u8; _] = "loadClass\0"
+    var s_lc: [u8; _] = "(Ljava/lang/String;)Ljava/lang/Class;\0"
+    var a: [u64; 1] = [0; 1]
+    let js: u64 = jnicall.j_str(env, dotted)
+    a[0] = js
+    let kl: u64 = jnicall.j_class(env, (&c_cl[0]) as u64)
+    let r: u64 = jnicall.j_obj(env, loader, jnicall.j_method(env, kl, (&n_lc[0]) as u64, (&s_lc[0]) as u64), (&a[0]) as u64)
+    jnicall.j_del(env, js)
+    return r
+}
+
+#[no_gc]
+fn hook() -> bool {
+    var c_name: [u8; _] = "org.firn.FirnCrash\0"
+    var c_thr: [u8; _] = "java/lang/Thread\0"
+    var n_init: [u8; _] = "<init>\0"
+    var s_init: [u8; _] = "(Ljava/lang/String;)V\0"
+    var n_get: [u8; _] = "getDefaultUncaughtExceptionHandler\0"
+    var s_get: [u8; _] = "()Ljava/lang/Thread$UncaughtExceptionHandler;\0"
+    var n_set: [u8; _] = "setDefaultUncaughtExceptionHandler\0"
+    var s_set: [u8; _] = "(Ljava/lang/Thread$UncaughtExceptionHandler;)V\0"
+    var tag: [u8; _] = "firn-crash\0"
+    var env: u64 = 0
+    let loader: u64 = loader_of(&env)
+    if loader == 0 || env == 0 { return false }
+    let kc: u64 = load_class(env, loader, (&c_name[0]) as u64)
+    if kc == 0 { return false }
+    var a: [u64; 1] = [0; 1]
+    let js: u64 = jnicall.j_str(env, (&tag[0]) as u64)
+    a[0] = js
+    let self_obj: u64 = jnicall.j_new(env, kc, jnicall.j_method(env, kc, (&n_init[0]) as u64, (&s_init[0]) as u64), (&a[0]) as u64)
+    jnicall.j_del(env, js)
+    if self_obj == 0 { return false }
+    let kt: u64 = jnicall.j_class(env, (&c_thr[0]) as u64)
+    let prev: u64 = jnicall.j_sobj(env, kt, jnicall.j_smethod(env, kt, (&n_get[0]) as u64, (&s_get[0]) as u64), 0)
+    G_PREV = jnicall.j_global(env, prev)
+    G_SELF = jnicall.j_global(env, self_obj)
+    a[0] = G_SELF
+    return jnicall.j_svoid(env, kt, jnicall.j_smethod(env, kt, (&n_set[0]) as u64, (&s_set[0]) as u64), (&a[0]) as u64)
+}
+
+// `path`: the trace file (appended to, created). The caller reads and removes an older one BEFORE this call.
+fn je_install(path: str) -> bool {
+    if path.n == 0 || path.n > 500 { return false }
+    let fd: i64 = fs.open_append(path) catch -1
+    if fd < 0 { return false }
+    G_FD = fd
+    return hook()
+}
+
+// the test hook: a REAL uncaught exception on a Java thread (the thread dies, the previous handler kills the process)
+#[no_gc]
+fn test_throw() -> bool {
+    var c_name: [u8; _] = "org.firn.FirnBoom\0"
+    var n_init: [u8; _] = "<init>\0"
+    var s_v: [u8; _] = "()V\0"
+    var c_thr: [u8; _] = "java/lang/Thread\0"
+    var n_start: [u8; _] = "start\0"
+    var env: u64 = 0
+    let loader: u64 = loader_of(&env)
+    if loader == 0 || env == 0 { return false }
+    let kb: u64 = load_class(env, loader, (&c_name[0]) as u64)
+    if kb == 0 { return false }
+    let th: u64 = jnicall.j_new(env, kb, jnicall.j_method(env, kb, (&n_init[0]) as u64, (&s_v[0]) as u64), 0)
+    if th == 0 { return false }
+    let kt: u64 = jnicall.j_class(env, (&c_thr[0]) as u64)
+    return jnicall.j_void(env, th, jnicall.j_method(env, kt, (&n_start[0]) as u64, (&s_v[0]) as u64), 0)
+}
+
+fn je_test_throw() -> bool { return test_throw() }
