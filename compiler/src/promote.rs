@@ -120,6 +120,10 @@ pub(crate) fn for_each_use_mut(op: &mut Op, mut g: impl FnMut(&mut Val)) {
         }
         Op::CheckedCast { src, .. } => g(src),
         Op::CheckedIdx { idx, .. } => g(idx),
+        Op::CheckedIdxV { idx, len, .. } => {
+            g(idx);
+            g(len);
+        }
         Op::Cmp { a, b, .. } => {
             g(a);
             g(b);
@@ -452,6 +456,7 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>], guard: bool) -> 
                     | Op::CheckedDiv { .. }
                     | Op::CheckedCast { .. }
                     | Op::CheckedIdx { .. }
+                    | Op::CheckedIdxV { .. }
             );
             if !again {
                 return false;

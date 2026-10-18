@@ -326,7 +326,9 @@ pub(crate) fn hook_assign(lo: &mut Lower, target: &Expr, addr: Val) -> Option<()
     // lives on the stack.
     let ins_heap = match &target.kind {
         ExprKind::Field(base, _, _) => gc::is_gc_ptr(&lo.ty_of(base)) || is_ptr(&lo.ty_of(base)),
-        ExprKind::Index(base, _) => is_ptr(&lo.ty_of(base)),
+        ExprKind::Index(base, _) => {
+            is_ptr(&lo.ty_of(base)) || crate::foreach::seq_struct(&lo.info.tcx, &lo.ty_of(base)).is_some()
+        }
         ExprKind::Unary(crate::ast::UnOp::Deref, _) => true,
         _ => false,
     };

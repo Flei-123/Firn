@@ -768,6 +768,7 @@ fn foldable_def(op: &Op) -> bool {
             | Op::CheckedDiv { .. }
             | Op::CheckedCast { .. }
             | Op::CheckedIdx { .. }
+            | Op::CheckedIdxV { .. }
             | Op::Cmp { .. }
             | Op::Un(..)
             | Op::Cast { .. }

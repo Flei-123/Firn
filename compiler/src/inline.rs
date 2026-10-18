@@ -553,6 +553,9 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val, blockmap: Option<&HashMap<u32, u32
         Op::CheckedIdx { idx, len, msg } => {
             Op::CheckedIdx { idx: mv(*idx), len: *len, msg: msg.clone() }
         }
+        Op::CheckedIdxV { idx, len, msg } => {
+            Op::CheckedIdxV { idx: mv(*idx), len: mv(*len), msg: msg.clone() }
+        }
         Op::Cmp { op, ty, a, b } => Op::Cmp { op: *op, ty: *ty, a: mv(*a), b: mv(*b) },
         Op::Un(o, a) => Op::Un(*o, mv(*a)),
         Op::Cast { src, from } => Op::Cast { src: mv(*src), from: *from },

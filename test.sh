@@ -268,6 +268,11 @@ run_case() {          # $1 = file, $2 = "opt" | "noopt" | "devfast" | "safe"
     if [ "$mode" != "opt" ] && head -5 "$file" | grep -q '^// only_mode: opt$'; then
         return
     fi
+    # r724: `// not_mode: opt` on line 2 = a program that proves a run-time check
+    # (panic) and therefore cannot run in release-fast, where nothing is checked.
+    if [ "$mode" = "opt" ] && head -5 "$file" | grep -q '^// not_mode: opt$'; then
+        return
+    fi
     bin="$WORK/${base}.${mode}"
     # ROUND 72: `mode=opt` used to mean "no flag at all", which quietly
     # meant `release-fast` ONLY as long as `OptConfig::default()` itself

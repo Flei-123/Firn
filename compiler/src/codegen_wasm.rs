@@ -643,7 +643,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
                     }
                     Op::Asm { .. } => refusals.push(Refusal { func: name.clone(), what: "inline assembler (it is x86 text)".into() }),
                     Op::ThreadSpawn { .. } => refusals.push(Refusal { func: name.clone(), what: "a thread start (threads are not supported on wasm32 yet)".into() }),
-                    Op::CheckedBin { msg, .. } | Op::CheckedCast { msg, .. } | Op::CheckedIdx { msg, .. } => {
+                    Op::CheckedBin { msg, .. } | Op::CheckedCast { msg, .. } | Op::CheckedIdx { msg, .. } | Op::CheckedIdxV { msg, .. } => {
                         if !msgs.contains(msg) {
                             msgs.push(msg.clone());
                         }
@@ -2658,6 +2658,29 @@ impl<'a> Fx<'a> {
                 self.ins(Ins::End);
                 self.get(*idx, class(ty).unwrap_or(VT::I64));
                 self.put(i, class(ty).unwrap_or(VT::I64));
+                self.release(VT::I64, v);
+            }
+            Op::CheckedIdxV { idx, len, msg } => {
+                let v = self.tmp(VT::I64);
+                let n = self.tmp(VT::I64);
+                self.get_ext64(*len, FTy::U64);
+                self.ins(Ins::LocalSet(n));
+                self.get_ext64(*idx, ty);
+                self.ins(Ins::LocalTee(v));
+                self.ins(Ins::LocalGet(n));
+                self.num(w::I64_GE_U);
+                self.ins(Ins::If);
+                self.ins(Ins::I32Const(1));
+                self.msg(msg)?;
+                self.ins(Ins::LocalGet(v));
+                self.ins(Ins::LocalGet(n));
+                self.ins(Ins::I64Const(crate::panic_rt::PANIC_INDEX as i64));
+                self.ins(Ins::I32Const(1));
+                self.ins(Ins::Call(self.g.rt.panic));
+                self.ins(Ins::End);
+                self.get(*idx, class(ty).unwrap_or(VT::I64));
+                self.put(i, class(ty).unwrap_or(VT::I64));
+                self.release(VT::I64, n);
                 self.release(VT::I64, v);
             }
             Op::Simd { kind, args, imm } if *kind != crate::simd::SimdKind::CpuFeatures && simd_on() => {

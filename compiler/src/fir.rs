@@ -264,6 +264,10 @@ pub enum Op {
     /// enough: an index is a `usize` (SPEC §14.1 item 2), so "below zero"
     /// is not a state it can be in.
     CheckedIdx { idx: Val, len: u64, msg: String },
+    /// r724: the checked index with a length known only at run time (`Vec`,
+    /// `str`: the length is a loaded word). Same contract as `CheckedIdx`:
+    /// hands `idx` back when `idx < len` (unsigned) and panics otherwise.
+    CheckedIdxV { idx: Val, len: Val, msg: String },
     /// stack storage of the function (allowed in the entry block only)
     Alloca { size: u64, align: u64 },
     Load { addr: Val },
@@ -446,7 +450,8 @@ impl Op {
             Op::CheckedBin { .. }
             | Op::CheckedDiv { .. }
             | Op::CheckedCast { .. }
-            | Op::CheckedIdx { .. } => false,
+            | Op::CheckedIdx { .. }
+            | Op::CheckedIdxV { .. } => false,
             Op::Store { .. }
             | Op::Call { .. }
             | Op::CallIndirect { .. }
@@ -501,6 +506,10 @@ impl Op {
             }
             Op::CheckedCast { src, .. } => rep(src),
             Op::CheckedIdx { idx, .. } => rep(idx),
+            Op::CheckedIdxV { idx, len, .. } => {
+                rep(idx);
+                rep(len);
+            }
             Op::Cmp { a, b: b2, .. } => {
                 rep(a);
                 rep(b2);
@@ -595,6 +604,10 @@ impl Op {
             }
             Op::CheckedCast { src, .. } => out.push(*src),
             Op::CheckedIdx { idx, .. } => out.push(*idx),
+            Op::CheckedIdxV { idx, len, .. } => {
+                out.push(*idx);
+                out.push(*len);
+            }
             Op::Cmp { a, b, .. } => {
                 out.push(*a);
                 out.push(*b);
@@ -1099,6 +1112,9 @@ pub(crate) fn fmt_inst(i: &Inst) -> String {
         }
         Op::CheckedIdx { idx, len, msg } => {
             format!("checked_idx.{} %{}, len={} \"{}\"", t, idx, len, asm_escape(msg))
+        }
+        Op::CheckedIdxV { idx, len, msg } => {
+            format!("checked_idxv.{} %{}, len=%{} \"{}\"", t, idx, len, asm_escape(msg))
         }
         Op::Cmp { op, ty, a, b } => format!("cmp.{}.{} %{}, %{}", op.name(), ty.name(), a, b),
         Op::Un(op, a) => match op {

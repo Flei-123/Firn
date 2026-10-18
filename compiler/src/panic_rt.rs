@@ -866,6 +866,19 @@ pub(crate) fn emit_checked_idx(e: &mut Emitter, len: u64, msg: &str, site: &mut 
     e.raw(&format!("{}:", ok));
 }
 
+/// r724: the checked index with a run-time length. The caller has the index
+/// in `rax` and the length in `rcx`; one unsigned compare decides both ends.
+pub(crate) fn emit_checked_idx_v(e: &mut Emitter, msg: &str, site: &mut SiteCounter) {
+    note_index_site();
+    let label = intern(msg);
+    let uid = site.next();
+    let ok = format!(".Lchkidx{}", uid);
+    e.line("cmp rax, rcx");
+    e.line(&format!("jb {}", ok));
+    emit_trampoline_jump_to(e, TRAMPOLINE_INDEX, PANIC_INDEX, &label, msg, "rax", "rcx", true);
+    e.raw(&format!("{}:", ok));
+}
+
 /// Like [`emit_trampoline_jump`], but into a NAMED entry point — round 89
 /// gave the trampoline a second one so that a bounds panic can say
 /// `index=`/`len=` instead of `a=`/`b=`.

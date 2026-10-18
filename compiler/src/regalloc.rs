@@ -422,6 +422,8 @@ fn inst_clobbers(i: &Inst) -> RegMask {
         // left to the `_` arm so the next reader does not have to go and
         // look it up in panic_rt.rs.
         Op::CheckedIdx { .. } => 0,
+        // loads the length into rcx, never returns on failure; rdx untouched
+        Op::CheckedIdxV { .. } => 0,
         // `+% -% *%` is bit for bit the unchecked path (two operand `imul`).
         // `+| -| *|` clamps with `mov rdx, <bound>` + `cmovl` for the signed
         // types, and multiplies through the one-operand `mul` for the
@@ -6790,6 +6792,13 @@ fn emit_inst(
             let d = i.dst.ok_or("internal error: checked index without target")?;
             ra.load_ext(e, "rax", *idx, ty, 64);
             crate::panic_rt::emit_checked_idx(e, *len, msg, site);
+            ra.store_dst(e, d, "rax");
+        }
+        Op::CheckedIdxV { idx, len, msg } => {
+            let d = i.dst.ok_or("internal error: checked index without target")?;
+            ra.load_ext(e, "rax", *idx, ty, 64);
+            ra.load_ext(e, "rcx", *len, FTy::U64, 64);
+            crate::panic_rt::emit_checked_idx_v(e, msg, site);
             ra.store_dst(e, d, "rax");
         }
         // ROUND 72 -- explicit "+% -% *%" / "+| -| *|" (SPEC section 13,

@@ -1799,8 +1799,16 @@ constants declared before it, and '+ - * /'"
                 Some((ty, m))
             }
             ExprKind::Index(base, idx) => {
-                let (bt, m) = self.lvalue(base)?;
+                let (bt, mut m) = self.lvalue(base)?;
                 let ty = self.index_type(&bt, idx, base.span);
+                // r724: a str / Span is a read-only view
+                let bt_inner = match &bt {
+                    Type::Ptr { inner, .. } => (**inner).clone(),
+                    other => other.clone(),
+                };
+                if crate::strtype::is_str_like(&bt_inner) {
+                    m = Mutability::Fixed("a str is read-only; its octets cannot be assigned".to_string());
+                }
                 self.record(e.id, ty.clone());
                 Some((ty, m))
             }
@@ -2017,7 +2025,53 @@ constants declared before it, and '+ - * /'"
         }
     }
 
+    /// r724: `v[i]` on a `Vec[T]` / `str` / `Span` VALUE (not behind a pointer,
+    /// there `p[i]` stays pointer arithmetic): any integer index, the element
+    /// type is `T` (`u8` for the str kinds). Lowering checks the bounds and
+    /// counts a negative index from the end.
+    fn seq_index_elem(&mut self, base: &Type, idx: &Expr) -> Option<Type> {
+        let inner = match base {
+            Type::Ptr { inner, .. } => &**inner,
+            other => other,
+        };
+        if !matches!(inner, Type::Struct(_)) {
+            return None;
+        }
+        if matches!(&idx.kind, ExprKind::Ident(n) if n.starts_with(crate::foreach::HIDDEN)) {
+            return None;
+        }
+        crate::foreach::seq_struct(&self.tcx, base)?;
+        Some(crate::foreach::seq_elem(self, base).unwrap_or(Type::Error))
+    }
+
+    /// Element type of a Vec / str sequence without reporting anything.
+    fn seq_elem_quiet(&self, t: &Type) -> Option<Type> {
+        let sidx = crate::foreach::seq_struct(&self.tcx, t)?;
+        if crate::strtype::is_str_like(&Type::Struct(sidx)) {
+            return Some(Type::U8);
+        }
+        let name = self.tcx.structs[sidx].name.clone();
+        let inst = crate::sema_generic::instantiation(&name)?;
+        if inst.base != "Vec" || inst.args.len() != 1 {
+            return None;
+        }
+        self.resolve_ty_quiet(&inst.args[0])
+    }
+
     fn index_type(&mut self, base: &Type, idx: &Expr, bspan: Span) -> Type {
+        if let Some(el) = self.seq_index_elem(base, idx) {
+            let it = self.expr(idx, Some(&Type::I64));
+            if !it.is_error() && !it.is_concrete_int() {
+                self.dg.error(
+                    idx.span,
+                    format!("index must be an integer, found {}", self.tcx.name_of(&it)),
+                );
+            }
+            if el.is_error() {
+                self.dg.error(bspan, format!("cannot tell the element type of {}", self.tcx.name_of(base)));
+            }
+            return el;
+        }
         let it = self.expr(idx, Some(&Type::Usize));
         if !it.is_error() && it != Type::Usize {
             self.dg.error_note(
@@ -3246,6 +3300,8 @@ constants declared before it, and '+ - * /'"
             }
             ExprKind::Index(base, _) => match self.probe_d(base, d + 1) {
                 Some(Type::Array(el, _)) => Some((*el).clone()),
+                // r724: `v[i]` / `s[i]` on a Vec / str value (or a pointer to one)
+                Some(bt) => self.seq_elem_quiet(&bt),
                 _ => None,
             },
             ExprKind::Call(name, args, _) => {

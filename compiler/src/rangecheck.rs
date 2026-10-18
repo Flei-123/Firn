@@ -391,6 +391,7 @@ pub(crate) fn remove_provable_arith_checks(f: &mut Func) -> usize {
                     | Op::CheckedCast { .. }
                     | Op::CheckedDiv { .. }
                     | Op::CheckedIdx { .. }
+                    | Op::CheckedIdxV { .. }
             )
         })
     });

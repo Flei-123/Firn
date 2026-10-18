@@ -489,6 +489,7 @@ fn reduce_loop(
                     | Op::CheckedDiv { .. }
                     | Op::CheckedCast { .. }
                     | Op::CheckedIdx { .. }
+                    | Op::CheckedIdxV { .. }
                     | Op::Call { .. }
                     | Op::CallIndirect { .. }
             );

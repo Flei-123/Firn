@@ -1013,6 +1013,7 @@ fn writes_memory(op: &Op) -> bool {
             | Op::CheckedDiv { .. }
             | Op::CheckedCast { .. }
             | Op::CheckedIdx { .. }
+            | Op::CheckedIdxV { .. }
     )
 }
 

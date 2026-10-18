@@ -546,10 +546,33 @@ impl<'a> Lower<'a> {
                 if crate::foreach::seq_struct(&self.info.tcx, &self.ty_of(base)).is_some() =>
             {
                 // r664: element of a Vec / str behind the hidden loop counter
-                let (data, _) = crate::foreach::seq_words(self, base)?;
+                let (data, len) = crate::foreach::seq_words(self, base)?;
                 let esz = self.info.tcx.size_of(&self.ty_of(e)).max(1);
-                let iv = self.lower_expr(idx)?;
-                let ift = self.fty_of(idx)?;
+                let hidden = matches!(&idx.kind, ExprKind::Ident(n) if n.starts_with(crate::foreach::HIDDEN));
+                let mut iv = self.lower_expr(idx)?;
+                let mut ift = self.fty_of(idx)?;
+                if hidden {
+                    return Some(self.elem_addr(data, esz, iv, ift));
+                }
+                // r724: user `v[i]` -- Python negative index (from the end)
+                // and a run-time bounds check against the loaded length.
+                if matches!(ift, FTy::I8 | FTy::I16 | FTy::I32 | FTy::I64) {
+                    if ift != FTy::I64 {
+                        iv = self.push(FTy::I64, Op::Cast { src: iv, from: ift });
+                    }
+                    let c63 = self.constant(FTy::I64, 63);
+                    let neg = self.push(FTy::I64, Op::Bin(FBin::Shr, iv, c63));
+                    let add = self.push(FTy::U64, Op::Bin(FBin::And, len, neg));
+                    iv = self.push(FTy::U64, Op::Bin(FBin::Add, iv, add));
+                } else if ift != FTy::U64 {
+                    iv = self.push(FTy::U64, Op::Cast { src: iv, from: ift });
+                }
+                ift = FTy::U64;
+                if crate::checkmode::is_checked() {
+                    let bt = self.ty_of(base);
+                    let msg = self.index_msg(idx.span, &bt);
+                    iv = self.push(ift, Op::CheckedIdxV { idx: iv, len, msg });
+                }
                 Some(self.elem_addr(data, esz, iv, ift))
             }
             ExprKind::Index(base, idx) => {

@@ -614,6 +614,27 @@ fn clamp_arm(e: &mut Emitter, clamp: &str, op: BinOp, ty: FTy, min_lit: i64, max
 /// not-taken `b.lo` (unsigned "below"). `len` is a compile time number and
 /// goes into `x10` through the backend's own immediate builder, which
 /// already knows how to make a 64-bit constant out of `movz`/`movk`.
+/// r724: run-time length variant; index in `A`, length in `B`.
+pub(crate) fn emit_checked_idx_v(e: &mut Emitter, msg: &str, site: &mut SiteCounter) {
+    crate::panic_rt::note_index_site();
+    let label = intern(msg);
+    let uid = site.next();
+    let ok = format!(".Lchkidx{}", uid);
+    e.line(&format!("cmp {}, {}", A, B));
+    e.line(&format!("b.lo {}", ok));
+    trampoline_jump_to(
+        e,
+        crate::panic_rt::TRAMPOLINE_INDEX,
+        crate::panic_rt::PANIC_INDEX,
+        &label,
+        msg.len(),
+        A,
+        B,
+        true,
+    );
+    e.raw(&format!("{}:", ok));
+}
+
 pub(crate) fn emit_checked_idx(e: &mut Emitter, len: u64, msg: &str, site: &mut SiteCounter) {
     crate::panic_rt::note_index_site();
     let label = intern(msg);

@@ -1343,6 +1343,13 @@ fn emit_inst(
             crate::panic_rt::emit_checked_idx(e, *len, msg, site);
             store_dst(e, fr, d, "rax");
         }
+        Op::CheckedIdxV { idx, len, msg } => {
+            let d = i.dst.ok_or("internal error: checked index without target")?;
+            load_ext(e, fr, "rax", *idx, ty, 64);
+            load_ext(e, fr, "rcx", *len, FTy::U64, 64);
+            crate::panic_rt::emit_checked_idx_v(e, msg, site);
+            store_dst(e, fr, d, "rax");
+        }
         Op::BinWrapSat { kind, op, a, b } => {
             let d = i.dst.ok_or("internal error: wrap/sat binary operation without target")?;
             emit_wrap_sat(e, fr, *kind, *op, ty, *a, *b, d, site)?;
