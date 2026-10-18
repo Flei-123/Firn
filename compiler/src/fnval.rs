@@ -366,6 +366,7 @@ pub(crate) fn closure_params(d: &LambdaDecl) -> Vec<Param> {
         },
         span: d.span,
         refk: 0,
+        default: None,
     });
     ps
 }
@@ -437,6 +438,7 @@ fn walk_stmt(s: &crate::ast::Stmt, out: &mut Vec<LambdaDecl>) {
 
 fn walk_expr(e: &Expr, out: &mut Vec<LambdaDecl>) {
     match &e.kind {
+        ExprKind::Named(_, v, _) => walk_expr(v, out),
         // ROUND IFEXPR
         ExprKind::IfElse(c, a, b) => {
             walk_expr(c, out);

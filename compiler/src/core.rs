@@ -823,6 +823,7 @@ fn visit_calls(ck: &mut Checker, b: &crate::ast::Block, names: &[String]) {
 
 fn visit_expr(ck: &mut Checker, e: &Expr, names: &[String]) {
     match &e.kind {
+        ExprKind::Named(_, v, _) => visit_expr(ck, v, names),
         // ROUND IFEXPR
         ExprKind::IfElse(c, a, b) => {
             visit_expr(ck, c, names);

@@ -214,6 +214,7 @@ fn expr(cx: &mut Ctx, e: &mut Expr) {
             auto_deref_base(cx, b, !hidden);
             expr(cx, i);
         }
+        ExprKind::Named(_, v, _) => expr(cx, v),
         ExprKind::IfElse(c, a, b) => {
             expr(cx, c);
             expr(cx, a);
@@ -347,6 +348,7 @@ fn children<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
             f(b);
             f(i);
         }
+        ExprKind::Named(_, v, _) => f(v),
         ExprKind::IfElse(c, a, b) => {
             f(c);
             f(a);

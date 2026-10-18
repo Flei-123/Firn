@@ -1037,6 +1037,7 @@ mod tests {
                     ty: TypeExpr::Named("i64".to_string(), sp(1, 1)),
                     span: sp(1, 10),
                     refk: 0,
+                    default: None,
                 })
                 .collect(),
             ret: None,

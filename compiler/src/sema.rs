@@ -2162,6 +2162,10 @@ constants declared before it, and '+ - * /'"
 
     fn expr_inner(&mut self, e: &Expr, hint: Option<&Type>) -> Type {
         match &e.kind {
+            ExprKind::Named(_, _, nsp) => {
+                self.dg.error(*nsp, "a named argument is only allowed in a call to a known plain function");
+                Type::Error
+            }
             // ROUND IFEXPR: `if c { a } else { b }` as an expression.
             // The condition has to be a `bool`, and both branches have to
             // produce the same type -- otherwise the expression would have a
@@ -3159,6 +3163,7 @@ constants declared before it, and '+ - * /'"
             return None;
         }
         match &e.kind {
+            ExprKind::Named(_, v, _) => self.probe_d(v, d + 1),
             // ROUND IFEXPR: the probe takes the `if` branch; that the two
             // branches disagree is reported by the real check.
             ExprKind::IfElse(_, a, _) => self.probe_d(a, d + 1),
@@ -4552,8 +4557,8 @@ mod tests {
         let f = FnDecl {
             name: "f".to_string(),
             params: vec![
-                Param { name: "a".to_string(), ty: named("i32"), span: sp(), refk: 0 },
-                Param { name: "b".to_string(), ty: named("i32"), span: sp(), refk: 0 },
+                Param { name: "a".to_string(), ty: named("i32"), span: sp(), refk: 0, default: None },
+                Param { name: "b".to_string(), ty: named("i32"), span: sp(), refk: 0, default: None },
             ],
             ret: Some(named("i32")),
             body: blk(vec![Stmt::Return { value: Some(fret), span: sp() }]),
@@ -4771,6 +4776,7 @@ mod tests {
                 ty: TypeExpr::Array { elem: Box::new(named("i32")), len: 4, span: sp() },
                 span: sp(),
                 refk: 0,
+                default: None,
             }],
             ret: None,
             body: blk(Vec::new()),

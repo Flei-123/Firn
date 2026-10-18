@@ -365,6 +365,7 @@ impl Guard<'_> {
 
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
+            ExprKind::Named(_, v, _) => self.expr(v),
             // ROUND IFEXPR
             ExprKind::IfElse(c, a, b) => {
                 self.expr(c);

@@ -1164,6 +1164,30 @@ are. At least two elements. See `docs/TUPLES.md`; proof in
 `tests/2410..2415_tuple_*.fi`, `tests/neg/2410..2419_tuple_*.fi` and
 `tools/tuples/run.sh` (both compilers).
 
+### 12.10 Default and named arguments (r664)
+
+```firn
+fn connect(host: str, port: i32 = 80, tls: bool = false) -> i32 { .. }
+
+connect("a")                       // port = 80, tls = false
+connect("a", tls: true)            // named, skips port
+connect(port: 1, host: "a")        // all named, any order
+```
+
+`x: T = <const-expr>` makes a parameter optional; once one parameter has a
+default, all following ones need one. The default is a constant expression
+(literals, `const` names, operators, casts, `size_of[..]()`; no calls, no
+variables). At the call site, positional arguments come first, then
+`name: expr`. The compiler rewrites the call to a plain positional one before
+the type check: named arguments are put in parameter order (and evaluated in
+that order), the missing tail is filled with a copy of the default. Errors:
+positional argument after a named one, unknown name (with "did you mean"),
+parameter given twice, missing required parameter, required parameter after an
+optional one, non-constant default. Not allowed: defaults on `extern fn`,
+methods, generic templates, closures and function types; named arguments on
+method calls. See `docs/DEFAULT-ARGS.md`; proof in `tests/3910_default_args.fi`
+and `tests/neg/default_args_*.fi`.
+
 ### 12.1 The grammar of the v0 subset (EBNF)
 
 This is the grammar that `firnc0` **really** implements. The extensions from

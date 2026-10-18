@@ -77,7 +77,10 @@ pub fn render(p: &Program) -> String {
     for f in &p.funcs {
         let mut ps = String::new();
         for pa in &f.params {
-            ps.push_str(&format!(" (param {} {})", pa.name, ty(&pa.ty)));
+            match &pa.default {
+                Some(d) => ps.push_str(&format!(" (param {} {} (default {}))", pa.name, ty(&pa.ty), ex(d))),
+                None => ps.push_str(&format!(" (param {} {})", pa.name, ty(&pa.ty))),
+            }
         }
         let r = match &f.ret {
             Some(t) => ty(t),
@@ -199,6 +202,7 @@ fn ex(e: &Expr) -> String {
 fn ex_core(e: &Expr) -> String {
     match &e.kind {
         ExprKind::Int(v) => format!("(int {})", v),
+        ExprKind::Named(n, v, _) => format!("(named {} {})", n, ex(v)),
         // ROUND IFEXPR: `if` as an expression appears as a node of its own.
         // The children go through `ex`, not `ex_core` -- otherwise they
         // would lack the type note every other node carries (found in the

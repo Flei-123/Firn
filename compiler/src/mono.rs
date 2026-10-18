@@ -424,6 +424,7 @@ fn subst_stmt(s: &mut Stmt, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
 fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(String, Instantiation)>) {
     let sp = e.span;
     match &mut e.kind {
+        ExprKind::Named(_, v, _) => subst_expr(v, map, queue),
         // ROUND IFEXPR
         ExprKind::IfElse(c, a, b) => {
             subst_expr(c, map, queue);
@@ -538,6 +539,7 @@ pub(crate) fn renumber_expr(e: &mut Expr, next: &mut u32) {
     e.id = *next;
     *next += 1;
     match &mut e.kind {
+        ExprKind::Named(_, v, _) => renumber_expr(v, next),
         // ROUND IFEXPR
         ExprKind::IfElse(c, a, b) => {
             renumber_expr(c, next);
@@ -682,6 +684,7 @@ fn check_bare_stmt(s: &Stmt, out: &mut Vec<(Span, String)>) {
 
 fn check_bare_expr(e: &Expr, out: &mut Vec<(Span, String)>) {
     match &e.kind {
+        ExprKind::Named(_, v, _) => check_bare_expr(v, out),
         // ROUND IFEXPR
         ExprKind::IfElse(c, a, b) => {
             check_bare_expr(c, out);

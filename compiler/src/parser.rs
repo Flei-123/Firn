@@ -69,6 +69,9 @@ pub(crate) struct Parser<'a> {
     /// `inout T` while it parses its list (`refparam.rs`).
     pub(crate) allow_ref_params: bool,
     pub(crate) ref_params: Vec<crate::refparam::RefParam>,
+    /// **r664** -- `fn_decl` allows `x: T = <const-expr>` while it parses
+    /// the parameter list of a plain function (`dargs.rs`).
+    pub(crate) allow_defaults: bool,
 }
 
 /// **Round TUPLES** -- the pattern of `let (a, b) = ..`.
@@ -901,7 +904,20 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
-            let a = self.nested_expr();
+            // r664: named argument `name: expr`
+            let named = match (self.kind(), self.toks.get(self.pos + 1).map(|t| &t.kind)) {
+                (TokKind::Ident(n), Some(TokKind::Colon)) => Some(n.clone()),
+                _ => None,
+            };
+            let a = if let Some(n) = named {
+                let nsp = self.bump();
+                self.bump(); // ':'
+                let v = self.nested_expr();
+                let sp = Parser::join(nsp, v.span);
+                self.mk(sp, ExprKind::Named(n, Box::new(v), nsp))
+            } else {
+                self.nested_expr()
+            };
             args.push(a);
             if self.recovering {
                 break;
@@ -1900,7 +1916,8 @@ compute it",
     // ------------------------------------------------------------------- Items
 
     pub(crate) fn params(&mut self) -> Vec<Param> {
-        let mut out = Vec::new();
+        let mut out: Vec<Param> = Vec::new();
+        let mut seen_default = false;
         loop {
             if self.at(&TokKind::RParen) || self.at_eof() {
                 break;
@@ -1951,7 +1968,31 @@ compute it",
                 Some(true) => 2,
                 Some(false) => 1,
             };
-            out.push(Param { name, ty, span: sp, refk });
+            // r664: `= <const-expr>` makes the parameter optional.
+            let mut default: Option<Expr> = None;
+            if self.at(&TokKind::Assign) {
+                let eq = self.span();
+                self.bump();
+                if !self.allow_defaults {
+                    self.dg.error(
+                        eq,
+                        "default values are only allowed on plain functions (not on extern fn, methods, generic templates, closures or function types)",
+                    );
+                } else if refk != 0 {
+                    self.dg.error(eq, "a reference parameter cannot have a default value");
+                }
+                default = Some(self.nested_expr());
+            }
+            if default.is_some() {
+                seen_default = true;
+            } else if seen_default {
+                self.dg.error_note(
+                    sp,
+                    format!("required parameter '{}' cannot follow an optional one", name),
+                    "give it a default value too, or move it before the optional parameters",
+                );
+            }
+            out.push(Param { name, ty, span: sp, refk, default });
             if !self.eat(&TokKind::Comma) {
                 break;
             }
@@ -1986,7 +2027,9 @@ compute it",
             self.sync_item();
             return;
         }
+        self.allow_defaults = !is_extern;
         let (params, ref_params) = self.params_ref();
+        self.allow_defaults = false;
         self.close(TokKind::RParen, "after the parameter list");
         self.recovering = false;
         let ret = if self.eat(&TokKind::Arrow) {
@@ -2749,6 +2792,7 @@ fn in_expr(
         tup_seq: 0,
         interp_depth: 1,
         allow_ref_params: false,
+        allow_defaults: false,
         ref_params: Vec::new(),
         infer_len_ok: false,
     };
@@ -2807,6 +2851,7 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         tup_seq: 0,
         interp_depth: 0,
         allow_ref_params: false,
+        allow_defaults: false,
         ref_params: Vec::new(),
         infer_len_ok: false,
     };

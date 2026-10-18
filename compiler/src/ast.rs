@@ -186,6 +186,10 @@ pub enum ExprKind {
     Index(Box<Expr>, Box<Expr>),
     /// Call `f(args)` — direct function names only (stage 0)
     Call(String, Vec<Expr>, Span),
+    /// **r664** -- named call argument `name: expr`. Parser output only:
+    /// `dargs.rs` turns the call into a plain positional one before the type
+    /// checker sees it, anywhere else it is an error.
+    Named(String, Box<Expr>, Span),
     /// `syscall(nr, a1..a6)`
     Syscall(Vec<Expr>),
     /// `expr as T`
@@ -377,6 +381,9 @@ pub struct Param {
     pub span: Span,
     /// **r199** -- 0 plain, 1 `&T`, 2 `inout T` (the type is then a pointer).
     pub refk: u8,
+    /// **r664** -- default value `= <const-expr>` (`dargs.rs` fills it in at
+    /// the call site); `None` for a required parameter.
+    pub default: Option<Expr>,
 }
 
 /// An attribute `#[attr]` or `#[attr(arg)]` in front of a declaration.

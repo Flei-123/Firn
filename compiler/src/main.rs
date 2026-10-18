@@ -72,6 +72,7 @@ mod ivsr;
 mod addrsink;
 mod escape;
 mod foreach;
+mod dargs;
 mod moves;
 mod nogc;
 mod opt;
@@ -1031,6 +1032,8 @@ fn run(opts: &Options) -> i32 {
     archsel::select(&mut prog, &mut dg);
     // --- Monomorphization of generic templates (module types) ---
     mono::expand(&mut prog, &mut dg);
+    // r664: default + named arguments -> plain positional calls (dargs.rs)
+    dargs::apply(&mut prog, &mut dg);
     tm.mark("mono");
     if opts.emit == Emit::Ast && !dg.has_errors() {
         println!("{:#?}", prog);

@@ -241,6 +241,7 @@ impl<'a> NoGcChecker<'a> {
 
     fn check_expr(&mut self, e: &Expr) {
         match &e.kind {
+            ExprKind::Named(_, v, _) => self.check_expr(v),
             // ROUND IFEXPR
             ExprKind::IfElse(c, a, b) => {
                 self.check_expr(c);

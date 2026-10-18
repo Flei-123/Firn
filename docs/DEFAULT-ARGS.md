@@ -1,10 +1,17 @@
-# Default and named arguments -- design (r664, not implemented)
+# Default and named arguments (r664, IMPLEMENTED)
 
 Gap list item (vspy-lang): `fn f(a: i32, b: i32 = 2)` and `f(b: 1, a: 4)`.
-Python: `def f(a, b=2)`, `f(b=1, a=4)`. Status: DESIGN ONLY. Reason: the
-change touches the grammar, so it must land in both compilers at once
-(parser_compare / sema_compare / fir_compare), and `firnc1` has no `for x in
-vec` either yet -- one parity project, not two.
+Python: `def f(a, b=2)`, `f(b=1, a=4)`. Status: IMPLEMENTED in firnc0
+(`compiler/src/dargs.rs`) and firnc1 (`lib/firnc1/mono.fi`, `dargs_run`),
+parser + canonical printer in both. Differences from the design below:
+the pass runs after the module merge AND the monomorphization (callees have
+final names, generic instances are plain functions); it is a node-table scan
+in firnc1. Named arguments exist as `ExprKind::Named` / `E_NAMED`
+(parser output only). NOT done yet: defaults/named arguments on METHOD calls
+(`x.m(..)` is resolved by the type checker, not by name), and in firnc1 the
+"default must be a constant expression" check (firnc0 has it). Arguments are
+evaluated in parameter order, not in written order.
+Tests: `tests/3910_default_args.fi`, `tests/neg/default_args_*.fi`.
 
 ## Syntax
 

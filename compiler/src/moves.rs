@@ -547,6 +547,7 @@ impl<'a> Walk<'a> {
                 self.consume(a);
                 self.read(b);
             }
+            ExprKind::Named(_, v, _) => self.read(v),
             ExprKind::IfElse(c, a, b) => {
                 self.read(c);
                 let n = self.vars.len();

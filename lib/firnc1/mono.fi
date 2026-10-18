@@ -1096,6 +1096,11 @@ fn copy_expr_inner(g: *mut Gen, e: u32) -> u32 {
         let off: u32 = copy_children(g, ast.e_b(b, e), ast.e_c(b, e))
         return ast.expr_new(b, a, 0, off, ast.e_c(b, e), 0)
     }
+    // r664: a named call argument (parser output; `dargs_run` removes them).
+    if a == ast.E_NAMED {
+        let nv: u32 = copy_expr(g, ast.e_b(b, e))
+        return ast.expr_new(b, a, ast.e_a(b, e), nv, 0, 0)
+    }
     // ROUND 70 (strtype.rs): the text literal carries its array literal
     // inside; only that one has to be copied.
     if a == ast.E_TEXT {
@@ -1231,4 +1236,180 @@ fn gen_run(g: *mut Gen) {
             struct_instantiate(g, ii)
         }
     }
+    // r664: default + named arguments -> plain positional calls
+    dargs_run(g)
+}
+
+// ------------------------------------------------ r664: default/named args
+//
+// Twin of `compiler/src/dargs.rs` (docs/DEFAULT-ARGS.md). Runs at the end of
+// `gen_run`, when every callee has its final name: named arguments are put
+// in parameter order and the missing tail is filled with a COPY of the
+// default expression (`copy_expr`, fresh nodes). Afterwards every call is a
+// plain positional one and no stage behind this one knows about it.
+//
+// The tree is a flat node table, so every `E_CALL` node is visited on its
+// own (no recursion). Calls with `e_number != 0` are intrinsics (`size_of`,
+// `asm$N`, ..) whose `e_b`/`e_c` are not an argument list: skipped. Errors
+// are only counted (`gen_error`), like everywhere in this file.
+fn dargs_run(g: *mut Gen) {
+    let b: *mut ast.Tree = gtree(g)
+    let total: usize = ast.expr_count(b)
+    var any: bool = false
+    var i: usize = 0
+    while i < total {
+        if ast.e_kind(b, i as u32) == ast.E_NAMED {
+            any = true
+            break
+        }
+        i = i + 1
+    }
+    let np: usize = vec_len[u32](&(*b).pa_def)
+    var k: usize = 0
+    while k < np && !any {
+        if ast.param_def(b, k as u32) != ast.NOTHING {
+            any = true
+        }
+        k = k + 1
+    }
+    if !any {
+        return
+    }
+    // interned name -> function number
+    let nf: usize = ast.fn_count(b)
+    var maxn: u32 = 0
+    var f: usize = 0
+    while f < nf {
+        if ast.fn_name(b, f) > maxn {
+            maxn = ast.fn_name(b, f)
+        }
+        f = f + 1
+    }
+    var fmap: Vec[u32] = vec_new[u32]()
+    var z: usize = 0
+    while z <= (maxn as usize) {
+        vec_push[u32](&fmap, NONE)
+        z = z + 1
+    }
+    f = 0
+    while f < nf {
+        vec_set[u32](&fmap, ast.fn_name(b, f) as usize, f as u32)
+        f = f + 1
+    }
+    var e: usize = 0
+    while e < total {
+        if ast.e_kind(b, e as u32) == ast.E_CALL && ast.e_number(b, e as u32) == 0 {
+            dargs_call(g, e as u32, &fmap)
+        }
+        e = e + 1
+    }
+    vec_free[u32](&fmap)
+    // the defaults are consumed: later printers must not show them
+    var q: usize = 0
+    while q < np {
+        ast.param_def_set(b, q as u32, ast.NOTHING)
+        q = q + 1
+    }
+}
+
+fn dargs_call(g: *mut Gen, e: u32, fmap: *mut Vec[u32]) {
+    let b: *mut ast.Tree = gtree(g)
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    var has_named: bool = false
+    var bad_order: bool = false
+    var npos: u32 = 0
+    var k: u32 = 0
+    while k < cnt {
+        let c: u32 = ast.child_at(b, off + k)
+        if ast.e_kind(b, c) == ast.E_NAMED {
+            has_named = true
+        } else if has_named {
+            bad_order = true
+        } else {
+            npos = npos + 1
+        }
+        k = k + 1
+    }
+    let name: u32 = ast.e_a(b, e)
+    var fi: u32 = NONE
+    if (name as usize) < vec_len[u32](fmap) {
+        fi = vec_at[u32](fmap, name as usize)
+    }
+    if fi == NONE {
+        if has_named {
+            (*g).err = (*g).err + 1
+        }
+        return
+    }
+    if bad_order {
+        (*g).err = (*g).err + 1
+        return
+    }
+    let poff: u32 = ast.fn_poff(b, fi as usize)
+    let plen: u32 = ast.fn_plen(b, fi as usize)
+    if npos > plen {
+        return
+    }
+    if !has_named && cnt == plen {
+        return
+    }
+    var slots: Vec[u32] = vec_new[u32]()
+    var j: u32 = 0
+    while j < plen {
+        vec_push[u32](&slots, NONE)
+        j = j + 1
+    }
+    var ok: bool = true
+    k = 0
+    while k < cnt {
+        let c: u32 = ast.child_at(b, off + k)
+        if k < npos {
+            vec_set[u32](&slots, k as usize, c)
+        } else {
+            let pn: u32 = ast.e_a(b, c)
+            var hit: u32 = NONE
+            j = 0
+            while j < plen {
+                if ast.param_name(b, poff + j) == pn {
+                    hit = j
+                }
+                j = j + 1
+            }
+            if hit == NONE {
+                ok = false
+            } else if vec_at[u32](&slots, hit as usize) != NONE {
+                ok = false
+            } else {
+                vec_set[u32](&slots, hit as usize, ast.e_b(b, c))
+            }
+        }
+        k = k + 1
+    }
+    j = 0
+    while j < plen && ok {
+        if vec_at[u32](&slots, j as usize) == NONE {
+            let d: u32 = ast.param_def(b, poff + j)
+            if d == ast.NOTHING {
+                ok = false
+            } else {
+                vec_set[u32](&slots, j as usize, copy_expr(g, d))
+            }
+        }
+        j = j + 1
+    }
+    if !ok {
+        (*g).err = (*g).err + 1
+        vec_free[u32](&slots)
+        return
+    }
+    let new: u32 = ast.child_start(b)
+    j = 0
+    while j < plen {
+        ast.child_add(b, vec_at[u32](&slots, j as usize))
+        j = j + 1
+    }
+    ast.e_b_set(b, e, new)
+    ast.e_c_set(b, e, plen)
+    vec_free[u32](&slots)
 }

@@ -106,6 +106,7 @@ fn reads_name(e: &Expr, name: Option<&str>) -> bool {
             // a call may read anything through its arguments or a global
             args.iter().any(|x| reads_name(x, name)) || name.is_none()
         }
+        ExprKind::Named(_, v, _) => reads_name(v, name),
         ExprKind::IfElse(c, a, b) => {
             reads_name(c, name) || reads_name(a, name) || reads_name(b, name)
         }
@@ -901,6 +902,7 @@ impl<'a> Lower<'a> {
                     self.ice(e.span, "unknown name in lowering")
                 }
             }
+            ExprKind::Named(..) => return self.ice(e.span, "named argument reached the lowering"),
             // ROUND IFEXPR: `if c { a } else { b }` as an expression.
             //
             // No phi node by hand: the lowering makes -- as for every mutable
@@ -2853,8 +2855,8 @@ mod tests {
         let f = ast::FnDecl {
             name: "f".into(),
             params: vec![
-                ast::Param { name: "p".into(), ty: ast::TypeExpr::Named("bool".into(), Span::none()), span: Span::none(), refk: 0 },
-                ast::Param { name: "q".into(), ty: ast::TypeExpr::Named("bool".into(), Span::none()), span: Span::none(), refk: 0 },
+                ast::Param { name: "p".into(), ty: ast::TypeExpr::Named("bool".into(), Span::none()), span: Span::none(), refk: 0, default: None },
+                ast::Param { name: "q".into(), ty: ast::TypeExpr::Named("bool".into(), Span::none()), span: Span::none(), refk: 0, default: None },
             ],
             ret: None,
             body: blk(vec![
@@ -2918,6 +2920,7 @@ mod tests {
                 ty: ast::TypeExpr::Named("i32".into(), Span::none()),
                 span: Span::none(),
                 refk: 0,
+                default: None,
             }],
             ret: Some(ast::TypeExpr::Named("i32".into(), Span::none())),
             body: blk(vec![

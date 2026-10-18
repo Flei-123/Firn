@@ -1094,6 +1094,7 @@ impl<'a, 'b> Renamer<'a, 'b> {
     fn expr(&mut self, e: &mut Expr) {
         let span = e.span;
         match &mut e.kind {
+            ExprKind::Named(_, v, _) => self.expr(v),
             // ROUND IFEXPR
             ExprKind::IfElse(c, a, b) => {
                 self.expr(c);
