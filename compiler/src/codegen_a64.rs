@@ -1914,6 +1914,33 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
             }
             return Ok(());
         }
+        syscalls::A64::AlarmItimer(n) => {
+            // alarm(sec) -> setitimer(ITIMER_REAL, &itimerval, NULL) with
+            // itimerval = { interval {0, 0}, value {sec, 0} } (32 bytes on the
+            // stack). Arguments past the first must be the padding zeroes.
+            for (k, a) in given.iter().enumerate().skip(1) {
+                if !matches!(fr.consts.get(a), Some(0)) {
+                    return Err(format!(
+                        "aarch64: alarm(2) becomes setitimer; argument {} is not the padding zero",
+                        k + 1
+                    ));
+                }
+            }
+            load_full(e, fr, "x9", given[0]);
+            e.line("sub sp, sp, #32");
+            e.line("stp xzr, xzr, [sp]");
+            e.line("stp x9, xzr, [sp, #16]");
+            e.line("mov x0, xzr");                        // ITIMER_REAL
+            e.line("mov x1, sp");
+            e.line("mov x2, xzr");                        // old value = NULL
+            imm_into(e, "x8", n as i64);
+            e.line("svc #0");
+            e.line("add sp, sp, #32");
+            if let Some(d) = i.dst {
+                store_dst(e, fr, d, "x0");
+            }
+            return Ok(());
+        }
         syscalls::A64::RenameAt(n) => {
             // FIRN r64: renameat(AT_FDCWD, old, AT_FDCWD, new).
             load_full(e, fr, "x1", given[0]);

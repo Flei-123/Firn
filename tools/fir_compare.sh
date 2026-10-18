@@ -58,12 +58,12 @@ KNOWN="tests/590_f64.fi tests/871_closure_plain.fi"
 # with an `import` line (even an unused one) therefore compares two different inputs, like the
 # note at the top says. By default such files are counted under IMPORTS and not compared; cross-module lowering
 # is covered by tools/fixpoint.sh, tools/self_compare.sh and tools/prune_compare.sh (real compiles).
-# OPT-IN (r765): `FIR_IMPORTS_STEP=N` compares every N-th such file (N=1: all, ~5-20 s each) against
+# ON BY DEFAULT with N=8 (r783: 61 SAME / 0 DIFFERENT; `FIR_IMPORTS_STEP=0` switches it off, `=1` compares all). `FIR_IMPORTS_STEP=N` compares every N-th such file (N=1: all, ~5-20 s each) against
 # `firnc1` with `FIRN_EMIT_FIR_RAW=1` (the real module loader) through tools/fir_norm.py (function order, build
 # path, @text numbering normalised; two named runtime functions ignored). The result goes to the extra lines
 # IMPORTS SAME / IMPORTS DIFFERENT and NEVER changes the exit code. Known rest: programs that use `gc` allocation
 # expressions (r767).
-IMPORTS_STEP=${FIR_IMPORTS_STEP:-0}
+IMPORTS_STEP=${FIR_IMPORTS_STEP:-8}
 FIRNC1=""
 if [ "$IMPORTS_STEP" -gt 0 ]; then
     FIRNC1="$TMPD"/firnc1
@@ -72,6 +72,7 @@ fi
 imp_same=0
 imp_diff=0
 imp_first=""
+imp_all=""
 
 same=0
 different=0
@@ -100,6 +101,7 @@ while IFS= read -r f; do
                 else
                     imp_diff=$((imp_diff+1))
                     [ -z "$imp_first" ] && imp_first="$f: $why"
+                    imp_all="$imp_all\n    $f: $why"
                 fi
             fi
         fi
@@ -142,6 +144,7 @@ echo "IMPORTS:       $imports  (module program, not comparable one file at a tim
 if [ "$IMPORTS_STEP" -gt 0 ]; then
     echo "IMPORTS SAME:      $imp_same  (every $IMPORTS_STEP-th file, firnc1 module loader, normalised)"
     echo "IMPORTS DIFFERENT: $imp_diff  (informational; first: ${imp_first:-none})"
+    [ -n "$imp_all" ] && printf "  all differing files:$imp_all\n"
 fi
 echo "NOT CORE:      $noncore"
 echo "COMPTIME:      $comptime"

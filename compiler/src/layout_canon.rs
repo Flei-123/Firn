@@ -30,8 +30,11 @@ pub fn render(p: &Program) -> String {
         let i = tcx.declare(&s.name);
         idx.insert(s.name.clone(), i);
     }
-    // 2. Resolve the fields. Order matters: a struct may contain one declared
-    //    earlier, and that layout must already be settled by then.
+    // 2. Resolve the fields. A struct may contain one declared LATER in the
+    //    file (the real checker lays out in dependency order), so the layout
+    //    is computed depth first: contained structs are settled before the
+    //    struct that holds them. Pointers and fn types break the dependency.
+    let mut resolved: Vec<Option<Vec<(String, Type)>>> = vec![None; tcx.structs.len()];
     for s in &p.structs {
         let i = match idx.get(&s.name) {
             Some(i) => *i,
@@ -42,7 +45,13 @@ pub fn render(p: &Program) -> String {
             .iter()
             .map(|(n, t, _)| (n.clone(), resolve(t, &idx)))
             .collect();
-        tcx.set_fields(i, fs);
+        resolved[i] = Some(fs);
+    }
+    let mut state = vec![0u8; tcx.structs.len()]; // 0 new, 1 on the path, 2 done
+    for s in &p.structs {
+        if let Some(i) = idx.get(&s.name) {
+            lay_out(*i, &mut resolved, &mut state, &mut tcx);
+        }
     }
 
     let mut o = String::from("(layout\n");
@@ -117,6 +126,43 @@ fn class(c: ArgClass) -> String {
                 .collect();
             names.join("+")
         }
+    }
+}
+
+/// Depth first: settle the structs that `i` holds by value, then `i` itself.
+fn lay_out(
+    i: usize,
+    resolved: &mut Vec<Option<Vec<(String, Type)>>>,
+    state: &mut Vec<u8>,
+    tcx: &mut TypeCtx,
+) {
+    if state[i] != 0 {
+        return;
+    }
+    state[i] = 1;
+    let fields = match resolved[i].take() {
+        Some(f) => f,
+        None => {
+            state[i] = 2;
+            return;
+        }
+    };
+    let mut deps: Vec<usize> = Vec::new();
+    for (_, t) in &fields {
+        value_deps(t, &mut deps);
+    }
+    for d in deps {
+        lay_out(d, resolved, state, tcx);
+    }
+    tcx.set_fields(i, fields);
+    state[i] = 2;
+}
+
+fn value_deps(t: &Type, out: &mut Vec<usize>) {
+    match t {
+        Type::Struct(i) => out.push(*i),
+        Type::Array(e, _) => value_deps(e, out),
+        _ => {}
     }
 }
 

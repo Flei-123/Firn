@@ -22,10 +22,26 @@
 #   NOT SUPPORTED  the aarch64 code generator REFUSED the program with a
 #                  clear message (threads, inline assembler, a system call
 #                  that has no counterpart). Nothing was emitted, nothing
-#                  was guessed.
+#                  was guessed. r779: every refusal carries a CATEGORY:
+#                    x86-asm   inline assembler is x86 text; it has no
+#                              meaning on aarch64 (not portable by design)
+#                    link-lib  `#[link_lib]` / std.dynlib loads host shared
+#                              libraries (GL, Vulkan, ...); qemu-user has no
+#                              aarch64 host libraries to load
+#                    gap       anything else: a feature the generator could
+#                              have and does not (these are the real gaps)
 #   X86 ALREADY    the x86-64 side does not meet its own expectation from
 #                  line 1 -- then there is nothing to compare and the case
 #                  says so instead of counting as a success.
+#                  (r778: this bucket is for REAL x86 failures only. Three
+#                  kinds of file used to land here by a harness gap and are
+#                  handled properly now:
+#                    `// only_mode: opt`  -> both sides are built with
+#                        --opt-level=release-fast, the level the file is for
+#                        (the checked default would trap by design);
+#                    `#[test]` file without `fn main` (a testkit file) ->
+#                        built with `firnc --test --no-run` for both
+#                        machines and RUN: same exit code, same counts.)
 #   ENVIRONMENT    the difference belongs to the RUNNER, not to the code
 #                  generator -- and that has to be PROVEN in this very run
 #                  by a probe written in C (tools/aarch64/environment.txt,
@@ -159,6 +175,21 @@ one_case() {
         *) echo "X86BAD $file :: no expectation in line 1"; return ;;
     esac
 
+    # r778: `// only_mode: opt` = the file exists to show the UNCHECKED
+    # wraparound of release-fast (tests/028, 030, 054, 1334b); the checked
+    # default would trap on purpose. Build both sides at that level.
+    local FLAGS="$FLAGS" testkit=0 xcmd acmd
+    if head -5 "$file" | grep -q '^// only_mode: opt$'; then
+        FLAGS="--opt-level=release-fast"
+    fi
+    # r778: a file with `#[test]` functions and NO `fn main` is a testkit file
+    # (test.sh runs it with `firnc --test`). Build the runner for both
+    # machines and run both; the verdict is the exit code (0 = all passed).
+    if grep -q '^#\[test\]' "$file" && ! grep -q '^fn main' "$file"; then
+        testkit=1
+        FLAGS="$FLAGS --test --no-run --test-limit=0"
+    fi
+
     # --- x86-64: does the case work at all, and does it meet its own
     # expectation? Only then is there something to compare.
     if ! "$FIRNC" $FLAGS --target=x86_64-linux -o "$WORK/$base.x86" "$file" \
@@ -174,6 +205,7 @@ one_case() {
     # compared.
     for try in 1 2; do
         xout=$(timeout 60 "$WORK/$base.x86" </dev/null 2>/dev/null); xrc=$?
+        [ "$testkit" = 1 ] && xout=""   # the runner report carries timings: the exit code is the verdict
         if [ "$kind" = out ]; then
             [ "$xrc" -eq 0 ] && [ "$xout" = "$exp" ] && break
         else
@@ -202,19 +234,28 @@ one_case() {
         case "$why" in
             *"not supported on aarch64"*|*"aarch64:"*|*"no meaning on aarch64"*|\
             *"threads are not supported"*|*"does not support the kernel profile"*)
-                echo "NOTSUP $file :: $why" ;;
+                # r779: the category (see the header)
+                local cat=gap
+                case "$why" in
+                    *"inline assembler is x86 text"*) cat=x86-asm ;;
+                    *"link_lib"*) cat=link-lib ;;
+                    *) grep -q '^import std\.dynlib' "$file" && cat=link-lib ;;
+                esac
+                echo "NOTSUP $file :: [$cat] $why" ;;
             *)  differs "$file" "aarch64 compilation failed: $why" ;;
         esac
         return
     fi
     local aout arc
     aout=$(timeout "${A64_TIMEOUT:-400}" "$QEMU" "$WORK/$base.a64" </dev/null 2>/dev/null); arc=$?
+    [ "$testkit" = 1 ] && aout=""
     # The same second attempt on this side, for the same reason -- and only
     # when the two really disagree, so a run that already agrees costs
     # nothing.
     if [ "$xrc" != "$arc" ] || [ "$xout" != "$aout" ]; then
         sleep 2
         aout=$(timeout "${A64_TIMEOUT:-400}" "$QEMU" "$WORK/$base.a64" </dev/null 2>/dev/null); arc=$?
+        [ "$testkit" = 1 ] && aout=""
     fi
     if [ "$xrc" != "$arc" ]; then
         differs "$file" "exit code x86=$xrc aarch64=$arc"; return
@@ -286,6 +327,10 @@ echo "  build stage:    $LABEL"
 echo "  SAME:           $SAME"
 echo "  DIFFERENT:      $DIFF"
 echo "  NOT SUPPORTED:  $NOTSUP"
+for c in x86-asm link-lib gap; do
+    n=$(grep -c "^NOTSUP .* :: \[$c\]" "$WORK/result.$LABEL.txt" || true)
+    [ "$n" -gt 0 ] && echo "    of which $c: $n"
+done
 echo "  ENVIRONMENT:    $ENVIRON (proven, see tools/aarch64/environment.txt)"
 echo "  x86 already:    $X86BAD"
 echo "  RESULT: $SAME of $COMPARABLE comparable cases identical on both machines ($PCT%)"
