@@ -83,6 +83,7 @@ import tls.trust
 import ws.ws
 import async.loop
 import async.stream
+import async.adns
 
 export {
     WsClient,
@@ -141,6 +142,7 @@ struct WsClient {
     iaddr: usize,
     res: dns.Resolver,
     res_ready: bool,
+    dq: *mut adns.AQuery, // the DNS lookup in flight, else 0
     store: x509.Store,
     store_ready: bool,
     sys_trust: bool,
@@ -218,7 +220,7 @@ fn wsc_new(l: *mut loop.Loop, cb: fn(*mut WsClient, u64, u32, u32), ud: u64) -> 
     let c: *mut WsClient = p as *mut WsClient
     *c = WsClient { l: l, cb: cb, ud: ud, state: WS_IDLE, s: 0 as *mut stream.Stream,
         u: url.url_new(), secure: false, have_url: false, addrs: [0; 8], naddr: 0,
-        iaddr: 0, res: dns.resolver_new(), res_ready: false, store: x509.store_new(),
+        iaddr: 0, res: dns.resolver_new(), res_ready: false, dq: 0 as *mut adns.AQuery, store: x509.store_new(),
         store_ready: false, sys_trust: false, key: [0; 32], nkey: 0,
         extra: rt.buf_new(), protos: rt.buf_new(), proto: [0; 64], nproto: 0,
         msg: rt.buf_new(), in_msg: false, mop: 0, utf: ws.utf8_new(),
@@ -250,6 +252,7 @@ fn wsc_free(c: *mut WsClient) {
     }
     (*c).dead = true
     (*c).user_closed = true
+    cancel_dns(c)
     cancel_timers(c)
     let s: *mut stream.Stream = (*c).s
     (*c).s = 0 as *mut stream.Stream
@@ -259,6 +262,13 @@ fn wsc_free(c: *mut WsClient) {
     }
     if (*c).busy == 0 {
         release(c)
+    }
+}
+
+fn cancel_dns(c: *mut WsClient) {
+    if (*c).dq as u64 != 0 {
+        adns.adns_cancel((*c).dq)
+        (*c).dq = 0 as *mut adns.AQuery
     }
 }
 
@@ -406,38 +416,82 @@ fn parse_ip4(p: u64, n: usize, out: *mut u32) -> bool {
     return true
 }
 
-fn resolve(c: *mut WsClient) -> bool {
+// 1 = addresses are in `addrs` now, 2 = a lookup runs on the loop (`on_dns`
+// goes on), 0 = failed.
+fn resolve(c: *mut WsClient) -> u32 {
     let hp: u64 = url.url_host_ptr(&(*c).u)
     let hn: usize = url.url_host_len(&(*c).u)
     var one: u32 = 0
     if parse_ip4(hp, hn, &one) {
         (*c).addrs[0] = one
         (*c).naddr = 1
-        return true
+        return 1
     }
     if hn == 9 && rt.mem_eq(hp, "localhost".p as u64, 9) {
         (*c).addrs[0] = net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8)
         (*c).naddr = 1
-        return true
+        return 1
     }
     if !(*c).res_ready {
         if !dns.resolver_init(&(*c).res) {
-            return false
+            return 0
         }
         (*c).res_ready = true
     }
     var o: dns.Resolved = dns.resolved_new()
-    let ok: bool = dns.dns_resolve_a(&(*c).res, hp, hn, &o) catch false
-    if !ok || o.n == 0 {
-        return false
+    let k: u32 = adns.adns_local(&(*c).res, hp, hn, &o)
+    if k == dns.LOCAL_FAIL {
+        return 0
     }
+    if k == dns.LOCAL_NONE {
+        (*c).dq = adns.adns_start((*c).l, &(*c).res, hp, hn, on_dns, c as u64)
+        if (*c).dq as u64 != 0 {
+            return 2
+        }
+        // could not start (no IPv4 server, no socket): the blocking way
+        let okb: bool = dns.dns_resolve_a(&(*c).res, hp, hn, &o) catch false
+        if !okb {
+            return 0
+        }
+    }
+    if o.n == 0 {
+        return 0
+    }
+    take_addrs(c, &o)
+    return 1
+}
+
+fn take_addrs(c: *mut WsClient, o: *mut dns.Resolved) {
     var i: usize = 0
-    while i < o.n && i < 8 {
-        (*c).addrs[i] = o.addr[i]
+    while i < (*o).n && i < 8 {
+        (*c).addrs[i] = (*o).addr[i]
         i = i + 1
     }
     (*c).naddr = i
-    return true
+}
+
+// The lookup started by `resolve` is over (called from the loop).
+fn on_dns(ud: u64, ok: bool, o: *mut dns.Resolved) {
+    let c: *mut WsClient = ud as *mut WsClient
+    (*c).dq = 0 as *mut adns.AQuery
+    if (*c).dead || (*c).state != WS_CONNECTING {
+        return
+    }
+    (*c).busy = (*c).busy + 1
+    if !ok || (*o).n == 0 {
+        (*c).err = WSE_RESOLVE
+        attempt_failed(c)
+    } else {
+        take_addrs(c, o)
+        (*c).iaddr = 0
+        if !open_stream(c) {
+            attempt_failed(c)
+        }
+    }
+    (*c).busy = (*c).busy - 1
+    if (*c).dead && (*c).busy == 0 {
+        release(c)
+    }
 }
 
 fn wall_seconds() -> u64 {
@@ -514,11 +568,15 @@ fn start_attempt(c: *mut WsClient) {
     (*c).nproto = 0
     rt.buf_clear(&(*c).msg)
     (*c).state = WS_CONNECTING
-    if !resolve(c) {
+    let rk: u32 = resolve(c)
+    if rk == 0 {
         // reported from the loop, not from inside wsc_connect
         (*c).err = WSE_RESOLVE
         loop.defer_call((*c).l, deferred_failed, c as u64)
         return
+    }
+    if rk == 2 {
+        return // on_dns goes on
     }
     (*c).iaddr = 0
     if !open_stream(c) {
@@ -1097,6 +1155,12 @@ fn wsc_abort(c: *mut WsClient) {
         (*c).state = WS_IDLE
         return
     }
+    if (*c).dq as u64 != 0 {
+        cancel_dns(c)
+        (*c).err = WSE_RESOLVE
+        attempt_failed(c)
+        return
+    }
     let s: *mut stream.Stream = (*c).s
     if s as u64 != 0 {
         (*c).close_code = 1006
@@ -1201,9 +1265,9 @@ fn on_retry(l: *mut loop.Loop, ud: u64) {
     start_attempt(c)
 }
 
-// A name lookup BLOCKS the loop (it is plain UDP with a wait): bound it. One
-// round, `ms` per name server -- a program with a window on the same thread
-// sets this to about a second so a dead resolver cannot freeze it for longer.
+// Per-attempt time of a name lookup and one round. Since the lookup runs on the
+// loop (async.adns) it no longer blocks it; this only bounds how long a dead
+// resolver delays the connect (only the blocking fallback freezes).
 fn wsc_set_dns_budget(c: *mut WsClient, ms: u64) {
     dns.resolver_set_timeout(&(*c).res, ms)
     dns.resolver_set_retries(&(*c).res, 1 as u32)

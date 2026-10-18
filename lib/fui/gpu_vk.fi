@@ -30,7 +30,7 @@ import gpu.vk_mem
 import gpu.vk_desc
 import gpu.vk_frame
 
-export { vkgl_api, vkgl_close, vkgl_is_cpu, vkgl_device, vkgl_stats, vkgl_passes, vkgl_breaks, vkgl_step, vkgl_alive,
+export { vkgl_api, vkgl_close, vkgl_is_cpu, vkgl_validation, vkgl_device, vkgl_stats, vkgl_passes, vkgl_breaks, vkgl_step, vkgl_alive,
     vkgl_options, vkgl_present_open, vkgl_present, vkgl_present_close, vkgl_present_vsync, vkgl_present_on, vkgl_presents, vkgl_present_mode }
 
 const SPV_VS: str = __include_str("spv/gpu_vk.vert.spv")
@@ -53,6 +53,7 @@ const FMT_R32G32_SFLOAT: u32 = 103
 const LAYOUT_GENERAL: u64 = 1
 const IMG_USAGE: u64 = 0x17 // TRANSFER_SRC | TRANSFER_DST | SAMPLED | COLOR_ATTACHMENT
 const ALL_CMDS: u64 = 0x10000
+const ALL_GFX: u64 = 0x8000 // ALL_GRAPHICS: the only 'all' mask a subpass dependency may name on the subpass side (VUID ...pDependencies-00837/00838)
 const MEM_W: u64 = 0x10000
 const MEM_RW: u64 = 0x18000
 
@@ -162,6 +163,8 @@ struct VG {
     // a command buffer could not be submitted / waited for (or FUI_GPU_FAIL=lost): every later call does nothing, vkgl_alive() is false
     lost: bool,
     fail_lost: bool,
+    fail_pr_open: bool, // FUI_GPU_FAIL=present: the swapchain does not open (read-back keeps the GPU)
+    fail_pr_stop: bool, // FUI_GPU_FAIL=presentstop: the swapchain stops showing at the 3rd present (device fine)
     draws: u64,
     submits: u64,
     uploads: u64,
@@ -218,7 +221,7 @@ fn vg_new() -> VG {
         p0n: vk_desc.vpipe_none(), p0b: vk_desc.vpipe_none(), p1n: vk_desc.vpipe_none(), p1b: vk_desc.vpipe_none(),
         nprog: 0, uni: 0, samp_unit: [0; 8], cur_prog: 0, cur_tex: [0; 8], unit: 0, arr_buf: 0, attr_buf: [0; 9],
         rfb: 0, dfb: 0, vp_x: 0, vp_y: 0, vp_w: 0, vp_h: 0, sc_x: 0, sc_y: 0, sc_w: 0, sc_h: 0, sc_on: false,
-        blend_on: false, cc: [0.0; 4], dummy: 0, next_vao: 0, fail_compile: false, lost: false, fail_lost: false,
+        blend_on: false, cc: [0.0; 4], dummy: 0, next_vao: 0, fail_compile: false, lost: false, fail_lost: false, fail_pr_open: false, fail_pr_stop: false,
         draws: 0, submits: 0, uploads: 0, readbacks: 0, passes: 0,
         swc: vk.sc_blank(), swc_on: false, swc_dirty: false, presents: 0,
     }
@@ -1440,12 +1443,12 @@ fn make_rpass(s: *mut VG) -> u64 {
     vk_mem.w32(dep, 0, 0xFFFFFFFF)
     vk_mem.w32(dep, 4, 0)
     vk_mem.w32(dep, 8, ALL_CMDS)
-    vk_mem.w32(dep, 12, ALL_CMDS)
+    vk_mem.w32(dep, 12, ALL_GFX)
     vk_mem.w32(dep, 16, MEM_W)
     vk_mem.w32(dep, 20, MEM_RW)
     vk_mem.w32(dep, 28, 0)
     vk_mem.w32(dep, 32, 0xFFFFFFFF)
-    vk_mem.w32(dep, 36, ALL_CMDS)
+    vk_mem.w32(dep, 36, ALL_GFX)
     vk_mem.w32(dep, 40, ALL_CMDS)
     vk_mem.w32(dep, 44, MEM_W)
     vk_mem.w32(dep, 48, MEM_RW)
@@ -1644,6 +1647,8 @@ fn vkgl_api(t: *mut gl.GlApi) -> bool {
     }
     (*gs()).fail_compile = fail == "compile"
     (*gs()).fail_lost = fail == "lost"
+    (*gs()).fail_pr_open = fail == "present"
+    (*gs()).fail_pr_stop = fail == "presentstop"
     (*t).program = f_program
     (*t).use_program = f_use_program
     (*t).uniform_location = f_uniform_location
@@ -1689,6 +1694,14 @@ fn vkgl_api(t: *mut gl.GlApi) -> bool {
     return true
 }
 
+// true when the Khronos validation layer is on the instance (FUI_GPU_VALIDATE=1 + layer found); false before vkgl_api
+fn vkgl_validation() -> bool {
+    if G_P == 0 {
+        return false
+    }
+    return vk.validation_on(&(*gs()).v)
+}
+
 // W39: must be called BEFORE the first vkgl_api (the device is opened once per process). present: also enable the window surface extensions
 // (needed for vkgl_present_open); allow_cpu: false = refuse a software Vulkan device (the automatic mode must not pick lavapipe).
 fn vkgl_options(present: bool, allow_cpu: bool) {
@@ -1710,7 +1723,7 @@ fn vkgl_present_open(native: u64, w: i32, h: i32) -> bool {
     if !(*s).ok || (*s).lost || (*s).swc_on {
         return false
     }
-    if env.get("FUI_GPU_PRESENT") == "0" || !vk.has_swapchain(&(*s).v) {
+    if env.get("FUI_GPU_PRESENT") == "0" || !vk.has_swapchain(&(*s).v) || (*s).fail_pr_open {
         return false
     }
     if !vk.sc_open(&(*s).v, &(*s).swc, native, w, h, 0) || !(*s).swc.xfer {
@@ -1783,6 +1796,9 @@ fn vkgl_present(w: i32, h: i32) -> i32 {
     }
     if !(*s).ok || (*s).lost {
         return -1
+    }
+    if (*s).fail_pr_stop && (*s).presents >= 2 {
+        return 0 // FUI_GPU_FAIL=presentstop: the swapchain "stops showing" from the 3rd present on (the caller reads back instead)
     }
     if (*s).rfb == 0 || (*s).rfb >= FB_MAX as u64 || w <= 0 || h <= 0 {
         return 0

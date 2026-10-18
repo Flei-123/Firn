@@ -56,7 +56,15 @@ run lost 5 640 400 0 20 FUI_GPU=1 FUI_GPU_PRESENT=0 FUI_GPU_FAIL=lost
 run lostp 5 640 400 0 20 FUI_GPU=1 FUI_GPU_FAIL=lost
 run open 5 640 400 0 20 FUI_GPU=1 FUI_GPU_FAIL=open
 run compile 5 640 400 0 20 FUI_GPU=1 FUI_GPU_FAIL=compile
-for t in cpu vk vkp lost lostp open compile; do sed "s/^/   $t: /" "$D/$t/out.txt" | grep "path=\|^   $t: size=\|size2"; done
+# W42-b: the rest of the chain. present = no swapchain (read-back keeps the GPU), presentstop = the swapchain stops showing at present 3
+# (read-back from then on, GPU kept), glfail = the window's GL stage is faked dead (Vulkan unaffected), def/polvk/polgl = the policies
+run present 5 640 400 0 20 FUI_GPU=1 FUI_GPU_FAIL=present
+run pstop 5 640 400 0 20 FUI_GPU=1 FUI_GPU_FAIL=presentstop
+run glfail 5 640 400 0 20 FUI_GPU=1 FUI_GPU_FAIL=glopen
+run def 5 640 400 0 20 FUI_GPU=
+run polvk 5 640 400 0 20 FUI_GPU=vk
+run polgl 5 640 400 0 20 FUI_GPU=gl
+for t in cpu vk vkp lost lostp open compile present pstop glfail def polvk polgl; do sed "s/^/   $t: /" "$D/$t/out.txt" | grep "path=\|^   $t: size=\|size2"; done
 # 1. the CPU run is the reference; 2. Vulkan really paints and equals it (near)
 grep -q "^path=cpu$" "$D/cpu/out.txt" || { echo "   FAIL: the cpu run did not paint on the CPU"; fail=1; }
 if grep -q "^path=vulkan-readback" "$D/vk/out.txt" && grep -q "gpu=true" "$D/vk/out.txt" && grep -q "^DONE" "$D/vk/out.txt"; then
@@ -90,11 +98,43 @@ if grep -q "^path=vulkan-present" "$D/lostp/out.txt" && grep -q "^size=.* gpu=fa
     echo "   ok:   device lost at present 3 -> swapchain closed, frame repainted on the CPU, canvas bit-equal to the CPU run"
 elif grep -q "^path=vulkan-readback" "$D/lostp/out.txt"; then echo "   note: no swapchain here: present-lost path NOT exercised"
 else echo "   FAIL: device-lost fallback with swapchain"; head -6 "$D/lostp/out.txt"; fail=1; fi
+# W42-b chain
+if grep -q "^path=vulkan-readback" "$D/present/out.txt" && grep -q "^size=.* gpu=true readback=true present=false" "$D/present/out.txt" && grep -q "^DONE" "$D/present/out.txt" \
+    && cmp -s "$D/vk/canvas.rgba" "$D/present/canvas.rgba"; then
+    echo "   ok:   FUI_GPU_FAIL=present -> no swapchain, read-back keeps the GPU, canvas bit-equal to the read-back run"
+elif grep -q "^path=vulkan-readback" "$D/present/out.txt" && grep -q "^size=.* gpu=true readback=true present=false" "$D/present/out.txt" && grep -q "^DONE" "$D/present/out.txt"; then
+    echo "   ok:   FUI_GPU_FAIL=present -> no swapchain, read-back keeps the GPU (canvas differs from the read-back run: see below)"; fail=1
+else echo "   FAIL: FUI_GPU_FAIL=present"; head -6 "$D/present/out.txt"; fail=1; fi
+if grep -q "^path=vulkan-present" "$D/pstop/out.txt" && grep -q "^size=.* gpu=true readback=true present=false" "$D/pstop/out.txt" && grep -q "^DONE" "$D/pstop/out.txt" \
+    && cmp -s "$D/vk/canvas.rgba" "$D/pstop/canvas.rgba"; then
+    echo "   ok:   FUI_GPU_FAIL=presentstop -> swapchain closed at present 3, GPU kept (read-back), canvas bit-equal to the read-back run"
+elif grep -q "^path=vulkan-readback" "$D/pstop/out.txt"; then echo "   note: no swapchain here: present-stop path NOT exercised"
+else echo "   FAIL: FUI_GPU_FAIL=presentstop"; head -6 "$D/pstop/out.txt"; fail=1; fi
+if grep -q "^path=vulkan-" "$D/glfail/out.txt" && grep -q "gpu=true" "$D/glfail/out.txt" && grep -q "^DONE" "$D/glfail/out.txt"; then
+    echo "   ok:   FUI_GPU_FAIL=glopen (window GL faked dead) -> Vulkan still paints (FUI_GPU=1 goes Vulkan first)"
+else echo "   FAIL: FUI_GPU_FAIL=glopen"; head -6 "$D/glfail/out.txt"; fail=1; fi
+if grep -q "^path=cpu$" "$D/def/out.txt" && cmp -s "$D/cpu/canvas.rgba" "$D/def/canvas.rgba"; then
+    echo "   ok:   FUI_GPU unset on this platform -> CPU painter (platform default), bit-equal"
+else echo "   FAIL: FUI_GPU unset is not the CPU painter here"; head -4 "$D/def/out.txt"; fail=1; fi
+if grep -q "software=true" "$D/vk/out.txt"; then
+    for t in polvk polgl; do
+        if grep -q "^path=cpu (FUI_GPU=1 asked" "$D/$t/out.txt" && grep -q "^DONE" "$D/$t/out.txt" && cmp -s "$D/cpu/canvas.rgba" "$D/$t/canvas.rgba"; then
+            echo "   ok:   policy FUI_GPU=${t#pol} on a software Vulkan device -> refused, CPU painter, bit-equal"
+        else echo "   FAIL: policy $t must refuse the software device"; head -4 "$D/$t/out.txt"; fail=1; fi
+    done
+else echo "   note: real Vulkan device here: software-refusal of FUI_GPU=vk|gl not exercised"; fi
 for t in open compile; do
     if grep -q "^path=cpu (FUI_GPU=1 asked" "$D/$t/out.txt" && grep -q "^DONE" "$D/$t/out.txt" && cmp -s "$D/cpu/canvas.rgba" "$D/$t/canvas.rgba"; then
         echo "   ok:   FUI_GPU_FAIL=$t -> CPU painter, canvas bit-equal to the CPU run"
     else echo "   FAIL: FUI_GPU_FAIL=$t fallback"; head -6 "$D/$t/out.txt"; fail=1; fi
 done
+# 3b. FUI_GPU_VALIDATE=1 (tools/fui/gpuvalidate.sh): the Khronos layer logs into each run's out.txt; any message fails the gate
+if [ "${FUI_GPU_VALIDATE:-0}" = 1 ]; then
+    if grep -l "Validation Error\|Validation Warning\|VUID-" "$D"/*/out.txt >"$D/vmsg.txt" 2>/dev/null && [ -s "$D/vmsg.txt" ]; then
+        echo "   FAIL: validation messages in: $(sed 's|.*/\([^/]*\)/out.txt|\1|' "$D/vmsg.txt" | tr '\n' ' ')"
+        cat "$D"/*/out.txt | grep -o 'VUID-[A-Za-z0-9_-]*\|Validation \(Error\|Warning\).\{0,300\}' | sort | uniq -c | sort -rn | head -8; fail=1
+    else echo "   ok:   validation layer: no messages in any window run (every window run)"; fi
+fi
 # 4. repaint time (forced full repaints incl. fUi painting), min of 3 alternating rounds. lavapipe is a CPU: NOT a GPU timing.
 if [ "$BENCH" = 1 ]; then
     for sz in "1280 800" "1920 1080"; do

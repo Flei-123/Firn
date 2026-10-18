@@ -102,6 +102,8 @@ export {
     dns_build_query, dns_parse_reply, reply_new, dns_name_valid,
     dns_parse_ipv4, dns_parse_resolv_conf, dns_parse_resolv_conf_all, dns_hosts_lookup,
     resolver_add_server6, resolver_server_is_v6,
+    resolver_set_budget, resolver_budget, resolver_port, resolver_timeout, resolver_retries, resolver_edns,
+    resolver_server_v4, dns_resolve_local, dns_cache_note, LOCAL_NONE, LOCAL_HIT, LOCAL_FAIL,
     resolver_set_edns, resolver_set_ndots, resolver_set_search, resolver_search_text,
     dns_parse_search, dns_resolve_search, dns_build_query_edns, resolver_edns_sent,
     T_A, T_CNAME, T_AAAA, T_SRV,
@@ -1010,6 +1012,7 @@ struct Resolver {
     ndots: u32,
     search: [u8; 256], // domains separated by one blank (D3)
     nsearch: usize,
+    budget_ms: u64, // 0 = no cap; else the most a blocking lookup may wait over ALL servers/retries (D9)
 }
 
 fn resolver_new() -> Resolver {
@@ -1021,7 +1024,7 @@ fn resolver_new() -> Resolver {
         n_queries: 0 as u64, n_hits: 0 as u64, n_udp: 0 as u64,
         n_tcp: 0 as u64, last_err: 0 as u32,
         edns: EDNS_PAYLOAD, n_edns: 0 as u64, ndots: 1 as u32, search: [0; 256],
-        nsearch: 0 }
+        nsearch: 0, budget_ms: 0 as u64 }
 }
 
 fn resolver_free(r: *mut Resolver) {
@@ -1357,6 +1360,7 @@ fn ask(r: *mut Resolver, name: u64, nlen: usize, qtype: u32,
     var last: i32 = X_TIMEOUT
     var attempt: u32 = 0
     var stop: bool = false
+    let t_start: u64 = now_ms()
     while attempt < (*r).retries && !stop {
         var ms: u64 = (*r).timeout_ms << (attempt as u64)
         if ms > 8000 as u64 {
@@ -1364,6 +1368,20 @@ fn ask(r: *mut Resolver, name: u64, nlen: usize, qtype: u32,
         }
         var s: usize = 0
         while s < (*r).nservers && !stop {
+            if (*r).budget_ms != 0 as u64 {
+                // D9: one budget for the whole lookup, not one per server
+                let spent: u64 = now_ms() - t_start
+                if spent >= (*r).budget_ms {
+                    return last
+                }
+                ms = (*r).budget_ms - spent
+                if ms > ((*r).timeout_ms << (attempt as u64)) {
+                    ms = (*r).timeout_ms << (attempt as u64)
+                }
+                if ms < 20 as u64 {
+                    ms = 20 as u64
+                }
+            }
             let server: u32 = (*r).servers[s]
             var idb: [u8; 2] = [0; 2]
             if !random.random_bytes((&idb[0]) as u64, 2) {
@@ -1603,6 +1621,59 @@ fn dns_resolve(r: *mut Resolver, name: u64, nlen: usize, qtype: u32,
         cache_put(r, q, nl, 1 as u32, &(*out).addr, rep.naddr, ttl as u64, now)
     }
     return true
+}
+
+// D9  A BUDGET FOR THE WHOLE BLOCKING LOOKUP. `resolver_set_budget(r, ms)`
+//     caps the total time `dns_resolve` may wait over every server and every
+//     retry (0 = no cap, the default). A program whose loop and UI share one
+//     thread sets it small (a few hundred ms) or -- better -- uses
+//     lib/async/adns.fi, which does not block at all.
+fn resolver_set_budget(r: *mut Resolver, ms: u64) { (*r).budget_ms = ms }
+fn resolver_port(r: *mut Resolver) -> u16 { return (*r).port }
+fn resolver_budget(r: *mut Resolver) -> u64 { return (*r).budget_ms }
+fn resolver_timeout(r: *mut Resolver) -> u64 { return (*r).timeout_ms }
+fn resolver_retries(r: *mut Resolver) -> u32 { return (*r).retries }
+fn resolver_edns(r: *mut Resolver) -> u32 { return (*r).edns }
+
+// The IPv4 address of server `i`, 0 when `i` is out of range or the
+// server is an IPv6 one (the async resolver asks IPv4 servers only).
+fn resolver_server_v4(r: *mut Resolver, i: usize) -> u32 {
+    if i >= (*r).nservers || (*r).fam[i] == 6 as u8 {
+        return 0 as u32
+    }
+    return (*r).servers[i]
+}
+
+const LOCAL_NONE: u32 = 0 // not known locally: the network has to be asked
+const LOCAL_HIT: u32 = 1 // answered (numeric, localhost, hosts, cache): `out` is filled
+const LOCAL_FAIL: u32 = 2 // a cached negative answer
+
+// Everything `dns_resolve_a` can answer WITHOUT the network. Never blocks.
+fn dns_resolve_local(r: *mut Resolver, name: u64, nlen: usize, out: *mut Resolved) -> u32 {
+    let saved: usize = (*r).nservers
+    (*r).nservers = 0
+    var hit: bool = false
+    var failed: bool = false
+    let ok: bool = dns_resolve(r, name, nlen, T_A, out) catch false
+    if ok {
+        hit = true
+    } else if (*r).last_err != 2 as u32 {
+        failed = true // 1 bad name, 7 / 8 negative cache entry; 2 = NoServers = "ask the network"
+    }
+    (*r).nservers = saved
+    if hit { return LOCAL_HIT }
+    if failed { return LOCAL_FAIL }
+    return LOCAL_NONE
+}
+
+// Stores an answer that came from outside `dns_resolve` (the async path).
+fn dns_cache_note(r: *mut Resolver, name: u64, nlen: usize, o: *mut Resolved) {
+    var qn: [u8; 256] = [0; 256]
+    if nlen > 200 { return }
+    copy_lower((&qn[0]) as u64, name, nlen)
+    var ttl: u32 = (*o).ttl
+    if ttl > TTL_MAX_S { ttl = TTL_MAX_S }
+    cache_put(r, (&qn[0]) as u64, nlen, 1 as u32, &(*o).addr, (*o).n, ttl as u64, now_ms())
 }
 
 fn err_of(code: u32) -> DnsError {

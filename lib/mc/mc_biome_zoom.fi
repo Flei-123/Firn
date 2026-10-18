@@ -1,0 +1,215 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_biome_zoom.fi -- vanilla client biome lookup for colours (r252): BiomeManager.getBiome (Voronoi zoom of the 4x4x4 biome cells,
+// seeded by the hashed world seed of the Join Game / Respawn packet) and the swamp grass colour noise (Biome.BIOME_INFO_NOISE).
+// Both follow the 1.20.1 client byte code (checked against the obfuscated classes of server-1.20.1.jar, see tests 4092-4094).
+//
+//     let q: BzQuart = bz_pick(hashed_seed, block_x, block_y, block_z)       // quart cell whose biome the block uses
+//     let sw: SwampNoise = swamp_new()
+//     let rgb: u32 = swamp_grass(&sw, block_x, block_z)                      // 0x4C763C or 0x6A7039
+//
+// BiomeManager.getBiome(pos): i = x - 2 ..., cell = i >> 2, fraction = (i & 3) / 4; of the 8 cells around, the one with the smallest
+// distance (fraction offset + fiddle of the cell) wins; the fiddle comes from LinearCongruentialGenerator.next chains keyed by the cell and
+// the seed. The result is a cell (x >> 2, y >> 2, z >> 2 coordinates) whose biome the caller looks up.
+import std.rt
+import std.core
+import std.math
+import mc.mc_noise
+
+export {
+    BzQuart, bz_lcg, bz_fiddle, bz_dist, bz_pick,
+    SwampNoise, swamp_new, swamp_value, swamp_grass,
+}
+
+const LCG_MUL: u64 = 6364136223846793005
+const LCG_ADD: u64 = 1442695040888963407
+
+struct BzQuart {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+// LinearCongruentialGenerator.next(seed, salt): seed * (seed * MUL + ADD) + salt (64 bit wrap-around)
+fn bz_lcg(seed: u64, salt: i64) -> u64 {
+    let s: u64 = seed *% (seed *% LCG_MUL +% LCG_ADD)
+    return s +% (salt as u64)
+}
+
+// BiomeManager.getFiddle: floorMod(l >> 24, 1024) / 1024 centred and scaled to (-0.45 .. 0.45)
+#[allow_fp]
+fn bz_fiddle(l: u64) -> f64 {
+    let m: u64 = (l >> (24 as u32)) & (1023 as u64)
+    return ((m as i64) as f64 / 1024.0 - 0.5) * 0.9
+}
+
+// BiomeManager.getFiddledDistance for the cell (x, y, z) and the fractional offset (xn, yn, zn) of the block inside it
+#[allow_fp]
+fn bz_dist(seed: u64, x: i32, y: i32, z: i32, xn: f64, yn: f64, zn: f64) -> f64 {
+    var l: u64 = bz_lcg(seed, x as i64)
+    l = bz_lcg(l, y as i64)
+    l = bz_lcg(l, z as i64)
+    l = bz_lcg(l, x as i64)
+    l = bz_lcg(l, y as i64)
+    l = bz_lcg(l, z as i64)
+    let d: f64 = bz_fiddle(l)
+    l = bz_lcg(l, seed as i64)
+    let e: f64 = bz_fiddle(l)
+    l = bz_lcg(l, seed as i64)
+    let f: f64 = bz_fiddle(l)
+    let a: f64 = zn + f
+    let b: f64 = yn + e
+    let c: f64 = xn + d
+    return a * a + b * b + c * c
+}
+
+// BiomeManager.getBiome(x, y, z): the quart cell (block coordinates >> 2 grid) the block takes its biome from. `seed` = hashed world seed.
+#[allow_fp]
+fn bz_pick(seed: u64, bx: i32, by: i32, bz: i32) -> BzQuart {
+    let i: i32 = bx - 2
+    let j: i32 = by - 2
+    let k: i32 = bz - 2
+    let l: i32 = i >> 2
+    let m: i32 = j >> 2
+    let n: i32 = k >> 2
+    let d: f64 = (i & 3) as f64 / 4.0
+    let e: f64 = (j & 3) as f64 / 4.0
+    let f: f64 = (k & 3) as f64 / 4.0
+    var best: i32 = 0
+    var g: f64 = 1000000.0
+    var p: i32 = 0
+    while p < 8 {
+        let bl: bool = (p & 4) == 0
+        let bl2: bool = (p & 2) == 0
+        let bl3: bool = (p & 1) == 0
+        var q: i32 = l + 1
+        var h: f64 = d - 1.0
+        if bl {
+            q = l
+            h = d
+        }
+        var r: i32 = m + 1
+        var t: f64 = e - 1.0
+        if bl2 {
+            r = m
+            t = e
+        }
+        var s: i32 = n + 1
+        var u: f64 = f - 1.0
+        if bl3 {
+            s = n
+            u = f
+        }
+        let v: f64 = bz_dist(seed, q, r, s, h, t, u)
+        if g > v {
+            best = p
+            g = v
+        }
+        p = p + 1
+    }
+    var w: i32 = l + 1
+    if (best & 4) == 0 { w = l }
+    var x: i32 = m + 1
+    if (best & 2) == 0 { x = m }
+    var y: i32 = n + 1
+    if (best & 1) == 0 { y = n }
+    return BzQuart { x: w, y: x, z: y }
+}
+
+// ---- swamp grass colour -----------------------------------------------------------------------------
+
+// Biome.BIOME_INFO_NOISE = PerlinSimplexNoise(WorldgenRandom(LegacyRandomSource(2345)), [0]): ONE octave of SimplexNoise (vanilla variant:
+// permutation shuffled by the random source, gradient table of 12 cube edges), evaluated with useOffsets = false.
+struct SwampNoise {
+    p: [u8; 256],
+}
+
+fn swamp_new() -> SwampNoise {
+    var sn: SwampNoise = SwampNoise { p: [0 as u8; 256] }
+    var g: mc_noise.JavaRandom = mc_noise.jrandom_new(2345)
+    // SimplexNoise(RandomSource): xo, yo, zo are drawn first (and unused with useOffsets = false), then the permutation is shuffled
+    mc_noise.jrandom_next_double(&g)
+    mc_noise.jrandom_next_double(&g)
+    mc_noise.jrandom_next_double(&g)
+    var i: usize = 0
+    while i < 256 {
+        sn.p[i] = i as u8
+        i = i + 1
+    }
+    i = 0
+    while i < 256 {
+        let j: usize = mc_noise.jrandom_next_int_bound(&g, (256 - i) as i32) as usize
+        let tmp: u8 = sn.p[i]
+        sn.p[i] = sn.p[j + i]
+        sn.p[j + i] = tmp
+        i = i + 1
+    }
+    return sn
+}
+
+fn sw_p(sn: *mut SwampNoise, i: i32) -> i32 {
+    return (*sn).p[(i & 255) as usize] as i32
+}
+
+// gradient of the 12 cube edges (index % 12); the third component of the evaluation point is 0
+fn sw_gx(i: i32) -> f64 {
+    if i == 0 || i == 2 || i == 4 || i == 6 { return 1.0 }
+    if i == 1 || i == 3 || i == 5 || i == 7 { return 0.0 - 1.0 }
+    return 0.0
+}
+
+fn sw_gy(i: i32) -> f64 {
+    if i == 0 || i == 1 || i == 8 || i == 10 { return 1.0 }
+    if i == 2 || i == 3 || i == 9 || i == 11 { return 0.0 - 1.0 }
+    return 0.0
+}
+
+// SimplexNoise.getCornerNoise3D with z = 0 (the z gradient part multiplies 0)
+#[allow_fp]
+fn sw_corner(index: i32, x: f64, y: f64) -> f64 {
+    var d: f64 = 0.5 - x * x - y * y
+    if d < 0.0 { return 0.0 }
+    d = d * d
+    return d * d * (sw_gx(index) * x + sw_gy(index) * y)
+}
+
+// SimplexNoise.getValue(x, y)
+#[allow_fp]
+fn swamp_value(sn: *mut SwampNoise, x: f64, y: f64) -> f64 {
+    let f2: f64 = 0.5 * (math.sqrt(3.0) - 1.0)
+    let g2: f64 = (3.0 - math.sqrt(3.0)) / 6.0
+    let d: f64 = (x + y) * f2
+    let i: i32 = math.floor(x + d) as i32
+    let j: i32 = math.floor(y + d) as i32
+    let e: f64 = (i + j) as f64 * g2
+    let f: f64 = i as f64 - e
+    let g: f64 = j as f64 - e
+    let h: f64 = x - f
+    let k: f64 = y - g
+    var l: i32 = 0
+    var m: i32 = 1
+    if h > k {
+        l = 1
+        m = 0
+    }
+    let n: f64 = h - l as f64 + g2
+    let o: f64 = k - m as f64 + g2
+    let p: f64 = h - 1.0 + 2.0 * g2
+    let q: f64 = k - 1.0 + 2.0 * g2
+    let r: i32 = i & 255
+    let s: i32 = j & 255
+    let t: i32 = sw_p(sn, r + sw_p(sn, s)) % 12
+    let u: i32 = sw_p(sn, r + l + sw_p(sn, s + m)) % 12
+    let v: i32 = sw_p(sn, r + 1 + sw_p(sn, s + 1)) % 12
+    let w: f64 = sw_corner(t, h, k)
+    let z: f64 = sw_corner(u, n, o)
+    let aa: f64 = sw_corner(v, p, q)
+    return 70.0 * (w + z + aa)
+}
+
+// SwampGrassColorModifier at the block column (bx, bz): noise(x * 0.0225, z * 0.0225) < -0.1 -> 0x4C763C else 0x6A7039
+#[allow_fp]
+fn swamp_grass(sn: *mut SwampNoise, bx: i32, bz: i32) -> u32 {
+    let v: f64 = swamp_value(sn, bx as f64 * 0.0225, bz as f64 * 0.0225)
+    if v < 0.0 - 0.1 { return 5011004 as u32 }
+    return 6975545 as u32
+}

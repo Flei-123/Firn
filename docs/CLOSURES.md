@@ -127,4 +127,9 @@ let s = option.opt_some[i32]             // module qualified
   argument gives no type there (write `apply_g[i32](inc, 4)`).
 * `mod.f` (qualified, no `[T]`) is a generic fn value in both compilers (`option.opt_some`): modules.rs resolves it to the global template name.
 * firnc1: a fn-typed/untyped variable named like a generic fn hides it; `ty_of` knows casts, `&x`, module statics/consts.
-* Bound method value `x.m` is NOT built (needs a closure record = `try gc |a| x.m(a)`; `Type.m` passes the receiver as first argument).
+* Bound method value (r750, firnc0 only): `try x.m` (x = a plain variable of type `*T` / `*mut T`, `m` a method, no call) is
+  `try gc |a0, ..| x.m(a0, ..)` -- the record captures the receiver pointer (one word, by value). Parameter and result types
+  come from the METHOD, so no expected type is needed (`let g = try p.add`). Without `try` -> error "needs `try`"
+  (tests/neg/4352); a struct VALUE receiver -> error "receiver is not a pointer" (tests/neg/4303); `Type.m` still passes the
+  receiver as first argument. The program needs the GC runtime (some `gc` token or `import std.vec`) so that `AllocError` exists.
+  Test 4351 (`firnc1_skip`): firnc1 builds closures inside the parser (capture analysis while parsing), so the twin needs types in the parser.

@@ -1,0 +1,317 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/async/adns.fi -- A NON-BLOCKING DNS LOOKUP on the event loop.
+//
+// WHY. lib/net/dns.fi asks with a blocking UDP socket: a name that is not in
+// the cache stalls the calling thread until a server answers (or 2 s per
+// attempt run out). On Android the loop and the UI are ONE thread, so a slow
+// resolver froze the window for up to 2.7 s (r104). This file asks the same
+// servers (the Resolver's list, its cache, its hosts table) with a
+// NON-BLOCKING UDP socket watched by the loop; the caller gets a callback.
+//
+// USE
+//     let k: u32 = adns.adns_local(&res, name, n, &out)   // never blocks
+//     if k == dns.LOCAL_HIT   -> out is filled, go on
+//     if k == dns.LOCAL_FAIL  -> the name is known not to resolve
+//     else                    -> let q = adns.adns_start(l, &res, name, n, cb, ud)
+//                                (0 = could not start: use the blocking path
+//                                or fail); `cb(ud, ok, &Resolved)` runs from the
+//                                loop. After the callback the query is gone:
+//                                clear your pointer there. `adns_cancel(q)`
+//                                only while the callback has not run.
+//
+// HONEST
+//   A1 IPv4 name servers and A records only (the rest of dns.fi is for the
+//      blocking path). A resolver with no IPv4 server: adns_start returns 0.
+//   A2 UDP only. A truncated answer (TC) counts as a failure of that server;
+//      for one A question with EDNS (1232 octets) this is rare.
+//   A3 One query in flight per AQuery; servers are tried in order, one
+//      attempt each per round, `resolver_retries` rounds, the per-attempt
+//      time doubles per round like dns.ask. Nothing waits: the time is in
+//      loop timers.
+//   A4 CNAME chains are followed only INSIDE one answer (dns_parse_reply
+//      does that); an answer with a CNAME and no address is a failure.
+//   A5 Successful answers go into the Resolver's cache (dns_cache_note), so
+//      the second lookup of a name is `adns_local` and costs nothing.
+import std.rt
+import std.net
+import std.crypto.random
+import net.dns
+import net.udp
+import async.loop
+
+export { AQuery, adns_local, adns_start, adns_cancel, adns_pending }
+
+struct AQuery {
+    l: *mut loop.Loop,
+    r: *mut dns.Resolver,
+    name: [u8; 256],
+    nlen: usize,
+    si: usize, // index of the server being asked
+    round: u32,
+    id: u32,
+    fd: i64,
+    wh: u64, // watch handle
+    th: u64, // timer handle
+    cb: fn(u64, bool, *mut dns.Resolved),
+    ud: u64,
+    out: dns.Resolved,
+    rep: dns.Reply,
+    pending: bool,
+}
+
+static mut G_PENDING: usize = 0
+
+fn adns_pending() -> usize { return G_PENDING }
+
+fn adns_local(r: *mut dns.Resolver, name: u64, nlen: usize,
+    out: *mut dns.Resolved) -> u32 {
+    return dns.dns_resolve_local(r, name, nlen, out)
+}
+
+// `size_of` only knows the types of the root file, but a generic parameter is
+// substituted before it is asked (the same trick as lib/async/stream.fi).
+fn adns_obj_alloc[T]() -> u64 {
+    return rt.heap_alloc(size_of[T]())
+}
+
+fn adns_obj_free[T](p: u64) {
+    rt.heap_free(p, size_of[T]())
+}
+
+fn q_alloc() -> *mut AQuery {
+    return adns_obj_alloc[AQuery]() as *mut AQuery
+}
+
+fn q_release(q: *mut AQuery) {
+    adns_obj_free[AQuery](q as u64)
+}
+
+fn q_close_io(q: *mut AQuery) {
+    if (*q).wh != 0 {
+        loop.watch_del((*q).l, (*q).wh)
+        (*q).wh = 0
+    }
+    if (*q).th != 0 {
+        loop.timer_cancel((*q).l, (*q).th)
+        (*q).th = 0
+    }
+    if (*q).fd >= 0 {
+        udp.udp_close((*q).fd)
+        (*q).fd = 0 - 1
+    }
+}
+
+fn q_finish(q: *mut AQuery, ok: bool) {
+    q_close_io(q)
+    (*q).pending = false
+    if G_PENDING > 0 {
+        G_PENDING = G_PENDING - 1
+    }
+    let cb: fn(u64, bool, *mut dns.Resolved) = (*q).cb
+    let ud: u64 = (*q).ud
+    if ok {
+        dns.dns_cache_note((*q).r, (&(*q).name[0]) as u64, (*q).nlen, &(*q).out)
+    }
+    cb(ud, ok, &(*q).out)
+    q_release(q)
+}
+
+fn attempt_ms(q: *mut AQuery) -> i64 {
+    var ms: u64 = dns.resolver_timeout((*q).r) << ((*q).round as u64)
+    if ms > 8000 as u64 {
+        ms = 8000 as u64
+    }
+    return ms as i64
+}
+
+// Sends the question to server (*q).si, arms the read watch and the timer.
+// false = this attempt cannot even be made (no socket / send failed).
+fn send_attempt(q: *mut AQuery) -> bool {
+    let server: u32 = dns.resolver_server_v4((*q).r, (*q).si)
+    if server == 0 as u32 {
+        return false
+    }
+    var idb: [u8; 2] = [0; 2]
+    if !random.random_bytes((&idb[0]) as u64, 2) {
+        return false
+    }
+    (*q).id = ((idb[0] as u32) << 8) | (idb[1] as u32)
+    var qb: rt.Buf = rt.buf_new()
+    if !dns.dns_build_query_edns(&qb, (*q).id, (&(*q).name[0]) as u64, (*q).nlen,
+        dns.T_A, dns.resolver_edns((*q).r)) {
+        rt.buf_free(&qb)
+        return false
+    }
+    let fd: i64 = udp.udp_open()
+    if fd < 0 {
+        rt.buf_free(&qb)
+        return false
+    }
+    if !net.set_nonblocking_fd(fd as i32, true) {
+        udp.udp_close(fd)
+        rt.buf_free(&qb)
+        return false
+    }
+    let sent: i64 = udp.udp_sendto(fd, qb.ptr, qb.len, server, dns.resolver_port((*q).r))
+    rt.buf_free(&qb)
+    if sent < 0 {
+        udp.udp_close(fd)
+        return false
+    }
+    (*q).fd = fd
+    (*q).wh = loop.watch_add((*q).l, fd as i32, loop.EV_READ, on_readable, q as u64)
+    if (*q).wh == 0 {
+        udp.udp_close(fd)
+        (*q).fd = 0 - 1
+        return false
+    }
+    (*q).th = loop.timer_after((*q).l, attempt_ms(q), on_timeout, q as u64)
+    return true
+}
+
+// The next server (or the next round); false = nothing left to ask.
+fn next_attempt(q: *mut AQuery) -> bool {
+    q_close_io(q)
+    var guard: usize = 0
+    while guard < 16 {
+        (*q).si = (*q).si + 1
+        if (*q).si >= dns.resolver_server_count((*q).r) {
+            (*q).si = 0
+            (*q).round = (*q).round + 1
+        }
+        if (*q).round >= dns.resolver_retries((*q).r) {
+            return false
+        }
+        if send_attempt(q) {
+            return true
+        }
+        guard = guard + 1
+    }
+    return false
+}
+
+fn on_timeout(l: *mut loop.Loop, ud: u64) {
+    let q: *mut AQuery = ud as *mut AQuery
+    (*q).th = 0
+    if !next_attempt(q) {
+        q_finish(q, false)
+    }
+}
+
+fn on_readable(l: *mut loop.Loop, ud: u64, ev: u32) {
+    let q: *mut AQuery = ud as *mut AQuery
+    var buf: [u8; 1500] = [0; 1500]
+    var go: bool = true
+    var n_read: usize = 0
+    while go && n_read < 8 {
+        var fa: u32 = 0
+        var fp: u16 = 0 as u16
+        let k: i64 = udp.udp_recvfrom((*q).fd, (&buf[0]) as u64, 1500, &fa, &fp)
+        n_read = n_read + 1
+        if k < 0 {
+            go = false
+            if !udp.udp_is_timeout(k) {
+                // a real socket error (ICMP refused...): try the next server
+                if !next_attempt(q) {
+                    q_finish(q, false)
+                }
+            }
+        } else {
+            let server: u32 = dns.resolver_server_v4((*q).r, (*q).si)
+            var mine: bool = fa == server && fp == dns.resolver_port((*q).r)
+            if mine {
+                (*q).rep = dns.reply_new()
+                mine = dns.dns_parse_reply((&buf[0]) as u64, k as usize,
+                    (&(*q).name[0]) as u64, (*q).nlen, dns.T_A, &(*q).rep)
+                    && (*q).rep.id == (*q).id
+            }
+            if mine {
+                go = false
+                got_answer(q)
+            }
+        }
+    }
+}
+
+// A well formed answer from the server asked, with our ID.
+fn got_answer(q: *mut AQuery) {
+    if (*q).rep.truncated || ((*q).rep.rcode != 0 as u32 && (*q).rep.rcode != 3 as u32) {
+        if !next_attempt(q) {
+            q_finish(q, false)
+        }
+        return
+    }
+    if (*q).rep.rcode == 3 as u32 || (*q).rep.naddr == 0 {
+        q_finish(q, false)
+        return
+    }
+    var i: usize = 0
+    while i < (*q).rep.naddr && i < 8 {
+        (*q).out.addr[i] = (*q).rep.addr[i]
+        i = i + 1
+    }
+    (*q).out.n = i
+    var ttl: u32 = (*q).rep.ttl
+    if ttl == 4294967295 as u32 {
+        ttl = 0 as u32
+    }
+    (*q).out.ttl = ttl
+    (*q).out.via = dns.VIA_UDP
+    q_finish(q, true)
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return c + 32 as u8
+    }
+    return c
+}
+
+// Starts the lookup. 0 = not started (bad name, no IPv4 server, no memory,
+// no socket): the callback will NOT run, the caller decides what to do.
+fn adns_start(l: *mut loop.Loop, r: *mut dns.Resolver, name: u64, nlen: usize,
+    cb: fn(u64, bool, *mut dns.Resolved), ud: u64) -> *mut AQuery {
+    var nl: usize = nlen
+    if nl > 0 && rt.ld8(name, nl - 1) == 46 as u8 {
+        nl = nl - 1
+    }
+    if nl == 0 || nl > 253 || !dns.dns_name_valid(name, nl) {
+        return 0 as *mut AQuery
+    }
+    if dns.resolver_server_v4(r, 0) == 0 as u32 && dns.resolver_server_count(r) == 0 {
+        return 0 as *mut AQuery
+    }
+    let q: *mut AQuery = q_alloc()
+    if q as u64 == 0 {
+        return q
+    }
+    *q = AQuery { l: l, r: r, name: [0; 256], nlen: nl, si: 0, round: 0 as u32, id: 0 as u32,
+        fd: 0 - 1, wh: 0, th: 0, cb: cb, ud: ud, out: dns.resolved_new(),
+        rep: dns.reply_new(), pending: true }
+    var i: usize = 0
+    while i < nl {
+        (*q).name[i] = lower(rt.ld8(name, i))
+        i = i + 1
+    }
+    G_PENDING = G_PENDING + 1
+    if !send_attempt(q) && !next_attempt(q) {
+        // nothing could be sent: undo, the callback does not run
+        G_PENDING = G_PENDING - 1
+        q_release(q)
+        return 0 as *mut AQuery
+    }
+    return q
+}
+
+// Gives up a lookup whose callback has not run yet. No callback follows.
+fn adns_cancel(q: *mut AQuery) {
+    if q as u64 == 0 || !(*q).pending {
+        return
+    }
+    q_close_io(q)
+    (*q).pending = false
+    if G_PENDING > 0 {
+        G_PENDING = G_PENDING - 1
+    }
+    q_release(q)
+}

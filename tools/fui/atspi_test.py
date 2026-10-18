@@ -26,7 +26,7 @@ ROLE = {
     "tabpanel": 39, "menu": 33, "menuitem": 35, "toolbar": 63, "scrollbar": 48,
     "separator": 50, "group": 39, "heading": 83, "link": 88, "image": 27, "tooltip": 64,
     "status": 54, "menuitemcheckbox": 8, "menuitemradio": 45, "dialog": 16,
-    "alertdialog": 2, "generic": 20,
+    "alertdialog": 2, "generic": 20, "columnheader": 25,
 }
 STATE = {"focusable": 11, "focused": 12, "selected": 23, "checked": 4, "mixed": 32,
          "pressed": 20, "expanded": 10, "collapsed": 5}
@@ -194,8 +194,9 @@ def main():
     # --- the table: rows are TABLE_ROW objects, their cells TABLE_CELL objects (paths c<node>_<row>_<col>)
     tb = find("table", "People")
     check(tb is not None, "table 'People' is in the tree")
-    tk = c.call(tb, ACC, "GetChildren")
-    check(len(tk) == 2 and all(str(k[1]).startswith("/org/a11y/atspi/accessible/v") for k in tk), "table: the rows are objects (%d)" % len(tk))
+    tkall = c.call(tb, ACC, "GetChildren")
+    tk = [k for k in tkall if str(k[1]).startswith("/org/a11y/atspi/accessible/v")]
+    check(len(tk) == 2 and len(tkall) == 5, "table: the rows are objects (%d) and the 3 header cells follow (%d children)" % (len(tk), len(tkall)))
     check(c.call(str(tk[0][1]), ACC, "GetRole") == 90, "table row has the role TABLE_ROW (90)")
     ck = c.call(str(tk[1][1]), ACC, "GetChildren")
     check(len(ck) == 3 and all(str(k[1]).startswith("/org/a11y/atspi/accessible/c") for k in ck), "table row: 3 cell objects")
@@ -203,6 +204,75 @@ def main():
     check([str(c.prop(str(k[1]), ACC, "Name")) for k in ck] == ["Bruno", "25", "b-02"], "table cells are named by their text")
     check(str(c.prop(str(ck[2][1]), ACC, "Parent")[1]) == str(tk[1][1]), "cell parent is its row")
     check(c.call(str(ck[2][1]), ACC, "GetIndexInParent") == 2, "cell index in parent is its column")
+
+    # --- W42: the Table interface, TableCell and the header cells (columnheader)
+    TBL, TCELL = "org.a11y.atspi.Table", "org.a11y.atspi.TableCell"
+    NULLP = "/org/a11y/atspi/null"
+    tifs = [str(i) for i in c.call(tb, ACC, "GetInterfaces")]
+    check(TBL in tifs and TBL not in [str(i) for i in c.call(cb, ACC, "GetInterfaces")], "table offers the Table interface, a check box does not")
+    check(TCELL in [str(i) for i in c.call(str(ck[0][1]), ACC, "GetInterfaces")], "table cell offers TableCell")
+    check(int(c.prop(tb, TBL, "NRows")) == 2 and int(c.prop(tb, TBL, "NColumns")) == 3, "Table: NRows 2, NColumns 3")
+    ga = c.prop  # alias: properties by name
+    tall = c.obj(tb).GetAll(TBL, dbus_interface=PROPS)
+    check(int(tall["NRows"]) == 2 and int(tall["NColumns"]) == 3 and int(tall["NSelectedRows"]) == 0 and int(tall["NSelectedColumns"]) == 0,
+          "Properties.GetAll(Table)")
+    check(str(c.prop(tb, TBL, "Caption")[1]) == NULLP and str(c.prop(tb, TBL, "Summary")[1]) == NULLP, "Table: Caption / Summary are the null reference")
+    check(str(c.call(tb, TBL, "GetAccessibleAt", 1, 2)[1]) == str(ck[2][1]), "Table.GetAccessibleAt(1,2) is the cell of row 1, column 2")
+    try:
+        c.call(tb, TBL, "GetAccessibleAt", 9, 0)
+        check(False, "GetAccessibleAt out of range gives an error")
+    except dbus.DBusException as e:
+        check("InvalidArgs" in str(e), "GetAccessibleAt out of range gives InvalidArgs")
+    check(c.call(tb, TBL, "GetIndexAt", 1, 2) == 5 and c.call(tb, TBL, "GetIndexAt", 2, 0) == -1, "Table.GetIndexAt(1,2) = 5, out of range = -1")
+    check(c.call(tb, TBL, "GetRowAtIndex", 5) == 1 and c.call(tb, TBL, "GetColumnAtIndex", 5) == 2 and c.call(tb, TBL, "GetRowAtIndex", 6) == -1,
+          "Table.GetRowAtIndex(5) = 1, GetColumnAtIndex(5) = 2, index 6 = -1")
+    ext = [int(v) for v in c.call(tb, TBL, "GetRowColumnExtentsAtIndex", 4)]
+    check(ext[0] == 1 and ext[1:5] == [1, 1, 1, 1] and ext[5] == 0, "Table.GetRowColumnExtentsAtIndex(4) = row 1, col 1, 1x1, not selected")
+    check(c.call(tb, TBL, "GetRowExtentAt", 0, 0) == 1 and c.call(tb, TBL, "GetColumnExtentAt", 1, 2) == 1 and c.call(tb, TBL, "GetColumnExtentAt", 5, 0) == 0,
+          "Table: row/column extents are 1 (0 out of range)")
+    check([str(c.call(tb, TBL, "GetColumnDescription", i)) for i in range(3)] == ["Name", "Age", "ID"] and str(c.call(tb, TBL, "GetRowDescription", 0)) == "",
+          "Table.GetColumnDescription = the header titles")
+    heads = [k for k in tkall if str(k[1]).startswith("/org/a11y/atspi/accessible/h")]
+    check(len(heads) == 3 and [str(k[1]) for k in tkall[-3:]] == [str(k[1]) for k in heads], "header cells are the last 3 children of the table")
+    check([c.call(str(k[1]), ACC, "GetRole") for k in heads] == [25, 25, 25], "header cells have the role COLUMN_HEADER (25)")
+    check(str(c.call(str(heads[0][1]), ACC, "GetRoleName")) == "columnheader", "header role name is 'columnheader'")
+    check([str(c.prop(str(k[1]), ACC, "Name")) for k in heads] == ["Name", "Age", "ID"], "header cells are named by their column titles")
+    check(str(c.prop(str(heads[1][1]), ACC, "Parent")[1]) == tb and c.call(str(heads[1][1]), ACC, "GetIndexInParent") == 3, "header parent is the table, index = after the rows")
+    check(str(c.call(tb, TBL, "GetColumnHeader", 1)[1]) == str(heads[1][1]) and str(c.call(tb, TBL, "GetColumnHeader", 7)[1]) == NULLP,
+          "Table.GetColumnHeader(1) is the header cell (null out of range)")
+    check(str(c.call(tb, TBL, "GetRowHeader", 0)[1]) == NULLP, "Table.GetRowHeader is the null reference (no row headers)")
+    hx = [int(v) for v in c.call(str(heads[1][1]), COMP, "GetExtents", dbus.UInt32(0))]
+    tx = [int(v) for v in c.call(tb, COMP, "GetExtents", dbus.UInt32(0))]
+    cx = [int(v) for v in c.call(str(ck[1][1]), COMP, "GetExtents", dbus.UInt32(0))]
+    check(hx[2] > 0 and hx[3] > 0 and hx[1] < cx[1] and hx[0] == cx[0] and hx[2] == cx[2] and hx[1] >= tx[1], "header cell: extent above its column's body cells, same x and width")
+    hifs = [str(i) for i in c.call(str(heads[0][1]), ACC, "GetInterfaces")]
+    check(COMP in hifs and ACT in hifs and TBL not in hifs, "header cell offers Component and Action")
+    check(c.prop(str(ck[2][1]), TCELL, "Position") == (1, 2) or [int(v) for v in c.prop(str(ck[2][1]), TCELL, "Position")] == [1, 2], "TableCell.Position = (row 1, column 2)")
+    check(int(c.prop(str(ck[2][1]), TCELL, "RowSpan")) == 1 and int(c.prop(str(ck[2][1]), TCELL, "ColumnSpan")) == 1, "TableCell: spans are 1")
+    check(str(c.prop(str(ck[2][1]), TCELL, "Table")[1]) == tb, "TableCell.Table is the table")
+    chc = c.call(str(ck[1][1]), TCELL, "GetColumnHeaderCells")
+    check(len(chc) == 1 and str(chc[0][1]) == str(heads[1][1]) and len(c.call(str(ck[1][1]), TCELL, "GetRowHeaderCells")) == 0,
+          "TableCell.GetColumnHeaderCells = the header of its column, no row headers")
+    rcs = [int(v) for v in c.call(str(ck[1][1]), TCELL, "GetRowColumnSpan")]
+    check(rcs == [1, 1, 1, 1, 1], "TableCell.GetRowColumnSpan = (row 1, col 1, 1x1)")
+    check(c.call(tb, TBL, "IsRowSelected", 0) == 0 and len(c.call(tb, TBL, "GetSelectedRows")) == 0, "no row is selected at first")
+    time.sleep(0.2)
+    check(bool(c.call(str(tk[0][1]), ACT, "DoAction", 0)), "DoAction on a row answers true (a click in the row)")
+    time.sleep(0.4)
+    check(c.call(tb, TBL, "IsRowSelected", 0) == 1 and c.call(tb, TBL, "IsRowSelected", 1) == 0 and c.call(tb, TBL, "IsSelected", 0, 1) == 1,
+          "after the click row 0 is selected (IsRowSelected / IsSelected)")
+    check([int(v) for v in c.call(tb, TBL, "GetSelectedRows")] == [0] and int(c.prop(tb, TBL, "NSelectedRows")) == 1, "Table.GetSelectedRows = [0], NSelectedRows 1")
+    check(23 in bits(c.call(str(tk[0][1]), ACC, "GetState")), "the selected row has the state SELECTED")
+    check(c.call(tb, TBL, "GetSelectedColumns") == [] and c.call(tb, TBL, "IsColumnSelected", 0) == 0 and c.call(tb, TBL, "AddRowSelection", 1) == 0,
+          "no column selection; AddRowSelection is refused (read only)")
+    # a header Invoke sorts like the mouse: two clicks on 'Name' = descending, 'Bruno' comes first
+    check(bool(c.call(str(heads[0][1]), ACT, "DoAction", 0)), "DoAction on the 'Name' header answers true")
+    time.sleep(0.4)
+    check(bool(c.call(str(heads[0][1]), ACT, "DoAction", 0)), "second DoAction on the 'Name' header answers true")
+    time.sleep(0.4)
+    tk2 = [k for k in c.call(tb, ACC, "GetChildren") if str(k[1]).startswith("/org/a11y/atspi/accessible/v")]
+    first = [str(c.prop(str(k[1]), ACC, "Name")) for k in c.call(str(tk2[0][1]), ACC, "GetChildren")]
+    check(first[0] == "Bruno", "the header click sorted the table: first row is now %r" % first[:1])
 
     # --- hit test over the bus
     ex = c.call(cb, COMP, "GetExtents", dbus.UInt32(0))

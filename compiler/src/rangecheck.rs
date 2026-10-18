@@ -644,51 +644,67 @@ impl<'a> Ana<'a> {
         (addr, 0)
     }
 
-    /// r759: `op` is the store of one ELEMENT of the `Vec` whose length word
-    /// is at `hdr` (base, offset): it writes `data + idx * size` where `data` is the
-    /// pointer word of that same header (the word right before the length,
-    /// layout `{ptr, len, cap}`) and `idx` is the result of a `CheckedIdxV`
-    /// against that same length word. Such a store lies inside the buffer
-    /// (the index was checked) and a buffer never contains its own header,
-    /// so the length word is not touched. Any other store (a raw pointer, a
-    /// field, a call, a push) is a write as before.
+    /// r759/r763: `op` is the store of one ELEMENT of some `Vec` and cannot
+    /// reach the length word at `hdr` (base, offset).
+    ///
+    /// The store writes `data + idx * size` where `data` is the pointer word
+    /// of a header `{ptr, len, cap}` (the word right before its length) and
+    /// `idx` is the result of a `CheckedIdxV` against that header's length
+    /// word. Such a store lies inside the data buffer of that Vec (the index
+    /// was checked) and a buffer never contains its own header.
+    ///
+    ///  * OWN header (r759): the Vec is the one whose length word is `hdr`.
+    ///    The store cannot touch it, a buffer never contains its own header.
+    ///  * FOREIGN header (r763): another Vec `v` is stored into, `hdr` is the
+    ///    header of `w`. Assumption (documented, as above): a data buffer
+    ///    holds a foreign header only as part of an element, i.e. the
+    ///    element embeds a `Vec` by value and is at least 24 bytes. So the
+    ///    store counts as harmless only if the element is smaller than a
+    ///    header: the stride is a constant below 24 (or 1) and a `CopyMem`
+    ///    copies less than 24 bytes. Stores into bigger elements stay writes.
+    ///
+    /// Any other store (a raw pointer, a field, a call, a push) is a write.
     fn elem_store_of(&self, op: &Op, hdr: (Val, i128)) -> bool {
-        let dst = match op {
-            Op::Store { addr, .. } => *addr,
-            Op::CopyMem { dst, .. } => *dst,
+        let (dst, copy) = match op {
+            Op::Store { addr, .. } => (*addr, None),
+            Op::CopyMem { dst, size, .. } => (*dst, Some(*size)),
             _ => return false,
         };
-        let (hb, hk) = hdr;
         let (ptr_addr, off) = match self.op_of(dst) {
             Some(Op::PtrAdd { base, off }) => (*base, *off),
             _ => return false,
         };
-        // data pointer: a load of the word at `len - 8` of the same header
+        // data pointer: a load of the pointer word of some header
         let word = match self.op_of(ptr_addr) {
             Some(Op::Load { addr }) => *addr,
             _ => return false,
         };
         let (wb, wk) = self.base_off(word);
-        if wb != hb || wk != hk - 8 {
-            return false;
-        }
         // the offset: `idx` or `idx * c`, `idx` a checked index of this length
-        let idx = match self.op_of(off) {
+        let (idx, stride) = match self.op_of(off) {
             Some(Op::Bin(BinOp::Mul, a, b)) => {
-                if matches!(self.op_of(*b), Some(Op::Const(_))) {
-                    *a
-                } else if matches!(self.op_of(*a), Some(Op::Const(_))) {
-                    *b
+                if let Some(Op::Const(c)) = self.op_of(*b) {
+                    (*a, *c)
+                } else if let Some(Op::Const(c)) = self.op_of(*a) {
+                    (*b, *c)
                 } else {
                     return false;
                 }
             }
-            _ => off,
+            _ => (off, 1),
         };
+        // the length word of the header the data pointer belongs to
+        let own = (wb, wk + 8);
         match self.op_of(idx) {
-            Some(Op::CheckedIdxV { len, .. }) => self.len_word_of(*len) == Some(hdr),
-            _ => false,
+            Some(Op::CheckedIdxV { len, .. }) if self.len_word_of(*len) == Some(own) => {}
+            _ => return false,
         }
+        if own == hdr {
+            return true;
+        }
+        // foreign header: only elements too small to embed a header
+        const HEADER_SIZE: i128 = 24;
+        stride > 0 && stride < HEADER_SIZE && copy.map_or(true, |n| (n as i128) < HEADER_SIZE)
     }
 
     /// `x <= y` for two unsigned values, structurally.
@@ -1906,7 +1922,7 @@ mod tests {
     }
 
     #[test]
-    fn an_element_store_of_the_same_vec_keeps_the_length_clean() {
+    fn an_item_store_of_the_same_vec_keeps_the_length_clean() {
         let mut f = elem_store_func(false);
         assert_eq!(remove_provable_arith_checks(&mut f), 2);
     }
