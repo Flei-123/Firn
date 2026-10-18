@@ -233,6 +233,7 @@ void main() {
         // frost_rect, step 5: the small band stretched back, integer lerp
         int f = int(v_p.x + 0.5); int sw = int(v_p.y + 0.5); int sh = int(v_p.z + 0.5);
         int xx = int(i.x - v_g.x); int yy = int(i.y - v_g.y);
+        ivec2 so = ivec2(v_t.xy); // where the small band sits in its target (batched panels)
         int fx = max(((xx * 2 + 1) * 128) / f - 128, 0);
         int c0 = fx >> 8; int wx = fx & 255;
         if (c0 >= sw - 1) { c0 = sw - 1; wx = 0; }
@@ -240,9 +241,9 @@ void main() {
         int r0 = fy >> 8; int wy = fy & 255;
         if (r0 >= sh - 1) { r0 = sh - 1; wy = 0; }
         int r1 = min(r0 + 1, sh - 1);
-        ivec4 a0 = lerp4(src_at(ivec2(c0, r0)), src_at(ivec2(c0, r1)), wy);
+        ivec4 a0 = lerp4(src_at(so + ivec2(c0, r0)), src_at(so + ivec2(c0, r1)), wy);
         if (wx == 0) { o = unoct(a0); return; }
-        ivec4 a1 = lerp4(src_at(ivec2(c0 + 1, r0)), src_at(ivec2(c0 + 1, r1)), wy);
+        ivec4 a1 = lerp4(src_at(so + ivec2(c0 + 1, r0)), src_at(so + ivec2(c0 + 1, r1)), wy);
         o = unoct(lerp4(a0, a1, wx));
         return;
     }
@@ -250,7 +251,7 @@ void main() {
         // frost_rect, step 1: the mean of 2 x 2 pixels in each f x f block
         int f = int(v_p.x + 0.5); int iw = int(v_p.y + 0.5); int ih = int(v_p.z + 0.5);
         int off = f / 2 - f / 4;
-        int sx = int(i.x); int sy = int(i.y);
+        int sx = int(i.x - v_t.x); int sy = int(i.y - v_t.y); // v_t.xy = where this band sits in the small target (batched panels)
         int ya = min(sy * f + off, ih - 1);
         int yb = f < 2 ? ya : min(ya + f / 2, ih - 1);
         int xa = min(sx * f + off, iw - 1);
@@ -265,12 +266,13 @@ void main() {
         int r = int(v_p.x + 0.5); int w = int(v_p.y + 0.5); int h = int(v_p.z + 0.5);
         int n = 2 * r + 1;
         ivec2 c = ivec2(i);
+        ivec2 lo = ivec2(v_t.xy); // where this band sits in the small target (batched panels)
         ivec4 sum = ivec4(0);
         for (int j = -64; j <= 64; j++) {
             if (j < -r) continue;
             if (j > r) break;
             ivec2 q = c;
-            if (kind == 11 || kind == 13) q.x = clamp(c.x + j, 0, w - 1); else q.y = clamp(c.y + j, 0, h - 1);
+            if (kind == 11 || kind == 13) q.x = clamp(c.x + j, lo.x, lo.x + w - 1); else q.y = clamp(c.y + j, lo.y, lo.y + h - 1);
             sum += src_at(q);
         }
         if (kind <= 12) { o = unoct((sum + n / 2) / n); return; }

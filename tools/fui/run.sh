@@ -750,6 +750,9 @@ build kita11y
 # wave5: rating, chips, segmented, skeleton, chart, page dots, pager at the pixel (both themes, mirrored)
 build wave5
 "$W/wave5" | tail -n 3
+# wave7: Range-Slider (r146): snapping, ordering, press/drag/keys, mirrored, pixels
+build wave7
+"$W/wave7" | tail -n 3
 # appw5: the wave 5 controls in the ten-line API (appctl.rating / segmented / chips / skeleton / chart / pager)
 build appw5
 "$W/appw5" | tail -n 3
