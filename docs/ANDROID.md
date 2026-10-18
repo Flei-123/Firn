@@ -255,8 +255,12 @@ all arm64, built from main with `build.sh` / `jarvis_build.sh`; own test package
 - Screenshots: pull the file (`screencap -p /sdcard/x.png`, `adb pull`); a PowerShell 5 `>` redirect corrupts the PNG.
 - Counter: cold start 365-639 ms (`am start -W` TotalTime, 4 starts, no death at the first start = r775 fix holds), tap works, HOME and
   back keeps the process and the state. FirnCam cold 182 ms, HOT return 49 ms. JARVIS shows the login screen.
-- Harmless log line after HOME: `libEGL: call to OpenGL ES API with no current context (logged once per thread)` -- the surface was
-  dropped (`CMD_TERM_WINDOW`) and the program draws once more before the next swap; the window comes back correct.
+- `libEGL: call to OpenGL ES API with no current context` (r785, fixed): after HOME the EGL surface is gone (`CMD_TERM_WINDOW`), and every
+  GL call logged this line. Now `window.gpu_place` reports size 0 without a surface; fUi (`lib/plat/fuiwin.fi`) paints nothing then and
+  FirnCam skips GL feed/render/draw (`fuishell.shell_surface`). The window that comes back sends EV_EXPOSE and paints everything. Xiaomi: no
+  line at cold start, after HOME, after force-stop.
+- FirnCam `cam_fps` 13-14 in a dark room (r793) is auto exposure, not a regression: the stats line shows `exp_us=66648 iso=8000`
+  (1 / 15 s at the highest gain). The AE range of the default request lets the frame rate fall to 15 fps. Afternoon (bright) 29-30 fps.
 - Not done on the real device: overlay relaunch check (changes a system overlay) and rotation (changes a system setting).
 
 ## Open
