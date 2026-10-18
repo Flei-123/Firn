@@ -1,0 +1,153 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+// tests/2880_async_epoll_layout.fi -- async.loop: the epoll_event layout is PROBED, not guessed from uname(2).
+//
+// libndk_translation (Android emulator and many x86 Chromebooks) runs an AArch64 program on an x86-64
+// kernel. It converts the epoll records to the AArch64 layout (16 octets) for the program -- and answers
+// uname(2) with the HOST's "x86_64". A loop that believes uname uses the 12 octet record: handles come
+// back damaged, only a watch in slot 0 still works (the first request after the sign-in), every later
+// connection runs into its timeout. This test is also run INSIDE that translator by
+// tools/android/arm64_epoll_check.sh (the same binary, `firnc --target=aarch64-linux`).
+//
+// A  the experiment gives a definite answer and the loop uses exactly that record size
+// B  six watches on six eventfds, all readable in ONE round: every callback gets its OWN ud
+//    (several records per epoll_pwait, so a wrong stride or data offset shows)
+// C  the same after delete + re-add (the generation in the high half of the handle is > 1 now)
+// D  the poll backend gives the same answers (no layout involved, the control)
+import std.rt
+import async.loop
+
+static mut fails: u32 = 0
+static mut seen: u64 = 0
+static mut wrong: u32 = 0
+static mut fds: [i64; 8] = [0 as i64; 8]
+static mut hs: [u64; 8] = [0 as u64; 8]
+
+const N: usize = 6
+const TAG: u64 = 7000
+
+fn say(s: str) {
+    syscall(1, 1, s.p as i64, s.n as i64, 0, 0, 0)
+}
+
+fn check(ok: bool, what: str) {
+    if !ok {
+        fails = fails + 1
+        say("FAIL ")
+        say(what)
+        say("\n")
+    }
+}
+
+fn make_fd() -> i64 {
+    return syscall(290, 0, 2048 | 524288, 0, 0, 0, 0) // eventfd2(0, EFD_NONBLOCK | EFD_CLOEXEC)
+}
+
+fn poke(fd: i64) {
+    var one: [u64; 1] = [1; 1]
+    syscall(1, fd, (&one[0]) as i64, 8, 0, 0, 0)
+}
+
+fn drain(fd: i64) {
+    var sink: [u64; 1] = [0; 1]
+    syscall(0, fd, (&sink[0]) as i64, 8, 0, 0, 0)
+}
+
+fn on_ev(l: *mut loop.Loop, ud: u64, ev: u32) {
+    if ud < TAG + 100 || ud >= TAG + 100 + N as u64 * 100 || ud % 100 != 0 {
+        wrong = wrong + 1
+        return
+    }
+    let idx: usize = ((ud - TAG) / 100 - 1) as usize
+    seen = seen | (1 as u64) << (idx as u64)
+    drain(fds[idx])
+}
+
+fn add_all(l: *mut loop.Loop) {
+    var i: usize = 0
+    while i < N {
+        hs[i] = loop.watch_add(l, fds[i] as i32, loop.EV_READ, on_ev, TAG + (i as u64 + 1) * 100)
+        i = i + 1
+    }
+}
+
+fn del_all(l: *mut loop.Loop) {
+    var i: usize = 0
+    while i < N {
+        loop.watch_del(l, hs[i])
+        i = i + 1
+    }
+}
+
+// All six readable, then rounds until nothing is left: every ud must have arrived once or more, none damaged.
+fn round_all(l: *mut loop.Loop, name: str) {
+    seen = 0
+    wrong = 0
+    var i: usize = 0
+    while i < N {
+        poke(fds[i])
+        i = i + 1
+    }
+    var r: u32 = 0
+    while r < 4 {
+        loop.run_once(l, 50)
+        r = r + 1
+    }
+    check(wrong == 0, name)
+    check(seen == 63, name)
+}
+
+fn suite(poll: bool) {
+    var l: loop.Loop = loop.loop_new()
+    var ok: bool = false
+    if poll {
+        ok = loop.loop_init_poll(&l)
+    } else {
+        ok = loop.loop_init(&l)
+    }
+    check(ok, "loop_init")
+    if !ok {
+        return
+    }
+    if !poll && loop.is_epoll(&l) {
+        let p: i64 = loop.epoll_layout_probe()
+        check(p == 0 || p == 1, "probe gives a definite answer")
+        if p == 1 {
+            check(loop.epoll_stride(&l) == 12, "packed record: stride 12")
+        }
+        if p == 0 {
+            check(loop.epoll_stride(&l) == 16, "natural record: stride 16")
+        }
+    }
+    var i: usize = 0
+    while i < N {
+        fds[i] = make_fd()
+        check(fds[i] >= 0, "eventfd")
+        i = i + 1
+    }
+    add_all(&l)
+    round_all(&l, "first round: six watches, six own uds")
+    del_all(&l)
+    add_all(&l)
+    round_all(&l, "after re-add: generation > 1")
+    del_all(&l)
+    add_all(&l)
+    round_all(&l, "third generation")
+    del_all(&l)
+    i = 0
+    while i < N {
+        syscall(3, fds[i], 0, 0, 0, 0, 0)
+        i = i + 1
+    }
+    loop.loop_free(&l)
+}
+
+fn main() -> i32 {
+    suite(false)
+    suite(true)
+    if fails != 0 {
+        return 1
+    }
+    say("epoll layout ok\n")
+    return 0
+}
