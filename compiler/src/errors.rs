@@ -393,6 +393,23 @@ pub(crate) fn set_pending_inner(idx: usize, inner: TypeExpr) {
     });
 }
 
+/// r733 — `fn f[T](x: T) -> AllocError!T`: when a template is instantiated the
+/// payload of the placeholder `__eu#<n>` still names the type parameter.
+/// This derives a NEW pending entry (same error set) whose payload is
+/// `map(old payload)` and returns the new placeholder name. `None` when the
+/// name is not a placeholder.
+pub(crate) fn pending_derive<F: FnOnce(&TypeExpr) -> TypeExpr>(name: &str, map: F) -> Option<String> {
+    let idx: usize = name.strip_prefix(TY_PREFIX)?.parse().ok()?;
+    let (set, sp, inner) = REG.with(|r| r.borrow().pending.get(idx).cloned())?;
+    let new_inner = map(&inner);
+    let n = REG.with(|r| {
+        let mut reg = r.borrow_mut();
+        reg.pending.push((set, sp, new_inner));
+        reg.pending.len() - 1
+    });
+    Some(format!("{}{}", TY_PREFIX, n))
+}
+
 /// `// HOOK fehlerunionen` in `parser.rs::primary` — `try expression`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     if !matches!(p.kind(), TokKind::KwTry) {
