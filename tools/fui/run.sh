@@ -753,6 +753,11 @@ build wave5
 # appw5: the wave 5 controls in the ten-line API (appctl.rating / segmented / chips / skeleton / chart / pager)
 build appw5
 "$W/appw5" | tail -n 3
+# W23-d: press wave on buttons (Shape.ripple + appctl.ripple_on) and the splitter as a scene node
+build ripplewire
+"$W/ripplewire" | tail -n 1 | grep -q "RIPPLEWIRE PASSED"
+build splitnode
+"$W/splitnode" | tail -n 1 | grep -q "SPLITNODE PASSED"
 # wave6: bottom sheet + property grid (geometry, hits, keys, drag, a11y twins)
 build wave6
 "$W/wave6" | tail -n 3
