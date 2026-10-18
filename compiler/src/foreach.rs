@@ -411,14 +411,17 @@ pub(crate) enum VecSugar {
     Copy,
     /// `v[a:b] = w` = `v.slice_assign(a, b, w)`.
     Assign,
+    /// r744: `v[a:b:c] = w` = `v.slice_assign(a, b, c, flags, w)`.
+    AssignStep,
 }
 
 pub(crate) fn vec_sugar(tcx: &crate::types::TypeCtx, fns: &std::collections::HashMap<String, crate::sema::FnSig>, name: &str, recv: &Type, nargs: usize) -> Option<VecSugar> {
     let m = crate::impls::method_name(name)?;
     let k = match (m, nargs) {
-        (crate::parser::SLICE_STEP, 4) => VecSugar::Step,
+        (crate::parser::SLICE_STEP, 5) => VecSugar::Step,
         ("copy", 1) => VecSugar::Copy,
         (crate::parser::SLICE_ASSIGN, 4) => VecSugar::Assign,
+        (crate::parser::SLICE_ASSIGN, 6) => VecSugar::AssignStep,
         _ => return None,
     };
     let sidx = seq_struct(tcx, recv)?;
@@ -435,20 +438,22 @@ pub(crate) fn vec_sugar(tcx: &crate::types::TypeCtx, fns: &std::collections::Has
 /// Assign yields `void` (the right side must be the same Vec type).
 pub(crate) fn check_vec_sugar(ck: &mut Checker, kind: VecSugar, recv_t: Type, args: &[Expr]) -> Type {
     let n_bounds = match kind {
-        VecSugar::Step => 3,
+        VecSugar::Step => 4,
         VecSugar::Copy => 0,
         VecSugar::Assign => 2,
+        VecSugar::AssignStep => 4,
     };
     for a in &args[1..1 + n_bounds] {
         let _ = ck.expr(a, Some(&Type::I64));
     }
     // notes the element type and the GC facts
     let vt = check_vec_slice(ck, recv_t, &[args[0].clone()]);
-    if kind == VecSugar::Assign {
+    if kind == VecSugar::Assign || kind == VecSugar::AssignStep {
+        let ri = if kind == VecSugar::Assign { 3 } else { 5 };
         let want = vt.clone();
-        let got = ck.expr(&args[3], Some(&want));
+        let got = ck.expr(&args[ri], Some(&want));
         if !got.is_error() && crate::foreach::seq_struct(&ck.tcx, &got) != crate::foreach::seq_struct(&ck.tcx, &want) {
-            ck.dg.error(args[3].span, "the right side of a slice assignment must be a Vec of the same element type".to_string());
+            ck.dg.error(args[ri].span, "the right side of a slice assignment must be a Vec of the same element type".to_string());
         }
         return Type::Void;
     }
@@ -474,30 +479,53 @@ pub(crate) fn lower_vec_sugar(
         None => return lo.ice(span, "slice: element type not recorded by the type check"),
     };
     let esz = lo.constant(FTy::U64, esz0 as i128);
-    let omit = lo.constant(FTy::I64, i64::MAX as i128 - 1);
-    if kind == VecSugar::Assign {
+    if kind == VecSugar::Assign || kind == VecSugar::AssignStep {
         let baddr = match &bt {
             Type::Ptr { .. } => lo.lower_expr(recv)?,
             _ => lo.lower_addr(recv)?,
         };
         let a = lo.lower_expr(&args[1])?;
         let b = lo.lower_expr(&args[2])?;
-        let (sdata, slen) = seq_words(lo, &args[3])?;
-        let can_move = lo.constant(FTy::Bool, if holds { 0 } else { 1 });
-        lo.push_void(
-            FTy::Void,
-            Op::Call { name: "vec__vec_splice_raw".to_string(), args: vec![baddr, esz, a, b, sdata, slen, can_move] },
-        );
+        let (c, flags, ri) = if kind == VecSugar::Assign {
+            (lo.constant(FTy::I64, 1), lo.constant(FTy::I64, 0), 3)
+        } else {
+            (lo.lower_expr(&args[3])?, lo.lower_expr(&args[4])?, 5)
+        };
+        let (sdata, slen) = seq_words(lo, &args[ri])?;
+        // {old_root, new_root, new_bytes}: set when the buffer moved (GC roots follow)
+        let info = lo.alloca(24, 8);
+        let mut cargs = vec![baddr, esz, a, b];
+        let name = if kind == VecSugar::Assign {
+            cargs.push(flags);
+            "vec__vec_splice_raw"
+        } else {
+            cargs.push(c);
+            cargs.push(flags);
+            "vec__vec_splice_step_raw"
+        };
+        cargs.extend([sdata, slen, info]);
+        lo.push_void(FTy::Void, Op::Call { name: name.to_string(), args: cargs });
+        if holds && lo.info.fns.contains_key("gc_root_add") && lo.info.fns.contains_key("gc_root_del") {
+            let old = lo.load(FTy::U64, info);
+            lo.push_void(FTy::Void, Op::Call { name: "gc_root_del".to_string(), args: vec![old] });
+            let na = lo.ptradd_const(info, 8);
+            let np = lo.load(FTy::U64, na);
+            let ba = lo.ptradd_const(info, 16);
+            let bytes = lo.load(FTy::U64, ba);
+            let r = lo.constant(FTy::U64, rast as i128);
+            lo.push_void(FTy::Void, Op::Call { name: "gc_root_add".to_string(), args: vec![np, bytes, r] });
+        }
         return Some(None);
     }
     let (data, len) = seq_words(lo, recv)?;
-    let (a, b, c) = if kind == VecSugar::Step {
+    let (a, b, c, flags) = if kind == VecSugar::Step {
         let a = lo.lower_expr(&args[1])?;
         let b = lo.lower_expr(&args[2])?;
         let c = lo.lower_expr(&args[3])?;
-        (a, b, c)
+        let f = lo.lower_expr(&args[4])?;
+        (a, b, c, f)
     } else {
-        (omit, omit, lo.constant(FTy::I64, 1))
+        (lo.constant(FTy::I64, 0), lo.constant(FTy::I64, 0), lo.constant(FTy::I64, 1), lo.constant(FTy::I64, 3))
     };
     let d = match dest {
         Some(d) => d,
@@ -505,7 +533,7 @@ pub(crate) fn lower_vec_sugar(
     };
     lo.push_void(
         FTy::Void,
-        Op::Call { name: "vec__vec_slice_step_raw".to_string(), args: vec![data, len, esz, a, b, c, d] },
+        Op::Call { name: "vec__vec_slice_step_raw".to_string(), args: vec![data, len, esz, a, b, c, flags, d] },
     );
     if holds && lo.info.fns.contains_key("gc_root_add") {
         let (pn, _) = word_names(&lo.info.tcx, sidx);

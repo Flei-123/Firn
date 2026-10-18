@@ -650,13 +650,16 @@ impl<'a> Parser<'a> {
             p.mk(esp, ExprKind::Cast(Box::new(e), TypeExpr::Named("i64".to_string(), esp)))
         };
         if let Some(st) = step {
-            // an omitted bound is `i64::MAX - 1` (resolved by the sign of the step)
-            let a = bound(self, lo, i64::MAX as i128 - 1);
-            let b = bound(self, hi, i64::MAX as i128 - 1);
+            // r744: an omitted bound is marked by the `flags` argument (bit 0 =
+            // start, bit 1 = stop), never by a magic value: every `i64` is a real bound
+            let flags = lo.is_none() as i128 | ((hi.is_none() as i128) << 1);
+            let a = bound(self, lo, 0);
+            let b = bound(self, hi, 0);
             let c = bound(self, st, 1);
+            let f = self.mk(colon, ExprKind::Int(flags));
             return self.mk(
                 sp,
-                ExprKind::Call(format!("{}{}", crate::impls::P_CALL, SLICE_STEP), vec![base, a, b, c], colon),
+                ExprKind::Call(format!("{}{}", crate::impls::P_CALL, SLICE_STEP), vec![base, a, b, c, f], colon),
             );
         }
         let a = bound(self, lo, 0);
@@ -1557,8 +1560,15 @@ impl<'a> Parser<'a> {
                             );
                             return Stmt::Expr(call);
                         }
-                        if cn == &format!("{}{}", crate::impls::P_CALL, SLICE_STEP) {
-                            self.dg.error(sp, "assignment to an extended slice 'x[a:b:c] = e' is not supported");
+                        if cn == &format!("{}{}", crate::impls::P_CALL, SLICE_STEP) && cargs.len() == 5 {
+                            // r744: `x[a:b:c] = w` is `x.slice_assign(a, b, c, flags, w)`
+                            let mut all = cargs.clone();
+                            all.push(v);
+                            let call = self.mk(
+                                sp,
+                                ExprKind::Call(format!("{}{}", crate::impls::P_CALL, SLICE_ASSIGN), all, *ccol),
+                            );
+                            return Stmt::Expr(call);
                         }
                     }
                     Stmt::Assign { target: e, value: v, span: sp }

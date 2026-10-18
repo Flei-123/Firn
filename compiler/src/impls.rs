@@ -83,6 +83,8 @@ pub(crate) const P_CALL: &str = "method ";
 /// r728: hidden method name of a call through an expression callee
 /// (`v[i](x)`); the callee is the receiver.
 pub(crate) const CALL_VALUE: &str = "__call";
+/// r744: function behind `s[a:b:c]` on `str`/`Span` (module std.pystr).
+pub(crate) const STEP_FLAGS_FN: &str = "pystr__slice_step_flags";
 /// Separator in the name of the method function: `Type__method`.
 pub(crate) const SEP: &str = "__";
 
@@ -530,10 +532,22 @@ pub(crate) fn target_of(
     recv: &Type,
 ) -> Option<(String, bool)> {
     let (prefixes, is_ptr) = receiver_prefixes(tcx, recv)?;
-    let full = prefixes
+    let found = prefixes
         .iter()
         .map(|p| fn_name(p, method))
-        .find(|f| fns.contains_key(f))?;
+        .find(|f| fns.contains_key(f));
+    // r744: the sugar `s[a:b:c]` on a `str`/`Span` is the library function
+    // `pystr.slice_step_flags(s, a, b, c, flags)` (a new GC string)
+    let full = match found {
+        Some(f) => f,
+        None if method == crate::parser::SLICE_STEP
+            && crate::strtype::is_str_like(recv)
+            && fns.contains_key(STEP_FLAGS_FN) =>
+        {
+            STEP_FLAGS_FN.to_string()
+        }
+        None => return None,
+    };
     let sig = fns.get(&full)?;
     let will_ptr = sig.params.first().map(|t| t.is_ptr()).unwrap_or(false);
     Some((full, will_ptr && !is_ptr))
@@ -749,7 +763,7 @@ pub(crate) fn hook_call(
                 ck.type_out_expr(a);
             }
             let msg = if m == crate::parser::SLICE_STEP {
-                "a step slice 's[a:b:c]' of a string is a library call: use std.pystr 'pystr.slice_step(s, a, b, c)'"
+                "a step slice 's[a:b:c]' of a string needs 'import std.pystr' (it calls pystr.slice_step_flags)"
             } else {
                 "a string is immutable: 's[a:b] = e' is only defined for Vec"
             };
@@ -792,10 +806,18 @@ pub(crate) fn hook_call(
     // even when the function is found under `str__Span__…`.
     let prefix = prefixes[0].clone();
     let sname = prefix.clone();
-    let hit = prefixes
+    let mut hit = prefixes
         .iter()
         .map(|p| fn_name(p, &method))
         .find(|full| ck.fns.contains_key(full));
+    // r744: `s[a:b:c]` on a str/Span -> `pystr.slice_step_flags` (see `target_of`)
+    if hit.is_none()
+        && method == crate::parser::SLICE_STEP
+        && crate::strtype::is_str_like(&et)
+        && ck.fns.contains_key(STEP_FLAGS_FN)
+    {
+        hit = Some(STEP_FLAGS_FN.to_string());
+    }
     let full = hit.clone().unwrap_or_else(|| fn_name(&prefix, &method));
     let sig = match hit.and_then(|f| ck.fns.get(&f)) {
         Some(s) => s.clone(),

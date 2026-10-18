@@ -34,7 +34,7 @@ export { Vec, vec_new, vec_free, vec_clear, vec_reserve, vec_push, vec_at,
     vec_sort_by, vec_is_sorted_by, vec_min_by, vec_max_by,
     vec_index_where, vec_count_where, vec_all, vec_any,
     // r738 -- raw helpers behind `v[a:b:c]`, `v.copy()`, `v[a:b] = w` (compiler hooks, foreach.rs)
-    vec_slice_step_raw, vec_splice_raw, py_slice }
+    vec_slice_step_raw, vec_splice_raw, vec_splice_step_raw, py_slice, py_slice_omit }
 
 // ------------------------------------------------------------ The ordering
 //
@@ -767,8 +767,9 @@ fn slice_fail(msg: str) {
 }
 
 // Python slice semantics for `n` elements: writes start, count and step to `o`.
-// An omitted bound is `SLICE_OMIT` (i64::MAX - 1) (its meaning depends on the sign of the step).
-fn py_slice(n: i64, a: i64, b: i64, c: i64, o: *mut i64) {
+// `flags`: bit 0 = start omitted, bit 1 = stop omitted (the meaning of an omitted
+// bound depends on the sign of the step; an explicit value is never an "omitted").
+fn py_slice(n: i64, a: i64, b: i64, c: i64, flags: i64, o: *mut i64) {
     var step: i64 = c
     if step == 0 {
         slice_fail("error: slice step cannot be zero\n")
@@ -781,7 +782,7 @@ fn py_slice(n: i64, a: i64, b: i64, c: i64, o: *mut i64) {
     var count: i64 = 0
     if step > 0 {
         lo = 0
-        if a != SLICE_OMIT {
+        if (flags & 1) == 0 {
             lo = a
             if lo < 0 {
                 lo = lo + n
@@ -790,7 +791,7 @@ fn py_slice(n: i64, a: i64, b: i64, c: i64, o: *mut i64) {
             if lo > n { lo = n }
         }
         hi = n
-        if b != SLICE_OMIT {
+        if (flags & 2) == 0 {
             hi = b
             if hi < 0 {
                 hi = hi + n
@@ -803,7 +804,7 @@ fn py_slice(n: i64, a: i64, b: i64, c: i64, o: *mut i64) {
         }
     } else {
         lo = n - 1
-        if a != SLICE_OMIT {
+        if (flags & 1) == 0 {
             lo = a
             if lo < 0 {
                 lo = lo + n
@@ -812,7 +813,7 @@ fn py_slice(n: i64, a: i64, b: i64, c: i64, o: *mut i64) {
             if lo > n - 1 { lo = n - 1 }
         }
         hi = 0 - 1
-        if b != SLICE_OMIT {
+        if (flags & 2) == 0 {
             hi = b
             if hi < 0 {
                 hi = hi + n
@@ -829,11 +830,19 @@ fn py_slice(n: i64, a: i64, b: i64, c: i64, o: *mut i64) {
     *((o as u64 + 16) as *mut i64) = step
 }
 
+// Library form: an omitted bound is the value `SLICE_OMIT` (i64::MAX - 1).
+fn py_slice_omit(n: i64, a: i64, b: i64, c: i64, o: *mut i64) {
+    var fl: i64 = 0
+    if a == SLICE_OMIT { fl = fl | 1 }
+    if b == SLICE_OMIT { fl = fl | 2 }
+    py_slice(n, a, b, c, fl, o)
+}
+
 // A new owning buffer with the elements `src[a:b:c]` (`n` elements of `esz`
 // octets at `src`); writes `{ptr, len, cap}` to `out`.
-fn vec_slice_step_raw(src: u64, n: usize, esz: usize, a: i64, b: i64, c: i64, out: *mut u64) {
+fn vec_slice_step_raw(src: u64, n: usize, esz: usize, a: i64, b: i64, c: i64, flags: i64, out: *mut u64) {
     var ix: [i64; 3] = [0, 0, 0]
-    py_slice(n as i64, a, b, c, &ix[0])
+    py_slice(n as i64, a, b, c, flags, &ix[0])
     let cnt: usize = ix[1] as usize
     *out = 0
     *((out as u64 + 8) as *mut u64) = 0
@@ -877,31 +886,36 @@ fn move_octets(dst: u64, src: u64, n: usize) {
     }
 }
 
-// `v[a:b] = src` (Python bounds; `src` = `srcn` elements at `src`). Equal
-// length: elementwise copy (through a view too). Other length: the tail moves;
-// a buffer that is too small (or a view) is replaced by a new owning one --
-// `can_move == false` (element type holds GC pointers: the new buffer would
-// need a root registration) turns that into a clear runtime error.
-fn vec_splice_raw(v: *mut u64, esz: usize, a: i64, b: i64, src: u64, srcn: usize, can_move: bool) {
-    let ptr: u64 = *v
-    let len: usize = *((v as u64 + 8) as *mut usize)
-    let cap: usize = *((v as u64 + 16) as *mut usize)
-    var ix: [i64; 3] = [0, 0, 0]
-    py_slice(len as i64, a, b, 1, &ix[0])
-    let lo: usize = ix[0] as usize
-    let cut: usize = ix[1] as usize
-    let newlen: usize = len - cut + srcn
-    var from: u64 = src
-    var tmp: u64 = 0
-    // the source may alias this buffer: take a private copy first
+// The source of a slice assignment may alias the target buffer: then take a
+// private copy first (the caller frees it with `heap_free` when it is not 0).
+fn splice_private(ptr: u64, len: usize, esz: usize, src: u64, srcn: usize, out: *mut u64) -> u64 {
+    *out = 0
     if srcn > 0 && src < ptr +% (len *% esz) as u64 && ptr < src +% (srcn *% esz) as u64 {
-        tmp = rt.heap_alloc(srcn * esz)
+        let tmp: u64 = rt.heap_alloc(srcn * esz)
         if tmp == 0 {
             slice_fail("error: out of memory in a slice assignment\n")
         }
         rt.mem_copy(tmp, src, srcn * esz)
-        from = tmp
+        *out = tmp
+        return tmp
     }
+    return src
+}
+
+// `v[lo:lo+cut] = src` (`src` = `srcn` elements). Equal length: elementwise
+// copy (through a view too). Other length: the tail moves; a buffer that is
+// too small (or a view) is replaced by a new owning one. `info` points at
+// three words: `{old_root, new_root, new_bytes}` -- when the buffer moved,
+// `old_root` is the buffer that was freed (0 for a view: it owned nothing),
+// `new_root` / `new_bytes` the new one. The compiler re-registers the GC root
+// of a Vec of GC pointers with them (`gc_root_del` / `gc_root_add`).
+fn splice_core(v: *mut u64, esz: usize, lo: usize, cut: usize, src: u64, srcn: usize, info: *mut u64) {
+    let ptr: u64 = *v
+    let len: usize = *((v as u64 + 8) as *mut usize)
+    let cap: usize = *((v as u64 + 16) as *mut usize)
+    let newlen: usize = len - cut + srcn
+    var tmp: u64 = 0
+    let from: u64 = splice_private(ptr, len, esz, src, srcn, &tmp)
     if newlen == len {
         rt.mem_copy(ptr +% (lo *% esz) as u64, from, srcn * esz)
     } else if newlen <= cap && cap != 0 {
@@ -909,9 +923,6 @@ fn vec_splice_raw(v: *mut u64, esz: usize, a: i64, b: i64, src: u64, srcn: usize
         rt.mem_copy(ptr +% (lo *% esz) as u64, from, srcn * esz)
         *((v as u64 + 8) as *mut usize) = newlen
     } else {
-        if !can_move {
-            slice_fail("error: slice assignment would reallocate a Vec of GC pointers; use vec_reserve first\n")
-        }
         var cap2: usize = cap * 2
         if cap2 < newlen { cap2 = newlen }
         let nb: u64 = rt.heap_alloc(cap2 * esz)
@@ -923,10 +934,57 @@ fn vec_splice_raw(v: *mut u64, esz: usize, a: i64, b: i64, src: u64, srcn: usize
         rt.mem_copy(nb +% ((lo + srcn) *% esz) as u64, ptr +% ((lo + cut) *% esz) as u64, (len - lo - cut) * esz)
         if cap != 0 {
             rt.heap_free(ptr, cap * esz)
+            *info = ptr
         }
+        *((info as u64 + 8) as *mut u64) = nb
+        *((info as u64 + 16) as *mut u64) = (cap2 * esz) as u64
         *v = nb
         *((v as u64 + 8) as *mut usize) = newlen
         *((v as u64 + 16) as *mut usize) = cap2
+    }
+    if tmp != 0 {
+        rt.heap_free(tmp, srcn * esz)
+    }
+}
+
+// `v[a:b] = src` (Python bounds; see `splice_core`).
+fn vec_splice_raw(v: *mut u64, esz: usize, a: i64, b: i64, flags: i64, src: u64, srcn: usize, info: *mut u64) {
+    *info = 0
+    *((info as u64 + 8) as *mut u64) = 0
+    *((info as u64 + 16) as *mut u64) = 0
+    let len: usize = *((v as u64 + 8) as *mut usize)
+    var ix: [i64; 3] = [0, 0, 0]
+    py_slice(len as i64, a, b, 1, flags, &ix[0])
+    splice_core(v, esz, ix[0] as usize, ix[1] as usize, src, srcn, info)
+}
+
+// `v[a:b:c] = src` (Python: a step of 1 is a plain slice assignment; any other
+// step needs `srcn` == the number of selected elements, the length never
+// changes, so the buffer never moves).
+fn vec_splice_step_raw(v: *mut u64, esz: usize, a: i64, b: i64, c: i64, flags: i64, src: u64, srcn: usize, info: *mut u64) {
+    if c == 1 {
+        vec_splice_raw(v, esz, a, b, flags, src, srcn, info)
+        return
+    }
+    *info = 0
+    *((info as u64 + 8) as *mut u64) = 0
+    *((info as u64 + 16) as *mut u64) = 0
+    let ptr: u64 = *v
+    let len: usize = *((v as u64 + 8) as *mut usize)
+    var ix: [i64; 3] = [0, 0, 0]
+    py_slice(len as i64, a, b, c, flags, &ix[0])
+    let cnt: usize = ix[1] as usize
+    if cnt != srcn {
+        slice_fail("error: attempt to assign a sequence of the wrong size to an extended slice\n")
+    }
+    var tmp: u64 = 0
+    let from: u64 = splice_private(ptr, len, esz, src, srcn, &tmp)
+    var k: usize = 0
+    var at: i64 = ix[0]
+    while k < cnt {
+        rt.mem_copy(ptr +% (at as usize *% esz) as u64, from +% (k *% esz) as u64, esz)
+        at = at + ix[2]
+        k = k + 1
     }
     if tmp != 0 {
         rt.heap_free(tmp, srcn * esz)
