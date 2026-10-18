@@ -1495,7 +1495,60 @@ impl<'a> Parser<'a> {
         Stmt::Defer(Box::new(inner), only_error, sp)
     }
 
+    /// r749: `with NAME = expr { .. }` starts here (`with` is no keyword: it is the word
+    /// `with` followed by `NAME =`, so `with` stays a usable identifier).
+    fn at_with_stmt(&self) -> bool {
+        matches!(self.kind(), TokKind::Ident(n) if n == "with")
+            && matches!(self.toks.get(self.pos + 1), Some(t) if matches!(t.kind, TokKind::Ident(_)))
+            && matches!(self.toks.get(self.pos + 2), Some(t) if t.kind == TokKind::Assign)
+    }
+
+    /// r749: `with NAME = expr { body }` is the block
+    /// `{ let NAME = expr; defer NAME.close(); body }`; several bindings
+    /// (`with a = x, b = y { .. }`) nest in source order, so they close in reverse.
+    fn with_stmt(&mut self) -> Stmt {
+        let start = self.bump(); // 'with'
+        let mut items: Vec<(String, Span, Expr)> = Vec::new();
+        loop {
+            let (name, nsp) = match self.ident("after 'with'") {
+                Some(x) => x,
+                None => break,
+            };
+            if !self.expect(TokKind::Assign, "after the name in a 'with' statement") {
+                break;
+            }
+            let init = self.cond_expr();
+            items.push((name, nsp, init));
+            if self.recovering || !self.eat(&TokKind::Comma) {
+                break;
+            }
+        }
+        if self.recovering || items.is_empty() {
+            self.recovering = false;
+            self.sync_stmt();
+            return Stmt::Error(start);
+        }
+        let body = self.block("after the 'with' header");
+        let mut stmts: Vec<Stmt> = Vec::new();
+        for (name, nsp, init) in items {
+            let sp = Parser::join(nsp, init.span);
+            stmts.push(Stmt::Let { name: name.clone(), mutable: false, ty: None, init, span: sp });
+            let recv = self.mk(nsp, ExprKind::Ident(name));
+            let call = self.mk(
+                nsp,
+                ExprKind::Call(format!("{}close", crate::impls::P_CALL), vec![recv], nsp),
+            );
+            stmts.push(Stmt::Defer(Box::new(Stmt::Expr(call)), false, nsp));
+        }
+        let sp = Parser::join(start, body.span);
+        stmts.extend(body.stmts);
+        Stmt::Block(Block { stmts, span: sp, end: body.end })
+    }
+
     fn stmt_inner(&mut self, start: Span) -> Stmt {
+        if self.at_with_stmt() {
+            return self.with_stmt();
+        }
         // HOOK types: `match` statement (sema_match.rs)
         if let Some(s) = crate::sema_match::hook_stmt(self) {
             return s;

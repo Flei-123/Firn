@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
-//! Python-level collection sugar (wf-py): list/dict literals and comprehensions
-//! for `Vec[T]` and `Dict[V]`. Pure parser desugar, docs/FIRN-VS-PYTHON.md G22b.
+//! Python-level collection sugar (wf-py): list/dict/set literals and comprehensions
+//! for `Vec[T]`, `Dict[V]` and `Set[K]`. Pure parser desugar, docs/FIRN-VS-PYTHON.md G22b.
 //!
 //! The element type cannot be inferred in the parser, so the sugar needs a
 //! DECLARED target type: the initializer of `let/var x: Vec[T] = ...` or the
@@ -11,6 +11,7 @@
 //! let v: Vec[i64] = [1, 2, 3]                          // list literal
 //! let d: Dict[i64] = {"a": 1, "b": 2}                  // dict literal
 //! let m: Dict[i64] = {name(i): i for i in 0..n}        // dict comprehension
+//! let u: Set[i64] = {x % 10 for x in xs}               // set comprehension (set literal `{1, 2}` too)
 //! ```
 //! becomes
 //! ```firn
@@ -91,13 +92,16 @@ impl<'a> Parser<'a> {
     /// `pre` / `after`); `None`: nothing consumed, parse as usual.
     pub(crate) fn coll_init(&mut self, ty: &TypeExpr, dest: CollDest) -> Option<Stmt> {
         let (base, targs) = coll_instance(ty)?;
-        let is_dict = match (base.as_str(), targs.len()) {
-            ("Vec", 1) => false,
-            ("Dict", 1) => true,
+        let (is_dict, is_set) = match (base.as_str(), targs.len()) {
+            ("Vec", 1) => (false, false),
+            ("Dict", 1) => (true, false),
+            ("Set", 1) => (false, true),
             _ => return None,
         };
         let (open, close, close_txt) = if is_dict {
             (TokKind::LBrace, TokKind::RBrace, "after the entries of the dict literal")
+        } else if is_set {
+            (TokKind::LBrace, TokKind::RBrace, "after the elements of the set literal")
         } else {
             (TokKind::LBracket, TokKind::RBracket, "after the elements of the list literal")
         };
@@ -109,7 +113,17 @@ impl<'a> Parser<'a> {
         if is_dict && !colon && !has_for && !self.next_is(&TokKind::RBrace) {
             return None;
         }
-        let (new_name, add_name) = if is_dict { ("dict_new", "dict_set") } else { ("vec_new", "vec_push") };
+        // `{ k: v }` is no set literal
+        if is_set && colon {
+            return None;
+        }
+        let (new_name, add_name) = if is_dict {
+            ("dict_new", "dict_set")
+        } else if is_set {
+            ("set_new", "set_put")
+        } else {
+            ("vec_new", "vec_push")
+        };
         let open_sp = self.span();
         let new_fn = coll_fn_name(self, new_name, &targs, open_sp)?;
         let add_fn = coll_fn_name(self, add_name, &targs, open_sp)?;
