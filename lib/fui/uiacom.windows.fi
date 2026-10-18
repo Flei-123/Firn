@@ -28,12 +28,22 @@
 //   C1  NOT TESTED against a live UIA client (Narrator / Inspect): no Windows machine was reachable. What IS
 //       tested: the vtables, QueryInterface, Navigate, properties, patterns by calling the objects through their
 //       own vtables (tools/fui/uiacom_main.fi, Wine 8, `win64_call`) and the cross build.
-//   C2  RangeValue.SetValue(double) and ElementProviderFromPoint(double, double): the doubles travel in xmm
-//       registers, which the thunk does not pass on. SetValue answers UIA_E_NOTSUPPORTED (the pattern reports
-//       IsReadOnly = true), ElementProviderFromPoint takes the point from GetCursorPos (right for a client that
-//       hit-tests under the mouse, which is what Inspect and Narrator's touch/mouse exploration do).
-//   C3  No events yet (UiaRaiseAutomationEvent / focus changed): a client that only listens sees the tree on
-//       demand, not changes. Next step: a poll like atspi.bridge_poll.
+//   C2  SOLVED (W23-c). RangeValue.SetValue(double) and ElementProviderFromPoint(double, double): the doubles
+//       travel in xmm1/xmm2, which the `#[win_callback]` thunk (integer slots only) does not pass on. The two
+//       vtable words therefore point at a tiny machine code STUB (`stub_write`, one page made executable with
+//       VirtualAlloc + VirtualProtect): `movq rdx, xmm1; movq r8, xmm2; mov rax, <callback thunk>; jmp rax` --
+//       the callbacks (m_rsetvalue, m_frompoint) see the double BITS in their 2nd/3rd integer parameter
+//       (`f64_of`). If the page cannot be made executable the old fallbacks stay (SetValue = NOTSUPPORTED,
+//       FromPoint = GetCursorPos). SetValue drives the slider through the pointer path (click at the computed
+//       position, corrected by the measured value) so the app's callbacks run like for a mouse.
+//   C3  SOLVED (W23-c), by POLLING like atspi.bridge_poll: a timer of the subclassed window (WM_TIMER, id 0xF0A1,
+//       100 ms) calls `poll`. While no UIA client listens (UiaClientsAreListening = FALSE) it only drains its
+//       queue and forgets the snapshot (one call per tick). While one listens it compares the scene with the
+//       snapshot of the last tick and raises: AutomationFocusChanged (20005), property changes (Name, IsEnabled,
+//       HasKeyboardFocus, ToggleState, ExpandCollapseState, SelectionItem.IsSelected, RangeValue.Value,
+//       Value.Value) with UiaRaiseAutomationPropertyChangedEvent (old value VT_EMPTY), StructureChanged
+//       (ChildrenInvalidated) when the node count or a node's child count changes, and Invoke.Invoked (20009,
+//       queued by m_invoke, raised from the poll, never from inside the provider call). At most 64 events per tick.
 //   C4  Value pattern is read only (the text field's text through the a11y name); SetValue = NOTSUPPORTED.
 //   C5  Rows of virtual lists are reachable and readable, but offer no actions (like the AT-SPI bridge).
 //   C6  One window per process (the globals below).
@@ -44,12 +54,14 @@ import fui.a11y
 import fui.app
 import fui.uia
 import fui.control
+import fui.widget
 import plat.fuiwirt
 import window.window
 import gpu.wgl
 
 export {
     attach, opened, enable_from_env, is_attached, root_interface, entry_count, test_attach, getobject_count,
+    poll, event_count, event_at, force_listening, double_caller,
     S_SIMPLE, S_FRAGMENT, S_ROOT, S_INVOKE, S_TOGGLE, S_VALUE, S_RANGE, S_EXPAND, S_SELITEM,
 }
 
@@ -101,6 +113,34 @@ static mut F_MB2WC: u64 = 0
 static mut F_BSTR: u64 = 0 // SysAllocStringLen
 static mut F_SACREATE: u64 = 0 // SafeArrayCreateVector
 static mut F_SAPUT: u64 = 0 // SafeArrayPutElement
+static mut F_VALLOC: u64 = 0 // VirtualAlloc
+static mut F_VPROT: u64 = 0 // VirtualProtect
+static mut F_FLUSH: u64 = 0 // FlushInstructionCache
+static mut F_LISTEN: u64 = 0 // UiaClientsAreListening
+static mut F_RAISE: u64 = 0 // UiaRaiseAutomationEvent
+static mut F_RAISEPROP: u64 = 0 // UiaRaiseAutomationPropertyChangedEvent
+static mut F_RAISESTRUCT: u64 = 0 // UiaRaiseStructureChangedEvent
+static mut F_SETTIMER: u64 = 0 // SetTimer
+static mut F_SYSFREE: u64 = 0 // SysFreeString
+
+// poll state (W23-c)
+const NSNAP: usize = 1024
+const SW: usize = 4 // words per node in the snapshot: state, name hash, range value, child count
+const NLOG: usize = 64
+const TIMER_ID: u64 = 61601 // 0xF0A1
+static mut G_SNAP: u64 = 0
+static mut G_SNAP_N: usize = 0
+static mut G_SNAP_OK: bool = false
+static mut G_SNAP_FOCUS: usize = 4294967295
+static mut G_FORCE: bool = false // tests: behave as if a client listened
+static mut G_EV_N: u64 = 0 // events raised (also logged when the call is not available)
+static mut G_ELOG: u64 = 0 // NLOG * 3 words: kind (1 event, 2 property, 3 structure), id, node
+static mut G_PEND: u64 = 0 // 8 nodes whose Invoke happened
+static mut G_PEND_N: usize = 0
+static mut G_NB: u64 = 0 // 1024 octets of name scratch
+static mut G_TRAMP: u64 = 0 // the executable stub page (0 = none)
+static mut G_STUB_SET: u64 = 0
+static mut G_STUB_PT: u64 = 0
 
 // ------------------------------------------------------------------ small helpers
 
@@ -248,6 +288,14 @@ fn click_node(node: usize) -> bool {
     }
     let x: f64 = scene.node_x(sc, node) + scene.node_w(sc, node) / 2.0
     let y: f64 = scene.node_y(sc, node) + scene.node_h(sc, node) / 2.0
+    pointer_click(x, y)
+    return true
+}
+
+// a left click at window coordinates (x, y) through the host's pointer path
+fn pointer_click(x: f64, y: f64) {
+    let a: *mut app.App = G_APP as *mut app.App
+    let w: *mut fuiwirt.Host = app.app_host(a)
     let c1: u32 = fuiwirt.host_pointer_move(w, x, y)
     let c2: u32 = fuiwirt.host_pointer_down(w, x, y, fuiwirt.BTN_LEFT)
     let c3: u32 = fuiwirt.host_pointer_up(w, x, y, fuiwirt.BTN_LEFT)
@@ -256,7 +304,67 @@ fn click_node(node: usize) -> bool {
         app.app_act(a as u64, i)
     }
     fuiwirt.host_touch(w)
-    return true
+}
+
+// The double whose bits are `b` (a callback gets xmm values in an integer slot through the stub).
+fn f64_of(b: u64) -> f64 {
+    var t: [u64; 1] = [b]
+    return *((&t[0]) as *mut f64)
+}
+
+// Set a slider / progress / scrollbar node to `target` (0 .. a11y max) the way a mouse does: click on the
+// computed track position, measure, correct (the handle size is not known here). Last resort: write the value.
+fn set_range_node(node: usize, target: i64) -> bool {
+    let a: *mut app.App = G_APP as *mut app.App
+    let w: *mut fuiwirt.Host = app.app_host(a)
+    let sc: *mut scene.Scene = app.app_scene(a)
+    if node >= scene.scene_count(sc) {
+        return false
+    }
+    let wd: *mut widget.Widget = scene.node_widget(sc, node)
+    let x0: f64 = scene.node_x(sc, node)
+    let y0: f64 = scene.node_y(sc, node)
+    let w0: f64 = scene.node_w(sc, node)
+    let h0: f64 = scene.node_h(sc, node)
+    let horiz: bool = w0 >= h0
+    var len: f64 = h0
+    var lo: f64 = y0
+    var thick: f64 = w0
+    if horiz {
+        len = w0
+        lo = x0
+        thick = h0
+    }
+    var handle: f64 = thick
+    if handle > len / 2.0 {
+        handle = len / 2.0
+    }
+    let travel: f64 = len - handle
+    let span: f64 = (uia.el_range_max() - uia.el_range_min()) as f64
+    var c: f64 = lo + handle / 2.0 + ((target as f64) / span) * travel
+    var k: usize = 0
+    while k < 6 {
+        if c < lo + 1.0 {
+            c = lo + 1.0
+        }
+        if c > lo + len - 1.0 {
+            c = lo + len - 1.0
+        }
+        if horiz {
+            pointer_click(c, y0 + h0 / 2.0)
+        } else {
+            pointer_click(x0 + w0 / 2.0, c)
+        }
+        let cur: i64 = widget.w_value(wd)
+        if cur == target {
+            return true
+        }
+        c = c + (((target - cur) as f64) / span) * travel
+        k = k + 1
+    }
+    widget.w_set_value(wd, target)
+    fuiwirt.host_touch(w)
+    return widget.w_value(wd) == target
 }
 
 // 0 = S_OK, else the HRESULT
@@ -596,10 +704,27 @@ fn m_fragroot(this: u64, out: u64, c: u64, d: u64) -> u64 {
 
 // ------------------------------------------------------------------ IRawElementProviderFragmentRoot
 
-// (this, double x, double y, out): the doubles are in xmm1/xmm2, so only `out` (4th slot) is usable -- the point
-// is the mouse position (C2).
+// (this, double x, double y, out): reached through the xmm stub, x and y arrive as double BITS (C2).
 #[win_callback]
-fn m_frompoint(this: u64, x: u64, y: u64, out: u64) -> u64 {
+fn m_frompoint(this: u64, xb: u64, yb: u64, out: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    put_word(out, 0, 0)
+    let x: f64 = f64_of(xb)
+    let y: f64 = f64_of(yb)
+    if !(x == x) || !(y == y) || x < -100000000.0 || x > 100000000.0 || y < -100000000.0 || y > 100000000.0 {
+        return S_OK
+    }
+    refresh_origin()
+    let el: uia.El = uia.el_from_point(pv(), (x as i64) - (*pv()).ox, (y as i64) - (*pv()).oy)
+    put_word(out, 0, give(el, S_FRAGMENT))
+    return S_OK
+}
+
+// The fallback when no executable stub page could be made: the point is the mouse position.
+#[win_callback]
+fn m_frompoint_cursor(this: u64, x: u64, y: u64, out: u64) -> u64 {
     if out == 0 {
         return E_POINTER
     }
@@ -640,7 +765,15 @@ fn m_getfocus(this: u64, out: u64, c: u64, d: u64) -> u64 {
 
 #[win_callback]
 fn m_invoke(this: u64, b: u64, c: u64, d: u64) -> u64 {
-    return do_click(this)
+    let r: u64 = do_click(this)
+    if r == S_OK {
+        let e: usize = entry_of(this)
+        if e != NONE && G_PEND != 0 && G_PEND_N < 8 {
+            put_word(G_PEND, G_PEND_N, meta(e, 2))
+            G_PEND_N = G_PEND_N + 1
+        }
+    }
+    return r
 }
 
 #[win_callback]
@@ -689,6 +822,41 @@ fn m_readonly(this: u64, out: u64, c: u64, d: u64) -> u64 {
         return UIA_E_ELEMENTNOTAVAILABLE
     }
     return bool_out(out, true)
+}
+
+#[win_callback]
+fn m_rreadonly(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    return bool_out(out, !uia.el_enabled(pv(), el_of(e)))
+}
+
+// (this, double value): reached through the xmm stub, the value arrives as double BITS (C2).
+#[win_callback]
+fn m_rsetvalue(this: u64, bits: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    let el: uia.El = el_of(e)
+    if el.kind != 1 as u32 {
+        return UIA_E_NOTSUPPORTED
+    }
+    if !uia.el_enabled(pv(), el) {
+        return UIA_E_ELEMENTNOTENABLED
+    }
+    let v: f64 = f64_of(bits)
+    let lo: f64 = uia.el_range_min() as f64
+    let hi: f64 = uia.el_range_max() as f64
+    if !(v >= lo && v <= hi) {
+        return E_INVALIDARG
+    }
+    if !set_range_node(el.node, (v + 0.5) as i64) {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    return S_OK
 }
 
 #[win_callback]
@@ -823,6 +991,357 @@ fn m_selcont(this: u64, out: u64, c: u64, d: u64) -> u64 {
     return S_OK
 }
 
+// ------------------------------------------------------------------ xmm stubs (C2)
+
+fn st_b(p: u64, i: usize, v: u32) {
+    rt.st8(p, i, v as u8)
+}
+
+// One stub at p+off, returns the offset after it.
+//   rev = false: Win64 caller put doubles in xmm1 / xmm2, the callback wants their BITS in rdx / r8:
+//                  movq rdx, xmm1 (mask bit 0) ; movq r8, xmm2 (mask bit 1) ; mov rax, target ; jmp rax
+//   rev = true (a test caller): the other way round, and the integer slots are zeroed so that only the xmm
+//                registers carry the values:  movq xmm1, rdx ; xor edx, edx ; movq xmm2, r8 ; xor r8d, r8d ; ...
+fn stub_write(p: u64, off: usize, target: u64, mask: usize, rev: bool) -> usize {
+    var o: usize = off
+    if (mask & 1) != 0 {
+        st_b(p, o, 0x66)
+        st_b(p, o + 1, 0x48)
+        st_b(p, o + 2, 0x0F)
+        if rev {
+            st_b(p, o + 3, 0x6E)
+        } else {
+            st_b(p, o + 3, 0x7E)
+        }
+        st_b(p, o + 4, 0xCA)
+        o = o + 5
+        if rev {
+            st_b(p, o, 0x31)
+            st_b(p, o + 1, 0xD2)
+            o = o + 2
+        }
+    }
+    if (mask & 2) != 0 {
+        st_b(p, o, 0x66)
+        st_b(p, o + 1, 0x49)
+        st_b(p, o + 2, 0x0F)
+        if rev {
+            st_b(p, o + 3, 0x6E)
+        } else {
+            st_b(p, o + 3, 0x7E)
+        }
+        st_b(p, o + 4, 0xD0)
+        o = o + 5
+        if rev {
+            st_b(p, o, 0x45)
+            st_b(p, o + 1, 0x31)
+            st_b(p, o + 2, 0xC0)
+            o = o + 3
+        }
+    }
+    // mov rax, imm64 ; jmp rax
+    st_b(p, o, 0x48)
+    st_b(p, o + 1, 0xB8)
+    var k: usize = 0
+    while k < 8 {
+        st_b(p, o + 2 + k, ((target >> ((k * 8) as u64)) & 255) as u32)
+        k = k + 1
+    }
+    st_b(p, o + 10, 0xFF)
+    st_b(p, o + 11, 0xE0)
+    return o + 12
+}
+
+// a page to write stubs into (read/write; `exec_seal` makes it executable). 0 = not possible.
+fn exec_alloc() -> u64 {
+    if F_VALLOC == 0 || F_VPROT == 0 {
+        return 0
+    }
+    // MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
+    return wgl.call4(F_VALLOC, 0, 4096, 12288, 4)
+}
+
+fn exec_seal(p: u64) -> bool {
+    var old: [u32; 2] = [0 as u32; 2]
+    // PAGE_EXECUTE_READ
+    let r: u64 = wgl.call4(F_VPROT, p, 4096, 32, (&old[0]) as u64)
+    if (r & 4294967295) == 0 {
+        return false
+    }
+    if F_FLUSH != 0 {
+        // the current process is the pseudo handle -1
+        let f: u64 = wgl.call3(F_FLUSH, 18446744073709551615, p, 4096)
+    }
+    return true
+}
+
+fn make_stubs() {
+    G_STUB_SET = 0
+    G_STUB_PT = 0
+    let p: u64 = exec_alloc()
+    if p == 0 {
+        return
+    }
+    let n1: usize = stub_write(p, 0, code_of4(m_rsetvalue), 1, false)
+    let n2: usize = stub_write(p, 32, code_of4(m_frompoint), 3, false)
+    if !exec_seal(p) {
+        return
+    }
+    G_TRAMP = p
+    G_STUB_SET = p
+    G_STUB_PT = p + 32
+}
+
+// Test aid: a Win64 function that takes its first two floating arguments from the INTEGER slots rdx / r8 (put into
+// xmm1 / xmm2, the integer slots zeroed) and then jumps to `target` -- how a client with doubles would call.
+// `mask` bit 0 = xmm1, bit 1 = xmm2. 0 = no executable page.
+fn double_caller(target: u64, mask: usize) -> u64 {
+    let p: u64 = exec_alloc()
+    if p == 0 {
+        return 0
+    }
+    let n: usize = stub_write(p, 0, target, mask, true)
+    if !exec_seal(p) {
+        return 0
+    }
+    return p
+}
+
+// ------------------------------------------------------------------ events by polling (C3)
+
+fn force_listening(on: bool) { G_FORCE = on }
+
+fn listening() -> bool {
+    if G_FORCE {
+        return true
+    }
+    if F_LISTEN == 0 {
+        return false
+    }
+    return (wgl.call0(F_LISTEN) & 4294967295) != 0
+}
+
+fn event_count() -> u64 { return G_EV_N }
+
+// field 0 = kind (1 event, 2 property, 3 structure), 1 = event / property id, 2 = node. 0 = out of the log window.
+fn event_at(seq: u64, field: usize) -> u64 {
+    if G_ELOG == 0 || seq >= G_EV_N || seq + (NLOG as u64) < G_EV_N || field > 2 {
+        return 0
+    }
+    return word(G_ELOG, ((seq % (NLOG as u64)) as usize) * 3 + field)
+}
+
+fn log_event(kind: u64, id: u64, node: usize) {
+    let k: usize = (G_EV_N % (NLOG as u64)) as usize
+    put_word(G_ELOG, k * 3, kind)
+    put_word(G_ELOG, k * 3 + 1, id)
+    put_word(G_ELOG, k * 3 + 2, node as u64)
+    G_EV_N = G_EV_N + 1
+}
+
+fn free_bstr(b: u64) {
+    if b != 0 && F_SYSFREE != 0 {
+        let r: u64 = wgl.call1(F_SYSFREE, b)
+    }
+}
+
+// UiaRaiseAutomationEvent for an element
+fn raise_event(el: uia.El, id: u32) {
+    log_event(1, id as u64, el.node)
+    if F_RAISE == 0 {
+        return
+    }
+    let p: u64 = give(el, S_SIMPLE)
+    if p == 0 {
+        return
+    }
+    let r: u64 = wgl.call2(F_RAISE, p, id as u64)
+    let q: u64 = m_release(p, 0, 0, 0)
+}
+
+const PK_I4: u32 = 0
+const PK_BOOL: u32 = 1
+const PK_BSTR: u32 = 2
+const PK_R8: u32 = 3
+
+// UiaRaiseAutomationPropertyChangedEvent: old value empty, new value of the kind (`iv` is the number; PK_BSTR: the
+// element's name, PK_R8: iv as a double)
+fn raise_prop(el: uia.El, prop: u32, kind: u32, iv: i64) {
+    log_event(2, prop as u64, el.node)
+    if F_RAISEPROP == 0 {
+        return
+    }
+    let p: u64 = give(el, S_SIMPLE)
+    if p == 0 {
+        return
+    }
+    var ov: [u64; 3] = [0; 3]
+    var nv: [u64; 3] = [0; 3]
+    let ovp: u64 = (&ov[0]) as u64
+    let nvp: u64 = (&nv[0]) as u64
+    var bs: u64 = 0
+    if kind == PK_I4 {
+        var_i32(nvp, iv as i32)
+    } else if kind == PK_BOOL {
+        var_bool(nvp, iv != 0)
+    } else if kind == PK_R8 {
+        rt.st16(nvp, 0, 5 as u16)
+        *((nvp + 8) as *mut f64) = iv as f64
+    } else {
+        let n: usize = uia.el_name(pv(), el, G_NB, 1024)
+        bs = bstr_of(G_NB, n)
+        var_bstr(nvp, bs)
+    }
+    // VARIANTs are passed by value = by pointer to a copy on Win64
+    let r: u64 = wgl.call4(F_RAISEPROP, p, prop as u64, ovp, nvp)
+    free_bstr(bs)
+    let q: u64 = m_release(p, 0, 0, 0)
+}
+
+// UiaRaiseStructureChangedEvent(ChildrenInvalidated)
+fn raise_structure(el: uia.El) {
+    log_event(3, 2, el.node)
+    if F_RAISESTRUCT == 0 {
+        return
+    }
+    let p: u64 = give(el, S_SIMPLE)
+    if p == 0 {
+        return
+    }
+    let r: u64 = wgl.call4(F_RAISESTRUCT, p, 2, 0, 0)
+    let q: u64 = m_release(p, 0, 0, 0)
+}
+
+fn name_hash(el: uia.El) -> u64 {
+    let n: usize = uia.el_name(pv(), el, G_NB, 1024)
+    var h: u64 = 2166136261
+    var i: usize = 0
+    while i < n {
+        h = ((h ^ (rt.ld8(G_NB, i) as u64)) * 16777619) & 4294967295
+        i = i + 1
+    }
+    return h
+}
+
+// bit 0 enabled, 1-2 toggle state, 3-4 expand state, 5 selected, 6 has focus
+fn state_word(el: uia.El) -> u64 {
+    var s: u64 = 0
+    if uia.el_enabled(pv(), el) {
+        s = s | 1
+    }
+    s = s | ((uia.el_toggle_state(pv(), el) as u64) << 1)
+    s = s | ((uia.el_expand_state(pv(), el) as u64) << 3)
+    if uia.el_is_selected(pv(), el) {
+        s = s | 32
+    }
+    if uia.el_has_focus(pv(), el) {
+        s = s | 64
+    }
+    return s
+}
+
+// One tick of the poll: compares the scene with the snapshot of the last tick and raises what changed. Returns the
+// number of events raised. Nothing is raised while no UIA client listens (the snapshot is dropped, so the next
+// listener starts from a fresh baseline).
+fn poll() -> usize {
+    if !G_READY || G_SNAP == 0 {
+        return 0
+    }
+    if !listening() {
+        G_SNAP_OK = false
+        G_PEND_N = 0
+        return 0
+    }
+    let before: u64 = G_EV_N
+    // the Invoke events the provider queued (never raised from inside the provider call)
+    var q: usize = 0
+    while q < G_PEND_N {
+        let el: uia.El = uia.el_from_node(pv(), word(G_PEND, q) as usize)
+        if !uia.el_is_none(el) {
+            raise_event(el, 20009)
+        }
+        q = q + 1
+    }
+    G_PEND_N = 0
+    let total: usize = scene.scene_count((*pv()).sc)
+    var n: usize = total
+    if n > NSNAP {
+        n = NSNAP
+    }
+    let have: bool = G_SNAP_OK
+    var focus_now: usize = 4294967295
+    var i: usize = 0
+    while i < n {
+        let el: uia.El = uia.el_from_node(pv(), i)
+        var st: u64 = 0
+        var nh: u64 = 0
+        var rv: u64 = 0
+        var kids: u64 = 0
+        if !uia.el_is_none(el) {
+            st = state_word(el)
+            nh = name_hash(el)
+            if uia.el_has_pattern(pv(), el, uia.PAT_RANGE) {
+                rv = uia.el_range_value(pv(), el) as u64
+            }
+            kids = uia.el_child_count(pv(), el) as u64
+            if (st & 64) != 0 && focus_now == 4294967295 {
+                focus_now = i
+            }
+            if have && i < G_SNAP_N && (G_EV_N - before) < (NLOG as u64) {
+                let b: usize = i * SW
+                let os: u64 = word(G_SNAP, b)
+                let d: u64 = os ^ st
+                if d != 0 {
+                    if (d & 1) != 0 {
+                        raise_prop(el, 30010, PK_BOOL, (st & 1) as i64)
+                    }
+                    if (d & 6) != 0 && uia.el_has_pattern(pv(), el, uia.PAT_TOGGLE) {
+                        raise_prop(el, 30086, PK_I4, ((st >> 1) & 3) as i64)
+                    }
+                    if (d & 24) != 0 && uia.el_has_pattern(pv(), el, uia.PAT_EXPAND) {
+                        raise_prop(el, 30070, PK_I4, ((st >> 3) & 3) as i64)
+                    }
+                    if (d & 32) != 0 && uia.el_has_pattern(pv(), el, uia.PAT_SELITEM) {
+                        raise_prop(el, 30079, PK_BOOL, ((st >> 5) & 1) as i64)
+                    }
+                    if (d & 64) != 0 {
+                        raise_prop(el, 30008, PK_BOOL, ((st >> 6) & 1) as i64)
+                    }
+                }
+                if word(G_SNAP, b + 1) != nh {
+                    raise_prop(el, 30005, PK_BSTR, 0)
+                    if uia.el_has_pattern(pv(), el, uia.PAT_VALUE) {
+                        raise_prop(el, 30045, PK_BSTR, 0)
+                    }
+                }
+                if word(G_SNAP, b + 2) != rv && uia.el_has_pattern(pv(), el, uia.PAT_RANGE) {
+                    raise_prop(el, 30047, PK_R8, rv as i64)
+                }
+                if word(G_SNAP, b + 3) != kids {
+                    raise_structure(el)
+                }
+            }
+        }
+        put_word(G_SNAP, i * SW, st)
+        put_word(G_SNAP, i * SW + 1, nh)
+        put_word(G_SNAP, i * SW + 2, rv)
+        put_word(G_SNAP, i * SW + 3, kids)
+        i = i + 1
+    }
+    if have {
+        if n != G_SNAP_N {
+            raise_structure(uia.el_root(pv()))
+        }
+        if focus_now != 4294967295 && focus_now != G_SNAP_FOCUS {
+            raise_event(uia.el_from_node(pv(), focus_now), 20005)
+        }
+    }
+    G_SNAP_N = n
+    G_SNAP_FOCUS = focus_now
+    G_SNAP_OK = true
+    return (G_EV_N - before) as usize
+}
+
 // ------------------------------------------------------------------ vtables
 
 struct Holder4 {
@@ -895,7 +1414,7 @@ fn build_tables() {
     // RangeValue: SetValue, Value, IsReadOnly, Maximum, Minimum, LargeChange, SmallChange
     vt_set(S_RANGE, 3, m_notsup)
     vt_set(S_RANGE, 4, m_rvalue)
-    vt_set(S_RANGE, 5, m_readonly)
+    vt_set(S_RANGE, 5, m_rreadonly)
     vt_set(S_RANGE, 6, m_rmax)
     vt_set(S_RANGE, 7, m_rmin)
     vt_set(S_RANGE, 8, m_rlarge)
@@ -910,6 +1429,16 @@ fn build_tables() {
     vt_set(S_SELITEM, 5, m_remsel)
     vt_set(S_SELITEM, 6, m_issel)
     vt_set(S_SELITEM, 7, m_selcont)
+    // the two methods with doubles go through the xmm stubs (C2); without an executable page: the old fallbacks
+    make_stubs()
+    if G_STUB_SET != 0 {
+        put_word(G_VT, S_RANGE * 16 + 3, G_STUB_SET)
+    }
+    if G_STUB_PT != 0 {
+        put_word(G_VT, S_ROOT * 16 + 3, G_STUB_PT)
+    } else {
+        vt_set(S_ROOT, 3, m_frompoint_cursor)
+    }
     // every slot of the pool points at its vtable
     var e: usize = 0
     while e < NENT {
@@ -928,6 +1457,11 @@ fn build_tables() {
 
 #[win_callback]
 fn uia_wndproc(hwnd: u64, msg: u64, wp: u64, lp: u64) -> u64 {
+    if msg == 275 && wp == TIMER_ID && G_READY {
+        // WM_TIMER of the event poll (C3)
+        let n: usize = poll()
+        return 0
+    }
     if msg == 61 && (lp & 4294967295) == 4294967271 && G_READY && F_RETURN != 0 {
         // WM_GETOBJECT, objid UiaRootObjectId (-25)
         refresh_origin()
@@ -963,6 +1497,15 @@ fn load_functions() -> bool {
     F_BSTR = wgl.dll_sym("oleaut32.dll", "SysAllocStringLen")
     F_SACREATE = wgl.dll_sym("oleaut32.dll", "SafeArrayCreateVector")
     F_SAPUT = wgl.dll_sym("oleaut32.dll", "SafeArrayPutElement")
+    F_SYSFREE = wgl.dll_sym("oleaut32.dll", "SysFreeString")
+    F_VALLOC = wgl.dll_sym("kernel32.dll", "VirtualAlloc")
+    F_VPROT = wgl.dll_sym("kernel32.dll", "VirtualProtect")
+    F_FLUSH = wgl.dll_sym("kernel32.dll", "FlushInstructionCache")
+    F_LISTEN = wgl.dll_sym("uiautomationcore.dll", "UiaClientsAreListening")
+    F_RAISE = wgl.dll_sym("uiautomationcore.dll", "UiaRaiseAutomationEvent")
+    F_RAISEPROP = wgl.dll_sym("uiautomationcore.dll", "UiaRaiseAutomationPropertyChangedEvent")
+    F_RAISESTRUCT = wgl.dll_sym("uiautomationcore.dll", "UiaRaiseStructureChangedEvent")
+    F_SETTIMER = wgl.dll_sym("user32.dll", "SetTimer")
     return F_RETURN != 0 && F_CALLWND != 0 && F_SETLONG != 0 && F_BSTR != 0 && F_SACREATE != 0 && F_SAPUT != 0
     && F_MB2WC != 0
 }
@@ -981,7 +1524,12 @@ fn setup(a: *mut app.App, title: str) -> bool {
     G_VT = rt.heap_alloc(NSLOT * 16 * 8)
     G_GUID = rt.heap_alloc(10 * 16)
     G_PV = rt.heap_alloc(4096)
-    if G_POOL == 0 || G_META == 0 || G_VT == 0 || G_GUID == 0 || G_PV == 0 {
+    G_SNAP = rt.heap_alloc(NSNAP * SW * 8)
+    G_ELOG = rt.heap_alloc(NLOG * 3 * 8)
+    G_PEND = rt.heap_alloc(8 * 8)
+    G_NB = rt.heap_alloc(1024)
+    if G_POOL == 0 || G_META == 0 || G_VT == 0 || G_GUID == 0 || G_PV == 0 || G_SNAP == 0 || G_ELOG == 0
+    || G_PEND == 0 || G_NB == 0 {
         return false
     }
     *(G_PV as *mut uia.Provider) = uia.provider_new(app.app_scene(a), app.ax(a), title)
@@ -1052,6 +1600,10 @@ fn attach(a: *mut app.App, hwnd: u64, title: str) -> bool {
         return false
     }
     G_OLD = old
+    // the event poll (C3): WM_TIMER, handled by the subclass
+    if F_SETTIMER != 0 {
+        let t: u64 = wgl.call4(F_SETTIMER, hwnd, TIMER_ID, 100, 0)
+    }
     return true
 }
 
