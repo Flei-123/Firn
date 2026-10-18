@@ -3346,6 +3346,12 @@ constants declared before it, and '+ - * /'"
                     if crate::foreach::is_vec_slice(&self.tcx, &self.fns, name, &et, args.len()) {
                         return crate::foreach::seq_struct(&self.tcx, &et).map(Type::Struct);
                     }
+                    if let Some(k) = crate::foreach::vec_sugar(&self.tcx, &self.fns, name, &et, args.len()) {
+                        if k == crate::foreach::VecSugar::Assign {
+                            return Some(Type::Void);
+                        }
+                        return crate::foreach::seq_struct(&self.tcx, &et).map(Type::Struct);
+                    }
                     if let Some((full, _)) =
                         crate::impls::target_of(&self.tcx, &self.fns, m, &et)
                     {

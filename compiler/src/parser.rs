@@ -157,6 +157,10 @@ fn starts_item(k: &TokKind) -> bool {
     )
 }
 
+/// r738: method names of the slice sugar (`x[a:b:c]`, `x[a:b] = e`).
+pub(crate) const SLICE_STEP: &str = "slice_step";
+pub(crate) const SLICE_ASSIGN: &str = "slice_assign";
+
 impl<'a> Parser<'a> {
     // -------------------------------------------------------------------- Basics
 
@@ -624,11 +628,11 @@ impl<'a> Parser<'a> {
         } else {
             Some(self.nested_expr())
         };
+        // r738: `x[a:b:c]` -- extended slice with a step (a copy, see `slice_step`)
+        let mut step: Option<Option<Expr>> = None;
         if self.at(&TokKind::Colon) {
-            self.error_here("a slice step 'x[a:b:c]' is not supported; use a loop or a library function");
-            while !self.at(&TokKind::RBracket) && !self.at_eof() {
-                self.bump();
-            }
+            self.bump();
+            step = Some(if self.at(&TokKind::RBracket) { None } else { Some(self.nested_expr()) });
         }
         let end = self.span();
         self.close(TokKind::RBracket, "after the slice");
@@ -641,6 +645,16 @@ impl<'a> Parser<'a> {
             let esp = e.span;
             p.mk(esp, ExprKind::Cast(Box::new(e), TypeExpr::Named("i64".to_string(), esp)))
         };
+        if let Some(st) = step {
+            // an omitted bound is `i64::MIN` (resolved by the sign of the step)
+            let a = bound(self, lo, i64::MIN as i128);
+            let b = bound(self, hi, i64::MIN as i128);
+            let c = bound(self, st, 1);
+            return self.mk(
+                sp,
+                ExprKind::Call(format!("{}{}", crate::impls::P_CALL, SLICE_STEP), vec![base, a, b, c], colon),
+            );
+        }
         let a = bound(self, lo, 0);
         let b = bound(self, hi, i64::MAX as i128);
         self.mk(
@@ -1518,6 +1532,22 @@ impl<'a> Parser<'a> {
                     let v = self.expr();
                     let sp = Parser::join(start, v.span);
                     self.end_stmt();
+                    // r738: `x[a:b] = other` -- slice assignment is the method call
+                    // `x.slice_assign(a, b, other)`
+                    if let ExprKind::Call(cn, cargs, ccol) = &e.kind {
+                        if cn == &format!("{}slice", crate::impls::P_CALL) && cargs.len() == 3 {
+                            let mut all = cargs.clone();
+                            all.push(v);
+                            let call = self.mk(
+                                sp,
+                                ExprKind::Call(format!("{}{}", crate::impls::P_CALL, SLICE_ASSIGN), all, *ccol),
+                            );
+                            return Stmt::Expr(call);
+                        }
+                        if cn == &format!("{}{}", crate::impls::P_CALL, SLICE_STEP) {
+                            self.dg.error(sp, "assignment to an extended slice 'x[a:b:c] = e' is not supported");
+                        }
+                    }
                     Stmt::Assign { target: e, value: v, span: sp }
                 } else {
                     let broken = self.recovering;
