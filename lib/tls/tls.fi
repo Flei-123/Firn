@@ -125,6 +125,7 @@ import std.crypto.gcm
 import std.crypto.rsa
 import std.crypto.ecdsa
 import std.crypto.p256
+import std.time
 import tls.keys
 import tls.x509
 import tls.prf12
@@ -141,7 +142,7 @@ export {
     SUITE_AES128GCM, SUITE_CHACHA20,
     // round ASYNC -- non-blocking mode (see N1..N4 below)
     tls_set_nonblocking, tls_handshake_step, tls_flush, tls_out_pending,
-    tls_is_nonblocking, tls_closed, tls_note_error,
+    tls_is_nonblocking, tls_closed, tls_note_error, tls_yielded, tls_stage_ms,
     SUITE12_ECDSA_AES128GCM, SUITE12_ECDSA_AES256GCM, SUITE12_RSA_AES128GCM,
     SUITE12_RSA_AES256GCM, SUITE12_ECDSA_CHACHA20, SUITE12_RSA_CHACHA20,
 }
@@ -257,6 +258,8 @@ struct Tls {
     wbuf: rt.Buf, // octets that still have to go to the socket (N2)
     wpos: usize,
     hs_step: u32, // 0 start, 1 ServerHello, 2 server flight, 3 done
+    hs_sub: u32, // inside a step: 0 .. (the next heavy operation to do)
+    yielded: bool, // the last step stopped early on purpose: call it again on the next loop round
     hs_have_cert: bool,
     hs_verified: bool,
     hs_fin: bool,
@@ -295,7 +298,7 @@ fn tls_new() -> Tls {
         established: false, truncated: false, closed: false,
         verify: x509.V_PARSE, chain_depth: 0, ncerts: 0, alert_desc: 0,
         now: 0, records_in: 0, records_out: 0, hs_bytes: 0,
-        nb: false, blocked: false, wbuf: rt.buf_new(), wpos: 0, hs_step: 0 as u32,
+        nb: false, blocked: false, wbuf: rt.buf_new(), wpos: 0, hs_step: 0 as u32, hs_sub: 0 as u32, yielded: false,
         hs_have_cert: false, hs_verified: false, hs_fin: false,
         certs: [x509.cert_new(); 10],
         hs_have_ske: false, hs_cert_req: false, hs_done12: false,
@@ -1585,6 +1588,33 @@ fn ecdsa_from_der(leaf: *mut x509.Cert, digest: u64, hlen: usize,
 // blocking socket `WouldBlock` cannot happen; if the socket is non-blocking
 // after all, the caller gets the error and may call `tls_handshake_step`
 // itself.
+// Time of the heavy handshake stages of the last handshake (ms), for the
+// measurements: 0 X25519 + P-256 keygen, 1 key exchange, 2 chain check,
+// 3 CertificateVerify.
+static mut G_STAGE_MS: [i64; 4] = [0, 0, 0, 0]
+
+fn tls_stage_ms(i: usize) -> i64 { return G_STAGE_MS[i] }
+
+fn stage_now() -> i64 { return (time.monotonic_ns() / 1000000 as u64) as i64 }
+
+// In non-blocking mode a handshake step stops after a heavy operation (a
+// scalar multiplication, a signature check) and says so; the stream calls it
+// again on the next loop round, so one handshake is many short pieces and
+// not one stall of seconds. Blocking callers just loop.
+fn tls_yielded(t: *mut Tls) -> bool {
+    let y: bool = (*t).yielded
+    (*t).yielded = false
+    return y
+}
+
+fn yield_now(t: *mut Tls) -> bool {
+    if (*t).nb {
+        (*t).yielded = true
+        return true
+    }
+    return false
+}
+
 fn tls_handshake(t: *mut Tls) -> TlsError!bool {
     while true {
         let done: bool = try tls_handshake_step(t)
@@ -1608,29 +1638,45 @@ fn tls_handshake_step(t: *mut Tls) -> TlsError!bool {
         return handshake12_step(t)
     }
     if (*t).hs_step == 0 as u32 {
-        if !random.random_bytes((&(*t).priv[0]) as u64, 32) {
-            return TlsError::Random
-        }
-        if !x25519.x25519_base((&(*t).priv[0]) as u64,
-            (&(*t).pub_key[0]) as u64) {
-            return TlsError::Random
-        }
-        // the secp256r1 share: a scalar in 1 .. n-1 (a draw outside is
-        // astronomically rare, but it is checked, not assumed)
-        var drawn: bool = false
-        var tries: usize = 0
-        while !drawn && tries < 8 {
-            if !random.random_bytes((&(*t).p256_priv[0]) as u64, 32) {
+        if (*t).hs_sub == 0 as u32 {
+            let g0: i64 = stage_now()
+            if !random.random_bytes((&(*t).priv[0]) as u64, 32) {
                 return TlsError::Random
             }
-            if p256.p256_scalar_valid((&(*t).p256_priv[0]) as u64) {
-                drawn = true
+            if !x25519.x25519_base((&(*t).priv[0]) as u64,
+                (&(*t).pub_key[0]) as u64) {
+                return TlsError::Random
             }
-            tries = tries + 1
+            G_STAGE_MS[0] = stage_now() - g0
+            (*t).hs_sub = 1 as u32
+            if yield_now(t) {
+                return false
+            }
         }
-        if !drawn || !p256.p256_public((&(*t).p256_priv[0]) as u64,
-            (&(*t).p256_pub[0]) as u64) {
-            return TlsError::Random
+        if (*t).hs_sub == 1 as u32 {
+            let g1: i64 = stage_now()
+            // the secp256r1 share: a scalar in 1 .. n-1 (a draw outside is
+            // astronomically rare, but it is checked, not assumed)
+            var drawn: bool = false
+            var tries: usize = 0
+            while !drawn && tries < 8 {
+                if !random.random_bytes((&(*t).p256_priv[0]) as u64, 32) {
+                    return TlsError::Random
+                }
+                if p256.p256_scalar_valid((&(*t).p256_priv[0]) as u64) {
+                    drawn = true
+                }
+                tries = tries + 1
+            }
+            if !drawn || !p256.p256_public((&(*t).p256_priv[0]) as u64,
+                (&(*t).p256_pub[0]) as u64) {
+                return TlsError::Random
+            }
+            G_STAGE_MS[0] = G_STAGE_MS[0] + (stage_now() - g1)
+            (*t).hs_sub = 2 as u32
+            if yield_now(t) {
+                return false
+            }
         }
         var ch: rt.Buf = rt.buf_new()
         if !build_client_hello(t, &ch) {
@@ -1645,23 +1691,40 @@ fn tls_handshake_step(t: *mut Tls) -> TlsError!bool {
             return TlsError::Io
         }
         (*t).hs_step = 1 as u32
+        (*t).hs_sub = 0 as u32
     }
 
     if (*t).hs_step == 1 as u32 {
-        var htype: u32 = 0
-        var hoff: usize = 0
-        var hlen: usize = 0
-        let got: bool = try next_handshake(t, &htype, &hoff, &hlen)
-        if htype != HS_SERVER_HELLO {
-            return TlsError::Protocol
-        }
-        var share: usize = 0
-        let okh: bool = try parse_server_hello(t, (*t).hsin.ptr, hoff, hlen,
-            &share)
-        if (*t).v12 {
-            // the server chose TLS 1.2 (T7): the rest is `handshake12_step`
-            (*t).hs_step = 5 as u32
-            return handshake12_step(t)
+        if (*t).hs_sub == 0 as u32 {
+            var htype: u32 = 0
+            var hoff: usize = 0
+            var hlen: usize = 0
+            let got: bool = try next_handshake(t, &htype, &hoff, &hlen)
+            if htype != HS_SERVER_HELLO {
+                return TlsError::Protocol
+            }
+            var share: usize = 0
+            let okh: bool = try parse_server_hello(t, (*t).hsin.ptr, hoff, hlen,
+                &share)
+            if (*t).v12 {
+                // the server chose TLS 1.2 (T7): the rest is `handshake12_step`
+                (*t).hs_step = 5 as u32
+                return handshake12_step(t)
+            }
+            // keep the server's share (the buffer it lives in moves while more octets arrive)
+            var sl: usize = 32
+            if (*t).group == 23 as u32 {
+                sl = 65
+            }
+            if share + sl > (*t).hsin.len {
+                return TlsError::Protocol
+            }
+            rt.mem_copy((&(*t).peer_pub[0]) as u64, (*t).hsin.ptr + share as u64, sl)
+            (*t).hs_sub = 1 as u32
+            // the key exchange is the next heavy operation: let the loop breathe first
+            if yield_now(t) {
+                return false
+            }
         }
         // the middlebox compatibility record (RFC 8446 D.4): after the first
         // server flight and before our second, in the clear. (Sent right after
@@ -1670,10 +1733,16 @@ fn tls_handshake_step(t: *mut Tls) -> TlsError!bool {
         var ccs: [u8; 1] = [1; 1]
         let ok_ccs: bool = write_record(t, REC_CHANGE_CIPHER,
             (&ccs[0]) as u64, 1)
-        if !install_handshake_keys(t, (*t).hsin.ptr + share as u64) {
+        let g5: i64 = stage_now()
+        if !install_handshake_keys(t, (&(*t).peer_pub[0]) as u64) {
             return TlsError::Protocol
         }
+        G_STAGE_MS[1] = stage_now() - g5
         (*t).hs_step = 2 as u32
+        (*t).hs_sub = 0 as u32
+        if yield_now(t) {
+            return false
+        }
     }
 
     if (*t).hs_step == 2 as u32 {
@@ -1697,10 +1766,15 @@ fn tls_handshake_step(t: *mut Tls) -> TlsError!bool {
                 (*t).ncerts = 0
                 let g3: bool = try parse_certificate(t, (*t).certbuf.ptr, 0, hl,
                     &(*t).certs, &(*t).ncerts)
+                let g6: i64 = stage_now()
                 if !check_chain(t, &(*t).certs, (*t).ncerts) {
                     return TlsError::Certificate
                 }
+                G_STAGE_MS[2] = stage_now() - g6
                 (*t).hs_have_cert = true
+                if yield_now(t) {
+                    return false
+                }
             } else if ht == HS_CERT_VERIFY {
                 if !(*t).hs_have_cert || hl < 4 {
                     return TlsError::Protocol
@@ -1710,9 +1784,14 @@ fn tls_handshake_step(t: *mut Tls) -> TlsError!bool {
                 if 4 + slen > hl {
                     return TlsError::Protocol
                 }
+                let g7: i64 = stage_now()
                 let g4: bool = try verify_certverify(t, &(*t).certs[0], alg,
                     (*t).hsin.ptr + (ho + 4) as u64, slen, before)
+                G_STAGE_MS[3] = stage_now() - g7
                 (*t).hs_verified = true
+                if yield_now(t) {
+                    return false
+                }
             } else if ht == HS_FINISHED {
                 if !(*t).hs_verified {
                     return TlsError::Signature
