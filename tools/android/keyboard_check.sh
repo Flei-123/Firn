@@ -104,7 +104,7 @@ import sys
 from PIL import Image
 import numpy as np
 im = np.array(Image.open(sys.argv[1]).convert('RGB'))
-sys.exit(0 if (im == [244, 244, 246]).all(axis=2).mean() > 0.6 else 1)
+sys.exit(0 if (abs(im.astype(int) - [244, 244, 246]).max(axis=2) <= 3).mean() > 0.6 else 1)
 PY
     done
     return 1

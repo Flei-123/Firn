@@ -244,6 +244,8 @@ const TABLE: &[(i64, A64)] = &[
     (228, A64::Direct(113)),         // clock_gettime
     (231, A64::Direct(94)),          // exit_group
     (233, A64::Direct(21)),          // epoll_ctl     (lib/async)
+    (254, A64::Direct(27)),          // inotify_add_watch (desktop.watch)
+    (255, A64::Direct(28)),          // inotify_rm_watch (desktop.watch)
     (257, A64::Direct(56)),          // openat
     (262, A64::Direct(79)),          // newfstatat
     // OPENPLAN LIB-001 (std.fs): rmdir has no generic form -- std.fs calls
@@ -258,6 +260,7 @@ const TABLE: &[(i64, A64)] = &[
     (290, A64::Direct(19)),          // eventfd2      (lib/async: wake-up from threads)
     (291, A64::Direct(20)),          // epoll_create1 (lib/async)
     (293, A64::Direct(59)),          // pipe2     (std.process)
+    (294, A64::Direct(26)),          // inotify_init1 (desktop.watch, input.padsys)
     (318, A64::Direct(278)),         // getrandom
     (332, A64::Direct(291)),         // statx
 ];
@@ -414,6 +417,8 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (228, "clock_gettime", Wasm::ClockGettime),
     (231, "exit_group", Wasm::Exit),
     (233, "epoll_ctl", Wasm::Missing(NO_FILES)),
+    (254, "inotify_add_watch", Wasm::Missing(NO_FILES)),
+    (255, "inotify_rm_watch", Wasm::Missing(NO_FILES)),
     (257, "openat", Wasm::Missing(NO_FILES)),
     (262, "newfstatat", Wasm::Missing(NO_FILES)),
     (263, "unlinkat", Wasm::Missing(NO_FILES)),
@@ -425,6 +430,7 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (290, "eventfd2", Wasm::Missing(NO_FILES)),
     (291, "epoll_create1", Wasm::Missing(NO_FILES)),
     (293, "pipe2", Wasm::Missing(NO_FILES)),
+    (294, "inotify_init1", Wasm::Missing(NO_FILES)),
     (318, "getrandom", Wasm::Getrandom),
     (332, "statx", Wasm::Missing(NO_FILES)),
 ];

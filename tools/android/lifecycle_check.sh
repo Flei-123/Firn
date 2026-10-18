@@ -45,7 +45,7 @@ from PIL import Image
 import numpy as np
 im = np.array(Image.open(sys.argv[1]).convert('RGB'))
 h, w, _ = im.shape
-base = (im == [244, 244, 246]).all(axis=2)
+base = (abs(im.astype(int) - [244, 244, 246]).max(axis=2) <= 3)  # tolerance: the theme grey is 243,243,243 now
 ys = np.where(base.any(axis=1))[0]
 crop = im[h * 43 // 100:h * 52 // 100, w * 40 // 100:w * 60 // 100]
 print(f"{w}x{h} {int(base.mean() * 100)} {hashlib.md5(crop.tobytes()).hexdigest()[:8]} {int(ys.max()) if len(ys) else 0}")
