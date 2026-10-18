@@ -80,11 +80,11 @@ pub(crate) const A64_XPOOL: [&str; 4] = ["x25", "x26", "x27", "x28"];
 
 /// r841: caller-saved registers that a LEAF with a loop may hand out as well (see `A64_XPOOL`). The emitter touches
 /// x0-x8 only in the sequences of calls, system calls, thread creation, `Ret` (x0) and the prologue's move of the incoming
-/// arguments; x15 and x17 it never touches (x16 is `U`, the scratch of the checked multiply, and the frame size for
+/// arguments; x17 it never touches (x15 is `T` of the checked-arithmetic sequences in panic_rt_a64.rs, so it is NOT handed out; x16 is `U`, the scratch of the checked multiply, and the frame size for
 /// big frames). The panic blocks read `x9`/`x10` (and write x0-x3 for the runtime call, which never returns).
 /// Consequences: no value of a PARAMETER may live in one of them (the prologue moves the arguments one by one), and
 /// x0/x1 stay out (return value / possible second result). Nothing here needs a save: the caller treats them as clobbered.
-pub(crate) const A64_XCALLER: [&str; 9] = ["x2", "x3", "x4", "x5", "x6", "x7", "x8", "x15", "x17"];
+pub(crate) const A64_XCALLER: [&str; 8] = ["x2", "x3", "x4", "x5", "x6", "x7", "x8", "x17"];
 
 /// ROUND FREG -- the floating point registers handed out: `d8`-`d15`. AAPCS64
 /// keeps the LOW 64 bits of `v8`-`v15` across a call, which is exactly what an
@@ -597,7 +597,8 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     pool.extend(A64_POOL.iter().copied());
     if xpool_on && std::env::var_os("FIRN_A64_NO_XCALLER").is_none() {
         // the end of the list is handed out first: caller-saved registers cost no save and restore
-        caller.extend(A64_XCALLER.iter().rev().copied());
+        let skip = std::env::var("FIRN_A64_XSKIP").unwrap_or_default();
+        caller.extend(A64_XCALLER.iter().rev().copied().filter(|r| !skip.split(',').any(|x| x == *r)));
         pool.extend(caller.iter().copied());
     }
     let (got, used) = linear_scan(&ivs, &pool, f.params.len(), &caller);
