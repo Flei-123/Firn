@@ -433,14 +433,14 @@ def parse_batterystats(txt, pkg):
         r["capacity_mah"] = int(m.group(1))
     if uid is not None:
         au = "u0a%d" % (uid - 10000) if uid >= 10000 else str(uid)
-        m = re.search(r"Uid %s:\s*([\d.]+)(.*)" % au, txt)
+        m = re.search(r"UID %s:\s*([\d.]+)(.*)" % au, txt, re.I)
         if m:
             r["app_mah"] = float(m.group(1))
             r["app_detail"] = m.group(2).strip()[:200]
-    m = re.search(r"^\s*Screen:\s*([\d.]+)", txt, re.M)
+    m = re.search(r"^\s*screen:\s*([\d.]+)", txt, re.M | re.I)
     if m:
         r["screen_mah"] = float(m.group(1))
-    m = re.search(r"^\s*Cpu:\s*([\d.]+)", txt, re.M)
+    m = re.search(r"^\s*cpu:\s*([\d.]+) apps", txt, re.M | re.I)
     if m:
         r["cpu_mah_all"] = float(m.group(1))
     return r
@@ -467,13 +467,13 @@ def phase_energy(app, energy_s, outdir):
             b, th = battery_state(), thermal_state()
             c, v = current_now()
             samples.append({"t_s": round(time.time() - t0), "temp_c": b["temp_c"], "level": b["level"],
-                            "cur_uA": c, "volt_uV": v, "cpu_ms": pid_cpu_ms(a["pkg"]), "skin": th["temps"].get("skin")
-                            if "skin" in th["temps"] else None, "hot": max(th["temps"].values()) if th["temps"] else None})
+                            "cur_uA": c, "volt_uV": v, "cpu_ms": pid_cpu_ms(a["pkg"]), "skin": th["temps"].get("SKIN")
+                            if "SKIN" in th["temps"] else None, "hot": max(th["temps"].values()) if th["temps"] else None})
             time.sleep(max(0, 30 - 1.5))
         cpu1 = pid_cpu_ms(a["pkg"])
         elapsed = time.time() - t0
         after = {"battery": battery_state(), "thermal": thermal_state()}
-        bs = sh("dumpsys batterystats", timeout=120)
+        bs = sh("dumpsys batterystats --usage", timeout=120)  # Android 16: power model lives here, not in the plain dump
         with open(os.path.join(outdir, "batterystats_%s_%s.txt" % (app, time.strftime("%Y%m%d-%H%M%S"))), "w",
                   encoding="utf-8") as f:
             f.write(bs)
