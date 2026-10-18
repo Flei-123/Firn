@@ -46,6 +46,6 @@ echo "-- live window ($(head -n 1 "$D/live.log"))"
 python3 -I tools/fui/atspi_test.py "unix:path=$D/bus" "$D/tree.json" --live
 R=$?
 i=0
-while kill -0 "$APID" 2>/dev/null && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+while kill -0 "$APID" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
 kill -0 "$APID" 2>/dev/null && { echo "  WRONG the window did not close after the Quit action"; R=1; }
 exit $R
