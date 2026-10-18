@@ -117,6 +117,8 @@ S = [
 ("N_GET_SERVICE","getService"),
 ("N_SET_DELETE","setDeleteIntent"),
 ("S_EXTRA_GONE","org.firn.extra.GONE"),
+("N_ADD_FLAGS","addFlags"),
+("G_ADD_FLAGS","(I)Landroid/content/Intent;"),
 ]
 # German UI texts: the generated comment is English (no-german guard); the text itself stays.
 EN = {
