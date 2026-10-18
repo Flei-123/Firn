@@ -1,0 +1,1071 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/wave8.fi -- THE CONTROLS OF WAVE 8 (r45 rest, gap list rows 17, 29, 33, 40):
+//
+//   spinner     busy ring (12 dots, a bright head with a fading tail), still when reduced motion is on
+//   timepicker  hour / minute / AM-PM fields, arrows + Home / End + digit type-ahead + wheel, 12 h and 24 h
+//   breadcrumb  path crumbs with chevrons; too wide -> the first crumbs fold into a "..." button
+//   infobar     one-line message bar (info / success / warning / error) with an action button and a close button
+//   stepper     numbered steps with connectors (done / current / todo), clickable, keys
+//
+// Same rules as lib/fui/kit.fi / wave5.fi / wave7.fi: IMMEDIATE MODE (the program keeps the small state, calls
+// `*_draw` every frame), ONE GEOMETRY (every `*_hit` asks the function the picture was made from), ONLY THEME tokens
+// (kit.tokc / the theme's message colours), lengths through kit.ln, RIGHT TO LEFT through kit.rx. Time is dt-free:
+// the program gives the spinner a millisecond clock; a clock below 0 draws the still ring (reduced motion).
+//
+// HONEST LIMITS: the time picker keeps its digits left to right in RTL (numbers do not mirror; only keys stay); no
+// seconds field; the info bar has ONE line (title + message are cut with "..."); the stepper is horizontal only; the
+// breadcrumb holds 16 crumbs and the stepper 8 steps.
+import std.math
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.kit
+import fui.kitcolor
+import fui.editor
+import fui.lucide
+
+export {
+    spinner_size, spinner_head, spinner_alpha, spinner_draw,
+    Time, TP_HOUR, TP_MIN, TP_AMPM, TP_NONE, tp_new, tp_set, tp_hour_shown, tp_fields, tp_step, tp_key, tp_digit, tp_wheel,
+    tp_focus, tp_text, tp_width, tp_height, tp_rect, tp_hit, tp_draw,
+    Crumbs, crumbs_new, crumbs_add, BC_MAX, BC_NONE, BC_OVERFLOW, bc_height, bc_first, bc_rect, bc_hit, bc_focus_step, bc_draw,
+    InfoBar, infobar_new, IB_INFO, IB_SUCCESS, IB_WARNING, IB_ERROR, IB_PART_NONE, IB_PART_ACTION, IB_PART_CLOSE,
+    ib_height, ib_color, ib_icon, ib_rect, ib_hit, ib_draw,
+    Steps, steps_new, steps_add, ST_MAX, STEP_NONE, stepper_height, stepper_rect, stepper_hit, stepper_key, stepper_draw,
+}
+
+fn text_run(size: f64, weight: usize) -> painter.TextRun {
+    var r: painter.TextRun = painter.run_new(size)
+    if weight >= 700 {
+        r = painter.run_set_weight(r, 700)
+    }
+    return r
+}
+
+fn colors_of(c: *mut render.Ctx) -> *mut theme.Colors {
+    return theme.theme_colors(render.ctx_theme(c))
+}
+
+// ====================================================================
+// SPINNER
+// ====================================================================
+
+const SPIN_DOTS: usize = 12
+const SPIN_PERIOD_MS: u64 = 1000
+
+fn spinner_size(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 32)
+}
+
+// the dot that is brightest at the clock t_ms (clockwise, one turn per second)
+fn spinner_head(t_ms: i64) -> usize {
+    var t: i64 = t_ms
+    if t < 0 as i64 {
+        t = 0
+    }
+    return (((t as u64) % SPIN_PERIOD_MS) * (SPIN_DOTS as u64) / SPIN_PERIOD_MS) as usize
+}
+
+// alpha (0..255) of dot i when dot `head` leads: 255 at the head, fading against the turning direction down to 40
+fn spinner_alpha(i: usize, head: usize) -> u32 {
+    let dist: usize = (head + SPIN_DOTS - i) % SPIN_DOTS
+    let a: usize = 255 - dist * 215 / (SPIN_DOTS - 1)
+    return a as u32
+}
+
+// A busy ring of diameter d with its top-left at (x, y). t_ms < 0 = still ring (all dots one calm value).
+fn spinner_draw(c: *mut render.Ctx, x: f64, y: f64, d: f64, t_ms: i64, col: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let dd: f64 = d / 6.0
+    let rad: f64 = (d - dd) / 2.0
+    let cx: f64 = x + d / 2.0
+    let cy: f64 = y + d / 2.0
+    let head: usize = spinner_head(t_ms)
+    var i: usize = 0
+    while i < SPIN_DOTS {
+        let ang: f64 = (i as f64) * 2.0 * math.PI() / (SPIN_DOTS as f64) - math.PI() / 2.0
+        let px: f64 = cx + rad * math.cos(ang)
+        let py: f64 = cy + rad * math.sin(ang)
+        var a: u32 = 110 as u32
+        if t_ms >= 0 as i64 {
+            a = spinner_alpha(i, head)
+        }
+        painter.round_rect(z, px - dd / 2.0, py - dd / 2.0, dd, dd, dd / 2.0, kit.with_alpha(col, a))
+        i = i + 1
+    }
+}
+
+// ====================================================================
+// TIME PICKER
+// ====================================================================
+
+const TP_HOUR: usize = 0
+const TP_MIN: usize = 1
+const TP_AMPM: usize = 2
+const TP_NONE: usize = 99
+
+// h = 0..23 always (the 12 h display is derived), m = 0..59; step = the minute step of the arrows / the wheel
+struct Time {
+    h: i64,
+    m: i64,
+    step: i64,
+    h24: bool,
+    field: usize, // the field the keys act on
+    pend: i64, // first typed digit waiting for the second (-1 none)
+}
+
+fn tp_new(h: i64, m: i64, step: i64, h24: bool) -> Time {
+    var t: Time = Time { h: 0, m: 0, step: step, h24: h24, field: TP_HOUR, pend: -1 }
+    if t.step < 1 {
+        t.step = 1
+    }
+    if t.step > 30 {
+        t.step = 30
+    }
+    tp_set(&t, h, m)
+    return t
+}
+
+// both values at once (wrapped into 0..23 / 0..59)
+fn tp_set(t: *mut Time, h: i64, m: i64) {
+    var hh: i64 = h % 24
+    if hh < 0 {
+        hh = hh + 24
+    }
+    var mm: i64 = m % 60
+    if mm < 0 {
+        mm = mm + 60
+    }
+    (*t).h = hh
+    (*t).m = mm
+    (*t).pend = -1
+}
+
+fn tp_fields(t: *mut Time) -> usize {
+    if (*t).h24 {
+        return 2
+    }
+    return 3
+}
+
+// the hour as it is shown (12 h: 12, 1..11)
+fn tp_hour_shown(t: *mut Time) -> i64 {
+    if (*t).h24 {
+        return (*t).h
+    }
+    let k: i64 = (*t).h % 12
+    if k == 0 {
+        return 12
+    }
+    return k
+}
+
+// field up (dir > 0) or down (dir < 0) by one unit; wraps inside the field (the minute does not carry into the hour)
+fn tp_step(t: *mut Time, field: usize, dir: i64) -> bool {
+    var d: i64 = 1
+    if dir < 0 {
+        d = -1
+    }
+    let oh: i64 = (*t).h
+    let om: i64 = (*t).m
+    (*t).pend = -1
+    if field == TP_HOUR {
+        if (*t).h24 {
+            tp_set(t, (*t).h + d, (*t).m)
+        } else {
+            // 12 h: wrap inside the half day
+            let pm: i64 = (*t).h / 12
+            tp_set(t, pm * 12 + (((*t).h % 12) + d + 12) % 12, (*t).m)
+        }
+    } else if field == TP_MIN {
+        var m: i64 = ((*t).m / (*t).step) * (*t).step + d * (*t).step
+        // keep on the grid; wrap at 60
+        let top: i64 = (59 / (*t).step) * (*t).step
+        if m < 0 {
+            m = top
+        } else if m > top {
+            m = 0
+        }
+        (*t).m = m
+    } else if field == TP_AMPM {
+        if !(*t).h24 {
+            tp_set(t, (*t).h + 12, (*t).m)
+        }
+    }
+    return (*t).h != oh || (*t).m != om
+}
+
+// the wheel: one notch = one step of the field under the pointer (dir > 0 = up)
+fn tp_wheel(t: *mut Time, field: usize, dir: i64) -> bool {
+    return tp_step(t, field, dir)
+}
+
+// the keys; true = the time changed. Left / Right pick the field (no wrap), Up / Down step, Home / End go to the ends.
+fn tp_key(t: *mut Time, key: u32) -> bool {
+    let last: usize = tp_fields(t) - 1
+    if key == editor.KEY_LEFT {
+        if (*t).field > 0 {
+            (*t).field = (*t).field - 1
+        }
+        (*t).pend = -1
+        return false
+    }
+    if key == editor.KEY_RIGHT {
+        if (*t).field < last {
+            (*t).field = (*t).field + 1
+        }
+        (*t).pend = -1
+        return false
+    }
+    if key == editor.KEY_UP {
+        return tp_step(t, (*t).field, 1)
+    }
+    if key == editor.KEY_DOWN {
+        return tp_step(t, (*t).field, -1)
+    }
+    let oh: i64 = (*t).h
+    let om: i64 = (*t).m
+    if key == editor.KEY_HOME || key == editor.KEY_END {
+        let end: bool = key == editor.KEY_END
+        if (*t).field == TP_HOUR {
+            if (*t).h24 {
+                if end {
+                    (*t).h = 23
+                } else {
+                    (*t).h = 0
+                }
+            } else {
+                let pm: i64 = (*t).h / 12
+                if end {
+                    (*t).h = pm * 12 + 11
+                } else {
+                    (*t).h = pm * 12
+                }
+            }
+        } else if (*t).field == TP_MIN {
+            if end {
+                (*t).m = (59 / (*t).step) * (*t).step
+            } else {
+                (*t).m = 0
+            }
+        } else {
+            if end {
+                (*t).h = ((*t).h % 12) + 12
+            } else {
+                (*t).h = (*t).h % 12
+            }
+        }
+        (*t).pend = -1
+    }
+    return (*t).h != oh || (*t).m != om
+}
+
+fn tp_set_hour_shown(t: *mut Time, v: i64) {
+    if (*t).h24 {
+        (*t).h = v
+    } else {
+        let pm: i64 = (*t).h / 12
+        (*t).h = (v % 12) + pm * 12
+    }
+}
+
+// digit type-ahead (d = 0..9) into the focused field. A first digit that cannot start a two-digit value finishes the
+// field and moves on. Returns true when the time changed.
+fn tp_digit(t: *mut Time, d: i64) -> bool {
+    if d < 0 || d > 9 {
+        return false
+    }
+    let oh: i64 = (*t).h
+    let om: i64 = (*t).m
+    if (*t).field == TP_HOUR {
+        var big: i64 = 3 // first digits >= big finish at once
+        if !(*t).h24 {
+            big = 2
+        }
+        if (*t).pend >= 0 as i64 {
+            var v: i64 = (*t).pend * 10 + d
+            var ok: bool = v <= 23
+            if !(*t).h24 {
+                ok = v >= 1 && v <= 12
+            }
+            if !ok {
+                v = d
+            }
+            tp_set_hour_shown(t, v)
+            (*t).pend = -1
+            (*t).field = TP_MIN
+        } else if d >= big {
+            tp_set_hour_shown(t, d)
+            (*t).field = TP_MIN
+        } else {
+            if !(*t).h24 && d == 0 {
+                // "0" alone is no 12 h hour: wait for the second digit
+                (*t).pend = 0
+            } else {
+                tp_set_hour_shown(t, d)
+                (*t).pend = d
+            }
+        }
+    } else if (*t).field == TP_MIN {
+        if (*t).pend >= 0 as i64 {
+            (*t).m = (*t).pend * 10 + d
+            (*t).pend = -1
+            if !(*t).h24 {
+                (*t).field = TP_AMPM
+            }
+        } else if d >= 6 {
+            (*t).m = d
+            if !(*t).h24 {
+                (*t).field = TP_AMPM
+            }
+        } else {
+            (*t).m = d
+            (*t).pend = d
+        }
+    } else {
+        return false
+    }
+    return (*t).h != oh || (*t).m != om
+}
+
+fn tp_focus(t: *mut Time, field: usize) {
+    if field < tp_fields(t) {
+        (*t).field = field
+        (*t).pend = -1
+    }
+}
+
+// the text of one field into `out` (2 digits, or AM / PM); its length
+fn tp_text(t: *mut Time, field: usize, out: *mut [u8; 24]) -> usize {
+    if field == TP_AMPM {
+        if (*t).h >= 12 {
+            (*out)[0] = 80 as u8
+        } else {
+            (*out)[0] = 65 as u8
+        }
+        (*out)[1] = 77 as u8
+        return 2
+    }
+    var v: i64 = (*t).m
+    if field == TP_HOUR {
+        v = tp_hour_shown(t)
+    }
+    (*out)[0] = (48 + v / 10) as u8
+    (*out)[1] = (48 + v % 10) as u8
+    return 2
+}
+
+fn tp_height(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 36)
+}
+
+fn tp_field_w(c: *mut render.Ctx, field: usize) -> f64 {
+    if field == TP_AMPM {
+        return kit.ln(c, 56)
+    }
+    return kit.ln(c, 48)
+}
+
+fn tp_colon_w(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 12)
+}
+
+fn tp_width(c: *mut render.Ctx, t: *mut Time) -> f64 {
+    var w: f64 = tp_field_w(c, TP_HOUR) + tp_colon_w(c) + tp_field_w(c, TP_MIN)
+    if !(*t).h24 {
+        w = w + kit.ln(c, 4) + tp_field_w(c, TP_AMPM)
+    }
+    return w
+}
+
+// the box of a field for a picker whose top-left is (x, y)
+fn tp_rect(c: *mut render.Ctx, t: *mut Time, field: usize, x: f64, y: f64, ox: *mut f64, oy: *mut f64, ow: *mut f64, oh: *mut f64) -> bool {
+    if field >= tp_fields(t) {
+        return false
+    }
+    var fx: f64 = x
+    if field >= TP_MIN {
+        fx = fx + tp_field_w(c, TP_HOUR) + tp_colon_w(c)
+    }
+    if field == TP_AMPM {
+        fx = fx + tp_field_w(c, TP_MIN) + kit.ln(c, 4)
+    }
+    (*ox) = fx
+    (*oy) = y
+    (*ow) = tp_field_w(c, field)
+    (*oh) = tp_height(c)
+    return true
+}
+
+// the field under (px, py), or TP_NONE
+fn tp_hit(c: *mut render.Ctx, t: *mut Time, x: f64, y: f64, px: f64, py: f64) -> usize {
+    var f: usize = 0
+    while f < tp_fields(t) {
+        var bx: f64 = 0.0
+        var by: f64 = 0.0
+        var bw: f64 = 0.0
+        var bh: f64 = 0.0
+        tp_rect(c, t, f, x, y, &bx, &by, &bw, &bh)
+        if px >= bx && px < bx + bw && py >= by && py < by + bh {
+            return f
+        }
+        f = f + 1
+    }
+    return TP_NONE
+}
+
+// centred text from raw bytes
+fn put_centered(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, size: f64, weight: usize, col: u32, p: u64, n: usize) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var r: painter.TextRun = text_run(size, weight)
+    let tw: f64 = painter.run_width(z, &r, p, n)
+    let by: f64 = painter.text_baseline_mid(z, y, h, size)
+    painter.run_draw_ellipsis(z, &r, x + (w - tw) / 2.0, by, w, col, p, n, painter.TEXT_L)
+}
+
+// `hover` = the field under the pointer (TP_NONE: none), `focused` = the picker has the keyboard focus (then the
+// field t.field gets the ring)
+fn tp_draw(c: *mut render.Ctx, t: *mut Time, x: f64, y: f64, hover: usize, focused: bool, enabled: bool) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var f: usize = 0
+    while f < tp_fields(t) {
+        var bx: f64 = 0.0
+        var by: f64 = 0.0
+        var bw: f64 = 0.0
+        var bh: f64 = 0.0
+        tp_rect(c, t, f, x, y, &bx, &by, &bw, &bh)
+        let r: f64 = kit.ln(c, 4)
+        var fill: u32 = kit.tokc(c, style.TOK_BUTTON)
+        if f == hover && enabled {
+            fill = kit.tokc(c, style.TOK_BUTTON_HOVER)
+        }
+        var fg: u32 = kit.tokc(c, style.TOK_TEXT)
+        if focused && f == (*t).field && enabled {
+            fill = theme.opaque(kit.accent_gfx(c, style.TOK_BASE))
+            fg = theme.opaque(kitcolor.on_color(render.ctx_theme(c), fill))
+        }
+        if !enabled {
+            fg = kit.tokc(c, style.TOK_TEXT_DISABLED)
+        }
+        painter.round_rect(z, bx, by, bw, bh, r, fill)
+        painter.round_ring(z, bx, by, bw, bh, r, kit.ln(c, 1), kit.tokc(c, style.TOK_BORDER))
+        var buf: [u8; 24] = [0 as u8; 24]
+        let n: usize = tp_text(t, f, &buf)
+        put_centered(c, bx, by, bw, bh, kit.ln(c, 16), 400, fg, (&buf[0]) as u64, n)
+        if f == TP_HOUR {
+            // the colon between hour and minute
+            var cb: [u8; 24] = [0 as u8; 24]
+            cb[0] = 58 as u8
+            put_centered(c, bx + bw, by, tp_colon_w(c), bh, kit.ln(c, 16), 700, kit.tokc(c, style.TOK_TEXT), (&cb[0]) as u64, 1)
+        }
+        if focused && f == (*t).field && enabled {
+            kit.focus_ring(c, bx, by, bw, bh, r, style.TOK_BASE)
+        }
+        f = f + 1
+    }
+}
+
+// ====================================================================
+// BREADCRUMB
+// ====================================================================
+
+const BC_MAX: usize = 16
+const BC_NONE: usize = 1000
+const BC_OVERFLOW: usize = 999 // the "..." button
+
+struct Crumbs {
+    n: usize,
+    label: [str; 16],
+}
+
+fn crumbs_new() -> Crumbs {
+    return Crumbs { n: 0, label: ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""] }
+}
+
+fn crumbs_add(cr: *mut Crumbs, s: str) -> bool {
+    if (*cr).n >= BC_MAX {
+        return false
+    }
+    (*cr).label[(*cr).n] = s
+    (*cr).n = (*cr).n + 1
+    return true
+}
+
+fn bc_height(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 32)
+}
+
+fn bc_pad(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 8)
+}
+
+fn bc_sep_w(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 16)
+}
+
+fn bc_over_w(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 32)
+}
+
+fn bc_item_w(c: *mut render.Ctx, cr: *mut Crumbs, i: usize) -> f64 {
+    var weight: usize = 400
+    if i + 1 == (*cr).n {
+        weight = 700
+    }
+    return kit.text_width(c, kit.ln(c, 14), weight, (*cr).label[i]) + 2.0 * bc_pad(c)
+}
+
+// The index of the first crumb that is still shown (0 = nothing folded). The last crumb is always shown; the folded
+// ones sit behind the "..." button.
+fn bc_first(c: *mut render.Ctx, cr: *mut Crumbs, w: f64) -> usize {
+    let n: usize = (*cr).n
+    if n == 0 {
+        return 0
+    }
+    var f: usize = 0
+    while f < n - 1 {
+        var tot: f64 = 0.0
+        if f > 0 {
+            tot = bc_over_w(c) + bc_sep_w(c)
+        }
+        var i: usize = f
+        while i < n {
+            tot = tot + bc_item_w(c, cr, i)
+            if i + 1 < n {
+                tot = tot + bc_sep_w(c)
+            }
+            i = i + 1
+        }
+        if tot <= w {
+            return f
+        }
+        f = f + 1
+    }
+    return n - 1
+}
+
+// the box (x offset inside the strip, width) of a part: a crumb index or BC_OVERFLOW; false = not shown. The strip
+// is [0, w) wide, laid out from the start edge (the caller mirrors with kit.rx).
+fn bc_pos(c: *mut render.Ctx, cr: *mut Crumbs, w: f64, part: usize, ox: *mut f64, ow: *mut f64) -> bool {
+    let n: usize = (*cr).n
+    let f: usize = bc_first(c, cr, w)
+    var x: f64 = 0.0
+    if f > 0 {
+        if part == BC_OVERFLOW {
+            (*ox) = 0.0
+            (*ow) = bc_over_w(c)
+            return true
+        }
+        x = bc_over_w(c) + bc_sep_w(c)
+    } else if part == BC_OVERFLOW {
+        return false
+    }
+    var i: usize = f
+    while i < n {
+        var iw: f64 = bc_item_w(c, cr, i)
+        if x + iw > w {
+            iw = w - x // the last crumb alone does not fit: cut
+            if iw < 0.0 {
+                iw = 0.0
+            }
+        }
+        if i == part {
+            (*ox) = x
+            (*ow) = iw
+            return true
+        }
+        x = x + bc_item_w(c, cr, i) + bc_sep_w(c)
+        i = i + 1
+    }
+    return false
+}
+
+fn bc_rect(c: *mut render.Ctx, cr: *mut Crumbs, x: f64, y: f64, w: f64, part: usize, ox: *mut f64, oy: *mut f64, ow: *mut f64, oh: *mut f64) -> bool {
+    var px: f64 = 0.0
+    var pw: f64 = 0.0
+    if !bc_pos(c, cr, w, part, &px, &pw) {
+        return false
+    }
+    (*ox) = kit.rx(x + px, pw, x, w)
+    (*oy) = y
+    (*ow) = pw
+    (*oh) = bc_height(c)
+    return true
+}
+
+// the part under (px, py): a crumb index, BC_OVERFLOW or BC_NONE
+fn bc_hit(c: *mut render.Ctx, cr: *mut Crumbs, x: f64, y: f64, w: f64, px: f64, py: f64) -> usize {
+    var p: usize = BC_OVERFLOW
+    var bx: f64 = 0.0
+    var by: f64 = 0.0
+    var bw: f64 = 0.0
+    var bh: f64 = 0.0
+    if bc_rect(c, cr, x, y, w, p, &bx, &by, &bw, &bh) {
+        if px >= bx && px < bx + bw && py >= by && py < by + bh {
+            return BC_OVERFLOW
+        }
+    }
+    var i: usize = bc_first(c, cr, w)
+    while i < (*cr).n {
+        if bc_rect(c, cr, x, y, w, i, &bx, &by, &bw, &bh) {
+            if px >= bx && px < bx + bw && py >= by && py < by + bh {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return BC_NONE
+}
+
+// Tab-like focus walk over the shown parts (overflow button first when something is folded). dir > 0 = next.
+// `cur` = BC_NONE: start at the first (dir > 0) or last part.
+fn bc_focus_step(c: *mut render.Ctx, cr: *mut Crumbs, w: f64, cur: usize, dir: i64) -> usize {
+    let n: usize = (*cr).n
+    if n == 0 {
+        return BC_NONE
+    }
+    let f: usize = bc_first(c, cr, w)
+    // positions: 0 = overflow (when f > 0), then crumbs f..n-1
+    var slots: usize = n - f
+    var base: usize = 0
+    if f > 0 {
+        slots = slots + 1
+        base = 1
+    }
+    var pos: usize = 0
+    if cur == BC_NONE {
+        if dir < 0 {
+            pos = slots - 1
+        }
+    } else {
+        var at: usize = 0
+        if cur == BC_OVERFLOW {
+            at = 0
+        } else if cur >= f {
+            at = cur - f + base
+        }
+        if dir > 0 {
+            pos = (at + 1) % slots
+        } else {
+            pos = (at + slots - 1) % slots
+        }
+    }
+    if f > 0 && pos == 0 {
+        return BC_OVERFLOW
+    }
+    return f + pos - base
+}
+
+// `hover` / `focus` = a part (crumb index / BC_OVERFLOW / BC_NONE)
+fn bc_draw(c: *mut render.Ctx, cr: *mut Crumbs, x: f64, y: f64, w: f64, hover: usize, focus: usize) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let n: usize = (*cr).n
+    let f: usize = bc_first(c, cr, w)
+    let h: f64 = bc_height(c)
+    let r: f64 = kit.ln(c, 4)
+    var bx: f64 = 0.0
+    var by: f64 = 0.0
+    var bw: f64 = 0.0
+    var bh: f64 = 0.0
+    let muted: u32 = kit.tokc(c, style.TOK_TEXT_MUTED)
+    let isz: f64 = kit.ln(c, 12)
+    var sep: i64 = lucide.CHEVRON_RIGHT
+    if kit.kit_rtl() {
+        sep = lucide.CHEVRON_LEFT
+    }
+    if f > 0 {
+        if bc_rect(c, cr, x, y, w, BC_OVERFLOW, &bx, &by, &bw, &bh) {
+            if hover == BC_OVERFLOW {
+                painter.round_rect(z, bx, by, bw, bh, r, kit.tokc(c, style.TOK_BUTTON_HOVER))
+            }
+            kit.sym(c, lucide.ELLIPSIS_VERTICAL, bx + (bw - kit.ln(c, 16)) / 2.0, by + (bh - kit.ln(c, 16)) / 2.0, kit.ln(c, 16), kit.tokc(c, style.TOK_TEXT))
+            if focus == BC_OVERFLOW {
+                kit.focus_ring(c, bx, by, bw, bh, r, style.TOK_BASE)
+            }
+            kit.sym(c, sep, kit.rx(x + bx - x + bw + (bc_sep_w(c) - isz) / 2.0, isz, x, w), by + (bh - isz) / 2.0, isz, muted)
+        }
+    }
+    var i: usize = f
+    while i < n {
+        if bc_rect(c, cr, x, y, w, i, &bx, &by, &bw, &bh) {
+            let last: bool = i + 1 == n
+            if i == hover && !last {
+                painter.round_rect(z, bx, by, bw, bh, r, kit.tokc(c, style.TOK_BUTTON_HOVER))
+            }
+            var fg: u32 = muted
+            var wt: usize = 400
+            if last {
+                fg = kit.tokc(c, style.TOK_TEXT)
+                wt = 700
+            }
+            kit.label_in(c, kit.rx(bx + bc_pad(c), bw - 2.0 * bc_pad(c), bx, bw), by, bh, kit.ln(c, 14), wt, fg, (*cr).label[i], bw - 2.0 * bc_pad(c))
+            if i == focus {
+                kit.focus_ring(c, bx, by, bw, bh, r, style.TOK_BASE)
+            }
+            if !last {
+                let sx: f64 = kit.rx(x + (bx - x) + bw + (bc_sep_w(c) - isz) / 2.0, isz, x, w)
+                kit.sym(c, sep, sx, by + (bh - isz) / 2.0, isz, muted)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ====================================================================
+// INFO BAR
+// ====================================================================
+
+const IB_INFO: u32 = 0
+const IB_SUCCESS: u32 = 1
+const IB_WARNING: u32 = 2
+const IB_ERROR: u32 = 3
+const IB_PART_NONE: u32 = 0
+const IB_PART_ACTION: u32 = 1
+const IB_PART_CLOSE: u32 = 2
+
+struct InfoBar {
+    severity: u32,
+    title: str,
+    message: str,
+    action: str, // "" = no action button
+    closable: bool,
+}
+
+fn infobar_new(severity: u32, title: str, message: str) -> InfoBar {
+    return InfoBar { severity: severity, title: title, message: message, action: "", closable: true }
+}
+
+fn ib_height(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 48)
+}
+
+// the message colour of a severity, pulled to 3:1 against the bar fill so the icon always reads
+fn ib_color(c: *mut render.Ctx, sev: u32) -> u32 {
+    let col: *mut theme.Colors = colors_of(c)
+    var base: u32 = (*col).accent
+    if sev == IB_SUCCESS {
+        base = (*col).success
+    } else if sev == IB_WARNING {
+        base = (*col).warning
+    } else if sev == IB_ERROR {
+        base = (*col).err_col
+    }
+    return theme.opaque(kitcolor.tone(render.ctx_theme(c), base, (*col).surface_raised, 3.0))
+}
+
+fn ib_icon(sev: u32) -> i64 {
+    if sev == IB_SUCCESS {
+        return lucide.CIRCLE_CHECK
+    }
+    if sev == IB_WARNING {
+        return lucide.TRIANGLE_ALERT
+    }
+    if sev == IB_ERROR {
+        return lucide.CIRCLE_X
+    }
+    return lucide.INFO
+}
+
+fn ib_action_w(c: *mut render.Ctx, ib: *mut InfoBar) -> f64 {
+    if (*ib).action.n == 0 {
+        return 0.0
+    }
+    return kit.text_width(c, kit.ln(c, 14), 400, (*ib).action) + 2.0 * kit.ln(c, 12)
+}
+
+fn ib_close_w(c: *mut render.Ctx, ib: *mut InfoBar) -> f64 {
+    if !(*ib).closable {
+        return 0.0
+    }
+    return kit.ln(c, 32)
+}
+
+// the box of a part (IB_PART_ACTION / IB_PART_CLOSE) of a bar at (x, y) w wide; false = not there
+fn ib_rect(c: *mut render.Ctx, ib: *mut InfoBar, x: f64, y: f64, w: f64, part: u32, ox: *mut f64, oy: *mut f64, ow: *mut f64, oh: *mut f64) -> bool {
+    let h: f64 = ib_height(c)
+    let pad: f64 = kit.ln(c, 8)
+    let cw: f64 = ib_close_w(c, ib)
+    if part == IB_PART_CLOSE {
+        if cw == 0.0 {
+            return false
+        }
+        (*ox) = kit.rx(x + w - pad - cw, cw, x, w)
+        (*oy) = y + (h - cw) / 2.0
+        (*ow) = cw
+        (*oh) = cw
+        return true
+    }
+    if part == IB_PART_ACTION {
+        let aw: f64 = ib_action_w(c, ib)
+        if aw == 0.0 {
+            return false
+        }
+        var right: f64 = x + w - pad
+        if cw > 0.0 {
+            right = right - cw - kit.ln(c, 4)
+        }
+        let ah: f64 = kit.ln(c, 28)
+        (*ox) = kit.rx(right - aw, aw, x, w)
+        (*oy) = y + (h - ah) / 2.0
+        (*ow) = aw
+        (*oh) = ah
+        return true
+    }
+    return false
+}
+
+fn ib_hit(c: *mut render.Ctx, ib: *mut InfoBar, x: f64, y: f64, w: f64, px: f64, py: f64) -> u32 {
+    var bx: f64 = 0.0
+    var by: f64 = 0.0
+    var bw: f64 = 0.0
+    var bh: f64 = 0.0
+    if ib_rect(c, ib, x, y, w, IB_PART_CLOSE, &bx, &by, &bw, &bh) {
+        if px >= bx && px < bx + bw && py >= by && py < by + bh {
+            return IB_PART_CLOSE
+        }
+    }
+    if ib_rect(c, ib, x, y, w, IB_PART_ACTION, &bx, &by, &bw, &bh) {
+        if px >= bx && px < bx + bw && py >= by && py < by + bh {
+            return IB_PART_ACTION
+        }
+    }
+    return IB_PART_NONE
+}
+
+// `hover` / `focus` = IB_PART_*
+fn ib_draw(c: *mut render.Ctx, ib: *mut InfoBar, x: f64, y: f64, w: f64, hover: u32, focus: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let h: f64 = ib_height(c)
+    let r: f64 = kit.ln(c, 6)
+    let col: *mut theme.Colors = colors_of(c)
+    let sc: u32 = ib_color(c, (*ib).severity)
+    // fill: the raised surface tinted with the message colour; border: the message colour
+    let fill: u32 = theme.mix((*col).surface_raised, sc, 120)
+    painter.round_rect(z, x, y, w, h, r, fill)
+    painter.round_ring(z, x, y, w, h, r, kit.ln(c, 1), sc)
+    let pad: f64 = kit.ln(c, 12)
+    let isz: f64 = kit.ln(c, 20)
+    kit.sym(c, ib_icon((*ib).severity), kit.rx(x + pad, isz, x, w), y + (h - isz) / 2.0, isz, sc)
+    // text zone between the icon and the buttons
+    let tx: f64 = pad + isz + kit.ln(c, 12)
+    var right: f64 = kit.ln(c, 8)
+    var bx: f64 = 0.0
+    var by: f64 = 0.0
+    var bw: f64 = 0.0
+    var bh: f64 = 0.0
+    if ib_close_w(c, ib) > 0.0 {
+        right = right + ib_close_w(c, ib) + kit.ln(c, 4)
+    }
+    if ib_action_w(c, ib) > 0.0 {
+        right = right + ib_action_w(c, ib) + kit.ln(c, 8)
+    }
+    var room: f64 = w - tx - right
+    if room < 0.0 {
+        room = 0.0
+    }
+    let tcol: u32 = kit.tokc(c, style.TOK_TEXT)
+    let size: f64 = kit.ln(c, 14)
+    let tw: f64 = kit.text_width(c, size, 700, (*ib).title)
+    var tshow: f64 = tw
+    if tshow > room {
+        tshow = room
+    }
+    kit.label_in(c, kit.rx(x + tx, room, x, w), y, h, size, 700, tcol, (*ib).title, tshow)
+    let mx: f64 = tx + tshow + kit.ln(c, 8)
+    let mroom: f64 = room - tshow - kit.ln(c, 8)
+    if mroom > kit.ln(c, 16) && (*ib).message.n > 0 {
+        kit.label_in(c, kit.rx(x + mx, mroom, x, w), y, h, size, 400, kit.tokc(c, style.TOK_TEXT_MUTED), (*ib).message, mroom)
+    }
+    if ib_rect(c, ib, x, y, w, IB_PART_ACTION, &bx, &by, &bw, &bh) {
+        var af: u32 = kit.tokc(c, style.TOK_BUTTON)
+        if hover == IB_PART_ACTION {
+            af = kit.tokc(c, style.TOK_BUTTON_HOVER)
+        }
+        painter.round_rect(z, bx, by, bw, bh, kit.ln(c, 4), af)
+        painter.round_ring(z, bx, by, bw, bh, kit.ln(c, 4), kit.ln(c, 1), kit.tokc(c, style.TOK_BORDER))
+        kit.label_in(c, kit.rx(bx + kit.ln(c, 12), bw - kit.ln(c, 24), bx, bw), by, bh, size, 400, tcol, (*ib).action, bw - kit.ln(c, 24))
+        if focus == IB_PART_ACTION {
+            kit.focus_ring(c, bx, by, bw, bh, kit.ln(c, 4), style.TOK_BASE)
+        }
+    }
+    if ib_rect(c, ib, x, y, w, IB_PART_CLOSE, &bx, &by, &bw, &bh) {
+        if hover == IB_PART_CLOSE {
+            painter.round_rect(z, bx, by, bw, bh, kit.ln(c, 4), kit.tokc(c, style.TOK_BUTTON_HOVER))
+        }
+        let gs: f64 = kit.ln(c, 14)
+        kit.sym(c, lucide.X, bx + (bw - gs) / 2.0, by + (bh - gs) / 2.0, gs, tcol)
+        if focus == IB_PART_CLOSE {
+            kit.focus_ring(c, bx, by, bw, bh, kit.ln(c, 4), style.TOK_BASE)
+        }
+    }
+}
+
+// ====================================================================
+// STEPPER
+// ====================================================================
+
+const ST_MAX: usize = 8
+const STEP_NONE: usize = 99
+
+struct Steps {
+    n: usize,
+    label: [str; 8],
+}
+
+fn steps_new() -> Steps {
+    return Steps { n: 0, label: ["", "", "", "", "", "", "", ""] }
+}
+
+fn steps_add(s: *mut Steps, label: str) -> bool {
+    if (*s).n >= ST_MAX {
+        return false
+    }
+    (*s).label[(*s).n] = label
+    (*s).n = (*s).n + 1
+    return true
+}
+
+fn stepper_height(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 24) + kit.ln(c, 8) + kit.ln(c, 20)
+}
+
+// the column of step i in a stepper at (x, y), w wide (equal columns, mirrored in RTL)
+fn stepper_rect(c: *mut render.Ctx, s: *mut Steps, x: f64, y: f64, w: f64, i: usize, ox: *mut f64, oy: *mut f64, ow: *mut f64, oh: *mut f64) -> bool {
+    if i >= (*s).n {
+        return false
+    }
+    let cw: f64 = w / ((*s).n as f64)
+    (*ox) = kit.rx(x + cw * (i as f64), cw, x, w)
+    (*oy) = y
+    (*ow) = cw
+    (*oh) = stepper_height(c)
+    return true
+}
+
+fn stepper_hit(c: *mut render.Ctx, s: *mut Steps, x: f64, y: f64, w: f64, px: f64, py: f64) -> usize {
+    var i: usize = 0
+    while i < (*s).n {
+        var bx: f64 = 0.0
+        var by: f64 = 0.0
+        var bw: f64 = 0.0
+        var bh: f64 = 0.0
+        stepper_rect(c, s, x, y, w, i, &bx, &by, &bw, &bh)
+        if px >= bx && px < bx + bw && py >= by && py < by + bh {
+            return i
+        }
+        i = i + 1
+    }
+    return STEP_NONE
+}
+
+// Left / Right (mirrored in RTL) / Home / End pick the next step. `max_reach` = the furthest step the user may go to
+// (linear wizard: current + 1 after validation). Returns the new current step (unchanged when refused).
+fn stepper_key(n: usize, current: usize, max_reach: usize, key: u32) -> usize {
+    var k: u32 = key
+    if kit.kit_rtl() {
+        if k == editor.KEY_LEFT {
+            k = editor.KEY_RIGHT
+        } else if k == editor.KEY_RIGHT {
+            k = editor.KEY_LEFT
+        }
+    }
+    var cur: usize = current
+    if k == editor.KEY_RIGHT && cur + 1 < n && cur + 1 <= max_reach {
+        cur = cur + 1
+    } else if k == editor.KEY_LEFT && cur > 0 {
+        cur = cur - 1
+    } else if k == editor.KEY_HOME {
+        cur = 0
+    } else if k == editor.KEY_END {
+        cur = n - 1
+        if cur > max_reach {
+            cur = max_reach
+        }
+    }
+    return cur
+}
+
+// `current` = the active step; steps before it are done. `hover` / `focus` = a step or STEP_NONE.
+fn stepper_draw(c: *mut render.Ctx, s: *mut Steps, current: usize, x: f64, y: f64, w: f64, hover: usize, focus: usize) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let d: f64 = kit.ln(c, 24)
+    let accent: u32 = theme.opaque(kit.accent_gfx(c, style.TOK_BASE))
+    let border: u32 = kit.tokc(c, style.TOK_BORDER)
+    var i: usize = 0
+    while i < (*s).n {
+        var bx: f64 = 0.0
+        var by: f64 = 0.0
+        var bw: f64 = 0.0
+        var bh: f64 = 0.0
+        stepper_rect(c, s, x, y, w, i, &bx, &by, &bw, &bh)
+        let cx: f64 = bx + bw / 2.0
+        // the connector to the next step (drawn first, under the circle)
+        if i + 1 < (*s).n {
+            var lc: u32 = border
+            if i < current {
+                lc = accent
+            }
+            let th: f64 = kit.ln(c, 2)
+            var nx: f64 = 0.0
+            var ny: f64 = 0.0
+            var nw: f64 = 0.0
+            var nh: f64 = 0.0
+            stepper_rect(c, s, x, y, w, i + 1, &nx, &ny, &nw, &nh)
+            let ncx: f64 = nx + nw / 2.0
+            var a: f64 = cx + d / 2.0
+            var b: f64 = ncx - d / 2.0
+            if ncx < cx {
+                a = ncx + d / 2.0
+                b = cx - d / 2.0
+            }
+            if b > a {
+                painter.round_rect(z, a, by + d / 2.0 - th / 2.0, b - a, th, th / 2.0, lc)
+            }
+        }
+        var fill: u32 = kit.tokc(c, style.TOK_BASE)
+        var fg: u32 = kit.tokc(c, style.TOK_TEXT_MUTED)
+        if i < current {
+            fill = accent
+            fg = theme.opaque(kitcolor.on_color(render.ctx_theme(c), accent))
+        } else if i == current {
+            fill = accent
+            fg = theme.opaque(kitcolor.on_color(render.ctx_theme(c), accent))
+        }
+        if i == hover && i > current {
+            fill = kit.tokc(c, style.TOK_BUTTON_HOVER)
+        }
+        painter.round_rect(z, cx - d / 2.0, by, d, d, d / 2.0, fill)
+        if i > current {
+            painter.round_ring(z, cx - d / 2.0, by, d, d, d / 2.0, kit.ln(c, 1), border)
+        }
+        if i < current {
+            let gs: f64 = kit.ln(c, 14)
+            kit.sym(c, lucide.CHECK, cx - gs / 2.0, by + (d - gs) / 2.0, gs, fg)
+        } else {
+            var buf: [u8; 24] = [0 as u8; 24]
+            let k: usize = kit.fmt_uint((i + 1) as u64, &buf)
+            put_centered(c, cx - d / 2.0, by, d, d, kit.ln(c, 12), 700, fg, (&buf[0]) as u64, k)
+        }
+        var lcol: u32 = kit.tokc(c, style.TOK_TEXT_MUTED)
+        var lw: usize = 400
+        if i == current {
+            lcol = kit.tokc(c, style.TOK_TEXT)
+            lw = 700
+        } else if i < current {
+            lcol = kit.tokc(c, style.TOK_TEXT)
+        }
+        let ly: f64 = by + d + kit.ln(c, 8)
+        let pad: f64 = kit.ln(c, 4)
+        let tw: f64 = kit.text_width(c, kit.ln(c, 12), lw, (*s).label[i])
+        var show: f64 = bw - 2.0 * pad
+        if tw < show {
+            show = tw
+        }
+        kit.draw_label(c, cx - show / 2.0, ly, kit.ln(c, 20), kit.ln(c, 12), lw, lcol, (*s).label[i], show)
+        if i == focus {
+            kit.focus_ring(c, cx - d / 2.0, by, d, d, d / 2.0, style.TOK_BASE)
+        }
+        i = i + 1
+    }
+}

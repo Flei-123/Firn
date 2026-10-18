@@ -1,0 +1,529 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/wave8m.fi -- THE MODELS OF WAVE 8 (gap list rows 12, 26, 36, 38, 78, 89): state machines and arithmetic,
+// no drawing, no allocation, no theme -- so a scene node, a vlist or a host can ask them the same way.
+//
+//   accordion   open / closed state of n sections; exclusive ("only one open") or free; keys
+//   toolbar     which items of a toolbar still fit; the rest goes behind a "..." chevron, least important first
+//   cell edit   the cursor + edit state of a table: arrows, Enter / F2 / typing begin, Enter / Tab commit, Esc cancels,
+//               read-only columns are skipped
+//   insets      safe area + system bars + keyboard as four edges; the lift that keeps a field above the keyboard
+//   density     comfortable / compact lengths (a coarse pointer never gets compact)
+//   text scale  the system text size factor, clamped and snapped, applied to a font size
+//
+// HONEST LIMITS: nothing here reads the system (the hosts must feed `insets`, `textscale`, the pointer kind); the
+// accordion has at most 64 sections, the toolbar 32 items, the cell editor 4G rows.
+import fui.editor
+
+export {
+    Accordion, acc_new, acc_is_open, acc_set, acc_toggle, acc_key, acc_open_count, ACC_MAX,
+    Toolbar, toolbar_new, toolbar_add, toolbar_fit, toolbar_hidden, TB_MAX,
+    CellEdit, cell_new, cell_set_readonly, cell_editable, cell_key, cell_type, cell_begin, cell_click, cell_editing,
+    CE_NONE, CE_MOVED, CE_BEGIN, CE_COMMIT, CE_CANCEL, CE_KEEP, CE_REPLACE,
+    Insets, insets_zero, insets_max, insets_add, insets_start, insets_end, insets_lift,
+    DENS_COMFORTABLE, DENS_COMPACT, density_pick, density_len, density_row_h,
+    textscale_clamp, textscale_snap, textscale_size, textscale_from_percent,
+}
+
+// ====================================================================
+// ACCORDION
+// ====================================================================
+
+const ACC_MAX: usize = 64
+
+struct Accordion {
+    n: usize,
+    open: u64, // bit i = section i open
+    exclusive: bool, // opening one closes the others
+    focus: usize, // header the keys act on
+}
+
+fn acc_new(n: usize, exclusive: bool) -> Accordion {
+    var m: usize = n
+    if m > ACC_MAX {
+        m = ACC_MAX
+    }
+    return Accordion { n: m, open: 0 as u64, exclusive: exclusive, focus: 0 }
+}
+
+fn acc_is_open(g: *mut Accordion, i: usize) -> bool {
+    if i >= (*g).n {
+        return false
+    }
+    return (((*g).open >> (i as u64)) & (1 as u64)) != (0 as u64)
+}
+
+fn acc_open_count(g: *mut Accordion) -> usize {
+    var k: usize = 0
+    var i: usize = 0
+    while i < (*g).n {
+        if acc_is_open(g, i) {
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return k
+}
+
+// open (true) or close (false) section i; in an exclusive group opening closes every other. true = the state changed.
+fn acc_set(g: *mut Accordion, i: usize, open: bool) -> bool {
+    if i >= (*g).n {
+        return false
+    }
+    let before: u64 = (*g).open
+    let bit: u64 = (1 as u64) << (i as u64)
+    if open {
+        if (*g).exclusive {
+            (*g).open = bit
+        } else {
+            (*g).open = (*g).open | bit
+        }
+    } else {
+        (*g).open = (*g).open - ((*g).open & bit)
+    }
+    return (*g).open != before
+}
+
+fn acc_toggle(g: *mut Accordion, i: usize) -> bool {
+    return acc_set(g, i, !acc_is_open(g, i))
+}
+
+// Up / Down move the header focus (no wrap), Home / End jump, Enter toggles the focused one. true = open state changed.
+fn acc_key(g: *mut Accordion, key: u32) -> bool {
+    if (*g).n == 0 {
+        return false
+    }
+    if key == editor.KEY_DOWN && (*g).focus + 1 < (*g).n {
+        (*g).focus = (*g).focus + 1
+    } else if key == editor.KEY_UP && (*g).focus > 0 {
+        (*g).focus = (*g).focus - 1
+    } else if key == editor.KEY_HOME {
+        (*g).focus = 0
+    } else if key == editor.KEY_END {
+        (*g).focus = (*g).n - 1
+    } else if key == editor.KEY_ENTER {
+        return acc_toggle(g, (*g).focus)
+    }
+    return false
+}
+
+// ====================================================================
+// TOOLBAR OVERFLOW
+// ====================================================================
+
+const TB_MAX: usize = 32
+
+struct Toolbar {
+    n: usize,
+    w: [f64; 32],
+    prio: [u32; 32], // 0 = never folds; higher = folds earlier
+}
+
+fn toolbar_new() -> Toolbar {
+    return Toolbar { n: 0, w: [0.0; 32], prio: [0 as u32; 32] }
+}
+
+fn toolbar_add(t: *mut Toolbar, w: f64, prio: u32) -> bool {
+    if (*t).n >= TB_MAX {
+        return false
+    }
+    (*t).w[(*t).n] = w
+    (*t).prio[(*t).n] = prio
+    (*t).n = (*t).n + 1
+    return true
+}
+
+fn bit_of(i: usize) -> u64 {
+    return (1 as u64) << (i as u64)
+}
+
+// The items that stay visible in `avail` (bit i = item i), with `gap` between items and a chevron of width chev_w
+// that appears as soon as one item is folded. Items fold from the highest prio, the LAST of equal prio first; prio 0
+// never folds (when even those do not fit, they stay and overflow is the caller's clipping).
+fn toolbar_fit(t: *mut Toolbar, avail: f64, gap: f64, chev_w: f64) -> u64 {
+    var mask: u64 = 0 as u64
+    var vis: usize = 0
+    var tot: f64 = 0.0
+    var i: usize = 0
+    while i < (*t).n {
+        mask = mask | bit_of(i)
+        vis = vis + 1
+        tot = tot + (*t).w[i]
+        i = i + 1
+    }
+    if vis > 0 {
+        tot = tot + gap * ((vis - 1) as f64)
+    }
+    if tot <= avail {
+        return mask
+    }
+    // something must fold: the chevron takes its room
+    var limit: f64 = avail - chev_w
+    if vis > 0 {
+        limit = limit - gap
+    }
+    while tot > limit {
+        // pick the victim: highest prio, last among equals
+        var best: usize = TB_MAX
+        var bp: u32 = 0 as u32
+        var k: usize = 0
+        while k < (*t).n {
+            if (mask & bit_of(k)) != (0 as u64) && (*t).prio[k] > 0 as u32 && (*t).prio[k] >= bp {
+                bp = (*t).prio[k]
+                best = k
+            }
+            k = k + 1
+        }
+        if best == TB_MAX {
+            break
+        }
+        mask = mask - (mask & bit_of(best))
+        tot = tot - (*t).w[best]
+        if vis > 1 {
+            tot = tot - gap
+        }
+        vis = vis - 1
+    }
+    return mask
+}
+
+// how many items a mask leaves out
+fn toolbar_hidden(t: *mut Toolbar, mask: u64) -> usize {
+    var k: usize = 0
+    var i: usize = 0
+    while i < (*t).n {
+        if (mask & bit_of(i)) == (0 as u64) {
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return k
+}
+
+// ====================================================================
+// CELL EDIT (table)
+// ====================================================================
+
+const CE_NONE: u32 = 0
+const CE_MOVED: u32 = 1 // the cell cursor moved (row / col)
+const CE_BEGIN: u32 = 2 // an editor opens in (row, col); mode in `mode`
+const CE_COMMIT: u32 = 3 // the edit in (last_row, last_col) is accepted (the cursor may have moved on)
+const CE_CANCEL: u32 = 4 // the edit in (row, col) is dropped
+const CE_KEEP: u32 = 0 // begin mode: keep the text, caret at the end (F2 / Enter / double click)
+const CE_REPLACE: u32 = 1 // begin mode: the typed character replaces the text
+
+struct CellEdit {
+    rows: usize,
+    cols: usize,
+    row: usize,
+    col: usize,
+    editing: bool,
+    mode: u32,
+    readonly: u64, // bit c = column c cannot be edited (and Tab skips it)
+    last_row: usize, // the cell the last CE_COMMIT / CE_CANCEL was about
+    last_col: usize,
+}
+
+fn cell_new(rows: usize, cols: usize) -> CellEdit {
+    var c: usize = cols
+    if c > 64 {
+        c = 64
+    }
+    return CellEdit { rows: rows, cols: c, row: 0, col: 0, editing: false, mode: CE_KEEP, readonly: 0 as u64, last_row: 0, last_col: 0 }
+}
+
+fn cell_set_readonly(e: *mut CellEdit, col: usize, ro: bool) {
+    if col >= (*e).cols {
+        return
+    }
+    if ro {
+        (*e).readonly = (*e).readonly | bit_of(col)
+    } else {
+        (*e).readonly = (*e).readonly - ((*e).readonly & bit_of(col))
+    }
+}
+
+fn cell_editable(e: *mut CellEdit, col: usize) -> bool {
+    if col >= (*e).cols {
+        return false
+    }
+    return ((*e).readonly & bit_of(col)) == (0 as u64)
+}
+
+fn cell_editing(e: *mut CellEdit) -> bool {
+    return (*e).editing
+}
+
+// open the editor in the cursor cell (F2 / double click / the program's own button). CE_NONE for a read-only cell.
+fn cell_begin(e: *mut CellEdit, mode: u32) -> u32 {
+    if (*e).rows == 0 || (*e).editing || !cell_editable(e, (*e).col) {
+        return CE_NONE
+    }
+    (*e).editing = true
+    (*e).mode = mode
+    return CE_BEGIN
+}
+
+// a printable key with the cursor on a cell and no editor open: begins with the character replacing the text
+fn cell_type(e: *mut CellEdit) -> u32 {
+    return cell_begin(e, CE_REPLACE)
+}
+
+// the next editable column after (row, col) in reading order, wrapping to the next row; false = none (end of table)
+fn next_cell(e: *mut CellEdit, back: bool) -> bool {
+    var r: usize = (*e).row
+    var c: usize = (*e).col
+    var guard: usize = 0
+    while guard < (*e).rows * (*e).cols + 1 {
+        if back {
+            if c > 0 {
+                c = c - 1
+            } else if r > 0 {
+                r = r - 1
+                c = (*e).cols - 1
+            } else {
+                return false
+            }
+        } else {
+            if c + 1 < (*e).cols {
+                c = c + 1
+            } else if r + 1 < (*e).rows {
+                r = r + 1
+                c = 0
+            } else {
+                return false
+            }
+        }
+        if cell_editable(e, c) {
+            (*e).row = r
+            (*e).col = c
+            return true
+        }
+        guard = guard + 1
+    }
+    return false
+}
+
+// A key. `shift` matters for Tab (backwards). Returns the event (CE_*).
+//   not editing: arrows / Home / End move the cursor (clamped), Enter begins (like F2)
+//   editing:     Enter commits and goes one row down, Tab / Shift+Tab commit and go to the next / previous editable
+//                cell, Esc cancels; every other key belongs to the text editor (CE_NONE)
+fn cell_key(e: *mut CellEdit, key: u32, shift: bool) -> u32 {
+    if (*e).rows == 0 || (*e).cols == 0 {
+        return CE_NONE
+    }
+    if (*e).editing {
+        if key == editor.KEY_ESC {
+            (*e).editing = false
+            (*e).last_row = (*e).row
+            (*e).last_col = (*e).col
+            return CE_CANCEL
+        }
+        if key == editor.KEY_ENTER {
+            (*e).editing = false
+            (*e).last_row = (*e).row
+            (*e).last_col = (*e).col
+            if shift {
+                if (*e).row > 0 {
+                    (*e).row = (*e).row - 1
+                }
+            } else if (*e).row + 1 < (*e).rows {
+                (*e).row = (*e).row + 1
+            }
+            return CE_COMMIT
+        }
+        if key == editor.KEY_TAB {
+            (*e).editing = false
+            (*e).last_row = (*e).row
+            (*e).last_col = (*e).col
+            next_cell(e, shift)
+            return CE_COMMIT
+        }
+        return CE_NONE
+    }
+    let r0: usize = (*e).row
+    let c0: usize = (*e).col
+    if key == editor.KEY_ENTER {
+        return cell_begin(e, CE_KEEP)
+    }
+    if key == editor.KEY_UP && (*e).row > 0 {
+        (*e).row = (*e).row - 1
+    } else if key == editor.KEY_DOWN && (*e).row + 1 < (*e).rows {
+        (*e).row = (*e).row + 1
+    } else if key == editor.KEY_LEFT && (*e).col > 0 {
+        (*e).col = (*e).col - 1
+    } else if key == editor.KEY_RIGHT && (*e).col + 1 < (*e).cols {
+        (*e).col = (*e).col + 1
+    } else if key == editor.KEY_HOME {
+        (*e).col = 0
+    } else if key == editor.KEY_END {
+        (*e).col = (*e).cols - 1
+    } else if key == editor.KEY_TAB {
+        next_cell(e, shift)
+    }
+    if (*e).row != r0 || (*e).col != c0 {
+        return CE_MOVED
+    }
+    return CE_NONE
+}
+
+// A click on cell (row, col). While editing, a click on another cell commits the edit first (CE_COMMIT, the cursor
+// moves there); a click on the edited cell is the text editor's. Not editing: moves the cursor; a double click
+// begins an edit.
+fn cell_click(e: *mut CellEdit, row: usize, col: usize, dbl: bool) -> u32 {
+    if row >= (*e).rows || col >= (*e).cols {
+        return CE_NONE
+    }
+    if (*e).editing {
+        if row == (*e).row && col == (*e).col {
+            return CE_NONE
+        }
+        (*e).editing = false
+        (*e).last_row = (*e).row
+        (*e).last_col = (*e).col
+        (*e).row = row
+        (*e).col = col
+        return CE_COMMIT
+    }
+    let moved: bool = row != (*e).row || col != (*e).col
+    (*e).row = row
+    (*e).col = col
+    if dbl {
+        return cell_begin(e, CE_KEEP)
+    }
+    if moved {
+        return CE_MOVED
+    }
+    return CE_NONE
+}
+
+// ====================================================================
+// INSETS (safe area, system bars, keyboard)
+// ====================================================================
+
+struct Insets {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+fn insets_zero() -> Insets {
+    return Insets { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 }
+}
+
+fn fmax(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// two sources that cover the same screen edge (notch and status bar): the larger one counts per edge
+fn insets_max(a: Insets, b: Insets) -> Insets {
+    return Insets { left: fmax(a.left, b.left), top: fmax(a.top, b.top), right: fmax(a.right, b.right), bottom: fmax(a.bottom, b.bottom) }
+}
+
+// two sources that stack (a nav bar and a keyboard above it): the edges add
+fn insets_add(a: Insets, b: Insets) -> Insets {
+    return Insets { left: a.left + b.left, top: a.top + b.top, right: a.right + b.right, bottom: a.bottom + b.bottom }
+}
+
+// the inset on the START side / END side (swapped in RTL)
+fn insets_start(a: Insets, rtl: bool) -> f64 {
+    if rtl {
+        return a.right
+    }
+    return a.left
+}
+
+fn insets_end(a: Insets, rtl: bool) -> f64 {
+    if rtl {
+        return a.left
+    }
+    return a.right
+}
+
+// How far the content must move UP (>= 0) so the field at [field_y, field_y + field_h) in a view view_h tall stays
+// visible above a keyboard kb_h tall, with `margin` air below it. A field taller than the free room is aligned at its
+// top edge (never lifted past its own top).
+fn insets_lift(field_y: f64, field_h: f64, view_h: f64, kb_h: f64, margin: f64) -> f64 {
+    let free: f64 = view_h - kb_h
+    var need: f64 = field_y + field_h + margin - free
+    if need <= 0.0 {
+        return 0.0
+    }
+    if need > field_y {
+        need = field_y
+    }
+    if need < 0.0 {
+        need = 0.0
+    }
+    return need
+}
+
+// ====================================================================
+// DENSITY
+// ====================================================================
+
+const DENS_COMFORTABLE: u32 = 0
+const DENS_COMPACT: u32 = 1
+
+// The density a program ASKS FOR (pref) as it is GRANTED: a coarse pointer (touch) always gets comfortable, so no
+// target falls under 44 dp of a finger.
+fn density_pick(pref: u32, coarse_pointer: bool) -> u32 {
+    if coarse_pointer {
+        return DENS_COMFORTABLE
+    }
+    return pref
+}
+
+// a vertical length of the comfortable design in the given density (compact = 80 %, rounded to the nearest unit)
+fn density_len(d: u32, pt: usize) -> usize {
+    if d == DENS_COMPACT {
+        return (pt * 4 + 2) / 5
+    }
+    return pt
+}
+
+// A row height: compact never goes under 24 (one text line plus air).
+fn density_row_h(d: u32, base: usize) -> usize {
+    var h: usize = density_len(d, base)
+    if h < 24 && base >= 24 {
+        h = 24
+    }
+    return h
+}
+
+// ====================================================================
+// TEXT SCALE
+// ====================================================================
+
+// permille: 1000 = 100 %. The system allows wide ranges; fUi layouts are tested from 85 % to 200 %.
+fn textscale_clamp(permille: i64) -> i64 {
+    if permille < 850 as i64 {
+        return 850
+    }
+    if permille > 2000 as i64 {
+        return 2000
+    }
+    return permille
+}
+
+// to the nearest 25 permille step (a changing slider must not re-layout at every permille)
+fn textscale_snap(permille: i64) -> i64 {
+    let c: i64 = textscale_clamp(permille)
+    return ((c + 12) / 25) * 25
+}
+
+fn textscale_from_percent(p: i64) -> i64 {
+    return textscale_snap(p * 10)
+}
+
+// a font size scaled (never under 1 unit)
+fn textscale_size(size: f64, permille: i64) -> f64 {
+    let s: f64 = size * (textscale_clamp(permille) as f64) / 1000.0
+    if s < 1.0 {
+        return 1.0
+    }
+    return s
+}

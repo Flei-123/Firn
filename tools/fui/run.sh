@@ -807,6 +807,9 @@ build uistr
 "$W/uistr" | tail -n 3
 build dnd
 "$W/dnd" | tail -n 3
+# W28-d: wave 8 (spinner, time picker, breadcrumb, info bar, stepper) + models (accordion, toolbar overflow, cell edit, insets, density, text scale) + shortcut capture
+build wave8
+"$W/wave8" | tail -n 3
 python3 tools/fui/uistr_audit.py
 build touch
 "$W/touch" | tail -n 3
