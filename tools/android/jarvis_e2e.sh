@@ -171,7 +171,7 @@ tap_word "Yes" 1 3
 check "need answered over /api/m/needs/answer" "$(wait_log '"path": "/api/m/needs/answer".*"answer": "Yes"' 10)" 1
 tap_word "Aufgaben" 1 4
 check "Tasks list shows the task" "$(OCR_TRIES=15 wait_ocr 06_tasks 'milk')" 1
-type_into "Neue|Aufgabe|Text" "callmum" && tap_word "Hinzuf.gen" 1 3
+type_into "Neue|Aufgabe|Text" "callmum" && tap_word "Hinzuf.{1,2}gen" 1 3
 check "task added over /api/m/tasks" "$(wait_log '"path": "/api/m/tasks".*callmum' 10 | awk '{print ($1>0)?"yes":"no"}')" yes
 # the two remaining tab pages, only photographed (design review)
 tap_word "Ger.te" 1 3; shot 06b_devices
@@ -189,7 +189,7 @@ check "list shows a chat" "$(OCR_TRIES=10 wait_ocr 07_convs 'hello\|worker\|hi')
 echo "== 4. photo upload"
 tap_word "Neu" 1 2
 tap_plus
-tap_word "Photo" 1 4 # "+" shows the two choices (Photo / File)
+tap_word "Foto|Photo" 1 4 # "+" shows the two choices (Photo / File)
 U=$(ui)
 check "the system's picker opens" "$(echo "$U" | grep -cE '(text|content-desc)="(Media picker|Photos|Files|Gallery|Camera|Recent|Photo taken)' | awk '{print ($1>0)?"yes":"no"}')" yes
 P0=$($ADB shell pidof $PKG)
@@ -215,7 +215,7 @@ $ADB shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file
 SHA_DOC=$(cat "$W/e2e_doc.sha")
 UP0=$(grep -c '"type": "upload_body"' "$SLOG")
 tap_plus
-tap_word "File" 1 4 # "+" shows the two choices (Photo / File)
+tap_word "Datei|File" 1 4 # "+" shows the two choices (Photo / File)
 FOUND=no
 for _ in 1 2 3 4 5 6; do
     tap_ui "jarvis_e2e_doc" && { FOUND=yes; break; }
