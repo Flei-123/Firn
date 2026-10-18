@@ -2,8 +2,10 @@
 # tools/mc/play/run_models.sh -- mcplay with MCPLAY_MODELS=1 (pack blockstates + models: stairs from baked quads instead of cubes) against the official 1.20.1
 # server (flat world): Xvfb + server + mcplay + xdotool. Own fixture pack (built here with python zipfile + PIL, NO Mojang file): oak_planks.png with four
 # pure quadrant colours (red / green top, blue / yellow bottom), a stairs model (parent block/stairs) and an oak_stairs blockstate with all four facings.
-# Run A: MCPLAY_MODELS=1. Run B: same world, MCPLAY_MODELS unset (default: the stairs are full cubes). Run C: like A, but the T key (pack reload) is
+# Run A: MCPLAY_MODELS=1 MCPLAY_STREAM=0 (mc_render_world). Run B: same world, MCPLAY_MODELS unset (default: the stairs are full cubes). Run C: like A, but the T key (pack reload) is
 # pressed after the blocks stand -> ModelSet reset + wr_clear, the picture must have the models again.
+# Runs D / E / F (r236b): like A / C, but with the mc_stream path (MCPLAY_STREAM=1 = default, worker pool): D must look like A (same fixture colours, picture
+# differs from A by no more than the same pair without models, F (cubes, STREAM=0) vs B, plus 1 %, counting only pixels that differ by more than 2 levels), E (T key: stream_release -> ms_reset -> new stream with stream_set_models) must have the models again. Same pick probes.
 # Pick probes (MCPLAY_PICK_PROBE, r236b): A / C pick the quads of the stairs (mc_model_pick: distances 3.0 / 4.5 / 4.0), B the whole voxel (2.5 / 4.0 / 4.0).
 # Checks: exit 0, frames; A and C print `models on` + `models states=N unmapped=0` (N > 0); B prints no `models` line; A has >= 120 pixels of EACH of
 # the four fixture colours in the 3D view; B differs from A in >= 1 % of the 3D view pixels (stairs vs cubes); C has the fixture colours again.
@@ -121,15 +123,18 @@ run_one() { # name, reload, env...
 # R1 sideways at y = 0.75 through the empty part into the step (models: 3.0 to the step face, voxel pick: 2.5 to the cell border), R2 down onto the
 # lower half (models 4.5 / voxel 4.0), R3 down onto the step (4.0 both).
 PROBE="-4500,-59250,5500,1000,0,0;-1750,-55000,5500,0,-1000,0;-1250,-55000,5500,0,-1000,0"
-run_one A 0 MCPLAY_MODELS=1 MCPLAY_PICK_PROBE="$PROBE"
+run_one A 0 MCPLAY_MODELS=1 MCPLAY_STREAM=0 MCPLAY_PICK_PROBE="$PROBE"
 run_one B 0 MCPLAY_PICK_PROBE="$PROBE"
-run_one C 1 MCPLAY_MODELS=1 MCPLAY_PICK_PROBE="$PROBE"
+run_one C 1 MCPLAY_MODELS=1 MCPLAY_STREAM=0 MCPLAY_PICK_PROBE="$PROBE"
+run_one D 0 MCPLAY_MODELS=1 MCPLAY_STREAM=1 MCPLAY_PICK_PROBE="$PROBE"
+run_one E 1 MCPLAY_MODELS=1 MCPLAY_STREAM=1 MCPLAY_PICK_PROBE="$PROBE"
+run_one F 0 MCPLAY_STREAM=0 MCPLAY_PICK_PROBE="$PROBE"
 num() { grep -E "mcplay: (end|stream)" "$W/$1.out" | grep -o "$2=[0-9]*" | tail -1 | cut -d= -f2; }
-for n in A B C; do
+for n in A B C D E F; do
     F=$(num $n frames)
     [ "${F:-0}" -gt 20 ] || { echo "  FAIL  $n: too few frames (${F:-?})"; ERR=1; }
 done
-for n in A C; do
+for n in A C D E; do
     grep -q "^mcplay: models on" "$W/$n.out" || { echo "  FAIL  $n: no 'models on' line"; ERR=1; }
     MS=$(grep -E "^mcplay: models states=" "$W/$n.out" | tail -1)
     S=$(echo "$MS" | grep -o "states=[0-9]*" | cut -d= -f2); U=$(echo "$MS" | grep -o "unmapped=[0-9]*" | cut -d= -f2)
@@ -137,10 +142,11 @@ for n in A C; do
     [ "${S:-0}" -gt 0 ] && [ "${U:-1}" -eq 0 ] || { echo "  FAIL  $n: no model states resolved or unmapped quads (states=${S:-?} unmapped=${U:-?})"; ERR=1; }
 done
 grep -q "^mcplay: models" "$W/B.out" && { echo "  FAIL  B (default) printed a models line"; ERR=1; }
-grep -q "stream workers" "$W/A.out" && { echo "  FAIL  A has the stream on (MCPLAY_MODELS must force MCPLAY_STREAM=0)"; ERR=1; }
-for n in A B C; do [ -s "$W/$n.png" ] || { echo "  FAIL  $n: no screenshot"; ERR=1; }; done
+for n in A C; do grep -q "stream=true" "$W/$n.out" && { echo "  FAIL  $n has the stream on (MCPLAY_STREAM=0)"; ERR=1; }; done
+for n in D E; do grep -q "models on.*stream=true" "$W/$n.out" || { echo "  FAIL  $n: models without the stream (MCPLAY_MODELS=1 must keep MCPLAY_STREAM=1)"; ERR=1; }; done
+for n in A B C D E F; do [ -s "$W/$n.png" ] || { echo "  FAIL  $n: no screenshot"; ERR=1; }; done
 if [ $ERR -eq 0 ]; then
-    RES=$(python3 -I - "$W/A.png" "$W/B.png" "$W/C.png" <<'PY'
+    RES=$(python3 -I - "$W/A.png" "$W/B.png" "$W/C.png" "$W/D.png" "$W/E.png" "$W/F.png" <<'PY'
 import sys
 from PIL import Image, ImageChops
 def crop(p): return Image.open(p).convert("RGB").crop((0, 60, 640, 330))
@@ -158,9 +164,12 @@ def fixture(im):
         elif b * 100 >= m * 88 and lo(r) and lo(g): cnt[2] += 1     # blue
         elif r * 100 >= m * 80 and g * 100 >= m * 80 and lo(b): cnt[3] += 1  # yellow
     return cnt
-a, b, c = crop(sys.argv[1]), crop(sys.argv[2]), crop(sys.argv[3])
+a, b, c, dd, e, f = [crop(p) for p in sys.argv[1:7]]
 d = ImageChops.difference(a, b).convert("L").point(lambda v: 255 if v > 0 else 0)
-print("A", *fixture(a), "B", *fixture(b), "C", *fixture(c), "diffAB", sum(d.histogram()[255:]), "total", a.width * a.height)
+d2 = ImageChops.difference(a, dd).convert("L").point(lambda v: 255 if v > 2 else 0)  # > 2 levels: the model path differs by 1 level on ~10 % of the grass (open point r244)
+d3 = ImageChops.difference(f, b).convert("L").point(lambda v: 255 if v > 0 else 0)
+print("A", *fixture(a), "B", *fixture(b), "C", *fixture(c), "diffAB", sum(d.histogram()[255:]), "total", a.width * a.height,
+      "D", *fixture(dd), "E", *fixture(e), "diffAD", sum(d2.histogram()[255:]), "diffFB", sum(d3.histogram()[255:]))
 PY
 ) || RES=""
     echo "  fixture colours (red green blue yellow): $RES"
@@ -169,6 +178,10 @@ PY
         for i in 2 3 4 5; do [ "${!i}" -ge 120 ] || { echo "  FAIL  A: fixture colour #$((i - 1)) only ${!i} pixels"; ERR=1; }; done
         for i in 12 13 14 15; do [ "${!i}" -ge 60 ] || { echo "  FAIL  C (after reload): fixture colour #$((i - 11)) only ${!i} pixels"; ERR=1; }; done
         DP=${17}; DT=${19}
+        for i in 21 22 23 24; do [ "${!i}" -ge 120 ] || { echo "  FAIL  D (stream): fixture colour #$((i - 20)) only ${!i} pixels"; ERR=1; }; done
+        for i in 26 27 28 29; do [ "${!i}" -ge 60 ] || { echo "  FAIL  E (stream, after reload): fixture colour #$((i - 25)) only ${!i} pixels"; ERR=1; }; done
+        # the stream picture differs from the inline one anyway (frustum / cave culling, light region, HUD fps): the baseline is the same pair WITHOUT models (F vs B)
+        [ "${31}" -le $((${33} + DT / 100)) ] || { echo "  FAIL  D (stream) differs from A (mc_render_world) by ${31} px (> 2 levels), baseline without models (F vs B) ${33} px, of $DT"; ERR=1; }
         [ "$DP" -ge $((DT / 100)) ] || { echo "  FAIL  A equals B (stairs drawn as cubes?): $DP of $DT pixels differ"; ERR=1; }
     fi
 fi
@@ -181,7 +194,7 @@ probe_chk() { # run, ray, expected "x= y= z= n= dist_mm=" tail, what
         *) echo "  FAIL  $1 probe $2 ($5): got '$L', want n=$3 dist_mm=$4"; ERR=1 ;;
     esac
 }
-for n in A C; do
+for n in A C D E; do
     grep -q "^mcplay: probe models=1" "$W/$n.out" || { echo "  FAIL  $n: no 'probe models=1' line"; ERR=1; }
     probe_chk $n 1 "-1,0,0" 3000 "step face through the empty half"
     probe_chk $n 2 "0,1,0" 4500 "top of the lower half"

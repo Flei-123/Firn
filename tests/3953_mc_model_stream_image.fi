@@ -1,0 +1,343 @@
+// expect_exit: 0
+// tests/3953_mc_model_stream_image.fi -- r236b pack models through mc_stream with a worker pool (3 threads): the picture equals wr_render (inline meshing) of
+// the same world and poses. The world mixes plain cubes, a half box (opaque model), a tinted flat quad (lily pad) and translucent glass boxes (MESH_MODEL_T,
+// translucent pass on in both). Guards: the models are visible (stream without models differs a lot), the pool really ran (stream stats), no job left.
+import std.rt
+import std.core
+import std.math
+import std.io
+import zip.zip
+import pack.icons
+import mc.mc_assets
+import mc.mc_texture
+import mc.mc_texext
+import mc.mc_mesh
+import mc.mc_model
+import mc.mc_model_mesh
+import mc.mc_registry
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_camera
+import mc.mc_math
+import mc.mc_backend
+import mc.mc_raster
+import mc.mc_render_world
+import mc.mc_stream
+import jobs.jobs
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+const W: i32 = 96
+const H: i32 = 72
+const CLEAR: u32 = 0xFF40A0C0 as u32 // R 0xC0 G 0xA0 B 0x40 (little endian R | G << 8 | B << 16)
+const MIN_Y: i32 = 0 - 64
+
+// 16 x 16 solid colour PNG
+fn png_solid(r: u8, g: u8, b: u8, a: u8, out: *mut rt.Buf) -> bool {
+    let px: u64 = rt.heap_alloc(16 * 16 * 4)
+    var i: usize = 0
+    while i < 256 {
+        rt.st8(px, i * 4, r)
+        rt.st8(px, i * 4 + 1, g)
+        rt.st8(px, i * 4 + 2, b)
+        rt.st8(px, i * 4 + 3, a)
+        i = i + 1
+    }
+    let ok: bool = icons.png_encode(px, 16, 16, out)
+    rt.heap_free(px, 16 * 16 * 4)
+    return ok
+}
+
+fn add_text(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    var ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn add_png(w: *mut zip.ZipWriter, name: str, r: u8, g: u8, b: u8, a: u8) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    if !png_solid(r, g, b, a, &p) { return false }
+    var ok: bool = zip.zip_add(w, name, rt.buf_ptr(&p), rt.buf_len(&p), true) catch | e | (false)
+    rt.buf_free(&p)
+    return ok
+}
+
+// blockstate of a block without properties: one model for every state
+fn add_state(w: *mut zip.ZipWriter, block: str, model: str) -> bool {
+    return add_text(w, "assets/minecraft/blockstates/" + block + ".json", "{\"variants\":{\"\":{\"model\":\"" + model + "\"}}}")
+}
+
+fn open_pack(b: *mut rt.Buf, w: *mut zip.ZipWriter, st: *mut mc_assets.PackStack) -> bool {
+    var n: usize = zip.zip_finish(w) catch | e | (0)
+    zip.zip_writer_free(w)
+    if n == 0 { return false }
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pk, rt.buf_ptr(b), rt.buf_len(b)) != mc_assets.ASSET_OK { return false }
+    rt.buf_free(b)
+    return mc_assets.stack_push(st, &pk) == mc_assets.ASSET_OK
+}
+
+fn sid(reg: *mut mc_registry.Registry, name: str) -> i32 {
+    let blk: i32 = mc_registry.reg_block_by_name(reg, name.p as u64, name.length())
+    if blk < 0 { return 0 - 1 }
+    return mc_registry.reg_block_min_state(reg, blk)
+}
+
+// cell (x, y, z) of section 0 (a 16 x 16 x 16 u16 array per section, 2 sections)
+fn put(ids: u64, x: i32, y: i32, z: i32, state: i32) {
+    rt.st16(ids, ((y * 16 + z) * 16 + x) as usize, state as u16)
+}
+
+fn new_ids() -> u64 {
+    let ids: u64 = rt.heap_alloc(2 * 4096 * 2)
+    var i: usize = 0
+    while i < 8192 {
+        rt.st16(ids, i, 0 as u16)
+        i = i + 1
+    }
+    return ids
+}
+
+fn chan(c: u32, k: i32) -> i32 {
+    return ((c >> ((k * 8) as u32)) & (255 as u32)) as i32
+}
+
+fn iabs(v: i32) -> i32 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// everything a scene needs, rebuilt per scene
+struct Scene {
+    tb: mc_mesh.MeshTables,
+    ex: mc_texext.TexExt,
+    atlas: mc_texture.Atlas,
+    an: mc_assets.AnimSet,
+}
+
+fn scene_init(sc: *mut Scene, reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack) -> bool {
+    (*sc).tb = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_texture.tex_alloc_tables(&(*sc).tb)
+    (*sc).ex = mc_texext.texext_new()
+    mc_texext.tex_build_tables_ext(reg, &(*sc).tb, &(*sc).ex)
+    (*sc).atlas = mc_texext.texext_atlas_new(16, &(*sc).ex)
+    (*sc).an = mc_assets.animset_new()
+    return mc_assets.assets_apply_ext(st, &(*sc).atlas, &(*sc).ex, &(*sc).an) >= 1
+}
+
+// look from (ex, ey, ez) at (tx, ty, tz), render and return the centre pixel
+fn shot(r: *mut mc_raster.Raster, wr: *mut mc_render_world.WorldRender, w: *mut mc_world.World, cam: *mut mc_camera.Camera,
+    ex: f64, ey: f64, ez: f64, tx: f64, ty: f64, tz: f64) -> u32 {
+    mc_camera.camera_set_pos(cam, ex, ey, ez)
+    mc_camera.camera_look_at(cam, tx, ty, tz)
+    mc_camera.camera_update(cam)
+    mc_raster.backend_begin(r, cam, CLEAR)
+    mc_render_world.wr_render(wr, w, r, cam, 0 - 1)
+    return mc_raster.raster_pixel(r, W / 2, H / 2)
+}
+
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == jobs.WORKER_KIND {
+        return jobs.worker_main(arg)
+    }
+    return 0
+}
+
+const NSEC: i32 = 2
+const NCH: i32 = 1 // chunks -1..1
+
+fn check(c: bool, code: i32) {
+    if !c {
+        io.fmt_print_line(f"FAIL code {code}")
+        rt.finish(code as i64)
+    }
+}
+
+fn add_box_model(w: *mut zip.ZipWriter, name: str, tex: str, fr: str, to: str, tint: bool) -> bool {
+    var tn: str = ""
+    if tint { tn = ",\"tintindex\":0" }
+    var faces: str = "\"down\":{\"uv\":[0,0,16,16],\"texture\":\"#t\"},\"up\":{\"uv\":[0,0,16,16],\"texture\":\"#t\"" + tn + "}"
+    if !tint {
+        faces = faces + ",\"north\":{\"uv\":[0,0,16,16],\"texture\":\"#t\"},\"south\":{\"uv\":[0,0,16,16],\"texture\":\"#t\"},\"west\":{\"uv\":[0,0,16,16],\"texture\":\"#t\"},\"east\":{\"uv\":[0,0,16,16],\"texture\":\"#t\"}"
+    }
+    return add_text(w, "assets/minecraft/models/block/" + name + ".json",
+        "{\"textures\":{\"t\":\"block/" + tex + "\"},\"elements\":[{\"from\":" + fr + ",\"to\":" + to + ",\"faces\":{" + faces + "}}]}")
+}
+
+fn build(st: *mut mc_assets.PackStack) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    var w: zip.ZipWriter = zip.zip_writer_new(&b)
+    if !add_text(&w, "pack.mcmeta", META) { return false }
+    if !add_png(&w, "assets/minecraft/textures/block/oak_planks.png", 200 as u8, 150 as u8, 80 as u8, 255 as u8) { return false }
+    if !add_png(&w, "assets/minecraft/textures/block/glass.png", 60 as u8, 200 as u8, 230 as u8, 160 as u8) { return false }
+    if !add_png(&w, "assets/minecraft/textures/block/lily_pad.png", 240 as u8, 240 as u8, 240 as u8, 255 as u8) { return false }
+    if !add_box_model(&w, "m_half", "oak_planks", "[0,0,0]", "[16,8,16]", false) { return false }
+    if !add_box_model(&w, "m_lily", "lily_pad", "[0,0,0]", "[16,1,16]", true) { return false }
+    if !add_box_model(&w, "m_glass", "glass", "[2,2,2]", "[14,14,14]", false) { return false }
+    if !add_state(&w, "dirt", "block/m_half") { return false }
+    if !add_state(&w, "lily_pad", "block/m_lily") { return false }
+    if !add_state(&w, "glass", "block/m_glass") { return false }
+    return open_pack(&b, &w, st)
+}
+
+// chunk (cx, cz): stone floor y 0..2, y 3 a hashed mix of half box / lily pad / glass / stone / air, glass stacked on some glass
+fn fill(ids: u64, cx: i32, cz: i32, s_stone: i32, s_dirt: i32, s_lily: i32, s_glass: i32) {
+    var i: usize = 0
+    while i < 8192 {
+        rt.st16(ids, i, 0 as u16)
+        i = i + 1
+    }
+    var z: i32 = 0
+    while z < 16 {
+        var x: i32 = 0
+        while x < 16 {
+            var y: i32 = 0
+            while y < 3 {
+                put(ids, x, y, z, s_stone)
+                y = y + 1
+            }
+            let h: i32 = (x * 7 + z * 13 + (cx + 5) * 31 + (cz + 5) * 17 + (x * z) % 5) % 7
+            if h == 0 { put(ids, x, 3, z, s_dirt) }
+            if h == 1 { put(ids, x, 3, z, s_lily) }
+            if h == 2 || h == 3 { put(ids, x, 3, z, s_glass) }
+            if h == 4 { put(ids, x, 3, z, s_stone) }
+            if h == 2 && (x + z) % 3 == 0 { put(ids, x, 4, z, s_glass) }
+            x = x + 1
+        }
+        z = z + 1
+    }
+}
+
+fn pose(cam: *mut mc_camera.Camera, p: i32) {
+    let base: f64 = (MIN_Y as f64)
+    if p == 0 {
+        mc_camera.camera_set_pos(cam, 8.0, base + 10.0, 0.0 - 22.0)
+        mc_camera.camera_look_at(cam, 8.0, base + 3.0, 6.0)
+    } else if p == 1 {
+        mc_camera.camera_set_pos(cam, 0.0 - 20.0, base + 9.0, 8.0)
+        mc_camera.camera_look_at(cam, 6.0, base + 3.0, 8.0)
+    } else {
+        mc_camera.camera_set_pos(cam, 8.0, base + 30.0, 8.0)
+        mc_camera.camera_look_at(cam, 8.0, base + 3.0, 14.0)
+    }
+    mc_camera.camera_update(cam)
+}
+
+fn diff(a: *mut mc_raster.Raster, b: *mut mc_raster.Raster) -> i32 {
+    var n: i32 = 0
+    var y: i32 = 0
+    while y < H {
+        var x: i32 = 0
+        while x < W {
+            if mc_raster.raster_pixel(a, x, y) != mc_raster.raster_pixel(b, x, y) { n = n + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n
+}
+
+#[allow_escape]
+fn load_world(w: *mut mc_world.World, s: *mut mc_stream.Stream, reg: *mut mc_registry.Registry) {
+    let ids: u64 = rt.heap_alloc(8192 * 2 * 2)
+    var cz: i32 = 0 - NCH
+    while cz <= NCH {
+        var cx: i32 = 0 - NCH
+        while cx <= NCH {
+            fill(ids, cx, cz, sid(reg, "stone"), sid(reg, "dirt"), sid(reg, "lily_pad"), sid(reg, "glass"))
+            check(mc_world.world_put(w, mc_render_world.wr_make_chunk(cx, cz, NSEC as usize, ids)), 50)
+            if s as u64 != 0 { check(mc_stream.stream_chunk_loaded(s, w, cx, cz), 51) }
+            cx = cx + 1
+        }
+        cz = cz + 1
+    }
+    rt.heap_free(ids, 8192 * 2 * 2)
+}
+
+#[allow_escape]
+fn stream_shot(s: *mut mc_stream.Stream, w: *mut mc_world.World, r: *mut mc_raster.Raster, cam: *mut mc_camera.Camera) -> u64 {
+    var b: mc_backend.Backend = mc_backend.backend_cpu(r)
+    mc_stream.stream_flush(s, w, &b, cam, 400)
+    b.begin(b.obj, cam as u64, CLEAR)
+    let tris: u64 = mc_stream.stream_frame(s, w, &b, cam)
+    b.end(b.obj)
+    return tris
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var v: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(763, &v) { return 1 }
+    var reg: mc_registry.Registry = v.registry_of()
+    if !mc_registry.registry_ok(&reg) { return 2 }
+    var st: mc_assets.PackStack = mc_assets.stack_new()
+    if !build(&st) { return 3 }
+    var ex0: mc_texext.TexExt = mc_texext.texext_new()
+    var sc: Scene = Scene { tb: mc_mesh.MeshTables { opaque: 0, tiles: 0 }, ex: mc_texext.texext_new(), atlas: mc_texext.texext_atlas_new(16, &ex0), an: mc_assets.animset_new() }
+    if !scene_init(&sc, &reg, &st) { return 4 }
+    var sc2: Scene = Scene { tb: mc_mesh.MeshTables { opaque: 0, tiles: 0 }, ex: mc_texext.texext_new(), atlas: mc_texext.texext_atlas_new(16, &ex0), an: mc_assets.animset_new() }
+    if !scene_init(&sc2, &reg, &st) { return 5 }
+    var ms: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(&reg, &st, &sc.ex)
+    if mc_model_mesh.ms_kind(&ms, sid(&reg, "dirt") as u16) != mc_model_mesh.K_MODEL { return 6 }
+    if mc_model_mesh.ms_kind(&ms, sid(&reg, "glass") as u16) != mc_model_mesh.K_MODEL { return 7 }
+
+    var pool: jobs.Jobs = jobs.create(3)
+    check(jobs.worker_count(&pool) > 0 as u64, 8)
+    let pa: u64 = (&pool) as *mut jobs.Jobs as u64
+
+    var cam: mc_camera.Camera = mc_camera.camera_new(W, H)
+    mc_camera.camera_set_lens(&cam, 70.0, 0.05, 300.0)
+    // A: stream + pool + models
+    var ra: mc_raster.Raster = mc_raster.raster_new(W, H)
+    mc_raster.backend_upload_atlas(&ra, &sc.atlas)
+    var wa: mc_world.World = mc_world.world_new()
+    var sa: mc_stream.Stream = mc_stream.stream_new(MIN_Y, NSEC, 4, &sc.tb, pa)
+    sa.nbr_wait = 3 as u32
+    mc_stream.stream_set_translucent(&sa, true, mc_texture.T_WATER, mc_texture.T_ICE, mc_texture.T_GLASS)
+    mc_stream.stream_set_models(&sa, (&ms) as u64)
+    load_world(&wa, &sa, &reg)
+    // B: wr_render (inline) + models
+    var rb: mc_raster.Raster = mc_raster.raster_new(W, H)
+    mc_raster.backend_upload_atlas(&rb, &sc.atlas)
+    var wb: mc_world.World = mc_world.world_new()
+    var wr: mc_render_world.WorldRender = mc_render_world.wr_new(MIN_Y, 4, &sc.tb)
+    mc_render_world.wr_set_models(&wr, (&ms) as u64)
+    mc_render_world.wr_set_translucent(&wr, true, mc_texture.T_WATER, mc_texture.T_ICE, mc_texture.T_GLASS)
+    load_world(&wb, 0 as *mut mc_stream.Stream, &reg)
+    // C: stream + pool WITHOUT models (own tables: the models patch the cube tables)
+    var rc: mc_raster.Raster = mc_raster.raster_new(W, H)
+    mc_raster.backend_upload_atlas(&rc, &sc2.atlas)
+    var wc: mc_world.World = mc_world.world_new()
+    var sk: mc_stream.Stream = mc_stream.stream_new(MIN_Y, NSEC, 4, &sc2.tb, pa)
+    sk.nbr_wait = 3 as u32
+    mc_stream.stream_set_translucent(&sk, true, mc_texture.T_WATER, mc_texture.T_ICE, mc_texture.T_GLASS)
+    load_world(&wc, &sk, &reg)
+
+    var p: i32 = 0
+    var total_ab: i32 = 0
+    while p < 3 {
+        pose(&cam, p)
+        stream_shot(&sa, &wa, &ra, &cam)
+        mc_raster.backend_begin(&rb, &cam, CLEAR)
+        mc_render_world.wr_render(&wr, &wb, &rb, &cam, 0 - 1)
+        mc_raster.backend_end(&rb)
+        stream_shot(&sk, &wc, &rc, &cam)
+        let dab: i32 = diff(&ra, &rb)
+        let dac: i32 = diff(&ra, &rc)
+        io.fmt_print_line(f"pose {p}: stream+pool vs wr_render {dab} px, vs stream without models {dac} px, drawn {sa.st.drawn} trans {sa.st.drawn_trans} inflight {sa.inflight}")
+        check(dab < 30, 10 + p) // of 9216
+        check(dac > 300, 20 + p) // the models are on the picture
+        check(sa.st.drawn > 0 as u32, 30 + p)
+        check(sa.inflight == 0, 40 + p)
+        total_ab = total_ab + dab
+        p = p + 1
+    }
+    var bfa: mc_backend.Backend = mc_backend.backend_cpu(&ra)
+    var bfc: mc_backend.Backend = mc_backend.backend_cpu(&rc)
+    mc_stream.stream_free(&sa, &bfa)
+    mc_stream.stream_free(&sk, &bfc)
+    jobs.destroy(&pool)
+    mc_model_mesh.ms_free(&ms)
+    return 0
+}
