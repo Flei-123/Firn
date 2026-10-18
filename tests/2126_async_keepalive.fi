@@ -1,0 +1,182 @@
+// expect_exit: 0
+// tests/2126_async_keepalive.fi -- async.ahttp keep-alive pool (aclient_set_keepalive).
+// A  keep-alive OFF (default): 3 requests = 3 connections
+// B  keep-alive ON: 5 sequential requests = 1 connection, 4 reused, bodies intact
+// C  `Connection: close` answer is not parked: next request opens a new connection
+// D  the server closes the parked connection: the next request still works (fresh connection)
+// E  chunked answer is parked and reused
+import std.rt
+import std.net
+import async.loop
+import async.stream
+import async.ahttp
+
+static mut fails: u32 = 0
+static mut conns: u32 = 0
+static mut reqs: u32 = 0
+static mut close_parked: u32 = 0 // the server closes a connection right after the answer when 1
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        let m: [u8; 5] = "FAIL "
+        syscall(1, 2, (&m[0]) as i64, 5, 0, 0, 0)
+        var d: [u8; 4] = [48, 48, 48, 10]
+        d[0] = (48 + (code / 100) % 10) as u8
+        d[1] = (48 + (code / 10) % 10) as u8
+        d[2] = (48 + code % 10) as u8
+        syscall(1, 2, (&d[0]) as i64, 4, 0, 0, 0)
+    }
+}
+
+fn find(p: u64, n: usize, lit: str) -> usize {
+    var i: usize = 0
+    while i + lit.n <= n {
+        if rt.mem_eq(p + i as u64, lit.p as u64, lit.n) { return i }
+        i = i + 1
+    }
+    return n
+}
+
+fn put(b: *mut rt.Buf, t: str) {
+    rt.buf_push_bytes(b, t.p as u64, t.n)
+}
+
+fn srv_event(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    if kind != stream.SE_DATA { return }
+    let p: u64 = stream.stream_in_ptr(s)
+    let n: usize = stream.stream_in_len(s)
+    let he: usize = find(p, n, "\r\n\r\n")
+    if he >= n { return }
+    reqs = reqs + 1
+    var out: rt.Buf = rt.buf_new()
+    if find(p, he, "GET /close ") < he {
+        put(&out, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello")
+    } else if find(p, he, "GET /chunked ") < he {
+        put(&out, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+    } else {
+        put(&out, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+    }
+    stream.stream_write(s, out.ptr, out.len)
+    rt.buf_free(&out)
+    stream.stream_consume(s, n)
+    if close_parked == 1 { stream.stream_close(s) }
+}
+
+fn on_conn(l: *mut loop.Loop, ud: u64, cn: net.Conn) {
+    conns = conns + 1
+    let s: *mut stream.Stream = stream.stream_adopt(l, cn, 20000, srv_event, 0)
+}
+
+static mut got: u32 = 0
+static mut st_ok: u32 = 0
+static mut body_ok: u32 = 0
+static mut reused_n: u32 = 0
+
+fn on_done(r: *mut ahttp.Request, ud: u64) {
+    got = got + 1
+    if ahttp.areq_error(r) == 0 && ahttp.areq_status(r) == 200 { st_ok = st_ok + 1 }
+    if ahttp.areq_body_len(r) == 5 && rt.mem_eq(ahttp.areq_body_ptr(r), "hello".p as u64, 5) { body_ok = body_ok + 1 }
+    if ahttp.areq_reused(r) { reused_n = reused_n + 1 }
+}
+
+fn t_stop(l: *mut loop.Loop, ud: u64) { loop.stop(l) }
+fn t_check(l: *mut loop.Loop, ud: u64) { if got >= 1 { loop.stop(l) } }
+
+fn one(l: *mut loop.Loop, a: *mut ahttp.AClient, port: u16, path: str) {
+    var u: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&u, "http://127.0.0.1:".p as u64, 17)
+    rt.buf_push_dec_u64(&u, port as u64)
+    rt.buf_push_bytes(&u, path.p as u64, path.n)
+    got = 0
+    ahttp.aclient_get(a, u.ptr, u.len, 3000, on_done, 0)
+    let h: u64 = loop.timer_after(l, 3000, t_stop, 0)
+    let c: u64 = loop.timer_every(l, 2, t_check, 0)
+    loop.run(l)
+    loop.timer_cancel(l, h)
+    loop.timer_cancel(l, c)
+    rt.buf_free(&u)
+    // let the loop settle (parking happens inside the callback; a closed parked stream is noticed here)
+    let t1: i64 = loop.mono_ms()
+    while loop.mono_ms() - t1 < 15 { loop.run_once(l, 5) }
+}
+
+#[allow_escape]
+fn suite(force_poll: bool) {
+    var l: loop.Loop = loop.loop_new()
+    var ok: bool = false
+    if force_poll { ok = loop.loop_init_poll(&l) } else { ok = loop.loop_init(&l) }
+    check(ok, 1)
+    var a: ahttp.AClient = ahttp.aclient_new()
+    check(ahttp.aclient_init(&a, &l), 2)
+    let acc: *mut stream.Acceptor = stream.acceptor_new(&l, net.ADDR_LOCAL, 0 as u16, 64, on_conn, 0)
+    check(acc as u64 != 0, 3)
+    let port: u16 = stream.acceptor_port(acc)
+
+    // ---- A: off
+    conns = 0
+    st_ok = 0
+    body_ok = 0
+    reused_n = 0
+    one(&l, &a, port, "/x")
+    one(&l, &a, port, "/x")
+    one(&l, &a, port, "/x")
+    check(st_ok == 3 && body_ok == 3, 10)
+    check(conns == 3 && reused_n == 0, 11)
+
+    // ---- B: on
+    ahttp.aclient_set_keepalive(&a, true)
+    conns = 0
+    st_ok = 0
+    body_ok = 0
+    reused_n = 0
+    var i: u32 = 0
+    while i < 5 {
+        one(&l, &a, port, "/x")
+        i = i + 1
+    }
+    check(st_ok == 5 && body_ok == 5, 20)
+    check(conns == 1, 21)
+    check(reused_n == 4, 22)
+    check(ahttp.ahttp_parked() == 1, 23)
+
+    // ---- C: Connection: close is not parked
+    one(&l, &a, port, "/close") // takes the parked one, the answer says close
+    check(st_ok == 6 && ahttp.ahttp_parked() == 0, 30)
+    conns = 0
+    one(&l, &a, port, "/x")
+    check(conns == 1 && st_ok == 7, 31)
+
+    // ---- E: chunked
+    conns = 0
+    reused_n = 0
+    one(&l, &a, port, "/chunked")
+    one(&l, &a, port, "/chunked")
+    check(st_ok == 9 && conns <= 1 && reused_n >= 1, 40)
+
+    // ---- D: the server closes right after each answer: the next request must still succeed
+    close_parked = 1
+    st_ok = 0
+    i = 0
+    while i < 4 {
+        one(&l, &a, port, "/x")
+        i = i + 1
+    }
+    check(st_ok == 4, 50)
+    close_parked = 0
+
+    ahttp.aclient_set_keepalive(&a, false)
+    check(ahttp.ahttp_parked() == 0, 60)
+    stream.acceptor_close(acc)
+    let t1: i64 = loop.mono_ms()
+    while loop.watch_count(&l) > 0 && loop.mono_ms() - t1 < 1000 { loop.run_once(&l, 10) }
+    ahttp.aclient_free(&a)
+    loop.loop_free(&l)
+}
+
+fn main() -> i32 {
+    suite(false)
+    suite(true)
+    if fails != 0 { return 1 }
+    return 0
+}

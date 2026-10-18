@@ -58,9 +58,16 @@
 //
 // ==================================================================== HONEST
 //
-// H1  ONE REQUEST, ONE CONNECTION. Every request sends `Connection: close`
-//     and opens its own socket; there is no keep-alive pool and no
-//     pipelining. 1000 requests are 1000 handshakes.
+// H1  ONE REQUEST, ONE CONNECTION AT A TIME. By default every request sends
+//     `Connection: close` and opens its own socket (1000 requests = 1000
+//     handshakes). `aclient_set_keepalive(a, true)` switches on a SMALL pool
+//     (POOL_MAX idle connections, parked PARK_MS): a finished request whose
+//     answer was framed (Content-Length / chunked, HTTP/1.1, no
+//     `Connection: close`) parks its stream; the next request to the same
+//     address/port/host name takes it and skips connect + TLS handshake. A
+//     parked connection that died meanwhile is retried ONCE on a fresh one
+//     when no answer octet had arrived. No pipelining: one request per
+//     connection at a time.
 // H2  NAMES ARE RESOLVED ON THE LOOP (lib/async/adns.fi: non-blocking UDP, the
 //     TTL cache of lib/net/dns.fi): a lookup never stalls the loop, phase
 //     P_RESOLVE. Cached, numeric and `localhost` names are answered at once.
@@ -103,6 +110,7 @@ export {
     areq_set_sink, areq_sink_got, areq_sink_digest, areq_sink_failed,
     areq_hops, areq_is_tls, areq_cancel, areq_set_max_body, areq_error_name,
     areq_elapsed_ms, aclient_active, aclient_completed,
+    aclient_set_keepalive, areq_reused, ahttp_parked, ahttp_reuse_count,
     Got, get_all, got_free_all, got_body,
 }
 
@@ -179,6 +187,10 @@ struct Request {
     sink_sha: sha256.Sha256,
     sink_cb: fn(u64, u64) -> u32, // (ud, octets so far) -> nonzero = abort
     sink_ud: u64,
+    keepable: bool, // the answer was framed and not `Connection: close`: the stream may be parked
+    reused: bool, // this request runs on a parked connection
+    nopool: bool, // do not take a parked connection (the retry after a dead one)
+    in0: u64, // stream octets-in when the parked connection was taken
 }
 
 // `size_of` needs a generic parameter outside the root file (see stream.fi).
@@ -209,7 +221,16 @@ fn aclient_init(a: *mut AClient, l: *mut loop.Loop) -> bool {
 }
 
 fn aclient_free(a: *mut AClient) {
+    pool_drop_client(a)
     http.client_free(&(*a).c)
+}
+
+// On: requests send `Connection: keep-alive` and finished connections are parked for the next request (H1).
+fn aclient_set_keepalive(a: *mut AClient, on: bool) {
+    (*a).c.keep_alive = on
+    if !on {
+        pool_drop_client(a)
+    }
 }
 
 // The embedded net.http client: `client_add_trust_pem`,
@@ -335,7 +356,8 @@ fn aclient_request(a: *mut AClient, method: u64, nm: usize, u: u64, n: usize,
         addrs: [0; 8], naddr: 0, iaddr: 0, port: 0 as u16, secure: false,
         is_tls_done: false, gone: false, defer_pending: false, busy: 0,
         dq: 0 as *mut adns.AQuery, sink_fd: 0 - 1, sink_got: 0, sink_failed: false,
-        sink_sha: sha256.sha256_new(), sink_cb: sink_none, sink_ud: 0 }
+        sink_sha: sha256.sha256_new(), sink_cb: sink_none, sink_ud: 0,
+        keepable: false, reused: false, nopool: false, in0: 0 }
     rt.buf_push_bytes(&(*rq).meth, method, nm)
     rt.buf_push_bytes(&(*rq).body, body, nb)
     rt.buf_push_bytes(&(*rq).ctype, ctype, nct)
@@ -449,12 +471,169 @@ fn on_dns(ud: u64, ok: bool, o: *mut dns.Resolved) {
     }
 }
 
+
+// ------------------------------------------------------------------ the pool of parked connections (H1)
+const POOL_MAX: usize = 4
+const PARK_MS: i64 = 20000 // a parked connection is closed after this idle time (servers close idle ones after 60-75 s)
+
+static mut G_PK_S: [u64; 4] = [0; 4]
+static mut G_PK_A: [u64; 4] = [0; 4]
+static mut G_PK_ADDR: [u32; 4] = [0; 4]
+static mut G_PK_PORT: [u32; 4] = [0; 4]
+static mut G_PK_SEC: [u32; 4] = [0; 4]
+static mut G_PK_HH: [u64; 4] = [0; 4]
+static mut G_PK_AT: [i64; 4] = [0; 4]
+static mut G_REUSED: u64 = 0
+
+fn ahttp_parked() -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < POOL_MAX {
+        if G_PK_S[i] != 0 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn ahttp_reuse_count() -> u64 { return G_REUSED }
+fn areq_reused(r: *mut Request) -> bool { return (*r).reused }
+
+fn host_hash(rq: *mut Request) -> u64 {
+    var h: u64 = 5381 as u64
+    let p: u64 = url.url_host_ptr(&(*rq).cur)
+    let n: usize = url.url_host_len(&(*rq).cur)
+    var i: usize = 0
+    while i < n {
+        h = (h * 131 as u64 + (rt.ld8(p, i) as u64)) & 281474976710655 as u64
+        i = i + 1
+    }
+    return h
+}
+
+fn pool_drop_slot(i: usize) {
+    let s: u64 = G_PK_S[i]
+    G_PK_S[i] = 0
+    if s != 0 {
+        stream.stream_abort(s as *mut stream.Stream)
+    }
+}
+
+fn pool_drop_client(a: *mut AClient) {
+    var i: usize = 0
+    while i < POOL_MAX {
+        if G_PK_S[i] != 0 && G_PK_A[i] == a as u64 { pool_drop_slot(i) }
+        i = i + 1
+    }
+}
+
+// events of a PARKED stream: closed (by the server or the idle timer) = forget it; data nobody asked for = drop it
+fn park_cb(s: *mut stream.Stream, ud: u64, kind: u32, arg: i64) {
+    var i: usize = 0
+    while i < POOL_MAX {
+        if G_PK_S[i] == s as u64 {
+            if kind == stream.SE_CLOSED {
+                G_PK_S[i] = 0
+            } else if kind == stream.SE_DATA {
+                pool_drop_slot(i)
+            }
+            return
+        }
+        i = i + 1
+    }
+}
+
+fn pool_find(rq: *mut Request, addr: u32) -> i64 {
+    let hh: u64 = host_hash(rq)
+    let sec: u32 = if (*rq).secure { 1 } else { 0 }
+    var i: usize = 0
+    while i < POOL_MAX {
+        if G_PK_S[i] != 0 && G_PK_A[i] == (*rq).a as u64 && G_PK_ADDR[i] == addr && G_PK_PORT[i] == (*rq).port as u32 && G_PK_SEC[i] == sec && G_PK_HH[i] == hh {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn pool_park(rq: *mut Request, s: *mut stream.Stream) -> bool {
+    var slot: usize = POOL_MAX
+    var oldest: usize = 0
+    var i: usize = 0
+    while i < POOL_MAX {
+        if G_PK_S[i] == 0 && slot == POOL_MAX { slot = i }
+        if G_PK_S[i] != 0 && G_PK_AT[i] < G_PK_AT[oldest] { oldest = i }
+        i = i + 1
+    }
+    if slot == POOL_MAX {
+        pool_drop_slot(oldest)
+        slot = oldest
+    }
+    G_PK_S[slot] = s as u64
+    G_PK_A[slot] = (*rq).a as u64
+    G_PK_ADDR[slot] = stream.stream_peer(s)
+    G_PK_PORT[slot] = (*rq).port as u32
+    G_PK_SEC[slot] = if (*rq).secure { 1 } else { 0 }
+    G_PK_HH[slot] = host_hash(rq)
+    G_PK_AT[slot] = loop.mono_ms()
+    stream.stream_set_callback(s, park_cb, 0)
+    stream.stream_set_timeout(s, PARK_MS)
+    return true
+}
+
+// may the stream of this finished request be parked?
+fn can_park(rq: *mut Request, s: *mut stream.Stream) -> bool {
+    if !(*(*rq).a).c.keep_alive || !(*rq).keepable || (*rq).err != 0 || (*rq).sink_fd >= 0 { return false }
+    if !stream.stream_is_open(s) || stream.stream_in_len(s) != 0 || stream.stream_out_pending(s) != 0 { return false }
+    return true
+}
+
+// the request goes out on a parked connection one loop turn later (never from inside aclient_request)
+fn reuse_go(l: *mut loop.Loop, ud: u64) {
+    let rq: *mut Request = ud as *mut Request
+    (*rq).defer_pending = false
+    if (*rq).gone || (*rq).phase != P_CONNECT || (*rq).st as u64 == 0 {
+        if (*rq).gone && (*rq).busy == 0 { release(rq) }
+        return
+    }
+    (*rq).busy = (*rq).busy + 1
+    send_request(rq, (*rq).st)
+    (*rq).busy = (*rq).busy - 1
+    if (*rq).busy == 0 && (*rq).gone && !(*rq).defer_pending { release(rq) }
+}
+
+// a parked connection was dead (nothing of an answer arrived): ask again on a fresh one, once
+fn retry_fresh(rq: *mut Request, s: *mut stream.Stream) -> bool {
+    if !(*rq).reused || stream.stream_bytes_in(s) != (*rq).in0 { return false }
+    (*rq).reused = false
+    (*rq).nopool = true
+    (*rq).err = 0
+    (*rq).phase = P_CONNECT
+    return connect_next(rq)
+}
+
 fn connect_next(rq: *mut Request) -> bool {
     let a: *mut AClient = (*rq).a
     let addr: u32 = (*rq).addrs[(*rq).iaddr]
     (*rq).phase = P_CONNECT
     (*rq).scan = 0
     rt.buf_clear(&(*rq).r.raw)
+    (*rq).keepable = false
+    if (*a).c.keep_alive && !(*rq).nopool {
+        let k: i64 = pool_find(rq, addr)
+        if k >= 0 {
+            let ps: *mut stream.Stream = G_PK_S[k as usize] as *mut stream.Stream
+            G_PK_S[k as usize] = 0
+            stream.stream_set_callback(ps, on_stream, rq as u64)
+            stream.stream_set_timeout(ps, (*a).c.timeout_ms as i64)
+            (*rq).st = ps
+            (*rq).reused = true
+            (*rq).in0 = stream.stream_bytes_in(ps)
+            G_REUSED = G_REUSED + 1 as u64
+            (*rq).defer_pending = true
+            loop.defer_call((*a).l, reuse_go, rq as u64)
+            return true
+        }
+    }
     var s: *mut stream.Stream = 0 as *mut stream.Stream
     let idle: i64 = (*a).c.timeout_ms as i64
     if (*rq).secure {
@@ -534,6 +713,9 @@ fn send_request(rq: *mut Request, s: *mut stream.Stream) {
 
 fn on_closed(rq: *mut Request, s: *mut stream.Stream, reason: i64) {
     if (*rq).phase == P_DONE {
+        return
+    }
+    if (*rq).reused && (*rq).phase <= P_HEAD && reason != stream.CL_TIMEOUT && retry_fresh(rq, s) {
         return
     }
     if (*rq).phase == P_BODY_CLOSE && reason == stream.CL_EOF {
@@ -906,6 +1088,17 @@ fn start_body(rq: *mut Request) -> bool {
         is_head = true
     }
     (*r).keep = false
+    // may the connection stay open after this answer? (HTTP/1.1, no `Connection: close`, body framed)
+    var ka: bool = (*rq).sink_fd < 0 && rt.ld8((*r).raw.ptr, 7) == 49 as u8
+    if ka {
+        var atn: u64 = 0
+        let ncn: usize = http.resp_header(r, (&h_cn[0]) as u64, 10, &atn)
+        if ncn > 0 {
+            var cl: [u8; 5] = "close"
+            if http.ci_eq(atn, ncn, (&cl[0]) as u64, 5) { ka = false }
+        }
+    }
+    (*rq).keepable = ka && (bodyless || is_head || chunked || have_clen)
     if bodyless || is_head {
         (*r).wire = 0
         finish_response(rq)
@@ -1078,7 +1271,11 @@ fn finish(rq: *mut Request) {
     let old: *mut stream.Stream = (*rq).st
     (*rq).st = 0 as *mut stream.Stream
     if old as u64 != 0 {
-        stream.stream_close(old)
+        if can_park(rq, old) {
+            let pk: bool = pool_park(rq, old)
+        } else {
+            stream.stream_close(old)
+        }
     }
     if (*rq).err != 0 {
         (*rq).r.status = 0
