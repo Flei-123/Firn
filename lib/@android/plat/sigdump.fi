@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/@android/plat/sigdump.fi -- the Android side of lib/plat/sigdump.fi: a signal handler that writes ONE line into a file before
+// the process dies: signal, si_code, fault address, the program counter (arm64 and x86_64 field both, one is noise), link register,
+// stack pointer, the load address of this library and pc minus that (for addr2line on the unstripped .so).
+//
+// After writing, the handler puts the PREVIOUS action of the signal back (debuggerd's, which makes the tombstone) and returns: the
+// faulting instruction runs again and the old handler sees the fault as if we had never been there. The handler runs on an own
+// signal stack (sigaltstack) of the thread that installed it, so a stack overflow is caught too. All of it is #[no_gc]: static
+// buffers, no allocation, only write(2).
+import std.rt
+import std.fs
+
+export { sd_install, sd_available }
+
+#[no_gc]
+extern fn sigaction(sig: i32, act: u64, old: u64) -> i32;
+#[no_gc]
+extern fn sigaltstack(ss: u64, old: u64) -> i32;
+#[no_gc]
+extern fn write(fd: i32, buf: u64, n: usize) -> i64;
+#[no_gc]
+extern fn dladdr(addr: u64, info: u64) -> i32;
+
+struct HolderS { f: fn(u64, u64, u64, u64) }
+
+const SA_SIGINFO: i32 = 4
+const SA_ONSTACK: i32 = 134217728 // 0x08000000
+const N_SIGS: usize = 7
+
+static mut G_FD: i64 = -1
+static mut G_BUSY: i64 = 0
+static mut G_BASE: u64 = 0
+static mut G_SIGS: [i32; 7] = [4, 5, 6, 7, 8, 11, 31]
+static mut G_OLD: [u64; 56] = [0; 56] // 7 old actions, 8 words (64 bytes) each
+static mut G_ACT: [u64; 8] = [0; 8]
+static mut G_SS: [u64; 3] = [0; 3]
+static mut G_ALT: [u8; 65536] = [0; 65536]
+static mut G_LINE: [u8; 400] = [0; 400]
+static mut G_N: usize = 0
+static mut G_DLI: [u64; 4] = [0; 4]
+
+fn sd_available() -> bool { return true }
+
+#[no_gc]
+fn code_of_s(f: fn(u64, u64, u64, u64)) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut HolderS = (&roh[0]) as *mut HolderS
+    (*h).f = f
+    return peek64(roh[0])
+}
+
+#[no_gc]
+fn peek64(p: u64) -> u64 {
+    return *(p as *mut u64)
+}
+
+#[no_gc]
+fn put_c(c: u8) {
+    if G_N < 399 {
+        G_LINE[G_N] = c
+        G_N = G_N + 1
+    }
+}
+
+#[no_gc]
+fn put_s(s: str) {
+    var i: usize = 0
+    while i < s.n {
+        put_c(rt.ld8(s.p as u64, i))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn put_dec(v: u64) {
+    var digits: [u8; 20] = [0; 20]
+    var n: usize = 0
+    var x: u64 = v
+    if x == 0 {
+        put_c(48 as u8)
+        return
+    }
+    while x > 0 {
+        digits[n] = (48 + x % 10) as u8
+        x = x / 10
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        put_c(digits[n])
+    }
+}
+
+#[no_gc]
+fn put_hex(v: u64) {
+    put_s("0x")
+    var i: usize = 0
+    var started: bool = false
+    while i < 16 {
+        let nib: u64 = (v >> ((15 - i) * 4) as u64) & 15
+        if nib != 0 || started || i == 15 {
+            started = true
+            if nib < 10 { put_c((48 + nib) as u8) } else { put_c((87 + nib) as u8) }
+        }
+        i = i + 1
+    }
+}
+
+// v minus the library's load address (0 when v lies below it: the field is noise on this architecture)
+#[no_gc]
+fn off(v: u64) -> u64 {
+    if v < G_BASE { return 0 }
+    return v - G_BASE
+}
+
+// (signal, siginfo*, ucontext*, unused): runs in signal context
+#[no_gc]
+fn on_signal(sig_raw: u64, info: u64, uc: u64, d: u64) {
+    let sig: u64 = sig_raw & 4294967295
+    if G_BUSY != 0 || G_FD < 0 { return }
+    G_BUSY = 1
+    G_N = 0
+    put_s("signal ")
+    put_dec(sig)
+    put_s(" code ")
+    put_dec(peek64(info + 8) & 4294967295)
+    put_s(" addr ")
+    put_hex(peek64(info + 16))
+    put_s("\n  a64 pc ")
+    put_hex(peek64(uc + 440))
+    put_s(" lr ")
+    put_hex(peek64(uc + 424))
+    put_s(" sp ")
+    put_hex(peek64(uc + 432))
+    put_s(" fault ")
+    put_hex(peek64(uc + 176))
+    put_s("\n  x64 rip ")
+    put_hex(peek64(uc + 168))
+    put_s("\n  base ")
+    put_hex(G_BASE)
+    put_s(" pc_off ")
+    put_hex(off(peek64(uc + 440)))
+    put_s(" lr_off ")
+    put_hex(off(peek64(uc + 424)))
+    put_s(" rip_off ")
+    put_hex(off(peek64(uc + 168)))
+    put_c(10 as u8)
+    let w: i64 = write(G_FD as i32, (&G_LINE[0]) as u64, G_N)
+    // the old action of this signal back (debuggerd's), then the fault runs again
+    var i: usize = 0
+    while i < N_SIGS {
+        if G_SIGS[i] as u64 == sig {
+            let r: i32 = sigaction(G_SIGS[i], (&G_OLD[0]) as u64 + (i * 64) as u64, 0)
+        }
+        i = i + 1
+    }
+    G_BUSY = 0
+}
+
+// `path`: the dump file (appended to, created). The caller reads and removes an older one BEFORE this call.
+fn sd_install(path: str) -> bool {
+    if path.n == 0 || path.n > 500 { return false }
+    var i: usize = 0
+    let fd: i64 = fs.open_append(path) catch -1
+    if fd < 0 { return false }
+    G_FD = fd
+    let code: u64 = code_of_s(on_signal)
+    if dladdr(code, (&G_DLI[0]) as u64) != 0 {
+        G_BASE = G_DLI[1]
+    }
+    // own signal stack for this thread
+    G_SS[0] = (&G_ALT[0]) as u64
+    G_SS[1] = 0
+    G_SS[2] = 65536
+    let sa: i32 = sigaltstack((&G_SS[0]) as u64, 0)
+    // struct sigaction (LP64 bionic): int sa_flags @0, handler @8, sa_mask @16, restorer @24
+    G_ACT[0] = ((SA_SIGINFO | SA_ONSTACK) as u64) & 4294967295
+    G_ACT[1] = code
+    G_ACT[2] = 0
+    G_ACT[3] = 0
+    var ok: bool = true
+    i = 0
+    while i < N_SIGS {
+        let r: i32 = sigaction(G_SIGS[i], (&G_ACT[0]) as u64, (&G_OLD[0]) as u64 + (i * 64) as u64)
+        if r != 0 { ok = false }
+        i = i + 1
+    }
+    return ok
+}

@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/stage.fi -- STARTUP STAGES in a file, to find out how far a start got before the process died.
+//
+//     stage.stage_open(state_dir)       // once, early: keeps the file of the PREVIOUS run, starts a new one
+//     stage.stage_mark("window")        // one line "<ms since open> window" appended (open, write, close)
+//     stage.stage_prev_has("frame")     // did the previous run reach that stage?
+//     stage.stage_prev(&buf)            // the previous run's file as text
+//
+// The file is `<state_dir>/startup_stage.txt`. It exists so that a crash BEFORE the user interface (host, EGL, window,
+// first frame) can still be told apart from one after it: the next start reads what the dead one wrote last.
+// stage_mark before stage_open does nothing. Nothing here is ever sent anywhere.
+import std.rt
+import std.fs
+import std.time
+
+export { stage_open, stage_mark, stage_prev, stage_prev_has, stage_prev_len, STAGE_PREV_MAX }
+
+const STAGE_PREV_MAX: usize = 4096
+
+static mut G_PATH: [u8; 640] = [0; 640]
+static mut G_PATH_N: usize = 0
+static mut G_PREV: [u8; 4096] = [0; 4096]
+static mut G_PREV_N: usize = 0
+static mut G_T0: i64 = 0
+
+fn path_str() -> str {
+    return str { p: (&G_PATH[0]) as *mut u8, n: G_PATH_N }
+}
+
+// Keeps the previous run's file, then starts a fresh one. false: no usable directory.
+fn stage_open(dir: str) -> bool {
+    if dir.n == 0 || dir.n > 600 { return false }
+    rt.mem_copy((&G_PATH[0]) as u64, dir.p as u64, dir.n)
+    var i: usize = 0
+    let tail: str = "/startup_stage.txt"
+    while i < tail.n {
+        G_PATH[dir.n + i] = rt.ld8(tail.p as u64, i)
+        i = i + 1
+    }
+    G_PATH_N = dir.n + tail.n
+    let made: bool = fs.mkdir_all(dir) catch false
+    var old: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path_str(), &old) catch 0
+    G_PREV_N = 0
+    if n > 0 {
+        var k: usize = n
+        if k > STAGE_PREV_MAX { k = STAGE_PREV_MAX }
+        rt.mem_copy((&G_PREV[0]) as u64, rt.buf_ptr(&old), k)
+        G_PREV_N = k
+    }
+    rt.buf_free(&old)
+    G_T0 = time.now_unix_ms()
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, "run ".p as u64, 4)
+    rt.buf_push_dec_u64(&b, G_T0 as u64)
+    rt.buf_push(&b, 10 as u8)
+    let w: usize = fs.write_file(path_str(), rt.buf_ptr(&b), rt.buf_len(&b)) catch 0
+    rt.buf_free(&b)
+    return w > 0
+}
+
+// One line "<ms> <name>" at the end of the file.
+fn stage_mark(name: str) {
+    if G_PATH_N == 0 { return }
+    var b: rt.Buf = rt.buf_new()
+    var ms: i64 = time.now_unix_ms() - G_T0
+    if ms < 0 { ms = 0 }
+    rt.buf_push_dec_u64(&b, ms as u64)
+    rt.buf_push(&b, 32 as u8)
+    rt.buf_push_bytes(&b, name.p as u64, name.n)
+    rt.buf_push(&b, 10 as u8)
+    let w: usize = fs.append_file(path_str(), rt.buf_ptr(&b), rt.buf_len(&b)) catch 0
+    rt.buf_free(&b)
+}
+
+fn stage_prev_len() -> usize { return G_PREV_N }
+
+// the previous run's file appended to `out`
+fn stage_prev(out: *mut rt.Buf) {
+    if G_PREV_N > 0 {
+        rt.buf_push_bytes(out, (&G_PREV[0]) as u64, G_PREV_N)
+    }
+}
+
+// is `name` a stage line of the previous run (matched as " name\n")
+fn stage_prev_has(name: str) -> bool {
+    if G_PREV_N == 0 || name.n == 0 { return false }
+    var i: usize = 0
+    while i + name.n + 1 <= G_PREV_N {
+        if rt.ld8((&G_PREV[0]) as u64, i) == 32 as u8 {
+            var k: usize = 0
+            var same: bool = true
+            while k < name.n {
+                if rt.ld8((&G_PREV[0]) as u64, i + 1 + k) != rt.ld8(name.p as u64, k) {
+                    same = false
+                    break
+                }
+                k = k + 1
+            }
+            if same {
+                let after: usize = i + 1 + name.n
+                if after >= G_PREV_N || rt.ld8((&G_PREV[0]) as u64, after) == 10 as u8 {
+                    return true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
