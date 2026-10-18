@@ -889,6 +889,69 @@ pub(crate) fn infer_fn_value(name: &str, expected: &TypeExpr, at: Span) -> Resul
     Ok(mangled)
 }
 
+/// r742b -- `apply_g(id, 4)`: the type arguments of the generic function `name`
+/// come from its VALUE arguments. `strong[i]` = the evident type of argument i,
+/// `weak[i]` = a literal default (`4` -> i32); weak types only fill parameters
+/// the strong ones left open. Records the instance (the caller runs
+/// `mono::expand_late`) and returns (mangled name, parameter types, result type)
+/// with the type arguments substituted.
+pub(crate) fn infer_call(
+    name: &str,
+    strong: &[Option<TypeExpr>],
+    weak: &[Option<TypeExpr>],
+    at: Span,
+) -> Result<(String, Vec<TypeExpr>, Option<TypeExpr>), String> {
+    let tpl = match fn_template(name) {
+        Some(t) => t,
+        None => return Err(format!("unknown generic function '{}'", name)),
+    };
+    if tpl.decl.params.len() != strong.len() {
+        return Err(format!(
+            "generic function '{}' expects {} argument(s), found {}",
+            name,
+            tpl.decl.params.len(),
+            strong.len()
+        ));
+    }
+    let mut map: HashMap<String, TypeExpr> = HashMap::new();
+    for (p, t) in tpl.decl.params.iter().zip(strong.iter()) {
+        if let Some(t) = t {
+            let mut trial = map.clone();
+            if unify_ty(&p.ty, t, &tpl.params, &mut trial) {
+                map = trial;
+            }
+        }
+    }
+    for (p, t) in tpl.decl.params.iter().zip(weak.iter()) {
+        if let Some(t) = t {
+            let mut trial = map.clone();
+            if unify_ty(&p.ty, t, &tpl.params, &mut trial) {
+                map = trial;
+            }
+        }
+    }
+    let mut args: Vec<TypeExpr> = Vec::new();
+    for p in &tpl.params {
+        match map.get(&p.name) {
+            Some(t) => args.push(t.clone()),
+            None => {
+                return Err(format!(
+                    "cannot infer the type parameter '{}' of '{}' from the arguments (write the type arguments, e.g. '{}[i32]')",
+                    p.name, name, name
+                ))
+            }
+        }
+    }
+    let mangled = mangle(name, &args);
+    record_inst(
+        &mangled,
+        Instantiation { base: name.to_string(), args, span: at, is_abstract: false, is_fn: true },
+    );
+    let ptys = tpl.decl.params.iter().map(|p| crate::mono::subst_for_infer(&p.ty, &map)).collect();
+    let ret = tpl.decl.ret.as_ref().map(|r| crate::mono::subst_for_infer(r, &map));
+    Ok((mangled, ptys, ret))
+}
+
 /// `// HOOK types` in `parser.rs::primary` — `Vec[i32]{ .. }`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     // r707: `mod.Vec[i32]{ .. }`

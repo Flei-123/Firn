@@ -529,6 +529,9 @@ struct ModuleInfo {
     consts: HashSet<String>,
     /// `export` list; empty = everything visible
     exports: HashSet<String>,
+    /// r742b: names of the generic function templates declared in the module
+    /// (`mod.f` without type arguments as a value: the template name is global)
+    generics: HashSet<String>,
 }
 
 /// Reads, parses and merges all modules into one program.
@@ -633,6 +636,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             items,
             consts,
             exports: p.exports.iter().map(|(n, _)| n.clone()).collect(),
+            generics: crate::sema_generic::fn_templates_the_file(f.id).into_iter().collect(),
         });
     }
 
@@ -889,7 +893,8 @@ impl<'a, 'b> Renamer<'a, 'b> {
                     return None;
                 }
             };
-            if !info.items.contains(rest) {
+            let generic = info.generics.contains(rest) && !info.items.contains(rest);
+            if !info.items.contains(rest) && !generic {
                 self.dg.error(
                     span,
                     format!("module '{}' has no element '{}'", m, rest),
@@ -903,6 +908,10 @@ impl<'a, 'b> Renamer<'a, 'b> {
                     "add the name to the 'export' list of the module",
                 );
                 return None;
+            }
+            if generic {
+                // r742b: the generic template keeps its program-wide name
+                return Some(rest.to_string());
             }
             return Some(mangle(&info.name, rest));
         }

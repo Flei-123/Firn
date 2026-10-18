@@ -1056,6 +1056,10 @@ fn run(opts: &Options) -> i32 {
     // r715: lambda sugar `|x| e` -> `fn(x: T) -> R { return e }` (lambda.rs)
     if !dg.has_errors() {
         lambda::apply(&mut prog, &mut dg);
+        // r742b: generic calls without type arguments that nothing inferred
+        if !dg.has_errors() {
+            mono::check_bare_calls(&prog, &mut dg);
+        }
     }
     tm.mark("mono");
     if opts.emit == Emit::Ast && !dg.has_errors() {

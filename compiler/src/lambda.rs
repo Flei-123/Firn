@@ -148,6 +148,8 @@ struct Cx<'a> {
     /// local whose type is not evident; it still SHADOWS an outer one.
     scopes: Vec<HashMap<String, Option<TypeExpr>>>,
     ret: Option<TypeExpr>,
+    /// r742b: result types of instances inferred in this round (`apply_g(id, 4)`)
+    inst_rets: HashMap<String, TypeExpr>,
     /// r742: an instance was recorded while inferring `apply(id, 4)` -> expand again
     pending: bool,
     dg: &'a mut Diags,
@@ -201,7 +203,7 @@ fn expr_ty(cx: &Cx, e: &Expr) -> Option<TypeExpr> {
                 _ => None,
             }
         }
-        ExprKind::Call(n, _, _) => cx.rets.get(n).cloned(),
+        ExprKind::Call(n, _, _) => cx.rets.get(n).or_else(|| cx.inst_rets.get(n)).cloned(),
         ExprKind::Unary(UnOp::Deref, a) => match expr_ty(cx, a)? {
             TypeExpr::Ptr { inner, .. } => Some(*inner),
             _ => None,
@@ -216,6 +218,50 @@ fn expr_ty(cx: &Cx, e: &Expr) -> Option<TypeExpr> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// r742b: `e` is the NAME of a generic fn used as a value (`id`, `mod.id`) -> its template name.
+fn generic_fn_value(cx: &Cx, e: &Expr) -> Option<String> {
+    let n = match &e.kind {
+        ExprKind::Ident(n) => n,
+        _ => return None,
+    };
+    if lookup(cx, n).is_some() || cx.globals.contains_key(n) {
+        return None;
+    }
+    let base = match n.split_once('.') {
+        Some((_, f)) if crate::sema_generic::is_generic_fn(f) => f.to_string(),
+        _ => n.clone(),
+    };
+    if crate::sema_generic::is_generic_fn(&base) {
+        Some(base)
+    } else {
+        None
+    }
+}
+
+/// r742b: the type of a call argument, for inferring the type parameters of a
+/// generic callee. (strong, weak): `weak` = a literal default.
+fn arg_ty(cx: &Cx, e: &Expr) -> (Option<TypeExpr>, Option<TypeExpr>) {
+    let named = |n: &str| Some(TypeExpr::Named(n.to_string(), e.span));
+    match &e.kind {
+        ExprKind::Int(_) => (None, named("i32")),
+        ExprKind::Float(..) => (None, named("f64")),
+        ExprKind::FloatF32(_) => (named("f32"), None),
+        ExprKind::Bool(_) => (named("bool"), None),
+        ExprKind::Unary(UnOp::Neg, a) => arg_ty(cx, a),
+        ExprKind::Ident(n) if lookup(cx, n).is_none() && !cx.globals.contains_key(n) => {
+            // a plain function used as a value: its signature is the type
+            match (cx.sigs.get(n), cx.rets.get(n)) {
+                (Some(ps), r) => (
+                    Some(TypeExpr::Fn { params: ps.clone(), ret: r.map(|r| Box::new(r.clone())), span: e.span }),
+                    None,
+                ),
+                _ => (None, None),
+            }
+        }
+        _ => (expr_ty(cx, e), None),
     }
 }
 
@@ -294,6 +340,7 @@ fn round(prog: &mut Program, dg: &mut Diags, start: usize) -> bool {
         methods: &methods,
         scopes: Vec::new(),
         ret: None,
+        inst_rets: HashMap::new(),
         pending: false,
         dg,
     };
@@ -563,7 +610,29 @@ fn walk(cx: &mut Cx, e: &mut Expr) {
             resolve(cx, d, None, sp);
         }
         ExprKind::Call(name, args, _) => {
-            let tys: Option<Vec<TypeExpr>> = match crate::impls::method_name(name) {
+            // r742b: `apply_g(id, 4)` -- a generic callee with a generic fn as a value
+            // argument: the type arguments come from the other arguments.
+            let mut inferred: Option<Vec<TypeExpr>> = None;
+            if crate::sema_generic::is_generic_fn(name)
+                && crate::impls::method_name(name).is_none()
+                && args.iter().any(|a| generic_fn_value(cx, a).is_some())
+            {
+                let tys: Vec<(Option<TypeExpr>, Option<TypeExpr>)> = args.iter().map(|a| arg_ty(cx, a)).collect();
+                let strong: Vec<Option<TypeExpr>> = tys.iter().map(|t| t.0.clone()).collect();
+                let weak: Vec<Option<TypeExpr>> = tys.iter().map(|t| t.1.clone()).collect();
+                match crate::sema_generic::infer_call(name, &strong, &weak, e.span) {
+                    Ok((m, ptys, ret)) => {
+                        if let Some(r) = ret {
+                            cx.inst_rets.insert(m.clone(), r);
+                        }
+                        *name = m;
+                        cx.pending = true;
+                        inferred = Some(ptys);
+                    }
+                    Err(msg) => cx.dg.error(e.span, msg),
+                }
+            }
+            let tys: Option<Vec<TypeExpr>> = if inferred.is_some() { inferred } else { match crate::impls::method_name(name) {
                 Some(m) => cx.msigs.get(m).and_then(|v| {
                     let c: Vec<&Vec<TypeExpr>> = v.iter().filter(|s| s.len() == args.len()).collect();
                     let first = c.first()?;
@@ -579,7 +648,7 @@ fn walk(cx: &mut Cx, e: &mut Expr) {
                     Some((*first).clone())
                 }),
                 None => cx.sigs.get(name.as_str()).cloned(),
-            };
+            } };
             for (i, a) in args.iter_mut().enumerate() {
                 let t = tys.as_ref().and_then(|v| v.get(i));
                 want(cx, a, t);
