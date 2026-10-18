@@ -79,6 +79,14 @@ done
 "$FIRNC" --opt-level=dev -o "$T/appgrid" tools/fui/appgrid_main.fi
 "$T/appgrid" "$T/img" > /dev/null
 
+# DRAG AND DROP (appctl.dnd_*): the drop marker between rows and the ghost at the pointer, light, dark
+"$FIRNC" --opt-level=dev -o "$T/appw10" tools/fui/appw10_main.fi
+"$T/appw10" "$T/img" > /dev/null
+
+# TOOLBAR OVERFLOW (appctl.toolbar): narrow bar with "..." and the open panel, light, dark
+"$FIRNC" --opt-level=dev -o "$T/apptb" tools/fui/apptb_main.fi
+"$T/apptb" "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/

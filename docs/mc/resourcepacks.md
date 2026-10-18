@@ -97,3 +97,13 @@ OGG + sound.json + mc_audio modes: 3-4 d. UI + persistence: 1-2 d.
   (right handed), uvlock. All are checked for self-consistency in the tests only.
 * **Not done:** mesher / renderer integration (texture names -> atlas tiles, 1/16 vertex format, culling against neighbours via `cull`), `builtin/generated` item models, `display`,
   `ambientocclusion`, `overrides`, `!` negation in `when`, `elements` with `light_emission`.
+
+## Models in the mesher (r230 / r231, opt-in, CPU back end)
+
+`lib/mc/mc_model_mesh.fi`: block state id -> `reg_state_text` split into name + `prop=value,...` -> `blockstate_bake` -> quads with atlas tiles
+(texture name -> extended tile through its candidate names), cullface against opaque / unknown neighbours, light of the cell in front.
+Only states whose model is NOT a unit cube become model states (stairs, slabs, plants ...); they leave the cube mesher (`ms_prepare` zeroes their
+tiles and opaque bit). Weighted variants use `seed_from_pos` (4 seeds per state, baked on demand). `'!'` in `when` negates a value list.
+Own built-ins: stairs, inner_stairs, outer_stairs. Output = `MQ_WORDS` (24) f64 per quad, drawn by the CPU raster as `MESH_MODEL` meshes
+(`mesh_class(MESH_MODEL)` + `mesh_upload`, `raster_draw_models`). `mc_render_world.wr_set_models(wr, &modelset)` switches it on (default off).
+NOT done: mcplay switch (MCPLAY_MODELS=1), mc_stream path, GL / VK, biome tint, AO, translucency, reload of the ModelSet after a pack change.
