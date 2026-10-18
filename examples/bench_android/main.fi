@@ -1,0 +1,938 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/bench_android/main.fi -- Android benchmark app, Firn + fUi side (spec: projects_kb/fui/bench_spec.md).
+//
+// Three tabs (List, Lab, Settings) like the Kotlin Compose twin (bench/android_kotlin). 1000 card rows in ONE virtual list, Lab with
+// Anim / Text / Net / CPU, test hooks through intent extras (plat.intentx) and BENCH log lines (plat.blog, logcat tag BENCH).
+//
+// ONE THREAD: the window, the network (async.ahttp) and the CPU benchmark (bcpu, 8 ms slices) all run on the window loop. A 16 ms loop
+// timer exists ONLY while something moves (Anim page, CPU run, autoscroll) -- an idle page costs no frames.
+import std.rt
+import std.time
+import async.loop
+import async.ahttp
+import fui.app
+import fui.appctl
+import fui.looppump
+import fui.scene
+import fui.flex
+import fui.vlist
+import fui.viewport
+import fui.sheet
+import fui.style
+import fui.theme
+import fui.lucide
+import fui.icons
+import fui.render
+import fui.widget
+import fui.painter
+import plat.blog
+import plat.intentx
+import window.window
+import bcpu
+
+const N_ITEMS: usize = 1000
+const MAX_ITEMS: usize = 4096
+const ROW_PT: usize = 80
+
+// style classes
+const K_FILLED: u32 = 1
+const K_OUTLINE: u32 = 2
+const K_BAR: u32 = 3
+const K_BODY: u32 = 4
+const K_BOX: u32 = 5
+const K_SPIN: u32 = 6
+const K_ENTRY: u32 = 7
+const K_NAV: u32 = 8
+const K_DIM: u32 = 9
+const K_TITLE: u32 = 10
+const K_ROOT: u32 = 11
+const K_BIG: u32 = 12
+
+const TAB_LIST: usize = 0
+const TAB_LAB: usize = 1
+const TAB_SET: usize = 2
+const S_ANIM: usize = 0
+const S_TEXT: usize = 1
+const S_NET: usize = 2
+const S_CPU: usize = 3
+
+static mut G_A: u64 = 0
+static mut G_LOOP: u64 = 0
+static mut G_WIN: u64 = 0
+static mut G_ITEMS: [i64; 4096] = [0; 4096]
+static mut G_NI: usize = 0
+static mut G_VIEW: [u32; 4096] = [0 as u32; 4096]
+static mut G_NV: usize = 0
+static mut G_QUERY: [u8; 64] = [0; 64]
+static mut G_QN: usize = 0
+static mut G_TAB: usize = 0
+static mut G_SECT: usize = 0
+static mut G_MODE: usize = 0 // 0 system, 1 light, 2 dark
+static mut G_DARK: bool = true
+static mut G_P: [usize; 3] = [0; 3]
+static mut G_S: [usize; 4] = [0; 4]
+static mut G_NAV: [usize; 3] = [0; 3]
+static mut G_LIST: usize = 0
+static mut G_TEXTLIST: usize = 0
+static mut G_FILTER: usize = 0
+static mut G_TOGGLE: usize = 0
+static mut G_SEG: usize = 0
+static mut G_RADIO: [usize; 3] = [0; 3]
+static mut G_SPIN_RULE: usize = 0
+static mut G_FPS: usize = 0
+static mut G_FRAMEL: usize = 0
+static mut G_NET: [usize; 4] = [0; 4]
+static mut G_NET_BTN: usize = 0
+static mut G_CPU: [usize; 3] = [0; 3]
+static mut G_CPU_BTN: usize = 0
+static mut G_T16: u64 = 0
+static mut G_TREADY: u64 = 0
+static mut G_AUTOSCROLL: bool = false
+static mut G_AS_T0: i64 = 0
+static mut G_AS_DIR: i64 = 1
+static mut G_AS_POS: f64 = 0.0
+static mut G_AS_LAST: i64 = 0
+static mut G_FPS_T0: i64 = 0
+static mut G_FPS_N0: i64 = 0
+static mut G_WIN_T0: i64 = 0
+static mut G_AHP: u64 = 0
+static mut G_NET_RUN: bool = false
+static mut G_NET_STEP: usize = 0
+static mut G_CPU_SEEN: i32 = 0
+static mut G_TICKS: u64 = 0
+
+// ---------------------------------------------------------------- helpers
+
+fn dec(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    let s: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+fn dec2(hundredths: i64) -> str {
+    let w: i64 = hundredths / 100
+    let f: i64 = hundredths % 100
+    var fs: str = dec(f)
+    if f < 10 { fs = "0" + fs }
+    return dec(w) + "." + fs
+}
+
+fn app_of() -> *mut app.App { return G_A as *mut app.App }
+
+fn put_str(dst: u64, n: *mut usize, cap: usize, s: str) {
+    var i: usize = 0
+    var k: usize = *n
+    while i < s.n && k < cap {
+        rt.st8(dst, k, rt.ld8(s.p as u64, i))
+        k = k + 1
+        i = i + 1
+    }
+    *n = k
+}
+
+fn put_dec(dst: u64, n: *mut usize, cap: usize, v: i64) {
+    put_str(dst, n, cap, dec(v))
+}
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 as u8 && c <= 90 as u8 { return c + 32 as u8 }
+    return c
+}
+
+// "Item <n>" contains the query (case insensitive)?
+fn matches(n: i64) -> bool {
+    if G_QN == 0 { return true }
+    let t: str = "Item " + dec(n)
+    if G_QN > t.n { return false }
+    var s: usize = 0
+    while s + G_QN <= t.n {
+        var k: usize = 0
+        while k < G_QN && lower(rt.ld8(t.p as u64, s + k)) == lower(G_QUERY[k]) { k = k + 1 }
+        if k == G_QN { return true }
+        s = s + 1
+    }
+    return false
+}
+
+fn refilter(a: *mut app.App) {
+    let q: str = app.text(a, G_FILTER)
+    var n: usize = q.n
+    if n > 64 { n = 64 }
+    var i: usize = 0
+    while i < n {
+        G_QUERY[i] = rt.ld8(q.p as u64, i)
+        i = i + 1
+    }
+    G_QN = n
+    G_NV = 0
+    i = 0
+    while i < G_NI {
+        if matches(G_ITEMS[i]) {
+            G_VIEW[G_NV] = i as u32
+            G_NV = G_NV + 1
+        }
+        i = i + 1
+    }
+    app.vlist_set_count(a, G_LIST, G_NV)
+}
+
+fn shown(a: *mut app.App, n: usize, on: bool, grow: i64) {
+    if n == app.NONE { return }
+    let sc: *mut scene.Scene = app.app_scene(a)
+    scene.node_set_hidden(sc, n, !on)
+    if on {
+        scene.node_set_flexitem(sc, n, grow, grow, 0, 0)
+    } else {
+        scene.node_set_flexitem(sc, n, 0, 0, 0, 1)
+    }
+}
+
+fn stretch(a: *mut app.App, n: usize) {
+    if n == app.NONE { return }
+    scene.node_set_align_self(app.app_scene(a), n, flex.AL_STRETCH)
+}
+
+fn cls(a: *mut app.App, n: usize, k: u32) {
+    if n == app.NONE { return }
+    let r: bool = scene.node_add_class(app.app_scene(a), n, k)
+}
+
+// ---------------------------------------------------------------- theme (same colours as bench/android_kotlin Theme.kt)
+
+fn apply_colors(a: *mut app.App, dark: bool) {
+    let m: *mut theme.Theme = app.app_theme(a)
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    if dark {
+        (*f).base = 0x0c0e1f
+        (*f).surface = 0x15172b
+        (*f).surface_raised = 0x1c1f38
+        (*f).button = 0x15172b
+        (*f).button_hover = 0x1c1f38
+        (*f).button_active = 0x232743
+        (*f).field = 0x232743
+        (*f).field_focus = 0x232743
+        (*f).border_col = 0x3a3f63
+        (*f).separator = 0x15172b
+        (*f).text = 0xe9ebf5
+        (*f).text_muted = 0x9aa0bb
+        (*f).text_disabled = 0x5d6285
+        (*f).text_on_accent = 0xffffff
+        (*f).accent = 0x2f86ff
+        (*f).selection = 0x1f3a66
+        (*f).selection_text = 0xe9ebf5
+    } else {
+        (*f).base = 0xf4f6fb
+        (*f).surface = 0xffffff
+        (*f).surface_raised = 0xebeef7
+        (*f).button = 0xffffff
+        (*f).button_hover = 0xebeef7
+        (*f).button_active = 0xe2e6f2
+        (*f).field = 0xe2e6f2
+        (*f).field_focus = 0xe2e6f2
+        (*f).border_col = 0xb9bfd6
+        (*f).separator = 0xffffff
+        (*f).text = 0x141830
+        (*f).text_muted = 0x5a6283
+        (*f).text_disabled = 0x9a9fb5
+        (*f).text_on_accent = 0xffffff
+        (*f).accent = 0x2f86ff
+        (*f).selection = 0xd6e6ff
+        (*f).selection_text = 0x141830
+    }
+    (*f).err_col = 0xef4444
+    (*f).warning = 0xf59e0b
+    (*f).success = 0x22c55e
+    var s: theme.Shape = theme.shape_fluent()
+    s.r_window = 16
+    s.r_panel = 16
+    s.r_button = 20
+    s.r_field = 4
+    s.font = 14
+    s.pad_x = 24
+    s.pad_y = 10
+    s.gap = 8
+    s.focus_w = 0
+    s.ctrl_h = 40
+    s.row = 48
+    theme.theme_set_shape(m, &s)
+}
+
+fn apply_theme() {
+    let a: *mut app.App = app_of()
+    var dark: bool = true
+    if G_MODE == 1 {
+        dark = false
+    } else if G_MODE == 2 {
+        dark = true
+    } else if G_WIN != 0 as u64 && window.theme_known(G_WIN as *mut window.Window) {
+        dark = window.dark(G_WIN as *mut window.Window)
+    }
+    G_DARK = dark
+    app.set_dark(a, dark)
+    apply_colors(a, dark)
+    if G_TOGGLE != app.NONE { appctl.set_checked(a, G_TOGGLE, dark) }
+}
+
+fn rule(a: *mut app.App, k: u32, st: style.Style) -> usize {
+    return sheet.sheet_rule(&(*a).sh, sheet.sel_class(k), st)
+}
+
+fn tok(t: u32) -> u32 { return style.color_token(t) }
+
+fn install_rules(a: *mut app.App) {
+    var st: style.Style = style.style_new()
+    // Add: filled pill 40 high
+    st = style.style_set_bg(st, tok(style.TOK_ACCENT))
+    st = style.style_set_fg(st, tok(style.TOK_TEXT_ON_ACCENT))
+    st = style.style_set_border(st, tok(style.TOK_ACCENT), 0)
+    st = style.style_set_radius(st, 20)
+    st = style.style_set_pad(st, 24, 10)
+    st = style.style_set_font(st, 0, 14)
+    st = style.style_set_weight(st, 500 as u32)
+    let r1: usize = rule(a, K_FILLED, st)
+    // Clear: outlined pill, accent text
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_BASE))
+    st = style.style_set_fg(st, tok(style.TOK_ACCENT))
+    st = style.style_set_border(st, tok(style.TOK_BORDER), 1)
+    st = style.style_set_radius(st, 20)
+    st = style.style_set_pad(st, 24, 10)
+    st = style.style_set_font(st, 0, 14)
+    st = style.style_set_weight(st, 500 as u32)
+    let r2: usize = rule(a, K_OUTLINE, st)
+    // top bar / bottom bar / root: surface
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_SURFACE))
+    let r3: usize = rule(a, K_BAR, st)
+    let r3b: usize = rule(a, K_ROOT, st)
+    // body: page ground
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_BASE))
+    let r4: usize = rule(a, K_BODY, st)
+    // rotating box 160 x 160, radius 24
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_ACCENT))
+    st = style.style_set_radius(st, 24)
+    st = style.style_set_size(st, 160, 160)
+    let r5: usize = rule(a, K_BOX, st)
+    // the rotation lives in its own rule (changed every frame)
+    var d: sheet.Decl = sheet.decl_new()
+    sheet.decl_set_rotate(&d, 0.0)
+    G_SPIN_RULE = sheet.sheet_add(&(*a).sh, sheet.sel_class(K_SPIN), d)
+    // filter field (filled text field)
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_FIELD))
+    st = style.style_set_radius(st, 4)
+    st = style.style_set_font(st, 0, 16)
+    st = style.style_set_pad(st, 16, 16)
+    let r6: usize = rule(a, K_ENTRY, st)
+    // bottom nav item: flat, label at the bottom, room for the icon above
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_SURFACE))
+    st = style.style_set_fg(st, tok(style.TOK_SURFACE))
+    st = style.style_set_border(st, tok(style.TOK_SURFACE), 0)
+    st = style.style_set_radius(st, 0)
+    st = style.style_set_font(st, 0, 12)
+    st = style.style_set_weight(st, 500 as u32)
+    let r7: usize = rule(a, K_NAV, st)
+    st = style.style_new()
+    st = style.style_set_fg(st, tok(style.TOK_TEXT_MUTED))
+    st = style.style_set_font(st, 0, 14)
+    let r8: usize = rule(a, K_DIM, st)
+    st = style.style_new()
+    st = style.style_set_font(st, 0, 16)
+    st = style.style_set_weight(st, 500 as u32)
+    let r9: usize = rule(a, K_TITLE, st)
+    st = style.style_new()
+    st = style.style_set_font(st, 0, 22)
+    let r10: usize = rule(a, K_BIG, st)
+}
+
+// ---------------------------------------------------------------- list rows
+
+fn icon_tint(n: i64) -> u32 {
+    let k: i64 = n % 5
+    if k == 0 { return 0x2f86ff as u32 }
+    if k == 1 { return 0x22c55e as u32 }
+    if k == 2 { return 0xf59e0b as u32 }
+    if k == 3 { return 0xef4444 as u32 }
+    return 0xa855f7 as u32
+}
+
+fn card_row(ud: u64, i: usize, out: *mut vlist.VRow) {
+    if i >= G_NV { return }
+    let n: i64 = G_ITEMS[G_VIEW[i] as usize]
+    let tp: u64 = (&(*out).text[0]) as u64
+    var k: usize = 0
+    put_str(tp, &k, 192, "Item ")
+    put_dec(tp, &k, 192, n)
+    (*out).n = k
+    let sp: u64 = (&(*out).sub[0]) as u64
+    var q: usize = 0
+    put_str(sp, &q, 96, "Subtitle for item ")
+    put_dec(sp, &q, 96, n)
+    put_str(sp, &q, 96, " — lorem ipsum")
+    (*out).sn = q
+    let dp: u64 = (&(*out).detail[0]) as u64
+    var d: usize = 0
+    put_str(dp, &d, 48, "tag ")
+    put_dec(dp, &d, 48, n % 7)
+    (*out).dn = d
+    (*out).icon = lucide.STAR
+    (*out).tint_on = true
+    (*out).tint = icon_tint(n)
+    (*out).px = 16
+}
+
+fn text_row(ud: u64, i: usize, out: *mut vlist.VRow) {
+    let n: i64 = i as i64 + 1
+    let tp: u64 = (&(*out).text[0]) as u64
+    var k: usize = 0
+    put_str(tp, &k, 192, "Line ")
+    put_dec(tp, &k, 192, n)
+    put_str(tp, &k, 192, ": The quick brown fox jumps over the lazy dog 0123456789")
+    (*out).n = k
+    if n % 2 == 1 { (*out).px = 14 } else { (*out).px = 18 }
+}
+
+// ---------------------------------------------------------------- navigation and timers
+
+fn want16() -> bool {
+    if G_TAB == TAB_LAB && G_SECT == S_ANIM { return true }
+    if bcpu.cpu_running() { return true }
+    if G_AUTOSCROLL && G_TAB == TAB_LIST { return true }
+    return false
+}
+
+fn sync_timer() {
+    let w: bool = want16()
+    let l: *mut loop.Loop = G_LOOP as *mut loop.Loop
+    if w && G_T16 == 0 as u64 {
+        G_FPS_T0 = loop.mono_ms()
+        G_WIN_T0 = G_FPS_T0
+        G_FPS_N0 = 0
+        app.frame_stats_reset()
+        G_T16 = loop.timer_every(l, 16, tick16, 0)
+    } else if !w && G_T16 != 0 as u64 {
+        let c: bool = loop.timer_cancel(l, G_T16)
+        G_T16 = 0 as u64
+    }
+}
+
+fn show_tab(a: *mut app.App, t: usize) {
+    G_TAB = t
+    var k: usize = 0
+    while k < 3 {
+        shown(a, G_P[k], k == t, 1)
+        k = k + 1
+    }
+    let r: u32 = 0 as u32
+    app.vlist_changed(a, G_LIST)
+    sync_timer()
+    fui_touch(a)
+}
+
+fn fui_touch(a: *mut app.App) {
+    app.vlist_changed(a, G_TEXTLIST)
+}
+
+fn show_sect(a: *mut app.App, s: usize) {
+    G_SECT = s
+    var k: usize = 0
+    while k < 4 {
+        shown(a, G_S[k], k == s, 1)
+        k = k + 1
+    }
+    sync_timer()
+    fui_touch(a)
+}
+
+fn tab0(a: *mut app.App) { show_tab(a, TAB_LIST) }
+fn tab1(a: *mut app.App) { show_tab(a, TAB_LAB) }
+fn tab2(a: *mut app.App) { show_tab(a, TAB_SET) }
+
+fn on_seg(a: *mut app.App, id: usize) {
+    show_sect(a, appctl.segmented_selected(a, id))
+}
+
+// ---------------------------------------------------------------- list page actions
+
+fn on_edit(a: *mut app.App, id: usize) {
+    if id == G_FILTER { refilter(a) }
+}
+
+fn on_add(a: *mut app.App) {
+    if G_NI < MAX_ITEMS {
+        G_ITEMS[G_NI] = G_ITEMS[G_NI - 1] + 1
+        G_NI = G_NI + 1
+    }
+    refilter(a)
+}
+
+fn on_clear(a: *mut app.App) {
+    app.set_text(a, G_FILTER, "")
+    refilter(a)
+}
+
+fn on_dark(a: *mut app.App, id: usize) {
+    if appctl.checked(a, id) { G_MODE = 2 } else { G_MODE = 1 }
+    sync_radios(a)
+    apply_theme()
+}
+
+fn sync_radios(a: *mut app.App) {
+    appctl.set_checked(a, G_RADIO[0], G_MODE == 0)
+    appctl.set_checked(a, G_RADIO[1], G_MODE == 1)
+    appctl.set_checked(a, G_RADIO[2], G_MODE == 2)
+}
+
+fn on_radio(a: *mut app.App, id: usize) {
+    if id == G_RADIO[0] { G_MODE = 0 }
+    if id == G_RADIO[1] { G_MODE = 1 }
+    if id == G_RADIO[2] { G_MODE = 2 }
+    apply_theme()
+}
+
+fn on_slider(a: *mut app.App, id: usize) {}
+
+// ---------------------------------------------------------------- Net
+
+fn count_keys(p: u64, n: usize) -> i64 {
+    // top-level keys of a JSON object: strings followed by ':' at depth 1
+    var depth: i64 = 0
+    var keys: i64 = 0
+    var i: usize = 0
+    var instr: bool = false
+    var strstart: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if instr {
+            if c == 92 as u8 { i = i + 1 }
+            else if c == 34 as u8 {
+                instr = false
+                var j: usize = i + 1
+                while j < n && (rt.ld8(p, j) == 32 as u8 || rt.ld8(p, j) == 10 as u8 || rt.ld8(p, j) == 13 as u8) { j = j + 1 }
+                if depth == 1 && j < n && rt.ld8(p, j) == 58 as u8 { keys = keys + 1 }
+            }
+        } else if c == 34 as u8 {
+            instr = true
+            strstart = i
+        } else if c == 123 as u8 || c == 91 as u8 {
+            depth = depth + 1
+        } else if c == 125 as u8 || c == 93 as u8 {
+            depth = depth - 1
+        }
+        i = i + 1
+    }
+    return keys
+}
+
+fn net_start(a: *mut app.App) {
+    if G_NET_RUN { return }
+    G_NET_RUN = true
+    G_NET_STEP = 0
+    app.set_text(a, G_NET[0], "requesting...")
+    app.set_text(a, G_NET[1], "")
+    app.set_text(a, G_NET[2], "")
+    app.set_text(a, G_NET[3], "")
+    net_get("https://httpbin.org/json")
+}
+
+fn net_get(u: str) {
+    let r: *mut ahttp.Request = ahttp.aclient_get_str(G_AHP as *mut ahttp.AClient, u, 8000, net_done, 0)
+}
+
+fn net_done(r: *mut ahttp.Request, ud: u64) {
+    let a: *mut app.App = app_of()
+    let st: i64 = ahttp.areq_status(r) as i64
+    let nb: usize = ahttp.areq_body_len(r)
+    let ms: i64 = ahttp.areq_elapsed_ms(r) as i64
+    if (st < 200 || st > 299) && G_NET_STEP == 0 {
+        G_NET_STEP = 1
+        net_get("https://example.com/")
+        return
+    }
+    var keys: i64 = 0 - 1
+    if st >= 200 && st <= 299 && nb > 0 && rt.ld8(ahttp.areq_body_ptr(r), 0) == 123 as u8 {
+        keys = count_keys(ahttp.areq_body_ptr(r), nb)
+    }
+    if st <= 0 {
+        app.set_text(a, G_NET[0], "status: error")
+    } else {
+        app.set_text(a, G_NET[0], "status: " + dec(st))
+        app.set_text(a, G_NET[1], "bytes: " + dec(nb as i64))
+        app.set_text(a, G_NET[2], "elapsed: " + dec(ms) + " ms")
+        if keys >= 0 { app.set_text(a, G_NET[3], "keys: " + dec(keys)) } else { app.set_text(a, G_NET[3], "keys: -") }
+    }
+    blog.log("BENCH", "net status=" + dec(st) + " bytes=" + dec(nb as i64) + " ms=" + dec(ms))
+    G_NET_RUN = false
+}
+
+fn on_get(a: *mut app.App) { net_start(a) }
+
+// ---------------------------------------------------------------- CPU
+
+fn cpu_labels(a: *mut app.App) {
+    let t: i32 = bcpu.cpu_task()
+    if t == G_CPU_SEEN { return }
+    G_CPU_SEEN = t
+    var k: i32 = 1
+    while k <= 3 {
+        let idx: usize = (k - 1) as usize
+        var name: str = "primes"
+        if k == 2 { name = "sort" }
+        if k == 3 { name = "mandel" }
+        if t > k {
+            app.set_text(a, G_CPU[idx], name + ": " + dec(bcpu.cpu_wall_ms(idx)) + " ms, checksum " + dec(bcpu.cpu_sum(idx)))
+        } else {
+            app.set_text(a, G_CPU[idx], name + ": ...")
+        }
+        k = k + 1
+    }
+}
+
+fn cpu_begin(a: *mut app.App) {
+    if bcpu.cpu_running() { return }
+    G_CPU_SEEN = 0 - 1
+    bcpu.cpu_start()
+    cpu_labels(a)
+    sync_timer()
+}
+
+fn on_run(a: *mut app.App) { cpu_begin(a) }
+
+fn cpu_tick(a: *mut app.App) {
+    if !bcpu.cpu_running() { return }
+    let more: bool = bcpu.cpu_step(8000000 as u64)
+    cpu_labels(a)
+    if !more && bcpu.cpu_finished() {
+        blog.log("BENCH", "cpu primes=" + dec(bcpu.cpu_wall_ms(0)) + ":" + dec(bcpu.cpu_sum(0)) + " sort=" + dec(bcpu.cpu_wall_ms(1)) + ":" + dec(bcpu.cpu_sum(1)) +
+            " mandel=" + dec(bcpu.cpu_wall_ms(2)) + ":" + dec(bcpu.cpu_sum(2)))
+        blog.log("BENCH", "cpu_pure primes=" + dec(bcpu.cpu_pure_ms(0)) + " sort=" + dec(bcpu.cpu_pure_ms(1)) + " mandel=" + dec(bcpu.cpu_pure_ms(2)))
+        G_CPU_SEEN = 0 - 1
+        let t: i32 = bcpu.cpu_task()
+        cpu_labels(a)
+        sync_timer()
+    }
+}
+
+// ---------------------------------------------------------------- 16 ms tick (only while something moves)
+
+fn anim_tick(a: *mut app.App, now: i64) {
+    let deg: f64 = ((now % 2000) as f64) * 0.18
+    sheet.decl_set_rotate(sheet.sheet_decl(&(*a).sh, G_SPIN_RULE), deg)
+    let el: i64 = now - G_FPS_T0
+    if el >= 1000 {
+        let n: i64 = app.frame_stat(app.FS_FRAMES)
+        app.set_text(a, G_FPS, "fps: " + dec(n - G_FPS_N0))
+        G_FPS_N0 = n
+        G_FPS_T0 = now
+        app.set_text(a, G_FRAMEL, "frame ms p95: " + dec2(app.frame_stat(app.FS_IV_P95_US) / 10) + " max: " + dec2(app.frame_stat(app.FS_IV_MAX_US) / 10))
+    }
+    let w: i64 = now - G_WIN_T0
+    if w >= 5000 {
+        let n2: i64 = app.frame_stat(app.FS_FRAMES)
+        let avg10: i64 = n2 * 10000 / w
+        blog.log("BENCH", "fps avg=" + dec2(avg10 * 10) + " p95_ms=" + dec2(app.frame_stat(app.FS_IV_P95_US) / 10) + " max_ms=" + dec2(app.frame_stat(app.FS_IV_MAX_US) / 10) + " frames=" + dec(n2))
+        app.frame_stats_reset()
+        G_FPS_N0 = 0
+        G_FPS_T0 = now
+        G_WIN_T0 = now
+    }
+}
+
+// 0 -> end at constant speed over 5 s, then back, repeated
+fn scroll_tick(a: *mut app.App, now: i64) {
+    let v: *mut vlist.Vlist = app.vlist_model(a, G_LIST)
+    if v as u64 == 0 as u64 { return }
+    let vp: *mut viewport.Viewport = vlist.vl_viewport(v)
+    let mx: f64 = viewport.viewport_max_y(vp)
+    if mx < 1.0 { return }
+    if G_AS_LAST == 0 { G_AS_LAST = now }
+    let dt: f64 = ((now - G_AS_LAST) as f64) / 1000.0
+    G_AS_LAST = now
+    G_AS_POS = G_AS_POS + (G_AS_DIR as f64) * (mx / 5.0) * dt
+    if G_AS_POS >= mx {
+        G_AS_POS = mx
+        G_AS_DIR = 0 - 1
+    }
+    if G_AS_POS <= 0.0 {
+        G_AS_POS = 0.0
+        G_AS_DIR = 1
+    }
+    viewport.viewport_set_offset(vp, 0.0, G_AS_POS)
+    app.vlist_changed(a, G_LIST)
+}
+
+fn tick16(l: *mut loop.Loop, ud: u64) {
+    let a: *mut app.App = app_of()
+    let now: i64 = loop.mono_ms()
+    if G_TAB == TAB_LAB && G_SECT == S_ANIM { anim_tick(a, now) }
+    if G_AUTOSCROLL && G_TAB == TAB_LIST { scroll_tick(a, now) }
+    cpu_tick(a)
+}
+
+// until the first frame is painted: BENCH ready
+fn ready_tick(l: *mut loop.Loop, ud: u64) {
+    if app.frame_stat(app.FS_FRAMES) > 0 {
+        blog.log("BENCH", "ready ms=" + dec(blog.since_start_ms()))
+        let c: bool = loop.timer_cancel(l, G_TREADY)
+        G_TREADY = 0 as u64
+    }
+}
+
+// 1 s: the system theme may arrive after the window opened
+fn slow_tick(l: *mut loop.Loop, ud: u64) {
+    G_TICKS = G_TICKS + 1 as u64
+    if G_TICKS == 1 as u64 || G_TICKS == 2 as u64 { apply_theme() }
+}
+
+fn opened(ud: u64, w: u64) {
+    G_WIN = w
+    apply_theme()
+}
+
+fn hotkey_none(ud: u64, id: u32) {}
+
+// ---------------------------------------------------------------- nav icons: indicator pill + icon above the label
+
+fn nav_paint(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let idx: usize = ud as usize
+    let on: bool = G_TAB == idx
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let side: f64 = render.len_of(c, 24)
+    let cx: f64 = widget.w_x(e) + widget.w_w(e) * 0.5
+    let top: f64 = widget.w_y(e) + render.len_of(c, 10)
+    var col: u32 = render.color_of(c, style.color_token(style.TOK_TEXT_MUTED))
+    if on {
+        let pw: f64 = render.len_of(c, 64)
+        let ph: f64 = render.len_of(c, 32)
+        painter.round_rect(z, cx - pw * 0.5, top - render.len_of(c, 4), pw, ph, ph * 0.5, render.color_of(c, style.color_token(style.TOK_SELECTION)))
+        col = render.color_of(c, style.color_token(style.TOK_TEXT))
+    }
+    var id: i64 = lucide.LIST
+    if idx == 1 { id = lucide.MENU }
+    if idx == 2 { id = lucide.SETTINGS }
+    icons.icon_stroke(z, id, cx - side * 0.5, top, side, col, icons.STROKE_DEFAULT)
+    // label below the icon (the button's own label is painted in the surface colour, it only names the control)
+    var lab: str = "List"
+    if idx == 1 { lab = "Lab" }
+    if idx == 2 { lab = "Settings" }
+    let px: f64 = render.len_of(c, 12)
+    let by: f64 = painter.text_baseline_mid(z, widget.w_y(e) + render.len_of(c, 39), render.len_of(c, 16), px)
+    let x1: f64 = painter.text(z, widget.w_x(e), by, widget.w_w(e), px, col, lab.p as u64, lab.n, painter.TEXT_M)
+}
+
+// ---------------------------------------------------------------- build
+
+fn build_ui(a: *mut app.App) {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let root: usize = app.root(a)
+    scene.node_set_gap(sc, root, 0, 0)
+    scene.node_set_padding(sc, root, 0, 0, 0, 0)
+    cls(a, root, K_ROOT)
+    // app bar
+    let hr: usize = app.row(a)
+    stretch(a, hr)
+    scene.node_set_flex(sc, hr, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_CENTER)
+    scene.node_set_padding(sc, hr, 16, 14, 16, 14)
+    cls(a, hr, K_BAR)
+    let h: usize = app.label(a, "Bench", 0)
+    cls(a, h, K_BIG)
+    app.end(a)
+    // body: three pages
+    let body: usize = app.column(a)
+    scene.node_set_flex(sc, body, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_padding(sc, body, 0, 0, 0, 0)
+    scene.node_set_gap(sc, body, 0, 0)
+    scene.node_set_grow(sc, body, 1, 1)
+    stretch(a, body)
+    cls(a, body, K_BODY)
+    // ---- List page
+    G_P[0] = app.column(a)
+    scene.node_set_flex(sc, G_P[0], flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_padding(sc, G_P[0], 16, 8, 16, 0)
+    scene.node_set_gap(sc, G_P[0], 8, 8)
+    G_FILTER = app.entry(a, "Filter")
+    cls(a, G_FILTER, K_ENTRY)
+    stretch(a, G_FILTER)
+    let br: usize = app.row(a)
+    stretch(a, br)
+    scene.node_set_flex(sc, br, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_CENTER)
+    scene.node_set_gap(sc, br, 8, 8)
+    scene.node_set_padding(sc, br, 0, 0, 0, 0)
+    let b1: usize = app.button(a, "Add", on_add)
+    cls(a, b1, K_FILLED)
+    let b2: usize = app.button(a, "Clear", on_clear)
+    cls(a, b2, K_OUTLINE)
+    let sp: usize = app.spacer(a, 1, 1)
+    scene.node_set_grow(sc, sp, 1, 0)
+    G_TOGGLE = appctl.toggle(a, "Dark", true, on_dark)
+    app.end(a)
+    G_LIST = app.vlist_new(a, "Items", 360, 400, G_NV, card_row, 0)
+    scene.node_set_align_self(sc, G_LIST, flex.AL_STRETCH)
+    scene.node_set_grow(sc, G_LIST, 1, 1)
+    app.vlist_set_row_pt(a, G_LIST, ROW_PT)
+    app.end(a)
+    // ---- Lab page
+    G_P[1] = app.column(a)
+    scene.node_set_flex(sc, G_P[1], flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_padding(sc, G_P[1], 16, 16, 16, 0)
+    scene.node_set_gap(sc, G_P[1], 16, 16)
+    G_SEG = appctl.segmented(a, "Lab section", 379, on_seg)
+    stretch(a, G_SEG)
+    let s0: bool = appctl.segment_add(a, G_SEG, "Anim")
+    let s1: bool = appctl.segment_add(a, G_SEG, "Text")
+    let s2: bool = appctl.segment_add(a, G_SEG, "Net")
+    let s3: bool = appctl.segment_add(a, G_SEG, "CPU")
+    // Anim
+    G_S[0] = app.column(a)
+    scene.node_set_flex(sc, G_S[0], flex.FLEX_COLUMN, flex.JUSTIFY_CENTER, flex.AL_CENTER)
+    scene.node_set_gap(sc, G_S[0], 24, 24)
+    scene.node_set_align_self(sc, G_S[0], flex.AL_STRETCH)
+    scene.node_set_grow(sc, G_S[0], 1, 1)
+    let bx: usize = app.spacer(a, 160, 160)
+    cls(a, bx, K_BOX)
+    cls(a, bx, K_SPIN)
+    G_FPS = app.label(a, "fps: --", 0)
+    cls(a, G_FPS, K_BIG)
+    G_FRAMEL = app.label(a, "frame ms p95: -- max: --", 0)
+    cls(a, G_FRAMEL, K_DIM)
+    app.end(a)
+    // Text
+    G_S[1] = app.column(a)
+    scene.node_set_flex(sc, G_S[1], flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_padding(sc, G_S[1], 0, 0, 0, 0)
+    scene.node_set_align_self(sc, G_S[1], flex.AL_STRETCH)
+    scene.node_set_grow(sc, G_S[1], 1, 1)
+    G_TEXTLIST = app.vlist_new(a, "Text lines", 360, 400, 400, text_row, 0)
+    scene.node_set_align_self(sc, G_TEXTLIST, flex.AL_STRETCH)
+    scene.node_set_grow(sc, G_TEXTLIST, 1, 1)
+    app.vlist_set_row_pt(a, G_TEXTLIST, 28)
+    app.end(a)
+    // Net
+    G_S[2] = app.column(a)
+    scene.node_set_flex(sc, G_S[2], flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_START)
+    scene.node_set_gap(sc, G_S[2], 8, 8)
+    scene.node_set_padding(sc, G_S[2], 0, 0, 0, 0)
+    scene.node_set_align_self(sc, G_S[2], flex.AL_STRETCH)
+    scene.node_set_grow(sc, G_S[2], 1, 1)
+    G_NET_BTN = app.button(a, "GET", on_get)
+    cls(a, G_NET_BTN, K_FILLED)
+    G_NET[0] = app.label(a, "press GET", 16)
+    G_NET[1] = app.label(a, "", 16)
+    G_NET[2] = app.label(a, "", 16)
+    G_NET[3] = app.label(a, "", 16)
+    app.end(a)
+    // CPU
+    G_S[3] = app.column(a)
+    scene.node_set_flex(sc, G_S[3], flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_START)
+    scene.node_set_gap(sc, G_S[3], 16, 16)
+    scene.node_set_padding(sc, G_S[3], 0, 0, 0, 0)
+    scene.node_set_align_self(sc, G_S[3], flex.AL_STRETCH)
+    scene.node_set_grow(sc, G_S[3], 1, 1)
+    G_CPU_BTN = app.button(a, "Run", on_run)
+    cls(a, G_CPU_BTN, K_FILLED)
+    G_CPU[0] = app.label(a, "primes: -", 16)
+    G_CPU[1] = app.label(a, "sort: -", 16)
+    G_CPU[2] = app.label(a, "mandel: -", 16)
+    app.end(a)
+    app.end(a)
+    // ---- Settings page
+    G_P[2] = app.column(a)
+    scene.node_set_flex(sc, G_P[2], flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_START)
+    scene.node_set_padding(sc, G_P[2], 16, 16, 16, 0)
+    scene.node_set_gap(sc, G_P[2], 16, 16)
+    scene.node_set_align_self(sc, G_P[2], flex.AL_STRETCH)
+    let th: usize = app.label(a, "Theme", 0)
+    cls(a, th, K_TITLE)
+    G_RADIO[0] = appctl.radio(a, 1, "System", G_MODE == 0, on_radio)
+    G_RADIO[1] = appctl.radio(a, 1, "Light", G_MODE == 1, on_radio)
+    G_RADIO[2] = appctl.radio(a, 1, "Dark", G_MODE == 2, on_radio)
+    let sl: usize = appctl.slider(a, "Value", 0, 100, 50, on_slider)
+    stretch(a, sl)
+    let ver: usize = app.label(a, "Version 1.0", 0)
+    cls(a, ver, K_DIM)
+    app.end(a)
+    app.end(a)
+    // ---- bottom navigation
+    let nb: usize = app.row(a)
+    stretch(a, nb)
+    scene.node_set_flex(sc, nb, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_gap(sc, nb, 0, 0)
+    scene.node_set_padding(sc, nb, 0, 0, 0, 0)
+    cls(a, nb, K_BAR)
+    G_NAV[0] = app.button(a, "List", tab0)
+    G_NAV[1] = app.button(a, "Lab", tab1)
+    G_NAV[2] = app.button(a, "Settings", tab2)
+    var k: usize = 0
+    while k < 3 {
+        cls(a, G_NAV[k], K_NAV)
+        scene.node_set_grow(sc, G_NAV[k], 1, 1)
+        scene.node_set_padding(sc, G_NAV[k], 4, 38, 4, 10)
+        scene.node_set_draw(sc, G_NAV[k], k as u64, nav_paint)
+        k = k + 1
+    }
+    app.end(a)
+}
+
+fn tab_of(s: str) -> usize {
+    if s == "lab" { return TAB_LAB }
+    if s == "settings" { return TAB_SET }
+    return TAB_LIST
+}
+
+#[allow_escape]
+fn main(start: u64) -> i32 {
+    var i: usize = 0
+    while i < N_ITEMS {
+        G_ITEMS[i] = i as i64 + 1
+        G_VIEW[i] = i as u32
+        i = i + 1
+    }
+    G_NI = N_ITEMS
+    G_NV = N_ITEMS
+    // test hooks
+    let th: str = intentx.ix_str("theme", "")
+    if th == "light" { G_MODE = 1 } else if th == "dark" { G_MODE = 2 }
+    let tab: usize = tab_of(intentx.ix_str("tab", "list"))
+    let lab: str = intentx.ix_str("lab", "anim")
+    var sect: usize = S_ANIM
+    if lab == "text" { sect = S_TEXT } else if lab == "net" { sect = S_NET } else if lab == "cpu" { sect = S_CPU }
+    let autorun: bool = intentx.ix_bool("autorun", false)
+    G_AUTOSCROLL = intentx.ix_int("autoscroll", 0) != 0
+
+    var l: loop.Loop = loop.loop_new()
+    if !loop.loop_init(&l) { return 2 }
+    G_LOOP = (&l) as u64
+    let a: *mut app.App = app.window("Bench Firn", 411, 914)
+    G_A = a as u64
+    app.follow_host(a, true, false)
+    install_rules(a)
+    G_TOGGLE = app.NONE
+    apply_colors(a, G_MODE != 1)
+    app.frame_stats_on(true)
+    build_ui(a)
+    app.on_edit(a, on_edit)
+    app.set_window_hooks(a, 0, opened, hotkey_none)
+    looppump.attach(a, &l)
+    var ah: ahttp.AClient = ahttp.aclient_new()
+    G_AHP = (&ah) as u64
+    let ok: bool = ahttp.aclient_init(&ah, &l)
+    apply_theme()
+    sync_radios(a)
+    show_tab(a, tab)
+    show_sect(a, sect)
+    appctl.set_segmented_selected(a, G_SEG, sect)
+    if autorun {
+        if sect == S_NET { net_start(a) }
+        if sect == S_CPU { cpu_begin(a) }
+    }
+    G_TREADY = loop.timer_every(&l, 20, ready_tick, 0)
+    let t1: u64 = loop.timer_every(&l, 1000, slow_tick, 0)
+    sync_timer()
+    let rc: i32 = app.run(a)
+    return rc
+}
