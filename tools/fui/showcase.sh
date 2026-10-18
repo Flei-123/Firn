@@ -71,6 +71,10 @@ done
 "$FIRNC" --opt-level=dev -o "$T/wave7" tools/fui/wave7_main.fi
 "$T/wave7" "$T/img" > /dev/null
 
+# WAVE 8 (lib/fui/wave8.fi): spinner, time picker, breadcrumb, info bar, stepper -- light, dark
+"$FIRNC" --opt-level=dev -o "$T/wave8" tools/fui/wave8_main.fi
+"$T/wave8" "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/

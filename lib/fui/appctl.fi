@@ -85,6 +85,7 @@ import fui.wave5
 import fui.wave6
 import fui.wave7
 import fui.timeline
+import fui.wave8
 import fui.a11y
 import fui.action
 import fui.ctxmenu
@@ -115,6 +116,10 @@ export {
     range_slider, range_lo, range_hi, set_range_values, range_focus_thumb,
     timeline, timeline_ref, timeline_play, timeline_pause, timeline_stop, timeline_value, timeline_playing, timeline_finished,
     timeline_reduced, TL_APP,
+    spinner, spinner_on, spinner_is_on, timepicker, timepicker_hour, timepicker_minute, set_time,
+    breadcrumb, breadcrumb_add, breadcrumb_clear, breadcrumb_event, BREADCRUMB_OVERFLOW,
+    infobar, infobar_action, infobar_closable, infobar_event, infobar_open, infobar_show,
+    stepper, stepper_add, stepper_current, stepper_set,
     ripple_on, split_begin, split_mid, split_end, split_ratio, split_set_ratio, split_limits, split_hovered, split_dragging,
     ANS_OK, ANS_CANCEL,
     CTL_MAX, OPT_MAX, NONE,
@@ -1528,6 +1533,9 @@ fn wake_tick(ud: u64, now: i64) -> bool {
     if w5_tick(c, now) {
         return true
     }
+    if w8_tick(c, now) {
+        return true
+    }
     if sh_tick(c, now) {
         return true
     }
@@ -1558,6 +1566,9 @@ fn wake_wait(ud: u64, now: i64) -> i64 {
     }
     if w5_busy(c) {
         return 16
+    }
+    if w8_busy(c) {
+        return 33
     }
     if sh_busy(c) {
         return 16
@@ -1979,6 +1990,7 @@ fn sync(c: *mut Ctl) {
 fn is_focus_kind(k: u32) -> bool {
     return k == K_SLIDER || k == K_RADIO || k == K_TAB || k == K_SPIN || k == K_DROP
     || k == K_RATING || k == K_SEG || k == K_CHIPS || k == K_PAGER || k == K_PGRID || k == K_RANGE
+    || k == K_TIMEP || k == K_CRUMB || k == K_INFOB || k == K_STEPPER
 }
 
 // move the keyboard focus to a node
@@ -2084,6 +2096,9 @@ fn ctl_key(ud: u64, key: u32, mods: u32) -> bool {
     if is_w5_kind(k) {
         return w5_key(c, i, key)
     }
+    if is_w8_kind(k) {
+        return w8_key(c, i, key)
+    }
     if k == K_PGRID {
         return w6_key(c, i, key)
     }
@@ -2180,6 +2195,9 @@ fn ctl_chr(ud: u64, cp: u32, mods: u32) -> bool {
         touch(c)
         return true
     }
+    if w8_chr(c, cp, mods) {
+        return true
+    }
     if menuview.mv_is_open(mv_of(c)) {
         return false
     }
@@ -2206,6 +2224,9 @@ fn ctl_ptr(ud: u64, kind: u32, x: f64, y: f64) -> bool {
         if w6_wheel(c, y) {
             return true
         }
+        if w8_wheel(c, y) {
+            return true
+        }
     } else {
         (*c).px = x
         (*c).py = y
@@ -2230,6 +2251,9 @@ fn ctl_ptr(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     }
     ripple_ptr(c, kind, x, y)
     var w5r: bool = w5_ptr(c, kind, x, y)
+    if w8_ptr(c, kind, x, y) {
+        w5r = true
+    }
     if w6_ptr(c, kind, x, y) {
         w5r = true
     }
@@ -2263,7 +2287,9 @@ fn ctl_act(ud: u64, node: usize) {
     if i == NONE {
         return
     }
-    if is_w5_kind((*c).kind[i]) {
+    if is_w8_kind((*c).kind[i]) {
+        w8_act(c, i)
+    } else if is_w5_kind((*c).kind[i]) {
         w5_act(c, i)
     } else if (*c).kind[i] == K_PGRID {
         w6_act(c, i)
@@ -2575,7 +2601,7 @@ fn ripple_ptr(c: *mut Ctl, kind: u32, x: f64, y: f64) {
             return
         }
         let wi: usize = find(c, n)
-        if wi != NONE && (is_w5_kind((*c).kind[wi]) || (*c).kind[wi] == K_PGRID) {
+        if wi != NONE && (is_w5_kind((*c).kind[wi]) || is_w8_kind((*c).kind[wi]) || (*c).kind[wi] == K_PGRID) {
             return
         }
         (*c).rp_node = n
@@ -4669,4 +4695,764 @@ fn tl_busy(c: *mut Ctl) -> bool {
         i = i + 1
     }
     return false
+}
+
+// ============================================================ WAVE 8 CONTROLS (r45 wiring)
+//
+// Spinner, time picker, breadcrumb, info bar and stepper of lib/fui/wave8.fi in the ten-line API. Each is ONE node
+// (a focusable one where keys make sense); the state lives in a heap `W8` next to the node.
+//
+//     let sp: usize = appctl.spinner(a, "Loading", 32)            // still when theme motion is 0 / reduced motion
+//     appctl.spinner_on(a, sp, false)                              // program side: hide the busy ring
+//     let tp: usize = appctl.timepicker(a, "Alarm", 160, 7, 30, 5, true, changed)   // h, m, minute step, 24 h
+//     appctl.timepicker_hour(a, tp)  appctl.timepicker_minute(a, tp)  appctl.set_time(a, tp, 18, 45)
+//     let bc: usize = appctl.breadcrumb(a, "Path", 320, changed)
+//     appctl.breadcrumb_add(a, bc, "Home")  appctl.breadcrumb_event(a, bc)   // crumb index or BREADCRUMB_OVERFLOW
+//     let ib: usize = appctl.infobar(a, wave8.IB_WARNING, "Low disk", "Only 2 GB left", 420, changed)
+//     appctl.infobar_action(a, ib, "Clean up")  appctl.infobar_event(a, ib)  // IB_PART_ACTION / IB_PART_CLOSE
+//     let st: usize = appctl.stepper(a, "Setup", 420, changed)
+//     appctl.stepper_add(a, st, "Account")  appctl.stepper_current(a, st)  appctl.stepper_set(a, st, 1, 2)
+//
+// `changed(a, id)` runs when the USER changed the control (the program setters do not call it). The a11y tree gets a
+// value / description: time "07:30", path "Home > Mods > Fabric", step "Step 2 of 4: Mods", bar title + message.
+// HONEST (wave 8): the closed info bar is hidden and gives back role / name; digits of the time picker come through
+// the character hook (typed digits), the wheel acts on the field under the pointer; no seconds, one-line info bar.
+
+const K_BUSY: u32 = 24
+const K_TIMEP: u32 = 25
+const K_CRUMB: u32 = 26
+const K_INFOB: u32 = 27
+const K_STEPPER: u32 = 28
+const NO8: usize = 1000
+const BREADCRUMB_OVERFLOW: usize = 999
+
+struct W8 {
+    on: bool,
+    hov: usize, // hovered part (NO8 = none)
+    foc: usize, // focused part (NO8 = default)
+    ev: usize, // the last event (crumb / info bar part)
+    cur: usize,
+    reach: usize,
+    tp: wave8.Time,
+    cr: wave8.Crumbs,
+    ib: wave8.InfoBar,
+    sp: wave8.Steps,
+    name: str,
+    role: u32,
+    dn: usize,
+    desc: [u8; 192],
+}
+
+fn is_w8_kind(k: u32) -> bool {
+    return k >= K_BUSY && k <= K_STEPPER
+}
+
+fn w8_of(c: *mut Ctl, i: usize) -> *mut W8 {
+    return (*c).aux[i] as *mut W8
+}
+
+fn w8_idx(a: *mut app.App, id: usize, kind: u32) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return NONE }
+    let i: usize = find(c, id)
+    if i == NONE || (*c).kind[i] != kind {
+        return NONE
+    }
+    return i
+}
+
+fn w8_put(w: *mut W8, p: u64, n: usize) {
+    var k: usize = 0
+    while k < n && (*w).dn < 188 {
+        (*w).desc[(*w).dn] = *((p + k as u64) as *mut u8)
+        (*w).dn = (*w).dn + 1
+        k = k + 1
+    }
+}
+
+fn w8_str(w: *mut W8, s: str) {
+    w8_put(w, s.p as u64, s.n)
+}
+
+fn w8_num(w: *mut W8, v: usize) {
+    var buf: [u8; 24] = [0 as u8; 24]
+    var tmp: [u8; 24] = [0 as u8; 24]
+    var m: usize = v
+    var k: usize = 0
+    if m == 0 {
+        tmp[0] = 48 as u8
+        k = 1
+    }
+    while m > 0 && k < 20 {
+        tmp[k] = (48 + m % 10) as u8
+        m = m / 10
+        k = k + 1
+    }
+    var j: usize = 0
+    while j < k {
+        buf[j] = tmp[k - 1 - j]
+        j = j + 1
+    }
+    w8_put(w, (&buf[0]) as u64, k)
+}
+
+// value + description for the screen reader, from the state
+fn w8_sync(c: *mut Ctl, i: usize) {
+    let w: *mut W8 = w8_of(c, i)
+    let k: u32 = (*c).kind[i]
+    let ax: *mut a11y.A11y = app.ax((*c).a)
+    (*w).dn = 0
+    if k == K_TIMEP {
+        var f: usize = 0
+        while f < wave8.tp_fields(&(*w).tp) {
+            var tb: [u8; 24] = [0 as u8; 24]
+            let n: usize = wave8.tp_text(&(*w).tp, f, &tb)
+            if f == wave8.TP_AMPM {
+                w8_str(w, " ")
+            } else if f > 0 {
+                w8_str(w, ":")
+            }
+            w8_put(w, (&tb[0]) as u64, n)
+            f = f + 1
+        }
+        widget.w_set_value(wid(c, i), (((*w).tp.h * 60 + (*w).tp.m) * 1000 / 1440) as i64)
+    } else if k == K_CRUMB {
+        var j: usize = 0
+        while j < (*w).cr.n {
+            if j > 0 {
+                w8_str(w, " > ")
+            }
+            w8_str(w, (*w).cr.label[j])
+            j = j + 1
+        }
+    } else if k == K_INFOB {
+        if (*w).ib.severity == wave8.IB_ERROR {
+            w8_str(w, "Error. ")
+        } else if (*w).ib.severity == wave8.IB_WARNING {
+            w8_str(w, "Warning. ")
+        } else if (*w).ib.severity == wave8.IB_SUCCESS {
+            w8_str(w, "Success. ")
+        }
+        w8_str(w, (*w).ib.message)
+        if (*w).ib.action.n > 0 {
+            w8_str(w, ". Action: ")
+            w8_str(w, (*w).ib.action)
+        }
+    } else if k == K_STEPPER {
+        w8_str(w, "Step ")
+        w8_num(w, (*w).cur + 1)
+        w8_str(w, " of ")
+        w8_num(w, (*w).sp.n)
+        if (*w).cur < (*w).sp.n {
+            w8_str(w, ": ")
+            w8_str(w, (*w).sp.label[(*w).cur])
+        }
+        var pm: usize = 0
+        if (*w).sp.n > 1 {
+            pm = (*w).cur * 1000 / ((*w).sp.n - 1)
+        }
+        widget.w_set_value(wid(c, i), pm as i64)
+    }
+    if (*w).dn > 0 && (*w).on {
+        a11y.a11y_set_description(ax, (*c).node[i], (&(*w).desc[0]) as u64, (*w).dn)
+    } else {
+        a11y.a11y_set_description(ax, (*c).node[i], 0, 0)
+    }
+}
+
+fn w8_make(a: *mut app.App, kind: u32, wpt: usize, hpt: usize, focusable: bool, name: str, role: u32,
+    on_change: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return NONE
+    }
+    let p: u64 = rt.heap_alloc(2048)
+    if p == 0 {
+        return NONE
+    }
+    *(p as *mut W8) = W8 { on: true, hov: NO8, foc: NO8, ev: NO8, cur: 0, reach: 0,
+        tp: wave8.tp_new(0, 0, 1, true), cr: wave8.crumbs_new(), ib: wave8.infobar_new(wave8.IB_INFO, "", ""),
+        sp: wave8.steps_new(), name: name, role: role, dn: 0, desc: [0 as u8; 192] }
+    var wk: u32 = widget.KIND_NONE
+    if focusable {
+        wk = widget.KIND_BUTTON
+    }
+    let node: usize = app.custom(a, wk, wpt, hpt)
+    if node == NONE {
+        return NONE
+    }
+    (*scene.nd(sc_of(c), node)).no_fill = 1 as u32
+    let i: usize = add_entry(c, kind, node)
+    (*c).aux[i] = p as usize
+    set_cb(c, i, on_change)
+    scene.node_set_draw(sc_of(c), node, c as u64, w8_draw)
+    a11y.a11y_set_role(app.ax(a), node, role)
+    name_node(c, node, name)
+    return node
+}
+
+fn w8_noop(a: *mut app.App, id: usize) {
+}
+
+fn w8_top(h: f64, ch: f64) -> f64 {
+    if h > ch {
+        return (h - ch) / 2.0
+    }
+    return 0.0
+}
+
+fn spinner(a: *mut app.App, name: str, size_pt: usize) -> usize {
+    let node: usize = w8_make(a, K_BUSY, size_pt, size_pt, false, name, a11y.ROLE_PROGRESSBAR, w8_noop)
+    return node
+}
+
+fn spinner_on(a: *mut app.App, id: usize, on: bool) {
+    let i: usize = w8_idx(a, id, K_BUSY)
+    if i == NONE { return }
+    (*w8_of(st(a), i)).on = on
+    touch(st(a))
+}
+
+fn spinner_is_on(a: *mut app.App, id: usize) -> bool {
+    let i: usize = w8_idx(a, id, K_BUSY)
+    if i == NONE { return false }
+    return (*w8_of(st(a), i)).on
+}
+
+fn timepicker(a: *mut app.App, name: str, wpt: usize, h: i64, m: i64, step: i64, h24: bool,
+    on_change: fn(*mut app.App, usize)) -> usize {
+    let node: usize = w8_make(a, K_TIMEP, wpt, 36, true, name, a11y.ROLE_GENERIC, on_change)
+    if node == NONE {
+        return NONE
+    }
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, node)
+    (*w8_of(c, i)).tp = wave8.tp_new(h, m, step, h24)
+    w8_sync(c, i)
+    return node
+}
+
+fn timepicker_hour(a: *mut app.App, id: usize) -> i64 {
+    let i: usize = w8_idx(a, id, K_TIMEP)
+    if i == NONE { return 0 }
+    return (*w8_of(st(a), i)).tp.h
+}
+
+fn timepicker_minute(a: *mut app.App, id: usize) -> i64 {
+    let i: usize = w8_idx(a, id, K_TIMEP)
+    if i == NONE { return 0 }
+    return (*w8_of(st(a), i)).tp.m
+}
+
+// program side: does not call `changed`
+fn set_time(a: *mut app.App, id: usize, h: i64, m: i64) {
+    let i: usize = w8_idx(a, id, K_TIMEP)
+    if i == NONE { return }
+    let c: *mut Ctl = st(a)
+    wave8.tp_set(&(*w8_of(c, i)).tp, h, m)
+    w8_sync(c, i)
+    touch(c)
+}
+
+fn breadcrumb(a: *mut app.App, name: str, wpt: usize, on_change: fn(*mut app.App, usize)) -> usize {
+    return w8_make(a, K_CRUMB, wpt, 32, true, name, a11y.ROLE_GROUP, on_change)
+}
+
+fn breadcrumb_add(a: *mut app.App, id: usize, label: str) -> bool {
+    let i: usize = w8_idx(a, id, K_CRUMB)
+    if i == NONE { return false }
+    let c: *mut Ctl = st(a)
+    let ok: bool = wave8.crumbs_add(&(*w8_of(c, i)).cr, label)
+    w8_sync(c, i)
+    touch(c)
+    return ok
+}
+
+// program side: drop every crumb (rebuild the path with breadcrumb_add)
+fn breadcrumb_clear(a: *mut app.App, id: usize) {
+    let i: usize = w8_idx(a, id, K_CRUMB)
+    if i == NONE { return }
+    let c: *mut Ctl = st(a)
+    (*w8_of(c, i)).cr = wave8.crumbs_new()
+    (*w8_of(c, i)).foc = NO8
+    w8_sync(c, i)
+    touch(c)
+}
+
+// the crumb the user clicked / activated last: its index or BREADCRUMB_OVERFLOW
+fn breadcrumb_event(a: *mut app.App, id: usize) -> usize {
+    let i: usize = w8_idx(a, id, K_CRUMB)
+    if i == NONE { return NONE }
+    return (*w8_of(st(a), i)).ev
+}
+
+fn infobar(a: *mut app.App, severity: u32, title: str, message: str, wpt: usize,
+    on_change: fn(*mut app.App, usize)) -> usize {
+    var role: u32 = a11y.ROLE_STATUS
+    if severity == wave8.IB_ERROR {
+        role = a11y.ROLE_ALERTDIALOG
+    }
+    let node: usize = w8_make(a, K_INFOB, wpt, 48, true, title, role, on_change)
+    if node == NONE {
+        return NONE
+    }
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, node)
+    (*w8_of(c, i)).ib = wave8.infobar_new(severity, title, message)
+    w8_sync(c, i)
+    return node
+}
+
+fn infobar_action(a: *mut app.App, id: usize, label: str) {
+    let i: usize = w8_idx(a, id, K_INFOB)
+    if i == NONE { return }
+    let c: *mut Ctl = st(a)
+    (*w8_of(c, i)).ib.action = label
+    w8_sync(c, i)
+    touch(c)
+}
+
+fn infobar_closable(a: *mut app.App, id: usize, on: bool) {
+    let i: usize = w8_idx(a, id, K_INFOB)
+    if i == NONE { return }
+    (*w8_of(st(a), i)).ib.closable = on
+    touch(st(a))
+}
+
+// the part the user used last: wave8.IB_PART_ACTION or IB_PART_CLOSE (the bar hides itself on close)
+fn infobar_event(a: *mut app.App, id: usize) -> u32 {
+    let i: usize = w8_idx(a, id, K_INFOB)
+    if i == NONE { return 0 as u32 }
+    return (*w8_of(st(a), i)).ev as u32
+}
+
+fn infobar_open(a: *mut app.App, id: usize) -> bool {
+    let i: usize = w8_idx(a, id, K_INFOB)
+    if i == NONE { return false }
+    return (*w8_of(st(a), i)).on
+}
+
+// program side: show or hide the bar (a hidden bar gives back its role and name)
+fn infobar_show(a: *mut app.App, id: usize, on: bool) {
+    let i: usize = w8_idx(a, id, K_INFOB)
+    if i == NONE { return }
+    let c: *mut Ctl = st(a)
+    let w: *mut W8 = w8_of(c, i)
+    (*w).on = on
+    scene.node_set_hidden(sc_of(c), id, !on)
+    let ax: *mut a11y.A11y = app.ax(a)
+    if on {
+        a11y.a11y_set_role(ax, id, (*w).role)
+        name_node(c, id, (*w).name)
+    } else {
+        a11y.a11y_set_role(ax, id, a11y.ROLE_GENERIC)
+        a11y.a11y_set_name(ax, id, 0, 0)
+    }
+    w8_sync(c, i)
+    touch(c)
+}
+
+fn stepper(a: *mut app.App, name: str, wpt: usize, on_change: fn(*mut app.App, usize)) -> usize {
+    return w8_make(a, K_STEPPER, wpt, 56, true, name, a11y.ROLE_GROUP, on_change)
+}
+
+fn stepper_add(a: *mut app.App, id: usize, label: str) -> bool {
+    let i: usize = w8_idx(a, id, K_STEPPER)
+    if i == NONE { return false }
+    let c: *mut Ctl = st(a)
+    let ok: bool = wave8.steps_add(&(*w8_of(c, i)).sp, label)
+    w8_sync(c, i)
+    touch(c)
+    return ok
+}
+
+fn stepper_current(a: *mut app.App, id: usize) -> usize {
+    let i: usize = w8_idx(a, id, K_STEPPER)
+    if i == NONE { return NONE }
+    return (*w8_of(st(a), i)).cur
+}
+
+// program side: the active step and the furthest step the user may click to (a linear wizard: current + 1)
+fn stepper_set(a: *mut app.App, id: usize, current: usize, max_reach: usize) {
+    let i: usize = w8_idx(a, id, K_STEPPER)
+    if i == NONE { return }
+    let c: *mut Ctl = st(a)
+    let w: *mut W8 = w8_of(c, i)
+    if current < (*w).sp.n {
+        (*w).cur = current
+    }
+    (*w).reach = max_reach
+    if (*w).reach < (*w).cur {
+        (*w).reach = (*w).cur
+    }
+    w8_sync(c, i)
+    touch(c)
+}
+
+fn w8_busy_on(c: *mut Ctl, i: usize) -> bool {
+    return (*c).kind[i] == K_BUSY && (*w8_of(c, i)).on && motion_of(c) > 0 && !app.app_reduced_motion((*c).a)
+    && !scene.node_hidden(sc_of(c), (*c).node[i])
+}
+
+// the effective focus part of a crumb bar / info bar
+fn w8_cr_focus(w: *mut W8) -> usize {
+    if (*w).foc != NO8 {
+        return (*w).foc
+    }
+    if (*w).cr.n == 0 {
+        return wave8.BC_NONE
+    }
+    return (*w).cr.n - 1
+}
+
+fn w8_ib_parts(w: *mut W8, out: *mut [u32; 2]) -> usize {
+    var n: usize = 0
+    if (*w).ib.action.n > 0 {
+        (*out)[n] = wave8.IB_PART_ACTION
+        n = n + 1
+    }
+    if (*w).ib.closable {
+        (*out)[n] = wave8.IB_PART_CLOSE
+        n = n + 1
+    }
+    return n
+}
+
+fn w8_ib_focus(w: *mut W8) -> u32 {
+    var ps: [u32; 2] = [0 as u32; 2]
+    let n: usize = w8_ib_parts(w, &ps)
+    if n == 0 {
+        return wave8.IB_PART_NONE
+    }
+    if (*w).foc != NO8 {
+        var k: usize = 0
+        while k < n {
+            if ps[k] == (*w).foc as u32 {
+                return ps[k]
+            }
+            k = k + 1
+        }
+    }
+    return ps[0]
+}
+
+fn w8_draw(ud: u64, rc: *mut render.Ctx, e: *mut widget.Widget) {
+    let c: *mut Ctl = ud as *mut Ctl
+    var i: usize = 0
+    while i < (*c).n {
+        if is_w8_kind((*c).kind[i]) && wid(c, i) == e {
+            break
+        }
+        i = i + 1
+    }
+    if i >= (*c).n {
+        return
+    }
+    let w: *mut W8 = w8_of(c, i)
+    let k: u32 = (*c).kind[i]
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let wd: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let focused: bool = app.focus((*c).a) == (*c).node[i]
+    if k == K_BUSY {
+        if !(*w).on {
+            return
+        }
+        var d: f64 = wave8.spinner_size(rc)
+        if d > h { d = h }
+        if d > wd { d = wd }
+        var t: i64 = fuiwirt.host_now(app.app_host((*c).a))
+        if motion_of(c) == 0 || app.app_reduced_motion((*c).a) {
+            t = 0 - 1
+        }
+        wave8.spinner_draw(rc, x + (wd - d) / 2.0, y + (h - d) / 2.0, d, t, kit.tokc(rc, style.TOK_TEXT))
+    } else if k == K_TIMEP {
+        var hv: usize = wave8.TP_NONE
+        if (*w).hov != NO8 { hv = (*w).hov }
+        wave8.tp_draw(rc, &(*w).tp, x, y + w8_top(h, wave8.tp_height(rc)), hv, focused, !widget.w_is_disabled(e))
+    } else if k == K_CRUMB {
+        var fp: usize = wave8.BC_NONE
+        if focused { fp = w8_cr_focus(w) }
+        wave8.bc_draw(rc, &(*w).cr, x, y + w8_top(h, wave8.bc_height(rc)), wd, (*w).hov, fp)
+    } else if k == K_INFOB {
+        if !(*w).on {
+            return
+        }
+        var hp: u32 = wave8.IB_PART_NONE
+        if (*w).hov != NO8 { hp = (*w).hov as u32 }
+        var fp2: u32 = wave8.IB_PART_NONE
+        if focused { fp2 = w8_ib_focus(w) }
+        wave8.ib_draw(rc, &(*w).ib, x, y + w8_top(h, wave8.ib_height(rc)), wd, hp, fp2)
+    } else if k == K_STEPPER {
+        var hs: usize = wave8.STEP_NONE
+        if (*w).hov != NO8 { hs = (*w).hov }
+        var fs: usize = wave8.STEP_NONE
+        if focused { fs = (*w).cur }
+        wave8.stepper_draw(rc, &(*w).sp, (*w).cur, x, y + w8_top(h, wave8.stepper_height(rc)), wd, hs, fs)
+    }
+}
+
+// the part of entry `i` under (x, y), as a W8 hover value
+fn w8_hit(c: *mut Ctl, i: usize, x: f64, y: f64) -> usize {
+    let w: *mut W8 = w8_of(c, i)
+    let rc: *mut render.Ctx = app.app_ctx((*c).a)
+    let sc: *mut scene.Scene = sc_of(c)
+    let nd: usize = (*c).node[i]
+    let nx: f64 = scene.node_x(sc, nd)
+    let nw: f64 = scene.node_w(sc, nd)
+    let nh: f64 = scene.node_h(sc, nd)
+    let ny: f64 = scene.node_y(sc, nd)
+    let k: u32 = (*c).kind[i]
+    if k == K_TIMEP {
+        let f: usize = wave8.tp_hit(rc, &(*w).tp, nx, ny + w8_top(nh, wave8.tp_height(rc)), x, y)
+        if f == wave8.TP_NONE { return NO8 }
+        return f
+    }
+    if k == K_CRUMB {
+        return wave8.bc_hit(rc, &(*w).cr, nx, ny + w8_top(nh, wave8.bc_height(rc)), nw, x, y)
+    }
+    if k == K_INFOB {
+        if !(*w).on { return NO8 }
+        let p: u32 = wave8.ib_hit(rc, &(*w).ib, nx, ny + w8_top(nh, wave8.ib_height(rc)), nw, x, y)
+        if p == wave8.IB_PART_NONE { return NO8 }
+        return p as usize
+    }
+    if k == K_STEPPER {
+        let s: usize = wave8.stepper_hit(rc, &(*w).sp, nx, ny + w8_top(nh, wave8.stepper_height(rc)), nw, x, y)
+        if s == wave8.STEP_NONE { return NO8 }
+        return s
+    }
+    return NO8
+}
+
+fn w8_clear_hover(c: *mut Ctl, keep: usize) -> bool {
+    var ch: bool = false
+    var i: usize = 0
+    while i < (*c).n {
+        if is_w8_kind((*c).kind[i]) && i != keep {
+            let w: *mut W8 = w8_of(c, i)
+            if (*w).hov != NO8 {
+                (*w).hov = NO8
+                ch = true
+            }
+        }
+        i = i + 1
+    }
+    return ch
+}
+
+// pointer events for the wave 8 nodes; true = repaint
+fn w8_ptr(c: *mut Ctl, kind: u32, x: f64, y: f64) -> bool {
+    if kind == fuiwirt.HOOK_LEAVE {
+        return w8_clear_hover(c, NONE)
+    }
+    let sc: *mut scene.Scene = sc_of(c)
+    var node: usize = scene.scene_hit(sc, x, y)
+    var i: usize = NONE
+    if node != NONE && node < scene.scene_count(sc) {
+        i = find(c, node)
+    }
+    if i != NONE && !is_w8_kind((*c).kind[i]) {
+        i = NONE
+    }
+    var ch: bool = w8_clear_hover(c, i)
+    if i == NONE {
+        return ch
+    }
+    let w: *mut W8 = w8_of(c, i)
+    let hv: usize = w8_hit(c, i, x, y)
+    if hv != (*w).hov {
+        (*w).hov = hv
+        ch = true
+    }
+    if kind != fuiwirt.HOOK_DOWN || hv == NO8 {
+        return ch
+    }
+    let k: u32 = (*c).kind[i]
+    if k == K_TIMEP {
+        wave8.tp_focus(&(*w).tp, hv)
+    } else if k == K_CRUMB {
+        (*w).ev = hv
+        (*w).foc = hv
+        fire(c, i)
+    } else if k == K_INFOB {
+        (*w).foc = hv
+        w8_ib_use(c, i, hv as u32)
+    } else if k == K_STEPPER {
+        if hv < (*w).sp.n && hv <= (*w).reach && hv != (*w).cur {
+            (*w).cur = hv
+            w8_sync(c, i)
+            fire(c, i)
+        }
+    }
+    touch(c)
+    return true
+}
+
+// the action / close part of an info bar used (by click or key)
+fn w8_ib_use(c: *mut Ctl, i: usize, part: u32) {
+    let w: *mut W8 = w8_of(c, i)
+    if part == wave8.IB_PART_ACTION && (*w).ib.action.n > 0 {
+        (*w).ev = wave8.IB_PART_ACTION as usize
+        fire(c, i)
+    } else if part == wave8.IB_PART_CLOSE && (*w).ib.closable {
+        (*w).ev = wave8.IB_PART_CLOSE as usize
+        let ax: *mut a11y.A11y = app.ax((*c).a)
+        (*w).on = false
+        (*w).foc = NO8
+        scene.node_set_hidden(sc_of(c), (*c).node[i], true)
+        a11y.a11y_set_role(ax, (*c).node[i], a11y.ROLE_GENERIC)
+        a11y.a11y_set_name(ax, (*c).node[i], 0, 0)
+        w8_sync(c, i)
+        fire(c, i)
+    }
+}
+
+fn w8_key(c: *mut Ctl, i: usize, key: u32) -> bool {
+    let w: *mut W8 = w8_of(c, i)
+    let k: u32 = (*c).kind[i]
+    if k == K_TIMEP {
+        let used: bool = key == editor.KEY_LEFT || key == editor.KEY_RIGHT || key == editor.KEY_UP
+        || key == editor.KEY_DOWN || key == editor.KEY_HOME || key == editor.KEY_END
+        if !used {
+            return false
+        }
+        if wave8.tp_key(&(*w).tp, key) {
+            w8_sync(c, i)
+            fire(c, i)
+        }
+        touch(c)
+        return true
+    }
+    if k == K_CRUMB {
+        var dir: i64 = 0
+        if key == editor.KEY_RIGHT { dir = 1 }
+        if key == editor.KEY_LEFT { dir = 0 - 1 }
+        if kit.kit_rtl() { dir = 0 - dir }
+        if dir == 0 {
+            return false
+        }
+        let rc: *mut render.Ctx = app.app_ctx((*c).a)
+        let nw: f64 = scene.node_w(sc_of(c), (*c).node[i])
+        let nf: usize = wave8.bc_focus_step(rc, &(*w).cr, nw, w8_cr_focus(w), dir)
+        if nf == wave8.BC_NONE || nf == (*w).foc {
+            return false
+        }
+        (*w).foc = nf
+        touch(c)
+        return true
+    }
+    if k == K_INFOB {
+        if key == editor.KEY_ESC && (*w).ib.closable {
+            w8_ib_use(c, i, wave8.IB_PART_CLOSE)
+            touch(c)
+            return true
+        }
+        if key != editor.KEY_LEFT && key != editor.KEY_RIGHT {
+            return false
+        }
+        var ps: [u32; 2] = [0 as u32; 2]
+        let n: usize = w8_ib_parts(w, &ps)
+        if n < 2 {
+            return false
+        }
+        let cur: u32 = w8_ib_focus(w)
+        if cur == ps[0] { (*w).foc = ps[1] as usize } else { (*w).foc = ps[0] as usize }
+        touch(c)
+        return true
+    }
+    if k == K_STEPPER {
+        let ns: usize = wave8.stepper_key((*w).sp.n, (*w).cur, (*w).reach, key)
+        if ns == (*w).cur || ns >= (*w).sp.n {
+            return false
+        }
+        (*w).cur = ns
+        w8_sync(c, i)
+        fire(c, i)
+        touch(c)
+        return true
+    }
+    return false
+}
+
+// Enter / Space on a crumb or an info bar part
+fn w8_act(c: *mut Ctl, i: usize) {
+    let w: *mut W8 = w8_of(c, i)
+    let k: u32 = (*c).kind[i]
+    if k == K_CRUMB {
+        let f: usize = w8_cr_focus(w)
+        if f == wave8.BC_NONE {
+            return
+        }
+        (*w).ev = f
+        fire(c, i)
+    } else if k == K_INFOB && (*w).on {
+        w8_ib_use(c, i, w8_ib_focus(w))
+        touch(c)
+    }
+}
+
+// typed digits go to the focused time picker
+fn w8_chr(c: *mut Ctl, cp: u32, mods: u32) -> bool {
+    if cp < 48 as u32 || cp > 57 as u32 || (mods & (editor.MOD_CTRL | editor.MOD_ALT)) != 0 as u32 {
+        return false
+    }
+    let f: usize = app.focus((*c).a)
+    if f == NONE {
+        return false
+    }
+    let i: usize = find(c, f)
+    if i == NONE || (*c).kind[i] != K_TIMEP {
+        return false
+    }
+    let w: *mut W8 = w8_of(c, i)
+    if wave8.tp_digit(&(*w).tp, (cp - 48 as u32) as i64) {
+        w8_sync(c, i)
+        fire(c, i)
+    }
+    touch(c)
+    return true
+}
+
+// the wheel over a time picker: one notch = one step of the field under the pointer
+fn w8_wheel(c: *mut Ctl, dy: f64) -> bool {
+    let sc: *mut scene.Scene = sc_of(c)
+    let node: usize = scene.scene_hit(sc, (*c).px, (*c).py)
+    if node == NONE || node >= scene.scene_count(sc) {
+        return false
+    }
+    let i: usize = find(c, node)
+    if i == NONE || (*c).kind[i] != K_TIMEP {
+        return false
+    }
+    let f: usize = w8_hit(c, i, (*c).px, (*c).py)
+    if f == NO8 || dy == 0.0 {
+        return false
+    }
+    var dir: i64 = 1
+    if dy > 0.0 { dir = 0 - 1 }
+    let w: *mut W8 = w8_of(c, i)
+    (*w).tp.field = f
+    if wave8.tp_wheel(&(*w).tp, f, dir) {
+        w8_sync(c, i)
+        fire(c, i)
+    }
+    touch(c)
+    return true
+}
+
+fn w8_tick(c: *mut Ctl, now: i64) -> bool {
+    var i: usize = 0
+    while i < (*c).n {
+        if w8_busy_on(c, i) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn w8_busy(c: *mut Ctl) -> bool {
+    return w8_tick(c, 0)
 }
