@@ -185,9 +185,9 @@ def fixture(im):
 def dark(im):
     return im.convert("L").point(lambda v: 255 if v < 25 else 0)
 def psnr(a, b):
-    # the selection box of the slab (1 px line on the CPU, 0.03 block thick box elsewhere) is checked on its own (box_top): its dark pixels, dilated
-    # by 6 px, inside the slab rectangle are left out here
-    m = ImageChops.lighter(dark(a), dark(b)).filter(ImageFilter.MaxFilter(13))
+    # the selection box of the slab (1 px line on the CPU, ~1 px thick box on GL / Vulkan since r253, mp_sel_thickness) is checked on its own (box_top, dark
+    # pixel count ratio): its dark pixels, dilated by 5 px (r248: 13), inside the slab rectangle are left out here; line rasterisation never matches pixel for pixel
+    m = ImageChops.lighter(dark(a), dark(b)).filter(ImageFilter.MaxFilter(5))
     rect = Image.new("L", a.size, 0); rect.paste(255, (250, 95, 390, 195))
     m = ImageChops.multiply(m, rect)
     black = Image.new("RGB", a.size, (0, 0, 0))
@@ -232,6 +232,7 @@ for n in runs:
     if n in ("C", "L0", "V0"): continue
     t, c2 = box_top(ims[n])
     print(f"  selection box top row {n}: {t} ({c2} dark px)")
+    if ct is not None and not (ct * 0.5 <= c2 <= ct * 3): print(f"  FAIL  {n}: selection box has {c2} dark px, CPU {ct} (visibility / thickness off)"); bad = 1
     if t is None or ct is None or abs(t - ct) > 6 or c2 < 20: print(f"  FAIL  {n}: selection box differs from the CPU model box (full block instead of the model bounds?)"); bad = 1
 for a, b in (("L", "L0"), ("V", "V0")):
     if a in ims and b in ims:
