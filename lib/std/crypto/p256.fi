@@ -228,15 +228,20 @@ fn ladder(c: *mut Ctx, k: *mut big.Big, px: *mut big.Big, py: *mut big.Big,
         pt_add(c, &r0, &r0, &r0)
         pt_cswap(&r0, &r1, mask)
     }
-    if big.big_is_zero(&r0.z) {
+    return to_affine(c, &r0, out_x, out_y)
+}
+
+// The affine point of a projective one, as 32+32 octets each. False for the point at infinity.
+fn to_affine(c: *mut Ctx, r0: *mut Pt3, out_x: u64, out_y: u64) -> bool {
+    if big.big_is_zero(&(*r0).z) {
         return false
     }
     var zi: big.Big = big.big_new()
-    big.mont_pow(&(*c).mp, &zi, &r0.z, &(*c).pm2)
+    big.mont_pow(&(*c).mp, &zi, &(*r0).z, &(*c).pm2)
     var ax: big.Big = big.big_new()
     var ay: big.Big = big.big_new()
-    fmul(c, &ax, &r0.x, &zi)
-    fmul(c, &ay, &r0.y, &zi)
+    fmul(c, &ax, &(*r0).x, &zi)
+    fmul(c, &ay, &(*r0).y, &zi)
     var x: big.Big = big.big_new()
     var y: big.Big = big.big_new()
     big.mont_from(&(*c).mp, &x, &ax)
@@ -244,6 +249,66 @@ fn ladder(c: *mut Ctx, k: *mut big.Big, px: *mut big.Big, py: *mut big.Big,
     big.big_to_be(&x, out_x, 32)
     big.big_to_be(&y, out_y, 32)
     return true
+}
+
+// ------------------------------------------- fixed-base comb for k * G
+//
+// The table (tools/crypto/gen_p256_comb.py -> p256_comb.bin) holds v * 16^j * G for j = 0..63, v = 1..15 as affine
+// points in the Montgomery domain: 64 octets per entry, eight 32-bit limbs of x then of y. k * G is then 64 additions
+// (one per 4-bit digit of k) and no doubling: about 6x fewer field operations than the ladder. The entry of a digit is
+// picked by reading ALL fifteen of its window and masking, and a zero digit adds a dummy and keeps the old sum by a mask,
+// so neither the memory addresses nor the branches depend on the secret scalar.
+const COMB: str = __include_str("p256_comb.bin")
+
+fn comb_pick(j: usize, v: u32, out: *mut Pt3) {
+    big.big_set_len(&(*out).x, 8)
+    big.big_set_len(&(*out).y, 8)
+    var w: usize = 0
+    while w < 8 {
+        (*out).x.d[w] = 0 as u32
+        (*out).y.d[w] = 0 as u32
+        w = w + 1
+    }
+    var e: u32 = 1 as u32
+    while e < 16 as u32 {
+        let dz: u64 = (v ^ e) as u64
+        let mask: u64 = (0 as u64) -% ((dz -% 1 as u64) >> 63)
+        let base: u64 = (COMB.p as u64) + (((j * 15 + (e as usize) - 1) * 64) as u64)
+        w = 0
+        while w < 8 {
+            let xp: *mut u32 = (base +% (w * 4) as u64) as *mut u32
+            let yp: *mut u32 = (base +% 32 as u64 +% (w * 4) as u64) as *mut u32
+            let xv: u64 = (*xp) as u64
+            let yv: u64 = (*yp) as u64
+            (*out).x.d[w] = ((*out).x.d[w] as u64 | (xv & mask)) as u32
+            (*out).y.d[w] = ((*out).y.d[w] as u64 | (yv & mask)) as u32
+            w = w + 1
+        }
+        e = e + 1 as u32
+    }
+}
+
+// k * G for 0 < k < n, k as eight 32-bit limbs; the affine result as 32+32 octets.
+fn comb_mult(c: *mut Ctx, k: *mut big.Big, out_x: u64, out_y: u64) -> bool {
+    var acc: Pt3 = pt_new()
+    big.big_set_len(&acc.x, 8)
+    acc.y = (*c).mp.one
+    big.big_set_len(&acc.z, 8)
+    var t: Pt3 = pt_new()
+    var sum: Pt3 = pt_new()
+    var j: usize = 0
+    while j < 64 {
+        let v: u32 = ((*k).d[j / 8] >> ((4 * (j % 8)) as u32)) & 15 as u32
+        comb_pick(j, v, &t)
+        t.z = (*c).mp.one
+        pt_add(c, &sum, &acc, &t)
+        let mask: u64 = (0 as u64) -% (((v as u64) +% 15 as u64) >> 4)
+        big.select_into(&acc.x, &acc.x, &sum.x, mask, 8)
+        big.select_into(&acc.y, &acc.y, &sum.y, mask, 8)
+        big.select_into(&acc.z, &acc.z, &sum.z, mask, 8)
+        j = j + 1
+    }
+    return to_affine(c, &acc, out_x, out_y)
 }
 
 // 1 <= d < n ?
@@ -267,7 +332,7 @@ fn p256_public(d: u64, out: u64) -> bool {
     big.big_set_len(&k, 8)
     if big.big_is_zero(&k) || big.big_cmp(&k, &c.n) >= 0 { return false }
     rt.st8(out, 0, 4 as u8)
-    return ladder(&c, &k, &c.gx, &c.gy, out + 1, out + 33)
+    return comb_mult(&c, &k, out + 1, out + 33)
 }
 
 // k * (x, y) for an affine point given as 32+32 octets. For tests and for
