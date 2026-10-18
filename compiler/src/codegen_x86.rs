@@ -2039,6 +2039,9 @@ fn emit_bin(
             let res = if op == BinOp::Div { "rax" } else { "rdx" };
             store_dst(e, fr, d, res);
         }
+        BinOp::Rotr32 => {
+            return Err(format!("internal error: '{}' is only generated for aarch64", op.name()));
+        }
         BinOp::Shl | BinOp::Shr => {
             // Widen the left operand exactly, so that `shr`/`sar` pull the right
             // bits along for 8/16-bit types too.

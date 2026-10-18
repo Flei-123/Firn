@@ -7985,6 +7985,9 @@ fn emit_bin(
             let res = if op == BinOp::Div { "rax" } else { "rdx" };
             ra.store_dst(e, d, res);
         }
+        BinOp::Rotr32 => {
+            return Err(format!("internal error: '{}' is only generated for aarch64", op.name()));
+        }
         BinOp::Shl | BinOp::Shr => {
             let m = match (op, ty.signed()) {
                 (BinOp::Shl, _) => "shl",

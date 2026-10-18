@@ -3143,6 +3143,9 @@ impl<'a> Fx<'a> {
                 self.get(b, vt);
                 self.num(if s { pick(w::I32_SHR_S, w::I64_SHR_S) } else { pick(w::I32_SHR_U, w::I64_SHR_U) });
             }
+            BinOp::Rotr32 => {
+                return Err(format!("internal error: '{}' is only generated for aarch64", op.name()));
+            }
         }
         self.put(i, vt);
         Ok(())

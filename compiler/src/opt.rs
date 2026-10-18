@@ -169,6 +169,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "checked u64 multiply by 2^k (after a checked i64 cast) becomes one compare, the original checks move to a cold block",
     },
     PassInfo {
+        name: "rotate",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "r837: ((x & M32) >> n | x << (32 - n)) & M32 becomes one 32-bit rotate (aarch64 only, once, after the fixpoint)",
+    },
+    PassInfo {
         name: "licm",
         scope: Scope::Func,
         debug_preserving: true,
@@ -551,6 +557,24 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         }
         clk.add("promote", t);
     }
+    // r837: 32-bit rotate recognition. After the fixpoint and the inliner (the shift counts are
+    // constants by now), before `fuse-checks`; the five operations of the old expression die in `dce`.
+    if cfg.runs("rotate") && crate::target::active() == crate::target::Target::Aarch64 {
+        let t = std::time::Instant::now();
+        let mut n = 0usize;
+        for f in m.funcs.iter_mut() {
+            if f.constant_time || !f.secret.is_empty() {
+                continue;
+            }
+            let k = crate::rotate::run(f);
+            if k > 0 {
+                remove_dead_insts(f, &mut st);
+                phi_check(f, "rotate");
+            }
+            n += k;
+        }
+        clk.add2("rotate", t, n > 0);
+    }
     // r806: the very last step, once per function. Earlier it would hide the checks from `bce`
     // and the range analysis, and from the inliner's size heuristic.
     if cfg.runs("fuse-checks") {
@@ -865,6 +889,7 @@ fn bink(o: BinOp) -> u8 {
         BinOp::Xor => 8,
         BinOp::Shl => 9,
         BinOp::Shr => 10,
+        BinOp::Rotr32 => 11,
     }
 }
 
@@ -1402,7 +1427,7 @@ fn fold_constants(f: &mut Func, st: &mut OptStats) -> bool {
     changed
 }
 
-fn fold_bin(ty: FTy, op: BinOp, a: i128, b: i128) -> Option<i128> {
+pub(crate) fn fold_bin(ty: FTy, op: BinOp, a: i128, b: i128) -> Option<i128> {
     if ty == FTy::Void || ty.bits() == 0 {
         return None;
     }
@@ -1443,6 +1468,13 @@ fn fold_bin(ty: FTy, op: BinOp, a: i128, b: i128) -> Option<i128> {
             // types not negative (-> logical shift), for signed ones
             // arithmetic.
             a >> b
+        }
+        BinOp::Rotr32 => {
+            if b < 1 || b > 31 {
+                return None;
+            }
+            let lo = (a as u64 & 0xFFFF_FFFF) as u32;
+            lo.rotate_right(b as u32) as i128
         }
     };
     Some(ty.truncate(r))

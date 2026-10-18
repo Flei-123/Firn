@@ -97,6 +97,7 @@ mod statics;
 mod sema_generic;
 mod sema_match;
 mod peephole;
+mod rotate;
 mod promote;
 mod rangecheck;
 mod strings;

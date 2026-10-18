@@ -127,6 +127,10 @@ pub enum BinOp {
     Xor,
     Shl,
     Shr,
+    /// r837: rotate the LOW 32 bits of `a` right by the constant `b` (1..=31)
+    /// and zero-extend the result to the full width. Produced only by
+    /// `rotate.rs` (aarch64 builds, `ror w, w, #n`), never by the front end.
+    Rotr32,
 }
 
 impl BinOp {
@@ -142,6 +146,7 @@ impl BinOp {
             BinOp::Xor => "xor",
             BinOp::Shl => "shl",
             BinOp::Shr => "shr",
+            BinOp::Rotr32 => "rotr32",
         }
     }
 }

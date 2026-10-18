@@ -2366,6 +2366,22 @@ fn emit_bin(
                 commit(e, fr, d, rd);
             }
         }
+        BinOp::Rotr32 => {
+            // r837: rotate the low 32 bits right; a write to a `w` register
+            // zero-extends, which is exactly the contract of `Rotr32`.
+            let ra = src(e, fr, a, A);
+            let rd = dreg(fr, d, A);
+            match fr.ra.imm(b) {
+                Some(k) if (1..=31).contains(&k) => {
+                    e.line(&format!("ror {}, {}, #{}", w(rd), w(ra), k));
+                }
+                _ => {
+                    let rb = src(e, fr, b, B);
+                    e.line(&format!("ror {}, {}, {}", w(rd), w(ra), w(rb)));
+                }
+            }
+            commit(e, fr, d, rd);
+        }
         BinOp::Shl | BinOp::Shr => {
             // Widen the left operand exactly, so that a right shift of an
             // 8/16-bit type pulls the right bits along. The shift count is
