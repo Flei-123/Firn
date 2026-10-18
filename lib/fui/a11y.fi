@@ -81,6 +81,7 @@ export {
     a11y_role_name, a11y_dump,
     // r19/r20 (W5): heading level, description, virtual list rows, JSON export
     a11y_set_level, a11y_level, a11y_set_description, a11y_set_described_by,
+    a11y_set_hidden, a11y_hidden, a11y_kid_first, a11y_kid_next,
     a11y_description, a11y_bind_vlist, a11y_vrow_first, a11y_vrow_end,
     a11y_vrow_total, a11y_vrow_name, a11y_vrow_state, a11y_vrow_rect,
     a11y_dump_json, a11y_hit, a11y_hit_row,
@@ -198,6 +199,9 @@ struct Ann {
     vl: u64,
     vsrc: fn(u64, usize, *mut vlist.VRow),
     vud: u64,
+    // aria-hidden: 1 = this node and everything under it is NOT in the
+    // accessibility tree (a scene node hidden by `node_set_hidden` counts too).
+    hid: u32,
 }
 
 fn vsrc_none(ud: u64, i: usize, r: *mut vlist.VRow) {}
@@ -206,7 +210,7 @@ fn ann_blank() -> Ann {
     return Ann { role: ROLE_NONE, np: 0, nn: 0, has_name: 0 as u32,
         lby: 0 as u32, exp: 0 as u32, ro: 0 as u32, toggle: 0 as u32,
         level: 0 as u32, dp: 0, dn: 0, dby: 0 as u32,
-        vl: 0, vsrc: vsrc_none, vud: 0 }
+        vl: 0, vsrc: vsrc_none, vud: 0, hid: 0 as u32 }
 }
 
 struct A11y {
@@ -666,15 +670,68 @@ fn label_text(sc: *mut scene.Scene, ax: *mut A11y, j: usize, o: *mut Out,
     kids_text(sc, ax, j, o, depth + 1)
 }
 
+// ======================================================================
+// HIDDEN NODES ARE NOT IN THE ACCESSIBILITY TREE
+// ======================================================================
+//
+// CSS `visibility: hidden` / `aria-hidden`: a node that is not shown is not
+// announced either. Two things hide a node: the scene flag
+// (`scene.node_set_hidden`: closed overlays, folded toolbar items, the
+// toolbar's overflow copies) and the explicit a11y flag below (for a node that
+// is painted but must not be read twice). Hiding is inherited: the children
+// of a hidden node are skipped with it, because the walk never enters it.
+// Every consumer (dump, JSON, AT-SPI, UIA, set position, tab order, names)
+// walks children through `a11y_kid_first/_next`, so all of them agree.
+fn a11y_set_hidden(ax: *mut A11y, i: usize, on: bool) {
+    if !slot_ok(i) {
+        return
+    }
+    if on {
+        (*an(ax, i)).hid = 1 as u32
+    } else {
+        (*an(ax, i)).hid = 0 as u32
+    }
+}
+
+fn a11y_hidden(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> bool {
+    if i >= scene.scene_count(sc) {
+        return false
+    }
+    if scene.node_hidden(sc, i) {
+        return true
+    }
+    if (*ax).a == 0 || i >= (*ax).ahi {
+        return false
+    }
+    return (*an(ax, i)).hid != 0 as u32
+}
+
+// The first / next child that is not hidden (SCENE_NONE at the end).
+fn a11y_kid_first(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> usize {
+    var k: usize = scene.scene_first_child(sc, i)
+    while k != scene.SCENE_NONE && a11y_hidden(sc, ax, k) {
+        k = scene.scene_next_sibling(sc, k)
+    }
+    return k
+}
+
+fn a11y_kid_next(sc: *mut scene.Scene, ax: *mut A11y, k: usize) -> usize {
+    var j: usize = scene.scene_next_sibling(sc, k)
+    while j != scene.SCENE_NONE && a11y_hidden(sc, ax, j) {
+        j = scene.scene_next_sibling(sc, j)
+    }
+    return j
+}
+
 fn kids_text(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out,
     depth: usize) {
     if depth > DEPTH_MAX {
         return
     }
-    var k: usize = scene.scene_first_child(sc, i)
+    var k: usize = a11y_kid_first(sc, ax, i)
     while k != scene.SCENE_NONE && k < scene.scene_count(sc) {
         label_text(sc, ax, k, o, depth)
-        k = scene.scene_next_sibling(sc, k)
+        k = a11y_kid_next(sc, ax, k)
     }
 }
 
@@ -932,11 +989,11 @@ fn a11y_pos(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> usize {
     }
     let r: u32 = a11y_role(sc, ax, i)
     let p: usize = scene.scene_parent(sc, i)
-    if !role_in_set(r) || p == scene.SCENE_NONE {
+    if !role_in_set(r) || p == scene.SCENE_NONE || a11y_hidden(sc, ax, i) {
         return 0
     }
     var n: usize = 0
-    var k: usize = scene.scene_first_child(sc, p)
+    var k: usize = a11y_kid_first(sc, ax, p)
     while k != scene.SCENE_NONE {
         if same_set(a11y_role(sc, ax, k), r) {
             n = n + 1
@@ -944,7 +1001,7 @@ fn a11y_pos(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> usize {
         if k == i {
             return n
         }
-        k = scene.scene_next_sibling(sc, k)
+        k = a11y_kid_next(sc, ax, k)
     }
     return 0
 }
@@ -955,12 +1012,12 @@ fn a11y_set_size(sc: *mut scene.Scene, ax: *mut A11y, i: usize) -> usize {
     }
     let r: u32 = a11y_role(sc, ax, i)
     var n: usize = 0
-    var k: usize = scene.scene_first_child(sc, scene.scene_parent(sc, i))
+    var k: usize = a11y_kid_first(sc, ax, scene.scene_parent(sc, i))
     while k != scene.SCENE_NONE {
         if same_set(a11y_role(sc, ax, k), r) {
             n = n + 1
         }
-        k = scene.scene_next_sibling(sc, k)
+        k = a11y_kid_next(sc, ax, k)
     }
     return n
 }
@@ -1032,10 +1089,10 @@ fn order_walk(sc: *mut scene.Scene, ax: *mut A11y, i: usize, depth: usize) {
         *(((*ax).ord + ((*ax).nord as u64) * 8) as *mut usize) = i
         (*ax).nord = (*ax).nord + 1
     }
-    var k: usize = scene.scene_first_child(sc, i)
+    var k: usize = a11y_kid_first(sc, ax, i)
     while k != scene.SCENE_NONE {
         order_walk(sc, ax, k, depth + 1)
-        k = scene.scene_next_sibling(sc, k)
+        k = a11y_kid_next(sc, ax, k)
     }
 }
 
@@ -1447,10 +1504,10 @@ fn dump_node(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out,
     put_dec(o, scene.node_h(sc, i) as i64)
     put(o, 10 as u8)
     dump_vrows(sc, ax, i, o, depth + 1)
-    var c: usize = scene.scene_first_child(sc, i)
+    var c: usize = a11y_kid_first(sc, ax, i)
     while c != scene.SCENE_NONE {
         dump_node(sc, ax, c, o, depth + 1)
-        c = scene.scene_next_sibling(sc, c)
+        c = a11y_kid_next(sc, ax, c)
     }
 }
 
@@ -1849,7 +1906,7 @@ fn json_node(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out, depth: 
     }
     json_rect(o, scene.node_x(sc, i) as i64, scene.node_y(sc, i) as i64,
         scene.node_w(sc, i) as i64, scene.node_h(sc, i) as i64)
-    let c0: usize = scene.scene_first_child(sc, i)
+    let c0: usize = a11y_kid_first(sc, ax, i)
     if c0 != scene.SCENE_NONE || a11y_vrow_end(ax, i) > a11y_vrow_first(ax, i) {
         put_lit(o, ",\"children\":[")
         var any: bool = json_vrows(sc, ax, i, o)
@@ -1860,7 +1917,7 @@ fn json_node(sc: *mut scene.Scene, ax: *mut A11y, i: usize, o: *mut Out, depth: 
             }
             any = true
             json_node(sc, ax, c, o, depth + 1)
-            c = scene.scene_next_sibling(sc, c)
+            c = a11y_kid_next(sc, ax, c)
         }
         put(o, 93 as u8)
     }

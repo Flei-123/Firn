@@ -785,6 +785,13 @@ build appgrid
 build appw8m
 "$W/appw8m" | tail -n 3 | grep -q "APPW8M PASSED"
 
+# appdark: a theme switch reaches resting widgets (button face + text keep WCAG AA after app.set_dark, both ways)
+build appdark
+"$W/appdark" | tail -n 3 | grep -q "APPDARK PASSED"
+# a11yhide: hidden nodes (scene flag + explicit a11y flag) are not in the dump / JSON / AT-SPI / UIA / tab order
+build a11yhide
+"$W/a11yhide" | tail -n 3 | grep -q "A11YHIDE PASSED"
+
 # apptb: toolbar overflow (items fold behind "...", panel with copies, widening unfolds, a11y)
 build apptb
 "$W/apptb" | tail -n 3 | grep -q "APPTB PASSED"
