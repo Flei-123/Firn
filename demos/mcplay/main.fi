@@ -56,6 +56,8 @@ import mc.mc_codec
 import mc.mc_chunk
 import mc.mc_world
 import mc.mc_client
+import mc.mc_session
+import mc.mc_auth
 import mc.mc_dimension
 import mc.mc_sem
 import mc.mc_version
@@ -2339,21 +2341,70 @@ fn log_redirect() {
 #[allow_escape]
 fn main(start: u64) -> i32 {
     log_redirect()
-    if rt.arg_count(start) < 4 {
-        io.eprint_line("usage: mcplay <host-ipv4> <port> <name>   (options: environment, see the header of demos/mcplay/main.fi)")
+    // FleiLauncher hand-off (GDD 5a.2, lib/mc/mc_session.fi): MCPLAY_SESSION_FILE=<file>|- carries host, port, name (+ uuid, mc_token for an
+    // online login, protocol, view); command line arguments override it. The file is deleted after reading (MCPLAY_SESSION_KEEP=1 keeps it).
+    var sess: rt.Buf = rt.buf_new()
+    var s_host: rt.Buf = rt.buf_new()
+    var s_name: rt.Buf = rt.buf_new()
+    var s_tok: rt.Buf = rt.buf_new()
+    var s_uuid: rt.Buf = rt.buf_new()
+    var have_sess: bool = false
+    var s_port: i32 = 0 - 1
+    var s_proto: i32 = 0 - 1
+    var s_view: i32 = 0 - 1
+    var s_path: rt.Buf = rt.buf_new()
+    if env.get_into("MCPLAY_SESSION_FILE", &s_path) && rt.buf_len(&s_path) > 0 {
+        rt.buf_push(&s_path, 0 as u8)
+        if !mc_session.session_load(rt.buf_ptr(&s_path), &sess) {
+            io.eprint_line("mcplay: cannot read MCPLAY_SESSION_FILE")
+            return 2
+        }
+        have_sess = true
+        if !(rt.c_length(rt.buf_ptr(&s_path)) == 1 && rt.ld8(rt.buf_ptr(&s_path), 0) == 45 as u8) && !env_flag("MCPLAY_SESSION_KEEP", false) {
+            fs.remove(str { p: rt.buf_data(&s_path), n: rt.buf_len(&s_path) - 1 }) catch false
+        }
+        let sp: u64 = rt.buf_ptr(&sess)
+        let sn: usize = rt.buf_len(&sess)
+        if mc_session.session_value(sp, sn, "host", &s_host) { rt.buf_push(&s_host, 0 as u8) }
+        if mc_session.session_value(sp, sn, "name", &s_name) { rt.buf_push(&s_name, 0 as u8) }
+        mc_session.session_value(sp, sn, "mc_token", &s_tok)
+        mc_session.session_value(sp, sn, "uuid", &s_uuid)
+        s_port = mc_session.session_int(sp, sn, "port", 0 - 1)
+        s_proto = mc_session.session_int(sp, sn, "protocol", 0 - 1)
+        s_view = mc_session.session_int(sp, sn, "view", 0 - 1)
+        mc_session.session_wipe(&sess)
+        rt.buf_free(&sess)
+    }
+    rt.buf_free(&s_path)
+    let argc: usize = rt.arg_count(start)
+    if !have_sess && argc < 4 {
+        io.eprint_line("usage: mcplay <host-ipv4> <port> <name>   (or MCPLAY_SESSION_FILE=<file>|-; options: environment, see the header of demos/mcplay/main.fi)")
         return 2
     }
-    let host: u64 = rt.arg_ptr(start, 1)
-    let pp: u64 = rt.arg_ptr(start, 2)
-    let name: u64 = rt.arg_ptr(start, 3)
-    let port: i64 = parse_dec(pp, rt.c_length(pp), 0 - 1)
+    var host: u64 = rt.buf_ptr(&s_host)
+    var name: u64 = rt.buf_ptr(&s_name)
+    var port: i64 = s_port as i64
+    if argc >= 2 { host = rt.arg_ptr(start, 1) }
+    if argc >= 3 {
+        let pp: u64 = rt.arg_ptr(start, 2)
+        port = parse_dec(pp, rt.c_length(pp), 0 - 1)
+    }
+    if argc >= 4 { name = rt.arg_ptr(start, 3) }
+    if host == 0 as u64 || name == 0 as u64 || rt.c_length(name) == 0 {
+        io.eprint_line("mcplay: host or name missing (command line and session file)")
+        return 2
+    }
     let addr: u32 = parse_ipv4(host)
     if addr == 0 as u32 || port <= 0 || port > 65535 {
         io.eprint_line("mcplay: bad host or port (IPv4 literal expected)")
         return 2
     }
-    let view: i32 = env_int("MCPLAY_VIEW", 6)
-    let proto: i32 = env_int("MCPLAY_PROTOCOL", 763)
+    var view_def: i32 = 6
+    if s_view > 0 { view_def = s_view }
+    var proto_def: i32 = 763
+    if s_proto > 0 { proto_def = s_proto }
+    let view: i32 = env_int("MCPLAY_VIEW", view_def)
+    let proto: i32 = env_int("MCPLAY_PROTOCOL", proto_def)
     let w0: i32 = env_int("MCPLAY_W", 854)
     let h0: i32 = env_int("MCPLAY_H", 480)
     let fps_cap: i32 = env_int("MCPLAY_FPS", 60)
@@ -2445,7 +2496,33 @@ fn main(start: u64) -> i32 {
         io.eprint_line("mcplay: could not send the handshake")
         return 4
     }
-    let lr: i32 = mc_client.client_login_offline(&c.cl, name, LOGIN_WAITS)
+    var lr: i32 = 0
+    if rt.buf_len(&s_tok) > 0 {
+        // online login with the launcher's account (session file: mc_token + uuid)
+        var sess_cl: mc_auth.SessionClient = mc_auth.session_new()
+        var acct: mc_client.OnlineAccount = mc_client.account_new("", &sess_cl)
+        if !mc_auth.uuid_from_text(rt.buf_ptr(&s_uuid), rt.buf_len(&s_uuid), (&acct.uuid[0]) as u64) {
+            io.eprint_line("mcplay: session file has no valid uuid")
+            return 5
+        }
+        if !mc_auth.session_init(&sess_cl) {
+            io.eprint_line("mcplay: cannot initialise the session client (TLS)")
+            return 5
+        }
+        mc_auth.session_set_system_trust(&sess_cl, true)
+        var s_base: rt.Buf = rt.buf_new()
+        if env.get_into("MC_SESSION_BASE", &s_base) && rt.buf_len(&s_base) > 0 {
+            mc_auth.session_set_base(&sess_cl, str { p: rt.buf_data(&s_base), n: s_base.len })
+        }
+        acct.token = str { p: rt.buf_data(&s_tok), n: s_tok.len }
+        lr = mc_client.client_login_online(&c.cl, name, &acct, LOGIN_WAITS)
+        mc_auth.session_free(&sess_cl)
+        mc_session.session_wipe(&s_tok)
+        rt.buf_free(&s_tok)
+        rt.buf_free(&s_base)
+    } else {
+        lr = mc_client.client_login_offline(&c.cl, name, LOGIN_WAITS)
+    }
     if lr != 0 {
         say(f"mcplay: login failed ({lr})\n")
         return 5
