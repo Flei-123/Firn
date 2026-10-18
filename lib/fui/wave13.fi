@@ -1,0 +1,563 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/wave13.fi -- FLYOUT and TEACHING TIP (r45 rest, W44-b).
+//
+//   Flyout        a small panel next to an anchor (a button): text, up to 3 action buttons, an arrow to the anchor.
+//                 LIGHT DISMISS: a click outside, or Esc, closes it. The keyboard stays inside (Tab, arrows, Enter).
+//   TeachingTip   the same panel with a title and a close button. It does NOT light-dismiss (the page stays live); Esc
+//                 closes it; the keyboard enters it on request (`fl_enter`).
+//
+// Same rules as wave8 / wave12: ONE GEOMETRY (`fl_geom` is what `fl_draw` paints and `fl_hit` asks), ONLY THEME tokens,
+// lengths through kit.ln, right to left through kit.rx. The panel is placed on the wanted side of the anchor; when it does
+// not fit it flips to the opposite side, then to the others, and is finally pushed inside the window.
+//
+// HONEST LIMITS: the body text is wrapped to 8 lines at most (the rest gets "..."); at most 3 action buttons; the title
+// is one line; the arrow is drawn in whole pixel rows (no anti-aliasing); no animation.
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.kit
+import fui.editor
+import fui.lucide
+
+export {
+    Fly, FlGeom, FL_AUTO, FL_BOTTOM, FL_TOP, FL_START, FL_END, FL_FLYOUT, FL_TIP,
+    FL_OUT, FL_BODY, FL_CLOSE, FL_ACT0, FL_ACT_MAX, FL_NONE,
+    FR_NONE, FR_FOCUS, FR_CLOSED, FR_ACTION,
+    RS_NONE, RS_ESC, RS_OUTSIDE, RS_CLOSE, RS_ACTION, RS_PROGRAM,
+    fl_new, fl_open, fl_close, fl_set_anchor, fl_add_action, fl_enter, fl_geom, fl_hit, fl_key, fl_activate,
+    fl_draw, fl_part_rect, fl_window_hit, D_NONE, D_BOTTOM, D_TOP, D_LEFT, D_RIGHT,
+}
+
+const FL_AUTO: u32 = 0
+const FL_BOTTOM: u32 = 1
+const FL_TOP: u32 = 2
+const FL_START: u32 = 3 // left in the default direction, right in RTL
+const FL_END: u32 = 4
+
+const FL_FLYOUT: u32 = 0
+const FL_TIP: u32 = 1
+
+const FL_NONE: usize = 1000
+const FL_OUT: usize = 1001
+const FL_BODY: usize = 1002
+const FL_CLOSE: usize = 1003
+const FL_ACT0: usize = 1010
+const FL_ACT_MAX: usize = 3
+
+const FR_NONE: u32 = 0
+const FR_FOCUS: u32 = 1
+const FR_CLOSED: u32 = 2
+const FR_ACTION: u32 = 3
+
+// why it closed
+const RS_NONE: u32 = 0
+const RS_ESC: u32 = 1
+const RS_OUTSIDE: u32 = 2
+const RS_CLOSE: u32 = 3
+const RS_ACTION: u32 = 4
+const RS_PROGRAM: u32 = 5
+
+// the direction of the panel from the anchor (after the flip)
+const D_NONE: u32 = 0
+const D_BOTTOM: u32 = 1
+const D_TOP: u32 = 2
+const D_LEFT: u32 = 3
+const D_RIGHT: u32 = 4
+
+struct Fly {
+    kind: u32,
+    open: bool,
+    side: u32, // the wanted side (FL_AUTO = below)
+    light: bool, // a click outside closes it (and the page does not hear the pointer)
+    closable: bool, // the close button
+    ax: f64, // the anchor rectangle in window pixels (aw = ah = 0: no anchor, the panel stands in the middle)
+    ay: f64,
+    aw: f64,
+    ah: f64,
+    title: str,
+    text: str,
+    na: usize,
+    acts: [str; 3],
+    foc: usize, // the part with the keyboard ring: FL_NONE / FL_CLOSE / FL_ACT0 + i
+    hov: usize, // the part under the pointer
+    down: usize, // the part held down
+    kin: bool, // the keyboard is inside
+    pick: usize, // the action that closed it last
+    reason: u32,
+}
+
+struct FlGeom {
+    ok: bool,
+    dir: u32, // D_*: where the panel is from the anchor (D_NONE: no anchor, no arrow)
+    x: f64, // the panel
+    y: f64,
+    w: f64,
+    h: f64,
+    tipx: f64, // the point of the arrow
+    tipy: f64,
+    close: [f64; 4],
+    title: [f64; 4],
+    body: [f64; 4],
+    acts: [f64; 12],
+    lines: usize, // body lines
+}
+
+fn fl_new(kind: u32) -> Fly {
+    return Fly { kind: kind, open: false, side: FL_AUTO, light: kind == FL_FLYOUT, closable: kind == FL_TIP,
+        ax: 0.0, ay: 0.0, aw: 0.0, ah: 0.0, title: "", text: "", na: 0, acts: ["", "", ""], foc: FL_NONE, hov: FL_NONE,
+        down: FL_NONE, kin: false, pick: FL_NONE, reason: RS_NONE }
+}
+
+fn fl_set_anchor(f: *mut Fly, x: f64, y: f64, w: f64, h: f64) {
+    (*f).ax = x
+    (*f).ay = y
+    (*f).aw = w
+    (*f).ah = h
+}
+
+fn fl_add_action(f: *mut Fly, label: str) -> bool {
+    if (*f).na >= FL_ACT_MAX { return false }
+    (*f).acts[(*f).na] = label
+    (*f).na = (*f).na + 1
+    return true
+}
+
+// the part that gets the ring first: the last action (the main one), else the close button
+fn fl_first_focus(f: *mut Fly) -> usize {
+    if (*f).na > 0 { return FL_ACT0 + (*f).na - 1 }
+    if (*f).closable { return FL_CLOSE }
+    return FL_NONE
+}
+
+// A flyout takes the keyboard when it opens; a teaching tip waits for `fl_enter`.
+fn fl_open(f: *mut Fly) {
+    (*f).open = true
+    (*f).hov = FL_NONE
+    (*f).down = FL_NONE
+    (*f).pick = FL_NONE
+    (*f).reason = RS_NONE
+    (*f).kin = (*f).kind == FL_FLYOUT
+    (*f).foc = FL_NONE
+    if (*f).kin { (*f).foc = fl_first_focus(f) }
+}
+
+fn fl_close(f: *mut Fly, reason: u32) {
+    (*f).open = false
+    (*f).kin = false
+    (*f).hov = FL_NONE
+    (*f).down = FL_NONE
+    (*f).reason = reason
+}
+
+// the keyboard goes into a teaching tip
+fn fl_enter(f: *mut Fly) {
+    if !(*f).open { return }
+    (*f).kin = true
+    if (*f).foc == FL_NONE { (*f).foc = fl_first_focus(f) }
+}
+
+fn fl_text_run(size: f64, weight: usize) -> painter.TextRun {
+    var r: painter.TextRun = painter.run_new(size)
+    if weight >= 700 {
+        r = painter.run_set_weight(r, 700)
+    }
+    return r
+}
+
+fn fl_min(a: f64, b: f64) -> f64 {
+    if a < b { return a }
+    return b
+}
+
+fn fl_max(a: f64, b: f64) -> f64 {
+    if a > b { return a }
+    return b
+}
+
+fn fl_clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if hi < lo { return lo }
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// the side as a direction (START / END follow the reading direction)
+fn fl_dir_of(side: u32) -> u32 {
+    if side == FL_TOP { return D_TOP }
+    if side == FL_START {
+        if kit.kit_rtl() { return D_RIGHT }
+        return D_LEFT
+    }
+    if side == FL_END {
+        if kit.kit_rtl() { return D_LEFT }
+        return D_RIGHT
+    }
+    return D_BOTTOM
+}
+
+fn fl_opposite(d: u32) -> u32 {
+    if d == D_BOTTOM { return D_TOP }
+    if d == D_TOP { return D_BOTTOM }
+    if d == D_LEFT { return D_RIGHT }
+    return D_LEFT
+}
+
+// the panel for direction `d` at panel size (pw, ph); false when it does not fit the window
+fn fl_try(c: *mut render.Ctx, f: *mut Fly, d: u32, pw: f64, ph: f64, win_w: f64, win_h: f64, ox: *mut f64, oy: *mut f64) -> bool {
+    let m: f64 = kit.ln(c, 8)
+    let gap: f64 = kit.ln(c, 4) + kit.ln(c, 8)
+    let cx: f64 = (*f).ax + (*f).aw / 2.0
+    let cy: f64 = (*f).ay + (*f).ah / 2.0
+    var fits: bool = true
+    if d == D_BOTTOM || d == D_TOP {
+        *ox = fl_clamp(cx - pw / 2.0, m, win_w - pw - m)
+        if d == D_BOTTOM {
+            *oy = (*f).ay + (*f).ah + gap
+            fits = *oy + ph <= win_h - m
+        } else {
+            *oy = (*f).ay - gap - ph
+            fits = *oy >= m
+        }
+    } else {
+        *oy = fl_clamp(cy - ph / 2.0, m, win_h - ph - m)
+        if d == D_LEFT {
+            *ox = (*f).ax - gap - pw
+            fits = *ox >= m
+        } else {
+            *ox = (*f).ax + (*f).aw + gap
+            fits = *ox + pw <= win_w - m
+        }
+    }
+    return fits
+}
+
+// All the rectangles of the panel for a window of the size (win_w, win_h), in window pixels.
+fn fl_geom(c: *mut render.Ctx, f: *mut Fly, win_w: f64, win_h: f64) -> FlGeom {
+    var g: FlGeom = FlGeom { ok: false, dir: D_NONE, x: 0.0, y: 0.0, w: 0.0, h: 0.0, tipx: 0.0, tipy: 0.0,
+        close: [0.0; 4], title: [0.0; 4], body: [0.0; 4], acts: [0.0; 12], lines: 0 }
+    if !(*f).open { return g }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let m: f64 = kit.ln(c, 8)
+    let pad: f64 = kit.ln(c, 16)
+    let lh: f64 = kit.ln(c, 20)
+    let btn: f64 = kit.ln(c, 32)
+    var wpt: usize = 288
+    if (*f).kind == FL_TIP { wpt = 320 }
+    let pw: f64 = fl_min(kit.ln(c, wpt), fl_max(win_w - 2.0 * m, 1.0))
+    let inw: f64 = pw - 2.0 * pad
+    var bw: f64 = inw
+    if (*f).closable { bw = inw - btn - kit.ln(c, 4) }
+    // the heights
+    var th: f64 = 0.0
+    if (*f).title.n > 0 { th = lh }
+    var lines: usize = 0
+    if (*f).text.n > 0 {
+        var r: painter.TextRun = fl_text_run(kit.ln(c, 14), 400)
+        lines = painter.run_line_count(z, &r, (*f).text.p as u64, (*f).text.n, bw, 8)
+        if lines == 0 { lines = 1 }
+    }
+    let bh: f64 = (lines as f64) * lh
+    var ph: f64 = pad + th + bh + pad
+    if th > 0.0 && bh > 0.0 { ph = ph + kit.ln(c, 4) }
+    if (*f).na > 0 { ph = ph + kit.ln(c, 12) + btn }
+    if (*f).closable { ph = fl_max(ph, kit.ln(c, 8) + btn + kit.ln(c, 8)) }
+    g.lines = lines
+    g.w = pw
+    g.h = ph
+    // the place
+    var px: f64 = 0.0
+    var py: f64 = 0.0
+    let has_anchor: bool = (*f).aw > 0.0 || (*f).ah > 0.0
+    if !has_anchor {
+        px = fl_clamp((win_w - pw) / 2.0, m, win_w - pw - m)
+        py = fl_clamp((win_h - ph) / 2.0, m, win_h - ph - m)
+    } else {
+        let want: u32 = fl_dir_of((*f).side)
+        var order: [u32; 4] = [want, fl_opposite(want), D_LEFT, D_BOTTOM]
+        if want == D_LEFT || want == D_RIGHT {
+            order[2] = D_BOTTOM
+            order[3] = D_TOP
+        } else {
+            order[2] = D_RIGHT
+            order[3] = D_LEFT
+        }
+        var chosen: u32 = D_NONE
+        var k: usize = 0
+        while k < 4 && chosen == D_NONE {
+            if fl_try(c, f, order[k], pw, ph, win_w, win_h, &px, &py) { chosen = order[k] }
+            k = k + 1
+        }
+        if chosen == D_NONE {
+            chosen = want
+            let nf: bool = fl_try(c, f, want, pw, ph, win_w, win_h, &px, &py)
+            px = fl_clamp(px, m, win_w - pw - m)
+            py = fl_clamp(py, m, win_h - ph - m)
+        }
+        g.dir = chosen
+        // the point of the arrow: on the anchor's middle line, kept inside the straight part of the panel edge
+        let rr: f64 = kit.ln(c, 8) + kit.ln(c, 8)
+        let acx: f64 = (*f).ax + (*f).aw / 2.0
+        let acy: f64 = (*f).ay + (*f).ah / 2.0
+        if chosen == D_BOTTOM || chosen == D_TOP {
+            g.tipx = fl_clamp(acx, px + rr, px + pw - rr)
+            if chosen == D_BOTTOM { g.tipy = py - kit.ln(c, 8) } else { g.tipy = py + ph + kit.ln(c, 8) }
+        } else {
+            g.tipy = fl_clamp(acy, py + rr, py + ph - rr)
+            if chosen == D_LEFT { g.tipx = px + pw + kit.ln(c, 8) } else { g.tipx = px - kit.ln(c, 8) }
+        }
+    }
+    g.x = px
+    g.y = py
+    // the parts (mirrored in RTL inside the panel)
+    g.close[0] = kit.rx(px + pw - kit.ln(c, 8) - btn, btn, px, pw)
+    g.close[1] = py + kit.ln(c, 8)
+    g.close[2] = btn
+    g.close[3] = btn
+    if !(*f).closable { g.close[2] = 0.0 }
+    if !(*f).closable { g.close[3] = 0.0 }
+    var tw: f64 = inw
+    if (*f).closable { tw = bw }
+    g.title[0] = kit.rx(px + pad, tw, px, pw)
+    g.title[1] = py + pad
+    g.title[2] = tw
+    g.title[3] = th
+    var by: f64 = py + pad + th
+    if th > 0.0 { by = by + kit.ln(c, 4) }
+    g.body[0] = kit.rx(px + pad, bw, px, pw)
+    g.body[1] = by
+    g.body[2] = bw
+    g.body[3] = bh
+    // the action row from the end edge: the last action at the end
+    var ex: f64 = px + pw - pad
+    var i: usize = (*f).na
+    while i > 0 {
+        i = i - 1
+        let lw: f64 = fl_max(kit.ln(c, 64), kit.button_width(c, (*f).acts[i], kit.ICON_NONE))
+        let bx: f64 = ex - lw
+        g.acts[i * 4] = kit.rx(bx, lw, px, pw)
+        g.acts[i * 4 + 1] = py + ph - pad - btn
+        g.acts[i * 4 + 2] = lw
+        g.acts[i * 4 + 3] = btn
+        ex = bx - kit.ln(c, 8)
+    }
+    g.ok = true
+    return g
+}
+
+fn fl_in(r0: f64, r1: f64, r2: f64, r3: f64, x: f64, y: f64) -> bool {
+    return r2 > 0.0 && x >= r0 && x < r0 + r2 && y >= r1 && y < r1 + r3
+}
+
+// the part under (x, y): FL_CLOSE / FL_ACT0 + i / FL_BODY (the panel) / FL_OUT
+fn fl_hit(c: *mut render.Ctx, f: *mut Fly, win_w: f64, win_h: f64, x: f64, y: f64) -> usize {
+    let g: FlGeom = fl_geom(c, f, win_w, win_h)
+    if !g.ok { return FL_OUT }
+    if fl_in(g.close[0], g.close[1], g.close[2], g.close[3], x, y) { return FL_CLOSE }
+    var i: usize = 0
+    while i < (*f).na {
+        if fl_in(g.acts[i * 4], g.acts[i * 4 + 1], g.acts[i * 4 + 2], g.acts[i * 4 + 3], x, y) { return FL_ACT0 + i }
+        i = i + 1
+    }
+    if fl_in(g.x, g.y, g.w, g.h, x, y) { return FL_BODY }
+    return FL_OUT
+}
+
+// is (x, y) on the panel (or, for a light dismiss flyout, anywhere in the window)?
+fn fl_window_hit(c: *mut render.Ctx, f: *mut Fly, win_w: f64, win_h: f64, x: f64, y: f64) -> bool {
+    if !(*f).open { return false }
+    if (*f).light { return true }
+    return fl_hit(c, f, win_w, win_h, x, y) != FL_OUT
+}
+
+// the rectangle of a part (FL_CLOSE, FL_ACT0 + i, FL_BODY = the panel)
+fn fl_part_rect(c: *mut render.Ctx, f: *mut Fly, win_w: f64, win_h: f64, part: usize, out: *mut [f64; 4]) -> bool {
+    let g: FlGeom = fl_geom(c, f, win_w, win_h)
+    if !g.ok { return false }
+    if part == FL_BODY {
+        (*out)[0] = g.x
+        (*out)[1] = g.y
+        (*out)[2] = g.w
+        (*out)[3] = g.h
+        return true
+    }
+    if part == FL_CLOSE && (*f).closable {
+        (*out)[0] = g.close[0]
+        (*out)[1] = g.close[1]
+        (*out)[2] = g.close[2]
+        (*out)[3] = g.close[3]
+        return true
+    }
+    if part >= FL_ACT0 && part < FL_ACT0 + (*f).na {
+        let i: usize = part - FL_ACT0
+        (*out)[0] = g.acts[i * 4]
+        (*out)[1] = g.acts[i * 4 + 1]
+        (*out)[2] = g.acts[i * 4 + 2]
+        (*out)[3] = g.acts[i * 4 + 3]
+        return true
+    }
+    return false
+}
+
+// the focus parts in order: the close button, then the actions
+fn fl_parts(f: *mut Fly, out: *mut [usize; 4]) -> usize {
+    var n: usize = 0
+    if (*f).closable {
+        (*out)[n] = FL_CLOSE
+        n = n + 1
+    }
+    var i: usize = 0
+    while i < (*f).na {
+        (*out)[n] = FL_ACT0 + i
+        n = n + 1
+        i = i + 1
+    }
+    return n
+}
+
+// The same as Enter / Space on the focused part: FR_CLOSED (close button), FR_ACTION (`pick` is the action; it closes),
+// FR_NONE (nothing focused).
+fn fl_activate(f: *mut Fly) -> u32 {
+    if !(*f).open || !(*f).kin { return FR_NONE }
+    if (*f).foc == FL_CLOSE {
+        fl_close(f, RS_CLOSE)
+        return FR_CLOSED
+    }
+    if (*f).foc >= FL_ACT0 && (*f).foc < FL_ACT0 + (*f).na {
+        (*f).pick = (*f).foc - FL_ACT0
+        fl_close(f, RS_ACTION)
+        return FR_ACTION
+    }
+    return FR_NONE
+}
+
+// Esc closes (always). While the keyboard is inside: Tab / Shift+Tab walk the parts (wrapping), Left / Right too (no wrap),
+// Enter activates. FR_NONE = the key is not used.
+fn fl_key(f: *mut Fly, key: u32, shift: bool) -> u32 {
+    if !(*f).open { return FR_NONE }
+    if key == editor.KEY_ESC {
+        fl_close(f, RS_ESC)
+        return FR_CLOSED
+    }
+    if !(*f).kin { return FR_NONE }
+    if key == editor.KEY_ENTER { return fl_activate(f) }
+    var parts: [usize; 4] = [0; 4]
+    let n: usize = fl_parts(f, &parts)
+    if n == 0 { return FR_NONE }
+    var cur: usize = n
+    var j: usize = 0
+    while j < n {
+        if parts[j] == (*f).foc { cur = j }
+        j = j + 1
+    }
+    var fwd: u32 = editor.KEY_RIGHT
+    var back: u32 = editor.KEY_LEFT
+    if kit.kit_rtl() {
+        fwd = editor.KEY_LEFT
+        back = editor.KEY_RIGHT
+    }
+    if key == editor.KEY_TAB {
+        if cur == n {
+            cur = 0
+        } else if shift {
+            if cur == 0 { cur = n - 1 } else { cur = cur - 1 }
+        } else {
+            cur = (cur + 1) % n
+        }
+        (*f).foc = parts[cur]
+        return FR_FOCUS
+    }
+    if key == fwd && cur + 1 < n {
+        (*f).foc = parts[cur + 1]
+        return FR_FOCUS
+    }
+    if key == back && cur != n && cur > 0 {
+        (*f).foc = parts[cur - 1]
+        return FR_FOCUS
+    }
+    // a flyout keeps the arrows and Tab to itself
+    if (*f).kind == FL_FLYOUT && (key == fwd || key == back) { return FR_FOCUS }
+    return FR_NONE
+}
+
+// one pixel row (r deep from the point, `half` wide to each side) of the arrow
+fn fl_arrow_row(z: *mut painter.Painter, g: *mut FlGeom, tx: f64, ty: f64, r: usize, half: f64, col: u32) {
+    let d: f64 = r as f64
+    if (*g).dir == D_BOTTOM {
+        painter.surface(z, tx - half, ty + d, 2.0 * half + 1.0, 1.0, col)
+    } else if (*g).dir == D_TOP {
+        painter.surface(z, tx - half, ty - d - 1.0, 2.0 * half + 1.0, 1.0, col)
+    } else if (*g).dir == D_RIGHT {
+        painter.surface(z, tx + d, ty - half, 1.0, 2.0 * half + 1.0, col)
+    } else if (*g).dir == D_LEFT {
+        painter.surface(z, tx - d - 1.0, ty - half, 1.0, 2.0 * half + 1.0, col)
+    }
+}
+
+// The arrow: a triangle with 45 degree sides in whole pixel rows. The border colour first (rows 0 .. n-1), then the fill one
+// pixel smaller (rows 1 .. n); row n lies on the panel edge and hides the panel border under the base.
+fn fl_arrow(c: *mut render.Ctx, g: *mut FlGeom, edge: u32, fill: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let n: usize = kit.ln(c, 8) as usize
+    let tx: f64 = ((*g).tipx + 0.5) as i64 as f64
+    let ty: f64 = ((*g).tipy + 0.5) as i64 as f64
+    var r: usize = 0
+    while r < n {
+        fl_arrow_row(z, g, tx, ty, r, r as f64, edge)
+        r = r + 1
+    }
+    r = 1
+    while r <= n {
+        fl_arrow_row(z, g, tx, ty, r, (r as f64) - 1.0, fill)
+        r = r + 1
+    }
+}
+
+// Paint the panel (call it LAST in the frame so it stands above the page).
+fn fl_draw(c: *mut render.Ctx, f: *mut Fly, win_w: f64, win_h: f64) {
+    var g: FlGeom = fl_geom(c, f, win_w, win_h)
+    if !g.ok { return }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let rad: f64 = kit.ln(c, 8)
+    let fill: u32 = theme.opaque(kit.tokc(c, style.TOK_SURFACE_RAISED))
+    let edge: u32 = theme.opaque(kit.tokc(c, style.TOK_BORDER))
+    kit.soft_shadow(c, g.x, g.y, g.w, g.h, rad, kit.ln(c, 10), kit.ln(c, 4), 255 as u32)
+    painter.round_rect(z, g.x, g.y, g.w, g.h, rad, fill)
+    painter.round_ring(z, g.x, g.y, g.w, g.h, rad, kit.ln(c, 1), edge)
+    if g.dir != D_NONE { fl_arrow(c, &g, edge, fill) }
+    let fg: u32 = kit.tokc(c, style.TOK_TEXT)
+    if (*f).title.n > 0 {
+        kit.label_in(c, g.title[0], g.title[1], g.title[3], kit.ln(c, 14), 700, fg, (*f).title, g.title[2])
+    }
+    if (*f).text.n > 0 && g.lines > 0 {
+        var r: painter.TextRun = fl_text_run(kit.ln(c, 14), 400)
+        let by: f64 = painter.text_baseline_mid(z, g.body[1], kit.ln(c, 20), kit.ln(c, 14))
+        var al: u32 = painter.TEXT_L
+        if kit.kit_rtl() { al = painter.TEXT_R }
+        let used: usize = painter.run_draw_wrapped(z, &r, g.body[0], by, g.body[2], kit.ln(c, 20), kit.tokc(c, style.TOK_TEXT_MUTED),
+            (*f).text.p as u64, (*f).text.n, al, 8)
+    }
+    if (*f).closable {
+        let rr: f64 = kit.ln(c, 6)
+        if (*f).hov == FL_CLOSE {
+            var bg: u32 = kit.tokc(c, style.TOK_BUTTON_HOVER)
+            painter.round_rect(z, g.close[0], g.close[1], g.close[2], g.close[3], rr, bg)
+        }
+        let isz: f64 = kit.ln(c, 16)
+        kit.sym(c, lucide.X, g.close[0] + (g.close[2] - isz) / 2.0, g.close[1] + (g.close[3] - isz) / 2.0, isz, fg)
+        if (*f).kin && (*f).foc == FL_CLOSE {
+            kit.focus_ring(c, g.close[0], g.close[1], g.close[2], g.close[3], rr, style.TOK_SURFACE_RAISED)
+        }
+    }
+    var i: usize = 0
+    while i < (*f).na {
+        var st: u32 = 0 as u32
+        if (*f).hov == FL_ACT0 + i { st = st | kit.ST_HOVER }
+        if (*f).down == FL_ACT0 + i { st = st | kit.ST_ACTIVE }
+        if (*f).kin && (*f).foc == FL_ACT0 + i { st = st | kit.ST_FOCUS }
+        var kind: u32 = kit.BTN_SECONDARY
+        if i + 1 == (*f).na { kind = kit.BTN_PRIMARY }
+        kit.button_draw(c, g.acts[i * 4], g.acts[i * 4 + 1], g.acts[i * 4 + 2], g.acts[i * 4 + 3], (*f).acts[i], kit.ICON_NONE, kind, st)
+        i = i + 1
+    }
+}

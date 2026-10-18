@@ -17,6 +17,7 @@ import mc.mc_noise
 
 export {
     BzQuart, bz_lcg, bz_fiddle, bz_dist, bz_pick,
+    BzFid, BzCache, bz_fid, bzc_new, bzc_free, bz_pick_c,
     SwampNoise, swamp_new, swamp_value, swamp_grass,
 }
 
@@ -42,9 +43,15 @@ fn bz_fiddle(l: u64) -> f64 {
     return ((m as i64) as f64 / 1024.0 - 0.5) * 0.9
 }
 
-// BiomeManager.getFiddledDistance for the cell (x, y, z) and the fractional offset (xn, yn, zn) of the block inside it
+struct BzFid {
+    d: f64,
+    e: f64,
+    f: f64,
+}
+
+// The three fiddles (x, y, z offsets) of the cell (x, y, z): BiomeManager.getFiddledDistance without the distance.
 #[allow_fp]
-fn bz_dist(seed: u64, x: i32, y: i32, z: i32, xn: f64, yn: f64, zn: f64) -> f64 {
+fn bz_fid(seed: u64, x: i32, y: i32, z: i32) -> BzFid {
     var l: u64 = bz_lcg(seed, x as i64)
     l = bz_lcg(l, y as i64)
     l = bz_lcg(l, z as i64)
@@ -56,15 +63,79 @@ fn bz_dist(seed: u64, x: i32, y: i32, z: i32, xn: f64, yn: f64, zn: f64) -> f64 
     let e: f64 = bz_fiddle(l)
     l = bz_lcg(l, seed as i64)
     let f: f64 = bz_fiddle(l)
-    let a: f64 = zn + f
-    let b: f64 = yn + e
-    let c: f64 = xn + d
+    return BzFid { d: d, e: e, f: f }
+}
+
+// BiomeManager.getFiddledDistance for the cell (x, y, z) and the fractional offset (xn, yn, zn) of the block inside it
+#[allow_fp]
+fn bz_dist(seed: u64, x: i32, y: i32, z: i32, xn: f64, yn: f64, zn: f64) -> f64 {
+    let fd: BzFid = bz_fid(seed, x, y, z)
+    let a: f64 = zn + fd.f
+    let b: f64 = yn + fd.e
+    let c: f64 = xn + fd.d
     return a * a + b * b + c * c
 }
 
-// BiomeManager.getBiome(x, y, z): the quart cell (block coordinates >> 2 grid) the block takes its biome from. `seed` = hashed world seed.
+// Cache of the cell fiddles for the blocks of ONE section (wx, wy, wz = block origin of the section, blend radius <= 4): the 8 cells around a block
+// are shared with the neighbouring blocks, so every cell is computed once (r258: the mesher asks 25 x 8 cells per tinted block). Cells outside the
+// window are computed directly, so the result never depends on the cache (bit-identical to bz_pick).
+const BZC_NX: i32 = 9
+const BZC_NY: i32 = 7
+const BZC_NZ: i32 = 9
+const BZC_N: usize = 567
+
+struct BzCache {
+    cx0: i32,
+    cy0: i32,
+    cz0: i32,
+    fv: u64, // u8 [BZC_N]: 1 = fiddles computed
+    fd: u64, // f64 [3 * BZC_N]
+}
+
+fn bzc_new(wx: i32, wy: i32, wz: i32) -> BzCache {
+    let fv: u64 = rt.heap_alloc(BZC_N)
+    rt.mem_set(fv, 0 as u8, BZC_N)
+    let fd: u64 = rt.heap_alloc(BZC_N * 24)
+    return BzCache { cx0: (wx >> 2) - 3, cy0: (wy >> 2) - 2, cz0: (wz >> 2) - 3, fv: fv, fd: fd }
+}
+
+fn bzc_free(c: *mut BzCache) {
+    rt.heap_free((*c).fv, BZC_N)
+    rt.heap_free((*c).fd, BZC_N * 24)
+}
+
 #[allow_fp]
+fn bz_dist_c(c: *mut BzCache, seed: u64, x: i32, y: i32, z: i32, xn: f64, yn: f64, zn: f64) -> f64 {
+    if (c as u64) != (0 as u64) {
+        let ix: i32 = x - (*c).cx0
+        let iy: i32 = y - (*c).cy0
+        let iz: i32 = z - (*c).cz0
+        if ix >= 0 && ix < BZC_NX && iy >= 0 && iy < BZC_NY && iz >= 0 && iz < BZC_NZ {
+            let idx: usize = ((iy * BZC_NZ + iz) * BZC_NX + ix) as usize
+            if rt.ld8((*c).fv, idx) == (0 as u8) {
+                let fd: BzFid = bz_fid(seed, x, y, z)
+                rt.st64((*c).fd, idx * 3, math.math_bits(fd.d))
+                rt.st64((*c).fd, idx * 3 + 1, math.math_bits(fd.e))
+                rt.st64((*c).fd, idx * 3 + 2, math.math_bits(fd.f))
+                rt.st8((*c).fv, idx, 1 as u8)
+            }
+            let a: f64 = zn + math.math_f64(rt.ld64((*c).fd, idx * 3 + 2))
+            let b: f64 = yn + math.math_f64(rt.ld64((*c).fd, idx * 3 + 1))
+            let cc: f64 = xn + math.math_f64(rt.ld64((*c).fd, idx * 3))
+            return a * a + b * b + cc * cc
+        }
+    }
+    return bz_dist(seed, x, y, z, xn, yn, zn)
+}
+
+// BiomeManager.getBiome(x, y, z): the quart cell (block coordinates >> 2 grid) the block takes its biome from. `seed` = hashed world seed.
 fn bz_pick(seed: u64, bx: i32, by: i32, bz: i32) -> BzQuart {
+    return bz_pick_c(0 as *mut BzCache, seed, bx, by, bz)
+}
+
+// bz_pick with the fiddle cache of the section (0 = none): same result.
+#[allow_fp]
+fn bz_pick_c(c: *mut BzCache, seed: u64, bx: i32, by: i32, bz: i32) -> BzQuart {
     let i: i32 = bx - 2
     let j: i32 = by - 2
     let k: i32 = bz - 2
@@ -99,7 +170,7 @@ fn bz_pick(seed: u64, bx: i32, by: i32, bz: i32) -> BzQuart {
             s = n
             u = f
         }
-        let v: f64 = bz_dist(seed, q, r, s, h, t, u)
+        let v: f64 = bz_dist_c(c, seed, q, r, s, h, t, u)
         if g > v {
             best = p
             g = v

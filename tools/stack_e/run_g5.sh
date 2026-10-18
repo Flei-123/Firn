@@ -49,7 +49,8 @@ if command -v wine >/dev/null && command -v x86_64-w64-mingw32-gcc >/dev/null; t
     x86_64-w64-mingw32-gcc -O1 -o "$D/hna.exe" tools/stack_e/host_noattach_win.c || { echo "FAIL mingw host_noattach_win"; rc=1; }
     for lvl in dev-fast release-fast; do
         "$FIRNC" --shared --target=x86_64-windows --opt-level=$lvl -o "$D/rtn.dll" tools/stack_e/lib_rt.fi || { echo "FAIL dll lib_rt (noattach) $lvl"; rc=1; continue; }
-        (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 300 wine hna.exe rtn.dll 2>&1 | tail -1 | grep -q 'ok  host_noattach') && echo "ok  Windows DLL unattached host threads under Wine ($lvl)" || { echo "FAIL DLL unattached host threads (wine, $lvl)"; rc=1; }
+        # keep the Wine output: a FAIL here was seen once under load 39 and did not reproduce in 24 reruns, so show why next time
+        (cd "$D" && WINEPREFIX=${WINEPREFIX:-$HOME/.wine-firn} WINEDEBUG=-all timeout 300 wine hna.exe rtn.dll > "$D/hna.out" 2>&1; echo "exit $?" >> "$D/hna.out"); tail -2 "$D/hna.out" | head -1 | grep -q 'ok  host_noattach' && echo "ok  Windows DLL unattached host threads under Wine ($lvl)" || { echo "FAIL DLL unattached host threads (wine, $lvl)"; tail -n 5 "$D/hna.out" | sed 's/^/      /'; rc=1; }
     done
     # r576: stale host-thread stacks that the host re-mapped (no-access / guard / read-write) must not be scanned (VirtualQuery over every region)
     x86_64-w64-mingw32-gcc -O1 -o "$D/hrm.exe" tools/stack_e/host_remap_win.c || { echo "FAIL mingw host_remap_win"; rc=1; }
