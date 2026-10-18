@@ -130,6 +130,8 @@ pub(crate) struct QualUse {
     pub(crate) alias: String,
     pub(crate) name: String,
     pub(crate) span: Span,
+    /// r707: a generic STRUCT (`mod.Box[i32]`), not a function
+    pub(crate) is_struct: bool,
 }
 
 pub(crate) fn record_qual_use(u: QualUse) {
@@ -145,6 +147,17 @@ pub(crate) fn file_has_fn_template(file: u32, name: &str) -> bool {
     REG.with(|r| {
         r.borrow()
             .fns
+            .get(name)
+            .map(|t| t.decl.span.file == file)
+            .unwrap_or(false)
+    })
+}
+
+/// Does file `file` declare a generic struct template `name`?
+pub(crate) fn file_has_struct_template(file: u32, name: &str) -> bool {
+    REG.with(|r| {
+        r.borrow()
+            .structs
             .get(name)
             .map(|t| t.decl.span.file == file)
             .unwrap_or(false)
@@ -692,6 +705,42 @@ pub(crate) fn hook_generic_type(p: &mut Parser, name: &str, sp: Span) -> Option<
     Some(TypeExpr::Named(mangled, sp))
 }
 
+/// r707: `mod.Box[..]` ahead? Yields `(member, span of "mod.Box")` and records
+/// the use for `modules.rs`; the cursor is left AT the `[`.
+fn qual_struct_head(p: &mut Parser, module: &str, sp: Span) -> Option<(String, Span)> {
+    if !p.modules.contains(module) || !p.at(&TokKind::Dot) {
+        return None;
+    }
+    let member = match p.toks.get(p.pos + 1).map(|t| t.kind.clone()) {
+        Some(TokKind::Ident(m)) => m,
+        _ => return None,
+    };
+    if !matches!(p.toks.get(p.pos + 2).map(|t| &t.kind), Some(TokKind::LBracket))
+        || !is_generic_struct(&member)
+    {
+        return None;
+    }
+    p.bump(); // '.'
+    let msp = p.bump();
+    let full = Parser::join(sp, msp);
+    record_qual_use(QualUse {
+        file: p.file,
+        alias: module.to_string(),
+        name: member.clone(),
+        span: full,
+        is_struct: true,
+    });
+    Some((member, full))
+}
+
+/// `// HOOK types` in `parser.rs::parse_type_inner` — `mod.Vec[i32]` (r707).
+pub(crate) fn hook_qual_generic_type(p: &mut Parser, module: &str, sp: Span) -> Option<TypeExpr> {
+    let (member, full) = qual_struct_head(p, module, sp)?;
+    let args = p.generic_args()?;
+    let mangled = p.note_inst(&member, args, full, false);
+    Some(TypeExpr::Named(mangled, full))
+}
+
 /// `// HOOK types` in `parser.rs::postfix` — `sum[i32](a, b)`.
 pub(crate) fn hook_generic_call(p: &mut Parser, base: &Expr) -> Option<Expr> {
     // `fn[T](..)` or the qualified `mod.fn[T](..)` (the parser reads the
@@ -724,6 +773,7 @@ pub(crate) fn hook_generic_call(p: &mut Parser, base: &Expr) -> Option<Expr> {
             alias: m.clone(),
             name: name.clone(),
             span: base.span,
+            is_struct: false,
         });
     }
     let args = p.generic_args()?;
@@ -745,6 +795,30 @@ pub(crate) fn hook_generic_call(p: &mut Parser, base: &Expr) -> Option<Expr> {
 
 /// `// HOOK types` in `parser.rs::primary` — `Vec[i32]{ .. }`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
+    // r707: `mod.Vec[i32]{ .. }`
+    if let TokKind::Ident(m) = p.kind().clone() {
+        if p.modules.contains(&m) && matches!(p.toks.get(p.pos + 1).map(|t| &t.kind), Some(TokKind::Dot)) {
+            let sp0 = p.span();
+            let save = p.pos;
+            p.bump();
+            if let Some((member, full)) = qual_struct_head(p, &m, sp0) {
+                let args = p.generic_args()?;
+                let mangled = p.note_inst(&member, args, full, false);
+                if p.at(&TokKind::LBrace) && !p.no_struct_lit {
+                    return Some(p.struct_lit(mangled, full));
+                }
+                p.error_here(format!(
+                    "expected '{{' after '{}.{}[..]', found '{}'",
+                    m,
+                    member,
+                    p.kind().text()
+                ));
+                p.recovering = false;
+                return None;
+            }
+            p.pos = save;
+        }
+    }
     let name = match p.kind().clone() {
         TokKind::Ident(n) if is_generic_struct(&n) => n,
         _ => return None,

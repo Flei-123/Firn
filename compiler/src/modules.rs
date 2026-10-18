@@ -647,10 +647,20 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             dg.error(u.span, format!("module '{}' is not imported", u.alias));
             continue;
         };
-        if !crate::sema_generic::file_has_fn_template(files[at].id, &u.name) {
+        let has = if u.is_struct {
+            crate::sema_generic::file_has_struct_template(files[at].id, &u.name)
+        } else {
+            crate::sema_generic::file_has_fn_template(files[at].id, &u.name)
+        };
+        if !has {
             dg.error(
                 u.span,
-                format!("module '{}' has no generic function '{}'", u.alias, u.name),
+                format!(
+                    "module '{}' has no generic {} '{}'",
+                    u.alias,
+                    if u.is_struct { "struct" } else { "function" },
+                    u.name
+                ),
             );
         } else if !infos[at].exports.is_empty() && !infos[at].exports.contains(&u.name) {
             dg.error_note(

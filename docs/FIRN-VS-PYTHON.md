@@ -144,7 +144,7 @@ Effort S <1 day, M 1-3 days, L >3 days. Status `done` = landed on main in this r
 | G22 | P1 | language | `for (i, x) in enumerate(v)` and `for (x, y) in zip(a, b)` DONE (r666, firnc0+firnc1); no comprehension, no general tuple patterns in `for` | comprehension syntax later | M | enumerate/zip **done**; open: comprehensions, `for (a, b) in vec_of_tuples` |
 | G23 | P1 | language | no generic enums, so no `Option[T]` with `match`/`?` | `std.option` (r712): generic STRUCT `Option[T]{has,val}` + `opt_some/opt_none/opt_unwrap_or/opt_or/opt_eq` + Vec bridges `vec_first_opt/last/get/pop/index_of_opt`; open: `if let Some(x) = o` sugar, `?` propagation, generic enums | L | partial |
 | G24 | P1 | language | capturing closures only as `gc fn` (+`try`); timers/sort keys need ctx struct | stack closures for non-escaping use | L | open |
-| G25 | P1 | language | `mod.fn[T](..)` works (r701, both compilers, tests 3970-3974); still open: `mod.Type[T]` and generic fns are not `fn` values | qualified generics | S-M | partial |
+| G25 | P1 | language | `mod.fn[T](..)` (r701) and `mod.Type[T]` (r707) work in both compilers (tests 3970-3975, 3991); open: generic fns are not `fn` values | qualified generics | S-M | done (fn values open) |
 | G26 | P1 | language | `main` cannot `try`; `catch | e | return x` rejected | `fn main() -> Err!i32`, `catch return` | M | open |
 | G27 | P1 | language | no `derive(Eq, Debug, Hash, Ord, Clone)`; struct `==` and print missing | derive via comptime/reflection (r23) | L | open |
 | G28 | P1 | language | slicing: `s[a:b]` / `s[a:]` / `s[:b]` / `s[:]` on `str`/`Span` DONE (r712, parser sugar for `s.slice(a, b)`, Python semantics: negative from the end, clamped, no copy, firnc0+firnc1); open: step `s[::2]` (error today), Vec/array slices as sugar (use `vec_slice`), negative index `v[-1]`, `v[i]` on Vec/str, `x in a`, `[]T` slice type | slice type + operators | L | partial |
@@ -203,7 +203,7 @@ Compile time (cold, `dev-fast`): hello 10 ms, any program importing `std.io` 0.5
 
 ## 8. Next steps
 
-1. **Language ergonomics first** (biggest lever for the 2-5x tasks): G02 `for x in vec`, G03/G04 default + named args (r664/r704), G21 f-string specs (r665/r699), G22 enumerate/zip (r666), G25 `mod.fn[T]` (r701) are done; open: `mod.Type[T]` + generic fns as values, tuple patterns in `for`, G26 (`main` with `try`), G25 (qualified generics -> libs can use proper names).
+1. **Language ergonomics first** (biggest lever for the 2-5x tasks): G02 `for x in vec`, G03/G04 default + named args (r664/r704), G21 f-string specs (r665/r699), G22 enumerate/zip (r666), G25 `mod.fn[T]`/`mod.Type[T]` (r701/r707) are done; open: generic fns as values, tuple patterns in `for`, G26 (`main` with `try`), G25 (qualified generics -> libs can use proper names).
 2. **Compile speed** (G33): reachability pruning before optimizer/codegen. It makes cold script start and any REPL ~10x faster and is the precondition for G34.
 3. **Packages** (G35): git URL + rev pin in `firn.lock`, `firn add/vendor`. Needed before a community lib ecosystem is possible.
 4. **Option[T] / closures / derive** (G23, G24, G27): large (L), but they decide whether Firn code reads like Python for data-processing code. Needs a design decision per item (SPEC currently says no operator overloading, no generic enums).

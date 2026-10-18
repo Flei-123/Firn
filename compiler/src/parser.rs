@@ -554,6 +554,10 @@ impl<'a> Parser<'a> {
                 if let Some(t) = crate::errors::hook_type(self, &name, sp) {
                     return Some(t);
                 }
+                // HOOK types: qualified generic type `mod.Vec[i32]` (r707)
+                if let Some(t) = crate::sema_generic::hook_qual_generic_type(self, &name, sp) {
+                    return Some(t);
+                }
                 // HOOK types: generic type `Vec[i32]` (sema_generic.rs)
                 if let Some(t) = crate::sema_generic::hook_generic_type(self, &name, sp) {
                     return Some(t);

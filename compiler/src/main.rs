@@ -1034,7 +1034,23 @@ fn run(opts: &Options) -> i32 {
     // --- Monomorphization of generic templates (module types) ---
     mono::expand(&mut prog, &mut dg);
     // r664: default + named arguments -> plain positional calls (dargs.rs)
-    dargs::apply(&mut prog, &mut dg);
+    let mut dargs_pending = dargs::apply(&mut prog, &mut dg);
+    while !dargs_pending.is_empty() && !dg.has_errors() {
+        // r705: some method calls need the receiver type for their defaults:
+        // a first type check (diagnostics thrown away) records which method
+        // each call reaches, then the calls are finished (dargs.rs). A call
+        // inside the arguments of another one shows up in a later round.
+        let mut scratch = diag::Diags::new(&root.path.display().to_string(), &root.src);
+        impls::log_begin();
+        let _ = sema::check(&prog, &mut scratch);
+        let resolved: std::collections::HashMap<ast::ExprId, String> = impls::log_take().into_iter().collect();
+        let rest = dargs::apply_late(&mut prog, &mut dg, &dargs_pending, &resolved, false);
+        if rest.len() >= dargs_pending.len() {
+            dargs::apply_late(&mut prog, &mut dg, &rest, &resolved, true);
+            break;
+        }
+        dargs_pending = rest;
+    }
     tm.mark("mono");
     if opts.emit == Emit::Ast && !dg.has_errors() {
         println!("{:#?}", prog);

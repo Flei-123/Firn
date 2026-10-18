@@ -40,10 +40,39 @@ struct Cx<'a> {
     msigs: &'a HashMap<String, Vec<Sig>>,
     next: u32,
     dg: &'a mut Diags,
+    /// r705: the ambiguous method calls (receiver `ExprId`), left as written
+    /// by the first run.
+    pending: Vec<ExprId>,
+    /// r705: second run -- only the `pending` calls are rewritten, with the
+    /// function the type checker resolved for each (receiver `ExprId` -> fn).
+    late: Option<&'a HashMap<ExprId, String>>,
+    late_set: HashSet<ExprId>,
 }
 
-/// Rewrites every call of `prog` in place.
-pub fn apply(prog: &mut Program, dg: &mut Diags) {
+/// Rewrites every call of `prog` in place. Yields the receiver ids of the
+/// method calls that could not be settled without the receiver type (r705);
+/// `apply_late` finishes those once the type checker has told which method
+/// each one reaches.
+pub fn apply(prog: &mut Program, dg: &mut Diags) -> Vec<ExprId> {
+    run(prog, dg, None, HashSet::new())
+}
+
+/// r705: second run for the calls `apply` left. `resolved` maps the receiver
+/// id of a method call to the function it reaches (from `impls::log_take`).
+/// Yields the calls still open (a call inside the arguments of another one is
+/// only seen by the type checker once the outer call is positional: the
+/// caller repeats until nothing is left or nothing changes). `last` reports
+/// the open ones as errors instead.
+pub fn apply_late(prog: &mut Program, dg: &mut Diags, pending: &[ExprId], resolved: &HashMap<ExprId, String>, last: bool) -> Vec<ExprId> {
+    LATE_LAST.with(|l| l.set(last));
+    run(prog, dg, Some(resolved), pending.iter().copied().collect())
+}
+
+thread_local! {
+    static LATE_LAST: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+fn run(prog: &mut Program, dg: &mut Diags, late: Option<&HashMap<ExprId, String>>, late_set: HashSet<ExprId>) -> Vec<ExprId> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     let mut msigs: HashMap<String, Vec<Sig>> = HashMap::new();
     let consts: HashSet<String> = prog.consts.iter().map(|c| c.name.clone()).collect();
@@ -57,21 +86,18 @@ pub fn apply(prog: &mut Program, dg: &mut Diags) {
             names: f.params.iter().map(|p| p.name.clone()).collect(),
             defaults: f.params.iter().map(|p| p.default.clone()).collect(),
         };
-        if f.params.first().map_or(false, |p| p.name == "self") {
+        if late.is_none() && f.params.first().map_or(false, |p| p.name == "self") {
             if let Some(i) = f.name.rfind("__") {
                 msigs.entry(f.name[i + 2..].to_string()).or_default().push(sig.clone());
             }
         }
         sigs.insert(f.name.clone(), sig);
     }
-    let mut cx = Cx { sigs: &sigs, msigs: &msigs, next: prog.expr_count, dg };
+    let mut cx = Cx { sigs: &sigs, msigs: &msigs, next: prog.expr_count, dg, pending: Vec::new(), late, late_set };
     for f in prog.funcs.iter_mut() {
         block(&mut cx, &mut f.body);
         // The defaults themselves stay on the declaration; nothing reads them
         // after this pass.
-        for p in f.params.iter_mut() {
-            p.default = None;
-        }
     }
     for c in prog.consts.iter_mut() {
         expr(&mut cx, &mut c.value);
@@ -80,6 +106,15 @@ pub fn apply(prog: &mut Program, dg: &mut Diags) {
         expr(&mut cx, &mut s.value);
     }
     prog.expr_count = cx.next;
+    // r705: the defaults stay while some method call waits for its receiver type
+    if cx.pending.is_empty() {
+        for f in prog.funcs.iter_mut() {
+            for p in f.params.iter_mut() {
+                p.default = None;
+            }
+        }
+    }
+    cx.pending
 }
 
 /// A default must be a constant expression: literals, `const` names, unary
@@ -203,17 +238,42 @@ fn call(cx: &mut Cx, e: &mut Expr) {
         expr(cx, a);
     }
     let has_named = args.iter().any(|a| matches!(a.kind, ExprKind::Named(..)));
+    let recv_id: Option<ExprId> = args.first().map(|a| a.id);
+    if cx.late.is_some() {
+        // second run: only the calls the first run left
+        match recv_id {
+            Some(r) if cx.late_set.contains(&r) => {}
+            _ => return,
+        }
+    }
     let sig_opt: Option<&Sig> = match crate::impls::method_name(&name) {
+        Some(_) if cx.late.is_some() => {
+            let full = recv_id.and_then(|r| cx.late.and_then(|l| l.get(&r)));
+            match full.and_then(|f| cx.sigs.get(f)) {
+                Some(s) => Some(s),
+                None => {
+                    if LATE_LAST.with(|l| l.get()) {
+                        cx.dg.error_note(
+                            call_span,
+                            format!("the method '{}' needs default or named arguments but its receiver type is unknown", crate::impls::method_name(&name).unwrap_or("")),
+                            "give the receiver a clear type or pass every argument",
+                        );
+                    } else if let Some(r) = recv_id {
+                        cx.pending.push(r);
+                    }
+                    return;
+                }
+            }
+        }
         Some(m) => match cx.msigs.get(m) {
             Some(v) => match pick_method(v, args.len(), has_named) {
                 Pick::One(s) => Some(s),
                 Pick::Unchanged => return,
                 Pick::Ambiguous => {
-                    cx.dg.error_note(
-                        call_span,
-                        format!("the method '{}' needs default or named arguments but exists on several types", m),
-                        "the receiver type is not known here: give those methods the same parameters and defaults, or pass every argument",
-                    );
+                    // r705: the receiver type decides -- settled in `apply_late`
+                    if let Some(r) = recv_id {
+                        cx.pending.push(r);
+                    }
                     return;
                 }
             },

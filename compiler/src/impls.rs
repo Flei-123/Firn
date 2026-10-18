@@ -68,7 +68,7 @@
 //! * Generic types (`Vec[T]`) have no methods during this round; see
 //!   `docs/ROUND45.md`, section "deliberately left out".
 
-use crate::ast::{Expr, ExprKind, FnDecl, Param, Program, TypeExpr, UnOp};
+use crate::ast::{Expr, ExprId, ExprKind, FnDecl, Param, Program, TypeExpr, UnOp};
 use crate::diag::Span;
 use crate::lexer::TokKind;
 use crate::parser::Parser;
@@ -87,6 +87,30 @@ pub(crate) const SEP: &str = "__";
 /// method name.
 pub(crate) fn method_name(name: &str) -> Option<&str> {
     name.strip_prefix(P_CALL)
+}
+
+thread_local! {
+    /// r705: while `Some`, `hook_call` records `(receiver ExprId, resolved
+    /// function)` for every method call it resolves (see `dargs::apply_late`).
+    static RES_LOG: std::cell::RefCell<Option<Vec<(ExprId, String)>>> = std::cell::RefCell::new(None);
+}
+
+/// Starts recording the method resolutions of the next type check.
+pub(crate) fn log_begin() {
+    RES_LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stops recording and hands out what was recorded.
+pub(crate) fn log_take() -> Vec<(ExprId, String)> {
+    RES_LOG.with(|l| l.borrow_mut().take().unwrap_or_default())
+}
+
+fn log_note(id: ExprId, full: &str) {
+    RES_LOG.with(|l| {
+        if let Some(v) = l.borrow_mut().as_mut() {
+            v.push((id, full.to_string()));
+        }
+    });
 }
 
 /// Name of the function behind `Type.method`.
@@ -786,6 +810,7 @@ pub(crate) fn hook_call(
         }
     };
     let display = format!("{}.{}", prefix, method);
+    log_note(recv.id, &full);
     // Adapt the receiver — the only automatism at the call site.
     match sig.params.first() {
         Some(t) if t.is_ptr() && !is_ptr => {

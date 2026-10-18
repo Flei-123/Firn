@@ -1186,9 +1186,11 @@ parameter given twice, missing required parameter, required parameter after an
 optional one, non-constant default. Methods (`x.m(a, b: 1)`, not in
 `impl I for T`) and generic templates (`f[T](a, b: 1)`, a default may name `T`:
 `b: T = 3 as T`) take defaults and named arguments too (r704). A method call is
-matched by its bare name (the receiver type is not known to the rewrite): if
-several types define a method of that name, the call is only rewritten when
-the signatures agree (same names, no defaults), otherwise it is an error.
+resolved by the RECEIVER type (r705, firnc0): two types may have a method of
+the same name with different parameters and defaults. When the bare name already
+decides (one candidate, or the signatures agree) the rewrite runs before the
+type check; otherwise a first type check records the method each call reaches
+and the rewrite is finished with that signature (`dargs::apply_late`).
 Not allowed: defaults on `extern fn`, `impl I for T` methods, closures and
 function types. See `docs/DEFAULT-ARGS.md`; proof in
 `tests/3910_default_args.fi`, `tests/3950_default_args_methods.fi` and
@@ -2018,10 +2020,13 @@ module can be called through its module: `vec.push[i32](&v, 3)`. The module
 part is checked (`module 'x' is not imported`, `module 'm' has no generic
 function 'f'`, `'f' is not exported by module 'm'`) and then dropped: generic
 names hold program-wide, so the call is the same as the bare `push[i32](..)`.
-Libraries no longer need to export bare names to stay usable. Not covered:
-`mod.Type[T]` in type or literal position, and generic functions as values.
-Both compilers (firnc0 `sema_generic.rs::hook_generic_call`, firnc1
-`parser.fi` primary identifier). Tests 3970-3974.
+Libraries no longer need to export bare names to stay usable. **r707:** a generic struct is named the same way, in type position and as a
+literal: `var b: vec.Vec[i32] = vec.Vec[i32] { .. }`; the same checks apply
+(`module 'm' has no generic struct 'S'`, `'S' is not exported by module 'm'`).
+Not covered: generic functions as VALUES (`let f = vec.push[i32]` -- there are no
+function values for templates). Both compilers (firnc0
+`sema_generic.rs::hook_qual_generic_type`/`hook_primary`, firnc1 `parser.fi`
+`ty()` and primary identifier). Tests 3970-3975, 3991, neg 3992.
 
 #### 14.1.sizeof -- `size_of[T]()` (round 16)
 
