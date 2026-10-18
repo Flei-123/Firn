@@ -298,8 +298,13 @@ pub(crate) fn emit_checked_bin(
     let bad = format!(".Lchksite{}", uid);
     // The two originals have to survive the operation: the message names
     // them. x11/x13 are scratch of the A64 backend and hold no FIR value.
-    e.line(&format!("mov x11, {}", A));
-    e.line(&format!("mov x13, {}", B));
+    // 64-bit add/sub: the originals are recomputed in the panic block (a = result -/+ b, exact modulo 2^64),
+    // so the hot path needs no copies.
+    let recompute = bits == 64 && matches!(op, BinOp::Add | BinOp::Sub);
+    if !recompute {
+        e.line(&format!("mov x11, {}", A));
+        e.line(&format!("mov x13, {}", B));
+    }
     if bits == 64 && op == BinOp::Mul {
         // 64 bits: the upper half decides. Signed overflow means the high
         // word is not the sign extension of the low one, unsigned means it
@@ -361,6 +366,11 @@ pub(crate) fn emit_checked_bin(
     }
     e.line(&format!("b {}", ok));
     e.raw(&format!("{}:", bad));
+    if recompute {
+        let inv = if op == BinOp::Add { "sub" } else { "add" };
+        e.line(&format!("{} x11, {}, {}", inv, A, B));
+        e.line(&format!("mov x13, {}", B));
+    }
     trampoline_jump(e, panic_code_of(op), &label, msg.len(), "x11", "x13", !ty.signed());
     e.raw(&format!("{}:", ok));
 }
