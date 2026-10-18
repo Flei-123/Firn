@@ -139,7 +139,7 @@ export {
     accordion, accordion_section, accordion_is_open, accordion_set, accordion_open_count, accordion_sections,
     table, table_col, table_add_row, table_set, table_cell, table_rows, table_cursor_row, table_cursor_col, table_set_cursor,
     table_event, table_event_row, table_event_col, table_sort, table_sort_col, table_sort_desc, table_editing, table_edit_text,
-    table_cell_rect, table_begin, table_commit, table_cancel, KEY_F2, TE_NONE, TE_MOVED, TE_BEGIN, TE_COMMIT, TE_CANCEL, TE_SORT,
+    table_cell_rect, table_begin, table_commit, table_cancel, table_edit_caret, table_edit_anchor, KEY_F2, TE_NONE, TE_MOVED, TE_BEGIN, TE_COMMIT, TE_CANCEL, TE_SORT,
     ripple_on, split_begin, split_mid, split_end, split_ratio, split_set_ratio, split_limits, split_hovered, split_dragging,
     ANS_OK, ANS_CANCEL,
     CTL_MAX, OPT_MAX, NONE,
@@ -6705,10 +6705,12 @@ fn tb_paint(c: *mut Ctl) {
 // IN-PLACE EDITOR of wave8m.CellEdit: Left / Right move the cursor, F2 / Enter / double click / typing begin editing,
 // Enter commits and goes one row down, Tab / Shift+Tab commit and go to the next / previous editable cell, Esc cancels,
 // a click on another cell commits. `cb(a, id)` runs after a commit, a cancel and a sort; `table_event` says which
-// (TE_*) and `table_event_row/_col` where. The screen reader gets role table, rows with the cells joined and the
-// description "Cell Name, column 1 of 3, row 2 of 40".
-// HONEST: a click inside the open editor does not place the caret; the rows of the a11y tree are the list's (the cells of
-// a row are one name, not child nodes); at most 64 columns; the data lives in the table (table_cell reads it).
+// (TE_*) and `table_event_row/_col` where. The screen reader gets role table, `row` children (the cells joined) with
+// one `cell` child per column (AT-SPI table row / table cell, UIA DataItem / cell; the cell at the cursor column is
+// the focused one) and the description "Cell Name, column 1 of 3, row 2 of 40".
+// A press inside the open editor places the caret (double click = word, triple = all); dragging selects.
+// HONEST: at most 64 columns; the data lives in the table (table_cell reads it); the header row is not a row of the a11y
+// tree (the column titles are in the cell descriptions); no AT-SPI Table interface / UIA Grid pattern yet; no Shift+click.
 
 const K_TABLE: u32 = 33
 const KEY_F2: u32 = 101
@@ -6794,6 +6796,7 @@ fn table(a: *mut app.App, name: str, w: usize, h: usize, cols: usize, on_change:
     app.vlist_on_sort(a, node, tbl_on_sort)
     app.vlist_on_activate(a, node, tbl_on_act)
     a11y.a11y_set_role(app.ax(a), node, a11y.ROLE_TABLE)
+    a11y.a11y_set_vtable(app.ax(a), node, true)
     return node
 }
 
@@ -6937,6 +6940,23 @@ fn table_edit_text(a: *mut app.App, id: usize) -> str {
     let t: *mut Tbl = tbl_of(st(a), i)
     let b: *mut textbuf.TextBuf = editor.editor_buf(&(*t).ed)
     return str { p: textbuf.tb_ptr(b) as *mut u8, n: textbuf.tb_len(b) }
+}
+
+// the caret (byte offset) and the selection anchor in the cell editor (equal = no selection)
+fn table_edit_caret(a: *mut app.App, id: usize) -> usize {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return 0
+    }
+    return textbuf.tb_caret(editor.editor_buf(&(*tbl_of(st(a), i)).ed))
+}
+
+fn table_edit_anchor(a: *mut app.App, id: usize) -> usize {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return 0
+    }
+    return textbuf.tb_anchor(editor.editor_buf(&(*tbl_of(st(a), i)).ed))
 }
 
 // the rectangle of a cell in window pixels (x, y, w, h) while it shows; false = scrolled away
@@ -7183,6 +7203,7 @@ fn tbl_describe(c: *mut Ctl, i: usize) {
         }
     }
     a11y.a11y_set_description(app.ax((*c).a), (*c).node[i], (&(*t).desc[0]) as u64, (*t).dn)
+    a11y.a11y_set_vcell_col(app.ax((*c).a), (*c).node[i], (*t).ce.col)
 }
 
 fn tbl_key_route(c: *mut Ctl, key: u32, mods: u32) -> bool {
@@ -7257,9 +7278,52 @@ fn tbl_chr_route(c: *mut Ctl, cp: u32, mods: u32) -> bool {
     return true
 }
 
+// the open editor as a field widget over its cell (the one tbl_paint draws)
+fn tbl_edit_widget(c: *mut Ctl, i: usize, f: *mut widget.Widget) -> bool {
+    let t: *mut Tbl = tbl_of(c, i)
+    var r: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
+    if !tbl_cell_rect(c, i, (*t).ce.row, (*t).ce.col, &r) {
+        return false
+    }
+    *f = widget.widget_new(widget.KIND_TEXTBOX)
+    widget.w_place(f, r[0], r[1], r[2], r[3])
+    widget.w_set_focus(f, true)
+    return true
+}
+
+// the mouse in the open editor: down places the caret (double click word, triple all), move drags a selection
+fn tbl_edit_mouse(c: *mut Ctl, i: usize, kind: u32, x: f64, y: f64) -> bool {
+    let t: *mut Tbl = tbl_of(c, i)
+    if kind == fuiwirt.HOOK_UP || kind == fuiwirt.HOOK_LEAVE {
+        let u: u32 = editor.editor_mouse_up(&(*t).ed)
+        return false
+    }
+    var f: widget.Widget = widget.widget_new(widget.KIND_TEXTBOX)
+    if !tbl_edit_widget(c, i, &f) {
+        return false
+    }
+    let rc: *mut render.Ctx = app.app_ctx((*c).a)
+    let x0: f64 = render.field_text_x0(rc, &f)
+    var fm: render.FieldMeas = render.field_meas_new(rc, &f)
+    if kind == fuiwirt.HOOK_DOWN {
+        let now: u64 = ((*rc).ms as u64) * 1000
+        let r: u32 = editor.editor_mouse_down(&(*t).ed, x - x0, now, render.field_meas, (&fm) as u64, false)
+        return true
+    }
+    if kind == fuiwirt.HOOK_MOVE && textbuf.tb_drag(editor.editor_buf(&(*t).ed)) != 0 as u32 {
+        let r2: u32 = editor.editor_mouse_drag(&(*t).ed, x - x0, render.field_meas, (&fm) as u64)
+        return true
+    }
+    return false
+}
+
 // a press: the cell under it becomes the cursor cell; an open edit is committed by a press anywhere else
 fn tbl_ptr_route(c: *mut Ctl, kind: u32, x: f64, y: f64) -> bool {
     if kind != fuiwirt.HOOK_DOWN {
+        let e: usize = tbl_editing_entry(c)
+        if e != NONE && (kind == fuiwirt.HOOK_MOVE || kind == fuiwirt.HOOK_UP || kind == fuiwirt.HOOK_LEAVE) {
+            return tbl_edit_mouse(c, e, kind, x, y)
+        }
         return false
     }
     var changed: bool = false
@@ -7305,6 +7369,8 @@ fn tbl_ptr_route(c: *mut Ctl, kind: u32, x: f64, y: f64) -> bool {
                     tbl_event(c, i, TE_COMMIT, (*t).ce.last_row, (*t).ce.last_col)
                     changed = true
                 }
+            } else if tbl_edit_mouse(c, i, kind, x, y) {
+                changed = true
             }
         } else if row != NONE && row < (*t).cells.rows {
             let moved: bool = col != (*t).ce.col

@@ -109,10 +109,22 @@ let s = option.opt_some[i32]             // module qualified
   firnc0: `lambda.rs::value_rewrite` + `sema_generic::infer_fn_value` + `mono::expand_late` (instances recorded after
   `mono::expand`; the lambda pass runs again over the new bodies). firnc1: `lamsugar.fi` calls the hook
   `mono.gen_infer_value` (`unify_ty`), `gen_run` expands the new instances and runs the pass again.
-  Limits: firnc1 does not detect a local variable named like the generic fn (flat tree); `mod.f` (qualified) only in firnc0.
+  Limits: firnc1 treats a fn-typed (or untyped) variable of that name ANYWHERE in the program as the variable (flat tree, over-cautious).
 * r742: methods as values: `Type.m` (no call) is the plain function `Type__m`, receiver pointer = first parameter:
   `let f = Acc.bump; f(&a, 4)`, `apply(Acc.bump, ..)`, struct field. A BOUND receiver (`x.m` without a call) is NOT supported:
   firnc0 reports `method 'm' of 'T' used as a value without a call` (hint: `Type.m` or `|a| x.m(a)`); firnc1 leaves it to the type checker.
 * r742: lambda assignment targets (`x.f = |a| ..`) find the type of the target through method-call results
   (`let x = obj.method()`), `try f()`, cast, address-of, module statics/consts (firnc0) and are block scoped
   (a `let` in an inner block that shadows with another type ends with the block; `for` variables shadow). Tests 4300-4304.
+
+## r742b (18.10.2026): the rest of generic fn values
+* `apply_g(id, 4)` -- a generic CALLEE without type arguments is allowed when an argument is the NAME of a generic fn
+  (`sema_generic::infer_call`, firnc1 `gen_infer_call`): `T` comes from the other arguments (typed locals, casts, `&x`,
+  literals as a weak default `4` -> i32, `2.5` -> f64; a plain `fn` name gives its signature in firnc0). Then the fn-value
+  argument is inferred from the now concrete parameter type. Other bare generic calls stay an error (tests/neg/generic_without_ty_args).
+  Not inferable -> `cannot infer the type parameter 'T' of 'f' from the arguments` (tests/neg/4305).
+  firnc1 gets the argument types from its statement walk (`calls_in_expr`, same env as the lambda targets); a plain `fn` name as
+  argument gives no type there (write `apply_g[i32](inc, 4)`).
+* `mod.f` (qualified, no `[T]`) is a generic fn value in both compilers (`option.opt_some`): modules.rs resolves it to the global template name.
+* firnc1: a fn-typed/untyped variable named like a generic fn hides it; `ty_of` knows casts, `&x`, module statics/consts.
+* Bound method value `x.m` is NOT built (needs a closure record = `try gc |a| x.m(a)`; `Type.m` passes the receiver as first argument).

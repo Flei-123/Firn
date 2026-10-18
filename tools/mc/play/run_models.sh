@@ -4,6 +4,7 @@
 # pure quadrant colours (red / green top, blue / yellow bottom), a stairs model (parent block/stairs) and an oak_stairs blockstate with all four facings.
 # Run A: MCPLAY_MODELS=1. Run B: same world, MCPLAY_MODELS unset (default: the stairs are full cubes). Run C: like A, but the T key (pack reload) is
 # pressed after the blocks stand -> ModelSet reset + wr_clear, the picture must have the models again.
+# Pick probes (MCPLAY_PICK_PROBE, r236b): A / C pick the quads of the stairs (mc_model_pick: distances 3.0 / 4.5 / 4.0), B the whole voxel (2.5 / 4.0 / 4.0).
 # Checks: exit 0, frames; A and C print `models on` + `models states=N unmapped=0` (N > 0); B prints no `models` line; A has >= 120 pixels of EACH of
 # the four fixture colours in the 3D view; B differs from A in >= 1 % of the 3D view pixels (stairs vs cubes); C has the fixture colours again.
 # Prints `RESULT mc-play-models: ok|FAIL`. Env: FIRNC, MODELS_KEEP_DIR (copy of outs/pngs/pack/server.log, always), MODELS_RUN_S (40 = run time per mcplay),
@@ -116,9 +117,13 @@ run_one() { # name, reload, env...
     [ $ok -eq 1 ] || { echo "  FAIL  $name: join / tp failed 3 times"; ERR=1; }
     echo "  $name player=$pn"
 }
-run_one A 0 MCPLAY_MODELS=1
-run_one B 0
-run_one C 1 MCPLAY_MODELS=1
+# Pick probes (r236b, mc_model_pick): rays through the stairs at (-2, -60, 5) (facing east: lower half y < 0.5, upper step x > -1.5).
+# R1 sideways at y = 0.75 through the empty part into the step (models: 3.0 to the step face, voxel pick: 2.5 to the cell border), R2 down onto the
+# lower half (models 4.5 / voxel 4.0), R3 down onto the step (4.0 both).
+PROBE="-4500,-59250,5500,1000,0,0;-1750,-55000,5500,0,-1000,0;-1250,-55000,5500,0,-1000,0"
+run_one A 0 MCPLAY_MODELS=1 MCPLAY_PICK_PROBE="$PROBE"
+run_one B 0 MCPLAY_PICK_PROBE="$PROBE"
+run_one C 1 MCPLAY_MODELS=1 MCPLAY_PICK_PROBE="$PROBE"
 num() { grep -E "mcplay: (end|stream)" "$W/$1.out" | grep -o "$2=[0-9]*" | tail -1 | cut -d= -f2; }
 for n in A B C; do
     F=$(num $n frames)
@@ -167,6 +172,25 @@ PY
         [ "$DP" -ge $((DT / 100)) ] || { echo "  FAIL  A equals B (stairs drawn as cubes?): $DP of $DT pixels differ"; ERR=1; }
     fi
 fi
+# pick probes: A and C (models) hit the quads, B (default) the whole voxel
+probe_line() { grep -E "^mcplay: probe " "$W/$1.out" | sed -n "${2}p"; } # run, ray number
+probe_chk() { # run, ray, expected "x= y= z= n= dist_mm=" tail, what
+    local L; L=$(probe_line "$1" "$2")
+    case "$L" in
+        *" hit=1 x=-2 y=-60 z=5 n=$3 dist_mm=$4 "*) ;;
+        *) echo "  FAIL  $1 probe $2 ($5): got '$L', want n=$3 dist_mm=$4"; ERR=1 ;;
+    esac
+}
+for n in A C; do
+    grep -q "^mcplay: probe models=1" "$W/$n.out" || { echo "  FAIL  $n: no 'probe models=1' line"; ERR=1; }
+    probe_chk $n 1 "-1,0,0" 3000 "step face through the empty half"
+    probe_chk $n 2 "0,1,0" 4500 "top of the lower half"
+    probe_chk $n 3 "0,1,0" 4000 "top of the step"
+done
+grep -q "^mcplay: probe models=0" "$W/B.out" || { echo "  FAIL  B: no 'probe models=0' line"; ERR=1; }
+probe_chk B 1 "-1,0,0" 2500 "voxel border"
+probe_chk B 2 "0,1,0" 4000 "voxel top"
+probe_chk B 3 "0,1,0" 4000 "voxel top"
 [ -n "${MCPLAY_PNG_OUT:-}" ] && [ -s "$W/A.png" ] && cp "$W/A.png" "$MCPLAY_PNG_OUT"
 keep_logs
 [ $ERR -eq 0 ] && echo "RESULT mc-play-models: ok" || echo "RESULT mc-play-models: FAIL"

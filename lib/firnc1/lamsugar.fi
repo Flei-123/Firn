@@ -30,9 +30,12 @@ import intern
 import ast
 import err
 
-export { run, ty_same, Hk, declared_anywhere }
+export { run, ty_same, Hk, declared_anywhere, declared_fn_var, CALL_MODE }
 
 const NONE: u32 = 4294967295
+// r742b: `hook(gp, call_node, CALL_MODE)` = infer the type arguments of the generic callee
+// of this `E_CALL` from its value arguments (`apply_g(id, 4)`).
+const CALL_MODE: u32 = 4294967294
 
 // r742: the generic-function hook. `hook(gp, node, expected)` is implemented by
 // mono.fi (`gen_infer_value`): node is an `E_ID` naming a generic function and
@@ -41,7 +44,7 @@ const NONE: u32 = 4294967295
 // (returns 1). gp == 0: no hook (callers without a generic registry).
 struct Hk {
     gp: u64,
-    hook: fn(u64, u32, u32) -> u32,
+    hook: fn(u64, u32, u32, u64) -> u32,
 }
 
 fn use_hook(hk: *mut Hk, b: *mut ast.Tree, node: u32, pt: u32) -> u32 {
@@ -51,8 +54,17 @@ fn use_hook(hk: *mut Hk, b: *mut ast.Tree, node: u32, pt: u32) -> u32 {
     if ast.e_kind(b, node) != ast.E_ID || ast.t_kind(b, pt) != ast.T_FN {
         return 0
     }
-    let f: fn(u64, u32, u32) -> u32 = (*hk).hook
-    return f((*hk).gp, node, pt)
+    let f: fn(u64, u32, u32, u64) -> u32 = (*hk).hook
+    return f((*hk).gp, node, pt, 0)
+}
+
+// r742b: `atys` = the evident type node of every argument (NOTHING = unknown).
+fn use_call_hook(hk: *mut Hk, node: u32, atys: *mut Vec[u32]) -> u32 {
+    if (*hk).gp == 0 {
+        return 0
+    }
+    let f: fn(u64, u32, u32, u64) -> u32 = (*hk).hook
+    return f((*hk).gp, node, CALL_MODE, atys as u64)
 }
 
 // Is `nm` declared as a parameter, `let`, `var` or loop variable anywhere? Then a bare
@@ -72,6 +84,36 @@ fn declared_anywhere(b: *mut ast.Tree, nm: u32) -> bool {
         let k: u32 = ast.s_kind(b, s as u32)
         if (k == ast.S_LET || k == ast.S_VAR || k == ast.S_FOR) && ast.s_a(b, s as u32) == nm {
             return true
+        }
+        s = s + 1
+    }
+    return false
+}
+
+// r742b: is `nm` declared anywhere as a variable that could be a function value (declared
+// `fn(..)` type, or no declared type at all)? A bare use of a generic function name is then
+// left alone. Variables of other types (`count: i32`) do not hide the generic function.
+fn declared_fn_var(b: *mut ast.Tree, nm: u32) -> bool {
+    let np: usize = vec_len[u32](&(*b).pa_name)
+    var i: usize = 0
+    while i < np {
+        if vec_at[u32](&(*b).pa_name, i) == nm {
+            let t: u32 = ast.param_ty(b, i as u32)
+            if t == ast.NOTHING || ast.t_kind(b, t) == ast.T_FN {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    let ns: usize = vec_len[u32](&(*b).s_kind)
+    var s: usize = 0
+    while s < ns {
+        let k: u32 = ast.s_kind(b, s as u32)
+        if (k == ast.S_LET || k == ast.S_VAR || k == ast.S_FOR) && ast.s_a(b, s as u32) == nm {
+            let t: u32 = ast.s_b(b, s as u32)
+            if k == ast.S_FOR || t == ast.NOTHING || ast.t_kind(b, t) == ast.T_FN {
+                return true
+            }
         }
         s = s + 1
     }
@@ -362,7 +404,37 @@ fn ty_of(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, fmap: *
     }
     let k: u32 = ast.e_kind(b, e)
     if k == ast.E_ID {
-        return env_find(names, tys, ast.e_a(b, e))
+        let t0: u32 = env_find(names, tys, ast.e_a(b, e))
+        if t0 != ast.NOTHING || declared_anywhere(b, ast.e_a(b, e)) {
+            return t0
+        }
+        // r742b: a module static / const
+        let nm0: u32 = ast.e_a(b, e)
+        var gi: usize = 0
+        while gi < ast.static_count(b) {
+            if ast.static_name(b, gi) == nm0 {
+                return ast.static_ty(b, gi)
+            }
+            gi = gi + 1
+        }
+        gi = 0
+        while gi < ast.const_count(b) {
+            if ast.const_name(b, gi) == nm0 {
+                return ast.const_ty(b, gi)
+            }
+            gi = gi + 1
+        }
+        return ast.NOTHING
+    }
+    if k == ast.E_AS {
+        return ast.e_b(b, e)
+    }
+    if k == ast.E_UN && ast.e_a(b, e) == 2 {
+        let inner: u32 = ty_of(b, it, ef, fmap, names, tys, ast.e_b(b, e))
+        if inner == ast.NOTHING {
+            return ast.NOTHING
+        }
+        return ast.ty_new(b, ast.T_PTR, inner, 1)
     }
     if k == ast.E_SLIT {
         return ast.ty_new(b, ast.T_NAME, ast.e_a(b, e), 0)
@@ -443,10 +515,70 @@ fn ty_of(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, fmap: *
     return ast.NOTHING
 }
 
+// r742b: every plain call inside the expression `e` (depth first). A call whose callee is a
+// generic function (not in the function table) gets the evident argument types from the
+// environment and may be renamed to an instance by the hook.
+fn calls_in_expr(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, hk: *mut Hk,
+    fmap: *mut Vec[u32], names: *mut Vec[u32], tys: *mut Vec[u32], e: u32) {
+    if e == ast.NOTHING || (*hk).gp == 0 {
+        return
+    }
+    let k: u32 = ast.e_kind(b, e)
+    if k == ast.E_UN || k == ast.E_NAMED {
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.e_b(b, e))
+    } else if k == ast.E_BIN {
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.e_b(b, e))
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.e_c(b, e))
+    } else if k == ast.E_FIELD || k == ast.E_AS {
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.e_a(b, e))
+    } else if k == ast.E_IDX {
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.e_a(b, e))
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.e_b(b, e))
+    } else if k == ast.E_IFEX {
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.e_a(b, e))
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.e_b(b, e))
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.e_c(b, e))
+    } else if k == ast.E_SLIT {
+        var q: u32 = 0
+        while q < ast.e_c(b, e) {
+            calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.child_at(b, ast.e_b(b, e) + q * 2 + 1))
+            q = q + 1
+        }
+    } else if k == ast.E_ALIT {
+        var q: u32 = 0
+        while q < ast.e_c(b, e) {
+            calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.child_at(b, ast.e_b(b, e) + q))
+            q = q + 1
+        }
+    } else if k == ast.E_CALL && ast.e_number(b, e) == 0 {
+        let off: u32 = ast.e_b(b, e)
+        let cnt: u32 = ast.e_c(b, e)
+        var q: u32 = 0
+        while q < cnt {
+            calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.child_at(b, off + q))
+            q = q + 1
+        }
+        var mw: [u8; 7] = "method "
+        let name: u32 = ast.e_a(b, e)
+        if !intern.intern_prefix(it, name, (&mw[0]) as u64, 7) && !err.error_is_tryname(it, name)
+        && ((name as usize) >= vec_len[u32](fmap) || vec_at[u32](fmap, name as usize) == NONE) {
+            var atys: Vec[u32] = vec_new[u32]()
+            q = 0
+            while q < cnt {
+                vec_push[u32](&atys, ty_of(b, it, ef, fmap, names, tys, ast.child_at(b, off + q)))
+                q = q + 1
+            }
+            use_call_hook(hk, e, &atys)
+            vec_free[u32](&atys)
+        }
+    }
+}
+
 fn assign_stmt(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, hk: *mut Hk,
     fmap: *mut Vec[u32], names: *mut Vec[u32], tys: *mut Vec[u32], st: u32) {
     let k: u32 = ast.s_kind(b, st)
     if k == ast.S_LET || k == ast.S_VAR {
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.s_c(b, st))
         var t: u32 = ast.s_b(b, st)
         if t == ast.NOTHING {
             t = ty_of(b, it, ef, fmap, names, tys, ast.s_c(b, st))
@@ -454,6 +586,17 @@ fn assign_stmt(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, h
         vec_push[u32](names, ast.s_a(b, st))
         vec_push[u32](tys, t)
         return
+    }
+    if k == ast.S_ZUW || k == ast.S_ZUWOP {
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.s_a(b, st))
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.s_b(b, st))
+    }
+    if k == ast.S_RET || k == ast.S_EXPR {
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.s_a(b, st))
+        return
+    }
+    if k == ast.S_IF || k == ast.S_WHILE {
+        calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.s_a(b, st))
     }
     if k == ast.S_ZUW {
         let tgt: u32 = ty_of(b, it, ef, fmap, names, tys, ast.s_a(b, st))
@@ -542,7 +685,7 @@ fn run_assign(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, hk
 // Resolves every lambda that sits in a place with a known expected type and
 // counts the ones that remain open. Cheap when the program uses no sugar.
 fn run(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, gp: u64,
-    hook: fn(u64, u32, u32) -> u32) -> u32 {
+    hook: fn(u64, u32, u32, u64) -> u32) -> u32 {
     var hkv: Hk = Hk { gp: gp, hook: hook }
     let hk: *mut Hk = &hkv
     let total: usize = ast.expr_count(b)
@@ -580,8 +723,8 @@ fn run(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, gp: u64,
         }
         // r742: a generic function name (candidate for inference) or `Type.m`
         if gp != 0 && ki == ast.E_ID {
-            let f0: fn(u64, u32, u32) -> u32 = hook
-            if f0(gp, i as u32, NONE) == 1 {
+            let f0: fn(u64, u32, u32, u64) -> u32 = hook
+            if f0(gp, i as u32, NONE, 0) == 1 {
                 any = true
                 break
             }
