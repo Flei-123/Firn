@@ -111,7 +111,7 @@ run_variant() { # abi:perm:density:font
     $ADB uninstall $PKG >/dev/null 2>&1
     check "$tag: install" "$($ADB install --abi "$abi" "$APK" 2>&1 | grep -c '^Success')" 1
     $ADB shell mkdir -p /sdcard/Android/data/$PKG/files
-    printf 'http://10.0.2.2:%s\n' "$PORT" >"$W/args.txt"; $ADB push "$W/args.txt" /sdcard/Android/data/$PKG/files/args.txt >/dev/null
+    printf 'http://10.0.2.2:%s\ncrashpage\n' "$PORT" >"$W/args.txt"; $ADB push "$W/args.txt" /sdcard/Android/data/$PKG/files/args.txt >/dev/null
     [ "$perm" = granted ] && $ADB shell pm grant $PKG android.permission.POST_NOTIFICATIONS >/dev/null 2>&1
     $ADB logcat -c; $ADB logcat -b crash -c
     local n0; n0=$(grep -c '"type": "info_sent"' "$SLOG")
@@ -149,6 +149,12 @@ run_variant() { # abi:perm:density:font
     $ADB logcat -d -v threadtime 2>/dev/null | grep -E "$PKG|firn|ANR|FATAL|DEBUG" | tail -400 >"$OUT/${tag}.logcat.txt"
     $ADB shell "cat \$(ls -t \$(find /data/data/$PKG /sdcard/Android/data/$PKG -name 'app.log' 2>/dev/null) 2>/dev/null | head -1) 2>/dev/null" | tail -150 >"$OUT/${tag}.app.log" 2>/dev/null
     $ADB shell "ls /data/anr 2>/dev/null | head -3; for f in /data/anr/*; do [ -f \"\$f\" ] && head -60 \"\$f\" | grep -E 'pid|sysTid|prio|Cmd line|\\\"main\\\"|at ' | head -40; done" 2>/dev/null >"$OUT/${tag}.anr.txt"
+    # the crash page: a run that was stopped in the foreground after the sign-in (args.txt line 2 `crashpage` arms it) must show the page at the next start
+    $ADB shell am force-stop $PKG; sleep 1
+    $ADB shell monkey -p $PKG -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+    check "$tag: crash page after the stop (died after sign-in)" "$(OCR_TRIES=20 wait_ocr ${tag}_07 'crash report|LAST STAGE|DIED')" 1
+    $ADB shell "cat \$(find /data/data/$PKG /sdcard/Android/data/$PKG -name last_report.txt 2>/dev/null | head -1) 2>/dev/null" | head -12 >"$OUT/${tag}.report.txt"
+    check "$tag: report names a stage after the sign-in" "$(grep -c -E 'LAST STAGE: (enter_app|ws_open|info_event|push_setup|pio_keep|first_chat_draw|fg|login_ok|alive_3s|first_frame)' "$OUT/${tag}.report.txt")" 1
     $ADB shell am force-stop $PKG
 }
 

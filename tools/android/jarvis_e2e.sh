@@ -349,7 +349,12 @@ echo "  tap the notification without a chat id"
 tap_note "No chat two"
 check "no cid tap: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
 sleep 5; shot 13_nocid_after_tap
+if [ "${STRICT_FRONT:-1}" = 1 ]; then
 check "no cid tap: no chat was forced (the history on screen is the same as before the tap)" "$(ocr 13_nocid_after_tap | grep -c 'second question\|second answer')$(ocr 13_nocid_after_tap | grep -c 'hello')" "$CHAT_BEFORE"
+else
+    # a plain NativeActivity (0.2.8, no org.firn.FirnMain) restarts into the saved chat on a tap: informational only
+    note "no cid tap: history before/after = $CHAT_BEFORE / $(ocr 13_nocid_after_tap | grep -c 'second question\|second answer')$(ocr 13_nocid_after_tap | grep -c 'hello') (plain activity, not checked)"
+fi
 check "no cid tap: the notification is gone" "$(note_lines | grep -c 'No chat two')" 0
 check "no cid tap: no crash so far" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
 
