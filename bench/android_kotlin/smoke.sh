@@ -38,6 +38,11 @@ for _ in $(seq 200); do
   sleep 3
 done
 echo "boot done, abilist: $($ADB shell getprop ro.product.cpu.abilist | tr -d '\r')"
+# wait for emulator network (DNS) so the net scenario can reach the internet
+for _ in $(seq 30); do
+  $ADB shell ping -c1 -W2 example.com >/dev/null 2>&1 && { echo "emulator net ok"; break; }
+  sleep 2
+done
 $ADB shell settings put global window_animation_scale 0 >/dev/null
 $ADB shell settings put global transition_animation_scale 0 >/dev/null
 $ADB shell settings put global animator_duration_scale 1 >/dev/null
