@@ -142,12 +142,12 @@ Effort S <1 day, M 1-3 days, L >3 days. Status `done` = landed on main in this r
 | G20 | P0 | bug | `"a" + f"{n}"` accepted, wrong result / hang; `"" + s` aliased | `text.dup` (done); type error for `str + Fmt` | S | dup **done**, Fmt check: vspy-fnc |
 | G21 | P1 | language | f-string format spec: DONE `{x:>6}` `{x:.2f}` `{n:05}` `{n:x}` `{x:.1%}` (r665) + `,` `_` `e E g G c n`, nested `{w}`/`{p}`, BMP fill (r699), firnc0+firnc1; `{{` + nested quotes done (r664) | spec -> `io.fmt_spec_*` | M | **done** (tools/fmtspec_cross: 0 diffs vs Python); open: `!r`, `f` beyond 2^64 |
 | G22 | P1 | language | `for (i, x) in enumerate(v)` and `for (x, y) in zip(a, b)` DONE (r666, firnc0+firnc1); no comprehension, no general tuple patterns in `for` | comprehension syntax later | M | enumerate/zip **done**; open: comprehensions, `for (a, b) in vec_of_tuples` |
-| G23 | P1 | language | no `Option[T]` (generic enums not possible) | generic enums + `Option[T]` + `?` | L | open |
+| G23 | P1 | language | no generic enums, so no `Option[T]` with `match`/`?` | `std.option` (r712): generic STRUCT `Option[T]{has,val}` + `opt_some/opt_none/opt_unwrap_or/opt_or/opt_eq` + Vec bridges `vec_first_opt/last/get/pop/index_of_opt`; open: `if let Some(x) = o` sugar, `?` propagation, generic enums | L | partial |
 | G24 | P1 | language | capturing closures only as `gc fn` (+`try`); timers/sort keys need ctx struct | stack closures for non-escaping use | L | open |
 | G25 | P1 | language | `mod.fn[T](..)` works (r701, both compilers, tests 3970-3974); still open: `mod.Type[T]` and generic fns are not `fn` values | qualified generics | S-M | partial |
 | G26 | P1 | language | `main` cannot `try`; `catch | e | return x` rejected | `fn main() -> Err!i32`, `catch return` | M | open |
 | G27 | P1 | language | no `derive(Eq, Debug, Hash, Ord, Clone)`; struct `==` and print missing | derive via comptime/reflection (r23) | L | open |
-| G28 | P1 | language | slicing `s[1..3]`, negative index, `x in a`, `[]T` slice type, `.len()` on arrays | slice type + operators | L | open |
+| G28 | P1 | language | slicing: `s[a:b]` / `s[a:]` / `s[:b]` / `s[:]` on `str`/`Span` DONE (r712, parser sugar for `s.slice(a, b)`, Python semantics: negative from the end, clamped, no copy, firnc0+firnc1); open: step `s[::2]` (error today), Vec/array slices as sugar (use `vec_slice`), negative index `v[-1]`, `v[i]` on Vec/str, `x in a`, `[]T` slice type | slice type + operators | L | partial |
 | G29 | P1 | language | no return-type inference, no generic argument inference (`mx[i32](..)` required) | local inference | M | open |
 | G30 | P1 | language | struct shorthand `P { x, y }` / `..base`, `const N` as array length, multi-line / raw strings, `static` with str/Vec init | small parser/sema items | S each | open |
 | G31 | P1 | language | no operator overloading (SPEC says no) | decision: keep rejecting or `impl Add` | M | decision |
