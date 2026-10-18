@@ -23,7 +23,7 @@ import mc.mc_chunk
 
 export {
     InputEvents, InputTables, Player, Pick, input_events_new, player_new, player_free, player_look, player_tick,
-    player_set_camera, player_reach, player_eye, input_pick, input_pick_camera, input_draw_box, input_draw_aabb, world_block_id,
+    player_set_camera, player_reach, player_eye, input_pick, input_pick_camera, input_draw_box, input_draw_aabb, input_draw_aabb_b, world_block_id,
     K_FORWARD, K_BACK, K_LEFT, K_RIGHT, K_JUMP, K_SNEAK, K_SPRINT,
 }
 
@@ -691,6 +691,44 @@ fn floor_div64(a: i64, b: i64) -> i64 {
 // one 3D line (world coordinates) into the colour buffer: near clip, project, snap to 1/16 pixel, integer DDA over the pixel cells,
 // pixel written when 1/z * 1.002 > stored 1/z (depth is not written).
 fn draw_line3(r: *mut mc_raster.Raster, ax: f64, ay: f64, az: f64, bx: f64, by: f64, bz: f64, rgba: u32) {
+    draw_line3_b(r, ax, ay, az, bx, by, bz, rgba, 1.002, 0.0)
+}
+
+// Depth stored by the raster at pixel idx (1/z, 0 = nothing drawn).
+fn depth_at(r: *mut mc_raster.Raster, idx: usize) -> f64 {
+    return *(((*r).depth + (idx as u64) * (8 as u64)) as *mut f64)
+}
+
+// Slope-scaled depth bias (r253): the line pixel is snapped to the pixel grid, so the surface it lies on can be up to half a pixel away; on a face seen
+// at a grazing angle 1/z changes by several percent per pixel and a flat 0.2 % bias z-fights. The largest 1/z step to the 4 neighbours (capped at 4 %
+// of the stored depth, so a line behind the edge of a nearer object stays hidden) scales the extra bias.
+fn depth_slope(r: *mut mc_raster.Raster, px: i64, py: i64, d: f64) -> f64 {
+    let w: i64 = (*r).w as i64
+    let h: i64 = (*r).h as i64
+    var g: f64 = 0.0
+    if px > 0 as i64 {
+        let n: f64 = math.fabs(d - depth_at(r, ((py * w + px - 1 as i64) as usize)))
+        if n > g { g = n }
+    }
+    if px + 1 as i64 < w {
+        let n: f64 = math.fabs(d - depth_at(r, ((py * w + px + 1 as i64) as usize)))
+        if n > g { g = n }
+    }
+    if py > 0 as i64 {
+        let n: f64 = math.fabs(d - depth_at(r, (((py - 1 as i64) * w + px) as usize)))
+        if n > g { g = n }
+    }
+    if py + 1 as i64 < h {
+        let n: f64 = math.fabs(d - depth_at(r, (((py + 1 as i64) * w + px) as usize)))
+        if n > g { g = n }
+    }
+    let cap: f64 = d * 0.04
+    if g > cap { g = cap }
+    return g
+}
+
+// draw_line3 with a configurable depth test: pixel written when iz * bias + slope * (local 1/z step) > stored 1/z.
+fn draw_line3_b(r: *mut mc_raster.Raster, ax: f64, ay: f64, az: f64, bx: f64, by: f64, bz: f64, rgba: u32, bias: f64, slope: f64) {
     let rax: f64 = ax - (*r).cx
     let ray: f64 = ay - (*r).cy
     let raz: f64 = az - (*r).cz
@@ -751,8 +789,10 @@ fn draw_line3(r: *mut mc_raster.Raster, ax: f64, ay: f64, az: f64, bx: f64, by: 
         if px >= 0 as i64 && py >= 0 as i64 && px < w && py < h {
             let iz: f64 = iz0 + (iz1 - iz0) * t
             let idx: usize = (py as usize) * (w as usize) + (px as usize)
-            let d: f64 = *(((*r).depth + (idx as u64) * (8 as u64)) as *mut f64)
-            if iz * 1.002 > d { rt.st32((*r).color, idx, rgba) }
+            let d: f64 = depth_at(r, idx)
+            var extra: f64 = 0.0
+            if slope > 0.0 && d > 0.0 { extra = slope * depth_slope(r, px, py, d) }
+            if iz * bias + extra > d { rt.st32((*r).color, idx, rgba) }
         }
         i = i + 1 as i64
     }
@@ -784,6 +824,11 @@ fn input_draw_box(r: *mut mc_raster.Raster, x: i32, y: i32, z: i32, rgba: u32) {
 
 // The 12 edges of an axis box (world coordinates), grown by 0.002 on every side: the selection box of a pack model (mc_model_pick).
 fn input_draw_aabb(r: *mut mc_raster.Raster, bx0: f64, by0: f64, bz0: f64, bx1: f64, by1: f64, bz1: f64, rgba: u32) {
+    input_draw_aabb_b(r, bx0, by0, bz0, bx1, by1, bz1, rgba, 1.002, 0.75)
+}
+
+// input_draw_aabb with an explicit depth test (see draw_line3_b); the default uses the slope-scaled bias against z-fighting with the model faces.
+fn input_draw_aabb_b(r: *mut mc_raster.Raster, bx0: f64, by0: f64, bz0: f64, bx1: f64, by1: f64, bz1: f64, rgba: u32, bias: f64, slope: f64) {
     let e: f64 = 0.002
     let x0: f64 = bx0 - e
     let y0: f64 = by0 - e
@@ -791,16 +836,16 @@ fn input_draw_aabb(r: *mut mc_raster.Raster, bx0: f64, by0: f64, bz0: f64, bx1: 
     let x1: f64 = bx1 + e
     let y1: f64 = by1 + e
     let z1: f64 = bz1 + e
-    draw_line3(r, x0, y0, z0, x1, y0, z0, rgba)
-    draw_line3(r, x1, y0, z0, x1, y0, z1, rgba)
-    draw_line3(r, x1, y0, z1, x0, y0, z1, rgba)
-    draw_line3(r, x0, y0, z1, x0, y0, z0, rgba)
-    draw_line3(r, x0, y1, z0, x1, y1, z0, rgba)
-    draw_line3(r, x1, y1, z0, x1, y1, z1, rgba)
-    draw_line3(r, x1, y1, z1, x0, y1, z1, rgba)
-    draw_line3(r, x0, y1, z1, x0, y1, z0, rgba)
-    draw_line3(r, x0, y0, z0, x0, y1, z0, rgba)
-    draw_line3(r, x1, y0, z0, x1, y1, z0, rgba)
-    draw_line3(r, x1, y0, z1, x1, y1, z1, rgba)
-    draw_line3(r, x0, y0, z1, x0, y1, z1, rgba)
+    draw_line3_b(r, x0, y0, z0, x1, y0, z0, rgba, bias, slope)
+    draw_line3_b(r, x1, y0, z0, x1, y0, z1, rgba, bias, slope)
+    draw_line3_b(r, x1, y0, z1, x0, y0, z1, rgba, bias, slope)
+    draw_line3_b(r, x0, y0, z1, x0, y0, z0, rgba, bias, slope)
+    draw_line3_b(r, x0, y1, z0, x1, y1, z0, rgba, bias, slope)
+    draw_line3_b(r, x1, y1, z0, x1, y1, z1, rgba, bias, slope)
+    draw_line3_b(r, x1, y1, z1, x0, y1, z1, rgba, bias, slope)
+    draw_line3_b(r, x0, y1, z1, x0, y1, z0, rgba, bias, slope)
+    draw_line3_b(r, x0, y0, z0, x0, y1, z0, rgba, bias, slope)
+    draw_line3_b(r, x1, y0, z0, x1, y1, z0, rgba, bias, slope)
+    draw_line3_b(r, x1, y0, z1, x1, y1, z1, rgba, bias, slope)
+    draw_line3_b(r, x0, y0, z1, x0, y1, z1, rgba, bias, slope)
 }

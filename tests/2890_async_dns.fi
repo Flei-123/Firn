@@ -1,0 +1,289 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+// tests/2890_async_dns.fi -- async.adns: a DNS lookup that never blocks the loop.
+// Two fake name servers in the same loop (127.0.0.1 and 127.0.0.2, one port).
+//
+// A  server 1 is silent, server 2 answers: the lookup succeeds through server 2,
+//    and a 10 ms heartbeat timer is never starved (largest gap < 80 ms while the
+//    lookup waited 150 ms for server 1)
+// B  the same name again: answered from the cache (LOCAL_HIT), no packet
+// C  both silent: the lookup FAILS after its own timeouts, loop alive meanwhile
+// D  NXDOMAIN from server 2 (server 1 silent): ok = false
+// F  async.ahttp: a GET by NAME goes through adns (name -> 127.0.0.1, port 1 refuses):
+//    the request fails at the TCP layer (not DNS), the heartbeat keeps going
+// G  async.ahttp: a name that is NXDOMAIN fails at the DNS layer
+// E  the blocking resolver with a budget of 120 ms and a 2000 ms timeout per
+//    attempt gives up in < 600 ms (budget over ALL servers and retries)
+import std.rt
+import std.net
+import net.dns
+import net.udp
+import async.loop
+import async.adns
+import async.ahttp
+import net.http
+
+static mut fails: u32 = 0
+static mut port: u16 = 0 as u16
+static mut srv_fd: [i64; 2] = [0 - 1, 0 - 1]
+static mut srv_wh: [u64; 2] = [0, 0]
+static mut srv_mode: [u32; 2] = [1, 1] // 0 answer, 1 silent, 2 NXDOMAIN
+static mut srv_hits: [u32; 2] = [0, 0]
+static mut done_flag: bool = false
+static mut done_ok: bool = false
+static mut done_ip: u32 = 0
+static mut last_tick: i64 = 0
+static mut max_gap: i64 = 0
+static mut ticks: u32 = 0
+static mut hb: u64 = 0
+static mut ans_a: u8 = 10
+static mut ans_b: u8 = 1
+static mut ans_c: u8 = 2
+static mut ans_d: u8 = 3
+static mut req_done: bool = false
+static mut req_layer: u32 = 0
+
+fn say(s: str) {
+    syscall(1, 1, s.p as i64, s.n as i64, 0, 0, 0)
+}
+
+fn say_num(v: u32) {
+    var b: [u8; 4] = [48, 32, 32, 10]
+    b[0] = (48 + v % 10) as u8
+    syscall(1, 1, (&b[0]) as i64, 2, 0, 0, 0)
+}
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        say("FAIL ")
+        say_num(code % 10)
+    }
+}
+
+fn on_tick(l: *mut loop.Loop, ud: u64) {
+    let now: i64 = loop.mono_ms()
+    if last_tick != 0 && now - last_tick > max_gap {
+        max_gap = now - last_tick
+    }
+    last_tick = now
+    ticks = ticks + 1
+}
+
+fn on_srv(l: *mut loop.Loop, ud: u64, ev: u32) {
+    let i: usize = ud as usize
+    var buf: [u8; 512] = [0; 512]
+    var fa: u32 = 0
+    var fp: u16 = 0 as u16
+    let k: i64 = udp.udp_recvfrom(srv_fd[i], (&buf[0]) as u64, 512, &fa, &fp)
+    if k < 12 {
+        return
+    }
+    srv_hits[i] = srv_hits[i] + 1
+    let mode: u32 = srv_mode[i]
+    if mode == 1 {
+        return
+    }
+    // end of the question: labels, then 4 octets
+    var p: usize = 12
+    while p < k as usize && buf[p] != 0 as u8 {
+        p = p + (buf[p] as usize) + 1
+    }
+    let qend: usize = p + 1 + 4
+    var out: [u8; 512] = [0; 512]
+    out[0] = buf[0]
+    out[1] = buf[1]
+    out[2] = 0x81 as u8
+    out[3] = 0x80 as u8
+    var an: u8 = 1 as u8
+    if mode == 2 {
+        out[3] = 0x83 as u8
+        an = 0 as u8
+    }
+    out[5] = 1 as u8
+    out[7] = an
+    var j: usize = 12
+    while j < qend {
+        out[j] = buf[j]
+        j = j + 1
+    }
+    var n: usize = qend
+    if mode == 0 {
+        out[n] = 0xC0 as u8
+        out[n + 1] = 12 as u8
+        out[n + 3] = 1 as u8
+        out[n + 5] = 1 as u8
+        out[n + 9] = 60 as u8
+        out[n + 11] = 4 as u8
+        out[n + 12] = ans_a
+        out[n + 13] = ans_b
+        out[n + 14] = ans_c
+        out[n + 15] = ans_d
+        n = n + 16
+    }
+    udp.udp_sendto(srv_fd[i], (&out[0]) as u64, n, fa, fp)
+}
+
+fn srv_open(i: usize, addr: u32, want_port: u16) -> bool {
+    let fd: i64 = udp.udp_open()
+    if fd < 0 {
+        return false
+    }
+    if udp.udp_bind(fd, addr, want_port) < 0 {
+        udp.udp_close(fd)
+        return false
+    }
+    net.set_nonblocking_fd(fd as i32, true)
+    srv_fd[i] = fd
+    return true
+}
+
+fn on_done(ud: u64, ok: bool, o: *mut dns.Resolved) {
+    done_flag = true
+    done_ok = ok
+    if ok && (*o).n > 0 {
+        done_ip = (*o).addr[0]
+    }
+}
+
+// Runs the loop until the lookup is done or `cap_ms` passed; returns the wait.
+fn pump(l: *mut loop.Loop, cap_ms: i64) -> i64 {
+    let t0: i64 = loop.mono_ms()
+    while !done_flag && loop.mono_ms() - t0 < cap_ms {
+        loop.run_once(l, 20)
+    }
+    return loop.mono_ms() - t0
+}
+
+fn lookup(l: *mut loop.Loop, r: *mut dns.Resolver, cap_ms: i64) -> i64 {
+    done_flag = false
+    done_ok = false
+    done_ip = 0
+    let q: *mut adns.AQuery = adns.adns_start(l, r, "example.test".p as u64, 12, on_done, 0)
+    if q as u64 == 0 {
+        return 0 - 1
+    }
+    return pump(l, cap_ms)
+}
+
+fn on_req(rq: *mut ahttp.Request, ud: u64) {
+    req_done = true
+    req_layer = ahttp.areq_layer(rq)
+}
+
+fn run_req(l: *mut loop.Loop, a: *mut ahttp.AClient, url: str) -> i64 {
+    req_done = false
+    req_layer = 0
+    ahttp.aclient_get(a, url.p as u64, url.n, 4000, on_req, 0)
+    let t0: i64 = loop.mono_ms()
+    while !req_done && loop.mono_ms() - t0 < 6000 {
+        loop.run_once(l, 20)
+    }
+    return loop.mono_ms() - t0
+}
+
+#[allow_escape]
+fn main() -> i32 {
+    var l: loop.Loop = loop.loop_new()
+    if !loop.loop_init(&l) {
+        return 2
+    }
+    if !srv_open(0, net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8), 0 as u16) {
+        return 3
+    }
+    port = udp.udp_local_port(srv_fd[0]) as u16
+    if !srv_open(1, net.ipv4(127 as u8, 0 as u8, 0 as u8, 2 as u8), port) {
+        return 4
+    }
+    srv_wh[0] = loop.watch_add(&l, srv_fd[0] as i32, loop.EV_READ, on_srv, 0)
+    srv_wh[1] = loop.watch_add(&l, srv_fd[1] as i32, loop.EV_READ, on_srv, 1)
+    hb = loop.timer_every(&l, 10, on_tick, 0)
+
+    var r: dns.Resolver = dns.resolver_new()
+    dns.resolver_clear_servers(&r)
+    dns.resolver_add_server(&r, net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8))
+    dns.resolver_add_server(&r, net.ipv4(127 as u8, 0 as u8, 0 as u8, 2 as u8))
+    dns.resolver_set_port(&r, port)
+    dns.resolver_set_timeout(&r, 150 as u64)
+    dns.resolver_set_retries(&r, 2 as u32)
+    dns.resolver_use_hosts(&r, false)
+
+    // A
+    srv_mode[0] = 1
+    srv_mode[1] = 0
+    let ta: i64 = lookup(&l, &r, 3000)
+    check(ta >= 0, 1)
+    check(done_flag && done_ok, 2)
+    check(done_ip == net.ipv4(10 as u8, 1 as u8, 2 as u8, 3 as u8), 3)
+    check(srv_hits[0] >= 1 && srv_hits[1] >= 1, 4)
+    check(ta >= 100, 5) // it really waited for server 1
+    check(max_gap < 80, 6) // ... and the heartbeat kept going
+    check(ticks >= 5, 7)
+
+    // B
+    var o: dns.Resolved = dns.resolved_new()
+    let before: u32 = srv_hits[0] + srv_hits[1]
+    check(adns.adns_local(&r, "Example.Test".p as u64, 12, &o) == dns.LOCAL_HIT, 8)
+    check(o.n == 1 && o.addr[0] == net.ipv4(10 as u8, 1 as u8, 2 as u8, 3 as u8), 9)
+    check(srv_hits[0] + srv_hits[1] == before, 0)
+
+    // C
+    dns.resolver_flush(&r)
+    srv_mode[1] = 1
+    max_gap = 0
+    let tc: i64 = lookup(&l, &r, 5000)
+    check(tc >= 0 && done_flag && !done_ok, 1)
+    check(tc >= 300, 2) // 150 + 150 + 300 + 300 in the worst order; at least two timeouts
+    check(max_gap < 80, 3)
+
+    // D
+    srv_mode[1] = 2
+    let td: i64 = lookup(&l, &r, 3000)
+    check(td >= 0 && done_flag && !done_ok, 4)
+
+    // F + G
+    var a: ahttp.AClient = ahttp.aclient_new()
+    check(ahttp.aclient_init(&a, &l), 8)
+    let hr: *mut dns.Resolver = http.client_resolver(ahttp.aclient_http(&a))
+    dns.resolver_clear_servers(hr)
+    dns.resolver_add_server(hr, net.ipv4(127 as u8, 0 as u8, 0 as u8, 1 as u8))
+    dns.resolver_add_server(hr, net.ipv4(127 as u8, 0 as u8, 0 as u8, 2 as u8))
+    dns.resolver_set_port(hr, port)
+    dns.resolver_set_timeout(hr, 150 as u64)
+    dns.resolver_use_hosts(hr, false)
+    srv_mode[0] = 1
+    srv_mode[1] = 0
+    ans_a = 127
+    ans_b = 0
+    ans_c = 0
+    ans_d = 1
+    max_gap = 0
+    let tf: i64 = run_req(&l, &a, "http://by-name.test:1/x")
+    check(req_done && req_layer == ahttp.NL_TCP, 9)
+    check(tf >= 100, 0) // it waited for the silent server 1
+    check(max_gap < 80, 1)
+    srv_mode[1] = 2
+    run_req(&l, &a, "http://missing.test:1/x")
+    check(req_done && req_layer == ahttp.NL_DNS, 2)
+
+    // E: blocking lookup with a budget
+    dns.resolver_flush(&r)
+    srv_mode[0] = 1
+    srv_mode[1] = 1
+    dns.resolver_set_timeout(&r, 2000 as u64)
+    dns.resolver_set_budget(&r, 120 as u64)
+    var ob: dns.Resolved = dns.resolved_new()
+    let t0: i64 = loop.mono_ms()
+    let okb: bool = dns.dns_resolve_a(&r, "budget.test".p as u64, 11, &ob) catch false
+    let spent: i64 = loop.mono_ms() - t0
+    check(!okb, 5)
+    check(spent < 600, 6)
+    check(spent >= 100, 7)
+
+    loop.timer_cancel(&l, hb)
+    if fails == 0 {
+        say("ADNS OK\n")
+        return 0
+    }
+    return 1
+}

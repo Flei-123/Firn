@@ -1,0 +1,243 @@
+// expect_exit: 0
+// tests/4110_mc_model_selbox.fi -- visibility of the CPU selection box of a pack model (r253): the 12 box lines of a bottom slab are drawn over the rendered
+// model (mc_model_pick.mp_draw_box) and counted by colour. The box edges lie on / next to the model faces and the line pixels are snapped to the pixel grid,
+// so a flat depth bias lets the faces cover many of them (z-fighting, worst at grazing angles). The default test must keep >= 90 % of the pixels that a
+// generous reference bias (5 %) shows, in four views from grazing to steep, and must still hide the edges behind the model (fewer pixels than without model).
+import std.rt
+import std.core
+import std.math
+import std.io
+import zip.zip
+import pack.icons
+import mc.mc_assets
+import mc.mc_texture
+import mc.mc_texext
+import mc.mc_mesh
+import mc.mc_model
+import mc.mc_model_ref
+import mc.mc_model_mesh
+import mc.mc_registry
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_camera
+import mc.mc_math
+import mc.mc_raster
+import mc.mc_render_world
+import mc.mc_model_pick
+import mc.mc_input
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+const W: i32 = 192
+const H: i32 = 144
+const QW: usize = 20 // f64 per oracle quad: x[4] y[4] z[4] u[4] v[4]
+
+fn ldd(p: u64, i: usize) -> f64 {
+    return *((p + (i as u64) * (8 as u64)) as *mut f64)
+}
+
+fn stf(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (8 as u64)) as *mut f64) = v
+}
+
+// 16 x 16 PNG: top left red, top right green, bottom left blue, bottom right yellow
+fn mk_png(out: *mut rt.Buf) -> bool {
+    let px: u64 = rt.heap_alloc(16 * 16 * 4)
+    var y: usize = 0
+    while y < 16 {
+        var x: usize = 0
+        while x < 16 {
+            let i: usize = (y * 16 + x) * 4
+            var r: u8 = 0 as u8
+            var g: u8 = 0 as u8
+            var b: u8 = 0 as u8
+            if y < 8 && x < 8 { r = 255 as u8 }
+            if y < 8 && x >= 8 { g = 255 as u8 }
+            if y >= 8 && x < 8 { b = 255 as u8 }
+            if y >= 8 && x >= 8 {
+                r = 255 as u8
+                g = 255 as u8
+            }
+            rt.st8(px, i, r)
+            rt.st8(px, i + 1, g)
+            rt.st8(px, i + 2, b)
+            rt.st8(px, i + 3, 255 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let ok: bool = icons.png_encode(px, 16, 16, out)
+    rt.heap_free(px, 16 * 16 * 4)
+    return ok
+}
+
+fn add(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    var ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn build_pack(st: *mut mc_assets.PackStack) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    var w: zip.ZipWriter = zip.zip_writer_new(&b)
+    if !add(&w, "pack.mcmeta", META) { return false }
+    var p: rt.Buf = rt.buf_new()
+    if !mk_png(&p) { return false }
+    var ok: bool = zip.zip_add(&w, "assets/minecraft/textures/block/oak_planks.png", rt.buf_ptr(&p), rt.buf_len(&p), true) catch | e | (false)
+    rt.buf_free(&p)
+    if !ok { return false }
+    if !add(&w, "assets/minecraft/models/block/sb_slab.json",
+        "{\"parent\":\"block/slab\",\"textures\":{\"bottom\":\"block/oak_planks\",\"top\":\"block/oak_planks\",\"side\":\"block/oak_planks\"}}") { return false }
+    if !add(&w, "assets/minecraft/blockstates/oak_slab.json",
+        "{\"variants\":{\"type=bottom,waterlogged=false\":{\"model\":\"block/sb_slab\"}}}") { return false }
+    var n: usize = zip.zip_finish(&w) catch | e | (0)
+    zip.zip_writer_free(&w)
+    if n == 0 { return false }
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pk, rt.buf_ptr(&b), rt.buf_len(&b)) != mc_assets.ASSET_OK { return false }
+    rt.buf_free(&b)
+    return mc_assets.stack_push(st, &pk) == mc_assets.ASSET_OK
+}
+
+fn has(b: *mut rt.Buf, s: str) -> bool {
+    let n: usize = rt.buf_len(b)
+    let sl: usize = s.length()
+    if sl > n { return false }
+    var i: usize = 0
+    while i + sl <= n {
+        if rt.mem_eq(rt.buf_ptr(b) + (i as u64), s.p as u64, sl) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+
+const MAGENTA: u32 = 0xFFFF00FF
+
+fn slab_state(reg: *mut mc_registry.Registry, blk: i32) -> i32 {
+    let lo: i32 = mc_registry.reg_block_min_state(reg, blk)
+    let hi: i32 = mc_registry.reg_block_max_state(reg, blk)
+    var s: i32 = lo
+    while s <= hi {
+        var t: rt.Buf = rt.buf_new()
+        if mc_registry.reg_state_text(reg, s, &t) {
+            if has(&t, "type=bottom") && has(&t, "waterlogged=false") {
+                rt.buf_free(&t)
+                return s
+            }
+        }
+        rt.buf_free(&t)
+        s = s + 1
+    }
+    return 0 - 1
+}
+
+fn count_px(r: *mut mc_raster.Raster, c: u32) -> i32 {
+    var n: i32 = 0
+    var i: usize = 0
+    let tot: usize = ((*r).w * (*r).h) as usize
+    while i < tot {
+        if rt.ld32((*r).color, i) == c { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn main() -> i32 {
+    var v: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(763, &v) { return 1 }
+    var reg: mc_registry.Registry = v.registry_of()
+    if !mc_registry.registry_ok(&reg) { return 2 }
+    var st: mc_assets.PackStack = mc_assets.stack_new()
+    if !build_pack(&st) { return 3 }
+    var tb: mc_mesh.MeshTables = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_texture.tex_alloc_tables(&tb)
+    var ex: mc_texext.TexExt = mc_texext.texext_new()
+    mc_texext.tex_build_tables_ext(&reg, &tb, &ex)
+    var atlas: mc_texture.Atlas = mc_texext.texext_atlas_new(16, &ex)
+    var an: mc_assets.AnimSet = mc_assets.animset_new()
+    if mc_assets.assets_apply_ext(&st, &atlas, &ex, &an) < 1 { return 4 }
+    var ms: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(&reg, &st, &ex)
+    let blk: i32 = mc_registry.reg_block_by_name(&reg, "oak_slab".p as u64, 8)
+    if blk < 0 { return 5 }
+    let sid: i32 = slab_state(&reg, blk)
+    if sid < 0 { return 6 }
+    if mc_model_mesh.ms_kind(&ms, sid as u16) != mc_model_mesh.K_MODEL { return 7 }
+    let ids: u64 = rt.heap_alloc(2 * 4096 * 2)
+    var i: usize = 0
+    while i < 8192 {
+        rt.st16(ids, i, 0 as u16)
+        i = i + 1
+    }
+    let by: i32 = 8
+    rt.st16(ids, ((by * 16 + 8) * 16 + 8) as usize, sid as u16)
+    var w: mc_world.World = mc_world.world_new()
+    if !mc_world.world_put(&w, mc_render_world.wr_make_chunk(0, 0, 2, ids)) { return 8 }
+    var empty: mc_world.World = mc_world.world_new()
+    let min_y: i32 = 0 - 64
+    var pk: mc_input.Pick = mc_input.Pick { x: 8, y: min_y + by, z: 8, nx: 0, ny: 1, nz: 0, dist: 1.0, id: sid }
+    var r: mc_raster.Raster = mc_raster.raster_new(W, H)
+    mc_raster.backend_upload_atlas(&r, &atlas)
+    var wr: mc_render_world.WorldRender = mc_render_world.wr_new(min_y, 8, &tb)
+    mc_render_world.wr_set_models(&wr, (&ms) as u64)
+    var wr0: mc_render_world.WorldRender = mc_render_world.wr_new(min_y, 8, &tb)
+    var cam: mc_camera.Camera = mc_camera.camera_new(W, H)
+    mc_camera.camera_set_lens(&cam, 70.0, 0.05, 200.0)
+    var bx: mc_model_pick.MpBox = mc_model_pick.MpBox { x0: 0.0, y0: 0.0, z0: 0.0, x1: 1.0, y1: 1.0, z1: 1.0 }
+    mc_model_pick.mp_pick_box(&ms, &pk, &bx)
+    if bx.y1 - bx.y0 > 0.51 { return 9 } // the model bounds (half a block), not the full block
+    let cxw: f64 = 8.5
+    let cyw: f64 = ((min_y + by) as f64) + 0.4
+    let czw: f64 = 8.5
+    var dxs: [f64; 4] = [1.0, 0.0 - 1.0, 1.0, 0.0 - 1.0]
+    var dzs: [f64; 4] = [1.0, 0.0 - 1.0, 0.0 - 1.0, 1.0]
+    var elev: [f64; 4] = [0.12, 0.3, 0.6, 1.0]
+    // thickness helper: grows with the distance, capped by max_e, floor 0.004
+    mc_camera.camera_set_pos(&cam, cxw + 2.0, cyw + 1.0, czw + 2.0)
+    mc_camera.camera_look_at(&cam, cxw, cyw, czw)
+    mc_camera.camera_update(&cam)
+    let t_near: f64 = mc_model_pick.mp_sel_thickness(&bx, &cam, 1.5, 1.0)
+    mc_camera.camera_set_pos(&cam, cxw + 20.0, cyw + 10.0, czw + 20.0)
+    mc_camera.camera_look_at(&cam, cxw, cyw, czw)
+    mc_camera.camera_update(&cam)
+    let t_far: f64 = mc_model_pick.mp_sel_thickness(&bx, &cam, 1.5, 1.0)
+    io.fmt_print(f"edge thickness near {t_near} far {t_far}\n")
+    if !(t_far > t_near) || t_far > 1.0 || t_near < 0.004 { return 10 }
+    var vw: usize = 0
+    while vw < 4 {
+        mc_camera.camera_set_pos(&cam, cxw + dxs[vw] * 3.0, cyw + elev[vw] * 4.0, czw + dzs[vw] * 3.0)
+        mc_camera.camera_look_at(&cam, cxw, cyw, czw)
+        mc_camera.camera_update(&cam)
+        // default box
+        mc_raster.backend_begin(&r, &cam, 0xFF000000 as u32)
+        mc_render_world.wr_render(&wr, &w, &r, &cam, 0 - 1)
+        mc_model_pick.mp_draw_box(&r, &ms, &pk, MAGENTA)
+        let n_def: i32 = count_px(&r, MAGENTA)
+        // reference: generous flat bias
+        mc_raster.backend_begin(&r, &cam, 0xFF000000 as u32)
+        mc_render_world.wr_render(&wr, &w, &r, &cam, 0 - 1)
+        mc_input.input_draw_aabb_b(&r, bx.x0, bx.y0, bx.z0, bx.x1, bx.y1, bx.z1, MAGENTA, 1.05, 0.0)
+        let n_ref: i32 = count_px(&r, MAGENTA)
+        // legacy flat 0.2 % bias (what r248 drew)
+        mc_raster.backend_begin(&r, &cam, 0xFF000000 as u32)
+        mc_render_world.wr_render(&wr, &w, &r, &cam, 0 - 1)
+        mc_input.input_draw_aabb_b(&r, bx.x0, bx.y0, bx.z0, bx.x1, bx.y1, bx.z1, MAGENTA, 1.002, 0.0)
+        let n_old: i32 = count_px(&r, MAGENTA)
+        // no model: all 12 edges visible
+        mc_raster.backend_begin(&r, &cam, 0xFF000000 as u32)
+        mc_render_world.wr_render(&wr0, &empty, &r, &cam, 0 - 1)
+        mc_model_pick.mp_draw_box(&r, &ms, &pk, MAGENTA)
+        let n_free: i32 = count_px(&r, MAGENTA)
+        io.fmt_print(f"view {vw}: box px default {n_def} reference {n_ref} flat-0.2% {n_old} no-model {n_free}\n")
+        if n_ref < 60 { return 20 + (vw as i32) }
+        if n_def * 10 < n_ref * 9 { return 30 + (vw as i32) }
+        if n_def >= n_free { return 40 + (vw as i32) }
+        if n_def * 100 < n_old * 110 { return 50 + (vw as i32) } // clearly better than the flat 0.2 % bias
+        // GL / Vulkan edge thickness: ~1.5 px on screen, capped close up, never below 0.004
+        let e_near: f64 = mc_model_pick.mp_sel_thickness(&bx, &cam, 1.5, 1.0)
+        if e_near > 1.0 || e_near < 0.004 { return 60 + (vw as i32) }
+        vw = vw + 1
+    }
+    mc_model_mesh.ms_free(&ms)
+    return 0
+}
