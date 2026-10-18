@@ -62,7 +62,14 @@ pub fn expand(prog: &mut Program, dg: &mut Diags) {
     prog.expr_count = next_id;
 
     // Generic names without type arguments are an error with line/column.
-    check_bare_uses(prog, dg);
+    // Bare CALLS are reported later (`check_bare_calls`): lambda.rs may still
+    // infer their type arguments from a generic fn passed as a value (r742b).
+    check_bare_uses(prog, dg, false);
+}
+
+/// r742b: bare calls of generic functions that lambda.rs did not rewrite.
+pub fn check_bare_calls(prog: &Program, dg: &mut Diags) {
+    check_bare_uses(prog, dg, true);
 }
 
 /// r742: instances recorded AFTER `expand` (lambda.rs infers the type arguments
@@ -267,6 +274,13 @@ fn is_int_name(n: &str) -> bool {
 }
 
 // ------------------------------------------------------------- Substitution
+
+/// r742b: a template type with the type parameters replaced (inference of
+/// `apply_g(id, 4)` needs the concrete parameter types before the instance exists).
+pub(crate) fn subst_for_infer(te: &TypeExpr, map: &HashMap<String, TypeExpr>) -> TypeExpr {
+    let mut q: Vec<(String, Instantiation)> = Vec::new();
+    subst_ty(te, map, &mut q)
+}
 
 fn subst_ty(
     te: &TypeExpr,
@@ -625,7 +639,7 @@ pub(crate) fn renumber_expr(e: &mut Expr, next: &mut u32) {
 
 // --------------------------------------------------- generic names without []
 
-fn check_bare_uses(prog: &Program, dg: &mut Diags) {
+fn check_bare_uses(prog: &Program, dg: &mut Diags, calls: bool) {
     let mut err: Vec<(Span, String)> = Vec::new();
     for f in &prog.funcs {
         for p in &f.params {
@@ -642,7 +656,9 @@ fn check_bare_uses(prog: &Program, dg: &mut Diags) {
         }
     }
     for (sp, msg) in err {
-        dg.error(sp, msg);
+        if msg.starts_with("generic function ") == calls {
+            dg.error(sp, msg);
+        }
     }
 }
 

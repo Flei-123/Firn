@@ -279,6 +279,8 @@ python3 -I tools/fui/glass_ref.py "$W/glassref"
 
 echo
 echo "== 14c. GLASS ON THE SURFACES: tooltip, title bar, modal, menu (glasspane.fi, theme token glass) =="
+# r264: also the dialog/menu look (theme token glass_kind 0 acrylic | 1 liquid), reduced transparency (glasspane.set_reduced,
+# syspref.transparency_*: flat fill, no pane computed) and the theme file key glass_kind -- all inside `glasspane check`.
 # level 0 (default) creates no pane; level 1/2 flatten a striped backdrop under each surface,
 # a second frame is a cache hit, the theme file key `glass = 2` parses (range 0..2).
 "$FIRNC" --opt-level=dev -o "$W/glasspane" tools/fui/glasspane_main.fi
@@ -799,6 +801,10 @@ build apptb
 # appw11: table in the ten-line API (header sort, cell cursor, in-place cell editor: F2 / Enter / typing / double click, Tab, Esc, read-only column, a11y)
 build appw11
 "$W/appw11" | tail -n 3 | grep -q "APPW11 PASSED"
+
+# tablex: caret by mouse click in the open cell editor (click / double click / drag) + table rows and cells in the a11y tree (model, dump, JSON, UIA elements, AT-SPI object count)
+build tablex
+"$W/tablex" | tail -n 3 | grep -q "TABLEX PASSED"
 
 # appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
 build appw6

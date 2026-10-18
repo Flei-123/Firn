@@ -191,6 +191,19 @@ def main():
     check(len(lk) > 3 and all(str(k[1]).startswith("/org/a11y/atspi/accessible/v") for k in lk), "virtual list: visible rows are objects (%d)" % len(lk))
     check(str(c.prop(str(lk[0][1]), ACC, "Name")) == "Row 00", "virtual row 0 is named 'Row 00'")
 
+    # --- the table: rows are TABLE_ROW objects, their cells TABLE_CELL objects (paths c<node>_<row>_<col>)
+    tb = find("table", "People")
+    check(tb is not None, "table 'People' is in the tree")
+    tk = c.call(tb, ACC, "GetChildren")
+    check(len(tk) == 2 and all(str(k[1]).startswith("/org/a11y/atspi/accessible/v") for k in tk), "table: the rows are objects (%d)" % len(tk))
+    check(c.call(str(tk[0][1]), ACC, "GetRole") == 90, "table row has the role TABLE_ROW (90)")
+    ck = c.call(str(tk[1][1]), ACC, "GetChildren")
+    check(len(ck) == 3 and all(str(k[1]).startswith("/org/a11y/atspi/accessible/c") for k in ck), "table row: 3 cell objects")
+    check(c.call(str(ck[1][1]), ACC, "GetRole") == 56, "table cell has the role TABLE_CELL (56)")
+    check([str(c.prop(str(k[1]), ACC, "Name")) for k in ck] == ["Bruno", "25", "b-02"], "table cells are named by their text")
+    check(str(c.prop(str(ck[2][1]), ACC, "Parent")[1]) == str(tk[1][1]), "cell parent is its row")
+    check(c.call(str(ck[2][1]), ACC, "GetIndexInParent") == 2, "cell index in parent is its column")
+
     # --- hit test over the bus
     ex = c.call(cb, COMP, "GetExtents", dbus.UInt32(0))
     hit = c.call(frame_path, COMP, "GetAccessibleAtPoint", int(ex[0]) + int(ex[2]) // 2, int(ex[1]) + int(ex[3]) // 2, dbus.UInt32(0))
