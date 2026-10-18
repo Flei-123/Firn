@@ -54,6 +54,11 @@ if [ -z "$ONLY" ] || [ "$ONLY" = modelplay ]; then
     echo "== mc/modelplay =="
     bash tools/mc/play/run_models.sh || ERR=$((ERR+1))
 fi
+# r245: the same pack models on the GL (MCPLAY_GL=1) and Vulkan (MCPLAY_GFX=vk) back ends vs the CPU picture (PSNR >= 34 dB, llvmpipe / lavapipe, no real GPU): ~6 min.
+if [ -z "$ONLY" ] || [ "$ONLY" = modelplay ] || [ "$ONLY" = modelgl ]; then
+    echo "== mc/modelgl =="
+    bash tools/mc/play/run_models_gl.sh || ERR=$((ERR+1))
+fi
 # entities in the mcplay play path against the real server (live packets + CPU/GL pictures with / without boxes): ~4 min, needs Xvfb + java; plus the rider entity scenario of tools/mcclient/run.sh.
 if [ -z "$ONLY" ] || [ "$ONLY" = ents ]; then
     echo "== mc/ents =="
