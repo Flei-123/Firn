@@ -80,8 +80,98 @@
 //! sources are: a constant (exact), a dominating comparison (holds by
 //! construction of the control flow), and the type (holds by definition).
 
-use crate::fir::{BinOp, CmpOp, FTy, Func, Op, Term, Val};
+use crate::fir::{BinOp, CmpOp, FTy, Func, Module, Op, Term, Val};
 use std::collections::HashMap;
+
+thread_local! {
+    /// r761: the functions of the module that are PURE LENGTH GETTERS
+    /// (`vec_len[T]`, `str_len`, ...): one pointer parameter, result = the
+    /// `u64` word at `param + K`. name -> K. Filled by `note_len_getters`
+    /// before the first function is optimised (the shape is read from the
+    /// raw body too), so the order of optimisation does not matter.
+    static LEN_GETTERS: std::cell::RefCell<HashMap<String, i128>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Scan the module for pure length getters (see `LEN_GETTERS`).
+pub(crate) fn note_len_getters(m: &Module) {
+    let mut map = HashMap::new();
+    for f in &m.funcs {
+        if let Some(k) = len_getter_offset(f) {
+            map.insert(f.name.clone(), k);
+        }
+    }
+    LEN_GETTERS.with(|g| *g.borrow_mut() = map);
+}
+
+/// `f(p) = *(u64*)(p + K)` and nothing else: one `ptr` parameter, a `u64`
+/// result, straight-line entry block that returns the loaded word. The
+/// parameter may go through a stack cell first (the raw shape before
+/// `mem2reg`). Any other instruction (a call, a store elsewhere, ...) and
+/// the answer is `None`.
+pub(crate) fn len_getter_offset(f: &Func) -> Option<i128> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Sym {
+        Param,
+        Cell,
+        Addr(i128),
+        Word(i128),
+        Num(i128),
+    }
+    if f.params.len() != 1 || f.params[0] != FTy::Ptr || f.ret != FTy::U64 || f.blocks.is_empty() {
+        return None;
+    }
+    let b = &f.blocks[0];
+    let ret = match b.term {
+        Term::Ret(Some(v)) => v,
+        _ => return None,
+    };
+    let mut sym: HashMap<Val, Sym> = HashMap::new();
+    sym.insert(0, Sym::Param);
+    let mut cell_holds_param = false;
+    let mut cell: Option<Val> = None;
+    for i in &b.insts {
+        match &i.op {
+            Op::Const(c) => {
+                sym.insert(i.dst?, Sym::Num(*c));
+            }
+            Op::Alloca { .. } => {
+                if cell.is_some() {
+                    return None;
+                }
+                cell = i.dst;
+                sym.insert(i.dst?, Sym::Cell);
+            }
+            Op::Store { addr, val } => {
+                if Some(*addr) != cell || !matches!(sym.get(val), Some(Sym::Param)) || cell_holds_param {
+                    return None;
+                }
+                cell_holds_param = true;
+            }
+            Op::Load { addr } => match sym.get(addr)? {
+                Sym::Cell if cell_holds_param && i.ty == FTy::Ptr => {
+                    sym.insert(i.dst?, Sym::Param);
+                }
+                Sym::Addr(k) if i.ty == FTy::U64 => {
+                    let k = *k;
+                    sym.insert(i.dst?, Sym::Word(k));
+                }
+                _ => return None,
+            },
+            Op::PtrAdd { base, off } => match (sym.get(base)?, sym.get(off)?) {
+                (Sym::Param, Sym::Num(c)) => {
+                    let c = *c;
+                    sym.insert(i.dst?, Sym::Addr(c));
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    match sym.get(&ret) {
+        Some(Sym::Word(k)) => Some(*k),
+        _ => None,
+    }
+}
 
 /// Inclusive interval of the mathematical value.
 type Range = (i128, i128);
@@ -420,15 +510,17 @@ impl<'a> Ana<'a> {
     /// a loop body counts: it is clean only if no instruction of it writes.
     /// Reaching the entry without passing `from` means `from` does not
     /// dominate `to`: no answer.
-    fn clean_between(&self, from: (usize, usize), to: (usize, usize), len_addr: Val) -> bool {
+    fn clean_between(&self, from: (usize, usize), to: (usize, usize), hdr: (Val, i128)) -> bool {
         // phis and copies are register moves, they write no memory; an
         // element store of the very Vec whose length word this is cannot
-        // reach that word either (`elem_store_of`)
+        // reach that word either (`elem_store_of`); a call of a pure length
+        // getter only reads (r761)
         let writes = |b: usize, lo: usize, hi: usize| -> bool {
             self.f.blocks[b].insts[lo..hi].iter().any(|i| {
                 !matches!(i.op, Op::Phi { .. } | Op::Copy { .. })
                     && crate::opt::writes_memory(&i.op)
-                    && !self.elem_store_of(&i.op, len_addr)
+                    && self.getter_call(&i.op).is_none()
+                    && !self.elem_store_of(&i.op, hdr)
             })
         };
         let (fb, fi) = from;
@@ -497,18 +589,49 @@ impl<'a> Ana<'a> {
         if a == b {
             return true;
         }
-        let (pa, pb) = match (self.op_of(a), self.op_of(b)) {
-            (Some(Op::Load { addr: x }), Some(Op::Load { addr: y })) => (*x, *y),
-            _ => return false,
-        };
-        if self.f.val_ty(a) != self.f.val_ty(b) || !self.addr_eq(pa, pb) {
+        if self.f.val_ty(a) != self.f.val_ty(b) {
             return false;
         }
         let (sa, sb) = match (self.site.get(&a), self.site.get(&b)) {
             (Some(x), Some(y)) => (*x, *y),
             _ => return false,
         };
-        self.clean_between(sa, sb, pa) || self.clean_between(sb, sa, pa)
+        // two loads of the same address
+        if let (Some(Op::Load { addr: x }), Some(Op::Load { addr: y })) = (self.op_of(a), self.op_of(b)) {
+            if !self.addr_eq(*x, *y) {
+                return false;
+            }
+            let hdr = self.base_off(*x);
+            return self.clean_between(sa, sb, hdr) || self.clean_between(sb, sa, hdr);
+        }
+        // r761: a call of a length getter (dev-fast keeps `vec_len` a call)
+        // and the word it reads, or two calls on the same pointer
+        match (self.len_word_of(a), self.len_word_of(b)) {
+            (Some(x), Some(y)) if x == y => {
+                self.clean_between(sa, sb, x) || self.clean_between(sb, sa, x)
+            }
+            _ => false,
+        }
+    }
+
+    /// `op` is a call of a pure length getter: `(pointer argument, offset)`.
+    fn getter_call(&self, op: &Op) -> Option<(Val, i128)> {
+        match op {
+            Op::Call { name, args } if args.len() == 1 => {
+                let k = LEN_GETTERS.with(|g| g.borrow().get(name).copied())?;
+                Some((args[0], k))
+            }
+            _ => None,
+        }
+    }
+
+    /// The memory word a `u64` length value is a read of: a load, or a call
+    /// of a length getter. `(base, byte offset)`.
+    fn len_word_of(&self, v: Val) -> Option<(Val, i128)> {
+        match self.op_of(v)? {
+            Op::Load { addr } => Some(self.base_off(*addr)),
+            op => self.getter_call(op),
+        }
     }
 
     /// `addr` as a base value plus a constant byte offset.
@@ -522,20 +645,20 @@ impl<'a> Ana<'a> {
     }
 
     /// r759: `op` is the store of one ELEMENT of the `Vec` whose length word
-    /// is at `len_addr`: it writes `data + idx * size` where `data` is the
+    /// is at `hdr` (base, offset): it writes `data + idx * size` where `data` is the
     /// pointer word of that same header (the word right before the length,
     /// layout `{ptr, len, cap}`) and `idx` is the result of a `CheckedIdxV`
     /// against that same length word. Such a store lies inside the buffer
     /// (the index was checked) and a buffer never contains its own header,
     /// so the length word is not touched. Any other store (a raw pointer, a
     /// field, a call, a push) is a write as before.
-    fn elem_store_of(&self, op: &Op, len_addr: Val) -> bool {
+    fn elem_store_of(&self, op: &Op, hdr: (Val, i128)) -> bool {
         let dst = match op {
             Op::Store { addr, .. } => *addr,
             Op::CopyMem { dst, .. } => *dst,
             _ => return false,
         };
-        let (hb, hk) = self.base_off(len_addr);
+        let (hb, hk) = hdr;
         let (ptr_addr, off) = match self.op_of(dst) {
             Some(Op::PtrAdd { base, off }) => (*base, *off),
             _ => return false,
@@ -563,10 +686,7 @@ impl<'a> Ana<'a> {
             _ => off,
         };
         match self.op_of(idx) {
-            Some(Op::CheckedIdxV { len, .. }) => match self.op_of(*len) {
-                Some(Op::Load { addr }) => self.addr_eq(*addr, len_addr),
-                _ => false,
-            },
+            Some(Op::CheckedIdxV { len, .. }) => self.len_word_of(*len) == Some(hdr),
             _ => false,
         }
     }
@@ -611,7 +731,10 @@ impl<'a> Ana<'a> {
                 CmpOp::Gt => (b, a, true),
                 _ => continue,
             };
-            if strict && self.le_val(x, lo, at) && self.same_len(hi, l) {
+            if strict
+                && (self.le_val(x, lo, at) || self.sub_le(x, lo, l, at, depth))
+                && self.same_len(hi, l)
+            {
                 return true;
             }
         }
@@ -722,7 +845,10 @@ impl<'a> Ana<'a> {
         }
         let incoming = match self.op_of(x) {
             Some(Op::Phi { incoming }) => incoming,
-            _ => return self.snonneg(x, l, at, &[], assume) && self.sbelow(x, l, at, ex),
+            _ => {
+                return (self.snonneg(x, l, at, &[], assume) || self.sub_nonneg(x, l, depth))
+                    && self.sbelow(x, l, at, ex)
+            }
         };
         if depth == 0 || incoming.is_empty() || incoming.len() > 4 {
             return false;
@@ -832,12 +958,134 @@ impl<'a> Ana<'a> {
                 CmpOp::Gt => (b, a),
                 _ => continue,
             };
-            let lo_ok = lo == x || matches!((cst(x), cst(lo)), (Some(p), Some(q)) if p <= q);
+            let lo_ok = lo == x
+                || matches!((cst(x), cst(lo)), (Some(p), Some(q)) if p <= q)
+                || self.sub_const_of(x, lo, at);
             if lo_ok && self.is_len_cast(hi, l) {
                 return true;
             }
         }
         false
+    }
+
+    /// r762: `x = lo - c` with a constant `c >= 0` that cannot wrap, so
+    /// `x <= lo` (signed): `v[i - 1]` under `i < n`. A checked subtraction
+    /// that was reached did not wrap; a plain one has to be proved by the
+    /// interval of `lo` (`lo - c` stays in the type).
+    fn sub_const_of(&self, x: Val, lo: Val, at: usize) -> bool {
+        let (a, b, checked) = match self.op_of(x) {
+            Some(Op::CheckedBin { op: BinOp::Sub, a, b, .. }) => (*a, *b, true),
+            Some(Op::Bin(BinOp::Sub, a, b)) => (*a, *b, false),
+            _ => return false,
+        };
+        let c = match self.op_of(b) {
+            Some(Op::Const(c)) if *c >= 0 => *c,
+            _ => return false,
+        };
+        if a != lo {
+            return false;
+        }
+        if checked {
+            return true;
+        }
+        let site = match self.site.get(&x) {
+            Some(s) => s.0,
+            None => return false,
+        };
+        let _ = at;
+        let full = match ty_range(self.f.val_ty(x)) {
+            Some(r) => r,
+            None => return false,
+        };
+        matches!(self.range(lo, site, DEPTH), Some(r) if r.0.checked_sub(c).map_or(false, |m| m >= full.0))
+    }
+
+    /// r762: `x = a - c` (constant `c >= 0`) with `a >= c`, so `x >= 0` and
+    /// the subtraction does not wrap.
+    fn sub_nonneg(&self, x: Val, l: Val, depth: u32) -> bool {
+        let (a, c) = match self.sub_const(x) {
+            Some(t) => t,
+            None => return false,
+        };
+        depth > 0 && self.ge_const(a, c, l, true, depth, &mut Vec::new())
+    }
+
+    /// r762 (unsigned): `x = lo - c`, `lo >= c`: so `x <= lo` without wrap.
+    fn sub_le(&self, x: Val, lo: Val, l: Val, at: usize, depth: u32) -> bool {
+        let _ = at;
+        if depth == 0 || self.f.val_ty(x) != FTy::U64 {
+            return false;
+        }
+        match self.sub_const(x) {
+            Some((a, c)) if a == lo => self.ge_const(a, c, l, false, depth, &mut Vec::new()),
+            _ => false,
+        }
+    }
+
+    /// `x = a - c` with a constant `c >= 0`: `(a, c)`.
+    fn sub_const(&self, x: Val) -> Option<(Val, i128)> {
+        let (a, b) = match self.op_of(x)? {
+            Op::CheckedBin { op: BinOp::Sub, a, b, .. } | Op::Bin(BinOp::Sub, a, b) => (*a, *b),
+            _ => return None,
+        };
+        match self.op_of(b) {
+            Some(Op::Const(c)) if *c >= 0 => Some((a, *c)),
+            _ => None,
+        }
+    }
+
+    /// `a >= m` (constant `m`), `a` a counter that starts at a constant
+    /// `>= m` and only grows: an interval, a constant, or a phi whose
+    /// operands are all `>= m` constants, the phi itself, or `phi' + c`
+    /// (`c >= 0`) of such a phi. A plain add must not wrap: `a2 + c` with
+    /// `c == 1` is safe while `a2` is below the length (`sbelow` / `less`).
+    /// `assume` holds the phis being proved (induction over the iterations).
+    fn ge_const(&self, a: Val, m: i128, l: Val, signed: bool, depth: u32, assume: &mut Vec<Val>) -> bool {
+        if assume.contains(&a) {
+            return true;
+        }
+        if let Some(&(sb, _)) = self.site.get(&a) {
+            if matches!(self.range(a, sb, DEPTH), Some(r) if r.0 >= m) {
+                return true;
+            }
+        }
+        if let Some(Op::Const(c)) = self.op_of(a) {
+            return *c >= m;
+        }
+        if depth == 0 {
+            return false;
+        }
+        match self.op_of(a) {
+            Some(Op::Phi { incoming }) => {
+                if incoming.is_empty() || incoming.len() > 4 {
+                    return false;
+                }
+                assume.push(a);
+                let ok = incoming.iter().all(|&(_, v)| self.ge_const(v, m, l, signed, depth - 1, assume));
+                assume.pop();
+                ok
+            }
+            Some(Op::CheckedBin { op: BinOp::Add, a: a2, b, .. }) => {
+                matches!(self.op_of(*b), Some(Op::Const(c)) if *c >= 0)
+                    && self.ge_const(*a2, m, l, signed, depth - 1, assume)
+            }
+            Some(Op::Bin(BinOp::Add, a2, b)) => {
+                if !matches!(self.op_of(*b), Some(Op::Const(1))) {
+                    return false;
+                }
+                let site = match self.site.get(&a) {
+                    Some(s) => s.0,
+                    None => return false,
+                };
+                let below = if signed {
+                    self.sbelow(*a2, l, site, None)
+                } else {
+                    self.less(*a2, l, site, None, depth - 1)
+                };
+                below && self.ge_const(*a2, m, l, signed, depth - 1, assume)
+            }
+            _ => false,
+        }
     }
 
     /// What the branches on the way into `at` say about the value.
@@ -1512,6 +1760,105 @@ mod tests {
     #[test]
     fn a_store_between_the_two_length_reads_keeps_the_check() {
         let mut f = vec_func(true);
+        assert_eq!(remove_provable_arith_checks(&mut f), 0);
+    }
+
+    /// `fn(p: ptr) -> u64`: the raw shape of a length getter (parameter
+    /// through a stack cell) or the optimised one; `extra` adds a store.
+    fn getter_func(raw: bool, extra: bool, ret: FTy) -> Func {
+        let mut f = Func::new("g", vec![FTy::Ptr], ret);
+        let cell = f.new_val_pub(FTy::Ptr);
+        let p = f.new_val_pub(FTy::Ptr);
+        let off = f.new_val_pub(FTy::I64);
+        let a = f.new_val_pub(FTy::Ptr);
+        let w = f.new_val_pub(FTy::U64);
+        let mut insts = vec![];
+        let base = if raw {
+            insts.push(Inst::new(Some(cell), FTy::Ptr, Op::Alloca { size: 8, align: 8 }));
+            insts.push(Inst::new(None, FTy::Ptr, Op::Store { addr: cell, val: 0 }));
+            insts.push(Inst::new(Some(p), FTy::Ptr, Op::Load { addr: cell }));
+            p
+        } else {
+            0
+        };
+        insts.push(Inst::new(Some(off), FTy::I64, Op::Const(8)));
+        insts.push(Inst::new(Some(a), FTy::Ptr, Op::PtrAdd { base, off }));
+        if extra {
+            insts.push(Inst::new(None, FTy::U64, Op::Store { addr: a, val: 0 }));
+        }
+        insts.push(Inst::new(Some(w), FTy::U64, Op::Load { addr: a }));
+        f.blocks = vec![Block { id: 0, insts, term: Term::Ret(Some(w)) }];
+        f
+    }
+
+    #[test]
+    fn a_length_getter_is_recognised_in_both_shapes() {
+        assert_eq!(len_getter_offset(&getter_func(true, false, FTy::U64)), Some(8));
+        assert_eq!(len_getter_offset(&getter_func(false, false, FTy::U64)), Some(8));
+    }
+
+    #[test]
+    fn a_function_that_also_writes_is_no_length_getter() {
+        assert_eq!(len_getter_offset(&getter_func(false, true, FTy::U64)), None);
+        assert_eq!(len_getter_offset(&getter_func(false, false, FTy::I64)), None);
+    }
+
+    /// `if i < vec_len(v) { <store?> v[i] }` with the length read once by a
+    /// CALL of `name` and once by a load (r761).
+    fn call_len_func(name: &str, store: bool) -> Func {
+        let mut f = Func::new("t", vec![FTy::Ptr, FTy::U64], FTy::U64);
+        let off = f.new_val_pub(FTy::I64);
+        let a = f.new_val_pub(FTy::Ptr);
+        let l1 = f.new_val_pub(FTy::U64);
+        let c = f.new_val_pub(FTy::Bool);
+        let l2 = f.new_val_pub(FTy::U64);
+        let ix = f.new_val_pub(FTy::U64);
+        let mut tail = vec![];
+        if store {
+            tail.push(Inst::new(None, FTy::U64, Op::Store { addr: a, val: 1 }));
+        }
+        tail.push(Inst::new(Some(l2), FTy::U64, Op::Load { addr: a }));
+        tail.push(Inst::new(Some(ix), FTy::U64, Op::CheckedIdxV { idx: 1, len: l2, msg: "x".into() }));
+        f.blocks = vec![
+            Block {
+                id: 0,
+                insts: vec![
+                    Inst::new(Some(off), FTy::I64, Op::Const(8)),
+                    Inst::new(Some(a), FTy::Ptr, Op::PtrAdd { base: 0, off }),
+                    Inst::new(Some(l1), FTy::U64, Op::Call { name: name.into(), args: vec![0] }),
+                    Inst::new(Some(c), FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: FTy::U64, a: 1, b: l1 }),
+                ],
+                term: Term::BrCond { cond: c, then_bb: 1, else_bb: 2 },
+            },
+            Block { id: 1, insts: tail, term: Term::Ret(Some(ix)) },
+            Block { id: 2, insts: vec![], term: Term::Ret(Some(1)) },
+        ];
+        f
+    }
+
+    fn register_getter(name: &str) {
+        LEN_GETTERS.with(|g| {
+            g.borrow_mut().insert(name.to_string(), 8);
+        });
+    }
+
+    #[test]
+    fn a_guard_on_a_length_call_covers_the_load_of_the_word() {
+        register_getter("vec_len_t");
+        let mut f = call_len_func("vec_len_t", false);
+        assert_eq!(remove_provable_arith_checks(&mut f), 1);
+    }
+
+    #[test]
+    fn a_store_after_the_length_call_keeps_the_check() {
+        register_getter("vec_len_t");
+        let mut f = call_len_func("vec_len_t", true);
+        assert_eq!(remove_provable_arith_checks(&mut f), 0);
+    }
+
+    #[test]
+    fn a_call_of_an_unknown_function_is_not_a_length() {
+        let mut f = call_len_func("some_other_fn", false);
         assert_eq!(remove_provable_arith_checks(&mut f), 0);
     }
 

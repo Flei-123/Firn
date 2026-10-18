@@ -388,6 +388,9 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         on: std::env::var_os("FIRN_PASS_TIMINGS").is_some(),
         ..Default::default()
     };
+    // r761: which functions are pure length getters (`vec_len`): the range
+    // analysis reads a call of one as a load of the word it returns.
+    crate::rangecheck::note_len_getters(m);
     // Clean up per function first, so that the size heuristic of the inliner
     // works on bodies that are already simplified.
     for f in m.funcs.iter_mut() {

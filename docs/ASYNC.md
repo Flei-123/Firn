@@ -47,7 +47,7 @@ loop.run(&l)                               // until loop.stop(&l) or nothing is 
 
 | backend | where | notes |
 |---|---|---|
-| epoll | Linux x86-64, AArch64 | `epoll_event` is 12 octets packed on x86-64 and 16 on AArch64; the loop asks `uname(2)` |
+| epoll | Linux x86-64, AArch64 | `epoll_event` is 12 octets packed on x86-64 and 16 on AArch64; the loop PROBES which one it sees (eventfd round trip, `epoll_layout_probe`), because `uname(2)` lies under the Android emulator's ARM translator (AArch64 program, answer "x86_64", 16 octet records) |
 | poll | everywhere | `poll(2)`; `ppoll` on AArch64 (the compiler rewrites the shape); on Windows the seam answers it with `select`, at most 64 sockets per round |
 
 Compiler tables added for this: AArch64 numbers for `epoll_create1`,
@@ -197,6 +197,7 @@ build level; 2122 takes 17 s of the `--no-opt` level).
   sees the read that returns 0.
 * `EV_ET` (EPOLLET): edge triggered, epoll backend only. The poll backend masks the bit away and stays level
   (check `is_epoll`). With ET the callback must drain until EAGAIN.
+* `tests/2880_async_epoll_layout.fi` (six watches readable in one round, generation > 1, probe == loop stride; `tools/android/arm64_epoll_check.sh` runs the same binary inside the Android emulator's ARM translator);
 * `tests/2867_async_epoll_flags.fi`; `tools/net/epoll.sh` diffs its output against Python `select.epoll` /
   `select.poll` (12 lines, 3 build stages). Loopback TCP only.
 * Capturing closures as callbacks: `async.fnpin` keeps the closure record alive (see docs/CLOSURES.md).

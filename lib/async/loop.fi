@@ -49,7 +49,8 @@
 //   epoll   Linux x86-64 and AArch64. O(1) per ready descriptor, so a
 //           thousand idle connections cost nothing. The `epoll_event`
 //           record is PACKED (12 octets) on x86-64 and 16 octets on AArch64;
-//           the loop asks uname(2) which one it is on.
+//           the loop PROBES which one it is (an eventfd round trip; uname(2)
+//           lies under the Android emulator's ARM translator).
 //   poll    everywhere: the same call the window layer uses (`poll(2)`;
 //           ppoll on AArch64; the Windows seam answers it with select, which
 //           caps a round at 64 sockets -- see A5). The array is rebuilt in
@@ -91,7 +92,7 @@ export {
     defer_call, wake, loop_fd, embed_wait_ms, set_wake_hook, wake_hook_fn, wake_hook_ud, set_block_hooks,
     run_once, run, stop, set_keep_alive,
     mono_ms, now_cached,
-    is_epoll, backend_name, wake_kind, socket_limit,
+    is_epoll, backend_name, wake_kind, socket_limit, epoll_layout_probe, epoll_stride,
     stat_rounds, stat_events, stat_timers, stat_defers, stat_wakes,
 }
 
@@ -286,9 +287,64 @@ fn ep_ctl(l: *mut Loop, op: i64, fd: i32, ev: u32, data: u64) -> bool {
     return !failed(r)
 }
 
-// x86-64 packs the record (12 octets); everything else keeps the natural
-// layout (16). A failed uname means "not Linux": the packed default is never
-// used then, because epoll_create1 fails first.
+// The record layout of this process's epoll_event, found by an EXPERIMENT.
+//
+// x86-64 packs the record (12 octets: events at 0, data at 4); everything
+// else keeps the natural layout (16 octets, data at 8). uname(2) is NOT a
+// reliable witness: libndk_translation (the Android emulator's ARM
+// translator, also on many x86 Chromebooks) runs an AArch64 program on an
+// x86-64 kernel, converts the epoll records to the AArch64 layout for the
+// program -- and answers uname(2) with the HOST's "x86_64". The loop then
+// used the 12 octet record against a translator that wanted 16: every
+// handle came back damaged, only a watch in slot 0 still worked (the first
+// login request), and every later connection (WebSocket, store check) ran
+// into its timeout. So the layout is probed: an eventfd is registered with a
+// known 64-bit value at `doff`, made readable and fetched again; the layout
+// that returns the value intact is the one this process sees. uname is
+// only the fallback when the probe cannot tell (no epoll: Windows seam).
+const PROBE_VALUE: u64 = 0x1122334455667788
+
+fn probe_layout(doff: usize) -> bool {
+    let ep: i64 = syscall(SYS_EPOLL_CREATE1, O_CLOEXEC, 0, 0, 0, 0, 0)
+    if failed(ep) {
+        return false
+    }
+    var ok: bool = false
+    let efd: i64 = syscall(SYS_EVENTFD2, 0, EFD_NONBLOCK | O_CLOEXEC, 0, 0, 0, 0)
+    if !failed(efd) {
+        var rec: [u64; 4] = [0; 4]
+        rt.st32((&rec[0]) as u64, 0, EV_READ)
+        rt.st64((&rec[0]) as u64 + doff as u64, 0, PROBE_VALUE)
+        let c: i64 = syscall(SYS_EPOLL_CTL, ep, EPOLL_CTL_ADD, efd, (&rec[0]) as i64, 0, 0)
+        if !failed(c) {
+            var one: [u64; 1] = [1; 1]
+            syscall(SYS_WRITE, efd, (&one[0]) as i64, 8, 0, 0, 0)
+            var out: [u64; 8] = [0; 8]
+            let r: i64 = syscall(SYS_EPOLL_PWAIT, ep, (&out[0]) as i64, 2, 100, 0, 8)
+            if r == 1 && rt.ld64((&out[0]) as u64 + doff as u64, 0) == PROBE_VALUE {
+                ok = true
+            }
+        }
+        syscall(SYS_CLOSE, efd, 0, 0, 0, 0, 0)
+    }
+    syscall(SYS_CLOSE, ep, 0, 0, 0, 0, 0)
+    return ok
+}
+
+// 1 = packed (12 octets, data at 4), 0 = natural (16 octets, data at 8),
+// -1 = the probe cannot tell (no epoll, or both/neither layout came back).
+fn epoll_layout_probe() -> i64 {
+    let packed: bool = probe_layout(4)
+    let natural: bool = probe_layout(8)
+    if packed && !natural {
+        return 1
+    }
+    if natural && !packed {
+        return 0
+    }
+    return 0 - 1
+}
+
 fn detect_layout(l: *mut Loop) {
     var u: [u8; 390] = [0; 390]
     let r: i64 = syscall(SYS_UNAME, (&u[0]) as i64, 0, 0, 0, 0, 0)
@@ -302,6 +358,15 @@ fn detect_layout(l: *mut Loop) {
             (*l).stride = 16
             (*l).doff = 8
         }
+    }
+    // The experiment overrules the guess (see above).
+    let p: i64 = epoll_layout_probe()
+    if p == 1 {
+        (*l).stride = 12
+        (*l).doff = 4
+    } else if p == 0 {
+        (*l).stride = 16
+        (*l).doff = 8
     }
 }
 
@@ -474,6 +539,9 @@ fn loop_free(l: *mut Loop) {
 }
 
 fn is_epoll(l: *mut Loop) -> bool { return (*l).use_ep }
+
+// Size of an epoll_event record the loop uses (12 packed / 16 natural).
+fn epoll_stride(l: *mut Loop) -> usize { return (*l).stride }
 fn wake_kind(l: *mut Loop) -> u32 { return (*l).wkind }
 
 // How many sockets one loop can watch: 0 = no practical limit (Linux),
