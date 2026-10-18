@@ -793,6 +793,18 @@ build uia
 "$W/uia" | tail -n 3
 build syspref
 "$W/syspref" | tail -n 3
+# W26-d: gap list P1 rows #5 (size classes), #21 (combobox filter), #67 (timeline), #64 (localised standard texts)
+build sizeclass
+"$W/sizeclass" | tail -n 3
+build combo
+"$W/combo" | tail -n 3
+build timeline
+"$W/timeline" | tail -n 3
+build uistr
+"$W/uistr" | tail -n 3
+build dnd
+"$W/dnd" | tail -n 3
+python3 tools/fui/uistr_audit.py
 build touch
 "$W/touch" | tail -n 3
 build kitrtl

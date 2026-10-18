@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/sizeclass.fi -- RESPONSIVE: size classes, breakpoints, container queries (gap list #5, r148).
+//
+// An app that runs on a phone, a tablet and a desktop window asks ONE question per frame: "how much room
+// do I have?" -- and switches its layout when the answer crosses a line. This file is that question and
+// its answer, as integers, so the same app switches at the same width on every host.
+//
+//     var t: sizeclass.Tracker = sizeclass.tracker_new()          // 600 / 900 dp, hysteresis 16 dp
+//     if sizeclass.track(&t, window_w) { relayout() }            // true when the class CHANGED
+//     let c: u32 = sizeclass.class_w(&t)                         // SC_COMPACT / SC_MEDIUM / SC_EXPANDED
+//     let nav: u32 = sizeclass.nav_mode(c)                       // NAV_BOTTOM / NAV_RAIL / NAV_SIDEBAR
+//     let cols: usize = sizeclass.columns(w, 280, 16, 6)         // how many 280 dp cards fit, max 6
+//     sizeclass.pick(c, one, two, three)                         // value by class
+//
+// The lines (dp) are the Material window-size classes that WinUI and Compose share: compact < 600,
+// medium 600..899, expanded >= 900. A tracker has HYSTERESIS: once expanded, the window must shrink below
+// 900 - h before it is medium again, so a window dragged exactly onto a line does not flicker between two
+// layouts every frame. Height has its own classes (compact < 480, medium 480..899, expanded >= 900), a
+// phone in landscape is wide but compact in height.
+//
+// CONTAINER QUERIES: `fits_min(w, min)` / `fits_range(w, lo, hi)` ask the same about ONE panel's width
+// instead of the window's -- a card grid in a 400 dp side panel behaves as compact on a big screen.
+//
+// All widths in dp (the host's logical unit), never in physical pixels: pass `px / scale`.
+export {
+    Tracker, tracker_new, track, track_h, set_lines, set_hysteresis, class_w, class_h,
+    classify, classify_h, columns, pick, nav_mode, fits_min, fits_range, is_compact_any,
+    SC_COMPACT, SC_MEDIUM, SC_EXPANDED, NAV_BOTTOM, NAV_RAIL, NAV_SIDEBAR,
+    LINE_MEDIUM, LINE_EXPANDED, LINE_H_MEDIUM, LINE_H_EXPANDED,
+}
+
+const SC_COMPACT: u32 = 0
+const SC_MEDIUM: u32 = 1
+const SC_EXPANDED: u32 = 2
+
+const NAV_BOTTOM: u32 = 0 // bottom bar (phone)
+const NAV_RAIL: u32 = 1 // narrow icon rail (tablet, small window)
+const NAV_SIDEBAR: u32 = 2 // full sidebar with labels (desktop)
+
+const LINE_MEDIUM: i64 = 600
+const LINE_EXPANDED: i64 = 900
+const LINE_H_MEDIUM: i64 = 480
+const LINE_H_EXPANDED: i64 = 900
+
+struct Tracker {
+    l1: i64, // width: first line (compact -> medium)
+    l2: i64, // width: second line (medium -> expanded)
+    h1: i64, // height lines
+    h2: i64,
+    hyst: i64, // dp the size must go back past a line before the class falls
+    cw: u32, // current width class
+    ch: u32, // current height class
+    known: u32, // 0 until the first track()
+}
+
+fn tracker_new() -> Tracker {
+    return Tracker { l1: LINE_MEDIUM, l2: LINE_EXPANDED, h1: LINE_H_MEDIUM, h2: LINE_H_EXPANDED,
+        hyst: 16, cw: SC_COMPACT, ch: SC_COMPACT, known: 0 as u32 }
+}
+
+// Own lines for the width (a dense tool app may say 480 / 720). l1 < l2 is enforced.
+fn set_lines(t: *mut Tracker, l1: i64, l2: i64) {
+    var a: i64 = l1
+    if a < 1 { a = 1 }
+    var b: i64 = l2
+    if b <= a { b = a + 1 }
+    (*t).l1 = a
+    (*t).l2 = b
+    (*t).known = 0 as u32
+}
+
+fn set_hysteresis(t: *mut Tracker, dp: i64) {
+    var h: i64 = dp
+    if h < 0 { h = 0 }
+    (*t).hyst = h
+}
+
+// The class of a width without any memory.
+fn classify(w: i64, l1: i64, l2: i64) -> u32 {
+    if w >= l2 { return SC_EXPANDED }
+    if w >= l1 { return SC_MEDIUM }
+    return SC_COMPACT
+}
+
+fn classify_h(h: i64) -> u32 {
+    return classify(h, LINE_H_MEDIUM, LINE_H_EXPANDED)
+}
+
+// With hysteresis: going UP happens at the line, going DOWN only `hyst` below it.
+fn step_class(cur: u32, w: i64, l1: i64, l2: i64, hyst: i64) -> u32 {
+    var c: u32 = cur
+    // up
+    if c == SC_COMPACT && w >= l1 { c = SC_MEDIUM }
+    if c == SC_MEDIUM && w >= l2 { c = SC_EXPANDED }
+    // down
+    if c == SC_EXPANDED && w < l2 - hyst { c = SC_MEDIUM }
+    if c == SC_MEDIUM && w < l1 - hyst { c = SC_COMPACT }
+    // a big jump (window maximised from a tiny one) may skip a class: settle it in one call
+    if c == SC_COMPACT && w >= l2 { c = SC_EXPANDED }
+    if c == SC_EXPANDED && w < l1 - hyst { c = SC_COMPACT }
+    return c
+}
+
+// Feed the window width; true when the WIDTH class changed (the first call is a change).
+fn track(t: *mut Tracker, w: i64) -> bool {
+    if (*t).known == 0 as u32 {
+        (*t).cw = classify(w, (*t).l1, (*t).l2)
+        (*t).known = 1 as u32
+        return true
+    }
+    let n: u32 = step_class((*t).cw, w, (*t).l1, (*t).l2, (*t).hyst)
+    if n != (*t).cw {
+        (*t).cw = n
+        return true
+    }
+    return false
+}
+
+// Feed the window height; true when the HEIGHT class changed.
+fn track_h(t: *mut Tracker, h: i64) -> bool {
+    let n: u32 = step_class((*t).ch, h, (*t).h1, (*t).h2, (*t).hyst)
+    if n != (*t).ch {
+        (*t).ch = n
+        return true
+    }
+    return false
+}
+
+fn class_w(t: *mut Tracker) -> u32 { return (*t).cw }
+fn class_h(t: *mut Tracker) -> u32 { return (*t).ch }
+
+// A phone in landscape: wide enough for medium but too low for comfortable sheets.
+fn is_compact_any(t: *mut Tracker) -> bool {
+    return (*t).cw == SC_COMPACT || (*t).ch == SC_COMPACT
+}
+
+// How many columns of at least `min_col` dp (with `gap` between) fit into `w`; 1..max_cols.
+fn columns(w: i64, min_col: i64, gap: i64, max_cols: usize) -> usize {
+    var mc: i64 = min_col
+    if mc < 1 { mc = 1 }
+    var g: i64 = gap
+    if g < 0 { g = 0 }
+    // n columns need n * mc + (n - 1) * g  <=  w
+    var n: i64 = (w + g) / (mc + g)
+    if n < 1 { n = 1 }
+    if n > (max_cols as i64) { n = max_cols as i64 }
+    if n < 1 { n = 1 }
+    return n as usize
+}
+
+fn pick(c: u32, compact: i64, medium: i64, expanded: i64) -> i64 {
+    if c == SC_EXPANDED { return expanded }
+    if c == SC_MEDIUM { return medium }
+    return compact
+}
+
+fn nav_mode(c: u32) -> u32 {
+    if c == SC_EXPANDED { return NAV_SIDEBAR }
+    if c == SC_MEDIUM { return NAV_RAIL }
+    return NAV_BOTTOM
+}
+
+// Container queries on one panel's width.
+fn fits_min(w: i64, min: i64) -> bool { return w >= min }
+fn fits_range(w: i64, lo: i64, hi: i64) -> bool { return w >= lo && w < hi }
