@@ -90,6 +90,11 @@ Screen-door (ordered dither) fade between two representations of a column, in th
   draws with a recording back end: old code 15..36 draws out of order, new 0 (checks 78/79).
 - Gate floor `fog_flat` is back to 75 dB: dump.fi renders that scene with `raster_set_edge_expand(false)` (the arithmetic is what it checks), the expansion stays on for all other scenes.
 
+## Pin hole closed (r154, 18.10.)
+- Cause of the last hole (tests/2917 x62 y38, frame 4): a T-junction crack in the NEAR full-detail mesh (also in the full-detail reference; there the ray ends on a cave wall, in the LOD stream there is no inside -> clear colour). A T vertex and the two line ends each snap up to 1/2 unit (1/32 px), the crack can be up to 1 unit wide; the old band l1/4 per side (0.25..0.35 unit) did not always cover it.
+- Fix: opaque edge expansion divisor 4 -> 3 (`mc_raster.fi` + `tools/mc/raster/ref.py`, byte-identical on all 19 scenes). Sweep on tests/2917 (holes mid ring / web chunk PSNR GL vs CPU): /4: 1 / 36.87 dB, /3: 0 / 35.63 dB, /2: 0 / 34.21 dB (gpu gate lit_* floor 38 failed at /2). /3 is the widest band that keeps `tools/gpu/run.sh` green (lit_night 38.04 vs floor 38 - margin is thin).
+- Skyline pixels: already explained above (rasterizer, not LOD height); PASS_LOD band unchanged.
+
 ## Client integration + ring bench (z4, 14.10.)
 - mcplay draws through mc_stream by default (a2; `MCPLAY_STREAM=0` = old mc_render_world path): `MCPLAY_LOD=<n>` adds LOD up to n chunks beyond `MCPLAY_VIEW`, `MCPLAY_WORKERS` = mesher threads.
   With LOD the client asks the server for n chunks (`client_send_settings`), `dist` of the stream = MCPLAY_VIEW (full detail), `lod_dist` = n; fog and far plane use n. The stream meshes inline (pool 0, the budgets of mc_stream apply).
