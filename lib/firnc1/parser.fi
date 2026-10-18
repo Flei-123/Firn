@@ -199,6 +199,7 @@ struct Parser {
     foreign: u64, // shared tree (0 = we use our own)
     multi: bool, // several files are compiled (`module__x`); an interpolation copy keeps it, `foreign` alone cannot tell
     module: Vec[u32], // intern numbers of the module aliases (for `module.x`)
+    module_to: Vec[u32], // parallel to `module`: the module name behind the alias (`import a.b as c`: c -> b)
     scratch: rt.Buf, // builds up qualified names
     parens: usize, // open parentheses (for `next()`)
     no_slit: usize, // > 0: no struct literal at the top level
@@ -369,6 +370,7 @@ fn par_new(lx: u64) -> Parser {
         tree: ast.tree_new(),
         alias: NONE, own: vec_new[u32](), foreign: 0, multi: false,
         module: vec_new[u32](),
+        module_to: vec_new[u32](),
         scratch: rt.buf_new(),
         parens: 0, no_slit: 0, err: 0, not_core: false,
         rp_name: vec_new[u32](), rp_flag: vec_new[u32](), rp_mark: vec_new[u32](),
@@ -484,6 +486,7 @@ fn par_free(p: *mut Parser) {
         ast.tree_free(&(*p).tree)
     }
     vec_free[u32](&(*p).module)
+    vec_free[u32](&(*p).module_to)
     vec_free[u32](&(*p).own)
     rt.buf_free(&(*p).scratch)
     vec_free[u32](&(*p).local)
@@ -865,7 +868,7 @@ fn renamed(p: *mut Parser, nr: u32) -> u32 {
 fn qualify(p: *mut Parser, module: u32, name: u32) -> u32 {
     if (*p).multi {
         var tr: [u8; 2] = "__"
-        return join(p, module, (&tr[0]) as u64, 2, name)
+        return join(p, module_target(p, module), (&tr[0]) as u64, 2, name)
     }
     var pt: [u8; 1] = "."
     return join(p, module, (&pt[0]) as u64, 1, name)
@@ -909,6 +912,19 @@ fn is_module(p: *mut Parser, nr: u32) -> bool {
         i = i + 1
     }
     return false
+}
+
+// `import a.b as c`: the module name behind the alias `c` (`b`); any other
+// name stays as it is (twin of `modules.rs`, alias -> last path part).
+fn module_target(p: *mut Parser, nr: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*p).module) {
+        if vec_at[u32](&(*p).module, i) == nr {
+            return vec_at[u32](&(*p).module_to, i)
+        }
+        i = i + 1
+    }
+    return nr
 }
 
 // The identifier has already been read; if it is a module alias followed by
@@ -6246,17 +6262,21 @@ fn import_decl(p: *mut Parser) {
         rt.buf_push_bytes(&(*p).scratch, intern.intern_ptr(it, last), intern.intern_length(it, last))
         next_bump(p)
     }
-    // `import a.b as c` is a stage 0 extension that is not ported yet.
+    // `import a.b as c`: the module is reached under the name `c`.
+    var chosen: u32 = last
     if actual(p, A_KWAS) {
-        (*p).not_core = true
         next_bump(p)
-        if actual(p, A_IDENT) {
-            next_bump(p)
+        if !actual(p, A_IDENT) {
+            complain(p)
+            return
         }
+        chosen = tok_nr(p, 0)
+        next_bump(p)
     }
     let path: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch), rt.buf_len(&(*p).scratch)) as u32
-    ast.imp_add(par_tree(p), path, last)
-    vec_push[u32](&(*p).module, last)
+    ast.imp_add(par_tree(p), path, chosen)
+    vec_push[u32](&(*p).module, chosen)
+    vec_push[u32](&(*p).module_to, last)
     end_stmt(p)
 }
 
@@ -6497,19 +6517,29 @@ fn pattern(p: *mut Parser, depth: u32) -> u32 {
             return variants_pattern(p, nr, depth)
         }
         // Round GAPS: `module.NAME` -- a qualified constant as a pattern
-        // (sema_match.rs). Not ported to stage 1: the file counts as not
-        // core (exit 3), exactly like the other unported extensions.
-        if actual(p, A_DOT) {
-            (*p).not_core = true
+        // (sema_match.rs `Pattern::Const`). A BIND with the qualified name and
+        // mu_b = 1: sema turns it into the constant's value (`pattern_check`)
+        // and reports a qualified name that is no constant (it never binds).
+        if actual(p, A_DOT) && kind(p, 1) == A_IDENT {
+            let member: u32 = tok_nr(p, 1)
             next_bump(p)
-            if actual(p, A_IDENT) {
-                next_bump(p)
-            }
-            return pattern.pat_mu_add(mn(p), pattern.MU_WILD, 0, 0, 0, 0, 0, 0)
+            next_bump(p)
+            let q: u32 = qualify(p, nr, member)
+            let cp: u32 = pattern.pat_mu_add(mn(p), pattern.MU_BIND, q, 1, 0, 0, 0, 0)
+            pattern.pat_mu_pos_set(mn(p), cp, ipos)
+            return cp
         }
         // binding of the whole value
         loc_add(p, nr)
-        let bind: u32 = pattern.pat_mu_add(mn(p), pattern.MU_BIND, nr, 0, 0, 0, 0, 0)
+        // mu_b = renamed spelling + 2 when the name is one of this module's own
+        // top-level names: a constant of the module is written bare in its
+        // patterns (modules.rs rewrites it), so sema looks that name up too.
+        var bind_b: u32 = 0
+        let rn: u32 = renamed(p, nr)
+        if rn != nr {
+            bind_b = rn + 2
+        }
+        let bind: u32 = pattern.pat_mu_add(mn(p), pattern.MU_BIND, nr, bind_b, 0, 0, 0, 0)
         pattern.pat_mu_pos_set(mn(p), bind, ipos)
         return bind
     }
@@ -6669,8 +6699,14 @@ fn module_upfront(p: *mut Parser) {
                 }
                 j = j + 1
             }
+            // `import a.b as c`: the name is `c`, the module behind it `b`
+            var chosen: u32 = last
+            if j + 1 < (*p).n && lexer.lex_kind(lx(p), j) == A_KWAS && lexer.lex_kind(lx(p), j + 1) == A_IDENT {
+                chosen = lexer.lex_nr(lx(p), j + 1)
+            }
             if last != ast.NOTHING {
-                vec_push[u32](&(*p).module, last)
+                vec_push[u32](&(*p).module, chosen)
+                vec_push[u32](&(*p).module_to, last)
             }
         }
         i = i + 1
