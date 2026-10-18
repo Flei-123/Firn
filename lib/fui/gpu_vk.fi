@@ -30,7 +30,7 @@ import gpu.vk_mem
 import gpu.vk_desc
 import gpu.vk_frame
 
-export { vkgl_api, vkgl_close, vkgl_is_cpu, vkgl_device, vkgl_stats, vkgl_passes, vkgl_step, vkgl_alive }
+export { vkgl_api, vkgl_close, vkgl_is_cpu, vkgl_device, vkgl_stats, vkgl_passes, vkgl_breaks, vkgl_step, vkgl_alive }
 
 const SPV_VS: str = __include_str("spv/gpu_vk.vert.spv")
 const SPV_FS: str = __include_str("spv/gpu_vk.frag.spv")
@@ -166,6 +166,15 @@ struct VG {
     uploads: u64,
     readbacks: u64,
     passes: u64, // render passes begun (draws / clears into one target in a row share one)
+    // why an open render pass ended (0 target change, 1 feedback draw, 2 texture create, 3 upload, 4 blit, 5 read-back, 6 flush)
+    br0: u64,
+    br1: u64,
+    br2: u64,
+    br3: u64,
+    br4: u64,
+    br5: u64,
+    br6: u64,
+    why: u64, // reason the next non-draw cmd_open reports (set by its caller)
 }
 
 static mut G_P: u64 = 0
@@ -196,7 +205,7 @@ fn vg_new() -> VG {
         ok: false, step: 0, v: vk.vk_new(), x: vk_mem.x_new(),
         fr: vk_frame.Frames { ok: false, pool: 0, n: 0, w: 0, icmd: 0, ifence: 0, serial: 0, done: 0, tpending: false },
         fn_clear_att: 0, fn_clear_img: 0, rp: 0, dsl: 0, dpool: 0, dset: 0, playout: 0, samp0: 0, samp1: 0,
-        ubo: vk_mem.buf_none(), stg: vk_mem.buf_none(), stg_n: 0, stg_off: 0, rb: vk_mem.buf_none(), rb_n: 0, pass_fb: 0, rec: 0, dsets: 0, set_n: 0, ops: 0,
+        ubo: vk_mem.buf_none(), stg: vk_mem.buf_none(), stg_n: 0, stg_off: 0, rb: vk_mem.buf_none(), rb_n: 0, br0: 0, br1: 0, br2: 0, br3: 0, br4: 0, br5: 0, br6: 0, why: 0, pass_fb: 0, rec: 0, dsets: 0, set_n: 0, ops: 0,
         scr: 0, top: 0, texs: 0, bufs: 0, fbs: 0,
         p0n: vk_desc.vpipe_none(), p0b: vk_desc.vpipe_none(), p1n: vk_desc.vpipe_none(), p1b: vk_desc.vpipe_none(),
         nprog: 0, uni: 0, samp_unit: [0; 8], cur_prog: 0, cur_tex: [0; 8], unit: 0, arr_buf: 0, attr_buf: [0; 9],
@@ -282,6 +291,28 @@ fn pass_end(s: *mut VG) {
 
 // The command buffer being recorded (started when none is) with a global barrier first: everything recorded before is done and visible.
 // Ends an open render pass first (for operations that are not draws / clears: use `cmd_pass` for those).
+// Counts why an open render pass ends (only when one is open).
+fn brk_count(s: *mut VG, w: u64) {
+    if (*s).pass_fb == 0 || (*s).rec == 0 {
+        return
+    }
+    if w == 0 {
+        (*s).br0 = (*s).br0 + 1
+    } else if w == 1 {
+        (*s).br1 = (*s).br1 + 1
+    } else if w == 2 {
+        (*s).br2 = (*s).br2 + 1
+    } else if w == 3 {
+        (*s).br3 = (*s).br3 + 1
+    } else if w == 4 {
+        (*s).br4 = (*s).br4 + 1
+    } else if w == 5 {
+        (*s).br5 = (*s).br5 + 1
+    } else {
+        (*s).br6 = (*s).br6 + 1
+    }
+}
+
 fn cmd_open() -> u64 {
     let s: *mut VG = gs()
     if (*s).lost {
@@ -296,6 +327,7 @@ fn cmd_open() -> u64 {
         }
         (*s).rec = c
     }
+    brk_count(s, (*s).why)
     pass_end(s)
     vk_frame.mem_barrier(&(*s).x, (*s).rec, ALL_CMDS, ALL_CMDS, MEM_W, MEM_RW)
     (*s).ops = (*s).ops + 1
@@ -314,6 +346,7 @@ fn cmd_flush() -> bool {
     if (*s).rec == 0 {
         return !(*s).lost
     }
+    brk_count(s, 6)
     pass_end(s)
     (*s).rec = 0
     (*s).set_n = 0
@@ -429,6 +462,7 @@ fn tex_make(t: *mut VTex, w: i32, h: i32, fmt: u32, bpp: usize) -> bool {
         return false
     }
     (*t).img = img
+    (*gs()).why = 2
     let cmd: u64 = cmd_open()
     if cmd == 0 {
         return false
@@ -470,6 +504,7 @@ fn tex_upload(t: *mut VTex, x: i64, y: i64, w: i64, h: i64, p: u64, rl: i64) -> 
         rt.mem_copy((*s).stg.ptr + (so as u64) + ((r as usize) * rowb) as u64, p + ((r as usize) * srcrow) as u64, rowb)
         r = r + 1
     }
+    (*gs()).why = 3
     let cmd: u64 = cmd_open()
     if cmd == 0 {
         return false
@@ -1067,6 +1102,14 @@ fn cmd_pass(s: *mut VG, fbi: u64, f: *mut VFb, feedback: bool) -> u64 {
         (*s).ops = (*s).ops + 1
         return (*s).rec
     }
+    if (*s).pass_fb != 0 && (*s).rec != 0 {
+        if (*s).pass_fb == fbi {
+            brk_count(s, 1)
+        } else {
+            brk_count(s, 0)
+        }
+        pass_end(s)
+    }
     let cmd: u64 = cmd_open()
     if cmd == 0 {
         return 0
@@ -1259,6 +1302,7 @@ fn f_blit_framebuffer(sx0: i64, sy0: i64, sx1: i64, sy1: i64, dx0: i64, dy0: i64
     if ax0 < 0 || ay0 < 0 || ax1 > (*rf).w as i64 || ay1 > (*rf).h as i64 || bx0 < 0 || by0 < 0 || bx1 > (*df).w as i64 || by1 > (*df).h as i64 {
         return
     }
+    (*gs()).why = 4
     let cmd: u64 = cmd_open()
     if cmd == 0 {
         return
@@ -1306,6 +1350,7 @@ fn f_read_pixels(x: i64, y: i64, w: i64, h: i64, dst: u64) {
     if !rb_ensure(n) {
         return
     }
+    (*gs()).why = 5
     let cmd: u64 = cmd_open()
     if cmd == 0 {
         return
@@ -1683,6 +1728,21 @@ fn vkgl_passes() -> u64 {
         return 0
     }
     return (*gs()).passes
+}
+
+// out[0..7] = why an open render pass ended: target change, feedback draw, texture create, upload, blit, read-back, flush
+fn vkgl_breaks(out: *mut u64) {
+    if G_P == 0 {
+        return
+    }
+    let s: *mut VG = gs()
+    *out = (*s).br0
+    *((out as u64 + 8) as *mut u64) = (*s).br1
+    *((out as u64 + 16) as *mut u64) = (*s).br2
+    *((out as u64 + 24) as *mut u64) = (*s).br3
+    *((out as u64 + 32) as *mut u64) = (*s).br4
+    *((out as u64 + 40) as *mut u64) = (*s).br5
+    *((out as u64 + 48) as *mut u64) = (*s).br6
 }
 
 // out[0..4] = draws, submits, uploads, read-backs
