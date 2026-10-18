@@ -298,8 +298,16 @@ pub(crate) fn emit_checked_bin(
     let bad = format!(".Lchksite{}", uid);
     // The two originals have to survive the operation: the message names
     // them. x11/x13 are scratch of the A64 backend and hold no FIR value.
-    e.line(&format!("mov x11, {}", A));
-    e.line(&format!("mov x13, {}", B));
+    // r454: a 64-bit `+`/`-` does not copy them on the hot path: `b` is not touched by the operation and `a` is recovered
+    // from the wrapped result inside the panic arm (`a = r - b` / `a = r + b`, exact modulo 2^64).
+    let recover64 = bits == 64 && op != BinOp::Mul;
+    if !recover64 {
+        e.line(&format!("mov x11, {}", A));
+        e.line(&format!("mov x13, {}", B));
+    }
+    // r454: the branch that skips the panic arm when nothing overflowed (the arm is the fall-through): one taken branch
+    // instead of a not-taken `b.<cond> bad` plus an unconditional `b ok`.
+    let skip: String;
     if bits == 64 && op == BinOp::Mul {
         // 64 bits: the upper half decides. Signed overflow means the high
         // word is not the sign extension of the low one, unsigned means it
@@ -309,18 +317,20 @@ pub(crate) fn emit_checked_bin(
             e.line(&format!("smulh {}, {}, {}", U, A, B));
             e.line(&format!("mul {}, {}, {}", A, A, B));
             e.line(&format!("cmp {}, {}, asr #63", U, A));
-            e.line(&format!("b.ne {}", bad));
+            skip = format!("b.eq {}", ok);
         } else {
             e.line(&format!("umulh {}, {}, {}", U, A, B));
             e.line(&format!("mul {}, {}, {}", A, A, B));
-            e.line(&format!("cbnz {}, {}", U, bad));
+            skip = format!("cbz {}, {}", U, ok);
         }
     } else if bits == 32 && op == BinOp::Mul {
         // Two 32-bit operands, each already extended to 64: their 64-bit
         // product is EXACT, so the question is a range question and needs
         // no flag at all.
         e.line(&format!("mul {}, {}, {}", A, A, B));
-        range_check(e, ty, &bad);
+        extend_to(e, T, A, ty);
+        e.line(&format!("cmp {}, {}", A, T));
+        skip = format!("b.eq {}", ok);
     } else if bits >= 32 {
         let (aw, bw) = (rw(A, bits), rw(B, bits));
         match op {
@@ -333,13 +343,13 @@ pub(crate) fn emit_checked_bin(
         // when a borrow was needed (C=0) -- x86 answers both with one
         // `jc`, A64 spells the borrow the other way round.
         let cond = if ty.signed() {
-            "vs"
+            "vc"
         } else if op == BinOp::Sub {
-            "cc"
-        } else {
             "cs"
+        } else {
+            "cc"
         };
-        e.line(&format!("b.{} {}", cond, bad));
+        skip = format!("b.{} {}", cond, ok);
     } else {
         // 8 and 16 bits: A64 has no arithmetic at those widths and
         // therefore no flags for them. Two values that fit into 8 or 16
@@ -357,23 +367,22 @@ pub(crate) fn emit_checked_bin(
         // its sign extension differ in the upper half for a reason that
         // has nothing to do with overflow.
         e.line(&format!("sxtw {}, {}", A, wn(A)));
-        range_check(e, ty, &bad);
+        extend_to(e, T, A, ty);
+        e.line(&format!("cmp {}, {}", A, T));
+        skip = format!("b.eq {}", ok);
     }
-    e.line(&format!("b {}", ok));
+    e.line(&skip);
     e.raw(&format!("{}:", bad));
+    if recover64 {
+        if op == BinOp::Add {
+            e.line(&format!("sub x11, {}, {}", A, B));
+        } else {
+            e.line(&format!("add x11, {}, {}", A, B));
+        }
+        e.line(&format!("mov x13, {}", B));
+    }
     trampoline_jump(e, panic_code_of(op), &label, msg.len(), "x11", "x13", !ty.signed());
     e.raw(&format!("{}:", ok));
-}
-
-/// `x9` cut to `ty` and read back: differs from `x9` exactly when the
-/// value does not fit. Branches to `bad` in that case.
-fn range_check(e: &mut Emitter, ty: FTy, bad: &str) {
-    if ty.bits() >= 64 {
-        return;
-    }
-    extend_to(e, T, A, ty);
-    e.line(&format!("cmp {}, {}", A, T));
-    e.line(&format!("b.ne {}", bad));
 }
 
 /// Emits `/` and `%`, CHECKED: division by zero, and for a signed type the
