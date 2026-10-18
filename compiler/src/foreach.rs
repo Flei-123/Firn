@@ -39,7 +39,7 @@
 
 use crate::ast::*;
 use crate::diag::Span;
-use crate::fir::{FTy, Val};
+use crate::fir::{BinOp as FBin, FTy, Op, Val};
 use crate::lower::Lower;
 use crate::parser::{Parser, TuplePat};
 use crate::sema::Checker;
@@ -359,4 +359,117 @@ pub(crate) fn lower_call(lo: &mut Lower, args: &[Expr], span: Span) -> Option<Op
         None => return lo.ice(span, "__each_len of something that is not an array"),
     };
     Some(Some(lo.constant(FTy::U64, n as i128)))
+}
+
+// ------------------------------------------------------------ Vec slice (r728)
+
+/// Name of the slice method (the sugar `v[a:b]` of the parser).
+const SLICE: &str = "slice";
+
+thread_local! {
+    /// Element type per `Vec__..` struct, noted by the type check for the
+    /// lowering of `v[a:b]` (the lowering cannot resolve type expressions).
+    static SLICE_ELEM: std::cell::RefCell<std::collections::HashMap<String, Type>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+pub(crate) fn slice_reset() {
+    SLICE_ELEM.with(|m| m.borrow_mut().clear());
+}
+
+/// Type check of `v[a:b]` on a Vec: checks the two bounds as `i64`, notes the
+/// element type for the lowering, yields the Vec type itself (a view).
+pub(crate) fn check_vec_slice(ck: &mut Checker, recv_t: Type, args: &[Expr]) -> Type {
+    for a in &args[1..] {
+        let _ = ck.expr(a, Some(&Type::I64));
+    }
+    let sidx = match seq_struct(&ck.tcx, &recv_t) {
+        Some(i) => i,
+        None => return Type::Error,
+    };
+    if let Some(et) = seq_elem(ck, &recv_t) {
+        let name = ck.tcx.structs[sidx].name.clone();
+        SLICE_ELEM.with(|m| m.borrow_mut().insert(name, et));
+    }
+    Type::Struct(sidx)
+}
+
+/// r728: is `recv.slice(a, b)` on a `Vec[T]` WITHOUT a method of that name?
+/// `Vec[T]` has no methods, so the sugar `v[a:b]` is resolved here: the
+/// result is a non-owning VIEW (`Vec[T]` with `cap = 0`, same element
+/// storage, Python bound rules: negative from the end, clamped). `str` and
+/// `Span` keep their own `slice` method (strtype / lib).
+pub(crate) fn is_vec_slice(tcx: &crate::types::TypeCtx, fns: &std::collections::HashMap<String, crate::sema::FnSig>, name: &str, recv: &Type, nargs: usize) -> bool {
+    if crate::impls::method_name(name) != Some(SLICE) || nargs != 3 {
+        return false;
+    }
+    let sidx = match seq_struct(tcx, recv) {
+        Some(i) => i,
+        None => return false,
+    };
+    if !tcx.structs[sidx].name.starts_with("Vec__") {
+        return false;
+    }
+    crate::impls::target_of(tcx, fns, SLICE, recv).is_none()
+}
+
+/// Clamps the Python bound `x` (I64) to `0..=n` (I64) without branches.
+fn clamp_bound(lo: &mut Lower, x: Val, n: Val) -> Val {
+    let c63 = lo.constant(FTy::I64, 63);
+    let neg = lo.push(FTy::I64, Op::Bin(FBin::Shr, x, c63));
+    let add = lo.push(FTy::I64, Op::Bin(FBin::And, n, neg));
+    let x1 = lo.push(FTy::I64, Op::Bin(FBin::Add, x, add));
+    let m1 = lo.push(FTy::I64, Op::Bin(FBin::Shr, x1, c63));
+    let ones = lo.constant(FTy::I64, -1);
+    let nm1 = lo.push(FTy::I64, Op::Bin(FBin::Xor, m1, ones));
+    let x2 = lo.push(FTy::I64, Op::Bin(FBin::And, x1, nm1));
+    let d = lo.push(FTy::I64, Op::Bin(FBin::Sub, n, x2));
+    let m2 = lo.push(FTy::I64, Op::Bin(FBin::Shr, d, c63));
+    let dm = lo.push(FTy::I64, Op::Bin(FBin::And, d, m2));
+    lo.push(FTy::I64, Op::Bin(FBin::Add, x2, dm))
+}
+
+/// Lowers `v[a:b]` on a `Vec[T]` into a view written to `dest`.
+pub(crate) fn lower_vec_slice(
+    lo: &mut Lower,
+    args: &[Expr],
+    dest: Option<Val>,
+    span: Span,
+) -> Option<Option<Val>> {
+    let recv = &args[0];
+    let bt = lo.ty_of(recv);
+    let sidx = seq_struct(&lo.info.tcx, &bt)?;
+    let ename = lo.info.tcx.structs[sidx].name.clone();
+    let et = SLICE_ELEM.with(|m| m.borrow().get(&ename).cloned());
+    let esz = match et {
+        Some(t) => lo.info.tcx.size_of(&t).max(1),
+        None => return lo.ice(span, "slice: element type not recorded by the type check"),
+    };
+    let (data, len) = seq_words(lo, recv)?;
+    let a0 = lo.lower_expr(&args[1])?;
+    let b0 = lo.lower_expr(&args[2])?;
+    let n = lo.push(FTy::I64, Op::Cast { src: len, from: FTy::U64 });
+    let a = clamp_bound(lo, a0, n);
+    let b = clamp_bound(lo, b0, n);
+    let cnt0 = lo.push(FTy::I64, Op::Bin(FBin::Sub, b, a));
+    let c63 = lo.constant(FTy::I64, 63);
+    let mc = lo.push(FTy::I64, Op::Bin(FBin::Shr, cnt0, c63));
+    let ones = lo.constant(FTy::I64, -1);
+    let nmc = lo.push(FTy::I64, Op::Bin(FBin::Xor, mc, ones));
+    let cnt = lo.push(FTy::U64, Op::Bin(FBin::And, cnt0, nmc));
+    let au = lo.push(FTy::U64, Op::Cast { src: a, from: FTy::I64 });
+    let ptr = lo.elem_addr(data, esz, au, FTy::U64);
+    let d = match dest {
+        Some(d) => d,
+        None => lo.alloca(24, 8),
+    };
+    let (pn, ln) = word_names(&lo.info.tcx, sidx);
+    let pa = lo.field_addr(d, sidx, pn, span)?;
+    let la = lo.field_addr(d, sidx, ln, span)?;
+    let ca = lo.field_addr(d, sidx, "cap", span)?;
+    lo.store(FTy::Ptr, pa, ptr);
+    lo.store(FTy::U64, la, cnt);
+    let zero = lo.constant(FTy::U64, 0);
+    lo.store(FTy::U64, ca, zero);
+    Some(None)
 }

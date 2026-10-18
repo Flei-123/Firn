@@ -2846,6 +2846,15 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
             }
         }
     }
+    // HOOK vslice (r728, foreach.rs::lower_vec_slice): `v[a:b]` on a Vec[T]
+    if ast.e_c(b, e) == 3 && is_method_call(names(l), name) {
+        let vr0: u32 = ast.child_at(b, ast.e_b(b, e))
+        let vt0: u32 = sema.sema_ty(sm(l), vr0)
+        if sema.sema_vec_slice(sm(l), name, vt0) {
+            lower_vec_slice(l, e, target, vt0)
+            return 0
+        }
+    }
     // HOOK impl (impls.rs, round 45): `x.m(a)` sits in the tree as
     // `"method m"`. The target is derived AGAIN here -- from the type of the
     // receiver and the method name, exactly as in the type checker. There is
@@ -2894,7 +2903,28 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
             }
         }
     }
+    // r728 (impls.rs HOOK callidx): `E(args)` -- the receiver IS the callee, an
+    // expression yielding a function record (word 0 = code address).
+    var callee_val: bool = false
     if !dispatch && is_method_call(names(l), name) {
+        var cw: [u8; 6] = "__call"
+        let cnr: u32 = intern.intern_number(names(l), (&cw[0]) as u64, 6) as u32
+        callee_val = intern.intern_ab(names(l), name, 7) == cnr
+    }
+    if callee_val {
+        let crecv: u32 = ast.child_at(b, ast.e_b(b, e))
+        let cet: u32 = sema.sema_ty(sm(l), crecv)
+        if types.ty_kind(tf(l), cet) != types.K_FN {
+            give_up(l)
+            return 0
+        }
+        v_rec = value(l, crecv)
+        v_code = load(l, fir.T_PTR, v_rec)
+        v_fnty = cet
+        indirect = true
+        skip_recv = true
+    }
+    if !dispatch && !callee_val && is_method_call(names(l), name) {
         let recv: u32 = ast.child_at(b, ast.e_b(b, e))
         let et: u32 = sema.sema_ty(sm(l), recv)
         let sn: u32 = recv_struct_l(l, et)
@@ -3081,6 +3111,60 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
         return 0
     }
     return push(l, call_kind, ft, call_target, 0, 0, 0, off, cnt)
+}
+
+// Clamps the Python bound `x` (I64) to 0..=n (I64) without branches.
+fn clamp_bound(l: *mut Lower, x: u32, n: u32) -> u32 {
+    let c63: u32 = constant(l, fir.T_I64, 63)
+    let neg: u32 = push(l, fir.O_BIN, fir.T_I64, x, c63, 9, 0, 0, 0)
+    let add: u32 = push(l, fir.O_BIN, fir.T_I64, n, neg, 5, 0, 0, 0)
+    let x1: u32 = push(l, fir.O_BIN, fir.T_I64, x, add, 0, 0, 0, 0)
+    let m1: u32 = push(l, fir.O_BIN, fir.T_I64, x1, c63, 9, 0, 0, 0)
+    let ones: u32 = constant(l, fir.T_I64, 18446744073709551615)
+    let nm1: u32 = push(l, fir.O_BIN, fir.T_I64, m1, ones, 7, 0, 0, 0)
+    let x2: u32 = push(l, fir.O_BIN, fir.T_I64, x1, nm1, 5, 0, 0, 0)
+    let d: u32 = push(l, fir.O_BIN, fir.T_I64, n, x2, 1, 0, 0, 0)
+    let m2: u32 = push(l, fir.O_BIN, fir.T_I64, d, c63, 9, 0, 0, 0)
+    let dm: u32 = push(l, fir.O_BIN, fir.T_I64, d, m2, 5, 0, 0, 0)
+    return push(l, fir.O_BIN, fir.T_I64, x2, dm, 0, 0, 0, 0)
+}
+
+// r728 (foreach.rs::lower_vec_slice): `v[a:b]` on a Vec[T] writes a VIEW
+// {ptr + lo*size, len, cap = 0} to `target` (Python bounds, clamped).
+fn lower_vec_slice(l: *mut Lower, e: u32, target: u32, vt0: u32) {
+    let b: *mut ast.Tree = tree(l)
+    let off: u32 = ast.e_b(b, e)
+    let recv: u32 = ast.child_at(b, off)
+    var saddr: u32 = 0
+    if types.ty_kind(tf(l), vt0) == types.K_PTR {
+        saddr = value(l, recv)
+    } else {
+        saddr = address(l, recv)
+    }
+    let sdata: u32 = load(l, fir.T_PTR, saddr)
+    let slen: u32 = load(l, fir.T_U64, ptradd_const(l, saddr, 8))
+    let esz: u64 = q_size(l, sema.sema_seq_elem(sm(l), vt0))
+    let a0: u32 = value(l, ast.child_at(b, off + 1))
+    let b0: u32 = value(l, ast.child_at(b, off + 2))
+    let n: u32 = push(l, fir.O_CAST, fir.T_I64, slen, 0, fir.T_U64, 0, 0, 0)
+    let a: u32 = clamp_bound(l, a0, n)
+    let bb: u32 = clamp_bound(l, b0, n)
+    let cnt0: u32 = push(l, fir.O_BIN, fir.T_I64, bb, a, 1, 0, 0, 0)
+    let c63: u32 = constant(l, fir.T_I64, 63)
+    let mc: u32 = push(l, fir.O_BIN, fir.T_I64, cnt0, c63, 9, 0, 0, 0)
+    let ones: u32 = constant(l, fir.T_I64, 18446744073709551615)
+    let nmc: u32 = push(l, fir.O_BIN, fir.T_I64, mc, ones, 7, 0, 0, 0)
+    let cnt: u32 = push(l, fir.O_BIN, fir.T_U64, cnt0, nmc, 5, 0, 0, 0)
+    let au: u32 = push(l, fir.O_CAST, fir.T_U64, a, 0, fir.T_I64, 0, 0, 0)
+    let ptr: u32 = elem_address(l, sdata, au, fir.T_U64, esz)
+    var d: u32 = target
+    if d == fir.NONE {
+        d = alloca(l, 24, 8)
+    }
+    store(l, fir.T_PTR, d, ptr)
+    store(l, fir.T_U64, ptradd_const(l, d, 8), cnt)
+    let zero: u32 = constant(l, fir.T_U64, 0)
+    store(l, fir.T_U64, ptradd_const(l, d, 16), zero)
 }
 
 fn call_with_target(l: *mut Lower, e: u32, target: u32) {

@@ -946,11 +946,23 @@ impl<'a> Parser<'a> {
                     let lp = self.span();
                     let name = match &e.kind {
                         ExprKind::Ident(n) => n.clone(),
+                        // HOOK callidx (r728): `v[i](x)`, `s.f[i](x)`,
+                        // `(expr)(x)` -- the callee is an expression holding
+                        // a function value; it travels as the receiver of
+                        // the hidden method `__call` (impls.rs).
                         _ => {
-                            self.error_here(
-                                "only direct function names can be called (pointer calls are not supported in stage 0)",
+                            self.bump();
+                            let (args, end) = self.call_args("after the argument list");
+                            let sp = Parser::join(e.span, end);
+                            let mut all = Vec::with_capacity(args.len() + 1);
+                            let cs = e.span;
+                            all.push(e);
+                            all.extend(args);
+                            e = self.mk(
+                                sp,
+                                ExprKind::Call(format!("{}{}", crate::impls::P_CALL, crate::impls::CALL_VALUE), all, cs),
                             );
-                            return e;
+                            continue;
                         }
                     };
                     self.bump();
@@ -2804,6 +2816,7 @@ pub fn reset_hooks() {
     // HOOK iface: the same for interfaces and their implementations (iface.rs)
     crate::iface::hook_reset();
     crate::fnval::hook_reset();
+    crate::foreach::slice_reset();
     crate::fnval::closure_reset();
     // HOOK str: the builtin type of round 70 (strtype.rs)
     crate::strtype::hook_reset();

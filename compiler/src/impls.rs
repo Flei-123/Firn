@@ -80,6 +80,9 @@ use crate::types::{Type, TypeCtx};
 /// Prefix of the method call not yet resolved in the AST.
 /// The space makes it unreachable from the source text.
 pub(crate) const P_CALL: &str = "method ";
+/// r728: hidden method name of a call through an expression callee
+/// (`v[i](x)`); the callee is the receiver.
+pub(crate) const CALL_VALUE: &str = "__call";
 /// Separator in the name of the method function: `Type__method`.
 pub(crate) const SEP: &str = "__";
 
@@ -695,6 +698,40 @@ pub(crate) fn hook_call(
             ck.type_out_expr(a);
         }
         return Some(Type::Error);
+    }
+    // HOOK callidx (r728): `E(args)` -- E is an expression of function type.
+    if method == CALL_VALUE {
+        if let Type::Fn { params, ret } = &et {
+            let shown = ck.tcx.name_of(&et);
+            let found = args.len() - 1;
+            if found != params.len() {
+                ck.dg.error(
+                    espan,
+                    format!(
+                        "the function value of type {} expects {} argument(s), found {}",
+                        shown,
+                        params.len(),
+                        found
+                    ),
+                );
+            }
+            for (i, a) in args[1..].iter().enumerate() {
+                match params.get(i) {
+                    Some(p) => ck.check_argument("(callee)", i + 1, a, p),
+                    None => ck.type_out_expr(a),
+                }
+            }
+            return Some((**ret).clone());
+        }
+        for a in &args[1..] {
+            ck.type_out_expr(a);
+        }
+        ck.dg.error(nspan, format!("a value of type {} cannot be called", ck.tcx.name_of(&et)));
+        return Some(Type::Error);
+    }
+    // HOOK vslice (r728): `v[a:b]` on a `Vec[T]` -- a view, see foreach.rs.
+    if crate::foreach::is_vec_slice(&ck.tcx, &ck.fns, name, &et, args.len()) {
+        return Some(crate::foreach::check_vec_slice(ck, et, args));
     }
     let (prefixes, is_ptr) = match receiver_prefixes(&ck.tcx, &et) {
         Some(x) => x,

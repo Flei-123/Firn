@@ -1411,6 +1411,18 @@ impl<'a> Lower<'a> {
             Some(n) if !self.info.fns.contains_key(name) => n,
             _ => name,
         };
+        // HOOK vslice (r728): `v[a:b]` on a `Vec[T]` is a view (foreach.rs)
+        {
+            let rt = match args.first() {
+                Some(e) => Some(self.ty_of(e)),
+                None => None,
+            };
+            if let Some(rt) = rt {
+                if crate::foreach::is_vec_slice(&self.info.tcx, &self.info.fns, name, &rt, args.len()) {
+                    return crate::foreach::lower_vec_slice(self, args, dest, span);
+                }
+            }
+        }
         // HOOK impl: `x.m(a)` appears as `"method m"` in the tree. The
         // resolution is derived AFRESH here — from the type of the receiver
         // and the method name, exactly as in `sema` (impls.rs, round 45). If
@@ -1449,6 +1461,21 @@ impl<'a> Lower<'a> {
         let name: &str = match crate::impls::method_name(name) {
             None => name,
             Some(_) if dispatch.is_some() => name,
+            // HOOK callidx (r728): `E(args)` -- E yields a function record.
+            Some(m) if m == crate::impls::CALL_VALUE => {
+                let recv = match args.first() {
+                    Some(e) => e.clone(),
+                    None => return self.ice(span, "call without callee"),
+                };
+                let (params, ret) = match self.ty_of(&recv) {
+                    Type::Fn { params, ret } => (params, *ret),
+                    _ => return self.ice(span, "callee is not a function value"),
+                };
+                let rec = self.lower_expr(&recv)?;
+                let code = self.load(FTy::Ptr, rec);
+                field_target = Some(((code, rec), crate::sema::FnSig { params, ret }));
+                name
+            }
             Some(m) => {
                 let et = match args.first() {
                     Some(e) => self.ty_of(e),
