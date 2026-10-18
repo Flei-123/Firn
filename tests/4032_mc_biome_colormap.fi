@@ -1,0 +1,271 @@
+// expect_exit: 0
+// tests/4032_mc_biome_colormap.fi -- r247 colormap from the pack: grass.png / foliage.png (256 x 256) are read at the vanilla (temperature, downfall) cell of
+// every 1.20.1 biome without an explicit colour; explicit colours (swamp, badlands ...) and water stay, dark_forest gets the modifier, a colormap of the wrong
+// size is ignored and a pack without colormaps keeps the built-in table.
+import std.rt
+import std.core
+import std.math
+import std.io
+import zip.zip
+import pack.icons
+import mc.mc_assets
+import mc.mc_texture
+import mc.mc_texext
+import mc.mc_mesh
+import mc.mc_model
+import mc.mc_model_mesh
+import mc.mc_registry
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_chunk
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+
+// 16 x 16 solid colour PNG
+fn png_solid(r: u8, g: u8, b: u8, a: u8, out: *mut rt.Buf) -> bool {
+    let px: u64 = rt.heap_alloc(16 * 16 * 4)
+    var i: usize = 0
+    while i < 256 {
+        rt.st8(px, i * 4, r)
+        rt.st8(px, i * 4 + 1, g)
+        rt.st8(px, i * 4 + 2, b)
+        rt.st8(px, i * 4 + 3, a)
+        i = i + 1
+    }
+    let ok: bool = icons.png_encode(px, 16, 16, out)
+    rt.heap_free(px, 16 * 16 * 4)
+    return ok
+}
+
+fn add_text(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    var ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn add_png(w: *mut zip.ZipWriter, name: str, r: u8, g: u8, b: u8, a: u8) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    if !png_solid(r, g, b, a, &p) { return false }
+    var ok: bool = zip.zip_add(w, name, rt.buf_ptr(&p), rt.buf_len(&p), true) catch | e | (false)
+    rt.buf_free(&p)
+    return ok
+}
+
+// blockstate of a block without properties: one model for every state
+fn add_state(w: *mut zip.ZipWriter, block: str, model: str) -> bool {
+    return add_text(w, "assets/minecraft/blockstates/" + block + ".json", "{\"variants\":{\"\":{\"model\":\"" + model + "\"}}}")
+}
+
+// a model with ONE up face covering the whole top of the cell (flat on the cell face: AO applies), texture `tex`, optional tintindex 0
+fn add_up_model(w: *mut zip.ZipWriter, name: str, tex: str, tinted: bool) -> bool {
+    var tn: str = ""
+    if tinted { tn = ",\"tintindex\":0" }
+    return add_text(w, "assets/minecraft/models/block/" + name + ".json",
+        "{\"textures\":{\"t\":\"block/" + tex + "\"},\"elements\":[{\"from\":[0,0,0],\"to\":[16,16,16],\"faces\":{\"up\":{\"uv\":[0,0,16,16],\"texture\":\"#t\"" + tn + "}}}]}")
+}
+
+fn open_pack(b: *mut rt.Buf, w: *mut zip.ZipWriter, st: *mut mc_assets.PackStack) -> bool {
+    var n: usize = zip.zip_finish(w) catch | e | (0)
+    zip.zip_writer_free(w)
+    if n == 0 { return false }
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pk, rt.buf_ptr(b), rt.buf_len(b)) != mc_assets.ASSET_OK { return false }
+    rt.buf_free(b)
+    return mc_assets.stack_push(st, &pk) == mc_assets.ASSET_OK
+}
+
+fn sid(reg: *mut mc_registry.Registry, name: str) -> i32 {
+    let blk: i32 = mc_registry.reg_block_by_name(reg, name.p as u64, name.length())
+    if blk < 0 { return 0 - 1 }
+    return mc_registry.reg_block_min_state(reg, blk)
+}
+
+// cell (x, y, z) of section 0 (a 16 x 16 x 16 u16 array per section, 2 sections)
+fn put(ids: u64, x: i32, y: i32, z: i32, state: i32) {
+    rt.st16(ids, ((y * 16 + z) * 16 + x) as usize, state as u16)
+}
+
+fn new_ids() -> u64 {
+    let ids: u64 = rt.heap_alloc(2 * 4096 * 2)
+    var i: usize = 0
+    while i < 8192 {
+        rt.st16(ids, i, 0 as u16)
+        i = i + 1
+    }
+    return ids
+}
+
+fn chan(c: u32, k: i32) -> i32 {
+    return ((c >> ((k * 8) as u32)) & (255 as u32)) as i32
+}
+
+fn iabs(v: i32) -> i32 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// everything a scene needs, rebuilt per scene
+struct Scene {
+    tb: mc_mesh.MeshTables,
+    ex: mc_texext.TexExt,
+    atlas: mc_texture.Atlas,
+    an: mc_assets.AnimSet,
+}
+
+fn scene_init(sc: *mut Scene, reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack) -> bool {
+    (*sc).tb = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_texture.tex_alloc_tables(&(*sc).tb)
+    (*sc).ex = mc_texext.texext_new()
+    mc_texext.tex_build_tables_ext(reg, &(*sc).tb, &(*sc).ex)
+    (*sc).atlas = mc_texext.texext_atlas_new(16, &(*sc).ex)
+    (*sc).an = mc_assets.animset_new()
+    return mc_assets.assets_apply_ext(st, &(*sc).atlas, &(*sc).ex, &(*sc).an) >= 1
+}
+
+fn biome_id(reg: *mut mc_registry.Registry, name: str) -> i32 {
+    var i: i32 = 0
+    while i < mc_registry.reg_biome_count(reg) {
+        var nl: usize = 0
+        let np: u64 = mc_registry.reg_biome_name(reg, i, &nl)
+        var off: usize = 0
+        if nl > 10 && rt.mem_eq(np, "minecraft:".p as u64, 10) { off = 10 }
+        if nl - off == name.length() && rt.mem_eq(np + (off as u64), name.p as u64, nl - off) { return mc_registry.reg_biome_id(reg, i) }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// tint word of quad k of the buffer, unpacked to 0xRRGGBB (the mesher stores R | G << 8 | B << 16)
+fn tint_of(buf: *mut rt.Buf, k: usize) -> u32 {
+    let v: u32 = math.math_f64(rt.ld64(rt.buf_ptr(buf), k * 30 + 24)) as u32
+    return ((v & (255 as u32)) << (16 as u32)) | (v & (65280 as u32)) | ((v >> (16 as u32)) & (255 as u32))
+}
+
+// the quad of cell (x, y, z): find it by its x0 (x + 0.0)
+fn quad_at(buf: *mut rt.Buf, nq: usize, x: i32) -> usize {
+    var k: usize = 0
+    while k < nq {
+        let qx: f64 = math.math_f64(rt.ld64(rt.buf_ptr(buf), k * 30))
+        if qx > (x as f64) - 0.5 && qx < (x as f64) + 0.5 { return k }
+        k = k + 1
+    }
+    return 999
+}
+
+
+// colormap PNG: pixel (x, y) = (x, y, blue), or (y, x, blue) with `swap`
+fn png_cmap(swap: bool, blue: u8, size: usize, out: *mut rt.Buf) -> bool {
+    let px: u64 = rt.heap_alloc(size * size * 4)
+    var y: usize = 0
+    while y < size {
+        var x: usize = 0
+        while x < size {
+            let o: usize = (y * size + x) * 4
+            if swap {
+                rt.st8(px, o, y as u8)
+                rt.st8(px, o + 1, x as u8)
+            } else {
+                rt.st8(px, o, x as u8)
+                rt.st8(px, o + 1, y as u8)
+            }
+            rt.st8(px, o + 2, blue)
+            rt.st8(px, o + 3, 255 as u8)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let ok: bool = icons.png_encode(px, size, size, out)
+    rt.heap_free(px, size * size * 4)
+    return ok
+}
+
+fn add_cmap(w: *mut zip.ZipWriter, name: str, swap: bool, blue: u8, size: usize) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    if !png_cmap(swap, blue, size, &p) { return false }
+    var ok: bool = zip.zip_add(w, name, rt.buf_ptr(&p), rt.buf_len(&p), true) catch | e | (false)
+    rt.buf_free(&p)
+    return ok
+}
+
+fn pack_with(stk: *mut mc_assets.PackStack, size: usize, with_cmap: bool) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    var w: zip.ZipWriter = zip.zip_writer_new(&b)
+    if !add_text(&w, "pack.mcmeta", META) { return false }
+    if with_cmap {
+        if !add_cmap(&w, "assets/minecraft/textures/colormap/grass.png", false, 7 as u8, size) { return false }
+        if !add_cmap(&w, "assets/minecraft/textures/colormap/foliage.png", true, 9 as u8, size) { return false }
+    }
+    return open_pack(&b, &w, stk)
+}
+
+fn main() -> i32 {
+    var v: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(763, &v) { return 1 }
+    var reg: mc_registry.Registry = v.registry_of()
+    if !mc_registry.registry_ok(&reg) { return 2 }
+    let ids: [str; 8] = ["plains", "desert", "swamp", "dark_forest", "cold_ocean", "badlands", "mangrove_swamp", "meadow"]
+    var bid: [i32; 8] = [0; 8]
+    var k: usize = 0
+    while k < 8 {
+        bid[k] = biome_id(&reg, ids[k])
+        if bid[k] < 0 { return 3 }
+        k = k + 1
+    }
+    var ex0: mc_texext.TexExt = mc_texext.texext_new()
+
+    // 1) pack with a 256 x 256 grass.png (x, y, 7) and foliage.png (y, x, 9)
+    var stk: mc_assets.PackStack = mc_assets.stack_new()
+    if !pack_with(&stk, 256, true) { return 4 }
+    var ms: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(&reg, &stk, &ex0)
+    mc_model_mesh.ms_load_biomes(&ms)
+    if mc_model_mesh.ms_colormaps(&ms) != (3 as u32) { return 10 }
+    // plains: temperature 0.8 / downfall 0.4 -> cell x = 50, y = 173
+    if mc_model_mesh.ms_biome_color(&ms, 0, bid[0] as usize) != (0x32AD07 as u32) { return 11 }
+    if mc_model_mesh.ms_biome_color(&ms, 1, bid[0] as usize) != (0xAD3209 as u32) { return 12 }
+    // desert: temperature 2.0 -> 1, downfall 0 -> cell x = 0, y = 255
+    if mc_model_mesh.ms_biome_color(&ms, 0, bid[1] as usize) != (0x00FF07 as u32) { return 13 }
+    if mc_model_mesh.ms_biome_color(&ms, 1, bid[1] as usize) != (0xFF0009 as u32) { return 14 }
+    // meadow had only an approximated table colour: now the colormap cell (blue channel 7)
+    if (mc_model_mesh.ms_biome_color(&ms, 0, bid[7] as usize) & (255 as u32)) != (7 as u32) { return 15 }
+    // swamp: explicit foliage + the swamp grass constant stay
+    if mc_model_mesh.ms_biome_color(&ms, 0, bid[2] as usize) != (0x6A7039 as u32) { return 16 }
+    if mc_model_mesh.ms_biome_color(&ms, 1, bid[2] as usize) != (0x6A7039 as u32) { return 17 }
+    // badlands: explicit grass + foliage
+    if mc_model_mesh.ms_biome_color(&ms, 0, bid[5] as usize) != (0x90814D as u32) { return 18 }
+    if mc_model_mesh.ms_biome_color(&ms, 1, bid[5] as usize) != (0x9E814D as u32) { return 19 }
+    // mangrove swamp: own foliage colour
+    if mc_model_mesh.ms_biome_color(&ms, 1, bid[6] as usize) != (0x8DB127 as u32) { return 20 }
+    // dark forest: cell (0x4C, 0x70) -> colour (0x4C, 0x70, 7) -> ((c & 0xFEFEFE) + 0x28340A) >> 1; foliage plain colormap (y, x, 9)
+    if mc_model_mesh.ms_biome_color(&ms, 0, bid[3] as usize) != (0x3A5208 as u32) { return 21 }
+    if mc_model_mesh.ms_biome_color(&ms, 1, bid[3] as usize) != (0x704C09 as u32) { return 22 }
+    // water never comes from the colormap
+    if mc_model_mesh.ms_biome_color(&ms, 2, bid[4] as usize) != (0x3D57D6 as u32) { return 23 }
+    if mc_model_mesh.ms_biome_color(&ms, 2, bid[0] as usize) != (0x3F76E4 as u32) { return 24 }
+    // ms_reset reads the colormaps again
+    mc_model_mesh.ms_reset(&ms)
+    if mc_model_mesh.ms_colormaps(&ms) != (3 as u32) { return 25 }
+    if mc_model_mesh.ms_biome_color(&ms, 0, bid[0] as usize) != (0x32AD07 as u32) { return 26 }
+    mc_model_mesh.ms_free(&ms)
+    mc_assets.stack_free(&stk)
+
+    // 2) a colormap of the wrong size is ignored: built-in table
+    var stk2: mc_assets.PackStack = mc_assets.stack_new()
+    if !pack_with(&stk2, 16, true) { return 30 }
+    var ms2: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(&reg, &stk2, &ex0)
+    mc_model_mesh.ms_load_biomes(&ms2)
+    if mc_model_mesh.ms_colormaps(&ms2) != (0 as u32) { return 31 }
+    if mc_model_mesh.ms_biome_color(&ms2, 0, bid[0] as usize) != (0x91BD59 as u32) { return 32 }
+    mc_model_mesh.ms_free(&ms2)
+    mc_assets.stack_free(&stk2)
+
+    // 3) no colormap in the pack: built-in table (dark forest = vanilla 0x507A32)
+    var stk3: mc_assets.PackStack = mc_assets.stack_new()
+    if !pack_with(&stk3, 256, false) { return 40 }
+    var ms3: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(&reg, &stk3, &ex0)
+    mc_model_mesh.ms_load_biomes(&ms3)
+    if mc_model_mesh.ms_colormaps(&ms3) != (0 as u32) { return 41 }
+    if mc_model_mesh.ms_biome_color(&ms3, 0, bid[3] as usize) != (0x507A32 as u32) { return 42 }
+    if mc_model_mesh.ms_biome_color(&ms3, 0, bid[1] as usize) != (0xBFB755 as u32) { return 43 }
+    mc_model_mesh.ms_free(&ms3)
+    mc_assets.stack_free(&stk3)
+    return 0
+}
