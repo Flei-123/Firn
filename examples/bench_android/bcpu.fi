@@ -1,20 +1,27 @@
 // SPDX-License-Identifier: MPL-2.0
-// examples/bench_android/bcpu.fi -- the CPU benchmark of the bench app (definition: CPU_SPEC.md), runnable IN SLICES.
+// examples/bench_android/bcpu.fi -- the CPU benchmark of the bench app (definition: CPU_SPEC.md), nine kernels.
 //
-// WHY SLICES: Firn's Android loop and the UI are ONE thread (no threads in the program). So the benchmark runs as a state machine:
-// `cpu_step(budget_ns)` works for at most `budget_ns`, then returns and the window loop paints / handles touch, and the next timer
-// tick continues. Every phase checks the clock at its natural unit (one sieve prime, one quicksort partition, one 200k chunk, one
-// Mandelbrot row), so a slice overshoots by at most one unit (< ~6 ms worst case).
-//   wall ms  = task start -> task end (UI frames in between included)         -> BENCH cpu ...
-//   pure ms  = only the time spent inside cpu_step (no UI work in between)    -> BENCH cpu_pure ...
-// Sort: iterative quicksort (median of three, Hoare partition, insertion sort below 17 elements) with an explicit stack, so it can
-// stop after any partition. All maths exactly as CPU_SPEC.md (no FMA, order of evaluation as written).
+// THREADING. `cpu_start` hands the whole run to ONE worker thread (std.pool, 1 worker). The UI thread never computes: it only
+// polls `cpu_running` / `cpu_task` and reads the results. The Kotlin app does the same with Dispatchers.Default, so
+//   wall ms = kernel start -> kernel end on the worker (data generation included, no UI work in between)
+// has the same definition in both apps. (Before r-C the run was cut into 8 ms slices on the UI loop; wall then included the 60 Hz
+// frames in between: 132/577/473 ms wall vs 31/301/243 ms pure. The sliced code is gone.)
+//
+// WIRING. A program has ONE `fn __thread_work(kind, arg)`; the app's main file must contain
+//     fn __thread_work(kind: u64, arg: u64) -> u64 { return bcpu.work(kind, arg) }
+//
+// `cpu_step(budget)` is kept for old callers: it does nothing but report whether the worker is still busy.
+// All maths exactly as CPU_SPEC.md (no FMA, order of evaluation as written).
 import std.rt
 import std.time
+import std.pool
+import std.map
+import std.vec
 
 export {
     cpu_reset, cpu_start, cpu_step, cpu_running, cpu_finished, cpu_task, cpu_wall_ms, cpu_pure_ms, cpu_sum, cpu_progress,
-    LIMIT, SORT_N,
+    cpu_count, cpu_name, cpu_log_line, work, cpu_shutdown,
+    LIMIT, SORT_N, KERNELS,
 }
 
 const LIMIT: usize = 5000000
@@ -23,183 +30,126 @@ const MW: usize = 800
 const MH: usize = 600
 const MAXIT: i64 = 200
 const MODP: i64 = 1000000007
+const KERNELS: usize = 9
 
-const P_IDLE: i32 = 0
-const P_SIEVE: i32 = 1
-const P_COUNT: i32 = 2
-const P_GEN: i32 = 3
-const P_QSORT: i32 = 4
-const P_SUM: i32 = 5
-const P_MANDEL: i32 = 6
-const P_DONE: i32 = 7
+const HASH_N: usize = 4194304
+const JSON_N: i64 = 40000
+const STR_N: i64 = 200000
+const MAT_N: usize = 256
+const MAP_N: usize = 300000
+const OBJ_N: usize = 200000
 
-static mut G_PHASE: i32 = 0
-static mut G_NOW: u64 = 0
-static mut G_DEADLINE: u64 = 0
-static mut G_LAST: u64 = 0
-static mut G_T0: [u64; 3] = [0 as u64; 3]
-static mut G_WALL: [u64; 3] = [0 as u64; 3]
-static mut G_PURE: [u64; 3] = [0 as u64; 3]
-static mut G_SUM: [i64; 3] = [0; 3]
-// sieve state
-static mut G_SV: u64 = 0
-static mut G_PI: usize = 0
-static mut G_CI: usize = 0
-static mut G_CNT: i64 = 0
-static mut G_PSUM: i64 = 0
-// sort state
-static mut G_ARR: u64 = 0
-static mut G_GI: usize = 0
-static mut G_X: i64 = 0
-static mut G_SP: usize = 0
-static mut G_STL: [i64; 96] = [0; 96]
-static mut G_STH: [i64; 96] = [0; 96]
-static mut G_SI: usize = 0
-static mut G_ACC: i64 = 0
-// mandelbrot state
-static mut G_ROW: usize = 0
-static mut G_TOTAL: i64 = 0
+static mut G_POOL: u64 = 0
+static mut G_STARTED: u64 = 0
+static mut G_DONE: u64 = 0
+static mut G_WALL: [u64; 9] = [0 as u64; 9]
+static mut G_SUM: [i64; 9] = [0; 9]
+static mut G_K: [u64; 64] = [0 as u64; 64]
+static mut G_H: [u64; 8] = [0 as u64; 8]
+// json parser state
+static mut G_JB: u64 = 0
+static mut G_JP: usize = 0
+static mut G_JNUM: i64 = 0
+static mut G_JSTR: i64 = 0
+static mut G_JOBJ: i64 = 0
+static mut G_JARR: i64 = 0
+static mut G_JTRUE: i64 = 0
+
+fn dec(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    let s: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn cpu_count() -> usize { return KERNELS }
+
+fn cpu_name(i: usize) -> str {
+    if i == 0 { return "primes" }
+    if i == 1 { return "sort" }
+    if i == 2 { return "mandel" }
+    if i == 3 { return "hash" }
+    if i == 4 { return "json" }
+    if i == 5 { return "strbuild" }
+    if i == 6 { return "matmul" }
+    if i == 7 { return "hashmap" }
+    return "objsort"
+}
 
 fn cpu_reset() {
-    if G_SV != 0 { rt.heap_free(G_SV, LIMIT) }
-    if G_ARR != 0 { rt.heap_free(G_ARR, SORT_N * 4) }
-    G_SV = 0
-    G_ARR = 0
-    G_PHASE = P_IDLE
     var i: usize = 0
-    while i < 3 {
-        G_T0[i] = 0 as u64
+    while i < KERNELS {
         G_WALL[i] = 0 as u64
-        G_PURE[i] = 0 as u64
         G_SUM[i] = 0
         i = i + 1
     }
+    __atomic_swap(&G_DONE, G_DONE, 0 as u64)
 }
 
-fn cpu_start() {
-    cpu_reset()
-    G_PHASE = P_SIEVE
-    G_T0[0] = time.monotonic_ns()
-    G_LAST = G_T0[0]
-    G_SV = rt.heap_alloc(LIMIT)
-    rt.mem_set(G_SV, 1 as u8, LIMIT)
-    *(G_SV as *mut u8) = 0 as u8
-    *((G_SV + 1 as u64) as *mut u8) = 0 as u8
-    G_PI = 2
-    G_CI = 0
-    G_CNT = 0
-    G_PSUM = 0
-}
-
-fn cpu_running() -> bool { return G_PHASE != P_IDLE && G_PHASE != P_DONE }
-fn cpu_finished() -> bool { return G_PHASE == P_DONE }
-// 0 = idle, 1 primes, 2 sort, 3 mandel, 4 done
+// 0 = idle, k+1 = kernel k running, KERNELS+1 = done
+fn cpu_done_count() -> u64 { return __atomic_add(&G_DONE, 0 as u64) }
+fn cpu_running() -> bool { return G_STARTED != 0 as u64 && cpu_done_count() < KERNELS as u64 }
+fn cpu_finished() -> bool { return G_STARTED != 0 as u64 && cpu_done_count() >= KERNELS as u64 }
 fn cpu_task() -> i32 {
-    if G_PHASE == P_IDLE { return 0 }
-    if G_PHASE <= P_COUNT { return 1 }
-    if G_PHASE <= P_SUM { return 2 }
-    if G_PHASE == P_MANDEL { return 3 }
-    return 4
+    if G_STARTED == 0 as u64 { return 0 }
+    return (cpu_done_count() + 1 as u64) as i32
 }
 fn cpu_wall_ms(t: usize) -> i64 { return (G_WALL[t] / 1000000 as u64) as i64 }
-fn cpu_pure_ms(t: usize) -> i64 { return (G_PURE[t] / 1000000 as u64) as i64 }
+// the worker computes without UI frames in between: pure == wall (kept for old callers)
+fn cpu_pure_ms(t: usize) -> i64 { return cpu_wall_ms(t) }
 fn cpu_sum(t: usize) -> i64 { return G_SUM[t] }
-// percent of the three tasks, rough (for the progress text)
-fn cpu_progress() -> i64 {
-    let t: i32 = cpu_task()
-    if t == 0 { return 0 }
-    if t == 4 { return 100 }
-    return ((t - 1) * 33) as i64
+fn cpu_progress() -> i64 { return (cpu_done_count() * 100 as u64 / KERNELS as u64) as i64 }
+fn cpu_step(budget_ns: u64) -> bool { return cpu_running() }
+
+// "<name>=<ms>:<checksum> ..." for kernels [from, to)
+fn cpu_log_line(from: usize, to: usize) -> str {
+    var s: str = ""
+    var i: usize = from
+    while i < to {
+        if i > from { s = s + " " }
+        s = s + cpu_name(i) + "=" + dec(cpu_wall_ms(i)) + ":" + dec(cpu_sum(i))
+        i = i + 1
+    }
+    return s
 }
 
-// accumulate the pure time since the last check onto `task`; true = the slice is used up
-fn tick(task: usize) -> bool {
-    G_NOW = time.monotonic_ns()
-    G_PURE[task] = G_PURE[task] + (G_NOW - G_LAST)
-    G_LAST = G_NOW
-    return G_NOW >= G_DEADLINE
-}
-
-fn finish(task: usize) {
-    G_NOW = time.monotonic_ns()
-    G_WALL[task] = G_NOW - G_T0[task]
-}
-
-fn begin(task: usize) {
-    G_T0[task] = time.monotonic_ns()
-}
-
-// ------------------------------------------------------------------ primes
-fn step_sieve() -> bool {
-    let sv: u64 = G_SV
-    while G_PI * G_PI < LIMIT {
-        if *((sv + G_PI as u64) as *mut u8) != 0 as u8 {
-            var m: usize = G_PI * G_PI
+// ------------------------------------------------------------------ 1 primes
+fn k_primes() -> i64 {
+    let sv: u64 = rt.heap_alloc(LIMIT)
+    rt.mem_set(sv, 1 as u8, LIMIT)
+    rt.st8(sv, 0, 0 as u8)
+    rt.st8(sv, 1, 0 as u8)
+    var p: usize = 2
+    while p * p < LIMIT {
+        if rt.ld8(sv, p) != 0 as u8 {
+            var m: usize = p * p
             while m < LIMIT {
-                *((sv + m as u64) as *mut u8) = 0 as u8
-                m = m + G_PI
+                rt.st8(sv, m, 0 as u8)
+                m = m + p
             }
         }
-        G_PI = G_PI + 1
-        if tick(0) { return true }
+        p = p + 1
     }
-    G_PHASE = P_COUNT
-    return false
-}
-
-fn step_count() -> bool {
-    let sv: u64 = G_SV
-    while G_CI < LIMIT {
-        var e: usize = G_CI + 100000
-        if e > LIMIT { e = LIMIT }
-        var i: usize = G_CI
-        while i < e {
-            if *((sv + i as u64) as *mut u8) != 0 as u8 {
-                G_CNT = G_CNT + 1
-                G_PSUM = G_PSUM + i as i64
-            }
-            i = i + 1
+    var cnt: i64 = 0
+    var psum: i64 = 0
+    var i: usize = 0
+    while i < LIMIT {
+        if rt.ld8(sv, i) != 0 as u8 {
+            cnt = cnt + 1
+            psum = psum + i as i64
         }
-        G_CI = e
-        if tick(0) && G_CI < LIMIT { return true }
+        i = i + 1
     }
-    G_SUM[0] = (G_CNT * 1000003 + G_PSUM) % MODP
-    rt.heap_free(G_SV, LIMIT)
-    G_SV = 0
-    tick(0)
-    finish(0)
-    begin(1)
-    G_PHASE = P_GEN
-    G_ARR = rt.heap_alloc(SORT_N * 4)
-    G_GI = 0
-    G_X = 12345
-    return false
+    rt.heap_free(sv, LIMIT)
+    return (cnt * 1000003 + psum) % MODP
 }
 
-// -------------------------------------------------------------------- sort
-fn step_gen() -> bool {
-    let ar: u64 = G_ARR
-    while G_GI < SORT_N {
-        var e: usize = G_GI + 100000
-        if e > SORT_N { e = SORT_N }
-        var i: usize = G_GI
-        var x: i64 = G_X
-        while i < e {
-            x = (x * 1103515245 + 12345) & 2147483647
-            *((ar + i as u64 * 4 as u64) as *mut u32) = x as u32
-            i = i + 1
-        }
-        G_X = x
-        G_GI = e
-        if tick(1) && G_GI < SORT_N { return true }
-    }
-    G_PHASE = P_QSORT
-    G_SP = 1
-    G_STL[0] = 0
-    G_STH[0] = SORT_N as i64 - 1
-    return false
-}
-
+// -------------------------------------------------------------------- 2 sort
 fn aget(ar: u64, i: i64) -> u32 { return *((ar + i as u64 * 4 as u64) as *mut u32) }
 fn aset(ar: u64, i: i64, v: u32) { *((ar + i as u64 * 4 as u64) as *mut u32) = v }
 
@@ -228,12 +178,17 @@ fn median3(a: u32, b: u32, c: u32) -> u32 {
     return b
 }
 
-fn step_qsort() -> bool {
-    let ar: u64 = G_ARR
-    while G_SP > 0 {
-        G_SP = G_SP - 1
-        let lo: i64 = G_STL[G_SP]
-        let hi: i64 = G_STH[G_SP]
+// iterative quicksort (median of three, Hoare partition, insertion sort below 17 elements), explicit stack
+fn qsort(ar: u64, n: i64) {
+    var stl: [i64; 96] = [0; 96]
+    var sth: [i64; 96] = [0; 96]
+    var sp: usize = 1
+    stl[0] = 0
+    sth[0] = n - 1
+    while sp > 0 {
+        sp = sp - 1
+        let lo: i64 = stl[sp]
+        let hi: i64 = sth[sp]
         if hi - lo < 16 {
             insertion(ar, lo, hi)
         } else {
@@ -253,56 +208,45 @@ fn step_qsort() -> bool {
             }
             // push the larger part first: the stack stays O(log n)
             if j - lo > hi - i {
-                if lo < j { G_STL[G_SP] = lo; G_STH[G_SP] = j; G_SP = G_SP + 1 }
-                if i < hi { G_STL[G_SP] = i; G_STH[G_SP] = hi; G_SP = G_SP + 1 }
+                if lo < j { stl[sp] = lo; sth[sp] = j; sp = sp + 1 }
+                if i < hi { stl[sp] = i; sth[sp] = hi; sp = sp + 1 }
             } else {
-                if i < hi { G_STL[G_SP] = i; G_STH[G_SP] = hi; G_SP = G_SP + 1 }
-                if lo < j { G_STL[G_SP] = lo; G_STH[G_SP] = j; G_SP = G_SP + 1 }
+                if i < hi { stl[sp] = i; sth[sp] = hi; sp = sp + 1 }
+                if lo < j { stl[sp] = lo; sth[sp] = j; sp = sp + 1 }
             }
         }
-        if tick(1) && G_SP > 0 { return true }
     }
-    G_PHASE = P_SUM
-    G_SI = 0
-    G_ACC = 0
-    return false
 }
 
-fn step_sum() -> bool {
-    let ar: u64 = G_ARR
-    while G_SI < SORT_N {
-        var e: usize = G_SI + 200000
-        if e > SORT_N { e = SORT_N }
-        var i: usize = G_SI
-        var acc: i64 = G_ACC
-        while i < e {
-            acc = acc + (aget(ar, i as i64) as i64) * ((i % 251) as i64 + 1)
-            i = i + 1
-        }
-        G_ACC = acc
-        G_SI = e
-        if tick(1) && G_SI < SORT_N { return true }
+fn k_sort() -> i64 {
+    let ar: u64 = rt.heap_alloc(SORT_N * 4)
+    var x: i64 = 12345
+    var i: usize = 0
+    while i < SORT_N {
+        x = (x * 1103515245 + 12345) & 2147483647
+        aset(ar, i as i64, x as u32)
+        i = i + 1
     }
-    G_SUM[1] = G_ACC % MODP
-    rt.heap_free(G_ARR, SORT_N * 4)
-    G_ARR = 0
-    tick(1)
-    finish(1)
-    begin(2)
-    G_PHASE = P_MANDEL
-    G_ROW = 0
-    G_TOTAL = 0
-    return false
+    qsort(ar, SORT_N as i64)
+    var acc: i64 = 0
+    i = 0
+    while i < SORT_N {
+        acc = acc + (aget(ar, i as i64) as i64) * ((i % 251) as i64 + 1)
+        i = i + 1
+    }
+    rt.heap_free(ar, SORT_N * 4)
+    return acc % MODP
 }
 
-// ----------------------------------------------------------------- mandel
-fn step_mandel() -> bool {
+// ----------------------------------------------------------------- 3 mandel
+fn k_mandel() -> i64 {
     let dx: f64 = 3.5 / 800.0
     let dy: f64 = 2.0 / 600.0
-    while G_ROW < MH {
-        let ci: f64 = -1.0 + (G_ROW as f64) * dy
+    var total: i64 = 0
+    var row: usize = 0
+    while row < MH {
+        let ci: f64 = -1.0 + (row as f64) * dy
         var px: usize = 0
-        var total: i64 = 0
         while px < MW {
             let cr: f64 = -2.5 + (px as f64) * dx
             var zr: f64 = 0.0
@@ -319,34 +263,435 @@ fn step_mandel() -> bool {
             total = total + it
             px = px + 1
         }
-        G_TOTAL = G_TOTAL + total
-        G_ROW = G_ROW + 1
-        if tick(2) && G_ROW < MH { return true }
+        row = row + 1
     }
-    G_SUM[2] = G_TOTAL
-    tick(2)
-    finish(2)
-    G_PHASE = P_DONE
-    return false
+    return total
 }
 
-// Work for at most `budget_ns` (one unit may overshoot). true = more to do (call again after the UI had its turn).
-fn cpu_step(budget_ns: u64) -> bool {
-    if !cpu_running() { return false }
-    G_LAST = time.monotonic_ns()
-    G_DEADLINE = G_LAST + budget_ns
-    var more: bool = true
-    while more {
-        var stop: bool = false
-        if G_PHASE == P_SIEVE { stop = step_sieve() }
-        else if G_PHASE == P_COUNT { stop = step_count() }
-        else if G_PHASE == P_GEN { stop = step_gen() }
-        else if G_PHASE == P_QSORT { stop = step_qsort() }
-        else if G_PHASE == P_SUM { stop = step_sum() }
-        else if G_PHASE == P_MANDEL { stop = step_mandel() }
-        else { more = false }
-        if stop { return true }
-        if G_PHASE == P_DONE { more = false }
+// -------------------------------------------------------------------- 4 hash
+const M32: u64 = 4294967295
+
+fn rotr32(x: u64, n: u64) -> u64 {
+    return (((x & M32) >> n) | (x << (32 as u64 - n))) & M32
+}
+
+fn k_table() {
+    G_K = [
+        1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993,
+        2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987,
+        1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774,
+        264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+        2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711,
+        113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291,
+        1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411,
+        3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+        430227734, 506948616, 659060556, 883997877, 958139571, 1322822218,
+        1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424,
+        2428436474, 2756734187, 3204031479, 3329325298
+    ]
+}
+
+fn sha_block(p: u64) {
+    var w: [u64; 64] = [0 as u64; 64]
+    var i: usize = 0
+    while i < 16 {
+        w[i] = ((rt.ld8(p, i * 4) as u64) << 24) | ((rt.ld8(p, i * 4 + 1) as u64) << 16) | ((rt.ld8(p, i * 4 + 2) as u64) << 8) | (rt.ld8(p, i * 4 + 3) as u64)
+        i = i + 1
     }
-    return false
+    while i < 64 {
+        let s0: u64 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3)
+        let s1: u64 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10)
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & M32
+        i = i + 1
+    }
+    var a: u64 = G_H[0]
+    var b: u64 = G_H[1]
+    var c: u64 = G_H[2]
+    var d: u64 = G_H[3]
+    var e: u64 = G_H[4]
+    var f: u64 = G_H[5]
+    var g: u64 = G_H[6]
+    var hh: u64 = G_H[7]
+    i = 0
+    while i < 64 {
+        let bs1: u64 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+        let ch: u64 = (e & f) ^ ((e ^ M32) & g)
+        let t1: u64 = (hh + bs1 + ch + G_K[i] + w[i]) & M32
+        let bs0: u64 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+        let maj: u64 = (a & b) ^ (a & c) ^ (b & c)
+        let t2: u64 = (bs0 + maj) & M32
+        hh = g
+        g = f
+        f = e
+        e = (d + t1) & M32
+        d = c
+        c = b
+        b = a
+        a = (t1 + t2) & M32
+        i = i + 1
+    }
+    G_H[0] = (G_H[0] + a) & M32
+    G_H[1] = (G_H[1] + b) & M32
+    G_H[2] = (G_H[2] + c) & M32
+    G_H[3] = (G_H[3] + d) & M32
+    G_H[4] = (G_H[4] + e) & M32
+    G_H[5] = (G_H[5] + f) & M32
+    G_H[6] = (G_H[6] + g) & M32
+    G_H[7] = (G_H[7] + hh) & M32
+}
+
+// SHA-256 (FIPS 180-4) of buf[0..n); returns the first digest word (big endian, unsigned)
+fn sha256_w0(buf: u64, n: usize) -> i64 {
+    k_table()
+    G_H = [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]
+    let full: usize = n / 64
+    var bi: usize = 0
+    while bi < full {
+        sha_block(buf + (bi * 64) as u64)
+        bi = bi + 1
+    }
+    let rem: usize = n - full * 64
+    let tail: u64 = rt.heap_alloc(128)
+    rt.mem_set(tail, 0 as u8, 128)
+    rt.mem_copy(tail, buf + (full * 64) as u64, rem)
+    rt.st8(tail, rem, 128 as u8)
+    var tl: usize = 64
+    if rem >= 56 { tl = 128 }
+    let bits: u64 = n as u64 * 8 as u64
+    var k: usize = 0
+    while k < 8 {
+        rt.st8(tail, tl - 1 - k, ((bits >> (k as u64 * 8 as u64)) & 255 as u64) as u8)
+        k = k + 1
+    }
+    sha_block(tail)
+    if tl == 128 { sha_block(tail + 64 as u64) }
+    rt.heap_free(tail, 128)
+    return G_H[0] as i64
+}
+
+fn k_hash() -> i64 {
+    let buf: u64 = rt.heap_alloc(HASH_N)
+    var x: i64 = 12345
+    var i: usize = 0
+    while i < HASH_N {
+        x = (x * 1103515245 + 12345) & 2147483647
+        rt.st8(buf, i, ((x >> 16) & 255) as u8)
+        i = i + 1
+    }
+    var h: i64 = 2166136261
+    i = 0
+    while i < HASH_N {
+        let b: u8 = rt.ld8(buf, i)
+        h = ((h ^ (b as i64)) * 16777619) & 4294967295
+        i = i + 1
+    }
+    let w0: i64 = sha256_w0(buf, HASH_N)
+    rt.heap_free(buf, HASH_N)
+    return (h * 31 + w0) % MODP
+}
+
+// -------------------------------------------------------------------- 5 json
+fn json_gen(b: *mut rt.Buf) {
+    var x: i64 = 12345
+    rt.buf_push(b, 91 as u8)
+    var i: i64 = 0
+    while i < JSON_N {
+        x = (x * 1103515245 + 12345) & 2147483647
+        let a: i64 = x
+        x = (x * 1103515245 + 12345) & 2147483647
+        let y: i64 = x
+        if i > 0 { rt.buf_push(b, 44 as u8) }
+        put(b, "{\"id\":")
+        rt.buf_push_dec_i64(b, i)
+        put(b, ",\"v\":")
+        rt.buf_push_dec_i64(b, a % 100000)
+        put(b, ",\"name\":\"n")
+        rt.buf_push_dec_i64(b, i)
+        put(b, "x\",\"f\":[")
+        rt.buf_push_dec_i64(b, y % 1000)
+        rt.buf_push(b, 44 as u8)
+        rt.buf_push_dec_i64(b, y % 977)
+        rt.buf_push(b, 44 as u8)
+        rt.buf_push_dec_i64(b, (y / 1000) % 1000)
+        put(b, "],\"ok\":")
+        if i % 2 == 0 { put(b, "true}") } else { put(b, "false}") }
+        i = i + 1
+    }
+    rt.buf_push(b, 93 as u8)
+}
+
+fn jpeek() -> u8 { return rt.ld8(G_JB, G_JP) }
+
+fn jskip() {
+    while jpeek() == 32 as u8 { G_JP = G_JP + 1 }
+}
+
+fn jstring() {
+    G_JP = G_JP + 1
+    let start: usize = G_JP
+    while jpeek() != 34 as u8 {
+        if jpeek() == 92 as u8 { G_JP = G_JP + 1 }
+        G_JP = G_JP + 1
+    }
+    G_JSTR = G_JSTR + (G_JP - start) as i64
+    G_JP = G_JP + 1
+}
+
+fn jvalue() {
+    jskip()
+    let c: u8 = jpeek()
+    if c == 123 as u8 {
+        G_JP = G_JP + 1
+        G_JOBJ = G_JOBJ + 1
+        jskip()
+        if jpeek() == 125 as u8 { G_JP = G_JP + 1; return }
+        var go: bool = true
+        while go {
+            jskip()
+            jstring()
+            jskip()
+            G_JP = G_JP + 1
+            jvalue()
+            jskip()
+            let d: u8 = jpeek()
+            G_JP = G_JP + 1
+            if d == 125 as u8 { go = false }
+        }
+    } else if c == 91 as u8 {
+        G_JP = G_JP + 1
+        G_JARR = G_JARR + 1
+        jskip()
+        if jpeek() == 93 as u8 { G_JP = G_JP + 1; return }
+        var go2: bool = true
+        while go2 {
+            jvalue()
+            jskip()
+            let d2: u8 = jpeek()
+            G_JP = G_JP + 1
+            if d2 == 93 as u8 { go2 = false }
+        }
+    } else if c == 34 as u8 {
+        jstring()
+    } else if c == 116 as u8 {
+        G_JP = G_JP + 4
+        G_JTRUE = G_JTRUE + 1
+    } else if c == 102 as u8 {
+        G_JP = G_JP + 5
+    } else if c == 110 as u8 {
+        G_JP = G_JP + 4
+    } else {
+        var neg: bool = false
+        if c == 45 as u8 { neg = true; G_JP = G_JP + 1 }
+        var v: i64 = 0
+        var dg: u8 = jpeek()
+        while dg >= 48 as u8 && dg <= 57 as u8 {
+            v = v * 10 + ((dg - 48 as u8) as i64)
+            G_JP = G_JP + 1
+            dg = jpeek()
+        }
+        if neg { v = 0 - v }
+        G_JNUM = G_JNUM + v
+    }
+}
+
+fn k_json() -> i64 {
+    var b: rt.Buf = rt.buf_new()
+    json_gen(&b)
+    G_JB = rt.buf_ptr(&b)
+    G_JP = 0
+    G_JNUM = 0
+    G_JSTR = 0
+    G_JOBJ = 0
+    G_JARR = 0
+    G_JTRUE = 0
+    jvalue()
+    rt.buf_free(&b)
+    return (G_JNUM + 7 * G_JSTR + 13 * G_JOBJ + 17 * G_JARR + 19 * G_JTRUE) % MODP
+}
+
+// ---------------------------------------------------------------- 6 strbuild
+fn k_strbuild() -> i64 {
+    var b: rt.Buf = rt.buf_new()
+    var i: i64 = 0
+    while i < STR_N {
+        let piece: str = "item" + dec(i) + ";"
+        put(&b, piece)
+        i = i + 1
+    }
+    let n: usize = rt.buf_len(&b)
+    let p: u64 = rt.buf_ptr(&b)
+    var t: i64 = n as i64 * 31
+    var j: usize = 0
+    while j < n {
+        t = t + (rt.ld8(p, j) as i64) * ((j % 7) as i64 + 1)
+        j = j + 1
+    }
+    rt.buf_free(&b)
+    return t % MODP
+}
+
+// ------------------------------------------------------------------ 7 matmul
+fn fget(a: u64, i: usize) -> f64 { return *((a + (i * 8) as u64) as *mut f64) }
+fn fset(a: u64, i: usize, v: f64) { *((a + (i * 8) as u64) as *mut f64) = v }
+
+fn k_matmul() -> i64 {
+    let n: usize = MAT_N
+    let a: u64 = rt.heap_alloc(n * n * 8)
+    let b: u64 = rt.heap_alloc(n * n * 8)
+    let c: u64 = rt.heap_alloc(n * n * 8)
+    var i: usize = 0
+    while i < n {
+        var j: usize = 0
+        while j < n {
+            fset(a, i * n + j, ((i * 31 + j * 17) % 101) as f64 * 0.25)
+            fset(b, i * n + j, ((i * 13 + j * 7) % 97) as f64 * 0.5)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        var j: usize = 0
+        while j < n {
+            var sum: f64 = 0.0
+            var k: usize = 0
+            while k < n {
+                sum = sum + fget(a, i * n + k) * fget(b, k * n + j)
+                k = k + 1
+            }
+            fset(c, i * n + j, sum)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    var total: f64 = 0.0
+    i = 0
+    while i < n * n {
+        total = total + fget(c, i)
+        i = i + 1
+    }
+    rt.heap_free(a, n * n * 8)
+    rt.heap_free(b, n * n * 8)
+    rt.heap_free(c, n * n * 8)
+    return ((total * 8.0) as i64) % MODP
+}
+
+// ----------------------------------------------------------------- 8 hashmap
+fn k_hashmap() -> i64 {
+    let n: usize = MAP_N
+    let keys: u64 = rt.heap_alloc(n * 8)
+    var m: Map[i64, i64] = map_new[i64, i64]()
+    map_reserve[i64, i64](&m, 0)
+    var x: i64 = 12345
+    var i: usize = 0
+    while i < n {
+        x = (x * 1103515245 + 12345) & 2147483647
+        *((keys + (i * 8) as u64) as *mut i64) = x
+        map_set[i64, i64](&m, x, i as i64)
+        i = i + 1
+    }
+    var hits: i64 = 0
+    var total: i64 = 0
+    i = 0
+    while i < n {
+        let q: i64 = *((keys + (((i * 7919) % n) * 8) as u64) as *mut i64)
+        let v: i64 = map_get_or[i64, i64](&m, q, 0 - 1)
+        if v >= 0 { hits = hits + 1; total = total + v }
+        let q2: i64 = (*((keys + (i * 8) as u64) as *mut i64)) ^ 1
+        let v2: i64 = map_get_or[i64, i64](&m, q2, 0 - 1)
+        if v2 >= 0 { hits = hits + 1; total = total + v2 }
+        i = i + 1
+    }
+    let sz: i64 = map_len[i64, i64](&m) as i64
+    map_free[i64, i64](&m)
+    rt.heap_free(keys, n * 8)
+    return (hits * 1000003 + total + sz) % MODP
+}
+
+// ----------------------------------------------------------------- 9 objsort
+struct Item {
+    key: i64,
+    w: i64,
+    id: i64,
+}
+
+fn item_less(a: *Item, b: *Item) -> bool {
+    if (*a).key != (*b).key { return (*a).key < (*b).key }
+    return (*a).w < (*b).w
+}
+
+fn k_objsort() -> i64 {
+    var v: Vec[Item] = vec_new[Item]()
+    var x: i64 = 12345
+    var i: usize = 0
+    while i < OBJ_N {
+        x = (x * 1103515245 + 12345) & 2147483647
+        let key: i64 = x % 1000
+        x = (x * 1103515245 + 12345) & 2147483647
+        vec_push[Item](&v, Item { key: key, w: x, id: i as i64 })
+        i = i + 1
+    }
+    vec_sort_by[Item](&v, item_less)
+    var t: i64 = 0
+    i = 0
+    while i < OBJ_N {
+        let it: *mut Item = vec_elem_ptr[Item](&v, i)
+        t = t + (*it).id * ((i % 251) as i64 + 1)
+        i = i + 1
+    }
+    vec_free[Item](&v)
+    return t % MODP
+}
+
+// ------------------------------------------------------------------- runner
+fn run_one(k: usize) {
+    let t0: u64 = time.monotonic_ns()
+    var cs: i64 = 0
+    if k == 0 { cs = k_primes() }
+    else if k == 1 { cs = k_sort() }
+    else if k == 2 { cs = k_mandel() }
+    else if k == 3 { cs = k_hash() }
+    else if k == 4 { cs = k_json() }
+    else if k == 5 { cs = k_strbuild() }
+    else if k == 6 { cs = k_matmul() }
+    else if k == 7 { cs = k_hashmap() }
+    else { cs = k_objsort() }
+    G_WALL[k] = time.monotonic_ns() - t0
+    G_SUM[k] = cs
+    __atomic_add(&G_DONE, 1 as u64)
+}
+
+fn worker_job(arg: u64) -> u64 {
+    var k: usize = 0
+    while k < KERNELS {
+        run_one(k)
+        k = k + 1
+    }
+    return 0 as u64
+}
+
+// the program's `__thread_work` calls this
+fn work(kind: u64, arg: u64) -> u64 {
+    if kind == pool.WORKER_KIND { return pool.worker_main(arg) }
+    return 0 as u64
+}
+
+fn cpu_start() {
+    if G_STARTED != 0 as u64 && cpu_running() { return }
+    cpu_reset()
+    if G_POOL == 0 as u64 {
+        let p: pool.Pool = pool.pool_new(1 as u64, 4 as u64)
+        G_POOL = p.blk
+    }
+    G_STARTED = 1 as u64
+    var pl: pool.Pool = pool.Pool { blk: G_POOL }
+    pool.submit(&pl, worker_job, 0 as u64)
+}
+
+// ends the worker thread (a host program must call it before main returns; the Android app never needs to)
+fn cpu_shutdown() {
+    if G_POOL == 0 as u64 { return }
+    var pl: pool.Pool = pool.Pool { blk: G_POOL }
+    pool.shutdown(&pl)
+    G_POOL = 0 as u64
 }

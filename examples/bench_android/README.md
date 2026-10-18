@@ -4,9 +4,10 @@ Same UI, tests and checksums as the Kotlin app `bench/android_kotlin` (spec: ben
 Tabs: List (1000 cards, filter, Add/Clear, dark toggle), Lab (Anim / Text / Net / CPU), Settings (theme radios, slider, version).
 
 - `main.fi`   the app (host: X11 window 411x914; Android: NativeActivity via tools/android/build.sh)
-- `bcpu.fi`   sliced CPU benchmark (8 ms slices on the UI loop); checksums primes=110730338 sort=605536303 mandel=23077341 (EXPECTED.txt)
+- `bcpu.fi`   CPU benchmark, nine kernels (primes sort mandel hash json strbuild matmul hashmap objsort) on ONE worker thread (std.pool); checksums in EXPECTED.txt, definition in CPU_SPEC.md, reference `cpu_ref.py`. The program must define `fn __thread_work(kind, arg) -> u64 { return bcpu.work(kind, arg) }`.
+- `cpu_main.fi` host test: `FIRNLIB=lib firnc --opt-level=release-fast -o x examples/bench_android/cpu_main.fi && ./x` -> nine checksums
 - `smoke.sh`  emulator run (AVD benchf, ports 5586/5093): screenshots + BENCH log lines -> shots/ (use via /root/jarvis/bin/heavy)
-- Log lines (logcat tag BENCH, stderr on the desktop, `lib/plat/blog.fi`): ready, fps, cpu, cpu_pure, net.
+- Log lines (logcat tag BENCH, stderr on the desktop, `lib/plat/blog.fi`): ready, fps, cpu, cpu2, net.
 - Test hooks: Intent extras (Android) / env INTENT_<KEY> (desktop): tab=list|lab|settings, lab=anim|text|net|cpu, theme=dark|light, autorun, autoscroll (`lib/plat/intentx.fi`).
 
 Build:

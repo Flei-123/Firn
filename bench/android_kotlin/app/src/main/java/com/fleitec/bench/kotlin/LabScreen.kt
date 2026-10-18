@@ -267,6 +267,15 @@ class CpuState {
         val m = timed { Cpu.mandelbrot() }
         mandel = "mandel: ${m.first} ms, checksum ${m.second}"
         BenchLog.i("cpu primes=${p.first}:${p.second} sort=${s.first}:${s.second} mandel=${m.first}:${m.second}")
+        // kernels 4..9 (CPU_SPEC.md): log only, same order and definition as the Firn app
+        val h = timed { Cpu.hash() }
+        val j = timed { Cpu.json() }
+        val sb = timed { Cpu.strbuild() }
+        val mm = timed { Cpu.matmul() }
+        val hm = timed { Cpu.hashmap() }
+        val os = timed { Cpu.objsort() }
+        BenchLog.i("cpu2 hash=${h.first}:${h.second} json=${j.first}:${j.second} strbuild=${sb.first}:${sb.second} " +
+            "matmul=${mm.first}:${mm.second} hashmap=${hm.first}:${hm.second} objsort=${os.first}:${os.second}")
         running = false
     }
 
