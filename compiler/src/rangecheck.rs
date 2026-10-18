@@ -300,7 +300,7 @@ impl<'a> Ana<'a> {
         let mut dom = Vec::new();
         if f.blocks.len() <= 512 && f.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i) {
             dom = crate::mem2reg::dominators(f);
-            let konst = |x: Val| -> Option<i128> {
+            let const_fact = |x: Val| -> Option<i128> {
                 let (b, i) = site.get(&x)?;
                 match &f.blocks[*b].insts[*i].op {
                     Op::Const(c) => Some(*c),
@@ -316,7 +316,7 @@ impl<'a> Ana<'a> {
                             }
                         }
                         Op::CheckedBin { op: BinOp::Mul, a, b: rhs, .. } => {
-                            let (x, c) = match (konst(*a), konst(*rhs)) {
+                            let (x, c) = match (const_fact(*a), const_fact(*rhs)) {
                                 (None, Some(c)) => (*a, c),
                                 (Some(c), None) => (*rhs, c),
                                 _ => continue,
