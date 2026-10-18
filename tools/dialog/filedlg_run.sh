@@ -66,6 +66,9 @@ if [ "$WHAT" = logic ] || [ "$WHAT" = all ]; then
   if [ "$(id -u)" = 0 ] && command -v setpriv >/dev/null; then
     chmod 000 "$D/tree/noaccess"
     chmod -R a+rX "$D/tree" "$D/filedlg_main"
+    # the user may not walk through a private (0700) parent such as the per-run TMPDIR of tools heavy
+    P=$(dirname "$D")
+    case "$P" in /tmp|/var/tmp|/dev/shm) ;; *) chmod a+x "$P" ;; esac
     chmod 000 "$D/tree/noaccess"
     echo "== as nobody: the locked folder"
     setpriv --reuid=65534 --regid=65534 --clear-groups "$D/filedlg_main" "$D/tree" perm | grep -v '^FRAME_MS' || rc=1
