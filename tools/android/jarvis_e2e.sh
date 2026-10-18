@@ -186,6 +186,10 @@ tap_word "Tasks" 1 4
 check "Tasks list shows the task" "$(OCR_TRIES=15 wait_ocr 06_tasks 'milk')" 1
 type_into "Task|New|Add|Text" "callmum" && tap_word "Add" 1 3
 check "task added over /api/m/tasks" "$(wait_log '"path": "/api/m/tasks".*callmum' 10 | awk '{print ($1>0)?"yes":"no"}')" yes
+# the two remaining tab pages, only photographed (design review)
+tap_word "Devices" 1 3; shot 06b_devices
+tap_px 965 2207 3; shot 06c_more # More tab by place: OCR does not find the small word
+[ "${E2E_STOP:-}" = tabs ] && { echo "stopped after the tab pages (E2E_STOP=tabs): $PASS ok, $FAIL failed"; exit 0; }
 tap_word "Chat" 1 2
 
 # ---- 3. conversation list ----------------------------------------------------------------------------------------------------
