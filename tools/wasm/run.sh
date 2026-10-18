@@ -135,6 +135,14 @@ one() {
         echo $? > "$base.$lvl.nrc"
         timeout "$RUN_TIMEOUT" node --stack-size=7800 "$ROOT/tools/wasm/run.mjs" "$base.$lvl.wasm" < /dev/null > "$base.$lvl.wout" 2> "$base.$lvl.werr"
         echo $? > "$base.$lvl.wrc"
+        # A program that imports env.dlopen (GL/dynamic-library tests) cannot be loaded by the browser
+        # host: the wasm module has an import the host does not provide. Same class as the compile-time
+        # refusals: visible as REFUSED "dlopen", not as a divergence.
+        if grep -q 'the program imports env\.dlopen' "$base.$lvl.werr"; then
+            verdict="REFUSED"
+            detail="dlopen -- wasm32-browser: the program imports env.dlopen, which the host does not provide (checked at $lvl)"
+            break
+        fi
         if [ "$nostderr" = 1 ]; then cp "$base.$lvl.nerr" "$base.$lvl.werr"; fi
         if ! cmp -s "$base.$lvl.nout" "$base.$lvl.wout" || ! cmp -s "$base.$lvl.nerr" "$base.$lvl.werr" \
             || ! cmp -s "$base.$lvl.nrc" "$base.$lvl.wrc"; then
