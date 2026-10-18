@@ -44,6 +44,62 @@ fn idents(text: &str, mut each: impl FnMut(&str)) {
     }
 }
 
+/// The functions that `f` can reach directly: `call`, `fnref`, the thread
+/// entry of a spawn and the labels an inline asm template names.
+pub fn direct_refs(
+    f: &crate::fir::Func,
+    by_name: &dyn Fn(&str) -> Option<usize>,
+    by_label: &dyn Fn(&str) -> Option<usize>,
+    out: &mut Vec<usize>,
+) {
+    for b in &f.blocks {
+        for ins in &b.insts {
+            match &ins.op {
+                Op::Call { name, .. } | Op::FnRef { name } => {
+                    if let Some(j) = by_name(name.as_str()) {
+                        out.push(j);
+                    }
+                }
+                // the spawn sequence calls the thread entry by name
+                Op::ThreadSpawn { .. } => {
+                    if let Some(j) = by_name(crate::thread::ENTRY) {
+                        out.push(j);
+                    }
+                }
+                Op::Asm { template, .. } => idents(template, |s| {
+                    if let Some(j) = by_label(s) {
+                        out.push(j);
+                    }
+                }),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Names the pruning (and the lazy lowering) start from, besides `main`,
+/// the interrupt handlers and the exports: collector init, panic handler,
+/// targets of all method tables.
+pub fn root_names() -> Vec<String> {
+    let mut named: Vec<String> = vec![crate::gc::FN_INIT.to_string()];
+    if let Some(h) = crate::panic_rt::handler() {
+        named.push(h);
+    }
+    named.extend(crate::iface::table_targets());
+    named
+}
+
+/// Is the pruning allowed for this compilation? (hosted x86-64 Linux exe)
+pub fn applicable(only_object: bool, exe: bool) -> bool {
+    enabled()
+        && matches!(crate::target::active(), crate::target::Target::X86_64)
+        && !crate::target::windows()
+        && !crate::target::shared()
+        && !crate::prof::is_kernel()
+        && !only_object
+        && exe
+}
+
 /// Removes the unreachable functions; returns how many were dropped.
 pub fn prune(m: &mut Module) -> usize {
     let n = m.funcs.len();
@@ -66,56 +122,33 @@ pub fn prune(m: &mut Module) -> usize {
             mark(i, &mut keep, &mut stack);
         }
     }
-    let mut named: Vec<String> = vec![crate::gc::FN_INIT.to_string()];
-    if let Some(h) = crate::panic_rt::handler() {
-        named.push(h);
-    }
-    named.extend(crate::iface::table_targets());
-    for s in &named {
+    for s in &root_names() {
         if let Some(&i) = by_name.get(s.as_str()) {
             mark(i, &mut keep, &mut stack);
         }
     }
     while let Some(i) = stack.pop() {
         let mut refs: Vec<usize> = Vec::new();
-        for b in &m.funcs[i].blocks {
-            for ins in &b.insts {
-                match &ins.op {
-                    Op::Call { name, .. } | Op::FnRef { name } => {
-                        if let Some(&j) = by_name.get(name.as_str()) {
-                            refs.push(j);
-                        }
-                    }
-                    // the spawn sequence calls the thread entry by name
-                    Op::ThreadSpawn { .. } => {
-                        if let Some(&j) = by_name.get(crate::thread::ENTRY) {
-                            refs.push(j);
-                        }
-                    }
-                    Op::Asm { template, .. } => idents(template, |s| {
-                        if let Some(&j) = by_label.get(s) {
-                            refs.push(j);
-                        }
-                    }),
-                    _ => {}
-                }
-            }
-        }
+        direct_refs(
+            &m.funcs[i],
+            &|n| by_name.get(n).copied(),
+            &|n| by_label.get(n).copied(),
+            &mut refs,
+        );
         for j in refs {
             mark(j, &mut keep, &mut stack);
         }
     }
     let dropped = keep.iter().filter(|k| !**k).count();
-    if dropped == 0 {
-        return 0;
-    }
     let mut live_refs: HashSet<String> = HashSet::new();
     let mut idx = 0usize;
-    m.funcs.retain(|_| {
-        let k = keep[idx];
-        idx += 1;
-        k
-    });
+    if dropped > 0 {
+        m.funcs.retain(|_| {
+            let k = keep[idx];
+            idx += 1;
+            k
+        });
+    }
     for f in &m.funcs {
         for b in &f.blocks {
             for ins in &b.insts {

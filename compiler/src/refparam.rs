@@ -340,6 +340,12 @@ fn index_touches(e: &Expr, p: &Path) -> bool {
     }
 }
 
+/// **r714** -- calls `f` on every expression of `b` (closure bodies included).
+pub(crate) fn walk_exprs(b: &Block, f: &mut dyn FnMut(&Expr)) {
+    let mut own: Vec<String> = Vec::new();
+    visit_block(b, &mut own, &mut |e, _| f(e));
+}
+
 /// Calls `f` on every direct sub-expression.
 fn children<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
     match &e.kind {

@@ -2754,6 +2754,117 @@ pub fn lower(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Module> 
     Some(m)
 }
 
+/// **r714** -- lowering that starts at the roots of `prune.rs` and lowers a
+/// function only when something already lowered refers to it. The result is
+/// the module `lower` + `prune::prune` produce (same functions, same order),
+/// without ever lowering the ~700 library functions a script never calls.
+pub fn lower_reach(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Module> {
+    let lambdas = crate::fnval::collect(prog);
+    let n = prog.funcs.len();
+    let total = n + lambdas.len();
+    let mut by_name: HashMap<String, usize> = HashMap::with_capacity(total);
+    let mut by_label: HashMap<String, usize> = HashMap::with_capacity(total);
+    for (i, d) in prog.funcs.iter().enumerate() {
+        if d.extern_info.is_some() {
+            continue;
+        }
+        by_name.entry(d.name.clone()).or_insert(i);
+        by_label.entry(crate::codegen_x86::label(&d.name)).or_insert(i);
+    }
+    for (k, d) in lambdas.iter().enumerate() {
+        let name = crate::fnval::closure_fn(d.id);
+        by_label.entry(crate::codegen_x86::label(&name)).or_insert(n + k);
+        by_name.entry(name).or_insert(n + k);
+    }
+    let mut queued = vec![false; total];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut push = |i: usize, queued: &mut Vec<bool>, stack: &mut Vec<usize>| {
+        if !queued[i] {
+            queued[i] = true;
+            stack.push(i);
+        }
+    };
+    for (i, d) in prog.funcs.iter().enumerate() {
+        if d.extern_info.is_none()
+            && (d.name == "main"
+                || crate::core::has_interrupt(d)
+                || crate::extfn::export_link_name(&d.name).is_some())
+        {
+            push(i, &mut queued, &mut stack);
+        }
+    }
+    for s in &crate::prune::root_names() {
+        if let Some(&i) = by_name.get(s.as_str()) {
+            push(i, &mut queued, &mut stack);
+        }
+    }
+    let mut done: Vec<Option<Func>> = (0..total).map(|_| None).collect();
+    let mut ok = true;
+    while let Some(i) = stack.pop() {
+        let lowered = if i < n {
+            lower_fn(&prog.funcs[i], info, dg)
+        } else {
+            let d = &lambdas[i - n];
+            let fd = ast::FnDecl {
+                name: crate::fnval::closure_fn(d.id),
+                params: crate::fnval::closure_params(d),
+                ret: d.ret.clone(),
+                body: d.body.clone(),
+                span: d.span,
+                attrs: Vec::new(),
+                extern_info: None,
+            };
+            lower_fn(&fd, info, dg)
+        };
+        match lowered {
+            Some(f) => {
+                let mut refs: Vec<usize> = Vec::new();
+                crate::prune::direct_refs(
+                    &f,
+                    &|nm| by_name.get(nm).copied(),
+                    &|nm| by_label.get(nm).copied(),
+                    &mut refs,
+                );
+                for j in refs {
+                    push(j, &mut queued, &mut stack);
+                }
+                done[i] = Some(f);
+            }
+            None => ok = false,
+        }
+    }
+    if !ok {
+        return None;
+    }
+    let mut m = Module::new();
+    m.funcs = done.into_iter().flatten().collect();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            if matches!(b.term, Term::Unset) {
+                dg.error(
+                    Span::none(),
+                    format!(
+                        "internal error while lowering to FIR: block bb{} in '{}' without terminator",
+                        b.id, f.name
+                    ),
+                );
+                return None;
+            }
+            if b.id != 0 && b.insts.iter().any(|i: &Inst| matches!(i.op, Op::Alloca { .. })) {
+                dg.error(
+                    Span::none(),
+                    format!(
+                        "internal error while lowering to FIR: alloca outside the entry block in '{}'",
+                        f.name
+                    ),
+                );
+                return None;
+            }
+        }
+    }
+    Some(m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

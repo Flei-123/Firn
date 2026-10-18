@@ -831,6 +831,42 @@ impl<'a> Lexer<'a> {
     }
 }
 
+thread_local! {
+    /// **r714** -- token streams of error-free lexer runs, per (file id,
+    /// source length, source hash). Every source file is lexed up to
+    /// three times per compilation (import scan, GC-runtime search, parse);
+    /// the second and third time are a lookup. A run WITH errors is never
+    /// stored, so the real diagnostics still come out of the one real run.
+    static TOKEN_CACHE: std::cell::RefCell<std::collections::HashMap<(u32, usize, usize), std::rc::Rc<Vec<Token>>>>
+        = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Like `lex_file`, but remembers error-free results (see `TOKEN_CACHE`).
+/// The key is (file id, length, content hash): a freed buffer that is
+/// reused for other text can never produce a stale hit.
+pub fn lex_file_cached(src: &str, file: u32, dg: &mut Diags) -> std::rc::Rc<Vec<Token>> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    src.hash(&mut h);
+    let key = (file, src.len(), h.finish() as usize);
+    if let Some(hit) = TOKEN_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let before = dg.count();
+    let toks = std::rc::Rc::new(lex_file(src, file, dg));
+    if dg.count() == before {
+        TOKEN_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            // bounded: a long-lived process (language server) must not grow
+            if c.len() >= 256 {
+                c.clear();
+            }
+            c.insert(key, toks.clone());
+        });
+    }
+    toks
+}
+
 pub fn lex(src: &str, dg: &mut Diags) -> Vec<Token> {
     lex_file(src, 0, dg)
 }
@@ -844,7 +880,7 @@ pub fn lex_file(src: &str, file: u32, dg: &mut Diags) -> Vec<Token> {
         line: 1,
         col: 1,
         dg,
-        out: Vec::new(),
+        out: Vec::with_capacity(src.len() / 5 + 16),
     };
     lx.run();
     lx.out

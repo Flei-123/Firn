@@ -381,7 +381,7 @@ pub(crate) fn gc_runtime(files: &[SourceFile]) -> Option<SourceFile> {
     let mut has_thread_work = false;
     for f in files {
         let mut dg = Diags::new("<gc-search>", &f.src);
-        let toks = lexer::lex_file(&f.src, f.id, &mut dg);
+        let toks = lexer::lex_file_cached(&f.src, f.id, &mut dg);
         needs |= crate::gc::source_needs_gc(&toks);
         has_allocerror |= crate::gc::source_has_allocerror(&toks);
         needs_collections |= crate::gc::source_needs_collections(&toks);
@@ -408,7 +408,7 @@ pub(crate) fn gc_runtime(files: &[SourceFile]) -> Option<SourceFile> {
 /// Looks for `import a.b` declarations without parsing the file fully.
 fn scan_imports(src: &str, file: u32) -> Vec<(Vec<String>, Span)> {
     let mut dg = Diags::new("<import-search>", src);
-    let toks = lexer::lex_file(src, file, &mut dg);
+    let toks = lexer::lex_file_cached(src, file, &mut dg);
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < toks.len() {
@@ -549,9 +549,9 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     // That is why the reset of the hooks belongs here, ONCE for the whole
     // compilation, and after that all files get scanned up front.
     parser::reset_hooks();
-    let mut all: Vec<Vec<lexer::Token>> = Vec::new();
+    let mut all: Vec<std::rc::Rc<Vec<lexer::Token>>> = Vec::new();
     for f in files {
-        let toks = lexer::lex_file(&f.src, f.id, dg);
+        let toks = lexer::lex_file_cached(&f.src, f.id, dg);
         crate::sema_generic::hook_prescan(&toks);
         all.push(toks);
     }

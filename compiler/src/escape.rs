@@ -253,8 +253,54 @@ pub(crate) fn hook_check(ck: &mut Checker, prog: &Program) {
     }
 }
 
+/// **r714** -- `FIRN_REACH_CHECKS=1` (set by `firn-run`): check only the
+/// functions that the functions of the file with `main` can reach by name.
+/// The summary of a function depends on its callees only, so the findings
+/// for everything reachable are exactly those of the full run; findings
+/// inside library functions nobody calls are not reported.
+fn reach_enabled() -> bool {
+    std::env::var("FIRN_REACH_CHECKS").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Marks the functions reachable from the functions of `main`'s file.
+fn reachable(prog: &Program) -> Option<Vec<bool>> {
+    let main = prog.funcs.iter().find(|f| f.name == "main")?;
+    let file = main.span.file;
+    let mut by_name: HashMap<&str, usize> = HashMap::with_capacity(prog.funcs.len());
+    for (i, f) in prog.funcs.iter().enumerate() {
+        by_name.entry(f.name.as_str()).or_insert(i);
+    }
+    let mut seen = vec![false; prog.funcs.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for (i, f) in prog.funcs.iter().enumerate() {
+        if f.span.file == file {
+            seen[i] = true;
+            stack.push(i);
+        }
+    }
+    while let Some(i) = stack.pop() {
+        let mut callees: Vec<usize> = Vec::new();
+        crate::refparam::walk_exprs(&prog.funcs[i].body, &mut |e| {
+            if let ExprKind::Call(n, _, _) = &e.kind {
+                if let Some(&j) = by_name.get(n.as_str()) {
+                    callees.push(j);
+                }
+            }
+        });
+        for j in callees {
+            if !seen[j] {
+                seen[j] = true;
+                stack.push(j);
+            }
+        }
+    }
+    Some(seen)
+}
+
 /// The pass proper, without `Checker` — testable on its own that way.
 fn collect_findings(prog: &Program, tys: &[Type]) -> Vec<(Span, String, String, String)> {
+    let reach: Option<Vec<bool>> = if reach_enabled() { reachable(prog) } else { None };
+    let skip = |i: usize| reach.as_ref().map(|r| !r[i]).unwrap_or(false);
     // --- phase 1: the summaries, to a fixed point ---------------------------
     let mut sums: HashMap<String, Vec<u64>> = HashMap::new();
     for f in &prog.funcs {
@@ -265,7 +311,10 @@ fn collect_findings(prog: &Program, tys: &[Type]) -> Vec<(Span, String, String, 
     }
     for _round in 0..MAX_ROUNDS {
         let mut fresh: Vec<(String, Vec<u64>)> = Vec::new();
-        for f in &prog.funcs {
+        for (fi, f) in prog.funcs.iter().enumerate() {
+            if skip(fi) {
+                continue;
+            }
             // `#[allow_escape]` vouches for the whole function, its callers
             // included: its summary stays EMPTY, so no call of it is blamed
             // for what it does with the pointers it is given. Anything else
@@ -289,8 +338,8 @@ fn collect_findings(prog: &Program, tys: &[Type]) -> Vec<(Span, String, String, 
     }
     // --- phase 2: the report ------------------------------------------------
     let mut out: Vec<(Span, String, String, String)> = Vec::new();
-    for f in &prog.funcs {
-        if f.extern_info.is_some() || is_closure(&f.name) || has_allow_escape(f) {
+    for (fi, f) in prog.funcs.iter().enumerate() {
+        if skip(fi) || f.extern_info.is_some() || is_closure(&f.name) || has_allow_escape(f) {
             continue;
         }
         let mut p = Pass::new(&sums, tys, f, true);

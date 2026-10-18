@@ -1085,7 +1085,14 @@ fn run(opts: &Options) -> i32 {
     }
 
     // --- Lowering to FIR ---
-    let mut module = match lower::lower(&prog, &info, &mut dg) {
+    // r714: with FIR pruning on, only the reachable functions are lowered.
+    let lazy_lower = prune::applicable(opts.only_object, opts.emit == Emit::Exe);
+    let lowered = if lazy_lower {
+        lower::lower_reach(&prog, &info, &mut dg)
+    } else {
+        lower::lower(&prog, &info, &mut dg)
+    };
+    let mut module = match lowered {
         Some(m) => m,
         None => {
             if !dg.has_errors() {
@@ -1124,14 +1131,7 @@ fn run(opts: &Options) -> i32 {
     }
 
     // --- FIR pruning (opt-in, hosted x86-64 Linux executables only) ---
-    if prune::enabled()
-        && matches!(target::active(), target::Target::X86_64)
-        && !target::windows()
-        && !target::shared()
-        && !prof::is_kernel()
-        && !opts.only_object
-        && opts.emit == Emit::Exe
-    {
+    if lazy_lower {
         let dropped = prune::prune(&mut module);
         if opts.stats {
             eprintln!("prune-fir:  {} functions dropped", dropped);
