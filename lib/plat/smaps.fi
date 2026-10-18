@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/smaps.fi -- memory breakdown of THIS process from /proc/self/smaps (Linux/Android; works without root because
+// it reads its own process). One log line per group / big mapping, tag given by the caller (bench app: BENCH).
+//
+//     smaps.dump("BENCH", 12, 8)    top 12 name groups + top 8 single mappings by PSS, plus one total line
+//
+// Group = mapping name (path, "[heap]", "[anon:scudo:primary]", ...); unnamed mappings are "[anon]".
+import std.rt
+import std.fs
+import plat.blog
+
+export { dump }
+
+// record layout in u64 words
+const REC_W: usize = 8
+const R_START: usize = 0
+const R_KB: usize = 1
+const R_PSS: usize = 2
+const R_PD: usize = 3
+const R_RSS: usize = 4
+const R_NOFF: usize = 5
+const R_NLEN: usize = 6
+const R_SWAP: usize = 7
+const MAX_REC: usize = 6000
+const MAX_GRP: usize = 400
+
+fn is_hex(c: u8) -> bool {
+    return (c >= 48 as u8 && c <= 57 as u8) || (c >= 97 as u8 && c <= 102 as u8)
+}
+
+fn hex_val(c: u8) -> u64 {
+    if c <= 57 as u8 { return (c - 48 as u8) as u64 }
+    return (c - 97 as u8) as u64 + 10
+}
+
+fn dec(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn hex(v: u64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_hex_u64(&b, v, 1)
+    let s: str = __str_copy(str { p: rt.buf_data(&b), n: rt.buf_len(&b) })
+    rt.buf_free(&b)
+    return s
+}
+
+fn name_eq(names: u64, o1: u64, l1: u64, o2: u64, l2: u64) -> bool {
+    if l1 != l2 { return false }
+    return rt.mem_eq(names + o1, names + o2, l1 as usize)
+}
+
+fn name_str(names: u64, off: u64, len: u64) -> str {
+    return __str_copy(str { p: rt.ptr_of(names + off), n: len as usize })
+}
+
+// numeric value of a "Key:   123 kB" line, p points at the first byte after ':'
+fn line_kb(p: u64, i: usize, e: usize) -> u64 {
+    var k: usize = i
+    while k < e && rt.ld8(p, k) == 32 as u8 { k = k + 1 }
+    var v: u64 = 0
+    while k < e && rt.ld8(p, k) >= 48 as u8 && rt.ld8(p, k) <= 57 as u8 {
+        v = v * 10 + (rt.ld8(p, k) - 48 as u8) as u64
+        k = k + 1
+    }
+    return v
+}
+
+// does the line at [i,e) start with the ASCII key (followed by ':')?
+fn key_is(p: u64, i: usize, e: usize, key: str) -> bool {
+    if i + key.n + 1 > e { return false }
+    var k: usize = 0
+    while k < key.n {
+        if rt.ld8(p, i + k) != *((key.p as u64 + k as u64) as *mut u8) { return false }
+        k = k + 1
+    }
+    return rt.ld8(p, i + key.n) == 58 as u8
+}
+
+fn dump(tag: str, top_groups: usize, top_maps: usize) {
+    var a: rt.Buf = rt.buf_new()
+    let na: usize = fs.read_file("/proc/self/smaps", &a) catch 0
+    if na == 0 {
+        blog.log(tag, "smaps unreadable")
+        rt.buf_free(&a)
+        return
+    }
+    let p: u64 = rt.buf_ptr(&a)
+    let recs: u64 = rt.heap_alloc(MAX_REC * REC_W * 8)
+    var names: rt.Buf = rt.buf_new()
+    var nrec: usize = 0
+    var cur: usize = MAX_REC
+    var i: usize = 0
+    while i < na {
+        var e: usize = i
+        while e < na && rt.ld8(p, e) != 10 as u8 { e = e + 1 }
+        let c: u8 = rt.ld8(p, i)
+        if is_hex(c) {
+            // header: start-end perms offset dev inode [name]
+            var k: usize = i
+            var s: u64 = 0
+            while k < e && rt.ld8(p, k) != 45 as u8 {
+                s = s * 16 + hex_val(rt.ld8(p, k))
+                k = k + 1
+            }
+            k = k + 1
+            var en: u64 = 0
+            while k < e && rt.ld8(p, k) != 32 as u8 {
+                en = en * 16 + hex_val(rt.ld8(p, k))
+                k = k + 1
+            }
+            var f: usize = 0
+            while f < 4 && k < e {
+                while k < e && rt.ld8(p, k) == 32 as u8 { k = k + 1 }
+                while k < e && rt.ld8(p, k) != 32 as u8 { k = k + 1 }
+                f = f + 1
+            }
+            while k < e && rt.ld8(p, k) == 32 as u8 { k = k + 1 }
+            if nrec < MAX_REC {
+                cur = nrec
+                nrec = nrec + 1
+                let r: u64 = recs + (cur * REC_W * 8) as u64
+                rt.st64(r, R_START, s)
+                rt.st64(r, R_KB, (en - s) / 1024)
+                rt.st64(r, R_PSS, 0)
+                rt.st64(r, R_PD, 0)
+                rt.st64(r, R_RSS, 0)
+                rt.st64(r, R_SWAP, 0)
+                rt.st64(r, R_NOFF, rt.buf_len(&names) as u64)
+                if k < e {
+                    // trim a path to its last 40 bytes
+                    var st: usize = k
+                    if e - k > 40 { st = e - 40 }
+                    rt.buf_push_bytes(&names, p + st as u64, e - st)
+                    rt.st64(r, R_NLEN, (e - st) as u64)
+                } else {
+                    rt.buf_push_bytes(&names, rt.addr_of("[anon]".p), 6)
+                    rt.st64(r, R_NLEN, 6)
+                }
+            } else {
+                cur = MAX_REC
+            }
+        } else if cur < MAX_REC {
+            let r: u64 = recs + (cur * REC_W * 8) as u64
+            if key_is(p, i, e, "Pss") { rt.st64(r, R_PSS, line_kb(p, i + 4, e)) }
+            if key_is(p, i, e, "Rss") { rt.st64(r, R_RSS, line_kb(p, i + 4, e)) }
+            if key_is(p, i, e, "Private_Dirty") { rt.st64(r, R_PD, line_kb(p, i + 14, e)) }
+            if key_is(p, i, e, "Swap") { rt.st64(r, R_SWAP, line_kb(p, i + 5, e)) }
+        }
+        i = e + 1
+    }
+    let np: u64 = rt.buf_ptr(&names)
+
+    // groups by name: [rec index of first member][pss][pd][rss][count]
+    let grp: u64 = rt.heap_alloc(MAX_GRP * 5 * 8)
+    var ng: usize = 0
+    var tot_pss: u64 = 0
+    var tot_pd: u64 = 0
+    var tot_rss: u64 = 0
+    var j: usize = 0
+    while j < nrec {
+        let r: u64 = recs + (j * REC_W * 8) as u64
+        let no: u64 = rt.ld64(r, R_NOFF)
+        let nl: u64 = rt.ld64(r, R_NLEN)
+        tot_pss = tot_pss + rt.ld64(r, R_PSS)
+        tot_pd = tot_pd + rt.ld64(r, R_PD)
+        tot_rss = tot_rss + rt.ld64(r, R_RSS)
+        var g: usize = 0
+        var found: usize = MAX_GRP
+        while g < ng {
+            let first: u64 = rt.ld64(grp + (g * 5 * 8) as u64, 0)
+            let fr: u64 = recs + (first as usize * REC_W * 8) as u64
+            if name_eq(np, no, nl, rt.ld64(fr, R_NOFF), rt.ld64(fr, R_NLEN)) {
+                found = g
+                g = ng
+            } else {
+                g = g + 1
+            }
+        }
+        if found == MAX_GRP && ng < MAX_GRP {
+            found = ng
+            ng = ng + 1
+            rt.st64(grp + (found * 5 * 8) as u64, 0, j as u64)
+            rt.st64(grp + (found * 5 * 8) as u64, 1, 0)
+            rt.st64(grp + (found * 5 * 8) as u64, 2, 0)
+            rt.st64(grp + (found * 5 * 8) as u64, 3, 0)
+            rt.st64(grp + (found * 5 * 8) as u64, 4, 0)
+        }
+        if found < MAX_GRP {
+            let q: u64 = grp + (found * 5 * 8) as u64
+            rt.st64(q, 1, rt.ld64(q, 1) + rt.ld64(r, R_PSS))
+            rt.st64(q, 2, rt.ld64(q, 2) + rt.ld64(r, R_PD))
+            rt.st64(q, 3, rt.ld64(q, 3) + rt.ld64(r, R_RSS))
+            rt.st64(q, 4, rt.ld64(q, 4) + 1)
+        }
+        j = j + 1
+    }
+    blog.log(tag, "smaps total pss_kb=" + dec(tot_pss as i64) + " private_dirty_kb=" + dec(tot_pd as i64) + " rss_kb=" + dec(tot_rss as i64) + " maps=" + dec(nrec as i64) + " groups=" + dec(ng as i64))
+
+    // selection: repeatedly take the largest not yet printed (marker: pss word 1 << 62)
+    var t: usize = 0
+    while t < top_groups {
+        var best: usize = MAX_GRP
+        var bv: u64 = 0
+        var g2: usize = 0
+        while g2 < ng {
+            let v: u64 = rt.ld64(grp + (g2 * 5 * 8) as u64, 1)
+            if v < 4611686018427387904 && (best == MAX_GRP || v > bv) {
+                best = g2
+                bv = v
+            }
+            g2 = g2 + 1
+        }
+        if best == MAX_GRP { t = top_groups } else {
+            let q: u64 = grp + (best * 5 * 8) as u64
+            let fr: u64 = recs + (rt.ld64(q, 0) as usize * REC_W * 8) as u64
+            blog.log(tag, "smaps g pss=" + dec(rt.ld64(q, 1) as i64) + " pd=" + dec(rt.ld64(q, 2) as i64) + " rss=" + dec(rt.ld64(q, 3) as i64) + " n=" + dec(rt.ld64(q, 4) as i64) + " " + name_str(np, rt.ld64(fr, R_NOFF), rt.ld64(fr, R_NLEN)))
+            rt.st64(q, 1, 4611686018427387904 + bv)
+            t = t + 1
+        }
+    }
+
+    // top single mappings by PSS
+    var m: usize = 0
+    while m < top_maps {
+        var bj: usize = MAX_REC
+        var bp: u64 = 0
+        var x: usize = 0
+        while x < nrec {
+            let r: u64 = recs + (x * REC_W * 8) as u64
+            let v: u64 = rt.ld64(r, R_PSS)
+            if v < 4611686018427387904 && (bj == MAX_REC || v > bp) {
+                bj = x
+                bp = v
+            }
+            x = x + 1
+        }
+        if bj == MAX_REC { m = top_maps } else {
+            let r: u64 = recs + (bj * REC_W * 8) as u64
+            blog.log(tag, "smaps m pss=" + dec(bp as i64) + " kb=" + dec(rt.ld64(r, R_KB) as i64) + " addr=" + hex(rt.ld64(r, R_START)) + " " + name_str(np, rt.ld64(r, R_NOFF), rt.ld64(r, R_NLEN)))
+            rt.st64(r, R_PSS, 4611686018427387904 + bp)
+            m = m + 1
+        }
+    }
+    rt.heap_free(grp, MAX_GRP * 5 * 8)
+    rt.heap_free(recs, MAX_REC * REC_W * 8)
+    rt.buf_free(&names)
+    rt.buf_free(&a)
+}
