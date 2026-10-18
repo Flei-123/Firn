@@ -1,0 +1,332 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/timeline.fi -- TIMELINE: keyframe tracks, sequence, parallel, stagger (gap list #67, r149).
+//
+// A timeline is a set of TRACKS on ONE clock. Each track moves one value (offset, alpha, scale ...)
+// from `from` to `to` between `start` and `start + dur` (ms) with an easing from fui.anim. The value at
+// a time is a PURE FUNCTION of the clock: the same time gives the same bits, run after run, on every
+// host. Nothing is stored per frame, so seeking, reversing and a rebuild of the tree cost nothing.
+//
+//     var tl: timeline.Timeline = timeline.timeline_new()
+//     timeline.seq(&tl, 200, 0.0, 1.0, anim.easing_fluent_decel())      // track 0: 0..200 ms
+//     timeline.seq(&tl, 300, 1.0, 0.0, anim.easing_linear())            // track 1: 200..500 ms
+//     timeline.par(&tl, 500, 0.0, 10.0, anim.easing_linear())           // track 2: 200..700, same start as 1
+//     timeline.stagger(&tl, 5, 40, 150, 0.0, 1.0, anim.easing_fluent_standard())   // tracks 3..7 each 40 ms later
+//     timeline.play(&tl)
+//     timeline.advance(&tl, dt_ms)                       // the host's frame time; returns true while busy
+//     let v: f64 = timeline.value(&tl, 1)               // value of track 1 NOW
+//     let u: f64 = timeline.value_at(&tl, 1, 350)       // value of track 1 at 350 ms (pure)
+//
+// RULES
+//   * Before its start a track shows `from` (fill backwards), after its end `to` (fill forwards).
+//   * `seq` starts where the LAST ADDED track ends (a chain); `par` starts where the last added track
+//     STARTS (they run together); `at` starts at an explicit time; `stagger` adds n tracks, the i-th
+//     starts i * step later than the first, the first starts where `seq` would.
+//   * `set_repeat(track, n)`: n extra runs (0 = once); `REPEAT_FOREVER` never ends; `set_alternate`
+//     turns every second run backwards (ping-pong).
+//   * `reverse` plays backwards from the current time; `set_speed` scales the clock (1000 = 1.0x).
+//   * REDUCED MOTION (system setting, gap list #71): `set_reduced(true)` makes every `advance` jump to the
+//     END at once -- no frame in between, the final state is the same. A timeline that repeats forever
+//     is held at its first run's end value.
+//   * `total_ms` is the end of the last finite track (forever tracks do not count).
+import std.rt
+import fui.anim
+
+export {
+    Timeline, Track, timeline_new, TL_MAX, REPEAT_FOREVER_TL,
+    seq, par, at, stagger, set_repeat, set_alternate, track_count, track_start, track_dur, clear,
+    play, pause, stop, seek, reverse, set_speed, set_reduced, advance, now_ms, playing, finished,
+    value, value_at, total_ms, progress_pm,
+}
+
+const TL_MAX: usize = 32
+const REPEAT_FOREVER_TL: i64 = 1000000
+
+struct Track {
+    start: i64,
+    dur: i64,
+    from: f64,
+    to: f64,
+    ease: anim.Easing,
+    repeat: i64, // extra runs after the first
+    alt: u32, // 1 = every second run backwards
+}
+
+struct Timeline {
+    t: [Track; 32],
+    n: usize,
+    now: i64, // the clock, ms
+    run: u32, // 1 = playing
+    dir: i64, // 1 forward, -1 backward
+    speed: i64, // permille of real time
+    frac: i64, // sub-ms remainder of the scaled clock (micro-ms, 0..999)
+    reduced: u32,
+}
+
+fn timeline_new() -> Timeline {
+    let z: Track = Track { start: 0, dur: 1, from: 0.0, to: 0.0, ease: anim.easing_linear(), repeat: 0, alt: 0 as u32 }
+    return Timeline { t: [z; 32], n: 0, now: 0, run: 0 as u32, dir: 1, speed: 1000, frac: 0, reduced: 0 as u32 }
+}
+
+fn clear(tl: *mut Timeline) {
+    (*tl).n = 0
+    (*tl).now = 0
+    (*tl).run = 0 as u32
+    (*tl).dir = 1
+    (*tl).frac = 0
+}
+
+fn track_count(tl: *mut Timeline) -> usize { return (*tl).n }
+fn track_start(tl: *mut Timeline, i: usize) -> i64 {
+    if i >= (*tl).n { return 0 }
+    return (*tl).t[i].start
+}
+fn track_dur(tl: *mut Timeline, i: usize) -> i64 {
+    if i >= (*tl).n { return 0 }
+    return (*tl).t[i].dur
+}
+
+// End time of one pass (all runs) of a track; -1 for a track that never ends.
+fn track_end(k: *mut Track) -> i64 {
+    if (*k).repeat >= REPEAT_FOREVER_TL {
+        return 0 - 1
+    }
+    return (*k).start + (*k).dur * ((*k).repeat + 1)
+}
+
+fn last_end(tl: *mut Timeline) -> i64 {
+    if (*tl).n == 0 { return 0 }
+    var e: i64 = track_end(&(*tl).t[(*tl).n - 1])
+    if e < 0 {
+        // a forever track: chain after its first run
+        e = (*tl).t[(*tl).n - 1].start + (*tl).t[(*tl).n - 1].dur
+    }
+    return e
+}
+
+fn last_start(tl: *mut Timeline) -> i64 {
+    if (*tl).n == 0 { return 0 }
+    return (*tl).t[(*tl).n - 1].start
+}
+
+// Add a track at an explicit start. Returns its index, or TL_MAX when the timeline is full.
+fn at(tl: *mut Timeline, start: i64, dur: i64, from: f64, to: f64, ease: anim.Easing) -> usize {
+    if (*tl).n >= TL_MAX {
+        return TL_MAX
+    }
+    var d: i64 = dur
+    if d < 1 { d = 1 }
+    var s: i64 = start
+    if s < 0 { s = 0 }
+    let i: usize = (*tl).n
+    (*tl).t[i] = Track { start: s, dur: d, from: from, to: to, ease: ease, repeat: 0, alt: 0 as u32 }
+    (*tl).n = i + 1
+    return i
+}
+
+// After the last track.
+fn seq(tl: *mut Timeline, dur: i64, from: f64, to: f64, ease: anim.Easing) -> usize {
+    return at(tl, last_end(tl), dur, from, to, ease)
+}
+
+// Together with the last track.
+fn par(tl: *mut Timeline, dur: i64, from: f64, to: f64, ease: anim.Easing) -> usize {
+    return at(tl, last_start(tl), dur, from, to, ease)
+}
+
+// n tracks, each `step` ms later than the one before; the first one starts where `seq` would.
+// Returns the index of the first track (TL_MAX when it did not all fit; then none is added).
+fn stagger(tl: *mut Timeline, n: usize, step: i64, dur: i64, from: f64, to: f64, ease: anim.Easing) -> usize {
+    if n == 0 || (*tl).n + n > TL_MAX {
+        return TL_MAX
+    }
+    let base: i64 = last_end(tl)
+    let first: usize = (*tl).n
+    var i: usize = 0
+    while i < n {
+        at(tl, base + (i as i64) * step, dur, from, to, ease)
+        i = i + 1
+    }
+    return first
+}
+
+fn set_repeat(tl: *mut Timeline, i: usize, n: i64) {
+    if i >= (*tl).n { return }
+    var r: i64 = n
+    if r < 0 { r = 0 }
+    if r > REPEAT_FOREVER_TL { r = REPEAT_FOREVER_TL }
+    (*tl).t[i].repeat = r
+}
+
+fn set_alternate(tl: *mut Timeline, i: usize, on: bool) {
+    if i >= (*tl).n { return }
+    if on {
+        (*tl).t[i].alt = 1 as u32
+    } else {
+        (*tl).t[i].alt = 0 as u32
+    }
+}
+
+// The end of the last FINITE track; 0 for an empty timeline.
+fn total_ms(tl: *mut Timeline) -> i64 {
+    var m: i64 = 0
+    var i: usize = 0
+    while i < (*tl).n {
+        let e: i64 = track_end(&(*tl).t[i])
+        if e > m { m = e }
+        i = i + 1
+    }
+    return m
+}
+
+fn has_forever(tl: *mut Timeline) -> bool {
+    var i: usize = 0
+    while i < (*tl).n {
+        if (*tl).t[i].repeat >= REPEAT_FOREVER_TL { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// A track's value at time `ms` -- pure.
+fn track_value(k: *mut Track, ms: i64) -> f64 {
+    let local: i64 = ms - (*k).start
+    if local <= 0 {
+        return (*k).from
+    }
+    let run: i64 = local / (*k).dur
+    if (*k).repeat < REPEAT_FOREVER_TL && run > (*k).repeat {
+        // finished: the end value of the last run (backwards when that run was a return)
+        var back_end: bool = false
+        if (*k).alt != 0 as u32 && ((*k).repeat % 2) == 1 {
+            back_end = true
+        }
+        if back_end { return (*k).from }
+        return (*k).to
+    }
+    let within: i64 = local - run * (*k).dur
+    var p: f64 = (within as f64) / ((*k).dur as f64)
+    if (*k).alt != 0 as u32 && (run % 2) == 1 {
+        p = 1.0 - p
+    }
+    var e: anim.Easing = (*k).ease
+    let q: f64 = anim.ease_eval(&e, p)
+    return (*k).from + ((*k).to - (*k).from) * q
+}
+
+fn value_at(tl: *mut Timeline, i: usize, ms: i64) -> f64 {
+    if i >= (*tl).n { return 0.0 }
+    return track_value(&(*tl).t[i], ms)
+}
+
+fn value(tl: *mut Timeline, i: usize) -> f64 {
+    return value_at(tl, i, (*tl).now)
+}
+
+fn now_ms(tl: *mut Timeline) -> i64 { return (*tl).now }
+fn playing(tl: *mut Timeline) -> bool { return (*tl).run != 0 as u32 }
+
+// Finished = past the end of every finite track and nothing repeats forever (or still at 0 going backwards).
+fn finished(tl: *mut Timeline) -> bool {
+    if has_forever(tl) && (*tl).reduced == 0 as u32 {
+        return false
+    }
+    if (*tl).dir < 0 {
+        return (*tl).now <= 0
+    }
+    return (*tl).now >= total_ms(tl)
+}
+
+// 0..1000: how far the whole timeline is.
+fn progress_pm(tl: *mut Timeline) -> i64 {
+    let tot: i64 = total_ms(tl)
+    if tot <= 0 { return 1000 }
+    var p: i64 = ((*tl).now * 1000) / tot
+    if p < 0 { p = 0 }
+    if p > 1000 { p = 1000 }
+    return p
+}
+
+fn play(tl: *mut Timeline) {
+    (*tl).run = 1 as u32
+    if (*tl).dir > 0 && (*tl).now >= total_ms(tl) && !has_forever(tl) {
+        (*tl).now = 0
+    }
+}
+
+fn pause(tl: *mut Timeline) { (*tl).run = 0 as u32 }
+
+fn stop(tl: *mut Timeline) {
+    (*tl).run = 0 as u32
+    (*tl).now = 0
+    (*tl).frac = 0
+    (*tl).dir = 1
+}
+
+fn seek(tl: *mut Timeline, ms: i64) {
+    var m: i64 = ms
+    if m < 0 { m = 0 }
+    (*tl).now = m
+    (*tl).frac = 0
+}
+
+// Turn the direction round; the clock stays where it is.
+fn reverse(tl: *mut Timeline) {
+    (*tl).dir = 0 - (*tl).dir
+    (*tl).run = 1 as u32
+}
+
+fn set_speed(tl: *mut Timeline, permille: i64) {
+    var s: i64 = permille
+    if s < 1 { s = 1 }
+    if s > 100000 { s = 100000 }
+    (*tl).speed = s
+}
+
+fn set_reduced(tl: *mut Timeline, on: bool) {
+    if on {
+        (*tl).reduced = 1 as u32
+    } else {
+        (*tl).reduced = 0 as u32
+    }
+}
+
+// Move the clock by `dt_ms` real milliseconds (scaled by the speed, in the playing direction).
+// True while the timeline still moves (the host wants another frame), false when it stands.
+fn advance(tl: *mut Timeline, dt_ms: i64) -> bool {
+    if (*tl).run == 0 as u32 {
+        return false
+    }
+    let tot: i64 = total_ms(tl)
+    if (*tl).reduced != 0 as u32 {
+        // no frames in between: jump to the end (or back to the start), and stand
+        if (*tl).dir > 0 {
+            (*tl).now = tot
+        } else {
+            (*tl).now = 0
+        }
+        (*tl).run = 0 as u32
+        return false
+    }
+    var d: i64 = dt_ms
+    if d < 0 { d = 0 }
+    // scaled step in micro-ms to keep the remainder exact: no drift over many frames
+    let micro: i64 = d * (*tl).speed + (*tl).frac
+    let whole: i64 = micro / 1000
+    (*tl).frac = micro - whole * 1000
+    if (*tl).dir > 0 {
+        (*tl).now = (*tl).now + whole
+        if !has_forever(tl) && (*tl).now >= tot {
+            (*tl).now = tot
+            (*tl).run = 0 as u32
+            return false
+        }
+    } else {
+        (*tl).now = (*tl).now - whole
+        if (*tl).now <= 0 {
+            (*tl).now = 0
+            (*tl).run = 0 as u32
+            return false
+        }
+    }
+    return true
+}

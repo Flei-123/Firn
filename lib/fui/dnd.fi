@@ -1,0 +1,306 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/dnd.fi -- DRAG AND DROP INSIDE THE APP: the state machine, the effect rules, the list drop slot, the
+// edge scroll, the keyboard way (gap list #96, r144).
+//
+// Dropping FILES onto a window is the host's job (XDND, WM_DROPFILES). This file is the other direction:
+// grab a row, a tab, a piece of text, a chip INSIDE the application and put it somewhere else. It is pure
+// state and integers: no window, no clipboard, so the same drag behaves the same on every host, and a test
+// can drive it with a script.
+//
+//     var d: dnd.Drag = dnd.drag_new()
+//     dnd.press(&d, x, y, dnd.KIND_ROW, row_id, dnd.OP_MOVE | dnd.OP_COPY, false)   // on button down over a source
+//     dnd.motion(&d, x, y, mods)             // true when the drag STARTED (4 px threshold, 10 px for touch)
+//     dnd.over(&d, target_id, target_kinds, target_ops)     // the target under the pointer, every motion
+//     dnd.leave(&d)                                         // pointer left every target
+//     let e: u32 = dnd.effect(&d)                           // OP_NONE / OP_MOVE / OP_COPY / OP_LINK -> cursor
+//     let r: u32 = dnd.release(&d)                          // the effect that happened (OP_NONE = nothing)
+//     dnd.cancel(&d)                                        // Esc, window lost focus
+//
+// EFFECT: the user can ask with a modifier -- Ctrl copy, Shift move, Alt link. Without one the first
+// operation both sides allow wins, in the order MOVE, COPY, LINK. An asked operation that the pair does not
+// allow gives NONE (the cursor shows "not here"), it does not silently do something else. A target that does
+// not accept the payload's KIND gives NONE.
+//
+// LISTS: `slot(y, y0, row_h, n, tree)` turns a pointer y into where a dragged row would land: a gap index
+// 0..n (insert before row i; n = at the end) and a zone (BEFORE / ON / AFTER the row). A plain list has no
+// ON zone (the row halves split the gaps); a tree has ON in the middle half (drop INTO the row).
+//
+// EDGE SCROLL: `edge_scroll(pos, lo, hi, zone, max_step)` is the scroll speed (px per frame, negative = up)
+// while the pointer is inside `zone` px of the viewport's edge; it grows to `max_step` at the very edge.
+//
+// KEYBOARD (no mouse needed; WAI-ARIA drag and drop pattern): Space on a focused source `grab`s it; Up/Down
+// (`kbd_move`) walk through the target list the app gives; Enter `kbd_drop`s on the current target, Esc cancels.
+// `kbd_target` tells which one is current so the app can speak "move to row 4 of 9".
+export {
+    Drag, drag_new, press, motion, over, leave, effect, release, cancel, is_active, is_pending, is_idle, payload_id,
+    payload_kind, drag_dx, drag_dy, target, slot, SLOT_BEFORE, SLOT_ON, SLOT_AFTER, slot_zone, slot_gap,
+    edge_scroll, grab, kbd_move, kbd_target, kbd_drop, is_keyboard,
+    KIND_TEXT, KIND_ROW, KIND_FILE, KIND_TAB, KIND_CUSTOM, OP_NONE, OP_MOVE, OP_COPY, OP_LINK,
+    MOD_SHIFT, MOD_CTRL, MOD_ALT, ST_IDLE, ST_PENDING, ST_DRAG, ST_KBD, state_of,
+}
+
+const KIND_TEXT: u32 = 1
+const KIND_ROW: u32 = 2
+const KIND_FILE: u32 = 4
+const KIND_TAB: u32 = 8
+const KIND_CUSTOM: u32 = 16
+
+const OP_NONE: u32 = 0
+const OP_MOVE: u32 = 1
+const OP_COPY: u32 = 2
+const OP_LINK: u32 = 4
+
+const MOD_SHIFT: u32 = 1
+const MOD_CTRL: u32 = 2
+const MOD_ALT: u32 = 4
+
+const ST_IDLE: u32 = 0
+const ST_PENDING: u32 = 1 // pressed on a source, not yet moved far enough
+const ST_DRAG: u32 = 2
+const ST_KBD: u32 = 3 // grabbed with the keyboard
+
+const SLOT_BEFORE: u32 = 0
+const SLOT_ON: u32 = 1
+const SLOT_AFTER: u32 = 2
+
+const NO_TARGET: u64 = 0
+
+struct Drag {
+    st: u32,
+    x0: i64,
+    y0: i64,
+    x: i64,
+    y: i64,
+    kind: u32,
+    id: u64,
+    src_ops: u32,
+    touch: u32,
+    mods: u32,
+    tgt: u64, // 0 = none (ids start at 1)
+    tgt_kinds: u32,
+    tgt_ops: u32,
+    kbd_idx: i64, // keyboard: current target index, -1 = none
+}
+
+fn drag_new() -> Drag {
+    return Drag { st: ST_IDLE, x0: 0, y0: 0, x: 0, y: 0, kind: 0 as u32, id: 0, src_ops: 0 as u32, touch: 0 as u32,
+        mods: 0 as u32, tgt: NO_TARGET, tgt_kinds: 0 as u32, tgt_ops: 0 as u32, kbd_idx: 0 - 1 }
+}
+
+fn state_of(d: *mut Drag) -> u32 { return (*d).st }
+fn is_idle(d: *mut Drag) -> bool { return (*d).st == ST_IDLE }
+fn is_pending(d: *mut Drag) -> bool { return (*d).st == ST_PENDING }
+fn is_active(d: *mut Drag) -> bool { return (*d).st == ST_DRAG || (*d).st == ST_KBD }
+fn is_keyboard(d: *mut Drag) -> bool { return (*d).st == ST_KBD }
+fn payload_id(d: *mut Drag) -> u64 { return (*d).id }
+fn payload_kind(d: *mut Drag) -> u32 { return (*d).kind }
+fn drag_dx(d: *mut Drag) -> i64 { return (*d).x - (*d).x0 }
+fn drag_dy(d: *mut Drag) -> i64 { return (*d).y - (*d).y0 }
+fn target(d: *mut Drag) -> u64 { return (*d).tgt }
+
+fn clear_target(d: *mut Drag) {
+    (*d).tgt = NO_TARGET
+    (*d).tgt_kinds = 0 as u32
+    (*d).tgt_ops = 0 as u32
+}
+
+// The button went down over a drag source. `touch` = a finger (needs more travel, so a scroll is not a drag).
+fn press(d: *mut Drag, x: i64, y: i64, kind: u32, id: u64, ops: u32, touch: bool) {
+    (*d).st = ST_PENDING
+    (*d).x0 = x
+    (*d).y0 = y
+    (*d).x = x
+    (*d).y = y
+    (*d).kind = kind
+    (*d).id = id
+    (*d).src_ops = ops
+    (*d).mods = 0 as u32
+    if touch {
+        (*d).touch = 1 as u32
+    } else {
+        (*d).touch = 0 as u32
+    }
+    clear_target(d)
+    (*d).kbd_idx = 0 - 1
+}
+
+// The pointer moved. True exactly once: when the drag STARTS (travel past the threshold, squared distance).
+fn motion(d: *mut Drag, x: i64, y: i64, mods: u32) -> bool {
+    (*d).x = x
+    (*d).y = y
+    (*d).mods = mods
+    if (*d).st != ST_PENDING {
+        return false
+    }
+    var th: i64 = 4
+    if (*d).touch != 0 as u32 {
+        th = 10
+    }
+    let dx: i64 = x - (*d).x0
+    let dy: i64 = y - (*d).y0
+    if dx * dx + dy * dy >= th * th {
+        (*d).st = ST_DRAG
+        return true
+    }
+    return false
+}
+
+// The target under the pointer (id >= 1), what it accepts and which operations it allows.
+fn over(d: *mut Drag, target_id: u64, kinds: u32, ops: u32) {
+    if (*d).st != ST_DRAG && (*d).st != ST_KBD { return }
+    (*d).tgt = target_id
+    (*d).tgt_kinds = kinds
+    (*d).tgt_ops = ops
+}
+
+fn leave(d: *mut Drag) {
+    clear_target(d)
+}
+
+// What a drop here would do. Pure function of the pair and the modifiers.
+fn effect_of(kind: u32, src_ops: u32, tgt_kinds: u32, tgt_ops: u32, mods: u32) -> u32 {
+    if (tgt_kinds & kind) == 0 as u32 { return OP_NONE }
+    let both: u32 = src_ops & tgt_ops
+    if both == 0 as u32 { return OP_NONE }
+    var asked: u32 = OP_NONE
+    if (mods & MOD_ALT) != 0 as u32 {
+        asked = OP_LINK
+    } else if (mods & MOD_CTRL) != 0 as u32 {
+        asked = OP_COPY
+    } else if (mods & MOD_SHIFT) != 0 as u32 {
+        asked = OP_MOVE
+    }
+    if asked != OP_NONE {
+        if (both & asked) != 0 as u32 { return asked }
+        return OP_NONE
+    }
+    if (both & OP_MOVE) != 0 as u32 { return OP_MOVE }
+    if (both & OP_COPY) != 0 as u32 { return OP_COPY }
+    if (both & OP_LINK) != 0 as u32 { return OP_LINK }
+    return OP_NONE
+}
+
+fn effect(d: *mut Drag) -> u32 {
+    if !is_active(d) || (*d).tgt == NO_TARGET { return OP_NONE }
+    return effect_of((*d).kind, (*d).src_ops, (*d).tgt_kinds, (*d).tgt_ops, (*d).mods)
+}
+
+// The button went up. Returns the effect that happened (OP_NONE = a click, a cancel or a refused drop) and
+// ends the drag; the app reads `payload_id` / `target` BEFORE calling this when it needs them.
+fn release(d: *mut Drag) -> u32 {
+    var r: u32 = OP_NONE
+    if (*d).st == ST_DRAG {
+        r = effect(d)
+    }
+    (*d).st = ST_IDLE
+    return r
+}
+
+fn cancel(d: *mut Drag) {
+    (*d).st = ST_IDLE
+    clear_target(d)
+    (*d).kbd_idx = 0 - 1
+}
+
+// ------------------------------------------------------------------ list drop slot
+
+fn slot_gap(y: i64, y0: i64, row_h: i64, n: i64) -> i64 {
+    if row_h < 1 || n <= 0 { return 0 }
+    var rel: i64 = y - y0
+    if rel < 0 { return 0 }
+    var row: i64 = rel / row_h
+    if row >= n { return n }
+    let within: i64 = rel - row * row_h
+    if within * 2 >= row_h { row = row + 1 }
+    return row
+}
+
+// For a tree: BEFORE the upper quarter, ON the middle half, AFTER the lower quarter. For a list the halves split.
+fn slot_zone(y: i64, y0: i64, row_h: i64, n: i64, tree: bool) -> u32 {
+    if row_h < 1 || n <= 0 { return SLOT_BEFORE }
+    let rel: i64 = y - y0
+    if rel < 0 { return SLOT_BEFORE }
+    if rel >= n * row_h { return SLOT_AFTER }
+    let within: i64 = rel - (rel / row_h) * row_h
+    if tree {
+        if within * 4 < row_h { return SLOT_BEFORE }
+        if within * 4 >= row_h * 3 { return SLOT_AFTER }
+        return SLOT_ON
+    }
+    if within * 2 < row_h { return SLOT_BEFORE }
+    return SLOT_AFTER
+}
+
+// Packed answer: zone in the low 2 bits, gap/row index above. `slot_zone` and `slot_gap` give the parts; for a
+// tree the row index (`rel / row_h`) is what the zone belongs to, so ON/BEFORE/AFTER refer to row `slot >> 2`.
+fn slot(y: i64, y0: i64, row_h: i64, n: i64, tree: bool) -> i64 {
+    var row: i64 = 0
+    if row_h >= 1 && y >= y0 { row = (y - y0) / row_h }
+    if row >= n { row = n - 1 }
+    if row < 0 { row = 0 }
+    let z: u32 = slot_zone(y, y0, row_h, n, tree)
+    return row * 4 + (z as i64)
+}
+
+// ------------------------------------------------------------------ edge scroll
+
+fn edge_scroll(pos: i64, lo: i64, hi: i64, zone: i64, max_step: i64) -> i64 {
+    if zone < 1 || max_step < 1 || hi <= lo { return 0 }
+    var z: i64 = zone
+    if z * 2 > hi - lo { z = (hi - lo) / 2 }
+    if z < 1 { return 0 }
+    if pos < lo + z {
+        var depth: i64 = lo + z - pos // 1 .. z (and more outside)
+        if depth > z { depth = z }
+        var s: i64 = (depth * max_step + z - 1) / z
+        if s < 1 { s = 1 }
+        return 0 - s
+    }
+    if pos > hi - z {
+        var depth2: i64 = pos - (hi - z)
+        if depth2 > z { depth2 = z }
+        var s2: i64 = (depth2 * max_step + z - 1) / z
+        if s2 < 1 { s2 = 1 }
+        return s2
+    }
+    return 0
+}
+
+// ------------------------------------------------------------------ keyboard
+
+// Space on a focused source: the drag starts without a pointer; the current target is none until Up/Down.
+fn grab(d: *mut Drag, kind: u32, id: u64, ops: u32) {
+    press(d, 0, 0, kind, id, ops, false)
+    (*d).st = ST_KBD
+}
+
+// Up / Down: walk through `ntargets` targets (the app decides their order); wraps around. Returns the index.
+fn kbd_move(d: *mut Drag, delta: i64, ntargets: i64) -> i64 {
+    if (*d).st != ST_KBD || ntargets <= 0 { return 0 - 1 }
+    var i: i64 = (*d).kbd_idx
+    if i < 0 {
+        if delta >= 0 {
+            i = 0
+        } else {
+            i = ntargets - 1
+        }
+    } else {
+        i = i + delta
+        while i < 0 { i = i + ntargets }
+        i = i % ntargets
+    }
+    (*d).kbd_idx = i
+    return i
+}
+
+fn kbd_target(d: *mut Drag) -> i64 { return (*d).kbd_idx }
+
+// Enter: the effect of dropping on the target the app announced with `over`; ends the drag.
+fn kbd_drop(d: *mut Drag) -> u32 {
+    if (*d).st != ST_KBD { return OP_NONE }
+    let r: u32 = effect_of((*d).kind, (*d).src_ops, (*d).tgt_kinds, (*d).tgt_ops, (*d).mods)
+    var out: u32 = r
+    if (*d).tgt == NO_TARGET { out = OP_NONE }
+    (*d).st = ST_IDLE
+    return out
+}

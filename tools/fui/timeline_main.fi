@@ -1,0 +1,185 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/timeline_main.fi -- THE CHECK OF lib/fui/timeline.fi (sequence / parallel / stagger / repeat /
+// reduced motion). Pure: no window. Gate of gap list #67: a timeline with 5+ tracks reproduces
+// bit for bit. Exit 1 on any WRONG.
+import std.rt
+import fui.anim
+import fui.timeline
+
+static mut BAD: usize = 0
+
+fn say(s: str) { rt.write_everything(1, s.p as u64, s.n) }
+
+fn check(ok: bool, what: str) {
+    if ok { say("  ok    ") } else {
+        say("  WRONG ")
+        BAD = BAD + 1
+    }
+    say(what)
+    say("\n")
+}
+
+fn near(a: f64, b: f64) -> bool {
+    var d: f64 = a - b
+    if d < 0.0 { d = 0.0 - d }
+    return d < 0.000001
+}
+
+// Build the 8-track reference timeline.
+fn build(tl: *mut timeline.Timeline) {
+    timeline.clear(tl)
+    timeline.seq(tl, 200, 0.0, 1.0, anim.easing_linear()) // 0:   0..200
+    timeline.seq(tl, 300, 1.0, 0.0, anim.easing_linear()) // 1: 200..500
+    timeline.par(tl, 500, 0.0, 10.0, anim.easing_linear()) // 2: 200..700
+    timeline.stagger(tl, 5, 40, 150, 0.0, 1.0, anim.easing_linear()) // 3..7: 700, 740, 780, 820, 860 (+150)
+}
+
+fn main(start: u64) -> i32 {
+    say("== timeline ==\n")
+    var tl: timeline.Timeline = timeline.timeline_new()
+    build(&tl)
+    check(timeline.track_count(&tl) == 8, "8 tracks")
+    check(timeline.track_start(&tl, 0) == 0 && timeline.track_start(&tl, 1) == 200, "seq chains: track 1 starts where 0 ends")
+    check(timeline.track_start(&tl, 2) == 200, "par starts with the last track")
+    check(timeline.track_start(&tl, 3) == 700, "stagger begins after the longest chain end (last track end)")
+    check(timeline.track_start(&tl, 7) == 860, "stagger steps 40 ms")
+    check(timeline.total_ms(&tl) == 1010, "total = end of the last track (860 + 150)")
+
+    check(near(timeline.value_at(&tl, 0, 100), 0.5), "linear half way")
+    check(near(timeline.value_at(&tl, 1, 0), 1.0), "before its start: from")
+    check(near(timeline.value_at(&tl, 1, 350), 0.5), "track 1 half way back")
+    check(near(timeline.value_at(&tl, 0, 5000), 1.0), "after its end: to")
+    check(near(timeline.value_at(&tl, 2, 450), 5.0), "parallel track half way")
+    check(near(timeline.value_at(&tl, 5, 780 + 75), 0.5), "stagger track 5 half way")
+    check(near(timeline.value_at(&tl, 6, 700), 0.0), "stagger track 6 not started")
+
+    // reproducible: two clocks stepped differently reach the same values at the same time
+    var a: timeline.Timeline = timeline.timeline_new()
+    var b: timeline.Timeline = timeline.timeline_new()
+    build(&a)
+    build(&b)
+    timeline.play(&a)
+    timeline.play(&b)
+    var i: i64 = 0
+    while i < 62 {
+        timeline.advance(&a, 16) // 62 * 16 = 992
+        i = i + 1
+    }
+    timeline.advance(&a, 8) // 1000
+    var j: i64 = 0
+    while j < 1000 {
+        timeline.advance(&b, 1) // 1000 steps of 1 ms
+        j = j + 1
+    }
+    check(timeline.now_ms(&a) == 1000 && timeline.now_ms(&b) == 1000, "both clocks at 1000 ms")
+    var same: bool = true
+    var k: usize = 0
+    while k < 8 {
+        if timeline.value(&a, k) != timeline.value(&b, k) { same = false }
+        k = k + 1
+    }
+    check(same, "frame-step 16 ms and 1 ms agree bit for bit on all 8 tracks")
+    var again: timeline.Timeline = timeline.timeline_new()
+    build(&again)
+    timeline.seek(&again, 1000)
+    var same2: bool = true
+    k = 0
+    while k < 8 {
+        if timeline.value(&again, k) != timeline.value(&a, k) { same2 = false }
+        k = k + 1
+    }
+    check(same2, "seek(1000) equals the played state")
+
+    // the end
+    check(timeline.advance(&a, 100) == false || timeline.now_ms(&a) == 1010, "advance past the end stops the clock")
+    check(timeline.now_ms(&a) == 1010 && !timeline.playing(&a) && timeline.finished(&a), "clock stops at total_ms; finished")
+    check(near(timeline.value(&a, 7), 1.0), "everything arrived")
+
+    // speed and the remainder: 0.5x for 3 frames of 5 ms = 7 ms (7.5 floor), the remainder survives
+    var s: timeline.Timeline = timeline.timeline_new()
+    build(&s)
+    timeline.set_speed(&s, 500)
+    timeline.play(&s)
+    timeline.advance(&s, 5)
+    timeline.advance(&s, 5)
+    timeline.advance(&s, 5)
+    timeline.advance(&s, 5)
+    check(timeline.now_ms(&s) == 10, "0.5x: 4 frames of 5 ms = 10 ms, no drift")
+
+    // pause / seek / reverse
+    var r: timeline.Timeline = timeline.timeline_new()
+    build(&r)
+    timeline.seek(&r, 100)
+    timeline.pause(&r)
+    check(!timeline.advance(&r, 50) && timeline.now_ms(&r) == 100, "paused: the clock does not move")
+    timeline.reverse(&r)
+    timeline.advance(&r, 30)
+    check(timeline.now_ms(&r) == 70, "reverse plays backwards from where it stands")
+    timeline.advance(&r, 500)
+    check(timeline.now_ms(&r) == 0 && !timeline.playing(&r) && timeline.finished(&r), "backwards stops at 0")
+
+    // repeat and alternate
+    var q: timeline.Timeline = timeline.timeline_new()
+    timeline.seq(&q, 100, 0.0, 1.0, anim.easing_linear())
+    timeline.set_repeat(&q, 0, 2)
+    check(timeline.total_ms(&q) == 300, "repeat 2 = 3 runs = 300 ms")
+    check(near(timeline.value_at(&q, 0, 150), 0.5), "second run starts again from 0")
+    check(near(timeline.value_at(&q, 0, 300), 1.0) && near(timeline.value_at(&q, 0, 999), 1.0), "ends on `to`")
+    timeline.set_alternate(&q, 0, true)
+    check(near(timeline.value_at(&q, 0, 150), 0.5) && near(timeline.value_at(&q, 0, 125), 0.75), "alternate: second run backwards")
+    check(near(timeline.value_at(&q, 0, 999), 1.0), "3 runs alternate: ends forward on `to`")
+    timeline.set_repeat(&q, 0, 1)
+    check(near(timeline.value_at(&q, 0, 999), 0.0), "2 runs alternate: ends back on `from`")
+
+    // forever
+    var f: timeline.Timeline = timeline.timeline_new()
+    timeline.seq(&f, 100, 0.0, 1.0, anim.easing_linear())
+    timeline.set_repeat(&f, 0, timeline.REPEAT_FOREVER_TL)
+    timeline.play(&f)
+    var live: bool = true
+    var n: i64 = 0
+    while n < 500 {
+        if !timeline.advance(&f, 16) { live = false }
+        n = n + 1
+    }
+    check(live && !timeline.finished(&f), "forever never finishes and keeps asking for frames")
+    check(timeline.total_ms(&f) == 0, "forever does not count in total_ms")
+
+    // reduced motion: no in-between frame
+    var m: timeline.Timeline = timeline.timeline_new()
+    build(&m)
+    timeline.set_reduced(&m, true)
+    timeline.play(&m)
+    check(!timeline.advance(&m, 16), "reduced motion: first advance ends it")
+    check(timeline.now_ms(&m) == 1010 && near(timeline.value(&m, 7), 1.0) && near(timeline.value(&m, 2), 10.0), "reduced motion: final state at once")
+    var mf: timeline.Timeline = timeline.timeline_new()
+    timeline.seq(&mf, 100, 0.0, 1.0, anim.easing_linear())
+    timeline.set_repeat(&mf, 0, timeline.REPEAT_FOREVER_TL)
+    timeline.set_reduced(&mf, true)
+    timeline.play(&mf)
+    check(!timeline.advance(&mf, 16) && timeline.finished(&mf), "reduced motion also stops a forever loop")
+
+    // capacity
+    var c: timeline.Timeline = timeline.timeline_new()
+    var added: usize = 0
+    var z: usize = 0
+    while z < 40 {
+        if timeline.seq(&c, 10, 0.0, 1.0, anim.easing_linear()) != timeline.TL_MAX { added = added + 1 }
+        z = z + 1
+    }
+    check(added == 32 && timeline.stagger(&c, 3, 10, 10, 0.0, 1.0, anim.easing_linear()) == timeline.TL_MAX, "32 tracks max; a full stagger adds none")
+
+    // easing is used
+    var e: timeline.Timeline = timeline.timeline_new()
+    timeline.seq(&e, 100, 0.0, 1.0, anim.easing_named(anim.EASE_IN))
+    check(timeline.value_at(&e, 0, 50) < 0.45, "ease-in is slower than linear at half time")
+
+    say("TIMELINE bad=")
+    var bf: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&bf, BAD as u64)
+    rt.write_everything(1, rt.buf_ptr(&bf), rt.buf_len(&bf))
+    rt.buf_free(&bf)
+    say("\n")
+    if BAD > 0 { return 1 }
+    return 0
+}

@@ -30,7 +30,7 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Grid mit Spannen, auto/fr-Spuren im Szenenbaum | **teilweise** | lib/fui/layout.fi (festes cols×rows); r148 | ✓ | ✓ | ✓ | ✓ | ~ | ✓ | ✓ | ✓ | P1 (r148) | 40 Grid-Fälle = Chromium-Referenz, 0 px Abweichung |
 | Stack/Overlay/Z-Ebenen | **vorhanden** | lib/fui/layer.fi; scene.node_set_offset | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | layer-Prüfung in run.sh |
 | Constraints: min/max (da); Seitenverhältnis, min-/max-content (fehlt) | **teilweise** | scene.node_set_bounds; kein aspect (r148) | ✓ | ✓ | ~ | ✓ | ✓ | ✓ | ✓ | ~ | P2 (r148) | aspect/fit-content-Fälle in layout_main |
-| Responsive: Media-/Container-Queries, Breakpoints, Size-Classes | **fehlt** | style.fi nur clamp() für Schrift; r148 | ~ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✗ | P1 (r148) | App schaltet bei 600/900 px Layout um; Test an 3 Breiten |
+| Responsive: Media-/Container-Queries, Breakpoints, Size-Classes | **teilweise** | lib/fui/sizeclass.fi (Größenklassen 600/900 dp, Hysterese, Spalten, Container-Abfrage); sizeclass_main (36 Checks); noch nicht im Szenenbaum verdrahtet (r148) | ~ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✗ | P1 (r148) | App schaltet bei 600/900 px Layout um; Test an 3 Breiten |
 | Scrollen (Rad, Touch-Fling, Overscroll, dünne Leiste) | **vorhanden** | lib/fui/viewport.fi; glide_main (30 Checks) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | glide_main |
 | Scroll-Snap, Pull-to-Refresh, verschachteltes Scrollen | **fehlt** | nicht gefunden | ~ | ✓ | ~ | ✗ | ✓ | ✓ | ✗ | ✗ | P3 | - |
 | Virtuelle Liste/Tabelle/Baum (100k Zeilen) | **teilweise** | lib/fui/vlist.fi + vlistview.fi (Sortierpfeil, Spaltenziehen, Mehrfachauswahl, Typeahead); nicht im Szenenbaum/fui.app (r134, r145) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P0 (r134, r145) | 100k Zeilen in fui.app: Frame ≤ 16 ms |
@@ -51,27 +51,27 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Range-Slider (2 Griffe), NumberBox/Spinbox | **teilweise** | appctl.spinbox da; Range-Slider fehlt (r146) | ~ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ | ~ | P2 (r146) | - |
 | Einzeiliges Textfeld (Auswahl, Undo, Passwort, Secret-Schutz) | **vorhanden** | lib/fui/editor.fi; textbuf.fi; r99/r108 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | editor_main |
 | Mehrzeiliges Textfeld | **teilweise** | lib/fui/textarea.fi (LINES_MAX 2048); r127 (Shift+Klick, bidi-Cursor, >100 KB) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P1 (r127) | textarea_main + 1 MB Text ≤ 16 ms/Frame |
-| Combobox editierbar + Autovervollständigung | **fehlt** | wave2.draw_dropdown nur fest; cmdbar.fi (Befehlsleiste); r146 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P1 (r146) | Tippen filtert 10k Einträge ≤ 16 ms |
+| Combobox editierbar + Autovervollständigung | **teilweise** | lib/fui/combofilter.fi (Filter+Ranking+Highlight+Tastatur, 10k Einträge 5,5 ms Release); combo_main; Zeichnen/Popup im Szenenbaum fehlt (r146) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P1 (r146) | Tippen filtert 10k Einträge ≤ 16 ms |
 | Dropdown/Select | **vorhanden** | appctl.dropdown; wave2.draw_dropdown | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | appctl-Prüfung |
 | Liste einfach (Tastatur Auf/Ab/Enter, Mehrfachauswahl, Umbenennen) | **teilweise** | listrow.fi, wave3.draw_list; vlist hat Tastatur, Szenenbaum nicht (r134) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P0 (r134) | listrow_main: Tastatur + Strg/Umschalt-Auswahl |
 | Tabs/TabBar/Pivot | **vorhanden** | appctl.tabs; kit.tabbar_draw; wave2.draw_tab | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | kit_main |
 | NavigationView/Sidebar (Kollaps, Hamburger) | **teilweise** | kit.nav_* (Seitenleiste); kein Kollaps/Hamburger | ~ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✗ | P2 | kit_main: 3 Breitenstufen |
 | Expander/Accordion | **teilweise** | appctl.expander (einzeln); Gruppe 'nur einer offen' fehlt | ~ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✓ | P2 | - |
-| Splitter (ziehbarer Trenner) | **teilweise** | lib/fuishell/dock.fi split_*; nicht im Szenenbaum/fui.app | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P1 (neu) | Zug/Tastatur/a11y-separator-Test, Mindestgrößen |
+| Splitter (ziehbarer Trenner) | **vorhanden** | lib/fui/splitter.fi; splitter_main, splitnode_main; appctl.split_* | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P1 (neu) | Zug/Tastatur/a11y-separator-Test, Mindestgrößen |
 | Docking (Panels andocken, Layout speichern) | **teilweise** | lib/fuishell/dock.fi (875 Z., JSON-Layout); nicht in fui.app | ✓ | ✓ | ✗ | ✗ | ~ | ✗ | ✗ | ~ | P2 | dock-Layout round-trip Test |
 | Stepper/Wizard, Breadcrumb | **teilweise** | Breadcrumb nur in filedlg.fi; kein Stepper | ~ | ~ | ~ | ✗ | ~ | ✗ | ✗ | ✗ | P3 | - |
-| Rating, Chips/Tags, Carousel/PageView, Segmented, Skeleton/Shimmer | **fehlt** | nicht gefunden; r45 (15 Elemente) | ~ | ✓ | ✓ | ~ | ✓ | ✓ | ~ | ✗ | P2 (r45) | - |
+| Rating, Chips/Tags, Carousel/PageView, Segmented, Skeleton/Shimmer | **vorhanden** | lib/fui/wave5.fi; wave5_main, appw5_main (Carousel/Pager, Segmented, Skeleton) | ~ | ✓ | ✓ | ~ | ✓ | ✓ | ~ | ✗ | P2 (r45) | - |
 | Badge, Avatar, Card/Tile, Kachelraster | **vorhanden** | kit.draw_badge/avatar_draw/grid_*; wave3.draw_card | ~ | ✓ | ✓ | ✗ | ✓ | ✓ | ~ | ✗ | - | kit_main |
 | DatePicker/Calendar | **vorhanden** | wave3.draw_datepicker (Monat/Jahr); kein Bereich | ✓ | ✓ | ✓ | ✓ | ~ | ✓ | ✓ | ~ | - | wave3-Prüfung |
 | TimePicker, Bereichs-Datum | **fehlt** | nicht gefunden; r146 | ✓ | ✓ | ✓ | ~ | ✓ | ✓ | ✓ | ✗ | P2 (r146) | - |
 | ColorPicker (Feld+Regler+Hex) | **vorhanden** | lib/fui/colordlg.fi; wave3.draw_colorpicker | ✓ | ~ | ✓ | ✓ | ~ | ✓ | ✗ | ✓ | - | colordlg_main |
 | TreeView (Tastatur, Drag-Umordnen, Lazy-Load) | **teilweise** | wave3.draw_tree; vlist-Baum; Tastatur/Lazy unbelegt | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P1 (r145) | Baum 100k Knoten lazy ≤ 16 ms |
 | TableView/DataGrid (Sortieren, Spaltenbreite) | **teilweise** | vlist: Sortierpfeil/Spalten ziehen; Zelle bearbeiten, Spalten umordnen, Fixierung fehlen | ✓ | ~ | ✓ | ~ | ~ | ✓ | ✗ | ~ | P1 (r146) | vlist_main + Zell-Edit-Test |
-| Property-Grid/Inspector-Form | **fehlt** | nicht gefunden | ~ | ✗ | ~ | ✗ | ✗ | ✗ | ✗ | ~ | P3 | - |
+| Property-Grid/Inspector-Form | **vorhanden** | lib/fui/wave6.fi; wave6_main, appctl.propgrid | ~ | ✗ | ~ | ✗ | ✗ | ✗ | ✗ | ~ | P3 | - |
 | Toolbar/CommandBar/Menüleiste (mit Überlauf) | **teilweise** | wave2.draw_toolbar/menubar; appctl.menubar; kein Überlauf-Chevron | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P2 | - |
 | Tooltip/Flyout/Popover/TeachingTip | **teilweise** | wave2.tooltip; fuipopup.fi (X11-Toplevel); Flyout/Popover fehlen; r175 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P1 (r175) | Popup ragt über Fensterrand, 3 Backends |
 | Modaler Dialog, Toast, InfoBar | **teilweise** | kit.modal_*/toasts_*; msgdlg.fi; InfoBar fehlt | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P2 | kit_main |
-| Bottom-Sheet/Drawer | **fehlt** | nicht gefunden (sheet.fi = Stilblatt) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P2 | - |
+| Bottom-Sheet/Drawer | **vorhanden** | lib/fui/wave6.fi; appctl.sheet_* | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P2 | - |
 | Markdown-/RichText-Ansicht, QR-Code, Kamera-Vorschau, Syntaxfarben | **vorhanden** | markdownview.fi (2289 Z.), richtext.fi, qrview.fi, camview.fi, syntaxcolor.fi | ~ | ~ | ~ | ✗ | ~ | ~ | ✗ | ~ | - | mdview_main, richtext_main, qrview_main |
 | Editierbarer RichText (WYSIWYG) | **fehlt** | richtext.fi nur Anzeige | ✓ | ~ | ✓ | ~ | ~ | ✓ | ✗ | ✗ | P3 | - |
 | Charts (Linie/Balken/Sparkline) | **fehlt** | nicht gefunden; Basis: Painter+viewport | ✓ | ~ | ~ | ~ | ~ | ✓ | ✗ | ✓ | P2 | Sparkline 1000 Punkte ≤ 1 ms |
@@ -88,7 +88,7 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Variable Fonts (fvar/gvar) + echte Gewichte | **fehlt** | nur Default-Instanz; r141, r192 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✗ | P2 (r141, r192) | Inter wght 400/500/600/700 gegen FreeType ≤ 1 % |
 | Fallback-Kette (Latein → CJK → Symbole → Emoji) im Standard-Setzer | **teilweise** | lib/font/fallback.fi (Gate 135) vorhanden; Painter nutzt sie nicht (r139) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P0 (r139) | Chat mit CJK+Emoji: 0 Kästchen |
 | Farb-Emoji (COLR v0, CBDT) | **teilweise** | lib/font/colr.fi, cbdt.fi; sbix/COLRv1/SVG-OT fehlen; r140 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✗ | P1 (r140) | Emoji-Zeile in Painter = Referenz, Diff ≤ 1 |
-| Zeilenumbruch UAX #14 (CJK, Bindestrich, NBSP, Zahlen) | **fehlt** | painter.run_draw_wrapped bricht nur an Wortgrenzen; lib/str nur grapheme.fi | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ~ | P1 (neu) | LineBreakTest.txt 100 % bestanden |
+| Zeilenumbruch UAX #14 (CJK, Bindestrich, NBSP, Zahlen) | **vorhanden** | lib/str/linebreak.fi; uax14_main 7654/7654 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ~ | P1 (neu) | LineBreakTest.txt 100 % bestanden |
 | Silbentrennung | **fehlt** | nicht gefunden | ✓ | ✓ | ~ | ~ | ✓ | ✓ | ✗ | ✗ | P3 | - |
 | Komplexschrift Arabisch (Formen, Ligaturen) | **teilweise** | lib/font/gsub.fi (Typ 1/4/7); Kontext 5/6 + Mark-Positionierung fehlen (r13) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P2 (r13) | Arabische Referenztexte gegen HarfBuzz |
 | Komplexschrift Indisch, Thai, Khmer, Hebräisch-Niqqud | **fehlt** | nur Arabisch; r13 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P2 | HarfBuzz-Referenz, 20 Texte |
@@ -99,7 +99,7 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Rechtschreibung/Autokorrektur | **fehlt** | nicht gefunden | ~ | ✓ | ✓ | ~ | ✓ | ✓ | ✗ | ✗ | P3 | - |
 | Suche im Text (Strg+F) in Textarea/Markdown | **fehlt** | nur kit.search (Suchfeld) | ✓ | ~ | ✓ | ~ | ~ | ✓ | ✗ | ✗ | P2 | - |
 | Zahlen/Datum/Plural (CLDR) als Bibliothek | **vorhanden** | lib/i18n/human.fi; 8016 Fälle gegen ICU 72 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ~ | - | i18n-Gate |
-| fUi-Standardtexte lokalisierbar (OK/Cancel, Dialoge, Picker) | **teilweise** | feste tr_ok/tr_cancel in appctl/colordlg/filedlg/fontdlg; i18n nur 1x in filedlg | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P1 (neu) | Audit: 0 feste UI-Strings; de/en/ar-Dump |
+| fUi-Standardtexte lokalisierbar (OK/Cancel, Dialoge, Picker) | **teilweise** | lib/fui/uistr.fi: alle 119 tr_-Texte (filedlg/colordlg/fontdlg/msgdlg/appctl) über uistr.t, Deutsch komplett; tools/fui/uistr_audit.py 0 Befunde; Arabisch fehlt | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P1 (neu) | Audit: 0 feste UI-Strings; de/en/ar-Dump |
 
 ### Animation
 
@@ -107,11 +107,11 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | Implizite Übergänge (Hover/Press/Zustand) | **vorhanden** | lib/fui/anim.fi transreg; animbench; Hover ≤ 1 Frame | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | - | animbench_main |
 | Federn, Easing, Fling | **vorhanden** | anim.easing_spring/bezier; viewport | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | - | anim_main |
-| Explizit: Keyframes/Timeline/Sequenz/Stagger | **teilweise** | anim.anim_* (Repeat/Richtung/Delay); keine Timeline (r149) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P1 (r149) | Timeline mit 5 Spuren pixelgenau reproduzierbar |
+| Explizit: Keyframes/Timeline/Sequenz/Stagger | **teilweise** | lib/fui/timeline.fi (seq/par/stagger/repeat/alternate/reverse/speed, reproduzierbar, Reduced-Motion); timeline_main (36 Checks); keine Verdrahtung mit Widgets (r149) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P1 (r149) | Timeline mit 5 Spuren pixelgenau reproduzierbar |
 | Shared-Element/Hero | **fehlt** | nicht gefunden | ✗ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ | ✗ | P2 | - |
 | Seitenübergänge/Navigation-Stack | **fehlt** | r149 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✗ | P2 (r149) | - |
 | Lottie/Vektor-Animation | **fehlt** | uianim.fi nur GIF/WebP | ✓ | ~ | ✓ | ~ | ✓ | ~ | ✗ | ✗ | P3 | - |
-| Reduzierte Bewegung (System) beachten | **fehlt** | nicht gefunden | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | P2 | Schalter → 0 Animationen |
+| Reduzierte Bewegung (System) beachten | **teilweise** | syspref.motion_* (gsettings/SPI/Android-Skala) + anim.transreg_set_reduced + timeline.set_reduced; Host-Leser fehlen | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | P2 | Schalter → 0 Animationen |
 | Frame-Pacing, Idle 0 % CPU | **vorhanden** | lib/fui/pacing.fi; looppump.fi | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | - | animbench_main |
 
 ### Theming
@@ -121,8 +121,8 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Tokens, Hell/Dunkel, Akzent-Ableitung (OKLab) | **vorhanden** | lib/fui/theme.fi; themefile.fi | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | - | themefile_main |
 | Theme-Dateien mit Kontrast-/Füllregel-Prüfung | **vorhanden** | themefile.fi; themelist.fi (6 Themes) | ✗ | ~ | ~ | ~ | ~ | ~ | ~ | ✗ | - | themefile_main |
 | Fluent-Preset (Radien, Dichte, Schatten, Maße) | **vorhanden** | theme.shape_fluent; fluent_main (58 Maße, 0 Abw.) | ~ | ✓ | ✓ | ~ | ✓ | ✓ | ~ | ✗ | - | fluent_main |
-| System-Akzent/Dark-Mode live folgen | **teilweise** | win32.fi ImmersiveColorSet (Dark); Akzent/Linux-Portal/Android fehlen (r150) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P1 (r150) | Systemwechsel → Frame in ≤ 1 s |
-| High-Contrast des OS erkennen (Forced Colors) | **teilweise** | Theme 7:1 da; keine Erkennung (r150) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | P1 (r150) | Windows-Kontrastmodus → Theme gewechselt |
+| System-Akzent/Dark-Mode live folgen | **teilweise** | lib/fui/syspref.fi (Parser+Theme-Anbindung, syspref_main); Host-Leser (DBus/Registry) fehlen (r150) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P1 (r150) | Systemwechsel → Frame in ≤ 1 s |
+| High-Contrast des OS erkennen (Forced Colors) | **teilweise** | lib/fui/syspref.fi hc_from_flags/portal_contrast -> Theme 7:1; Host-Leser fehlen | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | P1 (r150) | Windows-Kontrastmodus → Theme gewechselt |
 | Dichte compact/comfortable | **teilweise** | theme_set_scale, 3 Shapes; kein Dichte-Schalter | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P2 | - |
 | Mica/Acrylic/Blur-Behind | **fehlt** | r151; In-Fenster-Glas effect.fi (~100 ms/Dialog) | ~ | ~ | ✓ | ✗ | ~ | ✓ | ~ | ✗ | P2 (r151) | Blur ≤ 8 ms @1240x720 |
 | Icons (Lucide 93 + SVG) / Fluent-Icons | **teilweise** | icons.fi, lucide.fi; Fluent/Material-Satz fehlt | ✓ | ~ | ✓ | ✓ | ✓ | ✓ | ~ | ✗ | P2 | - |
@@ -151,7 +151,7 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Stift (Druck, Neigung, Radierer) | **teilweise** | pointerType pen; kein Druck | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ~ | P3 | - |
 | Gamepad-/Fokus-Navigation (D-Pad) | **teilweise** | lib/input/pad*.fi (Eingabe), keine fUi-Anbindung | ~ | ~ | ✓ | ~ | ✓ | ✓ | ✗ | ✗ | P2 | Launcher per Controller bedienbar |
 | Drag & Drop: Datei als Ziel | **vorhanden** | x11 XDND; win32 WM_DROPFILES | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | desktop-Tests |
-| Drag & Drop: Quelle/innerhalb der App | **fehlt** | r144 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✓ | P1 (r144) | Ziehen Zeile→Zeile, Text→Feld in 3 Hosts |
+| Drag & Drop: Quelle/innerhalb der App | **teilweise** | lib/fui/dnd.fi (Zustandsmaschine, Effekt-Regeln, Listen-Slot, Rand-Scroll, Tastatur); dnd_main (56 Checks); keine Host-/Szenenanbindung (r144) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ✓ | P1 (r144) | Ziehen Zeile→Zeile, Text→Feld in 3 Hosts |
 | Zwischenablage Text/Bild/Formate (Desktop) | **vorhanden** | window.clipboard_*; X11/Win32; Web webclip.fi | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | desktop-Tests |
 | Zwischenablage OrientOS/Android | **fehlt** | osum.fi:990, android.fi:1652 (interner Fallback) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P1 (neu) | Kopieren in App A, Einfügen in App B (Text+PNG) |
 | Tastaturlayouts, AltGr, Totasten | **teilweise** | x11.fi keymap_*; Totasten unbelegt | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P2 | Test mit de/fr/ru-Layout |
@@ -213,8 +213,8 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Inspector (Element wählen, Stil+Siegerregel, Live-Edit) | **vorhanden** | inspect.fi; query.fi; r97 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | ~ | - | apptree_main |
 | Widget-Tests headless (Pixel, scene_query) | **vorhanden** | tools/fui/*_main.fi (~100); query.fi | ✓ | ✓ | ✓ | ~ | ✓ | ✓ | ✓ | ✓ | - | run.sh |
 | Golden-Bilder/Parität X11-wasm-Wine | **vorhanden** | showcase.sh; tools/fui/golden; parity.sh | ~ | ✓ | ~ | ✗ | ✓ | ✓ | ✓ | ~ | - | showcase.sh |
-| Test-Recorder/Replay, Treiber für fremde Apps | **fehlt** | r159 | ✓ | ✓ | ✓ | ~ | ✓ | ✓ | ✓ | ~ | P1 (r159) | Aufzeichnung läuft 10× identisch ab |
-| Fuzz/Soak (Zufallsereignisse, Zufallsbäume) | **fehlt** | tools/fui ohne soak/fuzz (lib/layout, lib/css haben) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | P1 (neu) | 10^6 Ereignisse + 10^4 Bäume: 0 Absturz/OOB |
+| Test-Recorder/Replay, Treiber für fremde Apps | **vorhanden** | lib/fui/recorder.fi; recorder_main, rechook_main | ✓ | ✓ | ✓ | ~ | ✓ | ✓ | ✓ | ~ | P1 (r159) | Aufzeichnung läuft 10× identisch ab |
+| Fuzz/Soak (Zufallsereignisse, Zufallsbäume) | **vorhanden** | tools/fui/fuzz_main.fi (W-Fuzz) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | P1 (neu) | 10^6 Ereignisse + 10^4 Bäume: 0 Absturz/OOB |
 | Doku: API-Referenz, Rezeptbuch, Tutorials | **teilweise** | docs/fui-quickstart.md (217 Z.), fui-kit.md, APP-TREE.md; r160 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P1 (r160) | Jede pub fn mit Doku; 5 Rezepte laufen |
 | Beispiele/Galerie/Demo-Apps | **vorhanden** | examples/fui (7), fui_controls, gallery1-10, codehub | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | - | run.sh |
 | Perf-Gate + Baseline | **vorhanden** | perfgate.py; perfbench; perf_baseline.json | ~ | ✓ | ~ | ✗ | ✓ | ✓ | ✗ | ✗ | - | perfgate |
@@ -310,3 +310,18 @@ Konfliktregel: `painter.fi` gehört B, `scene.fi`/`app.fi` gehören A, `window/*
 * fUi-Status per grep/Dateilesen; **keine Testläufe wiederholt**. „vorhanden“ heißt: Code + Prüfprogramm existieren, nicht „heute grün“ (bekannte Altfehler: r48, r194).
 * Tree-/Tabellen-Fähigkeiten von `vlist.fi` (Tastatur, Lazy-Load) sind im Code nur teils belegt — Zeile „TreeView“ ist deshalb „teilweise“.
 * Das Layout „absolute Positionierung“ wurde nicht einzeln geprüft (nur `node_set_offset`, `layer.fi`).
+
+
+## Nachtrag 18.10.2026 (W26-d): Priorität-1-Zeilen
+
+Neu in main (alles reine Modelle mit Prüfprogramm in `tools/fui/run.sh`, Gerüst für die Szenenbaum-Anbindung folgt):
+
+* **#5 Responsive** `lib/fui/sizeclass.fi`, `sizeclass_main` (Klassen compact/medium/expanded bei 600/900 dp, Hysterese 16 dp, Höhenklassen, `columns`, Container-Abfragen).
+* **#21 Combobox** `lib/fui/combofilter.fi`, `combo_main` (Rangfolge exakt > Präfix > Wortanfang > Teilstring > Teilfolge, Highlight-Maske, Pfeil/Page/Home/End, Enter/Esc; 10 000 Einträge: 5,5 ms Release-Build, 30 ms Dev-Build).
+* **#67 Timeline** `lib/fui/timeline.fi`, `timeline_main` (Tracks, seq/par/at/stagger, Wiederholen/Pingpong, Rückwärts, Tempo ohne Drift, Reduced-Motion springt ans Ende; 16-ms- und 1-ms-Schritte liefern bitgleiche Werte).
+* **#96 Drag & Drop in der App** `lib/fui/dnd.fi`, `dnd_main` (Schwelle 4/10 px, Effekt Move/Copy/Link mit Strg/Umschalt/Alt, Listen-/Baum-Einfügeslot, Rand-Scroll, Tastaturweg).
+* **#64 Standardtexte** `lib/fui/uistr.fi` + `tools/fui/uistr_audit.py`: 119 Schlüssel, Deutsch komplett, Englisch unverändert (alle Dialog-Goldens/Läufe grün).
+* **#71 Reduzierte Bewegung**: `syspref.motion_*`, `anim.transreg_set_reduced`.
+* Veraltete Zeilen nachgezogen: UAX #14, Fuzz, Recorder, Splitter, wave5/6, Syspref (Stand W25).
+
+**Offen:** Verdrahtung in Szenenbaum/`fui.app` (Grid-Spuren r148, Combobox-Popup r146, Timeline-Widgets r149, DnD-Hosts r144), Host-Leser für System-Einstellungen, Arabisch in `uistr`.

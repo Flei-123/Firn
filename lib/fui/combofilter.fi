@@ -1,0 +1,348 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/combofilter.fi -- EDITABLE COMBOBOX / AUTOCOMPLETE: the filter, the ranking, the list state
+// (gap list #21, r146).
+//
+// A combobox you can type into shows a list that shrinks while you type. This file is the part that is not
+// pixels: WHICH entries match, in WHICH order, which letters to highlight, and what the arrow keys do. A host
+// draws the field and the popup; the model is the same everywhere (and runs in a kernel program: no heap).
+//
+//     // entries: one text pool + n+1 u32 offsets (entry i = pool[offs[i] .. offs[i+1]]), UTF-8
+//     let k: usize = combofilter.filter(pool, offs, n, query_ptr, query_len, out_idx, 64)   // best 64 -> out_idx (u32 array)
+//     var st: combofilter.ComboState = combofilter.state_new(8)         // 8 rows visible
+//     combofilter.set_results(&st, k)
+//     combofilter.key_down(&st) / key_up / page_down / page_up / key_home / key_end
+//     let row: i64 = combofilter.accept(&st)                            // result row to take, -1 = keep the typed text
+//     let m: u64 = combofilter.highlight(pool, offs, idx, q, ql)        // bit i = byte i of the entry is matched (first 64)
+//
+// RANKING (higher first, ties keep the entry order so the list does not shuffle while typing):
+//   exact 5000  >  prefix 4000 - len  >  word prefix 3000 - pos  >  substring 2000 - pos  >  subsequence 1000 - span.
+// ASCII letters compare case-insensitively; every other byte (UTF-8 sequences) compares exactly. An empty query
+// matches everything in the original order. The filter is one pass over the pool and keeps the best `cap`
+// (<= 256) in a small sorted array: 10 000 entries are far under a frame.
+//
+// KEYS: Down from "typed text" (-1) enters row 0; Down at the last row wraps to the typed text; Up at the typed text
+// goes to the last row (a ring, like the editable ComboBox of WinUI/Qt). PageUp/PageDown move a page and stop at the
+// ends. Home/End (with the list open) go to the first/last row. `accept` closes the list. Esc: `dismiss` returns
+// true when it closed an open list (the app swallows that Esc), false otherwise (the app handles it).
+//
+// A11Y (WAI-ARIA combobox): role combobox, aria-expanded = `is_open`, aria-activedescendant = `active_row`
+// (-1 = none), aria-autocomplete = list. `announce_count` is the number to speak ("5 results").
+export {
+    filter, score, highlight, is_prefix_match, ComboState, state_new, set_results, open, close, is_open,
+    key_down, key_up, page_down, page_up, key_home, key_end, accept, dismiss, active_row, top_row, visible_rows,
+    announce_count, row_visible, ensure_visible, MAX_RESULTS,
+}
+
+const MAX_RESULTS: usize = 256
+
+fn lc(b: u64) -> u64 {
+    if b >= 65 && b <= 90 { return b + 32 }
+    return b
+}
+
+fn rd32(p: u64) -> u64 { return (*(p as *mut u32)) as u64 }
+
+fn byte(p: u64, i: u64) -> u64 { return (*((p + i) as *mut u8)) as u64 }
+
+fn is_sep(b: u64) -> bool {
+    return b == 32 || b == 45 || b == 95 || b == 47 || b == 46 || b == 58 || b == 44
+}
+
+// Does the query sit at position `at` of the entry [s, s+len)?
+fn match_at(pool: u64, s: u64, len: u64, at: u64, q: u64, ql: u64) -> bool {
+    if at + ql > len { return false }
+    var i: u64 = 0
+    while i < ql {
+        if lc(byte(pool, s + at + i)) != lc(byte(q, i)) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// The score of one entry for the query, or -1 when it does not match. `ql` = 0 matches everything with 0.
+fn score(pool: u64, s: u64, len: u64, q: u64, ql: u64) -> i64 {
+    if ql == 0 { return 0 }
+    if ql > len { return 0 - 1 }
+    if match_at(pool, s, len, 0, q, ql) {
+        if ql == len { return 5000 }
+        var l: i64 = len as i64
+        if l > 999 { l = 999 }
+        return 4000 - l
+    }
+    // substring: first position; a hit right after a separator is a "word prefix"
+    var pos: u64 = 1
+    while pos + ql <= len {
+        if match_at(pool, s, len, pos, q, ql) {
+            var p: i64 = pos as i64
+            if p > 900 { p = 900 }
+            if is_sep(byte(pool, s + pos - 1)) { return 3000 - p }
+            // a later word-prefix hit beats this plain substring hit
+            var w: u64 = pos + 1
+            while w + ql <= len {
+                if is_sep(byte(pool, s + w - 1)) && match_at(pool, s, len, w, q, ql) {
+                    var pw: i64 = w as i64
+                    if pw > 900 { pw = 900 }
+                    return 3000 - pw
+                }
+                w = w + 1
+            }
+            return 2000 - p
+        }
+        pos = pos + 1
+    }
+    // subsequence, greedy from the left
+    var qi: u64 = 0
+    var first: u64 = 0
+    var last: u64 = 0
+    var i: u64 = 0
+    while i < len && qi < ql {
+        if lc(byte(pool, s + i)) == lc(byte(q, qi)) {
+            if qi == 0 { first = i }
+            last = i
+            qi = qi + 1
+        }
+        i = i + 1
+    }
+    if qi < ql { return 0 - 1 }
+    var span: i64 = (last - first) as i64
+    if span > 998 { span = 998 }
+    return 1000 - span
+}
+
+// Filter and rank `n` entries; write the indices of the best `cap` (<= 256) to `out` (a u32 array), return how many.
+fn filter(pool: u64, offs: u64, n: usize, q: u64, ql: u64, out: u64, cap: usize) -> usize {
+    var c: usize = cap
+    if c > MAX_RESULTS { c = MAX_RESULTS }
+    if c == 0 { return 0 }
+    var sc: [i64; 256] = [0; 256]
+    var cnt: usize = 0
+    var i: usize = 0
+    while i < n {
+        let s: u64 = rd32(offs + (i as u64) * 4)
+        let e: u64 = rd32(offs + ((i + 1) as u64) * 4)
+        let v: i64 = score(pool, s, e - s, q, ql)
+        if v >= 0 {
+            // insert behind every entry with a score >= v (stable: an earlier entry wins a tie)
+            var at: usize = cnt
+            while at > 0 && sc[at - 1] < v {
+                at = at - 1
+            }
+            if at < c {
+                var last: usize = cnt
+                if last >= c { last = c - 1 }
+                var m: usize = last
+                while m > at {
+                    sc[m] = sc[m - 1]
+                    *((out + (m as u64) * 4) as *mut u32) = *((out + ((m - 1) as u64) * 4) as *mut u32)
+                    m = m - 1
+                }
+                sc[at] = v
+                *((out + (at as u64) * 4) as *mut u32) = i as u32
+                if cnt < c { cnt = cnt + 1 }
+            }
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// True when entry `idx` starts with the query (the host may then show the rest as grey inline completion).
+fn is_prefix_match(pool: u64, offs: u64, idx: usize, q: u64, ql: u64) -> bool {
+    let s: u64 = rd32(offs + (idx as u64) * 4)
+    let e: u64 = rd32(offs + ((idx + 1) as u64) * 4)
+    return ql > 0 && match_at(pool, s, e - s, 0, q, ql)
+}
+
+// Which bytes of entry `idx` the query matched: bit i set = byte i. Only the first 64 bytes are covered.
+fn highlight(pool: u64, offs: u64, idx: usize, q: u64, ql: u64) -> u64 {
+    if ql == 0 { return 0 }
+    let s: u64 = rd32(offs + (idx as u64) * 4)
+    let e: u64 = rd32(offs + ((idx + 1) as u64) * 4)
+    let len: u64 = e - s
+    var mask: u64 = 0
+    // contiguous hit: prefix, word prefix or substring -- the same one `score` chose
+    var pos: u64 = 0
+    var found: bool = false
+    if match_at(pool, s, len, 0, q, ql) {
+        found = true
+    } else {
+        var p: u64 = 1
+        while p + ql <= len && !found {
+            if is_sep(byte(pool, s + p - 1)) && match_at(pool, s, len, p, q, ql) {
+                pos = p
+                found = true
+            }
+            p = p + 1
+        }
+        p = 1
+        while p + ql <= len && !found {
+            if match_at(pool, s, len, p, q, ql) {
+                pos = p
+                found = true
+            }
+            p = p + 1
+        }
+    }
+    if found {
+        var k: u64 = 0
+        while k < ql {
+            if pos + k < 64 { mask = mask | ((1 as u64) << (pos + k)) }
+            k = k + 1
+        }
+        return mask
+    }
+    // subsequence
+    var qi: u64 = 0
+    var i: u64 = 0
+    while i < len && qi < ql {
+        if lc(byte(pool, s + i)) == lc(byte(q, qi)) {
+            if i < 64 { mask = mask | ((1 as u64) << i) }
+            qi = qi + 1
+        }
+        i = i + 1
+    }
+    if qi < ql { return 0 }
+    return mask
+}
+
+// ------------------------------------------------------------------ list state
+
+struct ComboState {
+    n: i64, // results
+    sel: i64, // selected row, -1 = the typed text
+    top: i64, // first visible row
+    rows: i64, // rows visible at once
+    open: u32,
+}
+
+fn state_new(rows: i64) -> ComboState {
+    var r: i64 = rows
+    if r < 1 { r = 1 }
+    return ComboState { n: 0, sel: 0 - 1, top: 0, rows: r, open: 0 as u32 }
+}
+
+fn is_open(s: *mut ComboState) -> bool { return (*s).open != 0 as u32 }
+fn active_row(s: *mut ComboState) -> i64 { return (*s).sel }
+fn top_row(s: *mut ComboState) -> i64 { return (*s).top }
+fn visible_rows(s: *mut ComboState) -> i64 { return (*s).rows }
+fn announce_count(s: *mut ComboState) -> i64 { return (*s).n }
+
+fn row_visible(s: *mut ComboState, r: i64) -> bool {
+    return r >= (*s).top && r < (*s).top + (*s).rows
+}
+
+fn open(s: *mut ComboState) {
+    if (*s).n > 0 { (*s).open = 1 as u32 }
+}
+
+fn close(s: *mut ComboState) {
+    (*s).open = 0 as u32
+    (*s).sel = 0 - 1
+    (*s).top = 0
+}
+
+// New results after the text changed: the selection goes back to the typed text; the list opens when there is
+// something to show, and closes when there is not.
+fn set_results(s: *mut ComboState, n: usize) {
+    (*s).n = n as i64
+    (*s).sel = 0 - 1
+    (*s).top = 0
+    if n > 0 {
+        (*s).open = 1 as u32
+    } else {
+        (*s).open = 0 as u32
+    }
+}
+
+fn ensure_visible(s: *mut ComboState) {
+    if (*s).sel < 0 {
+        (*s).top = 0
+        return
+    }
+    if (*s).sel < (*s).top { (*s).top = (*s).sel }
+    if (*s).sel >= (*s).top + (*s).rows { (*s).top = (*s).sel - (*s).rows + 1 }
+    var maxtop: i64 = (*s).n - (*s).rows
+    if maxtop < 0 { maxtop = 0 }
+    if (*s).top > maxtop { (*s).top = maxtop }
+    if (*s).top < 0 { (*s).top = 0 }
+}
+
+fn key_down(s: *mut ComboState) {
+    if (*s).open == 0 as u32 {
+        open(s)
+        return
+    }
+    if (*s).n == 0 { return }
+    if (*s).sel + 1 >= (*s).n {
+        (*s).sel = 0 - 1
+    } else {
+        (*s).sel = (*s).sel + 1
+    }
+    ensure_visible(s)
+}
+
+fn key_up(s: *mut ComboState) {
+    if (*s).open == 0 as u32 {
+        open(s)
+        if (*s).open != 0 as u32 && (*s).n > 0 {
+            (*s).sel = (*s).n - 1
+            ensure_visible(s)
+        }
+        return
+    }
+    if (*s).n == 0 { return }
+    if (*s).sel < 0 {
+        (*s).sel = (*s).n - 1
+    } else {
+        (*s).sel = (*s).sel - 1
+    }
+    ensure_visible(s)
+}
+
+fn page_down(s: *mut ComboState) {
+    if (*s).open == 0 as u32 || (*s).n == 0 { return }
+    var r: i64 = (*s).sel + (*s).rows
+    if (*s).sel < 0 { r = (*s).rows - 1 }
+    if r > (*s).n - 1 { r = (*s).n - 1 }
+    (*s).sel = r
+    ensure_visible(s)
+}
+
+fn page_up(s: *mut ComboState) {
+    if (*s).open == 0 as u32 || (*s).n == 0 { return }
+    if (*s).sel < 0 { return }
+    var r: i64 = (*s).sel - (*s).rows
+    if r < 0 { r = 0 }
+    (*s).sel = r
+    ensure_visible(s)
+}
+
+fn key_home(s: *mut ComboState) {
+    if (*s).open == 0 as u32 || (*s).n == 0 { return }
+    (*s).sel = 0
+    ensure_visible(s)
+}
+
+fn key_end(s: *mut ComboState) {
+    if (*s).open == 0 as u32 || (*s).n == 0 { return }
+    (*s).sel = (*s).n - 1
+    ensure_visible(s)
+}
+
+// Enter: the row to take, or -1 when the typed text stays. The list closes either way.
+fn accept(s: *mut ComboState) -> i64 {
+    let r: i64 = (*s).sel
+    var out: i64 = 0 - 1
+    if (*s).open != 0 as u32 && r >= 0 && r < (*s).n { out = r }
+    close(s)
+    return out
+}
+
+// Esc: true when it closed an open list.
+fn dismiss(s: *mut ComboState) -> bool {
+    if (*s).open != 0 as u32 {
+        close(s)
+        return true
+    }
+    return false
+}
