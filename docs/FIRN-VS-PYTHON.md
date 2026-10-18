@@ -180,7 +180,7 @@ Evidence: `examples/vs_python/lang/` (79 probe files `.probe`, output in `PROBES
 | Script mode without build | `python3 x.py`, 25 ms | `firn-run x.fi` / shebang `#!/usr/bin/env firn-run`: warm 2-4 ms, cold 0.5-0.7 s (cache); `firn run x.fi` (driver) | **works** |
 | One command (`run/build/check/test/fmt/new`) | `python -m ...`, `pip` | `tools/firn/firn` (shell prototype, Linux) | partial |
 | REPL | `python` | `firn repl` / `firn eval '6*7'` rebuilds the whole program per input: 0.7 s | prototype |
-| Package manager | pip + PyPI | `firn.package` with `needs NAME ../path [version]`, `--package`, `--lock/--locked` (hash pin), version check. No git URL, fetch, registry, `add`, `update` | partial |
+| Package manager | pip + PyPI | `firn.package` with `needs NAME ../path [version]`, `--package`, `--lock/--locked` (hash pin), version check, `firn add NAME PATH|GITURL [REF]`, `firn fetch`, `firn deps` (git deps cloned into `.firn/deps`, recorded in `firn.deps`). No registry, no `update`, no transitive git fetch | partial |
 | Stdlib found automatically | yes | needs `FIRNLIB` (fix running: G01) | gap |
 | Type inference | yes | `let/var` inferred, generics only with `f[T](..)`, no return-type inference | partial |
 | Short syntax | defaults, kwargs, slices, `in` | none of default args, named args, slices, `in`, negative index | gap |

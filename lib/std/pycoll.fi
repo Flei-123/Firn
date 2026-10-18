@@ -1,0 +1,289 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/pycoll.fi -- Python-style collection helpers on Vec[T] and Dict[V]:
+// a STABLE sort (`sorted(xs, key=..., reverse=...)`), `sorted(d.items())`,
+// `d.values()`, `defaultdict(list)` group-by and `Counter(map(key, xs))`.
+//
+// Usage (the Python `sorted(rows, key=lambda r: -r.sum)` + group-by case):
+//
+//     import std.pycoll
+//     import std.dict
+//     import std.vec
+//
+//     fn region_of(r: *Row) -> str { return (*r).region }
+//     fn sum_of(r: *Row) -> f64 { return (*r).sum }
+//
+//     var groups: Dict[Vec[Row]] = dict_new[Vec[Row]]()
+//     group_by[Row](&rows, region_of, &groups)       // defaultdict(list)
+//     var counts: Dict[i64] = dict_new[i64]()
+//     count_by[Row](&rows, region_of, &counts)       // Counter(r.region for r in rows)
+//     sort_key_f64[Row](&rows, sum_of, true)         // sorted(rows, key=sum, reverse=True)
+//
+// API (all names are bare, generic types cannot be written module-qualified):
+//   sort_stable_by[T](v, less)        stable merge sort with your own `less(a, b)`
+//   sort_key_f64[T](v, key, reverse)  stable, key a fn(*T) -> f64 (NaN keys: unspecified)
+//   sort_key_i64[T](v, key, reverse)  stable, key a fn(*T) -> i64
+//   sort_key_str[T](v, key, reverse)  stable, key a fn(*T) -> str, byte order
+//   dict_items_sorted[V](d, &out)     sorted(d.items()): key bytes ascending
+//   dict_values[V](d, &out)           list(d.values()), insertion order
+//   group_by[T](v, key, &out)         out[key(x)].append(x), first-seen key order
+//   count_by[T](v, key, &out)         out[key(x)] += 1
+//
+// `reverse = true` is Python's `reverse=True`: elements with EQUAL keys keep
+// their original order (it is not "ascending, then reversed").
+// Keys returned by `key` for group_by/count_by are copied into the dict.
+// The Vec in a group_by entry is owned by the dict: free the groups with
+// `groups_free` (Firn has no destructors).
+import std.rt
+import std.vec
+import std.str
+import std.dict
+
+export { sort_stable_by, sort_key_f64, sort_key_i64, sort_key_str,
+    dict_items_sorted, dict_values, group_by, count_by, groups_free }
+
+// Stable bottom-up merge sort: `b` goes first only when `less(b, a)`, so equal
+// elements keep their order.
+fn sort_stable_by[T](v: *mut Vec[T], less: fn(*T, *T) -> bool) {
+    let n: usize = vec_len[T](v)
+    if n < 2 {
+        return
+    }
+    var tmp: Vec[T] = vec_new[T]()
+    var width: usize = 1
+    while width < n {
+        vec_clear[T](&tmp)
+        var lo: usize = 0
+        while lo < n {
+            var mid: usize = lo + width
+            if mid > n { mid = n }
+            var hi: usize = lo + 2 * width
+            if hi > n { hi = n }
+            var a: usize = lo
+            var b: usize = mid
+            while a < mid && b < hi {
+                if less(vec_elem_ptr[T](v, b), vec_elem_ptr[T](v, a)) {
+                    vec_push[T](&tmp, *vec_elem_ptr[T](v, b))
+                    b = b + 1
+                } else {
+                    vec_push[T](&tmp, *vec_elem_ptr[T](v, a))
+                    a = a + 1
+                }
+            }
+            while a < mid {
+                vec_push[T](&tmp, *vec_elem_ptr[T](v, a))
+                a = a + 1
+            }
+            while b < hi {
+                vec_push[T](&tmp, *vec_elem_ptr[T](v, b))
+                b = b + 1
+            }
+            lo = lo + 2 * width
+        }
+        var i: usize = 0
+        while i < n {
+            vec_set[T](v, i, *vec_elem_ptr[T](&tmp, i))
+            i = i + 1
+        }
+        width = width * 2
+    }
+    vec_free[T](&tmp)
+}
+
+// ------------------------------------------------------------- key sorts
+// A key sort sorts (key, original index) pairs with a total order (key, then
+// index), then rewrites the Vec by index.
+struct KeyF { k: f64, i: usize, r: bool }
+struct KeyI { k: i64, i: usize, r: bool }
+struct KeyS { k: str, i: usize, r: bool }
+
+fn key_f_less(a: *KeyF, b: *KeyF) -> bool {
+    if (*a).k != (*b).k {
+        if (*a).r { return (*a).k > (*b).k }
+        return (*a).k < (*b).k
+    }
+    return (*a).i < (*b).i
+}
+
+fn key_i_less(a: *KeyI, b: *KeyI) -> bool {
+    if (*a).k != (*b).k {
+        if (*a).r { return (*a).k > (*b).k }
+        return (*a).k < (*b).k
+    }
+    return (*a).i < (*b).i
+}
+
+fn key_s_less(a: *KeyS, b: *KeyS) -> bool {
+    let c: i32 = str.compare((*a).k, (*b).k)
+    if c != 0 {
+        if (*a).r { return c > 0 }
+        return c < 0
+    }
+    return (*a).i < (*b).i
+}
+
+fn permute[T](v: *mut Vec[T], order: *mut Vec[usize]) {
+    var out: Vec[T] = vec_new[T]()
+    let n: usize = vec_len[usize](order)
+    var i: usize = 0
+    while i < n {
+        vec_push[T](&out, *vec_elem_ptr[T](v, *vec_elem_ptr[usize](order, i)))
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        vec_set[T](v, i, *vec_elem_ptr[T](&out, i))
+        i = i + 1
+    }
+    vec_free[T](&out)
+}
+
+// `v.sort(key=key, reverse=reverse)` with a float key.
+fn sort_key_f64[T](v: *mut Vec[T], key: fn(*T) -> f64, reverse: bool) {
+    let n: usize = vec_len[T](v)
+    if n < 2 {
+        return
+    }
+    var ks: Vec[KeyF] = vec_new[KeyF]()
+    var i: usize = 0
+    while i < n {
+        vec_push[KeyF](&ks, KeyF { k: key(vec_elem_ptr[T](v, i)), i: i, r: reverse })
+        i = i + 1
+    }
+    sort_stable_by[KeyF](&ks, key_f_less)
+    var order: Vec[usize] = vec_new[usize]()
+    i = 0
+    while i < n {
+        vec_push[usize](&order, (*vec_elem_ptr[KeyF](&ks, i)).i)
+        i = i + 1
+    }
+    permute[T](v, &order)
+    vec_free[KeyF](&ks)
+    vec_free[usize](&order)
+}
+
+// The same with an integer key.
+fn sort_key_i64[T](v: *mut Vec[T], key: fn(*T) -> i64, reverse: bool) {
+    let n: usize = vec_len[T](v)
+    if n < 2 {
+        return
+    }
+    var ks: Vec[KeyI] = vec_new[KeyI]()
+    var i: usize = 0
+    while i < n {
+        vec_push[KeyI](&ks, KeyI { k: key(vec_elem_ptr[T](v, i)), i: i, r: reverse })
+        i = i + 1
+    }
+    sort_stable_by[KeyI](&ks, key_i_less)
+    var order: Vec[usize] = vec_new[usize]()
+    i = 0
+    while i < n {
+        vec_push[usize](&order, (*vec_elem_ptr[KeyI](&ks, i)).i)
+        i = i + 1
+    }
+    permute[T](v, &order)
+    vec_free[KeyI](&ks)
+    vec_free[usize](&order)
+}
+
+// The same with a text key (byte order, like Python on UTF-8 `bytes`).
+fn sort_key_str[T](v: *mut Vec[T], key: fn(*T) -> str, reverse: bool) {
+    let n: usize = vec_len[T](v)
+    if n < 2 {
+        return
+    }
+    var ks: Vec[KeyS] = vec_new[KeyS]()
+    var i: usize = 0
+    while i < n {
+        vec_push[KeyS](&ks, KeyS { k: key(vec_elem_ptr[T](v, i)), i: i, r: reverse })
+        i = i + 1
+    }
+    sort_stable_by[KeyS](&ks, key_s_less)
+    var order: Vec[usize] = vec_new[usize]()
+    i = 0
+    while i < n {
+        vec_push[usize](&order, (*vec_elem_ptr[KeyS](&ks, i)).i)
+        i = i + 1
+    }
+    permute[T](v, &order)
+    vec_free[KeyS](&ks)
+    vec_free[usize](&order)
+}
+
+// ------------------------------------------------------------- dict helpers
+
+// `sorted(d.items())`: pairs by key bytes ascending (keys are copied).
+fn dict_items_sorted[V](d: *mut Dict[V], out: *mut Vec[DictItem[V]]) {
+    var tmp: Vec[DictItem[V]] = vec_new[DictItem[V]]()
+    dict_items[V](d, &tmp)
+    sort_key_str_items[V](&tmp)
+    var i: usize = 0
+    let n: usize = vec_len[DictItem[V]](&tmp)
+    while i < n {
+        vec_push[DictItem[V]](out, *vec_elem_ptr[DictItem[V]](&tmp, i))
+        i = i + 1
+    }
+    vec_free[DictItem[V]](&tmp)
+}
+
+// Keys of a Dict are unique, so the order is total; an unstable sort is fine
+// but the stable one costs nothing extra to reuse.
+fn sort_key_str_items[V](v: *mut Vec[DictItem[V]]) {
+    let n: usize = vec_len[DictItem[V]](v)
+    var ks: Vec[KeyS] = vec_new[KeyS]()
+    var i: usize = 0
+    while i < n {
+        vec_push[KeyS](&ks, KeyS { k: (*vec_elem_ptr[DictItem[V]](v, i)).key, i: i, r: false })
+        i = i + 1
+    }
+    sort_stable_by[KeyS](&ks, key_s_less)
+    var order: Vec[usize] = vec_new[usize]()
+    i = 0
+    while i < n {
+        vec_push[usize](&order, (*vec_elem_ptr[KeyS](&ks, i)).i)
+        i = i + 1
+    }
+    permute[DictItem[V]](v, &order)
+    vec_free[KeyS](&ks)
+    vec_free[usize](&order)
+}
+
+// `list(d.values())` in insertion order.
+fn dict_values[V](d: *mut Dict[V], out: *mut Vec[V]) {
+    var i: usize = dict_first[V](d)
+    while i != dict_end[V](d) {
+        vec_push[V](out, *dict_val_ptr_at[V](d, i))
+        i = dict_next[V](d, i + 1)
+    }
+}
+
+// `defaultdict(list)`: out[key(x)].append(x). New keys go to the end.
+fn group_by[T](v: *mut Vec[T], key: fn(*T) -> str, out: *mut Dict[Vec[T]]) {
+    let n: usize = vec_len[T](v)
+    var i: usize = 0
+    while i < n {
+        let p: *mut T = vec_elem_ptr[T](v, i)
+        let g: *mut Vec[T] = dict_ref[Vec[T]](out, key(p), vec_new[T]())
+        vec_push[T](g, *p)
+        i = i + 1
+    }
+}
+
+// `Counter(key(x) for x in v)`: out[key(x)] += 1.
+fn count_by[T](v: *mut Vec[T], key: fn(*T) -> str, out: *mut Dict[i64]) {
+    let n: usize = vec_len[T](v)
+    var i: usize = 0
+    while i < n {
+        dict_inc[i64](out, key(vec_elem_ptr[T](v, i)), 1)
+        i = i + 1
+    }
+}
+
+// Frees every group Vec of a `group_by` result and the dict itself.
+fn groups_free[T](d: *mut Dict[Vec[T]]) {
+    var i: usize = dict_first[Vec[T]](d)
+    while i != dict_end[Vec[T]](d) {
+        vec_free[T](dict_val_ptr_at[Vec[T]](d, i))
+        i = dict_next[Vec[T]](d, i + 1)
+    }
+    dict_free[Vec[T]](d)
+}

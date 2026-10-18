@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/jobs/pmap.fi -- parallel map over FILES with the file text, the Python
+// `pool.map(work, paths)` where `work` opens and reads each file:
+//
+//     import jobs.jobs
+//     import jobs.pmap
+//
+//     fn __thread_work(kind: u64, arg: u64) -> u64 {
+//         if kind == jobs.WORKER_KIND { return jobs.worker_main(arg) }
+//         return 0
+//     }
+//     fn lines_of(path: *str, text: *str, out: *mut u64) { *out = ... }
+//
+//     var pool: jobs.Jobs = jobs.create(3)
+//     var counts: Vec[u64] = vec_new[u64]()
+//     jobs_map_texts[u64](&pool, &paths, lines_of, &counts)  // counts[i] = f(paths[i], text of paths[i])
+//
+// `f(path, text, out)` runs on any thread; `text` is a VIEW of the file bytes
+// (valid only during the call -- copy what you keep, e.g. `text.dup`).
+// A file that cannot be read: `f` is NOT called and its slot stays zeroed.
+// `out` is cleared first and holds one element per path afterwards, in path
+// order. False when memory ran out. All the notes of jobs.fi (J2-J4) apply.
+import std.rt
+import std.vec
+import std.fs
+import jobs.jobs
+
+export { jobs_map_texts }
+
+// The context is 4 words on the heap: f, paths, out base, slot size.
+fn texts_body(ctx: u64, lo: u64, hi: u64) {
+    let f: u64 = rt.ld64(ctx, 0)
+    let paths: u64 = rt.ld64(ctx, 1)
+    let base: u64 = rt.ld64(ctx, 2)
+    let size: u64 = rt.ld64(ctx, 3)
+    let g: fn(u64, u64, u64) = f as fn(u64, u64, u64)
+    var i: u64 = lo
+    while i < hi {
+        let pp: u64 = paths + i * 16
+        var data: rt.Buf = rt.buf_new()
+        let got: usize = fs.read_file(*(pp as *mut str), &data) catch | e | (0 -% 1)
+        if got != (0 -% 1) {
+            var text: str = str { p: rt.buf_data(&data) as *mut u8, n: rt.buf_len(&data) }
+            g(pp, (&text) as u64, base + i * size)
+        }
+        rt.buf_free(&data)
+        i = i + 1
+    }
+}
+
+fn jobs_map_texts[T](j: *mut jobs.Jobs, paths: *mut Vec[str], f: fn(*str, *str, *mut T), out: *mut Vec[T]) -> bool {
+    vec_clear[T](out)
+    let n: usize = vec_len[str](paths)
+    if n == 0 {
+        return true
+    }
+    if !vec_reserve[T](out, n) {
+        return false
+    }
+    rt.mem_set((*out).ptr, 0 as u8, n * size_of[T]())
+    (*out).len = n
+    let cp: u64 = rt.heap_alloc(32)
+    if cp == 0 {
+        return false
+    }
+    rt.st64(cp, 0, f as u64)
+    rt.st64(cp, 1, (*paths).ptr)
+    rt.st64(cp, 2, (*out).ptr)
+    rt.st64(cp, 3, size_of[T]() as u64)
+    jobs.parallel_for(j, 0, n as u64, 1, texts_body, cp)
+    rt.heap_free(cp, 32)
+    return true
+}
