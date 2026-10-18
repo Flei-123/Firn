@@ -243,7 +243,7 @@ fn layout(f: &Func) -> Frame {
     let mut slot = vec![NO_SLOT; n];
     let mut cursor = 0u64;
     for (idx, s) in slot.iter_mut().enumerate() {
-        if ra.reg(idx as Val).is_some() || ra.imm(idx as Val).is_some() {
+        if ra.reg(idx as Val).is_some() || ra.imm(idx as Val).is_some() || ra.freg(idx as Val).is_some() {
             continue;
         }
         // ROUND 91: a `v128` value needs SIXTEEN octets, and it wants them at
@@ -307,7 +307,7 @@ fn layout(f: &Func) -> Frame {
     // in this backend, the slots are addressed from the top of the frame
     // (`size - slot`), and the arguments from the bottom. The gap in between
     // was padding until this round.
-    let saved_bytes = align_up(8 * ra.saved.len() as u64, 16);
+    let saved_bytes = align_up(8 * (ra.saved.len() + ra.fsaved.len()) as u64, 16);
     Frame {
         slot,
         alloca_off,
@@ -411,8 +411,41 @@ pub(crate) fn load_full(e: &mut Emitter, fr: &Frame, r: &str, v: Val) {
         }
         return;
     }
+    // ROUND FREG: a float in a `d` register, read as a bit pattern. For an
+    // `f32` the `w` form zeroes the upper half, like the slot holds it.
+    if let Some((dn, single)) = fr.ra.freg(v) {
+        fp_bits_out(e, r, dn, single);
+        return;
+    }
     let m = at(e, fr, v, 8);
     e.line(&format!("ldr {}, {}", r, m));
+}
+
+/// ROUND FREG -- the bit pattern of a float register into a general register.
+fn fp_bits_out(e: &mut Emitter, r: &str, dn: &str, single: bool) {
+    if single {
+        e.line(&format!("fmov {}, {}", w(r), sreg(dn)));
+    } else {
+        e.line(&format!("fmov {}, {}", r, dn));
+    }
+}
+
+/// ROUND FREG -- a general register into a float register (bit pattern).
+fn fp_bits_in(e: &mut Emitter, dn: &str, r: &str, single: bool) {
+    if single {
+        e.line(&format!("fmov {}, {}", sreg(dn), w(r)));
+    } else {
+        e.line(&format!("fmov {}, {}", dn, r));
+    }
+}
+
+/// ROUND FREG -- the name of a float register at the width of its type.
+fn fname(d: &str, single: bool) -> String {
+    if single {
+        sreg(d)
+    } else {
+        d.to_string()
+    }
 }
 
 /// Loads a value sign/zero extended to `to_bits` (32 or 64) — the counterpart
@@ -433,6 +466,11 @@ fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to_bits: u32)
     }
     if let Some(rr) = fr.ra.reg(v) {
         ext_reg(e, r, rr, ty, to_bits);
+        return;
+    }
+    if let Some((dn, single)) = fr.ra.freg(v) {
+        fp_bits_out(e, r, dn, single);
+        ext_reg(e, r, r, ty, to_bits);
         return;
     }
     if bits >= to_bits {
@@ -614,6 +652,11 @@ fn load_zx(e: &mut Emitter, fr: &Frame, r: &str, v: Val, bits: u32) {
         imm_into(e, r, ((c as u64) & m) as i64);
         return;
     }
+    if let Some((dn, single)) = fr.ra.freg(v) {
+        fp_bits_out(e, r, dn, single);
+        zx_between(e, r, r, bits);
+        return;
+    }
     if let Some(rr) = fr.ra.reg(v) {
         match bits {
             8 => e.line(&format!("uxtb {}, {}", w(r), w(rr))),
@@ -656,12 +699,23 @@ pub(crate) fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
         }
         return;
     }
+    if let Some((dn, single)) = fr.ra.freg(d) {
+        fp_bits_in(e, dn, r, single);
+        return;
+    }
     let m = at(e, fr, d, 8);
     e.line(&format!("str {}, {}", r, m));
 }
 
 /// A floating point value out of its slot into `d0`/`d1` (or `s0`/`s1`).
 fn load_fp(e: &mut Emitter, fr: &Frame, x: &str, v: Val, single: bool) {
+    // ROUND FREG: already in a `d` register -- one `fmov`, or none.
+    if let Some((dn, _)) = fr.ra.freg(v) {
+        if dn != x {
+            e.line(&format!("fmov {}, {}", fname(x, single), fname(dn, single)));
+        }
+        return;
+    }
     if single {
         let m = at(e, fr, v, 4);
         e.line(&format!("ldr {}, {}", sreg(x), m));
@@ -676,12 +730,53 @@ fn load_fp(e: &mut Emitter, fr: &Frame, x: &str, v: Val, single: bool) {
 /// earlier instruction — the same reason `codegen_x86::store_xmm` goes
 /// through `movd eax`.
 fn store_fp(e: &mut Emitter, fr: &Frame, d: Val, x: &str, single: bool) {
+    if let Some((dn, _)) = fr.ra.freg(d) {
+        if dn != x {
+            e.line(&format!("fmov {}, {}", fname(dn, single), fname(x, single)));
+        }
+        return;
+    }
     if single {
         e.line(&format!("fmov {}, {}", w(A), sreg(x)));
         store_dst(e, fr, d, A);
     } else {
         let m = at(e, fr, d, 8);
         e.line(&format!("str {}, {}", x, m));
+    }
+}
+
+/// ROUND FREG -- the float operand AS a register: its own `d` register if it
+/// has one, else it is loaded into `scratch` (`d0`/`d1`). Returns the register.
+fn fsrc(e: &mut Emitter, fr: &Frame, v: Val, scratch: &'static str, single: bool) -> &'static str {
+    if let Some((dn, _)) = fr.ra.freg(v) {
+        return dn;
+    }
+    load_fp(e, fr, scratch, v, single);
+    scratch
+}
+
+/// ROUND FREG -- the register a float result is computed in.
+fn fdst(fr: &Frame, d: Val, scratch: &'static str) -> &'static str {
+    fr.ra.freg(d).map(|x| x.0).unwrap_or(scratch)
+}
+
+/// ROUND FREG -- write back a float result; nothing to do if it was computed
+/// in its own register.
+fn fcommit(e: &mut Emitter, fr: &Frame, d: Val, r: &str, single: bool) {
+    if fr.ra.freg(d).is_none() {
+        store_fp(e, fr, d, r, single);
+    }
+}
+
+/// ROUND FREG -- `d = s` for floats, by the shortest road.
+fn fcopy(e: &mut Emitter, fr: &Frame, d: Val, s: Val, single: bool) {
+    if let Some((dn, _)) = fr.ra.freg(d) {
+        load_fp(e, fr, dn, s, single);
+    } else if let Some((sn, _)) = fr.ra.freg(s) {
+        store_fp(e, fr, d, sn, single);
+    } else {
+        load_full(e, fr, A, s);
+        store_dst(e, fr, d, A);
     }
 }
 
@@ -923,6 +1018,12 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
             e.line(&format!("str {}, {}", r, m));
         }
     }
+    // ROUND FREG: the low halves of the callee-saved float registers in use,
+    // behind the integer ones.
+    for (k, r) in fr.ra.fsaved.iter().enumerate() {
+        let m = at_base(e, "sp", fr.saved_at + 8 * (fr.ra.saved.len() + k) as u64, 8);
+        e.line(&format!("str {}, {}", r, m));
+    }
     // The parameters into their slots. `place_args` is asked with the
     // parameter VALUES, so the caller's rule and the callee's rule are
     // literally the same function.
@@ -1057,6 +1158,10 @@ fn emit_epilogue(e: &mut Emitter, fr: &Frame) {
             let m = at_base(e, "sp", fr.saved_at + 8 * k as u64, 8);
             e.line(&format!("ldr {}, {}", r, m));
         }
+    }
+    for (k, r) in fr.ra.fsaved.iter().enumerate() {
+        let m = at_base(e, "sp", fr.saved_at + 8 * (fr.ra.saved.len() + k) as u64, 8);
+        e.line(&format!("ldr {}, {}", r, m));
     }
     if fr.size > 0 {
         if fr.size <= 4095 {
@@ -1251,13 +1356,9 @@ fn emit_cmp_flags(e: &mut Emitter, fr: &Frame, op: CmpOp, oty: FTy, a: Val, b: V
         // `eq` are all false and `ne` is true -- exactly what
         // IEEE-754 demands, without a single extra instruction.
         let single = oty == FTy::F32;
-        load_fp(e, fr, "d0", a, single);
-        load_fp(e, fr, "d1", b, single);
-        if single {
-            e.line("fcmp s0, s1");
-        } else {
-            e.line("fcmp d0, d1");
-        }
+        let ra = fsrc(e, fr, a, "d0", single);
+        let rb = fsrc(e, fr, b, "d1", single);
+        e.line(&format!("fcmp {}, {}", fname(ra, single), fname(rb, single)));
         return match op {
             CmpOp::Eq => "eq",
             CmpOp::Ne => "ne",
@@ -1342,15 +1443,12 @@ fn emit_inst(
                     return Err(format!("internal error: '!' is not defined for {}", ty.name()));
                 }
                 let single = ty == FTy::F32;
-                load_fp(e, fr, "d0", *a, single);
+                let rs = fsrc(e, fr, *a, "d0", single);
+                let rd = fdst(fr, d, "d0");
                 // Round GAPS: `fsqrt` next to `fneg` (fsqrt.rs).
                 let m = if matches!(op, UnOp::Sqrt) { "fsqrt" } else { "fneg" };
-                if single {
-                    e.line(&format!("{} s0, s0", m));
-                } else {
-                    e.line(&format!("{} d0, d0", m));
-                }
-                store_fp(e, fr, d, "d0", single);
+                e.line(&format!("{} {}, {}", m, fname(rd, single), fname(rs, single)));
+                fcommit(e, fr, d, rd, single);
                 return Ok(());
             }
             if matches!(op, UnOp::Sqrt) {
@@ -1375,17 +1473,13 @@ fn emit_inst(
             let d = i.dst.ok_or("internal error: conversion without target")?;
             if ty.is_float() && from.is_float() {
                 if ty == *from {
-                    load_full(e, fr, A, *src);
-                    store_dst(e, fr, d, A);
+                    fcopy(e, fr, d, *src, ty == FTy::F32);
                     return Ok(());
                 }
-                load_fp(e, fr, "d0", *src, *from == FTy::F32);
-                if ty == FTy::F64 {
-                    e.line("fcvt d0, s0");
-                } else {
-                    e.line("fcvt s0, d0");
-                }
-                store_fp(e, fr, d, "d0", ty == FTy::F32);
+                let rs = fsrc(e, fr, *src, "d0", *from == FTy::F32);
+                let rd = fdst(fr, d, "d0");
+                e.line(&format!("fcvt {}, {}", fname(rd, ty == FTy::F32), fname(rs, *from == FTy::F32)));
+                fcommit(e, fr, d, rd, ty == FTy::F32);
                 return Ok(());
             }
             if ty.is_float() {
@@ -1394,12 +1488,9 @@ fn emit_inst(
                 // `cvtsi2sd` does on x86, including its reservation about
                 // unsigned values above 2^63 (SPEC §14.1.f64).
                 load_ext(e, fr, A, *src, *from, 64);
-                if ty == FTy::F32 {
-                    e.line(&format!("scvtf s0, {}", A));
-                } else {
-                    e.line(&format!("scvtf d0, {}", A));
-                }
-                store_fp(e, fr, d, "d0", ty == FTy::F32);
+                let rd = fdst(fr, d, "d0");
+                e.line(&format!("scvtf {}, {}", fname(rd, ty == FTy::F32), A));
+                fcommit(e, fr, d, rd, ty == FTy::F32);
                 return Ok(());
             }
             if from.is_float() {
@@ -1410,13 +1501,10 @@ fn emit_inst(
                 // while `cvttsd2si` yields 0x8000000000000000 for every case
                 // it cannot represent. Both are outside what the language
                 // defines; docs/ROUND80.md names it.
-                load_fp(e, fr, "d0", *src, *from == FTy::F32);
-                if *from == FTy::F32 {
-                    e.line(&format!("fcvtzs {}, s0", A));
-                } else {
-                    e.line(&format!("fcvtzs {}, d0", A));
-                }
-                store_dst(e, fr, d, A);
+                let rs = fsrc(e, fr, *src, "d0", *from == FTy::F32);
+                let rd = dreg(fr, d, A);
+                e.line(&format!("fcvtzs {}, {}", rd, fname(rs, *from == FTy::F32)));
+                commit(e, fr, d, rd);
                 return Ok(());
             }
             if ty == FTy::Bool {
@@ -1476,6 +1564,14 @@ fn emit_inst(
                 }
                 return Ok(());
             }
+            // ROUND FREG: a float with a `d` register is loaded straight into it.
+            if ty.is_float() {
+                if let Some((dn, _)) = fr.ra.freg(d) {
+                    let rb = src(e, fr, *addr, B);
+                    e.line(&format!("ldr {}, [{}]", fname(dn, ty == FTy::F32), rb));
+                    return Ok(());
+                }
+            }
             let rb = src(e, fr, *addr, B);
             let rd = dreg(fr, d, A);
             match bits {
@@ -1497,6 +1593,13 @@ fn emit_inst(
             if let Some((cr, _ct)) = fr.ra.cell(*addr) {
                 load_full(e, fr, cr, *val);
                 return Ok(());
+            }
+            if ty.is_float() {
+                if let Some((vn, _)) = fr.ra.freg(*val) {
+                    let rb = src(e, fr, *addr, B);
+                    e.line(&format!("str {}, [{}]", fname(vn, ty == FTy::F32), rb));
+                    return Ok(());
+                }
             }
             let rb = src(e, fr, *addr, B);
             let rv = src(e, fr, *val, A);
@@ -1599,6 +1702,10 @@ fn emit_inst(
             // Round BILLIG: ONE `mov` when the target has a register --
             // `phi.rs` turns every phi into copies, so this is the single
             // most frequent instruction in a loop.
+            if ty.is_float() {
+                fcopy(e, fr, d, *src, ty == FTy::F32);
+                return Ok(());
+            }
             if let Some(dr) = fr.ra.reg(d) {
                 load_full(e, fr, dr, *src);
                 return Ok(());
@@ -2162,14 +2269,11 @@ fn emit_bin(
             }
         };
         let single = ty == FTy::F32;
-        load_fp(e, fr, "d0", a, single);
-        load_fp(e, fr, "d1", b, single);
-        if single {
-            e.line(&format!("{} s0, s0, s1", m));
-        } else {
-            e.line(&format!("{} d0, d0, d1", m));
-        }
-        store_fp(e, fr, d, "d0", single);
+        let ra = fsrc(e, fr, a, "d0", single);
+        let rb = fsrc(e, fr, b, "d1", single);
+        let rd = fdst(fr, d, "d0");
+        e.line(&format!("{} {}, {}, {}", m, fname(rd, single), fname(ra, single), fname(rb, single)));
+        fcommit(e, fr, d, rd, single);
         return Ok(());
     }
     match op {
