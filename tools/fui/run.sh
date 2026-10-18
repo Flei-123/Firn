@@ -875,6 +875,9 @@ build wave8
 # W42-c: wave 12 models + pixels (calendar day / range, navigation view, tree view), light + dark + RTL
 build wave12
 "$W/wave12" | tail -n 3 | grep -q "WAVE12 PASSED"
+# W44-b: wave 13 (flyout, teaching tip): placement/flip, keys, hit = geometry, pixels, light + dark + RTL
+build wave13
+"$W/wave13" | tail -n 3 | grep -q "WAVE13 PASSED"
 python3 tools/fui/uistr_audit.py
 build touch
 "$W/touch" | tail -n 3
