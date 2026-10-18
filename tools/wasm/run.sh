@@ -85,12 +85,25 @@ one() {
         printf 'REFUSED\t%s\tskipped -- %s\n' "$f" "$skip" > "$W/res/$id"
         return
     fi
+    # r736 (test.sh): a file with `#[test]` functions and NO `fn main` is a testkit file for
+    # `firnc --test`; there is no program to build and compare. Counted as skipped, not as a failure.
+    if grep -q '^#\[test\]' "$f" && ! grep -q '^fn main' "$f"; then
+        printf 'REFUSED\t%s\tskipped -- #[test] testkit file without fn main (run by test.sh via firnc --test)\n' "$f" > "$W/res/$id"
+        return
+    fi
     for lvl in $LEVELS; do
         flags="--opt-level=$lvl"
         [ "$lvl" = "dev" ] && flags="--no-opt"
         # ROUND 72 (test.sh): these programs exist to show release-fast
         # wrapping; every other level panics on purpose.
         if [ "$lvl" != "release-fast" ] && head -5 "$f" | grep -q '^// only_mode: opt$'; then
+            continue
+        fi
+        # `// not_mode: opt` (test.sh r724): the program proves a run-time check (panic) and has no
+        # meaning in release-fast, where nothing is checked. Natively an out-of-bounds read there is a
+        # SEGV (exit 139); in the wasm linear memory it is harmless (exit 0) -- an expected divergence
+        # that exists only because release-fast has no bounds checks, so the level is skipped.
+        if [ "$lvl" = "release-fast" ] && head -5 "$f" | grep -q '^// not_mode: opt$'; then
             continue
         fi
         if ! timeout 300 "$FIRNC" $flags -o "$base.$lvl.nat" "$f" > "$base.$lvl.ncomp" 2>&1; then
@@ -207,6 +220,8 @@ for f in $(grep '^SAME' "$W/results.tsv" | cut -f2); do
     n=$((n + 1))
     timeout "$RUN_TIMEOUT" node --stack-size=7800 tools/wasm/run.mjs "$W/$id.disp.wasm" < /dev/null > "$W/$id.dout" 2> "$W/$id.derr"
     rc=$?
+    # `// wasm_nostderr:` (as in step 1): stderr is timing-dependent for this program, do not compare it
+    if head -5 "$f" | grep -q '^// wasm_nostderr:'; then cp "$W/$id.$lvl.nerr" "$W/$id.derr" 2>/dev/null; fi
     if [ "$rc" = "$(cat "$W/$id.$lvl.nrc" 2>/dev/null)" ] && cmp -s "$W/$id.dout" "$W/$id.$lvl.nout" \
         && cmp -s "$W/$id.derr" "$W/$id.$lvl.nerr"; then
         ok=$((ok + 1))
