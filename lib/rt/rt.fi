@@ -98,11 +98,12 @@ fn pages_on(n: usize) -> usize {
 // list that is full gives its block back.
 //
 // WHAT STAYS AS IT WAS. A block is page aligned and zero initialized over
-// its WHOLE rounded size: a block that comes out of the cache is wiped
-// again (a word per step) -- the kernel's zero page was free, this is not,
-// but it costs a fraction of the mapping and the fault it saves. `heap_free`
-// has to get the size it was given at `heap_alloc` (it always had to: the
-// kernel's `munmap` needs it).
+// its WHOLE rounded size: a block is wiped when it is put on a list (only
+// over the `n` octets the caller can have written, rounded up to 64), so a
+// block that comes out of the cache is zero again except for the list link,
+// which `heap_alloc` clears. `heap_free` has to get the size it was given at
+// `heap_alloc` (it always had to: the kernel's `munmap` needs it, and now the
+// wipe needs it too).
 //
 // THE LIMIT. At most `CACHE_CLASS_BYTES` per size are held, so at most
 // `CACHE_PAGES * CACHE_CLASS_BYTES` (4 MiB) in all; the rest goes back to the
@@ -177,7 +178,9 @@ fn heap_alloc(n: usize) -> u64 {
             cache_head[k] = *(b as *mut u64)
             cache_count[k] = cache_count[k] - 1
             cache_release()
-            wipe(b, len)
+            // a cached block is already zero (wiped by `heap_free`) except for
+            // the list link in its first word
+            *(b as *mut u64) = 0
             return b
         }
         cache_release()
@@ -202,6 +205,14 @@ fn heap_free(p: u64, n: usize) {
     let k: usize = len / PAGE
     if k <= CACHE_PAGES && cache_try() {
         if cache_count[k] < (CACHE_CLASS_BYTES / len) as u64 {
+            // The caller can only have written the `n` octets it asked for, so
+            // only those (rounded up to 64) are wiped, not the whole page: a
+            // 64 octet buffer used to cost a 4 KiB wipe per allocation.
+            var dirty: usize = (n + 63) / 64 * 64
+            if dirty > len {
+                dirty = len
+            }
+            wipe(p, dirty)
             *(p as *mut u64) = cache_head[k]
             cache_head[k] = p
             cache_count[k] = cache_count[k] + 1
@@ -437,22 +448,35 @@ fn buf_push_bytes(b: *mut Buf, p: u64, n: usize) {
 // ---------------------------------------------------------- Number -> text
 
 fn buf_push_dec_u64(b: *mut Buf, v: u64) {
-    if v == 0 {
-        buf_push(b, 48 as u8)
+    if v < 10 {
+        buf_push(b, v as u8 + 48 as u8)
         return
     }
-    var d: [u8; 20] = [0 as u8; 20]
-    var n: usize = 0
+    // number of digits (v >= 10 here, at most 20): compare against powers of ten
+    var nd: usize = 2
+    var lim: u64 = 100
+    while nd < 19 && v >= lim {
+        lim = lim *% 10
+        nd = nd + 1
+    }
+    if nd == 19 && v >= lim {
+        nd = 20
+    }
+    buf_reserve(b, (*b).len + nd)
+    if (*b).len + nd > (*b).cap {
+        return
+    }
+    // the digits go straight into the buffer, last one first
+    let base: u64 = (*b).ptr +% (*b).len as u64
     var x: u64 = v
-    while x > 0 {
-        d[n] = (x % 10) as u8 + 48 as u8
-        x = x / 10
-        n = n + 1
+    var i: usize = nd
+    while i > 0 {
+        i = i -% 1
+        let q: u64 = x / 10
+        *((base +% i as u64) as *mut u8) = (((x -% (q *% 10)) +% 48) & 255) as u8
+        x = q
     }
-    while n > 0 {
-        n = n - 1
-        buf_push(b, d[n])
-    }
+    (*b).len = (*b).len + nd
 }
 
 fn buf_push_dec_i64(b: *mut Buf, v: i64) {
