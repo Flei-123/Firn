@@ -646,9 +646,9 @@ impl<'a> Parser<'a> {
             p.mk(esp, ExprKind::Cast(Box::new(e), TypeExpr::Named("i64".to_string(), esp)))
         };
         if let Some(st) = step {
-            // an omitted bound is `i64::MIN` (resolved by the sign of the step)
-            let a = bound(self, lo, i64::MIN as i128);
-            let b = bound(self, hi, i64::MIN as i128);
+            // an omitted bound is `i64::MAX - 1` (resolved by the sign of the step)
+            let a = bound(self, lo, i64::MAX as i128 - 1);
+            let b = bound(self, hi, i64::MAX as i128 - 1);
             let c = bound(self, st, 1);
             return self.mk(
                 sp,

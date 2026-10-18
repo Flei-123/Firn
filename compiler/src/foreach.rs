@@ -474,7 +474,7 @@ pub(crate) fn lower_vec_sugar(
         None => return lo.ice(span, "slice: element type not recorded by the type check"),
     };
     let esz = lo.constant(FTy::U64, esz0 as i128);
-    let omit = lo.constant(FTy::I64, i64::MIN as i128);
+    let omit = lo.constant(FTy::I64, i64::MAX as i128 - 1);
     if kind == VecSugar::Assign {
         let baddr = match &bt {
             Type::Ptr { .. } => lo.lower_expr(recv)?,
