@@ -189,7 +189,7 @@ sleep 2; tap $MIC_X $FIELD_Y 1
 for _ in $(seq 15); do grep -q '/api/stt' "$SLOG" && break; sleep 1; done
 check "recording uploaded as audio/wav to /api/stt" "$(grep -c '"path": "/api/stt?lang=de", "ctype": "audio/wav"' "$SLOG")" 1
 check "transcription lands in the input line" "$(wait_ocr 5_heard 'audio')" 1
-tap $VOICE_X $VOICE_Y 2; shot 6_voice; check "voice switch shows 'Voice on'" "$(ocr_crop 6_voice 520 330 800 450 | grep -ci 'oice on')" 1
+tap_word "Voice" 1 2; shot 6_voice; check "voice switch shows 'Voice on'" "$(ocr_crop 6_voice 330 320 660 440 | grep -ci 'oice on')" 1 # same word tap + crop as jarvis_e2e.sh (the A21 design moved the chip row; the old fixed pixels hit nothing)
 check "app alive after mic + voice" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
 
 check "no crash in logcat" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
