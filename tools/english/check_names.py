@@ -42,7 +42,7 @@ TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
 # tools/layout/cases/br_flex_basis_percent.expected seither als deutschen
 # Pfad gemeldet und check.sh gab 0 0 0 1 0 statt fuenf Nullen. Derselbe
 # Grund, dieselbe Antwort: das englische Wort der Spezifikation.
-ERLAUBT = {'kernel', 'start', 'core', 'min', 'max', 'lib', 'bin', 'src',
+ERLAUBT = {'lang', 'kernel', 'start', 'core', 'min', 'max', 'lib', 'bin', 'src',
            'demos', 'app', 'pause', 'linker', 'mess', 'basis',
            # ROUND SPEED: `.gitattributes` is a file name git prescribes, and
            # the English word "attributes" contains the German morpheme

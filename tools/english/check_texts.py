@@ -137,7 +137,9 @@ def main():
     de = basis_woerter() - englische_spalte() - ENGLISCH - ausnahmen()
     treffer = []
     for f in quelldateien():
-            if os.path.islink(f) or f.endswith('gctext.fi'):
+            # r757: lib/fui/uistr.fi is the German locale table on purpose;
+            # "msgdlg.question" is a key, not prose.
+            if os.path.islink(f) or f.endswith(('gctext.fi', 'lib/fui/uistr.fi')):
                 continue
             if not (f.endswith('.rs') or f.endswith('.fi')):
                 continue
