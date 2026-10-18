@@ -113,6 +113,11 @@ translucent table. Default (no env) is unchanged. Exit line: `mcplay: models sta
 (four-colour texture; swapped / mirrored UV or reversed quad winding give 12-100 % mismatch, the correct code ~1.6 % = edges). Quad winding (CCW from outside) and UV orientation of
 `raster_draw_models` are correct as they are. Gate stage `bash tools/mc/run.sh modelplay` (`tools/mc/play/run_models.sh`: own fixture pack, flat 1.20.1 server, A models / B default / C after T reload).
 NOT done: mc_stream path (r236), GL / VK, biome tint, AO, translucency, comparison with real Vanilla (r233).
+**Default + r244:** `MCPLAY_MODELS` unset = auto: models are on exactly when resource packs are loaded (`MC_PACKS` / `MC_PACK_CONFIG` / `MC_PACK_AUTO`), the back end is the CPU raster and LOD is off;
+without packs (Vanilla look) nothing changes (no ModelSet, same code path, same picture). `MCPLAY_MODELS=0` = off (full cubes), `=1` = forced (warns when packs / CPU back end are missing). A pack without
+blockstates / models for the visible blocks gives the picture of the cube path (gate run H vs B, 0 px). r244: the 1-level grass difference "stream vs inline" is NOT a stream bug: runs differ in TWO reproducible picture states (~19300 px by +-1 level on the grass of the chunk with the stairs, ~330 single pixels > 2 levels), the same
+path falls into either one (inline vs inline differs the same way; stream D == inline A2 in other runs). Cause of the bimodality (a timing dependent mesh input, probably light pad / quad split) is not found: roadmap r246. Gate `run_models.sh`: stairs set on the
+server before the join + `spawnRadius 0` (before: random spawn), cube pairs pixel-exact (B == F, default-without-models H == B), model pairs by pixels > 2 levels with a 0.5 % limit.
 **Pick table for models (r236b, `lib/mc/mc_model_pick.fi`, test 3961):** with `MCPLAY_MODELS=1` mcplay picks through `mp_pick_camera` instead of `mc_input.input_pick`. The voxel walk is the same;
 a MODEL cell (`ms_kind == K_MODEL`, weighted variant by position like the mesher) is hit only where the ray crosses one of its baked quads (2 triangles per quad, both sides, block local),
 so the ray passes through the empty half of a stair / slab / the corners of a plant. Distance = distance to the quad, normal = dominant axis of the quad plane turned toward the ray origin.

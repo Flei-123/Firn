@@ -25,7 +25,7 @@ for t in Xvfb xdotool java python3; do command -v $t >/dev/null || fail "missing
 python3 -I -c "import PIL" 2>/dev/null || fail "missing python module: PIL"
 $FIRNC -o "$W/mcplay" demos/mcplay/main.fi 2>"$W/err" || { head -10 "$W/err"; fail "demos/mcplay does not compile"; }
 # ---- fixture pack
-python3 -I - "$W/pack.zip" <<'PY' || fail "cannot build the fixture pack"
+python3 -I - "$W/pack.zip" "$W/pack2.zip" <<'PY' || fail "cannot build the fixture pack"
 import sys, zipfile, io
 from PIL import Image
 im = Image.new("RGBA", (16, 16))
@@ -48,6 +48,9 @@ with zipfile.ZipFile(sys.argv[1], "w") as z:
     z.writestr("assets/minecraft/textures/block/oak_planks.png", png.getvalue())
     z.writestr("assets/minecraft/models/block/mdl_stairs.json", model)
     z.writestr("assets/minecraft/blockstates/oak_stairs.json", bs)
+with zipfile.ZipFile(sys.argv[2], "w") as z:  # pack 2: only the texture, no blockstates / models (stairs stay cubes)
+    z.writestr("pack.mcmeta", json.dumps({"pack": {"pack_format": 15, "description": "mcplay models gate fixture, no models"}}))
+    z.writestr("assets/minecraft/textures/block/oak_planks.png", png.getvalue())
 PY
 MCV=1.20.1
 mkdir -p "$W/srv"
@@ -76,8 +79,18 @@ mkfifo "$W/in"; exec 3<>"$W/in"
 SRV_PID=$!
 for i in $(seq 1 180); do grep -q 'Done (' "$W/server.log" 2>/dev/null && break; kill -0 "$SRV_PID" 2>/dev/null || break; sleep 1; done
 grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did not start"; }
-for gr in "doDaylightCycle false" "doMobSpawning false" "doWeatherCycle false"; do echo "gamerule $gr" >&3; done
+for gr in "doDaylightCycle false" "doMobSpawning false" "doWeatherCycle false" "spawnRadius 0"; do echo "gamerule $gr" >&3; done
 echo "time set day" >&3
+# the four stairs (one per facing, row at z = 5) are set on the SERVER before any client joins: every run then gets them with the chunk data (r244:
+# stairs that arrive as block updates after the join give a different picture on ~10 % of the grass (+-1 level) than stairs loaded with the chunk,
+# in the inline path too -- the first run on a fresh world used to differ from all the others) and the spawn is fixed (spawnRadius 0)
+NSB=$(wc -l < "$W/server.log")
+for spec in "-2 east" "0 south" "2 west" "4 north"; do
+    set -- $spec
+    echo "setblock $1 -60 5 oak_stairs[facing=$2]" >&3
+done
+for i in $(seq 1 30); do [ "$(tail -n +"$((NSB + 1))" "$W/server.log" | grep -c 'Changed the block')" -ge 4 ] && break; sleep 1; done
+[ "$(tail -n +"$((NSB + 1))" "$W/server.log" | grep -c 'Changed the block')" -ge 4 ] || fail "server setblock of the stairs"
 DN=$((90 + RANDOM % 100))
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
@@ -100,12 +113,6 @@ run_one() { # name, reload, env...
             nl=$(wc -l < "$W/server.log")
             echo "tp $pn 0.5 -60 0.5 0 20" >&3
             wait_log "Teleported $pn to" 10 "$nl" || ok=0
-            local k=0
-            for spec in "-2 east" "0 south" "2 west" "4 north"; do
-                set -- $spec
-                echo "setblock $1 -60 5 oak_stairs[facing=$2]" >&3
-                k=$((k + 1))
-            done
             sleep 4
             if [ "$reload" = 1 ]; then xdotool key t; sleep 6; fi
         else
@@ -124,13 +131,15 @@ run_one() { # name, reload, env...
 # lower half (models 4.5 / voxel 4.0), R3 down onto the step (4.0 both).
 PROBE="-4500,-59250,5500,1000,0,0;-1750,-55000,5500,0,-1000,0;-1250,-55000,5500,0,-1000,0"
 run_one A 0 MCPLAY_MODELS=1 MCPLAY_STREAM=0 MCPLAY_PICK_PROBE="$PROBE"
-run_one B 0 MCPLAY_PICK_PROBE="$PROBE"
+run_one B 0 MCPLAY_MODELS=0 MCPLAY_PICK_PROBE="$PROBE"
 run_one C 1 MCPLAY_MODELS=1 MCPLAY_STREAM=0 MCPLAY_PICK_PROBE="$PROBE"
 run_one D 0 MCPLAY_MODELS=1 MCPLAY_STREAM=1 MCPLAY_PICK_PROBE="$PROBE"
 run_one E 1 MCPLAY_MODELS=1 MCPLAY_STREAM=1 MCPLAY_PICK_PROBE="$PROBE"
-run_one F 0 MCPLAY_STREAM=0 MCPLAY_PICK_PROBE="$PROBE"
+run_one F 0 MCPLAY_MODELS=0 MCPLAY_STREAM=0 MCPLAY_PICK_PROBE="$PROBE"
+run_one G 0 MCPLAY_PICK_PROBE="$PROBE"
+run_one H 0 MC_PACKS="$W/pack2.zip" MCPLAY_PICK_PROBE="$PROBE"
 num() { grep -E "mcplay: (end|stream)" "$W/$1.out" | grep -o "$2=[0-9]*" | tail -1 | cut -d= -f2; }
-for n in A B C D E F; do
+for n in A B C D E F G H; do
     F=$(num $n frames)
     [ "${F:-0}" -gt 20 ] || { echo "  FAIL  $n: too few frames (${F:-?})"; ERR=1; }
 done
@@ -141,12 +150,14 @@ for n in A C D E; do
     echo "  $n $MS"
     [ "${S:-0}" -gt 0 ] && [ "${U:-1}" -eq 0 ] || { echo "  FAIL  $n: no model states resolved or unmapped quads (states=${S:-?} unmapped=${U:-?})"; ERR=1; }
 done
-grep -q "^mcplay: models" "$W/B.out" && { echo "  FAIL  B (default) printed a models line"; ERR=1; }
+grep -q "^mcplay: models" "$W/B.out" && { echo "  FAIL  B (MCPLAY_MODELS=0) printed a models line"; ERR=1; }
+grep -q "^mcplay: models" "$W/F.out" && { echo "  FAIL  F (MCPLAY_MODELS=0) printed a models line"; ERR=1; }
+grep -q "^mcplay: models on.*stream=true" "$W/G.out" || { echo "  FAIL  G: the default (MCPLAY_MODELS unset) with a pack must switch the models on, with the stream"; ERR=1; }
 for n in A C; do grep -q "stream=true" "$W/$n.out" && { echo "  FAIL  $n has the stream on (MCPLAY_STREAM=0)"; ERR=1; }; done
 for n in D E; do grep -q "models on.*stream=true" "$W/$n.out" || { echo "  FAIL  $n: models without the stream (MCPLAY_MODELS=1 must keep MCPLAY_STREAM=1)"; ERR=1; }; done
-for n in A B C D E F; do [ -s "$W/$n.png" ] || { echo "  FAIL  $n: no screenshot"; ERR=1; }; done
+for n in A B C D E F G H; do [ -s "$W/$n.png" ] || { echo "  FAIL  $n: no screenshot"; ERR=1; }; done
 if [ $ERR -eq 0 ]; then
-    RES=$(python3 -I - "$W/A.png" "$W/B.png" "$W/C.png" "$W/D.png" "$W/E.png" "$W/F.png" <<'PY'
+    RES=$(python3 -I - "$W/A.png" "$W/B.png" "$W/C.png" "$W/D.png" "$W/E.png" "$W/F.png" "$W/G.png" "$W/H.png" <<'PY'
 import sys
 from PIL import Image, ImageChops
 def crop(p): return Image.open(p).convert("RGB").crop((0, 60, 640, 330))
@@ -164,12 +175,14 @@ def fixture(im):
         elif b * 100 >= m * 88 and lo(r) and lo(g): cnt[2] += 1     # blue
         elif r * 100 >= m * 80 and g * 100 >= m * 80 and lo(b): cnt[3] += 1  # yellow
     return cnt
-a, b, c, dd, e, f = [crop(p) for p in sys.argv[1:7]]
+a, b, c, dd, e, f, g, h = [crop(p) for p in sys.argv[1:9]]
 d = ImageChops.difference(a, b).convert("L").point(lambda v: 255 if v > 0 else 0)
-d2 = ImageChops.difference(a, dd).convert("L").point(lambda v: 255 if v > 2 else 0)  # > 2 levels: the model path differs by 1 level on ~10 % of the grass (open point r244)
+def nz(x, y, t=2): return sum(ImageChops.difference(x, y).convert("L").point(lambda v: 255 if v > t else 0).histogram()[255:])
+d2 = ImageChops.difference(a, dd).convert("L").point(lambda v: 255 if v > 2 else 0)
 d3 = ImageChops.difference(f, b).convert("L").point(lambda v: 255 if v > 0 else 0)
 print("A", *fixture(a), "B", *fixture(b), "C", *fixture(c), "diffAB", sum(d.histogram()[255:]), "total", a.width * a.height,
-      "D", *fixture(dd), "E", *fixture(e), "diffAD", sum(d2.histogram()[255:]), "diffFB", sum(d3.histogram()[255:]))
+      "D", *fixture(dd), "E", *fixture(e), "diffAD", sum(d2.histogram()[255:]), "diffFB", sum(d3.histogram()[255:]),
+      "diffAC", nz(a, c), "diffDE", nz(dd, e), "diffDG", nz(dd, g), "diffBH", nz(b, h, 0))
 PY
 ) || RES=""
     echo "  fixture colours (red green blue yellow): $RES"
@@ -180,8 +193,16 @@ PY
         DP=${17}; DT=${19}
         for i in 21 22 23 24; do [ "${!i}" -ge 120 ] || { echo "  FAIL  D (stream): fixture colour #$((i - 20)) only ${!i} pixels"; ERR=1; }; done
         for i in 26 27 28 29; do [ "${!i}" -ge 60 ] || { echo "  FAIL  E (stream, after reload): fixture colour #$((i - 25)) only ${!i} pixels"; ERR=1; }; done
-        # the stream picture differs from the inline one anyway (frustum / cave culling, light region, HUD fps): the baseline is the same pair WITHOUT models (F vs B)
-        [ "${31}" -le $((${33} + DT / 100)) ] || { echo "  FAIL  D (stream) differs from A (mc_render_world) by ${31} px (> 2 levels), baseline without models (F vs B) ${33} px, of $DT"; ERR=1; }
+        # r244: the cube pairs are pixel-exact (B == F: stream vs inline, H == B: the default without pack models changes nothing). The model pairs differ run to run
+        # in TWO reproducible states (+-1 level on the grass of one chunk, ~19000 px, plus ~350 single pixels > 2 levels from another quad split), independent of
+        # stream / inline (A vs A2 differ the same way): so they are compared by pixels > 2 levels with a small limit (0.5 %), not exactly.
+        LIM=$((DT / 200))
+        [ "${33}" -le 0 ] || { echo "  FAIL  F (cubes, STREAM=0) differs from B (cubes, stream) by ${33} px"; ERR=1; }
+        [ "${41}" -le 0 ] || { echo "  FAIL  H (default, pack without models) differs from B (cubes) by ${41} px (the default must not change a picture without pack models)"; ERR=1; }
+        [ "${31}" -le $LIM ] || { echo "  FAIL  D (stream) differs from A (mc_render_world) by ${31} px (> 2 levels), limit $LIM of $DT"; ERR=1; }
+        [ "${35}" -le $LIM ] || { echo "  FAIL  C (reload) differs from A by ${35} px (> 2 levels), limit $LIM"; ERR=1; }
+        [ "${37}" -le $LIM ] || { echo "  FAIL  E (stream, reload) differs from D by ${37} px (> 2 levels), limit $LIM"; ERR=1; }
+        [ "${39}" -le $LIM ] || { echo "  FAIL  G (default models) differs from D by ${39} px (> 2 levels), limit $LIM"; ERR=1; }
         [ "$DP" -ge $((DT / 100)) ] || { echo "  FAIL  A equals B (stairs drawn as cubes?): $DP of $DT pixels differ"; ERR=1; }
     fi
 fi
