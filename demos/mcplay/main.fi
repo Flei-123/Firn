@@ -16,6 +16,7 @@
 //   MCPLAY_LOD=<n>     LOD terrain beyond MCPLAY_VIEW up to n chunks (mc_stream + mc_lod, cross-fade at ring changes; asks the server for n chunks); 0 = off (default)
 //   MCPLAY_MODELS=1    resource pack models (blockstates + models of the packs, mc_model_mesh): stairs, slabs, plants ... are drawn from their baked quads instead of
 //                      full cubes. Needs packs (MC_PACKS ...) and the CPU back end; forces MCPLAY_STREAM=0 (no mc_stream / LOD); the T key reloads the models too. Default off.
+//   MCPLAY_PICK_PROBE="ox,oy,oz,dx,dy,dz[;...]"  pick rays (thousandths) at the end of the run, printed as `mcplay: probe ...` (tests; with MCPLAY_MODELS=1 through mc_model_pick)
 //   MCPLAY_STREAM=0    old path: mc_render_world (inline meshing) instead of mc_stream. DEFAULT is mc_stream (frustum + cave culling, worker meshing)
 //   MCPLAY_WORKERS=3   mesher threads of the stream (0 = inline on the render thread); default 3 on every path incl. MCPLAY_GFX=vk (r167 TLS fix, r199 verified with lavapipe)
 //   MCPLAY_W / MCPLAY_H window size (default 854x480)     MCPLAY_FULLSCREEN=1   start fullscreen
@@ -71,6 +72,7 @@ import mc.mc_texture
 import mc.mc_raster
 import mc.mc_render_world
 import mc.mc_model_mesh
+import mc.mc_model_pick
 import mc.mc_stream
 import jobs.jobs
 import mc.mc_sky
@@ -2511,7 +2513,11 @@ fn draw_frame(c: *mut Ctx) {
     ents_draw(c, &ebe)
     if !(*c).light { mc_sky.sky_tint_frame(&(*c).sky, r) }
     if (*c).hit {
-        mc_input.input_draw_box(r, (*c).pk.x, (*c).pk.y, (*c).pk.z, BOX_RGBA)
+        if (*c).models_on {
+            mc_model_pick.mp_draw_box(r, &(*c).ms, &(*c).pk, BOX_RGBA)
+        } else {
+            mc_input.input_draw_box(r, (*c).pk.x, (*c).pk.y, (*c).pk.z, BOX_RGBA)
+        }
     }
     var d: mc_hud.HudDebug = mc_hud.hud_debug_new()
     d.fps = (*c).fps
@@ -2609,6 +2615,59 @@ fn log_redirect() {
     syscall(33, fd, 1, 0, 0, 0, 0)
     syscall(33, fd, 2, 0, 0, 0, 0)
     if fd > 2 { syscall(3, fd, 0, 0, 0, 0, 0) }
+}
+
+// MCPLAY_PICK_PROBE="ox,oy,oz,dx,dy,dz[;...]" (thousandths: origin in blocks, direction): rays at the end of the run through the same pick path as the
+// mouse (models on: mc_model_pick, else mc_input.input_pick), reach 20. Prints `mcplay: probe models=<0|1> hit=<0|1> x= y= z= n=nx,ny,nz dist_mm= id=` per ray.
+fn pick_ray_probe(c: *mut Ctx, v: str) {
+    var parts: [i64; 6] = [0; 6]
+    var k: usize = 0
+    var st: usize = 0
+    var i: usize = 0
+    while i <= v.length() {
+        if i == v.length() || v.chars(i) == 44 as u8 {
+            if k < 6 { parts[k] = parse_dec((v.p as u64) + (st as u64), i - st, 0 as i64) }
+            k = k + 1
+            st = i + 1
+        }
+        i = i + 1
+    }
+    if k != 6 {
+        io.eprint_line("mcplay: MCPLAY_PICK_PROBE needs ox,oy,oz,dx,dy,dz (thousandths)")
+        return
+    }
+    var pk: mc_input.Pick = mc_input.Pick { x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, dist: 0.0, id: 0 }
+    let ox: f64 = (parts[0] as f64) / 1000.0
+    let oy: f64 = (parts[1] as f64) / 1000.0
+    let oz: f64 = (parts[2] as f64) / 1000.0
+    let dx: f64 = (parts[3] as f64) / 1000.0
+    let dy: f64 = (parts[4] as f64) / 1000.0
+    let dz: f64 = (parts[5] as f64) / 1000.0
+    var hit: bool = false
+    if (*c).models_on {
+        hit = mc_model_pick.mp_pick(&(*c).world, (*c).dim.min_y, &(*c).itb, &(*c).ms, ox, oy, oz, dx, dy, dz, 20.0, &pk)
+    } else {
+        hit = mc_input.input_pick(&(*c).world, (*c).dim.min_y, &(*c).itb, ox, oy, oz, dx, dy, dz, 20.0, &pk)
+    }
+    var h: i32 = 0
+    if hit { h = 1 }
+    var mo: i32 = 0
+    if (*c).models_on { mo = 1 }
+    say(f"mcplay: probe models={mo} hit={h} x={pk.x} y={pk.y} z={pk.z} n={pk.nx},{pk.ny},{pk.nz} dist_mm={(pk.dist * 1000.0 + 0.5) as i64} id={pk.id}\n")
+}
+
+fn pick_probe(c: *mut Ctx) {
+    if !env.has("MCPLAY_PICK_PROBE") { return }
+    let v: str = env.get("MCPLAY_PICK_PROBE")
+    var st: usize = 0
+    var i: usize = 0
+    while i <= v.length() {
+        if i == v.length() || v.chars(i) == 59 as u8 {
+            pick_ray_probe(c, str { p: ((v.p as u64) + (st as u64)) as *mut u8, n: i - st })
+            st = i + 1
+        }
+        i = i + 1
+    }
 }
 
 #[allow_escape]
@@ -2938,7 +2997,11 @@ fn main(start: u64) -> i32 {
         if quit_file.length() > 0 && c.n_frames % 5 as u64 == 0 as u64 && fs.exists(quit_file) { c.closed = true }
         if c.have_pos {
             mc_input.player_set_camera(&c.pl, &c.cam)
-            c.hit = mc_input.input_pick_camera(&c.world, c.dim.min_y, &c.itb, &c.cam, mc_input.player_reach(&c.pl), &c.pk)
+            if c.models_on {
+                c.hit = mc_model_pick.mp_pick_camera(&c.world, c.dim.min_y, &c.itb, &c.ms, &c.cam, mc_input.player_reach(&c.pl), &c.pk)
+            } else {
+                c.hit = mc_input.input_pick_camera(&c.world, c.dim.min_y, &c.itb, &c.cam, mc_input.player_reach(&c.pl), &c.pk)
+            }
         }
         handle_mouse(&c)
         audio_frame(&c)
@@ -3053,6 +3116,7 @@ fn main(start: u64) -> i32 {
     if c.models_on {
         say(f"mcplay: models states={c.ms.nmodel} unmapped={c.ms.unmapped}\n")
     }
+    pick_probe(&c)
     if c.vk {
         mc_render_world.wr_free_b(&c.g.wr, &c.be)
         vk_mc.vkbe_close(&c.vbk)
