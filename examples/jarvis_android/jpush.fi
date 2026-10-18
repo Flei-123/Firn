@@ -17,7 +17,7 @@ import appkit.log
 import window.window
 import jshell
 
-export { pending_take, setup, on_api, stop, state, state_text, tick, polling, events_seen, PS_IDLE, PS_ASKED, PS_ON, PS_NONE, PS_TLS, PS_FAILED }
+export { pending_take, launch_take, last_source, settle, setup, on_api, stop, state, state_text, tick, polling, events_seen, PS_IDLE, PS_ASKED, PS_ON, PS_NONE, PS_TLS, PS_FAILED }
 
 const PS_IDLE: i64 = 0
 const PS_ASKED: i64 = 1
@@ -38,14 +38,23 @@ static mut G_SINCE: i64 = 0
 static mut G_LEARN: bool = false // no stored id yet: the first answer only sets the id
 static mut G_SEEN: i64 = 0 // events turned into notifications (for the end-to-end check and the settings page)
 
-// The chat of the newest event that came in while the window was NOT on screen: a tap on its notification only brings the app to the
-// front (the notification cannot carry the chat id), so main.fi opens this chat when the window comes back (pending_take, at most
-// PENDING_MS later). An event that arrives while the window is on screen sets nothing.
+// WHICH CHAT A TAP MEANS. Three ways, the first that answers wins:
+//   1. the intent: every notification of an event with a chat id is posted KEYED (pushio.pio_notify_cid) and carries the chat id as an
+//      intent extra; a start by a tap on it reads it (pushio.pio_launch_cid, launch_take);
+//   2. the status bar: the chat ids of the keyed notifications are kept in SLOTS (slot = key); when the window comes back, the slot
+//      whose notification is GONE (auto-cancel on tap) is the tapped one -- the newest such slot (settle() frees the slots of
+//      notifications that went away while the window was on screen, so a swiped one is not mistaken for a tap);
+//   3. the guess: the chat of the newest event that came in while the window was not on screen (at most PENDING_MS old).
 const PENDING_MS: i64 = 900000
 const PENDING_CAP: usize = 96
+const SLOTS: usize = 8
 static mut G_PEND: [u8; 96] = [0; 96]
 static mut G_PEND_N: usize = 0
 static mut G_PEND_AT: i64 = 0
+static mut G_SRC: i64 = 0 // where the last chat id came from: 1 intent extra, 2 status bar (the notification that is gone), 3 guess
+static mut G_SLOT_CID: [u8; 768] = [0; 768] // SLOTS x PENDING_CAP
+static mut G_SLOT_N: [usize; 8] = [0; 8]
+static mut G_SLOT_AT: [i64; 8] = [0; 8]
 
 fn pending_set(cid: str) {
     if cid.n == 0 || cid.n > PENDING_CAP { return }
@@ -58,12 +67,88 @@ fn pending_set(cid: str) {
     G_PEND_AT = time.now_unix_ms()
 }
 
-// "" when nothing is pending (or it is stale); taking clears it
+fn slot_cid(i: usize) -> str {
+    return __str_copy(str { p: (&G_SLOT_CID[i * PENDING_CAP]) as u64 as *mut u8, n: G_SLOT_N[i] })
+}
+
+// the slot (= notification key) of a chat: the one it has, else a free one, else the oldest
+fn slot_of(cid: str) -> usize {
+    var free: usize = SLOTS
+    var oldest: usize = 0
+    var i: usize = 0
+    while i < SLOTS {
+        if G_SLOT_N[i] == cid.n && cid.n > 0 && slot_cid(i) == cid { return i }
+        if G_SLOT_N[i] == 0 && free == SLOTS { free = i }
+        if G_SLOT_AT[i] < G_SLOT_AT[oldest] { oldest = i }
+        i = i + 1
+    }
+    if free != SLOTS { return free }
+    return oldest
+}
+
+fn slot_put(i: usize, cid: str) {
+    var k: usize = 0
+    while k < cid.n {
+        G_SLOT_CID[i * PENDING_CAP + k] = *((cid.p as u64 + k as u64) as *mut u8)
+        k = k + 1
+    }
+    G_SLOT_N[i] = cid.n
+    G_SLOT_AT[i] = time.now_unix_ms()
+}
+
+// 1 s tick while the window is on screen: a keyed notification that is gone now was swiped away or cancelled -- not a tap
+fn settle() {
+    var i: usize = 0
+    while i < SLOTS {
+        if G_SLOT_N[i] > 0 && pushio.pio_shown(i as u64) == 0 { G_SLOT_N[i] = 0 }
+        i = i + 1
+    }
+}
+
+// the chat id of a start by a tap ("" = none; once)
+fn launch_take() -> str {
+    let c: str = pushio.pio_launch_cid()
+    if c.n > 0 { G_SRC = 1 }
+    return c
+}
+
+fn last_source() -> str {
+    if G_SRC == 1 { return "intent" }
+    if G_SRC == 2 { return "status bar" }
+    return "guess"
+}
+
+// "" when no chat is meant; taking clears it. Called when the window came back to the front.
 fn pending_take() -> str {
+    let now: i64 = time.now_unix_ms()
+    var from_intent: str = pushio.pio_launch_cid()
+    var best: usize = SLOTS
+    var i: usize = 0
+    while i < SLOTS {
+        if G_SLOT_N[i] > 0 && now - G_SLOT_AT[i] <= PENDING_MS && pushio.pio_shown(i as u64) == 0 {
+            if best == SLOTS || G_SLOT_AT[i] > G_SLOT_AT[best] { best = i }
+        }
+        i = i + 1
+    }
+    var tapped: str = ""
+    if best != SLOTS { tapped = slot_cid(best) }
+    // every slot whose notification is gone is free again
+    settle()
+    if from_intent.n > 0 {
+        G_PEND_N = 0
+        G_SRC = 1
+        return from_intent
+    }
+    if tapped.n > 0 {
+        G_PEND_N = 0
+        G_SRC = 2
+        return tapped
+    }
+    G_SRC = 3
     if G_PEND_N == 0 { return "" }
     let n: usize = G_PEND_N
     G_PEND_N = 0
-    if time.now_unix_ms() - G_PEND_AT > PENDING_MS { return "" }
+    if now - G_PEND_AT > PENDING_MS { return "" }
     return __str_copy(str { p: (&G_PEND[0]) as u64 as *mut u8, n: n })
 }
 
@@ -94,7 +179,8 @@ fn parse_dec(s: str) -> i64 {
 
 // once per start (and again after sign-out / sign-in)
 fn setup() {
-    if G_STATE != PS_IDLE || !pushio.pio_available() { return }
+    // not before the person saw the short note about the notification question (main.fi, jshell.push_allowed)
+    if G_STATE != PS_IDLE || !pushio.pio_available() || !jshell.push_allowed() { return }
     if jarvisapi.ja_push_register(jshell.api(), "android-app", "android") {
         G_STATE = PS_ASKED
     }
@@ -138,7 +224,16 @@ fn tick() {
 fn show(e: *mut jarvisapi.PushEvent) {
     var title: str = (*e).title
     if title.n == 0 { title = "JARVIS" }
-    if pushio.pio_notify(title, (*e).body) {
+    var posted: bool = false
+    let cid: str = (*e).cid
+    if cid.n > 0 && cid.n <= PENDING_CAP {
+        let k: usize = slot_of(cid)
+        posted = pushio.pio_notify_cid(k as u64, title, (*e).body, cid)
+        if posted { slot_put(k, cid) }
+    } else {
+        posted = pushio.pio_notify(title, (*e).body)
+    }
+    if posted {
         G_SEEN = G_SEEN + 1
         if jshell.win() as u64 != 0 && !window.in_front(jshell.win()) { pending_set((*e).cid) }
     }

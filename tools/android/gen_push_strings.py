@@ -105,6 +105,15 @@ S = [
 ("S_L_TLS","connected (tls, pinned key)"),
 ("S_L_TLSFAIL","tls handshake failed"),
 ("S_L_V6","relay reached over ipv6"),
+("N_PUT_EXTRA_S","putExtra"),
+("G_PUT_EXTRA_S","(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;"),
+("S_EXTRA_CID","org.firn.extra.CID"),
+("N_GET_INTENT","getIntent"),
+("G_GET_INTENT","()Landroid/content/Intent;"),
+("N_GET_STR_EXTRA","getStringExtra"),
+("G_GET_STR_EXTRA","(Ljava/lang/String;)Ljava/lang/String;"),
+("N_REMOVE_EXTRA","removeExtra"),
+("G_REMOVE_EXTRA","(Ljava/lang/String;)V"),
 ]
 # German UI texts: the generated comment is English (no-german guard); the text itself stays.
 EN = {

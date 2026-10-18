@@ -206,6 +206,98 @@ pub(crate) fn build(
     }
 }
 
+/// r666 -- `for (i, x) in enumerate(v)` and `for (x, y) in zip(a, b)`.
+///
+/// ```firn
+/// for __each#L_C in 0 as usize..__each_len(v) {
+///     let i = __each#L_C        // usize
+///     let x = v[__each#L_C]
+///     ...
+/// }
+/// ```
+/// `zip` walks to the SHORTER length (`if la < lb { la } else { lb }`). Every
+/// sequence must be a place without calls, as with `for x in v`.
+pub(crate) fn build_pair(
+    p: &mut Parser,
+    first: (String, Span),
+    second: (String, Span),
+    src: Expr,
+    body: Block,
+    start: Span,
+) -> Stmt {
+    let (fname, fargs) = match &src.kind {
+        ExprKind::Call(n, a, _) => (n.clone(), a.clone()),
+        _ => (String::new(), Vec::new()),
+    };
+    let is_enum = fname == "enumerate" && fargs.len() == 1;
+    let is_zip = fname == "zip" && fargs.len() == 2;
+    if !is_enum && !is_zip {
+        p.dg.error_note(
+            src.span,
+            "a tuple pattern in 'for' needs enumerate(v) or zip(a, b)",
+            "write `for (i, x) in enumerate(v)` or `for (x, y) in zip(a, b)`",
+        );
+        return Stmt::Error(start);
+    }
+    for a in &fargs {
+        if !place_ok(a) {
+            p.dg.error_note(
+                a.span,
+                "'for ... in enumerate/zip' needs a sequence variable",
+                "name the sequence first (`let a = ...`): the loop reads it more than once, so it \
+                 must be a name, a field path or `*p`, never a call",
+            );
+            return Stmt::Error(start);
+        }
+    }
+    let sp = src.span;
+    let idx = format!("{}{}_{}", HIDDEN, start.line, start.col);
+    let len_of = |p: &mut Parser, a: &Expr| {
+        let r = reid(p, a);
+        p.mk(sp, ExprKind::Call(LEN.to_string(), vec![r], sp))
+    };
+    let len = if is_enum {
+        len_of(p, &fargs[0])
+    } else {
+        let la = len_of(p, &fargs[0]);
+        let lb = len_of(p, &fargs[1]);
+        let la2 = len_of(p, &fargs[0]);
+        let lb2 = len_of(p, &fargs[1]);
+        let cond = p.mk(sp, ExprKind::Binary(BinOp::Lt, Box::new(la), Box::new(lb)));
+        p.mk(sp, ExprKind::IfElse(Box::new(cond), Box::new(la2), Box::new(lb2)))
+    };
+    let lit = p.mk(sp, ExprKind::Int(0));
+    let zero = p.mk(sp, ExprKind::Cast(Box::new(lit), TypeExpr::Named("usize".to_string(), sp)));
+    let mut stmts = Vec::with_capacity(body.stmts.len() + 2);
+    let at = |p: &mut Parser| p.mk(sp, ExprKind::Ident(idx.clone()));
+    if is_enum {
+        let init = at(p);
+        stmts.push(Stmt::Let { name: first.0, mutable: false, ty: None, init, span: first.1 });
+        let base = reid(p, &fargs[0]);
+        let i2 = at(p);
+        let elem = p.mk(sp, ExprKind::Index(Box::new(base), Box::new(i2)));
+        stmts.push(Stmt::Let { name: second.0, mutable: false, ty: None, init: elem, span: second.1 });
+    } else {
+        for (k, nm) in [first, second].into_iter().enumerate() {
+            let base = reid(p, &fargs[k]);
+            let i2 = at(p);
+            let elem = p.mk(sp, ExprKind::Index(Box::new(base), Box::new(i2)));
+            stmts.push(Stmt::Let { name: nm.0, mutable: false, ty: None, init: elem, span: nm.1 });
+        }
+    }
+    stmts.extend(body.stmts);
+    let body = Block { stmts, span: body.span, end: body.end };
+    Stmt::For {
+        name: idx,
+        start: zero,
+        end: len,
+        body,
+        inclusive: false,
+        name_span: sp,
+        span: start,
+    }
+}
+
 /// `// HOOK foreach` in `sema::Checker::call` -- the type of `__each_len(a)`.
 pub(crate) fn hook_call(ck: &mut Checker, name: &str, args: &[Expr], espan: Span) -> Option<Type> {
     if name != LEN {

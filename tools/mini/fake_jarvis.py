@@ -31,6 +31,8 @@ CONV = {}      # cid -> list of {role, text}
 seq = 0
 CONV["c1"] = [{"role": "user", "text": "hi", "at": "2026-10-17T18:00:00Z"}, {"role": "assistant", "text": "hello\n>STATUS: status=done", "at": "2026-10-17T18:00:05Z"}]
 
+CONV["c2"] = [{"role": "user", "text": "second question", "at": "2026-10-17T19:00:00Z"}, {"role": "assistant", "text": "second answer\n>STATUS: status=done", "at": "2026-10-17T19:00:05Z"}]
+
 def cookie_ok(headers):
     for c in headers.get_all("Cookie"):
         for part in c.split(";"):
@@ -152,7 +154,8 @@ def rest(method, rawpath, hdr, body):
         if mp == "devices":
             return out(200, {"devices": [{"name": "Dell", "type": "Windows", "online": True}, {"name": "Phone", "type": "Android", "online": False}]})
         if mp == "chats" and method == "GET":
-            return out(200, {"total": 2, "chats": [{"id": "c1", "title": "worker one", "kind": "worker", "updatedAt": 1760000000001, "running": True, "fav": True, "parent": None},
+            return out(200, {"total": 3, "chats": [{"id": "c1", "title": "worker one", "kind": "worker", "updatedAt": 1760000000001, "running": True, "fav": True, "parent": None},
+                                                    {"id": "c2", "title": "worker two", "kind": "worker", "updatedAt": 1760000000002, "running": False, "fav": False, "parent": None},
                                                     {"id": "o1", "title": "Leitstand", "kind": "orchestrator", "updatedAt": 5, "running": False, "fav": False, "parent": None}]})
         if mp.startswith("chats/") and method == "GET":
             cid = unquote(mp[len("chats/"):])
@@ -239,6 +242,8 @@ def rest(method, rawpath, hdr, body):
         name = q.get("name", ["file"])[0]
         disk = "ab12cd34ef56_" + name
         FILES[disk] = body
+        import hashlib  # the proof for the file picker check: what the server GOT (name, mime, size, sha256 of the octets)
+        LOG.write(json.dumps({"type": "upload_body", "name": name, "mime": q.get("mime", [jtype])[0], "size": len(body), "sha256": hashlib.sha256(body).hexdigest()}) + "\n")
         return out(200, {"file": {"name": name, "size": len(body), "mime": jtype, "url": "/file/u1/%s/%s" % (q.get("cid", ["c0"])[0], quote(disk)), "path": "/srv/uploads/u1/%s/%s" % (q.get("cid", ["mobile"])[0], disk)}})
     if path.startswith("/file/"):
         disk = unquote(path.split("/")[-1])

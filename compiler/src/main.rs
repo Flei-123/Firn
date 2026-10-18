@@ -97,6 +97,7 @@ mod promote;
 mod rangecheck;
 mod strings;
 mod strtype;
+mod fmtspec;
 mod syscalls;
 mod target;
 mod types;

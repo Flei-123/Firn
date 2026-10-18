@@ -29,6 +29,7 @@ shot() { [ -n "${SHOTS:-}" ] || return 0; mkdir -p "$SHOTS"; xwd -root -silent -
 click() { xdotool mousemove "$1" "$2" click 1; sleep "${3:-0.6}"; }
 sleep 3
 click 240 398; xdotool type --delay 30 justin; click 240 441; xdotool type --delay 30 pw; xdotool key Return; sleep 3
+shot notice; click 240 446 3   # the notification notice page after the first sign-in: "Continue"
 click 165 714; sleep 4; shot board
 click 240 180; sleep 3; click 130 267; sleep 1.5; click 206 391; sleep 4; shot need_answered
 click 363 180; sleep 3; click 130 298; sleep 4; shot worker_chat

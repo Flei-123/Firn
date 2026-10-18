@@ -148,7 +148,8 @@ struct Painter {
     // ---- THE BIDI PATH (see there). The table from the UCD, the
     // work area for BIDI_CAP characters, and what currently stands in it.
     bt: u64, // ucd_bidi.ucd_bidi_map, 0 = no table
-    bx: u64, // bidi_bytes() Oktette
+    bx: u64, // bidi_bytes(z) Oktette
+    bcap: usize, // characters the work area holds; grows on demand
     bn: usize, // prepared characters, 0 = the old way
     blev: u8, // Absatzebene des ersten Absatzes
     bvn: usize, // visible glyphs of the most recently laid out line
@@ -172,7 +173,7 @@ fn painter_new() -> Painter {
     return Painter {
         cv: 0, ra: raster.raster_new(), rbuf: 0 as *mut u8, rcap: 0,
         scratch: 0 as *mut u8, fm: 0, w: 0, h: 0, ok: 0,
-        bt: 0, bx: 0, bn: 0, blev: 0 as u8, bvn: 0,
+        bt: 0, bx: 0, bcap: 0, bn: 0, blev: 0 as u8, bvn: 0,
         gs: gsub.gsub_new(), gs_fm: 0, fslot: [0 as u64; 4], fb: [0 as u64; 3],
         wface: [0 as u64; 4], wface_w: [0 as usize; 4], fb_col: [0 as usize; 3], emoji_any: 0,
     }
@@ -205,7 +206,8 @@ fn painter_init(z: *mut Painter, cv: *mut canvas.Canvas, w: usize,
     // says so, and tools/fui/bidi_main.fi checks it.
     (*z).bt = ucd_bidi.ucd_bidi_map()
     if (*z).bt != 0 {
-        (*z).bx = rt.heap_alloc(bidi_bytes())
+        (*z).bcap = BIDI_CAP
+        (*z).bx = rt.heap_alloc(bidi_bytes(z))
         if (*z).bx == 0 {
             ucd_bidi.ucd_bidi_free((*z).bt)
             (*z).bt = 0
@@ -225,7 +227,7 @@ fn painter_free(z: *mut Painter) {
         (*z).scratch = 0 as *mut u8
     }
     if (*z).bx != 0 {
-        rt.heap_free((*z).bx, bidi_bytes())
+        rt.heap_free((*z).bx, bidi_bytes(z))
         (*z).bx = 0
     }
     if (*z).bt != 0 {
@@ -2314,6 +2316,16 @@ fn paint_run_base(z: *mut Painter, r: *mut TextRun, sx: f64, base_y: f64,
             if paint_run_kept(z, r, sx, base_y, wl, wt, ww, wh, col, p, nn) {
                 return sx + br
             }
+            // r281: a line whose window the canvas edge would cut is not kept, and a kept
+            // line cannot be written back at the edge. It must still look like the kept
+            // ones (glyphs at 1/8 px), not like the exact whole-line raster below -- else
+            // the same line differs by a few levels depending on where it stands.
+            if glyphcache.gc_on() {
+                if glyph_run_paint(z, r, sx, base_y, wl, wt, ww, wh, col, p, nn,
+                true, 0 as u64 as *mut fcache.CKey) {
+                    return sx + br
+                }
+            }
         } else if glyphcache.gc_on() {
             // no kept lines, but kept glyphs (lib/fui/glyphcache.fi)
             if glyph_run_paint(z, r, sx, base_y, wl, wt, ww, wh, col, p, nn,
@@ -2740,8 +2752,8 @@ fn glyphs_gpu(g: *mut gpu.Gpu, z: *mut Painter, r: *mut TextRun, vis: bool,
     if vis {
         var k: usize = 0
         while k < (*z).bvn {
-            let j: usize = br32(z, bo_vis(), k) as usize
-            gpu_glyph(g, z, r, (*z).fm, f, br32(z, bo_gid(), j), sx + dx + brf(z, bo_x(), j),
+            let j: usize = br32(z, bo_vis(z), k) as usize
+            gpu_glyph(g, z, r, (*z).fm, f, br32(z, bo_gid(z), j), sx + dx + brf(z, bo_x(z), j),
                 base_y + dy, sc, col, grad, col2, gy0, gy1)
             k = k + 1
         }
@@ -3110,50 +3122,79 @@ fn caret_bar(z: *mut Painter, x: f64, y: f64, h: f64, st: f64,
 //     fonts that expect the opposite; it is therefore
 //     NOT applied here.
 //
-// THE LIMIT: `BIDI_CAP` characters per text. A longer text goes the
-// old way (from left to right). For labels and input
-// fields that is far more than enough; a word processor window
-// needs a paragraph store of its own and not this work area.
+// THE LIMIT: the work area starts with room for `BIDI_CAP` characters and
+// GROWS (doubling) when a longer text comes, up to `BIDI_MAX`. Only a text
+// above that goes the old way (from left to right). A word processor
+// window needs a paragraph store of its own and not this work area.
 
 const BIDI_CAP: usize = 4096
+const BIDI_MAX: usize = 262144
+
+// Make room for a text of `n` octets (so at most `n` characters). The work
+// area is rebuilt from scratch with every `bidi_prepare`, so a new, larger
+// one can replace the old without copying. false = too long or no memory.
+#[no_gc]
+fn bidi_reserve(z: *mut Painter, n: usize) -> bool {
+    if n <= (*z).bcap {
+        return true
+    }
+    if n > BIDI_MAX {
+        return false
+    }
+    let oldcap: usize = (*z).bcap
+    let oldbytes: usize = bidi_bytes(z)
+    var nc: usize = oldcap
+    while nc < n {
+        nc = nc * 2
+    }
+    (*z).bcap = nc
+    let nx: u64 = rt.heap_alloc(bidi_bytes(z))
+    if nx == 0 {
+        (*z).bcap = oldcap
+        return false
+    }
+    rt.heap_free((*z).bx, oldbytes)
+    (*z).bx = nx
+    return true
+}
 
 // The sub-arrays of the work area, in this order from `bx`:
 //   cp u32, boff u32 (CAP + 2), cls0/cls/lev/pl/del/form/ll u8,
 //   gid/ord/vis u32, used u32[16], adv/x f64, work (bidi.fi)
 #[no_gc]
-fn bo_cp() -> usize { return 0 }
+fn bo_cp(z: *mut Painter) -> usize { return 0 }
 #[no_gc]
-fn bo_boff() -> usize { return BIDI_CAP * 4 }
+fn bo_boff(z: *mut Painter) -> usize { return (*z).bcap * 4 }
 #[no_gc]
-fn bo_cls0() -> usize { return BIDI_CAP * 8 + 8 }
+fn bo_cls0(z: *mut Painter) -> usize { return (*z).bcap * 8 + 8 }
 #[no_gc]
-fn bo_cls() -> usize { return bo_cls0() + BIDI_CAP }
+fn bo_cls(z: *mut Painter) -> usize { return bo_cls0(z) + (*z).bcap }
 #[no_gc]
-fn bo_lev() -> usize { return bo_cls() + BIDI_CAP }
+fn bo_lev(z: *mut Painter) -> usize { return bo_cls(z) + (*z).bcap }
 #[no_gc]
-fn bo_pl() -> usize { return bo_lev() + BIDI_CAP }
+fn bo_pl(z: *mut Painter) -> usize { return bo_lev(z) + (*z).bcap }
 #[no_gc]
-fn bo_del() -> usize { return bo_pl() + BIDI_CAP }
+fn bo_del(z: *mut Painter) -> usize { return bo_pl(z) + (*z).bcap }
 #[no_gc]
-fn bo_form() -> usize { return bo_del() + BIDI_CAP }
+fn bo_form(z: *mut Painter) -> usize { return bo_del(z) + (*z).bcap }
 #[no_gc]
-fn bo_ll() -> usize { return bo_form() + BIDI_CAP }
+fn bo_ll(z: *mut Painter) -> usize { return bo_form(z) + (*z).bcap }
 #[no_gc]
-fn bo_gid() -> usize { return bo_ll() + BIDI_CAP }
+fn bo_gid(z: *mut Painter) -> usize { return bo_ll(z) + (*z).bcap }
 #[no_gc]
-fn bo_ord() -> usize { return bo_gid() + BIDI_CAP * 4 }
+fn bo_ord(z: *mut Painter) -> usize { return bo_gid(z) + (*z).bcap * 4 }
 #[no_gc]
-fn bo_vis() -> usize { return bo_ord() + BIDI_CAP * 4 }
+fn bo_vis(z: *mut Painter) -> usize { return bo_ord(z) + (*z).bcap * 4 }
 #[no_gc]
-fn bo_used() -> usize { return bo_vis() + BIDI_CAP * 4 }
+fn bo_used(z: *mut Painter) -> usize { return bo_vis(z) + (*z).bcap * 4 }
 #[no_gc]
-fn bo_adv() -> usize { return bo_used() + 64 }
+fn bo_adv(z: *mut Painter) -> usize { return bo_used(z) + 64 }
 #[no_gc]
-fn bo_x() -> usize { return bo_adv() + BIDI_CAP * 8 }
+fn bo_x(z: *mut Painter) -> usize { return bo_adv(z) + (*z).bcap * 8 }
 #[no_gc]
-fn bo_work() -> usize { return bo_x() + BIDI_CAP * 8 }
+fn bo_work(z: *mut Painter) -> usize { return bo_x(z) + (*z).bcap * 8 }
 #[no_gc]
-fn bidi_bytes() -> usize { return bo_work() + bidi.bidi_work_bytes(BIDI_CAP) }
+fn bidi_bytes(z: *mut Painter) -> usize { return bo_work(z) + bidi.bidi_work_bytes((*z).bcap) }
 
 #[no_gc]
 fn bq(z: *mut Painter, off: usize) -> u64 { return (*z).bx + off as u64 }
@@ -3181,7 +3222,7 @@ fn bwf(z: *mut Painter, off: usize, i: usize, v: f64) {
 // The octet position of character `i` (at `bn` the end of the text).
 #[no_gc]
 fn bo_byte(z: *mut Painter, i: usize) -> usize {
-    return br32(z, bo_boff(), i) as usize
+    return br32(z, bo_boff(z), i) as usize
 }
 
 // The character that begins at octet `b` (or the first one behind it).
@@ -3196,16 +3237,16 @@ fn bo_char(z: *mut Painter, b: usize) -> usize {
 
 #[no_gc]
 fn bidi_para(z: *mut Painter) -> bidi.BidiPara {
-    return bidi.bidi_new((*z).bt, bq(z, bo_cp()), (*z).bn, bq(z, bo_cls0()),
-        bq(z, bo_cls()), bq(z, bo_lev()), bq(z, bo_pl()), bq(z, bo_work()))
+    return bidi.bidi_new((*z).bt, bq(z, bo_cp(z)), (*z).bn, bq(z, bo_cls0(z)),
+        bq(z, bo_cls(z)), bq(z, bo_lev(z)), bq(z, bo_pl(z)), bq(z, bo_work(z)))
 }
 
 // A character without a glyph: absorbed into a ligature, or a
 // control character that X9 takes out (LRM, RLE, ZWJ ...).
 #[no_gc]
 fn bidi_hidden(z: *mut Painter, i: usize) -> bool {
-    return br8(z, bo_del(), i) != 0 as u8
-    || bidi.bidi_is_removed(br8(z, bo_cls0(), i))
+    return br8(z, bo_del(z), i) != 0 as u8
+    || bidi.bidi_is_removed(br8(z, bo_cls0(z), i))
 }
 
 // Is a text currently prepared on the bidi path? For the check.
@@ -3220,22 +3261,25 @@ fn bidi_prepare(z: *mut Painter, r: *mut TextRun, p: u64, n: usize) -> usize {
     || !metrics.fm_present((*z).fm) {
         return 0
     }
+    if !bidi_reserve(z, n) {
+        return 0
+    }
     // 1. die Codepunkte
     var i: usize = 0
     var k: usize = 0
     while i < n {
-        if k >= BIDI_CAP {
+        if k >= (*z).bcap {
             return 0
         }
         var adv: usize = 1
         let cp: u32 = utf8_at(p, n, i, &adv)
-        bw32(z, bo_cp(), k, cp)
-        bw32(z, bo_boff(), k, i as u32)
+        bw32(z, bo_cp(z), k, cp)
+        bw32(z, bo_boff(z), k, i as u32)
         k = k + 1
         i = i + adv
     }
-    bw32(z, bo_boff(), k, n as u32)
-    if !bidi.bidi_needed((*z).bt, bq(z, bo_cp()), k, (*r).dir) {
+    bw32(z, bo_boff(z), k, n as u32)
+    if !bidi.bidi_needed((*z).bt, bq(z, bo_cp(z)), k, (*r).dir) {
         return 0
     }
     // 2. die Ebenen
@@ -3250,17 +3294,17 @@ fn bidi_prepare(z: *mut Painter, r: *mut TextRun, p: u64, n: usize) -> usize {
     }
     var miss: usize = 0
     let how: u32 = shape.shape_run((*z).bt, f, &(*z).gs, true,
-        bq(z, bo_cp()), bq(z, bo_cls0()), bq(z, bo_lev()), k,
-        bq(z, bo_gid()), bq(z, bo_del()), bq(z, bo_form()),
-        bq(z, bo_used()), &miss)
+        bq(z, bo_cp(z)), bq(z, bo_cls0(z)), bq(z, bo_lev(z)), k,
+        bq(z, bo_gid(z)), bq(z, bo_del(z)), bq(z, bo_form(z)),
+        bq(z, bo_used(z)), &miss)
     // 4. die Vorschuebe
     let sc: f64 = (*r).size / metrics.fm_upem((*z).fm)
     var j: usize = 0
     while j < k {
         var a: f64 = 0.0
         if !bidi_hidden(z, j) {
-            a = (ttf.font_advance(f, br32(z, bo_gid(), j)) as f64) * sc
-            if br32(z, bo_cp(), j) == 32 as u32 {
+            a = (ttf.font_advance(f, br32(z, bo_gid(z), j)) as f64) * sc
+            if br32(z, bo_cp(z), j) == 32 as u32 {
                 a = a + (*r).word_spacing
             }
         }
@@ -3272,13 +3316,13 @@ fn bidi_prepare(z: *mut Painter, r: *mut TextRun, p: u64, n: usize) -> usize {
         // painting read the same advances, so they cannot disagree. Right-to-left
         // runs and pairs across a level change stay unkerned (see above).
         if a > 0.0 && (*r).kerning != 0 && j + 1 < k && !bidi_hidden(z, j + 1) {
-            let lv: u8 = br8(z, bo_lev(), j)
-            if lv == br8(z, bo_lev(), j + 1) && (lv & 1 as u8) == 0 as u8 {
-                a = a + (ttf.font_kern(f, br32(z, bo_gid(), j),
-                    br32(z, bo_gid(), j + 1)) as f64) * sc
+            let lv: u8 = br8(z, bo_lev(z), j)
+            if lv == br8(z, bo_lev(z), j + 1) && (lv & 1 as u8) == 0 as u8 {
+                a = a + (ttf.font_kern(f, br32(z, bo_gid(z), j),
+                    br32(z, bo_gid(z), j + 1)) as f64) * sc
             }
         }
-        bwf(z, bo_adv(), j, a)
+        bwf(z, bo_adv(z), j, a)
         j = j + 1
     }
     return k
@@ -3292,7 +3336,7 @@ fn bw_range(z: *mut Painter, r: *mut TextRun, a: usize, b: usize) -> f64 {
     var nv: usize = 0
     var i: usize = a
     while i < b {
-        x = x + brf(z, bo_adv(), i)
+        x = x + brf(z, bo_adv(z), i)
         if !bidi_hidden(z, i) {
             nv = nv + 1
         }
@@ -3308,7 +3352,7 @@ fn bw_range(z: *mut Painter, r: *mut TextRun, a: usize, b: usize) -> f64 {
 // counterpart to `advance_of` with its `nxt`.
 #[no_gc]
 fn bidi_step(z: *mut Painter, r: *mut TextRun, i: usize, b: usize) -> f64 {
-    var s: f64 = brf(z, bo_adv(), i)
+    var s: f64 = brf(z, bo_adv(z), i)
     if !bidi_hidden(z, i) && i + 1 < b {
         s = s + (*r).tracking
     }
@@ -3346,7 +3390,7 @@ fn bidi_line_break(z: *mut Painter, r: *mut TextRun, a: usize, b: usize,
     var gap: usize = a
     var after: usize = a
     while i < b {
-        if br32(z, bo_cp(), i) == 32 as u32 {
+        if br32(z, bo_cp(z), i) == 32 as u32 {
             gap = i
             after = i + 1
         }
@@ -3385,8 +3429,8 @@ fn bidi_layout(z: *mut Painter, r: *mut TextRun, a: usize, b: usize) -> f64 {
         return 0.0
     }
     var bp: bidi.BidiPara = bidi_para(z)
-    bidi.bidi_line_levels(&bp, a, b, bq(z, bo_ll()))
-    bidi.bidi_reorder(bq(z, bo_ll()), b - a, bq(z, bo_ord()))
+    bidi.bidi_line_levels(&bp, a, b, bq(z, bo_ll(z)))
+    bidi.bidi_reorder(bq(z, bo_ll(z)), b - a, bq(z, bo_ord(z)))
     var tv: usize = 0
     var i: usize = a
     while i < b {
@@ -3399,12 +3443,12 @@ fn bidi_layout(z: *mut Painter, r: *mut TextRun, a: usize, b: usize) -> f64 {
     var seen: usize = 0
     var k: usize = 0
     while k < b - a {
-        let j: usize = a + br32(z, bo_ord(), k) as usize
-        bwf(z, bo_x(), j, x)
+        let j: usize = a + br32(z, bo_ord(z), k) as usize
+        bwf(z, bo_x(z), j, x)
         if !bidi_hidden(z, j) {
-            bw32(z, bo_vis(), (*z).bvn, j as u32)
+            bw32(z, bo_vis(z), (*z).bvn, j as u32)
             (*z).bvn = (*z).bvn + 1
-            x = x + brf(z, bo_adv(), j)
+            x = x + brf(z, bo_adv(z), j)
             seen = seen + 1
             if seen < tv {
                 x = x + (*r).tracking
@@ -3423,9 +3467,9 @@ fn bidi_into_raster(z: *mut Painter, r: *mut TextRun, sx: f64,
     let sc: f64 = (*r).size / metrics.fm_upem((*z).fm)
     var k: usize = 0
     while k < (*z).bvn {
-        let j: usize = br32(z, bo_vis(), k) as usize
-        glyph_into(z, r, f, br32(z, bo_gid(), j),
-            sx + dx + brf(z, bo_x(), j), base_y + dy, sc)
+        let j: usize = br32(z, bo_vis(z), k) as usize
+        glyph_into(z, r, f, br32(z, bo_gid(z), j),
+            sx + dx + brf(z, bo_x(z), j), base_y + dy, sc)
         k = k + 1
     }
 }
@@ -3473,7 +3517,7 @@ fn bidi_draw_ellipsis(z: *mut Painter, r: *mut TextRun, x: f64,
     } else if align == TEXT_R {
         sx = x + w - (tw + ew)
     }
-    let rtl: bool = (br8(z, bo_pl(), a) & 1 as u8) != 0 as u8
+    let rtl: bool = (br8(z, bo_pl(z), a) & 1 as u8) != 0 as u8
     var tx: f64 = sx
     var dx: f64 = sx + tw
     if rtl {
@@ -3507,7 +3551,7 @@ fn bidi_wrapped(z: *mut Painter, r: *mut TextRun, x: f64, base_y: f64,
         var empty: bool = true
         var q: usize = i
         while q < k {
-            if br32(z, bo_cp(), q) != 32 as u32 {
+            if br32(z, bo_cp(z), q) != 32 as u32 {
                 empty = false
                 break
             }
@@ -3568,18 +3612,18 @@ fn run_caret_x(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
     let tw: f64 = bidi_layout(z, r, 0, k)
     let ci: usize = bo_char(z, b)
     if ci == 0 {
-        let x0: f64 = brf(z, bo_x(), 0)
-        if (br8(z, bo_ll(), 0) & 1 as u8) != 0 as u8 {
-            return x0 + brf(z, bo_adv(), 0)
+        let x0: f64 = brf(z, bo_x(z), 0)
+        if (br8(z, bo_ll(z), 0) & 1 as u8) != 0 as u8 {
+            return x0 + brf(z, bo_adv(z), 0)
         }
         return x0
     }
     let j: usize = ci - 1
-    let xj: f64 = brf(z, bo_x(), j)
-    if (br8(z, bo_ll(), j) & 1 as u8) != 0 as u8 {
+    let xj: f64 = brf(z, bo_x(z), j)
+    if (br8(z, bo_ll(z), j) & 1 as u8) != 0 as u8 {
         return xj
     }
-    return xj + brf(z, bo_adv(), j)
+    return xj + brf(z, bo_adv(z), j)
 }
 
 // THE BOUNDARY UNDER A POINT x (relative to the left text margin), as an
@@ -3619,8 +3663,8 @@ fn run_hit(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
     var j: usize = 0
     while j < k {
         if !bidi_hidden(z, j) {
-            let l: f64 = brf(z, bo_x(), j)
-            let rr: f64 = l + brf(z, bo_adv(), j)
+            let l: f64 = brf(z, bo_x(z), j)
+            let rr: f64 = l + brf(z, bo_adv(z), j)
             var d: f64 = 0.0
             if x < l {
                 d = l - x
@@ -3637,9 +3681,9 @@ fn run_hit(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
     if best_i == k {
         return 0
     }
-    let l2: f64 = brf(z, bo_x(), best_i)
-    let mid: f64 = l2 + brf(z, bo_adv(), best_i) / 2.0
-    let odd: bool = (br8(z, bo_ll(), best_i) & 1 as u8) != 0 as u8
+    let l2: f64 = brf(z, bo_x(z), best_i)
+    let mid: f64 = l2 + brf(z, bo_adv(z), best_i) / 2.0
+    let odd: bool = (br8(z, bo_ll(z), best_i) & 1 as u8) != 0 as u8
     var after: bool = x >= mid
     if odd {
         after = !after
@@ -3648,7 +3692,7 @@ fn run_hit(z: *mut Painter, r: *mut TextRun, p: u64, n: usize,
     if after {
         c = best_i + 1
         // behind a lam-alif the caret stands behind the alif
-        while c < k && bidi_hidden(z, c) && br8(z, bo_del(), c) != 0 as u8 {
+        while c < k && bidi_hidden(z, c) && br8(z, bo_del(z), c) != 0 as u8 {
             c = c + 1
         }
     }
@@ -3693,10 +3737,10 @@ fn run_sel_draw(z: *mut Painter, r: *mut TextRun, ox: f64, y: f64, h: f64,
     var x1: f64 = 0.0
     var q: usize = 0
     while q < k {
-        let j: usize = br32(z, bo_ord(), q) as usize
+        let j: usize = br32(z, bo_ord(z), q) as usize
         let inside: bool = j >= ca && j < cb
-        let l: f64 = brf(z, bo_x(), j)
-        let rr: f64 = l + brf(z, bo_adv(), j)
+        let l: f64 = brf(z, bo_x(z), j)
+        let rr: f64 = l + brf(z, bo_adv(z), j)
         if inside {
             if !open {
                 open = true

@@ -15,6 +15,7 @@
 import rt
 import str
 import num
+import std.textfmt
 
 export {
     // ROUND 88 -- the plain name takes TEXT. Whoever hands over raw octets
@@ -44,6 +45,8 @@ export {
     read_file_text, write_file_text,
     // round 70 -- str
     fmt_value, fmt_str, print_str, println_str,
+    // r665 -- format specs: f"{x:>8.2f}" (placeholder + one step per type)
+    fmt_spec, fmt_spec_i, fmt_spec_u, fmt_spec_f64, fmt_spec_f32, fmt_spec_str, fmt_spec_bool,
     fmt_string,
     read_i64, read_f64, ask_i64, ask_f64,
 }
@@ -580,6 +583,257 @@ fn fmt_f32(f: Fmt, x: f32) -> Fmt {
     }
     num.bytes_free(&b)
     return g
+}
+
+// ---------------------------------------------- r665: format specs {x:spec}
+//
+// `f"{x:>8.2f}"`: the parser packs the spec into ONE u64 (layout in
+// compiler/src/fmtspec.rs) and writes the placeholder `io.fmt_spec(chain, x,
+// spec)`; the type check picks one of the steps below by the type of x.
+// Python subset: `[[fill]align][sign][#][0][width][.precision][d x X o b f F s %]`
+// (ASCII fill; no `,` `_` `e` `g` `c`). Width counts code points. `f` is exact
+// (std.textfmt.fixed, limit |x*10^digits| < 2^64). Ints take `:f`/`:%` too.
+
+// The placeholder itself (the type check always replaces it).
+fn fmt_spec(f: Fmt, v: i64, spec: u64) -> Fmt {
+    return fmt_spec_i(f, v, spec)
+}
+
+// Pad `head` (sign/prefix) + `body` to the width and append to the builder.
+fn spec_emit(f: Fmt, head: *mut rt.Buf, body: *mut rt.Buf, spec: u64, numeric: bool) -> Fmt {
+    var g: Fmt = f
+    let fill: u8 = (spec & 255) as u8
+    var align: u64 = (spec >> 8) & 7
+    let width: usize = ((spec >> 16) & 65535) as usize
+    if align == 0 {
+        if numeric {
+            align = 2
+        } else {
+            align = 1
+        }
+    }
+    let have: usize = rt.buf_len(head) + textfmt.char_count(str { p: rt.buf_data(body), n: rt.buf_len(body) })
+    var pad: usize = 0
+    if width > have {
+        pad = width - have
+    }
+    var left: usize = 0
+    var right: usize = 0
+    var mid: usize = 0
+    if align == 1 {
+        right = pad
+    } else if align == 2 {
+        left = pad
+    } else if align == 3 {
+        left = pad / 2
+        right = pad - left
+    } else {
+        mid = pad
+    }
+    var i: usize = 0
+    while i < left {
+        rt.buf_push(&g.b, fill)
+        i = i + 1
+    }
+    rt.buf_push_bytes(&g.b, rt.buf_ptr(head), rt.buf_len(head))
+    i = 0
+    while i < mid {
+        rt.buf_push(&g.b, fill)
+        i = i + 1
+    }
+    rt.buf_push_bytes(&g.b, rt.buf_ptr(body), rt.buf_len(body))
+    i = 0
+    while i < right {
+        rt.buf_push(&g.b, fill)
+        i = i + 1
+    }
+    return g
+}
+
+// Sign octets: `-` for negative, `+` / ` ` flags otherwise.
+fn spec_sign(head: *mut rt.Buf, neg: bool, spec: u64) {
+    if neg {
+        rt.buf_push(head, 45 as u8)
+    } else if ((spec >> 11) & 1) == 1 {
+        rt.buf_push(head, 43 as u8)
+    } else if ((spec >> 12) & 1) == 1 {
+        rt.buf_push(head, 32 as u8)
+    }
+}
+
+// An integer by sign + magnitude: d x X o b (and f F % through a float).
+fn spec_int(f: Fmt, neg: bool, mag: u64, spec: u64) -> Fmt {
+    let ty: u8 = ((spec >> 48) & 255) as u8
+    if ty == 102 || ty == 70 || ty == 37 {
+        var xf: f64 = mag as f64
+        if neg {
+            xf = 0.0 - xf
+        }
+        return fmt_spec_f64(f, xf, spec)
+    }
+    var head: rt.Buf = rt.buf_new()
+    var body: rt.Buf = rt.buf_new()
+    spec_sign(&head, neg, spec)
+    var base: u64 = 10
+    if ty == 120 || ty == 88 {
+        base = 16
+    } else if ty == 111 {
+        base = 8
+    } else if ty == 98 {
+        base = 2
+    }
+    if ((spec >> 13) & 1) == 1 && base != 10 {
+        rt.buf_push(&head, 48 as u8)
+        if ty == 120 {
+            rt.buf_push(&head, 120 as u8)
+        } else if ty == 88 {
+            rt.buf_push(&head, 88 as u8)
+        } else if ty == 111 {
+            rt.buf_push(&head, 111 as u8)
+        } else {
+            rt.buf_push(&head, 98 as u8)
+        }
+    }
+    var digits: [u8; 64] = [0 as u8; 64]
+    var n: usize = 0
+    var x: u64 = mag
+    if x == 0 {
+        digits[0] = 48 as u8
+        n = 1
+    }
+    while x > 0 {
+        let d: u64 = x % base
+        if d < 10 {
+            digits[n] = d as u8 + 48 as u8
+        } else if ty == 88 {
+            digits[n] = d as u8 + 55 as u8
+        } else {
+            digits[n] = d as u8 + 87 as u8
+        }
+        x = x / base
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        rt.buf_push(&body, digits[n])
+    }
+    let out: Fmt = spec_emit(f, &head, &body, spec, true)
+    rt.buf_free(&head)
+    rt.buf_free(&body)
+    return out
+}
+
+fn fmt_spec_i(f: Fmt, v: i64, spec: u64) -> Fmt {
+    let ty: u8 = ((spec >> 48) & 255) as u8
+    if ty == 102 || ty == 70 || ty == 37 {
+        return fmt_spec_f64(f, v as f64, spec)
+    }
+    if v < 0 {
+        return spec_int(f, true, (0 - (v + 1)) as u64 + 1, spec)
+    }
+    return spec_int(f, false, v as u64, spec)
+}
+
+fn fmt_spec_u(f: Fmt, v: u64, spec: u64) -> Fmt {
+    return spec_int(f, false, v, spec)
+}
+
+// A float body (text of `x`, maybe with a leading `-`) -> sign split + pad.
+fn spec_float_body(f: Fmt, body: *mut rt.Buf, spec: u64) -> Fmt {
+    var head: rt.Buf = rt.buf_new()
+    var rest: rt.Buf = rt.buf_new()
+    let n: usize = rt.buf_len(body)
+    let p: *mut u8 = rt.buf_data(body)
+    var from: usize = 0
+    if n > 0 && *p == 45 as u8 {
+        spec_sign(&head, true, spec)
+        from = 1
+    } else {
+        spec_sign(&head, false, spec)
+    }
+    rt.buf_push_bytes(&rest, rt.buf_ptr(body) + from as u64, n - from)
+    let out: Fmt = spec_emit(f, &head, &rest, spec, true)
+    rt.buf_free(&head)
+    rt.buf_free(&rest)
+    return out
+}
+
+fn fmt_spec_f64(f: Fmt, x: f64, spec: u64) -> Fmt {
+    let ty: u8 = ((spec >> 48) & 255) as u8
+    let p1: u64 = (spec >> 32) & 65535
+    var body: rt.Buf = rt.buf_new()
+    if ty == 0 {
+        var b: num.Bytes = num.bytes_new()
+        if num.write_f64(&b, x) {
+            rt.buf_push_bytes(&body, rt.addr_of(b.ptr), b.len)
+        }
+        num.bytes_free(&b)
+    } else {
+        var digits: usize = 6
+        if p1 > 0 {
+            digits = (p1 - 1) as usize
+        }
+        if ty == 37 {
+            textfmt.fixed(&body, x * 100.0, digits)
+            rt.buf_push(&body, 37 as u8)
+        } else {
+            textfmt.fixed(&body, x, digits)
+        }
+    }
+    let out: Fmt = spec_float_body(f, &body, spec)
+    rt.buf_free(&body)
+    return out
+}
+
+fn fmt_spec_f32(f: Fmt, x: f32, spec: u64) -> Fmt {
+    let ty: u8 = ((spec >> 48) & 255) as u8
+    if ty != 0 {
+        return fmt_spec_f64(f, x as f64, spec)
+    }
+    var body: rt.Buf = rt.buf_new()
+    var b: num.Bytes = num.bytes_new()
+    if num.write_f32(&b, x) {
+        rt.buf_push_bytes(&body, rt.addr_of(b.ptr), b.len)
+    }
+    num.bytes_free(&b)
+    let out: Fmt = spec_float_body(f, &body, spec)
+    rt.buf_free(&body)
+    return out
+}
+
+fn fmt_spec_str(f: Fmt, s: str, spec: u64) -> Fmt {
+    let p1: u64 = (spec >> 32) & 65535
+    var head: rt.Buf = rt.buf_new()
+    var body: rt.Buf = rt.buf_new()
+    var n: usize = s.n
+    if p1 > 0 {
+        // cut after `precision` code points
+        let keep: usize = (p1 - 1) as usize
+        var chars: usize = 0
+        var i: usize = 0
+        while i < s.n {
+            if (*(s.p + i) & 192 as u8) != 128 as u8 {
+                if chars == keep {
+                    break
+                }
+                chars = chars + 1
+            }
+            i = i + 1
+        }
+        n = i
+    }
+    rt.buf_push_bytes(&body, s.p as u64, n)
+    let out: Fmt = spec_emit(f, &head, &body, spec, false)
+    rt.buf_free(&head)
+    rt.buf_free(&body)
+    return out
+}
+
+fn fmt_spec_bool(f: Fmt, w: bool, spec: u64) -> Fmt {
+    if w {
+        return fmt_spec_str(f, "true", spec)
+    }
+    return fmt_spec_str(f, "false", spec)
 }
 
 // ================================================================= Input

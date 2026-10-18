@@ -5,9 +5,11 @@
 # notification service as the judge.
 #
 #   bash tools/android/jarvis_e2e.sh [apk]          (default: the newest /root/jarvis-android-builds/jarvis-*.apk)
-#   SERIAL=emulator-5592 ADB_PORT=5041 bash ...     (use a running emulator, do not boot or stop one)
+#   SERIAL=emulator-5594 ADB_PORT=5043 bash ...     (use a running emulator, do not boot or stop one)
+#   AVD=<name> EMU_PORT=<port> ADB_PORT=<port> OUT=<dir> bash ...   (own emulator copy, own adb server)
 #
-# Own AVD copy "a6e" (console port 5592, own adb server on port 5041): other checks that use the shared adb server never see it.
+# Own AVD copy "a7e" (console port 5594, own adb server on port 5043; image google_apis when installed, because that one has a speech
+# engine for section 9, else the plain "default" image and section 9 only notes it): other checks that use the shared adb server never see it.
 # Checks: login, message + streamed reply, Board (projects, a need answered), Tasks (add), conversation list (Chats), photo upload
 # (system picker -> POST /api/m/upload -> text carries the server path), file receive (JE_FILE -> download -> Downloads/Jarvis),
 # push over the HTTPS long poll while the app is in the background (POST /fake/push -> a REAL notification, tap opens the app,
@@ -33,7 +35,8 @@ for t in tesseract python3; do command -v $t >/dev/null || { echo "skip: $t miss
 python3 -c "import websockets, PIL" 2>/dev/null || { echo "skip: python3 websockets/PIL missing"; exit 0; }
 W=$(mktemp -d)
 EMU=""; SRV=""
-ADB_PORT=${ADB_PORT:-5041}
+ADB_PORT=${ADB_PORT:-5043}
+AVD=${AVD:-a7e}
 ADB0="$SDK/platform-tools/adb -P $ADB_PORT"
 cleanup() {
     [ -n "$SRV" ] && kill $SRV 2>/dev/null
@@ -45,14 +48,15 @@ trap cleanup EXIT
 
 if [ -z "${SERIAL:-}" ]; then
     AVDHOME=${ANDROID_AVD_HOME:-$HOME/.android/avd}
-    if [ ! -d "$AVDHOME/a6e.avd" ]; then # own copy: only the config, a fresh data partition
-        mkdir -p "$AVDHOME/a6e.avd"; sed 's/firn/a6e/g' "$AVDHOME/firn.avd/config.ini" >"$AVDHOME/a6e.avd/config.ini"
-        printf 'avd.ini.encoding=UTF-8\npath=%s/a6e.avd\npath.rel=avd/a6e.avd\ntarget=android-35\n' "$AVDHOME" >"$AVDHOME/a6e.ini"
+    IMG=default; [ -d "$SDK/system-images/android-35/google_apis/x86_64" ] && IMG=google_apis
+    if [ ! -d "$AVDHOME/$AVD.avd" ]; then # own copy: only the config, a fresh data partition
+        mkdir -p "$AVDHOME/$AVD.avd"; sed -e "s/firn/$AVD/g" -e "s#android-35/default/#android-35/$IMG/#" -e "s/^tag.id *=.*/tag.id = $IMG/" "$AVDHOME/firn.avd/config.ini" >"$AVDHOME/$AVD.avd/config.ini"
+        printf 'avd.ini.encoding=UTF-8\npath=%s/%s.avd\npath.rel=avd/%s.avd\ntarget=android-35\n' "$AVDHOME" "$AVD" "$AVD" >"$AVDHOME/$AVD.ini"
     fi
     $ADB0 start-server >/dev/null 2>&1
-    ANDROID_ADB_SERVER_PORT=$ADB_PORT ANDROID_SDK_ROOT=$SDK ANDROID_AVD_HOME=$AVDHOME "$SDK/emulator/emulator" -avd a6e -port 5592 \
+    ANDROID_ADB_SERVER_PORT=$ADB_PORT ANDROID_SDK_ROOT=$SDK ANDROID_AVD_HOME=$AVDHOME "$SDK/emulator/emulator" -avd $AVD -port ${EMU_PORT:-5594} \
         -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data -gpu swiftshader_indirect >"$W/emu.log" 2>&1 & EMU=$!
-    SERIAL=emulator-5592
+    SERIAL=emulator-${EMU_PORT:-5594}
 fi
 ADB="$ADB0 -s $SERIAL"
 for _ in $(seq 150); do [ "$($ADB shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break; sleep 3; done
@@ -96,9 +100,11 @@ from PIL import Image
 im=Image.open(sys.argv[1]).convert('L').crop(tuple(map(int,sys.argv[2:6])))
 im.resize((im.width*3,im.height*3)).save(sys.argv[6])" "$OUT/$1.png" "$2" "$3" "$4" "$5" "$OUT/$1_crop.png" && tesseract "$OUT/$1_crop.png" stdout --psm 7 2>/dev/null | tr -s '\n ' ' '; }
 kbd() { $ADB shell dumpsys input_method | grep -c 'mInputShown=true'; }
-hide_kbd() { $ADB shell input keyevent KEYCODE_BACK; sleep 1; }
+# BACK only while the keyboard is up: without it BACK leaves the app (a slow host shows the keyboard seconds late)
+wait_kbd_up() { local i; for i in $(seq 12); do [ "$(kbd)" = 1 ] && return 0; sleep 1; done; return 1; }
+hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; fi; sleep 1; }
 # type into the field whose hint is $1, then leave the keyboard
-type_into() { tap_word "$1" 1 1.5 || return 1; $ADB shell input text "$2"; sleep 1; hide_kbd; }
+type_into() { tap_word "$1" 1 1.5 || return 1; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
 send_text() { type_into "Message" "$1" && tap_word "Send" 1 1; }
 notes() { $ADB shell dumpsys notification --noredact; }
 # title / text lines of the notifications of the app (not the service one)
@@ -143,8 +149,10 @@ check "login screen shows" "$(OCR_TRIES=40 wait_ocr 01_login 'Sign in')" 1
 
 # ---- 1. login + chat ---------------------------------------------------------------------------------------------------------
 echo "== 1. login, message, streamed reply"
-type_into "User" justin; type_into "Password" pw
+type_into "Username" justin; type_into "Password" pw
 tap_word "Sign" 1 1
+check "the notification notice page shows after the first sign-in" "$(OCR_TRIES=20 wait_ocr 01b_notice 'Continue')" 1
+tap_word "Continue" 1 3
 check "chat screen after login" "$(OCR_TRIES=30 wait_ocr 02_chat 'Chats')" 1
 check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 1
 send_text hello
@@ -178,7 +186,9 @@ check "list shows a chat" "$(OCR_TRIES=10 wait_ocr 07_convs 'hello\|worker\|hi')
 # ---- 4. photo upload ---------------------------------------------------------------------------------------------------------
 echo "== 4. photo upload"
 tap_word "New" 1 2
-shot _p; p=$(word_at _p 'Message'); [ -n "$p" ] && $ADB shell input tap $((141 * SW / 1080)) ${p#* }; sleep 4; U=$(ui)
+shot _p; p=$(word_at _p 'Message'); [ -n "$p" ] && $ADB shell input tap $((141 * SW / 1080)) ${p#* }; sleep 2
+tap_word "Photo" 1 4 # "+" shows the two choices (Photo / File)
+U=$(ui)
 check "the system's picker opens" "$(echo "$U" | grep -cE '(text|content-desc)="(Media picker|Photos|Files|Gallery|Camera|Recent|Photo taken)' | awk '{print ($1>0)?"yes":"no"}')" yes
 P0=$($ADB shell pidof $PKG)
 # the chooser (Camera / Media picker) may come first; then the picker lists the photo as a content description
@@ -216,9 +226,10 @@ check "the service text is neutral (no 'Relay')" "$(notes | grep -A25 "pkg=$PKG"
 push "Second" "another line"
 for _ in $(seq 20); do note_lines | grep -q 'Second' && break; sleep 1; done
 check "a second event: a second notification" "$(note_lines | grep -c 'Second')" 1
+check "same chat: the second event replaces the first (one keyed notification per chat)" "$(note_lines | grep -c 'Worker done')" 0
 echo "  tap the notification"
 $ADB shell cmd statusbar expand-notifications; sleep 3
-b=$(ui | grep -E 'id/(notification_)?title"' | grep 'text="Worker done' | grep -oP 'bounds="\K[^"]+' | head -1)
+b=$(ui | grep -E 'id/(notification_)?title"' | grep 'text="Second' | grep -oP 'bounds="\K[^"]+' | head -1)
 if [ -n "$b" ]; then xy=$(mid "$b"); $ADB shell input tap $(( ${xy% *} + 200 )) ${xy#* }; sleep 5; else note "notification not found in the shade"; fi
 $ADB shell cmd statusbar collapse
 check "tap: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
