@@ -1557,6 +1557,32 @@ same desugaring in its parser (`for_each`) and knows `__each_len` in the type
 checker and the lowering. Proof: `tests/2008_for_each.fi`,
 `tests/neg/for_each_*.fi`.
 
+**r664 (`for` over `Vec` and `str`, stage 0 only).** The same desugar walks a
+`Vec[T]` (`x` = copy of the element, `T` scalar or plain struct) and a `str`
+(the BYTES, `u8` -- not code points). The sequence can be a local, a field path,
+`*p` or a `&` / `inout` parameter. The hidden counter is the ONLY thing that
+may index a Vec/str (no bounds check, so `v[i]` by hand stays an error "index
+on the non-array type Vec__i32"). The length is read once when the loop starts:
+do not push to / clear the Vec inside the body. `firnc1` does NOT know this yet
+(tests carry `// firnc1_skip:`, which `self_compare`/`sema_compare`/`fir_compare`/
+`types_compare` honour). Proof: `tests/3761_for_in_vec_str.fi`,
+`tests/neg/for_in_*.fi`, example `examples/vs_python/lang/for_in_vec.fi`.
+
+**r664 (f-strings, stage 0 only).** `{{` and `}}` are literal braces; a text
+literal may stand inside `{ ... }` (`f"{m.get(&r, "name")}"`, braces inside it
+are fine); `"a" + f"{n}"` is a type error ("an f-string is a Fmt builder, not a
+str", use `io.fmt_string(f"..")`) -- it used to compile and give garbage.
+Proof: `tests/3762`, `tests/3763` (`_fmtskip`: firnfmt's lexer does not know the
+nested form yet), `tests/neg/fstring_plus_str.fi`. `firnc1` does not know the
+first two (tests carry `// firnc1_skip:`).
+
+**r664 (stdlib without `$FIRNLIB`).** Step 4 of the import search looks at
+`<exe dir>/../lib`, then `../../lib`, then `../../../lib` (installed layout,
+deeper layout, repository layout `compiler/target/release/firnc` -> `lib/`);
+the first one holding `std/io.fi` wins, otherwise `../lib` as before. `$FIRNLIB`
+still wins. `firnc --print-sysroot` prints the directory (`$FIRNLIB` if set;
+exit 1 and no output if none). Both compilers; proof `tools/sysroot/run.sh`.
+
 **Round OWN (destructors and the move checker, `compiler/src/moves.rs`,
 `lower.rs`).** A struct with `fn drop(inout self)` in its `impl` owns something;
 so does every struct or array that contains one (*non-trivial* types, SPEC 3.3).

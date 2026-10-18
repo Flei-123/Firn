@@ -208,7 +208,10 @@ fn expr(cx: &mut Ctx, e: &mut Expr) {
     match &mut e.kind {
         ExprKind::Field(b, ..) => auto_deref_base(cx, b, false),
         ExprKind::Index(b, i) => {
-            auto_deref_base(cx, b, true);
+            // r664: the hidden counter of `for x in vec` walks any sequence
+            // behind a reference parameter, not only an array.
+            let hidden = matches!(&i.kind, ExprKind::Ident(n) if n.starts_with(crate::foreach::HIDDEN));
+            auto_deref_base(cx, b, !hidden);
             expr(cx, i);
         }
         ExprKind::IfElse(c, a, b) => {

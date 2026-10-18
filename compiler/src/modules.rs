@@ -83,12 +83,58 @@ fn extra_search_paths() -> Vec<PathBuf> {
     if let Some(p) = firnlib_path(std::env::var("FIRNLIB").ok().as_deref()) {
         out.push(p);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            out.push(dir.join("..").join("lib"));
-        }
+    if let Some(p) = sysroot_lib() {
+        out.push(p);
     }
     out
+}
+
+/// Marker file that identifies the standard library directory.
+const SYSROOT_MARKER: &str = "std/io.fi";
+
+/// The library directory next to the running compiler (no `$FIRNLIB`).
+/// Candidates, first one that holds `std/io.fi` wins:
+///   `<exe dir>/../lib`        installed layout (`bin/firnc` + `lib/`)
+///   `<exe dir>/../../lib`
+///   `<exe dir>/../../../lib`  repository layout
+///                             (`compiler/target/release/firnc` -> `lib/`)
+/// If none holds the marker, the old default `<exe dir>/../lib` stays, so
+/// existing resolutions do not change. `firnc1` (`exe_search_path`) keeps
+/// the same order and the same spelling of the path.
+pub fn sysroot_lib() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    sysroot_lib_in(dir)
+}
+
+fn sysroot_lib_in(dir: &Path) -> Option<PathBuf> {
+    let mut up = dir.to_path_buf();
+    let mut first: Option<PathBuf> = None;
+    for _ in 0..3 {
+        up.push("..");
+        let cand = up.join("lib");
+        if cand.join(SYSROOT_MARKER).is_file() {
+            return Some(cand);
+        }
+        if first.is_none() {
+            first = Some(cand);
+        }
+    }
+    first
+}
+
+/// What `--print-sysroot` prints: `$FIRNLIB` if set (it wins), otherwise
+/// the library directory next to the compiler; `None` if there is none.
+pub fn print_sysroot() -> Option<PathBuf> {
+    if let Some(p) = firnlib_path(std::env::var("FIRNLIB").ok().as_deref()) {
+        return Some(p);
+    }
+    let p = sysroot_lib()?;
+    if p.join(SYSROOT_MARKER).is_file() {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 /// Error of the module resolution. `Diag` is the familiar message with a

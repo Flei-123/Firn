@@ -133,6 +133,10 @@ pub fn lex_fstring_literal(src: &[char], pos: usize) -> Option<(Result<String, L
     let mut body: Vec<char> = Vec::new();
     let mut i = pos + 2;
     let mut closed = false;
+    // r664: inside `{ ... }` a `"` opens a NESTED text literal (up to its own
+    // closing quote) instead of ending the f-string, and `{{` / `}}` in the
+    // text part are literal braces (the parser splits them).
+    let mut depth: u32 = 0;
     while let Some(&c) = src.get(i) {
         if c == '\\' {
             body.push(c);
@@ -143,6 +147,44 @@ pub fn lex_fstring_literal(src: &[char], pos: usize) -> Option<(Result<String, L
                     i += 1;
                 }
                 _ => break,
+            }
+            continue;
+        }
+        if depth == 0 && (c == '{' || c == '}') && src.get(i + 1) == Some(&c) {
+            body.push(c);
+            body.push(c);
+            i += 2;
+            continue;
+        }
+        if c == '{' {
+            depth = 1;
+        } else if c == '}' {
+            depth = 0;
+        }
+        if c == '"' && depth > 0 {
+            body.push(c);
+            i += 1;
+            let mut shut = false;
+            while let Some(&d) = src.get(i) {
+                if d == '\n' {
+                    break;
+                }
+                body.push(d);
+                i += 1;
+                if d == '\\' {
+                    if let Some(&n) = src.get(i) {
+                        if n != '\n' {
+                            body.push(n);
+                            i += 1;
+                        }
+                    }
+                } else if d == '"' {
+                    shut = true;
+                    break;
+                }
+            }
+            if !shut {
+                break;
             }
             continue;
         }

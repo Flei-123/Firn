@@ -240,6 +240,15 @@ pub(crate) fn record_inst(mangled: &str, inst: Instantiation) {
         if !reg.insts.contains_key(mangled) {
             reg.order.push(mangled.to_string());
             reg.insts.insert(mangled.to_string(), inst);
+        } else if !inst.is_abstract {
+            // The first sighting may have been written inside a generic
+            // template (`vec_set[u8]` in a module imported earlier) and
+            // is flagged abstract, so the expansion skips it. A later
+            // sighting outside any template (concrete use) must win,
+            // else the result depends on the import order.
+            if let Some(old) = reg.insts.get_mut(mangled) {
+                old.is_abstract = false;
+            }
         }
     });
 }

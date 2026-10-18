@@ -26,6 +26,14 @@
 //! a field path, `*p`, or an index by a name / number. Anything else is a
 //! syntax error that tells the author to name the array first.
 //!
+//! **Vec and str (r664, vspy-fnc).** The same desugar also walks a
+//! `Vec[T]` (element copy, `T` scalar or plain struct) and a `str`/`Span`
+//! (the bytes, `u8`; NOT code points: decode with `str.utf8` if needed).
+//! The hidden loop index may index such a sequence -- and ONLY the hidden
+//! index (`__each#..`): `v[i]` written by hand stays an error, because this
+//! element access has no bounds check. The length is read once when the loop
+//! starts; do not push to or clear the Vec inside the body.
+//!
 //! `continue` and `break` work as in every other `for` (the hidden counter is
 //! raised in the step block of the loop).
 
@@ -39,6 +47,92 @@ use crate::types::Type;
 
 /// The hidden intrinsic: the length of an array.
 pub(crate) const LEN: &str = "__each_len";
+
+/// Name prefix of the hidden loop counter (`__each#L_C`).
+pub(crate) const HIDDEN: &str = "__each#";
+
+/// Offsets of the two words every walkable sequence starts with: the data
+/// pointer at 0 and the length at 8 (`Vec`: ptr, len, cap; `str`: p, n).
+const PTR_OFF: u64 = 0;
+const LEN_OFF: u64 = 8;
+
+/// Is `t` a sequence that `for x in s` can walk besides an array: a `Vec[T]`
+/// instance or a `str`-shaped view? Returns the struct index (also behind
+/// one reference).
+pub(crate) fn seq_struct(tcx: &crate::types::TypeCtx, t: &Type) -> Option<usize> {
+    let t = match t {
+        Type::Ptr { inner, .. } => &**inner,
+        other => other,
+    };
+    let sidx = match t {
+        Type::Struct(i) => *i,
+        _ => return None,
+    };
+    let sd = tcx.structs.get(sidx)?;
+    let word = |name: &str, off: u64| sd.field(name).map(|f| f.offset == off).unwrap_or(false);
+    if crate::strtype::is_str_like(t) {
+        return Some(sidx);
+    }
+    let vec_like = sd.name.starts_with("Vec__")
+        && sd.fields.len() == 3
+        && word("ptr", PTR_OFF)
+        && word("len", LEN_OFF)
+        && word("cap", 16);
+    if vec_like {
+        Some(sidx)
+    } else {
+        None
+    }
+}
+
+/// Field names of the two words: `str` calls them `p`/`n`, `Vec` `ptr`/`len`.
+fn word_names(tcx: &crate::types::TypeCtx, sidx: usize) -> (&'static str, &'static str) {
+    if tcx.structs[sidx].field("ptr").is_some() {
+        ("ptr", "len")
+    } else {
+        ("p", "n")
+    }
+}
+
+/// The element type of a sequence for the checker: `u8` for a `str`, the type
+/// argument for a `Vec[T]`.
+pub(crate) fn seq_elem(ck: &mut Checker, t: &Type) -> Option<Type> {
+    let sidx = seq_struct(&ck.tcx, t)?;
+    if crate::strtype::is_str_like(&Type::Struct(sidx)) {
+        return Some(Type::U8);
+    }
+    let name = ck.tcx.structs[sidx].name.clone();
+    let inst = crate::sema_generic::instantiation(&name)?;
+    if inst.base != "Vec" || inst.args.len() != 1 {
+        return None;
+    }
+    let te = inst.args[0].clone();
+    let et = ck.resolve_ty(&te);
+    if et.is_error() {
+        None
+    } else {
+        Some(et)
+    }
+}
+
+/// Address of the data of a sequence and its length (runtime loads).
+pub(crate) fn seq_words(lo: &mut Lower, base: &Expr) -> Option<(Val, Val)> {
+    let bt = lo.ty_of(base);
+    let sidx = match seq_struct(&lo.info.tcx, &bt) {
+        Some(i) => i,
+        None => return lo.ice(base.span, "walking something that is not a sequence"),
+    };
+    let baddr = match &bt {
+        Type::Ptr { .. } => lo.lower_expr(base)?,
+        _ => lo.lower_addr(base)?,
+    };
+    let (pn, ln) = word_names(&lo.info.tcx, sidx);
+    let pa = lo.field_addr(baddr, sidx, pn, base.span)?;
+    let la = lo.field_addr(baddr, sidx, ln, base.span)?;
+    let data = lo.load(FTy::Ptr, pa);
+    let len = lo.load(FTy::U64, la);
+    Some((data, len))
+}
 
 /// Is `e` a place that may be evaluated twice (no calls, no side effects)?
 fn place_ok(e: &Expr) -> bool {
@@ -85,7 +179,7 @@ pub(crate) fn build(
         );
         return Stmt::Error(start);
     }
-    let idx = format!("__each#{}_{}", start.line, start.col);
+    let idx = format!("{}{}_{}", HIDDEN, start.line, start.col);
     let arr_len = reid(p, &arr);
     let len = p.mk(arr.span, ExprKind::Call(LEN.to_string(), vec![arr_len], arr.span));
     let lit = p.mk(arr.span, ExprKind::Int(0));
@@ -121,6 +215,9 @@ pub(crate) fn hook_call(ck: &mut Checker, name: &str, args: &[Expr], espan: Span
         return Some(Type::Error);
     }
     let t = ck.expr(&args[0], None);
+    if seq_struct(&ck.tcx, &t).is_some() {
+        return Some(Type::Usize);
+    }
     let arr = match &t {
         Type::Array(..) => true,
         Type::Ptr { inner, .. } => matches!(**inner, Type::Array(..)),
@@ -155,6 +252,10 @@ fn length_of(t: &Type) -> Option<u64> {
 pub(crate) fn lower_call(lo: &mut Lower, args: &[Expr], span: Span) -> Option<Option<Val>> {
     if args.len() != 1 {
         return lo.ice(span, "__each_len with wrong arity");
+    }
+    if seq_struct(&lo.info.tcx, &lo.ty_of(&args[0])).is_some() {
+        let (_, len) = seq_words(lo, &args[0])?;
+        return Some(Some(len));
     }
     let n = match length_of(&lo.ty_of(&args[0])) {
         Some(n) => n,

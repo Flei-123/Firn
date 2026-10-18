@@ -291,6 +291,7 @@ fn usage() -> String {
          --no-run           with --test: only build, do not run\n  \
          --keep-asm         keep the generated .s file\n  \
          --version          print the version\n  \
+         --print-sysroot    print the standard library directory ($FIRNLIB wins) and exit\n  \
          -h, --help         this help\n",
         name = c,
         c = c,
@@ -335,6 +336,17 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--version" => {
                 println!("{} {}", config::compiler_name(), config::VERSION);
                 std::process::exit(0);
+            }
+            "--print-sysroot" => {
+                // The standard library directory this compiler would use
+                // ($FIRNLIB wins); exit 1 and no output if there is none.
+                match modules::print_sysroot() {
+                    Some(p) => {
+                        println!("{}", p.display());
+                        std::process::exit(0);
+                    }
+                    None => std::process::exit(1),
+                }
             }
             "--no-opt" => {
                 optimize = false;

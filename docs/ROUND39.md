@@ -16,6 +16,8 @@ feature: interpolation, resolved at compile time.
 4. in **`<directory of the compiler binary>/../lib`** — the installation
    layout `bin/firnc` + `lib/`. `firnc0` reads `current_exe` for that;
    `firnc1` reads `/proc/self/exe` via the `readlink` syscall.
+   Since r664 the candidates are `../lib`, `../../lib`, `../../../lib` (first
+   one with `std/io.fi`), and `firnc --print-sysroot` prints the result.
 
 The new places come AFTER the old ones: existing resolutions do not change
 (test.sh 640/640, self 186/0/0, fixpoint character-identical — measured

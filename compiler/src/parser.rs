@@ -2489,6 +2489,14 @@ impl<'a> Parser<'a> {
         let mut broken = false;
         while i < chars.len() {
             let c = chars[i];
+            // r664: `{{` and `}}` are literal braces. Close the text segment
+            // right after the FIRST brace and skip the second.
+            if (c == '{' || c == '}') && chars.get(i + 1) == Some(&c) {
+                chain = self.interp_text(chain, sp, &chars[text_of..i + 1], text_of);
+                i += 2;
+                text_of = i;
+                continue;
+            }
             if c == '}' {
                 self.dg.error(
                     sp,
@@ -2517,6 +2525,19 @@ impl<'a> Parser<'a> {
             let mut j = i + 1;
             let mut too = false;
             while j < chars.len() {
+                // r664: a nested text literal inside the expression is
+                // skipped as a whole (it may hold braces).
+                if chars[j] == '"' {
+                    j += 1;
+                    while j < chars.len() && chars[j] != '"' {
+                        if chars[j] == '\\' {
+                            j += 1;
+                        }
+                        j += 1;
+                    }
+                    j += 1;
+                    continue;
+                }
                 if chars[j] == '{' {
                     self.dg.error(
                         sp,

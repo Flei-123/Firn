@@ -541,6 +541,16 @@ impl<'a> Lower<'a> {
                 // Layer field access <-> storage location (layout.rs, DESIGN_GOALS 8)
                 self.field_addr(baddr, sidx, fname, *fspan)
             }
+            ExprKind::Index(base, idx)
+                if crate::foreach::seq_struct(&self.info.tcx, &self.ty_of(base)).is_some() =>
+            {
+                // r664: element of a Vec / str behind the hidden loop counter
+                let (data, _) = crate::foreach::seq_words(self, base)?;
+                let esz = self.info.tcx.size_of(&self.ty_of(e)).max(1);
+                let iv = self.lower_expr(idx)?;
+                let ift = self.fty_of(idx)?;
+                Some(self.elem_addr(data, esz, iv, ift))
+            }
             ExprKind::Index(base, idx) => {
                 let bt = self.ty_of(base);
                 let (elem, baddr) = match &bt {
