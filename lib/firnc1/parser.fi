@@ -4110,8 +4110,78 @@ fn if_expr(p: *mut Parser) -> u32 {
     return ast.expr_new(par_tree(p), ast.E_IFEX, cond, then_v, else_v, 0)
 }
 
-fn if_stmt(p: *mut Parser) -> u32 {
+// r719 (parser.rs::let_some_head) -- `let Some(<pat>) = <expr>` after `if` / `while`. Returns the
+// interned hidden name `__opt#<line>_<col>` (0 after an error) and sets `*scrut`; the pattern
+// bindings (reading `<hidden>.val`) are appended to `binds`.
+fn let_some_head(p: *mut Parser, hpos: u64, scrut: *mut u32, binds: *mut Vec[u32]) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
     next_bump(p)
+    var sw: [u8; 4] = "Some"
+    if !actual(p, A_IDENT) || !intern.intern_equal(lexer.lex_names(lx(p)), tok_nr(p, 0), (&sw[0]) as u64, 4) {
+        complain(p)
+        return 0
+    }
+    next_bump(p)
+    if !expect(p, A_LPAREN) {
+        return 0
+    }
+    var enc: Vec[u32] = vec_new[u32]()
+    if !tuple_pattern(p, &enc) {
+        vec_free[u32](&enc)
+        return 0
+    }
+    if !expect(p, A_RPAREN) || !expect(p, A_ASSIGN) {
+        vec_free[u32](&enc)
+        return 0
+    }
+    var si: usize = 0
+    while si < vec_len[u32](&enc) {
+        if vec_at[u32](&enc, si) == 0 {
+            rp_shadow(p, vec_at[u32](&enc, si + 1))
+        }
+        si = si + 2
+    }
+    *scrut = cond_expr(p)
+    rt.buf_clear(&(*p).scratch)
+    var hw: [u8; 6] = "__opt#"
+    rt.buf_push_bytes(&(*p).scratch, (&hw[0]) as u64, 6)
+    rt.buf_push_dec_u64(&(*p).scratch, ast.pos_line(hpos) as u64)
+    rt.buf_push(&(*p).scratch, 95 as u8)
+    rt.buf_push_dec_u64(&(*p).scratch, ast.pos_col(hpos) as u64)
+    let tmp: u32 = intern.intern_number(lexer.lex_names(lx(p)), rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+    let val: u32 = opt_field(p, tmp, false, hpos)
+    loc_on(p)
+    var cur: usize = 0
+    bind_pat(p, &enc, &cur, val, binds)
+    vec_free[u32](&enc)
+    return tmp
+}
+
+// `<tmp>.has` / `<tmp>.val` as an expression node.
+fn opt_field(p: *mut Parser, tmp: u32, is_has: bool, hpos: u64) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
+    let base: u32 = ast.expr_new(b, ast.E_ID, tmp, 0, 0, 0)
+    pos_default(p, base, hpos)
+    var hs: [u8; 3] = "has"
+    var vs: [u8; 3] = "val"
+    var nr: u32 = 0
+    if is_has {
+        nr = intern.intern_number(lexer.lex_names(lx(p)), (&hs[0]) as u64, 3) as u32
+    } else {
+        nr = intern.intern_number(lexer.lex_names(lx(p)), (&vs[0]) as u64, 3) as u32
+    }
+    let e: u32 = ast.expr_new(b, ast.E_FIELD, base, nr, 0, 0)
+    pos_default(p, e, hpos)
+    return e
+}
+
+fn if_stmt(p: *mut Parser) -> u32 {
+    let hpos: u64 = at_pos(p, 0)
+    next_bump(p)
+    if actual(p, A_KWLET) {
+        return if_let(p, hpos)
+    }
     let cond: u32 = cond_expr(p)
     let then: u32 = block(p)
     var els: u32 = ast.NOTHING
@@ -4127,8 +4197,86 @@ fn if_stmt(p: *mut Parser) -> u32 {
     return ast.stmt_new(par_tree(p), ast.S_IF, cond, then, els, 0)
 }
 
+// `if let Some(p) = e { A } else { B }` -> `{ let __opt#L_C = e; if __opt#L_C.has { <binds> A } else { B } }`
+fn if_let(p: *mut Parser, hpos: u64) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
+    var binds: Vec[u32] = vec_new[u32]()
+    var scrut: u32 = 0
+    let tmp: u32 = let_some_head(p, hpos, &scrut, &binds)
+    if tmp == 0 {
+        vec_free[u32](&binds)
+        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+    }
+    var bi: usize = 0
+    while bi < vec_len[u32](&binds) {
+        vec_push[u32](&(*p).pre_list, vec_at[u32](&binds, bi))
+        bi = bi + 1
+    }
+    vec_free[u32](&binds)
+    let then: u32 = block(p)
+    loc_off(p)
+    var els: u32 = ast.NOTHING
+    if actual(p, A_KWELSE) {
+        next_bump(p)
+        if actual(p, A_KWIF) {
+            els = stmt(p)
+        } else {
+            let eb: u32 = block(p)
+            els = ast.stmt_new(b, ast.S_BLOCK, eb, 0, 0, 0)
+        }
+    }
+    let cond: u32 = opt_field(p, tmp, true, hpos)
+    let hidden: u32 = ast.stmt_new(b, ast.S_LET, tmp, ast.NOTHING, scrut, 0)
+    let ifs: u32 = ast.stmt_new(b, ast.S_IF, cond, then, els, 0)
+    let off: u32 = vec_len[u32](&(*b).slist) as u32
+    vec_push[u32](&(*b).slist, hidden)
+    vec_push[u32](&(*b).slist, ifs)
+    let blk: u32 = ast.block_new(b, off, 2)
+    ast.block_end_set(b, blk, ast.block_end(b, then))
+    return ast.stmt_new(b, ast.S_BLOCK, blk, 0, 0, 0)
+}
+
+// `while let Some(p) = e { A }` -> `while true { let __opt#L_C = e; if !__opt#L_C.has { break }; <binds> A }`
+fn while_let(p: *mut Parser, hpos: u64) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
+    var binds: Vec[u32] = vec_new[u32]()
+    var scrut: u32 = 0
+    let tmp: u32 = let_some_head(p, hpos, &scrut, &binds)
+    if tmp == 0 {
+        vec_free[u32](&binds)
+        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let hidden: u32 = ast.stmt_new(b, ast.S_LET, tmp, ast.NOTHING, scrut, 0)
+    let has: u32 = opt_field(p, tmp, true, hpos)
+    let not: u32 = ast.expr_new(b, ast.E_UN, U_NOT, has, 0, 0)
+    pos_default(p, not, hpos)
+    let brk: u32 = ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+    let boff: u32 = vec_len[u32](&(*b).slist) as u32
+    vec_push[u32](&(*b).slist, brk)
+    let bblk: u32 = ast.block_new(b, boff, 1)
+    ast.block_end_set(b, bblk, hpos)
+    let ifs: u32 = ast.stmt_new(b, ast.S_IF, not, bblk, ast.NOTHING, 0)
+    vec_push[u32](&(*p).pre_list, hidden)
+    vec_push[u32](&(*p).pre_list, ifs)
+    var bi: usize = 0
+    while bi < vec_len[u32](&binds) {
+        vec_push[u32](&(*p).pre_list, vec_at[u32](&binds, bi))
+        bi = bi + 1
+    }
+    vec_free[u32](&binds)
+    let body: u32 = block(p)
+    loc_off(p)
+    let t: u32 = ast.expr_new(b, ast.E_BOOL, 1, 0, 0, 0)
+    pos_default(p, t, hpos)
+    return ast.stmt_new(b, ast.S_WHILE, t, body, 0, 0)
+}
+
 fn while_stmt(p: *mut Parser) -> u32 {
+    let hpos: u64 = at_pos(p, 0)
     next_bump(p)
+    if actual(p, A_KWLET) {
+        return while_let(p, hpos)
+    }
     let cond: u32 = cond_expr(p)
     let body: u32 = block(p)
     return ast.stmt_new(par_tree(p), ast.S_WHILE, cond, body, 0, 0)

@@ -1799,8 +1799,94 @@ compute it",
         }
     }
 
+    /// r719 -- `if let Some(p) = e { .. } else { .. }` / `while let Some(p) = e { .. }`.
+    /// Called with the current token at `let`. Parses `let Some(<pat>) = <expr>` and
+    /// returns (hidden name `__opt#<line>_<col>`, the scrutinee, the pattern bindings
+    /// reading `<hidden>.val`). `None` after an error (already reported).
+    fn let_some_head(&mut self, start: Span) -> Option<(String, Expr, Vec<Stmt>)> {
+        self.bump(); // 'let'
+        let ok = matches!(self.kind(), TokKind::Ident(n) if n == "Some");
+        if !ok {
+            self.error_here("expected 'Some(..)' after 'if let' / 'while let'");
+            self.recovering = false;
+            self.sync_stmt();
+            return None;
+        }
+        self.bump();
+        if !self.expect(TokKind::LParen, "after 'Some' in a 'let' condition") {
+            self.recovering = false;
+            self.sync_stmt();
+            return None;
+        }
+        let pat = match self.tuple_pattern() {
+            Some(p) => p,
+            None => {
+                self.recovering = false;
+                self.sync_stmt();
+                return None;
+            }
+        };
+        if !self.expect(TokKind::RParen, "after the pattern of 'Some(..)'") {
+            self.recovering = false;
+            self.sync_stmt();
+            return None;
+        }
+        if !self.expect(TokKind::Assign, "after 'Some(..)' in a 'let' condition") {
+            self.recovering = false;
+            self.sync_stmt();
+            return None;
+        }
+        let scrut = self.cond_expr();
+        if self.recovering {
+            self.recovering = false;
+            if !self.at(&TokKind::LBrace) {
+                self.sync_stmt();
+                return None;
+            }
+        }
+        let tmp = format!("__opt#{}_{}", start.line, start.col);
+        let base = self.mk(start, ExprKind::Ident(tmp.clone()));
+        let val = self.mk(start, ExprKind::Field(Box::new(base), "val".to_string(), start));
+        let mut binds = Vec::new();
+        self.bind_pat(&pat, val, &mut binds);
+        Some((tmp, scrut, binds))
+    }
+
+    fn opt_has(&mut self, tmp: &str, start: Span) -> Expr {
+        let base = self.mk(start, ExprKind::Ident(tmp.to_string()));
+        self.mk(start, ExprKind::Field(Box::new(base), "has".to_string(), start))
+    }
+
     fn if_stmt(&mut self) -> Stmt {
         let start = self.bump(); // 'if'
+        if self.at(&TokKind::KwLet) {
+            let (tmp, scrut, binds) = match self.let_some_head(start) {
+                Some(x) => x,
+                None => return Stmt::Error(start),
+            };
+            let mut then = self.block("after the condition of 'if let'");
+            let mut stmts = binds;
+            stmts.append(&mut then.stmts);
+            then.stmts = stmts;
+            let els = if self.at(&TokKind::KwElse) {
+                self.bump();
+                if self.at(&TokKind::KwIf) {
+                    Some(Box::new(self.stmt()))
+                } else {
+                    Some(Box::new(Stmt::Block(self.block("after 'else'"))))
+                }
+            } else {
+                None
+            };
+            let cond = self.opt_has(&tmp, start);
+            let hidden = Stmt::Let { name: tmp, mutable: false, ty: None, init: scrut, span: start };
+            let end = then.end;
+            return Stmt::Block(Block {
+                stmts: vec![hidden, Stmt::If { cond, then, els, span: start }],
+                span: start,
+                end,
+            });
+        }
         let cond = self.cond_expr();
         if self.recovering {
             self.recovering = false;
@@ -1825,6 +1911,28 @@ compute it",
 
     fn while_stmt(&mut self) -> Stmt {
         let start = self.bump(); // 'while'
+        if self.at(&TokKind::KwLet) {
+            let (tmp, scrut, binds) = match self.let_some_head(start) {
+                Some(x) => x,
+                None => return Stmt::Error(start),
+            };
+            self.loop_depth += 1;
+            let mut body = self.block("after the condition of 'while let'");
+            self.loop_depth -= 1;
+            // while true { let tmp = e; if !tmp.has { break }; <binds>; <body> }
+            let has = self.opt_has(&tmp, start);
+            let not = self.mk(start, ExprKind::Unary(UnOp::Not, Box::new(has)));
+            let brk = Block { stmts: vec![Stmt::Break(start)], span: start, end: start };
+            let mut stmts = vec![
+                Stmt::Let { name: tmp, mutable: false, ty: None, init: scrut, span: start },
+                Stmt::If { cond: not, then: brk, els: None, span: start },
+            ];
+            stmts.extend(binds);
+            stmts.append(&mut body.stmts);
+            body.stmts = stmts;
+            let t = self.mk(start, ExprKind::Bool(true));
+            return Stmt::While { cond: t, body, span: start };
+        }
         let cond = self.cond_expr();
         if self.recovering {
             self.recovering = false;
