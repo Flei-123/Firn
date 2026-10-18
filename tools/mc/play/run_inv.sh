@@ -140,6 +140,42 @@ want={9:("stone",40),10:("dirt",10),11:("stone",64)}
 ok=all(got[n]==want[n] for n in want) and all(got[n] is None for n in (12,13,14,15,36,37,38))
 sys.exit(0 if ok else 1)
 PY
+# ---- craft prediction (MCPLAY_CRAFT_TEST, r158): 20 planks spread over crafting grid slots 1 and 3 with "one each" drags -> stick x4 is predicted, take the result,
+# shift click it twice more; the client's result slot, grid and inventory must equal the server's (slot 20 = 12 sticks, source slot = 14 planks, grid empty)
+MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CRAFT_TEST=1 MCPLAY_RUN_S=22 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player12 > "$W/ct4.out" 2>&1 &
+PP=$!
+sleep 5
+echo "gamemode survival Player12" >&3; echo "give Player12 oak_planks 20" >&3
+sleep 13
+echo "data get entity Player12 Inventory" >&3
+sleep 2
+wait $PP
+C4P=$(grep 'mcplay: craftpre' "$W/ct4.out" | head -1)
+C4L=$(grep 'mcplay: crafttest' "$W/ct4.out" | head -1)
+echo "  $C4P"
+echo "  $C4L"
+C4BAD=$(grep -o ' bad=[0-9]*' "$W/ct4.out" | head -1 | cut -d= -f2)
+[ "${C4BAD:-1}" -eq 0 ] || { echo "  FAIL  craft: inv bad=${C4BAD:-?}"; ERR=1; }
+case "$C4P" in *"x4 g1=3 g3=3 "*) ;; *) echo "  FAIL  craft: predicted result after 3 drags $C4P"; ERR=1;; esac
+case "$C4L" in *"res=-1x0 "*"s20="*"x12 "*"x14 g1=0 g3=0 cursor=0 "*) ;; *) echo "  FAIL  craft: local result $C4L"; ERR=1;; esac
+# up to 1.20.2 the server stays silent when the prediction is exact (srv=0); from 1.21.x it re-sends the result slot after every grid change by itself (srv is info only there)
+if [ "$PROTO" -le 764 ]; then case "$C4L" in *" srv=0 "*) ;; *) echo "  FAIL  craft: the server had to correct the prediction ($C4L)"; ERR=1;; esac; fi
+INV4=$(grep 'Player12 has the following entity data' "$W/server.log" | tail -1)
+python3 - "$INV4" <<'PY' || ERR=1
+import re,sys
+t=sys.argv[1]
+tot={}
+at20=None
+for m in re.finditer(r'\{[^{}]*Slot: (\d+)b[^{}]*\}', t):
+    c=re.search(r'(?:Count: |count: )(\d+)', m.group(0))
+    i=re.search(r'(?:id: |id:)"minecraft:(\w+)"', m.group(0))
+    if c and i:
+        tot[i.group(1)]=tot.get(i.group(1),0)+int(c.group(1))
+        if int(m.group(1))==20: at20=(i.group(1),int(c.group(1)))
+print("  server inventory: totals=%s slot20=%s" % (tot, at20))
+sys.exit(0 if tot.get("stick")==12 and tot.get("oak_planks")==14 and at20==("stick",12) else 1)
+PY
 # ---- chest window (MCPLAY_CHEST_TEST): a chest next to the player (10 stone, 6 dirt, 64 stone); Open Window -> Window Items -> shift click both ways, pick up,
 # drag over four container slots, close; the chest content and the player's hotbar on the server must equal the client's prediction
 MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CHEST_TEST=1 MCPLAY_RUN_S=28 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
