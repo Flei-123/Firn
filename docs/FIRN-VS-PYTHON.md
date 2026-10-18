@@ -57,7 +57,7 @@ Python reference notes: 11 uses Pillow (installed), 13 and 08 use stdlib only (`
 | p03_parse_errors | 7 | 15 | 15 | 2.14 | 37 | 89 | 2.41 | 0 | 2 | 34.3 | 0.6 | 524 |
 
 Re-measured 18.10.2026 (meas2, 5 runs, host load ~16-20: ms are still noisy; line/token numbers exact). Median 1.67 -> 1.52.
-Rewritten with the new features (output identical to expect.txt): 02 (100->74, f-string specs, Vec+vec_sort_by instead of arrays/insertion sort), 03 (60->50, `{i:02}`, string tables), 15 (64->61, pystr.count, `{i:02}`), 18 (41->38, named arg, infof, pystr.read_text). 04 (58) and 09 (32) were already on std.pystr/pyre/defaults; nothing left to cut without new libs (04: finditer loop; 09: args setup is 1:1 with argparse).
+Rewritten with the new features (output identical to expect.txt): 02 (100->71, f-string specs, Vec+vec_sort_by instead of arrays/insertion sort), 03 (60->50, `{i:02}`, string tables), 15 (64->61, pystr.count, `{i:02}`), 18 (41->38, named arg, infof, pystr.read_text). 04 (58) and 09 (32) were already on std.pystr/pyre/defaults; nothing left to cut without new libs (04: finditer loop; 09: args setup is 1:1 with argparse).
 
 Summary (`table.py --stats`): `tasks=20 median_factor_now=1.52 median_factor_first=1.94 le1.5_now=9 le1.5_first=7`.
 Live numbers: `python3 tools/vspy/table.py` (reads `examples/vs_python/**/results_*.tsv`).
