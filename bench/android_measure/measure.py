@@ -68,7 +68,7 @@ def lock_acquire(wait_max_s=1800):
             if time.time() - t0 > wait_max_s:
                 raise RuntimeError("phone.lock held too long: " + open(LOCK).read().strip())
             print("phone.lock held (%s, %ds old) - waiting" % (open(LOCK).read().strip(), age), flush=True)
-            time.sleep(30)
+            time.sleep(5)
         else:
             break
     lock_touch()
