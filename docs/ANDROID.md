@@ -300,3 +300,19 @@ focus; nothing is built before.
   Android window kept its old texture. Fixed in `compiler/src/regalloc.rs` (the OrientOS worker found the same bug
   at the same time through fUi's caret and fixed it identically on main; both
   tests stay: `tests/3206_calli_float.fi`, `tests/2002_fnval_float.fi`).
+
+## Font size and window insets (r382, 18.10.2026)
+
+* `lib/android/hostinfo.fi` reads over JNI what NativeActivity's C side does not have: `Configuration.fontScale`
+  (`getResources().getConfiguration()`, a float field) and the window insets (`getDecorView().getRootWindowInsets()`: API 30+
+  `getInsets(statusBars|navigationBars|captionBar|ime|displayCutout)`, API 23-29 `getSystemWindowInsetLeft/Top/Right/Bottom`).
+  Called on the app thread (attached on first use); every local reference is deleted again.
+* `lib/window/android.fi` `metrics_take` feeds `android_set_font_scale` / `android_set_insets` on: open, new window,
+  `onConfigurationChanged`, `onContentRectChanged`, resume. A change sends `EV_THEME`; `fuiwin.window_system_look` reads it again.
+  The insets are cut by the content rectangle the window already leaves out (`hostmetrics.insets_minus_content`): no double padding.
+* `build.sh` now lists `fontScale` in `configChanges`: without it Android restarts the activity when the font size changes.
+* There is no `onApplyWindowInsets` listener (that needs a class of our own, `lib/android/dex.fi`): the content-rectangle command
+  fires when bars or keyboard move, and the check runs then.
+* Test: `bash tools/android/hostinfo_check.sh` (emulator API 35 x86_64: 8/8, font size 1.0/1.3/0.85 at start, 1.5 while running,
+  rotation re-reads the insets). **Not tested on a real phone, not on arm64 hardware, not API 23-29** (code path
+  `getSystemWindowInset*` is built, never run).

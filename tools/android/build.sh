@@ -215,7 +215,7 @@ if [ $PUSH -eq 1 ] || [ $PICK -eq 1 ] || [ $INSTALL -eq 1 ]; then
             echo '        <activity android:name="org.firn.FirnPick" android:exported="false"'
             echo '            android:theme="@android:style/Theme.Translucent.NoTitleBar"'
             echo '            android:excludeFromRecents="true"'
-            echo '            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|uiMode|density" />'
+            echo '            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|uiMode|density|fontScale" />'
         fi
         if [ $INSTALL -eq 1 ]; then
             echo '        <receiver android:name="org.firn.FirnInstall" android:exported="false" />'
@@ -261,7 +261,7 @@ EOF
         <activity android:name="$MAINACT"
             android:label="$NAME" android:exported="true" $LAUNCHMODE
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|uiMode|density">
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|uiMode|density|fontScale">
             <meta-data android:name="android.app.lib_name" android:value="$LIB" />
             <meta-data android:name="android.app.func_name" android:value="firn_activity_create" />
             <intent-filter>

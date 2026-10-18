@@ -16,6 +16,10 @@ export {
     SCALE_MIN, SCALE_MAX,
     insets_overlap, insets_screen, parse_number, parse_scale_permille, parse_insets,
     scale_from_percent, scale_from_factor, inset_points, scale_text_px,
+    // r382 (Android): what the JNI answers become
+    insets_clamp, insets_minus_content, insets_same, insets_from_ints, DISPLAY_CUTOUT_MASK, INSET_TYPES_ALL,
+    // W45-d: THE MONITOR OF THE WINDOW
+    MONITORS_MAX, le32, le16s, monitorinfo_parse, randr_monitors_parse, monitor_pick, area_clip, insets_on_monitor,
 }
 
 // A text scale outside this range is a broken setting, not a wish (Windows allows 100..225 %, GNOME 0.5..3.0).
@@ -227,4 +231,266 @@ fn scale_text_px(px: usize, text_permille: usize) -> usize {
         return 1
     }
     return v
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// r382 -- ANDROID: what lib/android/hostinfo.fi reads over JNI (WindowInsets, Configuration.fontScale) is turned into the setters'
+// values HERE, as pure functions, so tools/fui/hostmetrics_main.fi pins them without a phone.
+// ---------------------------------------------------------------------------------------------------------------------------
+
+// WindowInsets.Type bits (Android 11+, android.view.WindowInsets.Type): statusBars 1, navigationBars 2, captionBar 4, ime 8,
+// displayCutout 128. getInsets(mask) answers the per-side maximum over all types in the mask.
+const INSET_TYPES_ALL: i32 = 143 // 1 | 2 | 4 | 8 | 128: bars + caption + keyboard + cutout
+const DISPLAY_CUTOUT_MASK: i32 = 128
+
+// Four platform ints (Insets.left/top/right/bottom or getSystemWindowInsetLeft..) to out: negative = 0 (the platform never means it,
+// a broken answer must not shrink the layout), each side at most half the window (w x h, 0 = unknown: no limit).
+fn insets_from_ints(l: i32, t: i32, r: i32, b: i32, w: usize, h: usize, out: *mut [f64; 4]) {
+    var v: [i64; 4] = [l as i64, t as i64, r as i64, b as i64]
+    var i: usize = 0
+    while i < 4 {
+        if v[i] < 0 { v[i] = 0 }
+        i = i + 1
+    }
+    if w > 0 {
+        let hw: i64 = (w / 2) as i64
+        if v[0] > hw { v[0] = hw }
+        if v[2] > hw { v[2] = hw }
+    }
+    if h > 0 {
+        let hh: i64 = (h / 2) as i64
+        if v[1] > hh { v[1] = hh }
+        if v[3] > hh { v[3] = hh }
+    }
+    (*out)[0] = v[0] as f64
+    (*out)[1] = v[1] as f64
+    (*out)[2] = v[2] as f64
+    (*out)[3] = v[3] as f64
+}
+
+// The same limits for values that are already numbers.
+fn insets_clamp(ins: *mut [f64; 4], w: usize, h: usize) {
+    insets_from_ints((*ins)[0] as i32, (*ins)[1] as i32, (*ins)[2] as i32, (*ins)[3] as i32, w, h, ins)
+}
+
+// The part of the system insets the WINDOW HAS NOT ALREADY LEFT OUT. NativeActivity reports a content rectangle
+// (onContentRectChanged); lib/window/android.fi paints only inside it (ox, oy, cw, ch inside the w x h window). Insets that lie
+// inside that margin are handled -- giving them to the toolkit again would pad twice. cw = 0 = no content rectangle: the whole
+// window is content and the insets pass unchanged. out may be the same array as `ins`.
+fn insets_minus_content(ins: *mut [f64; 4], ox: usize, oy: usize, cw: usize, ch: usize, w: usize, h: usize, out: *mut [f64; 4]) {
+    var l: f64 = (*ins)[0]
+    var t: f64 = (*ins)[1]
+    var r: f64 = (*ins)[2]
+    var b: f64 = (*ins)[3]
+    if cw > 0 && ch > 0 {
+        var mr: usize = 0
+        var mb: usize = 0
+        if w > ox + cw { mr = w - (ox + cw) }
+        if h > oy + ch { mb = h - (oy + ch) }
+        l = l - (ox as f64)
+        t = t - (oy as f64)
+        r = r - (mr as f64)
+        b = b - (mb as f64)
+        if l < 0.0 { l = 0.0 }
+        if t < 0.0 { t = 0.0 }
+        if r < 0.0 { r = 0.0 }
+        if b < 0.0 { b = 0.0 }
+    }
+    (*out)[0] = l
+    (*out)[1] = t
+    (*out)[2] = r
+    (*out)[3] = b
+}
+
+// Are two inset sets the same (to a quarter pixel)? The change test for "send EV_THEME".
+fn insets_same(a: *mut [f64; 4], b: *mut [f64; 4]) -> bool {
+    var i: usize = 0
+    while i < 4 {
+        var d: f64 = (*a)[i] - (*b)[i]
+        if d < 0.0 { d = 0.0 - d }
+        if d > 0.25 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+// ======================================================================
+// W45-d: THE MONITOR OF THE WINDOW (multi-monitor)
+// ======================================================================
+//
+// `insets_overlap` compares the window with ONE work area. With several monitors that has to be the work area of the monitor the
+// window is on, not the primary one's (Win32 SPI_GETWORKAREA) and not the union of all (X11 _NET_WORKAREA): else a window on the
+// second monitor either gets no answer or is measured against the wrong bars. Everything the backends need to do that, as pure
+// byte/number functions (no display, no syscall): tools/fui/hostmetrics_main.fi pins them with synthetic replies.
+
+const MONITORS_MAX: usize = 8
+
+fn le32(p: u64, off: usize) -> i64 {
+    var v: i64 = (rt.ld8(p, off) as i64) | ((rt.ld8(p, off + 1) as i64) << 8) | ((rt.ld8(p, off + 2) as i64) << 16)
+    | ((rt.ld8(p, off + 3) as i64) << 24)
+    if v >= 2147483648 {
+        v = v - 4294967296
+    }
+    return v
+}
+
+// A signed 16-bit little-endian value.
+fn le16s(p: u64, off: usize) -> i64 {
+    var v: i64 = (rt.ld8(p, off) as i64) | ((rt.ld8(p, off + 1) as i64) << 8)
+    if v >= 32768 {
+        v = v - 65536
+    }
+    return v
+}
+
+// A Win32 MONITORINFO (40 bytes: cbSize, rcMonitor l t r b, rcWork l t r b, dwFlags, all 32 bit) into mon / work = x, y, w, h.
+// false = not a MONITORINFO (cbSize != 40), an empty monitor or a work area that is not inside its monitor.
+fn monitorinfo_parse(p: u64, n: usize, mon: *mut [i64; 4], work: *mut [i64; 4]) -> bool {
+    if n < 40 || le32(p, 0) != 40 {
+        return false
+    }
+    let ml: i64 = le32(p, 4)
+    let mt: i64 = le32(p, 8)
+    let mr: i64 = le32(p, 12)
+    let mb: i64 = le32(p, 16)
+    let wl: i64 = le32(p, 20)
+    let wt: i64 = le32(p, 24)
+    let wr: i64 = le32(p, 28)
+    let wb: i64 = le32(p, 32)
+    if mr <= ml || mb <= mt || wr <= wl || wb <= wt {
+        return false
+    }
+    if wl < ml || wt < mt || wr > mr || wb > mb {
+        return false
+    }
+    (*mon)[0] = ml
+    (*mon)[1] = mt
+    (*mon)[2] = mr - ml
+    (*mon)[3] = mb - mt
+    (*work)[0] = wl
+    (*work)[1] = wt
+    (*work)[2] = wr - wl
+    (*work)[3] = wb - wt
+    return true
+}
+
+// The reply of RandR 1.5 GetMonitors (minor opcode 42): 32 byte header (nMonitors at 8), then per monitor 24 bytes (name atom 4,
+// primary 1, automatic 1, nOutput 2, x 2, y 2, width 2, height 2, mm 4+4) + 4 bytes per output. out = x, y, w, h per monitor, at
+// most MONITORS_MAX. Returns how many were read; 0 = not a usable reply.
+fn randr_monitors_parse(p: u64, n: usize, out: *mut [i64; 32]) -> usize {
+    if n < 32 || rt.ld8(p, 0) != 1 as u8 {
+        return 0
+    }
+    let cnt: i64 = le32(p, 8)
+    if cnt <= 0 || cnt > 64 {
+        return 0
+    }
+    var at: usize = 32
+    var k: usize = 0
+    var i: i64 = 0
+    while i < cnt {
+        if at + 24 > n {
+            break
+        }
+        let nout: usize = (rt.ld8(p, at + 10) as usize) | ((rt.ld8(p, at + 11) as usize) << 8)
+        let x: i64 = le16s(p, at + 12)
+        let y: i64 = le16s(p, at + 14)
+        let w: i64 = (rt.ld8(p, at + 16) as i64) | ((rt.ld8(p, at + 17) as i64) << 8)
+        let h: i64 = (rt.ld8(p, at + 18) as i64) | ((rt.ld8(p, at + 19) as i64) << 8)
+        if w > 0 && h > 0 && k < MONITORS_MAX {
+            (*out)[k * 4] = x
+            (*out)[k * 4 + 1] = y
+            (*out)[k * 4 + 2] = w
+            (*out)[k * 4 + 3] = h
+            k = k + 1
+        }
+        at = at + 24 + nout * 4
+        i = i + 1
+    }
+    return k
+}
+
+// Which of `cnt` monitors (x, y, w, h each) the window (wx, wy, ww, wh) is on: the one holding its centre, else the one with the
+// biggest overlap. -1 = none (no monitors, empty window, or no overlap at all).
+fn monitor_pick(list: *mut [i64; 32], cnt: usize, wx: i64, wy: i64, ww: i64, wh: i64) -> i64 {
+    if cnt == 0 || ww <= 0 || wh <= 0 {
+        return 0 - 1
+    }
+    let cx: i64 = wx + ww / 2
+    let cy: i64 = wy + wh / 2
+    var best: i64 = 0 - 1
+    var best_a: i64 = 0
+    var k: usize = 0
+    while k < cnt && k < MONITORS_MAX {
+        let mx: i64 = (*list)[k * 4]
+        let my: i64 = (*list)[k * 4 + 1]
+        let mw: i64 = (*list)[k * 4 + 2]
+        let mh: i64 = (*list)[k * 4 + 3]
+        if cx >= mx && cx < mx + mw && cy >= my && cy < my + mh {
+            return k as i64
+        }
+        var ox: i64 = wx + ww
+        if mx + mw < ox { ox = mx + mw }
+        var ox0: i64 = wx
+        if mx > ox0 { ox0 = mx }
+        var oy: i64 = wy + wh
+        if my + mh < oy { oy = my + mh }
+        var oy0: i64 = wy
+        if my > oy0 { oy0 = my }
+        if ox > ox0 && oy > oy0 {
+            let ar: i64 = (ox - ox0) * (oy - oy0)
+            if ar > best_a {
+                best_a = ar
+                best = k as i64
+            }
+        }
+        k = k + 1
+    }
+    return best
+}
+
+// The part of a work area (ax, ay, aw, ah) that lies on a monitor (mx, my, mw, mh): the work area of THAT monitor when the system
+// only knows one rectangle for all (X11 _NET_WORKAREA). false = they do not touch.
+fn area_clip(mx: i64, my: i64, mw: i64, mh: i64, ax: i64, ay: i64, aw: i64, ah: i64, out: *mut [i64; 4]) -> bool {
+    var x0: i64 = mx
+    if ax > x0 { x0 = ax }
+    var y0: i64 = my
+    if ay > y0 { y0 = ay }
+    var x1: i64 = mx + mw
+    if ax + aw < x1 { x1 = ax + aw }
+    var y1: i64 = my + mh
+    if ay + ah < y1 { y1 = ay + ah }
+    if x1 <= x0 || y1 <= y0 {
+        return false
+    }
+    (*out)[0] = x0
+    (*out)[1] = y0
+    (*out)[2] = x1 - x0
+    (*out)[3] = y1 - y0
+    return true
+}
+
+// The insets of a window against ITS monitor's work area (`area_clip` of the monitor and the system work area, or the monitor's own
+// when the system gives one). Same output as `insets_overlap`; false = the window is on no monitor.
+fn insets_on_monitor(list: *mut [i64; 32], cnt: usize, wx: i64, wy: i64, ww: i64, wh: i64, ax: i64, ay: i64, aw: i64, ah: i64,
+    out: *mut [f64; 4]) -> bool {
+    (*out)[0] = 0.0
+    (*out)[1] = 0.0
+    (*out)[2] = 0.0
+    (*out)[3] = 0.0
+    let k: i64 = monitor_pick(list, cnt, wx, wy, ww, wh)
+    if k < 0 {
+        return false
+    }
+    var wa: [i64; 4] = [0; 4]
+    if !area_clip((*list)[(k as usize) * 4], (*list)[(k as usize) * 4 + 1], (*list)[(k as usize) * 4 + 2], (*list)[(k as usize) * 4 + 3],
+        ax, ay, aw, ah, &wa) {
+        // the system work area does not touch this monitor: the monitor has no bars
+        wa[0] = (*list)[(k as usize) * 4]
+        wa[1] = (*list)[(k as usize) * 4 + 1]
+        wa[2] = (*list)[(k as usize) * 4 + 2]
+        wa[3] = (*list)[(k as usize) * 4 + 3]
+    }
+    return insets_overlap(wx, wy, ww, wh, wa[0], wa[1], wa[2], wa[3], out)
 }

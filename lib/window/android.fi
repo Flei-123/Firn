@@ -80,6 +80,7 @@
 import std.rt
 import android.ndk
 import android.activity
+import android.hostinfo
 import android.inputmethod
 import plat.android.push
 import plat.android.pick
@@ -570,10 +571,12 @@ fn r_transp_spi(x: *mut Platte) -> bool {
 }
 
 // W40-a: high contrast -- this backend cannot ask the system: honestly "not known".
-// W44-c: WindowInsets and Configuration.fontScale live in Java. The activity glue (or a JNI call, lib/android/jnicall.fi) feeds
-// them with `android_set_insets` / `android_set_font_scale`; until then the answer is honestly "not known".
+// W44-c: WindowInsets and Configuration.fontScale live in Java. r382: `metrics_take` (below) reads them over JNI
+// (lib/android/hostinfo.fi) and feeds `android_set_insets` / `android_set_font_scale`; a program may also set them by hand. Until
+// something is set the answer is honestly "not known".
 static mut G_INSETS: [f64; 4] = [0.0; 4]
 static mut G_INSETS_SET: bool = false
+static mut G_INSETS_GEN: usize = 0 // counts the changes (the change test of a command)
 static mut G_FONT_SCALE: usize = 0
 
 // Device pixels: left, top, right, bottom (status bar, navigation bar, display cutout, soft keyboard).
@@ -583,6 +586,7 @@ fn android_set_insets(l: f64, t: f64, r: f64, b: f64) {
     G_INSETS[2] = r
     G_INSETS[3] = b
     G_INSETS_SET = true
+    G_INSETS_GEN = G_INSETS_GEN + 1
 }
 
 // Configuration.fontScale (1.0 = default) as given by the system.
@@ -603,6 +607,31 @@ fn r_insets(x: *mut Platte, out: *mut [f64; 4]) -> bool {
 
 fn r_text_scale(x: *mut Platte) -> usize {
     return G_FONT_SCALE
+}
+
+// r382: ask Java (lib/android/hostinfo.fi) for fontScale and the window insets and feed the setters. The insets are cut by the
+// content rectangle the window already leaves out (hostmetrics.insets_minus_content), so bars are not padded twice. true = one of
+// the two changed: the caller sends EV_THEME (the program's `window_system_look` reads both again).
+fn metrics_take(x: *mut Platte) -> bool {
+    var changed: bool = false
+    let fs: f64 = hostinfo.hostinfo_font_scale()
+    if fs > 0.0 {
+        let pm: usize = hostmetrics.scale_from_factor(fs)
+        if pm != G_FONT_SCALE {
+            android_set_font_scale(fs)
+            changed = true
+        }
+    }
+    var raw: [f64; 4] = [0.0; 4]
+    if hostinfo.hostinfo_insets((*x).w, (*x).h, &raw) {
+        var res: [f64; 4] = [0.0; 4]
+        hostmetrics.insets_minus_content(&raw, (*x).ox, (*x).oy, (*x).cw, (*x).ch, (*x).w, (*x).h, &res)
+        if !G_INSETS_SET || !hostmetrics.insets_same(&G_INSETS, &res) {
+            android_set_insets(res[0], res[1], res[2], res[3])
+            changed = true
+        }
+    }
+    return changed
 }
 
 fn r_contrast(x: *mut Platte) -> bool {
@@ -1076,6 +1105,7 @@ fn r_sysmenu(x: *mut Platte, sx: usize, sy: usize) {}
 // class (160 = 1 dp per pixel); the window layer counts design points at
 // 96 per inch. One Android dp is one design point, so 160 -> 96.
 fn config_take(x: *mut Platte) {
+    let m: bool = metrics_take(x)
     let d: usize = activity.activity_density()
     if d > 0 {
         an_set_dpi(x, (d * 96 + 80) / 160)
@@ -1105,8 +1135,12 @@ fn host_insn(x: *mut Platte, c: i32) {
                 (*x).w = ndk.ANativeWindow_getWidth(w) as usize
                 (*x).h = ndk.ANativeWindow_getHeight(w) as usize
                 rect_take(x)
+                let moved: bool = metrics_take(x)
                 an_event(x, window.EV_CONFIGURE, 0, r_width(x) as u32,
                     r_height(x) as u32, 0)
+                if moved {
+                    an_event(x, window.EV_THEME, 0, 0, 0, 0)
+                }
                 an_event(x, window.EV_EXPOSE, 0, 0, 0, 0)
             }
         }
@@ -1124,11 +1158,19 @@ fn host_insn(x: *mut Platte, c: i32) {
                 let again: bool = egl_surface(x)
             }
             rect_take(x)
+            let moved: bool = metrics_take(x)
             an_event(x, window.EV_CONFIGURE, 0, r_width(x) as u32,
                 r_height(x) as u32, 0)
+            if moved {
+                an_event(x, window.EV_THEME, 0, 0, 0, 0)
+            }
             an_event(x, window.EV_EXPOSE, 0, 0, 0, 0)
         }
     } else if c == activity.CMD_REDRAW || c == activity.CMD_RESUME {
+        // the font size is set in the system settings: back from there is the moment it may have changed
+        if c == activity.CMD_RESUME && (*x).win != 0 && metrics_take(x) {
+            an_event(x, window.EV_THEME, 0, 0, 0, 0)
+        }
         an_event(x, window.EV_EXPOSE, 0, 0, 0, 0)
     } else if c == activity.CMD_IME {
         // the keyboard asked something of the text field (answered here,
@@ -1150,13 +1192,15 @@ fn host_insn(x: *mut Platte, c: i32) {
     } else if c == activity.CMD_CONFIG {
         let alt_dpi: usize = (*x).dpi
         let alt_dark: bool = (*x).dark
+        let alt_scale: usize = G_FONT_SCALE
+        let alt_gen: usize = G_INSETS_GEN
         activity.activity_config_read()
         config_take(x)
         if (*x).dpi != alt_dpi {
             an_event(x, window.EV_CONFIGURE, 0, r_width(x) as u32,
                 r_height(x) as u32, 0)
         }
-        if (*x).dark != alt_dark {
+        if (*x).dark != alt_dark || G_FONT_SCALE != alt_scale || G_INSETS_GEN != alt_gen {
             an_event(x, window.EV_THEME, 0, 0, 0, 0)
         }
     } else if c == activity.CMD_DESTROY {
