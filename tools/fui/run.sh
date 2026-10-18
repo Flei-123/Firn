@@ -851,6 +851,10 @@ build uia
 "$W/uia" | tail -n 3
 build syspref
 "$W/syspref" | tail -n 3
+# W40-a hostpref: the host reads transparency / high contrast (FUI_TRANSPARENCY, FUI_CONTRAST) in a real X11 window on an own Xvfb
+hp_rc=0
+HP=$(FIRNC="$FIRNC" sh tools/fui/hostpref.sh 2>&1) || hp_rc=$?
+[ "$hp_rc" -eq 0 ] || [ "$hp_rc" -eq 77 ] || { echo "$HP"; exit 1; }
 # W26-d: gap list P1 rows #5 (size classes), #21 (combobox filter), #67 (timeline), #64 (localised standard texts)
 build sizeclass
 "$W/sizeclass" | tail -n 3
