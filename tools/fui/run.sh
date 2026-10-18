@@ -788,6 +788,9 @@ build appw8
 # appw9: window size class in the ten-line API (classes, hysteresis, callback once per change, columns)
 build appw9
 "$W/appw9" | tail -n 3 | grep -q "APPW9 PASSED"
+# appw10: drag and drop (threshold, rows A to B, Ctrl copy, node target, Esc, edge scroll, keyboard, no double click from a drag)
+build appw10
+"$W/appw10" | tail -n 3 | grep -q "APPW10 PASSED"
 # W16: mnemonics (Alt+letter, '&'), Tab order end to end, shortcut management
 build w16
 "$W/w16" | tail -n 3
