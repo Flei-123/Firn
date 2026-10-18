@@ -30,8 +30,21 @@ PKG=org.firn.keyboardtest
 OUT=${OUT:-/tmp/firn-keyboard-check}
 mkdir -p "$OUT"
 fail=0
+# r777: the emulator's own "<x> isn't responding" dialogs (System UI, Launcher,
+# the keyboard) show up on a cold, loaded emulator, cover the app and swallow
+# the taps -- the cause of the "flaky" runs. dismiss_anr taps them away.
+. "$ROOT/tools/android/dismiss_anr.sh"
+nfail=0
 ok()  { echo "   OK      $1"; }
-bad() { echo "   FAILED  $1"; fail=1; }
+bad() { echo "   FAILED  $1"; fail=1; diag; }
+# what the screen and the system looked like when a check failed (kept in $OUT)
+diag() {
+    nfail=$((nfail + 1))
+    $ADB exec-out screencap -p > "$OUT/fail_$nfail.png" 2>/dev/null
+    echo "           focus: $($ADB shell dumpsys window 2>/dev/null | grep -m1 mCurrentFocus | tr -d '\r' | cut -c1-120)"
+    echo "           ime:   $($ADB shell dumpsys input_method 2>/dev/null | grep -m1 -o 'mInputShown=[a-z]*')  screenshot: $OUT/fail_$nfail.png"
+    $ADB logcat -d -b events 2>/dev/null | grep -E 'am_anr' | tail -2 | cut -c1-160 | sed 's/^/           /'
+}
 check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
 echo "== 1. build the APK (x86_64) =="
@@ -42,6 +55,7 @@ APK=$ROOT/build/android/fui_form/fui_form.apk
 [ -f "$APK" ] || { echo "no APK"; exit 1; }
 $ADB root >/dev/null 2>&1; sleep 2; $ADB wait-for-device
 $ADB install -r "$APK" | tail -1
+dismiss_anr
 $ADB shell settings put system accelerometer_rotation 0
 $ADB shell settings put system user_rotation 0
 $ADB shell wm user-rotation lock 0 >/dev/null 2>&1
@@ -98,6 +112,7 @@ start() {
     local i=0
     while [ $i -lt 40 ]; do
         sleep 1; i=$((i + 1))
+        [ $((i % 6)) = 0 ] && dismiss_anr
         $ADB exec-out screencap -p > "$OUT/start.png"
         python3 - "$OUT/start.png" <<'PY' && return 0
 import sys
@@ -110,10 +125,38 @@ PY
     return 1
 }
 
+# r777: the keys are tapped by POSITION, so the keyboard has to be at rest.
+# `mInputShown=true` comes while the keyboard still slides in: a tap then lands
+# one row too high ("yello" instead of "hello" -- the measured flake). So after
+# "shown" wait until the keyboard area of the screen stops changing (three
+# equal pictures in a row), and clear emulator dialogs that would cover it.
+kb_hash() {
+    $ADB exec-out screencap -p 2>/dev/null | python3 -c '
+import sys, io, hashlib
+from PIL import Image
+im = Image.open(io.BytesIO(sys.stdin.buffer.read())).convert("RGB")
+w, h = im.size
+print(hashlib.md5(im.crop((0, 600 * h // 1000, w, 1000 * h // 1000)).tobytes()).hexdigest()[:8])
+' 2>/dev/null
+}
+settle() {
+    local i=0 same=0 prev="" cur
+    dismiss_anr
+    while [ $i -lt 40 ]; do
+        cur=$(kb_hash); i=$((i + 1))
+        if [ -n "$cur" ] && [ "$cur" = "$prev" ]; then same=$((same + 1)); else same=0; fi
+        prev=$cur
+        [ $same -ge 3 ] && break
+        sleep 0.3
+    done
+    [ "$(shown)" = 1 ] || sleep 2
+}
+
 echo "== 2. the keyboard comes up =="
 start; check "the program is on screen" "[ $? = 0 ]"
 tap $FIELD1_DOWN
 wait_shown 1; check "tap into the first field: the keyboard is shown" "[ $? = 0 ]"
+settle
 $ADB logcat -d 2>/dev/null | grep -q 'firn *: ime: ready'
 check "the input method was built (ime: ready in logcat)" "[ $? = 0 ]"
 
@@ -125,6 +168,7 @@ SOFT_HELL=$(crop soft_hell $F1); echo "   after Backspace:      $SOFT_HELL"
 check "Backspace changed the field" "[ '$SOFT_HELLO' != '$SOFT_HELL' ]"
 tap 300 330   # the second field (keyboard up)
 sleep 2
+dismiss_anr
 check "the keyboard stays up when the other field takes the focus" "[ \"\$(shown)\" = 1 ]"
 KEY_A; KEY_A; sleep 2
 SOFT_AA=$(crop soft_aa $F2); echo "   second field 'aa':    $SOFT_AA"
@@ -132,7 +176,7 @@ SOFT_AA=$(crop soft_aa $F2); echo "   second field 'aa':    $SOFT_AA"
 echo "== 4. the same text arrives some other way: the same pixels =="
 # Clear (a button) empties both fields and puts the keyboard away
 tap 595 391; wait_shown 0; check "a tap on a button puts the keyboard away" "[ $? = 0 ]"
-tap $FIELD1_DOWN; wait_shown 1
+tap $FIELD1_DOWN; wait_shown 1; settle
 $ADB shell input text hello; sleep 2
 REF_HELLO=$(crop ref_hello $F1); echo "   input text 'hello':   $REF_HELLO"
 check "soft keys 'hello' look exactly like 'hello'" "[ '$SOFT_HELLO' = '$REF_HELLO' ]"
