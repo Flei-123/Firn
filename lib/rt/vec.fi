@@ -463,43 +463,238 @@ fn vec_max[T: Scalar + Ord](v: *mut Vec[T]) -> T {
 
 // ----------------------------------------------------------------- Sorting
 //
-// HEAPSORT, not quicksort. Three reasons, all of them checkable:
-//   * O(n log n) in the WORST case -- quicksort degenerates to O(n^2) on
-//     already sorted or uniformly distributed input, and exactly those turn
-//     up all the time inside a compiler.
-//   * no extra memory (mergesort would need n elements).
-//   * no recursion -- otherwise the depth of a sorting run depends on the
-//     input, and stage 0 has no stack check.
+// INTROSORT (round 800+, was a plain heapsort): quicksort with median of 3 /
+// ninther, insertion sort for short ranges and a heapsort fallback when the
+// depth budget runs out. The reasons the heapsort was chosen once still hold
+// and are kept: O(n log n) in the WORST case, no extra memory, no recursion
+// (explicit range stack, see `vs_sort`). The heapsort was 5-8x slower on
+// random input because it touches memory log2(n) levels apart on every step.
 // NOT STABLE: equal elements may swap places. For scalars that cannot be
-// told apart; as soon as a Vec[T] carries key/value pairs it becomes a
-// promise that is missing here.
+// told apart; as soon as a Vec[T] carries key/value pairs use
+// `std.pycoll.sort_stable_by`.
 
-fn vec_lower[T: Ord](v: *mut Vec[T], root: usize, end: usize) {
-    var i: usize = root
-    var runs: bool = true
-    while runs {
-        var gr: usize = i
-        let l: usize = 2 * i + 1
-        let r: usize = 2 * i + 2
-        if l < end {
-            let pl: *mut T = vec_elem_ptr[T](v, l)
-            let pg: *mut T = vec_elem_ptr[T](v, gr)
-            if pg.less(pl) {
-                gr = l
+// Address of element `i` (signed so the sorter can hold `lo - 1`). No bounds
+// check on purpose: every caller stays inside [0, len).
+fn vs_at[T](base: u64, i: isize) -> *mut T {
+    return (base +% i as u64 *% size_of[T]() as u64) as *mut T
+}
+
+// ------------------------------------------------------------- introsort
+// Insertion sort on [lo, hi] (inclusive, signed so that `j = lo - 1` is legal).
+fn vs_insert[T: Ord](base: u64, lo: isize, hi: isize) {
+    var i: isize = lo + 1
+    while i <= hi {
+        let pi: *mut T = vs_at[T](base, i)
+        let key: T = *pi
+        var j: isize = i - 1
+        while j >= lo {
+            let pj: *mut T = vs_at[T](base, j)
+            if !(&key).less(pj) {
+                break
+            }
+            *vs_at[T](base, j + 1) = *pj
+            j = j - 1
+        }
+        *vs_at[T](base, j + 1) = key
+        i = i + 1
+    }
+}
+
+// Sift the element at `root` down inside the heap [lo, lo + end) -- the
+// fallback of the introsort when the recursion budget is used up.
+fn vs_sift[T: Ord](base: u64, lo: isize, root: isize, end: isize) {
+    var i: isize = root
+    while true {
+        var gr: isize = 2 * i + 1
+        if gr >= end {
+            break
+        }
+        if gr + 1 < end {
+            if vs_at[T](base, lo + gr).less(vs_at[T](base, lo + gr + 1)) {
+                gr = gr + 1
             }
         }
-        if r < end {
-            let pr: *mut T = vec_elem_ptr[T](v, r)
-            let pg: *mut T = vec_elem_ptr[T](v, gr)
-            if pg.less(pr) {
-                gr = r
+        let pi: *mut T = vs_at[T](base, lo + i)
+        let pg: *mut T = vs_at[T](base, lo + gr)
+        if !pi.less(pg) {
+            break
+        }
+        let t: T = *pi
+        *pi = *pg
+        *pg = t
+        i = gr
+    }
+}
+
+fn vs_heap[T: Ord](base: u64, lo: isize, hi: isize) {
+    let n: isize = hi - lo + 1
+    var i: isize = n / 2
+    while i > 0 {
+        i = i - 1
+        vs_sift[T](base, lo, i, n)
+    }
+    var e: isize = n
+    while e > 1 {
+        e = e - 1
+        let p0: *mut T = vs_at[T](base, lo)
+        let pe: *mut T = vs_at[T](base, lo + e)
+        let t: T = *p0
+        *p0 = *pe
+        *pe = t
+        vs_sift[T](base, lo, 0, e)
+    }
+}
+
+// The median of the elements at a, b, c (indexes) -- as an index.
+fn vs_med3[T: Ord](base: u64, a: isize, b: isize, c: isize) -> isize {
+    let pa: *mut T = vs_at[T](base, a)
+    let pb: *mut T = vs_at[T](base, b)
+    let pc: *mut T = vs_at[T](base, c)
+    if pa.less(pb) {
+        if pb.less(pc) {
+            return b
+        }
+        if pa.less(pc) {
+            return c
+        }
+        return a
+    }
+    if pa.less(pc) {
+        return a
+    }
+    if pb.less(pc) {
+        return c
+    }
+    return b
+}
+
+// Branch free Lomuto partition of [lo, hi] around the element at `pidx`.
+// The pivot goes to its final index (returned); everything left of it is
+// `< pivot` (or `<= pivot` if `eq` is set), everything right of it the rest.
+// No data dependent branch in the loop: on random input a Hoare scan
+// mispredicts about every second comparison, which costs more than all the
+// instructions of the sort together.
+fn vs_part[T: Ord](base: u64, lo: isize, hi: isize, pidx: isize, eq: bool) -> isize {
+    let pp: *mut T = vs_at[T](base, lo)
+    let px: *mut T = vs_at[T](base, pidx)
+    let t0: T = *pp
+    *pp = *px
+    *px = t0
+    var l: isize = lo + 1
+    var k: isize = lo + 1
+    if eq {
+        while k <= hi {
+            let pk: *mut T = vs_at[T](base, k)
+            let pl: *mut T = vs_at[T](base, l)
+            let v: T = *pk
+            let c: isize = (!pp.less(pk)) as isize
+            *pk = *pl
+            *pl = v
+            l = l + c
+            k = k + 1
+        }
+    } else {
+        while k <= hi {
+            let pk: *mut T = vs_at[T](base, k)
+            let pl: *mut T = vs_at[T](base, l)
+            let v: T = *pk
+            let c: isize = (pk.less(pp)) as isize
+            *pk = *pl
+            *pl = v
+            l = l + c
+            k = k + 1
+        }
+    }
+    let pf: *mut T = vs_at[T](base, l - 1)
+    let t1: T = *pp
+    *pp = *pf
+    *pf = t1
+    return l - 1
+}
+
+// Introsort on [0, n): quicksort (median of 3, "ninther" from 128 elements on,
+// two-sided partition that also splits runs of equal keys evenly), insertion
+// sort below 17 elements, heapsort when the depth budget 2*log2(n) is gone --
+// O(n log n) in the WORST case, no extra memory, NO recursion (explicit stack
+// of ranges; the larger half is pushed, the smaller one is worked on, so the
+// stack never holds more than log2(n) <= 64 ranges). NOT STABLE.
+fn vs_sort[T: Ord](base: u64, n: isize) {
+    var stl: [isize; 72] = [0; 72]
+    var sth: [isize; 72] = [0; 72]
+    var std: [isize; 72] = [0; 72]
+    var stp: [bool; 72] = [false; 72]
+    var pred: bool = false
+    var sp: usize = 0
+    var budget: isize = 0
+    var m: isize = n
+    while m > 1 {
+        budget = budget + 2
+        m = m / 2
+    }
+    var lo: isize = 0
+    var hi: isize = n - 1
+    var depth: isize = budget
+    var go: bool = true
+    while go {
+        while hi - lo >= 16 {
+            if depth <= 0 {
+                vs_heap[T](base, lo, hi)
+                lo = hi + 1
+                break
+            }
+            depth = depth - 1
+            let len: isize = hi - lo + 1
+            let mid: isize = lo + len / 2
+            var pidx: isize = 0
+            if len >= 128 {
+                let s: isize = len / 8
+                let x: isize = vs_med3[T](base, lo, lo + s, lo + 2 * s)
+                let y: isize = vs_med3[T](base, mid - s, mid, mid + s)
+                let z: isize = vs_med3[T](base, hi - 2 * s, hi - s, hi)
+                pidx = vs_med3[T](base, x, y, z)
+            } else {
+                pidx = vs_med3[T](base, lo, mid, hi)
+            }
+            // a[lo - 1] is an earlier pivot, <= everything in the range: if the new
+            // pivot is not greater than it, it is EQUAL to it and the elements equal
+            // to it are split off in one go (runs of equal keys stay O(n)).
+            var eq: bool = false
+            if pred {
+                eq = !vs_at[T](base, lo - 1).less(vs_at[T](base, pidx))
+            }
+            let pi: isize = vs_part[T](base, lo, hi, pidx, eq)
+            // right part [pi + 1, hi] always has a predecessor now
+            if eq {
+                lo = pi + 1
+                pred = true
+            } else if pi - lo > hi - pi {
+                stl[sp] = lo
+                sth[sp] = pi - 1
+                std[sp] = depth
+                stp[sp] = pred
+                sp = sp + 1
+                lo = pi + 1
+                pred = true
+            } else {
+                stl[sp] = pi + 1
+                sth[sp] = hi
+                std[sp] = depth
+                stp[sp] = true
+                sp = sp + 1
+                hi = pi - 1
             }
         }
-        if gr == i {
-            runs = false
+        if lo < hi {
+            vs_insert[T](base, lo, hi)
+        }
+        if sp == 0 {
+            go = false
         } else {
-            vec_swap[T](v, i, gr)
-            i = gr
+            sp = sp - 1
+            lo = stl[sp]
+            hi = sth[sp]
+            depth = std[sp]
+            pred = stp[sp]
         }
     }
 }
@@ -509,17 +704,7 @@ fn vec_sort[T: Ord](v: *mut Vec[T]) {
     if n < 2 {
         return
     }
-    var i: usize = n / 2
-    while i > 0 {
-        i = i - 1
-        vec_lower[T](v, i, n)
-    }
-    var e: usize = n
-    while e > 1 {
-        e = e - 1
-        vec_swap[T](v, 0, e)
-        vec_lower[T](v, 0, e)
-    }
+    vs_sort[T]((*v).ptr, n as isize)
 }
 
 // -------------------------------------------- ROUND 58: the ordering as a VALUE
@@ -535,34 +720,225 @@ fn vec_sort[T: Ord](v: *mut Vec[T]) {
 // statically. That is the price, and it stands here rather than in a
 // footnote.
 //
-// The same heapsort as above: O(n log n) in the worst case, no extra memory,
+// The same introsort as above: O(n log n) in the worst case, no extra memory,
 // no recursion. NOT STABLE.
-fn vec_lower_by[T](v: *mut Vec[T], root: usize, end: usize, less: fn(*T, *T) -> bool) {
-    var i: usize = root
-    var runs: bool = true
-    while runs {
-        var gr: usize = i
-        let l: usize = 2 * i + 1
-        let r: usize = 2 * i + 2
-        if l < end {
-            let pl: *mut T = vec_elem_ptr[T](v, l)
-            let pg: *mut T = vec_elem_ptr[T](v, gr)
-            if less(pg, pl) {
-                gr = l
+
+// ------------------------------------------------------------- introsort
+// Insertion sort on [lo, hi] (inclusive, signed so that `j = lo - 1` is legal).
+fn vs_insert_by[T](base: u64, lo: isize, hi: isize, less: fn(*T, *T) -> bool) {
+    var i: isize = lo + 1
+    while i <= hi {
+        let pi: *mut T = vs_at[T](base, i)
+        let key: T = *pi
+        var j: isize = i - 1
+        while j >= lo {
+            let pj: *mut T = vs_at[T](base, j)
+            if !less(&key, pj) {
+                break
+            }
+            *vs_at[T](base, j + 1) = *pj
+            j = j - 1
+        }
+        *vs_at[T](base, j + 1) = key
+        i = i + 1
+    }
+}
+
+// Sift the element at `root` down inside the heap [lo, lo + end) -- the
+// fallback of the introsort when the recursion budget is used up.
+fn vs_sift_by[T](base: u64, lo: isize, root: isize, end: isize, less: fn(*T, *T) -> bool) {
+    var i: isize = root
+    while true {
+        var gr: isize = 2 * i + 1
+        if gr >= end {
+            break
+        }
+        if gr + 1 < end {
+            if less(vs_at[T](base, lo + gr), vs_at[T](base, lo + gr + 1)) {
+                gr = gr + 1
             }
         }
-        if r < end {
-            let pr: *mut T = vec_elem_ptr[T](v, r)
-            let pg: *mut T = vec_elem_ptr[T](v, gr)
-            if less(pg, pr) {
-                gr = r
+        let pi: *mut T = vs_at[T](base, lo + i)
+        let pg: *mut T = vs_at[T](base, lo + gr)
+        if !less(pi, pg) {
+            break
+        }
+        let t: T = *pi
+        *pi = *pg
+        *pg = t
+        i = gr
+    }
+}
+
+fn vs_heap_by[T](base: u64, lo: isize, hi: isize, less: fn(*T, *T) -> bool) {
+    let n: isize = hi - lo + 1
+    var i: isize = n / 2
+    while i > 0 {
+        i = i - 1
+        vs_sift_by[T](base, lo, i, n, less)
+    }
+    var e: isize = n
+    while e > 1 {
+        e = e - 1
+        let p0: *mut T = vs_at[T](base, lo)
+        let pe: *mut T = vs_at[T](base, lo + e)
+        let t: T = *p0
+        *p0 = *pe
+        *pe = t
+        vs_sift_by[T](base, lo, 0, e, less)
+    }
+}
+
+// The median of the elements at a, b, c (indexes) -- as an index.
+fn vs_med3_by[T](base: u64, a: isize, b: isize, c: isize, less: fn(*T, *T) -> bool) -> isize {
+    let pa: *mut T = vs_at[T](base, a)
+    let pb: *mut T = vs_at[T](base, b)
+    let pc: *mut T = vs_at[T](base, c)
+    if less(pa, pb) {
+        if less(pb, pc) {
+            return b
+        }
+        if less(pa, pc) {
+            return c
+        }
+        return a
+    }
+    if less(pa, pc) {
+        return a
+    }
+    if less(pb, pc) {
+        return c
+    }
+    return b
+}
+
+// Introsort on [0, n): quicksort (median of 3, "ninther" from 128 elements on,
+// two-sided partition that also splits runs of equal keys evenly), insertion
+// sort below 17 elements, heapsort when the depth budget 2*log2(n) is gone --
+// O(n log n) in the WORST case, no extra memory, NO recursion (explicit stack
+// of ranges; the larger half is pushed, the smaller one is worked on, so the
+// stack never holds more than log2(n) <= 64 ranges). NOT STABLE.
+// Branch free Lomuto partition of [lo, hi] around the element at `pidx`.
+// The pivot goes to its final index (returned); everything left of it is
+// `< pivot` (or `<= pivot` if `eq` is set), everything right of it the rest.
+// No data dependent branch in the loop: on random input a Hoare scan
+// mispredicts about every second comparison, which costs more than all the
+// instructions of the sort together.
+fn vs_part_by[T](base: u64, lo: isize, hi: isize, pidx: isize, eq: bool, less: fn(*T, *T) -> bool) -> isize {
+    let pp: *mut T = vs_at[T](base, lo)
+    let px: *mut T = vs_at[T](base, pidx)
+    let t0: T = *pp
+    *pp = *px
+    *px = t0
+    var l: isize = lo + 1
+    var k: isize = lo + 1
+    if eq {
+        while k <= hi {
+            let pk: *mut T = vs_at[T](base, k)
+            let pl: *mut T = vs_at[T](base, l)
+            let v: T = *pk
+            let c: isize = (!less(pp, pk)) as isize
+            *pk = *pl
+            *pl = v
+            l = l + c
+            k = k + 1
+        }
+    } else {
+        while k <= hi {
+            let pk: *mut T = vs_at[T](base, k)
+            let pl: *mut T = vs_at[T](base, l)
+            let v: T = *pk
+            let c: isize = (less(pk, pp)) as isize
+            *pk = *pl
+            *pl = v
+            l = l + c
+            k = k + 1
+        }
+    }
+    let pf: *mut T = vs_at[T](base, l - 1)
+    let t1: T = *pp
+    *pp = *pf
+    *pf = t1
+    return l - 1
+}
+
+fn vs_sort_by[T](base: u64, n: isize, less: fn(*T, *T) -> bool) {
+    var stl: [isize; 72] = [0; 72]
+    var sth: [isize; 72] = [0; 72]
+    var std: [isize; 72] = [0; 72]
+    var stp: [bool; 72] = [false; 72]
+    var pred: bool = false
+    var sp: usize = 0
+    var budget: isize = 0
+    var m: isize = n
+    while m > 1 {
+        budget = budget + 2
+        m = m / 2
+    }
+    var lo: isize = 0
+    var hi: isize = n - 1
+    var depth: isize = budget
+    var go: bool = true
+    while go {
+        while hi - lo >= 16 {
+            if depth <= 0 {
+                vs_heap_by[T](base, lo, hi, less)
+                lo = hi + 1
+                break
+            }
+            depth = depth - 1
+            let len: isize = hi - lo + 1
+            let mid: isize = lo + len / 2
+            var pidx: isize = 0
+            if len >= 128 {
+                let s: isize = len / 8
+                let x: isize = vs_med3_by[T](base, lo, lo + s, lo + 2 * s, less)
+                let y: isize = vs_med3_by[T](base, mid - s, mid, mid + s, less)
+                let z: isize = vs_med3_by[T](base, hi - 2 * s, hi - s, hi, less)
+                pidx = vs_med3_by[T](base, x, y, z, less)
+            } else {
+                pidx = vs_med3_by[T](base, lo, mid, hi, less)
+            }
+            // a[lo - 1] is an earlier pivot, <= everything in the range: if the new
+            // pivot is not greater than it, it is EQUAL to it and the elements equal
+            // to it are split off in one go (runs of equal keys stay O(n)).
+            var eq: bool = false
+            if pred {
+                eq = !less(vs_at[T](base, lo - 1), vs_at[T](base, pidx))
+            }
+            let pi: isize = vs_part_by[T](base, lo, hi, pidx, eq, less)
+            // right part [pi + 1, hi] always has a predecessor now
+            if eq {
+                lo = pi + 1
+                pred = true
+            } else if pi - lo > hi - pi {
+                stl[sp] = lo
+                sth[sp] = pi - 1
+                std[sp] = depth
+                stp[sp] = pred
+                sp = sp + 1
+                lo = pi + 1
+                pred = true
+            } else {
+                stl[sp] = pi + 1
+                sth[sp] = hi
+                std[sp] = depth
+                stp[sp] = true
+                sp = sp + 1
+                hi = pi - 1
             }
         }
-        if gr == i {
-            runs = false
+        if lo < hi {
+            vs_insert_by[T](base, lo, hi, less)
+        }
+        if sp == 0 {
+            go = false
         } else {
-            vec_swap[T](v, i, gr)
-            i = gr
+            sp = sp - 1
+            lo = stl[sp]
+            hi = sth[sp]
+            depth = std[sp]
+            pred = stp[sp]
         }
     }
 }
@@ -576,17 +952,7 @@ fn vec_sort_by[T](v: *mut Vec[T], less: fn(*T, *T) -> bool) {
     if n < 2 {
         return
     }
-    var i: usize = n / 2
-    while i > 0 {
-        i = i - 1
-        vec_lower_by[T](v, i, n, less)
-    }
-    var e: usize = n
-    while e > 1 {
-        e = e - 1
-        vec_swap[T](v, 0, e)
-        vec_lower_by[T](v, 0, e, less)
-    }
+    vs_sort_by[T]((*v).ptr, n as isize, less)
 }
 
 fn vec_is_sorted_by[T](v: *mut Vec[T], less: fn(*T, *T) -> bool) -> bool {
