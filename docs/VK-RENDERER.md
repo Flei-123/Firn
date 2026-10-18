@@ -61,6 +61,8 @@ Push constants (vertex stage, 16 octets, `mc.vert` only): `vec3 u_origin` at 0 (
 `u_discs` 300 | `u_invert` 304 | `u_h` float 308. Each vec3 takes 16 octets (4 octets padding). Same names, same meaning as the GL uniforms
 (comments in `vk_frame.glsl`). Per-pass values (`u_trans`, `u_filter`, `u_fade`) = one UBO slice per pass (dynamic offset) or one write per pass.
 
+**Vertex snap (r261).** `mc_vs` / `mc_model_vs` (GL + Vulkan) snap the clip position to the CPU rasterizer's 1/16 px grid (`u_fade.w` = frame width, `u_fade.z` = height; width 0 = off), so llvmpipe / lavapipe / GPUs (1/256+ px) see the same triangle corners as `mc_raster.snap()`. Measured (tools/gpu/vk/vkmc_dump, scene `chunk`, lavapipe): CPU with edge expansion 35.2 -> 35.6 dB, CPU with the exact top-left rule (`raster_set_edge_expand(false)` / `MCPLAY_EDGE_EXP=0`) 37.1 -> 50.7 dB (`chunk_inside` 42.9 -> 62.9 dB). The rest vs the default CPU picture is the CPU's deliberate edge expansion (1/48 px, LOD pass 1/16 px).
+
 ### Vertex inputs (locations identical to GL)
 | shader | binding 0 | binding 1 |
 |---|---|---|

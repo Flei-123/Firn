@@ -156,6 +156,19 @@ for bk in $BACKENDS; do
     run_one T$sfx 59.5 $BKENV MCPLAY_MODELS=0 MCPLAY_LOD=9
     for n in A B B2 R S T; do NAMES="$NAMES $n$sfx"; done
 done
+# r261: exact-rule CPU reference (MCPLAY_EDGE_EXP=0, no edge expansion) for the GL / Vulkan comparison: the CPU raster deliberately grows every opaque
+# triangle by ~1/48 px (LOD pass 1/16 px, mc_raster.fi draw_clipped_tri) so shared edges never leave see-through slits; GL / Vulkan use the exact rule.
+# That growth, not the shaders, was the ~9000 scattered edge pixels of the snow terrain (28-29 dB). The GL / Vulkan vertex shaders snap to the CPU's 1/16 px grid.
+XNAMES=""
+case " $BACKENDS " in *" cpu "*)
+    case " $BACKENDS " in *" gl "*|*" vk "*)
+        run_one A_x "" MCPLAY_FPS=30 MCPLAY_EDGE_EXP=0 MCPLAY_MODELS=1 MCPLAY_LOD=9
+        run_one B_x "" MCPLAY_FPS=30 MCPLAY_EDGE_EXP=0 MCPLAY_MODELS=0 MCPLAY_LOD=9
+        FIRST_Z=59.5 run_one S_x "" MCPLAY_FPS=30 MCPLAY_EDGE_EXP=0 MCPLAY_MODELS=1 MCPLAY_LOD=9
+        XNAMES="A_x B_x S_x" ;;
+    esac ;;
+esac
+NAMES="$NAMES $XNAMES"
 num() { grep -E "mcplay: (end|stream)" "$W/$1.out" | grep -o "$2=[0-9]*" | tail -1 | cut -d= -f2; }
 for n in $NAMES; do
     F=$(num $n frames)
@@ -178,7 +191,7 @@ for bk in $BACKENDS; do
     esac
 done
 if [ $ERR -eq 0 ]; then
-    python3 -I - "$W" "$BACKENDS" "${LODSEAM_FULL_MIN_DB:-24}" "${LODSEAM_FIX_PCT:-0.5}" <<'PY' || ERR=1
+    python3 -I - "$W" "$BACKENDS" "${LODSEAM_FULL_MIN_DB:-24}" "${LODSEAM_FIX_PCT:-0.5}" "${LODSEAM_EXACT_MIN_DB:-34}" <<'PY' || ERR=1
 import sys, math
 from PIL import Image, ImageChops
 W, backends = sys.argv[1], sys.argv[2].split()
@@ -243,8 +256,8 @@ if "cpu" in allim:
     # the share of those pixels that differ by > 2 levels (<= LODSEAM_FIX_PCT, default 0.5 %; PSNR printed, a handful of quadrant-border pixels of 255 levels
     # cap it near 34 dB). Whole picture (LOD + chunk terrain, sky, fog: scattered 1 px edge differences on the high-contrast snow steps, the same for the
     # cube runs T): only measured, floor LODSEAM_FULL_MIN_DB (default 24) catches gross errors.
-    fullmin = float(sys.argv[4]) if len(sys.argv) > 4 else 24.0
-    fixpct = float(sys.argv[5]) if len(sys.argv) > 5 else 0.5
+    fullmin = float(sys.argv[3]) if len(sys.argv) > 3 else 24.0
+    fixpct = float(sys.argv[4]) if len(sys.argv) > 4 else 0.5
     cpu = allim["cpu"]
     def stat_mask(a, b, m):
         n = sum(m.histogram()[255:])
@@ -256,8 +269,15 @@ if "cpu" in allim:
             for v in range(256): se += h[ch * 256 + v] * v * v
         mse = se / (n * 3)
         return n, (99.0 if mse == 0 else 10 * math.log10(255 * 255 / mse)), nz(d.convert("L").point(lambda v: 255 if v > 2 else 0))
+    xmin = float(sys.argv[5]) if len(sys.argv) > 5 else 34.0
     for bk in backends:
         if bk == "cpu": continue
+        for n in ("A", "B", "S"):
+            try: cx = crop(n + "_x")
+            except Exception: continue
+            g = allim[bk][n]; p = psnr(g, cx); nd = nz(dmask(g, cx, 2))
+            print(f"  PSNR {n}{SFX[bk]} vs CPU exact rule (EDGE_EXP=0): whole {p:.2f} dB ({nd} px > 2 levels of {TOT})")
+            if p < xmin: print(f"  FAIL  PSNR {n}{SFX[bk]} vs exact-rule CPU {p:.2f} dB < {xmin}"); bad = 1
         for n in ("A", "B", "R", "S", "T"):
             g = allim[bk][n]; c = cpu[n]
             m = ImageChops.multiply(fixture_mask(g)[1], fixture_mask(c)[1])
