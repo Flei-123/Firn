@@ -1684,6 +1684,11 @@ rm -rf "$W/hr-scratch"
 # Both print SKIP and succeed without a Vulkan device (or without Xvfb for the second one).
 sh tools/fui/gpuparity.sh
 bash tools/fui/gpuhost.sh
+# W42-b: the pure paint-path decisions (FUI_GPU -> policy -> GL / Vulkan / CPU order, chain simulation) and the Vulkan path under the Khronos
+# validation layer (SKIP without Vulkan or without the layer; the layer is unpacked into a temp dir, never installed)
+build gpuchain
+"$W/gpuchain"
+bash tools/fui/gpuvalidate.sh
 
 echo
 echo "ALL CHECKS PASSED."
