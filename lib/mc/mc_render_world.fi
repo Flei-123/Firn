@@ -30,7 +30,7 @@ export {
     wr_set_light, wr_set_daylight, wr_mark_section, wr_light_sync, wr_region_follow, wr_set_models,
 }
 
-const EW: usize = 6 // words per cache entry: key, handle, state, quads, translucent handle (0 = none), model quad handle (0 = none)
+const EW: usize = 7 // words per cache entry: key, handle, state, quads, translucent handle (0 = none), model quad handle (0 = none), translucent model quad handle (0 = none)
 const ST_EMPTY: u64 = 0
 const ST_CLEAN: u64 = 1
 const ST_DIRTY: u64 = 2
@@ -134,6 +134,8 @@ fn wr_clear_b(wr: *mut WorldRender, b: *mut mc_backend.Backend) {
             if ht != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, ht) }
             let hm: usize = rt.ld64((*wr).cache, i * EW + 5) as usize
             if hm != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, hm) }
+            let hmt: usize = rt.ld64((*wr).cache, i * EW + 6) as usize
+            if hmt != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, hmt) }
         }
         i = i + 1
     }
@@ -303,6 +305,8 @@ fn wr_drop_chunk_b(wr: *mut WorldRender, b: *mut mc_backend.Backend, cx: i32, cz
                 if ht != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, ht) }
                 let hm: usize = rt.ld64((*wr).cache, i * EW + 5) as usize
                 if hm != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, hm) }
+                let hmt: usize = rt.ld64((*wr).cache, i * EW + 6) as usize
+                if hmt != 0 && b as u64 != 0 { (*b).mesh_free((*b).obj, hmt) }
                 rt.st64((*wr).cache, i * EW + 2, ST_EMPTY)
                 removed = removed + 1
             }
@@ -507,6 +511,9 @@ fn mesh_entry(wr: *mut WorldRender, w: *mut mc_world.World, b: *mut mc_backend.B
     if oldt != 0 { (*b).mesh_free((*b).obj, oldt) }
     let oldm: usize = rt.ld64((*wr).cache, slot * EW + 5) as usize
     if oldm != 0 { (*b).mesh_free((*b).obj, oldm) }
+    let oldmt: usize = rt.ld64((*wr).cache, slot * EW + 6) as usize
+    if oldmt != 0 { (*b).mesh_free((*b).obj, oldmt) }
+    var handle_mt: usize = 0
     var handle: usize = 0
     var handle_t: usize = 0
     var handle_m: usize = 0
@@ -562,18 +569,34 @@ fn mesh_entry(wr: *mut WorldRender, w: *mut mc_world.World, b: *mut mc_backend.B
         var mb: rt.Buf = rt.buf_new()
         var lp: u64 = 0
         if lit_flag { lp = (*wr).lpad }
-        let nm: usize = mc_model_mesh.ms_mesh(ms2, (*wr).pad, lp, &(*wr).tables, cx * 16, (*wr).min_y + sy * 16, cz * 16, &mb)
+        var mbt: rt.Buf = rt.buf_new()
+        var nm: usize = mc_model_mesh.ms_mesh_split(ms2, (*wr).pad, lp, &(*wr).tables, cx * 16, (*wr).min_y + sy * 16, cz * 16, &mb, &mbt)
+        var nmt: usize = rt.buf_len(&mbt) / (mc_model_mesh.MQ_WORDS * 8)
+        if (*wr).trans_tab == 0 && nmt > 0 {
+            // no translucent pass: the translucent quads are drawn cut out with the opaque ones
+            rt.buf_push_bytes(&mb, rt.buf_ptr(&mbt), rt.buf_len(&mbt))
+            nm = nm + nmt
+            nmt = 0
+        }
+        var dummy: u32 = 0 as u32
         if nm > 0 {
-            var dummy: u32 = 0 as u32
             (*b).mesh_class((*b).obj, mc_backend.MESH_MODEL)
             handle_m = (*b).mesh_upload((*b).obj, rt.ld64((*wr).cache, slot * EW), rt.buf_ptr(&mb), nm * mc_model_mesh.MQ_WORDS, (&dummy) as u64, 1)
             (*b).mesh_class((*b).obj, mc_backend.MESH_OPAQUE)
             nq = nq + (nm as u64)
         }
+        if nmt > 0 {
+            (*b).mesh_class((*b).obj, mc_backend.MESH_MODEL_T)
+            handle_mt = (*b).mesh_upload((*b).obj, rt.ld64((*wr).cache, slot * EW), rt.buf_ptr(&mbt), nmt * mc_model_mesh.MQ_WORDS, (&dummy) as u64, 1)
+            (*b).mesh_class((*b).obj, mc_backend.MESH_OPAQUE)
+            nq = nq + (nmt as u64)
+        }
+        rt.buf_free(&mbt)
         rt.buf_free(&mb)
     }
     rt.heap_free(sp, 27 * 8)
     rt.st64((*wr).cache, slot * EW + 5, handle_m as u64)
+    rt.st64((*wr).cache, slot * EW + 6, handle_mt as u64)
     rt.st64((*wr).cache, slot * EW + 1, handle as u64)
     rt.st64((*wr).cache, slot * EW + 2, ST_CLEAN)
     rt.st64((*wr).cache, slot * EW + 3, nq)
@@ -724,6 +747,11 @@ fn wr_render_b(wr: *mut WorldRender, w: *mut mc_world.World, b: *mut mc_backend.
                 let nt: u64 = (*b).draw((*b).obj, ht, (vcx * 16) as f64, ((*wr).min_y + vsy * 16) as f64, (vcz * 16) as f64)
                 (*wr).st.tris = (*wr).st.tris + nt
                 (*wr).st.drawn_trans = (*wr).st.drawn_trans + 1 as u32
+            }
+            let hmt: usize = rt.ld64((*wr).cache, slot * EW + 6) as usize
+            if hmt != 0 {
+                let nt: u64 = (*b).draw((*b).obj, hmt, (vcx * 16) as f64, ((*wr).min_y + vsy * 16) as f64, (vcz * 16) as f64)
+                (*wr).st.tris = (*wr).st.tris + nt
             }
         }
         (*b).set_pass((*b).obj, mc_backend.PASS_OPAQUE)

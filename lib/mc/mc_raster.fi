@@ -43,11 +43,11 @@ export {
     face_shade,
     backend_upload_atlas, backend_mesh_upload, backend_mesh_free, backend_begin, backend_draw,
     backend_end, backend_present, backend_read_pixels, backend_set_pass, backend_draw_entities, raster_draw_box,
-    backend_set_fade, bayer8, backend_mesh_class, raster_draw_models, MQ_WORDS,
+    backend_set_fade, bayer8, backend_mesh_class, raster_draw_models, raster_draw_models_ex, MQ_WORDS,
 }
 
 const SLOT_WORDS: usize = 6
-const MQ_WORDS: usize = 24 // f64 per model quad, see raster_draw_models
+const MQ_WORDS: usize = 30 // f64 per model quad, see raster_draw_models
 
 struct Stats {
     tris_in: u64, // triangles handed to the rasterizer
@@ -91,7 +91,8 @@ struct Raster {
     flat_rgb: u32,
     fade_a: i32, // LOD cross-fade (backend_set_fade): 64 = off; else a pixel is drawn where bayer8(x, y) < fade_a (fade_inv: >= fade_a)
     fade_inv: bool,
-    mesh_cls: i32, // class of the NEXT backend_mesh_upload (backend_mesh_class): 2 = MESH_MODEL (model quads, see raster_draw_models)
+    mesh_cls: i32, // class of the NEXT backend_mesh_upload (backend_mesh_class): 2 = MESH_MODEL, 3 = MESH_MODEL_T (model quads, see raster_draw_models)
+    qt: u32, // model quad tint (raster_draw_models): 0 = none, else R | G << 8 | B << 16 | 1 << 24, multiplies the texel (c * (t + 1) >> 8)
     // scratch
     vbuf: u64, // f64 [vcap * 8]
     vcap: usize,
@@ -124,7 +125,7 @@ fn raster_new(w: i32, h: i32) -> Raster {
         fx: 0.0, fy: 0.0, fz: 1.0, near: 0.05, hw: 0.0, hh: 0.0, fpx: 1.0, fpy: 1.0,
         apx: 0, atile: 16, acols: 16, aw: 256,
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0 as u32, fog_g: 0 as u32, fog_b: 0 as u32,
-        cull: true, edge_exp: true, day: 256, tint_r: 256, tint_g: 224, tint_b: 176, trans: false, lod_pass: false, flat_on: false, flat_rgb: 0 as u32, fade_a: 64, fade_inv: false, mesh_cls: 0,
+        cull: true, edge_exp: true, day: 256, tint_r: 256, tint_g: 224, tint_b: 176, trans: false, lod_pass: false, flat_on: false, flat_rgb: 0 as u32, fade_a: 64, fade_inv: false, mesh_cls: 0, qt: 0 as u32,
         vbuf: 0, vcap: 0, pa: 0, pb: 0, pc: 0, slots: 0, slot_cap: 0,
         st: Stats { tris_in: 0 as u64, tris_drawn: 0 as u64, tris_culled: 0 as u64, tris_clipped: 0 as u64, pixels: 0 as u64 },
     }
@@ -523,9 +524,17 @@ fn draw_clipped_tri(r: *mut Raster, a: u64, b: u64, c: u64, tile: u32, fk: u32) 
                         let tr: i64 = (total * light_factor(s256, b256, (*r).tint_r)) / 256 as i64
                         let tg: i64 = (total * light_factor(s256, b256, (*r).tint_g)) / 256 as i64
                         let tb: i64 = (total * light_factor(s256, b256, (*r).tint_b)) / 256 as i64
-                        var cr: i64 = (((tp & 255 as u32) as i64) * tr) / 256 as i64
-                        var cg: i64 = ((((tp >> 8 as u32) & 255 as u32) as i64) * tg) / 256 as i64
-                        var cb: i64 = ((((tp >> 16 as u32) & 255 as u32) as i64) * tb) / 256 as i64
+                        var t0r: i64 = (tp & 255 as u32) as i64
+                        var t0g: i64 = ((tp >> 8 as u32) & 255 as u32) as i64
+                        var t0b: i64 = ((tp >> 16 as u32) & 255 as u32) as i64
+                        if (*r).qt != 0 as u32 {
+                            t0r = (t0r * ((((*r).qt & 255 as u32) as i64) + 1 as i64)) / 256 as i64
+                            t0g = (t0g * (((((*r).qt >> 8 as u32) & 255 as u32) as i64) + 1 as i64)) / 256 as i64
+                            t0b = (t0b * (((((*r).qt >> 16 as u32) & 255 as u32) as i64) + 1 as i64)) / 256 as i64
+                        }
+                        var cr: i64 = (t0r * tr) / 256 as i64
+                        var cg: i64 = (t0g * tg) / 256 as i64
+                        var cb: i64 = (t0b * tb) / 256 as i64
                         if (*r).fog_on {
                             let z: f64 = 1.0 / zinv
                             var t: f64 = (z - (*r).fog_start) / fogd
@@ -705,15 +714,58 @@ fn raster_draw_mesh(r: *mut Raster, verts: u64, nverts: usize, idx: u64, nidx: u
 // ---- model quads (MESH_MODEL, opt-in: lib/mc/mc_model_mesh.fi) ------------------------------------------------------
 
 // One model quad = MQ_WORDS f64: x0..x3 (0..3), y0..y3 (4..7), z0..z3 (8..11) section relative block units, u0..u3 (12..15), v0..v3 (16..19) in
-// TILE units (0..1 = the whole tile, v down), tile id (20), face brightness 0..256 (21, face_shade scale), sky (22), block (23) light 0..15.
+// TILE units (0..1 = the whole tile, v down), tile id (20), face brightness 0..256 (21, face_shade scale), sky (22), block (23) light 0..15,
+// tint (24: R | G << 8 | B << 16 as a number, -1 = none; multiplies the texel), flags (25, bit 0 = translucent), ao0..ao3 (26..29, 0..3 like the cube
+// mesher: 3 = open, 0 = fully occluded) per corner.
 // Corners go round the quad; triangles (0 1 2) (0 2 3). Front faces are counter-clockwise seen from outside, like the mc_mesh quads.
 fn raster_draw_models(r: *mut Raster, q: u64, nq: usize, ox: f64, oy: f64, oz: f64) {
+    raster_draw_models_ex(r, q, nq, ox, oy, oz, false)
+}
+
+// Same with `sorted`: the quads are drawn FAR TO NEAR by the mean view depth of their corners (translucent mesh, MESH_MODEL_T): the blend order
+// must not depend on the mesher's cell order.
+fn raster_draw_models_ex(r: *mut Raster, q: u64, nq: usize, ox: f64, oy: f64, oz: f64, sorted: bool) {
     if nq == 0 { return }
     ensure_vbuf(r, 4)
     let vb: u64 = (*r).vbuf
+    var ord: u64 = 0
+    if sorted && nq > 1 {
+        ord = rt.heap_alloc(nq * 16)
+        var i0: usize = 0
+        while i0 < nq {
+            let b0: usize = i0 * MQ_WORDS
+            var dsum: f64 = 0.0
+            var k0: usize = 0
+            while k0 < 4 {
+                let ax: f64 = ox + ldd(q, b0 + k0) - (*r).cx
+                let ay: f64 = oy + ldd(q, b0 + 4 + k0) - (*r).cy
+                let az: f64 = oz + ldd(q, b0 + 8 + k0) - (*r).cz
+                dsum = dsum + ax * (*r).fx + ay * (*r).fy + az * (*r).fz
+                k0 = k0 + 1
+            }
+            stf(ord, nq + i0, dsum)
+            rt.st64(ord, i0, i0 as u64)
+            i0 = i0 + 1
+        }
+        // insertion sort, descending depth (stable); sections hold few translucent quads
+        var a1: usize = 1
+        while a1 < nq {
+            let ki: u64 = rt.ld64(ord, a1)
+            let kd: f64 = ldd(ord, nq + (ki as usize))
+            var j: usize = a1
+            while j > 0 && ldd(ord, nq + (rt.ld64(ord, j - 1) as usize)) < kd {
+                rt.st64(ord, j, rt.ld64(ord, j - 1))
+                j = j - 1
+            }
+            rt.st64(ord, j, ki)
+            a1 = a1 + 1
+        }
+    }
     var i: usize = 0
     while i < nq {
-        let base: usize = i * MQ_WORDS
+        var qi: usize = i
+        if ord != 0 { qi = rt.ld64(ord, i) as usize }
+        let base: usize = qi * MQ_WORDS
         i = i + 1
         let tile: u32 = ldd(q, base + 20) as u32
         if tile == 0 as u32 { continue }
@@ -727,15 +779,19 @@ fn raster_draw_models(r: *mut Raster, q: u64, nq: usize, ox: f64, oy: f64, oz: f
             stf(vb, k * VREC + 2, rx * (*r).fx + ry * (*r).fy + rz * (*r).fz)
             stf(vb, k * VREC + 3, ldd(q, base + 12 + k))
             stf(vb, k * VREC + 4, ldd(q, base + 16 + k))
-            stf(vb, k * VREC + 5, 3.0)
+            stf(vb, k * VREC + 5, ldd(q, base + 26 + k))
             stf(vb, k * VREC + 6, ldd(q, base + 22))
             stf(vb, k * VREC + 7, ldd(q, base + 23))
             k = k + 1
         }
+        let tn: f64 = ldd(q, base + 24)
+        if tn >= 0.0 { (*r).qt = (tn as u32) | 16777216 as u32 } else { (*r).qt = 0 as u32 }
         let fk: u32 = ldd(q, base + 21) as u32
         raster_draw_tri8(r, vb, vb + (VREC * 8) as u64, vb + (VREC * 16) as u64, tile, fk)
         raster_draw_tri8(r, vb, vb + (VREC * 16) as u64, vb + (VREC * 24) as u64, tile, fk)
     }
+    (*r).qt = 0 as u32
+    if ord != 0 { rt.heap_free(ord, nq * 16) }
 }
 
 // Class of the next backend_mesh_upload (0 / 1 = normal mesh, 2 = model quads: verts = nq * MQ_WORDS 8 byte units, idx = one dummy word).
@@ -848,7 +904,7 @@ fn backend_mesh_upload(r: *mut Raster, key: u64, verts: u64, nverts: usize, idx:
     rt.st64((*r).slots, b + 1, nverts as u64)
     rt.st64((*r).slots, b + 2, ip)
     rt.st64((*r).slots, b + 3, nidx as u64)
-    if (*r).mesh_cls == 2 { rt.st64((*r).slots, b + 4, 2 as u64) } else { rt.st64((*r).slots, b + 4, 1 as u64) }
+    if (*r).mesh_cls == 2 { rt.st64((*r).slots, b + 4, 2 as u64) } else if (*r).mesh_cls == 3 { rt.st64((*r).slots, b + 4, 3 as u64) } else { rt.st64((*r).slots, b + 4, 1 as u64) }
     rt.st64((*r).slots, b + 5, key)
     return s + 1
 }
@@ -879,6 +935,10 @@ fn backend_draw(r: *mut Raster, handle: usize, ox: f64, oy: f64, oz: f64) {
     if rt.ld64((*r).slots, b + 4) == 0 as u64 { return }
     if rt.ld64((*r).slots, b + 4) == 2 as u64 {
         raster_draw_models(r, rt.ld64((*r).slots, b), rt.ld64((*r).slots, b + 1) as usize / MQ_WORDS, ox, oy, oz)
+        return
+    }
+    if rt.ld64((*r).slots, b + 4) == 3 as u64 {
+        raster_draw_models_ex(r, rt.ld64((*r).slots, b), rt.ld64((*r).slots, b + 1) as usize / MQ_WORDS, ox, oy, oz, true)
         return
     }
     raster_draw_mesh(r, rt.ld64((*r).slots, b), rt.ld64((*r).slots, b + 1) as usize, rt.ld64((*r).slots, b + 2),

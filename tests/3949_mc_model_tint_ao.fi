@@ -1,0 +1,269 @@
+// expect_exit: 0
+// tests/3949_mc_model_tint_ao.fi -- r236 model quads: (1) biome tint (tintindex) multiplies the texel by the class colour (grass / lily pad), checked
+// as a pixel ratio against the untinted model; (2) per corner AO of a flat quad (ms_mesh_split words 26..29) against hand counted occluders;
+// (3) an image with all four corners fully occluded is 100/256 as bright as the open one (raster fq = 100 + 52 * ao).
+import std.rt
+import std.core
+import std.math
+import std.io
+import zip.zip
+import pack.icons
+import mc.mc_assets
+import mc.mc_texture
+import mc.mc_texext
+import mc.mc_mesh
+import mc.mc_model
+import mc.mc_model_mesh
+import mc.mc_registry
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_camera
+import mc.mc_math
+import mc.mc_backend
+import mc.mc_raster
+import mc.mc_render_world
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+const W: i32 = 96
+const H: i32 = 72
+const CLEAR: u32 = 0xFF000000 as u32
+const MIN_Y: i32 = 0 - 64
+
+// 16 x 16 solid colour PNG
+fn png_solid(r: u8, g: u8, b: u8, a: u8, out: *mut rt.Buf) -> bool {
+    let px: u64 = rt.heap_alloc(16 * 16 * 4)
+    var i: usize = 0
+    while i < 256 {
+        rt.st8(px, i * 4, r)
+        rt.st8(px, i * 4 + 1, g)
+        rt.st8(px, i * 4 + 2, b)
+        rt.st8(px, i * 4 + 3, a)
+        i = i + 1
+    }
+    let ok: bool = icons.png_encode(px, 16, 16, out)
+    rt.heap_free(px, 16 * 16 * 4)
+    return ok
+}
+
+fn add_text(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    var ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn add_png(w: *mut zip.ZipWriter, name: str, r: u8, g: u8, b: u8, a: u8) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    if !png_solid(r, g, b, a, &p) { return false }
+    var ok: bool = zip.zip_add(w, name, rt.buf_ptr(&p), rt.buf_len(&p), true) catch | e | (false)
+    rt.buf_free(&p)
+    return ok
+}
+
+// blockstate of a block without properties: one model for every state
+fn add_state(w: *mut zip.ZipWriter, block: str, model: str) -> bool {
+    return add_text(w, "assets/minecraft/blockstates/" + block + ".json", "{\"variants\":{\"\":{\"model\":\"" + model + "\"}}}")
+}
+
+// a model with ONE up face covering the whole top of the cell (flat on the cell face: AO applies), texture `tex`, optional tintindex 0
+fn add_up_model(w: *mut zip.ZipWriter, name: str, tex: str, tinted: bool) -> bool {
+    var tn: str = ""
+    if tinted { tn = ",\"tintindex\":0" }
+    return add_text(w, "assets/minecraft/models/block/" + name + ".json",
+        "{\"textures\":{\"t\":\"block/" + tex + "\"},\"elements\":[{\"from\":[0,0,0],\"to\":[16,16,16],\"faces\":{\"up\":{\"uv\":[0,0,16,16],\"texture\":\"#t\"" + tn + "}}}]}")
+}
+
+fn open_pack(b: *mut rt.Buf, w: *mut zip.ZipWriter, st: *mut mc_assets.PackStack) -> bool {
+    var n: usize = zip.zip_finish(w) catch | e | (0)
+    zip.zip_writer_free(w)
+    if n == 0 { return false }
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pk, rt.buf_ptr(b), rt.buf_len(b)) != mc_assets.ASSET_OK { return false }
+    rt.buf_free(b)
+    return mc_assets.stack_push(st, &pk) == mc_assets.ASSET_OK
+}
+
+fn sid(reg: *mut mc_registry.Registry, name: str) -> i32 {
+    let blk: i32 = mc_registry.reg_block_by_name(reg, name.p as u64, name.length())
+    if blk < 0 { return 0 - 1 }
+    return mc_registry.reg_block_min_state(reg, blk)
+}
+
+// cell (x, y, z) of section 0 (a 16 x 16 x 16 u16 array per section, 2 sections)
+fn put(ids: u64, x: i32, y: i32, z: i32, state: i32) {
+    rt.st16(ids, ((y * 16 + z) * 16 + x) as usize, state as u16)
+}
+
+fn new_ids() -> u64 {
+    let ids: u64 = rt.heap_alloc(2 * 4096 * 2)
+    var i: usize = 0
+    while i < 8192 {
+        rt.st16(ids, i, 0 as u16)
+        i = i + 1
+    }
+    return ids
+}
+
+fn chan(c: u32, k: i32) -> i32 {
+    return ((c >> ((k * 8) as u32)) & (255 as u32)) as i32
+}
+
+fn iabs(v: i32) -> i32 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// everything a scene needs, rebuilt per scene
+struct Scene {
+    tb: mc_mesh.MeshTables,
+    ex: mc_texext.TexExt,
+    atlas: mc_texture.Atlas,
+    an: mc_assets.AnimSet,
+}
+
+fn scene_init(sc: *mut Scene, reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack) -> bool {
+    (*sc).tb = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_texture.tex_alloc_tables(&(*sc).tb)
+    (*sc).ex = mc_texext.texext_new()
+    mc_texext.tex_build_tables_ext(reg, &(*sc).tb, &(*sc).ex)
+    (*sc).atlas = mc_texext.texext_atlas_new(16, &(*sc).ex)
+    (*sc).an = mc_assets.animset_new()
+    return mc_assets.assets_apply_ext(st, &(*sc).atlas, &(*sc).ex, &(*sc).an) >= 1
+}
+
+// look from (ex, ey, ez) at (tx, ty, tz), render and return the centre pixel
+fn shot(r: *mut mc_raster.Raster, wr: *mut mc_render_world.WorldRender, w: *mut mc_world.World, cam: *mut mc_camera.Camera,
+    ex: f64, ey: f64, ez: f64, tx: f64, ty: f64, tz: f64) -> u32 {
+    mc_camera.camera_set_pos(cam, ex, ey, ez)
+    mc_camera.camera_look_at(cam, tx, ty, tz)
+    mc_camera.camera_update(cam)
+    mc_raster.backend_begin(r, cam, CLEAR)
+    mc_render_world.wr_render(wr, w, r, cam, 0 - 1)
+    return mc_raster.raster_pixel(r, W / 2, H / 2)
+}
+
+fn build(st: *mut mc_assets.PackStack) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    var w: zip.ZipWriter = zip.zip_writer_new(&b)
+    if !add_text(&w, "pack.mcmeta", META) { return false }
+    if !add_png(&w, "assets/minecraft/textures/block/oak_planks.png", 240 as u8, 240 as u8, 240 as u8, 255 as u8) { return false }
+    if !add_up_model(&w, "ms_t", "oak_planks", true) { return false }
+    if !add_up_model(&w, "ms_n", "oak_planks", false) { return false }
+    if !add_state(&w, "stone", "block/ms_t") { return false }
+    if !add_state(&w, "lily_pad", "block/ms_t") { return false }
+    if !add_state(&w, "dirt", "block/ms_n") { return false }
+    return open_pack(&b, &w, st)
+}
+
+fn main() -> i32 {
+    var v: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(763, &v) { return 1 }
+    var reg: mc_registry.Registry = v.registry_of()
+    if !mc_registry.registry_ok(&reg) { return 2 }
+    var st: mc_assets.PackStack = mc_assets.stack_new()
+    if !build(&st) { return 3 }
+    var ex0: mc_texext.TexExt = mc_texext.texext_new()
+    var sc: Scene = Scene { tb: mc_mesh.MeshTables { opaque: 0, tiles: 0 }, ex: mc_texext.texext_new(), atlas: mc_texext.texext_atlas_new(16, &ex0), an: mc_assets.animset_new() }
+    if !scene_init(&sc, &reg, &st) { return 4 }
+    var ms: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(&reg, &st, &sc.ex)
+    let s_stone: i32 = sid(&reg, "stone")
+    let s_lily: i32 = sid(&reg, "lily_pad")
+    let s_dirt: i32 = sid(&reg, "dirt")
+    let s_bed: i32 = sid(&reg, "bedrock")
+    if s_stone < 0 || s_lily < 0 || s_dirt < 0 || s_bed < 0 { return 5 }
+    if mc_model_mesh.ms_kind(&ms, s_stone as u16) != mc_model_mesh.K_MODEL { return 6 }
+    if mc_model_mesh.ms_kind(&ms, s_dirt as u16) != mc_model_mesh.K_MODEL { return 7 }
+
+    // ---- (2) AO words: model cell (8,8,8) (padded 9,9,9); occluders east, north-west diagonal, south + west of the cell above
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    var i: usize = 0
+    while i < 5832 {
+        rt.st16(pad, i, 0 as u16)
+        i = i + 1
+    }
+    rt.st16(pad, ((9 * 18 + 9) * 18 + 9) as usize, s_dirt as u16)
+    rt.st16(pad, ((10 * 18 + 9) * 18 + 10) as usize, s_bed as u16) // (9, 9, 8)
+    rt.st16(pad, ((10 * 18 + 8) * 18 + 8) as usize, s_bed as u16) // (7, 9, 7)
+    rt.st16(pad, ((10 * 18 + 10) * 18 + 9) as usize, s_bed as u16) // (8, 9, 9)
+    rt.st16(pad, ((10 * 18 + 9) * 18 + 8) as usize, s_bed as u16) // (7, 9, 8)
+    mc_model_mesh.ms_prepare(&ms, pad, &sc.tb)
+    var out: rt.Buf = rt.buf_new()
+    var outt: rt.Buf = rt.buf_new()
+    let nq: usize = mc_model_mesh.ms_mesh_split(&ms, pad, 0, &sc.tb, 0, 0, 0, &out, &outt)
+    if nq != 1 || rt.buf_len(&outt) != 0 { return 10 }
+    let q: u64 = rt.buf_ptr(&out)
+    var c: usize = 0
+    while c < 4 {
+        let x: i32 = (math.math_f64(rt.ld64(q, c)) - 8.0 + 0.5) as i32 // 0 or 1
+        let z: i32 = (math.math_f64(rt.ld64(q, 8 + c)) - 8.0 + 0.5) as i32
+        let ao: i32 = (math.math_f64(rt.ld64(q, 26 + c)) + 0.5) as i32
+        var want: i32 = 3
+        if x == 1 && z == 0 { want = 2 }
+        if x == 1 && z == 1 { want = 0 }
+        if x == 0 && z == 0 { want = 1 }
+        if x == 0 && z == 1 { want = 0 }
+        io.fmt_print(f"corner x={x} z={z} ao={ao} want={want}\n")
+        if ao != want { return 11 }
+        c = c + 1
+    }
+    if math.math_f64(rt.ld64(q, 24)) >= 0.0 { return 12 } // dirt model: no tint
+
+    // ---- (1) + (3) images
+    let ids_n: usize = 0
+    var px: [u32; 5] = [0 as u32; 5]
+    var k: usize = 0
+    while k < 5 {
+        let ids: u64 = new_ids()
+        var state: i32 = s_dirt
+        if k == 1 { state = s_stone }
+        if k == 2 { state = s_lily }
+        put(ids, 8, 8, 8, state)
+        if k >= 3 {
+            var rx: i32 = 7
+            while rx <= 9 {
+                var rz: i32 = 7
+                while rz <= 9 {
+                    if !(rx == 8 && rz == 8) { put(ids, rx, 9, rz, s_bed) }
+                    rz = rz + 1
+                }
+                rx = rx + 1
+            }
+        }
+        if k == 4 { put(ids, 8, 9, 8, 0) }
+        var wd: mc_world.World = mc_world.world_new()
+        if !mc_world.world_put(&wd, mc_render_world.wr_make_chunk(0, 0, 2, ids)) { return 20 }
+        var r: mc_raster.Raster = mc_raster.raster_new(W, H)
+        mc_raster.backend_upload_atlas(&r, &sc.atlas)
+        var wr: mc_render_world.WorldRender = mc_render_world.wr_new(MIN_Y, 8, &sc.tb)
+        mc_render_world.wr_set_models(&wr, (&ms) as u64)
+        var cam: mc_camera.Camera = mc_camera.camera_new(W, H)
+        mc_camera.camera_set_lens(&cam, 40.0, 0.05, 200.0)
+        let top: f64 = ((MIN_Y + 9) as f64)
+        var ey: f64 = top + 4.0
+        if k >= 3 { ey = top + 8.0 }
+        px[k] = shot(&r, &wr, &wd, &cam, 8.5, ey, 8.9, 8.5, top, 8.5)
+        io.fmt_print(f"scene {k}: pixel {chan(px[k], 0)} {chan(px[k], 1)} {chan(px[k], 2)}\n")
+        k = k + 1
+    }
+    // tint: grass 0x91BD59 (145, 189, 89), lily pad 0x208030 (32, 128, 48): pixel = dirt pixel * (t + 1) / 256 (+- 3)
+    var gr: [i32; 3] = [145, 189, 89]
+    var lp: [i32; 3] = [32, 128, 48]
+    var ch: i32 = 0
+    while ch < 3 {
+        let base: i32 = chan(px[0], ch)
+        if base < 60 { return 30 }
+        if iabs(chan(px[1], ch) - base * (gr[ch as usize] + 1) / 256) > 3 { return 31 + ch }
+        if iabs(chan(px[2], ch) - base * (lp[ch as usize] + 1) / 256) > 3 { return 34 + ch }
+        ch = ch + 1
+    }
+    // ao: the closed ring (scene 3, all corners 0) is 100/256 of the open one (scene 4: the same ring cubes, cell above the model free but ao from the ring)
+    // scene 4 has the centre cell cleared as well, so scene 3 differs from scene 0 only by the AO factor
+    ch = 0
+    while ch < 3 {
+        let base: i32 = chan(px[0], ch)
+        if iabs(chan(px[3], ch) - base * 100 / 256) > 3 { return 40 + ch }
+        ch = ch + 1
+    }
+    mc_model_mesh.ms_free(&ms)
+    return 0
+}
