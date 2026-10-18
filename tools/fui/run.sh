@@ -1627,6 +1627,11 @@ build appnodes
 "$W/appnodes"
 
 echo
+echo "== 12y. fui.lay (CSS flexbox for the app API: 190 cases measured in Chromium + a mobile page) =="
+build lay
+"$W/lay"
+
+echo
 echo "== THE INTERACTIVE DIALOGS (roadmap r177, docs/DIALOG.md): message, colour, font, file =="
 # Each script builds its own in-memory test and live driver, runs the checks without a window, the
 # FRAME_MS limit (<= 16 ms) with release-fast, the accessibility audit, and the live test on a private
