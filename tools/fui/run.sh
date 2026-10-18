@@ -781,6 +781,9 @@ build appw8w
 # appgrid: grid container in the ten-line API (appctl.grid: track words, cells, spans, gap, padding, RTL, inspector line, pictures)
 build appgrid
 "$W/appgrid" | tail -n 3 | grep -q "APPGRID PASSED"
+# appw8m: accordion (exclusive / free, click, Up/Down/Home/End, Enter, program side) in the ten-line API
+build appw8m
+"$W/appw8m" | tail -n 3 | grep -q "APPW8M PASSED"
 
 # appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
 build appw6
