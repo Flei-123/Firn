@@ -93,7 +93,7 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Komplexschrift Arabisch (Formen, Ligaturen) | **teilweise** | lib/font/gsub.fi (Typ 1/4/7); Kontext 5/6 + Mark-Positionierung fehlen (r13) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P2 (r13) | Arabische Referenztexte gegen HarfBuzz |
 | Komplexschrift Indisch, Thai, Khmer, Hebräisch-Niqqud | **fehlt** | nur Arabisch; r13 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | P2 | HarfBuzz-Referenz, 20 Texte |
 | Bidi UAX #9 | **vorhanden** | lib/fui/bidi.fi (91707/91707, 770241/770241) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | - | bidiconf_main |
-| IME eigene Tabellen (Romaji, Hangul, Pinyin) | **teilweise** | lib/fui/ime.fi; Pinyin nur Zeichen (r16) | ~ | ~ | ~ | ~ | ~ | ~ | ~ | ✗ | P2 (r16) | - |
+| IME eigene Tabellen (Romaji, Hangul, Pinyin) | **teilweise** | lib/fui/ime.fi; Pinyin Zeichen + 634 Woerter (pywords.fi), keine Satz-Umwandlung | ~ | ~ | ~ | ~ | ~ | ~ | ~ | ✗ | P2 (r16) | - |
 | IME OS-Komposition (TSF/IMM32, ibus/fcitx, Wayland text-input) | **fehlt** | win32.fi/x11.fi nur Zeichen; r142 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P1 (r142) | Echter Test: Windows-Pinyin + fcitx |
 | Selektierbare Labels / Auswahl über Widgets | **teilweise** | nur markdownview (mdv_select_*), Labels nicht | ~ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | P2 | - |
 | Rechtschreibung/Autokorrektur | **fehlt** | nicht gefunden | ~ | ✓ | ✓ | ~ | ✓ | ✓ | ✗ | ✗ | P3 | - |
