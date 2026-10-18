@@ -595,6 +595,43 @@ impl<'a> Parser<'a> {
     }
 
     /// Expression inside brackets/arguments: struct literals are allowed there.
+    /// Python-style slice `x[a:b]` (r712). Called with the current token at
+    /// the first `:`; `lo` is the already parsed lower bound. The slice is
+    /// sugar for the method call `x.slice(a as i64, b as i64)` (an omitted
+    /// bound is `0` resp. `i64` max); `str`/`Span` implement `slice` in
+    /// `std.str` with Python semantics (negative = from the end, clamped).
+    pub(crate) fn slice_rest(&mut self, base: Expr, lo: Option<Expr>) -> Expr {
+        let colon = self.bump(); // ':'
+        let hi = if self.at(&TokKind::RBracket) || self.at(&TokKind::Colon) {
+            None
+        } else {
+            Some(self.nested_expr())
+        };
+        if self.at(&TokKind::Colon) {
+            self.error_here("a slice step 'x[a:b:c]' is not supported; use a loop or a library function");
+            while !self.at(&TokKind::RBracket) && !self.at_eof() {
+                self.bump();
+            }
+        }
+        let end = self.span();
+        self.close(TokKind::RBracket, "after the slice");
+        let sp = Parser::join(base.span, end);
+        let bound = |p: &mut Parser, e: Option<Expr>, dflt: i128| -> Expr {
+            let e = match e {
+                Some(e) => e,
+                None => p.mk(colon, ExprKind::Int(dflt)),
+            };
+            let esp = e.span;
+            p.mk(esp, ExprKind::Cast(Box::new(e), TypeExpr::Named("i64".to_string(), esp)))
+        };
+        let a = bound(self, lo, 0);
+        let b = bound(self, hi, i64::MAX as i128);
+        self.mk(
+            sp,
+            ExprKind::Call(format!("{}slice", crate::impls::P_CALL), vec![base, a, b], colon),
+        )
+    }
+
     pub(crate) fn nested_expr(&mut self) -> Expr {
         let saved = self.no_struct_lit;
         self.no_struct_lit = false;
@@ -833,7 +870,16 @@ impl<'a> Parser<'a> {
                         continue;
                     }
                     let start = self.bump();
+                    // HOOK slice (r712): `x[a:b]`, `x[a:]`, `x[:b]`, `x[:]`
+                    if self.at(&TokKind::Colon) {
+                        e = self.slice_rest(e, None);
+                        continue;
+                    }
                     let idx = self.nested_expr();
+                    if self.at(&TokKind::Colon) {
+                        e = self.slice_rest(e, Some(idx));
+                        continue;
+                    }
                     let end = self.span();
                     if !self.close(TokKind::RBracket, "after the index") {
                         let sp = Parser::join(e.span, start);
