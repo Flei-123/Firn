@@ -144,6 +144,20 @@ fn method_param_type(b: *mut ast.Tree, it: *mut intern.Interner, name: u32,
     return rep
 }
 
+// r739: `-> AllocError!fn(..)` -- the expected type of `return gc |x| ..` is the error
+// union placeholder `__eu#<n>`; the lambda wants its payload (twin of the
+// `pending_inner` step in lambda.rs::resolve). `ef` may be 0 (no error registry).
+fn unwrap_eu(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, pt: u32) -> u32 {
+    if pt == ast.NOTHING || ef as u64 == 0 || ast.t_kind(b, pt) != ast.T_NAME {
+        return pt
+    }
+    let ph: i64 = err.error_placeholder(it, ast.t_a(b, pt))
+    if ph < 0 || (ph as usize) >= vec_len[u32](&(*ef).p_te) {
+        return pt
+    }
+    return vec_at[u32](&(*ef).p_te, ph as usize)
+}
+
 // Fill in lambda `lam` from the expected type node `pt`. Returns the number
 // of errors (0 or 1).
 fn resolve(b: *mut ast.Tree, fmap: *mut Vec[u32], lam: u32, pt: u32) -> u32 {
@@ -221,9 +235,182 @@ fn field_type(b: *mut ast.Tree, sname: u32, fname: u32) -> u32 {
     return ast.NOTHING
 }
 
+// ---------------------------------------------------------------- r740
+// `s.f = |x| ..` / `v[i] = gc |x| ..` / `f = |x| ..` -- the expected type is the
+// DECLARED type of the assignment target (twin of lambda.rs `expr_ty` + the
+// `Stmt::Assign` arm). The type of a target is derived without a type check from
+// what is evident: parameters, `let x: T`, `let x = S{..}` / `let x = f(..)`,
+// fields, `*p`, `a[i]` (array element / `Vec[T]` element via the struct's elem).
+
+fn env_find(names: *mut Vec[u32], tys: *mut Vec[u32], name: u32) -> u32 {
+    var i: usize = vec_len[u32](names)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](names, i) == name {
+            return vec_at[u32](tys, i)
+        }
+    }
+    return ast.NOTHING
+}
+
+fn strip_ptr(b: *mut ast.Tree, t: u32) -> u32 {
+    var x: u32 = t
+    while x != ast.NOTHING && ast.t_kind(b, x) == ast.T_PTR {
+        x = ast.t_a(b, x)
+    }
+    return x
+}
+
+fn struct_at(b: *mut ast.Tree, name: u32) -> i64 {
+    let n: usize = ast.structure_count(b)
+    var i: usize = 0
+    while i < n {
+        if ast.structure_name(b, i) == name {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn ty_of(b: *mut ast.Tree, fmap: *mut Vec[u32], names: *mut Vec[u32], tys: *mut Vec[u32],
+    e: u32) -> u32 {
+    if e == ast.NOTHING {
+        return ast.NOTHING
+    }
+    let k: u32 = ast.e_kind(b, e)
+    if k == ast.E_ID {
+        return env_find(names, tys, ast.e_a(b, e))
+    }
+    if k == ast.E_SLIT {
+        return ast.ty_new(b, ast.T_NAME, ast.e_a(b, e), 0)
+    }
+    if k == ast.E_CALL && ast.e_number(b, e) == 0 {
+        let nm: u32 = ast.e_a(b, e)
+        if (nm as usize) < vec_len[u32](fmap) {
+            let fi: u32 = vec_at[u32](fmap, nm as usize)
+            if fi != NONE {
+                return ast.fn_ret(b, fi as usize)
+            }
+        }
+        return ast.NOTHING
+    }
+    if k == ast.E_UN && ast.e_a(b, e) == 3 {
+        let t: u32 = ty_of(b, fmap, names, tys, ast.e_b(b, e))
+        if t != ast.NOTHING && ast.t_kind(b, t) == ast.T_PTR {
+            return ast.t_a(b, t)
+        }
+        return ast.NOTHING
+    }
+    if k == ast.E_FIELD {
+        let t: u32 = strip_ptr(b, ty_of(b, fmap, names, tys, ast.e_a(b, e)))
+        if t != ast.NOTHING && ast.t_kind(b, t) == ast.T_NAME {
+            return field_type(b, ast.t_a(b, t), ast.e_b(b, e))
+        }
+        return ast.NOTHING
+    }
+    if k == ast.E_IDX {
+        let t: u32 = strip_ptr(b, ty_of(b, fmap, names, tys, ast.e_a(b, e)))
+        if t == ast.NOTHING {
+            return ast.NOTHING
+        }
+        if ast.t_kind(b, t) == ast.T_ARR {
+            return ast.t_a(b, t)
+        }
+        if ast.t_kind(b, t) == ast.T_NAME {
+            let si: i64 = struct_at(b, ast.t_a(b, t))
+            if si >= 0 {
+                return ast.structure_elem(b, si as usize)
+            }
+        }
+        return ast.NOTHING
+    }
+    return ast.NOTHING
+}
+
+fn assign_stmt(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error,
+    fmap: *mut Vec[u32], names: *mut Vec[u32], tys: *mut Vec[u32], st: u32) {
+    let k: u32 = ast.s_kind(b, st)
+    if k == ast.S_LET || k == ast.S_VAR {
+        var t: u32 = ast.s_b(b, st)
+        if t == ast.NOTHING {
+            t = ty_of(b, fmap, names, tys, ast.s_c(b, st))
+        }
+        vec_push[u32](names, ast.s_a(b, st))
+        vec_push[u32](tys, t)
+        return
+    }
+    if k == ast.S_ZUW {
+        let lam: u32 = lambda_of(b, it, ast.s_b(b, st))
+        if lam != NONE && is_open(b, lam) {
+            let t: u32 = ty_of(b, fmap, names, tys, ast.s_a(b, st))
+            resolve(b, fmap, lam, unwrap_eu(b, it, ef, t))
+        }
+        return
+    }
+    if k == ast.S_IF {
+        assign_block(b, it, ef, fmap, names, tys, ast.s_b(b, st))
+        if ast.s_c(b, st) != ast.NOTHING {
+            assign_stmt(b, it, ef, fmap, names, tys, ast.s_c(b, st))
+        }
+        return
+    }
+    if k == ast.S_WHILE {
+        assign_block(b, it, ef, fmap, names, tys, ast.s_b(b, st))
+        return
+    }
+    if k == ast.S_FOR {
+        assign_block(b, it, ef, fmap, names, tys, ast.s_d(b, st))
+        return
+    }
+    if k == ast.S_BLOCK {
+        assign_block(b, it, ef, fmap, names, tys, ast.s_a(b, st))
+        return
+    }
+    if k == ast.S_DEFER || k == ast.S_ERRDEFER {
+        assign_stmt(b, it, ef, fmap, names, tys, ast.s_a(b, st))
+        return
+    }
+}
+
+fn assign_block(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error,
+    fmap: *mut Vec[u32], names: *mut Vec[u32], tys: *mut Vec[u32], blk: u32) {
+    var i: u32 = 0
+    let n: u32 = ast.b_len(b, blk)
+    while i < n {
+        assign_stmt(b, it, ef, fmap, names, tys, ast.slist_at(b, ast.b_off(b, blk) + i))
+        i = i + 1
+    }
+}
+
+fn run_assign(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error,
+    fmap: *mut Vec[u32]) {
+    var names: Vec[u32] = vec_new[u32]()
+    var tys: Vec[u32] = vec_new[u32]()
+    let nf: usize = ast.fn_count(b)
+    var f: usize = 0
+    while f < nf {
+        vec_clear[u32](&names)
+        vec_clear[u32](&tys)
+        let poff: u32 = ast.fn_poff(b, f)
+        var k: u32 = 0
+        while k < ast.fn_plen(b, f) {
+            vec_push[u32](&names, ast.param_name(b, poff + k))
+            vec_push[u32](&tys, ast.param_ty(b, poff + k))
+            k = k + 1
+        }
+        if ast.fn_extern(b, f) == 0 {
+            assign_block(b, it, ef, fmap, &names, &tys, ast.fn_body(b, f))
+        }
+        f = f + 1
+    }
+    vec_free[u32](&names)
+    vec_free[u32](&tys)
+}
+
 // Resolves every lambda that sits in a place with a known expected type and
 // counts the ones that remain open. Cheap when the program uses no sugar.
-fn run(b: *mut ast.Tree, it: *mut intern.Interner) -> u32 {
+fn run(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error) -> u32 {
     let total: usize = ast.expr_count(b)
     var any: bool = false
     var i: usize = 0
@@ -274,7 +461,7 @@ fn run(b: *mut ast.Tree, it: *mut intern.Interner) -> u32 {
                     let lam: u32 = lambda_of(b, it, ast.child_at(b, off + k))
                     if lam != NONE && is_open(b, lam) {
                         let pt: u32 = method_param_type(b, it, name, cnt, k)
-                        errors = errors + resolve(b, &fmap, lam, pt)
+                        errors = errors + resolve(b, &fmap, lam, unwrap_eu(b, it, ef, pt))
                     }
                     k = k + 1
                 }
@@ -289,7 +476,7 @@ fn run(b: *mut ast.Tree, it: *mut intern.Interner) -> u32 {
                     while k < cnt && k < pln {
                         let lam: u32 = lambda_of(b, it, ast.child_at(b, off + k))
                         if lam != NONE && is_open(b, lam) {
-                            errors = errors + resolve(b, &fmap, lam, ast.param_ty(b, pof + k))
+                            errors = errors + resolve(b, &fmap, lam, unwrap_eu(b, it, ef, ast.param_ty(b, pof + k)))
                         }
                         k = k + 1
                     }
@@ -306,7 +493,7 @@ fn run(b: *mut ast.Tree, it: *mut intern.Interner) -> u32 {
         if (k2 == ast.S_LET || k2 == ast.S_VAR) && ast.s_b(b, s as u32) != ast.NOTHING {
             let lam: u32 = lambda_of(b, it, ast.s_c(b, s as u32))
             if lam != NONE && is_open(b, lam) {
-                errors = errors + resolve(b, &fmap, lam, ast.s_b(b, s as u32))
+                errors = errors + resolve(b, &fmap, lam, unwrap_eu(b, it, ef, ast.s_b(b, s as u32)))
             }
         }
         s = s + 1
@@ -318,11 +505,13 @@ fn run(b: *mut ast.Tree, it: *mut intern.Interner) -> u32 {
         && ast.s_a(b, s as u32) != ast.NOTHING {
             let lam: u32 = lambda_of(b, it, ast.s_a(b, s as u32))
             if lam != NONE && is_open(b, lam) {
-                errors = errors + resolve(b, &fmap, lam, ast.s_b(b, s as u32) - 1)
+                errors = errors + resolve(b, &fmap, lam, unwrap_eu(b, it, ef, ast.s_b(b, s as u32) - 1))
             }
         }
         s = s + 1
     }
+    // r740: assignments `target = lambda`
+    run_assign(b, it, ef, &fmap)
     // struct literal fields `S { f: lambda }`
     e = 0
     while e < total {
@@ -334,7 +523,7 @@ fn run(b: *mut ast.Tree, it: *mut intern.Interner) -> u32 {
                 let lam: u32 = lambda_of(b, it, ast.child_at(b, off + k * 2 + 1))
                 if lam != NONE && is_open(b, lam) {
                     let ft: u32 = field_type(b, ast.e_a(b, e as u32), ast.child_at(b, off + k * 2))
-                    errors = errors + resolve(b, &fmap, lam, ft)
+                    errors = errors + resolve(b, &fmap, lam, unwrap_eu(b, it, ef, ft))
                 }
                 k = k + 1
             }

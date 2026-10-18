@@ -136,8 +136,44 @@ struct Cx<'a> {
     sigs: &'a HashMap<String, Vec<TypeExpr>>,
     msigs: &'a HashMap<String, Vec<Vec<TypeExpr>>>,
     fields: &'a HashMap<String, HashMap<String, TypeExpr>>,
+    /// result type per function name (for `let x = f()`)
+    rets: &'a HashMap<String, TypeExpr>,
+    /// element type per instantiated `Vec__..` (r740: `v[i] = |x| ..`)
+    elems: &'a HashMap<String, TypeExpr>,
+    /// declared / evident types of the locals of the current function
+    locals: HashMap<String, TypeExpr>,
     ret: Option<TypeExpr>,
     dg: &'a mut Diags,
+}
+
+/// The declared type of an assignment target / local, as far as it is
+/// evident without a type check (r740). `None` = unknown.
+fn expr_ty(cx: &Cx, e: &Expr) -> Option<TypeExpr> {
+    fn strip(t: TypeExpr) -> TypeExpr {
+        match t {
+            TypeExpr::Ptr { inner, .. } => strip(*inner),
+            t => t,
+        }
+    }
+    match &e.kind {
+        ExprKind::Ident(n) => cx.locals.get(n).cloned(),
+        ExprKind::StructLit(n, _, _) => Some(TypeExpr::Named(n.clone(), e.span)),
+        ExprKind::Call(n, _, _) => cx.rets.get(n).cloned(),
+        ExprKind::Unary(UnOp::Deref, a) => match expr_ty(cx, a)? {
+            TypeExpr::Ptr { inner, .. } => Some(*inner),
+            _ => None,
+        },
+        ExprKind::Field(a, f, _) => match strip(expr_ty(cx, a)?) {
+            TypeExpr::Named(s, _) => cx.fields.get(&s)?.get(f).cloned(),
+            _ => None,
+        },
+        ExprKind::Index(a, _) => match strip(expr_ty(cx, a)?) {
+            TypeExpr::Array { elem, .. } => Some(*elem),
+            TypeExpr::Named(m, _) => cx.elems.get(&m).cloned(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn ty_key(t: &TypeExpr) -> String {
@@ -170,9 +206,18 @@ pub fn apply(prog: &mut Program, dg: &mut Diags) {
     for s in &prog.structs {
         fields.insert(s.name.clone(), s.fields.iter().map(|(n, t, _)| (n.clone(), t.clone())).collect());
     }
-    let mut cx = Cx { sigs: &sigs, msigs: &msigs, fields: &fields, ret: None, dg };
+    let rets: HashMap<String, TypeExpr> =
+        prog.funcs.iter().filter_map(|f| f.ret.clone().map(|r| (f.name.clone(), r))).collect();
+    let mut elems: HashMap<String, TypeExpr> = HashMap::new();
+    for (name, inst) in crate::sema_generic::instantiations() {
+        if !inst.is_fn && !inst.is_abstract && inst.base == "Vec" && inst.args.len() == 1 {
+            elems.insert(name, inst.args[0].clone());
+        }
+    }
+    let mut cx = Cx { sigs: &sigs, msigs: &msigs, fields: &fields, rets: &rets, elems: &elems, locals: HashMap::new(), ret: None, dg };
     for f in prog.funcs.iter_mut() {
         cx.ret = f.ret.clone();
+        cx.locals = f.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect();
         block(&mut cx, &mut f.body);
     }
     cx.ret = None;
@@ -192,13 +237,23 @@ fn block(cx: &mut Cx, b: &mut Block) {
 
 fn stmt(cx: &mut Cx, s: &mut Stmt) {
     match s {
-        Stmt::Let { ty, init, .. } => {
+        Stmt::Let { name, ty, init, .. } => {
             let t = ty.clone();
             want(cx, init, t.as_ref());
+            if let Some(t) = t.or_else(|| expr_ty(cx, init)) {
+                cx.locals.insert(name.clone(), t);
+            }
         }
-        Stmt::AssignOp { target, value, .. } | Stmt::Assign { target, value, .. } => {
+        Stmt::AssignOp { target, value, .. } => {
             want(cx, target, None);
             want(cx, value, None);
+        }
+        Stmt::Assign { target, value, .. } => {
+            // r740: `s.f = |x| ..` / `v[i] = gc |x| ..` / `f = |x| ..` -- the
+            // expected type is the declared type of the target
+            want(cx, target, None);
+            let t = expr_ty(cx, target);
+            want(cx, value, t.as_ref());
         }
         Stmt::Step { target, .. } => want(cx, target, None),
         Stmt::If { cond, then, els, .. } => {
