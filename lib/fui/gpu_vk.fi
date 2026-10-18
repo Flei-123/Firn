@@ -30,7 +30,8 @@ import gpu.vk_mem
 import gpu.vk_desc
 import gpu.vk_frame
 
-export { vkgl_api, vkgl_close, vkgl_is_cpu, vkgl_device, vkgl_stats, vkgl_passes, vkgl_breaks, vkgl_step, vkgl_alive }
+export { vkgl_api, vkgl_close, vkgl_is_cpu, vkgl_device, vkgl_stats, vkgl_passes, vkgl_breaks, vkgl_step, vkgl_alive,
+    vkgl_options, vkgl_present_open, vkgl_present, vkgl_present_close, vkgl_present_vsync, vkgl_present_on, vkgl_presents, vkgl_present_mode }
 
 const SPV_VS: str = __include_str("spv/gpu_vk.vert.spv")
 const SPV_FS: str = __include_str("spv/gpu_vk.frag.spv")
@@ -175,9 +176,16 @@ struct VG {
     br5: u64,
     br6: u64,
     why: u64, // reason the next non-draw cmd_open reports (set by its caller)
+    // W39 PRESENT: a swapchain on the window; the canvas target is blitted into the swapchain image on the GPU (no read-back, no CPU copy)
+    swc: vk.Sc,
+    swc_on: bool,
+    swc_dirty: bool, // the chain must be made again before the next present (vsync changed)
+    presents: u64,
 }
 
 static mut G_P: u64 = 0
+static mut G_WANT_SC: bool = false // open the Vulkan instance with the window-surface extensions (a swapchain present may follow)
+static mut G_ALLOW_CPU: bool = true // false: a software device (lavapipe / llvmpipe) is not accepted
 
 // `size_of` only knows the types of the root file; a generic parameter is substituted before it is asked (lib/async/stream.fi)
 fn gv_size_of[T]() -> usize {
@@ -212,6 +220,7 @@ fn vg_new() -> VG {
         rfb: 0, dfb: 0, vp_x: 0, vp_y: 0, vp_w: 0, vp_h: 0, sc_x: 0, sc_y: 0, sc_w: 0, sc_h: 0, sc_on: false,
         blend_on: false, cc: [0.0; 4], dummy: 0, next_vao: 0, fail_compile: false, lost: false, fail_lost: false,
         draws: 0, submits: 0, uploads: 0, readbacks: 0, passes: 0,
+        swc: vk.sc_blank(), swc_on: false, swc_dirty: false, presents: 0,
     }
 }
 
@@ -1552,7 +1561,7 @@ fn make_sampler(s: *mut VG, linear: bool) -> u64 {
 }
 
 fn open_all(s: *mut VG) -> bool {
-    if !vk.open(&(*s).v, false, true) {
+    if !vk.open(&(*s).v, G_WANT_SC, G_ALLOW_CPU) {
         (*s).step = 1
         return false
     }
@@ -1678,6 +1687,189 @@ fn vkgl_api(t: *mut gl.GlApi) -> bool {
     (*t).finish = f_finish
     (*t).ok = true
     return true
+}
+
+// W39: must be called BEFORE the first vkgl_api (the device is opened once per process). present: also enable the window surface extensions
+// (needed for vkgl_present_open); allow_cpu: false = refuse a software Vulkan device (the automatic mode must not pick lavapipe).
+fn vkgl_options(present: bool, allow_cpu: bool) {
+    if G_P == 0 {
+        G_WANT_SC = present
+        G_ALLOW_CPU = allow_cpu
+    }
+}
+
+// ---------------------------------------------------------------- present (swapchain)
+
+// Swapchain on the native window handle (Windows HWND / X11 XID) for a w x h client area. False: no surface extension, no present
+// support, no TRANSFER_DST on the swapchain images -- the caller keeps the read-back path.
+fn vkgl_present_open(native: u64, w: i32, h: i32) -> bool {
+    if G_P == 0 || native == 0 {
+        return false
+    }
+    let s: *mut VG = gs()
+    if !(*s).ok || (*s).lost || (*s).swc_on {
+        return false
+    }
+    if env.get("FUI_GPU_PRESENT") == "0" || !vk.has_swapchain(&(*s).v) {
+        return false
+    }
+    if !vk.sc_open(&(*s).v, &(*s).swc, native, w, h, 0) || !(*s).swc.xfer {
+        vk.sc_close(&(*s).v, &(*s).swc)
+        (*s).swc = vk.sc_blank()
+        return false
+    }
+    (*s).swc_on = true
+    (*s).swc_dirty = false
+    return true
+}
+
+fn vkgl_present_on() -> bool {
+    if G_P == 0 {
+        return false
+    }
+    return (*gs()).swc_on
+}
+
+fn vkgl_presents() -> u64 {
+    if G_P == 0 {
+        return 0
+    }
+    return (*gs()).presents
+}
+
+// 0 immediate, 1 mailbox, 2 fifo (what the swapchain was made with); 9 = no swapchain
+fn vkgl_present_mode() -> u64 {
+    if G_P == 0 || !(*gs()).swc_on {
+        return 9
+    }
+    return (*gs()).swc.pmode
+}
+
+// vsync on = FIFO, off = IMMEDIATE / MAILBOX when the surface has one (benchmarks). The chain is made again before the next present.
+fn vkgl_present_vsync(on: bool) {
+    if G_P == 0 || !(*gs()).swc_on {
+        return
+    }
+    vk.sc_set_vsync(&(*gs()).swc, on)
+    (*gs()).swc_dirty = true
+}
+
+fn vkgl_present_close() {
+    if G_P == 0 {
+        return
+    }
+    let s: *mut VG = gs()
+    if !(*s).swc_on {
+        return
+    }
+    cmd_flush()
+    vk.sc_close(&(*s).v, &(*s).swc)
+    (*s).swc = vk.sc_blank()
+    (*s).swc_on = false
+}
+
+// The read framebuffer (the canvas target, bound by the caller like for a read-back) goes into the next swapchain image: acquire, blit,
+// submit (waits for the acquire, signals the present), present. Returns 1 = on the screen, 0 = not shown (the swapchain is unusable:
+// the caller closes it and reads back instead, the device is fine), -1 = the device is gone.
+fn vkgl_present(w: i32, h: i32) -> i32 {
+    let s: *mut VG = gs()
+    if G_P == 0 || !(*s).swc_on {
+        return 0
+    }
+    if (*s).fail_lost && (*s).presents >= 2 && !(*s).lost {
+        // FUI_GPU_FAIL=lost: the device "disappears" at the 3rd present (a fallback test)
+        (*s).lost = true
+        (*s).ok = false
+    }
+    if !(*s).ok || (*s).lost {
+        return -1
+    }
+    if (*s).rfb == 0 || (*s).rfb >= FB_MAX as u64 || w <= 0 || h <= 0 {
+        return 0
+    }
+    let f: *mut VFb = fb_at((*s).rfb)
+    if !(*f).ok || w > (*f).w || h > (*f).h {
+        return 0
+    }
+    let sc: *mut vk.Sc = &(*s).swc
+    if (*s).swc_dirty || (*sc).w != w || (*sc).h != h {
+        cmd_flush()
+        (*s).swc_dirty = false
+        if !vk.sc_resize(&(*s).v, sc, w, h) {
+            return 0
+        }
+    }
+    var ra: u64 = vk.sc_acquire(&(*s).v, sc, (*sc).sem_acq)
+    if ra == 0xC4653214 {
+        // OUT_OF_DATE: made again once
+        cmd_flush()
+        if !vk.sc_resize(&(*s).v, sc, w, h) {
+            return 0
+        }
+        ra = vk.sc_acquire(&(*s).v, sc, (*sc).sem_acq)
+    }
+    if ra != 0 && ra != 1000001003 {
+        if ra == 0xFFFFFFFC {
+            return -1 // DEVICE_LOST
+        }
+        return 0
+    }
+    (*s).why = 4
+    let cmd: u64 = cmd_open()
+    if cmd == 0 {
+        return -1
+    }
+    let img: u64 = vk.sc_image(sc, (*sc).idx)
+    vk_frame.image_barrier(&(*s).x, cmd, img, 1, 1, vk_frame.LAYOUT_UNDEFINED, vk_frame.LAYOUT_TRANSFER_DST,
+        vk_frame.ST_TRANSFER | vk_frame.ST_COLOR_OUT, vk_frame.ST_TRANSFER, 0, vk_frame.AC_TRANSFER_WRITE)
+    (*s).x.top = 0
+    let r: u64 = vk_mem.xsa(&(*s).x, 80)
+    vk_mem.w32(r, 0, 1) // srcSubresource: COLOR aspect, mip 0, layer 0, 1 layer
+    vk_mem.w32(r, 12, 1)
+    // image row 0 is the BOTTOM of the picture (GL convention, see gpu_read): the source offsets run bottom to top (a negative extent
+    // flips the blit), so the swapchain image gets the picture top row first
+    vk_mem.w32(r, 20, (*f).h as u64) // srcOffsets[0].y = top of the picture
+    vk_mem.w32(r, 28, w as u64) // srcOffsets[1]
+    vk_mem.w32(r, 32, ((*f).h - h) as u64)
+    vk_mem.w32(r, 36, 1)
+    vk_mem.w32(r, 40, 1) // dstSubresource
+    vk_mem.w32(r, 52, 1)
+    vk_mem.w32(r, 68, (*sc).w as u64) // dstOffsets[1]
+    vk_mem.w32(r, 72, (*sc).h as u64)
+    vk_mem.w32(r, 76, 1)
+    // the canvas image stays in GENERAL (see the top of this file): it is the blit source as it is
+    vk_mem.cx(&(*s).x, vk_mem.X_CMD_BLIT, cmd, (*tex_at((*f).tex)).img.img, LAYOUT_GENERAL, img, vk_frame.LAYOUT_TRANSFER_DST, 1, r, 0, 0, 0)
+    vk_frame.image_barrier(&(*s).x, cmd, img, 1, 1, vk_frame.LAYOUT_TRANSFER_DST, vk_frame.LAYOUT_PRESENT,
+        vk_frame.ST_TRANSFER, vk_frame.ST_BOTTOM, vk_frame.AC_TRANSFER_WRITE, 0)
+    // submit + wait, like cmd_flush, but with the swapchain semaphores
+    brk_count(s, 6)
+    pass_end(s)
+    (*s).rec = 0
+    (*s).set_n = 0
+    (*s).stg_off = 0
+    var i: u64 = 0
+    while i < BUF_MAX as u64 {
+        let b: *mut VBuf = buf_at(i)
+        (*b).wr = (*b).end
+        i = i + 1
+    }
+    (*s).submits = (*s).submits + 1
+    if !vk_frame.imm_submit_sem(&(*s).x, &(*s).fr, (*sc).sem_acq, (*sc).sem_done) {
+        (*s).lost = true
+        (*s).ok = false
+        return -1
+    }
+    let rp: u64 = vk.sc_present(&(*s).v, sc, (*sc).idx, (*sc).sem_done)
+    (*s).presents = (*s).presents + 1
+    if rp == 0 || rp == 1000001003 {
+        return 1
+    }
+    if rp == 0xC4653214 {
+        // the frame was not shown (window size changed under us): the next present makes the chain again; read back this one
+        (*s).swc_dirty = true
+        return 0
+    }
+    return 0
 }
 
 // Waits for the device and frees what the table made (the process may also just exit).

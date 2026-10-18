@@ -34,7 +34,7 @@ export {
     open, close, idle, device_name, is_cpu, device_type, api_version, has_surface_ext, has_swapchain, mem_type,
     target_new, target_free, read_pixels, pipeline_tri, pipeline_new, pipeline_free, shader_make, shader_free,
     buf_new, buf_write, buf_free, draw,
-    sc_open, sc_resize, sc_frame, sc_close, window_pixels, sc_acquire, sc_present, sc_image,
+    sc_open, sc_resize, sc_set_vsync, sc_frame, sc_close, window_pixels, sc_acquire, sc_present, sc_image,
     // lifecycle layer (gpu.vk_life): raw helpers, result tracking, fault injection, release
     call, sa, good, r32, r64, w32, w64, cstr, release, inject, INJ_SUBMIT, INJ_ACQUIRE, INJ_PRESENT,
     STEP_NO_LOADER, STEP_NO_SYMBOL, STEP_NO_INSTANCE, STEP_NO_DEVICE, STEP_NO_QUEUE, STEP_NO_LOGICAL, STEP_NO_POOL,
@@ -135,6 +135,7 @@ const F_DESTROY_SC: usize = 63
 const F_GET_SC_IMAGES: usize = 64
 const F_ACQUIRE: usize = 65
 const F_PRESENT: usize = 66
+const F_SURF_MODES: usize = 67
 const F_COUNT: usize = 72
 
 const SCRATCH: usize = 16384
@@ -218,6 +219,8 @@ struct Sc {
     frames: u64,
     xfer: bool, // swapchain images also have TRANSFER_DST (blit target, r195)
     idx: u64, // image index of the last sc_acquire
+    nosync: bool, // W39: prefer IMMEDIATE / MAILBOX over FIFO (benchmarks; sc_set_vsync)
+    pmode: u64, // present mode the chain was made with (0 immediate, 1 mailbox, 2 fifo)
 }
 
 fn vk_new() -> Vk {
@@ -240,7 +243,7 @@ fn buf_blank() -> Buf {
 
 fn sc_blank() -> Sc {
     return Sc { ok: false, surface: 0, chain: 0, fmt: 0, w: 0, h: 0, n: 0, images: 0, views: 0, fbs: 0, rpass: 0, sem_acq: 0,
-        sem_done: 0, xid: 0, mode: 0, frames: 0, xfer: false, idx: 0 }
+        sem_done: 0, xid: 0, mode: 0, frames: 0, xfer: false, idx: 0, nosync: false, pmode: 2 }
 }
 
 // ---- raw access helpers --------------------------------------------------------------------------------------
@@ -387,6 +390,7 @@ fn load_instance_level(v: *mut Vk) -> bool {
     isym(v, F_SURF_CAPS, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
     isym(v, F_SURF_FMTS, "vkGetPhysicalDeviceSurfaceFormatsKHR")
     isym(v, F_DESTROY_SURFACE, "vkDestroySurfaceKHR")
+    isym(v, F_SURF_MODES, "vkGetPhysicalDeviceSurfacePresentModesKHR")
     return ok
 }
 
@@ -1391,7 +1395,30 @@ fn sc_build(v: *mut Vk, s: *mut Sc, w: i32, h: i32) -> bool {
     w32(ci, 56, usage)
     w32(ci, 80, r32(caps, 40)) // current transform
     w32(ci, 84, alpha)
-    w32(ci, 88, 2) // FIFO (always supported)
+    // present mode: FIFO (vsync, always supported) unless sc_set_vsync(false) asked for IMMEDIATE / MAILBOX and the surface offers one
+    var pm: u64 = 2
+    if (*s).nosync && fn_at(v, F_SURF_MODES) != 0 {
+        let nm: u64 = sa(v, 8)
+        w32(nm, 0, 8)
+        let ms: u64 = sa(v, 32)
+        c(v, F_SURF_MODES, (*v).phys, (*s).surface, nm, ms, 0, 0)
+        var mi: u64 = 0
+        var have_mail: bool = false
+        var have_imm: bool = false
+        while mi < r32(nm, 0) && mi < 8 {
+            let mv: u64 = r32(ms, (mi as usize) * 4)
+            if mv == 0 { have_imm = true }
+            if mv == 1 { have_mail = true }
+            mi = mi + 1
+        }
+        if have_imm {
+            pm = 0
+        } else if have_mail {
+            pm = 1
+        }
+    }
+    (*s).pmode = pm
+    w32(ci, 88, pm)
     w32(ci, 92, 1)
     let out: u64 = sa(v, 8)
     if !good(c(v, F_CREATE_SC, (*v).dev, ci, 0, out, 0, 0)) {
@@ -1478,6 +1505,11 @@ fn sc_open(v: *mut Vk, s: *mut Sc, xid: u64, w: i32, h: i32, mode: i32) -> bool 
     (*s).sem_done = r64(out, 0)
     (*s).ok = true
     return true
+}
+
+// W39: vsync off = IMMEDIATE (or MAILBOX) present mode, on = FIFO. Takes effect with the next sc_resize (the chain is made again).
+fn sc_set_vsync(s: *mut Sc, on: bool) {
+    (*s).nosync = !on
 }
 
 // The window changed its size: new swapchain (the old one is destroyed after the queue is idle). False = failed.

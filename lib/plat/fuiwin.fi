@@ -64,6 +64,8 @@ export {
     window_set_present, window_clear_present, window_present_hooked,
     // W18-F3: the GPU PROVIDER (lib/plat/fuiwinvk.fi: fUi painted on Vulkan, read back, shown by the CPU present)
     window_set_gpu_provider, window_force_provider, window_gpu_readback,
+    // W39: swapchain present of the provider (no read-back), vsync, finish
+    window_set_gpu_present, window_gpu_present, window_vsync, window_gpu_finish,
 }
 
 struct Window {
@@ -116,6 +118,14 @@ struct Window {
     gpu_rb: bool,
     // W38: the provider goes FIRST even when the window layer has a GPU of its own (Windows: WGL / OpenGL) -- FUI_GPU=1 means Vulkan
     prov_force: bool,
+    // W39 PRESENT: the provider can also show the canvas target itself (Vulkan swapchain on the window): no read-back, no CPU copy.
+    // psc_open(native handle, w, h), psc_show(w, h) = 1 shown / 0 not shown (swapchain unusable) / -1 device gone, psc_close, psc_vsync(on).
+    psc_on: bool,
+    psc_open: fn(u64, i32, i32) -> bool,
+    psc_show: fn(i32, i32) -> i32,
+    psc_close: fn(),
+    psc_vsync: fn(bool),
+    pres_sc: bool,
 }
 
 fn hook_none(ud: u64, kind: u32, a: u32, st: u32, x: f64, y: f64) -> bool {
@@ -128,6 +138,17 @@ fn pres_none(ud: u64, px: u64, w: usize, h: usize) -> bool {
 
 fn prov_open_none(api: *mut gl.GlApi) -> bool {
     return false
+}
+
+fn psc_open_none(native: u64, w: i32, h: i32) -> bool {
+    return false
+}
+
+fn psc_show_none(w: i32, h: i32) -> i32 {
+    return 0
+}
+
+fn psc_vsync_none(on: bool) {
 }
 
 fn prov_ok_none() -> bool {
@@ -148,6 +169,37 @@ fn window_set_gpu_provider(fx: *mut Window, open: fn(*mut gl.GlApi) -> bool, ali
     (*fx).prov_open = open
     (*fx).prov_ok = alive
     (*fx).prov_close = close
+}
+
+// W39: the provider's swapchain present (call BEFORE window_open, after window_set_gpu_provider). When the provider's GPU is up and
+// the window has a native handle, `open(handle, w, h)` puts a swapchain on the window and every frame goes `show(w, h)` instead of
+// read-back + CPU present. A swapchain that cannot be made, or stops working (show says 0), leaves the read-back path in charge.
+fn window_set_gpu_present(fx: *mut Window, open: fn(u64, i32, i32) -> bool, show: fn(i32, i32) -> i32, close: fn(), vsync: fn(bool)) {
+    (*fx).psc_on = true
+    (*fx).psc_open = open
+    (*fx).psc_show = show
+    (*fx).psc_close = close
+    (*fx).psc_vsync = vsync
+}
+
+// True while the canvas reaches the screen by the provider's swapchain (no read-back).
+fn window_gpu_present(fx: *mut Window) -> bool {
+    return (*fx).gpu_an && (*fx).gpu_rb && (*fx).pres_sc
+}
+
+// vsync on/off for the GPU paths that have a switch (WGL swap interval; the Vulkan swapchain: FIFO vs IMMEDIATE). Benchmarks only.
+fn window_vsync(fx: *mut Window, on: bool) {
+    let nv: bool = window.gpu_vsync(&(*fx).f, on)
+    if (*fx).pres_sc {
+        (*fx).psc_vsync(on)
+    }
+}
+
+// Waits until the GPU has finished what was submitted (glFinish on the GL table; the Vulkan present waits for its fence anyway).
+fn window_gpu_finish(fx: *mut Window) {
+    if (*fx).gpu_an && !(*fx).gpu_rb {
+        (*fx).gl.finish()
+    }
 }
 
 // W38: the provider is tried BEFORE the window layer's own GPU (Windows has WGL / OpenGL and would otherwise never ask the provider:
@@ -243,7 +295,8 @@ fn window_new() -> Window {
         gpu_will: true, gpu_an: false, gl: gl.gl_api_new(), gp: gpu.gpu_new(),
         hook_on: false, hook_ud: 0, hook: hook_none, real: false, rmouse: false, pdown: 0,
         pres_on: false, pres_ud: 0, pres: pres_none,
-        prov_on: false, prov_open: prov_open_none, prov_ok: prov_ok_none, prov_close: prov_close_none, gpu_rb: false, prov_force: false }
+        prov_on: false, prov_open: prov_open_none, prov_ok: prov_ok_none, prov_close: prov_close_none, gpu_rb: false, prov_force: false,
+        psc_on: false, psc_open: psc_open_none, psc_show: psc_show_none, psc_close: prov_close_none, psc_vsync: psc_vsync_none, pres_sc: false }
 }
 
 // ============================================================ ON THE GPU
@@ -315,8 +368,25 @@ fn gpu_start_provider(fx: *mut Window) {
     }
     (*fx).gpu_an = true
     (*fx).gpu_rb = true
+    (*fx).pres_sc = false
+    if (*fx).psc_on {
+        let nat: u64 = window.native_handle(&(*fx).f)
+        if nat != 0 {
+            (*fx).pres_sc = (*fx).psc_open(nat, (*fx).w as i32, (*fx).h as i32)
+        }
+    }
     var nm: [u8; 3] = "gpu"
-    line(fx, (&nm[0]) as u64, 3, 2, (*fx).w as i64, (*fx).h as i64, 0)
+    var mode: i64 = 2
+    if (*fx).pres_sc { mode = 3 }
+    line(fx, (&nm[0]) as u64, 3, mode, (*fx).w as i64, (*fx).h as i64, 0)
+}
+
+// The swapchain goes (its surface must be gone before the CPU present draws on the same window again).
+fn present_drop(fx: *mut Window) {
+    if (*fx).pres_sc {
+        (*fx).psc_close()
+        (*fx).pres_sc = false
+    }
 }
 
 // The provider's GPU is gone (a frame failed, the canvas could not be put on it again): back to the CPU painter for the rest of
@@ -326,6 +396,7 @@ fn gpu_drop(fx: *mut Window) {
         return
     }
     gpu.gpu_detach(&(*fx).gp, &(*fx).cv)
+    present_drop(fx)
     (*fx).gpu_an = false
     (*fx).gpu_rb = false
     (*fx).prov_on = false
@@ -440,6 +511,7 @@ fn flaechen(fx: *mut Window, w: usize, h: usize) -> bool {
     (*fx).h = h
     // the new canvas back onto the GPU (a target of the new size)
     if (*fx).gpu_an && !gpu.gpu_attach(&(*fx).gp, &(*fx).cv) {
+        present_drop(fx)
         (*fx).gpu_an = false
         (*fx).gpu_rb = false
     }
@@ -631,6 +703,7 @@ fn window_close(fx: *mut Window) {
     if (*fx).gpu_an {
         gpu.gpu_detach(&(*fx).gp, &(*fx).cv)
         if (*fx).gpu_rb {
+            present_drop(fx)
             (*fx).prov_close()
         } else {
             window.gpu_close(&(*fx).f)
@@ -896,20 +969,40 @@ fn window_step(fx: *mut Window, w: *mut fuiwirt.Host, m: *mut theme.Theme,
             gpu.gpu_frame_begin(&(*fx).gp, (*fx).w as i32, (*fx).h as i32)
             times(ud, fx)
             q1 = now_ms()
-            gpu.gpu_read(&(*fx).gp, 0, 0, (*fx).w as i32, (*fx).h as i32, canvas.canvas_pixels(&(*fx).cv) as u64, (*fx).w * 4)
-            hash_report(fx)
-            if !(*fx).prov_ok() {
-                // the device failed during this frame: the read-back is not a picture. CPU for good, this frame is painted again
-                gpu_drop(fx)
-                times(ud, fx)
-                q1 = now_ms()
+            var shown: bool = false
+            if (*fx).pres_sc {
+                // W39: the canvas target goes into the swapchain image on the GPU: no read-back, no RGBA -> BGRX, no PutImage
+                gpu.gpu_target_bind(&(*fx).gp)
+                let pr: i32 = (*fx).psc_show((*fx).w as i32, (*fx).h as i32)
+                if pr == 1 {
+                    shown = true
+                } else {
+                    // not shown: the swapchain is dropped for good, this frame takes the read-back route (a device that is gone is
+                    // found by prov_ok below)
+                    present_drop(fx)
+                }
             }
-            fuiwirt.rgba_to_bgrx(canvas.canvas_pixels(&(*fx).cv) as u64, (*fx).bgrx, (*fx).w * (*fx).h)
-            q2 = now_ms()
-            let okg: bool = window.image(f, (*fx).bgrx, (*fx).w, (*fx).h, 0, 0)
-            let okp: bool = window.present(f)
-            (*fx).last_px = ((*fx).w * (*fx).h) as i64
-            q3 = now_ms()
+            if shown {
+                hash_report(fx)
+                q2 = now_ms()
+                (*fx).last_px = ((*fx).w * (*fx).h) as i64
+                q3 = q2
+            } else {
+                gpu.gpu_read(&(*fx).gp, 0, 0, (*fx).w as i32, (*fx).h as i32, canvas.canvas_pixels(&(*fx).cv) as u64, (*fx).w * 4)
+                hash_report(fx)
+                if !(*fx).prov_ok() {
+                    // the device failed during this frame: the read-back is not a picture. CPU for good, this frame is painted again
+                    gpu_drop(fx)
+                    times(ud, fx)
+                    q1 = now_ms()
+                }
+                fuiwirt.rgba_to_bgrx(canvas.canvas_pixels(&(*fx).cv) as u64, (*fx).bgrx, (*fx).w * (*fx).h)
+                q2 = now_ms()
+                let okg: bool = window.image(f, (*fx).bgrx, (*fx).w, (*fx).h, 0, 0)
+                let okp: bool = window.present(f)
+                (*fx).last_px = ((*fx).w * (*fx).h) as i64
+                q3 = now_ms()
+            }
         } else if (*fx).gpu_an {
             // ON THE GPU: paint, one copy onto the screen, swap
             var pl: [u64; 4] = [0; 4]
