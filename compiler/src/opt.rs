@@ -993,7 +993,7 @@ fn remove_redundant_checks(f: &mut Func) -> usize {
 /// a write, because the question being answered ("is the value I loaded
 /// still the value I am about to index with") must not be answered
 /// optimistically.
-fn writes_memory(op: &Op) -> bool {
+pub(crate) fn writes_memory(op: &Op) -> bool {
     !matches!(
         op,
         Op::Const(_)

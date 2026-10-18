@@ -55,6 +55,14 @@
 //!    offset (`j + 1 < n`, the add checked or provably not wrapping) bounds
 //!    the base (`j < n - 1`).
 //!
+//!  * **run-time lengths (r755)** -- `CheckedIdxV` (`v[i]` on a `Vec`/`str`)
+//!    compares against a LOADED length. The proof is symbolic (`less`): a
+//!    branch `i < len` / `i + k < len`, a phi whose operands are all below
+//!    `len` on their own edge, a constant under a guarded `0 < len`. Two
+//!    loads of the same word are one value only if no instruction on any
+//!    path between them can write memory (`same_len`/`clean_between`: a loop
+//!    that stores anywhere keeps its checks, `v.push` or `v[i] = x` alike).
+//!
 //! ## What it deliberately does not do
 //!
 //! No fixpoint over phis (a loop counter's interval would come out of the
@@ -125,6 +133,8 @@ struct Ana<'a> {
     cmps: HashMap<Val, (CmpOp, FTy, Val, Val)>,
     /// per block: the conditions that hold on every way in, with their truth
     facts: Vec<Vec<(Val, bool)>>,
+    /// predecessors per block (for the memory-clean chain walk)
+    preds: Vec<Vec<usize>>,
 }
 
 /// The conditions that must hold in a block.
@@ -149,9 +159,8 @@ struct Ana<'a> {
 /// does not mean the branch went that way. That is sound (control must
 /// have passed through `s`), it survives joins, and it costs one dominator
 /// matrix, which `licm` computes for every function anyway.
-fn facts_per_block(f: &Func) -> Vec<Vec<(Val, bool)>> {
+fn facts_per_block(f: &Func, preds: &[Vec<usize>]) -> Vec<Vec<(Val, bool)>> {
     let n = f.blocks.len();
-    let preds = crate::mem2reg::preds(f);
     let dom = crate::mem2reg::dominators(f);
     let mut out: Vec<Vec<(Val, bool)>> = vec![Vec::new(); n];
     for p in 0..n {
@@ -190,7 +199,8 @@ impl<'a> Ana<'a> {
                 }
             }
         }
-        Ana { f, site, cmps, facts: facts_per_block(f) }
+        let preds = crate::mem2reg::preds(f);
+        Ana { f, site, cmps, facts: facts_per_block(f, &preds), preds }
     }
 
     fn op_of(&self, v: Val) -> Option<&'a Op> {
@@ -393,6 +403,194 @@ impl<'a> Ana<'a> {
         Some(k)
     }
 
+    // ---------------------------------------------------------------- r755 --
+    // The checked index with a run-time length (`CheckedIdxV`): `idx < len`
+    // where `len` is a LOADED word. There is no interval for it, the proof is
+    // symbolic: a branch `idx < len` (or `idx + k < len`), a phi whose every
+    // operand is below `len` on its own edge, a constant below a guarded
+    // `0 < len`. Two loads of the same word count as one value only if no
+    // instruction that may write memory sits between them on a chain of
+    // single predecessors (`same_len`).
+
+    /// No instruction on any path from `from` to `to` (both definition
+    /// sites) can write memory, and every path to `to` passes `from`.
+    ///
+    /// Walks the predecessors of `to` backwards and stops at the block of
+    /// `from` (only its tail is read). Blocks in between are read whole, so
+    /// a loop body counts: it is clean only if no instruction of it writes.
+    /// Reaching the entry without passing `from` means `from` does not
+    /// dominate `to`: no answer.
+    fn clean_between(&self, from: (usize, usize), to: (usize, usize)) -> bool {
+        // phis and copies are register moves, they write no memory
+        let writes = |b: usize, lo: usize, hi: usize| -> bool {
+            self.f.blocks[b].insts[lo..hi]
+                .iter()
+                .any(|i| !matches!(i.op, Op::Phi { .. } | Op::Copy { .. }) && crate::opt::writes_memory(&i.op))
+        };
+        let (fb, fi) = from;
+        let (tb, ti) = to;
+        if tb == fb {
+            return fi < ti && !writes(tb, fi + 1, ti);
+        }
+        if writes(tb, 0, ti) {
+            return false;
+        }
+        let n = self.f.blocks.len();
+        // `tb` is NOT marked: a loop back to it runs its whole body, also
+        // the part after `to`.
+        let mut seen = vec![false; n];
+        let mut work: Vec<usize> = vec![tb];
+        let mut visited = 0usize;
+        while let Some(cur) = work.pop() {
+            if self.preds[cur].is_empty() {
+                return false;
+            }
+            for &p in &self.preds[cur] {
+                if p == fb {
+                    if !seen[p] {
+                        seen[p] = true;
+                        if writes(p, fi + 1, self.f.blocks[p].insts.len()) {
+                            return false;
+                        }
+                    }
+                    continue;
+                }
+                if seen[p] {
+                    continue;
+                }
+                seen[p] = true;
+                visited += 1;
+                if visited > 64 || writes(p, 0, self.f.blocks[p].insts.len()) {
+                    return false;
+                }
+                work.push(p);
+            }
+        }
+        true
+    }
+
+    fn addr_eq(&self, p: Val, q: Val) -> bool {
+        if p == q {
+            return true;
+        }
+        let cst = |y: Val| -> Option<i128> {
+            match self.op_of(y) {
+                Some(Op::Const(c)) => Some(*c),
+                _ => None,
+            }
+        };
+        match (self.op_of(p), self.op_of(q)) {
+            (Some(Op::PtrAdd { base: b1, off: o1 }), Some(Op::PtrAdd { base: b2, off: o2 })) => {
+                b1 == b2 && (o1 == o2 || (cst(*o1).is_some() && cst(*o1) == cst(*o2)))
+            }
+            _ => false,
+        }
+    }
+
+    /// `a` and `b` are the same word of memory read twice, with nothing
+    /// that could write memory in between (or they are one value).
+    fn same_len(&self, a: Val, b: Val) -> bool {
+        if a == b {
+            return true;
+        }
+        let (pa, pb) = match (self.op_of(a), self.op_of(b)) {
+            (Some(Op::Load { addr: x }), Some(Op::Load { addr: y })) => (*x, *y),
+            _ => return false,
+        };
+        if self.f.val_ty(a) != self.f.val_ty(b) || !self.addr_eq(pa, pb) {
+            return false;
+        }
+        let (sa, sb) = match (self.site.get(&a), self.site.get(&b)) {
+            (Some(x), Some(y)) => (*x, *y),
+            _ => return false,
+        };
+        self.clean_between(sa, sb) || self.clean_between(sb, sa)
+    }
+
+    /// `x <= y` for two unsigned values, structurally.
+    fn le_val(&self, x: Val, y: Val, at: usize) -> bool {
+        if x == y {
+            return true;
+        }
+        let cst = |v: Val| -> Option<i128> {
+            match self.op_of(v) {
+                Some(Op::Const(c)) => Some(*c),
+                _ => None,
+            }
+        };
+        if let (Some(a), Some(b)) = (cst(x), cst(y)) {
+            return a <= b;
+        }
+        matches!(self.offset_of(y, x, at, DEPTH), Some(k) if k >= 0)
+    }
+
+    /// `x < l` (unsigned, both `u64`) holds at the END of block `at`
+    /// (plus the branch `ex` of the edge it is read on).
+    fn less(&self, x: Val, l: Val, at: usize, ex: Option<(Val, bool)>, depth: u32) -> bool {
+        let mut facts: Vec<(Val, bool)> = self.facts.get(at).cloned().unwrap_or_default();
+        if let Some(e) = ex {
+            if !facts.iter().any(|(c, _)| *c == e.0) {
+                facts.push(e);
+            }
+        }
+        for (cond, truth) in &facts {
+            let (op, cty, a, b) = match self.cmps.get(cond) {
+                Some(c) => *c,
+                None => continue,
+            };
+            if cty != FTy::U64 {
+                continue;
+            }
+            let op = if *truth { op } else { invert(op) };
+            let (lo, hi, strict) = match op {
+                CmpOp::Lt => (a, b, true),
+                CmpOp::Gt => (b, a, true),
+                _ => continue,
+            };
+            if strict && self.le_val(x, lo, at) && self.same_len(hi, l) {
+                return true;
+            }
+        }
+        if depth == 0 {
+            return false;
+        }
+        // a checked index of the same length is below it by its contract
+        if let Some(Op::CheckedIdxV { len, .. }) = self.op_of(x) {
+            if self.same_len(*len, l) {
+                return true;
+            }
+        }
+        if let Some(Op::Phi { incoming }) = self.op_of(x) {
+            let (home, _) = match self.site.get(&x) {
+                Some(s) => *s,
+                None => return false,
+            };
+            let n = self.f.blocks.len();
+            if incoming.is_empty() || incoming.len() > 4 {
+                return false;
+            }
+            for &(pb, val) in incoming.iter() {
+                let pb = pb as usize;
+                if pb >= n {
+                    return false;
+                }
+                let ex = match self.f.blocks[pb].term {
+                    Term::BrCond { cond, then_bb, else_bb }
+                        if then_bb != else_bb && (then_bb as usize == home) != (else_bb as usize == home) =>
+                    {
+                        Some((cond, then_bb as usize == home))
+                    }
+                    _ => None,
+                };
+                if !self.less(val, l, pb, ex, depth - 1) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
     /// What the branches on the way into `at` say about the value.
     fn from_facts(
         &self,
@@ -563,6 +761,17 @@ pub(crate) fn remove_provable_arith_checks(f: &mut Func) -> usize {
                         }
                         if let (Some(d), Some(r)) = (inst.dst, ana.range(*idx, bi, DEPTH)) {
                             if r.0 >= 0 && r.1 < *len as i128 {
+                                idx_hits.push((bi, ii, d, *idx));
+                            }
+                        }
+                        continue;
+                    }
+                    Op::CheckedIdxV { idx, len, .. } => {
+                        if f.is_secret(*idx) {
+                            continue;
+                        }
+                        if let Some(d) = inst.dst {
+                            if f.val_ty(*idx) == FTy::U64 && ana.less(*idx, *len, bi, None, DEPTH) {
                                 idx_hits.push((bi, ii, d, *idx));
                             }
                         }
@@ -1006,5 +1215,50 @@ mod tests {
         let mut f = offset_func(14);
         remove_provable_arith_checks(&mut f);
         assert!(f.blocks[1].insts.iter().any(|i| matches!(i.op, Op::CheckedIdx { .. })));
+    }
+    /// `if i < len { v[i] }` with the length read twice (r755). `store`
+    /// puts a store between the two reads.
+    fn vec_func(store: bool) -> Func {
+        let mut f = Func::new("t", vec![FTy::Ptr, FTy::U64], FTy::U64);
+        let off = f.new_val_pub(FTy::I64);
+        let a = f.new_val_pub(FTy::Ptr);
+        let l1 = f.new_val_pub(FTy::U64);
+        let c = f.new_val_pub(FTy::Bool);
+        let l2 = f.new_val_pub(FTy::U64);
+        let ix = f.new_val_pub(FTy::U64);
+        let mut tail = vec![];
+        if store {
+            tail.push(Inst::new(None, FTy::U64, Op::Store { addr: a, val: 1 }));
+        }
+        tail.push(Inst::new(Some(l2), FTy::U64, Op::Load { addr: a }));
+        tail.push(Inst::new(Some(ix), FTy::U64, Op::CheckedIdxV { idx: 1, len: l2, msg: "x".into() }));
+        f.blocks = vec![
+            Block {
+                id: 0,
+                insts: vec![
+                    Inst::new(Some(off), FTy::I64, Op::Const(8)),
+                    Inst::new(Some(a), FTy::Ptr, Op::PtrAdd { base: 0, off }),
+                    Inst::new(Some(l1), FTy::U64, Op::Load { addr: a }),
+                    Inst::new(Some(c), FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: FTy::U64, a: 1, b: l1 }),
+                ],
+                term: Term::BrCond { cond: c, then_bb: 1, else_bb: 2 },
+            },
+            Block { id: 1, insts: tail, term: Term::Ret(Some(ix)) },
+            Block { id: 2, insts: vec![], term: Term::Ret(Some(1)) },
+        ];
+        f
+    }
+
+    #[test]
+    fn an_index_below_a_guarded_length_needs_no_check() {
+        let mut f = vec_func(false);
+        assert_eq!(remove_provable_arith_checks(&mut f), 1);
+        assert!(!f.blocks[1].insts.iter().any(|i| matches!(i.op, Op::CheckedIdxV { .. })));
+    }
+
+    #[test]
+    fn a_store_between_the_two_length_reads_keeps_the_check() {
+        let mut f = vec_func(true);
+        assert_eq!(remove_provable_arith_checks(&mut f), 0);
     }
 }

@@ -82,7 +82,8 @@ echo "== 1. an index outside the array aborts, and both compilers say the same =
 for src in tools/checkidx/idx_read.fi tools/checkidx/idx_write.fi \
            tools/checkidx/idx_u8.fi tools/checkidx/idx_nested.fi \
            tools/checkidx/idx_mask_oob.fi tools/checkidx/idx_dom_oob.fi \
-           tools/checkidx/phi_oob.fi; do
+           tools/checkidx/phi_oob.fi tools/checkidx/vidx_off_oob.fi \
+           tools/checkidx/vidx_pop_oob.fi; do
     name=$(basename "$src" .fi)
     for lvl in $LEVELS_CHECKED; do
         msg0=""; msg1=""; rc0=0; rc1=0
@@ -248,6 +249,26 @@ dopt=$("$FIRNC" --emit=fir tools/checkidx/dom_ok.fi 2>/dev/null | grep -c "check
 if [ "$dopt" = 1 ]; then ok; else
     bad "dom_ok: $dopt checks left, expected exactly 1 (the dominating one)"
 fi
+# CheckedIdxV (r755): a Vec indexed under its own length guard leaves no
+# check in release-safe; an offset past the guard and a length written in
+# the loop leave one.
+vopt=$("$FIRNC" --emit=fir-opt --opt-level=release-safe tools/checkidx/vidx_ok.fi 2>/dev/null | grep -c "checked_idxv")
+if [ "$vopt" = 0 ]; then ok; else
+    bad "vidx_ok: $vopt checked_idxv left, expected 0"
+fi
+for src in tools/checkidx/vidx_off_oob.fi tools/checkidx/vidx_pop_oob.fi; do
+    kopt=$("$FIRNC" --emit=fir-opt --opt-level=release-safe "$src" 2>/dev/null | grep -c "checked_idxv")
+    if [ "$kopt" -ge 1 ]; then ok; else
+        bad "$(basename "$src"): the check that must stay was removed"
+    fi
+done
+# vidx_ok also has to RUN right in every checked level
+for lvl in $LEVELS_CHECKED; do
+    if build "$FIRNC" "$lvl" tools/checkidx/vidx_ok.fi "$TMPD/vok" && "$TMPD/vok" > /dev/null 2>&1; then ok; else
+        bad "vidx_ok [$lvl]: did not build or exit code not 0"
+    fi
+done
+
 # Phis: a clamp and a guard on an offset leave no check; a clamp one too
 # high leaves one.
 popt=$("$FIRNC" --emit=fir tools/checkidx/phi_ok.fi 2>/dev/null | grep -c "checked_idx")
