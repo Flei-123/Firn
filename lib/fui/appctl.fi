@@ -86,6 +86,9 @@ import fui.wave6
 import fui.wave7
 import fui.wave9
 import fui.wave10
+import fui.wave11
+import fui.vlist
+import fui.viewport
 import fui.dnd
 import fui.timeline
 import fui.grid
@@ -134,6 +137,9 @@ export {
     grid, grid_cell, grid_gap, grid_pad, grid_rtl, grid_name,
     toolbar, toolbar_item, toolbar_end, toolbar_width, toolbar_folded, toolbar_is_folded, toolbar_open, toolbar_set_open, toolbar_more,
     accordion, accordion_section, accordion_is_open, accordion_set, accordion_open_count, accordion_sections,
+    table, table_col, table_add_row, table_set, table_cell, table_rows, table_cursor_row, table_cursor_col, table_set_cursor,
+    table_event, table_event_row, table_event_col, table_sort, table_sort_col, table_sort_desc, table_editing, table_edit_text,
+    table_cell_rect, table_begin, table_commit, table_cancel, KEY_F2, TE_NONE, TE_MOVED, TE_BEGIN, TE_COMMIT, TE_CANCEL, TE_SORT,
     ripple_on, split_begin, split_mid, split_end, split_ratio, split_set_ratio, split_limits, split_hovered, split_dragging,
     ANS_OK, ANS_CANCEL,
     CTL_MAX, OPT_MAX, NONE,
@@ -2086,6 +2092,9 @@ fn ctl_key(ud: u64, key: u32, mods: u32) -> bool {
     if acc_key_route(c, key, mods) {
         return true
     }
+    if tbl_key_route(c, key, mods) {
+        return true
+    }
     if (*c).pg_edit_i != NONE {
         if key == editor.KEY_ENTER {
             w6_commit(c)
@@ -2234,6 +2243,9 @@ fn ctl_chr(ud: u64, cp: u32, mods: u32) -> bool {
     if dd_chr_route(c, cp, mods) {
         return true
     }
+    if tbl_chr_route(c, cp, mods) {
+        return true
+    }
     if (*c).pg_edit_i != NONE {
         let er: u32 = editor.editor_char(&(*c).pg_ed, cp, mods)
         touch(c)
@@ -2307,6 +2319,9 @@ fn ctl_ptr(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     if w6_ptr(c, kind, x, y) {
         w5r = true
     }
+    if tbl_ptr_route(c, kind, x, y) {
+        w5r = true
+    }
     if kind == fuiwirt.HOOK_MOVE {
         let tm: bool = tip_move(c, x, y)
         return tm || w5r
@@ -2364,6 +2379,7 @@ fn ctl_paint(ud: u64, rc: *mut render.Ctx, w: usize, h: usize) {
     cmb_paint(c, rc)
     sz_paint(c, rc, w, h)
     tb_paint(c)
+    tbl_paint(c, rc)
     if (*c).drop_open {
         draw_drop(c, rc)
     }
@@ -6669,6 +6685,655 @@ fn tb_paint(c: *mut Ctl) {
     while i < (*c).n {
         if (*c).kind[i] == K_TOOLBAR {
             tb_fit(c, i)
+        }
+        i = i + 1
+    }
+}
+
+// ============================================================ TABLE (wave 11, r338)
+//
+//     let t: usize = appctl.table(a, "People", 520, 240, 3, changed)         // 3 columns
+//     appctl.table_col(a, t, 0, "Name", 200, false)                           // title, width in px, read only?
+//     appctl.table_col(a, t, 1, "Age", 80, false)
+//     appctl.table_col(a, t, 2, "ID", 120, true)                              // a read-only column is never edited
+//     let r: usize = appctl.table_add_row(a, t)
+//     appctl.table_set(a, t, r, 0, "Anna")
+//
+// A table is a virtual list (app.vlist_new) with columns: header, divider drag, row selection and keys are the list's.
+// The table adds the DATA (wave11.Cells: text per cell, copied), a click on the header SORTS the rows (numbers as
+// numbers, stable, same arrow in the header), and a CELL CURSOR (column; the row is the list's selection) with the
+// IN-PLACE EDITOR of wave8m.CellEdit: Left / Right move the cursor, F2 / Enter / double click / typing begin editing,
+// Enter commits and goes one row down, Tab / Shift+Tab commit and go to the next / previous editable cell, Esc cancels,
+// a click on another cell commits. `cb(a, id)` runs after a commit, a cancel and a sort; `table_event` says which
+// (TE_*) and `table_event_row/_col` where. The screen reader gets role table, rows with the cells joined and the
+// description "Cell Name, column 1 of 3, row 2 of 40".
+// HONEST: a click inside the open editor does not place the caret; the rows of the a11y tree are the list's (the cells of
+// a row are one name, not child nodes); at most 64 columns; the data lives in the table (table_cell reads it).
+
+const K_TABLE: u32 = 33
+const KEY_F2: u32 = 101
+const TE_NONE: u32 = 0
+const TE_MOVED: u32 = 1
+const TE_BEGIN: u32 = 2
+const TE_COMMIT: u32 = 3
+const TE_CANCEL: u32 = 4
+const TE_SORT: u32 = 5
+
+struct Tbl {
+    cells: wave11.Cells,
+    ce: wave8m.CellEdit,
+    ed: editor.Editor,
+    buf: u64,
+    node: usize,
+    ev: u32,
+    ev_row: usize,
+    ev_col: usize,
+    dn: usize,
+    desc: [u8; 160],
+}
+
+fn tbl_blank(cols: usize) -> Tbl {
+    return Tbl { cells: wave11.cells_new(cols), ce: wave8m.cell_new(0, cols), ed: editor.editor_new(), buf: 0, node: NONE,
+        ev: 0 as u32, ev_row: 0, ev_col: 0, dn: 0, desc: [0 as u8; 160] }
+}
+
+fn tbl_of(c: *mut Ctl, i: usize) -> *mut Tbl {
+    return (*c).aux[i] as *mut Tbl
+}
+
+fn tbl_idx(a: *mut app.App, id: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 {
+        return NONE
+    }
+    let i: usize = find(c, id)
+    if i == NONE || (*c).kind[i] != K_TABLE {
+        return NONE
+    }
+    return i
+}
+
+fn tbl_model(c: *mut Ctl, i: usize) -> *mut vlist.Vlist {
+    return app.vlist_model((*c).a, (*c).node[i])
+}
+
+// the text of a cell for the list painter
+fn tbl_src(ud: u64, row: usize, out: *mut vlist.VRow) {
+    let t: *mut Tbl = ud as *mut Tbl
+    let n: usize = wave11.cells_len(&(*t).cells, row, (*out).col)
+    if n > 0 {
+        vlist.vrow_text(out, str { p: wave11.cells_ptr(&(*t).cells, row, (*out).col) as *mut u8, n: n })
+    }
+}
+
+fn table(a: *mut app.App, name: str, w: usize, h: usize, cols: usize, on_change: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return NONE
+    }
+    var probe: [Tbl; 2] = [tbl_blank(cols); 2]
+    let sz: usize = ((&probe[1]) as usize) - ((&probe[0]) as usize)
+    let p: u64 = rt.heap_alloc(sz)
+    if p == 0 {
+        return NONE
+    }
+    let t: *mut Tbl = p as *mut Tbl
+    *t = tbl_blank(cols)
+    (*t).buf = rt.heap_alloc(INPUT_CAP)
+    let ok: bool = editor.editor_init(&(*t).ed, (*t).buf, INPUT_CAP)
+    let node: usize = app.vlist_new(a, name, w, h, 0, tbl_src, p)
+    if node == NONE {
+        return NONE
+    }
+    (*t).node = node
+    let v: *mut vlist.Vlist = app.vlist_model(a, node)
+    vlist.vl_set_columns(v, (*t).cells.cols)
+    let i: usize = add_entry(c, K_TABLE, node)
+    (*c).aux[i] = p as usize
+    set_cb(c, i, on_change)
+    app.vlist_on_sort(a, node, tbl_on_sort)
+    app.vlist_on_activate(a, node, tbl_on_act)
+    a11y.a11y_set_role(app.ax(a), node, a11y.ROLE_TABLE)
+    return node
+}
+
+fn table_col(a: *mut app.App, id: usize, col: usize, title: str, width: usize, readonly: bool) {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return
+    }
+    let c: *mut Ctl = st(a)
+    let t: *mut Tbl = tbl_of(c, i)
+    if col >= (*t).cells.cols {
+        return
+    }
+    let v: *mut vlist.Vlist = tbl_model(c, i)
+    vlist.vl_set_col_title(v, col, title)
+    vlist.vl_set_col_width(v, col, width as f64)
+    wave8m.cell_set_readonly(&(*t).ce, col, readonly)
+}
+
+fn table_add_row(a: *mut app.App, id: usize) -> usize {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return NONE
+    }
+    let t: *mut Tbl = tbl_of(st(a), i)
+    let r: usize = wave11.cells_add_row(&(*t).cells)
+    if r == NONE {
+        return NONE
+    }
+    (*t).ce.rows = (*t).cells.rows
+    app.vlist_set_count(a, id, (*t).cells.rows)
+    return r
+}
+
+fn table_set(a: *mut app.App, id: usize, row: usize, col: usize, text: str) {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return
+    }
+    let t: *mut Tbl = tbl_of(st(a), i)
+    wave11.cells_set(&(*t).cells, row, col, text.p as u64, text.n)
+    app.vlist_changed(a, id)
+}
+
+// the text of a cell (valid until the cell changes)
+fn table_cell(a: *mut app.App, id: usize, row: usize, col: usize) -> str {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return ""
+    }
+    let t: *mut Tbl = tbl_of(st(a), i)
+    return str { p: wave11.cells_ptr(&(*t).cells, row, col) as *mut u8, n: wave11.cells_len(&(*t).cells, row, col) }
+}
+
+fn table_rows(a: *mut app.App, id: usize) -> usize {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return 0
+    }
+    return (*tbl_of(st(a), i)).cells.rows
+}
+
+fn table_cursor_row(a: *mut app.App, id: usize) -> usize {
+    return app.vlist_selected(a, id)
+}
+
+fn table_cursor_col(a: *mut app.App, id: usize) -> usize {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return NONE
+    }
+    return (*tbl_of(st(a), i)).ce.col
+}
+
+fn table_set_cursor(a: *mut app.App, id: usize, row: usize, col: usize) {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return
+    }
+    let t: *mut Tbl = tbl_of(st(a), i)
+    if col < (*t).cells.cols {
+        (*t).ce.col = col
+    }
+    app.vlist_select(a, id, row)
+}
+
+fn table_event(a: *mut app.App, id: usize) -> u32 {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return 0 as u32
+    }
+    return (*tbl_of(st(a), i)).ev
+}
+
+fn table_event_row(a: *mut app.App, id: usize) -> usize {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return NONE
+    }
+    return (*tbl_of(st(a), i)).ev_row
+}
+
+fn table_event_col(a: *mut app.App, id: usize) -> usize {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return NONE
+    }
+    return (*tbl_of(st(a), i)).ev_col
+}
+
+fn table_sort_col(a: *mut app.App, id: usize) -> usize {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return NONE
+    }
+    return vlist.vl_sort_col(tbl_model(st(a), i))
+}
+
+fn table_sort_desc(a: *mut app.App, id: usize) -> bool {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return false
+    }
+    return vlist.vl_sort_desc(tbl_model(st(a), i))
+}
+
+fn table_editing(a: *mut app.App, id: usize) -> bool {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return false
+    }
+    return (*tbl_of(st(a), i)).ce.editing
+}
+
+// the text in the cell editor (valid until the next change of it)
+fn table_edit_text(a: *mut app.App, id: usize) -> str {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return ""
+    }
+    let t: *mut Tbl = tbl_of(st(a), i)
+    let b: *mut textbuf.TextBuf = editor.editor_buf(&(*t).ed)
+    return str { p: textbuf.tb_ptr(b) as *mut u8, n: textbuf.tb_len(b) }
+}
+
+// the rectangle of a cell in window pixels (x, y, w, h) while it shows; false = scrolled away
+fn table_cell_rect(a: *mut app.App, id: usize, row: usize, col: usize, out: *mut [f64; 4]) -> bool {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return false
+    }
+    return tbl_cell_rect(st(a), i, row, col, out)
+}
+
+fn table_sort(a: *mut app.App, id: usize, col: usize, desc: bool) {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return
+    }
+    let c: *mut Ctl = st(a)
+    vlist.vl_set_sort(tbl_model(c, i), col, desc)
+    tbl_do_sort(c, i, col, desc)
+}
+
+fn table_begin(a: *mut app.App, id: usize) -> bool {
+    let i: usize = tbl_idx(a, id)
+    if i == NONE {
+        return false
+    }
+    return tbl_begin(st(a), i, wave8m.CE_KEEP)
+}
+
+fn table_commit(a: *mut app.App, id: usize) {
+    let i: usize = tbl_idx(a, id)
+    if i != NONE {
+        tbl_commit(st(a), i)
+    }
+}
+
+fn table_cancel(a: *mut app.App, id: usize) {
+    let i: usize = tbl_idx(a, id)
+    if i != NONE {
+        tbl_cancel(st(a), i)
+    }
+}
+
+fn tbl_event(c: *mut Ctl, i: usize, ev: u32, row: usize, col: usize) {
+    let t: *mut Tbl = tbl_of(c, i)
+    (*t).ev = ev
+    (*t).ev_row = row
+    (*t).ev_col = col
+    touch(c)
+    if ev == TE_COMMIT || ev == TE_CANCEL || ev == TE_SORT {
+        fire(c, i)
+    }
+}
+
+// the model knows the row count and the list's cursor row
+fn tbl_prep(c: *mut Ctl, i: usize) {
+    let t: *mut Tbl = tbl_of(c, i)
+    (*t).ce.rows = (*t).cells.rows
+    if !(*t).ce.editing {
+        let r: usize = vlist.vl_cur(tbl_model(c, i))
+        if r != NONE && r < (*t).cells.rows {
+            (*t).ce.row = r
+        }
+    }
+}
+
+fn tbl_editing_entry(c: *mut Ctl) -> usize {
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_TABLE && (*tbl_of(c, i)).ce.editing {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn tbl_focused_entry(c: *mut Ctl) -> usize {
+    let f: usize = app.focus((*c).a)
+    if f == NONE {
+        return NONE
+    }
+    let i: usize = find(c, f)
+    if i == NONE || (*c).kind[i] != K_TABLE {
+        return NONE
+    }
+    return i
+}
+
+// the editor text into the cell
+fn tbl_store(c: *mut Ctl, i: usize, row: usize, col: usize) {
+    let t: *mut Tbl = tbl_of(c, i)
+    let b: *mut textbuf.TextBuf = editor.editor_buf(&(*t).ed)
+    wave11.cells_set(&(*t).cells, row, col, textbuf.tb_ptr(b), textbuf.tb_len(b))
+    app.vlist_changed((*c).a, (*c).node[i])
+}
+
+fn tbl_begin(c: *mut Ctl, i: usize, mode: u32) -> bool {
+    let t: *mut Tbl = tbl_of(c, i)
+    tbl_prep(c, i)
+    let v: *mut vlist.Vlist = tbl_model(c, i)
+    if vlist.vl_cur(v) == NONE || (*t).ce.rows == 0 {
+        return false
+    }
+    let ev: u32 = wave8m.cell_begin(&(*t).ce, mode)
+    if ev != wave8m.CE_BEGIN {
+        return false
+    }
+    let row: usize = (*t).ce.row
+    let col: usize = (*t).ce.col
+    let n: usize = wave11.cells_len(&(*t).cells, row, col)
+    if mode == wave8m.CE_REPLACE || n == 0 {
+        editor.editor_set_text(&(*t).ed, (*t).buf, 0)
+    } else {
+        editor.editor_set_text(&(*t).ed, wave11.cells_ptr(&(*t).cells, row, col), n)
+    }
+    let r: bool = vlist.vl_reveal(v, row)
+    tbl_event(c, i, TE_BEGIN, row, col)
+    return true
+}
+
+// accepts the open edit and keeps the cursor where it is
+fn tbl_commit(c: *mut Ctl, i: usize) {
+    let t: *mut Tbl = tbl_of(c, i)
+    if !(*t).ce.editing {
+        return
+    }
+    (*t).ce.editing = false
+    tbl_store(c, i, (*t).ce.row, (*t).ce.col)
+    tbl_event(c, i, TE_COMMIT, (*t).ce.row, (*t).ce.col)
+}
+
+fn tbl_cancel(c: *mut Ctl, i: usize) {
+    let t: *mut Tbl = tbl_of(c, i)
+    if !(*t).ce.editing {
+        return
+    }
+    (*t).ce.editing = false
+    tbl_event(c, i, TE_CANCEL, (*t).ce.row, (*t).ce.col)
+}
+
+// the sorted rows; the list's cursor follows its row
+fn tbl_do_sort(c: *mut Ctl, i: usize, col: usize, desc: bool) {
+    let t: *mut Tbl = tbl_of(c, i)
+    tbl_commit(c, i)
+    let v: *mut vlist.Vlist = tbl_model(c, i)
+    let cur: usize = vlist.vl_cur(v)
+    wave11.cells_sort(&(*t).cells, col, desc)
+    if cur != NONE && cur < (*t).cells.rows {
+        let nr: usize = wave11.cells_moved(&(*t).cells, cur)
+        (*t).ce.row = nr
+        app.vlist_select((*c).a, (*c).node[i], nr)
+    }
+    app.vlist_changed((*c).a, (*c).node[i])
+    tbl_event(c, i, TE_SORT, cur, col)
+}
+
+fn tbl_on_sort(a: *mut app.App, node: usize, col: usize) {
+    let i: usize = tbl_idx(a, node)
+    if i == NONE {
+        return
+    }
+    let c: *mut Ctl = st(a)
+    tbl_do_sort(c, i, col, vlist.vl_sort_desc(tbl_model(c, i)))
+}
+
+// Enter or a double click on a row
+fn tbl_on_act(a: *mut app.App, node: usize, row: usize) {
+    let i: usize = tbl_idx(a, node)
+    if i == NONE {
+        return
+    }
+    let b: bool = tbl_begin(st(a), i, wave8m.CE_KEEP)
+}
+
+fn tbl_cell_rect(c: *mut Ctl, i: usize, row: usize, col: usize, out: *mut [f64; 4]) -> bool {
+    let v: *mut vlist.Vlist = tbl_model(c, i)
+    if row < vlist.vl_first(v) || row >= vlist.vl_end(v) {
+        return false
+    }
+    var x: f64 = (*v).x
+    var w: f64 = (*v).w
+    if vlist.vl_columns(v) > 0 {
+        if col >= vlist.vl_columns(v) {
+            return false
+        }
+        x = x + vlist.vl_col_x(v, col)
+        w = vlist.vl_col_width(v, col)
+    }
+    let by: f64 = vlist.vl_body_y(v)
+    let y: f64 = by + vlist.vl_row_top(v, row) - viewport.viewport_off_y(vlist.vl_viewport(v))
+    let h: f64 = vlist.vl_height_of(v, row)
+    if y < by || y + h > by + vlist.vl_body_h(v) + 1.0 {
+        return false
+    }
+    (*out)[0] = x
+    (*out)[1] = y
+    (*out)[2] = w
+    (*out)[3] = h
+    return true
+}
+
+fn tdesc_put(t: *mut Tbl, p: u64, n: usize) {
+    var k: usize = 0
+    while k < n && (*t).dn < 160 {
+        (*t).desc[(*t).dn] = *((p + k as u64) as *mut u8)
+        (*t).dn = (*t).dn + 1
+        k = k + 1
+    }
+}
+
+fn tdesc_str(t: *mut Tbl, s: str) {
+    tdesc_put(t, s.p as u64, s.n)
+}
+
+fn tdesc_dec(t: *mut Tbl, v: usize) {
+    var b: [u8; 24] = [0 as u8; 24]
+    let n: usize = w6_fmt_i64(v as i64, &b)
+    tdesc_put(t, (&b[0]) as u64, n)
+}
+
+// "Cell Name, column 1 of 3, row 2 of 40, editing"
+fn tbl_describe(c: *mut Ctl, i: usize) {
+    let t: *mut Tbl = tbl_of(c, i)
+    let v: *mut vlist.Vlist = tbl_model(c, i)
+    (*t).dn = 0
+    let row: usize = vlist.vl_cur(v)
+    if row != NONE && row < (*t).cells.rows {
+        let col: usize = (*t).ce.col
+        tdesc_str(t, "Cell ")
+        tdesc_str(t, vlist.vl_col_title(v, col))
+        tdesc_str(t, ", column ")
+        tdesc_dec(t, col + 1)
+        tdesc_str(t, " of ")
+        tdesc_dec(t, (*t).cells.cols)
+        tdesc_str(t, ", row ")
+        tdesc_dec(t, row + 1)
+        tdesc_str(t, " of ")
+        tdesc_dec(t, (*t).cells.rows)
+        if (*t).ce.editing {
+            tdesc_str(t, ", editing")
+        } else if !wave8m.cell_editable(&(*t).ce, col) {
+            tdesc_str(t, ", read only")
+        }
+    }
+    a11y.a11y_set_description(app.ax((*c).a), (*c).node[i], (&(*t).desc[0]) as u64, (*t).dn)
+}
+
+fn tbl_key_route(c: *mut Ctl, key: u32, mods: u32) -> bool {
+    let shift: bool = (mods & editor.MOD_SHIFT) != 0 as u32
+    let e: usize = tbl_editing_entry(c)
+    if e != NONE {
+        let t: *mut Tbl = tbl_of(c, e)
+        tbl_prep(c, e)
+        let ev: u32 = wave8m.cell_key(&(*t).ce, key, shift)
+        if ev == wave8m.CE_COMMIT {
+            tbl_store(c, e, (*t).ce.last_row, (*t).ce.last_col)
+            app.vlist_select((*c).a, (*c).node[e], (*t).ce.row)
+            tbl_event(c, e, TE_COMMIT, (*t).ce.last_row, (*t).ce.last_col)
+            return true
+        }
+        if ev == wave8m.CE_CANCEL {
+            tbl_event(c, e, TE_CANCEL, (*t).ce.row, (*t).ce.col)
+            return true
+        }
+        let er: u32 = editor.editor_key(&(*t).ed, key, mods)
+        touch(c)
+        return true
+    }
+    if (mods & editor.MOD_CTRL) != 0 as u32 || (mods & editor.MOD_ALT) != 0 as u32 {
+        return false
+    }
+    let i: usize = tbl_focused_entry(c)
+    if i == NONE {
+        return false
+    }
+    let t2: *mut Tbl = tbl_of(c, i)
+    if key == KEY_F2 {
+        return tbl_begin(c, i, wave8m.CE_KEEP)
+    }
+    if key == editor.KEY_LEFT || key == editor.KEY_RIGHT {
+        tbl_prep(c, i)
+        let m: u32 = wave8m.cell_key(&(*t2).ce, key, false)
+        if m == wave8m.CE_MOVED {
+            tbl_event(c, i, TE_MOVED, (*t2).ce.row, (*t2).ce.col)
+        }
+        return true
+    }
+    return false
+}
+
+fn tbl_chr_route(c: *mut Ctl, cp: u32, mods: u32) -> bool {
+    let e: usize = tbl_editing_entry(c)
+    if e != NONE {
+        let er: u32 = editor.editor_char(&(*tbl_of(c, e)).ed, cp, mods)
+        touch(c)
+        return true
+    }
+    if (mods & editor.MOD_CTRL) != 0 as u32 || (mods & editor.MOD_ALT) != 0 as u32 {
+        return false
+    }
+    if cp < 32 as u32 || cp == 127 as u32 {
+        return false
+    }
+    let i: usize = tbl_focused_entry(c)
+    if i == NONE {
+        return false
+    }
+    let t: *mut Tbl = tbl_of(c, i)
+    tbl_prep(c, i)
+    if !wave8m.cell_editable(&(*t).ce, (*t).ce.col) {
+        return false
+    }
+    if !tbl_begin(c, i, wave8m.CE_REPLACE) {
+        return false
+    }
+    let er2: u32 = editor.editor_char(&(*t).ed, cp, mods)
+    return true
+}
+
+// a press: the cell under it becomes the cursor cell; an open edit is committed by a press anywhere else
+fn tbl_ptr_route(c: *mut Ctl, kind: u32, x: f64, y: f64) -> bool {
+    if kind != fuiwirt.HOOK_DOWN {
+        return false
+    }
+    var changed: bool = false
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] != K_TABLE {
+            i = i + 1
+            continue
+        }
+        let t: *mut Tbl = tbl_of(c, i)
+        let v: *mut vlist.Vlist = tbl_model(c, i)
+        let z: u32 = vlist.vl_zone(v, x, y)
+        if z == vlist.ZONE_NONE {
+            if (*t).ce.editing {
+                tbl_commit(c, i)
+                changed = true
+            }
+            i = i + 1
+            continue
+        }
+        tbl_prep(c, i)
+        if z != vlist.ZONE_BODY {
+            if (*t).ce.editing {
+                tbl_commit(c, i)
+                changed = true
+            }
+            i = i + 1
+            continue
+        }
+        let row: usize = vlist.vl_hit(v, x, y)
+        var col: usize = vlist.vl_col_at(v, x)
+        if col == NONE {
+            col = (*t).ce.col
+        }
+        if (*t).ce.editing {
+            if row == NONE || row >= (*t).cells.rows {
+                tbl_commit(c, i)
+                changed = true
+            } else if row != (*t).ce.row || col != (*t).ce.col {
+                let ev: u32 = wave8m.cell_click(&(*t).ce, row, col, false)
+                if ev == wave8m.CE_COMMIT {
+                    tbl_store(c, i, (*t).ce.last_row, (*t).ce.last_col)
+                    tbl_event(c, i, TE_COMMIT, (*t).ce.last_row, (*t).ce.last_col)
+                    changed = true
+                }
+            }
+        } else if row != NONE && row < (*t).cells.rows {
+            let moved: bool = col != (*t).ce.col
+            (*t).ce.col = col
+            if moved {
+                tbl_event(c, i, TE_MOVED, row, col)
+                changed = true
+            }
+        }
+        i = i + 1
+    }
+    return changed
+}
+
+fn tbl_paint(c: *mut Ctl, rc: *mut render.Ctx) {
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_TABLE {
+            let t: *mut Tbl = tbl_of(c, i)
+            tbl_describe(c, i)
+            if (*t).ce.editing {
+                var r: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
+                if tbl_cell_rect(c, i, (*t).ce.row, (*t).ce.col, &r) {
+                    var f: widget.Widget = widget.widget_new(widget.KIND_TEXTBOX)
+                    widget.w_place(&f, r[0], r[1], r[2], r[3])
+                    widget.w_set_focus(&f, true)
+                    render.draw_textfield(rc, &f, &(*t).ed, true)
+                }
+            }
         }
         i = i + 1
     }

@@ -232,6 +232,10 @@ struct Parser {
     pre_stmt2: u32,
     // r708: the hidden bindings of `for (a, b) in ..` (any number); the NEXT `block` puts them in front
     pre_list: Vec[u32],
+    // wf-py: innermost statement of the comprehension being parsed (NOTHING = none) and the
+    // hoisted f-string parts of its element (collsugar.rs)
+    comp_leaf: u32,
+    comp_pre: Vec[u32],
     // GENERIC TEMPLATES. The store sits OUTSIDE the parser because it has to be
     // shared by all files of a translation: the root file may use `Vec[i32]`
     // while `Vec[T]` is declared in some module.
@@ -375,6 +379,7 @@ fn par_new(lx: u64) -> Parser {
         pre_stmt: ast.NOTHING,
         pre_stmt2: ast.NOTHING,
         pre_list: vec_new[u32](),
+        comp_leaf: ast.NOTHING, comp_pre: vec_new[u32](),
         gen: 0, mu: 0, feh: 0, time: false, gcr: 0, ifr: 0, nogc_pending: 0, int_pending: 0, ph_pending: 0, mc_pending: 0,
         link_pending: 0, link_pending_set: false, export_pending: 0, tpoff: 0, sonr: -1, hgnr: -1, gtnr: -1, gunr: -1,
         local: vec_new[u32](), llimit: vec_new[u32](),
@@ -491,6 +496,7 @@ fn par_free(p: *mut Parser) {
     vec_free[u32](&(*p).rp_mark)
     vec_free[u32](&(*p).after)
     vec_free[u32](&(*p).pre_list)
+    vec_free[u32](&(*p).comp_pre)
     vec_free[u32](&(*p).al_name)
     vec_free[u32](&(*p).al_head)
     vec_free[u32](&(*p).al_pos)
@@ -3543,6 +3549,10 @@ fn basic_expr_at(p: *mut Parser) -> u32 {
         var done: bool = false
         if !actual(p, A_RBRACKET) && !at_end(p) {
             let first: u32 = inner_expr(p)
+            if actual(p, A_KWFOR) {
+                // wf-py: a comprehension needs a declared Vec[T] / Dict[V] type (collsugar.rs)
+                complain(p)
+            }
             if actual(p, A_SEMI) {
                 next_bump(p)
                 let count: u32 = inner_expr(p)
@@ -4112,6 +4122,14 @@ fn let_stmt(p: *mut Parser) -> u32 {
     if !expect(p, A_ASSIGN) {
         return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
     }
+    // wf-py: `let x: Vec[T] = [..]` / `Dict[V] = {..}` (collsugar.rs)
+    if t != ast.NOTHING && (*p).err == 0 {
+        var cs: u32 = 0
+        if coll_init(p, t, true, name, at_pos(p, 0), &cs) {
+            loc_add(p, name)
+            return cs
+        }
+    }
     let init: u32 = expr(p)
     end_stmt(p)
     // ROUND 79: `[T; _]` -- now that the initializer has been read, the
@@ -4416,7 +4434,7 @@ fn fe_clone(p: *mut Parser, e: u32) -> u32 {
 
 // `for name in arr { body }` becomes
 //     for __each#L_C in 0 as usize..__each_len(arr) { let name = arr[__each#L_C]; body }
-fn for_each(p: *mut Parser, name: u32, arr: u32, fpos: u64, npos: u64) -> u32 {
+fn for_each(p: *mut Parser, name: u32, arr: u32, fpos: u64, npos: u64, comp: bool) -> u32 {
     let b: *mut ast.Tree = par_tree(p)
     if !fe_place_ok(p, arr) {
         complain(p)
@@ -4461,7 +4479,7 @@ fn for_each(p: *mut Parser, name: u32, arr: u32, fpos: u64, npos: u64) -> u32 {
     loc_add(p, name)
     loc_add(p, idx_nr)
     (*p).pre_stmt = bind
-    let body: u32 = block(p)
+    let body: u32 = block_c(p, comp)
     (*p).pre_stmt = ast.NOTHING
     loc_off(p)
     return ast.stmt_new(b, ast.S_FOR, idx_nr, zero, len_call, body)
@@ -4504,7 +4522,7 @@ fn fe_elem(p: *mut Parser, arr: u32, idx_nr: u32, apos: u64) -> u32 {
 //     for __each#L_C in 0 as usize..__each_len(v) { let a = __each#L_C; let b = v[__each#L_C]; body }
 // zip walks to the shorter length: `if la < lb { la } else { lb }`. Any part may be a nested
 // pattern; without enumerate/zip the whole pattern belongs to the element.
-fn for_pair(p: *mut Parser, fpos: u64) -> u32 {
+fn for_pair(p: *mut Parser, fpos: u64, comp: bool) -> u32 {
     let b: *mut ast.Tree = par_tree(p)
     var enc: Vec[u32] = vec_new[u32]()
     if !tuple_pattern(p, &enc) {
@@ -4523,7 +4541,7 @@ fn for_pair(p: *mut Parser, fpos: u64) -> u32 {
         si = si + 2
     }
     let src: u32 = cond_expr(p)
-    if !actual(p, A_LBRACE) {
+    if !comp && !actual(p, A_LBRACE) {
         vec_free[u32](&enc)
         complain(p)
         return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
@@ -4617,7 +4635,7 @@ fn for_pair(p: *mut Parser, fpos: u64) -> u32 {
     }
     vec_free[u32](&binds)
     vec_free[u32](&enc)
-    let body: u32 = block(p)
+    let body: u32 = block_c(p, comp)
     loc_off(p)
     return ast.stmt_new(b, ast.S_FOR, idx_nr, zero, len_e, body)
 }
@@ -4635,11 +4653,14 @@ fn fe_len_call(p: *mut Parser, len_nr: u32, arr: u32, apos: u64) -> u32 {
     return call
 }
 
-fn for_stmt(p: *mut Parser) -> u32 {
+fn for_stmt(p: *mut Parser) -> u32 { return for_stmt_c(p, false) }
+
+// wf-py: `comp` = the loop is a clause of a comprehension; its body is the rest of the clauses.
+fn for_stmt_c(p: *mut Parser, comp: bool) -> u32 {
     let fpos: u64 = at_pos(p, 0)
     next_bump(p)
     if actual(p, A_LPAREN) {
-        return for_pair(p, fpos)
+        return for_pair(p, fpos, comp)
     }
     if !actual(p, A_IDENT) {
         complain(p)
@@ -4654,8 +4675,8 @@ fn for_stmt(p: *mut Parser) -> u32 {
     rp_shadow(p, name)
     let of: u32 = cond_expr(p)
     // ROUND REF4: `for x in array { .. }` -- no `..`, the body follows.
-    if actual(p, A_LBRACE) {
-        return for_each(p, name, of, fpos, npos)
+    if (!comp && actual(p, A_LBRACE)) || (comp && !actual(p, A_DOTDOT)) {
+        return for_each(p, name, of, fpos, npos, comp)
     }
     if !expect(p, A_DOTDOT) {
         return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
@@ -4669,11 +4690,281 @@ fn for_stmt(p: *mut Parser) -> u32 {
     let to: u32 = cond_expr(p)
     loc_on(p)
     loc_add(p, name)
-    let body: u32 = block(p)
+    let body: u32 = block_c(p, comp)
     loc_off(p)
     let fs: u32 = ast.stmt_new(par_tree(p), ast.S_FOR, name, of, to, body)
     ast.s_f_set(par_tree(p), fs, incl)
     return fs
+}
+
+// ------------------------------------------------- wf-py: collection sugar
+//
+// Twin of compiler/src/collsugar.rs (list/dict literals and comprehensions for `Vec[T]` /
+// `Dict[V]` with a DECLARED target type). Read the header there for the desugaring.
+
+// The body of a `for` clause: a `{ block }`, or (comprehension) the rest of the clauses.
+fn block_c(p: *mut Parser, comp: bool) -> u32 {
+    if !comp {
+        return block(p)
+    }
+    return comp_clauses(p)
+}
+
+// Statement `add_fn(&target, args..)`; `a1`/`a2` are the value expressions (a2 = NOTHING: none).
+fn coll_add(p: *mut Parser, target: u32, add_fn: u32, a1: u32, a2: u32, at: u64) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
+    let id: u32 = ast.expr_new(b, ast.E_ID, target, 0, 0, 0)
+    pos_default(p, id, at)
+    let addr: u32 = ast.expr_new(b, ast.E_UN, U_ADDR, id, 0, 0)
+    pos_default(p, addr, at)
+    var args: Vec[u32] = vec_new[u32]()
+    vec_push[u32](&args, addr)
+    vec_push[u32](&args, a1)
+    var n: u32 = 2
+    if a2 != ast.NOTHING {
+        vec_push[u32](&args, a2)
+        n = 3
+    }
+    let off: u32 = list_store(p, &args)
+    vec_free[u32](&args)
+    let call: u32 = ast.expr_new(b, ast.E_CALL, add_fn, off, n, 0)
+    pos_default(p, call, at)
+    let st: u32 = ast.stmt_new(b, ast.S_EXPR, call, 0, 0, 0)
+    ast.stmt_pos_set(b, st, at)
+    return st
+}
+
+// Moves the hoisted statements from index `h0` on into `out`.
+fn coll_take_hoist(p: *mut Parser, h0: usize, out: *mut Vec[u32]) {
+    var i: usize = h0
+    while i < vec_len[u32](&(*p).hoist) {
+        vec_push[u32](out, vec_at[u32](&(*p).hoist, i))
+        i = i + 1
+    }
+    vec_shorten[u32](&(*p).hoist, h0)
+}
+
+// The clauses of a comprehension, innermost last, as statements appended to `out`.
+fn comp_stmts(p: *mut Parser, out: *mut Vec[u32]) {
+    if (*p).err > 0 || at_end(p) {
+        return
+    }
+    let b: *mut ast.Tree = par_tree(p)
+    if actual(p, A_KWFOR) {
+        let h0: usize = vec_len[u32](&(*p).hoist)
+        let st: u32 = for_stmt_c(p, true)
+        coll_take_hoist(p, h0, out)
+        vec_push[u32](out, st)
+    } else if actual(p, A_KWIF) {
+        let ipos: u64 = at_pos(p, 0)
+        next_bump(p)
+        let h0: usize = vec_len[u32](&(*p).hoist)
+        let cond: u32 = cond_expr(p)
+        coll_take_hoist(p, h0, out)
+        let then: u32 = comp_clauses(p)
+        let ifs: u32 = ast.stmt_new(b, ast.S_IF, cond, then, ast.NOTHING, 0)
+        ast.stmt_pos_set(b, ifs, ipos)
+        vec_push[u32](out, ifs)
+    } else {
+        var i: usize = 0
+        while i < vec_len[u32](&(*p).comp_pre) {
+            vec_push[u32](out, vec_at[u32](&(*p).comp_pre, i))
+            i = i + 1
+        }
+        vec_clear[u32](&(*p).comp_pre)
+        if (*p).comp_leaf == ast.NOTHING {
+            complain(p)
+        } else {
+            vec_push[u32](out, (*p).comp_leaf)
+            (*p).comp_leaf = ast.NOTHING
+        }
+    }
+}
+
+// `comp_stmts` as a block (the body of a `for` / `if` clause).
+fn comp_clauses(p: *mut Parser) -> u32 {
+    loc_on(p)
+    var own: Vec[u32] = vec_new[u32]()
+    if (*p).pre_stmt != ast.NOTHING {
+        vec_push[u32](&own, (*p).pre_stmt)
+        (*p).pre_stmt = ast.NOTHING
+    }
+    if (*p).pre_stmt2 != ast.NOTHING {
+        vec_push[u32](&own, (*p).pre_stmt2)
+        (*p).pre_stmt2 = ast.NOTHING
+    }
+    var pli: usize = 0
+    while pli < vec_len[u32](&(*p).pre_list) {
+        vec_push[u32](&own, vec_at[u32](&(*p).pre_list, pli))
+        pli = pli + 1
+    }
+    vec_clear[u32](&(*p).pre_list)
+    comp_stmts(p, &own)
+    let closing: u64 = at_pos(p, 0)
+    let off: u32 = vec_len[u32](&(*par_tree(p)).slist) as u32
+    var i: usize = 0
+    while i < vec_len[u32](&own) {
+        vec_push[u32](&(*par_tree(p)).slist, vec_at[u32](&own, i))
+        i = i + 1
+    }
+    let len: u32 = vec_len[u32](&own) as u32
+    vec_free[u32](&own)
+    loc_off(p)
+    let bi: u32 = ast.block_new(par_tree(p), off, len)
+    ast.block_end_set(par_tree(p), bi, closing)
+    return bi
+}
+
+// Entry (twin of `Parser::coll_init`): the current token stands right behind `=` / `return`;
+// `t` is the declared type node. true: handled, `*out` is the `let` / `return` statement and the
+// extra statements are queued in `after` / `qpre`. false: nothing consumed.
+fn coll_init(p: *mut Parser, t: u32, dest_let: bool, lname: u32, spos: u64, out: *mut u32) -> bool {
+    if !has_gen(p) {
+        return false
+    }
+    let b: *mut ast.Tree = par_tree(p)
+    if ast.t_kind(b, t) != ast.T_NAME {
+        return false
+    }
+    let tname: u32 = ast.t_a(b, t)
+    let ck: u32 = mono.coll_kind(gn(p), tname)
+    if ck == 0 {
+        return false
+    }
+    let is_dict: bool = ck == 2
+    var open: u32 = A_LBRACKET
+    var close: u32 = A_RBRACKET
+    if is_dict {
+        open = A_LBRACE
+        close = A_RBRACE
+    }
+    if !actual(p, open) {
+        return false
+    }
+    // look ahead over the bracket group: a top-level `for` / `:`
+    var depth: i64 = 0
+    var has_for: bool = false
+    var colon: bool = false
+    var k: usize = 0
+    while true {
+        let a: u32 = kind(p, k)
+        if a == A_LPAREN || a == A_LBRACKET || a == A_LBRACE {
+            depth = depth + 1
+        } else if a == A_RPAREN || a == A_RBRACKET || a == A_RBRACE {
+            depth = depth - 1
+            if depth <= 0 {
+                break
+            }
+        } else if a == A_EOF {
+            return false
+        } else if depth == 1 && a == A_KWFOR {
+            has_for = true
+        } else if depth == 1 && a == A_COLON {
+            colon = true
+        }
+        k = k + 1
+    }
+    if is_dict && !colon && !has_for && kind(p, 1) != A_RBRACE {
+        return false
+    }
+    var wnew: u32 = 0
+    var wadd: u32 = 1
+    if is_dict {
+        wnew = 2
+        wadd = 3
+    }
+    let new_fn: u32 = mono.coll_fn(gn(p), tname, wnew)
+    let add_fn: u32 = mono.coll_fn(gn(p), tname, wadd)
+    if new_fn == ast.NOTHING || add_fn == ast.NOTHING {
+        return false
+    }
+    let open_pos: u64 = at_pos(p, 0)
+    next_bump(p)
+    var target: u32 = lname
+    if !dest_let {
+        rt.buf_clear(&(*p).scratch)
+        var lw: [u8; 5] = "__lc#"
+        rt.buf_push_bytes(&(*p).scratch, (&lw[0]) as u64, 5)
+        rt.buf_push_dec_u64(&(*p).scratch, ast.pos_line(open_pos) as u64)
+        rt.buf_push(&(*p).scratch, 95 as u8)
+        rt.buf_push_dec_u64(&(*p).scratch, ast.pos_col(open_pos) as u64)
+        target = intern.intern_number(lexer.lex_names(lx(p)), rt.buf_ptr(&(*p).scratch),
+            rt.buf_len(&(*p).scratch)) as u32
+        loc_add(p, target)
+    }
+    var noargs: Vec[u32] = vec_new[u32]()
+    let noff: u32 = list_store(p, &noargs)
+    vec_free[u32](&noargs)
+    let init: u32 = ast.expr_new(b, ast.E_CALL, new_fn, noff, 0, 0)
+    pos_default(p, init, open_pos)
+    (*p).parens = (*p).parens + 1
+    (*p).no_q = (*p).no_q + 1
+    let remembered: usize = (*p).no_slit
+    (*p).no_slit = 0
+    var body: Vec[u32] = vec_new[u32]()
+    if !actual(p, close) {
+        let h0: usize = vec_len[u32](&(*p).hoist)
+        let first: u32 = expr(p)
+        var second: u32 = ast.NOTHING
+        if is_dict {
+            if expect(p, A_COLON) {
+                second = expr(p)
+            }
+        }
+        if (*p).err > 0 {
+            // fall through to the closing code
+        } else if actual(p, A_KWFOR) {
+            // comprehension: the hoisted f-string parts of the element run per iteration
+            coll_take_hoist(p, h0, &(*p).comp_pre)
+            (*p).comp_leaf = coll_add(p, target, add_fn, first, second, open_pos)
+            comp_stmts(p, &body)
+        } else {
+            vec_push[u32](&body, coll_add(p, target, add_fn, first, second, open_pos))
+            while (*p).err == 0 && eat(p, A_COMMA) && !actual(p, close) {
+                let k2: u32 = expr(p)
+                var v2: u32 = ast.NOTHING
+                if is_dict {
+                    if !expect(p, A_COLON) {
+                        break
+                    }
+                    v2 = expr(p)
+                }
+                vec_push[u32](&body, coll_add(p, target, add_fn, k2, v2, open_pos))
+            }
+        }
+    }
+    (*p).no_slit = remembered
+    (*p).no_q = (*p).no_q - 1
+    (*p).parens = (*p).parens - 1
+    expect(p, close)
+    end_stmt(p)
+    if (*p).err > 0 {
+        vec_free[u32](&body)
+        *out = ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+        return true
+    }
+    var bi: usize = 0
+    if dest_let {
+        while bi < vec_len[u32](&body) {
+            vec_push[u32](&(*p).after, vec_at[u32](&body, bi))
+            bi = bi + 1
+        }
+        vec_free[u32](&body)
+        *out = ast.stmt_new(b, ast.S_VAR, lname, t, init, 0)
+        return true
+    }
+    vec_push[u32](&(*p).qpre, ast.stmt_new(b, ast.S_VAR, target, t, init, 0))
+    while bi < vec_len[u32](&body) {
+        vec_push[u32](&(*p).qpre, vec_at[u32](&body, bi))
+        bi = bi + 1
+    }
+    vec_free[u32](&body)
+    let value: u32 = ast.expr_new(b, ast.E_ID, target, 0, 0, 0)
+    pos_default(p, value, open_pos)
+    let rs: u32 = ast.stmt_new(b, ast.S_RET, value, 0, 0, 0)
+    ast.s_b_set(b, rs, (*p).cur_ret)
+    *out = rs
+    return true
 }
 
 fn return_stmt(p: *mut Parser) -> u32 {
@@ -4682,6 +4973,12 @@ fn return_stmt(p: *mut Parser) -> u32 {
     var has: bool = true
     if actual(p, A_SEMI) || actual(p, A_RBRACE) || at_end(p) || line_start(p) {
         has = false
+    }
+    if has && (*p).cur_ret != 0 && (*p).err == 0 {
+        var cs: u32 = 0
+        if coll_init(p, (*p).cur_ret - 1, false, 0, at_pos(p, 0), &cs) {
+            return cs
+        }
     }
     if has {
         value = expr(p)

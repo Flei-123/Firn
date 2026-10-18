@@ -141,7 +141,7 @@ Effort S <1 day, M 1-3 days, L >3 days. Status `done` = landed on main in this r
 | G19 | P0 | lib | no drawing facade | `paint.draw` | S | **done** |
 | G20 | P0 | bug | `"a" + f"{n}"` accepted, wrong result / hang; `"" + s` aliased | `text.dup` (done); type error for `str + Fmt` | S | dup **done**, Fmt check: vspy-fnc |
 | G21 | P1 | language | f-string format spec: DONE `{x:>6}` `{x:.2f}` `{n:05}` `{n:x}` `{x:.1%}` (r665) + `,` `_` `e E g G c n`, nested `{w}`/`{p}`, BMP fill (r699), firnc0+firnc1; `{{` + nested quotes done (r664) | spec -> `io.fmt_spec_*` | M | **done** (tools/fmtspec_cross: 0 diffs vs Python); `!r` DONE (r708); open: `f` beyond 2^64 |
-| G22 | P1 | language | `for (i, x) in enumerate(v)` and `for (x, y) in zip(a, b)` DONE (r666, firnc0+firnc1); no comprehension, general tuple patterns in `for` DONE (r708) | comprehension syntax later | M | enumerate/zip + `for (a, b) in vec_of_tuples` **done**; open: comprehensions |
+| G22 | P1 | language | `for (i, x) in enumerate(v)` and `for (x, y) in zip(a, b)` DONE (r666, firnc0+firnc1); no comprehension, general tuple patterns in `for` DONE (r708) | comprehension syntax (section 9) | M | enumerate/zip + `for (a, b) in vec_of_tuples` **done**; comprehensions + list/dict literals **done** (wf-py, declared target type) |
 | G23 | P1 | language | no generic enums, so no `Option[T]` with `match`/`?` | `std.option` (r712): generic STRUCT `Option[T]{has,val}` + `opt_some/opt_none/opt_unwrap_or/opt_or/opt_eq` + Vec bridges `vec_first_opt/last/get/pop/index_of_opt`; `if let Some(x) = o {..} else {..}` and `while let Some(x) = o {..}` DONE (r719, parser sugar over any struct with `has`/`val`, hidden `let __opt#L_C`, firnc0+firnc1, tests 4070/4073); open: `?` propagation, generic enums | L | partial |
 | G24 | P1 | language | capturing closures only as `gc fn` (+`try`); timers/sort keys need ctx struct | stack closures for non-escaping use | L | open |
 | G25 | P1 | language | `mod.fn[T](..)` (r701) and `mod.Type[T]` (r707) work in both compilers (tests 3970-3975, 3991); open: generic fns are not `fn` values | qualified generics | S-M | done (fn values open) |
@@ -184,7 +184,7 @@ Evidence: `examples/vs_python/lang/` (79 probe files `.probe`, output in `PROBES
 | Stdlib found automatically | yes | needs `FIRNLIB` (fix running: G01) | gap |
 | Type inference | yes | `let/var` inferred, generics only with `f[T](..)`, no return-type inference | partial |
 | Short syntax | defaults, kwargs, slices, `in` | none of default args, named args, slices, `in`, negative index | gap |
-| Comprehensions / iterators | yes | no `for x in vec`, no enumerate/zip, no generators; `std.vecfn` map/filter/sum as lib | gap |
+| Comprehensions / iterators | yes | `[e for x in v if c]` -> `Vec[T]`, `{k: v for ..}` -> `Dict[V]`, list/dict literals (section 9, wf-py), `for x in vec`, enumerate/zip; no generators; `std.vecfn` map/filter/sum as lib | partial |
 | f-strings | `f"{x:>8.2f}"` | `f"{a + b}"` expressions work, but result is `Fmt` not `str`, no spec | partial |
 | `with` / RAII | `with open()` | `defer` | works |
 | dataclass | `@dataclass` (eq, repr, order) | plain `struct`; no `derive`, no `==`, no print | gap |
@@ -210,3 +210,21 @@ Compile time (cold, `dev-fast`): hello 10 ms, any program importing `std.io` 0.5
 5. **Re-run this study** after each block: `python3 tools/vspy/measure.py examples/vs_python/<task>` + `python3 tools/vspy/table.py`. Target: median line factor <= 1.5 (now 1.52), no task above 3x (open: 02 3.4, 15 3.6, 04 2.9, p02 3.1).
 
 Roadmap items: see ROADMAP in the JARVIS project (group "Python-Niveau"), one item per gap above.
+
+## 9. Collection literals and comprehensions (wf-py, 2026-10-18)
+
+Pure parser desugar on `Vec` / `Dict` (`std.vec`, `std.dict`), firnc0 (`compiler/src/collsugar.rs`) and firnc1 (`coll_init` in `lib/firnc1/parser.fi`). The element type is NOT inferred: the sugar needs a DECLARED target, namely the initializer of `let/var x: T = ...` or the value of `return ...` in a function declared `-> T`, with `T` = `Vec[E]` or `Dict[V]`. Anywhere else the old rules hold (`[a, b]` stays an array literal, `{` a block); an untyped `[e for x in v]` is the error "a comprehension needs a declared collection type".
+
+```firn
+let sq: Vec[i64] = [x * x for x in xs if x > 0]       // var sq = vec_new[i64](); for x in xs { if x > 0 { vec_push[i64](&sq, x * x) } }
+let l: Vec[i64] = [1, 2, 3]                            // list literal (trailing comma ok), [] is empty
+let d: Dict[i64] = {"a": 1, "b": 2}                    // dict_new[i64]() + dict_set[i64](&d, k, v) per entry
+let m: Dict[i64] = {s: (i as i64) for (i, s) in enumerate(names) if i != 1}
+fn evens(n: i64) -> Vec[i64] { return [i for i in 0..n if i % 2 == 0] }   // hidden `var __lc#L_C`
+```
+- Clauses nest in source order: `[e for i in a for j in b if c1 if c2]`. Sources follow `for x in v`: a place (name, field path, `*p`) or a range `a..b` / `a..=b`; tuple patterns `for (i, x) in enumerate(v)` work.
+- The target is declared mutable (`let x: Vec[T] = [..]` becomes a `var`); `import std.vec` / `import std.dict` is required (else the old error).
+- f-strings in the element are hoisted into the loop body; `?` is not allowed inside (error).
+- Not done: untyped comprehensions (needs inference), generators, set comprehensions, a literal as call argument / struct field / assignment (no declared type there). Dict keys are `str`. firnc1: a loop variable that shadows a global of the same name is read as the global in the element expression (the element is parsed before the loop).
+- `with`-sugar (defer desugar) and `firn add/fetch/deps` polish: not built; `with` = `defer`, the package manager works (section 7).
+- Tests: 4340 (Vec), 4341 (Dict), neg 4342.

@@ -1,0 +1,349 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/wave11.fi -- THE DATA OF A TABLE (wave 11): cells as text on the heap, a stable sort by a column.
+//
+//     var t: wave11.Cells = wave11.cells_new(3)
+//     let r: usize = wave11.cells_add_row(&t)
+//     wave11.cells_set(&t, r, 0, "Anna".p as u64, 4)
+//     wave11.cells_sort(&t, 2, false)          // by column 2, ascending; the row order is now permuted
+//     let was: usize = wave11.cells_moved(&t, 5)   // where row 5 of before the sort went
+//
+// Two numbers (optional '-', digits) compare as numbers ("9" < "10"), anything else by its bytes, ASCII letters
+// without case, ties by the old order (the sort is stable, a descending sort keeps equal rows in order too).
+// HONEST LIMITS: the text is bytes (no Unicode collation); at most 64 columns; a failed allocation drops the call.
+import std.rt
+
+export {
+    Cells, cells_new, cells_free, cells_rows, cells_cols, cells_add_row, cells_remove_row, cells_set, cells_ptr,
+    cells_len, cells_compare, cells_sort, cells_moved, CELLS_COLS_MAX,
+}
+
+const CELLS_COLS_MAX: usize = 64
+
+struct Cells {
+    cols: usize,
+    rows: usize,
+    cap: usize, // rows the slot block has room for
+    p: u64, // cap * cols slots of 16 bytes: pointer, length
+    perm: u64, // cap usize: after a sort perm[new] = old
+}
+
+fn ru(p: u64, i: usize) -> u64 {
+    return *((p + (i * 8) as u64) as *mut u64)
+}
+
+fn wu(p: u64, i: usize, v: u64) {
+    *((p + (i * 8) as u64) as *mut u64) = v
+}
+
+fn cells_new(cols: usize) -> Cells {
+    var c: usize = cols
+    if c > CELLS_COLS_MAX {
+        c = CELLS_COLS_MAX
+    }
+    if c == 0 {
+        c = 1
+    }
+    return Cells { cols: c, rows: 0, cap: 0, p: 0, perm: 0 }
+}
+
+fn cells_rows(c: *mut Cells) -> usize { return (*c).rows }
+fn cells_cols(c: *mut Cells) -> usize { return (*c).cols }
+
+fn slot(c: *mut Cells, r: usize, col: usize) -> u64 {
+    return (*c).p + ((r * (*c).cols + col) * 16) as u64
+}
+
+fn cells_ptr(c: *mut Cells, r: usize, col: usize) -> u64 {
+    if r >= (*c).rows || col >= (*c).cols {
+        return 0
+    }
+    return ru(slot(c, r, col), 0)
+}
+
+fn cells_len(c: *mut Cells, r: usize, col: usize) -> usize {
+    if r >= (*c).rows || col >= (*c).cols {
+        return 0
+    }
+    return ru(slot(c, r, col), 1) as usize
+}
+
+fn cells_free(c: *mut Cells) {
+    var r: usize = 0
+    while r < (*c).rows {
+        var k: usize = 0
+        while k < (*c).cols {
+            let s: u64 = slot(c, r, k)
+            if ru(s, 0) != 0 {
+                rt.heap_free(ru(s, 0), ru(s, 1) as usize)
+            }
+            k = k + 1
+        }
+        r = r + 1
+    }
+    if (*c).p != 0 {
+        rt.heap_free((*c).p, (*c).cap * (*c).cols * 16)
+    }
+    if (*c).perm != 0 {
+        rt.heap_free((*c).perm, (*c).cap * 8)
+    }
+    (*c).p = 0
+    (*c).perm = 0
+    (*c).cap = 0
+    (*c).rows = 0
+}
+
+// room for one more row; false = out of memory
+fn grow(c: *mut Cells) -> bool {
+    if (*c).rows < (*c).cap {
+        return true
+    }
+    var nc: usize = (*c).cap * 2
+    if nc < 8 {
+        nc = 8
+    }
+    let np: u64 = rt.heap_alloc(nc * (*c).cols * 16)
+    if np == 0 {
+        return false
+    }
+    let nq: u64 = rt.heap_alloc(nc * 8)
+    if nq == 0 {
+        rt.heap_free(np, nc * (*c).cols * 16)
+        return false
+    }
+    rt.mem_set(np, 0 as u8, nc * (*c).cols * 16)
+    if (*c).p != 0 {
+        rt.mem_copy(np, (*c).p, (*c).rows * (*c).cols * 16)
+        rt.heap_free((*c).p, (*c).cap * (*c).cols * 16)
+    }
+    if (*c).perm != 0 {
+        rt.heap_free((*c).perm, (*c).cap * 8)
+    }
+    (*c).p = np
+    (*c).perm = nq
+    (*c).cap = nc
+    return true
+}
+
+// a new empty row at the end; NONE (4294967295) when memory is out
+fn cells_add_row(c: *mut Cells) -> usize {
+    if !grow(c) {
+        return 4294967295
+    }
+    let r: usize = (*c).rows
+    rt.mem_set(slot(c, r, 0), 0 as u8, (*c).cols * 16)
+    (*c).rows = r + 1
+    return r
+}
+
+fn cells_remove_row(c: *mut Cells, r: usize) {
+    if r >= (*c).rows {
+        return
+    }
+    var k: usize = 0
+    while k < (*c).cols {
+        let s: u64 = slot(c, r, k)
+        if ru(s, 0) != 0 {
+            rt.heap_free(ru(s, 0), ru(s, 1) as usize)
+        }
+        k = k + 1
+    }
+    let tail: usize = (*c).rows - r - 1
+    if tail > 0 {
+        rt.mem_copy(slot(c, r, 0), slot(c, r + 1, 0), tail * (*c).cols * 16)
+    }
+    (*c).rows = (*c).rows - 1
+}
+
+// copies `n` bytes at `p` into the cell
+fn cells_set(c: *mut Cells, r: usize, col: usize, p: u64, n: usize) {
+    if r >= (*c).rows || col >= (*c).cols {
+        return
+    }
+    var q: u64 = 0
+    if n > 0 {
+        q = rt.heap_alloc(n)
+        if q == 0 {
+            return
+        }
+        rt.mem_copy(q, p, n)
+    }
+    let s: u64 = slot(c, r, col)
+    if ru(s, 0) != 0 {
+        rt.heap_free(ru(s, 0), ru(s, 1) as usize)
+    }
+    wu(s, 0, q)
+    wu(s, 1, n as u64)
+}
+
+// an integer with an optional minus; false = not one (empty, other characters, more than 18 digits)
+fn parse_int(p: u64, n: usize, out: *mut i64) -> bool {
+    var k: usize = 0
+    var neg: bool = false
+    if n > 0 && *(p as *mut u8) == 45 as u8 {
+        neg = true
+        k = 1
+    }
+    if k >= n || n - k > 18 {
+        return false
+    }
+    var v: i64 = 0
+    while k < n {
+        let ch: u8 = *((p + k as u64) as *mut u8)
+        if ch < 48 as u8 || ch > 57 as u8 {
+            return false
+        }
+        v = v * 10 + ((ch as i64) - 48)
+        k = k + 1
+    }
+    if neg {
+        v = 0 - v
+    }
+    *out = v
+    return true
+}
+
+fn fold(b: u8) -> u8 {
+    if b >= 65 as u8 && b <= 90 as u8 {
+        return b + 32 as u8
+    }
+    return b
+}
+
+// -1 / 0 / 1: the cell (ra, col) against (rb, col)
+fn cells_compare(c: *mut Cells, ra: usize, rb: usize, col: usize) -> i64 {
+    let pa: u64 = cells_ptr(c, ra, col)
+    let pb: u64 = cells_ptr(c, rb, col)
+    let na: usize = cells_len(c, ra, col)
+    let nb: usize = cells_len(c, rb, col)
+    var va: i64 = 0
+    var vb: i64 = 0
+    if parse_int(pa, na, &va) && parse_int(pb, nb, &vb) {
+        if va < vb {
+            return 0 - 1
+        }
+        if va > vb {
+            return 1
+        }
+        return 0
+    }
+    var i: usize = 0
+    while i < na && i < nb {
+        let x: u8 = fold(*((pa + i as u64) as *mut u8))
+        let y: u8 = fold(*((pb + i as u64) as *mut u8))
+        if x < y {
+            return 0 - 1
+        }
+        if x > y {
+            return 1
+        }
+        i = i + 1
+    }
+    if na < nb {
+        return 0 - 1
+    }
+    if na > nb {
+        return 1
+    }
+    return 0
+}
+
+// does the left row stay in front of the right one (stable)
+fn left_first(c: *mut Cells, a: usize, b: usize, col: usize, desc: bool) -> bool {
+    let d: i64 = cells_compare(c, a, b, col)
+    if desc {
+        return d >= 0
+    }
+    return d <= 0
+}
+
+// Sorts the rows by column `col` (stable merge sort). perm[new] = old stays for `cells_moved`.
+fn cells_sort(c: *mut Cells, col: usize, desc: bool) {
+    let n: usize = (*c).rows
+    if col >= (*c).cols || n == 0 {
+        return
+    }
+    let tmp: u64 = rt.heap_alloc(n * 8)
+    if tmp == 0 {
+        return
+    }
+    var src: u64 = (*c).perm
+    var dst: u64 = tmp
+    var i: usize = 0
+    while i < n {
+        wu(src, i, i as u64)
+        i = i + 1
+    }
+    var width: usize = 1
+    while width < n {
+        var lo: usize = 0
+        while lo < n {
+            var mid: usize = lo + width
+            if mid > n {
+                mid = n
+            }
+            var hi: usize = lo + 2 * width
+            if hi > n {
+                hi = n
+            }
+            var a: usize = lo
+            var b: usize = mid
+            var o: usize = lo
+            while a < mid || b < hi {
+                var take_left: bool = false
+                if a < mid {
+                    if b >= hi {
+                        take_left = true
+                    } else if left_first(c, ru(src, a) as usize, ru(src, b) as usize, col, desc) {
+                        take_left = true
+                    }
+                }
+                if take_left {
+                    wu(dst, o, ru(src, a))
+                    a = a + 1
+                } else {
+                    wu(dst, o, ru(src, b))
+                    b = b + 1
+                }
+                o = o + 1
+            }
+            lo = lo + 2 * width
+        }
+        let sw: u64 = src
+        src = dst
+        dst = sw
+        width = width * 2
+    }
+    if src != (*c).perm {
+        rt.mem_copy((*c).perm, src, n * 8)
+    }
+    rt.heap_free(tmp, n * 8)
+    // the slots in the new order
+    let np: u64 = rt.heap_alloc((*c).cap * (*c).cols * 16)
+    if np == 0 {
+        return
+    }
+    rt.mem_set(np, 0 as u8, (*c).cap * (*c).cols * 16)
+    var k: usize = 0
+    while k < n {
+        let from: usize = ru((*c).perm, k) as usize
+        rt.mem_copy(np + (k * (*c).cols * 16) as u64, slot(c, from, 0), (*c).cols * 16)
+        k = k + 1
+    }
+    rt.heap_free((*c).p, (*c).cap * (*c).cols * 16)
+    (*c).p = np
+}
+
+// where row `old` (before the last sort) is now; the old index when there was no sort
+fn cells_moved(c: *mut Cells, old: usize) -> usize {
+    if (*c).perm == 0 {
+        return old
+    }
+    var k: usize = 0
+    while k < (*c).rows {
+        if ru((*c).perm, k) as usize == old {
+            return k
+        }
+        k = k + 1
+    }
+    return old
+}

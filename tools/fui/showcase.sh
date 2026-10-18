@@ -87,6 +87,10 @@ done
 "$FIRNC" --opt-level=dev -o "$T/apptb" tools/fui/apptb_main.fi
 "$T/apptb" "$T/img" > /dev/null
 
+# TABLE (appctl.table): header sort arrow and the open cell editor, light, dark
+"$FIRNC" --opt-level=dev -o "$T/appw11" tools/fui/appw11_main.fi
+"$T/appw11" "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/

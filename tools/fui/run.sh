@@ -789,6 +789,10 @@ build appw8m
 build apptb
 "$W/apptb" | tail -n 3 | grep -q "APPTB PASSED"
 
+# appw11: table in the ten-line API (header sort, cell cursor, in-place cell editor: F2 / Enter / typing / double click, Tab, Esc, read-only column, a11y)
+build appw11
+"$W/appw11" | tail -n 3 | grep -q "APPW11 PASSED"
+
 # appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
 build appw6
 "$W/appw6" | tail -n 3
