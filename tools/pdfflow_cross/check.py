@@ -16,7 +16,7 @@ try:
     if r.returncode:
         print(r.stderr[:500]); sys.exit(2)
     rnd = random.Random(11)
-    syll = ["ka", "lo", "mi", "ren", "tu", "sa", "bro", "ix", "ol", "den", "far", "gu"]
+    syll = ["ka", "lo", "mi", "ren", "tu", "sa", "bro", "ix", "ol", "den", "far", "gu"]  # english: ok
 
     def word():
         w = "".join(rnd.choice(syll) for _ in range(rnd.randint(1, 4)))

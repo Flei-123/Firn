@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # tools/android/jarvis_login_de.sh -- proof that the JARVIS app shows the GERMAN "wrong password" text on an emulator whose system
 # language is German (de-DE): wrong user/password against tools/mini/fake_jarvis.py (answers 401) -> the screen must say
-# "Benutzername oder Passwort stimmt nicht." Pictures: $OUT/de_login.png, de_error.png.
+# "Benutzername oder Passwort stimmt nicht." Pictures: $OUT/de_login.png, de_error.png.  # english: ok
 #   SERIAL=emulator-5594 ADB_PORT=5043 OUT=<dir> bash tools/android/jarvis_login_de.sh [apk]   (a running emulator; it is NOT stopped)
 # Without SERIAL it boots the AVD like jarvis_e2e.sh (AVD/EMU_PORT/ADB_PORT, with -change-locale de-DE) and stops it again;
 # with SERIAL the running emulator must already be German (boot it with -change-locale de-DE).
@@ -79,7 +79,7 @@ check "German login screen: field 'Passwort'" "$(ocr de_login | grep -c 'Passwor
 type_into "Benutzername" justin; type_into "Passwort" wrongpw
 tap_word "Anmelden" 1 1
 check "the wrong login reached the server (401)" "$(for _ in $(seq 20); do grep -q '"type": "login"' "$SLOG" && break; sleep 1; done; grep -c '"type": "login"' "$SLOG")" 1
-check "the screen says it in German: wrong user name or password" "$(OCR_TRIES=15 wait_ocr de_error 'Passwort stimmt nicht')" 1
+check "the screen says it in German: wrong user name or password" "$(OCR_TRIES=15 wait_ocr de_error 'Passwort stimmt nicht')" 1  # english: ok
 check "no English error on the screen" "$(ocr de_error | grep -ci 'Wrong user')" 0
 check "no crash in logcat" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
 $ADB shell am force-stop $PKG
