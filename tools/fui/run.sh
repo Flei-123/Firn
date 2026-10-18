@@ -902,6 +902,9 @@ build webtheme
 # M1-b: mobile components (app bar, tiles, chips, segmented, fields, bubbles, nav): sizes, taps, safe area, rule budget, a11y audit
 build mobile
 "$W/mobile" | tail -n 3 | grep -q "MOBILE PASSED"
+# lay.scroll_v: a scroll area between bar and footer (size, content height, wheel, clamp)
+build layscroll
+"$W/layscroll" | tail -n 3 | grep -q "LAYSCROLL PASSED"
 python3 tools/fui/uistr_audit.py
 build touch
 "$W/touch" | tail -n 3

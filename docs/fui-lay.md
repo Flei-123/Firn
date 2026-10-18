@@ -35,7 +35,7 @@ app.end(a)
 - Child setters: `align_self`, `margin(l,t,r,b)`, `grow(permille)`, `shrink(permille)`, `basis(pt)`, `size(w,h)` (0 = auto),
   `min_w/max_w/min_h/max_h`, `fill_w`, `fill_h`, `aspect(w,h)`, `hidden(bool)` (= visibility), `inset_safe(a,id)`.
 - Text: `label(a,s,size)` (wrapping, start-aligned), `text_wrap(a,id)`, `text_start(a,id)`, `spacer_grow(a)`.
-- Not yet: `scroll_v` (scroll container) — open, see roadmap.
+- Scroll: `scroll_v(a)` opens a vertical scroll area that takes the room left in its column and returns the inner column (close with `app.end`); `scroll_sync(a)` once per frame (`mobile.sync` does it); `scroll_offset(k)/scroll_to(k,y)`. Wheel, keys and bar work (test `layscroll_main`); touch panning is not wired yet.
 
 ## How it works
 - `scene.fi` got additive Node fields (all zero = old behaviour): `strict` (CSS mode of a box), margins, min/max,
