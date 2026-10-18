@@ -619,6 +619,13 @@ build animkey
 "$W/animkey"
 
 echo
+echo "== 18o3b. A CLASS TOGGLED LATER SHOWS (r98: active chip / tab) =="
+# tools/fui/restyle_main.fi: the transition registry follows the style the sheet resolves
+# each frame; counter-check without transreg_set_fresh_style.
+build restyle
+"$W/restyle"
+
+echo
 echo "== 18o4. ANIMATION FEEL BENCH (W3): hover latency, curves, frame pacing, idle, fling =="
 # tools/fui/animbench_main.fi: a simulated monotonic clock drives the real Host. Gates: hover/press
 # visible in the very frame that handles the event, Fluent durations (83/50 ms), frames on the
