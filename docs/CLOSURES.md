@@ -17,11 +17,12 @@ main (bae77570d + this branch). Design reasoning is in `docs/ROUND58.md`; this p
    a capturing closure given to a timer / watch is swept. -> fixed WITHOUT compiler change by `async.fnpin`
    (root table, `pin`/`unpin`). Test `tests/2869_async_closure_pin.fi`, mutation `tools/net/pin_mutation.sh`
    (pin removed -> segfault, exit 139). Manual unpin: leaks if forgotten.
-2. Closure literal inside a generic function is refused (copy per instantiation).
-3. `Vec[fn(..)]` / fn type as template argument does not compile (`size_of$T` substitution). Wrapper struct works.
-4. `s.f(1)` on a struct FIELD is a call since round 68 (tests/1238); `v[i](1)` on an array/Vec element still needs a local first.
+2. ~~Closure literal inside a generic function is refused~~ -- FIXED r716 (firnc0): every instance gets its own
+   closure ids (`mono.rs`, test 4042). firnc1 mirror still open.
+3. ~~`Vec[fn(..)]`~~ already works on main (test 4043).
+4. `s.f(1)` on a struct FIELD is a call since round 68 (tests/1238); `v[i](1)` on an array/Vec element still needs a local first (OPEN: needs a call node with a callee EXPRESSION in sema + lower, both compilers).
 5. Captures larger than one word; mutation of captured state needs an explicit `*mut` / `Gc[Cell]`.
-6. No self-recursion of a literal.
+6. No self-recursion of a literal -- by design: a literal has no name; recurse through a named `fn` (or pass the function itself as a parameter).
 
 ## Recommendation
 * Keep capture BY VALUE (no lifetimes in the language; by-ref would dangle). Do NOT add capture by reference.
@@ -52,3 +53,23 @@ older note "Firn has no closures" is wrong. What is missing is the cheap, non-es
   unless `#[allow_escape]`. Callee must not keep it (same contract as `ud: *mut Ctx` callbacks today).
 * Cost: sema (expected-type lookup), lower (alloca instead of `gc_alloc`), escape.rs, both compilers + parser_compare
   / sema_compare / fir_compare cases. Roadmap items r-lambda / r-localfn.
+
+## Lambda sugar (r715, built 18.10.2026)
+```
+sort_stable_by[Row](&rows, |a, b| (*a).amount < (*b).amount)   // expression body = `return expr`
+each(5, &total, |acc, i| { *acc = *acc + i })                  // block body
+let f: fn(i32) -> i32 = |x| x - 1                              // expected type from the let
+let g = |x: i32, y: i32| -> i32 x + y                          // fully typed: no context needed
+let h: fn() -> i32 = || 42
+let c: fn(i32) -> i32 = try gc |x| x + n                       // capturing form = heap record, like `gc fn`
+```
+* Parser: a `|` (or `||`) at the START of an operand is a lambda (bit-or is infix, `catch |e|` follows an operand).
+  Untyped parameters carry the marker type `__infer`, a missing result the marker `__lam_expr` / `__lam_blk`.
+* `compiler/src/lambda.rs` (pass after mono + dargs, BEFORE sema) replaces the markers from the expected
+  `fn(..) -> R` type: parameter of a plain call or method call (all candidates must agree), `let x: T`, `return`
+  (fn result type), struct literal field. `E!fn(..)` (the `gc` form) is looked through. Without a usable expected
+  type: error "cannot infer the types of this lambda here". Afterwards the lambda is exactly `fn(x: T) -> R { .. }`
+  -- same lowering as before, capture by value, no stack closures yet.
+* firnc1 (`lib/firnc1/lamsugar.fi` + `lambda_sugar` in parser.fi) mirrors: arguments of plain calls (also behind `try`)
+  and `let`/`var` with a declared type. Not mirrored (stage 0 only): method calls, struct fields, `return`.
+* Stack/non-escaping closures (`local fn`) are still only a design (section above).

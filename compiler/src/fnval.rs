@@ -167,6 +167,10 @@ pub(crate) fn closure_reset() {
     NEXT_ID.with(|r| *r.borrow_mut() = 0);
 }
 
+pub(crate) fn next_lambda_id() -> u32 {
+    next_id()
+}
+
 fn next_id() -> u32 {
     NEXT_ID.with(|r| {
         let mut n = r.borrow_mut();

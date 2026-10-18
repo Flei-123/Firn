@@ -1015,6 +1015,10 @@ impl<'a> Parser<'a> {
         if let Some(e) = crate::gc::hook_primary(self) {
             return e;
         }
+        // HOOK lambda: `|x| expr` / `gc |x| { .. }` (lambda.rs, r715)
+        if let Some(e) = crate::lambda::hook_primary(self) {
+            return e;
+        }
         // HOOK fnval: the closure literal `fn(…) { … }` / `gc fn(…) { … }`
         // (fnval.rs, round 58)
         if let Some(e) = crate::fnval::hook_primary(self) {

@@ -73,6 +73,7 @@ mod addrsink;
 mod escape;
 mod foreach;
 mod dargs;
+mod lambda;
 mod moves;
 mod nogc;
 mod prune;
@@ -1050,6 +1051,10 @@ fn run(opts: &Options) -> i32 {
             break;
         }
         dargs_pending = rest;
+    }
+    // r715: lambda sugar `|x| e` -> `fn(x: T) -> R { return e }` (lambda.rs)
+    if !dg.has_errors() {
+        lambda::apply(&mut prog, &mut dg);
     }
     tm.mark("mono");
     if opts.emit == Emit::Ast && !dg.has_errors() {

@@ -18,6 +18,10 @@ use crate::sema_generic::{
     self, instantiation, is_generic_fn, is_generic_struct, mangle, Bound, Instantiation,
 };
 
+thread_local! {
+    static FRESH_LAMBDA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Upper bound against endless instantiation chains (`Vec[Vec[Vec[..]]]`).
 const MAX_INSTANCES: usize = 4096;
 
@@ -160,19 +164,6 @@ fn expand_fn(
         Some(m) => m,
         None => return,
     };
-    // ROUND 58 — an honest limit (fnval.rs): a closure literal inside a
-    // template would be copied once per instantiation and would need one
-    // capture record and one generated function per copy. Function
-    // POINTERS work in a template without any restriction; only the
-    // LITERAL is refused here, and it says so at the place where it stands.
-    for sp in crate::fnval::spans_in(&tpl.decl.body) {
-        dg.error_note(
-            sp,
-            "a closure literal inside a generic function is not supported",
-            "round 58: pass the closure IN as a parameter of type 'fn(…)' \
-             instead of building it inside the template",
-        );
-    }
     let mut decl: FnDecl = tpl.decl.clone();
     decl.name = mangled.to_string();
     for p in decl.params.iter_mut() {
@@ -187,7 +178,11 @@ fn expand_fn(
         *r = subst_ty(r, &map, queue);
     }
     subst_block(&mut decl.body, &map, queue);
+    // r716: a closure literal inside a template: every instance gets fresh
+    // closure ids (one generated function + capture class per copy).
+    FRESH_LAMBDA.with(|f| f.set(true));
     renumber_block(&mut decl.body, next_id);
+    FRESH_LAMBDA.with(|f| f.set(false));
     prog.funcs.push(decl);
 }
 
@@ -554,7 +549,13 @@ pub(crate) fn renumber_expr(e: &mut Expr, next: &mut u32) {
         ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::FloatF32(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
         // ROUND 70: the text literal carries its array literal inside.
         ExprKind::Text(_, inner) => renumber_expr(inner, next),
-        ExprKind::Lambda(d) => renumber_block(&mut d.body, next),
+        ExprKind::Lambda(d) => {
+            // r716: each instance of a template needs its OWN closure function
+            if FRESH_LAMBDA.with(|f| f.get()) {
+                d.id = crate::fnval::next_lambda_id();
+            }
+            renumber_block(&mut d.body, next)
+        }
         ExprKind::Unary(_, i) => renumber_expr(i, next),
         ExprKind::Binary(_, a, b) => {
             renumber_expr(a, next);

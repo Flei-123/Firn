@@ -3517,6 +3517,11 @@ fn basic_expr_at(p: *mut Parser) -> u32 {
     if a == A_KWFN {
         return lambda(p, false)
     }
+    // r715 (lambda.rs): `|x| expr` / `|a, b| { .. }` -- a `|` at the START of
+    // an operand cannot be anything else.
+    if a == A_PIPE || a == A_OROR {
+        return lambda_sugar(p, false)
+    }
     if a == A_KWSYSCALL {
         next_bump(p)
         expect(p, A_LPAREN)
@@ -3545,6 +3550,9 @@ fn basic_expr_at(p: *mut Parser) -> u32 {
                 // ROUND 58: `gc fn(...) { ... }` -- the capturing closure.
                 if actual(p, A_KWFN) {
                     return lambda(p, true)
+                }
+                if actual(p, A_PIPE) || actual(p, A_OROR) {
+                    return lambda_sugar(p, true)
                 }
                 // Round GAPS (gc.rs::hook_primary): `gc module.Class { ... }`.
                 if actual(p, A_IDENT) && kind(p, 1) == A_DOT && kind(p, 2) == A_IDENT
@@ -4718,13 +4726,7 @@ fn lambda(p: *mut Parser, heap: bool) -> u32 {
     let b: *mut ast.Tree = par_tree(p)
     // The name: `__closure#<number>`. The `#` is no identifier character,
     // so no source text can ever write it.
-    rt.buf_clear(&(*p).scratch)
-    var cw: [u8; 10] = "__closure#"
-    rt.buf_push_bytes(&(*p).scratch, (&cw[0]) as u64, 10)
-    rt.buf_push_dec_u64(&(*p).scratch, ast.fn_count(b) as u64)
     let it: *mut intern.Interner = lexer.lex_names(lx(p))
-    let cname: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
-        rt.buf_len(&(*p).scratch)) as u32
     next_bump(p)
     if !expect(p, A_LPAREN) {
         return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
@@ -4768,6 +4770,13 @@ fn lambda(p: *mut Parser, heap: bool) -> u32 {
     let body: u32 = block(p)
     (*p).no_slit = saved
     loc_off(p)
+    // The name only now: a closure nested in the body took its number first.
+    rt.buf_clear(&(*p).scratch)
+    var cw: [u8; 10] = "__closure#"
+    rt.buf_push_bytes(&(*p).scratch, (&cw[0]) as u64, 10)
+    rt.buf_push_dec_u64(&(*p).scratch, ast.fn_count(b) as u64)
+    let cname: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
     ast.fn_add(b, cname, poff, plen + 1, ret, body, 0, 0, 0, 0, 0, 0, 0)
     var packed: u64 = 0
     if ret != ast.NOTHING {
@@ -4775,6 +4784,131 @@ fn lambda(p: *mut Parser, heap: bool) -> u32 {
     }
     if heap {
         packed = packed | 1
+    }
+    return ast.expr_new(b, ast.E_LAMBDA, cname, poff, plen, packed)
+}
+
+// r715 (compiler/src/lambda.rs) -- the lambda sugar `|x, y: T| [-> R] expr` or
+// `{ block }`. Untyped parameters get the type NOTHING and the lambda a mark
+// in `e_number` (LAM_* bits, see lamsugar.fi); `lamsugar.run` fills in the
+// types from the expected `fn(..)` type after the parse, before the type
+// check. The current token is the opening `|` (or `||`).
+fn lambda_sugar(p: *mut Parser, heap: bool) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    loc_on(p)
+    let poff: u32 = ast.param_start(b)
+    var infer: bool = false
+    if actual(p, A_OROR) {
+        next_bump(p)
+    } else {
+        next_bump(p)
+        while !actual(p, A_PIPE) && !at_end(p) {
+            if !actual(p, A_IDENT) {
+                complain(p)
+                break
+            }
+            let name: u32 = tok_nr(p, 0)
+            let pat: u64 = at_pos(p, 0)
+            next_bump(p)
+            var t: u32 = ast.NOTHING
+            if actual(p, A_COLON) {
+                next_bump(p)
+                t = ty(p)
+                if t == ast.NOTHING {
+                    break
+                }
+            } else {
+                infer = true
+            }
+            let pidx: u32 = ast.param_add(b, name, t)
+            ast.param_pos_set(b, pidx, pat)
+            loc_add(p, name)
+            if !eat(p, A_COMMA) {
+                break
+            }
+        }
+        expect(p, A_PIPE)
+    }
+    let plen: u32 = ast.param_start(b) - poff
+    var ret: u32 = ast.NOTHING
+    if actual(p, A_ARROW) {
+        next_bump(p)
+        ret = ty(p)
+        if ret == ast.NOTHING {
+            loc_off(p)
+            return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+        }
+    }
+    var uw: [u8; 2] = "u8"
+    let unr: u32 = intern.intern_number(it, (&uw[0]) as u64, 2) as u32
+    let uty: u32 = ast.ty_new(b, ast.T_NAME, unr, 0)
+    let pty: u32 = ast.ty_new(b, ast.T_PTR, uty, 1)
+    rt.buf_clear(&(*p).scratch)
+    var ew: [u8; 6] = "__env#"
+    rt.buf_push_bytes(&(*p).scratch, (&ew[0]) as u64, 6)
+    let ename: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+    ast.param_add(b, ename, pty)
+    loc_add(p, ename)
+    var mark: u64 = 0
+    var body: u32 = 0
+    if actual(p, A_LBRACE) {
+        let saved: usize = (*p).no_slit
+        (*p).no_slit = 0
+        body = block(p)
+        (*p).no_slit = saved
+        if ret == ast.NOTHING {
+            mark = mark | 2305843009213693952
+            infer = true
+        }
+    } else {
+        let epos: u64 = at_pos(p, 0)
+        let ex: u32 = expr(p)
+        var own: Vec[u32] = vec_new[u32]()
+        var hi: usize = 0
+        while hi < vec_len[u32](&(*p).hoist) {
+            vec_push[u32](&own, vec_at[u32](&(*p).hoist, hi))
+            hi = hi + 1
+        }
+        vec_clear[u32](&(*p).hoist)
+        var sk: u32 = ast.S_RET
+        if ret == ast.NOTHING {
+            sk = ast.S_EXPR
+            mark = mark | 4611686018427387904
+            infer = true
+        }
+        let st: u32 = ast.stmt_new(b, sk, ex, 0, 0, 0)
+        ast.stmt_pos_set(b, st, epos)
+        vec_push[u32](&own, st)
+        let off: u32 = ast.slist_start(b)
+        var i: usize = 0
+        while i < vec_len[u32](&own) {
+            ast.slist_add(b, vec_at[u32](&own, i))
+            i = i + 1
+        }
+        body = ast.block_new(b, off, vec_len[u32](&own) as u32)
+        ast.block_end_set(b, body, epos)
+        vec_free[u32](&own)
+    }
+    loc_off(p)
+    // The name only now: a lambda nested in the body took its number first.
+    rt.buf_clear(&(*p).scratch)
+    var cw: [u8; 10] = "__closure#"
+    rt.buf_push_bytes(&(*p).scratch, (&cw[0]) as u64, 10)
+    rt.buf_push_dec_u64(&(*p).scratch, ast.fn_count(b) as u64)
+    let cname: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+    ast.fn_add(b, cname, poff, plen + 1, ret, body, 0, 0, 0, 0, 0, 0, 0)
+    var packed: u64 = mark
+    if ret != ast.NOTHING {
+        packed = packed | ((ret as u64 + 1) << 1)
+    }
+    if heap {
+        packed = packed | 1
+    }
+    if infer {
+        packed = packed | 1152921504606846976
     }
     return ast.expr_new(b, ast.E_LAMBDA, cname, poff, plen, packed)
 }

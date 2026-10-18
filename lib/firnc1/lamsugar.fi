@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/firnc1/lamsugar.fi -- r715 LAMBDA SUGAR, the type resolution (twin of
+// compiler/src/lambda.rs; docs/CLOSURES.md "Lambda sugar").
+//
+//   sort_stable_by[T](v, |a, b| (*a).x < (*b).x)     expression body
+//   apply(|x| { return x + 1 })                      block body
+//   let f: fn(i32) -> i32 = |x| x * 2                expected type from the let
+//   let g = |x: i32, y: i32| -> i32 x + y            fully typed, no context
+//   try gc |x| x + n                                 capturing form
+//
+// The parser (`lambda_sugar` in parser.fi) builds the ordinary closure
+// function with untyped parameters (type NOTHING) and marks the `E_LAMBDA`
+// node in `e_number`:
+//   bit 60  some type is still open (untyped parameter or no result type)
+//   bit 61  block body without result type   (`|x| { .. }`)
+//   bit 62  expression body without result type (`|x| expr`)
+// `run` finds the expected `fn(..) -> R` type -- parameter of a plain call
+// (also `try` in front), `let x: T = ..` -- copies the parameter types and
+// the result type into the closure function and turns an expression body
+// into `return <expr>`. After that the lambda is exactly `fn(x: T) -> R {..}`
+// and no later stage knows about the sugar. A lambda without a usable
+// expected type is an error (counted; the caller reports).
+//
+// Not mirrored (stage 0 only): method calls, struct literal fields, `return`.
+
+import rt
+import vec
+import intern
+import ast
+import err
+
+export { run }
+
+const NONE: u32 = 4294967295
+const LAM_OPEN: u64 = 1152921504606846976
+const LAM_BLK: u64 = 2305843009213693952
+const LAM_EXPR: u64 = 4611686018427387904
+
+fn is_open(b: *mut ast.Tree, e: u32) -> bool {
+    if ast.e_kind(b, e) != ast.E_LAMBDA {
+        return false
+    }
+    return (ast.e_number(b, e) & LAM_OPEN) != 0
+}
+
+// The lambda behind `e`, looking through one `try`: NONE if `e` is none.
+fn lambda_of(b: *mut ast.Tree, it: *mut intern.Interner, e: u32) -> u32 {
+    if ast.e_kind(b, e) == ast.E_LAMBDA {
+        return e
+    }
+    if ast.e_kind(b, e) == ast.E_CALL && ast.e_number(b, e) == 0
+    && err.error_is_tryname(it, ast.e_a(b, e)) && ast.e_c(b, e) == 1 {
+        let inner: u32 = ast.child_at(b, ast.e_b(b, e))
+        if ast.e_kind(b, inner) == ast.E_LAMBDA {
+            return inner
+        }
+    }
+    return NONE
+}
+
+// Fill in lambda `lam` from the expected type node `pt`. Returns the number
+// of errors (0 or 1).
+fn resolve(b: *mut ast.Tree, fmap: *mut Vec[u32], lam: u32, pt: u32) -> u32 {
+    if pt == ast.NOTHING || ast.t_kind(b, pt) != ast.T_FN {
+        return 0
+    }
+    let name: u32 = ast.e_a(b, lam)
+    if (name as usize) >= vec_len[u32](fmap) {
+        return 0
+    }
+    let fi: u32 = vec_at[u32](fmap, name as usize)
+    if fi == NONE {
+        return 0
+    }
+    let tb: u64 = ast.t_b(b, pt)
+    let coff: u32 = (tb >> 32) as u32
+    let ccnt: u32 = (tb & 4294967295) as u32
+    let nump: u32 = ast.fn_plen(b, fi as usize) - 1
+    var num: u64 = ast.e_number(b, lam)
+    if nump != ccnt {
+        // wrong number of parameters: leave the mark, `run` counts it
+        return 0
+    }
+    let poff: u32 = ast.fn_poff(b, fi as usize)
+    var i: u32 = 0
+    while i < nump {
+        if ast.param_ty(b, poff + i) == ast.NOTHING {
+            ast.param_ty_set(b, poff + i, ast.child_at(b, coff + i))
+        }
+        i = i + 1
+    }
+    if (num & (LAM_BLK | LAM_EXPR)) != 0 {
+        let rt_node: u32 = ast.t_a(b, pt)
+        ast.fn_ret_set(b, fi as usize, rt_node)
+        if (num & LAM_EXPR) != 0 && rt_node != ast.NOTHING {
+            // expression body -> `return <expr>`
+            let blk: u32 = ast.fn_body(b, fi as usize)
+            if ast.b_len(b, blk) > 0 {
+                let last: u32 = ast.slist_at(b, ast.b_off(b, blk) + ast.b_len(b, blk) - 1)
+                if ast.s_kind(b, last) == ast.S_EXPR {
+                    ast.s_kind_set(b, last, ast.S_RET)
+                }
+            }
+        }
+        num = num & 1
+        if rt_node != ast.NOTHING {
+            num = num | ((rt_node as u64 + 1) << 1)
+        }
+    } else {
+        num = num & ((LAM_OPEN | LAM_BLK | LAM_EXPR) ^ 18446744073709551615)
+    }
+    ast.e_number_set(b, lam, num)
+    return 0
+}
+
+// Resolves every lambda that sits in a place with a known expected type and
+// counts the ones that remain open. Cheap when the program uses no sugar.
+fn run(b: *mut ast.Tree, it: *mut intern.Interner) -> u32 {
+    let total: usize = ast.expr_count(b)
+    var any: bool = false
+    var i: usize = 0
+    while i < total {
+        if is_open(b, i as u32) {
+            any = true
+            break
+        }
+        i = i + 1
+    }
+    if !any {
+        return 0
+    }
+    // interned name -> function number
+    let nf: usize = ast.fn_count(b)
+    var maxn: u32 = 0
+    var f: usize = 0
+    while f < nf {
+        if ast.fn_name(b, f) > maxn {
+            maxn = ast.fn_name(b, f)
+        }
+        f = f + 1
+    }
+    var fmap: Vec[u32] = vec_new[u32]()
+    var z: usize = 0
+    while z <= (maxn as usize) {
+        vec_push[u32](&fmap, NONE)
+        z = z + 1
+    }
+    f = 0
+    while f < nf {
+        vec_set[u32](&fmap, ast.fn_name(b, f) as usize, f as u32)
+        f = f + 1
+    }
+    var errors: u32 = 0
+    // arguments of plain calls
+    var e: usize = 0
+    while e < total {
+        if ast.e_kind(b, e as u32) == ast.E_CALL && ast.e_number(b, e as u32) == 0 {
+            let name: u32 = ast.e_a(b, e as u32)
+            if (name as usize) < vec_len[u32](&fmap) && !err.error_is_tryname(it, name) {
+                let fi: u32 = vec_at[u32](&fmap, name as usize)
+                if fi != NONE {
+                    let off: u32 = ast.e_b(b, e as u32)
+                    let cnt: u32 = ast.e_c(b, e as u32)
+                    let pof: u32 = ast.fn_poff(b, fi as usize)
+                    let pln: u32 = ast.fn_plen(b, fi as usize)
+                    var k: u32 = 0
+                    while k < cnt && k < pln {
+                        let lam: u32 = lambda_of(b, it, ast.child_at(b, off + k))
+                        if lam != NONE && is_open(b, lam) {
+                            errors = errors + resolve(b, &fmap, lam, ast.param_ty(b, pof + k))
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+        }
+        e = e + 1
+    }
+    // `let x: T = lambda` / `var x: T = lambda`
+    let ns: usize = vec_len[u32](&(*b).s_kind)
+    var s: usize = 0
+    while s < ns {
+        let k2: u32 = ast.s_kind(b, s as u32)
+        if (k2 == ast.S_LET || k2 == ast.S_VAR) && ast.s_b(b, s as u32) != ast.NOTHING {
+            let lam: u32 = lambda_of(b, it, ast.s_c(b, s as u32))
+            if lam != NONE && is_open(b, lam) {
+                errors = errors + resolve(b, &fmap, lam, ast.s_b(b, s as u32))
+            }
+        }
+        s = s + 1
+    }
+    vec_free[u32](&fmap)
+    // whatever is still open has no usable expected type
+    e = 0
+    while e < total {
+        if is_open(b, e as u32) {
+            errors = errors + 1
+        }
+        e = e + 1
+    }
+    return errors
+}
