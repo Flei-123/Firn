@@ -1,0 +1,711 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/webtheme.fi -- THE WEB APP'S LOOK AS A fUi THEME: tokens, type scale, dark / light / system, elevation, gradient.
+//
+// Goal: a phone UI built in fUi looks like the mobile web app (jarvis.fleitec.com, public/style.css) -- same colours, radii, shadows,
+// type steps. The numbers are NOT typed in here: tools/fui/gen_webtheme.py reads style.css and writes lib/fui/webtheme_gen.fi
+// (`python3 tools/fui/gen_webtheme.py --check` fails when the CSS moved on). This file turns them into
+//
+//   palette(flavor, dark)          the colours of one look as a plain struct (pure, testable); FLAVOR_FLEITEC / FLAVOR_CLAUDE
+//   install(a, mode)               ONCE after the window exists: colours + shape + the style-sheet classes below. MODE_DARK / LIGHT / SYSTEM
+//   set_mode(a, mode)              live switch; MODE_SYSTEM follows set_system_dark(a, dark) / follow_syspref(a, sp)
+//   set_flavor(a, f), set_accent(a, rgb)
+//   text(a, s, ty) -> node         a label with one of the type steps TY_*  (wraps at the container width, starts at the left)
+//   style_for(ty), set_ty(a, n, ty), ty_px / ty_weight / ty_line_pm / ty_tracking / text_px   the type table
+//   K_CARD / K_PILL / K_BUBBLE / K_HEADER   classes (scene.node_add_class); K_TY(ty) per type step
+//   shadow_*, set_shadow, elev_level   the three web shadows as fUi elevation
+//   contrast_failures(flavor, dark)  how many text pairs of a palette fall under 4.5 : 1 (tests/webtheme_main.fi must see 0)
+//
+// THE WEB HAS NO LIGHT THEME. The light palette is derived: same hue family, same radii, same shadows (weaker), and every text
+// colour is darkened step by step until it reaches 4.5 : 1 on the surfaces it sits on. The dark palette is the CSS, bit for bit.
+// Exception on purpose: white on the accent button (#send) is the web's own pair (3.6 : 1) -- kept in dark for 1 : 1, tested >= 3 : 1.
+//
+// WEIGHTS. The painter has static faces only (r141 variable fonts open, r252 weight faces): 500/600 are not drawn as such.
+// `ty_weight` is the web value, `ty_weight_render` snaps 600 -> 700 so semibold reads as strong (faux bold, or the 700 face).
+// The text scale (theme_set_text_scale) moves every step: `text_px(a, ty)` = design size x UI scale x text scale.
+//
+// One window per process (module state: mode, flavor, accent, system flag, first rule index).
+import fui.app
+import fui.scene
+import fui.style
+import fui.sheet
+import fui.theme
+import fui.flex
+import fui.syspref
+import fui.webtheme_gen
+
+export {
+    MODE_DARK, MODE_LIGHT, MODE_SYSTEM, FLAVOR_FLEITEC, FLAVOR_CLAUDE,
+    Pal, palette, over, fit_text, contrast_failures, pal_contrast_min, pal_accent_min,
+    install, set_mode, mode, set_flavor, flavor, set_accent, set_system_dark, follow_syspref, is_dark, apply_palette, current_palette, rules_installed,
+    TY_BRAND, TY_TITLE, TY_SECTION, TY_BODY, TY_BODY_STRONG, TY_CAPTION, TY_MONO, TY_COUNT,
+    ty_px, ty_weight, ty_weight_render, ty_line_pm, ty_line_px, ty_tracking, ty_token, ty_font, text_px, style_for, text, set_ty, K_TY,
+    K_CARD, K_PILL, K_BUBBLE, K_HEADER, K_SH_SM, K_SH_MD, K_SH_LG, RULE_COUNT,
+    S4, S6, S8, S10, S12, S16, S24, R_SM, R_MD, R_CARD, R_PILL, R_BUBBLE, R_BUBBLE_TAIL, H_HEADER, H_ICON_BTN, H_ICON_BTN_DESKTOP, H_SEND, H_TOUCH_MIN, PX_PHONE_BODY,
+    SH_SM, SH_MD, SH_LG, shadow_dy, shadow_blur, shadow_alpha, set_shadow, elev_level, bubble_style,
+}
+
+const MODE_DARK: u32 = 0
+const MODE_LIGHT: u32 = 1
+const MODE_SYSTEM: u32 = 2
+const FLAVOR_FLEITEC: u32 = 0
+const FLAVOR_CLAUDE: u32 = 1
+
+// ---- spacing scale (CSS px = design points); the web uses exactly these gaps and paddings
+const S4: usize = 4
+const S6: usize = 6
+const S8: usize = 8
+const S10: usize = 10
+const S12: usize = 12
+const S16: usize = 16
+const S24: usize = 24
+// ---- shape and heights (from the CSS via webtheme_gen)
+const R_SM: usize = webtheme_gen.CSS_RADIUS_SM
+const R_MD: usize = webtheme_gen.CSS_RADIUS
+const R_CARD: usize = webtheme_gen.CSS_RADIUS_CARD
+const R_PILL: usize = webtheme_gen.CSS_RADIUS_PILL
+const R_BUBBLE: usize = webtheme_gen.CSS_BUBBLE_R
+const R_BUBBLE_TAIL: usize = webtheme_gen.CSS_BUBBLE_R_TAIL
+const H_HEADER: usize = webtheme_gen.CSS_HEADER_H
+const H_ICON_BTN: usize = webtheme_gen.CSS_ICON_BTN
+const H_ICON_BTN_DESKTOP: usize = webtheme_gen.CSS_ICON_BTN_DESKTOP
+const H_SEND: usize = webtheme_gen.CSS_SEND_BTN
+const H_TOUCH_MIN: usize = 44 // platform guideline for a touch target (the web's 36-38 px buttons sit under it; hit areas should be padded)
+const PX_PHONE_BODY: usize = webtheme_gen.CSS_BODY_PX
+
+// ============================================================ PALETTE
+//
+// All colours are 0xRRGGBB (what theme.Colors holds). Translucent web tokens (rgba(255,255,255,.08) ...) are flattened over the
+// surface they lie on, with the same rounding the browser uses (alpha out of 255).
+struct Pal {
+    bg: u32,
+    sidebar: u32,
+    panel: u32,
+    panel_up: u32,
+    line: u32,
+    field_bg: u32,
+    field_line: u32,
+    hover: u32,
+    press: u32,
+    txt: u32,
+    dim: u32,
+    accent: u32,
+    accent2: u32,
+    on_accent: u32,
+    warn: u32,
+    ok: u32,
+    warning: u32,
+    sel: u32,
+    ring: u32,
+    bubble0: u32,
+    bubble1: u32,
+    shadow_scale: usize, // per cent of the web shadow alpha (100 dark, weaker on light)
+    dark: bool,
+}
+
+const WHITE: u32 = 0xffffff
+const BLACK: u32 = 0x000000
+const FF: u32 = 255
+
+fn ch(c: u32, sh: u32) -> u32 {
+    return (c >> sh) & FF
+}
+
+fn over_ch(f: u32, a: u32, b: u32) -> u32 {
+    return (f * a + b * (FF - a) + 127) / FF
+}
+
+// A colour `fg` with alpha `a` (0..255) lying on the opaque colour `bg`.
+fn over(fg: u32, a: u32, bg: u32) -> u32 {
+    let r: u32 = over_ch(ch(fg, 16), a, ch(bg, 16))
+    let g: u32 = over_ch(ch(fg, 8), a, ch(bg, 8))
+    let b: u32 = over_ch(ch(fg, 0), a, ch(bg, 0))
+    return (r << 16) | (g << 8) | b
+}
+
+// Step `c` away from the surfaces `b1`, `b2` (towards black on a light page, towards white on a dark one) until both pairs reach 4.5 : 1.
+fn fit_text(c: u32, b1: u32, b2: u32, dark: bool) -> u32 {
+    var v: u32 = c
+    var n: usize = 0
+    while n < 60 && (theme.contrast(v, b1) < 4.5 || theme.contrast(v, b2) < 4.5) {
+        if dark {
+            v = theme.mix(v, WHITE, 40)
+        } else {
+            v = theme.mix(v, BLACK, 40)
+        }
+        n = n + 1
+    }
+    return v
+}
+
+#[no_gc]
+fn zero_pal() -> Pal {
+    return Pal { bg: 0, sidebar: 0, panel: 0, panel_up: 0, line: 0, field_bg: 0, field_line: 0, hover: 0, press: 0, txt: 0, dim: 0, accent: 0,
+        accent2: 0, on_accent: 0, warn: 0, ok: 0, warning: 0, sel: 0, ring: 0, bubble0: 0, bubble1: 0, shadow_scale: 100, dark: true }
+}
+
+static mut G_ACCENT: u32 = 0 // 0 = the web's accent
+
+// The dark palette of one flavour: the CSS tokens, translucent ones flattened.
+fn dark_pal(fl: u32) -> Pal {
+    var p: Pal = zero_pal()
+    p.dark = true
+    if fl == FLAVOR_CLAUDE {
+        p.bg = webtheme_gen.CLAUDE_BG
+        p.sidebar = webtheme_gen.CLAUDE_BG_SIDEBAR
+        p.panel = webtheme_gen.CLAUDE_PANEL
+        p.line = over(webtheme_gen.CLAUDE_LINE, webtheme_gen.CLAUDE_LINE_A, p.bg)
+        p.field_bg = over(webtheme_gen.CLAUDE_FIELD_BG, webtheme_gen.CLAUDE_FIELD_BG_A, p.panel)
+        p.field_line = over(webtheme_gen.CLAUDE_FIELD_LINE, webtheme_gen.CLAUDE_FIELD_LINE_A, p.bg)
+        p.hover = over(webtheme_gen.CLAUDE_BG_HOVER, webtheme_gen.CLAUDE_BG_HOVER_A, p.panel)
+        p.txt = webtheme_gen.CLAUDE_TXT
+        p.dim = webtheme_gen.CLAUDE_DIM
+        p.accent = webtheme_gen.CLAUDE_ACCENT
+        p.accent2 = webtheme_gen.CLAUDE_ACCENT2
+        p.warn = webtheme_gen.CLAUDE_WARN
+        p.ok = webtheme_gen.CLAUDE_OK
+        p.ring = over(webtheme_gen.CLAUDE_RING, webtheme_gen.CLAUDE_RING_A, p.panel)
+        p.bubble0 = webtheme_gen.CLAUDE_USER_GRAD_G0
+        p.bubble1 = webtheme_gen.CLAUDE_USER_GRAD_G1
+    } else {
+        p.bg = webtheme_gen.FLEITEC_BG
+        p.sidebar = webtheme_gen.FLEITEC_BG_SIDEBAR
+        p.panel = webtheme_gen.FLEITEC_PANEL
+        p.line = over(webtheme_gen.FLEITEC_LINE, webtheme_gen.FLEITEC_LINE_A, p.bg)
+        p.field_bg = over(webtheme_gen.FLEITEC_FIELD_BG, webtheme_gen.FLEITEC_FIELD_BG_A, p.panel)
+        p.field_line = over(webtheme_gen.FLEITEC_FIELD_LINE, webtheme_gen.FLEITEC_FIELD_LINE_A, p.bg)
+        p.hover = over(webtheme_gen.FLEITEC_BG_HOVER, webtheme_gen.FLEITEC_BG_HOVER_A, p.panel)
+        p.txt = webtheme_gen.FLEITEC_TXT
+        p.dim = webtheme_gen.FLEITEC_DIM
+        p.accent = webtheme_gen.FLEITEC_ACCENT
+        p.accent2 = webtheme_gen.FLEITEC_ACCENT2
+        p.warn = webtheme_gen.FLEITEC_WARN
+        p.ok = webtheme_gen.FLEITEC_OK
+        p.ring = over(webtheme_gen.FLEITEC_RING, webtheme_gen.FLEITEC_RING_A, p.panel)
+        p.bubble0 = webtheme_gen.FLEITEC_USER_GRAD_G0
+        p.bubble1 = webtheme_gen.FLEITEC_USER_GRAD_G1
+    }
+    p.panel_up = theme.mix(p.panel, WHITE, 25)
+    p.press = theme.mix(p.panel, p.bg, 500)
+    // text colours the CSS gets under 4.5 : 1 on a raised surface (claude: #ff5d5d on #30302e is 4.39) are lifted just enough; all others stay
+    p.warn = fit_text(p.warn, p.panel_up, p.panel, true)
+    p.ok = fit_text(p.ok, p.panel_up, p.panel, true)
+    p.dim = fit_text(p.dim, p.panel_up, p.panel, true)
+    p.on_accent = WHITE // #send { color: #fff }
+    p.warning = 0xffb020
+    p.sel = p.ring
+    return p
+}
+
+// The light palette: hand-set surfaces in the hue family of the dark ones (fleitec: blue-grey, hue ~230; claude: warm paper), text
+// colours fitted to 4.5 : 1. The accent is darkened until white on it (the button label) and itself as text on the page both reach 4.5.
+fn light_pal(fl: u32) -> Pal {
+    var p: Pal = zero_pal()
+    p.dark = false
+    p.shadow_scale = 40
+    let d: Pal = dark_pal(fl)
+    var raw_accent: u32 = d.accent
+    if fl == FLAVOR_CLAUDE {
+        p.bg = 0xf5f4ef
+        p.sidebar = 0xebeae3
+        p.panel = 0xffffff
+        p.panel_up = 0xfaf9f5
+        p.line = 0xe3e1d8
+        p.field_line = 0xd2cfc3
+        p.field_bg = 0xf0eee7
+        p.hover = 0xeceae2
+        p.press = 0xdfdcd2
+        p.txt = 0x2a2926
+        p.dim = 0x6b6a63
+    } else {
+        p.bg = 0xf4f6fc
+        p.sidebar = 0xeaeef8
+        p.panel = 0xffffff
+        p.panel_up = 0xf8f9fd
+        p.line = 0xe0e4f0
+        p.field_line = 0xcdd3e6
+        p.field_bg = 0xeef1f9
+        p.hover = 0xe8ecf7
+        p.press = 0xdce2f2
+        p.txt = 0x14172b
+        p.dim = 0x5b6280
+    }
+    if G_ACCENT != 0 {
+        raw_accent = G_ACCENT
+    }
+    // the accent: text on bg / panel / sidebar AND the white label on a filled accent button
+    var ac: u32 = raw_accent
+    var n: usize = 0
+    while n < 60 && (theme.contrast(ac, p.bg) < 4.5 || theme.contrast(ac, p.sidebar) < 4.5 || theme.contrast(WHITE, ac) < 4.5) {
+        ac = theme.mix(ac, BLACK, 40)
+        n = n + 1
+    }
+    p.accent = ac
+    p.accent2 = theme.mix(ac, WHITE, 250)
+    p.on_accent = WHITE
+    p.warn = fit_text(d.warn, p.bg, p.sidebar, false)
+    p.ok = fit_text(d.ok, p.bg, p.sidebar, false)
+    p.dim = fit_text(p.dim, p.sidebar, p.field_bg, false)
+    p.txt = fit_text(p.txt, p.sidebar, p.field_bg, false)
+    p.warning = 0xb26a00
+    p.ring = theme.mix(p.panel, ac, 500)
+    p.sel = theme.mix(p.panel, ac, 280)
+    p.bubble0 = theme.mix(WHITE, raw_accent, 120)
+    p.bubble1 = theme.mix(WHITE, raw_accent, 220)
+    return p
+}
+
+fn palette(fl: u32, dark: bool) -> Pal {
+    var p: Pal = zero_pal()
+    if dark {
+        p = dark_pal(fl)
+        if G_ACCENT != 0 {
+            p.accent = G_ACCENT
+            p.accent2 = theme.mix(G_ACCENT, WHITE, 250)
+            p.ring = over(G_ACCENT, 128, p.panel)
+            p.sel = p.ring
+            p.accent = fit_text(G_ACCENT, p.bg, p.sidebar, true)
+        }
+    } else {
+        p = light_pal(fl)
+    }
+    return p
+}
+
+// The smallest contrast of the pairs a screen really draws (x100, i.e. 450 = 4.5 : 1).
+fn pal_contrast_min(p: *mut Pal) -> i64 {
+    var mn: f64 = 99.0
+    var k: f64 = 0.0
+    // text on the three surfaces and the raised / field ones
+    k = theme.contrast((*p).txt, (*p).bg)
+    if k < mn { mn = k }
+    k = theme.contrast((*p).txt, (*p).panel)
+    if k < mn { mn = k }
+    k = theme.contrast((*p).txt, (*p).sidebar)
+    if k < mn { mn = k }
+    k = theme.contrast((*p).txt, (*p).panel_up)
+    if k < mn { mn = k }
+    k = theme.contrast((*p).txt, (*p).field_bg)
+    if k < mn { mn = k }
+    k = theme.contrast((*p).txt, (*p).bubble0)
+    if k < mn { mn = k }
+    k = theme.contrast((*p).txt, (*p).bubble1)
+    if k < mn { mn = k }
+    // muted text
+    k = theme.contrast((*p).dim, (*p).bg)
+    if k < mn { mn = k }
+    k = theme.contrast((*p).dim, (*p).panel)
+    if k < mn { mn = k }
+    k = theme.contrast((*p).dim, (*p).sidebar)
+    if k < mn { mn = k }
+    // warn, ok as text
+    k = theme.contrast((*p).warn, (*p).bg)
+    if k < mn { mn = k }
+    k = theme.contrast((*p).warn, (*p).panel)
+    if k < mn { mn = k }
+    k = theme.contrast((*p).ok, (*p).bg)
+    if k < mn { mn = k }
+    k = theme.contrast((*p).ok, (*p).panel)
+    if k < mn { mn = k }
+    return (mn * 100.0) as i64
+}
+
+// The accent as text on bg / panel (x100). The web's own accents are brand / link colours (bold, large): the dark look keeps them as
+// they are (claude's #c96442 on #262624 is 3.6 : 1) and the test asks 3 : 1 there; every derived colour is held to 4.5 : 1.
+fn pal_accent_min(p: *mut Pal) -> i64 {
+    var k: f64 = theme.contrast((*p).accent, (*p).bg)
+    let k2: f64 = theme.contrast((*p).accent, (*p).panel)
+    if k2 < k { k = k2 }
+    return (k * 100.0) as i64
+}
+
+// Pairs under 4.5 : 1 in one palette (0 expected). The label on a filled accent button counts at 3 : 1 in the dark look (the web's own
+// white-on-#2f86ff, large bold UI text) and at 4.5 : 1 in the light one (derived, so fitted). The accent as text: see pal_accent_min.
+fn contrast_failures(fl: u32, dark: bool) -> usize {
+    var p: Pal = palette(fl, dark)
+    var bad: usize = 0
+    if pal_contrast_min(&p) < 450 { bad = bad + 1 }
+    if dark {
+        if pal_accent_min(&p) < 300 { bad = bad + 1 }
+    } else {
+        if pal_accent_min(&p) < 450 { bad = bad + 1 }
+    }
+    let ka: f64 = theme.contrast(p.on_accent, p.accent)
+    if dark {
+        if ka < 3.0 { bad = bad + 1 }
+    } else {
+        if ka < 4.5 { bad = bad + 1 }
+    }
+    return bad
+}
+
+// ============================================================ SHADOWS
+const SH_SM: usize = 0
+const SH_MD: usize = 1
+const SH_LG: usize = 2
+
+fn shadow_dy(i: usize) -> i64 {
+    if i == SH_SM { return webtheme_gen.FLEITEC_SHADOW_SM_Y }
+    if i == SH_MD { return webtheme_gen.FLEITEC_SHADOW_Y }
+    return webtheme_gen.FLEITEC_SHADOW_LG_Y
+}
+
+fn shadow_blur(i: usize) -> usize {
+    if i == SH_SM { return webtheme_gen.FLEITEC_SHADOW_SM_BLUR }
+    if i == SH_MD { return webtheme_gen.FLEITEC_SHADOW_BLUR }
+    return webtheme_gen.FLEITEC_SHADOW_LG_BLUR
+}
+
+// Alpha 0..255 of the web shadow; the light look shows it at 40 % (the web shadows are made for a dark page).
+fn shadow_alpha(i: usize, dark: bool) -> usize {
+    var a: usize = webtheme_gen.FLEITEC_SHADOW_LG_A as usize
+    if i == SH_SM { a = webtheme_gen.FLEITEC_SHADOW_SM_A as usize }
+    if i == SH_MD { a = webtheme_gen.FLEITEC_SHADOW_A as usize }
+    if dark { return a }
+    return a * 40 / 100
+}
+
+// The box-shadow of the style carries the web values (dy, blur, black, alpha).
+fn set_shadow(st: style.Style, i: usize, dark: bool) -> style.Style {
+    return style.style_set_box_shadow(st, shadow_dy(i), shadow_blur(i), BLACK, shadow_alpha(i, dark))
+}
+
+// The fUi elevation level (theme.elev_*) closest to a web shadow by blur: sm -> 1 (blur 4), md -> 3 (16), lg -> 4 (32). For code that
+// paints with render.draw_elevation_at(c, x, y, w, h, r, level).
+fn elev_level(i: usize) -> usize {
+    let b: usize = shadow_blur(i)
+    var best: usize = 1
+    var bd: usize = 1000
+    var lv: usize = 1
+    while lv <= theme.ELEV_MAX {
+        let e: usize = theme.elev_blur(lv)
+        var d: usize = 0
+        if e > b { d = e - b } else { d = b - e }
+        if d < bd {
+            bd = d
+            best = lv
+        }
+        lv = lv + 1
+    }
+    return best
+}
+
+// The user bubble: `linear-gradient(135deg, ...)` as a style (needs the Pal for the colours).
+fn bubble_style(p: *mut Pal) -> style.Style {
+    var st: style.Style = style.style_new()
+    st = style.style_set_bg_gradient(st, (*p).bubble0, 255, (*p).bubble1, 255, 1000, 1000)
+    st = style.style_set_radius(st, R_BUBBLE)
+    st = style.style_set_fg(st, style.color_token(style.TOK_TEXT))
+    return st
+}
+
+// ============================================================ TYPE SCALE
+//
+// web phone: body 14, pill / caption 12, brand 16 / 800 / +2 px, code 12.5. Steps between them: section 16, title 20.
+//   step          px   web weight  line   tracking  colour
+//   TY_BRAND      16   800         1.20   +2        accent
+//   TY_TITLE      20   700         1.25    0        text
+//   TY_SECTION    16   600         1.35    0        text
+//   TY_BODY       14   400         1.50    0        text
+//   TY_BODY_STRONG14   600         1.50    0        text
+//   TY_CAPTION    12   400         1.40    0        text_muted
+//   TY_MONO       13   400         1.45    0        text   (font slot 1; main font when no slot is set)
+const TY_BRAND: usize = 0
+const TY_TITLE: usize = 1
+const TY_SECTION: usize = 2
+const TY_BODY: usize = 3
+const TY_BODY_STRONG: usize = 4
+const TY_CAPTION: usize = 5
+const TY_MONO: usize = 6
+const TY_COUNT: usize = 7
+
+const K_TY_BASE: u32 = 0x7700
+
+fn K_TY(ty: usize) -> u32 { return K_TY_BASE + ty as u32 }
+
+fn ty_px(ty: usize) -> usize {
+    if ty == TY_BRAND { return (webtheme_gen.CSS_BRAND_PX_X100 + 50) / 100 }
+    if ty == TY_TITLE { return 20 }
+    if ty == TY_SECTION { return 16 }
+    if ty == TY_BODY || ty == TY_BODY_STRONG { return webtheme_gen.CSS_BODY_PX }
+    if ty == TY_CAPTION { return webtheme_gen.CSS_PILL_PX }
+    return 13
+}
+
+// The web weight (CSS font-weight).
+fn ty_weight(ty: usize) -> usize {
+    if ty == TY_BRAND { return webtheme_gen.CSS_BRAND_WEIGHT }
+    if ty == TY_TITLE { return 700 }
+    if ty == TY_SECTION || ty == TY_BODY_STRONG { return 600 }
+    return 400
+}
+
+// The weight handed to the painter: 600 -> 700 (no semibold face; see the header).
+fn ty_weight_render(ty: usize) -> usize {
+    let w: usize = ty_weight(ty)
+    if w >= 600 && w < 700 { return 700 }
+    return w
+}
+
+// Line height in per mille of the font size.
+fn ty_line_pm(ty: usize) -> usize {
+    if ty == TY_BRAND { return 1200 }
+    if ty == TY_TITLE { return 1250 }
+    if ty == TY_SECTION { return 1350 }
+    if ty == TY_BODY || ty == TY_BODY_STRONG { return 1500 }
+    if ty == TY_CAPTION { return 1400 }
+    return 1450
+}
+
+// The line box in design points (before the text scale).
+fn ty_line_px(ty: usize) -> usize {
+    return (ty_px(ty) * ty_line_pm(ty) + 500) / 1000
+}
+
+fn ty_tracking(ty: usize) -> i64 {
+    if ty == TY_BRAND { return webtheme_gen.CSS_BRAND_TRACKING }
+    return 0
+}
+
+fn ty_token(ty: usize) -> u32 {
+    if ty == TY_BRAND { return style.TOK_ACCENT }
+    if ty == TY_CAPTION { return style.TOK_TEXT_MUTED }
+    return style.TOK_TEXT
+}
+
+fn ty_font(ty: usize) -> usize {
+    if ty == TY_MONO { return 1 }
+    return 0
+}
+
+// Device points of a step: design size x UI scale x text scale (theme.theme_text_px).
+fn text_px(a: *mut app.App, ty: usize) -> usize {
+    return theme.theme_text_px(app.app_theme(a), ty_px(ty))
+}
+
+// The style of one step. Colour is a theme token, so it follows dark / light.
+fn style_for(ty: usize) -> style.Style {
+    var st: style.Style = style.style_new()
+    st = style.style_set_fg(st, style.color_token(ty_token(ty)))
+    st = style.style_set_font(st, ty_font(ty), ty_px(ty))
+    st = style.style_set_weight(st, ty_weight_render(ty) as u32)
+    st = style.style_set_line_height(st, ty_line_pm(ty))
+    st = style.style_set_tracking(st, ty_tracking(ty))
+    st = style.style_set_align(st, style.ALIGN_LEFT)
+    return st
+}
+
+// ============================================================ SHEET CLASSES
+const K_CARD: u32 = 0x7710
+const K_PILL: u32 = 0x7711
+const K_BUBBLE: u32 = 0x7712
+const K_HEADER: u32 = 0x7713
+const K_SH_SM: u32 = 0x7714
+const K_SH_MD: u32 = 0x7715
+const K_SH_LG: u32 = 0x7716
+
+const RULE_COUNT: usize = 14 // 7 type steps + card, pill, bubble, header, three shadows
+
+static mut G_MODE: u32 = 0
+static mut G_FLAVOR: u32 = 0
+static mut G_SYS_DARK: bool = true // the system default until a host says otherwise (the web app is dark)
+static mut G_DARK: bool = true
+static mut G_RULE0: usize = 0
+static mut G_RULES: bool = false
+
+fn tok(t: u32) -> u32 { return style.color_token(t) }
+
+fn rule_style(k: usize, p: *mut Pal) -> style.Style {
+    if k < TY_COUNT {
+        return style_for(k)
+    }
+    var st: style.Style = style.style_new()
+    if k == TY_COUNT {
+        // card: panel, hairline, radius 16, small shadow
+        st = style.style_set_bg(st, tok(style.TOK_SURFACE))
+        st = style.style_set_border(st, tok(style.TOK_SEPARATOR), 1)
+        st = style.style_set_radius(st, R_CARD)
+        st = set_shadow(st, SH_SM, (*p).dark)
+    } else if k == TY_COUNT + 1 {
+        // pill: outline, round, muted 12 px, padding 10 x 4
+        st = style.style_set_fg(st, tok(style.TOK_TEXT_MUTED))
+        st = style.style_set_font(st, 0, webtheme_gen.CSS_PILL_PX)
+        st = style.style_set_border(st, tok(style.TOK_SEPARATOR), 1)
+        st = style.style_set_radius(st, R_PILL)
+        st = style.style_set_pad(st, 10, 4)
+    } else if k == TY_COUNT + 2 {
+        st = bubble_style(p)
+    } else if k == TY_COUNT + 3 {
+        // header: the page colour, 56 high at least
+        st = style.style_set_bg(st, tok(style.TOK_BASE))
+        st = style.style_set_height(st, H_HEADER)
+    } else if k == TY_COUNT + 4 {
+        st = set_shadow(st, SH_SM, (*p).dark)
+    } else if k == TY_COUNT + 5 {
+        st = set_shadow(st, SH_MD, (*p).dark)
+    } else {
+        st = set_shadow(st, SH_LG, (*p).dark)
+    }
+    return st
+}
+
+fn rule_sel(k: usize) -> sheet.Sel {
+    if k < TY_COUNT { return sheet.sel_class(K_TY(k)) }
+    return sheet.sel_class(K_CARD + (k - TY_COUNT) as u32)
+}
+
+fn rules_installed() -> bool { return G_RULES }
+
+// Write all rules (first call) or refresh them (theme change: bubble gradient and shadow strength are literals, the rest are tokens).
+fn sync_rules(a: *mut app.App) {
+    var p: Pal = palette(G_FLAVOR, G_DARK)
+    var k: usize = 0
+    if !G_RULES {
+        G_RULE0 = sheet.sheet_count(&(*a).sh)
+        while k < RULE_COUNT {
+            let r: usize = sheet.sheet_rule(&(*a).sh, rule_sel(k), rule_style(k, &p))
+            k = k + 1
+        }
+        G_RULES = true
+        return
+    }
+    while k < RULE_COUNT {
+        sheet.decl_set_style(sheet.sheet_decl(&(*a).sh, G_RULE0 + k), rule_style(k, &p))
+        k = k + 1
+    }
+}
+
+// ============================================================ THEME
+fn resolve_dark() -> bool {
+    if G_MODE == MODE_DARK { return true }
+    if G_MODE == MODE_LIGHT { return false }
+    return G_SYS_DARK
+}
+
+fn is_dark() -> bool { return G_DARK }
+fn mode() -> u32 { return G_MODE }
+fn flavor() -> u32 { return G_FLAVOR }
+
+fn current_palette() -> Pal { return palette(G_FLAVOR, G_DARK) }
+
+// theme.Colors from a palette.
+fn apply_palette(a: *mut app.App, p: *mut Pal) {
+    let m: *mut theme.Theme = app.app_theme(a)
+    let f: *mut theme.Colors = theme.theme_colors(m)
+    (*f).base = (*p).bg
+    (*f).surface = (*p).panel
+    (*f).surface_raised = (*p).panel_up
+    (*f).button = (*p).panel
+    (*f).button_hover = (*p).hover
+    (*f).button_active = (*p).press
+    (*f).field = (*p).field_bg
+    (*f).field_focus = (*p).field_bg
+    (*f).border_col = (*p).field_line
+    (*f).separator = (*p).line
+    (*f).text = (*p).txt
+    (*f).text_muted = (*p).dim
+    (*f).text_disabled = (*p).dim
+    (*f).text_on_accent = (*p).on_accent
+    (*f).accent = (*p).accent
+    (*f).selection = (*p).sel
+    (*f).selection_text = (*p).txt
+    (*f).err_col = (*p).warn
+    (*f).warning = (*p).warning
+    (*f).success = (*p).ok
+}
+
+fn apply_shape(a: *mut app.App) {
+    let m: *mut theme.Theme = app.app_theme(a)
+    var s: theme.Shape = theme.shape_fluent()
+    s.r_window = R_CARD
+    s.r_panel = R_CARD
+    s.r_button = R_MD
+    s.r_field = R_MD
+    s.font = PX_PHONE_BODY
+    s.sp_xs = S4
+    s.sp_s = S8
+    s.sp_m = S12
+    s.sp_l = S16
+    s.pad_x = 14
+    s.pad_y = S8
+    s.gap = S8
+    s.ctrl_h = H_SEND
+    s.row = 48
+    theme.theme_set_shape(m, &s)
+}
+
+fn refresh(a: *mut app.App) {
+    G_DARK = resolve_dark()
+    var p: Pal = palette(G_FLAVOR, G_DARK)
+    // set_dark first (it resets the colours to the stock set and touches the host), then the web palette on top
+    app.set_dark(a, G_DARK)
+    apply_shape(a)
+    apply_palette(a, &p)
+    sync_rules(a)
+}
+
+// ONCE after the window exists (before or after the widgets are built). `mode_` = MODE_DARK / MODE_LIGHT / MODE_SYSTEM.
+fn install(a: *mut app.App, mode_: u32) {
+    G_MODE = mode_
+    refresh(a)
+}
+
+fn set_mode(a: *mut app.App, mode_: u32) {
+    G_MODE = mode_
+    refresh(a)
+}
+
+fn set_flavor(a: *mut app.App, fl: u32) {
+    if fl == FLAVOR_CLAUDE {
+        G_FLAVOR = FLAVOR_CLAUDE
+    } else {
+        G_FLAVOR = FLAVOR_FLEITEC
+    }
+    refresh(a)
+}
+
+// A different accent (0xRRGGBB, 0 = the web's own). The light look darkens it to reach 4.5 : 1.
+fn set_accent(a: *mut app.App, rgb: u32) {
+    G_ACCENT = rgb & 0xffffff
+    refresh(a)
+}
+
+// What the host says about the system (dark or light). MODE_SYSTEM follows it live.
+fn set_system_dark(a: *mut app.App, dark: bool) {
+    G_SYS_DARK = dark
+    if G_MODE == MODE_SYSTEM {
+        refresh(a)
+    }
+}
+
+fn follow_syspref(a: *mut app.App, sp: *mut syspref.SysPref) {
+    if (*sp).dark_known {
+        set_system_dark(a, (*sp).dark)
+    }
+}
+
+// ============================================================ TEXT NODE
+// A label with one type step: wraps at the width its container gives it, starts at the left edge. The node takes the step's class
+// (colour, size, weight, line height, tracking), so a theme switch or a text scale change needs no rebuild.
+fn text(a: *mut app.App, s: str, ty: usize) -> usize {
+    let n: usize = app.label(a, s, 0)
+    if n == app.NONE {
+        return n
+    }
+    let sc: *mut scene.Scene = app.app_scene(a)
+    scene.node_set_text_wrap(sc, n, 64)
+    scene.node_set_align_self(sc, n, flex.AL_STRETCH)
+    scene.node_add_class(sc, n, K_TY(ty))
+    return n
+}
+
+// Move an existing node to another type step.
+fn set_ty(a: *mut app.App, n: usize, ty: usize) {
+    if n == app.NONE { return }
+    let sc: *mut scene.Scene = app.app_scene(a)
+    var k: usize = 0
+    while k < TY_COUNT {
+        let r: bool = scene.node_remove_class(sc, n, K_TY(k))
+        k = k + 1
+    }
+    scene.node_add_class(sc, n, K_TY(ty))
+}

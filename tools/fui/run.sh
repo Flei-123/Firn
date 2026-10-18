@@ -888,6 +888,10 @@ build wave12
 # W44-b: wave 13 (flyout, teaching tip): placement/flip, keys, hit = geometry, pixels, light + dark + RTL
 build wave13
 "$W/wave13" | tail -n 3 | grep -q "WAVE13 PASSED"
+# M1-c: webtheme (the web app's tokens, type scale, dark / light / system, accent, contrast, shadows) + the generator's drift check
+python3 -I tools/fui/gen_webtheme.py --check
+build webtheme
+"$W/webtheme" | tail -n 3 | grep -q "WEBTHEME PASSED"
 python3 tools/fui/uistr_audit.py
 build touch
 "$W/touch" | tail -n 3
@@ -1621,6 +1625,11 @@ echo
 echo "== 12x. fui.app NODES (card, group box, separator, badge, image, icon) + TREE OVER 128 NODES =="
 build appnodes
 "$W/appnodes"
+
+echo
+echo "== 12y. fui.lay (CSS flexbox for the app API: 190 cases measured in Chromium + a mobile page) =="
+build lay
+"$W/lay"
 
 echo
 echo "== THE INTERACTIVE DIALOGS (roadmap r177, docs/DIALOG.md): message, colour, font, file =="
