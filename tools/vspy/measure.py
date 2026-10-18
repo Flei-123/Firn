@@ -13,7 +13,7 @@ Imports: number of `import`/`from` statements.
 Run times: median of N runs (default 5), wall clock, Python = `python3 task.py`,
 Firn = the built binary (dev-fast, same as firn-run). Compile = one cold build.
 """
-import io, os, re, subprocess, sys, tempfile, time, tokenize, statistics
+import io, os, shutil, re, subprocess, sys, tempfile, time, tokenize, statistics
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 FIRNC = os.environ.get("FIRNC", os.path.join(ROOT, "compiler/target/release/firnc"))
@@ -42,7 +42,10 @@ def py_tokens(path):
 
 def fi_tokens(path):
     env = dict(os.environ, FIRNLIB=FIRNLIB)
-    out = subprocess.run([FIRNC, "--emit=tokens", path], capture_output=True, text=True, env=env).stdout
+    try:
+        out = subprocess.run([FIRNC, "--emit=tokens", path], capture_output=True, text=True, env=env, timeout=120).stdout
+    except (subprocess.SubprocessError, OSError):
+        return -1
     lines = [l for l in out.splitlines() if l.strip() and "Eof" not in l.split()[-1]]
     return len(lines)
 
@@ -56,8 +59,11 @@ def median_ms(cmd, runs, cwd, env=None):
     ts = []
     for _ in range(runs):
         t = time.perf_counter()
-        subprocess.run(cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       stdin=subprocess.DEVNULL, env=env)
+        try:
+            subprocess.run(cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           stdin=subprocess.DEVNULL, env=env, timeout=120)
+        except (subprocess.SubprocessError, OSError):
+            return -1.0
         ts.append((time.perf_counter() - t) * 1000)
     return statistics.median(ts)
 
@@ -93,9 +99,14 @@ def main():
     exe = os.path.join(tmp, "task")
     t = time.perf_counter()
     flags = open(os.path.join(d, "firnflags")).read().split() if os.path.exists(os.path.join(d, "firnflags")) else []
-    r = subprocess.run([FIRNC, "--opt-level=dev-fast", *flags, "-o", exe, fi], capture_output=True, text=True, env=env, cwd=d)
+    try:
+        r = subprocess.run([FIRNC, "--opt-level=dev-fast", *flags, "-o", exe, fi], capture_output=True, text=True, env=env, cwd=d, timeout=600)
+    except (subprocess.SubprocessError, OSError) as e:
+        print(name + "\tCOMPILE-FAIL\t" + str(e)[:200])
+        return 1
     comp = (time.perf_counter() - t) * 1000
     if r.returncode != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
         print(name + "\tCOMPILE-FAIL\t" + r.stderr[:200].replace("\n", " "))
         return 1
     pyl, fil = count_lines(py, "#"), count_lines(fi, "//")
@@ -117,7 +128,7 @@ def main():
     print("\t".join(str(x) for x in [
         name, pyl, fil, round(fil / pyl, 2), pyt, fit, round(fit / pyt, 2),
         imports(py, "py"), imports(fi, "fi"), round(pyr, 1), round(fir, 1), round(comp)]))
-    subprocess.run(["rm", "-rf", tmp])
+    shutil.rmtree(tmp, ignore_errors=True)
     return 0
 
 
