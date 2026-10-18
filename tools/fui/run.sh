@@ -778,6 +778,9 @@ build appw7
 # appw8w: wave 8 controls (spinner, time picker, breadcrumb, info bar, stepper) in the ten-line API: keys, digits, wheel, clicks, a11y
 build appw8w
 "$W/appw8w" | tail -n 3 | grep -q "APPW8W PASSED"
+# appgrid: grid container in the ten-line API (appctl.grid: track words, cells, spans, gap, padding, RTL, inspector line, pictures)
+build appgrid
+"$W/appgrid" | tail -n 3 | grep -q "APPGRID PASSED"
 
 # appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
 build appw6
