@@ -67,6 +67,8 @@
 import std.rt
 import fui.app
 import fui.scene
+import fui.splitter
+import fui.flex
 import fui.widget
 import fui.render
 import fui.style
@@ -91,6 +93,7 @@ export {
     menu_shortcut, menu_enable, menu_checked, menu_set_checked, open_menu_id, menu_is_open,
     tooltip, tooltip_shown, message, confirm, input, dialog_open, dialog_text, dialog_answer,
     dialog_rect,
+    split_begin, split_mid, split_end, split_ratio, split_set_ratio, split_limits, split_hovered, split_dragging,
     ANS_OK, ANS_CANCEL,
     CTL_MAX, OPT_MAX, NONE,
 }
@@ -114,6 +117,7 @@ const K_MENU: u32 = 10
 const K_POPUP: u32 = 11
 const K_CTXMAP: u32 = 12
 const K_TIP: u32 = 13
+const K_SPLIT: u32 = 14
 
 // the answers of a dialog
 const ANS_OK: u32 = 1
@@ -2077,6 +2081,9 @@ fn ctl_chr(ud: u64, cp: u32, mods: u32) -> bool {
 fn ctl_ptr(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     let c: *mut Ctl = ud as *mut Ctl
     sync(c)
+    if split_ptr(c, kind, x, y) {
+        return true
+    }
     if kind == fuiwirt.HOOK_MOVE {
         return tip_move(c, x, y)
     }
@@ -2129,6 +2136,240 @@ fn ctl_paint(ud: u64, rc: *mut render.Ctx, w: usize, h: usize) {
     if (*c).dlg != 0 as u32 {
         draw_dlg(c, rc)
     }
+}
+
+// ============================================================ SPLITTER (r240)
+//
+// Two panes with a draggable bar, as scene nodes:
+//
+//     let sp: usize = appctl.split_begin(a, true, 300, "Sidebar width", changed)   // side by side, 300 permille
+//     ... widgets of pane A ...
+//     appctl.split_mid(a)                                                            // bar + pane B
+//     ... widgets of pane B ...
+//     appctl.split_end(a)
+//
+// `sp` is the bar node (id of the control, valid after `split_mid`; before it `split_begin` returns the container).
+// The bar follows lib/fui/splitter.fi (grab margin, minimum sizes, offset of the grab, Esc cancels the drag); the
+// panes are flex children that share the room by weight (pixel sizes of the splitter), so a resize keeps the ratio.
+// Entry: node = bar, page = pane A, base = pane B, cnt = container, aux = the heap Splitter.
+
+fn split_state(c: *mut Ctl, i: usize) -> *mut splitter.Splitter {
+    return (*c).aux[i] as *mut splitter.Splitter
+}
+
+// the geometry from the last layout into the splitter, then the panes' weights from the splitter
+fn split_apply(c: *mut Ctl, i: usize) {
+    let sc: *mut scene.Scene = sc_of(c)
+    let s: *mut splitter.Splitter = split_state(c, i)
+    let ct: usize = (*c).cnt[i]
+    splitter.layout(s, scene.node_x(sc, ct) as i64, scene.node_y(sc, ct) as i64,
+        scene.node_w(sc, ct) as i64, scene.node_h(sc, ct) as i64)
+    var ra: [i64; 4] = [0, 0, 0, 0]
+    var rb: [i64; 4] = [0, 0, 0, 0]
+    splitter.pane_a(s, &ra)
+    splitter.pane_b(s, &rb)
+    var la: i64 = ra[2]
+    var lb: i64 = rb[2]
+    if (*s).vertical != 0 as u32 {
+        la = ra[3]
+        lb = rb[3]
+    }
+    // weights 0 would starve a flex item of its share; one unit keeps the item alive
+    scene.node_set_grow(sc, (*c).page[i], la + 1, 0)
+    scene.node_set_grow(sc, (*c).base[i], lb + 1, 0)
+}
+
+fn split_draw(ud: u64, rc: *mut render.Ctx, e: *mut widget.Widget) {
+    let c: *mut Ctl = ud as *mut Ctl
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_SPLIT && wid(c, i) == e {
+            let s: *mut splitter.Splitter = split_state(c, i)
+            let z: *mut painter.Painter = render.ctx_painter(rc)
+            var col: u32 = render.color_of(rc, style.color_token(style.TOK_SEPARATOR))
+            if splitter.dragging(s) {
+                col = render.color_of(rc, style.color_token(style.TOK_ACCENT))
+            } else if splitter.hovered(s) {
+                col = render.color_of(rc, style.color_token(style.TOK_BORDER))
+            }
+            let x: f64 = widget.w_x(e)
+            let y: f64 = widget.w_y(e)
+            let w: f64 = widget.w_w(e)
+            let h: f64 = widget.w_h(e)
+            painter.surface(z, x, y, w, h, col)
+            let grip: u32 = render.color_of(rc, style.color_token(style.TOK_TEXT_MUTED))
+            var k: i64 = 0 - 1
+            while k <= 1 {
+                if (*s).vertical != 0 as u32 {
+                    painter.round_rect(z, x + w / 2.0 + (k * 8) as f64 - 1.0, y + h / 2.0 - 1.0, 2.0, 2.0, 1.0, grip)
+                } else {
+                    painter.round_rect(z, x + w / 2.0 - 1.0, y + h / 2.0 + (k * 8) as f64 - 1.0, 2.0, 2.0, 1.0, grip)
+                }
+                k = k + 1
+            }
+            return
+        }
+        i = i + 1
+    }
+}
+
+// Opens the container and pane A. `vertical` = panes side by side (the bar is vertical), as in splitter.fi
+// splitter_new(false, ..); here `side_by_side` says it in plain words.
+fn split_begin(a: *mut app.App, side_by_side: bool, ratio_pm: i64, name: str,
+    on_change: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX {
+        return NONE
+    }
+    var ct: usize = NONE
+    if side_by_side {
+        ct = app.row(a)
+    } else {
+        ct = app.column(a)
+    }
+    if ct == NONE {
+        return NONE
+    }
+    scene.node_set_grow(sc_of(c), ct, 1, 1)
+    scene.node_set_align_self(sc_of(c), ct, flex.AL_STRETCH)
+    let sp: u64 = rt.heap_alloc(256)
+    if sp == 0 {
+        app.end(a)
+        return NONE
+    }
+    *(sp as *mut splitter.Splitter) = splitter.splitter_new(!side_by_side, ratio_pm)
+    let i: usize = add_entry(c, K_SPLIT, NONE)
+    (*c).aux[i] = sp as usize
+    (*c).cnt[i] = ct
+    set_cb(c, i, on_change)
+    (*c).tip[i] = name
+    let pa: usize = app.column(a)
+    scene.node_set_base(sc_of(c), pa, 0)
+    scene.node_set_align_self(sc_of(c), pa, flex.AL_STRETCH)
+    scene.node_set_grow(sc_of(c), pa, ratio_pm + 1, 0)
+    (*c).page[i] = pa
+    return ct
+}
+
+// Ends pane A, adds the bar, opens pane B. Returns the bar node (the id of the control).
+fn split_mid(a: *mut app.App) -> usize {
+    let c: *mut Ctl = st(a)
+    var i: usize = (*c).n
+    var found: usize = NONE
+    while i > 0 {
+        i = i - 1
+        if (*c).kind[i] == K_SPLIT && (*c).node[i] == NONE && found == NONE {
+            found = i
+        }
+    }
+    if found == NONE {
+        return NONE
+    }
+    app.end(a)
+    let s: *mut splitter.Splitter = split_state(c, found)
+    let bar: usize = app.custom(a, widget.KIND_NONE, 6, 6)
+    if bar == NONE {
+        return NONE
+    }
+    (*c).node[found] = bar
+    scene.node_set_grow(sc_of(c), bar, 0, 0)
+    scene.node_set_align_self(sc_of(c), bar, flex.AL_STRETCH)
+    scene.node_set_base(sc_of(c), bar, (*s).bar_px)
+    scene.node_set_draw(sc_of(c), bar, c as u64, split_draw)
+    name_node(c, bar, (*c).tip[found])
+    (*c).tip[found] = ""
+    let pb: usize = app.column(a)
+    scene.node_set_base(sc_of(c), pb, 0)
+    scene.node_set_align_self(sc_of(c), pb, flex.AL_STRETCH)
+    scene.node_set_grow(sc_of(c), pb, 1001 - (*s).pm, 0)
+    (*c).base[found] = pb
+    return bar
+}
+
+fn split_end(a: *mut app.App) {
+    app.end(a)
+    app.end(a)
+}
+
+fn split_index(a: *mut app.App, bar: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, bar)
+    if i == NONE || (*c).kind[i] != K_SPLIT {
+        return NONE
+    }
+    return i
+}
+
+// the ratio of the first pane in permille of the room both panes share
+fn split_ratio(a: *mut app.App, bar: usize) -> i64 {
+    let i: usize = split_index(a, bar)
+    if i == NONE { return 0 - 1 }
+    return splitter.ratio(split_state(st(a), i))
+}
+
+fn split_set_ratio(a: *mut app.App, bar: usize, pm: i64) {
+    let i: usize = split_index(a, bar)
+    if i == NONE { return }
+    let c: *mut Ctl = st(a)
+    splitter.set_ratio(split_state(c, i), pm)
+    split_apply(c, i)
+    touch(c)
+}
+
+// smallest size of pane A and pane B in pixels
+fn split_limits(a: *mut app.App, bar: usize, min_a: i64, min_b: i64) {
+    let i: usize = split_index(a, bar)
+    if i == NONE { return }
+    splitter.set_limits(split_state(st(a), i), min_a, min_b)
+}
+
+fn split_hovered(a: *mut app.App, bar: usize) -> bool {
+    let i: usize = split_index(a, bar)
+    return i != NONE && splitter.hovered(split_state(st(a), i))
+}
+
+fn split_dragging(a: *mut app.App, bar: usize) -> bool {
+    let i: usize = split_index(a, bar)
+    return i != NONE && splitter.dragging(split_state(st(a), i))
+}
+
+// pointer events for all splitters; true = the frame must be repainted (the event is consumed on a hit)
+fn split_ptr(c: *mut Ctl, kind: u32, x: f64, y: f64) -> bool {
+    var res: bool = false
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_SPLIT && (*c).node[i] != NONE {
+            let s: *mut splitter.Splitter = split_state(c, i)
+            split_apply(c, i)
+            let px: i64 = x as i64
+            let py: i64 = y as i64
+            if kind == fuiwirt.HOOK_MOVE {
+                let hv: bool = splitter.hovered(s)
+                let moved: bool = splitter.move(s, px, py)
+                if moved {
+                    split_apply(c, i)
+                    fire(c, i)
+                }
+                if moved || hv != splitter.hovered(s) {
+                    res = true
+                }
+            } else if kind == fuiwirt.HOOK_LEAVE {
+                if splitter.hovered(s) { res = true }
+                (*s).hover = 0 as u32
+            } else if kind == fuiwirt.HOOK_DOWN {
+                if splitter.down(s, px, py) {
+                    res = true
+                }
+            } else if kind == fuiwirt.HOOK_UP {
+                if splitter.dragging(s) {
+                    splitter.up(s)
+                    res = true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return res
 }
 
 // ============================================================ THE POPUP SINK
