@@ -43,7 +43,7 @@ import mc.mc_biome_tint
 
 export {
     ModelSet, PQ_WORDS, ms_new, ms_blank, ms_reset, ms_free, ms_set_tint, ms_prepare, ms_patch_opaque, ms_mesh, ms_mesh_split, ms_state_parts, ms_kind, ms_resolve, ms_tex_tile, ms_quad_count,
-    MQ_WORDS, K_UNKNOWN, K_PLAIN, K_MODEL, NVAR, BIO_OFF, BIO_BYTES, ms_load_biomes, ms_set_blend, ms_colormaps, ms_blend_color, ms_blend_color_w, ms_biome_color_xz, ms_set_seed, ms_clear_seed, ms_zoom_on, ms_has_biomes, ms_set_atlas, ms_tile_translucent, ms_snap_bio, ms_mesh_split_bio, ms_biome_color,
+    MQ_WORDS, K_UNKNOWN, K_PLAIN, K_MODEL, NVAR, BIO_OFF, BIO_BYTES, ms_load_biomes, ms_set_blend, ms_colormaps, ms_blend_color, ms_blend_color_w, ms_biome_color_xz, ms_set_seed, ms_clear_seed, ms_set_water_tint, ms_zoom_on, ms_has_biomes, ms_set_atlas, ms_tile_translucent, ms_snap_bio, ms_mesh_split_bio, ms_biome_color,
 }
 
 const MQ_WORDS: usize = 30 // output quad: x0..3 y0..3 z0..3 (block units, section relative), u0..3 v0..3 (tile units), tile, shade 0..256, sky, block, tint (R | G << 8 | B << 16, -1 none), flags (bit 0 translucent), ao0..3
@@ -83,11 +83,13 @@ struct ModelSet {
     zseed: u64, // hashed world seed of the Voronoi biome zoom (ms_set_seed)
     zoom: u32, // 1 = Voronoi zoom on (a seed is known), 0 = the 4x4x4 cell of the block
     swn: mc_biome_zoom.SwampNoise, // BIOME_INFO_NOISE of the swamp grass colour
+    wtint: u32, // 1 = fluid water is a tinted model (ms_set_water_tint), 0 = water stays on the cube path
+    wtab: u64, // u8 [NSTATE_MAX] 1 = state baked as water (same-water faces are hidden)
 }
 
 fn ms_new(reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack, ex: *mut mc_texext.TexExt) -> ModelSet {
     var m: ModelSet = ModelSet { reg: reg, st: st, ex: ex, kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0,
-        nmodel: 0, unmapped: 0, lk: 0, atlas: 0, blend: 2, cmap: 0 as u32, btab: 0, zseed: 0 as u64, zoom: 0 as u32, swn: mc_biome_zoom.swamp_new(),
+        nmodel: 0, unmapped: 0, lk: 0, atlas: 0, blend: 2, cmap: 0 as u32, btab: 0, zseed: 0 as u64, zoom: 0 as u32, swn: mc_biome_zoom.swamp_new(), wtint: 0 as u32, wtab: 0,
         tint: [0x91BD59 as u32, 0x77AB2F as u32, 0x3F76E4 as u32, 0x80A755 as u32, 0x619961 as u32, 0x208030 as u32, 0x4B0000 as u32, 0xFFFFFF as u32] }
     m.lk = rt.heap_alloc(8)
     rt.st64(m.lk, 0, 0 as u64)
@@ -95,6 +97,8 @@ fn ms_new(reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack, ex: *mut
     m.weighted = rt.heap_alloc(NSTATE_MAX)
     rt.mem_set(m.kind, 0 as u8, NSTATE_MAX)
     rt.mem_set(m.weighted, 0 as u8, NSTATE_MAX)
+    m.wtab = rt.heap_alloc(NSTATE_MAX)
+    rt.mem_set(m.wtab, 0 as u8, NSTATE_MAX)
     m.qptr = rt.heap_alloc(NSTATE_MAX * NVAR * 8)
     m.qcnt = rt.heap_alloc(NSTATE_MAX * NVAR * 4)
     var i: usize = 0
@@ -112,7 +116,7 @@ fn ms_new(reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack, ex: *mut
 // A ModelSet without tables (nothing allocated, ms_free is a no-op): placeholder for a struct field until ms_new runs.
 fn ms_blank() -> ModelSet {
     return ModelSet { reg: 0 as u64 as *mut mc_registry.Registry, st: 0 as u64 as *mut mc_assets.PackStack, ex: 0 as u64 as *mut mc_texext.TexExt,
-        kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0, nmodel: 0, unmapped: 0, lk: 0, atlas: 0, blend: 2, cmap: 0 as u32, btab: 0, zseed: 0 as u64, zoom: 0 as u32, swn: mc_biome_zoom.SwampNoise { p: [0 as u8; 256] },
+        kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0, nmodel: 0, unmapped: 0, lk: 0, atlas: 0, blend: 2, cmap: 0 as u32, btab: 0, zseed: 0 as u64, zoom: 0 as u32, swn: mc_biome_zoom.SwampNoise { p: [0 as u8; 256] }, wtint: 0 as u32, wtab: 0,
         tint: [0 as u32; 8] }
 }
 
@@ -128,6 +132,7 @@ fn ms_reset(m: *mut ModelSet) {
     let bl: i32 = (*m).blend
     let zs: u64 = (*m).zseed
     let zz: u32 = (*m).zoom
+    let wt: u32 = (*m).wtint
     ms_free(m)
     *m = ms_new(reg, st, ex)
     (*m).tint = tn
@@ -135,6 +140,7 @@ fn ms_reset(m: *mut ModelSet) {
     (*m).blend = bl
     (*m).zseed = zs
     (*m).zoom = zz
+    (*m).wtint = wt
     if had_bio { ms_load_biomes(m) }
 }
 
@@ -401,6 +407,14 @@ fn ms_biome_color_xzc(m: *mut ModelSet, cls: usize, bid: usize, bx: i32, bz: i32
         }
     }
     return ms_biome_color_xz(m, cls, bid, bx, bz)
+}
+
+// Fluid water as a tinted model (r260): water states get 6 full-cube quads (block/water_still, tint class 2) instead of the cube path, so the biome blend + Voronoi
+// zoom colour it like leaves; faces next to opaque blocks or other water are hidden. Needs the atlas (ms_set_atlas) for the translucent pass. Call BEFORE the first
+// meshing (or ms_reset + remesh afterwards). Default off (the picture without it is unchanged).
+fn ms_set_water_tint(m: *mut ModelSet, on: bool) {
+    (*m).wtint = 0 as u32
+    if on { (*m).wtint = 1 as u32 }
 }
 
 // Hashed world seed (Join Game / Respawn `hashedSeed`) of the vanilla Voronoi biome zoom: with a seed every column takes its biome from
@@ -672,6 +686,7 @@ fn ms_free(m: *mut ModelSet) {
     }
     rt.heap_free((*m).kind, NSTATE_MAX)
     rt.heap_free((*m).weighted, NSTATE_MAX)
+    rt.heap_free((*m).wtab, NSTATE_MAX)
     rt.heap_free((*m).qptr, NSTATE_MAX * NVAR * 8)
     rt.heap_free((*m).qcnt, NSTATE_MAX * NVAR * 4)
     rt.heap_free((*m).tnames, NTEX * 64)
@@ -901,9 +916,18 @@ fn bake_state(m: *mut ModelSet, s: usize, v: usize) -> u32 {
         if nsel > 0 && sel.weighted { rt.st8((*m).weighted, s, 1 as u8) }
     }
     var b: mc_model.Baked = mc_model.baked_new()
-    let nq: i32 = mc_model.blockstate_bake((*m).st, bname, pstr, seed, &b)
+    var nq: i32 = 0
     var model: bool = false
-    if nq > 0 && !is_unit_cube(&b) { model = true }
+    if (*m).wtint != (0 as u32) && v == 0 && bytes_ends(rt.buf_ptr(&name), rt.buf_len(&name), "water") && (rt.buf_len(&name) == 5 || bytes_ends(rt.buf_ptr(&name), rt.buf_len(&name), ":water")) {
+        nq = mc_model.water_cube_bake(&b)
+        if nq > 0 {
+            model = true
+            rt.st8((*m).wtab, s, 1 as u8)
+        }
+    } else {
+        nq = mc_model.blockstate_bake((*m).st, bname, pstr, seed, &b)
+        if nq > 0 && !is_unit_cube(&b) { model = true }
+    }
     if v == 0 && !model { rt.st8((*m).kind, s, K_PLAIN) }
     if model {
         let tcls: i32 = tint_class(rt.buf_ptr(&name), rt.buf_len(&name))
@@ -1186,6 +1210,8 @@ fn ms_mesh_split_bio(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.Mesh
                             skip = true
                         } else if ((nid as usize) < 32768) && (rt.ld8((*t).opaque, nid as usize) & (1 as u8)) != (0 as u8) {
                             skip = true
+                        } else if ((nid as usize) < NSTATE_MAX) && rt.ld8((*m).wtab, id as usize) != (0 as u8) && rt.ld8((*m).wtab, nid as usize) != (0 as u8) {
+                            skip = true // water next to water
                         }
                         lc = ni
                     }
