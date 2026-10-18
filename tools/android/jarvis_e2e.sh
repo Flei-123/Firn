@@ -318,16 +318,19 @@ shot 12_front_before_tap
 check "front: the chat on screen did not change (still c2)" "$(OCR_TRIES=6 wait_ocr 12_front_before_tap 'second question\|second answer')" 1
 check "front: the process lives" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
 echo "  tap the notification of c1 while the app is open"
+TAPS_BEFORE=$(app_log | grep -c 'tap opens chat c1')
 tap_note "Front c1"
 check "front tap: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
 shot 12b_front_after_tap
 # A tap on a notification while the window is already in front: org.firn.FirnMain (launchMode singleTop) gets onNewIntent, keeps the
 # intent (setIntent), the app reads the chat id from it within a second. STRICT_FRONT=0 turns a failure into a note.
-FRONT_C1=$(OCR_TRIES=10 wait_ocr 12b_front_after_tap 'hello')
+FRONT_C1=$(OCR_TRIES=30 wait_ocr 12b_front_after_tap 'hello')
 if [ "${STRICT_FRONT:-1}" = 1 ]; then check "front tap: the chat of the notification is on screen (c1: 'hi / hello')" "$FRONT_C1" 1
 elif [ "$FRONT_C1" = 1 ]; then echo "  OK    front tap: the chat of the notification is on screen (c1: 'hi / hello')"; PASS=$((PASS+1))
 else note "a tap while the app is open does not switch to the chat of the notification (c2 stays on screen)"; fi
-check "front tap: the app log says the chat came from the intent" "$(app_log | grep 'tap opens chat c1 (intent)' | tail -1 | wc -l)" 1
+app_log >"$OUT/app_front.log" 2>/dev/null # kept as proof (tap opens chat ..., slot states)
+check "front tap: the app log says the chat was opened by this tap (intent or status bar)" "$(( $(app_log | grep -c 'tap opens chat c1') - TAPS_BEFORE ))" 1
+if [ -n "${STOP_AFTER_FRONT:-}" ]; then app_log >"$OUT/app_front.log"; $ADB logcat -d >"$OUT/logcat.txt"; echo "STOP_AFTER_FRONT: passed $PASS failed $FAIL"; exit 0; fi
 CHAT_BEFORE="$(ocr 12b_front_after_tap | grep -c 'second question\|second answer')$(ocr 12b_front_after_tap | grep -c 'hello')" # c2 / c1 history on screen
 check "front tap: the notification is gone (auto-cancel)" "$(note_lines | grep -c 'Front c1')" 0
 
@@ -356,6 +359,7 @@ else
     note "no cid tap: history before/after = $CHAT_BEFORE / $(ocr 13_nocid_after_tap | grep -c 'second question\|second answer')$(ocr 13_nocid_after_tap | grep -c 'hello') (plain activity, not checked)"
 fi
 check "no cid tap: the notification is gone" "$(note_lines | grep -c 'No chat two')" 0
+app_log >"$OUT/app_nocid.log" 2>/dev/null
 check "no cid tap: no crash so far" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
 
 # ---- 7. frame time -----------------------------------------------------------------------------------------------------------

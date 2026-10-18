@@ -38,16 +38,17 @@ trap cleanup EXIT
 
 if [ -z "${SERIAL:-}" ]; then
     AVDHOME=${ANDROID_AVD_HOME:-$HOME/.android/avd}
-    if [ ! -d "$AVDHOME/a4b.avd" ]; then # own copy: only the config, a fresh data partition
-        mkdir -p "$AVDHOME/a4b.avd"; sed 's/firn/a4b/g' "$AVDHOME/firn.avd/config.ini" >"$AVDHOME/a4b.avd/config.ini"
-        printf 'avd.ini.encoding=UTF-8\npath=%s/a4b.avd\npath.rel=avd/a4b.avd\ntarget=android-35\n' "$AVDHOME" >"$AVDHOME/a4b.ini"
+    AVD=${AVD:-a4b}
+    if [ ! -d "$AVDHOME/$AVD.avd" ]; then # own copy: only the config, a fresh data partition
+        mkdir -p "$AVDHOME/$AVD.avd"; sed "s/firn/$AVD/g" "$AVDHOME/firn.avd/config.ini" >"$AVDHOME/$AVD.avd/config.ini"
+        printf 'avd.ini.encoding=UTF-8\npath=%s/%s.avd\npath.rel=avd/%s.avd\ntarget=android-35\n' "$AVDHOME" "$AVD" "$AVD" >"$AVDHOME/$AVD.ini"
     fi
     # own adb server (port 5039): the emulator registers there, so other checks that run `adb` without a serial on the shared
     # server (port 5037) never see it, install nothing into it and cannot steal its screen
     ADB0="$ADB0 -P ${ADB_PORT:-5039}"; $ADB0 start-server >/dev/null 2>&1
-    ANDROID_ADB_SERVER_PORT=${ADB_PORT:-5039} ANDROID_SDK_ROOT=$SDK ANDROID_AVD_HOME=$AVDHOME "$SDK/emulator/emulator" -avd a4b -port 5590 -no-window -no-audio \
+    ANDROID_ADB_SERVER_PORT=${ADB_PORT:-5039} ANDROID_SDK_ROOT=$SDK ANDROID_AVD_HOME=$AVDHOME "$SDK/emulator/emulator" -avd $AVD -port ${EMU_PORT:-5590} -no-window -no-audio \
         -no-boot-anim -no-snapshot -wipe-data -gpu swiftshader_indirect >"$W/emu.log" 2>&1 & EMU=$!
-    SERIAL=emulator-5590
+    SERIAL=emulator-${EMU_PORT:-5590}
 fi
 ADB="$ADB0 -s $SERIAL"
 for _ in $(seq 120); do [ "$($ADB shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break; sleep 3; done
@@ -133,11 +134,11 @@ check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 
 # ---- message + streamed reply
 # right after the login the connection is still being built ("offline - reconnecting"): a message sent before it is up is lost
 # the green "online" pill (outline, small) is lost by full-page OCR: crop the header corner, scale x3, read the line
-online_pill() { local i; for i in $(seq 30); do shot 2b_online
+online_pill() { local i n=${1:-2b_online}; for i in $(seq 30); do shot $n
         python3 -I -c "import sys
 from PIL import Image
 im=Image.open(sys.argv[1]).convert('L').crop((820,140,1080,240))
-im.resize((im.width*3,im.height*3)).save(sys.argv[2])" "$OUT/2b_online.png" "$W/pill.png"
+im.resize((im.width*3,im.height*3)).save(sys.argv[2])" "$OUT/$n.png" "$W/pill.png"
         tesseract "$W/pill.png" stdout --psm 7 2>/dev/null | grep -qi 'online' && { echo 1; return; }; sleep 1.5; done; echo 0; }
 check "online after the login" "$(online_pill)" 1
 tap $FIELD_X $FIELD_Y 1; check "Gboard shows for the message field" "$(wait_kbd)" 1; $ADB shell input text hello; sleep 1
@@ -164,7 +165,7 @@ if [ "$(OCR_TRIES=25 wait_ocr 7_restart 'Chats')" = 1 ]; then echo "  NOTE  rest
 fi
 
 # after the restart the connection is rebuilt ("offline - reconnecting"): a message sent before it is up is not delivered
-check "online again after the restart" "$(OCR_TRIES=30 wait_ocr 8b_online 'online')" 1
+check "online again after the restart" "$(online_pill 8b_online)" 1 # the pill is small and outlined: full-page OCR misses it, the crop of the header corner reads it (as after the login)
 
 # ---- keyboard: typing, cursor, selection, copy/paste. Proof = the exact text the server receives.
 tap $FIELD_X $FIELD_Y 1; wait_kbd >/dev/null; sleep 2; $ADB shell input text abd; sleep 1 # a loaded host reorders fast key events: one step per second
@@ -188,7 +189,7 @@ sleep 2; tap $MIC_X $FIELD_Y 1
 for _ in $(seq 15); do grep -q '/api/stt' "$SLOG" && break; sleep 1; done
 check "recording uploaded as audio/wav to /api/stt" "$(grep -c '"path": "/api/stt?lang=de", "ctype": "audio/wav"' "$SLOG")" 1
 check "transcription lands in the input line" "$(wait_ocr 5_heard 'audio')" 1
-tap $VOICE_X $VOICE_Y 2; shot 6_voice; check "voice switch shows 'Voice on'" "$(ocr_crop 6_voice 520 330 800 450 | grep -ci 'oice on')" 1
+tap_word "Voice" 1 2; shot 6_voice; check "voice switch shows 'Voice on'" "$(ocr_crop 6_voice 330 320 660 440 | grep -ci 'oice on')" 1 # same word tap + crop as jarvis_e2e.sh (the A21 design moved the chip row; the old fixed pixels hit nothing)
 check "app alive after mic + voice" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
 
 check "no crash in logcat" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0

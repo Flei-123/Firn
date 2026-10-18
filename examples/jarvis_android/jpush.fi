@@ -17,7 +17,7 @@ import appkit.log
 import window.window
 import jshell
 
-export { pending_take, launch_take, last_source, settle, setup, on_api, stop, state, state_text, tick, polling, events_seen, PS_IDLE, PS_ASKED, PS_ON, PS_NONE, PS_TLS, PS_FAILED }
+export { pending_take, tap_open, launch_take, last_source, settle, setup, on_api, stop, state, state_text, tick, polling, events_seen, PS_IDLE, PS_ASKED, PS_ON, PS_NONE, PS_TLS, PS_FAILED }
 
 const PS_IDLE: i64 = 0
 const PS_ASKED: i64 = 1
@@ -45,6 +45,9 @@ static mut G_SEEN: i64 = 0 // events turned into notifications (for the end-to-e
 //      whose notification is GONE (auto-cancel on tap) is the tapped one -- the newest such slot (settle() frees the slots of
 //      notifications that went away while the window was on screen, so a swiped one is not mistaken for a tap);
 //   3. the guess: the chat of the newest event that came in while the window was not on screen (at most PENDING_MS old).
+// A tap while the app is OPEN starts nothing (plain NativeActivity, no onNewIntent): the keyed notification is simply GONE. A swipe is told
+// to the service by the notification's deleteIntent (pushio.pio_dismissed); a slot that is gone for GONE_GRACE_MS WITHOUT that mark was
+// tapped (tap_open) -- the app is in front already, only the chat has to switch.
 const PENDING_MS: i64 = 900000
 const PENDING_CAP: usize = 96
 const SLOTS: usize = 8
@@ -55,6 +58,9 @@ static mut G_SRC: i64 = 0 // where the last chat id came from: 1 intent extra, 2
 static mut G_SLOT_CID: [u8; 768] = [0; 768] // SLOTS x PENDING_CAP
 static mut G_SLOT_N: [usize; 8] = [0; 8]
 static mut G_SLOT_AT: [i64; 8] = [0; 8]
+static mut G_SLOT_SEEN: [i32; 8] = [9; 8] // the last pio_shown answer of the slot (logged when it changes)
+static mut G_SLOT_GONE: [i64; 8] = [0; 8] // when the notification of the slot was first seen gone (0 = it is shown)
+const GONE_GRACE_MS: i64 = 1200 // the swipe mark of the system reaches the service within this time
 
 fn pending_set(cid: str) {
     if cid.n == 0 || cid.n > PENDING_CAP { return }
@@ -96,11 +102,76 @@ fn slot_put(i: usize, cid: str) {
     G_SLOT_AT[i] = time.now_unix_ms()
 }
 
-// 1 s tick while the window is on screen: a keyed notification that is gone now was swiped away or cancelled -- not a tap
+// 0 = free slot (or its notification was swiped away / cancelled: freed here), 1 = the notification is in the status bar (or unknown),
+// 2 = it is gone WITHOUT a swipe mark = tapped (or taken away by the group summary)
+fn slot_state(i: usize, now: i64) -> i64 {
+    if G_SLOT_N[i] == 0 { return 0 }
+    let shown: i32 = pushio.pio_shown(i as u64)
+    if shown != G_SLOT_SEEN[i] {
+        G_SLOT_SEEN[i] = shown
+        log.log_info("push", "slot " + jshell.dec(i as i64) + " shown " + jshell.dec(shown as i64))
+    }
+    if shown != 0 {
+        G_SLOT_GONE[i] = 0
+        return 1
+    }
+    if pushio.pio_dismissed(i as u64) == 1 {
+        log.log_info("push", "slot " + jshell.dec(i as i64) + " swiped away")
+        G_SLOT_N[i] = 0
+        G_SLOT_GONE[i] = 0
+        return 0
+    }
+    if G_SLOT_GONE[i] == 0 {
+        G_SLOT_GONE[i] = now
+        log.log_info("push", "slot " + jshell.dec(i as i64) + " gone (no swipe mark) cid " + slot_cid(i))
+    }
+    return 2
+}
+
+// 1 s tick while the window is on screen: frees the slots of swiped notifications
 fn settle() {
+    let now: i64 = time.now_unix_ms()
     var i: usize = 0
     while i < SLOTS {
-        if G_SLOT_N[i] > 0 && pushio.pio_shown(i as u64) == 0 { G_SLOT_N[i] = 0 }
+        let st: i64 = slot_state(i, now)
+        i = i + 1
+    }
+}
+
+// 1 s tick while the window is in front: the chat of a notification that was TAPPED (gone for GONE_GRACE_MS without a swipe mark),
+// "" = none. The newest such slot wins; every gone slot is freed (a tap on the group summary takes the messages with it).
+fn tap_open() -> str {
+    let now: i64 = time.now_unix_ms()
+    var best: usize = SLOTS
+    var i: usize = 0
+    while i < SLOTS {
+        if slot_state(i, now) == 2 && now - G_SLOT_GONE[i] >= GONE_GRACE_MS && now - G_SLOT_AT[i] <= PENDING_MS {
+            if best == SLOTS || G_SLOT_AT[i] > G_SLOT_AT[best] { best = i }
+        }
+        i = i + 1
+    }
+    if best == SLOTS { return "" }
+    let cid: str = slot_cid(best)
+    i = 0
+    while i < SLOTS {
+        if G_SLOT_N[i] > 0 && G_SLOT_GONE[i] > 0 && now - G_SLOT_GONE[i] >= GONE_GRACE_MS { G_SLOT_N[i] = 0; G_SLOT_GONE[i] = 0 }
+        i = i + 1
+    }
+    G_PEND_N = 0
+    G_SRC = 2
+    return cid
+}
+
+// a tap on the notification of chat `cid` was handled (by any way): its slot must not be found AGAIN as a "tapped" slot later
+// (a gone slot whose tap came through the intent was taken for a second tap when the window came back after the next notification)
+fn slot_free_cid(cid: str) {
+    if cid.n == 0 { return }
+    var i: usize = 0
+    while i < SLOTS {
+        if G_SLOT_N[i] == cid.n && slot_cid(i) == cid && pushio.pio_shown(i as u64) == 0 {
+            G_SLOT_N[i] = 0
+            G_SLOT_GONE[i] = 0
+        }
         i = i + 1
     }
 }
@@ -108,7 +179,11 @@ fn settle() {
 // the chat id of a start by a tap ("" = none; once)
 fn launch_take() -> str {
     let c: str = pushio.pio_launch_cid()
-    if c.n > 0 { G_SRC = 1 }
+    if c.n > 0 {
+        G_SRC = 1
+        slot_free_cid(c)
+        G_PEND_N = 0
+    }
     return c
 }
 
@@ -125,7 +200,7 @@ fn pending_take() -> str {
     var best: usize = SLOTS
     var i: usize = 0
     while i < SLOTS {
-        if G_SLOT_N[i] > 0 && now - G_SLOT_AT[i] <= PENDING_MS && pushio.pio_shown(i as u64) == 0 {
+        if now - G_SLOT_AT[i] <= PENDING_MS && slot_state(i, now) == 2 {
             if best == SLOTS || G_SLOT_AT[i] > G_SLOT_AT[best] { best = i }
         }
         i = i + 1
@@ -133,7 +208,11 @@ fn pending_take() -> str {
     var tapped: str = ""
     if best != SLOTS { tapped = slot_cid(best) }
     // every slot whose notification is gone is free again
-    settle()
+    i = 0
+    while i < SLOTS {
+        if G_SLOT_N[i] > 0 && G_SLOT_GONE[i] > 0 { G_SLOT_N[i] = 0; G_SLOT_GONE[i] = 0 }
+        i = i + 1
+    }
     if from_intent.n > 0 {
         G_PEND_N = 0
         G_SRC = 1
@@ -229,7 +308,11 @@ fn show(e: *mut jarvisapi.PushEvent) {
     if cid.n > 0 && cid.n <= PENDING_CAP {
         let k: usize = slot_of(cid)
         posted = pushio.pio_notify_cid(k as u64, title, (*e).body, cid)
-        if posted { slot_put(k, cid) }
+        if posted {
+            let stale: i32 = pushio.pio_dismissed(k as u64) // a swipe mark of the notification this one replaced must not count for the new one
+            slot_put(k, cid)
+            G_SLOT_GONE[k] = 0
+        }
     } else {
         posted = pushio.pio_notify(title, (*e).body)
     }
