@@ -5,6 +5,7 @@
 # notification service as the judge.
 #
 #   bash tools/android/jarvis_e2e.sh [apk]          (default: the newest /root/jarvis-android-builds/jarvis-*.apk)
+#   STRICT_FRONT=1 bash ...   (a tap on a notification while the app is open must switch the chat; today a known gap)
 #   SERIAL=emulator-5594 ADB_PORT=5043 bash ...     (use a running emulator, do not boot or stop one)
 #   AVD=<name> EMU_PORT=<port> ADB_PORT=<port> OUT=<dir> bash ...   (own emulator copy, own adb server)
 #
@@ -15,7 +16,10 @@
 # fake server's upload_body line carries the sha256 of the exact octets), file receive (JE_FILE -> download -> Downloads/Jarvis),
 # push over the HTTPS long poll while the app is in the background (POST /fake/push -> a REAL notification, tap opens the app,
 # the chat; two chats c1/c2 -> two notifications, each tap opens its own chat), the service text is neutral, the frame time of the app (paint microseconds per frame, <= 16 ms is the 60 Hz budget),
-# voice output without a speech engine (status text, no crash), no crash.
+# push while the app is IN FRONT (notification still posted, no chat switch by the push itself; a tap there is a KNOWN GAP, see STRICT_FRONT),
+# push WITHOUT a chat id (unkeyed notification next to keyed ones, a tap opens no unrelated chat),
+# voice output (status text, no crash) and, on the google_apis image, with the REAL speech engine (logcat firn-tts: engine requested ->
+# engine ready, speaking -> finished speaking), no crash.
 # Nothing is guessed from the app itself: the fake server's log is the proof for what the app SENT, `dumpsys notification` for what
 # the system SHOWS, tesseract (words with positions) for what is on the screen and where to touch it.
 set -uo pipefail
@@ -247,7 +251,9 @@ echo "== 6. push over the HTTPS long poll, app in the background"
 P1=$($ADB shell pidof $PKG)
 push() { python3 -I -c "
 import json, sys, urllib.request
-r = urllib.request.Request('http://127.0.0.1:$PORT/fake/push', json.dumps({'title': sys.argv[1], 'body': sys.argv[2], 'cid': sys.argv[3]}).encode(), {'Content-Type': 'application/json'})
+ev = {'title': sys.argv[1], 'body': sys.argv[2]}
+if sys.argv[3] != '-': ev['cid'] = sys.argv[3]  # '-' = an event without a chat id
+r = urllib.request.Request('http://127.0.0.1:$PORT/fake/push', json.dumps(ev).encode(), {'Content-Type': 'application/json'})
 print(urllib.request.urlopen(r).read().decode())" "$1" "$2" "${3:-c1}" >/dev/null; }
 sleep 8 # the first poll only learns the last event id
 tap_word "New" 1 2 # an empty chat: the history of the event's chat must show up after the tap
@@ -290,6 +296,51 @@ shot 09b_after_tap_c2
 check "tap c2: the second chat is on screen (its history 'second question / second answer')" "$(OCR_TRIES=10 wait_ocr 09b_after_tap_c2 'second question\|second answer')" 1
 check "tap c2: the chat of c1 is not on screen (its history 'JARVIS: hello' is gone)" "$(ocr 09b_after_tap_c2 | grep -c 'JARVIS: hello')" 0
 
+# ---- 6b. push while the app is IN FRONT --------------------------------------------------------------------------------------
+echo "== 6b. push while the app is in front (chat c2 on screen)"
+check "the app is in front before the push" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
+push "Front c1" "arrived while open" c1
+for _ in $(seq 20); do note_lines | grep -q 'Front c1' && break; sleep 1; done
+check "front: the notification is posted anyway (title | text)" "$(note_lines | grep 'Front c1' | head -1)" "Front c1 | arrived while open"
+check "front: the app stays in front (the push does not steal or switch the chat)" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
+shot 12_front_before_tap
+check "front: the chat on screen did not change (still c2)" "$(OCR_TRIES=6 wait_ocr 12_front_before_tap 'second question\|second answer')" 1
+check "front: the process lives" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
+echo "  tap the notification of c1 while the app is open"
+tap_note "Front c1"
+check "front tap: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
+shot 12b_front_after_tap
+# KNOWN GAP: a tap on a notification while the window is already in front brings no new intent to the activity (a standard launch mode,
+# no onNewIntent in NativeActivity) and the window never "comes back", so the chat does not switch. STRICT_FRONT=1 makes it a failure.
+FRONT_C1=$(OCR_TRIES=10 wait_ocr 12b_front_after_tap 'You: hi\|JARVIS: hello')
+if [ "${STRICT_FRONT:-0}" = 1 ]; then check "front tap: the chat of the notification is on screen (c1: 'hi / hello')" "$FRONT_C1" 1
+elif [ "$FRONT_C1" = 1 ]; then echo "  OK    front tap: the chat of the notification is on screen (c1: 'hi / hello')"; PASS=$((PASS+1))
+else note "KNOWN GAP: a tap while the app is open does not switch to the chat of the notification (c2 stays on screen)"; fi
+CHAT_BEFORE="$(ocr 12b_front_after_tap | grep -c 'second question\|second answer')$(ocr 12b_front_after_tap | grep -c 'JARVIS: hello')" # c2 / c1 history on screen
+check "front tap: the notification is gone (auto-cancel)" "$(note_lines | grep -c 'Front c1')" 0
+
+# ---- 6c. push WITHOUT a chat id ------------------------------------------------------------------------------------------------
+echo "== 6c. push without a chat id (cid missing)"
+$ADB shell input keyevent KEYCODE_HOME; sleep 3
+push "No chat" "event without cid" -
+for _ in $(seq 20); do note_lines | grep -q 'No chat' && break; sleep 1; done
+check "no cid: a real notification (title | text)" "$(note_lines | grep 'No chat' | head -1)" "No chat | event without cid"
+check "no cid: the process lives" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
+push "Keyed again" "c2 after the unkeyed one" c2
+for _ in $(seq 20); do note_lines | grep -q 'Keyed again' && break; sleep 1; done
+check "no cid: a keyed event next to it does not replace it" "$(note_lines | grep -c 'No chat')$(note_lines | grep -c 'Keyed again')" 11
+push "No chat two" "second event without cid" -
+for _ in $(seq 20); do note_lines | grep -q 'No chat two' && break; sleep 1; done
+check "no cid: a second unkeyed event shows too" "$(note_lines | grep -c 'No chat two')" 1
+check "no cid: the keyed notification of c2 is untouched" "$(note_lines | grep -c 'Keyed again')" 1
+echo "  tap the notification without a chat id"
+tap_note "No chat two"
+check "no cid tap: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
+sleep 5; shot 13_nocid_after_tap
+check "no cid tap: no chat was forced (the history on screen is the same as before the tap)" "$(ocr 13_nocid_after_tap | grep -c 'second question\|second answer')$(ocr 13_nocid_after_tap | grep -c 'JARVIS: hello')" "$CHAT_BEFORE"
+check "no cid tap: the notification is gone" "$(note_lines | grep -c 'No chat two')" 0
+check "no cid tap: no crash so far" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
+
 # ---- 7. frame time -----------------------------------------------------------------------------------------------------------
 echo "== 7. frame time"
 # scroll the chat and open tabs so that frames are painted, then read the app's own frame lines
@@ -318,6 +369,18 @@ check "Voice switch shows 'Voice on'" "$(ocr_crop 10_voice 600 330 860 450 | gre
 send_text "voicetest"
 check "the app lives after a spoken answer" "$(OCR_TRIES=12 wait_ocr 11_say 'Hallo voicetest')" 1
 check "app alive after voice output" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
+
+# ---- 8b. speech output WITH an engine (google_apis image: com.google.android.tts) ----------------------------------------------
+echo "== 8b. voice output with a speech engine"
+ENG=$($ADB shell cmd package query-services -a android.intent.action.TTS_SERVICE 2>/dev/null | grep -c 'GoogleTtsService')
+check "the image has a speech engine (google_apis)" "$ENG" 1
+for _ in $(seq 20); do $ADB logcat -d | grep -q 'firn-tts: finished speaking\|firn-tts: no engine answered' && break; sleep 1; done
+$ADB logcat -d | grep 'firn-tts' | tail -8 | sed 's/^/  tts-log /'
+check "tts: the engine was asked (log 'engine requested')" "$($ADB logcat -d | grep -c 'firn-tts: engine requested')" 1
+check "tts: the engine took the text (log 'engine ready, speaking')" "$($ADB logcat -d | grep -c 'firn-tts: engine ready, speaking')" 1
+check "tts: the speech ended (log 'finished speaking')" "$($ADB logcat -d | grep -c 'firn-tts: finished speaking')" 1
+check "tts: no timeout ('no engine answered in time')" "$($ADB logcat -d | grep -c 'firn-tts: no engine answered')" 0
+check "tts: the status line did not complain" "$(ocr 11_say | grep -c 'voice output not possible')" 0
 
 check "no crash in logcat" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
 $ADB shell am force-stop $PKG
