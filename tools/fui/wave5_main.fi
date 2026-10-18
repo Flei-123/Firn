@@ -1,0 +1,864 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/wave5_main.fi -- THE CHECK OF lib/fui/wave5.fi (rating, chips, segmented, skeleton,
+// chart, page dots, pager).
+//
+// Every part is painted into a canvas with the real font and the real theme (light AND dark),
+// the pixels are read back and compared with what the theme says they must be, the geometry the
+// picture was made from is asked again by the `*_hit` functions, the colour pairs are recomputed
+// with the WCAG 2 formula, motion is checked against the clock (dt-based: two 8 ms steps are one
+// 16 ms step), and everything is repeated mirrored (right to left). Without a window:
+//
+//     firnc -o /tmp/wave5 tools/fui/wave5_main.fi && /tmp/wave5 [dir]
+//
+// With a directory the pictures wave5-dark.png / wave5-light.png are written there. The last
+// line is WAVE5 PASSED or WAVE5 FAILED.
+import std.rt
+import fui.safeout
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import fui.theme
+import fui.painter
+import fui.render
+import fui.style
+import fui.editor
+import fui.kit
+import fui.kitcolor
+import fui.lucide
+import fui.wave5
+import plat.sysfont
+
+static mut BAD: usize = 0
+static mut CHECKS: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn check(ok: bool, what: str) {
+    CHECKS = CHECKS + 1
+    if ok {
+        say("  ok    ")
+    } else {
+        say("  WRONG ")
+        BAD = BAD + 1
+    }
+    say(what)
+    say("\n")
+}
+
+fn save(cv: *mut canvas.Canvas, dir: u64, name: str) {
+    if dir == 0 {
+        return
+    }
+    var path: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&path, dir, rt.c_length(dir))
+    rt.buf_push(&path, 47 as u8)
+    rt.buf_push_bytes(&path, name.p as u64, name.n)
+    rt.buf_push(&path, 0 as u8)
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    if png.write_png(cv, &out) {
+        let ok: bool = safeout.write_file(rt.buf_ptr(&path), mem.buf_ptr(&out) as u64, mem.buf_len(&out))
+    }
+    rt.buf_free(&path)
+}
+
+struct Page {
+    m: theme.Theme,
+    z: painter.Painter,
+    cv: canvas.Canvas,
+    c: render.Ctx,
+    w: usize,
+    h: usize,
+}
+
+fn page_new(w: usize, h: usize, dark: bool, font: u64) -> *mut Page {
+    let p: *mut Page = rt.heap_alloc(1 << 20) as *mut Page
+    (*p).m = theme.theme_new(dark)
+    kitcolor.kit_theme(&(*p).m, dark)
+    (*p).z = painter.painter_new()
+    (*p).cv = canvas.canvas_new()
+    (*p).w = w
+    (*p).h = h
+    if !canvas.canvas_init(&(*p).cv, w, h) || !painter.painter_init(&(*p).z, &(*p).cv, w, h) {
+        return 0 as u64 as *mut Page
+    }
+    painter.painter_set_font(&(*p).z, font)
+    (*p).c = render.ctx_new(&(*p).m, &(*p).z)
+    return p
+}
+
+fn tok(p: *mut Page, t: u32) -> u32 {
+    return theme.opaque(render.color_of(&(*p).c, style.color_token(t)))
+}
+
+fn clear(p: *mut Page) {
+    canvas.canvas_clear(&(*p).cv, tok(p, style.TOK_BASE))
+}
+
+fn px(p: *mut Page, x: f64, y: f64) -> u32 {
+    return canvas.canvas_get(&(*p).cv, x as usize, y as usize)
+}
+
+fn count_col(p: *mut Page, x0: f64, y0: f64, x1: f64, y1: f64, col: u32) -> usize {
+    var n: usize = 0
+    var y: f64 = y0
+    while y < y1 {
+        var x: f64 = x0
+        while x < x1 {
+            if px(p, x, y) == col {
+                n = n + 1
+            }
+            x = x + 1.0
+        }
+        y = y + 1.0
+    }
+    return n
+}
+
+fn count_not(p: *mut Page, x0: f64, y0: f64, x1: f64, y1: f64, col: u32) -> usize {
+    var n: usize = 0
+    var y: f64 = y0
+    while y < y1 {
+        var x: f64 = x0
+        while x < x1 {
+            if px(p, x, y) != col {
+                n = n + 1
+            }
+            x = x + 1.0
+        }
+        y = y + 1.0
+    }
+    return n
+}
+
+// the x of the left-most pixel in the box that differs from `col`; -1 if none
+fn first_ink_x(p: *mut Page, x0: f64, y0: f64, x1: f64, y1: f64, col: u32) -> f64 {
+    var x: f64 = x0
+    while x < x1 {
+        var y: f64 = y0
+        while y < y1 {
+            if px(p, x, y) != col {
+                return x
+            }
+            y = y + 1.0
+        }
+        x = x + 1.0
+    }
+    return 0.0 - 1.0
+}
+
+fn near(a: f64, b: f64, tol: f64) -> bool {
+    var d: f64 = a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d <= tol
+}
+
+fn rgb(c: u32) -> u32 {
+    return c & 16777215 as u32
+}
+
+fn gold(p: *mut Page) -> u32 {
+    let f: *mut theme.Colors = theme.theme_colors(&(*p).m)
+    return theme.opaque(kitcolor.tone(&(*p).m, (*f).warning, rgb(tok(p, style.TOK_BASE)), 3.0))
+}
+
+fn accent(p: *mut Page) -> u32 {
+    return theme.opaque((*theme.theme_colors(&(*p).m)).accent)
+}
+
+fn accent_gfx(p: *mut Page) -> u32 {
+    return theme.opaque(kitcolor.accent_ui(&(*p).m, rgb(tok(p, style.TOK_BASE))))
+}
+
+// ====================================================================
+// 1. RATING
+// ====================================================================
+fn run_rating(p: *mut Page, ts: str) {
+    say("== rating (")
+    say(ts)
+    say(")\n")
+    let c: *mut render.Ctx = &(*p).c
+    let fillc: u32 = gold(p)
+    check(near(wave5.rating_width(c, 5), 136.0, 0.01), "five stars of 24 points with 4 between are 136 wide")
+    check(near(wave5.rating_height(c), 32.0, 0.01), "the row is 32 points high")
+    // three whole stars
+    clear(p)
+    wave5.rating_draw(c, 20.0, 20.0, 5, 1, 3, kit.NONE, 0 as u32)
+    check(count_col(p, 20.0, 24.0, 44.0, 48.0, fillc) > 60, "star 1 of a 3-star rating is filled in the warning colour")
+    check(count_col(p, 76.0, 24.0, 100.0, 48.0, fillc) > 60, "star 3 is filled")
+    check(count_col(p, 104.0, 24.0, 128.0, 48.0, fillc) == 0, "star 4 is not")
+    check(count_not(p, 104.0, 24.0, 128.0, 48.0, tok(p, style.TOK_BASE)) > 20, "but its outline is there")
+    // half stars: 5 steps of 2 = two and a half
+    clear(p)
+    wave5.rating_draw(c, 20.0, 20.0, 5, 2, 5, kit.NONE, 0 as u32)
+    check(count_col(p, 76.0, 24.0, 88.0, 48.0, fillc) > 20, "the left half of star 3 of 2.5 is filled")
+    check(count_col(p, 89.0, 24.0, 100.0, 48.0, fillc) == 0, "the right half is not")
+    check(count_col(p, 48.0, 24.0, 72.0, 48.0, fillc) > 60, "star 2 is whole")
+    // hover preview: the accent, over the value
+    clear(p)
+    wave5.rating_draw(c, 20.0, 20.0, 5, 1, 1, 4, 0 as u32)
+    check(count_col(p, 104.0, 24.0, 128.0, 48.0, accent_gfx(p)) > 60, "a hover preview of 4 fills star 4 in the accent")
+    check(count_col(p, 20.0, 24.0, 44.0, 48.0, fillc) == 0, "and the value's own colour is not shown while previewing")
+    // disabled: no warning colour, no accent
+    clear(p)
+    wave5.rating_draw(c, 20.0, 20.0, 5, 1, 3, 2, kit.ST_DISABLED)
+    check(count_col(p, 20.0, 24.0, 128.0, 48.0, fillc) == 0 && count_col(p, 20.0, 24.0, 44.0, 48.0, tok(p, style.TOK_TEXT_DISABLED)) > 60,
+        "a disabled rating is in the disabled colour and ignores the preview")
+    // focus ring
+    clear(p)
+    wave5.rating_draw(c, 20.0, 20.0, 5, 1, 0, kit.NONE, kit.ST_FOCUS)
+    check(count_col(p, 14.0, 14.0, 170.0, 60.0, accent_gfx(p)) > 100, "keyboard focus draws the accent ring")
+    // hit: whole and half
+    check(wave5.rating_hit(c, 20.0, 20.0, 5, 2, 24.0, 30.0) == 1 && wave5.rating_hit(c, 20.0, 20.0, 5, 2, 36.0, 30.0) == 2,
+        "the left half of the first star is step 1, the right half step 2")
+    check(wave5.rating_hit(c, 20.0, 20.0, 5, 2, 80.0, 30.0) == 5 && wave5.rating_hit(c, 20.0, 20.0, 5, 2, 92.0, 30.0) == 6,
+        "star 3 is steps 5 and 6")
+    check(wave5.rating_hit(c, 20.0, 20.0, 5, 1, 156.0, 30.0) == 0 && wave5.rating_hit(c, 20.0, 20.0, 5, 1, 19.0, 30.0) == 0
+        && wave5.rating_hit(c, 20.0, 20.0, 5, 1, 60.0, 80.0) == 0, "outside the row nothing is hit")
+    check(wave5.rating_hit(c, 20.0, 20.0, 5, 1, 46.0, 30.0) == 1, "the gap between two stars belongs to the star before it")
+    // walking along the row gives 1..5 in order
+    var seen: usize = 0
+    var ordered: bool = true
+    var x: f64 = 21.0
+    while x < 155.0 {
+        let k: usize = wave5.rating_hit(c, 20.0, 20.0, 5, 1, x, 30.0)
+        if k != 0 {
+            if k < seen {
+                ordered = false
+            }
+            seen = k
+        }
+        x = x + 3.0
+    }
+    check(seen == 5 && ordered, "walking along the row hits star 1 .. 5 in order")
+    // keys
+    check(wave5.rating_key(5, 2, 4, editor.KEY_RIGHT) == 5 && wave5.rating_key(5, 2, 4, editor.KEY_LEFT) == 3, "Right and Left move one step")
+    check(wave5.rating_key(5, 2, 10, editor.KEY_RIGHT) == 10 && wave5.rating_key(5, 2, 0, editor.KEY_LEFT) == 0, "and stop at the ends")
+    check(wave5.rating_key(5, 1, 3, editor.KEY_HOME) == 0 && wave5.rating_key(5, 1, 3, editor.KEY_END) == 5, "Home clears, End is full")
+    // mirrored
+    kit.kit_set_rtl(true)
+    clear(p)
+    wave5.rating_draw(c, 20.0, 20.0, 5, 1, 2, kit.NONE, 0 as u32)
+    check(count_col(p, 112.0, 24.0, 156.0, 48.0, fillc) > 100 && count_col(p, 20.0, 24.0, 100.0, 48.0, fillc) == 0, "mirrored, the first stars are at the right")
+    check(wave5.rating_hit(c, 20.0, 20.0, 5, 1, 150.0, 30.0) == 1 && wave5.rating_hit(c, 20.0, 20.0, 5, 1, 30.0, 30.0) == 5, "and the hit follows")
+    check(wave5.rating_key(5, 1, 2, editor.KEY_LEFT) == 3, "Left raises the value in a right-to-left window")
+    clear(p)
+    wave5.rating_draw(c, 20.0, 20.0, 5, 2, 1, kit.NONE, 0 as u32)
+    check(count_col(p, 145.0, 24.0, 156.0, 48.0, fillc) > 20 && count_col(p, 132.0, 24.0, 143.0, 48.0, fillc) == 0, "a half star fills from the start edge, the right one")
+    kit.kit_set_rtl(false)
+}
+
+// ====================================================================
+// 2. CHIPS
+// ====================================================================
+fn run_chips(p: *mut Page, ts: str) {
+    say("== chips (")
+    say(ts)
+    say(")\n")
+    let c: *mut render.Ctx = &(*p).c
+    var chips: [wave5.Chip; 4] = [
+        wave5.Chip { label: "Rust", icon: kit.ICON_NONE, selected: false, close: false },
+        wave5.Chip { label: "Firn", icon: lucide.STAR, selected: true, close: false },
+        wave5.Chip { label: "Open source", icon: kit.ICON_NONE, selected: false, close: true },
+        wave5.Chip { label: "Embedded", icon: kit.ICON_NONE, selected: true, close: true }]
+    let cp: *mut wave5.Chip = (&chips[0]) as *mut wave5.Chip
+    check(near(wave5.chip_height(c), 32.0, 0.01), "a chip is 32 points high")
+    let w0: f64 = wave5.chip_width(c, wave5.chip_at(cp, 0))
+    let w1: f64 = wave5.chip_width(c, wave5.chip_at(cp, 1))
+    let w2: f64 = wave5.chip_width(c, wave5.chip_at(cp, 2))
+    check(w1 > w0 + 16.0, "a symbol makes a chip wider")
+    check(w2 > wave5.chip_width(c, wave5.chip_at(cp, 0)) + 40.0, "a longer label and a close button make it wider")
+    // one row when there is room, more when there is not
+    check(near(wave5.chips_height(c, cp, 4, 600.0), 32.0, 0.01), "all four chips fit one row of 600 points")
+    let hn: f64 = wave5.chips_height(c, cp, 4, 200.0)
+    check(hn > 60.0 && near(hn, 32.0 + 8.0 + 32.0, 0.01) || near(hn, 3.0 * 32.0 + 16.0, 0.01), "in 200 points they wrap to more rows (8 points between rows)")
+    check(near(wave5.chips_height(c, cp, 0, 200.0), 0.0, 0.001), "no chips take no room")
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var cw: f64 = 0.0
+    var ch: f64 = 0.0
+    let row_last: usize = wave5.chips_rect(c, cp, 4, 3, 20.0, 20.0, 200.0, &cx, &cy, &cw, &ch)
+    check(row_last >= 1 && cy > 20.0 + 31.0, "the last chip of the narrow block is on a later row")
+    check(cx >= 20.0 && cx + cw <= 220.5, "and no chip leaves the block")
+    // draw: the fills
+    clear(p)
+    wave5.chips_draw(c, cp, 4, kit.NONE, 0 as u32, kit.NONE, 20.0, 20.0, 600.0)
+    var x0: f64 = 0.0
+    var y0: f64 = 0.0
+    var w_: f64 = 0.0
+    var h_: f64 = 0.0
+    let r0: usize = wave5.chips_rect(c, cp, 4, 0, 20.0, 20.0, 600.0, &x0, &y0, &w_, &h_)
+    check(px(p, x0 + 6.0, y0 + 16.0) == tok(p, style.TOK_BUTTON), "an unselected chip is the button ground")
+    var x1: f64 = 0.0
+    var y1: f64 = 0.0
+    let r1: usize = wave5.chips_rect(c, cp, 4, 1, 20.0, 20.0, 600.0, &x1, &y1, &w_, &h_)
+    check(px(p, x1 + 6.0, y1 + 16.0) == accent(p), "a selected chip is filled with the accent")
+    check(count_col(p, x1, y1, x1 + w_, y1 + h_, theme.opaque(kitcolor.on_color(&(*p).m, accent(p)))) > 10,
+        "its label and symbol are in the colour that reads on the accent")
+    check(count_col(p, x0, y0, x0 + 40.0, y0 + 32.0, tok(p, style.TOK_BORDER)) > 20, "an unselected chip has a border")
+    // hover and close hover
+    clear(p)
+    wave5.chips_draw(c, cp, 4, 0, wave5.CHIP_PART_BODY, kit.NONE, 20.0, 20.0, 600.0)
+    check(px(p, x0 + 6.0, y0 + 16.0) == tok(p, style.TOK_BUTTON_HOVER), "the hovered chip takes the hover colour")
+    var x2: f64 = 0.0
+    var y2: f64 = 0.0
+    var w2_: f64 = 0.0
+    let r2: usize = wave5.chips_rect(c, cp, 4, 2, 20.0, 20.0, 600.0, &x2, &y2, &w2_, &h_)
+    clear(p)
+    wave5.chips_draw(c, cp, 4, 2, wave5.CHIP_PART_CLOSE, kit.NONE, 20.0, 20.0, 600.0)
+    let n_disc: usize = count_col(p, x2 + w2_ - 24.0, y2, x2 + w2_, y2 + 32.0, tok(p, style.TOK_BUTTON_ACTIVE))
+    check(n_disc > 100, "a hovered close button gets its disc")
+    clear(p)
+    wave5.chips_draw(c, cp, 4, 2, wave5.CHIP_PART_BODY, kit.NONE, 20.0, 20.0, 600.0)
+    check(count_col(p, x2 + w2_ - 24.0, y2, x2 + w2_, y2 + 32.0, tok(p, style.TOK_BUTTON_ACTIVE)) + 100 < n_disc, "the disc only shows when the close part is hovered")
+    // focus
+    clear(p)
+    wave5.chips_draw(c, cp, 4, kit.NONE, 0 as u32, 0, 20.0, 20.0, 600.0)
+    check(count_col(p, x0 - 4.0, y0 - 4.0, x0 + w_ + 4.0, y0 + 40.0, accent_gfx(p)) > 80, "the chip with the focus has the accent ring")
+    // hit
+    var part: u32 = 0 as u32
+    check(wave5.chips_hit(c, cp, 4, 20.0, 20.0, 600.0, x1 + 10.0, y1 + 16.0, &part) == 1 && part == wave5.CHIP_PART_BODY, "a point on chip 1 hits its body")
+    check(wave5.chips_hit(c, cp, 4, 20.0, 20.0, 600.0, x2 + w2_ - 10.0, y2 + 16.0, &part) == 2 && part == wave5.CHIP_PART_CLOSE, "a point on the close button of chip 2 hits the close part")
+    check(wave5.chips_hit(c, cp, 4, 20.0, 20.0, 600.0, x2 + 10.0, y2 + 16.0, &part) == 2 && part == wave5.CHIP_PART_BODY, "and the label of chip 2 hits the body")
+    check(wave5.chips_hit(c, cp, 4, 20.0, 20.0, 600.0, x0 + 6.0, y0 + 16.0, &part) == 0 && part == wave5.CHIP_PART_BODY, "a chip without a close button has only a body")
+    check(wave5.chips_hit(c, cp, 4, 20.0, 20.0, 600.0, 5.0, 5.0, &part) == kit.NONE && wave5.chips_hit(c, cp, 4, 20.0, 20.0, 600.0, x0 + 2.0, y0 + 60.0, &part) == kit.NONE,
+        "elsewhere nothing")
+    // keys
+    check(wave5.chips_key(4, kit.NONE, editor.KEY_RIGHT) == 0 && wave5.chips_key(4, 1, editor.KEY_RIGHT) == 2 && wave5.chips_key(4, 3, editor.KEY_RIGHT) == 3
+        && wave5.chips_key(4, 2, editor.KEY_HOME) == 0 && wave5.chips_key(4, 0, editor.KEY_END) == 3, "keys move the focus along the chips")
+    check(wave5.chip_wants_remove(editor.KEY_DELETE) && wave5.chip_wants_remove(editor.KEY_BACKSPACE) && !wave5.chip_wants_remove(editor.KEY_ENTER), "Delete and Backspace ask to remove")
+    // mirrored: the first chip is at the right of the block, the close button at the left of its chip
+    kit.kit_set_rtl(true)
+    var mx: f64 = 0.0
+    var my: f64 = 0.0
+    var mw: f64 = 0.0
+    var mx3: f64 = 0.0
+    let rm0: usize = wave5.chips_rect(c, cp, 4, 0, 20.0, 20.0, 600.0, &mx, &my, &mw, &h_)
+    let rm1: usize = wave5.chips_rect(c, cp, 4, 1, 20.0, 20.0, 600.0, &mx3, &my, &w_, &h_)
+    check(near(mx + mw, 620.0, 0.5) && mx3 < mx, "mirrored, the first chip is at the right edge and the next one to its left")
+    let rm2: usize = wave5.chips_rect(c, cp, 4, 2, 20.0, 20.0, 600.0, &x2, &y2, &w2_, &h_)
+    check(wave5.chips_hit(c, cp, 4, 20.0, 20.0, 600.0, x2 + 10.0, y2 + 16.0, &part) == 2 && part == wave5.CHIP_PART_CLOSE, "and the close button sits at the left of a chip")
+    check(wave5.chips_key(4, 1, editor.KEY_LEFT) == 2, "Left goes on in a right-to-left window")
+    kit.kit_set_rtl(false)
+}
+
+// ====================================================================
+// 3. SEGMENTED
+// ====================================================================
+fn run_segmented(p: *mut Page, ts: str) {
+    say("== segmented (")
+    say(ts)
+    say(")\n")
+    let c: *mut render.Ctx = &(*p).c
+    var segs: [wave5.Seg; 3] = [wave5.Seg { label: "Day", icon: kit.ICON_NONE }, wave5.Seg { label: "Week", icon: lucide.STAR },
+        wave5.Seg { label: "Month", icon: kit.ICON_NONE }]
+    let sp: *mut wave5.Seg = (&segs[0]) as *mut wave5.Seg
+    check(near(wave5.seg_height(c), 32.0, 0.01), "the pill is 32 points high")
+    clear(p)
+    wave5.seg_draw(c, sp, 3, 1, kit.NONE, false, 20.0, 20.0, 300.0)
+    var sx: f64 = 0.0
+    var sw: f64 = 0.0
+    wave5.seg_rect(c, 3, 1, 20.0, 300.0, &sx, &sw)
+    check(near(sw, 98.67, 0.05), "three segments share the width inside a 2-point rim")
+    check(px(p, sx + 6.0, 36.0) == accent(p), "the chosen segment is filled with the accent")
+    var sx0: f64 = 0.0
+    var sw0: f64 = 0.0
+    wave5.seg_rect(c, 3, 0, 20.0, 300.0, &sx0, &sw0)
+    check(px(p, sx0 + 6.0, 36.0) == tok(p, style.TOK_BUTTON), "the others show the pill's ground")
+    check(count_col(p, 20.0, 20.0, 320.0, 52.0, tok(p, style.TOK_BORDER)) > 100, "the pill has a border")
+    clear(p)
+    wave5.seg_draw(c, sp, 3, 1, 0, false, 20.0, 20.0, 300.0)
+    check(px(p, sx0 + 6.0, 36.0) == tok(p, style.TOK_BUTTON_HOVER), "the hovered one takes the hover colour")
+    clear(p)
+    wave5.seg_draw(c, sp, 3, 1, kit.NONE, true, 20.0, 20.0, 300.0)
+    check(count_col(p, sx - 4.0, 16.0, sx + sw + 4.0, 56.0, accent_gfx(p)) > 100, "with focus the chosen segment has a ring")
+    check(count_col(p, sx0, 22.0, sx0 + sw0, 50.0, tok(p, style.TOK_TEXT)) > 10 || count_not(p, sx0 + 20.0, 28.0, sx0 + sw0 - 20.0, 44.0, tok(p, style.TOK_BUTTON)) > 20, "the labels are in the text colour")
+    // hit
+    var seen: usize = 0
+    var ordered: bool = true
+    var x: f64 = 21.0
+    while x < 319.0 {
+        let k: usize = wave5.seg_hit(c, 3, 20.0, 20.0, 300.0, x, 36.0)
+        if k != kit.NONE {
+            if k < seen {
+                ordered = false
+            }
+            seen = k
+        }
+        x = x + 3.0
+    }
+    check(seen == 2 && ordered, "walking along the pill hits 0, 1, 2 in order")
+    check(wave5.seg_hit(c, 3, 20.0, 20.0, 300.0, 21.0, 36.0) == 0 && wave5.seg_hit(c, 3, 20.0, 20.0, 300.0, 319.0, 36.0) == 2, "the rim belongs to the end segments")
+    check(wave5.seg_hit(c, 3, 20.0, 20.0, 300.0, 100.0, 70.0) == kit.NONE && wave5.seg_hit(c, 3, 20.0, 20.0, 300.0, 10.0, 36.0) == kit.NONE, "outside nothing")
+    // keys
+    check(wave5.seg_key(3, 0, editor.KEY_RIGHT) == 1 && wave5.seg_key(3, 2, editor.KEY_RIGHT) == 2 && wave5.seg_key(3, 1, editor.KEY_LEFT) == 0
+        && wave5.seg_key(3, 1, editor.KEY_END) == 2 && wave5.seg_key(3, 2, editor.KEY_HOME) == 0, "arrow keys, Home and End choose, without wrapping")
+    check(wave5.seg_key(3, kit.NONE, editor.KEY_RIGHT) == 0 && wave5.seg_key(3, kit.NONE, editor.KEY_ENTER) == kit.NONE, "with nothing chosen the first arrow key picks the first")
+    // mirrored
+    kit.kit_set_rtl(true)
+    var mx0: f64 = 0.0
+    var mx2: f64 = 0.0
+    wave5.seg_rect(c, 3, 0, 20.0, 300.0, &mx0, &sw0)
+    wave5.seg_rect(c, 3, 2, 20.0, 300.0, &mx2, &sw0)
+    check(mx0 > mx2, "mirrored, the first segment is at the right")
+    check(wave5.seg_hit(c, 3, 20.0, 20.0, 300.0, 318.0, 36.0) == 0 && wave5.seg_hit(c, 3, 20.0, 20.0, 300.0, 22.0, 36.0) == 2, "and the hit follows")
+    check(wave5.seg_key(3, 0, editor.KEY_LEFT) == 1, "Left goes on")
+    kit.kit_set_rtl(false)
+}
+
+// ====================================================================
+// 4. SKELETON
+// ====================================================================
+fn run_skeleton(p: *mut Page, ts: str) {
+    say("== skeleton (")
+    say(ts)
+    say(")\n")
+    let c: *mut render.Ctx = &(*p).c
+    let base: u32 = tok(p, style.TOK_BUTTON)
+    let hov: u32 = tok(p, style.TOK_BUTTON_HOVER)
+    check(base != hov, "the band colour differs from the block colour")
+    // reduced motion: the still block
+    clear(p)
+    wave5.skeleton_draw(c, 20.0, 20.0, 200.0, 16.0, 4, 0 - 1)
+    check(count_not(p, 26.0, 23.0, 214.0, 33.0, base) == 0, "with a phase below 0 the block is plain (reduced motion)")
+    check(px(p, 120.0, 28.0) == base && px(p, 19.0, 28.0) == tok(p, style.TOK_BASE), "and stays inside its box")
+    // the band
+    clear(p)
+    wave5.skeleton_draw(c, 20.0, 20.0, 200.0, 16.0, 4, 800)
+    check(px(p, 120.0, 28.0) == hov, "half way through the cycle the core of the band is the hover colour")
+    check(px(p, 30.0, 28.0) == base && px(p, 210.0, 28.0) == base, "and the ends are untouched")
+    var steps: usize = 0
+    var last: u32 = base
+    var xx: f64 = 60.0
+    while xx < 130.0 {
+        let v: u32 = px(p, xx, 28.0)
+        if v != last {
+            steps = steps + 1
+            last = v
+        }
+        xx = xx + 1.0
+    }
+    check(steps >= 3, "the band rises in steps (three nested layers)")
+    clear(p)
+    wave5.skeleton_draw(c, 20.0, 20.0, 200.0, 16.0, 4, 200)
+    let a: f64 = first_ink_x(p, 24.0, 26.0, 216.0, 30.0, base)
+    clear(p)
+    wave5.skeleton_draw(c, 20.0, 20.0, 200.0, 16.0, 4, 1200)
+    let b: f64 = first_ink_x(p, 24.0, 26.0, 216.0, 30.0, base)
+    check(a != b && b > a, "the band is further on after 1000 ms")
+    // the corner stays round under the band
+    clear(p)
+    wave5.skeleton_draw(c, 20.0, 20.0, 200.0, 16.0, 8, 0)
+    check(px(p, 20.0, 20.0) == tok(p, style.TOK_BASE), "the band does not square the corners")
+    // time
+    check(wave5.shim_step(1500, 200) == 100 && wave5.shim_step(0 - 1, 50) == 0 - 1 && wave5.shim_step(10, 0 - 5) == 10, "the phase wraps in the cycle, a negative phase stays")
+    check(wave5.shim_step(wave5.shim_step(0, 8), 8) == wave5.shim_step(0, 16), "two 8 ms steps are one 16 ms step (dt-based)")
+    // lines
+    clear(p)
+    let lh: f64 = wave5.skeleton_lines(c, 20.0, 20.0, 200.0, 3, 0 - 1)
+    check(near(lh, 3.0 * 12.0 + 2.0 * 8.0, 0.01), "three text lines are 12 high with 8 between")
+    check(px(p, 100.0, 26.0) == base && px(p, 100.0, 26.0 + 20.0) == base, "the lines are painted")
+    check(px(p, 180.0, 26.0 + 40.0) == tok(p, style.TOK_BASE) && px(p, 100.0, 26.0 + 40.0) == base, "the last of several lines is shorter (60 %)")
+    clear(p)
+    let lh2: f64 = wave5.skeleton_lines(c, 20.0, 20.0, 200.0, 3, 800)
+    check(count_col(p, 20.0, 20.0, 220.0, 20.0 + lh2, hov) > 10, "the shimmer runs over the lines")
+    // a disc
+    clear(p)
+    wave5.skeleton_disc(c, 20.0, 20.0, 32.0, 0 - 1)
+    check(px(p, 20.0, 20.0) == tok(p, style.TOK_BASE) && px(p, 36.0, 36.0) == base, "a disc is round")
+    // mirrored: the band runs from the right
+    kit.kit_set_rtl(true)
+    clear(p)
+    wave5.skeleton_draw(c, 20.0, 20.0, 200.0, 16.0, 4, 200)
+    let r1: f64 = first_ink_x(p, 24.0, 26.0, 216.0, 30.0, base)
+    clear(p)
+    wave5.skeleton_draw(c, 20.0, 20.0, 200.0, 16.0, 4, 1000)
+    let r2: f64 = first_ink_x(p, 24.0, 26.0, 216.0, 30.0, base)
+    check(r2 < r1, "mirrored, the band moves from right to left")
+    kit.kit_set_rtl(false)
+}
+
+// ====================================================================
+// 5. CHART
+// ====================================================================
+fn fill_vals(n: usize) -> *mut f64 {
+    let v: *mut f64 = rt.heap_alloc(n * 8 + 8) as *mut f64
+    var i: usize = 0
+    while i < n {
+        *((v as usize + i * 8) as *mut f64) = (i as f64)
+        i = i + 1
+    }
+    return v
+}
+
+fn run_chart(p: *mut Page, ts: str) {
+    say("== chart (")
+    say(ts)
+    say(")\n")
+    let c: *mut render.Ctx = &(*p).c
+    let g: u32 = accent_gfx(p)
+    // decimation
+    let big: *mut f64 = fill_vals(1000)
+    var out: [f64; 512] = [0.0; 512]
+    let m: usize = wave5.chart_decimate(big, 1000, 50, false, &out)
+    check(m == 50, "1000 values reduce to the 50 asked for")
+    check(near(out[0], 9.5, 0.001) && near(out[49], 989.5, 0.001), "a line bucket is the mean of its values")
+    let m2: usize = wave5.chart_decimate(big, 1000, 50, true, &out)
+    check(m2 == 50 && near(out[0], 19.0, 0.001) && near(out[49], 999.0, 0.001), "a bar bucket is the largest of its values (a spike stays)")
+    let m3: usize = wave5.chart_decimate(big, 3, 50, false, &out)
+    check(m3 == 3 && near(out[2], 2.0, 0.001), "few values are kept as they are")
+    let m4: usize = wave5.chart_decimate(big, 1000, 9999, false, &out)
+    check(m4 == wave5.CHART_MAX_POINTS, "never more than the point cap")
+    // a line
+    var v: [f64; 7] = [1.0, 5.0, 2.0, 8.0, 3.0, 9.0, 4.0]
+    let vp: *mut f64 = (&v[0]) as *mut f64
+    clear(p)
+    wave5.chart_draw(c, 20.0, 20.0, 140.0, 48.0, vp, 7, wave5.CH_LINE, kit.NONE)
+    let line_px: usize = count_col(p, 20.0, 20.0, 160.0, 68.0, g)
+    check(line_px > 40, "a line is drawn in the accent graphic colour")
+    check(count_col(p, 20.0, 20.0, 40.0, 68.0, g) > 5 && count_col(p, 140.0, 20.0, 160.0, 68.0, g) > 5, "from the first value to the last")
+    check(px(p, 19.0, 44.0) == tok(p, style.TOK_BASE) && px(p, 161.0, 44.0) == tok(p, style.TOK_BASE), "and not outside its box")
+    // an area adds the translucent fill under the line
+    clear(p)
+    wave5.chart_draw(c, 20.0, 20.0, 140.0, 48.0, vp, 7, wave5.CH_AREA, kit.NONE)
+    check(count_not(p, 20.0, 20.0, 160.0, 68.0, tok(p, style.TOK_BASE)) > line_px + 400, "an area also tints the space under the line")
+    check(px(p, 90.0, 62.0) != tok(p, style.TOK_BASE), "right above the bottom the area is tinted")
+    // bars
+    clear(p)
+    wave5.chart_draw(c, 20.0, 20.0, 140.0, 48.0, vp, 7, wave5.CH_BARS, kit.NONE)
+    check(count_col(p, 20.0, 20.0, 160.0, 68.0, g) > 300, "bars are drawn")
+    var bars: usize = 0
+    var inbar: bool = false
+    var bx: f64 = 20.0
+    while bx < 160.0 {
+        let cur: bool = px(p, bx, 60.0) == g
+        if cur && !inbar {
+            bars = bars + 1
+        }
+        inbar = cur
+        bx = bx + 1.0
+    }
+    check(bars == 7, "seven values make seven separate bars")
+    // hover mark
+    clear(p)
+    wave5.chart_draw(c, 20.0, 20.0, 140.0, 48.0, vp, 7, wave5.CH_LINE, 3)
+    check(count_col(p, 20.0, 20.0, 160.0, 68.0, tok(p, style.TOK_TEXT)) > 8, "a hovered value gets a mark")
+    // hit
+    check(wave5.chart_hit(c, 20.0, 20.0, 140.0, 48.0, 7, 90.0, 40.0) == 3 && wave5.chart_hit(c, 20.0, 20.0, 140.0, 48.0, 7, 25.0, 40.0) == 0
+        && wave5.chart_hit(c, 20.0, 20.0, 140.0, 48.0, 7, 155.0, 40.0) == 6, "the index of the value under a point")
+    check(wave5.chart_hit(c, 20.0, 20.0, 140.0, 48.0, 7, 10.0, 40.0) == kit.NONE && wave5.chart_hit(c, 20.0, 20.0, 140.0, 48.0, 0, 90.0, 40.0) == kit.NONE, "outside, or with no data, nothing")
+    // a flat series and a single value do not divide by zero
+    var flat: [f64; 4] = [3.0, 3.0, 3.0, 3.0]
+    clear(p)
+    wave5.chart_draw(c, 20.0, 20.0, 140.0, 48.0, (&flat[0]) as *mut f64, 4, wave5.CH_LINE, kit.NONE)
+    check(count_col(p, 20.0, 20.0, 160.0, 68.0, g) > 20, "a flat series is a line")
+    var one: [f64; 1] = [5.0]
+    clear(p)
+    wave5.chart_draw(c, 20.0, 20.0, 140.0, 48.0, (&one[0]) as *mut f64, 1, wave5.CH_AREA, kit.NONE)
+    wave5.chart_draw(c, 20.0, 20.0, 140.0, 48.0, (&one[0]) as *mut f64, 1, wave5.CH_BARS, kit.NONE)
+    check(count_col(p, 20.0, 20.0, 160.0, 68.0, g) > 5, "a single value draws something")
+    // many values
+    let many: *mut f64 = fill_vals(200000)
+    clear(p)
+    wave5.chart_draw(c, 20.0, 20.0, 140.0, 48.0, many, 200000, wave5.CH_LINE, kit.NONE)
+    check(count_col(p, 20.0, 20.0, 160.0, 68.0, g) > 40, "200000 values are decimated and drawn")
+    clear(p)
+    wave5.chart_draw(c, 20.0, 20.0, 140.0, 48.0, many, 200000, wave5.CH_BARS, kit.NONE)
+    check(count_not(p, 20.0, 20.0, 160.0, 68.0, tok(p, style.TOK_BASE)) > 300, "and as bars")
+    // mirrored: the line rises to the left; the last value (the highest of 0..n) is at the left
+    kit.kit_set_rtl(true)
+    clear(p)
+    wave5.chart_draw(c, 20.0, 20.0, 140.0, 48.0, many, 200000, wave5.CH_LINE, kit.NONE)
+    check(count_col(p, 20.0, 20.0, 50.0, 30.0, g) > 5 && count_col(p, 130.0, 20.0, 160.0, 30.0, g) == 0, "mirrored, the end of the series is at the left")
+    check(wave5.chart_hit(c, 20.0, 20.0, 140.0, 48.0, 7, 155.0, 40.0) == 0 && wave5.chart_hit(c, 20.0, 20.0, 140.0, 48.0, 7, 25.0, 40.0) == 6, "and the hit follows")
+    kit.kit_set_rtl(false)
+}
+
+// ====================================================================
+// 6. PAGE DOTS
+// ====================================================================
+fn run_dots(p: *mut Page, ts: str) {
+    say("== page dots (")
+    say(ts)
+    say(")\n")
+    let c: *mut render.Ctx = &(*p).c
+    check(near(wave5.dots_width(c, 5), 80.0, 0.01) && near(wave5.dots_height(c), 24.0, 0.01), "five dots are 80 wide, 24 high")
+    let g: u32 = accent_gfx(p)
+    clear(p)
+    wave5.dots_draw(c, 20.0, 20.0, 5, 2.0, kit.NONE)
+    // the dot centres are at x + 8 + 16 i
+    check(px(p, 20.0 + 8.0 + 32.0, 32.0) == g, "the current dot is the accent")
+    let idle: u32 = px(p, 20.0 + 8.0, 32.0)
+    check(idle != g && idle != tok(p, style.TOK_BASE), "the others are muted")
+    check(count_col(p, 20.0, 20.0, 100.0, 44.0, g) > 100 && count_col(p, 20.0 + 24.0, 28.0, 20.0 + 56.0, 36.0, g) > 100, "the current one is a long pill (20 wide)")
+    clear(p)
+    wave5.dots_draw(c, 20.0, 20.0, 5, 2.5, kit.NONE)
+    check(px(p, 20.0 + 8.0 + 32.0, 32.0) == g && px(p, 20.0 + 8.0 + 48.0, 32.0) == g, "half way between two pages both dots are on")
+    clear(p)
+    wave5.dots_draw(c, 20.0, 20.0, 5, 0.0, 3)
+    check(px(p, 20.0 + 8.0 + 48.0, 32.0) != idle, "the hovered dot is brighter")
+    check(wave5.dots_hit(c, 20.0, 20.0, 5, 28.0, 30.0) == 0 && wave5.dots_hit(c, 20.0, 20.0, 5, 90.0, 30.0) == 4 && wave5.dots_hit(c, 20.0, 20.0, 5, 60.0, 30.0) == 2,
+        "the slot under a point")
+    check(wave5.dots_hit(c, 20.0, 20.0, 5, 110.0, 30.0) == kit.NONE && wave5.dots_hit(c, 20.0, 20.0, 5, 60.0, 50.0) == kit.NONE, "outside nothing")
+    kit.kit_set_rtl(true)
+    clear(p)
+    wave5.dots_draw(c, 20.0, 20.0, 5, 0.0, kit.NONE)
+    check(px(p, 20.0 + 80.0 - 8.0, 32.0) == g, "mirrored, page 0 is the dot at the right")
+    check(wave5.dots_hit(c, 20.0, 20.0, 5, 92.0, 30.0) == 0 && wave5.dots_hit(c, 20.0, 20.0, 5, 24.0, 30.0) == 4, "and the hit follows")
+    kit.kit_set_rtl(false)
+}
+
+// ====================================================================
+// 7. PAGER
+// ====================================================================
+fn run_pager(p: *mut Page, ts: str) {
+    say("== pager (")
+    say(ts)
+    say(")\n")
+    let c: *mut render.Ctx = &(*p).c
+    var g: wave5.Pager = wave5.pager_new(5)
+    check(g.cur == 0 && near(wave5.pager_pos(&g), 0.0, 0.0001) && !wave5.pager_animating(&g), "a new pager rests on page 0")
+    wave5.pager_next(&g)
+    check(g.cur == 1 && wave5.pager_animating(&g), "next sets the page; the position has to glide there")
+    wave5.pager_goto(&g, 99)
+    check(g.cur == 4, "goto is clamped to the last page")
+    wave5.pager_prev(&g)
+    wave5.pager_goto(&g, 0)
+    wave5.pager_prev(&g)
+    check(g.cur == 0, "previous stops at the first")
+    // keys
+    check(wave5.pager_key(&g, editor.KEY_RIGHT) && g.cur == 1 && wave5.pager_key(&g, editor.KEY_END) && g.cur == 4 && !wave5.pager_key(&g, editor.KEY_RIGHT)
+        && wave5.pager_key(&g, editor.KEY_HOME) && g.cur == 0 && !wave5.pager_key(&g, editor.KEY_ENTER), "arrow keys, Home and End turn pages; a key that does nothing says so")
+    check(wave5.pager_key(&g, editor.KEY_PGDN) && g.cur == 1 && wave5.pager_key(&g, editor.KEY_PGUP) && g.cur == 0, "Page Down and Page Up too")
+    // the glide is dt-based
+    var a: wave5.Pager = wave5.pager_new(5)
+    var b: wave5.Pager = wave5.pager_new(5)
+    wave5.pager_goto(&a, 3)
+    wave5.pager_goto(&b, 3)
+    let m1: bool = wave5.pager_tick(&a, 32, 160)
+    let m2: bool = wave5.pager_tick(&b, 16, 160)
+    let m3: bool = wave5.pager_tick(&b, 16, 160)
+    check(near(a.off, b.off, 0.000001), "two 16 ms ticks glide exactly as far as one 32 ms tick")
+    check(a.off > 0.5 && a.off < 2.9, "and the position is on its way")
+    var t: usize = 0
+    while t < 60 {
+        let mv: bool = wave5.pager_tick(&a, 16, 160)
+        t = t + 1
+    }
+    check(near(a.off, 3.0, 0.0001) && !wave5.pager_animating(&a), "after a second it has arrived and stops asking for frames")
+    var c0: wave5.Pager = wave5.pager_new(5)
+    wave5.pager_goto(&c0, 4)
+    let mv0: bool = wave5.pager_tick(&c0, 16, 0)
+    check(near(c0.off, 4.0, 0.0001) && !mv0, "a theme with motion 0 jumps")
+    let q0: i64 = 0
+    // the theme's own motion key is what the program hands in
+    check(((*theme.theme_shape(&(*p).m)).motion as i64) > 0, "the theme has a transition time (shape.motion)")
+    // drag with a fling
+    var d: wave5.Pager = wave5.pager_new(5)
+    wave5.pager_drag_begin(&d, 300.0, 0)
+    wave5.pager_drag_move(&d, 100.0, 400.0, 100)
+    check(near(d.off, 0.5, 0.001) && wave5.pager_animating(&d), "dragging 200 points left of a 400 wide page moves the position by half a page")
+    check(!wave5.pager_tick(&d, 16, 160) && near(d.off, 0.5, 0.001), "while the finger is down nothing glides")
+    wave5.pager_drag_end(&d)
+    check(d.cur == 1, "a quick flick goes on to the next page")
+    var s: wave5.Pager = wave5.pager_new(5)
+    wave5.pager_drag_begin(&s, 300.0, 0)
+    wave5.pager_drag_move(&s, 250.0, 400.0, 500)
+    wave5.pager_drag_end(&s)
+    check(s.cur == 0, "a short slow drag falls back")
+    var r: wave5.Pager = wave5.pager_new(5)
+    wave5.pager_drag_begin(&r, 300.0, 0)
+    wave5.pager_drag_move(&r, 500.0, 400.0, 400)
+    check(r.off < 0.0 && r.off > 0.0 - 0.3, "dragging past the first page meets resistance")
+    wave5.pager_drag_end(&r)
+    check(r.cur == 0, "and lets go back to the first")
+    var f: wave5.Pager = wave5.pager_new(5)
+    wave5.pager_goto(&f, 4)
+    f.off = 4.0
+    wave5.pager_drag_begin(&f, 300.0, 0)
+    wave5.pager_drag_move(&f, 100.0, 400.0, 100)
+    wave5.pager_drag_end(&f)
+    check(f.cur == 4, "a fling past the last page stays on it")
+    var far: wave5.Pager = wave5.pager_new(9)
+    wave5.pager_drag_begin(&far, 380.0, 0)
+    wave5.pager_drag_move(&far, 20.0, 400.0, 20)
+    wave5.pager_drag_end(&far)
+    check(far.cur == 1, "a flick moves at most one page")
+    // geometry
+    var h: wave5.Pager = wave5.pager_new(5)
+    check(near(wave5.pager_page_x(&h, 0, 20.0, 400.0), 20.0, 0.001) && near(wave5.pager_page_x(&h, 1, 20.0, 400.0), 420.0, 0.001), "page 1 waits one page width to the right")
+    h.off = 0.5
+    check(near(wave5.pager_page_x(&h, 0, 20.0, 400.0), 0.0 - 180.0, 0.001), "and page 0 is half out to the left")
+    // the clip
+    clear(p)
+    let inside: bool = wave5.pager_begin(c, 20.0, 20.0, 100.0, 60.0)
+    painter.surface(&(*p).z, 0.0, 0.0, 300.0, 300.0, tok(p, style.TOK_BUTTON))
+    if inside {
+        wave5.pager_end(c)
+    }
+    check(inside && px(p, 50.0, 50.0) == tok(p, style.TOK_BUTTON) && px(p, 10.0, 50.0) == tok(p, style.TOK_BASE) && px(p, 130.0, 50.0) == tok(p, style.TOK_BASE)
+        && px(p, 50.0, 90.0) == tok(p, style.TOK_BASE), "pages are clipped to the pager's box")
+    // the chrome: arrows and dots
+    var n: wave5.Pager = wave5.pager_new(5)
+    clear(p)
+    wave5.pager_nav_draw(c, &n, 20.0, 20.0, 400.0, 200.0, wave5.PG_NEXT)
+    check(px(p, 380.0 + 3.0, 120.0) == tok(p, style.TOK_BUTTON_HOVER), "the hovered arrow takes the hover colour")
+    check(px(p, 28.0 + 3.0, 120.0) == tok(p, style.TOK_SURFACE_RAISED), "the other arrow is plain")
+    check(count_not(p, 36.0, 112.0, 52.0, 128.0, tok(p, style.TOK_SURFACE_RAISED)) > 8 && count_not(p, 388.0, 112.0, 404.0, 128.0, tok(p, style.TOK_BUTTON_HOVER)) > 8,
+        "both arrows have a glyph (the one that cannot go on is drawn disabled)")
+    check(count_col(p, 20.0, 190.0, 420.0, 220.0, accent_gfx(p)) > 100, "the dots are at the bottom")
+    check(wave5.pager_nav_hit(c, &n, 20.0, 20.0, 400.0, 200.0, 390.0, 120.0) == wave5.PG_NEXT, "a point on the next arrow hits it")
+    check(wave5.pager_nav_hit(c, &n, 20.0, 20.0, 400.0, 200.0, 40.0, 120.0) == wave5.PG_NONE, "a disabled arrow is not hit")
+    wave5.pager_goto(&n, 4)
+    check(wave5.pager_nav_hit(c, &n, 20.0, 20.0, 400.0, 200.0, 40.0, 120.0) == wave5.PG_PREV && wave5.pager_nav_hit(c, &n, 20.0, 20.0, 400.0, 200.0, 390.0, 120.0) == wave5.PG_NONE,
+        "at the last page it is the other way round")
+    // the dots: 5 dots = 80 wide, centred in 400: x from 180; y = 20 + 200 - 24 - 4 = 192
+    let dp: u32 = wave5.pager_nav_hit(c, &n, 20.0, 20.0, 400.0, 200.0, 180.0 + 8.0 + 32.0, 200.0)
+    check(dp == wave5.PG_DOT + 2 as u32, "a point on dot 2 hits PG_DOT + 2")
+    check(wave5.pager_nav_hit(c, &n, 20.0, 20.0, 400.0, 200.0, 220.0, 120.0) == wave5.PG_NONE, "the middle of the page hits nothing")
+    // mirrored: previous at the right
+    kit.kit_set_rtl(true)
+    var w: wave5.Pager = wave5.pager_new(5)
+    wave5.pager_goto(&w, 2)
+    check(wave5.pager_nav_hit(c, &w, 20.0, 20.0, 400.0, 200.0, 390.0, 120.0) == wave5.PG_PREV && wave5.pager_nav_hit(c, &w, 20.0, 20.0, 400.0, 200.0, 40.0, 120.0) == wave5.PG_NEXT,
+        "mirrored, previous is at the right and next at the left")
+    check(near(wave5.pager_page_x(&h, 1, 20.0, 400.0), 20.0 - 0.5 * 400.0, 0.001) || near(wave5.pager_page_x(&h, 1, 20.0, 400.0), 20.0 - 200.0, 0.001), "and the next page comes in from the left")
+    check(wave5.pager_key(&w, editor.KEY_LEFT) && w.cur == 3, "Left turns on")
+    var rd: wave5.Pager = wave5.pager_new(5)
+    wave5.pager_drag_begin(&rd, 100.0, 0)
+    wave5.pager_drag_move(&rd, 300.0, 400.0, 100)
+    check(near(rd.off, 0.5, 0.001), "dragging to the right goes on in a right-to-left window")
+    kit.kit_set_rtl(false)
+}
+
+// ====================================================================
+// 8. PICTURES
+// ====================================================================
+fn run_picture(p: *mut Page) {
+    let c: *mut render.Ctx = &(*p).c
+    clear(p)
+    wave5.rating_draw(c, 20.0, 12.0, 5, 2, 7, kit.NONE, 0 as u32)
+    var chips: [wave5.Chip; 3] = [wave5.Chip { label: "Rust", icon: kit.ICON_NONE, selected: false, close: false },
+        wave5.Chip { label: "Firn", icon: lucide.STAR, selected: true, close: false },
+        wave5.Chip { label: "Open source", icon: kit.ICON_NONE, selected: false, close: true }]
+    wave5.chips_draw(c, (&chips[0]) as *mut wave5.Chip, 3, 2, wave5.CHIP_PART_BODY, kit.NONE, 20.0, 56.0, 300.0)
+    var segs: [wave5.Seg; 3] = [wave5.Seg { label: "Day", icon: kit.ICON_NONE }, wave5.Seg { label: "Week", icon: kit.ICON_NONE },
+        wave5.Seg { label: "Month", icon: kit.ICON_NONE }]
+    wave5.seg_draw(c, (&segs[0]) as *mut wave5.Seg, 3, 1, kit.NONE, false, 20.0, 100.0, 300.0)
+    wave5.skeleton_lines(c, 20.0, 148.0, 200.0, 3, 800)
+    wave5.skeleton_disc(c, 240.0, 148.0, 40.0, 800)
+    var v: [f64; 9] = [3.0, 5.0, 4.0, 8.0, 6.0, 9.0, 7.0, 11.0, 10.0]
+    wave5.chart_draw(c, 20.0, 220.0, 140.0, 56.0, (&v[0]) as *mut f64, 9, wave5.CH_AREA, 5)
+    wave5.chart_draw(c, 180.0, 220.0, 140.0, 56.0, (&v[0]) as *mut f64, 9, wave5.CH_BARS, kit.NONE)
+    var g: wave5.Pager = wave5.pager_new(5)
+    wave5.pager_goto(&g, 2)
+    g.off = 2.0
+    wave5.pager_nav_draw(c, &g, 20.0, 296.0, 300.0, 120.0, wave5.PG_NEXT)
+}
+
+fn run_pictures(dir: u64, font: u64) {
+    if dir == 0 {
+        return
+    }
+    let pd: *mut Page = page_new(340, 440, true, font)
+    run_picture(pd)
+    save(&(*pd).cv, dir, "wave5-dark.png")
+    let pl: *mut Page = page_new(340, 440, false, font)
+    run_picture(pl)
+    save(&(*pl).cv, dir, "wave5-light.png")
+}
+
+// ====================================================================
+// 9. CONTRAST (WCAG 2) and THE 4-POINT GRID
+// ====================================================================
+fn pair(m: *mut theme.Theme, fg: u32, bg: u32, need: f64, what: str, dark: bool) {
+    let ok: bool = theme.contrast(rgb(fg), rgb(bg)) >= need - 0.001
+    var s: str = "light: "
+    if dark {
+        s = "dark:  "
+    }
+    check(ok, what)
+}
+
+fn run_contrast() {
+    say("== contrast pairs of wave 5 in both themes\n")
+    var d: usize = 0
+    while d < 2 {
+        let dark: bool = d == 1
+        var m: theme.Theme = theme.theme_new(dark)
+        kitcolor.kit_theme(&m, dark)
+        let f: *mut theme.Colors = theme.theme_colors(&m)
+        let base: u32 = (*f).base
+        pair(&m, kitcolor.tone(&m, (*f).warning, base, 3.0), base, 3.0, "filled star on the ground", dark)
+        pair(&m, kitcolor.tone(&m, (*f).text_muted, base, 3.0), base, 3.0, "star outline / idle dot on the ground", dark)
+        pair(&m, kitcolor.accent_ui(&m, base), base, 3.0, "preview star / active dot on the ground", dark)
+        pair(&m, kitcolor.on_color(&m, (*f).accent), (*f).accent, 4.5, "selected chip / segment label", dark)
+        pair(&m, kitcolor.on_color(&m, theme.mix((*f).accent, 16777215 as u32, 140)), theme.mix((*f).accent, 16777215 as u32, 140), 4.5, "label on a hovered selected chip / segment", dark)
+        pair(&m, (*f).text, (*f).button, 4.5, "chip / segment label on the button ground", dark)
+        pair(&m, (*f).text, (*f).button_hover, 4.5, "chip / segment label on the hover ground", dark)
+        pair(&m, (*f).text, (*f).surface_raised, 4.5, "arrow glyph on the raised ground", dark)
+        pair(&m, (*f).text, base, 7.0 - 2.5, "hovered dot / chart mark on the ground", dark)
+        d = d + 1
+    }
+}
+
+fn run_grid4() {
+    say("== sizes on the 4-point grid, no literal colours\n")
+    let pg: *mut Page = page_new(100, 100, true, 0)
+    let c: *mut render.Ctx = &(*pg).c
+    check((wave5.chip_height(c) as usize) % 4 == 0 && (wave5.seg_height(c) as usize) % 4 == 0 && (wave5.rating_height(c) as usize) % 4 == 0
+        && (wave5.rating_size(c) as usize) % 4 == 0 && (wave5.dots_height(c) as usize) % 4 == 0, "chip, segmented, rating and dot row heights")
+    // scale really takes effect: at 200 % every length doubles
+    theme.theme_set_scale(&(*pg).m, 2000)
+    check(near(wave5.chip_height(c), 64.0, 0.01) && near(wave5.rating_width(c, 5), 272.0, 0.01) && near(wave5.dots_width(c, 5), 160.0, 0.01),
+        "every length goes through the scale (200 % doubles it)")
+}
+
+fn main(start: u64) -> i32 {
+    var dir: u64 = 0
+    if rt.arg_count(start) >= 2 {
+        dir = rt.arg_ptr(start, 1)
+    }
+    let fs: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    if !sysfont.sysfont_load(fs) {
+        say("wave5: no font (DejaVu Sans)\n")
+        return 9
+    }
+    var d: usize = 0
+    while d < 2 {
+        let dark: bool = d == 1
+        var ts: str = "light"
+        if dark {
+            ts = "dark"
+        }
+        let p: *mut Page = page_new(640, 480, dark, fs as u64)
+        run_rating(p, ts)
+        run_chips(p, ts)
+        run_segmented(p, ts)
+        run_skeleton(p, ts)
+        run_chart(p, ts)
+        run_dots(p, ts)
+        run_pager(p, ts)
+        d = d + 1
+    }
+    run_pictures(dir, fs as u64)
+    run_contrast()
+    run_grid4()
+    say("checks: ")
+    var nb: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_u64(&nb, CHECKS as u64)
+    rt.write_everything(1, rt.buf_ptr(&nb), rt.buf_len(&nb))
+    rt.buf_free(&nb)
+    say("\n")
+    if BAD == 0 {
+        say("WAVE5 PASSED\n")
+        return 0
+    }
+    say("WAVE5 FAILED\n")
+    return 1
+}

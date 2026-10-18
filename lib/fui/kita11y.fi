@@ -36,6 +36,14 @@
 //   modal        a group named by its title with a "Close" button; while open the
 //                caller should add only its own controls under it (the focus trap)
 //   avatar       an image named by the person
+//   rating       a slider named "Quality, 3.5 of 5", value 0..1000 (the stars filled)
+//   chips        a group of buttons, the selected ones pressed; a closable chip has a child
+//                button "Remove, <label>"
+//   segmented    a group of radio buttons, the chosen one checked
+//   chart        an image "Downloads, min 2, max 9, last 7"
+//   skeleton     a progress bar "Loading" (no value: it is a placeholder)
+//   pager        a group "Gallery, page 2 of 5": a toolbar of tabs "Page 1" .. (the current one
+//                selected) and Previous / Next buttons (disabled at the ends)
 //
 // The names are put in an arena of this object (`names`, 8 KiB): the a11y tree keeps
 // pointers, not copies, and the strings are made here (a label plus its badge, a
@@ -54,11 +62,13 @@ import fui.scene
 import fui.widget
 import fui.a11y
 import fui.kit
+import fui.wave5
 import fui.flex
 
 export {
     KitAx, kax_new, kax_free, kax_reset, kax_root, kax_button, kax_label, kax_tabbar, kax_nav, kax_grid,
     kax_search, kax_progress, kax_toasts, kax_modal, kax_avatar, kax_heading,
+    kax_rating, kax_chips, kax_segmented, kax_chart, kax_skeleton, kax_pagedots, kax_pager,
 }
 
 const ARENA_CAP: usize = 8192
@@ -372,4 +382,209 @@ fn kax_avatar(kx: *mut KitAx, parent: usize, name: str) -> usize {
         a11y.a11y_set_role((*kx).ax, n, a11y.ROLE_IMAGE)
     }
     return n
+}
+
+// ----------------------------------------------------------------------------- wave 5
+
+// Appends `s` to the open composition in the arena (see arena_view).
+fn arena_add(kx: *mut KitAx, s: str) {
+    if rt.buf_len(&(*kx).names) + s.n + 1 > ARENA_CAP || s.n == 0 {
+        return
+    }
+    rt.buf_push_bytes(&(*kx).names, s.p as u64, s.n)
+}
+
+// The decimal digits of `v`, straight into the open composition (dec() would keep() them apart).
+#[allow_escape]
+fn arena_dec(kx: *mut KitAx, v: usize) {
+    var tmp: [u8; 24] = [0 as u8; 24]
+    let n: usize = kit.fmt_uint(v as u64, &tmp)
+    arena_add(kx, str { p: rt.ptr_of((&tmp[0]) as u64), n: n })
+}
+
+fn arena_num(kx: *mut KitAx, v: i64) {
+    if v < 0 as i64 {
+        arena_add(kx, "-")
+        arena_dec(kx, (0 - v) as usize)
+    } else {
+        arena_dec(kx, v as usize)
+    }
+}
+
+fn arena_since(kx: *mut KitAx, start: usize) -> str {
+    return str { p: rt.ptr_of(rt.buf_ptr(&(*kx).names) + start as u64), n: rt.buf_len(&(*kx).names) - start }
+}
+
+// A rating: a slider named "name, 3.5 of 5" (the half only when `spp` is 2 and there is one),
+// the value the filled share of the stars in per mille.
+fn kax_rating(kx: *mut KitAx, parent: usize, name: str, max: usize, spp: usize, value: usize, st: u32) -> usize {
+    var sp: usize = spp
+    if sp == 0 {
+        sp = 1
+    }
+    let start: usize = rt.buf_len(&(*kx).names)
+    arena_add(kx, name)
+    arena_add(kx, ", ")
+    arena_dec(kx, value / sp)
+    if value % sp != 0 {
+        arena_add(kx, ".5")
+    }
+    arena_add(kx, " of ")
+    arena_dec(kx, max)
+    let n: usize = node(kx, parent, widget.KIND_SLIDER, arena_since(kx, start))
+    if n != scene.SCENE_NONE {
+        var pm: i64 = 0
+        if max > 0 {
+            pm = (value * 1000 / (max * sp)) as i64
+        }
+        widget.w_set_value(scene.node_widget((*kx).sc, n), pm)
+    }
+    apply_state(kx, n, st)
+    return n
+}
+
+// The chips: a group named `name`; each chip a button (pressed while selected), a closable one with
+// a "Remove, label" button as its child. `focus` is the chip with the keyboard focus (kit.NONE).
+fn kax_chips(kx: *mut KitAx, parent: usize, name: str, chips: *mut wave5.Chip, n: usize, focus: usize) -> usize {
+    let g: usize = scene.scene_add((*kx).sc, parent, scene.N_WIDGET)
+    if g == scene.SCENE_NONE {
+        return g
+    }
+    scene.node_set_widget_kind((*kx).sc, g, widget.KIND_GROUPBOX)
+    let gn: str = keep(kx, name)
+    a11y.a11y_set_name((*kx).ax, g, gn.p as u64, gn.n)
+    var i: usize = 0
+    while i < n {
+        let ch: *mut wave5.Chip = wave5.chip_at(chips, i)
+        let cn: usize = node(kx, g, widget.KIND_BUTTON, keep(kx, (*ch).label))
+        if cn != scene.SCENE_NONE {
+            if (*ch).selected {
+                a11y.a11y_set_toggle((*kx).ax, cn, true)
+                widget.w_set_value(scene.node_widget((*kx).sc, cn), 1)
+            }
+            if i == focus {
+                widget.w_set_focus(scene.node_widget((*kx).sc, cn), true)
+            }
+            if (*ch).close {
+                node(kx, cn, widget.KIND_BUTTON, join3(kx, "Remove", (*ch).label, ""))
+            }
+        }
+        i = i + 1
+    }
+    return g
+}
+
+// A segmented control: a group named `name` of radio buttons, the chosen one checked.
+fn kax_segmented(kx: *mut KitAx, parent: usize, name: str, segs: *mut wave5.Seg, n: usize, sel: usize) -> usize {
+    let g: usize = scene.scene_add((*kx).sc, parent, scene.N_WIDGET)
+    if g == scene.SCENE_NONE {
+        return g
+    }
+    scene.node_set_widget_kind((*kx).sc, g, widget.KIND_GROUPBOX)
+    let gn: str = keep(kx, name)
+    a11y.a11y_set_name((*kx).ax, g, gn.p as u64, gn.n)
+    var i: usize = 0
+    while i < n {
+        let s: *mut wave5.Seg = wave5.seg_at(segs, i)
+        let rn: usize = node(kx, g, widget.KIND_RADIO, keep(kx, (*s).label))
+        if rn != scene.SCENE_NONE && i == sel {
+            widget.w_set_value(scene.node_widget((*kx).sc, rn), 1)
+            widget.w_set_selected(scene.node_widget((*kx).sc, rn), true)
+        }
+        i = i + 1
+    }
+    return g
+}
+
+// A chart: an image named "name, min 2, max 9, last 7" (whole numbers; "no data" for none).
+fn kax_chart(kx: *mut KitAx, parent: usize, name: str, vals: *mut f64, n: usize) -> usize {
+    let start: usize = rt.buf_len(&(*kx).names)
+    arena_add(kx, name)
+    if n == 0 {
+        arena_add(kx, ", no data")
+    } else {
+        var lo: f64 = *vals
+        var hi: f64 = *vals
+        var i: usize = 0
+        while i < n {
+            let v: f64 = *((vals as usize + i * 8) as *mut f64)
+            if v < lo { lo = v }
+            if v > hi { hi = v }
+            i = i + 1
+        }
+        let last: f64 = *((vals as usize + (n - 1) * 8) as *mut f64)
+        arena_add(kx, ", min ")
+        arena_num(kx, lo as i64)
+        arena_add(kx, ", max ")
+        arena_num(kx, hi as i64)
+        arena_add(kx, ", last ")
+        arena_num(kx, last as i64)
+    }
+    let nm: str = arena_since(kx, start)
+    let node_i: usize = scene.scene_add((*kx).sc, parent, scene.N_BOX)
+    if node_i != scene.SCENE_NONE {
+        a11y.a11y_set_name((*kx).ax, node_i, nm.p as u64, nm.n)
+        a11y.a11y_set_role((*kx).ax, node_i, a11y.ROLE_IMAGE)
+    }
+    return node_i
+}
+
+// A skeleton (placeholder): a progress bar named `label` (empty: "Loading") without a value.
+fn kax_skeleton(kx: *mut KitAx, parent: usize, label: str) -> usize {
+    var nm: str = label
+    if nm.n == 0 {
+        nm = "Loading"
+    }
+    return node(kx, parent, widget.KIND_PROGRESS, keep(kx, nm))
+}
+
+// The page dots: a toolbar of tabs "Page 1" .. "Page n", the current one selected.
+fn kax_pagedots(kx: *mut KitAx, parent: usize, n: usize, cur: usize) -> usize {
+    let bar: usize = scene.scene_add((*kx).sc, parent, scene.N_WIDGET)
+    if bar == scene.SCENE_NONE {
+        return bar
+    }
+    scene.node_set_widget_kind((*kx).sc, bar, widget.KIND_TOOLBAR)
+    var i: usize = 0
+    while i < n {
+        let ps: usize = rt.buf_len(&(*kx).names)
+        arena_add(kx, "Page ")
+        arena_dec(kx, i + 1)
+        let tn: usize = node(kx, bar, widget.KIND_TAB, arena_since(kx, ps))
+        if tn != scene.SCENE_NONE && i == cur {
+            widget.w_set_selected(scene.node_widget((*kx).sc, tn), true)
+        }
+        i = i + 1
+    }
+    return bar
+}
+
+// A pager: a group "name, page 2 of 5" with the Previous / Next buttons (disabled at the ends)
+// and the page dots. The program describes the visible page's own controls under the group.
+fn kax_pager(kx: *mut KitAx, parent: usize, name: str, p: *mut wave5.Pager) -> usize {
+    let g: usize = scene.scene_add((*kx).sc, parent, scene.N_WIDGET)
+    if g == scene.SCENE_NONE {
+        return g
+    }
+    scene.node_set_widget_kind((*kx).sc, g, widget.KIND_GROUPBOX)
+    let start: usize = rt.buf_len(&(*kx).names)
+    arena_add(kx, name)
+    arena_add(kx, ", page ")
+    arena_dec(kx, (*p).cur + 1)
+    arena_add(kx, " of ")
+    arena_dec(kx, (*p).n)
+    let gn: str = arena_since(kx, start)
+    a11y.a11y_set_name((*kx).ax, g, gn.p as u64, gn.n)
+    var prev_st: u32 = 0 as u32
+    if (*p).cur == 0 {
+        prev_st = kit.ST_DISABLED
+    }
+    var next_st: u32 = 0 as u32
+    if (*p).cur + 1 >= (*p).n {
+        next_st = kit.ST_DISABLED
+    }
+    kax_button(kx, g, "Previous", prev_st)
+    kax_button(kx, g, "Next", next_st)
+    kax_pagedots(kx, g, (*p).n, (*p).cur)
+    return g
 }

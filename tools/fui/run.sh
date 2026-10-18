@@ -735,6 +735,7 @@ echo "         the kit in the accessibility tree, touch gestures, right-to-left,
 #   mdextras   syntax-coloured code blocks, select all / drag / word / block, copy text format
 #   anim       animated GIF + WebP against Pillow's frames and delays, loops, pause, big gaps
 #   kita11y    every kit part described into the a11y tree, the audit green, the dump
+#   wave5      rating, chips, segmented, skeleton, chart, page dots, pager: pixels, hits, dt-based motion, RTL
 #   touch      tap / double tap / long press / pan / fling / pinch, the grid and the Markdown view
 #   kitrtl     every kit part mirrored: hit functions, decorations, keys; the default untouched
 #   qrview     the QR widget's pixels and that the painted picture reads back
@@ -746,6 +747,9 @@ build anim
 "$W/anim" | tail -n 3
 build kita11y
 "$W/kita11y" | tail -n 3
+# wave5: rating, chips, segmented, skeleton, chart, page dots, pager at the pixel (both themes, mirrored)
+build wave5
+"$W/wave5" | tail -n 3
 # W16: mnemonics (Alt+letter, '&'), Tab order end to end, shortcut management
 build w16
 "$W/w16" | tail -n 3

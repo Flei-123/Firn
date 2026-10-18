@@ -1,0 +1,1351 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/wave5.fi -- THE CONTROLS OF WAVE 5: the ones a card, a list and a start page need.
+//
+//   rating        stars (whole or half), hover preview, keys
+//   chips         tags / filters, selectable, with a close button, laid out as a flowing
+//                 block that wraps (`chips_height` tells how tall it got)
+//   segmented     2..n exclusive choices in one pill
+//   skeleton      grey placeholder blocks with a travelling shimmer (text lines, discs)
+//   chart         sparkline, area and bars, from a plain array of numbers (decimated to the
+//                 pixels that exist)
+//   page dots     the "which page" row; the active dot is a pill that glides
+//   pager         the carousel state (page, drag, fling, dt-based glide) + the arrows and dots
+//
+// The rules are those of lib/fui/kit.fi, and they are repeated here because they are the
+// reason the parts look like one family:
+//
+//   * IMMEDIATE MODE. Every frame the program calls `*_draw(c, ...)` with the state it keeps;
+//     no node, no allocation (the chart builds one path string in a growable buffer).
+//   * ONE GEOMETRY. Every `*_draw` has a `*_hit` that asks the same geometry function the
+//     picture was made from, so what is painted and what is clicked cannot drift apart.
+//   * ONLY THEME. Colours are theme tokens (kit.tokc) or the theme's colours pulled to 3:1 /
+//     4.5:1 against the ground (kitcolor.tone); lengths are design points through kit.ln.
+//     The shape keys of the theme are read where they exist: `motion` (ms of a transition,
+//     0 = no animation at all) and `r_button` (the corner of the segmented pill).
+//   * MOTION IS dt-BASED. The shimmer phase, the pager glide and the dots take the time that
+//     passed (`dt_ms`), never a frame count: the same speed at 30 and 144 Hz. A shimmer phase
+//     below 0 draws the still placeholder (reduced motion); `motion` 0 makes the pager jump.
+//   * RIGHT TO LEFT: `kit.kit_set_rtl(true)` mirrors the order, the sides, the fills and the
+//     arrow keys of every part (the geometry functions use kit.rx).
+//   * ACCESSIBILITY: lib/fui/kita11y.fi has the `kax_*` twins (rating = slider with a value,
+//     chips = buttons with a remove button, segmented = radio group, chart = image with min /
+//     max / last, skeleton = progress "Loading", pager = group of tabs + previous / next).
+//
+// HONEST LIMITS: a chip has one line of text (cut with "..."), the chart has no axes and no
+// tooltips (a hover index is drawn, the program says what it means), the pager does not keep
+// its own pages -- the program draws page i at `pager_page_x` between `pager_begin` and
+// `pager_end` -- and there is no vertical pager.
+import std.rt
+import std.math
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.icons
+import fui.lucide
+import fui.kit
+import fui.kitcolor
+import fui.editor
+import paint.canvas
+
+export {
+    // rating
+    rating_size, rating_width, rating_height, rating_draw, rating_hit, rating_key,
+    // chips
+    Chip, chip_at, chip_height, chip_width, chips_rect, chips_height, chips_draw, chips_hit,
+    chips_key, chip_wants_remove, CHIP_PART_BODY, CHIP_PART_CLOSE,
+    // segmented
+    Seg, seg_at, seg_height, seg_rect, seg_draw, seg_hit, seg_key,
+    // skeleton
+    SHIM_PERIOD_MS, shim_step, skeleton_draw, skeleton_lines, skeleton_disc,
+    // chart
+    CH_LINE, CH_AREA, CH_BARS, chart_draw, chart_hit, chart_decimate, CHART_MAX_POINTS,
+    // dots
+    dots_width, dots_height, dots_draw, dots_hit,
+    // pager
+    Pager, pager_new, pager_set_count, pager_goto, pager_next, pager_prev, pager_key,
+    pager_tick, pager_pos, pager_animating, pager_drag_begin, pager_drag_move,
+    pager_drag_end, pager_page_x, pager_begin, pager_end, pager_nav_draw, pager_nav_hit,
+    PG_NONE, PG_PREV, PG_NEXT, PG_DOT,
+}
+
+// ======================================================================
+// SHARED HELPERS
+// ======================================================================
+
+fn fmin(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn fmax(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn fabs(a: f64) -> f64 {
+    if a < 0.0 {
+        return 0.0 - a
+    }
+    return a
+}
+
+// The transition time of the theme (shape.motion, ms); 0 = no animation.
+fn motion_ms(c: *mut render.Ctx) -> i64 {
+    return (*theme.theme_shape(render.ctx_theme(c))).motion as i64
+}
+
+// The theme's colour `col`, pulled to `need`:1 against the ground token `bg_tok`, painter colour.
+fn tone_on(c: *mut render.Ctx, col: u32, bg_tok: u32, need: f64) -> u32 {
+    let bg: u32 = kit.tokc(c, bg_tok) & 16777215 as u32
+    return theme.opaque(kitcolor.tone(render.ctx_theme(c), col, bg, need))
+}
+
+fn colors(c: *mut render.Ctx) -> *mut theme.Colors {
+    return theme.theme_colors(render.ctx_theme(c))
+}
+
+fn clip_rect(c: *mut render.Ctx, x0: f64, y0: f64, x1: f64, y1: f64) -> bool {
+    return canvas.clip_push_rect(painter.painter_canvas(render.ctx_painter(c)), x0, y0, x1, y1)
+}
+
+fn clip_end(c: *mut render.Ctx) {
+    canvas.clip_pop(painter.painter_canvas(render.ctx_painter(c)))
+}
+
+// ======================================================================
+// 1. RATING
+// ======================================================================
+//
+// `max` stars, each `spp` steps (1 = whole stars, 2 = half stars). The value is a number of
+// STEPS (0 .. max * spp): 7 steps of 2 per star is three and a half stars. Stars are the Lucide
+// star, outlined in a muted tone, the filled part in the warning colour (3:1 on the ground),
+// clipped at the step so a half star is a real half.
+
+fn rating_size(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 24)
+}
+
+fn rating_gap(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 4)
+}
+
+fn rating_width(c: *mut render.Ctx, max: usize) -> f64 {
+    if max == 0 {
+        return 0.0
+    }
+    return (max as f64) * rating_size(c) + ((max - 1) as f64) * rating_gap(c)
+}
+
+fn rating_height(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 32)
+}
+
+// The x of star `i` (0 = the first at the start edge).
+fn rating_star_x(c: *mut render.Ctx, x: f64, max: usize, i: usize) -> f64 {
+    let ex: f64 = x + (i as f64) * (rating_size(c) + rating_gap(c))
+    return kit.rx(ex, rating_size(c), x, rating_width(c, max))
+}
+
+// Paints the row at (x, y) (y = top of a rating_height box). `value` / `hover` are steps
+// (hover = kit.NONE: no preview); a preview is painted in the accent.
+fn rating_draw(c: *mut render.Ctx, x: f64, y: f64, max: usize, spp: usize, value: usize,
+    hover: usize, st: u32) {
+    if max == 0 || spp == 0 {
+        return
+    }
+    let f: *mut theme.Colors = colors(c)
+    let size: f64 = rating_size(c)
+    let sy: f64 = y + (rating_height(c) - size) / 2.0
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var shown: usize = value
+    var fill: u32 = tone_on(c, (*f).warning, style.TOK_BASE, kitcolor.MIN_UI_CONTRAST)
+    var line: u32 = tone_on(c, (*f).text_muted, style.TOK_BASE, kitcolor.MIN_UI_CONTRAST)
+    if hover != kit.NONE && (st & kit.ST_DISABLED) == 0 as u32 {
+        shown = hover
+        fill = theme.opaque(kit.accent_gfx(c, style.TOK_BASE))
+    }
+    if (st & kit.ST_DISABLED) != 0 as u32 {
+        fill = kit.tokc(c, style.TOK_TEXT_DISABLED)
+        line = fill
+    }
+    let total: usize = max * spp
+    if shown > total {
+        shown = total
+    }
+    var i: usize = 0
+    while i < max {
+        let sx: f64 = rating_star_x(c, x, max, i)
+        icons.icon_stroke(z, lucide.STAR, sx, sy, size, line, icons.STROKE_DEFAULT)
+        var steps: usize = 0
+        if shown > i * spp {
+            steps = shown - i * spp
+        }
+        if steps > spp {
+            steps = spp
+        }
+        if steps > 0 {
+            let part: f64 = size * (steps as f64) / (spp as f64)
+            var x0: f64 = sx
+            var x1: f64 = sx + part
+            if kit.kit_rtl() {
+                x0 = sx + size - part
+                x1 = sx + size
+            }
+            // the filled part is clipped at the step; the outline of that part in the same colour
+            if clip_rect(c, x0, sy - 2.0, x1, sy + size + 2.0) {
+                icons.icon_filled(z, lucide.STAR, sx, sy, size, fill)
+                icons.icon_stroke(z, lucide.STAR, sx, sy, size, fill, icons.STROKE_DEFAULT)
+                clip_end(c)
+            }
+        }
+        i = i + 1
+    }
+    if (st & kit.ST_FOCUS) != 0 as u32 {
+        kit.focus_ring(c, x - kit.ln(c, 2), y, rating_width(c, max) + kit.ln(c, 4), rating_height(c), kit.ln(c, 8), style.TOK_BASE)
+    }
+}
+
+// The step under a point: 1 .. max * spp, 0 if the point is not on the row.
+fn rating_hit(c: *mut render.Ctx, x: f64, y: f64, max: usize, spp: usize, px: f64, py: f64) -> usize {
+    if max == 0 || spp == 0 {
+        return 0
+    }
+    let w: f64 = rating_width(c, max)
+    if py < y || py >= y + rating_height(c) || px < x || px >= x + w {
+        return 0
+    }
+    var rel: f64 = px - x
+    if kit.kit_rtl() {
+        rel = w - rel
+    }
+    let size: f64 = rating_size(c)
+    let pitch: f64 = size + rating_gap(c)
+    var i: usize = (rel / pitch) as usize
+    if i >= max {
+        i = max - 1
+    }
+    let within: f64 = rel - (i as f64) * pitch
+    if within >= size {
+        return (i + 1) * spp
+    }
+    var k: usize = (within * (spp as f64) / size) as usize + 1
+    if k > spp {
+        k = spp
+    }
+    return i * spp + k
+}
+
+// Left / Right (and Down / Up) move one step, Home clears, End is full. The new value in
+// steps; in RTL Left and Right swap.
+fn rating_key(max: usize, spp: usize, value: usize, key0: u32) -> usize {
+    var key: u32 = key0
+    if kit.kit_rtl() {
+        if key == editor.KEY_LEFT {
+            key = editor.KEY_RIGHT
+        } else if key == editor.KEY_RIGHT {
+            key = editor.KEY_LEFT
+        }
+    }
+    let total: usize = max * spp
+    if (key == editor.KEY_RIGHT || key == editor.KEY_UP) && value < total {
+        return value + 1
+    }
+    if (key == editor.KEY_LEFT || key == editor.KEY_DOWN) && value > 0 {
+        return value - 1
+    }
+    if key == editor.KEY_HOME {
+        return 0
+    }
+    if key == editor.KEY_END {
+        return total
+    }
+    return value
+}
+
+// ======================================================================
+// 2. CHIPS
+// ======================================================================
+
+const CHIP_PART_BODY: u32 = 1
+const CHIP_PART_CLOSE: u32 = 2
+
+struct Chip {
+    label: str,
+    icon: i64,
+    selected: bool,
+    close: bool,
+}
+
+fn chip_size() -> usize {
+    var probe: [Chip; 2] = [Chip { label: "", icon: kit.ICON_NONE, selected: false, close: false },
+        Chip { label: "", icon: kit.ICON_NONE, selected: false, close: false }]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+// The chip `i` of an array of chips (for lib/fui/kita11y.fi and other readers of the same array).
+fn chip_at(chips: *mut Chip, i: usize) -> *mut Chip {
+    return (chips as usize + i * chip_size()) as *mut Chip
+}
+
+fn chip_height(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 32)
+}
+
+// The width of the close hit area / glyph box at the end of a closable chip.
+fn chip_close_w(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 24)
+}
+
+// The natural width of chip `ch` (not limited by a row).
+fn chip_width(c: *mut render.Ctx, ch: *mut Chip) -> f64 {
+    var w: f64 = kit.ln(c, 12) * 2.0 + kit.text_width(c, kit.ln(c, 14), 400, (*ch).label)
+    if (*ch).icon >= 0 as i64 {
+        w = w + kit.ln(c, 16) + kit.ln(c, 8)
+    }
+    if (*ch).close {
+        w = w + chip_close_w(c) - kit.ln(c, 8)
+    }
+    return w
+}
+
+// The rectangle of chip `i` in a block of width `w` at (x, y): chips follow each other with 8
+// points between them and wrap to the next row when the next one does not fit (a chip wider
+// than the block is cut to it). Returns the row (0 = first).
+fn chips_rect(c: *mut render.Ctx, chips: *mut Chip, n: usize, i: usize, x: f64, y: f64, w: f64,
+    ox: *mut f64, oy: *mut f64, ow: *mut f64, oh: *mut f64) -> usize {
+    let gap: f64 = kit.ln(c, 8)
+    let h: f64 = chip_height(c)
+    var lx: f64 = 0.0
+    var row: usize = 0
+    var k: usize = 0
+    while k < n {
+        var cw: f64 = chip_width(c, chip_at(chips, k))
+        if cw > w {
+            cw = w
+        }
+        if lx > 0.0 && lx + cw > w + 0.01 {
+            lx = 0.0
+            row = row + 1
+        }
+        if k == i {
+            *ox = kit.rx(x + lx, cw, x, w)
+            *oy = y + (row as f64) * (h + gap)
+            *ow = cw
+            *oh = h
+            return row
+        }
+        lx = lx + cw + gap
+        k = k + 1
+    }
+    *ox = x
+    *oy = y
+    *ow = 0.0
+    *oh = h
+    return row
+}
+
+// The height of the whole block (0 for no chips).
+fn chips_height(c: *mut render.Ctx, chips: *mut Chip, n: usize, w: f64) -> f64 {
+    if n == 0 {
+        return 0.0
+    }
+    var ox: f64 = 0.0
+    var oy: f64 = 0.0
+    var ow: f64 = 0.0
+    var oh: f64 = 0.0
+    let row: usize = chips_rect(c, chips, n, n - 1, 0.0, 0.0, w, &ox, &oy, &ow, &oh)
+    return oy + oh
+}
+
+fn chip_fill(c: *mut render.Ctx, ch: *mut Chip, hover: bool) -> u32 {
+    if (*ch).selected {
+        let a: u32 = theme.opaque((*colors(c)).accent)
+        if hover {
+            return theme.mix(a, 16777215 as u32, 140)
+        }
+        return a
+    }
+    if hover {
+        return kit.tokc(c, style.TOK_BUTTON_HOVER)
+    }
+    return kit.tokc(c, style.TOK_BUTTON)
+}
+
+// Paints the block. `hover` = the chip under the pointer (kit.NONE: none), `hover_part` the part
+// of it (CHIP_PART_*), `focus` = the chip with the keyboard focus (kit.NONE: none).
+fn chips_draw(c: *mut render.Ctx, chips: *mut Chip, n: usize, hover: usize, hover_part: u32,
+    focus: usize, x: f64, y: f64, w: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var i: usize = 0
+    while i < n {
+        let ch: *mut Chip = chip_at(chips, i)
+        var cx: f64 = 0.0
+        var cy: f64 = 0.0
+        var cw: f64 = 0.0
+        var chh: f64 = 0.0
+        let row: usize = chips_rect(c, chips, n, i, x, y, w, &cx, &cy, &cw, &chh)
+        let r: f64 = chh / 2.0
+        let hov: bool = i == hover
+        let fill: u32 = chip_fill(c, ch, hov)
+        painter.round_rect(z, cx, cy, cw, chh, r, fill)
+        if !(*ch).selected {
+            painter.round_ring(z, cx, cy, cw, chh, r, kit.ln(c, 1), kit.tokc(c, style.TOK_BORDER))
+        }
+        var fg: u32 = kit.tokc(c, style.TOK_TEXT)
+        if (*ch).selected {
+            fg = theme.opaque(kitcolor.on_color(render.ctx_theme(c), fill))
+        }
+        // from the start edge: pad, symbol, label, close
+        var lx: f64 = kit.ln(c, 12)
+        let isz: f64 = kit.ln(c, 16)
+        if (*ch).icon >= 0 as i64 {
+            let ix: f64 = kit.rx(cx + lx, isz, cx, cw)
+            kit.sym(c, (*ch).icon, ix, cy + (chh - isz) / 2.0, isz, fg)
+            lx = lx + isz + kit.ln(c, 8)
+        }
+        var room: f64 = cw - lx - kit.ln(c, 12)
+        if (*ch).close {
+            room = cw - lx - chip_close_w(c)
+        }
+        if room < 0.0 {
+            room = 0.0
+        }
+        let lbx: f64 = kit.rx(cx + lx, room, cx, cw)
+        let used: f64 = kit.label_in(c, lbx, cy, chh, kit.ln(c, 14), 400, fg, (*ch).label, room)
+        if (*ch).close {
+            let kw: f64 = chip_close_w(c)
+            let kx: f64 = kit.rx(cx + cw - kw, kw, cx, cw)
+            if hov && hover_part == CHIP_PART_CLOSE {
+                let d: f64 = kit.ln(c, 20)
+                var disc: u32 = kit.tokc(c, style.TOK_BUTTON_ACTIVE)
+                if (*ch).selected {
+                    disc = theme.mix(fill, 0 as u32, 200)
+                }
+                painter.round_rect(z, kx + (kw - d) / 2.0, cy + (chh - d) / 2.0, d, d, d / 2.0, disc)
+            }
+            let gs: f64 = kit.ln(c, 12)
+            kit.sym(c, lucide.X, kx + (kw - gs) / 2.0, cy + (chh - gs) / 2.0, gs, fg)
+        }
+        if i == focus {
+            kit.focus_ring(c, cx, cy, cw, chh, r, style.TOK_BASE)
+        }
+        i = i + 1
+    }
+}
+
+// Which chip is at a point (kit.NONE: none); `part` gets CHIP_PART_BODY or CHIP_PART_CLOSE.
+fn chips_hit(c: *mut render.Ctx, chips: *mut Chip, n: usize, x: f64, y: f64, w: f64,
+    px: f64, py: f64, part: *mut u32) -> usize {
+    var i: usize = 0
+    while i < n {
+        var cx: f64 = 0.0
+        var cy: f64 = 0.0
+        var cw: f64 = 0.0
+        var chh: f64 = 0.0
+        let row: usize = chips_rect(c, chips, n, i, x, y, w, &cx, &cy, &cw, &chh)
+        if px >= cx && px < cx + cw && py >= cy && py < cy + chh {
+            *part = CHIP_PART_BODY
+            let ch: *mut Chip = chip_at(chips, i)
+            if (*ch).close {
+                let kw: f64 = chip_close_w(c)
+                let kx: f64 = kit.rx(cx + cw - kw, kw, cx, cw)
+                if px >= kx && px < kx + kw {
+                    *part = CHIP_PART_CLOSE
+                }
+            }
+            return i
+        }
+        i = i + 1
+    }
+    return kit.NONE
+}
+
+// Left / Right / Home / End move the focus along the chips (a line, not a ring). The new focus.
+fn chips_key(n: usize, focus0: usize, key: u32) -> usize {
+    if n == 0 {
+        return focus0
+    }
+    if focus0 == kit.NONE {
+        return 0
+    }
+    return kit.tabbar_key(n, focus0, key)
+}
+
+// Delete / Backspace on a closable chip ask to remove it.
+fn chip_wants_remove(key: u32) -> bool {
+    return key == editor.KEY_DELETE || key == editor.KEY_BACKSPACE
+}
+
+// ======================================================================
+// 3. SEGMENTED
+// ======================================================================
+
+struct Seg {
+    label: str,
+    icon: i64,
+}
+
+fn seg_size() -> usize {
+    var probe: [Seg; 2] = [Seg { label: "", icon: kit.ICON_NONE }, Seg { label: "", icon: kit.ICON_NONE }]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+fn seg_at(segs: *mut Seg, i: usize) -> *mut Seg {
+    return (segs as usize + i * seg_size()) as *mut Seg
+}
+
+fn seg_height(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 32)
+}
+
+// The rectangle of segment `i` of `n` in a pill at (x, w): equal widths inside a 2-point rim.
+fn seg_rect(c: *mut render.Ctx, n: usize, i: usize, x: f64, w: f64, ox: *mut f64, ow: *mut f64) {
+    let rim: f64 = kit.ln(c, 2)
+    var each: f64 = 0.0
+    if n > 0 {
+        each = (w - 2.0 * rim) / (n as f64)
+    }
+    *ow = each
+    *ox = kit.rx(x + rim + (i as f64) * each, each, x, w)
+}
+
+// Paints the pill at (x, y, w, seg_height). `sel` is the chosen segment (kit.NONE: none),
+// `hover` the one under the pointer, `focus` shows the ring around the chosen one.
+fn seg_draw(c: *mut render.Ctx, segs: *mut Seg, n: usize, sel: usize, hover: usize, focus: bool,
+    x: f64, y: f64, w: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let h: f64 = seg_height(c)
+    let shp: *mut theme.Shape = theme.theme_shape(render.ctx_theme(c))
+    let r: f64 = kit.ln(c, (*shp).r_button)
+    painter.round_rect(z, x, y, w, h, r, kit.tokc(c, style.TOK_BUTTON))
+    painter.round_ring(z, x, y, w, h, r, kit.ln(c, 1), kit.tokc(c, style.TOK_BORDER))
+    let rim: f64 = kit.ln(c, 2)
+    let accent: u32 = theme.opaque((*colors(c)).accent)
+    var i: usize = 0
+    while i < n {
+        var sx: f64 = 0.0
+        var sw: f64 = 0.0
+        seg_rect(c, n, i, x, w, &sx, &sw)
+        let s: *mut Seg = seg_at(segs, i)
+        let active: bool = i == sel
+        let sr: f64 = fmax(r - rim, 2.0)
+        var fg: u32 = kit.tokc(c, style.TOK_TEXT)
+        if active {
+            var fill: u32 = accent
+            if i == hover {
+                fill = theme.mix(accent, 16777215 as u32, 140)
+            }
+            painter.round_rect(z, sx, y + rim, sw, h - 2.0 * rim, sr, fill)
+            fg = theme.opaque(kitcolor.on_color(render.ctx_theme(c), fill))
+        } else if i == hover {
+            painter.round_rect(z, sx, y + rim, sw, h - 2.0 * rim, sr, kit.tokc(c, style.TOK_BUTTON_HOVER))
+        }
+        // a thin divider between two segments that are neither chosen nor next to the chosen one
+        if i + 1 < n && i != sel && i + 1 != sel && i != hover && i + 1 != hover {
+            var dx: f64 = sx + sw
+            if kit.kit_rtl() {
+                dx = sx
+            }
+            painter.surface(z, dx - 0.5, y + kit.ln(c, 8), 1.0, h - kit.ln(c, 16), kit.tokc(c, style.TOK_SEPARATOR))
+        }
+        // symbol + label, centred in the segment
+        var weight: usize = 400
+        if active {
+            weight = 700
+        }
+        let size: f64 = kit.ln(c, 14)
+        var lw: f64 = kit.text_width(c, size, weight, (*s).label)
+        let isz: f64 = kit.ln(c, 16)
+        var total: f64 = lw
+        if (*s).icon >= 0 as i64 {
+            total = total + isz + kit.ln(c, 8)
+        }
+        let room: f64 = sw - kit.ln(c, 16)
+        if total > room {
+            lw = fmax(lw - (total - room), 0.0)
+            total = room
+        }
+        var cx: f64 = sx + (sw - total) / 2.0
+        if (*s).icon >= 0 as i64 {
+            var ix: f64 = cx
+            var lx: f64 = cx + isz + kit.ln(c, 8)
+            if kit.kit_rtl() {
+                ix = cx + total - isz
+                lx = cx
+            }
+            kit.sym(c, (*s).icon, ix, y + (h - isz) / 2.0, isz, fg)
+            let u: f64 = kit.draw_label(c, lx, y, h, size, weight, fg, (*s).label, lw + 2.0)
+        } else {
+            let u: f64 = kit.draw_label(c, cx, y, h, size, weight, fg, (*s).label, lw + 2.0)
+        }
+        if focus && active {
+            kit.focus_ring(c, sx, y + rim, sw, h - 2.0 * rim, sr, style.TOK_BASE)
+        }
+        i = i + 1
+    }
+}
+
+// Which segment is at a point (kit.NONE: none).
+fn seg_hit(c: *mut render.Ctx, n: usize, x: f64, y: f64, w: f64, px: f64, py: f64) -> usize {
+    if py < y || py >= y + seg_height(c) || px < x || px >= x + w {
+        return kit.NONE
+    }
+    var i: usize = 0
+    while i < n {
+        var sx: f64 = 0.0
+        var sw: f64 = 0.0
+        seg_rect(c, n, i, x, w, &sx, &sw)
+        if px >= sx && px < sx + sw {
+            return i
+        }
+        i = i + 1
+    }
+    // the 2-point rim belongs to the nearest end segment
+    if n > 0 {
+        var sx0: f64 = 0.0
+        var sw0: f64 = 0.0
+        seg_rect(c, n, 0, x, w, &sx0, &sw0)
+        if px < sx0 && !kit.kit_rtl() || px >= sx0 + sw0 && kit.kit_rtl() {
+            return 0
+        }
+        return n - 1
+    }
+    return kit.NONE
+}
+
+// Left / Right / Home / End choose (the tab bar's rule, RTL included). The new choice.
+fn seg_key(n: usize, sel: usize, key: u32) -> usize {
+    if sel == kit.NONE {
+        if n > 0 && (key == editor.KEY_LEFT || key == editor.KEY_RIGHT || key == editor.KEY_HOME) {
+            return 0
+        }
+        return sel
+    }
+    return kit.tabbar_key(n, sel, key)
+}
+
+// ======================================================================
+// 4. SKELETON / SHIMMER
+// ======================================================================
+//
+// The placeholder block is the button ground; the shimmer is a band that runs from the start
+// edge to the end edge, made of THREE nested steps (the colour moves 35 %, 70 %, 100 % of the way
+// to the hover colour) clipped to the band -- no gradient, no alpha, so it is exact on the CPU
+// and on the GPU path. The phase is the time in ms in the cycle; below 0 the band is absent.
+
+const SHIM_PERIOD_MS: i64 = 1600
+
+// The next phase after `dt_ms`: wraps in the cycle; a phase below 0 (reduced motion) stays below 0.
+fn shim_step(phase_ms: i64, dt_ms: i64) -> i64 {
+    if phase_ms < 0 {
+        return phase_ms
+    }
+    var p: i64 = phase_ms + dt_ms
+    if dt_ms < 0 {
+        p = phase_ms
+    }
+    return p % SHIM_PERIOD_MS
+}
+
+fn shimmer_band(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, r: f64, phase_ms: i64) {
+    if phase_ms < 0 {
+        return
+    }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let base: u32 = kit.tokc(c, style.TOK_BUTTON)
+    let hov: u32 = kit.tokc(c, style.TOK_BUTTON_HOVER)
+    let band: f64 = w * 0.45
+    let t: f64 = ((phase_ms % SHIM_PERIOD_MS) as f64) / (SHIM_PERIOD_MS as f64)
+    var lead: f64 = x - band + (w + band) * t
+    if kit.kit_rtl() {
+        lead = x + w - (w + band) * t
+    }
+    var step: usize = 0
+    while step < 3 {
+        // step 0 is the whole band, 1 its middle two thirds, 2 its middle third
+        let inset: f64 = band * (step as f64) / 6.0
+        var x0: f64 = lead + inset
+        var x1: f64 = lead + band - inset
+        if x0 < x {
+            x0 = x
+        }
+        if x1 > x + w {
+            x1 = x + w
+        }
+        let amount: usize = 350 + step * 325
+        if x1 > x0 && clip_rect(c, x0, y, x1, y + h) {
+            painter.round_rect(z, x, y, w, h, r, theme.mix(base, hov, amount))
+            clip_end(c)
+        }
+        step = step + 1
+    }
+}
+
+// A placeholder block (`radius` in points; a radius of half the height or more makes a pill).
+fn skeleton_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, radius: usize, phase_ms: i64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var r: f64 = kit.ln(c, radius)
+    if r > h / 2.0 {
+        r = h / 2.0
+    }
+    painter.round_rect(z, x, y, w, h, r, kit.tokc(c, style.TOK_BUTTON))
+    shimmer_band(c, x, y, w, h, r, phase_ms)
+}
+
+// A disc of diameter `d`.
+fn skeleton_disc(c: *mut render.Ctx, x: f64, y: f64, d: f64, phase_ms: i64) {
+    skeleton_draw(c, x, y, d, d, 1000, phase_ms)
+}
+
+// `lines` lines of text (12 points high, 8 apart), the last one 60 % wide; the whole block
+// shares one band, so the shimmer runs across the lines at the same time. Returns the height.
+fn skeleton_lines(c: *mut render.Ctx, x: f64, y: f64, w: f64, lines: usize, phase_ms: i64) -> f64 {
+    let lh: f64 = kit.ln(c, 12)
+    let gap: f64 = kit.ln(c, 8)
+    var i: usize = 0
+    while i < lines {
+        var lw: f64 = w
+        if i + 1 == lines && lines > 1 {
+            lw = w * 0.6
+        }
+        var lx: f64 = x
+        if kit.kit_rtl() {
+            lx = x + w - lw
+        }
+        // the band is computed over the whole block width so the lines shimmer together
+        let ly: f64 = y + (i as f64) * (lh + gap)
+        let z: *mut painter.Painter = render.ctx_painter(c)
+        let r: f64 = lh / 2.0
+        painter.round_rect(z, lx, ly, lw, lh, r, kit.tokc(c, style.TOK_BUTTON))
+        if phase_ms >= 0 && clip_rect(c, lx, ly, lx + lw, ly + lh) {
+            shimmer_band(c, x, ly, w, lh, r, phase_ms)
+            clip_end(c)
+        }
+        i = i + 1
+    }
+    if lines == 0 {
+        return 0.0
+    }
+    return (lines as f64) * lh + ((lines - 1) as f64) * gap
+}
+
+// ======================================================================
+// 5. CHART (sparkline, area, bars)
+// ======================================================================
+
+const CH_LINE: u32 = 0
+const CH_AREA: u32 = 1
+const CH_BARS: u32 = 2
+const CHART_MAX_POINTS: usize = 512
+
+// Reduces `n` values to at most `m` (<= CHART_MAX_POINTS): buckets of equal size, the mean of a
+// bucket for lines (`peak` false), its largest value for bars (`peak` true, so a spike
+// does not vanish). Returns the count written to `out`.
+fn chart_decimate(vals: *mut f64, n: usize, m0: usize, peak: bool, out: *mut [f64; 512]) -> usize {
+    var m: usize = m0
+    if m > CHART_MAX_POINTS {
+        m = CHART_MAX_POINTS
+    }
+    if m < 2 {
+        m = 2
+    }
+    if n <= m {
+        var k: usize = 0
+        while k < n {
+            (*out)[k] = *((vals as usize + k * 8) as *mut f64)
+            k = k + 1
+        }
+        return n
+    }
+    var b: usize = 0
+    while b < m {
+        let lo: usize = b * n / m
+        var hi: usize = (b + 1) * n / m
+        if hi <= lo {
+            hi = lo + 1
+        }
+        var acc: f64 = 0.0
+        var top: f64 = *((vals as usize + lo * 8) as *mut f64)
+        var j: usize = lo
+        while j < hi {
+            let v: f64 = *((vals as usize + j * 8) as *mut f64)
+            acc = acc + v
+            if v > top {
+                top = v
+            }
+            j = j + 1
+        }
+        if peak {
+            (*out)[b] = top
+        } else {
+            (*out)[b] = acc / ((hi - lo) as f64)
+        }
+        b = b + 1
+    }
+    return m
+}
+
+fn chart_pad(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 4)
+}
+
+// The y of value `v` in the range [lo, hi] inside the box (higher = further up).
+fn chart_y(y: f64, h: f64, lo: f64, hi: f64, v: f64) -> f64 {
+    var span: f64 = hi - lo
+    if span <= 0.0 {
+        span = 1.0
+    }
+    return y + h - (v - lo) / span * h
+}
+
+// A fixed-point number (2 decimals) into a buffer, for the path string.
+fn push_fixed(b: *mut rt.Buf, v0: f64) {
+    var v: f64 = v0
+    if v < 0.0 {
+        rt.buf_push(b, 45 as u8)
+        v = 0.0 - v
+    }
+    let scaled: u64 = (v * 100.0 + 0.5) as u64
+    rt.buf_push_dec_u64(b, scaled / 100 as u64)
+    rt.buf_push(b, 46 as u8)
+    let frac: u64 = scaled % 100 as u64
+    if frac < 10 as u64 {
+        rt.buf_push(b, 48 as u8)
+    }
+    rt.buf_push_dec_u64(b, frac)
+}
+
+// Paints values into the box (x, y, w, h). `kind` CH_LINE / CH_AREA / CH_BARS; `hover` is the
+// index of the value to mark (kit.NONE: none). Bars start at zero; lines and areas use the
+// range of the data. The last value of a line gets a dot.
+fn chart_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, vals: *mut f64, n: usize,
+    kind: u32, hover: usize) {
+    if n == 0 || w <= 0.0 || h <= 0.0 {
+        return
+    }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let pad: f64 = chart_pad(c)
+    let ix: f64 = x + pad
+    let iy: f64 = y + pad
+    let iw: f64 = w - 2.0 * pad
+    let ih: f64 = h - 2.0 * pad
+    if iw <= 2.0 || ih <= 2.0 {
+        return
+    }
+    let gfx: u32 = theme.opaque(kit.accent_gfx(c, style.TOK_BASE))
+    var lo: f64 = *vals
+    var hi: f64 = *vals
+    var i: usize = 0
+    while i < n {
+        let v: f64 = *((vals as usize + i * 8) as *mut f64)
+        if v < lo { lo = v }
+        if v > hi { hi = v }
+        i = i + 1
+    }
+    var pts: [f64; 512] = [0.0; 512]
+    let peak: bool = kind == CH_BARS
+    if peak {
+        if lo > 0.0 { lo = 0.0 }
+    }
+    if hi <= lo {
+        hi = lo + 1.0
+    }
+    let want: usize = (iw / 2.0) as usize
+    let m: usize = chart_decimate(vals, n, want, peak, &pts)
+    if kind == CH_BARS {
+        let base: f64 = chart_y(iy, ih, lo, hi, fmax(lo, 0.0))
+        painter.surface(z, ix, base, iw, 1.0, kit.tokc(c, style.TOK_SEPARATOR))
+        let gap: f64 = fmin(kit.ln(c, 2), iw / (m as f64) / 3.0)
+        let bw: f64 = (iw - gap * ((m - 1) as f64)) / (m as f64)
+        var k: usize = 0
+        while k < m {
+            let top: f64 = chart_y(iy, ih, lo, hi, pts[k])
+            var by0: f64 = top
+            var by1: f64 = base
+            if by0 > by1 {
+                by0 = base
+                by1 = top
+            }
+            if by1 - by0 < 1.0 {
+                by1 = by0 + 1.0
+            }
+            let bx: f64 = kit.rx(ix + (k as f64) * (bw + gap), bw, ix, iw)
+            var col: u32 = gfx
+            // the hovered bar is the one holding the hovered value (after decimation)
+            if hover != kit.NONE && hover * m / n == k {
+                col = tone_on(c, (*colors(c)).text, style.TOK_BASE, 7.0)
+            }
+            var rr: f64 = fmin(bw / 2.0, kit.ln(c, 2))
+            painter.round_rect(z, bx, by0, bw, by1 - by0, rr, col)
+            k = k + 1
+        }
+        return
+    }
+    // line / area: one path in 24-grid units of the larger side of the box
+    let side: f64 = fmax(iw, ih)
+    let kk: f64 = side / 24.0
+    var d: rt.Buf = rt.buf_new()
+    var k2: usize = 0
+    var lastx: f64 = ix
+    var lasty: f64 = iy
+    while k2 < m {
+        var fx: f64 = ix
+        if m > 1 {
+            fx = ix + iw * (k2 as f64) / ((m - 1) as f64)
+        } else {
+            fx = ix + iw / 2.0
+        }
+        let px: f64 = kit.rx(fx, 0.0, ix, iw)
+        let py: f64 = chart_y(iy, ih, lo, hi, pts[k2])
+        if k2 == 0 {
+            rt.buf_push(&d, 77 as u8)
+        } else {
+            rt.buf_push(&d, 76 as u8)
+        }
+        push_fixed(&d, (px - ix) / kk)
+        rt.buf_push(&d, 32 as u8)
+        push_fixed(&d, (py - iy) / kk)
+        rt.buf_push(&d, 32 as u8)
+        lastx = px
+        lasty = py
+        k2 = k2 + 1
+    }
+    let dstr: str = str { p: rt.ptr_of(rt.buf_ptr(&d)), n: rt.buf_len(&d) }
+    if kind == CH_AREA {
+        var a: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&a, rt.buf_ptr(&d), rt.buf_len(&d))
+        let firstx: f64 = kit.rx(ix + iw * 0.0, 0.0, ix, iw)
+        let bottom: f64 = iy + ih
+        rt.buf_push(&a, 76 as u8)
+        push_fixed(&a, (lastx - ix) / kk)
+        rt.buf_push(&a, 32 as u8)
+        push_fixed(&a, (bottom - iy) / kk)
+        rt.buf_push(&a, 32 as u8)
+        rt.buf_push(&a, 76 as u8)
+        push_fixed(&a, (firstx - ix) / kk)
+        rt.buf_push(&a, 32 as u8)
+        push_fixed(&a, (bottom - iy) / kk)
+        rt.buf_push(&a, 32 as u8)
+        rt.buf_push(&a, 90 as u8)
+        let astr: str = str { p: rt.ptr_of(rt.buf_ptr(&a)), n: rt.buf_len(&a) }
+        icons.path_draw(z, astr, ix, iy, side, kit.with_alpha(gfx, 56 as u32), 0.0)
+        rt.buf_free(&a)
+    }
+    icons.path_draw(z, dstr, ix, iy, side, gfx, kit.ln(c, 2) / kk)
+    rt.buf_free(&d)
+    // the marks: the last value, and the hovered one
+    let dd: f64 = kit.ln(c, 6)
+    painter.round_rect(z, lastx - dd / 2.0, lasty - dd / 2.0, dd, dd, dd / 2.0, gfx)
+    if hover != kit.NONE && n > 0 {
+        var hk: usize = hover * m / n
+        if hk >= m {
+            hk = m - 1
+        }
+        var hx: f64 = ix + iw / 2.0
+        if m > 1 {
+            hx = ix + iw * (hk as f64) / ((m - 1) as f64)
+        }
+        let hpx: f64 = kit.rx(hx, 0.0, ix, iw)
+        let hpy: f64 = chart_y(iy, ih, lo, hi, pts[hk])
+        painter.surface(z, hpx - 0.5, iy, 1.0, ih, kit.tokc(c, style.TOK_SEPARATOR))
+        let hd: f64 = kit.ln(c, 8)
+        painter.round_rect(z, hpx - hd / 2.0, hpy - hd / 2.0, hd, hd, hd / 2.0, kit.tokc(c, style.TOK_TEXT))
+        painter.round_rect(z, hpx - hd / 2.0 + 2.0, hpy - hd / 2.0 + 2.0, hd - 4.0, hd - 4.0, (hd - 4.0) / 2.0, gfx)
+    }
+}
+
+// The index of the value under a point (kit.NONE: outside the plot). Same box as chart_draw.
+fn chart_hit(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, n: usize, px: f64, py: f64) -> usize {
+    let pad: f64 = chart_pad(c)
+    if n == 0 || px < x + pad || px >= x + w - pad || py < y || py >= y + h {
+        return kit.NONE
+    }
+    var rel: f64 = (px - (x + pad)) / (w - 2.0 * pad)
+    if kit.kit_rtl() {
+        rel = 1.0 - rel
+    }
+    var i: usize = (rel * (n as f64)) as usize
+    if i >= n {
+        i = n - 1
+    }
+    return i
+}
+
+// ======================================================================
+// 6. PAGE DOTS
+// ======================================================================
+
+fn dots_pitch(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 16)
+}
+
+fn dots_width(c: *mut render.Ctx, n: usize) -> f64 {
+    return (n as f64) * dots_pitch(c)
+}
+
+fn dots_height(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 24)
+}
+
+// Paints `n` dots at (x, y, dots_width, dots_height). `pos` is the page as a number that may be
+// between two pages (a gliding pager hands its offset): the dot nearest to it is the long pill,
+// its neighbours shrink as it passes. `hover` is the dot under the pointer (kit.NONE: none).
+fn dots_draw(c: *mut render.Ctx, x: f64, y: f64, n: usize, pos: f64, hover: usize) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let d: f64 = kit.ln(c, 8)
+    let pitch: f64 = dots_pitch(c)
+    let total: f64 = dots_width(c, n)
+    let act: u32 = theme.opaque(kit.accent_gfx(c, style.TOK_BASE))
+    let idle: u32 = tone_on(c, (*colors(c)).text_muted, style.TOK_BASE, kitcolor.MIN_UI_CONTRAST)
+    var i: usize = 0
+    while i < n {
+        var t: f64 = 1.0 - fabs(pos - (i as f64))
+        if t < 0.0 {
+            t = 0.0
+        }
+        let dw: f64 = d + kit.ln(c, 12) * t
+        let cx: f64 = x + (i as f64) * pitch + pitch / 2.0
+        let sx: f64 = kit.rx(cx - dw / 2.0, dw, x, total)
+        var col: u32 = idle
+        if i == hover {
+            col = tone_on(c, (*colors(c)).text, style.TOK_BASE, 7.0)
+        }
+        if t >= 0.5 {
+            col = act
+        }
+        painter.round_rect(z, sx, y + (dots_height(c) - d) / 2.0, dw, d, d / 2.0, col)
+        i = i + 1
+    }
+}
+
+// Which dot is at a point (kit.NONE: none).
+fn dots_hit(c: *mut render.Ctx, x: f64, y: f64, n: usize, px: f64, py: f64) -> usize {
+    if py < y || py >= y + dots_height(c) || px < x || px >= x + dots_width(c, n) {
+        return kit.NONE
+    }
+    var rel: f64 = px - x
+    if kit.kit_rtl() {
+        rel = dots_width(c, n) - rel
+    }
+    var i: usize = (rel / dots_pitch(c)) as usize
+    if i >= n {
+        i = n - 1
+    }
+    return i
+}
+
+// ======================================================================
+// 7. PAGER (carousel state + chrome)
+// ======================================================================
+//
+// The state is a plain struct (no pointers): the page, the position `off` in pages (it glides
+// to the page), and the drag. The program draws page `i` at `pager_page_x(...)` between
+// `pager_begin` and `pager_end`, which clip to the pager's box; `pager_nav_draw` adds the
+// arrows and the dots over it.
+
+const PG_NONE: u32 = 0
+const PG_PREV: u32 = 1
+const PG_NEXT: u32 = 2
+const PG_DOT: u32 = 16
+
+struct Pager {
+    n: usize,
+    cur: usize,
+    off: f64,
+    drag: bool,
+    drag_x0: f64,
+    drag_off0: f64,
+    last_x: f64,
+    last_ms: i64,
+    vel: f64,
+}
+
+fn pager_new(n: usize) -> Pager {
+    return Pager { n: n, cur: 0, off: 0.0, drag: false, drag_x0: 0.0, drag_off0: 0.0,
+        last_x: 0.0, last_ms: 0, vel: 0.0 }
+}
+
+fn pager_set_count(p: *mut Pager, n: usize) {
+    (*p).n = n
+    if n == 0 {
+        (*p).cur = 0
+    } else if (*p).cur >= n {
+        (*p).cur = n - 1
+    }
+}
+
+// Go to page `i` (clamped); the position glides there on the next ticks.
+fn pager_goto(p: *mut Pager, i: usize) {
+    if (*p).n == 0 {
+        return
+    }
+    var k: usize = i
+    if k >= (*p).n {
+        k = (*p).n - 1
+    }
+    (*p).cur = k
+}
+
+fn pager_next(p: *mut Pager) {
+    pager_goto(p, (*p).cur + 1)
+}
+
+fn pager_prev(p: *mut Pager) {
+    if (*p).cur > 0 {
+        pager_goto(p, (*p).cur - 1)
+    }
+}
+
+// Left / Right (swapped in RTL), PageUp / PageDown, Home, End. True if the page changed.
+fn pager_key(p: *mut Pager, key0: u32) -> bool {
+    var key: u32 = key0
+    if kit.kit_rtl() {
+        if key == editor.KEY_LEFT {
+            key = editor.KEY_RIGHT
+        } else if key == editor.KEY_RIGHT {
+            key = editor.KEY_LEFT
+        }
+    }
+    let before: usize = (*p).cur
+    if key == editor.KEY_RIGHT || key == editor.KEY_PGDN {
+        pager_next(p)
+    } else if key == editor.KEY_LEFT || key == editor.KEY_PGUP {
+        pager_prev(p)
+    } else if key == editor.KEY_HOME {
+        pager_goto(p, 0)
+    } else if key == editor.KEY_END && (*p).n > 0 {
+        pager_goto(p, (*p).n - 1)
+    }
+    return (*p).cur != before
+}
+
+// Advances the glide by `dt_ms`: the position closes the distance exponentially with a time
+// constant of a third of the theme's `motion` (so ~95 % after one `motion`), frame-rate
+// independent; `motion_ms` 0 jumps. While dragging nothing glides. True while it still moves.
+fn pager_tick(p: *mut Pager, dt_ms: i64, motion_ms: i64) -> bool {
+    if (*p).drag {
+        return false
+    }
+    let target: f64 = (*p).cur as f64
+    let dist: f64 = target - (*p).off
+    if fabs(dist) < 0.001 {
+        (*p).off = target
+        return false
+    }
+    if motion_ms <= 0 || dt_ms <= 0 {
+        if motion_ms <= 0 {
+            (*p).off = target
+            return false
+        }
+        return true
+    }
+    let tau: f64 = (motion_ms as f64) / 3.0
+    let k: f64 = 1.0 - math.exp(0.0 - (dt_ms as f64) / tau)
+    (*p).off = (*p).off + dist * k
+    if fabs(target - (*p).off) < 0.001 {
+        (*p).off = target
+        return false
+    }
+    return true
+}
+
+// The position in pages (0 .. n - 1, fractional while gliding or dragging).
+fn pager_pos(p: *mut Pager) -> f64 {
+    return (*p).off
+}
+
+fn pager_animating(p: *mut Pager) -> bool {
+    return (*p).drag || fabs(((*p).cur as f64) - (*p).off) >= 0.001
+}
+
+// A drag (swipe) starts at pointer x `px` at time `now_ms`.
+fn pager_drag_begin(p: *mut Pager, px: f64, now_ms: i64) {
+    (*p).drag = true
+    (*p).drag_x0 = px
+    (*p).drag_off0 = (*p).off
+    (*p).last_x = px
+    (*p).last_ms = now_ms
+    (*p).vel = 0.0
+}
+
+// The pointer moved to `px` (page width `page_w`): the position follows the finger, with
+// resistance past the first and last page. The velocity is kept (pages per second).
+fn pager_drag_move(p: *mut Pager, px: f64, page_w: f64, now_ms: i64) {
+    if !(*p).drag || page_w <= 0.0 {
+        return
+    }
+    var dx: f64 = px - (*p).drag_x0
+    if kit.kit_rtl() {
+        dx = 0.0 - dx
+    }
+    var off: f64 = (*p).drag_off0 - dx / page_w
+    let last: f64 = (((*p).n as f64) - 1.0)
+    if off < 0.0 {
+        off = off * 0.35
+    }
+    if off > last {
+        off = last + (off - last) * 0.35
+    }
+    (*p).off = off
+    let dt: i64 = now_ms - (*p).last_ms
+    if dt > 0 {
+        var vx: f64 = (px - (*p).last_x) / (dt as f64) * 1000.0
+        if kit.kit_rtl() {
+            vx = 0.0 - vx
+        }
+        // pages per second (the finger moves right = the position goes down)
+        (*p).vel = 0.0 - vx / page_w
+        (*p).last_x = px
+        (*p).last_ms = now_ms
+    }
+}
+
+// The finger lifted: the page is the nearest one to where the fling would end (0.18 s of the
+// last velocity); the position then glides there.
+fn pager_drag_end(p: *mut Pager) {
+    if !(*p).drag {
+        return
+    }
+    (*p).drag = false
+    if (*p).n == 0 {
+        return
+    }
+    var proj: f64 = (*p).off + (*p).vel * 0.18
+    let last: f64 = (((*p).n as f64) - 1.0)
+    if proj < 0.0 { proj = 0.0 }
+    if proj > last { proj = last }
+    // at most one page further than the page the drag started on
+    let from: f64 = (*p).drag_off0
+    if proj > from + 1.0 { proj = from + 1.0 }
+    if proj < from - 1.0 { proj = from - 1.0 }
+    (*p).cur = (proj + 0.5) as usize
+    if (*p).cur >= (*p).n {
+        (*p).cur = (*p).n - 1
+    }
+}
+
+// The x of page `i` in a pager box at `x` of width `w`.
+fn pager_page_x(p: *mut Pager, i: usize, x: f64, w: f64) -> f64 {
+    let ox: f64 = (((i as f64) - (*p).off)) * w
+    if kit.kit_rtl() {
+        return x - ox
+    }
+    return x + ox
+}
+
+// Clips to the pager box; draw the pages, then call pager_end if this returned true.
+fn pager_begin(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64) -> bool {
+    return clip_rect(c, x, y, x + w, y + h)
+}
+
+fn pager_end(c: *mut render.Ctx) {
+    clip_end(c)
+}
+
+fn nav_d(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 32)
+}
+
+// The arrow button of `part` (PG_PREV / PG_NEXT) in the box (x, y, w, h): at the sides, vertically
+// centred, 8 points inside; PG_PREV is at the start edge.
+fn nav_rect(c: *mut render.Ctx, part: u32, x: f64, y: f64, w: f64, h: f64, ox: *mut f64, oy: *mut f64) {
+    let d: f64 = nav_d(c)
+    let m: f64 = kit.ln(c, 8)
+    var ex: f64 = x + m
+    if part == PG_NEXT {
+        ex = x + w - m - d
+    }
+    *ox = kit.rx(ex, d, x, w)
+    *oy = y + (h - d) / 2.0
+}
+
+fn dots_origin_x(c: *mut render.Ctx, p: *mut Pager, x: f64, w: f64) -> f64 {
+    return x + (w - dots_width(c, (*p).n)) / 2.0
+}
+
+fn dots_origin_y(c: *mut render.Ctx, y: f64, h: f64) -> f64 {
+    return y + h - dots_height(c) - kit.ln(c, 4)
+}
+
+// Paints the chrome over the pager box: the two arrows (the one that cannot go on is shown
+// disabled) and the dots at the bottom. `hover` is a PG_* part of the pointer.
+fn pager_nav_draw(c: *mut render.Ctx, p: *mut Pager, x: f64, y: f64, w: f64, h: f64, hover: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let d: f64 = nav_d(c)
+    var part: u32 = PG_PREV
+    while part <= PG_NEXT {
+        var bx: f64 = 0.0
+        var by: f64 = 0.0
+        nav_rect(c, part, x, y, w, h, &bx, &by)
+        var off: bool = (*p).n == 0
+        if part == PG_PREV && (*p).cur == 0 {
+            off = true
+        }
+        if part == PG_NEXT && (*p).cur + 1 >= (*p).n {
+            off = true
+        }
+        var fill: u32 = kit.tokc(c, style.TOK_SURFACE_RAISED)
+        if hover == part && !off {
+            fill = kit.tokc(c, style.TOK_BUTTON_HOVER)
+        }
+        painter.round_rect(z, bx, by, d, d, d / 2.0, fill)
+        painter.round_ring(z, bx, by, d, d, d / 2.0, kit.ln(c, 1), kit.tokc(c, style.TOK_BORDER))
+        var fg: u32 = kit.tokc(c, style.TOK_TEXT)
+        if off {
+            fg = kit.tokc(c, style.TOK_TEXT_DISABLED)
+        }
+        // the arrow points to where the page goes: left for "previous" in the default direction
+        var left: bool = part == PG_PREV
+        if kit.kit_rtl() {
+            left = !left
+        }
+        var icon: i64 = lucide.CHEVRON_RIGHT
+        if left {
+            icon = lucide.CHEVRON_LEFT
+        }
+        let gs: f64 = kit.ln(c, 16)
+        kit.sym(c, icon, bx + (d - gs) / 2.0, by + (d - gs) / 2.0, gs, fg)
+        part = part + 1
+    }
+    if (*p).n > 1 {
+        var hov: usize = kit.NONE
+        if hover >= PG_DOT {
+            hov = (hover - PG_DOT) as usize
+        }
+        dots_draw(c, dots_origin_x(c, p, x, w), dots_origin_y(c, y, h), (*p).n, (*p).off, hov)
+    }
+}
+
+// Which part of the chrome is at a point: PG_PREV, PG_NEXT, PG_DOT + i, or PG_NONE.
+// A disabled arrow is not hit.
+fn pager_nav_hit(c: *mut render.Ctx, p: *mut Pager, x: f64, y: f64, w: f64, h: f64, px: f64, py: f64) -> u32 {
+    let d: f64 = nav_d(c)
+    var part: u32 = PG_PREV
+    while part <= PG_NEXT {
+        var bx: f64 = 0.0
+        var by: f64 = 0.0
+        nav_rect(c, part, x, y, w, h, &bx, &by)
+        if px >= bx && px < bx + d && py >= by && py < by + d {
+            if part == PG_PREV && (*p).cur > 0 {
+                return PG_PREV
+            }
+            if part == PG_NEXT && (*p).cur + 1 < (*p).n {
+                return PG_NEXT
+            }
+            return PG_NONE
+        }
+        part = part + 1
+    }
+    if (*p).n > 1 {
+        let k: usize = dots_hit(c, dots_origin_x(c, p, x, w), dots_origin_y(c, y, h), (*p).n, px, py)
+        if k != kit.NONE {
+            return PG_DOT + (k as u32)
+        }
+    }
+    return PG_NONE
+}
