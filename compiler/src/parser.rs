@@ -84,6 +84,10 @@ pub(crate) struct Parser<'a> {
     /// **r664** -- `fn_decl` allows `x: T = <const-expr>` while it parses
     /// the parameter list of a plain function (`dargs.rs`).
     pub(crate) allow_defaults: bool,
+    /// wf-py -- innermost statement of the comprehension being parsed (`collsugar.rs`).
+    pub(crate) comp_leaf: Option<crate::collsugar::CollLeaf>,
+    /// wf-py -- the `for (a, b) in ..` being built is a comprehension clause.
+    pub(crate) comp_for_pair: bool,
 }
 
 /// **Round TUPLES** -- the pattern of `let (a, b) = ..`.
@@ -1228,6 +1232,15 @@ impl<'a> Parser<'a> {
                 // `[value; N]` — repeat literal
                 if !self.at(&TokKind::RBracket) && !self.at_eof() {
                     let first = self.nested_expr();
+                    if self.at(&TokKind::KwFor) && !self.recovering {
+                        let sp = self.span();
+                        self.dg.error_note(
+                            sp,
+                            "a comprehension needs a declared collection type",
+                            "write `let xs: Vec[T] = [e for x in v]` (or `return [..]` in a function returning `Vec[T]`); the element type is not inferred",
+                        );
+                        self.recovering = true;
+                    }
                     if self.at(&TokKind::Semi) && !self.recovering {
                         self.bump();
                         let count = self.nested_expr();
@@ -1696,6 +1709,15 @@ impl<'a> Parser<'a> {
             self.sync_stmt();
             return Stmt::Error(start);
         }
+        // wf-py: `let x: Vec[T] = [..]` / `Dict[V] = {..}` (collsugar.rs)
+        if let Some(t) = &ty {
+            if !self.recovering {
+                let dest = crate::collsugar::CollDest::Let { name: name.clone(), span: start };
+                if let Some(s) = self.coll_init(&t.clone(), dest) {
+                    return s;
+                }
+            }
+        }
         let init = self.expr();
         let broken = self.recovering;
         let sp = Parser::join(start, init.span);
@@ -2081,7 +2103,7 @@ compute it",
     /// r666 / r708 -- `for (a, b) in enumerate(v)`, `for (a, b) in zip(x, y)` and
     /// `for (a, b) in vec_of_tuples` (any pattern, nested tuples allowed, also
     /// `for (i, (a, b)) in enumerate(v)`); all desugar like `for x in vec`.
-    fn for_pair(&mut self, start: Span) -> Stmt {
+    fn for_pair(&mut self, start: Span, comp: bool) -> Stmt {
         let pat = match self.tuple_pattern() {
             Some(p) => p,
             None => {
@@ -2096,20 +2118,22 @@ compute it",
             return Stmt::Error(start);
         }
         let src = self.cond_expr();
-        if !self.at(&TokKind::LBrace) {
+        if !comp && !self.at(&TokKind::LBrace) {
             self.error_here("expected '{' after 'for (a, b) in ...'");
             self.recovering = false;
             self.sync_stmt();
             return Stmt::Error(start);
         }
+        self.comp_for_pair = comp;
         crate::foreach::build_pair(self, pat, src, start)
     }
 
     /// The body block of a `for` with a tuple pattern (called by `foreach`
     /// AFTER the hidden bindings took their `__tup#` numbers).
     pub(crate) fn for_pair_body(&mut self) -> Block {
+        let comp = std::mem::take(&mut self.comp_for_pair);
         self.loop_depth += 1;
-        let body = self.block("after 'for (a, b) in ...'");
+        let body = if comp { self.coll_clauses() } else { self.block("after 'for (a, b) in ...'") };
         self.loop_depth -= 1;
         body
     }
@@ -2134,10 +2158,16 @@ compute it",
 
     /// The `for` loop over a half-open, ascending range `start..end`.
     fn for_stmt(&mut self) -> Stmt {
+        self.for_stmt_c(false)
+    }
+
+    /// `comp`: the loop is a clause of a comprehension (`collsugar.rs`): no `{` body
+    /// follows, the body is the rest of the clauses.
+    pub(crate) fn for_stmt_c(&mut self, comp: bool) -> Stmt {
         let start = self.bump(); // 'for'
         // r666: `for (i, x) in enumerate(v) { }` / `for (x, y) in zip(a, b) { }`
         if self.at(&TokKind::LParen) {
-            return self.for_pair(start);
+            return self.for_pair(start, comp);
         }
         let (name, name_span) = match self.ident("after 'for'") {
             Some(x) => x,
@@ -2154,9 +2184,9 @@ compute it",
         }
         let from = self.cond_expr();
         // ROUND REF4: `for x in array { ... }` -- no `..`, the body follows.
-        if self.at(&TokKind::LBrace) {
+        if (!comp && self.at(&TokKind::LBrace)) || (comp && !self.at(&TokKind::DotDot)) {
             self.loop_depth += 1;
-            let body = self.block("after 'for ... in array'");
+            let body = if comp { self.coll_clauses() } else { self.block("after 'for ... in array'") };
             self.loop_depth -= 1;
             return crate::foreach::build(self, name, name_span, from, body, start);
         }
@@ -2180,13 +2210,13 @@ compute it",
         let to = self.cond_expr();
         if self.recovering {
             self.recovering = false;
-            if !self.at(&TokKind::LBrace) {
+            if comp || !self.at(&TokKind::LBrace) {
                 self.sync_stmt();
                 return Stmt::Error(start);
             }
         }
         self.loop_depth += 1;
-        let body = self.block("after the range of 'for'");
+        let body = if comp { self.coll_clauses() } else { self.block("after the range of 'for'") };
         self.loop_depth -= 1;
         Stmt::For { name, start: from, end: to, body, inclusive, name_span, span: start }
     }
@@ -2215,6 +2245,15 @@ compute it",
             || self.at(&TokKind::RBrace)
             || self.at_eof()
             || self.at_line_start());
+        // wf-py: `return [..]` / `return {..}` in a function declared `-> Vec[T]` / `Dict[V]`
+        if has_value {
+            if let Some(rt) = self.cur_ret.clone() {
+                let dest = crate::collsugar::CollDest::Return { span: start };
+                if let Some(s) = self.coll_init(&rt, dest) {
+                    return s;
+                }
+            }
+        }
         let value = if has_value {
             let e = self.expr();
             Some(e)
@@ -3184,6 +3223,8 @@ fn in_expr(
         after: Vec::new(),
         tup_seq: 0,
         qpend: Vec::new(),
+        comp_leaf: None,
+        comp_for_pair: false,
         pre: Vec::new(),
         no_q: 0,
         stmt_depth: 0,
@@ -3248,6 +3289,8 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         after: Vec::new(),
         tup_seq: 0,
         qpend: Vec::new(),
+        comp_leaf: None,
+        comp_for_pair: false,
         pre: Vec::new(),
         no_q: 0,
         stmt_depth: 0,

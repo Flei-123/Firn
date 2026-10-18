@@ -862,3 +862,27 @@ pub(crate) fn option_none_call(p: &mut Parser, ret: &TypeExpr, at: Span) -> Opti
     let mangled = p.note_inst("opt_none", inst.args.clone(), at, true);
     Some(p.mk(at, ExprKind::Call(mangled, Vec::new(), at)))
 }
+
+/// Python-level collections sugar -- the instance `base[args]` named by a
+/// declared type (`Vec[i64]` -> `("Vec", [i64])`); `None` for anything that
+/// is not a generic struct instance.
+pub(crate) fn coll_instance(ty: &TypeExpr) -> Option<(String, Vec<TypeExpr>)> {
+    let name = match ty {
+        TypeExpr::Named(n, _) => n.clone(),
+        _ => return None,
+    };
+    let inst = instantiation(&name)?;
+    if inst.is_fn {
+        return None;
+    }
+    Some((inst.base.clone(), inst.args.clone()))
+}
+
+/// Python-level collections sugar -- the expanded name of the generic function
+/// `base[args]` (`vec_push[i64]`), `None` when the library is not imported.
+pub(crate) fn coll_fn_name(p: &mut Parser, base: &str, args: &[TypeExpr], at: Span) -> Option<String> {
+    if !is_generic_fn(base) {
+        return None;
+    }
+    Some(p.note_inst(base, args.to_vec(), at, true))
+}

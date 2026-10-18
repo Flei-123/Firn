@@ -14,6 +14,8 @@
 //   MCPLAY_FACECULL=1  GL: opaque meshes sorted by face direction, a section draws only directions facing the camera (same image; 0 = off)
 //   MCPLAY_VIEW=6      view distance in chunks            MCPLAY_PROTOCOL=763   protocol number
 //   MCPLAY_LOD=<n>     LOD terrain beyond MCPLAY_VIEW up to n chunks (mc_stream + mc_lod, cross-fade at ring changes; asks the server for n chunks); 0 = off (default)
+//   MCPLAY_MODELS=1    resource pack models (blockstates + models of the packs, mc_model_mesh): stairs, slabs, plants ... are drawn from their baked quads instead of
+//                      full cubes. Needs packs (MC_PACKS ...) and the CPU back end; forces MCPLAY_STREAM=0 (no mc_stream / LOD); the T key reloads the models too. Default off.
 //   MCPLAY_STREAM=0    old path: mc_render_world (inline meshing) instead of mc_stream. DEFAULT is mc_stream (frustum + cave culling, worker meshing)
 //   MCPLAY_WORKERS=3   mesher threads of the stream (0 = inline on the render thread); default 3 on every path incl. MCPLAY_GFX=vk (r167 TLS fix, r199 verified with lavapipe)
 //   MCPLAY_W / MCPLAY_H window size (default 854x480)     MCPLAY_FULLSCREEN=1   start fullscreen
@@ -68,6 +70,7 @@ import mc.mc_camera
 import mc.mc_texture
 import mc.mc_raster
 import mc.mc_render_world
+import mc.mc_model_mesh
 import mc.mc_stream
 import jobs.jobs
 import mc.mc_sky
@@ -329,6 +332,8 @@ struct Ctx {
     be: mc_backend.Backend, // the GL back end table
     stm: mc_stream.Stream, // the world drawn by mc_stream (worker meshing, LOD rings) instead of g.wr (MCPLAY_STREAM=0)
     stream_on: bool,
+    models_on: bool, // MCPLAY_MODELS=1: pack models through g.wr (ModelSet `ms`, CPU back end, no stream)
+    ms: mc_model_mesh.ModelSet,
     stm_live: bool,
     pool: jobs.Jobs, // mesher threads of the stream (blk 0 = none: inline)
     win_cx: i32, // camera column of the last window sync
@@ -920,12 +925,28 @@ fn handle_window(c: *mut Ctx) {
     if (*c).g.use_res && raw.key_pressed(&(*c).rw, SC_T) {
         var be: mc_backend.Backend = cur_be(c)
         let nr: i32 = mc_packs.res_on_key(&(*c).g.res, &be, mc_packs.RES_KEY_RELOAD)
-        if nr >= 0 { audio_packs_reload(c) }
+        if nr >= 0 {
+            audio_packs_reload(c)
+            models_reload(c)
+        }
     }
     if raw.key_pressed(&(*c).rw, SC_F11 as u32) {
         (*c).n_f11 = (*c).n_f11 + 1
         (*c).fullscreen = !(*c).fullscreen
         window.fullscreen((*c).wp, (*c).fullscreen)
+    }
+}
+
+// MCPLAY_MODELS after a pack reload (T): the models / blockstates / texture names may all have changed. Drops every mesh, forgets the baked models
+// and restores the cube tables (ms_prepare took the faces of model states out of them), then the translucent table is derived again.
+fn models_reload(c: *mut Ctx) {
+    if !(*c).models_on { return }
+    var be: mc_backend.Backend = cur_be(c)
+    mc_render_world.wr_clear_b(&(*c).g.wr, &be)
+    mc_model_mesh.ms_reset(&(*c).ms)
+    mc_packs.res_build_tables(&(*c).g.res, &(*c).reg, &(*c).g.tb)
+    if env_flag("MCPLAY_TRANS", true) {
+        mc_render_world.wr_set_translucent(&(*c).g.wr, true, mc_texture.T_WATER, mc_texture.T_ICE, mc_texture.T_GLASS)
     }
 }
 
@@ -2675,8 +2696,22 @@ fn main(start: u64) -> i32 {
         return 3
     }
     net.set_no_delay(&conn, true) catch false
-    let lod_n: i32 = env_int("MCPLAY_LOD", 0)
-    let want_stream: bool = lod_n > 0 || env_flag("MCPLAY_STREAM", true)
+    var lod_n: i32 = env_int("MCPLAY_LOD", 0)
+    var models_on: bool = env_flag("MCPLAY_MODELS", false)
+    if models_on && !use_res {
+        io.eprint_line("mcplay: MCPLAY_MODELS=1 needs resource packs (MC_PACKS / MC_PACK_CONFIG / MC_PACK_AUTO) -- ignored")
+        models_on = false
+    }
+    if models_on && (want_gl || want_vk_gfx()) {
+        io.eprint_line("mcplay: MCPLAY_MODELS=1 works with the CPU back end only -- ignored")
+        models_on = false
+    }
+    if models_on && lod_n > 0 {
+        io.eprint_line("mcplay: MCPLAY_MODELS=1 does not combine with MCPLAY_LOD -- LOD off")
+        lod_n = 0
+    }
+    // models go through mc_render_world (g.wr): mc_stream has no model path (r236)
+    let want_stream: bool = !models_on && (lod_n > 0 || env_flag("MCPLAY_STREAM", true))
     // GL + Firn worker threads (r167): the thread runtime keeps its block behind `gs` in programs linked against glibc
     // (thread.rs use_gs), so glibc's TLS (`fs`) stays intact and GL dispatch / dlopen(libEGL) work next to the mesher threads.
     // Workers never call GL (upload only in `consume` on the render thread).
@@ -2699,7 +2734,7 @@ fn main(start: u64) -> i32 {
         pl: mc_input.player_new(0.0, 0.0, 0.0),
         rw: raw.raw_new(),
         win: window.window_new(), wp: 0 as *mut window.Window, gl: false, vk: false, vbk: vk_mc.vkbe_blank(), vk_lost_at: env_int("MCPLAY_VK_LOST_AT", 0) as u64, vk_losses: 0 as u64, vk_recoveries: 0 as u64, gw: glwindow.glwindow_new(), gb: gb0, gsc: gl_scene.scene_empty(&gb0), sh: glshow.show_new(), be: mc_backend.backend_new(),
-        stm: mc_stream.stream_new(0, 1, 1, &dummy_tb, 0 as u64), stream_on: want_stream, stm_live: true, lod: lod_n, pool: jobs.Jobs { blk: 0 }, win_cx: 1000000, win_cz: 1000000, win_n: 0 as u32, n_win: 0 as u64, t_stream: 0 as u64, max_stream: 0 as u64,
+        stm: mc_stream.stream_new(0, 1, 1, &dummy_tb, 0 as u64), stream_on: want_stream, models_on: models_on, ms: mc_model_mesh.ms_blank(), stm_live: true, lod: lod_n, pool: jobs.Jobs { blk: 0 }, win_cx: 1000000, win_cz: 1000000, win_n: 0 as u32, n_win: 0 as u64, t_stream: 0 as u64, max_stream: 0 as u64,
         pk: mc_input.Pick { x: 0, y: 0, z: 0, nx: 0, ny: 0, nz: 0, dist: 0.0, id: 0 },
         bg: 0, w: w0, h: h0, view: view, protocol: proto,
         join: false, have_pos: false, last_tp: 0, tp_quiet_until: 0 as u64, grab: false, closed: false, resized: false, fullscreen: false, hit: false,
@@ -2723,6 +2758,11 @@ fn main(start: u64) -> i32 {
         return 5
     }
     if use_res { gfx_packs_load(&c.g, proto) }
+    if c.models_on {
+        c.ms = mc_model_mesh.ms_new(&c.reg, &c.g.res.stack, &c.g.res.ex)
+        mc_render_world.wr_set_models(&c.g.wr, (&c.ms) as u64)
+        say(f"mcplay: models on (pack blockstates + models, CPU raster, no stream)\n")
+    }
     if c.light {
         mc_chunk.scratch_set_keep_light(&c.sc, true)
         light_setup(&c)
@@ -3010,6 +3050,9 @@ fn main(start: u64) -> i32 {
         stream_release(&c)
     }
     if c.pool.blk != 0 { jobs.destroy(&c.pool) }
+    if c.models_on {
+        say(f"mcplay: models states={c.ms.nmodel} unmapped={c.ms.unmapped}\n")
+    }
     if c.vk {
         mc_render_world.wr_free_b(&c.g.wr, &c.be)
         vk_mc.vkbe_close(&c.vbk)
@@ -3020,6 +3063,7 @@ fn main(start: u64) -> i32 {
     } else {
         mc_render_world.wr_free(&c.g.wr, &c.g.r)
     }
+    mc_model_mesh.ms_free(&c.ms)
     window.close_window(c.wp)
     mc_entity_draw.entlist_free(&c.entl)
     mc_entity.store_free(&c.ents)
