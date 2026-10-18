@@ -74,6 +74,9 @@ for _ in $(seq 50); do grep -q '^PORT' "$W/out" && break; sleep 0.1; done
 PORT=$(awk '/^PORT/{print $2}' "$W/out")
 SLOG=$W/server.log
 
+# pixel-comparison runs: WM_SIZE=1339x2974 WM_DENSITY=520 (emulator only) gives the 412x915 dp of the web references
+[ -n "${WM_SIZE:-}" ] && $ADB shell wm size "$WM_SIZE" >/dev/null 2>&1
+[ -n "${WM_DENSITY:-}" ] && $ADB shell wm density "$WM_DENSITY" >/dev/null 2>&1
 read -r SW SH < <($ADB shell wm size | tr -d '\r' | sed -n 's/.*: *\([0-9]*\)x\([0-9]*\).*/\1 \2/p' | tail -1)
 shot() { $ADB exec-out screencap -p >"$OUT/$1.png"; }
 ocr() { tesseract "$OUT/$1.png" stdout 2>/dev/null | tr -s '\n ' ' '; }
