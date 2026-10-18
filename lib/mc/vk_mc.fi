@@ -62,7 +62,7 @@ const HUD_REC_BYTES: usize = 24 // one mc_hud.hud_record rectangle: x0 y0 x1 y1 
 const CUBE_IB: u64 = 384 // byte offset of the 36 u16 cube indices (24 vertices * 16 octets before it)
 const CUBE_BYTES: u64 = 512
 const ENT_INST_BYTES: usize = 48 // 3 x vec4 per box instance
-const MW: usize = 8 // words per mesh slot
+const MW: usize = 12 // words per mesh slot
 const M_USED: usize = 0
 const M_BUF: usize = 1
 const M_BLK: usize = 2
@@ -71,6 +71,11 @@ const M_SIZE: usize = 4
 const M_IOFF: usize = 5
 const M_NIDX: usize = 6
 const M_KEY: usize = 7
+const M_CLS: usize = 8 // 0 = voxel mesh, 2 = MESH_MODEL, 3 = MESH_MODEL_T (model quads, float vertices, own pipeline)
+const M_NQ: usize = 9 // model quads
+const M_MV: usize = 10 // MESH_MODEL_T: heap copy of the float vertices (MODEL_STRIDE per vertex) for the far-to-near sort
+const MQW: usize = 30 // f64 per model quad (mc_model_mesh.MQ_WORDS)
+const MV_BYTES: usize = 48 // per model vertex: pos xyz | u v tile fk | sky block tint ao (12 f32)
 const DW: usize = 6 // words per deferred release
 const D_KIND: usize = 0 // 0 = mesh buffer (+ its allocation), 1 = staging buffer
 const D_BUF: usize = 1
@@ -116,6 +121,12 @@ struct VkBackend {
     pipe_tint: vk_desc.VPipe,
     pipe_hud: vk_desc.VPipe,
     pipe_ent: vk_desc.VPipe,
+    pipe_mod_op: vk_desc.VPipe, // MESH_MODEL / MESH_MODEL_T pass (optional: a failed build only disables model quads)
+    pipe_mod_tr: vk_desc.VPipe,
+    mcls: i32, // class of the NEXT mesh_upload (mesh_class): 2 = MESH_MODEL, 3 = MESH_MODEL_T
+    rv3: f64, // row 3 of projection * view rotation (view depth of a camera relative point), for the sort of MESH_MODEL_T
+    rv7: f64,
+    rv11: f64,
     cube: vk_mem.Buf, // unit cube for the entity boxes: 24 vertices (pos f32 x3 + face f32) at 0, 36 u16 indices at CUBE_IB
     ents_drawn: u64,
     pipe_hud_inv: vk_desc.VPipe,
@@ -187,7 +198,7 @@ fn blank() -> VkBackend {
     return VkBackend { ok: false, step: 0, v: vk.vk_new(), x: vk_mem.x_new(),
         fr: vk_frame.Frames { ok: false, pool: 0, n: 0, w: 0, icmd: 0, ifence: 0, serial: 0, done: 0, tpending: false },
         d: vk_desc.desc_none(), life: vk_life.life_new(), cache_path: "", base: 0, nslice: 0, slice_off: 0, ubo_over: 0, dirty: true,
-        gran: vk_mem.buf_none(), org: vk_mem.buf_none(), gran_view: 0, org_view: 0, w: 0, h: 0, rp: 0, playout: 0, pipe_op: vk_desc.vpipe_none(), pipe_tr: vk_desc.vpipe_none(), pipe_sky: vk_desc.vpipe_none(), pipe_tint: vk_desc.vpipe_none(), pipe_hud: vk_desc.vpipe_none(), pipe_ent: vk_desc.vpipe_none(), cube: vk_mem.buf_none(), ents_drawn: 0, pipe_hud_inv: vk_desc.vpipe_none(), dyn_top: 0, dyn_over: 0, inv_on: false, bound: 0,
+        gran: vk_mem.buf_none(), org: vk_mem.buf_none(), gran_view: 0, org_view: 0, w: 0, h: 0, rp: 0, playout: 0, pipe_op: vk_desc.vpipe_none(), pipe_tr: vk_desc.vpipe_none(), pipe_sky: vk_desc.vpipe_none(), pipe_tint: vk_desc.vpipe_none(), pipe_hud: vk_desc.vpipe_none(), pipe_ent: vk_desc.vpipe_none(), pipe_mod_op: vk_desc.vpipe_none(), pipe_mod_tr: vk_desc.vpipe_none(), mcls: 0, rv3: 0.0, rv7: 0.0, rv11: 0.0, cube: vk_mem.buf_none(), ents_drawn: 0, pipe_hud_inv: vk_desc.vpipe_none(), dyn_top: 0, dyn_over: 0, inv_on: false, bound: 0,
         fs: [fslot_none(); 2], atlas: vk_mem.img_none(), tile: 0, layers_lost: 0, meshes: 0, mcap: 0, live: 0, dfr: 0, dcap: 0,
         dn: 0, cur: 0, next: 0, in_frame: false, has_last: false, last: 0, trec: false, readback: true, lost: false, inject_lost: false, trans: false,
         cx: 0.0, cy: 0.0, cz: 0.0, fade_a: 64.0, fade_inv: 0.0, day: 256.0, tr: 256.0, tg: 256.0, tb: 256.0, fog_on: false,
@@ -273,7 +284,7 @@ fn targets_make(b: *mut VkBackend) -> bool {
             }
             vk_desc.desc_write_ubo(&(*b).x, &(*b).d, i, (*b).fs[i].ubo.buf, vk_shaders.FRAME_SIZE as u64)
         }
-        (*b).fs[i].dyn = vk_mem.buf_make(&(*b).x, DYN_BYTES, vk_mem.U_VERTEX, vk_mem.MEM_STAGING)
+        (*b).fs[i].dyn = vk_mem.buf_make(&(*b).x, DYN_BYTES, vk_mem.U_VERTEX | vk_mem.U_INDEX, vk_mem.MEM_STAGING)
         if !(*b).fs[i].dyn.ok {
             return false
         }
@@ -397,6 +408,19 @@ fn vkbe_open_win(b: *mut VkBackend, w: i32, h: i32, cache_path: str, xid: u64, m
     esp.depth_test = true
     esp.depth_write = true
     (*b).pipe_ent = vk_desc.pipeline_make(&(*b).x, (*b).v.cache, (*b).rp, (*b).playout, &esp)
+    // model quads: float vertices (binding 0, stride MODEL_STRIDE: pos xyz | u v tile fk | sky block tint ao), same state as the voxel pass
+    var msp: vk_desc.PipeSpec = vk_desc.spec_new(vk_shaders.MODEL_VS.p as u64, vk_shaders.MODEL_VS.n, vk_shaders.MODEL_FS.p as u64, vk_shaders.MODEL_FS.n)
+    vk_desc.spec_bind(&msp, vk_shaders.MODEL_STRIDE as u32, false)
+    vk_desc.spec_attr(&msp, 0 as u32, 0 as u32, vk_desc.FMT_R32G32B32_SFLOAT, 0 as u32)
+    vk_desc.spec_attr(&msp, 1 as u32, 0 as u32, vk_desc.FMT_R32G32B32A32_SFLOAT, 12 as u32)
+    vk_desc.spec_attr(&msp, 2 as u32, 0 as u32, vk_desc.FMT_R32G32B32A32_SFLOAT, 28 as u32)
+    msp.cull = 2 as u32
+    msp.depth_test = true
+    msp.depth_write = true
+    (*b).pipe_mod_op = vk_desc.pipeline_make(&(*b).x, (*b).v.cache, (*b).rp, (*b).playout, &msp)
+    msp.depth_write = false
+    msp.blend = vk_desc.BLEND_ALPHA
+    (*b).pipe_mod_tr = vk_desc.pipeline_make(&(*b).x, (*b).v.cache, (*b).rp, (*b).playout, &msp)
     (*b).cube = vk_mem.buf_make(&(*b).x, CUBE_BYTES, vk_mem.U_VERTEX | vk_mem.U_INDEX, vk_mem.MEM_STAGING)
     if (*b).cube.ok { cube_fill((*b).cube.ptr) }
     if !(*b).pipe_op.ok || !(*b).pipe_tr.ok || !(*b).pipe_sky.ok || !(*b).pipe_tint.ok || !(*b).pipe_hud.ok || !(*b).pipe_hud_inv.ok || !(*b).pipe_ent.ok || !(*b).cube.ok {
@@ -708,12 +732,23 @@ fn ensure_tcmd(b: *mut VkBackend) -> u64 {
 
 fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize) -> usize {
     let b: *mut VkBackend = o as *mut VkBackend
-    if !(*b).ok || nverts == 0 || nidx < 3 {
+    if !(*b).ok || nverts == 0 || (nidx < 3 && (*b).mcls < 2) { // model quads pass one dummy index word
         return 0
     }
-    let vbytes: u64 = (nverts as u64) * 8
+    let cls: i32 = (*b).mcls
+    var nq: usize = 0
+    var vbytes: u64 = (nverts as u64) * 8
+    var nid: usize = nidx
+    if cls >= 2 {
+        if (*b).pipe_mod_op.ok == false || nverts < MQW {
+            return 0 // no model pipeline / no quads: nothing to draw
+        }
+        nq = nverts / MQW
+        vbytes = (nq * 4 * MV_BYTES) as u64
+        nid = nq * 6
+    }
     let ioff: u64 = (vbytes + 15) / 16 * 16
-    let total: u64 = ioff + (nidx as u64) * 4
+    let total: u64 = ioff + (nid as u64) * 4
     let c: u64 = ensure_tcmd(b)
     if c == 0 {
         return 0
@@ -727,8 +762,12 @@ fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize)
         vk_mem.buf_free(&(*b).x, &st)
         return 0
     }
-    rt.mem_copy(st.ptr, verts, nverts * 8)
-    rt.mem_copy(st.ptr + ioff, idx, nidx * 4)
+    if cls >= 2 {
+        model_fill(st.ptr, st.ptr + ioff, verts, nq)
+    } else {
+        rt.mem_copy(st.ptr, verts, nverts * 8)
+        rt.mem_copy(st.ptr + ioff, idx, nidx * 4)
+    }
     (*b).x.top = 0
     let rg: u64 = vk_mem.xsa(&(*b).x, 24)
     vk_mem.w64(rg, 16, total)
@@ -757,10 +796,86 @@ fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize)
     rt.st64((*b).meshes, q + M_OFF, dv.a.off)
     rt.st64((*b).meshes, q + M_SIZE, dv.a.size)
     rt.st64((*b).meshes, q + M_IOFF, ioff)
-    rt.st64((*b).meshes, q + M_NIDX, nidx as u64)
+    rt.st64((*b).meshes, q + M_NIDX, nid as u64)
     rt.st64((*b).meshes, q + M_KEY, key)
+    rt.st64((*b).meshes, q + M_CLS, 0)
+    rt.st64((*b).meshes, q + M_NQ, 0)
+    rt.st64((*b).meshes, q + M_MV, 0)
+    if cls >= 2 {
+        rt.st64((*b).meshes, q + M_CLS, cls as u64)
+        rt.st64((*b).meshes, q + M_NQ, nq as u64)
+        if cls == 3 {
+            let cv: u64 = rt.heap_alloc(nq * 4 * MV_BYTES)
+            if cv != 0 {
+                rt.mem_copy(cv, st.ptr, nq * 4 * MV_BYTES)
+                rt.st64((*b).meshes, q + M_MV, cv)
+            }
+        }
+    }
     (*b).live = (*b).live + 1
     return s + 1
+}
+
+fn mesh_drop_copy(b: *mut VkBackend, q: usize) {
+    let cv: u64 = rt.ld64((*b).meshes, q + M_MV)
+    if cv != 0 {
+        rt.heap_free(cv, (rt.ld64((*b).meshes, q + M_NQ) as usize) * 4 * MV_BYTES)
+        rt.st64((*b).meshes, q + M_MV, 0)
+    }
+}
+
+fn be_mesh_class(o: u64, c: i32) {
+    let b: *mut VkBackend = o as *mut VkBackend
+    (*b).mcls = c
+}
+
+fn qd(p: u64, i: usize) -> f64 {
+    return *((p + (i as u64) * (8 as u64)) as *mut f64)
+}
+
+// nq quads of MQW f64 (mc_raster.raster_draw_models) -> 4 float vertices each at `vd` (MV_BYTES: pos xyz | u v tile fk | sky block tint ao,
+// the layout of gl_mc.upload_models) and 6 u32 indices at `id`. Quads without a tile (tile 0) are skipped by the CPU raster: degenerate here.
+fn model_fill(vd: u64, id: u64, q: u64, nq: usize) {
+    var i: usize = 0
+    while i < nq {
+        let qb: usize = i * MQW
+        var k: usize = 0
+        while k < 4 {
+            let vo: u64 = vd + ((i * 4 + k) * MV_BYTES) as u64
+            *(vo as *mut f32) = qd(q, qb + k) as f32
+            *((vo + 4 as u64) as *mut f32) = qd(q, qb + 4 + k) as f32
+            *((vo + 8 as u64) as *mut f32) = qd(q, qb + 8 + k) as f32
+            *((vo + 12 as u64) as *mut f32) = qd(q, qb + 12 + k) as f32
+            *((vo + 16 as u64) as *mut f32) = qd(q, qb + 16 + k) as f32
+            *((vo + 20 as u64) as *mut f32) = qd(q, qb + 20) as f32
+            *((vo + 24 as u64) as *mut f32) = qd(q, qb + 21) as f32
+            *((vo + 28 as u64) as *mut f32) = qd(q, qb + 22) as f32
+            *((vo + 32 as u64) as *mut f32) = qd(q, qb + 23) as f32
+            *((vo + 36 as u64) as *mut f32) = qd(q, qb + 24) as f32
+            *((vo + 40 as u64) as *mut f32) = qd(q, qb + 26 + k) as f32
+            k = k + 1
+        }
+        let io: u64 = id + (i * 6 * 4) as u64
+        if qd(q, qb + 20) as u32 == 0 as u32 {
+            var z: usize = 0
+            while z < 6 {
+                *((io + (z * 4) as u64) as *mut u32) = (i * 4) as u32
+                z = z + 1
+            }
+        } else {
+            quad_idx(io, (i * 4) as u32)
+        }
+        i = i + 1
+    }
+}
+
+fn quad_idx(io: u64, base: u32) {
+    *(io as *mut u32) = base
+    *((io + 4 as u64) as *mut u32) = base + 1 as u32
+    *((io + 8 as u64) as *mut u32) = base + 2 as u32
+    *((io + 12 as u64) as *mut u32) = base
+    *((io + 16 as u64) as *mut u32) = base + 2 as u32
+    *((io + 20 as u64) as *mut u32) = base + 3 as u32
 }
 
 fn be_free(o: u64, h: usize) {
@@ -774,6 +889,7 @@ fn be_free(o: u64, h: usize) {
     }
     defer_add(b, 0, rt.ld64((*b).meshes, q + M_BUF), rt.ld64((*b).meshes, q + M_BLK) as usize, rt.ld64((*b).meshes, q + M_OFF),
         rt.ld64((*b).meshes, q + M_SIZE))
+    mesh_drop_copy(b, q)
     rt.st64((*b).meshes, q + M_USED, 0)
     (*b).live = (*b).live - 1
 }
@@ -802,6 +918,9 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     rot.m[14] = 0.0
     var rv: mc_math.Mat4 = mc_math.Mat4 { m: [0.0; 16] }
     mc_math.mat4_mul(&rv, &(*c).proj, &rot)
+    (*b).rv3 = rv.m[3]
+    (*b).rv7 = rv.m[7]
+    (*b).rv11 = rv.m[11]
     // per-frame part of the Frame UBO (copied into a fresh slice whenever pass / fade / light change, see bake)
     let u: u64 = (*b).base
     var i: usize = 0
@@ -1015,6 +1134,123 @@ fn vkbe_hud(b: *mut VkBackend, rec: *mut rt.Buf) {
     (*b).dirty = true
 }
 
+// MESH_MODEL_T: stable merge sort of the quads FAR TO NEAR by the summed view depth of their corners (like mc_raster.raster_draw_models_ex);
+// the sorted index list goes into the per-frame bump buffer (index buffer of this draw).
+fn sort_model_idx(b: *mut VkBackend, cv: u64, nq: usize, ox: f64, oy: f64, oz: f64, out: u64) {
+    let ord: u64 = rt.heap_alloc(nq * 8 * 3)
+    if ord == 0 {
+        return
+    }
+    let tmp: u64 = ord + (nq * 8) as u64
+    let dep: u64 = ord + (nq * 16) as u64
+    var i: usize = 0
+    while i < nq {
+        var dsum: f64 = 0.0
+        var k: usize = 0
+        while k < 4 {
+            let vo: u64 = cv + ((i * 4 + k) * MV_BYTES) as u64
+            let x: f64 = ox - (*b).cx + (*(vo as *mut f32)) as f64
+            let y: f64 = oy - (*b).cy + (*((vo + 4 as u64) as *mut f32)) as f64
+            let z: f64 = oz - (*b).cz + (*((vo + 8 as u64) as *mut f32)) as f64
+            dsum = dsum + (*b).rv3 * x + (*b).rv7 * y + (*b).rv11 * z
+            k = k + 1
+        }
+        *((dep + (i * 8) as u64) as *mut f64) = dsum
+        rt.st64(ord, i, i as u64)
+        i = i + 1
+    }
+    var w: usize = 1
+    var src: u64 = ord
+    var dst: u64 = tmp
+    while w < nq {
+        var lo: usize = 0
+        while lo < nq {
+            var mid: usize = lo + w
+            if mid > nq { mid = nq }
+            var hi: usize = lo + 2 * w
+            if hi > nq { hi = nq }
+            var a: usize = lo
+            var c2: usize = mid
+            var o2: usize = lo
+            while a < mid && c2 < hi {
+                let da: f64 = *((dep + rt.ld64(src, a) * 8 as u64) as *mut f64)
+                let dc: f64 = *((dep + rt.ld64(src, c2) * 8 as u64) as *mut f64)
+                if dc > da { // descending depth, ties keep the left (earlier) element first
+                    rt.st64(dst, o2, rt.ld64(src, c2))
+                    c2 = c2 + 1
+                } else {
+                    rt.st64(dst, o2, rt.ld64(src, a))
+                    a = a + 1
+                }
+                o2 = o2 + 1
+            }
+            while a < mid {
+                rt.st64(dst, o2, rt.ld64(src, a))
+                a = a + 1
+                o2 = o2 + 1
+            }
+            while c2 < hi {
+                rt.st64(dst, o2, rt.ld64(src, c2))
+                c2 = c2 + 1
+                o2 = o2 + 1
+            }
+            lo = lo + 2 * w
+        }
+        let sw: u64 = src
+        src = dst
+        dst = sw
+        w = w * 2
+    }
+    var n: usize = 0
+    while n < nq {
+        quad_idx(out + (n * 24) as u64, (rt.ld64(src, n) as u32) * 4 as u32)
+        n = n + 1
+    }
+    rt.heap_free(ord, nq * 8 * 3)
+}
+
+// Draws a model slot (MESH_MODEL / MESH_MODEL_T) in submission order: own pipeline (float vertices), the same pass state as the voxel draws.
+fn draw_model(b: *mut VkBackend, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
+    let q: usize = (h - 1) * MW
+    let nq: usize = rt.ld64((*b).meshes, q + M_NQ) as usize
+    if nq == 0 || !(*b).pipe_mod_op.ok || !(*b).pipe_mod_tr.ok {
+        return 0 as u64
+    }
+    let cmd: u64 = vk_frame.frame_cmd(&(*b).fr, (*b).cur)
+    if (*b).dirty {
+        bake(b, cmd)
+    }
+    if (*b).trans {
+        bind_pipe(b, cmd, (*b).pipe_mod_tr.pipe)
+    } else {
+        bind_pipe(b, cmd, (*b).pipe_mod_op.pipe)
+    }
+    let p: u64 = (*b).push
+    vk_mem.wf(p, 0, ox - (*b).cx)
+    vk_mem.wf(p, 4, oy - (*b).cy)
+    vk_mem.wf(p, 8, oz - (*b).cz)
+    vk_mem.w32(p, 12, 0)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_PUSH, cmd, (*b).playout, 0x1, 0, vk_desc.PUSH_BYTES, p, 0, 0, 0, 0)
+    let buf: u64 = rt.ld64((*b).meshes, q + M_BUF)
+    vk_mem.w64((*b).vb, 0, buf)
+    vk_mem.w64((*b).vb, 8, 0)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_VB, cmd, 0, 1, (*b).vb, (*b).vb + 8, 0, 0, 0, 0, 0)
+    var ib: u64 = buf
+    var ioff: u64 = rt.ld64((*b).meshes, q + M_IOFF)
+    let cv: u64 = rt.ld64((*b).meshes, q + M_MV)
+    if rt.ld64((*b).meshes, q + M_CLS) == 3 && cv != 0 {
+        let off: u64 = dyn_alloc(b, (nq * 24) as u64)
+        if off != 0xFFFFFFFFFFFFFFFF as u64 {
+            sort_model_idx(b, cv, nq, ox, oy, oz, (*b).fs[(*b).cur].dyn.ptr + off)
+            ib = (*b).fs[(*b).cur].dyn.buf
+            ioff = off
+        }
+    }
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_BIND_IB, cmd, ib, ioff, 1, 0, 0, 0, 0, 0, 0)
+    vk_mem.cx(&(*b).x, vk_mem.X_CMD_DRAW_IDX, cmd, (nq * 6) as u64, 1, 0, 0, 0, 0, 0, 0, 0)
+    return (nq * 2) as u64
+}
+
 fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
     let b: *mut VkBackend = o as *mut VkBackend
     if !(*b).in_frame || h < 1 || h > (*b).mcap {
@@ -1023,6 +1259,12 @@ fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
     let q: usize = (h - 1) * MW
     if rt.ld64((*b).meshes, q + M_USED) == 0 {
         return 0 as u64
+    }
+    if rt.ld64((*b).meshes, q + M_CLS) != 0 {
+        let mt: u64 = draw_model(b, h, ox, oy, oz)
+        (*b).draws = (*b).draws + 1 as u64
+        (*b).tris = (*b).tris + mt
+        return mt
     }
     let nidx: u64 = rt.ld64((*b).meshes, q + M_NIDX)
     let cmd: u64 = vk_frame.frame_cmd(&(*b).fr, (*b).cur)
@@ -1293,6 +1535,7 @@ fn vkbe_close(b: *mut VkBackend) {
         var s: usize = 0
         while s < (*b).mcap && (*b).meshes != 0 {
             if rt.ld64((*b).meshes, s * MW + M_USED) != 0 {
+                mesh_drop_copy(b, s * MW)
                 vk_mem.cx(&(*b).x, vk_mem.X_DESTROY_BUFFER, (*b).x.dev, rt.ld64((*b).meshes, s * MW + M_BUF), 0, 0, 0, 0, 0, 0, 0, 0)
                 rt.st64((*b).meshes, s * MW + M_USED, 0)
             }
@@ -1310,6 +1553,8 @@ fn vkbe_close(b: *mut VkBackend) {
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_tint)
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_hud)
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_ent)
+        vk_desc.vpipe_free(&(*b).x, &(*b).pipe_mod_op)
+        vk_desc.vpipe_free(&(*b).x, &(*b).pipe_mod_tr)
         vk_mem.buf_free(&(*b).x, &(*b).cube)
         vk_desc.vpipe_free(&(*b).x, &(*b).pipe_hud_inv)
         if (*b).playout != 0 {
@@ -1350,6 +1595,7 @@ fn vkbe_backend(b: *mut VkBackend) -> mc_backend.Backend {
     t.set_pass = be_set_pass
     t.set_light = be_set_light
     t.set_fade = be_set_fade
+    t.mesh_class = be_mesh_class
     t.ent_obj = b as u64
     t.draw_entities = be_ents
     return t

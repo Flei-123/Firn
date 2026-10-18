@@ -1,0 +1,391 @@
+// expect_exit: 0
+// tests/3993_mc_vk_models.fi -- (same program as tools/gpu/vk/vkmodel_dump.fi; without a Vulkan device it prints SKIP and passes)
+// MODEL quads (MESH_MODEL / MESH_MODEL_T of lib/mc/mc_model_mesh.fi) on the VULKAN back end (lib/mc/vk_mc.fi,
+// vk_glsl/mc_model_vs/fs.glsl) against the CPU rasterizer (lib/mc/mc_raster.fi): same Backend calls on both, PSNR / coverage thresholds like
+// tools/gpu/model_dump.fi (the GL twin). lavapipe, NO real GPU.
+// Scenes: textured quad, tint + AO + face shade, block/sky light, cut-out + fog, translucent quads (sorted far to near) over an opaque
+// voxel wall. Usage: model_dump [outdir]. Exit 0 = all ok, 3 = threshold failed, 4 = no Vulkan device.
+import std.rt
+import std.io
+import std.math
+import std.time
+import mc.mc_mesh
+import mc.mc_camera
+import mc.mc_texture
+import mc.mc_raster
+import mc.mc_backend
+import mc.vk_mc
+
+const W: i32 = 320
+const H: i32 = 180
+const TW: i32 = 640
+const TH: i32 = 360
+
+struct Cmp {
+    npx: u64,
+    diff_px: u64, // any channel differs
+    big_px: u64, // max channel difference > 16
+    max_diff: u32,
+    cov_cpu: u64, // pixels that are not the clear colour
+    cov_gpu: u64,
+    cov_mm: u64, // exactly one of the two covered the pixel
+    psnr_x100: u64,
+}
+
+struct Sc {
+    r: mc_raster.Raster,
+    gb: vk_mc.VkBackend,
+    bc: mc_backend.Backend,
+    bg: mc_backend.Backend,
+    cam: mc_camera.Camera,
+    dir: u64, // output directory (NUL terminated) or 0
+    dirn: usize,
+    fails: i32,
+    fade_a: i32, // scene_t: draw the opaque mesh with set_fade(fade_a, fade_inv) (64 = off)
+    fade_inv: i32,
+}
+
+fn print_f2(v: f64) {
+    var x: f64 = v
+    if x < 0.0 { x = 0.0 }
+    let i: i64 = x as i64
+    var f: i64 = ((x - (i as f64)) * 100.0 + 0.5) as i64
+    var ii: i64 = i
+    if f >= 100 as i64 {
+        f = f - 100 as i64
+        ii = ii + 1 as i64
+    }
+    if f < 10 as i64 {
+        io.fmt_print(f"{ii}.0{f}")
+    } else {
+        io.fmt_print(f"{ii}.{f}")
+    }
+}
+
+// ---- atlas for the hand made scenes -----------------------------------------------------------------
+fn put(a: *mut mc_texture.Atlas, tile: u32, x: i32, y: i32, rgba: u32) {
+    let ox: i32 = mc_texture.atlas_tile_x(a, tile)
+    let oy: i32 = mc_texture.atlas_tile_y(a, tile)
+    rt.st32((*a).px, ((oy + y) * (*a).w + ox + x) as usize, rgba)
+}
+
+// tile 1 solid orange, tile 2 four coloured quadrants + white top row + black left column, tile 3 left half transparent
+fn test_atlas() -> mc_texture.Atlas {
+    var a: mc_texture.Atlas = mc_texture.atlas_new(16, 4, 4)
+    var y: i32 = 0
+    while y < 16 {
+        var x: i32 = 0
+        while x < 16 {
+            put(&a, 1 as u32, x, y, mc_texture.pack_pixel(230 as u32, 120 as u32, 40 as u32, 255 as u32))
+            var c: u32 = mc_texture.pack_pixel(220 as u32, 30 as u32, 30 as u32, 255 as u32)
+            if x >= 8 && y < 8 { c = mc_texture.pack_pixel(30 as u32, 200 as u32, 30 as u32, 255 as u32) }
+            if x < 8 && y >= 8 { c = mc_texture.pack_pixel(30 as u32, 60 as u32, 230 as u32, 255 as u32) }
+            if x >= 8 && y >= 8 { c = mc_texture.pack_pixel(240 as u32, 230 as u32, 30 as u32, 255 as u32) }
+            if y == 0 { c = mc_texture.pack_pixel(255 as u32, 255 as u32, 255 as u32, 255 as u32) }
+            if x == 0 { c = mc_texture.pack_pixel(0 as u32, 0 as u32, 0 as u32, 255 as u32) }
+            put(&a, 2 as u32, x, y, c)
+            var al: u32 = 255 as u32
+            if x < 8 { al = 0 as u32 }
+            put(&a, 3 as u32, x, y, mc_texture.pack_pixel(30 as u32, 220 as u32, 220 as u32, al))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return a
+}
+
+// ---- hand made meshes -------------------------------------------------------------------------------
+fn vw0(x: u32, y: u32, z: u32, face: u32, ao: u32) -> u32 {
+    return x | (y << 8 as u32) | (z << 16 as u32) | (face << 24 as u32) | (ao << 27 as u32)
+}
+
+fn vw1(tile: u32, u: u32, v: u32) -> u32 {
+    return tile | (u << 14 as u32) | (v << 19 as u32) | (15 as u32 << 24 as u32) // mc_mesh layout: tile14 | u5 | v5 | sky4 (15 = full daylight) | block4
+}
+
+fn put_vtx(vp: u64, i: usize, w0: u32, w1: u32) {
+    rt.st32(vp, i * 2, w0)
+    rt.st32(vp, i * 2 + 1, w1)
+}
+
+// ---- compare ----------------------------------------------------------------------------------------
+fn compare(a: u64, b: u64, n: usize, clear: u32, out: *mut Cmp) {
+    (*out).npx = n as u64
+    (*out).diff_px = 0 as u64
+    (*out).big_px = 0 as u64
+    (*out).max_diff = 0 as u32
+    (*out).cov_cpu = 0 as u64
+    (*out).cov_gpu = 0 as u64
+    (*out).cov_mm = 0 as u64
+    var sq: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let pa: u32 = rt.ld32(a, i)
+        let pb: u32 = rt.ld32(b, i)
+        var ca: bool = pa != clear
+        var cb: bool = pb != clear
+        if ca { (*out).cov_cpu = (*out).cov_cpu + 1 as u64 }
+        if cb { (*out).cov_gpu = (*out).cov_gpu + 1 as u64 }
+        if ca != cb { (*out).cov_mm = (*out).cov_mm + 1 as u64 }
+        if pa != pb {
+            (*out).diff_px = (*out).diff_px + 1 as u64
+            var mx: u32 = 0 as u32
+            var k: u32 = 0 as u32
+            while k < 4 as u32 {
+                let ba: i32 = ((pa >> (k * 8 as u32)) & 255 as u32) as i32
+                let bb: i32 = ((pb >> (k * 8 as u32)) & 255 as u32) as i32
+                var d: i32 = ba - bb
+                if d < 0 { d = 0 - d }
+                if k < 3 as u32 { sq = sq + (d * d) as f64 }
+                if (d as u32) > mx { mx = d as u32 }
+                k = k + 1 as u32
+            }
+            if mx > (*out).max_diff { (*out).max_diff = mx }
+            if mx > 16 as u32 { (*out).big_px = (*out).big_px + 1 as u64 }
+        }
+        i = i + 1
+    }
+    var psnr: f64 = 99.0
+    if sq > 0.0 {
+        let mse: f64 = sq / ((n as f64) * 3.0)
+        psnr = 10.0 * math.log10(255.0 * 255.0 / mse)
+    }
+    (*out).psnr_x100 = (psnr * 100.0) as u64
+}
+
+fn write_raw(s: *mut Sc, name: str, kind: str, px: u64, n: usize) {
+    if (*s).dir == 0 { return }
+    var path: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&path, (*s).dir, (*s).dirn)
+    rt.buf_push(&path, 47 as u8)
+    rt.buf_push_bytes(&path, name.p as u64, name.n)
+    rt.buf_push(&path, 46 as u8)
+    rt.buf_push_bytes(&path, kind.p as u64, kind.n)
+    rt.buf_push_bytes(&path, ".rgba".p as u64, 5)
+    rt.buf_push(&path, 0 as u8)
+    rt.write_file(rt.buf_ptr(&path), px, n * 4)
+    rt.buf_free(&path)
+}
+
+// One frame on one back end: mesh `verts/idx` drawn `nx` x `nz` times (section step 16 blocks) from (ox, oy, oz).
+
+// ---- model quads ------------------------------------------------------------------------------------------
+const MQW: usize = 30
+
+fn stq(p: u64, i: usize, v: f64) {
+    *((p + (i as u64) * (8 as u64)) as *mut f64) = v
+}
+
+// Quad i of the buffer: a rectangle in the plane z = `z` between x0 > x1 and y0 < y1 (counter-clockwise seen from -z, the camera side),
+// u / v in tile units (u0 .. u1, v1 .. v0 from the bottom to the top edge), tile, face brightness, sky, block, tint (-1 none), ao per corner.
+fn mq_z(q: u64, i: usize, x0: f64, x1: f64, y0: f64, y1: f64, z: f64, tile: u32, fk: u32, sky: u32, blk: u32, tint: i64, ao0: u32, ao1: u32, ao2: u32, ao3: u32) {
+    let b: usize = i * MQW
+    stq(q, b, x0)
+    stq(q, b + 1, x1)
+    stq(q, b + 2, x1)
+    stq(q, b + 3, x0)
+    stq(q, b + 4, y0)
+    stq(q, b + 5, y0)
+    stq(q, b + 6, y1)
+    stq(q, b + 7, y1)
+    var k: usize = 0
+    while k < 4 {
+        stq(q, b + 8 + k, z)
+        k = k + 1
+    }
+    stq(q, b + 12, 0.0)
+    stq(q, b + 13, 1.0)
+    stq(q, b + 14, 1.0)
+    stq(q, b + 15, 0.0)
+    stq(q, b + 16, 1.0)
+    stq(q, b + 17, 1.0)
+    stq(q, b + 18, 0.0)
+    stq(q, b + 19, 0.0)
+    stq(q, b + 20, tile as f64)
+    stq(q, b + 21, fk as f64)
+    stq(q, b + 22, sky as f64)
+    stq(q, b + 23, blk as f64)
+    stq(q, b + 24, tint as f64)
+    stq(q, b + 25, 0.0)
+    stq(q, b + 26, ao0 as f64)
+    stq(q, b + 27, ao1 as f64)
+    stq(q, b + 28, ao2 as f64)
+    stq(q, b + 29, ao3 as f64)
+}
+
+// One frame: optional opaque voxel mesh `ho`, then the model meshes (opaque `hm`, translucent `hmt` in PASS_TRANS).
+fn frame_m(b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera, clear: u32, ho: usize, hm: usize, hmt: usize) {
+    (*b).begin((*b).obj, (cam as u64), clear)
+    if ho != 0 { (*b).draw((*b).obj, ho, 0.0, 0.0, 0.0) }
+    if hm != 0 { (*b).draw((*b).obj, hm, 0.0, 0.0, 0.0) }
+    if hmt != 0 {
+        (*b).set_pass((*b).obj, mc_backend.PASS_TRANS)
+        (*b).draw((*b).obj, hmt, 0.0, 0.0, 0.0)
+        (*b).set_pass((*b).obj, mc_backend.PASS_OPAQUE)
+    }
+    (*b).end((*b).obj)
+}
+
+fn up_model(b: *mut mc_backend.Backend, key: u64, q: u64, nq: usize, cls: i32, dummy: u64) -> usize {
+    if nq == 0 { return 0 }
+    (*b).mesh_class((*b).obj, cls)
+    let h: usize = (*b).mesh_upload((*b).obj, key, q, nq * MQW, dummy, 1)
+    (*b).mesh_class((*b).obj, mc_backend.MESH_OPAQUE)
+    return h
+}
+
+fn scene_m(s: *mut Sc, name: str, ov: u64, onv: usize, oi: u64, oni: usize, q: u64, nq: usize, qt: u64, nqt: usize, fog: bool, clear: u32,
+    min_psnr_x100: u64, max_mm_permille: u64) {
+    mc_camera.camera_update(&(*s).cam)
+    mc_raster.raster_set_fog(&(*s).r, fog, 20.0, 90.0, 150 as u32, 190 as u32, 230 as u32)
+    vk_mc.vkbe_set_fog(&(*s).gb, fog, 20.0, 90.0, 150 as u32, 190 as u32, 230 as u32)
+    let dummy: u64 = rt.heap_alloc(8)
+    rt.st32(dummy, 0, 0 as u32)
+    rt.st32(dummy, 1, 0 as u32)
+    var hoc: usize = 0
+    var hog: usize = 0
+    if onv > 0 {
+        hoc = (*s).bc.mesh_upload((*s).bc.obj, 1, ov, onv, oi, oni)
+        hog = (*s).bg.mesh_upload((*s).bg.obj, 1, ov, onv, oi, oni)
+    }
+    let hmc: usize = up_model(&(*s).bc, 2, q, nq, mc_backend.MESH_MODEL, dummy)
+    let hmg: usize = up_model(&(*s).bg, 2, q, nq, mc_backend.MESH_MODEL, dummy)
+    let htc: usize = up_model(&(*s).bc, 3, qt, nqt, mc_backend.MESH_MODEL_T, dummy)
+    let htg: usize = up_model(&(*s).bg, 3, qt, nqt, mc_backend.MESH_MODEL_T, dummy)
+    frame_m(&(*s).bc, &(*s).cam, clear, hoc, hmc, htc)
+    frame_m(&(*s).bg, &(*s).cam, clear, hog, hmg, htg)
+    let pc: u64 = (*s).bc.present((*s).bc.obj)
+    let pg: u64 = (*s).bg.present((*s).bg.obj)
+    var c: Cmp = Cmp { npx: 0 as u64, diff_px: 0 as u64, big_px: 0 as u64, max_diff: 0 as u32, cov_cpu: 0 as u64,
+        cov_gpu: 0 as u64, cov_mm: 0 as u64, psnr_x100: 0 as u64 }
+    let n: usize = (W as usize) * (H as usize)
+    compare(pc, pg, n, clear, &c)
+    write_raw(s, name, "cpu", pc, n)
+    write_raw(s, name, "gpu", pg, n)
+    if hoc != 0 { (*s).bc.mesh_free((*s).bc.obj, hoc) }
+    if hog != 0 { (*s).bg.mesh_free((*s).bg.obj, hog) }
+    if hmc != 0 { (*s).bc.mesh_free((*s).bc.obj, hmc) }
+    if hmg != 0 { (*s).bg.mesh_free((*s).bg.obj, hmg) }
+    if htc != 0 { (*s).bc.mesh_free((*s).bc.obj, htc) }
+    if htg != 0 { (*s).bg.mesh_free((*s).bg.obj, htg) }
+    rt.heap_free(dummy, 8)
+    let mm_permille: u64 = c.cov_mm * 1000 as u64 / c.npx
+    var ok: bool = c.cov_cpu > 0 as u64 && c.cov_gpu > 0 as u64
+    if c.psnr_x100 < min_psnr_x100 { ok = false }
+    if mm_permille > max_mm_permille { ok = false }
+    io.print("scene ")
+    io.print(name)
+    io.fmt_print(f" cov_cpu={c.cov_cpu} cov_gpu={c.cov_gpu} cov_mismatch={c.cov_mm} ({mm_permille} permille) diff_px={c.diff_px} big_px={c.big_px} max_diff={c.max_diff} psnr=")
+    print_f2((c.psnr_x100 as f64) / 100.0)
+    io.print(" min_psnr=")
+    print_f2((min_psnr_x100 as f64) / 100.0)
+    if ok {
+        io.print(" ok\n")
+    } else {
+        io.print(" FAIL\n")
+        (*s).fails = (*s).fails + 1
+    }
+}
+
+// opaque voxel wall (tile 1) behind the translucent quads: z = 20, x 0..16, y 0..16
+fn wall(vp: u64, ip: u64) {
+    put_vtx(vp, 0, vw0(16 as u32, 0 as u32, 20 as u32, 3 as u32, 3 as u32), vw1(2 as u32, 0 as u32, 1 as u32))
+    put_vtx(vp, 1, vw0(0 as u32, 0 as u32, 20 as u32, 3 as u32, 3 as u32), vw1(2 as u32, 1 as u32, 1 as u32))
+    put_vtx(vp, 2, vw0(0 as u32, 16 as u32, 20 as u32, 3 as u32, 3 as u32), vw1(2 as u32, 1 as u32, 0 as u32))
+    put_vtx(vp, 3, vw0(16 as u32, 16 as u32, 20 as u32, 3 as u32, 3 as u32), vw1(2 as u32, 0 as u32, 0 as u32))
+    rt.st32(ip, 0, 0 as u32)
+    rt.st32(ip, 1, 1 as u32)
+    rt.st32(ip, 2, 2 as u32)
+    rt.st32(ip, 3, 0 as u32)
+    rt.st32(ip, 4, 2 as u32)
+    rt.st32(ip, 5, 3 as u32)
+}
+
+fn main(start: u64) -> i32 {
+    var dir: u64 = 0
+    var dirn: usize = 0
+    if rt.arg_count(start) >= 2 {
+        dir = rt.arg_ptr(start, 1)
+        while rt.ld8(dir, dirn) != 0 as u8 { dirn = dirn + 1 }
+    }
+    var gb: vk_mc.VkBackend = vk_mc.vkbe_open(W, H)
+    if !gb.ok {
+        io.print("SKIP: no Vulkan device\n")
+        return 0
+    }
+    io.print("renderer: ")
+    io.print_c(vk_mc.vkbe_device_name(&gb))
+    io.new_line()
+    var s: Sc = Sc { r: mc_raster.raster_new(W, H), gb: gb, bc: mc_backend.backend_new(), bg: mc_backend.backend_new(),
+        cam: mc_camera.camera_new(W, H), dir: dir, dirn: dirn, fails: 0, fade_a: 64, fade_inv: 0 }
+    s.bc = mc_backend.backend_cpu(&s.r)
+    s.bg = vk_mc.vkbe_backend(&s.gb)
+    var ta: mc_texture.Atlas = test_atlas()
+    // tile 4: translucent cyan (alpha 140), tile 5: translucent magenta (alpha 110)
+    var y: i32 = 0
+    while y < 16 {
+        var x: i32 = 0
+        while x < 16 {
+            put(&ta, 4 as u32, x, y, mc_texture.pack_pixel(40 as u32, 220 as u32, 230 as u32, 140 as u32))
+            put(&ta, 5 as u32, x, y, mc_texture.pack_pixel(230 as u32, 40 as u32, 200 as u32, 110 as u32))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    s.bc.upload_atlas(s.bc.obj, (&ta) as u64)
+    s.bg.upload_atlas(s.bg.obj, (&ta) as u64)
+    let clear: u32 = 0xFFE6BE96 as u32
+    let q: u64 = rt.heap_alloc(8 * MQW * 8)
+    let qt: u64 = rt.heap_alloc(8 * MQW * 8)
+    let wv: u64 = rt.heap_alloc(4 * 8)
+    let wi: u64 = rt.heap_alloc(6 * 4)
+    wall(wv, wi)
+    mc_camera.camera_set_pos(&s.cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&s.cam, 0.0, 0.0)
+
+    // 1. one textured quad (tile 2), full light, no tint
+    mq_z(q, 0, 12.0, 4.0, 2.0, 14.0, 10.0, 2 as u32, 256 as u32, 15 as u32, 0 as u32, 0 - 1, 3 as u32, 3 as u32, 3 as u32, 3 as u32)
+    scene_m(&s, "model_quad", 0, 0, 0, 0, q, 1, 0, 0, false, clear, 3400 as u64, 5 as u64)
+    mc_camera.camera_set_pos(&s.cam, 14.0, 9.0, 1.0)
+    mc_camera.camera_set_angles(&s.cam, 25.0, 8.0)
+    scene_m(&s, "model_quad_angled", 0, 0, 0, 0, q, 1, 0, 0, false, clear, 3400 as u64, 5 as u64)
+    mc_camera.camera_set_pos(&s.cam, 8.0, 8.0, 0.0)
+    mc_camera.camera_set_angles(&s.cam, 0.0, 0.0)
+
+    // 2. tint (grass green, birch, none), AO gradients, face shades, on solid tile 1
+    mq_z(q, 0, 15.0, 11.0, 2.0, 14.0, 10.0, 1 as u32, 256 as u32, 15 as u32, 0 as u32, 0x48B03C, 3 as u32, 3 as u32, 3 as u32, 3 as u32)
+    mq_z(q, 1, 10.0, 6.0, 2.0, 14.0, 10.0, 1 as u32, 204 as u32, 15 as u32, 0 as u32, 0x6EA55A, 0 as u32, 3 as u32, 3 as u32, 0 as u32)
+    mq_z(q, 2, 5.0, 1.0, 2.0, 14.0, 10.0, 2 as u32, 153 as u32, 15 as u32, 0 as u32, 0 - 1, 1 as u32, 1 as u32, 3 as u32, 2 as u32)
+    scene_m(&s, "model_tint_ao", 0, 0, 0, 0, q, 3, 0, 0, false, clear, 3400 as u64, 5 as u64)
+
+    // 3. light: sky 6 / block 9, dim day and a warm block tint on both back ends
+    mc_raster.raster_set_light(&s.r, 120, 256, 200, 140)
+    vk_mc.vkbe_set_light(&s.gb, 120, 256, 200, 140)
+    mq_z(q, 0, 15.0, 11.0, 2.0, 14.0, 10.0, 1 as u32, 256 as u32, 6 as u32, 9 as u32, 0xFFFFFF, 3 as u32, 3 as u32, 3 as u32, 3 as u32)
+    mq_z(q, 1, 10.0, 6.0, 2.0, 14.0, 10.0, 2 as u32, 256 as u32, 12 as u32, 0 as u32, 0 - 1, 3 as u32, 3 as u32, 3 as u32, 3 as u32)
+    mq_z(q, 2, 5.0, 1.0, 2.0, 14.0, 10.0, 2 as u32, 256 as u32, 0 as u32, 14 as u32, 0 - 1, 3 as u32, 3 as u32, 3 as u32, 3 as u32)
+    scene_m(&s, "model_light", 0, 0, 0, 0, q, 3, 0, 0, false, clear, 3400 as u64, 5 as u64)
+    mc_raster.raster_set_light(&s.r, 256, 256, 224, 176)
+    vk_mc.vkbe_set_light(&s.gb, 256, 256, 224, 176)
+
+    // 4. cut-out (tile 3) + fog on a receding tinted quad pair
+    mq_z(q, 0, 15.0, 3.0, 2.0, 14.0, 12.0, 3 as u32, 256 as u32, 15 as u32, 0 as u32, 0x48B03C, 3 as u32, 3 as u32, 3 as u32, 3 as u32)
+    mq_z(q, 1, 14.0, 5.0, 3.0, 12.0, 40.0, 1 as u32, 256 as u32, 15 as u32, 0 as u32, 0 - 1, 3 as u32, 3 as u32, 3 as u32, 3 as u32)
+    scene_m(&s, "model_cutout_fog", 0, 0, 0, 0, q, 2, 0, 0, true, clear, 3400 as u64, 5 as u64)
+
+    // 5. translucent quads in a deliberately wrong order (near first): the sort has to draw them far to near; over the voxel wall at z = 20
+    mq_z(qt, 0, 13.0, 5.0, 3.0, 11.0, 8.0, 4 as u32, 256 as u32, 15 as u32, 0 as u32, 0 - 1, 3 as u32, 3 as u32, 3 as u32, 3 as u32)
+    mq_z(qt, 1, 11.0, 3.0, 5.0, 13.0, 12.0, 5 as u32, 256 as u32, 15 as u32, 0 as u32, 0 - 1, 3 as u32, 3 as u32, 3 as u32, 3 as u32)
+    mq_z(qt, 2, 14.0, 6.0, 7.0, 15.0, 16.0, 4 as u32, 204 as u32, 15 as u32, 0 as u32, 0x48B03C, 3 as u32, 3 as u32, 3 as u32, 3 as u32)
+    scene_m(&s, "model_trans_sorted", wv, 4, wi, 6, q, 0, qt, 3, false, clear, 3400 as u64, 5 as u64)
+    // the same together with an opaque model quad in front of one of them (depth test against the model depth)
+    mq_z(q, 0, 10.0, 4.0, 1.0, 9.0, 10.0, 2 as u32, 256 as u32, 15 as u32, 0 as u32, 0xB0B0B0, 3 as u32, 3 as u32, 3 as u32, 3 as u32)
+    scene_m(&s, "model_trans_mixed", wv, 4, wi, 6, q, 1, qt, 3, true, clear, 3400 as u64, 5 as u64)
+    if s.fails > 0 {
+        vk_mc.vkbe_close(&s.gb)
+        return 3
+    }
+    vk_mc.vkbe_close(&s.gb)
+    io.print("vkmodel_dump: all scenes ok\n")
+    return 0
+}
