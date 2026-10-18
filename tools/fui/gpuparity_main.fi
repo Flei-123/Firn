@@ -26,6 +26,8 @@ import paint.png
 import paint.gl
 import font.metrics
 import fui.gpu
+import fui.glass
+import fui.glasspane
 import fui.gpu_vk
 import fui.painter
 import fui.theme
@@ -160,6 +162,79 @@ fn zoo(z: *mut painter.Painter, dark: bool, text: bool) {
     transform.tf_draw_image(z, &xf, &pic, 520.0, 520.0, 96.0, 64.0, 1.0)
     transform.tf_fill_quad(z, 700.0, 520.0, 820.0, 540.0, 800.0, 640.0, 690.0, 610.0,
         4294930176 as u32)
+    // a batch of glass panels (three apart, the fourth over two of them: its own group)
+    painter.round_rect(z, 880.0, 500.0, 300.0, 40.0, 10.0, 4294930176 as u32)
+    painter.round_rect(z, 1000.0, 520.0, 40.0, 100.0, 10.0, 4278229503 as u32)
+    batch_panels(z)
+    // a glass pane of the surfaces (menu, dialog, tip): on the GPU the band is read back, the glass engine paints it, the band goes up
+    let cvz: *mut canvas.Canvas = painter.painter_canvas(z)
+    var slot: usize = glasspane.SLOT_MENU
+    if gpu.gpu_of(cvz) as u64 != 0 {
+        slot = glasspane.SLOT_SUB // its own cache: the second run must not take the pane of the first
+    }
+    let gp1: bool = glasspane.pane_cv(cvz, slot, 1110.0, 560.0, 110.0, 110.0, 12.0, glass.KIND_ACRYLIC, 2, dark)
+}
+
+// 4 panels, blur 18: the first three do not touch, the fourth lies over the first and the third
+fn batch_panels(z: *mut painter.Painter) {
+    var r: [f64; 16] = [860.0, 490.0, 110.0, 80.0, 990.0, 490.0, 110.0, 80.0, 860.0, 620.0, 240.0, 70.0, 900.0, 530.0, 120.0, 110.0]
+    var t: [u32; 4] = [1728053247 as u32, 1711276287 as u32, 1996488959 as u32, 1442840575 as u32]
+    if env.has("FUI_BATCH_OFF") {
+        var i: usize = 0
+        while i < 4 {
+            let f: bool = effect.frost_rect(z, r[i * 4], r[i * 4 + 1], r[i * 4 + 2], r[i * 4 + 3], 18, t[i])
+            i = i + 1
+        }
+        return
+    }
+    let ok: bool = effect.frost_rects(z, &r[0], &t[0], 4, 18)
+}
+
+// The batch must give EXACTLY what the same panels one by one give (on the GPU): both ways on one canvas size, compare the octets.
+#[allow_escape]
+fn batch_exact(g: *mut gpu.Gpu, fm: u64, blur: i64) -> bool {
+    var cva: canvas.Canvas = canvas.canvas_new()
+    var cvb: canvas.Canvas = canvas.canvas_new()
+    if !canvas.canvas_init(&cva, PW, PH) || !canvas.canvas_init(&cvb, PW, PH) {
+        return false
+    }
+    var za: painter.Painter = painter.painter_new()
+    var zb: painter.Painter = painter.painter_new()
+    if !painter.painter_init(&za, &cva, 1200, 120) || !painter.painter_init(&zb, &cvb, 1200, 120) {
+        return false
+    }
+    painter.painter_set_font(&za, fm)
+    painter.painter_set_font(&zb, fm)
+    let pa: u64 = canvas.canvas_pixels(&cva) as u64
+    let pb: u64 = canvas.canvas_pixels(&cvb) as u64
+    var r: [f64; 24] = [20.5, 30.0, 200.0, 90.0, 300.0, 40.0, 130.0, 70.0, 20.0, 150.0, 333.0, 61.0, 100.0, 60.0, 150.0, 120.0, 1180.0, 650.0, 100.0, 100.0, 600.0, 300.0, 90.0, 9.0]
+    var t: [u32; 6] = [1728053247 as u32, 1711276287 as u32, 1996488959 as u32, 1442840575 as u32, 2147483648 as u32, 1291845631 as u32]
+    // singles
+    gpu.gpu_attach(g, &cva)
+    zoo(&za, false, false)
+    var i: usize = 0
+    while i < 6 {
+        let f: bool = effect.frost_rect(&za, r[i * 4], r[i * 4 + 1], r[i * 4 + 2], r[i * 4 + 3], blur, t[i])
+        i = i + 1
+    }
+    gpu.gpu_read(g, 0, 0, PW as i32, PH as i32, pa, PW * 4)
+    gpu.gpu_detach(g, &cva)
+    let pass1: u64 = gpu_vk.vkgl_passes()
+    // batch
+    gpu.gpu_attach(g, &cvb)
+    zoo(&zb, false, false)
+    let ok: bool = effect.frost_rects(&zb, &r[0], &t[0], 6, blur)
+    gpu.gpu_read(g, 0, 0, PW as i32, PH as i32, pb, PW * 4)
+    gpu.gpu_detach(g, &cvb)
+    let pass2: u64 = gpu_vk.vkgl_passes()
+    var tot: [i64; 4] = [0; 4]
+    cmp_region(pa, pb, PW, 0, 0, PW as i64, PH as i64, &tot)
+    io.fmt_print(f"gpuparity batch blur={blur}: singles vs batch sum|d|={tot[0]} max={tot[1]}; render passes so far {pass1} -> {pass2} (zoo page + batch, includes the page)\n")
+    painter.painter_free(&za)
+    painter.painter_free(&zb)
+    canvas.canvas_free(&cva)
+    canvas.canvas_free(&cvb)
+    return ok && tot[0] == 0
 }
 
 // ---------------------------------------------------------------- comparing
@@ -212,17 +287,17 @@ fn r3(v: f64) -> f64 {
 // The regions of the page (x0, y0, x1, y1) -- diagnosis only; the gate looks at the whole picture.
 fn region_set(rg: *mut [i64; 56], names: *mut [str; 14]) {
     var v: [i64; 56] = [
-        20, 20, 730, 85,    // shapes
-        15, 100, 700, 200,  // text runs
-        15, 186, 440, 250,  // icons
-        20, 275, 240, 380,  // shadow + rrect_fast
+        20, 20, 730, 85, // shapes
+        15, 100, 700, 200, // text runs
+        15, 186, 440, 250, // icons
+        20, 275, 240, 380, // shadow + rrect_fast
         245, 285, 435, 365, // ramp
         455, 285, 645, 365, // veil
         675, 275, 925, 375, // frost
         945, 275, 1195, 375, // backdrop blur
         675, 385, 925, 475, // glass round
         945, 390, 1175, 470, // drop shadow
-        35, 395, 305, 470,  // pictures
+        35, 395, 305, 470, // pictures
         330, 505, 480, 600, // turned round rect
         330, 600, 520, 650, // turned text
         510, 505, 830, 660, // turned picture + quad
@@ -444,6 +519,28 @@ fn bench_one(z: *mut painter.Painter, kind: i32) {
         page1080(z)
     } else if kind == 1 {
         let f: bool = effect.frost_rect(z, 100.0, 100.0, 400.0, 300.0, 18, 1728053247 as u32)
+    } else if kind >= 3 {
+        // 12 panels (4 x 3 grid of 300x200) that do not touch: one by one (3) or as one batch (4)
+        var r: [f64; 48] = [0.0; 48]
+        var t: [u32; 12] = [0 as u32; 12]
+        var i: usize = 0
+        while i < 12 {
+            r[i * 4] = 40.0 + ((i % 4) as f64) * 320.0
+            r[i * 4 + 1] = 40.0 + ((i / 4) as f64) * 260.0
+            r[i * 4 + 2] = 300.0
+            r[i * 4 + 3] = 200.0
+            t[i] = 1728053247 as u32
+            i = i + 1
+        }
+        if kind == 3 {
+            i = 0
+            while i < 12 {
+                let f: bool = effect.frost_rect(z, r[i * 4], r[i * 4 + 1], r[i * 4 + 2], r[i * 4 + 3], 18, t[i])
+                i = i + 1
+            }
+        } else {
+            let f: bool = effect.frost_rects(z, &r[0], &t[0], 12, 18)
+        }
     } else {
         let f: bool = effect.frost_rect(z, 100.0, 100.0, 1200.0, 700.0, 18, 1728053247 as u32)
     }
@@ -480,11 +577,12 @@ fn perf_run(g: *mut gpu.Gpu, fm: u64) -> bool {
     }
     let pb: u64 = canvas.canvas_pixels(&cvb) as u64
     var kind: i32 = 0
-    while kind < 3 {
+    while kind < 5 {
         var reps: i32 = 1
         if kind > 0 {
             reps = 10
         }
+        let ps0: u64 = gpu_vk.vkgl_passes()
         var bc: f64 = 1000000.0
         var bg: f64 = 1000000.0
         var br: f64 = 1000000.0
@@ -526,8 +624,12 @@ fn perf_run(g: *mut gpu.Gpu, fm: u64) -> bool {
             nm = "blur panel 400x300 r=18 (frost_rect)"
         } else if kind == 2 {
             nm = "blur panel 1200x700 r=18 (frost_rect)"
+        } else if kind == 3 {
+            nm = "12 glass panels one by one (frost_rect x12)"
+        } else if kind == 4 {
+            nm = "12 glass panels as one batch (frost_rects)"
         }
-        io.fmt_print(f"gpuperf {nm}: cpu={r3(bc)} ms  vulkan_paint={r3(bg)} ms  readback_1080p={r3(br)} ms\n")
+        io.fmt_print(f"gpuperf {nm}: cpu={r3(bc)} ms  vulkan_paint={r3(bg)} ms  readback_1080p={r3(br)} ms  render passes={gpu_vk.vkgl_passes() - ps0}\n")
         kind = kind + 1
     }
     var vs: [u64; 4] = [0; 4]
@@ -609,6 +711,11 @@ fn main(start: u64) -> i32 {
     }
     if !run_case(gp, fm, true, true, dir, have_dir, "dark-text") {
         all = false
+    }
+    if gp as usize != 0 {
+        if !batch_exact(gp, fm, 18) || !batch_exact(gp, fm, 6) || !batch_exact(gp, fm, 40) {
+            all = false
+        }
     }
     if all {
         io.print("gpuparity: OK\n")

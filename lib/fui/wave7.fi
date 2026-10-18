@@ -1,0 +1,262 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/wave7.fi -- THE CONTROLS OF WAVE 7 (r146): the Range-Slider (two thumbs).
+//
+// Same rules as lib/fui/kit.fi / wave5.fi: IMMEDIATE MODE (the program keeps a `Range`, calls `range_draw` every frame),
+// ONE GEOMETRY (`range_thumb_x` serves draw and hit), ONLY THEME tokens, lengths through kit.ln, RIGHT TO LEFT through
+// kit.rx (the low value sits on the right, the arrow keys swap).
+//
+//   range_new(min, max, step, lo, hi)      lo <= hi is kept by every call; step snaps the values (min + k * step)
+//   range_press(c, r, x, w, px)            picks the NEARER thumb (the low one when both lie on the same spot and the
+//                                          press is left of it, else the high one), moves it there
+//   range_drag(c, r, x, w, px)             moves the picked thumb; thumbs never cross (they stop at each other)
+//   range_release(r)                       nothing is picked any more
+//   range_key(r, key)                      arrows +-step on the focused thumb (r.focus), Home / End to the end of its range,
+//                                          Tab-like switch with range_focus_next
+//   range_draw(c, x, y, w, r, st)          track, filled part between the thumbs, two thumbs, focus ring on the focused one
+// HONEST LIMITS: horizontal only, no ticks, no value labels (the program draws them from lo / hi).
+import std.rt
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.kit
+import fui.editor
+
+export {
+    Range, range_new, range_set, range_snap, range_thumb_x, range_value_at, range_height, range_press, range_drag,
+    range_release, range_key, range_focus_next, range_draw, RANGE_NONE, RANGE_LO, RANGE_HI,
+}
+
+const RANGE_NONE: usize = 0
+const RANGE_LO: usize = 1
+const RANGE_HI: usize = 2
+
+struct Range {
+    min: i64,
+    max: i64,
+    step: i64,
+    lo: i64,
+    hi: i64,
+    picked: usize, // RANGE_* of the thumb a press picked (0 = none)
+    focus: usize, // RANGE_* of the thumb the keys move
+}
+
+fn range_snap(r: *mut Range, v: i64) -> i64 {
+    var s: i64 = (*r).step
+    if s < 1 {
+        s = 1
+    }
+    var t: i64 = v
+    if t < (*r).min {
+        t = (*r).min
+    }
+    if t > (*r).max {
+        t = (*r).max
+    }
+    let k: i64 = (t - (*r).min + s / 2) / s
+    t = (*r).min + k * s
+    if t > (*r).max {
+        t = (*r).min + (((*r).max - (*r).min) / s) * s
+    }
+    return t
+}
+
+fn range_new(min: i64, max: i64, step: i64, lo: i64, hi: i64) -> Range {
+    var r: Range = Range { min: min, max: max, step: step, lo: min, hi: max, picked: 0, focus: RANGE_LO }
+    if r.max < r.min {
+        r.max = r.min
+    }
+    range_set(&r, lo, hi)
+    return r
+}
+
+// both values at once (snapped, ordered)
+fn range_set(r: *mut Range, lo: i64, hi: i64) {
+    var a: i64 = range_snap(r, lo)
+    var b: i64 = range_snap(r, hi)
+    if a > b {
+        let t: i64 = a
+        a = b
+        b = t
+    }
+    (*r).lo = a
+    (*r).hi = b
+}
+
+fn range_height(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 24)
+}
+
+fn range_thumb_d(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 18)
+}
+
+// x of the CENTRE of the thumb with value v on a slider at x, w wide (the track runs from x + d/2 to x + w - d/2)
+fn range_thumb_x(c: *mut render.Ctx, r: *mut Range, x: f64, w: f64, v: i64) -> f64 {
+    let d: f64 = range_thumb_d(c)
+    let span: f64 = w - d
+    var t: f64 = 0.0
+    if (*r).max > (*r).min {
+        t = ((v - (*r).min) as f64) / (((*r).max - (*r).min) as f64)
+    }
+    let cx: f64 = x + d / 2.0 + span * t
+    // mirrored: a point at cx goes to the other side of the box
+    return kit.rx(cx, 0.0, x, w)
+}
+
+// the value under the pixel column px (snapped, clamped)
+fn range_value_at(c: *mut render.Ctx, r: *mut Range, x: f64, w: f64, px: f64) -> i64 {
+    let d: f64 = range_thumb_d(c)
+    let span: f64 = w - d
+    if span <= 0.0 || (*r).max <= (*r).min {
+        return (*r).min
+    }
+    var p: f64 = kit.rx(px, 0.0, x, w) // mirror back
+    var t: f64 = (p - x - d / 2.0) / span
+    if t < 0.0 {
+        t = 0.0
+    }
+    if t > 1.0 {
+        t = 1.0
+    }
+    let v: i64 = (*r).min + ((t * (((*r).max - (*r).min) as f64)) + 0.5) as i64
+    return range_snap(r, v)
+}
+
+fn range_press(c: *mut render.Ctx, r: *mut Range, x: f64, w: f64, px: f64) -> usize {
+    let xl: f64 = range_thumb_x(c, r, x, w, (*r).lo)
+    let xh: f64 = range_thumb_x(c, r, x, w, (*r).hi)
+    var dl: f64 = px - xl
+    if dl < 0.0 {
+        dl = 0.0 - dl
+    }
+    var dh: f64 = px - xh
+    if dh < 0.0 {
+        dh = 0.0 - dh
+    }
+    var pick: usize = RANGE_LO
+    if dh < dl {
+        pick = RANGE_HI
+    } else if dh == dl && (*r).lo == (*r).hi {
+        // both on one spot: go to the side the press lies on (so the thumbs can part again)
+        let left: bool = px < xl
+        if left == kit.kit_rtl() {
+            pick = RANGE_HI
+        }
+    }
+    (*r).picked = pick
+    (*r).focus = pick
+    range_drag(c, r, x, w, px)
+    return pick
+}
+
+fn range_drag(c: *mut render.Ctx, r: *mut Range, x: f64, w: f64, px: f64) {
+    if (*r).picked == RANGE_NONE {
+        return
+    }
+    let v: i64 = range_value_at(c, r, x, w, px)
+    if (*r).picked == RANGE_LO {
+        var a: i64 = v
+        if a > (*r).hi {
+            a = (*r).hi
+        }
+        (*r).lo = a
+    } else {
+        var b: i64 = v
+        if b < (*r).lo {
+            b = (*r).lo
+        }
+        (*r).hi = b
+    }
+}
+
+fn range_release(r: *mut Range) {
+    (*r).picked = RANGE_NONE
+}
+
+fn range_focus_next(r: *mut Range) {
+    if (*r).focus == RANGE_LO {
+        (*r).focus = RANGE_HI
+    } else {
+        (*r).focus = RANGE_LO
+    }
+}
+
+// true = the value changed
+fn range_key(r: *mut Range, key0: u32) -> bool {
+    var key: u32 = key0
+    if kit.kit_rtl() {
+        if key == editor.KEY_LEFT {
+            key = editor.KEY_RIGHT
+        } else if key == editor.KEY_RIGHT {
+            key = editor.KEY_LEFT
+        }
+    }
+    var s: i64 = (*r).step
+    if s < 1 {
+        s = 1
+    }
+    var v: i64 = (*r).lo
+    if (*r).focus == RANGE_HI {
+        v = (*r).hi
+    }
+    let old: i64 = v
+    if key == editor.KEY_RIGHT || key == editor.KEY_UP {
+        v = v + s
+    } else if key == editor.KEY_LEFT || key == editor.KEY_DOWN {
+        v = v - s
+    } else if key == editor.KEY_HOME {
+        v = (*r).min
+    } else if key == editor.KEY_END {
+        v = (*r).max
+    }
+    v = range_snap(r, v)
+    if (*r).focus == RANGE_LO {
+        if v > (*r).hi {
+            v = (*r).hi
+        }
+        (*r).lo = v
+    } else {
+        if v < (*r).lo {
+            v = (*r).lo
+        }
+        (*r).hi = v
+    }
+    return v != old
+}
+
+fn range_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, r: *mut Range, st: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let d: f64 = range_thumb_d(c)
+    let h: f64 = range_height(c)
+    let th: f64 = kit.ln(c, 4)
+    let ty: f64 = y + (h - th) / 2.0
+    var track: u32 = kit.tokc(c, style.TOK_BORDER)
+    var fill: u32 = theme.opaque(kit.accent_gfx(c, style.TOK_BASE))
+    var knob: u32 = kit.tokc(c, style.TOK_TEXT)
+    if (st & kit.ST_DISABLED) != 0 as u32 {
+        fill = kit.tokc(c, style.TOK_TEXT_DISABLED)
+        knob = fill
+    }
+    painter.round_rect(z, x + d / 2.0, ty, w - d, th, th / 2.0, track)
+    let xl: f64 = range_thumb_x(c, r, x, w, (*r).lo)
+    let xh: f64 = range_thumb_x(c, r, x, w, (*r).hi)
+    var a: f64 = xl
+    var b: f64 = xh
+    if a > b {
+        a = xh
+        b = xl
+    }
+    if b > a {
+        painter.round_rect(z, a, ty, b - a, th, th / 2.0, fill)
+    }
+    painter.round_rect(z, xl - d / 2.0, y + (h - d) / 2.0, d, d, d / 2.0, knob)
+    painter.round_rect(z, xh - d / 2.0, y + (h - d) / 2.0, d, d, d / 2.0, knob)
+    if (st & kit.ST_FOCUS) != 0 as u32 {
+        var fx: f64 = xl
+        if (*r).focus == RANGE_HI {
+            fx = xh
+        }
+        kit.focus_ring(c, fx - d / 2.0 - kit.ln(c, 2), y + (h - d) / 2.0 - kit.ln(c, 2), d + kit.ln(c, 4), d + kit.ln(c, 4), d / 2.0 + kit.ln(c, 2), style.TOK_BASE)
+    }
+}

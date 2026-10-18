@@ -73,7 +73,7 @@ export {
     gpu_frame_begin, gpu_present, gpu_present_at, gpu_flush, gpu_read, gpu_finish,
     gpu_clear, gpu_fill_raster,
     gpu_rect, gpu_mask_at, gpu_rrect_fast, gpu_rrect_shadow, gpu_ramp,
-    gpu_veil, gpu_glow, gpu_round, gpu_frost,
+    gpu_veil, gpu_glow, gpu_round, gpu_frost, gpu_frost_many,
     gpu_sw_begin, gpu_sw_end, gpu_upload_band, gpu_stray,
     Target, target_new, gpu_target_make, gpu_target_free, gpu_target_ok, gpu_copy,
     gpu_draw_target, gpu_draw_pixels, gpu_draw_image, gpu_draw_photo, gpu_main, gpu_clear_rows, gpu_tmp,
@@ -1032,76 +1032,176 @@ fn gpu_round(g: *mut Gpu, x: f64, y: f64, w: f64, h: f64, r: f64, st: f64,
 // back into the canvas without blending.
 fn gpu_frost(g: *mut Gpu, x: f64, y: f64, w: f64, h: f64, blur: i64,
     tint: u32) -> bool {
-    let rx0: f64 = flo_r(x)
-    let ry0: f64 = flo_r(y)
-    var b: [f64; 4] = [rx0, ry0, flo_r(x + w), flo_r(y + h)]
-    if !band(g, &b[0]) {
-        return true
+    var r: [f64; 4] = [x, y, w, h]
+    var t: [u32; 1] = [tint]
+    return gpu_frost_many(g, &r[0], &t[0], 1, blur)
+}
+
+// Most panels of one batch (a group is cut here).
+const FROST_MAX: usize = 16
+// The small targets never grow past this many rows for a group.
+const FROST_ROWS: i64 = 2048
+
+// n panels (x, y, w, h each in `rects`, a tint each in `tints`) with ONE blur radius, painted in this order. The same arithmetic as
+// n calls of gpu_frost; but panels whose bands do not touch share the passes: their small bands lie one under the other in s1 / s2,
+// and every step is ONE render pass for the whole group (9 passes for the group instead of 9 for each panel). A panel whose band
+// overlaps one of the group is the start of the next group (it must see the glass of the earlier one).
+fn gpu_frost_many(g: *mut Gpu, rects: *mut f64, tints: *mut u32, n: usize,
+    blur: i64) -> bool {
+    var bs: [f64; 64] = [0.0; 64] // the bands (x0, y0, x1, y1) of the group
+    var ts: [u32; 16] = [0 as u32; 16]
+    var m: usize = 0
+    var rows: i64 = 0
+    var i: usize = 0
+    while i < n {
+        let x: f64 = *((rects as u64 + (i * 32) as u64) as *mut f64)
+        let y: f64 = *((rects as u64 + (i * 32 + 8) as u64) as *mut f64)
+        let w: f64 = *((rects as u64 + (i * 32 + 16) as u64) as *mut f64)
+        let h: f64 = *((rects as u64 + (i * 32 + 24) as u64) as *mut f64)
+        var b: [f64; 4] = [flo_r(x), flo_r(y), flo_r(x + w), flo_r(y + h)]
+        if band(g, &b[0]) && b[2] > b[0] && b[3] > b[1] {
+            var f: i64 = 4
+            if blur >= 16 { f = 8 }
+            if blur < 8 { f = 2 }
+            if blur < 3 { f = 1 }
+            let shn: i64 = ((b[3] - b[1]) as i64 + f - 1) / f
+            var cut_here: bool = m >= FROST_MAX || rows + shn > FROST_ROWS
+            var k: usize = 0
+            while k < m && !cut_here {
+                if b[0] < bs[k * 4 + 2] && bs[k * 4] < b[2] && b[1] < bs[k * 4 + 3] &&
+                bs[k * 4 + 1] < b[3] {
+                    cut_here = true
+                }
+                k = k + 1
+            }
+            if cut_here && m > 0 {
+                if !frost_group(g, &bs[0], &ts[0], m, blur) {
+                    return false
+                }
+                m = 0
+                rows = 0
+            }
+            bs[m * 4] = b[0]
+            bs[m * 4 + 1] = b[1]
+            bs[m * 4 + 2] = b[2]
+            bs[m * 4 + 3] = b[3]
+            ts[m] = *((tints as u64 + (i * 4) as u64) as *mut u32)
+            rows = rows + shn
+            m = m + 1
+        }
+        i = i + 1
     }
-    let x0: i64 = b[0] as i64
-    let y0: i64 = b[1] as i64
-    let iw: i64 = (b[2] - b[0]) as i64
-    let ih: i64 = (b[3] - b[1]) as i64
-    if iw <= 0 || ih <= 0 {
-        return true
+    if m > 0 {
+        return frost_group(g, &bs[0], &ts[0], m, blur)
     }
+    return true
+}
+
+// One group: `m` bands (x0, y0, x1, y1; clipped, whole pixels, none touching another).
+fn frost_group(g: *mut Gpu, bs: *mut f64, ts: *mut u32, m: usize, blur: i64) -> bool {
     var f: i64 = 4
     if blur >= 16 { f = 8 }
     if blur < 8 { f = 2 }
     if blur < 3 { f = 1 }
-    let sw: i64 = (iw + f - 1) / f
-    let sh: i64 = (ih + f - 1) / f
-    if !small_targets(g, sw as i32, sh as i32) {
+    var sws: [i64; 16] = [0; 16]
+    var shs: [i64; 16] = [0; 16]
+    var oys: [i64; 16] = [0; 16] // the row of the band in the small targets
+    var maxw: i64 = 1
+    var rows: i64 = 0
+    var k: usize = 0
+    while k < m {
+        let iw: i64 = (*((bs as u64 + (k * 32 + 16) as u64) as *mut f64) - *((bs as u64 + (k * 32) as u64) as *mut f64)) as i64
+        let ih: i64 = (*((bs as u64 + (k * 32 + 24) as u64) as *mut f64) - *((bs as u64 + (k * 32 + 8) as u64) as *mut f64)) as i64
+        sws[k] = (iw + f - 1) / f
+        shs[k] = (ih + f - 1) / f
+        oys[k] = rows
+        rows = rows + shs[k]
+        if sws[k] > maxw { maxw = sws[k] }
+        k = k + 1
+    }
+    if !small_targets(g, maxw as i32, rows as i32) {
         return false
     }
     gpu_flush(g)
     let mw: i32 = (*g).main.w
     let mh: i32 = (*g).main.h
-    // 1. shrink: main -> s1
-    want(g, &(*g).s1, false, (*g).main.tex, mw, mh)
-    var p: u64 = quad(g, K_SHRINK, 0.0, 0.0, sw as f64, sh as f64, 0.0, 0.0,
-        sw as f64, sh as f64)
-    v4(p, 12, x0 as f64, y0 as f64, 0.0, 0.0)
-    v4(p, 16, f as f64, iw as f64, ih as f64, 0.0)
-    gpu_flush(g)
-    // 2. blur: three box passes each way (f < 8) or one each way (box2)
     var rs: i64 = (blur + f / 2) / f
     if rs < 1 { rs = 1 }
     if rs > 64 { rs = 64 }
+    // 1. shrink: main -> s1
+    want(g, &(*g).s1, false, (*g).main.tex, mw, mh)
+    k = 0
+    while k < m {
+        let x0: f64 = *((bs as u64 + (k * 32) as u64) as *mut f64)
+        let y0: f64 = *((bs as u64 + (k * 32 + 8) as u64) as *mut f64)
+        let iw: f64 = *((bs as u64 + (k * 32 + 16) as u64) as *mut f64) - x0
+        let ih: f64 = *((bs as u64 + (k * 32 + 24) as u64) as *mut f64) - y0
+        let oy: f64 = oys[k] as f64
+        let p: u64 = quad(g, K_SHRINK, 0.0, oy, sws[k] as f64, oy + shs[k] as f64, 0.0, oy,
+            sws[k] as f64, oy + shs[k] as f64)
+        v4(p, 12, x0, y0, 0.0, 0.0)
+        v4(p, 16, f as f64, iw, ih, 0.0)
+        v4(p, 20, 0.0, oy, 0.0, 0.0)
+        k = k + 1
+    }
+    gpu_flush(g)
+    // 2. blur: three box passes each way (f < 8) or one each way (box2)
     if f >= 8 {
-        pass(g, K_BOX2H, &(*g).s1, &(*g).s2, sw, sh, rs)
-        pass(g, K_BOX2V, &(*g).s2, &(*g).s1, sw, sh, rs)
+        pass_many(g, K_BOX2H, &(*g).s1, &(*g).s2, &sws[0], &shs[0], &oys[0], m, rs)
+        pass_many(g, K_BOX2V, &(*g).s2, &(*g).s1, &sws[0], &shs[0], &oys[0], m, rs)
     } else {
-        pass(g, K_BOXH, &(*g).s1, &(*g).s2, sw, sh, rs)
-        pass(g, K_BOXH, &(*g).s2, &(*g).s1, sw, sh, rs)
-        pass(g, K_BOXH, &(*g).s1, &(*g).s2, sw, sh, rs)
-        pass(g, K_BOXV, &(*g).s2, &(*g).s1, sw, sh, rs)
-        pass(g, K_BOXV, &(*g).s1, &(*g).s2, sw, sh, rs)
-        pass(g, K_BOXV, &(*g).s2, &(*g).s1, sw, sh, rs)
+        pass_many(g, K_BOXH, &(*g).s1, &(*g).s2, &sws[0], &shs[0], &oys[0], m, rs)
+        pass_many(g, K_BOXH, &(*g).s2, &(*g).s1, &sws[0], &shs[0], &oys[0], m, rs)
+        pass_many(g, K_BOXH, &(*g).s1, &(*g).s2, &sws[0], &shs[0], &oys[0], m, rs)
+        pass_many(g, K_BOXV, &(*g).s2, &(*g).s1, &sws[0], &shs[0], &oys[0], m, rs)
+        pass_many(g, K_BOXV, &(*g).s1, &(*g).s2, &sws[0], &shs[0], &oys[0], m, rs)
+        pass_many(g, K_BOXV, &(*g).s2, &(*g).s1, &sws[0], &shs[0], &oys[0], m, rs)
     }
     // 3. tint: s1 -> s2
     want(g, &(*g).s2, false, (*g).s1.tex, (*g).s1.w, (*g).s1.h)
-    p = quad(g, K_TINT, 0.0, 0.0, sw as f64, sh as f64, 0.0, 0.0, sw as f64,
-        sh as f64)
-    col4(p, 4, tint)
+    k = 0
+    while k < m {
+        let oy: f64 = oys[k] as f64
+        let p: u64 = quad(g, K_TINT, 0.0, oy, sws[k] as f64, oy + shs[k] as f64, 0.0, oy,
+            sws[k] as f64, oy + shs[k] as f64)
+        col4(p, 4, *((ts as u64 + (k * 4) as u64) as *mut u32))
+        k = k + 1
+    }
     gpu_flush(g)
-    // 5. stretch: s2 -> the band of main, no blending
+    // 5. stretch: s2 -> the bands of main, no blending
     want(g, &(*g).main, false, (*g).s2.tex, (*g).s2.w, (*g).s2.h)
-    p = quad(g, K_STRETCH, b[0], b[1], b[2], b[3], b[0], b[1], b[2], b[3])
-    v4(p, 12, b[0], b[1], 0.0, 0.0)
-    v4(p, 16, f as f64, sw as f64, sh as f64, 0.0)
+    k = 0
+    while k < m {
+        let x0: f64 = *((bs as u64 + (k * 32) as u64) as *mut f64)
+        let y0: f64 = *((bs as u64 + (k * 32 + 8) as u64) as *mut f64)
+        let x1: f64 = *((bs as u64 + (k * 32 + 16) as u64) as *mut f64)
+        let y1: f64 = *((bs as u64 + (k * 32 + 24) as u64) as *mut f64)
+        let p: u64 = quad(g, K_STRETCH, x0, y0, x1, y1, x0, y0, x1, y1)
+        v4(p, 12, x0, y0, 0.0, 0.0)
+        v4(p, 16, f as f64, sws[k] as f64, shs[k] as f64, 0.0)
+        v4(p, 20, 0.0, oys[k] as f64, 0.0, 0.0)
+        k = k + 1
+    }
     gpu_flush(g)
     return true
 }
 
-fn pass(g: *mut Gpu, k: f64, from: *mut Target, to: *mut Target, sw: i64,
-    sh: i64, r: i64) {
+// One blur step for all `m` bands: from -> to, each band at its row `oys[k]`.
+fn pass_many(g: *mut Gpu, kd: f64, from: *mut Target, to: *mut Target, sws: *mut i64,
+    shs: *mut i64, oys: *mut i64, m: usize, r: i64) {
     // the box passes clamp at the band's size (sw, sh), which is not the
     // target's: that one goes as u_srcsize (for the rows from the bottom)
     want(g, to, false, (*from).tex, (*from).w, (*from).h)
-    let p: u64 = quad(g, k, 0.0, 0.0, sw as f64, sh as f64, 0.0, 0.0, sw as f64,
-        sh as f64)
-    v4(p, 16, r as f64, sw as f64, sh as f64, 0.0)
+    var k: usize = 0
+    while k < m {
+        let sw: f64 = (*((sws as u64 + (k * 8) as u64) as *mut i64)) as f64
+        let sh: f64 = (*((shs as u64 + (k * 8) as u64) as *mut i64)) as f64
+        let oy: f64 = (*((oys as u64 + (k * 8) as u64) as *mut i64)) as f64
+        let p: u64 = quad(g, kd, 0.0, oy, sw, oy + sh, 0.0, oy, sw, oy + sh)
+        v4(p, 16, r as f64, sw, sh, 0.0)
+        v4(p, 20, 0.0, oy, 0.0, 0.0)
+        k = k + 1
+    }
     gpu_flush(g)
 }
 
