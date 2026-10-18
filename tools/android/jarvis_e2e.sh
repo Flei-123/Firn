@@ -80,7 +80,7 @@ ocr() { tesseract "$OUT/$1.png" stdout 2>/dev/null | tr -s '\n ' ' '; }
 # the centre (pixels) of the n-th word matching a regex in the screenshot $1; empty when there is none
 word_at() { python3 -I "$(dirname "${BASH_SOURCE[0]}")/ocr_words.py" "$OUT/$1.png" "$2" "${3:-1}"; }
 # touch the n-th word matching a regex ($1); fails (returns 1) when the word is not on the screen
-tap_word() { local p; shot _w; p=$(word_at _w "$1" "${2:-1}"); [ -n "$p" ] || { echo "  (no word $1 on the screen)"; return 1; }
+tap_word() { local p; shot _w; p=$(word_at _w "$1" "${2:-1}"); [ -n "$p" ] || { echo "  (no word $1 on the screen; shot nf_${1//[^A-Za-z]/}.png)"; cp "$OUT/_w.png" "$OUT/nf_${1//[^A-Za-z]/}.png"; return 1; }
     $ADB shell input tap $p; sleep "${3:-1.5}"; }
 wait_ocr() { local i; for i in $(seq ${OCR_TRIES:-12}); do shot "$1"; ocr "$1" | grep -q "$2" && break; sleep 1.5; done; ocr "$1" | grep -c "$2"; }
 wait_log() { local i; for i in $(seq ${2:-20}); do grep -q "$1" "$SLOG" && break; sleep 1; done; grep -c "$1" "$SLOG"; }
@@ -148,7 +148,7 @@ check "login screen shows" "$(OCR_TRIES=40 wait_ocr 01_login 'Passwort')" 1
 echo "== 1. login, message, streamed reply"
 type_into "Benutzername" justin; type_into "Passwort" pw
 tap_word "Anmelden" 1 1
-check "the notification notice page shows after the first sign-in" "$(OCR_TRIES=20 wait_ocr 01b_notice 'Weiter')" 1
+check "the notification notice page shows after the first sign-in" "$(OCR_TRIES=20 wait_ocr 01b_notice 'Weiter\|Benachrichtigungen')" 1
 tap_word "Weiter" 1 3
 check "chat screen after login" "$(OCR_TRIES=30 wait_ocr 02_chat 'Chats')" 1
 check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 1
@@ -177,7 +177,8 @@ check "task added over /api/m/tasks" "$(wait_log '"path": "/api/m/tasks".*callmu
 tap_word "Ger.te" 1 3; shot 06b_devices
 tap_px 965 $TAB_Y 3; shot 06c_more # More tab by place: OCR does not find the small word
 [ "${E2E_STOP:-}" = tabs ] && { echo "stopped after the tab pages (E2E_STOP=tabs): $PASS ok, $FAIL failed"; exit 0; }
-tap_word "Chat" 1 2
+# the Chat tab by place (the word is too small for OCR on the More page, and a miss would leave the next taps on that page: Logout!)
+tap_px 106 $TAB_Y 2
 
 # ---- 3. conversation list ----------------------------------------------------------------------------------------------------
 echo "== 3. conversation list"
