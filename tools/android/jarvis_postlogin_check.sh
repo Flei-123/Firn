@@ -93,6 +93,14 @@ type_into() { tap_word "$1" 1 1.5 || return 1; wait_kbd_up || note "keyboard did
 ui() { local i=0; while [ $i -lt 4 ]; do $ADB shell uiautomator dump /sdcard/ui.xml 2>&1 | grep -q dumped && break; sleep 1; i=$((i+1)); done; $ADB shell cat /sdcard/ui.xml | tr '>' '\n'; }
 mid() { echo "$1" | tr '[],' '   ' | awk '{print int(($1+$3)/2), int(($2+$4)/2)}'; }
 tap_ui_id() { local b; b=$(ui | grep -E "resource-id=\"[^\"]*$1\"" | grep -oP 'bounds="\K[^"]+' | head -1); [ -n "$b" ] || return 1; $ADB shell input tap $(mid "$b"); sleep 2; }
+applog() { $ADB shell "cat \$(ls -t \$(find /data/data/$PKG /sdcard/Android/data/$PKG -name 'app.log' 2>/dev/null) 2>/dev/null | head -1) 2>/dev/null" | tr -d '\r'; }
+# WAIT_UPDATE=1 (default): do not touch the screen while the blocking store update check of the first seconds runs (it freezes the
+# program's thread: on a slow/translated phone a tap during it ends in "Input dispatching timed out" BEFORE the sign-in). 0 = like a hasty person.
+wait_update_check() { local i L; [ "${WAIT_UPDATE:-1}" = 1 ] || return 0
+    for i in $(seq 45); do sleep 2; L=$(applog)
+        if echo "$L" | grep -q 'update: checking'; then echo "$L" | grep 'update: ' | grep -vq 'checking' && break
+        elif [ $i -ge 8 ] && echo "$L" | grep -q 'main: start'; then break; fi
+    done; note "update check settled after about $((i*2)) s"; }
 alive() { [ -n "$($ADB shell pidof $PKG | tr -d '\r')" ] && echo yes || echo no; }
 fatal_lines() { { $ADB logcat -b crash -d; $ADB logcat -b main,system -d -s AndroidRuntime:E ActivityManager:I DEBUG:I libc:F 2>/dev/null; } \
     | grep -E "FATAL|Fatal signal|SIGSEGV|SIGABRT|JNI DETECTED|Process $PKG .*has died|ANR in $PKG|crash_dump|am_crash.*$PKG" | head -5; }
@@ -116,6 +124,7 @@ run_variant() { # abi:perm:density:font
     $ADB logcat -c; $ADB logcat -b crash -c
     local n0; n0=$(grep -c '"type": "info_sent"' "$SLOG")
     $ADB shell monkey -p $PKG -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+    wait_update_check
     check "$tag: sign-in page" "$(OCR_TRIES=30 wait_ocr ${tag}_01 'Sign in')" 1
     type_into "Username" justin; type_into "Password" pw; tap_word "Sign" 1 1
     check "$tag: notice page or main view after the sign-in" "$(OCR_TRIES=20 wait_ocr ${tag}_02 'Continue|Chats')" 1
@@ -147,7 +156,7 @@ run_variant() { # abi:perm:density:font
     echo "  stage file: $(stage_file)"
     # evidence: the app's own log, the logcat of the run, ANR traces
     $ADB logcat -d -v threadtime 2>/dev/null | grep -E "$PKG|firn|ANR|FATAL|DEBUG" | tail -400 >"$OUT/${tag}.logcat.txt"
-    $ADB shell "cat \$(ls -t \$(find /data/data/$PKG /sdcard/Android/data/$PKG -name 'app.log' 2>/dev/null) 2>/dev/null | head -1) 2>/dev/null" | tail -150 >"$OUT/${tag}.app.log" 2>/dev/null
+    applog >"$OUT/${tag}.app.log" 2>/dev/null
     $ADB shell "ls /data/anr 2>/dev/null | head -3; for f in /data/anr/*; do [ -f \"\$f\" ] && head -60 \"\$f\" | grep -E 'pid|sysTid|prio|Cmd line|\\\"main\\\"|at ' | head -40; done" 2>/dev/null >"$OUT/${tag}.anr.txt"
     # the crash page: a run that was stopped in the foreground after the sign-in (args.txt line 2 `crashpage` arms it) must show the page at the next start
     $ADB shell am force-stop $PKG; sleep 1
