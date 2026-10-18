@@ -244,6 +244,14 @@ pub const PASSES: &[PassInfo] = &[
         debug_preserving: true,
         what: "#[inline]: only the explicitly requested inlinings (round EINBETTEN)",
     },
+    // r591: tiny leaves that cannot trap -- never on a call stack, so the
+    // debug picture (values, panic positions, backtraces) stays as it was.
+    PassInfo {
+        name: "inline-leaf",
+        scope: Scope::Module,
+        debug_preserving: true,
+        what: "tiny call-free, loop-free, trap-free leaf functions are embedded (r591, dev-fast)",
+    },
 ];
 
 /// What shall be executed during a run.
@@ -408,6 +416,33 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         }
         for f in m.funcs.iter_mut() {
             optimize_func(f, &mut st, cfg, &mut clk);
+        }
+    }
+    // r591 -- the leaf inliner of the debug-preserving levels. Two rounds: a
+    // thin wrapper (`fn chars(self, i) { return chars(self, i) }`) is a leaf
+    // only after the first one.
+    if cfg.runs("inline-leaf") && !cfg.runs("inline") && std::env::var_os("FIRN_NO_INLINE_LEAF").is_none() {
+        let rounds: usize = std::env::var("FIRN_LEAF_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        for _ in 0..rounds {
+            let t = std::time::Instant::now();
+            let (k, changed) = crate::inline::inline_module_dev_leaves(m);
+            st.inlined += k;
+            clk.add("inline-leaf", t);
+            // The clean-up of an embedded body (the result travelling through
+            // a slot, the parameter spills) needs the cheap passes only.
+            let mut cheap = cfg.clone();
+            if std::env::var_os("FIRN_LEAF_FULL").is_none() {
+                for n in ["cse", "licm", "bce", "unroll"] {
+                    cheap.disabled.push(n.to_string());
+                }
+            }
+            for &ci in &changed {
+                phi_check(&m.funcs[ci], "inline-leaf");
+                optimize_func(&mut m.funcs[ci], &mut st, &cheap, &mut clk);
+            }
+            if k == 0 {
+                break;
+            }
         }
     }
     if cfg.runs("inline") {

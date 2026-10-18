@@ -1,0 +1,218 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/android/hostinfo.fi -- r382: WHAT ONLY JAVA KNOWS ABOUT THE HOST, READ OVER JNI.
+//
+// NativeActivity's C side (AConfiguration) has density and light/dark but NOT the user's font size and NOT the window insets. Both
+// live in Java:
+//
+//     activity.getResources().getConfiguration().fontScale                        float, 1.0 = default
+//     activity.getWindow().getDecorView().getRootWindowInsets()                   WindowInsets, null while not attached
+//         API 30+  .getInsets(statusBars | navigationBars | captionBar | ime | displayCutout)   -> Insets {left, top, right, bottom}
+//         API 23-29 .getSystemWindowInsetLeft / Top / Right / Bottom()                         (bars + keyboard)
+//
+// The calls are made on the APP thread (attached to the VM on first use, `jnicall.j_env`), on the activity object NativeActivity
+// keeps in `ANativeActivity.clazz` (a global reference for the life of the activity). Every local reference made on the way is
+// deleted again: a thread that is never detached would collect them. Any failed step answers "not known" (false / 0.0) and clears
+// the Java exception -- never a guess.
+//
+// WHEN: lib/window/android.fi asks on the commands that can change the answer (window, configuration, content rectangle, focus,
+// resume). A real `onApplyWindowInsets` listener would need a class of our own (lib/android/dex.fi) and a call on the UI thread;
+// the content-rectangle command fires whenever bars or keyboard move, so asking then comes to the same without a class.
+//
+// The conversions that need no phone (limits, the part the window already left out, per mille) are pure functions in
+// lib/window/hostmetrics.fi (tools/fui/hostmetrics_main.fi).
+import std.rt
+import android.ndk
+import android.activity
+import android.jnicall
+import window.hostmetrics
+
+export {
+    hostinfo_font_scale, hostinfo_insets, hostinfo_sdk,
+}
+
+// android.app.Activity / ContextWrapper
+const S_GET_RES: str = "getResources\0"
+const S_GET_RES_SIG: str = "()Landroid/content/res/Resources;\0"
+const S_GET_CFG: str = "getConfiguration\0"
+const S_GET_CFG_SIG: str = "()Landroid/content/res/Configuration;\0"
+const S_FONT_SCALE: str = "fontScale\0"
+const S_FLOAT: str = "F\0"
+const S_GET_WINDOW: str = "getWindow\0"
+const S_GET_WINDOW_SIG: str = "()Landroid/view/Window;\0"
+const S_GET_DECOR: str = "getDecorView\0"
+const S_GET_DECOR_SIG: str = "()Landroid/view/View;\0"
+const S_GET_ROOT: str = "getRootWindowInsets\0"
+const S_GET_ROOT_SIG: str = "()Landroid/view/WindowInsets;\0"
+const S_GET_INSETS: str = "getInsets\0"
+const S_GET_INSETS_SIG: str = "(I)Landroid/graphics/Insets;\0"
+const S_LEFT: str = "left\0"
+const S_TOP: str = "top\0"
+const S_RIGHT: str = "right\0"
+const S_BOTTOM: str = "bottom\0"
+const S_INT: str = "I\0"
+const S_SYS_L: str = "getSystemWindowInsetLeft\0"
+const S_SYS_T: str = "getSystemWindowInsetTop\0"
+const S_SYS_R: str = "getSystemWindowInsetRight\0"
+const S_SYS_B: str = "getSystemWindowInsetBottom\0"
+const S_INT_SIG: str = "()I\0"
+
+const SDK_INSETS_TYPES: i32 = 30 // WindowInsets.getInsets(int) exists
+const SDK_ROOT_INSETS: i32 = 23 // View.getRootWindowInsets() exists
+
+// The JNIEnv of this thread and the activity object; false = not possible (no activity, no VM).
+#[no_gc]
+fn session(env: *mut u64, obj: *mut u64) -> bool {
+    let act: u64 = activity.activity_pointer()
+    if act == 0 {
+        return false
+    }
+    let vm: u64 = ndk.peek64(act + 8)
+    let clazz: u64 = ndk.peek64(act + 24)
+    if vm == 0 || clazz == 0 {
+        return false
+    }
+    let e: u64 = jnicall.j_env(vm)
+    if e == 0 {
+        return false
+    }
+    *env = e
+    *obj = clazz
+    return true
+}
+
+// The Android API level of the running system (ANativeActivity.sdkVersion); 0 = no activity.
+#[no_gc]
+fn hostinfo_sdk() -> i32 {
+    let act: u64 = activity.activity_pointer()
+    if act == 0 {
+        return 0
+    }
+    return ndk.peek32(act + ndk.ACT_SDK_VERSION)
+}
+
+// One object-returning call on `o` (looked up on its own class, so inherited methods are found). The class reference is deleted.
+// The result is a new local reference (the caller deletes it); 0 = the step failed.
+#[no_gc]
+fn call_obj(env: u64, o: u64, name: str, sig: str, args: u64) -> u64 {
+    if o == 0 {
+        return 0
+    }
+    let k: u64 = jnicall.j_obj_class(env, o)
+    if k == 0 {
+        return 0
+    }
+    let m: u64 = jnicall.j_method(env, k, name.p as u64, sig.p as u64)
+    jnicall.j_del(env, k)
+    if m == 0 {
+        return 0
+    }
+    return jnicall.j_obj(env, o, m, args)
+}
+
+// A no-argument int method of `o` (WindowInsets.getSystemWindowInsetLeft..); -1 = failed.
+#[no_gc]
+fn call_int(env: u64, o: u64, name: str) -> i32 {
+    let k: u64 = jnicall.j_obj_class(env, o)
+    if k == 0 {
+        return -1
+    }
+    let m: u64 = jnicall.j_method(env, k, name.p as u64, S_INT_SIG.p as u64)
+    jnicall.j_del(env, k)
+    if m == 0 {
+        return -1
+    }
+    return jnicall.j_int(env, o, m, 0)
+}
+
+// One int field of `o` (Insets.left); -1 = failed.
+#[no_gc]
+fn field_int(env: u64, o: u64, name: str) -> i32 {
+    let k: u64 = jnicall.j_obj_class(env, o)
+    if k == 0 {
+        return -1
+    }
+    let f: u64 = jnicall.j_field(env, k, name.p as u64, S_INT.p as u64)
+    jnicall.j_del(env, k)
+    if f == 0 {
+        return -1
+    }
+    return jnicall.j_get_int_field(env, o, f)
+}
+
+// Configuration.fontScale as a factor (1.0 = default); 0.0 = not known.
+#[no_gc]
+fn hostinfo_font_scale() -> f64 {
+    var env: u64 = 0
+    var act: u64 = 0
+    if !session(&env, &act) {
+        return 0.0
+    }
+    let res: u64 = call_obj(env, act, S_GET_RES, S_GET_RES_SIG, 0)
+    let cfg: u64 = call_obj(env, res, S_GET_CFG, S_GET_CFG_SIG, 0)
+    var scale: f64 = 0.0
+    if cfg != 0 {
+        let k: u64 = jnicall.j_obj_class(env, cfg)
+        let f: u64 = jnicall.j_field(env, k, S_FONT_SCALE.p as u64, S_FLOAT.p as u64)
+        if f != 0 {
+            let v: f32 = jnicall.j_get_float_field(env, cfg, f)
+            if jnicall.j_ok(env) {
+                scale = v as f64
+            }
+        }
+        jnicall.j_del(env, k)
+    }
+    jnicall.j_del(env, cfg)
+    jnicall.j_del(env, res)
+    return scale
+}
+
+// The window insets in device pixels: left, top, right, bottom, limited to half of the w x h window (hostmetrics.insets_from_ints).
+// false = not known (no activity, no decor view yet, API below 23, a failed call): `out` is left alone.
+fn hostinfo_insets(w: usize, h: usize, out: *mut [f64; 4]) -> bool {
+    var env: u64 = 0
+    var act: u64 = 0
+    if !session(&env, &act) {
+        return false
+    }
+    let sdk: i32 = hostinfo_sdk()
+    if sdk < SDK_ROOT_INSETS {
+        return false
+    }
+    let win: u64 = call_obj(env, act, S_GET_WINDOW, S_GET_WINDOW_SIG, 0)
+    let decor: u64 = call_obj(env, win, S_GET_DECOR, S_GET_DECOR_SIG, 0)
+    let wi: u64 = call_obj(env, decor, S_GET_ROOT, S_GET_ROOT_SIG, 0)
+    var l: i32 = -1
+    var t: i32 = -1
+    var r: i32 = -1
+    var b: i32 = -1
+    var known: bool = false
+    if wi != 0 {
+        if sdk >= SDK_INSETS_TYPES {
+            var arg: [u64; 1] = [0; 1]
+            arg[0] = hostmetrics.INSET_TYPES_ALL as u64
+            let ins: u64 = call_obj(env, wi, S_GET_INSETS, S_GET_INSETS_SIG, (&arg[0]) as u64)
+            if ins != 0 {
+                l = field_int(env, ins, S_LEFT)
+                t = field_int(env, ins, S_TOP)
+                r = field_int(env, ins, S_RIGHT)
+                b = field_int(env, ins, S_BOTTOM)
+                jnicall.j_del(env, ins)
+            }
+        } else {
+            l = call_int(env, wi, S_SYS_L)
+            t = call_int(env, wi, S_SYS_T)
+            r = call_int(env, wi, S_SYS_R)
+            b = call_int(env, wi, S_SYS_B)
+        }
+        // -1 from any step = that call failed: the whole answer is not trusted
+        known = l >= 0 && t >= 0 && r >= 0 && b >= 0
+    }
+    jnicall.j_del(env, wi)
+    jnicall.j_del(env, decor)
+    jnicall.j_del(env, win)
+    if !known {
+        return false
+    }
+    hostmetrics.insets_from_ints(l, t, r, b, w, h, out)
+    return true
+}
