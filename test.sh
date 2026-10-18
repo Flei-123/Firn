@@ -276,7 +276,7 @@ run_case() {          # $1 = file, $2 = "opt" | "noopt" | "devfast" | "safe"
     # r736: a file with `#[test]` functions and NO `fn main` is a testkit file for
     # `firnc --test` (it must not declare main): run it once (dev-fast) as such.
     if grep -q '^#\[test\]' "$file" && ! grep -q '^fn main' "$file"; then
-        [ "$mode" = "devfast" ] || return
+        [ "$mode" = "devfast" ] || return 0   # (a bare `|| return` returns 1 and set -e killed the whole suite here)
         if "$FIRNC" --test --opt-level=dev-fast -o "$WORK/${base}.tr" "$file" >"$WORK/$base.tr.out" 2>&1; then
             ok
         else
