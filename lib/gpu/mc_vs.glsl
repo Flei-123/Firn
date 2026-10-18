@@ -12,6 +12,7 @@
 layout(location = 0) in uvec2 a_w;
 uniform mat4 u_rv;
 uniform vec3 u_origin;
+uniform vec4 u_fade;     // x = fade a, y = inverted, z = frame height, w = frame width (vertex snap, r261)
 uniform int u_pool;
 uniform usamplerBuffer u_gran;
 uniform samplerBuffer u_org;
@@ -32,6 +33,14 @@ void main() {
     vec3 p = vec3(float(w0 & 255u), float((w0 >> 8) & 255u), float((w0 >> 16) & 255u)) + org;
     gl_Position = u_rv * vec4(p, 1.0);
     v_depth = gl_Position.w;
+    // r261: snap the vertex to the 1/16 pixel grid of lib/mc/mc_raster.fi (snap()), so llvmpipe / lavapipe / a GPU (1/256 or 1/4096 px) see the
+    // same triangle corners as the CPU rasterizer. u_fade.w = frame width in pixels (0 = off); u_fade.z = frame height.
+    if (u_fade.w > 0.5 && gl_Position.w > 0.0001) {
+        vec2 hs = vec2(u_fade.w, u_fade.z) * 0.5;
+        vec2 ndc = gl_Position.xy / gl_Position.w;
+        vec2 sc = floor(vec2(hs.x + ndc.x * hs.x, hs.y - ndc.y * hs.y) * 16.0 + 0.5) * 0.0625;
+        gl_Position.xy = vec2((sc.x - hs.x) / hs.x, (hs.y - sc.y) / hs.y) * gl_Position.w;
+    }
     v_uvao = vec3(float((w1 >> 14) & 31u), float((w1 >> 19) & 31u), float((w0 >> 27) & 3u));
     v_tile = int(w1 & 16383u);
     v_light = vec2(float((w1 >> 24) & 15u), float(w1 >> 28));

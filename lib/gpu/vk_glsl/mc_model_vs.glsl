@@ -22,6 +22,14 @@ layout(location = 5) flat out int v_tint;
 void main() {
     gl_Position = u_rv * vec4(a_pos + u_origin, 1.0);
     v_depth = gl_Position.w;
+    // r261: snap the vertex to the 1/16 pixel grid of lib/mc/mc_raster.fi (snap()), so llvmpipe / lavapipe / a GPU (1/256 or 1/4096 px) see the
+    // same triangle corners as the CPU rasterizer. u_fade.w = frame width in pixels (0 = off); u_fade.z = frame height.
+    if (u_fade.w > 0.5 && gl_Position.w > 0.0001) {
+        vec2 hs = vec2(u_fade.w, u_fade.z) * 0.5;
+        vec2 ndc = gl_Position.xy / gl_Position.w;
+        vec2 sc = floor(vec2(hs.x + ndc.x * hs.x, hs.y - ndc.y * hs.y) * 16.0 + 0.5) * 0.0625;
+        gl_Position.xy = vec2((sc.x - hs.x) / hs.x, (hs.y - sc.y) / hs.y) * gl_Position.w;
+    }
     gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;
     v_uvao = vec3(a_uvt.xy, a_lt.w);
     v_tile = int(a_uvt.z + 0.5);

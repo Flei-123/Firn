@@ -21,7 +21,7 @@ layout(set = 0, binding = 0, std140) uniform Frame {
     mat4 u_rv;          // projection * view rotation (no translation), column-major, OpenGL clip space (z in -w..w); the
                         // vertex shaders remap z to Vulkan's 0..w, so the CPU keeps ONE matrix for GL and Vulkan
     vec4 u_fog;         // x = 1 fog on, y = start, z = end
-    vec4 u_fade;        // x = fade a (>= 64 off), y = 1 inverted, z = frame height (LOD cross-fade, screen door)
+    vec4 u_fade;        // x = fade a (>= 64 off), y = 1 inverted, z = frame height (LOD cross-fade, screen door), w = frame width (vertex snap r261)
     vec4 u_light;       // x = day (sky light multiplier 0..256), yzw = block light tint per channel 0..256
     vec4 u_cam;         // sky: half width, half height, focal length x, focal length y (pixels)
     vec4 u_sun;         // sky: xyz = unit direction to the sun, w = glow strength 0..256
