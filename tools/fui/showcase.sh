@@ -103,6 +103,10 @@ done
 "$FIRNC" --opt-level=dev -o "$T/webtheme" tools/fui/webtheme_main.fi
 "$T/webtheme" "$T/img" > /dev/null
 
+# MOBILE COMPONENTS (lib/fui/mobile.fi): every component once on a 360x1200 page, dark + light
+"$FIRNC" --opt-level=dev -o "$T/mobile" tools/fui/mobile_main.fi
+"$T/mobile" "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/

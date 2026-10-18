@@ -899,6 +899,9 @@ build wave13
 python3 -I tools/fui/gen_webtheme.py --check
 build webtheme
 "$W/webtheme" | tail -n 3 | grep -q "WEBTHEME PASSED"
+# M1-b: mobile components (app bar, tiles, chips, segmented, fields, bubbles, nav): sizes, taps, safe area, rule budget, a11y audit
+build mobile
+"$W/mobile" | tail -n 3 | grep -q "MOBILE PASSED"
 python3 tools/fui/uistr_audit.py
 build touch
 "$W/touch" | tail -n 3
