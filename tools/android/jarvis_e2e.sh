@@ -287,14 +287,14 @@ echo "  tap the notification of c1"
 tap_note "Second"
 check "tap: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
 shot 09_after_tap
-check "tap: the chat of the event is on screen (its history 'hi / hello')" "$(OCR_TRIES=10 wait_ocr 09_after_tap 'You: hi\|JARVIS: hello')" 1
+check "tap: the chat of the event is on screen (its history 'hi / hello')" "$(OCR_TRIES=10 wait_ocr 09_after_tap 'hello')" 1
 echo "  tap the notification of c2"
 $ADB shell input keyevent KEYCODE_HOME; sleep 3
 tap_note "Chat two again"
 check "tap c2: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
 shot 09b_after_tap_c2
 check "tap c2: the second chat is on screen (its history 'second question / second answer')" "$(OCR_TRIES=10 wait_ocr 09b_after_tap_c2 'second question\|second answer')" 1
-check "tap c2: the chat of c1 is not on screen (its history 'JARVIS: hello' is gone)" "$(ocr 09b_after_tap_c2 | grep -c 'JARVIS: hello')" 0
+check "tap c2: the chat of c1 is not on screen (its history 'hello' is gone)" "$(ocr 09b_after_tap_c2 | grep -c 'hello')" 0
 
 # ---- 6b. push while the app is IN FRONT --------------------------------------------------------------------------------------
 echo "== 6b. push while the app is in front (chat c2 on screen)"
@@ -312,12 +312,12 @@ check "front tap: the app is in front" "$($ADB shell dumpsys activity activities
 shot 12b_front_after_tap
 # A tap on a notification while the window is already in front: org.firn.FirnMain (launchMode singleTop) gets onNewIntent, keeps the
 # intent (setIntent), the app reads the chat id from it within a second. STRICT_FRONT=0 turns a failure into a note.
-FRONT_C1=$(OCR_TRIES=10 wait_ocr 12b_front_after_tap 'You: hi\|JARVIS: hello')
+FRONT_C1=$(OCR_TRIES=10 wait_ocr 12b_front_after_tap 'hello')
 if [ "${STRICT_FRONT:-1}" = 1 ]; then check "front tap: the chat of the notification is on screen (c1: 'hi / hello')" "$FRONT_C1" 1
 elif [ "$FRONT_C1" = 1 ]; then echo "  OK    front tap: the chat of the notification is on screen (c1: 'hi / hello')"; PASS=$((PASS+1))
 else note "a tap while the app is open does not switch to the chat of the notification (c2 stays on screen)"; fi
 check "front tap: the app log says the chat came from the intent" "$(app_log | grep 'tap opens chat c1 (intent)' | tail -1 | wc -l)" 1
-CHAT_BEFORE="$(ocr 12b_front_after_tap | grep -c 'second question\|second answer')$(ocr 12b_front_after_tap | grep -c 'JARVIS: hello')" # c2 / c1 history on screen
+CHAT_BEFORE="$(ocr 12b_front_after_tap | grep -c 'second question\|second answer')$(ocr 12b_front_after_tap | grep -c 'hello')" # c2 / c1 history on screen
 check "front tap: the notification is gone (auto-cancel)" "$(note_lines | grep -c 'Front c1')" 0
 
 # ---- 6c. push WITHOUT a chat id ------------------------------------------------------------------------------------------------
@@ -338,7 +338,7 @@ echo "  tap the notification without a chat id"
 tap_note "No chat two"
 check "no cid tap: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
 sleep 5; shot 13_nocid_after_tap
-check "no cid tap: no chat was forced (the history on screen is the same as before the tap)" "$(ocr 13_nocid_after_tap | grep -c 'second question\|second answer')$(ocr 13_nocid_after_tap | grep -c 'JARVIS: hello')" "$CHAT_BEFORE"
+check "no cid tap: no chat was forced (the history on screen is the same as before the tap)" "$(ocr 13_nocid_after_tap | grep -c 'second question\|second answer')$(ocr 13_nocid_after_tap | grep -c 'hello')" "$CHAT_BEFORE"
 check "no cid tap: the notification is gone" "$(note_lines | grep -c 'No chat two')" 0
 check "no cid tap: no crash so far" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
 
