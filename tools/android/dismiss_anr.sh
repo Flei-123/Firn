@@ -9,7 +9,7 @@ dismiss_anr() {
         i=$((i+1))
         timeout 20 $ADB shell uiautomator dump /sdcard/anr_ui.xml >/dev/null 2>&1 || { sleep 1; continue; }
         xml=$(timeout 10 $ADB shell cat /sdcard/anr_ui.xml 2>/dev/null | tr '>' '\n')
-        echo "$xml" | grep -q -E "text=\"[^\"]*(isn't responding|nicht reagiert|keeps stopping)" || break
+        echo "$xml" | grep -q -E "text=\"[^\"]*(isn't responding|nicht reagiert|keeps stopping)" || break  # english: ok (German system dialog text)
         # prefer "Wait" (keeps the process), else "Close app"; German UI: "Warten"
         b=$(echo "$xml" | grep -E 'text="(Wait|Warten)"' | grep -oP 'bounds="\K[^"]+' | head -1)
         [ -n "$b" ] || b=$(echo "$xml" | grep -E 'text="(Close app|App schließen|OK)"' | grep -oP 'bounds="\K[^"]+' | head -1)
