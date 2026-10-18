@@ -215,6 +215,7 @@ struct Parser {
     // ROUND REF4: a statement the NEXT `block` puts in front of its own (the
     // `let x = a[i]` of `for x in array`). `ast.NOTHING` = none.
     pre_stmt: u32,
+    pre_stmt2: u32,
     // GENERIC TEMPLATES. The store sits OUTSIDE the parser because it has to be
     // shared by all files of a translation: the root file may use `Vec[i32]`
     // while `Vec[T]` is declared in some module.
@@ -352,6 +353,7 @@ fn par_new(lx: u64) -> Parser {
         parens: 0, no_slit: 0, err: 0, not_core: false,
         rp_name: vec_new[u32](), rp_flag: vec_new[u32](), rp_mark: vec_new[u32](),
         pre_stmt: ast.NOTHING,
+        pre_stmt2: ast.NOTHING,
         gen: 0, mu: 0, feh: 0, time: false, gcr: 0, ifr: 0, nogc_pending: 0, int_pending: 0, ph_pending: 0, mc_pending: 0,
         link_pending: 0, link_pending_set: false, export_pending: 0, tpoff: 0, sonr: -1, hgnr: -1, gtnr: -1, gunr: -1,
         local: vec_new[u32](), llimit: vec_new[u32](),
@@ -2749,11 +2751,170 @@ fn interp_text(p: *mut Parser, chain: u32, io_nr: u32, k: usize, of: usize, to: 
     return ast.expr_new(par_tree(p), ast.E_CALL, text_nr, aoff, 3, 0)
 }
 
+// r665 -- index of the spec colon in lit bytes [from, to): the first `:`
+// outside brackets, quotes and `::`; `to` when there is none.
+fn fspec_split(p: *mut Parser, k: usize, from: usize, to: usize) -> usize {
+    var depth: i32 = 0
+    var i: usize = from
+    while i < to {
+        let c: u32 = lexer.lex_lit_byte(lx(p), k, i) as u32
+        if c == 34 {
+            i = i + 1
+            while i < to && (lexer.lex_lit_byte(lx(p), k, i) as u32) != 34 {
+                if (lexer.lex_lit_byte(lx(p), k, i) as u32) == 92 {
+                    i = i + 1
+                }
+                i = i + 1
+            }
+            i = i + 1
+            continue
+        }
+        if c == 40 || c == 91 {
+            depth = depth + 1
+        } else if c == 41 || c == 93 {
+            depth = depth - 1
+        } else if c == 58 && depth == 0 {
+            if i + 1 < to && (lexer.lex_lit_byte(lx(p), k, i + 1) as u32) == 58 {
+                i = i + 2
+                continue
+            }
+            return i
+        }
+        i = i + 1
+    }
+    return to
+}
+
+fn fspec_is_align(c: u32) -> bool {
+    return c == 60 || c == 62 || c == 94 || c == 61
+}
+
+fn fspec_align_code(c: u32) -> u64 {
+    if c == 60 {
+        return 1
+    }
+    if c == 62 {
+        return 2
+    }
+    if c == 94 {
+        return 3
+    }
+    return 4
+}
+
+// The same grammar and packing as compiler/src/fmtspec.rs::parse_spec.
+fn fspec_parse(p: *mut Parser, k: usize, from: usize, to: usize, out: *mut u64) -> bool {
+    var i: usize = from
+    var fill: u64 = 32
+    var fill_set: bool = false
+    var align: u64 = 0
+    if to - from >= 2 && fspec_is_align(lexer.lex_lit_byte(lx(p), k, from + 1) as u32) {
+        let f0: u32 = lexer.lex_lit_byte(lx(p), k, from) as u32
+        if f0 >= 128 {
+            return false
+        }
+        fill = f0 as u64
+        fill_set = true
+        align = fspec_align_code(lexer.lex_lit_byte(lx(p), k, from + 1) as u32)
+        i = from + 2
+    } else if to > from && fspec_is_align(lexer.lex_lit_byte(lx(p), k, from) as u32) {
+        align = fspec_align_code(lexer.lex_lit_byte(lx(p), k, from) as u32)
+        i = from + 1
+    }
+    var flags: u64 = 0
+    if i < to {
+        let c: u32 = lexer.lex_lit_byte(lx(p), k, i) as u32
+        if c == 43 {
+            flags = flags | 2048
+            i = i + 1
+        } else if c == 32 {
+            flags = flags | 4096
+            i = i + 1
+        } else if c == 45 {
+            i = i + 1
+        }
+    }
+    if i < to && (lexer.lex_lit_byte(lx(p), k, i) as u32) == 35 {
+        flags = flags | 8192
+        i = i + 1
+    }
+    if i < to && (lexer.lex_lit_byte(lx(p), k, i) as u32) == 48 {
+        if !fill_set {
+            fill = 48
+        }
+        if align == 0 {
+            align = 4
+        }
+        i = i + 1
+    }
+    var width: u64 = 0
+    while i < to {
+        let d: u32 = lexer.lex_lit_byte(lx(p), k, i) as u32
+        if d < 48 || d > 57 {
+            break
+        }
+        width = width * 10 + (d - 48) as u64
+        if width > 65535 {
+            return false
+        }
+        i = i + 1
+    }
+    var prec1: u64 = 0
+    if i < to && (lexer.lex_lit_byte(lx(p), k, i) as u32) == 46 {
+        i = i + 1
+        let start: usize = i
+        var pr: u64 = 0
+        while i < to {
+            let d: u32 = lexer.lex_lit_byte(lx(p), k, i) as u32
+            if d < 48 || d > 57 {
+                break
+            }
+            pr = pr * 10 + (d - 48) as u64
+            if pr > 65534 {
+                return false
+            }
+            i = i + 1
+        }
+        if i == start {
+            return false
+        }
+        prec1 = pr + 1
+    }
+    var ty: u64 = 0
+    if i < to {
+        let c: u32 = lexer.lex_lit_byte(lx(p), k, i) as u32
+        // d x X o b f F s %
+        if c != 100 && c != 120 && c != 88 && c != 111 && c != 98 && c != 102 && c != 70 && c != 115 && c != 37 {
+            return false
+        }
+        ty = c as u64
+        i = i + 1
+    }
+    if i < to {
+        return false
+    }
+    *out = fill | (align << 8) | flags | (width << 16) | (prec1 << 32) | (ty << 48)
+    return true
+}
+
 // An expression segment: lex the fragment again, parse ONE expression from
 // it with a copy of the parser (same tree, same registries, same intern
 // table, same local names) and append it to the chain as
 // `io.fmt_number(chain, (expr) as i64)`.
-fn interp_expr(p: *mut Parser, chain: u32, io_nr: u32, k: usize, of: usize, to: usize) -> u32 {
+fn interp_expr(p: *mut Parser, chain: u32, io_nr: u32, k: usize, of: usize, to_all: usize) -> u32 {
+    // r665: `{expr:spec}` -- split at the first `:` outside brackets, quotes and `::`
+    var to: usize = to_all
+    var has_spec: bool = false
+    var spec: u64 = 0
+    let colon: usize = fspec_split(p, k, of, to_all)
+    if colon < to_all {
+        to = colon
+        has_spec = true
+        if !fspec_parse(p, k, colon + 1, to_all, &spec) {
+            complain(p)
+            return chain
+        }
+    }
     var source: rt.Buf = rt.buf_new()
     defer rt.buf_free(&source)
     var i: usize = of
@@ -2801,6 +2962,16 @@ fn interp_expr(p: *mut Parser, chain: u32, io_nr: u32, k: usize, of: usize, to: 
     // on the TYPE of the expression, and only the type check knows that.
     // `io.fmt_value` is the placeholder that the type check and the lowering
     // both resolve, out of the same material (sema::fmt_target).
+    if has_spec {
+        var sz: [u8; 8] = "fmt_spec"
+        let spec_nr: u32 = qualify(p, io_nr, intern.intern_number(it, (&sz[0]) as u64, 8) as u32)
+        let slit: u32 = ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, spec)
+        let soff: u32 = ast.child_start(par_tree(p))
+        ast.child_add(par_tree(p), chain)
+        ast.child_add(par_tree(p), e)
+        ast.child_add(par_tree(p), slit)
+        return ast.expr_new(par_tree(p), ast.E_CALL, spec_nr, soff, 3, 0)
+    }
     var fz: [u8; 9] = "fmt_value"
     let number_nr: u32 = qualify(p, io_nr, intern.intern_number(it, (&fz[0]) as u64, 9) as u32)
     let aoff: u32 = ast.child_start(par_tree(p))
@@ -3295,6 +3466,10 @@ fn block(p: *mut Parser) -> u32 {
         vec_push[u32](&own, (*p).pre_stmt)
         (*p).pre_stmt = ast.NOTHING
     }
+    if (*p).pre_stmt2 != ast.NOTHING {
+        vec_push[u32](&own, (*p).pre_stmt2)
+        (*p).pre_stmt2 = ast.NOTHING
+    }
     while true {
         if actual(p, A_RBRACE) {
             break
@@ -3748,9 +3923,165 @@ fn for_each(p: *mut Parser, name: u32, arr: u32, fpos: u64, npos: u64) -> u32 {
     return ast.stmt_new(b, ast.S_FOR, idx_nr, zero, len_call, body)
 }
 
+// r666 (foreach.rs::build_pair) -- `for (a, b) in enumerate(v) { body }` and
+// `for (a, b) in zip(x, y) { body }`:
+//     for __each#L_C in 0 as usize..__each_len(v) { let a = __each#L_C; let b = v[__each#L_C]; body }
+// zip walks to the shorter length: `if la < lb { la } else { lb }`.
+fn for_pair(p: *mut Parser, fpos: u64) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
+    next_bump(p)
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let n1: u32 = tok_nr(p, 0)
+    let n1pos: u64 = at_pos(p, 0)
+    next_bump(p)
+    if !expect(p, A_COMMA) {
+        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+    }
+    if !actual(p, A_IDENT) {
+        complain(p)
+        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let n2: u32 = tok_nr(p, 0)
+    let n2pos: u64 = at_pos(p, 0)
+    next_bump(p)
+    if !expect(p, A_RPAREN) {
+        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+    }
+    if !expect(p, A_KWIN) {
+        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+    }
+    rp_shadow(p, n1)
+    rp_shadow(p, n2)
+    let src: u32 = cond_expr(p)
+    if !actual(p, A_LBRACE) {
+        complain(p)
+        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    var ew: [u8; 9] = "enumerate"
+    var zw: [u8; 3] = "zip"
+    let enum_nr: u32 = intern.intern_number(it, (&ew[0]) as u64, 9) as u32
+    let zip_nr: u32 = intern.intern_number(it, (&zw[0]) as u64, 3) as u32
+    var is_enum: bool = false
+    var is_zip: bool = false
+    var arg0: u32 = 0
+    var arg1: u32 = 0
+    if ast.e_kind(b, src) == ast.E_CALL {
+        let cnr: u32 = ast.e_a(b, src)
+        let coff: u32 = ast.e_b(b, src)
+        let ccount: u32 = ast.e_c(b, src)
+        if cnr == enum_nr && ccount == 1 {
+            is_enum = true
+            arg0 = ast.child_at(b, coff)
+        }
+        if cnr == zip_nr && ccount == 2 {
+            is_zip = true
+            arg0 = ast.child_at(b, coff)
+            arg1 = ast.child_at(b, coff + 1)
+        }
+    }
+    if !is_enum && !is_zip {
+        complain(p)
+        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+    }
+    if !fe_place_ok(p, arg0) || (is_zip && !fe_place_ok(p, arg1)) {
+        complain(p)
+        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+    }
+    rt.buf_clear(&(*p).scratch)
+    var hw: [u8; 7] = "__each#"
+    rt.buf_push_bytes(&(*p).scratch, (&hw[0]) as u64, 7)
+    rt.buf_push_dec_u64(&(*p).scratch, ast.pos_line(fpos) as u64)
+    rt.buf_push(&(*p).scratch, 95 as u8)
+    rt.buf_push_dec_u64(&(*p).scratch, ast.pos_col(fpos) as u64)
+    let idx_nr: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+    var lw: [u8; 10] = "__each_len"
+    let len_nr: u32 = intern.intern_number(it, (&lw[0]) as u64, 10) as u32
+    let apos: u64 = ast.expr_pos(b, src)
+    var len_e: u32 = fe_len_call(p, len_nr, arg0, apos)
+    if is_zip {
+        let la: u32 = len_e
+        let lb: u32 = fe_len_call(p, len_nr, arg1, apos)
+        let la2: u32 = fe_len_call(p, len_nr, arg0, apos)
+        let lb2: u32 = fe_len_call(p, len_nr, arg1, apos)
+        let cond: u32 = ast.expr_new(b, ast.E_BIN, B_LT, la, lb, 0)
+        pos_default(p, cond, apos)
+        len_e = ast.expr_new(b, ast.E_IFEX, cond, la2, lb2, 0)
+        pos_default(p, len_e, apos)
+    }
+    let lit: u32 = ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+    var uw: [u8; 5] = "usize"
+    let un: u32 = intern.intern_number(it, (&uw[0]) as u64, 5) as u32
+    let uty: u32 = ast.ty_new(b, ast.T_NAME, un, 0)
+    let zero: u32 = ast.expr_new(b, ast.E_AS, lit, uty, 0, 0)
+    pos_default(p, lit, apos)
+    pos_default(p, zero, apos)
+    var bind1: u32 = 0
+    var bind2: u32 = 0
+    if is_enum {
+        let at: u32 = ast.expr_new(b, ast.E_ID, idx_nr, 0, 0, 0)
+        pos_default(p, at, n1pos)
+        bind1 = ast.stmt_new(b, ast.S_LET, n1, ast.NOTHING, at, 0)
+        ast.stmt_pos_set(b, bind1, n1pos)
+        let base: u32 = rp_base(p, fe_clone(p, arg0), false)
+        let at2: u32 = ast.expr_new(b, ast.E_ID, idx_nr, 0, 0, 0)
+        pos_default(p, at2, n2pos)
+        let elem: u32 = ast.expr_new(b, ast.E_IDX, base, at2, 0, 0)
+        pos_default(p, elem, apos)
+        bind2 = ast.stmt_new(b, ast.S_LET, n2, ast.NOTHING, elem, 0)
+        ast.stmt_pos_set(b, bind2, n2pos)
+    } else {
+        let base1: u32 = rp_base(p, fe_clone(p, arg0), false)
+        let at1: u32 = ast.expr_new(b, ast.E_ID, idx_nr, 0, 0, 0)
+        pos_default(p, at1, n1pos)
+        let elem1: u32 = ast.expr_new(b, ast.E_IDX, base1, at1, 0, 0)
+        pos_default(p, elem1, apos)
+        bind1 = ast.stmt_new(b, ast.S_LET, n1, ast.NOTHING, elem1, 0)
+        ast.stmt_pos_set(b, bind1, n1pos)
+        let base2: u32 = rp_base(p, fe_clone(p, arg1), false)
+        let at2: u32 = ast.expr_new(b, ast.E_ID, idx_nr, 0, 0, 0)
+        pos_default(p, at2, n2pos)
+        let elem2: u32 = ast.expr_new(b, ast.E_IDX, base2, at2, 0, 0)
+        pos_default(p, elem2, apos)
+        bind2 = ast.stmt_new(b, ast.S_LET, n2, ast.NOTHING, elem2, 0)
+        ast.stmt_pos_set(b, bind2, n2pos)
+    }
+    loc_on(p)
+    loc_add(p, n1)
+    loc_add(p, n2)
+    loc_add(p, idx_nr)
+    (*p).pre_stmt = bind1
+    (*p).pre_stmt2 = bind2
+    let body: u32 = block(p)
+    (*p).pre_stmt = ast.NOTHING
+    (*p).pre_stmt2 = ast.NOTHING
+    loc_off(p)
+    return ast.stmt_new(b, ast.S_FOR, idx_nr, zero, len_e, body)
+}
+
+// `__each_len(clone of arr)` as an expression node.
+fn fe_len_call(p: *mut Parser, len_nr: u32, arr: u32, apos: u64) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
+    let c: u32 = fe_clone(p, arr)
+    var tmp: Vec[u32] = vec_new[u32]()
+    vec_push[u32](&tmp, c)
+    let off: u32 = list_store(p, &tmp)
+    vec_free[u32](&tmp)
+    let call: u32 = ast.expr_new(b, ast.E_CALL, len_nr, off, 1, 0)
+    pos_default(p, call, apos)
+    return call
+}
+
 fn for_stmt(p: *mut Parser) -> u32 {
     let fpos: u64 = at_pos(p, 0)
     next_bump(p)
+    if actual(p, A_LPAREN) {
+        return for_pair(p, fpos)
+    }
     if !actual(p, A_IDENT) {
         complain(p)
         return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)

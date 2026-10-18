@@ -2823,6 +2823,44 @@ constants declared before it, and '+ - * /'"
     /// lowering derives the very same target from the very same material
     /// (`lower::fmt_target`) — no side table between the phases.
     pub(crate) fn fmt_target(&mut self, name: &str, args: &[Expr], span: Span) -> Option<String> {
+        // r665: `io.fmt_spec(chain, x, spec)` -- the same resolution with a
+        // format spec (packed literal, compiler/src/fmtspec.rs).
+        if let Some(head) = fmt_spec_head(name) {
+            if args.len() != 3 {
+                return None;
+            }
+            let t = self.expr(&args[1], None);
+            if t.is_concrete_int() {
+                self.widen.insert(args[1].id);
+            }
+            let (step, kind) = match &t {
+                _ if t.is_error() => return None,
+                _ if t.is_concrete_int() && t.is_signed() => ("fmt_spec_i", 'i'),
+                _ if t.is_concrete_int() => ("fmt_spec_u", 'i'),
+                Type::Bool => ("fmt_spec_bool", 's'),
+                Type::F64 => ("fmt_spec_f64", 'f'),
+                Type::F32 => ("fmt_spec_f32", 'f'),
+                _ if crate::strtype::is_str_like(&t) => ("fmt_spec_str", 's'),
+                other => {
+                    self.dg.error_note(
+                        span,
+                        format!(
+                            "an interpolation f\"{{…:spec}}\" cannot show a value of type {}",
+                            self.tcx.name_of(other)
+                        ),
+                        "integers, bool, f32, f64 and str work; for everything else turn it into text yourself",
+                    );
+                    return None;
+                }
+            };
+            if let ExprKind::Int(v) = &args[2].kind {
+                if let Err(m) = crate::fmtspec::check_for(kind, *v as u64) {
+                    self.dg.error(span, format!("in a format spec of an interpolation: {}", m));
+                    return None;
+                }
+            }
+            return Some(format!("{}{}", head, step));
+        }
         let head = fmt_value_head(name)?;
         if args.len() != 2 {
             return None;
@@ -3633,6 +3671,16 @@ fn bit(b: bool) -> i128 {
 /// front of its last segment? `io__fmt_value` -> `Some("io__")`.
 pub(crate) fn fmt_value_head(name: &str) -> Option<&str> {
     let rest = name.strip_suffix("fmt_value")?;
+    if rest.is_empty() || rest.ends_with('_') || rest.ends_with('.') {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+/// r665 -- like `fmt_value_head`, for the placeholder `io.fmt_spec`.
+pub(crate) fn fmt_spec_head(name: &str) -> Option<&str> {
+    let rest = name.strip_suffix("fmt_spec")?;
     if rest.is_empty() || rest.ends_with('_') || rest.ends_with('.') {
         Some(rest)
     } else {

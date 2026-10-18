@@ -1765,9 +1765,43 @@ compute it",
         Stmt::While { cond, body, span: start }
     }
 
+    /// r666 -- `for (a, b) in enumerate(v)` and `for (a, b) in zip(x, y)`:
+    /// the only tuple patterns of `for`; both desugar like `for x in vec`.
+    fn for_pair(&mut self, start: Span) -> Stmt {
+        self.bump(); // '('
+        let first = self.ident("in the pattern of 'for'");
+        let mut second = None;
+        if first.is_some() && self.expect(TokKind::Comma, "between the two names of the 'for' pattern") {
+            second = self.ident("in the pattern of 'for'");
+        }
+        let ok = first.is_some() && second.is_some() && self.expect(TokKind::RParen, "after the 'for' pattern");
+        if !ok || !self.expect(TokKind::KwIn, "after the loop pattern") {
+            self.recovering = false;
+            self.sync_stmt();
+            return Stmt::Error(start);
+        }
+        let src = self.cond_expr();
+        if !self.at(&TokKind::LBrace) {
+            self.error_here("expected '{' after 'for (a, b) in enumerate(..)' / 'zip(..)'");
+            self.recovering = false;
+            self.sync_stmt();
+            return Stmt::Error(start);
+        }
+        self.loop_depth += 1;
+        let body = self.block("after 'for (a, b) in ...'");
+        self.loop_depth -= 1;
+        let (a, asp) = first.unwrap();
+        let (b, bsp) = second.unwrap();
+        crate::foreach::build_pair(self, (a, asp), (b, bsp), src, body, start)
+    }
+
     /// The `for` loop over a half-open, ascending range `start..end`.
     fn for_stmt(&mut self) -> Stmt {
         let start = self.bump(); // 'for'
+        // r666: `for (i, x) in enumerate(v) { }` / `for (x, y) in zip(a, b) { }`
+        if self.at(&TokKind::LParen) {
+            return self.for_pair(start);
+        }
         let (name, name_span) = match self.ident("after 'for'") {
             Some(x) => x,
             None => {
@@ -2626,7 +2660,21 @@ impl<'a> Parser<'a> {
     /// One expression segment: lex the fragment again with padded positions,
     /// parse ONE expression out of it and append it to the chain as
     /// `io.fmt_number(chain, (expression) as i64)`.
-    fn interp_expr(&mut self, chain: Expr, sp: Span, raw: &[char], of: usize) -> Expr {
+    fn interp_expr(&mut self, chain: Expr, sp: Span, raw_all: &[char], of: usize) -> Expr {
+        // r665: `{expr:spec}` -- split at the first `:` outside brackets,
+        // quotes and `::`; the spec becomes ONE packed u64 literal.
+        let mut raw: &[char] = raw_all;
+        let mut spec: Option<u64> = None;
+        if let Some(c) = crate::fmtspec::split_colon(raw_all) {
+            raw = &raw_all[..c];
+            match crate::fmtspec::parse_spec(&raw_all[c + 1..]) {
+                Ok(v) => spec = Some(v),
+                Err(m) => {
+                    self.dg.error(sp, format!("in a format spec of an interpolation: {}", m));
+                    return chain;
+                }
+            }
+        }
         // The positions are right when the fragment stands at its real place:
         // pad lines and columns beforehand (strings are single line, so ONE
         // line suffices).
@@ -2647,10 +2695,19 @@ impl<'a> Parser<'a> {
             // and the lowering both resolve — out of the same material
             // (`strtype`/`sema::call`/`lower::lower_call`), so that they
             // cannot drift apart.
-            Some(e) => self.mk(
-                sp,
-                ExprKind::Call("io.fmt_value".to_string(), vec![chain, e], sp),
-            ),
+            Some(e) => match spec {
+                None => self.mk(
+                    sp,
+                    ExprKind::Call("io.fmt_value".to_string(), vec![chain, e], sp),
+                ),
+                Some(v) => {
+                    let lit = self.mk(sp, ExprKind::Int(v as i128));
+                    self.mk(
+                        sp,
+                        ExprKind::Call("io.fmt_spec".to_string(), vec![chain, e, lit], sp),
+                    )
+                }
+            },
             None => chain,
         }
     }

@@ -1576,6 +1576,32 @@ Proof: `tests/3762`, `tests/3763` (`_fmtskip`: firnfmt's lexer does not know the
 nested form yet), `tests/neg/fstring_plus_str.fi`. `firnc1` does not know the
 first two (tests carry `// firnc1_skip:`).
 
+**r665 (f-string format specs).** `f"{expr:spec}"` with Python's grammar
+`[[fill]align][sign][#][0][width][.precision][type]`; types `d x X o b f F s %`.
+Examples: `{x:.2f}` `{x:>8}` `{x:<8}` `{x:^8}` `{n:05}` `{n:x}` `{n:#06x}` `{x:08.2f}`
+`{x:+.1f}` `{x:.1%}` `{s:*^9}` `{s:.3}`. The parser splits at the first `:` outside
+`()`/`[]`, quotes and `::` and packs the spec into ONE `u64` literal
+(`compiler/src/fmtspec.rs`); the chain step is the placeholder
+`io.fmt_spec(chain, x, spec)`, which the type check and the lowering resolve by the
+type of `x` to `io.fmt_spec_i/_u/_f64/_f32/_str/_bool` (library: `lib/std/io.fi`,
+floats via the exact `std.textfmt.fixed`). Rules: width counts code points; numbers
+align right and strings left by default; `0` = fill `0` with `=` (zeros after the sign);
+an integer takes `f`/`%` too (as Python); an integer takes no precision without `f`,
+a float needs `f`/`%` for a precision (no `g`), a str takes only `s`/precision/width --
+all reported at compile time ("in a format spec of an interpolation: ..."). NOT
+supported: `,` `_` grouping, `e` `g` `c` `n`, non-ASCII fill, `{x!r}`, nested `{width}`.
+`firnc1` mirrors parser, type check and lowering. Proof: `tests/3920_fstring_spec.fi`,
+`tests/neg/fstring_spec_*.fi`, random comparison with Python `tools/fmtspec_cross/run.sh`.
+
+**r666 (`for` with `enumerate` / `zip`).** `for (i, x) in enumerate(v) { }` binds
+`i: usize` and a copy `x` of the element; `for (x, y) in zip(a, b) { }` walks to the
+SHORTER length. Both desugar like `for x in v` (`foreach.rs::build_pair`, firnc1
+`for_pair`): `for __each#N in 0..len { let i = __each#N; let x = v[__each#N]; .. }`.
+`v`/`a`/`b` can be a Vec, array or str and must be a place without calls. Other tuple
+patterns in `for` are an error ("a tuple pattern in 'for' needs enumerate(v) or
+zip(a, b)"). `break`/`continue` work. Proof: `tests/3921_for_enumerate_zip.fi`,
+`tests/neg/for_pair_*.fi`.
+
 **r664 (stdlib without `$FIRNLIB`).** Step 4 of the import search looks at
 `<exe dir>/../lib`, then `../../lib`, then `../../../lib` (installed layout,
 deeper layout, repository layout `compiler/target/release/firnc` -> `lib/`);

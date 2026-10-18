@@ -1264,6 +1264,28 @@ impl<'a> Lower<'a> {
     /// **ROUND 70** — the same resolution as `sema::fmt_target`, derived
     /// from the same material: the type of the interpolated expression.
     fn fmt_target(&mut self, name: &str, args: &[Expr]) -> Option<String> {
+        if let Some(head) = crate::sema::fmt_spec_head(name) {
+            if args.len() != 3 {
+                return None;
+            }
+            let t = self.ty_of(&args[1]);
+            let step = if crate::strtype::is_str_like(&t) {
+                "fmt_spec_str"
+            } else if t.is_concrete_int() && t.is_signed() {
+                "fmt_spec_i"
+            } else if t.is_concrete_int() {
+                "fmt_spec_u"
+            } else if t == Type::Bool {
+                "fmt_spec_bool"
+            } else if t == Type::F64 {
+                "fmt_spec_f64"
+            } else if t == Type::F32 {
+                "fmt_spec_f32"
+            } else {
+                return None;
+            };
+            return Some(format!("{}{}", head, step));
+        }
         let head = crate::sema::fmt_value_head(name)?;
         if args.len() != 2 {
             return None;
