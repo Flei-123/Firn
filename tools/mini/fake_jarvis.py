@@ -17,6 +17,9 @@
 # /api/m/upload (raw body), /file/<uid>/<cid>/<name>, /api/projects/broken (cut JSON).
 # Push: GET /api/m/push/poll?since=N&wait=S is a real long poll (wait capped by FAKE_POLL_MAX, default 5 s); a test injects an event
 # with POST /fake/push {"title","body","cid","type"} (no login) -> {"id": N}. Event ids start at 1000 (FAKE_EVENT_BASE).
+# BAD NETWORK (REST only; the WebSocket keeps working): POST /fake/net {"delay_ms":3000,"drop":1000000,"status":503} slows the REST
+# answers, drops the connection without an answer (drop = how many requests; 1000000 = all) or answers every data route with that
+# status (ping stays 200). Start values: FAKE_REST_DELAY_MS / FAKE_REST_DROP / FAKE_REST_STATUS.
 # Text "file" in a chat message -> the server sends a file event (report.txt) that the client fetches over /file/.
 # REALISTIC DATA (default on, FAKE_REALISTIC=0 = the old tiny answers): the WebSocket `info` is shaped like the real server's
 # (server.js ~4154: active_model, efforts, devices, deviceInfo, models, modelIds, caps, labels, providers, running, partials,
@@ -33,6 +36,9 @@ from websockets.http11 import Response
 from websockets.datastructures import Headers
 
 TOKEN = "fake.tok+en=1_x"
+# bad network on purpose, REST only (POST /fake/net changes it, or the FAKE_REST_* environment at start)
+NET = {"delay_ms": int(os.environ.get("FAKE_REST_DELAY_MS", "0")), "drop": int(os.environ.get("FAKE_REST_DROP", "0")),
+       "status": int(os.environ.get("FAKE_REST_STATUS", "0"))}
 LOG = open(sys.argv[1], "a", buffering=1)
 CONV = {}      # cid -> list of {role, text}
 seq = 0
@@ -479,6 +485,17 @@ async def main():
                 st = "401 Unauthorized"
             writer.write(("HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % (st, len(out))).encode() + out)
             await writer.drain(); writer.close(); return
+        if method == "POST" and path == "/fake/net":
+            # {"delay_ms":N,"drop":N (1000000 = always, 0 = off),"status":N (0 = off)}: the REST answers get slow / dropped / a fixed status
+            try:
+                j = json.loads(body)
+            except Exception:
+                j = {}
+            for k in ("delay_ms", "drop", "status"):
+                if k in j: NET[k] = int(j[k])
+            out = json.dumps(NET).encode()
+            writer.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(out)).encode() + out)
+            await writer.drain(); writer.close(); return
         if method == "POST" and path == "/fake/push":
             global EVSEQ
             try:
@@ -513,6 +530,16 @@ async def main():
             await writer.drain(); writer.close(); return
         rr = rest(method, path, hdr, body)
         if rr is not None:
+            # a bad network on purpose (REST only, the WebSocket keeps working): slow answers, dropped connections, a fixed status
+            if NET["delay_ms"] > 0:
+                await asyncio.sleep(NET["delay_ms"] / 1000.0)
+            if NET["drop"] > 0:
+                NET["drop"] -= 1 if NET["drop"] < 1000000 else 0
+                LOG.write(json.dumps({"type": "net", "what": "drop", "path": path}) + "\n")
+                writer.close(); return
+            if NET["status"] and path != "/api/m/ping":
+                LOG.write(json.dumps({"type": "net", "what": "status", "path": path, "status": NET["status"]}) + "\n")
+                rr = (NET["status"], b'{"error":"fake failure"}', "application/json")
             st, data, ct = rr
             writer.write(("HTTP/1.1 %d X\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % (st, ct, len(data))).encode() + data)
             await writer.drain(); writer.close(); return

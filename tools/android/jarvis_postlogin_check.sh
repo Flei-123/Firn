@@ -151,6 +151,18 @@ run_variant() { # abi:perm:density:font
     for t in Board Tasks; do tap_word "$t" 1 2.5; done
     sleep 3
     check "$tag: alive after the tabs" "$(alive)" yes
+    # BAD NETWORK (REST only; the WebSocket stays up): the lists must say WHY ("No connection - <reason>") and the app log must name the
+    # reason (a bare "No connection" was the 0.2.17 complaint); when the network is back they must load again BY THEMSELVES (backoff retry
+    # + chat socket open), without a tap on Reload. A slow network (4 s per answer) must not end in "No connection" either.
+    curl -s -m 5 -X POST "http://127.0.0.1:$PORT/fake/net" -d '{"drop":1000000}' >/dev/null
+    tap_word "Tasks" 1 1; tap_word "Reload" 1 1 2>/dev/null
+    check "$tag: REST dropped: the screen names the reason" "$(OCR_TRIES=20 wait_ocr ${tag}_08 'No connection - |Offline - as of')" 1
+    note "reason on screen: $(ocr ${tag}_08 | grep -oE '(No connection|Offline - as of)[^|]{0,60}' | head -1)"
+    check "$tag: REST dropped: app log has the failure line with the reason" "$(applog | grep -cE '\[?net\]? .*(connection closed|network error|timeout|server unreachable|no DNS)')" 1
+    curl -s -m 5 -X POST "http://127.0.0.1:$PORT/fake/net" -d '{"drop":0,"delay_ms":4000}' >/dev/null
+    check "$tag: network back (slow, 4 s): the list recovers alone" "$(OCR_TRIES=30 wait_ocr ${tag}_09 'Live')" 1
+    check "$tag: no ANR/crash while the REST was bad" "$(alive)" yes
+    curl -s -m 5 -X POST "http://127.0.0.1:$PORT/fake/net" -d '{"drop":0,"delay_ms":0}' >/dev/null
     # the store check (async since 0.2.9) starts after 30 s of calm: keep tapping like a hasty person until it is done, nothing may freeze
     local k=0 L2=""
     while [ $k -lt 40 ]; do
