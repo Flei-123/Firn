@@ -113,3 +113,12 @@ translucent table. Default (no env) is unchanged. Exit line: `mcplay: models sta
 (four-colour texture; swapped / mirrored UV or reversed quad winding give 12-100 % mismatch, the correct code ~1.6 % = edges). Quad winding (CCW from outside) and UV orientation of
 `raster_draw_models` are correct as they are. Gate stage `bash tools/mc/run.sh modelplay` (`tools/mc/play/run_models.sh`: own fixture pack, flat 1.20.1 server, A models / B default / C after T reload).
 NOT done: mc_stream path (r236), GL / VK, biome tint, AO, translucency, comparison with real Vanilla (r233).
+**Pick table for models (r236b, `lib/mc/mc_model_pick.fi`, test 3961):** with `MCPLAY_MODELS=1` mcplay picks through `mp_pick_camera` instead of `mc_input.input_pick`. The voxel walk is the same;
+a MODEL cell (`ms_kind == K_MODEL`, weighted variant by position like the mesher) is hit only where the ray crosses one of its baked quads (2 triangles per quad, both sides, block local),
+so the ray passes through the empty half of a stair / slab / the corners of a plant. Distance = distance to the quad, normal = dominant axis of the quad plane turned toward the ray origin.
+The pick flag of the table is not used for model cells (the mesher clears the tiles of model states). All other cells behave exactly like `input_pick`; without models mcplay still calls
+`input_pick` (bit identical; test 3961 also compares 400 random rays against `input_pick` in a world without model cells). Selection box: `mp_draw_box` draws the axis box around the quads
+(`mp_bounds`, via `mc_input.input_draw_aabb`), the unit cube for other blocks. Quads with an unmapped texture are not baked, so they are not pickable either. Live: `MCPLAY_PICK_PROBE="ox,oy,oz,dx,dy,dz[;...]"`
+(thousandths) prints `mcplay: probe ...` at the end of the run; `run_models.sh` checks 3 rays through a stair (models 3.0 / 4.5 / 4.0, default voxel 2.5 / 4.0 / 4.0).
+NOT done: collision from model elements (the player still uses `mc_shapes` shape codes: stairs / slabs are covered there, fences / plants / custom shapes are not), transparent texels of plant quads are
+still pickable (vanilla plants have a smaller outline box than the quads' texture).
