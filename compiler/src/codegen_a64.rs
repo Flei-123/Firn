@@ -995,7 +995,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
         e.raw(&crate::so_thunk::runtime_asm()?);
     }
     e.raw(".section .note.GNU-stack,\"\",%progbits");
-    Ok(spill_peephole(&e.out))
+    Ok(cold_checks(&spill_peephole(&e.out)))
 }
 
 fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
@@ -2303,6 +2303,21 @@ fn emit_bin(
                     return Ok(());
                 }
             }
+            if op == BinOp::Mul {
+                // Multiplying by a power of two is a shift (the low bits are the same).
+                let pow2 = |v: Val| match fr.ra.imm(v) {
+                    Some(c) if c > 1 && (c as u64).is_power_of_two() => Some((c as u64).trailing_zeros()),
+                    _ => None,
+                };
+                let hit = pow2(b).map(|k| (a, k)).or_else(|| pow2(a).map(|k| (b, k)));
+                if let Some((x, k)) = hit {
+                    let ra = src(e, fr, x, A);
+                    let rd = dreg(fr, d, A);
+                    e.line(&format!("lsl {}, {}, #{}", rw(rd, bits), rw(ra, bits), k));
+                    commit(e, fr, d, rd);
+                    return Ok(());
+                }
+            }
             let ra = src(e, fr, a, A);
             let rb = src(e, fr, b, B);
             let rd = dreg(fr, d, A);
@@ -2575,6 +2590,97 @@ fn spill_peephole(text: &str) -> String {
             r.push_str(l);
         }
         r.push('\n');
+    }
+    r
+}
+
+/// Moves the panic block of an overflow/range check out of the hot path. The emitted shape is
+/// `b.cc .LchksiteN` / `b .LokN` / `.LchksiteN:` <panic call> / `.LokN:`; the unconditional `b .LokN` is dropped and
+/// the panic block is parked behind the next unconditional branch (nothing falls through it), so the hot path
+/// just falls into `.LokN`.
+fn cold_checks(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let n = lines.len();
+    let mut skip = vec![false; n];
+    // block start -> (end exclusive) for blocks to move; parked[after_idx] = blocks to emit after that line
+    let mut pending: Vec<(usize, usize)> = Vec::new();
+    let mut parked: std::collections::HashMap<usize, Vec<(usize, usize)>> = std::collections::HashMap::new();
+    let mut drop_b = vec![false; n];
+    let is_term = |l: &str| {
+        let t = l.trim_start();
+        t == "ret" || (t.starts_with("b ") && !t.starts_with("b.")) || t.starts_with("br ")
+    };
+    let mut i = 0;
+    while i < n {
+        if let Some(prev) = i.checked_sub(1) {
+            let l = lines[i];
+            if l.starts_with(".Lchksite") && l.ends_with(':') {
+                // previous line must be `    b <ok>` and the block must end with the ok label
+                if let Some(ok) = lines[prev].strip_prefix("    b ") {
+                    let ok_line = format!("{}:", ok);
+                    let mut j = i + 1;
+                    let mut good = false;
+                    while j < n && j < i + 40 {
+                        if lines[j] == ok_line {
+                            good = true;
+                            break;
+                        }
+                        if lines[j].ends_with(':') && !lines[j].starts_with("    ") {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if good && j > i + 1 && is_term(lines[j - 1]) && !lines[i + 1..j].iter().any(|x| x.ends_with(':') && !x.starts_with("    ")) {
+                        pending.push((i, j));
+                        drop_b[prev] = true;
+                        for k in i..j {
+                            skip[k] = true;
+                        }
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    // park each block after the next terminator following its ok label
+    let mut waiting: Vec<(usize, usize)> = Vec::new();
+    let mut pk = 0;
+    for idx in 0..n {
+        while pk < pending.len() && pending[pk].1 <= idx {
+            waiting.push(pending[pk]);
+            pk += 1;
+        }
+        if !waiting.is_empty() && !skip[idx] && !drop_b[idx] && is_term(lines[idx]) && idx >= waiting[0].1 {
+            parked.entry(idx).or_default().extend(waiting.drain(..));
+        }
+    }
+    // blocks that found no terminator are left in place (restore)
+    let mut restore = vec![false; n];
+    for (a, b) in &waiting {
+        for k in *a..*b {
+            skip[k] = false;
+        }
+        restore[*a - 1] = true;
+    }
+    let mut r = String::with_capacity(text.len());
+    for idx in 0..n {
+        if drop_b[idx] && !restore[idx] {
+            continue;
+        }
+        if !skip[idx] {
+            r.push_str(lines[idx]);
+            r.push('\n');
+        }
+        if let Some(bs) = parked.get(&idx) {
+            for (a, b) in bs {
+                for k in *a..*b {
+                    r.push_str(lines[k]);
+                    r.push('\n');
+                }
+            }
+        }
     }
     r
 }
