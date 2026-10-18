@@ -329,3 +329,7 @@ Neu in main (alles reine Modelle mit Prüfprogramm in `tools/fui/run.sh`, Gerüs
 ## W28-d (18.10.2026): Wave 8 + Modelle
 * `lib/fui/wave8.fi`: Spinner, TimePicker, Breadcrumb, InfoBar, Stepper (Sofortmodus, ein Geometrie-Pfad, Theme-Tokens, RTL); `lib/fui/wave8m.fi`: Accordion, Toolbar-Ueberlauf, Tabellen-Zellbearbeitung, Insets, Dichte, Textskalierung; `lib/fui/keycapture.fi`: Tastenkuerzel aufnehmen (Konflikt/Ersetzen). Test `tools/fui/wave8_main.fi` (227 Checks, hell+dunkel), in `run.sh`.
 * **Offen (r45-Rest):** appctl-/a11y-(kita11y)-Anbindung der wave8-Elemente, Golden fuer wave8, Host-Leser (Insets, Textskalierung), Bereichs-Datum, Zeichnen des Toolbar-Chevrons, Cell-Edit in vlistview.
+
+## W42-c (18.10.2026): Wave 12 (r45 rest)
+* `lib/fui/wave12.fi`: calendar (one day or a RANGE, month arrows, arrows/PgUp/PgDn/Home/End), navigation view (hamburger + `kit.nav_*` list; expanded 240 / compact 64 / hidden 48, Esc closes the minimal overlay), tree view (flat pre-order list, Left/Right expand/collapse, keys scroll). appctl: `datepicker*`, `navview*`, `tree*` (one node each, a11y role + description). Tests `wave12_main` (147 checks, light/dark/RTL) and `appw12_main` (appctl clicks/keys/a11y), both in `run.sh`. Rows 25, 32, 33, 35 are now covered (rows stay "teilweise": wheel scrolling, lazy tree, nested nav levels, min/max dates).
+* **Offen (r45-Rest):** Flyout/Popover/TeachingTip (row 39), Golden fuer wave8/wave12, Host-Leser (Insets, Textskalierung), Tree-Lazy-Load/Drag-Umordnen, Nav-Untermenues.

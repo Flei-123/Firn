@@ -1,0 +1,828 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/wave12.fi -- THE CONTROLS OF WAVE 12 (r45 rest, gap list rows 25, 32, 33, 35):
+//
+//   calendar    month grid with ONE day or a day RANGE (start .. end), month arrows, keys (arrows, PgUp / PgDn, Home / End)
+//   navview     navigation column: a hamburger button + the kit.nav_* list; expanded (240) / compact icons (64) / hidden (48)
+//   tree        tree view: flat pre-order list (depth per item), expand / collapse, keys (Up / Down / Left / Right / Home / End)
+//
+// Same rules as lib/fui/wave8.fi: IMMEDIATE MODE (the program keeps the small state, calls `*_draw` every frame), ONE GEOMETRY
+// (every `*_hit` asks the function the picture was made from), ONLY THEME tokens, lengths through kit.ln, RIGHT TO LEFT
+// through kit.rx. Dates are plain integers y*10000 + m*100 + d (0 = none), so a range test is a comparison.
+//
+// HONEST LIMITS: the week starts on Monday; no week numbers, no min / max date, no disabled days; the tree holds 64 items
+// and has no wheel scrolling (the keys scroll it); the nav list holds 16 items and ONE level.
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.kit
+import fui.kitcolor
+import fui.editor
+import fui.lucide
+import fui.uistr
+
+export {
+    Cal, CAL_PREV, CAL_NEXT, CAL_NONE, cal_new, cal_ymd, cal_dim, cal_weekday, cal_move_days, cal_shift_month, cal_choose,
+    cal_key, cal_width, cal_height, cal_day_rect, cal_arrow_rect, cal_hit, cal_in_range, cal_draw, cal_title,
+    NavView, NV_MAX, NV_EXPANDED, NV_COMPACT, NV_MINIMAL, NV_HAMBURGER, NV_NONE, nv_new, nv_add, nv_header, nv_set_mode,
+    nv_full, nv_list_shown, nv_width_pt, nv_hb_rect, nv_hit, nv_key, nv_item_rect, nv_draw,
+    Tree, TreeItem, TR_MAX, TR_NONE, tr_new, tr_add, tr_has_kids, tr_visible, tr_vis_count, tr_vis_at, tr_row_of, tr_set_open,
+    tr_select, tr_key, tr_row_h, tr_rect, tr_hit, tr_draw, tr_fit,
+}
+
+fn text_run(size: f64, weight: usize) -> painter.TextRun {
+    var r: painter.TextRun = painter.run_new(size)
+    if weight >= 700 {
+        r = painter.run_set_weight(r, 700)
+    }
+    return r
+}
+
+fn ctext(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, size: f64, weight: usize, col: u32, p: u64, n: usize) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var r: painter.TextRun = text_run(size, weight)
+    let tw: f64 = painter.run_width(z, &r, p, n)
+    let by: f64 = painter.text_baseline_mid(z, y, h, size)
+    painter.run_draw_ellipsis(z, &r, x + (w - tw) / 2.0, by, w, col, p, n, painter.TEXT_L)
+}
+
+fn panel(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let r: f64 = kit.ln(c, 8)
+    painter.round_rect(z, x, y, w, h, r, kit.tokc(c, style.TOK_SURFACE))
+    painter.round_ring(z, x, y, w, h, r, kit.ln(c, 1), kit.tokc(c, style.TOK_BORDER))
+}
+
+// ====================================================================
+// CALENDAR (single day or range)
+// ====================================================================
+
+const CAL_PREV: usize = 1000
+const CAL_NEXT: usize = 1001
+const CAL_NONE: usize = 1002
+
+struct Cal {
+    y: i64,
+    m: i64,
+    cur: i64, // the day with the keyboard cursor (1..31) in the shown month
+    range: bool,
+    a: i64, // start (or the single day); 0 = none
+    b: i64, // end of a finished range; 0 = none
+    pend: bool, // the start of a range is chosen, the end is awaited
+}
+
+fn cal_ymd(y: i64, m: i64, d: i64) -> i64 {
+    return y * 10000 + m * 100 + d
+}
+
+fn cal_leap(y: i64) -> bool {
+    if y % 4 != 0 { return false }
+    if y % 100 != 0 { return true }
+    return y % 400 == 0
+}
+
+fn cal_dim(y: i64, m: i64) -> i64 {
+    if m == 2 {
+        if cal_leap(y) { return 29 }
+        return 28
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 { return 30 }
+    return 31
+}
+
+// 0 = Monday (Sakamoto)
+fn cal_weekday(y: i64, m: i64, d: i64) -> i64 {
+    var yy: i64 = y
+    var t: [i64; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+    if m < 3 { yy = yy - 1 }
+    let w: i64 = (yy + yy / 4 - yy / 100 + yy / 400 + t[(m - 1) as usize] + d) % 7
+    return (w + 6) % 7
+}
+
+fn cal_new(y: i64, m: i64, d: i64, range: bool) -> Cal {
+    var yy: i64 = y
+    var mm: i64 = m
+    if yy < 1 { yy = 1 }
+    if yy > 9999 { yy = 9999 }
+    if mm < 1 { mm = 1 }
+    if mm > 12 { mm = 12 }
+    var dd: i64 = d
+    if dd < 1 { dd = 1 }
+    if dd > cal_dim(yy, mm) { dd = cal_dim(yy, mm) }
+    var a: i64 = 0
+    if !range { a = cal_ymd(yy, mm, dd) }
+    return Cal { y: yy, m: mm, cur: dd, range: range, a: a, b: 0, pend: false }
+}
+
+fn cal_move_days(k: *mut Cal, delta: i64) {
+    var d: i64 = (*k).cur + delta
+    while d < 1 {
+        (*k).m = (*k).m - 1
+        if (*k).m < 1 {
+            (*k).m = 12
+            (*k).y = (*k).y - 1
+        }
+        d = d + cal_dim((*k).y, (*k).m)
+    }
+    while d > cal_dim((*k).y, (*k).m) {
+        d = d - cal_dim((*k).y, (*k).m)
+        (*k).m = (*k).m + 1
+        if (*k).m > 12 {
+            (*k).m = 1
+            (*k).y = (*k).y + 1
+        }
+    }
+    if (*k).y < 1 { (*k).y = 1 }
+    if (*k).y > 9999 { (*k).y = 9999 }
+    (*k).cur = d
+}
+
+fn cal_shift_month(k: *mut Cal, dir: i64) {
+    (*k).m = (*k).m + dir
+    while (*k).m < 1 {
+        (*k).m = (*k).m + 12
+        (*k).y = (*k).y - 1
+    }
+    while (*k).m > 12 {
+        (*k).m = (*k).m - 12
+        (*k).y = (*k).y + 1
+    }
+    if (*k).y < 1 { (*k).y = 1 }
+    if (*k).y > 9999 { (*k).y = 9999 }
+    if (*k).cur > cal_dim((*k).y, (*k).m) { (*k).cur = cal_dim((*k).y, (*k).m) }
+}
+
+// The cursor day becomes the selection. Single: it is the day. Range: the first choice sets the start, the second the
+// end (swapped when earlier); a third choice starts a new range. Returns true when the range / day is COMPLETE.
+fn cal_choose(k: *mut Cal) -> bool {
+    let v: i64 = cal_ymd((*k).y, (*k).m, (*k).cur)
+    if !(*k).range {
+        (*k).a = v
+        (*k).b = 0
+        return true
+    }
+    if (*k).pend {
+        if v < (*k).a {
+            (*k).b = (*k).a
+            (*k).a = v
+        } else {
+            (*k).b = v
+        }
+        (*k).pend = false
+        return true
+    }
+    (*k).a = v
+    (*k).b = 0
+    (*k).pend = true
+    return false
+}
+
+// 0 = not used, 1 = the cursor / month moved
+fn cal_key(k: *mut Cal, key: u32) -> u32 {
+    var step: i64 = 1
+    if kit.kit_rtl() { step = 0 - 1 }
+    if key == editor.KEY_LEFT {
+        cal_move_days(k, 0 - step)
+        return 1 as u32
+    }
+    if key == editor.KEY_RIGHT {
+        cal_move_days(k, step)
+        return 1 as u32
+    }
+    if key == editor.KEY_UP {
+        cal_move_days(k, 0 - 7)
+        return 1 as u32
+    }
+    if key == editor.KEY_DOWN {
+        cal_move_days(k, 7)
+        return 1 as u32
+    }
+    if key == editor.KEY_PGUP {
+        cal_shift_month(k, 0 - 1)
+        return 1 as u32
+    }
+    if key == editor.KEY_PGDN {
+        cal_shift_month(k, 1)
+        return 1 as u32
+    }
+    if key == editor.KEY_HOME {
+        (*k).cur = 1
+        return 1 as u32
+    }
+    if key == editor.KEY_END {
+        (*k).cur = cal_dim((*k).y, (*k).m)
+        return 1 as u32
+    }
+    return 0 as u32
+}
+
+// is the day `v` (y*10000 + m*100 + d) inside the finished range (both ends included)?
+fn cal_in_range(k: *mut Cal, v: i64) -> bool {
+    if !(*k).range || (*k).a == 0 || (*k).b == 0 { return false }
+    return v >= (*k).a && v <= (*k).b
+}
+
+fn cal_cell(c: *mut render.Ctx) -> f64 { return kit.ln(c, 36) }
+fn cal_pad(c: *mut render.Ctx) -> f64 { return kit.ln(c, 8) }
+fn cal_hdr(c: *mut render.Ctx) -> f64 { return kit.ln(c, 36) }
+fn cal_wdh(c: *mut render.Ctx) -> f64 { return kit.ln(c, 28) }
+
+fn cal_width(c: *mut render.Ctx) -> f64 { return 7.0 * cal_cell(c) + 2.0 * cal_pad(c) }
+fn cal_height(c: *mut render.Ctx) -> f64 {
+    return 2.0 * cal_pad(c) + cal_hdr(c) + cal_wdh(c) + 6.0 * cal_cell(c)
+}
+
+// the rectangle of a day of the shown month
+fn cal_day_rect(c: *mut render.Ctx, k: *mut Cal, x: f64, y: f64, day: i64, out: *mut [f64; 4]) -> bool {
+    if day < 1 || day > cal_dim((*k).y, (*k).m) { return false }
+    let idx: i64 = cal_weekday((*k).y, (*k).m, 1) + day - 1
+    var col: i64 = idx % 7
+    let row: i64 = idx / 7
+    if kit.kit_rtl() { col = 6 - col }
+    (*out)[0] = x + cal_pad(c) + (col as f64) * cal_cell(c)
+    (*out)[1] = y + cal_pad(c) + cal_hdr(c) + cal_wdh(c) + (row as f64) * cal_cell(c)
+    (*out)[2] = cal_cell(c)
+    (*out)[3] = cal_cell(c)
+    return true
+}
+
+// CAL_PREV / CAL_NEXT: the month arrows (previous at the start edge)
+fn cal_arrow_rect(c: *mut render.Ctx, x: f64, y: f64, w: f64, part: usize, out: *mut [f64; 4]) -> bool {
+    var start: bool = part == CAL_PREV
+    if kit.kit_rtl() { start = !start }
+    if part != CAL_PREV && part != CAL_NEXT { return false }
+    var ax: f64 = x + cal_pad(c)
+    if !start { ax = x + w - cal_pad(c) - cal_cell(c) }
+    (*out)[0] = ax
+    (*out)[1] = y + cal_pad(c)
+    (*out)[2] = cal_cell(c)
+    (*out)[3] = cal_hdr(c)
+    return true
+}
+
+// CAL_PREV / CAL_NEXT / the day 1..31 (as usize) / CAL_NONE
+fn cal_hit(c: *mut render.Ctx, k: *mut Cal, x: f64, y: f64, w: f64, px: f64, py: f64) -> usize {
+    var r: [f64; 4] = [0.0; 4]
+    var p: usize = CAL_PREV
+    while p <= CAL_NEXT {
+        if cal_arrow_rect(c, x, y, w, p, &r) && px >= r[0] && px < r[0] + r[2] && py >= r[1] && py < r[1] + r[3] {
+            return p
+        }
+        p = p + 1
+    }
+    var d: i64 = 1
+    let n: i64 = cal_dim((*k).y, (*k).m)
+    while d <= n {
+        if cal_day_rect(c, k, x, y, d, &r) && px >= r[0] && px < r[0] + r[2] && py >= r[1] && py < r[1] + r[3] {
+            return d as usize
+        }
+        d = d + 1
+    }
+    return CAL_NONE
+}
+
+fn tr_month(m: i64) -> str {
+    if m == 1 { return uistr.t("wave12.m1", "January") }
+    if m == 2 { return uistr.t("wave12.m2", "February") }
+    if m == 3 { return uistr.t("wave12.m3", "March") }
+    if m == 4 { return uistr.t("wave12.m4", "April") }
+    if m == 5 { return uistr.t("wave12.m5", "May") }
+    if m == 6 { return uistr.t("wave12.m6", "June") }
+    if m == 7 { return uistr.t("wave12.m7", "July") }
+    if m == 8 { return uistr.t("wave12.m8", "August") }
+    if m == 9 { return uistr.t("wave12.m9", "September") }
+    if m == 10 { return uistr.t("wave12.m10", "October") }
+    if m == 11 { return uistr.t("wave12.m11", "November") }
+    return uistr.t("wave12.m12", "December")
+}
+
+fn tr_wd(i: usize) -> str {
+    if i == 0 { return uistr.t("wave12.d0", "Mo") }
+    if i == 1 { return uistr.t("wave12.d1", "Tu") }
+    if i == 2 { return uistr.t("wave12.d2", "We") }
+    if i == 3 { return uistr.t("wave12.d3", "Th") }
+    if i == 4 { return uistr.t("wave12.d4", "Fr") }
+    if i == 5 { return uistr.t("wave12.d5", "Sa") }
+    return uistr.t("wave12.d6", "Su")
+}
+
+fn put_str(buf: *mut [u8; 48], n0: usize, s: str) -> usize {
+    var n: usize = n0
+    var k: usize = 0
+    while k < s.n && n < 47 {
+        (*buf)[n] = *((s.p as u64 + k as u64) as *mut u8)
+        n = n + 1
+        k = k + 1
+    }
+    return n
+}
+
+fn put_dec(buf: *mut [u8; 48], n0: usize, v0: i64, digits: usize) -> usize {
+    var tmp: [u8; 12] = [0 as u8; 12]
+    var v: i64 = v0
+    var k: usize = 0
+    while (v > 0 || k < digits) && k < 11 {
+        tmp[k] = (48 + v % 10) as u8
+        v = v / 10
+        k = k + 1
+    }
+    var n: usize = n0
+    while k > 0 && n < 47 {
+        k = k - 1
+        (*buf)[n] = tmp[k]
+        n = n + 1
+    }
+    return n
+}
+
+// "October 2026" into `buf`; the length
+fn cal_title(k: *mut Cal, buf: *mut [u8; 48]) -> usize {
+    var n: usize = put_str(buf, 0, tr_month((*k).m))
+    n = put_str(buf, n, " ")
+    return put_dec(buf, n, (*k).y, 1)
+}
+
+// `hover` = a cal_hit value (CAL_NONE: none); `focused` = the control has the keyboard focus (ring on the cursor day)
+fn cal_draw(c: *mut render.Ctx, k: *mut Cal, x: f64, y: f64, w: f64, h: f64, hover: usize, focused: bool, enabled: bool) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    panel(c, x, y, w, h)
+    var r: [f64; 4] = [0.0; 4]
+    let rr: f64 = kit.ln(c, 6)
+    let muted: u32 = kit.tokc(c, style.TOK_TEXT_MUTED)
+    var fgt: u32 = kit.tokc(c, style.TOK_TEXT)
+    if !enabled { fgt = kit.tokc(c, style.TOK_TEXT_DISABLED) }
+    // the header: arrows and the month name
+    var part: usize = CAL_PREV
+    while part <= CAL_NEXT {
+        if cal_arrow_rect(c, x, y, w, part, &r) {
+            if part == hover && enabled {
+                painter.round_rect(z, r[0], r[1], r[2], r[3], rr, kit.tokc(c, style.TOK_BUTTON_HOVER))
+            }
+            var ic: i64 = lucide.CHEVRON_LEFT
+            if part == CAL_NEXT { ic = lucide.CHEVRON_RIGHT }
+            if kit.kit_rtl() {
+                if part == CAL_PREV { ic = lucide.CHEVRON_RIGHT } else { ic = lucide.CHEVRON_LEFT }
+            }
+            let isz: f64 = kit.ln(c, 16)
+            kit.sym(c, ic, r[0] + (r[2] - isz) / 2.0, r[1] + (r[3] - isz) / 2.0, isz, fgt)
+        }
+        part = part + 1
+    }
+    var tb: [u8; 48] = [0 as u8; 48]
+    let tn: usize = cal_title(k, &tb)
+    ctext(c, x + cal_pad(c) + cal_cell(c), y + cal_pad(c), w - 2.0 * (cal_pad(c) + cal_cell(c)), cal_hdr(c), kit.ln(c, 14), 700, fgt,
+        (&tb[0]) as u64, tn)
+    // the weekday letters
+    var i: usize = 0
+    while i < 7 {
+        var col: usize = i
+        if kit.kit_rtl() { col = 6 - i }
+        let s: str = tr_wd(i)
+        ctext(c, x + cal_pad(c) + (col as f64) * cal_cell(c), y + cal_pad(c) + cal_hdr(c), cal_cell(c), cal_wdh(c), kit.ln(c, 12), 400,
+            muted, s.p as u64, s.n)
+        i = i + 1
+    }
+    // the days: range band first, then the ends / the single day, hover, cursor ring
+    let n: i64 = cal_dim((*k).y, (*k).m)
+    var d: i64 = 1
+    while d <= n {
+        if cal_day_rect(c, k, x, y, d, &r) {
+            let v: i64 = cal_ymd((*k).y, (*k).m, d)
+            let is_end: bool = v == (*k).a || (v == (*k).b && (*k).b != 0)
+            let inside: bool = cal_in_range(k, v)
+            var fg: u32 = fgt
+            if inside && !is_end {
+                painter.surface(z, r[0], r[1] + kit.ln(c, 2), r[2], r[3] - kit.ln(c, 4), kit.tokc(c, style.TOK_SELECTION))
+                fg = kit.tokc(c, style.TOK_SELECTION_TEXT)
+            } else if is_end && enabled {
+                let fill: u32 = theme.opaque(kit.accent_gfx(c, style.TOK_SURFACE))
+                painter.round_rect(z, r[0] + kit.ln(c, 2), r[1] + kit.ln(c, 2), r[2] - kit.ln(c, 4), r[3] - kit.ln(c, 4), rr, fill)
+                fg = theme.opaque(kitcolor.on_color(render.ctx_theme(c), fill))
+            } else if (d as usize) == hover && enabled {
+                painter.round_rect(z, r[0] + kit.ln(c, 2), r[1] + kit.ln(c, 2), r[2] - kit.ln(c, 4), r[3] - kit.ln(c, 4), rr,
+                    kit.tokc(c, style.TOK_BUTTON_HOVER))
+            }
+            var nb: [u8; 48] = [0 as u8; 48]
+            let nn: usize = put_dec(&nb, 0, d, 1)
+            ctext(c, r[0], r[1], r[2], r[3], kit.ln(c, 14), 400, fg, (&nb[0]) as u64, nn)
+            if focused && enabled && d == (*k).cur {
+                kit.focus_ring(c, r[0] + kit.ln(c, 2), r[1] + kit.ln(c, 2), r[2] - kit.ln(c, 4), r[3] - kit.ln(c, 4), rr, style.TOK_SURFACE)
+            }
+        }
+        d = d + 1
+    }
+}
+
+// ====================================================================
+// NAVIGATION VIEW
+// ====================================================================
+
+const NV_MAX: usize = 16
+const NV_EXPANDED: u32 = 0
+const NV_COMPACT: u32 = 1
+const NV_MINIMAL: u32 = 2
+const NV_HAMBURGER: usize = 1000
+const NV_NONE: usize = 1001
+
+struct NavView {
+    n: usize,
+    items: [kit.NavItem; 16],
+    active: usize, // the selected item (NV_NONE = none)
+    mode: u32, // by window size: expanded / compact / minimal
+    open: bool, // the full pane is shown (hamburger toggles it)
+    foc: usize, // NV_HAMBURGER while the keyboard sits on the hamburger button, else NV_NONE
+}
+
+fn nv_new() -> NavView {
+    return NavView { n: 0, items: [kit.NavItem { icon: kit.ICON_NONE, label: "", badge: 0, header: false }; 16],
+        active: NV_NONE, mode: NV_EXPANDED, open: true, foc: NV_NONE }
+}
+
+fn nv_add(v: *mut NavView, icon: i64, label: str, badge: usize) -> bool {
+    if (*v).n >= NV_MAX { return false }
+    (*v).items[(*v).n] = kit.NavItem { icon: icon, label: label, badge: badge, header: false }
+    if (*v).active == NV_NONE { (*v).active = (*v).n }
+    (*v).n = (*v).n + 1
+    return true
+}
+
+fn nv_header(v: *mut NavView, label: str) -> bool {
+    if (*v).n >= NV_MAX { return false }
+    (*v).items[(*v).n] = kit.NavItem { icon: kit.ICON_NONE, label: label, badge: 0, header: true }
+    (*v).n = (*v).n + 1
+    return true
+}
+
+// a new mode (by the size class); expanded starts with the pane open, the others closed
+fn nv_set_mode(v: *mut NavView, mode: u32) {
+    if (*v).mode == mode { return }
+    (*v).mode = mode
+    (*v).open = mode == NV_EXPANDED
+    (*v).foc = NV_NONE
+}
+
+// the full 240 pane is shown
+fn nv_full(v: *mut NavView) -> bool { return (*v).open }
+
+// the width of the control in design points
+fn nv_width_pt(v: *mut NavView) -> usize {
+    if (*v).open { return 240 }
+    if (*v).mode == NV_MINIMAL { return 48 }
+    return 64
+}
+
+fn nv_hb_h(c: *mut render.Ctx) -> f64 { return kit.ln(c, 48) }
+
+// the hamburger button
+fn nv_hb_rect(c: *mut render.Ctx, x: f64, y: f64, w: f64, out: *mut [f64; 4]) -> bool {
+    let s: f64 = kit.ln(c, 40)
+    var bx: f64 = x + kit.ln(c, 4)
+    if kit.kit_rtl() { bx = x + w - kit.ln(c, 4) - s }
+    (*out)[0] = bx
+    (*out)[1] = y + kit.ln(c, 4)
+    (*out)[2] = s
+    (*out)[3] = s
+    return true
+}
+
+// the list is drawn (not in the hidden strip of the minimal mode)
+fn nv_list_shown(v: *mut NavView) -> bool {
+    return (*v).open || (*v).mode != NV_MINIMAL
+}
+
+// NV_HAMBURGER / the item / NV_NONE
+fn nv_hit(c: *mut render.Ctx, v: *mut NavView, x: f64, y: f64, w: f64, px: f64, py: f64) -> usize {
+    var r: [f64; 4] = [0.0; 4]
+    nv_hb_rect(c, x, y, w, &r)
+    if px >= r[0] && px < r[0] + r[2] && py >= r[1] && py < r[1] + r[3] { return NV_HAMBURGER }
+    if !nv_list_shown(v) { return NV_NONE }
+    let it: usize = kit.nav_hit(c, &(*v).items[0], (*v).n, x, y + nv_hb_h(c), w, !(*v).open, px, py)
+    if it == kit.NONE { return NV_NONE }
+    return it
+}
+
+// the rectangle of item `i`
+fn nv_item_rect(c: *mut render.Ctx, v: *mut NavView, x: f64, y: f64, w: f64, i: usize, out: *mut [f64; 4]) -> bool {
+    if i >= (*v).n || !nv_list_shown(v) { return false }
+    (*out)[0] = x
+    (*out)[1] = y + nv_hb_h(c) + kit.nav_item_y(c, &(*v).items[0], i)
+    (*out)[2] = w
+    (*out)[3] = kit.nav_item_h(c, kit.nav_at(&(*v).items[0], i))
+    return true
+}
+
+// Up / Down / Home / End. 0 = not used, 1 = the active item changed, 2 = the focus moved between hamburger and list
+fn nv_key(v: *mut NavView, key: u32) -> u32 {
+    if (*v).foc == NV_HAMBURGER {
+        if key == editor.KEY_DOWN && nv_list_shown(v) {
+            (*v).foc = NV_NONE
+            return 2 as u32
+        }
+        return 0 as u32
+    }
+    if key == editor.KEY_UP {
+        // from the first item up onto the hamburger
+        var first: usize = 0
+        while first < (*v).n && (*v).items[first].header { first = first + 1 }
+        if (*v).active == NV_NONE || (*v).active <= first {
+            (*v).foc = NV_HAMBURGER
+            return 2 as u32
+        }
+    }
+    if !nv_list_shown(v) { return 0 as u32 }
+    if key != editor.KEY_UP && key != editor.KEY_DOWN && key != editor.KEY_HOME && key != editor.KEY_END { return 0 as u32 }
+    var cur: usize = (*v).active
+    if cur == NV_NONE { cur = kit.NONE }
+    let nx: usize = kit.nav_key(&(*v).items[0], (*v).n, cur, key)
+    if nx == kit.NONE || nx == (*v).active || nx >= (*v).n { return 0 as u32 }
+    (*v).active = nx
+    return 1 as u32
+}
+
+fn nv_draw(c: *mut render.Ctx, v: *mut NavView, x: f64, y: f64, w: f64, h: f64, hover: usize, focused: bool) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    painter.surface(z, x, y, w, h, kit.tokc(c, style.TOK_SURFACE))
+    var r: [f64; 4] = [0.0; 4]
+    nv_hb_rect(c, x, y, w, &r)
+    if hover == NV_HAMBURGER {
+        painter.round_rect(z, r[0], r[1], r[2], r[3], kit.ln(c, 6), kit.tokc(c, style.TOK_BUTTON_HOVER))
+    }
+    let isz: f64 = kit.ln(c, 20)
+    kit.sym(c, lucide.MENU, r[0] + (r[2] - isz) / 2.0, r[1] + (r[3] - isz) / 2.0, isz, kit.tokc(c, style.TOK_TEXT))
+    if focused && (*v).foc == NV_HAMBURGER {
+        kit.focus_ring(c, r[0], r[1], r[2], r[3], kit.ln(c, 6), style.TOK_SURFACE)
+    }
+    if !nv_list_shown(v) {
+        painter.surface(z, kit.rx(x + w - kit.ln(c, 1), kit.ln(c, 1), x, w), y, kit.ln(c, 1), h, kit.tokc(c, style.TOK_SEPARATOR))
+        return
+    }
+    var hv: usize = kit.NONE
+    if hover < (*v).n { hv = hover }
+    var act: usize = kit.NONE
+    if (*v).active < (*v).n { act = (*v).active }
+    kit.nav_draw(c, &(*v).items[0], (*v).n, act, hv, focused && (*v).foc != NV_HAMBURGER, x, y + nv_hb_h(c), w, h - nv_hb_h(c), !(*v).open)
+}
+
+// ====================================================================
+// TREE VIEW
+// ====================================================================
+
+const TR_MAX: usize = 64
+const TR_NONE: usize = 1000
+
+struct TreeItem {
+    label: str,
+    depth: usize,
+    open: bool,
+}
+
+struct Tree {
+    n: usize,
+    item: [TreeItem; 64],
+    sel: usize, // the selected item (TR_NONE = none)
+    top: usize, // the first visible row (an index into the visible rows)
+}
+
+fn tr_new() -> Tree {
+    return Tree { n: 0, item: [TreeItem { label: "", depth: 0, open: false }; 64], sel: TR_NONE, top: 0 }
+}
+
+// items come in pre-order; a depth may be at most one deeper than the item before
+fn tr_add(t: *mut Tree, depth: usize, label: str, open: bool) -> bool {
+    if (*t).n >= TR_MAX { return false }
+    if (*t).n == 0 && depth != 0 { return false }
+    if (*t).n > 0 && depth > (*t).item[(*t).n - 1].depth + 1 { return false }
+    (*t).item[(*t).n] = TreeItem { label: label, depth: depth, open: open }
+    if (*t).sel == TR_NONE { (*t).sel = (*t).n }
+    (*t).n = (*t).n + 1
+    return true
+}
+
+fn tr_has_kids(t: *mut Tree, i: usize) -> bool {
+    return i + 1 < (*t).n && (*t).item[i + 1].depth > (*t).item[i].depth
+}
+
+// are all the parents of item `i` open?
+fn tr_visible(t: *mut Tree, i: usize) -> bool {
+    if i >= (*t).n { return false }
+    var need: usize = (*t).item[i].depth
+    var k: usize = i
+    while need > 0 {
+        while k > 0 && (*t).item[k - 1].depth >= need { k = k - 1 }
+        if k == 0 { return false }
+        k = k - 1
+        if !(*t).item[k].open { return false }
+        need = (*t).item[k].depth
+    }
+    return true
+}
+
+fn tr_vis_count(t: *mut Tree) -> usize {
+    var m: usize = 0
+    var i: usize = 0
+    while i < (*t).n {
+        if tr_visible(t, i) { m = m + 1 }
+        i = i + 1
+    }
+    return m
+}
+
+// the item of visible row `r` (TR_NONE past the end)
+fn tr_vis_at(t: *mut Tree, r: usize) -> usize {
+    var m: usize = 0
+    var i: usize = 0
+    while i < (*t).n {
+        if tr_visible(t, i) {
+            if m == r { return i }
+            m = m + 1
+        }
+        i = i + 1
+    }
+    return TR_NONE
+}
+
+// the visible row of item `i` (TR_NONE when hidden)
+fn tr_row_of(t: *mut Tree, i: usize) -> usize {
+    if !tr_visible(t, i) { return TR_NONE }
+    var m: usize = 0
+    var k: usize = 0
+    while k < i {
+        if tr_visible(t, k) { m = m + 1 }
+        k = k + 1
+    }
+    return m
+}
+
+fn tr_row_h(c: *mut render.Ctx) -> f64 { return kit.ln(c, 28) }
+
+// how many rows fit into the height h
+fn tr_fit(c: *mut render.Ctx, h: f64) -> usize {
+    let m: f64 = (h - 2.0 * kit.ln(c, 4)) / tr_row_h(c)
+    if m < 1.0 { return 1 }
+    return m as usize
+}
+
+// keep the selected row inside the window of `fit` rows
+fn tr_scroll_to_sel(t: *mut Tree, fit: usize) {
+    if (*t).sel == TR_NONE { return }
+    let r: usize = tr_row_of(t, (*t).sel)
+    if r == TR_NONE { return }
+    if r < (*t).top { (*t).top = r }
+    if fit > 0 && r >= (*t).top + fit { (*t).top = r + 1 - fit }
+}
+
+fn tr_set_open(t: *mut Tree, i: usize, open: bool) -> bool {
+    if i >= (*t).n || !tr_has_kids(t, i) || (*t).item[i].open == open { return false }
+    (*t).item[i].open = open
+    // a selection inside a collapsed branch moves to the branch
+    if !open && (*t).sel != TR_NONE && !tr_visible(t, (*t).sel) { (*t).sel = i }
+    return true
+}
+
+fn tr_select(t: *mut Tree, i: usize, fit: usize) -> bool {
+    if i >= (*t).n || !tr_visible(t, i) || (*t).sel == i { return false }
+    (*t).sel = i
+    tr_scroll_to_sel(t, fit)
+    return true
+}
+
+fn tr_parent(t: *mut Tree, i: usize) -> usize {
+    let d: usize = (*t).item[i].depth
+    if d == 0 { return TR_NONE }
+    var k: usize = i
+    while k > 0 {
+        k = k - 1
+        if (*t).item[k].depth < d { return k }
+    }
+    return TR_NONE
+}
+
+// 0 = not used, 1 = the selection moved, 2 = a branch opened / closed
+fn tr_key(t: *mut Tree, key: u32, fit: usize) -> u32 {
+    if (*t).n == 0 { return 0 as u32 }
+    if (*t).sel == TR_NONE || !tr_visible(t, (*t).sel) { (*t).sel = tr_vis_at(t, 0) }
+    let r: usize = tr_row_of(t, (*t).sel)
+    let rows: usize = tr_vis_count(t)
+    var back: u32 = editor.KEY_LEFT
+    var fwd: u32 = editor.KEY_RIGHT
+    if kit.kit_rtl() {
+        back = editor.KEY_RIGHT
+        fwd = editor.KEY_LEFT
+    }
+    if key == editor.KEY_DOWN && r + 1 < rows {
+        if tr_select(t, tr_vis_at(t, r + 1), fit) { return 1 as u32 }
+    }
+    if key == editor.KEY_UP && r > 0 {
+        if tr_select(t, tr_vis_at(t, r - 1), fit) { return 1 as u32 }
+    }
+    if key == editor.KEY_HOME {
+        if tr_select(t, tr_vis_at(t, 0), fit) { return 1 as u32 }
+    }
+    if key == editor.KEY_END {
+        if tr_select(t, tr_vis_at(t, rows - 1), fit) { return 1 as u32 }
+    }
+    if key == fwd && tr_has_kids(t, (*t).sel) {
+        if !(*t).item[(*t).sel].open {
+            tr_set_open(t, (*t).sel, true)
+            return 2 as u32
+        }
+        if tr_select(t, (*t).sel + 1, fit) { return 1 as u32 }
+    }
+    if key == back {
+        if tr_has_kids(t, (*t).sel) && (*t).item[(*t).sel].open {
+            tr_set_open(t, (*t).sel, false)
+            return 2 as u32
+        }
+        let p: usize = tr_parent(t, (*t).sel)
+        if p != TR_NONE {
+            if tr_select(t, p, fit) { return 1 as u32 }
+        }
+    }
+    return 0 as u32
+}
+
+// the rectangle of visible row `r` (relative to the first shown row)
+fn tr_rect(c: *mut render.Ctx, t: *mut Tree, x: f64, y: f64, w: f64, i: usize, out: *mut [f64; 4]) -> bool {
+    let r: usize = tr_row_of(t, i)
+    if r == TR_NONE || r < (*t).top { return false }
+    (*out)[0] = x + kit.ln(c, 4)
+    (*out)[1] = y + kit.ln(c, 4) + ((r - (*t).top) as f64) * tr_row_h(c)
+    (*out)[2] = w - kit.ln(c, 8)
+    (*out)[3] = tr_row_h(c)
+    return true
+}
+
+fn tr_chev_w(c: *mut render.Ctx) -> f64 { return kit.ln(c, 24) }
+
+fn tr_indent(c: *mut render.Ctx, t: *mut Tree, i: usize) -> f64 {
+    return kit.ln(c, 8) + ((*t).item[i].depth as f64) * kit.ln(c, 16)
+}
+
+// the item under (px, py); `chev` = on its expand arrow. TR_NONE for empty space.
+fn tr_hit(c: *mut render.Ctx, t: *mut Tree, x: f64, y: f64, w: f64, h: f64, px: f64, py: f64, chev: *mut bool) -> usize {
+    *chev = false
+    let fit: usize = tr_fit(c, h)
+    var r: [f64; 4] = [0.0; 4]
+    var k: usize = 0
+    while k < fit {
+        let i: usize = tr_vis_at(t, (*t).top + k)
+        if i == TR_NONE { return TR_NONE }
+        if tr_rect(c, t, x, y, w, i, &r) && px >= r[0] && px < r[0] + r[2] && py >= r[1] && py < r[1] + r[3] {
+            if tr_has_kids(t, i) {
+                var cx: f64 = r[0] + tr_indent(c, t, i)
+                if kit.kit_rtl() { cx = r[0] + r[2] - tr_indent(c, t, i) - tr_chev_w(c) }
+                if px >= cx && px < cx + tr_chev_w(c) { *chev = true }
+            }
+            return i
+        }
+        k = k + 1
+    }
+    return TR_NONE
+}
+
+fn tr_draw(c: *mut render.Ctx, t: *mut Tree, x: f64, y: f64, w: f64, h: f64, hover: usize, focused: bool) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    panel(c, x, y, w, h)
+    let fit: usize = tr_fit(c, h)
+    var r: [f64; 4] = [0.0; 4]
+    var k: usize = 0
+    while k < fit {
+        let i: usize = tr_vis_at(t, (*t).top + k)
+        if i == TR_NONE { break }
+        if tr_rect(c, t, x, y, w, i, &r) {
+            let rr: f64 = kit.ln(c, 6)
+            var fg: u32 = kit.tokc(c, style.TOK_TEXT)
+            var gnd: u32 = style.TOK_SURFACE
+            if i == (*t).sel {
+                painter.round_rect(z, r[0], r[1], r[2], r[3], rr, kit.tokc(c, style.TOK_SELECTION))
+                fg = kit.tokc(c, style.TOK_SELECTION_TEXT)
+                gnd = style.TOK_SELECTION
+            } else if i == hover {
+                painter.round_rect(z, r[0], r[1], r[2], r[3], rr, kit.tokc(c, style.TOK_BUTTON_HOVER))
+            }
+            var cx: f64 = r[0] + tr_indent(c, t, i)
+            if kit.kit_rtl() { cx = r[0] + r[2] - tr_indent(c, t, i) - tr_chev_w(c) }
+            if tr_has_kids(t, i) {
+                var ic: i64 = lucide.CHEVRON_RIGHT
+                if (*t).item[i].open {
+                    ic = lucide.CHEVRON_DOWN
+                } else if kit.kit_rtl() {
+                    ic = lucide.CHEVRON_LEFT
+                }
+                let isz: f64 = kit.ln(c, 12)
+                kit.sym(c, ic, cx + (tr_chev_w(c) - isz) / 2.0, r[1] + (r[3] - isz) / 2.0, isz, fg)
+            }
+            var lx: f64 = cx + tr_chev_w(c)
+            var lw: f64 = r[0] + r[2] - lx - kit.ln(c, 8)
+            if kit.kit_rtl() {
+                lw = cx - r[0] - kit.ln(c, 8)
+                lx = r[0] + kit.ln(c, 8)
+            }
+            kit.label_in(c, lx, r[1], r[3], kit.ln(c, 14), 400, fg, (*t).item[i].label, lw)
+            if focused && i == (*t).sel {
+                kit.focus_ring(c, r[0], r[1], r[2], r[3], rr, gnd)
+            }
+        }
+        k = k + 1
+    }
+}
