@@ -515,12 +515,126 @@ fn ty_of(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, fmap: *
     return ast.NOTHING
 }
 
+// r750 (twin of lambda.rs `bound_method`) -- `try x.m` (x a pointer variable, `m` a method of its
+// struct, no call): the operand `x.m` becomes the closure `gc |a0, ..| x.m(a0, ..)`. The parameter
+// and result types come from the method, so no expected type is needed. The node is changed in
+// place into an `E_LAMBDA` over a new closure function; the type check finds the captured `x`.
+// Anything that is not that shape is left alone (stage 0 reports the errors).
+fn bound_method(b: *mut ast.Tree, it: *mut intern.Interner, fmap: *mut Vec[u32],
+    names: *mut Vec[u32], tys: *mut Vec[u32], ef: *mut err.Error, e: u32) {
+    if ast.e_kind(b, e) != ast.E_FIELD {
+        return
+    }
+    let base: u32 = ast.e_a(b, e)
+    if base == ast.NOTHING || ast.e_kind(b, base) != ast.E_ID {
+        return
+    }
+    let rt_ty: u32 = ty_of(b, it, ef, fmap, names, tys, base)
+    if rt_ty == ast.NOTHING || ast.t_kind(b, rt_ty) != ast.T_PTR {
+        return
+    }
+    let st: u32 = strip_ptr(b, rt_ty)
+    if st == ast.NOTHING || ast.t_kind(b, st) != ast.T_NAME {
+        return
+    }
+    let sn: u32 = ast.t_a(b, st)
+    let mn: u32 = ast.e_b(b, e)
+    if field_type(b, sn, mn) != ast.NOTHING {
+        return
+    }
+    var us: [u8; 2] = "__"
+    var kl: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&kl, intern.intern_ptr(it, sn), intern.intern_length(it, sn))
+    rt.buf_push_bytes(&kl, (&us[0]) as u64, 2)
+    rt.buf_push_bytes(&kl, intern.intern_ptr(it, mn), intern.intern_length(it, mn))
+    let fnm: u32 = intern.intern_number(it, rt.buf_ptr(&kl), rt.buf_len(&kl)) as u32
+    rt.buf_free(&kl)
+    if (fnm as usize) >= vec_len[u32](fmap) || vec_at[u32](fmap, fnm as usize) == NONE {
+        return
+    }
+    let mf: u32 = vec_at[u32](fmap, fnm as usize)
+    let mplen: u32 = ast.fn_plen(b, mf as usize)
+    if mplen == 0 {
+        return
+    }
+    let mpoff: u32 = ast.fn_poff(b, mf as usize)
+    let ret: u32 = ast.fn_ret(b, mf as usize)
+    let pos: u64 = ast.expr_pos(b, e)
+
+    // the closure parameters `__bm_a<i>` (typed like the method's) and the record
+    let poff: u32 = ast.param_start(b)
+    var k: u32 = 1
+    while k < mplen {
+        var pw: [u8; 6] = "__bm_a"
+        kl = rt.buf_new()
+        rt.buf_push_bytes(&kl, (&pw[0]) as u64, 6)
+        rt.buf_push_dec_u64(&kl, (k - 1) as u64)
+        let pnm: u32 = intern.intern_number(it, rt.buf_ptr(&kl), rt.buf_len(&kl)) as u32
+        rt.buf_free(&kl)
+        ast.param_add(b, pnm, ast.param_ty(b, mpoff + k))
+        k = k + 1
+    }
+    var uw: [u8; 2] = "u8"
+    let unr: u32 = intern.intern_number(it, (&uw[0]) as u64, 2) as u32
+    let uty: u32 = ast.ty_new(b, ast.T_NAME, unr, 0)
+    let pty: u32 = ast.ty_new(b, ast.T_PTR, uty, 1)
+    var ew: [u8; 6] = "__env#"
+    let ename: u32 = intern.intern_number(it, (&ew[0]) as u64, 6) as u32
+    ast.param_add(b, ename, pty)
+
+    // the body: `return x.m(a0, ..)` (or just the call when the method has no result)
+    var mw: [u8; 7] = "method "
+    kl = rt.buf_new()
+    rt.buf_push_bytes(&kl, (&mw[0]) as u64, 7)
+    rt.buf_push_bytes(&kl, intern.intern_ptr(it, mn), intern.intern_length(it, mn))
+    let cnm: u32 = intern.intern_number(it, rt.buf_ptr(&kl), rt.buf_len(&kl)) as u32
+    rt.buf_free(&kl)
+    let aoff: u32 = ast.child_start(b)
+    ast.child_add(b, base)
+    k = 1
+    while k < mplen {
+        let ai: u32 = ast.expr_new(b, ast.E_ID, ast.param_name(b, poff + k - 1), 0, 0, 0)
+        ast.expr_pos_set(b, ai, pos)
+        ast.child_add(b, ai)
+        k = k + 1
+    }
+    let call: u32 = ast.expr_new(b, ast.E_CALL, cnm, aoff, mplen, 0)
+    ast.expr_pos_set(b, call, pos)
+    var sk: u32 = ast.S_EXPR
+    if ret != ast.NOTHING {
+        sk = ast.S_RET
+    }
+    let stm: u32 = ast.stmt_new(b, sk, call, 0, 0, 0)
+    ast.stmt_pos_set(b, stm, pos)
+    let soff: u32 = ast.slist_start(b)
+    ast.slist_add(b, stm)
+    let body: u32 = ast.block_new(b, soff, 1)
+    ast.block_end_set(b, body, pos)
+
+    var cw: [u8; 10] = "__closure#"
+    kl = rt.buf_new()
+    rt.buf_push_bytes(&kl, (&cw[0]) as u64, 10)
+    rt.buf_push_dec_u64(&kl, ast.fn_count(b) as u64)
+    let cname: u32 = intern.intern_number(it, rt.buf_ptr(&kl), rt.buf_len(&kl)) as u32
+    rt.buf_free(&kl)
+    ast.fn_add(b, cname, poff, mplen, ret, body, 0, 0, 0, 0, 0, 0, 0)
+    var packed: u64 = 1
+    if ret != ast.NOTHING {
+        packed = packed | ((ret as u64 + 1) << 1)
+    }
+    ast.e_kind_set(b, e, ast.E_LAMBDA)
+    ast.e_a_set(b, e, cname)
+    ast.e_b_set(b, e, poff)
+    ast.e_c_set(b, e, mplen - 1)
+    ast.e_number_set(b, e, packed)
+}
+
 // r742b: every plain call inside the expression `e` (depth first). A call whose callee is a
 // generic function (not in the function table) gets the evident argument types from the
 // environment and may be renamed to an instance by the hook.
 fn calls_in_expr(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, hk: *mut Hk,
     fmap: *mut Vec[u32], names: *mut Vec[u32], tys: *mut Vec[u32], e: u32) {
-    if e == ast.NOTHING || (*hk).gp == 0 {
+    if e == ast.NOTHING {
         return
     }
     let k: u32 = ast.e_kind(b, e)
@@ -553,6 +667,9 @@ fn calls_in_expr(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error,
     } else if k == ast.E_CALL && ast.e_number(b, e) == 0 {
         let off: u32 = ast.e_b(b, e)
         let cnt: u32 = ast.e_c(b, e)
+        if cnt == 1 && err.error_is_tryname(it, ast.e_a(b, e)) {
+            bound_method(b, it, fmap, names, tys, ef, ast.child_at(b, off))
+        }
         var q: u32 = 0
         while q < cnt {
             calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.child_at(b, off + q))
@@ -728,6 +845,13 @@ fn run(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, gp: u64,
                 any = true
                 break
             }
+        }
+        // r750: `try x.m` (bound method value)
+        if ki == ast.E_CALL && ast.e_number(b, i as u32) == 0 && ast.e_c(b, i as u32) == 1
+        && err.error_is_tryname(it, ast.e_a(b, i as u32))
+        && ast.e_kind(b, ast.child_at(b, ast.e_b(b, i as u32))) == ast.E_FIELD {
+            any = true
+            break
         }
         if ki == ast.E_FIELD {
             let bs: u32 = ast.e_a(b, i as u32)

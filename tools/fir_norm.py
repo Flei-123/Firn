@@ -8,15 +8,13 @@ What is normalised (all of it is order or spelling, never behaviour):
   * the function ORDER (firnc0 lowers the root file first, firnc1 the root file last), so functions are sorted by name;
   * the build path in panic messages (firnc0 spells `<exe dir>/../../../lib/..`, firnc1 `lib/..`);
   * the numbering of `@text#N` (assigned in lowering order): renumbered by first use in the sorted text.
-What is IGNORED, named one by one:
-  * `__thread_known`: firnc0 rewrites `ARCH_GET_TCB` to `ARCH_GET_FS` in the lowering (lower.rs retarget_thread_base),
-    firnc1 does that in the code generator.
-  * `__str_tid`: the lowering of the `gc T { .. } catch ..` expression numbers its slots in another order (r767).
+Nothing is ignored any more: r767 (`gc T { .. } catch ..` numbering, slot = the `__val` cell) and r768
+(`ARCH_GET_TCB` -> `ARCH_GET_FS` in the lowering) are the same in firnc1 now.
 """
 import re
 import sys
 
-IGNORED = {"fn @__thread_known", "fn @__str_tid"}
+IGNORED = set()
 
 
 def split(text):

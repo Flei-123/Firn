@@ -236,6 +236,41 @@ fn push(l: *mut Lower, kind: u32, ty: u32, a: u32, b: u32, c: u32, z: u64, aoff:
     return fir.inst_add(&(*l).f, (*l).fi, (*l).cur, kind, ty, a, b, c, z, aoff, alen)
 }
 
+// True when `v` is a constant of the CURRENT block (its value goes to `out`)
+// (lower.rs `retarget_thread_base`, `const_val`: same search, newest first).
+fn block_const_of(l: *mut Lower, v: u32, out: *mut u64) -> bool {
+    let n: u32 = fir.inst_count(&(*l).f, (*l).fi, (*l).cur)
+    var k: u32 = n
+    while k > 0 {
+        k = k - 1
+        let i: u32 = fir.inst_at(&(*l).f, (*l).fi, (*l).cur, k)
+        if fir.i_dst_of(&(*l).f, i) == v {
+            if fir.i_kind_of(&(*l).f, i) == fir.O_CONST {
+                *out = fir.i_number_of(&(*l).f, i)
+                return true
+            }
+            return false
+        }
+    }
+    return false
+}
+
+// r768 (lower.rs `retarget_thread_base`): `arch_prctl(ARCH_GET_TCB, ..)` becomes
+// `ARCH_GET_FS` right in the lowering. firnc1 only builds x86-64 Linux
+// executables with `fs` as the thread register, so that is the one case.
+fn retarget_thread_base(l: *mut Lower, args: *mut Vec[u32]) {
+    if vec_len[u32](args) < 3 {
+        return
+    }
+    var nr: u64 = 0
+    var req: u64 = 0
+    if block_const_of(l, vec_at[u32](args, 0), &nr) && block_const_of(l, vec_at[u32](args, 1), &req) {
+        if nr == 158 && req == 7937 {
+            vec_set[u32](args, 1, constant(l, fir.T_I64, 4099))
+        }
+    }
+}
+
 fn push_void(l: *mut Lower, kind: u32, ty: u32, a: u32, b: u32, c: u32, z: u64, aoff: u32, alen: u32) {
     fir.inst_void_add(&(*l).f, (*l).fi, (*l).cur, kind, ty, a, b, c, z, aoff, alen)
 }
@@ -1621,6 +1656,7 @@ fn value_inner(l: *mut Lower, e: u32) -> u32 {
             }
             k = k + 1
         }
+        retarget_thread_base(l, &tmp)
         let off: u32 = args_store(l, &tmp)
         vec_free[u32](&tmp)
         return push(l, fir.O_SYSCALL, fir.T_I64, 0, 0, 0, 0, off, ast.e_c(b, e))
@@ -1951,10 +1987,11 @@ fn args_store(l: *mut Lower, tmp: *mut Vec[u32]) -> u32 {
 // slow:
 //   p = call __gc_alloc_raw(tid, size)
 //
-// The result travels through a stack cell, not through a phi: FIR has none.
-fn gc_alloc_fast(l: *mut Lower, tid: u64, size: u64) -> u32 {
+// The result travels through `slot`, the `__val` cell of the error union (r767,
+// same as firnc0): FIR has no phi, but a stack cell of its own would stay a
+// conservative root for as long as the function runs.
+fn gc_alloc_fast(l: *mut Lower, tid: u64, size: u64, slot: u32) -> u32 {
     let class: u64 = gc.gc_class_for(size)
-    let slot: u32 = alloca(l, 8, 8)
     let slow_bb: u32 = new_block(l)
     let done_bb: u32 = new_block(l)
     if class < gc.GC_CLASSES {
@@ -1963,18 +2000,18 @@ fn gc_alloc_fast(l: *mut Lower, tid: u64, size: u64) -> u32 {
         let st: u32 = push(l, fir.O_GCADDR, fir.T_PTR, 0, 0, 0, 0, 0, 0)
 
         // S_INIT == 1
+        let one: u32 = constant(l, fir.T_U64, 1)
         let ia: u32 = ptradd_const(l, st, gc.ST_INIT)
         let iv: u32 = load(l, fir.T_U64, ia)
-        let one: u32 = constant(l, fir.T_U64, 1)
         let ic: u32 = push(l, fir.O_CMP, fir.T_BOOL, iv, one, 0, fir.T_U64 as u64, 0, 0)
         let b1: u32 = new_block(l)
         term(l, fir.TERM_BRCOND, ic, b1, slow_bb)
         (*l).cur = b1
 
         // S_MULTI == 0
+        let zero: u32 = constant(l, fir.T_U64, 0)
         let ma: u32 = ptradd_const(l, st, gc.ST_MULTI)
         let mv: u32 = load(l, fir.T_U64, ma)
-        let zero: u32 = constant(l, fir.T_U64, 0)
         let mc: u32 = push(l, fir.O_CMP, fir.T_BOOL, mv, zero, 0, fir.T_U64 as u64, 0, 0)
         let b2: u32 = new_block(l)
         term(l, fir.TERM_BRCOND, mc, b2, slow_bb)
@@ -2039,8 +2076,9 @@ fn gc_alloc_fast(l: *mut Lower, tid: u64, size: u64) -> u32 {
 
         // the three counters
         let stv: u32 = constant(l, fir.T_U64, step)
+        let sa2: u32 = ptradd_const(l, st, gc.ST_SINCE)
         let sn: u32 = push(l, fir.O_BIN, fir.T_U64, sv, stv, 0, 0, 0, 0)
-        store(l, fir.T_U64, sa, sn)
+        store(l, fir.T_U64, sa2, sn)
         let ta: u32 = ptradd_const(l, st, gc.ST_TOTAL)
         let tv0: u32 = load(l, fir.T_U64, ta)
         let tn: u32 = push(l, fir.O_BIN, fir.T_U64, tv0, stv, 0, 0, 0, 0)
@@ -2104,7 +2142,8 @@ fn gc_alloc_lower(l: *mut Lower, e: u32, target: u32) {
     }
     // ROUND ANLEGEWEG: the fast path stands here, folded into constants;
     // the runtime is only reached when the ordinary case does not hold.
-    let p: u32 = gc_alloc_fast(l, gc.gc_tid(gcl(l), ki), gc.gc_size(gcl(l), ki))
+    let vslot: u32 = ptradd_const(l, target, voff)
+    let p: u32 = gc_alloc_fast(l, gc.gc_tid(gcl(l), ki), gc.gc_size(gcl(l), ki), vslot)
     let null: u32 = constant(l, fir.T_PTR, 0)
     // 1 = not equal (in the order of `ast::BinOp`: eq ne lt le gt ge)
     let ok: u32 = push(l, fir.O_CMP, fir.T_BOOL, p, null, 1, fir.T_PTR as u64, 0, 0)
