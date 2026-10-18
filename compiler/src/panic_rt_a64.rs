@@ -305,8 +305,7 @@ pub(crate) fn emit_checked_bin(
         e.line(&format!("mov x11, {}", A));
         e.line(&format!("mov x13, {}", B));
     }
-    // r454: the branch that skips the panic arm when nothing overflowed (the arm is the fall-through): one taken branch
-    // instead of a not-taken `b.<cond> bad` plus an unconditional `b ok`.
+    // The shape `b.<cond> bad` / `b ok` / `bad:` is what cold_checks (codegen_a64) parks out of the hot path.
     let skip: String;
     if bits == 64 && op == BinOp::Mul {
         // 64 bits: the upper half decides. Signed overflow means the high
@@ -317,11 +316,11 @@ pub(crate) fn emit_checked_bin(
             e.line(&format!("smulh {}, {}, {}", U, A, B));
             e.line(&format!("mul {}, {}, {}", A, A, B));
             e.line(&format!("cmp {}, {}, asr #63", U, A));
-            skip = format!("b.eq {}", ok);
+            skip = format!("b.ne {}", bad);
         } else {
             e.line(&format!("umulh {}, {}, {}", U, A, B));
             e.line(&format!("mul {}, {}, {}", A, A, B));
-            skip = format!("cbz {}, {}", U, ok);
+            skip = format!("cbnz {}, {}", U, bad);
         }
     } else if bits == 32 && op == BinOp::Mul {
         // Two 32-bit operands, each already extended to 64: their 64-bit
@@ -330,7 +329,7 @@ pub(crate) fn emit_checked_bin(
         e.line(&format!("mul {}, {}, {}", A, A, B));
         extend_to(e, T, A, ty);
         e.line(&format!("cmp {}, {}", A, T));
-        skip = format!("b.eq {}", ok);
+        skip = format!("b.ne {}", bad);
     } else if bits >= 32 {
         let (aw, bw) = (rw(A, bits), rw(B, bits));
         match op {
@@ -343,13 +342,13 @@ pub(crate) fn emit_checked_bin(
         // when a borrow was needed (C=0) -- x86 answers both with one
         // `jc`, A64 spells the borrow the other way round.
         let cond = if ty.signed() {
-            "vc"
+            "vs"
         } else if op == BinOp::Sub {
-            "cs"
-        } else {
             "cc"
+        } else {
+            "cs"
         };
-        skip = format!("b.{} {}", cond, ok);
+        skip = format!("b.{} {}", cond, bad);
     } else {
         // 8 and 16 bits: A64 has no arithmetic at those widths and
         // therefore no flags for them. Two values that fit into 8 or 16
@@ -369,9 +368,10 @@ pub(crate) fn emit_checked_bin(
         e.line(&format!("sxtw {}, {}", A, wn(A)));
         extend_to(e, T, A, ty);
         e.line(&format!("cmp {}, {}", A, T));
-        skip = format!("b.eq {}", ok);
+        skip = format!("b.ne {}", bad);
     }
     e.line(&skip);
+    e.line(&format!("b {}", ok));
     e.raw(&format!("{}:", bad));
     if recover64 {
         if op == BinOp::Add {
