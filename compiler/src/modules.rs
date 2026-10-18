@@ -631,6 +631,36 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         });
     }
 
+    // Qualified generic calls `m.f[T](..)`: the parser resolved the template
+    // by its program-wide name; here the module and its export list are
+    // checked like for every other `m.item`.
+    for u in crate::sema_generic::qual_uses() {
+        let target = files
+            .iter()
+            .position(|f| f.id == u.file)
+            .and_then(|i| progs[i].imports.iter().find(|im| im.alias == u.alias))
+            .and_then(|im| im.path.last().cloned());
+        let at = target
+            .as_ref()
+            .and_then(|t| files.iter().position(|g| module_name(g) == *t));
+        let Some(at) = at else {
+            dg.error(u.span, format!("module '{}' is not imported", u.alias));
+            continue;
+        };
+        if !crate::sema_generic::file_has_fn_template(files[at].id, &u.name) {
+            dg.error(
+                u.span,
+                format!("module '{}' has no generic function '{}'", u.alias, u.name),
+            );
+        } else if !infos[at].exports.is_empty() && !infos[at].exports.contains(&u.name) {
+            dg.error_note(
+                u.span,
+                format!("'{}' is not exported by module '{}'", u.name, u.alias),
+                "add the name to the 'export' list of the module",
+            );
+        }
+    }
+
     let mut merged = Program::default();
     merged.profile = progs.first().and_then(|p| p.profile.clone());
     merged.expr_count = base_id;

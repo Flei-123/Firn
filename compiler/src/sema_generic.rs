@@ -119,6 +119,36 @@ struct Registry {
     order: Vec<String>,
     /// nesting depth while parsing a template
     in_template: u32,
+    /// qualified generic calls `mod.fn[T](..)`, checked by `modules.rs`
+    qual_uses: Vec<QualUse>,
+}
+
+/// One qualified generic call as written in a source file.
+#[derive(Clone, Debug)]
+pub(crate) struct QualUse {
+    pub(crate) file: u32,
+    pub(crate) alias: String,
+    pub(crate) name: String,
+    pub(crate) span: Span,
+}
+
+pub(crate) fn record_qual_use(u: QualUse) {
+    REG.with(|r| r.borrow_mut().qual_uses.push(u));
+}
+
+pub(crate) fn qual_uses() -> Vec<QualUse> {
+    REG.with(|r| r.borrow().qual_uses.clone())
+}
+
+/// Does file `file` declare a generic function template `name`?
+pub(crate) fn file_has_fn_template(file: u32, name: &str) -> bool {
+    REG.with(|r| {
+        r.borrow()
+            .fns
+            .get(name)
+            .map(|t| t.decl.span.file == file)
+            .unwrap_or(false)
+    })
 }
 
 thread_local! {
@@ -548,6 +578,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Lookahead: at `[`, is the bracket group followed by `(`? Tells a
+    /// generic call `m.f[T](..)` from an index `m.arr[i]`.
+    fn bracket_then_paren(&self) -> bool {
+        if !self.at(&TokKind::LBracket) {
+            return false;
+        }
+        let mut depth = 0i32;
+        let mut i = self.pos;
+        while let Some(t) = self.toks.get(i) {
+            match t.kind {
+                TokKind::LBracket => depth += 1,
+                TokKind::RBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.toks.get(i + 1).map(|t| &t.kind),
+                            Some(TokKind::LParen)
+                        );
+                    }
+                }
+                TokKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn note_inst(&mut self, base: &str, args: Vec<TypeExpr>, span: Span, is_fn: bool) -> String {
         let mangled = mangle(base, &args);
         let is_abstract = REG.with(|r| r.borrow().in_template > 0);
@@ -636,10 +694,38 @@ pub(crate) fn hook_generic_type(p: &mut Parser, name: &str, sp: Span) -> Option<
 
 /// `// HOOK types` in `parser.rs::postfix` — `sum[i32](a, b)`.
 pub(crate) fn hook_generic_call(p: &mut Parser, base: &Expr) -> Option<Expr> {
-    let name = match &base.kind {
-        ExprKind::Ident(n) if is_generic_fn(n) => n.clone(),
+    // `fn[T](..)` or the qualified `mod.fn[T](..)` (the parser reads the
+    // latter as the identifier "mod.fn" when `mod` is an imported module).
+    let (qual, name) = match &base.kind {
+        ExprKind::Ident(n) if is_generic_fn(n) => (None, n.clone()),
+        ExprKind::Ident(n) => match n.split_once('.') {
+            Some((m, f)) if p.modules.contains(m) && p.bracket_then_paren() => {
+                (Some(m.to_string()), f.to_string())
+            }
+            _ => return None,
+        },
+        // `x.f[T](..)` with `x` no module and `f` a generic function name:
+        // a call through something that is not imported.
+        ExprKind::Field(inner, f, _)
+            if is_generic_fn(f) && p.bracket_then_paren() && matches!(inner.kind, ExprKind::Ident(_)) =>
+        {
+            if let ExprKind::Ident(m) = &inner.kind {
+                p.dg.error(inner.span, format!("module '{}' is not imported", m));
+            }
+            (None, f.clone())
+        }
         _ => return None,
     };
+    if let Some(m) = &qual {
+        // The generic names hold program wide; modules.rs checks that the
+        // module really offers the template (and exports it).
+        record_qual_use(QualUse {
+            file: p.file,
+            alias: m.clone(),
+            name: name.clone(),
+            span: base.span,
+        });
+    }
     let args = p.generic_args()?;
     let mangled = p.note_inst(&name, args, base.span, true);
     if !p.at(&TokKind::LParen) {

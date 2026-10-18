@@ -2006,6 +2006,16 @@ With that a generic collection can be written as a library:
 template, and the root file writes `var v: Vec[i32] = vec_neu[i32]()`
 (`tests/640_vec_module.fi`).
 
+**Qualified generic calls (G25, r701).** A generic function of an imported
+module can be called through its module: `vec.push[i32](&v, 3)`. The module
+part is checked (`module 'x' is not imported`, `module 'm' has no generic
+function 'f'`, `'f' is not exported by module 'm'`) and then dropped: generic
+names hold program-wide, so the call is the same as the bare `push[i32](..)`.
+Libraries no longer need to export bare names to stay usable. Not covered:
+`mod.Type[T]` in type or literal position, and generic functions as values.
+Both compilers (firnc0 `sema_generic.rs::hook_generic_call`, firnc1
+`parser.fi` primary identifier). Tests 3970-3974.
+
 #### 14.1.sizeof -- `size_of[T]()` (round 16)
 
 `size_of[T]()` returns the size of a type in **bytes**, determined at compile

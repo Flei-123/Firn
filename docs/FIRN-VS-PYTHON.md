@@ -144,7 +144,7 @@ Effort S <1 day, M 1-3 days, L >3 days. Status `done` = landed on main in this r
 | G22 | P1 | language | `for (i, x) in enumerate(v)` and `for (x, y) in zip(a, b)` DONE (r666, firnc0+firnc1); no comprehension, no general tuple patterns in `for` | comprehension syntax later | M | enumerate/zip **done**; open: comprehensions, `for (a, b) in vec_of_tuples` |
 | G23 | P1 | language | no `Option[T]` (generic enums not possible) | generic enums + `Option[T]` + `?` | L | open |
 | G24 | P1 | language | capturing closures only as `gc fn` (+`try`); timers/sort keys need ctx struct | stack closures for non-escaping use | L | open |
-| G25 | P1 | language | `mod.Type[T]` / `mod.fn[T](..)` do not parse, generic fns are not `fn` values | qualified generics | S-M | open |
+| G25 | P1 | language | `mod.fn[T](..)` works (r701, both compilers, tests 3970-3974); still open: `mod.Type[T]` and generic fns are not `fn` values | qualified generics | S-M | partial |
 | G26 | P1 | language | `main` cannot `try`; `catch | e | return x` rejected | `fn main() -> Err!i32`, `catch return` | M | open |
 | G27 | P1 | language | no `derive(Eq, Debug, Hash, Ord, Clone)`; struct `==` and print missing | derive via comptime/reflection (r23) | L | open |
 | G28 | P1 | language | slicing `s[1..3]`, negative index, `x in a`, `[]T` slice type, `.len()` on arrays | slice type + operators | L | open |
