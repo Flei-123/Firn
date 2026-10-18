@@ -355,7 +355,7 @@ check "no cid tap: no crash so far" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|
 echo "== 7. frame time"
 # scroll the chat and open tabs so that frames are painted, then read the app's own frame lines
 for _ in 1 2 3; do $ADB shell input swipe 540 900 540 1500 150; $ADB shell input swipe 540 1500 540 900 150; done
-tap_word "Board" 1 3; tap_word "Chat" 1 3
+tap_word "Board" 1 3; tap_px 106 $TAB_Y 3 # the Chat tab by place (the word "Chat" also sits in the header pill)
 sleep 7
 FL=$(app_log | grep ' frames: ' | tail -20)
 check "frame lines in the app log" "$(echo "$FL" | grep -c 'n=' | awk '{print ($1>0)?"yes":"no"}')" yes
