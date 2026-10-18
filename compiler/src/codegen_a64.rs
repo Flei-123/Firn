@@ -600,6 +600,17 @@ fn imm12(fr: &Frame, v: Val) -> Option<u64> {
     }
 }
 
+/// r842: a known constant that the BITMASK immediate of `and`/`orr`/`eor` can express at the computing width
+/// (`bits` = 32 or 64). `src/imm12` above explain why this needs the encoding check and not a range check: 0xff and
+/// 0xffffffff are encodable, 3 and 0x5 are not. The pattern is what the register form would have held in its low
+/// `bits` bits, so the result of the instruction is bit for bit the one of the register form.
+fn logical_const(fr: &Frame, v: Val, bits: u32) -> Option<u64> {
+    let c = if let Some(c) = fr.ra.imm(v) { c as i128 } else { *fr.consts.get(&v)? };
+    let pat = if bits >= 64 { c as u64 } else { (c as u64) & 0xffff_ffff };
+    crate::a64enc::logical_imm(pat, bits >= 64)?;
+    Some(pat)
+}
+
 fn dreg(fr: &Frame, d: Val, scratch: &'static str) -> &'static str {
     fr.ra.reg(d).unwrap_or(scratch)
 }
@@ -2306,6 +2317,24 @@ fn emit_bin(
                     return Ok(());
                 }
             }
+            if matches!(op, BinOp::And | BinOp::Or | BinOp::Xor) {
+                // r842: the operation commutes, so the constant may sit on either side.
+                let hit = logical_const(fr, b, bits)
+                    .map(|c| (a, c))
+                    .or_else(|| logical_const(fr, a, bits).map(|c| (b, c)));
+                if let Some((x, c)) = hit {
+                    let rx = src(e, fr, x, A);
+                    let rd = dreg(fr, d, A);
+                    let m = match op {
+                        BinOp::And => "and",
+                        BinOp::Or => "orr",
+                        _ => "eor",
+                    };
+                    e.line(&format!("{} {}, {}, #{}", m, rw(rd, bits), rw(rx, bits), c));
+                    commit(e, fr, d, rd);
+                    return Ok(());
+                }
+            }
             if op == BinOp::Mul {
                 // Multiplying by a power of two is a shift (the low bits are the same).
                 let pow2 = |v: Val| match fr.ra.imm(v) {
@@ -2390,13 +2419,23 @@ fn emit_bin(
             // 8/16-bit type pulls the right bits along. The shift count is
             // taken modulo the width by the hardware — on both machines.
             let ra = src_ext(e, fr, a, ty, bits, A);
-            let rb = src(e, fr, b, B);
-            let rd = dreg(fr, d, A);
             let m = match (op, ty.signed()) {
                 (BinOp::Shl, _) => "lsl",
                 (_, true) => "asr",
                 (_, false) => "lsr",
             };
+            // r842: a constant count is the immediate form (one instruction less). The hardware takes the count
+            // modulo the width in the register form; the immediate form keeps exactly that by reducing it here.
+            let kc = fr.ra.imm(b).map(|c| c as i128).or_else(|| fr.consts.get(&b).copied());
+            if let Some(k) = kc {
+                let rd = dreg(fr, d, A);
+                let k = (k as u64) & (bits as u64 - 1);
+                e.line(&format!("{} {}, {}, #{}", m, rw(rd, bits), rw(ra, bits), k));
+                commit(e, fr, d, rd);
+                return Ok(());
+            }
+            let rb = src(e, fr, b, B);
+            let rd = dreg(fr, d, A);
             e.line(&format!(
                 "{} {}, {}, {}",
                 m,

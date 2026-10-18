@@ -64,6 +64,28 @@ use std::collections::HashMap;
 /// register save of `emit_gc_addr` — see the header.
 pub(crate) const A64_POOL: [&str; 6] = ["x19", "x20", "x21", "x22", "x23", "x24"];
 
+/// r841: the callee-saved registers that are NOT part of the collector's state block. They are handed out ONLY in a
+/// function that is a LEAF in the sense of `is_leaf` (no call, no system call, no `GcAddr`, no atomics, no inline
+/// assembler) and that has a loop. Why that is safe:
+///
+/// * the collector reads x19-x24 at a save point (`emit_gc_addr`), and the world stops only at a safepoint (futex word,
+///   `__thread_safepoint`, cooperative). A leaf has neither, so nothing alive in x25-x28 can ever be missed;
+/// * nothing called by a leaf can clobber them (it calls nothing; the check blocks end in the panic runtime, which
+///   never returns);
+/// * the prologue saves and the epilogue restores every one that is used, so the caller sees them unchanged -- and no
+///   stale pointer is left behind in them for a later collection to find (the "permanent root" finding of `safepoints`).
+///
+/// `FIRN_A64_NO_XPOOL=1` switches it off for bisecting.
+pub(crate) const A64_XPOOL: [&str; 4] = ["x25", "x26", "x27", "x28"];
+
+/// r841: caller-saved registers that a LEAF with a loop may hand out as well (see `A64_XPOOL`). The emitter touches
+/// x0-x8 only in the sequences of calls, system calls, thread creation, `Ret` (x0) and the prologue's move of the incoming
+/// arguments; x15 and x17 it never touches (x16 is `U`, the scratch of the checked multiply, and the frame size for
+/// big frames). The panic blocks read `x9`/`x10` (and write x0-x3 for the runtime call, which never returns).
+/// Consequences: no value of a PARAMETER may live in one of them (the prologue moves the arguments one by one), and
+/// x0/x1 stay out (return value / possible second result). Nothing here needs a save: the caller treats them as clobbered.
+pub(crate) const A64_XCALLER: [&str; 9] = ["x2", "x3", "x4", "x5", "x6", "x7", "x8", "x15", "x17"];
+
 /// ROUND FREG -- the floating point registers handed out: `d8`-`d15`. AAPCS64
 /// keeps the LOW 64 bits of `v8`-`v15` across a call, which is exactly what an
 /// `f64` (or an `f32` in the low half) needs. Like the integer pool there is
@@ -248,9 +270,45 @@ fn needs_frame_slot(f: &Func, v: Val) -> bool {
     f.is_secret(v)
 }
 
+/// A function that never calls anything and never reaches a safepoint -- see `A64_XPOOL`. Whitelist: every operation
+/// the emitter writes as straight code with the scratch registers x9-x14 only. Anything else (calls, system calls,
+/// `GcAddr`, atomics, threads, `CopyMem`, SIMD, MMIO, inline assembler) makes the function a non-leaf.
+fn is_leaf(f: &Func) -> bool {
+    f.blocks.iter().all(|b| {
+        b.insts.iter().all(|i| {
+            matches!(
+                i.op,
+                Op::Const(_)
+                    | Op::Bin(..)
+                    | Op::BinWrapSat { .. }
+                    | Op::Cmp { .. }
+                    | Op::Un(..)
+                    | Op::Cast { .. }
+                    | Op::CheckedBin { .. }
+                    | Op::CheckedDiv { .. }
+                    | Op::CheckedCast { .. }
+                    | Op::CheckedIdx { .. }
+                    | Op::CheckedIdxV { .. }
+                    | Op::Alloca { .. }
+                    | Op::Load { .. }
+                    | Op::Store { .. }
+                    | Op::PtrAdd { .. }
+                    | Op::Select { .. }
+                    | Op::GlobalAddr { .. }
+                    | Op::Copy { .. }
+            )
+        })
+    })
+}
+
 /// The Poletto/Sarkar scan, once for each register class. Returns the register
 /// of every interval (or `None` = stays in the frame) and the registers used.
-fn linear_scan(ivs: &[Iv], pool: &[&'static str]) -> (Vec<Option<&'static str>>, Vec<&'static str>) {
+fn linear_scan(
+    ivs: &[Iv],
+    pool: &[&'static str],
+    param_n: usize,
+    caller_saved: &[&'static str],
+) -> (Vec<Option<&'static str>>, Vec<&'static str>) {
     let mut free: Vec<&'static str> = pool.to_vec();
     let mut active: Vec<(usize, &'static str, usize)> = Vec::new(); // (end, reg, index in ivs)
     let mut got: Vec<Option<&'static str>> = vec![None; ivs.len()];
@@ -266,7 +324,15 @@ fn linear_scan(ivs: &[Iv], pool: &[&'static str]) -> (Vec<Option<&'static str>>,
                 true
             }
         });
-        if let Some(r) = free.pop() {
+        // r841: a parameter must not get a caller-saved register -- the prologue moves the incoming arguments (x0-x7)
+        // one by one and would overwrite a neighbour.
+        let is_param = (ivs[k].val as usize) < param_n;
+        let pick = if is_param {
+            free.iter().rposition(|r| !caller_saved.contains(r))
+        } else {
+            free.len().checked_sub(1)
+        };
+        if let Some(r) = pick.map(|at| free.remove(at)) {
             got[k] = Some(r);
             if !used.contains(&r) {
                 used.push(r);
@@ -279,7 +345,7 @@ fn linear_scan(ivs: &[Iv], pool: &[&'static str]) -> (Vec<Option<&'static str>>,
         // but only if the newcomer is worth more (uses, weighted by loop
         // depth). Otherwise the newcomer goes to the stack.
         if let Some(&(le, lr, li)) = active.last() {
-            if le > ivs[k].end && ivs[k].weight > ivs[li].weight {
+            if le > ivs[k].end && ivs[k].weight > ivs[li].weight && !(is_param && caller_saved.contains(&lr)) {
                 got[li] = None;
                 got[k] = Some(lr);
                 active.pop();
@@ -518,8 +584,24 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
         ra.on = !ra.remat.is_empty();
         return ra;
     }
-    let (got, used) = linear_scan(&ivs, &A64_POOL);
-    let (fgot, fused) = linear_scan(&fivs, &A64_FPOOL);
+    // r841: a leaf with a loop may use x25-x28 as well (see `A64_XPOOL`). They go to the FRONT of the list: the scan
+    // hands out from the back, so the extras are only touched when the six ordinary ones are full.
+    let xpool_on = std::env::var_os("FIRN_A64_NO_XPOOL").is_none()
+        && depth.iter().any(|&d| d > 0)
+        && is_leaf(f);
+    let mut pool: Vec<&'static str> = Vec::new();
+    let mut caller: Vec<&'static str> = Vec::new();
+    if xpool_on {
+        pool.extend(A64_XPOOL.iter().rev().copied());
+    }
+    pool.extend(A64_POOL.iter().copied());
+    if xpool_on && std::env::var_os("FIRN_A64_NO_XCALLER").is_none() {
+        // the end of the list is handed out first: caller-saved registers cost no save and restore
+        caller.extend(A64_XCALLER.iter().rev().copied());
+        pool.extend(caller.iter().copied());
+    }
+    let (got, used) = linear_scan(&ivs, &pool, f.params.len(), &caller);
+    let (fgot, fused) = linear_scan(&fivs, &A64_FPOOL, 0, &[]);
 
     for (k, iv) in ivs.iter().enumerate() {
         if let Some(r) = got[k] {
@@ -540,7 +622,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     if ra.regs.is_empty() && ra.cells.is_empty() && ra.remat.is_empty() && ra.fregs.is_empty() {
         return ra;
     }
-    ra.saved = A64_POOL.iter().copied().filter(|r| used.contains(r)).collect();
+    ra.saved = A64_POOL.iter().chain(A64_XPOOL.iter()).copied().filter(|r| used.contains(r)).collect();
     ra.fsaved = A64_FPOOL.iter().copied().filter(|r| fused.contains(r)).collect();
 
     // ---- the save points -------------------------------------------------
@@ -608,6 +690,10 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
                 None => continue,
             };
             if f.val_types.get(iv.val as usize) != Some(&FTy::Ptr) {
+                continue;
+            }
+            // r841: x25-x28 and the caller-saved extras exist only in a leaf; nothing there is ever scanned.
+            if !A64_POOL.contains(&r) {
                 continue;
             }
             // If the register is needed again right after, the next writer
