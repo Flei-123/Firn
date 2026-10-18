@@ -960,11 +960,93 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     // the same function get two label pairs and two functions never
     // collide -- the same rule (and the same struct) the x86 side uses.
     let mut site = crate::panic_rt::SiteCounter::new(&f.name);
-    for b in &f.blocks {
+    let fusable = fusable_compares(f);
+    for (k, b) in f.blocks.iter().enumerate() {
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
-        emit_block(e, f, &fr, b, &mut site)?;
+        let next = f.blocks.get(k + 1).map(|n| n.id);
+        emit_block(e, f, &fr, b, next, fusable[b.id as usize], &mut site)?;
     }
     Ok(())
+}
+
+/// For every block: does it end in `cmp` + `brcond` on exactly that compare, with the compare result read
+/// nowhere else? Then the flags feed the branch directly (`cmp` + `b.cc`) and the boolean is never built.
+fn fusable_compares(f: &Func) -> Vec<bool> {
+    let mut uses = vec![0u32; f.val_types.len()];
+    let mut buf: Vec<Val> = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            buf.clear();
+            i.op.uses(&mut buf);
+            for u in &buf {
+                if let Some(c) = uses.get_mut(*u as usize) {
+                    *c += 1;
+                }
+            }
+        }
+        let tv = match &b.term {
+            Term::BrCond { cond, .. } => Some(*cond),
+            Term::Switch { val, .. } => Some(*val),
+            Term::Ret(Some(v)) => Some(*v),
+            _ => None,
+        };
+        if let Some(v) = tv {
+            if let Some(c) = uses.get_mut(v as usize) {
+                *c += 1;
+            }
+        }
+    }
+    let mut out = vec![false; f.blocks.len().max(1) + 1];
+    for b in &f.blocks {
+        if let (Some(last), Term::BrCond { cond, .. }) = (b.insts.last(), &b.term) {
+            if let (Op::Cmp { ty, .. }, Some(d)) = (&last.op, last.dst) {
+                // a vector compare does not exist here, but stay on the safe side
+                if d == *cond
+                    && uses.get(d as usize) == Some(&1)
+                    && *ty != FTy::V128
+                    && !f.is_secret(d)
+                    && (b.id as usize) < out.len()
+                {
+                    out[b.id as usize] = true;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The condition code that is the exact logical negation of `cc` (valid for floats with NaN as well: it
+/// negates the FLAG predicate, not the arithmetic relation).
+fn inv_cc(cc: &str) -> &'static str {
+    match cc {
+        "eq" => "ne",
+        "ne" => "eq",
+        "hs" => "lo",
+        "lo" => "hs",
+        "mi" => "pl",
+        "pl" => "mi",
+        "vs" => "vc",
+        "vc" => "vs",
+        "hi" => "ls",
+        "ls" => "hi",
+        "ge" => "lt",
+        "lt" => "ge",
+        "gt" => "le",
+        _ => "gt", // "le"
+    }
+}
+
+/// A conditional branch on `cc` with the two targets of a `brcond`; the target that is the next block in
+/// the output is not branched to.
+fn cond_branch(e: &mut Emitter, f: &Func, cc: &str, then_bb: u32, else_bb: u32, next: Option<u32>) {
+    if Some(else_bb) == next {
+        e.line(&format!("b.{} {}", cc, block_label(&f.name, then_bb)));
+    } else if Some(then_bb) == next {
+        e.line(&format!("b.{} {}", inv_cc(cc), block_label(&f.name, else_bb)));
+    } else {
+        e.line(&format!("b.{} {}", cc, block_label(&f.name, then_bb)));
+        e.line(&format!("b {}", block_label(&f.name, else_bb)));
+    }
 }
 
 fn emit_epilogue(e: &mut Emitter, fr: &Frame) {
@@ -993,11 +1075,21 @@ fn emit_block(
     f: &Func,
     fr: &Frame,
     b: &Block,
+    next: Option<u32>,
+    fused: bool,
     site: &mut crate::panic_rt::SiteCounter,
 ) -> Result<(), String> {
     let bi = b.id as usize;
+    let mut fused_cc: Option<&'static str> = None;
     for (ii, i) in b.insts.iter().enumerate() {
-        emit_inst(e, f, fr, i, site)?;
+        if fused && ii + 1 == b.insts.len() {
+            // the compare feeds the branch of this block: flags only, no boolean
+            if let Op::Cmp { op, ty: oty, a, b: rb } = &i.op {
+                fused_cc = Some(emit_cmp_flags(e, fr, *op, *oty, *a, *rb));
+            }
+        } else {
+            emit_inst(e, f, fr, i, site)?;
+        }
         // Round BILLIG: a POINTER died here. The collector's scan is
         // conservative; a dead pointer in a callee-saved register keeps its
         // whole tree alive -- and the prologue of every called function also
@@ -1008,8 +1100,15 @@ fn emit_block(
         }
     }
     match &b.term {
-        Term::Br(t) => e.line(&format!("b {}", block_label(&f.name, *t))),
+        Term::Br(t) => {
+            if Some(*t) != next {
+                e.line(&format!("b {}", block_label(&f.name, *t)))
+            }
+        }
         Term::Switch { .. } => emit_switch(e, f, fr, &b.term)?,
+        Term::BrCond { then_bb, else_bb, .. } if fused_cc.is_some() => {
+            cond_branch(e, f, fused_cc.unwrap_or("ne"), *then_bb, *else_bb, next);
+        }
         Term::BrCond { cond, then_bb, else_bb } => {
             // SPEC §9.2 — the same rule as on x86: inside `#[constant_time]`
             // no conditional branch may depend on a secret value.
@@ -1028,8 +1127,14 @@ fn emit_block(
                 ));
             }
             load_zx(e, fr, A, *cond, 8);
-            e.line(&format!("cbnz {}, {}", w(A), block_label(&f.name, *then_bb)));
-            e.line(&format!("b {}", block_label(&f.name, *else_bb)));
+            if Some(*then_bb) == next {
+                e.line(&format!("cbz {}, {}", w(A), block_label(&f.name, *else_bb)));
+            } else {
+                e.line(&format!("cbnz {}, {}", w(A), block_label(&f.name, *then_bb)));
+                if Some(*else_bb) != next {
+                    e.line(&format!("b {}", block_label(&f.name, *else_bb)));
+                }
+            }
         }
         Term::Ret(v) => {
             if let Some(v) = v {
@@ -1138,6 +1243,55 @@ fn emit_switch(e: &mut Emitter, f: &Func, fr: &Frame, term: &Term) -> Result<(),
 
 // -------------------------------------------------------------- instructions
 
+/// Emits the comparison (flags only) and returns the condition code that holds when `a op b` is true.
+fn emit_cmp_flags(e: &mut Emitter, fr: &Frame, op: CmpOp, oty: FTy, a: Val, b: Val) -> &'static str {
+    if oty.is_float() {
+        // `fcmp` sets N/Z/C/V so that the UNORDERED case (NaN) is
+        // C=1, V=1, N=0, Z=0. With that, `mi`, `gt`, `ls`, `ge` and
+        // `eq` are all false and `ne` is true -- exactly what
+        // IEEE-754 demands, without a single extra instruction.
+        let single = oty == FTy::F32;
+        load_fp(e, fr, "d0", a, single);
+        load_fp(e, fr, "d1", b, single);
+        if single {
+            e.line("fcmp s0, s1");
+        } else {
+            e.line("fcmp d0, d1");
+        }
+        return match op {
+            CmpOp::Eq => "eq",
+            CmpOp::Ne => "ne",
+            CmpOp::Lt => "mi",
+            CmpOp::Le => "ls",
+            CmpOp::Gt => "gt",
+            CmpOp::Ge => "ge",
+        };
+    }
+    let bits = if oty.bits() > 32 { 64 } else { 32 };
+    let ra = src_ext(e, fr, a, oty, bits, A);
+    // `cmp_imm` already knows every form A64 has for a comparison
+    // against a number, including the negative one over `cmn`.
+    match fr.ra.imm(b) {
+        Some(c) if oty.bits().max(8) >= bits => cmp_imm(e, ra, bits, c),
+        _ => {
+            let rb = src_ext(e, fr, b, oty, bits, B);
+            e.line(&format!("cmp {}, {}", rw(ra, bits), rw(rb, bits)));
+        }
+    }
+    match (op, oty.signed()) {
+        (CmpOp::Eq, _) => "eq",
+        (CmpOp::Ne, _) => "ne",
+        (CmpOp::Lt, true) => "lt",
+        (CmpOp::Lt, false) => "lo",
+        (CmpOp::Le, true) => "le",
+        (CmpOp::Le, false) => "ls",
+        (CmpOp::Gt, true) => "gt",
+        (CmpOp::Gt, false) => "hi",
+        (CmpOp::Ge, true) => "ge",
+        (CmpOp::Ge, false) => "hs",
+    }
+}
+
 fn emit_inst(
     e: &mut Emitter,
     f: &Func,
@@ -1167,56 +1321,7 @@ fn emit_inst(
         }
         Op::Cmp { op, ty: oty, a, b } => {
             let d = i.dst.ok_or("internal error: comparison without target")?;
-            if oty.is_float() {
-                // `fcmp` sets N/Z/C/V so that the UNORDERED case (NaN) is
-                // C=1, V=1, N=0, Z=0. With that, `mi`, `gt`, `ls`, `ge` and
-                // `eq` are all false and `ne` is true — exactly what
-                // IEEE-754 demands, without a single extra instruction.
-                // On x86 the same result needs the parity flag and a swap of
-                // the operands; that is the whole difference.
-                let single = *oty == FTy::F32;
-                load_fp(e, fr, "d0", *a, single);
-                load_fp(e, fr, "d1", *b, single);
-                if single {
-                    e.line("fcmp s0, s1");
-                } else {
-                    e.line("fcmp d0, d1");
-                }
-                let cc = match op {
-                    CmpOp::Eq => "eq",
-                    CmpOp::Ne => "ne",
-                    CmpOp::Lt => "mi",
-                    CmpOp::Le => "ls",
-                    CmpOp::Gt => "gt",
-                    CmpOp::Ge => "ge",
-                };
-                e.line(&format!("cset {}, {}", w(A), cc));
-                store_dst(e, fr, d, A);
-                return Ok(());
-            }
-            let bits = if oty.bits() > 32 { 64 } else { 32 };
-            let ra = src_ext(e, fr, *a, *oty, bits, A);
-            // `cmp_imm` already knows every form A64 has for a comparison
-            // against a number, including the negative one over `cmn`.
-            match fr.ra.imm(*b) {
-                Some(c) if oty.bits().max(8) >= bits => cmp_imm(e, ra, bits, c),
-                _ => {
-                    let rb = src_ext(e, fr, *b, *oty, bits, B);
-                    e.line(&format!("cmp {}, {}", rw(ra, bits), rw(rb, bits)));
-                }
-            }
-            let cc = match (op, oty.signed()) {
-                (CmpOp::Eq, _) => "eq",
-                (CmpOp::Ne, _) => "ne",
-                (CmpOp::Lt, true) => "lt",
-                (CmpOp::Lt, false) => "lo",
-                (CmpOp::Le, true) => "le",
-                (CmpOp::Le, false) => "ls",
-                (CmpOp::Gt, true) => "gt",
-                (CmpOp::Gt, false) => "hi",
-                (CmpOp::Ge, true) => "ge",
-                (CmpOp::Ge, false) => "hs",
-            };
+            let cc = emit_cmp_flags(e, fr, *op, *oty, *a, *b);
             let rd = dreg(fr, d, A);
             e.line(&format!("cset {}, {}", w(rd), cc));
             commit(e, fr, d, rd);
