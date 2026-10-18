@@ -47,7 +47,7 @@ import gc
 import iface
 import core
 
-export { Lower, low_new, low_free, low_run, low_error, low_fir, low_unsuitable,
+export { Lower, low_new, low_free, low_run, low_one, low_error, low_fir, low_unsuitable,
     low_mu_set, low_fe_set, low_gc_set, low_if_set, low_checked_set }
 
 const NONE: u32 = 4294967295
@@ -4428,215 +4428,224 @@ fn catch_slot(l: *mut Lower, e: u32) -> u32 {
     return slot
 }
 
+// Lowers source function `i` into the FIR (appends one function; an extern
+// fn adds nothing). Sets `unsuitable` when the function cannot be lowered.
+fn low_one(l: *mut Lower, i: usize) {
+    let b: *mut ast.Tree = tree(l)
+    // **Round 75** (SPEC 14.5) -- `extern fn` has no Firn body: there
+    // is nothing to lower to FIR. Its signature is still registered by
+    // `sema` (so every CALLER of it type-checks normally); codegen
+    // resolves the call name through the extern/link tables instead of
+    // expecting a `fir.Func` with this name to exist.
+    if ast.fn_extern(b, i) != 0 {
+        return
+    }
+    let rt2: u32 = types.ret_ty_the_func(tf(l), i)
+    let ret_agg: bool = is_aggregate(l, rt2)
+    let sret: bool = abi_sret(l, rt2)
+    // FIR return type: aggregates through the hidden pointer, otherwise
+    // one word in `rax`.
+    var rf: u32 = 0
+    if ret_agg {
+        if sret {
+            rf = fir.T_PTR
+        } else {
+            // ROUND 71: `rax`, or `xmm0` for an SSE eightbyte.
+            rf = word_fty(l, rt2, 0)
+        }
+    } else {
+        rf = fty(l, rt2)
+        if rf == fir.NONE {
+            give_up(l)
+            return
+        }
+    }
+    // FIR parameters from the calling convention.
+    let poff: u32 = vec_len[u32](&(*l).f.p_ty) as u32
+    if sret {
+        vec_push[u32](&(*l).f.p_ty, fir.T_PTR)
+    }
+    // Kind per source parameter: >=0 number of words | NONE pointer | else scalar
+    var kind: Vec[u32] = vec_new[u32]()
+    var k: u32 = 0
+    while k < ast.fn_plen(b, i) {
+        let pt: u32 = types.param_ty_resolved(tf(l), i, k)
+        if is_aggregate(l, pt) {
+            let kl: u32 = abi_class(l, pt)
+            if kl != fir.NONE {
+                var w: u32 = 0
+                while w < kl {
+                    // ROUND 71: the class per eightbyte, exactly as at
+                    // the call site.
+                    vec_push[u32](&(*l).f.p_ty, word_fty(l, pt, w as u64))
+                    w = w + 1
+                }
+                vec_push[u32](&kind, kl)
+            } else {
+                vec_push[u32](&(*l).f.p_ty, fir.T_PTR)
+                vec_push[u32](&kind, NONE)
+            }
+        } else {
+            let pf: u32 = fty(l, pt)
+            if pf == fir.NONE || pf == fir.T_VOID {
+                give_up(l)
+                vec_free[u32](&kind)
+                return
+            }
+            vec_push[u32](&(*l).f.p_ty, pf)
+            vec_push[u32](&kind, NONE - 1)
+        }
+        k = k + 1
+    }
+    let plen: u32 = vec_len[u32](&(*l).f.p_ty) as u32 - poff
+    (*l).fi = fir.fn_new(&(*l).f, ast.fn_name(b, i), rf, poff, plen)
+    // ROUND 52 (core.rs): `#[interrupt]` -- calling convention of its own.
+    if ast.fn_int(b, i) != 0 {
+        fir.f_int_set(&(*l).f, (*l).fi, 1)
+    }
+    (*l).cur = 0
+    (*l).sret = NONE
+    var next: u32 = 0
+    if sret {
+        (*l).sret = fir.param_value(&(*l).f, (*l).fi, 0)
+        next = 1
+    }
+    range_on(l)
+    // ROUND OWN-3: the parameters that own a value with a `drop`.
+    var pdr_slot: Vec[u32] = vec_new[u32]()
+    var pdr_ty: Vec[u32] = vec_new[u32]()
+    // Parameters get a slot and are stored in the entry block.
+    k = 0
+    while k < ast.fn_plen(b, i) {
+        let pt: u32 = types.param_ty_resolved(tf(l), i, k)
+        let ak: u32 = vec_at[u32](&kind, k as usize)
+        let pname: u32 = ast.param_name(b, ast.fn_poff(b, i) + k)
+        let owns: bool = sema.sema_needs_drop(sm(l), pt)
+        if ak == NONE - 1 {
+            let pf: u32 = vec_at[u32](&(*l).f.p_ty, (poff + next) as usize)
+            var by: u64 = fir.fty_bytes(pf)
+            if by < 1 { by = 1 }
+            let slot: u32 = alloca(l, by, by)
+            store(l, pf, slot, fir.param_value(&(*l).f, (*l).fi, next))
+            next = next + 1
+            create_ty(l, pname, slot, pt)
+        } else if ak == NONE {
+            // The caller has already made a copy; its address
+            // IS the parameter slot.
+            let pv: u32 = fir.param_value(&(*l).f, (*l).fi, next)
+            if owns {
+                // ROUND OWN-3: the callee owns it and destroys it.
+                create_ty(l, pname, pv, pt)
+                vec_push[u32](&pdr_slot, pv)
+                vec_push[u32](&pdr_ty, pt)
+            } else {
+                create(l, pname, pv)
+            }
+            next = next + 1
+        } else {
+            // The slot is padded to whole words, so that the
+            // stores stay completely inside the object.
+            var gr: u64 = q_size(l, pt)
+            if gr < ak as u64 * 8 {
+                gr = ak as u64 * 8
+            }
+            var au: u64 = q_align(l, pt)
+            if au < 8 {
+                au = 8
+            }
+            let slot: u32 = alloca(l, gr, au)
+            var w: u32 = 0
+            while w < ak {
+                let a2: u32 = ptradd_const(l, slot, w as u64 * 8)
+                store(l, fir.T_I64, a2, fir.param_value(&(*l).f, (*l).fi, next + w))
+                w = w + 1
+            }
+            next = next + ak
+            if owns {
+                create_ty(l, pname, slot, pt)
+                vec_push[u32](&pdr_slot, slot)
+                vec_push[u32](&pdr_ty, pt)
+            } else {
+                create(l, pname, slot)
+            }
+        }
+        k = k + 1
+    }
+    vec_free[u32](&kind)
+    // HOOK fnval: inside a closure body the captured values are
+    // ordinary names -- they lie in the record, which arrived as the
+    // last parameter (fnval.rs, round 58).
+    let ci2: u32 = sema.sema_closure_index(sm(l), ast.fn_name(b, i))
+    if ci2 != NONE {
+        var ew2: [u8; 6] = "__env#"
+        let enr: u32 = intern.intern_number(names(l), (&ew2[0]) as u64, 6) as u32
+        let eslot: u32 = search(l, enr)
+        if eslot == NONE {
+            give_up(l)
+            return
+        }
+        let env: u32 = load(l, fir.T_PTR, eslot)
+        var ck2: u32 = 0
+        while ck2 < sema.sema_closure_caps(sm(l), ci2) {
+            let ca: u32 = ptradd_const(l, env, 8 + ck2 as u64 * 8)
+            create_ty(l, sema.sema_capture_name(sm(l), ci2, ck2), ca,
+                sema.sema_capture_ty(sm(l), ci2, ck2))
+            ck2 = ck2 + 1
+        }
+    }
+    let has_pdr: bool = vec_len[u32](&pdr_slot) > 0
+    if has_pdr {
+        defer_level_on(l)
+        var pk: usize = 0
+        while pk < vec_len[u32](&pdr_slot) {
+            drop_push(l, vec_at[u32](&pdr_slot, pk), vec_at[u32](&pdr_ty, pk))
+            pk = pk + 1
+        }
+    }
+    vec_free[u32](&pdr_slot)
+    vec_free[u32](&pdr_ty)
+    block(l, ast.fn_body(b, i))
+    if has_pdr {
+        if !terminated(l) {
+            // falling off the end: the parameters die here
+            defer_level_off(l)
+        } else {
+            // the level is only left, nothing runs (everything that
+            // left earlier has run its drops already)
+            let lim: u32 = vec_last[u32](&(*l).d_limit)
+            vec_pop[u32](&(*l).d_limit)
+            vec_shorten[u32](&(*l).d_stmt, lim as usize)
+            vec_shorten[u32](&(*l).d_err, lim as usize)
+        }
+    }
+    range_off(l)
+    vec_clear[u32](&(*l).ms)
+    if (*l).unsuitable {
+        return
+    }
+    // Close the open (unreachable) blocks.
+    var bb: u32 = 0
+    while bb < fir.block_count(&(*l).f, (*l).fi) {
+        if !fir.is_terminated(&(*l).f, (*l).fi, bb) {
+            (*l).cur = bb
+            if rf == fir.T_VOID {
+                term(l, fir.TERM_RET, NONE, 0, 0)
+            } else {
+                let v: u32 = constant(l, rf, 0)
+                term(l, fir.TERM_RET, v, 0, 0)
+            }
+        }
+        bb = bb + 1
+    }
+}
+
 fn low_run(l: *mut Lower) {
     let b: *mut ast.Tree = tree(l)
     var i: usize = 0
     while i < ast.fn_count(b) {
-        // **Round 75** (SPEC 14.5) -- `extern fn` has no Firn body: there
-        // is nothing to lower to FIR. Its signature is still registered by
-        // `sema` (so every CALLER of it type-checks normally); codegen
-        // resolves the call name through the extern/link tables instead of
-        // expecting a `fir.Func` with this name to exist.
-        if ast.fn_extern(b, i) != 0 {
-            i = i + 1
-            continue
-        }
-        let rt2: u32 = types.ret_ty_the_func(tf(l), i)
-        let ret_agg: bool = is_aggregate(l, rt2)
-        let sret: bool = abi_sret(l, rt2)
-        // FIR return type: aggregates through the hidden pointer, otherwise
-        // one word in `rax`.
-        var rf: u32 = 0
-        if ret_agg {
-            if sret {
-                rf = fir.T_PTR
-            } else {
-                // ROUND 71: `rax`, or `xmm0` for an SSE eightbyte.
-                rf = word_fty(l, rt2, 0)
-            }
-        } else {
-            rf = fty(l, rt2)
-            if rf == fir.NONE {
-                give_up(l)
-                return
-            }
-        }
-        // FIR parameters from the calling convention.
-        let poff: u32 = vec_len[u32](&(*l).f.p_ty) as u32
-        if sret {
-            vec_push[u32](&(*l).f.p_ty, fir.T_PTR)
-        }
-        // Kind per source parameter: >=0 number of words | NONE pointer | else scalar
-        var kind: Vec[u32] = vec_new[u32]()
-        var k: u32 = 0
-        while k < ast.fn_plen(b, i) {
-            let pt: u32 = types.param_ty_resolved(tf(l), i, k)
-            if is_aggregate(l, pt) {
-                let kl: u32 = abi_class(l, pt)
-                if kl != fir.NONE {
-                    var w: u32 = 0
-                    while w < kl {
-                        // ROUND 71: the class per eightbyte, exactly as at
-                        // the call site.
-                        vec_push[u32](&(*l).f.p_ty, word_fty(l, pt, w as u64))
-                        w = w + 1
-                    }
-                    vec_push[u32](&kind, kl)
-                } else {
-                    vec_push[u32](&(*l).f.p_ty, fir.T_PTR)
-                    vec_push[u32](&kind, NONE)
-                }
-            } else {
-                let pf: u32 = fty(l, pt)
-                if pf == fir.NONE || pf == fir.T_VOID {
-                    give_up(l)
-                    vec_free[u32](&kind)
-                    return
-                }
-                vec_push[u32](&(*l).f.p_ty, pf)
-                vec_push[u32](&kind, NONE - 1)
-            }
-            k = k + 1
-        }
-        let plen: u32 = vec_len[u32](&(*l).f.p_ty) as u32 - poff
-        (*l).fi = fir.fn_new(&(*l).f, ast.fn_name(b, i), rf, poff, plen)
-        // ROUND 52 (core.rs): `#[interrupt]` -- calling convention of its own.
-        if ast.fn_int(b, i) != 0 {
-            fir.f_int_set(&(*l).f, (*l).fi, 1)
-        }
-        (*l).cur = 0
-        (*l).sret = NONE
-        var next: u32 = 0
-        if sret {
-            (*l).sret = fir.param_value(&(*l).f, (*l).fi, 0)
-            next = 1
-        }
-        range_on(l)
-        // ROUND OWN-3: the parameters that own a value with a `drop`.
-        var pdr_slot: Vec[u32] = vec_new[u32]()
-        var pdr_ty: Vec[u32] = vec_new[u32]()
-        // Parameters get a slot and are stored in the entry block.
-        k = 0
-        while k < ast.fn_plen(b, i) {
-            let pt: u32 = types.param_ty_resolved(tf(l), i, k)
-            let ak: u32 = vec_at[u32](&kind, k as usize)
-            let pname: u32 = ast.param_name(b, ast.fn_poff(b, i) + k)
-            let owns: bool = sema.sema_needs_drop(sm(l), pt)
-            if ak == NONE - 1 {
-                let pf: u32 = vec_at[u32](&(*l).f.p_ty, (poff + next) as usize)
-                var by: u64 = fir.fty_bytes(pf)
-                if by < 1 { by = 1 }
-                let slot: u32 = alloca(l, by, by)
-                store(l, pf, slot, fir.param_value(&(*l).f, (*l).fi, next))
-                next = next + 1
-                create_ty(l, pname, slot, pt)
-            } else if ak == NONE {
-                // The caller has already made a copy; its address
-                // IS the parameter slot.
-                let pv: u32 = fir.param_value(&(*l).f, (*l).fi, next)
-                if owns {
-                    // ROUND OWN-3: the callee owns it and destroys it.
-                    create_ty(l, pname, pv, pt)
-                    vec_push[u32](&pdr_slot, pv)
-                    vec_push[u32](&pdr_ty, pt)
-                } else {
-                    create(l, pname, pv)
-                }
-                next = next + 1
-            } else {
-                // The slot is padded to whole words, so that the
-                // stores stay completely inside the object.
-                var gr: u64 = q_size(l, pt)
-                if gr < ak as u64 * 8 {
-                    gr = ak as u64 * 8
-                }
-                var au: u64 = q_align(l, pt)
-                if au < 8 {
-                    au = 8
-                }
-                let slot: u32 = alloca(l, gr, au)
-                var w: u32 = 0
-                while w < ak {
-                    let a2: u32 = ptradd_const(l, slot, w as u64 * 8)
-                    store(l, fir.T_I64, a2, fir.param_value(&(*l).f, (*l).fi, next + w))
-                    w = w + 1
-                }
-                next = next + ak
-                if owns {
-                    create_ty(l, pname, slot, pt)
-                    vec_push[u32](&pdr_slot, slot)
-                    vec_push[u32](&pdr_ty, pt)
-                } else {
-                    create(l, pname, slot)
-                }
-            }
-            k = k + 1
-        }
-        vec_free[u32](&kind)
-        // HOOK fnval: inside a closure body the captured values are
-        // ordinary names -- they lie in the record, which arrived as the
-        // last parameter (fnval.rs, round 58).
-        let ci2: u32 = sema.sema_closure_index(sm(l), ast.fn_name(b, i))
-        if ci2 != NONE {
-            var ew2: [u8; 6] = "__env#"
-            let enr: u32 = intern.intern_number(names(l), (&ew2[0]) as u64, 6) as u32
-            let eslot: u32 = search(l, enr)
-            if eslot == NONE {
-                give_up(l)
-                return
-            }
-            let env: u32 = load(l, fir.T_PTR, eslot)
-            var ck2: u32 = 0
-            while ck2 < sema.sema_closure_caps(sm(l), ci2) {
-                let ca: u32 = ptradd_const(l, env, 8 + ck2 as u64 * 8)
-                create_ty(l, sema.sema_capture_name(sm(l), ci2, ck2), ca,
-                    sema.sema_capture_ty(sm(l), ci2, ck2))
-                ck2 = ck2 + 1
-            }
-        }
-        let has_pdr: bool = vec_len[u32](&pdr_slot) > 0
-        if has_pdr {
-            defer_level_on(l)
-            var pk: usize = 0
-            while pk < vec_len[u32](&pdr_slot) {
-                drop_push(l, vec_at[u32](&pdr_slot, pk), vec_at[u32](&pdr_ty, pk))
-                pk = pk + 1
-            }
-        }
-        vec_free[u32](&pdr_slot)
-        vec_free[u32](&pdr_ty)
-        block(l, ast.fn_body(b, i))
-        if has_pdr {
-            if !terminated(l) {
-                // falling off the end: the parameters die here
-                defer_level_off(l)
-            } else {
-                // the level is only left, nothing runs (everything that
-                // left earlier has run its drops already)
-                let lim: u32 = vec_last[u32](&(*l).d_limit)
-                vec_pop[u32](&(*l).d_limit)
-                vec_shorten[u32](&(*l).d_stmt, lim as usize)
-                vec_shorten[u32](&(*l).d_err, lim as usize)
-            }
-        }
-        range_off(l)
-        vec_clear[u32](&(*l).ms)
+        low_one(l, i)
         if (*l).unsuitable {
             return
-        }
-        // Close the open (unreachable) blocks.
-        var bb: u32 = 0
-        while bb < fir.block_count(&(*l).f, (*l).fi) {
-            if !fir.is_terminated(&(*l).f, (*l).fi, bb) {
-                (*l).cur = bb
-                if rf == fir.T_VOID {
-                    term(l, fir.TERM_RET, NONE, 0, 0)
-                } else {
-                    let v: u32 = constant(l, rf, 0)
-                    term(l, fir.TERM_RET, v, 0, 0)
-                }
-            }
-            bb = bb + 1
         }
         i = i + 1
     }
