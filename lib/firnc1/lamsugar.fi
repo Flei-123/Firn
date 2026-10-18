@@ -30,12 +30,18 @@ import intern
 import ast
 import err
 
-export { run, ty_same, Hk, declared_anywhere, declared_fn_var, CALL_MODE }
+export { run, ty_same, Hk, declared_anywhere, declared_fn_var, CALL_MODE, COLL_MODE, COLL_NEW_MODE }
 
 const NONE: u32 = 4294967295
 // r742b: `hook(gp, call_node, CALL_MODE)` = infer the type arguments of the generic callee
 // of this `E_CALL` from its value arguments (`apply_g(id, 4)`).
 const CALL_MODE: u32 = 4294967294
+// r751: untyped comprehension. `hook(gp, add_call, COLL_MODE, io)` (io = Vec[u32]: [element type node,
+// out: 1 when a new instance came up]) names the instances `Vec[T]` / `Dict[T]` / `Set[T]`, renames the
+// `__coll_add_*` call and returns the instance NAME (NONE: not possible). `COLL_NEW_MODE` renames the
+// `__coll_new_*` call of the hidden variable (extra = the instance name).
+const COLL_MODE: u32 = 4294967293
+const COLL_NEW_MODE: u32 = 4294967292
 
 // r742: the generic-function hook. `hook(gp, node, expected)` is implemented by
 // mono.fi (`gen_infer_value`): node is an `E_ID` naming a generic function and
@@ -45,6 +51,16 @@ const CALL_MODE: u32 = 4294967294
 struct Hk {
     gp: u64,
     hook: fn(u64, u32, u32, u64) -> u32,
+    coll_pending: u32,
+    coll_grew: u32,
+}
+
+fn use_coll_hook(hk: *mut Hk, node: u32, mode: u32, extra: u64) -> u32 {
+    if (*hk).gp == 0 {
+        return NONE
+    }
+    let f: fn(u64, u32, u32, u64) -> u32 = (*hk).hook
+    return f((*hk).gp, node, mode, extra)
 }
 
 fn use_hook(hk: *mut Hk, b: *mut ast.Tree, node: u32, pt: u32) -> u32 {
@@ -515,6 +531,223 @@ fn ty_of(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, fmap: *
     return ast.NOTHING
 }
 
+// ---------------------------------------------------------------- r751
+// Untyped comprehension `let x = [e for ..]` (twin of lambda.rs `val_ty` / `coll_push`): the parser
+// stores a hidden variable of the marker type `__infer_coll` and pushes through `__coll_add_*`;
+// the element type is derived here from what is evident, the instances are named by mono.fi.
+
+// 0 = i32, 1 = f64, 2 = f32, 3 = bool, 4 = str
+fn named_ty(b: *mut ast.Tree, it: *mut intern.Interner, which: u32) -> u32 {
+    if which == 0 {
+        var w0: [u8; 3] = "i32"
+        return ast.ty_new(b, ast.T_NAME, intern.intern_number(it, (&w0[0]) as u64, 3) as u32, 0)
+    }
+    if which == 1 {
+        var w1: [u8; 3] = "f64"
+        return ast.ty_new(b, ast.T_NAME, intern.intern_number(it, (&w1[0]) as u64, 3) as u32, 0)
+    }
+    if which == 2 {
+        var w2: [u8; 3] = "f32"
+        return ast.ty_new(b, ast.T_NAME, intern.intern_number(it, (&w2[0]) as u64, 3) as u32, 0)
+    }
+    if which == 3 {
+        var w3: [u8; 4] = "bool"
+        return ast.ty_new(b, ast.T_NAME, intern.intern_number(it, (&w3[0]) as u64, 4) as u32, 0)
+    }
+    var w4: [u8; 3] = "str"
+    return ast.ty_new(b, ast.T_NAME, intern.intern_number(it, (&w4[0]) as u64, 3) as u32, 0)
+}
+
+// The type of an element expression as far as it is evident: `*sd` = a strong type, `*wk` = the
+// default of a literal (`1` -> i32); a strong type of one operand wins over the default of the other.
+// NOTHING = unknown.
+fn val_ty(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, fmap: *mut Vec[u32],
+    names: *mut Vec[u32], tys: *mut Vec[u32], e: u32, sd: *mut u32, wk: *mut u32) {
+    *sd = ast.NOTHING
+    *wk = ast.NOTHING
+    if e == ast.NOTHING {
+        return
+    }
+    let k: u32 = ast.e_kind(b, e)
+    if k == ast.E_INT {
+        *wk = named_ty(b, it, 0)
+        return
+    }
+    if k == ast.E_FLOAT {
+        *wk = named_ty(b, it, 1)
+        return
+    }
+    if k == ast.E_FLOAT32 {
+        *sd = named_ty(b, it, 2)
+        return
+    }
+    if k == ast.E_BOOL {
+        *sd = named_ty(b, it, 3)
+        return
+    }
+    if k == ast.E_TEXT {
+        if ast.e_b(b, e) == 0 {
+            *sd = named_ty(b, it, 4)
+        }
+        return
+    }
+    if k == ast.E_AS {
+        *sd = ast.e_b(b, e)
+        return
+    }
+    if k == ast.E_UN {
+        let op: u32 = ast.e_a(b, e)
+        if op == 0 || op == 4 {
+            val_ty(b, it, ef, fmap, names, tys, ast.e_b(b, e), sd, wk)
+            return
+        }
+        if op == 1 {
+            *sd = named_ty(b, it, 3)
+            return
+        }
+        *sd = ty_of(b, it, ef, fmap, names, tys, e)
+        return
+    }
+    if k == ast.E_BIN {
+        let op: u32 = ast.e_a(b, e)
+        if op >= 10 && op <= 17 {
+            *sd = named_ty(b, it, 3)
+            return
+        }
+        if op == 8 || op == 9 {
+            val_ty(b, it, ef, fmap, names, tys, ast.e_b(b, e), sd, wk)
+            return
+        }
+        var s1: u32 = ast.NOTHING
+        var w1: u32 = ast.NOTHING
+        var s2: u32 = ast.NOTHING
+        var w2: u32 = ast.NOTHING
+        val_ty(b, it, ef, fmap, names, tys, ast.e_b(b, e), &s1, &w1)
+        val_ty(b, it, ef, fmap, names, tys, ast.e_c(b, e), &s2, &w2)
+        *sd = s1
+        if s1 == ast.NOTHING {
+            *sd = s2
+        }
+        *wk = w1
+        if w1 == ast.NOTHING {
+            *wk = w2
+        }
+        return
+    }
+    if k == ast.E_IFEX {
+        var s1: u32 = ast.NOTHING
+        var w1: u32 = ast.NOTHING
+        var s2: u32 = ast.NOTHING
+        var w2: u32 = ast.NOTHING
+        val_ty(b, it, ef, fmap, names, tys, ast.e_b(b, e), &s1, &w1)
+        val_ty(b, it, ef, fmap, names, tys, ast.e_c(b, e), &s2, &w2)
+        *sd = s1
+        if s1 == ast.NOTHING {
+            *sd = s2
+        }
+        *wk = w1
+        if w1 == ast.NOTHING {
+            *wk = w2
+        }
+        return
+    }
+    *sd = ty_of(b, it, ef, fmap, names, tys, e)
+}
+
+// Is type node `t` the marker type `__infer_coll`?
+fn is_coll_marker_ty(b: *mut ast.Tree, it: *mut intern.Interner, t: u32) -> bool {
+    if t == ast.NOTHING || ast.t_kind(b, t) != ast.T_NAME {
+        return false
+    }
+    var mw: [u8; 12] = "__infer_coll"
+    return intern.intern_equal(it, ast.t_a(b, t), (&mw[0]) as u64, 12)
+}
+
+// `__coll_add_<kind>(&x, ..)` as a statement: the element type is known now -> name the instances,
+// rename the call and give the hidden variable `x` its type in the environment.
+fn coll_add_stmt(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, hk: *mut Hk,
+    fmap: *mut Vec[u32], names: *mut Vec[u32], tys: *mut Vec[u32], e: u32) {
+    if (*hk).gp == 0 || e == ast.NOTHING || ast.e_kind(b, e) != ast.E_CALL || ast.e_number(b, e) != 0 {
+        return
+    }
+    var pw: [u8; 11] = "__coll_add_"
+    if !intern.intern_prefix(it, ast.e_a(b, e), (&pw[0]) as u64, 11) {
+        return
+    }
+    let off: u32 = ast.e_b(b, e)
+    let cnt: u32 = ast.e_c(b, e)
+    if cnt < 2 {
+        return
+    }
+    let a0: u32 = ast.child_at(b, off)
+    if ast.e_kind(b, a0) != ast.E_UN || ast.e_a(b, a0) != 2 {
+        return
+    }
+    let tv: u32 = ast.e_b(b, a0)
+    if ast.e_kind(b, tv) != ast.E_ID {
+        return
+    }
+    let target: u32 = ast.e_a(b, tv)
+    var ve: u32 = ast.child_at(b, off + 1)
+    if cnt == 3 {
+        ve = ast.child_at(b, off + 2)
+    }
+    var sd: u32 = ast.NOTHING
+    var wk: u32 = ast.NOTHING
+    val_ty(b, it, ef, fmap, names, tys, ve, &sd, &wk)
+    var t: u32 = sd
+    if t == ast.NOTHING {
+        t = wk
+    }
+    if t == ast.NOTHING {
+        return
+    }
+    var io: Vec[u32] = vec_new[u32]()
+    vec_push[u32](&io, t)
+    vec_push[u32](&io, 0)
+    let oty: u32 = use_coll_hook(hk, e, COLL_MODE, (&io) as u64)
+    let grew: u32 = vec_at[u32](&io, 1)
+    vec_free[u32](&io)
+    if oty == NONE {
+        return
+    }
+    (*hk).coll_grew = (*hk).coll_grew + grew
+    let cty: u32 = ast.ty_new(b, ast.T_NAME, oty, 0)
+    var i: usize = vec_len[u32](names)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](names, i) == target {
+            vec_set[u32](tys, i, cty)
+            break
+        }
+    }
+}
+
+// End of a block: the hidden variables of untyped comprehensions declared in it get their type
+// (the instance found by `coll_add_stmt`) and their `__coll_new_*` call is renamed.
+fn coll_patch_block(b: *mut ast.Tree, it: *mut intern.Interner, hk: *mut Hk,
+    names: *mut Vec[u32], tys: *mut Vec[u32], blk: u32) {
+    if (*hk).gp == 0 {
+        return
+    }
+    var i: u32 = 0
+    let n: u32 = ast.b_len(b, blk)
+    while i < n {
+        let st: u32 = ast.slist_at(b, ast.b_off(b, blk) + i)
+        i = i + 1
+        if ast.s_kind(b, st) != ast.S_VAR || !is_coll_marker_ty(b, it, ast.s_b(b, st)) {
+            continue
+        }
+        let ct: u32 = env_find(names, tys, ast.s_a(b, st))
+        if ct == ast.NOTHING || is_coll_marker_ty(b, it, ct) || ast.t_kind(b, ct) != ast.T_NAME {
+            (*hk).coll_pending = (*hk).coll_pending + 1
+            continue
+        }
+        ast.s_b_set(b, st, ct)
+        use_coll_hook(hk, ast.s_c(b, st), COLL_NEW_MODE, ast.t_a(b, ct) as u64)
+    }
+}
+
 // r750 (twin of lambda.rs `bound_method`) -- `try x.m` (x a pointer variable, `m` a method of its
 // struct, no call): the operand `x.m` becomes the closure `gc |a0, ..| x.m(a0, ..)`. The parameter
 // and result types come from the method, so no expected type is needed. The node is changed in
@@ -710,6 +943,9 @@ fn assign_stmt(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, h
     }
     if k == ast.S_RET || k == ast.S_EXPR {
         calls_in_expr(b, it, ef, hk, fmap, names, tys, ast.s_a(b, st))
+        if k == ast.S_EXPR {
+            coll_add_stmt(b, it, ef, hk, fmap, names, tys, ast.s_a(b, st))
+        }
         return
     }
     if k == ast.S_IF || k == ast.S_WHILE {
@@ -739,8 +975,25 @@ fn assign_stmt(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, h
     if k == ast.S_FOR {
         // r742: the loop variable shadows an outer name of another type
         let fmark: usize = vec_len[u32](names)
+        // r751: the loop variable has the type of its range (a literal range is i32)
+        var fs1: u32 = ast.NOTHING
+        var fw1: u32 = ast.NOTHING
+        var fs2: u32 = ast.NOTHING
+        var fw2: u32 = ast.NOTHING
+        val_ty(b, it, ef, fmap, names, tys, ast.s_b(b, st), &fs1, &fw1)
+        val_ty(b, it, ef, fmap, names, tys, ast.s_c(b, st), &fs2, &fw2)
+        var fvt: u32 = fs1
+        if fvt == ast.NOTHING {
+            fvt = fs2
+        }
+        if fvt == ast.NOTHING {
+            fvt = fw1
+        }
+        if fvt == ast.NOTHING {
+            fvt = fw2
+        }
         vec_push[u32](names, ast.s_a(b, st))
-        vec_push[u32](tys, ast.NOTHING)
+        vec_push[u32](tys, fvt)
         assign_block(b, it, ef, hk, fmap, names, tys, ast.s_d(b, st))
         while vec_len[u32](names) > fmark {
             vec_pop[u32](names)
@@ -768,6 +1021,7 @@ fn assign_block(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, 
         assign_stmt(b, it, ef, hk, fmap, names, tys, ast.slist_at(b, ast.b_off(b, blk) + i))
         i = i + 1
     }
+    coll_patch_block(b, it, hk, names, tys, blk)
     while vec_len[u32](names) > mark {
         vec_pop[u32](names)
         vec_pop[u32](tys)
@@ -803,7 +1057,7 @@ fn run_assign(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, hk
 // counts the ones that remain open. Cheap when the program uses no sugar.
 fn run(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, gp: u64,
     hook: fn(u64, u32, u32, u64) -> u32) -> u32 {
-    var hkv: Hk = Hk { gp: gp, hook: hook }
+    var hkv: Hk = Hk { gp: gp, hook: hook, coll_pending: 0, coll_grew: 0 }
     let hk: *mut Hk = &hkv
     let total: usize = ast.expr_count(b)
     var any: bool = false
@@ -842,6 +1096,14 @@ fn run(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, gp: u64,
         if gp != 0 && ki == ast.E_ID {
             let f0: fn(u64, u32, u32, u64) -> u32 = hook
             if f0(gp, i as u32, NONE, 0) == 1 {
+                any = true
+                break
+            }
+        }
+        // r751: an untyped comprehension (`__coll_add_*` call)
+        if ki == ast.E_CALL && ast.e_number(b, i as u32) == 0 {
+            var cw: [u8; 11] = "__coll_add_"
+            if intern.intern_prefix(it, ast.e_a(b, i as u32), (&cw[0]) as u64, 11) {
                 any = true
                 break
             }
@@ -961,6 +1223,10 @@ fn run(b: *mut ast.Tree, it: *mut intern.Interner, ef: *mut err.Error, gp: u64,
     }
     // r740: assignments `target = lambda`
     run_assign(b, it, ef, hk, &fmap)
+    // r751: a comprehension whose element type stays open although nothing new came up
+    if (*hk).coll_pending > 0 && (*hk).coll_grew == 0 {
+        errors = errors + (*hk).coll_pending
+    }
     // struct literal fields `S { f: lambda }`
     e = 0
     while e < total {
