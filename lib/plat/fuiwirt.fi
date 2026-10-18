@@ -83,7 +83,7 @@ export {
     // r161: context menus (lib/fui/ctxmenu.fi): the request hook, the popup
     // sink that takes the input while a menu is open, the keys that open one
     host_set_context, host_set_popup, host_damage, host_damage_rects, host_touch_rect, host_popup_open, host_set_mods,
-    host_set_popup_note, host_popup_note, host_set_wake, host_now,
+    host_set_popup_note, host_popup_note, host_set_wake, host_now, host_set_shield, host_shielded,
     host_context, host_context_key, host_mods,
     KEY_ESCAPE, KEY_MENU, KEY_F10, BTN_RIGHT, MOD_ALT,
     rgba_to_bgrx,
@@ -228,7 +228,18 @@ struct Host {
     mv_pend: bool,
     mv_x: f64,
     mv_y: f64,
+    // THE POINTER SHIELD (non-modal overlays such as the bottom sheet): `sh_f(ud, x, y)` says "the page
+    // does not get the pointer here". A shielded press, its moves and its release only reach the hook;
+    // a press that began on the page keeps its moves and release (sh_press 2), so a drag is never cut off.
+    // sh_press: 0 = no press, 1 = shielded press, 2 = page press. sh_now = the last event was shielded.
+    sh_ud: u64,
+    sh_f: fn(u64, f64, f64) -> bool,
+    has_sh: u32,
+    sh_press: u32,
+    sh_now: bool,
 }
+
+fn shield_none(ud: u64, x: f64, y: f64) -> bool { return false }
 
 fn cx_none(ud: u64, target: usize, x: f64, y: f64, ay: f64, source: u32, mods: u32) -> bool {
     return false
@@ -434,6 +445,7 @@ fn host_new(sc: *mut scene.Scene, c: *mut render.Ctx) -> Host {
         pop_ud: 0, pop_open: pop_open_none, pop_ptr: pop_ptr_none,
         pop_key: pop_key_none, pop_chr: pop_key_none, pop_tick: pop_tick_none,
         pop_wait: pop_wait_none, pop_note: pop_note_none, has_pop: 0 as u32,
+        sh_ud: 0, sh_f: shield_none, has_sh: 0 as u32, sh_press: 0 as u32, sh_now: false,
         wake_ud: 0, wake_tick: wake_tick_none, wake_wait: wake_wait_none, has_wake: 0 as u32,
         pace: pacing.pacer_new(60), pnow: 0, paced_dirty: false, smooth_wheel: false, overscroll: false,
         mv_turn: 0 - 1, mv_n: 0, mv_pend: false, mv_x: 0.0, mv_y: 0.0 }
@@ -545,6 +557,30 @@ const MOVE_BURST: usize = 6
 fn host_pointer_x(w: *mut Host) -> f64 { return (*w).px }
 fn host_pointer_y(w: *mut Host) -> f64 { return (*w).py }
 
+// Install the pointer shield (see Host.sh_f).
+fn host_set_shield(w: *mut Host, ud: u64, f: fn(u64, f64, f64) -> bool) {
+    (*w).sh_ud = ud
+    (*w).sh_f = f
+    (*w).has_sh = 1 as u32
+}
+
+// True when the event being handled was kept from the page by the shield (the hook may ask).
+fn host_shielded(w: *mut Host) -> bool { return (*w).sh_now }
+
+fn shield_at(w: *mut Host, x: f64, y: f64) -> bool {
+    if (*w).has_sh == 0 as u32 { return false }
+    let f: fn(u64, f64, f64) -> bool = (*w).sh_f
+    return f((*w).sh_ud, x, y)
+}
+
+// Would a move / press / release (HOOK_*) at (x, y) be shielded? Pure: changes no state.
+fn shield_peek(w: *mut Host, kind: u32, x: f64, y: f64) -> bool {
+    if (*w).has_sh == 0 as u32 { return false }
+    if kind == HOOK_UP { return (*w).sh_press == 1 as u32 }
+    if kind == HOOK_MOVE && (*w).sh_press != 0 as u32 { return (*w).sh_press == 1 as u32 }
+    return shield_at(w, x, y)
+}
+
 fn host_pointer_move(w: *mut Host, x: f64, y: f64) -> u32 {
     if (*w).now == (*w).mv_turn {
         (*w).mv_n = (*w).mv_n + 1
@@ -579,6 +615,12 @@ fn pointer_move_now(w: *mut Host, x: f64, y: f64) -> u32 {
         if (pr & ctxmenu.CR_CONSUMED) != 0 as u32 {
             return control.CH_REPAINT
         }
+    }
+    (*w).sh_now = shield_peek(w, HOOK_MOVE, x, y)
+    if (*w).sh_now {
+        // the page hears nothing under a shield: its hover ends, the hook (the overlay) still hears
+        let chs: u32 = schmutzig(w, control.mouse_leave(&(*w).pn))
+        return chs | call_hook(w, HOOK_MOVE, x, y)
     }
     if (*w).bar_node != scene.SCENE_NONE {
         let v: *mut viewport.Viewport = scene.node_viewport(wsc(w),
@@ -667,6 +709,18 @@ fn host_pointer_down(w: *mut Host, x: f64, y: f64, btn: u32) -> u32 {
             return control.CH_REPAINT
         }
     }
+    (*w).sh_now = false
+    if btn == BTN_LEFT || btn == BTN_RIGHT || btn >= BTN_WHEEL_UP {
+        (*w).sh_now = shield_at(w, x, y)
+    }
+    if btn == BTN_LEFT {
+        (*w).sh_press = 2 as u32
+        if (*w).sh_now { (*w).sh_press = 1 as u32 }
+    }
+    if (*w).sh_now {
+        if btn == BTN_LEFT { return call_hook(w, HOOK_DOWN, x, y) }
+        return control.CH_NONE
+    }
     if btn == BTN_WHEEL_UP {
         return rad(w, x, y, 0.0, -1.0)
     }
@@ -711,11 +765,17 @@ fn host_pointer_up(w: *mut Host, x: f64, y: f64, btn: u32) -> u32 {
     if host_popup_open(w) {
         let pr: u32 = pop_pointer(w, HOOK_UP, x, y, btn)
         if (pr & ctxmenu.CR_CONSUMED) != 0 as u32 {
+            (*w).sh_press = 0 as u32
             return control.CH_REPAINT
         }
     }
     if btn != BTN_LEFT {
         return control.CH_NONE
+    }
+    (*w).sh_now = shield_peek(w, HOOK_UP, x, y)
+    (*w).sh_press = 0 as u32
+    if (*w).sh_now {
+        return call_hook(w, HOOK_UP, x, y)
     }
     if (*w).bar_node != scene.SCENE_NONE {
         let v: *mut viewport.Viewport = scene.node_viewport(wsc(w),
@@ -811,7 +871,17 @@ fn host_pointer(w: *mut Host, kind: u32, pid: u32, ptype: u32,
         }
     }
     let r: *mut event.Router = host_router(w)
-    if r as u64 != 0 as u64 {
+    var shd: bool = false
+    if primary && (*w).has_sh != 0 as u32 {
+        if kind == PE_DOWN {
+            shd = shield_at(w, x, y)
+        } else if kind == PE_MOVE {
+            shd = shield_peek(w, HOOK_MOVE, x, y)
+        } else if kind == PE_UP {
+            shd = shield_peek(w, HOOK_UP, x, y)
+        }
+    }
+    if r as u64 != 0 as u64 && !shd {
         let sc: *mut scene.Scene = wsc(w)
         if kind == PE_DOWN {
             let ok: bool = event.ev_pointer_down(r, sc, pid, ptype, x, y, t)
