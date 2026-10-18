@@ -118,10 +118,11 @@ fn push_prefix(out: *mut rt.Buf, prefix: u64, plen: usize) -> usize {
 
 // ConnectivityManager.getActiveNetwork() -> getLinkProperties(net) ->
 // getDnsServers() -> each InetAddress.getHostAddress(); the IPv4 ones become
-// "nameserver a.b.c.d\n" lines in `out` (at most 4). Returns how many.
+// text of the addresses (16 octet slots, NUL ended, at most 4) is copied to
+// `slots`; jni_dns_servers turns the IPv4 ones into resolv.conf lines.
 // Runs once per resolver init, not per lookup. #[no_gc]: JNI.
 #[no_gc]
-fn jni_dns_servers(out: *mut rt.Buf) -> usize {
+fn jni_dns_raw(slots: u64) -> usize {
     let act: u64 = activity.activity_pointer()
     if act == 0 {
         return 0
@@ -201,16 +202,14 @@ fn jni_dns_servers(out: *mut rt.Buf) -> usize {
             if js != 0 {
                 let chars: u64 = jnicall.j_utf_chars(env, js)
                 if chars != 0 {
+                    // copy the text (<= 15 octets) into slot `taken` of 16 octets, NUL ended
                     var n: usize = 0
-                    while n < 20 && rt.ld8(chars, n) != 0 as u8 {
+                    while n < 15 && *((chars + n as u64) as *mut u8) != 0 as u8 {
+                        *((slots + (taken * 16 + n) as u64) as *mut u8) = *((chars + n as u64) as *mut u8)
                         n = n + 1
                     }
-                    // an IPv6 text has colons and fails prop_ipv4_ok: skipped (A2)
-                    if n < 16 && prop_ipv4_ok(chars, n) {
-                        var word: [u8; 11] = "nameserver "
-                        rt.buf_push_bytes(out, (&word[0]) as u64, 11)
-                        rt.buf_push_bytes(out, chars, n)
-                        rt.buf_push(out, 10 as u8)
+                    *((slots + (taken * 16 + n) as u64) as *mut u8) = 0 as u8
+                    if *((chars + n as u64) as *mut u8) == 0 as u8 && n > 0 {
                         taken = taken + 1
                     }
                     jnicall.j_utf_release(env, js, chars)
@@ -222,6 +221,30 @@ fn jni_dns_servers(out: *mut rt.Buf) -> usize {
     }
     jnicall.j_del(env, kl)
     jnicall.j_del(env, list)
+    return taken
+}
+
+fn jni_dns_servers(out: *mut rt.Buf) -> usize {
+    var slots: [u8; 64] = [0 as u8; 64]
+    let k: usize = jni_dns_raw((&slots[0]) as u64)
+    var taken: usize = 0
+    var i: usize = 0
+    while i < k {
+        let p: u64 = ((&slots[0]) as u64) + (i * 16) as u64
+        var n: usize = 0
+        while n < 16 && rt.ld8(p, n) != 0 as u8 {
+            n = n + 1
+        }
+        // an IPv6 text has colons and fails prop_ipv4_ok: skipped (A2)
+        if prop_ipv4_ok(p, n) {
+            var word: [u8; 11] = "nameserver "
+            rt.buf_push_bytes(out, (&word[0]) as u64, 11)
+            rt.buf_push_bytes(out, p, n)
+            rt.buf_push(out, 10 as u8)
+            taken = taken + 1
+        }
+        i = i + 1
+    }
     return taken
 }
 
