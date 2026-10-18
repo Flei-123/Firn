@@ -127,7 +127,7 @@ run_one() { # name, hop_z, env...
         fi
         wait $pp; rc=$?
         py=$(grep -E "^mcplay: pos " "$W/$name.out" | tail -1 | grep -o " y=-\?[0-9]*" | cut -d= -f2)
-        [ -n "$py" ] && [ "$py" -ge 80 ] 2>/dev/null || ok=0
+        [ -n "$py" ] && [ "$py" -ge 100 ] 2>/dev/null || ok=0
         [ $rc -eq 0 ] || { echo "  FAIL  $name exit code $rc"; ERR=1; }
         [ $ok -eq 1 ] && break
         echo "  retry $name (attempt $att): join / tp lost or player not up (end y=${py:-?})"
@@ -136,31 +136,54 @@ run_one() { # name, hop_z, env...
     echo "  $name player=$pn end y=${py:-?} load=$(cut -d' ' -f1 /proc/loadavg)"
 }
 RUN_S=${SEAM_RUN_S:-40}
-run_one A "" MCPLAY_MODELS=1 MCPLAY_LOD=9
-run_one B "" MCPLAY_MODELS=0 MCPLAY_LOD=9
-run_one B2 "" MCPLAY_MODELS=0 MCPLAY_LOD=9
-run_one R 59.5 MCPLAY_MODELS=1 MCPLAY_LOD=9
-FIRST_Z=59.5 run_one S "" MCPLAY_MODELS=1 MCPLAY_LOD=9
-run_one T 59.5 MCPLAY_MODELS=0 MCPLAY_LOD=9
+# r259: back ends. LODSEAM_BACKENDS="cpu gl vk" (default cpu; LODSEAM_BACKEND is an alias). cpu = CPU raster, gl = MCPLAY_GL=1 (llvmpipe),
+# vk = MCPLAY_GFX=vk (lavapipe). Run names get the suffix "" / _gl / _vk. Per back end: the same seam / ring-change checks as the CPU run (0 px).
+# With "cpu" in the list the other back ends are also compared to the CPU pictures (stairs pixels: share differing > 2 levels <= LODSEAM_FIX_PCT; whole picture PSNR >= LODSEAM_FULL_MIN_DB).
+BACKENDS=${LODSEAM_BACKENDS:-${LODSEAM_BACKEND:-cpu}}
+NAMES=""
+for bk in $BACKENDS; do
+    case $bk in
+        cpu) sfx=""; BKENV="MCPLAY_FPS=30" ;;
+        gl) sfx="_gl"; BKENV="MCPLAY_GL=1 MCPLAY_VSYNC=0" ;;
+        vk) sfx="_vk"; BKENV="MCPLAY_GFX=vk MCPLAY_VSYNC=0" ;;
+        *) fail "unknown back end '$bk' (cpu|gl|vk)" ;;
+    esac
+    run_one A$sfx "" $BKENV MCPLAY_MODELS=1 MCPLAY_LOD=9
+    run_one B$sfx "" $BKENV MCPLAY_MODELS=0 MCPLAY_LOD=9
+    run_one B2$sfx "" $BKENV MCPLAY_MODELS=0 MCPLAY_LOD=9
+    run_one R$sfx 59.5 $BKENV MCPLAY_MODELS=1 MCPLAY_LOD=9
+    FIRST_Z=59.5 run_one S$sfx "" $BKENV MCPLAY_MODELS=1 MCPLAY_LOD=9
+    run_one T$sfx 59.5 $BKENV MCPLAY_MODELS=0 MCPLAY_LOD=9
+    for n in A B B2 R S T; do NAMES="$NAMES $n$sfx"; done
+done
 num() { grep -E "mcplay: (end|stream)" "$W/$1.out" | grep -o "$2=[0-9]*" | tail -1 | cut -d= -f2; }
-for n in A B B2 R S T; do
+for n in $NAMES; do
     F=$(num $n frames)
     [ "${F:-0}" -gt 20 ] || { echo "  FAIL  $n: too few frames (${F:-?})"; ERR=1; }
     [ -s "$W/$n.png" ] || { echo "  FAIL  $n: no screenshot"; ERR=1; }
 done
-for n in A R S; do
-    grep -q "^mcplay: models on.*lod=9" "$W/$n.out" || { echo "  FAIL  $n: 'models on ... lod=9' line missing"; ERR=1; }
+for n in $NAMES; do
+    case ${n%%_*} in
+        A|R|S) grep -q "^mcplay: models on.*lod=9" "$W/$n.out" || { echo "  FAIL  $n: 'models on ... lod=9' line missing"; ERR=1; } ;;
+        *) grep -q "^mcplay: models" "$W/$n.out" && { echo "  FAIL  $n (MCPLAY_MODELS=0) printed a models line"; ERR=1; } ;;
+    esac
 done
-for n in B B2 T; do grep -q "^mcplay: models" "$W/$n.out" && { echo "  FAIL  $n (MCPLAY_MODELS=0) printed a models line"; ERR=1; }; done
-LA=$(num A lod_cols); echo "  A lod_cols=${LA:-?} lod_tris=$(num A lod_tris)"
-[ "${LA:-0}" -gt 0 ] || { echo "  FAIL  A: no LOD columns drawn"; ERR=1; }
+for bk in $BACKENDS; do
+    case $bk in cpu) sfx="";; gl) sfx=_gl;; vk) sfx=_vk;; esac
+    LA=$(num A$sfx lod_cols); echo "  A$sfx lod_cols=${LA:-?} lod_tris=$(num A$sfx lod_tris)"
+    [ "${LA:-0}" -gt 0 ] || { echo "  FAIL  A$sfx: no LOD columns drawn"; ERR=1; }
+    case $bk in
+        gl) grep -q "^mcplay: gl renderer=" "$W/A$sfx.out" || { echo "  FAIL  A$sfx: GL path did not start"; ERR=1; } ;;
+        vk) grep -q "^mcplay: vk " "$W/A$sfx.out" || { echo "  FAIL  A$sfx: Vulkan path did not start"; ERR=1; } ;;
+    esac
+done
 if [ $ERR -eq 0 ]; then
-    RES=$(python3 -I - "$W" <<'PY'
-import sys
+    python3 -I - "$W" "$BACKENDS" "${LODSEAM_FULL_MIN_DB:-24}" "${LODSEAM_FIX_PCT:-0.5}" <<'PY' || ERR=1
+import sys, math
 from PIL import Image, ImageChops
-W = sys.argv[1]
+W, backends = sys.argv[1], sys.argv[2].split()
+SFX = {"cpu": "", "gl": "_gl", "vk": "_vk"}
 def crop(n): return Image.open(f"{W}/{n}.png").convert("RGB").crop((0, 60, 640, 330))
-im = {n: crop(n) for n in ("A", "B", "B2", "R", "S", "T")}
 def fixture_mask(i):
     raw = i.tobytes(); w, h = i.size
     m = Image.new("L", (w, h), 0); px = m.load()
@@ -178,34 +201,72 @@ def fixture_mask(i):
         if c >= 0:
             cnt[c] += 1; px[(k // 3) % w, (k // 3) // w] = 255
     return cnt, m
-def dmask(x, y): return ImageChops.difference(x, y).convert("L").point(lambda v: 255 if v > 0 else 0)
+def dmask(x, y, t=0): return ImageChops.difference(x, y).convert("L").point(lambda v: 255 if v > t else 0)
 def nz(m): return sum(m.histogram()[255:])
-ca, ma = fixture_mask(im["A"]); cb, mb = fixture_mask(im["B"])
-cr, _ = fixture_mask(im["R"]); cs, _ = fixture_mask(im["S"])
-u = ImageChops.lighter(ma, mb)
-bb = u.getbbox()
-dab = dmask(im["A"], im["B"])
-out_ab = 0
-if bb:
-    x0, y0, x1, y1 = bb; pad = 8
-    r = (max(0, x0 - pad), max(0, y0 - pad), min(640, x1 + pad), min(270, y1 + pad))
-    inside = dab.crop(r); out_ab = nz(dab) - nz(inside)
-print("fixA", *ca, "fixR", *cr, "fixS", *cs, "diffAB", nz(dab), "outAB", out_ab, "diffBB2", nz(dmask(im["B"], im["B2"])),
-      "diffRT", nz(dmask(im["R"], im["T"])), "diffRS", nz(dmask(im["R"], im["S"])), "total", 640 * 270, "bbox", bb)
+def psnr(a, b):
+    h = ImageChops.difference(a, b).histogram(); se = 0
+    for ch in range(3):
+        for v in range(256): se += h[ch * 256 + v] * v * v
+    mse = se / (a.width * a.height * 3)
+    return 99.0 if mse == 0 else 10 * math.log10(255 * 255 / mse)
+bad = 0
+TOT = 640 * 270
+allim = {}
+for bk in backends:
+    s = SFX[bk]
+    im = {n: crop(n + s) for n in ("A", "B", "B2", "R", "S", "T")}
+    allim[bk] = im
+    ca, ma = fixture_mask(im["A"]); cb, mb = fixture_mask(im["B"])
+    cr, _ = fixture_mask(im["R"]); cs, _ = fixture_mask(im["S"])
+    bb = ImageChops.lighter(ma, mb).getbbox()
+    dab = dmask(im["A"], im["B"])
+    out_ab = 0
+    if bb:
+        x0, y0, x1, y1 = bb; pad = 8
+        r = (max(0, x0 - pad), max(0, y0 - pad), min(640, x1 + pad), min(270, y1 + pad))
+        out_ab = nz(dab) - nz(dab.crop(r))
+    bb2 = nz(dmask(im["B"], im["B2"])); rt = nz(dmask(im["R"], im["T"])); rs = nz(dmask(im["R"], im["S"]))
+    print(f"  [{bk}] fixA {ca} fixR {cr} fixS {cs} diffAB {nz(dab)} outAB {out_ab} diffBB2 {bb2} diffRT {rt} diffRS {rs} total {TOT} bbox {bb}")
+    for i, c in enumerate(ca):
+        if c < 100: print(f"  FAIL  [{bk}] A: fixture colour #{i + 1} only {c} pixels"); bad = 1
+    for i, c in enumerate(cr):
+        if c < 60: print(f"  FAIL  [{bk}] R (ring change LOD -> full): fixture colour #{i + 1} only {c} pixels"); bad = 1
+    for i, c in enumerate(cs):
+        if c < 60: print(f"  FAIL  [{bk}] S (direct): fixture colour #{i + 1} only {c} pixels"); bad = 1
+    if bb2 > 0: print(f"  FAIL  [{bk}] B vs B2 (cubes + LOD, same config) differ by {bb2} px: the LOD picture is not deterministic"); bad = 1
+    if out_ab > 0: print(f"  FAIL  [{bk}] A vs B differ by {out_ab} px OUTSIDE the stairs (seam hole / double drawing / colour jump)"); bad = 1
+    if rt < TOT // 500: print(f"  FAIL  [{bk}] R equals T: models did not appear after the ring change ({rt} px)"); bad = 1
+    if rs > 0: print(f"  FAIL  [{bk}] R (late remesh) differs from S (direct load) by {rs} px"); bad = 1
+if "cpu" in allim:
+    # Stairs pixels (pixels with a fixture colour in BOTH the CPU and the other run): the models / cubes themselves, compared across back ends. Checked as
+    # the share of those pixels that differ by > 2 levels (<= LODSEAM_FIX_PCT, default 0.5 %; PSNR printed, a handful of quadrant-border pixels of 255 levels
+    # cap it near 34 dB). Whole picture (LOD + chunk terrain, sky, fog: scattered 1 px edge differences on the high-contrast snow steps, the same for the
+    # cube runs T): only measured, floor LODSEAM_FULL_MIN_DB (default 24) catches gross errors.
+    fullmin = float(sys.argv[4]) if len(sys.argv) > 4 else 24.0
+    fixpct = float(sys.argv[5]) if len(sys.argv) > 5 else 0.5
+    cpu = allim["cpu"]
+    def stat_mask(a, b, m):
+        n = sum(m.histogram()[255:])
+        if n == 0: return 0, 0.0, 0
+        black = Image.new("RGB", a.size, (0, 0, 0))
+        a = Image.composite(a, black, m); b = Image.composite(b, black, m)
+        d = ImageChops.difference(a, b); h = d.histogram(); se = 0
+        for ch in range(3):
+            for v in range(256): se += h[ch * 256 + v] * v * v
+        mse = se / (n * 3)
+        return n, (99.0 if mse == 0 else 10 * math.log10(255 * 255 / mse)), nz(d.convert("L").point(lambda v: 255 if v > 2 else 0))
+    for bk in backends:
+        if bk == "cpu": continue
+        for n in ("A", "B", "R", "S", "T"):
+            g = allim[bk][n]; c = cpu[n]
+            m = ImageChops.multiply(fixture_mask(g)[1], fixture_mask(c)[1])
+            p = psnr(g, c); npx, pm, ndm = stat_mask(g, c, m)
+            nd = nz(dmask(g, c, 2))
+            print(f"  PSNR {n}{SFX[bk]} vs CPU: whole {p:.2f} dB ({nd} px > 2 levels of {TOT}) | fixture pixels {npx}: {pm:.2f} dB, {ndm} px > 2 levels")
+            if n in ("A", "R", "S") and (npx < 1000 or ndm * 100 > npx * fixpct): print(f"  FAIL  {n}{SFX[bk]} fixture pixels differ from the CPU run: {ndm} of {npx} (> {fixpct} %)"); bad = 1
+            if p < fullmin: print(f"  FAIL  PSNR {n}{SFX[bk]} whole picture {p:.2f} dB < {fullmin}"); bad = 1
+sys.exit(bad)
 PY
-) || RES=""
-    echo "  $RES"
-    set -- $RES
-    if [ -z "$RES" ]; then echo "  FAIL  picture analysis failed"; ERR=1; else
-        for i in 2 3 4 5; do [ "${!i}" -ge 100 ] || { echo "  FAIL  A: fixture colour #$((i - 1)) only ${!i} pixels"; ERR=1; }; done
-        for i in 7 8 9 10; do [ "${!i}" -ge 60 ] || { echo "  FAIL  R (ring change LOD -> full): fixture colour #$((i - 6)) only ${!i} pixels"; ERR=1; }; done
-        for i in 12 13 14 15; do [ "${!i}" -ge 60 ] || { echo "  FAIL  S (direct): fixture colour #$((i - 11)) only ${!i} pixels"; ERR=1; }; done
-        OUTAB=${19}; BB2=${21}; RT=${23}; RS=${25}; TOT=${27}
-        [ "$BB2" -le 0 ] || { echo "  FAIL  B vs B2 (cubes + LOD, same config) differ by $BB2 px: the LOD picture is not deterministic"; ERR=1; }
-        [ "$OUTAB" -le 0 ] || { echo "  FAIL  A vs B differ by $OUTAB px OUTSIDE the stairs (seam hole / double drawing / colour jump)"; ERR=1; }
-        [ "$RT" -ge $((TOT / 500)) ] || { echo "  FAIL  R equals T: models did not appear after the ring change ($RT px)"; ERR=1; }
-        [ "$RS" -le 0 ] || { echo "  FAIL  R (late remesh) differs from S (direct load) by $RS px"; ERR=1; }
-    fi
 fi
 # ---- perf: frame work time p50, median over reps
 if [ "${LODSEAM_PERF:-0}" = 1 ]; then
