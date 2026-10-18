@@ -55,6 +55,27 @@ pub(crate) fn split_colon(raw: &[char]) -> Option<usize> {
     None
 }
 
+/// r708 -- the conversion of `{x!r}` / `{x!s}`: the expression text without it, plus the
+/// conversion letter (`'r'` repr, `'s'` str, `'\0'` none). It sits at the very END of the
+/// expression part (before the spec colon); `!=` never matches because `!` must be followed
+/// by the letter and nothing else.
+pub(crate) fn split_conv(raw: &[char]) -> (&[char], char) {
+    let mut end = raw.len();
+    while end > 0 && raw[end - 1].is_whitespace() {
+        end -= 1;
+    }
+    if end >= 3 && raw[end - 2] == '!' && (raw[end - 1] == 'r' || raw[end - 1] == 's') {
+        let prev = raw[end - 3];
+        if !matches!(prev, '!' | '=' | '<' | '>' | '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | '(' | ',') {
+            return (&raw[..end - 2], raw[end - 1]);
+        }
+    }
+    (raw, '\0')
+}
+
+/// The type octet that means "repr" (`{x!r}`): a text is shown quoted with escapes.
+pub(crate) const REPR_TY: u64 = 'r' as u64;
+
 /// Result of `parse_spec`: the packed spec and the ranges (in the spec text) of
 /// nested width / precision fields.
 pub(crate) struct Parsed {
@@ -206,7 +227,11 @@ pub(crate) fn parse_spec(s: &[char]) -> Result<Parsed, String> {
 /// Type-specific validity of a spec, decided where the type is known.
 /// `kind`: 'i' signed/unsigned integer, 'f' float, 's' str, 'b' bool.
 pub(crate) fn check_for(kind: char, spec: u64) -> Result<(), String> {
-    let ty = ((spec >> 48) & 255) as u8 as char;
+    let mut ty = ((spec >> 48) & 255) as u8 as char;
+    // r708: `!r` on a number or bool shows it as without conversion
+    if ty == 'r' && kind != 's' {
+        ty = '\0';
+    }
     let prec = (spec >> 32) & 0xFFFF;
     let align = (spec >> 8) & 7;
     let group = (spec >> 14) & 3;
@@ -241,7 +266,7 @@ pub(crate) fn check_for(kind: char, spec: u64) -> Result<(), String> {
             }
         }
         _ => {
-            if !matches!(ty, '\0' | 's') {
+            if !matches!(ty, '\0' | 's' | 'r') {
                 return Err(format!("format type '{}' does not fit a str/bool", ty));
             }
             if align == 4 || (spec >> 11) & 7 != 0 || group != 0 {

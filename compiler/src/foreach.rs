@@ -41,7 +41,7 @@ use crate::ast::*;
 use crate::diag::Span;
 use crate::fir::{FTy, Val};
 use crate::lower::Lower;
-use crate::parser::Parser;
+use crate::parser::{Parser, TuplePat};
 use crate::sema::Checker;
 use crate::types::Type;
 
@@ -206,49 +206,50 @@ pub(crate) fn build(
     }
 }
 
-/// r666 -- `for (i, x) in enumerate(v)` and `for (x, y) in zip(a, b)`.
+/// r666 / r708 -- `for (i, x) in enumerate(v)`, `for (x, y) in zip(a, b)` and
+/// `for (a, b) in vec_of_tuples`.
 ///
 /// ```firn
 /// for __each#L_C in 0 as usize..__each_len(v) {
 ///     let i = __each#L_C        // usize
-///     let x = v[__each#L_C]
+///     let x = v[__each#L_C]     // x may be a nested pattern: `(i, (a, b))`
 ///     ...
 /// }
 /// ```
-/// `zip` walks to the SHORTER length (`if la < lb { la } else { lb }`). Every
-/// sequence must be a place without calls, as with `for x in v`.
-pub(crate) fn build_pair(
-    p: &mut Parser,
-    first: (String, Span),
-    second: (String, Span),
-    src: Expr,
-    body: Block,
-    start: Span,
-) -> Stmt {
+/// `zip` walks to the SHORTER length (`if la < lb { la } else { lb }`). Without
+/// `enumerate`/`zip` the whole pattern is the pattern of the element (a
+/// tuple): `let __tup#k#n = v[__each#L_C]` then one `let` per name. Every
+/// sequence must be a place without calls, as with `for x in v`. The hidden
+/// bindings are made BEFORE the body is parsed (the `__tup#` numbers run in
+/// source order, like firnc1).
+pub(crate) fn build_pair(p: &mut Parser, pat: TuplePat, src: Expr, start: Span) -> Stmt {
     let (fname, fargs) = match &src.kind {
         ExprKind::Call(n, a, _) => (n.clone(), a.clone()),
         _ => (String::new(), Vec::new()),
     };
-    let is_enum = fname == "enumerate" && fargs.len() == 1;
-    let is_zip = fname == "zip" && fargs.len() == 2;
-    if !is_enum && !is_zip {
-        p.dg.error_note(
-            src.span,
-            "a tuple pattern in 'for' needs enumerate(v) or zip(a, b)",
-            "write `for (i, x) in enumerate(v)` or `for (x, y) in zip(a, b)`",
-        );
-        return Stmt::Error(start);
-    }
-    for a in &fargs {
+    let parts: Vec<TuplePat> = match &pat {
+        TuplePat::Tuple(e, _) => e.clone(),
+        _ => Vec::new(),
+    };
+    let is_enum = fname == "enumerate" && fargs.len() == 1 && parts.len() == 2;
+    let is_zip = fname == "zip" && fargs.len() == 2 && parts.len() == 2;
+    // the sequences that are read more than once
+    let seqs: Vec<Expr> = if is_enum || is_zip { fargs.clone() } else { vec![src.clone()] };
+    let mut ok = true;
+    for a in &seqs {
         if !place_ok(a) {
+            ok = false;
             p.dg.error_note(
                 a.span,
-                "'for ... in enumerate/zip' needs a sequence variable",
+                "'for ... in' needs a sequence variable",
                 "name the sequence first (`let a = ...`): the loop reads it more than once, so it \
                  must be a name, a field path or `*p`, never a call",
             );
-            return Stmt::Error(start);
         }
+    }
+    if !ok {
+        let _ = p.for_pair_body();
+        return Stmt::Error(start);
     }
     let sp = src.span;
     let idx = format!("{}{}_{}", HIDDEN, start.line, start.col);
@@ -256,35 +257,39 @@ pub(crate) fn build_pair(
         let r = reid(p, a);
         p.mk(sp, ExprKind::Call(LEN.to_string(), vec![r], sp))
     };
-    let len = if is_enum {
-        len_of(p, &fargs[0])
-    } else {
-        let la = len_of(p, &fargs[0]);
-        let lb = len_of(p, &fargs[1]);
-        let la2 = len_of(p, &fargs[0]);
-        let lb2 = len_of(p, &fargs[1]);
+    let len = if is_zip {
+        let la = len_of(p, &seqs[0]);
+        let lb = len_of(p, &seqs[1]);
+        let la2 = len_of(p, &seqs[0]);
+        let lb2 = len_of(p, &seqs[1]);
         let cond = p.mk(sp, ExprKind::Binary(BinOp::Lt, Box::new(la), Box::new(lb)));
         p.mk(sp, ExprKind::IfElse(Box::new(cond), Box::new(la2), Box::new(lb2)))
+    } else {
+        len_of(p, &seqs[0])
     };
     let lit = p.mk(sp, ExprKind::Int(0));
     let zero = p.mk(sp, ExprKind::Cast(Box::new(lit), TypeExpr::Named("usize".to_string(), sp)));
-    let mut stmts = Vec::with_capacity(body.stmts.len() + 2);
-    let at = |p: &mut Parser| p.mk(sp, ExprKind::Ident(idx.clone()));
+    let mut stmts: Vec<Stmt> = Vec::new();
+    let elem_at = |p: &mut Parser, k: usize| {
+        let base = reid(p, &seqs[k]);
+        let i2 = p.mk(sp, ExprKind::Ident(idx.clone()));
+        p.mk(sp, ExprKind::Index(Box::new(base), Box::new(i2)))
+    };
     if is_enum {
-        let init = at(p);
-        stmts.push(Stmt::Let { name: first.0, mutable: false, ty: None, init, span: first.1 });
-        let base = reid(p, &fargs[0]);
-        let i2 = at(p);
-        let elem = p.mk(sp, ExprKind::Index(Box::new(base), Box::new(i2)));
-        stmts.push(Stmt::Let { name: second.0, mutable: false, ty: None, init: elem, span: second.1 });
-    } else {
-        for (k, nm) in [first, second].into_iter().enumerate() {
-            let base = reid(p, &fargs[k]);
-            let i2 = at(p);
-            let elem = p.mk(sp, ExprKind::Index(Box::new(base), Box::new(i2)));
-            stmts.push(Stmt::Let { name: nm.0, mutable: false, ty: None, init: elem, span: nm.1 });
+        let init = p.mk(sp, ExprKind::Ident(idx.clone()));
+        p.bind_pat(&parts[0], init, &mut stmts);
+        let elem = elem_at(p, 0);
+        p.bind_pat(&parts[1], elem, &mut stmts);
+    } else if is_zip {
+        for k in 0..2 {
+            let elem = elem_at(p, k);
+            p.bind_pat(&parts[k], elem, &mut stmts);
         }
+    } else {
+        let elem = elem_at(p, 0);
+        p.bind_pat(&pat, elem, &mut stmts);
     }
+    let body = p.for_pair_body();
     stmts.extend(body.stmts);
     let body = Block { stmts, span: body.span, end: body.end };
     Stmt::For {

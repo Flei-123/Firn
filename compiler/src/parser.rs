@@ -75,7 +75,8 @@ pub(crate) struct Parser<'a> {
 }
 
 /// **Round TUPLES** -- the pattern of `let (a, b) = ..`.
-enum TuplePat {
+#[derive(Clone)]
+pub(crate) enum TuplePat {
     Name(String, Span),
     Skip,
     Tuple(Vec<TuplePat>, Span),
@@ -1838,34 +1839,58 @@ compute it",
         Stmt::While { cond, body, span: start }
     }
 
-    /// r666 -- `for (a, b) in enumerate(v)` and `for (a, b) in zip(x, y)`:
-    /// the only tuple patterns of `for`; both desugar like `for x in vec`.
+    /// r666 / r708 -- `for (a, b) in enumerate(v)`, `for (a, b) in zip(x, y)` and
+    /// `for (a, b) in vec_of_tuples` (any pattern, nested tuples allowed, also
+    /// `for (i, (a, b)) in enumerate(v)`); all desugar like `for x in vec`.
     fn for_pair(&mut self, start: Span) -> Stmt {
-        self.bump(); // '('
-        let first = self.ident("in the pattern of 'for'");
-        let mut second = None;
-        if first.is_some() && self.expect(TokKind::Comma, "between the two names of the 'for' pattern") {
-            second = self.ident("in the pattern of 'for'");
-        }
-        let ok = first.is_some() && second.is_some() && self.expect(TokKind::RParen, "after the 'for' pattern");
-        if !ok || !self.expect(TokKind::KwIn, "after the loop pattern") {
+        let pat = match self.tuple_pattern() {
+            Some(p) => p,
+            None => {
+                self.recovering = false;
+                self.sync_stmt();
+                return Stmt::Error(start);
+            }
+        };
+        if !self.expect(TokKind::KwIn, "after the loop pattern") {
             self.recovering = false;
             self.sync_stmt();
             return Stmt::Error(start);
         }
         let src = self.cond_expr();
         if !self.at(&TokKind::LBrace) {
-            self.error_here("expected '{' after 'for (a, b) in enumerate(..)' / 'zip(..)'");
+            self.error_here("expected '{' after 'for (a, b) in ...'");
             self.recovering = false;
             self.sync_stmt();
             return Stmt::Error(start);
         }
+        crate::foreach::build_pair(self, pat, src, start)
+    }
+
+    /// The body block of a `for` with a tuple pattern (called by `foreach`
+    /// AFTER the hidden bindings took their `__tup#` numbers).
+    pub(crate) fn for_pair_body(&mut self) -> Block {
         self.loop_depth += 1;
         let body = self.block("after 'for (a, b) in ...'");
         self.loop_depth -= 1;
-        let (a, asp) = first.unwrap();
-        let (b, bsp) = second.unwrap();
-        crate::foreach::build_pair(self, (a, asp), (b, bsp), src, body, start)
+        body
+    }
+
+    /// Bind the pattern `pat` to the value `init` (r708): a name is one
+    /// `let`, `_` nothing, a nested tuple a hidden `let __tup#k#n` plus its
+    /// parts -- exactly the statements of `let (a, b) = init`.
+    pub(crate) fn bind_pat(&mut self, pat: &TuplePat, init: Expr, out: &mut Vec<Stmt>) {
+        match pat {
+            TuplePat::Name(n, sp) => {
+                out.push(Stmt::Let { name: n.clone(), mutable: false, ty: None, init, span: *sp })
+            }
+            TuplePat::Skip => {}
+            TuplePat::Tuple(e, sp) => {
+                let tmp = format!("__tup#{}#{}", self.tup_seq, e.len());
+                self.tup_seq += 1;
+                out.push(Stmt::Let { name: tmp.clone(), mutable: false, ty: None, init, span: *sp });
+                self.tuple_bindings(pat, &tmp, false, out);
+            }
+        }
     }
 
     /// The `for` loop over a half-open, ascending range `start..end`.
@@ -2810,6 +2835,17 @@ impl<'a> Parser<'a> {
                     return chain;
                 }
             }
+        }
+        // r708: `{x!r}` / `{x!s}` (+ optional spec): `!r` is the type octet 'r' of the spec.
+        let (raw, conv) = crate::fmtspec::split_conv(raw);
+        if conv == 'r' {
+            let base = spec.unwrap_or(32);
+            let ty = (base >> 48) & 255;
+            if ty != 0 && ty != 's' as u64 {
+                self.dg.error(sp, "after `!r` a format spec takes no type but `s`".to_string());
+                return chain;
+            }
+            spec = Some((base & !(255u64 << 48)) | (crate::fmtspec::REPR_TY << 48));
         }
         let expr = self.interp_sub(sp, raw, of);
         match expr {

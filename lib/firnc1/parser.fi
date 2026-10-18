@@ -221,6 +221,8 @@ struct Parser {
     // `let x = a[i]` of `for x in array`). `ast.NOTHING` = none.
     pre_stmt: u32,
     pre_stmt2: u32,
+    // r708: the hidden bindings of `for (a, b) in ..` (any number); the NEXT `block` puts them in front
+    pre_list: Vec[u32],
     // GENERIC TEMPLATES. The store sits OUTSIDE the parser because it has to be
     // shared by all files of a translation: the root file may use `Vec[i32]`
     // while `Vec[T]` is declared in some module.
@@ -361,6 +363,7 @@ fn par_new(lx: u64) -> Parser {
         meth_defaults: 0,
         pre_stmt: ast.NOTHING,
         pre_stmt2: ast.NOTHING,
+        pre_list: vec_new[u32](),
         gen: 0, mu: 0, feh: 0, time: false, gcr: 0, ifr: 0, nogc_pending: 0, int_pending: 0, ph_pending: 0, mc_pending: 0,
         link_pending: 0, link_pending_set: false, export_pending: 0, tpoff: 0, sonr: -1, hgnr: -1, gtnr: -1, gunr: -1,
         local: vec_new[u32](), llimit: vec_new[u32](),
@@ -474,6 +477,7 @@ fn par_free(p: *mut Parser) {
     vec_free[u32](&(*p).rp_flag)
     vec_free[u32](&(*p).rp_mark)
     vec_free[u32](&(*p).after)
+    vec_free[u32](&(*p).pre_list)
     vec_free[u32](&(*p).al_name)
     vec_free[u32](&(*p).al_head)
     vec_free[u32](&(*p).al_pos)
@@ -3770,6 +3774,12 @@ fn block(p: *mut Parser) -> u32 {
         vec_push[u32](&own, (*p).pre_stmt2)
         (*p).pre_stmt2 = ast.NOTHING
     }
+    var pli: usize = 0
+    while pli < vec_len[u32](&(*p).pre_list) {
+        vec_push[u32](&own, vec_at[u32](&(*p).pre_list, pli))
+        pli = pli + 1
+    }
+    vec_clear[u32](&(*p).pre_list)
     while true {
         if actual(p, A_RBRACE) {
             break
@@ -3931,7 +3941,8 @@ fn tuple_pattern(p: *mut Parser, enc: *mut Vec[u32]) -> bool {
 // The statements that take the tuple `tmp` apart: one `let` per name, one
 // hidden `let __tup#<k>#<n>` per nested tuple (parser.rs::tuple_bindings).
 // `cur` stands on the header of the pattern that belongs to `tmp`.
-fn tuple_bindings(p: *mut Parser, enc: *mut Vec[u32], cur: *mut usize, tmp: u32, kind_s: u32) {
+fn tuple_bindings(p: *mut Parser, enc: *mut Vec[u32], cur: *mut usize, tmp: u32, kind_s: u32,
+    out: *mut Vec[u32]) {
     let count: u32 = vec_at[u32](enc, *cur + 1)
     *cur = *cur + 2
     var i: u32 = 0
@@ -3947,13 +3958,13 @@ fn tuple_bindings(p: *mut Parser, enc: *mut Vec[u32], cur: *mut usize, tmp: u32,
         let field: u32 = ast.expr_new(par_tree(p), ast.E_FIELD, base, index_name(p, i as u64), 0, 0)
         if k == 0 {
             *cur = *cur + 2
-            vec_push[u32](&(*p).after, ast.stmt_new(par_tree(p), kind_s, v, ast.NOTHING, field, 0))
+            vec_push[u32](out, ast.stmt_new(par_tree(p), kind_s, v, ast.NOTHING, field, 0))
             rp_shadow(p, v)
             loc_add(p, v)
         } else {
             let sub: u32 = tuple_temp_name(p, v as usize)
-            vec_push[u32](&(*p).after, ast.stmt_new(par_tree(p), ast.S_LET, sub, ast.NOTHING, field, 0))
-            tuple_bindings(p, enc, cur, sub, kind_s)
+            vec_push[u32](out, ast.stmt_new(par_tree(p), ast.S_LET, sub, ast.NOTHING, field, 0))
+            tuple_bindings(p, enc, cur, sub, kind_s, out)
         }
         i = i + 1
     }
@@ -3985,7 +3996,7 @@ fn let_tuple(p: *mut Parser, kind_s: u32) -> u32 {
     end_stmt(p)
     let tmp: u32 = tuple_temp_name(p, vec_at[u32](&enc, 1) as usize)
     var cur: usize = 0
-    tuple_bindings(p, &enc, &cur, tmp, kind_s)
+    tuple_bindings(p, &enc, &cur, tmp, kind_s, &(*p).after)
     vec_free[u32](&enc)
     return ast.stmt_new(par_tree(p), ast.S_LET, tmp, t, init, 0)
 }
@@ -4223,40 +4234,64 @@ fn for_each(p: *mut Parser, name: u32, arr: u32, fpos: u64, npos: u64) -> u32 {
     return ast.stmt_new(b, ast.S_FOR, idx_nr, zero, len_call, body)
 }
 
-// r666 (foreach.rs::build_pair) -- `for (a, b) in enumerate(v) { body }` and
-// `for (a, b) in zip(x, y) { body }`:
+// r708 (parser.rs::bind_pat) -- bind the pattern at `*cur` to `init`: a name is one `let`,
+// `_` nothing, a nested tuple a hidden `let __tup#<k>#<n>` plus its parts.
+fn bind_pat(p: *mut Parser, enc: *mut Vec[u32], cur: *mut usize, init: u32, out: *mut Vec[u32]) {
+    let k: u32 = vec_at[u32](enc, *cur)
+    let v: u32 = vec_at[u32](enc, *cur + 1)
+    if k == 1 {
+        *cur = *cur + 2
+        return
+    }
+    if k == 0 {
+        *cur = *cur + 2
+        vec_push[u32](out, ast.stmt_new(par_tree(p), ast.S_LET, v, ast.NOTHING, init, 0))
+        rp_shadow(p, v)
+        loc_add(p, v)
+        return
+    }
+    let tmp: u32 = tuple_temp_name(p, v as usize)
+    vec_push[u32](out, ast.stmt_new(par_tree(p), ast.S_LET, tmp, ast.NOTHING, init, 0))
+    tuple_bindings(p, enc, cur, tmp, ast.S_LET, out)
+}
+
+// `v[__each#L_C]` of a clone of `arr`.
+fn fe_elem(p: *mut Parser, arr: u32, idx_nr: u32, apos: u64) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
+    let base: u32 = rp_base(p, fe_clone(p, arr), false)
+    let at: u32 = ast.expr_new(b, ast.E_ID, idx_nr, 0, 0, 0)
+    pos_default(p, at, apos)
+    let elem: u32 = ast.expr_new(b, ast.E_IDX, base, at, 0, 0)
+    pos_default(p, elem, apos)
+    return elem
+}
+
+// r666 / r708 (foreach.rs::build_pair) -- `for (a, b) in enumerate(v) { body }`,
+// `for (a, b) in zip(x, y) { body }` and `for (a, b) in vec_of_tuples { body }`:
 //     for __each#L_C in 0 as usize..__each_len(v) { let a = __each#L_C; let b = v[__each#L_C]; body }
-// zip walks to the shorter length: `if la < lb { la } else { lb }`.
+// zip walks to the shorter length: `if la < lb { la } else { lb }`. Any part may be a nested
+// pattern; without enumerate/zip the whole pattern belongs to the element.
 fn for_pair(p: *mut Parser, fpos: u64) -> u32 {
     let b: *mut ast.Tree = par_tree(p)
-    next_bump(p)
-    if !actual(p, A_IDENT) {
-        complain(p)
-        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
-    }
-    let n1: u32 = tok_nr(p, 0)
-    let n1pos: u64 = at_pos(p, 0)
-    next_bump(p)
-    if !expect(p, A_COMMA) {
-        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
-    }
-    if !actual(p, A_IDENT) {
-        complain(p)
-        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
-    }
-    let n2: u32 = tok_nr(p, 0)
-    let n2pos: u64 = at_pos(p, 0)
-    next_bump(p)
-    if !expect(p, A_RPAREN) {
+    var enc: Vec[u32] = vec_new[u32]()
+    if !tuple_pattern(p, &enc) {
+        vec_free[u32](&enc)
         return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
     }
     if !expect(p, A_KWIN) {
+        vec_free[u32](&enc)
         return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
     }
-    rp_shadow(p, n1)
-    rp_shadow(p, n2)
+    var si: usize = 0
+    while si < vec_len[u32](&enc) {
+        if vec_at[u32](&enc, si) == 0 {
+            rp_shadow(p, vec_at[u32](&enc, si + 1))
+        }
+        si = si + 2
+    }
     let src: u32 = cond_expr(p)
     if !actual(p, A_LBRACE) {
+        vec_free[u32](&enc)
         complain(p)
         return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
     }
@@ -4265,11 +4300,12 @@ fn for_pair(p: *mut Parser, fpos: u64) -> u32 {
     var zw: [u8; 3] = "zip"
     let enum_nr: u32 = intern.intern_number(it, (&ew[0]) as u64, 9) as u32
     let zip_nr: u32 = intern.intern_number(it, (&zw[0]) as u64, 3) as u32
+    let two: bool = vec_at[u32](&enc, 1) == 2
     var is_enum: bool = false
     var is_zip: bool = false
-    var arg0: u32 = 0
+    var arg0: u32 = src
     var arg1: u32 = 0
-    if ast.e_kind(b, src) == ast.E_CALL {
+    if ast.e_kind(b, src) == ast.E_CALL && two {
         let cnr: u32 = ast.e_a(b, src)
         let coff: u32 = ast.e_b(b, src)
         let ccount: u32 = ast.e_c(b, src)
@@ -4283,11 +4319,8 @@ fn for_pair(p: *mut Parser, fpos: u64) -> u32 {
             arg1 = ast.child_at(b, coff + 1)
         }
     }
-    if !is_enum && !is_zip {
-        complain(p)
-        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
-    }
     if !fe_place_ok(p, arg0) || (is_zip && !fe_place_ok(p, arg1)) {
+        vec_free[u32](&enc)
         complain(p)
         return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
     }
@@ -4320,45 +4353,38 @@ fn for_pair(p: *mut Parser, fpos: u64) -> u32 {
     let zero: u32 = ast.expr_new(b, ast.E_AS, lit, uty, 0, 0)
     pos_default(p, lit, apos)
     pos_default(p, zero, apos)
-    var bind1: u32 = 0
-    var bind2: u32 = 0
+    // the value expressions first (they name the sequences OUTSIDE the body scope)
+    var e0: u32 = 0
+    var e1: u32 = 0
     if is_enum {
-        let at: u32 = ast.expr_new(b, ast.E_ID, idx_nr, 0, 0, 0)
-        pos_default(p, at, n1pos)
-        bind1 = ast.stmt_new(b, ast.S_LET, n1, ast.NOTHING, at, 0)
-        ast.stmt_pos_set(b, bind1, n1pos)
-        let base: u32 = rp_base(p, fe_clone(p, arg0), false)
-        let at2: u32 = ast.expr_new(b, ast.E_ID, idx_nr, 0, 0, 0)
-        pos_default(p, at2, n2pos)
-        let elem: u32 = ast.expr_new(b, ast.E_IDX, base, at2, 0, 0)
-        pos_default(p, elem, apos)
-        bind2 = ast.stmt_new(b, ast.S_LET, n2, ast.NOTHING, elem, 0)
-        ast.stmt_pos_set(b, bind2, n2pos)
+        e0 = ast.expr_new(b, ast.E_ID, idx_nr, 0, 0, 0)
+        pos_default(p, e0, apos)
+        e1 = fe_elem(p, arg0, idx_nr, apos)
+    } else if is_zip {
+        e0 = fe_elem(p, arg0, idx_nr, apos)
+        e1 = fe_elem(p, arg1, idx_nr, apos)
     } else {
-        let base1: u32 = rp_base(p, fe_clone(p, arg0), false)
-        let at1: u32 = ast.expr_new(b, ast.E_ID, idx_nr, 0, 0, 0)
-        pos_default(p, at1, n1pos)
-        let elem1: u32 = ast.expr_new(b, ast.E_IDX, base1, at1, 0, 0)
-        pos_default(p, elem1, apos)
-        bind1 = ast.stmt_new(b, ast.S_LET, n1, ast.NOTHING, elem1, 0)
-        ast.stmt_pos_set(b, bind1, n1pos)
-        let base2: u32 = rp_base(p, fe_clone(p, arg1), false)
-        let at2: u32 = ast.expr_new(b, ast.E_ID, idx_nr, 0, 0, 0)
-        pos_default(p, at2, n2pos)
-        let elem2: u32 = ast.expr_new(b, ast.E_IDX, base2, at2, 0, 0)
-        pos_default(p, elem2, apos)
-        bind2 = ast.stmt_new(b, ast.S_LET, n2, ast.NOTHING, elem2, 0)
-        ast.stmt_pos_set(b, bind2, n2pos)
+        e0 = fe_elem(p, arg0, idx_nr, apos)
     }
     loc_on(p)
-    loc_add(p, n1)
-    loc_add(p, n2)
     loc_add(p, idx_nr)
-    (*p).pre_stmt = bind1
-    (*p).pre_stmt2 = bind2
+    var binds: Vec[u32] = vec_new[u32]()
+    var cur: usize = 0
+    if is_enum || is_zip {
+        cur = 2
+        bind_pat(p, &enc, &cur, e0, &binds)
+        bind_pat(p, &enc, &cur, e1, &binds)
+    } else {
+        bind_pat(p, &enc, &cur, e0, &binds)
+    }
+    var bi: usize = 0
+    while bi < vec_len[u32](&binds) {
+        vec_push[u32](&(*p).pre_list, vec_at[u32](&binds, bi))
+        bi = bi + 1
+    }
+    vec_free[u32](&binds)
+    vec_free[u32](&enc)
     let body: u32 = block(p)
-    (*p).pre_stmt = ast.NOTHING
-    (*p).pre_stmt2 = ast.NOTHING
     loc_off(p)
     return ast.stmt_new(b, ast.S_FOR, idx_nr, zero, len_e, body)
 }

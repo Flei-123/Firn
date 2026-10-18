@@ -11,6 +11,8 @@ rnd = random.Random(seed)
 FILLS = ["", "*", "-", "x", "0", "#", "_", ".", "中", "ä", "€"]
 ALIGN = ["", "<", ">", "^"]
 STRS = ["", "a", "ab", "hello", "hällo", "中文", "x y z", "0123456789"]
+# r708: texts for the `!r` cases (quotes and backslashes change the repr)
+REPR_STRS = STRS + ["it's", 'say "hi"', 'both \' and "', "a\\b", "tab\there", "line\nbreak"]
 
 
 def spec_common(num: bool, types: str, alt_ok: bool, prec_ok: bool, str_kind: bool, group: str = ""):
@@ -104,11 +106,12 @@ for _ in range(n):
         fs, ps = spec_common(True, t, False, has_prec, False, grp)
         cases.append(("f64", repr(float(v)), float(v), fs, ps))
     elif k == "s":
-        v = rnd.choice(STRS)
+        use_repr = rnd.random() < 0.35
+        v = rnd.choice(REPR_STRS if use_repr else STRS)
         t = rnd.choice(["", "s"])
         fs, ps = spec_common(False, t, False, True, True)
-        lit = '"' + v + '"'
-        cases.append(("str", lit, v, fs, ps))
+        lit = '"' + v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t") + '"'
+        cases.append(("strr" if use_repr else "str", lit, v, fs, ps))
     else:
         v = rnd.choice([True, False])
         fs, ps = spec_common(False, "", False, False, True)
@@ -121,7 +124,7 @@ for chunk in range(0, len(cases), per):
     fi.append("fn part%d() {" % (chunk // per))
     for i, (ty, lit, v, fspec, pspec) in enumerate(cases[chunk:chunk + per]):
         # a spec with a '"' or '{' cannot occur (generator alphabet) except the nested fields
-        fi.append("    let v%d: %s = %s" % (i, ty, lit))
+        fi.append("    let v%d: %s = %s" % (i, "str" if ty == "strr" else ty, lit))
         # nested fields: @W@:<digits> -> {wN}, @P@:<digits> -> {pN}
         import re
         m = re.search(r"@W@:(\d+)", fspec)
@@ -132,8 +135,10 @@ for chunk in range(0, len(cases), per):
         if m:
             fi.append("    let p%d: u8 = %s" % (i, m.group(1)))
             fspec = fspec.replace(m.group(0), "{p%d}" % i)
-        fi.append('    show(io.fmt_string(f"[{v%d:%s}]"))' % (i, fspec))
-        if ty == "bool":
+        fi.append('    show(io.fmt_string(f"[{v%d%s:%s}]"))' % (i, "!r" if ty == "strr" else "", fspec))
+        if ty == "strr":
+            exp.append("[" + format(repr(v), pspec) + "]")
+        elif ty == "bool":
             exp.append("[" + format(str(v).lower(), pspec) + "]")
         elif ty == "i64" and "c" in pspec[-1:]:
             exp.append("[" + format(v, pspec) + "]")

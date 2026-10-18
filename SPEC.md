@@ -1604,8 +1604,8 @@ do not push to / clear the Vec inside the body. `firnc1` does NOT know this yet
 literal may stand inside `{ ... }` (`f"{m.get(&r, "name")}"`, braces inside it
 are fine); `"a" + f"{n}"` is a type error ("an f-string is a Fmt builder, not a
 str", use `io.fmt_string(f"..")`) -- it used to compile and give garbage.
-Proof: `tests/3762`, `tests/3763` (`_fmtskip`: firnfmt's lexer does not know the
-nested form yet), `tests/neg/fstring_plus_str.fi`. `firnc1` does not know the
+Proof: `tests/3762`, `tests/3763` (firnfmt keeps the nested literals as
+written, `tools/fmt/cases/fstring_nested`), `tests/neg/fstring_plus_str.fi`. `firnc1` does not know the
 first two (tests carry `// firnc1_skip:`).
 
 **r665 (f-string format specs).** `f"{expr:spec}"` with Python's grammar
