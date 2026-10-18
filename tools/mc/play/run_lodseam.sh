@@ -191,7 +191,7 @@ for bk in $BACKENDS; do
     esac
 done
 if [ $ERR -eq 0 ]; then
-    python3 -I - "$W" "$BACKENDS" "${LODSEAM_FULL_MIN_DB:-24}" "${LODSEAM_FIX_PCT:-0.5}" "${LODSEAM_EXACT_MIN_DB:-34}" <<'PY' || ERR=1
+    python3 -I - "$W" "$BACKENDS" "${LODSEAM_FULL_MIN_DB:-24}" "${LODSEAM_FIX_PCT:-0.5}" "${LODSEAM_EXACT_MIN_DB:-25}" <<'PY' || ERR=1
 import sys, math
 from PIL import Image, ImageChops
 W, backends = sys.argv[1], sys.argv[2].split()
@@ -269,7 +269,7 @@ if "cpu" in allim:
             for v in range(256): se += h[ch * 256 + v] * v * v
         mse = se / (n * 3)
         return n, (99.0 if mse == 0 else 10 * math.log10(255 * 255 / mse)), nz(d.convert("L").point(lambda v: 255 if v > 2 else 0))
-    xmin = float(sys.argv[5]) if len(sys.argv) > 5 else 34.0
+    xmin = float(sys.argv[5]) if len(sys.argv) > 5 else 25.0
     for bk in backends:
         if bk == "cpu": continue
         for n in ("A", "B", "S"):
