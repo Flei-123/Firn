@@ -71,6 +71,12 @@ pub(crate) fn record_of(name: &str) -> String {
     name.to_string()
 }
 
+/// Keeps only the records `keep` accepts (FIR pruning drops the functions
+/// that would have used the others).
+pub(crate) fn retain_records(keep: impl Fn(&str) -> bool) {
+    REG.with(|r| r.borrow_mut().records.retain(|k| keep(k)));
+}
+
 pub(crate) fn has_records() -> bool {
     REG.with(|r| !r.borrow().records.is_empty())
 }

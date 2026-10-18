@@ -68,6 +68,23 @@ zwei komplette Läufe am 08.10.2026):
   rechenintensive Skripte: `FIRN_OPT=release-fast` (die Laufzeit-Zahlen dazu: `bench/RESULTS.md`).
 - Gemessen wird Wandzeit der ganzen Schleife durch `date +%s%N`; die Streuung wegen der Last ist **nicht** statistisch ausgewertet (Unterschied der beiden Läufe ≈ 10–15 %).
 
+## 3b. Kaltstart: FIR-Pruning (18.10.2026)
+Gemessen mit `firn-run --no-cache` (Median von 5, Host Load ~30, dev-fast), `--timings`: Optimizer 34 % + Codegen 37 % der
+Zeit eines Hello gingen an ~744 Funktionen (GC, Runtime, std), von denen 4 erreichbar sind. Der Assembler-Pruner
+(`codegen_x86::prune_unreachable`) lief erst NACH beiden Phasen. Neu: `compiler/src/prune.rs` entfernt unerreichbare
+FIR-Funktionen direkt nach dem Lowering (nur mit `FIRN_PRUNE_FIR=1`, nur hostet x86-64 Linux-Exe; Wurzeln: main, gc_init,
+Exporte, Panic-Handler, Methodentabellen, Thread-Entry bei `ThreadSpawn`).
+| Skript | vorher | nachher |
+|---|---|---|
+| Hello (kalt) | 638 ms | 205 ms |
+| 41 Zeilen mit std.log/fsx/pystr (kalt) | 1190 ms | 730 ms |
+| `firn eval '1 + 2 * 3'` | 641 ms | 307 ms |
+| Hello warm | 4 ms | 4 ms |
+`firn-run` setzt `FIRN_PRUNE_FIR=1` selbst; scheitert der Link (eine Tabelle nennt eine entfernte Funktion), baut es ohne
+Pruning neu. `FIRN_PRUNE=0` schaltet es ab. Prüfung: `bash tools/script_port/prune_check.sh [STEP]` (baut jeden STEP-ten Test mit
+und ohne, vergleicht Ausgabe+Exitcode; 260 Tests: 255 gleich, 0 Link-Fehler nach dem Thread-Fix, 1 Timeout unter Last). Rest-Kosten Hello:
+Lex+Parse+Sema+Lower ~170 ms (gc.fi 5950 Zeilen wird jedes Mal geparst) -> nächster Schritt: Frontend-Cache der GC-Runtime.
+
 ## 4. Vorschlag: der echte `firn`-Treiber (später)
 
 `firn-run` ist ein Shell-Skript und bleibt Prototyp. Ein kleines Firn-Programm `firn` (Subkommandos) würde dieselbe Cache-Logik ohne

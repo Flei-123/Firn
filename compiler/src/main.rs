@@ -75,6 +75,7 @@ mod foreach;
 mod dargs;
 mod moves;
 mod nogc;
+mod prune;
 mod opt;
 mod panic_rt;
 mod panic_rt_a64;
@@ -1105,6 +1106,22 @@ fn run(opts: &Options) -> i32 {
         print!("{}", module.to_text());
         return 0;
     }
+
+    // --- FIR pruning (opt-in, hosted x86-64 Linux executables only) ---
+    if prune::enabled()
+        && matches!(target::active(), target::Target::X86_64)
+        && !target::windows()
+        && !target::shared()
+        && !prof::is_kernel()
+        && !opts.only_object
+        && opts.emit == Emit::Exe
+    {
+        let dropped = prune::prune(&mut module);
+        if opts.stats {
+            eprintln!("prune-fir:  {} functions dropped", dropped);
+        }
+    }
+    tm.mark("prune");
 
     // --- Optimizer ---
     if opts.optimize {

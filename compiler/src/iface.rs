@@ -1337,6 +1337,22 @@ pub(crate) fn table_of(iface: &str, sidx: usize) -> Option<String> {
 
 // ------------------------------------------------------------ Code generator
 
+/// Every function a method table names (roots for FIR pruning).
+pub(crate) fn table_targets() -> Vec<String> {
+    REG.with(|r| {
+        let reg = r.borrow();
+        let mut v = Vec::new();
+        for u in reg.impls.iter().filter(|u| u.ok && u.struct_idx != usize::MAX) {
+            if let Some(ii) = reg.ifaces.iter().position(|s| s.name == u.iface) {
+                for m in &reg.ifaces[ii].methods {
+                    v.push(format!("{}{}{}", u.prefix, crate::impls::SEP, m.name));
+                }
+            }
+        }
+        v
+    })
+}
+
 /// All method tables as one `.rodata` block.
 ///
 /// One table per complete implementation — even for one that never appears
