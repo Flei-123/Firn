@@ -49,6 +49,19 @@ for path, wa in ((sys.argv[1], 255), (sys.argv[2], 150)):  # second pack: transl
         z.writestr("assets/minecraft/blockstates/grass_block.json", json.dumps({"variants": {"": {"model": "block/mdl_grass"}}}))
         z.writestr("assets/minecraft/blockstates/oak_leaves.json", json.dumps({"variants": {"": {"model": "block/mdl_leaves"}}}))
 PY
+# r268: optional REAL vanilla water_still (animated 16 x 512 strip, alpha 180): BZ_REAL_WATER=<path of water_still.png> (+ <path>.mcmeta) adds run WR
+if [ -n "${BZ_REAL_WATER:-}" ] && [ -s "$BZ_REAL_WATER" ]; then
+    python3 -I - "$W/pack.zip" "$W/pack_r.zip" "$BZ_REAL_WATER" <<'PY' || fail "cannot build the real water pack"
+import sys, zipfile, os
+src, dst, real = sys.argv[1:4]
+with zipfile.ZipFile(src) as zi, zipfile.ZipFile(dst, "w") as zo:
+    for n in zi.namelist():
+        if n != "assets/minecraft/textures/block/water_still.png": zo.writestr(n, zi.read(n))
+    zo.writestr("assets/minecraft/textures/block/water_still.png", open(real, "rb").read())
+    meta = real + ".mcmeta"
+    zo.writestr("assets/minecraft/textures/block/water_still.png.mcmeta", open(meta, "rb").read() if os.path.exists(meta) else '{"animation":{"frametime":2}}')
+PY
+fi
 MCV=1.20.1
 mkdir -p "$W/srv"
 bash tools/mcclient/fetch_server.sh "$W/srv" "$MCV" || fail "server download"
@@ -162,6 +175,10 @@ if [ "${BZ_NO_WATER:-0}" != "1" ]; then
         run_one WT MCPLAY_WATER_TINT=1 MCPLAY_BIOME_ZOOM=1 MC_PACKS="$W/pack_t.zip"
         run_one WG MCPLAY_WATER_TINT=1 MCPLAY_BIOME_ZOOM=1 MCPLAY_GL=1
         run_one WV MCPLAY_WATER_TINT=1 MCPLAY_BIOME_ZOOM=1 MCPLAY_GFX=vk
+        if [ -s "$W/pack_r.zip" ]; then
+            WATER_NAMES="$WATER_NAMES WR"
+            run_one WR MCPLAY_WATER_TINT=1 MCPLAY_BIOME_ZOOM=1 MC_PACKS="$W/pack_r.zip"
+        fi
     fi
 fi
 for n in Z0B0 Z1B0 Z0B2 Z1B2 Z1B2b $WATER_NAMES; do
@@ -248,7 +265,8 @@ if [ $ERR -eq 0 ] && [ -n "$WATER_NAMES" ]; then
 import sys, json
 from PIL import Image, ImageChops
 W = sys.argv[1]
-names = ("WOFF", "WZ0B0", "WZ1B0", "WZ1B2", "WZ1B2b", "WT", "WG", "WV")
+import os
+names = ("WOFF", "WZ0B0", "WZ1B0", "WZ1B2", "WZ1B2b", "WT", "WG", "WV") + (("WR",) if os.path.exists(f"{W}/WR.png") else ())
 im = {n: Image.open(f"{W}/{n}.png").convert("RGB") for n in names}
 for n in names: im[n].paste((0, 0, 0), (0, 0, 170, 60))
 def nz(a, b): return sum(ImageChops.difference(a, b).convert("L").point(lambda v: 255 if v > 0 else 0).histogram()[255:])
@@ -290,7 +308,7 @@ for n in names:
 print("rows", *[f"{n}:{res[n]['rows']}/{res[n]['range']}/{res[n]['distinct']}" for n in names],
       "LR", *[f"{n}:L={res[n]['L']},R={res[n]['R']}".replace(" ", "") for n in names],
       "diffWB0", nz(im["WZ0B0"], im["WZ1B0"]), "diffWB2", nz(im["WOFF"], im["WZ1B2"]), "diffWtint", nz(im["WOFF"], im["WZ1B0"]),
-      "wdet", nz(im["WZ1B2"], im["WZ1B2b"]), "wtr", nz(im["WZ1B2"], im["WT"]), "psnrGL", round(psnr(im["WG"], im["WZ1B2"]), 2), "psnrVK", round(psnr(im["WV"], im["WZ1B2"]), 2), "total", 640 * 360)
+      "wdet", nz(im["WZ1B2"], im["WZ1B2b"]), "wtr", nz(im["WZ1B2"], im["WT"]), "wreal", (nz(im["WZ1B2"], im["WR"]) if "WR" in im else 0), "psnrGL", round(psnr(im["WG"], im["WZ1B2"]), 2), "psnrVK", round(psnr(im["WV"], im["WZ1B2"]), 2), "total", 640 * 360)
 json.dump(res, open(f"{W}/wstats.json", "w"))
 for a, b, nm in (("WOFF", "WZ1B2", "cmp_water_tint"), ("WZ0B0", "WZ1B0", "cmp_water_zoom")):
     c = Image.new("RGB", (1280, 360)); c.paste(im[a], (0, 0)); c.paste(im[b], (640, 0)); c.save(f"{W}/{nm}.png")
@@ -305,7 +323,7 @@ st = json.load(open(sys.argv[1])); t = sys.argv[2].split()
 ok = True
 def bad(m):
     global ok; ok = False; print("  FAIL ", m)
-v = {t[i]: int(t[i + 1]) for i in range(len(t) - 1) if t[i] in ("diffWB0", "diffWB2", "diffWtint", "wdet", "wtr", "total") and t[i + 1].lstrip("-").isdigit()}
+v = {t[i]: int(t[i + 1]) for i in range(len(t) - 1) if t[i] in ("diffWB0", "diffWB2", "diffWtint", "wdet", "wtr", "wreal", "total") and t[i + 1].lstrip("-").isdigit()}
 pg = [float(t[i + 1]) for i in range(len(t) - 1) if t[i] in ("psnrGL", "psnrVK")]
 if len(pg) != 2 or min(pg) < 30.0: bad(f"GL / Vulkan water picture vs CPU: PSNR {pg} dB (need >= 30; the zoom border differs by sub pixel edge rules, see r261)")
 def dist(a, b): return max(abs(a[c] - b[c]) for c in range(3))
@@ -330,6 +348,12 @@ if v.get("wdet", 1) != 0: bad(f"water zoom ON is not deterministic: {v.get('wdet
 w = st["WT"]
 if w["rows"] < 60: bad(f"translucent water: border found in only {w['rows']} rows")
 if v.get("wtr", 0) < 20000: bad(f"translucent water picture equals the opaque one ({v.get('wtr')} px differ)")
+if "WR" in st:
+    r = st["WR"]  # real vanilla texture: grey texels x tint, alpha 180 over the stone floor; the biome border must stay visible and differ from the white fixture
+    if dist(r["L"], r["R"]) < 20: bad(f"real water_still: colour does not follow the biome ({r['L']} vs {r['R']})")
+    if r["rows"] < 60: bad(f"real water_still: border found in only {r['rows']} rows")
+    if v.get("wreal", 0) < 20000: bad(f"real water_still picture equals the fixture one ({v.get('wreal')} px differ)")
+    if min(r["L"]) < 20 or max(r["L"]) > 250: bad(f"real water_still: implausible water colour {r['L']}")
 sys.exit(0 if ok else 1)
 PY
     fi
