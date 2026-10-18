@@ -63,6 +63,8 @@ def lock_acquire(wait_max_s=7200):
     while True:
         if os.path.exists(LOCK):
             age = time.time() - os.path.getmtime(LOCK)
+            if open(LOCK).read().startswith(WHO):
+                break  # our own lock (e.g. from a previous phase/install step)
             if age >= LOCK_MAX_AGE_S:
                 break  # stale
             if time.time() - t0 > wait_max_s:
@@ -96,6 +98,14 @@ def pct(sorted_vals, p):
 def med(vals):
     vals = [v for v in vals if v is not None]
     return round(statistics.median(vals), 3) if vals else None
+
+
+def preflight(apps):
+    pk = sh("pm list packages com.fleitec.bench")
+    miss = [x for x in apps if "package:" + APPS[x]["pkg"] not in pk]
+    if miss:
+        raise RuntimeError("apps not installed on device: %s (install the APKs from "
+                           "/root/jarvis-android-builds/bench/ first)" % miss)
 
 
 def prep_device():
@@ -524,6 +534,7 @@ def main():
             lock_acquire()
         try:
             prep_device()
+            preflight(target if isinstance(target, list) else [target])
             result = {"phase": ph, "date": datetime.datetime.now().isoformat(timespec="seconds"), "serial": SERIAL,
                       "model": sh("getprop ro.product.model").strip(), "android": sh("getprop ro.build.version.release").strip(),
                       "battery_start": battery_state(), "apps": {}}
