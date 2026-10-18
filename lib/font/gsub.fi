@@ -35,15 +35,17 @@
 //                 and 3, with ClassDef: `gsub_context` finds the first rule
 //                 that matches at a position and hands back its
 //                 SubstLookupRecords (position + lookup number); the
-//                 caller applies them (nested type 1 and 4, in place).
+//                 caller applies them (nested type 1, 2, 4 and again 5/6).
+//   Multiple      type 2: one output replaces the glyph; SEVERAL outputs make
+//                 the first the glyph of the position and the rest EXTRA
+//                 glyphs of the same character (`gsub_x_insert`), painted
+//                 behind it in reading direction.
 //   ccmp          is taken along (bit F_CCMP, every Arabic position); DejaVu
 //                 carries two chaining lookups under it (Hebrew ayin with
 //                 vowel, the tone letters U+02E5..).
 //
 // WHAT IS NOT READ, and it is said here instead of silently missing:
-// type 2 with more than one output glyph (multiple substitution needs
-// INSERTING into the glyph array, which the per-character arrays of
-// lib/fui/shape.fi cannot do), type 3 and 8 (alternate and reverse
+// type 3 and 8 (alternate and reverse
 // substitution), and nested lookups that are themselves context
 // lookups. DejaVu needs none of them for `arab`. GPOS (the position of the vowel signs) is likewise not read;
 // how vowel signs nevertheless end up in the right place is stated in
@@ -61,6 +63,8 @@ export {
     gsub_is_mark, gsub_context, gsub_act_count, gsub_act_pos,
     gsub_act_lookup, gsub_li_type, gsub_li_single, gsub_li_ligature,
     gsub_li_ignores_marks, gsub_context_li, gsub_open, gsub_multiple_len, gsub_multiple_glyph,
+    gsub_x_reset, gsub_x_count, gsub_x_pos, gsub_x_gid, gsub_x_set,
+    gsub_x_room, gsub_x_insert, MAX_EXTRA,
     F_ISOL, F_FINA, F_INIT, F_MEDI, F_RLIG, F_LIGA, F_RQD, F_CCMP,
     MAX_LOOKUPS,
 }
@@ -79,6 +83,9 @@ const F_CCMP: u32 = 128
 // This many lookups `gsub_init` remembers at most. DejaVu Sans needs
 // nine for `arab`.
 const MAX_LOOKUPS: usize = 48
+
+// The table of EXTRA glyphs (see `gsub_x_insert`) holds this many entries.
+const MAX_EXTRA: usize = 64
 
 // The lookup flag IgnoreMarks from the lookup head.
 const LF_IGNORE_MARKS: u32 = 8
@@ -105,6 +112,14 @@ struct Gsub {
     act_pos: [u32; 8],
     act_li: [u32; 8],
     nact: usize,
+    // The EXTRA glyphs: a multiple substitution (type 2) that makes several
+    // glyphs of one makes the first the glyph of the position and puts the
+    // rest here, as (position, glyph) in glyph order. Entries of one position
+    // stand in the order of the glyphs; entries of different positions are
+    // not sorted. Reset by `gsub_x_reset` at the start of every shaping run.
+    xn: usize,
+    xpos: [u32; 64],
+    xgid: [u32; 64],
 }
 
 #[no_gc]
@@ -115,6 +130,7 @@ fn gsub_new() -> Gsub {
         c_gids: 0, c_skip: 0, c_n: 0, c_ign: 0, c_mode: 0, c_st: 0,
         c_cdb: 0, c_cdi: 0, c_cda: 0, ipos: [0; 16],
         act_pos: [0; 8], act_li: [0; 8], nact: 0,
+        xn: 0, xpos: [0; 64], xgid: [0; 64],
     }
 }
 
@@ -557,8 +573,9 @@ fn gsub_li_ligature(f: *mut ttf.Font, g: *mut Gsub, li: u32, gids: u64,
 
 // MULTIPLE SUBSTITUTION (type 2): the number of glyphs the lookup `li`
 // makes of `gid`, 0 if it does not apply. `gsub_multiple_glyph` is the j-th.
-// More than one glyph needs INSERTING into the glyph array; the caller
-// (lib/fui/shape.fi) can only take the one-glyph case.
+// More than one glyph does not fit the per-character glyph array of
+// lib/fui/shape.fi: the first is the glyph of the position, the rest go
+// into the table of EXTRA glyphs (`gsub_x_insert`) of the same cluster.
 #[no_gc]
 fn multiple_seq(f: *mut ttf.Font, g: *mut Gsub, li: u32, gid: u32) -> usize {
     let lk: usize = lookup_li(f, g, li)
@@ -593,6 +610,58 @@ fn gsub_multiple_glyph(f: *mut ttf.Font, g: *mut Gsub, li: u32, gid: u32,
         return gid
     }
     return u16at(f, sq + 2 + j * 2)
+}
+
+// ------------------------------------------------------ EXTRA GLYPHS
+//
+// The arrays of lib/fui/shape.fi hold ONE glyph per character. A multiple
+// substitution with n > 1 output glyphs keeps that: the first output is the
+// glyph of the position, outputs 2..n are EXTRA glyphs, they belong to the
+// same character (= the same cluster: caret, selection and hit test see one
+// unit) and are painted behind (left to right) the glyph of the position.
+
+#[no_gc]
+fn gsub_x_reset(g: *mut Gsub) { (*g).xn = 0 }
+
+#[no_gc]
+fn gsub_x_count(g: *mut Gsub) -> usize { return (*g).xn }
+
+#[no_gc]
+fn gsub_x_pos(g: *mut Gsub, i: usize) -> usize { return (*g).xpos[i] as usize }
+
+#[no_gc]
+fn gsub_x_gid(g: *mut Gsub, i: usize) -> u32 { return (*g).xgid[i] }
+
+#[no_gc]
+fn gsub_x_set(g: *mut Gsub, i: usize, gid: u32) { (*g).xgid[i] = gid }
+
+// How many more extra glyphs fit.
+#[no_gc]
+fn gsub_x_room(g: *mut Gsub) -> usize { return MAX_EXTRA - (*g).xn }
+
+// Put `gid` as the k-th extra glyph (k from 0) of position `pos`: in front of
+// the extras that the position had, so inserting k = 0, 1, 2 .. in a row
+// gives their order. false if the table is full (nothing changed).
+#[no_gc]
+fn gsub_x_insert(g: *mut Gsub, pos: usize, k: usize, gid: u32) -> bool {
+    if (*g).xn >= MAX_EXTRA {
+        return false
+    }
+    var i0: usize = 0
+    while i0 < (*g).xn && (*g).xpos[i0] != pos as u32 {
+        i0 = i0 + 1
+    }
+    let at: usize = i0 + k
+    var j: usize = (*g).xn
+    while j > at {
+        (*g).xpos[j] = (*g).xpos[j - 1]
+        (*g).xgid[j] = (*g).xgid[j - 1]
+        j = j - 1
+    }
+    (*g).xpos[at] = pos as u32
+    (*g).xgid[at] = gid
+    (*g).xn = (*g).xn + 1
+    return true
 }
 
 // ------------------------------------------------------ CONTEXT (5, 6)

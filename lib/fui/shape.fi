@@ -68,7 +68,7 @@ import font.ttf
 import font.gsub
 
 export {
-    shape_run, shape_forms, shape_is_arabic,
+    shape_run, shape_forms, apply_acts, multi_apply, single_apply, shape_is_arabic,
     SHAPE_NONE, SHAPE_GSUB, SHAPE_FORMS,
     FORM_NONE, FORM_OTHER,
     LAM,
@@ -197,29 +197,90 @@ fn form_bit(fm: u8) -> u32 {
     return 0
 }
 
+// MULTIPLE SUBSTITUTION (type 2) of lookup `li` at position `q`. One output
+// glyph replaces the glyph of the position; several: the first is the glyph
+// of the position, the others go into the table of EXTRA glyphs of the Gsub
+// (they belong to the same character, so the cluster map stays: one
+// character -> its glyph + its extras). A full table leaves everything as it
+// was.
+#[no_gc]
+fn multi_apply(f: *mut ttf.Font, g: *mut gsub.Gsub, gid: u64, li: u32,
+    q: usize) {
+    let g1: u32 = r32(gid, q)
+    let m: usize = gsub.gsub_multiple_len(f, g, li, g1)
+    if m == 0 {
+        return
+    }
+    if m > 1 && gsub.gsub_x_room(g) < m - 1 {
+        return
+    }
+    w32(gid, q, gsub.gsub_multiple_glyph(f, g, li, g1, 0))
+    var j: usize = 1
+    while j < m {
+        let ok: bool = gsub.gsub_x_insert(g, q, j - 1,
+            gsub.gsub_multiple_glyph(f, g, li, g1, j))
+        j = j + 1
+    }
+}
+
+// A single substitution (type 1) at position `q` for the glyph of the
+// position AND its extra glyphs.
+#[no_gc]
+fn single_apply(f: *mut ttf.Font, g: *mut gsub.Gsub, gid: u64, li: u32,
+    ign: bool, q: usize) {
+    let g1: u32 = r32(gid, q)
+    if !(ign && gsub.gsub_is_mark(f, g, g1)) {
+        w32(gid, q, gsub.gsub_li_single(f, g, li, g1))
+    }
+    var e: usize = 0
+    while e < gsub.gsub_x_count(g) {
+        if gsub.gsub_x_pos(g, e) == q {
+            let x1: u32 = gsub.gsub_x_gid(g, e)
+            if !(ign && gsub.gsub_is_mark(f, g, x1)) {
+                gsub.gsub_x_set(g, e, gsub.gsub_li_single(f, g, li, x1))
+            }
+        }
+        e = e + 1
+    }
+}
+
+// How deep a context lookup may call context lookups.
+const NEST_MAX: u32 = 6
+
 // The SubstLookupRecords that `gsub_context` found: each names a position
-// and a lookup of the font. Single (1), one-glyph multiple (2) and ligature
-// (4) are applied in place; a multiple substitution with several output
-// glyphs would need INSERTING into the arrays (they are per character) and
-// is left alone, as is a nested context lookup.
+// and a lookup of the font. Single (1), multiple (2, several output glyphs go
+// into the extra glyphs), ligature (4) are applied in place; a CONTEXT lookup
+// (5, 6) as the target is matched at that position and its own records are
+// applied the same way, NEST_MAX deep. Nested lookups reuse the scratch of the
+// Gsub, so the records are copied first.
 #[no_gc]
 fn apply_acts(f: *mut ttf.Font, g: *mut gsub.Gsub, gid: u64, del: u64,
-    n: usize, used: u64, na: usize) {
+    n: usize, used: u64, na: usize, depth: u32) {
+    var ap: [u32; 8] = [0; 8]
+    var al: [u32; 8] = [0; 8]
+    var cnt: usize = na
+    if cnt > 8 {
+        cnt = 8
+    }
+    var c: usize = 0
+    while c < cnt {
+        ap[c] = gsub.gsub_act_pos(g, c) as u32
+        al[c] = gsub.gsub_act_lookup(g, c)
+        c = c + 1
+    }
     var j: usize = 0
-    while j < na {
-        let q: usize = gsub.gsub_act_pos(g, j)
-        let li: u32 = gsub.gsub_act_lookup(g, j)
+    while j < cnt {
+        let q: usize = ap[j] as usize
+        let li: u32 = al[j]
         let nty: u32 = gsub.gsub_li_type(f, g, li)
         let nign: bool = gsub.gsub_li_ignores_marks(f, g, li)
         let g1: u32 = r32(gid, q)
         if q < n && r8(del, q) == 0 as u8
         && !(nign && gsub.gsub_is_mark(f, g, g1)) {
             if nty == 1 as u32 {
-                w32(gid, q, gsub.gsub_li_single(f, g, li, g1))
+                single_apply(f, g, gid, li, nign, q)
             } else if nty == 2 as u32 {
-                if gsub.gsub_multiple_len(f, g, li, g1) == 1 {
-                    w32(gid, q, gsub.gsub_multiple_glyph(f, g, li, g1, 0))
-                }
+                multi_apply(f, g, gid, li, q)
             } else if nty == 4 as u32 {
                 var nu: usize = 0
                 let lg: u32 = gsub.gsub_li_ligature(f, g, li, gid, del, n, q,
@@ -232,6 +293,9 @@ fn apply_acts(f: *mut ttf.Font, g: *mut gsub.Gsub, gid: u64, del: u64,
                         u = u + 1
                     }
                 }
+            } else if (nty == 5 as u32 || nty == 6 as u32) && depth < NEST_MAX {
+                let nn: usize = gsub.gsub_context_li(f, g, li, gid, del, n, q)
+                apply_acts(f, g, gid, del, n, used, nn, depth + 1)
             }
         }
         j = j + 1
@@ -263,6 +327,7 @@ fn shape_run(t: u64, f: *mut ttf.Font, g: *mut gsub.Gsub, use_gsub: bool,
     cp: u64, cls0: u64, lev: u64, n: usize, gid: u64, del: u64,
     form: u64, used: u64, missing: *mut usize) -> u32 {
     *missing = 0
+    gsub.gsub_x_reset(g)
     // 1. die Glyphen, samt L4
     var i: usize = 0
     while i < n {
@@ -300,8 +365,11 @@ fn shape_run(t: u64, f: *mut ttf.Font, g: *mut gsub.Gsub, use_gsub: bool,
                 if applies {
                     let g0: u32 = r32(gid, p)
                     if ty == 1 as u32 {
+                        single_apply(f, g, gid, gsub.gsub_lookup_index(g, k),
+                            ign, p)
+                    } else if ty == 2 as u32 {
                         if !(ign && gsub.gsub_is_mark(f, g, g0)) {
-                            w32(gid, p, gsub.gsub_single(f, g, k, g0))
+                            multi_apply(f, g, gid, gsub.gsub_lookup_index(g, k), p)
                         }
                     } else if ty == 4 as u32 {
                         var nu: usize = 0
@@ -319,7 +387,7 @@ fn shape_run(t: u64, f: *mut ttf.Font, g: *mut gsub.Gsub, use_gsub: bool,
                         if !(ign && gsub.gsub_is_mark(f, g, g0)) {
                             let na: usize = gsub.gsub_context(f, g, k, gid,
                                 del, n, p)
-                            apply_acts(f, g, gid, del, n, used, na)
+                            apply_acts(f, g, gid, del, n, used, na, 0 as u32)
                         }
                     }
                 }
