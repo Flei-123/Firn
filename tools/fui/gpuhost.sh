@@ -4,7 +4,7 @@
 #
 #     bash tools/fui/gpuhost.sh [--bench]
 #
-#   gpuhost_main (hello window) runs 5 times on one Xvfb:
+#   gpuhost/main (hello window) runs 5 times on one Xvfb:
 #     cpu      FUI_GPU unset                -> CPU painter (the reference)
 #     vk       FUI_GPU=1                    -> fUi painted on Vulkan, canvas read back, CPU present; X shot + canvas == CPU (PSNR >= 34),
 #                                              also after a window resize (640x400 -> 500x300: the canvas target is made again)
@@ -30,7 +30,7 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$D/xdg}"
 "$FIRNC" --opt-level=dev -o "$D/smoke" tools/fui/gpuvk_main.fi 2>"$D/err" || { echo "   FAIL: compile gpuvk_main.fi"; head -5 "$D/err"; exit 1; }
 "$D/smoke" >/dev/null 2>&1; rc=$?
 if [ "$rc" = 4 ]; then echo "   SKIP: no Vulkan device"; exit 0; fi
-"$FIRNC" --opt-level=dev -o "$D/gpuhost" tools/fui/gpuhost_main.fi 2>"$D/err" || { echo "   FAIL: compile gpuhost_main.fi"; head -5 "$D/err"; exit 1; }
+"$FIRNC" --opt-level=dev -o "$D/gpuhost" tools/fui/gpuhost/main.fi 2>"$D/err" || { echo "   FAIL: compile gpuhost/main.fi"; head -5 "$D/err"; exit 1; }
 mkfifo "$D/disp"; Xvfb -displayfd 3 -screen 0 1920x1200x24 -dpi 96 -nolisten tcp 3>"$D/disp" >/dev/null 2>&1 & XP=$!
 read -r -t 20 n <"$D/disp" || { echo "   SKIP: Xvfb did not start"; exit 0; }
 export DISPLAY=":$n"
