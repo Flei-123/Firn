@@ -243,6 +243,22 @@ pictures), so page and app see the same photos.
 * Check: `tools/android/voicedemo` + `bash tools/android/voice_check.sh` (emulator API 35 x86_64: 10/10).
   The program must drain events (`next_event`) or Android raises an ANR on the focus event.
 
+## Real device (Xiaomi 14T Pro, HyperOS, Android 16, arm64) -- 18.10.2026
+Measured with `tools/android/xiaomi_adb.ps1` over ADB (fUi counter, FirnCam `--camera --release`, JARVIS `--speech --tts`,
+all arm64, built from main with `build.sh` / `jarvis_build.sh`; own test packages, removed afterwards).
+- Install: HyperOS shows "Install this app via USB?" and CANCELS after ~10 s (`INSTALL_FAILED_USER_RESTRICTED: Install canceled by
+  user`). A scripted `input tap` on the "Install" button works. The first start of a new package is held by the Xiaomi security scan
+  (a few seconds), start it again afterwards.
+- **Camera**: an APK installed with a plain `adb install` (installer `null`) gets `Camera "0" disabled by policy` from CameraService
+  although CAMERA is granted. The same APK installed with `adb install -r -i com.google.android.packageinstaller` opens the camera
+  (cam 29-30 fps, ui 60 fps, preview 1220x2019, max frame gap 21 ms). Not an app bug: test camera builds with `-i`.
+- Screenshots: pull the file (`screencap -p /sdcard/x.png`, `adb pull`); a PowerShell 5 `>` redirect corrupts the PNG.
+- Counter: cold start 365-639 ms (`am start -W` TotalTime, 4 starts, no death at the first start = r775 fix holds), tap works, HOME and
+  back keeps the process and the state. FirnCam cold 182 ms, HOT return 49 ms. JARVIS shows the login screen.
+- Harmless log line after HOME: `libEGL: call to OpenGL ES API with no current context (logged once per thread)` -- the surface was
+  dropped (`CMD_TERM_WINDOW`) and the program draws once more before the next swap; the window comes back correct.
+- Not done on the real device: overlay relaunch check (changes a system overlay) and rotation (changes a system setting).
+
 ## Open
 
 * fUi apps (apphost) get the soft keyboard through dex classes (r114, see below); the plain Firn window host
