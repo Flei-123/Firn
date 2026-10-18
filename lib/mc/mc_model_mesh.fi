@@ -894,6 +894,84 @@ fn is_translucent_name(h: u64, n: usize) -> bool {
     return false
 }
 
+// Fluid amount 1..8 of a water state string ("level=N"): level 0 = source (8), 1..7 = flowing (8 - level), 8..15 = falling (8). Own height = amount / 9 (vanilla).
+fn water_amount(sp: u64, sn: usize) -> i32 {
+    var off: usize = 0
+    let k: str = "level"
+    let n: usize = mc_model.props_get(sp, sn, k.p as u64, k.length(), &off)
+    if n == 0 { return 8 }
+    var lv: i32 = 0
+    var i: usize = 0
+    while i < n {
+        lv = lv * 10 + ((rt.ld8(sp, off + i) as i32) - 48)
+        i = i + 1
+    }
+    if lv <= 0 || lv >= 8 { return 8 }
+    return 8 - lv
+}
+
+// Vanilla FlowingFluid height of the padded cell (px, py, pz): water with water above = 1, water = amount / 9, other non-solid = 0, solid / unknown = -1.
+fn water_h(m: *mut ModelSet, pad: u64, t: *mut mc_mesh.MeshTables, px: i32, py: i32, pz: i32) -> f64 {
+    let id: u16 = rt.ld16(pad, ((py * 18 + pz) * 18 + px) as usize)
+    if id == mc_mesh.UNKNOWN_ID || (id as usize) >= NSTATE_MAX { return 0.0 - 1.0 }
+    let am: u8 = rt.ld8((*m).wtab, id as usize)
+    if am != (0 as u8) {
+        if py < 17 {
+            let up: u16 = rt.ld16(pad, (((py + 1) * 18 + pz) * 18 + px) as usize)
+            if (up as usize) < NSTATE_MAX && up != mc_mesh.UNKNOWN_ID && rt.ld8((*m).wtab, up as usize) != (0 as u8) { return 1.0 }
+        }
+        return (am as f64) / 9.0
+    }
+    if (id as usize) < 32768 && (rt.ld8((*t).opaque, id as usize) & (1 as u8)) != (0 as u8) { return 0.0 - 1.0 }
+    return 0.0
+}
+
+fn water_add(acc: *mut [f64; 2], f: f64) {
+    if f >= 0.8 {
+        (*acc)[0] = (*acc)[0] + f * 10.0
+        (*acc)[1] = (*acc)[1] + 10.0
+    } else if f >= 0.0 {
+        (*acc)[0] = (*acc)[0] + f
+        (*acc)[1] = (*acc)[1] + 1.0
+    }
+}
+
+// Vanilla LiquidBlockRenderer.calculateAverageHeight: h1 = own height, h2 / h3 = the two edge neighbours, (dx, dz) = the diagonal cell.
+fn water_corner(m: *mut ModelSet, pad: u64, t: *mut mc_mesh.MeshTables, px: i32, py: i32, pz: i32, h1: f64, h2: f64, h3: f64) -> f64 {
+    if h3 >= 1.0 || h2 >= 1.0 { return 1.0 }
+    var acc: [f64; 2] = [0.0; 2]
+    if h3 > 0.0 || h2 > 0.0 {
+        let hd: f64 = water_h(m, pad, t, px, py, pz)
+        if hd >= 1.0 { return 1.0 }
+        water_add(&acc, hd)
+    }
+    water_add(&acc, h1)
+    water_add(&acc, h3)
+    water_add(&acc, h2)
+    if acc[1] <= 0.0 { return h1 }
+    return acc[0] / acc[1]
+}
+
+// Top heights of the 4 corners of water cell (px, py, pz), index cz * 2 + cx (cx / cz = 0 at the low x / z edge).
+fn water_corners(m: *mut ModelSet, pad: u64, t: *mut mc_mesh.MeshTables, px: i32, py: i32, pz: i32, out: *mut [f64; 4]) {
+    let f: f64 = water_h(m, pad, t, px, py, pz)
+    if f >= 1.0 {
+        (*out)[0] = 1.0
+        (*out)[1] = 1.0
+        (*out)[2] = 1.0
+        (*out)[3] = 1.0
+        return
+    }
+    let hn: f64 = water_h(m, pad, t, px, py, pz - 1)
+    let fs: f64 = water_h(m, pad, t, px, py, pz + 1)
+    let fe: f64 = water_h(m, pad, t, px + 1, py, pz)
+    let fw: f64 = water_h(m, pad, t, px - 1, py, pz)
+    (*out)[0] = water_corner(m, pad, t, px - 1, py, pz - 1, f, hn, fw)
+    (*out)[2] = water_corner(m, pad, t, px - 1, py, pz + 1, f, fs, fw)
+    (*out)[3] = water_corner(m, pad, t, px + 1, py, pz + 1, f, fs, fe)
+    (*out)[1] = water_corner(m, pad, t, px + 1, py, pz - 1, f, hn, fe)
+}
+
 // Bakes state `s` for variant `v` (0..NVAR-1). Sets kind / weighted on v == 0. Returns the quad count (0 = nothing usable).
 fn bake_state(m: *mut ModelSet, s: usize, v: usize) -> u32 {
     var name: rt.Buf = rt.buf_new()
@@ -922,7 +1000,7 @@ fn bake_state(m: *mut ModelSet, s: usize, v: usize) -> u32 {
         nq = mc_model.water_cube_bake(&b)
         if nq > 0 {
             model = true
-            rt.st8((*m).wtab, s, 1 as u8)
+            rt.st8((*m).wtab, s, water_amount(rt.buf_ptr(&props), rt.buf_len(&props)) as u8)
         }
     } else {
         nq = mc_model.blockstate_bake((*m).st, bname, pstr, seed, &b)
@@ -1194,6 +1272,8 @@ fn ms_mesh_split_bio(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.Mesh
                     v = (mc_model.seed_from_pos(wx + x - 1, wy + y, wz + z) % (NVAR as u32)) as usize
                 }
                 var bc: [u32; 3] = [0 as u32; 3] // blended biome colours of this block per tint class, bit 24 = computed
+                var wc: [f64; 4] = [1.0; 4] // water corner heights of this block (water_corners), lazily
+                var wc_on: bool = false
                 var cnt: u32 = 0 as u32
                 let q: u64 = ms_resolve(m, id, v, &cnt)
                 if q == 0 { continue }
@@ -1234,9 +1314,30 @@ fn ms_mesh_split_bio(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.Mesh
                             stq(dst, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + c)) + ((x - 1) as f64))
                             c = c + 1
                         }
+                        // water: the top vertices (baked y = 1) sit at the vanilla corner heights; side faces shorten their V by the same amount
+                        var wyv: [f64; 4] = [0.0; 4]
+                        var wdv: [f64; 4] = [0.0; 4]
+                        var iswater: bool = false
+                        if rt.ld8((*m).wtab, id as usize) != (0 as u8) {
+                            iswater = true
+                            if !wc_on {
+                                water_corners(m, pad, t, x, y + 1, z + 1, &wc)
+                                wc_on = true
+                            }
+                        }
+                        let qdir: i32 = math.math_f64(rt.ld64(q, i * PQ_WORDS + 25)) as i32
                         c = 0
                         while c < 4 {
-                            stq(dst, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 4 + c)) + (y as f64))
+                            var yv: f64 = math.math_f64(rt.ld64(q, i * PQ_WORDS + 4 + c))
+                            if iswater && yv > 0.5 {
+                                var ci: usize = 0
+                                if math.math_f64(rt.ld64(q, i * PQ_WORDS + 8 + c)) > 0.5 { ci = 2 }
+                                if math.math_f64(rt.ld64(q, i * PQ_WORDS + c)) > 0.5 { ci = ci + 1 }
+                                yv = wc[ci]
+                                if qdir >= 2 { wdv[c] = 1.0 - wc[ci] }
+                            }
+                            wyv[c] = yv
+                            stq(dst, 1, yv + (y as f64))
                             c = c + 1
                         }
                         c = 0
@@ -1246,7 +1347,9 @@ fn ms_mesh_split_bio(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.Mesh
                         }
                         c = 0
                         while c < 8 {
-                            stq(dst, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 12 + c)))
+                            var uvv: f64 = math.math_f64(rt.ld64(q, i * PQ_WORDS + 12 + c))
+                            if c >= 4 { uvv = uvv + wdv[c - 4] }
+                            stq(dst, 1, uvv)
                             c = c + 1
                         }
                         stq(dst, 1, math.math_f64(rt.ld64(q, i * PQ_WORDS + 20)))
