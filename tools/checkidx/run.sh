@@ -83,7 +83,9 @@ for src in tools/checkidx/idx_read.fi tools/checkidx/idx_write.fi \
            tools/checkidx/idx_u8.fi tools/checkidx/idx_nested.fi \
            tools/checkidx/idx_mask_oob.fi tools/checkidx/idx_dom_oob.fi \
            tools/checkidx/phi_oob.fi tools/checkidx/vidx_off_oob.fi \
-           tools/checkidx/vidx_pop_oob.fi; do
+           tools/checkidx/vidx_pop_oob.fi tools/checkidx/vstore_pop_oob.fi \
+           tools/checkidx/vstore_other_oob.fi tools/checkidx/vsign_end_oob.fi \
+           tools/checkidx/vsign_neg_oob.fi; do
     name=$(basename "$src" .fi)
     for lvl in $LEVELS_CHECKED; do
         msg0=""; msg1=""; rc0=0; rc1=0
@@ -256,7 +258,22 @@ vopt=$("$FIRNC" --emit=fir-opt --opt-level=release-safe tools/checkidx/vidx_ok.f
 if [ "$vopt" = 0 ]; then ok; else
     bad "vidx_ok: $vopt checked_idxv left, expected 0"
 fi
-for src in tools/checkidx/vidx_off_oob.fi tools/checkidx/vidx_pop_oob.fi; do
+# r759/r760: element stores in the loop and a signed counter below the length
+# leave no check; the abort cases keep theirs.
+for okf in vstore_ok vsign_ok; do
+    vopt=$("$FIRNC" --emit=fir-opt --opt-level=release-safe tools/checkidx/$okf.fi 2>/dev/null | grep -c "checked_idxv")
+    if [ "$vopt" = 0 ]; then ok; else
+        bad "$okf: $vopt checked_idxv left, expected 0"
+    fi
+    for lvl in $LEVELS_CHECKED; do
+        if build "$FIRNC" "$lvl" tools/checkidx/$okf.fi "$TMPD/vok" && "$TMPD/vok" > /dev/null 2>&1; then ok; else
+            bad "$okf [$lvl]: did not build or exit code not 0"
+        fi
+    done
+done
+for src in tools/checkidx/vidx_off_oob.fi tools/checkidx/vidx_pop_oob.fi \
+           tools/checkidx/vstore_pop_oob.fi tools/checkidx/vstore_other_oob.fi \
+           tools/checkidx/vsign_end_oob.fi tools/checkidx/vsign_neg_oob.fi; do
     kopt=$("$FIRNC" --emit=fir-opt --opt-level=release-safe "$src" 2>/dev/null | grep -c "checked_idxv")
     if [ "$kopt" -ge 1 ]; then ok; else
         bad "$(basename "$src"): the check that must stay was removed"

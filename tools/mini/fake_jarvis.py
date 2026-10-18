@@ -18,7 +18,14 @@
 # Push: GET /api/m/push/poll?since=N&wait=S is a real long poll (wait capped by FAKE_POLL_MAX, default 5 s); a test injects an event
 # with POST /fake/push {"title","body","cid","type"} (no login) -> {"id": N}. Event ids start at 1000 (FAKE_EVENT_BASE).
 # Text "file" in a chat message -> the server sends a file event (report.txt) that the client fetches over /file/.
-import asyncio, json, os, sys, time
+# REALISTIC DATA (default on, FAKE_REALISTIC=0 = the old tiny answers): the WebSocket `info` is shaped like the real server's
+# (server.js ~4154: active_model, efforts, devices, deviceInfo, models, modelIds, caps, labels, providers, running, partials,
+# runStarts, beats, asks, newModels) with FAKE_NRUNNING (30) running chats whose live text `partials` are FAKE_PARTIAL_MIN_KB..
+# FAKE_PARTIAL_MAX_KB (50..200) each = a few MB; every second WS connection sends it ASCII-escaped (\\ud83d\\ude00 pairs), the others
+# as raw UTF-8. /api/m/chats lists FAKE_NCHATS (150) chats (emoji, umlauts, 300-char titles, null/empty titles, null parents) and
+# /api/m/chats/<id> serves any of them with big answers (code, tables, CJK, emoji, control chars). FAKE_STREAM=1: after `info` the
+# server streams tokens of the other running chats all the time (the client must skip them).
+import asyncio, json, os, random, sys, time
 from urllib.parse import unquote, urlparse, parse_qs, quote
 from http import HTTPStatus
 from websockets.asyncio.server import serve
@@ -32,6 +39,110 @@ seq = 0
 CONV["c1"] = [{"role": "user", "text": "hi", "at": "2026-10-17T18:00:00Z"}, {"role": "assistant", "text": "hello\n>STATUS: status=done", "at": "2026-10-17T18:00:05Z"}]
 
 CONV["c2"] = [{"role": "user", "text": "second question", "at": "2026-10-17T19:00:00Z"}, {"role": "assistant", "text": "second answer\n>STATUS: status=done", "at": "2026-10-17T19:00:05Z"}]
+
+
+# ------------------------------------------------------------------ realistic data (shapes of the real server)
+REAL = os.environ.get("FAKE_REALISTIC", "1") != "0"
+NCHATS = int(os.environ.get("FAKE_NCHATS", "150"))
+NRUNNING = int(os.environ.get("FAKE_NRUNNING", "30"))
+PMIN = int(os.environ.get("FAKE_PARTIAL_MIN_KB", "50")) * 1024
+PMAX = int(os.environ.get("FAKE_PARTIAL_MAX_KB", "200")) * 1024
+STREAM = os.environ.get("FAKE_STREAM", "0") == "1"
+MODELS = ["opus", "sonnet", "haiku", "fable", "hy3", "glm"]
+SNIPPETS = [
+    "Wird erledigt, Boss. Größe: 42 MB, Übergabe über Straße: ä ö ü Ä Ö Ü ß €.\n",
+    "```js\nconst a = { \"k\": [1, 2, 3], 'q': `tpl ${x}` }; // \\ backslash \\\\ double\n```\n",
+    "| Spalte | Wert | Notiz |\n|---|---|---|\n| ä | \U0001F600 | ✅ |\n| ö | \U0001F680 | ❌ |\n",
+    "Emoji: \U0001F600 \U0001F680 \U0001F468‍\U0001F469‍\U0001F467‍\U0001F466 \U0001F1E6\U0001F1F9 ✅ ❌ ⚠️ zero​width rtl‮abc\n",
+    "CJK: 你好，世界。日本語のテキスト。한국어 텍스트 Русский текст العربية\n",
+    "Tab\there, CRLF here\r\nquotes \"x\" and a literal \\u00e4 and a literal \\n and \\\\ and / slash\n",
+    "> quote line\n- list a\n- list b\n  1. nested\n    - deeper\n",
+    "# Heading\n**bold** _it_ `code` [link](https://example.com/?a=1&b=2) ~~strike~~\n",
+    "<b>html</b> &amp; </script> <!-- x --> <img src=x onerror=1>\n",
+    "ctrl \x01\x02\x1f del \x7f nul-ish \x0b\x0c end\n",
+    "Astral \U0001d514\U0001d52b\U0001d526\U0001d520\U0001d52c\U0001d521\U0001d522 \U00010348 \U00020b9e plane chars\n",
+    "x" * 3000 + "\n",
+    "Wort " * 400 + "\n",
+]
+
+def rich_text(rng, n):
+    out = []; tot = 0
+    while tot < n:
+        sn = rng.choice(SNIPPETS)
+        out.append(sn); tot += len(sn.encode("utf-8"))
+    return "".join(out)[:n].rstrip("\ud800") if n else ""
+
+def chat_title(i):
+    k = i % 10
+    if k == 1: return "\U0001F680 Größe Übergabe äöü – Emoji \U0001F600 Chat %d" % i
+    if k == 2: return ("Sehr langer Titel " * 20 + str(i))[:300]
+    if k == 3: return None
+    if k == 4: return ""
+    if k == 5: return "你好世界 日本語 %d" % i
+    if k == 6: return "Quote \"x\" \\ back / slash <b> %d" % i
+    if k == 7: return "\U0001F468‍\U0001F469‍\U0001F467 family %d" % i
+    return "worker task %d" % i
+
+def chat_row(i):
+    return {"id": "w%03d" % i, "title": chat_title(i), "kind": "worker" if i % 3 else "chat",
+            "updatedAt": 1760000000000 - i * 60000, "running": i < NRUNNING,
+            "fav": i % 11 == 0, "parent": None if i % 4 else "o1"}
+
+def all_chats():
+    base = [{"id": "c1", "title": "worker one", "kind": "worker", "updatedAt": 1760000000001, "running": True, "fav": True, "parent": None},
+            {"id": "c2", "title": "worker two", "kind": "worker", "updatedAt": 1760000000002, "running": False, "fav": False, "parent": None},
+            {"id": "o1", "title": "Leitstand", "kind": "orchestrator", "updatedAt": 5, "running": False, "fav": False, "parent": None}]
+    if not REAL:
+        return base
+    return base + [chat_row(i) for i in range(max(0, NCHATS - 3))]
+
+def gen_messages(cid):
+    seed = sum(ord(ch) * (k + 1) for k, ch in enumerate(cid))
+    rng = random.Random(seed)
+    n = 8 + seed % 40
+    msgs = []
+    for i in range(n):
+        role = "user" if i % 2 == 0 else "assistant"
+        size = rng.choice([40, 200, 1500, 6000, 6000]) if role == "assistant" else rng.choice([20, 80, 300])
+        txt = rich_text(rng, size)
+        if role == "assistant":
+            txt += "\n>STATUS: status=done braucht_nutzer=\"\" naechster_schritt=\"ä\"" 
+        m = {"role": role, "text": txt, "at": 1760000000000 + i * 1000}
+        if i == 3: m["images"] = [{"url": "/file/u1/%s/img.png" % cid}]
+        msgs.append(m)
+    return msgs
+
+def real_info(conn_no):
+    running = ["c1"] + ["w%03d" % i for i in range(max(0, NRUNNING - 1))]
+    rng = random.Random(1000 + conn_no)
+    partials = {cid: rich_text(rng, rng.randint(PMIN, PMAX)) for cid in running if cid != "c1"}
+    now = int(time.time() * 1000)
+    info = {"type": "info", "user": "justin", "active_model": "opus", "active_effort": "max", "thinking": False,
+            "efforts": ["low", "medium", "high", "max"],
+            "devices": ["Dell", "OrientOS-VM", "HOLO-LAPTOP-3"],
+            "deviceInfo": [{"name": "Dell", "type": "Windows", "online": True}, {"name": "OrientOS-VM", "type": "Windows", "online": True},
+                           {"name": "HOLO-LAPTOP-3", "type": "Windows", "online": True}, {"name": "Pixel ä\U0001F600", "type": None, "online": False}],
+            "models": MODELS, "modelIds": {m: "claude-%s-5-5" % m for m in MODELS},
+            "caps": {m: {"thinking": m in ("opus", "fable"), "effort": m != "haiku", "vision": m != "glm"} for m in MODELS},
+            "labels": {m: {"label": m.capitalize() + " ★", "blurb": "Modell „%s“ für alles \U0001F680" % m} for m in MODELS},
+            "providers": {m: ("anthropic" if m in ("opus", "sonnet", "haiku", "fable") else "other") for m in MODELS},
+            "running": running, "partials": partials,
+            "runStarts": {cid: now - 1000 * (7 + k) for k, cid in enumerate(running)},
+            "beats": {cid: {"startedAt": now - 5000 * (k + 1), "idleMs": 120 * k, "kind": ("tool" if k % 2 else "text"),
+                            "name": (None if k % 3 == 0 else "mcp__jarvis__run_shell"), "note": ("" if k % 4 else "warte auf ä\U0001F600"), "sleepMs": 0}
+                      for k, cid in enumerate(running)},
+            "asks": [{"id": "ask%d" % k, "cid": running[k], "workerCid": None if k == 0 else running[k + 1],
+                      "questions": [{"question": "Welche Variante ä \U0001F600?", "options": ["A", {"label": "B ü"}, None], "multi": k == 1}]}
+                     for k in range(2)],
+            "newModels": ["gamma-1", None]}
+    return info
+
+def info_text(conn_no):
+    # even connection numbers: raw UTF-8 like node's JSON.stringify; odd: ASCII-escaped (surrogate pairs as \\ud83d\\ude00)
+    if not REAL:
+        return json.dumps({"type": "info", "user": "justin", "running": []})
+    return json.dumps(real_info(conn_no), ensure_ascii=(conn_no % 2 == 1))
+CONNS = 0
 
 def cookie_ok(headers):
     for c in headers.get_all("Cookie"):
@@ -154,16 +265,30 @@ def rest(method, rawpath, hdr, body):
         if mp == "devices":
             return out(200, {"devices": [{"name": "Dell", "type": "Windows", "online": True}, {"name": "Phone", "type": "Android", "online": False}]})
         if mp == "chats" and method == "GET":
-            return out(200, {"total": 3, "chats": [{"id": "c1", "title": "worker one", "kind": "worker", "updatedAt": 1760000000001, "running": True, "fav": True, "parent": None},
-                                                    {"id": "c2", "title": "worker two", "kind": "worker", "updatedAt": 1760000000002, "running": False, "fav": False, "parent": None},
-                                                    {"id": "o1", "title": "Leitstand", "kind": "orchestrator", "updatedAt": 5, "running": False, "fav": False, "parent": None}]})
+            allc = all_chats()
+            if not REAL:
+                return out(200, {"total": 3, "chats": allc})
+            lim = max(1, min(100, int(q.get("limit", ["30"])[0] or 30))); off = max(0, int(q.get("offset", ["0"])[0] or 0))
+            qq = (q.get("q", [""])[0] or "").lower()
+            if qq: allc = [c for c in allc if qq in str(c["title"] or "").lower()]
+            return out(200, {"total": len(allc), "chats": allc[off:off + lim]})
         if mp.startswith("chats/") and method == "GET":
             cid = unquote(mp[len("chats/"):])
-            if cid not in CONV:
+            row = next((c for c in all_chats() if c["id"] == cid), None)
+            if cid not in CONV and not (REAL and row):
                 return out(404, {"error": "Not found"})
-            return out(200, {"chat": {"id": cid, "title": "worker one", "kind": "worker", "running": False, "partial": "", "beat": None},
-                             "first": 0, "hasMore": False,
-                             "messages": [dict(m, i=i, at=1760000000000 + i) for i, m in enumerate(CONV[cid])]})
+            msgs = CONV[cid] if cid in CONV else gen_messages(cid)
+            lim = max(1, min(100, int(q.get("limit", ["30"])[0] or 30)))
+            end = len(msgs)
+            if "before" in q: end = max(0, min(end, int(q["before"][0] or 0)))
+            lo = max(0, end - lim)
+            part = ""
+            if REAL and row and row.get("running") and cid != "c1":
+                part = rich_text(random.Random(7), 6000)
+            return out(200, {"chat": {"id": cid, "title": (row or {}).get("title", "worker one") if row else "worker one", "kind": (row or {}).get("kind", "worker"),
+                                      "running": False if not part else True, "partial": part, "beat": None},
+                             "first": lo, "hasMore": lo > 0,
+                             "messages": [dict(m, i=i, at=1760000000000 + i) for i, m in enumerate(msgs) if lo <= i < end]})
         if mp == "push/register" and method == "POST":
             return out(200, {"pushToken": "00112233445566778899aabbccddeeff", "relay": {"host": "127.0.0.1", "port": 7781, "tls": False, "pin": None, "hello": True, "sni": None}, "poll": "/api/m/push/poll"})
         if mp == "push/test" and method == "POST":
@@ -258,7 +383,27 @@ async def send(ws, obj):
 async def handler(ws):
     global seq
     q = asyncio.Queue()
-    await send(ws, {"type": "info", "user": "justin", "running": []})
+    global CONNS
+    CONNS += 1
+    itext = info_text(CONNS - 1)
+    LOG.write(json.dumps({"type": "info_sent", "bytes": len(itext), "conn": CONNS}) + "\n")
+    await ws.send(itext)
+    streamer = None
+    if STREAM and REAL:
+        async def pump():
+            rng = random.Random(CONNS)
+            k = 0
+            try:
+                while True:
+                    cid = "w%03d" % rng.randint(0, max(0, NRUNNING - 2))
+                    k += 1
+                    if k % 40 == 0: await send(ws, {"type": "thinking", "cid": cid})
+                    elif k % 55 == 0: await send(ws, {"type": "tool", "cid": cid, "name": "mcp__jarvis__run_shell"})
+                    else: await send(ws, {"type": "token", "cid": cid, "content": rich_text(rng, rng.randint(20, 600))})
+                    await asyncio.sleep(0.02)
+            except Exception:
+                pass
+        streamer = asyncio.ensure_future(pump())
     async for raw in ws:
         m = json.loads(raw)
         LOG.write(json.dumps(m) + "\n")

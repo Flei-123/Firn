@@ -851,6 +851,10 @@ build uia
 "$W/uia" | tail -n 3
 build syspref
 "$W/syspref" | tail -n 3
+# W40-a hostpref: the host reads transparency / high contrast (FUI_TRANSPARENCY, FUI_CONTRAST) in a real X11 window on an own Xvfb
+hp_rc=0
+HP=$(FIRNC="$FIRNC" sh tools/fui/hostpref.sh 2>&1) || hp_rc=$?
+[ "$hp_rc" -eq 0 ] || [ "$hp_rc" -eq 77 ] || { echo "$HP"; exit 1; }
 # W26-d: gap list P1 rows #5 (size classes), #21 (combobox filter), #67 (timeline), #64 (localised standard texts)
 build sizeclass
 "$W/sizeclass" | tail -n 3
@@ -920,14 +924,14 @@ for f in tools/fui/*_main.fi demos/*/main.fi examples/*/main.fi; do
         "$FIRNC" --opt-level=dev -o "$W/baupruefung" "$f" >/dev/null
     fi
 done
-echo "  alle tools/fui/*_main.fi, demos/*/main.fi und examples/*/main.fi uebersetzen  OK"
+echo "  all tools/fui/*_main.fi, demos/*/main.fi and examples/*/main.fi compile  OK"
 # W37: programs in their OWN folder (tools/fui/<name>/main.fi). Directly under tools/fui a Windows build would pick up
 # tools/fui/window/backend.fi (X11) instead of the Win32 backend -- so the Windows-capable ones live in a subfolder.
 for f in tools/fui/uialive/main.fi tools/fui/gpuhost/main.fi; do
     "$FIRNC" --opt-level=dev -o "$W/baupruefung" "$f" >/dev/null
     "$FIRNC" --opt-level=dev --target=x86_64-windows -o "$W/baupruefung.exe" "$f" >/dev/null
 done
-echo "  tools/fui/uialive und tools/fui/gpuhost (Linux + Windows) uebersetzen  OK"
+echo "  tools/fui/uialive and tools/fui/gpuhost (Linux + Windows) compile  OK"
 missing_any=0
 for f in tools/fui/*_main.fi demos/fuidemo/main.fi; do
     n=$(basename "$f" _main.fi)

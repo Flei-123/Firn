@@ -22,10 +22,12 @@
 // CULL: a quad with a cullface is dropped when the neighbour cell in that direction is opaque (tables.opaque bit 0) or unknown (not loaded).
 // LIGHT: sky / block nibble of the cell in FRONT of a culled-face quad (the neighbour), else of the cell itself; no light array = sky 15 / block 0.
 // TINT (r236): a quad with a tintindex gets a colour by block class (grass / foliage / water / birch / spruce / lily pad / redstone wire; defaults =
-// the plains colours, ms_set_tint changes them; there is NO per position biome blend: the cube path has no biome colours either).
+// the plains colours, ms_set_tint changes them). BIOME TINT (r242): ms_load_biomes + ms_mesh_split_bio colour grass / foliage / water by the biome of the 4x4x4 cell
+// (no smooth blend between cells; the cube path has no biome colours).
 // AO (r236): per corner 0..3 like the cube mesher (3 = open) for quads that lie flat on a cell face (dir 0..5); other quads stay 3.
-// TRANSLUCENCY (r236): quads of glass / ice / slime / honey states go to the second stream (ms_mesh_split `out_t`, MESH_MODEL_T); the rest is cut out
-// at alpha 128. NOT done: smooth light per corner, per position biome tint, GL / VK back ends.
+// TRANSLUCENCY (r236 / r242): quads of glass / ice / slime / honey states AND quads whose texture is partly transparent (ms_set_atlas: >= 25% of the
+// visible texels have alpha 1..254) go to the second stream (ms_mesh_split `out_t`, MESH_MODEL_T), drawn far to near with a src-alpha blend by the texel
+// alpha; the rest is cut out at alpha 128. NOT done: smooth light per corner, biome blend across cells.
 import std.rt
 import std.core
 import std.math
@@ -34,15 +36,21 @@ import mc.mc_assets
 import mc.mc_registry
 import mc.mc_texext
 import mc.mc_mesh
+import mc.mc_chunk
+import mc.mc_texture
+import mc.mc_biome_tint
 
 export {
     ModelSet, PQ_WORDS, ms_new, ms_blank, ms_reset, ms_free, ms_set_tint, ms_prepare, ms_patch_opaque, ms_mesh, ms_mesh_split, ms_state_parts, ms_kind, ms_resolve, ms_tex_tile, ms_quad_count,
-    MQ_WORDS, K_UNKNOWN, K_PLAIN, K_MODEL, NVAR,
+    MQ_WORDS, K_UNKNOWN, K_PLAIN, K_MODEL, NVAR, BIO_OFF, BIO_BYTES, ms_load_biomes, ms_has_biomes, ms_set_atlas, ms_tile_translucent, ms_snap_bio, ms_mesh_split_bio, ms_biome_color,
 }
 
 const MQ_WORDS: usize = 30 // output quad: x0..3 y0..3 z0..3 (block units, section relative), u0..3 v0..3 (tile units), tile, shade 0..256, sky, block, tint (R | G << 8 | B << 16, -1 none), flags (bit 0 translucent), ao0..3
 const PQ_WORDS: usize = 30 // prepared quad: the first 24 as above (unit block coordinates), 24 cullface (-1 / 0..5), 25 direction (-1 / 0..5), 26 tint class (-1 none), 27 translucent, 28 flat on its face (ao), 29 unused
 const NTINT: usize = 8
+const BT_MAXID: usize = 1024 // biome ids covered by the per biome colour table
+const BIO_OFF: usize = 11664 // byte offset of the biome grid behind a block pad (u16 [18^3])
+const BIO_BYTES: usize = 128 // 4x4x4 u16 cells, index (y*4 + z)*4 + x, section local
 const NSTATE_MAX: usize = 32768
 const NVAR: usize = 4
 const NTEX: usize = 256
@@ -66,11 +74,13 @@ struct ModelSet {
     unmapped: usize, // quads dropped because their texture has no atlas tile
     lk: u64, // heap word: spin lock of the lazy bake (mesh jobs of several threads share one ModelSet)
     tint: [u32; 8], // 0xRRGGBB per tint class: 0 grass 1 foliage 2 water 3 birch 4 spruce 5 lily pad 6 redstone wire
+    atlas: u64, // *mut mc_texture.Atlas or 0: texel alpha decides the translucent class too (ms_set_atlas)
+    btab: u64, // u32 [3 * BT_MAXID] per biome id: grass / foliage / water, bit 24 = valid (0 = class colour); 0 = no biome tint (ms_load_biomes)
 }
 
 fn ms_new(reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack, ex: *mut mc_texext.TexExt) -> ModelSet {
     var m: ModelSet = ModelSet { reg: reg, st: st, ex: ex, kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0,
-        nmodel: 0, unmapped: 0, lk: 0,
+        nmodel: 0, unmapped: 0, lk: 0, atlas: 0, btab: 0,
         tint: [0x91BD59 as u32, 0x77AB2F as u32, 0x3F76E4 as u32, 0x80A755 as u32, 0x619961 as u32, 0x208030 as u32, 0x4B0000 as u32, 0xFFFFFF as u32] }
     m.lk = rt.heap_alloc(8)
     rt.st64(m.lk, 0, 0 as u64)
@@ -95,7 +105,7 @@ fn ms_new(reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack, ex: *mut
 // A ModelSet without tables (nothing allocated, ms_free is a no-op): placeholder for a struct field until ms_new runs.
 fn ms_blank() -> ModelSet {
     return ModelSet { reg: 0 as u64 as *mut mc_registry.Registry, st: 0 as u64 as *mut mc_assets.PackStack, ex: 0 as u64 as *mut mc_texext.TexExt,
-        kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0, nmodel: 0, unmapped: 0, lk: 0,
+        kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0, nmodel: 0, unmapped: 0, lk: 0, atlas: 0, btab: 0,
         tint: [0 as u32; 8] }
 }
 
@@ -106,14 +116,135 @@ fn ms_reset(m: *mut ModelSet) {
     let st: *mut mc_assets.PackStack = (*m).st
     let ex: *mut mc_texext.TexExt = (*m).ex
     let tn: [u32; 8] = (*m).tint
+    let had_bio: bool = (*m).btab != 0
+    let at: u64 = (*m).atlas
     ms_free(m)
     *m = ms_new(reg, st, ex)
     (*m).tint = tn
+    (*m).atlas = at
+    if had_bio { ms_load_biomes(m) }
 }
 
 // Colour 0xRRGGBB of a tint class (0 grass 1 foliage 2 water 3 birch 4 spruce 5 lily pad 6 redstone wire). Call before meshing (or follow with a remesh).
 fn ms_set_tint(m: *mut ModelSet, cls: usize, rgb: u32) {
     if cls < NTINT { (*m).tint[cls] = rgb }
+}
+
+// ---- biome tint (r242) -------------------------------------------------------------------------------
+
+fn hex6(p: u64, i: usize) -> u32 {
+    var v: u32 = 0 as u32
+    var k: usize = 0
+    while k < 6 {
+        let c: u8 = rt.ld8(p, i + k)
+        var d: u32 = 0 as u32
+        if c >= (97 as u8) { d = (c - (87 as u8)) as u32 } else if c >= (65 as u8) { d = (c - (55 as u8)) as u32 } else { d = (c - (48 as u8)) as u32 }
+        v = (v << (4 as u32)) | d
+        k = k + 1
+    }
+    return v
+}
+
+// Reads the grass / foliage / water colour of every biome of the registry (matched by name against mc_biome_tint, generated by
+// tools/mc/gen_biome_tint.py) into a table by biome id and turns the per biome tint ON: ms_mesh_split_bio then colours quads of tint class 0 / 1 / 2
+// by the biome of their 4x4x4 cell. Biomes without an entry keep the class colour.
+fn ms_load_biomes(m: *mut ModelSet) {
+    if (*m).btab == 0 { (*m).btab = rt.heap_alloc(3 * BT_MAXID * 4) }
+    rt.mem_set((*m).btab, 0 as u8, 3 * BT_MAXID * 4)
+    let d: u64 = mc_biome_tint.BT_DATA.p as u64
+    let dn: usize = mc_biome_tint.BT_LEN
+    let nb: i32 = mc_registry.reg_biome_count((*m).reg)
+    var bi: i32 = 0
+    while bi < nb {
+        var nl: usize = 0
+        var np: u64 = mc_registry.reg_biome_name((*m).reg, bi, &nl)
+        let id: i32 = mc_registry.reg_biome_id((*m).reg, bi)
+        bi = bi + 1
+        if id < 0 || (id as usize) >= BT_MAXID { continue }
+        if nl > 10 && rt.mem_eq(np, "minecraft:".p as u64, 10) {
+            np = np + (10 as u64)
+            nl = nl - 10
+        }
+        // entries are "name:GGGGGG:FFFFFF:WWWWWW" separated by ';'
+        var i: usize = 0
+        while i < dn {
+            var e: usize = i
+            while e < dn && rt.ld8(d, e) != (59 as u8) { e = e + 1 }
+            // name = i .. (e - 21)
+            if e - i > 21 {
+                let ln: usize = e - i - 21
+                if ln == nl && rt.mem_eq(d + (i as u64), np, nl) {
+                    let o: usize = i + ln + 1
+                    rt.st32((*m).btab, (id as usize), hex6(d, o) | (16777216 as u32))
+                    rt.st32((*m).btab, BT_MAXID + (id as usize), hex6(d, o + 7) | (16777216 as u32))
+                    rt.st32((*m).btab, 2 * BT_MAXID + (id as usize), hex6(d, o + 14) | (16777216 as u32))
+                    break
+                }
+            }
+            i = e + 1
+        }
+    }
+}
+
+fn ms_has_biomes(m: *mut ModelSet) -> bool { return (*m).btab != 0 }
+
+// ---- translucency by texel alpha (r242) ---------------------------------------------------------------
+
+// The atlas whose texels decide the translucent class (call before meshing; the pointer stays valid across hot reloads, the pixels are read at bake time,
+// so ms_reset after a reload). Without an atlas only the block names (glass / ice / slime / honey) decide.
+fn ms_set_atlas(m: *mut ModelSet, a: *mut mc_texture.Atlas) {
+    (*m).atlas = a as u64
+}
+
+// true when the atlas tile `tile` (1 based) is partly transparent: at least a quarter of its visible texels (alpha > 0) have alpha 1..254. Such a
+// texture (ice, stained glass, honey, slime, custom glass) is blended in the translucent pass; textures that only have alpha 0 / 255 (leaves, plants,
+// vanilla clear glass) and the odd soft edge texel stay cut out. false without an atlas.
+fn ms_tile_translucent(m: *mut ModelSet, tile: u32) -> bool {
+    if (*m).atlas == 0 || tile == 0 as u32 { return false }
+    let a: *mut mc_texture.Atlas = (*m).atlas as *mut mc_texture.Atlas
+    if (*a).px == 0 || (*a).cols < 1 || (*a).tile < 1 { return false }
+    let t: i32 = (tile as i32) - 1
+    let col: i32 = t % (*a).cols
+    let row: i32 = t / (*a).cols
+    if (row + 1) * (*a).tile > (*a).h { return false }
+    var vis: usize = 0
+    var part: usize = 0
+    var y: i32 = 0
+    while y < (*a).tile {
+        var x: i32 = 0
+        while x < (*a).tile {
+            let px: u32 = rt.ld32((*a).px, (((row * (*a).tile + y) * (*a).w) + col * (*a).tile + x) as usize)
+            let al: u32 = px >> (24 as u32)
+            if al > (0 as u32) { vis = vis + 1 }
+            if al > (0 as u32) && al < (255 as u32) { part = part + 1 }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return vis > 0 && part * 4 >= vis
+}
+
+// Colour 0xRRGGBB of tint class `cls` (0 grass 1 foliage 2 water) in biome `bid`, or the class colour when the biome has no entry.
+fn ms_biome_color(m: *mut ModelSet, cls: usize, bid: usize) -> u32 {
+    if (*m).btab != 0 && cls < 3 && bid < BT_MAXID {
+        let e: u32 = rt.ld32((*m).btab, cls * BT_MAXID + bid)
+        if (e >> (24 as u32)) != (0 as u32) { return e & (16777215 as u32) }
+    }
+    return (*m).tint[cls]
+}
+
+// Copies the 64 biome cells (4x4x4, u16 global ids, index (y*4 + z)*4 + x) of a section into `out` (BIO_BYTES bytes). Call from the snapshot
+// code while the section pointer is valid; `sec` = 0 fills biome 0.
+fn ms_snap_bio(sec: u64, out: u64) {
+    var i: usize = 0
+    while i < 64 {
+        if sec == 0 || (*(sec as *mut mc_chunk.Section)).biomes.pal == 0 {
+            rt.st16(out, i, 0 as u16)
+        } else {
+            rt.st16(out, i, mc_chunk.container_get(&(*(sec as *mut mc_chunk.Section)).biomes, i))
+        }
+        i = i + 1
+    }
 }
 
 fn ms_lock(m: *mut ModelSet) {
@@ -143,6 +274,10 @@ fn ms_free(m: *mut ModelSet) {
     rt.heap_free((*m).tnames, NTEX * 64)
     rt.heap_free((*m).ttiles, NTEX * 4)
     rt.heap_free((*m).lk, 8)
+    if (*m).btab != 0 {
+        rt.heap_free((*m).btab, 3 * BT_MAXID * 4)
+        (*m).btab = 0
+    }
 }
 
 // ---- state string -------------------------------------------------------------------------------
@@ -409,7 +544,9 @@ fn bake_state(m: *mut ModelSet, s: usize, v: usize) -> u32 {
                 var tc: f64 = 0.0 - 1.0
                 if mc_model.baked_f(&b, i, mc_model.W_TINT) >= 0.0 { tc = tcls as f64 }
                 rt.st64(buf, o * PQ_WORDS + 26, math.math_bits(tc))
-                rt.st64(buf, o * PQ_WORDS + 27, math.math_bits(trn))
+                var qtrn: f64 = trn
+                if qtrn < 0.5 && ms_tile_translucent(m, tile) { qtrn = 1.0 }
+                rt.st64(buf, o * PQ_WORDS + 27, math.math_bits(qtrn))
                 rt.st64(buf, o * PQ_WORDS + 28, math.math_bits(flat_on_face(buf, o, dir)))
                 rt.st64(buf, o * PQ_WORDS + 29, math.math_bits(0.0))
                 o = o + 1
@@ -604,6 +741,11 @@ fn ms_mesh(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.MeshTables, wx
 // quad to `out` (cleared first); translucent quads (glass, ice ...) go to `out_t` (cleared too). Returns the opaque quad count; the translucent
 // count is rt.buf_len(out_t) / (MQ_WORDS * 8). Tint, flags and AO: see MQ_WORDS.
 fn ms_mesh_split(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.MeshTables, wx: i32, wy: i32, wz: i32, out: *mut rt.Buf, out_t: *mut rt.Buf) -> usize {
+    return ms_mesh_split_bio(m, pad, lpad, t, wx, wy, wz, out, out_t, 0)
+}
+
+// ms_mesh_split with biome tint: `bio` = the BIO_BYTES grid of ms_snap_bio (0 = class colours only; also needs ms_load_biomes).
+fn ms_mesh_split_bio(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.MeshTables, wx: i32, wy: i32, wz: i32, out: *mut rt.Buf, out_t: *mut rt.Buf, bio: u64) -> usize {
     rt.buf_clear(out)
     rt.buf_clear(out_t)
     var nq: usize = 0
@@ -683,7 +825,10 @@ fn ms_mesh_split(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.MeshTabl
                         let tcls: i32 = math.math_f64(rt.ld64(q, i * PQ_WORDS + 26)) as i32
                         var tv: f64 = 0.0 - 1.0
                         if tcls >= 0 && (tcls as usize) < NTINT {
-                            let rgb: u32 = (*m).tint[tcls as usize]
+                            var rgb: u32 = (*m).tint[tcls as usize]
+                            if bio != 0 && tcls < 3 {
+                                rgb = ms_biome_color(m, tcls as usize, rt.ld16(bio, (((y / 4) * 4 + (z / 4)) * 4 + ((x - 1) / 4)) as usize) as usize)
+                            }
                             tv = (((rgb >> (16 as u32)) & (255 as u32)) | (rgb & (65280 as u32)) | ((rgb & (255 as u32)) << (16 as u32))) as f64
                         }
                         stq(dst, 1, tv)
