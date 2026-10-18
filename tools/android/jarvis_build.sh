@@ -51,6 +51,7 @@ fi
 bash "$ROOT/tools/android/build.sh" "$ROOT/examples/jarvis_android/main.fi" --name "$LABEL" --package "$PKGNAME" $PLAIN \
     --version-code "$VCODE" --version-name "$VERSION" \
     --permission android.permission.INTERNET \
+    --permission android.permission.ACCESS_NETWORK_STATE \
     --permission android.permission.REQUEST_INSTALL_PACKAGES \
     --permission android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION \
     --abi "$ABI" --install --push --pick --speech --tts --out "$APK"

@@ -83,6 +83,7 @@ import net.url
 import net.http
 import net.dns
 import async.adns
+import std.crypto.sha256
 import tls.x509
 import tls.trust
 import async.loop
@@ -98,6 +99,7 @@ export {
     NL_TIMEOUT, NL_CLOSED, NL_CANCELLED, NL_OTHER,
     areq_status, areq_body_ptr, areq_body_len,
     areq_header, areq_response, areq_final_url_ptr, areq_final_url_len,
+    areq_set_sink, areq_sink_got, areq_sink_digest, areq_sink_failed,
     areq_hops, areq_is_tls, areq_cancel, areq_set_max_body, areq_error_name,
     areq_elapsed_ms, aclient_active, aclient_completed,
     Got, get_all, got_free_all, got_body,
@@ -169,6 +171,13 @@ struct Request {
     defer_pending: bool, // deferred_fail will still look at this request
     busy: u32,
     dq: *mut adns.AQuery, // the DNS lookup in flight (phase P_RESOLVE), else 0
+    // a sink: the body of a 200 answer goes to this file (not into memory), hashed on the way
+    sink_fd: i64, // -1 = none
+    sink_got: u64,
+    sink_failed: bool, // the write to the file failed
+    sink_sha: sha256.Sha256,
+    sink_cb: fn(u64, u64) -> u32, // (ud, octets so far) -> nonzero = abort
+    sink_ud: u64,
 }
 
 // `size_of` needs a generic parameter outside the root file (see stream.fi).
@@ -324,7 +333,8 @@ fn aclient_request(a: *mut AClient, method: u64, nm: usize, u: u64, n: usize,
         t0: loop.mono_ms(), t_end: 0, scan: 0, remaining: 0, maxbody: http.BODY_MAX,
         addrs: [0; 8], naddr: 0, iaddr: 0, port: 0 as u16, secure: false,
         is_tls_done: false, gone: false, defer_pending: false, busy: 0,
-        dq: 0 as *mut adns.AQuery }
+        dq: 0 as *mut adns.AQuery, sink_fd: 0 - 1, sink_got: 0, sink_failed: false,
+        sink_sha: sha256.sha256_new(), sink_cb: sink_none, sink_ud: 0 }
     rt.buf_push_bytes(&(*rq).meth, method, nm)
     rt.buf_push_bytes(&(*rq).body, body, nb)
     rt.buf_push_bytes(&(*rq).ctype, ctype, nct)
@@ -587,8 +597,69 @@ fn hexv(ch: u8) -> i32 {
     return 0 - 1
 }
 
+fn sink_none(ud: u64, got: u64) -> u32 {
+    return 0 as u32
+}
+
+// H4b  A SINK (`areq_set_sink`): a 200 answer's body is written to an open
+//     file descriptor as it comes (and hashed with SHA-256), never held in
+//     memory; the size limit is `areq_set_max_body` over the octets written.
+//     Call it right after `aclient_get` returns (the first byte of the answer
+//     comes later, from the loop). The descriptor stays the caller's.
+//     `cb(ud, got)` runs after every write; a nonzero result aborts the
+//     request with AE_CANCELLED. Redirect bodies and error pages are not written.
+fn areq_set_sink(rq: *mut Request, fd: i64, cb: fn(u64, u64) -> u32, ud: u64) {
+    (*rq).sink_fd = fd
+    (*rq).sink_cb = cb
+    (*rq).sink_ud = ud
+    (*rq).sink_got = 0
+    (*rq).sink_failed = false
+    (*rq).sink_sha = sha256.sha256_new()
+}
+
+fn areq_sink_got(rq: *mut Request) -> u64 { return (*rq).sink_got }
+fn areq_sink_failed(rq: *mut Request) -> bool { return (*rq).sink_failed }
+
+// The SHA-256 of what was written (call once, from the done callback).
+fn areq_sink_digest(rq: *mut Request, out: u64) {
+    sha256.sha256_final(&(*rq).sink_sha, out)
+}
+
+fn sink_take(rq: *mut Request, s: *mut stream.Stream, n: usize) -> bool {
+    if (*rq).sink_got + n as u64 > (*rq).maxbody as u64 {
+        fail(rq, 15)
+        return false
+    }
+    let p: u64 = stream.stream_in_ptr(s)
+    var done: usize = 0
+    while done < n {
+        let w: i64 = syscall(1, (*rq).sink_fd, (p + done as u64) as i64, (n - done) as i64, 0, 0, 0)
+        if w == 0 - 4 {
+            continue
+        }
+        if w <= 0 {
+            (*rq).sink_failed = true
+            fail(rq, 7)
+            return false
+        }
+        done = done + w as usize
+    }
+    sha256.sha256_update(&(*rq).sink_sha, p, n)
+    (*rq).sink_got = (*rq).sink_got + n as u64
+    stream.stream_consume(s, n)
+    let cb: fn(u64, u64) -> u32 = (*rq).sink_cb
+    if cb((*rq).sink_ud, (*rq).sink_got) != 0 as u32 {
+        fail(rq, AE_CANCELLED)
+        return false
+    }
+    return true
+}
+
 // Takes `n` octets of the stream's input into the body.
 fn take_body(rq: *mut Request, s: *mut stream.Stream, n: usize) -> bool {
+    if (*rq).sink_fd >= 0 && (*rq).r.status == 200 {
+        return sink_take(rq, s, n)
+    }
     if (*rq).r.body.len + n > (*rq).maxbody {
         fail(rq, 15)
         return false

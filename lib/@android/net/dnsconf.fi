@@ -17,7 +17,11 @@
 //   2. the system properties  net.dns1 .. net.dns4, then
 //                             dhcp.wlan0.dns1 .. 4, dhcp.eth0.dns1 .. 4
 //                             (bionic's __system_property_get)
-//   3. nothing -> false -> the public fallback of dns.fi
+//   3. ConnectivityManager -> LinkProperties.getDnsServers() through JNI
+//      (the reliable source since Android 8; needs the activity, so only
+//      inside an app, and ACCESS_NETWORK_STATE -- without it the call throws,
+//      the exception is cleared and source 4 applies)
+//   4. nothing -> false -> the public fallback of dns.fi
 //
 // HONEST
 //   A1 Since Android 8 (API 26) an app cannot read net.dns* any more: the
@@ -25,13 +29,16 @@
 //      value. Then source 3 applies -- the same behaviour as before this
 //      file, never worse. The reliable source on those versions is
 //      ConnectivityManager -> LinkProperties.getDnsServers() through JNI,
-//      which needs a Context and is NOT done here (open item).
+//      which needs a Context: source 3 (`jni_dns_servers`) does that.
 //   A2 Property values that are not a dotted IPv4 address (an IPv6 server,
 //      a name) are skipped; the resolver text only gets what the parser of
 //      dns.fi would accept anyway.
 //   A3 The hosts table is /system/etc/hosts (Android's own, localhost
 //      only on a stock system), then /etc/hosts.
 import std.rt
+import android.ndk
+import android.activity
+import android.jnicall
 
 export { conf_resolv, conf_hosts, prop_ipv4_ok }
 
@@ -109,6 +116,115 @@ fn push_prefix(out: *mut rt.Buf, prefix: u64, plen: usize) -> usize {
     return taken
 }
 
+// ConnectivityManager.getActiveNetwork() -> getLinkProperties(net) ->
+// getDnsServers() -> each InetAddress.getHostAddress(); the IPv4 ones become
+// "nameserver a.b.c.d\n" lines in `out` (at most 4). Returns how many.
+// Runs once per resolver init, not per lookup. #[no_gc]: JNI.
+#[no_gc]
+fn jni_dns_servers(out: *mut rt.Buf) -> usize {
+    let act: u64 = activity.activity_pointer()
+    if act == 0 {
+        return 0
+    }
+    let env: u64 = jnicall.j_env(ndk.peek64(act + 8))
+    let ctx: u64 = ndk.peek64(act + 24)
+    if env == 0 || ctx == 0 {
+        return 0
+    }
+    var s_conn: [u8; _] = "connectivity\0"
+    var n_gss: [u8; _] = "getSystemService\0"
+    var sg_gss: [u8; _] = "(Ljava/lang/String;)Ljava/lang/Object;\0"
+    var n_gan: [u8; _] = "getActiveNetwork\0"
+    var sg_gan: [u8; _] = "()Landroid/net/Network;\0"
+    var n_glp: [u8; _] = "getLinkProperties\0"
+    var sg_glp: [u8; _] = "(Landroid/net/Network;)Landroid/net/LinkProperties;\0"
+    var n_gds: [u8; _] = "getDnsServers\0"
+    var sg_gds: [u8; _] = "()Ljava/util/List;\0"
+    var n_size: [u8; _] = "size\0"
+    var sg_size: [u8; _] = "()I\0"
+    var n_get: [u8; _] = "get\0"
+    var sg_get: [u8; _] = "(I)Ljava/lang/Object;\0"
+    var n_gha: [u8; _] = "getHostAddress\0"
+    var sg_gha: [u8; _] = "()Ljava/lang/String;\0"
+    var a: [u64; 2] = [0; 2]
+    let ap: u64 = (&a[0]) as u64
+    let kc: u64 = jnicall.j_obj_class(env, ctx)
+    let jn: u64 = jnicall.j_str(env, (&s_conn[0]) as u64)
+    a[0] = jn
+    let cm: u64 = jnicall.j_obj(env, ctx,
+        jnicall.j_method(env, kc, (&n_gss[0]) as u64, (&sg_gss[0]) as u64), ap)
+    jnicall.j_del(env, jn)
+    jnicall.j_del(env, kc)
+    if cm == 0 {
+        return 0
+    }
+    let kcm: u64 = jnicall.j_obj_class(env, cm)
+    let net: u64 = jnicall.j_obj(env, cm,
+        jnicall.j_method(env, kcm, (&n_gan[0]) as u64, (&sg_gan[0]) as u64), 0)
+    if net == 0 {
+        jnicall.j_del(env, kcm)
+        jnicall.j_del(env, cm)
+        return 0
+    }
+    a[0] = net
+    let lp: u64 = jnicall.j_obj(env, cm,
+        jnicall.j_method(env, kcm, (&n_glp[0]) as u64, (&sg_glp[0]) as u64), ap)
+    jnicall.j_del(env, net)
+    jnicall.j_del(env, kcm)
+    jnicall.j_del(env, cm)
+    if lp == 0 {
+        return 0
+    }
+    let klp: u64 = jnicall.j_obj_class(env, lp)
+    let list: u64 = jnicall.j_obj(env, lp,
+        jnicall.j_method(env, klp, (&n_gds[0]) as u64, (&sg_gds[0]) as u64), 0)
+    jnicall.j_del(env, klp)
+    jnicall.j_del(env, lp)
+    if list == 0 {
+        return 0
+    }
+    let kl: u64 = jnicall.j_obj_class(env, list)
+    let m_size: u64 = jnicall.j_method(env, kl, (&n_size[0]) as u64, (&sg_size[0]) as u64)
+    let m_get: u64 = jnicall.j_method(env, kl, (&n_get[0]) as u64, (&sg_get[0]) as u64)
+    let total: i32 = jnicall.j_int(env, list, m_size, 0)
+    var taken: usize = 0
+    var i: i32 = 0
+    while i < total && i < 8 && taken < 4 {
+        a[0] = i as u64
+        let ia: u64 = jnicall.j_obj(env, list, m_get, ap)
+        if ia != 0 {
+            let kia: u64 = jnicall.j_obj_class(env, ia)
+            let js: u64 = jnicall.j_obj(env, ia,
+                jnicall.j_method(env, kia, (&n_gha[0]) as u64, (&sg_gha[0]) as u64), 0)
+            jnicall.j_del(env, kia)
+            jnicall.j_del(env, ia)
+            if js != 0 {
+                let chars: u64 = jnicall.j_utf_chars(env, js)
+                if chars != 0 {
+                    var n: usize = 0
+                    while n < 20 && rt.ld8(chars, n) != 0 as u8 {
+                        n = n + 1
+                    }
+                    // an IPv6 text has colons and fails prop_ipv4_ok: skipped (A2)
+                    if n < 16 && prop_ipv4_ok(chars, n) {
+                        var word: [u8; 11] = "nameserver "
+                        rt.buf_push_bytes(out, (&word[0]) as u64, 11)
+                        rt.buf_push_bytes(out, chars, n)
+                        rt.buf_push(out, 10 as u8)
+                        taken = taken + 1
+                    }
+                    jnicall.j_utf_release(env, js, chars)
+                }
+                jnicall.j_del(env, js)
+            }
+        }
+        i = i + 1
+    }
+    jnicall.j_del(env, kl)
+    jnicall.j_del(env, list)
+    return taken
+}
+
 fn conf_resolv(out: *mut rt.Buf) -> bool {
     var path: [u8; 17] = "/etc/resolv.conf\0"
     var file: rt.Buf = rt.buf_new()
@@ -119,7 +235,10 @@ fn conf_resolv(out: *mut rt.Buf) -> bool {
         return true
     }
     rt.buf_free(&file)
-    var taken: usize = 0
+    var taken: usize = jni_dns_servers(out)
+    if taken > 0 {
+        return true
+    }
     var p1: [u8; 7] = "net.dns"
     taken = push_prefix(out, (&p1[0]) as u64, 7)
     if taken == 0 {
