@@ -709,6 +709,18 @@ pub(crate) fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
 
 /// A floating point value out of its slot into `d0`/`d1` (or `s0`/`s1`).
 fn load_fp(e: &mut Emitter, fr: &Frame, x: &str, v: Val, single: bool) {
+    // r826: a constant `fmov` can build is rebuilt at the use (no slot, no load)
+    if let Some(c) = fr.ra.imm(v) {
+        let bits = if single { c as u64 & 0xffff_ffff } else { c as u64 };
+        if let Some(t) = crate::regalloc_a64::fp_imm_text(bits, single) {
+            if t == "0" {
+                e.line(&format!("fmov {}, {}", fname(x, single), if single { "wzr" } else { "xzr" }));
+            } else {
+                e.line(&format!("fmov {}, #{}", fname(x, single), t));
+            }
+            return;
+        }
+    }
     // ROUND FREG: already in a `d` register -- one `fmov`, or none.
     if let Some((dn, _)) = fr.ra.freg(v) {
         if dn != x {
@@ -983,7 +995,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
         e.raw(&crate::so_thunk::runtime_asm()?);
     }
     e.raw(".section .note.GNU-stack,\"\",%progbits");
-    Ok(e.out)
+    Ok(spill_peephole(&e.out))
 }
 
 fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
@@ -2500,4 +2512,69 @@ mod tests {
         let s = build(&Module { funcs: vec![f] });
         assert!(s.contains("mov x8, #64") || s.contains("movz x8, #64"), "{}", s);
     }
+}
+
+/// Parses `str|ldr <reg>, [sp, #<off>]` (no write-back) into (mnemonic, reg, rest-of-operand).
+fn sp_slot(line: &str) -> Option<(&str, &str, &str)> {
+    let t = line.strip_prefix("    ")?;
+    let (mn, rest) = t.split_once(' ')?;
+    if mn != "str" && mn != "ldr" {
+        return None;
+    }
+    let (reg, addr) = rest.split_once(", ")?;
+    if !addr.starts_with("[sp") || addr.ends_with('!') || !addr.ends_with(']') {
+        return None;
+    }
+    Some((mn, reg, addr))
+}
+
+/// Text peephole: `str r,[sp,#o]` directly followed (only `.loc` lines between) by `ldr r,[sp,#o]` drops the
+/// load (the value is still in `r`); `ldr r2,[sp,#o]` of the same slot becomes `mov r2, r` for x/w registers.
+/// A label or any other instruction between the two keeps the pair untouched.
+fn spill_peephole(text: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut owned: Vec<(usize, String)> = Vec::new();
+    // index in `out` of the last str, valid while only .loc lines followed
+    let mut last_str: Option<usize> = None;
+    for line in text.lines() {
+        if line.starts_with("    .loc ") {
+            out.push(line);
+            continue;
+        }
+        if let (Some((mn, reg, addr)), Some(si)) = (sp_slot(line), last_str) {
+            if mn == "ldr" {
+                if let Some((_, sreg, saddr)) = sp_slot(out[si]) {
+                    if saddr == addr {
+                        if sreg == reg {
+                            continue; // value still in the register
+                        }
+                        let c0 = sreg.as_bytes()[0];
+                        if c0 == reg.as_bytes()[0] && (c0 == b'x' || c0 == b'w') {
+                            owned.push((out.len(), format!("    mov {}, {}", reg, sreg)));
+                            out.push("");
+                            last_str = None;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        last_str = match sp_slot(line) {
+            Some(("str", _, _)) => Some(out.len()),
+            _ => None,
+        };
+        out.push(line);
+    }
+    let mut r = String::with_capacity(text.len());
+    let mut oi = 0;
+    for (i, l) in out.iter().enumerate() {
+        if oi < owned.len() && owned[oi].0 == i {
+            r.push_str(&owned[oi].1);
+            oi += 1;
+        } else {
+            r.push_str(l);
+        }
+        r.push('\n');
+    }
+    r
 }

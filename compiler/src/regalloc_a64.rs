@@ -211,6 +211,28 @@ pub(crate) fn cheap_const(v: i64) -> bool {
     nz == 1 || nf <= 1
 }
 
+/// The immediate operand text of `fmov d, #imm8` (`None` if the bit pattern is not one of the 256 values of
+/// the form), `"0"` for +0.0 (built from the zero register instead).
+pub(crate) fn fp_imm_text(bits: u64, single: bool) -> Option<String> {
+    if bits == 0 {
+        return Some("0".to_string());
+    }
+    if single {
+        let b = bits as u32;
+        let e = (b >> 25) & 0x1f;
+        if b & 0x7ffff != 0 || !(e == 0 || e == 0x1f) || ((b >> 30) & 1) == (e & 1) {
+            return None;
+        }
+        Some(format!("{:?}", f32::from_bits(b)))
+    } else {
+        let e = (bits >> 54) & 0xff;
+        if bits & 0xffff_ffff_ffff != 0 || !(e == 0 || e == 0xff) || ((bits >> 62) & 1) == (e & 1) {
+            return None;
+        }
+        Some(format!("{:?}", f64::from_bits(bits)))
+    }
+}
+
 /// May a value of this type live in a general purpose register?
 fn integral(t: FTy) -> bool {
     if t == FTy::Ptr && std::env::var_os("FIRN_A64_NO_PTR").is_some() {
@@ -317,7 +339,19 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
-                if defs.get(&d).copied().unwrap_or(0) != 1 || !integral(i.ty) || f.is_secret(d) {
+                if defs.get(&d).copied().unwrap_or(0) != 1 || f.is_secret(d) {
+                    continue;
+                }
+                if matches!(i.ty, FTy::F32 | FTy::F64) {
+                    // a float constant that `fmov d, #imm8` (or a zero register) can build at the use
+                    let single = i.ty == FTy::F32;
+                    let bits = i.ty.truncate(*c) as u64;
+                    if fp_imm_text(bits, single).is_some() && std::env::var_os("FIRN_A64_NO_REMAT").is_none() {
+                        ra.remat.insert(d, bits as i64);
+                    }
+                    continue;
+                }
+                if !integral(i.ty) {
                     continue;
                 }
                 let val = i.ty.truncate(*c) as i64;
@@ -459,7 +493,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     if std::env::var_os("FIRN_A64_NO_FREGS").is_none() {
         for v in 0..nv {
             let vv = v as Val;
-            if start[v] == usize::MAX || needs_frame_slot(f, vv) {
+            if start[v] == usize::MAX || needs_frame_slot(f, vv) || ra.remat.contains_key(&vv) {
                 continue;
             }
             if !matches!(f.val_types.get(v), Some(FTy::F32) | Some(FTy::F64)) {
