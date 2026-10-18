@@ -4,6 +4,10 @@ One section per version, newest first: `## <version>`, then short bullet lines (
 `tools/android/jarvis_release.sh` puts the section of the released version into the signed
 store entry (field `aenderungen`, at most 1536 bytes); the app shows it in Settings.
 
+## 0.2.5
+- A tap on a notification while the app is open now switches to the chat of that notification.
+- A notification without a chat id no longer opens an unrelated chat.
+
 ## 0.2.2
 - Settings shows the update channel, the installed version, the available version and these release notes.
 - Channel switch (stable / test) appears only when the store offers both for this app.
