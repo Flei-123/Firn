@@ -108,10 +108,14 @@ kbd() { $ADB shell dumpsys input_method | grep -c 'mInputShown=true'; }
 # BACK only while the keyboard is up: without it BACK leaves the app (a slow host shows the keyboard seconds late)
 wait_kbd_up() { local i; for i in $(seq 12); do [ "$(kbd)" = 1 ] && return 0; sleep 1; done; return 1; }
 hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; fi; sleep 1; }
-# type into the field whose hint is $1, then leave the keyboard
-# (the grey "Message" hint is sometimes lost by OCR after a long chat: then touch the field by its place, 418/1898 of 1080x2340)
-type_into() { tap_word "$1" 1 1.5 || { [ "$1" = Message ] && { $ADB shell input tap $((418 * SW / 1080)) $((1898 * SH / 2340)); sleep 1.5; } || return 1; }; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
-send_text() { type_into "Message" "$1" && tap_word "Send" 1 1; }
+# the composer buttons are vector icons without text (Plus, Mic, Send): touch them by place, as pixels of the 1080x2340 layout
+# (the field "Message" grey hint is lost by OCR as well). Row y 1911, centres: plus 103, field 305, mic 790, send 960
+tap_px() { $ADB shell input tap $(($1 * SW / 1080)) $(($2 * SH / 2340)); sleep "${3:-1.5}"; }
+tap_plus() { tap_px 103 1911 2; }
+tap_send() { tap_px 960 1911 1; }
+# type into the composer field (place), or into the field whose hint is $1 (OCR) for other screens, then leave the keyboard
+type_into() { if [ "$1" = Message ]; then tap_px 305 1911 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
+send_text() { type_into "Message" "$1" && tap_send; }
 notes() { $ADB shell dumpsys notification --noredact; }
 # title / text lines of the notifications of the app (not the service one)
 note_lines() { notes | awk -v p="$PKG" '/NotificationRecord\(/ { inrec = ($0 ~ "pkg=" p " ") }
@@ -164,6 +168,7 @@ check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 
 send_text hello
 check "message 'hello' reached the server" "$(wait_log '"text": "hello"' 15 | awk '{print ($1>0)?"yes":"no"}')" yes
 check "streamed reply visible" "$(OCR_TRIES=15 wait_ocr 03_reply 'Hallo hello')" 1
+[ "${E2E_STOP:-}" = reply ] && { echo "stopped after the reply (E2E_STOP=reply): $PASS ok, $FAIL failed"; exit 0; }
 
 # ---- 2. Board: projects, a need answered; Tasks: add ---------------------------------------------------------------------
 echo "== 2. Board and Tasks"
@@ -192,7 +197,7 @@ check "list shows a chat" "$(OCR_TRIES=10 wait_ocr 07_convs 'hello\|worker\|hi')
 # ---- 4. photo upload ---------------------------------------------------------------------------------------------------------
 echo "== 4. photo upload"
 tap_word "New" 1 2
-shot _p; p=$(word_at _p 'Message'); [ -n "$p" ] && $ADB shell input tap $((141 * SW / 1080)) ${p#* }; sleep 2
+tap_plus
 tap_word "Photo" 1 4 # "+" shows the two choices (Photo / File)
 U=$(ui)
 check "the system's picker opens" "$(echo "$U" | grep -cE '(text|content-desc)="(Media picker|Photos|Files|Gallery|Camera|Recent|Photo taken)' | awk '{print ($1>0)?"yes":"no"}')" yes
@@ -218,7 +223,7 @@ $ADB push "$W/e2e_doc.bin" /sdcard/Download/jarvis_e2e_doc.bin >/dev/null
 $ADB shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Download/jarvis_e2e_doc.bin >/dev/null
 SHA_DOC=$(cat "$W/e2e_doc.sha")
 UP0=$(grep -c '"type": "upload_body"' "$SLOG")
-shot _p; p=$(word_at _p 'Message'); [ -n "$p" ] && $ADB shell input tap $((141 * SW / 1080)) ${p#* }; sleep 2
+tap_plus
 tap_word "File" 1 4 # "+" shows the two choices (Photo / File)
 FOUND=no
 for _ in 1 2 3 4 5 6; do
