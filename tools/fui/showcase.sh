@@ -59,6 +59,10 @@ done
 "$FIRNC" --opt-level=dev -o "$T/glasspane" tools/fui/glasspane_main.fi
 "$T/glasspane" shot "$T/img" > /dev/null
 
+# WAVE 5 (lib/fui/wave5.fi): rating, chips, segmented, skeleton, chart, page dots, pager -- light, dark, RTL
+"$FIRNC" --opt-level=dev -o "$T/wave5" tools/fui/wave5_main.fi
+"$T/wave5" "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/
