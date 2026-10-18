@@ -1,0 +1,204 @@
+// expect_exit: 0
+// tests/4071_mc_model_collision.fi -- r238: player collision of pack-model blocks comes from the REGISTRY (vanilla code shapes, mc_shapes.shapes_fill),
+// never from resource-pack models: whole-registry coverage of stairs / slabs / fences / walls / gates / doors / trapdoors, plus registry-driven walking
+// (stairs are stepped up without a jump, fences are a wall). Same table fill as demos/mcplay.
+import std.rt
+import mc.mc_world
+import mc.mc_render_world
+import mc.mc_input
+import mc.mc_math
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_registry
+import mc.mc_shapes
+
+static mut g_fail: i32 = 0
+
+fn check(c: bool, code: i32) {
+    if !c {
+        var o: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&o, "FAIL ".p as u64, 5)
+        rt.buf_push_hex_u64(&o, code as u64, 2)
+        rt.buf_push(&o, 10)
+        rt.write_everything(1, rt.buf_ptr(&o), rt.buf_len(&o))
+        rt.buf_free(&o)
+        g_fail = g_fail + 1
+    }
+}
+
+fn near(a: f64, b: f64) -> bool {
+    var d: f64 = a - b
+    if d < 0.0 { d = 0.0 - d }
+    return d < 0.000001
+}
+
+// floor y = -64..-61 (layers 0..3 of 32); block id `id` at layer 4 (y = -60) for z in [z0, z1) on every x
+fn make_world(w: *mut mc_world.World, floor: u16, id: u16, z0: i32, z1: i32) {
+    let ids: u64 = rt.heap_alloc(2 * 4096 * 2)
+    var i: usize = 0
+    while i < 8192 {
+        rt.st16(ids, i, 0 as u16)
+        i = i + 1
+    }
+    i = 0
+    while i < 4 * 256 {
+        rt.st16(ids, i, floor)
+        i = i + 1
+    }
+    var z: i32 = z0
+    while z < z1 {
+        var x: i32 = 0
+        while x < 16 {
+            rt.st16(ids, ((4 * 16 + z) * 16 + x) as usize, id)
+            x = x + 1
+        }
+        z = z + 1
+    }
+    mc_world.world_put(w, mc_render_world.wr_make_chunk(0, 0, 2, ids))
+}
+
+fn walk(p: *mut mc_input.Player, w: *mut mc_world.World, tb: *mut mc_input.InputTables, keys: u32, ticks: i32) {
+    var ev: mc_input.InputEvents = mc_input.input_events_new()
+    ev.keys = keys
+    var t: i32 = 0
+    while t < ticks {
+        mc_input.player_tick(p, &ev, w, tb, 0 - 64)
+        t = t + 1
+    }
+}
+
+fn box_eq(c: i32, i: i32, x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> bool {
+    var b: mc_math.Aabb = mc_math.Aabb { x0: 0.0, y0: 0.0, z0: 0.0, x1: 0.0, y1: 0.0, z1: 0.0 }
+    mc_math.shape_box(c, i, &b)
+    return near(b.x0, x0) && near(b.y0, y0) && near(b.z0, z0) && near(b.x1, x1) && near(b.y1, y1) && near(b.z1, z1)
+}
+
+fn state_of(r: *mut mc_registry.Registry, text: str) -> i32 {
+    var s: i32 = 0
+    var t: rt.Buf = rt.buf_new()
+    let n: i32 = mc_registry.reg_state_count(r)
+    while s < n {
+        rt.buf_clear(&t)
+        if mc_registry.reg_state_text(r, s, &t) && rt.buf_len(&t) == text.n {
+            var j: usize = 0
+            while j < text.n && rt.ld8(rt.buf_ptr(&t), j) == rt.ld8(text.p as u64, j) {
+                j = j + 1
+            }
+            if j == text.n {
+                rt.buf_free(&t)
+                return s
+            }
+        }
+        s = s + 1
+    }
+    rt.buf_free(&t)
+    return 0 - 1
+}
+
+fn ends_with(p: u64, n: usize, suf: str, sn: usize) -> bool {
+    if n < sn { return false }
+    var i: usize = 0
+    while i < sn {
+        if rt.ld8(p, n - sn + i) != rt.ld8(suf.p as u64, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn suffix_cover(r: *mut mc_registry.Registry, suf: str, partial_min: i32) -> i32 {
+    // counts states of blocks ending in `suf` that are NOT a partial shape / passable (code 0 or 1 = full cube); returns -1 if no state matched
+    var bad: i32 = 0
+    var seen: i32 = 0
+    let n: i32 = mc_registry.reg_state_count(r)
+    var s: i32 = 0
+    while s < n {
+        let b: i32 = mc_registry.reg_block_of_state(r, s)
+        var nl: usize = 0
+        let np: u64 = mc_registry.reg_block_name(r, b, &nl)
+        if ends_with(np, nl, suf, suf.n) {
+            seen = seen + 1
+            let c: i32 = mc_shapes.shape_code_for_state(r, s)
+            if c != mc_shapes.PASSABLE && c < partial_min { bad = bad + 1 }
+        }
+        s = s + 1
+    }
+    if seen == 0 { return 0 - 1 }
+    return bad
+}
+
+fn main() -> i32 {
+    var v: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(763, &v) { return 30 }
+    var r: mc_registry.Registry = v.registry_of()
+    let ns: i32 = mc_registry.reg_state_count(&r)
+    // whole table exactly like mcplay: 1 = full cube for every state but air, then shapes_fill overrides partial / passable
+    var tb: mc_input.InputTables = mc_input.InputTables { pick: rt.heap_alloc(ns as usize), solid: rt.heap_alloc(ns as usize * 2), n: ns as usize }
+    var i: usize = 0
+    while i < ns as usize {
+        rt.st8(tb.pick, i, 1 as u8)
+        rt.st16(tb.solid, i, 1 as u16)
+        i = i + 1
+    }
+    rt.st16(tb.solid, 0, 0 as u16)
+    mc_shapes.shapes_fill(&r, tb.solid, ns as usize)
+
+    // 1) coverage: no stairs / fence / wall / gate / trapdoor / door / (non-double) slab state is a full cube
+    let sb: i32 = mc_math.SHAPE_BASE
+    check(suffix_cover(&r, "_stairs", sb) == 0, 1)
+    check(suffix_cover(&r, "_fence", sb) == 0, 2)
+    check(suffix_cover(&r, "_fence_gate", sb) == 0, 3)
+    check(suffix_cover(&r, "_wall", sb) == 0, 4)
+    check(suffix_cover(&r, "_trapdoor", sb) == 0, 5)
+    check(suffix_cover(&r, "_door", sb) == 0, 6)
+    check(suffix_cover(&r, "_pane", sb) == 0, 7)
+    // slabs: only type=double may be a full cube (checked in 3290); count them
+    var dbl: i32 = 0
+    var part: i32 = 0
+    var s: i32 = 0
+    while s < ns {
+        let b: i32 = mc_registry.reg_block_of_state(&r, s)
+        var nl: usize = 0
+        let np: u64 = mc_registry.reg_block_name(&r, b, &nl)
+        if ends_with(np, nl, "_slab", 5) {
+            let c: i32 = mc_shapes.shape_code_for_state(&r, s)
+            if c == 1 { dbl = dbl + 1 } else if c >= sb { part = part + 1 }
+        }
+        s = s + 1
+    }
+    check(dbl > 0 && part == 2 * dbl, 8) // every slab block: 2 half states per double state (type=top / bottom, waterlogged)
+
+    // 2) the table is the one mcplay walks on: the stored value equals the registry code
+    let stairs: i32 = state_of(&r, "oak_stairs[facing=south,half=bottom,shape=straight,waterlogged=false]")
+    let stairs_n: i32 = state_of(&r, "oak_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]")
+    let fence: i32 = state_of(&r, "oak_fence[east=false,north=false,south=false,waterlogged=false,west=false]")
+    let stone: i32 = state_of(&r, "stone")
+    check(stairs > 0 && stairs_n > 0 && fence > 0 && stone > 0, 9)
+    check(rt.ld16(tb.solid, stairs as usize) as i32 == mc_shapes.shape_code_for_state(&r, stairs) && mc_shapes.shape_code_for_state(&r, stairs) >= sb, 10)
+
+    // 3) walking on registry state ids (no model set involved): stairs facing south -> step 0.5 without a jump, then the back 1.0
+    var w1: mc_world.World = mc_world.world_new()
+    make_world(&w1, stone as u16, stairs as u16, 10, 11)
+    var p: mc_input.Player = mc_input.player_new(8.5, 0.0 - 60.0, 6.5)
+    walk(&p, &w1, &tb, 0 as u32, 2)
+    walk(&p, &w1, &tb, mc_input.K_FORWARD, 16)
+    check(near(p.y, 0.0 - 59.5) && p.on_ground, 11)
+    walk(&p, &w1, &tb, mc_input.K_FORWARD, 3)
+    check(near(p.y, 0.0 - 59.0) && p.on_ground, 12)
+
+    // stairs with the high back towards the player: wall (1.0 high, no step)
+    var w2: mc_world.World = mc_world.world_new()
+    make_world(&w2, stone as u16, stairs_n as u16, 10, 11)
+    var q: mc_input.Player = mc_input.player_new(8.5, 0.0 - 60.0, 6.5)
+    walk(&q, &w2, &tb, 0 as u32, 2)
+    walk(&q, &w2, &tb, mc_input.K_FORWARD, 30)
+    check(near(q.y, 0.0 - 60.0) && q.z > 9.69 && q.z < 9.71, 13)
+
+    // fence post: 1.5 high, a jump (apex ~1.25) does not clear it; post front face z = 10.375 -> player centre 10.075
+    var w3: mc_world.World = mc_world.world_new()
+    make_world(&w3, stone as u16, fence as u16, 10, 11)
+    var f: mc_input.Player = mc_input.player_new(10.5, 0.0 - 60.0, 6.5)
+    walk(&f, &w3, &tb, 0 as u32, 2)
+    walk(&f, &w3, &tb, mc_input.K_FORWARD | mc_input.K_JUMP, 60)
+    check(near(f.z, 10.075) && near(f.y, 0.0 - 60.0), 14)
+    return g_fail
+}
