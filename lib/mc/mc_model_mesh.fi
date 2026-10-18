@@ -43,7 +43,7 @@ import mc.mc_biome_tint
 
 export {
     ModelSet, PQ_WORDS, ms_new, ms_blank, ms_reset, ms_free, ms_set_tint, ms_prepare, ms_patch_opaque, ms_mesh, ms_mesh_split, ms_state_parts, ms_kind, ms_resolve, ms_tex_tile, ms_quad_count,
-    MQ_WORDS, K_UNKNOWN, K_PLAIN, K_MODEL, NVAR, BIO_OFF, BIO_BYTES, ms_load_biomes, ms_set_blend, ms_colormaps, ms_blend_color, ms_blend_color_w, ms_biome_color_xz, ms_set_seed, ms_clear_seed, ms_zoom_on, ms_has_biomes, ms_set_atlas, ms_tile_translucent, ms_snap_bio, ms_mesh_split_bio, ms_biome_color,
+    MQ_WORDS, K_UNKNOWN, K_PLAIN, K_MODEL, NVAR, BIO_OFF, BIO_BYTES, ms_load_biomes, ms_set_blend, ms_colormaps, ms_blend_color, ms_blend_color_w, ms_biome_color_xz, ms_set_seed, ms_clear_seed, ms_set_water_tint, ms_zoom_on, ms_has_biomes, ms_set_atlas, ms_tile_translucent, ms_snap_bio, ms_mesh_split_bio, ms_biome_color,
 }
 
 const MQ_WORDS: usize = 30 // output quad: x0..3 y0..3 z0..3 (block units, section relative), u0..3 v0..3 (tile units), tile, shade 0..256, sky, block, tint (R | G << 8 | B << 16, -1 none), flags (bit 0 translucent), ao0..3
@@ -83,11 +83,13 @@ struct ModelSet {
     zseed: u64, // hashed world seed of the Voronoi biome zoom (ms_set_seed)
     zoom: u32, // 1 = Voronoi zoom on (a seed is known), 0 = the 4x4x4 cell of the block
     swn: mc_biome_zoom.SwampNoise, // BIOME_INFO_NOISE of the swamp grass colour
+    wtint: u32, // 1 = fluid water is a tinted model (ms_set_water_tint), 0 = water stays on the cube path
+    wtab: u64, // u8 [NSTATE_MAX] 1 = state baked as water (same-water faces are hidden)
 }
 
 fn ms_new(reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack, ex: *mut mc_texext.TexExt) -> ModelSet {
     var m: ModelSet = ModelSet { reg: reg, st: st, ex: ex, kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0,
-        nmodel: 0, unmapped: 0, lk: 0, atlas: 0, blend: 2, cmap: 0 as u32, btab: 0, zseed: 0 as u64, zoom: 0 as u32, swn: mc_biome_zoom.swamp_new(),
+        nmodel: 0, unmapped: 0, lk: 0, atlas: 0, blend: 2, cmap: 0 as u32, btab: 0, zseed: 0 as u64, zoom: 0 as u32, swn: mc_biome_zoom.swamp_new(), wtint: 0 as u32, wtab: 0,
         tint: [0x91BD59 as u32, 0x77AB2F as u32, 0x3F76E4 as u32, 0x80A755 as u32, 0x619961 as u32, 0x208030 as u32, 0x4B0000 as u32, 0xFFFFFF as u32] }
     m.lk = rt.heap_alloc(8)
     rt.st64(m.lk, 0, 0 as u64)
@@ -95,6 +97,8 @@ fn ms_new(reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack, ex: *mut
     m.weighted = rt.heap_alloc(NSTATE_MAX)
     rt.mem_set(m.kind, 0 as u8, NSTATE_MAX)
     rt.mem_set(m.weighted, 0 as u8, NSTATE_MAX)
+    m.wtab = rt.heap_alloc(NSTATE_MAX)
+    rt.mem_set(m.wtab, 0 as u8, NSTATE_MAX)
     m.qptr = rt.heap_alloc(NSTATE_MAX * NVAR * 8)
     m.qcnt = rt.heap_alloc(NSTATE_MAX * NVAR * 4)
     var i: usize = 0
@@ -112,7 +116,7 @@ fn ms_new(reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack, ex: *mut
 // A ModelSet without tables (nothing allocated, ms_free is a no-op): placeholder for a struct field until ms_new runs.
 fn ms_blank() -> ModelSet {
     return ModelSet { reg: 0 as u64 as *mut mc_registry.Registry, st: 0 as u64 as *mut mc_assets.PackStack, ex: 0 as u64 as *mut mc_texext.TexExt,
-        kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0, nmodel: 0, unmapped: 0, lk: 0, atlas: 0, blend: 2, cmap: 0 as u32, btab: 0, zseed: 0 as u64, zoom: 0 as u32, swn: mc_biome_zoom.SwampNoise { p: [0 as u8; 256] },
+        kind: 0, weighted: 0, qptr: 0, qcnt: 0, tnames: 0, ttiles: 0, ntex: 0, nmodel: 0, unmapped: 0, lk: 0, atlas: 0, blend: 2, cmap: 0 as u32, btab: 0, zseed: 0 as u64, zoom: 0 as u32, swn: mc_biome_zoom.SwampNoise { p: [0 as u8; 256] }, wtint: 0 as u32, wtab: 0,
         tint: [0 as u32; 8] }
 }
 
@@ -128,6 +132,7 @@ fn ms_reset(m: *mut ModelSet) {
     let bl: i32 = (*m).blend
     let zs: u64 = (*m).zseed
     let zz: u32 = (*m).zoom
+    let wt: u32 = (*m).wtint
     ms_free(m)
     *m = ms_new(reg, st, ex)
     (*m).tint = tn
@@ -135,6 +140,7 @@ fn ms_reset(m: *mut ModelSet) {
     (*m).blend = bl
     (*m).zseed = zs
     (*m).zoom = zz
+    (*m).wtint = wt
     if had_bio { ms_load_biomes(m) }
 }
 
@@ -350,6 +356,10 @@ struct BlendCache {
     bz: mc_biome_zoom.BzCache,
     ids: u64, // u16 [16 * 24 * 24] biome id, 0xFFFF = not computed
     sw: u64, // u32 [24 * 24] swamp grass colour | 1 << 24, 0 = not computed
+    pl: u64, // u32 [16 * 3 * 256] blended colour of every column per (height, tint class) layer (ms_blend_plane)
+    pst: u64, // u8 [16 * 3] per layer: blocks blended one by one so far, 255 = plane computed
+    pcol: u64, // u64 [24 * 24] scratch: packed column colours of ms_blend_plane
+    phs: u64, // u64 [24 * 16] scratch: window sums along x
 }
 
 fn bcache_new(wx: i32, wy: i32, wz: i32) -> BlendCache {
@@ -357,13 +367,19 @@ fn bcache_new(wx: i32, wy: i32, wz: i32) -> BlendCache {
     rt.mem_set(ids, 255 as u8, (16 * BC_W * BC_W * 2) as usize)
     let sw: u64 = rt.heap_alloc((BC_W * BC_W * 4) as usize)
     rt.mem_set(sw, 0 as u8, (BC_W * BC_W * 4) as usize)
-    return BlendCache { bz: mc_biome_zoom.bzc_new(wx, wy, wz), ids: ids, sw: sw }
+    let pst: u64 = rt.heap_alloc(48)
+    rt.mem_set(pst, 0 as u8, 48)
+    return BlendCache { bz: mc_biome_zoom.bzc_new(wx, wy, wz), ids: ids, sw: sw, pl: rt.heap_alloc((16 * 3 * 256 * 4) as usize), pst: pst, pcol: rt.heap_alloc((BC_W * BC_W * 8) as usize), phs: rt.heap_alloc((BC_W * 16 * 8) as usize) }
 }
 
 fn bcache_free(c: *mut BlendCache) {
     mc_biome_zoom.bzc_free(&(*c).bz)
     rt.heap_free((*c).ids, (16 * BC_W * BC_W * 2) as usize)
     rt.heap_free((*c).sw, (BC_W * BC_W * 4) as usize)
+    rt.heap_free((*c).pl, (16 * 3 * 256 * 4) as usize)
+    rt.heap_free((*c).pst, 48)
+    rt.heap_free((*c).pcol, (BC_W * BC_W * 8) as usize)
+    rt.heap_free((*c).phs, (BC_W * 16 * 8) as usize)
 }
 
 // ms_biome_color of the block column (bx, bz): the grass colour of a swamp biome comes from the swamp noise of the column (vanilla
@@ -391,6 +407,14 @@ fn ms_biome_color_xzc(m: *mut ModelSet, cls: usize, bid: usize, bx: i32, bz: i32
         }
     }
     return ms_biome_color_xz(m, cls, bid, bx, bz)
+}
+
+// Fluid water as a tinted model (r260): water states get 6 full-cube quads (block/water_still, tint class 2) instead of the cube path, so the biome blend + Voronoi
+// zoom colour it like leaves; faces next to opaque blocks or other water are hidden. Needs the atlas (ms_set_atlas) for the translucent pass. Call BEFORE the first
+// meshing (or ms_reset + remesh afterwards). Default off (the picture without it is unchanged).
+fn ms_set_water_tint(m: *mut ModelSet, on: bool) {
+    (*m).wtint = 0 as u32
+    if on { (*m).wtint = 1 as u32 }
 }
 
 // Hashed world seed (Join Game / Respawn `hashedSeed`) of the vanilla Voronoi biome zoom: with a seed every column takes its biome from
@@ -485,64 +509,62 @@ fn ms_blend_color_w(m: *mut ModelSet, bio: u64, cls: usize, lx: i32, y: i32, z: 
     return ms_blend_color_c(m, bio, cls, lx, y, z, wx, wy, wz, 0 as *mut BlendCache)
 }
 
+// Biome id of the block column at window position (wcx, wcz) (= section local x / z + 4, 0..23) at section local height y: vanilla
+// BiomeManager.getBiome (Voronoi zoom) when a seed is set, else the plain 4x4x4 cell. `cache` (0 = none) keeps zoom results per column.
+fn ms_col_bid(m: *mut ModelSet, bio: u64, y: i32, wcx: i32, wcz: i32, wx: i32, wy: i32, wz: i32, cache: *mut BlendCache) -> usize {
+    var cx2: i32 = wcx / 4 - 1
+    var cy2: i32 = y / 4
+    var cz2: i32 = wcz / 4 - 1
+    let bx: i32 = wx + wcx - 4
+    let bz: i32 = wz + wcz - 4
+    if (*m).zoom != (0 as u32) {
+        if (cache as u64) != (0 as u64) {
+            let hit: usize = rt.ld16((*cache).ids, ((y * BC_W + wcz) * BC_W + wcx) as usize) as usize
+            if hit != 65535 { return hit }
+        }
+        var bid: usize = 0
+        // all 8 cells the zoom can pick from hold the same biome -> that is the biome, no pick needed
+        let uni: i32 = ms_zoom_cells_same(bio, ((bx - 2) >> 2) - (wx >> 2), ((wy + y - 2) >> 2) - (wy >> 2), ((bz - 2) >> 2) - (wz >> 2))
+        if uni >= 0 {
+            bid = uni as usize
+        } else {
+            var q: mc_biome_zoom.BzQuart = mc_biome_zoom.BzQuart { x: 0, y: 0, z: 0 }
+            if (cache as u64) != (0 as u64) {
+                q = mc_biome_zoom.bz_pick_c(&(*cache).bz, (*m).zseed, bx, wy + y, bz)
+            } else {
+                q = mc_biome_zoom.bz_pick((*m).zseed, bx, wy + y, bz)
+            }
+            cx2 = q.x - (wx >> 2)
+            cy2 = q.y - (wy >> 2)
+            cz2 = q.z - (wz >> 2)
+            if cx2 < 0 - 1 { cx2 = 0 - 1 }
+            if cx2 > 4 { cx2 = 4 }
+            if cy2 < 0 - 1 { cy2 = 0 - 1 }
+            if cy2 > 4 { cy2 = 4 }
+            if cz2 < 0 - 1 { cz2 = 0 - 1 }
+            if cz2 > 4 { cz2 = 4 }
+            bid = rt.ld16(bio, (((cy2 + 1) * 6 + cz2 + 1) * 6 + cx2 + 1) as usize) as usize
+        }
+        if (cache as u64) != (0 as u64) { rt.st16((*cache).ids, ((y * BC_W + wcz) * BC_W + wcx) as usize, bid as u16) }
+        return bid
+    }
+    return rt.ld16(bio, (((cy2 + 1) * 6 + cz2 + 1) * 6 + cx2 + 1) as usize) as usize
+}
+
 // ms_blend_color_w with the per-section scratch `cache` (0 = none): lx, z in 0..15, y in 0..15 when a cache is given. Same result.
 fn ms_blend_color_c(m: *mut ModelSet, bio: u64, cls: usize, lx: i32, y: i32, z: i32, wx: i32, wy: i32, wz: i32, cache: *mut BlendCache) -> u32 {
     let r: i32 = (*m).blend
-    let cy: i32 = y / 4
     var sr: u32 = 0 as u32
     var sg: u32 = 0 as u32
     var sb: u32 = 0 as u32
     var n: u32 = 0 as u32
     var dz: i32 = 0 - r
     while dz <= r {
-        let cz: i32 = (z + dz + 4) / 4 - 1
         var dx: i32 = 0 - r
         while dx <= r {
-            var cx2: i32 = (lx + dx + 4) / 4 - 1
-            var cy2: i32 = cy
-            var cz2: i32 = cz
-            var bid: usize = 0
-            var wcx: i32 = 0
-            var wcz: i32 = 0
-            var have: bool = false
-            if (cache as u64) != (0 as u64) {
-                wcx = lx + dx + 4
-                wcz = z + dz + 4
-                if (*m).zoom != (0 as u32) {
-                    bid = rt.ld16((*cache).ids, ((y * BC_W + wcz) * BC_W + wcx) as usize) as usize
-                    have = bid != 65535
-                }
-            }
-            if !have {
-                var uni: i32 = 0 - 1
-                if (*m).zoom != (0 as u32) {
-                    // all 8 cells the zoom can pick from hold the same biome -> that is the biome, no pick needed
-                    uni = ms_zoom_cells_same(bio, ((wx + lx + dx - 2) >> 2) - (wx >> 2), ((wy + y - 2) >> 2) - (wy >> 2), ((wz + z + dz - 2) >> 2) - (wz >> 2))
-                }
-                if uni >= 0 {
-                    bid = uni as usize
-                } else {
-                    if (*m).zoom != (0 as u32) {
-                        var q: mc_biome_zoom.BzQuart = mc_biome_zoom.BzQuart { x: 0, y: 0, z: 0 }
-                        if (cache as u64) != (0 as u64) {
-                            q = mc_biome_zoom.bz_pick_c(&(*cache).bz, (*m).zseed, wx + lx + dx, wy + y, wz + z + dz)
-                        } else {
-                            q = mc_biome_zoom.bz_pick((*m).zseed, wx + lx + dx, wy + y, wz + z + dz)
-                        }
-                        cx2 = q.x - (wx >> 2)
-                        cy2 = q.y - (wy >> 2)
-                        cz2 = q.z - (wz >> 2)
-                        if cx2 < 0 - 1 { cx2 = 0 - 1 }
-                        if cx2 > 4 { cx2 = 4 }
-                        if cy2 < 0 - 1 { cy2 = 0 - 1 }
-                        if cy2 > 4 { cy2 = 4 }
-                        if cz2 < 0 - 1 { cz2 = 0 - 1 }
-                        if cz2 > 4 { cz2 = 4 }
-                    }
-                    bid = rt.ld16(bio, (((cy2 + 1) * 6 + cz2 + 1) * 6 + cx2 + 1) as usize) as usize
-                }
-                if (cache as u64) != (0 as u64) && (*m).zoom != (0 as u32) { rt.st16((*cache).ids, ((y * BC_W + wcz) * BC_W + wcx) as usize, bid as u16) }
-            }
+            let wcx: i32 = lx + dx + 4
+            let wcz: i32 = z + dz + 4
+            let bid: usize = ms_col_bid(m, bio, y, wcx, wcz, wx, wy, wz, cache)
             let c: u32 = ms_biome_color_xzc(m, cls, bid, wx + lx + dx, wz + z + dz, cache, wcx, wcz)
             sr = sr + ((c >> (16 as u32)) & (255 as u32))
             sg = sg + ((c >> (8 as u32)) & (255 as u32))
@@ -553,6 +575,88 @@ fn ms_blend_color_c(m: *mut ModelSet, bio: u64, cls: usize, lx: i32, y: i32, z: 
         dz = dz + 1
     }
     return (((sr / n) & (255 as u32)) << (16 as u32)) | (((sg / n) & (255 as u32)) << (8 as u32)) | ((sb / n) & (255 as u32))
+}
+
+// Blocks of ONE (height, tint class) layer that are blended one by one before the whole 16 x 16 layer is computed with separable window sums.
+const PLANE_AT: u8 = 10 as u8
+
+// Blended colours of ALL 16 x 16 columns of the layer (y, cls) at once: the packed per channel colour of every window column (r|g|b in three 16 bit lanes, max
+// 81 * 255 per lane at radius 4: no carry) -> running sums along x -> running sums along z -> integer mean per channel (sum / n, like vanilla
+// calculateBlockTint). Same values as ms_blend_color_c; the window columns are computed once instead of (2r+1)^2 times.
+fn ms_blend_plane(m: *mut ModelSet, bio: u64, cls: usize, y: i32, wx: i32, wy: i32, wz: i32, cache: *mut BlendCache) {
+    let r: i32 = (*m).blend
+    let w2: i32 = 16 + 2 * r
+    let nw: i32 = 2 * r + 1
+    let nn: u32 = (nw * nw) as u32
+    let col: u64 = (*cache).pcol
+    let hs: u64 = (*cache).phs
+    var jz: i32 = 0
+    while jz < w2 {
+        let wcz: i32 = jz + 4 - r
+        var jx: i32 = 0
+        while jx < w2 {
+            let wcx: i32 = jx + 4 - r
+            let bid: usize = ms_col_bid(m, bio, y, wcx, wcz, wx, wy, wz, cache)
+            let c: u32 = ms_biome_color_xzc(m, cls, bid, wx + wcx - 4, wz + wcz - 4, cache, wcx, wcz)
+            let pk: u64 = ((((c >> (16 as u32)) & (255 as u32)) as u64) << (32 as u64)) | ((((c >> (8 as u32)) & (255 as u32)) as u64) << (16 as u64)) | ((c & (255 as u32)) as u64)
+            rt.st64(col, (jz * w2 + jx) as usize, pk)
+            jx = jx + 1
+        }
+        // window sums along x of this row
+        var s: u64 = 0 as u64
+        var k: i32 = 0
+        while k < nw {
+            s = s + rt.ld64(col, (jz * w2 + k) as usize)
+            k = k + 1
+        }
+        rt.st64(hs, (jz * 16) as usize, s)
+        var x: i32 = 1
+        while x < 16 {
+            s = s + rt.ld64(col, (jz * w2 + x + nw - 1) as usize) - rt.ld64(col, (jz * w2 + x - 1) as usize)
+            rt.st64(hs, (jz * 16 + x) as usize, s)
+            x = x + 1
+        }
+        jz = jz + 1
+    }
+    let base: usize = ((y * 3) as usize + cls) * 256
+    var x: i32 = 0
+    while x < 16 {
+        var s: u64 = 0 as u64
+        var k: i32 = 0
+        while k < nw {
+            s = s + rt.ld64(hs, (k * 16 + x) as usize)
+            k = k + 1
+        }
+        var z: i32 = 0
+        while z < 16 {
+            if z > 0 { s = s + rt.ld64(hs, ((z + nw - 1) * 16 + x) as usize) - rt.ld64(hs, ((z - 1) * 16 + x) as usize) }
+            let sr: u32 = ((s >> (32 as u64)) & (65535 as u64)) as u32
+            let sg: u32 = ((s >> (16 as u64)) & (65535 as u64)) as u32
+            let sb: u32 = (s & (65535 as u64)) as u32
+            rt.st32((*cache).pl, base + (z * 16 + x) as usize, (((sr / nn) & (255 as u32)) << (16 as u32)) | (((sg / nn) & (255 as u32)) << (8 as u32)) | ((sb / nn) & (255 as u32)))
+            z = z + 1
+        }
+        x = x + 1
+    }
+}
+
+// ms_blend_color_c through the layer planes: the first PLANE_AT - 1 blocks of a (height, class) layer are blended one by one, then the whole layer is
+// computed by ms_blend_plane (cheaper from there on). Needs a cache; same values.
+fn ms_blend_color_p(m: *mut ModelSet, bio: u64, cls: usize, lx: i32, y: i32, z: i32, wx: i32, wy: i32, wz: i32, cache: *mut BlendCache) -> u32 {
+    if (*m).blend > 0 {
+        let li: usize = (y * 3) as usize + cls
+        var st: u8 = rt.ld8((*cache).pst, li)
+        if st != (255 as u8) {
+            st = st + (1 as u8)
+            if st >= PLANE_AT {
+                ms_blend_plane(m, bio, cls, y, wx, wy, wz, cache)
+                st = 255 as u8
+            }
+            rt.st8((*cache).pst, li, st)
+        }
+        if st == (255 as u8) { return rt.ld32((*cache).pl, li * 256 + (z * 16 + lx) as usize) }
+    }
+    return ms_blend_color_c(m, bio, cls, lx, y, z, wx, wy, wz, cache)
 }
 
 // ms_blend_color_w for a section at the world origin.
@@ -582,6 +686,7 @@ fn ms_free(m: *mut ModelSet) {
     }
     rt.heap_free((*m).kind, NSTATE_MAX)
     rt.heap_free((*m).weighted, NSTATE_MAX)
+    rt.heap_free((*m).wtab, NSTATE_MAX)
     rt.heap_free((*m).qptr, NSTATE_MAX * NVAR * 8)
     rt.heap_free((*m).qcnt, NSTATE_MAX * NVAR * 4)
     rt.heap_free((*m).tnames, NTEX * 64)
@@ -811,9 +916,18 @@ fn bake_state(m: *mut ModelSet, s: usize, v: usize) -> u32 {
         if nsel > 0 && sel.weighted { rt.st8((*m).weighted, s, 1 as u8) }
     }
     var b: mc_model.Baked = mc_model.baked_new()
-    let nq: i32 = mc_model.blockstate_bake((*m).st, bname, pstr, seed, &b)
+    var nq: i32 = 0
     var model: bool = false
-    if nq > 0 && !is_unit_cube(&b) { model = true }
+    if (*m).wtint != (0 as u32) && v == 0 && bytes_ends(rt.buf_ptr(&name), rt.buf_len(&name), "water") && (rt.buf_len(&name) == 5 || bytes_ends(rt.buf_ptr(&name), rt.buf_len(&name), ":water")) {
+        nq = mc_model.water_cube_bake(&b)
+        if nq > 0 {
+            model = true
+            rt.st8((*m).wtab, s, 1 as u8)
+        }
+    } else {
+        nq = mc_model.blockstate_bake((*m).st, bname, pstr, seed, &b)
+        if nq > 0 && !is_unit_cube(&b) { model = true }
+    }
     if v == 0 && !model { rt.st8((*m).kind, s, K_PLAIN) }
     if model {
         let tcls: i32 = tint_class(rt.buf_ptr(&name), rt.buf_len(&name))
@@ -1062,7 +1176,7 @@ fn ms_mesh_split_bio(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.Mesh
     rt.buf_clear(out)
     rt.buf_clear(out_t)
     var nq: usize = 0
-    var bcache: BlendCache = BlendCache { bz: mc_biome_zoom.BzCache { cx0: 0, cy0: 0, cz0: 0, fv: 0, fd: 0 }, ids: 0, sw: 0 }
+    var bcache: BlendCache = BlendCache { bz: mc_biome_zoom.BzCache { cx0: 0, cy0: 0, cz0: 0, fv: 0, fd: 0 }, ids: 0, sw: 0, pl: 0, pst: 0, pcol: 0, phs: 0 }
     var bcache_on: bool = false
     var y: i32 = 0
     while y < 16 {
@@ -1096,6 +1210,8 @@ fn ms_mesh_split_bio(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.Mesh
                             skip = true
                         } else if ((nid as usize) < 32768) && (rt.ld8((*t).opaque, nid as usize) & (1 as u8)) != (0 as u8) {
                             skip = true
+                        } else if ((nid as usize) < NSTATE_MAX) && rt.ld8((*m).wtab, id as usize) != (0 as u8) && rt.ld8((*m).wtab, nid as usize) != (0 as u8) {
+                            skip = true // water next to water
                         }
                         lc = ni
                     }
@@ -1148,7 +1264,7 @@ fn ms_mesh_split_bio(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.Mesh
                                         bcache = bcache_new(wx, wy, wz)
                                         bcache_on = true
                                     }
-                                    bc[tcls as usize] = ms_blend_color_c(m, bio, tcls as usize, x - 1, y, z, wx, wy, wz, &bcache) | (16777216 as u32)
+                                    bc[tcls as usize] = ms_blend_color_p(m, bio, tcls as usize, x - 1, y, z, wx, wy, wz, &bcache) | (16777216 as u32)
                                 }
                                 rgb = bc[tcls as usize] & (16777215 as u32)
                             }

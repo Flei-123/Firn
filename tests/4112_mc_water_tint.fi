@@ -1,0 +1,303 @@
+// expect_exit: 0
+// tests/4112_mc_water_tint.fi -- r260 fluid water as a tinted model (ms_set_water_tint): a one layer water body gets 6 quads per block minus the faces hidden by
+// neighbouring water (256 top + 256 bottom + 64 edge sides), the colour of every top face is the biome blend of tint class 2 (water) with the Voronoi zoom and
+// with the plain 4x4x4 cell, radius 0..4. Without ms_set_water_tint water stays on the cube path (no model quads).
+import std.rt
+import std.core
+import std.math
+import std.io
+import zip.zip
+import pack.icons
+import mc.mc_assets
+import mc.mc_texture
+import mc.mc_texext
+import mc.mc_mesh
+import mc.mc_model
+import mc.mc_model_mesh
+import mc.mc_registry
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_chunk
+import mc.mc_biome_zoom
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+
+// 16 x 16 solid colour PNG
+fn png_solid(r: u8, g: u8, b: u8, a: u8, out: *mut rt.Buf) -> bool {
+    let px: u64 = rt.heap_alloc(16 * 16 * 4)
+    var i: usize = 0
+    while i < 256 {
+        rt.st8(px, i * 4, r)
+        rt.st8(px, i * 4 + 1, g)
+        rt.st8(px, i * 4 + 2, b)
+        rt.st8(px, i * 4 + 3, a)
+        i = i + 1
+    }
+    let ok: bool = icons.png_encode(px, 16, 16, out)
+    rt.heap_free(px, 16 * 16 * 4)
+    return ok
+}
+
+fn add_text(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    var ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn add_png(w: *mut zip.ZipWriter, name: str, r: u8, g: u8, b: u8, a: u8) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    if !png_solid(r, g, b, a, &p) { return false }
+    var ok: bool = zip.zip_add(w, name, rt.buf_ptr(&p), rt.buf_len(&p), true) catch | e | (false)
+    rt.buf_free(&p)
+    return ok
+}
+
+// blockstate of a block without properties: one model for every state
+fn add_state(w: *mut zip.ZipWriter, block: str, model: str) -> bool {
+    return add_text(w, "assets/minecraft/blockstates/" + block + ".json", "{\"variants\":{\"\":{\"model\":\"" + model + "\"}}}")
+}
+
+// a model with ONE up face covering the whole top of the cell (flat on the cell face: AO applies), texture `tex`, optional tintindex 0
+fn add_up_model(w: *mut zip.ZipWriter, name: str, tex: str, tinted: bool) -> bool {
+    var tn: str = ""
+    if tinted { tn = ",\"tintindex\":0" }
+    return add_text(w, "assets/minecraft/models/block/" + name + ".json",
+        "{\"textures\":{\"t\":\"block/" + tex + "\"},\"elements\":[{\"from\":[0,0,0],\"to\":[16,16,16],\"faces\":{\"up\":{\"uv\":[0,0,16,16],\"texture\":\"#t\"" + tn + "}}}]}")
+}
+
+fn open_pack(b: *mut rt.Buf, w: *mut zip.ZipWriter, st: *mut mc_assets.PackStack) -> bool {
+    var n: usize = zip.zip_finish(w) catch | e | (0)
+    zip.zip_writer_free(w)
+    if n == 0 { return false }
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pk, rt.buf_ptr(b), rt.buf_len(b)) != mc_assets.ASSET_OK { return false }
+    rt.buf_free(b)
+    return mc_assets.stack_push(st, &pk) == mc_assets.ASSET_OK
+}
+
+fn sid(reg: *mut mc_registry.Registry, name: str) -> i32 {
+    let blk: i32 = mc_registry.reg_block_by_name(reg, name.p as u64, name.length())
+    if blk < 0 { return 0 - 1 }
+    return mc_registry.reg_block_min_state(reg, blk)
+}
+
+// cell (x, y, z) of section 0 (a 16 x 16 x 16 u16 array per section, 2 sections)
+fn put(ids: u64, x: i32, y: i32, z: i32, state: i32) {
+    rt.st16(ids, ((y * 16 + z) * 16 + x) as usize, state as u16)
+}
+
+fn new_ids() -> u64 {
+    let ids: u64 = rt.heap_alloc(2 * 4096 * 2)
+    var i: usize = 0
+    while i < 8192 {
+        rt.st16(ids, i, 0 as u16)
+        i = i + 1
+    }
+    return ids
+}
+
+fn chan(c: u32, k: i32) -> i32 {
+    return ((c >> ((k * 8) as u32)) & (255 as u32)) as i32
+}
+
+fn iabs(v: i32) -> i32 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// everything a scene needs, rebuilt per scene
+struct Scene {
+    tb: mc_mesh.MeshTables,
+    ex: mc_texext.TexExt,
+    atlas: mc_texture.Atlas,
+    an: mc_assets.AnimSet,
+}
+
+fn scene_init(sc: *mut Scene, reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack) -> bool {
+    (*sc).tb = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_texture.tex_alloc_tables(&(*sc).tb)
+    (*sc).ex = mc_texext.texext_new()
+    mc_texext.tex_build_tables_ext(reg, &(*sc).tb, &(*sc).ex)
+    (*sc).atlas = mc_texext.texext_atlas_new(16, &(*sc).ex)
+    (*sc).an = mc_assets.animset_new()
+    return mc_assets.assets_apply_ext(st, &(*sc).atlas, &(*sc).ex, &(*sc).an) >= 1
+}
+
+fn biome_id(reg: *mut mc_registry.Registry, name: str) -> i32 {
+    var i: i32 = 0
+    while i < mc_registry.reg_biome_count(reg) {
+        var nl: usize = 0
+        let np: u64 = mc_registry.reg_biome_name(reg, i, &nl)
+        var off: usize = 0
+        if nl > 10 && rt.mem_eq(np, "minecraft:".p as u64, 10) { off = 10 }
+        if nl - off == name.length() && rt.mem_eq(np + (off as u64), name.p as u64, nl - off) { return mc_registry.reg_biome_id(reg, i) }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+
+// tint word of quad k of the buffer, unpacked to 0xRRGGBB (the mesher stores R | G << 8 | B << 16)
+fn tint_of(buf: *mut rt.Buf, k: usize) -> u32 {
+    let v: u32 = math.math_f64(rt.ld64(rt.buf_ptr(buf), k * 30 + 24)) as u32
+    return ((v & (255 as u32)) << (16 as u32)) | (v & (65280 as u32)) | ((v >> (16 as u32)) & (255 as u32))
+}
+
+// reference colour of the block (lx, y, z) of the section at (wx, wy, wz): per channel mean of the (2r+1)^2 columns, each from the PLAIN vanilla pick
+// (bz_pick + clamp to the grid, no cache, no shortcut)
+fn ref_color(ms: *mut mc_model_mesh.ModelSet, bio: u64, seed: u64, zoom: bool, cls: usize, r: i32, lx: i32, y: i32, z: i32, wx: i32, wy: i32, wz: i32) -> u32 {
+    var sr: u32 = 0 as u32
+    var sg: u32 = 0 as u32
+    var sb: u32 = 0 as u32
+    var n: u32 = 0 as u32
+    var dz: i32 = 0 - r
+    while dz <= r {
+        var dx: i32 = 0 - r
+        while dx <= r {
+            var cx: i32 = (lx + dx + 4) / 4 - 1
+            var cy: i32 = y / 4
+            var cz: i32 = (z + dz + 4) / 4 - 1
+            if zoom {
+                let q: mc_biome_zoom.BzQuart = mc_biome_zoom.bz_pick(seed, wx + lx + dx, wy + y, wz + z + dz)
+                cx = q.x - (wx >> 2)
+                cy = q.y - (wy >> 2)
+                cz = q.z - (wz >> 2)
+            }
+            if cx < 0 - 1 { cx = 0 - 1 }
+            if cx > 4 { cx = 4 }
+            if cy < 0 - 1 { cy = 0 - 1 }
+            if cy > 4 { cy = 4 }
+            if cz < 0 - 1 { cz = 0 - 1 }
+            if cz > 4 { cz = 4 }
+            let bid: usize = rt.ld16(bio, (((cy + 1) * 6 + cz + 1) * 6 + cx + 1) as usize) as usize
+            let c: u32 = mc_model_mesh.ms_biome_color_xz(ms, cls, bid, wx + lx + dx, wz + z + dz)
+            sr = sr + ((c >> (16 as u32)) & (255 as u32))
+            sg = sg + ((c >> (8 as u32)) & (255 as u32))
+            sb = sb + (c & (255 as u32))
+            n = n + (1 as u32)
+            dx = dx + 1
+        }
+        dz = dz + 1
+    }
+    return (((sr / n) & (255 as u32)) << (16 as u32)) | (((sg / n) & (255 as u32)) << (8 as u32)) | ((sb / n) & (255 as u32))
+}
+
+fn main() -> i32 {
+    var v: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(763, &v) { return 1 }
+    var reg: mc_registry.Registry = v.registry_of()
+    if !mc_registry.registry_ok(&reg) { return 2 }
+    var stk: mc_assets.PackStack = mc_assets.stack_new()
+    {
+        var b: rt.Buf = rt.buf_new()
+        var w: zip.ZipWriter = zip.zip_writer_new(&b)
+        if !add_text(&w, "pack.mcmeta", META) { return 3 }
+        if !add_png(&w, "assets/minecraft/textures/block/water_still.png", 60 as u8, 100 as u8, 200 as u8, 175 as u8) { return 3 }
+        if !open_pack(&b, &w, &stk) { return 3 }
+    }
+    var ex0: mc_texext.TexExt = mc_texext.texext_new()
+    var sc: Scene = Scene { tb: mc_mesh.MeshTables { opaque: 0, tiles: 0 }, ex: mc_texext.texext_new(), atlas: mc_texext.texext_atlas_new(16, &ex0), an: mc_assets.animset_new() }
+    if !scene_init(&sc, &reg, &stk) { return 4 }
+    var ms: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(&reg, &stk, &sc.ex)
+    let s_water: i32 = sid(&reg, "water")
+    if s_water < 0 { return 5 }
+    mc_model_mesh.ms_set_water_tint(&ms, true)
+    var bids: [i32; 5] = [biome_id(&reg, "plains"), biome_id(&reg, "desert"), biome_id(&reg, "jungle"), biome_id(&reg, "forest"), biome_id(&reg, "swamp")]
+    var bi: usize = 0
+    while bi < 5 {
+        if bids[bi] < 0 { return 6 }
+        bi = bi + 1
+    }
+    mc_model_mesh.ms_load_biomes(&ms)
+    let hs: i64 = 293737985876514017
+    var zoomed: bool = true
+    mc_model_mesh.ms_set_seed(&ms, hs)
+    let pad: u64 = rt.heap_alloc(5832 * 2 + mc_model_mesh.BIO_BYTES)
+    var i: usize = 0
+    while i < 5832 {
+        rt.st16(pad, i, 0 as u16)
+        i = i + 1
+    }
+    // one water layer at y = 8
+    var z0: i32 = 0
+    while z0 < 16 {
+        var x0: i32 = 0
+        while x0 < 16 {
+            rt.st16(pad, (((8 + 1) * 18 + (z0 + 1)) * 18 + (x0 + 1)) as usize, s_water as u16)
+            x0 = x0 + 1
+        }
+        z0 = z0 + 1
+    }
+    mc_model_mesh.ms_prepare(&ms, pad, &sc.tb)
+    let bio: u64 = pad + (mc_model_mesh.BIO_OFF as u64)
+    var out: rt.Buf = rt.buf_new()
+    var outt: rt.Buf = rt.buf_new()
+    // grids: 0 = mosaic of 5 biomes (swamp noise columns included), 1 = two halves (the shortcut for equal cells applies to most blocks)
+    var zpass: i32 = 0
+    while zpass < 2 {
+    zoomed = zpass == 0
+    if zoomed { mc_model_mesh.ms_set_seed(&ms, hs) } else { mc_model_mesh.ms_clear_seed(&ms) }
+    var grid: i32 = 0
+    while grid < 2 {
+        var gy: i32 = 0 - 1
+        while gy < 5 {
+            var gz: i32 = 0 - 1
+            while gz < 5 {
+                var gx: i32 = 0 - 1
+                while gx < 5 {
+                    var id: i32 = bids[(iabs(gx * 7 + gy * 13 + gz * 3) % 5) as usize]
+                    if grid == 1 {
+                        id = bids[0]
+                        if gx >= 2 { id = bids[4] }
+                    }
+                    rt.st16(bio, (((gy + 1) * 6 + gz + 1) * 6 + gx + 1) as usize, id as u16)
+                    gx = gx + 1
+                }
+                gz = gz + 1
+            }
+            gy = gy + 1
+        }
+        var rr: i32 = 0
+        while rr <= 4 {
+            mc_model_mesh.ms_set_blend(&ms, rr)
+            var org: i32 = 0
+            while org < 2 {
+                var wx: i32 = 0 - 48
+                var wy: i32 = 32
+                var wz: i32 = 80
+                if org == 1 {
+                    wx = 4096
+                    wy = 0 - 16
+                    wz = 0 - 2032
+                }
+                let nq: usize = mc_model_mesh.ms_mesh_split_bio(&ms, pad, 0, &sc.tb, wx, wy, wz, &out, &outt, bio)
+                let total: usize = nq + rt.buf_len(&outt) / 240
+                if total != 576 { return 10 }
+                var tops: i32 = 0
+                var k: usize = 0
+                while k < nq {
+                    let ob: u64 = rt.buf_ptr(&out) + ((k * 240) as u64)
+                    let y1: f64 = math.math_f64(rt.ld64(ob, 4))
+                    let y2: f64 = math.math_f64(rt.ld64(ob, 5))
+                    if y1 > 8.99 && y1 < 9.01 && y2 > 8.99 && y2 < 9.01 {
+                        let xx: i32 = math.math_f64(rt.ld64(ob, 0)) as i32
+                        let zz: i32 = math.math_f64(rt.ld64(ob, 8)) as i32
+                        if xx < 0 || xx > 15 || zz < 0 || zz > 15 { return 11 }
+                        let want: u32 = ref_color(&ms, bio, hs as u64, zoomed, 2, rr, xx, 8, zz, wx, wy, wz)
+                        if tint_of(&out, k) != want { return 20 + grid * 100 + (rr * 10) + org }
+                        tops = tops + 1
+                    }
+                    k = k + 1
+                }
+                if tops != 256 { return 12 }
+                org = org + 1
+            }
+            rr = rr + 1
+        }
+        grid = grid + 1
+    }
+    zpass = zpass + 1
+    }
+    mc_model_mesh.ms_free(&ms)
+    rt.heap_free(pad, 5832 * 2 + mc_model_mesh.BIO_BYTES)
+    return 0
+}
