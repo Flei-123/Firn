@@ -74,8 +74,9 @@ export {
     UE_PLATFORM, UE_HASH, UE_SIZE, UE_DISK, UE_WRITABLE, UE_APPLY,
     UE_WORKER, UE_CANCELLED, UE_CONFIG, UE_UNSUPPORTED, UE_VERSION,
     UE_FLOOR, UE_MAGIC, UE_STATE,
-    OP_CHECK, OP_FETCH, RUN_AUTO, RUN_THREAD, RUN_PROCESS, RUN_BLOCKING,
-    UPDATE_THREAD_KIND,
+    OP_CHECK, OP_FETCH, RUN_AUTO, RUN_THREAD, RUN_PROCESS, RUN_BLOCKING, RUN_ASYNC,
+    UPDATE_THREAD_KIND, PH_PENDING, FE_PENDING,
+    update_async_install, update_async_finish, update_async_fail, update_async_cancelled,
 }
 
 // ---- phases (what the UI shows)
@@ -122,6 +123,17 @@ const RUN_AUTO: u32 = 0
 const RUN_THREAD: u32 = 1
 const RUN_PROCESS: u32 = 2
 const RUN_BLOCKING: u32 = 3
+// RUN_ASYNC: no thread, no second process, but an event loop (Android): the
+// check runs as passes between non-blocking requests (lib/appkit/update_async.fi).
+const RUN_ASYNC: u32 = 4
+
+// internal: a pass of the check found an answer missing (the async driver
+// fetches it and runs the pass again)
+const PH_PENDING: u64 = 90
+const FE_PENDING: u32 = 9000
+// a check that has to run on the UI thread (no thread, no loop) may take this long in total
+const UI_BUDGET_MS: u64 = 4000
+const UI_REQ_MS: u64 = 2500
 
 const UPDATE_THREAD_KIND: u64 = 7771
 
@@ -187,6 +199,13 @@ struct Updater {
     started_ms: u64,
     last_cancel_check_ms: u64,
     new_token: i64, // the program update_apply started (platform.plat_spawned_alive)
+    ahook: fn(u64, u32) -> bool, // starts an async check (appkit.update_async), see RUN_ASYNC
+    aget: fn(u64, u64, usize, *mut rt.Buf, *mut u32) -> u32, // answers get_mem from the async cache
+    ahooked: bool,
+    apass: bool, // a pass of an async check is running: get_mem answers from the cache
+    alogged: bool,
+    budget_ms: u64, // >0: a blocking run on the UI thread, bounded in total
+    chk_t0: u64,
 }
 
 static mut G_UPDATER: u64 = 0
@@ -215,11 +234,31 @@ fn update_new() -> *mut Updater {
     (*u).build = catalog.build_new()
     (*u).verify_tls = true
     (*u).resolver = fetch.resolve_system
+    (*u).ahook = ahook_none
+    (*u).aget = aget_none
     (*u).mode = RUN_AUTO
     (*u).new_token = -1
     (*u).ok = false
     G_UPDATER = p
     return u
+}
+
+fn ahook_none(u: u64, op: u32) -> bool {
+    return false
+}
+
+fn aget_none(u: u64, rel: u64, n: usize, out: *mut rt.Buf, http: *mut u32) -> u32 {
+    return fetch.FE_CANCELLED
+}
+
+// Installs the async driver (appkit.update_async): `start` begins a check,
+// `get` answers one request path from what the driver has fetched so far
+// (FE_PENDING = not yet; the driver then fetches it and runs the pass again).
+fn update_async_install(u: *mut Updater, start: fn(u64, u32) -> bool,
+    get: fn(u64, u64, usize, *mut rt.Buf, *mut u32) -> u32) {
+    (*u).ahook = start
+    (*u).aget = get
+    (*u).ahooked = true
 }
 
 // The one updater of the program (the one update_new made last).
@@ -631,6 +670,25 @@ fn package_key(out: *mut rt.Buf) {
 
 // fetch `path` (relative to the store) into memory
 fn get_mem(u: *mut Updater, rel: str, max: u64, out: *mut rt.Buf, http: *mut u32) -> u32 {
+    if (*u).apass {
+        // async check: the driver holds what the requests brought in
+        return (*u).aget(u as u64, rel.p as u64, rel.n, out, http)
+    }
+    var tmo: u64 = 15000
+    var dl: u64 = 120000
+    if (*u).budget_ms != 0 as u64 {
+        // blocking on the UI thread (no loop to wait on): bounded in total
+        let spent: u64 = now_ms() - (*u).chk_t0
+        if spent >= (*u).budget_ms {
+            *http = 0 as u32
+            rt.buf_clear(out)
+            return fetch.FE_TIMEOUT
+        }
+        let left: u64 = (*u).budget_ms - spent
+        tmo = UI_REQ_MS
+        if left < tmo { tmo = left }
+        dl = left
+    }
     var f: fetch.Fetch = fetch.fetch_new()
     var url: rt.Buf = rt.buf_new()
     util.buf_push_str(&url, appinfo.app_store_url())
@@ -638,8 +696,8 @@ fn get_mem(u: *mut Updater, rel: str, max: u64, out: *mut rt.Buf, http: *mut u32
     fetch.fetch_set_url(&f, util.buf_to_str_copy(&url))
     rt.buf_free(&url)
     f.max_body = max
-    f.timeout_ms = 15000
-    f.deadline_ms = 120000
+    f.timeout_ms = tmo
+    f.deadline_ms = dl
     f.verify_tls = (*u).verify_tls
     f.cancel = (&(*u).cancel) as u64
     fetch.fetch_set_resolver(&f, (*u).resolver)
@@ -686,6 +744,7 @@ fn ec_text(ec: u32) -> str {
 // Runs the whole check and leaves the answer in the status. The chosen
 // build is copied into (*u).build. Returns the final phase.
 fn update_check_blocking(u: *mut Updater) -> u64 {
+    if (*u).budget_ms != 0 as u64 && !(*u).apass { (*u).chk_t0 = now_ms() }
     (*u).cancel = 0
     (*u).st.err = UE_NONE
     (*u).st.nerr = 0
@@ -698,7 +757,10 @@ fn update_check_blocking(u: *mut Updater) -> u64 {
         st_fail(u, UE_CONFIG, "")
         return PH_ERROR
     }
-    log.log_info("update", "checking " + (appinfo.app_store_url()) + " channel " + appinfo.app_channel())
+    if !(*u).alogged {
+        log.log_info("update", "checking " + (appinfo.app_store_url()) + " channel " + appinfo.app_channel())
+        if (*u).apass { (*u).alogged = true }
+    }
     var entry_raw: rt.Buf = rt.buf_new()
     var sig: rt.Buf = rt.buf_new()
     var cat_raw: rt.Buf = rt.buf_new()
@@ -717,6 +779,14 @@ fn update_check_blocking(u: *mut Updater) -> u64 {
 
     // ---- 1. the signed entry (TUF-light), or the old direct way
     var r: u32 = get_mem(u, "entry.json", ENTRY_MAX, &entry_raw, &http)
+    if r == FE_PENDING {
+        rt.buf_free(&entry_raw)
+        rt.buf_free(&sig)
+        rt.buf_free(&cat_raw)
+        rt.buf_free(&last_ts)
+        rt.buf_free(&ts_text)
+        return PH_PENDING
+    }
     var legacy: bool = false
     if r == fetch.FE_STATUS && http == 404 as u32 {
         if entry_seen {
@@ -743,6 +813,14 @@ fn update_check_blocking(u: *mut Updater) -> u64 {
     var good: bool = true
     if !legacy {
         r = get_mem(u, "entry.json.sig", 128, &sig, &http)
+        if r == FE_PENDING {
+            rt.buf_free(&entry_raw)
+            rt.buf_free(&sig)
+            rt.buf_free(&cat_raw)
+            rt.buf_free(&last_ts)
+            rt.buf_free(&ts_text)
+            return PH_PENDING
+        }
         if r != fetch.FE_OK {
             net_fail(u, r, http)
             good = false
@@ -770,6 +848,14 @@ fn update_check_blocking(u: *mut Updater) -> u64 {
                 good = false
             } else {
                 r = get_mem(u, rel, CATALOG_MAX, &cat_raw, &http)
+                if r == FE_PENDING {
+                    rt.buf_free(&entry_raw)
+                    rt.buf_free(&sig)
+                    rt.buf_free(&cat_raw)
+                    rt.buf_free(&last_ts)
+                    rt.buf_free(&ts_text)
+                    return PH_PENDING
+                }
                 if r != fetch.FE_OK {
                     net_fail(u, r, http)
                     good = false
@@ -788,12 +874,28 @@ fn update_check_blocking(u: *mut Updater) -> u64 {
     } else {
         // the old way: index.json + index.json.sig, no freshness protection
         r = get_mem(u, "index.json", CATALOG_MAX, &cat_raw, &http)
+        if r == FE_PENDING {
+            rt.buf_free(&entry_raw)
+            rt.buf_free(&sig)
+            rt.buf_free(&cat_raw)
+            rt.buf_free(&last_ts)
+            rt.buf_free(&ts_text)
+            return PH_PENDING
+        }
         if r != fetch.FE_OK {
             net_fail(u, r, http)
             good = false
         }
         if good {
             r = get_mem(u, "index.json.sig", 128, &sig, &http)
+            if r == FE_PENDING {
+                rt.buf_free(&entry_raw)
+                rt.buf_free(&sig)
+                rt.buf_free(&cat_raw)
+                rt.buf_free(&last_ts)
+                rt.buf_free(&ts_text)
+                return PH_PENDING
+            }
             if r != fetch.FE_OK {
                 net_fail(u, r, http)
                 good = false
@@ -1142,6 +1244,35 @@ fn worker_run(u: *mut Updater, op: u32) {
     publish(u, true)
 }
 
+// The async driver is done with its passes: `ph` is the last phase the check
+// returned. A wanted download (OP_FETCH) still runs here, blocking, with its
+// progress callback -- the user asked for it and watches it.
+fn update_async_finish(u: *mut Updater, ph: u64) {
+    (*u).apass = false
+    (*u).alogged = false
+    var last: u64 = ph
+    if (*u).cancel != 0 as u64 && last != PH_ERROR {
+        st_fail(u, UE_CANCELLED, "")
+        last = PH_ERROR
+    }
+    if (*u).worker_op == OP_FETCH && last == PH_AVAILABLE {
+        update_fetch_blocking(u)
+    }
+    (*u).st.running = 0
+    (*u).st.seq = (*u).st.seq + 1
+    publish(u, true)
+}
+
+// the driver could not get an answer (no client, no memory, ...)
+fn update_async_fail(u: *mut Updater, what: str) {
+    st_fail(u, UE_NETWORK, what)
+    update_async_finish(u, PH_ERROR)
+}
+
+fn update_async_cancelled(u: *mut Updater) -> bool {
+    return (*u).cancel != 0 as u64
+}
+
 // the thread entry (the program's __thread_work forwards here)
 fn thread_dispatch(kind: u64, arg: u64) -> u64 {
     if kind != UPDATE_THREAD_KIND {
@@ -1201,9 +1332,31 @@ fn update_start(u: *mut Updater, op: u32, mode: u32) -> bool {
     (*u).st.nerr = 0
     (*u).st.nsha = 0
     (*u).st.nver = 0
+    (*u).budget_ms = 0 as u64
+    if m == RUN_BLOCKING && mode == RUN_AUTO && (*u).ahooked && (*u).verify_tls {
+        // no thread, no worker process, but an event loop: the check goes
+        // in passes between non-blocking requests, the UI never waits for it
+        (*u).publish_file = false
+        (*u).mode = RUN_ASYNC
+        (*u).st.phase = PH_CHECKING
+        (*u).st.running = 1
+        (*u).st.seq = (*u).st.seq + 1
+        (*u).apass = true
+        (*u).alogged = false
+        if (*u).ahook(u as u64, op) {
+            return true
+        }
+        (*u).apass = false
+        (*u).st.phase = PH_IDLE
+        (*u).st.running = 0
+        (*u).st.seq = (*u).st.seq + 1
+        return false
+    }
     if m == RUN_BLOCKING {
         (*u).publish_file = false
+        if mode == RUN_AUTO { (*u).budget_ms = UI_BUDGET_MS }
         worker_run(u, op)
+        (*u).budget_ms = 0 as u64
         return true
     }
     if m == RUN_THREAD {

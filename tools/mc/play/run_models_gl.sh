@@ -74,7 +74,7 @@ mkfifo "$W/in"; exec 3<>"$W/in"
 SRV_PID=$!
 for i in $(seq 1 180); do grep -q 'Done (' "$W/server.log" 2>/dev/null && break; kill -0 "$SRV_PID" 2>/dev/null || break; sleep 1; done
 grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did not start"; }
-for gr in "doDaylightCycle false" "doMobSpawning false" "doWeatherCycle false" "spawnRadius 0"; do echo "gamerule $gr" >&3; done
+for gr in "doDaylightCycle false" "doMobSpawning false" "doWeatherCycle false" "spawnRadius 0" "randomTickSpeed 0"; do echo "gamerule $gr" >&3; done
 echo "time set day" >&3
 # the four stairs (one per facing, row at z = 5) are set on the SERVER before any client joins: every run then gets them with the chunk data (r244:
 # stairs that arrive as block updates after the join give a different picture on ~10 % of the grass (+-1 level) than stairs loaded with the chunk,

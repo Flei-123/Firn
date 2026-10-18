@@ -182,7 +182,8 @@ remembered (`bad.0` .. `bad.3` in the state) and not offered again by itself.
 |---|---|
 | a thread (`thread_start`) | Linux x86-64 (and AArch64 where the compiler has threads) |
 | a worker **process** (`--appkit-worker check|fetch`: the program again; progress in `update-status.txt` with a beat counter -- 30 s without a beat means the worker died --, cancel by a file) | Windows (Firn has no threads there) |
-| right here (`RUN_BLOCKING`; the progress call-back is called from the same thread) | Android, and tools/tests |
+| on the program's event loop (`RUN_ASYNC`, `appkit.update_async.install(u, &loop)`: the check is a few CPU-only PASSES between non-blocking `async.ahttp` requests; a user-started download still runs blocking after it) | Android (needs `verify_tls`) |
+| right here (`RUN_BLOCKING`; the progress call-back is called from the same thread; a `RUN_AUTO` run that ends up here is bounded: 2.5 s per request, 4 s in total) | tools/tests, Android without `update_async` |
 
 The UI side is the same for all three: `update_start`, `update_poll` each
 frame, read `update_status`.

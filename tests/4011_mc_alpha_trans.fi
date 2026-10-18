@@ -1,0 +1,259 @@
+// expect_exit: 0
+// tests/4011_mc_alpha_trans.fi -- r242 translucency by texel alpha: a model whose texture is >= 25% partly transparent goes to the translucent stream
+// (ms_set_atlas) although its block name is no glass; fully opaque / cut out textures stay in the opaque stream; without an atlas only names count.
+import std.rt
+import std.core
+import std.math
+import std.io
+import zip.zip
+import pack.icons
+import mc.mc_assets
+import mc.mc_texture
+import mc.mc_texext
+import mc.mc_mesh
+import mc.mc_model
+import mc.mc_model_mesh
+import mc.mc_registry
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_camera
+import mc.mc_math
+import mc.mc_backend
+import mc.mc_raster
+import mc.mc_render_world
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+const W: i32 = 96
+const H: i32 = 72
+const CLEAR: u32 = 0xFF000000 as u32
+const MIN_Y: i32 = 0 - 64
+
+// 16 x 16 solid colour PNG
+fn png_solid(r: u8, g: u8, b: u8, a: u8, out: *mut rt.Buf) -> bool {
+    let px: u64 = rt.heap_alloc(16 * 16 * 4)
+    var i: usize = 0
+    while i < 256 {
+        rt.st8(px, i * 4, r)
+        rt.st8(px, i * 4 + 1, g)
+        rt.st8(px, i * 4 + 2, b)
+        rt.st8(px, i * 4 + 3, a)
+        i = i + 1
+    }
+    let ok: bool = icons.png_encode(px, 16, 16, out)
+    rt.heap_free(px, 16 * 16 * 4)
+    return ok
+}
+
+fn add_text(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    var ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn add_png(w: *mut zip.ZipWriter, name: str, r: u8, g: u8, b: u8, a: u8) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    if !png_solid(r, g, b, a, &p) { return false }
+    var ok: bool = zip.zip_add(w, name, rt.buf_ptr(&p), rt.buf_len(&p), true) catch | e | (false)
+    rt.buf_free(&p)
+    return ok
+}
+
+// blockstate of a block without properties: one model for every state
+fn add_state(w: *mut zip.ZipWriter, block: str, model: str) -> bool {
+    return add_text(w, "assets/minecraft/blockstates/" + block + ".json", "{\"variants\":{\"\":{\"model\":\"" + model + "\"}}}")
+}
+
+// a model with ONE up face covering the whole top of the cell (flat on the cell face: AO applies), texture `tex`, optional tintindex 0
+fn add_up_model(w: *mut zip.ZipWriter, name: str, tex: str, tinted: bool) -> bool {
+    var tn: str = ""
+    if tinted { tn = ",\"tintindex\":0" }
+    return add_text(w, "assets/minecraft/models/block/" + name + ".json",
+        "{\"textures\":{\"t\":\"block/" + tex + "\"},\"elements\":[{\"from\":[0,0,0],\"to\":[16,16,16],\"faces\":{\"up\":{\"uv\":[0,0,16,16],\"texture\":\"#t\"" + tn + "}}}]}")
+}
+
+fn open_pack(b: *mut rt.Buf, w: *mut zip.ZipWriter, st: *mut mc_assets.PackStack) -> bool {
+    var n: usize = zip.zip_finish(w) catch | e | (0)
+    zip.zip_writer_free(w)
+    if n == 0 { return false }
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pk, rt.buf_ptr(b), rt.buf_len(b)) != mc_assets.ASSET_OK { return false }
+    rt.buf_free(b)
+    return mc_assets.stack_push(st, &pk) == mc_assets.ASSET_OK
+}
+
+fn sid(reg: *mut mc_registry.Registry, name: str) -> i32 {
+    let blk: i32 = mc_registry.reg_block_by_name(reg, name.p as u64, name.length())
+    if blk < 0 { return 0 - 1 }
+    return mc_registry.reg_block_min_state(reg, blk)
+}
+
+// cell (x, y, z) of section 0 (a 16 x 16 x 16 u16 array per section, 2 sections)
+fn put(ids: u64, x: i32, y: i32, z: i32, state: i32) {
+    rt.st16(ids, ((y * 16 + z) * 16 + x) as usize, state as u16)
+}
+
+fn new_ids() -> u64 {
+    let ids: u64 = rt.heap_alloc(2 * 4096 * 2)
+    var i: usize = 0
+    while i < 8192 {
+        rt.st16(ids, i, 0 as u16)
+        i = i + 1
+    }
+    return ids
+}
+
+fn chan(c: u32, k: i32) -> i32 {
+    return ((c >> ((k * 8) as u32)) & (255 as u32)) as i32
+}
+
+fn iabs(v: i32) -> i32 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// everything a scene needs, rebuilt per scene
+struct Scene {
+    tb: mc_mesh.MeshTables,
+    ex: mc_texext.TexExt,
+    atlas: mc_texture.Atlas,
+    an: mc_assets.AnimSet,
+}
+
+fn scene_init(sc: *mut Scene, reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack) -> bool {
+    (*sc).tb = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_texture.tex_alloc_tables(&(*sc).tb)
+    (*sc).ex = mc_texext.texext_new()
+    mc_texext.tex_build_tables_ext(reg, &(*sc).tb, &(*sc).ex)
+    (*sc).atlas = mc_texext.texext_atlas_new(16, &(*sc).ex)
+    (*sc).an = mc_assets.animset_new()
+    return mc_assets.assets_apply_ext(st, &(*sc).atlas, &(*sc).ex, &(*sc).an) >= 1
+}
+
+// look from (ex, ey, ez) at (tx, ty, tz), render and return the centre pixel
+fn shot(r: *mut mc_raster.Raster, wr: *mut mc_render_world.WorldRender, w: *mut mc_world.World, cam: *mut mc_camera.Camera,
+    ex: f64, ey: f64, ez: f64, tx: f64, ty: f64, tz: f64) -> u32 {
+    mc_camera.camera_set_pos(cam, ex, ey, ez)
+    mc_camera.camera_look_at(cam, tx, ty, tz)
+    mc_camera.camera_update(cam)
+    mc_raster.backend_begin(r, cam, CLEAR)
+    mc_render_world.wr_render(wr, w, r, cam, 0 - 1)
+    return mc_raster.raster_pixel(r, W / 2, H / 2)
+}
+
+// 16 x 16 PNG, alpha 128 in the first `nc` columns and 255 elsewhere, optional fully clear column 15 (cut out)
+fn png_cols(nc: i32, clear_last: bool, out: *mut rt.Buf) -> bool {
+    let px: u64 = rt.heap_alloc(16 * 16 * 4)
+    var y: i32 = 0
+    while y < 16 {
+        var x: i32 = 0
+        while x < 16 {
+            let o: usize = ((y * 16 + x) * 4) as usize
+            rt.st8(px, o, 200 as u8)
+            rt.st8(px, o + 1, 100 as u8)
+            rt.st8(px, o + 2, 50 as u8)
+            var a: u8 = 255 as u8
+            if x < nc { a = 128 as u8 }
+            if clear_last && x == 15 { a = 0 as u8 }
+            rt.st8(px, o + 3, a)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let ok: bool = icons.png_encode(px, 16, 16, out)
+    rt.heap_free(px, 16 * 16 * 4)
+    return ok
+}
+
+fn add_cols(w: *mut zip.ZipWriter, name: str, nc: i32, clear_last: bool) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    if !png_cols(nc, clear_last, &p) { return false }
+    var ok: bool = zip.zip_add(w, name, rt.buf_ptr(&p), rt.buf_len(&p), true) catch | e | (false)
+    rt.buf_free(&p)
+    return ok
+}
+
+fn main() -> i32 {
+    var v: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(763, &v) { return 1 }
+    var reg: mc_registry.Registry = v.registry_of()
+    if !mc_registry.registry_ok(&reg) { return 2 }
+    var stk: mc_assets.PackStack = mc_assets.stack_new()
+    {
+        var b: rt.Buf = rt.buf_new()
+        var w: zip.ZipWriter = zip.zip_writer_new(&b)
+        if !add_text(&w, "pack.mcmeta", META) { return 3 }
+        if !add_cols(&w, "assets/minecraft/textures/block/stone.png", 16, false) { return 3 }       // all texels alpha 128: translucent
+        if !add_cols(&w, "assets/minecraft/textures/block/dirt.png", 0, false) { return 3 }         // all 255: opaque
+        if !add_cols(&w, "assets/minecraft/textures/block/sand.png", 4, true) { return 3 }          // 4 of 15 visible columns at 128 = 26.7%: translucent
+        if !add_cols(&w, "assets/minecraft/textures/block/gravel.png", 3, true) { return 3 }        // 3 of 15 = 20%: stays cut out
+        if !add_up_model(&w, "ms_a", "stone", false) { return 3 }
+        if !add_up_model(&w, "ms_b", "dirt", false) { return 3 }
+        if !add_up_model(&w, "ms_c", "sand", false) { return 3 }
+        if !add_up_model(&w, "ms_d", "gravel", false) { return 3 }
+        if !add_state(&w, "stone", "block/ms_a") { return 3 }
+        if !add_state(&w, "dirt", "block/ms_b") { return 3 }
+        if !add_state(&w, "sand", "block/ms_c") { return 3 }
+        if !add_state(&w, "gravel", "block/ms_d") { return 3 }
+        if !open_pack(&b, &w, &stk) { return 3 }
+    }
+    var ex0: mc_texext.TexExt = mc_texext.texext_new()
+    var sc: Scene = Scene { tb: mc_mesh.MeshTables { opaque: 0, tiles: 0 }, ex: mc_texext.texext_new(), atlas: mc_texext.texext_atlas_new(16, &ex0), an: mc_assets.animset_new() }
+    if !scene_init(&sc, &reg, &stk) { return 4 }
+    let s_a: i32 = sid(&reg, "stone")
+    let s_b: i32 = sid(&reg, "dirt")
+    let s_c: i32 = sid(&reg, "sand")
+    let s_d: i32 = sid(&reg, "gravel")
+    if s_a < 0 || s_b < 0 || s_c < 0 || s_d < 0 { return 5 }
+
+    let pad: u64 = rt.heap_alloc(5832 * 2)
+    var i: usize = 0
+    while i < 5832 {
+        rt.st16(pad, i, 0 as u16)
+        i = i + 1
+    }
+    rt.st16(pad, ((3 * 18 + 3) * 18 + 3) as usize, s_a as u16) // (2, 2, 2)
+    rt.st16(pad, ((3 * 18 + 3) * 18 + 6) as usize, s_b as u16) // (5, 2, 2)
+    rt.st16(pad, ((3 * 18 + 3) * 18 + 9) as usize, s_c as u16) // (8, 2, 2)
+    rt.st16(pad, ((3 * 18 + 3) * 18 + 12) as usize, s_d as u16) // (11, 2, 2)
+    var out: rt.Buf = rt.buf_new()
+    var outt: rt.Buf = rt.buf_new()
+
+    // without an atlas: names only -> everything opaque stream
+    var ms: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(&reg, &stk, &sc.ex)
+    mc_model_mesh.ms_prepare(&ms, pad, &sc.tb)
+    var nq: usize = mc_model_mesh.ms_mesh_split(&ms, pad, 0, &sc.tb, 0, 0, 0, &out, &outt)
+    if nq != 4 || rt.buf_len(&outt) != 0 { return 10 }
+    mc_model_mesh.ms_free(&ms)
+
+    // with the atlas: stone (128) + sand (26.7%) translucent, dirt (255) + gravel (20%) opaque
+    ms = mc_model_mesh.ms_new(&reg, &stk, &sc.ex)
+    mc_model_mesh.ms_set_atlas(&ms, &sc.atlas)
+    mc_model_mesh.ms_prepare(&ms, pad, &sc.tb)
+    nq = mc_model_mesh.ms_mesh_split(&ms, pad, 0, &sc.tb, 0, 0, 0, &out, &outt)
+    if nq != 2 { return 20 }
+    if rt.buf_len(&outt) / (mc_model_mesh.MQ_WORDS * 8) != 2 { return 21 }
+    // translucent flags (word 25) and x positions: opaque = dirt (x 5) + gravel (x 11); translucent = stone (x 2) + sand (x 8)
+    var k: usize = 0
+    var sum_o: f64 = 0.0
+    var sum_t: f64 = 0.0
+    while k < 2 {
+        sum_o = sum_o + math.math_f64(rt.ld64(rt.buf_ptr(&out), k * 30))
+        sum_t = sum_t + math.math_f64(rt.ld64(rt.buf_ptr(&outt), k * 30))
+        if math.math_f64(rt.ld64(rt.buf_ptr(&outt), k * 30 + 25)) < 0.5 { return 22 }
+        if math.math_f64(rt.ld64(rt.buf_ptr(&out), k * 30 + 25)) > 0.5 { return 23 }
+        k = k + 1
+    }
+    if sum_o < 15.5 || sum_o > 16.5 { return 24 }
+    if sum_t < 9.5 || sum_t > 10.5 { return 25 }
+    if mc_model_mesh.ms_tile_translucent(&ms, 0 as u32) { return 26 }
+
+    // ms_reset keeps the atlas
+    mc_model_mesh.ms_reset(&ms)
+    mc_model_mesh.ms_prepare(&ms, pad, &sc.tb)
+    nq = mc_model_mesh.ms_mesh_split(&ms, pad, 0, &sc.tb, 0, 0, 0, &out, &outt)
+    if nq != 2 { return 30 }
+    mc_model_mesh.ms_free(&ms)
+    rt.heap_free(pad, 5832 * 2)
+    return 0
+}

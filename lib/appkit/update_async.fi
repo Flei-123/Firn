@@ -1,0 +1,273 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/appkit/update_async.fi -- THE STORE CHECK THAT NEVER BLOCKS THE UI THREAD.
+//
+// Android has no thread of our own and no second process (see
+// lib/@android/appkit/platform.fi), so update.fi used to run the whole check
+// (DNS, TCP, TLS, three HTTPS requests) on the app thread: 3.4 s frozen on
+// x86_64, 8 s on a translated arm64 -- the system's ANR limit is 5 s and every
+// tap in that time was lost. This driver runs the SAME check as PASSES between
+// NON-BLOCKING requests (async.ahttp, on the program's event loop):
+//
+//   1. entry.json and entry.json.sig are asked at once;
+//   2. when all answers are in, a PASS runs update.update_check_blocking. Every
+//      answer comes from the cache of this driver (update.get_mem -> `a_get`);
+//      the first answer a pass misses (the catalog, whose address is in the
+//      entry) makes it return PH_PENDING without any side effect;
+//   3. the driver asks for that one and runs the pass again;
+//   4. a pass that gets through returns the real phase -> update_async_finish.
+//
+// A pass is CPU only (signature, JSON, compare): the log shows `pass n .. ms`.
+//
+// HONEST
+//   A1  The first lookup of the store's NAME still blocks the loop (ahttp H2);
+//       its time is bounded here: DNS_TIMEOUT_MS per name server, one round.
+//   A2  The download of an update (OP_FETCH, started by the user, progress on
+//       screen) still runs blocking after the check (update.fetch).
+//   A3  Needs verify_tls (the default); a check against a test server without
+//       TLS verification takes the blocking way of update.fi.
+//   A4  update_cancel is looked at between passes (a request in flight ends by
+//       itself within REQ_TIMEOUT_MS).
+import std.rt
+import async.loop
+import async.ahttp
+import net.http
+import net.dns
+import appkit.update
+import appkit.fetch
+import appkit.appinfo
+import appkit.util
+import appkit.log
+
+export { install }
+
+const SLOTS: usize = 4
+const REL_MAX: usize = 128
+const REQ_TIMEOUT_MS: i64 = 12000
+const DNS_TIMEOUT_MS: u64 = 700
+const MAX_SIG: usize = 128
+const MAX_ENTRY: usize = 65536
+const MAX_CATALOG: usize = 8388608
+
+struct Driver {
+    l: *mut loop.Loop,
+    up: *mut update.Updater,
+    ah: ahttp.AClient,
+    ready: bool,
+    inflight: u32,
+    n: usize,
+    rel: [u8; 512], // SLOTS x REL_MAX
+    nrel: [usize; 4],
+    res: [u32; 4], // fetch.FE_* per request
+    code: [u32; 4], // HTTP status per request
+    off: [usize; 4],
+    len: [usize; 4],
+    state: [u8; 4], // 0 free, 1 asked, 2 answered
+    blob: rt.Buf, // all bodies, one after the other
+    need: [u8; 128], // the address the last pass missed
+    nneed: usize,
+    npass: u32,
+    t0: i64,
+    cpu_ms: i64,
+}
+
+static mut G_DRV: u64 = 0
+
+fn dec(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var x: i64 = v
+    if x < 0 { x = 0 }
+    rt.buf_push_dec_u64(&b, x as u64)
+    let s: str = util.buf_to_str_copy(&b)
+    rt.buf_free(&b)
+    return s
+}
+
+fn drv_size[T: Any]() -> usize {
+    return size_of[T]()
+}
+
+// Makes the driver and hands it to the updater (RUN_AUTO on a platform
+// without threads then means RUN_ASYNC). `l` is the program's event loop.
+fn install(u: *mut update.Updater, l: *mut loop.Loop) -> bool {
+    let sz: usize = drv_size[Driver]()
+    let p: u64 = rt.heap_alloc(sz)
+    if p == 0 as u64 {
+        return false
+    }
+    rt.mem_set(p, 0 as u8, sz)
+    let d: *mut Driver = p as *mut Driver
+    (*d).l = l
+    (*d).up = u
+    (*d).ah = ahttp.aclient_new()
+    (*d).blob = rt.buf_new()
+    G_DRV = p
+    update.update_async_install(u, a_start, a_get)
+    return true
+}
+
+fn rel_at(d: *mut Driver, i: usize) -> u64 {
+    return ((&(*d).rel[0]) as u64) + (i * REL_MAX) as u64
+}
+
+fn map_layer(layer: u32, err: u32) -> u32 {
+    if err == 15 as u32 { return fetch.FE_TOOLARGE }
+    if layer == ahttp.NL_URL { return fetch.FE_URL }
+    if layer == ahttp.NL_DNS { return fetch.FE_RESOLVE }
+    if layer == ahttp.NL_TCP { return fetch.FE_CONNECT }
+    if layer == ahttp.NL_TLS_NOROOTS || layer == ahttp.NL_TLS_CERT || layer == ahttp.NL_TLS_OTHER { return fetch.FE_TLS }
+    if layer == ahttp.NL_TIMEOUT { return fetch.FE_TIMEOUT }
+    if layer == ahttp.NL_CANCELLED { return fetch.FE_CANCELLED }
+    return fetch.FE_RECV
+}
+
+// the answer to one request of the check, from what the requests brought in
+fn a_get(up: u64, relp: u64, reln: usize, out: *mut rt.Buf, http_out: *mut u32) -> u32 {
+    let d: *mut Driver = G_DRV as *mut Driver
+    var i: usize = 0
+    while i < (*d).n {
+        if (*d).nrel[i] == reln && rt.mem_eq(rel_at(d, i), relp, reln) {
+            if (*d).state[i] != 2 as u8 {
+                return update.FE_PENDING
+            }
+            *http_out = (*d).code[i]
+            rt.buf_clear(out)
+            if (*d).res[i] == fetch.FE_OK {
+                rt.buf_push_bytes(out, rt.buf_ptr(&(*d).blob) + (*d).off[i] as u64, (*d).len[i])
+            }
+            return (*d).res[i]
+        }
+        i = i + 1
+    }
+    if (*d).nneed == 0 && reln > 0 && reln < 128 {
+        rt.mem_copy((&(*d).need[0]) as u64, relp, reln)
+        (*d).nneed = reln
+    }
+    return update.FE_PENDING
+}
+
+// one request: the slot is the callback's user data
+fn req(d: *mut Driver, rel: str, max: usize) -> bool {
+    let i: usize = (*d).n
+    if i >= SLOTS || rel.n == 0 || rel.n >= REL_MAX {
+        return false
+    }
+    rt.mem_copy(rel_at(d, i), rel.p as u64, rel.n)
+    (*d).nrel[i] = rel.n
+    (*d).state[i] = 1 as u8
+    (*d).res[i] = fetch.FE_OK
+    (*d).code[i] = 0 as u32
+    (*d).n = i + 1
+    var url: rt.Buf = rt.buf_new()
+    util.buf_push_str(&url, appinfo.app_store_url())
+    util.buf_push_str(&url, rel)
+    (*d).inflight = (*d).inflight + 1 as u32
+    let r: *mut ahttp.Request = ahttp.aclient_get(&(*d).ah, rt.buf_ptr(&url), rt.buf_len(&url), REQ_TIMEOUT_MS, on_done, i as u64)
+    rt.buf_free(&url)
+    if r == 0 as *mut ahttp.Request {
+        (*d).inflight = (*d).inflight - 1 as u32
+        (*d).state[i] = 2 as u8
+        (*d).res[i] = fetch.FE_MEMORY
+        return false
+    }
+    ahttp.areq_set_max_body(r, max)
+    return true
+}
+
+fn on_done(r: *mut ahttp.Request, ud: u64) {
+    let d: *mut Driver = G_DRV as *mut Driver
+    let i: usize = ud as usize
+    var code: u32 = fetch.FE_OK
+    var st: u32 = 0 as u32
+    let err: u32 = ahttp.areq_error(r)
+    if err != 0 as u32 {
+        code = map_layer(ahttp.areq_layer(r), err)
+    } else {
+        st = ahttp.areq_status(r)
+        if st != 200 as u32 {
+            code = fetch.FE_STATUS
+        } else {
+            (*d).off[i] = rt.buf_len(&(*d).blob)
+            (*d).len[i] = ahttp.areq_body_len(r)
+            rt.buf_push_bytes(&(*d).blob, ahttp.areq_body_ptr(r), ahttp.areq_body_len(r))
+        }
+    }
+    (*d).res[i] = code
+    (*d).code[i] = st
+    (*d).state[i] = 2 as u8
+    (*d).inflight = (*d).inflight - 1 as u32
+    if (*d).inflight == 0 as u32 {
+        step(d)
+    }
+}
+
+fn need_str(d: *mut Driver) -> str {
+    return str { p: (&(*d).need[0]) as *mut u8, n: (*d).nneed }
+}
+
+fn max_for(rel: str) -> usize {
+    if rel == "entry.json" { return MAX_ENTRY }
+    if rel == "entry.json.sig" || rel == "index.json.sig" { return MAX_SIG }
+    return MAX_CATALOG
+}
+
+// all requests are answered: run a pass of the check
+fn step(d: *mut Driver) {
+    let u: *mut update.Updater = (*d).up
+    if update.update_async_cancelled(u) {
+        update.update_async_finish(u, update.PH_IDLE)
+        return
+    }
+    (*d).npass = (*d).npass + 1 as u32
+    (*d).nneed = 0
+    let t: i64 = loop.mono_ms()
+    let ph: u64 = update.update_check_blocking(u)
+    let took: i64 = loop.mono_ms() - t
+    (*d).cpu_ms = (*d).cpu_ms + took
+    if ph == update.PH_PENDING {
+        let rel: str = need_str(d)
+        log.log_info("update", "pass " + dec((*d).npass as i64) + " " + dec(took) + " ms, asks " + rel)
+        if rel.n == 0 || !req(d, rel, max_for(rel)) {
+            update.update_async_fail(u, "cannot ask for the next file")
+        }
+        return
+    }
+    log.log_info("update", "pass " + dec((*d).npass as i64) + " " + dec(took) + " ms, done after " + dec(loop.mono_ms() - (*d).t0) + " ms (cpu " + dec((*d).cpu_ms) + " ms)")
+    update.update_async_finish(u, ph)
+}
+
+// update_start (RUN_AUTO, no threads) calls this
+fn a_start(up: u64, op: u32) -> bool {
+    let d: *mut Driver = G_DRV as *mut Driver
+    if d == 0 as *mut Driver {
+        return false
+    }
+    if !(*d).ready {
+        if !ahttp.aclient_init(&(*d).ah, (*d).l) {
+            return false
+        }
+        (*d).ready = true
+        // a name lookup blocks the loop (A1): one round, a short wait per server
+        let rs: *mut dns.Resolver = http.client_resolver(ahttp.aclient_http(&(*d).ah))
+        dns.resolver_set_timeout(rs, DNS_TIMEOUT_MS)
+        dns.resolver_set_retries(rs, 1 as u32)
+    }
+    (*d).n = 0
+    (*d).inflight = 0 as u32
+    (*d).npass = 0 as u32
+    (*d).nneed = 0
+    (*d).cpu_ms = 0
+    rt.buf_clear(&(*d).blob)
+    (*d).t0 = loop.mono_ms()
+    // entry.json and its signature are always needed: ask for both at once
+    let a: bool = req(d, "entry.json", MAX_ENTRY)
+    let b: bool = req(d, "entry.json.sig", MAX_SIG)
+    if !a && !b {
+        return false
+    }
+    // a request that failed to start is an answered one (FE_MEMORY); if both
+    // were answered right away the pass runs now
+    if (*d).inflight == 0 as u32 {
+        step(d)
+    }
+    return true
+}

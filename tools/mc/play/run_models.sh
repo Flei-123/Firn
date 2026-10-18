@@ -5,7 +5,7 @@
 # Run A: MCPLAY_MODELS=1 MCPLAY_STREAM=0 (mc_render_world). Run B: same world, MCPLAY_MODELS unset (default: the stairs are full cubes). Run C: like A, but the T key (pack reload) is
 # pressed after the blocks stand -> ModelSet reset + wr_clear, the picture must have the models again.
 # Runs D / E / F (r236b): like A / C, but with the mc_stream path (MCPLAY_STREAM=1 = default, worker pool): D must look like A (same fixture colours, picture
-# differs from A by no more than the same pair without models, F (cubes, STREAM=0) vs B, plus 1 %, counting only pixels that differ by more than 2 levels), E (T key: stream_release -> ms_reset -> new stream with stream_set_models) must have the models again. Same pick probes.
+# differs from A by no more than the same pair without models, F (cubes, STREAM=0) vs B, exactly 0 px since r246, randomTickSpeed 0), E (T key: stream_release -> ms_reset -> new stream with stream_set_models) must have the models again. Same pick probes.
 # Pick probes (MCPLAY_PICK_PROBE, r236b): A / C pick the quads of the stairs (mc_model_pick: distances 3.0 / 4.5 / 4.0), B the whole voxel (2.5 / 4.0 / 4.0).
 # Checks: exit 0, frames; A and C print `models on` + `models states=N unmapped=0` (N > 0); B prints no `models` line; A has >= 120 pixels of EACH of
 # the four fixture colours in the 3D view; B differs from A in >= 1 % of the 3D view pixels (stairs vs cubes); C has the fixture colours again.
@@ -79,7 +79,7 @@ mkfifo "$W/in"; exec 3<>"$W/in"
 SRV_PID=$!
 for i in $(seq 1 180); do grep -q 'Done (' "$W/server.log" 2>/dev/null && break; kill -0 "$SRV_PID" 2>/dev/null || break; sleep 1; done
 grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did not start"; }
-for gr in "doDaylightCycle false" "doMobSpawning false" "doWeatherCycle false" "spawnRadius 0"; do echo "gamerule $gr" >&3; done
+for gr in "doDaylightCycle false" "doMobSpawning false" "doWeatherCycle false" "spawnRadius 0" "randomTickSpeed 0"; do echo "gamerule $gr" >&3; done
 echo "time set day" >&3
 # the four stairs (one per facing, row at z = 5) are set on the SERVER before any client joins: every run then gets them with the chunk data (r244:
 # stairs that arrive as block updates after the join give a different picture on ~10 % of the grass (+-1 level) than stairs loaded with the chunk,
@@ -177,8 +177,8 @@ def fixture(im):
     return cnt
 a, b, c, dd, e, f, g, h = [crop(p) for p in sys.argv[1:9]]
 d = ImageChops.difference(a, b).convert("L").point(lambda v: 255 if v > 0 else 0)
-def nz(x, y, t=2): return sum(ImageChops.difference(x, y).convert("L").point(lambda v: 255 if v > t else 0).histogram()[255:])
-d2 = ImageChops.difference(a, dd).convert("L").point(lambda v: 255 if v > 2 else 0)
+def nz(x, y, t=0): return sum(ImageChops.difference(x, y).convert("L").point(lambda v: 255 if v > t else 0).histogram()[255:])
+d2 = ImageChops.difference(a, dd).convert("L").point(lambda v: 255 if v > 0 else 0)
 d3 = ImageChops.difference(f, b).convert("L").point(lambda v: 255 if v > 0 else 0)
 print("A", *fixture(a), "B", *fixture(b), "C", *fixture(c), "diffAB", sum(d.histogram()[255:]), "total", a.width * a.height,
       "D", *fixture(dd), "E", *fixture(e), "diffAD", sum(d2.histogram()[255:]), "diffFB", sum(d3.histogram()[255:]),
@@ -193,16 +193,16 @@ PY
         DP=${17}; DT=${19}
         for i in 21 22 23 24; do [ "${!i}" -ge 120 ] || { echo "  FAIL  D (stream): fixture colour #$((i - 20)) only ${!i} pixels"; ERR=1; }; done
         for i in 26 27 28 29; do [ "${!i}" -ge 60 ] || { echo "  FAIL  E (stream, after reload): fixture colour #$((i - 25)) only ${!i} pixels"; ERR=1; }; done
-        # r244: the cube pairs are pixel-exact (B == F: stream vs inline, H == B: the default without pack models changes nothing). The model pairs differ run to run
-        # in TWO reproducible states (+-1 level on the grass of one chunk, ~19000 px, plus ~350 single pixels > 2 levels from another quad split), independent of
-        # stream / inline (A vs A2 differ the same way): so they are compared by pixels > 2 levels with a small limit (0.5 %), not exactly.
-        LIM=$((DT / 200))
+        # r246: ALL pairs are pixel-exact. The old bimodal picture (~19000 px +-1 level on the grass + ~350 px > 2 levels) was no client nondeterminism:
+        # the SERVER's random ticks turn the grass under a stair (a light blocking block) into dirt, a different number of cells per run
+        # (block_updates=1 or 2 in the run line); the cube mesher then splits the coplanar top quad differently (nv 4 / 16 / 24 / 32) and the affine rounding of
+        # the split quads differs by 1 level. `gamerule randomTickSpeed 0` (set before the stairs) removes the cause.
         [ "${33}" -le 0 ] || { echo "  FAIL  F (cubes, STREAM=0) differs from B (cubes, stream) by ${33} px"; ERR=1; }
         [ "${41}" -le 0 ] || { echo "  FAIL  H (default, pack without models) differs from B (cubes) by ${41} px (the default must not change a picture without pack models)"; ERR=1; }
-        [ "${31}" -le $LIM ] || { echo "  FAIL  D (stream) differs from A (mc_render_world) by ${31} px (> 2 levels), limit $LIM of $DT"; ERR=1; }
-        [ "${35}" -le $LIM ] || { echo "  FAIL  C (reload) differs from A by ${35} px (> 2 levels), limit $LIM"; ERR=1; }
-        [ "${37}" -le $LIM ] || { echo "  FAIL  E (stream, reload) differs from D by ${37} px (> 2 levels), limit $LIM"; ERR=1; }
-        [ "${39}" -le $LIM ] || { echo "  FAIL  G (default models) differs from D by ${39} px (> 2 levels), limit $LIM"; ERR=1; }
+        [ "${31}" -le 0 ] || { echo "  FAIL  D (stream) differs from A (mc_render_world) by ${31} px"; ERR=1; }
+        [ "${35}" -le 0 ] || { echo "  FAIL  C (reload) differs from A by ${35} px"; ERR=1; }
+        [ "${37}" -le 0 ] || { echo "  FAIL  E (stream, reload) differs from D by ${37} px"; ERR=1; }
+        [ "${39}" -le 0 ] || { echo "  FAIL  G (default models) differs from D by ${39} px"; ERR=1; }
         [ "$DP" -ge $((DT / 100)) ] || { echo "  FAIL  A equals B (stairs drawn as cubes?): $DP of $DT pixels differ"; ERR=1; }
     fi
 fi
