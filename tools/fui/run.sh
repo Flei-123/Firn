@@ -1628,6 +1628,14 @@ build vlistapp
 "$FIRNC" --opt-level=release-fast -o "$W/vlistapp_fast" tools/fui/vlistapp_main.fi
 "$W/vlistapp_fast" speed
 
+echo "== 18q4. PAINT-ONLY FRAME + x-CUT RASTER WINDOW (r455 / r456) =="
+# app.touch_rotated -> style + draw under the clip == a full repaint, byte for byte; any other change in the same step (text, hover) leaves
+# the fast path. painter.round_rect cuts its raster window to the clip in x between the corners: same octets inside the clip.
+build rotpaint
+"$W/rotpaint"
+build xcut
+"$W/xcut"
+
 echo "== 18q2. fui.appctl PART 2: MENU BAR, TOOLTIP, DIALOGS =="
 # lib/fui/appctl.fi: Alt+letter, shortcuts, Left / Right between menus, check items, the context menu,
 # the tooltip delay (fuiwirt.host_set_wake), message / confirm / input dialogs and the audit.
