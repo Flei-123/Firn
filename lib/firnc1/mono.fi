@@ -1417,8 +1417,30 @@ fn struct_instantiate(g: *mut Gen, ii: u32) {
 // they appeared; anything that comes up in between is handled right
 // afterwards.
 fn gen_run(g: *mut Gen) {
+    gen_expand_from(g, 0)
+    // r664: default + named arguments -> plain positional calls
+    dargs_run(g)
+    // r715: lambda sugar `|x| e` -> typed closure (lamsugar.fi).
+    // r742: the same pass infers the type arguments of a generic function used as a
+    // value from the expected `fn` type (`apply(id, 4)`); those instances are created
+    // afterwards and the pass runs again for the new bodies.
+    var round: usize = 0
+    while round < 8 {
+        let before: usize = vec_len[u32](&(*g).iv_name)
+        (*g).err = (*g).err + (lamsugar.run(gtree(g), gnames(g), (*g).feh as *mut err.Error, g as u64, gen_infer_value) as usize)
+        if vec_len[u32](&(*g).iv_name) == before || (*g).err > 0 {
+            break
+        }
+        gen_expand_from(g, before)
+        dargs_run(g)
+        round = round + 1
+    }
+}
+
+// Expands every instance from number `from` on that is not abstract (all of them for 0).
+fn gen_expand_from(g: *mut Gen, from: usize) {
     var i: usize = vec_len[u32](&(*g).iv_name)
-    while i > 0 {
+    while i > from {
         i = i - 1
         if vec_at[u32](&(*g).iv_abstract, i) == 0 {
             vec_push[u32](&(*g).stack, i as u32)
@@ -1443,10 +1465,233 @@ fn gen_run(g: *mut Gen) {
             struct_instantiate(g, ii)
         }
     }
-    // r664: default + named arguments -> plain positional calls
-    dargs_run(g)
-    // r715: lambda sugar `|x| e` -> typed closure (lamsugar.fi)
-    (*g).err = (*g).err + (lamsugar.run(gtree(g), gnames(g), (*g).feh as *mut err.Error) as usize)
+}
+
+// ------------------------------------------- r742: generic fn as a value
+//
+// Twin of `sema_generic.rs::infer_fn_value` + `unify_ty`. `lamsugar.run` calls
+// `gen_infer_value(g, node, expected)` for an `E_ID` where a `fn(..)` type is expected.
+// expected == NONE: only "is this a generic function name?" (returns 1).
+// Returns 1 = node renamed to the instance, 0 = not applicable, 2 = error (counted).
+
+fn is_tparam(g: *mut Gen, nr: u32, toff: u32, tlen: u32) -> i64 {
+    var k: u32 = 0
+    while k < tlen {
+        if vec_at[u32](&(*g).tp_name, (toff + k) as usize) == nr {
+            return k as i64
+        }
+        k = k + 1
+    }
+    return -1
+}
+
+// Does the type mention a type parameter name of ANY template? (A node inside a
+// template body; the instances get their own copies.)
+fn mentions_tparam(g: *mut Gen, t: u32) -> bool {
+    if t == ast.NOTHING {
+        return false
+    }
+    let b: *mut ast.Tree = gtree(g)
+    let k: u32 = ast.t_kind(b, t)
+    if k == ast.T_PTR || k == ast.T_ARR {
+        return mentions_tparam(g, ast.t_a(b, t))
+    }
+    if k == ast.T_FN || k == ast.T_TUP {
+        if mentions_tparam(g, ast.t_a(b, t)) {
+            return true
+        }
+        let pk: u64 = ast.t_b(b, t)
+        let off: u32 = (pk >> 32) as u32
+        let cnt: u32 = (pk & 4294967295) as u32
+        var i: u32 = 0
+        while i < cnt {
+            if mentions_tparam(g, ast.child_at(b, off + i)) {
+                return true
+            }
+            i = i + 1
+        }
+        return false
+    }
+    let nr: u32 = ast.t_a(b, t)
+    var j: usize = 0
+    while j < vec_len[u32](&(*g).tp_name) {
+        if vec_at[u32](&(*g).tp_name, j) == nr {
+            return true
+        }
+        j = j + 1
+    }
+    let ii: u32 = inst_find(g, nr)
+    if ii != NONE {
+        let ao: u32 = vec_at[u32](&(*g).iv_aoff, ii as usize)
+        let al: u32 = vec_at[u32](&(*g).iv_alen, ii as usize)
+        var q: u32 = 0
+        while q < al {
+            if mentions_tparam(g, vec_at[u32](&(*g).iargs, (ao + q) as usize)) {
+                return true
+            }
+            q = q + 1
+        }
+    }
+    return false
+}
+
+// unify(template type `t`, concrete type `c`); the bindings go to bn / bt.
+fn unify_ty(g: *mut Gen, toff: u32, tlen: u32, t: u32, c: u32, bn: *mut Vec[u32], bt: *mut Vec[u32]) -> bool {
+    if t == ast.NOTHING || c == ast.NOTHING {
+        return t == c
+    }
+    let b: *mut ast.Tree = gtree(g)
+    let kt: u32 = ast.t_kind(b, t)
+    let kc: u32 = ast.t_kind(b, c)
+    if kt == ast.T_NAME {
+        let nr: u32 = ast.t_a(b, t)
+        if is_tparam(g, nr, toff, tlen) >= 0 {
+            var i: usize = 0
+            while i < vec_len[u32](bn) {
+                if vec_at[u32](bn, i) == nr {
+                    return lamsugar.ty_same(b, vec_at[u32](bt, i), c)
+                }
+                i = i + 1
+            }
+            vec_push[u32](bn, nr)
+            vec_push[u32](bt, c)
+            return true
+        }
+        if kc != ast.T_NAME {
+            return false
+        }
+        if nr == ast.t_a(b, c) {
+            return true
+        }
+        let i1: u32 = inst_find(g, nr)
+        let i2: u32 = inst_find(g, ast.t_a(b, c))
+        if i1 == NONE || i2 == NONE {
+            return false
+        }
+        if vec_at[u32](&(*g).iv_base, i1 as usize) != vec_at[u32](&(*g).iv_base, i2 as usize) {
+            return false
+        }
+        let l1: u32 = vec_at[u32](&(*g).iv_alen, i1 as usize)
+        if l1 != vec_at[u32](&(*g).iv_alen, i2 as usize) {
+            return false
+        }
+        var q: u32 = 0
+        while q < l1 {
+            let x: u32 = vec_at[u32](&(*g).iargs, (vec_at[u32](&(*g).iv_aoff, i1 as usize) + q) as usize)
+            let y: u32 = vec_at[u32](&(*g).iargs, (vec_at[u32](&(*g).iv_aoff, i2 as usize) + q) as usize)
+            if !unify_ty(g, toff, tlen, x, y, bn, bt) {
+                return false
+            }
+            q = q + 1
+        }
+        return true
+    }
+    if kt != kc {
+        return false
+    }
+    if kt == ast.T_PTR {
+        return unify_ty(g, toff, tlen, ast.t_a(b, t), ast.t_a(b, c), bn, bt)
+    }
+    if kt == ast.T_ARR {
+        return ast.t_b(b, t) == ast.t_b(b, c) && unify_ty(g, toff, tlen, ast.t_a(b, t), ast.t_a(b, c), bn, bt)
+    }
+    // T_FN / T_TUP
+    let pt: u64 = ast.t_b(b, t)
+    let pc: u64 = ast.t_b(b, c)
+    let n: u32 = (pt & 4294967295) as u32
+    if n != ((pc & 4294967295) as u32) {
+        return false
+    }
+    if !unify_ty(g, toff, tlen, ast.t_a(b, t), ast.t_a(b, c), bn, bt) {
+        return false
+    }
+    var i2: u32 = 0
+    while i2 < n {
+        if !unify_ty(g, toff, tlen, ast.child_at(b, ((pt >> 32) as u32) + i2), ast.child_at(b, ((pc >> 32) as u32) + i2), bn, bt) {
+            return false
+        }
+        i2 = i2 + 1
+    }
+    return true
+}
+
+fn gen_infer_value(gp: u64, node: u32, exp: u32) -> u32 {
+    let g: *mut Gen = gp as *mut Gen
+    let b: *mut ast.Tree = gtree(g)
+    if ast.e_kind(b, node) != ast.E_ID {
+        return 0
+    }
+    let nm: u32 = ast.e_a(b, node)
+    let ti: u32 = fn_template_find(g, nm)
+    if ti == NONE {
+        return 0
+    }
+    if exp == NONE {
+        return 1
+    }
+    if ast.t_kind(b, exp) != ast.T_FN || mentions_tparam(g, exp) {
+        return 0
+    }
+    // NOTE: a local variable with the name of a generic function is not detected here
+    // (the flat tree has no scopes; firnc0 checks exactly). Only a variable that is also an
+    // exactly unifiable fn value could be mistaken.
+    let toff: u32 = vec_at[u32](&(*g).fv_toff, ti as usize)
+    let tlen: u32 = vec_at[u32](&(*g).fv_tlen, ti as usize)
+    let poff: u32 = vec_at[u32](&(*g).fv_poff, ti as usize)
+    let plen: u32 = vec_at[u32](&(*g).fv_plen, ti as usize)
+    let pk: u64 = ast.t_b(b, exp)
+    if plen != ((pk & 4294967295) as u32) {
+        (*g).err = (*g).err + 1
+        return 2
+    }
+    var bn: Vec[u32] = vec_new[u32]()
+    var bt: Vec[u32] = vec_new[u32]()
+    var ok: bool = true
+    var i: u32 = 0
+    while i < plen && ok {
+        ok = unify_ty(g, toff, tlen, ast.param_ty(b, poff + i), ast.child_at(b, ((pk >> 32) as u32) + i), &bn, &bt)
+        i = i + 1
+    }
+    if ok {
+        ok = unify_ty(g, toff, tlen, vec_at[u32](&(*g).fv_ret, ti as usize), ast.t_a(b, exp), &bn, &bt)
+    }
+    var args: Vec[u32] = vec_new[u32]()
+    var res: u32 = 0
+    if ok {
+        var k: u32 = 0
+        while k < tlen && ok {
+            let pn: u32 = vec_at[u32](&(*g).tp_name, (toff + k) as usize)
+            var found: bool = false
+            var j: usize = 0
+            while j < vec_len[u32](&bn) {
+                if vec_at[u32](&bn, j) == pn {
+                    vec_push[u32](&args, vec_at[u32](&bt, j))
+                    found = true
+                    break
+                }
+                j = j + 1
+            }
+            if !found || mentions_tparam(g, vec_at[u32](&args, k as usize)) {
+                ok = false
+            } else if !satisfied_all(g, vec_at[u32](&args, k as usize), toff + k) {
+                ok = false
+            }
+            k = k + 1
+        }
+        if ok {
+            let inst: u32 = register(g, nm, &args, true, false)
+            ast.e_a_set(b, node, inst)
+            res = 1
+        }
+    }
+    if !ok && res == 0 {
+        (*g).err = (*g).err + 1
+        res = 2
+    }
+    vec_free[u32](&bn)
+    vec_free[u32](&bt)
+    vec_free[u32](&args)
+    return res
 }
 
 // ------------------------------------------------ r664: default/named args
