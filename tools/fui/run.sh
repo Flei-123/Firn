@@ -806,6 +806,10 @@ build appw11
 build tablex
 "$W/tablex" | tail -n 3 | grep -q "TABLEX PASSED"
 
+# uiatab (W37): UIA model of the table / text field / slider: Grid, Table, GridItem, TableItem, Selection, real Value text, range 0..100, hit tests
+build uiatab
+"$W/uiatab" | tail -n 3 | grep -q "UIATAB PASSED"
+
 # appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
 build appw6
 "$W/appw6" | tail -n 3
@@ -917,6 +921,13 @@ for f in tools/fui/*_main.fi demos/*/main.fi examples/*/main.fi; do
     fi
 done
 echo "  alle tools/fui/*_main.fi, demos/*/main.fi und examples/*/main.fi uebersetzen  OK"
+# W37: programs in their OWN folder (tools/fui/<name>/main.fi). Directly under tools/fui a Windows build would pick up
+# tools/fui/window/backend.fi (X11) instead of the Win32 backend -- so the Windows-capable ones live in a subfolder.
+for f in tools/fui/uialive/main.fi tools/fui/gpuhost/main.fi; do
+    "$FIRNC" --opt-level=dev -o "$W/baupruefung" "$f" >/dev/null
+    "$FIRNC" --opt-level=dev --target=x86_64-windows -o "$W/baupruefung.exe" "$f" >/dev/null
+done
+echo "  tools/fui/uialive und tools/fui/gpuhost (Linux + Windows) uebersetzen  OK"
 missing_any=0
 for f in tools/fui/*_main.fi demos/fuidemo/main.fi; do
     n=$(basename "$f" _main.fi)
