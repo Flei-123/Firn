@@ -83,7 +83,7 @@ OGG + sound.json + mc_audio modes: 3-4 d. UI + persistence: 1-2 d.
   unchanged OGG = same sample (hash), changed OGG = takes over its old slot -> the `samples=` number stays equal. Pack events that vanished stay (small).
 * Test: `tools/mc/play/run_packsnd.sh` (server + Xvfb; both/file with a changed-OGG reload, both/device with PulseAudio null sink, original/file).
 
-## Models / blockstates (r80, lib/mc/mc_model.fi + mc_model_ref.fi, tests 3940 / 3941)
+## Models / blockstates (r80, lib/mc/mc_model.fi + mc_model_ref.fi, tests 3945 / 3946)
 * **Done (library level, CPU only):** `blockstate_select(stack, block, "k=v,k=v", seed, &sel)` picks the models of a block state from `assets/minecraft/blockstates/<block>.json`
   (variants: key = subset of the state in any order, `""`/`normal` = all, weighted lists by seed; multipart: `when` with `a|b`, `true/false`, `OR`, `AND`, `apply` object or weighted list).
   `model_bake` / `blockstate_bake` read `models/<path>.json` (parent chain up to 16, `#texture` references, `elements`, element rotation incl. rescale, face `uv` / `rotation` /
