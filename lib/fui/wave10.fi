@@ -1,0 +1,694 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/wave10.fi -- WAVE 10 (W29): DRAG AND DROP between lists and nodes, wired into a window.
+//
+// dnd.fi is the pure state machine (threshold, effect by modifier, kinds, edge scroll, keyboard way). This file
+// is the glue that needs a window: sources and targets are scene nodes; a virtual list (app.vlist_new) is a
+// source of ROWS and a target with a drop slot (gap between rows, or ON a row in tree mode). The drag starts
+// after 4 px (10 px touch); the target under the pointer decides the effect (dnd.effect_of via dnd.over); at the
+// release the app's `on_drop(a, target_node)` runs and the result is read with the dd_r_* getters. Esc cancels.
+// KEYBOARD: Ctrl+Space on a focused source grabs (rows: the current row), Up/Down walk the drop gaps of all
+// targets, Enter drops, Esc cancels; the grabbed node says "Drop at position n of m" as its description.
+// Painting: drop marker (line between rows, outline on a row / node) and a ghost card at the pointer.
+// lib/fui/appctl.fi is the door (`appctl.dnd_*`); it only forwards events here and owns the Dd state.
+
+import std.rt
+import fui.app
+import fui.scene
+import fui.render
+import fui.kit
+import fui.style
+import fui.painter
+import fui.theme
+import fui.a11y
+import fui.dnd
+import fui.vlist
+import fui.viewport
+import fui.editor
+import fui.event
+import fui.uistr
+import plat.fuiwirt
+
+export {
+    Dd, dd_new, dd_source, dd_target, dd_pointer, dd_key, dd_char, dd_draw, dd_tick, dd_busy, dd_cancel,
+    dd_set_ghost, move_index, dd_is_source, dd_total_gaps, dd_on_start, dd_on_drop, dd_edge_active, dd_keyboard,
+    dd_r_effect, dd_r_source, dd_r_row, dd_r_target, dd_r_gap, dd_r_zone, dd_r_trow, dd_drops, dd_active,
+    DD_MAX,
+}
+
+const NONE: usize = 4294967295
+const DD_MAX: usize = 8
+
+fn put_dec(p: u64, v: usize) -> usize {
+    var tmp: [u8; 20] = [0 as u8; 20]
+    var n: usize = 0
+    var x: usize = v
+    if x == 0 {
+        tmp[0] = 48 as u8
+        n = 1
+    }
+    while x > 0 {
+        tmp[n] = (48 + (x % 10)) as u8
+        x = x / 10
+        n = n + 1
+    }
+    var i: usize = 0
+    while i < n {
+        *((p + i as u64) as *mut u8) = tmp[n - 1 - i]
+        i = i + 1
+    }
+    return n
+}
+
+// ============================================================ DRAG AND DROP
+
+struct Dd {
+    d: dnd.Drag,
+    ns: usize,
+    s_node: [usize; 8],
+    s_kind: [u32; 8],
+    s_ops: [u32; 8],
+    nt: usize,
+    t_node: [usize; 8],
+    t_kinds: [u32; 8],
+    t_ops: [u32; 8],
+    t_tree: [bool; 8],
+    src: usize, // the source of the running drag (index), NONE = none
+    s_row: usize, // its row (a list source), NONE for a plain node
+    tgt: usize, // the target under the pointer (index), NONE = none
+    t_gap: i64, // its drop slot: gap 0..n, the zone and the row (list targets)
+    t_zone: u32,
+    t_row: usize,
+    edge: i64, // the edge scroll step of the last probe (px, negative = up)
+    px: f64,
+    py: f64,
+    on_start: fn(*mut app.App, usize),
+    on_drop: fn(*mut app.App, usize),
+    ghost: [u8; 48],
+    ghost_n: usize,
+    // the last finished drop
+    r_eff: u32,
+    r_src: usize,
+    r_row: usize,
+    r_tgt: usize,
+    r_gap: i64,
+    r_zone: u32,
+    r_trow: usize,
+    drops: usize,
+    // the keyboard way: the node that was grabbed and the description buffer of its announcement
+    kb_node: usize,
+    kb_desc: u64,
+}
+
+fn dd_cb_none(a: *mut app.App, node: usize) {
+}
+
+fn dd_blank() -> Dd {
+    return Dd { d: dnd.drag_new(), ns: 0, s_node: [NONE; 8], s_kind: [0 as u32; 8], s_ops: [0 as u32; 8],
+        nt: 0, t_node: [NONE; 8], t_kinds: [0 as u32; 8], t_ops: [0 as u32; 8], t_tree: [false; 8],
+        src: NONE, s_row: NONE, tgt: NONE, t_gap: 0, t_zone: dnd.SLOT_BEFORE, t_row: NONE, edge: 0, px: 0.0, py: 0.0,
+        on_start: dd_cb_none, on_drop: dd_cb_none, ghost: [0 as u8; 48], ghost_n: 0,
+        r_eff: dnd.OP_NONE, r_src: NONE, r_row: NONE, r_tgt: NONE, r_gap: 0, r_zone: dnd.SLOT_BEFORE, r_trow: NONE,
+        drops: 0, kb_node: NONE, kb_desc: 0 }
+}
+
+fn dd_new() -> *mut Dd {
+    var probe: [Dd; 2] = [dd_blank(); 2]
+    let sz: usize = ((&probe[1]) as usize) - ((&probe[0]) as usize)
+    let p: u64 = rt.heap_alloc(sz)
+    if p == 0 {
+        return 0 as u64 as *mut Dd
+    }
+    let dd: *mut Dd = p as *mut Dd
+    *dd = dd_blank()
+    (*dd).kb_desc = rt.heap_alloc(96)
+    return dd
+}
+
+fn dd_source(dd: *mut Dd, node: usize, kind: u32, ops: u32) -> bool {
+    if (*dd).ns >= DD_MAX {
+        return false
+    }
+    let i: usize = (*dd).ns
+    (*dd).s_node[i] = node
+    (*dd).s_kind[i] = kind
+    (*dd).s_ops[i] = ops
+    (*dd).ns = i + 1
+    return true
+}
+
+fn dd_target(dd: *mut Dd, node: usize, kinds: u32, ops: u32, tree: bool) -> bool {
+    if (*dd).nt >= DD_MAX {
+        return false
+    }
+    let i: usize = (*dd).nt
+    (*dd).t_node[i] = node
+    (*dd).t_kinds[i] = kinds
+    (*dd).t_ops[i] = ops
+    (*dd).t_tree[i] = tree
+    (*dd).nt = i + 1
+    return true
+}
+
+fn dd_is_source(dd: *mut Dd, node: usize) -> bool {
+    var i: usize = 0
+    while i < (*dd).ns {
+        if (*dd).s_node[i] == node {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The text of the ghost that follows the pointer (copied, 47 bytes at most).
+fn dd_set_ghost(dd: *mut Dd, t: str) {
+    var n: usize = t.n
+    if n > 47 {
+        n = 47
+    }
+    var i: usize = 0
+    while i < n {
+        (*dd).ghost[i] = *((t.p as u64 + i as u64) as *mut u8)
+        i = i + 1
+    }
+    (*dd).ghost_n = n
+}
+
+fn tr_item() -> str { return uistr.t("wave10.item", "Item") }
+fn tr_drop_at() -> str { return uistr.t("wave10.drop_at", "Drop at position") }
+fn tr_of() -> str { return uistr.t("wave10.of", "of") }
+
+// Move the item `from` of an n-item list so that it lands in gap `gap` (0..n, as the drop slot gives it): the
+// index it has afterwards. Dropping next to itself changes nothing.
+fn move_index(from: usize, gap: usize) -> usize {
+    if gap > from {
+        return gap - 1
+    }
+    return gap
+}
+
+fn dd_mods(a: *mut app.App) -> u32 {
+    let m: u32 = fuiwirt.host_mods(app.app_host(a))
+    var r: u32 = 0 as u32
+    if (m & editor.MOD_SHIFT) != 0 as u32 {
+        r = r | dnd.MOD_SHIFT
+    }
+    if (m & editor.MOD_CTRL) != 0 as u32 {
+        r = r | dnd.MOD_CTRL
+    }
+    if (m & editor.MOD_ALT) != 0 as u32 {
+        r = r | dnd.MOD_ALT
+    }
+    return r
+}
+
+fn node_has(sc: *mut scene.Scene, node: usize, x: f64, y: f64) -> bool {
+    return x >= scene.node_x(sc, node) && x < scene.node_x(sc, node) + scene.node_w(sc, node)
+    && y >= scene.node_y(sc, node) && y < scene.node_y(sc, node) + scene.node_h(sc, node)
+}
+
+// The source under a press: a list gives the row, any other node itself. false = none.
+fn dd_find_source(a: *mut app.App, dd: *mut Dd, x: f64, y: f64, row: *mut usize) -> usize {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    var i: usize = 0
+    while i < (*dd).ns {
+        let node: usize = (*dd).s_node[i]
+        let v: *mut vlist.Vlist = app.vlist_model(a, node)
+        if (v as u64) != 0 {
+            let r: usize = vlist.vl_hit(v, x, y)
+            if r != vlist.NONE && r != NONE {
+                *row = r
+                return i
+            }
+        } else if !scene.node_hidden(sc, node) && node_has(sc, node, x, y) {
+            *row = NONE
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// The drop slot of a list under y: gap 0..n, zone and row (tree mode has an ON zone).
+fn list_slot(v: *mut vlist.Vlist, y: f64, tree: bool, gap: *mut i64, zone: *mut u32, row: *mut usize) {
+    let n: usize = vlist.vl_count(v)
+    if n == 0 {
+        *gap = 0
+        *zone = dnd.SLOT_BEFORE
+        *row = NONE
+        return
+    }
+    let cy: f64 = y - vlist.vl_body_y(v) + vlist.vl_scroll_y(v)
+    if cy < 0.0 {
+        *gap = 0
+        *zone = dnd.SLOT_BEFORE
+        *row = 0
+        return
+    }
+    let r: usize = vlist.vl_index_at(v, cy)
+    if r == vlist.NONE || r == NONE {
+        *gap = n as i64
+        *zone = dnd.SLOT_AFTER
+        *row = n - 1
+        return
+    }
+    let top: f64 = vlist.vl_row_top(v, r)
+    let h: f64 = vlist.vl_height_of(v, r)
+    let z: u32 = dnd.slot_zone(cy as i64, top as i64, h as i64, 1, tree)
+    *row = r
+    *zone = z
+    *gap = r as i64
+    if z == dnd.SLOT_AFTER {
+        *gap = r as i64 + 1
+    }
+}
+
+// Look for the target under (x, y): feeds dnd.over / dnd.leave, the slot and the edge scroll step.
+fn dd_probe(a: *mut app.App, dd: *mut Dd, x: f64, y: f64) {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    var found: usize = NONE
+    var i: usize = 0
+    while i < (*dd).nt && found == NONE {
+        let node: usize = (*dd).t_node[i]
+        if !scene.node_hidden(sc, node) && node_has(sc, node, x, y) {
+            found = i
+        }
+        i = i + 1
+    }
+    (*dd).tgt = found
+    (*dd).edge = 0
+    if found == NONE {
+        dnd.leave(&(*dd).d)
+        return
+    }
+    dnd.over(&(*dd).d, (found + 1) as u64, (*dd).t_kinds[found], (*dd).t_ops[found])
+    let v: *mut vlist.Vlist = app.vlist_model(a, (*dd).t_node[found])
+    (*dd).t_gap = 0
+    (*dd).t_zone = dnd.SLOT_ON
+    (*dd).t_row = NONE
+    if (v as u64) != 0 {
+        list_slot(v, y, (*dd).t_tree[found], &(*dd).t_gap, &(*dd).t_zone, &(*dd).t_row)
+        let rc: *mut render.Ctx = app.app_ctx(a)
+        let lo: f64 = vlist.vl_body_y(v)
+        (*dd).edge = dnd.edge_scroll(y as i64, lo as i64, (lo + vlist.vl_body_h(v)) as i64,
+            kit.ln(rc, 24) as i64, kit.ln(rc, 12) as i64)
+    }
+}
+
+fn dd_clear_run(dd: *mut Dd) {
+    (*dd).src = NONE
+    (*dd).s_row = NONE
+    (*dd).tgt = NONE
+    (*dd).edge = 0
+    (*dd).kb_node = NONE
+}
+
+fn dd_cancel(dd: *mut Dd) {
+    dnd.cancel(&(*dd).d)
+    dd_clear_run(dd)
+}
+
+// Is a drag running or pressed (the window wants the timer / the pointer)?
+fn dd_busy(dd: *mut Dd) -> bool {
+    return dnd.is_active(&(*dd).d)
+}
+
+// The drag ends: keep the result, tell the app.
+fn dd_finish(a: *mut app.App, dd: *mut Dd, eff: u32) {
+    let had: usize = (*dd).tgt
+    (*dd).r_eff = eff
+    (*dd).r_src = NONE
+    if (*dd).src != NONE {
+        (*dd).r_src = (*dd).s_node[(*dd).src]
+    }
+    (*dd).r_row = (*dd).s_row
+    (*dd).r_tgt = NONE
+    if had != NONE {
+        (*dd).r_tgt = (*dd).t_node[had]
+    }
+    (*dd).r_gap = (*dd).t_gap
+    (*dd).r_zone = (*dd).t_zone
+    (*dd).r_trow = (*dd).t_row
+    dd_clear_run(dd)
+    if eff != dnd.OP_NONE && (*dd).r_tgt != NONE {
+        (*dd).drops = (*dd).drops + 1
+        let f: fn(*mut app.App, usize) = (*dd).on_drop
+        f(a, (*dd).r_tgt)
+    }
+}
+
+// The pointer (fuiwirt.HOOK_*). true = the event is part of a drag (the caller repaints).
+fn dd_pointer(a: *mut app.App, dd: *mut Dd, kind: u32, x: f64, y: f64) -> bool {
+    if kind == fuiwirt.HOOK_WHEEL {
+        return false
+    }
+    let d: *mut dnd.Drag = &(*dd).d
+    (*dd).px = x
+    (*dd).py = y
+    if kind == fuiwirt.HOOK_DOWN {
+        if !dnd.is_idle(d) {
+            return false
+        }
+        var row: usize = NONE
+        let s: usize = dd_find_source(a, dd, x, y, &row)
+        if s == NONE {
+            return false
+        }
+        let touch: bool = fuiwirt.host_pointer_type(app.app_host(a)) == event.PT_TOUCH
+        var payload: u64 = (*dd).s_node[s] as u64
+        if row != NONE {
+            payload = row as u64
+        }
+        dnd.press(d, x as i64, y as i64, (*dd).s_kind[s], payload, (*dd).s_ops[s], touch)
+        (*dd).src = s
+        (*dd).s_row = row
+        (*dd).tgt = NONE
+        return false
+    }
+    if kind == fuiwirt.HOOK_MOVE {
+        if dnd.is_idle(d) || dnd.is_keyboard(d) {
+            return false
+        }
+        let started: bool = dnd.motion(d, x as i64, y as i64, dd_mods(a))
+        if started {
+            dd_set_ghost(dd, tr_item())
+            let f: fn(*mut app.App, usize) = (*dd).on_start
+            f(a, (*dd).s_node[(*dd).src])
+        }
+        if dnd.is_active(d) {
+            dd_probe(a, dd, x, y)
+            return true
+        }
+        return false
+    }
+    if kind == fuiwirt.HOOK_UP {
+        if dnd.is_pending(d) {
+            dnd.cancel(d)
+            dd_clear_run(dd)
+            return false
+        }
+        if dnd.is_active(d) && !dnd.is_keyboard(d) {
+            dnd.motion(d, x as i64, y as i64, dd_mods(a))
+            dd_probe(a, dd, x, y)
+            let eff: u32 = dnd.release(d)
+            dd_finish(a, dd, eff)
+            return true
+        }
+        return false
+    }
+    if kind == fuiwirt.HOOK_LEAVE {
+        if dnd.is_active(d) && !dnd.is_keyboard(d) {
+            dnd.leave(d)
+            (*dd).tgt = NONE
+            return true
+        }
+    }
+    return false
+}
+
+// The edge scroll of a list target while the pointer rests near its border; true = scrolled (repaint).
+fn dd_tick(a: *mut app.App, dd: *mut Dd) -> bool {
+    if !dnd.is_active(&(*dd).d) || (*dd).tgt == NONE || (*dd).edge == 0 || dnd.is_keyboard(&(*dd).d) {
+        return false
+    }
+    let v: *mut vlist.Vlist = app.vlist_model(a, (*dd).t_node[(*dd).tgt])
+    if (v as u64) == 0 {
+        return false
+    }
+    let before: f64 = vlist.vl_scroll_y(v)
+    viewport.viewport_scroll_by(vlist.vl_viewport(v), 0.0, (*dd).edge as f64)
+    dd_probe(a, dd, (*dd).px, (*dd).py)
+    return vlist.vl_scroll_y(v) != before
+}
+
+// ------------------------------------------------------------ keyboard
+
+// How many drop positions all targets have together (a list: n + 1 gaps; a node: 1).
+fn dd_total_gaps(a: *mut app.App, dd: *mut Dd) -> i64 {
+    var t: i64 = 0
+    var i: usize = 0
+    while i < (*dd).nt {
+        let v: *mut vlist.Vlist = app.vlist_model(a, (*dd).t_node[i])
+        if (v as u64) != 0 {
+            t = t + vlist.vl_count(v) as i64 + 1
+        } else {
+            t = t + 1
+        }
+        i = i + 1
+    }
+    return t
+}
+
+// Put the keyboard drop position `idx` (0 .. total) on the target / gap it names, and announce it.
+fn dd_kbd_place(a: *mut app.App, dd: *mut Dd, idx: i64) {
+    var rest: i64 = idx
+    var i: usize = 0
+    var done: bool = false
+    while i < (*dd).nt && !done {
+        let v: *mut vlist.Vlist = app.vlist_model(a, (*dd).t_node[i])
+        var span: i64 = 1
+        if (v as u64) != 0 {
+            span = vlist.vl_count(v) as i64 + 1
+        }
+        if rest < span {
+            (*dd).tgt = i
+            dnd.over(&(*dd).d, (i + 1) as u64, (*dd).t_kinds[i], (*dd).t_ops[i])
+            if (v as u64) != 0 {
+                (*dd).t_gap = rest
+                (*dd).t_zone = dnd.SLOT_BEFORE
+                (*dd).t_row = NONE
+                let n: i64 = vlist.vl_count(v) as i64
+                if n > 0 {
+                    var ri: i64 = rest
+                    if ri >= n {
+                        ri = n - 1
+                        (*dd).t_zone = dnd.SLOT_AFTER
+                    }
+                    (*dd).t_row = ri as usize
+                    vlist.vl_reveal(v, ri as usize)
+                }
+                dd_announce(a, dd, rest + 1, span)
+            } else {
+                (*dd).t_gap = 0
+                (*dd).t_zone = dnd.SLOT_ON
+                (*dd).t_row = NONE
+                dd_announce(a, dd, 1, 1)
+            }
+            done = true
+        }
+        rest = rest - span
+        i = i + 1
+    }
+}
+
+// "Drop at position 4 of 9" as the description of the grabbed node.
+fn dd_announce(a: *mut app.App, dd: *mut Dd, pos: i64, total: i64) {
+    if (*dd).kb_desc == 0 || (*dd).kb_node == NONE {
+        return
+    }
+    var n: usize = 0
+    // text: <drop_at> <pos> <of> <total>
+    n = dd_cat((*dd).kb_desc, n, tr_drop_at())
+    n = dd_cat((*dd).kb_desc, n, " ")
+    n = n + put_dec((*dd).kb_desc + n as u64, pos as usize)
+    n = dd_cat((*dd).kb_desc, n, " ")
+    n = dd_cat((*dd).kb_desc, n, tr_of())
+    n = dd_cat((*dd).kb_desc, n, " ")
+    n = n + put_dec((*dd).kb_desc + n as u64, total as usize)
+    a11y.a11y_set_description(app.ax(a), (*dd).kb_node, (*dd).kb_desc, n)
+}
+
+fn dd_cat(buf: u64, at: usize, s: str) -> usize {
+    var n: usize = at
+    var i: usize = 0
+    while i < s.n && n < 95 {
+        *((buf + n as u64) as *mut u8) = *((s.p as u64 + i as u64) as *mut u8)
+        n = n + 1
+        i = i + 1
+    }
+    return n
+}
+
+// Ctrl+Space on the focused node `focus`: grab it when it is a source. true = grabbed.
+fn dd_char(a: *mut app.App, dd: *mut Dd, focus: usize, cp: u32, mods: u32) -> bool {
+    let d: *mut dnd.Drag = &(*dd).d
+    if cp != 32 as u32 || (mods & editor.MOD_CTRL) == 0 as u32 || !dnd.is_idle(d) || focus == NONE {
+        return false
+    }
+    var s: usize = NONE
+    var i: usize = 0
+    while i < (*dd).ns && s == NONE {
+        if (*dd).s_node[i] == focus {
+            s = i
+        }
+        i = i + 1
+    }
+    if s == NONE {
+        return false
+    }
+    var payload: u64 = focus as u64
+    var row: usize = NONE
+    let v: *mut vlist.Vlist = app.vlist_model(a, focus)
+    if (v as u64) != 0 {
+        row = vlist.vl_cur(v)
+        if row == vlist.NONE || row == NONE || row >= vlist.vl_count(v) {
+            return false
+        }
+        payload = row as u64
+    }
+    dnd.grab(d, (*dd).s_kind[s], payload, (*dd).s_ops[s])
+    (*dd).src = s
+    (*dd).s_row = row
+    (*dd).tgt = NONE
+    (*dd).kb_node = focus
+    dd_set_ghost(dd, tr_item())
+    let f: fn(*mut app.App, usize) = (*dd).on_start
+    f(a, focus)
+    return true
+}
+
+// A key while a drag runs: Up / Down walk the drop positions, Enter drops, Esc cancels. 0 = not ours, 1 = used,
+// 2 = used and the drop ran.
+fn dd_key(a: *mut app.App, dd: *mut Dd, key: u32, mods: u32) -> u32 {
+    let d: *mut dnd.Drag = &(*dd).d
+    if !dnd.is_keyboard(d) {
+        if dnd.is_active(d) && key == editor.KEY_ESC {
+            dd_cancel(dd)
+            return 1
+        }
+        return 0
+    }
+    if key == editor.KEY_ESC {
+        let node: usize = (*dd).kb_node
+        dd_cancel(dd)
+        if node != NONE {
+            a11y.a11y_set_description(app.ax(a), node, 0, 0)
+        }
+        return 1
+    }
+    if key == editor.KEY_UP || key == editor.KEY_DOWN {
+        let total: i64 = dd_total_gaps(a, dd)
+        var delta: i64 = 1
+        if key == editor.KEY_UP {
+            delta = 0 - 1
+        }
+        let idx: i64 = dnd.kbd_move(d, delta, total)
+        if idx >= 0 {
+            dd_kbd_place(a, dd, idx)
+        }
+        return 1
+    }
+    if key == editor.KEY_ENTER {
+        let node2: usize = (*dd).kb_node
+        let eff: u32 = dnd.kbd_drop(d)
+        dd_finish(a, dd, eff)
+        if node2 != NONE {
+            a11y.a11y_set_description(app.ax(a), node2, 0, 0)
+        }
+        return 2
+    }
+    // every other key is swallowed while a grabbed item is being placed (Tab would lose it)
+    if key == editor.KEY_TAB {
+        return 0
+    }
+    return 1
+}
+
+// ------------------------------------------------------------ painting
+
+fn outline(z: *mut painter.Painter, x: f64, y: f64, w: f64, h: f64, t: f64, col: u32) {
+    painter.surface(z, x, y, w, t, col)
+    painter.surface(z, x, y + h - t, w, t, col)
+    painter.surface(z, x, y, t, h, col)
+    painter.surface(z, x + w - t, y, t, h, col)
+}
+
+// The drop marker of the target and the ghost at the pointer.
+fn dd_draw(a: *mut app.App, rc: *mut render.Ctx, dd: *mut Dd, win_w: f64, win_h: f64) {
+    let d: *mut dnd.Drag = &(*dd).d
+    if !dnd.is_active(d) {
+        return
+    }
+    let z: *mut painter.Painter = render.ctx_painter(rc)
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let eff: u32 = dnd.effect(d)
+    let ok: bool = eff != dnd.OP_NONE
+    var col: u32 = kit.tokc(rc, style.TOK_ACCENT)
+    if !ok {
+        col = kit.tokc(rc, style.TOK_ERROR)
+    }
+    let t: usize = (*dd).tgt
+    if t != NONE {
+        let node: usize = (*dd).t_node[t]
+        let nx: f64 = scene.node_x(sc, node)
+        let ny: f64 = scene.node_y(sc, node)
+        let nw: f64 = scene.node_w(sc, node)
+        let nh: f64 = scene.node_h(sc, node)
+        let v: *mut vlist.Vlist = app.vlist_model(a, node)
+        let th: f64 = kit.ln(rc, 2)
+        if (v as u64) != 0 {
+            let body_y: f64 = vlist.vl_body_y(v)
+            let body_h: f64 = vlist.vl_body_h(v)
+            if ok && (*dd).t_zone == dnd.SLOT_ON && (*dd).t_row != NONE {
+                let ry: f64 = body_y - vlist.vl_scroll_y(v) + vlist.vl_row_top(v, (*dd).t_row)
+                if ry >= body_y - 1.0 && ry < body_y + body_h {
+                    outline(z, nx + th, ry, nw - 2.0 * th, vlist.vl_height_of(v, (*dd).t_row), th, col)
+                }
+            } else if ok {
+                var ly: f64 = body_y - vlist.vl_scroll_y(v) + vlist.vl_row_top(v, (*dd).t_gap as usize)
+                if ly >= body_y && ly <= body_y + body_h {
+                    painter.surface(z, nx + kit.ln(rc, 4), ly - th / 2.0, nw - kit.ln(rc, 8), th, col)
+                    let dot: f64 = kit.ln(rc, 6)
+                    painter.round_rect(z, nx + kit.ln(rc, 2), ly - dot / 2.0, dot, dot, dot / 2.0, col)
+                }
+            } else {
+                outline(z, nx, ny, nw, nh, th, col)
+            }
+        } else {
+            outline(z, nx, ny, nw, nh, th, col)
+        }
+    }
+    // the ghost: a small card with the text, a "+" in front for a copy, near the pointer
+    let fo: *mut theme.Shape = theme.theme_shape(render.ctx_theme(rc))
+    let size: f64 = render.len_of(rc, (*fo).font)
+    var label: str = str { p: (&(*dd).ghost[0]) as *mut u8, n: (*dd).ghost_n }
+    let tw: f64 = kit.text_width(rc, size, 400, label)
+    let padx: f64 = kit.ln(rc, 8)
+    let gh: f64 = kit.ln(rc, 26)
+    var gw: f64 = tw + 2.0 * padx
+    var gx: f64 = (*dd).px + kit.ln(rc, 14)
+    var gy: f64 = (*dd).py + kit.ln(rc, 10)
+    if dnd.is_keyboard(d) {
+        gx = 0.0 - 1000.0
+    }
+    if gx + gw > win_w {
+        gx = win_w - gw
+    }
+    if gy + gh > win_h {
+        gy = win_h - gh
+    }
+    if gx > 0.0 - 500.0 {
+        painter.round_rect(z, gx, gy, gw, gh, kit.ln(rc, 6), kit.tokc(rc, style.TOK_SURFACE))
+        outline(z, gx, gy, gw, gh, kit.ln(rc, 1), col)
+        let u: f64 = kit.draw_label(rc, gx + padx, gy, gh, size, 400, kit.tokc(rc, style.TOK_TEXT), label, tw + 2.0)
+    }
+}
+
+fn dd_on_start(dd: *mut Dd, f: fn(*mut app.App, usize)) { (*dd).on_start = f }
+fn dd_on_drop(dd: *mut Dd, f: fn(*mut app.App, usize)) { (*dd).on_drop = f }
+fn dd_active(dd: *mut Dd) -> bool { return dnd.is_active(&(*dd).d) }
+fn dd_keyboard(dd: *mut Dd) -> bool { return dnd.is_keyboard(&(*dd).d) }
+// the edge scroll of a list target is running (the window wants its 16 ms timer)
+fn dd_edge_active(dd: *mut Dd) -> bool {
+    return dnd.is_active(&(*dd).d) && (*dd).tgt != NONE && (*dd).edge != 0 && !dnd.is_keyboard(&(*dd).d)
+}
+// the last finished drag: effect (dnd.OP_*), source node + row (NONE for a plain node), target node, drop gap
+// 0..n, zone (dnd.SLOT_*) and the row the pointer was on (list targets)
+fn dd_r_effect(dd: *mut Dd) -> u32 { return (*dd).r_eff }
+fn dd_r_source(dd: *mut Dd) -> usize { return (*dd).r_src }
+fn dd_r_row(dd: *mut Dd) -> usize { return (*dd).r_row }
+fn dd_r_target(dd: *mut Dd) -> usize { return (*dd).r_tgt }
+fn dd_r_gap(dd: *mut Dd) -> i64 { return (*dd).r_gap }
+fn dd_r_zone(dd: *mut Dd) -> u32 { return (*dd).r_zone }
+fn dd_r_trow(dd: *mut Dd) -> usize { return (*dd).r_trow }
+fn dd_drops(dd: *mut Dd) -> usize { return (*dd).drops }
