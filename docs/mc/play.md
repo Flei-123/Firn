@@ -32,7 +32,7 @@ NOT done (roadmap): the demo itself (demos/mcplay), packet senders/receivers glu
   cursor = face middle; local prediction only with `MCPLAY_PLACE_ID`, otherwise the server's Block Update shows the block), F fly, N noclip.
 * Server -> client: Block Update / Multi Block Change (`mc_play.decode_block_change`, `multi_begin/next`) -> `mc_blockset.world_set_block`
   + `wr_mark_block`; chunk load/unload mark/drop the mesh cache.
-* `lib/mc/mc_play.fi` (window free, test `tests/2890_mc_play.fi`): key map, hotbar keys, face numbers, decoders, schema driven senders.
+* `lib/mc/mc_play.fi` (window free, test `tests/4390_mc_play.fi`): key map, hotbar keys, face numbers, decoders, schema driven senders.
 * `glwindow.Opts.full_input` added (calls `window.full_input` before `make`), both Linux and Windows twin.
 * `tools/mc/play/run.sh`: Xvfb + official 1.20.1 server (creative, offline) + mcplay + xdotool, checks frames/chunks/ticks, server saw the join,
   no "moved wrongly", screenshot PNG + hash. Needs java + network (server jar); run via heavy.

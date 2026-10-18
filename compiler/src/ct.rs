@@ -264,7 +264,8 @@ mod tests {
     #[test]
     fn select_becomes_cmov_and_never_in_jump() {
         let asm = asm_of(
-            "fn choose(b: bool, a: i32, c: i32) -> i32 { return select(b, a, c) }\n\
+            "#[no_inline]\n\
+             fn choose(b: bool, a: i32, c: i32) -> i32 { return select(b, a, c) }\n\
              fn main() -> i32 { return choose(true, 1 as i32, 2 as i32) }\n",
         );
         assert!(asm.contains("cmov"), "no cmov:\n{}", asm);
@@ -315,7 +316,8 @@ mod tests {
     #[test]
     fn own_func_shadowed_the_primitive() {
         let asm = asm_of(
-            "fn barrier(x: i32) -> i32 { return x + 1 as i32 }\n\
+            "#[no_inline]\n\
+             fn barrier(x: i32) -> i32 { return x + 1 as i32 }\n\
              fn main() -> i32 { return barrier(1 as i32) }\n",
         );
         assert!(asm.contains("barrier:"), "own function missing:\n{}", asm);

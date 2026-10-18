@@ -114,6 +114,9 @@ S = [
 ("G_GET_STR_EXTRA","(Ljava/lang/String;)Ljava/lang/String;"),
 ("N_REMOVE_EXTRA","removeExtra"),
 ("G_REMOVE_EXTRA","(Ljava/lang/String;)V"),
+("N_GET_SERVICE","getService"),
+("N_SET_DELETE","setDeleteIntent"),
+("S_EXTRA_GONE","org.firn.extra.GONE"),
 ]
 # German UI texts: the generated comment is English (no-german guard); the text itself stays.
 EN = {
