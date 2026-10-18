@@ -39,8 +39,15 @@ SERIAL = DEFAULT_SERIAL
 
 
 def adb(*args, timeout=60, check=False):
-    p = subprocess.run([ADB, "-s", SERIAL, *args], capture_output=True, text=True, timeout=timeout,
-                       encoding="utf-8", errors="replace")
+    for attempt in (1, 2):
+        try:
+            p = subprocess.run([ADB, "-s", SERIAL, *args], capture_output=True, text=True, timeout=timeout,
+                               encoding="utf-8", errors="replace")
+            break
+        except subprocess.TimeoutExpired:
+            print("WARN adb timeout (%ds, attempt %d): %s" % (timeout, attempt, " ".join(args)[:80]), flush=True)
+            if attempt == 2:
+                return ""
     if check and p.returncode != 0:
         raise RuntimeError("adb %s failed: %s" % (" ".join(args), p.stderr.strip()))
     return p.stdout.replace("\r", "")
@@ -102,7 +109,7 @@ def start(app, extra="", wait=True):
     a = APPS[app]
     sh("am force-stop " + a["pkg"])
     time.sleep(1)
-    adb("logcat", "-c")
+    adb("logcat", "-c", timeout=20)
     out = sh("am start %s -n %s %s" % ("-W" if wait else "", a["act"], extra))
     return out
 
