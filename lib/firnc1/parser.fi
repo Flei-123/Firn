@@ -4822,6 +4822,35 @@ fn comp_clauses(p: *mut Parser) -> u32 {
     return bi
 }
 
+// Registers the names bound by the top-level `for PAT in` clauses of the bracket group
+// that follows the current position as locals (the element expression comes first in the source).
+fn comp_loop_vars(p: *mut Parser) {
+    var depth: i64 = 1 // the opening bracket is already consumed
+    var k: usize = 0
+    while true {
+        let a: u32 = kind(p, k)
+        if a == A_LPAREN || a == A_LBRACKET || a == A_LBRACE {
+            depth = depth + 1
+        } else if a == A_RPAREN || a == A_RBRACKET || a == A_RBRACE {
+            depth = depth - 1
+            if depth <= 0 {
+                return
+            }
+        } else if a == A_EOF {
+            return
+        } else if depth == 1 && a == A_KWFOR {
+            var j: usize = k + 1
+            while kind(p, j) != A_KWIN && kind(p, j) != A_EOF && kind(p, j) != A_RBRACKET && kind(p, j) != A_RBRACE {
+                if kind(p, j) == A_IDENT {
+                    loc_add(p, tok_nr(p, j))
+                }
+                j = j + 1
+            }
+        }
+        k = k + 1
+    }
+}
+
 // Entry (twin of `Parser::coll_init`): the current token stands right behind `=` / `return`;
 // `t` is the declared type node. true: handled, `*out` is the `let` / `return` statement and the
 // extra statements are queued in `after` / `qpre`. false: nothing consumed.
@@ -4839,9 +4868,10 @@ fn coll_init(p: *mut Parser, t: u32, dest_let: bool, lname: u32, spos: u64, out:
         return false
     }
     let is_dict: bool = ck == 2
+    let is_set: bool = ck == 3
     var open: u32 = A_LBRACKET
     var close: u32 = A_RBRACKET
-    if is_dict {
+    if is_dict || is_set {
         open = A_LBRACE
         close = A_RBRACE
     }
@@ -4874,11 +4904,19 @@ fn coll_init(p: *mut Parser, t: u32, dest_let: bool, lname: u32, spos: u64, out:
     if is_dict && !colon && !has_for && kind(p, 1) != A_RBRACE {
         return false
     }
+    // `{ k: v }` is no set literal
+    if is_set && colon {
+        return false
+    }
     var wnew: u32 = 0
     var wadd: u32 = 1
     if is_dict {
         wnew = 2
         wadd = 3
+    }
+    if is_set {
+        wnew = 4
+        wadd = 5
     }
     let new_fn: u32 = mono.coll_fn(gn(p), tname, wnew)
     let add_fn: u32 = mono.coll_fn(gn(p), tname, wadd)
@@ -4911,12 +4949,21 @@ fn coll_init(p: *mut Parser, t: u32, dest_let: bool, lname: u32, spos: u64, out:
     var body: Vec[u32] = vec_new[u32]()
     if !actual(p, close) {
         let h0: usize = vec_len[u32](&(*p).hoist)
+        // The element is parsed BEFORE its loops: the loop variables must already
+        // count as locals, or they get renamed like a global of the same name.
+        if has_for {
+            loc_on(p)
+            comp_loop_vars(p)
+        }
         let first: u32 = expr(p)
         var second: u32 = ast.NOTHING
         if is_dict {
             if expect(p, A_COLON) {
                 second = expr(p)
             }
+        }
+        if has_for {
+            loc_off(p)
         }
         if (*p).err > 0 {
             // fall through to the closing code
@@ -5083,7 +5130,110 @@ fn question_op(p: *mut Parser, e: u32) -> u32 {
     return opt_field(p, tmp, false, qpos)
 }
 
+// r749 -- `with NAME = expr { body }` (twin of `Parser::at_with_stmt`): the word `with`
+// followed by `NAME =`. `with` stays a usable identifier.
+fn at_with(p: *mut Parser) -> bool {
+    if kind(p, 0) != A_IDENT || kind(p, 1) != A_IDENT || kind(p, 2) != A_ASSIGN {
+        return false
+    }
+    var ww: [u8; 4] = "with"
+    let wnr: u32 = intern.intern_number(lexer.lex_names(lx(p)), (&ww[0]) as u64, 4) as u32
+    return tok_nr(p, 0) == wnr
+}
+
+// r749 -- `with NAME = expr { body }` is the block `{ let NAME = expr; defer NAME.close(); body }`;
+// `with a = x, b = y { .. }` nests in source order, so the bindings close in reverse.
+// Twin of `Parser::with_stmt`.
+fn with_stmt(p: *mut Parser) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
+    next_bump(p) // 'with'
+    var names: Vec[u32] = vec_new[u32]()
+    var inits: Vec[u32] = vec_new[u32]()
+    var poss: Vec[u64] = vec_new[u64]()
+    loc_on(p)
+    while true {
+        if !actual(p, A_IDENT) {
+            complain(p)
+            break
+        }
+        let name: u32 = tok_nr(p, 0)
+        let npos: u64 = at_pos(p, 0)
+        next_bump(p)
+        rp_shadow(p, name)
+        if !expect(p, A_ASSIGN) {
+            break
+        }
+        let init: u32 = cond_expr(p)
+        // visible only from now on
+        loc_add(p, name)
+        vec_push[u32](&names, name)
+        vec_push[u32](&inits, init)
+        vec_push[u64](&poss, npos)
+        if (*p).err > 0 || !eat(p, A_COMMA) {
+            break
+        }
+    }
+    if (*p).err > 0 || vec_len[u32](&names) == 0 {
+        loc_off(p)
+        vec_free[u32](&names)
+        vec_free[u32](&inits)
+        vec_free[u64](&poss)
+        return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let body: u32 = block(p)
+    loc_off(p)
+    var wc: [u8; 5] = "close"
+    let cnr: u32 = intern.intern_number(lexer.lex_names(lx(p)), (&wc[0]) as u64, 5) as u32
+    let cname: u32 = method_call_name(p, cnr)
+    var own: Vec[u32] = vec_new[u32]()
+    var i: usize = 0
+    while i < vec_len[u32](&names) {
+        let name: u32 = vec_at[u32](&names, i)
+        let npos: u64 = vec_at[u64](&poss, i)
+        let ls: u32 = ast.stmt_new(b, ast.S_LET, name, ast.NOTHING, vec_at[u32](&inits, i), 0)
+        ast.stmt_pos_set(b, ls, npos)
+        vec_push[u32](&own, ls)
+        let id: u32 = ast.expr_new(b, ast.E_ID, name, 0, 0, 0)
+        pos_default(p, id, npos)
+        var cargs: Vec[u32] = vec_new[u32]()
+        vec_push[u32](&cargs, id)
+        let coff: u32 = list_store(p, &cargs)
+        vec_free[u32](&cargs)
+        let call: u32 = ast.expr_new(b, ast.E_CALL, cname, coff, 1, 0)
+        pos_default(p, call, npos)
+        let es: u32 = ast.stmt_new(b, ast.S_EXPR, call, 0, 0, 0)
+        ast.stmt_pos_set(b, es, npos)
+        let ds: u32 = ast.stmt_new(b, ast.S_DEFER, es, 0, 0, 0)
+        ast.stmt_pos_set(b, ds, npos)
+        vec_push[u32](&own, ds)
+        i = i + 1
+    }
+    let boff: u32 = ast.b_off(b, body)
+    let blen: u32 = ast.b_len(b, body)
+    var j: u32 = 0
+    while j < blen {
+        vec_push[u32](&own, vec_at[u32](&(*b).slist, (boff + j) as usize))
+        j = j + 1
+    }
+    let off: u32 = vec_len[u32](&(*b).slist) as u32
+    var k: usize = 0
+    while k < vec_len[u32](&own) {
+        vec_push[u32](&(*b).slist, vec_at[u32](&own, k))
+        k = k + 1
+    }
+    let nb: u32 = ast.block_new(b, off, vec_len[u32](&own) as u32)
+    ast.block_end_set(b, nb, ast.block_end(b, body))
+    vec_free[u32](&own)
+    vec_free[u32](&names)
+    vec_free[u32](&inits)
+    vec_free[u64](&poss)
+    return ast.stmt_new(b, ast.S_BLOCK, nb, 0, 0, 0)
+}
+
 fn stmt_inner(p: *mut Parser) -> u32 {
+    if at_with(p) {
+        return with_stmt(p)
+    }
     let a: u32 = kind(p, 0)
     if a == A_KWLET || a == A_KWVAR {
         return let_stmt(p)

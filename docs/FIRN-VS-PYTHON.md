@@ -184,9 +184,9 @@ Evidence: `examples/vs_python/lang/` (79 probe files `.probe`, output in `PROBES
 | Stdlib found automatically | yes | needs `FIRNLIB` (fix running: G01) | gap |
 | Type inference | yes | `let/var` inferred, generics only with `f[T](..)`, no return-type inference | partial |
 | Short syntax | defaults, kwargs, slices, `in` | none of default args, named args, slices, `in`, negative index | gap |
-| Comprehensions / iterators | yes | `[e for x in v if c]` -> `Vec[T]`, `{k: v for ..}` -> `Dict[V]`, list/dict literals (section 9, wf-py), `for x in vec`, enumerate/zip; no generators; `std.vecfn` map/filter/sum as lib | partial |
+| Comprehensions / iterators | yes | `[e for x in v if c]` -> `Vec[T]`, `{k: v for ..}` -> `Dict[V]`, `{e for ..}` -> `Set[K]`, list/dict/set literals (section 9, wf-py), `for x in vec`, enumerate/zip; no generators; `std.vecfn` map/filter/sum as lib | partial |
 | f-strings | `f"{x:>8.2f}"` | `f"{a + b}"` expressions work, but result is `Fmt` not `str`, no spec | partial |
-| `with` / RAII | `with open()` | `defer` | works |
+| `with` / RAII | `with open()` | `with f = open(p) { .. }` = `let f = ..; defer f.close()` (r749, section 9) | works |
 | dataclass | `@dataclass` (eq, repr, order) | plain `struct`; no `derive`, no `==`, no print | gap |
 | Tuples / unpacking | yes | `let (q, r) = f()` | works |
 | Enums + match | 3.10 `match` | `enum` with payload + `match` | works |
@@ -213,18 +213,24 @@ Roadmap items: see ROADMAP in the JARVIS project (group "Python-Niveau"), one it
 
 ## 9. Collection literals and comprehensions (wf-py, 2026-10-18)
 
-Pure parser desugar on `Vec` / `Dict` (`std.vec`, `std.dict`), firnc0 (`compiler/src/collsugar.rs`) and firnc1 (`coll_init` in `lib/firnc1/parser.fi`). The element type is NOT inferred: the sugar needs a DECLARED target, namely the initializer of `let/var x: T = ...` or the value of `return ...` in a function declared `-> T`, with `T` = `Vec[E]` or `Dict[V]`. Anywhere else the old rules hold (`[a, b]` stays an array literal, `{` a block); an untyped `[e for x in v]` is the error "a comprehension needs a declared collection type".
+Pure parser desugar on `Vec` / `Dict` / `Set` (`std.vec`, `std.dict`, `std.map`), firnc0 (`compiler/src/collsugar.rs`) and firnc1 (`coll_init` in `lib/firnc1/parser.fi`). The element type is NOT inferred: the sugar needs a DECLARED target, namely the initializer of `let/var x: T = ...` or the value of `return ...` in a function declared `-> T`, with `T` = `Vec[E]`, `Dict[V]` or `Set[K]`. Anywhere else the old rules hold (`[a, b]` stays an array literal, `{` a block); an untyped `[e for x in v]` is the error "a comprehension needs a declared collection type".
 
 ```firn
 let sq: Vec[i64] = [x * x for x in xs if x > 0]       // var sq = vec_new[i64](); for x in xs { if x > 0 { vec_push[i64](&sq, x * x) } }
 let l: Vec[i64] = [1, 2, 3]                            // list literal (trailing comma ok), [] is empty
 let d: Dict[i64] = {"a": 1, "b": 2}                    // dict_new[i64]() + dict_set[i64](&d, k, v) per entry
 let m: Dict[i64] = {s: (i as i64) for (i, s) in enumerate(names) if i != 1}
+let u: Set[i64] = {x % 3 for x in xs}                  // set comprehension: set_new[i64]() + set_put[i64](&u, e); {1, 2} and {} are set literals
 fn evens(n: i64) -> Vec[i64] { return [i for i in 0..n if i % 2 == 0] }   // hidden `var __lc#L_C`
 ```
 - Clauses nest in source order: `[e for i in a for j in b if c1 if c2]`. Sources follow `for x in v`: a place (name, field path, `*p`) or a range `a..b` / `a..=b`; tuple patterns `for (i, x) in enumerate(v)` work.
 - The target is declared mutable (`let x: Vec[T] = [..]` becomes a `var`); `import std.vec` / `import std.dict` is required (else the old error).
 - f-strings in the element are hoisted into the loop body; `?` is not allowed inside (error).
-- Not done: untyped comprehensions (needs inference), generators, set comprehensions, a literal as call argument / struct field / assignment (no declared type there). Dict keys are `str`. firnc1: a loop variable that shadows a global of the same name is read as the global in the element expression (the element is parsed before the loop).
-- `with`-sugar (defer desugar) and `firn add/fetch/deps` polish: not built; `with` = `defer`, the package manager works (section 7).
-- Tests: 4340 (Vec), 4341 (Dict), neg 4342.
+- Not done: untyped comprehensions (`let x = [e for ..]`, a comprehension as call argument: needs type inference, which does not exist: generic calls always need `f[T](..)` and a lambda body does not give `U`; the error "a comprehension needs a declared collection type" stays), generators, a literal as call argument / struct field / assignment (no declared type there). Dict keys are `str`; `Set[K]` needs a `Scalar` K and `import std.map` (`set_put` ignores whether the element was new).
+- firnc1 (fixed r748): a loop variable that shadows a global of the same name (non-root module) is a local in the element expression: the loop variables of the `for` clauses are registered before the element is parsed (test 4345).
+
+### `with` (r749)
+
+`with NAME = expr { body }` is the parser desugar `{ let NAME = expr; defer NAME.close(); body }` (firnc0 `with_stmt` in `parser.rs`, firnc1 `with_stmt` in `lib/firnc1/parser.fi`). `with` is no keyword: the statement starts only with `with IDENT =`, so `with` stays a usable identifier. Several bindings `with a = x, b = y { .. }` close in reverse order (b, then a). The value needs a method `close(*mut self)`; else the usual "has no method 'close'" error. The init is a condition-style expression: a struct literal needs parentheses or a function. `return`, `break`, `continue` and `?` in the body close as with `defer`. Tests: 4343, neg 4344.
+
+- Tests: 4340 (Vec), 4341 (Dict), 4346 (Set), 4345 (shadowing), neg 4342.
