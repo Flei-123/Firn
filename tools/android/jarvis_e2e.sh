@@ -11,9 +11,10 @@
 # Own AVD copy "a7e" (console port 5594, own adb server on port 5043; image google_apis when installed, because that one has a speech
 # engine for section 9, else the plain "default" image and section 9 only notes it): other checks that use the shared adb server never see it.
 # Checks: login, message + streamed reply, Board (projects, a need answered), Tasks (add), conversation list (Chats), photo upload
-# (system picker -> POST /api/m/upload -> text carries the server path), file receive (JE_FILE -> download -> Downloads/Jarvis),
+# (system picker -> POST /api/m/upload -> text carries the server path), file upload ("+" -> File -> system document picker -> the
+# fake server's upload_body line carries the sha256 of the exact octets), file receive (JE_FILE -> download -> Downloads/Jarvis),
 # push over the HTTPS long poll while the app is in the background (POST /fake/push -> a REAL notification, tap opens the app,
-# the chat), the service text is neutral, the frame time of the app (paint microseconds per frame, <= 16 ms is the 60 Hz budget),
+# the chat; two chats c1/c2 -> two notifications, each tap opens its own chat), the service text is neutral, the frame time of the app (paint microseconds per frame, <= 16 ms is the 60 Hz budget),
 # voice output without a speech engine (status text, no crash), no crash.
 # Nothing is guessed from the app itself: the fake server's log is the proof for what the app SENT, `dumpsys notification` for what
 # the system SHOWS, tesseract (words with positions) for what is on the screen and where to touch it.
@@ -104,7 +105,8 @@ kbd() { $ADB shell dumpsys input_method | grep -c 'mInputShown=true'; }
 wait_kbd_up() { local i; for i in $(seq 12); do [ "$(kbd)" = 1 ] && return 0; sleep 1; done; return 1; }
 hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; fi; sleep 1; }
 # type into the field whose hint is $1, then leave the keyboard
-type_into() { tap_word "$1" 1 1.5 || return 1; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
+# (the grey "Message" hint is sometimes lost by OCR after a long chat: then touch the field by its place, 418/1964 of 1080x2340)
+type_into() { tap_word "$1" 1 1.5 || { [ "$1" = Message ] && { $ADB shell input tap $((418 * SW / 1080)) $((1964 * SH / 2340)); sleep 1.5; } || return 1; }; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
 send_text() { type_into "Message" "$1" && tap_word "Send" 1 1; }
 notes() { $ADB shell dumpsys notification --noredact; }
 # title / text lines of the notifications of the app (not the service one)
@@ -201,6 +203,39 @@ send_text "see"
 check "upload reached the server (POST /api/m/upload)" "$(wait_log '"path": "/api/m/upload' 20 | awk '{print ($1>0)?"yes":"no"}')" yes
 check "the text carries the server path of the photo" "$(wait_log '"text": ".*/srv/uploads/' 15 | awk '{print ($1>0)?"yes":"no"}')" yes
 
+# ---- 4b. file upload through "+" -> File ---------------------------------------------------------------------------------
+echo "== 4b. file picker (any file, sha256 proof)"
+python3 -I -c "
+import hashlib
+data = bytes((i * 7 + (i >> 8)) & 255 for i in range(5000)) # not text, not a photo: 5000 octets
+open('$W/e2e_doc.bin', 'wb').write(data)
+open('$W/e2e_doc.sha', 'w').write(hashlib.sha256(data).hexdigest())"
+$ADB push "$W/e2e_doc.bin" /sdcard/Download/jarvis_e2e_doc.bin >/dev/null
+$ADB shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Download/jarvis_e2e_doc.bin >/dev/null
+SHA_DOC=$(cat "$W/e2e_doc.sha")
+UP0=$(grep -c '"type": "upload_body"' "$SLOG")
+shot _p; p=$(word_at _p 'Message'); [ -n "$p" ] && $ADB shell input tap $((141 * SW / 1080)) ${p#* }; sleep 2
+tap_word "File" 1 4 # "+" shows the two choices (Photo / File)
+FOUND=no
+for _ in 1 2 3 4 5 6; do
+    tap_ui "jarvis_e2e_doc" && { FOUND=yes; break; }
+    sleep 3
+done
+if [ $FOUND = no ]; then # the document picker opens on "Recent" and may not list it: the Downloads root does
+    tap_ui "Show roots" || tap_ui "Open drawer" || true
+    tap_ui "Downloads" || true
+    for _ in 1 2 3 4; do tap_ui "jarvis_e2e_doc" && { FOUND=yes; break; }; sleep 2; done
+fi
+check "the document picker lists the file" "$FOUND" yes
+sleep 8
+check "the app survives the file picker (same process)" "$($ADB shell pidof $PKG)" "$P0"
+check "the file waits in the input line (name + size)" "$(OCR_TRIES=15 wait_ocr 08b_file 'file jarvis_e2e_doc')" 1
+send_text "doc"
+check "file upload reached the server (a new upload_body line)" "$(for _ in $(seq 25); do [ "$(grep -c '"type": "upload_body"' "$SLOG")" -gt "$UP0" ] && echo yes && break; sleep 1; done)" yes
+check "the server got exactly the octets of the file (sha256)" "$(grep '"type": "upload_body"' "$SLOG" | tail -1 | grep -c "\"sha256\": \"$SHA_DOC\"")" 1
+check "the server got the file name and size" "$(grep '"type": "upload_body"' "$SLOG" | tail -1 | grep -c '"name": "jarvis_e2e_doc.bin".*"size": 5000')" 1
+check "the text carries the server path of the file" "$(wait_log '"text": ".*/srv/uploads/.*jarvis_e2e_doc' 15 | awk '{print ($1>0)?"yes":"no"}')" yes
+
 # ---- 5. file receive ---------------------------------------------------------------------------------------------------------
 echo "== 5. file receive"
 send_text file
@@ -212,8 +247,8 @@ echo "== 6. push over the HTTPS long poll, app in the background"
 P1=$($ADB shell pidof $PKG)
 push() { python3 -I -c "
 import json, sys, urllib.request
-r = urllib.request.Request('http://127.0.0.1:$PORT/fake/push', json.dumps({'title': sys.argv[1], 'body': sys.argv[2], 'cid': 'c1'}).encode(), {'Content-Type': 'application/json'})
-print(urllib.request.urlopen(r).read().decode())" "$1" "$2" >/dev/null; }
+r = urllib.request.Request('http://127.0.0.1:$PORT/fake/push', json.dumps({'title': sys.argv[1], 'body': sys.argv[2], 'cid': sys.argv[3]}).encode(), {'Content-Type': 'application/json'})
+print(urllib.request.urlopen(r).read().decode())" "$1" "$2" "${3:-c1}" >/dev/null; }
 sleep 8 # the first poll only learns the last event id
 tap_word "New" 1 2 # an empty chat: the history of the event's chat must show up after the tap
 $ADB shell input keyevent KEYCODE_HOME; sleep 3
@@ -227,14 +262,33 @@ push "Second" "another line"
 for _ in $(seq 20); do note_lines | grep -q 'Second' && break; sleep 1; done
 check "a second event: a second notification" "$(note_lines | grep -c 'Second')" 1
 check "same chat: the second event replaces the first (one keyed notification per chat)" "$(note_lines | grep -c 'Worker done')" 0
-echo "  tap the notification"
-$ADB shell cmd statusbar expand-notifications; sleep 3
-b=$(ui | grep -E 'id/(notification_)?title"' | grep 'text="Second' | grep -oP 'bounds="\K[^"]+' | head -1)
-if [ -n "$b" ]; then xy=$(mid "$b"); $ADB shell input tap $(( ${xy% *} + 200 )) ${xy#* }; sleep 5; else note "notification not found in the shade"; fi
-$ADB shell cmd statusbar collapse
+# a second chat (c2): its own notification next to the one of c1, neither replaces the other
+push "Chat two" "from the second chat" c2
+for _ in $(seq 20); do note_lines | grep -q 'Chat two' && break; sleep 1; done
+check "second chat: its own notification appears" "$(note_lines | grep -c 'Chat two | from the second chat')" 1
+check "second chat: the notification of the first chat is still there" "$(note_lines | grep -c 'Second | another line')" 1
+check "two chats: two notifications of the app (not counting the service one)" "$(note_lines | grep -c 'Second\|Chat two')" 2
+push "Chat two again" "more from c2" c2
+for _ in $(seq 20); do note_lines | grep -q 'Chat two again' && break; sleep 1; done
+check "second chat, second event: replaces its own, leaves the other" "$(note_lines | grep -c 'Chat two again')$(note_lines | grep -c 'Chat two |')$(note_lines | grep -c 'Second')" 101
+# tap a notification of the shade: the app comes to the front with the chat of that notification
+tap_note() { # title prefix
+    $ADB shell cmd statusbar expand-notifications; sleep 3
+    local b; b=$(ui | grep -E 'id/(notification_)?title"' | grep "text=\"$1" | grep -oP 'bounds="\K[^"]+' | head -1)
+    if [ -n "$b" ]; then local xy; xy=$(mid "$b"); $ADB shell input tap $(( ${xy% *} + 200 )) ${xy#* }; sleep 5; else note "notification '$1' not found in the shade"; fi
+    $ADB shell cmd statusbar collapse; }
+echo "  tap the notification of c1"
+tap_note "Second"
 check "tap: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
 shot 09_after_tap
 check "tap: the chat of the event is on screen (its history 'hi / hello')" "$(OCR_TRIES=10 wait_ocr 09_after_tap 'You: hi\|JARVIS: hello')" 1
+echo "  tap the notification of c2"
+$ADB shell input keyevent KEYCODE_HOME; sleep 3
+tap_note "Chat two again"
+check "tap c2: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
+shot 09b_after_tap_c2
+check "tap c2: the second chat is on screen (its history 'second question / second answer')" "$(OCR_TRIES=10 wait_ocr 09b_after_tap_c2 'second question\|second answer')" 1
+check "tap c2: the chat of c1 is not on screen (its history 'JARVIS: hello' is gone)" "$(ocr 09b_after_tap_c2 | grep -c 'JARVIS: hello')" 0
 
 # ---- 7. frame time -----------------------------------------------------------------------------------------------------------
 echo "== 7. frame time"
