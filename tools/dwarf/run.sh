@@ -102,12 +102,12 @@ echo "   $(grep -c DW_TAG_variable "$TMPD/info.txt") variables, $(grep -c DW_TAG
 echo
 echo "== 3. gdb over docs/gdb_example.fi =="
 gdb -batch \
-    -ex "break summe" -ex run -ex bt -ex "info args" -ex "info locals" \
+    -ex "break sum_to" -ex run -ex bt -ex "info args" -ex "info locals" \
     -ex "next" -ex "next" -ex "next" \
-    -ex "print s" -ex "print i" -ex "print n" -ex "ptype summe" \
+    -ex "print s" -ex "print i" -ex "print n" -ex "ptype sum_to" \
     -ex continue "$TMPD/demo" > "$TMPD/g1.txt" 2>&1
 expect "$TMPD/g1.txt" "file docs/gdb_example.fi, line 3." "breakpoint on the Firn function"
-expect "$TMPD/g1.txt" "summe (n=10) at docs/gdb_example.fi:3" "frame with the parameter value"
+expect "$TMPD/g1.txt" "sum_to (n=10) at docs/gdb_example.fi:3" "frame with the parameter value"
 expect "$TMPD/g1.txt" "#1  0x" "backtrace has the caller"
 expect "$TMPD/g1.txt" "in main () at docs/gdb_example.fi:11" "the caller is main, line 11"
 expect "$TMPD/g1.txt" "n = 10" "info args"
@@ -169,7 +169,7 @@ fi
 
 # 6c. gdb has to say NO to a name that does not exist -- otherwise the
 # preceding print results would prove nothing.
-gdb -batch -ex "break summe" -ex run -ex "print does_not_exist" -ex kill \
+gdb -batch -ex "break sum_to" -ex run -ex "print does_not_exist" -ex kill \
     "$TMPD/demo" > "$TMPD/g3.txt" 2>&1
 expect "$TMPD/g3.txt" "No symbol" "unknown name is refused"
 
