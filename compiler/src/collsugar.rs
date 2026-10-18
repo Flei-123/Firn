@@ -34,7 +34,17 @@ pub(crate) enum CollDest {
     Let { name: String, span: Span },
     /// `return <literal>`.
     Return { span: Span },
+    /// r751: untyped comprehension in expression position (`let x = [..]`, argument):
+    /// the statements are hoisted in front of the statement, the value is the hidden variable.
+    Expr,
 }
+
+/// r751: marker type of the hidden variable of an untyped comprehension; `lambda.rs`
+/// replaces it by the inferred `Vec[T]` / `Dict[V]` / `Set[K]`.
+pub(crate) const INFER_COLL: &str = "__infer_coll";
+/// r751: marker callee prefixes (`__coll_new_vec()`, `__coll_add_dict(&d, k, v)`, ..).
+pub(crate) const COLL_NEW: &str = "__coll_new_";
+pub(crate) const COLL_ADD: &str = "__coll_add_";
 
 /// The innermost statement of a comprehension (and what must run before it).
 pub(crate) struct CollLeaf {
@@ -98,6 +108,53 @@ impl<'a> Parser<'a> {
             ("Set", 1) => (false, true),
             _ => return None,
         };
+        self.coll_core(is_dict, is_set, Some((ty.clone(), targs)), dest)
+    }
+
+    /// r751: `[e for ..]` / `{k: v for ..}` / `{e for ..}` WITHOUT a declared type, in
+    /// expression position (current token = the opening bracket). The element type is
+    /// inferred later (`lambda.rs`). `None` = not a comprehension of this kind (nothing consumed).
+    pub(crate) fn coll_infer_expr(&mut self) -> Option<Expr> {
+        let (is_dict, is_set) = self.coll_infer_kind()?;
+        let at = self.span();
+        match self.coll_core(is_dict, is_set, None, CollDest::Expr)? {
+            Stmt::Expr(e) => Some(e),
+            _ => Some(self.mk(at, ExprKind::Int(0))),
+        }
+    }
+
+    /// r751: (is_dict, is_set) when the bracket group at the current token is an untyped
+    /// comprehension whose library functions are imported; `None` otherwise.
+    pub(crate) fn coll_infer_kind(&self) -> Option<(bool, bool)> {
+        let (has_for, colon) = self.coll_scan()?;
+        if !has_for {
+            return None;
+        }
+        let is_vec = self.at(&TokKind::LBracket);
+        if !is_vec && !self.at(&TokKind::LBrace) {
+            return None;
+        }
+        let (is_dict, is_set) = (!is_vec && colon, !is_vec && !colon);
+        let (n, a) = if is_dict {
+            ("dict_new", "dict_set")
+        } else if is_set {
+            ("set_new", "set_put")
+        } else {
+            ("vec_new", "vec_push")
+        };
+        if !crate::sema_generic::is_generic_fn(n) || !crate::sema_generic::is_generic_fn(a) {
+            return None;
+        }
+        Some((is_dict, is_set))
+    }
+
+    fn coll_core(
+        &mut self,
+        is_dict: bool,
+        is_set: bool,
+        typed: Option<(TypeExpr, Vec<TypeExpr>)>,
+        dest: CollDest,
+    ) -> Option<Stmt> {
         let (open, close, close_txt) = if is_dict {
             (TokKind::LBrace, TokKind::RBrace, "after the entries of the dict literal")
         } else if is_set {
@@ -125,12 +182,24 @@ impl<'a> Parser<'a> {
             ("vec_new", "vec_push")
         };
         let open_sp = self.span();
-        let new_fn = coll_fn_name(self, new_name, &targs, open_sp)?;
-        let add_fn = coll_fn_name(self, add_name, &targs, open_sp)?;
+        let (new_fn, add_fn) = match &typed {
+            Some((_, targs)) => (
+                coll_fn_name(self, new_name, targs, open_sp)?,
+                coll_fn_name(self, add_name, targs, open_sp)?,
+            ),
+            None => {
+                let kind = if is_dict { "dict" } else if is_set { "set" } else { "vec" };
+                (format!("{}{}", COLL_NEW, kind), format!("{}{}", COLL_ADD, kind))
+            }
+        };
+        let ty = match &typed {
+            Some((t, _)) => t.clone(),
+            None => TypeExpr::Named(INFER_COLL.to_string(), open_sp),
+        };
         self.bump(); // open
         let target = match &dest {
             CollDest::Let { name, .. } => name.clone(),
-            CollDest::Return { .. } => format!("__lc#{}_{}", open_sp.line, open_sp.col),
+            _ => format!("__lc#{}_{}", open_sp.line, open_sp.col),
         };
         let init = self.mk(open_sp, ExprKind::Call(new_fn, Vec::new(), open_sp));
         self.paren_depth += 1;
@@ -194,7 +263,9 @@ impl<'a> Parser<'a> {
         let end = self.span();
         self.close(close, close_txt);
         let broken = self.recovering;
-        self.end_stmt();
+        if !matches!(dest, CollDest::Expr) {
+            self.end_stmt();
+        }
         if broken {
             return Some(Stmt::Error(open_sp));
         }
@@ -203,6 +274,12 @@ impl<'a> Parser<'a> {
             CollDest::Let { name, span } => {
                 self.after.append(&mut body);
                 Some(Stmt::Let { name, mutable: true, ty: Some(ty.clone()), init, span })
+            }
+            CollDest::Expr => {
+                self.hoist.push(Stmt::Let { name: target.clone(), mutable: true, ty: Some(ty.clone()), init, span: sp });
+                self.hoist.append(&mut body);
+                let value = self.coll_ident(&target, sp);
+                Some(Stmt::Expr(value))
             }
             CollDest::Return { span } => {
                 self.pre.push(Stmt::Let { name: target.clone(), mutable: true, ty: Some(ty.clone()), init, span: sp });

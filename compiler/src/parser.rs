@@ -1230,6 +1230,12 @@ impl<'a> Parser<'a> {
                 e
             }
             TokKind::LBracket => {
+                // r751: untyped comprehension `[e for ..]` -- element type inferred in lambda.rs
+                if !self.recovering {
+                    if let Some(e) = self.coll_infer_expr() {
+                        return e;
+                    }
+                }
                 let start = self.bump();
                 let mut elems = Vec::new();
                 // `[value; N]` — repeat literal
@@ -1283,6 +1289,14 @@ impl<'a> Parser<'a> {
                 self.close(TokKind::RBracket, "after the elements of the array literal");
                 let sp = Parser::join(start, end);
                 self.mk(sp, ExprKind::ArrayLit(elems))
+            }
+            // r751: untyped dict / set comprehension `{k: v for ..}` / `{e for ..}`
+            TokKind::LBrace if !self.recovering && self.coll_infer_kind().is_some() => {
+                let at = self.span();
+                match self.coll_infer_expr() {
+                    Some(e) => e,
+                    None => self.mk(at, ExprKind::Int(0)),
+                }
             }
             TokKind::KwSyscall => {
                 let start = self.bump();
@@ -1360,6 +1374,9 @@ impl<'a> Parser<'a> {
             return Block { stmts: Vec::new(), span: start, end: start };
         }
         self.depth += 1;
+        // r751: statements hoisted by the condition in front of this block (`if f(<comprehension>) {`)
+        // belong in front of the statement that owns the block, not into it
+        let outer_hoist = std::mem::take(&mut self.hoist);
         let mut stmts = Vec::new();
         loop {
             if self.at(&TokKind::RBrace) {
@@ -1403,6 +1420,7 @@ impl<'a> Parser<'a> {
         let end = self.span();
         self.eat(&TokKind::RBrace);
         self.depth -= 1;
+        self.hoist = outer_hoist;
         Block { stmts, span: Parser::join(start, end), end }
     }
 

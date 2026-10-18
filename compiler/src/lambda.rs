@@ -154,6 +154,13 @@ struct Cx<'a> {
     pending: bool,
     /// r750: next free ExprId (bound method values build new expressions)
     next: u32,
+    /// r751: untyped comprehensions of the current function: hidden variable -> (collection
+    /// type, instance name of the `*_new` function) once the element type is inferred
+    coll_res: HashMap<String, (TypeExpr, String)>,
+    /// r751: comprehensions whose element type could not be inferred (error already reported)
+    coll_failed: HashSet<String>,
+    /// r751: element type per `Vec` instance created by an inferred comprehension
+    new_elems: HashMap<String, TypeExpr>,
     dg: &'a mut Diags,
 }
 
@@ -283,11 +290,122 @@ fn expr_ty(cx: &Cx, e: &Expr) -> Option<TypeExpr> {
         },
         ExprKind::Index(a, _) => match strip(expr_ty(cx, a)?) {
             TypeExpr::Array { elem, .. } => Some(*elem),
-            TypeExpr::Named(m, _) => cx.elems.get(&m).cloned(),
+            TypeExpr::Named(m, _) => cx.elems.get(&m).or_else(|| cx.new_elems.get(&m)).cloned(),
             _ => None,
         },
         _ => None,
     }
+}
+
+/// r751: the type of an element expression of a comprehension, as far as it is evident
+/// without the type checker. (strong, weak): `weak` = a literal default (`1` -> i32);
+/// a strong type of one operand wins over the weak default of the other.
+fn val_ty(cx: &Cx, e: &Expr) -> (Option<TypeExpr>, Option<TypeExpr>) {
+    let named = |n: &str| Some(TypeExpr::Named(n.to_string(), e.span));
+    match &e.kind {
+        ExprKind::Int(_) => (None, named("i32")),
+        ExprKind::Float(..) => (None, named("f64")),
+        ExprKind::FloatF32(_) => (named("f32"), None),
+        ExprKind::Bool(_) => (named("bool"), None),
+        ExprKind::Text(false, _) => (named(crate::strtype::NAME), None),
+        ExprKind::Cast(_, t) => (Some(t.clone()), None),
+        ExprKind::StructLit(n, _, _) if n == crate::ast::TUPLE_LIT => (None, None),
+        ExprKind::Unary(UnOp::Neg, a) | ExprKind::Unary(UnOp::BitNot, a) => val_ty(cx, a),
+        ExprKind::Unary(UnOp::Not, _) => (named("bool"), None),
+        ExprKind::Binary(op, a, b) => match op {
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::LAnd | BinOp::LOr => {
+                (named("bool"), None)
+            }
+            BinOp::Shl | BinOp::Shr => val_ty(cx, a),
+            _ => {
+                let (s1, w1) = val_ty(cx, a);
+                let (s2, w2) = val_ty(cx, b);
+                (s1.or(s2), w1.or(w2))
+            }
+        },
+        ExprKind::IfElse(_, a, b) => {
+            let (s1, w1) = val_ty(cx, a);
+            let (s2, w2) = val_ty(cx, b);
+            (s1.or(s2), w1.or(w2))
+        }
+        _ => (expr_ty(cx, e), None),
+    }
+}
+
+/// r751: the element type of the comprehension that pushes `args` through `__coll_add_<kind>`.
+fn coll_elem_ty(cx: &Cx, kind: &str, args: &[Expr]) -> Option<TypeExpr> {
+    let e = if kind == "dict" { args.get(2)? } else { args.get(1)? };
+    let (s, w) = val_ty(cx, e);
+    s.or(w)
+}
+
+fn is_coll_marker(t: &Option<TypeExpr>) -> bool {
+    matches!(t, Some(TypeExpr::Named(n, _)) if n == crate::collsugar::INFER_COLL)
+}
+
+fn error_coll(cx: &mut Cx, sp: Span) {
+    cx.dg.error_note(
+        sp,
+        "a comprehension needs a declared collection type",
+        "the element type is not evident here: write `let xs: Vec[T] = [e for x in v]` (or `return [..]` in a function returning `Vec[T]`)",
+    );
+}
+
+/// r751: `__coll_add_<kind>(&x, ..)` -- the element type is known now: name the instances
+/// `vec_push[T]` / `Vec[T]` ..., record them (expanded by `mono::expand_late`) and tell the
+/// block that owns `let x`.
+fn coll_push(cx: &mut Cx, name: &mut String, args: &[Expr], sp: Span) {
+    let kind = name[crate::collsugar::COLL_ADD.len()..].to_string();
+    let target = match args.first().map(|a| &a.kind) {
+        Some(ExprKind::Unary(UnOp::AddrOf, a)) => match &a.kind {
+            ExprKind::Ident(n) => n.clone(),
+            _ => return,
+        },
+        _ => return,
+    };
+    let t = match coll_elem_ty(cx, &kind, args) {
+        Some(t) => t,
+        None => {
+            if cx.coll_failed.insert(target) {
+                error_coll(cx, sp);
+            }
+            return;
+        }
+    };
+    let (base, new_fn, add_fn) = match kind.as_str() {
+        "dict" => ("Dict", "dict_new", "dict_set"),
+        "set" => ("Set", "set_new", "set_put"),
+        _ => ("Vec", "vec_new", "vec_push"),
+    };
+    let targs = vec![t.clone()];
+    let sty = crate::sema_generic::mangle(base, &targs);
+    let nfn = crate::sema_generic::mangle(new_fn, &targs);
+    let afn = crate::sema_generic::mangle(add_fn, &targs);
+    let rec = |m: &str, b: &str, is_fn: bool| {
+        crate::sema_generic::record_inst(
+            m,
+            crate::sema_generic::Instantiation {
+                base: b.to_string(),
+                args: targs.clone(),
+                span: sp,
+                is_abstract: false,
+                is_fn,
+            },
+        )
+    };
+    rec(&sty, base, false);
+    rec(&nfn, new_fn, true);
+    rec(&afn, add_fn, true);
+    *name = afn;
+    let cty = TypeExpr::Named(sty.clone(), sp);
+    if base == "Vec" {
+        cx.new_elems.insert(sty, t);
+    }
+    if let Some(sc) = cx.scopes.iter_mut().rev().find(|s| s.contains_key(&target)) {
+        sc.insert(target.clone(), Some(cty.clone()));
+    }
+    cx.coll_res.insert(target, (cty, nfn));
+    cx.pending = true;
 }
 
 /// r742b: `e` is the NAME of a generic fn used as a value (`id`, `mod.id`) -> its template name.
@@ -412,10 +530,15 @@ fn round(prog: &mut Program, dg: &mut Diags, start: usize) -> bool {
         inst_rets: HashMap::new(),
         pending: false,
         next: prog.expr_count,
+        coll_res: HashMap::new(),
+        coll_failed: HashSet::new(),
+        new_elems: HashMap::new(),
         dg,
     };
     for f in prog.funcs.iter_mut().skip(start) {
         cx.ret = f.ret.clone();
+        cx.coll_res.clear();
+        cx.coll_failed.clear();
         cx.scopes = vec![f.params.iter().map(|p| (p.name.clone(), Some(p.ty.clone()))).collect()];
         block(&mut cx, &mut f.body);
     }
@@ -443,11 +566,38 @@ fn block(cx: &mut Cx, b: &mut Block) {
     for s in b.stmts.iter_mut() {
         stmt(cx, s);
     }
+    // r751: the hidden variables of untyped comprehensions get their inferred type
+    for s in b.stmts.iter_mut() {
+        if let Stmt::Let { name, ty, init, span, .. } = s {
+            if !is_coll_marker(ty) {
+                continue;
+            }
+            match cx.coll_res.get(name.as_str()).cloned() {
+                Some((cty, nfn)) => {
+                    *ty = Some(cty);
+                    if let ExprKind::Call(n, _, _) = &mut init.kind {
+                        *n = nfn;
+                    }
+                }
+                None => {
+                    if !cx.coll_failed.contains(name.as_str()) {
+                        let sp = *span;
+                        error_coll(cx, sp);
+                    }
+                }
+            }
+        }
+    }
     cx.scopes.pop();
 }
 
 fn stmt(cx: &mut Cx, s: &mut Stmt) {
     match s {
+        Stmt::Let { name, ty, init, .. } if is_coll_marker(ty) => {
+            // r751: the type arrives with the push inside the loops that follow
+            let _ = init;
+            declare(cx, name, None);
+        }
         Stmt::Let { name, ty, init, .. } => {
             let t = ty.clone();
             want(cx, init, t.as_ref());
@@ -487,7 +637,11 @@ fn stmt(cx: &mut Cx, s: &mut Stmt) {
             want(cx, start, None);
             want(cx, end, None);
             cx.scopes.push(HashMap::new());
-            declare(cx, name, None);
+            // r751: the loop variable has the type of its range (a literal range is i32)
+            let (s1, w1) = val_ty(cx, start);
+            let (s2, w2) = val_ty(cx, end);
+            let vt = s1.or(s2).or(w1).or(w2);
+            declare(cx, name, vt);
             block(cx, body);
             cx.scopes.pop();
         }
@@ -693,6 +847,13 @@ fn walk(cx: &mut Cx, e: &mut Expr) {
         ExprKind::Lambda(d) => {
             let sp = e.span;
             resolve(cx, d, None, sp);
+        }
+        ExprKind::Call(name, args, _) if name.starts_with(crate::collsugar::COLL_ADD) => {
+            for a in args.iter_mut() {
+                want(cx, a, None);
+            }
+            let sp = e.span;
+            coll_push(cx, name, args, sp);
         }
         ExprKind::Call(name, args, _) => {
             // r742b: `apply_g(id, 4)` -- a generic callee with a generic fn as a value
