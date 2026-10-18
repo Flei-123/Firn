@@ -142,7 +142,7 @@ export {
     SUITE_AES128GCM, SUITE_CHACHA20,
     // round ASYNC -- non-blocking mode (see N1..N4 below)
     tls_set_nonblocking, tls_handshake_step, tls_flush, tls_out_pending,
-    tls_is_nonblocking, tls_closed, tls_note_error, tls_yielded, tls_stage_ms,
+    tls_is_nonblocking, tls_closed, tls_note_error, tls_yielded, tls_stage_ms, tls_pregen, tls_pregen_ready,
     SUITE12_ECDSA_AES128GCM, SUITE12_ECDSA_AES256GCM, SUITE12_RSA_AES128GCM,
     SUITE12_RSA_AES256GCM, SUITE12_ECDSA_CHACHA20, SUITE12_RSA_CHACHA20,
 }
@@ -1599,6 +1599,62 @@ fn tls_stage_ms(i: usize) -> i64 { return G_STAGE_MS[i] }
 
 fn stage_now() -> i64 { return (time.monotonic_ns() / 1000000 as u64) as i64 }
 
+// KEY SHARES DRAWN AHEAD: the X25519 and P-256 key pairs of ONE coming handshake (they cost ~15 ms on a desktop and several
+// times that on a phone, and a ClientHello cannot leave without them). `tls_pregen` draws them off the request's critical path
+// (an app calls it once at start-up, `ahttp.aclient_warm` does); the next handshake takes them -- each pair is used exactly
+// once, then the slot is empty again.
+static mut G_PRE_OK: bool = false
+static mut G_PRE_PRIV: [u8; 32] = [0; 32]
+static mut G_PRE_PUB: [u8; 32] = [0; 32]
+static mut G_PRE_P256_PRIV: [u8; 32] = [0; 32]
+static mut G_PRE_P256_PUB: [u8; 65] = [0; 65]
+
+fn tls_pregen_ready() -> bool { return G_PRE_OK }
+
+fn draw_shares(priv: u64, pub_key: u64, p_priv: u64, p_pub: u64) -> bool {
+    if !random.random_bytes(priv, 32) { return false }
+    if !x25519.x25519_base(priv, pub_key) { return false }
+    var drawn: bool = false
+    var tries: usize = 0
+    while !drawn && tries < 8 {
+        if !random.random_bytes(p_priv, 32) { return false }
+        if p256.p256_scalar_valid(p_priv) { drawn = true }
+        tries = tries + 1
+    }
+    if !drawn { return false }
+    return p256.p256_public(p_priv, p_pub)
+}
+
+fn tls_pregen() -> bool {
+    if G_PRE_OK { return true }
+    if !draw_shares((&G_PRE_PRIV[0]) as u64, (&G_PRE_PUB[0]) as u64, (&G_PRE_P256_PRIV[0]) as u64, (&G_PRE_P256_PUB[0]) as u64) {
+        return false
+    }
+    G_PRE_OK = true
+    return true
+}
+
+// Moves the drawn pair into `t`; false when none is waiting.
+fn take_pregen(t: *mut Tls) -> bool {
+    if !G_PRE_OK { return false }
+    var i: usize = 0
+    while i < 32 {
+        (*t).priv[i] = G_PRE_PRIV[i]
+        (*t).pub_key[i] = G_PRE_PUB[i]
+        (*t).p256_priv[i] = G_PRE_P256_PRIV[i]
+        G_PRE_PRIV[i] = 0 as u8
+        G_PRE_P256_PRIV[i] = 0 as u8
+        i = i + 1
+    }
+    i = 0
+    while i < 65 {
+        (*t).p256_pub[i] = G_PRE_P256_PUB[i]
+        i = i + 1
+    }
+    G_PRE_OK = false
+    return true
+}
+
 // In non-blocking mode a handshake step stops after a heavy operation (a
 // scalar multiplication, a signature check) and says so; the stream calls it
 // again on the next loop round, so one handshake is many short pieces and
@@ -1640,6 +1696,10 @@ fn tls_handshake_step(t: *mut Tls) -> TlsError!bool {
         return handshake12_step(t)
     }
     if (*t).hs_step == 0 as u32 {
+        if (*t).hs_sub == 0 as u32 && take_pregen(t) {
+            G_STAGE_MS[0] = 0
+            (*t).hs_sub = 2 as u32
+        }
         if (*t).hs_sub == 0 as u32 {
             let g0: i64 = stage_now()
             if !random.random_bytes((&(*t).priv[0]) as u64, 32) {
