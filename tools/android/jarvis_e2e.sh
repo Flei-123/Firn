@@ -109,9 +109,9 @@ kbd() { $ADB shell dumpsys input_method | grep -c 'mInputShown=true'; }
 wait_kbd_up() { local i; for i in $(seq 12); do [ "$(kbd)" = 1 ] && return 0; sleep 1; done; return 1; }
 hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; fi; sleep 1; }
 # the composer buttons are vector icons without text (Plus, Mic, Send): touch them by place, as pixels of the 1080x2340 layout
-# (the field "Message" grey hint is lost by OCR as well). Row y 1911, centres: plus 103, field 305, mic 790, send 960
+# (the field "Message" grey hint is lost by OCR as well). Row y 2028 (a42: composer sits directly above the tab bar; a40 and older 1911), centres: plus 103, field 305, mic 790, send 960
 # the composer row sits higher with the 3-button navigation bar (settings navigation_mode 0) than with gestures (2)
-if [ "$($ADB shell settings get secure navigation_mode 2>/dev/null | tr -d '\r')" = 2 ]; then COMP_Y=1911; TAB_Y=2207; else COMP_Y=1845; TAB_Y=2141; fi
+if [ "$($ADB shell settings get secure navigation_mode 2>/dev/null | tr -d '\r')" = 2 ]; then COMP_Y=2028; TAB_Y=2207; else COMP_Y=1962; TAB_Y=2141; fi
 tap_px() { $ADB shell input tap $(($1 * SW / 1080)) $(($2 * SH / 2340)); sleep "${3:-1.5}"; }
 tap_plus() { tap_px 103 $COMP_Y 2; }
 tap_send() { tap_px 960 $COMP_Y 1; }
@@ -400,7 +400,7 @@ if n:
 # ---- 8. voice output without an engine -------------------------------------------------------------------------------------
 echo "== 8. voice output"
 tap_word "Sprache" 1 2; shot 10_voice
-check "Voice switch shows 'Sprache an'" "$(ocr_crop 10_voice 330 320 660 440 | grep -ci 'prache an')" 1
+check "Voice switch shows 'Sprache an'" "$(ocr_crop 10_voice 330 240 660 400 | grep -ci 'prache an')" 1
 send_text "voicetest"
 check "the app lives after a spoken answer" "$(OCR_TRIES=12 wait_ocr 11_say 'Hallo voicetest')" 1
 check "app alive after voice output" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
