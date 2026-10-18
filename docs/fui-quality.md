@@ -17,7 +17,7 @@
 - Not done: host hook that records a real session (`FUI_RECORD=<file>` in apphost), capturing scroll/focus/selection of an App into `State`, trying the loop on a real app.
 
 ## Ripple, splitter, XRandR (W18-E)
-- `lib/fui/ripple.fi` + `ripple_main`: time-based circle (decelerate curve 450 ms, fade 300 ms), 4 slots, off switch; not wired into buttons yet.
+- `lib/fui/ripple.fi` + `ripple_main`: time-based circle (decelerate curve 450 ms, fade 300 ms), 4 slots, off switch; wired into buttons via `Shape.ripple` (theme key `ripple = 1`, default off) and `appctl.ripple_on`; `ripplewire_main` checks it.
 - `lib/fui/splitter.fi` + `splitter_main`: drag with grab offset, grab margin, min sizes, keyboard, RTL, a11y values; not a scene node yet.
 - X11 refresh rate: `RRGetScreenInfo` rate (octet 26) -> `window.refresh_hz` -> `apphost` calls `host_set_refresh_hz` (unless FUI_REFRESH_HZ is set). Xvfb reports 0 = unknown -> stays 60.
 - Sheet: `tools/fui/ecosystem_main.fi check|shot <dir>`.
