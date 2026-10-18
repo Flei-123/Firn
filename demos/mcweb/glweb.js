@@ -169,6 +169,7 @@
             firn_glw_read_pixels(x, y, w, h, p) { gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, u8(p, w * h * 4)); },
             firn_glw_flush() { gl.flush(); },
             firn_glw_finish() { gl.finish(); },
+            firn_glw_get_int(p) { return gl ? (gl.getParameter(p) | 0) : 0; },
             firn_glw_get_error() { return gl ? gl.getError() : 0; },
             // the frame is on the canvas now (glweb_show): a test takes its snapshot here
             firn_glw_present(w, h) { if (opts.onPresent) opts.onPresent(canvas, w, h); },
