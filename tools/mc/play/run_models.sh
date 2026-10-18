@@ -138,6 +138,8 @@ run_one E 1 MCPLAY_MODELS=1 MCPLAY_STREAM=1 MCPLAY_PICK_PROBE="$PROBE"
 run_one F 0 MCPLAY_MODELS=0 MCPLAY_STREAM=0 MCPLAY_PICK_PROBE="$PROBE"
 run_one G 0 MCPLAY_PICK_PROBE="$PROBE"
 run_one H 0 MC_PACKS="$W/pack2.zip" MCPLAY_PICK_PROBE="$PROBE"
+# r238b: models + LOD together (full ring 3 chunks has the stairs, the rings beyond are LOD cubes)
+run_one I 0 MCPLAY_MODELS=1 MCPLAY_LOD=9 MCPLAY_PICK_PROBE="$PROBE"
 num() { grep -E "mcplay: (end|stream)" "$W/$1.out" | grep -o "$2=[0-9]*" | tail -1 | cut -d= -f2; }
 for n in A B C D E F G H; do
     F=$(num $n frames)
@@ -155,9 +157,9 @@ grep -q "^mcplay: models" "$W/F.out" && { echo "  FAIL  F (MCPLAY_MODELS=0) prin
 grep -q "^mcplay: models on.*stream=true" "$W/G.out" || { echo "  FAIL  G: the default (MCPLAY_MODELS unset) with a pack must switch the models on, with the stream"; ERR=1; }
 for n in A C; do grep -q "stream=true" "$W/$n.out" && { echo "  FAIL  $n has the stream on (MCPLAY_STREAM=0)"; ERR=1; }; done
 for n in D E; do grep -q "models on.*stream=true" "$W/$n.out" || { echo "  FAIL  $n: models without the stream (MCPLAY_MODELS=1 must keep MCPLAY_STREAM=1)"; ERR=1; }; done
-for n in A B C D E F G H; do [ -s "$W/$n.png" ] || { echo "  FAIL  $n: no screenshot"; ERR=1; }; done
+for n in A B C D E F G H I; do [ -s "$W/$n.png" ] || { echo "  FAIL  $n: no screenshot"; ERR=1; }; done
 if [ $ERR -eq 0 ]; then
-    RES=$(python3 -I - "$W/A.png" "$W/B.png" "$W/C.png" "$W/D.png" "$W/E.png" "$W/F.png" "$W/G.png" "$W/H.png" <<'PY'
+    RES=$(python3 -I - "$W/A.png" "$W/B.png" "$W/C.png" "$W/D.png" "$W/E.png" "$W/F.png" "$W/G.png" "$W/H.png" "$W/I.png" <<'PY'
 import sys
 from PIL import Image, ImageChops
 def crop(p): return Image.open(p).convert("RGB").crop((0, 60, 640, 330))
@@ -175,14 +177,14 @@ def fixture(im):
         elif b * 100 >= m * 88 and lo(r) and lo(g): cnt[2] += 1     # blue
         elif r * 100 >= m * 80 and g * 100 >= m * 80 and lo(b): cnt[3] += 1  # yellow
     return cnt
-a, b, c, dd, e, f, g, h = [crop(p) for p in sys.argv[1:9]]
+a, b, c, dd, e, f, g, h, ii = [crop(p) for p in sys.argv[1:10]]
 d = ImageChops.difference(a, b).convert("L").point(lambda v: 255 if v > 0 else 0)
 def nz(x, y, t=0): return sum(ImageChops.difference(x, y).convert("L").point(lambda v: 255 if v > t else 0).histogram()[255:])
 d2 = ImageChops.difference(a, dd).convert("L").point(lambda v: 255 if v > 0 else 0)
 d3 = ImageChops.difference(f, b).convert("L").point(lambda v: 255 if v > 0 else 0)
 print("A", *fixture(a), "B", *fixture(b), "C", *fixture(c), "diffAB", sum(d.histogram()[255:]), "total", a.width * a.height,
       "D", *fixture(dd), "E", *fixture(e), "diffAD", sum(d2.histogram()[255:]), "diffFB", sum(d3.histogram()[255:]),
-      "diffAC", nz(a, c), "diffDE", nz(dd, e), "diffDG", nz(dd, g), "diffBH", nz(b, h, 0))
+      "diffAC", nz(a, c), "diffDE", nz(dd, e), "diffDG", nz(dd, g), "diffBH", nz(b, h, 0), "I", *fixture(ii))
 PY
 ) || RES=""
     echo "  fixture colours (red green blue yellow): $RES"
@@ -203,6 +205,9 @@ PY
         [ "${35}" -le 0 ] || { echo "  FAIL  C (reload) differs from A by ${35} px"; ERR=1; }
         [ "${37}" -le 0 ] || { echo "  FAIL  E (stream, reload) differs from D by ${37} px"; ERR=1; }
         [ "${39}" -le 0 ] || { echo "  FAIL  G (default models) differs from D by ${39} px"; ERR=1; }
+        for i in 43 44 45 46; do [ "${!i}" -ge 120 ] || { echo "  FAIL  I (models + LOD): fixture colour #$((i - 42)) only ${!i} pixels"; ERR=1; }; done
+        grep -q "^mcplay: models on.*lod=9" "$W/I.out" || { echo "  FAIL  I: 'models on ... lod=9' line missing (models must combine with MCPLAY_LOD)"; ERR=1; }
+        grep -qE "^mcplay: stream .*lod_cols=[1-9]" "$W/I.out" || { echo "  FAIL  I: no LOD columns drawn"; ERR=1; }
         [ "$DP" -ge $((DT / 100)) ] || { echo "  FAIL  A equals B (stairs drawn as cubes?): $DP of $DT pixels differ"; ERR=1; }
     fi
 fi

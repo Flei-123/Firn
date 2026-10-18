@@ -94,6 +94,8 @@ import fui.timeline
 import fui.grid
 import fui.wave8
 import fui.wave8m
+import fui.wave12
+import fui.sizeclass
 import fui.a11y
 import fui.action
 import fui.ctxmenu
@@ -136,6 +138,11 @@ export {
     stepper, stepper_add, stepper_current, stepper_set,
     grid, grid_cell, grid_gap, grid_pad, grid_rtl, grid_name,
     toolbar, toolbar_item, toolbar_end, toolbar_width, toolbar_folded, toolbar_is_folded, toolbar_open, toolbar_set_open, toolbar_more,
+    datepicker, datepicker_start, datepicker_end, datepicker_month, datepicker_cursor, datepicker_complete, datepicker_set,
+    datepicker_event, datepicker_day_rect, datepicker_arrow_rect,
+    navview, navview_add, navview_header, navview_selected, navview_select, navview_set_mode, navview_follow, navview_toggle,
+    navview_open, navview_mode, navview_event, navview_hamburger_rect, navview_item_rect,
+    tree, tree_add, tree_count, tree_visible, tree_selected, tree_select, tree_is_open, tree_set_open, tree_event, tree_item_rect,
     accordion, accordion_section, accordion_is_open, accordion_set, accordion_open_count, accordion_sections,
     table, table_col, table_add_row, table_set, table_cell, table_rows, table_cursor_row, table_cursor_col, table_set_cursor,
     table_event, table_event_row, table_event_col, table_sort, table_sort_col, table_sort_desc, table_editing, table_edit_text,
@@ -2028,7 +2035,7 @@ fn sync(c: *mut Ctl) {
 fn is_focus_kind(k: u32) -> bool {
     return k == K_SLIDER || k == K_RADIO || k == K_TAB || k == K_SPIN || k == K_DROP
     || k == K_RATING || k == K_SEG || k == K_CHIPS || k == K_PAGER || k == K_PGRID || k == K_RANGE
-    || k == K_TIMEP || k == K_CRUMB || k == K_INFOB || k == K_STEPPER
+    || k == K_TIMEP || k == K_CRUMB || k == K_INFOB || k == K_STEPPER || is_w12_kind(k)
 }
 
 // move the keyboard focus to a node
@@ -2148,6 +2155,9 @@ fn ctl_key(ud: u64, key: u32, mods: u32) -> bool {
     }
     if is_w8_kind(k) {
         return w8_key(c, i, key)
+    }
+    if is_w12_kind(k) {
+        return w12_key(c, i, key)
     }
     if k == K_PGRID {
         return w6_key(c, i, key)
@@ -2319,6 +2329,9 @@ fn ctl_ptr(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     if w6_ptr(c, kind, x, y) {
         w5r = true
     }
+    if w12_ptr(c, kind, x, y) {
+        w5r = true
+    }
     if tbl_ptr_route(c, kind, x, y) {
         w5r = true
     }
@@ -2354,6 +2367,8 @@ fn ctl_act(ud: u64, node: usize) {
     }
     if is_w8_kind((*c).kind[i]) {
         w8_act(c, i)
+    } else if is_w12_kind((*c).kind[i]) {
+        w12_act(c, i)
     } else if is_w5_kind((*c).kind[i]) {
         w5_act(c, i)
     } else if (*c).kind[i] == K_PGRID {
@@ -2674,7 +2689,7 @@ fn ripple_ptr(c: *mut Ctl, kind: u32, x: f64, y: f64) {
             return
         }
         let wi: usize = find(c, n)
-        if wi != NONE && (is_w5_kind((*c).kind[wi]) || is_w8_kind((*c).kind[wi]) || (*c).kind[wi] == K_PGRID) {
+        if wi != NONE && (is_w5_kind((*c).kind[wi]) || is_w8_kind((*c).kind[wi]) || is_w12_kind((*c).kind[wi]) || (*c).kind[wi] == K_PGRID) {
             return
         }
         (*c).rp_node = n
@@ -7403,4 +7418,660 @@ fn tbl_paint(c: *mut Ctl, rc: *mut render.Ctx) {
         }
         i = i + 1
     }
+}
+
+// ============================================================ WAVE 12 (r45 rest): calendar / range, navigation view, tree
+// lib/fui/wave12.fi has the models and the painters. Each control is ONE focusable node (no fill) with a heap `W12`.
+//
+//     let d: usize = appctl.datepicker(a, "Trip", 2026, 10, 18, true, picked)   // true = a range; false = one day
+//     appctl.datepicker_start(a, d)  appctl.datepicker_end(a, d)                 // y*10000 + m*100 + day (0 = none)
+//     let nv: usize = appctl.navview(a, "Sections", 360, on_nav)                 // hamburger + list; width follows the mode
+//     appctl.navview_add(a, nv, lucide.HOUSE, "Home", 0)  appctl.navview_set_mode(a, nv, wave12.NV_COMPACT)
+//     let t: usize = appctl.tree(a, "Files", 240, 220, on_tree)
+//     appctl.tree_add(a, t, 0, "Documents", true)  appctl.tree_add(a, t, 1, "Work", false)   // pre-order, depth per item
+//
+// Keys: calendar arrows / PgUp / PgDn / Home / End + Enter / Space; nav list Up / Down / Home / End (Up from the first item
+// = hamburger, Enter on it toggles the pane, Esc closes the overlay of the minimal mode); tree Up / Down / Left / Right /
+// Home / End + Enter. a11y: one node each with a role, name and a description of the state (screen reader).
+const K_DATEP: u32 = 34
+const K_NAVV: u32 = 35
+const K_TREE: u32 = 36
+const NO12: usize = 100000
+
+struct W12 {
+    cal: wave12.Cal,
+    nv: wave12.NavView,
+    tr: wave12.Tree,
+    hov: usize,
+    ev: usize,
+    done: bool,
+    name: str,
+    dn: usize,
+    desc: [u8; 192],
+}
+
+fn is_w12_kind(k: u32) -> bool {
+    return k >= K_DATEP && k <= K_TREE
+}
+
+fn w12_of(c: *mut Ctl, i: usize) -> *mut W12 {
+    return (*c).aux[i] as *mut W12
+}
+
+fn w12_idx(a: *mut app.App, id: usize, kind: u32) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return NONE }
+    let i: usize = find(c, id)
+    if i == NONE || (*c).kind[i] != kind { return NONE }
+    return i
+}
+
+fn w12_put(w: *mut W12, s: str) {
+    var k: usize = 0
+    while k < s.n && (*w).dn < 188 {
+        (*w).desc[(*w).dn] = *((s.p as u64 + k as u64) as *mut u8)
+        (*w).dn = (*w).dn + 1
+        k = k + 1
+    }
+}
+
+fn w12_num(w: *mut W12, v0: i64, digits: usize) {
+    var tmp: [u8; 12] = [0 as u8; 12]
+    var v: i64 = v0
+    var k: usize = 0
+    while (v > 0 || k < digits) && k < 11 {
+        tmp[k] = (48 + v % 10) as u8
+        v = v / 10
+        k = k + 1
+    }
+    while k > 0 && (*w).dn < 188 {
+        k = k - 1
+        (*w).desc[(*w).dn] = tmp[k]
+        (*w).dn = (*w).dn + 1
+    }
+}
+
+fn w12_date(w: *mut W12, v: i64) {
+    w12_num(w, v / 10000, 4)
+    w12_put(w, "-")
+    w12_num(w, (v / 100) % 100, 2)
+    w12_put(w, "-")
+    w12_num(w, v % 100, 2)
+}
+
+// the description for the screen reader, from the state
+fn w12_sync(c: *mut Ctl, i: usize) {
+    let w: *mut W12 = w12_of(c, i)
+    let k: u32 = (*c).kind[i]
+    let ax: *mut a11y.A11y = app.ax((*c).a)
+    let nd: usize = (*c).node[i]
+    (*w).dn = 0
+    if k == K_DATEP {
+        w12_put(w, "Cursor ")
+        w12_date(w, wave12.cal_ymd((*w).cal.y, (*w).cal.m, (*w).cal.cur))
+        if (*w).cal.a != 0 {
+            if (*w).cal.b != 0 {
+                w12_put(w, ". Selected ")
+                w12_date(w, (*w).cal.a)
+                w12_put(w, " to ")
+                w12_date(w, (*w).cal.b)
+            } else if (*w).cal.range {
+                w12_put(w, ". Start ")
+                w12_date(w, (*w).cal.a)
+                w12_put(w, ", choose the end")
+            } else {
+                w12_put(w, ". Selected ")
+                w12_date(w, (*w).cal.a)
+            }
+        }
+    } else if k == K_NAVV {
+        if (*w).nv.active < (*w).nv.n {
+            w12_put(w, (*w).nv.items[(*w).nv.active].label)
+        }
+        if (*w).nv.open {
+            w12_put(w, ". Pane open")
+        } else if (*w).nv.mode == wave12.NV_MINIMAL {
+            w12_put(w, ". Pane hidden")
+        } else {
+            w12_put(w, ". Pane compact")
+        }
+    } else if k == K_TREE {
+        let s: usize = (*w).tr.sel
+        if s < (*w).tr.n {
+            w12_put(w, (*w).tr.item[s].label)
+            w12_put(w, ". Level ")
+            w12_num(w, ((*w).tr.item[s].depth + 1) as i64, 1)
+            if wave12.tr_has_kids(&(*w).tr, s) {
+                if (*w).tr.item[s].open { w12_put(w, ". Expanded") } else { w12_put(w, ". Collapsed") }
+            }
+            w12_put(w, ". Row ")
+            w12_num(w, (wave12.tr_row_of(&(*w).tr, s) + 1) as i64, 1)
+            w12_put(w, " of ")
+            w12_num(w, wave12.tr_vis_count(&(*w).tr) as i64, 1)
+            var ex: u32 = a11y.EXP_NONE
+            if wave12.tr_has_kids(&(*w).tr, s) {
+                if (*w).tr.item[s].open { ex = a11y.EXP_EXPANDED } else { ex = a11y.EXP_COLLAPSED }
+            }
+            a11y.a11y_set_expanded(ax, nd, ex)
+        }
+    }
+    if (*w).dn > 0 {
+        a11y.a11y_set_description(ax, nd, (&(*w).desc[0]) as u64, (*w).dn)
+    } else {
+        a11y.a11y_set_description(ax, nd, 0, 0)
+    }
+}
+
+fn w12_make(a: *mut app.App, kind: u32, wpt: usize, hpt: usize, name: str, role: u32,
+    on_change: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX { return NONE }
+    let p: u64 = rt.heap_alloc(8192)
+    if p == 0 { return NONE }
+    *(p as *mut W12) = W12 { cal: wave12.cal_new(2026, 1, 1, false), nv: wave12.nv_new(), tr: wave12.tr_new(),
+        hov: NO12, ev: NO12, done: false, name: name, dn: 0, desc: [0 as u8; 192] }
+    let node: usize = app.custom(a, widget.KIND_BUTTON, wpt, hpt)
+    if node == NONE { return NONE }
+    (*scene.nd(sc_of(c), node)).no_fill = 1 as u32
+    let i: usize = add_entry(c, kind, node)
+    if i == NONE { return NONE }
+    (*c).aux[i] = p as usize
+    set_cb(c, i, on_change)
+    scene.node_set_draw(sc_of(c), node, c as u64, w12_draw)
+    a11y.a11y_set_role(app.ax(a), node, role)
+    name_node(c, node, name)
+    return node
+}
+
+fn w12_draw(ud: u64, rc: *mut render.Ctx, e: *mut widget.Widget) {
+    let c: *mut Ctl = ud as *mut Ctl
+    var i: usize = 0
+    while i < (*c).n {
+        if is_w12_kind((*c).kind[i]) && wid(c, i) == e { break }
+        i = i + 1
+    }
+    if i >= (*c).n { return }
+    let w: *mut W12 = w12_of(c, i)
+    let k: u32 = (*c).kind[i]
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let wd: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let focused: bool = app.focus((*c).a) == (*c).node[i]
+    let en: bool = !widget.w_is_disabled(e)
+    if k == K_DATEP {
+        var hv: usize = wave12.CAL_NONE
+        if (*w).hov != NO12 { hv = (*w).hov }
+        wave12.cal_draw(rc, &(*w).cal, x, y, wd, h, hv, focused, en)
+    } else if k == K_NAVV {
+        var hn: usize = wave12.NV_NONE
+        if (*w).hov != NO12 { hn = (*w).hov }
+        wave12.nv_draw(rc, &(*w).nv, x, y, wd, h, hn, focused)
+    } else if k == K_TREE {
+        var ht: usize = wave12.TR_NONE
+        if (*w).hov != NO12 { ht = (*w).hov }
+        wave12.tr_draw(rc, &(*w).tr, x, y, wd, h, ht, focused)
+    }
+}
+
+// the part of entry `i` under (x, y) as a hover value (NO12 = none); `chev` = on a tree arrow
+fn w12_hit(c: *mut Ctl, i: usize, x: f64, y: f64, chev: *mut bool) -> usize {
+    let w: *mut W12 = w12_of(c, i)
+    let rc: *mut render.Ctx = app.app_ctx((*c).a)
+    let sc: *mut scene.Scene = sc_of(c)
+    let nd: usize = (*c).node[i]
+    let nx: f64 = scene.node_x(sc, nd)
+    let ny: f64 = scene.node_y(sc, nd)
+    let nw: f64 = scene.node_w(sc, nd)
+    let nh: f64 = scene.node_h(sc, nd)
+    *chev = false
+    let k: u32 = (*c).kind[i]
+    if k == K_DATEP {
+        let p: usize = wave12.cal_hit(rc, &(*w).cal, nx, ny, nw, x, y)
+        if p == wave12.CAL_NONE { return NO12 }
+        return p
+    }
+    if k == K_NAVV {
+        let p: usize = wave12.nv_hit(rc, &(*w).nv, nx, ny, nw, x, y)
+        if p == wave12.NV_NONE { return NO12 }
+        return p
+    }
+    let p: usize = wave12.tr_hit(rc, &(*w).tr, nx, ny, nw, nh, x, y, chev)
+    if p == wave12.TR_NONE { return NO12 }
+    return p
+}
+
+fn w12_clear_hover(c: *mut Ctl, keep: usize) -> bool {
+    var ch: bool = false
+    var i: usize = 0
+    while i < (*c).n {
+        if is_w12_kind((*c).kind[i]) && i != keep {
+            let w: *mut W12 = w12_of(c, i)
+            if (*w).hov != NO12 {
+                (*w).hov = NO12
+                ch = true
+            }
+        }
+        i = i + 1
+    }
+    return ch
+}
+
+fn w12_fit(c: *mut Ctl, i: usize) -> usize {
+    let rc: *mut render.Ctx = app.app_ctx((*c).a)
+    return wave12.tr_fit(rc, scene.node_h(sc_of(c), (*c).node[i]))
+}
+
+// the pane changed: the node gets the width of the new pane
+fn w12_nv_width(c: *mut Ctl, i: usize) {
+    let nd: usize = (*c).node[i]
+    scene.node_set_size(sc_of(c), nd, wave12.nv_width_pt(&(*w12_of(c, i)).nv) as f64, (*scene.nd(sc_of(c), nd)).fix_h)
+    touch(c)
+}
+
+fn w12_event(c: *mut Ctl, i: usize, ev: usize) {
+    (*w12_of(c, i)).ev = ev
+    w12_sync(c, i)
+    fire(c, i)
+}
+
+// pointer events for the wave 12 nodes; true = repaint
+fn w12_ptr(c: *mut Ctl, kind: u32, x: f64, y: f64) -> bool {
+    if kind == fuiwirt.HOOK_LEAVE {
+        return w12_clear_hover(c, NONE)
+    }
+    let sc: *mut scene.Scene = sc_of(c)
+    var node: usize = scene.scene_hit(sc, x, y)
+    var i: usize = NONE
+    if node != NONE && node < scene.scene_count(sc) { i = find(c, node) }
+    if i != NONE && !is_w12_kind((*c).kind[i]) { i = NONE }
+    var ch: bool = w12_clear_hover(c, i)
+    if i == NONE { return ch }
+    let w: *mut W12 = w12_of(c, i)
+    var chev: bool = false
+    let hv: usize = w12_hit(c, i, x, y, &chev)
+    if hv != (*w).hov {
+        (*w).hov = hv
+        ch = true
+    }
+    if kind != fuiwirt.HOOK_DOWN || hv == NO12 { return ch }
+    let k: u32 = (*c).kind[i]
+    if k == K_DATEP {
+        if hv == wave12.CAL_PREV {
+            wave12.cal_shift_month(&(*w).cal, 0 - 1)
+            w12_sync(c, i)
+        } else if hv == wave12.CAL_NEXT {
+            wave12.cal_shift_month(&(*w).cal, 1)
+            w12_sync(c, i)
+        } else {
+            (*w).cal.cur = hv as i64
+            (*w).done = wave12.cal_choose(&(*w).cal)
+            w12_event(c, i, 1)
+        }
+    } else if k == K_NAVV {
+        (*w).nv.foc = wave12.NV_NONE
+        if hv == wave12.NV_HAMBURGER {
+            (*w).nv.open = !(*w).nv.open
+            w12_nv_width(c, i)
+            w12_event(c, i, 2)
+        } else if hv < (*w).nv.n {
+            (*w).nv.active = hv
+            if (*w).nv.mode == wave12.NV_MINIMAL && (*w).nv.open {
+                (*w).nv.open = false
+                w12_nv_width(c, i)
+            }
+            w12_event(c, i, 1)
+        }
+    } else if k == K_TREE {
+        if chev {
+            let o: bool = wave12.tr_set_open(&(*w).tr, hv, !(*w).tr.item[hv].open)
+            let s: bool = wave12.tr_select(&(*w).tr, hv, w12_fit(c, i))
+            w12_event(c, i, 2)
+        } else {
+            let s2: bool = wave12.tr_select(&(*w).tr, hv, w12_fit(c, i))
+            w12_event(c, i, 1)
+        }
+    }
+    touch(c)
+    return true
+}
+
+fn w12_key(c: *mut Ctl, i: usize, key: u32) -> bool {
+    let w: *mut W12 = w12_of(c, i)
+    let k: u32 = (*c).kind[i]
+    if k == K_DATEP {
+        if wave12.cal_key(&(*w).cal, key) == 0 as u32 { return false }
+        w12_sync(c, i)
+        touch(c)
+        return true
+    }
+    if k == K_NAVV {
+        if key == editor.KEY_ESC && (*w).nv.mode == wave12.NV_MINIMAL && (*w).nv.open {
+            (*w).nv.open = false
+            w12_nv_width(c, i)
+            w12_event(c, i, 2)
+            touch(c)
+            return true
+        }
+        let r: u32 = wave12.nv_key(&(*w).nv, key)
+        if r == 0 as u32 { return false }
+        if r == 1 as u32 {
+            w12_event(c, i, 1)
+        }
+        touch(c)
+        return true
+    }
+    let r2: u32 = wave12.tr_key(&(*w).tr, key, w12_fit(c, i))
+    if r2 == 0 as u32 { return false }
+    w12_event(c, i, r2 as usize)
+    touch(c)
+    return true
+}
+
+// Enter / Space
+fn w12_act(c: *mut Ctl, i: usize) {
+    let w: *mut W12 = w12_of(c, i)
+    let k: u32 = (*c).kind[i]
+    if k == K_DATEP {
+        (*w).done = wave12.cal_choose(&(*w).cal)
+        w12_event(c, i, 1)
+    } else if k == K_NAVV {
+        if (*w).nv.foc == wave12.NV_HAMBURGER {
+            (*w).nv.open = !(*w).nv.open
+            w12_nv_width(c, i)
+            w12_event(c, i, 2)
+        } else {
+            if (*w).nv.mode == wave12.NV_MINIMAL && (*w).nv.open {
+                (*w).nv.open = false
+                w12_nv_width(c, i)
+            }
+            w12_event(c, i, 1)
+        }
+    } else if k == K_TREE {
+        w12_event(c, i, 3)
+    }
+    touch(c)
+}
+
+// ---- calendar
+
+fn datepicker(a: *mut app.App, name: str, y: i64, m: i64, d: i64, range: bool, on_change: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return NONE }
+    let rc: *mut render.Ctx = app.app_ctx(a)
+    let node: usize = w12_make(a, K_DATEP, 268, 296, name, a11y.ROLE_GROUP, on_change)
+    if node == NONE { return NONE }
+    let i: usize = find(c, node)
+    (*w12_of(c, i)).cal = wave12.cal_new(y, m, d, range)
+    w12_sync(c, i)
+    return node
+}
+
+fn datepicker_start(a: *mut app.App, id: usize) -> i64 {
+    let i: usize = w12_idx(a, id, K_DATEP)
+    if i == NONE { return 0 }
+    return (*w12_of(st(a), i)).cal.a
+}
+
+fn datepicker_end(a: *mut app.App, id: usize) -> i64 {
+    let i: usize = w12_idx(a, id, K_DATEP)
+    if i == NONE { return 0 }
+    return (*w12_of(st(a), i)).cal.b
+}
+
+// the month shown, as y*100 + m
+fn datepicker_month(a: *mut app.App, id: usize) -> i64 {
+    let i: usize = w12_idx(a, id, K_DATEP)
+    if i == NONE { return 0 }
+    let k: *mut wave12.Cal = &(*w12_of(st(a), i)).cal
+    return (*k).y * 100 + (*k).m
+}
+
+// the day with the keyboard cursor
+fn datepicker_cursor(a: *mut app.App, id: usize) -> i64 {
+    let i: usize = w12_idx(a, id, K_DATEP)
+    if i == NONE { return 0 }
+    return (*w12_of(st(a), i)).cal.cur
+}
+
+// the last choice completed the day / range (false while a range waits for its end)
+fn datepicker_complete(a: *mut app.App, id: usize) -> bool {
+    let i: usize = w12_idx(a, id, K_DATEP)
+    if i == NONE { return false }
+    let w: *mut W12 = w12_of(st(a), i)
+    return (*w).cal.a != 0 && !(*w).cal.pend
+}
+
+// the program sets the day (single) or the whole range (end 0 = a single day); the month shown follows the start
+fn datepicker_set(a: *mut app.App, id: usize, start: i64, end: i64) {
+    let i: usize = w12_idx(a, id, K_DATEP)
+    if i == NONE { return }
+    let c: *mut Ctl = st(a)
+    let k: *mut wave12.Cal = &(*w12_of(c, i)).cal
+    (*k).a = start
+    (*k).b = end
+    (*k).pend = false
+    if start != 0 {
+        (*k).y = start / 10000
+        (*k).m = (start / 100) % 100
+        (*k).cur = start % 100
+    }
+    w12_sync(c, i)
+    touch(c)
+}
+
+fn datepicker_event(a: *mut app.App, id: usize) -> usize {
+    let i: usize = w12_idx(a, id, K_DATEP)
+    if i == NONE { return NONE }
+    return (*w12_of(st(a), i)).ev
+}
+
+// the rectangle of a day (screen design pixels) of the month shown; false when not in the month
+fn datepicker_day_rect(a: *mut app.App, id: usize, day: i64, out: *mut [f64; 4]) -> bool {
+    let i: usize = w12_idx(a, id, K_DATEP)
+    if i == NONE { return false }
+    let c: *mut Ctl = st(a)
+    let sc: *mut scene.Scene = sc_of(c)
+    return wave12.cal_day_rect(app.app_ctx(a), &(*w12_of(c, i)).cal, scene.node_x(sc, id), scene.node_y(sc, id), day, out)
+}
+
+// the month arrows: wave12.CAL_PREV / CAL_NEXT
+fn datepicker_arrow_rect(a: *mut app.App, id: usize, part: usize, out: *mut [f64; 4]) -> bool {
+    let i: usize = w12_idx(a, id, K_DATEP)
+    if i == NONE { return false }
+    let sc: *mut scene.Scene = sc_of(st(a))
+    return wave12.cal_arrow_rect(app.app_ctx(a), scene.node_x(sc, id), scene.node_y(sc, id), scene.node_w(sc, id), part, out)
+}
+
+// ---- navigation view
+
+fn navview(a: *mut app.App, name: str, hpt: usize, on_change: fn(*mut app.App, usize)) -> usize {
+    let node: usize = w12_make(a, K_NAVV, 240, hpt, name, a11y.ROLE_LIST, on_change)
+    if node == NONE { return NONE }
+    let c: *mut Ctl = st(a)
+    w12_sync(c, find(c, node))
+    return node
+}
+
+fn navview_add(a: *mut app.App, id: usize, icon: i64, label: str, badge: usize) -> bool {
+    let i: usize = w12_idx(a, id, K_NAVV)
+    if i == NONE { return false }
+    let ok: bool = wave12.nv_add(&(*w12_of(st(a), i)).nv, icon, label, badge)
+    w12_sync(st(a), i)
+    return ok
+}
+
+fn navview_header(a: *mut app.App, id: usize, label: str) -> bool {
+    let i: usize = w12_idx(a, id, K_NAVV)
+    if i == NONE { return false }
+    return wave12.nv_header(&(*w12_of(st(a), i)).nv, label)
+}
+
+// the selected item (NONE = none)
+fn navview_selected(a: *mut app.App, id: usize) -> usize {
+    let i: usize = w12_idx(a, id, K_NAVV)
+    if i == NONE { return NONE }
+    let v: *mut wave12.NavView = &(*w12_of(st(a), i)).nv
+    if (*v).active >= (*v).n { return NONE }
+    return (*v).active
+}
+
+fn navview_select(a: *mut app.App, id: usize, item: usize) {
+    let i: usize = w12_idx(a, id, K_NAVV)
+    if i == NONE { return }
+    let c: *mut Ctl = st(a)
+    let v: *mut wave12.NavView = &(*w12_of(c, i)).nv
+    if item < (*v).n && !(*v).items[item].header {
+        (*v).active = item
+        w12_sync(c, i)
+        touch(c)
+    }
+}
+
+// wave12.NV_EXPANDED / NV_COMPACT / NV_MINIMAL (by the window size); the node gets the width of the pane
+fn navview_set_mode(a: *mut app.App, id: usize, mode: u32) {
+    let i: usize = w12_idx(a, id, K_NAVV)
+    if i == NONE { return }
+    let c: *mut Ctl = st(a)
+    wave12.nv_set_mode(&(*w12_of(c, i)).nv, mode)
+    w12_nv_width(c, i)
+    w12_sync(c, i)
+    touch(c)
+}
+
+// the mode that fits the window (sizeclass.NAV_SIDEBAR -> expanded, NAV_RAIL -> compact, NAV_BOTTOM -> minimal)
+fn navview_follow(a: *mut app.App, id: usize) {
+    let nm: u32 = nav_mode(a)
+    var m: u32 = wave12.NV_MINIMAL
+    if nm == sizeclass.NAV_SIDEBAR { m = wave12.NV_EXPANDED }
+    if nm == sizeclass.NAV_RAIL { m = wave12.NV_COMPACT }
+    navview_set_mode(a, id, m)
+}
+
+fn navview_toggle(a: *mut app.App, id: usize) {
+    let i: usize = w12_idx(a, id, K_NAVV)
+    if i == NONE { return }
+    let c: *mut Ctl = st(a)
+    (*w12_of(c, i)).nv.open = !(*w12_of(c, i)).nv.open
+    w12_nv_width(c, i)
+    w12_sync(c, i)
+    touch(c)
+}
+
+// the full pane is shown
+fn navview_open(a: *mut app.App, id: usize) -> bool {
+    let i: usize = w12_idx(a, id, K_NAVV)
+    if i == NONE { return false }
+    return (*w12_of(st(a), i)).nv.open
+}
+
+fn navview_mode(a: *mut app.App, id: usize) -> u32 {
+    let i: usize = w12_idx(a, id, K_NAVV)
+    if i == NONE { return 0 as u32 }
+    return (*w12_of(st(a), i)).nv.mode
+}
+
+// 1 = an item was chosen, 2 = the hamburger / Esc changed the pane
+fn navview_event(a: *mut app.App, id: usize) -> usize {
+    let i: usize = w12_idx(a, id, K_NAVV)
+    if i == NONE { return NONE }
+    return (*w12_of(st(a), i)).ev
+}
+
+fn navview_hamburger_rect(a: *mut app.App, id: usize, out: *mut [f64; 4]) -> bool {
+    let i: usize = w12_idx(a, id, K_NAVV)
+    if i == NONE { return false }
+    let sc: *mut scene.Scene = sc_of(st(a))
+    return wave12.nv_hb_rect(app.app_ctx(a), scene.node_x(sc, id), scene.node_y(sc, id), scene.node_w(sc, id), out)
+}
+
+fn navview_item_rect(a: *mut app.App, id: usize, item: usize, out: *mut [f64; 4]) -> bool {
+    let i: usize = w12_idx(a, id, K_NAVV)
+    if i == NONE { return false }
+    let c: *mut Ctl = st(a)
+    let sc: *mut scene.Scene = sc_of(c)
+    return wave12.nv_item_rect(app.app_ctx(a), &(*w12_of(c, i)).nv, scene.node_x(sc, id), scene.node_y(sc, id), scene.node_w(sc, id), item, out)
+}
+
+// ---- tree
+
+fn tree(a: *mut app.App, name: str, wpt: usize, hpt: usize, on_change: fn(*mut app.App, usize)) -> usize {
+    let node: usize = w12_make(a, K_TREE, wpt, hpt, name, a11y.ROLE_TREE, on_change)
+    if node == NONE { return NONE }
+    let c: *mut Ctl = st(a)
+    w12_sync(c, find(c, node))
+    return node
+}
+
+// items come in pre-order; a depth is at most one deeper than the item before; `open` for branches
+fn tree_add(a: *mut app.App, id: usize, depth: usize, label: str, open: bool) -> bool {
+    let i: usize = w12_idx(a, id, K_TREE)
+    if i == NONE { return false }
+    let ok: bool = wave12.tr_add(&(*w12_of(st(a), i)).tr, depth, label, open)
+    w12_sync(st(a), i)
+    return ok
+}
+
+fn tree_count(a: *mut app.App, id: usize) -> usize {
+    let i: usize = w12_idx(a, id, K_TREE)
+    if i == NONE { return 0 }
+    return (*w12_of(st(a), i)).tr.n
+}
+
+fn tree_visible(a: *mut app.App, id: usize) -> usize {
+    let i: usize = w12_idx(a, id, K_TREE)
+    if i == NONE { return 0 }
+    return wave12.tr_vis_count(&(*w12_of(st(a), i)).tr)
+}
+
+// the selected item (NONE = none)
+fn tree_selected(a: *mut app.App, id: usize) -> usize {
+    let i: usize = w12_idx(a, id, K_TREE)
+    if i == NONE { return NONE }
+    let t: *mut wave12.Tree = &(*w12_of(st(a), i)).tr
+    if (*t).sel >= (*t).n { return NONE }
+    return (*t).sel
+}
+
+fn tree_select(a: *mut app.App, id: usize, item: usize) -> bool {
+    let i: usize = w12_idx(a, id, K_TREE)
+    if i == NONE { return false }
+    let c: *mut Ctl = st(a)
+    let ok: bool = wave12.tr_select(&(*w12_of(c, i)).tr, item, w12_fit(c, i))
+    w12_sync(c, i)
+    touch(c)
+    return ok
+}
+
+fn tree_is_open(a: *mut app.App, id: usize, item: usize) -> bool {
+    let i: usize = w12_idx(a, id, K_TREE)
+    if i == NONE { return false }
+    let t: *mut wave12.Tree = &(*w12_of(st(a), i)).tr
+    return item < (*t).n && (*t).item[item].open
+}
+
+fn tree_set_open(a: *mut app.App, id: usize, item: usize, open: bool) -> bool {
+    let i: usize = w12_idx(a, id, K_TREE)
+    if i == NONE { return false }
+    let c: *mut Ctl = st(a)
+    let ok: bool = wave12.tr_set_open(&(*w12_of(c, i)).tr, item, open)
+    w12_sync(c, i)
+    touch(c)
+    return ok
+}
+
+// 1 = the selection moved, 2 = a branch opened / closed, 3 = Enter on the selection
+fn tree_event(a: *mut app.App, id: usize) -> usize {
+    let i: usize = w12_idx(a, id, K_TREE)
+    if i == NONE { return NONE }
+    return (*w12_of(st(a), i)).ev
+}
+
+// the rectangle of a VISIBLE item (screen design pixels); false when hidden / scrolled out
+fn tree_item_rect(a: *mut app.App, id: usize, item: usize, out: *mut [f64; 4]) -> bool {
+    let i: usize = w12_idx(a, id, K_TREE)
+    if i == NONE { return false }
+    let c: *mut Ctl = st(a)
+    let sc: *mut scene.Scene = sc_of(c)
+    return wave12.tr_rect(app.app_ctx(a), &(*w12_of(c, i)).tr, scene.node_x(sc, id), scene.node_y(sc, id), scene.node_w(sc, id), item, out)
 }

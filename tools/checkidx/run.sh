@@ -86,7 +86,8 @@ for src in tools/checkidx/idx_read.fi tools/checkidx/idx_write.fi \
            tools/checkidx/vidx_pop_oob.fi tools/checkidx/vstore_pop_oob.fi \
            tools/checkidx/vstore_other_oob.fi tools/checkidx/vsign_end_oob.fi \
            tools/checkidx/vsign_neg_oob.fi tools/checkidx/vlen_push_oob.fi \
-           tools/checkidx/vsub_noguard_oob.fi tools/checkidx/vsub_end_oob.fi; do
+           tools/checkidx/vsub_noguard_oob.fi tools/checkidx/vsub_end_oob.fi \
+           tools/checkidx/vforeign_big_oob.fi; do
     name=$(basename "$src" .fi)
     for lvl in $LEVELS_CHECKED; do
         msg0=""; msg1=""; rc0=0; rc1=0
@@ -263,7 +264,7 @@ fi
 # leave no check; the abort cases keep theirs.
 # r761/r762: the same in dev-fast (`vec_len` stays a call there) and `v[i - 1]`
 # under `1 <= i < n`.
-for okf in vstore_ok vsign_ok vsub_ok vlen_ok; do
+for okf in vstore_ok vsign_ok vsub_ok vlen_ok vforeign_ok; do
     for olvl in release-safe dev-fast; do
         vopt=$("$FIRNC" --emit=fir-opt --opt-level=$olvl tools/checkidx/$okf.fi 2>/dev/null | grep -c "= checked_idxv")
         if [ "$vopt" = 0 ]; then ok; else
@@ -280,7 +281,7 @@ for src in tools/checkidx/vidx_off_oob.fi tools/checkidx/vidx_pop_oob.fi \
            tools/checkidx/vstore_pop_oob.fi tools/checkidx/vstore_other_oob.fi \
            tools/checkidx/vsign_end_oob.fi tools/checkidx/vsign_neg_oob.fi \
            tools/checkidx/vlen_push_oob.fi tools/checkidx/vsub_noguard_oob.fi \
-           tools/checkidx/vsub_end_oob.fi; do
+           tools/checkidx/vsub_end_oob.fi tools/checkidx/vforeign_big_oob.fi; do
     for olvl in release-safe dev-fast; do
         kopt=$("$FIRNC" --emit=fir-opt --opt-level=$olvl "$src" 2>/dev/null | grep -c "= checked_idxv")
         if [ "$kopt" -ge 1 ]; then ok; else

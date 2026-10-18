@@ -783,6 +783,9 @@ build appw8w
 # appgrid: grid container in the ten-line API (appctl.grid: track words, cells, spans, gap, padding, RTL, inspector line, pictures)
 build appgrid
 "$W/appgrid" | tail -n 3 | grep -q "APPGRID PASSED"
+# appw12: wave 12 controls (calendar day / range, navigation view with hamburger, tree view) in the ten-line API: clicks, keys, a11y
+build appw12
+"$W/appw12" | tail -n 3 | grep -q "APPW12 PASSED"
 # appw8m: accordion (exclusive / free, click, Up/Down/Home/End, Enter, program side) in the ten-line API
 build appw8m
 "$W/appw8m" | tail -n 3 | grep -q "APPW8M PASSED"
@@ -869,6 +872,9 @@ build dnd
 # W28-d: wave 8 (spinner, time picker, breadcrumb, info bar, stepper) + models (accordion, toolbar overflow, cell edit, insets, density, text scale) + shortcut capture
 build wave8
 "$W/wave8" | tail -n 3
+# W42-c: wave 12 models + pixels (calendar day / range, navigation view, tree view), light + dark + RTL
+build wave12
+"$W/wave12" | tail -n 3 | grep -q "WAVE12 PASSED"
 python3 tools/fui/uistr_audit.py
 build touch
 "$W/touch" | tail -n 3
