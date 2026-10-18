@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_model_ref.fi -- CPU REFERENCE view of baked model quads (lib/mc/mc_model.fi): loads the quad textures from the packs and draws
+// the quads orthographically from one of the six block directions, nearest sampling, depth test, alpha 0 = transparent. No GPU, no mesher.
+// It is the test oracle for UV orientation / rotation / uvlock (tests/3941) and a debug view for pack authors; NOT the game renderer.
+//
+//     var tex: rt.Buf = rt.buf_new()
+//     mc_model_ref.baked_load_textures(&stack, &baked, 16, &tex)         // ts*ts u32 per baked texture (mc_texture.pack_pixel), missing = magenta
+//     mc_model_ref.ref_render(&baked, rt.buf_ptr(&tex), 16, 2, 16, img)  // view from NORTH (0 down 1 up 2 north 3 south 4 west 5 east), 16x16 u32
+//
+// View mapping = the unrotated texture mapping of that face: on screen the point (x, y, z) of the block lands at
+// (canon_u(view) / 16, canon_v(view) / 16), so "north" shows +x on the left and "up" shows north at the top.
+import std.rt
+import std.core
+import std.math
+import paint.png
+import zip.zip
+import mc.mc_assets
+import mc.mc_texture
+import mc.mc_model
+
+export { baked_load_textures, ref_render }
+
+const MAX_PNG_PIXELS: u64 = 16777216
+
+fn tex_path(nm: *mut mc_model.Name, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    let pre: str = "assets/minecraft/textures/"
+    rt.buf_push_bytes(out, pre.p as u64, pre.length())
+    var i: usize = 0
+    while i < (*nm).n {
+        rt.buf_push(out, rt.ld8((&(*nm).b[0]) as u64, i))
+        i = i + 1
+    }
+    let suf: str = ".png"
+    rt.buf_push_bytes(out, suf.p as u64, suf.length())
+}
+
+// Appends ts*ts u32 pixels per baked texture to `out` (cleared first). Returns the number of textures that were found in a pack.
+fn baked_load_textures(st: *mut mc_assets.PackStack, b: *mut mc_model.Baked, ts: usize, out: *mut rt.Buf) -> usize {
+    rt.buf_clear(out)
+    var found: usize = 0
+    var t: usize = 0
+    var path: rt.Buf = rt.buf_new()
+    let cnt: usize = mc_model.baked_tex_count(b)
+    while t < cnt {
+        var nm: mc_model.Name = mc_model.name_new()
+        mc_model.baked_tex_name(b, t, &nm)
+        tex_path(&nm, &path)
+        var ok: bool = false
+        var px: u64 = rt.heap_alloc(ts * ts * 4)
+        // top-most pack that decodes wins
+        var i: usize = 0
+        while i < (*st).n && !ok {
+            let pk: *mut mc_assets.Pack = &(*st).packs[i]
+            let idx: i64 = mc_assets.pack_find_bytes(pk, rt.buf_ptr(&path), rt.buf_len(&path))
+            if idx >= 0 {
+                var raw: rt.Buf = rt.buf_new()
+                var got: usize = zip.zip_extract(&(*pk).z, idx as usize, &raw) catch | e | (0)
+                if got > 0 {
+                    var im: png.Image = png.image_new()
+                    if png.decode_png_limited(rt.buf_ptr(&raw), rt.buf_len(&raw), MAX_PNG_PIXELS, &im) {
+                        let w: usize = png.image_width(&im)
+                        if w > 0 && png.image_height(&im) >= w {
+                            mc_assets.resample_tile(&im, ts as i32, px)
+                            ok = true
+                        }
+                        png.image_free(&im)
+                    }
+                }
+                rt.buf_free(&raw)
+            }
+            i = i + 1
+        }
+        if ok {
+            found = found + 1
+        } else {
+            var k: usize = 0
+            while k < ts * ts {
+                rt.st32(px, k, mc_texture.pack_pixel(255 as u32, 0 as u32, 255 as u32, 255 as u32))
+                k = k + 1
+            }
+        }
+        rt.buf_push_bytes(out, px, ts * ts * 4)
+        rt.heap_free(px, ts * ts * 4)
+        t = t + 1
+    }
+    rt.buf_free(&path)
+    return found
+}
+
+fn edge(ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64) -> f64 {
+    return (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+}
+
+// Draws one triangle (screen coordinates in pixels, depth, uv in 0..16).
+fn tri(img: u64, dep: u64, size: usize, tex: u64, ts: usize,
+       x0: f64, y0: f64, d0: f64, u0: f64, v0: f64,
+       x1: f64, y1: f64, d1: f64, u1: f64, v1: f64,
+       x2: f64, y2: f64, d2: f64, u2: f64, v2: f64) {
+    let area: f64 = edge(x0, y0, x1, y1, x2, y2)
+    if area < 0.000001 && area > 0.0 - 0.000001 { return }
+    var py: usize = 0
+    while py < size {
+        var px: usize = 0
+        while px < size {
+            let cx: f64 = (px as f64) + 0.5
+            let cy: f64 = (py as f64) + 0.5
+            let w0: f64 = edge(x1, y1, x2, y2, cx, cy) / area
+            let w1: f64 = edge(x2, y2, x0, y0, cx, cy) / area
+            let w2: f64 = 1.0 - w0 - w1
+            let eps: f64 = 0.0 - 0.00001
+            if w0 >= eps && w1 >= eps && w2 >= eps {
+                let u: f64 = w0 * u0 + w1 * u1 + w2 * u2
+                let v: f64 = w0 * v0 + w1 * v1 + w2 * v2
+                var tx: i64 = math.floor(u / 16.0 * (ts as f64)) as i64
+                var ty: i64 = math.floor(v / 16.0 * (ts as f64)) as i64
+                if tx < 0 { tx = 0 }
+                if ty < 0 { ty = 0 }
+                if tx >= (ts as i64) { tx = (ts as i64) - 1 }
+                if ty >= (ts as i64) { ty = (ts as i64) - 1 }
+                let c: u32 = rt.ld32(tex, (ty as usize) * ts + (tx as usize))
+                let d: f64 = w0 * d0 + w1 * d1 + w2 * d2
+                let di: usize = py * size + px
+                let old: f64 = math.math_f64(rt.ld64(dep, di))
+                if ((c >> 24 as u32) & 255 as u32) > (0 as u32) && d > old {
+                    rt.st64(dep, di, math.math_bits(d))
+                    rt.st32(img, di, c)
+                }
+            }
+            px = px + 1
+        }
+        py = py + 1
+    }
+}
+
+// Renders all quads of `b` seen from direction `view` into img (size*size u32, cleared to 0 = transparent first).
+// `tex` = the pixels of baked_load_textures (ts*ts u32 per texture).
+fn ref_render(b: *mut mc_model.Baked, tex: u64, ts: usize, view: usize, size: usize, img: u64) {
+    let dep: u64 = rt.heap_alloc(size * size * 8)
+    var i: usize = 0
+    while i < size * size {
+        rt.st32(img, i, 0 as u32)
+        rt.st64(dep, i, math.math_bits(0.0 - 1000000.0))
+        i = i + 1
+    }
+    let dv: mc_model.V3 = mc_model.dir_vec(view)
+    var qd: usize = 0
+    while qd < mc_model.baked_count(b) {
+        var sx: [f64; 4] = [0.0; 4]
+        var sy: [f64; 4] = [0.0; 4]
+        var sd: [f64; 4] = [0.0; 4]
+        var k: usize = 0
+        while k < 4 {
+            let x: f64 = mc_model.baked_f(b, qd, mc_model.X0 + k)
+            let y: f64 = mc_model.baked_f(b, qd, mc_model.Y0 + k)
+            let z: f64 = mc_model.baked_f(b, qd, mc_model.Z0 + k)
+            sx[k] = mc_model.canon_u(view, x * 16.0, y * 16.0, z * 16.0) / 16.0 * (size as f64)
+            sy[k] = mc_model.canon_v(view, x * 16.0, y * 16.0, z * 16.0) / 16.0 * (size as f64)
+            sd[k] = x * dv.x + y * dv.y + z * dv.z
+            k = k + 1
+        }
+        let t: usize = mc_model.baked_f(b, qd, mc_model.W_TEX) as usize
+        let tp: u64 = tex + ((t * ts * ts * 4) as u64)
+        let u0: f64 = mc_model.baked_f(b, qd, mc_model.U0)
+        let u1: f64 = mc_model.baked_f(b, qd, mc_model.U0 + 1)
+        let u2: f64 = mc_model.baked_f(b, qd, mc_model.U0 + 2)
+        let u3: f64 = mc_model.baked_f(b, qd, mc_model.U0 + 3)
+        let v0: f64 = mc_model.baked_f(b, qd, mc_model.V0)
+        let v1: f64 = mc_model.baked_f(b, qd, mc_model.V0 + 1)
+        let v2: f64 = mc_model.baked_f(b, qd, mc_model.V0 + 2)
+        let v3: f64 = mc_model.baked_f(b, qd, mc_model.V0 + 3)
+        tri(img, dep, size, tp, ts, sx[0], sy[0], sd[0], u0, v0, sx[1], sy[1], sd[1], u1, v1, sx[2], sy[2], sd[2], u2, v2)
+        tri(img, dep, size, tp, ts, sx[0], sy[0], sd[0], u0, v0, sx[2], sy[2], sd[2], u2, v2, sx[3], sy[3], sd[3], u3, v3)
+        qd = qd + 1
+    }
+    rt.heap_free(dep, size * size * 8)
+}
