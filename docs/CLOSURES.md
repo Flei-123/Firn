@@ -101,5 +101,18 @@ let s = option.opt_some[i32]             // module qualified
 * Inside a template body `mono.rs::subst_expr` (firnc1: `copy_expr_inner` -> `inst_rewrite`) substitutes the type
   parameters of such an identifier.
 * Type arguments may be fn types: `pass[fn(i32) -> i32](inc)`, `Holder[fn(i32) -> i32]{..}`.
-* NOT done: inference from the expected `fn` type (`apply(id, 4)` is an error with a hint to write `id[i32]`);
-  methods as values (`x.m` without a call). Tests 4280, 4282 (neg 4281).
+* r742: a generic function WITHOUT type arguments takes them from the expected `fn(..)` type:
+  `apply(id, 4)`, `let f: fn(i32) -> i32 = dbl`, `g = dbl`, struct field `Ops { f: dbl }`, `return dbl`,
+  `fn(*mut Vec[i32]) -> i32` against `count[T](v: *mut Vec[T])` (generic struct instances unify by their arguments).
+  Without an expected fn type (`let f = id`) it stays an error (`unknown name`, hint). A type parameter the
+  fn type does not fix is an error (`cannot infer the type parameter 'U' of 'conv' ...`).
+  firnc0: `lambda.rs::value_rewrite` + `sema_generic::infer_fn_value` + `mono::expand_late` (instances recorded after
+  `mono::expand`; the lambda pass runs again over the new bodies). firnc1: `lamsugar.fi` calls the hook
+  `mono.gen_infer_value` (`unify_ty`), `gen_run` expands the new instances and runs the pass again.
+  Limits: firnc1 does not detect a local variable named like the generic fn (flat tree); `mod.f` (qualified) only in firnc0.
+* r742: methods as values: `Type.m` (no call) is the plain function `Type__m`, receiver pointer = first parameter:
+  `let f = Acc.bump; f(&a, 4)`, `apply(Acc.bump, ..)`, struct field. A BOUND receiver (`x.m` without a call) is NOT supported:
+  firnc0 reports `method 'm' of 'T' used as a value without a call` (hint: `Type.m` or `|a| x.m(a)`); firnc1 leaves it to the type checker.
+* r742: lambda assignment targets (`x.f = |a| ..`) find the type of the target through method-call results
+  (`let x = obj.method()`), `try f()`, cast, address-of, module statics/consts (firnc0) and are block scoped
+  (a `let` in an inner block that shadows with another type ends with the block; `for` variables shadow). Tests 4300-4304.
