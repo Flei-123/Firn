@@ -159,7 +159,8 @@ C4BAD=$(grep -o ' bad=[0-9]*' "$W/ct4.out" | head -1 | cut -d= -f2)
 [ "${C4BAD:-1}" -eq 0 ] || { echo "  FAIL  craft: inv bad=${C4BAD:-?}"; ERR=1; }
 case "$C4P" in *"x4 g1=3 g3=3 "*) ;; *) echo "  FAIL  craft: predicted result after 3 drags $C4P"; ERR=1;; esac
 case "$C4L" in *"res=-1x0 "*"s20="*"x12 "*"x14 g1=0 g3=0 cursor=0 "*) ;; *) echo "  FAIL  craft: local result $C4L"; ERR=1;; esac
-case "$C4L" in *" srv=0 "*) ;; *) echo "  FAIL  craft: the server had to correct the prediction ($C4L)"; ERR=1;; esac
+# up to 1.20.2 the server stays silent when the prediction is exact (srv=0); from 1.21.x it re-sends the result slot after every grid change by itself (srv is info only there)
+if [ "$PROTO" -le 764 ]; then case "$C4L" in *" srv=0 "*) ;; *) echo "  FAIL  craft: the server had to correct the prediction ($C4L)"; ERR=1;; esac; fi
 INV4=$(grep 'Player12 has the following entity data' "$W/server.log" | tail -1)
 python3 - "$INV4" <<'PY' || ERR=1
 import re,sys
