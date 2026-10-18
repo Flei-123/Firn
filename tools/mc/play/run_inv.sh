@@ -176,6 +176,46 @@ for m in re.finditer(r'\{[^{}]*Slot: (\d+)b[^{}]*\}', t):
 print("  server inventory: totals=%s slot20=%s" % (tot, at20))
 sys.exit(0 if tot.get("stick")==12 and tot.get("oak_planks")==14 and at20==("stick",12) else 1)
 PY
+# ---- crafting table 3x3 (MCPLAY_TABLE_TEST, r158 round 2): table next to the player; 12 planks -> 6 in grid slots 1 and 4 -> stick x4, RIGHT click takes it, shift click crafts
+# the rest (12 sticks, 6 planks left); then a cake (3 milk buckets, 2 sugar, egg, 3 wheat): right click on the result, the 3 buckets stay in the grid. After the window closes
+# the server returns the grid, so its inventory must hold stick 12, oak_planks 6, cake 1, bucket 3 and no milk / sugar / egg / wheat.
+MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_TABLE_TEST=1 MCPLAY_RUN_S=34 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player13 > "$W/tt.out" 2>&1 &
+PP=$!
+sleep 5
+echo "gamemode survival Player13" >&3
+for g in "oak_planks 12" "milk_bucket 3" "sugar 2" "egg 1" "wheat 3"; do echo "give Player13 $g" >&3; done
+echo "execute at Player13 run setblock ~1 ~ ~ minecraft:crafting_table" >&3
+sleep 24
+echo "data get entity Player13 Inventory" >&3
+sleep 2
+wait $PP
+TTO=$(grep 'mcplay: tabletest open' "$W/tt.out" | head -1)
+TTP=$(grep 'mcplay: tablepre ' "$W/tt.out" | head -1)
+TTP2=$(grep 'mcplay: tablepre2' "$W/tt.out" | head -1)
+TTL=$(grep 'mcplay: tabletest res=' "$W/tt.out" | head -1)
+echo "  $TTO"; echo "  $TTP"; echo "  $TTP2"; echo "  $TTL"
+TTBAD=$(grep -o ' bad=[0-9]*' "$W/tt.out" | head -1 | cut -d= -f2)
+[ "${TTBAD:-1}" -eq 0 ] || { echo "  FAIL  table: inv bad=${TTBAD:-?}"; ERR=1; }
+case "$TTP" in *"x4 "*"g1=3 g4=3 cursor=0"*) ;; *) echo "  FAIL  table: predicted stick result $TTP"; ERR=1;; esac
+case "$TTP2" in *"res="*"x1 "*) ;; *) echo "  FAIL  table: no cake predicted $TTP2"; ERR=1;; esac
+case "$TTL" in *"res=-1x0 stick=12 planks=6 cake=1 bucket=3 milk=0 sugar=0 egg=0 wheat=0 "*"cursor=0 "*) ;; *) echo "  FAIL  table: local result $TTL"; ERR=1;; esac
+# up to 1.20.2 the server stays silent when the prediction is exact; from 1.21.x it re-sends slots after every change (srv is info only there)
+if [ "$PROTO" -le 764 ]; then case "$TTL" in *" srv=0") ;; *) echo "  FAIL  table: the server had to correct the prediction ($TTL)"; ERR=1;; esac; fi
+INV5=$(grep 'Player13 has the following entity data' "$W/server.log" | tail -1)
+python3 - "$INV5" <<'PY' || ERR=1
+import re,sys
+t=sys.argv[1]
+tot={}
+for m in re.finditer(r'\{[^{}]*Slot: (\d+)b[^{}]*\}', t):
+    c=re.search(r'(?:Count: |count: )(\d+)', m.group(0))
+    i=re.search(r'(?:id: |id:)"minecraft:(\w+)"', m.group(0))
+    if c and i: tot[i.group(1)]=tot.get(i.group(1),0)+int(c.group(1))
+print("  server inventory (table): totals=%s" % tot)
+want={"stick":12,"oak_planks":6,"cake":1,"bucket":3}
+ok=all(tot.get(k)==v for k,v in want.items()) and not any(k in tot for k in ("milk_bucket","sugar","egg","wheat"))
+sys.exit(0 if ok else 1)
+PY
 # ---- chest window (MCPLAY_CHEST_TEST): a chest next to the player (10 stone, 6 dirt, 64 stone); Open Window -> Window Items -> shift click both ways, pick up,
 # drag over four container slots, close; the chest content and the player's hotbar on the server must equal the client's prediction
 MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CHEST_TEST=1 MCPLAY_RUN_S=28 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \

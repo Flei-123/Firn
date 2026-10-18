@@ -35,8 +35,9 @@
 //   and shapeless recipes of minecraft-data; special recipes such as banners, fireworks, dyeing, repair are not in the table and stay with the server),
 //   and the result slot itself is clickable: left click takes the stack to the cursor (or merges it into an equal carried stack) and uses up one of every
 //   ingredient, shift click crafts repeatedly into main inventory + hotbar until the inventory is full or the ingredients run out (CraftingMenu /
-//   InventoryMenu.quickMoveStack). Right click / hotbar swap / drop on the result slot, and recipes with a remainder item (milk bucket, honey bottle, ...),
-//   are left to the server. Without inv_use_recipes nothing changes (the result slot is only what the server sent).
+//   InventoryMenu.quickMoveStack). Right click works like left click (ResultSlot takes the whole result); hotbar swap / drop on the result slot stay with the server.
+//   Recipes with a remainder item (milk bucket -> bucket, honey bottle / dragon's breath -> glass bottle) put it back into the ingredient's grid slot; when that
+//   is impossible (stack of several honey bottles, unknown remainder such as a potion) the click is left to the server. Without inv_use_recipes nothing changes (the result slot is only what the server sent).
 //   inv_window(i) / inv_window_slots(i) / inv_win_item(i, k) / inv_win_count(i, k) / inv_close_window(cl, i)
 import std.rt
 import std.bytes
@@ -1907,9 +1908,36 @@ fn inv_craft_refresh(v: *mut Inv, snap: u64) {
     }
 }
 
-// does using up the ingredients leave an item behind (bucket of milk -> bucket, honey bottle -> glass bottle)? Judged by the registry name.
-fn craft_has_remainder(v: *mut Inv) -> bool {
-    if (*v).reg == 0 { return false }
+// Remainder item (vanilla Item.getCraftingRemainingItem) left behind when ONE `it` is used up in a recipe: item id, -1 = none,
+// -2 = unknown / not modelled (the click is left to the server). Water / lava / milk / powder snow bucket -> bucket, honey bottle / dragon's
+// breath -> glass bottle. Any other bucket or potion is judged "unknown" on purpose.
+fn craft_remainder(v: *mut Inv, it: i32) -> i32 {
+    if (*v).reg == 0 { return 0 - 1 }
+    var n: usize = 0
+    let p: u64 = mc_registry.reg_item_name((*v).reg as *mut mc_registry.Registry, it, &n)
+    if p == 0 || n == 0 { return 0 - 1 }
+    var id: i32 = 0 - 1
+    var hit: bool = false
+    if name_ends(p, n, "water_bucket") || name_ends(p, n, "lava_bucket") || name_ends(p, n, "milk_bucket") || name_ends(p, n, "powder_snow_bucket") {
+        hit = true
+        id = mc_registry.reg_item_by_name((*v).reg as *mut mc_registry.Registry, "bucket".p as u64, 6)
+    }
+    if name_ends(p, n, "honey_bottle") || name_ends(p, n, "dragon_breath") {
+        hit = true
+        id = mc_registry.reg_item_by_name((*v).reg as *mut mc_registry.Registry, "glass_bottle".p as u64, 12)
+    }
+    if hit {
+        if id < 0 { return 0 - 2 }
+        return id
+    }
+    if name_ends(p, n, "_bucket") || name_ends(p, n, "potion") { return 0 - 2 }
+    return 0 - 1
+}
+
+// Can the click on the result slot be predicted? The remainder is put back into its own grid slot (vanilla ResultSlot.onTake); that works when the
+// ingredient stack has exactly one item (buckets always do). A bigger stack (honey bottles x5) sends the remainder to the player inventory
+// (Inventory.add) and an unknown remainder is not modelled: both stay with the server.
+fn craft_blocked(v: *mut Inv) -> bool {
     var rs: i32 = 0
     var first: i32 = 0
     var gw: i32 = 0
@@ -1918,18 +1946,16 @@ fn craft_has_remainder(v: *mut Inv) -> bool {
     while i < gw * gw {
         let it: i32 = inv_item(v, first + i)
         if it >= 0 && inv_count(v, first + i) > 0 {
-            var n: usize = 0
-            let p: u64 = mc_registry.reg_item_name((*v).reg as *mut mc_registry.Registry, it, &n)
-            if p != 0 && n > 0 {
-                if name_ends(p, n, "_bucket") || name_ends(p, n, "honey_bottle") || name_ends(p, n, "potion") || name_ends(p, n, "dragon_breath") { return true }
-            }
+            let rem: i32 = craft_remainder(v, it)
+            if rem == 0 - 2 { return true }
+            if rem >= 0 && inv_count(v, first + i) > 1 { return true }
         }
         i = i + 1
     }
     return false
 }
 
-// ResultSlot.onTake: one of every ingredient is used up, then the result is recomputed
+// ResultSlot.onTake: one of every ingredient is used up (a remainder item takes the place of a single-item ingredient), then the result is recomputed
 fn craft_consume(v: *mut Inv) {
     var rs: i32 = 0
     var first: i32 = 0
@@ -1940,7 +1966,10 @@ fn craft_consume(v: *mut Inv) {
         let it: i32 = inv_item(v, first + i)
         let c: i32 = inv_count(v, first + i)
         if it >= 0 && c > 0 {
-            if c <= 1 { put_slot(v, first + i, 0 - 1, 0) } else { put_slot_e(v, first + i, it, c - 1, inv_eff(v, first + i)); set_extra(v, first + i, inv_sig(v, first + i), inv_max_stack(v, first + i)) }
+            if c <= 1 {
+                let rem: i32 = craft_remainder(v, it)
+                if rem >= 0 { put_slot(v, first + i, rem, 1) } else { put_slot(v, first + i, 0 - 1, 0) }
+            } else { put_slot_e(v, first + i, it, c - 1, inv_eff(v, first + i)); set_extra(v, first + i, inv_sig(v, first + i), inv_max_stack(v, first + i)) }
         }
         i = i + 1
     }
@@ -1949,13 +1978,14 @@ fn craft_consume(v: *mut Inv) {
 
 // click on the result slot `rs` (internal number). 0 = not predictable, 1 = predicted, 2 = predicted shift click (`lg` = legacy clicked stack)
 fn craft_result_click(v: *mut Inv, rs: i32, button: i32, mode: i32, lg: *mut Stk) -> i32 {
-    if !((mode == 0 && button == 0) || (mode == 1 && (button == 0 || button == 1))) { return 0 }
+    // PICKUP with either button takes the whole result (ResultSlot.remove ignores the amount) or merges it into an equal cursor stack; SWAP / THROW stay with the server
+    if !((mode == 0 && (button == 0 || button == 1)) || (mode == 1 && (button == 0 || button == 1))) { return 0 }
     var r: Stk = stk_new()
     var cu: Stk = stk_new()
     var t: Stk = stk_new()
     load(v, rs, &r)
     if r.item < 0 || r.count <= 0 { return 1 }
-    if craft_has_remainder(v) { return 0 }
+    if craft_blocked(v) { return 0 }
     if mode == 0 {
         load(v, SLOT_CUR, &cu)
         if cu.item < 0 || cu.count <= 0 {
@@ -1976,6 +2006,7 @@ fn craft_result_click(v: *mut Inv, rs: i32, button: i32, mode: i32, lg: *mut Stk
     while guard < 128 {
         load(v, rs, &r)
         if r.item < 0 || r.count <= 0 { break }
+        if craft_blocked(v) { break }
         stk_n(&r, r.count, &w)
         if !move_to(v, &w, 9, 45, true) { break }
         craft_consume(v)
