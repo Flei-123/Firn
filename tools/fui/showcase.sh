@@ -63,6 +63,10 @@ done
 "$FIRNC" --opt-level=dev -o "$T/wave5" tools/fui/wave5_main.fi
 "$T/wave5" "$T/img" > /dev/null
 
+# WAVE 6 (lib/fui/wave6.fi): property grid + half-open modal bottom sheet with a grid as body -- light, dark
+"$FIRNC" --opt-level=dev -o "$T/wave6" tools/fui/wave6_main.fi
+"$T/wave6" "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/
