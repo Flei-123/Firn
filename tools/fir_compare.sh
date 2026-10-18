@@ -58,12 +58,12 @@ KNOWN="tests/590_f64.fi tests/871_closure_plain.fi"
 # with an `import` line (even an unused one) therefore compares two different inputs, like the
 # note at the top says. By default such files are counted under IMPORTS and not compared; cross-module lowering
 # is covered by tools/fixpoint.sh, tools/self_compare.sh and tools/prune_compare.sh (real compiles).
-# OPT-IN (r765): `FIR_IMPORTS_STEP=N` compares every N-th such file (N=1: all, ~5-20 s each) against
+# ON BY DEFAULT with N=8 (r783: 61 SAME / 0 DIFFERENT; `FIR_IMPORTS_STEP=0` switches it off, `=1` compares all). `FIR_IMPORTS_STEP=N` compares every N-th such file (N=1: all, ~5-20 s each) against
 # `firnc1` with `FIRN_EMIT_FIR_RAW=1` (the real module loader) through tools/fir_norm.py (function order, build
 # path, @text numbering normalised; two named runtime functions ignored). The result goes to the extra lines
 # IMPORTS SAME / IMPORTS DIFFERENT and NEVER changes the exit code. Known rest: programs that use `gc` allocation
 # expressions (r767).
-IMPORTS_STEP=${FIR_IMPORTS_STEP:-0}
+IMPORTS_STEP=${FIR_IMPORTS_STEP:-8}
 FIRNC1=""
 if [ "$IMPORTS_STEP" -gt 0 ]; then
     FIRNC1="$TMPD"/firnc1
