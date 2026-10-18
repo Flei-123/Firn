@@ -3085,6 +3085,7 @@ mod tests {
                 let args: Vec<String> = a.iter().map(dump).collect();
                 format!("{}({})", n, args.join(","))
             }
+            ExprKind::Named(n, v, _) => format!("{}:{}", n, dump(v)),
             ExprKind::Syscall(a) => {
                 let args: Vec<String> = a.iter().map(dump).collect();
                 format!("syscall({})", args.join(","))
