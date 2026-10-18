@@ -1,0 +1,1288 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/mobile.fi -- MOBILE-APP COMPONENTS IN A FEW LINES (card, section, list tile, app bar, bottom nav, chips, segmented control,
+// text field, chat bubble, empty state, skeleton, spinner, pill). docs/fui-mobile.md.
+//
+// WHY: a phone screen is built from the same ten parts everywhere (cards, rows with a chevron, a bar on top, tabs at the bottom, a
+// field that spans the screen). fui.app gives labels and buttons; each of these parts took twenty lines of node, class and
+// padding calls. Here each is ONE call, with the look of the mobile web app (public/style.css, @media max-width 760px):
+// radius 16 cards, 12 fields, round pills, 44 pt touch targets, the type scale of docs/fui-mobile.md.
+//
+// HOW: a component is a container (card, section, chip_row, bottom_nav, segmented, bubble_open: open it, add children, `app.end(a)`)
+// or a leaf (list_tile, text_field, pill, skeleton: one call). Everything is built from the stock parts: scene boxes with
+// style-sheet classes (ONE set of rules per window, made on the first call), KIND_BUTTON containers (focus, Enter / space, the
+// pressed state), fui.app entries and text areas, appctl skeleton / spinner. Colours are THEME TOKENS only (style.TOK_*), so a
+// theme (hell / dunkel / webtheme) restyles every component. Strings are POINTED AT, not copied: pass literals or text that lives
+// as long as the window (no 256 byte cap, unlike app.label).
+//
+// CALLBACKS: `fn(*mut app.App, usize)` -- the second argument says what was meant (index in a nav / segmented / chip row, the
+// node of a tile). One shared click handler finds the node through app.activated(a).
+//
+// LIMITS: a window has 64 style rules (sheet.RULE_MAX); the components use 28 of them. One window at a time (the tap table is a
+// static). 8 text fields per window (app.ENTRIES_MAX) -- text_field / text_area count against them.
+import std.rt
+import fui.app
+import fui.appctl
+import fui.scene
+import fui.style
+import fui.sheet
+import fui.flex
+import fui.widget
+import fui.render
+import fui.icons
+import fui.listrow
+import fui.a11y
+import fui.theme
+import fui.webtheme
+import fui.textarea
+import window.hostmetrics
+
+export {
+    // setup
+    install, sync, page, is_installed, rules_used,
+    // containers and leaves
+    card, section, list_tile, divider,
+    app_bar, app_bar_center,
+    bottom_nav, nav_item, nav_badge, nav_item_count,
+    chip_row, chip, chip_closable, chip_selected, set_chip_selected,
+    segmented, segment, selected, select,
+    text_field, text_area, field_error, field_error_node, fit_text_area, text_area_rows_of,
+    bubble, bubble_open, bubble_node_text,
+    empty_state, skeleton, spinner, pill, badge,
+    text, text_class,
+    // classes (for programs that style their own nodes the same way)
+    K_CARD, K_FLAT, K_FLAT_BASE, K_FLAT_FIELD, K_PRESS, K_FIELD,
+    // sizes
+    TOUCH_PT, BAR_H, NAV_H, R_CARD, R_FIELD, R_PILL, R_BUBBLE, PAGE_MARGIN,
+    PILL_OK, PILL_WARN, PILL_DIM,
+    TAP_MAX, NONE,
+    K_SEG_ON, K_SEG_ITEM, K_NAV_ON, K_NAV_ITEM, K_CHIP_ON, K_PILL_OK, K_PILL_WARN, K_BUBBLE_BOT, K_BADGE, K_APPBAR, K_NAV,
+}
+
+// ------------------------------------------------------------------------------------------------ sizes (design points)
+const TOUCH_PT: usize = 44
+const BAR_H: usize = 56
+const NAV_H: usize = 56
+const R_CARD: usize = 16
+const R_FIELD: usize = 12
+const R_PILL: usize = 999
+const R_BUBBLE: usize = 18
+const PAGE_MARGIN: usize = 12
+const BUBBLE_PCT: i64 = 82
+const NONE: usize = 4294967295
+
+const PILL_DIM: u32 = 0
+const PILL_OK: u32 = 1
+const PILL_WARN: u32 = 2
+
+// ------------------------------------------------------------------------------------------------ classes
+const K_BASE: u32 = 19712 // 0x4D00: far from the small numbers programs use for their own classes
+const K_FLAT: u32 = 19718 // flat button on the card / nav colour (surface)
+const K_FLAT_BASE: u32 = 19740 // ... on the page colour (app bar, chips)
+const K_FLAT_FIELD: u32 = 19741 // ... on the field colour (segmented track)
+const K_PRESS: u32 = 19719
+const K_APPBAR: u32 = 19720
+const K_NAV: u32 = 19721
+const K_NAV_ITEM: u32 = 19722
+const K_NAV_ON: u32 = 19723
+const K_CHIP: u32 = 19724
+const K_CHIP_ON: u32 = 19725
+const K_SEG: u32 = 19726
+const K_SEG_ITEM: u32 = 19727
+const K_SEG_ON: u32 = 19728
+const K_FIELD: u32 = 19729
+const K_ERR: u32 = 19730
+const K_BUBBLE_BOT: u32 = 19733
+const K_PILL_OK: u32 = 19735
+const K_PILL_WARN: u32 = 19736
+const K_BADGE: u32 = 19737
+const K_ROOT: u32 = 19738 // marks the page root
+const K_CENTER: u32 = 19739
+const K_CARD: u32 = webtheme.K_CARD // the card class is webtheme's (panel, hairline, radius 16, small shadow)
+
+// ------------------------------------------------------------------------------------------------ state (one window)
+const TAP_MAX: usize = 256
+const KIND_PLAIN: u32 = 0
+const KIND_NAV: u32 = 1
+const KIND_SEG: u32 = 2
+const GRP_MAX: usize = 16
+
+static mut G_APP: u64 = 0
+static mut G_RULES: usize = 0
+static mut G_DARK: bool = false
+static mut G_PAGE: bool = false
+static mut G_VIEW_W: f64 = 0.0
+static mut TAP_N: usize = 0
+static mut TAP_NODE: [usize; 256] = [4294967295; 256]
+static mut TAP_ARG: [usize; 256] = [0; 256]
+static mut TAP_KIND: [u32; 256] = [0 as u32; 256]
+static mut TAP_CBS: u64 = 0 // heap tables of callbacks (a static cannot hold function values): 256 / 16 slots of 8 bytes
+static mut GRP_N: usize = 0
+static mut GRP_NODE: [usize; 16] = [4294967295; 16]
+static mut GRP_SEL: [usize; 16] = [0; 16]
+static mut GRP_CBS: u64 = 0
+static mut ERR_N: usize = 0
+static mut ERR_FIELD: [usize; 8] = [4294967295; 8]
+static mut ERR_NODE: [usize; 8] = [4294967295; 8]
+static mut BADGE_N: [usize; 64] = [0; 64]
+
+fn cb_none(a: *mut app.App, i: usize) {
+}
+
+fn tap_cb(i: usize) -> fn(*mut app.App, usize) {
+    if TAP_CBS == 0 || i >= TAP_MAX {
+        return cb_none
+    }
+    return *((TAP_CBS + (i * 8) as u64) as *mut fn(*mut app.App, usize))
+}
+
+fn tap_cb_put(i: usize, f: fn(*mut app.App, usize)) {
+    if TAP_CBS == 0 {
+        TAP_CBS = rt.heap_alloc(TAP_MAX * 8)
+    }
+    if TAP_CBS != 0 && i < TAP_MAX {
+        *((TAP_CBS + (i * 8) as u64) as *mut fn(*mut app.App, usize)) = f
+    }
+}
+
+fn grp_cb(i: usize) -> fn(*mut app.App, usize) {
+    if GRP_CBS == 0 || i >= GRP_MAX {
+        return cb_none
+    }
+    return *((GRP_CBS + (i * 8) as u64) as *mut fn(*mut app.App, usize))
+}
+
+fn grp_cb_put(i: usize, f: fn(*mut app.App, usize)) {
+    if GRP_CBS == 0 {
+        GRP_CBS = rt.heap_alloc(GRP_MAX * 8)
+    }
+    if GRP_CBS != 0 && i < GRP_MAX {
+        *((GRP_CBS + (i * 8) as u64) as *mut fn(*mut app.App, usize)) = f
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ rules
+fn tok(t: u32) -> u32 {
+    return style.color_token(t)
+}
+
+fn rule(a: *mut app.App, s: sheet.Sel, st: style.Style) {
+    let r: usize = sheet.sheet_rule(&(*a).sh, s, st)
+}
+
+fn cls(c: u32) -> sheet.Sel {
+    return sheet.sel_class(c)
+}
+
+// The rules of the components, made once per window ON TOP of webtheme (type steps, card, pill, bubble are webtheme's classes).
+// Colours are theme tokens only, so a theme switch restyles everything.
+fn install(a: *mut app.App) {
+    if G_APP == a as u64 {
+        return
+    }
+    if !webtheme.rules_installed() {
+        webtheme.install(a, webtheme.MODE_DARK)
+    }
+    G_APP = a as u64
+    G_PAGE = false
+    G_VIEW_W = 0.0
+    TAP_N = 0
+    GRP_N = 0
+    ERR_N = 0
+    let n0: usize = sheet.sheet_count(&(*a).sh)
+    // flat buttons (tile, chip part, nav item, bar button): no chrome of their own. NOT transparent: the animation registry
+    // (draw_button -> anim_run) writes a transparent target back as literal black, so each button takes the colour of what it sits on.
+    var st: style.Style = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_SURFACE))
+    st = style.style_set_border(st, tok(style.TOK_SEPARATOR), 0)
+    st = style.style_set_radius(st, R_FIELD)
+    st = style.style_set_pad(st, 0, 0)
+    rule(a, cls(K_FLAT), st)
+    st = style.style_set_bg(st, tok(style.TOK_BASE))
+    rule(a, cls(K_FLAT_BASE), st)
+    st = style.style_set_bg(st, tok(style.TOK_FIELD))
+    rule(a, cls(K_FLAT_FIELD), st)
+    // hover and pressed state of anything pressable
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_BUTTON_HOVER))
+    rule(a, sheet.sel_with_state(cls(K_PRESS), style.STATE_HOVER), st)
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_BUTTON_ACTIVE))
+    rule(a, sheet.sel_with_state(cls(K_PRESS), style.STATE_ACTIVE), st)
+    // centred text (app bar title)
+    st = style.style_new()
+    st = style.style_set_align(st, style.ALIGN_CENTER)
+    rule(a, cls(K_CENTER), st)
+    // app bar
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_BASE))
+    rule(a, cls(K_APPBAR), st)
+    // bottom navigation
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_SURFACE))
+    st = style.style_set_border(st, tok(style.TOK_SEPARATOR), 1)
+    st = style.style_set_radius(st, 0)
+    rule(a, cls(K_NAV), st)
+    st = style.style_new()
+    st = style.style_set_fg(st, tok(style.TOK_TEXT_MUTED))
+    st = style.style_set_font(st, 0, 11)
+    rule(a, cls(K_NAV_ITEM), st)
+    st = style.style_new()
+    st = style.style_set_fg(st, tok(style.TOK_ACCENT))
+    rule(a, cls(K_NAV_ON), st)
+    // chips: outline pills; selected = accent outline and text
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_BASE))
+    st = style.style_set_fg(st, tok(style.TOK_TEXT))
+    st = style.style_set_border(st, tok(style.TOK_SEPARATOR), 1)
+    st = style.style_set_radius(st, R_PILL)
+    st = style.style_set_font(st, 0, 13)
+    rule(a, cls(K_CHIP), st)
+    st = style.style_new()
+    st = style.style_set_fg(st, tok(style.TOK_ACCENT))
+    st = style.style_set_border(st, tok(style.TOK_ACCENT), 1)
+    rule(a, cls(K_CHIP_ON), st)
+    // segmented control: a field-coloured track, the chosen segment raised
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_FIELD))
+    st = style.style_set_border(st, tok(style.TOK_SEPARATOR), 1)
+    st = style.style_set_radius(st, R_FIELD)
+    rule(a, cls(K_SEG), st)
+    st = style.style_new()
+    st = style.style_set_fg(st, tok(style.TOK_TEXT_MUTED))
+    st = style.style_set_radius(st, 9)
+    st = style.style_set_font(st, 0, 14)
+    st = style.style_set_align(st, style.ALIGN_CENTER)
+    rule(a, cls(K_SEG_ITEM), st)
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_SURFACE_RAISED))
+    st = style.style_set_fg(st, tok(style.TOK_TEXT))
+    st = style.style_set_weight(st, 700 as u32)
+    rule(a, cls(K_SEG_ON), st)
+    // text field: field colours, radius 12, accent line while focused
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_FIELD))
+    st = style.style_set_border(st, tok(style.TOK_BORDER), 1)
+    st = style.style_set_radius(st, R_FIELD)
+    st = style.style_set_pad(st, 14, 12)
+    st = style.style_set_font(st, 0, 14)
+    rule(a, cls(K_FIELD), st)
+    st = style.style_new()
+    st = style.style_set_border(st, tok(style.TOK_ACCENT), 1)
+    rule(a, sheet.sel_with_state(cls(K_FIELD), style.STATE_FOCUS), st)
+    // the assistant's bubble: panel with a hairline (mine = webtheme.K_BUBBLE)
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_SURFACE))
+    st = style.style_set_fg(st, tok(style.TOK_TEXT))
+    st = style.style_set_border(st, tok(style.TOK_SEPARATOR), 1)
+    st = style.style_set_radius(st, R_BUBBLE)
+    rule(a, cls(K_BUBBLE_BOT), st)
+    // pill colours (the base pill is webtheme.K_PILL)
+    st = style.style_new()
+    st = style.style_set_fg(st, tok(style.TOK_SUCCESS))
+    st = style.style_set_border(st, tok(style.TOK_SUCCESS), 1)
+    rule(a, cls(K_PILL_OK), st)
+    st = style.style_new()
+    st = style.style_set_fg(st, tok(style.TOK_ERROR))
+    st = style.style_set_border(st, tok(style.TOK_ERROR), 1)
+    rule(a, cls(K_PILL_WARN), st)
+    // count badge on a nav icon
+    st = style.style_new()
+    st = style.style_set_bg(st, tok(style.TOK_ACCENT))
+    st = style.style_set_fg(st, tok(style.TOK_TEXT_ON_ACCENT))
+    st = style.style_set_radius(st, R_PILL)
+    st = style.style_set_pad(st, 5, 1)
+    st = style.style_set_font(st, 0, 10)
+    st = style.style_set_weight(st, 700 as u32)
+    rule(a, cls(K_BADGE), st)
+    st = style.style_new()
+    st = style.style_set_fg(st, tok(style.TOK_ERROR))
+    st = style.style_set_font(st, 0, 12)
+    rule(a, cls(K_ERR), st)
+    G_RULES = sheet.sheet_count(&(*a).sh) - n0
+}
+
+fn is_installed(a: *mut app.App) -> bool {
+    return G_APP == a as u64
+}
+
+// How many style rules the components made (28), for tests and for budgeting the 64 of a window.
+fn rules_used() -> usize {
+    return G_RULES
+}
+
+// ------------------------------------------------------------------------------------------------ node helpers
+fn sc_of(a: *mut app.App) -> *mut scene.Scene {
+    return &(*a).sc
+}
+
+fn top(a: *mut app.App) -> usize {
+    return (*a).stack[(*a).depth - 1]
+}
+
+fn push(a: *mut app.App, b: usize) -> bool {
+    if (*a).depth >= 16 {
+        return false
+    }
+    (*a).stack[(*a).depth] = b
+    (*a).depth = (*a).depth + 1
+    return true
+}
+
+fn add_class(a: *mut app.App, n: usize, c: u32) {
+    if n != NONE {
+        let r: bool = scene.node_add_class(sc_of(a), n, c)
+    }
+}
+
+fn drop_class(a: *mut app.App, n: usize, c: u32) {
+    if n != NONE {
+        let r: bool = scene.node_remove_class(sc_of(a), n, c)
+    }
+}
+
+// A box (no painter of its own) under `p` with the style class `c`.
+fn box_in(a: *mut app.App, p: usize, c: u32, dir: u32, justify: u32, align: u32) -> usize {
+    let b: usize = scene.scene_box(sc_of(a), p, c, dir, justify, align)
+    if b != scene.SCENE_NONE {
+        scene.node_set_strict(sc_of(a), b, true)
+    }
+    return b
+}
+
+// A text node under `p` with class `c`; the text is pointed at.
+fn text_in(a: *mut app.App, p: usize, s: str, c: u32) -> usize {
+    let t: usize = scene.scene_add(sc_of(a), p, scene.N_TEXT)
+    if t == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_text(sc_of(a), t, s.p as u64, s.n)
+    add_class(a, t, c)
+    return t
+}
+
+fn name_node(a: *mut app.App, n: usize, s: str, role: u32) {
+    if n == NONE {
+        return
+    }
+    a11y.a11y_set_name(&(*a).ax, n, s.p as u64, s.n)
+    if role != 0 as u32 {
+        a11y.a11y_set_role(&(*a).ax, n, role)
+    }
+}
+
+// The painter of an icon box: a Lucide symbol in the box's text colour, centred.
+fn paint_icon(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let col: u32 = render.color_of(c, style.resolve_fg(widget.w_styleset(e), widget.w_state(e), style.color_token(style.TOK_TEXT)))
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    var side: f64 = w
+    if h < side {
+        side = h
+    }
+    icons.icon_stroke(render.ctx_painter(c), ud as i64, widget.w_x(e) + (w - side) * 0.5, widget.w_y(e) + (h - side) * 0.5, side, col, icons.STROKE_DEFAULT)
+}
+
+// A square icon node of `pt` points under `p` (Lucide name, "" = empty room).
+fn icon_in(a: *mut app.App, p: usize, name: str, pt: usize) -> usize {
+    let b: usize = scene.scene_add(sc_of(a), p, scene.N_BOX)
+    if b == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_size(sc_of(a), b, pt as f64, pt as f64)
+    scene.node_set_grow(sc_of(a), b, 0, 0)
+    if name.n > 0 {
+        let id: i64 = listrow.icon_named(name)
+        if id >= 0 as i64 {
+            scene.node_set_draw(sc_of(a), b, id as u64, paint_icon)
+        }
+    }
+    return b
+}
+
+// An empty box that only holds a minimum size (the strut that makes a row 44 high).
+fn min_h(a: *mut app.App, n: usize, h: usize) {
+    if n != NONE {
+        scene.node_set_minmax(sc_of(a), n, 0, 0, h as i64, 0)
+    }
+}
+
+fn strut(a: *mut app.App, p: usize, w: usize, h: usize) -> usize {
+    let b: usize = scene.scene_add(sc_of(a), p, scene.N_BOX)
+    if b == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_size(sc_of(a), b, w as f64, h as f64)
+    scene.node_set_grow(sc_of(a), b, 0, 0)
+    return b
+}
+
+// A pressable container (KIND_BUTTON) under `p`: focus, Enter / space, pressed state, a11y button.
+fn press_box(a: *mut app.App, p: usize, flat: u32, c: u32, dir: u32, justify: u32, align: u32) -> usize {
+    let b: usize = scene.scene_add(sc_of(a), p, scene.N_WIDGET)
+    if b == scene.SCENE_NONE {
+        return NONE
+    }
+    scene.node_set_widget_kind(sc_of(a), b, widget.KIND_BUTTON)
+    scene.node_set_flex(sc_of(a), b, dir, justify, align)
+    scene.node_set_strict(sc_of(a), b, true)
+    add_class(a, b, flat)
+    add_class(a, b, K_PRESS)
+    if c != 0 as u32 {
+        add_class(a, b, c)
+    }
+    a11y.a11y_set_role(&(*a).ax, b, a11y.ROLE_BUTTON)
+    return b
+}
+
+// ------------------------------------------------------------------------------------------------ taps
+fn tap_find(node: usize) -> usize {
+    var i: usize = 0
+    while i < TAP_N {
+        if TAP_NODE[i] == node {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn grp_find(node: usize) -> usize {
+    var i: usize = 0
+    while i < GRP_N {
+        if GRP_NODE[i] == node {
+            return i
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+// Register a group container (nav, segmented) with its change callback.
+fn grp_add(node: usize, sel: usize, cb: fn(*mut app.App, usize)) {
+    let g: usize = grp_find(node)
+    if g != NONE {
+        GRP_SEL[g] = sel
+        grp_cb_put(g, cb)
+        return
+    }
+    if GRP_N >= GRP_MAX {
+        return
+    }
+    GRP_NODE[GRP_N] = node
+    GRP_SEL[GRP_N] = sel
+    grp_cb_put(GRP_N, cb)
+    GRP_N = GRP_N + 1
+}
+
+// Nth child of `p` that carries class `c`.
+fn nth_with_class(a: *mut app.App, p: usize, c: u32, k: usize) -> usize {
+    var n: usize = 0
+    var ch: usize = scene.scene_first_child(sc_of(a), p)
+    while ch != scene.SCENE_NONE {
+        if scene.node_has_class(sc_of(a), ch, c) {
+            if n == k {
+                return ch
+            }
+            n = n + 1
+        }
+        ch = scene.scene_next_sibling(sc_of(a), ch)
+    }
+    return NONE
+}
+
+fn item_class(kind: u32) -> u32 {
+    if kind == KIND_NAV {
+        return K_NAV_ITEM
+    }
+    return K_SEG_ITEM
+}
+
+fn on_class(kind: u32) -> u32 {
+    if kind == KIND_NAV {
+        return K_NAV_ON
+    }
+    return K_SEG_ON
+}
+
+fn paint_group(a: *mut app.App, grp: usize, kind: u32, sel: usize) {
+    let ic: u32 = item_class(kind)
+    let oc: u32 = on_class(kind)
+    var k: usize = 0
+    var ch: usize = scene.scene_first_child(sc_of(a), grp)
+    while ch != scene.SCENE_NONE {
+        if scene.node_has_class(sc_of(a), ch, ic) {
+            if k == sel {
+                add_class(a, ch, oc)
+            } else {
+                drop_class(a, ch, oc)
+            }
+            k = k + 1
+        }
+        ch = scene.scene_next_sibling(sc_of(a), ch)
+    }
+}
+
+// The one click handler of every mobile component.
+fn on_tap(a: *mut app.App) {
+    let n: usize = app.activated(a)
+    let t: usize = tap_find(n)
+    if t == NONE {
+        return
+    }
+    let kind: u32 = TAP_KIND[t]
+    if kind == KIND_PLAIN {
+        let f: fn(*mut app.App, usize) = tap_cb(t)
+        f(a, TAP_ARG[t])
+        return
+    }
+    let grp: usize = scene.scene_parent(sc_of(a), n)
+    let g: usize = grp_find(grp)
+    paint_group(a, grp, kind, TAP_ARG[t])
+    if g != NONE {
+        GRP_SEL[g] = TAP_ARG[t]
+        let f2: fn(*mut app.App, usize) = grp_cb(g)
+        f2(a, TAP_ARG[t])
+    }
+}
+
+fn tap_add(a: *mut app.App, node: usize, kind: u32, arg: usize, cb: fn(*mut app.App, usize)) {
+    if node == NONE || TAP_N >= TAP_MAX {
+        return
+    }
+    TAP_NODE[TAP_N] = node
+    TAP_ARG[TAP_N] = arg
+    TAP_KIND[TAP_N] = kind
+    tap_cb_put(TAP_N, cb)
+    TAP_N = TAP_N + 1
+    app.node_set_click(a, node, on_tap)
+}
+
+// ------------------------------------------------------------------------------------------------ sync
+fn is_dark(a: *mut app.App) -> bool {
+    return webtheme.is_dark()
+}
+
+// Re-apply what depends on the window and the theme: the page root padding (the host's insets reset it), the safe-area padding of
+// bars, the 82% maximum width of chat bubbles, the bubble colours after a light / dark switch. Cheap; call it once per frame or after
+// a resize / theme change (every component call does it for what it just built).
+fn sync(a: *mut app.App) {
+    install(a)
+    let sc: *mut scene.Scene = sc_of(a)
+    let root: usize = app.root(a)
+    let scl: usize = theme.theme_scale(&(*a).m)
+    let il: i64 = hostmetrics.inset_points((*a).ins[0], scl)
+    let it: i64 = hostmetrics.inset_points((*a).ins[1], scl)
+    let ir: i64 = hostmetrics.inset_points((*a).ins[2], scl)
+    let ib: i64 = hostmetrics.inset_points((*a).ins[3], scl)
+    if G_PAGE {
+        scene.node_set_padding(sc, root, 0, 0, 0, 0)
+    }
+    var w: f64 = scene.node_w(sc, root)
+    if w > 0.0 {
+        G_VIEW_W = w
+    }
+    let dark: bool = is_dark(a)
+    let n: usize = scene.scene_count(sc)
+    var i: usize = 0
+    while i < n {
+        if scene.node_has_class(sc, i, K_APPBAR) {
+            scene.node_set_padding(sc, i, 4 + il, it, 4 + ir, 0)
+        } else if scene.node_has_class(sc, i, K_NAV) {
+            scene.node_set_padding(sc, i, il, 0, ir, ib)
+        } else if scene.node_has_class(sc, i, webtheme.K_BUBBLE) {
+            bubble_bounds(a, i)
+        } else if scene.node_has_class(sc, i, K_BUBBLE_BOT) {
+            bubble_bounds(a, i)
+        }
+        i = i + 1
+    }
+    G_DARK = dark
+}
+
+fn bubble_bounds(a: *mut app.App, b: usize) {
+    if G_VIEW_W > 0.0 {
+        let mx: i64 = ((G_VIEW_W * BUBBLE_PCT as f64) / 100.0) as i64
+        scene.node_set_bounds(sc_of(a), b, 0, mx)
+    }
+}
+
+// The window's root as a mobile page: a column that stretches its children over the full width, no margin, start-aligned. Call it
+// first. With app.follow_host the host's insets are kept as the bars' safe-area padding (sync).
+fn page(a: *mut app.App) {
+    install(a)
+    G_PAGE = true
+    let sc: *mut scene.Scene = sc_of(a)
+    let root: usize = app.root(a)
+    scene.node_set_flex(sc, root, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_gap(sc, root, 0, 0)
+    scene.node_set_padding(sc, root, 0, 0, 0, 0)
+    add_class(a, root, K_ROOT)
+    sync(a)
+}
+
+// ------------------------------------------------------------------------------------------------ text
+// A text line in one of the type classes (K_T_*); pointed at, not copied.
+fn text(a: *mut app.App, s: str, c: u32) -> usize {
+    install(a)
+    let t: usize = text_in(a, top(a), s, c)
+    return t
+}
+
+fn text_class(a: *mut app.App, n: usize, c: u32) {
+    add_class(a, n, c)
+}
+
+// ------------------------------------------------------------------------------------------------ card, section
+// A panel (radius 16, hairline, small shadow) over the full width; what follows stands in it (a column, 14 pt air) until app.end.
+fn card(a: *mut app.App) -> usize {
+    install(a)
+    let b: usize = box_in(a, top(a), K_CARD, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    if b == NONE {
+        return NONE
+    }
+    scene.node_set_gap(sc_of(a), b, 8, 8)
+    scene.node_set_padding(sc_of(a), b, 14, 14, 14, 14)
+    scene.node_set_align_self(sc_of(a), b, flex.AL_STRETCH)
+    let ok: bool = push(a, b)
+    return b
+}
+
+// A heading (caption type, upper edge 16 pt below the previous part) and a column for its content, until app.end.
+fn section(a: *mut app.App, title: str) -> usize {
+    install(a)
+    let b: usize = box_in(a, top(a), 0 as u32, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    if b == NONE {
+        return NONE
+    }
+    scene.node_set_gap(sc_of(a), b, 8, 8)
+    scene.node_set_padding(sc_of(a), b, 0, 16, 0, 0)
+    scene.node_set_align_self(sc_of(a), b, flex.AL_STRETCH)
+    let t: usize = text_in(a, b, title, webtheme.K_TY(webtheme.TY_CAPTION))
+    name_node(a, t, title, a11y.ROLE_HEADING)
+    let ok: bool = push(a, b)
+    return b
+}
+
+// A one-point rule across the container.
+fn divider(a: *mut app.App) -> usize {
+    install(a)
+    return app.separator(a)
+}
+
+// ------------------------------------------------------------------------------------------------ list tile
+// A row of the full width, at least 56 pt: leading icon (Lucide name, "" = none), title, optional subtitle (second line), optional
+// trailing text, a chevron when `on_tap` is given. A rule above it when it is not the first row of its container. `on_tap(a, tile)`.
+fn list_tile(a: *mut app.App, icon: str, title: str, subtitle: str, trailing: str, on_tap_cb: fn(*mut app.App, usize)) -> usize {
+    install(a)
+    let p: usize = top(a)
+    if scene.scene_child_count(sc_of(a), p) > 0 {
+        let d: usize = app.separator(a)
+    }
+    let t: usize = press_box(a, p, K_FLAT, 0 as u32, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_CENTER)
+    if t == NONE {
+        return NONE
+    }
+    scene.node_set_gap(sc_of(a), t, 12, 0)
+    scene.node_set_padding(sc_of(a), t, 12, 6, 12, 6)
+    scene.node_set_align_self(sc_of(a), t, flex.AL_STRETCH)
+    min_h(a, t, 56)
+    if icon.n > 0 {
+        let ic: usize = icon_in(a, t, icon, 24)
+        add_class(a, ic, webtheme.K_TY(webtheme.TY_CAPTION))
+    }
+    let col: usize = box_in(a, t, 0 as u32, flex.FLEX_COLUMN, flex.JUSTIFY_CENTER, flex.AL_START)
+    scene.node_set_gap(sc_of(a), col, 2, 2)
+    scene.node_set_flexitem(sc_of(a), col, 1000, 1000, 24, 0)
+    let tt: usize = text_in(a, col, title, webtheme.K_TY(webtheme.TY_BODY))
+    scene.node_set_text_wrap(sc_of(a), tt, 2)
+    if subtitle.n > 0 {
+        let st: usize = text_in(a, col, subtitle, webtheme.K_TY(webtheme.TY_CAPTION))
+        scene.node_set_text_wrap(sc_of(a), st, 2)
+    }
+    if trailing.n > 0 {
+        let tr: usize = text_in(a, t, trailing, webtheme.K_TY(webtheme.TY_CAPTION))
+        scene.node_set_grow(sc_of(a), tr, 0, 0)
+    }
+    name_node(a, t, title, a11y.ROLE_BUTTON)
+    if subtitle.n > 0 {
+        a11y.a11y_set_description(&(*a).ax, t, subtitle.p as u64, subtitle.n)
+    }
+    let ch: usize = icon_in(a, t, "chevron-right", 20)
+    add_class(a, ch, webtheme.K_TY(webtheme.TY_CAPTION))
+    tap_add(a, t, KIND_PLAIN, t, on_tap_cb)
+    return t
+}
+
+// ------------------------------------------------------------------------------------------------ app bar
+// A bar of 56 pt on the page ground: optional icon button left (Lucide name, "" = none), the title (left aligned), an optional icon
+// button right. Safe area: the top inset becomes padding (sync). `cb(a, 0)` = left, `cb(a, 1)` = right.
+fn app_bar(a: *mut app.App, title: str, left_icon: str, right_icon: str, cb: fn(*mut app.App, usize)) -> usize {
+    return app_bar_center(a, title, left_icon, right_icon, false, cb)
+}
+
+fn app_bar_center(a: *mut app.App, title: str, left_icon: str, right_icon: str, centered: bool, cb: fn(*mut app.App, usize)) -> usize {
+    install(a)
+    let p: usize = top(a)
+    let b: usize = box_in(a, p, K_APPBAR, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_CENTER)
+    if b == NONE {
+        return NONE
+    }
+    scene.node_set_gap(sc_of(a), b, 4, 0)
+    scene.node_set_align_self(sc_of(a), b, flex.AL_STRETCH)
+    min_h(a, b, BAR_H)
+    if left_icon.n > 0 {
+        let lb: usize = bar_button(a, b, left_icon, "Back")
+        tap_add(a, lb, KIND_PLAIN, 0, cb)
+    } else if centered {
+        let sp: usize = strut(a, b, TOUCH_PT, 0)
+    }
+    let tt: usize = text_in(a, b, title, webtheme.K_TY(webtheme.TY_SECTION))
+    scene.node_set_flexitem(sc_of(a), tt, 1000, 1000, 24, 0)
+    if centered {
+        add_class(a, tt, K_CENTER)
+    }
+    name_node(a, tt, title, a11y.ROLE_HEADING)
+    if right_icon.n > 0 {
+        let rb: usize = bar_button(a, b, right_icon, "Action")
+        tap_add(a, rb, KIND_PLAIN, 1, cb)
+    } else if centered {
+        let sp2: usize = strut(a, b, TOUCH_PT, 0)
+    }
+    sync(a)
+    return b
+}
+
+// A 44 x 44 icon button.
+fn bar_button(a: *mut app.App, p: usize, icon: str, label: str) -> usize {
+    let b: usize = press_box(a, p, K_FLAT_BASE, 0 as u32, flex.FLEX_ROW, flex.JUSTIFY_CENTER, flex.AL_CENTER)
+    if b == NONE {
+        return NONE
+    }
+    scene.node_set_size(sc_of(a), b, TOUCH_PT as f64, TOUCH_PT as f64)
+    scene.node_set_grow(sc_of(a), b, 0, 0)
+    let ic: usize = icon_in(a, b, icon, 24)
+    name_node(a, b, icon, a11y.ROLE_BUTTON)
+    return b
+}
+
+// ------------------------------------------------------------------------------------------------ bottom nav
+// The bar at the bottom: 3 to 5 items of equal width (nav_item), the chosen one in the accent colour, safe-area padding below.
+// `on_change(a, index)`. Open it, add items, app.end.
+fn bottom_nav(a: *mut app.App, sel: usize, on_change: fn(*mut app.App, usize)) -> usize {
+    install(a)
+    let b: usize = box_in(a, top(a), K_NAV, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_STRETCH)
+    if b == NONE {
+        return NONE
+    }
+    scene.node_set_gap(sc_of(a), b, 0, 0)
+    scene.node_set_align_self(sc_of(a), b, flex.AL_STRETCH)
+    grp_add(b, sel, on_change)
+    let ok: bool = push(a, b)
+    return b
+}
+
+// One item: a Lucide icon above a label. NONE when the bar already has 5.
+fn nav_item(a: *mut app.App, icon: str, label: str) -> usize {
+    let nav: usize = top(a)
+    let k: usize = nav_item_count(a, nav)
+    if k >= 5 {
+        return NONE
+    }
+    let it: usize = press_box(a, nav, K_FLAT, K_NAV_ITEM, flex.FLEX_COLUMN, flex.JUSTIFY_CENTER, flex.AL_CENTER)
+    if it == NONE {
+        return NONE
+    }
+    scene.node_set_gap(sc_of(a), it, 2, 2)
+    scene.node_set_padding(sc_of(a), it, 4, 6, 4, 6)
+    scene.node_set_flexitem(sc_of(a), it, 1000, 1000, 0, 0)
+    scene.node_set_base(sc_of(a), it, 0)
+    min_h(a, it, NAV_H)
+    let ic: usize = icon_in(a, it, icon, 24)
+    let lb: usize = text_in(a, it, label, 0 as u32)
+    scene.node_set_text_wrap(sc_of(a), lb, 0)
+    name_node(a, it, label, a11y.ROLE_TAB)
+    let g: usize = grp_find(nav)
+    var sel: usize = 0
+    if g != NONE {
+        sel = GRP_SEL[g]
+    }
+    if k == sel {
+        add_class(a, it, K_NAV_ON)
+    }
+    tap_add(a, it, KIND_NAV, k, cb_none)
+    return it
+}
+
+fn nav_item_count(a: *mut app.App, nav: usize) -> usize {
+    var n: usize = 0
+    var ch: usize = scene.scene_first_child(sc_of(a), nav)
+    while ch != scene.SCENE_NONE {
+        if scene.node_has_class(sc_of(a), ch, K_NAV_ITEM) {
+            n = n + 1
+        }
+        ch = scene.scene_next_sibling(sc_of(a), ch)
+    }
+    return n
+}
+
+// A count bubble on item `k` of the bar (0 = hidden). The text is pointed at ("3", "9+").
+fn nav_badge(a: *mut app.App, nav: usize, k: usize, s: str) {
+    let it: usize = nth_with_class(a, nav, K_NAV_ITEM, k)
+    if it == NONE {
+        return
+    }
+    var b: usize = NONE
+    var ch: usize = scene.scene_first_child(sc_of(a), it)
+    while ch != scene.SCENE_NONE {
+        if scene.node_has_class(sc_of(a), ch, K_BADGE) {
+            b = ch
+        }
+        ch = scene.scene_next_sibling(sc_of(a), ch)
+    }
+    if b == NONE {
+        b = text_in(a, it, s, K_BADGE)
+        if b == NONE {
+            return
+        }
+        scene.node_set_grow(sc_of(a), b, 0, 0)
+        scene.node_set_offset(sc_of(a), b, 14.0, -30.0)
+    }
+    scene.node_set_text(sc_of(a), b, s.p as u64, s.n)
+    scene.node_set_hidden(sc_of(a), b, s.n == 0)
+}
+
+// ------------------------------------------------------------------------------------------------ chips
+// A row that WRAPS onto further lines when the chips do not fit (real line logic), 8 pt between chips and lines.
+fn chip_row(a: *mut app.App) -> usize {
+    install(a)
+    let b: usize = box_in(a, top(a), 0 as u32, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_CENTER)
+    if b == NONE {
+        return NONE
+    }
+    scene.node_set_wrap(sc_of(a), b, flex.WRAP_WRAP)
+    scene.node_set_gap(sc_of(a), b, 8, 8)
+    scene.node_set_align_self(sc_of(a), b, flex.AL_STRETCH)
+    let ok: bool = push(a, b)
+    return b
+}
+
+fn chip_index(a: *mut app.App, row: usize, c: usize) -> usize {
+    var k: usize = 0
+    var ch: usize = scene.scene_first_child(sc_of(a), row)
+    while ch != scene.SCENE_NONE {
+        if ch == c {
+            return k
+        }
+        k = k + 1
+        ch = scene.scene_next_sibling(sc_of(a), ch)
+    }
+    return NONE
+}
+
+// A chip (outline pill, 36 pt high + 4 pt hit slop); `on_tap(a, index)`. Selected = accent outline and text.
+fn chip(a: *mut app.App, label: str, sel: bool, on_tap_cb: fn(*mut app.App, usize)) -> usize {
+    install(a)
+    let row: usize = top(a)
+    let c: usize = box_in(a, row, K_CHIP, flex.FLEX_ROW, flex.JUSTIFY_CENTER, flex.AL_CENTER)
+    if c == NONE {
+        return NONE
+    }
+    if sel {
+        add_class(a, c, K_CHIP_ON)
+    }
+    scene.node_set_gap(sc_of(a), c, 0, 0)
+    scene.node_set_grow(sc_of(a), c, 0, 0)
+    let b: usize = press_box(a, c, K_FLAT_BASE, 0 as u32, flex.FLEX_ROW, flex.JUSTIFY_CENTER, flex.AL_CENTER)
+    scene.node_set_padding(sc_of(a), b, 14, 0, 14, 0)
+    min_h(a, b, 36)
+    let t: usize = text_in(a, b, label, 0 as u32)
+    name_node(a, b, label, a11y.ROLE_BUTTON)
+    tap_add(a, b, KIND_PLAIN, chip_index(a, row, c), on_tap_cb)
+    return c
+}
+
+// A chip with a close button (x). `on_tap(a, index)` selects, `on_close(a, index)` removes it (the program deletes the node's data).
+fn chip_closable(a: *mut app.App, label: str, sel: bool, on_tap_cb: fn(*mut app.App, usize), on_close: fn(*mut app.App, usize)) -> usize {
+    let c: usize = chip(a, label, sel, on_tap_cb)
+    if c == NONE {
+        return NONE
+    }
+    let x: usize = press_box(a, c, K_FLAT_BASE, 0 as u32, flex.FLEX_ROW, flex.JUSTIFY_CENTER, flex.AL_CENTER)
+    scene.node_set_size(sc_of(a), x, 32.0, 36.0)
+    scene.node_set_grow(sc_of(a), x, 0, 0)
+    let ic: usize = icon_in(a, x, "x", 16)
+    name_node(a, x, "Remove", a11y.ROLE_BUTTON)
+    tap_add(a, x, KIND_PLAIN, chip_index(a, scene.scene_parent(sc_of(a), c), c), on_close)
+    return c
+}
+
+fn chip_selected(a: *mut app.App, c: usize) -> bool {
+    return scene.node_has_class(sc_of(a), c, K_CHIP_ON)
+}
+
+fn set_chip_selected(a: *mut app.App, c: usize, on: bool) {
+    if on {
+        add_class(a, c, K_CHIP_ON)
+    } else {
+        drop_class(a, c, K_CHIP_ON)
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ segmented control
+// A track with 2 to 5 segments of equal width; the chosen one is raised. `on_change(a, index)`. Open it, add `segment`s, app.end.
+fn segmented(a: *mut app.App, sel: usize, on_change: fn(*mut app.App, usize)) -> usize {
+    install(a)
+    let b: usize = box_in(a, top(a), K_SEG, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_STRETCH)
+    if b == NONE {
+        return NONE
+    }
+    scene.node_set_gap(sc_of(a), b, 2, 0)
+    scene.node_set_padding(sc_of(a), b, 3, 3, 3, 3)
+    scene.node_set_align_self(sc_of(a), b, flex.AL_STRETCH)
+    a11y.a11y_set_role(&(*a).ax, b, a11y.ROLE_GROUP)
+    grp_add(b, sel, on_change)
+    let ok: bool = push(a, b)
+    return b
+}
+
+fn segment(a: *mut app.App, label: str) -> usize {
+    let seg: usize = top(a)
+    var k: usize = 0
+    var ch: usize = scene.scene_first_child(sc_of(a), seg)
+    while ch != scene.SCENE_NONE {
+        if scene.node_has_class(sc_of(a), ch, K_SEG_ITEM) {
+            k = k + 1
+        }
+        ch = scene.scene_next_sibling(sc_of(a), ch)
+    }
+    if k >= 5 {
+        return NONE
+    }
+    let it: usize = press_box(a, seg, K_FLAT_FIELD, K_SEG_ITEM, flex.FLEX_ROW, flex.JUSTIFY_CENTER, flex.AL_CENTER)
+    if it == NONE {
+        return NONE
+    }
+    scene.node_set_flexitem(sc_of(a), it, 1000, 1000, 0, 0)
+    scene.node_set_base(sc_of(a), it, 0)
+    scene.node_set_padding(sc_of(a), it, 8, 0, 8, 0)
+    min_h(a, it, TOUCH_PT - 6)
+    let t: usize = text_in(a, it, label, 0 as u32)
+    name_node(a, it, label, a11y.ROLE_TAB)
+    let g: usize = grp_find(seg)
+    var sel: usize = 0
+    if g != NONE {
+        sel = GRP_SEL[g]
+    }
+    if k == sel {
+        add_class(a, it, K_SEG_ON)
+    }
+    tap_add(a, it, KIND_SEG, k, cb_none)
+    return it
+}
+
+// The chosen index of a nav / segmented container; select() sets it by program (no callback).
+fn selected(a: *mut app.App, grp: usize) -> usize {
+    let g: usize = grp_find(grp)
+    if g == NONE {
+        return NONE
+    }
+    return GRP_SEL[g]
+}
+
+fn select(a: *mut app.App, grp: usize, k: usize) {
+    let g: usize = grp_find(grp)
+    if g == NONE {
+        return
+    }
+    GRP_SEL[g] = k
+    var kind: u32 = KIND_SEG
+    if scene.node_has_class(sc_of(a), grp, K_NAV) {
+        kind = KIND_NAV
+    }
+    paint_group(a, grp, kind, k)
+}
+
+// ------------------------------------------------------------------------------------------------ text fields
+// A labelled field over the full width: `name` (caption above, also the accessible name), the field (44+ pt, field colours, radius
+// 12, accent line while focused) and an error line (empty until field_error). `hint` stands in the field while it is empty;
+// `secret` hides the characters. Returns the ENTRY node (app.text / set_text / set_focus work on it). NONE when the 8 fields are used.
+// app.entry / app.textarea add one id rule with a fixed width (240 / 320): the field of a phone page spans its container. That rule is
+// the last one made, so it is emptied here (the height of a text area is put back by area_height).
+fn unset_width_rule(a: *mut app.App) {
+    let n: usize = sheet.sheet_count(&(*a).sh)
+    if n > 0 {
+        sheet.decl_set_style(sheet.sheet_decl(&(*a).sh, n - 1), style.style_new())
+    }
+}
+
+fn text_field(a: *mut app.App, name: str, hint: str, secret: bool) -> usize {
+    install(a)
+    let col: usize = box_in(a, top(a), 0 as u32, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    if col == NONE {
+        return NONE
+    }
+    scene.node_set_gap(sc_of(a), col, 4, 4)
+    scene.node_set_align_self(sc_of(a), col, flex.AL_STRETCH)
+    let ok: bool = push(a, col)
+    if name.n > 0 {
+        let lb: usize = text_in(a, col, name, webtheme.K_TY(webtheme.TY_CAPTION))
+    }
+    let e: usize = app.entry(a, hint)
+    if e == app.NONE {
+        app.end(a)
+        return NONE
+    }
+    unset_width_rule(a)
+    add_class(a, e, K_FIELD)
+    scene.node_set_align_self(sc_of(a), e, flex.AL_STRETCH)
+    scene.node_set_flexitem(sc_of(a), e, 1000, 1000, 0, 0)
+    if secret {
+        app.set_secret(a, e, true)
+    }
+    if name.n > 0 {
+        a11y.a11y_set_name(&(*a).ax, e, name.p as u64, name.n)
+    }
+    let er: usize = text_in(a, col, "", K_ERR)
+    scene.node_set_hidden(sc_of(a), er, true)
+    if ERR_N < 8 {
+        ERR_FIELD[ERR_N] = e
+        ERR_NODE[ERR_N] = er
+        ERR_N = ERR_N + 1
+    }
+    app.end(a)
+    return e
+}
+
+// A multi-line field of rows_min (grows with its text up to rows_max rows, fit_text_area) rows. Same parts as text_field.
+fn text_area(a: *mut app.App, name: str, hint: str, rows_min: usize, rows_max: usize) -> usize {
+    install(a)
+    let col: usize = box_in(a, top(a), 0 as u32, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    if col == NONE {
+        return NONE
+    }
+    scene.node_set_gap(sc_of(a), col, 4, 4)
+    scene.node_set_align_self(sc_of(a), col, flex.AL_STRETCH)
+    let ok: bool = push(a, col)
+    if name.n > 0 {
+        let lb: usize = text_in(a, col, name, webtheme.K_TY(webtheme.TY_CAPTION))
+    }
+    var rmin: usize = rows_min
+    if rmin < 2 {
+        rmin = 2
+    }
+    let e: usize = app.textarea(a, hint, rmin)
+    if e == app.NONE {
+        app.end(a)
+        return NONE
+    }
+    let rule_ix: usize = sheet.sheet_count(&(*a).sh) - 1
+    sheet.decl_set_style(sheet.sheet_decl(&(*a).sh, rule_ix), style.style_set_height(style.style_new(), app.area_height_pt(a, rmin)))
+    add_class(a, e, K_FIELD)
+    scene.node_set_align_self(sc_of(a), e, flex.AL_STRETCH)
+    scene.node_set_flexitem(sc_of(a), e, 1000, 1000, 0, 0)
+    if name.n > 0 {
+        a11y.a11y_set_name(&(*a).ax, e, name.p as u64, name.n)
+    }
+    let er: usize = text_in(a, col, "", K_ERR)
+    scene.node_set_hidden(sc_of(a), er, true)
+    var slot: usize = NONE
+    if ERR_N < 8 {
+        slot = ERR_N
+        ERR_FIELD[ERR_N] = e
+        ERR_NODE[ERR_N] = er
+        ERR_N = ERR_N + 1
+        AREA_MIN[slot] = rmin
+        AREA_MAX[slot] = rows_max
+        AREA_RULE[slot] = rule_ix
+    }
+    app.end(a)
+    return e
+}
+
+static mut AREA_MIN: [usize; 8] = [0; 8]
+static mut AREA_MAX: [usize; 8] = [0; 8]
+static mut AREA_RULE: [usize; 8] = [0; 8]
+
+// Show `msg` in red under the field and mark it invalid (red ring, a11y); "" clears. The text is pointed at.
+fn field_error(a: *mut app.App, field: usize, msg: str) {
+    var k: usize = 0
+    while k < ERR_N {
+        if ERR_FIELD[k] == field {
+            scene.node_set_text(sc_of(a), ERR_NODE[k], msg.p as u64, msg.n)
+            scene.node_set_hidden(sc_of(a), ERR_NODE[k], msg.n == 0)
+            app.set_invalid(a, field, msg.n > 0)
+            if msg.n > 0 {
+                a11y.a11y_set_description(&(*a).ax, field, msg.p as u64, msg.n)
+            }
+            return
+        }
+        k = k + 1
+    }
+}
+
+fn field_error_node(a: *mut app.App, field: usize) -> usize {
+    var k: usize = 0
+    while k < ERR_N {
+        if ERR_FIELD[k] == field {
+            return ERR_NODE[k]
+        }
+        k = k + 1
+    }
+    return NONE
+}
+
+// Rows of a text area for its current line count, between rows_min and rows_max (valid after the first frame; rows_min before it).
+fn text_area_rows_of(a: *mut app.App, field: usize) -> usize {
+    var k: usize = 0
+    while k < ERR_N {
+        if ERR_FIELD[k] == field && AREA_MIN[k] > 0 {
+            let ln: *mut textarea.Lines = app.lines_of(a, field)
+            var rows: usize = AREA_MIN[k]
+            if ln as u64 != 0 {
+                let n: usize = textarea.ta_line_count(ln)
+                if n > rows {
+                    rows = n
+                }
+            }
+            if rows > AREA_MAX[k] {
+                rows = AREA_MAX[k]
+            }
+            if rows < AREA_MIN[k] {
+                rows = AREA_MIN[k]
+            }
+            return rows
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+// Resize a text area to the lines it holds (call it from app.on_edit or once per frame).
+fn fit_text_area(a: *mut app.App, field: usize) {
+    var k: usize = 0
+    while k < ERR_N {
+        if ERR_FIELD[k] == field && AREA_MIN[k] > 0 {
+            let rows: usize = text_area_rows_of(a, field)
+            sheet.decl_set_style(sheet.sheet_decl(&(*a).sh, AREA_RULE[k]), style.style_set_height(style.style_new(), app.area_height_pt(a, rows)))
+            return
+        }
+        k = k + 1
+    }
+}
+
+// ------------------------------------------------------------------------------------------------ bubble
+// A chat bubble in a row of the full width: mine = right, blue gradient (dark) / light blue (light); the assistant's = left,
+// panel with a hairline. At most 82% of the page width (sync), 18 pt radius, 12 / 16 pt padding. The text wraps; pointed at.
+fn bubble(a: *mut app.App, s: str, mine: bool) -> usize {
+    let b: usize = bubble_open(a, mine)
+    if b == NONE {
+        return NONE
+    }
+    let t: usize = text_in(a, b, s, 0 as u32)
+    scene.node_set_text_wrap(sc_of(a), t, 100000)
+    name_node(a, b, s, a11y.ROLE_TEXT)
+    app.end(a)
+    return b
+}
+
+// The bubble container, to put your own content in (a markdown view); close with app.end. The row around it is closed by that end.
+fn bubble_open(a: *mut app.App, mine: bool) -> usize {
+    install(a)
+    var j: u32 = flex.JUSTIFY_START
+    if mine {
+        j = flex.JUSTIFY_END
+    }
+    let row: usize = box_in(a, top(a), 0 as u32, flex.FLEX_ROW, j, flex.AL_START)
+    if row == NONE {
+        return NONE
+    }
+    scene.node_set_align_self(sc_of(a), row, flex.AL_STRETCH)
+    var c: u32 = K_BUBBLE_BOT
+    if mine {
+        c = webtheme.K_BUBBLE
+    }
+    let b: usize = box_in(a, row, c, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    if b == NONE {
+        return NONE
+    }
+    scene.node_set_padding(sc_of(a), b, 16, 12, 16, 12)
+    scene.node_set_gap(sc_of(a), b, 6, 6)
+    scene.node_set_flexitem(sc_of(a), b, 0, 1000, 0, 0)
+    bubble_bounds(a, b)
+    let ok: bool = push(a, b)
+    return b
+}
+
+// The text node of a bubble made with bubble().
+fn bubble_node_text(a: *mut app.App, b: usize) -> usize {
+    return scene.scene_first_child(sc_of(a), b)
+}
+
+// ------------------------------------------------------------------------------------------------ empty state, skeleton, spinner
+// Centred block: a 48 pt icon, a title (section type) and a text (caption, wraps). Stays in the current container.
+fn empty_state(a: *mut app.App, icon: str, title: str, body: str) -> usize {
+    install(a)
+    let b: usize = box_in(a, top(a), 0 as u32, flex.FLEX_COLUMN, flex.JUSTIFY_CENTER, flex.AL_CENTER)
+    if b == NONE {
+        return NONE
+    }
+    scene.node_set_gap(sc_of(a), b, 8, 8)
+    scene.node_set_padding(sc_of(a), b, 24, 32, 24, 32)
+    scene.node_set_align_self(sc_of(a), b, flex.AL_STRETCH)
+    let ic: usize = icon_in(a, b, icon, 48)
+    add_class(a, ic, webtheme.K_TY(webtheme.TY_CAPTION))
+    let t: usize = text_in(a, b, title, webtheme.K_TY(webtheme.TY_SECTION))
+    name_node(a, t, title, a11y.ROLE_HEADING)
+    if body.n > 0 {
+        let x: usize = text_in(a, b, body, webtheme.K_TY(webtheme.TY_CAPTION))
+        scene.node_set_text_wrap(sc_of(a), x, 6)
+    }
+    a11y.a11y_set_role(&(*a).ax, b, a11y.ROLE_GROUP)
+    return b
+}
+
+// A placeholder block (shimmer; still with reduced motion): the appctl skeleton, one line of `w` x `h` points.
+fn skeleton(a: *mut app.App, w: usize, h: usize) -> usize {
+    install(a)
+    return appctl.skeleton(a, w, h, 1)
+}
+
+// The busy ring (appctl spinner, 24 pt), named "Loading".
+fn spinner(a: *mut app.App) -> usize {
+    install(a)
+    let s: usize = appctl.spinner(a, "Loading", 24)
+    if s != appctl.NONE {
+        appctl.spinner_on(a, s, true)
+    }
+    return s
+}
+
+// ------------------------------------------------------------------------------------------------ pill, badge
+// A status word in an outline pill: PILL_DIM (muted), PILL_OK (green), PILL_WARN (red).
+fn pill(a: *mut app.App, s: str, kind: u32) -> usize {
+    install(a)
+    let t: usize = text_in(a, top(a), s, webtheme.K_PILL)
+    if t == NONE {
+        return NONE
+    }
+    if kind == PILL_OK {
+        add_class(a, t, K_PILL_OK)
+    } else if kind == PILL_WARN {
+        add_class(a, t, K_PILL_WARN)
+    }
+    scene.node_set_grow(sc_of(a), t, 0, 0)
+    name_node(a, t, s, a11y.ROLE_STATUS)
+    return t
+}
+
+// A small filled count badge (accent).
+fn badge(a: *mut app.App, s: str) -> usize {
+    install(a)
+    let t: usize = text_in(a, top(a), s, K_BADGE)
+    if t == NONE {
+        return NONE
+    }
+    scene.node_set_grow(sc_of(a), t, 0, 0)
+    name_node(a, t, s, a11y.ROLE_STATUS)
+    return t
+}
