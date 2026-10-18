@@ -605,10 +605,17 @@ impl<'a> Parser<'a> {
                 TokKind::RBracket => {
                     depth -= 1;
                     if depth == 0 {
+                        // r729: the `(` must belong to the same line (or
+                        // sit inside round brackets): `m.TABLE[i]` followed
+                        // by a line that starts with `(*p).f = 0` is an index.
+                        let same_line = match (self.toks.get(i), self.toks.get(i + 1)) {
+                            (Some(a), Some(b)) => b.span.line == a.span.line,
+                            _ => false,
+                        };
                         return matches!(
                             self.toks.get(i + 1).map(|t| &t.kind),
                             Some(TokKind::LParen)
-                        );
+                        ) && (same_line || self.paren_depth > 0);
                     }
                 }
                 TokKind::Eof => return false,
