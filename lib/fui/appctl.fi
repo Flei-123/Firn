@@ -132,6 +132,7 @@ export {
     infobar, infobar_action, infobar_closable, infobar_event, infobar_open, infobar_show,
     stepper, stepper_add, stepper_current, stepper_set,
     grid, grid_cell, grid_gap, grid_pad, grid_rtl, grid_name,
+    toolbar, toolbar_item, toolbar_end, toolbar_width, toolbar_folded, toolbar_is_folded, toolbar_open, toolbar_set_open, toolbar_more,
     accordion, accordion_section, accordion_is_open, accordion_set, accordion_open_count, accordion_sections,
     ripple_on, split_begin, split_mid, split_end, split_ratio, split_set_ratio, split_limits, split_hovered, split_dragging,
     ANS_OK, ANS_CANCEL,
@@ -1011,7 +1012,9 @@ fn expander_label(c: *mut Ctl, i: usize) {
         app.set_text((*c).a, (*c).node[i], "> ")
     }
     app.append_text((*c).a, (*c).node[i], (*c).tip[i])
-    a11y.a11y_set_expanded(app.ax((*c).a), (*c).node[i], (*c).last[i] as u32)
+    var exs: u32 = a11y.EXP_COLLAPSED
+    if (*c).last[i] != 0 { exs = a11y.EXP_EXPANDED }
+    a11y.a11y_set_expanded(app.ax((*c).a), (*c).node[i], exs)
 }
 
 fn expander_body(a: *mut app.App, id: usize) -> usize {
@@ -2344,6 +2347,8 @@ fn ctl_act(ud: u64, node: usize) {
         let o: bool = open_dropdown((*c).a, node)
     } else if (*c).kind[i] == K_MENU {
         let o2: bool = open_menu(c, i)
+    } else if (*c).kind[i] == K_TBMORE {
+        tb_more_act(c, i)
     } else if (*c).kind[i] == K_EXPAND {
         set_expanded((*c).a, node, (*c).last[i] == 0)
         acc_changed(c, i)
@@ -2358,6 +2363,7 @@ fn ctl_paint(ud: u64, rc: *mut render.Ctx, w: usize, h: usize) {
     draw_sheet(c, rc)
     cmb_paint(c, rc)
     sz_paint(c, rc, w, h)
+    tb_paint(c)
     if (*c).drop_open {
         draw_drop(c, rc)
     }
@@ -6361,4 +6367,309 @@ fn accordion_sections(a: *mut app.App, acc: usize) -> usize {
     let i: usize = acc_idx(a, acc)
     if i == NONE { return 0 }
     return (*acc_of(st(a), i)).m.n
+}
+
+// ============================================================ TOOLBAR OVERFLOW (r338, lib/fui/wave8m.fi)
+//
+// A toolbar whose items fold behind a "..." button when the window is too narrow. Items fold from the highest
+// priority (the last of equal priority first); priority 0 never folds. The "..." button opens a panel row below the
+// bar with a copy of every folded item (same label, same callback).
+//
+//     let tb: usize = appctl.toolbar(a, "Tools")            // opens a column with the bar row
+//     appctl.toolbar_item(a, tb, "Cut", 2, on_cut)          // a button in the bar; prio 0 = never folds
+//     appctl.toolbar_item(a, tb, "Paste", 1, on_paste)
+//     appctl.toolbar_item(a, tb, "Save", 0, on_save)
+//     appctl.toolbar_end(a, tb)                             // adds "...", the panel row; closes the column
+//
+// The fit runs each frame from the width of the toolbar (the parent's width, or `toolbar_width`), so the bar follows
+// the window. Hidden nodes keep their place in a row, so a folded item is squeezed to 1 and its gap is paid.
+// Limit: hidden nodes still show in the a11y tree (the panel copies and the folded originals both).
+
+const K_TBMORE: u32 = 32
+const K_TOOLBAR: u32 = 31
+const TB_ITEMS: usize = 16
+
+struct Tbar {
+    m: wave8m.Toolbar,
+    lbl: [str; 16],
+    bar: [usize; 16],
+    copy: [usize; 16],
+    cbs: [fn(*mut app.App); 16],
+    wset: [bool; 16],
+    n: usize,
+    row: usize,
+    more: usize,
+    panel: usize,
+    more_w: f64,
+    more_set: bool,
+    open: bool,
+    built: bool,
+    mask: u64,
+    fixed: f64,
+    nfold: usize,
+}
+
+fn tb_idx(a: *mut app.App, id: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return NONE }
+    let i: usize = find(c, id)
+    if i == NONE || (*c).kind[i] != K_TOOLBAR { return NONE }
+    return i
+}
+
+fn tb_of(c: *mut Ctl, i: usize) -> *mut Tbar {
+    return (*c).aux[i] as *mut Tbar
+}
+
+fn tb_dup(s: str) -> str {
+    let p: u64 = rt.heap_alloc(s.n + 1)
+    if p == 0 {
+        return s
+    }
+    var k: usize = 0
+    while k < s.n {
+        *((p + k as u64) as *mut u8) = *((s.p as u64 + k as u64) as *mut u8)
+        k = k + 1
+    }
+    return str { p: rt.ptr_of(p), n: s.n }
+}
+
+fn tb_show(sc: *mut scene.Scene, node: usize, on: bool) {
+    scene.node_set_hidden(sc, node, !on)
+    if on {
+        scene.node_set_bounds(sc, node, 0, 0)
+    } else {
+        scene.node_set_bounds(sc, node, 1, 1)
+    }
+}
+
+fn tb_noop(a: *mut app.App) {
+}
+
+// Opens the toolbar column and its bar row; fill with toolbar_item, close with toolbar_end.
+fn toolbar(a: *mut app.App, name: str) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n + 2 > CTL_MAX {
+        return NONE
+    }
+    let p: u64 = rt.heap_alloc(2048)
+    if p == 0 {
+        return NONE
+    }
+    let col: usize = app.column(a)
+    if col == NONE {
+        return NONE
+    }
+    let i: usize = add_entry(c, K_TOOLBAR, col)
+    let q: *mut Tbar = p as *mut Tbar
+    (*q).m = wave8m.toolbar_new()
+    (*q).n = 0
+    (*q).row = NONE
+    (*q).more = NONE
+    (*q).panel = NONE
+    (*q).more_w = 0.0
+    (*q).more_set = false
+    (*q).open = false
+    (*q).built = false
+    (*q).mask = 18446744073709551615 as u64
+    (*q).fixed = 0.0
+    (*q).nfold = 0
+    (*c).aux[i] = p as usize
+    a11y.a11y_set_role(app.ax(a), col, a11y.ROLE_TOOLBAR)
+    name_node(c, col, name)
+    (*q).row = app.row(a)
+    return col
+}
+
+// A button in the bar (the bar row must be the open container). prio 0 = never folds, higher = folds earlier.
+fn toolbar_item(a: *mut app.App, tb: usize, label: str, prio: u32, cb: fn(*mut app.App)) -> usize {
+    let i: usize = tb_idx(a, tb)
+    if i == NONE { return NONE }
+    let q: *mut Tbar = tb_of(st(a), i)
+    if (*q).built || (*q).n >= TB_ITEMS { return NONE }
+    let node: usize = app.button(a, label, cb)
+    if node == NONE { return NONE }
+    let k: usize = (*q).n
+    (*q).bar[k] = node
+    (*q).lbl[k] = tb_dup(label)
+    (*q).cbs[k] = cb
+    (*q).wset[k] = false
+    let ok: bool = wave8m.toolbar_add(&(*q).m, 0.0, prio)
+    (*q).n = k + 1
+    return node
+}
+
+// Adds the "..." button, builds the panel row with a copy of every item, closes the bar and the toolbar.
+fn toolbar_end(a: *mut app.App, tb: usize) {
+    let i: usize = tb_idx(a, tb)
+    if i == NONE { return }
+    let c: *mut Ctl = st(a)
+    let q: *mut Tbar = tb_of(c, i)
+    if (*q).built { return }
+    let more: usize = app.node_new(a, widget.KIND_BUTTON, "...")
+    if more == NONE { return }
+    let j: usize = add_entry(c, K_TBMORE, more)
+    (*c).lo[j] = tb as i64
+    a11y.a11y_set_expanded(app.ax(a), more, a11y.EXP_COLLAPSED)
+    a11y.a11y_set_name(app.ax(a), more, "More".p as u64, 4)
+    (*q).more = more
+    app.end(a)
+    (*q).panel = app.row(a)
+    let sc: *mut scene.Scene = sc_of(c)
+    var k: usize = 0
+    while k < (*q).n {
+        let cp: usize = app.button(a, (*q).lbl[k], (*q).cbs[k])
+        (*q).copy[k] = cp
+        if cp != NONE { tb_show(sc, cp, false) }
+        k = k + 1
+    }
+    app.end(a)
+    app.end(a)
+    tb_show(sc, (*q).panel, false)
+    (*q).built = true
+    touch(c)
+}
+
+// Fixes the toolbar's width (design points) instead of following its parent.
+fn toolbar_width(a: *mut app.App, tb: usize, w: usize) {
+    let i: usize = tb_idx(a, tb)
+    if i == NONE { return }
+    (*tb_of(st(a), i)).fixed = w as f64
+    app.set_width(a, tb, w)
+}
+
+// How many items are folded now.
+fn toolbar_folded(a: *mut app.App, tb: usize) -> usize {
+    let i: usize = tb_idx(a, tb)
+    if i == NONE { return 0 }
+    return (*tb_of(st(a), i)).nfold
+}
+
+fn toolbar_is_folded(a: *mut app.App, tb: usize, idx: usize) -> bool {
+    let i: usize = tb_idx(a, tb)
+    if i == NONE { return false }
+    let q: *mut Tbar = tb_of(st(a), i)
+    if idx >= (*q).n { return false }
+    return ((*q).mask & ((1 as u64) << (idx as u64))) == (0 as u64) && (*q).nfold > 0
+}
+
+// The "..." button of the toolbar (NONE before toolbar_end).
+fn toolbar_more(a: *mut app.App, tb: usize) -> usize {
+    let i: usize = tb_idx(a, tb)
+    if i == NONE { return NONE }
+    return (*tb_of(st(a), i)).more
+}
+
+fn toolbar_open(a: *mut app.App, tb: usize) -> bool {
+    let i: usize = tb_idx(a, tb)
+    if i == NONE { return false }
+    return (*tb_of(st(a), i)).open
+}
+
+// Opens / closes the panel with the folded items (only while something is folded).
+fn toolbar_set_open(a: *mut app.App, tb: usize, open: bool) {
+    let i: usize = tb_idx(a, tb)
+    if i == NONE { return }
+    let c: *mut Ctl = st(a)
+    let q: *mut Tbar = tb_of(c, i)
+    (*q).open = open && (*q).nfold > 0
+    tb_apply(c, q)
+}
+
+fn tb_more_act(c: *mut Ctl, j: usize) {
+    let i: usize = find(c, (*c).lo[j] as usize)
+    if i == NONE || (*c).kind[i] != K_TOOLBAR { return }
+    let q: *mut Tbar = tb_of(c, i)
+    (*q).open = !(*q).open && (*q).nfold > 0
+    tb_apply(c, q)
+}
+
+// the mask -> the nodes: folded originals squeezed, the chevron when something is folded, the panel copies
+fn tb_apply(c: *mut Ctl, q: *mut Tbar) {
+    let sc: *mut scene.Scene = sc_of(c)
+    var nf: usize = 0
+    var k: usize = 0
+    while k < (*q).n {
+        let folded: bool = ((*q).mask & ((1 as u64) << (k as u64))) == (0 as u64)
+        if folded { nf = nf + 1 }
+        tb_show(sc, (*q).bar[k], !folded)
+        tb_show(sc, (*q).copy[k], folded && (*q).open)
+        k = k + 1
+    }
+    (*q).nfold = nf
+    if nf == 0 { (*q).open = false }
+    tb_show(sc, (*q).more, nf > 0)
+    tb_show(sc, (*q).panel, (*q).open && nf > 0)
+    var ex: u32 = a11y.EXP_COLLAPSED
+    if (*q).open { ex = a11y.EXP_EXPANDED }
+    a11y.a11y_set_expanded(app.ax((*c).a), (*q).more, ex)
+    touch(c)
+}
+
+// the fit of one toolbar for the width of this frame; applies the nodes when the mask changed
+fn tb_fit(c: *mut Ctl, i: usize) {
+    let q: *mut Tbar = tb_of(c, i)
+    if !(*q).built || (*q).n == 0 { return }
+    let sc: *mut scene.Scene = sc_of(c)
+    // measure each item and the chevron once, while they are still unfolded
+    var k: usize = 0
+    var all: bool = true
+    while k < (*q).n {
+        if !(*q).wset[k] {
+            let pw: f64 = scene.node_pref_w(sc, (*q).bar[k])
+            if pw > 0.0 {
+                (*q).m.w[k] = pw
+                (*q).wset[k] = true
+            } else {
+                all = false
+            }
+        }
+        k = k + 1
+    }
+    if !(*q).more_set {
+        let mw: f64 = scene.node_pref_w(sc, (*q).more)
+        if mw > 0.0 {
+            (*q).more_w = mw
+            (*q).more_set = true
+        } else {
+            all = false
+        }
+    }
+    if !all { return }
+    var avail: f64 = (*q).fixed
+    if avail <= 0.0 {
+        let par: usize = scene.scene_parent(sc, (*c).node[i])
+        if par == NONE || par == scene.SCENE_NONE { return }
+        avail = scene.node_w(sc, par)
+    }
+    if avail <= 0.0 { return }
+    let gap: f64 = 10.0
+    // folded children stay in the row with width 1 and pay their gap; so does the hidden chevron
+    var f: usize = 0
+    var mask: u64 = 0 as u64
+    var guard: usize = 0
+    while guard < 40 {
+        var paid: usize = f
+        if f == 0 { paid = 1 }
+        let a2: f64 = avail - ((paid as f64) * (1.0 + gap))
+        mask = wave8m.toolbar_fit(&(*q).m, a2, gap, (*q).more_w)
+        let nf: usize = wave8m.toolbar_hidden(&(*q).m, mask)
+        if nf == f { break }
+        f = nf
+        guard = guard + 1
+    }
+    if mask != (*q).mask || (*q).nfold != f {
+        (*q).mask = mask
+        tb_apply(c, q)
+    }
+}
+
+fn tb_paint(c: *mut Ctl) {
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_TOOLBAR {
+            tb_fit(c, i)
+        }
+        i = i + 1
+    }
 }

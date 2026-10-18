@@ -785,6 +785,10 @@ build appgrid
 build appw8m
 "$W/appw8m" | tail -n 3 | grep -q "APPW8M PASSED"
 
+# apptb: toolbar overflow (items fold behind "...", panel with copies, widening unfolds, a11y)
+build apptb
+"$W/apptb" | tail -n 3 | grep -q "APPTB PASSED"
+
 # appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
 build appw6
 "$W/appw6" | tail -n 3

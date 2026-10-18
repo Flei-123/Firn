@@ -83,6 +83,10 @@ done
 "$FIRNC" --opt-level=dev -o "$T/appw10" tools/fui/appw10_main.fi
 "$T/appw10" "$T/img" > /dev/null
 
+# TOOLBAR OVERFLOW (appctl.toolbar): narrow bar with "..." and the open panel, light, dark
+"$FIRNC" --opt-level=dev -o "$T/apptb" tools/fui/apptb_main.fi
+"$T/apptb" "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/
