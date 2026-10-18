@@ -84,6 +84,7 @@ import fui.wave2
 import fui.wave5
 import fui.wave6
 import fui.wave7
+import fui.wave9
 import fui.timeline
 import fui.wave8
 import fui.a11y
@@ -114,6 +115,9 @@ export {
     propgrid_label_pm, propgrid_inline, propgrid_cell, propgrid_row_rect, propgrid_editing, propgrid_edit_text,
     propgrid_commit, propgrid_cancel, propgrid_refresh, PGE_COMMIT,
     range_slider, range_lo, range_hi, set_range_values, range_focus_thumb,
+    combobox, combobox_add, combobox_open, combobox_close, combobox_is_open, combobox_results, combobox_picked,
+    combobox_active, combobox_row_text, combobox_list_node, combobox_item_node, combobox_row_rect, combobox_rect,
+    combobox_count, combobox_top,
     timeline, timeline_ref, timeline_play, timeline_pause, timeline_stop, timeline_value, timeline_playing, timeline_finished,
     timeline_reduced, TL_APP,
     spinner, spinner_on, spinner_is_on, timepicker, timepicker_hour, timepicker_minute, set_time,
@@ -309,6 +313,7 @@ fn st(a: *mut app.App) -> *mut Ctl {
         sink_tick, sink_wait)
     fuiwirt.host_set_wake(app.app_host(a), p, wake_tick, wake_wait)
     fuiwirt.host_set_shield(app.app_host(a), p, sh_shield)
+    app.set_ctl_edit(a, ctl_edit)
     return c
 }
 
@@ -1521,7 +1526,7 @@ fn tip_move(c: *mut Ctl, x: f64, y: f64) -> bool {
 }
 
 fn tip_blocked(c: *mut Ctl) -> bool {
-    return (*c).dlg != 0 as u32 || (*c).drop_open || sh_blocking(c) || menuview.mv_is_open(mv_of(c))
+    return (*c).dlg != 0 as u32 || (*c).drop_open || sh_blocking(c) || cmb_any_open(c) || menuview.mv_is_open(mv_of(c))
 }
 
 // the program timer (fuiwirt.host_set_wake): shows the tooltip after the delay, runs the dialog fade
@@ -1699,6 +1704,7 @@ fn dlg_open(a: *mut app.App, kind: u32, title: str, text: str, init: str,
     if (*c).drop_open {
         drop_close(c)
     }
+    cmb_close_all(c)
     let ctxm: *mut ctxmenu.Ctxm = app.context(a)
     if ctxmenu.ctx_is_open(ctxm) {
         let r: u32 = ctxmenu.ctx_close(ctxm, ctxmenu.CLOSE_API)
@@ -2045,6 +2051,9 @@ fn ctl_key(ud: u64, key: u32, mods: u32) -> bool {
             return true
         }
     }
+    if cmb_key_route(c, key, mods) {
+        return true
+    }
     if (*c).pg_edit_i != NONE {
         if key == editor.KEY_ENTER {
             w6_commit(c)
@@ -2234,6 +2243,9 @@ fn ctl_ptr(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     if sh_blocking(c) {
         return false
     }
+    if cmb_ptr_route(c, kind, x, y) {
+        return true
+    }
     if sh_visible(c) && !(*c).sh.modal {
         // the host keeps a press / move over the panel from the page (the shield); the same events must not
         // reach the controls behind it here either (tooltip, split, ripple, wave 5/6 pointer)
@@ -2308,6 +2320,7 @@ fn ctl_paint(ud: u64, rc: *mut render.Ctx, w: usize, h: usize) {
     (*c).win_w = w as f64
     (*c).win_h = h as f64
     draw_sheet(c, rc)
+    cmb_paint(c, rc)
     if (*c).drop_open {
         draw_drop(c, rc)
     }
@@ -3483,6 +3496,7 @@ fn w5_busy(c: *mut Ctl) -> bool {
 const K_PGRID: u32 = 21
 const K_SHEET: u32 = 22
 const K_RANGE: u32 = 23
+const K_COMBO: u32 = 29
 const PG_ROWS_MAX: usize = 64
 const PGE_COMMIT: u32 = 5
 
@@ -3778,6 +3792,9 @@ fn sheet_item_rect(a: *mut app.App, k: usize, x: usize, y: usize, w: usize, h: u
 // behind does not hear them. The modal one shuts the whole window off through the popup sink instead.
 fn sh_shield(ud: u64, x: f64, y: f64) -> bool {
     let c: *mut Ctl = ud as *mut Ctl
+    if cmb_shield(c, x, y) {
+        return true
+    }
     if !sh_visible(c) || (*c).sh.modal {
         return false
     }
@@ -5455,4 +5472,249 @@ fn w8_tick(c: *mut Ctl, now: i64) -> bool {
 
 fn w8_busy(c: *mut Ctl) -> bool {
     return w8_tick(c, 0)
+}
+
+
+// ============================================================ COMBOBOX (r146, W29)
+//
+// An editable combobox: an `app.entry` whose text is the query (lib/fui/wave9.fi has the model, the popup, the
+// painting and the accessible side).
+//
+//     let cb: usize = appctl.combobox(a, "Country", picked)       // the field; `picked(a, node)` after a pick
+//     let ok: bool = appctl.combobox_add(a, cb, "Austria")        // items (copied; 512 / 16 KB)
+//
+// Typing refilters (fuzzy, best first, 64 hits at most, 8 rows show), Down / Up open and walk, Enter takes the
+// active row (`picked` fires, the field shows the item), Esc shuts the list, a click on a row takes it. The
+// item index of the last pick is `combobox_picked` (NONE = none). The field is an ordinary entry: `app.text`,
+// `app.set_text`, `app.on_edit` work as always. Entry: node = the field, aux = the heap Cmb.
+
+fn cmb_of(c: *mut Ctl, i: usize) -> *mut wave9.Cmb {
+    return (*c).aux[i] as u64 as *mut wave9.Cmb
+}
+
+fn cmb_idx(a: *mut app.App, id: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return NONE }
+    let i: usize = find(c, id)
+    if i == NONE || (*c).kind[i] != K_COMBO { return NONE }
+    return i
+}
+
+fn cmb_any_open(c: *mut Ctl) -> bool {
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_COMBO && wave9.cmb_is_open(cmb_of(c, i)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn cmb_close_all(c: *mut Ctl) {
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_COMBO {
+            wave9.cmb_close(cmb_of(c, i))
+        }
+        i = i + 1
+    }
+}
+
+// the user changed a text field: a combobox field refilters (and opens its list)
+fn ctl_edit(ud: u64, node: usize) {
+    let c: *mut Ctl = ud as *mut Ctl
+    let i: usize = find(c, node)
+    if i == NONE || (*c).kind[i] != K_COMBO {
+        return
+    }
+    let r: bool = wave9.cmb_edit((*c).a, cmb_of(c, i), node)
+}
+
+// the combobox with the focus whose list is open (or any combobox with the focus for Down / Up)
+fn cmb_focused(c: *mut Ctl) -> usize {
+    let f: usize = app.focus((*c).a)
+    if f == NONE { return NONE }
+    let i: usize = find(c, f)
+    if i == NONE || (*c).kind[i] != K_COMBO { return NONE }
+    return i
+}
+
+fn cmb_key_route(c: *mut Ctl, key: u32, mods: u32) -> bool {
+    let i: usize = cmb_focused(c)
+    if i == NONE {
+        return false
+    }
+    if (mods & editor.MOD_CTRL) != 0 as u32 || (mods & editor.MOD_ALT) != 0 as u32 {
+        return false
+    }
+    let r: u32 = wave9.cmb_key((*c).a, cmb_of(c, i), (*c).node[i], key, mods)
+    if r == wave9.CK_PICK {
+        fire(c, i)
+    }
+    return r != wave9.CK_PASS
+}
+
+// the pointer while a list is open; true = the event belongs to the popup
+fn cmb_ptr_route(c: *mut Ctl, kind: u32, x: f64, y: f64) -> bool {
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_COMBO && wave9.cmb_is_open(cmb_of(c, i)) {
+            let cb: *mut wave9.Cmb = cmb_of(c, i)
+            let en: usize = (*c).node[i]
+            let hit: bool = wave9.cmb_hit((*c).a, cb, en, (*c).win_h, x, y)
+            let r: u32 = wave9.cmb_pointer((*c).a, cb, en, (*c).win_h, kind, x, y, (*c).px, (*c).py)
+            if r == wave9.CK_PICK {
+                fire(c, i)
+                return true
+            }
+            if r != wave9.CK_PASS && hit {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn cmb_shield(c: *mut Ctl, x: f64, y: f64) -> bool {
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_COMBO && wave9.cmb_is_open(cmb_of(c, i))
+        && wave9.cmb_hit((*c).a, cmb_of(c, i), (*c).node[i], (*c).win_h, x, y) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// paint: a list loses its focus -> shut; the scene nodes follow; the popup goes above the page
+fn cmb_paint(c: *mut Ctl, rc: *mut render.Ctx) {
+    let foc: usize = app.focus((*c).a)
+    var i: usize = 0
+    while i < (*c).n {
+        if (*c).kind[i] == K_COMBO {
+            let cb: *mut wave9.Cmb = cmb_of(c, i)
+            if wave9.cmb_is_open(cb) && foc != (*c).node[i] {
+                wave9.cmb_close(cb)
+            }
+            wave9.cmb_sync((*c).a, cb, (*c).node[i], (*c).win_h)
+            if wave9.cmb_is_open(cb) {
+                wave9.cmb_draw((*c).a, rc, cb, (*c).node[i], (*c).win_h)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// An editable combobox; returns the field node (NONE when the entries or controls are used up).
+fn combobox(a: *mut app.App, hint: str, on_pick: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return NONE }
+    let node: usize = app.entry(a, hint)
+    if node == NONE { return NONE }
+    let cb: *mut wave9.Cmb = wave9.cmb_new(a, node)
+    if cb as u64 == 0 { return NONE }
+    let i: usize = add_entry(c, K_COMBO, node)
+    if i == NONE { return NONE }
+    (*c).aux[i] = cb as u64 as usize
+    set_cb(c, i, on_pick)
+    return node
+}
+
+fn combobox_add(a: *mut app.App, id: usize, text: str) -> bool {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return false }
+    return wave9.cmb_add(cmb_of(st(a), i), text)
+}
+
+fn combobox_count(a: *mut app.App, id: usize) -> usize {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return 0 }
+    return wave9.cmb_item_count(cmb_of(st(a), i))
+}
+
+// open the list for the text in the field (all items for an empty field); true = it is open
+fn combobox_open(a: *mut app.App, id: usize) -> bool {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return false }
+    let c: *mut Ctl = st(a)
+    let r: bool = wave9.cmb_open(a, cmb_of(c, i), id)
+    touch(c)
+    return r
+}
+
+fn combobox_close(a: *mut app.App, id: usize) {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return }
+    wave9.cmb_close(cmb_of(st(a), i))
+    touch(st(a))
+}
+
+fn combobox_is_open(a: *mut app.App, id: usize) -> bool {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return false }
+    return wave9.cmb_is_open(cmb_of(st(a), i))
+}
+
+fn combobox_results(a: *mut app.App, id: usize) -> usize {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return 0 }
+    return wave9.cmb_results(cmb_of(st(a), i))
+}
+
+// the item index of the last pick, NONE = none
+fn combobox_picked(a: *mut app.App, id: usize) -> usize {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return NONE }
+    return wave9.cmb_picked(cmb_of(st(a), i))
+}
+
+// the active result row, NONE = the typed text
+fn combobox_active(a: *mut app.App, id: usize) -> usize {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return NONE }
+    return wave9.cmb_active(cmb_of(st(a), i))
+}
+
+fn combobox_row_text(a: *mut app.App, id: usize, row: usize) -> str {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return "" }
+    return wave9.cmb_row_text(cmb_of(st(a), i), row)
+}
+
+// the accessible list node below the field and its row nodes (NONE = no such)
+fn combobox_list_node(a: *mut app.App, id: usize) -> usize {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return NONE }
+    return wave9.cmb_list_node(cmb_of(st(a), i))
+}
+
+fn combobox_item_node(a: *mut app.App, id: usize, r: usize) -> usize {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return NONE }
+    return wave9.cmb_item_node(cmb_of(st(a), i), r)
+}
+
+// the popup rectangle / of a result row (window pixels); false = closed or not shown
+fn combobox_rect(a: *mut app.App, id: usize, out: *mut [f64; 4]) -> bool {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return false }
+    let c: *mut Ctl = st(a)
+    return wave9.cmb_rect(a, cmb_of(c, i), id, (*c).win_h, out)
+}
+
+fn combobox_row_rect(a: *mut app.App, id: usize, row: usize, out: *mut [f64; 4]) -> bool {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return false }
+    let c: *mut Ctl = st(a)
+    return wave9.cmb_row_rect(a, cmb_of(c, i), id, (*c).win_h, row, out)
+}
+
+// the first result row that shows (the list scrolls)
+fn combobox_top(a: *mut app.App, id: usize) -> usize {
+    let i: usize = cmb_idx(a, id)
+    if i == NONE { return 0 }
+    return wave9.cmb_top(cmb_of(st(a), i))
 }

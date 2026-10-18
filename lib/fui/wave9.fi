@@ -1,0 +1,710 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/wave9.fi -- WAVE 9 (W29): editable COMBOBOX popup and the SIZE CLASS tracker, wired into a window.
+//
+// combofilter.fi and sizeclass.fi are pure state. This file is the glue that needs a window.
+// COMBOBOX: the field is an `app.entry`; its text is the query. Every edit refilters (combofilter.filter);
+// the popup is drawn above the page (ctl_paint) with the best 64 hits, 8 rows at a time, the matched letters
+// highlighted. The a11y side: the field has role combobox + expanded/collapsed + a description "N results";
+// the popup is a hidden-when-closed `list` node below the field with up to 8 `listitem` children (the
+// visible rows, the active one selected) -- like the bottom sheet's items, they carry true bounds.
+// SIZE CLASS: a sizeclass.Tracker fed with the window size in dp on every paint.
+// lib/fui/appctl.fi is the door (`appctl.combobox*`, `appctl.size_class`); it only forwards events here.
+
+import std.rt
+import fui.app
+import fui.scene
+import fui.render
+import fui.kit
+import fui.style
+import fui.painter
+import fui.theme
+import fui.widget
+import fui.wave2
+import fui.a11y
+import fui.combofilter
+import fui.sizeclass
+import fui.vlist
+import fui.viewport
+import fui.editor
+import fui.event
+import fui.uistr
+import plat.fuiwirt
+
+export {
+    Cmb, cmb_new, cmb_add, cmb_edit, cmb_refilter, cmb_is_open, cmb_open, cmb_close, cmb_key, cmb_pointer, cmb_hit,
+    cmb_sync, cmb_draw, cmb_rect, cmb_row_rect, cmb_results, cmb_active, cmb_row_text, cmb_item_count, cmb_picked,
+    cmb_list_node, cmb_item_node, cmb_set_active, cmb_top, CB_ROWS, CB_ITEMS, CB_CAP,
+    CK_PASS, CK_USED, CK_PICK,
+    Sz, sz_new, sz_feed, sz_class_w, sz_class_h, sz_nav, sz_columns, sz_dp_w,
+}
+
+const NONE: usize = 4294967295
+const CB_ITEMS: usize = 512
+const CB_POOL: usize = 16384
+const CB_ROWS: usize = 8
+const CB_CAP: usize = 64
+
+// the answers of the key / pointer handlers
+const CK_PASS: u32 = 0
+const CK_USED: u32 = 1
+const CK_PICK: u32 = 2
+
+fn rd32(p: u64) -> u64 { return (*(p as *mut u32)) as u64 }
+
+fn rd8(p: u64) -> u64 { return (*(p as *mut u8)) as u64 }
+
+fn fmin(a: f64, b: f64) -> f64 {
+    if a < b { return a }
+    return b
+}
+
+fn fmax(a: f64, b: f64) -> f64 {
+    if a > b { return a }
+    return b
+}
+
+fn in_rect(x: f64, y: f64, r: *mut [f64; 4]) -> bool {
+    return x >= (*r)[0] && x < (*r)[0] + (*r)[2] && y >= (*r)[1] && y < (*r)[1] + (*r)[3]
+}
+
+// ============================================================ COMBOBOX
+
+struct Cmb {
+    pool: u64, // the text of all items, back to back
+    offs: u64, // n + 1 u32 offsets into the pool
+    res: u64, // the result indices (u32), best first
+    n: usize, // items
+    used: usize, // pool bytes used
+    k: usize, // results of the last filter
+    st: combofilter.ComboState,
+    picked: usize, // item index of the last pick, NONE = none
+    list: usize, // the a11y list node below the field
+    it: [usize; 8], // the a11y rows
+    desc: u64, // heap buffer of the description ("5 results")
+    qh: u64, // hash + length of the last query: an edit that did not change the text does not refilter
+    ql: usize,
+    qvalid: bool,
+    lname: str,
+}
+
+fn cmb_blank() -> Cmb {
+    return Cmb { pool: 0, offs: 0, res: 0, n: 0, used: 0, k: 0, st: combofilter.state_new(8), picked: NONE,
+        list: NONE, it: [NONE; 8], desc: 0, qh: 0, ql: 0, qvalid: false, lname: "" }
+}
+
+fn tr_suggestions() -> str { return uistr.t("wave9.suggestions", "Suggestions") }
+fn tr_result() -> str { return uistr.t("wave9.result", "result") }
+fn tr_results() -> str { return uistr.t("wave9.results", "results") }
+
+// The state of one combobox whose field is the entry node `entry`. NULL when the heap is full.
+fn cmb_new(a: *mut app.App, entry: usize) -> *mut Cmb {
+    var probe: [Cmb; 2] = [cmb_blank(); 2]
+    let sz: usize = ((&probe[1]) as usize) - ((&probe[0]) as usize)
+    let p: u64 = rt.heap_alloc(sz)
+    if p == 0 {
+        return 0 as u64 as *mut Cmb
+    }
+    let cb: *mut Cmb = p as *mut Cmb
+    *cb = cmb_blank()
+    (*cb).pool = rt.heap_alloc(CB_POOL)
+    (*cb).offs = rt.heap_alloc((CB_ITEMS + 1) * 4)
+    (*cb).res = rt.heap_alloc(CB_CAP * 4)
+    (*cb).desc = rt.heap_alloc(64)
+    if (*cb).pool == 0 || (*cb).offs == 0 || (*cb).res == 0 || (*cb).desc == 0 {
+        return 0 as u64 as *mut Cmb
+    }
+    *((*cb).offs as *mut u32) = 0 as u32
+    (*cb).st = combofilter.state_new(CB_ROWS as i64)
+    (*cb).lname = tr_suggestions()
+    // the accessible popup: a list node and its rows, children of the field (like the sheet's items)
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let lst: usize = scene.scene_add(sc, entry, scene.N_WIDGET)
+    if lst != scene.SCENE_NONE {
+        scene.node_set_widget_kind(sc, lst, widget.KIND_NONE)
+        scene.node_set_size(sc, lst, 0.0, 0.0)
+        (*scene.nd(sc, lst)).no_fill = 1 as u32
+        scene.node_set_hidden(sc, lst, true)
+        (*cb).list = lst
+        var r: usize = 0
+        while r < CB_ROWS {
+            let ri: usize = scene.scene_add(sc, lst, scene.N_WIDGET)
+            if ri != scene.SCENE_NONE {
+                scene.node_set_widget_kind(sc, ri, widget.KIND_NONE)
+                scene.node_set_size(sc, ri, 0.0, 0.0)
+                (*scene.nd(sc, ri)).no_fill = 1 as u32
+                scene.node_set_hidden(sc, ri, true)
+                (*cb).it[r] = ri
+            }
+            r = r + 1
+        }
+    }
+    a11y.a11y_set_role(app.ax(a), entry, a11y.ROLE_COMBOBOX)
+    a11y.a11y_set_expanded(app.ax(a), entry, a11y.EXP_COLLAPSED)
+    return cb
+}
+
+// Add an item (copied). false when the 512 items or the 16 KB of text are used up.
+fn cmb_add(cb: *mut Cmb, text: str) -> bool {
+    if (*cb).n >= CB_ITEMS || (*cb).used + text.n > CB_POOL {
+        return false
+    }
+    var i: usize = 0
+    while i < text.n {
+        *(((*cb).pool + ((*cb).used + i) as u64) as *mut u8) = *((text.p as u64 + i as u64) as *mut u8)
+        i = i + 1
+    }
+    (*cb).used = (*cb).used + text.n
+    (*cb).n = (*cb).n + 1
+    *(((*cb).offs + ((*cb).n as u64) * 4) as *mut u32) = (*cb).used as u32
+    (*cb).qvalid = false
+    return true
+}
+
+fn cmb_item_count(cb: *mut Cmb) -> usize { return (*cb).n }
+fn cmb_results(cb: *mut Cmb) -> usize { return (*cb).k }
+fn cmb_picked(cb: *mut Cmb) -> usize { return (*cb).picked }
+fn cmb_list_node(cb: *mut Cmb) -> usize { return (*cb).list }
+fn cmb_top(cb: *mut Cmb) -> usize { return combofilter.top_row(&(*cb).st) as usize }
+
+fn cmb_item_node(cb: *mut Cmb, r: usize) -> usize {
+    if r >= CB_ROWS {
+        return NONE
+    }
+    return (*cb).it[r]
+}
+
+fn cmb_is_open(cb: *mut Cmb) -> bool { return combofilter.is_open(&(*cb).st) }
+
+// The active result row, NONE while the typed text is the "current" one.
+fn cmb_active(cb: *mut Cmb) -> usize {
+    let r: i64 = combofilter.active_row(&(*cb).st)
+    if r < 0 {
+        return NONE
+    }
+    return r as usize
+}
+
+fn cmb_set_active(cb: *mut Cmb, row: usize) {
+    if row >= (*cb).k {
+        return
+    }
+    (*cb).st.sel = row as i64
+    combofilter.ensure_visible(&(*cb).st)
+}
+
+// The text of the item behind result row `row`.
+fn cmb_row_text(cb: *mut Cmb, row: usize) -> str {
+    if row >= (*cb).k {
+        return ""
+    }
+    let idx: u64 = rd32((*cb).res + (row as u64) * 4)
+    let s: u64 = rd32((*cb).offs + idx * 4)
+    let e: u64 = rd32((*cb).offs + (idx + 1) * 4)
+    return str { p: ((*cb).pool + s) as *mut u8, n: (e - s) as usize }
+}
+
+fn hash_str(s: str) -> u64 {
+    var h: u64 = 5381
+    var i: usize = 0
+    while i < s.n {
+        h = ((h * 131) + rd8(s.p as u64 + i as u64)) & 281474976710655
+        i = i + 1
+    }
+    return h
+}
+
+// Refilter for the text of the field. `force` = even when the text did not change (a key that opens the list).
+// true = the results are new.
+fn cmb_refilter(a: *mut app.App, cb: *mut Cmb, entry: usize, force: bool) -> bool {
+    let q: str = app.text(a, entry)
+    let h: u64 = hash_str(q)
+    if !force && (*cb).qvalid && (*cb).qh == h && (*cb).ql == q.n {
+        return false
+    }
+    (*cb).qh = h
+    (*cb).ql = q.n
+    (*cb).qvalid = true
+    let k: usize = combofilter.filter((*cb).pool, (*cb).offs, (*cb).n, q.p as u64, q.n as u64, (*cb).res, CB_CAP)
+    (*cb).k = k
+    combofilter.set_results(&(*cb).st, k)
+    return true
+}
+
+// The field's text changed (typing, paste, cut): list the matches.
+fn cmb_edit(a: *mut app.App, cb: *mut Cmb, entry: usize) -> bool {
+    return cmb_refilter(a, cb, entry, false)
+}
+
+fn cmb_open(a: *mut app.App, cb: *mut Cmb, entry: usize) -> bool {
+    let r: bool = cmb_refilter(a, cb, entry, true)
+    return combofilter.is_open(&(*cb).st)
+}
+
+fn cmb_close(cb: *mut Cmb) {
+    combofilter.close(&(*cb).st)
+}
+
+// ------------------------------------------------------------ geometry
+
+fn cmb_shown(cb: *mut Cmb) -> usize {
+    if (*cb).k > CB_ROWS {
+        return CB_ROWS
+    }
+    return (*cb).k
+}
+
+// The popup rectangle (x, y, w, h) in window pixels; false while the list is closed.
+fn cmb_rect(a: *mut app.App, cb: *mut Cmb, entry: usize, win_h: f64, out: *mut [f64; 4]) -> bool {
+    if !combofilter.is_open(&(*cb).st) || (*cb).k == 0 {
+        return false
+    }
+    let rc: *mut render.Ctx = app.app_ctx(a)
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let rh: f64 = wave2.menu_item_height(rc)
+    let pad: f64 = kit.ln(rc, 4)
+    let h: f64 = rh * (cmb_shown(cb) as f64) + 2.0 * pad
+    let ey: f64 = scene.node_y(sc, entry)
+    let eh: f64 = scene.node_h(sc, entry)
+    var y: f64 = ey + eh + kit.ln(rc, 2)
+    if y + h > win_h {
+        y = ey - h - kit.ln(rc, 2)
+    }
+    if y < 0.0 {
+        y = 0.0
+    }
+    (*out)[0] = scene.node_x(sc, entry)
+    (*out)[1] = y
+    (*out)[2] = fmax(scene.node_w(sc, entry), kit.ln(rc, 120))
+    (*out)[3] = h
+    return true
+}
+
+// The rectangle of result row `row` (only for rows that show).
+fn cmb_row_rect(a: *mut app.App, cb: *mut Cmb, entry: usize, win_h: f64, row: usize, out: *mut [f64; 4]) -> bool {
+    var r: [f64; 4] = [0.0; 4]
+    if !cmb_rect(a, cb, entry, win_h, &r) {
+        return false
+    }
+    let top: usize = combofilter.top_row(&(*cb).st) as usize
+    if row < top || row >= top + cmb_shown(cb) || row >= (*cb).k {
+        return false
+    }
+    let rc: *mut render.Ctx = app.app_ctx(a)
+    let rh: f64 = wave2.menu_item_height(rc)
+    let pad: f64 = kit.ln(rc, 4)
+    (*out)[0] = r[0] + pad
+    (*out)[1] = r[1] + pad + rh * ((row - top) as f64)
+    (*out)[2] = r[2] - 2.0 * pad
+    (*out)[3] = rh
+    return true
+}
+
+// The result row under a window point, NONE outside the rows.
+fn cmb_row_at(a: *mut app.App, cb: *mut Cmb, entry: usize, win_h: f64, x: f64, y: f64) -> usize {
+    var r: [f64; 4] = [0.0; 4]
+    if !cmb_rect(a, cb, entry, win_h, &r) || !in_rect(x, y, &r) {
+        return NONE
+    }
+    let rc: *mut render.Ctx = app.app_ctx(a)
+    let pad: f64 = kit.ln(rc, 4)
+    let k: f64 = (y - r[1] - pad) / wave2.menu_item_height(rc)
+    if k < 0.0 {
+        return NONE
+    }
+    let row: usize = (combofilter.top_row(&(*cb).st) as usize) + (k as usize)
+    if (k as usize) >= cmb_shown(cb) || row >= (*cb).k {
+        return NONE
+    }
+    return row
+}
+
+// Is the point on the popup (the pointer shield of the host asks)?
+fn cmb_hit(a: *mut app.App, cb: *mut Cmb, entry: usize, win_h: f64, x: f64, y: f64) -> bool {
+    var r: [f64; 4] = [0.0; 4]
+    if !cmb_rect(a, cb, entry, win_h, &r) {
+        return false
+    }
+    return in_rect(x, y, &r)
+}
+
+// ------------------------------------------------------------ keys and pointer
+
+// Take row `row` of the results: the field shows its text, the list closes. The item index is `cmb_picked`.
+fn cmb_pick(a: *mut app.App, cb: *mut Cmb, entry: usize, row: usize) {
+    if row >= (*cb).k {
+        return
+    }
+    let idx: u64 = rd32((*cb).res + (row as u64) * 4)
+    let t: str = cmb_row_text(cb, row)
+    app.set_text(a, entry, t)
+    (*cb).picked = idx as usize
+    // the text now is the picked one: an arrow key that only moves the caret must not open the list again
+    (*cb).qh = hash_str(t)
+    (*cb).ql = t.n
+    (*cb).qvalid = true
+    combofilter.close(&(*cb).st)
+}
+
+// A key while the field has the focus. CK_PASS = the field takes it, CK_USED = taken, CK_PICK = taken and a row was picked.
+fn cmb_key(a: *mut app.App, cb: *mut Cmb, entry: usize, key: u32, mods: u32) -> u32 {
+    let s: *mut combofilter.ComboState = &(*cb).st
+    let open: bool = combofilter.is_open(s)
+    if key == editor.KEY_DOWN {
+        if !open {
+            let o: bool = cmb_open(a, cb, entry)
+        } else {
+            combofilter.key_down(s)
+        }
+        return CK_USED
+    }
+    if key == editor.KEY_UP {
+        if !open {
+            let o2: bool = cmb_open(a, cb, entry)
+            if combofilter.is_open(s) && (*cb).k > 0 {
+                (*s).sel = (*cb).k as i64 - 1
+                combofilter.ensure_visible(s)
+            }
+        } else {
+            combofilter.key_up(s)
+        }
+        return CK_USED
+    }
+    if !open {
+        return CK_PASS
+    }
+    if key == editor.KEY_PGDN {
+        combofilter.page_down(s)
+        return CK_USED
+    }
+    if key == editor.KEY_PGUP {
+        combofilter.page_up(s)
+        return CK_USED
+    }
+    // Home / End move the list only while a row is active; otherwise they are the caret's
+    if key == editor.KEY_HOME && combofilter.active_row(s) >= 0 {
+        combofilter.key_home(s)
+        return CK_USED
+    }
+    if key == editor.KEY_END && combofilter.active_row(s) >= 0 {
+        combofilter.key_end(s)
+        return CK_USED
+    }
+    if key == editor.KEY_ENTER {
+        let r: i64 = combofilter.accept(s)
+        if r >= 0 {
+            cmb_pick(a, cb, entry, r as usize)
+            return CK_PICK
+        }
+        // the typed text stays: the list is shut, Enter goes on to the app
+        return CK_PASS
+    }
+    if key == editor.KEY_ESC {
+        if combofilter.dismiss(s) {
+            return CK_USED
+        }
+        return CK_PASS
+    }
+    if key == editor.KEY_TAB {
+        combofilter.close(s)
+        return CK_PASS
+    }
+    return CK_PASS
+}
+
+// The pointer while the list is open (px, py = the last window position, for the wheel). CK_PICK = a row was clicked.
+fn cmb_pointer(a: *mut app.App, cb: *mut Cmb, entry: usize, win_h: f64, kind: u32, x: f64, y: f64,
+    px: f64, py: f64) -> u32 {
+    if !combofilter.is_open(&(*cb).st) {
+        return CK_PASS
+    }
+    let s: *mut combofilter.ComboState = &(*cb).st
+    if kind == fuiwirt.HOOK_WHEEL {
+        if !cmb_hit(a, cb, entry, win_h, px, py) {
+            return CK_PASS
+        }
+        // y = the notches (positive = down)
+        var d: i64 = 0
+        if y > 0.0 {
+            d = 3
+        } else if y < 0.0 {
+            d = 0 - 3
+        }
+        var t: i64 = (*s).top + d
+        var maxtop: i64 = (*s).n - (*s).rows
+        if maxtop < 0 {
+            maxtop = 0
+        }
+        if t > maxtop {
+            t = maxtop
+        }
+        if t < 0 {
+            t = 0
+        }
+        (*s).top = t
+        return CK_USED
+    }
+    let row: usize = cmb_row_at(a, cb, entry, win_h, x, y)
+    if kind == fuiwirt.HOOK_MOVE {
+        if row != NONE {
+            (*s).sel = row as i64
+            return CK_USED
+        }
+        return CK_PASS
+    }
+    if kind == fuiwirt.HOOK_DOWN {
+        if row != NONE {
+            cmb_pick(a, cb, entry, row)
+            return CK_PICK
+        }
+        if cmb_hit(a, cb, entry, win_h, x, y) {
+            return CK_USED
+        }
+        // on the field itself the list stays; anywhere else it closes (the click goes on to what is there)
+        let sc: *mut scene.Scene = app.app_scene(a)
+        let inside: bool = x >= scene.node_x(sc, entry) && x < scene.node_x(sc, entry) + scene.node_w(sc, entry)
+        && y >= scene.node_y(sc, entry) && y < scene.node_y(sc, entry) + scene.node_h(sc, entry)
+        if !inside {
+            combofilter.close(s)
+            return CK_USED
+        }
+    }
+    return CK_PASS
+}
+
+// ------------------------------------------------------------ accessible side
+
+fn put_dec(p: u64, v: usize) -> usize {
+    var tmp: [u8; 20] = [0 as u8; 20]
+    var n: usize = 0
+    var x: usize = v
+    if x == 0 {
+        tmp[0] = 48 as u8
+        n = 1
+    }
+    while x > 0 {
+        tmp[n] = (48 + (x % 10)) as u8
+        x = x / 10
+        n = n + 1
+    }
+    var i: usize = 0
+    while i < n {
+        *((p + i as u64) as *mut u8) = tmp[n - 1 - i]
+        i = i + 1
+    }
+    return n
+}
+
+// The scene nodes follow the state: expanded flag, "N results", the list and its visible rows with bounds.
+fn cmb_sync(a: *mut app.App, cb: *mut Cmb, entry: usize, win_h: f64) {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let ax: *mut a11y.A11y = app.ax(a)
+    let open: bool = combofilter.is_open(&(*cb).st) && (*cb).k > 0
+    if open {
+        a11y.a11y_set_expanded(ax, entry, a11y.EXP_EXPANDED)
+        var n: usize = put_dec((*cb).desc, (*cb).k)
+        *(((*cb).desc + n as u64) as *mut u8) = 32 as u8
+        n = n + 1
+        var w: str = tr_results()
+        if (*cb).k == 1 {
+            w = tr_result()
+        }
+        var j: usize = 0
+        while j < w.n && n < 63 {
+            *(((*cb).desc + n as u64) as *mut u8) = *((w.p as u64 + j as u64) as *mut u8)
+            n = n + 1
+            j = j + 1
+        }
+        a11y.a11y_set_description(ax, entry, (*cb).desc, n)
+    } else {
+        a11y.a11y_set_expanded(ax, entry, a11y.EXP_COLLAPSED)
+        a11y.a11y_set_description(ax, entry, 0, 0)
+    }
+    let lst: usize = (*cb).list
+    if lst == NONE {
+        return
+    }
+    scene.node_set_hidden(sc, lst, !open)
+    if open {
+        a11y.a11y_set_role(ax, lst, a11y.ROLE_LIST)
+        a11y.a11y_set_name(ax, lst, (*cb).lname.p as u64, (*cb).lname.n)
+        var pr: [f64; 4] = [0.0; 4]
+        if cmb_rect(a, cb, entry, win_h, &pr) {
+            let nl: *mut scene.Node = scene.nd(sc, lst)
+            (*nl).x = pr[0]
+            (*nl).y = pr[1]
+            (*nl).w = pr[2]
+            (*nl).h = pr[3]
+        }
+    } else {
+        a11y.a11y_set_role(ax, lst, a11y.ROLE_NONE)
+        a11y.a11y_clear_name(ax, lst)
+    }
+    let top: usize = combofilter.top_row(&(*cb).st) as usize
+    let sel: i64 = combofilter.active_row(&(*cb).st)
+    var r: usize = 0
+    while r < CB_ROWS {
+        let ni: usize = (*cb).it[r]
+        if ni != NONE {
+            let row: usize = top + r
+            let show: bool = open && row < (*cb).k && r < cmb_shown(cb)
+            scene.node_set_hidden(sc, ni, !show)
+            let ew: *mut widget.Widget = scene.node_widget(sc, ni)
+            if show {
+                let t: str = cmb_row_text(cb, row)
+                a11y.a11y_set_role(ax, ni, a11y.ROLE_LISTITEM)
+                a11y.a11y_set_name(ax, ni, t.p as u64, t.n)
+                widget.w_set_selected(ew, sel == row as i64)
+                var rr: [f64; 4] = [0.0; 4]
+                if cmb_row_rect(a, cb, entry, win_h, row, &rr) {
+                    let nr: *mut scene.Node = scene.nd(sc, ni)
+                    (*nr).x = rr[0]
+                    (*nr).y = rr[1]
+                    (*nr).w = rr[2]
+                    (*nr).h = rr[3]
+                }
+            } else {
+                a11y.a11y_set_role(ax, ni, a11y.ROLE_NONE)
+                a11y.a11y_clear_name(ax, ni)
+                widget.w_set_selected(ew, false)
+            }
+        }
+        r = r + 1
+    }
+}
+
+// ------------------------------------------------------------ painting
+
+// One result line: the matched letters in bold accent colour, the rest in the text colour.
+fn cmb_draw_row(rc: *mut render.Ctx, cb: *mut Cmb, row: usize, q: str, x: f64, y: f64, w: f64, h: f64, hot: bool) {
+    let z: *mut painter.Painter = render.ctx_painter(rc)
+    let fo: *mut theme.Shape = theme.theme_shape(render.ctx_theme(rc))
+    if hot {
+        painter.round_rect(z, x, y, w, h, render.len_of(rc, (*fo).r_button), kit.tokc(rc, style.TOK_BUTTON_HOVER))
+    }
+    let t: str = cmb_row_text(cb, row)
+    let idx: usize = rd32((*cb).res + (row as u64) * 4) as usize
+    let mask: u64 = combofilter.highlight((*cb).pool, (*cb).offs, idx, q.p as u64, q.n as u64)
+    let size: f64 = render.len_of(rc, (*fo).font)
+    let tcol: u32 = kit.tokc(rc, style.TOK_TEXT)
+    let acol: u32 = kit.accent_on(rc, style.TOK_SURFACE)
+    let padx: f64 = kit.ln(rc, 8)
+    var cx: f64 = x + padx
+    let maxx: f64 = x + w - padx
+    var i: usize = 0
+    while i < t.n && maxx - cx > 1.0 {
+        let m: bool = byte_matched(t, mask, i)
+        var j: usize = i + 1
+        while j < t.n && byte_matched(t, mask, j) == m {
+            j = j + 1
+        }
+        let piece: str = str { p: (t.p as u64 + i as u64) as *mut u8, n: j - i }
+        var col: u32 = tcol
+        var wt: usize = 400
+        if m {
+            col = acol
+            wt = 700
+        }
+        let adv: f64 = kit.draw_label(rc, cx, y, h, size, wt, col, piece, maxx - cx)
+        cx = cx + adv
+        i = j
+    }
+}
+
+// Is byte `i` part of the match? A UTF-8 continuation byte follows the lead byte of its letter.
+fn byte_matched(t: str, mask: u64, i: usize) -> bool {
+    var lead: usize = i
+    while lead > 0 && (rd8(t.p as u64 + lead as u64) & 192) == 128 {
+        lead = lead - 1
+    }
+    if lead >= 64 {
+        return false
+    }
+    return ((mask >> (lead as u64)) & 1) != 0
+}
+
+// The popup, above everything of the page.
+fn cmb_draw(a: *mut app.App, rc: *mut render.Ctx, cb: *mut Cmb, entry: usize, win_h: f64) {
+    var r: [f64; 4] = [0.0; 4]
+    if !cmb_rect(a, cb, entry, win_h, &r) {
+        return
+    }
+    var p: widget.Widget = widget.widget_new(widget.KIND_MENU)
+    widget.w_place(&p, r[0], r[1], r[2], r[3])
+    wave2.draw_menu(rc, &p)
+    let q: str = app.text(a, entry)
+    let top: usize = combofilter.top_row(&(*cb).st) as usize
+    let sel: i64 = combofilter.active_row(&(*cb).st)
+    var k: usize = 0
+    while k < cmb_shown(cb) {
+        var rr: [f64; 4] = [0.0; 4]
+        if cmb_row_rect(a, cb, entry, win_h, top + k, &rr) {
+            cmb_draw_row(rc, cb, top + k, q, rr[0], rr[1], rr[2], rr[3], sel == (top + k) as i64)
+        }
+        k = k + 1
+    }
+    // a thin thumb when there are more results than rows
+    if (*cb).k > CB_ROWS {
+        let z: *mut painter.Painter = render.ctx_painter(rc)
+        let pad: f64 = kit.ln(rc, 4)
+        let th: f64 = r[3] - 2.0 * pad
+        let tw: f64 = kit.ln(rc, 3)
+        let size: f64 = th * (CB_ROWS as f64) / ((*cb).k as f64)
+        let off: f64 = th * (top as f64) / ((*cb).k as f64)
+        painter.round_rect(z, r[0] + r[2] - tw - kit.ln(rc, 2), r[1] + pad + off, tw, size, tw / 2.0,
+            kit.tokc(rc, style.TOK_TEXT_MUTED))
+    }
+}
+
+// ============================================================ SIZE CLASS
+
+struct Sz {
+    t: sizeclass.Tracker,
+    w_dp: i64,
+    h_dp: i64,
+    cb: fn(*mut app.App, u32),
+    has_cb: bool,
+    changes: usize,
+}
+
+fn sz_cb_none(a: *mut app.App, c: u32) {
+}
+
+fn sz_new() -> *mut Sz {
+    var probe: [Sz; 2] = [Sz { t: sizeclass.tracker_new(), w_dp: 0, h_dp: 0, cb: sz_cb_none, has_cb: false, changes: 0 },
+        Sz { t: sizeclass.tracker_new(), w_dp: 0, h_dp: 0, cb: sz_cb_none, has_cb: false, changes: 0 }]
+    let sz: usize = ((&probe[1]) as usize) - ((&probe[0]) as usize)
+    let p: u64 = rt.heap_alloc(sz)
+    if p == 0 {
+        return 0 as u64 as *mut Sz
+    }
+    let s: *mut Sz = p as *mut Sz
+    *s = Sz { t: sizeclass.tracker_new(), w_dp: 0, h_dp: 0, cb: sz_cb_none, has_cb: false, changes: 0 }
+    return s
+}
+
+// Feed the window size (pixels); `scale` = pixels per dp. true = the width or height class changed.
+fn sz_feed(s: *mut Sz, w_px: f64, h_px: f64, scale: f64) -> bool {
+    var sc: f64 = scale
+    if sc < 0.25 {
+        sc = 1.0
+    }
+    (*s).w_dp = (w_px / sc) as i64
+    (*s).h_dp = (h_px / sc) as i64
+    let a: bool = sizeclass.track(&(*s).t, (*s).w_dp)
+    let b: bool = sizeclass.track_h(&(*s).t, (*s).h_dp)
+    if a || b {
+        (*s).changes = (*s).changes + 1
+        return true
+    }
+    return false
+}
+
+fn sz_class_w(s: *mut Sz) -> u32 { return sizeclass.class_w(&(*s).t) }
+fn sz_class_h(s: *mut Sz) -> u32 { return sizeclass.class_h(&(*s).t) }
+fn sz_nav(s: *mut Sz) -> u32 { return sizeclass.nav_mode(sizeclass.class_w(&(*s).t)) }
+fn sz_dp_w(s: *mut Sz) -> i64 { return (*s).w_dp }
+
+// How many columns of at least `min_col` dp fit into the window (gap dp between them, at most `max_cols`).
+fn sz_columns(s: *mut Sz, min_col: i64, gap: i64, max_cols: usize) -> usize {
+    return sizeclass.columns((*s).w_dp, min_col, gap, max_cols)
+}

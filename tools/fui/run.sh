@@ -782,6 +782,9 @@ build appw8w
 # appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
 build appw6
 "$W/appw6" | tail -n 3
+# appw8: editable combobox in the ten-line API (typing filters, Down/Up/Enter/Esc, click, shield, a11y rows, wheel, focus)
+build appw8
+"$W/appw8" | tail -n 3 | grep -q "APPW8 PASSED"
 # W16: mnemonics (Alt+letter, '&'), Tab order end to end, shortcut management
 build w16
 "$W/w16" | tail -n 3
