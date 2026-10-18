@@ -163,6 +163,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "combine common subexpressions",
     },
     PassInfo {
+        name: "fuse-checks",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "checked u64 multiply by 2^k (after a checked i64 cast) becomes one compare, the original checks move to a cold block",
+    },
+    PassInfo {
         name: "licm",
         scope: Scope::Func,
         debug_preserving: true,
@@ -544,6 +550,20 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
             eprintln!("promote: pre-check {:.1} ms, {} functions passed it, all {:.1} ms", t_check, n_check, t.elapsed().as_secs_f64() * 1000.0);
         }
         clk.add("promote", t);
+    }
+    // r806: the very last step, once per function. Earlier it would hide the checks from `bce`
+    // and the range analysis, and from the inliner's size heuristic.
+    if cfg.runs("fuse-checks") {
+        let t = std::time::Instant::now();
+        let mut n = 0usize;
+        for f in m.funcs.iter_mut() {
+            if f.constant_time || !f.secret.is_empty() {
+                continue;
+            }
+            n += fuse_checks(f);
+            phi_check(f, "fuse-checks");
+        }
+        clk.add2("fuse-checks", t, n > 0);
     }
     clk.print();
     st
@@ -2249,4 +2269,195 @@ fn op_has_float(op: &Op, f: &Func) -> bool {
 /// **ROUND 71** — a 32-bit pattern out of the i128 an `Op::Const` carries.
 fn bits32(a: i128) -> u32 {
     (a as u128) as u32
+}
+
+// ------------------------------------------ check fusion with a slow path (r806) ---
+
+/// An instruction that cannot trap, store or call: it may move behind a fused check.
+fn fuse_movable(op: &Op) -> bool {
+    match op {
+        Op::Const(_) | Op::Cmp { .. } | Op::Un(..) | Op::Cast { .. } | Op::PtrAdd { .. } | Op::Select { .. } => true,
+        Op::Bin(o, ..) => !matches!(o, BinOp::Div | BinOp::Rem),
+        _ => false,
+    }
+}
+
+/// `checked_mul.u64 v, 2^k` (optionally preceded by the `checked_cast.i64.u64` of `v` in the same block)
+/// becomes ONE unsigned compare `v >= 2^(64-k)` on the fast path. The failing branch goes to a cold block
+/// that repeats the original checked operations (they panic there, with the original message and
+/// operand values), so behaviour is unchanged. The fast path then multiplies unchecked.
+fn fuse_checks(f: &mut Func) -> usize {
+    let cm = const_map(f);
+    let n0 = f.blocks.len();
+    // A checked multiply whose result nobody reads is the body of an earlier cold block: leave it alone.
+    let used = collect_uses(f, &(0..n0).collect::<Vec<usize>>());
+    let mut chain_t: Vec<Vec<u32>> = vec![Vec::new(); n0];
+    let mut chain_s: Vec<Vec<u32>> = vec![Vec::new(); n0];
+    let mut count = 0usize;
+    for b in 0..n0 {
+        let mut cur = b;
+        let mut from = 0usize;
+        'again: loop {
+            let blk = &f.blocks[cur];
+            let mut found = None;
+            for i in from..blk.insts.len() {
+                let ins = &blk.insts[i];
+                if ins.dst.map_or(true, |d| !used.contains(&d)) {
+                    continue;
+                }
+                let (a, bb, msg) = match (&ins.op, ins.dst) {
+                    (Op::CheckedBin { op: BinOp::Mul, a, b, msg }, Some(_)) if ins.ty == FTy::U64 => (*a, *b, msg),
+                    _ => continue,
+                };
+                let pow2 = |v: Val| -> Option<u32> {
+                    let c = *cm.get(&v)?;
+                    if c >= 2 && c <= (1i128 << 63) && (c & (c - 1)) == 0 { Some(c.trailing_zeros()) } else { None }
+                };
+                let (v, kv, k, v_first) = if let Some(k) = pow2(bb) {
+                    (a, bb, k, true)
+                } else if let Some(k) = pow2(a) {
+                    (bb, a, k, false)
+                } else {
+                    continue;
+                };
+                if cm.contains_key(&v) {
+                    continue;
+                }
+                // the checked cast of `v` earlier in this block, with only movable instructions in between
+                let mut cast: Option<(usize, Val, FTy, String)> = None;
+                for j in (0..i).rev() {
+                    let c = &blk.insts[j];
+                    if c.dst == Some(v) {
+                        if let Op::CheckedCast { src, from, msg } = &c.op {
+                            if *from == FTy::I64 && c.ty == FTy::U64 {
+                                cast = Some((j, *src, *from, msg.clone()));
+                            }
+                        }
+                        break;
+                    }
+                    if !fuse_movable(&c.op) {
+                        break;
+                    }
+                }
+                let split_at = cast.as_ref().map(|c| c.0).unwrap_or(i);
+                // no alloca may end up outside the entry block
+                if blk.insts[split_at + 1..].iter().any(|x| matches!(x.op, Op::Alloca { .. })) {
+                    continue;
+                }
+                found = Some((i, split_at, v, kv, k, v_first, msg.clone(), cast));
+                break;
+            }
+            let (i, split_at, v, kv, k, v_first, msg, cast) = match found {
+                Some(x) => x,
+                None => break 'again,
+            };
+            let _ = kv;
+            let loc = f.blocks[cur].insts[i].loc;
+            let m = f.blocks[cur].insts[i].dst.unwrap();
+            let (ma, mb) = match &f.blocks[cur].insts[i].op {
+                Op::CheckedBin { a, b, .. } => (*a, *b),
+                _ => unreachable!(),
+            };
+            let tail_id = f.add_block();
+            let slow_id = f.add_block();
+            let mut rest = f.blocks[cur].insts.split_off(split_at);
+            // rest[0] is the instruction at split_at (the cast, or the mul itself)
+            let mut tail_insts: Vec<crate::fir::Inst> = Vec::new();
+            let mut slow_insts: Vec<crate::fir::Inst> = Vec::new();
+            let mut head_extra: Vec<crate::fir::Inst> = Vec::new();
+            let kconst = (1u64 << k) as i128;
+            let lim: i128 = if k == 0 { 0 } else { (1u128 << (64 - k)) as i128 };
+            let lim_v = f.new_val_pub(FTy::U64);
+            let ok_v = f.new_val_pub(FTy::Bool);
+            let kc = f.new_val_pub(FTy::U64);
+            let sm = f.new_val_pub(FTy::U64);
+            if let Some((j, src, from, cmsg)) = &cast {
+                let _ = j;
+                let cl = rest[0].loc;
+                head_extra.push(crate::fir::Inst::like(Some(v), FTy::U64, Op::Cast { src: *src, from: *from }, cl));
+                let sc = f.new_val_pub(FTy::U64);
+                slow_insts.push(crate::fir::Inst::like(
+                    Some(sc),
+                    FTy::U64,
+                    Op::CheckedCast { src: *src, from: *from, msg: cmsg.clone() },
+                    cl,
+                ));
+                slow_insts.push(crate::fir::Inst::like(Some(kc), FTy::U64, Op::Const(kconst), loc));
+                let (x, y) = if v_first { (sc, kc) } else { (kc, sc) };
+                slow_insts.push(crate::fir::Inst::like(
+                    Some(sm),
+                    FTy::U64,
+                    Op::CheckedBin { op: BinOp::Mul, a: x, b: y, msg: msg.clone() },
+                    loc,
+                ));
+                // tail: everything between the cast and the mul, the unchecked mul, the rest
+                let mul_idx = i - split_at;
+                for (n, ins) in rest.drain(..).enumerate() {
+                    if n == 0 {
+                        continue; // the cast
+                    }
+                    if n == mul_idx {
+                        tail_insts.push(crate::fir::Inst::like(Some(m), FTy::U64, Op::Bin(BinOp::Mul, ma, mb), loc));
+                    } else {
+                        tail_insts.push(ins);
+                    }
+                }
+            } else {
+                slow_insts.push(crate::fir::Inst::like(Some(kc), FTy::U64, Op::Const(kconst), loc));
+                let (x, y) = if v_first { (v, kc) } else { (kc, v) };
+                slow_insts.push(crate::fir::Inst::like(
+                    Some(sm),
+                    FTy::U64,
+                    Op::CheckedBin { op: BinOp::Mul, a: x, b: y, msg: msg.clone() },
+                    loc,
+                ));
+                for (n, ins) in rest.drain(..).enumerate() {
+                    if n == 0 {
+                        tail_insts.push(crate::fir::Inst::like(Some(m), FTy::U64, Op::Bin(BinOp::Mul, ma, mb), loc));
+                    } else {
+                        tail_insts.push(ins);
+                    }
+                }
+            }
+            let _ = i;
+            let old_term = std::mem::replace(
+                &mut f.blocks[cur].term,
+                Term::BrCond { cond: ok_v, then_bb: slow_id, else_bb: tail_id },
+            );
+            {
+                let h = &mut f.blocks[cur];
+                h.insts.extend(head_extra);
+                h.insts.push(crate::fir::Inst::like(Some(lim_v), FTy::U64, Op::Const(lim), loc));
+                h.insts.push(crate::fir::Inst::like(
+                    Some(ok_v),
+                    FTy::Bool,
+                    Op::Cmp { op: CmpOp::Ge, ty: FTy::U64, a: v, b: lim_v },
+                    loc,
+                ));
+            }
+            let succs = old_term.successors();
+            f.blocks[tail_id as usize].insts = tail_insts;
+            f.blocks[tail_id as usize].term = old_term;
+            f.blocks[slow_id as usize].insts = slow_insts;
+            f.blocks[slow_id as usize].term = Term::Br(tail_id);
+            for s in succs {
+                crate::promote::rename_phi_pred_pub(f, s as usize, cur as BlockId, tail_id);
+            }
+            chain_t[b].push(tail_id);
+            chain_s[b].push(slow_id);
+            count += 1;
+            cur = tail_id as usize;
+            from = 0;
+        }
+    }
+    if count > 0 {
+        let mut order: Vec<u32> = Vec::with_capacity(f.blocks.len());
+        for i in 0..n0 {
+            order.push(i as u32);
+            order.extend(chain_t[i].iter().copied());
+            order.extend(chain_s[i].iter().copied());
+        }
+        crate::inline::apply_block_order(f, &order);
+    }
+    count
 }

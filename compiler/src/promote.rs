@@ -1717,3 +1717,7 @@ fn apply(f: &mut Func, plan: &Plan, k: &Cell, l: &LoopInfo, ph: usize) {
     }
     f.loc_stamp = saved_stamp;
 }
+
+pub(crate) fn rename_phi_pred_pub(f: &mut Func, b: usize, old: BlockId, new: BlockId) {
+    rename_phi_pred(f, b, old, new);
+}

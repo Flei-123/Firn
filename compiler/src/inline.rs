@@ -707,6 +707,16 @@ pub(crate) fn reorder_blocks(f: &mut Func, after: usize, new_ids: &[u32]) {
     if order.len() != n {
         return; // something is off -- better not reorder at all
     }
+    apply_block_order(f, &order);
+}
+
+/// Brings the blocks into the order `order` (old numbers, every block exactly once)
+/// and rewrites jump targets and phi edges.
+pub(crate) fn apply_block_order(f: &mut Func, order: &[u32]) {
+    let n = f.blocks.len();
+    if order.len() != n {
+        return;
+    }
     // old -> new
     let mut map = vec![0u32; n];
     for (new_i, &old) in order.iter().enumerate() {
@@ -716,7 +726,7 @@ pub(crate) fn reorder_blocks(f: &mut Func, after: usize, new_ids: &[u32]) {
     let old_blocks = std::mem::take(&mut f.blocks);
     let mut by_id: Vec<Option<crate::fir::Block>> = old_blocks.into_iter().map(Some).collect();
     let mut new_blocks: Vec<crate::fir::Block> = Vec::with_capacity(n);
-    for &old in &order {
+    for &old in order {
         let mut b = by_id[old as usize].take().expect("block handed out twice");
         b.id = map[old as usize];
         new_blocks.push(b);
