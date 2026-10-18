@@ -431,6 +431,10 @@ gzip -dc tools/ucd/BidiCharacterTest.txt.gz | "$W/bidiconf"
 # via the approximation.
 build bidi
 "$W/bidi"
+# GSUB context lookups (type 5/6, formats 1-3) against rules of real fonts,
+# and the ccmp lookups of DejaVu (tools/fui/gsubctx_main.fi).
+build gsubctx
+"$W/gsubctx"
 echo "== 18h. DIE PLATTFORMSCHICHT OHNE BILDSCHIRM (X11 + WIRT) =="
 # lib/window/x11.fi speaks the X11 protocol itself (no Xlib, no
 # xcb), lib/plat/fuiwirt.fi hands the events to lib/fui/control.fi.

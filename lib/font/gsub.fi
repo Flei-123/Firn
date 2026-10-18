@@ -31,13 +31,21 @@
 //                 lookup flag IgnoreMarks: a vowel sign between lam and
 //                 alif must not prevent the ligature
 //
+//   Context       type 5 and 6 (context / chaining context), formats 1, 2
+//                 and 3, with ClassDef: `gsub_context` finds the first rule
+//                 that matches at a position and hands back its
+//                 SubstLookupRecords (position + lookup number); the
+//                 caller applies them (nested type 1 and 4, in place).
+//   ccmp          is taken along (bit F_CCMP, every Arabic position); DejaVu
+//                 carries two chaining lookups under it (Hebrew ayin with
+//                 vowel, the tone letters U+02E5..).
+//
 // WHAT IS NOT READ, and it is said here instead of silently missing:
-// type 2, 3, 5, 6 and 8 (multiple, alternate, context and
-// reverse substitution). DejaVu Sans carries for `arab` two such
-// context lookups under `ccmp` (the decomposition of characters with hamza); they
-// are skipped, and the result is the precomposed
-// character instead of the decomposed form -- readable and right, just not
-// finer. GPOS (the position of the vowel signs) is likewise not read;
+// type 2 with more than one output glyph (multiple substitution needs
+// INSERTING into the glyph array, which the per-character arrays of
+// lib/fui/shape.fi cannot do), type 3 and 8 (alternate and reverse
+// substitution), and nested lookups that are themselves context
+// lookups. DejaVu needs none of them for `arab`. GPOS (the position of the vowel signs) is likewise not read;
 // how vowel signs nevertheless end up in the right place is stated in
 // lib/fui/painter.fi at the bidi path.
 //
@@ -50,8 +58,10 @@ export {
     Gsub, gsub_new, gsub_init, gsub_ok, gsub_count,
     gsub_lookup_index, gsub_lookup_mask, gsub_lookup_type,
     gsub_lookup_ignores_marks, gsub_single, gsub_ligature,
-    gsub_is_mark,
-    F_ISOL, F_FINA, F_INIT, F_MEDI, F_RLIG, F_LIGA, F_RQD,
+    gsub_is_mark, gsub_context, gsub_act_count, gsub_act_pos,
+    gsub_act_lookup, gsub_li_type, gsub_li_single, gsub_li_ligature,
+    gsub_li_ignores_marks, gsub_context_li, gsub_open, gsub_multiple_len, gsub_multiple_glyph,
+    F_ISOL, F_FINA, F_INIT, F_MEDI, F_RLIG, F_LIGA, F_RQD, F_CCMP,
     MAX_LOOKUPS,
 }
 
@@ -64,6 +74,7 @@ const F_MEDI: u32 = 8
 const F_RLIG: u32 = 16
 const F_LIGA: u32 = 32
 const F_RQD: u32 = 64
+const F_CCMP: u32 = 128
 
 // This many lookups `gsub_init` remembers at most. DejaVu Sans needs
 // nine for `arab`.
@@ -80,6 +91,20 @@ struct Gsub {
     n: usize,
     idx: [u16; 48], // Lookup-Nummern, aufsteigend (= Anwendungsfolge)
     mask: [u32; 48], // which features they apply to
+    // Scratch of gsub_context (the question parameters and the answer).
+    c_gids: u64,
+    c_skip: u64,
+    c_n: usize,
+    c_ign: usize,
+    c_mode: u32, // 1 glyphs, 2 classes, 3 coverages
+    c_st: usize,
+    c_cdb: usize,
+    c_cdi: usize,
+    c_cda: usize,
+    ipos: [u32; 16], // the positions of the matched input glyphs
+    act_pos: [u32; 8],
+    act_li: [u32; 8],
+    nact: usize,
 }
 
 #[no_gc]
@@ -87,6 +112,9 @@ fn gsub_new() -> Gsub {
     return Gsub {
         ok: 0, base: 0, lookups: 0, classdef: 0, n: 0,
         idx: [0; 48], mask: [0; 48],
+        c_gids: 0, c_skip: 0, c_n: 0, c_ign: 0, c_mode: 0, c_st: 0,
+        c_cdb: 0, c_cdi: 0, c_cda: 0, ipos: [0; 16],
+        act_pos: [0; 8], act_li: [0; 8], nact: 0,
     }
 }
 
@@ -126,6 +154,7 @@ fn feature_bit(f: *mut ttf.Font, rec: usize) -> u32 {
     if tag_is(f, rec, 109, 101, 100, 105) { return F_MEDI } // medi
     if tag_is(f, rec, 114, 108, 105, 103) { return F_RLIG } // rlig
     if tag_is(f, rec, 108, 105, 103, 97) { return F_LIGA } // liga
+    if tag_is(f, rec, 99, 99, 109, 112) { return F_CCMP } // ccmp
     return 0
 }
 
@@ -236,6 +265,31 @@ fn gsub_init(f: *mut ttf.Font, g: *mut Gsub) -> bool {
     }
     (*g).ok = 1
     return (*g).n > 0
+}
+
+// Open the GSUB and GDEF tables WITHOUT choosing a script: the lookups can
+// then be asked by number (gsub_li_*, gsub_context_li). false if there is
+// no GSUB.
+#[no_gc]
+fn gsub_open(f: *mut ttf.Font, g: *mut Gsub) -> bool {
+    var o: usize = 0
+    var l: usize = 0
+    if !ttf.font_table(f, 71, 83, 85, 66, &o, &l) { // GSUB
+        return false
+    }
+    (*g).base = o
+    (*g).lookups = o + u16at(f, o + 8) as usize
+    (*g).classdef = 0
+    var go: usize = 0
+    var gl: usize = 0
+    if ttf.font_table(f, 71, 68, 69, 70, &go, &gl) { // GDEF
+        let cd: u32 = u16at(f, go + 4)
+        if cd != 0 as u32 {
+            (*g).classdef = go + cd as usize
+        }
+    }
+    (*g).ok = 1
+    return true
 }
 
 // ------------------------------------------------------------ Coverage
@@ -359,7 +413,11 @@ fn subtable(f: *mut ttf.Font, lk: usize, s: usize) -> usize {
 // SINGLE SUBSTITUTION (type 1). The new glyph, or `gid` itself.
 #[no_gc]
 fn gsub_single(f: *mut ttf.Font, g: *mut Gsub, k: usize, gid: u32) -> u32 {
-    let lk: usize = lookup_at(f, g, k)
+    return single_lk(f, lookup_at(f, g, k), gid)
+}
+
+#[no_gc]
+fn single_lk(f: *mut ttf.Font, lk: usize, gid: u32) -> u32 {
     let ns: usize = u16at(f, lk + 4) as usize
     var s: usize = 0
     while s < ns {
@@ -392,8 +450,15 @@ fn gsub_single(f: *mut ttf.Font, g: *mut Gsub, k: usize, gid: u32) -> u32 {
 fn gsub_ligature(f: *mut ttf.Font, g: *mut Gsub, k: usize, gids: u64,
     skip: u64, n: usize, at: usize, used: u64, cap: usize,
     nused: *mut usize) -> u32 {
+    return ligature_lk(f, g, lookup_at(f, g, k), gids, skip, n, at, used,
+        cap, nused)
+}
+
+#[no_gc]
+fn ligature_lk(f: *mut ttf.Font, g: *mut Gsub, lk: usize, gids: u64,
+    skip: u64, n: usize, at: usize, used: u64, cap: usize,
+    nused: *mut usize) -> u32 {
     *nused = 0
-    let lk: usize = lookup_at(f, g, k)
     let ign: bool = (u16at(f, lk + 2) & LF_IGNORE_MARKS) != 0 as u32
     let first: u32 = *((gids + (at * 4) as u64) as *mut u32)
     let ns: usize = u16at(f, lk + 4) as usize
@@ -446,3 +511,431 @@ fn gsub_ligature(f: *mut ttf.Font, g: *mut Gsub, k: usize, gids: u64,
     }
     return 0
 }
+
+// ------------------------------------------- Lookups by LOOKUP NUMBER
+
+// The lookups that the SubstLookupRecords of a context rule name are
+// numbered in the LookupList of the font, not in our short list, and they
+// need not belong to any feature of ours.
+#[no_gc]
+fn lookup_li(f: *mut ttf.Font, g: *mut Gsub, li: u32) -> usize {
+    return (*g).lookups + u16at(f, (*g).lookups + 2 + (li as usize) * 2) as usize
+}
+
+#[no_gc]
+fn lk_type(f: *mut ttf.Font, lk: usize) -> u32 {
+    let ty: u32 = u16at(f, lk)
+    if ty == 7 as u32 && u16at(f, lk + 4) > 0 as u32 {
+        let st: usize = lk + u16at(f, lk + 6) as usize
+        return u16at(f, st + 2)
+    }
+    return ty
+}
+
+#[no_gc]
+fn gsub_li_type(f: *mut ttf.Font, g: *mut Gsub, li: u32) -> u32 {
+    return lk_type(f, lookup_li(f, g, li))
+}
+
+#[no_gc]
+fn gsub_li_ignores_marks(f: *mut ttf.Font, g: *mut Gsub, li: u32) -> bool {
+    return (u16at(f, lookup_li(f, g, li) + 2) & LF_IGNORE_MARKS) != 0 as u32
+}
+
+#[no_gc]
+fn gsub_li_single(f: *mut ttf.Font, g: *mut Gsub, li: u32, gid: u32) -> u32 {
+    return single_lk(f, lookup_li(f, g, li), gid)
+}
+
+#[no_gc]
+fn gsub_li_ligature(f: *mut ttf.Font, g: *mut Gsub, li: u32, gids: u64,
+    skip: u64, n: usize, at: usize, used: u64, cap: usize,
+    nused: *mut usize) -> u32 {
+    return ligature_lk(f, g, lookup_li(f, g, li), gids, skip, n, at, used,
+        cap, nused)
+}
+
+// MULTIPLE SUBSTITUTION (type 2): the number of glyphs the lookup `li`
+// makes of `gid`, 0 if it does not apply. `gsub_multiple_glyph` is the j-th.
+// More than one glyph needs INSERTING into the glyph array; the caller
+// (lib/fui/shape.fi) can only take the one-glyph case.
+#[no_gc]
+fn multiple_seq(f: *mut ttf.Font, g: *mut Gsub, li: u32, gid: u32) -> usize {
+    let lk: usize = lookup_li(f, g, li)
+    let ns: usize = u16at(f, lk + 4) as usize
+    var s: usize = 0
+    while s < ns {
+        let st: usize = subtable(f, lk, s)
+        let ci: i32 = coverage(f, st + u16at(f, st + 2) as usize, gid)
+        if ci >= 0 && (ci as u32) < u16at(f, st + 4) {
+            return st + u16at(f, st + 6 + (ci as usize) * 2) as usize
+        }
+        s = s + 1
+    }
+    return 0
+}
+
+#[no_gc]
+fn gsub_multiple_len(f: *mut ttf.Font, g: *mut Gsub, li: u32,
+    gid: u32) -> usize {
+    let sq: usize = multiple_seq(f, g, li, gid)
+    if sq == 0 {
+        return 0
+    }
+    return u16at(f, sq) as usize
+}
+
+#[no_gc]
+fn gsub_multiple_glyph(f: *mut ttf.Font, g: *mut Gsub, li: u32, gid: u32,
+    j: usize) -> u32 {
+    let sq: usize = multiple_seq(f, g, li, gid)
+    if sq == 0 || j >= u16at(f, sq) as usize {
+        return gid
+    }
+    return u16at(f, sq + 2 + j * 2)
+}
+
+// ------------------------------------------------------ CONTEXT (5, 6)
+
+// The class of a glyph in the ClassDef at `cd` (0 = none: everything is
+// class 0).
+#[no_gc]
+fn classdef_of(f: *mut ttf.Font, cd: usize, gid: u32) -> u32 {
+    if cd == 0 {
+        return 0
+    }
+    let fmt: u32 = u16at(f, cd)
+    if fmt == 1 as u32 {
+        let start: u32 = u16at(f, cd + 2)
+        let cnt: u32 = u16at(f, cd + 4)
+        if gid < start || gid >= start + cnt {
+            return 0
+        }
+        return u16at(f, cd + 6 + ((gid - start) as usize) * 2)
+    }
+    if fmt == 2 as u32 {
+        var lo: usize = 0
+        var hi: usize = u16at(f, cd + 2) as usize
+        while lo < hi {
+            let mid: usize = (lo + hi) / 2
+            let r: usize = cd + 4 + mid * 6
+            let s: u32 = u16at(f, r)
+            let e: u32 = u16at(f, r + 2)
+            if gid < s {
+                hi = mid
+            } else if gid > e {
+                lo = mid + 1
+            } else {
+                return u16at(f, r + 4)
+            }
+        }
+    }
+    return 0
+}
+
+#[no_gc]
+fn ctx_gid(g: *mut Gsub, pos: usize) -> u32 {
+    return *(((*g).c_gids + (pos * 4) as u64) as *mut u32)
+}
+
+// Does the position not count (absorbed into a ligature, or a mark under
+// IgnoreMarks)?
+#[no_gc]
+fn ctx_skipped(f: *mut ttf.Font, g: *mut Gsub, pos: usize) -> bool {
+    if *(((*g).c_skip + pos as u64) as *mut u8) != 0 as u8 {
+        return true
+    }
+    return (*g).c_ign != 0 && gsub_is_mark(f, g, ctx_gid(g, pos))
+}
+
+// Does the entry `at` of the array `arr` (octets 2 each) fit the glyph?
+// Mode 1: the entry is a glyph, 2: a class, 3: an offset to a coverage.
+// `cd` is the ClassDef that goes with the array (mode 2).
+#[no_gc]
+fn ctx_fits(f: *mut ttf.Font, g: *mut Gsub, arr: usize, c: usize,
+    gid: u32, cd: usize) -> bool {
+    let v: u32 = u16at(f, arr + c * 2)
+    let mode: u32 = (*g).c_mode
+    if mode == 1 as u32 {
+        return gid == v
+    }
+    if mode == 2 as u32 {
+        return classdef_of(f, cd, gid) == v
+    }
+    return coverage(f, (*g).c_st + v as usize, gid) >= 0
+}
+
+// `cnt` entries forward from position `from`; with `rec` the positions are
+// remembered as input positions from index `ibase` on. `end` gets the
+// position behind the last match.
+#[no_gc]
+fn ctx_fwd(f: *mut ttf.Font, g: *mut Gsub, from: usize, arr: usize,
+    cnt: usize, cd: usize, rec: bool, ibase: usize, end: *mut usize) -> bool {
+    var pos: usize = from
+    var c: usize = 0
+    while c < cnt {
+        while pos < (*g).c_n && ctx_skipped(f, g, pos) {
+            pos = pos + 1
+        }
+        if pos >= (*g).c_n {
+            return false
+        }
+        if !ctx_fits(f, g, arr, c, ctx_gid(g, pos), cd) {
+            return false
+        }
+        if rec {
+            (*g).ipos[ibase + c] = pos as u32
+        }
+        pos = pos + 1
+        c = c + 1
+    }
+    *end = pos
+    return true
+}
+
+// `cnt` entries BACKWARD from before position `at` (entry 0 is the nearest).
+#[no_gc]
+fn ctx_back(f: *mut ttf.Font, g: *mut Gsub, at: usize, arr: usize,
+    cnt: usize, cd: usize) -> bool {
+    var pos: usize = at
+    var c: usize = 0
+    while c < cnt {
+        if pos == 0 {
+            return false
+        }
+        pos = pos - 1
+        while ctx_skipped(f, g, pos) {
+            if pos == 0 {
+                return false
+            }
+            pos = pos - 1
+        }
+        if !ctx_fits(f, g, arr, c, ctx_gid(g, pos), cd) {
+            return false
+        }
+        c = c + 1
+    }
+    return true
+}
+
+// One rule. `inp1` is the array of the input entries from the SECOND glyph
+// on (for coverage format 3 from the second coverage on), `ni` the count of
+// the whole input including the first glyph. If everything fits, the
+// records are put into the answer.
+#[no_gc]
+fn ctx_rule(f: *mut ttf.Font, g: *mut Gsub, at: usize, nb: usize, bt: usize,
+    ni: usize, inp1: usize, nl: usize, la: usize, ns: usize,
+    rec: usize) -> bool {
+    if ni < 1 || ni > 16 {
+        return false
+    }
+    (*g).ipos[0] = at as u32
+    var end: usize = at + 1
+    if ni > 1 {
+        if !ctx_fwd(f, g, at + 1, inp1, ni - 1, (*g).c_cdi, true, 1, &end) {
+            return false
+        }
+    }
+    if nb > 0 && !ctx_back(f, g, at, bt, nb, (*g).c_cdb) {
+        return false
+    }
+    if nl > 0 {
+        var end2: usize = 0
+        if !ctx_fwd(f, g, end, la, nl, (*g).c_cda, false, 0, &end2) {
+            return false
+        }
+    }
+    var j: usize = 0
+    var na: usize = 0
+    while j < ns && na < 8 {
+        let sq: usize = u16at(f, rec + j * 4) as usize
+        if sq < ni {
+            (*g).act_pos[na] = (*g).ipos[sq]
+            (*g).act_li[na] = u16at(f, rec + j * 4 + 2)
+            na = na + 1
+        }
+        j = j + 1
+    }
+    (*g).nact = na
+    return true
+}
+
+// A rule of format 1 or 2 at `rule`; `chain` tells the layout.
+#[no_gc]
+fn ctx_rule_at(f: *mut ttf.Font, g: *mut Gsub, at: usize, rule: usize,
+    chain: bool) -> bool {
+    if chain {
+        let nb: usize = u16at(f, rule) as usize
+        let bt: usize = rule + 2
+        var p: usize = rule + 2 + nb * 2
+        let ni: usize = u16at(f, p) as usize
+        let inp: usize = p + 2
+        if ni < 1 {
+            return false
+        }
+        p = p + 2 + (ni - 1) * 2
+        let nl: usize = u16at(f, p) as usize
+        let la: usize = p + 2
+        p = p + 2 + nl * 2
+        let ns: usize = u16at(f, p) as usize
+        return ctx_rule(f, g, at, nb, bt, ni, inp, nl, la, ns, p + 2)
+    }
+    let ni2: usize = u16at(f, rule) as usize
+    let ns2: usize = u16at(f, rule + 2) as usize
+    if ni2 < 1 {
+        return false
+    }
+    return ctx_rule(f, g, at, 0, 0, ni2, rule + 4, 0, 0, ns2,
+        rule + 4 + (ni2 - 1) * 2)
+}
+
+// The rules of one set (format 1: per glyph, format 2: per class).
+#[no_gc]
+fn ctx_set(f: *mut ttf.Font, g: *mut Gsub, at: usize, set: usize,
+    chain: bool) -> bool {
+    let nr: usize = u16at(f, set) as usize
+    var r: usize = 0
+    while r < nr {
+        if ctx_rule_at(f, g, at, set + u16at(f, set + 2 + r * 2) as usize,
+            chain) {
+            return true
+        }
+        r = r + 1
+    }
+    return false
+}
+
+// The ClassDef at the offset `o` of the subtable `st`; 0 if the offset is 0.
+#[no_gc]
+fn ctx_cd(st: usize, o: u32) -> usize {
+    if o == 0 as u32 {
+        return 0
+    }
+    return st + o as usize
+}
+
+// CONTEXT / CHAINING CONTEXT (type 5 and 6) of lookup `k` at position
+// `at`. `gids` and `skip` are the arrays of the shape (see gsub_ligature),
+// `n` their length. Number of the records of the first matching rule is
+// returned (0 = no rule fits, or it names nothing); they are read with
+// gsub_act_pos / gsub_act_lookup. Positions that are skipped (absorbed,
+// or marks under IgnoreMarks) do not count -- neither in the input nor in
+// the backtrack and lookahead.
+#[no_gc]
+fn gsub_context(f: *mut ttf.Font, g: *mut Gsub, k: usize, gids: u64,
+    skip: u64, n: usize, at: usize) -> usize {
+    return context_lk(f, g, lookup_at(f, g, k), gids, skip, n, at)
+}
+
+// The same for a lookup named by its number in the LookupList of the font
+// (any script: used by the proof against other fonts, see `gsub_open`).
+#[no_gc]
+fn gsub_context_li(f: *mut ttf.Font, g: *mut Gsub, li: u32, gids: u64,
+    skip: u64, n: usize, at: usize) -> usize {
+    return context_lk(f, g, lookup_li(f, g, li), gids, skip, n, at)
+}
+
+#[no_gc]
+fn context_lk(f: *mut ttf.Font, g: *mut Gsub, lk: usize, gids: u64,
+    skip: u64, n: usize, at: usize) -> usize {
+    (*g).nact = 0
+    (*g).c_gids = gids
+    (*g).c_skip = skip
+    (*g).c_n = n
+    (*g).c_ign = 0
+    if (u16at(f, lk + 2) & LF_IGNORE_MARKS) != 0 as u32 {
+        (*g).c_ign = 1
+    }
+    let chain: bool = lk_type(f, lk) == 6 as u32
+    let first: u32 = ctx_gid(g, at)
+    let nsub: usize = u16at(f, lk + 4) as usize
+    var s: usize = 0
+    while s < nsub {
+        let st: usize = subtable(f, lk, s)
+        let fmt: u32 = u16at(f, st)
+        (*g).c_st = st
+        (*g).c_cdb = 0
+        (*g).c_cdi = 0
+        (*g).c_cda = 0
+        if fmt == 1 as u32 {
+            (*g).c_mode = 1
+            let ci: i32 = coverage(f, st + u16at(f, st + 2) as usize, first)
+            if ci >= 0 && (ci as u32) < u16at(f, st + 4) {
+                let set: usize = st + u16at(f, st + 6 + (ci as usize) * 2) as usize
+                if ctx_set(f, g, at, set, chain) {
+                    return (*g).nact
+                }
+            }
+        } else if fmt == 2 as u32 {
+            (*g).c_mode = 2
+            let ci: i32 = coverage(f, st + u16at(f, st + 2) as usize, first)
+            if ci >= 0 {
+                var cnt: usize = 0
+                var sets: usize = 0
+                if chain {
+                    (*g).c_cdb = ctx_cd(st, u16at(f, st + 4))
+                    (*g).c_cdi = ctx_cd(st, u16at(f, st + 6))
+                    (*g).c_cda = ctx_cd(st, u16at(f, st + 8))
+                    cnt = u16at(f, st + 10) as usize
+                    sets = st + 12
+                } else {
+                    (*g).c_cdi = ctx_cd(st, u16at(f, st + 4))
+                    cnt = u16at(f, st + 6) as usize
+                    sets = st + 8
+                }
+                let cls: usize = classdef_of(f, (*g).c_cdi, first) as usize
+                if cls < cnt {
+                    let so: usize = u16at(f, sets + cls * 2) as usize
+                    if so != 0 && ctx_set(f, g, at, st + so, chain) {
+                        return (*g).nact
+                    }
+                }
+            }
+        } else if fmt == 3 as u32 {
+            (*g).c_mode = 3
+            if chain {
+                let nb: usize = u16at(f, st + 2) as usize
+                let bt: usize = st + 4
+                var p: usize = st + 4 + nb * 2
+                let ni: usize = u16at(f, p) as usize
+                let inp: usize = p + 2
+                p = p + 2 + ni * 2
+                let nl: usize = u16at(f, p) as usize
+                let la: usize = p + 2
+                p = p + 2 + nl * 2
+                let ns: usize = u16at(f, p) as usize
+                if ni >= 1 && coverage(f, st + u16at(f, inp) as usize,
+                    first) >= 0 {
+                    if ctx_rule(f, g, at, nb, bt, ni, inp + 2, nl, la, ns,
+                        p + 2) {
+                        return (*g).nact
+                    }
+                }
+            } else {
+                let ni2: usize = u16at(f, st + 2) as usize
+                let ns2: usize = u16at(f, st + 4) as usize
+                let inp2: usize = st + 6
+                if ni2 >= 1 && coverage(f, st + u16at(f, inp2) as usize,
+                    first) >= 0 {
+                    if ctx_rule(f, g, at, 0, 0, ni2, inp2 + 2, 0, 0, ns2,
+                        inp2 + ni2 * 2) {
+                        return (*g).nact
+                    }
+                }
+            }
+        }
+        s = s + 1
+    }
+    return 0
+}
+
+#[no_gc]
+fn gsub_act_count(g: *mut Gsub) -> usize { return (*g).nact }
+
+#[no_gc]
+fn gsub_act_pos(g: *mut Gsub, j: usize) -> usize {
+    return (*g).act_pos[j] as usize
+}
+
+#[no_gc]
+fn gsub_act_lookup(g: *mut Gsub, j: usize) -> u32 { return (*g).act_li[j] }
