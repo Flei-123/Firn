@@ -53,11 +53,20 @@ fi
 #   longer exists -- so it compared NOTHING and reported zeros).
 KNOWN="tests/590_f64.fi tests/871_closure_plain.fi"
 
+# IMPORTS (r752). `firnc0 --emit=fir-raw` lowers the whole merged module program: every function of
+# every imported module, used or not. `.firdump` has no module loader and lowers the one file. A file
+# with an `import` line (even an unused one) therefore compares two different inputs, like the
+# note at the top says. Such files are counted under IMPORTS and not compared; cross-module lowering is
+# covered by tools/fixpoint.sh, tools/self_compare.sh and tools/prune_compare.sh (real compiles).
+# (Stage 1 with a module loader writes the same set of functions in another ORDER and with a different
+# order of the octets in `Str` literals -- measured in r752, not a goal of this gate.)
+
 same=0
 different=0
 known=0
 noncore=0
 comptime=0
+imports=0
 defer_count=0
 skipped=0
 instructions=0
@@ -67,6 +76,10 @@ while IFS= read -r f; do
     # r664: `// firnc1_skip: <why>` in the first lines = a stage-0-only feature (not yet in firnc1).
     if head -n 3 "$f" | grep -q '^// firnc1_skip'; then
         skipped=$((skipped+1))
+        continue
+    fi
+    if grep -qE '^[[:space:]]*import[[:space:]]' "$f"; then
+        imports=$((imports+1))
         continue
     fi
     if ! "$FIRNC" --emit=types "$f" >/dev/null 2>&1; then
@@ -102,6 +115,7 @@ echo "SAME:          $same"
 echo "DIFFERENT:     $different   (known and named: $known)"
 echo "INSTRUCTIONS:  $instructions  (value numbers and blocks included)"
 echo "DEFER:         $defer_count  (not ported in the lowering yet)"
+echo "IMPORTS:       $imports  (module program, not comparable one file at a time)"
 echo "NOT CORE:      $noncore"
 echo "COMPTIME:      $comptime"
 echo "SKIPPED:       $skipped  (firnc0 does not compile the file on its own)"
