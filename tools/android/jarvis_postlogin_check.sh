@@ -171,12 +171,19 @@ run_variant() { # abi:perm:density:font
     $ADB logcat -d -v threadtime 2>/dev/null | grep -E "$PKG|firn|ANR|FATAL|DEBUG" | tail -400 >"$OUT/${tag}.logcat.txt"
     applog >"$OUT/${tag}.app.log" 2>/dev/null
     $ADB shell "ls /data/anr 2>/dev/null | head -3; for f in /data/anr/*; do [ -f \"\$f\" ] && head -60 \"\$f\" | grep -E 'pid|sysTid|prio|Cmd line|\\\"main\\\"|at ' | head -40; done" 2>/dev/null >"$OUT/${tag}.anr.txt"
-    # the crash page: a run that was stopped in the foreground after the sign-in (args.txt line 2 `crashpage` arms it) must show the page at the next start
+    # a bare kill (am force-stop = swipe away) is NO crash: no page, no report is sent (a42). A run with a trace (signal dump) shows the page.
     $ADB shell am force-stop $PKG; sleep 1
     $ADB shell monkey -p $PKG -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
-    check "$tag: crash page after the stop (died after sign-in)" "$(OCR_TRIES=20 wait_ocr ${tag}_07 'crash report|LAST STAGE|DIED')" 1
-    $ADB shell "cat \$(find /data/data/$PKG /sdcard/Android/data/$PKG -name last_report.txt 2>/dev/null | head -1) 2>/dev/null" | head -12 >"$OUT/${tag}.report.txt"
-    check "$tag: report names a stage after the sign-in" "$(grep -c -E 'LAST STAGE: (enter_app|ws_open|info_event|push_setup|pio_keep|first_chat_draw|fg|login_ok|alive_3s|first_frame)' "$OUT/${tag}.report.txt")" 1
+    check "$tag: no crash page after a plain force-stop" "$(OCR_TRIES=16 wait_ocr ${tag}_07 'crash report|LAST STAGE|DIED|abgest')" 0
+    check "$tag: the app shows its normal view after a plain force-stop" "$(OCR_TRIES=20 wait_ocr ${tag}_07b 'Chat|Board|Passwort|Weiter|Benachrichtigungen')" 1
+    applog | grep -c "without an orderly end and without a trace" | sed 's/^/        trace-less start lines in app.log: /'
+    $ADB shell am force-stop $PKG; sleep 1
+    local sdir; sdir="$($ADB shell "dirname \$(find /data/data/$PKG /sdcard/Android/data/$PKG -name startup_stage.txt 2>/dev/null | head -1)" | tr -d '\r')"
+    $ADB shell "printf 'signal 11 (SIGSEGV), code 1, fault addr 0x0 (a42 test dump)\n' > $sdir/sigdump.txt"
+    $ADB shell monkey -p $PKG -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+    check "$tag: crash page when a signal dump is left" "$(OCR_TRIES=20 wait_ocr ${tag}_07c 'crash report|LAST STAGE|DIED')" 1
+    $ADB shell "cat $sdir/last_report.txt 2>/dev/null" | head -12 >"$OUT/${tag}.report.txt"
+    check "$tag: report holds the dump" "$(grep -c -E 'SIGSEGV' "$OUT/${tag}.report.txt")" 1
     $ADB shell am force-stop $PKG
 }
 

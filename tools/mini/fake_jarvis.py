@@ -194,6 +194,14 @@ PROJECTS = {
     "p 2/x": {"id": "p 2/x", "name": "Odd id", "status": "paused", "goal": "", "next": "", "updatedAt": "2026-10-16T10:00:00Z",
               "roadmap": [], "needs": [], "chats": []},
 }
+# FAKE_NPROJECTS=N adds projects g1..gN with roadmaps and open needs (the tab bar must stay visible with 16+ projects)
+for _i in range(1, int(os.environ.get("FAKE_NPROJECTS", "0")) + 1):
+    PROJECTS["g%d" % _i] = {"id": "g%d" % _i, "name": "Project number %d with a longish name" % _i, "status": "active",
+        "goal": "goal %d" % _i, "next": "next step of project %d, a sentence that runs a bit long" % _i, "updatedAt": "2026-10-17T18:00:00Z",
+        "roadmap": [{"id": "r%d" % k, "text": "item %d" % k, "group": "G", "done": k % 3 == 0, "note": ""} for k in range(1, 9)],
+        "needs": [{"id": "n%d" % k, "text": "Question %d of project %d?" % (k, _i), "options": ["Yes", "No"], "cid": None, "done": False}
+                  for k in range(1, 9)],
+        "chats": []}
 TASKS = [{"id": "t1", "text": "buy milk", "due": "2026-10-18T09:00", "category": "Private", "repeat": "none", "done": False, "created": 1}]
 FILES = {}     # disk name -> bytes
 EVENTS = []    # push events (poll feed)
