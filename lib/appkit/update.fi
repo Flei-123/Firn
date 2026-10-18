@@ -76,7 +76,9 @@ export {
     UE_FLOOR, UE_MAGIC, UE_STATE,
     OP_CHECK, OP_FETCH, RUN_AUTO, RUN_THREAD, RUN_PROCESS, RUN_BLOCKING, RUN_ASYNC,
     UPDATE_THREAD_KIND, PH_PENDING, FE_PENDING,
-    update_async_install, update_async_finish, update_async_fail, update_async_cancelled,
+    update_async_install, update_async_install_dl, update_fetch_prepare, update_fetch_url,
+    update_fetch_size, update_fetch_complete, update_async_dl_end, update_progress,
+    update_async_finish, update_async_fail, update_async_cancelled,
 }
 
 // ---- phases (what the UI shows)
@@ -206,6 +208,7 @@ struct Updater {
     alogged: bool,
     budget_ms: u64, // >0: a blocking run on the UI thread, bounded in total
     chk_t0: u64,
+    adl: fn(u64) -> bool, // starts the download on the loop (appkit.update_async), see update_async_finish
 }
 
 static mut G_UPDATER: u64 = 0
@@ -236,11 +239,23 @@ fn update_new() -> *mut Updater {
     (*u).resolver = fetch.resolve_system
     (*u).ahook = ahook_none
     (*u).aget = aget_none
+    (*u).adl = adl_none
     (*u).mode = RUN_AUTO
     (*u).new_token = -1
     (*u).ok = false
     G_UPDATER = p
     return u
+}
+
+fn adl_none(u: u64) -> bool {
+    return false
+}
+
+// The async driver can download too: `start` is called instead of
+// update_fetch_blocking. It returns true when it took over (it ends the run
+// with update_async_dl_end), false when it cannot (nothing was changed).
+fn update_async_install_dl(u: *mut Updater, start: fn(u64) -> bool) {
+    (*u).adl = start
 }
 
 fn ahook_none(u: u64, op: u32) -> bool {
@@ -1221,6 +1236,114 @@ fn update_fetch_blocking(u: *mut Updater) -> u64 {
     return PH_READY
 }
 
+// ---- the same download, driven by the event loop (appkit.update_async) ----
+// update_fetch_blocking above stays for the platforms with a thread or a worker
+// process; here the octets arrive through ahttp's sink and these three calls
+// are the before / the url / the after.
+
+// Checks and opens the staged file for writing. 0 = ready (`fd_out` open,
+// `sp_out` = its path, phase DOWNLOADING); 1 = failed (st_fail is set, nothing open).
+fn update_fetch_prepare(u: *mut Updater, fd_out: *mut i64, sp_out: *mut str) -> u32 {
+    if (*u).st.phase != PH_AVAILABLE || !(*u).build.found {
+        st_fail(u, UE_STATE, "no update to download")
+        return 1
+    }
+    if !platform.plat_can_self_update() {
+        st_fail(u, UE_UNSUPPORTED, "")
+        return 1
+    }
+    (*u).cancel = 0
+    var staged: rt.Buf = rt.buf_new()
+    if !update_staged_path(u, &staged) {
+        rt.buf_free(&staged)
+        st_fail(u, UE_APPLY, "cannot find the program file")
+        return 1
+    }
+    let sp: str = util.buf_to_str_copy(&staged)
+    rt.buf_free(&staged)
+    if platform.plat_swap_kind() == platform.SWAP_FILES {
+        var exe: rt.Buf = rt.buf_new()
+        platform.plat_exe_path(&exe)
+        if !platform.plat_can_write_beside(util.buf_to_str_copy(&exe)) {
+            rt.buf_free(&exe)
+            st_fail(u, UE_WRITABLE, platform.plat_install_hint())
+            return 1
+        }
+        rt.buf_free(&exe)
+    }
+    (*u).st.done = 0
+    (*u).st.total = (*u).build.size
+    st_phase(u, PH_DOWNLOADING)
+    var cp: rt.Buf = rt.buf_new()
+    util.buf_push_str(&cp, sp)
+    rt.buf_push(&cp, 0 as u8)
+    let fd: i64 = syscall(2, rt.buf_ptr(&cp) as i64, 577 | 524288, 493, 0, 0, 0)
+    rt.buf_free(&cp)
+    if fd < 0 {
+        st_fail(u, UE_DISK, sp)
+        return 1
+    }
+    *fd_out = fd
+    *sp_out = sp
+    return 0
+}
+
+// store URL + the build's file name
+fn update_fetch_url(u: *mut Updater, out: *mut rt.Buf) {
+    util.buf_push_str(out, appinfo.app_store_url())
+    rt.buf_push_bytes(out, (&(*u).build.file[0]) as u64, (*u).build.nfile)
+}
+
+fn update_fetch_size(u: *mut Updater) -> u64 {
+    return (*u).build.size
+}
+
+// What update_fetch_blocking does after fetch_run: `fe` = fetch.FE_* of the
+// transfer (FE_OK = it ended well), `http` = the status, `got` = octets
+// written, `digest` = address of the 32 octet SHA-256. The file is closed.
+fn update_fetch_complete(u: *mut Updater, sp: str, fe: u32, http: u32, got: u64, digest: u64) {
+    let b: *mut catalog.Build = &(*u).build
+    if fe != fetch.FE_OK {
+        fs.remove(sp) catch false
+        net_fail(u, fe, http)
+        return
+    }
+    st_phase(u, PH_VERIFYING)
+    if got != (*b).size {
+        fs.remove(sp) catch false
+        st_fail(u, UE_SIZE, "")
+        return
+    }
+    var hex: rt.Buf = rt.buf_new()
+    util.hex_encode(digest, 32, &hex)
+    let same: bool = rt.buf_len(&hex) == 64 && rt.mem_eq(rt.buf_ptr(&hex), (&(*b).sha256[0]) as u64, 64)
+    rt.buf_free(&hex)
+    if !same {
+        fs.remove(sp) catch false
+        log.log_error("update", "download hash mismatch; file deleted")
+        st_fail(u, UE_HASH, "")
+        return
+    }
+    if !magic_ok(sp, str { p: (&(*b).art[0]) as *mut u8, n: (*b).nart }) {
+        fs.remove(sp) catch false
+        st_fail(u, UE_MAGIC, "")
+        return
+    }
+    log.log_info("update", "downloaded and verified")
+    st_phase(u, PH_READY)
+}
+
+// The run is over (after update_fetch_complete or a failed prepare).
+fn update_async_dl_end(u: *mut Updater) {
+    (*u).st.running = 0
+    (*u).st.seq = (*u).st.seq + 1
+    publish(u, true)
+}
+
+fn update_progress(u: *mut Updater, done: u64, total: u64) {
+    fetch_progress(u as u64, done, total)
+}
+
 fn update_forget_staged(u: *mut Updater) {
     var staged: rt.Buf = rt.buf_new()
     if update_staged_path(u, &staged) {
@@ -1256,6 +1379,12 @@ fn update_async_finish(u: *mut Updater, ph: u64) {
         last = PH_ERROR
     }
     if (*u).worker_op == OP_FETCH && last == PH_AVAILABLE {
+        // the driver downloads on the loop (a sink, progress between loop
+        // rounds) and ends the run itself; without one: the blocking way
+        let adl: fn(u64) -> bool = (*u).adl
+        if adl(u as u64) {
+            return
+        }
         update_fetch_blocking(u)
     }
     (*u).st.running = 0
