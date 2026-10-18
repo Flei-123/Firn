@@ -81,7 +81,8 @@ build() {
 echo "== 1. an index outside the array aborts, and both compilers say the same =="
 for src in tools/checkidx/idx_read.fi tools/checkidx/idx_write.fi \
            tools/checkidx/idx_u8.fi tools/checkidx/idx_nested.fi \
-           tools/checkidx/idx_mask_oob.fi tools/checkidx/idx_dom_oob.fi; do
+           tools/checkidx/idx_mask_oob.fi tools/checkidx/idx_dom_oob.fi \
+           tools/checkidx/phi_oob.fi; do
     name=$(basename "$src" .fi)
     for lvl in $LEVELS_CHECKED; do
         msg0=""; msg1=""; rc0=0; rc1=0
@@ -247,7 +248,13 @@ dopt=$("$FIRNC" --emit=fir tools/checkidx/dom_ok.fi 2>/dev/null | grep -c "check
 if [ "$dopt" = 1 ]; then ok; else
     bad "dom_ok: $dopt checks left, expected exactly 1 (the dominating one)"
 fi
-for src in tools/checkidx/idx_mask_oob.fi tools/checkidx/idx_dom_oob.fi; do
+# Phis: a clamp and a guard on an offset leave no check; a clamp one too
+# high leaves one.
+popt=$("$FIRNC" --emit=fir tools/checkidx/phi_ok.fi 2>/dev/null | grep -c "checked_idx")
+if [ "$popt" = 0 ]; then ok; else
+    bad "phi_ok: $popt checks left, expected 0"
+fi
+for src in tools/checkidx/idx_mask_oob.fi tools/checkidx/idx_dom_oob.fi tools/checkidx/phi_oob.fi; do
     kopt=$("$FIRNC" --emit=fir "$src" 2>/dev/null | grep -c "checked_idx")
     if [ "$kopt" -ge 1 ]; then ok; else
         bad "$(basename "$src"): the check that must stay was removed"

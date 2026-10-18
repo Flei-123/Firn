@@ -1,0 +1,269 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_android/jcrash.fi -- crash diagnosis WITHOUT adb. Three sources, put into ONE text the next start shows on screen:
+//   * the startup stages of the last run (appkit.stage: main, window, EGL, first frame ...): where did it die when it never painted?
+//   * the signal dump (plat.sigdump): signal, fault address, pc, library base -- written by the dying process itself
+//   * logcat of this app's own uid (crash + warnings): Android keeps it past the death and lets the app read its own lines
+//   * the newest appkit.crash report file (stderr tail + log tail)
+// The page (build) offers Copy, Send (POST /api/m/crash, text/plain) and Close. The send also happens by itself once a session is there.
+// A start that painted a frame and left no signal dump shows nothing. The text is also kept in `<state>/last_report.txt`.
+import std.rt
+import std.fs
+import std.process
+import std.clipboard
+import async.loop
+import net.jarvisapi
+import fui.app
+import fui.scene
+import appkit.appinfo
+import appkit.platform
+import appkit.util
+import appkit.stage
+import appkit.crash
+import plat.sigdump
+import jshell
+import jtexts
+
+export { init, have_report, build, tick, on_login, on_api, on_close_clear, report_len }
+
+const REPORT_CAP: usize = 16384
+const SHOWN_CAP: usize = 3800
+const SIG_CAP: usize = 1536
+const FILE_CAP: usize = 2500
+const LOG_CAP: usize = 2200
+
+static mut G_REPORT: [u8; 16384] = [0; 16384]
+static mut G_REPORT_N: usize = 0
+static mut G_SIG: [u8; 1536] = [0; 1536]
+static mut G_SIG_N: usize = 0
+static mut G_DIR: [u8; 512] = [0; 512]
+static mut G_DIR_N: usize = 0
+static mut G_HAVE: bool = false
+static mut G_SENT: bool = false
+static mut G_INFLIGHT: bool = false
+static mut G_TRIES: i64 = 0
+static mut G_NODE: usize = 0
+static mut G_TEXT: usize = 0
+static mut G_STATUS: usize = 0
+static mut G_API: u64 = 0
+
+fn dir_str() -> str { return str { p: (&G_DIR[0]) as *mut u8, n: G_DIR_N } }
+
+fn have_report() -> bool { return G_HAVE }
+fn report_len() -> usize { return G_REPORT_N }
+
+fn add(b: *mut rt.Buf, s: str) { util.buf_push_str(b, s) }
+
+// at most `cap` octets from the END of `src` (the last words matter) appended to b
+fn add_tail(b: *mut rt.Buf, src: *mut rt.Buf, cap: usize) {
+    let n: usize = rt.buf_len(src)
+    var from: usize = 0
+    if n > cap { from = n - cap }
+    rt.buf_push_bytes(b, rt.buf_ptr(src) + from as u64, n - from)
+}
+
+// logcat of our own uid: the crash buffer and the warnings of the main buffer
+fn add_logcat(b: *mut rt.Buf) {
+    var c: process.Command = process.command("/system/bin/logcat")
+    process.add_arg(&c, "-d")
+    process.add_arg(&c, "-b")
+    process.add_arg(&c, "crash,main")
+    process.add_arg(&c, "-v")
+    process.add_arg(&c, "threadtime")
+    process.add_arg(&c, "-t")
+    process.add_arg(&c, "250")
+    process.add_arg(&c, "*:W")
+    var out: rt.Buf = rt.buf_new()
+    var err: rt.Buf = rt.buf_new()
+    let code: i32 = process.run_capture(&c, &out, &err, 2500) catch | e | -1
+    process.command_free(&c)
+    add(b, "\n--- logcat (own uid, *:W) exit ")
+    add(b, jshell.dec(code as i64))
+    add(b, " ---\n")
+    if rt.buf_len(&out) > 0 {
+        add_tail(b, &out, LOG_CAP)
+    } else {
+        add(b, "(empty)\n")
+    }
+    rt.buf_free(&out)
+    rt.buf_free(&err)
+}
+
+// Call once, right after appinfo_init and before anything that can crash: opens the stage file, keeps the previous one, reads and
+// removes the old signal dump, installs the signal handler.
+fn init() {
+    var sd: rt.Buf = rt.buf_new()
+    if !platform.plat_dir(platform.DIR_STATE, appinfo.app_id(), appinfo.app_vendor(), &sd) || rt.buf_len(&sd) > 480 {
+        rt.buf_free(&sd)
+        return
+    }
+    rt.mem_copy((&G_DIR[0]) as u64, rt.buf_ptr(&sd), rt.buf_len(&sd))
+    G_DIR_N = rt.buf_len(&sd)
+    rt.buf_free(&sd)
+    let dir: str = dir_str()
+    let opened: bool = stage.stage_open(dir)
+    let sigpath: str = dir + "/sigdump.txt"
+    var old: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(sigpath, &old) catch 0
+    if n > 0 {
+        var k: usize = n
+        if k > SIG_CAP { k = SIG_CAP }
+        rt.mem_copy((&G_SIG[0]) as u64, rt.buf_ptr(&old), k)
+        G_SIG_N = k
+    }
+    rt.buf_free(&old)
+    fs.remove(sigpath) catch false
+    let hooked: bool = sigdump.sd_install(sigpath)
+    stage.stage_mark("main_enter")
+    if hooked { stage.stage_mark("sigdump_installed") }
+}
+
+// After crash_begin: judge the last run and compose the text. True: the page should be shown.
+fn collect() {
+    let unfinished: bool = stage.stage_prev_len() > 0 && !stage.stage_prev_has("first_frame")
+    if !unfinished && G_SIG_N == 0 { return }
+    var b: rt.Buf = rt.buf_new()
+    add(&b, "JARVIS crash report\napp ")
+    add(&b, appinfo.app_name())
+    add(&b, " ")
+    add(&b, appinfo.app_version())
+    add(&b, " (")
+    add(&b, platform.plat_id())
+    add(&b, ")\npackage ")
+    add(&b, appinfo.app_id())
+    add(&b, "\nLAST STAGE: ")
+    if stage.stage_prev_len() > 0 {
+        stage.stage_prev_last(&b)
+    } else {
+        add(&b, "(no stage file)")
+    }
+    add(&b, "\n\n--- signal dump ---\n")
+    if G_SIG_N > 0 {
+        rt.buf_push_bytes(&b, (&G_SIG[0]) as u64, G_SIG_N)
+    } else {
+        add(&b, "(none: no fatal signal reached our handler)\n")
+    }
+    add(&b, "\n--- startup stages of the last start (ms name) ---\n")
+    if stage.stage_prev_len() > 0 {
+        stage.stage_prev(&b)
+    } else {
+        add(&b, "(none)\n")
+    }
+    add_logcat(&b)
+    var cp: rt.Buf = rt.buf_new()
+    if crash.crash_pending(&cp) {
+        var cf: rt.Buf = rt.buf_new()
+        let cn: usize = fs.read_file(util.buf_to_str_copy(&cp), &cf) catch 0
+        if cn > 0 {
+            add(&b, "\n--- appkit crash file ---\n")
+            var k: usize = cn
+            if k > FILE_CAP { k = FILE_CAP }
+            rt.buf_push_bytes(&b, rt.buf_ptr(&cf), k)
+        }
+        rt.buf_free(&cf)
+    }
+    rt.buf_free(&cp)
+    var n: usize = rt.buf_len(&b)
+    if n > REPORT_CAP { n = REPORT_CAP }
+    rt.mem_copy((&G_REPORT[0]) as u64, rt.buf_ptr(&b), n)
+    G_REPORT_N = n
+    rt.buf_free(&b)
+    G_HAVE = true
+    fs.write_file(dir_str() + "/last_report.txt", (&G_REPORT[0]) as u64, G_REPORT_N) catch 0
+}
+
+fn report_str() -> str { return str { p: (&G_REPORT[0]) as *mut u8, n: G_REPORT_N } }
+
+fn set_status(a: *mut app.App, s: str) {
+    if G_STATUS != 0 { app.set_text(a, G_STATUS, s) }
+}
+
+fn on_copy(a: *mut app.App) {
+    let ok: bool = clipboard.copy_text(report_str())
+    if ok { set_status(a, jtexts.t("crash.copied")) }
+}
+
+fn api() -> *mut jarvisapi.Api {
+    if G_API == 0 {
+        G_API = jarvisapi.ja_new(jshell.loop_of(), on_api_raw, 0) as u64
+    }
+    return G_API as *mut jarvisapi.Api
+}
+
+fn on_api_raw(x: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
+    on_api(kind, status)
+}
+
+// true when the answer was ours
+fn on_api(kind: u32, status: i64) -> bool {
+    if kind != jarvisapi.AK_CRASH { return false }
+    G_INFLIGHT = false
+    let a: *mut app.App = jshell.app_ui()
+    if status >= 200 && status < 300 {
+        G_SENT = true
+        set_status(a, jtexts.t("crash.sent"))
+    } else {
+        set_status(a, jtexts.t("crash.failed"))
+    }
+    return true
+}
+
+fn send_now(a: *mut app.App) {
+    if !G_HAVE || G_INFLIGHT || G_SENT { return }
+    let x: *mut jarvisapi.Api = api()
+    jarvisapi.ja_use_jc(x, jshell.jc())
+    if !jarvisapi.ja_has_token(x) {
+        set_status(a, jtexts.t("crash.nosession"))
+        return
+    }
+    G_TRIES = G_TRIES + 1
+    if jarvisapi.ja_crash_send(x, appinfo.app_version(), "firn-android", (&G_REPORT[0]) as u64, G_REPORT_N) {
+        G_INFLIGHT = true
+        set_status(a, jtexts.t("crash.sending"))
+    } else {
+        set_status(a, jtexts.t("crash.failed"))
+    }
+}
+
+fn on_send(a: *mut app.App) {
+    G_SENT = false
+    send_now(a)
+}
+
+// the page is closed: the reports are seen
+fn on_close_clear() {
+    crash.crash_clear()
+    G_HAVE = false
+}
+
+// once a second from main.fi: the first send happens by itself as soon as a session exists (max 3 automatic tries)
+fn tick() {
+    if !G_HAVE || G_SENT || G_INFLIGHT || G_TRIES >= 3 { return }
+    let x: *mut jarvisapi.Api = api()
+    jarvisapi.ja_use_jc(x, jshell.jc())
+    if jarvisapi.ja_has_token(x) { send_now(jshell.app_ui()) }
+}
+
+fn on_login() {
+    G_TRIES = 0
+}
+
+// the page; `on_close` is main.fi's closer (it knows which page comes back)
+fn build(a: *mut app.App, on_close: fn(*mut app.App)) -> usize {
+    collect()
+    G_NODE = app.column(a)
+    jshell.fill(a, G_NODE)
+    let t: usize = app.label(a, jtexts.t("crash.title"), 20)
+    let h: usize = app.label(a, jtexts.t("crash.hint"), 13)
+    G_TEXT = app.textarea(a, "", 16)
+    var shown: usize = G_REPORT_N
+    if shown > SHOWN_CAP { shown = SHOWN_CAP }
+    app.set_text(a, G_TEXT, str { p: (&G_REPORT[0]) as *mut u8, n: shown })
+    G_STATUS = app.label(a, "", 12)
+    let r: usize = app.row(a)
+    app.button(a, jtexts.t("crash.copy"), on_copy)
+    app.button(a, jtexts.t("crash.send"), on_send)
+    app.button(a, jtexts.t("crash.close"), on_close)
+    app.end(a)
+    app.end(a)
+    return G_NODE
+}

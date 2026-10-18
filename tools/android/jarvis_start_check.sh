@@ -13,7 +13,7 @@ APK=${1:?usage: jarvis_start_check.sh <apk> [abi]}
 ABI=${2:-}
 SDK=${SDK:-/root/android-sdk}
 ADB="$SDK/platform-tools/adb -P ${ADB_PORT:-5037} -s ${SERIAL:?set SERIAL}"
-PKG=org.fleitec.jarvis
+PKG=${PKG:-org.fleitec.jarvis}
 PASS=0; FAIL=0
 check() { # name got want
     if [ "$2" = "$3" ]; then echo "  OK    $1"; PASS=$((PASS+1))

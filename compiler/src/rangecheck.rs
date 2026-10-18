@@ -49,11 +49,18 @@
 //! disappears, so the pass is **debug preserving** and runs at `dev-fast`
 //! as well — which is the level the everyday build uses.
 //!
+//!  * **phis (r14)** -- the union of the operands, each read at the end of
+//!    its predecessor with that block's facts plus the branch of the edge
+//!    (`if m > 16 { m = 16 }` gives `m` the interval `[0, 16]`). A guard on an
+//!    offset (`j + 1 < n`, the add checked or provably not wrapping) bounds
+//!    the base (`j < n - 1`).
+//!
 //! ## What it deliberately does not do
 //!
 //! No fixpoint over phis (a loop counter's interval would come out of the
 //! back edge; the loop guard says the same thing more cheaply and without
-//! widening), no interval per program point (one interval per value at the
+//! widening; a loop-carried operand reads the phi again, the depth runs out
+//! and the union is the whole type), no interval per program point (one interval per value at the
 //! block that reads it), no reasoning across calls.
 //!
 //! ## Soundness
@@ -196,7 +203,7 @@ impl<'a> Ana<'a> {
     /// `depth` bounds the recursion; `0` means "the type and the facts, but
     /// do not look at how the value was computed".
     fn range(&self, v: Val, at: usize, depth: u32) -> Option<Range> {
-        self.range_x(v, at, depth, true)
+        self.range_x(v, at, depth, true, None)
     }
 
     /// `use_facts = false` is what makes this terminate. A fact says
@@ -205,17 +212,30 @@ impl<'a> Ana<'a> {
     /// ask each other forever. Below a fact only the STRUCTURE of the other
     /// side counts (a constant, a remainder, a checked index), and the
     /// recursion is bounded by `depth` alone.
-    fn range_x(&self, v: Val, at: usize, depth: u32, use_facts: bool) -> Option<Range> {
+    ///
+    /// `ex` is one more fact that holds on the way into `at`: the branch of
+    /// the edge a phi operand arrives on (see `phi_range`).
+    fn range_x(
+        &self,
+        v: Val,
+        at: usize,
+        depth: u32,
+        use_facts: bool,
+        ex: Option<(Val, bool)>,
+    ) -> Option<Range> {
         let t = self.f.val_ty(v);
         let full = ty_range(t)?;
         let mut r = full;
         if depth > 0 {
-            if let Some(s) = self.structural(v, at, depth - 1, full, use_facts) {
+            if let Some(s) = self.structural(v, at, depth - 1, full, use_facts, ex) {
                 r = meet(r, s);
             }
         }
-        if use_facts {
-            if let Some(s) = self.from_facts(v, at, t, depth) {
+        // Without `use_facts` only the branch of the phi edge itself counts
+        // (it is one comparison, and the other side of it is read by
+        // structure alone), the facts of the block do not.
+        if use_facts || ex.is_some() {
+            if let Some(s) = self.from_facts(v, at, t, depth, ex, use_facts) {
                 r = meet(r, s);
             }
         }
@@ -234,6 +254,7 @@ impl<'a> Ana<'a> {
         depth: u32,
         full: Range,
         use_facts: bool,
+        ex: Option<(Val, bool)>,
     ) -> Option<Range> {
         let op = self.op_of(v)?;
         let t = self.f.val_ty(v);
@@ -275,8 +296,8 @@ impl<'a> Ana<'a> {
             Op::CheckedIdx { len, .. } => Some((0, (*len as i128) - 1)),
             Op::Bin(o @ (BinOp::Add | BinOp::Sub | BinOp::Mul), a, b)
             | Op::CheckedBin { op: o @ (BinOp::Add | BinOp::Sub | BinOp::Mul), a, b, .. } => {
-                let ra = self.range_x(*a, at, depth, use_facts)?;
-                let rb = self.range_x(*b, at, depth, use_facts)?;
+                let ra = self.range_x(*a, at, depth, use_facts, ex)?;
+                let rb = self.range_x(*b, at, depth, use_facts, ex)?;
                 let r = combine(*o, ra, rb)?;
                 // `Op::Bin` WRAPS. Only an interval that cannot leave the
                 // type describes the value that really comes out.
@@ -289,23 +310,111 @@ impl<'a> Ana<'a> {
             // A conversion is the identity exactly when the value fits into
             // the target type; the interval then travels unchanged.
             Op::Cast { src, .. } | Op::CheckedCast { src, .. } => {
-                let rs = self.range_x(*src, at, depth, use_facts)?;
+                let rs = self.range_x(*src, at, depth, use_facts, ex)?;
                 if fits(rs, full) {
                     Some(rs)
                 } else {
                     None
                 }
             }
+            Op::Phi { incoming } => self.phi_range(v, incoming, depth, use_facts),
             _ => None,
         }
     }
 
-    /// What the branches on the way into `at` say about the value.
-    fn from_facts(&self, v: Val, at: usize, t: FTy, depth: u32) -> Option<Range> {
-        let facts = self.facts.get(at)?;
-        if facts.is_empty() {
+    /// The interval of a phi: the union of what each operand is on the edge
+    /// it arrives on. The operand is read at the END of its predecessor,
+    /// with the facts of that block plus the branch of the edge itself
+    /// (`if m > 16 { m = 16 }`: the other operand arrives under `m <= 16`).
+    ///
+    /// No fixpoint. A loop-carried operand asks for the phi again, the depth
+    /// runs out and that read says "the whole type" -- which makes the union
+    /// the whole type and proves nothing, so it is sound. What does work is
+    /// an operand the loop guard bounds (`i + 1` under `i < 240`) and every
+    /// acyclic join of bounded values.
+    fn phi_range(&self, v: Val, incoming: &[(u32, Val)], depth: u32, use_facts: bool) -> Option<Range> {
+        let (home, _) = *self.site.get(&v)?;
+        let n = self.f.blocks.len();
+        if incoming.is_empty() || incoming.len() > 4 {
             return None;
         }
+        let mut acc: Option<Range> = None;
+        for &(pb, val) in incoming {
+            let pb = pb as usize;
+            if pb >= n {
+                return None;
+            }
+            let ex = match self.f.blocks[pb].term {
+                Term::BrCond { cond, then_bb, else_bb }
+                    if then_bb != else_bb && (then_bb as usize == home) != (else_bb as usize == home) =>
+                {
+                    Some((cond, then_bb as usize == home))
+                }
+                _ => None,
+            };
+            let _ = use_facts;
+            let r = self.range_x(val, pb, depth, true, ex)?;
+            acc = Some(match acc {
+                None => r,
+                Some(a) => (a.0.min(r.0), a.1.max(r.1)),
+            });
+        }
+        acc
+    }
+
+    /// `x` as `v + k` (mathematically), if the definition says so and the
+    /// addition cannot wrap: a checked one has already panicked otherwise.
+    fn offset_of(&self, x: Val, v: Val, at: usize, depth: u32) -> Option<i128> {
+        let cst = |y: Val| -> Option<i128> {
+            match self.op_of(y) {
+                Some(Op::Const(c)) => Some(*c),
+                _ => None,
+            }
+        };
+        let (op, a, b, checked) = match self.op_of(x)? {
+            Op::CheckedBin { op: o @ (BinOp::Add | BinOp::Sub), a, b, .. } => (*o, *a, *b, true),
+            Op::Bin(o @ (BinOp::Add | BinOp::Sub), a, b) => (*o, *a, *b, false),
+            _ => return None,
+        };
+        let (base, k) = match op {
+            BinOp::Add if a == v => (a, cst(b)?),
+            BinOp::Add if b == v => (b, cst(a)?),
+            BinOp::Sub if a == v => (a, cst(b)?.checked_neg()?),
+            _ => return None,
+        };
+        if !checked {
+            // A wrapping addition is `v + k` only if it stays in the type.
+            let full = ty_range(self.f.val_ty(x))?;
+            let rv = self.range_x(base, at, depth, false, None)?;
+            if !fits((rv.0.checked_add(k)?, rv.1.checked_add(k)?), full) {
+                return None;
+            }
+        }
+        Some(k)
+    }
+
+    /// What the branches on the way into `at` say about the value.
+    fn from_facts(
+        &self,
+        v: Val,
+        at: usize,
+        t: FTy,
+        depth: u32,
+        ex: Option<(Val, bool)>,
+        use_base: bool,
+    ) -> Option<Range> {
+        let empty: Vec<(Val, bool)> = Vec::new();
+        let base = if use_base { self.facts.get(at).unwrap_or(&empty) } else { &empty };
+        let mut all: Vec<(Val, bool)> = base.clone();
+        if let Some(e) = ex {
+            if !all.iter().any(|(c, _)| *c == e.0) {
+                all.push(e);
+            }
+        }
+        if all.is_empty() {
+            return None;
+        }
+        let facts = &all;
         let mut r = ty_range(t)?;
         for (cond, truth) in facts {
             let (op, cty, a, b) = match self.cmps.get(cond) {
@@ -319,9 +428,26 @@ impl<'a> Ana<'a> {
                 continue;
             }
             let op = if *truth { op } else { invert(op) };
-            // `v OP other` and the mirrored `other OP v`.
+            // `v OP other` and the mirrored `other OP v`; also `v + k OP
+            // other` (`while j + 1 < n` bounds `j` by `n - 1`).
+            let mut shift: i128 = 0;
             let (op, other) = if a == v {
                 (op, b)
+            } else if let Some(k) = self.offset_of(a, v, at, 0) {
+                shift = k;
+                (op, b)
+            } else if let Some(k) = self.offset_of(b, v, at, 0) {
+                shift = k;
+                (
+                    match op {
+                        CmpOp::Lt => CmpOp::Gt,
+                        CmpOp::Le => CmpOp::Ge,
+                        CmpOp::Gt => CmpOp::Lt,
+                        CmpOp::Ge => CmpOp::Le,
+                        x => x,
+                    },
+                    a,
+                )
             } else if b == v {
                 (
                     match op {
@@ -338,9 +464,14 @@ impl<'a> Ana<'a> {
             };
             // The other side needs an interval of its own; asking for it
             // must not walk back into this fact, hence `depth = 0` there.
-            let ro = match self.range_x(other, at, depth, false) {
+            let ro = match self.range_x(other, at, depth, false, None) {
                 Some(x) => x,
                 None => continue,
+            };
+            // `v + shift OP other`  =>  `v OP other - shift`
+            let ro = match (ro.0.checked_sub(shift), ro.1.checked_sub(shift)) {
+                (Some(l), Some(h)) => (l, h),
+                _ => continue,
             };
             match op {
                 CmpOp::Lt => r.1 = r.1.min(ro.1.saturating_sub(1)),
@@ -777,5 +908,103 @@ mod tests {
         );
         f.set_term(0, Term::Ret(Some(q)));
         assert_eq!(remove_provable_arith_checks(&mut f), 0);
+    }
+
+    /// `if x > 16 { x = 16 }; a[x]` -- the phi joins `x` (arriving under
+    /// `x <= 16`) and the constant 16.
+    fn clamp_func(len: u64) -> Func {
+        let mut f = Func::new("t", vec![FTy::U64], FTy::U64);
+        let k = f.new_val_pub(FTy::U64);
+        let c = f.new_val_pub(FTy::Bool);
+        let m = f.new_val_pub(FTy::U64);
+        let ix = f.new_val_pub(FTy::U64);
+        f.blocks = vec![
+            Block {
+                id: 0,
+                insts: vec![
+                    Inst::new(Some(k), FTy::U64, Op::Const(16)),
+                    Inst::new(Some(c), FTy::Bool, Op::Cmp { op: CmpOp::Gt, ty: FTy::U64, a: 0, b: k }),
+                ],
+                term: Term::BrCond { cond: c, then_bb: 1, else_bb: 2 },
+            },
+            Block { id: 1, insts: vec![], term: Term::Br(2) },
+            Block {
+                id: 2,
+                insts: vec![
+                    Inst::new(Some(m), FTy::U64, Op::Phi { incoming: vec![(0, 0), (1, k)] }),
+                    Inst::new(Some(ix), FTy::U64, Op::CheckedIdx { idx: m, len, msg: "x".into() }),
+                ],
+                term: Term::Ret(Some(ix)),
+            },
+        ];
+        f
+    }
+
+    #[test]
+    fn a_clamped_index_needs_no_bounds_check() {
+        let mut f = clamp_func(17);
+        assert_eq!(remove_provable_arith_checks(&mut f), 1);
+    }
+
+    #[test]
+    fn a_clamp_one_past_the_end_keeps_its_bounds_check() {
+        let mut f = clamp_func(16);
+        assert_eq!(remove_provable_arith_checks(&mut f), 0);
+    }
+
+    #[test]
+    fn a_phi_with_an_unbounded_operand_keeps_its_bounds_check() {
+        let mut f = clamp_func(17);
+        // the direct edge now carries the parameter under `x > 16`
+        f.blocks[0].term = Term::BrCond { cond: 2, then_bb: 2, else_bb: 1 };
+        assert_eq!(remove_provable_arith_checks(&mut f), 0);
+    }
+
+    /// `if j + 1 < 16 { a[j] }` -- the guard is about `j + 1`.
+    fn offset_func(len: u64) -> Func {
+        let mut f = Func::new("t", vec![FTy::U64], FTy::U64);
+        let one = f.new_val_pub(FTy::U64);
+        let lim = f.new_val_pub(FTy::U64);
+        let s = f.new_val_pub(FTy::U64);
+        let c = f.new_val_pub(FTy::Bool);
+        let ix = f.new_val_pub(FTy::U64);
+        f.blocks = vec![
+            Block {
+                id: 0,
+                insts: vec![
+                    Inst::new(Some(one), FTy::U64, Op::Const(1)),
+                    Inst::new(Some(lim), FTy::U64, Op::Const(16)),
+                    Inst::new(
+                        Some(s),
+                        FTy::U64,
+                        Op::CheckedBin { op: BinOp::Add, a: 0, b: one, msg: "x".into() },
+                    ),
+                    Inst::new(Some(c), FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: FTy::U64, a: s, b: lim }),
+                ],
+                term: Term::BrCond { cond: c, then_bb: 1, else_bb: 2 },
+            },
+            Block {
+                id: 1,
+                insts: vec![Inst::new(Some(ix), FTy::U64, Op::CheckedIdx { idx: 0, len, msg: "x".into() })],
+                term: Term::Ret(Some(ix)),
+            },
+            Block { id: 2, insts: vec![], term: Term::Ret(Some(0)) },
+        ];
+        f
+    }
+
+    #[test]
+    fn a_guard_on_an_offset_bounds_the_base() {
+        let mut f = offset_func(15);
+        // the checked add (`j + 1 < 16` => `j <= 14`) is gone and so is the index check
+        assert!(remove_provable_arith_checks(&mut f) >= 1);
+        assert!(!f.blocks[1].insts.iter().any(|i| matches!(i.op, Op::CheckedIdx { .. })));
+    }
+
+    #[test]
+    fn a_guard_on_an_offset_does_not_bound_the_base_too_far() {
+        let mut f = offset_func(14);
+        remove_provable_arith_checks(&mut f);
+        assert!(f.blocks[1].insts.iter().any(|i| matches!(i.op, Op::CheckedIdx { .. })));
     }
 }
