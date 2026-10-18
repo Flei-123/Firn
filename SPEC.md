@@ -1183,10 +1183,16 @@ the type check: named arguments are put in parameter order (and evaluated in
 that order), the missing tail is filled with a copy of the default. Errors:
 positional argument after a named one, unknown name (with "did you mean"),
 parameter given twice, missing required parameter, required parameter after an
-optional one, non-constant default. Not allowed: defaults on `extern fn`,
-methods, generic templates, closures and function types; named arguments on
-method calls. See `docs/DEFAULT-ARGS.md`; proof in `tests/3910_default_args.fi`
-and `tests/neg/default_args_*.fi`.
+optional one, non-constant default. Methods (`x.m(a, b: 1)`, not in
+`impl I for T`) and generic templates (`f[T](a, b: 1)`, a default may name `T`:
+`b: T = 3 as T`) take defaults and named arguments too (r704). A method call is
+matched by its bare name (the receiver type is not known to the rewrite): if
+several types define a method of that name, the call is only rewritten when
+the signatures agree (same names, no defaults), otherwise it is an error.
+Not allowed: defaults on `extern fn`, `impl I for T` methods, closures and
+function types. See `docs/DEFAULT-ARGS.md`; proof in
+`tests/3910_default_args.fi`, `tests/3950_default_args_methods.fi` and
+`tests/neg/default_args_*.fi`.
 
 ### 12.1 The grammar of the v0 subset (EBNF)
 

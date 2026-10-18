@@ -123,7 +123,7 @@ Effort S <1 day, M 1-3 days, L >3 days. Status `done` = landed on main in this r
 | G01 | P0 | tooling | `firnc` needs `FIRNLIB` (`import std.io` -> `cannot read dir/std/io.fi`) | sysroot lookup relative to the binary | S | worker vspy-fnc |
 | G02 | P0 | language | `for x in vec` / `for c in str` rejected (`'for ... in' needs an array`) | iteration sugar (desugar to index loop) | M | worker vspy-fnc |
 | G03 | P0 | language | DONE (r664): `fn f(a: i32, b: i32 = 2)` works, constant defaults filled at the call site (docs/DEFAULT-ARGS.md) | constant defaults filled at call site | M | worker dargs |
-| G04 | P0 | language | DONE (r664): named args `f(b: 1, a: 4)` work on plain functions (not on method calls yet) | compile-time resolution | M | worker dargs |
+| G04 | P0 | language | DONE (r664): named args `f(b: 1, a: 4)` work on plain functions, generic templates and method calls (r704; methods matched by bare name) | compile-time resolution | M | worker dargs |
 | G05 | P0 | lib | no blocking SMTP send (sans-IO only, ~40 lines callbacks) | `mail.send(host, port, from, to, msg)` | M | **done** (`mail.mail`: `mail.send`, 11 lines vs Python 12) |
 | G06 | P0 | lib | no `regex.findall`, no `str.lower/split/join` front | Python-like `str` front + findall | S | worker vspy-text |
 | G07 | P0 | lib | no scraping API (dom.api = browser DOM) | `html.soup` | M | **done** |

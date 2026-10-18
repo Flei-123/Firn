@@ -7,11 +7,23 @@ parser + canonical printer in both. Differences from the design below:
 the pass runs after the module merge AND the monomorphization (callees have
 final names, generic instances are plain functions); it is a node-table scan
 in firnc1. Named arguments exist as `ExprKind::Named` / `E_NAMED`
-(parser output only). NOT done yet: defaults/named arguments on METHOD calls
-(`x.m(..)` is resolved by the type checker, not by name), and in firnc1 the
-"default must be a constant expression" check (firnc0 has it). Arguments are
-evaluated in parameter order, not in written order.
-Tests: `tests/3910_default_args.fi`, `tests/neg/default_args_*.fi`.
+(parser output only). Arguments are evaluated in parameter
+order, not in written order. **r704 (methods + templates):** `x.m(a, b: 1)` and
+`f[T](a, b: 1)` take defaults and named args. Generic instances are plain
+functions when the pass runs; the default is copied into each instance with
+`T` substituted (`mono.rs` / `fn_instantiate`). Methods are NOT resolved by
+the receiver type (sema runs later): the pass matches the bare method name
+against every function whose first parameter is `self` (`pick_method` in
+`dargs.rs`, `dargs_pick` in `mono.fi`). One candidate: it is used. Several
+(same method name on different types): the call is left alone when a candidate
+takes it as written; accepted when all have the same parameter names and no
+defaults (named-only); else error "needs default or named arguments but
+exists on several types". `impl I for T` methods take no defaults (the
+signature must equal the interface). firnc1 also checks "default must be a
+constant" now (error counted, no text). Consts inside defaults of a module
+function are renamed with the module (`modules.rs`). Also open: exact
+receiver-type resolution (second sema pass) if the name rule gets in the way.
+Tests: `tests/3910_default_args.fi`, `tests/3950_default_args_methods.fi`, `tests/3951_std_defaults.fi`, `tests/neg/default_args_*.fi`.
 
 ## Syntax
 
