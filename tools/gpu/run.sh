@@ -5,6 +5,7 @@
 #      (lib/mc/mc_raster.fi) on 8 scenes (triangle, textured quad x2, cut-out, voxel chunk, fog, camera inside, far
 #      from the origin) + 3 translucent / entity scenes water_glass, water_glass_fog, boxes (PASS_TRANS, instanced entity boxes
 #      through gl_scene.scene_attach, r94; PSNR ~42 dB measured on llvmpipe, threshold 38): coverage mismatch + PSNR thresholds; ms/frame GPU (llvmpipe) vs CPU raster
+#   2b. model_dump.fi: MESH_MODEL / MESH_MODEL_T quads (own program mc_model_vs/fs.glsl) against mc_raster on 7 scenes (PSNR >= 34 dB)
 #   3. the same dump.fi built for Windows (lib/gpu/glctx.windows.fi, wgl) under Wine + Xvfb; its scene lines must be
 #      IDENTICAL to the Linux ones
 # Prints SKIP (exit 0) when libEGL is missing / no Wine. Usage: bash tools/gpu/run.sh [firnc]
@@ -40,6 +41,19 @@ if [ "$rc" -eq 0 ]; then
     echo "   ok:   GL back end vs mc_raster: $(grep -c '^scene .* ok$' "$D/linux.txt") scenes within the PSNR / coverage thresholds"
 else
     echo "   FAIL: dump exit $rc"; head -3 "$D/linux.err"; fail=1
+fi
+
+# ---- model quads (MESH_MODEL / MESH_MODEL_T, mc_model_vs/fs.glsl) vs mc_raster
+if ! "$FIRNC" -o "$D/model_dump" tools/gpu/model_dump.fi 2>"$D/err"; then
+    echo "   FAIL: model_dump.fi does not compile"; head -5 "$D/err"; fail=1
+else
+    env -u DISPLAY -u EGL_PLATFORM timeout 300 "$D/model_dump" > "$D/model.txt" 2>"$D/model.err"; rc=$?
+    sed 's/^/   /' "$D/model.txt"
+    if [ "$rc" -eq 0 ]; then
+        echo "   ok:   GL model quads vs mc_raster: $(grep -c '^scene .* ok$' "$D/model.txt") scenes (tint, AO, light, cut-out + fog, translucent sorted)"
+    else
+        echo "   FAIL: model_dump exit $rc"; head -3 "$D/model.err"; fail=1
+    fi
 fi
 
 # ---- the same program as a Windows exe under Wine (wgl through the Win64 call gate)

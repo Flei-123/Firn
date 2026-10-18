@@ -56,7 +56,21 @@ export {
 const MAX_PAGES: usize = 4 // atlas pages (texture arrays) the fragment shader can address
 const VS_SRC: str = __include_str("mc_vs.glsl")
 const FS_SRC: str = __include_str("mc_fs.glsl")
+const MVS_SRC: str = __include_str("mc_model_vs.glsl")
+const MFS_SRC: str = __include_str("mc_model_fs.glsl")
 
+const MLOC_RV: usize = 0
+const MLOC_ORIGIN: usize = 1
+const MLOC_ATLAS: usize = 2
+const MLOC_ATLAS1: usize = 3 // 3, 4, 5
+const MLOC_PAGEL: usize = 6
+const MLOC_TILES: usize = 7
+const MLOC_FOG: usize = 8
+const MLOC_FOGC: usize = 9
+const MLOC_LIGHT: usize = 10
+const MLOC_FILTER: usize = 11
+const MLOC_TRANS: usize = 12
+const MLOC_FADE: usize = 13
 const MODE_LEGACY: i32 = 0
 const MODE_POOL: i32 = 1
 const MODE_MULTI: i32 = 2
@@ -68,7 +82,7 @@ const MAX_PAGE_VERTS: usize = 1048576 // later pages grow x4 up to 8 MB + 6 MB
 const NONE: usize = 0xFFFFFFFFFFFFFFFF as usize
 
 // mesh slot (words): vao, vbo, ibo (legacy only), nidx, used, key, page, voff, ioff, nverts, staged, stage_v, stage_i, scratch, stamp
-const SLOT_WORDS: usize = 20
+const SLOT_WORDS: usize = 24
 const S_VAO: usize = 0
 const S_VBO: usize = 1
 const S_IBO: usize = 2
@@ -87,6 +101,11 @@ const S_STAMP: usize = 14 // batch number of the last collected draw (a slot dra
 const S_BK: usize = 15 // 1 = the indices are sorted by face direction (glbe_set_facecull), S_BKE.. hold the bucket ends
 const S_BKE: usize = 16 // 4 words: bucket ends (index counts, 7 buckets: faces -x +x -y +y -z +z, other), 2 x u32 per word
 const FB_N: usize = 7
+const S_MODEL: usize = 20 // 0 = voxel mesh, 2 = MESH_MODEL, 3 = MESH_MODEL_T (model quads, own program + float vertices)
+const S_MV: usize = 21 // CPU copy of the model vertices (12 f32 per vertex, 4 per quad), for the far-to-near sort of MESH_MODEL_T
+const S_MNQ: usize = 22 // quads
+const MQW: usize = 30 // f64 per model quad (mc_model_mesh.MQ_WORDS)
+const MV_F: usize = 12 // f32 per model vertex
 
 // page (words): vbo, ibo, vao, vertex pool, index pool, granule buffer, granule texture, granule CPU copy, vcap, icap, live
 const PAGE_WORDS: usize = 12
@@ -109,6 +128,9 @@ struct GlBackend {
     g: gl33.Gl,
     fbo: gl33.Fbo,
     prog: u32,
+    mprog: u32, // model quad program (mc_model_vs/fs.glsl); 0 = not available (model meshes are skipped)
+    ml: [i32; 20], // its uniform locations (MLOC_*)
+    mcls: i32, // class of the NEXT mesh_upload (mc_backend MESH_*)
     atlas_tex: u32, // texture array of atlas page 0: layer = tile - 1 (page p holds tiles p*page_layers .. (p+1)*page_layers - 1)
     atlas_x: [u32; 3], // texture arrays of atlas pages 1..3 (only when the atlas has more layers than GL_MAX_ARRAY_TEXTURE_LAYERS)
     n_apages: i32, // atlas pages in use (1..MAX_PAGES)
@@ -205,7 +227,7 @@ struct GlBackend {
 fn empty(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
     return GlBackend { ok: false, step: 0, ctx: c, g: gl33.gl_new(),
         fbo: gl33.Fbo { fbo: 0 as u32, color: 0 as u32, depth: 0 as u32, w: w, h: h },
-        prog: 0 as u32, atlas_tex: 0 as u32, atlas_x: [0 as u32; 3], n_apages: 0, page_layers: 1048576, limit_set: 0, l_atlas_x: [0 - 1; 3], l_pagel: 0 - 1, l_rv: 0 - 1, l_origin: 0 - 1, l_atlas: 0 - 1, l_tiles: 0 - 1, l_fog: 0 - 1,
+        prog: 0 as u32, mprog: 0 as u32, ml: [0 - 1; 20], mcls: 0, atlas_tex: 0 as u32, atlas_x: [0 as u32; 3], n_apages: 0, page_layers: 1048576, limit_set: 0, l_atlas_x: [0 - 1; 3], l_pagel: 0 - 1, l_rv: 0 - 1, l_origin: 0 - 1, l_atlas: 0 - 1, l_tiles: 0 - 1, l_fog: 0 - 1,
         l_fogc: 0 - 1, l_light: 0 - 1, l_pool: 0 - 1, l_gran: 0 - 1, l_org: 0 - 1, l_filter: 0 - 1, l_trans: 0 - 1, l_fade: 0 - 1, fade_a: 64, fade_inv: 0, trans_pass: false, near: 0.05,
         w: w, h: h, atile: 16, acols: 16, max_layers: 0, layers_lost: 0, cx: 0.0, cy: 0.0, cz: 0.0, rv: [0.0 as f32; 16],
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0.0, fog_g: 0.0, fog_b: 0.0, day: 256.0, tint_r: 256.0, tint_g: 224.0, tint_b: 176.0, cull: true,
@@ -259,6 +281,24 @@ fn glbe_open_with(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
     gb.l_filter = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_filter")
     gb.l_trans = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_trans")
     gb.l_fade = gl33.gl_uniform_loc(&gb.g, gb.prog, "u_fade")
+    // model quad program: optional (a failed build only disables MESH_MODEL on this back end)
+    gb.mprog = gl33.gl_program(&gb.g, MVS_SRC.p as u64, MVS_SRC.n, MFS_SRC.p as u64, MFS_SRC.n, (&gb.log[0]) as u64, 512)
+    if gb.mprog != 0 as u32 {
+        gb.ml[MLOC_RV] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_rv")
+        gb.ml[MLOC_ORIGIN] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_origin")
+        gb.ml[MLOC_ATLAS] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_atlas")
+        gb.ml[MLOC_ATLAS1] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_atlas1")
+        gb.ml[MLOC_ATLAS1 + 1] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_atlas2")
+        gb.ml[MLOC_ATLAS1 + 2] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_atlas3")
+        gb.ml[MLOC_PAGEL] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_pagel")
+        gb.ml[MLOC_TILES] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_tiles")
+        gb.ml[MLOC_FOG] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_fog")
+        gb.ml[MLOC_FOGC] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_fogc")
+        gb.ml[MLOC_LIGHT] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_light")
+        gb.ml[MLOC_FILTER] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_filter")
+        gb.ml[MLOC_TRANS] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_trans")
+        gb.ml[MLOC_FADE] = gl33.gl_uniform_loc(&gb.g, gb.mprog, "u_fade")
+    }
     gb.fbo = gl33.gl_fbo_new(&gb.g, w, h)
     if gb.fbo.fbo == 0 as u32 {
         gb.step = 4
@@ -308,6 +348,7 @@ fn glbe_set_facecull(gb: *mut GlBackend, on: bool) {
 fn be_mesh_class(o: u64, c: i32) {
     let gb: *mut GlBackend = o as *mut GlBackend
     (*gb).up_keep = c != 0
+    (*gb).mcls = c
 }
 
 fn glbe_calls(gb: *mut GlBackend) -> u64 {
@@ -514,6 +555,9 @@ fn glbe_close(gb: *mut GlBackend) {
         free_atlas_pages(gb)
         if (*gb).prog != 0 as u32 {
             gl33.gl_delete_program(&(*gb).g, (*gb).prog)
+        }
+        if (*gb).mprog != 0 as u32 {
+            gl33.gl_delete_program(&(*gb).g, (*gb).mprog)
         }
         if (*gb).msaa > 0 {
             gl_fbo.target_free(&(*gb).x, &(*gb).mt)
@@ -1127,6 +1171,187 @@ fn bk_visible(k: usize, rx: f64, ry: f64, rz: f64) -> bool {
     return true
 }
 
+// MESH_MODEL / MESH_MODEL_T: nq quads of MQW f64 (mc_raster.raster_draw_models) -> 4 float vertices (MV_F f32: pos xyz | u v tile fk |
+// sky block tint ao) + 6 u32 indices per quad in a private VAO / VBO / IBO (not in the pool pages: model meshes are few and may be re-sorted).
+fn upload_models(gb: *mut GlBackend, s: usize, q: u64, nq: usize, cls: i32) {
+    let g: *mut gl33.Gl = &(*gb).g
+    let b: usize = s * SLOT_WORDS
+    let vbytes: usize = nq * 4 * MV_F * 4
+    let cv: u64 = rt.heap_alloc(vbytes)
+    let ci: u64 = rt.heap_alloc(nq * 6 * 4)
+    if cv == 0 || ci == 0 {
+        if cv != 0 { rt.heap_free(cv, vbytes) }
+        if ci != 0 { rt.heap_free(ci, nq * 6 * 4) }
+        rt.st64((*gb).slots, b + S_USED, 1 as u64)
+        return
+    }
+    var i: usize = 0
+    while i < nq {
+        let qb: usize = i * MQW
+        var k: usize = 0
+        while k < 4 {
+            let vo: u64 = cv + ((i * 4 + k) * MV_F * 4) as u64
+            *(vo as *mut f32) = qd(q, qb + k) as f32
+            *((vo + 4 as u64) as *mut f32) = qd(q, qb + 4 + k) as f32
+            *((vo + 8 as u64) as *mut f32) = qd(q, qb + 8 + k) as f32
+            *((vo + 12 as u64) as *mut f32) = qd(q, qb + 12 + k) as f32
+            *((vo + 16 as u64) as *mut f32) = qd(q, qb + 16 + k) as f32
+            *((vo + 20 as u64) as *mut f32) = qd(q, qb + 20) as f32
+            *((vo + 24 as u64) as *mut f32) = qd(q, qb + 21) as f32
+            *((vo + 28 as u64) as *mut f32) = qd(q, qb + 22) as f32
+            *((vo + 32 as u64) as *mut f32) = qd(q, qb + 23) as f32
+            *((vo + 36 as u64) as *mut f32) = qd(q, qb + 24) as f32
+            *((vo + 40 as u64) as *mut f32) = qd(q, qb + 26 + k) as f32
+            k = k + 1
+        }
+        // quads without a tile (tile 0) are skipped by the CPU raster: degenerate here (index 0 0 0 ...)
+        let io: u64 = ci + (i * 6 * 4) as u64
+        if qd(q, qb + 20) as u32 == 0 as u32 {
+            var z: usize = 0
+            while z < 6 {
+                *((io + (z * 4) as u64) as *mut u32) = (i * 4) as u32
+                z = z + 1
+            }
+        } else {
+            let base: u32 = (i * 4) as u32
+            *(io as *mut u32) = base
+            *((io + 4 as u64) as *mut u32) = base + 1 as u32
+            *((io + 8 as u64) as *mut u32) = base + 2 as u32
+            *((io + 12 as u64) as *mut u32) = base
+            *((io + 16 as u64) as *mut u32) = base + 2 as u32
+            *((io + 20 as u64) as *mut u32) = base + 3 as u32
+        }
+        i = i + 1
+    }
+    let vao: u32 = gl33.gl_gen_vao(g)
+    gl33.gl_bind_vao(g, vao)
+    let vbo: u32 = gl33.gl_gen_buffer(g)
+    gl33.gl_bind_buffer(g, gl33.GL_ARRAY_BUFFER, vbo)
+    gl33.gl_buffer_data(g, gl33.GL_ARRAY_BUFFER, cv, vbytes, gl33.GL_STATIC_DRAW)
+    gl33.gl_enable_attrib(g, 0 as u32)
+    gl33.gl_attrib_f(g, 0 as u32, 3, gl33.GL_FLOAT, false, 48, 0)
+    gl33.gl_enable_attrib(g, 1 as u32)
+    gl33.gl_attrib_f(g, 1 as u32, 4, gl33.GL_FLOAT, false, 48, 12)
+    gl33.gl_enable_attrib(g, 2 as u32)
+    gl33.gl_attrib_f(g, 2 as u32, 4, gl33.GL_FLOAT, false, 48, 28)
+    let ibo: u32 = gl33.gl_gen_buffer(g)
+    gl33.gl_bind_buffer(g, gl33.GL_ELEMENT_ARRAY_BUFFER, ibo)
+    var usage: u32 = gl33.GL_STATIC_DRAW
+    if cls == 3 { usage = gl33.GL_DYNAMIC_DRAW }
+    gl33.gl_buffer_data(g, gl33.GL_ELEMENT_ARRAY_BUFFER, ci, nq * 6 * 4, usage)
+    gl33.gl_bind_vao(g, 0 as u32)
+    (*gb).cur_vao = 0 as u32
+    rt.heap_free(ci, nq * 6 * 4)
+    rt.st64((*gb).slots, b + S_VAO, vao as u64)
+    rt.st64((*gb).slots, b + S_VBO, vbo as u64)
+    rt.st64((*gb).slots, b + S_IBO, ibo as u64)
+    rt.st64((*gb).slots, b + S_NIDX, (nq * 6) as u64)
+    rt.st64((*gb).slots, b + S_MODEL, cls as u64)
+    rt.st64((*gb).slots, b + S_MNQ, nq as u64)
+    if cls == 3 {
+        rt.st64((*gb).slots, b + S_MV, cv) // kept for the sort
+    } else {
+        rt.heap_free(cv, vbytes)
+    }
+    rt.st64((*gb).slots, b + S_USED, 1 as u64)
+    (*gb).up_bytes = (*gb).up_bytes + (vbytes + nq * 24) as u64
+}
+
+fn qd(p: u64, i: usize) -> f64 {
+    return *((p + (i as u64) * (8 as u64)) as *mut f64)
+}
+
+// Draws a model slot now (the collected voxel draws are submitted first so the draw order stays the submission order).
+// MESH_MODEL_T: the quads are sorted far to near by the mean view depth of their corners (like raster_draw_models_ex) and the index buffer
+// is rewritten; blending / depth write come from the pass state (apply_pass).
+fn draw_model(gb: *mut GlBackend, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
+    let g: *mut gl33.Gl = &(*gb).g
+    let b: usize = (h - 1) * SLOT_WORDS
+    let nq: usize = rt.ld64((*gb).slots, b + S_MNQ) as usize
+    if nq == 0 || (*gb).mprog == 0 as u32 { return 0 as u64 }
+    if (*gb).mode >= MODE_MULTI {
+        flush_batch(gb)
+    }
+    let vao: u32 = rt.ld64((*gb).slots, b + S_VAO) as u32
+    if rt.ld64((*gb).slots, b + S_MODEL) == 3 as u64 && rt.ld64((*gb).slots, b + S_MV) != 0 as u64 {
+        let cv: u64 = rt.ld64((*gb).slots, b + S_MV)
+        let ord: u64 = rt.heap_alloc(nq * 8 * 2 + nq * 24)
+        if ord != 0 {
+            let ix: u64 = ord + (nq * 16) as u64 // u32 x 6 per quad
+            var i: usize = 0
+            while i < nq {
+                var dsum: f64 = 0.0
+                var k: usize = 0
+                while k < 4 {
+                    let vo: u64 = cv + ((i * 4 + k) * MV_F * 4) as u64
+                    let x: f64 = ox - (*gb).cx + (*(vo as *mut f32)) as f64
+                    let y: f64 = oy - (*gb).cy + (*((vo + 4 as u64) as *mut f32)) as f64
+                    let z: f64 = oz - (*gb).cz + (*((vo + 8 as u64) as *mut f32)) as f64
+                    dsum = dsum + (*gb).rv[3] as f64 * x + (*gb).rv[7] as f64 * y + (*gb).rv[11] as f64 * z
+                    k = k + 1
+                }
+                *((ord + (nq * 8 + i * 8) as u64) as *mut f64) = dsum
+                rt.st64(ord, i, i as u64)
+                i = i + 1
+            }
+            // stable insertion sort, descending depth (same as the CPU raster)
+            var a1: usize = 1
+            while a1 < nq {
+                let ki: u64 = rt.ld64(ord, a1)
+                let kd: f64 = *((ord + (nq * 8) as u64 + ki * 8 as u64) as *mut f64)
+                var j: usize = a1
+                while j > 0 && *((ord + (nq * 8) as u64 + rt.ld64(ord, j - 1) * 8 as u64) as *mut f64) < kd {
+                    rt.st64(ord, j, rt.ld64(ord, j - 1))
+                    j = j - 1
+                }
+                rt.st64(ord, j, ki)
+                a1 = a1 + 1
+            }
+            var n: usize = 0
+            while n < nq {
+                let qi: u32 = (rt.ld64(ord, n) as u32) * 4 as u32
+                let io: u64 = ix + (n * 24) as u64
+                *(io as *mut u32) = qi
+                *((io + 4 as u64) as *mut u32) = qi + 1 as u32
+                *((io + 8 as u64) as *mut u32) = qi + 2 as u32
+                *((io + 12 as u64) as *mut u32) = qi
+                *((io + 16 as u64) as *mut u32) = qi + 2 as u32
+                *((io + 20 as u64) as *mut u32) = qi + 3 as u32
+                n = n + 1
+            }
+            gl33.gl_bind_vao(g, vao)
+            gl33.gl_bind_buffer(g, gl33.GL_ELEMENT_ARRAY_BUFFER, rt.ld64((*gb).slots, b + S_IBO) as u32)
+            gl33.gl_buffer_sub_data(g, gl33.GL_ELEMENT_ARRAY_BUFFER, 0, nq * 24, ix)
+            rt.heap_free(ord, nq * 8 * 2 + nq * 24)
+        }
+    }
+    gl33.gl_use(g, (*gb).mprog)
+    gl33.gl_u1i(g, (*gb).ml[MLOC_ATLAS], 0)
+    gl33.gl_u1i(g, (*gb).ml[MLOC_ATLAS1], 3)
+    gl33.gl_u1i(g, (*gb).ml[MLOC_ATLAS1 + 1], 4)
+    gl33.gl_u1i(g, (*gb).ml[MLOC_ATLAS1 + 2], 5)
+    gl33.gl_u1i(g, (*gb).ml[MLOC_PAGEL], (*gb).page_layers)
+    var fl: i32 = 0
+    if filtered(gb) { fl = 1 }
+    gl33.gl_u1i(g, (*gb).ml[MLOC_FILTER], fl)
+    gl33.gl_u1i(g, (*gb).ml[MLOC_TRANS], if (*gb).trans_pass { 1 } else { 0 })
+    gl33.gl_u4f(g, (*gb).ml[MLOC_FADE], (*gb).fade_a as f64, (*gb).fade_inv as f64, (*gb).h as f64, 0.0)
+    gl33.gl_uniform_mat4(g, (*gb).ml[MLOC_RV], (&(*gb).rv[0]) as u64)
+    gl33.gl_u2f(g, (*gb).ml[MLOC_TILES], (*gb).atile as f64, (*gb).acols as f64)
+    gl33.gl_u4f(g, (*gb).ml[MLOC_FOG], if (*gb).fog_on { 1.0 } else { 0.0 }, (*gb).fog_start, (*gb).fog_end, 0.0)
+    gl33.gl_u3f(g, (*gb).ml[MLOC_FOGC], (*gb).fog_r, (*gb).fog_g, (*gb).fog_b)
+    gl33.gl_u4f(g, (*gb).ml[MLOC_LIGHT], (*gb).day, (*gb).tint_r, (*gb).tint_g, (*gb).tint_b)
+    gl33.gl_u3f(g, (*gb).ml[MLOC_ORIGIN], ox - (*gb).cx, oy - (*gb).cy, oz - (*gb).cz)
+    gl33.gl_bind_vao(g, vao)
+    gl33.gl_draw_elements(g, gl33.GL_TRIANGLES, (nq * 6) as i32, gl33.GL_UNSIGNED_INT, 0)
+    gl33.gl_bind_vao(g, 0 as u32)
+    (*gb).cur_vao = 0 as u32
+    gl33.gl_use(g, (*gb).prog)
+    (*gb).calls = (*gb).calls + 1 as u64
+    (*gb).fresh = false
+    return (nq * 2) as u64
+}
+
 fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize) -> usize {
     let gb: *mut GlBackend = o as *mut GlBackend
     let s: usize = alloc_slot(gb)
@@ -1140,6 +1365,14 @@ fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize)
         i = i + 1
     }
     rt.st64((*gb).slots, b + S_KEY, key)
+    if (*gb).mcls >= 2 {
+        if (*gb).mprog == 0 as u32 || nverts < MQW {
+            rt.st64((*gb).slots, b + S_USED, 1 as u64)
+            return s + 1 // no model program / no quads: nothing to draw
+        }
+        upload_models(gb, s, verts, nverts / MQW, (*gb).mcls)
+        return s + 1
+    }
     if nverts == 0 || nidx == 0 {
         rt.st64((*gb).slots, b + S_USED, 1 as u64) // empty section: nothing to draw
         return s + 1
@@ -1270,6 +1503,11 @@ fn free_slot(gb: *mut GlBackend, handle: usize) {
         rt.heap_free(rt.ld64((*gb).slots, b + S_SI), (rt.ld64((*gb).slots, b + S_NIDX) as usize) * 4)
         (*gb).staged = (*gb).staged - 1
     }
+    if rt.ld64((*gb).slots, b + S_MV) != 0 as u64 {
+        rt.heap_free(rt.ld64((*gb).slots, b + S_MV), (rt.ld64((*gb).slots, b + S_MNQ) as usize) * 4 * MV_F * 4)
+        rt.st64((*gb).slots, b + S_MV, 0 as u64)
+    }
+    rt.st64((*gb).slots, b + S_MODEL, 0 as u64)
     rt.st64((*gb).slots, b + S_USED, 0 as u64)
     rt.st64((*gb).slots, b + S_NV, 0 as u64)
     rt.st64((*gb).slots, b + S_STAGED, 0 as u64)
@@ -1596,6 +1834,12 @@ fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
     let b: usize = (h - 1) * SLOT_WORDS
     if rt.ld64((*gb).slots, b + S_USED) == 0 as u64 || rt.ld64((*gb).slots, b + S_STAGED) != 0 as u64 {
         return 0 as u64
+    }
+    if rt.ld64((*gb).slots, b + S_MODEL) != 0 as u64 {
+        let mt: u64 = draw_model(gb, h, ox, oy, oz)
+        (*gb).draws = (*gb).draws + 1 as u64
+        (*gb).tris = (*gb).tris + mt
+        return mt
     }
     let nidx: usize = rt.ld64((*gb).slots, b + S_NIDX) as usize
     if nidx < 3 {
