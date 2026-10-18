@@ -211,6 +211,7 @@ if [ $PUSH -eq 1 ] || [ $PICK -eq 1 ] || [ $INSTALL -eq 1 ]; then
     SDX=$BUILD/servicedex
     "$FIRNC" -o "$SDX" "$ROOT/tools/android/servicedex_main.fi"
     "$SDX" "$BUILD/classes.dex" "$LIB"
+    python3 "$ROOT/tools/android/dex_align_check.py" "$BUILD/classes.dex"
     DEX=$BUILD/classes.dex
     OWNDEX=1
     SVCXML=$BUILD/service.xml
