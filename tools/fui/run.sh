@@ -756,6 +756,9 @@ build appw5
 # wave6: bottom sheet + property grid (geometry, hits, keys, drag, a11y twins)
 build wave6
 "$W/wave6" | tail -n 3
+# appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
+build appw6
+"$W/appw6" | tail -n 3
 # W16: mnemonics (Alt+letter, '&'), Tab order end to end, shortcut management
 build w16
 "$W/w16" | tail -n 3

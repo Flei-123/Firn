@@ -50,6 +50,8 @@
 //          kit.Modal focus trap, answers by callback)
 //   WAVE 5 (r45): rating  segmented (+ segment_add)  chips (+ chip_add)  skeleton  chart (+ chart_set)  pager --
 //          see the section WAVE 5 CONTROLS at the end of this file
+//   WAVE 6 (r45): sheet_setup / sheet_show / sheet_hide (bottom sheet overlay, body callback)  propgrid (property grid
+//          node, inline editor, edit callback) -- see the section WAVE 6 CONTROLS at the end of this file
 //
 // ========================================================= HONEST
 //
@@ -80,6 +82,7 @@ import fui.painter
 import fui.kit
 import fui.wave2
 import fui.wave5
+import fui.wave6
 import fui.a11y
 import fui.action
 import fui.ctxmenu
@@ -101,6 +104,11 @@ export {
     rating, rating_value, set_rating_value, segmented, segment_add, segmented_selected, set_segmented_selected,
     chips, chip_add, chip_count, chip_selected, chip_changed, chip_was_removed, skeleton, skeleton_on,
     chart, chart_set, pager, pager_page, pager_show,
+    sheet_setup, sheet_snaps, sheet_dismiss, sheet_on_pointer, sheet_show, sheet_hide, sheet_snap, sheet_visible,
+    sheet_height, sheet_body, sheet_handle,
+    propgrid, propgrid_event, propgrid_row, propgrid_selected, propgrid_select, propgrid_top, propgrid_set_top,
+    propgrid_label_pm, propgrid_inline, propgrid_cell, propgrid_row_rect, propgrid_editing, propgrid_edit_text,
+    propgrid_commit, propgrid_cancel, propgrid_refresh, PGE_COMMIT,
     ripple_on, split_begin, split_mid, split_end, split_ratio, split_set_ratio, split_limits, split_hovered, split_dragging,
     ANS_OK, ANS_CANCEL,
     CTL_MAX, OPT_MAX, NONE,
@@ -214,6 +222,21 @@ struct Ctl {
     mbar: bool,
     // the wave 5 entry whose pager is being dragged
     w5_drag: usize,
+    // wave 6: the bottom sheet (one per window), the property grid whose divider is dragged, the inline editor
+    sh: wave6.Sheet,
+    sh_on: bool,
+    sh_node: usize,
+    sh_body: fn(*mut app.App, *mut render.Ctx, f64, f64, f64, f64),
+    sh_bptr: fn(*mut app.App, u32, f64, f64),
+    sh_kb: bool,
+    sh_ms: i64,
+    w6_drag: usize,
+    pg_ed: editor.Editor,
+    pg_buf: u64,
+    pg_edit_i: usize,
+    pg_edit_row: usize,
+    px: f64,
+    py: f64,
 }
 
 fn dlg_cb_none(a: *mut app.App, ans: u32) {
@@ -229,7 +252,10 @@ fn ctl_blank() -> Ctl {
         drop_open: false, drop_ctl: NONE, drop_hot: NONE,
         tip_node: NONE, tip_on: false, tip_since: 0, rp: ripple.ripples_new(), rp_node: NONE, tip_x: 0.0, tip_y: 0.0, win_w: 640.0, win_h: 480.0,
         dlg: 0 as u32, dlg_m: kit.modal_new(), dlg_title: "", dlg_text: "", dlg_cb: dlg_cb_none,
-        dlg_ed: editor.editor_new(), dlg_buf: 0, dlg_hot: NONE, dlg_hclose: false, mbar: false, w5_drag: NONE }
+        dlg_ed: editor.editor_new(), dlg_buf: 0, dlg_hot: NONE, dlg_hclose: false, mbar: false, w5_drag: NONE,
+        sh: wave6.sheet_new(true), sh_on: false, sh_node: NONE, sh_body: sh_body_none, sh_bptr: sh_bptr_none,
+        sh_kb: false, sh_ms: 0, w6_drag: NONE, pg_ed: editor.editor_new(), pg_buf: 0, pg_edit_i: NONE,
+        pg_edit_row: NONE, px: 0.0, py: 0.0 }
 }
 
 // ============================================================ THE STATE
@@ -250,6 +276,8 @@ fn st(a: *mut app.App) -> *mut Ctl {
     (*c).a = a
     (*c).dlg_buf = rt.heap_alloc(INPUT_CAP)
     let ok: bool = editor.editor_init(&(*c).dlg_ed, (*c).dlg_buf, INPUT_CAP)
+    (*c).pg_buf = rt.heap_alloc(INPUT_CAP)
+    let ok2: bool = editor.editor_init(&(*c).pg_ed, (*c).pg_buf, INPUT_CAP)
     app.set_ctl(a, p, ctl_key, ctl_chr, ctl_ptr, ctl_act, ctl_paint)
     // the popup sink of the host: ours first (drop-down, dialog), the menu's otherwise.
     // ctx_view makes the menu state (and installs the menu's own sink) before we override it.
@@ -1469,7 +1497,7 @@ fn tip_move(c: *mut Ctl, x: f64, y: f64) -> bool {
 }
 
 fn tip_blocked(c: *mut Ctl) -> bool {
-    return (*c).dlg != 0 as u32 || (*c).drop_open || menuview.mv_is_open(mv_of(c))
+    return (*c).dlg != 0 as u32 || (*c).drop_open || sh_blocking(c) || menuview.mv_is_open(mv_of(c))
 }
 
 // the program timer (fuiwirt.host_set_wake): shows the tooltip after the delay, runs the dialog fade
@@ -1479,6 +1507,9 @@ fn wake_tick(ud: u64, now: i64) -> bool {
         return true
     }
     if w5_tick(c, now) {
+        return true
+    }
+    if sh_tick(c, now) {
         return true
     }
     // a virtual list (app.vlist_new) running out after a fling or a wheel turn: paint every tick
@@ -1504,6 +1535,9 @@ fn wake_wait(ud: u64, now: i64) -> i64 {
         return 16
     }
     if w5_busy(c) {
+        return 16
+    }
+    if sh_busy(c) {
         return 16
     }
     if app.vlist_moving((*c).a) {
@@ -1919,7 +1953,7 @@ fn sync(c: *mut Ctl) {
 
 fn is_focus_kind(k: u32) -> bool {
     return k == K_SLIDER || k == K_RADIO || k == K_TAB || k == K_SPIN || k == K_DROP
-        || k == K_RATING || k == K_SEG || k == K_CHIPS || k == K_PAGER
+    || k == K_RATING || k == K_SEG || k == K_CHIPS || k == K_PAGER || k == K_PGRID
 }
 
 // move the keyboard focus to a node
@@ -1969,6 +2003,28 @@ fn ctl_key(ud: u64, key: u32, mods: u32) -> bool {
         drop_key(c, key, mods)
         return true
     }
+    if (*c).sh_on && (*c).sh.cur != kit.NONE {
+        if sh_key(c, key) {
+            return true
+        }
+    }
+    if (*c).pg_edit_i != NONE {
+        if key == editor.KEY_ENTER {
+            w6_commit(c)
+            return true
+        }
+        if key == editor.KEY_ESC {
+            w6_cancel(c)
+            return true
+        }
+        if key == editor.KEY_TAB {
+            w6_commit(c)
+            return false
+        }
+        let er: u32 = editor.editor_key(&(*c).pg_ed, key, mods)
+        touch(c)
+        return true
+    }
     let hid: bool = tip_hide(c)
     if menuview.mv_is_open(mv_of(c)) {
         if (*c).mhdr != NONE && (key == editor.KEY_LEFT || key == editor.KEY_RIGHT) {
@@ -2002,6 +2058,9 @@ fn ctl_key(ud: u64, key: u32, mods: u32) -> bool {
     let down: bool = key == editor.KEY_DOWN || key == editor.KEY_RIGHT
     if is_w5_kind(k) {
         return w5_key(c, i, key)
+    }
+    if k == K_PGRID {
+        return w6_key(c, i, key)
     }
     if k == K_SLIDER {
         let cur: i64 = from_permille((*c).last[i], (*c).lo[i], (*c).hi[i])
@@ -2088,6 +2147,14 @@ fn ctl_chr(ud: u64, cp: u32, mods: u32) -> bool {
     if (*c).drop_open {
         return true
     }
+    if sh_blocking(c) {
+        return true
+    }
+    if (*c).pg_edit_i != NONE {
+        let er: u32 = editor.editor_char(&(*c).pg_ed, cp, mods)
+        touch(c)
+        return true
+    }
     if menuview.mv_is_open(mv_of(c)) {
         return false
     }
@@ -2110,11 +2177,30 @@ fn ctl_chr(ud: u64, cp: u32, mods: u32) -> bool {
 fn ctl_ptr(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     let c: *mut Ctl = ud as *mut Ctl
     sync(c)
+    if kind == fuiwirt.HOOK_WHEEL {
+        if w6_wheel(c, y) {
+            return true
+        }
+    } else {
+        (*c).px = x
+        (*c).py = y
+    }
+    if sh_blocking(c) {
+        return false
+    }
+    if sh_visible(c) && !(*c).sh.modal {
+        if sh_ptr(c, kind, x, y) {
+            return true
+        }
+    }
     if split_ptr(c, kind, x, y) {
         return true
     }
     ripple_ptr(c, kind, x, y)
-    let w5r: bool = w5_ptr(c, kind, x, y)
+    var w5r: bool = w5_ptr(c, kind, x, y)
+    if w6_ptr(c, kind, x, y) {
+        w5r = true
+    }
     if kind == fuiwirt.HOOK_MOVE {
         let tm: bool = tip_move(c, x, y)
         return tm || w5r
@@ -2147,6 +2233,8 @@ fn ctl_act(ud: u64, node: usize) {
     }
     if is_w5_kind((*c).kind[i]) {
         w5_act(c, i)
+    } else if (*c).kind[i] == K_PGRID {
+        w6_act(c, i)
     } else if (*c).kind[i] == K_DROP && !(*c).drop_open {
         let o: bool = open_dropdown((*c).a, node)
     } else if (*c).kind[i] == K_MENU {
@@ -2161,6 +2249,7 @@ fn ctl_paint(ud: u64, rc: *mut render.Ctx, w: usize, h: usize) {
     let c: *mut Ctl = ud as *mut Ctl
     (*c).win_w = w as f64
     (*c).win_h = h as f64
+    draw_sheet(c, rc)
     if (*c).drop_open {
         draw_drop(c, rc)
     }
@@ -2454,7 +2543,7 @@ fn ripple_ptr(c: *mut Ctl, kind: u32, x: f64, y: f64) {
             return
         }
         let wi: usize = find(c, n)
-        if wi != NONE && is_w5_kind((*c).kind[wi]) {
+        if wi != NONE && (is_w5_kind((*c).kind[wi]) || (*c).kind[wi] == K_PGRID) {
             return
         }
         (*c).rp_node = n
@@ -2488,13 +2577,17 @@ fn mv_of(c: *mut Ctl) -> u64 { return app.ctx_view((*c).a) as u64 }
 
 fn sink_open(ud: u64) -> bool {
     let c: *mut Ctl = ud as *mut Ctl
-    return (*c).drop_open || (*c).dlg != 0 as u32 || menuview.mv_is_open(mv_of(c))
+    return (*c).drop_open || (*c).dlg != 0 as u32 || sh_blocking(c) || menuview.mv_is_open(mv_of(c))
 }
 
 fn sink_ptr(ud: u64, kind: u32, x: f64, y: f64, btn: u32, now: i64) -> u32 {
     let c: *mut Ctl = ud as *mut Ctl
     if (*c).dlg != 0 as u32 {
         return dlg_ptr(c, kind, x, y)
+    }
+    if sh_blocking(c) && !(*c).drop_open && !menuview.mv_is_open(mv_of(c)) {
+        let used: bool = sh_ptr(c, kind, x, y)
+        return ctxmenu.CR_CONSUMED | ctxmenu.CR_REPAINT
     }
     if !(*c).drop_open {
         return menuview.mv_pointer(mv_of(c), kind, x, y, btn, now)
@@ -3249,4 +3342,888 @@ fn w5_busy(c: *mut Ctl) -> bool {
         i = i + 1
     }
     return false
+}
+
+// ============================================================ WAVE 6 CONTROLS (r45 wiring)
+//
+// The bottom sheet and the property grid of lib/fui/wave6.fi in the ten-line API.
+//
+// BOTTOM SHEET -- an OVERLAY drawn by the library over the whole window (like the dialogs), ONE per window:
+//
+//     appctl.sheet_setup(a, "Details", true, draw_body, changed)      // modal = with scrim; call it where the
+//                                                                     // sheet's a11y marker should stand
+//     appctl.sheet_show(a, 0)  /  appctl.sheet_hide(a)                // program side; they do NOT call `changed`
+//     draw_body(a, rc, x, y, w, h)                                    // paints the content, clip is set
+//
+// The panel glides (dt-based), the handle drags with rubber band + fling, Esc / Up / Down / PgUp / PgDn move the
+// snap points, a click on the scrim closes (modal). `changed(a, id)` runs when the USER moved or closed the sheet;
+// `sheet_snap(a)` says where it rests (NONE = closed). `sheet_on_pointer` hears the pointer in the body
+// (HOOK_MOVE / DOWN / UP at window coordinates) because a modal sheet shuts off the page behind it.
+//
+// PROPERTY GRID -- ONE focusable node, rows owned by the program (an array of wave6.PgRow, at most 64):
+//
+//     let g: usize = appctl.propgrid(a, "Properties", 360, 240, &rows[0], 9, changed, edit)
+//
+// `changed(a, id)` runs for a moved selection, a flipped switch, a folded group and a committed inline edit;
+// `propgrid_event(a, id)` is the PGK_* (or PGE_COMMIT) and `propgrid_row(a, id)` its row. A text / number value
+// opens an INLINE editor in its cell (Enter commits, Esc cancels, a click elsewhere commits; a number that does
+// not parse is dropped). Choice and colour values (and everything if `propgrid_inline(a, g, false)`) call
+// `edit(a, id)` instead: the program opens its own editor for `propgrid_row(a, id)`. The wheel, PgUp / PgDn and
+// the selection scroll the rows; the divider between the columns drags. The screen reader gets the node as a
+// tree whose description is the selected row ("label, value").
+//
+// HONEST (wave 6): the rows array must outlive the window (GC heap, or `#[allow_escape]` on main); the sheet is the
+// library's drawing, not a scene node (the marker node carries the dialog role and name; a screen reader does not
+// list the body); a NON-modal sheet leaves the page behind the panel clickable (only the panel's own hits are
+// taken); the inline editor has no mouse caret / selection (keys only) and no IME; a grid has at most 64 rows.
+const K_PGRID: u32 = 21
+const K_SHEET: u32 = 22
+const PG_ROWS_MAX: usize = 64
+const PGE_COMMIT: u32 = 5
+
+fn sh_body_none(a: *mut app.App, rc: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64) {
+}
+
+fn sh_bptr_none(a: *mut app.App, kind: u32, x: f64, y: f64) {
+}
+
+struct W6 {
+    rows: *mut wave6.PgRow,
+    n: usize,
+    g: wave6.PGrid,
+    ev: u32,
+    ev_row: usize,
+    inl: bool,
+    on_edit: fn(*mut app.App, usize),
+    own_p: [u64; 64],
+    own_n: [usize; 64],
+    desc: [u8; 192],
+    dn: usize,
+}
+
+fn w6_blank() -> W6 {
+    return W6 { rows: 0 as u64 as *mut wave6.PgRow, n: 0, g: wave6.pgrid_new(), ev: 0 as u32, ev_row: NONE,
+        inl: true, on_edit: cb_none, own_p: [0 as u64; 64], own_n: [0; 64], desc: [0 as u8; 192], dn: 0 }
+}
+
+fn w6_of(c: *mut Ctl, i: usize) -> *mut W6 {
+    return (*c).aux[i] as *mut W6
+}
+
+fn is_w6_kind(k: u32) -> bool {
+    return k == K_PGRID
+}
+
+// ------------------------------------------------------------ the sheet
+
+// open (or still gliding out), and blocking = the modal sheet holds the window (open and not already leaving)
+fn sh_visible(c: *mut Ctl) -> bool {
+    return (*c).sh_on && wave6.sheet_is_open(&(*c).sh)
+}
+
+fn sh_blocking(c: *mut Ctl) -> bool {
+    return (*c).sh_on && (*c).sh.modal && ((*c).sh.cur != kit.NONE || (*c).sh.drag)
+}
+
+fn sh_sync_marker(c: *mut Ctl) {
+    if (*c).sh_node != NONE {
+        scene.node_set_hidden(sc_of(c), (*c).sh_node, !wave6.sheet_is_open(&(*c).sh))
+    }
+}
+
+// The sheet of the window (one): `modal` = scrim and the page behind is shut off. `body` paints the content.
+// The marker node (zero size, role dialog, name `name`) is made HERE: call it where the node should stand.
+fn sheet_setup(a: *mut app.App, name: str, modal: bool, body: fn(*mut app.App, *mut render.Ctx, f64, f64, f64, f64),
+    on_change: fn(*mut app.App, usize)) -> bool {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).sh_on || (*c).n >= CTL_MAX {
+        return false
+    }
+    let node: usize = app.custom(a, widget.KIND_NONE, 0, 0)
+    if node == NONE {
+        return false
+    }
+    (*scene.nd(sc_of(c), node)).no_fill = 1 as u32
+    let i: usize = add_entry(c, K_SHEET, node)
+    set_cb(c, i, on_change)
+    (*c).sh = wave6.sheet_new(modal)
+    (*c).sh_on = true
+    (*c).sh_node = node
+    (*c).sh_body = body
+    a11y.a11y_set_role(app.ax(a), node, a11y.ROLE_DIALOG)
+    name_node(c, node, name)
+    sh_sync_marker(c)
+    return true
+}
+
+// 1..4 ascending fractions of the window height (0.1 .. 1.0); false for a bad list
+fn sheet_snaps(a: *mut app.App, f: *mut f64, n: usize) -> bool {
+    let c: *mut Ctl = st(a)
+    if !(*c).sh_on {
+        return false
+    }
+    return wave6.sheet_set_snaps(&(*c).sh, f, n)
+}
+
+fn sheet_dismiss(a: *mut app.App, on: bool) {
+    let c: *mut Ctl = st(a)
+    if (*c).sh_on {
+        (*c).sh.dismiss = on
+    }
+}
+
+fn sheet_on_pointer(a: *mut app.App, f: fn(*mut app.App, u32, f64, f64)) {
+    let c: *mut Ctl = st(a)
+    (*c).sh_bptr = f
+}
+
+fn sheet_show(a: *mut app.App, snap: usize) {
+    let c: *mut Ctl = st(a)
+    if !(*c).sh_on {
+        return
+    }
+    wave6.sheet_open(&(*c).sh, snap)
+    (*c).sh_ms = 0
+    (*c).sh_kb = false
+    sh_sync_marker(c)
+    touch(c)
+}
+
+fn sheet_hide(a: *mut app.App) {
+    let c: *mut Ctl = st(a)
+    if !(*c).sh_on {
+        return
+    }
+    wave6.sheet_close(&(*c).sh)
+    (*c).sh_ms = 0
+    touch(c)
+}
+
+// the snap point it rests at (NONE = closed)
+fn sheet_snap(a: *mut app.App) -> usize {
+    let c: *mut Ctl = st(a)
+    if !(*c).sh_on || (*c).sh.cur == kit.NONE {
+        return NONE
+    }
+    return (*c).sh.cur
+}
+
+fn sheet_visible(a: *mut app.App) -> bool {
+    let c: *mut Ctl = st(a)
+    return sh_visible(c)
+}
+
+// the shown height as a fraction of the window (0 .. 1)
+fn sheet_height(a: *mut app.App) -> f64 {
+    let c: *mut Ctl = st(a)
+    if !(*c).sh_on {
+        return 0.0
+    }
+    return wave6.sheet_pos(&(*c).sh)
+}
+
+// the content room / the grab zone in window pixels (x, y, w, h); false when nothing shows
+fn sheet_body(a: *mut app.App, out: *mut [f64; 4]) -> bool {
+    let c: *mut Ctl = st(a)
+    if !(*c).sh_on {
+        return false
+    }
+    return wave6.sheet_body_rect(app.app_ctx(a), &(*c).sh, 0.0, 0.0, (*c).win_w, (*c).win_h, out)
+}
+
+fn sheet_handle(a: *mut app.App, out: *mut [f64; 4]) -> bool {
+    let c: *mut Ctl = st(a)
+    if !(*c).sh_on {
+        return false
+    }
+    return wave6.sheet_handle_rect(app.app_ctx(a), &(*c).sh, 0.0, 0.0, (*c).win_w, (*c).win_h, out)
+}
+
+// tell the program once when the USER changed where the sheet rests
+fn sh_notify(c: *mut Ctl, prev: usize) {
+    sh_sync_marker(c)
+    if (*c).sh.cur != prev {
+        let i: usize = find(c, (*c).sh_node)
+        if i != NONE {
+            fire(c, i)
+        }
+    }
+}
+
+fn sh_busy(c: *mut Ctl) -> bool {
+    return (*c).sh_on && wave6.sheet_animating(&(*c).sh) && !wave6.sheet_dragging(&(*c).sh)
+}
+
+// the glide of the sheet; true = repaint
+fn sh_tick(c: *mut Ctl, now: i64) -> bool {
+    if !sh_busy(c) {
+        (*c).sh_ms = 0
+        return false
+    }
+    var dt: i64 = 0
+    if (*c).sh_ms != 0 {
+        dt = now - (*c).sh_ms
+    }
+    (*c).sh_ms = now
+    let more: bool = wave6.sheet_tick(&(*c).sh, dt, motion_of(c))
+    if !more {
+        (*c).sh_ms = 0
+        sh_sync_marker(c)
+    }
+    return true
+}
+
+// the pointer on the sheet: true = used
+fn sh_ptr(c: *mut Ctl, kind: u32, x: f64, y: f64) -> bool {
+    let now: i64 = fuiwirt.host_now(app.app_host((*c).a))
+    let s: *mut wave6.Sheet = &(*c).sh
+    if wave6.sheet_dragging(s) {
+        if kind == fuiwirt.HOOK_MOVE {
+            wave6.sheet_drag_move(s, y, (*c).win_h, now)
+        } else if kind == fuiwirt.HOOK_UP || kind == fuiwirt.HOOK_LEAVE {
+            let prev: usize = (*s).cur
+            let closing: bool = wave6.sheet_drag_end(s)
+            (*c).sh_ms = 0
+            sh_notify(c, prev)
+        }
+        touch(c)
+        return true
+    }
+    if kind == fuiwirt.HOOK_LEAVE {
+        return false
+    }
+    let hit: u32 = wave6.sheet_hit(app.app_ctx((*c).a), s, 0.0, 0.0, (*c).win_w, (*c).win_h, x, y)
+    if kind == fuiwirt.HOOK_DOWN {
+        (*c).sh_kb = false
+        if hit == wave6.SH_HANDLE {
+            wave6.sheet_drag_begin(s, y, now)
+            touch(c)
+            return true
+        }
+        if hit == wave6.SH_NONE {
+            if (*s).modal && (*s).dismiss {
+                let prev2: usize = (*s).cur
+                wave6.sheet_close(s)
+                (*c).sh_ms = 0
+                sh_notify(c, prev2)
+                touch(c)
+            }
+            return (*s).modal
+        }
+    }
+    if hit == wave6.SH_BODY {
+        let f: fn(*mut app.App, u32, f64, f64) = (*c).sh_bptr
+        f((*c).a, kind, x, y)
+        touch(c)
+        return true
+    }
+    return false
+}
+
+// keys of the sheet: Esc / Up / Down / PgUp / PgDn; a modal sheet takes every key
+fn sh_key(c: *mut Ctl, key: u32) -> bool {
+    (*c).sh_kb = true
+    let modal: bool = (*c).sh.modal
+    if !modal && key != editor.KEY_ESC && key != editor.KEY_PGUP && key != editor.KEY_PGDN {
+        return false
+    }
+    let prev: usize = (*c).sh.cur
+    let r: u32 = wave6.sheet_key(&(*c).sh, key)
+    if r == wave6.SH_KEY_NONE {
+        return modal
+    }
+    (*c).sh_ms = 0
+    sh_notify(c, prev)
+    touch(c)
+    return true
+}
+
+fn draw_sheet(c: *mut Ctl, rc: *mut render.Ctx) {
+    if !sh_visible(c) {
+        return
+    }
+    var stt: u32 = 0 as u32
+    if (*c).sh_kb && (*c).sh.cur != kit.NONE {
+        stt = kit.ST_FOCUS
+    }
+    wave6.sheet_draw(rc, &(*c).sh, 0.0, 0.0, (*c).win_w, (*c).win_h, stt)
+    var r: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
+    if wave6.sheet_body_begin(rc, &(*c).sh, 0.0, 0.0, (*c).win_w, (*c).win_h, &r) {
+        let f: fn(*mut app.App, *mut render.Ctx, f64, f64, f64, f64) = (*c).sh_body
+        f((*c).a, rc, r[0], r[1], r[2], r[3])
+        wave6.sheet_body_end(rc)
+    }
+}
+
+// ------------------------------------------------------------ the property grid
+
+fn propgrid(a: *mut app.App, name: str, wpt: usize, hpt: usize, rows: *mut wave6.PgRow, n: usize,
+    on_change: fn(*mut app.App, usize), on_edit: fn(*mut app.App, usize)) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).n >= CTL_MAX || n > PG_ROWS_MAX {
+        return NONE
+    }
+    let p: u64 = rt.heap_alloc(4096)
+    if p == 0 {
+        return NONE
+    }
+    *(p as *mut W6) = w6_blank()
+    let node: usize = app.custom(a, widget.KIND_BUTTON, wpt, hpt)
+    if node == NONE {
+        return NONE
+    }
+    (*scene.nd(sc_of(c), node)).no_fill = 1 as u32
+    let i: usize = add_entry(c, K_PGRID, node)
+    (*c).aux[i] = p as usize
+    set_cb(c, i, on_change)
+    let w: *mut W6 = p as *mut W6
+    (*w).rows = rows
+    (*w).n = n
+    (*w).on_edit = on_edit
+    scene.node_set_draw(sc_of(c), node, c as u64, w6_draw)
+    a11y.a11y_set_role(app.ax(a), node, a11y.ROLE_TREE)
+    name_node(c, node, name)
+    return node
+}
+
+fn w6_idx(a: *mut app.App, id: usize) -> usize {
+    let c: *mut Ctl = st(a)
+    let i: usize = find(c, id)
+    if i == NONE || (*c).kind[i] != K_PGRID {
+        return NONE
+    }
+    return i
+}
+
+// the PGK_* (or PGE_COMMIT) of the last event and its row
+fn propgrid_event(a: *mut app.App, id: usize) -> u32 {
+    let i: usize = w6_idx(a, id)
+    if i == NONE { return 0 as u32 }
+    return (*w6_of(st(a), i)).ev
+}
+
+fn propgrid_row(a: *mut app.App, id: usize) -> usize {
+    let i: usize = w6_idx(a, id)
+    if i == NONE { return NONE }
+    return (*w6_of(st(a), i)).ev_row
+}
+
+fn propgrid_selected(a: *mut app.App, id: usize) -> usize {
+    let i: usize = w6_idx(a, id)
+    if i == NONE { return NONE }
+    let sel: usize = (*w6_of(st(a), i)).g.sel
+    if sel == kit.NONE { return NONE }
+    return sel
+}
+
+fn propgrid_select(a: *mut app.App, id: usize, row: usize) {
+    let c: *mut Ctl = st(a)
+    let i: usize = w6_idx(a, id)
+    if i == NONE { return }
+    let w: *mut W6 = w6_of(c, i)
+    if row != NONE && row >= (*w).n { return }
+    (*w).g.sel = row
+    if row == NONE {
+        (*w).g.sel = kit.NONE
+    }
+    w6_fit_sel(c, i)
+    w6_describe(c, i)
+    touch(c)
+}
+
+fn propgrid_top(a: *mut app.App, id: usize) -> usize {
+    let i: usize = w6_idx(a, id)
+    if i == NONE { return 0 }
+    return (*w6_of(st(a), i)).g.top
+}
+
+fn propgrid_set_top(a: *mut app.App, id: usize, top: usize) {
+    let c: *mut Ctl = st(a)
+    let i: usize = w6_idx(a, id)
+    if i == NONE { return }
+    let w: *mut W6 = w6_of(c, i)
+    (*w).g.top = top
+    w6_fit_top(c, i)
+    touch(c)
+}
+
+// the label column in permille of the width
+fn propgrid_label_pm(a: *mut app.App, id: usize) -> i64 {
+    let i: usize = w6_idx(a, id)
+    if i == NONE { return 0 as i64 }
+    return (*w6_of(st(a), i)).g.label_pm
+}
+
+// the inline editor on / off (off = every edit asks the program: `edit(a, id)`)
+fn propgrid_inline(a: *mut app.App, id: usize, on: bool) {
+    let i: usize = w6_idx(a, id)
+    if i == NONE { return }
+    (*w6_of(st(a), i)).inl = on
+}
+
+// The value cell of row `row` in window pixels (x, y, w, h); false for a group or a row not shown.
+fn propgrid_cell(a: *mut app.App, id: usize, row: usize, out: *mut [f64; 4]) -> bool {
+    let c: *mut Ctl = st(a)
+    let i: usize = w6_idx(a, id)
+    if i == NONE { return false }
+    let w: *mut W6 = w6_of(c, i)
+    let sc: *mut scene.Scene = sc_of(c)
+    let nd: usize = (*c).node[i]
+    return wave6.pg_value_rect(app.app_ctx(a), &(*w).g, (*w).rows, (*w).n, row, scene.node_x(sc, nd),
+        scene.node_y(sc, nd), scene.node_w(sc, nd), scene.node_h(sc, nd), out)
+}
+
+// The row (any kind) at visible position `k` counted from the top, as a rectangle; for tests and automation.
+fn propgrid_row_rect(a: *mut app.App, id: usize, row: usize, out: *mut [f64; 4]) -> bool {
+    let c: *mut Ctl = st(a)
+    let i: usize = w6_idx(a, id)
+    if i == NONE { return false }
+    let w: *mut W6 = w6_of(c, i)
+    if row >= (*w).n || !wave6.pg_is_visible((*w).rows, (*w).n, row) { return false }
+    let vp: usize = wave6.pg_visible_pos((*w).rows, (*w).n, row)
+    if vp < (*w).g.top { return false }
+    let sc: *mut scene.Scene = sc_of(c)
+    let nd: usize = (*c).node[i]
+    let rh: f64 = wave6.pg_row_h(app.app_ctx(a))
+    let ry: f64 = scene.node_y(sc, nd) + ((vp - (*w).g.top) as f64) * rh
+    if ry + rh > scene.node_y(sc, nd) + scene.node_h(sc, nd) + 0.5 { return false }
+    (*out)[0] = scene.node_x(sc, nd)
+    (*out)[1] = ry
+    (*out)[2] = scene.node_w(sc, nd)
+    (*out)[3] = rh
+    return true
+}
+
+fn propgrid_editing(a: *mut app.App) -> bool {
+    return (*st(a)).pg_edit_i != NONE
+}
+
+// the text in the inline editor (valid until the next change of it)
+fn propgrid_edit_text(a: *mut app.App) -> str {
+    let c: *mut Ctl = st(a)
+    let t: *mut textbuf.TextBuf = editor.editor_buf(&(*c).pg_ed)
+    return str { p: textbuf.tb_ptr(t) as *mut u8, n: textbuf.tb_len(t) }
+}
+
+fn propgrid_commit(a: *mut app.App) {
+    w6_commit(st(a))
+}
+
+fn propgrid_cancel(a: *mut app.App) {
+    w6_cancel(st(a))
+}
+
+// the description of the selected row for the screen reader, after the program changed rows itself
+fn propgrid_refresh(a: *mut app.App, id: usize) {
+    let c: *mut Ctl = st(a)
+    let i: usize = w6_idx(a, id)
+    if i == NONE { return }
+    w6_describe(c, i)
+    touch(c)
+}
+
+fn w6_fit(c: *mut Ctl, i: usize) -> usize {
+    return wave6.pg_fit(app.app_ctx((*c).a), scene.node_h(sc_of(c), (*c).node[i]))
+}
+
+fn w6_fit_top(c: *mut Ctl, i: usize) {
+    let w: *mut W6 = w6_of(c, i)
+    wave6.pg_clamp_top(&(*w).g, (*w).rows, (*w).n, w6_fit(c, i))
+}
+
+fn w6_fit_sel(c: *mut Ctl, i: usize) {
+    let w: *mut W6 = w6_of(c, i)
+    wave6.pg_show_sel(&(*w).g, (*w).rows, (*w).n, w6_fit(c, i))
+}
+
+// ---- the a11y description: "label, value"
+
+fn desc_put(w: *mut W6, p: u64, n: usize) {
+    var k: usize = 0
+    while k < n && (*w).dn < 190 {
+        (*w).desc[(*w).dn] = *((p + k as u64) as *mut u8)
+        (*w).dn = (*w).dn + 1
+        k = k + 1
+    }
+}
+
+fn desc_str(w: *mut W6, s: str) {
+    desc_put(w, s.p as u64, s.n)
+}
+
+// decimal digits of v into buf (at most 24 bytes), returns the length
+fn w6_fmt_i64(v: i64, buf: *mut [u8; 24]) -> usize {
+    var tmp: [u8; 24] = [0 as u8; 24]
+    var m: i64 = v
+    var neg: bool = false
+    if m < 0 as i64 {
+        neg = true
+        m = 0 as i64 - m
+    }
+    var k: usize = 0
+    if m == 0 as i64 {
+        tmp[0] = 48 as u8
+        k = 1
+    }
+    while m > 0 as i64 && k < 22 {
+        tmp[k] = (48 + (m % 10 as i64)) as u8
+        m = m / 10 as i64
+        k = k + 1
+    }
+    var o: usize = 0
+    if neg {
+        (*buf)[0] = 45 as u8
+        o = 1
+    }
+    while k > 0 {
+        k = k - 1
+        (*buf)[o] = tmp[k]
+        o = o + 1
+    }
+    return o
+}
+
+fn desc_dec(w: *mut W6, v: i64) {
+    var b: [u8; 24] = [0 as u8; 24]
+    let n: usize = w6_fmt_i64(v, &b)
+    desc_put(w, (&b[0]) as u64, n)
+}
+
+fn w6_describe(c: *mut Ctl, i: usize) {
+    let w: *mut W6 = w6_of(c, i)
+    (*w).dn = 0
+    let sel: usize = (*w).g.sel
+    if sel != kit.NONE && sel < (*w).n {
+        let r: *mut wave6.PgRow = wave6.pg_row_at((*w).rows, sel)
+        desc_str(w, (*r).label)
+        if (*r).kind == wave6.PG_GROUP {
+            if (*r).on {
+                desc_str(w, ", expanded")
+            } else {
+                desc_str(w, ", collapsed")
+            }
+        } else {
+            desc_str(w, ", ")
+            if (*r).kind == wave6.PG_BOOL {
+                if (*r).on {
+                    desc_str(w, "on")
+                } else {
+                    desc_str(w, "off")
+                }
+            } else if (*r).kind == wave6.PG_NUM {
+                desc_dec(w, (*r).num)
+                if (*r).text.n > 0 {
+                    desc_str(w, " ")
+                    desc_str(w, (*r).text)
+                }
+            } else if (*r).kind == wave6.PG_COLOR {
+                desc_str(w, "color")
+            } else {
+                desc_str(w, (*r).text)
+            }
+            if (*r).readonly {
+                desc_str(w, ", read only")
+            }
+        }
+    }
+    a11y.a11y_set_description(app.ax((*c).a), (*c).node[i], (&(*w).desc[0]) as u64, (*w).dn)
+}
+
+// ---- the inline editor
+
+fn w6_begin_edit(c: *mut Ctl, i: usize) -> bool {
+    let w: *mut W6 = w6_of(c, i)
+    let sel: usize = (*w).g.sel
+    if !(*w).inl || sel == kit.NONE || sel >= (*w).n || sel >= PG_ROWS_MAX {
+        return false
+    }
+    let r: *mut wave6.PgRow = wave6.pg_row_at((*w).rows, sel)
+    if (*r).readonly || ((*r).kind != wave6.PG_TEXT && (*r).kind != wave6.PG_NUM) {
+        return false
+    }
+    if (*c).pg_edit_i != NONE {
+        w6_commit(c)
+    }
+    if (*r).kind == wave6.PG_TEXT {
+        editor.editor_set_text(&(*c).pg_ed, (*r).text.p as u64, (*r).text.n)
+    } else {
+        var tmp: [u8; 24] = [0 as u8; 24]
+        let n: usize = w6_fmt_i64((*r).num, &tmp)
+        editor.editor_set_text(&(*c).pg_ed, (&tmp[0]) as u64, n)
+    }
+    editor.editor_select_all(&(*c).pg_ed)
+    (*c).pg_edit_i = i
+    (*c).pg_edit_row = sel
+    touch(c)
+    return true
+}
+
+fn w6_cancel(c: *mut Ctl) {
+    if (*c).pg_edit_i == NONE {
+        return
+    }
+    (*c).pg_edit_i = NONE
+    (*c).pg_edit_row = NONE
+    touch(c)
+}
+
+// Applies the inline editor to its row; a number that does not parse is dropped (the row stays as it was).
+fn w6_commit(c: *mut Ctl) {
+    let i: usize = (*c).pg_edit_i
+    if i == NONE {
+        return
+    }
+    let row: usize = (*c).pg_edit_row
+    (*c).pg_edit_i = NONE
+    (*c).pg_edit_row = NONE
+    touch(c)
+    let w: *mut W6 = w6_of(c, i)
+    let t: *mut textbuf.TextBuf = editor.editor_buf(&(*c).pg_ed)
+    let p: u64 = textbuf.tb_ptr(t)
+    let n: usize = textbuf.tb_len(t)
+    let r: *mut wave6.PgRow = wave6.pg_row_at((*w).rows, row)
+    if (*r).kind == wave6.PG_NUM {
+        var k: usize = 0
+        var neg: bool = false
+        if n > 0 && *(p as *mut u8) == 45 as u8 {
+            neg = true
+            k = 1
+        }
+        if k >= n || n - k > 17 {
+            return
+        }
+        var v: i64 = 0
+        while k < n {
+            let ch: u8 = *((p + k as u64) as *mut u8)
+            if ch < 48 as u8 || ch > 57 as u8 {
+                return
+            }
+            v = v * 10 as i64 + ((ch as i64) - 48 as i64)
+            k = k + 1
+        }
+        if neg {
+            v = 0 as i64 - v
+        }
+        (*r).num = v
+    } else {
+        if (*w).own_p[row] != 0 as u64 {
+            rt.heap_free((*w).own_p[row], (*w).own_n[row])
+            (*w).own_p[row] = 0 as u64
+            (*w).own_n[row] = 0
+        }
+        var q: u64 = 0
+        if n > 0 {
+            q = rt.heap_alloc(n)
+            if q == 0 {
+                return
+            }
+            rt.mem_copy(q, p, n)
+            (*w).own_p[row] = q
+            (*w).own_n[row] = n
+        }
+        (*r).text = str { p: q as *mut u8, n: n }
+    }
+    (*w).ev = PGE_COMMIT
+    (*w).ev_row = row
+    w6_describe(c, i)
+    fire(c, i)
+}
+
+// ---- events
+
+fn w6_event(c: *mut Ctl, i: usize, e: u32) {
+    let w: *mut W6 = w6_of(c, i)
+    (*w).ev = e
+    (*w).ev_row = (*w).g.sel
+    if e == wave6.PGK_NONE {
+        return
+    }
+    if e == wave6.PGK_EDIT {
+        w6_describe(c, i)
+        if !w6_begin_edit(c, i) {
+            let f: fn(*mut app.App, usize) = (*w).on_edit
+            f((*c).a, (*c).node[i])
+        }
+        touch(c)
+        return
+    }
+    w6_fit_sel(c, i)
+    w6_describe(c, i)
+    touch(c)
+    fire(c, i)
+}
+
+fn w6_draw(ud: u64, rc: *mut render.Ctx, e: *mut widget.Widget) {
+    let c: *mut Ctl = ud as *mut Ctl
+    var i: usize = 0
+    while i < (*c).n {
+        if is_w6_kind((*c).kind[i]) && wid(c, i) == e {
+            break
+        }
+        i = i + 1
+    }
+    if i >= (*c).n {
+        return
+    }
+    let w: *mut W6 = w6_of(c, i)
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let wd: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    let focused: bool = app.focus((*c).a) == (*c).node[i]
+    wave6.pg_clamp_top(&(*w).g, (*w).rows, (*w).n, wave6.pg_fit(rc, h))
+    wave6.pg_draw(rc, &(*w).g, (*w).rows, (*w).n, focused, x, y, wd, h)
+    if (*c).pg_edit_i == i {
+        var r: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
+        if wave6.pg_value_rect(rc, &(*w).g, (*w).rows, (*w).n, (*c).pg_edit_row, x, y, wd, h, &r) {
+            var f: widget.Widget = widget.widget_new(widget.KIND_TEXTBOX)
+            widget.w_place(&f, r[0], r[1], r[2], r[3])
+            widget.w_set_focus(&f, true)
+            render.draw_textfield(rc, &f, &(*c).pg_ed, true)
+        }
+    }
+}
+
+fn w6_hover(c: *mut Ctl, i: usize, x: f64, y: f64) -> bool {
+    let w: *mut W6 = w6_of(c, i)
+    let sc: *mut scene.Scene = sc_of(c)
+    let nd: usize = (*c).node[i]
+    var part: u32 = 0 as u32
+    let row: usize = wave6.pg_hit(app.app_ctx((*c).a), &(*w).g, (*w).rows, (*w).n, scene.node_x(sc, nd),
+        scene.node_y(sc, nd), scene.node_w(sc, nd), scene.node_h(sc, nd), x, y, &part)
+    if row == (*w).g.hover && part == (*w).g.hpart {
+        return false
+    }
+    (*w).g.hover = row
+    (*w).g.hpart = part
+    return true
+}
+
+fn w6_clear_hover(c: *mut Ctl, keep: usize) -> bool {
+    var ch: bool = false
+    var i: usize = 0
+    while i < (*c).n {
+        if is_w6_kind((*c).kind[i]) && i != keep {
+            let w: *mut W6 = w6_of(c, i)
+            if (*w).g.hover != kit.NONE || (*w).g.hpart != 0 as u32 {
+                (*w).g.hover = kit.NONE
+                (*w).g.hpart = 0 as u32
+                ch = true
+            }
+        }
+        i = i + 1
+    }
+    return ch
+}
+
+// pointer events for the property grids; true = repaint
+fn w6_ptr(c: *mut Ctl, kind: u32, x: f64, y: f64) -> bool {
+    let sc: *mut scene.Scene = sc_of(c)
+    if (*c).w6_drag != NONE {
+        let di: usize = (*c).w6_drag
+        let dw: *mut W6 = w6_of(c, di)
+        if kind == fuiwirt.HOOK_MOVE {
+            wave6.pg_div_move(&(*dw).g, x, scene.node_w(sc, (*c).node[di]))
+            return true
+        }
+        if kind == fuiwirt.HOOK_UP || kind == fuiwirt.HOOK_LEAVE {
+            wave6.pg_div_end(&(*dw).g)
+            (*c).w6_drag = NONE
+            return true
+        }
+    }
+    if kind == fuiwirt.HOOK_LEAVE {
+        return w6_clear_hover(c, NONE)
+    }
+    var node: usize = scene.scene_hit(sc, x, y)
+    var i: usize = NONE
+    if node != NONE && node < scene.scene_count(sc) {
+        i = find(c, node)
+    }
+    if i != NONE && !is_w6_kind((*c).kind[i]) {
+        i = NONE
+    }
+    var ch: bool = w6_clear_hover(c, i)
+    if i == NONE {
+        if kind == fuiwirt.HOOK_DOWN && (*c).pg_edit_i != NONE {
+            w6_commit(c)
+            ch = true
+        }
+        return ch
+    }
+    if w6_hover(c, i, x, y) {
+        ch = true
+    }
+    if kind != fuiwirt.HOOK_DOWN {
+        return ch
+    }
+    let w: *mut W6 = w6_of(c, i)
+    let part: u32 = (*w).g.hpart
+    let row: usize = (*w).g.hover
+    if (*c).pg_edit_i != NONE {
+        // a press inside the cell being edited stays in the editor (no mouse caret placement: honest limit)
+        if (*c).pg_edit_i == i && row == (*c).pg_edit_row && part == wave6.PGP_VALUE {
+            return true
+        }
+        w6_commit(c)
+    }
+    if part == wave6.PGP_DIV {
+        wave6.pg_div_begin(&(*w).g, x)
+        (*c).w6_drag = i
+        touch(c)
+        return true
+    }
+    let e: u32 = wave6.pg_press(&(*w).g, (*w).rows, (*w).n, row, part)
+    w6_event(c, i, e)
+    touch(c)
+    return true
+}
+
+// the wheel over a property grid (dy in notches, positive = down); true = used
+fn w6_wheel(c: *mut Ctl, dy: f64) -> bool {
+    if (*c).pg_edit_i != NONE {
+        return false
+    }
+    let sc: *mut scene.Scene = sc_of(c)
+    let node: usize = scene.scene_hit(sc, (*c).px, (*c).py)
+    if node == NONE || node >= scene.scene_count(sc) {
+        return false
+    }
+    let i: usize = find(c, node)
+    if i == NONE || !is_w6_kind((*c).kind[i]) {
+        return false
+    }
+    let w: *mut W6 = w6_of(c, i)
+    var d: i64 = (dy * 3.0) as i64
+    if d == 0 as i64 {
+        if dy > 0.0 {
+            d = 1 as i64
+        } else if dy < 0.0 {
+            d = 0 as i64 - 1 as i64
+        }
+    }
+    if wave6.pg_scroll_by(&(*w).g, (*w).rows, (*w).n, w6_fit(c, i), d) {
+        touch(c)
+    }
+    return true
+}
+
+// keys of the focused property grid; true = used
+fn w6_key(c: *mut Ctl, i: usize, key: u32) -> bool {
+    let w: *mut W6 = w6_of(c, i)
+    let e: u32 = wave6.pg_key(&(*w).g, (*w).rows, (*w).n, key)
+    if e == wave6.PGK_NONE {
+        return false
+    }
+    w6_event(c, i, e)
+    return true
+}
+
+// Space / Enter that reach the node as an activation (the grid has taken the keys it knows already)
+fn w6_act(c: *mut Ctl, i: usize) {
+    let w: *mut W6 = w6_of(c, i)
+    let e: u32 = wave6.pg_key(&(*w).g, (*w).rows, (*w).n, 32 as u32)
+    if e != wave6.PGK_NONE {
+        w6_event(c, i, e)
+    }
 }
