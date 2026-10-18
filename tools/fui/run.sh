@@ -750,6 +750,12 @@ build kita11y
 # wave5: rating, chips, segmented, skeleton, chart, page dots, pager at the pixel (both themes, mirrored)
 build wave5
 "$W/wave5" | tail -n 3
+# appw5: the wave 5 controls in the ten-line API (appctl.rating / segmented / chips / skeleton / chart / pager)
+build appw5
+"$W/appw5" | tail -n 3
+# wave6: bottom sheet + property grid (geometry, hits, keys, drag, a11y twins)
+build wave6
+"$W/wave6" | tail -n 3
 # W16: mnemonics (Alt+letter, '&'), Tab order end to end, shortcut management
 build w16
 "$W/w16" | tail -n 3

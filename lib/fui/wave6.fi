@@ -1,0 +1,973 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/wave6.fi -- THE CONTROLS OF WAVE 6: the bottom sheet and the property grid (the rest of r45).
+//
+//   bottom sheet   a panel that rises from the bottom edge of a container: snap points (peek / half / full),
+//                  a grab handle, drag with rubber band + fling, a scrim (modal) or none, Esc / Up / Down,
+//                  dt-based glide. The program paints the CONTENT inside `sheet_body_rect`.
+//   property grid  the two-column "name | value" table of an inspector: groups that fold, rows of text,
+//                  switch, number, choice and colour, a draggable column divider, a selection, the keys.
+//
+// The rules are those of lib/fui/kit.fi and lib/fui/wave5.fi (repeated, because they are what makes the parts
+// one family):
+//
+//   * IMMEDIATE MODE. Each frame the program calls `*_draw(...)` with the state it keeps; no node, no allocation.
+//   * ONE GEOMETRY. Every `*_draw` has a `*_hit` that asks the same geometry the picture was made from.
+//   * ONLY THEME. Colours are theme tokens, lengths are design points through `kit.ln`, the shadow is
+//     `render.draw_elevation_faded`. `shape.motion` (ms; 0 = no animation) and `shape.r_window` are read.
+//   * MOTION IS dt-BASED (the sheet glide takes the time that passed, never a frame count).
+//   * RIGHT TO LEFT: `kit.kit_set_rtl(true)` mirrors the grid columns and the chevrons (`kit.rx`).
+//   * ACCESSIBILITY: lib/fui/kita11y.fi has `kax_sheet` (dialog or group + handle slider) and `kax_propgrid`
+//     (tree grid: group rows = tree items, value rows = rows with two cells).
+//
+// HONEST LIMITS: the sheet does not lay out its content and has no scrolling inside (the program paints into the
+// body rect and clips); the property grid edits nothing itself -- a click or Enter on a text / number / choice /
+// colour value is REPORTED (`PGK_EDIT`) and the program opens its editor, a switch and a group fold by
+// themselves; no multi-select, no sorting, no column other than the one divider, no inline editors.
+import std.rt
+import std.math
+import fui.theme
+import fui.style
+import fui.painter
+import fui.render
+import fui.lucide
+import fui.kit
+import fui.kitcolor
+import fui.editor
+import paint.canvas
+
+export {
+    // sheet
+    Sheet, sheet_new, sheet_set_snaps, sheet_open, sheet_close, sheet_is_open, sheet_at, sheet_pos, sheet_tick,
+    sheet_animating, sheet_drag_begin, sheet_drag_move, sheet_drag_end, sheet_key, sheet_panel_rect,
+    sheet_body_rect, sheet_handle_rect, sheet_draw, sheet_hit, sheet_dragging,
+    SH_NONE, SH_HANDLE, SH_BODY, SH_KEY_NONE, SH_KEY_USED, SH_KEY_CLOSED, SHEET_SNAPS_MAX,
+    // property grid
+    PgRow, PGrid, pg_row_at, pg_group, pg_text, pg_bool, pg_num, pg_choice, pg_color, pgrid_new,
+    pg_row_h, pg_visible_count, pg_visible_row, pg_is_visible, pg_height, pg_draw, pg_hit, pg_press, pg_key,
+    pg_div_begin, pg_div_move, pg_div_end, pg_label_w,
+    PG_GROUP, PG_TEXT, PG_BOOL, PG_NUM, PG_CHOICE, PG_COLOR,
+    PGP_NONE, PGP_LABEL, PGP_VALUE, PGP_ARROW, PGP_DIV,
+    PGK_NONE, PGK_MOVED, PGK_TOGGLED, PGK_EDIT, PGK_FOLDED,
+}
+
+fn fmin(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn fmax(a: f64, b: f64) -> f64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn fabs(a: f64) -> f64 {
+    if a < 0.0 {
+        return 0.0 - a
+    }
+    return a
+}
+
+fn motion_ms(c: *mut render.Ctx) -> i64 {
+    return (*theme.theme_shape(render.ctx_theme(c))).motion as i64
+}
+
+// ======================================================================
+// 1. BOTTOM SHEET
+// ======================================================================
+//
+// `pos` is the shown height as a fraction of the container (0 = hidden, 1 = the whole container). The snap points
+// are fractions in (0, 1], ascending; `cur` is the snap point it rests at (kit.NONE = closed). Opening goes to a
+// snap point and glides there; a drag follows the finger, past the highest point with resistance; letting go
+// settles at the snap point (or closed, if `dismiss`) nearest to where a fling of 0.18 s would end.
+
+const SHEET_SNAPS_MAX: usize = 4
+const SH_NONE: u32 = 0 // outside the panel (the scrim / the page behind)
+const SH_HANDLE: u32 = 1 // the grab zone at the top of the panel
+const SH_BODY: u32 = 2
+const SH_KEY_NONE: u32 = 0
+const SH_KEY_USED: u32 = 1
+const SH_KEY_CLOSED: u32 = 2
+
+struct Sheet {
+    n: usize,
+    snaps: [f64; 4],
+    cur: usize,
+    pos: f64,
+    modal: bool,
+    dismiss: bool,
+    drag: bool,
+    drag_y0: f64,
+    drag_pos0: f64,
+    last_y: f64,
+    last_ms: i64,
+    vel: f64,
+}
+
+// A sheet with the snap points 0.5 and 0.9, closed; `modal` = with scrim (a click on it is `SH_NONE`),
+// swiping it down closes it.
+fn sheet_new(modal: bool) -> Sheet {
+    return Sheet { n: 2, snaps: [0.5, 0.9, 0.0, 0.0], cur: kit.NONE, pos: 0.0, modal: modal, dismiss: true,
+        drag: false, drag_y0: 0.0, drag_pos0: 0.0, last_y: 0.0, last_ms: 0, vel: 0.0 }
+}
+
+// 1..4 ascending fractions (clamped to 0.1 .. 1.0); returns false for a bad list. A rest below the
+// new count is moved to the highest point.
+fn sheet_set_snaps(s: *mut Sheet, f: *mut f64, n: usize) -> bool {
+    if n == 0 || n > SHEET_SNAPS_MAX {
+        return false
+    }
+    var prev: f64 = 0.0
+    var i: usize = 0
+    while i < n {
+        let v: f64 = *((f as u64 + (i * 8) as u64) as *mut f64)
+        if v <= prev || v < 0.1 || v > 1.0 {
+            return false
+        }
+        prev = v
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        (*s).snaps[i] = *((f as u64 + (i * 8) as u64) as *mut f64)
+        i = i + 1
+    }
+    (*s).n = n
+    if (*s).cur != kit.NONE && (*s).cur >= n {
+        (*s).cur = n - 1
+    }
+    return true
+}
+
+fn sheet_at(s: *mut Sheet, i: usize) -> f64 {
+    if i >= (*s).n {
+        return 0.0
+    }
+    return (*s).snaps[i]
+}
+
+fn sheet_target(s: *mut Sheet) -> f64 {
+    if (*s).cur == kit.NONE {
+        return 0.0
+    }
+    return (*s).snaps[(*s).cur]
+}
+
+// Opens (or moves) to snap point `i`; the position glides there (`sheet_tick`).
+fn sheet_open(s: *mut Sheet, i: usize) {
+    if (*s).n == 0 {
+        return
+    }
+    var k: usize = i
+    if k >= (*s).n {
+        k = (*s).n - 1
+    }
+    (*s).cur = k
+}
+
+fn sheet_close(s: *mut Sheet) {
+    (*s).cur = kit.NONE
+}
+
+// Open or still on its way out (the scrim and the panel are painted).
+fn sheet_is_open(s: *mut Sheet) -> bool {
+    return (*s).cur != kit.NONE || (*s).pos > 0.001 || (*s).drag
+}
+
+fn sheet_pos(s: *mut Sheet) -> f64 {
+    return (*s).pos
+}
+
+fn sheet_dragging(s: *mut Sheet) -> bool {
+    return (*s).drag
+}
+
+fn sheet_animating(s: *mut Sheet) -> bool {
+    return (*s).drag || fabs(sheet_target(s) - (*s).pos) >= 0.001
+}
+
+// Advances the glide by `dt_ms` (time constant = a third of `motion_ms`; 0 jumps). True while it moves.
+fn sheet_tick(s: *mut Sheet, dt_ms: i64, motion: i64) -> bool {
+    if (*s).drag {
+        return false
+    }
+    let target: f64 = sheet_target(s)
+    let dist: f64 = target - (*s).pos
+    if fabs(dist) < 0.001 {
+        (*s).pos = target
+        return false
+    }
+    if motion <= 0 {
+        (*s).pos = target
+        return false
+    }
+    if dt_ms <= 0 {
+        return true
+    }
+    let tau: f64 = (motion as f64) / 3.0
+    let k: f64 = 1.0 - math.exp(0.0 - (dt_ms as f64) / tau)
+    (*s).pos = (*s).pos + dist * k
+    if fabs(target - (*s).pos) < 0.001 {
+        (*s).pos = target
+        return false
+    }
+    return true
+}
+
+fn sheet_top_snap(s: *mut Sheet) -> f64 {
+    if (*s).n == 0 {
+        return 0.0
+    }
+    return (*s).snaps[(*s).n - 1]
+}
+
+// A grab at pointer y `py` (a drag of the handle zone or of the panel).
+fn sheet_drag_begin(s: *mut Sheet, py: f64, now_ms: i64) {
+    (*s).drag = true
+    (*s).drag_y0 = py
+    (*s).drag_pos0 = (*s).pos
+    (*s).last_y = py
+    (*s).last_ms = now_ms
+    (*s).vel = 0.0
+}
+
+// The pointer moved to `py` in a container of height `h`: the panel follows; above the top point with
+// resistance (0.35), below 0 it stops. The velocity is kept (fractions per second, up = positive).
+fn sheet_drag_move(s: *mut Sheet, py: f64, h: f64, now_ms: i64) {
+    if !(*s).drag || h <= 0.0 {
+        return
+    }
+    var p: f64 = (*s).drag_pos0 + ((*s).drag_y0 - py) / h
+    let top: f64 = sheet_top_snap(s)
+    if p > top {
+        p = top + (p - top) * 0.35
+    }
+    if p < 0.0 {
+        p = 0.0
+    }
+    (*s).pos = p
+    let dt: i64 = now_ms - (*s).last_ms
+    if dt > 0 {
+        (*s).vel = ((*s).last_y - py) / h / (dt as f64) * 1000.0
+        (*s).last_y = py
+        (*s).last_ms = now_ms
+    }
+}
+
+// Let go: settle at the nearest of {closed (only if `dismiss`), the snap points} to where the fling ends.
+// Returns true when the sheet is closing.
+fn sheet_drag_end(s: *mut Sheet) -> bool {
+    if !(*s).drag {
+        return false
+    }
+    (*s).drag = false
+    let proj: f64 = (*s).pos + (*s).vel * 0.18
+    var best: usize = kit.NONE
+    var bd: f64 = 1000.0
+    if (*s).dismiss {
+        bd = fabs(proj)
+    } else {
+        best = 0
+        bd = fabs(proj - (*s).snaps[0])
+    }
+    var i: usize = 0
+    while i < (*s).n {
+        let d: f64 = fabs(proj - (*s).snaps[i])
+        if d < bd {
+            bd = d
+            best = i
+        }
+        i = i + 1
+    }
+    (*s).cur = best
+    return best == kit.NONE
+}
+
+// Esc closes (if `dismiss`); Up goes to the next higher snap point, Down to the next lower (the lowest
+// closes if `dismiss`). SH_KEY_NONE when the key was not used.
+fn sheet_key(s: *mut Sheet, key: u32) -> u32 {
+    if (*s).n == 0 || !sheet_is_open(s) {
+        return SH_KEY_NONE
+    }
+    if key == editor.KEY_ESC {
+        if (*s).dismiss {
+            (*s).cur = kit.NONE
+            return SH_KEY_CLOSED
+        }
+        return SH_KEY_NONE
+    }
+    if key == editor.KEY_UP || key == editor.KEY_PGUP {
+        if (*s).cur == kit.NONE {
+            (*s).cur = 0
+        } else if (*s).cur + 1 < (*s).n {
+            (*s).cur = (*s).cur + 1
+        }
+        return SH_KEY_USED
+    }
+    if key == editor.KEY_DOWN || key == editor.KEY_PGDN {
+        if (*s).cur == kit.NONE {
+            return SH_KEY_NONE
+        }
+        if (*s).cur > 0 {
+            (*s).cur = (*s).cur - 1
+        } else if (*s).dismiss {
+            (*s).cur = kit.NONE
+            return SH_KEY_CLOSED
+        }
+        return SH_KEY_USED
+    }
+    return SH_KEY_NONE
+}
+
+fn sheet_max_w(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 640)
+}
+
+fn sheet_handle_h(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 28)
+}
+
+// The panel in a container (x, y, w, h): out = x, y, w, h. The panel is centered and at most 640 points wide;
+// its top edge is at y + h - pos * h. False when nothing is shown.
+fn sheet_panel_rect(c: *mut render.Ctx, s: *mut Sheet, x: f64, y: f64, w: f64, h: f64, out: *mut [f64; 4]) -> bool {
+    let ph: f64 = (*s).pos * h
+    if ph < 1.0 {
+        return false
+    }
+    let pw: f64 = fmin(w, sheet_max_w(c))
+    (*out)[0] = x + (w - pw) / 2.0
+    (*out)[1] = y + h - ph
+    (*out)[2] = pw
+    (*out)[3] = ph
+    return true
+}
+
+// The grab zone at the top of the panel (out = x, y, w, h).
+fn sheet_handle_rect(c: *mut render.Ctx, s: *mut Sheet, x: f64, y: f64, w: f64, h: f64, out: *mut [f64; 4]) -> bool {
+    var r: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
+    if !sheet_panel_rect(c, s, x, y, w, h, &r) {
+        return false
+    }
+    (*out)[0] = r[0]
+    (*out)[1] = r[1]
+    (*out)[2] = r[2]
+    (*out)[3] = fmin(sheet_handle_h(c), r[3])
+    return true
+}
+
+// The room for the program's content: below the handle zone, 16 points of padding at the sides and the end.
+fn sheet_body_rect(c: *mut render.Ctx, s: *mut Sheet, x: f64, y: f64, w: f64, h: f64, out: *mut [f64; 4]) -> bool {
+    var r: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
+    if !sheet_panel_rect(c, s, x, y, w, h, &r) {
+        return false
+    }
+    let hh: f64 = sheet_handle_h(c)
+    let pad: f64 = kit.ln(c, 16)
+    if r[3] <= hh + pad {
+        return false
+    }
+    (*out)[0] = r[0] + pad
+    (*out)[1] = r[1] + hh
+    (*out)[2] = r[2] - 2.0 * pad
+    (*out)[3] = r[3] - hh - pad
+    return true
+}
+
+// Paints scrim (modal) + shadow + panel + grab handle in the container (x, y, w, h). The program paints its
+// content afterwards into `sheet_body_rect` (clipped by the container). `st`: kit.ST_FOCUS paints the focus
+// ring around the handle.
+fn sheet_draw(c: *mut render.Ctx, s: *mut Sheet, x: f64, y: f64, w: f64, h: f64, st: u32) {
+    var r: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
+    if !sheet_panel_rect(c, s, x, y, w, h, &r) {
+        return
+    }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let top: f64 = sheet_top_snap(s)
+    var fade: f64 = 1.0
+    if top > 0.0 {
+        fade = fmin(1.0, (*s).pos / top)
+    }
+    if (*s).modal {
+        let a: u32 = (180.0 * fade) as u32
+        painter.surface(z, x, y, w, h, kit.with_alpha(theme.scrim_color(render.ctx_theme(c)), a))
+    }
+    let rad: f64 = kit.ln(c, (*theme.theme_shape(render.ctx_theme(c))).r_window)
+    if canvas.clip_push_rect(painter.painter_canvas(z), x, y, x + w, y + h) {
+        // the panel is drawn taller than it shows, so only the top corners are round
+        let ok: bool = render.draw_elevation_at(c, r[0], r[1], r[2], r[3] + rad, rad, 3)
+        painter.round_rect(z, r[0], r[1], r[2], r[3] + rad, rad, kit.tokc(c, style.TOK_SURFACE))
+        painter.round_ring(z, r[0], r[1], r[2], r[3] + rad, rad, kit.ln(c, 1), kit.tokc(c, style.TOK_BORDER))
+        let gw: f64 = kit.ln(c, 32)
+        let gh: f64 = kit.ln(c, 4)
+        var hov: u32 = kit.tokc(c, style.TOK_TEXT_MUTED)
+        painter.round_rect(z, r[0] + (r[2] - gw) / 2.0, r[1] + kit.ln(c, 12), gw, gh, gh / 2.0, hov)
+        if (st & kit.ST_FOCUS) != 0 as u32 {
+            kit.focus_ring(c, r[0] + (r[2] - gw) / 2.0 - kit.ln(c, 12), r[1] + kit.ln(c, 4), gw + kit.ln(c, 24),
+                kit.ln(c, 20), kit.ln(c, 10), style.TOK_SURFACE)
+        }
+        canvas.clip_pop(painter.painter_canvas(z))
+    }
+}
+
+// What is at (px, py): the grab zone, the panel body, or outside (the scrim / the page). SH_NONE when closed.
+fn sheet_hit(c: *mut render.Ctx, s: *mut Sheet, x: f64, y: f64, w: f64, h: f64, px: f64, py: f64) -> u32 {
+    var r: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
+    if !sheet_panel_rect(c, s, x, y, w, h, &r) {
+        return SH_NONE
+    }
+    if px < r[0] || px >= r[0] + r[2] || py < r[1] || py >= y + h {
+        return SH_NONE
+    }
+    if py < r[1] + fmin(sheet_handle_h(c), r[3]) {
+        return SH_HANDLE
+    }
+    return SH_BODY
+}
+
+// ======================================================================
+// 2. PROPERTY GRID
+// ======================================================================
+//
+// `rows` is an array of `PgRow` the program owns (`pg_row_at`); a group row folds the value rows after it up
+// to the next group row. The grid shows the VISIBLE rows from `top` (the program scrolls by changing it).
+// Geometry: a row is 32 points; the label column is `label_pm` permille of the width (draggable divider of 6
+// points around the line); in a group row the label starts at the chevron.
+
+const PG_GROUP: u32 = 1
+const PG_TEXT: u32 = 2
+const PG_BOOL: u32 = 3
+const PG_NUM: u32 = 4
+const PG_CHOICE: u32 = 5
+const PG_COLOR: u32 = 6
+
+const PGP_NONE: u32 = 0
+const PGP_LABEL: u32 = 1
+const PGP_VALUE: u32 = 2
+const PGP_ARROW: u32 = 3
+const PGP_DIV: u32 = 4
+
+const PGK_NONE: u32 = 0
+const PGK_MOVED: u32 = 1 // the selection moved
+const PGK_TOGGLED: u32 = 2 // a switch was flipped (PgRow.on is new)
+const PGK_EDIT: u32 = 3 // the program should open an editor for the selected row
+const PGK_FOLDED: u32 = 4 // a group opened or closed
+
+struct PgRow {
+    label: str,
+    kind: u32,
+    text: str, // PG_TEXT, PG_CHOICE (the shown choice), PG_NUM (the unit, "" = none)
+    num: i64, // PG_NUM
+    on: bool, // PG_BOOL; PG_GROUP: open
+    color: u32, // PG_COLOR (painter colour)
+    readonly: bool,
+}
+
+fn pgrow_size() -> usize {
+    var probe: [PgRow; 2] = [pg_group("", true), pg_group("", true)]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+// The row `i` of an array of rows.
+fn pg_row_at(rows: *mut PgRow, i: usize) -> *mut PgRow {
+    return (rows as usize + i * pgrow_size()) as *mut PgRow
+}
+
+fn pg_group(label: str, open: bool) -> PgRow {
+    return PgRow { label: label, kind: PG_GROUP, text: "", num: 0, on: open, color: 0 as u32, readonly: false }
+}
+
+fn pg_text(label: str, text: str, readonly: bool) -> PgRow {
+    return PgRow { label: label, kind: PG_TEXT, text: text, num: 0, on: false, color: 0 as u32, readonly: readonly }
+}
+
+fn pg_bool(label: str, on: bool) -> PgRow {
+    return PgRow { label: label, kind: PG_BOOL, text: "", num: 0, on: on, color: 0 as u32, readonly: false }
+}
+
+fn pg_num(label: str, v: i64, unit: str) -> PgRow {
+    return PgRow { label: label, kind: PG_NUM, text: unit, num: v, on: false, color: 0 as u32, readonly: false }
+}
+
+fn pg_choice(label: str, shown: str) -> PgRow {
+    return PgRow { label: label, kind: PG_CHOICE, text: shown, num: 0, on: false, color: 0 as u32, readonly: false }
+}
+
+fn pg_color(label: str, argb: u32) -> PgRow {
+    return PgRow { label: label, kind: PG_COLOR, text: "", num: 0, on: false, color: argb, readonly: false }
+}
+
+struct PGrid {
+    sel: usize, // the selected row (index into the rows), kit.NONE
+    top: usize, // the first visible row shown (index into the VISIBLE rows)
+    label_pm: i64,
+    drag: bool,
+    drag_x0: f64,
+    drag_pm0: i64,
+    hover: usize,
+    hpart: u32,
+}
+
+fn pgrid_new() -> PGrid {
+    return PGrid { sel: kit.NONE, top: 0, label_pm: 420, drag: false, drag_x0: 0.0, drag_pm0: 420,
+        hover: kit.NONE, hpart: PGP_NONE }
+}
+
+fn pg_row_h(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 32)
+}
+
+// A row is visible unless a folded group is above it (a group row itself is always visible).
+fn pg_is_visible(rows: *mut PgRow, n: usize, i: usize) -> bool {
+    if i >= n {
+        return false
+    }
+    if (*pg_row_at(rows, i)).kind == PG_GROUP {
+        return true
+    }
+    var k: usize = i
+    while k > 0 {
+        k = k - 1
+        let r: *mut PgRow = pg_row_at(rows, k)
+        if (*r).kind == PG_GROUP {
+            return (*r).on
+        }
+    }
+    return true
+}
+
+fn pg_visible_count(rows: *mut PgRow, n: usize) -> usize {
+    var cnt: usize = 0
+    var i: usize = 0
+    while i < n {
+        if pg_is_visible(rows, n, i) {
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// The row index of the k-th visible row (kit.NONE past the end).
+fn pg_visible_row(rows: *mut PgRow, n: usize, k: usize) -> usize {
+    var cnt: usize = 0
+    var i: usize = 0
+    while i < n {
+        if pg_is_visible(rows, n, i) {
+            if cnt == k {
+                return i
+            }
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    return kit.NONE
+}
+
+fn pg_visible_pos(rows: *mut PgRow, n: usize, row: usize) -> usize {
+    var cnt: usize = 0
+    var i: usize = 0
+    while i < n && i < row {
+        if pg_is_visible(rows, n, i) {
+            cnt = cnt + 1
+        }
+        i = i + 1
+    }
+    return cnt
+}
+
+// The height all visible rows need.
+fn pg_height(c: *mut render.Ctx, rows: *mut PgRow, n: usize) -> f64 {
+    return pg_row_h(c) * (pg_visible_count(rows, n) as f64)
+}
+
+// The width of the label column in a grid of width `w`.
+fn pg_label_w(g: *mut PGrid, w: f64) -> f64 {
+    return w * ((*g).label_pm as f64) / 1000.0
+}
+
+fn pg_value_x(c: *mut render.Ctx, g: *mut PGrid, x: f64, w: f64) -> f64 {
+    return x + pg_label_w(g, w)
+}
+
+// the x-range [ox, ox + ow) of the label (part 0) or value (part 1) column, mirrored in RTL
+fn pg_col(c: *mut render.Ctx, g: *mut PGrid, x: f64, w: f64, part: usize, ox: *mut f64, ow: *mut f64) {
+    let lw: f64 = pg_label_w(g, w)
+    var cx: f64 = x
+    var cw: f64 = lw
+    if part == 1 {
+        cx = x + lw
+        cw = w - lw
+    }
+    *ox = kit.rx(cx, cw, x, w)
+    *ow = cw
+}
+
+fn pg_chev_w(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 28)
+}
+
+fn pg_div_zone(c: *mut render.Ctx) -> f64 {
+    return kit.ln(c, 3)
+}
+
+// The first visible row drawn is visible-row `top`; rows that do not fit in `h` are cut (clip).
+fn pg_draw(c: *mut render.Ctx, g: *mut PGrid, rows: *mut PgRow, n: usize, focus: bool, x: f64, y: f64, w: f64, h: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let rh: f64 = pg_row_h(c)
+    if !canvas.clip_push_rect(painter.painter_canvas(z), x, y, x + w, y + h) {
+        return
+    }
+    let nvis: usize = pg_visible_count(rows, n)
+    let pad: f64 = kit.ln(c, 8)
+    var lx: f64 = 0.0
+    var lw: f64 = 0.0
+    var vx: f64 = 0.0
+    var vw: f64 = 0.0
+    pg_col(c, g, x, w, 0, &lx, &lw)
+    pg_col(c, g, x, w, 1, &vx, &vw)
+    var k: usize = (*g).top
+    var ry: f64 = y
+    while k < nvis && ry < y + h {
+        let i: usize = pg_visible_row(rows, n, k)
+        let r: *mut PgRow = pg_row_at(rows, i)
+        let selected: bool = i == (*g).sel
+        let hot: bool = i == (*g).hover
+        if (*r).kind == PG_GROUP {
+            painter.surface(z, x, ry, w, rh, kit.tokc(c, style.TOK_SURFACE_RAISED))
+        } else if selected {
+            painter.surface(z, x, ry, w, rh, kit.with_alpha(kit.accent_gfx(c, style.TOK_BASE), 56 as u32))
+        } else if hot {
+            painter.surface(z, x, ry, w, rh, kit.tokc(c, style.TOK_BUTTON_HOVER))
+        }
+        painter.surface(z, x, ry + rh - kit.ln(c, 1), w, kit.ln(c, 1), kit.tokc(c, style.TOK_SEPARATOR))
+        let tcol: u32 = kit.tokc(c, style.TOK_TEXT)
+        let mcol: u32 = kit.tokc(c, style.TOK_TEXT_MUTED)
+        if (*r).kind == PG_GROUP {
+            var ic: i64 = lucide.CHEVRON_RIGHT
+            if (*r).on {
+                ic = lucide.CHEVRON_DOWN
+            }
+            let cs: f64 = kit.ln(c, 16)
+            let cw: f64 = pg_chev_w(c)
+            let cx: f64 = kit.rx(x + (cw - cs) / 2.0, cs, x, w)
+            kit.sym(c, ic, cx, ry + (rh - cs) / 2.0, cs, tcol)
+            let tx: f64 = kit.rx(x + cw, w - cw, x, w)
+            let used: f64 = kit.label_in(c, tx, ry, rh, kit.ln(c, 13), 700, tcol, (*r).label, w - cw - pad)
+        } else {
+            let used2: f64 = kit.label_in(c, lx + pad, ry, rh, kit.ln(c, 13), 400, tcol, (*r).label, lw - 2.0 * pad)
+            pg_draw_value(c, r, vx + pad, ry, vw - 2.0 * pad, rh, mcol, tcol, selected && focus)
+        }
+        ry = ry + rh
+        k = k + 1
+    }
+    // the divider: a hairline between the columns (accent while dragged / hovered)
+    var dcol: u32 = kit.tokc(c, style.TOK_SEPARATOR)
+    if (*g).drag || (*g).hpart == PGP_DIV {
+        dcol = kit.accent_gfx(c, style.TOK_BASE)
+    }
+    let dx: f64 = kit.rx(x + pg_label_w(g, w), 0.0, x, w)
+    painter.surface(z, dx - kit.ln(c, 1) / 2.0, y, kit.ln(c, 1), fmin(h, ry - y), dcol)
+    // the focus ring around the selected row
+    if focus && (*g).sel != kit.NONE && pg_is_visible(rows, n, (*g).sel) {
+        let vp: usize = pg_visible_pos(rows, n, (*g).sel)
+        if vp >= (*g).top && vp < nvis {
+            let fy: f64 = y + ((vp - (*g).top) as f64) * rh
+            if fy < y + h {
+                kit.focus_ring(c, x + kit.ln(c, 1), fy + kit.ln(c, 1), w - kit.ln(c, 2), rh - kit.ln(c, 2), kit.ln(c, 4), style.TOK_BASE)
+            }
+        }
+    }
+    canvas.clip_pop(painter.painter_canvas(z))
+}
+
+#[allow_escape]
+fn pg_draw_value(c: *mut render.Ctx, r: *mut PgRow, x: f64, y: f64, w: f64, h: f64, mcol: u32, tcol: u32, ring: bool) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var col: u32 = tcol
+    if (*r).readonly {
+        col = mcol
+    }
+    if (*r).kind == PG_TEXT {
+        let u: f64 = kit.label_in(c, x, y, h, kit.ln(c, 13), 400, col, (*r).text, w)
+    } else if (*r).kind == PG_NUM {
+        var buf: [u8; 32] = [0 as u8; 32]
+        let nl: usize = fmt_i64((*r).num, &buf)
+        let ns: str = str { p: (&buf[0]) as *mut u8, n: nl }
+        let nw: f64 = kit.text_width(c, kit.ln(c, 13), 400, ns)
+        var sx: f64 = x
+        if kit.kit_rtl() {
+            sx = x + w - nw
+        }
+        let u2: f64 = kit.draw_label(c, sx, y, h, kit.ln(c, 13), 400, col, ns, 0.0)
+        if (*r).text.n > 0 {
+            var ux: f64 = x + nw + kit.ln(c, 4)
+            if kit.kit_rtl() {
+                ux = x + w - nw - kit.ln(c, 4) - kit.text_width(c, kit.ln(c, 12), 400, (*r).text)
+            }
+            let u3: f64 = kit.draw_label(c, ux, y, h, kit.ln(c, 12), 400, mcol, (*r).text, 0.0)
+        }
+    } else if (*r).kind == PG_CHOICE {
+        let cs: f64 = kit.ln(c, 16)
+        let u4: f64 = kit.label_in(c, x, y, h, kit.ln(c, 13), 400, col, (*r).text, w - cs - kit.ln(c, 4))
+        kit.sym(c, lucide.CHEVRON_DOWN, kit.rx(x + w - cs, cs, x, w), y + (h - cs) / 2.0, cs, mcol)
+    } else if (*r).kind == PG_COLOR {
+        let sw: f64 = kit.ln(c, 20)
+        let sx2: f64 = kit.rx(x, sw, x, w)
+        painter.round_rect(z, sx2, y + (h - sw) / 2.0, sw, sw, kit.ln(c, 4), (*r).color)
+        painter.round_ring(z, sx2, y + (h - sw) / 2.0, sw, sw, kit.ln(c, 4), kit.ln(c, 1), kit.tokc(c, style.TOK_BORDER))
+        var hexb: [u8; 8] = [35 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8]
+        var q: usize = 0
+        while q < 6 {
+            let sh: u32 = (20 - 4 * q) as u32
+            let nib: u32 = ((*r).color >> sh) & 15 as u32
+            var ch: u8 = (48 + nib) as u8
+            if nib >= 10 as u32 {
+                ch = (55 + nib) as u8
+            }
+            hexb[1 + q] = ch
+            q = q + 1
+        }
+        let hs: str = str { p: (&hexb[0]) as *mut u8, n: 7 }
+        let hx: f64 = x + sw + kit.ln(c, 8)
+        var hxx: f64 = hx
+        if kit.kit_rtl() {
+            hxx = x + w - sw - kit.ln(c, 8) - kit.text_width(c, kit.ln(c, 13), 400, hs)
+        }
+        let u5: f64 = kit.draw_label(c, hxx, y, h, kit.ln(c, 13), 400, col, hs, 0.0)
+    } else if (*r).kind == PG_BOOL {
+        let bw: f64 = kit.ln(c, 18)
+        let bx: f64 = kit.rx(x, bw, x, w)
+        let by: f64 = y + (h - bw) / 2.0
+        if (*r).on {
+            let ac: u32 = kit.accent_gfx(c, style.TOK_BASE)
+            painter.round_rect(z, bx, by, bw, bw, kit.ln(c, 4), ac)
+            kit.sym(c, lucide.CHECK, bx + kit.ln(c, 1), by + kit.ln(c, 1), bw - kit.ln(c, 2), kit.accent_on(c, style.TOK_BASE))
+        } else {
+            painter.round_ring(z, bx, by, bw, bw, kit.ln(c, 4), kit.ln(c, 1), mcol)
+        }
+    }
+}
+
+// the decimal of v into buf (<= 31 bytes); the length
+fn fmt_i64(v: i64, buf: *mut [u8; 32]) -> usize {
+    var tmp: [u8; 24] = [0 as u8; 24]
+    var n: usize = 0
+    var neg: bool = v < 0 as i64
+    var u: u64 = v as u64
+    if neg {
+        u = (0 as i64 - v) as u64
+    }
+    if u == 0 as u64 {
+        tmp[0] = 48 as u8
+        n = 1
+    }
+    while u > 0 as u64 {
+        tmp[n] = (48 as u64 + u % 10 as u64) as u8
+        u = u / 10 as u64
+        n = n + 1
+    }
+    var o: usize = 0
+    if neg {
+        (*buf)[0] = 45 as u8
+        o = 1
+    }
+    var j: usize = 0
+    while j < n {
+        (*buf)[o + j] = tmp[n - 1 - j]
+        j = j + 1
+    }
+    return o + n
+}
+
+// The row and part at a point (the grid at x, y, w): the row index or kit.NONE; `part` is a PGP_*. A point on
+// the column divider answers PGP_DIV and row kit.NONE.
+fn pg_hit(c: *mut render.Ctx, g: *mut PGrid, rows: *mut PgRow, n: usize, x: f64, y: f64, w: f64, h: f64,
+    px: f64, py: f64, part: *mut u32) -> usize {
+    *part = PGP_NONE
+    if px < x || px >= x + w || py < y || py >= y + h {
+        return kit.NONE
+    }
+    let dx: f64 = kit.rx(x + pg_label_w(g, w), 0.0, x, w)
+    if fabs(px - dx) <= pg_div_zone(c) {
+        *part = PGP_DIV
+        return kit.NONE
+    }
+    let rh: f64 = pg_row_h(c)
+    let k: usize = (*g).top + ((py - y) / rh) as usize
+    let i: usize = pg_visible_row(rows, n, k)
+    if i == kit.NONE {
+        return kit.NONE
+    }
+    if (*pg_row_at(rows, i)).kind == PG_GROUP {
+        *part = PGP_LABEL
+        let cw: f64 = pg_chev_w(c)
+        var cx0: f64 = x
+        if kit.kit_rtl() {
+            cx0 = x + w - cw
+        }
+        if px >= cx0 && px < cx0 + cw {
+            *part = PGP_ARROW
+        }
+        return i
+    }
+    var lx: f64 = 0.0
+    var lw: f64 = 0.0
+    pg_col(c, g, x, w, 0, &lx, &lw)
+    if px >= lx && px < lx + lw {
+        *part = PGP_LABEL
+    } else {
+        *part = PGP_VALUE
+    }
+    return i
+}
+
+// What a press on (row, part) does: selects the row; a group folds (arrow or label), a switch flips (value
+// or label), text / number / choice / colour values ask for an editor (value part, not read-only).
+fn pg_press(g: *mut PGrid, rows: *mut PgRow, n: usize, row: usize, part: u32) -> u32 {
+    if row == kit.NONE || row >= n {
+        return PGK_NONE
+    }
+    let moved: bool = (*g).sel != row
+    (*g).sel = row
+    let r: *mut PgRow = pg_row_at(rows, row)
+    if (*r).kind == PG_GROUP {
+        (*r).on = !(*r).on
+        return PGK_FOLDED
+    }
+    if (*r).readonly {
+        if moved {
+            return PGK_MOVED
+        }
+        return PGK_NONE
+    }
+    if (*r).kind == PG_BOOL && part == PGP_VALUE {
+        (*r).on = !(*r).on
+        return PGK_TOGGLED
+    }
+    if part == PGP_VALUE {
+        return PGK_EDIT
+    }
+    if moved {
+        return PGK_MOVED
+    }
+    return PGK_NONE
+}
+
+// The keys of the focused grid: Up / Down / Home / End move over the VISIBLE rows, Right opens a group (on a
+// group row), Left closes it (or jumps from a value row to its group), Space flips a switch / folds a group,
+// Enter asks for an editor (switch: flips). Returns a PGK_*.
+fn pg_key(g: *mut PGrid, rows: *mut PgRow, n: usize, key0: u32) -> u32 {
+    var key: u32 = key0
+    if kit.kit_rtl() {
+        if key == editor.KEY_LEFT {
+            key = editor.KEY_RIGHT
+        } else if key == editor.KEY_RIGHT {
+            key = editor.KEY_LEFT
+        }
+    }
+    let nvis: usize = pg_visible_count(rows, n)
+    if nvis == 0 {
+        return PGK_NONE
+    }
+    var cur: usize = 0
+    if (*g).sel != kit.NONE && pg_is_visible(rows, n, (*g).sel) {
+        cur = pg_visible_pos(rows, n, (*g).sel)
+    } else {
+        (*g).sel = pg_visible_row(rows, n, 0)
+        if key == editor.KEY_UP || key == editor.KEY_DOWN || key == editor.KEY_HOME || key == editor.KEY_END {
+            return PGK_MOVED
+        }
+    }
+    var to: usize = cur
+    if key == editor.KEY_DOWN && cur + 1 < nvis {
+        to = cur + 1
+    } else if key == editor.KEY_UP && cur > 0 {
+        to = cur - 1
+    } else if key == editor.KEY_HOME {
+        to = 0
+    } else if key == editor.KEY_END {
+        to = nvis - 1
+    } else if key == editor.KEY_PGDN {
+        to = cur + 8
+        if to >= nvis { to = nvis - 1 }
+    } else if key == editor.KEY_PGUP {
+        if cur >= 8 { to = cur - 8 } else { to = 0 }
+    }
+    if to != cur {
+        (*g).sel = pg_visible_row(rows, n, to)
+        return PGK_MOVED
+    }
+    let sr: usize = (*g).sel
+    if sr == kit.NONE {
+        return PGK_NONE
+    }
+    let r: *mut PgRow = pg_row_at(rows, sr)
+    if (*r).kind == PG_GROUP {
+        if key == editor.KEY_RIGHT && !(*r).on {
+            (*r).on = true
+            return PGK_FOLDED
+        }
+        if key == editor.KEY_LEFT && (*r).on {
+            (*r).on = false
+            return PGK_FOLDED
+        }
+        if key == editor.KEY_ENTER {
+            (*r).on = !(*r).on
+            return PGK_FOLDED
+        }
+        return PGK_NONE
+    }
+    if key == editor.KEY_LEFT {
+        // to the group above
+        var k: usize = sr
+        while k > 0 {
+            k = k - 1
+            if (*pg_row_at(rows, k)).kind == PG_GROUP {
+                (*g).sel = k
+                return PGK_MOVED
+            }
+        }
+        return PGK_NONE
+    }
+    if (*r).readonly {
+        return PGK_NONE
+    }
+    if key == editor.KEY_ENTER || key == 32 as u32 {
+        if (*r).kind == PG_BOOL {
+            (*r).on = !(*r).on
+            return PGK_TOGGLED
+        }
+        if key == editor.KEY_ENTER {
+            return PGK_EDIT
+        }
+    }
+    return PGK_NONE
+}
+
+// The divider drag: begin at pointer x, move to x (width `w`), end. The label column keeps 15 .. 85 %.
+fn pg_div_begin(g: *mut PGrid, px: f64) {
+    (*g).drag = true
+    (*g).drag_x0 = px
+    (*g).drag_pm0 = (*g).label_pm
+}
+
+fn pg_div_move(g: *mut PGrid, px: f64, w: f64) {
+    if !(*g).drag || w <= 0.0 {
+        return
+    }
+    var dx: f64 = px - (*g).drag_x0
+    if kit.kit_rtl() {
+        dx = 0.0 - dx
+    }
+    var pm: i64 = (*g).drag_pm0 + (dx * 1000.0 / w) as i64
+    if pm < 150 as i64 { pm = 150 }
+    if pm > 850 as i64 { pm = 850 }
+    (*g).label_pm = pm
+}
+
+fn pg_div_end(g: *mut PGrid) {
+    (*g).drag = false
+}
