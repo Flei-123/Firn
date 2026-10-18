@@ -36,6 +36,8 @@
 #                         (with --push/--pick/--install the launcher activity is org.firn.FirnMain, launchMode singleTop:
 #                         onNewIntent keeps the intent of a notification tap while the app is open; an
 #                         activity-alias keeps the component name android.app.NativeActivity working)
+#   --plain-activity      the launcher is the plain android.app.NativeActivity (no org.firn.FirnMain, no alias, no singleTop) even with
+#                         our own dex (bisect builds; a notification tap while the app is open then does not switch the chat)
 #   --dex <file>          classes.dex to ship (then hasCode="true")
 #   --args-file <file>    default arguments (one per line) the app starts
 #                         with, shipped as assets/args.txt; a file args.txt
@@ -100,6 +102,7 @@ while [ $# -gt 0 ]; do
         --package) PKG=$2; shift 2 ;;
         --lib) LIB=$2; shift 2 ;;
         --abi) ABI=$2; shift 2 ;;
+        --plain-activity) PLAINACT=1; shift ;;
         --version-code) VCODE=$2; shift 2 ;;
         --version-name) VNAME=$2; shift 2 ;;
         --opt) OPT=$2; shift 2 ;;
@@ -232,7 +235,7 @@ fi
 # With our own dex the launcher activity is org.firn.FirnMain (singleTop + onNewIntent: a tap on a notification while
 # the app is open reaches the app); without it the plain NativeActivity.
 MAINACT=android.app.NativeActivity; LAUNCHMODE=""
-if [ $OWNDEX -eq 1 ]; then MAINACT=org.firn.FirnMain; LAUNCHMODE='android:launchMode="singleTop"'; fi
+if [ $OWNDEX -eq 1 ] && [ "${PLAINACT:-0}" -eq 0 ]; then MAINACT=org.firn.FirnMain; LAUNCHMODE='android:launchMode="singleTop"'; fi
 HASCODE=false
 [ -n "$DEX" ] && HASCODE=true
 MAN=$BUILD/AndroidManifest.xml
@@ -267,7 +270,7 @@ EOF
             </intent-filter>
         </activity>
 EOF
-    if [ $OWNDEX -eq 1 ]; then
+    if [ $OWNDEX -eq 1 ] && [ "${PLAINACT:-0}" -eq 0 ]; then
         # the old component name keeps working (am start -n pkg/android.app.NativeActivity)
         # (NativeActivity reads lib_name/func_name from the component of the START intent: the alias, so it carries them too)
         echo '        <activity-alias android:name="android.app.NativeActivity" android:targetActivity="org.firn.FirnMain" android:exported="true">'
