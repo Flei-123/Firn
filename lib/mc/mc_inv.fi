@@ -35,9 +35,9 @@
 //   and shapeless recipes of minecraft-data; special recipes such as banners, fireworks, dyeing, repair are not in the table and stay with the server),
 //   and the result slot itself is clickable: left click takes the stack to the cursor (or merges it into an equal carried stack) and uses up one of every
 //   ingredient, shift click crafts repeatedly into main inventory + hotbar until the inventory is full or the ingredients run out (CraftingMenu /
-//   InventoryMenu.quickMoveStack). Right click works like left click (ResultSlot takes the whole result); hotbar swap / drop on the result slot stay with the server.
-//   Recipes with a remainder item (milk bucket -> bucket, honey bottle / dragon's breath -> glass bottle) put it back into the ingredient's grid slot; when that
-//   is impossible (stack of several honey bottles, unknown remainder such as a potion) the click is left to the server. Without inv_use_recipes nothing changes (the result slot is only what the server sent).
+//   InventoryMenu.quickMoveStack). Right click works like left click (ResultSlot takes the whole result); hotbar swap (into an empty target slot only) and Q drop (the whole result is dropped) on the result slot are predicted too (r234).
+//   Recipes with a remainder item (milk bucket -> bucket, honey bottle / dragon's breath -> glass bottle) put it back into the ingredient's grid slot; from a stack of
+//   several items it goes into the player inventory (vanilla Inventory.add: selected hotbar slot, off hand, stack with room, empty slot; inv_set_selected(i, k)). With no room (vanilla drops it) or an unknown remainder (potion) the click is left to the server. Without inv_use_recipes nothing changes (the result slot is only what the server sent).
 //   inv_window(i) / inv_window_slots(i) / inv_win_item(i, k) / inv_win_count(i, k) / inv_close_window(cl, i)
 import std.rt
 import std.bytes
@@ -59,7 +59,7 @@ export {
     inv_set_enchant_keys, inv_patch_of, inv_hash_off, inv_set_creative, inv_drag_begin, inv_drag_add, inv_drag_end,
     INV_CAP, inv_window_cols, inv_window_title, inv_on_open_window_v, inv_on_close_window_v, inv_close_window, inv_local_close, inv_window, inv_window_slots,
     inv_win_item, inv_win_count, inv_win_to_int, inv_int_to_win, inv_window_size,
-    inv_use_recipes, inv_craft_geom, inv_craft_refresh, inv_craft_update,
+    inv_use_recipes, inv_craft_geom, inv_craft_refresh, inv_craft_update, inv_set_selected,
 }
 
 const SLOT_CUR: i32 = 1000
@@ -121,13 +121,15 @@ struct Inv {
     xscr: u64, // u32 [XS_LEN], structured component (food / tool / attribute_modifiers) being parsed
     rcp: u64, // borrowed: *mut mc_craft.Recipes for the craft result prediction, 0 = none
     craft_g: u64, // u32 [9], scratch grid (item id + 1) of the craft matcher
+    sel: i32, // selected hotbar slot 0..8 (Inventory.add tries it first)
+    sv: u64, // u32 [(INV_CAP + 1) * 5], undo buffer of a craft click (slot_save / slot_restore)
 }
 
 fn inv_new() -> Inv {
     var v: Inv = Inv { ids: rt.heap_alloc(INV_CAP * 4), counts: rt.heap_alloc(INV_CAP * 4), effs: rt.heap_alloc(INV_CAP * 4),
         sigs: rt.heap_alloc(INV_CAP * 4), maxs: rt.heap_alloc(INV_CAP * 4), cur_sig: 0, cur_max: 0,
         cur_id: 0 - 1, cur_count: 0, cur_eff: 0, eff_id: 0 - 1, reg: 0, state_id: 0, action: 1, n_updates: 0 as u32, n_srv: 0 as u32, hash_off: false, n_clicks: 0 as u32, bad: 0 as u32, qc_status: 0, qc_type: 0, qc_mask: 0 as u64, qc_hi: 0 as u64, win: 0, win_n: 0, creative: false,
-        pscr: rt.heap_alloc(PS_LEN * 4), ptab: rt.heap_alloc(PT_CAP * PT_STRIDE * 4), pt_next: 0, ek: 0, ek_n: 0, win_cols: 9, win_title: rt.heap_alloc(WIN_TITLE_CAP), win_title_n: 0, win_res: 0 - 1, xscr: rt.heap_alloc(XS_LEN * 4), rcp: 0, craft_g: rt.heap_alloc(9 * 4) }
+        pscr: rt.heap_alloc(PS_LEN * 4), ptab: rt.heap_alloc(PT_CAP * PT_STRIDE * 4), pt_next: 0, ek: 0, ek_n: 0, win_cols: 9, win_title: rt.heap_alloc(WIN_TITLE_CAP), win_title_n: 0, win_res: 0 - 1, xscr: rt.heap_alloc(XS_LEN * 4), rcp: 0, craft_g: rt.heap_alloc(9 * 4), sel: 0, sv: rt.heap_alloc((INV_CAP + 1) * 5 * 4) }
     inv_clear(&v)
     var z: usize = 0
     while z < PT_CAP * PT_STRIDE { rt.st32(v.ptab, z, 0 as u32); z = z + 1 }
@@ -148,6 +150,7 @@ fn inv_free(v: *mut Inv) {
     rt.heap_free((*v).xscr, XS_LEN * 4)
     (*v).xscr = 0
     rt.heap_free((*v).craft_g, 9 * 4)
+    rt.heap_free((*v).sv, (INV_CAP + 1) * 5 * 4)
     (*v).craft_g = 0
     rt.heap_free((*v).ptab, PT_CAP * PT_STRIDE * 4)
     (*v).pscr = 0
@@ -165,6 +168,7 @@ fn inv_use_recipes(v: *mut Inv, rcp: *mut mc_craft.Recipes) {
     (*v).rcp = 0
     if mc_craft.craft_ok(rcp) { (*v).rcp = rcp as u64 }
 }
+fn inv_set_selected(v: *mut Inv, k: i32) { if k >= 0 && k < 9 { (*v).sel = k } }
 fn inv_cursor_item(v: *mut Inv) -> i32 { return (*v).cur_id }
 fn inv_cursor_count(v: *mut Inv) -> i32 { return (*v).cur_count }
 
@@ -1934,9 +1938,8 @@ fn craft_remainder(v: *mut Inv, it: i32) -> i32 {
     return 0 - 1
 }
 
-// Can the click on the result slot be predicted? The remainder is put back into its own grid slot (vanilla ResultSlot.onTake); that works when the
-// ingredient stack has exactly one item (buckets always do). A bigger stack (honey bottles x5) sends the remainder to the player inventory
-// (Inventory.add) and an unknown remainder is not modelled: both stay with the server.
+// Can the click on the result slot be predicted? Only an unknown remainder (potion, other buckets) is not modelled and stays with the server.
+// (A remainder of a stack with several items goes into the player inventory, see inv_add_one / craft_consume; a full inventory is detected there.)
 fn craft_blocked(v: *mut Inv) -> bool {
     var rs: i32 = 0
     var first: i32 = 0
@@ -1946,70 +1949,190 @@ fn craft_blocked(v: *mut Inv) -> bool {
     while i < gw * gw {
         let it: i32 = inv_item(v, first + i)
         if it >= 0 && inv_count(v, first + i) > 0 {
-            let rem: i32 = craft_remainder(v, it)
-            if rem == 0 - 2 { return true }
-            if rem >= 0 && inv_count(v, first + i) > 1 { return true }
+            if craft_remainder(v, it) == 0 - 2 { return true }
         }
         i = i + 1
     }
     return false
 }
 
-// ResultSlot.onTake: one of every ingredient is used up (a remainder item takes the place of a single-item ingredient), then the result is recomputed
-fn craft_consume(v: *mut Inv) {
+// undo buffer of a craft click: every slot and the cursor (item + 1, count, Efficiency, signature, max stack)
+fn slot_save(v: *mut Inv) {
+    var t: Stk = stk_new()
+    var k: usize = 0
+    while k <= INV_CAP {
+        if k == INV_CAP { load(v, SLOT_CUR, &t) } else { load(v, k as i32, &t) }
+        rt.st32((*v).sv, k * 5, (t.item + 1) as u32)
+        rt.st32((*v).sv, k * 5 + 1, t.count as u32)
+        rt.st32((*v).sv, k * 5 + 2, t.eff as u32)
+        rt.st32((*v).sv, k * 5 + 3, t.sig as u32)
+        rt.st32((*v).sv, k * 5 + 4, t.mx as u32)
+        k = k + 1
+    }
+}
+
+fn slot_restore(v: *mut Inv) {
+    var t: Stk = stk_new()
+    var k: usize = 0
+    while k <= INV_CAP {
+        t.item = (rt.ld32((*v).sv, k * 5) as i32) - 1
+        t.count = rt.ld32((*v).sv, k * 5 + 1) as i32
+        t.eff = rt.ld32((*v).sv, k * 5 + 2) as i32
+        t.sig = rt.ld32((*v).sv, k * 5 + 3) as i32
+        t.mx = rt.ld32((*v).sv, k * 5 + 4) as i32
+        if t.item < 0 || t.count <= 0 { stk_empty(&t) }
+        if k == INV_CAP { store(v, SLOT_CUR, &t) } else { store(v, k as i32, &t) }
+        k = k + 1
+    }
+}
+
+// can slot `k` take one more of `s` (vanilla Inventory.hasRemainingSpaceForItem: same stack, stackable, below the limit)
+fn has_room(v: *mut Inv, k: i32, s: *mut Stk, mx: i32) -> bool {
+    if mx <= 1 { return false }
+    var sl: Stk = stk_new()
+    load(v, k, &sl)
+    return same_stack(&sl, s) && sl.count < mx
+}
+
+// vanilla Inventory.add of ONE plain item (a remainder item): first the selected hotbar slot, the off hand, then the first stack with room
+// (hotbar 36..44, main 9..35), then the first empty slot in the same order. The armour slots are not touched. false = no room (vanilla drops the item).
+fn inv_add_one(v: *mut Inv, item: i32) -> bool {
+    var s: Stk = stk_new()
+    s.item = item
+    s.count = 1
+    let mx: i32 = stack_max(v, &s)
+    var t: Stk = stk_new()
+    var sl: Stk = stk_new()
+    var tgt: i32 = 0 - 1
+    if has_room(v, INV_HOTBAR0 + (*v).sel, &s, mx) { tgt = INV_HOTBAR0 + (*v).sel }
+    else if has_room(v, 45, &s, mx) { tgt = 45 }
+    var k: i32 = INV_HOTBAR0
+    while tgt < 0 && k < 45 {
+        if has_room(v, k, &s, mx) { tgt = k }
+        k = k + 1
+    }
+    k = INV_MAIN0
+    while tgt < 0 && k < INV_HOTBAR0 {
+        if has_room(v, k, &s, mx) { tgt = k }
+        k = k + 1
+    }
+    if tgt >= 0 {
+        load(v, tgt, &sl)
+        stk_n(&sl, sl.count + 1, &t)
+        store(v, tgt, &t)
+        return true
+    }
+    k = INV_HOTBAR0
+    while k < 45 {
+        if inv_item(v, k) < 0 || inv_count(v, k) <= 0 { store(v, k, &s); return true }
+        k = k + 1
+    }
+    k = INV_MAIN0
+    while k < INV_HOTBAR0 {
+        if inv_item(v, k) < 0 || inv_count(v, k) <= 0 { store(v, k, &s); return true }
+        k = k + 1
+    }
+    return false
+}
+
+// ResultSlot.onTake: one of every ingredient is used up. A remainder item takes the place of a single-item ingredient; when the ingredient stack has
+// several items the remainder goes into the player inventory (Inventory.add). Then the result is recomputed.
+// false = a remainder found no room (vanilla drops it): the caller undoes everything (slot_restore) and leaves the click to the server.
+fn craft_consume(v: *mut Inv) -> bool {
     var rs: i32 = 0
     var first: i32 = 0
     var gw: i32 = 0
-    if !inv_craft_geom(v, &rs, &first, &gw) { return }
+    if !inv_craft_geom(v, &rs, &first, &gw) { return true }
+    var ok: bool = true
     var i: i32 = 0
     while i < gw * gw {
         let it: i32 = inv_item(v, first + i)
         let c: i32 = inv_count(v, first + i)
         if it >= 0 && c > 0 {
+            let rem: i32 = craft_remainder(v, it)
             if c <= 1 {
-                let rem: i32 = craft_remainder(v, it)
                 if rem >= 0 { put_slot(v, first + i, rem, 1) } else { put_slot(v, first + i, 0 - 1, 0) }
-            } else { put_slot_e(v, first + i, it, c - 1, inv_eff(v, first + i)); set_extra(v, first + i, inv_sig(v, first + i), inv_max_stack(v, first + i)) }
+            } else {
+                put_slot_e(v, first + i, it, c - 1, inv_eff(v, first + i))
+                set_extra(v, first + i, inv_sig(v, first + i), inv_max_stack(v, first + i))
+                if rem >= 0 && !inv_add_one(v, rem) { ok = false }
+            }
         }
         i = i + 1
     }
     craft_update(v)
+    return ok
 }
 
-// click on the result slot `rs` (internal number). 0 = not predictable, 1 = predicted, 2 = predicted shift click (`lg` = legacy clicked stack)
+// click on the result slot `rs` (internal number). 0 = not predictable (nothing changed), 1 = predicted, 2 = predicted shift click (`lg` = legacy clicked stack).
+// PICKUP / QUICK_MOVE: see below. SWAP with a hotbar key (button 0..8, 40 = off hand): only into an EMPTY target slot (the result slot takes nothing), the result
+// moves there, then onTake. THROW (Q / Ctrl+Q, empty cursor): ResultSlot.remove ignores the amount, the WHOLE result is dropped (no inventory change), then onTake.
 fn craft_result_click(v: *mut Inv, rs: i32, button: i32, mode: i32, lg: *mut Stk) -> i32 {
-    // PICKUP with either button takes the whole result (ResultSlot.remove ignores the amount) or merges it into an equal cursor stack; SWAP / THROW stay with the server
-    if !((mode == 0 && (button == 0 || button == 1)) || (mode == 1 && (button == 0 || button == 1))) { return 0 }
+    var kind: i32 = 0 // 1 pickup, 2 shift, 3 swap, 4 throw
+    if mode == 0 && (button == 0 || button == 1) { kind = 1 }
+    if mode == 1 && (button == 0 || button == 1) { kind = 2 }
+    var other: i32 = 0 - 1
+    if mode == 2 {
+        if button >= 0 && button <= 8 { other = INV_HOTBAR0 + button }
+        if button == 40 { other = 45 }
+        if other >= 0 { kind = 3 }
+    }
+    if mode == 4 && (button == 0 || button == 1) { kind = 4 }
+    if kind == 0 { return 0 }
     var r: Stk = stk_new()
     var cu: Stk = stk_new()
     var t: Stk = stk_new()
     load(v, rs, &r)
     if r.item < 0 || r.count <= 0 { return 1 }
     if craft_blocked(v) { return 0 }
-    if mode == 0 {
+    if kind == 3 {
+        load(v, other, &t)
+        if t.item >= 0 && t.count > 0 { return 1 }
+        slot_save(v)
+        store(v, other, &r)
+        put_slot(v, rs, 0 - 1, 0)
+        if !craft_consume(v) { slot_restore(v); return 0 }
+        return 1
+    }
+    if kind == 4 {
+        load(v, SLOT_CUR, &cu)
+        if cu.item >= 0 && cu.count > 0 { return 1 }
+        slot_save(v)
+        put_slot(v, rs, 0 - 1, 0)
+        if !craft_consume(v) { slot_restore(v); return 0 }
+        return 1
+    }
+    if kind == 1 {
         load(v, SLOT_CUR, &cu)
         if cu.item < 0 || cu.count <= 0 {
+            slot_save(v)
             store(v, SLOT_CUR, &r)
-            craft_consume(v)
+            if !craft_consume(v) { slot_restore(v); return 0 }
             return 1
         }
         if cu.item == r.item && cu.eff == r.eff && cu.sig == r.sig && cu.count + r.count <= stack_max(v, &cu) {
+            slot_save(v)
             stk_n(&cu, cu.count + r.count, &t)
             store(v, SLOT_CUR, &t)
-            craft_consume(v)
+            if !craft_consume(v) { slot_restore(v); return 0 }
         }
         return 1
     }
-    // shift click: craft again and again into main inventory + hotbar (moveItemStackTo(stack, 9 / 10, 45 / 46, true))
+    // shift click: craft again and again into main inventory + hotbar (moveItemStackTo(stack, 9 / 10, 45 / 46, true)), the result first, then onTake
     var guard: i32 = 0
     var w: Stk = stk_new()
     while guard < 128 {
         load(v, rs, &r)
         if r.item < 0 || r.count <= 0 { break }
         if craft_blocked(v) { break }
+        slot_save(v)
         stk_n(&r, r.count, &w)
         if !move_to(v, &w, 9, 45, true) { break }
-        craft_consume(v)
+        if !craft_consume(v) {
+            slot_restore(v)
+            if guard == 0 { return 0 }
+            break
+        }
         load(v, rs, &t)
         if !(t.item >= 0 && t.count > 0 && t.item == r.item) { break }
         stk_n(&r, r.count, lg)

@@ -216,6 +216,46 @@ want={"stick":12,"oak_planks":6,"cake":1,"bucket":3}
 ok=all(tot.get(k)==v for k,v in want.items()) and not any(k in tot for k in ("milk_bucket","sugar","egg","wheat"))
 sys.exit(0 if ok else 1)
 PY
+# ---- crafting table 3x3, DROP / SWAP on the result and a remainder from an ingredient STACK (MCPLAY_TABLE_TEST2, r234): 2 planks -> stick x4, Q drops it; 8 honey bottles
+# (2 in each of 4 grid slots) -> honey block: left click (4 glass bottles into the inventory), hotbar swap (single bottles: they stay in the grid). After the window closes the
+# server returns the grid: honey_block 2, glass_bottle 8, no honey / planks; the dropped sticks may have been picked up again (0 or 4).
+MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_TABLE_TEST2=1 MCPLAY_RUN_S=30 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+    timeout 150 "$W/mcplay" 127.0.0.1 "$PORT" Player14 > "$W/tt2.out" 2>&1 &
+PP=$!
+sleep 5
+echo "gamemode survival Player14" >&3
+for g in "honey_bottle 8" "oak_planks 2"; do echo "give Player14 $g" >&3; done
+echo "execute at Player14 run setblock ~1 ~ ~ minecraft:crafting_table" >&3
+sleep 21
+echo "data get entity Player14 Inventory" >&3
+sleep 2
+wait $PP
+T2O=$(grep 'mcplay: tabletest2 open' "$W/tt2.out" | head -1)
+T2P=$(grep 'mcplay: tablepre3' "$W/tt2.out" | head -1)
+T2T=$(grep 'mcplay: tablethrow' "$W/tt2.out" | head -1)
+T2Q=$(grep 'mcplay: tablepre4' "$W/tt2.out" | head -1)
+T2L=$(grep 'mcplay: tabletest2 res=' "$W/tt2.out" | head -1)
+echo "  $T2O"; echo "  $T2P"; echo "  $T2T"; echo "  $T2Q"; echo "  $T2L"
+T2BAD=$(grep -o ' bad=[0-9]*' "$W/tt2.out" | head -1 | cut -d= -f2)
+[ "${T2BAD:-1}" -eq 0 ] || { echo "  FAIL  table2: inv bad=${T2BAD:-?}"; ERR=1; }
+case "$T2P" in *"x4 "*"cursor=0"*) ;; *) echo "  FAIL  table2: stick result not predicted $T2P"; ERR=1;; esac
+case "$T2T" in *"res=-1x0 stick=0 planks=0 cursor=-1"*) ;; *) echo "  FAIL  table2: Q on the result $T2T"; ERR=1;; esac
+case "$T2Q" in *"x1 "*"g1=2 g5=2 cursor=0"*) ;; *) echo "  FAIL  table2: honey block not predicted $T2Q"; ERR=1;; esac
+case "$T2L" in *"res=-1x0 hblock=2 gbottle=8 honey=0 stick=0 planks=0 "*"cursor=-1 "*) ;; *) echo "  FAIL  table2: local result $T2L"; ERR=1;; esac
+if [ "$PROTO" -le 764 ]; then case "$T2L" in *" srv=0") ;; *) echo "  FAIL  table2: the server had to correct the prediction ($T2L)"; ERR=1;; esac; fi
+INV6=$(grep 'Player14 has the following entity data' "$W/server.log" | tail -1)
+python3 - "$INV6" <<'PY' || ERR=1
+import re,sys
+t=sys.argv[1]
+tot={}
+for m in re.finditer(r'\{[^{}]*Slot: (\d+)b[^{}]*\}', t):
+    c=re.search(r'(?:Count: |count: )(\d+)', m.group(0))
+    i=re.search(r'(?:id: |id:)"minecraft:(\w+)"', m.group(0))
+    if c and i: tot[i.group(1)]=tot.get(i.group(1),0)+int(c.group(1))
+print("  server inventory (table2): totals=%s" % tot)
+ok=tot.get("honey_block")==2 and tot.get("glass_bottle")==8 and "honey_bottle" not in tot and "oak_planks" not in tot and tot.get("stick",0) in (0,4)
+sys.exit(0 if ok else 1)
+PY
 # ---- chest window (MCPLAY_CHEST_TEST): a chest next to the player (10 stone, 6 dirt, 64 stone); Open Window -> Window Items -> shift click both ways, pick up,
 # drag over four container slots, close; the chest content and the player's hotbar on the server must equal the client's prediction
 MCPLAY_AUDIO=0 MCPLAY_CREATIVE=0 MCPLAY_CHEST_TEST=1 MCPLAY_RUN_S=28 MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
