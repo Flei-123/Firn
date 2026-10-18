@@ -289,7 +289,23 @@ focus; nothing is built before.
   classes, part of `tools/fui/run.sh`), `tools/android/keyboard_check.sh`
   (emulator: taps the keys of the real keyboard, compares the pixels with
   the same text arriving as key events) and `tools/android/lifecycle_check.sh`
-  (pause, resume, rotation, screen off).
+  (pause, resume, rotation, screen off), `tools/android/relaunch_check.sh`
+  (the system re-creates the activity: toggles a framework overlay twice;
+  the process, the picture and the touch have to survive).
+* **The system re-creates the activity** (roadmap r775). A change in the
+  resources under a running activity (a resource overlay that comes up shortly
+  after an emulator's first boot, a theme switch) relaunches it, and no
+  manifest `configChanges` can declare that. `onDestroy` of such a destroy
+  (`Activity.isChangingConfigurations()`) keeps the process and the running
+  program; the next activity brings its window to it. Before, the process ended
+  100 ms after the first window ("main returned, finishing"). A new window also
+  gets its EGL surface at once (`host_insn` CMD_WINDOW), or fUi's targets for
+  the new size had no current context and the program fell to the CPU painter
+  for good (a black window).
+* **Link check.** `build.sh` links with `-z defs`: a program that uses
+  `lib/plat/android/speech.fi` without `--speech` (or `camera.fi` without
+  `--camera`) fails at build time instead of in `dlopen` on the phone
+  (`cannot locate symbol AAudioStreamBuilder_setChannelCount`, roadmap r776).
 * **Not done:** a real phone (the emulator's AOSP keyboard is what was run),
   more than one line of text, the full-screen extract UI (the flags ask the
   keyboard not to use it).
