@@ -99,6 +99,11 @@ struct Mont {
     n0: u64, // -m[0]^-1 mod 2^32
     nl: usize, // the length of the modulus in limbs
     ok: bool,
+    // Scratch of `mont_mul` (accumulator + result + trial subtraction): kept here so a multiplication does not zero ~3 KB of
+    // stack every call (the P-256 handshake does ~18000 of them on 8 limbs).
+    t: [u64; 138],
+    o: Big,
+    sb: Big,
 }
 
 // ------------------------------------------------------------- The number
@@ -147,12 +152,20 @@ fn big_set_u32(a: *mut Big, v: u32) {
 
 #[no_gc]
 fn big_copy(dst: *mut Big, src: *mut Big) {
+    // Only the limbs in use travel; whatever the destination held above the new length is cleared up to its old length, so
+    // limbs above `n` still read as zero (a copy of all 136 limbs cost ~800 instructions per call).
+    let sn: usize = (*src).n
+    let dn: usize = (*dst).n
     var i: usize = 0
-    while i < BIG_MAX {
+    while i < sn {
         (*dst).d[i] = (*src).d[i]
         i = i + 1
     }
-    (*dst).n = (*src).n
+    while i < dn {
+        (*dst).d[i] = 0 as u32
+        i = i + 1
+    }
+    (*dst).n = sn
 }
 
 #[no_gc]
@@ -429,6 +442,38 @@ fn select_into(r: *mut Big, t: *mut Big, s: *mut Big, mask: u64,
 #[no_gc]
 fn big_add_mod(r: *mut Big, a: *mut Big, b: *mut Big, m: *mut Big) {
     let nl: usize = (*m).n
+    if nl <= 12 {
+        // up to 384 bits (P-256, P-384, 25519): small local arrays instead of two zeroed 136-limb numbers
+        var tt: [u64; 12] = [0; 12]
+        var ss: [u64; 12] = [0; 12]
+        var carry: u64 = 0
+        var borrow: u64 = 0
+        var i: usize = 0
+        while i < nl {
+            var av: u64 = 0
+            var bv: u64 = 0
+            if i < (*a).n { av = (*a).d[i] as u64 }
+            if i < (*b).n { bv = (*b).d[i] as u64 }
+            let sum: u64 = av + bv + carry
+            tt[i] = sum & M32
+            carry = sum >> 32
+            let mv: u64 = (*m).d[i] as u64
+            let df: u64 = tt[i] + 4294967296 as u64 - mv - borrow
+            ss[i] = df & M32
+            if df < 4294967296 as u64 { borrow = 1 } else { borrow = 0 }
+            i = i + 1
+        }
+        let need: u64 = carry | (1 as u64 -% borrow)
+        let mask: u64 = (0 as u64) -% (need & 1 as u64)
+        i = 0
+        while i < nl {
+            let tv: u64 = tt[i]
+            (*r).d[i] = (tv ^ (mask & (tv ^ ss[i]))) as u32
+            i = i + 1
+        }
+        (*r).n = nl
+        return
+    }
     var t: Big = big_new()
     let carry: u64 = big_add(&t, a, b, nl)
     var s: Big = big_new()
@@ -444,6 +489,39 @@ fn big_add_mod(r: *mut Big, a: *mut Big, b: *mut Big, m: *mut Big) {
 #[no_gc]
 fn big_sub_mod(r: *mut Big, a: *mut Big, b: *mut Big, m: *mut Big) {
     let nl: usize = (*m).n
+    if nl <= 12 {
+        var tt: [u64; 12] = [0; 12]
+        var ss: [u64; 12] = [0; 12]
+        var borrow: u64 = 0
+        var i: usize = 0
+        while i < nl {
+            var av: u64 = 0
+            var bv: u64 = 0
+            if i < (*a).n { av = (*a).d[i] as u64 }
+            if i < (*b).n { bv = (*b).d[i] as u64 }
+            let df: u64 = av + 4294967296 as u64 - bv - borrow
+            tt[i] = df & M32
+            if df < 4294967296 as u64 { borrow = 1 } else { borrow = 0 }
+            i = i + 1
+        }
+        var carry: u64 = 0
+        i = 0
+        while i < nl {
+            let sum: u64 = tt[i] + ((*m).d[i] as u64) + carry
+            ss[i] = sum & M32
+            carry = sum >> 32
+            i = i + 1
+        }
+        let mask: u64 = (0 as u64) -% borrow
+        i = 0
+        while i < nl {
+            let tv: u64 = tt[i]
+            (*r).d[i] = (tv ^ (mask & (tv ^ ss[i]))) as u32
+            i = i + 1
+        }
+        (*r).n = nl
+        return
+    }
     var t: Big = big_new()
     let borrow: u64 = big_sub(&t, a, b, nl)
     var s: Big = big_new()
@@ -457,7 +535,7 @@ fn big_sub_mod(r: *mut Big, a: *mut Big, b: *mut Big, m: *mut Big) {
 #[no_gc]
 fn mont_new() -> Mont {
     return Mont { m: big_new(), rr: big_new(), one: big_new(),
-        n0: 0, nl: 0, ok: false }
+        n0: 0, nl: 0, ok: false, t: [0; 138], o: big_new(), sb: big_new() }
 }
 
 #[no_gc]
@@ -552,70 +630,73 @@ fn mont_init(mc: *mut Mont, m: *mut Big) -> bool {
 #[no_gc]
 fn mont_mul(mc: *mut Mont, r: *mut Big, a: *mut Big, b: *mut Big) {
     let nl: usize = (*mc).nl
-    var t: [u64; 274] = [0; 274]
+    var la: usize = (*a).n
+    if la > nl { la = nl }
+    var lb: usize = (*b).n
+    if lb > nl { lb = nl }
     var i: usize = 0
     while i < nl + 2 {
-        t[i] = 0
+        (*mc).t[i] = 0
         i = i + 1
     }
     i = 0
     while i < nl {
         var ai: u64 = 0
-        if i < (*a).n {
+        if i < la {
             ai = (*a).d[i] as u64
         }
         // t = t + a_i * b
         var carry: u64 = 0
         var j: usize = 0
-        while j < nl {
-            var bj: u64 = 0
-            if j < (*b).n {
-                bj = (*b).d[j] as u64
-            }
-            let s: u64 = t[j] + ai * bj + carry
-            t[j] = s & M32
+        while j < lb {
+            let s: u64 = (*mc).t[j] + ai * ((*b).d[j] as u64) + carry
+            (*mc).t[j] = s & M32
             carry = s >> 32
             j = j + 1
         }
-        let s1: u64 = t[nl] + carry
-        t[nl] = s1 & M32
-        t[nl + 1] = t[nl + 1] + (s1 >> 32)
+        while j < nl {
+            let s: u64 = (*mc).t[j] + carry
+            (*mc).t[j] = s & M32
+            carry = s >> 32
+            j = j + 1
+        }
+        let s1: u64 = (*mc).t[nl] + carry
+        (*mc).t[nl] = s1 & M32
+        (*mc).t[nl + 1] = (*mc).t[nl + 1] + (s1 >> 32)
         // m_i = t_0 * n0 mod 2^32, then t = (t + m_i * m) / 2^32
-        let mi: u64 = (t[0] * (*mc).n0) & M32
-        let s0: u64 = t[0] + mi * ((*mc).m.d[0] as u64)
+        let mi: u64 = ((*mc).t[0] * (*mc).n0) & M32
+        let s0: u64 = (*mc).t[0] + mi * ((*mc).m.d[0] as u64)
         carry = s0 >> 32
         j = 1
         while j < nl {
-            let s: u64 = t[j] + mi * ((*mc).m.d[j] as u64) + carry
-            t[j - 1] = s & M32
+            let s: u64 = (*mc).t[j] + mi * ((*mc).m.d[j] as u64) + carry
+            (*mc).t[j - 1] = s & M32
             carry = s >> 32
             j = j + 1
         }
-        let s2: u64 = t[nl] + carry
-        t[nl - 1] = s2 & M32
-        t[nl] = (s2 >> 32) + t[nl + 1]
-        t[nl + 1] = 0
+        let s2: u64 = (*mc).t[nl] + carry
+        (*mc).t[nl - 1] = s2 & M32
+        (*mc).t[nl] = (s2 >> 32) + (*mc).t[nl + 1]
+        (*mc).t[nl + 1] = 0
         i = i + 1
     }
-    var out: Big = big_new()
     i = 0
     while i < nl {
-        out.d[i] = t[i] as u32
+        (*mc).o.d[i] = (*mc).t[i] as u32
         i = i + 1
     }
-    out.n = nl
+    (*mc).o.n = nl
     // One conditional subtraction: the CIOS result is below 2*m. Written
     // branch-free, because the X25519 ladder runs on this function and a
     // jump that depends on a secret value is exactly what it must not do.
-    var sub: Big = big_new()
-    let borrow: u64 = big_sub(&sub, &out, &(*mc).m, nl)
+    let borrow: u64 = big_sub(&(*mc).sb, &(*mc).o, &(*mc).m, nl)
     var top: u64 = 0
-    if t[nl] != 0 as u64 {
+    if (*mc).t[nl] != 0 as u64 {
         top = 1
     }
     let need: u64 = top | (1 as u64 -% borrow)
     let mask: u64 = (0 as u64) -% (need & 1 as u64)
-    select_into(r, &out, &sub, mask, nl)
+    select_into(r, &(*mc).o, &(*mc).sb, mask, nl)
 }
 
 // r = a * R mod m -- into the domain.
