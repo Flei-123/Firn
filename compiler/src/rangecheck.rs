@@ -651,7 +651,7 @@ impl<'a> Ana<'a> {
     /// of a header `{ptr, len, cap}` (the word right before its length) and
     /// `idx` is the result of a `CheckedIdxV` against that header's length
     /// word. Such a store lies inside the data buffer of that Vec (the index
-    /// was checked) and a buffer never contains a header of its own...
+    /// was checked) and a buffer never contains its own header.
     ///
     ///  * OWN header (r759): the Vec is the one whose length word is `hdr`.
     ///    The store cannot touch it, a buffer never contains its own header.
