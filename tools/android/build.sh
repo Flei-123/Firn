@@ -180,11 +180,19 @@ build_abi() { # $1 abi dir, $2 firn target, $3 linker, $4 NDK triple
     # (resolved by name by ART).
     printf '{ global: firn_activity_create; Java_org_firn_*; local: *; };\n' > "$out/exports.ver"
     local syslib=$NDK/sysroot/usr/lib/$triple/$API
-    "$linker" -shared -Bsymbolic --version-script="$out/exports.ver" \
+    # `-z defs`: every symbol must resolve at LINK time. Without it a program that
+    # uses lib/plat/android/{speech,camera}.fi but was built without --speech /
+    # --camera links "fine" and only dies in dlopen on the phone ("cannot locate
+    # symbol AAudioStreamBuilder_setChannelCount").
+    if ! "$linker" -shared -Bsymbolic -z defs --version-script="$out/exports.ver" \
         -z noexecstack -z max-page-size=16384 \
         -soname "lib$LIB.so" -o "$out/lib$LIB.so" "$out/app.o" \
         -L"$syslib" -landroid -llog -lc -lm -ldl \
-        --as-needed -lEGL -lGLESv3 --no-as-needed $CAMLIBS
+        --as-needed -lEGL -lGLESv3 --no-as-needed $CAMLIBS 2>"$out/link.err"; then
+        head -n 12 "$out/link.err" >&2
+        echo "ERROR: $abi: link failed (undefined symbols above). A program that uses lib/plat/android/speech.fi needs --speech (libaaudio), camera.fi needs --camera (libcamera2ndk + libmediandk)." >&2
+        exit 1
+    fi
     if readelf -d "$out/lib$LIB.so" | grep -q TEXTREL; then
         echo "ERROR: $abi: TEXTREL -- Android would refuse the library" >&2
         exit 1
