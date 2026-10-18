@@ -775,10 +775,19 @@ build wave6
 # appw7: range slider + window timelines in the ten-line API (press/drag/keys, dt-based clock, reduced motion)
 build appw7
 "$W/appw7" | tail -n 3
+# appw8w: wave 8 controls (spinner, time picker, breadcrumb, info bar, stepper) in the ten-line API: keys, digits, wheel, clicks, a11y
+build appw8w
+"$W/appw8w" | tail -n 3 | grep -q "APPW8W PASSED"
 
 # appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
 build appw6
 "$W/appw6" | tail -n 3
+# appw8: editable combobox in the ten-line API (typing filters, Down/Up/Enter/Esc, click, shield, a11y rows, wheel, focus)
+build appw8
+"$W/appw8" | tail -n 3 | grep -q "APPW8 PASSED"
+# appw9: window size class in the ten-line API (classes, hysteresis, callback once per change, columns)
+build appw9
+"$W/appw9" | tail -n 3 | grep -q "APPW9 PASSED"
 # W16: mnemonics (Alt+letter, '&'), Tab order end to end, shortcut management
 build w16
 "$W/w16" | tail -n 3
