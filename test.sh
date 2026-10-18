@@ -273,6 +273,18 @@ run_case() {          # $1 = file, $2 = "opt" | "noopt" | "devfast" | "safe"
     if [ "$mode" = "opt" ] && head -5 "$file" | grep -q '^// not_mode: opt$'; then
         return
     fi
+    # r736: a file with `#[test]` functions and NO `fn main` is a testkit file for
+    # `firnc --test` (it must not declare main): run it once (dev-fast) as such.
+    if grep -q '^#\[test\]' "$file" && ! grep -q '^fn main' "$file"; then
+        [ "$mode" = "devfast" ] || return
+        if "$FIRNC" --test --opt-level=dev-fast -o "$WORK/${base}.tr" "$file" >"$WORK/$base.tr.out" 2>&1; then
+            ok
+        else
+            bad "$file [firnc --test]: failed"
+            head -8 "$WORK/$base.tr.out" | sed 's/^/        /' || true
+        fi
+        return
+    fi
     bin="$WORK/${base}.${mode}"
     # ROUND 72: `mode=opt` used to mean "no flag at all", which quietly
     # meant `release-fast` ONLY as long as `OptConfig::default()` itself
