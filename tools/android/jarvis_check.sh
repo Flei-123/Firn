@@ -153,6 +153,9 @@ if [ "$(OCR_TRIES=25 wait_ocr 7_restart 'Chats')" = 1 ]; then echo "  NOTE  rest
     check "second sign-in works" "$(OCR_TRIES=30 wait_ocr 8_chat_again 'Chats')" 1
 fi
 
+# after the restart the connection is rebuilt ("offline - reconnecting"): a message sent before it is up is not delivered
+check "online again after the restart" "$(OCR_TRIES=30 wait_ocr 8b_online 'online')" 1
+
 # ---- keyboard: typing, cursor, selection, copy/paste. Proof = the exact text the server receives.
 tap $FIELD_X $FIELD_Y 1; wait_kbd >/dev/null; sleep 2; $ADB shell input text abd; sleep 1 # a loaded host reorders fast key events: one step per second
 $ADB shell input keyevent KEYCODE_DPAD_LEFT; sleep 1; $ADB shell input text c      # cursor moved left, inserted: abcd
