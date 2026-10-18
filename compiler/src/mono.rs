@@ -65,6 +65,31 @@ pub fn expand(prog: &mut Program, dg: &mut Diags) {
     check_bare_uses(prog, dg);
 }
 
+/// r742: instances recorded AFTER `expand` (lambda.rs infers the type arguments
+/// of `apply(id, 4)` from the expected `fn` type). Expands only what is missing.
+pub fn expand_late(prog: &mut Program, dg: &mut Diags) {
+    let fnames: HashSet<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
+    let mut done: HashSet<String> = fnames.clone();
+    done.extend(prog.structs.iter().map(|s| s.name.clone()));
+    let mut queue: Vec<(String, Instantiation)> = sema_generic::instantiations()
+        .into_iter()
+        .filter(|(m, i)| !i.is_abstract && !done.contains(m))
+        .collect();
+    queue.reverse();
+    let mut next_id = prog.expr_count;
+    while let Some((mangled, inst)) = queue.pop() {
+        if !done.insert(mangled.clone()) {
+            continue;
+        }
+        if inst.is_fn {
+            expand_fn(prog, dg, &fnames, &mangled, &inst, &mut queue, &mut next_id);
+        } else {
+            expand_struct(prog, dg, &fnames, &mangled, &inst, &mut queue);
+        }
+    }
+    prog.expr_count = next_id;
+}
+
 // ------------------------------------------------------------ Instantiations
 
 fn bind_params(

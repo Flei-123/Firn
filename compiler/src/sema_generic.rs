@@ -799,6 +799,96 @@ pub(crate) fn hook_generic_call(p: &mut Parser, base: &Expr) -> Option<Expr> {
     Some(p.mk(span, ExprKind::Call(mangled, cargs, base.span)))
 }
 
+/// r742 -- unify a template type (mentions the type parameters) with a concrete
+/// type. `false` = the shapes differ (the type checker reports that later).
+fn unify_ty(t: &TypeExpr, c: &TypeExpr, tps: &[TyParam], map: &mut HashMap<String, TypeExpr>) -> bool {
+    match (t, c) {
+        (TypeExpr::Named(n, _), _) if tps.iter().any(|p| &p.name == n) => match map.get(n) {
+            Some(old) => type_tag(old) == type_tag(c),
+            None => {
+                map.insert(n.clone(), c.clone());
+                true
+            }
+        },
+        (TypeExpr::Named(n, _), TypeExpr::Named(m, _)) => {
+            if n == m {
+                return true;
+            }
+            // `Vec__T` (abstract instance written in the template) against `Vec__i32`
+            match (instantiation(n), instantiation(m)) {
+                (Some(a), Some(b)) if a.base == b.base && a.args.len() == b.args.len() && a.is_fn == b.is_fn => {
+                    a.args.iter().zip(b.args.iter()).all(|(x, y)| unify_ty(x, y, tps, map))
+                }
+                _ => false,
+            }
+        }
+        (TypeExpr::Ptr { inner: a, .. }, TypeExpr::Ptr { inner: b, .. }) => unify_ty(a, b, tps, map),
+        (TypeExpr::Array { elem: a, len: la, .. }, TypeExpr::Array { elem: b, len: lb, .. }) => {
+            la == lb && unify_ty(a, b, tps, map)
+        }
+        (TypeExpr::Fn { params: pa, ret: ra, .. }, TypeExpr::Fn { params: pb, ret: rb, .. }) => {
+            pa.len() == pb.len()
+                && pa.iter().zip(pb.iter()).all(|(x, y)| unify_ty(x, y, tps, map))
+                && match (ra, rb) {
+                    (Some(x), Some(y)) => unify_ty(x, y, tps, map),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        (TypeExpr::Tuple(a, _), TypeExpr::Tuple(b, _)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| unify_ty(x, y, tps, map))
+        }
+        _ => false,
+    }
+}
+
+/// r742 -- `apply(id, 4)` / `let f: fn(i32) -> i32 = id`: the type arguments of
+/// the generic function `name` come from the expected `fn(..)` type. Records the
+/// instance (the caller runs `mono::expand_late`) and returns its mangled name.
+/// `Err` = the message for the user.
+pub(crate) fn infer_fn_value(name: &str, expected: &TypeExpr, at: Span) -> Result<String, String> {
+    let tpl = match fn_template(name) {
+        Some(t) => t,
+        None => return Err(format!("unknown generic function '{}'", name)),
+    };
+    let (eparams, eret) = match expected {
+        TypeExpr::Fn { params, ret, .. } => (params, ret),
+        _ => return Err(format!("'{}' is a generic function: write the type arguments, e.g. '{}[i32]'", name, name)),
+    };
+    let mut map: HashMap<String, TypeExpr> = HashMap::new();
+    let ok = tpl.decl.params.len() == eparams.len()
+        && tpl.decl.params.iter().zip(eparams.iter()).all(|(p, e)| unify_ty(&p.ty, e, &tpl.params, &mut map))
+        && match (&tpl.decl.ret, eret) {
+            (Some(x), Some(y)) => unify_ty(x, y, &tpl.params, &mut map),
+            (None, None) => true,
+            _ => false,
+        };
+    if !ok {
+        return Err(format!(
+            "generic function '{}' does not fit the expected function type (write the type arguments, e.g. '{}[i32]')",
+            name, name
+        ));
+    }
+    let mut args: Vec<TypeExpr> = Vec::new();
+    for p in &tpl.params {
+        match map.get(&p.name) {
+            Some(t) => args.push(t.clone()),
+            None => {
+                return Err(format!(
+                    "cannot infer the type parameter '{}' of '{}' from the expected function type (write the type arguments, e.g. '{}[i32]')",
+                    p.name, name, name
+                ))
+            }
+        }
+    }
+    let mangled = mangle(name, &args);
+    record_inst(
+        &mangled,
+        Instantiation { base: name.to_string(), args, span: at, is_abstract: false, is_fn: true },
+    );
+    Ok(mangled)
+}
+
 /// `// HOOK types` in `parser.rs::primary` — `Vec[i32]{ .. }`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     // r707: `mod.Vec[i32]{ .. }`

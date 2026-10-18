@@ -26,7 +26,7 @@ use crate::ast::*;
 use crate::diag::{Diags, Span};
 use crate::lexer::TokKind;
 use crate::parser::Parser;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const INFER: &str = "__infer";
 const RET_EXPR: &str = "__lam_expr";
@@ -140,10 +140,29 @@ struct Cx<'a> {
     rets: &'a HashMap<String, TypeExpr>,
     /// element type per instantiated `Vec__..` (r740: `v[i] = |x| ..`)
     elems: &'a HashMap<String, TypeExpr>,
-    /// declared / evident types of the locals of the current function
-    locals: HashMap<String, TypeExpr>,
+    /// type per static / const (r742: `s.f = |x| ..` on a module static)
+    globals: &'a HashMap<String, TypeExpr>,
+    /// functions whose first parameter is `self` (r742: `Type.m` as a value)
+    methods: &'a HashSet<String>,
+    /// block scopes of the current function, innermost last (r742). `None` = a
+    /// local whose type is not evident; it still SHADOWS an outer one.
+    scopes: Vec<HashMap<String, Option<TypeExpr>>>,
     ret: Option<TypeExpr>,
+    /// r742: an instance was recorded while inferring `apply(id, 4)` -> expand again
+    pending: bool,
     dg: &'a mut Diags,
+}
+
+/// Looks `n` up from the innermost block outwards. `Some(None)` = a local of
+/// unknown type, `None` = no local of that name.
+fn lookup(cx: &Cx, n: &str) -> Option<Option<TypeExpr>> {
+    cx.scopes.iter().rev().find_map(|s| s.get(n).cloned())
+}
+
+fn declare(cx: &mut Cx, n: &str, t: Option<TypeExpr>) {
+    if let Some(s) = cx.scopes.last_mut() {
+        s.insert(n.to_string(), t);
+    }
 }
 
 /// The declared type of an assignment target / local, as far as it is
@@ -156,8 +175,32 @@ fn expr_ty(cx: &Cx, e: &Expr) -> Option<TypeExpr> {
         }
     }
     match &e.kind {
-        ExprKind::Ident(n) => cx.locals.get(n).cloned(),
+        ExprKind::Ident(n) => match lookup(cx, n) {
+            Some(t) => t,
+            None => cx.globals.get(n).cloned(),
+        },
         ExprKind::StructLit(n, _, _) => Some(TypeExpr::Named(n.clone(), e.span)),
+        ExprKind::Cast(_, t) => Some(t.clone()),
+        ExprKind::Unary(UnOp::AddrOf, a) => {
+            let inner = expr_ty(cx, a)?;
+            Some(TypeExpr::Ptr { mutable: true, inner: Box::new(inner), span: e.span })
+        }
+        // r742: `let x = obj.method(); x.f = |a| ..` -- the receiver type picks `Type__method`
+        ExprKind::Call(n, args, _) if crate::impls::method_name(n).is_some() => {
+            let m = crate::impls::method_name(n)?;
+            let recv = strip(expr_ty(cx, args.first()?)?);
+            match recv {
+                TypeExpr::Named(s, _) => cx.rets.get(&format!("{}__{}", s, m)).cloned(),
+                _ => None,
+            }
+        }
+        // `try f()`: the payload of the error union
+        ExprKind::Call(n, args, _) if n == crate::errors::TRY_NAME && args.len() == 1 => {
+            match expr_ty(cx, &args[0])? {
+                TypeExpr::Named(u, _) => crate::errors::pending_inner(&u).map(|x| x.1),
+                _ => None,
+            }
+        }
         ExprKind::Call(n, _, _) => cx.rets.get(n).cloned(),
         ExprKind::Unary(UnOp::Deref, a) => match expr_ty(cx, a)? {
             TypeExpr::Ptr { inner, .. } => Some(*inner),
@@ -191,11 +234,31 @@ fn ty_key(t: &TypeExpr) -> String {
 }
 
 pub fn apply(prog: &mut Program, dg: &mut Diags) {
+    let mut start = 0usize;
+    loop {
+        let before = prog.funcs.len();
+        let pending = round(prog, dg, start);
+        if !pending || dg.has_errors() {
+            break;
+        }
+        // r742: instances of generic functions inferred from an expected `fn`
+        // type (`apply(id, 4)`) are expanded now; the new bodies get their turn.
+        crate::mono::expand_late(prog, dg);
+        if prog.funcs.len() == before {
+            break;
+        }
+        start = before;
+    }
+}
+
+fn round(prog: &mut Program, dg: &mut Diags, start: usize) -> bool {
     let mut sigs: HashMap<String, Vec<TypeExpr>> = HashMap::new();
     let mut msigs: HashMap<String, Vec<Vec<TypeExpr>>> = HashMap::new();
+    let mut methods: HashSet<String> = HashSet::new();
     for f in &prog.funcs {
         let tys: Vec<TypeExpr> = f.params.iter().map(|p| p.ty.clone()).collect();
         if f.params.first().map_or(false, |p| p.name == "self") {
+            methods.insert(f.name.clone());
             if let Some(i) = f.name.rfind("__") {
                 msigs.entry(f.name[i + 2..].to_string()).or_default().push(tys.clone());
             }
@@ -214,25 +277,54 @@ pub fn apply(prog: &mut Program, dg: &mut Diags) {
             elems.insert(name, inst.args[0].clone());
         }
     }
-    let mut cx = Cx { sigs: &sigs, msigs: &msigs, fields: &fields, rets: &rets, elems: &elems, locals: HashMap::new(), ret: None, dg };
-    for f in prog.funcs.iter_mut() {
+    let mut globals: HashMap<String, TypeExpr> = HashMap::new();
+    for c in &prog.consts {
+        globals.insert(c.name.clone(), c.ty.clone());
+    }
+    for s in &prog.statics {
+        globals.insert(s.name.clone(), s.ty.clone());
+    }
+    let mut cx = Cx {
+        sigs: &sigs,
+        msigs: &msigs,
+        fields: &fields,
+        rets: &rets,
+        elems: &elems,
+        globals: &globals,
+        methods: &methods,
+        scopes: Vec::new(),
+        ret: None,
+        pending: false,
+        dg,
+    };
+    for f in prog.funcs.iter_mut().skip(start) {
         cx.ret = f.ret.clone();
-        cx.locals = f.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect();
+        cx.scopes = vec![f.params.iter().map(|p| (p.name.clone(), Some(p.ty.clone()))).collect()];
         block(&mut cx, &mut f.body);
     }
     cx.ret = None;
-    for c in prog.consts.iter_mut() {
-        want(&mut cx, &mut c.value, None);
+    cx.scopes = vec![HashMap::new()];
+    if start == 0 {
+        for c in prog.consts.iter_mut() {
+            let t = c.ty.clone();
+            want(&mut cx, &mut c.value, Some(&t));
+        }
+        for s in prog.statics.iter_mut() {
+            let t = s.ty.clone();
+            want(&mut cx, &mut s.value, Some(&t));
+        }
     }
-    for s in prog.statics.iter_mut() {
-        want(&mut cx, &mut s.value, None);
-    }
+    cx.pending
 }
 
 fn block(cx: &mut Cx, b: &mut Block) {
+    // r742: block scoping -- a `let` inside `{ .. }` ends with the block and a
+    // shadowing `let` of another type does not leak into the outer one
+    cx.scopes.push(HashMap::new());
     for s in b.stmts.iter_mut() {
         stmt(cx, s);
     }
+    cx.scopes.pop();
 }
 
 fn stmt(cx: &mut Cx, s: &mut Stmt) {
@@ -240,9 +332,8 @@ fn stmt(cx: &mut Cx, s: &mut Stmt) {
         Stmt::Let { name, ty, init, .. } => {
             let t = ty.clone();
             want(cx, init, t.as_ref());
-            if let Some(t) = t.or_else(|| expr_ty(cx, init)) {
-                cx.locals.insert(name.clone(), t);
-            }
+            let known = t.or_else(|| expr_ty(cx, init));
+            declare(cx, name, known);
         }
         Stmt::AssignOp { target, value, .. } => {
             want(cx, target, None);
@@ -273,10 +364,13 @@ fn stmt(cx: &mut Cx, s: &mut Stmt) {
                 want(cx, v, t.as_ref());
             }
         }
-        Stmt::For { start, end, body, .. } => {
+        Stmt::For { name, start, end, body, .. } => {
             want(cx, start, None);
             want(cx, end, None);
+            cx.scopes.push(HashMap::new());
+            declare(cx, name, None);
             block(cx, body);
+            cx.scopes.pop();
         }
         Stmt::Defer(inner, _, _) => stmt(cx, inner),
         Stmt::Expr(e) => want(cx, e, None),
@@ -287,6 +381,9 @@ fn stmt(cx: &mut Cx, s: &mut Stmt) {
 
 /// Visit `e`, knowing the type the context wants (if any).
 fn want(cx: &mut Cx, e: &mut Expr, t: Option<&TypeExpr>) {
+    if value_rewrite(cx, e, t) {
+        return;
+    }
     match &mut e.kind {
         ExprKind::Call(n, args, _) if n == crate::errors::TRY_NAME && args.len() == 1 => {
             // `try gc |x| ..`: the lambda is the operand
@@ -294,6 +391,75 @@ fn want(cx: &mut Cx, e: &mut Expr, t: Option<&TypeExpr>) {
         }
         ExprKind::Lambda(d) => resolve(cx, d, t, e.span),
         _ => walk(cx, e),
+    }
+}
+
+/// r742: a function NAME used as a value.
+/// * `id` (generic fn, no type arguments) where a `fn(..)` type is expected:
+///   the type arguments come from that type (`apply(id, 4)`, `let f: fn(i32) -> i32 = id`,
+///   struct field, `return`) -> the identifier becomes the instance name.
+/// * `Type.m` (method of a struct, no call) -> the plain function `Type__m`, whose
+///   first parameter is the receiver pointer. A BOUND receiver (`x.m` without a call)
+///   is not supported: error with a hint.
+/// Returns true when `e` was rewritten or reported.
+fn value_rewrite(cx: &mut Cx, e: &mut Expr, t: Option<&TypeExpr>) -> bool {
+    match &e.kind {
+        ExprKind::Ident(n) => {
+            let n = n.clone();
+            if lookup(cx, &n).is_some() || cx.globals.contains_key(&n) {
+                return false;
+            }
+            // `mod.f` is read as one identifier when `mod` is an imported module
+            let base = match n.split_once('.') {
+                Some((_, f)) if crate::sema_generic::is_generic_fn(f) => f.to_string(),
+                _ => n.clone(),
+            };
+            if !crate::sema_generic::is_generic_fn(&base) {
+                return false;
+            }
+            let want_t = match t {
+                Some(t @ TypeExpr::Fn { .. }) => t.clone(),
+                _ => return false,
+            };
+            match crate::sema_generic::infer_fn_value(&base, &want_t, e.span) {
+                Ok(m) => {
+                    e.kind = ExprKind::Ident(m);
+                    cx.pending = true;
+                }
+                Err(msg) => cx.dg.error(e.span, msg),
+            }
+            true
+        }
+        ExprKind::Field(inner, m, _) => {
+            let m = m.clone();
+            if let ExprKind::Ident(s) = &inner.kind {
+                // `Type.m`: `Type` is a struct, no variable
+                if lookup(cx, s).is_none() && !cx.globals.contains_key(s) {
+                    let f = format!("{}__{}", s, m);
+                    if cx.fields.contains_key(s) && cx.methods.contains(&f) {
+                        e.kind = ExprKind::Ident(f);
+                        return true;
+                    }
+                }
+            }
+            // `x.m` without a call: a method, no field
+            if let Some(TypeExpr::Named(s, _)) = expr_ty(cx, inner).map(|t| match t {
+                TypeExpr::Ptr { inner, .. } => *inner,
+                t => t,
+            }) {
+                let has_field = cx.fields.get(&s).map_or(false, |fs| fs.contains_key(&m));
+                if !has_field && cx.methods.contains(&format!("{}__{}", s, m)) {
+                    cx.dg.error_note(
+                        e.span,
+                        format!("method '{}' of '{}' used as a value without a call", m, s),
+                        format!("a bound method value is not supported; write `{}.{}` (receiver passed as first argument) or a lambda: `|a| x.{}(a)`", s, m, m),
+                    );
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
     }
 }
 
@@ -350,7 +516,17 @@ fn resolve(cx: &mut Cx, d: &mut LambdaDecl, t: Option<&TypeExpr>, sp: Span) {
     // the body: its own `return` is checked against the lambda result
     let saved = cx.ret.take();
     cx.ret = d.ret.clone();
+    let ps: HashMap<String, Option<TypeExpr>> = d
+        .params
+        .iter()
+        .map(|p| {
+            let known = !matches!(&p.ty, TypeExpr::Named(n, _) if n == INFER);
+            (p.name.clone(), if known { Some(p.ty.clone()) } else { None })
+        })
+        .collect();
+    cx.scopes.push(ps);
     block(cx, &mut d.body);
+    cx.scopes.pop();
     cx.ret = saved;
 }
 
