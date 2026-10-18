@@ -802,6 +802,10 @@ build apptb
 build appw11
 "$W/appw11" | tail -n 3 | grep -q "APPW11 PASSED"
 
+# tablex: caret by mouse click in the open cell editor (click / double click / drag) + table rows and cells in the a11y tree (model, dump, JSON, UIA elements, AT-SPI object count)
+build tablex
+"$W/tablex" | tail -n 3 | grep -q "TABLEX PASSED"
+
 # appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
 build appw6
 "$W/appw6" | tail -n 3
