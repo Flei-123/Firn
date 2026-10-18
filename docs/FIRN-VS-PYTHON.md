@@ -35,6 +35,7 @@ Python reference notes: 11 uses Pillow (installed), 13 and 08 use stdlib only (`
 | 01_http_json_api | 43 | 58 | 57 | 1.33 | 345 | 569 | 1.65 | 5 | 6 | 102.2 | 3.0 | 4407 |
 | 02_csv_json_report | 21 | 105 | 100 | 4.76 | 242 | 1012 | 4.18 | 3 | 9 | 39.1 | 1.6 | 823 |
 | 03_find_rename | 33 | 78 | 60 | 1.82 | 401 | 535 | 1.33 | 1 | 5 | 80.8 | 13.7 | 1203 |
+| 04_regex_text | 20 | 58 | 58 | 2.9 | 230 | 631 | 2.74 | 2 | 7 | 42.2 | 4.1 | 1037 |
 | 05_download_extract | 16 | 37 | 37 | 2.31 | 183 | 402 | 2.2 | 1 | 8 | 130.9 | 6.4 | 5712 |
 | 06_sqlite_query | 15 | 35 | 35 | 2.33 | 79 | 327 | 4.14 | 1 | 6 | 44.1 | 2.3 | 4067 |
 | 07_send_mail | 12 | 11 | 11 | 0.92 | 87 | 83 | 0.95 | 3 | 3 | 88.6 | 8.6 | 3616 |
@@ -55,7 +56,7 @@ Python reference notes: 11 uses Pillow (installed), 13 and 08 use stdlib only (`
 | p02_wordcount | 8 | 43 | 25 | 3.12 | 80 | 236 | 2.95 | 1 | 4 | 25.2 | 1.0 | 736 |
 | p03_parse_errors | 7 | 15 | 15 | 2.14 | 37 | 89 | 2.41 | 0 | 2 | 34.3 | 0.6 | 524 |
 
-Summary (`table.py --stats`): `tasks=19 median_factor_now=1.64 median_factor_first=1.86 le1.5_now=9 le1.5_first=7`.
+Summary (`table.py --stats`): `tasks=20 median_factor_now=1.67 median_factor_first=1.94 le1.5_now=9 le1.5_first=7`.
 Live numbers: `python3 tools/vspy/table.py` (reads `examples/vs_python/**/results_*.tsv`).
 Ratios < 1 = Firn shorter. "first pass" = first working Firn version with the libs that existed on 2026-10-17 morning; "now" = after this round's libs.
 Run times: Firn programs run 5-100x faster than `python3` (start 1-4 ms vs 25-45 ms + imports); exception: 14 (timer test is wall-clock bound). Task 10 first looked 5x slower (1278 ms vs 233 ms): the cause was the Python test server (listen backlog 5 -> SYN retransmit), not Firn; fixed in the harness: 61 ms vs 174 ms.
