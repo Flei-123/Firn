@@ -131,6 +131,7 @@ struct Stream {
     timeout_ms: i64,
     deadline: i64,
     timer: u64,
+    hs_timer: u64, // a TLS handshake step that stopped on purpose is called again from here
     paused: bool,
     max_in: usize,
     bytes_in: u64,
@@ -171,7 +172,7 @@ fn stream_alloc(l: *mut loop.Loop, cb: fn(*mut Stream, u64, u32, i64), ud: u64) 
         cb: cb, ud: ud, inb: rt.buf_new(), inpos: 0, outb: rt.buf_new(), outpos: 0,
         secure: false, t: tls.tls_new(), store: 0 as *mut x509.Store,
         host: [0; 256], hostlen: 0, now: 0, reason: 0, errno: 0, tlserr: 0,
-        timeout_ms: 0, deadline: 0, timer: 0, paused: false, max_in: 4194304,
+        timeout_ms: 0, deadline: 0, timer: 0, hs_timer: 0, paused: false, max_in: 4194304,
         bytes_in: 0, bytes_out: 0, busy: 0, want_drain: false, interest: 0 }
     return s
 }
@@ -358,6 +359,10 @@ fn close_now(s: *mut Stream, reason: i64) {
     if (*s).timer != 0 {
         loop.timer_cancel((*s).l, (*s).timer)
         (*s).timer = 0
+    }
+    if (*s).hs_timer != 0 {
+        loop.timer_cancel((*s).l, (*s).hs_timer)
+        (*s).hs_timer = 0
     }
     if (*s).secure && tls.tls_established(&(*s).t) && reason == CL_LOCAL {
         tls.tls_close(&(*s).t) // close_notify, best effort
@@ -740,6 +745,15 @@ fn on_fd_inner(s: *mut Stream, ev: u32) {
     sync_interest(s)
 }
 
+fn on_hs_timer(l: *mut loop.Loop, ud: u64) {
+    let s: *mut Stream = ud as *mut Stream
+    (*s).hs_timer = 0
+    if (*s).state != ST_TLS {
+        return
+    }
+    tls_step(s)
+}
+
 fn tls_step(s: *mut Stream) {
     let done: bool = tls.tls_handshake_step(&(*s).t) catch | e | tls.tls_note_error(&(*s).tlserr, e)
     if !done {
@@ -754,6 +768,12 @@ fn tls_step(s: *mut Stream) {
             return
         }
         touch(s)
+        if tls.tls_yielded(&(*s).t) {
+            // a heavy operation is done: the loop gets a round (frames, input, timers) before the next one
+            if (*s).hs_timer == 0 {
+                (*s).hs_timer = loop.timer_after((*s).l, 1, on_hs_timer, s as u64)
+            }
+        }
         sync_interest(s)
         return
     }

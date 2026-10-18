@@ -176,6 +176,12 @@ struct Store {
     off: [usize; 256],
     len: [usize; 256],
     n: usize,
+    // A cheap index for finding the issuer of a certificate: where the subject Name of root i
+    // lies inside its DER (sub_len 0 = cannot be read). Filled lazily by `store_index`; a full
+    // `cert_parse` of up to 256 roots per handshake took seconds on a slow CPU.
+    sub_off: [usize; 256],
+    sub_len: [usize; 256],
+    idx_n: usize,
 }
 
 // ------------------------------------------------------------------ OIDs
@@ -1245,12 +1251,71 @@ fn verify_signature_by(child: *mut Cert, parent: *mut Cert) -> u32 {
 // ------------------------------------------------------------- The store
 
 fn store_new() -> Store {
-    return Store { blob: rt.buf_new(), off: [0; 256], len: [0; 256], n: 0 }
+    return Store { blob: rt.buf_new(), off: [0; 256], len: [0; 256], n: 0,
+        sub_off: [0; 256], sub_len: [0; 256], idx_n: 0 }
 }
 
 fn store_free(s: *mut Store) {
     rt.buf_free(&(*s).blob)
     (*s).n = 0
+    (*s).idx_n = 0
+}
+
+// Where the subject Name (its contents, like `Cert.subject_off`) lies in a certificate's DER.
+// Walks only as far as the subject; false = not a certificate we can read.
+fn cert_subject_span(p: u64, n: usize, off: *mut usize, len: *mut usize) -> bool {
+    var top: der.Der = der.der_open(p, 0, n)
+    var cert: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&top, der.T_SEQ, &cert) {
+        return false
+    }
+    var tbs: der.Der = der.der_open(p, 0, 0)
+    if !der.der_enter(&cert, der.T_SEQ, &tbs) {
+        return false
+    }
+    if der.der_peek(&tbs) == der.T_CONTEXT + der.T_CONSTRUCTED {
+        if !der.der_skip(&tbs) {
+            return false // version
+        }
+    }
+    if !der.der_skip(&tbs) {
+        return false // serialNumber
+    }
+    if !der.der_skip(&tbs) {
+        return false // signature
+    }
+    if !der.der_skip(&tbs) {
+        return false // issuer
+    }
+    if !der.der_skip(&tbs) {
+        return false // validity
+    }
+    var t: u32 = 0
+    var o: usize = 0
+    var l: usize = 0
+    if !der.der_read(&tbs, &t, &o, &l) || t != der.T_SEQ {
+        return false
+    }
+    *off = o
+    *len = l
+    return true
+}
+
+// Indexes the roots added since the last call (the first handshake pays for all of them, once).
+fn store_index(s: *mut Store) {
+    while (*s).idx_n < (*s).n {
+        let i: usize = (*s).idx_n
+        var so: usize = 0
+        var sl: usize = 0
+        if cert_subject_span((*s).blob.ptr + (*s).off[i] as u64, (*s).len[i], &so, &sl) {
+            (*s).sub_off[i] = so
+            (*s).sub_len[i] = sl
+        } else {
+            (*s).sub_off[i] = 0
+            (*s).sub_len[i] = 0
+        }
+        (*s).idx_n = i + 1
+    }
 }
 
 fn store_count(s: *mut Store) -> usize {
@@ -1451,13 +1516,15 @@ fn verify_chain(store: *mut Store, certs: *mut [Cert; 10], n: usize,
         var ri: usize = 0
         var found_root: bool = false
         var root: Cert = cert_new()
+        store_index(store)
         while ri < (*store).n {
-            var cand: Cert = cert_new()
-            if cert_parse(&cand, (*store).blob.ptr + (*store).off[ri] as u64,
-                (*store).len[ri]) {
-                if same_name(cand.base, cand.subject_off, cand.subject_len,
-                    (*child).base, (*child).issuer_off,
-                    (*child).issuer_len) {
+            // the cheap test first (the subject Name from the index); only a root with the right
+            // name is parsed in full
+            let rb: u64 = (*store).blob.ptr + (*store).off[ri] as u64
+            if (*store).sub_len[ri] != 0 && same_name(rb, (*store).sub_off[ri], (*store).sub_len[ri],
+                (*child).base, (*child).issuer_off, (*child).issuer_len) {
+                var cand: Cert = cert_new()
+                if cert_parse(&cand, rb, (*store).len[ri]) {
                     root = cand
                     found_root = true
                     break
