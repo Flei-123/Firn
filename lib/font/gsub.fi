@@ -50,11 +50,25 @@
 //                 carries two chaining lookups under it (Hebrew ayin with
 //                 vowel, the tone letters U+02E5..).
 //
-// WHAT IS NOT READ, and it is said here instead of silently missing:
-// type 3 and 8 (alternate and reverse
-// substitution). DejaVu needs none of them for `arab`. GPOS (the position of the vowel signs) is likewise not read;
-// how vowel signs nevertheless end up in the right place is stated in
-// lib/fui/painter.fi at the bidi path.
+//   Alternate     type 3: the glyph is replaced by its N-th alternative; N is
+//                 the feature value (`gsub_alt_set`, default 1 = the first
+//                 alternative, as HarfBuzz does for a feature that is on). A
+//                 value above the number of alternatives changes nothing.
+//   Reverse       type 8 (reverse chaining contextual single): backtrack and
+//                 lookahead are coverages; the lookup runs over the sequence
+//                 BACKWARD (last unit first), so the lookahead already sees
+//                 what was substituted behind. Only at the top level -- as
+//                 in HarfBuzz it cannot be the target of a context record.
+//   Match end     after a context rule (5/6) matched, the walk goes on BEHIND
+//                 THE END OF THE MATCHED INPUT (`gsub_match_end`), not at the
+//                 next unit, shifted by the units that the records inserted or
+//                 removed on the way (HarfBuzz apply_lookup). The edits are
+//                 logged (`gsub_elog_*`) so that a record that is itself a
+//                 context lookup shifts the outer records and the end too.
+//
+// WHAT IS NOT READ, and it is said here instead of silently missing: GPOS
+// (the position of the vowel signs). How vowel signs nevertheless end up in
+// the right place is stated in lib/fui/painter.fi at the bidi path.
 //
 // No allocation, no copy of the table: everything is read with every question
 // from the octets of the font, exactly as in ttf.fi. `gsub_init`
@@ -73,6 +87,10 @@ export {
     UNIT, gsub_ligature_u, gsub_li_ligature_u, gsub_context_u,
     gsub_context_li_u, gsub_act_unit, gsub_x_cnt, gsub_x_index,
     gsub_x_remove, gsub_multiple_has, gsub_unit_gid, gsub_unit_next,
+    gsub_alternate, gsub_li_alternate, gsub_alt_set, gsub_alt,
+    gsub_reverse_u, gsub_li_reverse_u, gsub_match_hit, gsub_match_end,
+    gsub_elog_reset, gsub_elog_len, gsub_elog_add, gsub_elog_unit,
+    gsub_elog_count, MAX_ELOG,
     F_ISOL, F_FINA, F_INIT, F_MEDI, F_RLIG, F_LIGA, F_RQD, F_CCMP,
     MAX_LOOKUPS,
 }
@@ -134,7 +152,21 @@ struct Gsub {
     xn: usize,
     xpos: [u32; 64],
     xgid: [u32; 64],
+    // The last context question: did a rule match (also one without
+    // records), and the unit behind its input.
+    hit: usize,
+    mend: usize,
+    // Alternate substitution (type 3): which alternative (1 = first).
+    alt: u32,
+    // Log of the edits (insert / remove units) since `gsub_elog_reset`:
+    // unit and count (0 = the unit was removed, c > 0 = c units were put
+    // behind it).
+    elen: usize,
+    elog_u: [u32; 128],
+    elog_c: [u32; 128],
 }
+
+const MAX_ELOG: usize = 128
 
 #[no_gc]
 fn gsub_new() -> Gsub {
@@ -145,6 +177,8 @@ fn gsub_new() -> Gsub {
         c_cdb: 0, c_cdi: 0, c_cda: 0, ipos: [0; 16],
         act_pos: [0; 8], act_li: [0; 8], nact: 0,
         xn: 0, xpos: [0; 64], xgid: [0; 64],
+        hit: 0, mend: 0, alt: 1, elen: 0,
+        elog_u: [0; 128], elog_c: [0; 128],
     }
 }
 
@@ -995,6 +1029,8 @@ fn ctx_rule(f: *mut ttf.Font, g: *mut Gsub, at: usize, nb: usize, bt: usize,
         j = j + 1
     }
     (*g).nact = na
+    (*g).hit = 1
+    (*g).mend = end
     return true
 }
 
@@ -1099,6 +1135,8 @@ fn context_pos(f: *mut ttf.Font, g: *mut Gsub, lk: usize, gids: u64,
 fn context_lk(f: *mut ttf.Font, g: *mut Gsub, lk: usize, gids: u64,
     skip: u64, n: usize, at: usize) -> usize {
     (*g).nact = 0
+    (*g).hit = 0
+    (*g).mend = at
     (*g).c_gids = gids
     (*g).c_skip = skip
     (*g).c_n = n
@@ -1206,3 +1244,162 @@ fn gsub_act_unit(g: *mut Gsub, j: usize) -> usize {
 
 #[no_gc]
 fn gsub_act_lookup(g: *mut Gsub, j: usize) -> u32 { return (*g).act_li[j] }
+
+// The last context question matched a rule (also one with no records).
+#[no_gc]
+fn gsub_match_hit(g: *mut Gsub) -> bool { return (*g).hit != 0 }
+
+// The unit behind the input of the matching rule: where the walk goes on.
+#[no_gc]
+fn gsub_match_end(g: *mut Gsub) -> usize { return (*g).mend }
+
+// ------------------------------------------------------ EDIT LOG
+
+#[no_gc]
+fn gsub_elog_reset(g: *mut Gsub) { (*g).elen = 0 }
+
+#[no_gc]
+fn gsub_elog_len(g: *mut Gsub) -> usize { return (*g).elen }
+
+// Note an edit: c == 0 the unit `u` was removed, c > 0 c units were put
+// behind `u`. A full log drops the edit (the walk then just does not shift).
+#[no_gc]
+fn gsub_elog_add(g: *mut Gsub, u: usize, c: usize) {
+    if (*g).elen >= MAX_ELOG {
+        return
+    }
+    (*g).elog_u[(*g).elen] = u as u32
+    (*g).elog_c[(*g).elen] = c as u32
+    (*g).elen = (*g).elen + 1
+}
+
+#[no_gc]
+fn gsub_elog_unit(g: *mut Gsub, i: usize) -> usize {
+    return (*g).elog_u[i] as usize
+}
+
+#[no_gc]
+fn gsub_elog_count(g: *mut Gsub, i: usize) -> usize {
+    return (*g).elog_c[i] as usize
+}
+
+// ------------------------------------------------ ALTERNATE (type 3)
+
+// Which alternative `gsub_alternate` takes when asked for the feature value
+// (1 = the first; 0 is treated as 1).
+#[no_gc]
+fn gsub_alt_set(g: *mut Gsub, v: u32) {
+    if v == 0 as u32 {
+        (*g).alt = 1
+    } else {
+        (*g).alt = v
+    }
+}
+
+#[no_gc]
+fn gsub_alt(g: *mut Gsub) -> u32 { return (*g).alt }
+
+// The `alt`-th alternative (from 1) of `gid` in lookup `lk`, or `gid`
+// itself if the lookup has none (or fewer than `alt`).
+#[no_gc]
+fn alternate_lk(f: *mut ttf.Font, lk: usize, gid: u32, alt: u32) -> u32 {
+    let ns: usize = u16at(f, lk + 4) as usize
+    var s: usize = 0
+    while s < ns {
+        let st: usize = subtable(f, lk, s)
+        if u16at(f, st) == 1 as u32 {
+            let ci: i32 = coverage(f, st + u16at(f, st + 2) as usize, gid)
+            if ci >= 0 && (ci as u32) < u16at(f, st + 4) {
+                let set: usize = st + u16at(f, st + 6 + (ci as usize) * 2) as usize
+                if alt >= 1 as u32 && alt <= u16at(f, set) {
+                    return u16at(f, set + 2 + ((alt - 1) as usize) * 2)
+                }
+                return gid
+            }
+        }
+        s = s + 1
+    }
+    return gid
+}
+
+#[no_gc]
+fn gsub_alternate(f: *mut ttf.Font, g: *mut Gsub, k: usize, gid: u32,
+    alt: u32) -> u32 {
+    return alternate_lk(f, lookup_at(f, g, k), gid, alt)
+}
+
+#[no_gc]
+fn gsub_li_alternate(f: *mut ttf.Font, g: *mut Gsub, li: u32, gid: u32,
+    alt: u32) -> u32 {
+    return alternate_lk(f, lookup_li(f, g, li), gid, alt)
+}
+
+// ------------------------------------------ REVERSE CHAINING (type 8)
+
+// The substitute for the glyph of unit `u` if a rule of lookup `lk` fits
+// (the glyph covered, backtrack and lookahead coverages fit), else 0.
+// `gids`, `skip`, `n` as in gsub_ligature. The sequence is seen as it is NOW:
+// the caller walks backward, so units behind `u` already carry their
+// substitutes.
+#[no_gc]
+fn reverse_lk(f: *mut ttf.Font, g: *mut Gsub, lk: usize, gids: u64,
+    skip: u64, n: usize, u: usize) -> u32 {
+    (*g).c_gids = gids
+    (*g).c_skip = skip
+    (*g).c_n = n
+    (*g).c_ign = 0
+    if (u16at(f, lk + 2) & LF_IGNORE_MARKS) != 0 as u32 {
+        (*g).c_ign = 1
+    }
+    (*g).c_mode = 3
+    (*g).c_cdb = 0
+    (*g).c_cdi = 0
+    (*g).c_cda = 0
+    let first: u32 = ctx_gid(g, u)
+    let ns: usize = u16at(f, lk + 4) as usize
+    var s: usize = 0
+    while s < ns {
+        let st: usize = subtable(f, lk, s)
+        if u16at(f, st) == 1 as u32 {
+            let ci: i32 = coverage(f, st + u16at(f, st + 2) as usize, first)
+            if ci >= 0 {
+                let nb: usize = u16at(f, st + 4) as usize
+                let bt: usize = st + 6
+                let p: usize = st + 6 + nb * 2
+                let nl: usize = u16at(f, p) as usize
+                let la: usize = p + 2
+                let q: usize = p + 2 + nl * 2
+                let ng: usize = u16at(f, q) as usize
+                if (ci as usize) < ng {
+                    (*g).c_st = st
+                    var ok: bool = true
+                    if nb > 0 && !ctx_back(f, g, u, bt, nb, 0) {
+                        ok = false
+                    }
+                    var e: usize = 0
+                    if ok && nl > 0
+                    && !ctx_fwd(f, g, unit_next(g, u), la, nl, 0, false, 0, &e) {
+                        ok = false
+                    }
+                    if ok {
+                        return u16at(f, q + 2 + (ci as usize) * 2)
+                    }
+                }
+            }
+        }
+        s = s + 1
+    }
+    return 0
+}
+
+#[no_gc]
+fn gsub_reverse_u(f: *mut ttf.Font, g: *mut Gsub, k: usize, gids: u64,
+    skip: u64, n: usize, u: usize) -> u32 {
+    return reverse_lk(f, g, lookup_at(f, g, k), gids, skip, n, u)
+}
+
+#[no_gc]
+fn gsub_li_reverse_u(f: *mut ttf.Font, g: *mut Gsub, li: u32, gids: u64,
+    skip: u64, n: usize, u: usize) -> u32 {
+    return reverse_lk(f, g, lookup_li(f, g, li), gids, skip, n, u)
+}
