@@ -17,7 +17,8 @@
 # `FIRN_PRUNE_FIR=1 FIRN_EAGER_LOWER=1` lowers everything and prunes after (the
 # r731 path). Both assemblies must agree byte for byte, except for the static
 # text constants of dead functions (blocks `.Lstatic_text.N`, which the lazy
-# path never creates -- they are removed and the labels renumbered first).
+# path never creates and numbers in another order -- tools/asm_norm.pl replaces
+# every reference by the bytes it stands for and drops the blocks).
 #
 # Usage: tools/prune_compare.sh [files.fi ...]      (default: tests/*.fi)
 #   PRUNE_CMP_MAX=<n>   look at the first n usable files only
@@ -53,10 +54,9 @@ first=""
 labels0() { grep -E '^(_F0\.)?[A-Za-z_][^ ]*:$' "$1" | grep -E '^(_F0\.|main:)' | sed -E 's/^_F0\.//;s/:$//' | sort -u; }
 labels1() { grep -E '^_F1\.[^ ]*:$' "$1" | sed -E 's/^_F1\.//;s/:$//' | sort -u; }
 
-# Assembly without the static text blocks, labels renumbered.
-norm_asm() {
-    perl -0pe 's/\.section \.rodata\n\s*\.p2align 0\n\.Lstatic_text\.\d+:\n\s*\.byte [^\n]*\n//g; s/\.Lstatic_text\.\d+/.Lstatic_text.#/g' "$1"
-}
+# Assembly with the static text blocks cut out and their references spelled
+# as the bytes (tools/asm_norm.pl).
+norm_asm() { perl tools/asm_norm.pl < "$1"; }
 
 for f in "${FILES[@]}"; do
     [ "$looked" -ge "$MAX" ] && break
