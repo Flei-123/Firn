@@ -30,7 +30,7 @@ python3 -c "import websockets" 2>/dev/null || { echo "skip: python3 websockets m
 W=$(mktemp -d)
 EMU=""
 cleanup() {
-    kill $SRV 2>/dev/null; cp "$W/server.log" "$OUT/server.log" 2>/dev/null # the proof the checks read stays with the pictures
+    pkill -P $GUARD 2>/dev/null; kill $GUARD 2>/dev/null; kill $SRV 2>/dev/null; cp "$W/server.log" "$OUT/server.log" 2>/dev/null # the proof the checks read stays with the pictures
     [ -n "$EMU" ] && { $ADB emu kill >/dev/null 2>&1; sleep 2; kill $EMU 2>/dev/null; $ADB0 kill-server >/dev/null 2>&1; }
     rm -rf "$W"
 }
@@ -50,7 +50,11 @@ if [ -z "${SERIAL:-}" ]; then
         -no-boot-anim -no-snapshot -wipe-data -gpu swiftshader_indirect >"$W/emu.log" 2>&1 & EMU=$!
     SERIAL=emulator-${EMU_PORT:-5590}
 fi
-ADB="$ADB0 -s $SERIAL"
+# every adb call is bounded: on a loaded host an `input text` / `dumpsys` can stall for minutes and the whole check seemed to hang
+ADB="timeout ${ADB_TIMEOUT:-60} $ADB0 -s $SERIAL"
+. "$ROOT/tools/android/dismiss_anr.sh"
+# overall guard: a stuck run ends with a clear message instead of blocking a heavy slot until the wrapper's limit
+( sleep "${CHECK_MAX_S:-2400}" && { echo "jarvis_check: overall limit reached, stopping" >&2; kill -TERM $$; } ) >/dev/null 2>&1 & GUARD=$!
 for _ in $(seq 120); do [ "$($ADB shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break; sleep 3; done
 [ "$($ADB shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] || { echo "the emulator did not boot"; exit 1; }
 mkdir -p "$OUT"
@@ -74,7 +78,9 @@ kbd() { $ADB shell dumpsys input_method | grep -c 'mInputShown=true'; }
 # a loaded host makes the first tap slow (the app builds its IME classes: seconds): wait, do not assume
 wait_kbd() { for _ in $(seq 20); do [ "$(kbd)" = 1 ] && break; sleep 1; done; kbd; }
 wait_sent() { for _ in $(seq 15); do [ "$(grep -c "\"text\": \"$1\"" "$SLOG")" -ge "${2:-1}" ] && break; sleep 1; done; grep -c "\"text\": \"$1\"" "$SLOG"; }
-wait_ocr() { for _ in $(seq ${OCR_TRIES:-12}); do shot "$1"; ocr "$1" | grep -q "$2" && break; sleep 1.5; done; ocr "$1" | grep -c "$2"; }
+# (an emulator "isn't responding" dialog covers the app on a cold, loaded host: tapped away every 4th miss)
+wait_ocr() { local i; for i in $(seq ${OCR_TRIES:-12}); do shot "$1"; ocr "$1" | grep -q "$2" && break
+        [ $((i % 4)) = 0 ] && dismiss_anr; sleep 1.5; done; ocr "$1" | grep -c "$2"; }
 # BACK only while the keyboard is up: without it BACK leaves the app (a slow host shows the keyboard seconds late)
 hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; fi; sleep 1; }
 # the centre (pixels) of the n-th word matching a regex in the screenshot $1; empty when there is none
@@ -116,6 +122,7 @@ $ADB shell pm grant $PKG android.permission.RECORD_AUDIO >/dev/null 2>&1
 $ADB shell pm grant $PKG android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 # else the system asks after the notice page and covers the chat
 $ADB logcat -c
 sleep 20 # a fresh emulator is still starting its launcher, Gboard and the package manager
+dismiss_anr
 $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null
 for _ in $(seq 40); do [ -n "$($ADB shell pidof $PKG)" ] && break; sleep 1; done
 check "login screen shows" "$(OCR_TRIES=40 wait_ocr 1_login 'Sign in')" 1

@@ -261,6 +261,8 @@ struct Tls {
     hs_sub: u32, // inside a step: 0 .. (the next heavy operation to do)
     yielded: bool, // the last step stopped early on purpose: call it again on the next loop round
     hs_have_cert: bool,
+    chain_on: bool, // the chain check of the Certificate message is under way (A32: one signature per step)
+    chain: x509.ChainState,
     hs_verified: bool,
     hs_fin: bool,
     certs: [x509.Cert; 10],
@@ -299,7 +301,7 @@ fn tls_new() -> Tls {
         verify: x509.V_PARSE, chain_depth: 0, ncerts: 0, alert_desc: 0,
         now: 0, records_in: 0, records_out: 0, hs_bytes: 0,
         nb: false, blocked: false, wbuf: rt.buf_new(), wpos: 0, hs_step: 0 as u32, hs_sub: 0 as u32, yielded: false,
-        hs_have_cert: false, hs_verified: false, hs_fin: false,
+        hs_have_cert: false, chain_on: false, chain: x509.chain_state_new(), hs_verified: false, hs_fin: false,
         certs: [x509.cert_new(); 10],
         hs_have_ske: false, hs_cert_req: false, hs_done12: false,
         max_ver: 772 as u32, v12: false, rx12: false, tx12: false, ems: false,
@@ -1591,7 +1593,7 @@ fn ecdsa_from_der(leaf: *mut x509.Cert, digest: u64, hlen: usize,
 // Time of the heavy handshake stages of the last handshake (ms), for the
 // measurements: 0 X25519 + P-256 keygen, 1 key exchange, 2 chain check,
 // 3 CertificateVerify.
-static mut G_STAGE_MS: [i64; 4] = [0, 0, 0, 0]
+static mut G_STAGE_MS: [i64; 6] = [0, 0, 0, 0, 0, 0] // 4 = longest single chain step, 5 = number of chain steps
 
 fn tls_stage_ms(i: usize) -> i64 { return G_STAGE_MS[i] }
 
@@ -1747,6 +1749,19 @@ fn tls_handshake_step(t: *mut Tls) -> TlsError!bool {
 
     if (*t).hs_step == 2 as u32 {
         while !(*t).hs_fin {
+            if (*t).chain_on {
+                let cr: u32 = chain_run(t)
+                if cr == 2 as u32 {
+                    return TlsError::Certificate
+                }
+                if cr == 1 as u32 {
+                    (*t).hs_have_cert = true
+                }
+                if yield_now(t) {
+                    return false
+                }
+                continue
+            }
             var ht: u32 = 0
             var ho: usize = 0
             var hl: usize = 0
@@ -1766,12 +1781,7 @@ fn tls_handshake_step(t: *mut Tls) -> TlsError!bool {
                 (*t).ncerts = 0
                 let g3: bool = try parse_certificate(t, (*t).certbuf.ptr, 0, hl,
                     &(*t).certs, &(*t).ncerts)
-                let g6: i64 = stage_now()
-                if !check_chain(t, &(*t).certs, (*t).ncerts) {
-                    return TlsError::Certificate
-                }
-                G_STAGE_MS[2] = stage_now() - g6
-                (*t).hs_have_cert = true
+                chain_begin(t) // the check itself runs at the top of this loop, one step per call
                 if yield_now(t) {
                     return false
                 }
@@ -1872,17 +1882,39 @@ fn is_ecdsa_suite12(s: u32) -> bool {
 
 // Verifies the chain against the store and the host name; the verdict stays
 // in `t.verify`. An unknown or bad chain is answered with an alert.
-fn check_chain(t: *mut Tls, certs: *mut [x509.Cert; 10], n: usize) -> bool {
+fn chain_begin(t: *mut Tls) {
+    (*t).chain = x509.chain_state_new()
+    (*t).chain_on = true
+    G_STAGE_MS[2] = 0
+    G_STAGE_MS[4] = 0
+    G_STAGE_MS[5] = 0
+}
+
+// ONE step of the chain check (A32): 0 = more to do, 1 = the chain is trusted, 2 = refused (alert sent, `verify` has the reason).
+// A step is one store lookup or one signature check; the caller gives the loop a round in between.
+fn chain_run(t: *mut Tls) -> u32 {
     var res: x509.VerifyResult = x509.VerifyResult { reason: 0, depth: 0,
         anchor: 0 }
-    (*t).verify = x509.verify_chain((*t).store, certs, n,
-        (&(*t).host[0]) as u64, (*t).hostlen, (*t).now, &res)
-    (*t).chain_depth = res.depth
-    if (*t).verify != x509.V_OK {
-        send_alert(t, 2 as u32, 48 as u32) // unknown_ca
-        return false
+    let g: i64 = stage_now()
+    let r: u32 = x509.verify_chain_step((*t).store, &(*t).certs, (*t).ncerts,
+        (&(*t).host[0]) as u64, (*t).hostlen, (*t).now, &(*t).chain, &res)
+    let d: i64 = stage_now() - g
+    G_STAGE_MS[2] = G_STAGE_MS[2] + d
+    G_STAGE_MS[5] = G_STAGE_MS[5] + 1
+    if d > G_STAGE_MS[4] {
+        G_STAGE_MS[4] = d
     }
-    return true
+    if r == x509.V_MORE {
+        return 0 as u32
+    }
+    (*t).chain_on = false
+    (*t).chain_depth = res.depth
+    (*t).verify = r
+    if r != x509.V_OK {
+        send_alert(t, 2 as u32, 48 as u32) // unknown_ca
+        return 2 as u32
+    }
+    return 1 as u32
 }
 // TLS 1.2 Certificate: a list of certificates, no request context and no
 // per-certificate extensions (RFC 5246 7.4.2).
@@ -1984,6 +2016,19 @@ fn parse_server_key_exchange(t: *mut Tls, leaf: *mut x509.Cert, p: u64,
 fn handshake12_step(t: *mut Tls) -> TlsError!bool {
     if (*t).hs_step == 5 as u32 {
         while !(*t).hs_done12 {
+            if (*t).chain_on {
+                let cr: u32 = chain_run(t)
+                if cr == 2 as u32 {
+                    return TlsError::Certificate
+                }
+                if cr == 1 as u32 {
+                    (*t).hs_have_cert = true
+                }
+                if yield_now(t) {
+                    return false
+                }
+                continue
+            }
             var ht: u32 = 0
             var ho: usize = 0
             var hl: usize = 0
@@ -1998,10 +2043,10 @@ fn handshake12_step(t: *mut Tls) -> TlsError!bool {
                 (*t).ncerts = 0
                 let g3: bool = try parse_certificate12((*t).certbuf.ptr, 0, hl,
                     &(*t).certs, &(*t).ncerts)
-                if !check_chain(t, &(*t).certs, (*t).ncerts) {
-                    return TlsError::Certificate
+                chain_begin(t)
+                if yield_now(t) {
+                    return false
                 }
-                (*t).hs_have_cert = true
             } else if ht == HS_SERVER_KEY_EXCHANGE {
                 if !(*t).hs_have_cert || (*t).hs_have_ske {
                     return TlsError::Protocol
@@ -2011,6 +2056,9 @@ fn handshake12_step(t: *mut Tls) -> TlsError!bool {
                 let g4: bool = try parse_server_key_exchange(t, &(*t).certs[0],
                     (*t).hsin.ptr, ho, hl)
                 (*t).hs_have_ske = true
+                if yield_now(t) { // the signature over the key share was the heavy part
+                    return false
+                }
             } else if ht == HS_CERT_REQUEST {
                 (*t).hs_cert_req = true // T3: answered with an empty Certificate below
             } else if ht == HS_SERVER_HELLO_DONE {
@@ -2028,7 +2076,15 @@ fn handshake12_step(t: *mut Tls) -> TlsError!bool {
         if !(*t).hs_have_cert || !(*t).hs_have_ske {
             return TlsError::Protocol
         }
+        // the key exchange + key schedule of our flight are the next heavy piece: a round of the loop first
+        if (*t).hs_sub == 0 as u32 {
+            (*t).hs_sub = 1 as u32
+            if yield_now(t) {
+                return false
+            }
+        }
         let flight: bool = try send_flight12(t)
+        (*t).hs_sub = 0 as u32
         (*t).hs_step = 6 as u32
     }
 

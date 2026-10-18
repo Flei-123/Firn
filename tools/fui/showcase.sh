@@ -99,6 +99,10 @@ done
 "$FIRNC" --opt-level=dev -o "$T/appw13" tools/fui/appw13_main.fi
 "$T/appw13" "$T/img" > /dev/null
 
+# MOBILE TOKENS (webtheme): type steps, palette swatches, radii, shadows, bubble gradient, light, dark
+"$FIRNC" --opt-level=dev -o "$T/webtheme" tools/fui/webtheme_main.fi
+"$T/webtheme" "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/
