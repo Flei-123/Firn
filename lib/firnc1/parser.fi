@@ -218,6 +218,12 @@ struct Parser {
     // r727: return type node + 1 of the function being parsed (0 = unknown); `return |x| e`
     // stores it in the statement for lamsugar.fi.
     cur_ret: u32,
+    // r725 -- `e?` on an Option: quadruples (hidden name, operand, opt_none call) in
+    // `qpend`, the finished statements in `qpre` (`block` drains them BEFORE the statement).
+    qpend: Vec[u32],
+    qpre: Vec[u32],
+    no_q: u32,
+    stmt_depth: u32,
     // r704: 1 inside `impl T {..}` (methods take defaults), 0 in `impl I for T`.
     meth_defaults: u32,
     // ROUND REF4: a statement the NEXT `block` puts in front of its own (the
@@ -364,6 +370,7 @@ fn par_new(lx: u64) -> Parser {
         rp_name: vec_new[u32](), rp_flag: vec_new[u32](), rp_mark: vec_new[u32](),
         defaults_ok: 0,
         cur_ret: 0,
+        qpend: vec_new[u32](), qpre: vec_new[u32](), no_q: 0, stmt_depth: 0,
         meth_defaults: 0,
         pre_stmt: ast.NOTHING,
         pre_stmt2: ast.NOTHING,
@@ -477,6 +484,8 @@ fn par_free(p: *mut Parser) {
     vec_free[u32](&(*p).local)
     vec_free[u32](&(*p).llimit)
     vec_free[u32](&(*p).hoist)
+    vec_free[u32](&(*p).qpend)
+    vec_free[u32](&(*p).qpre)
     vec_free[u32](&(*p).rp_name)
     vec_free[u32](&(*p).rp_flag)
     vec_free[u32](&(*p).rp_mark)
@@ -1714,7 +1723,9 @@ fn or_expr(p: *mut Parser) -> u32 {
     var left: u32 = and_expr(p)
     while actual(p, A_OROR) && next(p) {
         next_bump(p)
+        (*p).no_q = (*p).no_q + 1
         let right: u32 = and_expr(p)
+        (*p).no_q = (*p).no_q - 1
         let old_left: u32 = left
         left = ast.expr_new(par_tree(p), ast.E_BIN, B_LOR, left, right, 0)
         pos_from(p, left, old_left)
@@ -1726,7 +1737,9 @@ fn and_expr(p: *mut Parser) -> u32 {
     var left: u32 = cmp_expr(p)
     while actual(p, A_ANDAND) && next(p) {
         next_bump(p)
+        (*p).no_q = (*p).no_q + 1
         let right: u32 = cmp_expr(p)
+        (*p).no_q = (*p).no_q - 1
         let old_left: u32 = left
         left = ast.expr_new(par_tree(p), ast.E_BIN, B_LAND, left, right, 0)
         pos_from(p, left, old_left)
@@ -2045,6 +2058,10 @@ fn after_expr(p: *mut Parser) -> u32 {
             return e
         }
         let a: u32 = kind(p, 0)
+        if a == A_QUESTION {
+            e = question_op(p, e)
+            continue
+        }
         if a == A_DOT {
             next_bump(p)
             // ROUND 34 (gc.rs::hook_postfix): `x.as?[C]` -- the checked
@@ -3823,6 +3840,13 @@ fn block(p: *mut Parser) -> u32 {
             hi = hi + 1
         }
         vec_clear[u32](&(*p).hoist)
+        // r725: the `?` statements stand in front of the statement as well
+        var qj: usize = 0
+        while qj < vec_len[u32](&(*p).qpre) {
+            vec_push[u32](&own, vec_at[u32](&(*p).qpre, qj))
+            qj = qj + 1
+        }
+        vec_clear[u32](&(*p).qpre)
         vec_push[u32](&own, s)
         // ROUND TUPLES: the bindings of `let (a, b) = ..` follow it
         var ai: usize = 0
@@ -4207,7 +4231,7 @@ fn if_stmt(p: *mut Parser) -> u32 {
     if actual(p, A_KWELSE) {
         next_bump(p)
         if actual(p, A_KWIF) {
-            els = stmt(p)
+            els = stmt_no_pre(p)
         } else {
             let b: u32 = block(p)
             els = ast.stmt_new(par_tree(p), ast.S_BLOCK, b, 0, 0, 0)
@@ -4238,7 +4262,7 @@ fn if_let(p: *mut Parser, hpos: u64) -> u32 {
     if actual(p, A_KWELSE) {
         next_bump(p)
         if actual(p, A_KWIF) {
-            els = stmt(p)
+            els = stmt_no_pre(p)
         } else {
             let eb: u32 = block(p)
             els = ast.stmt_new(b, ast.S_BLOCK, eb, 0, 0, 0)
@@ -4260,7 +4284,9 @@ fn while_let(p: *mut Parser, hpos: u64) -> u32 {
     let b: *mut ast.Tree = par_tree(p)
     var binds: Vec[u32] = vec_new[u32]()
     var scrut: u32 = 0
+    (*p).no_q = (*p).no_q + 1
     let tmp: u32 = let_some_head(p, hpos, &scrut, &binds)
+    (*p).no_q = (*p).no_q - 1
     if tmp == 0 {
         vec_free[u32](&binds)
         return ast.stmt_new(b, ast.S_BREAK, 0, 0, 0, 0)
@@ -4296,7 +4322,9 @@ fn while_stmt(p: *mut Parser) -> u32 {
     if actual(p, A_KWLET) {
         return while_let(p, hpos)
     }
+    (*p).no_q = (*p).no_q + 1
     let cond: u32 = cond_expr(p)
+    (*p).no_q = (*p).no_q - 1
     let body: u32 = block(p)
     return ast.stmt_new(par_tree(p), ast.S_WHILE, cond, body, 0, 0)
 }
@@ -4633,9 +4661,84 @@ fn return_stmt(p: *mut Parser) -> u32 {
 // so `return &x` gets reported at the `return` in both compilers.
 fn stmt(p: *mut Parser) -> u32 {
     let at: u64 = at_pos(p, 0)
+    let qbase: usize = vec_len[u32](&(*p).qpend)
+    (*p).stmt_depth = (*p).stmt_depth + 1
     let s: u32 = stmt_inner(p)
+    (*p).stmt_depth = (*p).stmt_depth - 1
     ast.stmt_pos_set(par_tree(p), s, at)
+    // r725: `let <tmp> = e; if !<tmp>.has { return opt_none[U]() }` per `?`
+    let b: *mut ast.Tree = par_tree(p)
+    var qi: usize = qbase
+    while qi < vec_len[u32](&(*p).qpend) {
+        let tmp: u32 = vec_at[u32](&(*p).qpend, qi)
+        let inner: u32 = vec_at[u32](&(*p).qpend, qi + 1)
+        let nonec: u32 = vec_at[u32](&(*p).qpend, qi + 2)
+        let hid: u32 = ast.stmt_new(b, ast.S_LET, tmp, ast.NOTHING, inner, 0)
+        let has: u32 = opt_field(p, tmp, true, at)
+        let not: u32 = ast.expr_new(b, ast.E_UN, U_NOT, has, 0, 0)
+        pos_default(p, not, at)
+        let rs: u32 = ast.stmt_new(b, ast.S_RET, nonec, 0, 0, 0)
+        ast.s_b_set(b, rs, (*p).cur_ret)
+        let roff: u32 = vec_len[u32](&(*b).slist) as u32
+        vec_push[u32](&(*b).slist, rs)
+        let rblk: u32 = ast.block_new(b, roff, 1)
+        ast.block_end_set(b, rblk, at)
+        let ifs: u32 = ast.stmt_new(b, ast.S_IF, not, rblk, ast.NOTHING, 0)
+        vec_push[u32](&(*p).qpre, hid)
+        vec_push[u32](&(*p).qpre, ifs)
+        qi = qi + 4
+    }
+    vec_shorten[u32](&(*p).qpend, qbase)
     return s
+}
+
+// r725 -- a statement parsed where nothing drains `qpre` (`defer`, `else if`).
+fn stmt_no_pre(p: *mut Parser) -> u32 {
+    let s: u32 = stmt(p)
+    if vec_len[u32](&(*p).qpre) > 0 {
+        vec_clear[u32](&(*p).qpre)
+        complain(p)
+    }
+    return s
+}
+
+// r725 -- `e?` (current token: the `?`). See parser.rs::question_op.
+fn question_op(p: *mut Parser, e: u32) -> u32 {
+    let qpos: u64 = at_pos(p, 0)
+    next_bump(p)
+    if (*p).stmt_depth == 0 || (*p).no_q > 0 || (*p).cur_ret == 0 || !has_gen(p) {
+        complain(p)
+        return e
+    }
+    let b: *mut ast.Tree = par_tree(p)
+    let rty: u32 = (*p).cur_ret - 1
+    if ast.t_kind(b, rty) != ast.T_NAME {
+        complain(p)
+        return e
+    }
+    let m: u32 = mono.option_none_name(gn(p), ast.t_a(b, rty))
+    if m == ast.NOTHING {
+        complain(p)
+        return e
+    }
+    var none_args: Vec[u32] = vec_new[u32]()
+    let noff: u32 = list_store(p, &none_args)
+    vec_free[u32](&none_args)
+    let nonec: u32 = ast.expr_new(b, ast.E_CALL, m, noff, 0, 0)
+    pos_default(p, nonec, qpos)
+    rt.buf_clear(&(*p).scratch)
+    var qw: [u8; 4] = "__q#"
+    rt.buf_push_bytes(&(*p).scratch, (&qw[0]) as u64, 4)
+    rt.buf_push_dec_u64(&(*p).scratch, ast.pos_line(qpos) as u64)
+    rt.buf_push(&(*p).scratch, 95 as u8)
+    rt.buf_push_dec_u64(&(*p).scratch, ast.pos_col(qpos) as u64)
+    let tmp: u32 = intern.intern_number(lexer.lex_names(lx(p)), rt.buf_ptr(&(*p).scratch),
+        rt.buf_len(&(*p).scratch)) as u32
+    vec_push[u32](&(*p).qpend, tmp)
+    vec_push[u32](&(*p).qpend, e)
+    vec_push[u32](&(*p).qpend, nonec)
+    vec_push[u32](&(*p).qpend, 0 as u32)
+    return opt_field(p, tmp, false, qpos)
 }
 
 fn stmt_inner(p: *mut Parser) -> u32 {
@@ -4668,7 +4771,7 @@ fn stmt_inner(p: *mut Parser) -> u32 {
             kind_s = ast.S_ERRDEFER
         }
         next_bump(p)
-        let inner: u32 = stmt(p)
+        let inner: u32 = stmt_no_pre(p)
         return ast.stmt_new(par_tree(p), kind_s, inner, 0, 0, 0)
     }
     if a == A_KWRETURN {
@@ -4895,7 +4998,9 @@ fn lambda_sugar(p: *mut Parser, heap: bool) -> u32 {
         }
     } else {
         let epos: u64 = at_pos(p, 0)
+        (*p).no_q = (*p).no_q + 1
         let ex: u32 = expr(p)
+        (*p).no_q = (*p).no_q - 1
         var own: Vec[u32] = vec_new[u32]()
         var hi: usize = 0
         while hi < vec_len[u32](&(*p).hoist) {
@@ -5061,7 +5166,13 @@ fn fn_template(p: *mut Parser, name: u32) {
             return
         }
     }
+    let saved_ret: u32 = (*p).cur_ret
+    (*p).cur_ret = 0
+    if ret != ast.NOTHING {
+        (*p).cur_ret = ret + 1
+    }
     let body: u32 = block(p)
+    (*p).cur_ret = saved_ret
     loc_off(p)
     mono.gen_depth_off(gn(p))
     mono.gen_fn_template(gn(p), name, toff, tlen, poff, plen, ret, body)
@@ -6396,7 +6507,13 @@ fn methods_decl(p: *mut Parser, tname: u32) {
             return
         }
     }
+    let saved_ret: u32 = (*p).cur_ret
+    (*p).cur_ret = 0
+    if ret != ast.NOTHING {
+        (*p).cur_ret = ret + 1
+    }
     let body: u32 = block(p)
+    (*p).cur_ret = saved_ret
     loc_off(p)
     ast.fn_add(par_tree(p), name, poff, plen, ret, body, 0, 0, 0, 0, 0, 0, 0)
     ast.fn_pos_set(par_tree(p), ast.fn_count(par_tree(p)) - 1, fn_at)

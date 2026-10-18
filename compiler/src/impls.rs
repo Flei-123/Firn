@@ -323,7 +323,9 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span, is_for: bool)
         p.sync_item();
         return false;
     }
+    let saved_ret = std::mem::replace(&mut p.cur_ret, ret.clone());
     let mut body = p.block("at the start of the method body");
+    p.cur_ret = saved_ret;
     p.recovering = false;
     p.finish_body(&ref_params, &mut body);
     let attrs = std::mem::take(&mut p.pending_attrs);

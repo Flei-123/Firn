@@ -239,7 +239,9 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     // surrounding condition must not reach into it.
     let saved = p.no_struct_lit;
     p.no_struct_lit = false;
+    let saved_ret = std::mem::replace(&mut p.cur_ret, ret.clone());
     let mut body = p.block("of a closure");
+    p.cur_ret = saved_ret;
     p.no_struct_lit = saved;
     p.finish_body(&ref_params, &mut body);
     let span = Parser::join(start, body.span);

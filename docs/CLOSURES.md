@@ -72,9 +72,17 @@ let c: fn(i32) -> i32 = try gc |x| x + n                       // capturing form
   -- same lowering as before, capture by value, no stack closures yet.
 * firnc1 (`lib/firnc1/lamsugar.fi` + `lambda_sugar` in parser.fi) mirrors: arguments of plain calls (also behind `try`)
   and `let`/`var` with a declared type, `return` (the parser stores the result type in the `S_RET` statement) and
-  struct literal fields. Not mirrored (stage 0 only): method-call arguments.
+  struct literal fields, and (r732) method-call arguments (all methods of that name and arity must agree on the `fn` type).
 * A closure inside a template body: firnc1 parks the closure function in `Gen` (`gen_closure_template`) instead
   of the function table; every instance gets its own copy (`copy_lambda` in mono.fi, fresh `__closure#N`).
   `-> AllocError!T` on a generic fn is a separate firnc1 gap (not closure related).
 * firnfmt: `|x, y|` stays tight (`lambda_open`/`lambda_close` in tools/fmt/fmt.fi); binary `a | b` is unchanged.
 * Stack/non-escaping closures (`local fn`) are still only a design (section above).
+
+## `?` on Option (r725)
+`let x = f()?` / `a = f()? + g()?` / `return h(f()?)` / `if f()? > 0 {..}`: `f()` runs into a hidden `let __q#L_C`
+in front of the statement; `!__q#L_C.has` does `return opt_none[U]()` (the enclosing fn must return `Option[U]`,
+`import std.option`); the value is `__q#L_C.val`. Not allowed (error): right side of `&&`/`||`, `while` condition,
+lambda expression body, `defer`, `else if` condition, a fn that does not return an Option. Operands of all `?` in
+a statement run in source order before the rest of the statement. firnc0 `parser.rs::question_op`, firnc1
+`parser.fi::question_op` + `mono.option_none_name`.

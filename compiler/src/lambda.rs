@@ -106,12 +106,16 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     let saved = p.no_struct_lit;
     let (body, ret) = if p.at(&TokKind::LBrace) {
         p.no_struct_lit = false;
+        let saved_ret = std::mem::replace(&mut p.cur_ret, ret.clone());
         let b = p.block("of a lambda");
+        p.cur_ret = saved_ret;
         p.no_struct_lit = saved;
         let r = ret.or(Some(TypeExpr::Named(RET_BLK.to_string(), start)));
         (b, r)
     } else {
+        p.no_q += 1;
         let e = p.expr();
+        p.no_q -= 1;
         let sp = e.span;
         let stmt = match ret {
             Some(_) => Stmt::Return { value: Some(e), span: sp },

@@ -511,7 +511,9 @@ impl<'a> Parser<'a> {
             self.sync_item();
             return None;
         }
+        let saved_ret = std::mem::replace(&mut self.cur_ret, ret.clone());
         let mut body = self.block("at the start of the function body");
+        self.cur_ret = saved_ret;
         self.recovering = false;
         self.finish_body(&ref_params, &mut body);
         Some(FnDecl { name, params, ret, body, span: start, attrs: Vec::new(), extern_info: None })
@@ -847,4 +849,19 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     ));
     p.recovering = false;
     None
+}
+
+/// r725 -- `opt_none[U]()` for a declared result type `Option[U]` (`None` when the
+/// type is not an Option instance or `opt_none` is unknown).
+pub(crate) fn option_none_call(p: &mut Parser, ret: &TypeExpr, at: Span) -> Option<Expr> {
+    let name = match ret {
+        TypeExpr::Named(n, _) => n.clone(),
+        _ => return None,
+    };
+    let inst = instantiation(&name)?;
+    if inst.is_fn || inst.base != "Option" || !is_generic_fn("opt_none") {
+        return None;
+    }
+    let mangled = p.note_inst("opt_none", inst.args.clone(), at, true);
+    Some(p.mk(at, ExprKind::Call(mangled, Vec::new(), at)))
 }

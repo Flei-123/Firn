@@ -58,6 +58,18 @@ pub(crate) struct Parser<'a> {
     /// (`__tup#<k>#<n>`); `lib/firnc1/parser.fi` counts the same way, so the
     /// two syntax trees carry the same names.
     pub(crate) tup_seq: u32,
+    /// r725 -- `e?` on an Option: hidden `let __q#L_C = e` + early `return opt_none[U]()`
+    /// statements, hoisted in front of the statement that contains the `?`.
+    pub(crate) qpend: Vec<(String, Expr, Expr)>,
+    /// r725 -- prelude of the statement just parsed (`block` drains it BEFORE the statement).
+    pub(crate) pre: Vec<Stmt>,
+    /// r725 -- > 0: a `?` here would run unconditionally although the source says
+    /// conditionally (right side of `&&`/`||`, lambda expression, `while` condition).
+    pub(crate) no_q: u32,
+    /// r725 -- > 0: inside a statement (a `?` needs one to hoist in front of).
+    pub(crate) stmt_depth: u32,
+    /// r725 -- declared result type of the function being parsed (None: no/unknown).
+    pub(crate) cur_ret: Option<TypeExpr>,
     /// > 0: an interpolation is already running — nesting does not exist yet.
     pub(crate) interp_depth: u32,
     /// **ROUND 79** — `[T; _]` is only allowed where an initializer follows
@@ -651,7 +663,9 @@ impl<'a> Parser<'a> {
         let mut lhs = self.and_expr();
         while self.at(&TokKind::OrOr) && self.cont() {
             self.bump();
+            self.no_q += 1;
             let rhs = self.and_expr();
+            self.no_q -= 1;
             let sp = Parser::join(lhs.span, rhs.span);
             lhs = self.mk(sp, ExprKind::Binary(BinOp::LOr, Box::new(lhs), Box::new(rhs)));
         }
@@ -662,7 +676,9 @@ impl<'a> Parser<'a> {
         let mut lhs = self.cmp_expr();
         while self.at(&TokKind::AndAnd) && self.cont() {
             self.bump();
+            self.no_q += 1;
             let rhs = self.cmp_expr();
+            self.no_q -= 1;
             let sp = Parser::join(lhs.span, rhs.span);
             lhs = self.mk(sp, ExprKind::Binary(BinOp::LAnd, Box::new(lhs), Box::new(rhs)));
         }
@@ -828,6 +844,39 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// r725 -- `e?` for `Option[T]`: `e` is evaluated into a hidden `let __q#L_C`
+    /// in front of the statement; `!__q#L_C.has` returns `opt_none[U]()` from the
+    /// enclosing function (which must return `Option[U]`); the value is `__q#L_C.val`.
+    fn question_op(&mut self, e: Expr, q: Span) -> Expr {
+        if self.stmt_depth == 0 || self.no_q > 0 {
+            self.dg.error_note(
+                q,
+                "'?' is not allowed here",
+                "use it in a statement, not in the right side of '&&' / '||', a 'while' condition or a lambda expression",
+            );
+            return e;
+        }
+        let ret = match self.cur_ret.clone() {
+            Some(r) => r,
+            None => {
+                self.dg.error_note(q, "'?' needs a function that returns 'Option[T]'", "this function has no declared result type");
+                return e;
+            }
+        };
+        let none_call = match crate::sema_generic::option_none_call(self, &ret, q) {
+            Some(c) => c,
+            None => {
+                self.dg.error_note(q, "'?' needs a function that returns 'Option[T]'", "the result type of the enclosing function is not an Option (import std.option)");
+                return e;
+            }
+        };
+        let tmp = format!("__q#{}_{}", q.line, q.col);
+        let span = Parser::join(e.span, q);
+        self.qpend.push((tmp.clone(), e, none_call));
+        let base = self.mk(span, ExprKind::Ident(tmp));
+        self.mk(span, ExprKind::Field(Box::new(base), "val".to_string(), q))
+    }
+
     fn postfix(&mut self) -> Expr {
         let mut e = self.primary();
         loop {
@@ -919,6 +968,10 @@ impl<'a> Parser<'a> {
                     } else {
                         e = self.mk(sp, ExprKind::Call(name, args, e.span));
                     }
+                }
+                TokKind::Question => {
+                    let q = self.bump();
+                    e = self.question_op(e, q);
                 }
                 TokKind::KwAs => {
                     self.bump();
@@ -1293,6 +1346,9 @@ impl<'a> Parser<'a> {
             if !self.hoist.is_empty() {
                 stmts.append(&mut self.hoist);
             }
+            if !self.pre.is_empty() {
+                stmts.append(&mut self.pre);
+            }
             stmts.push(s);
             // ROUND TUPLES: the bindings of `let (a, b) = ..`
             if !self.after.is_empty() {
@@ -1353,8 +1409,32 @@ impl<'a> Parser<'a> {
             return Stmt::Error(start);
         }
         self.depth += 1;
+        let outer = std::mem::take(&mut self.qpend);
+        self.stmt_depth += 1;
         let s = self.stmt_inner(start);
+        self.stmt_depth -= 1;
+        let mine = std::mem::replace(&mut self.qpend, outer);
         self.depth -= 1;
+        // r725: `?` operands run (and may leave the function) before the statement
+        for (tmp, inner, none_call) in mine {
+            let sp = inner.span;
+            let has = self.opt_has(&tmp, sp);
+            let not = self.mk(sp, ExprKind::Unary(UnOp::Not, Box::new(has)));
+            let ret = Block { stmts: vec![Stmt::Return { value: Some(none_call), span: sp }], span: sp, end: sp };
+            self.pre.push(Stmt::Let { name: tmp, mutable: false, ty: None, init: inner, span: sp });
+            self.pre.push(Stmt::If { cond: not, then: ret, els: None, span: sp });
+        }
+        s
+    }
+
+    /// r725 -- a statement parsed where nothing drains `pre` (`defer`, `else if`).
+    fn stmt_no_pre(&mut self, what: &str) -> Stmt {
+        let s = self.stmt();
+        if !self.pre.is_empty() {
+            let sp = s.span();
+            self.pre.clear();
+            self.dg.error(sp, format!("'?' is not allowed in {}", what));
+        }
         s
     }
 
@@ -1368,7 +1448,7 @@ impl<'a> Parser<'a> {
             self.error_here(format!("the deferred statement is missing after '{}'", word));
             return Stmt::Error(start);
         }
-        let inner = self.stmt();
+        let inner = self.stmt_no_pre("a 'defer' statement");
         let sp = Parser::join(start, inner.span());
         Stmt::Defer(Box::new(inner), only_error, sp)
     }
@@ -1875,7 +1955,7 @@ compute it",
             let els = if self.at(&TokKind::KwElse) {
                 self.bump();
                 if self.at(&TokKind::KwIf) {
-                    Some(Box::new(self.stmt()))
+                    Some(Box::new(self.stmt_no_pre("an 'else if' condition")))
                 } else {
                     Some(Box::new(Stmt::Block(self.block("after 'else'"))))
                 }
@@ -1903,7 +1983,7 @@ compute it",
         let els = if self.at(&TokKind::KwElse) {
             self.bump();
             if self.at(&TokKind::KwIf) {
-                Some(Box::new(self.stmt()))
+                Some(Box::new(self.stmt_no_pre("an 'else if' condition")))
             } else {
                 Some(Box::new(Stmt::Block(self.block("after 'else'"))))
             }
@@ -1916,7 +1996,10 @@ compute it",
     fn while_stmt(&mut self) -> Stmt {
         let start = self.bump(); // 'while'
         if self.at(&TokKind::KwLet) {
-            let (tmp, scrut, binds) = match self.let_some_head(start) {
+            self.no_q += 1;
+            let head = self.let_some_head(start);
+            self.no_q -= 1;
+            let (tmp, scrut, binds) = match head {
                 Some(x) => x,
                 None => return Stmt::Error(start),
             };
@@ -1937,7 +2020,9 @@ compute it",
             let t = self.mk(start, ExprKind::Bool(true));
             return Stmt::While { cond: t, body, span: start };
         }
+        self.no_q += 1;
         let cond = self.cond_expr();
+        self.no_q -= 1;
         if self.recovering {
             self.recovering = false;
             if !self.at(&TokKind::LBrace) {
@@ -2282,7 +2367,9 @@ compute it",
             self.sync_item();
             return;
         }
+        let saved_ret = std::mem::replace(&mut self.cur_ret, ret.clone());
         let mut body = self.block("at the start of the function body");
+        self.cur_ret = saved_ret;
         self.recovering = false;
         self.finish_body(&ref_params, &mut body);
         prog.funcs.push(FnDecl { name, params, ret, body, span: start, attrs, extern_info: None });
@@ -3053,6 +3140,11 @@ fn in_expr(
         hoist: Vec::new(),
         after: Vec::new(),
         tup_seq: 0,
+        qpend: Vec::new(),
+        pre: Vec::new(),
+        no_q: 0,
+        stmt_depth: 0,
+        cur_ret: None,
         interp_depth: 1,
         allow_ref_params: false,
         allow_defaults: false,
@@ -3112,6 +3204,11 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         hoist: Vec::new(),
         after: Vec::new(),
         tup_seq: 0,
+        qpend: Vec::new(),
+        pre: Vec::new(),
+        no_q: 0,
+        stmt_depth: 0,
+        cur_ret: None,
         interp_depth: 0,
         allow_ref_params: false,
         allow_defaults: false,
