@@ -46,6 +46,7 @@
 import std.rt
 import android.ndk
 import android.inputmethod
+import android.jnicall
 
 export {
     firn_activity_create,
@@ -477,7 +478,10 @@ fn thread_app_main(arg: u64) -> u64 {
     __atomic_add((G_B + B_GONE) as *mut u64, 1)
     var m: [u8; 26] = "main returned, finishing\0\0"
     log_c((&m[0]) as u64)
-    ndk.ANativeActivity_finish(ld(B_ACT))
+    // 0: the activity went (a relaunch) and no new one has come yet
+    if ld(B_ACT) != 0 {
+        ndk.ANativeActivity_finish(ld(B_ACT))
+    }
     return code as u64
 }
 
@@ -527,6 +531,29 @@ fn auf_pause(a: u64) {
 #[no_gc]
 fn auf_halt(a: u64) {}
 
+// Is this onDestroy the system's re-creation of the activity (configuration
+// or resource change), not the user's / the program's own finish? Asks the
+// Java activity (`isChangingConfigurations()`) on the main thread, where the
+// ANativeActivity (env at +16, clazz at +24) is still valid.
+#[no_gc]
+fn activity_is_relaunching(act: u64) -> bool {
+    if act == 0 {
+        return false
+    }
+    let env: u64 = ndk.peek64(act + 16)
+    let obj: u64 = ndk.peek64(act + 24)
+    if env == 0 || obj == 0 {
+        return false
+    }
+    let cls: u64 = jnicall.j_obj_class(env, obj)
+    var name: [u8; 25] = "isChangingConfigurations\0"
+    var sig: [u8; 4] = "()Z\0"
+    let m: u64 = jnicall.j_method(env, cls, (&name[0]) as u64, (&sig[0]) as u64)
+    let r: bool = jnicall.j_bool(env, obj, m, 0)
+    jnicall.j_del(env, cls)
+    return r
+}
+
 // The activity is going away for good. The program got EV_CLOSED; give
 // it two seconds to leave `main`, then END THE PROCESS. A second activity
 // in the same process cannot get a fresh program: the collector measured
@@ -534,6 +561,19 @@ fn auf_halt(a: u64) {}
 // of the program still holds its old value. A new start is a new process.
 #[no_gc]
 fn on_end(a: u64) {
+    // r775: Android destroys and re-creates the activity by itself when the
+    // resources change under it (a resource overlay that comes up at the
+    // first boot, a theme or dynamic-colour switch: CONFIG_ASSETS_PATHS --
+    // nothing a manifest `configChanges` can declare). That destroy is no
+    // goodbye: ending the process here killed the app 100 ms after its first
+    // start. Such a destroy is treated like keep-alive; the new activity
+    // brings its window to the SAME running program (see firn_activity_create).
+    if ld_sync(B_GONE) == 0 && activity_is_relaunching(a) {
+        st(B_ACT, 0)
+        var k: [u8; 22] = "activity relaunching\0\0"
+        log_c((&k[0]) as u64)
+        return
+    }
     if ld_sync(B_KEEP) != 0 && ld_sync(B_GONE) == 0 {
         // The program lives on without a window (see activity_keep_alive).
         // The ANativeActivity is freed after this callback: nobody may
