@@ -1872,7 +1872,10 @@ fn emit_inst(
         Op::CheckedCast { src, from, msg } => {
             let d = i.dst.ok_or("internal error: checked cast without target")?;
             load_ext(e, fr, A, *src, *from, 64);
-            crate::panic_rt_a64::emit_checked_cast(e, *from, ty, msg, site);
+            // r454: a cast TO a 64-bit type loses nothing (the check compares the value with itself): no code, no panic arm.
+            if ty.bits() < 64 {
+                crate::panic_rt_a64::emit_checked_cast(e, *from, ty, msg, site);
+            }
             store_dst(e, fr, d, A);
         }
         Op::BinWrapSat { kind, op, a, b } => {
