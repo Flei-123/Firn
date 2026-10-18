@@ -73,7 +73,8 @@ existing installs can never be updated again (users have to uninstall).
 * `lib/plat/android/push.fi`: the relay may be a **host name**. The push thread
   resolves it at every connect with `lib/net/dnsmini.fi` (a `#[no_gc]` A lookup,
   IPv4/UDP, no cache). `push_set_dns("a.b.c.d[:port]")` before `push_start`
-  picks a name server; it is kept in `firn-push.cfg` (3rd line). No TLS yet.
+  picks a name server; it is kept in `firn-push.cfg` (3rd line). TLS with a pinned key
+  is in `lib/net/tlsmini.fi`; not yet run against a TLS relay in the emulator (roadmap r74).
 * Test: `bash tools/android/dns_check.sh` (emulator; a fake DNS server on the
   host as 10.0.2.2) and `bash tools/dns/run.sh` (dnsmini on Linux).
 
@@ -244,12 +245,11 @@ pictures), so page and app see the same photos.
 
 ## Open
 
-* The soft keyboard composes nothing yet (no InputConnection without a dex
-  class); hardware keys and the key events Android synthesises arrive.
+* fUi apps (apphost) get the soft keyboard through dex classes (r114, see below); the plain Firn window host
+  composes nothing yet (r70); hardware keys and the key events Android synthesises arrive.
 * A finger drag does not scroll: fUi scrolls by scroll bar, wheel and keys.
 * Only tested in the emulator; the arm64 build still needs a real phone.
-* Push: the relay address is a dotted IPv4 address (no name lookup), the
-  connection is plain TCP (no TLS yet), one line = one message.
+* Push: one line = one message; the relay may be a host name (see above), TLS is not run end to end yet (r74).
 * Push after a phone restart or after Android killed the process: the
   service comes back (START_STICKY) but the program does not -- no
   BOOT_COMPLETED receiver, no headless start of the program yet. Opening
@@ -257,8 +257,8 @@ pictures), so page and app see the same photos.
 * A tap on the COLLAPSED bundle of several chats opens the newest chat
   (the summary takes the whole group with it).
 * FIRNCHAT's desktop layout is not a phone layout (fixed side bar).
-* aarch64 still lacks stat/lstat/pipe/rmdir/readlink forms (compile error
-  when a program uses them, not a silent guess).
+* aarch64: stat/lstat/pipe/rmdir/readlink are mapped (Firn r75, `compiler/src/syscalls.rs`). Still refused with a clear
+  message: inline assembler, `#[interrupt]`, `#[link_lib]` (dynamic linking), raw `clone`; see `tools/aarch64/environment.txt`.
 
 ## The on-screen keyboard (r114)
 
