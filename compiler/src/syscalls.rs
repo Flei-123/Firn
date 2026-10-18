@@ -70,6 +70,12 @@ pub enum A64 {
     /// — which is why the constant -1 is translated as a null pointer and
     /// a computed timeout is refused rather than guessed at.
     PpollMs(u32),
+    /// `alarm(sec)` -> `setitimer(ITIMER_REAL, &{0,0},{sec,0}, NULL)`. The
+    /// generic table has no `alarm`; the call it is a special case of is
+    /// there, with an `itimerval` built on the stack at the call site
+    /// (used by the `firnc --test` runner for its per-case time limit).
+    /// The result is 0, not the seconds left of an earlier alarm.
+    AlarmItimer(u32),
     /// `arch_prctl(ARCH_SET_FS, p)` -> `msr tpidr_el0, p`. This one is not a
     /// system call at all here: AArch64 lets EL0 write its own thread
     /// pointer, so what costs a system call on x86 costs one instruction.
@@ -164,6 +170,7 @@ const TABLE: &[(i64, A64)] = &[
     (32, A64::Direct(23)),           // dup
     (33, A64::Dup3(24)),             // dup2      -> dup3
     (35, A64::Direct(101)),          // nanosleep
+    (37, A64::AlarmItimer(103)),     // alarm     -> setitimer (firnc --test time limit)
     (39, A64::Direct(172)),          // getpid
     (41, A64::Direct(198)),          // socket
     (42, A64::Direct(203)),          // connect
@@ -359,6 +366,7 @@ const WASM_TABLE: &[(i64, &str, Wasm)] = &[
     (32, "dup", Wasm::Missing(NO_FILES)),
     (33, "dup2", Wasm::Missing(NO_FILES)),
     (35, "nanosleep", Wasm::Nanosleep),
+    (37, "alarm", Wasm::Missing(NO_SIGNALS)),
     // The one process of the page. 1 is as good a number as any, and it
     // is never 0 (which a caller could read as "the child").
     (39, "getpid", Wasm::Constant(1)),
@@ -476,6 +484,7 @@ mod tests {
     #[test]
     fn fork_and_dup2_survive_as_their_general_forms() {
         assert_eq!(aarch64(57), Some(A64::ForkClone(220)));
+        assert_eq!(aarch64(37), Some(A64::AlarmItimer(103)));
         assert_eq!(aarch64(33), Some(A64::Dup3(24)));
         assert_eq!(aarch64(158), Some(A64::SetThreadPointer));
     }
