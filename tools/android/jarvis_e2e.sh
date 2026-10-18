@@ -186,7 +186,9 @@ check "list shows a chat" "$(OCR_TRIES=10 wait_ocr 07_convs 'hello\|worker\|hi')
 # ---- 4. photo upload ---------------------------------------------------------------------------------------------------------
 echo "== 4. photo upload"
 tap_word "New" 1 2
-shot _p; p=$(word_at _p 'Message'); [ -n "$p" ] && $ADB shell input tap $((141 * SW / 1080)) ${p#* }; sleep 4; U=$(ui)
+shot _p; p=$(word_at _p 'Message'); [ -n "$p" ] && $ADB shell input tap $((141 * SW / 1080)) ${p#* }; sleep 2
+tap_word "Photo" 1 4 # "+" shows the two choices (Photo / File)
+U=$(ui)
 check "the system's picker opens" "$(echo "$U" | grep -cE '(text|content-desc)="(Media picker|Photos|Files|Gallery|Camera|Recent|Photo taken)' | awk '{print ($1>0)?"yes":"no"}')" yes
 P0=$($ADB shell pidof $PKG)
 # the chooser (Camera / Media picker) may come first; then the picker lists the photo as a content description
@@ -224,9 +226,10 @@ check "the service text is neutral (no 'Relay')" "$(notes | grep -A25 "pkg=$PKG"
 push "Second" "another line"
 for _ in $(seq 20); do note_lines | grep -q 'Second' && break; sleep 1; done
 check "a second event: a second notification" "$(note_lines | grep -c 'Second')" 1
+check "same chat: the second event replaces the first (one keyed notification per chat)" "$(note_lines | grep -c 'Worker done')" 0
 echo "  tap the notification"
 $ADB shell cmd statusbar expand-notifications; sleep 3
-b=$(ui | grep -E 'id/(notification_)?title"' | grep 'text="Worker done' | grep -oP 'bounds="\K[^"]+' | head -1)
+b=$(ui | grep -E 'id/(notification_)?title"' | grep 'text="Second' | grep -oP 'bounds="\K[^"]+' | head -1)
 if [ -n "$b" ]; then xy=$(mid "$b"); $ADB shell input tap $(( ${xy% *} + 200 )) ${xy#* }; sleep 5; else note "notification not found in the shade"; fi
 $ADB shell cmd statusbar collapse
 check "tap: the app is in front" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 1
