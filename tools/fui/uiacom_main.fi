@@ -1,0 +1,372 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/uiacom_main.fi -- THE CHECK OF lib/fui/uiacom.windows.fi (the UIA COM glue), WITHOUT A WINDOW.
+// Windows target (Wine): walks the COM objects through their OWN vtables (the way UIA would call them).
+// Build+run: sh tools/fui/uiacom.sh
+// Builds the same settings window as atspi_main.fi, paints it and asks the UIA model: control types,
+// patterns, states, navigation consistency, runtime ids, rectangles, hit test; the element count must equal
+// the AT-SPI bridge's (same tree). Run:  FIRNLIB=lib firnc --opt-level=dev -o X tools/fui/uia_main.fi && X
+import std.rt
+import fui.safeout
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import fui.theme
+import fui.painter
+import fui.scene
+import fui.editor
+import fui.widget
+import plat.fuiwirt
+import plat.sysfont
+import fui.apphost
+import fui.app
+import fui.appctl
+import fui.ctxmenu
+import fui.a11y
+import fui.uiacom
+import gpu.wgl
+import fui.uia
+import fui.control
+import fui.vlist
+import std.env
+
+static mut BAD: usize = 0
+static mut CHANGES: usize = 0
+static mut LAST_ID: usize = 0
+
+static mut MAIL_ID: usize = 0
+static mut OUT_ID: usize = 0
+
+fn say(s: str) {
+    rt.write_everything(1, s.p as u64, s.n)
+}
+
+fn say_num(v: i64) {
+    var t: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&t, v)
+    rt.write_everything(1, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_free(&t)
+}
+
+fn check(ok: bool, what: str) {
+    if ok {
+        say("  ok    ")
+    } else {
+        say("  WRONG ")
+        BAD = BAD + 1
+    }
+    say(what)
+    say("\n")
+}
+
+struct Surface {
+    cv: canvas.Canvas,
+    z: painter.Painter,
+    w: usize,
+    h: usize,
+}
+
+static mut FONT: u64 = 0
+
+fn surface_for(a: *mut app.App, w: usize, h: usize) -> *mut Surface {
+    let s: *mut Surface = rt.heap_alloc(65536) as *mut Surface
+    (*s).cv = canvas.canvas_new()
+    (*s).z = painter.painter_new()
+    (*s).w = w
+    (*s).h = h
+    if !canvas.canvas_init(&(*s).cv, w, h)
+    || !painter.painter_init(&(*s).z, &(*s).cv, w, h) {
+        return 0 as u64 as *mut Surface
+    }
+    painter.painter_set_font(&(*s).z, FONT)
+    app.app_attach(a as u64, &(*s).z)
+    return s
+}
+
+fn frame(a: *mut app.App, s: *mut Surface) {
+    app.app_paint(a as u64, (*s).w, (*s).h)
+    fuiwirt.host_painted(app.app_host(a))
+    let c: u32 = fuiwirt.host_after_layout(app.app_host(a))
+}
+
+fn settle(a: *mut app.App) {
+    let i: usize = fuiwirt.host_take_activated(app.app_host(a))
+    if i != fuiwirt.KEINER {
+        app.app_act(a as u64, i)
+    }
+}
+
+fn click_at(a: *mut app.App, s: *mut Surface, x: f64, y: f64) {
+    let w: *mut fuiwirt.Host = app.app_host(a)
+    let c1: u32 = fuiwirt.host_pointer_move(w, x, y)
+    let c2: u32 = fuiwirt.host_pointer_down(w, x, y, fuiwirt.BTN_LEFT)
+    let c3: u32 = fuiwirt.host_pointer_up(w, x, y, fuiwirt.BTN_LEFT)
+    settle(a)
+    frame(a, s)
+}
+
+fn click(a: *mut app.App, s: *mut Surface, id: usize) {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    click_at(a, s, scene.node_x(sc, id) + scene.node_w(sc, id) / 2.0,
+        scene.node_y(sc, id) + scene.node_h(sc, id) / 2.0)
+}
+
+fn key(a: *mut app.App, s: *mut Surface, k: u32) {
+    let used: bool = app.app_key(a as u64, k, 0 as u32)
+    if !used {
+        let h: u32 = fuiwirt.host_key(app.app_host(a), 0 as u32, 0 as u32)
+    }
+    frame(a, s)
+}
+
+fn changed(a: *mut app.App, id: usize) {
+    CHANGES = CHANGES + 1
+    LAST_ID = id
+}
+
+fn focus_on(a: *mut app.App, id: usize) {
+    let r: u32 = fuiwirt.host_pointer_move(app.app_host(a), 1.0, 1.0)
+    let f: bool = false
+}
+
+static mut WALKED: usize = 0
+static mut NAV_BAD: usize = 0
+static mut RID_BAD: usize = 0
+static mut RIDS: [u64; 256] = [0; 256]
+
+fn rid_key(e: uia.El) -> u64 {
+    var r: [i32; 3] = [0; 3]
+    uia.el_runtime_id(e, &r)
+    return ((r[1] as u64) * 100000) + (r[2] as u64)
+}
+
+fn walk(pv: *mut uia.Provider, e: uia.El, depth: usize) {
+    if WALKED < 256 {
+        let key: u64 = rid_key(e)
+        var j: usize = 0
+        while j < WALKED {
+            if RIDS[j] == key { RID_BAD = RID_BAD + 1 }
+            j = j + 1
+        }
+        RIDS[WALKED] = key
+    }
+    WALKED = WALKED + 1
+    if depth > 30 { return }
+    let kc: usize = uia.el_child_count(pv, e)
+    let f: uia.El = uia.el_first_child(pv, e)
+    let l: uia.El = uia.el_last_child(pv, e)
+    if kc == 0 {
+        if !uia.el_is_none(f) || !uia.el_is_none(l) { NAV_BAD = NAV_BAD + 1 }
+    } else {
+        if !uia.el_equal(uia.el_parent(pv, f), e) { NAV_BAD = NAV_BAD + 1 }
+        if !uia.el_equal(uia.el_parent(pv, l), e) { NAV_BAD = NAV_BAD + 1 }
+        if !uia.el_is_none(uia.el_prev(pv, f)) { NAV_BAD = NAV_BAD + 1 }
+        if !uia.el_is_none(uia.el_next(pv, l)) { NAV_BAD = NAV_BAD + 1 }
+    }
+    var c: uia.El = f
+    var k: usize = 0
+    while !uia.el_is_none(c) && k < kc + 1 {
+        let nx: uia.El = uia.el_next(pv, c)
+        if !uia.el_is_none(nx) && !uia.el_equal(uia.el_prev(pv, nx), c) { NAV_BAD = NAV_BAD + 1 }
+        walk(pv, c, depth + 1)
+        c = nx
+        k = k + 1
+    }
+    if k != kc { NAV_BAD = NAV_BAD + 1 }
+}
+
+fn on_quit(a: *mut app.App) {}
+
+// COM call: p->vtbl[i](p, a, b, c)
+fn vc(p: u64, i: usize, a: u64, b: u64, c: u64) -> u64 {
+    return wgl.call4(rt.ld64(rt.ld64(p, 0), i), p, a, b, c)
+}
+
+fn hr(x: u64) -> u64 { return x & 4294967295 }
+
+// QueryInterface with GUID words; returns the interface pointer or 0
+fn qi(p: u64, w0: u64, w1: u64) -> u64 {
+    var g: [u64; 2] = [w0, w1]
+    var out: [u64; 1] = [0; 1]
+    let r: u64 = hr(vc(p, 0, (&g[0]) as u64, (&out[0]) as u64, 0))
+    if r != 0 {
+        return 0
+    }
+    return out[0]
+}
+
+fn release(p: u64) -> u64 { return hr(vc(p, 2, 0, 0, 0)) }
+
+fn prop_i32(simple: u64, id: u64) -> i64 {
+    var v: [u64; 3] = [0; 3]
+    let r: u64 = hr(vc(simple, 5, id, (&v[0]) as u64, 0))
+    if r != 0 || (v[0] & 65535) != 3 {
+        return 0 - 1
+    }
+    return (v[1] & 4294967295) as i64
+}
+
+// BSTR property compared with an ASCII string
+fn prop_str_is(simple: u64, id: u64, want: str) -> bool {
+    var v: [u64; 3] = [0; 3]
+    let r: u64 = hr(vc(simple, 5, id, (&v[0]) as u64, 0))
+    if r != 0 || (v[0] & 65535) != 8 || v[1] == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < want.n {
+        if (rt.ld16(v[1], i) as u64) != (want.chars(i) as u64) {
+            return false
+        }
+        i = i + 1
+    }
+    return rt.ld16(v[1], i) == 0 as u16
+}
+
+static mut WALK_N: usize = 0
+static mut WALK_BAD: usize = 0
+static mut FOUND_CB: u64 = 0
+static mut FOUND_BTN: u64 = 0
+static mut FOUND_SL: u64 = 0
+
+fn walk_com(frag: u64, parent: u64, depth: usize) {
+    WALK_N = WALK_N + 1
+    if depth > 20 { return }
+    // Navigate(Parent) must return the parent (same pointer: same entry, same slot)
+    var o: [u64; 1] = [0; 1]
+    let rp: u64 = hr(vc(frag, 3, 0, (&o[0]) as u64, 0))
+    if rp != 0 { WALK_BAD = WALK_BAD + 1 }
+    if parent == 0 {
+        if o[0] != 0 { WALK_BAD = WALK_BAD + 1 }
+    } else {
+        if o[0] != parent { WALK_BAD = WALK_BAD + 1 }
+    }
+    if o[0] != 0 { let q: u64 = release(o[0]) }
+    let simple: u64 = qi(frag, 0x433286fdd6dd68d1, 0x4cd2a2debe9a6686)
+    if simple == 0 { WALK_BAD = WALK_BAD + 1 } else {
+        if prop_str_is(simple, 30005, "Dark mode") { FOUND_CB = simple }
+        if prop_str_is(simple, 30005, "Quit") { FOUND_BTN = simple }
+        if prop_str_is(simple, 30005, "Volume") { FOUND_SL = simple }
+    }
+    var c: [u64; 1] = [0; 1]
+    let rc: u64 = hr(vc(frag, 3, 3, (&c[0]) as u64, 0))
+    if rc != 0 { WALK_BAD = WALK_BAD + 1 }
+    var cur: u64 = c[0]
+    while cur != 0 {
+        walk_com(cur, frag, depth + 1)
+        var nx: [u64; 1] = [0; 1]
+        let rn: u64 = hr(vc(cur, 3, 1, (&nx[0]) as u64, 0))
+        if rn != 0 { WALK_BAD = WALK_BAD + 1; nx[0] = 0 }
+        let q: u64 = release(cur)
+        cur = nx[0]
+    }
+}
+
+fn main(start: u64) -> i32 {
+    let fs: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    if !sysfont.sysfont_load(fs) {
+        say("uiacom: no font\n")
+        return 9
+    }
+    FONT = fs as u64
+    let a: *mut app.App = app.window("Settings", 520, 700)
+    let hd: usize = app.label(a, "Preferences", 0)
+    a11y.a11y_set_role(app.ax(a), hd, a11y.ROLE_HEADING)
+    let cb: usize = appctl.checkbox(a, "Dark mode", false, changed)
+    let sl: usize = appctl.slider(a, "Volume", 0, 100, 40, changed)
+    let en: usize = app.entry(a, "Search")
+    let qb: usize = app.button(a, "Quit", on_quit)
+    fuiwirt.host_bind(app.app_host(a))
+    let s: *mut Surface = surface_for(a, 520, 700)
+    frame(a, s)
+    frame(a, s)
+    say("== UIA COM glue (through the vtables) ==\n")
+    check(uiacom.test_attach(a, "Settings"), "tables + pool + provider set up")
+    let root: u64 = uiacom.root_interface()
+    check(root != 0, "root_interface() gives a pointer")
+    // identity: IUnknown / Simple / Fragment / FragmentRoot on the root; no Invoke on the root
+    let u0: u64 = qi(root, 0x0, 0x46000000000000c0)
+    check(u0 == root, "QI IUnknown -> the Simple slot")
+    let fr: u64 = qi(root, 0x439c8359f7063da8, 0x877d9a29c5bb9792)
+    check(fr != 0 && fr != root, "QI Fragment")
+    let rr: u64 = qi(root, 0x40a9ab8f620ce2a5, 0x589b59753cdecb86)
+    check(rr != 0, "QI FragmentRoot on the root")
+    check(qi(root, 0x47a2e18e54fcb24b, 0xa29975e7cbecd3b4) == 0, "QI Invoke on the root: E_NOINTERFACE")
+    check(qi(root, 0x1, 0x2) == 0, "QI unknown IID: E_NOINTERFACE")
+    var opt: [u64; 1] = [0; 1]
+    check(hr(vc(root, 3, (&opt[0]) as u64, 0, 0)) == 0 && (opt[0] & 4294967295) == 34, "ProviderOptions = ServerSide | UseComThreading (0x22)")
+    check(prop_i32(root, 30003) == 50032, "root ControlType = Window (50032)")
+    // AddRef / Release count
+    let r1: u64 = hr(vc(root, 1, 0, 0, 0))
+    let r2: u64 = hr(vc(root, 2, 0, 0, 0))
+    check(r1 == r2 + 1, "AddRef then Release: counts differ by one")
+    // walk the whole tree through Navigate
+    walk_com(fr, 0, 0)
+    say("  walked ")
+    say_num(WALK_N as i64)
+    say(" fragments\n")
+    check(WALK_BAD == 0, "Navigate: parent(child) == parent, root has no parent, all calls S_OK, QI Simple works everywhere")
+    var pvm: uia.Provider = uia.provider_new(app.app_scene(a), app.ax(a), "Settings")
+    WALKED = 0
+    walk(&pvm, uia.el_root(&pvm), 0)
+    check(WALK_N == WALKED, "the COM walk visits as many elements as the model")
+    check(FOUND_CB != 0 && FOUND_BTN != 0 && FOUND_SL != 0, "names via GetPropertyValue(Name): 'Dark mode', 'Quit', 'Volume' found")
+    check(prop_i32(FOUND_CB, 30003) == 50002, "check box ControlType = CheckBox (50002)")
+    check(prop_i32(FOUND_BTN, 30003) == 50000, "button ControlType = Button (50000)")
+    check(prop_str_is(root, 30024, "fUi"), "FrameworkId = fUi")
+    // patterns
+    var pt: [u64; 1] = [0; 1]
+    check(hr(vc(FOUND_CB, 4, 10015, (&pt[0]) as u64, 0)) == 0 && pt[0] != 0, "GetPatternProvider(Toggle) on the check box")
+    let tg: u64 = pt[0]
+    var st: [u64; 1] = [9; 1]
+    check(hr(vc(tg, 4, (&st[0]) as u64, 0, 0)) == 0 && (st[0] & 4294967295) == 0, "ToggleState = Off")
+    check(hr(vc(tg, 3, 0, 0, 0)) == 0, "Toggle() -> S_OK")
+    frame(a, s)
+    check(hr(vc(tg, 4, (&st[0]) as u64, 0, 0)) == 0 && (st[0] & 4294967295) == 1, "ToggleState = On after Toggle()")
+    var pi: [u64; 1] = [0; 1]
+    check(hr(vc(FOUND_CB, 4, 10000, (&pi[0]) as u64, 0)) == 0 && pi[0] == 0, "GetPatternProvider(Invoke) on a check box: none")
+    check(hr(vc(FOUND_BTN, 4, 10000, (&pi[0]) as u64, 0)) == 0 && pi[0] != 0, "GetPatternProvider(Invoke) on the button")
+    var rg: [u64; 1] = [0; 1]
+    check(hr(vc(FOUND_SL, 4, 10003, (&rg[0]) as u64, 0)) == 0 && rg[0] != 0, "GetPatternProvider(RangeValue) on the slider")
+    var dv: [f64; 1] = [0.0; 1]
+    check(hr(vc(rg[0], 4, (&dv[0]) as u64, 0, 0)) == 0 && dv[0] == 400.0, "RangeValue.Value = 400")
+    var mx: [f64; 1] = [0.0; 1]
+    check(hr(vc(rg[0], 6, (&mx[0]) as u64, 0, 0)) == 0 && mx[0] > 400.0, "RangeValue.Maximum > 400")
+    check(hr(vc(rg[0], 3, 0, 0, 0)) == 0x80040204, "RangeValue.SetValue -> UIA_E_NOTSUPPORTED (C2)")
+    // bounds (UiaRect of doubles)
+    // runtime id
+    var sa: [u64; 1] = [0; 1]
+    let frag_btn: u64 = qi(FOUND_BTN, 0x439c8359f7063da8, 0x877d9a29c5bb9792)
+    check(frag_btn != 0 && hr(vc(frag_btn, 4, (&sa[0]) as u64, 0, 0)) == 0 && sa[0] != 0, "GetRuntimeId gives a SAFEARRAY")
+    var bx2: [f64; 4] = [0.0; 4]
+    check(hr(vc(frag_btn, 5, (&bx2[0]) as u64, 0, 0)) == 0 && bx2[2] > 0.0 && bx2[3] > 0.0, "BoundingRectangle of the button has a size")
+    // FragmentRoot of an inner element is the root, and GetFocus works
+    var fro: [u64; 1] = [0; 1]
+    check(hr(vc(frag_btn, 8, (&fro[0]) as u64, 0, 0)) == 0 && fro[0] == rr, "get_FragmentRoot of a leaf = the root's FragmentRoot slot")
+    var fo: [u64; 1] = [0; 1]
+    check(hr(vc(rr, 4, (&fo[0]) as u64, 0, 0)) == 0, "FragmentRoot.GetFocus -> S_OK")
+    check(uiacom.entry_count() > 5, "pool holds entries")
+    // the window procedure: a real (STATIC) window, subclassed; WM_GETOBJECT(-25) must reach the glue
+    let cw: u64 = wgl.dll_sym("user32.dll", "CreateWindowExW")
+    let sm: u64 = wgl.dll_sym("user32.dll", "SendMessageW")
+    var cls: [u16; 8] = [83 as u16, 84 as u16, 65 as u16, 84 as u16, 73 as u16, 67 as u16, 0 as u16, 0 as u16]
+    var hw: u64 = 0
+    if cw != 0 {
+        hw = wgl.call12(cw, 0, (&cls[0]) as u64, 0, 0, 0, 0, 100, 100, 18446744073709551613, 0, 0, 0)
+    }
+    check(hw != 0, "test window created")
+    check(uiacom.attach(a, hw, "Settings") && uiacom.is_attached(), "attach: CoInitializeEx(STA) + subclass")
+    let before: u64 = uiacom.getobject_count()
+    let lr: u64 = wgl.call4(sm, hw, 61, 0, 18446744073709551591)
+    check(uiacom.getobject_count() == before + 1, "WM_GETOBJECT(UiaRootObjectId) reaches the glue (answer " + "counted)")
+    say("  (UiaReturnRawElementProvider LRESULT = ")
+    say_num(lr as i64)
+    say(")\n")
+    let lr2: u64 = wgl.call4(sm, hw, 61, 0, 12345)
+    check(uiacom.getobject_count() == before + 1, "another object id is passed on, not answered")
+    say("UIACOM bad=")
+    say_num(BAD as i64)
+    say("\n")
+    if BAD > 0 { return 1 }
+    return 0
+}

@@ -1,0 +1,1080 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/uiacom.windows.fi -- the COM glue of the Windows UI Automation bridge (roadmap r19).
+//
+//     import fui.uiacom
+//
+//     app.set_window_hooks(a, a as u64, uiacom.opened, my_hotkey)   // or: uiacom.enable_from_env(a, "My app")
+//
+// WHAT IT IS. lib/fui/uia.fi answers every question a UIA provider gets (control type, name, patterns, navigation,
+// rectangle ...). This file is the part that speaks COM: it hands those answers to Windows. Narrator, Inspect.exe,
+// NVDA and every other UIA client send WM_GETOBJECT(UiaRootObjectId) to the window; the window procedure is
+// SUBCLASSED here (SetWindowLongPtrW), and the answer is `UiaReturnRawElementProvider(hwnd, wParam, lParam, root)`.
+// The root is an IRawElementProviderSimple that also is a Fragment and a FragmentRoot; every other element of the
+// tree is created on demand (Navigate) from the live scene.
+//
+// OBJECTS. One element = one entry of a fixed pool (NENT entries, never freed by the GC: `rt.heap_alloc`). An entry
+// has nine interface slots [vtable, entry index]: Simple, Fragment, FragmentRoot, Invoke, Toggle, Value, RangeValue,
+// ExpandCollapse, SelectionItem. `this` of every method is the address of a slot, so the entry is one load away. One
+// reference count per entry (all interfaces share it); a released entry is reused. The vtables are shared. The
+// methods are `#[win_callback]` functions (Win64 -> System V thunk), the vtable words are the thunk addresses
+// (`code_of4`, as in lib/window/win32.fi). Every Windows function other than the window procedure is reached with
+// `gpu.wgl.dll_sym` + `callN` (no import-table entry).
+//
+// THREADS. The provider is registered with ProviderOptions_UseComThreading: UIA marshals every call into the
+// thread that owns the window (an STA, `CoInitializeEx(STA)` in `attach`), so the scene is only ever touched from
+// the window thread. If that thread already is an MTA, `attach` refuses (false) rather than run unsafe.
+//
+// HONEST
+//   C1  NOT TESTED against a live UIA client (Narrator / Inspect): no Windows machine was reachable. What IS
+//       tested: the vtables, QueryInterface, Navigate, properties, patterns by calling the objects through their
+//       own vtables (tools/fui/uiacom_main.fi, Wine 8, `win64_call`) and the cross build.
+//   C2  RangeValue.SetValue(double) and ElementProviderFromPoint(double, double): the doubles travel in xmm
+//       registers, which the thunk does not pass on. SetValue answers UIA_E_NOTSUPPORTED (the pattern reports
+//       IsReadOnly = true), ElementProviderFromPoint takes the point from GetCursorPos (right for a client that
+//       hit-tests under the mouse, which is what Inspect and Narrator's touch/mouse exploration do).
+//   C3  No events yet (UiaRaiseAutomationEvent / focus changed): a client that only listens sees the tree on
+//       demand, not changes. Next step: a poll like atspi.bridge_poll.
+//   C4  Value pattern is read only (the text field's text through the a11y name); SetValue = NOTSUPPORTED.
+//   C5  Rows of virtual lists are reachable and readable, but offer no actions (like the AT-SPI bridge).
+//   C6  One window per process (the globals below).
+import std.rt
+import std.env
+import fui.scene
+import fui.a11y
+import fui.app
+import fui.uia
+import fui.control
+import plat.fuiwirt
+import window.window
+import gpu.wgl
+
+export {
+    attach, opened, enable_from_env, is_attached, root_interface, entry_count, test_attach, getobject_count,
+    S_SIMPLE, S_FRAGMENT, S_ROOT, S_INVOKE, S_TOGGLE, S_VALUE, S_RANGE, S_EXPAND, S_SELITEM,
+}
+
+const NENT: usize = 512
+const NSLOT: usize = 9
+const MW: usize = 6 // meta words per entry: used, kind, node, row, refs, pad
+
+const S_SIMPLE: usize = 0
+const S_FRAGMENT: usize = 1
+const S_ROOT: usize = 2
+const S_INVOKE: usize = 3
+const S_TOGGLE: usize = 4
+const S_VALUE: usize = 5
+const S_RANGE: usize = 6
+const S_EXPAND: usize = 7
+const S_SELITEM: usize = 8
+
+const NONE: usize = 4294967295
+
+const S_OK: u64 = 0
+const E_NOINTERFACE: u64 = 0x80004002
+const E_POINTER: u64 = 0x80004003
+const E_FAIL: u64 = 0x80004005
+const E_INVALIDARG: u64 = 0x80070057
+const UIA_E_ELEMENTNOTENABLED: u64 = 0x80040200
+const UIA_E_ELEMENTNOTAVAILABLE: u64 = 0x80040201
+const UIA_E_NOTSUPPORTED: u64 = 0x80040204
+
+static mut G_PV: u64 = 0 // *mut uia.Provider
+static mut G_APP: u64 = 0 // *mut app.App
+static mut G_HWND: u64 = 0
+static mut G_OLD: u64 = 0 // the window procedure we replaced
+static mut G_POOL: u64 = 0 // NENT * NSLOT * 16 octets
+static mut G_META: u64 = 0 // NENT * MW words
+static mut G_VT: u64 = 0 // 9 vtables of 16 words
+static mut G_GUID: u64 = 0 // 10 GUIDs of 16 octets
+static mut G_ROOT: usize = 4294967295 // the entry of the root (never released)
+static mut G_READY: bool = false
+static mut G_COUNT: u64 = 0 // WM_GETOBJECT answers
+
+// dynamic Windows functions
+static mut F_RETURN: u64 = 0 // UiaReturnRawElementProvider
+static mut F_HOST: u64 = 0 // UiaHostProviderFromHwnd
+static mut F_CALLWND: u64 = 0 // CallWindowProcW
+static mut F_SETLONG: u64 = 0 // SetWindowLongPtrW
+static mut F_CLIENT2SCREEN: u64 = 0
+static mut F_CURSOR: u64 = 0
+static mut F_MB2WC: u64 = 0
+static mut F_BSTR: u64 = 0 // SysAllocStringLen
+static mut F_SACREATE: u64 = 0 // SafeArrayCreateVector
+static mut F_SAPUT: u64 = 0 // SafeArrayPutElement
+
+// ------------------------------------------------------------------ small helpers
+
+fn pv() -> *mut uia.Provider { return G_PV as *mut uia.Provider }
+
+fn word(p: u64, i: usize) -> u64 { return rt.ld64(p, i) }
+
+fn put_word(p: u64, i: usize, v: u64) { rt.st64(p, i, v) }
+
+fn slot_ptr(e: usize, s: usize) -> u64 {
+    return G_POOL + (((e * NSLOT + s) * 16) as u64)
+}
+
+fn meta(e: usize, k: usize) -> u64 { return word(G_META, e * MW + k) }
+
+fn set_meta(e: usize, k: usize, v: u64) { put_word(G_META, e * MW + k, v) }
+
+// the entry a `this` belongs to (NONE = not ours / released)
+fn entry_of(this: u64) -> usize {
+    if this == 0 || G_POOL == 0 {
+        return NONE
+    }
+    if this < G_POOL || this >= G_POOL + ((NENT * NSLOT * 16) as u64) {
+        return NONE
+    }
+    let e: usize = word(this, 1) as usize
+    if e >= NENT || meta(e, 0) == 0 {
+        return NONE
+    }
+    return e
+}
+
+fn el_of(e: usize) -> uia.El {
+    return uia.El { kind: meta(e, 1) as u32, node: meta(e, 2) as usize, row: meta(e, 3) as usize }
+}
+
+// The entry of an element: the one that exists, else a free one (refs 0). NONE = pool full.
+fn entry_for(el: uia.El) -> usize {
+    var free: usize = NONE
+    var i: usize = 0
+    while i < NENT {
+        if meta(i, 0) != 0 {
+            if meta(i, 1) == (el.kind as u64) && meta(i, 2) == (el.node as u64) && meta(i, 3) == (el.row as u64) {
+                return i
+            }
+        } else if free == NONE {
+            free = i
+        }
+        i = i + 1
+    }
+    if free == NONE {
+        return NONE
+    }
+    set_meta(free, 0, 1)
+    set_meta(free, 1, el.kind as u64)
+    set_meta(free, 2, el.node as u64)
+    set_meta(free, 3, el.row as u64)
+    set_meta(free, 4, 0)
+    return free
+}
+
+fn entry_count() -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while G_META != 0 && i < NENT {
+        if meta(i, 0) != 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// An interface pointer for an element, AddRef'd (0 = none / pool full).
+fn give(el: uia.El, s: usize) -> u64 {
+    if uia.el_is_none(el) {
+        return 0
+    }
+    let e: usize = entry_for(el)
+    if e == NONE {
+        return 0
+    }
+    set_meta(e, 4, meta(e, 4) + 1)
+    return slot_ptr(e, s)
+}
+
+fn out_ptr(p: u64, v: u64) {
+    if p != 0 {
+        put_word(p, 0, v)
+    }
+}
+
+fn out_i32(p: u64, v: i32) {
+    if p != 0 {
+        rt.st32(p, 0, v as u32)
+    }
+}
+
+fn out_f64(p: u64, v: f64) {
+    if p != 0 {
+        *(p as *mut f64) = v
+    }
+}
+
+// the window's client origin on the screen, refreshed before every geometry answer (the window may have moved)
+fn refresh_origin() {
+    if G_HWND == 0 || F_CLIENT2SCREEN == 0 {
+        return
+    }
+    var pt: [i32; 2] = [0; 2]
+    if wgl.call2(F_CLIENT2SCREEN, G_HWND, (&pt[0]) as u64) != 0 {
+        uia.provider_set_origin(pv(), pt[0] as i64, pt[1] as i64)
+    }
+}
+
+// BSTR from UTF-8 (0 = failed or empty)
+fn bstr_of(p: u64, n: usize) -> u64 {
+    if n == 0 || F_MB2WC == 0 || F_BSTR == 0 {
+        return 0
+    }
+    var wb: [u16; 600] = [0 as u16; 600]
+    var m: usize = n
+    if m > 590 {
+        m = 590
+    }
+    let c: u64 = wgl.call6(F_MB2WC, 65001, 0, p, m as u64, (&wb[0]) as u64, 600) & 4294967295
+    if c == 0 {
+        return 0
+    }
+    return wgl.call2(F_BSTR, (&wb[0]) as u64, c)
+}
+
+fn bstr_lit(s: str) -> u64 {
+    return bstr_of(s.p as u64, s.n)
+}
+
+// ------------------------------------------------------------------ actions (same path as a mouse click)
+
+fn click_node(node: usize) -> bool {
+    let a: *mut app.App = G_APP as *mut app.App
+    let w: *mut fuiwirt.Host = app.app_host(a)
+    let sc: *mut scene.Scene = app.app_scene(a)
+    if node >= scene.scene_count(sc) {
+        return false
+    }
+    let x: f64 = scene.node_x(sc, node) + scene.node_w(sc, node) / 2.0
+    let y: f64 = scene.node_y(sc, node) + scene.node_h(sc, node) / 2.0
+    let c1: u32 = fuiwirt.host_pointer_move(w, x, y)
+    let c2: u32 = fuiwirt.host_pointer_down(w, x, y, fuiwirt.BTN_LEFT)
+    let c3: u32 = fuiwirt.host_pointer_up(w, x, y, fuiwirt.BTN_LEFT)
+    let i: usize = fuiwirt.host_take_activated(w)
+    if i != fuiwirt.KEINER {
+        app.app_act(a as u64, i)
+    }
+    fuiwirt.host_touch(w)
+    return true
+}
+
+// 0 = S_OK, else the HRESULT
+fn do_click(this: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    let el: uia.El = el_of(e)
+    if el.kind != 1 as u32 {
+        return UIA_E_NOTSUPPORTED
+    }
+    if !uia.el_enabled(pv(), el) {
+        return UIA_E_ELEMENTNOTENABLED
+    }
+    if !click_node(el.node) {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    return S_OK
+}
+
+// ------------------------------------------------------------------ IUnknown (shared by all nine vtables)
+
+fn guid_is(p: u64, k: usize) -> bool {
+    return word(p, 0) == word(G_GUID, k * 2) && word(p, 1) == word(G_GUID, k * 2 + 1)
+}
+
+#[win_callback]
+fn m_qi(this: u64, riid: u64, ppv: u64, x: u64) -> u64 {
+    if ppv == 0 || riid == 0 {
+        return E_POINTER
+    }
+    put_word(ppv, 0, 0)
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    let el: uia.El = el_of(e)
+    var s: usize = NONE
+    if guid_is(riid, 0) || guid_is(riid, 1) {
+        s = S_SIMPLE
+    } else if guid_is(riid, 2) {
+        s = S_FRAGMENT
+    } else if guid_is(riid, 3) {
+        if e == G_ROOT {
+            s = S_ROOT
+        }
+    } else if guid_is(riid, 4) {
+        if uia.el_has_pattern(pv(), el, uia.PAT_INVOKE) { s = S_INVOKE }
+    } else if guid_is(riid, 5) {
+        if uia.el_has_pattern(pv(), el, uia.PAT_TOGGLE) { s = S_TOGGLE }
+    } else if guid_is(riid, 6) {
+        if uia.el_has_pattern(pv(), el, uia.PAT_VALUE) { s = S_VALUE }
+    } else if guid_is(riid, 7) {
+        if uia.el_has_pattern(pv(), el, uia.PAT_RANGE) { s = S_RANGE }
+    } else if guid_is(riid, 8) {
+        if uia.el_has_pattern(pv(), el, uia.PAT_EXPAND) { s = S_EXPAND }
+    } else if guid_is(riid, 9) {
+        if uia.el_has_pattern(pv(), el, uia.PAT_SELITEM) { s = S_SELITEM }
+    }
+    if s == NONE {
+        return E_NOINTERFACE
+    }
+    set_meta(e, 4, meta(e, 4) + 1)
+    put_word(ppv, 0, slot_ptr(e, s))
+    return S_OK
+}
+
+#[win_callback]
+fn m_addref(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return 0
+    }
+    set_meta(e, 4, meta(e, 4) + 1)
+    return meta(e, 4)
+}
+
+#[win_callback]
+fn m_release(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return 0
+    }
+    var r: u64 = meta(e, 4)
+    if r > 0 {
+        r = r - 1
+    }
+    set_meta(e, 4, r)
+    if r == 0 && e != G_ROOT {
+        set_meta(e, 0, 0)
+    }
+    return r
+}
+
+#[win_callback]
+fn m_notsup(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    return UIA_E_NOTSUPPORTED
+}
+
+// ------------------------------------------------------------------ IRawElementProviderSimple
+
+#[win_callback]
+fn m_options(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    // ServerSideProvider (2) | UseComThreading (0x20)
+    rt.st32(out, 0, 34 as u32)
+    return S_OK
+}
+
+#[win_callback]
+fn m_getpattern(this: u64, pid: u64, out: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    put_word(out, 0, 0)
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    let el: uia.El = el_of(e)
+    var s: usize = NONE
+    let id: u32 = (pid & 4294967295) as u32
+    if id == uia.pattern_id(uia.PAT_INVOKE) && uia.el_has_pattern(pv(), el, uia.PAT_INVOKE) { s = S_INVOKE }
+    if id == uia.pattern_id(uia.PAT_TOGGLE) && uia.el_has_pattern(pv(), el, uia.PAT_TOGGLE) { s = S_TOGGLE }
+    if id == uia.pattern_id(uia.PAT_VALUE) && uia.el_has_pattern(pv(), el, uia.PAT_VALUE) { s = S_VALUE }
+    if id == uia.pattern_id(uia.PAT_RANGE) && uia.el_has_pattern(pv(), el, uia.PAT_RANGE) { s = S_RANGE }
+    if id == uia.pattern_id(uia.PAT_EXPAND) && uia.el_has_pattern(pv(), el, uia.PAT_EXPAND) { s = S_EXPAND }
+    if id == uia.pattern_id(uia.PAT_SELITEM) && uia.el_has_pattern(pv(), el, uia.PAT_SELITEM) { s = S_SELITEM }
+    if s == NONE {
+        return S_OK
+    }
+    set_meta(e, 4, meta(e, 4) + 1)
+    put_word(out, 0, slot_ptr(e, s))
+    return S_OK
+}
+
+// VARIANT (24 octets on x64): vt at 0, value at 8
+fn var_empty(v: u64) {
+    put_word(v, 0, 0)
+    put_word(v, 1, 0)
+    put_word(v, 2, 0)
+}
+
+fn var_i32(v: u64, x: i32) {
+    rt.st16(v, 0, 3 as u16)
+    rt.st32(v, 2, x as u32)
+}
+
+fn var_bool(v: u64, b: bool) {
+    rt.st16(v, 0, 11 as u16)
+    if b {
+        rt.st16(v, 4, 65535 as u16)
+    } else {
+        rt.st16(v, 4, 0 as u16)
+    }
+}
+
+fn var_bstr(v: u64, b: u64) {
+    if b == 0 {
+        return
+    }
+    rt.st16(v, 0, 8 as u16)
+    put_word(v, 1, b)
+}
+
+#[win_callback]
+fn m_getprop(this: u64, prop: u64, v: u64, d: u64) -> u64 {
+    if v == 0 {
+        return E_POINTER
+    }
+    var_empty(v)
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    let el: uia.El = el_of(e)
+    let p: u64 = prop & 4294967295
+    if p == 30003 {
+        var_i32(v, uia.el_control_type(pv(), el) as i32)
+    } else if p == 30005 {
+        var nb: [u8; 1024] = [0 as u8; 1024]
+        let n: usize = uia.el_name(pv(), el, (&nb[0]) as u64, 1024)
+        var_bstr(v, bstr_of((&nb[0]) as u64, n))
+    } else if p == 30011 {
+        var ab: rt.Buf = rt.buf_new()
+        let n: usize = uia.el_automation_id(el, &ab)
+        var_bstr(v, bstr_of(rt.buf_ptr(&ab), n))
+        rt.buf_free(&ab)
+    } else if p == 30004 {
+        var_bstr(v, bstr_lit(uia.el_type_name(pv(), el)))
+    } else if p == 30010 {
+        var_bool(v, uia.el_enabled(pv(), el))
+    } else if p == 30009 {
+        var_bool(v, uia.el_focusable(pv(), el))
+    } else if p == 30008 {
+        var_bool(v, uia.el_has_focus(pv(), el))
+    } else if p == 30016 || p == 30017 {
+        var_bool(v, true)
+    } else if p == 30022 || p == 30019 {
+        var_bool(v, false)
+    } else if p == 30024 {
+        var_bstr(v, bstr_lit("fUi"))
+    } else if p == 30107 {
+        var_bstr(v, bstr_lit("fUi UIA bridge"))
+    } else if p == 30020 && e == G_ROOT {
+        var_i32(v, G_HWND as i32)
+    }
+    return S_OK
+}
+
+#[win_callback]
+fn m_host(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    put_word(out, 0, 0)
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    if e == G_ROOT && F_HOST != 0 {
+        // the window's own provider (non-client area, window patterns) is merged in by UIA
+        let r: u64 = wgl.call2(F_HOST, G_HWND, out)
+        if (r & 4294967295) != 0 {
+            put_word(out, 0, 0)
+        }
+    }
+    return S_OK
+}
+
+// ------------------------------------------------------------------ IRawElementProviderFragment
+
+#[win_callback]
+fn m_navigate(this: u64, dir: u64, out: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    put_word(out, 0, 0)
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    let r: uia.El = uia.el_navigate(pv(), el_of(e), (dir & 4294967295) as u32)
+    put_word(out, 0, give(r, S_FRAGMENT))
+    return S_OK
+}
+
+#[win_callback]
+fn m_runtimeid(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    put_word(out, 0, 0)
+    let e: usize = entry_of(this)
+    if e == NONE || F_SACREATE == 0 || F_SAPUT == 0 {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    var ids: [i32; 3] = [0; 3]
+    uia.el_runtime_id(el_of(e), &ids)
+    let sa: u64 = wgl.call3(F_SACREATE, 3, 0, 3)
+    if sa == 0 {
+        return E_FAIL
+    }
+    var k: usize = 0
+    while k < 3 {
+        var idx: [i32; 1] = [k as i32]
+        var val: [i32; 1] = [ids[k]]
+        wgl.call3(F_SAPUT, sa, (&idx[0]) as u64, (&val[0]) as u64)
+        k = k + 1
+    }
+    put_word(out, 0, sa)
+    return S_OK
+}
+
+#[win_callback]
+fn m_bounds(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    refresh_origin()
+    var q: [i64; 4] = [0; 4]
+    uia.el_rect(pv(), el_of(e), &q)
+    // UiaRect { left, top, width, height } as doubles
+    out_f64(out, q[0] as f64)
+    out_f64(out + 8, q[1] as f64)
+    out_f64(out + 16, q[2] as f64)
+    out_f64(out + 24, q[3] as f64)
+    return S_OK
+}
+
+#[win_callback]
+fn m_embedded(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    put_word(out, 0, 0)
+    return S_OK
+}
+
+#[win_callback]
+fn m_setfocus(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    let el: uia.El = el_of(e)
+    if el.kind != 1 as u32 {
+        return UIA_E_NOTSUPPORTED
+    }
+    let w: *mut fuiwirt.Host = app.app_host(G_APP as *mut app.App)
+    let pn: *mut control.Panel = fuiwirt.host_panel(w)
+    let r: u32 = control.panel_set_focus(pn, el.node)
+    fuiwirt.host_touch(w)
+    return S_OK
+}
+
+#[win_callback]
+fn m_fragroot(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    put_word(out, 0, 0)
+    if G_ROOT == NONE || meta(G_ROOT, 0) == 0 {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    set_meta(G_ROOT, 4, meta(G_ROOT, 4) + 1)
+    put_word(out, 0, slot_ptr(G_ROOT, S_ROOT))
+    return S_OK
+}
+
+// ------------------------------------------------------------------ IRawElementProviderFragmentRoot
+
+// (this, double x, double y, out): the doubles are in xmm1/xmm2, so only `out` (4th slot) is usable -- the point
+// is the mouse position (C2).
+#[win_callback]
+fn m_frompoint(this: u64, x: u64, y: u64, out: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    put_word(out, 0, 0)
+    if F_CURSOR == 0 {
+        return S_OK
+    }
+    refresh_origin()
+    var pt: [i32; 2] = [0; 2]
+    if wgl.call1(F_CURSOR, (&pt[0]) as u64) == 0 {
+        return S_OK
+    }
+    let el: uia.El = uia.el_from_point(pv(), (pt[0] as i64) - (*pv()).ox, (pt[1] as i64) - (*pv()).oy)
+    put_word(out, 0, give(el, S_FRAGMENT))
+    return S_OK
+}
+
+#[win_callback]
+fn m_getfocus(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    put_word(out, 0, 0)
+    let n: usize = scene.scene_count((*pv()).sc)
+    var i: usize = 0
+    while i < n {
+        let el: uia.El = uia.el_from_node(pv(), i)
+        if uia.el_has_focus(pv(), el) {
+            put_word(out, 0, give(el, S_FRAGMENT))
+            return S_OK
+        }
+        i = i + 1
+    }
+    return S_OK
+}
+
+// ------------------------------------------------------------------ patterns
+
+#[win_callback]
+fn m_invoke(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    return do_click(this)
+}
+
+#[win_callback]
+fn m_toggle(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    return do_click(this)
+}
+
+#[win_callback]
+fn m_togglestate(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE || out == 0 {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    out_i32(out, uia.el_toggle_state(pv(), el_of(e)) as i32)
+    return S_OK
+}
+
+#[win_callback]
+fn m_value(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE || out == 0 {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    var nb: [u8; 1024] = [0 as u8; 1024]
+    let n: usize = uia.el_name(pv(), el_of(e), (&nb[0]) as u64, 1024)
+    put_word(out, 0, bstr_of((&nb[0]) as u64, n))
+    return S_OK
+}
+
+fn bool_out(out: u64, b: bool) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    if b {
+        rt.st32(out, 0, 1 as u32)
+    } else {
+        rt.st32(out, 0, 0 as u32)
+    }
+    return S_OK
+}
+
+#[win_callback]
+fn m_readonly(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    return bool_out(out, true)
+}
+
+#[win_callback]
+fn m_rvalue(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE || out == 0 {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    out_f64(out, uia.el_range_value(pv(), el_of(e)) as f64)
+    return S_OK
+}
+
+#[win_callback]
+fn m_rmax(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    out_f64(out, uia.el_range_max() as f64)
+    return S_OK
+}
+
+#[win_callback]
+fn m_rmin(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    out_f64(out, uia.el_range_min() as f64)
+    return S_OK
+}
+
+#[win_callback]
+fn m_rlarge(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    out_f64(out, ((uia.el_range_max() - uia.el_range_min()) as f64) / 10.0)
+    return S_OK
+}
+
+#[win_callback]
+fn m_rsmall(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    out_f64(out, ((uia.el_range_max() - uia.el_range_min()) as f64) / 100.0)
+    return S_OK
+}
+
+#[win_callback]
+fn m_expand(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    if uia.el_expand_state(pv(), el_of(e)) == uia.EXP_EXPANDED_S {
+        return S_OK
+    }
+    return do_click(this)
+}
+
+#[win_callback]
+fn m_collapse(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    if uia.el_expand_state(pv(), el_of(e)) != uia.EXP_EXPANDED_S {
+        return S_OK
+    }
+    return do_click(this)
+}
+
+#[win_callback]
+fn m_expstate(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE || out == 0 {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    out_i32(out, uia.el_expand_state(pv(), el_of(e)) as i32)
+    return S_OK
+}
+
+#[win_callback]
+fn m_select(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    return do_click(this)
+}
+
+#[win_callback]
+fn m_addsel(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    if uia.el_is_selected(pv(), el_of(e)) {
+        return S_OK
+    }
+    return do_click(this)
+}
+
+#[win_callback]
+fn m_remsel(this: u64, b: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    if !uia.el_is_selected(pv(), el_of(e)) {
+        return S_OK
+    }
+    return do_click(this)
+}
+
+#[win_callback]
+fn m_issel(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    return bool_out(out, uia.el_is_selected(pv(), el_of(e)))
+}
+
+#[win_callback]
+fn m_selcont(this: u64, out: u64, c: u64, d: u64) -> u64 {
+    if out == 0 {
+        return E_POINTER
+    }
+    put_word(out, 0, 0)
+    let e: usize = entry_of(this)
+    if e == NONE {
+        return UIA_E_ELEMENTNOTAVAILABLE
+    }
+    put_word(out, 0, give(uia.el_parent(pv(), el_of(e)), S_SIMPLE))
+    return S_OK
+}
+
+// ------------------------------------------------------------------ vtables
+
+struct Holder4 {
+    f: fn(u64, u64, u64, u64) -> u64,
+}
+
+fn code_of4(f: fn(u64, u64, u64, u64) -> u64) -> u64 {
+    var roh: [u64; 1] = [0; 1]
+    let h: *mut Holder4 = (&roh[0]) as *mut Holder4
+    (*h).f = f
+    return *((roh[0]) as *mut u64)
+}
+
+fn vt_set(k: usize, i: usize, f: fn(u64, u64, u64, u64) -> u64) {
+    put_word(G_VT, k * 16 + i, code_of4(f))
+}
+
+fn vt_unknown(k: usize) {
+    vt_set(k, 0, m_qi)
+    vt_set(k, 1, m_addref)
+    vt_set(k, 2, m_release)
+}
+
+fn guid_set(k: usize, w0: u64, w1: u64) {
+    put_word(G_GUID, k * 2, w0)
+    put_word(G_GUID, k * 2 + 1, w1)
+}
+
+fn build_tables() {
+    // IUnknown, Simple, Fragment, FragmentRoot, Invoke, Toggle, Value, RangeValue, ExpandCollapse, SelectionItem
+    guid_set(0, 0x0, 0x46000000000000c0)
+    guid_set(1, 0x433286fdd6dd68d1, 0x4cd2a2debe9a6686)
+    guid_set(2, 0x439c8359f7063da8, 0x877d9a29c5bb9792)
+    guid_set(3, 0x40a9ab8f620ce2a5, 0x589b59753cdecb86)
+    guid_set(4, 0x47a2e18e54fcb24b, 0xa29975e7cbecd3b4)
+    guid_set(5, 0x433cc4f456d00bd0, 0x92087ea5521a36a8)
+    guid_set(6, 0x42016fb3c7935180, 0x4af6db3af77d74b1)
+    guid_set(7, 0x469133e636dc7aef, 0x333d4b27e72be1af)
+    guid_set(8, 0x4a98cab0d847d3a5, 0x24ad595cb4ec328c)
+    guid_set(9, 0x452db2d42acad808, 0xb267d11aff9107a4)
+    var k: usize = 0
+    while k < NSLOT {
+        vt_unknown(k)
+        k = k + 1
+    }
+    // Simple: ProviderOptions, GetPatternProvider, GetPropertyValue, HostRawElementProvider
+    vt_set(S_SIMPLE, 3, m_options)
+    vt_set(S_SIMPLE, 4, m_getpattern)
+    vt_set(S_SIMPLE, 5, m_getprop)
+    vt_set(S_SIMPLE, 6, m_host)
+    // Fragment: Navigate, GetRuntimeId, BoundingRectangle, GetEmbeddedFragmentRoots, SetFocus, FragmentRoot
+    vt_set(S_FRAGMENT, 3, m_navigate)
+    vt_set(S_FRAGMENT, 4, m_runtimeid)
+    vt_set(S_FRAGMENT, 5, m_bounds)
+    vt_set(S_FRAGMENT, 6, m_embedded)
+    vt_set(S_FRAGMENT, 7, m_setfocus)
+    vt_set(S_FRAGMENT, 8, m_fragroot)
+    // FragmentRoot: ElementProviderFromPoint, GetFocus
+    vt_set(S_ROOT, 3, m_frompoint)
+    vt_set(S_ROOT, 4, m_getfocus)
+    // Invoke: Invoke
+    vt_set(S_INVOKE, 3, m_invoke)
+    // Toggle: Toggle, ToggleState
+    vt_set(S_TOGGLE, 3, m_toggle)
+    vt_set(S_TOGGLE, 4, m_togglestate)
+    // Value: SetValue, Value, IsReadOnly
+    vt_set(S_VALUE, 3, m_notsup)
+    vt_set(S_VALUE, 4, m_value)
+    vt_set(S_VALUE, 5, m_readonly)
+    // RangeValue: SetValue, Value, IsReadOnly, Maximum, Minimum, LargeChange, SmallChange
+    vt_set(S_RANGE, 3, m_notsup)
+    vt_set(S_RANGE, 4, m_rvalue)
+    vt_set(S_RANGE, 5, m_readonly)
+    vt_set(S_RANGE, 6, m_rmax)
+    vt_set(S_RANGE, 7, m_rmin)
+    vt_set(S_RANGE, 8, m_rlarge)
+    vt_set(S_RANGE, 9, m_rsmall)
+    // ExpandCollapse: Expand, Collapse, ExpandCollapseState
+    vt_set(S_EXPAND, 3, m_expand)
+    vt_set(S_EXPAND, 4, m_collapse)
+    vt_set(S_EXPAND, 5, m_expstate)
+    // SelectionItem: Select, AddToSelection, RemoveFromSelection, IsSelected, SelectionContainer
+    vt_set(S_SELITEM, 3, m_select)
+    vt_set(S_SELITEM, 4, m_addsel)
+    vt_set(S_SELITEM, 5, m_remsel)
+    vt_set(S_SELITEM, 6, m_issel)
+    vt_set(S_SELITEM, 7, m_selcont)
+    // every slot of the pool points at its vtable
+    var e: usize = 0
+    while e < NENT {
+        var s: usize = 0
+        while s < NSLOT {
+            let sp: u64 = slot_ptr(e, s)
+            put_word(sp, 0, G_VT + ((s * 16 * 8) as u64))
+            put_word(sp, 1, e as u64)
+            s = s + 1
+        }
+        e = e + 1
+    }
+}
+
+// ------------------------------------------------------------------ the window procedure (subclass)
+
+#[win_callback]
+fn uia_wndproc(hwnd: u64, msg: u64, wp: u64, lp: u64) -> u64 {
+    if msg == 61 && (lp & 4294967295) == 4294967271 && G_READY && F_RETURN != 0 {
+        // WM_GETOBJECT, objid UiaRootObjectId (-25)
+        refresh_origin()
+        let root: uia.El = uia.el_root(pv())
+        if !uia.el_is_none(root) {
+            let e: usize = entry_for(root)
+            if e != NONE {
+                if G_ROOT == NONE {
+                    G_ROOT = e
+                    set_meta(e, 4, meta(e, 4) + 1) // the permanent reference
+                }
+                G_COUNT = G_COUNT + 1
+                let r: u64 = wgl.call4(F_RETURN, hwnd, wp, lp, slot_ptr(e, S_SIMPLE))
+                if r != 0 {
+                    return r
+                }
+            }
+        }
+    }
+    return wgl.call5(F_CALLWND, G_OLD, hwnd, msg, wp, lp)
+}
+
+// ------------------------------------------------------------------ set up
+
+fn load_functions() -> bool {
+    F_RETURN = wgl.dll_sym("uiautomationcore.dll", "UiaReturnRawElementProvider")
+    F_HOST = wgl.dll_sym("uiautomationcore.dll", "UiaHostProviderFromHwnd")
+    F_CALLWND = wgl.dll_sym("user32.dll", "CallWindowProcW")
+    F_SETLONG = wgl.dll_sym("user32.dll", "SetWindowLongPtrW")
+    F_CLIENT2SCREEN = wgl.dll_sym("user32.dll", "ClientToScreen")
+    F_CURSOR = wgl.dll_sym("user32.dll", "GetCursorPos")
+    F_MB2WC = wgl.dll_sym("kernel32.dll", "MultiByteToWideChar")
+    F_BSTR = wgl.dll_sym("oleaut32.dll", "SysAllocStringLen")
+    F_SACREATE = wgl.dll_sym("oleaut32.dll", "SafeArrayCreateVector")
+    F_SAPUT = wgl.dll_sym("oleaut32.dll", "SafeArrayPutElement")
+    return F_RETURN != 0 && F_CALLWND != 0 && F_SETLONG != 0 && F_BSTR != 0 && F_SACREATE != 0 && F_SAPUT != 0
+    && F_MB2WC != 0
+}
+
+// The state without a window: tables, pool, provider. `test_attach` and `attach` both start here.
+#[allow_escape]
+fn setup(a: *mut app.App, title: str) -> bool {
+    if G_READY {
+        return true
+    }
+    if !load_functions() {
+        return false
+    }
+    G_POOL = rt.heap_alloc(NENT * NSLOT * 16)
+    G_META = rt.heap_alloc(NENT * MW * 8)
+    G_VT = rt.heap_alloc(NSLOT * 16 * 8)
+    G_GUID = rt.heap_alloc(10 * 16)
+    G_PV = rt.heap_alloc(4096)
+    if G_POOL == 0 || G_META == 0 || G_VT == 0 || G_GUID == 0 || G_PV == 0 {
+        return false
+    }
+    *(G_PV as *mut uia.Provider) = uia.provider_new(app.app_scene(a), app.ax(a), title)
+    G_APP = a as u64
+    build_tables()
+    G_READY = true
+    return true
+}
+
+// The root's Simple interface (AddRef'd): what a test hands to `win64_call`. 0 = not set up / no tree.
+fn root_interface() -> u64 {
+    if !G_READY {
+        return 0
+    }
+    let root: uia.El = uia.el_root(pv())
+    if uia.el_is_none(root) {
+        return 0
+    }
+    let e: usize = entry_for(root)
+    if e == NONE {
+        return 0
+    }
+    if G_ROOT == NONE {
+        G_ROOT = e
+        set_meta(e, 4, meta(e, 4) + 1)
+    }
+    set_meta(e, 4, meta(e, 4) + 1)
+    return slot_ptr(e, S_SIMPLE)
+}
+
+// Set up WITHOUT a window (the check in tools/fui/uiacom_main.fi walks the objects through their vtables).
+#[allow_escape]
+fn test_attach(a: *mut app.App, title: str) -> bool {
+    return setup(a, title)
+}
+
+fn is_attached() -> bool { return G_READY && G_OLD != 0 }
+
+// How many WM_GETOBJECT(UiaRootObjectId) the subclass has answered (a test sends one).
+fn getobject_count() -> u64 { return G_COUNT }
+
+// Hook the native window `hwnd` (the window thread must call this). false = no UIA on this machine, or the thread
+// is an MTA.
+#[allow_escape]
+fn attach(a: *mut app.App, hwnd: u64, title: str) -> bool {
+    if hwnd == 0 {
+        return false
+    }
+    if G_OLD != 0 {
+        return true
+    }
+    if !setup(a, title) {
+        return false
+    }
+    // an STA for the window thread: UseComThreading marshals every UIA call here (S_OK / S_FALSE = fine)
+    let co: u64 = wgl.dll_sym("ole32.dll", "CoInitializeEx")
+    if co != 0 {
+        let hr: u64 = wgl.call2(co, 0, 2) & 4294967295
+        if hr != 0 && hr != 1 {
+            return false
+        }
+    }
+    G_HWND = hwnd
+    // GWLP_WNDPROC = -4
+    let old: u64 = wgl.call3(F_SETLONG, hwnd, 18446744073709551612, code_of4(uia_wndproc))
+    if old == 0 {
+        G_HWND = 0
+        return false
+    }
+    G_OLD = old
+    return true
+}
+
+// `app.set_window_hooks(a, a as u64, uiacom.opened, hotkey)`: the native window is open.
+fn opened(ud: u64, win: u64) {
+    let a: *mut app.App = ud as *mut app.App
+    let f: *mut window.Window = win as *mut window.Window
+    let ok: bool = attach(a, window.ime_handle(f), (*pv()).title)
+}
+
+fn no_hotkey(ud: u64, id: u32) {}
+
+// With FUI_UIA unset UIA is ON (a screen reader only costs a thing when it asks); FUI_UIA=0 turns it off.
+// Call before `app.run`.
+#[allow_escape]
+fn enable_from_env(a: *mut app.App, title: str) -> bool {
+    let v: str = env.get("FUI_UIA")
+    if v == "0" {
+        return false
+    }
+    if !setup(a, title) {
+        return false
+    }
+    app.set_window_hooks(a, a as u64, opened, no_hotkey)
+    return true
+}
