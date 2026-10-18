@@ -145,6 +145,10 @@ run_variant() { # abi:perm:density:font
     check "$tag: crash buffer + logcat free of fatal lines" "$(fatal_lines | wc -l)" 0
     fatal_lines | sed 's/^/        /'
     echo "  stage file: $(stage_file)"
+    # evidence: the app's own log, the logcat of the run, ANR traces
+    $ADB logcat -d -v threadtime 2>/dev/null | grep -E "$PKG|firn|ANR|FATAL|DEBUG" | tail -400 >"$OUT/${tag}.logcat.txt"
+    $ADB shell "cat \$(ls -t \$(find /data/data/$PKG /sdcard/Android/data/$PKG -name 'app.log' 2>/dev/null) 2>/dev/null | head -1) 2>/dev/null" | tail -150 >"$OUT/${tag}.app.log" 2>/dev/null
+    $ADB shell "ls /data/anr 2>/dev/null | head -3; for f in /data/anr/*; do [ -f \"\$f\" ] && head -60 \"\$f\" | grep -E 'pid|sysTid|prio|Cmd line|\\\"main\\\"|at ' | head -40; done" 2>/dev/null >"$OUT/${tag}.anr.txt"
     $ADB shell am force-stop $PKG
 }
 
