@@ -20,6 +20,8 @@ export {
     insets_clamp, insets_minus_content, insets_same, insets_from_ints, DISPLAY_CUTOUT_MASK, INSET_TYPES_ALL,
     // W45-d: THE MONITOR OF THE WINDOW
     MONITORS_MAX, le32, le16s, monitorinfo_parse, randr_monitors_parse, monitor_pick, area_clip, insets_on_monitor,
+    // W47-b (r386): THE BARS OF ONE MONITOR from the clients' struts (_NET_WM_STRUT_PARTIAL / _NET_WM_STRUT)
+    STRUTS_MAX, STRUT_FAR, strut_parse, strut_insets, insets_on_monitor_struts,
 }
 
 // A text scale outside this range is a broken setting, not a wish (Windows allows 100..225 %, GNOME 0.5..3.0).
@@ -375,14 +377,14 @@ fn monitorinfo_parse(p: u64, n: usize, mon: *mut [i64; 4], work: *mut [i64; 4]) 
     return true
 }
 
-// The reply of RandR 1.5 GetMonitors (minor opcode 42): 32 byte header (nMonitors at 8), then per monitor 24 bytes (name atom 4,
-// primary 1, automatic 1, nOutput 2, x 2, y 2, width 2, height 2, mm 4+4) + 4 bytes per output. out = x, y, w, h per monitor, at
+// The reply of RandR 1.5 GetMonitors (minor opcode 42): 32 byte header (timestamp at 8, nMonitors at 12 -- W47-b fixed: it was read at 8, the timestamp, so a live server's reply gave none), then per monitor 24 bytes (name atom 4,
+// primary 1, automatic 1, nOutput 2 at 6, x 2 at 8, y 2 at 10, width 2 at 12, height 2 at 14, mm 4+4) + 4 bytes per output. out = x, y, w, h per monitor, at
 // most MONITORS_MAX. Returns how many were read; 0 = not a usable reply.
 fn randr_monitors_parse(p: u64, n: usize, out: *mut [i64; 32]) -> usize {
     if n < 32 || rt.ld8(p, 0) != 1 as u8 {
         return 0
     }
-    let cnt: i64 = le32(p, 8)
+    let cnt: i64 = le32(p, 12)
     if cnt <= 0 || cnt > 64 {
         return 0
     }
@@ -393,11 +395,11 @@ fn randr_monitors_parse(p: u64, n: usize, out: *mut [i64; 32]) -> usize {
         if at + 24 > n {
             break
         }
-        let nout: usize = (rt.ld8(p, at + 10) as usize) | ((rt.ld8(p, at + 11) as usize) << 8)
-        let x: i64 = le16s(p, at + 12)
-        let y: i64 = le16s(p, at + 14)
-        let w: i64 = (rt.ld8(p, at + 16) as i64) | ((rt.ld8(p, at + 17) as i64) << 8)
-        let h: i64 = (rt.ld8(p, at + 18) as i64) | ((rt.ld8(p, at + 19) as i64) << 8)
+        let nout: usize = (rt.ld8(p, at + 6) as usize) | ((rt.ld8(p, at + 7) as usize) << 8)
+        let x: i64 = le16s(p, at + 8)
+        let y: i64 = le16s(p, at + 10)
+        let w: i64 = (rt.ld8(p, at + 12) as i64) | ((rt.ld8(p, at + 13) as i64) << 8)
+        let h: i64 = (rt.ld8(p, at + 14) as i64) | ((rt.ld8(p, at + 15) as i64) << 8)
         if w > 0 && h > 0 && k < MONITORS_MAX {
             (*out)[k * 4] = x
             (*out)[k * 4 + 1] = y
@@ -493,4 +495,133 @@ fn insets_on_monitor(list: *mut [i64; 32], cnt: usize, wx: i64, wy: i64, ww: i64
         wa[3] = (*list)[(k as usize) * 4 + 3]
     }
     return insets_overlap(wx, wy, ww, wh, wa[0], wa[1], wa[2], wa[3], out)
+}
+
+// ---- W47-b (r386): the bars of ONE monitor, from the struts of the top-level clients ------------------------------------------
+// X11 _NET_WORKAREA is ONE rectangle for all monitors: a panel on monitor B only shrinks the rectangle for A as well. The honest
+// source is what each dock/panel reserves: _NET_WM_STRUT_PARTIAL = 12 CARDINALs (left, right, top, bottom, then the span along the
+// edge for each: left_start_y, left_end_y, right_start_y, right_end_y, top_start_x, top_end_x, bottom_start_x, bottom_end_x) or the
+// old _NET_WM_STRUT = 4 CARDINALs (left, right, top, bottom, the whole edge). All values are measured from the edge of the SCREEN
+// (the root window, all monitors together), NOT from the monitor: a left strut of 40 does not touch a monitor that starts at x=1920.
+
+const STRUTS_MAX: usize = 32
+const STRUT_FAR: i64 = 2147483647
+
+// One strut property value (p[0..n], 32 bit little-endian CARDINALs) as 12 numbers into list[k*12 ..]. 12 values = PARTIAL, 4 or
+// more = the old form (spans = the whole edge). A strut SIZE that is negative or absurd (> 65535) refuses the whole property; spans are unsigned.
+// false = not a strut (too short, bad number, all four sizes zero, k out of range); nothing is written then.
+fn strut_parse(p: u64, n: usize, list: *mut [i64; 384], k: usize) -> bool {
+    if k >= STRUTS_MAX || n < 16 {
+        return false
+    }
+    var v: [i64; 12] = [0; 12]
+    var i: usize = 0
+    let partial: bool = n >= 48
+    var cnt: usize = 4
+    if partial { cnt = 12 }
+    while i < cnt {
+        v[i] = le32(p, i * 4)
+        if i >= 4 && v[i] < 0 {
+            // a span end of 0xFFFFFFFF ("to the end") is unsigned
+            v[i] = v[i] + 4294967296
+        }
+        if i < 4 && (v[i] < 0 || v[i] > 65535) {
+            return false
+        }
+        i = i + 1
+    }
+    if v[0] == 0 && v[1] == 0 && v[2] == 0 && v[3] == 0 {
+        // all zero = "no strut" (many ordinary windows set it): not kept, so it never hides the work area
+        return false
+    }
+    if !partial {
+        v[4] = 0
+        v[5] = STRUT_FAR
+        v[6] = 0
+        v[7] = STRUT_FAR
+        v[8] = 0
+        v[9] = STRUT_FAR
+        v[10] = 0
+        v[11] = STRUT_FAR
+    }
+    i = 0
+    while i < 12 {
+        (*list)[k * 12 + i] = v[i]
+        i = i + 1
+    }
+    return true
+}
+
+// Do the spans [a0, a1] and [b0, b1] (both inclusive) share a pixel?
+fn span_hits(a0: i64, a1: i64, b0: i64, b1: i64) -> bool {
+    return a0 <= b1 && a1 >= b0
+}
+
+// How far the struts of `cnt` clients (12 numbers each) cover the monitor (mx, my, mw, mh) of a screen sw x sh: out = left, top,
+// right, bottom, in pixels, the biggest of all clients per side. A strut counts only where its span meets the monitor's side and
+// it reaches into the monitor from the SCREEN edge. true = at least one side is covered.
+fn strut_insets(list: *mut [i64; 384], cnt: usize, sw: i64, sh: i64, mx: i64, my: i64, mw: i64, mh: i64, out: *mut [i64; 4]) -> bool {
+    (*out)[0] = 0
+    (*out)[1] = 0
+    (*out)[2] = 0
+    (*out)[3] = 0
+    var any: bool = false
+    var k: usize = 0
+    while k < cnt && k < STRUTS_MAX {
+        let b: usize = k * 12
+        let l: i64 = (*list)[b]
+        let r: i64 = (*list)[b + 1]
+        let t: i64 = (*list)[b + 2]
+        let bo: i64 = (*list)[b + 3]
+        if l > 0 && span_hits((*list)[b + 4], (*list)[b + 5], my, my + mh - 1) {
+            var v: i64 = l - mx
+            if v > mw { v = mw }
+            if v > (*out)[0] { (*out)[0] = v }
+        }
+        if r > 0 && span_hits((*list)[b + 6], (*list)[b + 7], my, my + mh - 1) {
+            var v: i64 = (mx + mw) - (sw - r)
+            if v > mw { v = mw }
+            if v > (*out)[2] { (*out)[2] = v }
+        }
+        if t > 0 && span_hits((*list)[b + 8], (*list)[b + 9], mx, mx + mw - 1) {
+            var v: i64 = t - my
+            if v > mh { v = mh }
+            if v > (*out)[1] { (*out)[1] = v }
+        }
+        if bo > 0 && span_hits((*list)[b + 10], (*list)[b + 11], mx, mx + mw - 1) {
+            var v: i64 = (my + mh) - (sh - bo)
+            if v > mh { v = mh }
+            if v > (*out)[3] { (*out)[3] = v }
+        }
+        k = k + 1
+    }
+    if (*out)[0] > 0 || (*out)[1] > 0 || (*out)[2] > 0 || (*out)[3] > 0 {
+        any = true
+    }
+    return any
+}
+
+// The insets of a window (wx, wy, ww, wh) against the work area of ITS monitor, made of the struts that cover that monitor (the
+// monitor's rectangle minus `strut_insets`). Same output as `insets_overlap`. false = the window is on no monitor, or no monitors.
+fn insets_on_monitor_struts(list: *mut [i64; 32], cnt: usize, sw: i64, sh: i64, struts: *mut [i64; 384], ns: usize,
+    wx: i64, wy: i64, ww: i64, wh: i64, out: *mut [f64; 4]) -> bool {
+    (*out)[0] = 0.0
+    (*out)[1] = 0.0
+    (*out)[2] = 0.0
+    (*out)[3] = 0.0
+    let k: i64 = monitor_pick(list, cnt, wx, wy, ww, wh)
+    if k < 0 {
+        return false
+    }
+    let mx: i64 = (*list)[(k as usize) * 4]
+    let my: i64 = (*list)[(k as usize) * 4 + 1]
+    let mw: i64 = (*list)[(k as usize) * 4 + 2]
+    let mh: i64 = (*list)[(k as usize) * 4 + 3]
+    var si: [i64; 4] = [0; 4]
+    strut_insets(struts, ns, sw, sh, mx, my, mw, mh, &si)
+    var aw: i64 = mw - si[0] - si[2]
+    var ah: i64 = mh - si[1] - si[3]
+    if aw < 1 { aw = 1 }
+    if ah < 1 { ah = 1 }
+    return insets_overlap(wx, wy, ww, wh, mx + si[0], my + si[1], aw, ah, out)
 }
