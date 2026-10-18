@@ -152,6 +152,8 @@ struct Cx<'a> {
     inst_rets: HashMap<String, TypeExpr>,
     /// r742: an instance was recorded while inferring `apply(id, 4)` -> expand again
     pending: bool,
+    /// r750: next free ExprId (bound method values build new expressions)
+    next: u32,
     dg: &'a mut Diags,
 }
 
@@ -167,15 +169,82 @@ fn declare(cx: &mut Cx, n: &str, t: Option<TypeExpr>) {
     }
 }
 
+fn strip(t: TypeExpr) -> TypeExpr {
+    match t {
+        TypeExpr::Ptr { inner, .. } => strip(*inner),
+        t => t,
+    }
+}
+
+fn mkx(cx: &mut Cx, span: Span, kind: ExprKind) -> Expr {
+    let id = cx.next;
+    cx.next += 1;
+    Expr { id, span, kind }
+}
+
+/// r750: `x.m` (a method of `x`'s struct, no call) -> the closure
+/// `gc |a0, ..| x.m(a0, ..)`; the record captures the receiver pointer `x`.
+/// `None` = `e` is no bound method; `Some(None)` = error reported.
+fn bound_method(cx: &mut Cx, e: &Expr) -> Option<Option<Expr>> {
+    let (inner, m) = match &e.kind {
+        ExprKind::Field(i, m, _) => (i, m.clone()),
+        _ => return None,
+    };
+    let recv_t = expr_ty(cx, inner)?;
+    let is_ptr = matches!(recv_t, TypeExpr::Ptr { .. });
+    let s = match strip(recv_t) {
+        TypeExpr::Named(s, _) => s,
+        _ => return None,
+    };
+    if cx.fields.get(&s).map_or(false, |fs| fs.contains_key(&m)) {
+        return None;
+    }
+    let f = format!("{}__{}", s, m);
+    if !cx.methods.contains(&f) {
+        return None;
+    }
+    let name = match &inner.kind {
+        ExprKind::Ident(n) if !n.contains('.') => n.clone(),
+        _ => {
+            cx.dg.error_note(
+                e.span,
+                format!("method '{}' of '{}' used as a value: the receiver must be a plain variable", m, s),
+                "bind the receiver first: `let r = <expr>` and write `try r.m`",
+            );
+            return Some(None);
+        }
+    };
+    if !is_ptr {
+        cx.dg.error_note(
+            e.span,
+            format!("method '{}' of '{}' used as a value: the receiver '{}' is not a pointer", m, s, name),
+            "the closure captures one word; pass a pointer (`p: *mut T`) or a Gc[T], or write `Type.m` (receiver as first argument)",
+        );
+        return Some(None);
+    }
+    let ptys = cx.sigs.get(&f)?.clone();
+    let ret = cx.rets.get(&f).cloned();
+    let sp = e.span;
+    let mut params: Vec<Param> = Vec::new();
+    let mut args: Vec<Expr> = vec![(**inner).clone()];
+    for (i, t) in ptys.iter().skip(1).enumerate() {
+        let pn = format!("__bm_a{}", i);
+        params.push(Param { name: pn.clone(), ty: t.clone(), span: sp, refk: 0, default: None });
+        args.push(mkx(cx, sp, ExprKind::Ident(pn)));
+    }
+    let call = mkx(cx, sp, ExprKind::Call(format!("{}{}", crate::impls::P_CALL, m), args, sp));
+    let stmt = match ret {
+        Some(_) => Stmt::Return { value: Some(call), span: sp },
+        None => Stmt::Expr(call),
+    };
+    let body = Block { stmts: vec![stmt], span: sp, end: sp };
+    let d = LambdaDecl { id: crate::fnval::next_lambda_id(), heap: true, params, ret, body, span: sp };
+    Some(Some(mkx(cx, sp, ExprKind::Lambda(Box::new(d)))))
+}
+
 /// The declared type of an assignment target / local, as far as it is
 /// evident without a type check (r740). `None` = unknown.
 fn expr_ty(cx: &Cx, e: &Expr) -> Option<TypeExpr> {
-    fn strip(t: TypeExpr) -> TypeExpr {
-        match t {
-            TypeExpr::Ptr { inner, .. } => strip(*inner),
-            t => t,
-        }
-    }
     match &e.kind {
         ExprKind::Ident(n) => match lookup(cx, n) {
             Some(t) => t,
@@ -342,6 +411,7 @@ fn round(prog: &mut Program, dg: &mut Diags, start: usize) -> bool {
         ret: None,
         inst_rets: HashMap::new(),
         pending: false,
+        next: prog.expr_count,
         dg,
     };
     for f in prog.funcs.iter_mut().skip(start) {
@@ -361,7 +431,9 @@ fn round(prog: &mut Program, dg: &mut Diags, start: usize) -> bool {
             want(&mut cx, &mut s.value, Some(&t));
         }
     }
-    cx.pending
+    let pending = cx.pending;
+    prog.expr_count = cx.next;
+    pending
 }
 
 fn block(cx: &mut Cx, b: &mut Block) {
@@ -434,6 +506,12 @@ fn want(cx: &mut Cx, e: &mut Expr, t: Option<&TypeExpr>) {
     match &mut e.kind {
         ExprKind::Call(n, args, _) if n == crate::errors::TRY_NAME && args.len() == 1 => {
             // `try gc |x| ..`: the lambda is the operand
+            // r750: `try x.m` -- bound method value
+            match bound_method(cx, &args[0]) {
+                Some(Some(lam)) => args[0] = lam,
+                Some(None) => return,
+                None => {}
+            }
             want(cx, &mut args[0], t);
         }
         ExprKind::Lambda(d) => resolve(cx, d, t, e.span),
@@ -446,8 +524,8 @@ fn want(cx: &mut Cx, e: &mut Expr, t: Option<&TypeExpr>) {
 ///   the type arguments come from that type (`apply(id, 4)`, `let f: fn(i32) -> i32 = id`,
 ///   struct field, `return`) -> the identifier becomes the instance name.
 /// * `Type.m` (method of a struct, no call) -> the plain function `Type__m`, whose
-///   first parameter is the receiver pointer. A BOUND receiver (`x.m` without a call)
-///   is not supported: error with a hint.
+///   first parameter is the receiver pointer.
+/// * r750: a BOUND receiver `try x.m` (x a pointer variable) -> `try gc |a..| x.m(a..)`.
 /// Returns true when `e` was rewritten or reported.
 fn value_rewrite(cx: &mut Cx, e: &mut Expr, t: Option<&TypeExpr>) -> bool {
     match &e.kind {
@@ -489,20 +567,27 @@ fn value_rewrite(cx: &mut Cx, e: &mut Expr, t: Option<&TypeExpr>) -> bool {
                     }
                 }
             }
-            // `x.m` without a call: a method, no field
-            if let Some(TypeExpr::Named(s, _)) = expr_ty(cx, inner).map(|t| match t {
-                TypeExpr::Ptr { inner, .. } => *inner,
-                t => t,
-            }) {
-                let has_field = cx.fields.get(&s).map_or(false, |fs| fs.contains_key(&m));
-                if !has_field && cx.methods.contains(&format!("{}__{}", s, m)) {
-                    cx.dg.error_note(
-                        e.span,
-                        format!("method '{}' of '{}' used as a value without a call", m, s),
-                        format!("a bound method value is not supported; write `{}.{}` (receiver passed as first argument) or a lambda: `|a| x.{}(a)`", s, m, m),
-                    );
+            // `x.m` without a call: a method, no field (r750: bound method value)
+            let payload = match t {
+                Some(TypeExpr::Named(n, _)) => crate::errors::pending_inner(n).map(|x| x.1),
+                _ => None,
+            };
+            match bound_method(cx, e) {
+                Some(Some(lam)) => {
+                    if payload.is_some() {
+                        *e = lam;
+                        walk(cx, e);
+                    } else {
+                        cx.dg.error_note(
+                            e.span,
+                            format!("method '{}' used as a value without a call needs `try`", m),
+                            "a bound method value allocates a closure record (type `AllocError!fn(..)`): write `try x.m`",
+                        );
+                    }
                     return true;
                 }
+                Some(None) => return true,
+                None => {}
             }
             false
         }
