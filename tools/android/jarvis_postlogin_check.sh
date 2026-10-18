@@ -141,8 +141,8 @@ run_variant() { # abi:perm:density:font
     # + chat socket open), without a tap on Reload. A slow network (4 s per answer) must not end in "No connection" either.
     curl -s -m 5 -X POST "http://127.0.0.1:$PORT/fake/net" -d '{"drop":1000000}' >/dev/null
     tap_word "Aufgaben" 1 1; tap_word "Neu laden" 1 1 2>/dev/null
-    check "$tag: REST dropped: the screen names the reason" "$(OCR_TRIES=20 wait_ocr ${tag}_08 'Keine Verbindung|Offline . Stand')" 1
-    note "reason on screen: $(ocr ${tag}_08 | grep -oE '(Keine Verbindung|Offline . Stand)[^|]{0,60}' | head -1)"
+    check "$tag: REST dropped: the screen names the reason" "$(OCR_TRIES=20 wait_ocr ${tag}_08 'Keine Verbindung|Offline . Stand')" 1 # english: ok
+    note "reason on screen: $(ocr ${tag}_08 | grep -oE '(Keine Verbindung|Offline . Stand)[^|]{0,60}' | head -1)" # english: ok
     check "$tag: REST dropped: app log has the failure line with the reason" "$(applog | grep -cE '\[?net\]? .*(connection closed|network error|timeout|server unreachable|no DNS)')" 1
     curl -s -m 5 -X POST "http://127.0.0.1:$PORT/fake/net" -d '{"drop":0,"delay_ms":4000}' >/dev/null
     check "$tag: network back (slow, 4 s): the list recovers alone" "$(OCR_TRIES=30 wait_ocr ${tag}_09 'Live')" 1

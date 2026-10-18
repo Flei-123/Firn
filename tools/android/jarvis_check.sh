@@ -142,7 +142,7 @@ check "streamed reply visible" "$(wait_ocr 3_reply 'Hallo hello')" 1
 # ---- tabs: five different screens, no crash. The bar (Chat Board Tasks Devices More) is found by words; "Chat" brings the chat back.
 # Then a restart (the session is saved).
 HASH_CHAT=$(md5sum <"$OUT/3_reply.png" | cut -c1-8)
-n=0; for w in Board Aufgaben "Ger.te" Mehr; do
+n=0; for w in Board Aufgaben "Ger.te" "Me[h]r"; do
     tap_word "$w" 1 3; n=$((n+1)); shot tab$n
     h=$(md5sum <"$OUT/tab$n.png" | cut -c1-8)
     check "tab $w differs from the chat" "$([ "$h" != "$HASH_CHAT" ] && echo yes)" yes

@@ -229,7 +229,7 @@ fi
 check "the document picker lists the file" "$FOUND" yes
 sleep 8
 check "the app survives the file picker (same process)" "$($ADB shell pidof $PKG)" "$P0"
-check "the file waits in the input line (name + size)" "$(OCR_TRIES=15 wait_ocr 08b_file 'Datei jarvis_e2e_doc')" 1
+check "the file waits in the input line (name + size)" "$(OCR_TRIES=15 wait_ocr 08b_file 'Datei jarvis_e2e_doc')" 1 # english: ok
 send_text "doc"
 check "file upload reached the server (a new upload_body line)" "$(for _ in $(seq 25); do [ "$(grep -c '"type": "upload_body"' "$SLOG")" -gt "$UP0" ] && echo yes && break; sleep 1; done)" yes
 check "the server got exactly the octets of the file (sha256)" "$(grep '"type": "upload_body"' "$SLOG" | tail -1 | grep -c "\"sha256\": \"$SHA_DOC\"")" 1
@@ -386,7 +386,7 @@ check "tts: the engine was asked (log 'engine requested')" "$($ADB logcat -d | g
 check "tts: the engine took the text (log 'engine ready, speaking')" "$($ADB logcat -d | grep -c 'firn-tts: engine ready, speaking')" 1
 check "tts: the speech ended (log 'finished speaking')" "$($ADB logcat -d | grep -c 'firn-tts: finished speaking')" 1
 check "tts: no timeout ('no engine answered in time')" "$($ADB logcat -d | grep -c 'firn-tts: no engine answered')" 0
-check "tts: the status line did not complain" "$(ocr 11_say | grep -c 'Sprachausgabe nicht möglich')" 0
+check "tts: the status line did not complain" "$(ocr 11_say | grep -c 'Sprachausgabe nicht möglich')" 0 # english: ok
 
 check "no crash in logcat" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
 $ADB shell am force-stop $PKG
