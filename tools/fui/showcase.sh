@@ -67,6 +67,10 @@ done
 "$FIRNC" --opt-level=dev -o "$T/wave6" tools/fui/wave6_main.fi
 "$T/wave6" "$T/img" > /dev/null
 
+# WAVE 7 (lib/fui/wave7.fi): range slider -- light, dark
+"$FIRNC" --opt-level=dev -o "$T/wave7" tools/fui/wave7_main.fi
+"$T/wave7" "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/
