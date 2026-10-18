@@ -375,7 +375,7 @@ if n:
 # ---- 8. voice output without an engine -------------------------------------------------------------------------------------
 echo "== 8. voice output"
 tap_word "Voice" 1 2; shot 10_voice
-check "Voice switch shows 'Voice on'" "$(ocr_crop 10_voice 600 330 860 450 | grep -ci 'oice on')" 1
+check "Voice switch shows 'Voice on'" "$(ocr_crop 10_voice 330 320 660 440 | grep -ci 'oice on')" 1
 send_text "voicetest"
 check "the app lives after a spoken answer" "$(OCR_TRIES=12 wait_ocr 11_say 'Hallo voicetest')" 1
 check "app alive after voice output" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
