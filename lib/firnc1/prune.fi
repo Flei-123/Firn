@@ -1,0 +1,239 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/firnc1/prune.fi -- FIR level dead function pruning (r731).
+//
+// The port of `compiler/src/prune.rs` (`--prune-fir`, `FIRN_PRUNE_FIR=1`):
+// right after the lowering, every function that no root can reach is
+// dropped. `firnc1` has no optimizer, so the gain is in the code generator
+// and the assembler: a `hello` program pulls in several hundred functions
+// of the collector, the runtime and `std`.
+//
+// ROOTS (the same as `prune::root_names` + the loop in `prune::prune`):
+//   * `main`, every `#[interrupt]` function, every `#[export_c]` function
+//   * the collector init `gc_init` (`_start` calls it)
+//   * the `#[panic_handler]`
+//   * the targets of all method tables (`<prefix>__<method>`)
+// EDGES: `call`, `fnref`, the thread entry on a `spawn`, and every `_F1.name`
+// that an inline asm template spells.
+//
+// Opt-in (`FIRN_PRUNE_FIR=1`, decided by the driver) and only for hosted
+// executables: the driver does not call this for `-c` / the kernel profile.
+// Without the switch nothing changes -- the output stays byte-identical.
+
+import rt
+import vec
+import intern
+import fir
+import iface
+import ast
+
+export { prune_fir }
+
+const NONE: u32 = 4294967295
+
+// Function index of the interned name `nr` (a signed result of
+// `intern_find`), or NONE.
+fn lookup(idx: *mut Vec[u32], nr: i64) -> u32 {
+    if nr < 0 {
+        return NONE
+    }
+    if nr as usize >= vec_len[u32](idx) {
+        return NONE
+    }
+    return vec_at[u32](idx, nr as usize)
+}
+
+fn lookup_bytes(idx: *mut Vec[u32], it: *mut intern.Interner, p: u64, n: usize) -> u32 {
+    return lookup(idx, intern.intern_find(it, p, n))
+}
+
+fn mark(keep: *mut Vec[u32], stack: *mut Vec[u32], i: u32) {
+    if i == NONE {
+        return
+    }
+    if vec_at[u32](keep, i as usize) == 0 as u32 {
+        vec_set[u32](keep, i as usize, 1 as u32)
+        vec_push[u32](stack, i)
+    }
+}
+
+// Is `c` a character of an assembler identifier (prune.rs::idents)?
+fn word(c: u8) -> bool {
+    if c >= 97 as u8 && c <= 122 as u8 {
+        return true
+    }
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return true
+    }
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return true
+    }
+    return c == 95 as u8 || c == 46 as u8 || c == 36 as u8
+}
+
+// Marks the functions an inline asm template names. The code generator
+// spells a function `_F1.<name>` (a `#` in the name becomes a dot), so that
+// is what is looked for -- a template that wants to call a Firn function has
+// to write exactly that.
+fn asm_refs(idx: *mut Vec[u32], it: *mut intern.Interner, f: *mut fir.Fir,
+        keep: *mut Vec[u32], stack: *mut Vec[u32], nr: u32) {
+    let p: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    var i: usize = 0
+    while i < n {
+        if !word(rt.ld8(p, i)) {
+            i = i + 1
+            continue
+        }
+        let st: usize = i
+        while i < n && word(rt.ld8(p, i)) {
+            i = i + 1
+        }
+        // `_F1.` + at least one character
+        if i - st > 4 && rt.ld8(p, st) == 95 as u8 && rt.ld8(p, st + 1) == 70 as u8
+            && rt.ld8(p, st + 2) == 49 as u8 && rt.ld8(p, st + 3) == 46 as u8 {
+            let want: usize = i - st - 4
+            var fi: u32 = 0
+            while fi < fir.fn_count(f) as u32 {
+                let nm: u32 = fir.f_name_of(f, fi)
+                if intern.intern_length(it, nm) == want {
+                    let q: u64 = intern.intern_ptr(it, nm)
+                    var same: bool = true
+                    var k: usize = 0
+                    while k < want {
+                        var ch: u8 = rt.ld8(q, k)
+                        if ch == 35 as u8 {
+                            ch = 46 as u8
+                        }
+                        if ch != rt.ld8(p, st + 4 + k) {
+                            same = false
+                            break
+                        }
+                        k = k + 1
+                    }
+                    if same {
+                        mark(keep, stack, fi)
+                    }
+                }
+                fi = fi + 1
+            }
+        }
+    }
+}
+
+// Marks everything function `fi` reaches directly.
+fn scan(idx: *mut Vec[u32], it: *mut intern.Interner, f: *mut fir.Fir, fi: u32,
+        keep: *mut Vec[u32], stack: *mut Vec[u32], spawn: u32) {
+    var bb: u32 = 0
+    while bb < fir.block_count(f, fi) {
+        var n: u32 = 0
+        while n < fir.inst_count(f, fi, bb) {
+            let i: u32 = fir.inst_at(f, fi, bb, n)
+            let kind: u32 = fir.i_kind_of(f, i)
+            if kind == fir.O_CALL || kind == fir.O_FNREF {
+                mark(keep, stack, lookup(idx, fir.i_a_of(f, i) as i64))
+            }
+            if kind == fir.O_SPAWN {
+                mark(keep, stack, spawn)
+            }
+            if kind == fir.O_ASM {
+                asm_refs(idx, it, f, keep, stack, fir.i_a_of(f, i))
+            }
+            n = n + 1
+        }
+        bb = bb + 1
+    }
+}
+
+// Drops the unreachable functions of `f`; returns how many were dropped.
+// `tree` (the AST, for `#[export_c]` and the panic handler) and `ifr` (the
+// method tables) may be 0.
+fn prune_fir(f: *mut fir.Fir, it: *mut intern.Interner, tree: u64, ifr: u64) -> usize {
+    let n: usize = fir.fn_count(f)
+    let cnt: usize = intern.intern_count(it)
+    // interned name -> function index
+    var idx: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&idx)
+    var q: usize = 0
+    while q < cnt {
+        vec_push[u32](&idx, NONE)
+        q = q + 1
+    }
+    var fi: u32 = 0
+    while (fi as usize) < n {
+        let nm: u32 = fir.f_name_of(f, fi)
+        if (nm as usize) < cnt && vec_at[u32](&idx, nm as usize) == NONE {
+            vec_set[u32](&idx, nm as usize, fi)
+        }
+        fi = fi + 1
+    }
+    var keep: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&keep)
+    var stack: Vec[u32] = vec_new[u32]()
+    defer vec_free[u32](&stack)
+    q = 0
+    while q < n {
+        vec_push[u32](&keep, 0 as u32)
+        q = q + 1
+    }
+
+    // --- roots
+    var s_main: [u8; 4] = "main"
+    var s_init: [u8; 7] = "gc_init"
+    var s_entry: [u8; 14] = "__thread_entry"
+    mark(&keep, &stack, lookup_bytes(&idx, it, (&s_main[0]) as u64, 4))
+    mark(&keep, &stack, lookup_bytes(&idx, it, (&s_init[0]) as u64, 7))
+    let spawn: u32 = lookup_bytes(&idx, it, (&s_entry[0]) as u64, 14)
+    fi = 0
+    while (fi as usize) < n {
+        if fir.f_int_of(f, fi) == 1 {
+            mark(&keep, &stack, fi)
+        }
+        fi = fi + 1
+    }
+    if tree != 0 {
+        let b: *mut ast.Tree = tree as *mut ast.Tree
+        var a: usize = 0
+        while a < ast.fn_count(b) {
+            if ast.fn_export(b, a) != 0 {
+                mark(&keep, &stack, lookup(&idx, ast.fn_name(b, a) as i64))
+            }
+            a = a + 1
+        }
+        let ph: u32 = ast.panic_handler(b)
+        if ph != ast.NOTHING {
+            mark(&keep, &stack, lookup(&idx, ph as i64))
+        }
+    }
+    if ifr != 0 {
+        let g: *mut iface.If = ifr as *mut iface.If
+        var tb: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&tb)
+        var u: usize = 0
+        while u < iface.if_u_count(g) {
+            if iface.if_u_ok(g, u) && iface.if_u_sidx(g, u) != NONE {
+                let ii: u32 = iface.if_index(g, iface.if_u_if(g, u))
+                let pfx: u32 = iface.if_u_pre(g, u)
+                var k: u32 = 0
+                while k < iface.if_mlen(g, ii as usize) {
+                    // <prefix>__<method>, the symbol the table names
+                    rt.buf_clear(&tb)
+                    rt.buf_push_bytes(&tb, intern.intern_ptr(it, pfx), intern.intern_length(it, pfx))
+                    rt.buf_push(&tb, 95 as u8)
+                    rt.buf_push(&tb, 95 as u8)
+                    let mn: u32 = iface.if_mname(g, ii as usize, k)
+                    rt.buf_push_bytes(&tb, intern.intern_ptr(it, mn), intern.intern_length(it, mn))
+                    mark(&keep, &stack, lookup_bytes(&idx, it, rt.buf_ptr(&tb), rt.buf_len(&tb)))
+                    k = k + 1
+                }
+            }
+            u = u + 1
+        }
+    }
+
+    // --- reachability
+    while vec_len[u32](&stack) > 0 {
+        let cur: u32 = vec_pop[u32](&stack)
+        scan(&idx, it, f, cur, &keep, &stack, spawn)
+    }
+    return fir.fn_retain(f, &keep)
+}
