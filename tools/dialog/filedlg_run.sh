@@ -88,11 +88,12 @@ if [ "$WHAT" = timing ] || [ "$WHAT" = all ]; then
   # Still over the limit while the load is above FUI_PERF_LOAD_SKIP (default 16): not counted, like the perfgate.
   ok=0
   for try in 1 2 3 4 5; do
-    # The exit code of this build is NOT judged: the logic checks are the job of the unoptimised run above (a rare flake
-    # of the release-fast build is on the roadmap, it was invisible before because this run only reads the timings).
+    # The exit code of this build IS judged again (r379: the one flake was a crumb row that filled the whole bar for
+    # an unlucky temp folder name -- fixed in filedlg.fi, FREE_PTS). A logic failure is never "noise".
     if ! "$D/filedlg_fast" "$D/tree" > "$D/timing$try.txt"; then
-      echo "  NOTE  the release-fast build reported a logic failure (timing only run):"
+      echo "  WRONG  the release-fast build reported a failure:"
       grep 'WRONG' "$D/timing$try.txt" | head -5
+      rc=1
     fi
     echo "-- run $try"
     grep 'FRAME_MS\|NAV_MS\|FILEDLG' "$D/timing$try.txt"
