@@ -614,7 +614,12 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             let target = imp.path.last().cloned().unwrap_or_default();
             let at = files.iter().position(|g| module_name(g) == target);
             let module_is_kernel = at.map(|i| declares_kernel[i]).unwrap_or(false);
-            crate::prof::hook_import(dg, &imp.path, imp.span, module_is_kernel);
+            // r736: imports INSIDE a std module (std.io -> rt/str/num/textfmt) are not
+            // reported again: the importing user line already got its one error.
+            let importer_is_std = f.path.parent().and_then(|d| d.file_name()).map(|n| n == "std").unwrap_or(false);
+            if !importer_is_std {
+                crate::prof::hook_import(dg, &imp.path, imp.span, module_is_kernel);
+            }
             let known = at.is_some();
             if !known {
                 dg.error(
