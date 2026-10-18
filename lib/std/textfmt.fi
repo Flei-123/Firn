@@ -22,13 +22,13 @@
 // marks count 1 each, as Python's format does). (T2) `fixed` is exact for
 // |x * 10^digits| < 2^64 and digits <= 15; beyond that (numbers above ~1e18) it
 // writes the shortest text of the double and appends zeros -- not exact. (T3) NaN is
-// "nan", infinities "inf" / "-inf" (padded like any other text). (T4) no thousands
-// separators, no exponent form, no `%g`.
+// "nan", infinities "inf" / "-inf" (padded like any other text). (T4) `sig_digits` (e/g forms) is exact for EVERY finite double (big number
+// expansion, half to even on the exact value); only `fixed` has the limit above.
 import std.rt
 import std.str
 import std.num
 
-export { put, pad_left, pad_right, fixed, pad_left_fixed, pad_left_i64, round_to, char_count }
+export { put, pad_left, pad_right, fixed, pad_left_fixed, pad_left_i64, round_to, char_count, sig_digits }
 
 fn put(out: *mut rt.Buf, s: str) {
     rt.buf_push_bytes(out, s.p as u64, s.n)
@@ -280,4 +280,161 @@ fn round_to(x: f64, digits: usize) -> f64 {
         return r.value
     }
     return x
+}
+
+// ---------------------------------------------------------------- r699: e / g forms
+//
+// `sig_digits` writes exactly `ndig` (>= 1) ASCII significant digits of |x|,
+// correctly rounded half to even on the EXACT decimal value of the double
+// (like C's printf and Python), and the decimal exponent of the first digit
+// (1234.5 -> "12345", exp10 = 3). x must be finite; 0 gives zeros, exp10 = 0.
+
+// limbs (u32, least significant first) at address lp, capacity 100: *= m
+fn limb_mul(lp: u64, n: usize, m: u32) -> usize {
+    var carry: u64 = 0
+    var i: usize = 0
+    while i < n {
+        let t: u64 = (rt.ld32(lp, i) as u64) * (m as u64) + carry
+        rt.st32(lp, i, (t & 4294967295) as u32)
+        carry = t >> 32
+        i = i + 1
+    }
+    var nn: usize = n
+    if carry != 0 && nn < 100 {
+        rt.st32(lp, nn, carry as u32)
+        nn = nn + 1
+    }
+    return nn
+}
+
+// limbs at lp /= 10^9 in place; returns the remainder, shrinks *n
+fn limb_div9(lp: u64, n: *mut usize) -> u32 {
+    var rem: u64 = 0
+    var i: usize = *n
+    while i > 0 {
+        i = i - 1
+        let cur: u64 = (rem << 32) | (rt.ld32(lp, i) as u64)
+        rt.st32(lp, i, (cur / 1000000000) as u32)
+        rem = cur % 1000000000
+    }
+    while *n > 0 && rt.ld32(lp, *n - 1) == 0 as u32 {
+        *n = *n - 1
+    }
+    return rem as u32
+}
+
+#[allow_fp]
+fn sig_digits(x: f64, ndig: usize, out: *mut rt.Buf, exp10: *mut i64) {
+    let bits: u64 = __bits(x)
+    let ex: u64 = (bits >> 52) & 2047
+    let frac: u64 = bits & 4503599627370495
+    var m: u64 = frac
+    var e: i64 = -1074
+    if ex > 0 {
+        m = frac | 4503599627370496
+        e = (ex as i64) - 1075
+    }
+    *exp10 = 0
+    if m == 0 {
+        fill_zero(out, ndig)
+        return
+    }
+    var limb: [u32; 100] = [0 as u32; 100]
+    let lp: u64 = (&limb[0]) as u64
+    limb[0] = (m & 4294967295) as u32
+    limb[1] = (m >> 32) as u32
+    var n: usize = 2
+    if limb[1] == 0 as u32 {
+        n = 1
+    }
+    var scale: i64 = 0
+    if e >= 0 {
+        var sh: i64 = e
+        while sh > 0 {
+            var s1: i64 = 31
+            if sh < 31 {
+                s1 = sh
+            }
+            n = limb_mul(lp, n, (1 as u32) << (s1 as u32))
+            sh = sh - s1
+        }
+    } else {
+        scale = 0 - e
+        var k: i64 = scale
+        while k >= 13 {
+            n = limb_mul(lp, n, 1220703125 as u32)
+            k = k - 13
+        }
+        var pw: u32 = 1
+        while k > 0 {
+            pw = pw * 5
+            k = k - 1
+        }
+        n = limb_mul(lp, n, pw)
+    }
+    // decimal digits, filled from the end of `dig`
+    var dig: [u8; 800] = [0 as u8; 800]
+    var pos: usize = 800
+    while n > 0 {
+        var r: u32 = limb_div9(lp, &n)
+        var q: usize = 0
+        while q < 9 {
+            pos = pos - 1
+            dig[pos] = (48 + (r % 10)) as u8
+            r = r / 10
+            q = q + 1
+        }
+    }
+    while pos < 799 && dig[pos] == 48 as u8 {
+        pos = pos + 1
+    }
+    let len: usize = 800 - pos
+    *exp10 = (len as i64) - 1 - scale
+    if len > ndig {
+        let rd: u8 = dig[pos + ndig]
+        var sticky: bool = false
+        var t: usize = pos + ndig + 1
+        while t < 800 {
+            if dig[t] != 48 as u8 {
+                sticky = true
+                break
+            }
+            t = t + 1
+        }
+        var up: bool = false
+        if rd > 53 as u8 {
+            up = true
+        } else if rd == 53 as u8 {
+            up = sticky || ((dig[pos + ndig - 1] - 48 as u8) % 2 as u8) == 1 as u8
+        }
+        if up {
+            var c: usize = ndig
+            var carry: bool = true
+            while carry && c > 0 {
+                c = c - 1
+                if dig[pos + c] == 57 as u8 {
+                    dig[pos + c] = 48 as u8
+                } else {
+                    dig[pos + c] = dig[pos + c] + 1 as u8
+                    carry = false
+                }
+            }
+            if carry {
+                dig[pos] = 49 as u8
+                *exp10 = *exp10 + 1
+            }
+        }
+    }
+    var have: usize = ndig
+    if len < ndig {
+        have = len
+    }
+    var i: usize = 0
+    while i < have {
+        rt.buf_push(out, dig[pos + i])
+        i = i + 1
+    }
+    if ndig > have {
+        fill_zero(out, ndig - have)
+    }
 }

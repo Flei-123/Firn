@@ -2605,9 +2605,14 @@ impl<'a> Parser<'a> {
             if i > text_of {
                 chain = self.interp_text(chain, sp, &chars[text_of..i], text_of);
             }
-            // Look for the closing '}'; nesting of '{' counts as an error.
+            // Look for the closing '}'. A '{' is an error in the expression;
+            // in the format spec (after the first `:`) one level of nested
+            // fields `{w}` / `{p}` is allowed.
             let mut j = i + 1;
             let mut too = false;
+            let mut depth: i32 = 0;
+            let mut in_spec = false;
+            let mut nest = false;
             while j < chars.len() {
                 // r664: a nested text literal inside the expression is
                 // skipped as a whole (it may hold braces).
@@ -2622,7 +2627,25 @@ impl<'a> Parser<'a> {
                     j += 1;
                     continue;
                 }
+                if !in_spec {
+                    if chars[j] == '(' || chars[j] == '[' {
+                        depth += 1;
+                    } else if chars[j] == ')' || chars[j] == ']' {
+                        depth -= 1;
+                    } else if chars[j] == ':' && depth == 0 {
+                        if chars.get(j + 1) == Some(&':') {
+                            j += 2;
+                            continue;
+                        }
+                        in_spec = true;
+                    }
+                }
                 if chars[j] == '{' {
+                    if in_spec && !nest {
+                        nest = true;
+                        j += 1;
+                        continue;
+                    }
                     self.dg.error(
                         sp,
                         "unbalanced brace in an interpolation: '{' inside the expression".to_string(),
@@ -2631,6 +2654,11 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 if chars[j] == '}' {
+                    if nest {
+                        nest = false;
+                        j += 1;
+                        continue;
+                    }
                     too = true;
                     break;
                 }
@@ -2713,31 +2741,27 @@ impl<'a> Parser<'a> {
     fn interp_expr(&mut self, chain: Expr, sp: Span, raw_all: &[char], of: usize) -> Expr {
         // r665: `{expr:spec}` -- split at the first `:` outside brackets,
         // quotes and `::`; the spec becomes ONE packed u64 literal.
+        // r699: `{x:{w}.{p}f}` -- nested width / precision fields are
+        // expressions merged at run time by `io.spec_dyn(spec, w, p)`.
         let mut raw: &[char] = raw_all;
         let mut spec: Option<u64> = None;
+        let mut wf: Option<(usize, usize)> = None;
+        let mut pf: Option<(usize, usize)> = None;
         if let Some(c) = crate::fmtspec::split_colon(raw_all) {
             raw = &raw_all[..c];
             match crate::fmtspec::parse_spec(&raw_all[c + 1..]) {
-                Ok(v) => spec = Some(v),
+                Ok(v) => {
+                    spec = Some(v.packed);
+                    wf = v.width_field.map(|(a, b)| (a + c + 1, b + c + 1));
+                    pf = v.prec_field.map(|(a, b)| (a + c + 1, b + c + 1));
+                }
                 Err(m) => {
                     self.dg.error(sp, format!("in a format spec of an interpolation: {}", m));
                     return chain;
                 }
             }
         }
-        // The positions are right when the fragment stands at its real place:
-        // pad lines and columns beforehand (strings are single line, so ONE
-        // line suffices).
-        let mut source = String::new();
-        for _ in 1..sp.line {
-            source.push('\n');
-        }
-        for _ in 0..sp.col + 1 + of as u32 {
-            source.push(' ');
-        }
-        source.extend(raw.iter());
-        let toks = crate::lexer::lex_file(&source, self.file, self.dg);
-        let expr = in_expr(&toks, self.dg, self.file, &self.modules, &mut self.next_id);
+        let expr = self.interp_sub(sp, raw, of);
         match expr {
             // ROUND 70 — NO `as i64` any more. Which builder step is right
             // depends on the TYPE of the expression, and only the type check
@@ -2751,7 +2775,24 @@ impl<'a> Parser<'a> {
                     ExprKind::Call("io.fmt_value".to_string(), vec![chain, e], sp),
                 ),
                 Some(v) => {
-                    let lit = self.mk(sp, ExprKind::Int(v as i128));
+                    let mut lit = self.mk(sp, ExprKind::Int(v as i128));
+                    if wf.is_some() || pf.is_some() {
+                        let mut args = vec![lit];
+                        for (field, none) in [(wf, 0i128), (pf, 99999i128)] {
+                            match field {
+                                Some((a, b)) => {
+                                    let fe = match self.interp_sub(sp, &raw_all[a..b], of + a) {
+                                        Some(x) => x,
+                                        None => return chain,
+                                    };
+                                    let ty = TypeExpr::Named("i64".to_string(), sp);
+                                    args.push(self.mk(sp, ExprKind::Cast(Box::new(fe), ty)));
+                                }
+                                None => args.push(self.mk(sp, ExprKind::Int(none))),
+                            }
+                        }
+                        lit = self.mk(sp, ExprKind::Call("io.spec_dyn".to_string(), args, sp));
+                    }
                     self.mk(
                         sp,
                         ExprKind::Call("io.fmt_spec".to_string(), vec![chain, e, lit], sp),
@@ -2760,6 +2801,23 @@ impl<'a> Parser<'a> {
             },
             None => chain,
         }
+    }
+
+    /// Lex and parse ONE expression out of a fragment of an interpolation.
+    fn interp_sub(&mut self, sp: Span, raw: &[char], of: usize) -> Option<Expr> {
+        // The positions are right when the fragment stands at its real place:
+        // pad lines and columns beforehand (strings are single line, so ONE
+        // line suffices).
+        let mut source = String::new();
+        for _ in 1..sp.line {
+            source.push('\n');
+        }
+        for _ in 0..sp.col + 1 + of as u32 {
+            source.push(' ');
+        }
+        source.extend(raw.iter());
+        let toks = crate::lexer::lex_file(&source, self.file, self.dg);
+        in_expr(&toks, self.dg, self.file, &self.modules, &mut self.next_id)
     }
 
     /// Help for the error message above: a span built from single parts.

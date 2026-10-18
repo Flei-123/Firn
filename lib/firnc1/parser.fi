@@ -2843,21 +2843,95 @@ fn fspec_align_code(c: u32) -> u64 {
     return 4
 }
 
+// One code point at byte `i` (UTF-8); `*len` gets its byte length (0 = invalid).
+fn fspec_cp(p: *mut Parser, k: usize, i: usize, to: usize, len: *mut usize) -> u32 {
+    let b0: u32 = lexer.lex_lit_byte(lx(p), k, i) as u32
+    *len = 0
+    if b0 < 128 {
+        *len = 1
+        return b0
+    }
+    var n: usize = 0
+    var cp: u32 = 0
+    if b0 >= 192 && b0 < 224 {
+        n = 2
+        cp = b0 & 31
+    } else if b0 >= 224 && b0 < 240 {
+        n = 3
+        cp = b0 & 15
+    } else if b0 >= 240 && b0 < 248 {
+        n = 4
+        cp = b0 & 7
+    } else {
+        return 0
+    }
+    if i + n > to {
+        return 0
+    }
+    var q: usize = 1
+    while q < n {
+        let c: u32 = lexer.lex_lit_byte(lx(p), k, i + q) as u32
+        if (c & 192) != 128 {
+            return 0
+        }
+        cp = (cp << 6) | (c & 63)
+        q = q + 1
+    }
+    *len = n
+    return cp
+}
+
+// Range of a nested `{...}` field starting at `i` (the `{`): inner start / end.
+fn fspec_field(p: *mut Parser, k: usize, i: usize, to: usize, a: *mut usize, b: *mut usize) -> bool {
+    var j: usize = i + 1
+    while j < to && (lexer.lex_lit_byte(lx(p), k, j) as u32) != 125 {
+        if (lexer.lex_lit_byte(lx(p), k, j) as u32) == 123 {
+            return false
+        }
+        j = j + 1
+    }
+    if j >= to || j == i + 1 {
+        return false
+    }
+    *a = i + 1
+    *b = j
+    return true
+}
+
+// Source ranges of the nested width / precision fields (from == to: none).
+struct FSpecF {
+    wa: usize,
+    wb: usize,
+    pa: usize,
+    pb: usize,
+}
+
 // The same grammar and packing as compiler/src/fmtspec.rs::parse_spec.
-fn fspec_parse(p: *mut Parser, k: usize, from: usize, to: usize, out: *mut u64) -> bool {
+fn fspec_parse(p: *mut Parser, k: usize, from: usize, to: usize, out: *mut u64, fr: *mut FSpecF) -> bool {
     var i: usize = from
     var fill: u64 = 32
     var fill_set: bool = false
     var align: u64 = 0
-    if to - from >= 2 && fspec_is_align(lexer.lex_lit_byte(lx(p), k, from + 1) as u32) {
-        let f0: u32 = lexer.lex_lit_byte(lx(p), k, from) as u32
-        if f0 >= 128 {
+    (*fr).wa = 0
+    (*fr).wb = 0
+    (*fr).pa = 0
+    (*fr).pb = 0
+    var c0len: usize = 0
+    var cp0: u32 = 0
+    if to > from {
+        cp0 = fspec_cp(p, k, from, to, &c0len)
+    }
+    if to > from && c0len == 0 {
+        return false
+    }
+    if to > from && from + c0len < to && fspec_is_align(lexer.lex_lit_byte(lx(p), k, from + c0len) as u32) {
+        if cp0 > 65535 {
             return false
         }
-        fill = f0 as u64
+        fill = cp0 as u64
         fill_set = true
-        align = fspec_align_code(lexer.lex_lit_byte(lx(p), k, from + 1) as u32)
-        i = from + 2
+        align = fspec_align_code(lexer.lex_lit_byte(lx(p), k, from + c0len) as u32)
+        i = from + c0len + 1
     } else if to > from && fspec_is_align(lexer.lex_lit_byte(lx(p), k, from) as u32) {
         align = fspec_align_code(lexer.lex_lit_byte(lx(p), k, from) as u32)
         i = from + 1
@@ -2889,43 +2963,74 @@ fn fspec_parse(p: *mut Parser, k: usize, from: usize, to: usize, out: *mut u64) 
         i = i + 1
     }
     var width: u64 = 0
-    while i < to {
-        let d: u32 = lexer.lex_lit_byte(lx(p), k, i) as u32
-        if d < 48 || d > 57 {
-            break
-        }
-        width = width * 10 + (d - 48) as u64
-        if width > 65535 {
+    if i < to && (lexer.lex_lit_byte(lx(p), k, i) as u32) == 123 {
+        var wa: usize = 0
+        var wb: usize = 0
+        if !fspec_field(p, k, i, to, &wa, &wb) {
             return false
         }
-        i = i + 1
-    }
-    var prec1: u64 = 0
-    if i < to && (lexer.lex_lit_byte(lx(p), k, i) as u32) == 46 {
-        i = i + 1
-        let start: usize = i
-        var pr: u64 = 0
+        (*fr).wa = wa
+        (*fr).wb = wb
+        i = wb + 1
+    } else {
         while i < to {
             let d: u32 = lexer.lex_lit_byte(lx(p), k, i) as u32
             if d < 48 || d > 57 {
                 break
             }
-            pr = pr * 10 + (d - 48) as u64
-            if pr > 65534 {
+            width = width * 10 + (d - 48) as u64
+            if width > 65535 {
                 return false
             }
             i = i + 1
         }
-        if i == start {
-            return false
+    }
+    if i < to && (lexer.lex_lit_byte(lx(p), k, i) as u32) == 44 {
+        flags = flags | 16384
+        i = i + 1
+    } else if i < to && (lexer.lex_lit_byte(lx(p), k, i) as u32) == 95 {
+        flags = flags | 32768
+        i = i + 1
+    }
+    var prec1: u64 = 0
+    if i < to && (lexer.lex_lit_byte(lx(p), k, i) as u32) == 46 {
+        i = i + 1
+        if i < to && (lexer.lex_lit_byte(lx(p), k, i) as u32) == 123 {
+            var pa: usize = 0
+            var pb: usize = 0
+            if !fspec_field(p, k, i, to, &pa, &pb) {
+                return false
+            }
+            (*fr).pa = pa
+            (*fr).pb = pb
+            prec1 = 1
+            i = pb + 1
+        } else {
+            let start: usize = i
+            var pr: u64 = 0
+            while i < to {
+                let d: u32 = lexer.lex_lit_byte(lx(p), k, i) as u32
+                if d < 48 || d > 57 {
+                    break
+                }
+                pr = pr * 10 + (d - 48) as u64
+                if pr > 65534 {
+                    return false
+                }
+                i = i + 1
+            }
+            if i == start {
+                return false
+            }
+            prec1 = pr + 1
         }
-        prec1 = pr + 1
     }
     var ty: u64 = 0
     if i < to {
         let c: u32 = lexer.lex_lit_byte(lx(p), k, i) as u32
-        // d x X o b f F s %
-        if c != 100 && c != 120 && c != 88 && c != 111 && c != 98 && c != 102 && c != 70 && c != 115 && c != 37 {
+        // d x X o b f F e E g G c n s %
+        if c != 100 && c != 120 && c != 88 && c != 111 && c != 98 && c != 102 && c != 70 && c != 115 && c != 37
+        && c != 101 && c != 69 && c != 103 && c != 71 && c != 99 && c != 110 {
             return false
         }
         ty = c as u64
@@ -2934,28 +3039,12 @@ fn fspec_parse(p: *mut Parser, k: usize, from: usize, to: usize, out: *mut u64) 
     if i < to {
         return false
     }
-    *out = fill | (align << 8) | flags | (width << 16) | (prec1 << 32) | (ty << 48)
+    *out = (fill & 255) | (align << 8) | flags | (width << 16) | (prec1 << 32) | (ty << 48) | ((fill >> 8) << 56)
     return true
 }
 
-// An expression segment: lex the fragment again, parse ONE expression from
-// it with a copy of the parser (same tree, same registries, same intern
-// table, same local names) and append it to the chain as
-// `io.fmt_number(chain, (expr) as i64)`.
-fn interp_expr(p: *mut Parser, chain: u32, io_nr: u32, k: usize, of: usize, to_all: usize) -> u32 {
-    // r665: `{expr:spec}` -- split at the first `:` outside brackets, quotes and `::`
-    var to: usize = to_all
-    var has_spec: bool = false
-    var spec: u64 = 0
-    let colon: usize = fspec_split(p, k, of, to_all)
-    if colon < to_all {
-        to = colon
-        has_spec = true
-        if !fspec_parse(p, k, colon + 1, to_all, &spec) {
-            complain(p)
-            return chain
-        }
-    }
+// Lex + parse ONE expression out of the literal bytes [of, to); NOTHING on error.
+fn interp_sub(p: *mut Parser, k: usize, of: usize, to: usize) -> u32 {
     var source: rt.Buf = rt.buf_new()
     defer rt.buf_free(&source)
     var i: usize = of
@@ -2971,7 +3060,7 @@ fn interp_expr(p: *mut Parser, chain: u32, io_nr: u32, k: usize, of: usize, to_a
     if lexer.lex_error(&l2) > 0 {
         complain(p)
         lexer.lex_free(&l2)
-        return chain
+        return ast.NOTHING
     }
     // The copy shares everything that expressions need (tree, registries,
     // modules, local names); `interp = 1` blocks nesting.
@@ -2996,6 +3085,32 @@ fn interp_expr(p: *mut Parser, chain: u32, io_nr: u32, k: usize, of: usize, to_a
     lexer.lex_free(&l2)
     if !whole {
         complain(p)
+        return ast.NOTHING
+    }
+    return e
+}
+
+// An expression segment: lex the fragment again, parse ONE expression from
+// it with a copy of the parser (same tree, same registries, same intern
+// table, same local names) and append it to the chain as
+// `io.fmt_number(chain, (expr) as i64)`.
+fn interp_expr(p: *mut Parser, chain: u32, io_nr: u32, k: usize, of: usize, to_all: usize) -> u32 {
+    // r665: `{expr:spec}` -- split at the first `:` outside brackets, quotes and `::`
+    var to: usize = to_all
+    var has_spec: bool = false
+    var spec: u64 = 0
+    var fr: FSpecF = FSpecF { wa: 0, wb: 0, pa: 0, pb: 0 }
+    let colon: usize = fspec_split(p, k, of, to_all)
+    if colon < to_all {
+        to = colon
+        has_spec = true
+        if !fspec_parse(p, k, colon + 1, to_all, &spec, &fr) {
+            complain(p)
+            return chain
+        }
+    }
+    let e: u32 = interp_sub(p, k, of, to)
+    if e == ast.NOTHING {
         return chain
     }
     let it: *mut intern.Interner = lexer.lex_names(lx(p))
@@ -3006,7 +3121,37 @@ fn interp_expr(p: *mut Parser, chain: u32, io_nr: u32, k: usize, of: usize, to_a
     if has_spec {
         var sz: [u8; 8] = "fmt_spec"
         let spec_nr: u32 = qualify(p, io_nr, intern.intern_number(it, (&sz[0]) as u64, 8) as u32)
-        let slit: u32 = ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, spec)
+        var slit: u32 = ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, spec)
+        if fr.wb > fr.wa || fr.pb > fr.pa {
+            // r699: nested fields -> io.spec_dyn(spec, (w) as i64, (p) as i64)
+            var wexpr: u32 = ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+            var pexpr: u32 = ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 99999)
+            var i64s: [u8; 3] = "i64"
+            let i64_nr: u32 = intern.intern_number(it, (&i64s[0]) as u64, 3) as u32
+            if fr.wb > fr.wa {
+                let we: u32 = interp_sub(p, k, fr.wa, fr.wb)
+                if we == ast.NOTHING {
+                    return chain
+                }
+                let wt: u32 = ast.ty_new(par_tree(p), ast.T_NAME, i64_nr, 0)
+                wexpr = ast.expr_new(par_tree(p), ast.E_AS, we, wt, 0, 0)
+            }
+            if fr.pb > fr.pa {
+                let pe: u32 = interp_sub(p, k, fr.pa, fr.pb)
+                if pe == ast.NOTHING {
+                    return chain
+                }
+                let pt: u32 = ast.ty_new(par_tree(p), ast.T_NAME, i64_nr, 0)
+                pexpr = ast.expr_new(par_tree(p), ast.E_AS, pe, pt, 0, 0)
+            }
+            var dz: [u8; 8] = "spec_dyn"
+            let dyn_nr: u32 = qualify(p, io_nr, intern.intern_number(it, (&dz[0]) as u64, 8) as u32)
+            let doff: u32 = ast.child_start(par_tree(p))
+            ast.child_add(par_tree(p), slit)
+            ast.child_add(par_tree(p), wexpr)
+            ast.child_add(par_tree(p), pexpr)
+            slit = ast.expr_new(par_tree(p), ast.E_CALL, dyn_nr, doff, 3, 0)
+        }
         let soff: u32 = ast.child_start(par_tree(p))
         ast.child_add(par_tree(p), chain)
         ast.child_add(par_tree(p), e)
@@ -3072,6 +3217,9 @@ fn interpolation(p: *mut Parser) -> u32 {
         }
         var j: usize = i + 1
         var closed: bool = false
+        var depth: i32 = 0
+        var in_spec: bool = false
+        var nest: bool = false
         while j < n {
             let b2: u32 = lexer.lex_lit_byte(lx(p), k, j) as u32
             if b2 == 34 {
@@ -3086,12 +3234,35 @@ fn interpolation(p: *mut Parser) -> u32 {
                 j = j + 1
                 continue
             }
+            if !in_spec {
+                if b2 == 40 || b2 == 91 {
+                    depth = depth + 1
+                } else if b2 == 41 || b2 == 93 {
+                    depth = depth - 1
+                } else if b2 == 58 && depth == 0 {
+                    if j + 1 < n && (lexer.lex_lit_byte(lx(p), k, j + 1) as u32) == 58 {
+                        j = j + 2
+                        continue
+                    }
+                    in_spec = true
+                }
+            }
             if b2 == 123 {
-                // '{' inside the expression -- core version: no nesting
+                // r699: one level of nested `{w}` / `{p}` fields in the spec only
+                if in_spec && !nest {
+                    nest = true
+                    j = j + 1
+                    continue
+                }
                 complain(p)
                 break
             }
             if b2 == 125 {
+                if nest {
+                    nest = false
+                    j = j + 1
+                    continue
+                }
                 closed = true
                 break
             }

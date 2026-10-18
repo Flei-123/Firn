@@ -140,7 +140,7 @@ Effort S <1 day, M 1-3 days, L >3 days. Status `done` = landed on main in this r
 | G18 | P0 | lib | no HTTP client/server convenience | `net.web`, `http.server` listen/port | M | **done** |
 | G19 | P0 | lib | no drawing facade | `paint.draw` | S | **done** |
 | G20 | P0 | bug | `"a" + f"{n}"` accepted, wrong result / hang; `"" + s` aliased | `text.dup` (done); type error for `str + Fmt` | S | dup **done**, Fmt check: vspy-fnc |
-| G21 | P1 | language | f-string format spec: DONE `{x:>6}` `{x:.2f}` `{n:05}` `{n:x}` `{x:.1%}` (r665, firnc0+firnc1; no `,`/`e`/`g`); `{{` + nested quotes done (r664) | spec -> `io.fmt_spec_*` | M | **done** (tools/fmtspec_cross: 0 diffs vs Python); open: thousands `,`, `g`/`e` |
+| G21 | P1 | language | f-string format spec: DONE `{x:>6}` `{x:.2f}` `{n:05}` `{n:x}` `{x:.1%}` (r665) + `,` `_` `e E g G c n`, nested `{w}`/`{p}`, BMP fill (r699), firnc0+firnc1; `{{` + nested quotes done (r664) | spec -> `io.fmt_spec_*` | M | **done** (tools/fmtspec_cross: 0 diffs vs Python); open: `!r`, `f` beyond 2^64 |
 | G22 | P1 | language | `for (i, x) in enumerate(v)` and `for (x, y) in zip(a, b)` DONE (r666, firnc0+firnc1); no comprehension, no general tuple patterns in `for` | comprehension syntax later | M | enumerate/zip **done**; open: comprehensions, `for (a, b) in vec_of_tuples` |
 | G23 | P1 | language | no `Option[T]` (generic enums not possible) | generic enums + `Option[T]` + `?` | L | open |
 | G24 | P1 | language | capturing closures only as `gc fn` (+`try`); timers/sort keys need ctx struct | stack closures for non-escaping use | L | open |

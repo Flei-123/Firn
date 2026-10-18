@@ -1607,7 +1607,7 @@ nested form yet), `tests/neg/fstring_plus_str.fi`. `firnc1` does not know the
 first two (tests carry `// firnc1_skip:`).
 
 **r665 (f-string format specs).** `f"{expr:spec}"` with Python's grammar
-`[[fill]align][sign][#][0][width][.precision][type]`; types `d x X o b f F s %`.
+`[[fill]align][sign][#][0][width][,|_][.precision][type]`; types `d x X o b f F e E g G c n s %`.
 Examples: `{x:.2f}` `{x:>8}` `{x:<8}` `{x:^8}` `{n:05}` `{n:x}` `{n:#06x}` `{x:08.2f}`
 `{x:+.1f}` `{x:.1%}` `{s:*^9}` `{s:.3}`. The parser splits at the first `:` outside
 `()`/`[]`, quotes and `::` and packs the spec into ONE `u64` literal
@@ -1617,9 +1617,16 @@ type of `x` to `io.fmt_spec_i/_u/_f64/_f32/_str/_bool` (library: `lib/std/io.fi`
 floats via the exact `std.textfmt.fixed`). Rules: width counts code points; numbers
 align right and strings left by default; `0` = fill `0` with `=` (zeros after the sign);
 an integer takes `f`/`%` too (as Python); an integer takes no precision without `f`,
-a float needs `f`/`%` for a precision (no `g`), a str takes only `s`/precision/width --
-all reported at compile time ("in a format spec of an interpolation: ..."). NOT
-supported: `,` `_` grouping, `e` `g` `c` `n`, non-ASCII fill, `{x!r}`, nested `{width}`.
+a float needs a type (`f e g %`) for a precision, a str takes only `s`/precision/width --
+all reported at compile time ("in a format spec of an interpolation: ...").
+r699 adds: thousands `,` / `_` (ints, floats; `_` also groups x X o b by 4; with the `0`
+fill the zeros are grouped too, as Python), `e E g G` (exact for every double:
+`std.textfmt.sig_digits`, big-number expansion, half to even), `c` (code point), `n`
+(= `d` / `g`, no locale), a BMP fill character (`{x:中^7}`), and nested width /
+precision fields `{x:{w}.{p}f}` (one level; each field is an integer expression,
+merged at run time by `io.spec_dyn(spec, w, p)`, no static spec check then).
+NOT supported: `{x!r}`, `#` on floats (kept point), fill outside the BMP, `f` of values
+>= 2^64 * 10^-digits (inexact, use `e`/`g`), locale grouping.
 `firnc1` mirrors parser, type check and lowering. Proof: `tests/3920_fstring_spec.fi`,
 `tests/neg/fstring_spec_*.fi`, random comparison with Python `tools/fmtspec_cross/run.sh`.
 
