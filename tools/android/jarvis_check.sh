@@ -38,16 +38,17 @@ trap cleanup EXIT
 
 if [ -z "${SERIAL:-}" ]; then
     AVDHOME=${ANDROID_AVD_HOME:-$HOME/.android/avd}
-    if [ ! -d "$AVDHOME/a4b.avd" ]; then # own copy: only the config, a fresh data partition
-        mkdir -p "$AVDHOME/a4b.avd"; sed 's/firn/a4b/g' "$AVDHOME/firn.avd/config.ini" >"$AVDHOME/a4b.avd/config.ini"
-        printf 'avd.ini.encoding=UTF-8\npath=%s/a4b.avd\npath.rel=avd/a4b.avd\ntarget=android-35\n' "$AVDHOME" >"$AVDHOME/a4b.ini"
+    AVD=${AVD:-a4b}
+    if [ ! -d "$AVDHOME/$AVD.avd" ]; then # own copy: only the config, a fresh data partition
+        mkdir -p "$AVDHOME/$AVD.avd"; sed "s/firn/$AVD/g" "$AVDHOME/firn.avd/config.ini" >"$AVDHOME/$AVD.avd/config.ini"
+        printf 'avd.ini.encoding=UTF-8\npath=%s/%s.avd\npath.rel=avd/%s.avd\ntarget=android-35\n' "$AVDHOME" "$AVD" "$AVD" >"$AVDHOME/$AVD.ini"
     fi
     # own adb server (port 5039): the emulator registers there, so other checks that run `adb` without a serial on the shared
     # server (port 5037) never see it, install nothing into it and cannot steal its screen
     ADB0="$ADB0 -P ${ADB_PORT:-5039}"; $ADB0 start-server >/dev/null 2>&1
-    ANDROID_ADB_SERVER_PORT=${ADB_PORT:-5039} ANDROID_SDK_ROOT=$SDK ANDROID_AVD_HOME=$AVDHOME "$SDK/emulator/emulator" -avd a4b -port 5590 -no-window -no-audio \
+    ANDROID_ADB_SERVER_PORT=${ADB_PORT:-5039} ANDROID_SDK_ROOT=$SDK ANDROID_AVD_HOME=$AVDHOME "$SDK/emulator/emulator" -avd $AVD -port ${EMU_PORT:-5590} -no-window -no-audio \
         -no-boot-anim -no-snapshot -wipe-data -gpu swiftshader_indirect >"$W/emu.log" 2>&1 & EMU=$!
-    SERIAL=emulator-5590
+    SERIAL=emulator-${EMU_PORT:-5590}
 fi
 ADB="$ADB0 -s $SERIAL"
 for _ in $(seq 120); do [ "$($ADB shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break; sleep 3; done
