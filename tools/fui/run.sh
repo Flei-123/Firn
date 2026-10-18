@@ -83,7 +83,9 @@ fi
     -o "$W/style.o" lib/fui/style.fi
 "$FIRNC" --profile=kernel $NONE_T -c \
     -o "$W/layout.o" lib/fui/layout.fi
-for o in core style layout; do
+"$FIRNC" --profile=kernel $NONE_T -c \
+    -o "$W/grid.o" lib/fui/grid.fi
+for o in core style layout grid; do
     n=$(objdump -d "$W/$o.o" | grep -c syscall || true)
     if [ "$n" != "0" ]; then
         echo "  $o.o: $n syscall instructions -- forbidden in the core"
@@ -239,6 +241,12 @@ echo "== 13. FLEX-LAYOUT AM PIXEL =="
 # at the right edge.
 build flex
 "$W/flex"
+# W28-c: GRID TRACKS (lib/fui/grid.fi): px/auto/fr/minmax, spans, gaps, auto-placement,
+# RTL -- bare numbers (grid) and the wiring in the scene tree (gridnode)
+build grid
+"$W/grid" | tail -n 3
+build gridnode
+"$W/gridnode" | tail -n 3
 
 echo
 echo "== 14. UNSCHAERFE, SCHATTEN, FARBMATRIX =="
