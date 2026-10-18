@@ -1,0 +1,1028 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_model.fi -- resource pack blockstates + block models (JSON) -> baked quads (CPU only, no GPU API).
+// Docs: docs/mc/resourcepacks.md ("Models / blockstates").
+//
+//     var st: mc_assets.PackStack = ...                       // opened packs, first pushed = top priority
+//     var sel: mc_model.Selection = mc_model.selection_new()
+//     let n: i32 = mc_model.blockstate_select(&st, "oak_stairs", "facing=east,half=bottom,shape=straight", seed, &sel)
+//     var b: mc_model.Baked = mc_model.baked_new()
+//     mc_model.blockstate_bake(&st, "oak_stairs", "facing=east,half=bottom,shape=straight", seed, &b)
+//     // quads: mc_model.baked_count(&b), mc_model.baked_f(&b, i, K_X0 + corner) ...
+//     mc_model.baked_free(&b)
+//
+// WHAT IS READ (public format, assets/minecraft/blockstates/<block>.json and models/<path>.json):
+//   * blockstate "variants": key "a=b,c=d" (all pairs must be in the state; "" and "normal" match everything), value = object or weighted
+//     list {model, x, y, uvlock, weight}; "multipart": [{when: {k: "v|w"} | {OR: [...]} | {AND: [...]}, apply: object | list}].
+//   * model: "parent" chain (child wins; max 16 deep), "textures" (#name references, followed), "elements" (the first model of the chain
+//     that has any): from / to, rotation {origin, axis, angle, rescale}, shade, faces {down up north south west east:
+//     {uv, texture, cullface, rotation, tintindex}}. "display", "overrides", "gui_light", "ambientocclusion" are ignored.
+//   * Variant rotation x / y (multiples of 90, x first, then y, around the block centre) turns quads and cullfaces; uvlock keeps the texture
+//     aligned with the world (UV turned back by the quarter turns of its face plane).
+//
+// CLEAN ROOM: no Mojang file is read or shipped. When no pack has a parent model the small OWN built-ins below stand in (cube, cube_all,
+// cube_column, cube_bottom_top, slab, slab_top, cross, stairs = straight stairs only; inner / outer stairs are NOT built in). Their JSON is
+// written from the block shapes, not copied. The vertex / UV conventions (corner order, default UV per face, face rotation = quarter shift,
+// variant x: north -> down, y: north -> east) follow the public format and are checked against the own fixtures (tests/3945), NOT against a
+// real client -- no Mojang pack was available.
+//
+// QUAD LAYOUT (QW = 28 f64 words per quad, `baked_f`): X0..X0+3 / Y0.. / Z0.. = corner positions in BLOCK units (0..1, may exceed),
+// U0.. / V0.. = texture coordinates in 0..16, W_TEX = index in the texture table (`baked_tex_name`), W_CULL = -1 | 0..5 (down up north
+// south west east: the quad can be skipped when that neighbour hides it), W_TINT = tintindex or -1, W_SHADE = 1.0 / 0.0, W_DIR = face direction
+// after rotation (0..5, for lighting).
+import std.rt
+import std.core
+import std.str
+import std.math
+import std.json
+import zip.zip
+import mc.mc_assets
+
+export {
+    Name, Part, Selection, Baked, Quad,
+    name_new, name_set, name_str_eq,
+    selection_new, baked_new, baked_free, baked_count, baked_f, baked_tex_count, baked_tex_name,
+    blockstate_select, model_bake, blockstate_bake, props_get, canon_u, canon_v, dir_vec, V3,
+    QW, X0, Y0, Z0, U0, V0, W_TEX, W_CULL, W_TINT, W_SHADE, W_DIR,
+}
+
+const QW: usize = 28
+const X0: usize = 0
+const Y0: usize = 4
+const Z0: usize = 8
+const U0: usize = 12
+const V0: usize = 16
+const W_TEX: usize = 20
+const W_CULL: usize = 21
+const W_TINT: usize = 22
+const W_SHADE: usize = 23
+const W_DIR: usize = 24
+const MAX_CHAIN: usize = 16
+const MAX_PARTS: usize = 16
+const MAX_TEXTURES: usize = 48
+const MAX_QUADS: usize = 8192
+
+// ------------------------------------------------------------------ small types
+
+struct Name { b: [u8; 64], n: usize }
+
+fn name_new() -> Name { return Name { b: [0 as u8; 64], n: 0 } }
+
+fn name_ptr(nm: *mut Name) -> u64 { return (&(*nm).b[0]) as u64 }
+
+// Copies n bytes (without a leading "minecraft:"); false = empty or too long (name left empty).
+fn name_set(nm: *mut Name, p: u64, n: usize) -> bool {
+    var q: u64 = p
+    var m: usize = n
+    if m > 10 && rt.mem_eq(q, "minecraft:".p as u64, 10) {
+        q = q + (10 as u64)
+        m = m - 10
+    }
+    (*nm).n = 0
+    if m == 0 || m > 63 { return false }
+    rt.mem_copy(name_ptr(nm), q, m)
+    rt.st8(name_ptr(nm), m, 0 as u8)
+    (*nm).n = m
+    return true
+}
+
+fn name_str_eq(nm: *mut Name, s: str) -> bool {
+    if (*nm).n != s.length() { return false }
+    return rt.mem_eq(name_ptr(nm), s.p as u64, (*nm).n)
+}
+
+fn name_eq(a: *mut Name, b: *mut Name) -> bool {
+    if (*a).n != (*b).n { return false }
+    return rt.mem_eq(name_ptr(a), name_ptr(b), (*a).n)
+}
+
+// One chosen model of a blockstate.
+struct Part { name: Name, rx: i32, ry: i32, uvlock: bool }
+
+struct Selection { n: usize, p: [Part; 16] }
+
+fn part_new() -> Part { return Part { name: name_new(), rx: 0, ry: 0, uvlock: false } }
+
+fn selection_new() -> Selection { return Selection { n: 0, p: [part_new(); 16] } }
+
+// Baked quads of one block state. q = QW f64 words per quad (heap), tn = MAX_TEXTURES x 64 byte texture names.
+struct Baked { q: u64, nq: usize, cap: usize, tn: u64, nt: usize }
+
+fn baked_new() -> Baked {
+    let tn: u64 = rt.heap_alloc(MAX_TEXTURES * 64)
+    rt.mem_set(tn, 0 as u8, MAX_TEXTURES * 64)
+    return Baked { q: 0, nq: 0, cap: 0, tn: tn, nt: 0 }
+}
+
+fn baked_free(b: *mut Baked) {
+    if (*b).q != 0 { rt.heap_free((*b).q, (*b).cap * QW * 8) }
+    if (*b).tn != 0 { rt.heap_free((*b).tn, MAX_TEXTURES * 64) }
+    (*b).q = 0
+    (*b).tn = 0
+    (*b).nq = 0
+    (*b).cap = 0
+    (*b).nt = 0
+}
+
+fn baked_count(b: *mut Baked) -> usize { return (*b).nq }
+fn baked_tex_count(b: *mut Baked) -> usize { return (*b).nt }
+
+fn baked_f(b: *mut Baked, i: usize, k: usize) -> f64 {
+    return math.math_f64(rt.ld64((*b).q, i * QW + k))
+}
+
+fn baked_tex_name(b: *mut Baked, t: usize, out: *mut Name) -> bool {
+    if t >= (*b).nt { return false }
+    var n: usize = 0
+    while n < 63 && rt.ld8((*b).tn, t * 64 + n) != (0 as u8) { n = n + 1 }
+    return name_set(out, (*b).tn + ((t * 64) as u64), n)
+}
+
+fn baked_tex_index(b: *mut Baked, nm: *mut Name) -> usize {
+    var t: usize = 0
+    while t < (*b).nt {
+        var same: bool = true
+        var i: usize = 0
+        while i <= (*nm).n {
+            if rt.ld8((*b).tn, t * 64 + i) != rt.ld8(name_ptr(nm), i) { same = false }
+            i = i + 1
+        }
+        if same { return t }
+        t = t + 1
+    }
+    if (*b).nt >= MAX_TEXTURES { return MAX_TEXTURES - 1 }
+    rt.mem_copy((*b).tn + (((*b).nt * 64) as u64), name_ptr(nm), (*nm).n + 1)
+    (*b).nt = (*b).nt + 1
+    return (*b).nt - 1
+}
+
+// ------------------------------------------------------------------ geometry helpers
+
+struct V3 { x: f64, y: f64, z: f64 }
+
+struct Quad { w: [f64; 28] }
+
+fn quad_new() -> Quad { return Quad { w: [0.0; 28] } }
+
+fn qsin(k: i32) -> f64 {
+    let m: i32 = ((k % 4) + 4) % 4
+    if m == 1 { return 1.0 }
+    if m == 3 { return 0.0 - 1.0 }
+    return 0.0
+}
+
+fn qcos(k: i32) -> f64 {
+    let m: i32 = ((k % 4) + 4) % 4
+    if m == 0 { return 1.0 }
+    if m == 2 { return 0.0 - 1.0 }
+    return 0.0
+}
+
+// Variant rotation of a point relative to the block centre: x first (north -> down), then y (north -> east).
+fn rot_xy(v: V3, kx: i32, ky: i32) -> V3 {
+    let cx: f64 = qcos(kx)
+    let sx: f64 = qsin(kx)
+    let y1: f64 = v.y * cx + v.z * sx
+    let z1: f64 = 0.0 - v.y * sx + v.z * cx
+    let cy: f64 = qcos(ky)
+    let sy: f64 = qsin(ky)
+    let x2: f64 = v.x * cy - z1 * sy
+    let z2: f64 = v.x * sy + z1 * cy
+    return V3 { x: x2, y: y1, z: z2 }
+}
+
+fn dir_vec(d: usize) -> V3 {
+    if d == 0 { return V3 { x: 0.0, y: 0.0 - 1.0, z: 0.0 } }
+    if d == 1 { return V3 { x: 0.0, y: 1.0, z: 0.0 } }
+    if d == 2 { return V3 { x: 0.0, y: 0.0, z: 0.0 - 1.0 } }
+    if d == 3 { return V3 { x: 0.0, y: 0.0, z: 1.0 } }
+    if d == 4 { return V3 { x: 0.0 - 1.0, y: 0.0, z: 0.0 } }
+    return V3 { x: 1.0, y: 0.0, z: 0.0 }
+}
+
+fn dir_of_vec(v: V3) -> usize {
+    if v.y < 0.0 - 0.5 { return 0 }
+    if v.y > 0.5 { return 1 }
+    if v.z < 0.0 - 0.5 { return 2 }
+    if v.z > 0.5 { return 3 }
+    if v.x < 0.0 - 0.5 { return 4 }
+    return 5
+}
+
+fn rotate_dir(d: usize, kx: i32, ky: i32) -> usize {
+    return dir_of_vec(rot_xy(dir_vec(d), kx, ky))
+}
+
+fn dir_name(d: usize) -> str {
+    if d == 0 { return "down" }
+    if d == 1 { return "up" }
+    if d == 2 { return "north" }
+    if d == 3 { return "south" }
+    if d == 4 { return "west" }
+    return "east"
+}
+
+// Direction index of a name (-1 unknown).
+fn dir_index(p: u64, n: usize) -> i32 {
+    var d: usize = 0
+    while d < 6 {
+        let s: str = dir_name(d)
+        if s.length() == n && rt.mem_eq(s.p as u64, p, n) { return d as i32 }
+        d = d + 1
+    }
+    return 0 - 1
+}
+
+fn set_v(q: *mut Quad, k: usize, x: f64, y: f64, z: f64) {
+    (*q).w[X0 + k] = x
+    (*q).w[Y0 + k] = y
+    (*q).w[Z0 + k] = z
+}
+
+// Corner order of the format: counter clockwise seen from outside, corner 0 = (u1, v1).
+fn face_corners(f: usize, x1: f64, y1: f64, z1: f64, x2: f64, y2: f64, z2: f64, q: *mut Quad) {
+    if f == 0 {
+        set_v(q, 0, x1, y1, z2)
+        set_v(q, 1, x1, y1, z1)
+        set_v(q, 2, x2, y1, z1)
+        set_v(q, 3, x2, y1, z2)
+    } else if f == 1 {
+        set_v(q, 0, x1, y2, z1)
+        set_v(q, 1, x1, y2, z2)
+        set_v(q, 2, x2, y2, z2)
+        set_v(q, 3, x2, y2, z1)
+    } else if f == 2 {
+        set_v(q, 0, x2, y2, z1)
+        set_v(q, 1, x2, y1, z1)
+        set_v(q, 2, x1, y1, z1)
+        set_v(q, 3, x1, y2, z1)
+    } else if f == 3 {
+        set_v(q, 0, x1, y2, z2)
+        set_v(q, 1, x1, y1, z2)
+        set_v(q, 2, x2, y1, z2)
+        set_v(q, 3, x2, y2, z2)
+    } else if f == 4 {
+        set_v(q, 0, x1, y2, z1)
+        set_v(q, 1, x1, y1, z1)
+        set_v(q, 2, x1, y1, z2)
+        set_v(q, 3, x1, y2, z2)
+    } else {
+        set_v(q, 0, x2, y2, z2)
+        set_v(q, 1, x2, y1, z2)
+        set_v(q, 2, x2, y1, z1)
+        set_v(q, 3, x2, y2, z1)
+    }
+}
+
+// Default UV rectangle of a face of the box (u1, v1, u2, v2).
+fn default_uv(f: usize, x1: f64, y1: f64, z1: f64, x2: f64, y2: f64, z2: f64, uv: *mut [f64; 4]) {
+    if f == 0 {
+        (*uv)[0] = x1
+        (*uv)[1] = 16.0 - z2
+        (*uv)[2] = x2
+        (*uv)[3] = 16.0 - z1
+    } else if f == 1 {
+        (*uv)[0] = x1
+        (*uv)[1] = z1
+        (*uv)[2] = x2
+        (*uv)[3] = z2
+    } else if f == 2 {
+        (*uv)[0] = 16.0 - x2
+        (*uv)[1] = 16.0 - y2
+        (*uv)[2] = 16.0 - x1
+        (*uv)[3] = 16.0 - y1
+    } else if f == 3 {
+        (*uv)[0] = x1
+        (*uv)[1] = 16.0 - y2
+        (*uv)[2] = x2
+        (*uv)[3] = 16.0 - y1
+    } else if f == 4 {
+        (*uv)[0] = z1
+        (*uv)[1] = 16.0 - y2
+        (*uv)[2] = z2
+        (*uv)[3] = 16.0 - y1
+    } else {
+        (*uv)[0] = 16.0 - z2
+        (*uv)[1] = 16.0 - y2
+        (*uv)[2] = 16.0 - z1
+        (*uv)[3] = 16.0 - y1
+    }
+}
+
+// Texture plane coordinates of a point (0..16 block units) seen on face f -- the unrotated default mapping.
+fn canon_u(f: usize, x: f64, y: f64, z: f64) -> f64 {
+    if f == 0 || f == 1 || f == 3 { return x }
+    if f == 2 { return 16.0 - x }
+    if f == 4 { return z }
+    return 16.0 - z
+}
+
+fn canon_v(f: usize, x: f64, y: f64, z: f64) -> f64 {
+    if f == 0 { return 16.0 - z }
+    if f == 1 { return z }
+    return 16.0 - y
+}
+
+fn near(a: f64, b: f64) -> bool {
+    var d: f64 = a - b
+    if d < 0.0 { d = 0.0 - d }
+    return d < 0.001
+}
+
+// UV quarter turn around (8, 8), k times.
+fn uv_turn_u(u: f64, v: f64, k: i32) -> f64 {
+    var a: f64 = u
+    var b: f64 = v
+    var i: i32 = 0
+    while i < k {
+        let na: f64 = 16.0 - b
+        let nb: f64 = a
+        a = na
+        b = nb
+        i = i + 1
+    }
+    return a
+}
+
+fn uv_turn_v(u: f64, v: f64, k: i32) -> f64 {
+    var a: f64 = u
+    var b: f64 = v
+    var i: i32 = 0
+    while i < k {
+        let na: f64 = 16.0 - b
+        let nb: f64 = a
+        a = na
+        b = nb
+        i = i + 1
+    }
+    return b
+}
+
+// ------------------------------------------------------------------ pack file access
+
+fn path_build(pre: str, nm: *mut Name, suf: str, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, pre.p as u64, pre.length())
+    rt.buf_push_bytes(out, name_ptr(nm), (*nm).n)
+    rt.buf_push_bytes(out, suf.p as u64, suf.length())
+}
+
+// Reads one file from the top-most pack that has it (a pack that holds an empty or broken entry is skipped).
+fn stack_read(st: *mut mc_assets.PackStack, path: *mut rt.Buf, out: *mut rt.Buf) -> bool {
+    var i: usize = 0
+    while i < (*st).n {
+        let pk: *mut mc_assets.Pack = &(*st).packs[i]
+        let idx: i64 = mc_assets.pack_find_bytes(pk, rt.buf_ptr(path), rt.buf_len(path))
+        if idx >= 0 {
+            rt.buf_clear(out)
+            var got: usize = zip.zip_extract(&(*pk).z, idx as usize, out) catch | e | (0)
+            if got > 0 { return true }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ------------------------------------------------------------------ own built-in parent models
+
+fn builtin_model(nm: *mut Name) -> str {
+    if name_str_eq(nm, "block/cube") {
+        return "{\"elements\":[{\"from\":[0,0,0],\"to\":[16,16,16],\"faces\":{\"down\":{\"texture\":\"#down\",\"cullface\":\"down\"},\"up\":{\"texture\":\"#up\",\"cullface\":\"up\"},\"north\":{\"texture\":\"#north\",\"cullface\":\"north\"},\"south\":{\"texture\":\"#south\",\"cullface\":\"south\"},\"west\":{\"texture\":\"#west\",\"cullface\":\"west\"},\"east\":{\"texture\":\"#east\",\"cullface\":\"east\"}}}]}"
+    }
+    if name_str_eq(nm, "block/cube_all") {
+        return "{\"parent\":\"block/cube\",\"textures\":{\"particle\":\"#all\",\"down\":\"#all\",\"up\":\"#all\",\"north\":\"#all\",\"south\":\"#all\",\"west\":\"#all\",\"east\":\"#all\"}}"
+    }
+    if name_str_eq(nm, "block/cube_column") {
+        return "{\"parent\":\"block/cube\",\"textures\":{\"particle\":\"#side\",\"down\":\"#end\",\"up\":\"#end\",\"north\":\"#side\",\"south\":\"#side\",\"west\":\"#side\",\"east\":\"#side\"}}"
+    }
+    if name_str_eq(nm, "block/cube_bottom_top") {
+        return "{\"parent\":\"block/cube\",\"textures\":{\"particle\":\"#side\",\"down\":\"#bottom\",\"up\":\"#top\",\"north\":\"#side\",\"south\":\"#side\",\"west\":\"#side\",\"east\":\"#side\"}}"
+    }
+    if name_str_eq(nm, "block/slab") {
+        return "{\"textures\":{\"particle\":\"#side\"},\"elements\":[{\"from\":[0,0,0],\"to\":[16,8,16],\"faces\":{\"down\":{\"texture\":\"#bottom\",\"cullface\":\"down\"},\"up\":{\"texture\":\"#top\"},\"north\":{\"texture\":\"#side\",\"cullface\":\"north\"},\"south\":{\"texture\":\"#side\",\"cullface\":\"south\"},\"west\":{\"texture\":\"#side\",\"cullface\":\"west\"},\"east\":{\"texture\":\"#side\",\"cullface\":\"east\"}}}]}"
+    }
+    if name_str_eq(nm, "block/slab_top") {
+        return "{\"textures\":{\"particle\":\"#side\"},\"elements\":[{\"from\":[0,8,0],\"to\":[16,16,16],\"faces\":{\"down\":{\"texture\":\"#bottom\"},\"up\":{\"texture\":\"#top\",\"cullface\":\"up\"},\"north\":{\"texture\":\"#side\",\"cullface\":\"north\"},\"south\":{\"texture\":\"#side\",\"cullface\":\"south\"},\"west\":{\"texture\":\"#side\",\"cullface\":\"west\"},\"east\":{\"texture\":\"#side\",\"cullface\":\"east\"}}}]}"
+    }
+    if name_str_eq(nm, "block/cross") {
+        return "{\"textures\":{\"particle\":\"#cross\"},\"elements\":[{\"from\":[0.8,0,8],\"to\":[15.2,16,8],\"rotation\":{\"origin\":[8,8,8],\"axis\":\"y\",\"angle\":45,\"rescale\":true},\"shade\":false,\"faces\":{\"north\":{\"texture\":\"#cross\"},\"south\":{\"texture\":\"#cross\"}}},{\"from\":[8,0,0.8],\"to\":[8,16,15.2],\"rotation\":{\"origin\":[8,8,8],\"axis\":\"y\",\"angle\":45,\"rescale\":true},\"shade\":false,\"faces\":{\"west\":{\"texture\":\"#cross\"},\"east\":{\"texture\":\"#cross\"}}}]}"
+    }
+    if name_str_eq(nm, "block/stairs") {
+        return "{\"textures\":{\"particle\":\"#side\"},\"elements\":[{\"from\":[0,0,0],\"to\":[16,8,16],\"faces\":{\"down\":{\"texture\":\"#bottom\",\"cullface\":\"down\"},\"up\":{\"texture\":\"#top\"},\"north\":{\"texture\":\"#side\",\"cullface\":\"north\"},\"south\":{\"texture\":\"#side\",\"cullface\":\"south\"},\"west\":{\"texture\":\"#side\",\"cullface\":\"west\"},\"east\":{\"texture\":\"#side\",\"cullface\":\"east\"}}},{\"from\":[8,8,0],\"to\":[16,16,16],\"faces\":{\"up\":{\"texture\":\"#top\",\"cullface\":\"up\"},\"north\":{\"texture\":\"#side\",\"cullface\":\"north\"},\"south\":{\"texture\":\"#side\",\"cullface\":\"south\"},\"west\":{\"texture\":\"#side\"},\"east\":{\"texture\":\"#side\",\"cullface\":\"east\"}}}]}"
+    }
+    return ""
+}
+
+// ------------------------------------------------------------------ model chain
+
+struct Chain {
+    d: [json.Json; 16],
+    raw: [rt.Buf; 16],
+    n: usize,
+}
+
+fn chain_new() -> Chain {
+    return Chain { d: [json.json_new(); 16], raw: [rt.buf_new(); 16], n: 0 }
+}
+
+fn chain_free(ch: *mut Chain) {
+    var i: usize = 0
+    while i < (*ch).n {
+        json.json_free(&(*ch).d[i])
+        rt.buf_free(&(*ch).raw[i])
+        i = i + 1
+    }
+    (*ch).n = 0
+}
+
+fn jlit(d: *mut json.Json, obj: u32, key: str) -> u32 {
+    if obj == json.JSON_NONE { return json.JSON_NONE }
+    if json.json_kind(d, obj) != json.JSON_OBJECT { return json.JSON_NONE }
+    return json.json_get(d, obj, key.p as u64, key.length())
+}
+
+fn jnum(d: *mut json.Json, n: u32, dflt: f64) -> f64 {
+    if n == json.JSON_NONE { return dflt }
+    if json.json_kind(d, n) != json.JSON_NUMBER { return dflt }
+    return json.json_number(d, n)
+}
+
+fn jstr_name(d: *mut json.Json, n: u32, out: *mut Name) -> bool {
+    (*out).n = 0
+    if n == json.JSON_NONE { return false }
+    if json.json_kind(d, n) != json.JSON_STRING { return false }
+    let sp: str.Span = json.json_string(d, n)
+    return name_set(out, sp.p as u64, sp.n)
+}
+
+// Loads the model `nm` and its parents (child first). false = the first model is not there (neither in a pack nor built in).
+fn chain_load(st: *mut mc_assets.PackStack, first: *mut Name, ch: *mut Chain) -> bool {
+    var cur: Name = *first
+    var path: rt.Buf = rt.buf_new()
+    var guard: usize = 0
+    var more: bool = true
+    while more && guard < 16 {
+        guard = guard + 1
+        let i: usize = (*ch).n
+        path_build("assets/minecraft/models/", &cur, ".json", &path)
+        var found: bool = stack_read(st, &path, &(*ch).raw[i])
+        if !found {
+            let bi: str = builtin_model(&cur)
+            if bi.length() > 0 {
+                rt.buf_clear(&(*ch).raw[i])
+                rt.buf_push_bytes(&(*ch).raw[i], bi.p as u64, bi.length())
+                found = true
+            }
+        }
+        if !found {
+            more = false
+        } else {
+            let pr: bool = json.json_parse(&(*ch).d[i], rt.buf_ptr(&(*ch).raw[i]), rt.buf_len(&(*ch).raw[i])) catch false
+            (*ch).n = i + 1
+            if !pr {
+                more = false
+            } else {
+                let root: u32 = json.json_root(&(*ch).d[i])
+                let par: u32 = jlit(&(*ch).d[i], root, "parent")
+                var nx: Name = name_new()
+                if !jstr_name(&(*ch).d[i], par, &nx) { more = false } else { cur = nx }
+            }
+        }
+    }
+    rt.buf_free(&path)
+    return (*ch).n > 0
+}
+
+// Value of texture variable `key` (child first), then followed through "#ref" values. false = unresolved.
+fn tex_resolve(ch: *mut Chain, kp: u64, kn: usize, out: *mut Name) -> bool {
+    var p: u64 = kp
+    var n: usize = kn
+    var hops: usize = 0
+    while hops < 10 {
+        hops = hops + 1
+        if n > 0 && rt.ld8(p, 0) == (35 as u8) {
+            // "#name": look the variable up
+            var found: bool = false
+            var i: usize = 0
+            while i < (*ch).n && !found {
+                let d: *mut json.Json = &(*ch).d[i]
+                let tx: u32 = jlit(d, json.json_root(d), "textures")
+                if tx != json.JSON_NONE {
+                    let v: u32 = json.json_get(d, tx, (p + (1 as u64)), n - 1)
+                    if v != json.JSON_NONE && json.json_kind(d, v) == json.JSON_STRING {
+                        let sp: str.Span = json.json_string(d, v)
+                        p = sp.p as u64
+                        n = sp.n
+                        found = true
+                    }
+                }
+                i = i + 1
+            }
+            if !found { return false }
+        } else {
+            return name_set(out, p, n)
+        }
+    }
+    return false
+}
+
+// ------------------------------------------------------------------ baking
+
+struct Elem {
+    x1: f64, y1: f64, z1: f64, x2: f64, y2: f64, z2: f64,
+    has_rot: bool, ox: f64, oy: f64, oz: f64, axis: i32, ang: f64, rescale: bool,
+    shade: bool,
+}
+
+fn baked_add(b: *mut Baked, q: *mut Quad) -> bool {
+    if (*b).nq >= MAX_QUADS { return false }
+    if (*b).nq >= (*b).cap {
+        var nc: usize = (*b).cap * 2
+        if nc < 32 { nc = 32 }
+        let np: u64 = rt.heap_alloc(nc * QW * 8)
+        if (*b).q != 0 {
+            rt.mem_copy(np, (*b).q, (*b).nq * QW * 8)
+            rt.heap_free((*b).q, (*b).cap * QW * 8)
+        }
+        (*b).q = np
+        (*b).cap = nc
+    }
+    var k: usize = 0
+    while k < QW {
+        rt.st64((*b).q, (*b).nq * QW + k, math.math_bits((*q).w[k]))
+        k = k + 1
+    }
+    (*b).nq = (*b).nq + 1
+    return true
+}
+
+// Element rotation of one corner (right handed around the axis, origin in 0..16 units).
+fn elem_rot(e: *mut Elem, v: V3) -> V3 {
+    let rad: f64 = (*e).ang * math.PI() / 180.0
+    let c: f64 = math.cos(rad)
+    let s: f64 = math.sin(rad)
+    var dx: f64 = v.x - (*e).ox
+    var dy: f64 = v.y - (*e).oy
+    var dz: f64 = v.z - (*e).oz
+    var sc: f64 = 1.0
+    if (*e).rescale && c > 0.01 { sc = 1.0 / c }
+    if (*e).axis == 0 {
+        let ny: f64 = dy * c - dz * s
+        let nz: f64 = dy * s + dz * c
+        dy = ny * sc
+        dz = nz * sc
+        dx = dx
+    } else if (*e).axis == 1 {
+        let nx: f64 = dx * c + dz * s
+        let nz: f64 = 0.0 - dx * s + dz * c
+        dx = nx * sc
+        dz = nz * sc
+    } else {
+        let nx: f64 = dx * c - dy * s
+        let ny: f64 = dx * s + dy * c
+        dx = nx * sc
+        dy = ny * sc
+    }
+    return V3 { x: dx + (*e).ox, y: dy + (*e).oy, z: dz + (*e).oz }
+}
+
+fn bake_face(ch: *mut Chain, d: *mut json.Json, fobj: u32, f: usize, e: *mut Elem, kx: i32, ky: i32, uvlock: bool, b: *mut Baked) {
+    // texture
+    let tn: u32 = jlit(d, fobj, "texture")
+    var tname: Name = name_new()
+    var have: bool = false
+    if tn != json.JSON_NONE && json.json_kind(d, tn) == json.JSON_STRING {
+        let sp: str.Span = json.json_string(d, tn)
+        have = tex_resolve(ch, sp.p as u64, sp.n, &tname)
+    }
+    if !have {
+        let mn: str = "missingno"
+        have = name_set(&tname, mn.p as u64, mn.length())
+    }
+    if !have { return }
+    var q: Quad = quad_new()
+    face_corners(f, (*e).x1, (*e).y1, (*e).z1, (*e).x2, (*e).y2, (*e).z2, &q)
+    // uv rectangle
+    var uv: [f64; 4] = [0.0; 4]
+    default_uv(f, (*e).x1, (*e).y1, (*e).z1, (*e).x2, (*e).y2, (*e).z2, &uv)
+    let un: u32 = jlit(d, fobj, "uv")
+    if un != json.JSON_NONE && json.json_kind(d, un) == json.JSON_ARRAY && json.json_count(d, un) == 4 {
+        var k: usize = 0
+        while k < 4 {
+            uv[k] = jnum(d, json.json_child_at(d, un, k), uv[k])
+            k = k + 1
+        }
+    }
+    let rn: u32 = jlit(d, fobj, "rotation")
+    var shift: i32 = 0
+    if rn != json.JSON_NONE { shift = ((((json.json_int(d, rn) as i32) / 90) % 4) + 4) % 4 }
+    var i: usize = 0
+    while i < 4 {
+        let ci: usize = (i + (shift as usize)) % 4
+        var uu: f64 = uv[0]
+        if ci >= 2 { uu = uv[2] }
+        var vv: f64 = uv[1]
+        if ci == 1 || ci == 2 { vv = uv[3] }
+        q.w[U0 + i] = uu
+        q.w[V0 + i] = vv
+        i = i + 1
+    }
+    // cullface, tint
+    var cull: i32 = 0 - 1
+    let cn: u32 = jlit(d, fobj, "cullface")
+    if cn != json.JSON_NONE && json.json_kind(d, cn) == json.JSON_STRING {
+        let sp: str.Span = json.json_string(d, cn)
+        cull = dir_index(sp.p as u64, sp.n)
+    }
+    var tint: i32 = 0 - 1
+    let tt: u32 = jlit(d, fobj, "tintindex")
+    if tt != json.JSON_NONE && json.json_kind(d, tt) == json.JSON_NUMBER { tint = json.json_int(d, tt) as i32 }
+    // element rotation
+    if (*e).has_rot {
+        i = 0
+        while i < 4 {
+            let r: V3 = elem_rot(e, V3 { x: q.w[X0 + i], y: q.w[Y0 + i], z: q.w[Z0 + i] })
+            q.w[X0 + i] = r.x
+            q.w[Y0 + i] = r.y
+            q.w[Z0 + i] = r.z
+            i = i + 1
+        }
+    }
+    // canonical coordinates before the variant rotation (uvlock)
+    var cu: [f64; 4] = [0.0; 4]
+    var cv: [f64; 4] = [0.0; 4]
+    i = 0
+    while i < 4 {
+        cu[i] = canon_u(f, q.w[X0 + i], q.w[Y0 + i], q.w[Z0 + i])
+        cv[i] = canon_v(f, q.w[X0 + i], q.w[Y0 + i], q.w[Z0 + i])
+        i = i + 1
+    }
+    // variant rotation around the block centre
+    var fd: usize = f
+    if kx != 0 || ky != 0 {
+        i = 0
+        while i < 4 {
+            let r: V3 = rot_xy(V3 { x: q.w[X0 + i] - 8.0, y: q.w[Y0 + i] - 8.0, z: q.w[Z0 + i] - 8.0 }, kx, ky)
+            q.w[X0 + i] = r.x + 8.0
+            q.w[Y0 + i] = r.y + 8.0
+            q.w[Z0 + i] = r.z + 8.0
+            i = i + 1
+        }
+        fd = rotate_dir(f, kx, ky)
+        if cull >= 0 { cull = rotate_dir(cull as usize, kx, ky) as i32 }
+        if uvlock {
+            // find the quarter turns k with turn(c) == canonical coordinates of the rotated corner on the rotated face
+            var kk: i32 = 0
+            var hit: i32 = 0 - 1
+            while kk < 4 && hit < 0 {
+                var all: bool = true
+                i = 0
+                while i < 4 {
+                    let nu: f64 = canon_u(fd, q.w[X0 + i], q.w[Y0 + i], q.w[Z0 + i])
+                    let nv: f64 = canon_v(fd, q.w[X0 + i], q.w[Y0 + i], q.w[Z0 + i])
+                    if !near(uv_turn_u(cu[i], cv[i], kk), nu) || !near(uv_turn_v(cu[i], cv[i], kk), nv) { all = false }
+                    i = i + 1
+                }
+                if all { hit = kk }
+                kk = kk + 1
+            }
+            if hit > 0 {
+                i = 0
+                while i < 4 {
+                    let u0: f64 = q.w[U0 + i]
+                    let v0: f64 = q.w[V0 + i]
+                    q.w[U0 + i] = uv_turn_u(u0, v0, hit)
+                    q.w[V0 + i] = uv_turn_v(u0, v0, hit)
+                    i = i + 1
+                }
+            }
+        }
+    }
+    // to block units
+    i = 0
+    while i < 4 {
+        q.w[X0 + i] = q.w[X0 + i] / 16.0
+        q.w[Y0 + i] = q.w[Y0 + i] / 16.0
+        q.w[Z0 + i] = q.w[Z0 + i] / 16.0
+        i = i + 1
+    }
+    q.w[W_TEX] = baked_tex_index(b, &tname) as f64
+    q.w[W_CULL] = cull as f64
+    q.w[W_TINT] = tint as f64
+    q.w[W_SHADE] = 0.0
+    if (*e).shade { q.w[W_SHADE] = 1.0 }
+    q.w[W_DIR] = fd as f64
+    baked_add(b, &q)
+}
+
+fn bake_element(ch: *mut Chain, d: *mut json.Json, el: u32, kx: i32, ky: i32, uvlock: bool, b: *mut Baked) {
+    if json.json_kind(d, el) != json.JSON_OBJECT { return }
+    let fr: u32 = jlit(d, el, "from")
+    let to: u32 = jlit(d, el, "to")
+    if fr == json.JSON_NONE || to == json.JSON_NONE { return }
+    if json.json_kind(d, fr) != json.JSON_ARRAY || json.json_count(d, fr) != 3 { return }
+    if json.json_kind(d, to) != json.JSON_ARRAY || json.json_count(d, to) != 3 { return }
+    var e: Elem = Elem {
+        x1: jnum(d, json.json_child_at(d, fr, 0), 0.0), y1: jnum(d, json.json_child_at(d, fr, 1), 0.0), z1: jnum(d, json.json_child_at(d, fr, 2), 0.0),
+        x2: jnum(d, json.json_child_at(d, to, 0), 16.0), y2: jnum(d, json.json_child_at(d, to, 1), 16.0), z2: jnum(d, json.json_child_at(d, to, 2), 16.0),
+        has_rot: false, ox: 8.0, oy: 8.0, oz: 8.0, axis: 1, ang: 0.0, rescale: false, shade: true,
+    }
+    let sh: u32 = jlit(d, el, "shade")
+    if sh != json.JSON_NONE && json.json_kind(d, sh) == json.JSON_FALSE { e.shade = false }
+    let rot: u32 = jlit(d, el, "rotation")
+    if rot != json.JSON_NONE && json.json_kind(d, rot) == json.JSON_OBJECT {
+        let og: u32 = jlit(d, rot, "origin")
+        if og != json.JSON_NONE && json.json_kind(d, og) == json.JSON_ARRAY && json.json_count(d, og) == 3 {
+            e.ox = jnum(d, json.json_child_at(d, og, 0), 8.0)
+            e.oy = jnum(d, json.json_child_at(d, og, 1), 8.0)
+            e.oz = jnum(d, json.json_child_at(d, og, 2), 8.0)
+        }
+        let ax: u32 = jlit(d, rot, "axis")
+        if ax != json.JSON_NONE && json.json_kind(d, ax) == json.JSON_STRING {
+            let sp: str.Span = json.json_string(d, ax)
+            if sp.n == 1 {
+                let c: u8 = rt.ld8(sp.p as u64, 0)
+                if c == (120 as u8) { e.axis = 0 }
+                if c == (121 as u8) { e.axis = 1 }
+                if c == (122 as u8) { e.axis = 2 }
+            }
+        }
+        e.ang = jnum(d, jlit(d, rot, "angle"), 0.0)
+        let rs: u32 = jlit(d, rot, "rescale")
+        if rs != json.JSON_NONE { e.rescale = json.json_bool(d, rs) }
+        e.has_rot = e.ang != 0.0
+    }
+    let faces: u32 = jlit(d, el, "faces")
+    if faces == json.JSON_NONE || json.json_kind(d, faces) != json.JSON_OBJECT { return }
+    var f: usize = 0
+    while f < 6 {
+        let fo: u32 = jlit(d, faces, dir_name(f))
+        if fo != json.JSON_NONE && json.json_kind(d, fo) == json.JSON_OBJECT {
+            bake_face(ch, d, fo, f, &e, kx, ky, uvlock, b)
+        }
+        f = f + 1
+    }
+}
+
+fn quarter(deg: i32) -> i32 { return ((((deg / 90) % 4) + 4) % 4) }
+
+// Bakes model `nm` (path like "block/stone", rotated by the variant x / y degrees) and APPENDS its quads to `b`.
+// Returns the number of quads added, -1 = model not found.
+fn model_bake_name(st: *mut mc_assets.PackStack, nm: *mut Name, rx: i32, ry: i32, uvlock: bool, b: *mut Baked) -> i32 {
+    var ch: Chain = chain_new()
+    if !chain_load(st, nm, &ch) {
+        chain_free(&ch)
+        return 0 - 1
+    }
+    let before: usize = (*b).nq
+    var i: usize = 0
+    var done: bool = false
+    while i < ch.n && !done {
+        let d: *mut json.Json = &ch.d[i]
+        let els: u32 = jlit(d, json.json_root(d), "elements")
+        if els != json.JSON_NONE && json.json_kind(d, els) == json.JSON_ARRAY {
+            var k: usize = 0
+            while k < json.json_count(d, els) && k < 256 {
+                bake_element(&ch, d, json.json_child_at(d, els, k), quarter(rx), quarter(ry), uvlock, b)
+                k = k + 1
+            }
+            done = true
+        }
+        i = i + 1
+    }
+    chain_free(&ch)
+    return ((*b).nq - before) as i32
+}
+
+fn model_bake(st: *mut mc_assets.PackStack, name: str, rx: i32, ry: i32, uvlock: bool, b: *mut Baked) -> i32 {
+    var nm: Name = name_new()
+    if !name_set(&nm, name.p as u64, name.length()) { return 0 - 1 }
+    return model_bake_name(st, &nm, rx, ry, uvlock, b)
+}
+
+// ------------------------------------------------------------------ blockstates
+
+// Value of property `key` in "a=b,c=d" (the state string). Returns the value length (0 = property missing), start in *off.
+fn props_get(sp: u64, sn: usize, kp: u64, kn: usize, off: *mut usize) -> usize {
+    var i: usize = 0
+    while i < sn {
+        var j: usize = i
+        while j < sn && rt.ld8(sp, j) != (44 as u8) { j = j + 1 }
+        // token [i, j)
+        var e: usize = i
+        while e < j && rt.ld8(sp, e) != (61 as u8) { e = e + 1 }
+        if e < j && e - i == kn && rt.mem_eq(sp + (i as u64), kp, kn) {
+            *off = e + 1
+            return j - e - 1
+        }
+        i = j + 1
+    }
+    return 0
+}
+
+// Does the state hold every "k=v" token of the variant key?  "" and "normal" match everything.
+fn key_matches(kp: u64, kn: usize, sp: u64, sn: usize) -> bool {
+    if kn == 0 { return true }
+    if kn == 6 && rt.mem_eq(kp, "normal".p as u64, 6) { return true }
+    var i: usize = 0
+    while i < kn {
+        var j: usize = i
+        while j < kn && rt.ld8(kp, j) != (44 as u8) { j = j + 1 }
+        var e: usize = i
+        while e < j && rt.ld8(kp, e) != (61 as u8) { e = e + 1 }
+        if e >= j { return false }
+        var off: usize = 0
+        let vn: usize = props_get(sp, sn, kp + (i as u64), e - i, &off)
+        if vn != j - e - 1 { return false }
+        if !rt.mem_eq(sp + (off as u64), kp + ((e + 1) as u64), vn) { return false }
+        i = j + 1
+    }
+    return true
+}
+
+// value "a|b|c" contains the state's value?
+fn alt_matches(vp: u64, vn: usize, sp: u64, sn: usize) -> bool {
+    var i: usize = 0
+    while i <= vn {
+        var j: usize = i
+        while j < vn && rt.ld8(vp, j) != (124 as u8) { j = j + 1 }
+        if j - i == sn && rt.mem_eq(vp + (i as u64), sp, sn) { return true }
+        i = j + 1
+    }
+    return false
+}
+
+fn cond_object(d: *mut json.Json, o: u32, sp: u64, sn: usize) -> bool {
+    var k: usize = 0
+    let cnt: usize = json.json_count(d, o)
+    while k < cnt {
+        let c: u32 = json.json_child_at(d, o, k)
+        let key: str.Span = json.json_key(d, c)
+        var off: usize = 0
+        let vn: usize = props_get(sp, sn, key.p as u64, key.n, &off)
+        var okv: bool = false
+        let kd: u8 = json.json_kind(d, c)
+        if kd == json.JSON_STRING {
+            let want: str.Span = json.json_string(d, c)
+            if vn > 0 { okv = alt_matches(want.p as u64, want.n, sp + (off as u64), vn) }
+        } else if kd == json.JSON_TRUE {
+            okv = vn == 4 && rt.mem_eq(sp + (off as u64), "true".p as u64, 4)
+        } else if kd == json.JSON_FALSE {
+            okv = vn == 5 && rt.mem_eq(sp + (off as u64), "false".p as u64, 5)
+        } else if kd == json.JSON_NUMBER {
+            var nb: rt.Buf = rt.buf_new()
+            rt.buf_push_dec_i64(&nb, json.json_int(d, c))
+            okv = vn == rt.buf_len(&nb) && rt.mem_eq(sp + (off as u64), rt.buf_ptr(&nb), vn)
+            rt.buf_free(&nb)
+        }
+        if !okv { return false }
+        k = k + 1
+    }
+    return true
+}
+
+fn when_eval(d: *mut json.Json, w: u32, sp: u64, sn: usize, depth: usize) -> bool {
+    if w == json.JSON_NONE { return true }
+    if json.json_kind(d, w) != json.JSON_OBJECT || depth > 4 { return false }
+    let orr: u32 = jlit(d, w, "OR")
+    if orr != json.JSON_NONE && json.json_kind(d, orr) == json.JSON_ARRAY {
+        var k: usize = 0
+        while k < json.json_count(d, orr) {
+            if when_eval(d, json.json_child_at(d, orr, k), sp, sn, depth + 1) { return true }
+            k = k + 1
+        }
+        return false
+    }
+    let an: u32 = jlit(d, w, "AND")
+    if an != json.JSON_NONE && json.json_kind(d, an) == json.JSON_ARRAY {
+        var k: usize = 0
+        while k < json.json_count(d, an) {
+            if !when_eval(d, json.json_child_at(d, an, k), sp, sn, depth + 1) { return false }
+            k = k + 1
+        }
+        return true
+    }
+    return cond_object(d, w, sp, sn)
+}
+
+// {model, x, y, uvlock} -> next free Part of `sel`.
+fn part_from_object(d: *mut json.Json, o: u32, sel: *mut Selection) {
+    if (*sel).n >= MAX_PARTS { return }
+    if json.json_kind(d, o) != json.JSON_OBJECT { return }
+    var p: Part = part_new()
+    if !jstr_name(d, jlit(d, o, "model"), &p.name) { return }
+    p.rx = jnum(d, jlit(d, o, "x"), 0.0) as i32
+    p.ry = jnum(d, jlit(d, o, "y"), 0.0) as i32
+    let ul: u32 = jlit(d, o, "uvlock")
+    if ul != json.JSON_NONE { p.uvlock = json.json_bool(d, ul) }
+    (*sel).p[(*sel).n] = p
+    (*sel).n = (*sel).n + 1
+}
+
+// object or weighted list (weight default 1, seed picks deterministically).
+fn apply_node(d: *mut json.Json, a: u32, seed: u32, sel: *mut Selection) {
+    if a == json.JSON_NONE { return }
+    if json.json_kind(d, a) == json.JSON_OBJECT {
+        part_from_object(d, a, sel)
+        return
+    }
+    if json.json_kind(d, a) != json.JSON_ARRAY { return }
+    let cnt: usize = json.json_count(d, a)
+    var total: u64 = 0 as u64
+    var k: usize = 0
+    while k < cnt {
+        var w: i64 = 1
+        let c: u32 = json.json_child_at(d, a, k)
+        let wn: u32 = jlit(d, c, "weight")
+        if wn != json.JSON_NONE { w = json.json_int(d, wn) }
+        if w < 1 { w = 1 }
+        if w > 100000 { w = 100000 }
+        total = total + (w as u64)
+        k = k + 1
+    }
+    if total == (0 as u64) { return }
+    var r: u64 = (seed as u64) % total
+    k = 0
+    while k < cnt {
+        var w: i64 = 1
+        let c: u32 = json.json_child_at(d, a, k)
+        let wn: u32 = jlit(d, c, "weight")
+        if wn != json.JSON_NONE { w = json.json_int(d, wn) }
+        if w < 1 { w = 1 }
+        if w > 100000 { w = 100000 }
+        if r < (w as u64) {
+            part_from_object(d, c, sel)
+            return
+        }
+        r = r - (w as u64)
+        k = k + 1
+    }
+}
+
+// Picks the models of block `block` for the state string ("facing=north,half=top", any order, "" for none).
+// Returns the number of parts (0 = nothing matched), -1 = no blockstate file / not JSON.
+fn blockstate_select(st: *mut mc_assets.PackStack, block: str, state: str, seed: u32, sel: *mut Selection) -> i32 {
+    (*sel).n = 0
+    var nm: Name = name_new()
+    if !name_set(&nm, block.p as u64, block.length()) { return 0 - 1 }
+    var path: rt.Buf = rt.buf_new()
+    var raw: rt.Buf = rt.buf_new()
+    path_build("assets/minecraft/blockstates/", &nm, ".json", &path)
+    let got: bool = stack_read(st, &path, &raw)
+    rt.buf_free(&path)
+    if !got {
+        rt.buf_free(&raw)
+        return 0 - 1
+    }
+    var d: json.Json = json.json_new()
+    let ok: bool = json.json_parse(&d, rt.buf_ptr(&raw), rt.buf_len(&raw)) catch false
+    var res: i32 = 0 - 1
+    if ok {
+        res = 0
+        let root: u32 = json.json_root(&d)
+        let sp: u64 = state.p as u64
+        let sn: usize = state.length()
+        let vs: u32 = jlit(&d, root, "variants")
+        let mp: u32 = jlit(&d, root, "multipart")
+        if vs != json.JSON_NONE && json.json_kind(&d, vs) == json.JSON_OBJECT {
+            var k: usize = 0
+            var hit: bool = false
+            while k < json.json_count(&d, vs) && !hit {
+                let c: u32 = json.json_child_at(&d, vs, k)
+                let key: str.Span = json.json_key(&d, c)
+                if key_matches(key.p as u64, key.n, sp, sn) {
+                    apply_node(&d, c, seed, sel)
+                    hit = true
+                }
+                k = k + 1
+            }
+        } else if mp != json.JSON_NONE && json.json_kind(&d, mp) == json.JSON_ARRAY {
+            var k: usize = 0
+            while k < json.json_count(&d, mp) {
+                let c: u32 = json.json_child_at(&d, mp, k)
+                if when_eval(&d, jlit(&d, c, "when"), sp, sn, 0) {
+                    apply_node(&d, jlit(&d, c, "apply"), seed + (k as u32), sel)
+                }
+                k = k + 1
+            }
+        }
+        res = (*sel).n as i32
+    }
+    json.json_free(&d)
+    rt.buf_free(&raw)
+    return res
+}
+
+// select + bake every chosen model into `b`. Returns the number of quads, -1 = no blockstate.
+fn blockstate_bake(st: *mut mc_assets.PackStack, block: str, state: str, seed: u32, b: *mut Baked) -> i32 {
+    var sel: Selection = selection_new()
+    let n: i32 = blockstate_select(st, block, state, seed, &sel)
+    if n < 0 { return 0 - 1 }
+    var total: i32 = 0
+    var i: usize = 0
+    while i < sel.n {
+        let r: i32 = model_bake_name(st, &sel.p[i].name, sel.p[i].rx, sel.p[i].ry, sel.p[i].uvlock, b)
+        if r > 0 { total = total + r }
+        i = i + 1
+    }
+    return total
+}
