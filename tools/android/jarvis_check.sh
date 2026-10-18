@@ -102,7 +102,8 @@ type_into() { tap_word "$1" 1 1.5 || return 1; wait_kbd >/dev/null; $ADB shell i
 login() { type_into "Username" justin; type_into "Password" pw; tap_word "Sign" 1 1
     if [ "$(OCR_TRIES=20 wait_ocr _notice 'Continue')" = 1 ]; then tap_word "Continue" 1 3; fi; }
 # chat page (1080x2340, web-like composer with icon buttons): message field (418,1911), mic (790,1911), send (960,1911), "Voice" chip (450,380)
-FIELD_X=418; FIELD_Y=1911; SEND_X=960; MIC_X=790; VOICE_X=450; VOICE_Y=380
+if [ "$($ADB shell settings get secure navigation_mode 2>/dev/null | tr -d '\r')" = 2 ]; then FIELD_Y=1911; else FIELD_Y=1845; fi
+FIELD_X=418; SEND_X=960; MIC_X=790; VOICE_X=450; VOICE_Y=380
 
 $ADB uninstall $PKG >/dev/null 2>&1
 $ADB install -r "$APK" >/dev/null 2>&1
@@ -131,7 +132,14 @@ check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 
 
 # ---- message + streamed reply
 # right after the login the connection is still being built ("offline - reconnecting"): a message sent before it is up is lost
-check "online after the login" "$(OCR_TRIES=30 wait_ocr 2b_online 'online')" 1
+# the green "online" pill (outline, small) is lost by full-page OCR: crop the header corner, scale x3, read the line
+online_pill() { local i; for i in $(seq 30); do shot 2b_online
+        python3 -I -c "import sys
+from PIL import Image
+im=Image.open(sys.argv[1]).convert('L').crop((820,140,1080,240))
+im.resize((im.width*3,im.height*3)).save(sys.argv[2])" "$OUT/2b_online.png" "$W/pill.png"
+        tesseract "$W/pill.png" stdout --psm 7 2>/dev/null | grep -qi 'online' && { echo 1; return; }; sleep 1.5; done; echo 0; }
+check "online after the login" "$(online_pill)" 1
 tap $FIELD_X $FIELD_Y 1; check "Gboard shows for the message field" "$(wait_kbd)" 1; $ADB shell input text hello; sleep 1
 hide_kbd # BACK only while the keyboard is up, else it leaves the app
 tap $SEND_X $FIELD_Y 1

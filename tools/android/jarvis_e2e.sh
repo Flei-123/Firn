@@ -110,11 +110,13 @@ wait_kbd_up() { local i; for i in $(seq 12); do [ "$(kbd)" = 1 ] && return 0; sl
 hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; fi; sleep 1; }
 # the composer buttons are vector icons without text (Plus, Mic, Send): touch them by place, as pixels of the 1080x2340 layout
 # (the field "Message" grey hint is lost by OCR as well). Row y 1911, centres: plus 103, field 305, mic 790, send 960
+# the composer row sits higher with the 3-button navigation bar (settings navigation_mode 0) than with gestures (2)
+if [ "$($ADB shell settings get secure navigation_mode 2>/dev/null | tr -d '\r')" = 2 ]; then COMP_Y=1911; TAB_Y=2207; else COMP_Y=1845; TAB_Y=2141; fi
 tap_px() { $ADB shell input tap $(($1 * SW / 1080)) $(($2 * SH / 2340)); sleep "${3:-1.5}"; }
-tap_plus() { tap_px 103 1911 2; }
-tap_send() { tap_px 960 1911 1; }
+tap_plus() { tap_px 103 $COMP_Y 2; }
+tap_send() { tap_px 960 $COMP_Y 1; }
 # type into the composer field (place), or into the field whose hint is $1 (OCR) for other screens, then leave the keyboard
-type_into() { if [ "$1" = Message ]; then tap_px 305 1911 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
+type_into() { if [ "$1" = Message ]; then tap_px 305 $COMP_Y 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
 send_text() { type_into "Message" "$1" && tap_send; }
 notes() { $ADB shell dumpsys notification --noredact; }
 # title / text lines of the notifications of the app (not the service one)
@@ -188,7 +190,7 @@ type_into "Task|New|Add|Text" "callmum" && tap_word "Add" 1 3
 check "task added over /api/m/tasks" "$(wait_log '"path": "/api/m/tasks".*callmum' 10 | awk '{print ($1>0)?"yes":"no"}')" yes
 # the two remaining tab pages, only photographed (design review)
 tap_word "Devices" 1 3; shot 06b_devices
-tap_px 965 2207 3; shot 06c_more # More tab by place: OCR does not find the small word
+tap_px 965 $TAB_Y 3; shot 06c_more # More tab by place: OCR does not find the small word
 [ "${E2E_STOP:-}" = tabs ] && { echo "stopped after the tab pages (E2E_STOP=tabs): $PASS ok, $FAIL failed"; exit 0; }
 tap_word "Chat" 1 2
 
