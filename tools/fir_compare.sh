@@ -72,6 +72,7 @@ fi
 imp_same=0
 imp_diff=0
 imp_first=""
+imp_all=""
 
 same=0
 different=0
@@ -100,6 +101,7 @@ while IFS= read -r f; do
                 else
                     imp_diff=$((imp_diff+1))
                     [ -z "$imp_first" ] && imp_first="$f: $why"
+                    imp_all="$imp_all\n    $f: $why"
                 fi
             fi
         fi
@@ -142,6 +144,7 @@ echo "IMPORTS:       $imports  (module program, not comparable one file at a tim
 if [ "$IMPORTS_STEP" -gt 0 ]; then
     echo "IMPORTS SAME:      $imp_same  (every $IMPORTS_STEP-th file, firnc1 module loader, normalised)"
     echo "IMPORTS DIFFERENT: $imp_diff  (informational; first: ${imp_first:-none})"
+    [ -n "$imp_all" ] && printf "  all differing files:$imp_all\n"
 fi
 echo "NOT CORE:      $noncore"
 echo "COMPTIME:      $comptime"
