@@ -84,22 +84,7 @@ wait_ocr() { local i; for i in $(seq ${OCR_TRIES:-12}); do shot "$1"; ocr "$1" |
 # BACK only while the keyboard is up: without it BACK leaves the app (a slow host shows the keyboard seconds late)
 hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; fi; sleep 1; }
 # the centre (pixels) of the n-th word matching a regex in the screenshot $1; empty when there is none
-word_at() { python3 -I - "$OUT/$1.png" "$2" "${3:-1}" <<'PYEOF'
-import re, subprocess, sys
-png, rx, nth = sys.argv[1], sys.argv[2], int(sys.argv[3])
-tsv = subprocess.run(["tesseract", png, "stdout", "--psm", "11", "tsv"], capture_output=True, text=True).stdout.splitlines()
-hit = 0
-for ln in tsv[1:]:
-    f = ln.split("\t")
-    if len(f) < 12 or not f[11].strip():
-        continue
-    if re.fullmatch(rx, f[11].strip()):
-        hit += 1
-        if hit == nth:
-            print(int(f[6]) + int(f[8]) // 2, int(f[7]) + int(f[9]) // 2)
-            break
-PYEOF
-}
+word_at() { python3 -I "$(dirname "${BASH_SOURCE[0]}")/ocr_words.py" "$OUT/$1.png" "$2" "${3:-1}"; }
 # touch the n-th word matching a regex ($1); returns 1 when the word is not on the screen
 tap_word() { local p; shot _w; p=$(word_at _w "$1" "${2:-1}"); [ -n "$p" ] || { echo "  (no word $1 on the screen)"; return 1; }
     $ADB shell input tap $p; sleep "${3:-1.5}"; }
@@ -125,7 +110,7 @@ sleep 20 # a fresh emulator is still starting its launcher, Gboard and the packa
 dismiss_anr
 $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null
 for _ in $(seq 40); do [ -n "$($ADB shell pidof $PKG)" ] && break; sleep 1; done
-check "login screen shows" "$(OCR_TRIES=40 wait_ocr 1_login 'Anmelden')" 1
+check "login screen shows" "$(OCR_TRIES=40 wait_ocr 1_login 'Passwort')" 1
 check "process runs" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
 
 # ---- login: found by words; the soft keyboard shifts the layout, so each field is left with Back before the next tap
@@ -157,7 +142,7 @@ check "streamed reply visible" "$(wait_ocr 3_reply 'Hallo hello')" 1
 # ---- tabs: five different screens, no crash. The bar (Chat Board Tasks Devices More) is found by words; "Chat" brings the chat back.
 # Then a restart (the session is saved).
 HASH_CHAT=$(md5sum <"$OUT/3_reply.png" | cut -c1-8)
-n=0; for w in Board Tasks Devices More; do
+n=0; for w in Board Aufgaben "Ger.te" Mehr; do
     tap_word "$w" 1 3; n=$((n+1)); shot tab$n
     h=$(md5sum <"$OUT/tab$n.png" | cut -c1-8)
     check "tab $w differs from the chat" "$([ "$h" != "$HASH_CHAT" ] && echo yes)" yes

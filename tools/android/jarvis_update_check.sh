@@ -101,22 +101,7 @@ for _ in $(seq 150); do [ "$($ADB shell getprop sys.boot_completed 2>/dev/null |
 read -r SW SH < <($ADB shell wm size | tr -d '\r' | sed -n 's/.*: *\([0-9]*\)x\([0-9]*\).*/\1 \2/p' | tail -1)
 shot() { $ADB exec-out screencap -p >"$OUT/$1.png"; }
 ocr() { tesseract "$OUT/$1.png" stdout 2>/dev/null | tr -s '\n ' ' '; }
-word_at() { python3 -I - "$OUT/$1.png" "$2" "${3:-1}" <<'PY'
-import re, subprocess, sys
-png, rx, nth = sys.argv[1], sys.argv[2], int(sys.argv[3])
-tsv = subprocess.run(["tesseract", png, "stdout", "--psm", "11", "tsv"], capture_output=True, text=True).stdout.splitlines()
-hit = 0
-for ln in tsv[1:]:
-    f = ln.split("\t")
-    if len(f) < 12 or not f[11].strip():
-        continue
-    if re.fullmatch(rx, f[11].strip()):
-        hit += 1
-        if hit == nth:
-            print(int(f[6]) + int(f[8]) // 2, int(f[7]) + int(f[9]) // 2)
-            break
-PY
-}
+word_at() { python3 -I "$(dirname "${BASH_SOURCE[0]}")/ocr_words.py" "$OUT/$1.png" "$2" "${3:-1}"; }
 # the channel switch: a focused button defeats OCR of its own text, so it is found by position: the button row sits a fixed
 # distance above "Notifications" (an anchor that is never focused), the switch is the right-hand button (x about 0.66 of the width)
 tap_switch() { local p x y; shot _w; p=$(word_at _w "Notifications"); [ -n "$p" ] || { echo "  (no anchor on the screen)"; return 1; }

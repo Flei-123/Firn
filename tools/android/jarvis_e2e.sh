@@ -78,22 +78,7 @@ read -r SW SH < <($ADB shell wm size | tr -d '\r' | sed -n 's/.*: *\([0-9]*\)x\(
 shot() { $ADB exec-out screencap -p >"$OUT/$1.png"; }
 ocr() { tesseract "$OUT/$1.png" stdout 2>/dev/null | tr -s '\n ' ' '; }
 # the centre (pixels) of the n-th word matching a regex in the screenshot $1; empty when there is none
-word_at() { python3 -I - "$OUT/$1.png" "$2" "${3:-1}" <<'EOF'
-import re, subprocess, sys
-png, rx, nth = sys.argv[1], sys.argv[2], int(sys.argv[3])
-tsv = subprocess.run(["tesseract", png, "stdout", "--psm", "11", "tsv"], capture_output=True, text=True).stdout.splitlines()
-hit = 0
-for ln in tsv[1:]:
-    f = ln.split("\t")
-    if len(f) < 12 or not f[11].strip():
-        continue
-    if re.fullmatch(rx, f[11].strip()):
-        hit += 1
-        if hit == nth:
-            print(int(f[6]) + int(f[8]) // 2, int(f[7]) + int(f[9]) // 2)
-            break
-EOF
-}
+word_at() { python3 -I "$(dirname "${BASH_SOURCE[0]}")/ocr_words.py" "$OUT/$1.png" "$2" "${3:-1}"; }
 # touch the n-th word matching a regex ($1); fails (returns 1) when the word is not on the screen
 tap_word() { local p; shot _w; p=$(word_at _w "$1" "${2:-1}"); [ -n "$p" ] || { echo "  (no word $1 on the screen)"; return 1; }
     $ADB shell input tap $p; sleep "${3:-1.5}"; }
@@ -157,7 +142,7 @@ $ADB logcat -c
 sleep 15
 $ADB shell am start -n $ACT >/dev/null
 for _ in $(seq 40); do [ -n "$($ADB shell pidof $PKG)" ] && break; sleep 1; done
-check "login screen shows" "$(OCR_TRIES=40 wait_ocr 01_login 'Anmelden')" 1
+check "login screen shows" "$(OCR_TRIES=40 wait_ocr 01_login 'Passwort')" 1
 
 # ---- 1. login + chat ---------------------------------------------------------------------------------------------------------
 echo "== 1. login, message, streamed reply"
@@ -184,12 +169,12 @@ check "Needs list shows the question" "$(OCR_TRIES=10 wait_ocr 05_needs 'Merge')
 tap_word 'Merge\?' 1 2; shot 05b_need_answers
 tap_word "Yes" 1 3
 check "need answered over /api/m/needs/answer" "$(wait_log '"path": "/api/m/needs/answer".*"answer": "Yes"' 10)" 1
-tap_word "Tasks" 1 4
+tap_word "Aufgaben" 1 4
 check "Tasks list shows the task" "$(OCR_TRIES=15 wait_ocr 06_tasks 'milk')" 1
-type_into "Task|New|Add|Text" "callmum" && tap_word "Add" 1 3
+type_into "Neue|Aufgabe|Text" "callmum" && tap_word "Hinzuf.gen" 1 3
 check "task added over /api/m/tasks" "$(wait_log '"path": "/api/m/tasks".*callmum' 10 | awk '{print ($1>0)?"yes":"no"}')" yes
 # the two remaining tab pages, only photographed (design review)
-tap_word "Devices" 1 3; shot 06b_devices
+tap_word "Ger.te" 1 3; shot 06b_devices
 tap_px 965 $TAB_Y 3; shot 06c_more # More tab by place: OCR does not find the small word
 [ "${E2E_STOP:-}" = tabs ] && { echo "stopped after the tab pages (E2E_STOP=tabs): $PASS ok, $FAIL failed"; exit 0; }
 tap_word "Chat" 1 2
