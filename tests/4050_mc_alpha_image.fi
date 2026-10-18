@@ -1,0 +1,238 @@
+// expect_exit: 0
+// tests/4050_mc_alpha_image.fi -- r248 image proof of the texel-alpha classification (r242): model quads whose texture is partly transparent
+// (stone / dirt here: NO glass / ice name) go to MESH_MODEL_T once ms_set_atlas is set and are BLENDED src-alpha in the CPU raster. Reference pixels:
+// the same scene WITHOUT the atlas (opaque stream, cut out: alpha >= 128 written as the shaded texel, alpha < 128 discarded).
+// Checks: alpha 128 -> blend(texel, clear, 128) != cut-out texel; alpha 60 -> blend(texel, clear, 60) (an alpha test would show the clear colour);
+// both stacked -> near over (far over clear); the atlas-less picture of alpha 60 is the clear colour (alpha test) so the test can tell blend from test.
+import std.rt
+import std.core
+import std.math
+import std.io
+import zip.zip
+import pack.icons
+import mc.mc_assets
+import mc.mc_texture
+import mc.mc_texext
+import mc.mc_mesh
+import mc.mc_model
+import mc.mc_model_mesh
+import mc.mc_registry
+import mc.mc_version
+import mc.mc_versions
+import mc.mc_chunk
+import mc.mc_world
+import mc.mc_camera
+import mc.mc_math
+import mc.mc_backend
+import mc.mc_raster
+import mc.mc_render_world
+
+const META: str = "{\"pack\":{\"pack_format\": 15, \"description\":\"t\"}}"
+const W: i32 = 96
+const H: i32 = 72
+const CLEAR: u32 = 0xFF40A0C0 as u32 // R 0xC0 G 0xA0 B 0x40 (little endian R | G << 8 | B << 16)
+const MIN_Y: i32 = 0 - 64
+
+// 16 x 16 solid colour PNG
+fn png_solid(r: u8, g: u8, b: u8, a: u8, out: *mut rt.Buf) -> bool {
+    let px: u64 = rt.heap_alloc(16 * 16 * 4)
+    var i: usize = 0
+    while i < 256 {
+        rt.st8(px, i * 4, r)
+        rt.st8(px, i * 4 + 1, g)
+        rt.st8(px, i * 4 + 2, b)
+        rt.st8(px, i * 4 + 3, a)
+        i = i + 1
+    }
+    let ok: bool = icons.png_encode(px, 16, 16, out)
+    rt.heap_free(px, 16 * 16 * 4)
+    return ok
+}
+
+fn add_text(w: *mut zip.ZipWriter, name: str, s: str) -> bool {
+    var ok: bool = zip.zip_add(w, name, s.p as u64, s.length(), true) catch | e | (false)
+    return ok
+}
+
+fn add_png(w: *mut zip.ZipWriter, name: str, r: u8, g: u8, b: u8, a: u8) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    if !png_solid(r, g, b, a, &p) { return false }
+    var ok: bool = zip.zip_add(w, name, rt.buf_ptr(&p), rt.buf_len(&p), true) catch | e | (false)
+    rt.buf_free(&p)
+    return ok
+}
+
+// blockstate of a block without properties: one model for every state
+fn add_state(w: *mut zip.ZipWriter, block: str, model: str) -> bool {
+    return add_text(w, "assets/minecraft/blockstates/" + block + ".json", "{\"variants\":{\"\":{\"model\":\"" + model + "\"}}}")
+}
+
+// a model with ONE down face covering the whole bottom of the cell (not a unit cube, so the state is a model), texture `tex`
+fn add_down_model(w: *mut zip.ZipWriter, name: str, tex: str) -> bool {
+    return add_text(w, "assets/minecraft/models/block/" + name + ".json",
+        "{\"textures\":{\"t\":\"block/" + tex + "\"},\"elements\":[{\"from\":[0,0,0],\"to\":[16,16,16],\"faces\":{\"down\":{\"uv\":[0,0,16,16],\"texture\":\"#t\"}}}]}")
+}
+
+fn open_pack(b: *mut rt.Buf, w: *mut zip.ZipWriter, st: *mut mc_assets.PackStack) -> bool {
+    var n: usize = zip.zip_finish(w) catch | e | (0)
+    zip.zip_writer_free(w)
+    if n == 0 { return false }
+    var pk: mc_assets.Pack = mc_assets.pack_empty()
+    if mc_assets.pack_open_mem(&pk, rt.buf_ptr(b), rt.buf_len(b)) != mc_assets.ASSET_OK { return false }
+    rt.buf_free(b)
+    return mc_assets.stack_push(st, &pk) == mc_assets.ASSET_OK
+}
+
+fn sid(reg: *mut mc_registry.Registry, name: str) -> i32 {
+    let blk: i32 = mc_registry.reg_block_by_name(reg, name.p as u64, name.length())
+    if blk < 0 { return 0 - 1 }
+    return mc_registry.reg_block_min_state(reg, blk)
+}
+
+// cell (x, y, z) of section 0 (a 16 x 16 x 16 u16 array per section, 2 sections)
+fn put(ids: u64, x: i32, y: i32, z: i32, state: i32) {
+    rt.st16(ids, ((y * 16 + z) * 16 + x) as usize, state as u16)
+}
+
+fn new_ids() -> u64 {
+    let ids: u64 = rt.heap_alloc(2 * 4096 * 2)
+    var i: usize = 0
+    while i < 8192 {
+        rt.st16(ids, i, 0 as u16)
+        i = i + 1
+    }
+    return ids
+}
+
+fn chan(c: u32, k: i32) -> i32 {
+    return ((c >> ((k * 8) as u32)) & (255 as u32)) as i32
+}
+
+fn iabs(v: i32) -> i32 {
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// everything a scene needs, rebuilt per scene
+struct Scene {
+    tb: mc_mesh.MeshTables,
+    ex: mc_texext.TexExt,
+    atlas: mc_texture.Atlas,
+    an: mc_assets.AnimSet,
+}
+
+fn scene_init(sc: *mut Scene, reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack) -> bool {
+    (*sc).tb = mc_mesh.MeshTables { opaque: 0, tiles: 0 }
+    mc_texture.tex_alloc_tables(&(*sc).tb)
+    (*sc).ex = mc_texext.texext_new()
+    mc_texext.tex_build_tables_ext(reg, &(*sc).tb, &(*sc).ex)
+    (*sc).atlas = mc_texext.texext_atlas_new(16, &(*sc).ex)
+    (*sc).an = mc_assets.animset_new()
+    return mc_assets.assets_apply_ext(st, &(*sc).atlas, &(*sc).ex, &(*sc).an) >= 1
+}
+
+// look from (ex, ey, ez) at (tx, ty, tz), render and return the centre pixel
+fn shot(r: *mut mc_raster.Raster, wr: *mut mc_render_world.WorldRender, w: *mut mc_world.World, cam: *mut mc_camera.Camera,
+    ex: f64, ey: f64, ez: f64, tx: f64, ty: f64, tz: f64) -> u32 {
+    mc_camera.camera_set_pos(cam, ex, ey, ez)
+    mc_camera.camera_look_at(cam, tx, ty, tz)
+    mc_camera.camera_update(cam)
+    mc_raster.backend_begin(r, cam, CLEAR)
+    mc_render_world.wr_render(wr, w, r, cam, 0 - 1)
+    return mc_raster.raster_pixel(r, W / 2, H / 2)
+}
+
+fn build(st: *mut mc_assets.PackStack) -> bool {
+    var b: rt.Buf = rt.buf_new()
+    var w: zip.ZipWriter = zip.zip_writer_new(&b)
+    if !add_text(&w, "pack.mcmeta", META) { return false }
+    if !add_png(&w, "assets/minecraft/textures/block/dirt.png", 230 as u8, 40 as u8, 40 as u8, 60 as u8) { return false } // far: red, alpha 60
+    if !add_png(&w, "assets/minecraft/textures/block/stone.png", 40 as u8, 60 as u8, 240 as u8, 128 as u8) { return false } // near: blue, alpha 128
+    if !add_down_model(&w, "tg_far", "dirt") { return false }
+    if !add_down_model(&w, "tg_near", "stone") { return false }
+    if !add_state(&w, "dirt", "block/tg_far") { return false }
+    if !add_state(&w, "stone", "block/tg_near") { return false }
+    return open_pack(&b, &w, st)
+}
+
+// src-alpha blend of the raster, per channel
+fn bl(c: i32, dst: i32, a: i32) -> i32 {
+    return (c * a + dst * (255 - a) + 127) / 255
+}
+
+fn blend(src: u32, dst: u32, a: i32) -> u32 {
+    let r: i32 = bl(chan(src, 0), chan(dst, 0), a)
+    let g: i32 = bl(chan(src, 1), chan(dst, 1), a)
+    let b: i32 = bl(chan(src, 2), chan(dst, 2), a)
+    return (r as u32) | ((g as u32) << 8 as u32) | ((b as u32) << 16 as u32) | (0xFF000000 as u32)
+}
+
+// One picture: the cell y = 8 holds the NEAR quad (stone, alpha 128), the cell y = 12 the FAR quad (dirt, alpha 60), the camera looks up from y = 4.
+// `atlas`: ms_set_atlas on (texel alpha classifies -> translucent stream) or off (names only -> opaque stream, cut out). Returns the centre pixel.
+fn scene(reg: *mut mc_registry.Registry, st: *mut mc_assets.PackStack, sc: *mut Scene, near: bool, far: bool, atlas: bool) -> u32 {
+    let ids: u64 = new_ids()
+    if near { put(ids, 8, 8, 8, sid(reg, "stone")) }
+    if far { put(ids, 8, 12, 8, sid(reg, "dirt")) }
+    var ms: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(reg, st, &(*sc).ex)
+    if atlas { mc_model_mesh.ms_set_atlas(&ms, &(*sc).atlas) }
+    var wd: mc_world.World = mc_world.world_new()
+    if !mc_world.world_put(&wd, mc_render_world.wr_make_chunk(0, 0, 2, ids)) { return 0 as u32 }
+    var r: mc_raster.Raster = mc_raster.raster_new(W, H)
+    mc_raster.backend_upload_atlas(&r, &(*sc).atlas)
+    var wr: mc_render_world.WorldRender = mc_render_world.wr_new(MIN_Y, 8, &(*sc).tb)
+    let msp: *mut mc_model_mesh.ModelSet = &ms
+    mc_render_world.wr_set_models(&wr, msp as u64)
+    mc_render_world.wr_set_translucent(&wr, true, mc_texture.T_WATER, mc_texture.T_ICE, mc_texture.T_GLASS)
+    var cam: mc_camera.Camera = mc_camera.camera_new(W, H)
+    mc_camera.camera_set_lens(&cam, 40.0, 0.05, 200.0)
+    let base: f64 = (MIN_Y as f64)
+    let px: u32 = shot(&r, &wr, &wd, &cam, 8.5, base + 4.0, 8.9, 8.5, base + 12.0, 8.5)
+    mc_model_mesh.ms_free(&ms)
+    return px
+}
+
+fn main() -> i32 {
+    var v: mc_version.Version = mc_version.version_empty()
+    if !mc_versions.version_by_protocol(763, &v) { return 1 }
+    var reg: mc_registry.Registry = v.registry_of()
+    if !mc_registry.registry_ok(&reg) { return 2 }
+    var st: mc_assets.PackStack = mc_assets.stack_new()
+    if !build(&st) { return 3 }
+    var ex0: mc_texext.TexExt = mc_texext.texext_new()
+    var sc: Scene = Scene { tb: mc_mesh.MeshTables { opaque: 0, tiles: 0 }, ex: mc_texext.texext_new(), atlas: mc_texext.texext_atlas_new(16, &ex0), an: mc_assets.animset_new() }
+    if !scene_init(&sc, &reg, &st) { return 4 }
+    var ms: mc_model_mesh.ModelSet = mc_model_mesh.ms_new(&reg, &st, &sc.ex)
+    let s_far: i32 = sid(&reg, "dirt")
+    let s_near: i32 = sid(&reg, "stone")
+    if s_far < 0 || s_near < 0 { return 5 }
+    if mc_model_mesh.ms_kind(&ms, s_far as u16) != mc_model_mesh.K_MODEL { return 6 }
+    if mc_model_mesh.ms_kind(&ms, s_near as u16) != mc_model_mesh.K_MODEL { return 7 }
+    mc_model_mesh.ms_free(&ms)
+
+    // no atlas: names only, both quads opaque stream. Alpha 128 is written as the shaded texel, alpha 60 is discarded (alpha test)
+    let clear: u32 = scene(&reg, &st, &sc, false, false, false)
+    let on: u32 = scene(&reg, &st, &sc, true, false, false)
+    let of: u32 = scene(&reg, &st, &sc, false, true, false)
+    if clear != CLEAR { return 10 }
+    if on == clear { return 11 }
+    if of != clear { return 12 } // alpha 60: cut out, nothing drawn
+    // atlas: both translucent -> blend
+    let pn: u32 = scene(&reg, &st, &sc, true, false, true)
+    let pf: u32 = scene(&reg, &st, &sc, false, true, true)
+    let pb: u32 = scene(&reg, &st, &sc, true, true, true)
+    io.fmt_print(f"clear {chan(clear, 0)} {chan(clear, 1)} {chan(clear, 2)} | cut near {chan(on, 0)} {chan(on, 1)} {chan(on, 2)}\n")
+    io.fmt_print(f"blend near {chan(pn, 0)} {chan(pn, 1)} {chan(pn, 2)} far {chan(pf, 0)} {chan(pf, 1)} {chan(pf, 2)} both {chan(pb, 0)} {chan(pb, 1)} {chan(pb, 2)}\n")
+    // near (alpha 128): blend of the shaded texel over the clear colour, not the opaque texel
+    if pn == on { return 20 }
+    if pn != blend(on, clear, 128) { return 21 }
+    // far (alpha 60): visible although the alpha test would drop it; colour = shaded red texel at alpha 60. The shaded texel of the far quad
+    // is the same constant as for alpha 255 shading: derive it from the near one (same light, same face) is not possible (other colour), so
+    // check the blend channel-wise against the raw texel within the shade tolerance.
+    if pf == clear { return 22 }
+    if !(chan(pf, 0) > chan(clear, 0) - 60 && chan(pf, 0) < chan(clear, 0) + 60) { return 23 }
+    if !(chan(pf, 1) < chan(clear, 1) && chan(pf, 2) < chan(clear, 2)) { return 24 } // red texel (40, 40) pulls G and B down
+    // both: near over (far over clear) differs from the reverse order
+    let want: u32 = blend(on, pf, 128)
+    if pb != want { return 31 }
+    return 0
+}

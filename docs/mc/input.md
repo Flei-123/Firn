@@ -63,3 +63,7 @@ Measured: input_pick ~2.0 us/call, player_tick ~170 us (256 chunks; linear `worl
 - Honey wall slide (`HoneyBlock.isSlidingDown`): vy = -0.05 after the move, then gravity -> -0.1274 per tick. Not modelled: flying, powder snow, fall damage.
 - Bamboo (max 0.25) and pointed dripstone (max 0.125): shape code | `OFF_A` (0x8000) / `OFF_B` (0x4000); `mc_math.shape_box_at` adds the vanilla offset of the cell (`block_offset`, Mth.getSeed + float32 math).
 - Checks: `tools/mc/input/run.sh` (python reference, 12 `slow_*` scenes bit identical + 5 mutation counters), `tests/3530_mc_input_slowdown.fi`.
+
+## r238: collision of pack-model blocks (no extra code needed)
+* Player collision NEVER reads resource-pack models. `demos/mcplay` fills `InputTables.solid` from the registry (`mc_shapes.shapes_fill`, `tab_code` data table) before and independent of `MCPLAY_MODELS`; vanilla uses fixed Java code shapes (stairs, fences, slabs, walls ...), not the model JSONs, so a pack that changes a model's geometry changes only the picture (and, with `mc_model_pick`, the pick/selection), not where the player stands.
+* Proof: `tests/4071_mc_model_collision.fi` -- all 1.20.1 states of `*_stairs/_fence/_fence_gate/_wall/_trapdoor/_door/_pane` are partial (or passable), slab halves = 2 x double slabs; walking on registry ids: stairs step 0.5 + 0.5 without a jump (stepHeight 0.6), reversed stairs a wall, fence post not jumpable.

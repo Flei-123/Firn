@@ -39,6 +39,7 @@ import fui.gpu
 import window.window
 import window.pointers
 import plat.fuiwirt
+import plat.gpuchain
 import fui.recorder
 import fui.damage
 import fui.event
@@ -65,7 +66,7 @@ export {
     // r422: a present hook (lib/plat/fuiwingl.fi: the canvas goes through an OpenGL window instead of PutImage)
     window_set_present, window_clear_present, window_present_hooked,
     // W18-F3: the GPU PROVIDER (lib/plat/fuiwinvk.fi: fUi painted on Vulkan, read back, shown by the CPU present)
-    window_set_gpu_provider, window_force_provider, window_gpu_readback,
+    window_set_gpu_provider, window_force_provider, window_fail_gl, window_gpu_readback,
     // W39: swapchain present of the provider (no read-back), vsync, finish
     window_set_gpu_present, window_gpu_present, window_vsync, window_gpu_finish,
 }
@@ -120,6 +121,7 @@ struct Window {
     gpu_rb: bool,
     // W38: the provider goes FIRST even when the window layer has a GPU of its own (Windows: WGL / OpenGL) -- FUI_GPU=1 means Vulkan
     prov_force: bool,
+    gl_fail: i32, // test hook (window_fail_gl): 1 = the GL stage does not open, 2 = its shaders do not build, 0 = real
     // W39 PRESENT: the provider can also show the canvas target itself (Vulkan swapchain on the window): no read-back, no CPU copy.
     // psc_open(native handle, w, h), psc_show(w, h) = 1 shown / 0 not shown (swapchain unusable) / -1 device gone, psc_close, psc_vsync(on).
     psc_on: bool,
@@ -208,6 +210,11 @@ fn window_gpu_finish(fx: *mut Window) {
 
 // W38: the provider is tried BEFORE the window layer's own GPU (Windows has WGL / OpenGL and would otherwise never ask the provider:
 // FUI_GPU=1 silently stayed on OpenGL). A provider that says no leaves the window layer's own GPU (or the CPU painter) in charge.
+// W42-b: fake a failing GL stage (1 = no context, 2 = fUi's shaders do not build) to test the chain GL -> Vulkan -> CPU. 0 = off.
+fn window_fail_gl(fx: *mut Window, mode: i32) {
+    (*fx).gl_fail = mode
+}
+
 fn window_force_provider(fx: *mut Window, on: bool) {
     (*fx).prov_force = on
 }
@@ -299,7 +306,7 @@ fn window_new() -> Window {
         gpu_will: true, gpu_an: false, gl: gl.gl_api_new(), gp: gpu.gpu_new(),
         hook_on: false, hook_ud: 0, hook: hook_none, real: false, rmouse: false, pdown: 0,
         pres_on: false, pres_ud: 0, pres: pres_none,
-        prov_on: false, prov_open: prov_open_none, prov_ok: prov_ok_none, prov_close: prov_close_none, gpu_rb: false, prov_force: false,
+        prov_on: false, prov_open: prov_open_none, prov_ok: prov_ok_none, prov_close: prov_close_none, gpu_rb: false, prov_force: false, gl_fail: 0,
         psc_on: false, psc_open: psc_open_none, psc_show: psc_show_none, psc_close: prov_close_none, psc_vsync: psc_vsync_none, pres_sc: false,
         hc: syspref.hcstate_new() }
 }
@@ -328,23 +335,41 @@ fn gpu_start(fx: *mut Window) {
     if !(*fx).gpu_will || (*fx).cap == 0 {
         return
     }
-    if (*fx).prov_on && (*fx).prov_force {
-        gpu_start_provider(fx)
+    // THE CHAIN (lib/plat/gpuchain.fi): the window's own GL and the Vulkan provider in the order the policy gave; a stage that does not
+    // open hands over to the next one, the CPU painter is what is left. `window_fail_gl` fakes a failing GL stage (tests).
+    var tried: i32 = 0
+    var guard: i32 = 0
+    while guard < 3 {
+        let st: i32 = gpuchain.next_stage(tried, (*fx).prov_on, (*fx).prov_force)
+        if st == gpuchain.STAGE_CPU {
+            return
+        }
+        tried = tried | gpuchain.stage_bit(st)
+        if st == gpuchain.STAGE_VULKAN {
+            gpu_start_provider(fx)
+        } else {
+            gpu_start_gl(fx)
+        }
         if (*fx).gpu_an {
             return
         }
+        guard = guard + 1
+    }
+}
+
+// The window layer's own GL: context, fUi's renderer on it, canvas on the GPU. Any "no" gives the context back and leaves the
+// table empty, so the next stage starts clean (W42-b: before, a GL context that opened but whose shaders did not build ended the
+// chain on the CPU without asking Vulkan).
+fn gpu_start_gl(fx: *mut Window) {
+    if (*fx).gl_fail == 1 {
+        return
     }
     if !window.gpu_open(&(*fx).f, (&(*fx).gl) as u64) {
-        // the window has no GPU of its own (X11, Osum): a provider (FUI_GPU=1, Vulkan) may paint for it
-        if !(*fx).prov_force {
-            gpu_start_provider(fx)
-        }
         return
     }
-    if !gpu.gpu_open(&(*fx).gp, &(*fx).gl) {
-        return
-    }
-    if !gpu.gpu_attach(&(*fx).gp, &(*fx).cv) {
+    if (*fx).gl_fail == 2 || !gpu.gpu_open(&(*fx).gp, &(*fx).gl) || !gpu.gpu_attach(&(*fx).gp, &(*fx).cv) {
+        window.gpu_close(&(*fx).f)
+        (*fx).gl = gl.gl_api_new()
         return
     }
     (*fx).gpu_an = true

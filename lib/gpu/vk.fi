@@ -26,12 +26,13 @@
 // THREADS: main thread only (docs/FFI.md, glibc TLS). Vulkan 1.0 core only, no validation layer, no allocator callbacks.
 
 import std.rt
+import std.env
 import std.dynlib
 import gpu.vkplat
 
 export {
     Vk, Target, Pipe, Buf, Sc, vk_new, target_new_blank, pipe_blank, buf_blank, sc_blank,
-    open, close, idle, device_name, is_cpu, device_type, api_version, has_surface_ext, has_swapchain, mem_type,
+    open, close, idle, device_name, is_cpu, device_type, api_version, has_surface_ext, has_swapchain, validation_on, mem_type,
     target_new, target_free, read_pixels, pipeline_tri, pipeline_new, pipeline_free, shader_make, shader_free,
     buf_new, buf_write, buf_free, draw,
     sc_open, sc_resize, sc_set_vsync, sc_frame, sc_close, window_pixels, sc_acquire, sc_present, sc_image,
@@ -163,6 +164,7 @@ struct Vk {
     mprops: u64, // VkPhysicalDeviceMemoryProperties (520 octets)
     ext_mask: u64, // instance surface extensions enabled (bit i = vkplat.surface_ext_name(i))
     swapchain: bool, // VK_KHR_swapchain enabled on the device
+    validation: bool, // VK_LAYER_KHRONOS_validation is on the instance (opt-in FUI_GPU_VALIDATE=1, W42-b)
     plat: vkplat.PlatState,
     cache: u64, // VkPipelineCache used by pipeline_new (0 = none), owned by gpu.vk_life
     last_res: u64, // last non-zero VkResult (low 32 bits) seen by submit / acquire / present; gpu.vk_life resets it
@@ -225,7 +227,7 @@ struct Sc {
 
 fn vk_new() -> Vk {
     return Vk { ok: false, step: 0, lib: 0, gipa: 0, ft: 0, scratch: 0, top: 0, inst: 0, phys: 0, dev: 0, queue: 0, qfam: 0,
-        pool: 0, cmd: 0, fence: 0, dev_type: 0, api_ver: 0, vendor: 0, name: 0, mprops: 0, ext_mask: 0, swapchain: false,
+        pool: 0, cmd: 0, fence: 0, dev_type: 0, api_ver: 0, vendor: 0, name: 0, mprops: 0, ext_mask: 0, swapchain: false, validation: false,
         plat: vkplat.plat_new(), cache: 0, last_res: 0, inj_site: 0, inj_res: 0 }
 }
 
@@ -484,8 +486,11 @@ fn make_instance(v: *mut Vk, want_surface: bool) -> bool {
             mask = 0
         }
     }
+    // FUI_GPU_VALIDATE=1: ask for the Khronos validation layer (found through VK_LAYER_PATH / the system layer dirs). A missing layer
+    // (VK_ERROR_LAYER_NOT_PRESENT) is not an error: the instance is made again without it. Messages go to the layer's own stdout log.
+    var want_layer: bool = env.get("FUI_GPU_VALIDATE") == "1"
     var attempt: i32 = 0
-    while attempt < 2 {
+    while attempt < 3 {
         (*v).top = 0
         let app: u64 = sa(v, 48)
         w32(app, 0, 0) // VK_STRUCTURE_TYPE_APPLICATION_INFO
@@ -507,6 +512,12 @@ fn make_instance(v: *mut Vk, want_surface: bool) -> bool {
         let ci: u64 = sa(v, 64)
         w32(ci, 0, 1) // INSTANCE_CREATE_INFO
         w64(ci, 24, app)
+        if want_layer {
+            let lnames: u64 = sa(v, 8)
+            rt.st64(lnames, 0, cstr(v, "VK_LAYER_KHRONOS_validation"))
+            w32(ci, 32, 1)
+            w64(ci, 40, lnames)
+        }
         w32(ci, 48, cnt)
         w64(ci, 56, names)
         let out: u64 = sa(v, 8)
@@ -514,12 +525,17 @@ fn make_instance(v: *mut Vk, want_surface: bool) -> bool {
         if good(r) {
             (*v).inst = r64(out, 0)
             (*v).ext_mask = mask
+            (*v).validation = want_layer
             return true
         }
-        if mask == 0 {
-            return false
+        if want_layer {
+            want_layer = false
+        } else {
+            if mask == 0 {
+                return false
+            }
+            mask = 0
         }
-        mask = 0
         attempt = attempt + 1
     }
     return false
@@ -775,6 +791,11 @@ fn has_surface_ext(v: *mut Vk) -> bool {
     return (*v).ext_mask != 0
 }
 
+// true when the validation layer is really on this instance (FUI_GPU_VALIDATE=1 and the layer was found)
+fn validation_on(v: *mut Vk) -> bool {
+    return (*v).validation
+}
+
 fn has_swapchain(v: *mut Vk) -> bool {
     return (*v).swapchain
 }
@@ -875,8 +896,8 @@ fn rpass_make(v: *mut Vk, fmt: u64, mode: i32) -> u64 {
     w32(att, 8, 1) // 1 sample
     w32(att, 12, 1) // load op CLEAR
     w32(att, 16, 0) // store op STORE
-    w32(att, 20, 2) // stencil DONT_CARE
-    w32(att, 24, 2)
+    w32(att, 20, 2) // stencil load DONT_CARE
+    w32(att, 24, 1) // stencil store DONT_CARE (store ops: 0 STORE, 1 DONT_CARE; 2 is invalid)
     w32(att, 28, 0) // initial UNDEFINED
     if mode == 0 {
         w32(att, 32, 6) // TRANSFER_SRC_OPTIMAL

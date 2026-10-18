@@ -5,6 +5,8 @@
 # MCPLAY_MODELS=0 (stairs = cubes), LS / VS = GL / Vulkan with MCPLAY_STREAM=0 (mc_render_world path).
 # Checks: exit 0, frames, `models on` + `models states=N unmapped=0`; every model run has >= 60 pixels of EACH of the four fixture colours;
 # PSNR(L, C), PSNR(LS, C), PSNR(V, C), PSNR(VS, C) (3D view crop) >= MODELS_GL_MIN_DB (34); L / V differ from the cube runs L0 / V0 in >= 0.5 % of the pixels.
+# r248 selection box: a bottom slab (half-height model) at (0, -60, 3) lies under the crosshair; the picked model's box must be the model bounds (half a block
+# high) on EVERY back end, not the whole block: the top-most near-black row (box edge) in a column band left of the crosshair has to match the CPU run (<= 6 px).
 # Prints `RESULT mc-play-models-gl: ok|FAIL`. Env: FIRNC, MODELS_KEEP_DIR, MODELS_RUN_S (30), MODELS_GL_MIN_DB (34), MODELS_GL_ONLY=gl|vk. Start it via heavy (java server).
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
@@ -38,7 +40,15 @@ def var(y):
     return v
 bs = json.dumps({"variants": {"facing=east,half=bottom,shape=straight": var(0), "facing=south,half=bottom,shape=straight": var(90),
     "facing=west,half=bottom,shape=straight": var(180), "facing=north,half=bottom,shape=straight": var(270)}})
+slab = {"parent": "block/slab", "textures": tex}
+slab_top = {"parent": "block/slab_top", "textures": tex}
+full = {"parent": "block/cube_all", "textures": {"all": "block/oak_planks"}}
+bs_slab = json.dumps({"variants": {"type=bottom": {"model": "block/mdl_slab"}, "type=top": {"model": "block/mdl_slab_top"}, "type=double": {"model": "block/mdl_full"}}})
 with zipfile.ZipFile(sys.argv[1], "w") as z:
+    z.writestr("assets/minecraft/models/block/mdl_slab.json", json.dumps(slab))
+    z.writestr("assets/minecraft/models/block/mdl_slab_top.json", json.dumps(slab_top))
+    z.writestr("assets/minecraft/models/block/mdl_full.json", json.dumps(full))
+    z.writestr("assets/minecraft/blockstates/oak_slab.json", bs_slab)
     z.writestr("pack.mcmeta", json.dumps({"pack": {"pack_format": 15, "description": "mcplay models gate fixture"}}))
     z.writestr("assets/minecraft/textures/block/oak_planks.png", png.getvalue())
     z.writestr("assets/minecraft/models/block/mdl_stairs.json", model)
@@ -84,8 +94,9 @@ for spec in "-2 east" "0 south" "2 west" "4 north"; do
     set -- $spec
     echo "setblock $1 -60 5 oak_stairs[facing=$2]" >&3
 done
-for i in $(seq 1 30); do [ "$(tail -n +"$((NSB + 1))" "$W/server.log" | grep -c 'Changed the block')" -ge 4 ] && break; sleep 1; done
-[ "$(tail -n +"$((NSB + 1))" "$W/server.log" | grep -c 'Changed the block')" -ge 4 ] || fail "server setblock of the stairs"
+echo "setblock 0 -60 3 oak_slab[type=bottom]" >&3 # r248: half-height model under the crosshair (selection box)
+for i in $(seq 1 30); do [ "$(tail -n +"$((NSB + 1))" "$W/server.log" | grep -c 'Changed the block')" -ge 5 ] && break; sleep 1; done
+[ "$(tail -n +"$((NSB + 1))" "$W/server.log" | grep -c 'Changed the block')" -ge 5 ] || fail "server setblock of the stairs"
 DN=$((90 + RANDOM % 100))
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
@@ -154,7 +165,7 @@ for n in L0 V0 L V; do case " $RUNS " in *" $n "*) grep -qi "warn\|ignored" "$W/
 if [ $ERR -eq 0 ]; then
     python3 -I - "$W" "$RUNS" "${MODELS_GL_MIN_DB:-34}" <<'PY' || ERR=1
 import sys, math
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageFilter
 W, runs, mindb = sys.argv[1], sys.argv[2].split(), float(sys.argv[3])
 box = (0, 60, 640, 330)
 def img(n): return Image.open(f"{W}/{n}.png").convert("RGB").crop(box)
@@ -171,7 +182,17 @@ def fixture(im):
         elif b * 100 >= m * 88 and lo(r) and lo(g): cnt[2] += 1
         elif r * 100 >= m * 80 and g * 100 >= m * 80 and lo(b): cnt[3] += 1
     return cnt
+def dark(im):
+    return im.convert("L").point(lambda v: 255 if v < 25 else 0)
 def psnr(a, b):
+    # the selection box of the slab (1 px line on the CPU, 0.03 block thick box elsewhere) is checked on its own (box_top): its dark pixels, dilated
+    # by 6 px, inside the slab rectangle are left out here
+    m = ImageChops.lighter(dark(a), dark(b)).filter(ImageFilter.MaxFilter(13))
+    rect = Image.new("L", a.size, 0); rect.paste(255, (250, 95, 390, 195))
+    m = ImageChops.multiply(m, rect)
+    black = Image.new("RGB", a.size, (0, 0, 0))
+    a = Image.composite(black, a, m)
+    b = Image.composite(black, b, m)
     ha = ImageChops.difference(a, b).histogram()
     se = 0
     for ch in range(3):
@@ -180,6 +201,16 @@ def psnr(a, b):
     return 99.0 if mse == 0 else 10 * math.log10(255 * 255 / mse)
 def ndiff(a, b, t=0):
     return sum(ImageChops.difference(a, b).convert("L").point(lambda v: 255 if v > t else 0).histogram()[255:])
+def box_top(im):
+    # top-most row (in the 3D crop) with near-black pixels in the column band x 250..290 (selection box edges) + their count
+    px = im.load(); top = None; cnt = 0
+    for y in range(im.height):
+        for x in range(250, 291):
+            r, g, b = px[x, y]
+            if max(r, g, b) < 25:
+                cnt += 1
+                if top is None: top = y
+    return top, cnt
 ims = {n: img(n) for n in runs}
 tot = ims["C"].width * ims["C"].height
 bad = 0
@@ -194,6 +225,14 @@ for n in runs:
     tag = "cubes vs models-CPU (info)" if n in ("L0", "V0") else "vs CPU models"
     print(f"  PSNR {n} {tag}: {p:.2f} dB  (px differing > 2 levels: {ndiff(ims[n], ims['C'], 2)} of {tot})")
     if n not in ("L0", "V0") and p < mindb: print(f"  FAIL  PSNR {n} {p:.2f} dB < {mindb}"); bad = 1
+ct, cc = box_top(ims["C"])
+print(f"  selection box top row C: {ct} ({cc} dark px)")
+if ct is None or cc < 20: print("  FAIL  C: no selection box found under the crosshair"); bad = 1
+for n in runs:
+    if n in ("C", "L0", "V0"): continue
+    t, c2 = box_top(ims[n])
+    print(f"  selection box top row {n}: {t} ({c2} dark px)")
+    if t is None or ct is None or abs(t - ct) > 6 or c2 < 20: print(f"  FAIL  {n}: selection box differs from the CPU model box (full block instead of the model bounds?)"); bad = 1
 for a, b in (("L", "L0"), ("V", "V0")):
     if a in ims and b in ims:
         d = ndiff(ims[a], ims[b], 2)
