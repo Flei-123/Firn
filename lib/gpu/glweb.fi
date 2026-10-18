@@ -36,7 +36,7 @@ import mc.mc_math
 
 export {
     GlWeb, glweb_open, glweb_close, glweb_backend, glweb_show, glweb_set_fog, glweb_set_light, glweb_set_cull, glweb_resize,
-    glweb_draws, glweb_tris, glweb_finish, glweb_calls, glweb_upload_bytes, glweb_error, glweb_width, glweb_height,
+    glweb_draws, glweb_tris, glweb_finish, glweb_calls, glweb_upload_bytes, glweb_error, glweb_set_layer_limit, glweb_atlas_pages, glweb_layers_lost, glweb_max_layers, glweb_width, glweb_height,
     glweb_camera_rv, glweb_fog_on, glweb_fog_start, glweb_fog_end, glweb_fog_r, glweb_fog_g, glweb_fog_b,
     glweb_rebind, glweb_poll_context, glweb_recreate, glweb_keep_meshes, glweb_lost_meshes, glweb_fbo,
     CTX_OK, CTX_LOST, CTX_RESTORED,
@@ -97,6 +97,7 @@ extern fn firn_glw_read_pixels(x: i32, y: i32, w: i32, h: i32, p: u32);
 extern fn firn_glw_flush();
 extern fn firn_glw_finish();
 extern fn firn_glw_get_error() -> i32;
+extern fn firn_glw_get_int(pname: i32) -> i32; // gl.getParameter(pname) | 0 (MAX_ARRAY_TEXTURE_LAYERS)
 extern fn firn_glw_present(w: i32, h: i32);
 extern fn firn_glw_ctx_state() -> i32; // 0 = context alive, 1 = webglcontextlost seen and not yet restored
 extern fn firn_glw_ctx_gen() -> i32; // +1 on every webglcontextrestored (all WebGL object ids from before are dead)
@@ -121,6 +122,8 @@ const GL_RGBA: i32 = 0x1908
 const GL_RGBA8: i32 = 0x8058
 const GL_TEXTURE_2D: i32 = 0xDE1
 const GL_TEXTURE_2D_ARRAY: i32 = 0x8C1A
+const GL_MAX_ARRAY_TEXTURE_LAYERS: i32 = 0x88FF
+const MAX_PAGES: usize = 4 // atlas pages (texture arrays) the fragment shader can address
 const GL_NEAREST: i32 = 0x2600
 const GL_TEXTURE_MAG_FILTER: i32 = 0x2800
 const GL_TEXTURE_MIN_FILTER: i32 = 0x2801
@@ -169,7 +172,15 @@ struct GlWeb {
     fbo: i32,
     color: i32, // RGBA8 texture
     depth: i32, // DEPTH24 renderbuffer
-    atlas_tex: i32, // texture array, layer = tile - 1
+    atlas_tex: i32, // texture array of atlas page 0: layer = tile - 1 (page p holds tiles p*page_layers .. (p+1)*page_layers - 1)
+    atlas_x: [i32; 3], // texture arrays of atlas pages 1..3 (only when the atlas has more layers than MAX_ARRAY_TEXTURE_LAYERS)
+    n_apages: i32, // atlas pages in use (1..MAX_PAGES)
+    page_layers: i32, // layers per page; the shader splits the tile id with it (u_pagel), >= 1048576 = single array
+    limit_set: i32, // > 0: test hook, caps the driver layer limit (glweb_set_layer_limit)
+    max_layers: i32, // MAX_ARRAY_TEXTURE_LAYERS of the driver (read on the first atlas upload; WebGL2 guarantees 256)
+    layers_lost: i32, // layers of the last atlas that did not fit (0 = all uploaded); those tiles read garbage
+    l_atlas_x: [i32; 3],
+    l_pagel: i32,
     atile: i32,
     acols: i32,
     slots: u64,
@@ -204,7 +215,8 @@ struct GlWeb {
 
 fn empty(w: i32, h: i32) -> GlWeb {
     return GlWeb { ok: false, step: 0, w: w, h: h, prog: 0, l_rv: 0 - 1, l_origin: 0 - 1, l_atlas: 0 - 1, l_tiles: 0 - 1,
-        l_fog: 0 - 1, l_fogc: 0 - 1, l_light: 0 - 1, l_fade: 0 - 1, fade_a: 64, fade_inv: 0, fbo: 0, color: 0, depth: 0, atlas_tex: 0, atile: 16, acols: 16, slots: 0, slot_cap: 0,
+        l_fog: 0 - 1, l_fogc: 0 - 1, l_light: 0 - 1, l_fade: 0 - 1, fade_a: 64, fade_inv: 0, fbo: 0, color: 0, depth: 0, atlas_tex: 0, atlas_x: [0; 3], n_apages: 0, page_layers: 1048576, limit_set: 0, max_layers: 0, layers_lost: 0,
+        l_atlas_x: [0 - 1; 3], l_pagel: 0 - 1, atile: 16, acols: 16, slots: 0, slot_cap: 0,
         cx: 0.0, cy: 0.0, cz: 0.0, rv: [0.0 as f32; 16], fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0.0,
         fog_g: 0.0, fog_b: 0.0, day: 256.0, tint_r: 256.0, tint_g: 224.0, tint_b: 176.0, cull: true, pix: 0, tmp: 0, fresh: false, cur_vao: 0, draws: 0, tris: 0, calls: 0,
         up_bytes: 0, gen: 0, keep: true, lost_meshes: 0, atlas_src: 0, log: [0; 512] }
@@ -276,6 +288,10 @@ fn make_gpu_objects(gw: *mut GlWeb) -> i32 {
     (*gw).l_rv = uloc(gw, "u_rv")
     (*gw).l_origin = uloc(gw, "u_origin")
     (*gw).l_atlas = uloc(gw, "u_atlas")
+    (*gw).l_atlas_x[0] = uloc(gw, "u_atlas1")
+    (*gw).l_atlas_x[1] = uloc(gw, "u_atlas2")
+    (*gw).l_atlas_x[2] = uloc(gw, "u_atlas3")
+    (*gw).l_pagel = uloc(gw, "u_pagel")
     (*gw).l_tiles = uloc(gw, "u_tiles")
     (*gw).l_fog = uloc(gw, "u_fog")
     (*gw).l_fogc = uloc(gw, "u_fogc")
@@ -353,8 +369,7 @@ fn glweb_close(gw: *mut GlWeb) {
         (*gw).slots = 0
         (*gw).slot_cap = 0
     }
-    if (*gw).atlas_tex != 0 { firn_glw_delete_texture((*gw).atlas_tex) }
-    (*gw).atlas_tex = 0
+    free_atlas_pages(gw, true)
     free_fbo(gw)
     if (*gw).prog != 0 { firn_glw_delete_program((*gw).prog) }
     (*gw).prog = 0
@@ -367,47 +382,100 @@ fn glweb_close(gw: *mut GlWeb) {
 
 // ---- Backend table ---------------------------------------------------------------------------------------------
 
-// The atlas as a texture ARRAY (layer = tile - 1), NEAREST, REPEAT -- the same copy loop as gl_mc.fi be_atlas.
+// Deletes (del) or only forgets (context lost: the host dropped the ids) the atlas page textures.
+fn free_atlas_pages(gw: *mut GlWeb, del: bool) {
+    if del && (*gw).atlas_tex != 0 { firn_glw_delete_texture((*gw).atlas_tex) }
+    (*gw).atlas_tex = 0
+    var i: usize = 0
+    while i < 3 {
+        if del && (*gw).atlas_x[i] != 0 { firn_glw_delete_texture((*gw).atlas_x[i]) }
+        (*gw).atlas_x[i] = 0
+        i = i + 1
+    }
+    (*gw).n_apages = 0
+}
+
+// The atlas as texture ARRAY(s) (layer = tile - 1), NEAREST, REPEAT -- the same copy loop as gl_mc.fi be_atlas.
+// MAX_ARRAY_TEXTURE_LAYERS caps one array (WebGL2 only guarantees 256): a bigger atlas is split into up to MAX_PAGES arrays of
+// `page_layers` layers each (tile id t - 1 lives in page (t - 1) / page_layers, layer (t - 1) % page_layers; the fragment shader
+// picks the sampler). Only layers beyond MAX_PAGES * limit are lost (glweb_layers_lost).
 fn be_atlas(o: u64, a: u64) {
     let gw: *mut GlWeb = o as *mut GlWeb
     let at: *mut mc_texture.Atlas = a as *mut mc_texture.Atlas
     if (*at).px == 0 { return }
     (*gw).atlas_src = a
-    if (*gw).atlas_tex != 0 {
-        firn_glw_delete_texture((*gw).atlas_tex)
-        (*gw).atlas_tex = 0
-    }
+    free_atlas_pages(gw, true)
     let t: usize = (*at).tile as usize
-    let layers: usize = ((*at).cols as usize) * ((*at).rows as usize)
+    let total: usize = ((*at).cols as usize) * ((*at).rows as usize)
+    if (*gw).max_layers == 0 {
+        (*gw).max_layers = firn_glw_get_int(GL_MAX_ARRAY_TEXTURE_LAYERS)
+        if (*gw).max_layers < 256 { (*gw).max_layers = 256 }
+    }
+    var lim: usize = (*gw).max_layers as usize
+    if (*gw).limit_set > 0 && ((*gw).limit_set as usize) < lim { lim = (*gw).limit_set as usize }
+    var np: usize = 1
+    var pl: usize = total
+    if total > lim {
+        np = (total + lim - 1) / lim
+        pl = lim
+        if np > MAX_PAGES { np = MAX_PAGES }
+    }
+    (*gw).layers_lost = 0
+    if total > np * pl { (*gw).layers_lost = (total - np * pl) as i32 }
     let row: usize = t * 4
     let lbytes: usize = t * row
-    let buf: u64 = rt.heap_alloc(layers * lbytes)
-    if buf == 0 { return }
     let stride: usize = ((*at).w as usize) * 4
-    var l: usize = 0
-    while l < layers {
-        let col: usize = l % ((*at).cols as usize)
-        let rw: usize = l / ((*at).cols as usize)
-        var y: usize = 0
-        while y < t {
-            rt.mem_copy(buf + (l * lbytes + y * row) as u64, (*at).px + ((rw * t + y) * stride + col * row) as u64, row)
-            y = y + 1
+    firn_glw_active_texture(GL_TEXTURE0)
+    var pg: usize = 0
+    while pg < np {
+        var layers: usize = total - pg * pl
+        if layers > pl { layers = pl }
+        let buf: u64 = rt.heap_alloc(layers * lbytes)
+        if buf == 0 { return }
+        var l: usize = 0
+        while l < layers {
+            let g: usize = pg * pl + l
+            let col: usize = g % ((*at).cols as usize)
+            let rw: usize = g / ((*at).cols as usize)
+            var y: usize = 0
+            while y < t {
+                rt.mem_copy(buf + (l * lbytes + y * row) as u64, (*at).px + ((rw * t + y) * stride + col * row) as u64, row)
+                y = y + 1
+            }
+            l = l + 1
         }
-        l = l + 1
+        let id: i32 = firn_glw_create_texture()
+        firn_glw_bind_texture(GL_TEXTURE_2D_ARRAY, id)
+        firn_glw_pixel_storei(GL_UNPACK_ALIGNMENT, 1)
+        firn_glw_tex_parameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        firn_glw_tex_parameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        firn_glw_tex_parameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT)
+        firn_glw_tex_parameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_REPEAT)
+        firn_glw_tex_image_3d(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, (*at).tile, (*at).tile, layers as i32, GL_RGBA, GL_UNSIGNED_BYTE, buf as u32)
+        rt.heap_free(buf, layers * lbytes)
+        if pg == 0 {
+            (*gw).atlas_tex = id
+        } else {
+            (*gw).atlas_x[pg - 1] = id
+        }
+        pg = pg + 1
     }
-    let id: i32 = firn_glw_create_texture()
-    firn_glw_bind_texture(GL_TEXTURE_2D_ARRAY, id)
-    firn_glw_pixel_storei(GL_UNPACK_ALIGNMENT, 1)
-    firn_glw_tex_parameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
-    firn_glw_tex_parameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
-    firn_glw_tex_parameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT)
-    firn_glw_tex_parameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_REPEAT)
-    firn_glw_tex_image_3d(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, (*at).tile, (*at).tile, layers as i32, GL_RGBA, GL_UNSIGNED_BYTE, buf as u32)
-    rt.heap_free(buf, layers * lbytes)
-    (*gw).atlas_tex = id
+    (*gw).n_apages = np as i32
+    if np == 1 {
+        (*gw).page_layers = 1048576 // single array: the shader never splits
+    } else {
+        (*gw).page_layers = pl as i32
+    }
     (*gw).atile = (*at).tile
     (*gw).acols = (*at).cols
 }
+
+// Test hook: caps the driver's array layer limit (0 = driver limit) so the multi-page path can be exercised on a driver that
+// allows thousands of layers. Takes effect on the next upload_atlas.
+fn glweb_set_layer_limit(gw: *mut GlWeb, n: i32) { (*gw).limit_set = n }
+fn glweb_atlas_pages(gw: *mut GlWeb) -> i32 { return (*gw).n_apages }
+fn glweb_layers_lost(gw: *mut GlWeb) -> i32 { return (*gw).layers_lost }
+fn glweb_max_layers(gw: *mut GlWeb) -> i32 { return (*gw).max_layers }
 
 // Returns a free slot index (the table grows by doubling), NONE (all ones) on failure.
 fn alloc_slot(gw: *mut GlWeb) -> usize {
@@ -542,6 +610,18 @@ fn voxel_program(gw: *mut GlWeb) {
     firn_glw_active_texture(GL_TEXTURE0)
     firn_glw_bind_texture(GL_TEXTURE_2D_ARRAY, (*gw).atlas_tex)
     firn_glw_uniform1i((*gw).l_atlas, 0)
+    var xi: usize = 0
+    while xi < 3 {
+        // pages 1..3 on units 3..5; unused samplers point at page 0 (every sampler must hold an array texture of its type)
+        var xt: i32 = (*gw).atlas_x[xi]
+        if xt == 0 { xt = (*gw).atlas_tex }
+        firn_glw_active_texture(GL_TEXTURE0 + 3 + (xi as i32))
+        firn_glw_bind_texture(GL_TEXTURE_2D_ARRAY, xt)
+        firn_glw_uniform1i((*gw).l_atlas_x[xi], 3 + (xi as i32))
+        xi = xi + 1
+    }
+    firn_glw_active_texture(GL_TEXTURE0)
+    firn_glw_uniform1i((*gw).l_pagel, (*gw).page_layers)
     firn_glw_uniform_matrix4fv((*gw).l_rv, ((&(*gw).rv[0]) as u64) as u32)
     firn_glw_uniform2f((*gw).l_tiles, (*gw).atile as f64, (*gw).acols as f64)
     var fogf: f64 = 0.0
@@ -722,7 +802,7 @@ fn glweb_recreate(gw: *mut GlWeb) -> bool {
     (*gw).fbo = 0
     (*gw).color = 0
     (*gw).depth = 0
-    (*gw).atlas_tex = 0
+    free_atlas_pages(gw, false) // the host dropped the ids of the dead context: just forget them
     (*gw).cur_vao = 0
     (*gw).fresh = false
     (*gw).lost_meshes = 0 as u32

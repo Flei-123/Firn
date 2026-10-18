@@ -7,7 +7,11 @@
 precision highp float;
 precision highp int;
 precision highp sampler2DArray;
-uniform sampler2DArray u_atlas;
+uniform sampler2DArray u_atlas;   // atlas page 0 (the whole atlas when it fits into MAX_ARRAY_TEXTURE_LAYERS)
+uniform sampler2DArray u_atlas1;  // atlas pages 1..3 (glweb.be_atlas splits a bigger atlas); unused ones alias page 0
+uniform sampler2DArray u_atlas2;
+uniform sampler2DArray u_atlas3;
+uniform int u_pagel;    // layers per page; >= 1048576 = single array (page 0 only)
 uniform vec2 u_tiles;   // x = tile edge in texels (power of two)
 uniform vec4 u_fog;     // x = 1 fog on, y = start, z = end
 uniform vec3 u_fogc;    // fog colour 0..255
@@ -19,11 +23,24 @@ flat in int v_tile;
 flat in int v_fk;
 in float v_depth;
 out vec4 o_color;
+// page `pg` = tile / u_pagel (flat per primitive), layer inside it = tile % u_pagel
+vec4 fetch_page(int pg, ivec3 c) {
+    if (pg == 0) return texelFetch(u_atlas, c, 0);
+    if (pg == 1) return texelFetch(u_atlas1, c, 0);
+    if (pg == 2) return texelFetch(u_atlas2, c, 0);
+    return texelFetch(u_atlas3, c, 0);
+}
 void main() {
     int tsz = int(u_tiles.x);
     int tx = int(floor(v_uvao.x * float(tsz))) & (tsz - 1);
     int ty = int(floor(v_uvao.y * float(tsz))) & (tsz - 1);
-    ivec4 t = ivec4(texelFetch(u_atlas, ivec3(tx, ty, v_tile - 1), 0) * 255.0 + 0.5);
+    int tl = v_tile - 1;
+    int pg = 0;
+    if (u_pagel < 1048576) {
+        pg = min(tl / u_pagel, 3);
+        tl = tl - pg * u_pagel;
+    }
+    ivec4 t = ivec4(fetch_page(pg, ivec3(tx, ty, tl)) * 255.0 + 0.5);
     if (t.a < 128) discard;
     if (u_fade.x < 63.5) {
         int px = int(gl_FragCoord.x);

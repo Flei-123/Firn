@@ -19,7 +19,7 @@ CLEAR = (0x96, 0xBE, 0xE6)  # 0xFFE6BE96 = A B G R
 # gate 133 (scene layer) reuses this script: GATE_WASM / GATE_CLEAR (RRGGBB) / GATE_MIN_SCENES / GATE_LABEL
 WASM = os.environ.get("GATE_WASM", "mcscene.wasm")
 if os.environ.get("GATE_CLEAR"): CLEAR = tuple(int(os.environ["GATE_CLEAR"][i:i + 2], 16) for i in (0, 2, 4))
-MIN_SCENES = int(os.environ.get("GATE_MIN_SCENES", "9"))
+MIN_SCENES = int(os.environ.get("GATE_MIN_SCENES", "18"))
 LABEL = os.environ.get("GATE_LABEL", "webgl2")
 
 s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
@@ -53,7 +53,7 @@ names = [n for n, _ in scenes]
 if len(imgs) != len(names): fail.append("%d canvas snapshots for %d scenes" % (len(imgs), len(names)))
 for n, b in zip(names, imgs):
     a = np.array(Image.open(io.BytesIO(base64.b64decode(b))).convert("RGB"), dtype=np.int32)
-    f = os.path.join(ref, n + ".cpu.rgba")
+    f = os.path.join(ref, n.replace("_paged", "") + ".cpu.rgba")  # _paged = same scene, atlas split into pages
     if not os.path.exists(f): fail.append(n + ": no native reference"); continue
     r = np.fromfile(f, dtype=np.uint8).reshape(H, W, 4)[:, :, :3].astype(np.int32)
     if a.shape != r.shape: fail.append("%s: size %s" % (n, a.shape)); continue
