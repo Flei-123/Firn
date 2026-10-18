@@ -40,8 +40,19 @@ lookup L8  { sub A B' lookup L7 C' lookup L5; } L8;
 lookup LM  { sub uni0628 by uni0628 uni0627 uni0628; } LM;
 lookup LS  { sub uni0627 by D; } LS;
 
+# W23-b: extras in the matching. 11/12: meem -> meem alef beh (extras), then a
+# ligature of two EXTRAS (alef beh -> D), 17: a ligature from an extra into the next position (D meem -> beh). 13-15: ligatures that reach over
+# extras (pos/extra mixes), 16: multiple substitution with 0 outputs.
+lookup LM2 { sub uni0645 by uni0645 uni0627 uni0628; } LM2;
+lookup LL  { sub uni0627 uni0628 by D; } LL;
+lookup LG1 { sub A B by D; } LG1;
+lookup LG2 { sub B C by D; } LG2;
+lookup LG3 { sub A B C by D; } LG3;
+lookup LN  { sub D by NULL; } LN;
+lookup LX  { sub D uni0645 by uni0628; } LX;
+
 feature dlig { script latn; lookup L8; } dlig;
-feature rlig { script arab; lookup LM; lookup LS; } rlig;
+feature rlig { script arab; lookup LM; lookup LS; lookup LM2; lookup LL; lookup LX; } rlig;
 '''
 addOpenTypeFeaturesFromString(font, FEA)
 font.save(OUT)

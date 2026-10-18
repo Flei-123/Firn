@@ -39,15 +39,20 @@
 //   Multiple      type 2: one output replaces the glyph; SEVERAL outputs make
 //                 the first the glyph of the position and the rest EXTRA
 //                 glyphs of the same character (`gsub_x_insert`), painted
-//                 behind it in reading direction.
+//                 behind it in reading direction. A sequence is the glyph of
+//                 each position followed by its extras: context (5/6) and
+//                 ligature (4) matching walk it by UNITS (`pos * UNIT + k`),
+//                 so extras count as input, backtrack and lookahead and can be
+//                 ligature components. An absorbed position that has extras
+//                 keeps them (the first becomes its glyph). A type 2 sequence
+//                 of 0 glyphs deletes the unit.
 //   ccmp          is taken along (bit F_CCMP, every Arabic position); DejaVu
 //                 carries two chaining lookups under it (Hebrew ayin with
 //                 vowel, the tone letters U+02E5..).
 //
 // WHAT IS NOT READ, and it is said here instead of silently missing:
 // type 3 and 8 (alternate and reverse
-// substitution), and nested lookups that are themselves context
-// lookups. DejaVu needs none of them for `arab`. GPOS (the position of the vowel signs) is likewise not read;
+// substitution). DejaVu needs none of them for `arab`. GPOS (the position of the vowel signs) is likewise not read;
 // how vowel signs nevertheless end up in the right place is stated in
 // lib/fui/painter.fi at the bidi path.
 //
@@ -65,6 +70,9 @@ export {
     gsub_li_ignores_marks, gsub_context_li, gsub_open, gsub_multiple_len, gsub_multiple_glyph,
     gsub_x_reset, gsub_x_count, gsub_x_pos, gsub_x_gid, gsub_x_set,
     gsub_x_room, gsub_x_insert, MAX_EXTRA,
+    UNIT, gsub_ligature_u, gsub_li_ligature_u, gsub_context_u,
+    gsub_context_li_u, gsub_act_unit, gsub_x_cnt, gsub_x_index,
+    gsub_x_remove, gsub_multiple_has, gsub_unit_gid, gsub_unit_next,
     F_ISOL, F_FINA, F_INIT, F_MEDI, F_RLIG, F_LIGA, F_RQD, F_CCMP,
     MAX_LOOKUPS,
 }
@@ -86,6 +94,12 @@ const MAX_LOOKUPS: usize = 48
 
 // The table of EXTRA glyphs (see `gsub_x_insert`) holds this many entries.
 const MAX_EXTRA: usize = 64
+
+// UNITS name one glyph of the sequence a shaping run holds: `pos * UNIT + k`,
+// k = 0 is the glyph of the position, k >= 1 its k-th extra glyph. The
+// sequence runs position by position, each position as glyph + extras.
+// (MAX_EXTRA < UNIT.)
+const UNIT: usize = 128
 
 // The lookup flag IgnoreMarks from the lookup head.
 const LF_IGNORE_MARKS: u32 = 8
@@ -457,17 +471,156 @@ fn single_lk(f: *mut ttf.Font, lk: usize, gid: u32) -> u32 {
     return gid
 }
 
+// ------------------------------------------------------------- UNITS
+//
+// The extra glyphs of one position stand next to each other in the table
+// (`gsub_x_insert` keeps it so). These helpers walk the sequence
+// "glyph, its extras, next position's glyph, ..." by units (see UNIT).
+
+// Index in the table of the first extra of `pos`; MAX_EXTRA + 1 .. no: the
+// count `xn` if the position has none.
+#[no_gc]
+fn x_first(g: *mut Gsub, pos: usize) -> usize {
+    var i: usize = 0
+    while i < (*g).xn && (*g).xpos[i] != pos as u32 {
+        i = i + 1
+    }
+    return i
+}
+
+// How many extra glyphs `pos` has.
+#[no_gc]
+fn gsub_x_cnt(g: *mut Gsub, pos: usize) -> usize {
+    if (*g).xn == 0 {
+        return 0
+    }
+    var i: usize = x_first(g, pos)
+    var c: usize = 0
+    while i < (*g).xn && (*g).xpos[i] == pos as u32 {
+        c = c + 1
+        i = i + 1
+    }
+    return c
+}
+
+// Index in the table of the k-th extra (k from 1) of `pos`, or MAX_EXTRA if
+// there is none.
+#[no_gc]
+fn gsub_x_index(g: *mut Gsub, pos: usize, k: usize) -> usize {
+    if k == 0 || k > gsub_x_cnt(g, pos) {
+        return MAX_EXTRA
+    }
+    return x_first(g, pos) + k - 1
+}
+
+// Take the k-th extra (k from 1) of `pos` out of the table; the later
+// entries move up. false if there is none.
+#[no_gc]
+fn gsub_x_remove(g: *mut Gsub, pos: usize, k: usize) -> bool {
+    let at: usize = gsub_x_index(g, pos, k)
+    if at >= MAX_EXTRA {
+        return false
+    }
+    var j: usize = at
+    while j + 1 < (*g).xn {
+        (*g).xpos[j] = (*g).xpos[j + 1]
+        (*g).xgid[j] = (*g).xgid[j + 1]
+        j = j + 1
+    }
+    (*g).xn = (*g).xn - 1
+    return true
+}
+
+// The glyph of a unit: `gids` is the glyph per position.
+#[no_gc]
+fn unit_gid(g: *mut Gsub, gids: u64, u: usize) -> u32 {
+    let pos: usize = u / UNIT
+    let k: usize = u % UNIT
+    if k == 0 {
+        return *((gids + (pos * 4) as u64) as *mut u32)
+    }
+    let at: usize = gsub_x_index(g, pos, k)
+    if at >= MAX_EXTRA {
+        return 0
+    }
+    return (*g).xgid[at]
+}
+
+#[no_gc]
+fn gsub_unit_gid(g: *mut Gsub, gids: u64, u: usize) -> u32 {
+    return unit_gid(g, gids, u)
+}
+
+// The next unit of the sequence (the first of the next position behind the
+// last extra).
+#[no_gc]
+fn unit_next(g: *mut Gsub, u: usize) -> usize {
+    let pos: usize = u / UNIT
+    if (*g).xn > 0 && (u % UNIT) < gsub_x_cnt(g, pos) {
+        return u + 1
+    }
+    return (pos + 1) * UNIT
+}
+
+#[no_gc]
+fn gsub_unit_next(g: *mut Gsub, u: usize) -> usize { return unit_next(g, u) }
+
+// The unit before `u` (u > 0): the last extra of the position before, if it
+// has any.
+#[no_gc]
+fn unit_prev(g: *mut Gsub, u: usize) -> usize {
+    if u % UNIT > 0 {
+        return u - 1
+    }
+    let pos: usize = u / UNIT - 1
+    if (*g).xn > 0 {
+        return pos * UNIT + gsub_x_cnt(g, pos)
+    }
+    return pos * UNIT
+}
+
 // LIGATURE (type 4). `gids` are the glyphs of the sequence from the first
 // component on, `skip[i] != 0` means "this position no longer exists"
 // (already absorbed into a ligature). If a ligature fits, its
 // glyph comes back and `used` gets the positions of the further components
 // (at most `cap`), `nused` their number; otherwise 0.
+//
+// The sequence the components are searched in contains the EXTRA glyphs
+// (see `gsub_x_insert`) too: a position stands for its glyph followed by
+// its extras. The `_u` variants speak in UNITS (`pos * UNIT + k`, k = 0 the
+// glyph of the position, k >= 1 its k-th extra): `at` and the answer in
+// `used` are units. The plain variants take and give positions -- the
+// same as long as there are no extras.
 #[no_gc]
 fn gsub_ligature(f: *mut ttf.Font, g: *mut Gsub, k: usize, gids: u64,
     skip: u64, n: usize, at: usize, used: u64, cap: usize,
     nused: *mut usize) -> u32 {
+    return ligature_pos(f, g, lookup_at(f, g, k), gids, skip, n, at, used,
+        cap, nused)
+}
+
+#[no_gc]
+fn gsub_ligature_u(f: *mut ttf.Font, g: *mut Gsub, k: usize, gids: u64,
+    skip: u64, n: usize, at: usize, used: u64, cap: usize,
+    nused: *mut usize) -> u32 {
     return ligature_lk(f, g, lookup_at(f, g, k), gids, skip, n, at, used,
         cap, nused)
+}
+
+// Positions in, positions out (the units of `used` shrink back to positions).
+#[no_gc]
+fn ligature_pos(f: *mut ttf.Font, g: *mut Gsub, lk: usize, gids: u64,
+    skip: u64, n: usize, at: usize, used: u64, cap: usize,
+    nused: *mut usize) -> u32 {
+    let r: u32 = ligature_lk(f, g, lk, gids, skip, n, at * UNIT, used, cap,
+        nused)
+    var i: usize = 0
+    while i < *nused {
+        let pu: u64 = used + (i * 4) as u64
+        *(pu as *mut u32) = *(pu as *mut u32) / (UNIT as u32)
+        i = i + 1
+    }
+    return r
 }
 
 #[no_gc]
@@ -476,7 +629,8 @@ fn ligature_lk(f: *mut ttf.Font, g: *mut Gsub, lk: usize, gids: u64,
     nused: *mut usize) -> u32 {
     *nused = 0
     let ign: bool = (u16at(f, lk + 2) & LF_IGNORE_MARKS) != 0 as u32
-    let first: u32 = *((gids + (at * 4) as u64) as *mut u32)
+    let first: u32 = unit_gid(g, gids, at)
+    let un: usize = n * UNIT
     let ns: usize = u16at(f, lk + 4) as usize
     var s: usize = 0
     while s < ns {
@@ -491,28 +645,28 @@ fn ligature_lk(f: *mut ttf.Font, g: *mut Gsub, lk: usize, gids: u64,
                 let comp: usize = u16at(f, lig + 2) as usize
                 var ok: bool = comp >= 1 && comp - 1 <= cap
                 var c: usize = 1
-                var pos: usize = at + 1
+                var pos: usize = unit_next(g, at)
                 while ok && c < comp {
-                    // the next position that still exists and that is not a
+                    // the next unit that still exists and that is not a
                     // skipped character
-                    while pos < n {
-                        if *((skip + pos as u64) as *mut u8) != 0 as u8 {
-                            pos = pos + 1
+                    while pos < un {
+                        if *((skip + (pos / UNIT) as u64) as *mut u8) != 0 as u8 {
+                            pos = unit_next(g, pos)
                         } else if ign && gsub_is_mark(f, g,
-                            *((gids + (pos * 4) as u64) as *mut u32)) {
-                            pos = pos + 1
+                            unit_gid(g, gids, pos)) {
+                            pos = unit_next(g, pos)
                         } else {
                             break
                         }
                     }
-                    if pos >= n {
+                    if pos >= un {
                         ok = false
-                    } else if *((gids + (pos * 4) as u64) as *mut u32)
+                    } else if unit_gid(g, gids, pos)
                     != u16at(f, lig + 4 + (c - 1) * 2) {
                         ok = false
                     } else {
                         *((used + ((c - 1) * 4) as u64) as *mut u32) = pos as u32
-                        pos = pos + 1
+                        pos = unit_next(g, pos)
                         c = c + 1
                     }
                 }
@@ -567,6 +721,14 @@ fn gsub_li_single(f: *mut ttf.Font, g: *mut Gsub, li: u32, gid: u32) -> u32 {
 fn gsub_li_ligature(f: *mut ttf.Font, g: *mut Gsub, li: u32, gids: u64,
     skip: u64, n: usize, at: usize, used: u64, cap: usize,
     nused: *mut usize) -> u32 {
+    return ligature_pos(f, g, lookup_li(f, g, li), gids, skip, n, at, used,
+        cap, nused)
+}
+
+#[no_gc]
+fn gsub_li_ligature_u(f: *mut ttf.Font, g: *mut Gsub, li: u32, gids: u64,
+    skip: u64, n: usize, at: usize, used: u64, cap: usize,
+    nused: *mut usize) -> u32 {
     return ligature_lk(f, g, lookup_li(f, g, li), gids, skip, n, at, used,
         cap, nused)
 }
@@ -600,6 +762,13 @@ fn gsub_multiple_len(f: *mut ttf.Font, g: *mut Gsub, li: u32,
         return 0
     }
     return u16at(f, sq) as usize
+}
+
+// Does the lookup `li` have a sequence for `gid` (also an EMPTY one: the
+// glyph is deleted)?
+#[no_gc]
+fn gsub_multiple_has(f: *mut ttf.Font, g: *mut Gsub, li: u32, gid: u32) -> bool {
+    return multiple_seq(f, g, li, gid) != 0
 }
 
 #[no_gc]
@@ -704,14 +873,14 @@ fn classdef_of(f: *mut ttf.Font, cd: usize, gid: u32) -> u32 {
 
 #[no_gc]
 fn ctx_gid(g: *mut Gsub, pos: usize) -> u32 {
-    return *(((*g).c_gids + (pos * 4) as u64) as *mut u32)
+    return unit_gid(g, (*g).c_gids, pos)
 }
 
 // Does the position not count (absorbed into a ligature, or a mark under
 // IgnoreMarks)?
 #[no_gc]
 fn ctx_skipped(f: *mut ttf.Font, g: *mut Gsub, pos: usize) -> bool {
-    if *(((*g).c_skip + pos as u64) as *mut u8) != 0 as u8 {
+    if *(((*g).c_skip + (pos / UNIT) as u64) as *mut u8) != 0 as u8 {
         return true
     }
     return (*g).c_ign != 0 && gsub_is_mark(f, g, ctx_gid(g, pos))
@@ -743,10 +912,10 @@ fn ctx_fwd(f: *mut ttf.Font, g: *mut Gsub, from: usize, arr: usize,
     var pos: usize = from
     var c: usize = 0
     while c < cnt {
-        while pos < (*g).c_n && ctx_skipped(f, g, pos) {
-            pos = pos + 1
+        while pos < (*g).c_n * UNIT && ctx_skipped(f, g, pos) {
+            pos = unit_next(g, pos)
         }
-        if pos >= (*g).c_n {
+        if pos >= (*g).c_n * UNIT {
             return false
         }
         if !ctx_fits(f, g, arr, c, ctx_gid(g, pos), cd) {
@@ -755,7 +924,7 @@ fn ctx_fwd(f: *mut ttf.Font, g: *mut Gsub, from: usize, arr: usize,
         if rec {
             (*g).ipos[ibase + c] = pos as u32
         }
-        pos = pos + 1
+        pos = unit_next(g, pos)
         c = c + 1
     }
     *end = pos
@@ -772,12 +941,12 @@ fn ctx_back(f: *mut ttf.Font, g: *mut Gsub, at: usize, arr: usize,
         if pos == 0 {
             return false
         }
-        pos = pos - 1
+        pos = unit_prev(g, pos)
         while ctx_skipped(f, g, pos) {
             if pos == 0 {
                 return false
             }
-            pos = pos - 1
+            pos = unit_prev(g, pos)
         }
         if !ctx_fits(f, g, arr, c, ctx_gid(g, pos), cd) {
             return false
@@ -799,9 +968,9 @@ fn ctx_rule(f: *mut ttf.Font, g: *mut Gsub, at: usize, nb: usize, bt: usize,
         return false
     }
     (*g).ipos[0] = at as u32
-    var end: usize = at + 1
+    var end: usize = unit_next(g, at)
     if ni > 1 {
-        if !ctx_fwd(f, g, at + 1, inp1, ni - 1, (*g).c_cdi, true, 1, &end) {
+        if !ctx_fwd(f, g, end, inp1, ni - 1, (*g).c_cdi, true, 1, &end) {
             return false
         }
     }
@@ -893,7 +1062,7 @@ fn ctx_cd(st: usize, o: u32) -> usize {
 #[no_gc]
 fn gsub_context(f: *mut ttf.Font, g: *mut Gsub, k: usize, gids: u64,
     skip: u64, n: usize, at: usize) -> usize {
-    return context_lk(f, g, lookup_at(f, g, k), gids, skip, n, at)
+    return context_pos(f, g, lookup_at(f, g, k), gids, skip, n, at)
 }
 
 // The same for a lookup named by its number in the LookupList of the font
@@ -901,7 +1070,29 @@ fn gsub_context(f: *mut ttf.Font, g: *mut Gsub, k: usize, gids: u64,
 #[no_gc]
 fn gsub_context_li(f: *mut ttf.Font, g: *mut Gsub, li: u32, gids: u64,
     skip: u64, n: usize, at: usize) -> usize {
+    return context_pos(f, g, lookup_li(f, g, li), gids, skip, n, at)
+}
+
+// The `_u` variants: `at` is a UNIT (see UNIT) and the sequence includes the
+// extra glyphs; the positions of the records come back as units
+// (`gsub_act_unit`).
+#[no_gc]
+fn gsub_context_u(f: *mut ttf.Font, g: *mut Gsub, k: usize, gids: u64,
+    skip: u64, n: usize, at: usize) -> usize {
+    return context_lk(f, g, lookup_at(f, g, k), gids, skip, n, at)
+}
+
+#[no_gc]
+fn gsub_context_li_u(f: *mut ttf.Font, g: *mut Gsub, li: u32, gids: u64,
+    skip: u64, n: usize, at: usize) -> usize {
     return context_lk(f, g, lookup_li(f, g, li), gids, skip, n, at)
+}
+
+// Position in; the answer of `gsub_act_pos` is a position too.
+#[no_gc]
+fn context_pos(f: *mut ttf.Font, g: *mut Gsub, lk: usize, gids: u64,
+    skip: u64, n: usize, at: usize) -> usize {
+    return context_lk(f, g, lk, gids, skip, n, at * UNIT)
 }
 
 #[no_gc]
@@ -1001,8 +1192,15 @@ fn context_lk(f: *mut ttf.Font, g: *mut Gsub, lk: usize, gids: u64,
 #[no_gc]
 fn gsub_act_count(g: *mut Gsub) -> usize { return (*g).nact }
 
+// The position of the j-th record (the position that holds its unit).
 #[no_gc]
 fn gsub_act_pos(g: *mut Gsub, j: usize) -> usize {
+    return ((*g).act_pos[j] as usize) / UNIT
+}
+
+// The unit of the j-th record.
+#[no_gc]
+fn gsub_act_unit(g: *mut Gsub, j: usize) -> usize {
     return (*g).act_pos[j] as usize
 }
 

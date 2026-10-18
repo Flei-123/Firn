@@ -68,7 +68,7 @@ import font.ttf
 import font.gsub
 
 export {
-    shape_run, shape_forms, apply_acts, multi_apply, single_apply, shape_is_arabic,
+    shape_run, shape_forms, apply_acts, multi_apply, multi_apply_u, single_apply, shape_is_arabic,
     SHAPE_NONE, SHAPE_GSUB, SHAPE_FORMS,
     FORM_NONE, FORM_OTHER,
     LAM,
@@ -197,30 +197,92 @@ fn form_bit(fm: u8) -> u32 {
     return 0
 }
 
-// MULTIPLE SUBSTITUTION (type 2) of lookup `li` at position `q`. One output
-// glyph replaces the glyph of the position; several: the first is the glyph
-// of the position, the others go into the table of EXTRA glyphs of the Gsub
-// (they belong to the same character, so the cluster map stays: one
+// Sequence units (see lib/font/gsub.fi UNIT): `pos * UNIT + k`, k = 0 the glyph
+// of the position, k >= 1 its k-th extra glyph.
+
+// Write the glyph of a unit.
+#[no_gc]
+fn unit_put(g: *mut gsub.Gsub, gid: u64, u: usize, v: u32) {
+    let pos: usize = u / gsub.UNIT
+    let k: usize = u % gsub.UNIT
+    if k == 0 {
+        w32(gid, pos, v)
+        return
+    }
+    let at: usize = gsub.gsub_x_index(g, pos, k)
+    if at < gsub.MAX_EXTRA {
+        gsub.gsub_x_set(g, at, v)
+    }
+}
+
+// The unit goes away (absorbed into a ligature, or deleted by a multiple
+// substitution with 0 outputs). An extra glyph leaves the table. The glyph of
+// the position: if the position still has extras the first of them becomes
+// its glyph (the character keeps its cluster and stays visible, the extras
+// are NOT hidden with it); otherwise the position is marked absorbed.
+// Afterwards a position with `del` set has no extras.
+#[no_gc]
+fn unit_absorb(g: *mut gsub.Gsub, gid: u64, del: u64, u: usize) {
+    let pos: usize = u / gsub.UNIT
+    let k: usize = u % gsub.UNIT
+    if k > 0 {
+        gsub.gsub_x_remove(g, pos, k)
+        return
+    }
+    if gsub.gsub_x_cnt(g, pos) > 0 {
+        w32(gid, pos, gsub.gsub_x_gid(g, gsub.gsub_x_index(g, pos, 1)))
+        gsub.gsub_x_remove(g, pos, 1)
+        return
+    }
+    w8(del, pos, 1 as u8)
+}
+
+// MULTIPLE SUBSTITUTION (type 2) of lookup `li` at the unit `u`. One output
+// glyph replaces the glyph of the unit; several: the first is the glyph of
+// the unit, the others go into the table of EXTRA glyphs of the Gsub right
+// behind it (they belong to the same character, so the cluster map stays: one
 // character -> its glyph + its extras). A full table leaves everything as it
-// was.
+// was; a sequence of 0 glyphs deletes the unit. Returns how many units to
+// step forward: 1 + the inserted extras, 0 if the unit was deleted (the next
+// unit moved into its place).
+#[no_gc]
+fn multi_apply_u(f: *mut ttf.Font, g: *mut gsub.Gsub, gid: u64, del: u64,
+    li: u32, u: usize) -> usize {
+    let q: usize = u / gsub.UNIT
+    let k: usize = u % gsub.UNIT
+    let g1: u32 = gsub.gsub_unit_gid(g, gid, u)
+    if !gsub.gsub_multiple_has(f, g, li, g1) {
+        return 1
+    }
+    let m: usize = gsub.gsub_multiple_len(f, g, li, g1)
+    if m == 0 {
+        unit_absorb(g, gid, del, u)
+        return 0
+    }
+    if m > 1 && gsub.gsub_x_room(g) < m - 1 {
+        return 1
+    }
+    unit_put(g, gid, u, gsub.gsub_multiple_glyph(f, g, li, g1, 0))
+    var j: usize = 1
+    while j < m {
+        let ok: bool = gsub.gsub_x_insert(g, q, k + j - 1,
+            gsub.gsub_multiple_glyph(f, g, li, g1, j))
+        j = j + 1
+    }
+    return m
+}
+
+// The same for the glyph of the POSITION `q` (no deletion handling needed by
+// the callers: a sequence of 0 glyphs does nothing here -- use
+// `multi_apply_u` for deletion).
 #[no_gc]
 fn multi_apply(f: *mut ttf.Font, g: *mut gsub.Gsub, gid: u64, li: u32,
     q: usize) {
     let g1: u32 = r32(gid, q)
-    let m: usize = gsub.gsub_multiple_len(f, g, li, g1)
-    if m == 0 {
+    if gsub.gsub_multiple_len(f, g, li, g1) == 0 {
         return
     }
-    if m > 1 && gsub.gsub_x_room(g) < m - 1 {
-        return
-    }
-    w32(gid, q, gsub.gsub_multiple_glyph(f, g, li, g1, 0))
-    var j: usize = 1
-    while j < m {
-        let ok: bool = gsub.gsub_x_insert(g, q, j - 1,
-            gsub.gsub_multiple_glyph(f, g, li, g1, j))
-        j = j + 1
-    }
+    let st: usize = multi_apply_u(f, g, gid, 0, li, q * gsub.UNIT)
 }
 
 // A single substitution (type 1) at position `q` for the glyph of the
@@ -247,12 +309,18 @@ fn single_apply(f: *mut ttf.Font, g: *mut gsub.Gsub, gid: u64, li: u32,
 // How deep a context lookup may call context lookups.
 const NEST_MAX: u32 = 6
 
-// The SubstLookupRecords that `gsub_context` found: each names a position
-// and a lookup of the font. Single (1), multiple (2, several output glyphs go
-// into the extra glyphs), ligature (4) are applied in place; a CONTEXT lookup
-// (5, 6) as the target is matched at that position and its own records are
-// applied the same way, NEST_MAX deep. Nested lookups reuse the scratch of the
-// Gsub, so the records are copied first.
+// A record that no longer names anything (its unit was absorbed).
+const UNIT_GONE: u32 = 4294967295
+
+// The SubstLookupRecords that `gsub_context_u` found: each names a UNIT
+// (a glyph of the sequence, the extras included) and a lookup of the font.
+// Single (1, on that unit), multiple (2, several output glyphs go into the
+// extra glyphs), ligature (4, components may be extras; absorbed ones leave
+// the sequence) are applied in place; a CONTEXT lookup (5, 6) as the target is
+// matched at that unit and its own records are applied the same way,
+// NEST_MAX deep. Records still to do are shifted when an earlier record
+// inserts (2) or removes (4) units of the same position. Nested lookups reuse
+// the scratch of the Gsub, so the records are copied first.
 #[no_gc]
 fn apply_acts(f: *mut ttf.Font, g: *mut gsub.Gsub, gid: u64, del: u64,
     n: usize, used: u64, na: usize, depth: u32) {
@@ -264,37 +332,72 @@ fn apply_acts(f: *mut ttf.Font, g: *mut gsub.Gsub, gid: u64, del: u64,
     }
     var c: usize = 0
     while c < cnt {
-        ap[c] = gsub.gsub_act_pos(g, c) as u32
+        ap[c] = gsub.gsub_act_unit(g, c) as u32
         al[c] = gsub.gsub_act_lookup(g, c)
         c = c + 1
     }
     var j: usize = 0
     while j < cnt {
-        let q: usize = ap[j] as usize
+        let u: usize = ap[j] as usize
+        let q: usize = u / gsub.UNIT
+        let uk: usize = u % gsub.UNIT
         let li: u32 = al[j]
         let nty: u32 = gsub.gsub_li_type(f, g, li)
         let nign: bool = gsub.gsub_li_ignores_marks(f, g, li)
-        let g1: u32 = r32(gid, q)
-        if q < n && r8(del, q) == 0 as u8
-        && !(nign && gsub.gsub_is_mark(f, g, g1)) {
+        if ap[j] != UNIT_GONE && q < n && r8(del, q) == 0 as u8
+        && uk <= gsub.gsub_x_cnt(g, q)
+        && !(nign && gsub.gsub_is_mark(f, g, gsub.gsub_unit_gid(g, gid, u))) {
             if nty == 1 as u32 {
-                single_apply(f, g, gid, li, nign, q)
+                unit_put(g, gid, u, gsub.gsub_li_single(f, g, li,
+                    gsub.gsub_unit_gid(g, gid, u)))
             } else if nty == 2 as u32 {
-                multi_apply(f, g, gid, li, q)
+                let st: usize = multi_apply_u(f, g, gid, del, li, u)
+                var j2: usize = j + 1
+                while j2 < cnt {
+                    let v: usize = ap[j2] as usize
+                    if ap[j2] != UNIT_GONE && v / gsub.UNIT == q {
+                        if st == 0 {
+                            if v == u {
+                                ap[j2] = UNIT_GONE
+                            } else if v % gsub.UNIT > uk {
+                                ap[j2] = ap[j2] - 1
+                            }
+                        } else if v % gsub.UNIT > uk {
+                            ap[j2] = ap[j2] + (st - 1) as u32
+                        }
+                    }
+                    j2 = j2 + 1
+                }
             } else if nty == 4 as u32 {
                 var nu: usize = 0
-                let lg: u32 = gsub.gsub_li_ligature(f, g, li, gid, del, n, q,
+                let lg: u32 = gsub.gsub_li_ligature_u(f, g, li, gid, del, n, u,
                     used, 16, &nu)
                 if lg != 0 as u32 {
-                    w32(gid, q, lg)
-                    var u: usize = 0
-                    while u < nu {
-                        w8(del, r32(used, u) as usize, 1 as u8)
-                        u = u + 1
+                    unit_put(g, gid, u, lg)
+                    // from behind, so the removals do not shift the units
+                    // still to be taken out
+                    var uu: usize = nu
+                    while uu > 0 {
+                        uu = uu - 1
+                        let au: usize = r32(used, uu) as usize
+                        unit_absorb(g, gid, del, au)
+                        var j3: usize = j + 1
+                        while j3 < cnt {
+                            let v3: usize = ap[j3] as usize
+                            if ap[j3] != UNIT_GONE && v3 / gsub.UNIT
+                            == au / gsub.UNIT {
+                                if v3 == au {
+                                    ap[j3] = UNIT_GONE
+                                } else if v3 % gsub.UNIT > au % gsub.UNIT {
+                                    ap[j3] = ap[j3] - 1
+                                }
+                            }
+                            j3 = j3 + 1
+                        }
                     }
                 }
             } else if (nty == 5 as u32 || nty == 6 as u32) && depth < NEST_MAX {
-                let nn: usize = gsub.gsub_context_li(f, g, li, gid, del, n, q)
+                let nn: usize = gsub.gsub_context_li_u(f, g, li, gid, del, n, u)
                 apply_acts(f, g, gid, del, n, used, nn, depth + 1)
             }
         }
@@ -362,33 +465,42 @@ fn shape_run(t: u64, f: *mut ttf.Font, g: *mut gsub.Gsub, use_gsub: bool,
                 if fm != FORM_NONE && r8(del, p) == 0 as u8 {
                     applies = every || (mk & form_bit(fm)) != 0 as u32
                 }
-                if applies {
-                    let g0: u32 = r32(gid, p)
-                    if ty == 1 as u32 {
-                        single_apply(f, g, gid, gsub.gsub_lookup_index(g, k),
-                            ign, p)
-                    } else if ty == 2 as u32 {
+                if applies && ty == 1 as u32 {
+                    single_apply(f, g, gid, gsub.gsub_lookup_index(g, k),
+                        ign, p)
+                } else if applies && (ty == 2 as u32 || ty == 4 as u32
+                || ty == 5 as u32 || ty == 6 as u32) {
+                    // the glyph of the position and then its extras, one
+                    // unit after the other; the table changes meanwhile
+                    var uk: usize = 0
+                    while r8(del, p) == 0 as u8 && uk <= gsub.gsub_x_cnt(g, p) {
+                        let u: usize = p * gsub.UNIT + uk
+                        let g0: u32 = gsub.gsub_unit_gid(g, gid, u)
+                        var step: usize = 1
                         if !(ign && gsub.gsub_is_mark(f, g, g0)) {
-                            multi_apply(f, g, gid, gsub.gsub_lookup_index(g, k), p)
-                        }
-                    } else if ty == 4 as u32 {
-                        var nu: usize = 0
-                        let lg: u32 = gsub.gsub_ligature(f, g, k, gid, del,
-                            n, p, used, 16, &nu)
-                        if lg != 0 as u32 {
-                            w32(gid, p, lg)
-                            var u: usize = 0
-                            while u < nu {
-                                w8(del, r32(used, u) as usize, 1 as u8)
-                                u = u + 1
+                            if ty == 2 as u32 {
+                                step = multi_apply_u(f, g, gid, del,
+                                    gsub.gsub_lookup_index(g, k), u)
+                            } else if ty == 4 as u32 {
+                                var nu: usize = 0
+                                let lg: u32 = gsub.gsub_ligature_u(f, g, k, gid,
+                                    del, n, u, used, 16, &nu)
+                                if lg != 0 as u32 {
+                                    unit_put(g, gid, u, lg)
+                                    var uu: usize = nu
+                                    while uu > 0 {
+                                        uu = uu - 1
+                                        unit_absorb(g, gid, del,
+                                            r32(used, uu) as usize)
+                                    }
+                                }
+                            } else {
+                                let na: usize = gsub.gsub_context_u(f, g, k,
+                                    gid, del, n, u)
+                                apply_acts(f, g, gid, del, n, used, na, 0 as u32)
                             }
                         }
-                    } else if ty == 5 as u32 || ty == 6 as u32 {
-                        if !(ign && gsub.gsub_is_mark(f, g, g0)) {
-                            let na: usize = gsub.gsub_context(f, g, k, gid,
-                                del, n, p)
-                            apply_acts(f, g, gid, del, n, used, na, 0 as u32)
-                        }
+                        uk = uk + step
                     }
                 }
                 p = p + 1
