@@ -94,9 +94,9 @@ ui() { local i=0; while [ $i -lt 4 ]; do $ADB shell uiautomator dump /sdcard/ui.
 mid() { echo "$1" | tr '[],' '   ' | awk '{print int(($1+$3)/2), int(($2+$4)/2)}'; }
 tap_ui_id() { local b; b=$(ui | grep -E "resource-id=\"[^\"]*$1\"" | grep -oP 'bounds="\K[^"]+' | head -1); [ -n "$b" ] || return 1; $ADB shell input tap $(mid "$b"); sleep 2; }
 applog() { $ADB shell "cat \$(ls -t \$(find /data/data/$PKG /sdcard/Android/data/$PKG -name 'app.log' 2>/dev/null) 2>/dev/null | head -1) 2>/dev/null" | tr -d '\r'; }
-# WAIT_UPDATE=1 (default): do not touch the screen while the blocking store update check of the first seconds runs (it freezes the
-# program's thread: on a slow/translated phone a tap during it ends in "Input dispatching timed out" BEFORE the sign-in). 0 = like a hasty person.
-wait_update_check() { local i L; [ "${WAIT_UPDATE:-1}" = 1 ] || return 0
+# WAIT_UPDATE=1: do not touch the screen while the store update check runs. Since 0.2.9 the check is asynchronous and starts only after
+# 30 s of calm, so the default is 0 (like a hasty person; the section "store check under taps" proves nothing blocks).
+wait_update_check() { local i L; [ "${WAIT_UPDATE:-0}" = 1 ] || return 0
     for i in $(seq 45); do sleep 2; L=$(applog)
         if echo "$L" | grep -q 'update: checking'; then echo "$L" | grep 'update: ' | grep -vq 'checking' && break
         elif [ $i -ge 25 ] && echo "$L" | grep -q 'main: start'; then break; fi
@@ -151,6 +151,19 @@ run_variant() { # abi:perm:density:font
     for t in Board Tasks; do tap_word "$t" 1 2.5; done
     sleep 3
     check "$tag: alive after the tabs" "$(alive)" yes
+    # the store check (async since 0.2.9) starts after 30 s of calm: keep tapping like a hasty person until it is done, nothing may freeze
+    local k=0 L2=""
+    while [ $k -lt 40 ]; do
+        L2=$(applog); echo "$L2" | grep -q 'update: pass .* done after' && break
+        echo "$L2" | grep -q 'update: .*ERROR\|update: This program' && break
+        for t in Chats Board Tasks; do tap_word "$t" 1 0.6; done
+        k=$((k+1))
+    done
+    echo "  store check: $(echo "$L2" | grep -E 'update: (store check|pass|checking)' | tr '\n' '|' | cut -c1-400)"
+    check "$tag: store check ran (after the calm time)" "$(echo "$L2" | grep -c 'update: store check starts')" 1
+    local worst; worst=$(echo "$L2" | grep -oP 'loop thread was busy for \K[0-9]+' | sort -n | tail -1); worst=${worst:-0}
+    check "$tag: loop never blocked >= 1500 ms (worst lag line: ${worst} ms)" "$([ "$worst" -lt 1500 ] && echo yes || echo no)" yes
+    check "$tag: no ANR/Input dispatching timeout" "$($ADB logcat -b main,system -d 2>/dev/null | grep -c -E "ANR in $PKG|Input dispatching timed out")" 0
     check "$tag: crash buffer + logcat free of fatal lines" "$(fatal_lines | wc -l)" 0
     fatal_lines | sed 's/^/        /'
     echo "  stage file: $(stage_file)"
