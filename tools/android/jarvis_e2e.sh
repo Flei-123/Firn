@@ -5,7 +5,7 @@
 # notification service as the judge.
 #
 #   bash tools/android/jarvis_e2e.sh [apk]          (default: the newest /root/jarvis-android-builds/jarvis-*.apk)
-#   SERIAL=emulator-5592 ADB_PORT=5041 bash ...     (use a running emulator, do not boot or stop one)
+#   SERIAL=emulator-${EMU_PORT:-5592} ADB_PORT=5041 bash ...     (use a running emulator, do not boot or stop one)
 #
 # Own AVD copy "a6e" (console port 5592, own adb server on port 5041): other checks that use the shared adb server never see it.
 # Checks: login, message + streamed reply, Board (projects, a need answered), Tasks (add), conversation list (Chats), photo upload
@@ -34,6 +34,7 @@ python3 -c "import websockets, PIL" 2>/dev/null || { echo "skip: python3 websock
 W=$(mktemp -d)
 EMU=""; SRV=""
 ADB_PORT=${ADB_PORT:-5041}
+AVD=${AVD:-a6e}
 ADB0="$SDK/platform-tools/adb -P $ADB_PORT"
 cleanup() {
     [ -n "$SRV" ] && kill $SRV 2>/dev/null
@@ -45,14 +46,14 @@ trap cleanup EXIT
 
 if [ -z "${SERIAL:-}" ]; then
     AVDHOME=${ANDROID_AVD_HOME:-$HOME/.android/avd}
-    if [ ! -d "$AVDHOME/a6e.avd" ]; then # own copy: only the config, a fresh data partition
-        mkdir -p "$AVDHOME/a6e.avd"; sed 's/firn/a6e/g' "$AVDHOME/firn.avd/config.ini" >"$AVDHOME/a6e.avd/config.ini"
-        printf 'avd.ini.encoding=UTF-8\npath=%s/a6e.avd\npath.rel=avd/a6e.avd\ntarget=android-35\n' "$AVDHOME" >"$AVDHOME/a6e.ini"
+    if [ ! -d "$AVDHOME/$AVD.avd" ]; then # own copy: only the config, a fresh data partition
+        mkdir -p "$AVDHOME/$AVD.avd"; sed "s/firn/$AVD/g" "$AVDHOME/firn.avd/config.ini" >"$AVDHOME/$AVD.avd/config.ini"
+        printf 'avd.ini.encoding=UTF-8\npath=%s/%s.avd\npath.rel=avd/%s.avd\ntarget=android-35\n' "$AVDHOME" "$AVD" "$AVD" >"$AVDHOME/$AVD.ini"
     fi
     $ADB0 start-server >/dev/null 2>&1
-    ANDROID_ADB_SERVER_PORT=$ADB_PORT ANDROID_SDK_ROOT=$SDK ANDROID_AVD_HOME=$AVDHOME "$SDK/emulator/emulator" -avd a6e -port 5592 \
+    ANDROID_ADB_SERVER_PORT=$ADB_PORT ANDROID_SDK_ROOT=$SDK ANDROID_AVD_HOME=$AVDHOME "$SDK/emulator/emulator" -avd $AVD -port ${EMU_PORT:-5592} \
         -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data -gpu swiftshader_indirect >"$W/emu.log" 2>&1 & EMU=$!
-    SERIAL=emulator-5592
+    SERIAL=emulator-${EMU_PORT:-5592}
 fi
 ADB="$ADB0 -s $SERIAL"
 for _ in $(seq 150); do [ "$($ADB shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break; sleep 3; done
@@ -143,8 +144,10 @@ check "login screen shows" "$(OCR_TRIES=40 wait_ocr 01_login 'Sign in')" 1
 
 # ---- 1. login + chat ---------------------------------------------------------------------------------------------------------
 echo "== 1. login, message, streamed reply"
-type_into "User" justin; type_into "Password" pw
+type_into "Username" justin; type_into "Password" pw
 tap_word "Sign" 1 1
+check "the notification notice page shows after the first sign-in" "$(OCR_TRIES=20 wait_ocr 01b_notice 'Continue')" 1
+tap_word "Continue" 1 3
 check "chat screen after login" "$(OCR_TRIES=30 wait_ocr 02_chat 'Chats')" 1
 check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 1
 send_text hello
