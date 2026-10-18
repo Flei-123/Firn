@@ -833,14 +833,14 @@ build dpi
 "$W/dpi" | tail -n 3
 # W10: the AT-SPI bridge on a private dbus-daemon, headless and in a real window (own Xvfb);
 # exit 77 = prerequisites missing (not testable), anything else but 0 fails the run
-FIRNC="$FIRNC" sh tools/fui/atspi.sh >"$W/atspi.log" 2>&1
-rc=$?
+rc=0
+FIRNC="$FIRNC" sh tools/fui/atspi.sh >"$W/atspi.log" 2>&1 || rc=$?
 tail -n 4 "$W/atspi.log"
 if [ "$rc" != 0 ] && [ "$rc" != 77 ]; then echo "atspi FAILED ($rc)"; exit 1; fi
 # W23-c: the UIA COM glue (Windows-only program), cross-built and run under Wine; skipped without Wine
 if [ -x /usr/lib/wine/wine64 ]; then
-    FIRNC="$FIRNC" sh tools/fui/uiacom.sh >"$W/uiacom.log" 2>&1
-    rc=$?
+    rc=0
+    FIRNC="$FIRNC" sh tools/fui/uiacom.sh >"$W/uiacom.log" 2>&1 || rc=$?
     tail -n 2 "$W/uiacom.log"
     if [ "$rc" != 0 ]; then echo "uiacom FAILED ($rc)"; exit 1; fi
 else
