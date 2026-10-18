@@ -64,7 +64,7 @@ scenario list-autoscroll 14 --es tab list --es theme dark --ei autoscroll 1
 scenario lab-anim-dark 13 --es tab lab --es lab anim --es theme dark
 scenario lab-anim-light 6 --es tab lab --es lab anim --es theme light
 scenario lab-text-dark 6 --es tab lab --es lab text --es theme dark
-scenario lab-net-dark 12 --es tab lab --es lab net --es theme dark --ez autorun true
+scenario lab-net-dark 30 --es tab lab --es lab net --es theme dark --ez autorun true
 scenario lab-cpu-dark 150 --es tab lab --es lab cpu --es theme dark --ez autorun true
 scenario settings-dark 6 --es tab settings --es theme dark
 scenario settings-light 6 --es tab settings --es theme light
