@@ -140,42 +140,42 @@ $ADB logcat -c
 sleep 15
 $ADB shell am start -n $ACT >/dev/null
 for _ in $(seq 40); do [ -n "$($ADB shell pidof $PKG)" ] && break; sleep 1; done
-check "login screen shows" "$(OCR_TRIES=40 wait_ocr 01_login 'Sign in')" 1
-type_into "User" justin; type_into "Password" pw
-tap_word "Sign" 1 1
+check "login screen shows" "$(OCR_TRIES=40 wait_ocr 01_login 'Anmelden')" 1
+type_into "Benutzer" justin; type_into "Passwort" pw
+tap_word "Anmelden" 1 1
 check "chat screen after login" "$(OCR_TRIES=30 wait_ocr 02_chat 'Chats')" 1
 
 # ---- 3. store knows the channel test only ------------------------------------------------------------------------------------------
 echo "== 3. channel test only"
-tap_word "Prefs" 1 2
+tap_word "Mehr" 1 2
 check "Settings shows the channel and the installed version" "$(OCR_TRIES=15 wait_ocr 03_prefs 'Channel: test.*installed 0\.2\.2')" 1
-check "available version shown" "$(OCR_TRIES=25 wait_ocr 03_prefs 'update 0\.2\.3 available')" 1
+check "available version shown" "$(OCR_TRIES=25 wait_ocr 03_prefs 'Update 0\.2\.3 verf')" 1
 check "release notes of the offered build shown" "$(wait_ocr 03_prefs 'Faster chat')" 1
 check "the app asked the store (entry.json + index.json)" "$([ "$(store_gets 'GET /entry.json')" -ge 1 ] && [ "$(store_gets 'GET /index.json')" -ge 1 ] && echo yes)" yes
-check "no channel switch while the store knows one channel" "$(ocr 03_prefs | grep -ciE 'Channel: stable')" 0
+check "no channel switch while the store knows one channel" "$(ocr 03_prefs | grep -ciE 'stabil')" 0
 
 # ---- 4. the store also has stabil ----------------------------------------------------------------------------------------------------
 echo "== 4. channels stabil + test"
 $REL --version 0.2.2 --apk "$W/apk/jarvis-0.2.2.apk" --channel stabil >"$W/rel2.log" 2>&1 || { cat "$W/rel2.log"; exit 1; }
 tap_word "Check" 1 2
-check "switch appears (offers stable)" "$(OCR_TRIES=25 wait_ocr 04_two 'Channel: stable')" 1
+check "switch appears (offers stable)" "$(OCR_TRIES=25 wait_ocr 04_two 'stabil')" 1
 tap_switch 2
-check "after the switch: channel stable" "$(OCR_TRIES=15 wait_ocr 05_stable 'Channel: stable.*installed 0\.2\.2')" 1
-check "stable channel: up to date" "$(OCR_TRIES=25 wait_ocr 05_stable 'up to date')" 1
+check "after the switch: channel stable" "$(OCR_TRIES=15 wait_ocr 05_stable 'stabil')" 1
+check "stable channel: up to date" "$(OCR_TRIES=25 wait_ocr 05_stable 'Aktuell')" 1
 check "stable channel: notes of 0.2.2" "$(wait_ocr 05_stable 'First stable')" 1
 tap_switch 2
-check "back on test: update offered again" "$(OCR_TRIES=25 wait_ocr 06_back 'update 0\.2\.3 available')" 1
+check "back on test: update offered again" "$(OCR_TRIES=25 wait_ocr 06_back 'Update 0\.2\.3 verf')" 1
 tap_switch 2
-check "stable again" "$(OCR_TRIES=15 wait_ocr 07_again 'up to date')" 1
+check "stable again" "$(OCR_TRIES=15 wait_ocr 07_again 'Aktuell')" 1
 $ADB shell am force-stop $PKG
 sleep 2
 $ADB shell am start -n $ACT >/dev/null
-check "login screen after the restart" "$(OCR_TRIES=30 wait_ocr 08_login 'Sign in')" 1
-type_into "User" justin; type_into "Password" pw
-tap_word "Sign" 1 1
+check "login screen after the restart" "$(OCR_TRIES=30 wait_ocr 08_login 'Anmelden')" 1
+type_into "Benutzer" justin; type_into "Passwort" pw
+tap_word "Anmelden" 1 1
 check "chat screen after the second login" "$(OCR_TRIES=30 wait_ocr 08_chat 'Chats')" 1
-tap_word "Prefs" 1 2
-check "the channel choice survives a restart" "$(OCR_TRIES=15 wait_ocr 08_restart 'Channel: stable.*installed 0\.2\.2')" 1
+tap_word "Mehr" 1 2
+check "the channel choice survives a restart" "$(OCR_TRIES=15 wait_ocr 08_restart 'stabil')" 1
 check "no crash in logcat" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
 $ADB shell am force-stop $PKG
 echo "JARVIS update check: $PASS passed, $FAIL failed. Pictures in $OUT"

@@ -125,10 +125,10 @@ run_variant() { # abi:perm:density:font
     local n0; n0=$(grep -c '"type": "info_sent"' "$SLOG")
     $ADB shell monkey -p $PKG -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
     wait_update_check
-    check "$tag: sign-in page" "$(OCR_TRIES=30 wait_ocr ${tag}_01 'Sign in')" 1
-    type_into "Username" justin; type_into "Password" pw; tap_word "Sign" 1 1
-    check "$tag: notice page or main view after the sign-in" "$(OCR_TRIES=20 wait_ocr ${tag}_02 'Continue|Chats')" 1
-    tap_word "Continue" 1 3 && echo "  (notice page: Continue)"
+    check "$tag: sign-in page" "$(OCR_TRIES=30 wait_ocr ${tag}_01 'Anmelden')" 1
+    type_into "Benutzername" justin; type_into "Passwort" pw; tap_word "Anmelden" 1 1
+    check "$tag: notice page or main view after the sign-in" "$(OCR_TRIES=20 wait_ocr ${tag}_02 'Weiter|Chats')" 1
+    tap_word "Weiter" 1 3 && echo "  (notice page: Weiter)"
     # the system permission dialog (perm=allow|deny): answer it like a person would
     if [ "$perm" != granted ]; then
         local ans=permission_allow_button; [ "$perm" = deny ] && ans=permission_deny_button
