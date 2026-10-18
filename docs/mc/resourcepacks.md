@@ -61,7 +61,7 @@ and the range (`supported_formats` number | [a,b] | {min_inclusive,max_inclusive
   an `animation` object stay static (first frame) -- vanilla behaviour not verified. Square frames only.
 * **mcview wiring (13.10., s5):** `--pack=a.zip,b.zip` or env `MC_PACKS` / `MC_PACK_CONFIG` / `MC_PACK_AUTO` (+ `MC_PACK_DIR`, `MC_PACK_TILE`) -> `mc_packs.res_setup_env`; extended tile tables; `MCVIEW_PACK_TICK=n` (animation tick), `MCVIEW_PACK_RELOAD=1` (hot reload between frames). A windowed client calls `res_tick` once per game tick and `res_on_key(m, &backend, RES_KEY_RELOAD)` from its key handler. Offline test: `bash tools/mc/view/run.sh --offline` (fixture packs from `tools/mc/view/mkpack.py`: hash != default, deterministic, reload keeps the image, flag == env, 32 px != 16 px, priority, broken pack warns). Without packs the image is unchanged (python reference hash). Not compared with the python renderer when packs are on.
 * **Pack sounds (`lib/mc/mc_packsnd.fi`, test 2895):** `sounds.json` + `sounds/**.ogg` of every pack -> Aulos bank events (`packsnd_apply`, mode from `res_sounds_mode`: synth = nothing, original/both = pack events; vanilla merge: the lists of ALL packs are joined top first, `replace: true` cuts the packs below, same file once, `type: event` entries ignored; `stream` ignored; `volume` / `pitch` are PER ENTRY (engine per-slot factors, bank fields `sample_volume` / `sample_pitch`; event volume stays 1.0; same file twice = the first entry's factors; test 2994); `weight` (1..1000, default 1) = number of the event's <= 16 sample slots the file gets (the engine picks uniformly from the slots; exact while the weights sum to <= 16, above that scaled proportionally, >= 1 slot each; test 2993); <= 1600 files / events and never more than the free room of the engine (2048 samples / events). Hot reload: files are hashed (FNV-1a), unchanged = sample reused, changed = takes over its old sample slot, so the sample table does not leak; test 2895). Animation: partial atlas upload still whole-atlas.
-* **Not done yet:** folder packs, models/blockstates (non-cubes still full cubes of their material; plants/torches have names in the table but no faces), `lang`, GUI textures.
+* **Not done yet:** folder packs, mesher/renderer use of the models (below: the bake is done, the game still draws non-cubes as full cubes), partial atlas upload for animation (whole atlas today), `lang`, GUI textures. OGG: decoder exists (`audio.load_ogg`, used by `mc_packsnd`).
 
 ## Later
 * **Animated textures:** `<tile>.png.mcmeta` (`animation`: frametime, frames, interpolate); strip PNG (height = n * width); needs per-frame atlas upload or layer cycling.
@@ -82,3 +82,18 @@ OGG + sound.json + mc_audio modes: 3-4 d. UI + persistence: 1-2 d.
 * **T (hot reload)** re-reads the packs, then rebuilds the pack sounds. With a device sink the audio thread is stopped around the bank load (engine rule) and restarted;
   unchanged OGG = same sample (hash), changed OGG = takes over its old slot -> the `samples=` number stays equal. Pack events that vanished stay (small).
 * Test: `tools/mc/play/run_packsnd.sh` (server + Xvfb; both/file with a changed-OGG reload, both/device with PulseAudio null sink, original/file).
+
+## Models / blockstates (r80, lib/mc/mc_model.fi + mc_model_ref.fi, tests 3945 / 3946)
+* **Done (library level, CPU only):** `blockstate_select(stack, block, "k=v,k=v", seed, &sel)` picks the models of a block state from `assets/minecraft/blockstates/<block>.json`
+  (variants: key = subset of the state in any order, `""`/`normal` = all, weighted lists by seed; multipart: `when` with `a|b`, `true/false`, `OR`, `AND`, `apply` object or weighted list).
+  `model_bake` / `blockstate_bake` read `models/<path>.json` (parent chain up to 16, `#texture` references, `elements`, element rotation incl. rescale, face `uv` / `rotation` /
+  `cullface` / `tintindex`, `shade`) and append quads to a `Baked` (28 f64 per quad: 4 corners in block units, UV 0..16, texture index, cullface, tint, shade, direction).
+  Variant `x` / `y` (multiples of 90, x first) turn quads + cullfaces around the block centre; `uvlock` keeps the texture on the world axes (UV turned back by the quarter turns of the face plane).
+* **Own built-in parents** (written from the shapes, no Mojang file): `block/cube`, `cube_all`, `cube_column`, `cube_bottom_top`, `slab`, `slab_top`, `cross`, `stairs` (straight only).
+  A pack file with the same name wins. Inner / outer stairs, fences, doors etc. come from the pack's own model files.
+* **Reference view:** `mc_model_ref.baked_load_textures` + `ref_render` draw the quads orthographically from one of six directions (nearest, depth, alpha 0 = hole) -- oracle for UV
+  orientation, rotation, uvlock; not the game renderer.
+* **Unverified against a real client** (no Mojang pack available): corner order, default UV, face rotation direction, variant x (north -> down) / y (north -> east), element rotation sign
+  (right handed), uvlock. All are checked for self-consistency in the tests only.
+* **Not done:** mesher / renderer integration (texture names -> atlas tiles, 1/16 vertex format, culling against neighbours via `cull`), `builtin/generated` item models, `display`,
+  `ambientocclusion`, `overrides`, `!` negation in `when`, `elements` with `light_emission`.

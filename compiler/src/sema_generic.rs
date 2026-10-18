@@ -757,7 +757,7 @@ pub(crate) fn hook_generic_call(p: &mut Parser, base: &Expr) -> Option<Expr> {
     let (qual, name) = match &base.kind {
         ExprKind::Ident(n) if is_generic_fn(n) => (None, n.clone()),
         ExprKind::Ident(n) => match n.split_once('.') {
-            Some((m, f)) if p.modules.contains(m) && p.bracket_then_paren() => {
+            Some((m, f)) if p.modules.contains(m) && (p.bracket_then_paren() || is_generic_fn(f)) => {
                 (Some(m.to_string()), f.to_string())
             }
             _ => return None,
@@ -788,13 +788,10 @@ pub(crate) fn hook_generic_call(p: &mut Parser, base: &Expr) -> Option<Expr> {
     let args = p.generic_args()?;
     let mangled = p.note_inst(&name, args, base.span, true);
     if !p.at(&TokKind::LParen) {
-        p.error_here(format!(
-            "expected '(' after the type arguments of '{}', found '{}'",
-            name,
-            p.kind().text()
-        ));
-        p.recovering = false;
-        return None;
+        // r718: `id[i32]` without a call is the instance as a function value.
+        let end = p.toks.get(p.pos.wrapping_sub(1)).map(|t| t.span).unwrap_or(base.span);
+        let span = Parser::join(base.span, end);
+        return Some(p.mk(span, ExprKind::Ident(mangled)));
     }
     p.bump();
     let (cargs, end) = p.call_args("after the argument list");

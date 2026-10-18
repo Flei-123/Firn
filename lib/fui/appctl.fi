@@ -85,7 +85,10 @@ import fui.wave5
 import fui.wave6
 import fui.wave7
 import fui.wave9
+import fui.wave10
+import fui.dnd
 import fui.timeline
+import fui.grid
 import fui.wave8
 import fui.a11y
 import fui.action
@@ -118,6 +121,8 @@ export {
     combobox, combobox_add, combobox_open, combobox_close, combobox_is_open, combobox_results, combobox_picked,
     combobox_active, combobox_row_text, combobox_list_node, combobox_item_node, combobox_row_rect, combobox_rect,
     combobox_count, combobox_top,
+    dnd_source, dnd_target, dnd_on_start, dnd_on_drop, dnd_ghost, dnd_busy, dnd_cancel, dnd_effect, dnd_from, dnd_from_row,
+    dnd_to, dnd_gap, dnd_zone, dnd_to_row, dnd_drops, dnd_keyboard,
     size_class, height_class, nav_mode, on_size_class, size_columns, size_dp_width, size_changes,
     timeline, timeline_ref, timeline_play, timeline_pause, timeline_stop, timeline_value, timeline_playing, timeline_finished,
     timeline_reduced, TL_APP,
@@ -125,6 +130,7 @@ export {
     breadcrumb, breadcrumb_add, breadcrumb_clear, breadcrumb_event, BREADCRUMB_OVERFLOW,
     infobar, infobar_action, infobar_closable, infobar_event, infobar_open, infobar_show,
     stepper, stepper_add, stepper_current, stepper_set,
+    grid, grid_cell, grid_gap, grid_pad, grid_rtl, grid_name,
     ripple_on, split_begin, split_mid, split_end, split_ratio, split_set_ratio, split_limits, split_hovered, split_dragging,
     ANS_OK, ANS_CANCEL,
     CTL_MAX, OPT_MAX, NONE,
@@ -269,6 +275,8 @@ struct Ctl {
     sz: u64,
     sz_cb: fn(*mut app.App, u32),
     sz_has: bool,
+    // drag and drop of the window (heap Dd, made on first use)
+    dd: u64,
 }
 
 fn dlg_cb_none(a: *mut app.App, ans: u32) {
@@ -288,7 +296,7 @@ fn ctl_blank() -> Ctl {
         sh: wave6.sheet_new(true), sh_on: false, sh_node: NONE, sh_body: sh_body_none, sh_bptr: sh_bptr_none,
         sh_kb: false, sh_ms: 0, sh_desc: 0, sh_dn: 0, sh_ni: 0, sh_it: [NONE; 8], sh_ir: [0.0; 32], sh_irole: [0 as u32; 8], sh_iname: [""; 8], sh_name: "", w6_drag: NONE, pg_ed: editor.editor_new(), pg_buf: 0, pg_edit_i: NONE,
         pg_edit_row: NONE, px: 0.0, py: 0.0, w7: 0,
-        sz: 0, sz_cb: sz_cb_none, sz_has: false }
+        sz: 0, sz_cb: sz_cb_none, sz_has: false, dd: 0 }
 }
 
 // ============================================================ THE STATE
@@ -1532,7 +1540,7 @@ fn tip_move(c: *mut Ctl, x: f64, y: f64) -> bool {
 }
 
 fn tip_blocked(c: *mut Ctl) -> bool {
-    return (*c).dlg != 0 as u32 || (*c).drop_open || sh_blocking(c) || cmb_any_open(c) || menuview.mv_is_open(mv_of(c))
+    return (*c).dlg != 0 as u32 || (*c).drop_open || sh_blocking(c) || cmb_any_open(c) || dd_running(c) || menuview.mv_is_open(mv_of(c))
 }
 
 // the program timer (fuiwirt.host_set_wake): shows the tooltip after the delay, runs the dialog fade
@@ -1551,6 +1559,9 @@ fn wake_tick(ud: u64, now: i64) -> bool {
         return true
     }
     if tl_tick(c, now) {
+        return true
+    }
+    if dd_tick_c(c) {
         return true
     }
     // a virtual list (app.vlist_new) running out after a fling or a wheel turn: paint every tick
@@ -1585,6 +1596,9 @@ fn wake_wait(ud: u64, now: i64) -> i64 {
         return 16
     }
     if tl_busy(c) {
+        return 16
+    }
+    if dd_wants_timer(c) {
         return 16
     }
     if app.vlist_moving((*c).a) {
@@ -1711,6 +1725,7 @@ fn dlg_open(a: *mut app.App, kind: u32, title: str, text: str, init: str,
         drop_close(c)
     }
     cmb_close_all(c)
+    dd_stop(c)
     let ctxm: *mut ctxmenu.Ctxm = app.context(a)
     if ctxmenu.ctx_is_open(ctxm) {
         let r: u32 = ctxmenu.ctx_close(ctxm, ctxmenu.CLOSE_API)
@@ -2057,6 +2072,9 @@ fn ctl_key(ud: u64, key: u32, mods: u32) -> bool {
             return true
         }
     }
+    if dd_key_route(c, key, mods) {
+        return true
+    }
     if cmb_key_route(c, key, mods) {
         return true
     }
@@ -2205,6 +2223,9 @@ fn ctl_chr(ud: u64, cp: u32, mods: u32) -> bool {
     if sh_blocking(c) {
         return true
     }
+    if dd_chr_route(c, cp, mods) {
+        return true
+    }
     if (*c).pg_edit_i != NONE {
         let er: u32 = editor.editor_char(&(*c).pg_ed, cp, mods)
         touch(c)
@@ -2248,6 +2269,9 @@ fn ctl_ptr(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     }
     if sh_blocking(c) {
         return false
+    }
+    if dd_ptr_route(c, kind, x, y) {
+        return true
     }
     if cmb_ptr_route(c, kind, x, y) {
         return true
@@ -2338,6 +2362,7 @@ fn ctl_paint(ud: u64, rc: *mut render.Ctx, w: usize, h: usize) {
         draw_dlg(c, rc)
     }
     ripple_draw(c, rc)
+    dd_paint(c, rc, w, h)
 }
 
 // ============================================================ SPLITTER (r240)
@@ -5821,4 +5846,351 @@ fn on_size_class(a: *mut app.App, f: fn(*mut app.App, u32)) {
     if c as u64 == 0 { return }
     (*c).sz_cb = f
     (*c).sz_has = true
+}
+
+// ============================================================ DRAG AND DROP (r144, W29)
+//
+// Sources and targets are nodes; a virtual list (app.vlist_new) is a source of ROWS and a target with a drop
+// slot. lib/fui/wave10.fi has the model, the hit tests, the marker, the ghost and the keyboard way.
+//
+//     appctl.dnd_source(a, list_a, dnd.KIND_ROW, dnd.OP_MOVE | dnd.OP_COPY)    // rows of list_a can be dragged
+//     appctl.dnd_target(a, list_b, dnd.KIND_ROW, dnd.OP_MOVE | dnd.OP_COPY, false)   // ... and dropped on list_b
+//     appctl.dnd_on_drop(a, dropped)                                        // dropped(a, target_node)
+//     // in `dropped`: appctl.dnd_effect(a), dnd_from(a), dnd_from_row(a), dnd_gap(a) say what happened
+//
+// The drag starts after 4 px (10 px touch). Ctrl moves to copy, Shift to move, Alt to link where the target
+// allows it. Ctrl+Space on a focused source grabs it, Up / Down walk the drop gaps, Enter drops, Esc cancels.
+
+fn dd_of(c: *mut Ctl) -> *mut wave10.Dd {
+    if (*c).dd == 0 {
+        (*c).dd = wave10.dd_new() as u64
+    }
+    return (*c).dd as *mut wave10.Dd
+}
+
+fn dd_running(c: *mut Ctl) -> bool {
+    return (*c).dd != 0 && wave10.dd_busy((*c).dd as *mut wave10.Dd)
+}
+
+fn dd_stop(c: *mut Ctl) {
+    if (*c).dd != 0 {
+        wave10.dd_cancel((*c).dd as *mut wave10.Dd)
+    }
+}
+
+fn dd_wants_timer(c: *mut Ctl) -> bool {
+    return (*c).dd != 0 && wave10.dd_edge_active((*c).dd as *mut wave10.Dd)
+}
+
+fn dd_tick_c(c: *mut Ctl) -> bool {
+    if (*c).dd == 0 {
+        return false
+    }
+    return wave10.dd_tick((*c).a, (*c).dd as *mut wave10.Dd)
+}
+
+// the pointer: true = the event belongs to a running drag (nothing else hears it)
+fn dd_ptr_route(c: *mut Ctl, kind: u32, x: f64, y: f64) -> bool {
+    if (*c).dd == 0 {
+        return false
+    }
+    return wave10.dd_pointer((*c).a, (*c).dd as *mut wave10.Dd, kind, x, y)
+}
+
+fn dd_key_route(c: *mut Ctl, key: u32, mods: u32) -> bool {
+    if (*c).dd == 0 {
+        return false
+    }
+    return wave10.dd_key((*c).a, (*c).dd as *mut wave10.Dd, key, mods) != 0 as u32
+}
+
+// Ctrl+Space grabs the focused source; while a keyboard drag runs, characters are swallowed
+fn dd_chr_route(c: *mut Ctl, cp: u32, mods: u32) -> bool {
+    if (*c).dd == 0 {
+        return false
+    }
+    let dd: *mut wave10.Dd = (*c).dd as *mut wave10.Dd
+    if wave10.dd_keyboard(dd) {
+        return true
+    }
+    return wave10.dd_char((*c).a, dd, app.focus((*c).a), cp, mods)
+}
+
+fn dd_paint(c: *mut Ctl, rc: *mut render.Ctx, w: usize, h: usize) {
+    if (*c).dd == 0 {
+        return
+    }
+    wave10.dd_draw((*c).a, rc, (*c).dd as *mut wave10.Dd, w as f64, h as f64)
+}
+
+// `node` can be dragged (a list: its rows). kind = dnd.KIND_*, ops = dnd.OP_* bits it allows. false = 8 are taken.
+fn dnd_source(a: *mut app.App, node: usize, kind: u32, ops: u32) -> bool {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return false }
+    let dd: *mut wave10.Dd = dd_of(c)
+    if dd as u64 == 0 { return false }
+    return wave10.dd_source(dd, node, kind, ops)
+}
+
+// `node` takes drops of the kinds (dnd.KIND bits) with the ops it allows; `tree` = a drop may land ON a row.
+fn dnd_target(a: *mut app.App, node: usize, kinds: u32, ops: u32, tree: bool) -> bool {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return false }
+    let dd: *mut wave10.Dd = dd_of(c)
+    if dd as u64 == 0 { return false }
+    return wave10.dd_target(dd, node, kinds, ops, tree)
+}
+
+fn dnd_on_start(a: *mut app.App, f: fn(*mut app.App, usize)) {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return }
+    let dd: *mut wave10.Dd = dd_of(c)
+    if dd as u64 != 0 { wave10.dd_on_start(dd, f) }
+}
+
+// `f(a, target_node)` after a drop that was accepted (read what happened with dnd_effect / dnd_from / ...)
+fn dnd_on_drop(a: *mut app.App, f: fn(*mut app.App, usize)) {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return }
+    let dd: *mut wave10.Dd = dd_of(c)
+    if dd as u64 != 0 { wave10.dd_on_drop(dd, f) }
+}
+
+// the text of the ghost at the pointer (47 bytes at most)
+fn dnd_ghost(a: *mut app.App, text: str) {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return }
+    let dd: *mut wave10.Dd = dd_of(c)
+    if dd as u64 != 0 { wave10.dd_set_ghost(dd, text) }
+}
+
+fn dnd_busy(a: *mut app.App) -> bool {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return false }
+    return dd_running(c)
+}
+
+fn dnd_cancel(a: *mut app.App) {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 { return }
+    dd_stop(c)
+    touch(c)
+}
+
+fn dnd_keyboard(a: *mut app.App) -> bool {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).dd == 0 { return false }
+    return wave10.dd_keyboard((*c).dd as *mut wave10.Dd)
+}
+
+// the last finished drag (valid in `on_drop` and after): effect dnd.OP_*, source node and row (NONE = a plain
+// node), target node, drop gap 0..n between the target's rows, zone dnd.SLOT_*, the row under the pointer
+fn dnd_effect(a: *mut app.App) -> u32 {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).dd == 0 { return dnd.OP_NONE }
+    return wave10.dd_r_effect((*c).dd as *mut wave10.Dd)
+}
+
+fn dnd_from(a: *mut app.App) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).dd == 0 { return NONE }
+    return wave10.dd_r_source((*c).dd as *mut wave10.Dd)
+}
+
+fn dnd_from_row(a: *mut app.App) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).dd == 0 { return NONE }
+    return wave10.dd_r_row((*c).dd as *mut wave10.Dd)
+}
+
+fn dnd_to(a: *mut app.App) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).dd == 0 { return NONE }
+    return wave10.dd_r_target((*c).dd as *mut wave10.Dd)
+}
+
+fn dnd_gap(a: *mut app.App) -> i64 {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).dd == 0 { return 0 }
+    return wave10.dd_r_gap((*c).dd as *mut wave10.Dd)
+}
+
+fn dnd_zone(a: *mut app.App) -> u32 {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).dd == 0 { return dnd.SLOT_ON }
+    return wave10.dd_r_zone((*c).dd as *mut wave10.Dd)
+}
+
+fn dnd_to_row(a: *mut app.App) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).dd == 0 { return NONE }
+    return wave10.dd_r_trow((*c).dd as *mut wave10.Dd)
+}
+
+// accepted drops since the start
+fn dnd_drops(a: *mut app.App) -> usize {
+    let c: *mut Ctl = st(a)
+    if c as u64 == 0 || (*c).dd == 0 { return 0 }
+    return wave10.dd_drops((*c).dd as *mut wave10.Dd)
+}
+
+// ============================================================ GRID (r334)
+//
+// `grid(a, "1fr 120 auto", "auto auto")` opens a GRID container (like
+// app.row / app.column: the widgets after it sit in its cells, until
+// app.end). Tracks are words split by blanks:
+//   "120"       fixed, design points
+//   "auto"      as big as the content
+//   "1fr"       a share of the rest (also "2fr", "1.5fr")
+//   "100-1fr"   at least 100 points, then a share (minmax(100px, 1fr))
+// A child without grid_cell is placed automatically, row by row; extra rows
+// get the size "auto". At most 16 explicit tracks per axis (grid.fi).
+
+fn gr_digit(b: u8) -> bool {
+    return b >= (48 as u8) && b <= (57 as u8)
+}
+
+fn gr_at(s: str, i: usize) -> u8 {
+    return *((s.p as u64 + i as u64) as *mut u8)
+}
+
+// One track word from s[a..e); false = not understood.
+fn gr_track(s: str, a: usize, e: usize, out: *mut grid.Track) -> bool {
+    let w: str = str { p: (s.p as u64 + a as u64) as *mut u8, n: e - a }
+    if w.n == 4 && *((w.p as u64) as *mut u8) == (97 as u8) {
+        // "auto"
+        if *((w.p as u64 + 1) as *mut u8) == (117 as u8) && *((w.p as u64 + 2) as *mut u8) == (116 as u8)
+        && *((w.p as u64 + 3) as *mut u8) == (111 as u8) {
+            *out = grid.tk_auto()
+            return true
+        }
+        return false
+    }
+    // number [. digits] [fr] [- number [. digits] fr]
+    var i: usize = 0
+    var whole: i64 = 0
+    var nd: usize = 0
+    while i < w.n && gr_digit(*((w.p as u64 + i as u64) as *mut u8)) {
+        whole = whole * 10 + (gr_at(w, i) as i64 - 48)
+        i = i + 1
+        nd = nd + 1
+    }
+    if nd == 0 {
+        return false
+    }
+    var frac: i64 = 0
+    var scale: i64 = 1000
+    if i < w.n && *((w.p as u64 + i as u64) as *mut u8) == (46 as u8) {
+        i = i + 1
+        var fd: usize = 0
+        scale = 100
+        while i < w.n && gr_digit(*((w.p as u64 + i as u64) as *mut u8)) {
+            if fd < 3 {
+                frac = frac + (gr_at(w, i) as i64 - 48) * scale
+                scale = scale / 10
+            }
+            fd = fd + 1
+            i = i + 1
+        }
+        if fd == 0 {
+            return false
+        }
+    }
+    let is_fr: bool = i + 2 == w.n && *((w.p as u64 + i as u64) as *mut u8) == (102 as u8)
+    && *((w.p as u64 + i as u64 + 1) as *mut u8) == (114 as u8)
+    if is_fr {
+        *out = grid.tk_fr(whole * 1000 + frac)
+        return true
+    }
+    if i == w.n {
+        if frac != 0 {
+            return false
+        }
+        *out = grid.tk_px(whole)
+        return true
+    }
+    // "min-<f>fr"
+    if *((w.p as u64 + i as u64) as *mut u8) == (45 as u8) && frac == 0 {
+        let rest: str = str { p: (w.p as u64 + i as u64 + 1) as *mut u8, n: w.n - i - 1 }
+        var t2: grid.Track = grid.tk_auto()
+        if gr_track(rest, 0, rest.n, &t2) && t2.max_k == grid.TK_FR {
+            *out = grid.tk_minfr(whole, t2.max_v)
+            return true
+        }
+    }
+    return false
+}
+
+// Add the tracks of `spec` to node g (axis 0 columns, 1 rows). Returns how many were added.
+fn gr_tracks(a: *mut app.App, g: usize, spec: str, axis: usize) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < spec.n {
+        while i < spec.n && *((spec.p as u64 + i as u64) as *mut u8) == (32 as u8) {
+            i = i + 1
+        }
+        let s0: usize = i
+        while i < spec.n && *((spec.p as u64 + i as u64) as *mut u8) != (32 as u8) {
+            i = i + 1
+        }
+        if i > s0 {
+            var t: grid.Track = grid.tk_auto()
+            if !gr_track(spec, s0, i, &t) {
+                t = grid.tk_auto()
+            }
+            var ok: bool = false
+            if axis == 0 {
+                ok = scene.node_grid_col(app.app_scene(a), g, t)
+            } else {
+                ok = scene.node_grid_row(app.app_scene(a), g, t)
+            }
+            if ok {
+                n = n + 1
+            }
+        }
+    }
+    return n
+}
+
+// Open a grid. NONE if the window is full. Close it with app.end(a).
+fn grid(a: *mut app.App, cols: str, rows: str) -> usize {
+    let g: usize = app.grid_box(a)
+    if g == NONE {
+        return NONE
+    }
+    gr_tracks(a, g, cols, 0)
+    gr_tracks(a, g, rows, 1)
+    a11y.a11y_set_role(app.ax(a), g, a11y.ROLE_GROUP)
+    touch(st(a))
+    return g
+}
+
+// The cell of a child: column/row 0-based (-1 = automatic), spans >= 1.
+fn grid_cell(a: *mut app.App, child: usize, col: i64, row: i64, cspan: i64, rspan: i64) {
+    scene.node_set_cell(app.app_scene(a), child, col, row, cspan, rspan)
+    touch(st(a))
+}
+
+// Space between columns (x) and rows (y), design points.
+fn grid_gap(a: *mut app.App, g: usize, x: i64, y: i64) {
+    scene.node_grid_gap(app.app_scene(a), g, x, y)
+    touch(st(a))
+}
+
+fn grid_pad(a: *mut app.App, g: usize, l: i64, t: i64, r: i64, b: i64) {
+    scene.node_grid_padding(app.app_scene(a), g, l, t, r, b)
+    touch(st(a))
+}
+
+// Right-to-left: column 0 on the right.
+fn grid_rtl(a: *mut app.App, g: usize, rtl: bool) {
+    scene.node_grid_rtl(app.app_scene(a), g, rtl)
+    touch(st(a))
+}
+
+// The name a screen reader says for the group.
+fn grid_name(a: *mut app.App, g: usize, name: str) {
+    if name.n > 0 {
+        a11y.a11y_set_name(app.ax(a), g, name.p as u64, name.n)
+    }
 }

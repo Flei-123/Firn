@@ -778,6 +778,9 @@ build appw7
 # appw8w: wave 8 controls (spinner, time picker, breadcrumb, info bar, stepper) in the ten-line API: keys, digits, wheel, clicks, a11y
 build appw8w
 "$W/appw8w" | tail -n 3 | grep -q "APPW8W PASSED"
+# appgrid: grid container in the ten-line API (appctl.grid: track words, cells, spans, gap, padding, RTL, inspector line, pictures)
+build appgrid
+"$W/appgrid" | tail -n 3 | grep -q "APPGRID PASSED"
 
 # appw6: sheet overlay + property grid in the ten-line API (inline editor, edit callback, scroll, divider, a11y)
 build appw6
@@ -788,6 +791,9 @@ build appw8
 # appw9: window size class in the ten-line API (classes, hysteresis, callback once per change, columns)
 build appw9
 "$W/appw9" | tail -n 3 | grep -q "APPW9 PASSED"
+# appw10: drag and drop (threshold, rows A to B, Ctrl copy, node target, Esc, edge scroll, keyboard, no double click from a drag)
+build appw10
+"$W/appw10" | tail -n 3 | grep -q "APPW10 PASSED"
 # W16: mnemonics (Alt+letter, '&'), Tab order end to end, shortcut management
 build w16
 "$W/w16" | tail -n 3
