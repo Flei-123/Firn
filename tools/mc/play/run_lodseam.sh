@@ -136,6 +136,8 @@ run_one() { # name, hop_z, env...
     echo "  $name player=$pn end y=${py:-?} load=$(cut -d' ' -f1 /proc/loadavg)"
 }
 RUN_S=${SEAM_RUN_S:-40}
+# r265: the shot shows the converged picture (LOD builds + cross-fades finished); without it the CPU picture differed 32 dB between two runs
+export MCPLAY_SHOT_SETTLE=1
 # r259: back ends. LODSEAM_BACKENDS="cpu gl vk" (default cpu; LODSEAM_BACKEND is an alias). cpu = CPU raster, gl = MCPLAY_GL=1 (llvmpipe),
 # vk = MCPLAY_GFX=vk (lavapipe). Run names get the suffix "" / _gl / _vk. Per back end: the same seam / ring-change checks as the CPU run (0 px; GL / Vulkan: <= 17 noise pixels for R == S and B == B2).
 # With "cpu" in the list the other back ends are also compared to the CPU pictures (stairs pixels: share differing > 2 levels <= LODSEAM_FIX_PCT; whole picture PSNR >= LODSEAM_FULL_MIN_DB).
@@ -191,7 +193,7 @@ for bk in $BACKENDS; do
     esac
 done
 if [ $ERR -eq 0 ]; then
-    python3 -I - "$W" "$BACKENDS" "${LODSEAM_FULL_MIN_DB:-24}" "${LODSEAM_FIX_PCT:-0.5}" "${LODSEAM_EXACT_MIN_DB:-25}" <<'PY' || ERR=1
+    python3 -I - "$W" "$BACKENDS" "${LODSEAM_FULL_MIN_DB:-24}" "${LODSEAM_FIX_PCT:-0.5}" "${LODSEAM_EXACT_MIN_DB:-33}" <<'PY' || ERR=1
 import sys, math
 from PIL import Image, ImageChops
 W, backends = sys.argv[1], sys.argv[2].split()

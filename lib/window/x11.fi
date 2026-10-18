@@ -2304,9 +2304,64 @@ fn r_insets(x: *mut Platte, out: *mut [f64; 4]) -> bool {
     var mons: [i64; 32] = [0; 32]
     let cnt: usize = r_monitors(x, &mons)
     if cnt > 1 {
+        // W47-b (r386): _NET_WORKAREA is ONE rectangle for all monitors, so a bar on monitor B shrinks it for A too. The struts of the
+        // clients say which monitor a bar really sits on; none found (no dock lists one, no _NET_CLIENT_LIST) = the work area as before.
+        var struts: [i64; 384] = [0; 384]
+        let ns: usize = r_struts(x, &struts)
+        if ns > 0 && (*x).schirm_w > 0 && (*x).schirm_h > 0 {
+            return hostmetrics.insets_on_monitor_struts(&mons, cnt, (*x).schirm_w as i64, (*x).schirm_h as i64, &struts, ns,
+                wr[0], wr[1], wr[2], wr[3], out)
+        }
         return hostmetrics.insets_on_monitor(&mons, cnt, wr[0], wr[1], wr[2], wr[3], wa[0], wa[1], wa[2], wa[3], out)
     }
     return hostmetrics.insets_overlap(wr[0], wr[1], wr[2], wr[3], wa[0], wa[1], wa[2], wa[3], out)
+}
+
+// W47-b (r386) -- the struts of the top-level clients (_NET_CLIENT_LIST of the root): per client _NET_WM_STRUT_PARTIAL, else the old
+// _NET_WM_STRUT. At most STRUTS_MAX with a strut are kept (12 numbers each, see hostmetrics.strut_parse), at most 128 clients are asked.
+// Returns how many were kept; 0 = no list, no struts, or no answer (the caller falls back to the work area).
+fn r_struts(x: *mut Platte, out: *mut [i64; 384]) -> usize {
+    if !(*x).open {
+        return 0
+    }
+    let a_list: u32 = intern_live(x, "_NET_CLIENT_LIST")
+    let a_part: u32 = intern_live(x, "_NET_WM_STRUT_PARTIAL")
+    let a_old: u32 = intern_live(x, "_NET_WM_STRUT")
+    if a_list == 0 || (a_part == 0 && a_old == 0) {
+        return 0
+    }
+    var lv: rt.Buf = rt.buf_new()
+    var lt: u32 = 0
+    var kept: usize = 0
+    if get_prop_any(x, (*x).root, a_list, false, &lv, &lt) {
+        var nwin: usize = rt.buf_len(&lv) / 4
+        if nwin > 128 { nwin = 128 }
+        var i: usize = 0
+        while i < nwin && kept < hostmetrics.STRUTS_MAX {
+            let w: u32 = ld32le(rt.buf_ptr(&lv), i * 4)
+            var got: bool = false
+            if a_part != 0 {
+                var v: rt.Buf = rt.buf_new()
+                var t: u32 = 0
+                if get_prop_any(x, w, a_part, false, &v, &t) && rt.buf_len(&v) >= 48 {
+                    got = hostmetrics.strut_parse(rt.buf_ptr(&v), rt.buf_len(&v), out, kept)
+                }
+                rt.buf_free(&v)
+            }
+            if !got && a_old != 0 {
+                var v2: rt.Buf = rt.buf_new()
+                var t2: u32 = 0
+                if get_prop_any(x, w, a_old, false, &v2, &t2) && rt.buf_len(&v2) >= 16 {
+                    got = hostmetrics.strut_parse(rt.buf_ptr(&v2), 16, out, kept)
+                }
+                rt.buf_free(&v2)
+            }
+            if got { kept = kept + 1 }
+            i = i + 1
+        }
+    }
+    rt.buf_free(&lv)
+    return kept
 }
 
 // RRGetMonitors (RandR 1.5, minor opcode 42): the window, get_active = 1. The monitors of the screen as x, y, w, h each; the count
@@ -2323,30 +2378,41 @@ fn r_monitors(x: *mut Platte, out: *mut [i64; 32]) -> usize {
     if !(*x).open || (*x).rr_op == 0 as u32 {
         return 0
     }
-    // RRQueryVersion 1.5: the server answers with the highest version it has (<= 1.5); older than 1.5 has no GetMonitors
+    // RRQueryVersion 1.5: the server answers with the highest version it has (<= 1.5); older than 1.5 has no GetMonitors.
+    // W47-b: the answers are fetched BY SEQUENCE NUMBER (send_request + wait_record) -- `question` takes the next 32 bytes of the
+    // stream, which on a live window is often an event (Expose, ConfigureNotify) that is then swallowed, so the monitors were never read.
     var q: rt.Buf = rt.buf_new()
     req_randr_query_version(&q, (*x).rr_op, 1 as u32, 5 as u32)
-    var at: usize = 0
-    let n: usize = question(x, &q, &at)
-    rt.buf_free(&q)
-    if n < 16 {
+    if !send_request(x, &q) {
+        rt.buf_free(&q)
         return 0
     }
-    let pv: u64 = (*x).rb.ptr + at as u64
-    let major: u32 = ld32le(pv, 8)
-    let minor: u32 = ld32le(pv, 12)
+    rt.buf_free(&q)
+    var rep: rt.Buf = rt.buf_new()
+    if !wait_record(x, 1 as u32, (*x).seq, 2000, &rep) || rt.buf_len(&rep) < 16 {
+        rt.buf_free(&rep)
+        return 0
+    }
+    let major: u32 = ld32le(rt.buf_ptr(&rep), 8)
+    let minor: u32 = ld32le(rt.buf_ptr(&rep), 12)
+    rt.buf_free(&rep)
     if major < 1 as u32 || (major == 1 as u32 && minor < 5 as u32) {
         return 0
     }
     var g: rt.Buf = rt.buf_new()
     req_randr_get_monitors(&g, (*x).rr_op, (*x).root)
-    var at2: usize = 0
-    let n2: usize = question(x, &g, &at2)
-    rt.buf_free(&g)
-    if n2 == 0 {
+    if !send_request(x, &g) {
+        rt.buf_free(&g)
         return 0
     }
-    return hostmetrics.randr_monitors_parse((*x).rb.ptr + at2 as u64, n2, out)
+    rt.buf_free(&g)
+    var rep2: rt.Buf = rt.buf_new()
+    var cnt: usize = 0
+    if wait_record(x, 1 as u32, (*x).seq, 2000, &rep2) {
+        cnt = hostmetrics.randr_monitors_parse(rt.buf_ptr(&rep2), rt.buf_len(&rep2), out)
+    }
+    rt.buf_free(&rep2)
+    return cnt
 }
 
 // W44-c -- GNOME's text size: `gsettings get org.gnome.desktop.interface text-scaling-factor` ("1.25"), per mille; 0 = no answer.
