@@ -905,8 +905,15 @@ impl<'a> Parser<'a> {
             }
             let before = self.pos;
             // r664: named argument `name: expr`
-            let named = match (self.kind(), self.toks.get(self.pos + 1).map(|t| &t.kind)) {
-                (TokKind::Ident(n), Some(TokKind::Colon)) => Some(n.clone()),
+            // (`A::B` is two colons: only a single colon names an argument)
+            let named = match (
+                self.kind(),
+                self.toks.get(self.pos + 1).map(|t| &t.kind),
+                self.toks.get(self.pos + 2).map(|t| &t.kind),
+            ) {
+                (TokKind::Ident(n), Some(TokKind::Colon), t2) if !matches!(t2, Some(TokKind::Colon)) => {
+                    Some(n.clone())
+                }
                 _ => None,
             };
             let a = if let Some(n) = named {

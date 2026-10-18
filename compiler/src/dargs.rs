@@ -223,6 +223,8 @@ fn call(cx: &mut Cx, e: &mut Expr) {
     }
     let mut slots: Vec<Option<Expr>> = (0..n).map(|_| None).collect();
     let mut ok = true;
+    let mut keep = false;
+    let backup: Vec<Expr> = args.clone();
     let old: Vec<Expr> = std::mem::take(args);
     for (i, a) in old.into_iter().enumerate() {
         if i < npos {
@@ -270,6 +272,13 @@ fn call(cx: &mut Cx, e: &mut Expr) {
                         crate::mono::renumber_expr(&mut c, &mut cx.next);
                         out.push(c);
                     }
+                    None if !has_named => {
+                        // plain call with too few arguments: the type checker
+                        // reports the count, as it always did
+                        ok = false;
+                        keep = true;
+                        break;
+                    }
                     None => {
                         ok = false;
                         cx.dg.error(
@@ -289,6 +298,11 @@ fn call(cx: &mut Cx, e: &mut Expr) {
             if let ExprKind::Call(_, a, _) = &mut e.kind {
                 *a = out;
             }
+        }
+    }
+    if keep {
+        if let ExprKind::Call(_, a, _) = &mut e.kind {
+            *a = backup;
         }
     }
 }
