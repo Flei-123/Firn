@@ -705,6 +705,9 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             r.push_scope();
             for prm in f.params.iter_mut() {
                 r.ty(&mut prm.ty);
+                if let Some(d) = prm.default.as_mut() {
+                    r.expr(d); // r704: a default names consts of its module
+                }
                 r.declare(&prm.name);
             }
             if let Some(t) = f.ret.as_mut() {
@@ -736,6 +739,9 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
                 r.push_scope();
                 for prm in decl.params.iter_mut() {
                     r.ty(&mut prm.ty);
+                    if let Some(d) = prm.default.as_mut() {
+                        r.expr(d);
+                    }
                     r.declare(&prm.name);
                 }
                 if let Some(t) = decl.ret.as_mut() {
