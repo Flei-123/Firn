@@ -64,6 +64,15 @@ KNOWN="tests/590_f64.fi tests/871_closure_plain.fi"
 # IMPORTS SAME / IMPORTS DIFFERENT and NEVER changes the exit code. Known rest: programs that use `gc` allocation
 # expressions (r767).
 IMPORTS_STEP=${FIR_IMPORTS_STEP:-8}
+# FIR_IMPORTS_SHARD=i/n (r787): with STEP=1, compare only the imports files whose index modulo n is i, so that a
+# full run can be split into several heavy runs. FIR_IMPORTS_ONLY=1 skips the single-file comparison (already covered).
+IMPORTS_SHARD_I=0
+IMPORTS_SHARD_N=1
+if [ -n "${FIR_IMPORTS_SHARD:-}" ]; then
+    IMPORTS_SHARD_I=${FIR_IMPORTS_SHARD%/*}
+    IMPORTS_SHARD_N=${FIR_IMPORTS_SHARD#*/}
+fi
+IMPORTS_ONLY=${FIR_IMPORTS_ONLY:-0}
 FIRNC1=""
 if [ "$IMPORTS_STEP" -gt 0 ]; then
     FIRNC1="$TMPD"/firnc1
@@ -72,6 +81,9 @@ fi
 imp_same=0
 imp_diff=0
 imp_first=""
+imp_skip0=0
+imp_skip1=0
+imp_skip1_all=""
 imp_all=""
 
 same=0
@@ -93,9 +105,15 @@ while IFS= read -r f; do
     fi
     if grep -qE '^[[:space:]]*import[[:space:]]' "$f"; then
         imports=$((imports+1))
-        if [ "$IMPORTS_STEP" -gt 0 ] && [ $((imports % IMPORTS_STEP)) -eq 0 ]; then
-            if "$FIRNC" --emit=fir-raw "$f" > "$TMPD"/imp_a.txt 2>/dev/null \
-                && FIRN_EMIT_FIR_RAW=1 FIRNLIB=lib "$FIRNC1" "$f" -o "$TMPD"/imp_x > "$TMPD"/imp_b.txt 2>/dev/null; then
+        if [ "$IMPORTS_STEP" -gt 0 ] && [ $((imports % IMPORTS_STEP)) -eq 0 ] \
+            && [ $((imports % IMPORTS_SHARD_N)) -eq "$IMPORTS_SHARD_I" ]; then
+            if ! "$FIRNC" --emit=fir-raw "$f" > "$TMPD"/imp_a.txt 2>/dev/null; then
+                imp_skip0=$((imp_skip0+1))
+            elif ! FIRN_EMIT_FIR_RAW=1 FIRNLIB=lib "$FIRNC1" "$f" -o "$TMPD"/imp_x > "$TMPD"/imp_b.txt 2>/dev/null; then
+                # firnc0 lowers it but firnc1 does not: a real gap, listed (r787)
+                imp_skip1=$((imp_skip1+1))
+                imp_skip1_all="$imp_skip1_all\n    $f"
+            else
                 if why=$(python3 tools/fir_norm.py "$TMPD"/imp_a.txt "$TMPD"/imp_b.txt); then
                     imp_same=$((imp_same+1))
                 else
@@ -105,6 +123,9 @@ while IFS= read -r f; do
                 fi
             fi
         fi
+        continue
+    fi
+    if [ "$IMPORTS_ONLY" -eq 1 ]; then
         continue
     fi
     if ! "$FIRNC" --emit=types "$f" >/dev/null 2>&1; then
@@ -145,6 +166,9 @@ if [ "$IMPORTS_STEP" -gt 0 ]; then
     echo "IMPORTS SAME:      $imp_same  (every $IMPORTS_STEP-th file, firnc1 module loader, normalised)"
     echo "IMPORTS DIFFERENT: $imp_diff  (informational; first: ${imp_first:-none})"
     [ -n "$imp_all" ] && printf "  all differing files:$imp_all\n"
+    echo "IMPORTS firnc0 does not compile alone: $imp_skip0"
+    echo "IMPORTS firnc1 fails where firnc0 lowers: $imp_skip1"
+    [ -n "$imp_skip1_all" ] && printf "  firnc1 failures:$imp_skip1_all\n"
 fi
 echo "NOT CORE:      $noncore"
 echo "COMPTIME:      $comptime"
