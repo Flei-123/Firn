@@ -11,9 +11,9 @@ cd "$(dirname "$0")/../.."
 SRC=lib/gpu/vk_glsl
 OUT=lib/gpu/spv
 # name:stage:glsl source  (the tint pass reuses vk_sky.vert)
-LIST="vk_mc.vert:vert:mc_vs vk_mc.frag:frag:mc_fs vk_sky.vert:vert:sky_vs vk_sky.frag:frag:sky_fs vk_ent.vert:vert:ent_vs vk_ent.frag:frag:ent_fs vk_hud.vert:vert:hud_vs vk_hud.frag:frag:hud_fs vk_tint.frag:frag:tint_fs"
+LIST="vk_mc.vert:vert:mc_vs vk_mc.frag:frag:mc_fs vk_sky.vert:vert:sky_vs vk_sky.frag:frag:sky_fs vk_ent.vert:vert:ent_vs vk_ent.frag:frag:ent_fs vk_hud.vert:vert:hud_vs vk_hud.frag:frag:hud_fs vk_tint.frag:frag:tint_fs vk_model.vert:vert:mc_model_vs vk_model.frag:frag:mc_model_fs"
 # GL twin of every Vulkan source (for --parity)
-PAIRS="mc_vs:mc_vs mc_fs:mc_fs sky_vs:gl_sky_vs sky_fs:gl_sky_fs ent_vs:gl_ent_vs ent_fs:gl_ent_fs hud_vs:gl_hud_vs hud_fs:gl_hud_fs tint_fs:gl_tint_fs"
+PAIRS="mc_vs:mc_vs mc_fs:mc_fs sky_vs:gl_sky_vs sky_fs:gl_sky_fs ent_vs:gl_ent_vs ent_fs:gl_ent_fs hud_vs:gl_hud_vs hud_fs:gl_hud_fs tint_fs:gl_tint_fs mc_model_vs:mc_model_vs mc_model_fs:mc_model_fs"
 
 build_to() { # $1 = output dir
     local item name stage src

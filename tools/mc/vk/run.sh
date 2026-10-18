@@ -53,6 +53,7 @@ fi
 if [ -e lib/mc/vk_mc.fi ]; then
     bash tools/gpu/vk/vkmc_run.sh "$FIRNC" || fail=1
     bash tools/gpu/vk/vkscene_run.sh "$FIRNC" || fail=1   # sky / tint / HUD / entities vs mc_sky + mc_hud + mc_raster (r180)
+    bash tools/gpu/vk/vkmodel_run.sh "$FIRNC" || fail=1   # model quads MESH_MODEL / MESH_MODEL_T vs mc_raster (r241)
 else
     echo "   NOTE: lib/mc/vk_mc.fi not on this branch: voxel scene PSNR vs mc_raster not run (vkprobe covers flat + gradient triangles only)"
 fi
