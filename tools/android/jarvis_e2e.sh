@@ -79,7 +79,12 @@ SLOG=$W/server.log
 [ -n "${WM_DENSITY:-}" ] && $ADB shell wm density "$WM_DENSITY" >/dev/null 2>&1
 read -r SW SH < <($ADB shell wm size | tr -d '\r' | sed -n 's/.*: *\([0-9]*\)x\([0-9]*\).*/\1 \2/p' | tail -1)
 shot() { $ADB exec-out screencap -p >"$OUT/$1.png"; }
-ocr() { tesseract "$OUT/$1.png" stdout 2>/dev/null | tr -s '\n ' ' '; }
+# full page plus a second read of the chat band (18-42 % of the height, 2x, psm 6): the page segmentation of the full read sometimes
+# drops a plain chat line when the layout moves by a few pixels ('hello' next to 'hi' bubble)
+ocr() { { tesseract "$OUT/$1.png" stdout 2>/dev/null; python3 -I -c "import sys
+from PIL import Image
+im=Image.open(sys.argv[1]).convert('L'); w,h=im.size
+c=im.crop((0,int(h*0.18),w,int(h*0.42))); c.resize((c.width*2,c.height*2)).save(sys.argv[2])" "$OUT/$1.png" "$W/_band.png" 2>/dev/null && tesseract "$W/_band.png" stdout --psm 6 2>/dev/null; } | tr -s '\n ' ' '; }
 # the centre (pixels) of the n-th word matching a regex in the screenshot $1; empty when there is none
 word_at() { python3 -I "$(dirname "${BASH_SOURCE[0]}")/ocr_words.py" "$OUT/$1.png" "$2" "${3:-1}"; }
 # touch the n-th word matching a regex ($1); fails (returns 1) when the word is not on the screen
