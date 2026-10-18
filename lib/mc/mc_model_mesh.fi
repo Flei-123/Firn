@@ -306,6 +306,32 @@ fn ms_tile_translucent(m: *mut ModelSet, tile: u32) -> bool {
     return vis > 0 && part * 4 >= vis
 }
 
+fn zoom_clamp(v: i32) -> i32 {
+    if v < 0 - 1 { return 0 - 1 }
+    if v > 4 { return 4 }
+    return v
+}
+
+// The biome id when the 8 cells (l..l+1, m..m+1, n..n+1; cell coordinates relative to the section, clamped to the grid like the pick result) around
+// a block all hold the same biome, else -1. BiomeManager.getBiome always returns one of these 8 cells, so no Voronoi pick is needed then.
+fn ms_zoom_cells_same(bio: u64, l: i32, m: i32, n: i32) -> i32 {
+    let xa: i32 = zoom_clamp(l)
+    let xb: i32 = zoom_clamp(l + 1)
+    let ya: i32 = zoom_clamp(m)
+    let yb: i32 = zoom_clamp(m + 1)
+    let za: i32 = zoom_clamp(n)
+    let zb: i32 = zoom_clamp(n + 1)
+    let v: u16 = rt.ld16(bio, (((ya + 1) * 6 + za + 1) * 6 + xa + 1) as usize)
+    if rt.ld16(bio, (((ya + 1) * 6 + za + 1) * 6 + xb + 1) as usize) != v { return 0 - 1 }
+    if rt.ld16(bio, (((ya + 1) * 6 + zb + 1) * 6 + xa + 1) as usize) != v { return 0 - 1 }
+    if rt.ld16(bio, (((ya + 1) * 6 + zb + 1) * 6 + xb + 1) as usize) != v { return 0 - 1 }
+    if rt.ld16(bio, (((yb + 1) * 6 + za + 1) * 6 + xa + 1) as usize) != v { return 0 - 1 }
+    if rt.ld16(bio, (((yb + 1) * 6 + za + 1) * 6 + xb + 1) as usize) != v { return 0 - 1 }
+    if rt.ld16(bio, (((yb + 1) * 6 + zb + 1) * 6 + xa + 1) as usize) != v { return 0 - 1 }
+    if rt.ld16(bio, (((yb + 1) * 6 + zb + 1) * 6 + xb + 1) as usize) != v { return 0 - 1 }
+    return v as i32
+}
+
 // Colour 0xRRGGBB of tint class `cls` (0 grass 1 foliage 2 water) in biome `bid`, or the class colour when the biome has no entry.
 fn ms_biome_color(m: *mut ModelSet, cls: usize, bid: usize) -> u32 {
     if (*m).btab != 0 && cls < 3 && bid < BT_MAXID {
@@ -313,6 +339,31 @@ fn ms_biome_color(m: *mut ModelSet, cls: usize, bid: usize) -> u32 {
         if (e >> (24 as u32)) != (0 as u32) { return e & (16777215 as u32) }
     }
     return (*m).tint[cls]
+}
+
+// Scratch of ONE ms_mesh_split_bio call (r258): the biome id of every (y, z, x) column position the blend windows of the section touch (zoom picks are
+// shared by the neighbouring blocks and by the tint classes), the swamp grass colour of every column, the cell fiddles of mc_biome_zoom. Window
+// = section + 4 blocks on each side (blend radius <= 4) -> 24 x 24 columns, 16 heights. Results are the same as without the cache.
+const BC_W: i32 = 24
+
+struct BlendCache {
+    bz: mc_biome_zoom.BzCache,
+    ids: u64, // u16 [16 * 24 * 24] biome id, 0xFFFF = not computed
+    sw: u64, // u32 [24 * 24] swamp grass colour | 1 << 24, 0 = not computed
+}
+
+fn bcache_new(wx: i32, wy: i32, wz: i32) -> BlendCache {
+    let ids: u64 = rt.heap_alloc((16 * BC_W * BC_W * 2) as usize)
+    rt.mem_set(ids, 255 as u8, (16 * BC_W * BC_W * 2) as usize)
+    let sw: u64 = rt.heap_alloc((BC_W * BC_W * 4) as usize)
+    rt.mem_set(sw, 0 as u8, (BC_W * BC_W * 4) as usize)
+    return BlendCache { bz: mc_biome_zoom.bzc_new(wx, wy, wz), ids: ids, sw: sw }
+}
+
+fn bcache_free(c: *mut BlendCache) {
+    mc_biome_zoom.bzc_free(&(*c).bz)
+    rt.heap_free((*c).ids, (16 * BC_W * BC_W * 2) as usize)
+    rt.heap_free((*c).sw, (BC_W * BC_W * 4) as usize)
 }
 
 // ms_biome_color of the block column (bx, bz): the grass colour of a swamp biome comes from the swamp noise of the column (vanilla
@@ -323,6 +374,23 @@ fn ms_biome_color_xz(m: *mut ModelSet, cls: usize, bid: usize, bx: i32, bz: i32)
         if (e & (33554432 as u32)) != (0 as u32) { return mc_biome_zoom.swamp_grass(&(*m).swn, bx, bz) }
     }
     return ms_biome_color(m, cls, bid)
+}
+
+// ms_biome_color_xz with the swamp colour of the column read from / stored in the cache (`cx`, `cz` = window position of the column, 0..23; cache 0 = none).
+fn ms_biome_color_xzc(m: *mut ModelSet, cls: usize, bid: usize, bx: i32, bz: i32, cache: *mut BlendCache, cx: i32, cz: i32) -> u32 {
+    if (cache as u64) != (0 as u64) && (*m).btab != 0 && cls == 0 && bid < BT_MAXID {
+        let e: u32 = rt.ld32((*m).btab, bid)
+        if (e & (33554432 as u32)) != (0 as u32) {
+            let si: usize = (cz * BC_W + cx) as usize
+            var v: u32 = rt.ld32((*cache).sw, si)
+            if v == (0 as u32) {
+                v = mc_biome_zoom.swamp_grass(&(*m).swn, bx, bz) | (16777216 as u32)
+                rt.st32((*cache).sw, si, v)
+            }
+            return v & (16777215 as u32)
+        }
+    }
+    return ms_biome_color_xz(m, cls, bid, bx, bz)
 }
 
 // Hashed world seed (Join Game / Respawn `hashedSeed`) of the vanilla Voronoi biome zoom: with a seed every column takes its biome from
@@ -414,6 +482,11 @@ fn ms_snap_bio(ptrs: u64, out: u64) {
 // is vanilla BiomeManager.getBiome (Voronoi zoom of the cells of the grid `bio`, ms_snap_bio) when a seed is set (ms_set_seed), else its plain 4x4x4 cell;
 // the grass colour of swamp biomes comes from the column noise (ms_biome_color_xz).
 fn ms_blend_color_w(m: *mut ModelSet, bio: u64, cls: usize, lx: i32, y: i32, z: i32, wx: i32, wy: i32, wz: i32) -> u32 {
+    return ms_blend_color_c(m, bio, cls, lx, y, z, wx, wy, wz, 0 as *mut BlendCache)
+}
+
+// ms_blend_color_w with the per-section scratch `cache` (0 = none): lx, z in 0..15, y in 0..15 when a cache is given. Same result.
+fn ms_blend_color_c(m: *mut ModelSet, bio: u64, cls: usize, lx: i32, y: i32, z: i32, wx: i32, wy: i32, wz: i32, cache: *mut BlendCache) -> u32 {
     let r: i32 = (*m).blend
     let cy: i32 = y / 4
     var sr: u32 = 0 as u32
@@ -428,19 +501,49 @@ fn ms_blend_color_w(m: *mut ModelSet, bio: u64, cls: usize, lx: i32, y: i32, z: 
             var cx2: i32 = (lx + dx + 4) / 4 - 1
             var cy2: i32 = cy
             var cz2: i32 = cz
-            if (*m).zoom != (0 as u32) {
-                let q: mc_biome_zoom.BzQuart = mc_biome_zoom.bz_pick((*m).zseed, wx + lx + dx, wy + y, wz + z + dz)
-                cx2 = q.x - (wx >> 2)
-                cy2 = q.y - (wy >> 2)
-                cz2 = q.z - (wz >> 2)
-                if cx2 < 0 - 1 { cx2 = 0 - 1 }
-                if cx2 > 4 { cx2 = 4 }
-                if cy2 < 0 - 1 { cy2 = 0 - 1 }
-                if cy2 > 4 { cy2 = 4 }
-                if cz2 < 0 - 1 { cz2 = 0 - 1 }
-                if cz2 > 4 { cz2 = 4 }
+            var bid: usize = 0
+            var wcx: i32 = 0
+            var wcz: i32 = 0
+            var have: bool = false
+            if (cache as u64) != (0 as u64) {
+                wcx = lx + dx + 4
+                wcz = z + dz + 4
+                if (*m).zoom != (0 as u32) {
+                    bid = rt.ld16((*cache).ids, ((y * BC_W + wcz) * BC_W + wcx) as usize) as usize
+                    have = bid != 65535
+                }
             }
-            let c: u32 = ms_biome_color_xz(m, cls, rt.ld16(bio, (((cy2 + 1) * 6 + cz2 + 1) * 6 + cx2 + 1) as usize) as usize, wx + lx + dx, wz + z + dz)
+            if !have {
+                var uni: i32 = 0 - 1
+                if (*m).zoom != (0 as u32) {
+                    // all 8 cells the zoom can pick from hold the same biome -> that is the biome, no pick needed
+                    uni = ms_zoom_cells_same(bio, ((wx + lx + dx - 2) >> 2) - (wx >> 2), ((wy + y - 2) >> 2) - (wy >> 2), ((wz + z + dz - 2) >> 2) - (wz >> 2))
+                }
+                if uni >= 0 {
+                    bid = uni as usize
+                } else {
+                    if (*m).zoom != (0 as u32) {
+                        var q: mc_biome_zoom.BzQuart = mc_biome_zoom.BzQuart { x: 0, y: 0, z: 0 }
+                        if (cache as u64) != (0 as u64) {
+                            q = mc_biome_zoom.bz_pick_c(&(*cache).bz, (*m).zseed, wx + lx + dx, wy + y, wz + z + dz)
+                        } else {
+                            q = mc_biome_zoom.bz_pick((*m).zseed, wx + lx + dx, wy + y, wz + z + dz)
+                        }
+                        cx2 = q.x - (wx >> 2)
+                        cy2 = q.y - (wy >> 2)
+                        cz2 = q.z - (wz >> 2)
+                        if cx2 < 0 - 1 { cx2 = 0 - 1 }
+                        if cx2 > 4 { cx2 = 4 }
+                        if cy2 < 0 - 1 { cy2 = 0 - 1 }
+                        if cy2 > 4 { cy2 = 4 }
+                        if cz2 < 0 - 1 { cz2 = 0 - 1 }
+                        if cz2 > 4 { cz2 = 4 }
+                    }
+                    bid = rt.ld16(bio, (((cy2 + 1) * 6 + cz2 + 1) * 6 + cx2 + 1) as usize) as usize
+                }
+                if (cache as u64) != (0 as u64) && (*m).zoom != (0 as u32) { rt.st16((*cache).ids, ((y * BC_W + wcz) * BC_W + wcx) as usize, bid as u16) }
+            }
+            let c: u32 = ms_biome_color_xzc(m, cls, bid, wx + lx + dx, wz + z + dz, cache, wcx, wcz)
             sr = sr + ((c >> (16 as u32)) & (255 as u32))
             sg = sg + ((c >> (8 as u32)) & (255 as u32))
             sb = sb + (c & (255 as u32))
@@ -959,6 +1062,8 @@ fn ms_mesh_split_bio(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.Mesh
     rt.buf_clear(out)
     rt.buf_clear(out_t)
     var nq: usize = 0
+    var bcache: BlendCache = BlendCache { bz: mc_biome_zoom.BzCache { cx0: 0, cy0: 0, cz0: 0, fv: 0, fd: 0 }, ids: 0, sw: 0 }
+    var bcache_on: bool = false
     var y: i32 = 0
     while y < 16 {
         var z: i32 = 0
@@ -1039,7 +1144,11 @@ fn ms_mesh_split_bio(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.Mesh
                             var rgb: u32 = (*m).tint[tcls as usize]
                             if bio != 0 && tcls < 3 {
                                 if (bc[tcls as usize] & (16777216 as u32)) == (0 as u32) {
-                                    bc[tcls as usize] = ms_blend_color_w(m, bio, tcls as usize, x - 1, y, z, wx, wy, wz) | (16777216 as u32)
+                                    if !bcache_on {
+                                        bcache = bcache_new(wx, wy, wz)
+                                        bcache_on = true
+                                    }
+                                    bc[tcls as usize] = ms_blend_color_c(m, bio, tcls as usize, x - 1, y, z, wx, wy, wz, &bcache) | (16777216 as u32)
                                 }
                                 rgb = bc[tcls as usize] & (16777215 as u32)
                             }
@@ -1071,5 +1180,6 @@ fn ms_mesh_split_bio(m: *mut ModelSet, pad: u64, lpad: u64, t: *mut mc_mesh.Mesh
         }
         y = y + 1
     }
+    if bcache_on { bcache_free(&bcache) }
     return nq
 }
