@@ -858,6 +858,13 @@ build syspref
 hp_rc=0
 HP=$(FIRNC="$FIRNC" sh tools/fui/hostpref.sh 2>&1) || hp_rc=$?
 [ "$hp_rc" -eq 0 ] || [ "$hp_rc" -eq 77 ] || { echo "$HP"; exit 1; }
+# W44-c hostmetrics: the host's safe area (insets) + text scale: pure functions, headless toolkit checks, then a real X11 window (FUI_INSETS,
+# FUI_TEXT_SCALE, a real _NET_WORKAREA) on an own Xvfb
+build hostmetrics
+"$W/hostmetrics" | tail -n 3 | grep -q "HOSTMETRICS PASSED"
+hm_rc=0
+HM=$(FIRNC="$FIRNC" sh tools/fui/hostmetrics.sh 2>&1) || hm_rc=$?
+[ "$hm_rc" -eq 0 ] || [ "$hm_rc" -eq 77 ] || { echo "$HM"; exit 1; }
 # W26-d: gap list P1 rows #5 (size classes), #21 (combobox filter), #67 (timeline), #64 (localised standard texts)
 build sizeclass
 "$W/sizeclass" | tail -n 3
@@ -875,6 +882,9 @@ build wave8
 # W42-c: wave 12 models + pixels (calendar day / range, navigation view, tree view), light + dark + RTL
 build wave12
 "$W/wave12" | tail -n 3 | grep -q "WAVE12 PASSED"
+# W44-b: wave 13 (flyout, teaching tip): placement/flip, keys, hit = geometry, pixels, light + dark + RTL
+build wave13
+"$W/wave13" | tail -n 3 | grep -q "WAVE13 PASSED"
 python3 tools/fui/uistr_audit.py
 build touch
 "$W/touch" | tail -n 3
