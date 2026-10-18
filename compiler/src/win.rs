@@ -269,6 +269,10 @@ const KNOWN: &[(&str, &str, u32)] = &[
     // symbols -- this list IS the import table.
     ("SystemParametersInfoW", "USER32.dll", 4),
     ("GetWindowRect", "USER32.dll", 2),
+    // W45-d: the monitor a window is on (MONITOR_DEFAULTTONEAREST) and its rcMonitor / rcWork, so the safe-area insets use the
+    // taskbar of THAT monitor and not SPI_GETWORKAREA of the primary one (lib/window/win32.fi r_monitor_work).
+    ("MonitorFromWindow", "USER32.dll", 2),
+    ("GetMonitorInfoW", "USER32.dll", 2),
     ("ReleaseCapture", "USER32.dll", 0),
     // --- gdi32: the DIB section and the one blit ----------------------
     ("CreateDIBSection", "GDI32.dll", 6),
