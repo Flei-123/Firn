@@ -157,14 +157,14 @@ $ADB logcat -c
 sleep 15
 $ADB shell am start -n $ACT >/dev/null
 for _ in $(seq 40); do [ -n "$($ADB shell pidof $PKG)" ] && break; sleep 1; done
-check "login screen shows" "$(OCR_TRIES=40 wait_ocr 01_login 'Sign in')" 1
+check "login screen shows" "$(OCR_TRIES=40 wait_ocr 01_login 'Anmelden')" 1
 
 # ---- 1. login + chat ---------------------------------------------------------------------------------------------------------
 echo "== 1. login, message, streamed reply"
-type_into "Username" justin; type_into "Password" pw
-tap_word "Sign" 1 1
-check "the notification notice page shows after the first sign-in" "$(OCR_TRIES=20 wait_ocr 01b_notice 'Continue')" 1
-tap_word "Continue" 1 3
+type_into "Benutzername" justin; type_into "Passwort" pw
+tap_word "Anmelden" 1 1
+check "the notification notice page shows after the first sign-in" "$(OCR_TRIES=20 wait_ocr 01b_notice 'Weiter')" 1
+tap_word "Weiter" 1 3
 check "chat screen after login" "$(OCR_TRIES=30 wait_ocr 02_chat 'Chats')" 1
 check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 1
 send_text hello
@@ -202,7 +202,7 @@ check "list shows a chat" "$(OCR_TRIES=10 wait_ocr 07_convs 'hello\|worker\|hi')
 
 # ---- 4. photo upload ---------------------------------------------------------------------------------------------------------
 echo "== 4. photo upload"
-tap_word "New" 1 2
+tap_word "Neu" 1 2
 tap_plus
 tap_word "Photo" 1 4 # "+" shows the two choices (Photo / File)
 U=$(ui)
@@ -213,7 +213,7 @@ tap_ui "Media picker" || true
 for _ in 1 2 3 4 5 6; do tap_ui "Photo taken" && break; sleep 3; done || note "no photo in the picker"
 sleep 10
 check "the app survives the picker (same process)" "$($ADB shell pidof $PKG)" "$P0"
-check "the photo waits in the input line" "$(OCR_TRIES=15 wait_ocr 08_photo 'photo ')" 1
+check "the photo waits in the input line" "$(OCR_TRIES=15 wait_ocr 08_photo 'Foto ')" 1
 send_text "see"
 check "upload reached the server (POST /api/m/upload)" "$(wait_log '"path": "/api/m/upload' 20 | awk '{print ($1>0)?"yes":"no"}')" yes
 check "the text carries the server path of the photo" "$(wait_log '"text": ".*/srv/uploads/' 15 | awk '{print ($1>0)?"yes":"no"}')" yes
@@ -244,7 +244,7 @@ fi
 check "the document picker lists the file" "$FOUND" yes
 sleep 8
 check "the app survives the file picker (same process)" "$($ADB shell pidof $PKG)" "$P0"
-check "the file waits in the input line (name + size)" "$(OCR_TRIES=15 wait_ocr 08b_file 'file jarvis_e2e_doc')" 1
+check "the file waits in the input line (name + size)" "$(OCR_TRIES=15 wait_ocr 08b_file 'Datei jarvis_e2e_doc')" 1
 send_text "doc"
 check "file upload reached the server (a new upload_body line)" "$(for _ in $(seq 25); do [ "$(grep -c '"type": "upload_body"' "$SLOG")" -gt "$UP0" ] && echo yes && break; sleep 1; done)" yes
 check "the server got exactly the octets of the file (sha256)" "$(grep '"type": "upload_body"' "$SLOG" | tail -1 | grep -c "\"sha256\": \"$SHA_DOC\"")" 1
@@ -267,7 +267,7 @@ if sys.argv[3] != '-': ev['cid'] = sys.argv[3]  # '-' = an event without a chat 
 r = urllib.request.Request('http://127.0.0.1:$PORT/fake/push', json.dumps(ev).encode(), {'Content-Type': 'application/json'})
 print(urllib.request.urlopen(r).read().decode())" "$1" "$2" "${3:-c1}" >/dev/null; }
 sleep 8 # the first poll only learns the last event id
-tap_word "New" 1 2 # an empty chat: the history of the event's chat must show up after the tap
+tap_word "Neu" 1 2 # an empty chat: the history of the event's chat must show up after the tap
 $ADB shell input keyevent KEYCODE_HOME; sleep 3
 check "the app is in the background" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 0
 push "Worker done" "Merge finished äö"
@@ -385,8 +385,8 @@ if n:
 
 # ---- 8. voice output without an engine -------------------------------------------------------------------------------------
 echo "== 8. voice output"
-tap_word "Voice" 1 2; shot 10_voice
-check "Voice switch shows 'Voice on'" "$(ocr_crop 10_voice 330 320 660 440 | grep -ci 'oice on')" 1
+tap_word "Sprache" 1 2; shot 10_voice
+check "Voice switch shows 'Sprache an'" "$(ocr_crop 10_voice 330 320 660 440 | grep -ci 'prache an')" 1
 send_text "voicetest"
 check "the app lives after a spoken answer" "$(OCR_TRIES=12 wait_ocr 11_say 'Hallo voicetest')" 1
 check "app alive after voice output" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
@@ -401,7 +401,7 @@ check "tts: the engine was asked (log 'engine requested')" "$($ADB logcat -d | g
 check "tts: the engine took the text (log 'engine ready, speaking')" "$($ADB logcat -d | grep -c 'firn-tts: engine ready, speaking')" 1
 check "tts: the speech ended (log 'finished speaking')" "$($ADB logcat -d | grep -c 'firn-tts: finished speaking')" 1
 check "tts: no timeout ('no engine answered in time')" "$($ADB logcat -d | grep -c 'firn-tts: no engine answered')" 0
-check "tts: the status line did not complain" "$(ocr 11_say | grep -c 'voice output not possible')" 0
+check "tts: the status line did not complain" "$(ocr 11_say | grep -c 'Sprachausgabe nicht möglich')" 0
 
 check "no crash in logcat" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|SIGSYS|ANR in '$PKG)" 0
 $ADB shell am force-stop $PKG
