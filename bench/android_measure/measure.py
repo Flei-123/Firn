@@ -32,7 +32,7 @@ LOCK_MAX_AGE_S = 600
 VSYNC_120_MS = 8.333
 OVER_VSYNC_MS = VSYNC_120_MS + 0.2
 OVER_20_MS = 20.0
-WHO = "fui-beat-kotlin-messharness"
+WHO = os.environ.get("MEASURE_WHO", "fui-beat-kotlin-messharness")
 
 ADB = os.environ.get("ADB") or os.path.join(os.path.expanduser("~"), "adbtools", "platform-tools", "adb.exe")
 SERIAL = DEFAULT_SERIAL
@@ -232,9 +232,13 @@ def gfx_framestats(pkg):
 
 
 # ---------- phase: scroll ----------
-def scroll_one(app, scroll_s, warm_s=3):
+SCROLL_EXTRA = "--es tab list --es theme dark --ei autoscroll 1"
+ANIM_EXTRA = "--es tab lab --es lab anim --es theme dark"
+
+
+def scroll_one(app, scroll_s, warm_s=3, extra=SCROLL_EXTRA):
     a = APPS[app]
-    start(app, "--es tab list --es theme dark --ei autoscroll 1")
+    start(app, extra)
     time.sleep(warm_s)
     layers = find_layers(a["pkg"])
     layer = None
@@ -264,6 +268,10 @@ def scroll_one(app, scroll_s, warm_s=3):
     res["layer"] = layer
     res["polls"] = polls
     res["breaks"] = len(breaks)
+    # the Firn app logs its own paint time every 5 s (BENCH fps ... paint_avg_us=...): keep the last line
+    fl = bench_lines("fps ")
+    if fl:
+        res["bench_fps_line"] = fl[-1][:300]
     if app == "kotlin":
         res["gfxinfo"] = gfxinfo_summary(a["pkg"])
         fs = sorted(gfx_framestats(a["pkg"]))
@@ -274,11 +282,11 @@ def scroll_one(app, scroll_s, warm_s=3):
     return res
 
 
-def phase_scroll(app, runs, scroll_s):
+def phase_scroll(app, runs, scroll_s, extra=SCROLL_EXTRA):
     runs_out = []
     for i in range(runs):
         lock_touch()
-        r = scroll_one(app, scroll_s)
+        r = scroll_one(app, scroll_s, extra=extra)
         print("scroll %s run %d: %s" % (app, i + 1, json.dumps(r)), flush=True)
         runs_out.append(r)
     ok = [r for r in runs_out if "error" not in r]
@@ -510,7 +518,7 @@ def phase_energy(app, energy_s, outdir):
 def main():
     global SERIAL
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--phase", default="all", choices=["scroll", "startup", "cpunet", "energy", "all"])
+    ap.add_argument("--phase", default="all", choices=["scroll", "anim", "startup", "cpunet", "energy", "all"])
     ap.add_argument("--app", default="both", choices=["kotlin", "firn", "both"])
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--scroll-s", type=int, default=10)
@@ -541,6 +549,8 @@ def main():
             for x in (target if isinstance(target, list) else [target]):
                 if ph == "scroll":
                     result["apps"][x] = phase_scroll(x, a.runs, a.scroll_s)
+                elif ph == "anim":
+                    result["apps"][x] = phase_scroll(x, a.runs, a.scroll_s, ANIM_EXTRA)
                 elif ph == "startup":
                     result["apps"][x] = phase_startup(x, 5)
                 elif ph == "cpunet":
