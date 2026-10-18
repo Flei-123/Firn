@@ -50,6 +50,7 @@ if [ "$ABI" = arm64-v8a ]; then $ADB install --abi arm64-v8a -r "$APK" || $ADB i
 # scenario name | wait seconds | am start extras
 scenario() {
   local name=$1 wait=$2; shift 2
+  if [ -n "${ONLY:-}" ] && ! [[ $name =~ $ONLY ]]; then return; fi
   $ADB shell am force-stop $PKG; sleep 1
   $ADB logcat -c
   $ADB shell am start -W -n $PKG/.MainActivity "$@" | grep -E "TotalTime|WaitTime" | tr '\n' ' '; echo
@@ -65,7 +66,7 @@ scenario lab-anim-dark 13 --es tab lab --es lab anim --es theme dark
 scenario lab-anim-light 6 --es tab lab --es lab anim --es theme light
 scenario lab-text-dark 6 --es tab lab --es lab text --es theme dark
 scenario lab-net-dark 30 --es tab lab --es lab net --es theme dark --ez autorun true
-scenario lab-cpu-dark 150 --es tab lab --es lab cpu --es theme dark --ez autorun true
+scenario lab-cpu-dark ${CPU_WAIT:-150} --es tab lab --es lab cpu --es theme dark --ez autorun true
 scenario settings-dark 6 --es tab settings --es theme dark
 scenario settings-light 6 --es tab settings --es theme light
 

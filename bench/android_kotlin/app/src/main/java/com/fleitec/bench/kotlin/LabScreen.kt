@@ -67,12 +67,13 @@ fun LabScreen(launch: LaunchConfig, onAutorunConsumed: () -> Unit, modifier: Mod
                 ) { Text(s.label) }
             }
         }
-        // Autorun starts the task of the selected section exactly once.
+        // Autorun starts the task of the selected section exactly once. The task runs in the screen scope:
+        // onAutorunConsumed() changes the effect keys, which would cancel a task started inside the effect.
         LaunchedEffect(launch.autorun, section) {
             if (!launch.autorun) return@LaunchedEffect
             when (section) {
-                LabSection.Net -> { onAutorunConsumed(); net.run() }
-                LabSection.Cpu -> { onAutorunConsumed(); cpu.run() }
+                LabSection.Net -> { onAutorunConsumed(); scope.launch { net.run() } }
+                LabSection.Cpu -> { onAutorunConsumed(); scope.launch { cpu.run() } }
                 else -> Unit
             }
         }
