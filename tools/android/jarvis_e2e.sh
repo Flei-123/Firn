@@ -97,9 +97,11 @@ from PIL import Image
 im=Image.open(sys.argv[1]).convert('L').crop(tuple(map(int,sys.argv[2:6])))
 im.resize((im.width*3,im.height*3)).save(sys.argv[6])" "$OUT/$1.png" "$2" "$3" "$4" "$5" "$OUT/$1_crop.png" && tesseract "$OUT/$1_crop.png" stdout --psm 7 2>/dev/null | tr -s '\n ' ' '; }
 kbd() { $ADB shell dumpsys input_method | grep -c 'mInputShown=true'; }
-hide_kbd() { $ADB shell input keyevent KEYCODE_BACK; sleep 1; }
+# BACK only while the keyboard is up: without it BACK leaves the app (a slow host shows the keyboard seconds late)
+wait_kbd_up() { local i; for i in $(seq 12); do [ "$(kbd)" = 1 ] && return 0; sleep 1; done; return 1; }
+hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; fi; sleep 1; }
 # type into the field whose hint is $1, then leave the keyboard
-type_into() { tap_word "$1" 1 1.5 || return 1; $ADB shell input text "$2"; sleep 1; hide_kbd; }
+type_into() { tap_word "$1" 1 1.5 || return 1; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
 send_text() { type_into "Message" "$1" && tap_word "Send" 1 1; }
 notes() { $ADB shell dumpsys notification --noredact; }
 # title / text lines of the notifications of the app (not the service one)
