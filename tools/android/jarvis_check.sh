@@ -101,8 +101,8 @@ type_into() { tap_word "$1" 1 1.5 || return 1; wait_kbd >/dev/null; $ADB shell i
 # the sign-in page: user, password, "Sign in", then the notice page ("Continue") that follows the first sign-in
 login() { type_into "Username" justin; type_into "Password" pw; tap_word "Sign" 1 1
     if [ "$(OCR_TRIES=20 wait_ocr _notice 'Continue')" = 1 ]; then tap_word "Continue" 1 3; fi; }
-# chat page (1080x2340): message field (418,1898), mic (714,1898), send (906,1898), "Voice" button (730,411)
-FIELD_X=418; FIELD_Y=1898; SEND_X=906; MIC_X=714; VOICE_X=730; VOICE_Y=411
+# chat page (1080x2340, web-like composer with icon buttons): message field (418,1911), mic (790,1911), send (960,1911), "Voice" chip (450,380)
+FIELD_X=418; FIELD_Y=1911; SEND_X=960; MIC_X=790; VOICE_X=450; VOICE_Y=380
 
 $ADB uninstall $PKG >/dev/null 2>&1
 $ADB install -r "$APK" >/dev/null 2>&1
