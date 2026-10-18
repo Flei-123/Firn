@@ -99,7 +99,7 @@ export {
     cert_mod_ptr, cert_mod_len, cert_exp_ptr, cert_exp_len, cert_ec_ptr,
     ecdsa_der_split,
     store_new, store_free, store_load_pem, store_add_der, store_count,
-    verify_signature_by, verify_chain,
+    verify_signature_by, verify_chain, verify_chain_step, chain_state_new, ChainState, V_MORE,
     base64_decode,
     V_OK, V_PARSE, V_EXPIRED, V_NOT_YET, V_NAME, V_UNKNOWN_ISSUER,
     V_BAD_SIGNATURE, V_NOT_CA, V_UNSUPPORTED, V_TOO_LONG, V_CRITICAL,
@@ -1482,41 +1482,64 @@ struct VerifyResult {
     anchor: usize, // which root in the store ended it, when it did
 }
 
+// The chain check cut into steps (A32 / r117): one signature check is the heavy part (RSA/ECDSA verify, ~0.5 s on a
+// translated arm64 core), the store lookup and the root parse come before it. A non-blocking handshake must not run them in
+// one piece, so `verify_chain_step` does ONE of them per call and answers V_MORE until it is done; the caller gives the event
+// loop a round in between. `verify_chain` below just loops the steps (blocking callers).
+const V_MORE: u32 = 99
+
+struct ChainState {
+    started: bool,
+    phase: u32, // 0 = look for the issuer of `cur`, 1 = check the signature of `cur` by it
+    kind: u32, // phase 1: 1 = the issuer is root number `idx` of the store, 2 = it is the sent certificate number `idx`
+    idx: usize,
+    cur: usize,
+    depth: usize,
+    used: [bool; 10],
+}
+
+fn chain_state_new() -> ChainState {
+    return ChainState { started: false, phase: 0 as u32, kind: 0 as u32, idx: 0, cur: 0, depth: 0,
+        used: [false; 10] }
+}
+
 // `certs` is the list the peer sent, `n` of them, the leaf first. `host`
-// is the name that was asked for. Returns V_OK or the FIRST reason it
+// is the name that was asked for. Returns V_OK, V_MORE (call again with the same state) or the FIRST reason it
 // refused -- see the head of the file for why the reason matters.
-fn verify_chain(store: *mut Store, certs: *mut [Cert; 10], n: usize,
-    host: u64, hn: usize, now: u64, out: *mut VerifyResult) -> u32 {
-    (*out).reason = V_PARSE
-    (*out).depth = 0
-    (*out).anchor = 0
-    if n == 0 || n > MAX_CHAIN {
-        return V_PARSE
+fn verify_chain_step(store: *mut Store, certs: *mut [Cert; 10], n: usize,
+    host: u64, hn: usize, now: u64, st: *mut ChainState, out: *mut VerifyResult) -> u32 {
+    if !(*st).started {
+        (*out).reason = V_PARSE
+        (*out).depth = 0
+        (*out).anchor = 0
+        if n == 0 || n > MAX_CHAIN {
+            return V_PARSE
+        }
+        var leaf: *mut Cert = &(*certs)[0]
+        if !(*leaf).ok {
+            return V_PARSE
+        }
+        if !cert_name_matches(leaf, host, hn) {
+            (*out).reason = V_NAME
+            return V_NAME
+        }
+        (*st).started = true
+        (*st).used[0] = true
     }
-    var leaf: *mut Cert = &(*certs)[0]
-    if !(*leaf).ok {
-        return V_PARSE
+    if (*st).depth >= MAX_CHAIN {
+        (*out).reason = V_TOO_LONG
+        return V_TOO_LONG
     }
-    if !cert_name_matches(leaf, host, hn) {
-        (*out).reason = V_NAME
-        return V_NAME
-    }
-    var cur: usize = 0
-    var depth: usize = 0
-    var used: [bool; 10] = [false; 10]
-    used[0] = true
-    while depth < MAX_CHAIN {
-        var child: *mut Cert = &(*certs)[cur]
+    var child: *mut Cert = &(*certs)[(*st).cur]
+    if (*st).phase == 0 as u32 {
         let t: u32 = cert_time_ok(child, now)
         if t != V_OK {
             (*out).reason = t
             return t
         }
         // is the issuer a root we already trust?
-        var ri: usize = 0
-        var found_root: bool = false
-        var root: Cert = cert_new()
         store_index(store)
+        var ri: usize = 0
         while ri < (*store).n {
             // the cheap test first (the subject Name from the index); only a root with the right
             // name is parsed in full
@@ -1525,38 +1548,19 @@ fn verify_chain(store: *mut Store, certs: *mut [Cert; 10], n: usize,
                 (*child).base, (*child).issuer_off, (*child).issuer_len) {
                 var cand: Cert = cert_new()
                 if cert_parse(&cand, rb, (*store).len[ri]) {
-                    root = cand
-                    found_root = true
-                    break
+                    (*st).kind = 1 as u32
+                    (*st).idx = ri
+                    (*st).phase = 1 as u32
+                    return V_MORE
                 }
             }
             ri = ri + 1
-        }
-        if found_root {
-            if !root.is_ca && root.has_bc {
-                (*out).reason = V_NOT_CA
-                return V_NOT_CA
-            }
-            let v: u32 = verify_signature_by(child, &root)
-            if v != V_OK {
-                (*out).reason = v
-                return v
-            }
-            let rt2: u32 = cert_time_ok(&root, now)
-            if rt2 != V_OK {
-                (*out).reason = rt2
-                return rt2
-            }
-            (*out).reason = V_OK
-            (*out).depth = depth + 1
-            (*out).anchor = ri
-            return V_OK
         }
         // otherwise: is the issuer one of the certificates the peer sent?
         var k: usize = 0
         var next: usize = n
         while k < n {
-            if !used[k] && (*certs)[k].ok {
+            if !(*st).used[k] && (*certs)[k].ok {
                 if same_name((*certs)[k].base, (*certs)[k].subject_off,
                     (*certs)[k].subject_len, (*child).base,
                     (*child).issuer_off, (*child).issuer_len) {
@@ -1570,20 +1574,61 @@ fn verify_chain(store: *mut Store, certs: *mut [Cert; 10], n: usize,
             (*out).reason = V_UNKNOWN_ISSUER
             return V_UNKNOWN_ISSUER
         }
-        var parent: *mut Cert = &(*certs)[next]
-        if !(*parent).is_ca {
+        (*st).kind = 2 as u32
+        (*st).idx = next
+        (*st).phase = 1 as u32
+        return V_MORE
+    }
+    // phase 1: the signature (the heavy part)
+    (*st).phase = 0 as u32
+    if (*st).kind == 1 as u32 {
+        let ri2: usize = (*st).idx
+        var root: Cert = cert_new()
+        if !cert_parse(&root, (*store).blob.ptr + (*store).off[ri2] as u64, (*store).len[ri2]) {
+            (*out).reason = V_PARSE
+            return V_PARSE
+        }
+        if !root.is_ca && root.has_bc {
             (*out).reason = V_NOT_CA
             return V_NOT_CA
         }
-        let v2: u32 = verify_signature_by(child, parent)
-        if v2 != V_OK {
-            (*out).reason = v2
-            return v2
+        let v: u32 = verify_signature_by(child, &root)
+        if v != V_OK {
+            (*out).reason = v
+            return v
         }
-        used[next] = true
-        cur = next
-        depth = depth + 1
+        let rt2: u32 = cert_time_ok(&root, now)
+        if rt2 != V_OK {
+            (*out).reason = rt2
+            return rt2
+        }
+        (*out).reason = V_OK
+        (*out).depth = (*st).depth + 1
+        (*out).anchor = ri2
+        return V_OK
     }
-    (*out).reason = V_TOO_LONG
-    return V_TOO_LONG
+    var parent: *mut Cert = &(*certs)[(*st).idx]
+    if !(*parent).is_ca {
+        (*out).reason = V_NOT_CA
+        return V_NOT_CA
+    }
+    let v2: u32 = verify_signature_by(child, parent)
+    if v2 != V_OK {
+        (*out).reason = v2
+        return v2
+    }
+    (*st).used[(*st).idx] = true
+    (*st).cur = (*st).idx
+    (*st).depth = (*st).depth + 1
+    return V_MORE
+}
+
+fn verify_chain(store: *mut Store, certs: *mut [Cert; 10], n: usize,
+    host: u64, hn: usize, now: u64, out: *mut VerifyResult) -> u32 {
+    var st: ChainState = chain_state_new()
+    var r: u32 = V_MORE
+    while r == V_MORE {
+        r = verify_chain_step(store, certs, n, host, hn, now, &st, out)
+    }
+    return r
 }

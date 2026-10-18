@@ -133,11 +133,12 @@ struct FlexItem {
     max_main: i64, // <= 0 means "no upper bound"
     align: u32, // align-self, AL_AUTO = what the container says
     baseline: i64, // distance top edge -> baseline, for AL_BASELINE
+    mgn: i64, // margin on the main axis already inside `basis` (shrink is scaled by basis - mgn, as CSS)
 }
 
 fn flex_item(basis: i64, cross: i64) -> FlexItem {
     return FlexItem { basis: basis, cross: cross, grow: 0, shrink: 1000,
-        min_main: 0, max_main: 0, align: AL_AUTO, baseline: 0 }
+        min_main: 0, max_main: 0, align: AL_AUTO, baseline: 0, mgn: 0 }
 }
 
 fn item_set_flex(k: *mut FlexItem, grow: i64, shrink: i64, basis: i64) {
@@ -441,7 +442,7 @@ fn main_slot(s: *mut FlexBox, space: layout.Rect) -> i64 {
 // stays comfortable in i64: 64 children times 1000 per mille times a few
 // thousand pixels of basis are around 10^8.
 fn schrumpfgewicht(it: *mut FlexItem) -> i64 {
-    let g: i64 = (*it).shrink * (*it).basis
+    let g: i64 = (*it).shrink * ((*it).basis - (*it).mgn)
     if g < 0 {
         return 0
     }
@@ -450,51 +451,60 @@ fn schrumpfgewicht(it: *mut FlexItem) -> i64 {
 
 fn verteile(s: *mut FlexBox, k: *mut FlexItem, von: usize, n: usize,
     slot: i64, groessen: *mut i64, frozen: *mut i64) {
+    // css-flexbox-1 9.7, in the order of the spec (18.10.2026): grow or shrink
+    // is decided by the HYPOTHETICAL sizes (basis clamped to min/max); an item
+    // whose basis already lies on the wrong side of its limit is frozen at the
+    // limit at once; everybody else starts from the BASIS (not the clamped
+    // size), gets its share, and the items that clamp are frozen by the sign
+    // of the TOTAL violation (all min violations if it is positive, all max
+    // violations if it is negative) -- then the free space is distributed anew.
     var i: usize = 0
-    var base_sum: i64 = 0
+    var hyp_sum: i64 = 0
     while i < n {
         let it: *mut FlexItem = item_at(k, von + i)
         st(groessen, i, (*it).basis)
         st(frozen, i, 0)
-        base_sum = base_sum + (*it).basis
+        hyp_sum = hyp_sum + klemme(it, (*it).basis)
         i = i + 1
     }
     var gaps: i64 = 0
     if n > 1 {
         gaps = (*s).gap_main * ((n - 1) as i64)
     }
-    // Children whose basis already lies outside their limits
-    // freeze at once -- otherwise the first round distributes space to
-    // somebody who cannot accept it at all.
+    let avail: i64 = slot - gaps
+    let growing: bool = hyp_sum < avail
     i = 0
     while i < n {
         let it: *mut FlexItem = item_at(k, von + i)
-        let g: i64 = klemme(it, ld(groessen, i))
-        if g != ld(groessen, i) {
-            st(groessen, i, g)
+        let hyp: i64 = klemme(it, (*it).basis)
+        var fz: bool = false
+        if growing {
+            if (*it).grow <= 0 || (*it).basis > hyp {
+                fz = true
+            }
+        } else {
+            if (*it).shrink <= 0 || (*it).basis < hyp {
+                fz = true
+            }
+        }
+        if fz {
+            st(groessen, i, hyp)
             st(frozen, i, 1)
         }
         i = i + 1
     }
     var round: usize = 0
-    while round <= n {
+    while round <= n + 1 {
         var sum: i64 = 0
+        var weight: i64 = 0
+        var last: usize = n
         i = 0
         while i < n {
             sum = sum + ld(groessen, i)
-            i = i + 1
-        }
-        let rest: i64 = slot - gaps - sum
-        if rest == 0 {
-            return
-        }
-        // The weights of the still movable children.
-        var weight: i64 = 0
-        i = 0
-        while i < n {
             if ld(frozen, i) == 0 {
                 let it: *mut FlexItem = item_at(k, von + i)
-                if rest > 0 {
+                last = i
+                if growing {
                     weight = weight + (*it).grow
                 } else {
                     weight = weight + schrumpfgewicht(it)
@@ -502,48 +512,80 @@ fn verteile(s: *mut FlexBox, k: *mut FlexItem, von: usize, n: usize,
             }
             i = i + 1
         }
-        if weight <= 0 {
+        if last >= n {
             return
         }
-        // Distribute, and whoever clamps in doing so freezes.
-        var new_frozen: bool = false
+        let rest: i64 = avail - sum
+        // the shares and the remainder of the integer division
         var vergeben: i64 = 0
-        var last: usize = n
+        i = 0
+        while i < n {
+            if ld(frozen, i) == 0 && weight > 0 {
+                let it: *mut FlexItem = item_at(k, von + i)
+                if growing {
+                    vergeben = vergeben + rest * (*it).grow / weight
+                } else {
+                    vergeben = vergeben + rest * schrumpfgewicht(it) / weight
+                }
+            }
+            i = i + 1
+        }
+        var missing: i64 = 0
+        if weight > 0 {
+            missing = rest - vergeben
+        }
+        var viol: i64 = 0
         i = 0
         while i < n {
             if ld(frozen, i) == 0 {
                 let it: *mut FlexItem = item_at(k, von + i)
                 var anteil: i64 = 0
-                if rest > 0 {
-                    anteil = rest * (*it).grow / weight
-                } else {
-                    anteil = rest * schrumpfgewicht(it) / weight
+                if weight > 0 {
+                    if growing {
+                        anteil = rest * (*it).grow / weight
+                    } else {
+                        anteil = rest * schrumpfgewicht(it) / weight
+                    }
+                }
+                if i == last {
+                    anteil = anteil + missing
+                }
+                let roh: i64 = ld(groessen, i) + anteil
+                viol = viol + klemme(it, roh) - roh
+            }
+            i = i + 1
+        }
+        i = 0
+        while i < n {
+            if ld(frozen, i) == 0 {
+                let it: *mut FlexItem = item_at(k, von + i)
+                var anteil: i64 = 0
+                if weight > 0 {
+                    if growing {
+                        anteil = rest * (*it).grow / weight
+                    } else {
+                        anteil = rest * schrumpfgewicht(it) / weight
+                    }
+                }
+                if i == last {
+                    anteil = anteil + missing
                 }
                 let roh: i64 = ld(groessen, i) + anteil
                 let ge: i64 = klemme(it, roh)
-                st(groessen, i, ge)
-                vergeben = vergeben + anteil
-                last = i
-                if ge != roh {
+                if viol == 0 {
+                    st(groessen, i, ge)
                     st(frozen, i, 1)
-                    new_frozen = true
+                } else if viol > 0 && ge > roh {
+                    st(groessen, i, ge)
+                    st(frozen, i, 1)
+                } else if viol < 0 && ge < roh {
+                    st(groessen, i, ge)
+                    st(frozen, i, 1)
                 }
             }
             i = i + 1
         }
-        // THE REMAINDER OF THE INTEGER DIVISION. It goes to the last movable
-        // child, so that the sum of the parts fills the space EXACTLY -- exactly
-        // the rule that box_layout already has.
-        if !new_frozen && last < n {
-            let missing: i64 = rest - vergeben
-            if missing != 0 {
-                let it: *mut FlexItem = item_at(k, von + last)
-                let ge: i64 = klemme(it, ld(groessen, last) + missing)
-                st(groessen, last, ge)
-            }
-            return
-        }
-        if !new_frozen {
+        if viol == 0 {
             return
         }
         round = round + 1

@@ -1,0 +1,91 @@
+// expect_exit: 0
+// SPDX-License-Identifier: MPL-2.0
+// tests/3903_x509_chain_steps.fi -- x509.verify_chain_step cuts the chain check into pieces (A32 / r117): one store
+// lookup or one signature check per call, V_MORE in between, so a non-blocking TLS handshake can give the loop a round.
+//
+// A  leaf <- intermediate (sent) <- root (store): exactly 4 steps (find issuer, verify, find root, verify), V_OK, depth 2
+// B  verify_chain (the blocking loop over the steps) gives the same result
+// C  a wrong host name stops in the first step with V_NAME, an empty store ends in V_UNKNOWN_ISSUER
+// D  the intermediate missing from the sent list: V_UNKNOWN_ISSUER after the first lookup
+import std.rt
+import tls.x509
+
+const ROOT_PEM: str = "-----BEGIN CERTIFICATE-----\nMIIBmDCCAT+gAwIBAgIUJUC7P0FmaaU7vK/ZWtMH4dfsvZ8wCgYIKoZIzj0EAwIw\nGjEYMBYGA1UEAwwPRmlybiBDaGFpbiBSb290MB4XDTI2MTAxODE1MzgzNVoXDTQ1\nMTIxNzE1MzgzNVowGjEYMBYGA1UEAwwPRmlybiBDaGFpbiBSb290MFkwEwYHKoZI\nzj0CAQYIKoZIzj0DAQcDQgAE+muwl8468EY7G0LakUF3G4JsrNtpIuPSZz94EESr\n7EVvizco9YzTat0VlIdSUibsFseG3o09l1Us49S7z4doI6NjMGEwHQYDVR0OBBYE\nFGIbFCKboceNM9buroFlB5Op4ZyIMB8GA1UdIwQYMBaAFGIbFCKboceNM9buroFl\nB5Op4ZyIMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgIEMAoGCCqGSM49\nBAMCA0cAMEQCIFaqvTiuFNGsx2FQLZyasngGlSXxl21u1E8uHvcix6bTAiAkejJz\ngngnWjkbkcrYT8HaSC3ToUG/3HMdSOwA0u/8JA==\n-----END CERTIFICATE-----\n"
+const INTER_PEM: str = "-----BEGIN CERTIFICATE-----\nMIIBmTCCAUCgAwIBAgIUbCxI28YQflFKIR2aJ1QknVOrh0YwCgYIKoZIzj0EAwIw\nGjEYMBYGA1UEAwwPRmlybiBDaGFpbiBSb290MB4XDTI2MTAxODE1MzgzNVoXDTQ1\nMTIxNzE1MzgzNVowGzEZMBcGA1UEAwwQRmlybiBDaGFpbiBJbnRlcjBZMBMGByqG\nSM49AgEGCCqGSM49AwEHA0IABBgz5td2sdRScpPeIPoFiOtwHTltMbwZMAKE0t+I\nLyvsq5KZnkD3TN0jfPpgZabF0ZPw4XbLJtLarwN+eZUbKsKjYzBhMA8GA1UdEwEB\n/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgIEMB0GA1UdDgQWBBTQhmPwQjrTwZUZ85ok\noUyFP1F3NzAfBgNVHSMEGDAWgBRiGxQim6HHjTPW7q6BZQeTqeGciDAKBggqhkjO\nPQQDAgNHADBEAiA1Q/J9GE+DaLt+9WuTxCYyNFlMH9mdpx4i89S5nyKg6QIgZNxk\nWHEgP3aPRHdEhRZ24mc7uFrR0C3RwniFRJBBbiU=\n-----END CERTIFICATE-----\n"
+const LEAF_PEM: str = "-----BEGIN CERTIFICATE-----\nMIIBlDCCATqgAwIBAgIUAMx16alcc35JKW/H7LDaLaY8OPowCgYIKoZIzj0EAwIw\nGzEZMBcGA1UEAwwQRmlybiBDaGFpbiBJbnRlcjAeFw0yNjEwMTgxNTM4MzVaFw00\nNTEyMTcxNTM4MzVaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEG\nCCqGSM49AwEHA0IABEXAWBoWenuXH7DNBMLTDMEnF0rSc7ZI0+EoooAT+YUidg7I\nn88i8iBToFlTeRngL2LUVBoZcsF2r/lljT0al9+jYzBhMBQGA1UdEQQNMAuCCWxv\nY2FsaG9zdDAJBgNVHRMEAjAAMB0GA1UdDgQWBBSI9G+tBHL8nFUCUVzfIN79Qx3Y\nhDAfBgNVHSMEGDAWgBTQhmPwQjrTwZUZ85okoUyFP1F3NzAKBggqhkjOPQQDAgNI\nADBFAiEAnQC5UKoB1oYDr0EwruAGT4sKRw3QhPSrFmrhqCgsBA4CIE3OefX04TU0\n2kSvqwfRQbxytKb777BaOp2AtcukXWUJ\n-----END CERTIFICATE-----\n"
+
+static mut fails: u32 = 0
+
+fn check(ok: bool, code: u32) {
+    if !ok {
+        fails = fails + 1
+        let m: [u8; 5] = "FAIL "
+        syscall(1, 2, (&m[0]) as i64, 5, 0, 0, 0)
+        var d: [u8; 4] = [48, 48, 48, 10]
+        d[0] = (48 + (code / 100) % 10) as u8
+        d[1] = (48 + (code / 10) % 10) as u8
+        d[2] = (48 + code % 10) as u8
+        syscall(1, 2, (&d[0]) as i64, 4, 0, 0, 0)
+    }
+}
+
+fn wall_seconds() -> u64 {
+    var ts: [i64; 2] = [0; 2]
+    syscall(228, 0, (&ts[0]) as i64, 0, 0, 0)
+    return ts[0] as u64
+}
+
+fn load_one(c: *mut x509.Cert, pem: str) -> bool {
+    var s: x509.Store = x509.store_new()
+    if x509.store_load_pem(&s, pem.p as u64, pem.n) != 1 {
+        return false
+    }
+    let ok: bool = x509.cert_parse(c, s.blob.ptr + s.off[0] as u64, s.len[0])
+    // the parsed certificate points into the blob of the store, which must stay: it is leaked on purpose (a test)
+    return ok
+}
+
+fn steps(st: *mut x509.Store, certs: *mut [x509.Cert; 10], n: usize, host: str, res: *mut x509.VerifyResult,
+    count: *mut usize) -> u32 {
+    var state: x509.ChainState = x509.chain_state_new()
+    var r: u32 = x509.V_MORE
+    var c: usize = 0
+    while r == x509.V_MORE && c < 20 {
+        r = x509.verify_chain_step(st, certs, n, host.p as u64, host.n, wall_seconds(), &state, res)
+        c = c + 1
+    }
+    *count = c
+    return r
+}
+
+fn main() -> i32 {
+    var certs: [x509.Cert; 10] = [x509.cert_new(); 10]
+    check(load_one(&certs[0], LEAF_PEM), 1)
+    check(load_one(&certs[1], INTER_PEM), 2)
+    var store: x509.Store = x509.store_new()
+    check(x509.store_load_pem(&store, ROOT_PEM.p as u64, ROOT_PEM.n) == 1, 3)
+    var res: x509.VerifyResult = x509.VerifyResult { reason: 0, depth: 0, anchor: 0 }
+    var count: usize = 0
+
+    // A
+    let r: u32 = steps(&store, &certs, 2, "localhost", &res, &count)
+    check(r == x509.V_OK, 10)
+    check(count == 4, 11)
+    check(res.depth == 2, 12)
+    // B
+    var res2: x509.VerifyResult = x509.VerifyResult { reason: 0, depth: 0, anchor: 0 }
+    check(x509.verify_chain(&store, &certs, 2, "localhost".p as u64, 9, wall_seconds(), &res2) == x509.V_OK, 20)
+    check(res2.depth == 2 && res2.anchor == res.anchor, 21)
+    // C
+    check(steps(&store, &certs, 2, "evil.example", &res, &count) == x509.V_NAME && count == 1, 30)
+    var empty: x509.Store = x509.store_new()
+    check(steps(&empty, &certs, 2, "localhost", &res, &count) == x509.V_UNKNOWN_ISSUER, 31)
+    check(count == 3, 32)
+    // D
+    check(steps(&store, &certs, 1, "localhost", &res, &count) == x509.V_UNKNOWN_ISSUER && count == 1, 40)
+
+    if fails != 0 {
+        return 1
+    }
+    return 0
+}
