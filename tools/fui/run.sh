@@ -786,6 +786,9 @@ build appgrid
 # appw12: wave 12 controls (calendar day / range, navigation view with hamburger, tree view) in the ten-line API: clicks, keys, a11y
 build appw12
 "$W/appw12" | tail -n 3 | grep -q "APPW12 PASSED"
+# appw13: flyout / teaching tip in the ten-line API (light dismiss, shield, keys, a11y nodes, pictures) + wave 12 additions (limits, nested nav, wheel)
+build appw13
+"$W/appw13" | tail -n 3 | grep -q "APPW13 PASSED"
 # appw8m: accordion (exclusive / free, click, Up/Down/Home/End, Enter, program side) in the ten-line API
 build appw8m
 "$W/appw8m" | tail -n 3 | grep -q "APPW8M PASSED"

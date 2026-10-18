@@ -95,6 +95,10 @@ done
 "$FIRNC" --opt-level=dev -o "$T/appw12" tools/fui/appw12_main.fi
 "$T/appw12" "$T/img" > /dev/null
 
+# WAVE 13 (appctl.flyout / teaching_tip): flyout below its anchor, tip flipped below, light, dark
+"$FIRNC" --opt-level=dev -o "$T/appw13" tools/fui/appw13_main.fi
+"$T/appw13" "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/
