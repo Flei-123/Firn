@@ -1922,7 +1922,7 @@ mod tests {
     }
 
     #[test]
-    fn an_element_store_of_the_same_vec_keeps_the_length_clean() {
+    fn an_item_store_of_the_same_vec_keeps_the_length_clean() {
         let mut f = elem_store_func(false);
         assert_eq!(remove_provable_arith_checks(&mut f), 2);
     }
