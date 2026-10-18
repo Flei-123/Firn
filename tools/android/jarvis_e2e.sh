@@ -109,8 +109,8 @@ kbd() { $ADB shell dumpsys input_method | grep -c 'mInputShown=true'; }
 wait_kbd_up() { local i; for i in $(seq 12); do [ "$(kbd)" = 1 ] && return 0; sleep 1; done; return 1; }
 hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; fi; sleep 1; }
 # type into the field whose hint is $1, then leave the keyboard
-# (the grey "Message" hint is sometimes lost by OCR after a long chat: then touch the field by its place, 418/1964 of 1080x2340)
-type_into() { tap_word "$1" 1 1.5 || { [ "$1" = Message ] && { $ADB shell input tap $((418 * SW / 1080)) $((1964 * SH / 2340)); sleep 1.5; } || return 1; }; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
+# (the grey "Message" hint is sometimes lost by OCR after a long chat: then touch the field by its place, 418/1898 of 1080x2340)
+type_into() { tap_word "$1" 1 1.5 || { [ "$1" = Message ] && { $ADB shell input tap $((418 * SW / 1080)) $((1898 * SH / 2340)); sleep 1.5; } || return 1; }; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
 send_text() { type_into "Message" "$1" && tap_word "Send" 1 1; }
 notes() { $ADB shell dumpsys notification --noredact; }
 # title / text lines of the notifications of the app (not the service one)

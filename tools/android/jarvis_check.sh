@@ -101,8 +101,8 @@ type_into() { tap_word "$1" 1 1.5 || return 1; wait_kbd >/dev/null; $ADB shell i
 # the sign-in page: user, password, "Sign in", then the notice page ("Continue") that follows the first sign-in
 login() { type_into "Username" justin; type_into "Password" pw; tap_word "Sign" 1 1
     if [ "$(OCR_TRIES=20 wait_ocr _notice 'Continue')" = 1 ]; then tap_word "Continue" 1 3; fi; }
-# chat page (1080x2340): message field (418,1964), mic (714,1964), send (906,1964), "Voice" button (730,411)
-FIELD_X=418; FIELD_Y=1964; SEND_X=906; MIC_X=714; VOICE_X=730; VOICE_Y=411
+# chat page (1080x2340): message field (418,1898), mic (714,1898), send (906,1898), "Voice" button (730,411)
+FIELD_X=418; FIELD_Y=1898; SEND_X=906; MIC_X=714; VOICE_X=730; VOICE_Y=411
 
 $ADB uninstall $PKG >/dev/null 2>&1
 $ADB install -r "$APK" >/dev/null 2>&1
@@ -130,8 +130,10 @@ check "chat screen after login" "$(OCR_TRIES=30 wait_ocr 2_chat 'Chats')" 1
 check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 1
 
 # ---- message + streamed reply
-tap $FIELD_X $FIELD_Y 1; wait_kbd >/dev/null; $ADB shell input text hello; sleep 1
-$ADB shell input keyevent KEYCODE_BACK; sleep 1
+# right after the login the connection is still being built ("offline - reconnecting"): a message sent before it is up is lost
+check "online after the login" "$(OCR_TRIES=30 wait_ocr 2b_online 'online')" 1
+tap $FIELD_X $FIELD_Y 1; check "Gboard shows for the message field" "$(wait_kbd)" 1; $ADB shell input text hello; sleep 1
+hide_kbd # BACK only while the keyboard is up, else it leaves the app
 tap $SEND_X $FIELD_Y 1
 check "message 'hello' reached the server" "$(wait_sent hello)" 1
 check "streamed reply visible" "$(wait_ocr 3_reply 'Hallo hello')" 1
