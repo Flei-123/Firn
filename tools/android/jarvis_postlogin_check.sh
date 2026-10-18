@@ -112,7 +112,7 @@ run_variant() { # abi:perm:density:font
     wait_update_check
     check "$tag: sign-in page" "$(OCR_TRIES=30 wait_ocr ${tag}_01 'Passwort')" 1
     type_into "Benutzername" justin; type_into "Passwort" pw; tap_word "Anmelden" 1 1
-    check "$tag: notice page or main view after the sign-in" "$(OCR_TRIES=20 wait_ocr ${tag}_02 'Weiter|Chats|Benachrichtigungen')" 1
+    check "$tag: notice page or main view after the sign-in" "$(OCR_TRIES=20 wait_ocr ${tag}_02 'Weiter|Chats|Benachrichtigungen')" 1 # english: ok
     tap_word "Weiter" 1 3 && echo "  (notice page: Weiter)"
     # the system permission dialog (perm=allow|deny): answer it like a person would
     if [ "$perm" != granted ]; then
@@ -146,8 +146,8 @@ run_variant() { # abi:perm:density:font
     check "$tag: REST dropped: app log has the failure line with the reason" "$(applog | grep -E 'net:? .*(connection closed|network error|timeout|server unreachable|no DNS)' | head -1 | wc -l)" 1
     curl -s -m 5 -X POST "http://127.0.0.1:$PORT/fake/net" -d '{"drop":0,"delay_ms":4000}' >/dev/null
     # the "Live" hint is hidden when the list is fresh: recovered = the task is there and no Offline / No-connection hint is left
-    local rec=0 q
-    for q in $(seq 30); do shot ${tag}_09; if ! ocr ${tag}_09 | grep -qE 'Offline|Keine Verbindung' && ocr ${tag}_09 | grep -q 'milk'; then rec=1; break; fi; sleep 1.5; done
+    local rec=0 q offpat='Offline|Keine Verbindung' # english: ok
+    for q in $(seq 30); do shot ${tag}_09; if ! ocr ${tag}_09 | grep -qE "$offpat" && ocr ${tag}_09 | grep -q 'milk'; then rec=1; break; fi; sleep 1.5; done
     check "$tag: network back (slow, 4 s): the list recovers alone" "$rec" 1
     check "$tag: no ANR/crash while the REST was bad" "$(alive)" yes
     curl -s -m 5 -X POST "http://127.0.0.1:$PORT/fake/net" -d '{"drop":0,"delay_ms":0}' >/dev/null
