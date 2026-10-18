@@ -771,6 +771,15 @@ FIRNC="$FIRNC" sh tools/fui/atspi.sh >"$W/atspi.log" 2>&1
 rc=$?
 tail -n 4 "$W/atspi.log"
 if [ "$rc" != 0 ] && [ "$rc" != 77 ]; then echo "atspi FAILED ($rc)"; exit 1; fi
+# W23-c: the UIA COM glue (Windows-only program), cross-built and run under Wine; skipped without Wine
+if [ -x /usr/lib/wine/wine64 ]; then
+    FIRNC="$FIRNC" sh tools/fui/uiacom.sh >"$W/uiacom.log" 2>&1
+    rc=$?
+    tail -n 2 "$W/uiacom.log"
+    if [ "$rc" != 0 ]; then echo "uiacom FAILED ($rc)"; exit 1; fi
+else
+    echo "  uiacom: wine missing, skipped"
+fi
 # W18c: the UIA model (same tree as the AT-SPI bridge) and the system appearance (dark/accent/high contrast)
 build uia
 "$W/uia" | tail -n 3
@@ -818,6 +827,10 @@ echo "== 19. JEDE PRUEFDATEI BAUT, UND JEDE KOMMT IM LAUF VOR =="
 for f in tools/fui/*_main.fi demos/*/main.fi examples/*/main.fi; do
     if grep -q '^import plat\.android' "$f"; then
         "$FIRNC" --opt-level=dev --target=x86_64-android --pic -c -o "$W/baupruefung.o" "$f" >/dev/null
+    elif grep -q '^import gpu\.wgl' "$f"; then
+        # A Windows-only program (lib/gpu/wgl.windows.fi has no Linux twin;
+        # tools/fui/uiacom.sh runs it under Wine): built for x86_64-windows.
+        "$FIRNC" --opt-level=dev --target=x86_64-windows -o "$W/baupruefung.exe" "$f" >/dev/null
     elif grep -q '^import web\.dom' "$f"; then
         # A browser-only program (lib/web/dom.fi imports its functions
         # from the page's JavaScript): it is built for wasm32-browser.
