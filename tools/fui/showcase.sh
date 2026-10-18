@@ -91,6 +91,10 @@ done
 "$FIRNC" --opt-level=dev -o "$T/appw11" tools/fui/appw11_main.fi
 "$T/appw11" "$T/img" > /dev/null
 
+# WAVE 12 (appctl.datepicker / navview / tree): calendar range, expanded navigation pane, open tree, light, dark
+"$FIRNC" --opt-level=dev -o "$T/appw12" tools/fui/appw12_main.fi
+"$T/appw12" "$T/img" > /dev/null
+
 if [ -n "$KEEP" ]; then
     mkdir -p "$KEEP"
     cp "$T"/img/*.png "$KEEP"/
