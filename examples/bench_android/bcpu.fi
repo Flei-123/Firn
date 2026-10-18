@@ -1,0 +1,352 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/bench_android/bcpu.fi -- the CPU benchmark of the bench app (definition: CPU_SPEC.md), runnable IN SLICES.
+//
+// WHY SLICES: Firn's Android loop and the UI are ONE thread (no threads in the program). So the benchmark runs as a state machine:
+// `cpu_step(budget_ns)` works for at most `budget_ns`, then returns and the window loop paints / handles touch, and the next timer
+// tick continues. Every phase checks the clock at its natural unit (one sieve prime, one quicksort partition, one 200k chunk, one
+// Mandelbrot row), so a slice overshoots by at most one unit (< ~6 ms worst case).
+//   wall ms  = task start -> task end (UI frames in between included)         -> BENCH cpu ...
+//   pure ms  = only the time spent inside cpu_step (no UI work in between)    -> BENCH cpu_pure ...
+// Sort: iterative quicksort (median of three, Hoare partition, insertion sort below 17 elements) with an explicit stack, so it can
+// stop after any partition. All maths exactly as CPU_SPEC.md (no FMA, order of evaluation as written).
+import std.rt
+import std.time
+
+export {
+    cpu_reset, cpu_start, cpu_step, cpu_running, cpu_finished, cpu_task, cpu_wall_ms, cpu_pure_ms, cpu_sum, cpu_progress,
+    LIMIT, SORT_N,
+}
+
+const LIMIT: usize = 5000000
+const SORT_N: usize = 1000000
+const MW: usize = 800
+const MH: usize = 600
+const MAXIT: i64 = 200
+const MODP: i64 = 1000000007
+
+const P_IDLE: i32 = 0
+const P_SIEVE: i32 = 1
+const P_COUNT: i32 = 2
+const P_GEN: i32 = 3
+const P_QSORT: i32 = 4
+const P_SUM: i32 = 5
+const P_MANDEL: i32 = 6
+const P_DONE: i32 = 7
+
+static mut G_PHASE: i32 = 0
+static mut G_NOW: u64 = 0
+static mut G_DEADLINE: u64 = 0
+static mut G_LAST: u64 = 0
+static mut G_T0: [u64; 3] = [0 as u64; 3]
+static mut G_WALL: [u64; 3] = [0 as u64; 3]
+static mut G_PURE: [u64; 3] = [0 as u64; 3]
+static mut G_SUM: [i64; 3] = [0; 3]
+// sieve state
+static mut G_SV: u64 = 0
+static mut G_PI: usize = 0
+static mut G_CI: usize = 0
+static mut G_CNT: i64 = 0
+static mut G_PSUM: i64 = 0
+// sort state
+static mut G_ARR: u64 = 0
+static mut G_GI: usize = 0
+static mut G_X: i64 = 0
+static mut G_SP: usize = 0
+static mut G_STL: [i64; 96] = [0; 96]
+static mut G_STH: [i64; 96] = [0; 96]
+static mut G_SI: usize = 0
+static mut G_ACC: i64 = 0
+// mandelbrot state
+static mut G_ROW: usize = 0
+static mut G_TOTAL: i64 = 0
+
+fn cpu_reset() {
+    if G_SV != 0 { rt.heap_free(G_SV, LIMIT) }
+    if G_ARR != 0 { rt.heap_free(G_ARR, SORT_N * 4) }
+    G_SV = 0
+    G_ARR = 0
+    G_PHASE = P_IDLE
+    var i: usize = 0
+    while i < 3 {
+        G_T0[i] = 0 as u64
+        G_WALL[i] = 0 as u64
+        G_PURE[i] = 0 as u64
+        G_SUM[i] = 0
+        i = i + 1
+    }
+}
+
+fn cpu_start() {
+    cpu_reset()
+    G_PHASE = P_SIEVE
+    G_T0[0] = time.monotonic_ns()
+    G_LAST = G_T0[0]
+    G_SV = rt.heap_alloc(LIMIT)
+    rt.mem_set(G_SV, 1 as u8, LIMIT)
+    *(G_SV as *mut u8) = 0 as u8
+    *((G_SV + 1 as u64) as *mut u8) = 0 as u8
+    G_PI = 2
+    G_CI = 0
+    G_CNT = 0
+    G_PSUM = 0
+}
+
+fn cpu_running() -> bool { return G_PHASE != P_IDLE && G_PHASE != P_DONE }
+fn cpu_finished() -> bool { return G_PHASE == P_DONE }
+// 0 = idle, 1 primes, 2 sort, 3 mandel, 4 done
+fn cpu_task() -> i32 {
+    if G_PHASE == P_IDLE { return 0 }
+    if G_PHASE <= P_COUNT { return 1 }
+    if G_PHASE <= P_SUM { return 2 }
+    if G_PHASE == P_MANDEL { return 3 }
+    return 4
+}
+fn cpu_wall_ms(t: usize) -> i64 { return (G_WALL[t] / 1000000 as u64) as i64 }
+fn cpu_pure_ms(t: usize) -> i64 { return (G_PURE[t] / 1000000 as u64) as i64 }
+fn cpu_sum(t: usize) -> i64 { return G_SUM[t] }
+// percent of the three tasks, rough (for the progress text)
+fn cpu_progress() -> i64 {
+    let t: i32 = cpu_task()
+    if t == 0 { return 0 }
+    if t == 4 { return 100 }
+    return ((t - 1) * 33) as i64
+}
+
+// accumulate the pure time since the last check onto `task`; true = the slice is used up
+fn tick(task: usize) -> bool {
+    G_NOW = time.monotonic_ns()
+    G_PURE[task] = G_PURE[task] + (G_NOW - G_LAST)
+    G_LAST = G_NOW
+    return G_NOW >= G_DEADLINE
+}
+
+fn finish(task: usize) {
+    G_NOW = time.monotonic_ns()
+    G_WALL[task] = G_NOW - G_T0[task]
+}
+
+fn begin(task: usize) {
+    G_T0[task] = time.monotonic_ns()
+}
+
+// ------------------------------------------------------------------ primes
+fn step_sieve() -> bool {
+    let sv: u64 = G_SV
+    while G_PI * G_PI < LIMIT {
+        if *((sv + G_PI as u64) as *mut u8) != 0 as u8 {
+            var m: usize = G_PI * G_PI
+            while m < LIMIT {
+                *((sv + m as u64) as *mut u8) = 0 as u8
+                m = m + G_PI
+            }
+        }
+        G_PI = G_PI + 1
+        if tick(0) { return true }
+    }
+    G_PHASE = P_COUNT
+    return false
+}
+
+fn step_count() -> bool {
+    let sv: u64 = G_SV
+    while G_CI < LIMIT {
+        var e: usize = G_CI + 100000
+        if e > LIMIT { e = LIMIT }
+        var i: usize = G_CI
+        while i < e {
+            if *((sv + i as u64) as *mut u8) != 0 as u8 {
+                G_CNT = G_CNT + 1
+                G_PSUM = G_PSUM + i as i64
+            }
+            i = i + 1
+        }
+        G_CI = e
+        if tick(0) && G_CI < LIMIT { return true }
+    }
+    G_SUM[0] = (G_CNT * 1000003 + G_PSUM) % MODP
+    rt.heap_free(G_SV, LIMIT)
+    G_SV = 0
+    tick(0)
+    finish(0)
+    begin(1)
+    G_PHASE = P_GEN
+    G_ARR = rt.heap_alloc(SORT_N * 4)
+    G_GI = 0
+    G_X = 12345
+    return false
+}
+
+// -------------------------------------------------------------------- sort
+fn step_gen() -> bool {
+    let ar: u64 = G_ARR
+    while G_GI < SORT_N {
+        var e: usize = G_GI + 100000
+        if e > SORT_N { e = SORT_N }
+        var i: usize = G_GI
+        var x: i64 = G_X
+        while i < e {
+            x = (x * 1103515245 + 12345) & 2147483647
+            *((ar + i as u64 * 4 as u64) as *mut u32) = x as u32
+            i = i + 1
+        }
+        G_X = x
+        G_GI = e
+        if tick(1) && G_GI < SORT_N { return true }
+    }
+    G_PHASE = P_QSORT
+    G_SP = 1
+    G_STL[0] = 0
+    G_STH[0] = SORT_N as i64 - 1
+    return false
+}
+
+fn aget(ar: u64, i: i64) -> u32 { return *((ar + i as u64 * 4 as u64) as *mut u32) }
+fn aset(ar: u64, i: i64, v: u32) { *((ar + i as u64 * 4 as u64) as *mut u32) = v }
+
+fn insertion(ar: u64, lo: i64, hi: i64) {
+    var i: i64 = lo + 1
+    while i <= hi {
+        let v: u32 = aget(ar, i)
+        var j: i64 = i - 1
+        while j >= lo && aget(ar, j) > v {
+            aset(ar, j + 1, aget(ar, j))
+            j = j - 1
+        }
+        aset(ar, j + 1, v)
+        i = i + 1
+    }
+}
+
+fn median3(a: u32, b: u32, c: u32) -> u32 {
+    if a < b {
+        if b < c { return b }
+        if a < c { return c }
+        return a
+    }
+    if a < c { return a }
+    if b < c { return c }
+    return b
+}
+
+fn step_qsort() -> bool {
+    let ar: u64 = G_ARR
+    while G_SP > 0 {
+        G_SP = G_SP - 1
+        let lo: i64 = G_STL[G_SP]
+        let hi: i64 = G_STH[G_SP]
+        if hi - lo < 16 {
+            insertion(ar, lo, hi)
+        } else {
+            let piv: u32 = median3(aget(ar, lo), aget(ar, lo + (hi - lo) / 2), aget(ar, hi))
+            var i: i64 = lo
+            var j: i64 = hi
+            while i <= j {
+                while aget(ar, i) < piv { i = i + 1 }
+                while aget(ar, j) > piv { j = j - 1 }
+                if i <= j {
+                    let t: u32 = aget(ar, i)
+                    aset(ar, i, aget(ar, j))
+                    aset(ar, j, t)
+                    i = i + 1
+                    j = j - 1
+                }
+            }
+            // push the larger part first: the stack stays O(log n)
+            if j - lo > hi - i {
+                if lo < j { G_STL[G_SP] = lo; G_STH[G_SP] = j; G_SP = G_SP + 1 }
+                if i < hi { G_STL[G_SP] = i; G_STH[G_SP] = hi; G_SP = G_SP + 1 }
+            } else {
+                if i < hi { G_STL[G_SP] = i; G_STH[G_SP] = hi; G_SP = G_SP + 1 }
+                if lo < j { G_STL[G_SP] = lo; G_STH[G_SP] = j; G_SP = G_SP + 1 }
+            }
+        }
+        if tick(1) && G_SP > 0 { return true }
+    }
+    G_PHASE = P_SUM
+    G_SI = 0
+    G_ACC = 0
+    return false
+}
+
+fn step_sum() -> bool {
+    let ar: u64 = G_ARR
+    while G_SI < SORT_N {
+        var e: usize = G_SI + 200000
+        if e > SORT_N { e = SORT_N }
+        var i: usize = G_SI
+        var acc: i64 = G_ACC
+        while i < e {
+            acc = acc + (aget(ar, i as i64) as i64) * ((i % 251) as i64 + 1)
+            i = i + 1
+        }
+        G_ACC = acc
+        G_SI = e
+        if tick(1) && G_SI < SORT_N { return true }
+    }
+    G_SUM[1] = G_ACC % MODP
+    rt.heap_free(G_ARR, SORT_N * 4)
+    G_ARR = 0
+    tick(1)
+    finish(1)
+    begin(2)
+    G_PHASE = P_MANDEL
+    G_ROW = 0
+    G_TOTAL = 0
+    return false
+}
+
+// ----------------------------------------------------------------- mandel
+fn step_mandel() -> bool {
+    let dx: f64 = 3.5 / 800.0
+    let dy: f64 = 2.0 / 600.0
+    while G_ROW < MH {
+        let ci: f64 = -1.0 + (G_ROW as f64) * dy
+        var px: usize = 0
+        var total: i64 = 0
+        while px < MW {
+            let cr: f64 = -2.5 + (px as f64) * dx
+            var zr: f64 = 0.0
+            var zi: f64 = 0.0
+            var it: i64 = 0
+            while it < MAXIT {
+                let zr2: f64 = zr * zr
+                let zi2: f64 = zi * zi
+                if zr2 + zi2 > 4.0 { break }
+                zi = (2.0 * zr) * zi + ci
+                zr = (zr2 - zi2) + cr
+                it = it + 1
+            }
+            total = total + it
+            px = px + 1
+        }
+        G_TOTAL = G_TOTAL + total
+        G_ROW = G_ROW + 1
+        if tick(2) && G_ROW < MH { return true }
+    }
+    G_SUM[2] = G_TOTAL
+    tick(2)
+    finish(2)
+    G_PHASE = P_DONE
+    return false
+}
+
+// Work for at most `budget_ns` (one unit may overshoot). true = more to do (call again after the UI had its turn).
+fn cpu_step(budget_ns: u64) -> bool {
+    if !cpu_running() { return false }
+    G_LAST = time.monotonic_ns()
+    G_DEADLINE = G_LAST + budget_ns
+    var more: bool = true
+    while more {
+        var stop: bool = false
+        if G_PHASE == P_SIEVE { stop = step_sieve() }
+        else if G_PHASE == P_COUNT { stop = step_count() }
+        else if G_PHASE == P_GEN { stop = step_gen() }
+        else if G_PHASE == P_QSORT { stop = step_qsort() }
+        else if G_PHASE == P_SUM { stop = step_sum() }
+        else if G_PHASE == P_MANDEL { stop = step_mandel() }
+        else { more = false }
+        if stop { return true }
+        if G_PHASE == P_DONE { more = false }
+    }
+    return false
+}
