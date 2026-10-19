@@ -64,6 +64,7 @@ WANTED = [
     "pin-off", "list-checks", "app-window", "power",
     # a camera app (examples/firncam)
     "zap", "zap-off", "timer", "timer-off", "grid-3x3", "switch-camera", "camera", "sliders-horizontal", "aperture", "video", "scan", "circle", "flashlight",
+    "volume-2", "volume-x",
 ]
 
 
