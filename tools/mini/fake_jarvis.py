@@ -118,12 +118,18 @@ def sidebar_chats():
             row("s8", "Diplomarbeit", 100 * h), row("s9", "Anzug-KI", 24 * 20 * h), row("s10", "Russisch", 24 * 90 * h),
             row("w1", "Daidalos: Render", 6 * h, True, "worker", True)]
 
+# folders (A48): FAKE_FOLDERS=1 starts with two folders and puts s1/s3/s5 in them; POST /api/m/folders/(add|rename|remove), /api/m/chats/move
+FOLDERS = [{"id": "f_work", "name": "Work", "order": 0}, {"id": "f_priv", "name": "Privat", "order": 1}] if os.environ.get("FAKE_FOLDERS") == "1" else []
+CHAT_FOLDER = {"s1": "f_work", "s3": "f_work", "s5": "f_priv"} if os.environ.get("FAKE_FOLDERS") == "1" else {}
+CHAT_FAV = {}  # POST /api/m/chats/move {fav}: id -> bool
+FOLDER_SEQ = [0]
+
 RENAMED = {}   # POST /api/m/chats/rename: id -> new title (FAKE_NO_CHAT_OPS=1: an older server, 404)
 REMOVED = set()  # POST /api/m/chats/remove
 
 def all_chats():
     rows = all_chats_raw()
-    return [dict(c, title=RENAMED.get(c["id"], c["title"])) for c in rows if c["id"] not in REMOVED]
+    return [dict(c, title=RENAMED.get(c["id"], c["title"]), folder=CHAT_FOLDER.get(c["id"], ""), fav=CHAT_FAV.get(c["id"], c.get("fav", False))) for c in rows if c["id"] not in REMOVED]
 
 def all_chats_raw():
     if os.environ.get("FAKE_SIDEBAR") == "1":
@@ -343,11 +349,11 @@ def rest(method, rawpath, hdr, body):
         if mp == "chats" and method == "GET":
             allc = all_chats()
             if not REAL:
-                return out(200, {"total": len(allc), "chats": allc})
+                return out(200, {"total": len(allc), "folders": FOLDERS, "chats": allc})
             lim = max(1, min(100, int(q.get("limit", ["30"])[0] or 30))); off = max(0, int(q.get("offset", ["0"])[0] or 0))
             qq = (q.get("q", [""])[0] or "").lower()
             if qq: allc = [c for c in allc if qq in str(c["title"] or "").lower()]
-            return out(200, {"total": len(allc), "chats": allc[off:off + lim]})
+            return out(200, {"total": len(allc), "folders": FOLDERS, "chats": allc[off:off + lim]})
         if mp.startswith("chats/") and method == "GET":
             cid = unquote(mp[len("chats/"):])
             row = next((c for c in all_chats() if c["id"] == cid), None)
@@ -365,6 +371,39 @@ def rest(method, rawpath, hdr, body):
                                       "running": False if not part else True, "partial": part, "beat": None},
                              "first": lo, "hasMore": lo > 0,
                              "messages": [dict(m, i=i, at=1760000000000 + i) for i, m in enumerate(msgs) if lo <= i < end]})
+        if mp == "folders" and method == "GET":
+            return out(200, {"folders": FOLDERS})
+        if mp in ("folders/add", "folders/rename", "folders/remove") and method == "POST":
+            if os.environ.get("FAKE_NO_CHAT_OPS"): return out(404, {"error": "Not found"})
+            j = j or {}
+            if mp == "folders/add":
+                nm = (j.get("name") or "").strip()[:40]
+                if not nm or len(FOLDERS) >= 40: return out(400, {"error": "Name missing or too many folders"})
+                FOLDER_SEQ[0] += 1
+                f = {"id": "f_new%d" % FOLDER_SEQ[0], "name": nm, "order": len(FOLDERS)}
+                FOLDERS.append(f)
+                return out(200, {"folder": f, "folders": FOLDERS})
+            f = next((x for x in FOLDERS if x["id"] == j.get("id")), None)
+            if not f: return out(404, {"error": "Folder not found"})
+            if mp == "folders/rename":
+                nm = (j.get("name") or "").strip()[:40]
+                if not nm: return out(404, {"error": "Name empty"})
+                f["name"] = nm
+                return out(200, {"folder": f, "folders": FOLDERS})
+            FOLDERS.remove(f)
+            for k in [k for k, v in CHAT_FOLDER.items() if v == f["id"]]: del CHAT_FOLDER[k]
+            return out(200, {"ok": True, "folders": FOLDERS})
+        if mp == "chats/move" and method == "POST":
+            if os.environ.get("FAKE_NO_CHAT_OPS"): return out(404, {"error": "Not found"})
+            j = j or {}
+            row = next((c for c in all_chats() if c["id"] == j.get("id")), None)
+            if not row: return out(404, {"error": "Not found"})
+            if not isinstance(j.get("folder"), str) and not isinstance(j.get("fav"), bool): return out(400, {"error": "folder or fav missing"})
+            if isinstance(j.get("folder"), str):
+                if j["folder"] and any(x["id"] == j["folder"] for x in FOLDERS): CHAT_FOLDER[row["id"]] = j["folder"]
+                else: CHAT_FOLDER.pop(row["id"], None)
+            if isinstance(j.get("fav"), bool): CHAT_FAV[row["id"]] = j["fav"]
+            return out(200, {"ok": True, "id": row["id"]})
         if mp in ("chats/rename", "chats/remove") and method == "POST":
             if os.environ.get("FAKE_NO_CHAT_OPS"): return out(404, {"error": "Not found"})
             row = next((c for c in all_chats() if c["id"] == (j or {}).get("id")), None)

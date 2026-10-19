@@ -91,7 +91,7 @@ export {
     ja_devices, ja_push_token, ja_stt, ja_set_mobile, ja_is_mobile, ja_ping, ja_push_register, ja_push_test, ja_push_poll, ja_crash_send,
     PushEvent, PushEvents, pushevents_new, pushevents_free, parse_push_events,
     PushReg, pushreg_new, pushreg_free, parse_push_register, ja_upload, ja_download,
-    ja_get, ja_post_json, ja_kind_name, ja_get_abs, ja_post_abs, ja_chat_rename, ja_chat_remove, parse_usage, parse_model_label,
+    ja_get, ja_post_json, ja_kind_name, ja_get_abs, ja_post_abs, ja_chat_rename, ja_chat_remove, ja_folder_op, ja_chat_move, FolderRow, parse_usage, parse_model_label,
     ja_body_ptr, ja_body_len, ja_body, ja_key, ja_age_s, ja_status,
     Me, ProjectRow, Projects, RoadItem, NeedItem, ChatRef, ProjectFull,
     WorkerRow, ActRow, Center, ConvRow, Convs, Msg, Conv, TaskRow, Tasks, DeviceRow, Devices,
@@ -800,6 +800,44 @@ fn ja_chat_remove(a: *mut Api, id: str) -> bool {
     return post_abs(a, AK_CHAT_OP, "/api/m/chats/remove", "/api/m/chats/remove", (*a).req.ptr, (*a).req.len)
 }
 
+// Folder ops (AK_CHAT_OP, key = the path): "add" {"name"}, "rename" {"id","name"}, "remove" {"id"} -> POST /api/m/folders/<op>.
+fn ja_folder_op(a: *mut Api, op: str, id: str, name: str) -> bool {
+    rt.buf_clear(&(*a).req)
+    var w: json.JsonWriter = json.jw_new(&(*a).req, false)
+    json.jw_begin_object(&w)
+    if id.n > 0 { jstr(&w, "id", id) }
+    if name.n > 0 { jstr(&w, "name", name) }
+    json.jw_end(&w)
+    json.jw_free(&w)
+    rt.buf_clear(&(*a).url)
+    rt.buf_push_bytes(&(*a).url, (*a).base.ptr, (*a).base.len)
+    put(&(*a).url, "/api/m/folders/")
+    put(&(*a).url, op)
+    var kb: rt.Buf = rt.buf_new()
+    put(&kb, "/api/m/folders/")
+    put(&kb, op)
+    let ok: bool = start(a, AK_CHAT_OP, true, false, 0, as_str(&kb), (*a).req.ptr, (*a).req.len, "application/json")
+    rt.buf_free(&kb)
+    return ok
+}
+
+// Move a chat into a folder ("" = out) and/or set the favorite flag (fav: -1 = leave, 0 = off, 1 = on); has_folder false = leave the folder.
+// POST /api/m/chats/move -> AK_CHAT_OP (key = the path).
+fn ja_chat_move(a: *mut Api, id: str, has_folder: bool, folder: str, fav: i64) -> bool {
+    rt.buf_clear(&(*a).req)
+    var w: json.JsonWriter = json.jw_new(&(*a).req, false)
+    json.jw_begin_object(&w)
+    jstr(&w, "id", id)
+    if has_folder { jstr(&w, "folder", folder) }
+    if fav >= 0 {
+        jkey(&w, "fav")
+        json.jw_bool(&w, fav > 0)
+    }
+    json.jw_end(&w)
+    json.jw_free(&w)
+    return post_abs(a, AK_CHAT_OP, "/api/m/chats/move", "/api/m/chats/move", (*a).req.ptr, (*a).req.len)
+}
+
 // A crash report (plain text, up to 64 KB) of the last start -> AK_CRASH, body {"ok":true,"id":"..."}.
 fn ja_crash_send(a: *mut Api, version: str, device: str, p: u64, n: usize) -> bool {
     rt.buf_clear(&(*a).url)
@@ -1447,21 +1485,29 @@ struct ConvRow {
     running: bool,    // /api/m/chats `running`
     dispatched: bool, // started by dispatch_work (Workers tab); older servers omit it
     parent: str,      // parent chat id of a sub-worker ("" = none)
+    folder: str,      // folder id ("" = no folder)
+}
+
+struct FolderRow {
+    id: str,
+    name: str,
 }
 
 struct Convs {
     d: json.Json,
     rows: Vec[ConvRow],
+    folders: Vec[FolderRow], // /api/m/chats `folders` (sorted by the server)
     total: i64,
     unchanged: bool,
 }
 
 fn convs_new() -> Convs {
-    return Convs { d: json.json_new(), rows: vec_new[ConvRow](), total: 0, unchanged: false }
+    return Convs { d: json.json_new(), rows: vec_new[ConvRow](), folders: vec_new[FolderRow](), total: 0, unchanged: false }
 }
 
 fn convs_free(c: *mut Convs) {
     vec_free[ConvRow](&(*c).rows)
+    vec_free[FolderRow](&(*c).folders)
     json.json_free(&(*c).d)
 }
 
@@ -1472,6 +1518,16 @@ fn parse_convs(p: u64, n: usize, out: *mut Convs) -> bool {
     let o: u32 = json.json_root(d)
     (*out).unchanged = gb(d, o, "unchanged")
     (*out).total = gi(d, o, "total")
+    let fa: u32 = gc (d, o, "folders", json.JSON_ARRAY)
+    if fa != json.JSON_NONE {
+        var fe: u32 = json.json_child(d, fa)
+        while fe != json.JSON_NONE {
+            if json.json_kind(d, fe) == json.JSON_OBJECT {
+                let fok: bool = vec_push[FolderRow](&(*out).folders, FolderRow { id: gs(d, fe, "id"), name: gs(d, fe, "name") })
+            }
+            fe = json.json_next(d, fe)
+        }
+    }
     var arr: u32 = gc (d, o, "conversations", json.JSON_ARRAY)
     if arr == json.JSON_NONE { arr = gc (d, o, "chats", json.JSON_ARRAY) } // /api/m/chats
     if arr == json.JSON_NONE { return (*out).unchanged }
@@ -1480,7 +1536,8 @@ fn parse_convs(p: u64, n: usize, out: *mut Convs) -> bool {
         if json.json_kind(d, e) == json.JSON_OBJECT {
             let ok: bool = vec_push[ConvRow](&(*out).rows, ConvRow { id: gs(d, e, "id"), title: gs(d, e, "title"),
                     kind: gs(d, e, "kind"), updated: gi(d, e, "updatedAt"), fav: gb(d, e, "fav"),
-                    running: gb(d, e, "running"), dispatched: gb(d, e, "dispatched"), parent: gs(d, e, "parent") })
+                    running: gb(d, e, "running"), dispatched: gb(d, e, "dispatched"), parent: gs(d, e, "parent"),
+                    folder: gs(d, e, "folder") })
         }
         e = json.json_next(d, e)
     }
