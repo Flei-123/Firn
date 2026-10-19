@@ -346,6 +346,7 @@ check "the service text is neutral (no 'Relay')" "$(notes | grep -A25 "pkg=$PKG"
 push "Second" "another line"
 for _ in $(seq 20); do note_lines | grep -q 'Second' && break; sleep 1; done
 check "a second event: a second notification" "$(note_lines | grep -c 'Second')" 1
+for _ in $(seq 10); do note_lines | grep -q 'Worker done' || break; sleep 1; done # the replaced notification vanishes a moment later
 check "same chat: the second event replaces the first (one keyed notification per chat)" "$(note_lines | grep -c 'Worker done')" 0
 # a second chat (c2): its own notification next to the one of c1, neither replaces the other
 push "Chat two" "from the second chat" c2
@@ -355,6 +356,7 @@ check "second chat: the notification of the first chat is still there" "$(note_l
 check "two chats: two notifications of the app (not counting the service one)" "$(note_lines | grep -c 'Second\|Chat two')" 2
 push "Chat two again" "more from c2" c2
 for _ in $(seq 20); do note_lines | grep -q 'Chat two again' && break; sleep 1; done
+for _ in $(seq 10); do note_lines | grep -q 'Chat two |' || break; sleep 1; done # the replaced notification vanishes a moment later
 check "second chat, second event: replaces its own, leaves the other" "$(note_lines | grep -c 'Chat two again')$(note_lines | grep -c 'Chat two |')$(note_lines | grep -c 'Second')" 101
 # tap a notification of the shade: the app comes to the front with the chat of that notification
 tap_note() { # title prefix
