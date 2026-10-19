@@ -188,6 +188,7 @@ async def process_request(conn, request):
         if not cookie_ok(request.headers):
             return reply(401, {"error": "Not logged in"})
         cid = unquote(u.path[len("/api/conversations/"):])
+        LOG.write(json.dumps({"type": "rest", "method": "GET", "path": u.path, "auth": True}) + "\n"); LOG.flush()
         if cid not in CONV:
             return reply(404, {"error": "Not found"})
         return reply(200, {"conversation": {"messages": CONV[cid]}, "running": False, "partial": ""})
