@@ -1030,6 +1030,7 @@ fn clobbers_memory(op: &Op) -> bool {
             | Op::AtomicCas { .. }
             | Op::ThreadSpawn { .. }
             | Op::SecureZero { .. }
+            | Op::MemCopy { .. }
     )
 }
 

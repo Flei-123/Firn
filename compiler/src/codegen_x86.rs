@@ -1863,6 +1863,12 @@ fn emit_inst(
             }
             store_dst(e, fr, d, "rax");
         }
+        Op::MemCopy { dst, src, n, esz } => {
+            load_full(e, fr, "rdi", *dst);
+            load_full(e, fr, "rsi", *src);
+            load_full(e, fr, "rcx", *n);
+            crate::memcpy_idiom::emit_rep(e, *esz);
+        }
         Op::CopyMem { dst, src, size } => {
             load_full(e, fr, "rdi", *dst);
             load_full(e, fr, "rsi", *src);

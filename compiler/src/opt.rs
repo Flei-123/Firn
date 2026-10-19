@@ -187,6 +187,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "a loop that writes only zeroes becomes one block instruction",
     },
     PassInfo {
+        name: "memcpy",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "a counting copy loop (u8/u32/u64 elements) becomes one forward block copy, x86-64 only (see docs/LOOP-IDIOMS.md)",
+    },
+    PassInfo {
         name: "unroll",
         scope: Scope::Func,
         debug_preserving: true,
@@ -750,9 +756,13 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             fx.note(5, h > 0);
             phi_check(f, "licm");
         }
-        if cfg.runs("memset") && fx.due(11) {
+        let memcpy_on = cfg.runs("memcpy") && crate::target::active() == crate::target::Target::X86_64;
+        if (cfg.runs("memset") || memcpy_on) && fx.due(11) {
             let t = std::time::Instant::now();
-            let m = crate::memset::recognise(f);
+            let mut m = if cfg.runs("memset") { crate::memset::recognise(f) } else { 0 };
+            if memcpy_on {
+                m += crate::memcpy_idiom::recognise(f);
+            }
             clk.add2("memset", t, m > 0);
             fx.note(11, m > 0);
             phi_check(f, "memset");

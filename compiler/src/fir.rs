@@ -293,6 +293,12 @@ pub enum Op {
     Barrier { val: Val },
     /// `secure_zero(inout buf)`: zeroes `size` bytes from `addr`. NEVER counts as dead.
     SecureZero { addr: Val, size: Val },
+    /// **Loop idiom** (`memcpy_idiom.rs`): forward element-wise copy of `n`
+    /// ELEMENTS of `esz` bytes (1, 4 or 8) from `src` to `dst`. Exactly the
+    /// semantics of the counting loop it replaces, including partial overlap
+    /// (it is `rep movsb/movsd/movsq`, which the CPU defines element by element,
+    /// forward). x86 only; no result value.
+    MemCopy { dst: Val, src: Val, n: Val, esz: u8 },
     /// **Round 47** — atomic read-add-write (`atomic.rs`): `[addr] += val` as
     /// ONE machine instruction (`lock xadd`), the result is the OLD value.
     /// Always 64 bits. Foundation of the counter of `Arc[T]` (SPEC §3.4).
@@ -471,6 +477,7 @@ impl Op {
             | Op::MmioStore { .. }
             | Op::AtomicCas { .. }
             | Op::ThreadSpawn { .. }
+            | Op::MemCopy { .. }
             | Op::SecureZero { .. } => false,
             // The self pointer changes nothing and only reads the thread
             // base; it must NOT be moved across an `arch_prctl`, though.
@@ -550,6 +557,11 @@ impl Op {
             Op::CopyMem { dst, src, .. } => {
                 rep(dst);
                 rep(src);
+            }
+            Op::MemCopy { dst, src, n, .. } => {
+                rep(dst);
+                rep(src);
+                rep(n);
             }
             Op::AtomicCas { addr, erw, new } => {
                 rep(addr);
@@ -632,6 +644,11 @@ impl Op {
             Op::CopyMem { dst, src, .. } => {
                 out.push(*dst);
                 out.push(*src);
+            }
+            Op::MemCopy { dst, src, n, .. } => {
+                out.push(*dst);
+                out.push(*src);
+                out.push(*n);
             }
             Op::Select { cond, a, b } => {
                 out.push(*cond);
@@ -1158,6 +1175,9 @@ pub(crate) fn fmt_inst(i: &Inst) -> String {
             format!("simd.{:?}.{} {} imm={}", kind, t, vlist(args), imm)
         }
         Op::SecureZero { addr, size } => format!("secure_zero %{}, %{}", addr, size),
+        Op::MemCopy { dst, src, n, esz } => {
+            format!("memcopy %{}, %{}, n=%{}, esz={}", dst, src, n, esz)
+        }
         Op::AtomicAdd { addr, val } => format!("atomadd.{} %{}, %{}", t, addr, val),
         Op::Asm { template, out, in_regs, ins, out_regs, outs, clobber } => {
             let mut o = format!("asm.{} \"{}\"", t, asm_escape(template));

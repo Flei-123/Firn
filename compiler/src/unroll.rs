@@ -472,6 +472,11 @@ fn map_all(op: &mut Op, m: &HashMap<Val, Val>) {
             r(addr);
             r(size);
         }
+        Op::MemCopy { dst, src, n, .. } => {
+            r(dst);
+            r(src);
+            r(n);
+        }
         Op::MmioLoad { addr } => r(addr),
         Op::MmioStore { addr, val } => {
             r(addr);

@@ -102,6 +102,7 @@ fn disturbs_memory(op: &Op) -> bool {
             | Op::Asm { .. }
             | Op::MmioStore { .. }
             | Op::ThreadSpawn { .. }
+            | Op::MemCopy { .. }
             | Op::SecureZero { .. }
     )
 }

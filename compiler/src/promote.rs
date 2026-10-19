@@ -164,6 +164,11 @@ pub(crate) fn for_each_use_mut(op: &mut Op, mut g: impl FnMut(&mut Val)) {
             g(addr);
             g(size);
         }
+        Op::MemCopy { dst, src, n, .. } => {
+            g(dst);
+            g(src);
+            g(n);
+        }
         Op::AtomicAdd { addr, val } => {
             g(addr);
             g(val);
@@ -935,7 +940,7 @@ impl<'a> Ctx<'a> {
             },
             Op::AtomicAdd { .. } | Op::AtomicCas { .. } => Eff::Wild { read: true, write: true },
             Op::MmioLoad { .. } | Op::MmioStore { .. } => Eff::Wild { read: true, write: true },
-            Op::SecureZero { .. } => Eff::Wild { read: true, write: true },
+            Op::SecureZero { .. } | Op::MemCopy { .. } => Eff::Wild { read: true, write: true },
             Op::GcAddr { regs: true } => Eff::Wild { read: true, write: true },
             Op::Call { name, .. } => {
                 if self.nounmap.contains(name) {

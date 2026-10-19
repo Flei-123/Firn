@@ -1841,6 +1841,8 @@ fn emit_inst(
             }
             store_dst(e, fr, d, A);
         }
+        // `memcpy_idiom.rs` only runs for x86-64; this can never be reached.
+        Op::MemCopy { .. } => return Err("internal error: memcopy on a non-x86 target".to_string()),
         Op::CopyMem { dst, src, size } => {
             if *size == 0 {
                 return Ok(());

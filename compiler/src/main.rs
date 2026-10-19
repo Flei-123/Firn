@@ -65,6 +65,7 @@ mod lower_match;
 mod modules;
 mod mono;
 mod mem2reg;
+mod memcpy_idiom;
 mod memset;
 mod sroa;
 mod unroll;

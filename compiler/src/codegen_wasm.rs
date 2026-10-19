@@ -2630,6 +2630,8 @@ impl<'a> Fx<'a> {
                 self.ins(Ins::I64Const(0));
                 self.put(i, VT::I64);
             }
+            // `memcpy_idiom.rs` only runs for x86-64; this can never be reached.
+            Op::MemCopy { .. } => unreachable!("memcopy on a non-x86 target"),
             Op::CopyMem { dst, src, size } => {
                 if *size > 0 {
                     self.addr(*dst);

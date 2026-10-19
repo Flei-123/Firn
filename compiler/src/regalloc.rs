@@ -395,7 +395,7 @@ fn inst_clobbers(i: &Inst) -> RegMask {
         // already decided after tests/1613_crypto.fi died of it.
         Op::Simd { .. } if is_cpuid(&i.op) => M_CALL,
         // `rep movsb` / `rep stosb`.
-        Op::CopyMem { .. } | Op::SecureZero { .. } => M_MEMOP,
+        Op::CopyMem { .. } | Op::SecureZero { .. } | Op::MemCopy { .. } => M_MEMOP,
         // `cqo`/`cdq` + `div`/`idiv`: the remainder register.
         Op::Bin(BinOp::Div | BinOp::Rem, _, _) => M_RDX,
         // `test dl, dl` + `cmovnz` — the condition is fetched into rdx BEFORE
@@ -472,6 +472,11 @@ fn op_pins(op: &Op, out: &mut Vec<Val>) {
         Op::SecureZero { addr, size } => {
             out.push(*addr);
             out.push(*size);
+        }
+        Op::MemCopy { dst, src, n, .. } => {
+            out.push(*dst);
+            out.push(*src);
+            out.push(*n);
         }
         Op::Select { cond, a, b } => {
             out.push(*cond);
@@ -1138,6 +1143,11 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
                 Op::SecureZero { addr, size } => {
                     kill(*addr, &mut bad);
                     kill(*size, &mut bad);
+                }
+                Op::MemCopy { dst, src, n, .. } => {
+                    kill(*dst, &mut bad);
+                    kill(*src, &mut bad);
+                    kill(*n, &mut bad);
                 }
                 _ => {}
             }
@@ -7635,6 +7645,12 @@ fn emit_inst(
             e.line(&format!("mov rcx, {}", size));
             e.line("cld");
             e.line("rep movsb");
+        }
+        Op::MemCopy { dst, src, n, esz } => {
+            ra.load_full(e, "rdi", *dst);
+            ra.load_full(e, "rsi", *src);
+            ra.load_full(e, "rcx", *n);
+            crate::memcpy_idiom::emit_rep(e, *esz);
         }
         // ROUND 52: unreachable — `unsupported_basic` sends every function
         // containing inline assembler or MMIO to the base path. As an error
