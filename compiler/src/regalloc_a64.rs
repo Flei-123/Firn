@@ -406,6 +406,7 @@ fn linear_scan(
         true
     };
 
+    let density = std::env::var_os("FIRN_A64_SPILL_OLD").is_none();
     for k in 0..ivs.len() {
         // expire
         active.retain(|&(e, r, _)| {
@@ -429,7 +430,26 @@ fn linear_scan(
         // full: the interval that ends LAST (and whose register the newcomer may use) is the candidate for the
         // stack -- but only if the newcomer is worth more (uses, weighted by loop depth). Otherwise the newcomer
         // goes to the stack.
-        if let Some(ai) = active.iter().rposition(|&(_, lr, _)| fits(k, lr)) {
+        if density {
+            // r847: evict the fitting active interval with the lowest weight per length, if the newcomer is denser.
+            let dens = |i: usize| -> u128 { (ivs[i].weight as u128) * 1024 / ((ivs[i].end - ivs[i].start + 1) as u128) };
+            let mut best: Option<usize> = None;
+            for (ai, &(_, lr, li)) in active.iter().enumerate() {
+                if fits(k, lr) && best.map_or(true, |b| dens(li) < dens(active[b].2)) {
+                    best = Some(ai);
+                }
+            }
+            if let Some(ai) = best {
+                let (_, lr, li) = active[ai];
+                if dens(k) > dens(li) {
+                    got[li] = None;
+                    got[k] = Some(lr);
+                    active.remove(ai);
+                    active.push((ivs[k].end, lr, k));
+                    active.sort_by_key(|&(e, _, _)| e);
+                }
+            }
+        } else if let Some(ai) = active.iter().rposition(|&(_, lr, _)| fits(k, lr)) {
             let (le, lr, li) = active[ai];
             if le > ivs[k].end && ivs[k].weight > ivs[li].weight {
                 got[li] = None;
