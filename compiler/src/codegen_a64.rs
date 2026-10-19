@@ -1399,6 +1399,25 @@ fn emit_cmp_flags(e: &mut Emitter, fr: &Frame, op: CmpOp, oty: FTy, a: Val, b: V
     // `cmp_imm` already knows every form A64 has for a comparison
     // against a number, including the negative one over `cmn`.
     match fr.ra.imm(b) {
+        // r849: unsigned `x < 2^k` / `x >= 2^k` (k >= 12, too big for a cmp immediate) is a bit test: one `tst` with the
+        // mask of all bits from k up (a contiguous run, always a valid bitmask immediate) instead of movz + cmp.
+        Some(c)
+            if oty.bits().max(8) >= bits
+                && !oty.signed()
+                && matches!(op, CmpOp::Lt | CmpOp::Ge)
+                && c > 4095
+                && (c as u64).is_power_of_two()
+                && ((bits >= 64) || (c as u64) < (1u64 << 32))
+                && std::env::var_os("FIRN_A64_NO_TST").is_none() =>
+        {
+            let full: u64 = if bits >= 64 { u64::MAX } else { 0xffff_ffff };
+            let mask = full & !((c as u64) - 1);
+            if crate::a64enc::logical_imm(mask, bits >= 64).is_some() {
+                e.line(&format!("tst {}, #{:#x}", rw(ra, bits), mask));
+                return if op == CmpOp::Lt { "eq" } else { "ne" };
+            }
+            cmp_imm(e, ra, bits, c)
+        }
         Some(c) if oty.bits().max(8) >= bits => cmp_imm(e, ra, bits, c),
         _ => {
             let rb = src_ext(e, fr, b, oty, bits, B);
