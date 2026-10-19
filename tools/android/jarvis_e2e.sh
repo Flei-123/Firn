@@ -114,11 +114,19 @@ hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; f
 if [ "$($ADB shell settings get secure navigation_mode 2>/dev/null | tr -d '\r')" = 2 ]; then COMP_Y=1944; TAB_Y=2207; else COMP_Y=1878; TAB_Y=2141; fi
 tap_px() { $ADB shell input tap $(($1 * SW / 1080)) $(($2 * SH / 2340)); sleep "${3:-1.5}"; }
 # a44 layout: the composer is a card (text area on top, below it the paperclip left and the round send button right); the microphone sits in the header
-# frame coords of the 1080x2340 layout: paperclip x 108, send x 972 (row COMP_Y), text area y COMP_Y-160, hamburger (74, 222), speaker (783, 222), sidebar "+" (998, 222)
+# frame coords of the 1080x2340 layout: paperclip x 108, send x 972 (row COMP_Y), text area y COMP_Y-160, hamburger x 74, speaker x 783, sidebar plus x 998 (all at the header height: tap_hdr)
 tap_plus() { tap_px 108 $COMP_Y 2; }
 tap_send() { tap_px 972 $COMP_Y 1; }
-open_sidebar() { tap_px 74 222 2; }
-sidebar_new() { tap_px 998 222 2; }
+# the header row sits at a different height with a different status bar: find the top of the header (first row below the black status bar, column 8) and tap its centre
+hdr_y() { shot _h; python3 -I -c "import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert('RGB')
+y = 20
+while y < 400 and sum(im.getpixel((8, y))) < 14: y += 1
+print(y + int(80 * im.width / 1080))" "$OUT/_h.png"; }
+tap_hdr() { $ADB shell input tap $(($1 * SW / 1080)) "$(hdr_y)"; sleep "${2:-2}"; } # x in the 1080 frame
+open_sidebar() { tap_hdr 74 2; }
+sidebar_new() { tap_hdr 998 2; }
 # type into the composer field (place), or into the field whose hint is $1 (OCR) for other screens, then leave the keyboard
 type_into() { if [ "$1" = Message ]; then tap_px 240 $((COMP_Y - 160)) 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
 send_text() { type_into "Message" "$1" && tap_send; }
@@ -423,7 +431,7 @@ if n:
 
 # ---- 8. voice output without an engine -------------------------------------------------------------------------------------
 echo "== 8. voice output"
-tap_px 783 222 2; shot 10_voice # the speaker icon in the chat header (a44); its status text shows in the composer status line
+tap_hdr 783 2; shot 10_voice # the speaker icon in the chat header (a44); its status text shows in the composer status line
 check "Voice switch shows 'Sprache an'" "$(ocr_crop 10_voice 150 $((COMP_Y * SH / 2340 - 45)) 900 $((COMP_Y * SH / 2340 + 45)) | grep -ci 'prache an')" 1
 send_text "voicetest"
 check "the app lives after a spoken answer" "$(OCR_TRIES=12 wait_ocr 11_say 'Hallo voicetest')" 1
