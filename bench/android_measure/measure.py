@@ -429,7 +429,7 @@ def current_now():
 
 def parse_batterystats(txt, pkg):
     uid = None
-    m = re.search(r"userId=(\d+)", sh("dumpsys package %s | grep userId" % pkg))
+    m = re.search(r"uid:(\d+)", sh("pm list packages -U %s" % pkg))  # Android 16: `dumpsys package | grep userId` no longer matches
     if m:
         uid = int(m.group(1))
     r = {"uid": uid}
