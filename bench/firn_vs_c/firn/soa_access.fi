@@ -1,0 +1,150 @@
+// expect_out: 6732583958992955180
+// Array-of-structs vs struct-of-arrays on 1M elements with 4 u64 fields (x, y, z, w).
+// Both layouts hold the same data and run the same kernels:
+//   A (touches all fields): x += y*3 + (z >> 1); w ^= x      -- 8 passes
+//   B (touches x and w only): w += x                          -- 24 passes
+// Checksum combines a fold of both layouts. Firn side uses raw memory (AoS stride
+// 4 words), no struct arrays.
+// C counterpart: bench/firn_vs_c/c/soa_access.c
+
+fn print_u64(v: u64) {
+    var buf: [u8; 24] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var n: usize = 0
+    var x: u64 = v
+    if x == 0 {
+        buf[0] = 48
+        n = 1
+    }
+    while x > 0 {
+        buf[n] = (x % 10) as u8 + 48
+        x = x / 10
+        n = n + 1
+    }
+    var i: usize = 0
+    while i < n / 2 {
+        let t: u8 = buf[i]
+        buf[i] = buf[n - 1 - i]
+        buf[n - 1 - i] = t
+        i = i + 1
+    }
+    buf[n] = 10
+    syscall(1, 1, &buf[0], (n + 1) as i64)
+}
+
+fn alloc(size: usize) -> usize {
+    // mmap(0, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    let r: i64 = syscall(9, 0, size as i64, 3, 34, -1, 0)
+    return r as usize
+}
+
+fn ld8(p: usize, i: usize) -> u8 {
+    let q: *mut u8 = (p + i) as *mut u8
+    return *q
+}
+
+fn st8(p: usize, i: usize, v: u8) {
+    let q: *mut u8 = (p + i) as *mut u8
+    *q = v
+}
+
+fn ld32(p: usize, i: usize) -> u32 {
+    let q: *mut u32 = (p + i * 4) as *mut u32
+    return *q
+}
+
+fn st32(p: usize, i: usize, v: u32) {
+    let q: *mut u32 = (p + i * 4) as *mut u32
+    *q = v
+}
+
+fn ld64(p: usize, i: usize) -> u64 {
+    let q: *mut u64 = (p + i * 8) as *mut u64
+    return *q
+}
+
+fn st64(p: usize, i: usize, v: u64) {
+    let q: *mut u64 = (p + i * 8) as *mut u64
+    *q = v
+}
+
+// 64-bit LCG (Knuth MMIX constants), wraps mod 2^64
+fn lcg(s: u64) -> u64 {
+    return s *% 6364136223846793005 +% 1442695040888963407
+}
+
+
+fn main() -> i32 {
+    let n: usize = 1000000
+    let aos: usize = alloc(n * 32)
+    let sx: usize = alloc(n * 8)
+    let sy: usize = alloc(n * 8)
+    let sz: usize = alloc(n * 8)
+    let sw: usize = alloc(n * 8)
+    var s: u64 = 5
+    var i: usize = 0
+    while i < n {
+        s = lcg(s)
+        let x: u64 = s >> 20
+        s = lcg(s)
+        let y: u64 = s >> 20
+        s = lcg(s)
+        let z: u64 = s >> 20
+        s = lcg(s)
+        let w: u64 = s >> 20
+        st64(aos, i * 4, x)
+        st64(aos, i * 4 + 1, y)
+        st64(aos, i * 4 + 2, z)
+        st64(aos, i * 4 + 3, w)
+        st64(sx, i, x)
+        st64(sy, i, y)
+        st64(sz, i, z)
+        st64(sw, i, w)
+        i = i + 1
+    }
+    var pass: u32 = 0
+    while pass < 8 {
+        // AoS kernel A
+        i = 0
+        while i < n {
+            let nx: u64 = ld64(aos, i * 4) +% ld64(aos, i * 4 + 1) *% 3 +% (ld64(aos, i * 4 + 2) >> 1)
+            st64(aos, i * 4, nx)
+            st64(aos, i * 4 + 3, ld64(aos, i * 4 + 3) ^ nx)
+            i = i + 1
+        }
+        // SoA kernel A
+        i = 0
+        while i < n {
+            let nx: u64 = ld64(sx, i) +% ld64(sy, i) *% 3 +% (ld64(sz, i) >> 1)
+            st64(sx, i, nx)
+            st64(sw, i, ld64(sw, i) ^ nx)
+            i = i + 1
+        }
+        pass = pass + 1
+    }
+    pass = 0
+    while pass < 24 {
+        // AoS kernel B
+        i = 0
+        while i < n {
+            st64(aos, i * 4 + 3, ld64(aos, i * 4 + 3) +% ld64(aos, i * 4))
+            i = i + 1
+        }
+        // SoA kernel B
+        i = 0
+        while i < n {
+            st64(sw, i, ld64(sw, i) +% ld64(sx, i))
+            i = i + 1
+        }
+        pass = pass + 1
+    }
+    var fa: u64 = 0
+    var fs: u64 = 0
+    i = 0
+    while i < n {
+        fa = fa *% 31 +% (ld64(aos, i * 4) ^ ld64(aos, i * 4 + 3))
+        fs = fs *% 31 +% (ld64(sx, i) ^ ld64(sw, i))
+        i = i + 1
+    }
+    print_u64(fa *% 1000003 +% fs)
+    return 0
+}
