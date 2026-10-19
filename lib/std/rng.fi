@@ -1,0 +1,359 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/rng.fi -- Python's `random` module: a seedable Mersenne Twister
+// (MT19937) that produces the SAME numbers as CPython 3.11 for the same seed.
+// (The module is called `rng` because `random` is taken by std.crypto.random.)
+// `random()`, `getrandbits`, `randrange` / `randint`, `shuffle`, `choice`,
+// `sample`, `uniform`, `randbytes` are bit-exact (tests/4441 compares with
+// numbers printed by CPython), `gauss` / `expovariate` agree to ~1e-12 (the
+// libm differs in the last bit). Same seed = same sequence in Python and Firn.
+//
+// NOT FOR KEYS: the Mersenne Twister is predictable. Keys come from
+// `std.crypto.random` (`random_bytes`).
+//
+//     import std.vec
+//     import std.rng
+//
+//     var r: rng.Rng = rng.new(42)           // random.seed(42)  (any u64 seed)
+//     rng.random(&r)                         // random.random()  -> [0, 1)
+//     rng.randint(&r, 1, 6)                  // random.randint(1, 6)   (both ends in)
+//     rng.randrange(&r, 0, 10)               // random.randrange(0, 10)
+//     rng.uniform(&r, 2.0, 5.0)              // random.uniform(2, 5)
+//     rng.gauss(&r, 0.0, 1.0)                // random.gauss(0, 1)
+//     rng.getrandbits(&r, 17)                // random.getrandbits(17)   (k <= 64)
+//     rng_shuffle[i64](&r, &v)               // random.shuffle(v)
+//     rng_choice[i64](&r, &v)                // random.choice(v)  -> pointer, null when empty
+//     rng_sample[i64](&r, &v, 3, &out)       // random.sample(v, 3)  (APPENDS to out)
+//     var os: rng.Rng = rng.new_os()         // random.seed()  -- seeded from the kernel
+//
+// Python raises (ValueError / IndexError) where Firn returns: `randrange`
+// with an empty range returns `start`, `rng_choice` on an empty Vec returns
+// null, `rng_sample` with k > len returns false and appends nothing.
+// The generic functions (`rng_shuffle`, `rng_choice`, `rng_sample`) are bare because a
+// generic function cannot be called module-qualified; everything else is `rng.NAME`.
+import std.rt
+import std.vec
+import std.map
+import std.math
+import std.crypto.random
+
+export { Rng, new, seed, seed_key, new_os, next_u32, random,
+    getrandbits, randbelow, randrange, randint, uniform,
+    gauss, expovariate, randbytes, rng_shuffle, rng_choice,
+    rng_sample }
+
+const RNG_N: usize = 624
+
+struct Rng {
+    mt: [u32; 624],
+    idx: usize,
+    gauss_next: f64,
+    has_gauss: bool,
+}
+
+fn empty() -> Rng {
+    return Rng { mt: [0; 624], idx: 624, gauss_next: 0.0, has_gauss: false }
+}
+
+// init_genrand(s) of the reference implementation.
+fn init_genrand(r: *mut Rng, s: u64) {
+    (*r).mt[0] = (s & 0xffffffff) as u32
+    var i: usize = 1
+    while i < 624 {
+        let prev: u64 = (*r).mt[i - 1] as u64
+        let x: u64 = (1812433253 *% (prev ^ (prev >> 30))) +% (i as u64)
+        (*r).mt[i] = (x & 0xffffffff) as u32
+        i = i + 1
+    }
+    (*r).idx = 624
+}
+
+// Python `random.seed(<list of 32 bit words>)` = init_by_array. `key` points
+// at `len` u32 words, least significant first.
+fn seed_key(r: *mut Rng, key: *u32, len: usize) {
+    init_genrand(r, 19650218)
+    var i: usize = 1
+    var j: usize = 0
+    var k: usize = 624
+    if len > k { k = len }
+    while k > 0 {
+        let prev: u64 = (*r).mt[i - 1] as u64
+        let cur: u64 = (*r).mt[i] as u64
+        let kp: *u32 = (key as u64 +% (j as u64) *% 4) as *u32
+        let kw: u64 = (*kp) as u64
+        let x: u64 = (cur ^ ((prev ^ (prev >> 30)) *% 1664525)) +% kw +% (j as u64)
+        (*r).mt[i] = (x & 0xffffffff) as u32
+        i = i + 1
+        j = j + 1
+        if i >= 624 {
+            (*r).mt[0] = (*r).mt[623]
+            i = 1
+        }
+        if j >= len { j = 0 }
+        k = k - 1
+    }
+    k = 623
+    while k > 0 {
+        let prev: u64 = (*r).mt[i - 1] as u64
+        let cur: u64 = (*r).mt[i] as u64
+        let x: u64 = (cur ^ ((prev ^ (prev >> 30)) *% 1566083941)) -% (i as u64)
+        (*r).mt[i] = (x & 0xffffffff) as u32
+        i = i + 1
+        if i >= 624 {
+            (*r).mt[0] = (*r).mt[623]
+            i = 1
+        }
+        k = k - 1
+    }
+    (*r).mt[0] = 0x80000000
+    (*r).idx = 624
+    (*r).has_gauss = false
+}
+
+// random.seed(seed) for 0 <= seed < 2^64: the key is the 32 bit words of the
+// number (one word below 2^32, two above), like CPython.
+fn seed(r: *mut Rng, seed: u64) {
+    var key: [u32; 2] = [(seed & 0xffffffff) as u32, (seed >> 32) as u32]
+    var n: usize = 2
+    if (seed >> 32) == 0 { n = 1 }
+    seed_key(r, &key[0], n)
+}
+
+fn new(seed: u64) -> Rng {
+    var r: Rng = empty()
+    seed(&r, seed)
+    return r
+}
+
+// Seeded from the kernel (256 bit), like `random.seed()` without argument.
+fn new_os() -> Rng {
+    var r: Rng = empty()
+    var key: [u32; 8] = [0; 8]
+    if !random.random_bytes((&key[0]) as u64, 32) {
+        key[0] = 1
+    }
+    seed_key(&r, &key[0], 8)
+    return r
+}
+
+fn twist(r: *mut Rng) {
+    var kk: usize = 0
+    while kk < 624 {
+        let a: u64 = (*r).mt[kk] as u64
+        let b: u64 = (*r).mt[(kk + 1) % 624] as u64
+        let y: u64 = (a & 0x80000000) | (b & 0x7fffffff)
+        var x: u64 = ((*r).mt[(kk + 397) % 624] as u64) ^ (y >> 1)
+        if (y & 1) != 0 { x = x ^ 0x9908b0df }
+        (*r).mt[kk] = (x & 0xffffffff) as u32
+        kk = kk + 1
+    }
+    (*r).idx = 0
+}
+
+// genrand_uint32: the next 32 random bits.
+fn next_u32(r: *mut Rng) -> u32 {
+    if (*r).idx >= 624 {
+        twist(r)
+    }
+    var y: u64 = (*r).mt[(*r).idx] as u64
+    (*r).idx = (*r).idx + 1
+    y = y ^ (y >> 11)
+    y = y ^ ((y << 7) & 0x9d2c5680)
+    y = y ^ ((y << 15) & 0xefc60000)
+    y = y ^ (y >> 18)
+    return (y & 0xffffffff) as u32
+}
+
+// random.random(): 53 bit float in [0, 1).
+fn random(r: *mut Rng) -> f64 {
+    let a: u64 = (next_u32(r) >> 5) as u64
+    let b: u64 = (next_u32(r) >> 6) as u64
+    return ((a * 67108864 + b) as f64) / 9007199254740992.0
+}
+
+// random.getrandbits(k) for k = 0..64 (larger k: call twice).
+fn getrandbits(r: *mut Rng, k: u32) -> u64 {
+    if k == 0 {
+        return 0
+    }
+    if k <= 32 {
+        return (next_u32(r) >> (32 - k)) as u64
+    }
+    var kk: u32 = k
+    if kk > 64 { kk = 64 }
+    let lo: u64 = next_u32(r) as u64
+    let hi: u64 = (next_u32(r) >> (64 - kk)) as u64
+    return lo | (hi << 32)
+}
+
+fn bit_length(n: u64) -> u32 {
+    var k: u32 = 0
+    var x: u64 = n
+    while x != 0 {
+        k = k + 1
+        x = x >> 1
+    }
+    return k
+}
+
+// Python's `_randbelow`: uniform in [0, n) by rejection. n == 0 gives 0.
+fn randbelow(r: *mut Rng, n: u64) -> u64 {
+    if n == 0 {
+        return 0
+    }
+    let k: u32 = bit_length(n)
+    var v: u64 = getrandbits(r, k)
+    while v >= n {
+        v = getrandbits(r, k)
+    }
+    return v
+}
+
+// random.randrange(start, stop): start <= x < stop. Empty range returns start.
+fn randrange(r: *mut Rng, start: i64, stop: i64) -> i64 {
+    if stop <= start {
+        return start
+    }
+    let width: u64 = (stop as u64) -% (start as u64)
+    return ((start as u64) +% randbelow(r, width)) as i64
+}
+
+// random.randint(a, b): a <= x <= b.
+fn randint(r: *mut Rng, a: i64, b: i64) -> i64 {
+    if b < a {
+        return a
+    }
+    let width: u64 = ((b as u64) -% (a as u64)) +% 1
+    if width == 0 {
+        // the full 64 bit range
+        return getrandbits(r, 64) as i64
+    }
+    return ((a as u64) +% randbelow(r, width)) as i64
+}
+
+// random.uniform(a, b)
+fn uniform(r: *mut Rng, a: f64, b: f64) -> f64 {
+    return a + (b - a) * random(r)
+}
+
+// random.gauss(mu, sigma) (CPython 3.11: Box-Muller pairs, second value cached).
+fn gauss(r: *mut Rng, mu: f64, sigma: f64) -> f64 {
+    var z: f64 = 0.0
+    if (*r).has_gauss {
+        z = (*r).gauss_next
+        (*r).has_gauss = false
+    } else {
+        let x2pi: f64 = random(r) * 6.283185307179586
+        let g2rad: f64 = math.sqrt(-2.0 * math.ln(1.0 - random(r)))
+        z = math.cos(x2pi) * g2rad
+        (*r).gauss_next = math.sin(x2pi) * g2rad
+        (*r).has_gauss = true
+    }
+    return mu + z * sigma
+}
+
+// random.expovariate(lambd)
+fn expovariate(r: *mut Rng, lambd: f64) -> f64 {
+    return -math.ln(1.0 - random(r)) / lambd
+}
+
+// random.randbytes(n): writes n bytes at `p` (= getrandbits(8n) little endian).
+fn randbytes(r: *mut Rng, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let left: usize = n - i
+        var w: u64 = 0
+        var take: usize = 4
+        if left >= 4 {
+            w = next_u32(r) as u64
+        } else {
+            // the last, partial word keeps its TOP bits, like getrandbits
+            w = (next_u32(r) >> (32 - (left as u32) * 8)) as u64
+            take = left
+        }
+        var b: usize = 0
+        while b < take {
+            *((p +% (i + b) as u64) as *mut u8) = ((w >> ((b as u64) * 8)) & 255) as u8
+            b = b + 1
+        }
+        i = i + take
+    }
+}
+
+// random.shuffle(v), in place (Fisher-Yates from the end, like CPython).
+fn rng_shuffle[T](r: *mut Rng, v: *mut Vec[T]) {
+    var i: usize = vec_len[T](v)
+    while i > 1 {
+        i = i - 1
+        let j: usize = randbelow(r, (i + 1) as u64) as usize
+        vec_swap[T](v, i, j)
+    }
+}
+
+// random.choice(v): pointer to an element, null when v is empty.
+fn rng_choice[T](r: *mut Rng, v: *mut Vec[T]) -> *mut T {
+    let n: usize = vec_len[T](v)
+    if n == 0 {
+        return 0 as *mut T
+    }
+    return vec_elem_ptr[T](v, randbelow(r, n as u64) as usize)
+}
+
+// random.sample(v, k): k distinct elements in selection order, APPENDED to out.
+// False (nothing appended) when k > len or memory ran out.
+fn rng_sample[T](r: *mut Rng, v: *mut Vec[T], k: usize, out: *mut Vec[T]) -> bool {
+    let n: usize = vec_len[T](v)
+    if k > n {
+        return false
+    }
+    var setsize: usize = 21
+    if k > 5 {
+        var e: usize = 0
+        var p: usize = 1
+        while p < k * 3 {
+            p = p * 4
+            e = e + 1
+        }
+        var q: usize = 1
+        var t: usize = 0
+        while t < e {
+            q = q * 4
+            t = t + 1
+        }
+        setsize = setsize + q
+    }
+    if n <= setsize {
+        var pool: Vec[T] = vec_new[T]()
+        if !vec_copy[T](v, &pool) {
+            vec_free[T](&pool)
+            return false
+        }
+        var i: usize = 0
+        while i < k {
+            let j: usize = randbelow(r, (n - i) as u64) as usize
+            if !vec_push[T](out, *vec_elem_ptr[T](&pool, j)) {
+                vec_free[T](&pool)
+                return false
+            }
+            *vec_elem_ptr[T](&pool, j) = *vec_elem_ptr[T](&pool, n - i - 1)
+            i = i + 1
+        }
+        vec_free[T](&pool)
+        return true
+    }
+    var sel: Set[u64] = set_new[u64]()
+    var i: usize = 0
+    while i < k {
+        var j: u64 = randbelow(r, n as u64)
+        while set_has[u64](&sel, j) {
+            j = randbelow(r, n as u64)
+        }
+        set_put[u64](&sel, j)
+        if !vec_push[T](out, *vec_elem_ptr[T](v, j as usize)) {
+            set_free[u64](&sel)
+            return false
+        }
+        i = i + 1
+    }
+    set_free[u64](&sel)
+    return true
+}

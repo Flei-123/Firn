@@ -1,0 +1,419 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/heap.fi -- Python's `heapq`: a binary min-heap / priority queue on a
+// plain `Vec[T]`. The algorithm is CPython's (`_siftdown` / `_siftup`, which
+// walks to a leaf first), so after the same pushes and pops the Vec holds the
+// SAME array as a Python list (cross-checked in tests/4440).
+//
+// Two families, like `vec_sort` / `vec_sort_by`:
+//   heap_*      T: Ord -- uses `<` of the element type (ints, floats, ...)
+//   heap_*_by   a `less(a, b)` callback taking element POINTERS (any struct;
+//               pass the reverse comparison for a max-heap)
+//
+//     import std.vec
+//     import std.heap
+//
+//     var h: Vec[i64] = vec_new[i64]()
+//     heap_push[i64](&h, 5)                 // heapq.heappush(h, 5)
+//     heap_push[i64](&h, 2)
+//     var top: i64 = 0
+//     heap_pop[i64](&h, &top)               // top = heapq.heappop(h)   (false when empty)
+//     heap_peek[i64](&h)                    // pointer to h[0], null when empty
+//     heap_heapify[i64](&h)                 // heapq.heapify(h)
+//     heap_push_pop[i64](&h, 7)             // heapq.heappushpop(h, 7)
+//     heap_replace[i64](&h, 7, &old)        // heapq.heapreplace(h, 7)
+//     heap_nsmallest[i64](&h, 3, &out)      // heapq.nsmallest(3, h)  (APPENDS to out)
+//     heap_nlargest[i64](&h, 3, &out)       // heapq.nlargest(3, h)
+//
+//     // Dijkstra style: struct + callback
+//     fn by_dist(a: *Item, b: *Item) -> bool { return (*a).dist < (*b).dist }
+//     heap_push_by[Item](&q, Item { dist: 4, node: 1 }, by_dist)
+//     heap_pop_by[Item](&q, &it, by_dist)
+//
+// nsmallest / nlargest equal `sorted(v)[:n]` / `sorted(v, reverse=True)[:n]`
+// (equal elements keep their original order, like Python). They work on any
+// Vec (it need not be a heap), do not change it, cost O(N log n + N n) element
+// moves worst case, and APPEND to `out` (call `vec_clear` first for a fresh
+// list). All names are bare because a generic function cannot be called
+// module-qualified. The caller owns every Vec (`vec_free`).
+import std.rt
+import std.vec
+
+export { heap_push, heap_pop, heap_peek, heap_heapify, heap_push_pop,
+    heap_replace, heap_nsmallest, heap_nlargest, heap_is_heap,
+    heap_push_by, heap_pop_by, heap_heapify_by, heap_push_pop_by,
+    heap_replace_by, heap_nsmallest_by, heap_nlargest_by, heap_is_heap_by }
+
+// ---------------------------------------------------------------- Ord family
+
+// CPython `_siftdown`: moves heap[pos] up towards `start`.
+fn heap_sift_down[T: Ord](v: *mut Vec[T], start: usize, pos0: usize) {
+    var pos: usize = pos0
+    var newitem: T = *vec_elem_ptr[T](v, pos)
+    while pos > start {
+        let parent: usize = (pos - 1) >> 1
+        let pp: *mut T = vec_elem_ptr[T](v, parent)
+        if (&newitem).less(pp) {
+            *vec_elem_ptr[T](v, pos) = *pp
+            pos = parent
+        } else {
+            break
+        }
+    }
+    *vec_elem_ptr[T](v, pos) = newitem
+}
+
+// CPython `_siftup`: the item at `pos0` goes down to a leaf (always taking the
+// smaller child), then bubbles back up.
+fn heap_sift_up[T: Ord](v: *mut Vec[T], pos0: usize) {
+    let end: usize = vec_len[T](v)
+    var pos: usize = pos0
+    let newitem: T = *vec_elem_ptr[T](v, pos)
+    var child: usize = 2 * pos + 1
+    while child < end {
+        let right: usize = child + 1
+        if right < end {
+            if !vec_elem_ptr[T](v, child).less(vec_elem_ptr[T](v, right)) {
+                child = right
+            }
+        }
+        *vec_elem_ptr[T](v, pos) = *vec_elem_ptr[T](v, child)
+        pos = child
+        child = 2 * pos + 1
+    }
+    *vec_elem_ptr[T](v, pos) = newitem
+    heap_sift_down[T](v, pos0, pos)
+}
+
+// heapq.heappush. False when memory ran out.
+fn heap_push[T: Ord](v: *mut Vec[T], item: T) -> bool {
+    if !vec_push[T](v, item) {
+        return false
+    }
+    heap_sift_down[T](v, 0, vec_len[T](v) - 1)
+    return true
+}
+
+// heapq.heappop: smallest item into *out. False (out untouched) when empty.
+fn heap_pop[T: Ord](v: *mut Vec[T], out: *mut T) -> bool {
+    let n: usize = vec_len[T](v)
+    if n == 0 {
+        return false
+    }
+    let last: T = *vec_elem_ptr[T](v, n - 1)
+    vec_shorten[T](v, n - 1)
+    if n == 1 {
+        *out = last
+        return true
+    }
+    *out = *vec_elem_ptr[T](v, 0)
+    *vec_elem_ptr[T](v, 0) = last
+    heap_sift_up[T](v, 0)
+    return true
+}
+
+// heap[0] as a pointer (null when empty). Valid until the next push / pop.
+fn heap_peek[T](v: *mut Vec[T]) -> *mut T {
+    return vec_elem_ptr[T](v, 0)
+}
+
+// heapq.heapify: any Vec becomes a heap in O(n).
+fn heap_heapify[T: Ord](v: *mut Vec[T]) {
+    var i: usize = vec_len[T](v) / 2
+    while i > 0 {
+        i = i - 1
+        heap_sift_up[T](v, i)
+    }
+}
+
+// heapq.heappushpop: push `item`, then pop the smallest -- faster than both.
+// Returns the popped item (`item` itself when it is not larger than the root,
+// or when the heap is empty).
+fn heap_push_pop[T: Ord](v: *mut Vec[T], item: T) -> T {
+    var it: T = item
+    if vec_len[T](v) == 0 {
+        return it
+    }
+    let root: *mut T = vec_elem_ptr[T](v, 0)
+    if root.less(&it) {
+        let out: T = *root
+        *root = it
+        heap_sift_up[T](v, 0)
+        return out
+    }
+    return it
+}
+
+// heapq.heapreplace: pop the smallest into *old, then push `item` (the heap
+// size does not change). False (nothing done) when empty.
+fn heap_replace[T: Ord](v: *mut Vec[T], item: T, old: *mut T) -> bool {
+    if vec_len[T](v) == 0 {
+        return false
+    }
+    *old = *vec_elem_ptr[T](v, 0)
+    *vec_elem_ptr[T](v, 0) = item
+    heap_sift_up[T](v, 0)
+    return true
+}
+
+// True when every parent is <= its children.
+fn heap_is_heap[T: Ord](v: *mut Vec[T]) -> bool {
+    let n: usize = vec_len[T](v)
+    var i: usize = 1
+    while i < n {
+        if vec_elem_ptr[T](v, i).less(vec_elem_ptr[T](v, (i - 1) >> 1)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// First index in the sorted prefix `out[from..]` where a new element goes so
+// that equal elements keep their order. asc: position after all x with !(item < x).
+fn heap_ins_asc[T: Ord](out: *mut Vec[T], from: usize, item: *mut T) -> usize {
+    var lo: usize = from
+    var hi: usize = vec_len[T](out)
+    while lo < hi {
+        let m: usize = lo + (hi - lo) / 2
+        if item.less(vec_elem_ptr[T](out, m)) {
+            hi = m
+        } else {
+            lo = m + 1
+        }
+    }
+    return lo
+}
+
+// desc: new element goes after all x with !(x < item).
+fn heap_ins_desc[T: Ord](out: *mut Vec[T], from: usize, item: *mut T) -> usize {
+    var lo: usize = from
+    var hi: usize = vec_len[T](out)
+    while lo < hi {
+        let m: usize = lo + (hi - lo) / 2
+        if vec_elem_ptr[T](out, m).less(item) {
+            hi = m
+        } else {
+            lo = m + 1
+        }
+    }
+    return lo
+}
+
+// heapq.nsmallest(n, v): the n smallest, ascending, stable. Appends to out.
+fn heap_nsmallest[T: Ord](v: *mut Vec[T], n: usize, out: *mut Vec[T]) -> bool {
+    let from: usize = vec_len[T](out)
+    let total: usize = vec_len[T](v)
+    var i: usize = 0
+    while i < total {
+        let e: *mut T = vec_elem_ptr[T](v, i)
+        let pos: usize = heap_ins_asc[T](out, from, e)
+        if pos - from < n {
+            if !vec_insert[T](out, pos, *e) {
+                return false
+            }
+            if vec_len[T](out) - from > n {
+                vec_shorten[T](out, from + n)
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// heapq.nlargest(n, v): the n largest, descending, stable. Appends to out.
+fn heap_nlargest[T: Ord](v: *mut Vec[T], n: usize, out: *mut Vec[T]) -> bool {
+    let from: usize = vec_len[T](out)
+    let total: usize = vec_len[T](v)
+    var i: usize = 0
+    while i < total {
+        let e: *mut T = vec_elem_ptr[T](v, i)
+        let pos: usize = heap_ins_desc[T](out, from, e)
+        if pos - from < n {
+            if !vec_insert[T](out, pos, *e) {
+                return false
+            }
+            if vec_len[T](out) - from > n {
+                vec_shorten[T](out, from + n)
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------ callback family
+
+fn heap_sift_down_by[T](v: *mut Vec[T], start: usize, pos0: usize, less: fn(*T, *T) -> bool) {
+    var pos: usize = pos0
+    var newitem: T = *vec_elem_ptr[T](v, pos)
+    while pos > start {
+        let parent: usize = (pos - 1) >> 1
+        let pp: *mut T = vec_elem_ptr[T](v, parent)
+        if less(&newitem, pp) {
+            *vec_elem_ptr[T](v, pos) = *pp
+            pos = parent
+        } else {
+            break
+        }
+    }
+    *vec_elem_ptr[T](v, pos) = newitem
+}
+
+fn heap_sift_up_by[T](v: *mut Vec[T], pos0: usize, less: fn(*T, *T) -> bool) {
+    let end: usize = vec_len[T](v)
+    var pos: usize = pos0
+    let newitem: T = *vec_elem_ptr[T](v, pos)
+    var child: usize = 2 * pos + 1
+    while child < end {
+        let right: usize = child + 1
+        if right < end {
+            if !less(vec_elem_ptr[T](v, child), vec_elem_ptr[T](v, right)) {
+                child = right
+            }
+        }
+        *vec_elem_ptr[T](v, pos) = *vec_elem_ptr[T](v, child)
+        pos = child
+        child = 2 * pos + 1
+    }
+    *vec_elem_ptr[T](v, pos) = newitem
+    heap_sift_down_by[T](v, pos0, pos, less)
+}
+
+fn heap_push_by[T](v: *mut Vec[T], item: T, less: fn(*T, *T) -> bool) -> bool {
+    if !vec_push[T](v, item) {
+        return false
+    }
+    heap_sift_down_by[T](v, 0, vec_len[T](v) - 1, less)
+    return true
+}
+
+fn heap_pop_by[T](v: *mut Vec[T], out: *mut T, less: fn(*T, *T) -> bool) -> bool {
+    let n: usize = vec_len[T](v)
+    if n == 0 {
+        return false
+    }
+    let last: T = *vec_elem_ptr[T](v, n - 1)
+    vec_shorten[T](v, n - 1)
+    if n == 1 {
+        *out = last
+        return true
+    }
+    *out = *vec_elem_ptr[T](v, 0)
+    *vec_elem_ptr[T](v, 0) = last
+    heap_sift_up_by[T](v, 0, less)
+    return true
+}
+
+fn heap_heapify_by[T](v: *mut Vec[T], less: fn(*T, *T) -> bool) {
+    var i: usize = vec_len[T](v) / 2
+    while i > 0 {
+        i = i - 1
+        heap_sift_up_by[T](v, i, less)
+    }
+}
+
+fn heap_push_pop_by[T](v: *mut Vec[T], item: T, less: fn(*T, *T) -> bool) -> T {
+    var it: T = item
+    if vec_len[T](v) == 0 {
+        return it
+    }
+    let root: *mut T = vec_elem_ptr[T](v, 0)
+    if less(root, &it) {
+        let out: T = *root
+        *root = it
+        heap_sift_up_by[T](v, 0, less)
+        return out
+    }
+    return it
+}
+
+fn heap_replace_by[T](v: *mut Vec[T], item: T, old: *mut T, less: fn(*T, *T) -> bool) -> bool {
+    if vec_len[T](v) == 0 {
+        return false
+    }
+    *old = *vec_elem_ptr[T](v, 0)
+    *vec_elem_ptr[T](v, 0) = item
+    heap_sift_up_by[T](v, 0, less)
+    return true
+}
+
+fn heap_is_heap_by[T](v: *mut Vec[T], less: fn(*T, *T) -> bool) -> bool {
+    let n: usize = vec_len[T](v)
+    var i: usize = 1
+    while i < n {
+        if less(vec_elem_ptr[T](v, i), vec_elem_ptr[T](v, (i - 1) >> 1)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn heap_ins_asc_by[T](out: *mut Vec[T], from: usize, item: *mut T, less: fn(*T, *T) -> bool) -> usize {
+    var lo: usize = from
+    var hi: usize = vec_len[T](out)
+    while lo < hi {
+        let m: usize = lo + (hi - lo) / 2
+        if less(item, vec_elem_ptr[T](out, m)) {
+            hi = m
+        } else {
+            lo = m + 1
+        }
+    }
+    return lo
+}
+
+fn heap_ins_desc_by[T](out: *mut Vec[T], from: usize, item: *mut T, less: fn(*T, *T) -> bool) -> usize {
+    var lo: usize = from
+    var hi: usize = vec_len[T](out)
+    while lo < hi {
+        let m: usize = lo + (hi - lo) / 2
+        if less(vec_elem_ptr[T](out, m), item) {
+            hi = m
+        } else {
+            lo = m + 1
+        }
+    }
+    return lo
+}
+
+// heapq.nsmallest(n, v, key=..): `less` compares the keys.
+fn heap_nsmallest_by[T](v: *mut Vec[T], n: usize, out: *mut Vec[T], less: fn(*T, *T) -> bool) -> bool {
+    let from: usize = vec_len[T](out)
+    let total: usize = vec_len[T](v)
+    var i: usize = 0
+    while i < total {
+        let e: *mut T = vec_elem_ptr[T](v, i)
+        let pos: usize = heap_ins_asc_by[T](out, from, e, less)
+        if pos - from < n {
+            if !vec_insert[T](out, pos, *e) {
+                return false
+            }
+            if vec_len[T](out) - from > n {
+                vec_shorten[T](out, from + n)
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn heap_nlargest_by[T](v: *mut Vec[T], n: usize, out: *mut Vec[T], less: fn(*T, *T) -> bool) -> bool {
+    let from: usize = vec_len[T](out)
+    let total: usize = vec_len[T](v)
+    var i: usize = 0
+    while i < total {
+        let e: *mut T = vec_elem_ptr[T](v, i)
+        let pos: usize = heap_ins_desc_by[T](out, from, e, less)
+        if pos - from < n {
+            if !vec_insert[T](out, pos, *e) {
+                return false
+            }
+            if vec_len[T](out) - from > n {
+                vec_shorten[T](out, from + n)
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
