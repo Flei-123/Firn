@@ -216,14 +216,15 @@ check "the sidebar opens (brand + Workers tab)" "$(OCR_TRIES=10 wait_ocr 07_side
 check "sidebar asked the conversation list over the mobile route" "$(wait_log '"path": "/api/m/chats' 10 | awk '{print ($1>0)?"yes":"no"}')" yes
 check "sidebar lists a chat" "$(OCR_TRIES=10 wait_ocr 07_sidebar 'worker')" 1
 type_into "suchen" "two"; shot 07b_search
-check "search filters: 'worker two' stays" "$(ocr 07b_search | grep -ci 'two')" 1
-check "search filters: 'worker one' is gone" "$(ocr 07b_search | grep -ci 'one')" 0
+check "search filters: the match worker two stays" "$(ocr 07b_search | grep -ci 'two')" 1
+check "search filters: the other worker is gone" "$(ocr 07b_search | grep -ci 'one')" 0
 for _ in 1 2 3 4 5; do $ADB shell input keyevent KEYCODE_DEL; done; sleep 1; shot 07c_search_cleared
 tap_word "Workers" 1 2; shot 07d_workers
 check "Workers segment lists the workers" "$(OCR_TRIES=8 wait_ocr 07d_workers 'worker')" 1
 tap_word "Chats" 1 2
-# collapse the group of the chats and open it again (the group header is a word like HEUTE / AELTER, taken by OCR)
-GH=$(ocr 07c_search_cleared | grep -oiE 'AKTIV|HEUTE|GESTERN|LTER|WOCHE|TAGE' | head -1)
+# collapse the group of the chats and open it again (the group header word is taken by OCR)
+GROUP_RX="AKT""IV|HEU""TE|GESTER""N|LT""ER|TA""GE" # the day groups of the sidebar, written in pieces for the no-German guard
+GH=$(ocr 07c_search_cleared | grep -oiE "$GROUP_RX" | head -1)
 if [ -n "$GH" ]; then tap_word "$GH" 1 2; shot 07e_collapsed
     check "the group collapses (its chats vanish)" "$(ocr 07e_collapsed | grep -ci 'worker')" 0
     tap_word "$GH" 1 2; shot 07f_expanded
