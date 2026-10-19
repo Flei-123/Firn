@@ -480,13 +480,13 @@ check "dropdown: the socket got '/effort high'" "$(wait_log '"text": "/effort hi
 check "dropdown: POST /api/m/models stored the model" "$(wait_log '"json": {"model": "opus"}' 10)" 1
 shot 12_dropdown_closed
 check "dropdown: the pill shows Opus" "$(ocr 12_dropdown_closed | grep -ci 'opus')" 1
-# copy button: right of the meta line "<n>s - finished HH:MM" under the last answer (about 79 dp = 207 px right of the word "finished")
-shot _w; FP=$(word_at _w 'finished' 1)
+# copy button: right of the meta line "<n>s · HH:MM" under the last answer (about 8 dp + the width of "HH:MM" = ~130 px right of the start of the time word)
+shot _w; FP=$(word_at _w '[0-9][0-9]:[0-9][0-9]' 1)
 if [ -n "$FP" ]; then
-    set -- $FP; $ADB shell input tap $(($1 + 207 * SW / 1080)) $2; sleep 1.5; shot 12_copied
+    set -- $FP; $ADB shell input tap $(($1 + 130 * SW / 1080)) $2; sleep 1.5; shot 12_copied
     check "copy button: the status line says 'Kopiert'" "$(ocr_crop 12_copied 150 $((COMP_Y * SH / 2340 - 45)) 900 $((COMP_Y * SH / 2340 + 45)) | grep -ci 'opiert')" 1
 else
-    check "copy button: the meta line 'finished' is on the screen" no yes
+    check "copy button: the meta line time (HH:MM) is on the screen" no yes
 fi
 
 # ---- 8b. speech output WITH an engine (google_apis image: com.google.android.tts) ----------------------------------------------
