@@ -169,6 +169,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "a % c next to a / c (same a, constant c) becomes a - (a / c) * c so cse shares the division",
     },
     PassInfo {
+        name: "loadcse",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "redundant load elimination and store-to-load forwarding with alias facts (distinct stack/global roots, non-escaping slots)",
+    },
+    PassInfo {
         name: "storemerge",
         scope: Scope::Func,
         debug_preserving: false,
@@ -655,7 +661,7 @@ struct Fix {
 }
 
 /// as many slots as there are passes in `PASSES`
-const PASS_SLOTS: usize = 17;
+const PASS_SLOTS: usize = 18;
 
 impl Fix {
     fn new() -> Fix {
@@ -760,6 +766,13 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             clk.add2("divrem", t, n > 0);
             fx.note(15, n > 0);
             phi_check(f, "divrem");
+        }
+        if cfg.runs("loadcse") && fx.due(17) {
+            let t = std::time::Instant::now();
+            let n = crate::loadcse::run(f);
+            clk.add2("loadcse", t, n > 0);
+            fx.note(17, n > 0);
+            phi_check(f, "loadcse");
         }
         if cfg.runs("storemerge") && fx.due(16) {
             let t = std::time::Instant::now();

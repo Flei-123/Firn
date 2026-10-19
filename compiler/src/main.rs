@@ -68,6 +68,7 @@ mod mem2reg;
 mod memcpy_idiom;
 mod memset;
 mod divrem;
+mod loadcse;
 mod storemerge;
 mod sroa;
 mod unroll;
