@@ -67,6 +67,8 @@ mod mono;
 mod mem2reg;
 mod memcpy_idiom;
 mod memset;
+mod divrem;
+mod storemerge;
 mod sroa;
 mod unroll;
 mod vec2reg;

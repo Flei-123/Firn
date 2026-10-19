@@ -163,6 +163,18 @@ pub const PASSES: &[PassInfo] = &[
         what: "combine common subexpressions",
     },
     PassInfo {
+        name: "divrem",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "a % c next to a / c (same a, constant c) becomes a - (a / c) * c so cse shares the division",
+    },
+    PassInfo {
+        name: "storemerge",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "runs of constant byte/halfword stores into one stack slot become 8/4/2 byte stores",
+    },
+    PassInfo {
         name: "fuse-checks",
         scope: Scope::Func,
         debug_preserving: false,
@@ -643,7 +655,7 @@ struct Fix {
 }
 
 /// as many slots as there are passes in `PASSES`
-const PASS_SLOTS: usize = 15;
+const PASS_SLOTS: usize = 17;
 
 impl Fix {
     fn new() -> Fix {
@@ -741,6 +753,20 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             clk.add2("strength", t, n > 0);
             fx.note(3, n > 0);
             phi_check(f, "strength");
+        }
+        if cfg.runs("divrem") && fx.due(15) {
+            let t = std::time::Instant::now();
+            let n = crate::divrem::run(f);
+            clk.add2("divrem", t, n > 0);
+            fx.note(15, n > 0);
+            phi_check(f, "divrem");
+        }
+        if cfg.runs("storemerge") && fx.due(16) {
+            let t = std::time::Instant::now();
+            let n = crate::storemerge::run(f);
+            clk.add2("storemerge", t, n > 0);
+            fx.note(16, n > 0);
+            phi_check(f, "storemerge");
         }
         if cfg.runs("cse") && fx.due(4) {
             let t = std::time::Instant::now();
