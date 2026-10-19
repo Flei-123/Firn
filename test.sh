@@ -241,7 +241,7 @@ echo "== 1b. repository hygiene: gctext.fi fresh, no new duplicate test numbers 
 if bash tools/hygiene/check.sh; then ok; else bad "tools/hygiene/check.sh"; fi
 
 echo "== 2. module tests of the compiler =="
-cargo test --release --manifest-path compiler/Cargo.toml -- --test-threads=4 >/dev/null
+RUST_MIN_STACK=${RUST_MIN_STACK:-268435456} cargo test --release --manifest-path compiler/Cargo.toml -- --test-threads=4 >/dev/null
 echo "   cargo test: ok"
 
 rm -rf "$WORK"

@@ -962,6 +962,9 @@ pub fn emit(m: &Module) -> Result<String, String> {
     if !no_start && !m.funcs.iter().any(|f| f.name == "main") {
         return Err("no entry point: 'fn main() -> i32' is missing".to_string());
     }
+    // r845: which functions can never reach a safepoint (the register allocation may keep values in x25-x28 across
+    // a call of them).
+    regalloc_a64::compute_silent(m);
     for f in &m.funcs {
         emit_func(&mut e, f)?;
     }

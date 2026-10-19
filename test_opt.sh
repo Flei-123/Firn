@@ -43,7 +43,7 @@ echo "== baue Compiler =="
 cargo build --release --manifest-path compiler/Cargo.toml
 
 echo "== Modul-Tests des Optimierers =="
-cargo test --manifest-path compiler/Cargo.toml --release -- opt:: mem2reg:: inline:: regalloc::
+RUST_MIN_STACK=${RUST_MIN_STACK:-268435456} cargo test --manifest-path compiler/Cargo.toml --release -- opt:: mem2reg:: inline:: regalloc::
 
 rm -rf "$WORK"
 mkdir -p "$WORK"

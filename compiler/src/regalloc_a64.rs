@@ -213,6 +213,10 @@ struct Iv {
     end: usize,
     weight: u64,
     is_cell: bool,
+    /// r845: the interval spans a barrier (call, system call, ...) -- no caller-saved register
+    cross: bool,
+    /// r845: the interval spans a point where the world may stop -- no register the collector does not read (x25-x28)
+    gc: bool,
 }
 
 /// Does `codegen_a64::imm_into` write this value in exactly ONE
@@ -270,35 +274,104 @@ fn needs_frame_slot(f: &Func, v: Val) -> bool {
     f.is_secret(v)
 }
 
-/// A function that never calls anything and never reaches a safepoint -- see `A64_XPOOL`. Whitelist: every operation
-/// the emitter writes as straight code with the scratch registers x9-x14 only. Anything else (calls, system calls,
-/// `GcAddr`, atomics, threads, `CopyMem`, SIMD, MMIO, inline assembler) makes the function a non-leaf.
+/// Operations the emitter writes as straight code with the scratch registers x9-x16 only (and never as a call or a
+/// safepoint). Whitelist: anything else (calls, system calls, `GcAddr`, atomics, threads, `CopyMem`, SIMD, MMIO, inline
+/// assembler) is a BARRIER for the allocation, see `allocate`.
+fn plain_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Const(_)
+            | Op::Bin(..)
+            | Op::BinWrapSat { .. }
+            | Op::Cmp { .. }
+            | Op::Un(..)
+            | Op::Cast { .. }
+            | Op::CheckedBin { .. }
+            | Op::CheckedDiv { .. }
+            | Op::CheckedCast { .. }
+            | Op::CheckedIdx { .. }
+            | Op::CheckedIdxV { .. }
+            | Op::Alloca { .. }
+            | Op::Load { .. }
+            | Op::Store { .. }
+            | Op::PtrAdd { .. }
+            | Op::Select { .. }
+            | Op::GlobalAddr { .. }
+            | Op::Copy { .. }
+    )
+}
+
+/// A function that never calls anything and never reaches a safepoint -- see `A64_XPOOL`.
 fn is_leaf(f: &Func) -> bool {
-    f.blocks.iter().all(|b| {
-        b.insts.iter().all(|i| {
-            matches!(
-                i.op,
-                Op::Const(_)
-                    | Op::Bin(..)
-                    | Op::BinWrapSat { .. }
-                    | Op::Cmp { .. }
-                    | Op::Un(..)
-                    | Op::Cast { .. }
-                    | Op::CheckedBin { .. }
-                    | Op::CheckedDiv { .. }
-                    | Op::CheckedCast { .. }
-                    | Op::CheckedIdx { .. }
-                    | Op::CheckedIdxV { .. }
-                    | Op::Alloca { .. }
-                    | Op::Load { .. }
-                    | Op::Store { .. }
-                    | Op::PtrAdd { .. }
-                    | Op::Select { .. }
-                    | Op::GlobalAddr { .. }
-                    | Op::Copy { .. }
-            )
-        })
-    })
+    f.blocks.iter().all(|b| b.insts.iter().all(|i| plain_op(&i.op)))
+}
+
+thread_local! {
+    /// r845: the functions of the module that can NEVER reach a safepoint (no `GcAddr`, no system call, no atomic, no
+    /// thread operation, no inline assembler, no indirect call, no call of anything outside the module -- transitively).
+    /// Filled by `compute_silent` at the start of the code generation of a module.
+    static SILENT: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// r845: greatest fixed point over the call graph. A function is silent if it consists of plain operations and calls of
+/// silent functions only. A silent function leaves x19-x28 alone (it saves what it uses), and nothing in it can stop the
+/// world -- so a caller may keep a value (a pointer too) in x25-x28 ACROSS a call of it, although the collector reads
+/// only x19-x24 at a save point.
+pub(crate) fn compute_silent(m: &crate::fir::Module) {
+    use std::collections::{HashMap, HashSet};
+    let mut cand: HashSet<&str> = HashSet::new();
+    let mut calls: HashMap<&str, Vec<&str>> = HashMap::new();
+    for f in &m.funcs {
+        if f.interrupt {
+            continue;
+        }
+        let mut ok = true;
+        let mut cs: Vec<&str> = Vec::new();
+        'scan: for b in &f.blocks {
+            for i in &b.insts {
+                match &i.op {
+                    Op::Call { name, .. } => cs.push(name.as_str()),
+                    op if plain_op(op) => {}
+                    _ => {
+                        ok = false;
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        if ok {
+            cand.insert(f.name.as_str());
+            calls.insert(f.name.as_str(), cs);
+        }
+    }
+    loop {
+        let out: Vec<&str> = cand
+            .iter()
+            .copied()
+            .filter(|n| calls.get(n).map(|cs| cs.iter().any(|c| !cand.contains(c))).unwrap_or(true))
+            .collect();
+        if out.is_empty() {
+            break;
+        }
+        for n in out {
+            cand.remove(n);
+        }
+    }
+    SILENT.with(|s| *s.borrow_mut() = cand.into_iter().map(|x| x.to_string()).collect());
+}
+
+/// Does the interval [s, e] contain one of the (sorted) barrier positions? The one exception: an interval that STARTS at
+/// the position of a call (`calls`) is that call's result, written from x0 after the call returned.
+fn spans(bars: &[usize], calls: &std::collections::HashSet<usize>, s: usize, e: usize) -> bool {
+    let mut k = bars.partition_point(|&p| p < s);
+    while k < bars.len() && bars[k] <= e {
+        if !(bars[k] == s && calls.contains(&s)) {
+            return true;
+        }
+        k += 1;
+    }
+    false
 }
 
 /// The Poletto/Sarkar scan, once for each register class. Returns the register
@@ -308,11 +381,27 @@ fn linear_scan(
     pool: &[&'static str],
     param_n: usize,
     caller_saved: &[&'static str],
+    unscanned: &[&'static str],
 ) -> (Vec<Option<&'static str>>, Vec<&'static str>) {
     let mut free: Vec<&'static str> = pool.to_vec();
     let mut active: Vec<(usize, &'static str, usize)> = Vec::new(); // (end, reg, index in ivs)
     let mut got: Vec<Option<&'static str>> = vec![None; ivs.len()];
     let mut used: Vec<&'static str> = Vec::new();
+    // May interval `k` live in register `r`?
+    //  * r841: a parameter must not get a caller-saved register -- the prologue moves the incoming arguments (x0-x7)
+    //    one by one and would overwrite a neighbour;
+    //  * r845: an interval that spans a call (or another barrier) must not get a caller-saved register, and one that
+    //    spans a point where the world may stop must not get a register the collector does not read.
+    let fits = |k: usize, r: &str| -> bool {
+        let iv = &ivs[k];
+        if caller_saved.contains(&r) && (iv.cross || (iv.val as usize) < param_n) {
+            return false;
+        }
+        if unscanned.contains(&r) && iv.gc {
+            return false;
+        }
+        true
+    };
 
     for k in 0..ivs.len() {
         // expire
@@ -324,14 +413,7 @@ fn linear_scan(
                 true
             }
         });
-        // r841: a parameter must not get a caller-saved register -- the prologue moves the incoming arguments (x0-x7)
-        // one by one and would overwrite a neighbour.
-        let is_param = (ivs[k].val as usize) < param_n;
-        let pick = if is_param {
-            free.iter().rposition(|r| !caller_saved.contains(r))
-        } else {
-            free.len().checked_sub(1)
-        };
+        let pick = free.iter().rposition(|r| fits(k, r));
         if let Some(r) = pick.map(|at| free.remove(at)) {
             got[k] = Some(r);
             if !used.contains(&r) {
@@ -341,14 +423,15 @@ fn linear_scan(
             active.sort_by_key(|&(e, _, _)| e);
             continue;
         }
-        // full: the interval that ends LAST is the candidate for the stack --
-        // but only if the newcomer is worth more (uses, weighted by loop
-        // depth). Otherwise the newcomer goes to the stack.
-        if let Some(&(le, lr, li)) = active.last() {
-            if le > ivs[k].end && ivs[k].weight > ivs[li].weight && !(is_param && caller_saved.contains(&lr)) {
+        // full: the interval that ends LAST (and whose register the newcomer may use) is the candidate for the
+        // stack -- but only if the newcomer is worth more (uses, weighted by loop depth). Otherwise the newcomer
+        // goes to the stack.
+        if let Some(ai) = active.iter().rposition(|&(_, lr, _)| fits(k, lr)) {
+            let (le, lr, li) = active[ai];
+            if le > ivs[k].end && ivs[k].weight > ivs[li].weight {
                 got[li] = None;
                 got[k] = Some(lr);
-                active.pop();
+                active.remove(ai);
                 active.push((ivs[k].end, lr, k));
                 active.sort_by_key(|&(e, _, _)| e);
             }
@@ -534,7 +617,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
             Some(t) if integral(*t) => {}
             _ => continue,
         }
-        ivs.push(Iv { val: vv, start: start[v], end: end[v], weight: weight[v], is_cell: false });
+        ivs.push(Iv { val: vv, start: start[v], end: end[v], weight: weight[v], is_cell: false, cross: false, gc: false });
     }
     for (&c, t) in cells.iter() {
         let cv = c as usize;
@@ -551,6 +634,8 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
             end: end[cv],
             weight: weight[cv].saturating_mul(2).max(1),
             is_cell: true,
+            cross: false,
+            gc: false,
         });
     }
     // ROUND FREG -- the float intervals. Same weights, same scan, the pool
@@ -565,7 +650,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
             if !matches!(f.val_types.get(v), Some(FTy::F32) | Some(FTy::F64)) {
                 continue;
             }
-            fivs.push(Iv { val: vv, start: start[v], end: end[v], weight: weight[v], is_cell: false });
+            fivs.push(Iv { val: vv, start: start[v], end: end[v], weight: weight[v], is_cell: false, cross: false, gc: false });
         }
     }
     if ivs.is_empty() && fivs.is_empty() {
@@ -584,25 +669,68 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
         ra.on = !ra.remat.is_empty();
         return ra;
     }
-    // r841: a leaf with a loop may use x25-x28 as well (see `A64_XPOOL`). They go to the FRONT of the list: the scan
+    // r841: a function with a loop may use x25-x28 as well (see `A64_XPOOL`). They go to the FRONT of the list: the scan
     // hands out from the back, so the extras are only touched when the six ordinary ones are full.
+    // r845: not only a LEAF: the barriers (calls, system calls, ...) are known by position, an interval that spans one
+    // gets no caller-saved register, and an interval that spans a point where the world may stop gets no x25-x28
+    // (calls of silent functions, see `compute_silent`, are no such point). `FIRN_A64_LEAF_ONLY=1` restores r841.
+    let leaf = is_leaf(f);
+    let leaf_only = std::env::var_os("FIRN_A64_LEAF_ONLY").is_some();
     let xpool_on = std::env::var_os("FIRN_A64_NO_XPOOL").is_none()
         && depth.iter().any(|&d| d > 0)
-        && is_leaf(f);
+        && (leaf || !leaf_only);
+    let xcaller_on = std::env::var_os("FIRN_A64_NO_XCALLER").is_none() && (leaf || !leaf_only);
     let mut pool: Vec<&'static str> = Vec::new();
     let mut caller: Vec<&'static str> = Vec::new();
     if xpool_on {
         pool.extend(A64_XPOOL.iter().rev().copied());
     }
     pool.extend(A64_POOL.iter().copied());
-    if xpool_on && std::env::var_os("FIRN_A64_NO_XCALLER").is_none() {
+    if xcaller_on {
         // the end of the list is handed out first: caller-saved registers cost no save and restore
         let skip = std::env::var("FIRN_A64_XSKIP").unwrap_or_default();
         caller.extend(A64_XCALLER.iter().rev().copied().filter(|r| !skip.split(',').any(|x| x == *r)));
         pool.extend(caller.iter().copied());
     }
-    let (got, used) = linear_scan(&ivs, &pool, f.params.len(), &caller);
-    let (fgot, fused) = linear_scan(&fivs, &A64_FPOOL, 0, &[]);
+    if !leaf {
+        let mut bar_all: Vec<usize> = Vec::new();
+        let mut bar_gc: Vec<usize> = Vec::new();
+        let mut bar_call: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        SILENT.with(|sl| {
+            let sl = sl.borrow();
+            for (bi, b) in f.blocks.iter().enumerate() {
+                for (ii, i) in b.insts.iter().enumerate() {
+                    if plain_op(&i.op) {
+                        continue;
+                    }
+                    let p = live.pos[bi][ii];
+                    bar_all.push(p);
+                    match &i.op {
+                        Op::Call { name, .. } => {
+                            bar_call.insert(p);
+                            if !sl.contains(name.as_str()) {
+                                bar_gc.push(p);
+                            }
+                        }
+                        Op::CallIndirect { .. } => {
+                            bar_call.insert(p);
+                            bar_gc.push(p);
+                        }
+                        _ => bar_gc.push(p),
+                    }
+                }
+            }
+        });
+        bar_all.sort_unstable();
+        bar_gc.sort_unstable();
+        for iv in ivs.iter_mut() {
+            iv.cross = spans(&bar_all, &bar_call, iv.start, iv.end);
+            iv.gc = spans(&bar_gc, &bar_call, iv.start, iv.end);
+        }
+    }
+    let unscanned: &[&'static str] = if xpool_on { &A64_XPOOL } else { &[] };
+    let (got, used) = linear_scan(&ivs, &pool, f.params.len(), &caller, unscanned);
+    let (fgot, fused) = linear_scan(&fivs, &A64_FPOOL, 0, &[], &[]);
 
     for (k, iv) in ivs.iter().enumerate() {
         if let Some(r) = got[k] {
@@ -693,8 +821,10 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
             if f.val_types.get(iv.val as usize) != Some(&FTy::Ptr) {
                 continue;
             }
-            // r841: x25-x28 and the caller-saved extras exist only in a leaf; nothing there is ever scanned.
-            if !A64_POOL.contains(&r) {
+            // r841: x25-x28 and the caller-saved extras are never scanned in a leaf. r845: in a function with calls
+            // x25-x28 can be saved by a callee's prologue (its frame is scanned), so a dead pointer must go there too.
+            // The caller-saved ones never reach a frame of a callee.
+            if !A64_POOL.contains(&r) && !(A64_XPOOL.contains(&r) && !leaf) {
                 continue;
             }
             // If the register is needed again right after, the next writer

@@ -247,14 +247,14 @@ one_case() {
         return
     fi
     local aout arc
-    aout=$(timeout "${A64_TIMEOUT:-400}" "$QEMU" "$WORK/$base.a64" </dev/null 2>/dev/null); arc=$?
+    aout=$(timeout "${A64_TIMEOUT:-240}" "$QEMU" "$WORK/$base.a64" </dev/null 2>/dev/null); arc=$?
     [ "$testkit" = 1 ] && aout=""
     # The same second attempt on this side, for the same reason -- and only
     # when the two really disagree, so a run that already agrees costs
     # nothing.
     if [ "$xrc" != "$arc" ] || [ "$xout" != "$aout" ]; then
         sleep 2
-        aout=$(timeout "${A64_TIMEOUT:-400}" "$QEMU" "$WORK/$base.a64" </dev/null 2>/dev/null); arc=$?
+        aout=$(timeout "${A64_TIMEOUT:-240}" "$QEMU" "$WORK/$base.a64" </dev/null 2>/dev/null); arc=$?
         [ "$testkit" = 1 ] && aout=""
     fi
     if [ "$xrc" != "$arc" ]; then
