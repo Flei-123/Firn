@@ -361,12 +361,15 @@ pub(crate) fn compute_silent(m: &crate::fir::Module) {
     SILENT.with(|s| *s.borrow_mut() = cand.into_iter().map(|x| x.to_string()).collect());
 }
 
-/// Does the interval [s, e] contain one of the (sorted) barrier positions? The one exception: an interval that STARTS at
-/// the position of a call (`calls`) is that call's result, written from x0 after the call returned.
-fn spans(bars: &[usize], calls: &std::collections::HashSet<usize>, s: usize, e: usize) -> bool {
+/// Does the interval [s, e] contain one of the (sorted) barrier positions? The one exception: the value `val` that IS
+/// the result of the call at position `s` (`calls`: position -> result value) -- written from x0 after the call
+/// returned. NOTE: `block_start` is the position of the FIRST instruction of the block, so "starts at a call" alone
+/// would also match a value that is live into a block whose first instruction is a call (found by the gate:
+/// tests/1003_js_gc_cycle.fi).
+fn spans(bars: &[usize], calls: &HashMap<usize, Val>, s: usize, e: usize, val: Val) -> bool {
     let mut k = bars.partition_point(|&p| p < s);
     while k < bars.len() && bars[k] <= e {
-        if !(bars[k] == s && calls.contains(&s)) {
+        if !(bars[k] == s && calls.get(&s) == Some(&val)) {
             return true;
         }
         k += 1;
@@ -679,7 +682,12 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     let xpool_on = std::env::var_os("FIRN_A64_NO_XPOOL").is_none()
         && depth.iter().any(|&d| d > 0)
         && (leaf || !leaf_only);
-    let xcaller_on = std::env::var_os("FIRN_A64_NO_XCALLER").is_none() && (leaf || !leaf_only);
+    // The caller-saved extras in a function WITH calls (crossing analysis) are OFF by default: the gate found four
+    // retention failures (tests 1003/1135/1503 js gc, 2421 gc_chunk_index: "too many objects alive after the
+    // collection"; any single one of x2-x8/x17 reproduces it, so it is no clobber but a stale conservative root --
+    // cause not found yet). `FIRN_A64_NONLEAF_CALLER=1` switches them on for the investigation.
+    let xcaller_on = std::env::var_os("FIRN_A64_NO_XCALLER").is_none()
+        && (leaf || std::env::var_os("FIRN_A64_NONLEAF_CALLER").is_some());
     let mut pool: Vec<&'static str> = Vec::new();
     let mut caller: Vec<&'static str> = Vec::new();
     if xpool_on {
@@ -695,7 +703,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     if !leaf {
         let mut bar_all: Vec<usize> = Vec::new();
         let mut bar_gc: Vec<usize> = Vec::new();
-        let mut bar_call: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut bar_call: HashMap<usize, Val> = HashMap::new();
         SILENT.with(|sl| {
             let sl = sl.borrow();
             for (bi, b) in f.blocks.iter().enumerate() {
@@ -707,13 +715,21 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
                     bar_all.push(p);
                     match &i.op {
                         Op::Call { name, .. } => {
-                            bar_call.insert(p);
+                            if let Some(d) = i.dst {
+                                if !live.live_in[bi][d as usize] {
+                                    bar_call.insert(p, d);
+                                }
+                            }
                             if !sl.contains(name.as_str()) {
                                 bar_gc.push(p);
                             }
                         }
                         Op::CallIndirect { .. } => {
-                            bar_call.insert(p);
+                            if let Some(d) = i.dst {
+                                if !live.live_in[bi][d as usize] {
+                                    bar_call.insert(p, d);
+                                }
+                            }
                             bar_gc.push(p);
                         }
                         _ => bar_gc.push(p),
@@ -724,8 +740,8 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
         bar_all.sort_unstable();
         bar_gc.sort_unstable();
         for iv in ivs.iter_mut() {
-            iv.cross = spans(&bar_all, &bar_call, iv.start, iv.end);
-            iv.gc = spans(&bar_gc, &bar_call, iv.start, iv.end);
+            iv.cross = spans(&bar_all, &bar_call, iv.start, iv.end, iv.val);
+            iv.gc = spans(&bar_gc, &bar_call, iv.start, iv.end, iv.val);
         }
     }
     let unscanned: &[&'static str] = if xpool_on { &A64_XPOOL } else { &[] };
