@@ -111,12 +111,16 @@ hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; f
 # the composer buttons are vector icons without text (Plus, Mic, Send): touch them by place, as pixels of the 1080x2340 layout
 # (the field "Message" grey hint is lost by OCR as well). Row y 2028 (a42: composer sits directly above the tab bar; a40 and older 1911), centres: plus 103, field 305, mic 790, send 960
 # the composer row sits higher with the 3-button navigation bar (settings navigation_mode 0) than with gestures (2)
-if [ "$($ADB shell settings get secure navigation_mode 2>/dev/null | tr -d '\r')" = 2 ]; then COMP_Y=2028; TAB_Y=2207; else COMP_Y=1962; TAB_Y=2141; fi
+if [ "$($ADB shell settings get secure navigation_mode 2>/dev/null | tr -d '\r')" = 2 ]; then COMP_Y=1976; TAB_Y=2207; else COMP_Y=1910; TAB_Y=2141; fi
 tap_px() { $ADB shell input tap $(($1 * SW / 1080)) $(($2 * SH / 2340)); sleep "${3:-1.5}"; }
+# a44 layout: the composer is a card (text area on top, below it the paperclip left and the round send button right); the microphone sits in the header
+# frame coords of the 1080x2340 layout: paperclip x 103, send x 978 (row COMP_Y), text area y COMP_Y-150, hamburger (71, 140), sidebar "+" (998, 145)
 tap_plus() { tap_px 103 $COMP_Y 2; }
-tap_send() { tap_px 960 $COMP_Y 1; }
+tap_send() { tap_px 978 $COMP_Y 1; }
+open_sidebar() { tap_px 71 140 2; }
+sidebar_new() { tap_px 998 145 2; }
 # type into the composer field (place), or into the field whose hint is $1 (OCR) for other screens, then leave the keyboard
-type_into() { if [ "$1" = Message ]; then tap_px 305 $COMP_Y 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
+type_into() { if [ "$1" = Message ]; then tap_px 240 $((COMP_Y - 150)) 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
 send_text() { type_into "Message" "$1" && tap_send; }
 notes() { $ADB shell dumpsys notification --noredact; }
 # title / text lines of the notifications of the app (not the service one)
@@ -165,7 +169,7 @@ type_into "Benutzername" justin; type_into "Passwort" pw
 tap_word "Anmelden" 1 1
 check "the notification notice page shows after the first sign-in" "$(OCR_TRIES=20 wait_ocr 01b_notice 'Weiter\|Benachrichtigungen')" 1 # english: ok
 tap_word "Weiter" 1 3
-check "chat screen after login" "$(OCR_TRIES=30 wait_ocr 02_chat 'Chats')" 1
+check "chat screen after login" "$(OCR_TRIES=30 wait_ocr 02_chat 'Standard\|Nachricht')" 1
 check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 1
 send_text hello
 check "message 'hello' reached the server" "$(wait_log '"text": "hello"' 15 | awk '{print ($1>0)?"yes":"no"}')" yes
@@ -205,15 +209,34 @@ bar_check "More after swipe" 4
 # the Chat tab by place (the word is too small for OCR on the More page, and a miss would leave the next taps on that page: Logout!)
 tap_px 106 $TAB_Y 2
 
-# ---- 3. conversation list ----------------------------------------------------------------------------------------------------
-echo "== 3. conversation list"
-tap_word "Chats" 1 3; shot 07_convs
-check "conversation list asked over the mobile route" "$(wait_log '"path": "/api/m/chats' 10 | awk '{print ($1>0)?"yes":"no"}')" yes
-check "list shows a chat" "$(OCR_TRIES=10 wait_ocr 07_convs 'hello\|worker\|hi')" 1
+# ---- 3. sidebar (the conversation list: hamburger in the chat header) -----------------------------------------------------
+echo "== 3. sidebar"
+open_sidebar; shot 07_sidebar
+check "the sidebar opens (brand + Workers tab)" "$(OCR_TRIES=10 wait_ocr 07_sidebar 'Workers')" 1
+check "sidebar asked the conversation list over the mobile route" "$(wait_log '"path": "/api/m/chats' 10 | awk '{print ($1>0)?"yes":"no"}')" yes
+check "sidebar lists a chat" "$(OCR_TRIES=10 wait_ocr 07_sidebar 'worker')" 1
+type_into "suchen" "two"; shot 07b_search
+check "search filters: 'worker two' stays" "$(ocr 07b_search | grep -ci 'two')" 1
+check "search filters: 'worker one' is gone" "$(ocr 07b_search | grep -ci 'one')" 0
+for _ in 1 2 3 4 5; do $ADB shell input keyevent KEYCODE_DEL; done; sleep 1; shot 07c_search_cleared
+tap_word "Workers" 1 2; shot 07d_workers
+check "Workers segment lists the workers" "$(OCR_TRIES=8 wait_ocr 07d_workers 'worker')" 1
+tap_word "Chats" 1 2
+# collapse the group of the chats and open it again (the group header is a word like HEUTE / AELTER, taken by OCR)
+GH=$(ocr 07c_search_cleared | grep -oiE 'AKTIV|HEUTE|GESTERN|LTER|WOCHE|TAGE' | head -1)
+if [ -n "$GH" ]; then tap_word "$GH" 1 2; shot 07e_collapsed
+    check "the group collapses (its chats vanish)" "$(ocr 07e_collapsed | grep -ci 'worker')" 0
+    tap_word "$GH" 1 2; shot 07f_expanded
+    check "the group expands again" "$(OCR_TRIES=8 wait_ocr 07f_expanded 'worker')" 1
+else note "no group header found by OCR"; fi
+tap_word "worker two" 1 3; shot 07g_picked
+check "choosing a chat closes the sidebar" "$(ocr 07g_picked | grep -ci 'Workers')" 0
+check "the chosen chat is open (history of c2)" "$(OCR_TRIES=15 wait_ocr 07g_picked 'second question\|second answer')" 1
 
 # ---- 4. photo upload ---------------------------------------------------------------------------------------------------------
 echo "== 4. photo upload"
-tap_word "Neu" 1 2
+open_sidebar; sidebar_new; shot 07h_new
+check "the sidebar plus opens a new chat (chat screen, sidebar closed)" "$(OCR_TRIES=10 wait_ocr 07h_new 'Standard\|Nachricht')" 1
 tap_plus
 tap_word "Foto|Photo" 1 4 # "+" shows the two choices (Photo / File)
 U=$(ui)
@@ -278,7 +301,7 @@ if sys.argv[3] != '-': ev['cid'] = sys.argv[3]  # '-' = an event without a chat 
 r = urllib.request.Request('http://127.0.0.1:$PORT/fake/push', json.dumps(ev).encode(), {'Content-Type': 'application/json'})
 print(urllib.request.urlopen(r).read().decode())" "$1" "$2" "${3:-c1}" >/dev/null; }
 sleep 8 # the first poll only learns the last event id
-tap_word "Neu" 1 2 # an empty chat: the history of the event's chat must show up after the tap
+open_sidebar; sidebar_new # an empty chat: the history of the event's chat must show up after the tap
 $ADB shell input keyevent KEYCODE_HOME; sleep 3
 check "the app is in the background" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 0
 push "Worker done" "Merge finished äö"
@@ -399,8 +422,8 @@ if n:
 
 # ---- 8. voice output without an engine -------------------------------------------------------------------------------------
 echo "== 8. voice output"
-tap_word "Sprache" 1 2; shot 10_voice
-check "Voice switch shows 'Sprache an'" "$(ocr_crop 10_voice 330 240 660 400 | grep -ci 'prache an')" 1
+tap_px 798 140 2; shot 10_voice # the speaker icon in the chat header (a44); its status text shows in the composer status line
+check "Voice switch shows 'Sprache an'" "$(ocr_crop 10_voice 150 $((COMP_Y * SH / 2340 - 45)) 900 $((COMP_Y * SH / 2340 + 45)) | grep -ci 'prache an')" 1
 send_text "voicetest"
 check "the app lives after a spoken answer" "$(OCR_TRIES=12 wait_ocr 11_say 'Hallo voicetest')" 1
 check "app alive after voice output" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
