@@ -10,6 +10,8 @@
 #
 # Output: /root/jarvis-android-builds/jarvis-<version>.apk (default). NEVER published: the Orient store (test channel) is
 # fed by hand by the boss (staged locally by tools/android/jarvis_release.sh). App id de.fleitec.jarvis, package org.fleitec.jarvis, update channel "test".
+# Launcher icon: examples/jarvis_android/res (adaptive + monochrome + legacy PNGs; regenerate with tools/android/gen_jarvis_icon.py);
+# --variant builds use the same icon.
 # Heavy: run through `/root/jarvis/bin/heavy bash tools/android/jarvis_build.sh`.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -54,5 +56,6 @@ bash "$ROOT/tools/android/build.sh" "$ROOT/examples/jarvis_android/main.fi" --na
     --permission android.permission.ACCESS_NETWORK_STATE \
     --permission android.permission.REQUEST_INSTALL_PACKAGES \
     --permission android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION \
-    --abi "$ABI" --install --push --pick --speech --tts --out "$APK"
+    --abi "$ABI" --install --push --pick --speech --tts \
+    --icon-res "$ROOT/examples/jarvis_android/res" --out "$APK"
 echo "built $APK (versionCode $VCODE, channel $FIRN_APP_CHANNEL)"
