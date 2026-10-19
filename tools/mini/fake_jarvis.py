@@ -147,7 +147,8 @@ def gen_messages(cid):
         if role == "assistant":
             txt += "\n>STATUS: status=done braucht_nutzer=\"\" naechster_schritt=\"ä\"" 
         m = {"role": role, "text": txt, "at": 1760000000000 + i * 1000}
-        if i == 3: m["images"] = [{"url": "/file/u1/%s/img.png" % cid}]
+        if i == 3: m["images"] = [{"url": "/img/u1/%s/pic.png" % cid}]
+        if i == 5: m["files"] = [{"name": "report.txt", "mime": "text/plain", "size": 2048, "url": "/file/u1/%s/report.txt" % cid}]
         msgs.append(m)
     return msgs
 
@@ -262,7 +263,7 @@ def rest(method, rawpath, hdr, body):
     if not (path in ("/api/me", "/api/projects", "/api/command-center", "/api/conversations", "/api/tasks",
                      "/api/remote/devices", "/api/push-token", "/api/stt", "/api/m/upload")
             or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
-            or path.startswith("/vendor/fonts/")):
+            or path.startswith("/vendor/fonts/") or path.startswith("/img/")):
         return None
     jtype = hdr.get("content-type")
     entry = {"type": "rest", "method": method, "path": rawpath, "ctype": jtype, "n": len(body)}
@@ -457,6 +458,13 @@ def rest(method, rawpath, hdr, body):
         import hashlib  # the proof for the file picker check: what the server GOT (name, mime, size, sha256 of the octets)
         LOG.write(json.dumps({"type": "upload_body", "name": name, "mime": q.get("mime", [jtype])[0], "size": len(body), "sha256": hashlib.sha256(body).hexdigest()}) + "\n")
         return out(200, {"file": {"name": name, "size": len(body), "mime": jtype, "url": "/file/u1/%s/%s" % (q.get("cid", ["c0"])[0], quote(disk)), "path": "/srv/uploads/u1/%s/%s" % (q.get("cid", ["mobile"])[0], disk)}})
+    if path.startswith("/img/"):  # a PNG gradient (320x200), behind the login like the real /img/
+        import zlib, struct
+        w, h = 320, 200
+        raw = b"".join(b"\x00" + b"".join(bytes((x * 255 // w, y * 255 // h, 160)) for x in range(w)) for y in range(h))
+        def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+        png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+        return (200, png, "image/png")
     if path.startswith("/file/"):
         disk = unquote(path.split("/")[-1])
         if disk not in FILES:

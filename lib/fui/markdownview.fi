@@ -91,7 +91,7 @@ import highlight.highlight
 
 export {
     MdView, ImgInfo, mdv_new, mdv_free, mdv_set_markdown, mdv_set_base_size,
-    mdv_set_link_cb, mdv_set_image_cb, mdv_set_rect, mdv_set_pad,
+    mdv_set_link_cb, mdv_set_image_cb, mdv_set_image_tap_cb, mdv_set_rect, mdv_set_pad,
     mdv_set_background, mdv_set_bubble, mdv_set_bubble_end, mdv_set_meta_h6, mdv_invalidate, mdv_paint, mdv_layout,
     mdv_wheel, mdv_key, mdv_pointer_move, mdv_pointer_down, mdv_pointer_up,
     mdv_pointer_leave, mdv_link_count, mdv_link_url, mdv_hover_link,
@@ -219,6 +219,9 @@ struct MdView {
     img_ud: u64,
     img_cb: fn(u64, u64, usize, *mut ImgInfo) -> u32,
     has_img_cb: bool,
+    imgtap_ud: u64,
+    imgtap_cb: fn(u64, u64, usize, u32),
+    has_imgtap_cb: bool,
     drag_bar: bool,
     // syntax highlighting of fenced code (lib/highlight): on by default
     hl: highlight.Highlighter,
@@ -247,6 +250,9 @@ fn clip_none(p: u64, n: usize) -> bool {
     return false
 }
 
+fn cb_imgtap_none(ud: u64, p: u64, n: usize, st: u32) {
+}
+
 fn cb_img_none(ud: u64, p: u64, n: usize, info: *mut ImgInfo) -> u32 {
     return IMG_PENDING
 }
@@ -259,7 +265,8 @@ fn mdv_new() -> MdView {
         base_pt: 15, pad_pt: 12, bg_tok: NIL, lay_w: 0.0, lay_scale: 0,
         total_h: 0.0, dirty: true, hover: NIL, press: NIL,
         link_ud: 0, link_cb: cb_link_none, has_link_cb: false,
-        img_ud: 0, img_cb: cb_img_none, has_img_cb: false, drag_bar: false,
+        img_ud: 0, img_cb: cb_img_none, has_img_cb: false,
+        imgtap_ud: 0, imgtap_cb: cb_imgtap_none, has_imgtap_cb: false, drag_bar: false,
         hl: highlight.hl_new(), hl_on: true, hl_spans: vec_new[highlight.HlSpan](),
         sel_on: false, sa_item: 0, sa_off: 0, sf_item: 0, sf_off: 0, sel_drag: false, now_ms: 0,
         last_down_ms: -100000, last_x: 0.0, last_y: 0.0, clicks: 0 as u32, clip_write: clip_none, has_clip: false,
@@ -419,6 +426,14 @@ fn mdv_set_image_cb(v: *mut MdView, ud: u64, f: fn(u64, u64, usize, *mut ImgInfo
 }
 
 // Pictures arrived (or went away): lay out again, keep the scroll position.
+// A tap on a picture that is no link: f(ud, url_ptr, url_len, state) with state IMG_READY / IMG_PENDING / IMG_FAILED
+// (the url is valid during the call only). A chat app opens its full-screen viewer there.
+fn mdv_set_image_tap_cb(v: *mut MdView, ud: u64, f: fn(u64, u64, usize, u32)) {
+    (*v).imgtap_ud = ud
+    (*v).imgtap_cb = f
+    (*v).has_imgtap_cb = true
+}
+
 fn mdv_invalidate(v: *mut MdView) {
     (*v).dirty = true
 }
@@ -908,6 +923,10 @@ fn flow_image(l: *mut L, n: u32, flags: u32, size: f64, link: u32) {
     it.off = alt_off
     it.n = alt_n as u32
     it.extra = (st as i64)
+    // the url (for mdv_set_image_tap_cb): offset in the pool in `tok`, length in `radius`
+    it.tok = rt.buf_len(&(*v).vpool) as u32
+    it.radius = u.n as f64
+    rt.buf_push_bytes(&(*v).vpool, u.p, u.n)
     if ready {
         // keep the pixel description in the view's pool: 5 words (the last: the animation)
         it.extra = 100
@@ -2365,11 +2384,34 @@ fn mdv_touch_fling(v: *mut MdView, vx_per_s: f64, vy_per_s: f64, now_ms: i64) {
     viewport.viewport_fling_friction(&(*v).vp, (0.0 - vx_per_s) / 1000.0, (0.0 - vy_per_s) / 1000.0, now_ms)
 }
 
+// A picture without a link under a window point: the image-tap callback runs.
+fn image_tap(v: *mut MdView, x: f64, y: f64) -> bool {
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    if !viewport.viewport_hit(&(*v).vp, x, y, &cx, &cy) { return false }
+    let n: usize = vec_len[Item](&(*v).items)
+    var i: usize = 0
+    while i < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+        if (*it).kind == IT_IMAGE && (*it).link == NIL && (*it).radius > 0.0
+            && cx >= (*it).x && cx < (*it).x + (*it).w && cy >= (*it).y && cy < (*it).y + (*it).h {
+            var st: u32 = IMG_PENDING
+            if (*it).extra == 100 as i64 { st = IMG_READY } else if (*it).extra == 2 as i64 { st = IMG_FAILED }
+            let f: fn(u64, u64, usize, u32) = (*v).imgtap_cb
+            f((*v).imgtap_ud, rt.buf_ptr(&(*v).vpool) + ((*it).tok as u64), (*it).radius as usize, st)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
 // A tap at a window point: a link under it is followed (the link callback runs); a tap
 // elsewhere clears the selection. True when a link was followed.
 fn mdv_touch_tap(v: *mut MdView, c: *mut render.Ctx, x: f64, y: f64) -> bool {
     let l: u32 = link_at(v, x, y)
     if l == NIL {
+        if (*v).has_imgtap_cb && image_tap(v, x, y) { return true }
         (*v).sel_on = false
         return false
     }
