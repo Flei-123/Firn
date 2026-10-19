@@ -45,6 +45,15 @@ seq = 0
 CONV["c1"] = [{"role": "user", "text": "hi", "at": "2026-10-17T18:00:00Z"}, {"role": "assistant", "text": "hello\n>STATUS: status=done", "at": "2026-10-17T18:00:05Z"}]
 
 CONV["c2"] = [{"role": "user", "text": "second question", "at": "2026-10-17T19:00:00Z"}, {"role": "assistant", "text": "second answer\n>STATUS: status=done", "at": "2026-10-17T19:00:05Z"}]
+if os.environ.get("FAKE_TOOLS") == "1":  # c1 history with tool steps (ok, failed, long output, no output stored)
+    _long = "\n".join("line %d of a long output" % k for k in range(1, 31))
+    CONV["c1"][1:1] = [
+        {"role": "tool", "text": "mcp__jarvis__run_parallel", "input": {"commands": ["ls /root", "df -h"]}, "result": {"ok": True, "text": _long, "images": []}, "at": 1760000000450},
+        {"role": "tool", "text": "mcp__jarvis__read_file", "input": {"path": "/root/jarvis/server.js"}, "result": {"ok": True, "text": "import express from 'express'\nconst app = express()\napp.listen(3000)", "images": []}, "at": 1760000000500},
+        {"role": "tool", "text": "mcp__jarvis__run_shell", "input": {"command": "cat /nonexistent/file"}, "result": {"ok": False, "text": "cat: /nonexistent/file: No such file or directory", "images": []}, "at": 1760000000600},
+                {"role": "tool", "text": "mcp__jarvis__list_devices", "input": {}, "at": 1760000000800},
+    ]
+    CONV["s1"] = CONV["c1"]  # the first chat of the FAKE_SIDEBAR list
 
 
 # ------------------------------------------------------------------ realistic data (shapes of the real server)
@@ -150,6 +159,19 @@ def gen_messages(cid):
         if i == 3: m["images"] = [{"url": "/img/u1/%s/pic.png" % cid}]
         if i == 5: m["files"] = [{"name": "report.txt", "mime": "text/plain", "size": 2048, "url": "/file/u1/%s/report.txt" % cid}]
         msgs.append(m)
+    if os.environ.get("FAKE_TOOLS") == "1" and len(msgs) >= 2:
+        # tool steps before the last answer: ok, failed, long output (the app's collapsible step groups)
+        long_out = "\n".join("line %d of a long output" % k for k in range(1, 31))
+        steps = [
+            {"role": "tool", "text": "mcp__jarvis__read_file", "input": {"path": "/root/jarvis/server.js"},
+             "result": {"ok": True, "text": "import express from 'express'\nconst app = express()\napp.listen(3000)", "images": []}, "at": 1760000000500},
+            {"role": "tool", "text": "mcp__jarvis__run_shell", "input": {"command": "cat /nonexistent/file"},
+             "result": {"ok": False, "text": "cat: /nonexistent/file: No such file or directory", "images": []}, "at": 1760000000600},
+            {"role": "tool", "text": "mcp__jarvis__run_parallel", "input": {"commands": ["ls /root", "df -h"]},
+             "result": {"ok": True, "text": long_out, "images": []}, "at": 1760000000700},
+            {"role": "tool", "text": "mcp__jarvis__list_devices", "input": {}, "at": 1760000000800},
+        ]
+        msgs[-1:-1] = steps
     return msgs
 
 def real_info(conn_no):
@@ -530,6 +552,16 @@ async def handler(ws):
                 await send(ws, {"type": "ask_request", "id": "a1", "cid": cid, "question": "Which?", "options": ["A", {"label": "B"}]})
                 r = json.loads(await ws.recv()); LOG.write(json.dumps(r) + "\n")
                 await send(ws, {"type": "token", "cid": cid, "content": "ans=%s" % r["answers"][0]})
+            elif text == "tools":  # live tool steps: ok, failed, long output
+                await send(ws, {"type": "tool", "cid": cid, "name": "mcp__jarvis__run_shell", "id": "t1", "input": {"command": "ls -la /root"}})
+                await asyncio.sleep(0.3)
+                await send(ws, {"type": "tool_result", "id": "t1", "ok": True, "text": "total 4\ndrwx------ 2 root root 4096 Oct 19 .\n", "images": []})
+                await send(ws, {"type": "tool", "cid": cid, "name": "mcp__jarvis__read_file", "id": "t2", "input": {"path": "/etc/nothing"}})
+                await asyncio.sleep(0.3)
+                await send(ws, {"type": "tool_result", "id": "t2", "ok": False, "text": "ENOENT: no such file", "images": []})
+                await send(ws, {"type": "tool", "cid": cid, "name": "mcp__jarvis__run_shell", "id": "t3", "input": {"command": "seq 1 25"}})
+                await send(ws, {"type": "tool_result", "id": "t3", "ok": True, "text": "\n".join(str(k) for k in range(1, 26)), "images": []})
+                await send(ws, {"type": "token", "cid": cid, "content": "Done: 3 steps.\n>STATUS: status=done"})
             elif text == "code":  # a fenced block + inline code: the monospace face (font slot 1) check
                 await send(ws, {"type": "token", "cid": cid, "content": "Run `ls -la` here:\n\n```sh\nfor f in *.fi; do echo \"$f\"; done\n```\n"})
             elif text == "file":

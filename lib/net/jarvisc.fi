@@ -53,6 +53,10 @@
 //                 labels one per line (arg 1 = a simple single choice you can answer with jc_answer)
 //   JE_ASK_END    the question went away           JE_FILE    text = file name
 //   JE_HIST       arg 1 = user, 0 = JARVIS, text (JARVIS: jc_id = "genMs,at")   JE_HIST_END  arg 1 = running, text = partial
+//   JE_TOOL       (also) jc_id = the call id, jc_options = its short argument (command / path / query ..., one line cut)
+//   JE_TOOL_RESULT  jc_id = the call id, jc_result = the output text, arg 1 = ok, 0 = error
+//   JE_HIST_TOOL  a tool step of the history: text = tool name, jc_options = short argument, jc_result = output (arg 1 ok,
+//                 0 error, 2 = no output stored)
 //   JE_HTTP_ERR   a history request failed; arg = status (401 = log in again,
 //                 404 = the chat is gone, the stored id is dropped)
 //
@@ -81,12 +85,12 @@ export {
     Jc,
     JE_LOGIN, JE_OPEN, JE_CLOSE, JE_NETERR, JE_TOKEN, JE_DONE, JE_TOOL, JE_THINKING,
     JE_CONVERSATION, JE_ERROR, JE_SYSTEM, JE_INFO, JE_USER, JE_CONFIRM, JE_ASK,
-    JE_ASK_END, JE_FILE, JE_HIST, JE_HIST_END, JE_HTTP_ERR, md_target, md_label,
+    JE_ASK_END, JE_FILE, JE_HIST, JE_HIST_END, JE_HTTP_ERR, JE_TOOL_RESULT, JE_HIST_TOOL, md_target, md_label,
     jc_new, jc_free, jc_set_base, jc_set_token, jc_has_token, jc_set_tz, jc_set_dev,
     jc_add_trust_pem, jc_login, jc_connect, jc_disconnect, jc_is_open,
     jc_send, jc_stop, jc_confirm, jc_answer, jc_history, jc_new_chat,
     jc_set_system_trust, jc_net_layer, jc_net_tls, jc_net_verify, jc_net_layer_name,
-    jc_text, jc_id, jc_options, jc_cid, jc_set_cid, jc_ws_status, jc_user, jc_set_user, jc_user_from_json, jc_token, jc_base,
+    jc_text, jc_id, jc_options, jc_result, jc_cid, jc_set_cid, jc_ws_status, jc_user, jc_set_user, jc_user_from_json, jc_token, jc_base,
     jc_save, jc_restore, jc_forget, jc_clean,
 }
 
@@ -110,6 +114,8 @@ const JE_FILE: u32 = 17
 const JE_HIST: u32 = 18
 const JE_HIST_END: u32 = 19
 const JE_HTTP_ERR: u32 = 20
+const JE_TOOL_RESULT: u32 = 21
+const JE_HIST_TOOL: u32 = 22
 
 const COOKIE_NAME: str = "fleitec_session"
 
@@ -128,7 +134,8 @@ struct Jc {
     last_sent: rt.Buf,
     text: rt.Buf, // the payload of the event being delivered
     id: rt.Buf, // id of the open confirm / ask
-    opts: rt.Buf, // options of the open ask, one per line
+    opts: rt.Buf, // options of the open ask, one per line (JE_TOOL / JE_HIST_TOOL: the short argument of the call)
+    res: rt.Buf, // JE_TOOL_RESULT / JE_HIST_TOOL: the result text of a tool call
     outq: rt.Buf, // [u32 len][bytes] ... messages written while the socket is down
     req_url: rt.Buf,
     req_body: rt.Buf,
@@ -159,7 +166,7 @@ fn jc_new(l: *mut loop.Loop, cb: fn(*mut Jc, u64, u32, i64), ud: u64) -> *mut Jc
     *c = Jc { l: l, cb: cb, ud: ud, ah: ahttp.aclient_new(), ws: 0 as *mut wsc.WsClient,
         base: rt.buf_new(), token: rt.buf_new(), user: rt.buf_new(), cid: rt.buf_new(),
         tz: rt.buf_new(), dev: rt.buf_new(), last_sent: rt.buf_new(), text: rt.buf_new(),
-        id: rt.buf_new(), opts: rt.buf_new(), outq: rt.buf_new(), req_url: rt.buf_new(),
+        id: rt.buf_new(), opts: rt.buf_new(), res: rt.buf_new(), outq: rt.buf_new(), req_url: rt.buf_new(),
         req_body: rt.buf_new(), net_layer: 0, net_tls: 0, net_verify: 0, no_sys: false, busy_login: false, busy_hist: false, started: false, seq: 0 }
     if !ahttp.aclient_init(&(*c).ah, l) {
         jc_obj_free[Jc](p)
@@ -188,6 +195,7 @@ fn jc_free(c: *mut Jc) {
     rt.buf_free(&(*c).text)
     rt.buf_free(&(*c).id)
     rt.buf_free(&(*c).opts)
+    rt.buf_free(&(*c).res)
     rt.buf_free(&(*c).outq)
     rt.buf_free(&(*c).req_url)
     rt.buf_free(&(*c).req_body)
@@ -279,6 +287,7 @@ fn emit_span(c: *mut Jc, kind: u32, s: str.Span, arg: i64) {
 fn jc_text(c: *mut Jc) -> str { return as_str(&(*c).text) }
 fn jc_id(c: *mut Jc) -> str { return as_str(&(*c).id) }
 fn jc_options(c: *mut Jc) -> str { return as_str(&(*c).opts) }
+fn jc_result(c: *mut Jc) -> str { return as_str(&(*c).res) }
 fn jc_cid(c: *mut Jc) -> str { return as_str(&(*c).cid) }
 fn jc_user(c: *mut Jc) -> str { return as_str(&(*c).user) }
 
@@ -647,6 +656,90 @@ fn jget_num(d: *mut json.Json, obj: u32, name: str) -> i64 {
     return f as i64
 }
 
+// the string value of `name` in object `o`, or empty when it is no string
+fn jget_text(d: *mut json.Json, o: u32, name: str) -> str.Span {
+    let n: u32 = json.json_get(d, o, name.p as u64, name.n)
+    if n == json.JSON_NONE || json.json_kind(d, n) != json.JSON_STRING {
+        return str.span_empty()
+    }
+    return json.json_string(d, n)
+}
+
+// The short argument of a tool call (what the web app's step shows): the first of command / path / query / ... in the
+// input object, cut to ARG_MAX bytes (not inside a UTF-8 sequence), lands in (*c).opts. `commands` (run_parallel) = first + " (+N)".
+const ARG_MAX: usize = 160
+fn arg_key(k: usize) -> str {
+    if k == 0 { return "command" }
+    if k == 1 { return "path" }
+    if k == 2 { return "query" }
+    if k == 3 { return "url" }
+    if k == 4 { return "action" }
+    if k == 5 { return "text" }
+    if k == 6 { return "message" }
+    if k == 7 { return "host" }
+    if k == 8 { return "name" }
+    if k == 9 { return "title" }
+    if k == 10 { return "goal" }
+    if k == 11 { return "server" }
+    if k == 12 { return "source" }
+    if k == 13 { return "prompt" }
+    return "code"
+}
+fn tool_arg(c: *mut Jc, d: *mut json.Json, inp: u32) {
+    rt.buf_clear(&(*c).opts)
+    if inp == json.JSON_NONE || json.json_kind(d, inp) != json.JSON_OBJECT { return }
+    var s: str.Span = str.span_empty()
+    var k: usize = 0
+    while k < 15 && s.n == 0 {
+        s = jget_text(d, inp, arg_key(k))
+        k = k + 1
+    }
+    var extra: usize = 0
+    if s.n == 0 {
+        let cn: u32 = json.json_get(d, inp, "commands".p as u64, 8)
+        if cn != json.JSON_NONE && json.json_kind(d, cn) == json.JSON_ARRAY {
+            let f: u32 = json.json_child(d, cn)
+            if f != json.JSON_NONE && json.json_kind(d, f) == json.JSON_STRING { s = json.json_string(d, f) }
+            let cnt: usize = json.json_count(d, cn)
+            if cnt > 1 { extra = cnt - 1 }
+        }
+    }
+    if s.n == 0 { return }
+    var n: usize = s.n
+    if n > ARG_MAX {
+        n = ARG_MAX
+        while n > 0 && (rt.ld8(s.p as u64, n) & 192 as u8) == 128 as u8 { n = n - 1 }
+    }
+    rt.buf_push_bytes(&(*c).opts, s.p as u64, n)
+    if n < s.n { put(&(*c).opts, "...") }
+    if extra > 0 {
+        put(&(*c).opts, " (+")
+        var dg: [u8; 20] = [0; 20]
+        var m: usize = extra
+        var len: usize = 0
+        while m > 0 { dg[len] = (48 + m % 10) as u8; len = len + 1; m = m / 10 }
+        while len > 0 { len = len - 1; rt.buf_push_bytes(&(*c).opts, (&dg[len]) as u64, 1) }
+        put(&(*c).opts, ")")
+    }
+}
+
+// a message with role "tool" of the history: name (text), input, result {ok, text}
+fn hist_tool(c: *mut Jc, d: *mut json.Json, e: u32, name: str.Span) {
+    if name.n == 0 { return }
+    tool_arg(c, d, json.json_get(d, e, "input".p as u64, 5))
+    rt.buf_clear(&(*c).res)
+    var okf: i64 = 2
+    let r: u32 = json.json_get(d, e, "result".p as u64, 6)
+    if r != json.JSON_NONE && json.json_kind(d, r) == json.JSON_OBJECT {
+        okf = 1
+        let rt2: str.Span = jget_text(d, r, "text")
+        rt.buf_push_bytes(&(*c).res, rt2.p as u64, rt2.n)
+        let okn: u32 = json.json_get(d, r, "ok".p as u64, 2)
+        if okn != json.JSON_NONE && json.json_kind(d, okn) == json.JSON_FALSE { okf = 0 }
+    }
+    emit_span(c, JE_HIST_TOOL, tool_short(name), okf)
+}
+
 // "mcp__server__tool" -> "tool"
 fn tool_short(s: str.Span) -> str.Span {
     if s.n > 5 && rt.mem_eq(s.p as u64, "mcp__".p as u64, 5) {
@@ -781,7 +874,22 @@ fn handle(c: *mut Jc, p: u64, n: usize) {
         } else if span_is(ty, "thinking") {
             emit(c, JE_THINKING, "", 0)
         } else if span_is(ty, "tool") {
+            let tid: str.Span = jget_str(&d, o, "id")
+            rt.buf_clear(&(*c).id)
+            rt.buf_push_bytes(&(*c).id, tid.p as u64, tid.n)
+            tool_arg(c, &d, json.json_get(&d, o, "input".p as u64, 5))
             emit_span(c, JE_TOOL, tool_short(jget_str(&d, o, "name")), 0)
+        } else if span_is(ty, "tool_result") {
+            let rid: str.Span = jget_str(&d, o, "id")
+            rt.buf_clear(&(*c).id)
+            rt.buf_push_bytes(&(*c).id, rid.p as u64, rid.n)
+            let rt2: str.Span = jget_str(&d, o, "text")
+            rt.buf_clear(&(*c).res)
+            rt.buf_push_bytes(&(*c).res, rt2.p as u64, rt2.n)
+            var okf: i64 = 1
+            let okn: u32 = json.json_get(&d, o, "ok".p as u64, 2)
+            if okn != json.JSON_NONE && json.json_kind(&d, okn) == json.JSON_FALSE { okf = 0 }
+            emit(c, JE_TOOL_RESULT, "", okf)
         } else if span_is(ty, "token") {
             emit_span(c, JE_TOKEN, jget_str(&d, o, "content"), 0)
         } else if span_is(ty, "done") {
@@ -1105,6 +1213,8 @@ fn on_hist(r: *mut ahttp.Request, ud: u64) {
                 hist_media(&d, e, &extra)
                 if span_is(role, "user") {
                     emit_hist(c, t, &extra, 1)
+                } else if span_is(role, "tool") {
+                    hist_tool(c, &d, e, t)
                 } else if !(span_is(role, "tool") || span_is(role, "thinking") || span_is(role, "sys")
                     || span_is(role, "reminder") || span_is(role, "file") || span_is(role, "ask")) && (t.n > 0 || extra.len > 0) {
                     // jc_id() of an answer: "<genMs>,<at>" (epoch ms; 0 = the server did not store it)
