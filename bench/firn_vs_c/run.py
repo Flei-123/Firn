@@ -19,6 +19,11 @@ ONLY = [x for x in os.environ.get("ONLY", "").split(",") if x]
 OUT = os.environ.get("OUT", os.path.join(HERE, "results.json"))
 TIMEOUT = int(os.environ.get("BENCH_TIMEOUT", "120"))
 
+ARCH = os.environ.get("ARCH", "x86_64")  # x86_64 | aarch64 (qemu-user time: a proxy for instruction count)
+QEMU = ["qemu-aarch64"] if ARCH == "aarch64" else []
+WARM = 1 if ARCH == "x86_64" else 0
+JOBS = int(os.environ.get("JOBS", "1" if ARCH == "x86_64" else "6"))
+
 COLS = [
     ("firn_fast", "Firn release-fast", "firn", ["--opt-level=release-fast"]),
     ("firn_safe", "Firn release-safe", "firn", ["--opt-level=release-safe"]),
@@ -27,41 +32,34 @@ COLS = [
     ("gcc_o3", "gcc -O3", "gcc", ["-O3", "-march=x86-64"]),
     ("clang_o2", "clang -O2", "clang", ["-O2"]),
 ]
+if ARCH == "aarch64":
+    COLS = [c for c in COLS if c[2] != "clang"]
 
 
 def build(kind, flags, src, out):
     if kind == "firn":
-        cmd = [FIRNC] + flags + [src, "-o", out]
+        cmd = [FIRNC] + flags + (["--target=aarch64-linux"] if ARCH == "aarch64" else []) + [src, "-o", out]
     elif kind == "gcc":
-        cmd = ["gcc"] + flags + ["-fno-strict-aliasing", src, "-o", out, "-lm"]
+        cmd = (["aarch64-linux-gnu-gcc", "-static"] if ARCH == "aarch64" else ["gcc"]) + [f for f in flags if not (ARCH == "aarch64" and f.startswith("-march"))] + ["-fno-strict-aliasing", "-ffp-contract=off", src, "-o", out, "-lm"]
     else:
-        cmd = ["clang"] + flags + ["-fno-strict-aliasing", src, "-o", out, "-lm"]
+        cmd = ["clang"] + flags + ["-fno-strict-aliasing", "-ffp-contract=off", src, "-o", out, "-lm"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     return r.returncode == 0, (r.stderr or r.stdout)[-300:]
 
 
-def run_once(binary):
-    t0 = time.perf_counter()
-    p = subprocess.Popen([binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    try:
-        out, _ = p.communicate(timeout=TIMEOUT)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        return None, "TIMEOUT"
-    wall = time.perf_counter() - t0
-    return wall, out.decode().strip()
-
-
 def run_cpu(binary):
-    # fork+exec via resource usage of children
-    import resource
-    before = resource.getrusage(resource.RUSAGE_CHILDREN)
-    wall, out = run_once(binary)
-    after = resource.getrusage(resource.RUSAGE_CHILDREN)
-    if wall is None:
-        return None, out
-    cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
-    return cpu, out
+    """user+sys CPU seconds of ONE child (wait4 rusage: safe with parallel jobs)."""
+    import threading
+    p = subprocess.Popen(QEMU + [binary], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    timer = threading.Timer(TIMEOUT, p.kill)
+    timer.start()
+    out = p.stdout.read()
+    _, status, ru = os.wait4(p.pid, 0)
+    timer.cancel()
+    p.returncode = 0  # reaped by wait4
+    if os.WIFSIGNALED(status):
+        return None, "KILLED/TIMEOUT"
+    return ru.ru_utime + ru.ru_stime, out.decode().strip()
 
 
 def main():
@@ -70,47 +68,51 @@ def main():
     if ONLY:
         names = [n for n in names if n in ONLY]
     work = tempfile.mkdtemp(prefix="firnvsc.")
-    res = {"runs": RUNS, "cpu": open("/proc/cpuinfo").read().split("model name")[1].split(":")[1].split("\n")[0].strip(),
+    res = {"arch": ARCH, "runs": RUNS, "cpu": open("/proc/cpuinfo").read().split("model name")[1].split(":")[1].split("\n")[0].strip(),
            "firnc": subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip(),
            "gcc": subprocess.run(["gcc", "-dumpfullversion"], capture_output=True, text=True).stdout.strip(),
            "load": open("/proc/loadavg").read().split()[:3], "benchmarks": {}}
-    try:
-        for n in names:
-            entry = {"sum": None, "t": {}, "err": {}}
-            sums = {}
-            bins = {}
-            for key, title, kind, flags in COLS:
-                src = os.path.join(HERE, "firn" if kind == "firn" else "c", n + (".fi" if kind == "firn" else ".c"))
-                out = os.path.join(work, n + "." + key)
-                ok, msg = build(kind, flags, src, out)
-                if not ok:
-                    entry["err"][key] = "build: " + msg
+    def one(n):
+        entry = {"sum": None, "t": {}, "err": {}}
+        sums = {}
+        bins = {}
+        for key, title, kind, flags in COLS:
+            src = os.path.join(HERE, "firn" if kind == "firn" else "c", n + (".fi" if kind == "firn" else ".c"))
+            out = os.path.join(work, n + "." + key)
+            ok, msg = build(kind, flags, src, out)
+            if not ok:
+                entry["err"][key] = "build: " + msg
+                continue
+            bins[key] = out
+        # interleave runs across columns to even out host noise
+        samples = {k: [] for k in bins}
+        for r in range(RUNS + WARM):
+            for k, b in bins.items():
+                cpu, out = run_cpu(b)
+                if cpu is None:
+                    entry["err"][k] = out
                     continue
-                bins[key] = out
-            # interleave runs across columns to even out host noise
-            samples = {k: [] for k in bins}
-            for r in range(RUNS + 1):
-                for k, b in bins.items():
-                    cpu, out = run_cpu(b)
-                    if cpu is None:
-                        entry["err"][k] = out
-                        continue
-                    sums.setdefault(k, out)
-                    if sums[k] != out:
-                        entry["err"][k] = "unstable output"
-                    if r > 0:
-                        samples[k].append(cpu)
-            vals = set(sums.values())
-            entry["sums"] = sums
-            if len(vals) == 1:
-                entry["sum"] = vals.pop()
-            else:
-                entry["err"]["_"] = "MISMATCH %r" % sums
-            for k, s in samples.items():
-                if s and "_" not in entry["err"] and k not in entry["err"]:
-                    entry["t"][k] = {"median": statistics.median(s), "min": min(s), "max": max(s)}
-            res["benchmarks"][n] = entry
-            print(n, entry["sum"], {k: round(v["median"], 3) for k, v in entry["t"].items()}, entry["err"] or "", flush=True)
+                sums.setdefault(k, out)
+                if sums[k] != out:
+                    entry["err"][k] = "unstable output"
+                if r >= WARM:
+                    samples[k].append(cpu)
+        vals = set(sums.values())
+        entry["sums"] = sums
+        if len(vals) == 1:
+            entry["sum"] = vals.pop()
+        else:
+            entry["err"]["_"] = "MISMATCH %r" % sums
+        for k, s in samples.items():
+            if s and "_" not in entry["err"] and k not in entry["err"]:
+                entry["t"][k] = {"median": statistics.median(s), "min": min(s), "max": max(s)}
+        return n, entry
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        with ThreadPoolExecutor(max_workers=JOBS) as ex:
+            for n, entry in ex.map(one, names):
+                res["benchmarks"][n] = entry
+                print(n, entry["sum"], {k: round(v["median"], 3) for k, v in entry["t"].items()}, entry["err"] or "", flush=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     with open(OUT, "w") as f:
