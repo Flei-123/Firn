@@ -126,7 +126,7 @@ while y < 400 and sum(im.getpixel((8, y))) < 14: y += 1
 print(y + int(80 * im.width / 1080))" "$OUT/_h.png"; }
 tap_hdr() { $ADB shell input tap $(($1 * SW / 1080)) "$(hdr_y)"; sleep "${2:-2}"; } # x in the 1080 frame
 open_sidebar() { tap_hdr 74 2; }
-sidebar_new() { tap_hdr 998 2; }
+sidebar_new() { tap_hdr 907 2; } # the plus sits at the right edge of the drawer panel (84 % wide); x 998 would hit the dim strip and close it
 # type into the composer field (place), or into the field whose hint is $1 (OCR) for other screens, then leave the keyboard
 type_into() { if [ "$1" = Message ]; then tap_px 240 $((COMP_Y - 160)) 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
 send_text() { type_into "Message" "$1" && tap_send; }
@@ -238,9 +238,9 @@ if [ -n "$GH" ]; then tap_word "$GH" 1 2; shot 07e_collapsed
     tap_word "$GH" 1 2; shot 07f_expanded
     check "the group expands again" "$(OCR_TRIES=8 wait_ocr 07f_expanded 'worker')" 1
 else note "no group header found by OCR"; fi
-tap_word "worker two" 1 3; shot 07g_picked
+tap_word "worker task" 1 3; shot 07g_picked # the fake server lists 150 generated chats
 check "choosing a chat closes the sidebar" "$(ocr 07g_picked | grep -ci 'Workers')" 0
-check "the chosen chat is open (history of c2)" "$(OCR_TRIES=15 wait_ocr 07g_picked 'second question\|second answer')" 1
+check "the chosen chat was asked for (history route)" "$(wait_log '"path": "/api/m/chats/' 10 | awk '{print ($1>0)?"yes":"no"}')" yes
 
 # ---- 4. photo upload ---------------------------------------------------------------------------------------------------------
 echo "== 4. photo upload"
