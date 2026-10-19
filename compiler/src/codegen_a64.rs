@@ -1855,6 +1855,26 @@ fn emit_inst(
         // them; the check itself computes at the type's own width.
         Op::CheckedBin { op, a, b, msg } => {
             let d = i.dst.ok_or("internal error: checked binary operation without target")?;
+            // r850: 64-bit add/sub with everything in registers: `adds rd, ra, rb|#imm`, nothing else on the hot path
+            if ty.bits() == 64 && matches!(op, crate::fir::BinOp::Add | crate::fir::BinOp::Sub) && std::env::var_os("FIRN_A64_NO_DIRECT").is_none() {
+                if let (Some(rd), Some(ra)) = (fr.ra.reg(d), fr.ra.reg(*a)) {
+                    let rhs = if let Some(c) = fr.ra.imm(*b) {
+                        let c = widen_const(c, ty, 64);
+                        if (0..=4095).contains(&c) {
+                            Some(crate::panic_rt_a64::Rhs::Imm(c as u64))
+                        } else {
+                            None
+                        }
+                    } else {
+                        fr.ra.reg(*b).map(crate::panic_rt_a64::Rhs::Reg)
+                    };
+                    if let Some(rhs) = rhs {
+                        if crate::panic_rt_a64::emit_checked_addsub_direct(e, *op, ty, msg, site, rd, ra, rhs) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             load_ext(e, fr, A, *a, ty, 64);
             load_ext(e, fr, B, *b, ty, 64);
             crate::panic_rt_a64::emit_checked_bin(e, *op, ty, msg, site);

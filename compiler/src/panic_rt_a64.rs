@@ -375,6 +375,82 @@ pub(crate) fn emit_checked_bin(
     e.raw(&format!("{}:", ok));
 }
 
+/// Right operand of `emit_checked_addsub_direct`: a register, or a constant that fits the 12-bit immediate.
+pub(crate) enum Rhs<'a> {
+    Reg(&'a str),
+    Imm(u64),
+}
+
+/// r850: checked 64-bit `+` / `-` straight on the registers of the operands: `adds rd, ra, rb|#imm` + `b.cc`, no copies
+/// through x9/x10 and no move of the result. The panic block recomputes the two originals (exact modulo 2^64): with
+/// `rd == ra` it is `a = res -/+ b`, with `rd == rb` it is `b = res - a` (add) or `b = a - res` (sub). Returns false
+/// without emitting anything when the registers do not allow it (`rd == ra == rb`).
+pub(crate) fn emit_checked_addsub_direct(
+    e: &mut Emitter,
+    op: BinOp,
+    ty: FTy,
+    msg: &str,
+    site: &mut SiteCounter,
+    rd: &str,
+    ra: &str,
+    rhs: Rhs,
+) -> bool {
+    if let Rhs::Reg(rb) = rhs {
+        if rd == ra && rd == rb {
+            return false;
+        }
+    }
+    let label = intern(msg);
+    let uid = site.next();
+    let ok = format!(".Lchkok{}", uid);
+    let bad = format!(".Lchksite{}", uid);
+    let mn = if op == BinOp::Add { "adds" } else { "subs" };
+    match rhs {
+        Rhs::Reg(rb) => e.line(&format!("{} {}, {}, {}", mn, rd, ra, rb)),
+        Rhs::Imm(c) => e.line(&format!("{} {}, {}, #{}", mn, rd, ra, c)),
+    }
+    let cond = if ty.signed() {
+        "vs"
+    } else if op == BinOp::Sub {
+        "cc"
+    } else {
+        "cs"
+    };
+    e.line(&format!("b.{} {}", cond, bad));
+    e.line(&format!("b {}", ok));
+    e.raw(&format!("{}:", bad));
+    let inv = if op == BinOp::Add { "sub" } else { "add" };
+    match rhs {
+        Rhs::Reg(rb) => {
+            if rd == ra {
+                e.line(&format!("{} x11, {}, {}", inv, rd, rb));
+                e.line(&format!("mov x13, {}", rb));
+            } else if rd == rb {
+                if op == BinOp::Add {
+                    e.line(&format!("sub x13, {}, {}", rd, ra));
+                } else {
+                    e.line(&format!("sub x13, {}, {}", ra, rd));
+                }
+                e.line(&format!("mov x11, {}", ra));
+            } else {
+                e.line(&format!("mov x11, {}", ra));
+                e.line(&format!("mov x13, {}", rb));
+            }
+        }
+        Rhs::Imm(c) => {
+            if rd == ra {
+                e.line(&format!("{} x11, {}, #{}", inv, rd, c));
+            } else {
+                e.line(&format!("mov x11, {}", ra));
+            }
+            e.line(&format!("movz x13, #{}", c));
+        }
+    }
+    trampoline_jump(e, panic_code_of(op), &label, msg.len(), "x11", "x13", !ty.signed());
+    e.raw(&format!("{}:", ok));
+    true
+}
+
 /// `x9` cut to `ty` and read back: differs from `x9` exactly when the
 /// value does not fit. Branches to `bad` in that case.
 fn range_check(e: &mut Emitter, ty: FTy, bad: &str) {
