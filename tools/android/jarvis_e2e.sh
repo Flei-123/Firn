@@ -244,7 +244,8 @@ if [ -n "$LP" ]; then
     set -- $LP; $ADB shell input swipe $1 $2 $1 $2 800; sleep 2; shot 07i_menu # a long press on a chat entry opens its menu page
     check "long press opens the entry menu (rename + delete)" "$(OCR_TRIES=8 wait_ocr 07i_menu 'Umbenennen')" 1 # english: ok
     tap_word "Umbenennen" 1 2; shot 07j_rename # english: ok
-    check "rename shows the title field + save" "$(OCR_TRIES=8 wait_ocr 07j_rename 'Speichern')" 1 # english: ok
+    check "rename shows the title field + cancel" "$(OCR_TRIES=8 wait_ocr 07j_rename 'Abbrechen')" 1 # english: ok
+    hide_kbd # the first Back would only close the keyboard
     $ADB shell input keyevent KEYCODE_BACK; sleep 2; shot 07k_back1
     check "Back leaves the rename step (menu page again, app still open)" "$(OCR_TRIES=8 wait_ocr 07k_back1 'L.schen')" 1 # english: ok
     $ADB shell input keyevent KEYCODE_BACK; sleep 2; shot 07l_back2
@@ -469,7 +470,7 @@ echo "== 8a. model dropdown and copy button"
 tap_hdr_dy() { $ADB shell input tap $(($1 * SW / 1080)) $(( $(hdr_y) + $2 * SW / 1080 )); sleep "${3:-1.5}"; } # x in the 1080 frame, dy in 1080-frame pixels below the header centre
 tap_hdr 400 2; shot 12_dropdown
 check "dropdown lists Haiku" "$(ocr 12_dropdown | grep -ci 'haiku')" 1
-check "dropdown lists the effort levels (Medium)" "$(ocr 12_dropdown | grep -ci 'medium')" 1
+check "dropdown lists the effort levels (Xhigh)" "$(ocr 12_dropdown | grep -ci 'xhigh')" 1
 tap_hdr_dy 540 380 2 # third model chip (Opus has effort levels, the panel stays open)
 tap_hdr_dy 422 561 2 # effort chip High: stored, the panel closes
 check "dropdown: the socket got '/model opus'" "$(wait_log '"text": "/model opus"' 10)" 1
