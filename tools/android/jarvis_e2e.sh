@@ -182,6 +182,15 @@ check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 
 send_text hello
 check "message 'hello' reached the server" "$(wait_log '"text": "hello"' 15 | awk '{print ($1>0)?"yes":"no"}')" yes
 check "streamed reply visible" "$(OCR_TRIES=15 wait_ocr 03_reply 'Hallo hello')" 1
+if [ -n "${E2E_COMPOSER:-}" ]; then # a52: the composer must be empty after "new chat" and after Send (no stale keyboard buffer)
+    echo "== 1b. composer buffer"
+    type_into "Message" "Otter"; shot 03b_typed
+    check "typed text shows in the composer" "$(ocr 03b_typed | grep -c 'Otter')" 1
+    open_sidebar; tap_hdr 951 3; shot 03c_after_new  # a52: UNVERIFIED x (plus of the a46 sidebar header ~ 951 in the 1080 frame; 907 missed it): check 03c shows the chat, not the drawer
+    check "composer is empty after a new chat" "$(ocr 03c_after_new | grep -c 'Otter')" 0
+    send_text "abc"
+    check "next message is exactly 'abc'" "$(wait_log '"text": "abc"' 15 | awk '{print ($1>0)?"yes":"no"}')" yes
+fi
 [ "${E2E_STOP:-}" = reply ] && { echo "stopped after the reply (E2E_STOP=reply): $PASS ok, $FAIL failed"; exit 0; }
 
 # ---- 2. Board: projects, a need answered; Tasks: add ---------------------------------------------------------------------
