@@ -48,12 +48,15 @@ CONV["c2"] = [{"role": "user", "text": "second question", "at": "2026-10-17T19:0
 if os.environ.get("FAKE_TOOLS") == "1":  # c1 history with tool steps (ok, failed, long output, no output stored)
     _long = "\n".join("line %d of a long output" % k for k in range(1, 31))
     CONV["c1"][1:1] = [
+        {"role": "assistant", "text": "Ich schaue kurz nach.", "at": 1760000000400},
         {"role": "tool", "text": "mcp__jarvis__run_parallel", "input": {"commands": ["ls /root", "df -h"]}, "result": {"ok": True, "text": _long, "images": []}, "at": 1760000000450},
         {"role": "tool", "text": "mcp__jarvis__read_file", "input": {"path": "/root/jarvis/server.js"}, "result": {"ok": True, "text": "import express from 'express'\nconst app = express()\napp.listen(3000)", "images": []}, "at": 1760000000500},
+        {"role": "assistant", "text": "Die Datei ist da, ich pruefe noch den Rest.", "at": 1760000000550},
         {"role": "tool", "text": "mcp__jarvis__run_shell", "input": {"command": "cat /nonexistent/file"}, "result": {"ok": False, "text": "cat: /nonexistent/file: No such file or directory", "images": []}, "at": 1760000000600},
                 {"role": "tool", "text": "mcp__jarvis__list_devices", "input": {}, "at": 1760000000800},
     ]
     CONV["s1"] = CONV["c1"]  # the first chat of the FAKE_SIDEBAR list
+    CONV["s2"] = CONV["c1"]
 
 
 # ------------------------------------------------------------------ realistic data (shapes of the real server)
@@ -631,9 +634,13 @@ async def handler(ws):
                 r = json.loads(await ws.recv()); LOG.write(json.dumps(r) + "\n")
                 await send(ws, {"type": "token", "cid": cid, "content": "ans=%s" % r["answers"][0]})
             elif text == "tools":  # live tool steps: ok, failed, long output
+                await send(ws, {"type": "token", "cid": cid, "content": "Ich schaue kurz nach. "})
+                await asyncio.sleep(0.2)
                 await send(ws, {"type": "tool", "cid": cid, "name": "mcp__jarvis__run_shell", "id": "t1", "input": {"command": "ls -la /root"}})
                 await asyncio.sleep(0.3)
                 await send(ws, {"type": "tool_result", "id": "t1", "ok": True, "text": "total 4\ndrwx------ 2 root root 4096 Oct 19 .\n", "images": []})
+                await send(ws, {"type": "token", "cid": cid, "content": "Zwischenstand: das erste Kommando lief."})
+                await asyncio.sleep(0.2)
                 await send(ws, {"type": "tool", "cid": cid, "name": "mcp__jarvis__read_file", "id": "t2", "input": {"path": "/etc/nothing"}})
                 await asyncio.sleep(0.3)
                 await send(ws, {"type": "tool_result", "id": "t2", "ok": False, "text": "ENOENT: no such file", "images": []})
