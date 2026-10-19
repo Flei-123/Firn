@@ -25,6 +25,7 @@ import fui.theme
 import fui.icons
 import fui.listrow
 import fui.event
+import fui.wave3
 import fui.markdownview
 import markdown.doc
 import net.jarvisc
@@ -99,8 +100,13 @@ static mut G_USE_PROV: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_USE_R5: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // ISO reset time of the 5 h window ("" = unknown)
 static mut G_USE_R7: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 const INFO_LINES: usize = 6
-static mut G_INFO: usize = 0 // the info panel under the header (answer details / usage details)
-static mut G_INFO_L: [usize; 6] = [0; 6]
+// the info panel (answer details / usage details) is DRAWN over the top of the chat view (paint_info): it takes no layout room, so
+// the composer and the usage strip never move when it opens
+static mut G_INFO_ON: bool = false
+static mut G_INFO_N: usize = 0
+static mut G_INFO_BUF: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_INFO_OFF: [usize; 6] = [0; 6]
+static mut G_INFO_LEN: [usize; 6] = [0; 6]
 static mut G_ANS_DUR: [i64; 512] = [0; 512] // per answer: run time (ms, 0 = unknown), time it finished (ms, 0 = unknown), model label (pool offset / length)
 static mut G_ANS_FIN: [i64; 512] = [0; 512]
 static mut G_ANS_MO: [usize; 512] = [0; 512]
@@ -298,6 +304,7 @@ fn draw_chat(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     G_AT_BOTTOM = markdownview.mdv_offset(v) + G_VIEW_H + render.len_of(c, 24) >= markdownview.mdv_content_height(v)
     paint_copy_icons(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_h(sc, n))
     if !G_AT_BOTTOM { paint_chip(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n)) }
+    if G_INFO_ON { paint_info(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n)) }
     if G_VIEW_ON { paint_viewer(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n), scene.node_h(sc, n)) }
 }
 
@@ -339,12 +346,18 @@ fn paint_viewer(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64) {
 
 // Android Back: closes the picture first (true = consumed)
 fn screen_chat_viewer_back() -> bool {
-    if !G_VIEW_ON { return false }
-    G_VIEW_ON = false
-    return true
+    if G_VIEW_ON {
+        G_VIEW_ON = false
+        return true
+    }
+    if G_INFO_ON {
+        G_INFO_ON = false
+        return true
+    }
+    return false
 }
 
-fn screen_chat_viewer_open() -> bool { return G_VIEW_ON }
+fn screen_chat_viewer_open() -> bool { return G_VIEW_ON || G_INFO_ON } // the info card counts: Back closes it first
 
 // composer position for the geom log line (keyboard diagnosis)
 fn screen_chat_geom(a: *mut app.App) -> str {
@@ -553,24 +566,87 @@ fn iso_ms(s: str) -> i64 {
 }
 
 fn info_clear(a: *mut app.App) {
-    var i: usize = 0
-    while i < INFO_LINES {
-        jshell.set_shown(a, G_INFO_L[i], false, 0)
-        i = i + 1
-    }
+    rt.buf_clear(&G_INFO_BUF)
+    G_INFO_N = 0
 }
 
 fn info_line(a: *mut app.App, i: usize, text: str) {
-    if i >= INFO_LINES { return }
-    app.set_text(a, G_INFO_L[i], text)
-    jshell.set_shown(a, G_INFO_L[i], true, 0)
+    if G_INFO_N >= INFO_LINES { return }
+    G_INFO_OFF[G_INFO_N] = G_INFO_BUF.len
+    G_INFO_LEN[G_INFO_N] = text.n
+    rt.buf_push_bytes(&G_INFO_BUF, text.p as u64, text.n)
+    G_INFO_N = G_INFO_N + 1
 }
 
-fn info_close(a: *mut app.App) { jshell.set_shown(a, G_INFO, false, 0) }
+fn info_close(a: *mut app.App) { G_INFO_ON = false }
 
 fn info_open(a: *mut app.App) {
     if G_DD_OPEN { dd_show(a, false) }
-    jshell.set_shown(a, G_INFO, true, 0)
+    G_INFO_ON = true
+}
+
+// the card and its close chip in window pixels (a41 overlay: the card hangs from the top edge of the chat view)
+fn info_rects(c: *mut render.Ctx, nx: f64, ny: f64, nw: f64, r: *mut [f64; 8]) {
+    let m: f64 = render.len_of(c, 8)
+    let pad: f64 = render.len_of(c, 12)
+    let title_h: f64 = render.len_of(c, 28)
+    let line_h: f64 = render.len_of(c, 22)
+    let chip_h: f64 = render.len_of(c, 40)
+    var h: f64 = pad + chip_h + pad + render.len_of(c, 8)
+    if G_INFO_N > 0 { h = h + title_h + line_h * ((G_INFO_N - 1) as f64) }
+    (*r)[0] = nx + m
+    (*r)[1] = ny + m
+    (*r)[2] = nw - m * 2.0
+    (*r)[3] = h
+    (*r)[4] = nx + m + pad
+    (*r)[5] = ny + m + h - pad - chip_h
+    (*r)[6] = render.len_of(c, 112)
+    (*r)[7] = chip_h
+}
+
+fn paint_info(c: *mut render.Ctx, nx: f64, ny: f64, nw: f64) {
+    var r: [f64; 8] = [0.0; 8]
+    info_rects(c, nx, ny, nw, &r)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let f: *mut theme.Colors = theme.theme_colors(render.ctx_theme(c))
+    let rad: f64 = render.len_of(c, 14)
+    let pad: f64 = render.len_of(c, 12)
+    painter.round_rect(z, r[0], r[1], r[2], r[3], rad, (*f).separator)
+    painter.round_rect(z, r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0, rad - 1.0, theme.opaque((*f).surface))
+    var y: f64 = r[1] + pad
+    var i: usize = 0
+    while i < G_INFO_N {
+        var lh: f64 = render.len_of(c, 22)
+        var px: usize = 13
+        var wt: u32 = 400 as u32
+        var fg: u32 = style.color_token(style.TOK_TEXT_MUTED)
+        if i == 0 {
+            lh = render.len_of(c, 28)
+            px = 17
+            wt = 600 as u32
+            fg = style.color_token(style.TOK_TEXT)
+        }
+        wave3.cell_text_weight(c, (G_INFO_BUF.ptr as u64) + G_INFO_OFF[i] as u64, G_INFO_LEN[i], r[0] + pad, y, r[2] - pad * 2.0, lh, fg, style.ALIGN_LEFT, px, wt)
+        y = y + lh
+        i = i + 1
+    }
+    let cr: f64 = r[7] * 0.5
+    painter.round_rect(z, r[4], r[5], r[6], r[7], cr, (*f).separator)
+    painter.round_rect(z, r[4] + 1.0, r[5] + 1.0, r[6] - 2.0, r[7] - 2.0, cr - 1.0, theme.opaque((*f).base))
+    let lbl: str = jtexts.t("info.close")
+    wave3.cell_text_weight(c, lbl.p as u64, lbl.n, r[4], r[5], r[6], r[7], style.color_token(style.TOK_TEXT), style.ALIGN_CENTER, 14, 400 as u32)
+}
+
+// a tap while the card is open: the close chip or anything outside the card closes it, a tap on the card itself does nothing
+fn info_tap(a: *mut app.App, tx: f64, ty: f64) {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let c: *mut render.Ctx = app.app_ctx(a)
+    var r: [f64; 8] = [0.0; 8]
+    info_rects(c, scene.node_x(sc, G_NODE), scene.node_y(sc, G_NODE), scene.node_w(sc, G_NODE), &r)
+    let m: f64 = render.len_of(c, 6)
+    let on_chip: bool = tx >= r[4] - m && tx <= r[4] + r[6] + m && ty >= r[5] - m && ty <= r[5] + r[7] + m
+    let on_card: bool = tx >= r[0] && tx <= r[0] + r[2] && ty >= r[1] && ty <= r[1] + r[3]
+    if on_chip || !on_card { G_INFO_ON = false }
 }
 
 // the details of answer i: duration, start and end, model, length (the API carries no token counts or costs)
@@ -726,6 +802,10 @@ fn on_touch(ud: u64, e: *mut event.Ev) -> u32 {
     if G_VIEW_ON {
         // the full-screen picture takes every gesture; a tap closes it
         if k == event.EV_TAP { G_VIEW_ON = false }
+        return event.H_STOP
+    }
+    if G_INFO_ON && k == event.EV_TAP {
+        info_tap(a, event.ev_x(e), event.ev_y(e))
         return event.H_STOP
     }
     if k == event.EV_PAN_MOVE {
@@ -957,6 +1037,7 @@ fn fit_pill(a: *mut app.App) {
 
 fn dd_show(a: *mut app.App, on: bool) {
     G_DD_OPEN = on
+    if on { G_INFO_ON = false }
     jshell.set_shown(a, G_DD, on, 0)
 }
 
@@ -1082,34 +1163,6 @@ fn build_dropdown(a: *mut app.App) {
     jshell.set_shown(a, G_EFF_ROW, false, 0)
     jshell.set_shown(a, dd, false, 0)
 }
-fn on_info_close(a: *mut app.App) { info_close(a) }
-
-// the info panel: a title line, up to 5 detail lines and a close button; hidden until a meta line / the usage strip is tapped
-fn build_info(a: *mut app.App) {
-    let sc: *mut scene.Scene = app.app_scene(a)
-    let col: usize = app.column(a)
-    G_INFO = col
-    scene.node_set_flex(sc, col, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
-    scene.node_set_gap(sc, col, 4, 4)
-    scene.node_set_padding(sc, col, 12, 10, 12, 10)
-    jshell.fill_stretch(a, col)
-    jtheme.style_node(a, col, jtheme.K_LIST)
-    var i: usize = 0
-    while i < INFO_LINES {
-        let l: usize = app.label(a, "", 0)
-        G_INFO_L[i] = l
-        applay.align_start(a, l)
-        if i == 0 { jtheme.style_node(a, l, jtheme.K_NAME) } else { jtheme.style_node(a, l, jtheme.K_DIM) }
-        i = i + 1
-    }
-    let x: usize = app.button(a, jtexts.t("info.close"), on_info_close)
-    jtheme.style_node(a, x, jtheme.K_CHIP)
-    applay.align_start(a, x)
-    app.end(a)
-    info_clear(a)
-    jshell.set_shown(a, col, false, 0)
-}
-
 fn on_sliders(a: *mut app.App) { jshell.request_tab(jshell.TAB_SETTINGS) }
 
 // the busy marker in the composer (an answer is being made)
@@ -1495,7 +1548,6 @@ fn screen_chat_build_header(a: *mut app.App) -> usize {
     app.end(a)
     let sep: usize = app.separator(a)
     build_dropdown(a)
-    build_info(a)
     app.end(a)
     return col
 }
@@ -1518,6 +1570,9 @@ fn screen_chat_build(a: *mut app.App) {
     jshell.set_shown(a, G_COPY, false, 0)
     G_NODE = app.custom(a, widget.KIND_TILE, 340, 300)
     jshell.fill(a, G_NODE)
+    // the chat view gives room first (shrink 1000, minimum 1 pt): when the header grows (model list) the composer and the usage
+    // strip stay at the bottom, only this view gets shorter
+    scene.node_set_flexitem(sc, G_NODE, 1, 1000, 1, 0)
     jtheme.style_node(a, G_NODE, jtheme.K_PLAIN)
     scene.node_set_draw(app.app_scene(a), G_NODE, 0, draw_chat)
     let b: bool = app.on(a, G_NODE, event.EV_PAN_ALL | event.ev_bit(event.EV_TAP) | event.ev_bit(event.EV_LONG_PRESS), on_touch)
