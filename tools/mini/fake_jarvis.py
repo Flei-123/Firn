@@ -396,12 +396,15 @@ def rest(method, rawpath, hdr, body):
             return out(200, {"devices": [{"name": "Dell", "type": "Windows", "online": True}, {"name": "Phone", "type": "Android", "online": False}]})
         if mp == "chats" and method == "GET":
             allc = all_chats()
+            if os.environ.get("FAKE_NO_FOLDERS"):  # an older server: no folders / folder / fav keys in the chat list
+                allc = [{k: v for k, v in c.items() if k not in ("folder", "fav")} for c in allc]
+            fkey = {} if os.environ.get("FAKE_NO_FOLDERS") else {"folders": FOLDERS}
             if not REAL:
-                return out(200, {"total": len(allc), "folders": FOLDERS, "chats": allc})
+                return out(200, dict({"total": len(allc), "chats": allc}, **fkey))
             lim = max(1, min(100, int(q.get("limit", ["30"])[0] or 30))); off = max(0, int(q.get("offset", ["0"])[0] or 0))
             qq = (q.get("q", [""])[0] or "").lower()
             if qq: allc = [c for c in allc if qq in str(c["title"] or "").lower()]
-            return out(200, {"total": len(allc), "folders": FOLDERS, "chats": allc[off:off + lim]})
+            return out(200, dict({"total": len(allc), "chats": allc[off:off + lim]}, **fkey))
         if mp.startswith("chats/") and method == "GET":
             cid = unquote(mp[len("chats/"):])
             row = next((c for c in all_chats() if c["id"] == cid), None)
@@ -419,6 +422,8 @@ def rest(method, rawpath, hdr, body):
                                       "running": False if not part else True, "partial": part, "beat": None},
                              "first": lo, "hasMore": lo > 0,
                              "messages": [dict(m, i=i, at=1760000000000 + i) for i, m in enumerate(msgs) if lo <= i < end]})
+        if os.environ.get("FAKE_NO_FOLDERS") and (mp.startswith("folders") or mp == "chats/move"):  # FAKE_NO_FOLDERS=1: older server, 404
+            return out(404, {"error": "Not found"})
         if mp == "folders" and method == "GET":
             return out(200, {"folders": FOLDERS})
         if mp in ("folders/add", "folders/rename", "folders/remove") and method == "POST":
