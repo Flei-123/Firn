@@ -460,12 +460,14 @@ const CHUNK_HEADER: u64 = 64
 const CHUNK_BYTES: u64 = 262144
 const CLASSES: u64 = 13
 const MARK_BYTES: u64 = 1048576
-// Default growth of the allocation budget between two runs: limit = live * 1 / 1,
-// i.e. the next run starts when as much has been allocated since as is alive.
-// A program that trades memory for speed raises it at run time with
-// `gc_set_growth` (Certus runs at 2/1: the collector share of a page load drops,
-// the heap peaks at about three times the live set instead of two).
-const GROW_NUM: u64 = 1
+// Default growth of the allocation budget between two runs: limit = live * 2 / 1,
+// i.e. the next run starts when twice as much has been allocated since as is
+// alive; the heap peaks at about three times the live set. W2 (binary_trees):
+// at 1/1 a program with a large long-lived structure re-marked it 60 times
+// (8.7 M marks for 8.6 M allocations, 65 % of all instructions); 2/1 cuts the
+// instruction count by 30 %, 3/1 by 42 %. Certus already ran at 2/1. A program
+// that is tight on memory lowers it at run time with `gc_set_growth(1, 1)`.
+const GROW_NUM: u64 = 2
 const GROW_DEN: u64 = 1
 const MIN_LIMIT: u64 = 1048576
 // The largest distance between two collection runs (in freshly allocated
@@ -947,6 +949,9 @@ fn gc_diag(i: u64) -> u64 {
     if i > 6 {
         return 0
     }
+    if i == 6 {
+        return gc_allok_n()
+    }
     return __gc_ld64(__gc_state() as u64 + S_D_CN_RUHE + i * 8)
 }
 
@@ -1360,9 +1365,10 @@ fn __gc_block_of(a: u64) -> u64 {
     let cc: u64 = (*((st + S_CHUNK_CACHE) as *mut u64))
     if cc != 0 {
         let data0: u64 = cc + CHUNK_HEADER
-        let end0: u64 = data0 + (*((cc + 16) as *mut u64)) * (*((cc + 24) as *mut u64))
+        let blk0: u64 = (*((cc + 16) as *mut u64))
+        let end0: u64 = data0 + blk0 * (*((cc + 24) as *mut u64))
         if a >= data0 && a < end0 {
-            return data0 + (a - data0) / (*((cc + 16) as *mut u64)) * (*((cc + 16) as *mut u64))
+            return data0 + (a - data0) / blk0 * blk0
         }
     }
     // r566: inside the last gap found empty -- no chunk, out in four instructions.
@@ -2369,6 +2375,7 @@ fn __gc_collect_now() -> u64 {
     __gc_st64(st + S_TSUM_START + 4 * 8, __gc_ld64(st + S_TSUM_START + 4 * 8) + duration)
     __gc_st64(st + S_TCNT_START + 4 * 8, __gc_ld64(st + S_TCNT_START + 4 * 8) + 1)
     __gc_st64(st + S_FULL, __gc_ld64(st + S_FULL) + 1)
+    __gc_st64(st + S_TOTAL, __gc_ld64(st + S_TOTAL) + __gc_ld64(st + S_SINCE))
     __gc_st64(st + S_SINCE, 0)
     // The next collection run when as much has been allocated since as is
     // alive (at least MIN_LIMIT) -- that keeps the consumption bounded.
@@ -2590,7 +2597,9 @@ fn gc_freed() -> u64 {
 }
 
 fn gc_allok_n() -> u64 {
-    return __gc_ld64(__gc_state() as u64 + S_D_ALLOK)
+    // W2: every allocation path bumps S_SERIES by exactly one, so it IS the
+    // allocation count (the separate diagnostic counter was dropped).
+    return __gc_ld64(__gc_state() as u64 + S_SERIES)
 }
 
 // Begin a cycle: the only atomic root work -- scan the registers and the
@@ -2637,6 +2646,7 @@ fn __gc_cycle_end() {
         limit = MAX_LIMIT
     }
     __gc_st64(st + S_LIMIT, limit)
+    __gc_st64(st + S_TOTAL, __gc_ld64(st + S_TOTAL) + __gc_ld64(st + S_SINCE))
     __gc_st64(st + S_SINCE, 0)
     __gc_st64(st + S_SCHRT, 0)
     __gc_st64(st + S_RUNS, __gc_ld64(st + S_RUNS) + 1)
@@ -2891,8 +2901,6 @@ fn __gc_alloc_fast(st: u64, tid: u64, size: u64) -> u64 {
     *((b +% 4) as *mut u32) = ((*((st +% S_PAR) as *mut u64)) & 4294967295) as u32
     *((b +% 8) as *mut u64) = series
     *((st +% S_SINCE) as *mut u64) = since0 +% step
-    *((st +% S_TOTAL) as *mut u64) = (*((st +% S_TOTAL) as *mut u64)) +% step
-    *((st +% S_D_ALLOK) as *mut u64) = (*((st +% S_D_ALLOK) as *mut u64)) +% 1
     return obj0
 }
 
@@ -3006,7 +3014,6 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
     // stack: the stack is not scanned again, otherwise an object that lives
     // only on the stack could be swept before it was ever attached to a heap
     // field. While idle: the current white.
-    __gc_diag_inc(S_D_ALLOK)
     if (*((st + S_PHASE) as *mut u64)) == 0 {
         *((b + 4) as *mut u32) = (*((st + S_PAR) as *mut u64)) as u32
     } else {
@@ -3025,7 +3032,6 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
     }
     let block: u64 = (*((st + S_BLOCKGROESSE) as *mut u64))
     *((st + S_SINCE) as *mut u64) = (*((st + S_SINCE) as *mut u64)) + block
-    *((st + S_TOTAL) as *mut u64) = (*((st + S_TOTAL) as *mut u64)) + block
     __gc_alloc_out(st)
     return obj as *mut u8
 }
@@ -3106,8 +3112,6 @@ fn __gc_alloc_local(st: u64, tid: u64, size: u64) -> u64 {
     }
     let block: u64 = HEADER + __gc_classes_bytes(class)
     __atomic_add((st + S_SINCE) as *mut u64, block)
-    __atomic_add((st + S_TOTAL) as *mut u64, block)
-    __gc_diag_inc(S_D_ALLOK)
     return obj
 }
 
@@ -4582,7 +4586,10 @@ fn gc_barriers() -> u64 {
 }
 
 fn gc_total_bytes() -> u64 {
-    return __gc_ld64(__gc_state() as u64 + S_TOTAL)
+    // W2: S_TOTAL holds the bytes of all finished runs; the open run is S_SINCE
+    // (the allocation paths only bump S_SINCE).
+    let st: u64 = __gc_state() as u64
+    return __gc_ld64(st + S_TOTAL) + __gc_ld64(st + S_SINCE)
 }
 
 // ==========================================================================

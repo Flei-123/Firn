@@ -1288,12 +1288,14 @@ pub(crate) const ST_SERIES: u64 = 104;
 /// `S_FREE` -- head of the free list, one word per size class.
 pub(crate) const ST_FREE: u64 = 168;
 /// `S_TOTAL` -- octets allocated in total.
+#[allow(dead_code)]
 pub(crate) const ST_TOTAL: u64 = 296;
 /// `S_PHASE` -- 0 = idle, 1 = marking, 2 = sweeping, 3 = winding up.
 pub(crate) const ST_PHASE: u64 = 320;
 /// `S_PAR` -- the current WHITE (0 or 2); a fresh object gets it while idle.
 pub(crate) const ST_PAR: u64 = 360;
 /// `S_D_ALLOK` -- the diagnostic counter of all allocations.
+#[allow(dead_code)]
 pub(crate) const ST_D_ALLOK: u64 = 1528;
 /// `S_MULTI` -- 1 as soon as there is (or was) more than one thread.
 pub(crate) const ST_MULTI: u64 = 1992;

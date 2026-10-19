@@ -114,7 +114,8 @@ pub(crate) fn hook_call(
 ///   [b]   = tid  (u32)                  the type id, a constant
 ///   [b+4] = [st+PAR] (u32)              the current white
 ///   [b+8] = ser
-///   [st+SINCE] += step ; [st+TOTAL] += step ; [st+D_ALLOK] += 1
+///   [st+SINCE] += step     (TOTAL = TOTAL_BASE + SINCE and the allocation
+///                           count = SERIES are derived by the readers)
 ///   p = b + 16
 /// slow:
 ///   p = call __gc_alloc_raw(tid, size)
@@ -208,19 +209,11 @@ fn alloc_fast(lo: &mut Lower, tid: u64, size: u64, slot: Val) -> Option<Val> {
         let ser_at = lo.ptradd_const(b, 8);
         lo.store(FTy::U64, ser_at, ser);
 
-        // the three counters
+        // the counter (TOTAL and the allocation count are derived: W2)
         let stepv = lo.constant(FTy::U64, step as i128);
         let since_a = lo.ptradd_const(st, gc::ST_SINCE);
         let since_n = lo.push(FTy::U64, Op::Bin(BinOp::Add, since, stepv));
         lo.store(FTy::U64, since_a, since_n);
-        let tot_a = lo.ptradd_const(st, gc::ST_TOTAL);
-        let tot = lo.load(FTy::U64, tot_a);
-        let tot_n = lo.push(FTy::U64, Op::Bin(BinOp::Add, tot, stepv));
-        lo.store(FTy::U64, tot_a, tot_n);
-        let al_a = lo.ptradd_const(st, gc::ST_D_ALLOK);
-        let al = lo.load(FTy::U64, al_a);
-        let al_n = lo.push(FTy::U64, Op::Bin(BinOp::Add, al, one));
-        lo.store(FTy::U64, al_a, al_n);
 
         lo.store(FTy::Ptr, slot, obj);
         lo.set_term(Term::Br(done_bb));
