@@ -75,6 +75,7 @@ data class LaunchConfig(
     val autorun: Boolean = false,
     val autoscroll: Boolean = false,
     val theme: ThemeMode? = null,
+    val netBase: String? = null,
 ) {
     companion object {
         fun from(intent: Intent?, id: Int): LaunchConfig {
@@ -85,6 +86,7 @@ data class LaunchConfig(
                 lab = LabSection.entries.firstOrNull { it.name.equals(intent.getStringExtra("lab"), true) },
                 autorun = intent.getBooleanExtra("autorun", false),
                 autoscroll = intent.getIntExtra("autoscroll", 0) != 0,
+                netBase = intent.getStringExtra("netbase"),
                 theme = when (intent.getStringExtra("theme")?.lowercase(Locale.ROOT)) {
                     "light" -> ThemeMode.Light
                     "dark" -> ThemeMode.Dark

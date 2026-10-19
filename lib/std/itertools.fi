@@ -1,0 +1,531 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/itertools.fi -- Python's `itertools`, EAGER: every function reads
+// plain `Vec[T]` inputs and APPENDS its result to an `out` Vec (call
+// `vec_clear` first for a fresh list). Order and tuple contents are exactly
+// CPython's (cross-checked against Python in tests/4520).
+//
+// Tuples come out FLAT: `it_permutations[T](&pool, 2, &out)` appends
+// a0 a1 | b0 b1 | ... and returns the NUMBER of tuples (so r = 0 still reports
+// the one empty tuple). Two-element results use `IterPair[A, B]`.
+//
+//     import std.vec
+//     import std.itertools
+//
+//     var out: Vec[i64] = vec_new[i64]()
+//     let n: usize = it_combinations[i64](&pool, 3, &out)  // combinations(pool, 3)
+//     it_product[i64](&pool, 2, &out)                      // product(pool, repeat=2)
+//     it_islice[i64](&v, 1, 10, 3, &out)                   // islice(v, 1, 10, 3)
+//     it_islice[i64](&v, 2, itertools.it_none(), 1, &out) // islice(v, 2, None)
+//     it_accumulate[i64](&v, add_i64, &out)                // accumulate(v, add)
+//     var starts: Vec[usize] = vec_new[usize]()
+//     it_groupby[i64, i64](&v, key_of, &starts)            // run i = starts[i] .. starts[i+1]
+//     it_next_permutation[i64](&v)                         // in place, false at the last one
+//
+// Callbacks are plain `fn` values taking element POINTERS (like `vec_sort_by`).
+// `T: Ord` is used wherever equality is needed (equal = neither is less).
+// All names are bare because a generic function cannot be called
+// module-qualified. The caller owns every Vec (`vec_free`).
+//
+// Not here on purpose: lazy infinite iterators (`count`, `cycle` without a
+// bound, `tee`) -- `it_cycle` and `it_repeat` take the item count instead.
+import std.rt
+import std.vec
+
+export { IterPair, it_none, it_chain, it_repeat, it_cycle, it_islice,
+    it_takewhile, it_dropwhile, it_filterfalse, it_compress, it_accumulate,
+    it_accumulate_from, it_pairwise, it_batched, it_zip, it_zip_longest,
+    it_product, it_product2, it_permutations, it_combinations,
+    it_combinations_with_replacement, it_groupby, it_runs,
+    it_next_permutation, it_prev_permutation, it_tuple_count }
+
+struct IterPair[A, B] {
+    a: A,
+    b: B,
+}
+
+// `None` for the `stop` of `it_islice`.
+fn it_none() -> usize {
+    return (0 as usize) -% 1
+}
+
+// chain(a, b)
+fn it_chain[T](a: *mut Vec[T], b: *mut Vec[T], out: *mut Vec[T]) {
+    var i: usize = 0
+    while i < vec_len[T](a) {
+        vec_push[T](out, *vec_elem_ptr[T](a, i))
+        i = i + 1
+    }
+    i = 0
+    while i < vec_len[T](b) {
+        vec_push[T](out, *vec_elem_ptr[T](b, i))
+        i = i + 1
+    }
+}
+
+// repeat(x, n)
+fn it_repeat[T](x: T, n: usize, out: *mut Vec[T]) {
+    var i: usize = 0
+    while i < n {
+        vec_push[T](out, x)
+        i = i + 1
+    }
+}
+
+// islice(cycle(v), n): the first n items of the endless repetition.
+fn it_cycle[T](v: *mut Vec[T], n: usize, out: *mut Vec[T]) {
+    let len: usize = vec_len[T](v)
+    if len == 0 { return }
+    var i: usize = 0
+    while i < n {
+        vec_push[T](out, *vec_elem_ptr[T](v, i % len))
+        i = i + 1
+    }
+}
+
+// islice(v, start, stop, step): `stop` = it_none() for no end; step >= 1
+// (a step of 0 is ValueError in Python and appends nothing here).
+fn it_islice[T](v: *mut Vec[T], start: usize, stop: usize, step: usize, out: *mut Vec[T]) {
+    if step == 0 { return }
+    var end: usize = vec_len[T](v)
+    if stop < end { end = stop }
+    var i: usize = start
+    while i < end {
+        vec_push[T](out, *vec_elem_ptr[T](v, i))
+        if end - i <= step { break }
+        i = i + step
+    }
+}
+
+// takewhile(pred, v)
+fn it_takewhile[T](v: *mut Vec[T], pred: fn(*T) -> bool, out: *mut Vec[T]) {
+    var i: usize = 0
+    while i < vec_len[T](v) {
+        let p: *mut T = vec_elem_ptr[T](v, i)
+        if !pred(p) { break }
+        vec_push[T](out, *p)
+        i = i + 1
+    }
+}
+
+// dropwhile(pred, v)
+fn it_dropwhile[T](v: *mut Vec[T], pred: fn(*T) -> bool, out: *mut Vec[T]) {
+    var i: usize = 0
+    while i < vec_len[T](v) && pred(vec_elem_ptr[T](v, i)) {
+        i = i + 1
+    }
+    while i < vec_len[T](v) {
+        vec_push[T](out, *vec_elem_ptr[T](v, i))
+        i = i + 1
+    }
+}
+
+// filterfalse(pred, v)
+fn it_filterfalse[T](v: *mut Vec[T], pred: fn(*T) -> bool, out: *mut Vec[T]) {
+    var i: usize = 0
+    while i < vec_len[T](v) {
+        let p: *mut T = vec_elem_ptr[T](v, i)
+        if !pred(p) { vec_push[T](out, *p) }
+        i = i + 1
+    }
+}
+
+// compress(v, selectors): keeps v[i] while sel[i] != 0; stops at the shorter.
+fn it_compress[T](v: *mut Vec[T], sel: *mut Vec[u8], out: *mut Vec[T]) {
+    var i: usize = 0
+    while i < vec_len[T](v) && i < vec_len[u8](sel) {
+        if vec_at[u8](sel, i) != 0 as u8 {
+            vec_push[T](out, *vec_elem_ptr[T](v, i))
+        }
+        i = i + 1
+    }
+}
+
+// accumulate(v, f): running f(acc, x); first item is v[0].
+fn it_accumulate[T](v: *mut Vec[T], f: fn(T, T) -> T, out: *mut Vec[T]) {
+    if vec_len[T](v) == 0 { return }
+    var acc: T = *vec_elem_ptr[T](v, 0)
+    vec_push[T](out, acc)
+    var i: usize = 1
+    while i < vec_len[T](v) {
+        acc = f(acc, *vec_elem_ptr[T](v, i))
+        vec_push[T](out, acc)
+        i = i + 1
+    }
+}
+
+// accumulate(v, f, initial=init): the output starts with `init`.
+fn it_accumulate_from[T](v: *mut Vec[T], init: T, f: fn(T, T) -> T, out: *mut Vec[T]) {
+    var acc: T = init
+    vec_push[T](out, acc)
+    var i: usize = 0
+    while i < vec_len[T](v) {
+        acc = f(acc, *vec_elem_ptr[T](v, i))
+        vec_push[T](out, acc)
+        i = i + 1
+    }
+}
+
+// pairwise(v): (v0,v1), (v1,v2), ...
+fn it_pairwise[T](v: *mut Vec[T], out: *mut Vec[IterPair[T, T]]) {
+    var i: usize = 1
+    while i < vec_len[T](v) {
+        vec_push[IterPair[T, T]](out, IterPair[T, T] {
+            a: *vec_elem_ptr[T](v, i - 1), b: *vec_elem_ptr[T](v, i) })
+        i = i + 1
+    }
+}
+
+// batched(v, n): chunks of n (the last one may be shorter). Every chunk is a
+// new Vec the caller must free. n = 0 appends nothing (ValueError in Python).
+fn it_batched[T](v: *mut Vec[T], n: usize, out: *mut Vec[Vec[T]]) {
+    if n == 0 { return }
+    var i: usize = 0
+    while i < vec_len[T](v) {
+        var chunk: Vec[T] = vec_new[T]()
+        var j: usize = i
+        while j < vec_len[T](v) && j - i < n {
+            vec_push[T](&chunk, *vec_elem_ptr[T](v, j))
+            j = j + 1
+        }
+        vec_push[Vec[T]](out, chunk)
+        i = j
+    }
+}
+
+// zip(a, b): stops at the shorter.
+fn it_zip[A, B](a: *mut Vec[A], b: *mut Vec[B], out: *mut Vec[IterPair[A, B]]) {
+    var i: usize = 0
+    while i < vec_len[A](a) && i < vec_len[B](b) {
+        vec_push[IterPair[A, B]](out, IterPair[A, B] {
+            a: *vec_elem_ptr[A](a, i), b: *vec_elem_ptr[B](b, i) })
+        i = i + 1
+    }
+}
+
+// zip_longest(a, b, fillvalue=..): the shorter side is padded with fa / fb.
+fn it_zip_longest[A, B](a: *mut Vec[A], b: *mut Vec[B], fa: A, fb: B,
+        out: *mut Vec[IterPair[A, B]]) {
+    let la: usize = vec_len[A](a)
+    let lb: usize = vec_len[B](b)
+    var n: usize = la
+    if lb > n { n = lb }
+    var i: usize = 0
+    while i < n {
+        var x: A = fa
+        var y: B = fb
+        if i < la { x = *vec_elem_ptr[A](a, i) }
+        if i < lb { y = *vec_elem_ptr[B](b, i) }
+        vec_push[IterPair[A, B]](out, IterPair[A, B] { a: x, b: y })
+        i = i + 1
+    }
+}
+
+// Number of tuples of `width` in a flat Vec.
+fn it_tuple_count[T](flat: *mut Vec[T], width: usize) -> usize {
+    if width == 0 { return 0 }
+    return vec_len[T](flat) / width
+}
+
+// product(pool, repeat=r): odometer, the last position varies fastest.
+// Returns the number of tuples (len^r; 1 for r = 0; 0 for an empty pool).
+fn it_product[T](pool: *mut Vec[T], r: usize, out: *mut Vec[T]) -> usize {
+    let n: usize = vec_len[T](pool)
+    if r == 0 { return 1 }
+    if n == 0 { return 0 }
+    var idx: Vec[usize] = vec_new[usize]()
+    var k: usize = 0
+    while k < r {
+        vec_push[usize](&idx, 0)
+        k = k + 1
+    }
+    var count: usize = 0
+    while true {
+        k = 0
+        while k < r {
+            vec_push[T](out, *vec_elem_ptr[T](pool, vec_at[usize](&idx, k)))
+            k = k + 1
+        }
+        count = count + 1
+        // advance
+        var pos: usize = r
+        var done: bool = true
+        while pos > 0 {
+            pos = pos - 1
+            let cur: usize = vec_at[usize](&idx, pos) + 1
+            if cur < n {
+                vec_set[usize](&idx, pos, cur)
+                done = false
+                break
+            }
+            vec_set[usize](&idx, pos, 0)
+        }
+        if done { break }
+    }
+    vec_free[usize](&idx)
+    return count
+}
+
+// product(a, b)
+fn it_product2[A, B](a: *mut Vec[A], b: *mut Vec[B], out: *mut Vec[IterPair[A, B]]) {
+    var i: usize = 0
+    while i < vec_len[A](a) {
+        var j: usize = 0
+        while j < vec_len[B](b) {
+            vec_push[IterPair[A, B]](out, IterPair[A, B] {
+                a: *vec_elem_ptr[A](a, i), b: *vec_elem_ptr[B](b, j) })
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// permutations(pool, r): CPython's `indices` / `cycles` walk. Returns the
+// number of tuples (0 when r > len).
+fn it_permutations[T](pool: *mut Vec[T], r: usize, out: *mut Vec[T]) -> usize {
+    let n: usize = vec_len[T](pool)
+    if r > n { return 0 }
+    var idx: Vec[usize] = vec_new[usize]()
+    var cyc: Vec[usize] = vec_new[usize]()
+    var k: usize = 0
+    while k < n {
+        vec_push[usize](&idx, k)
+        k = k + 1
+    }
+    k = 0
+    while k < r {
+        vec_push[usize](&cyc, n - k)
+        k = k + 1
+    }
+    var count: usize = 0
+    k = 0
+    while k < r {
+        vec_push[T](out, *vec_elem_ptr[T](pool, vec_at[usize](&idx, k)))
+        k = k + 1
+    }
+    count = 1
+    if n == 0 {
+        vec_free[usize](&idx)
+        vec_free[usize](&cyc)
+        return count
+    }
+    while true {
+        var advanced: bool = false
+        var i: usize = r
+        while i > 0 {
+            i = i - 1
+            let c: usize = vec_at[usize](&cyc, i) - 1
+            vec_set[usize](&cyc, i, c)
+            if c == 0 {
+                // idx[i:] = idx[i+1:] + idx[i:i+1]
+                let first: usize = vec_at[usize](&idx, i)
+                var q: usize = i
+                while q + 1 < n {
+                    vec_set[usize](&idx, q, vec_at[usize](&idx, q + 1))
+                    q = q + 1
+                }
+                vec_set[usize](&idx, n - 1, first)
+                vec_set[usize](&cyc, i, n - i)
+            } else {
+                let j: usize = n - c
+                let t: usize = vec_at[usize](&idx, i)
+                vec_set[usize](&idx, i, vec_at[usize](&idx, j))
+                vec_set[usize](&idx, j, t)
+                k = 0
+                while k < r {
+                    vec_push[T](out, *vec_elem_ptr[T](pool, vec_at[usize](&idx, k)))
+                    k = k + 1
+                }
+                count = count + 1
+                advanced = true
+                break
+            }
+        }
+        if !advanced { break }
+    }
+    vec_free[usize](&idx)
+    vec_free[usize](&cyc)
+    return count
+}
+
+// combinations(pool, r): lexicographic by position. Returns the tuple count.
+fn it_combinations[T](pool: *mut Vec[T], r: usize, out: *mut Vec[T]) -> usize {
+    let n: usize = vec_len[T](pool)
+    if r > n { return 0 }
+    var idx: Vec[usize] = vec_new[usize]()
+    var k: usize = 0
+    while k < r {
+        vec_push[usize](&idx, k)
+        k = k + 1
+    }
+    var count: usize = 0
+    while true {
+        k = 0
+        while k < r {
+            vec_push[T](out, *vec_elem_ptr[T](pool, vec_at[usize](&idx, k)))
+            k = k + 1
+        }
+        count = count + 1
+        // find the rightmost index that can still move
+        var i: usize = r
+        var found: bool = false
+        while i > 0 {
+            i = i - 1
+            if vec_at[usize](&idx, i) != i + n - r {
+                found = true
+                break
+            }
+        }
+        if !found { break }
+        vec_set[usize](&idx, i, vec_at[usize](&idx, i) + 1)
+        var j: usize = i + 1
+        while j < r {
+            vec_set[usize](&idx, j, vec_at[usize](&idx, j - 1) + 1)
+            j = j + 1
+        }
+    }
+    vec_free[usize](&idx)
+    return count
+}
+
+// combinations_with_replacement(pool, r)
+fn it_combinations_with_replacement[T](pool: *mut Vec[T], r: usize, out: *mut Vec[T]) -> usize {
+    let n: usize = vec_len[T](pool)
+    if r == 0 { return 1 }
+    if n == 0 { return 0 }
+    var idx: Vec[usize] = vec_new[usize]()
+    var k: usize = 0
+    while k < r {
+        vec_push[usize](&idx, 0)
+        k = k + 1
+    }
+    var count: usize = 0
+    while true {
+        k = 0
+        while k < r {
+            vec_push[T](out, *vec_elem_ptr[T](pool, vec_at[usize](&idx, k)))
+            k = k + 1
+        }
+        count = count + 1
+        var i: usize = r
+        var found: bool = false
+        while i > 0 {
+            i = i - 1
+            if vec_at[usize](&idx, i) != n - 1 {
+                found = true
+                break
+            }
+        }
+        if !found { break }
+        let nv: usize = vec_at[usize](&idx, i) + 1
+        var j: usize = i
+        while j < r {
+            vec_set[usize](&idx, j, nv)
+            j = j + 1
+        }
+    }
+    vec_free[usize](&idx)
+    return count
+}
+
+// groupby(v, key): appends the START index of every run of equal keys to
+// `starts` (run g = starts[g] .. starts[g+1], the last one ends at len(v)).
+// Like Python it only merges ADJACENT equal keys (sort first for a SQL-style
+// group by). Returns the number of runs.
+fn it_groupby[T, K: Ord](v: *mut Vec[T], key: fn(*T) -> K, starts: *mut Vec[usize]) -> usize {
+    let n: usize = vec_len[T](v)
+    if n == 0 { return 0 }
+    var prev: K = key(vec_elem_ptr[T](v, 0))
+    vec_push[usize](starts, 0)
+    var runs: usize = 1
+    var i: usize = 1
+    while i < n {
+        let k: K = key(vec_elem_ptr[T](v, i))
+        if (&prev).less(&k) || (&k).less(&prev) {
+            vec_push[usize](starts, i)
+            runs = runs + 1
+        }
+        prev = k
+        i = i + 1
+    }
+    return runs
+}
+
+// Runs of equal ADJACENT elements (groupby(v) without a key).
+fn it_runs[T: Ord](v: *mut Vec[T], starts: *mut Vec[usize]) -> usize {
+    var runs: usize = 0
+    var i: usize = 0
+    while i < vec_len[T](v) {
+        var same: bool = false
+        if i > 0 {
+            let a: *mut T = vec_elem_ptr[T](v, i - 1)
+            let b: *mut T = vec_elem_ptr[T](v, i)
+            same = !a.less(b) && !b.less(a)
+        }
+        if !same {
+            vec_push[usize](starts, i)
+            runs = runs + 1
+        }
+        i = i + 1
+    }
+    return runs
+}
+
+// Next lexicographic permutation in place (the C++ `std::next_permutation`);
+// false (and the vector is left sorted ascending) after the last one.
+fn it_next_permutation[T: Ord](v: *mut Vec[T]) -> bool {
+    let n: usize = vec_len[T](v)
+    if n < 2 { return false }
+    var i: usize = n - 1
+    while i > 0 && !vec_elem_ptr[T](v, i - 1).less(vec_elem_ptr[T](v, i)) {
+        i = i - 1
+    }
+    if i == 0 {
+        it_reverse_range[T](v, 0, n)
+        return false
+    }
+    var j: usize = n - 1
+    while !vec_elem_ptr[T](v, i - 1).less(vec_elem_ptr[T](v, j)) {
+        j = j - 1
+    }
+    it_swap[T](v, i - 1, j)
+    it_reverse_range[T](v, i, n)
+    return true
+}
+
+// Previous lexicographic permutation in place; false (vector left sorted
+// DEscending) before the first one.
+fn it_prev_permutation[T: Ord](v: *mut Vec[T]) -> bool {
+    let n: usize = vec_len[T](v)
+    if n < 2 { return false }
+    var i: usize = n - 1
+    while i > 0 && !vec_elem_ptr[T](v, i).less(vec_elem_ptr[T](v, i - 1)) {
+        i = i - 1
+    }
+    if i == 0 {
+        it_reverse_range[T](v, 0, n)
+        return false
+    }
+    var j: usize = n - 1
+    while !vec_elem_ptr[T](v, j).less(vec_elem_ptr[T](v, i - 1)) {
+        j = j - 1
+    }
+    it_swap[T](v, i - 1, j)
+    it_reverse_range[T](v, i, n)
+    return true
+}
+
+fn it_swap[T](v: *mut Vec[T], i: usize, j: usize) {
+    let t: T = *vec_elem_ptr[T](v, i)
+    *vec_elem_ptr[T](v, i) = *vec_elem_ptr[T](v, j)
+    *vec_elem_ptr[T](v, j) = t
+}
+
+fn it_reverse_range[T](v: *mut Vec[T], lo: usize, hi: usize) {
+    var a: usize = lo
+    var b: usize = hi
+    while a + 1 < b {
+        b = b - 1
+        it_swap[T](v, a, b)
+        a = a + 1
+    }
+}

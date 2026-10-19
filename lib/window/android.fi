@@ -82,6 +82,7 @@ import android.ndk
 import android.activity
 import android.hostinfo
 import plat.envvar
+import plat.intentx
 import android.inputmethod
 import plat.android.push
 import plat.android.pick
@@ -383,6 +384,11 @@ fn an_set_screen(x: *mut Platte, sw: usize, sh: usize) {
 // messages and x11.fi with its event numbers.
 fn an_event(x: *mut Platte, kind: u32, a: u32, ex: u32, ey: u32,
     es: u32) {
+    // r469: while `r_open` waits for window and content rect, a size event would carry a stale size (the whole screen): the program
+    // would size its canvas and GPU target at that, then again at the content size. `make` takes the size anyway.
+    if G_OPENING && kind == window.EV_CONFIGURE {
+        return
+    }
     let n: usize = ((*x).q_head + 1) % RING
     if n == (*x).q_tail {
         // The queue is full. The OLDEST goes -- a lost motion event
@@ -421,6 +427,7 @@ fn an_locked(x: *mut Platte) -> bool {
 // as under Windows.
 fn r_open(x: *mut Platte, disp: usize) -> bool {
     (*x).is_open = true
+    G_OPENING = true
     if activity.activity_on() {
         (*x).host = true
         (*x).akt = activity.activity_pointer()
@@ -442,11 +449,27 @@ fn r_open(x: *mut Platte, disp: usize) -> bool {
                 var es: u32 = 0
                 let t: bool = r_next(x, &k, &a, &ex, &ey, &es)
                 if k == window.EV_CLOSED {
+                    G_OPENING = false
                     return false
                 }
             }
         }
     }
+    // r469: the content rectangle (status/navigation bar) arrives AFTER the window. Sized before it, the first canvas/GPU target is
+    // the whole screen and the second (after the rect) the content area: two main textures, and the driver keeps the first one's
+    // memory. Wait (max ~300 ms) for the rect so that `make` sizes the final canvas at once.
+    if (*x).host && (*x).win != 0 {
+        var rl: i32 = 0
+        var rt0: i32 = 0
+        var rr: i32 = 0
+        var rb: i32 = 0
+        var spins: i32 = 0
+        while !activity.activity_content_rect(&rl, &rt0, &rr, &rb) && spins < 30 && (*x).win != 0 {
+            let dw: bool = host_pump(x, 10)
+            spins = spins + 1
+        }
+    }
+    G_OPENING = false
     return true
 }
 
@@ -1664,6 +1687,7 @@ extern fn eglCreateContext(d: u64, cfg: u64, share: u64, attrs: u64) -> u64;
 extern fn eglCreateWindowSurface(d: u64, cfg: u64, win: u64, attrs: u64) -> u64;
 extern fn eglMakeCurrent(d: u64, draw: u64, read: u64, ctx: u64) -> u32;
 extern fn eglSwapBuffers(d: u64, srf: u64) -> u32;
+extern fn eglSurfaceAttrib(d: u64, srf: u64, attr: i32, val: i32) -> u32;
 extern fn eglDestroySurface(d: u64, srf: u64) -> u32;
 extern fn eglDestroyContext(d: u64, c: u64) -> u32;
 extern fn eglGetError() -> i32;
@@ -1679,6 +1703,10 @@ const EGL_DEPTH_SIZE: i32 = 12325
 const EGL_STENCIL_SIZE: i32 = 12326
 const EGL_SURFACE_TYPE: i32 = 12339
 const EGL_WINDOW_BIT: i32 = 4
+// r472 probe (intent extra direct=true): paint straight into the window surface; the swap keeps the previous picture
+const EGL_SWAP_BEHAVIOR_PRESERVED_BIT: i32 = 1024
+const EGL_SWAP_BEHAVIOR: i32 = 12435
+const EGL_BUFFER_PRESERVED: i32 = 12436
 const EGL_RENDERABLE_TYPE: i32 = 12352
 const EGL_OPENGL_ES3_BIT: i32 = 64
 const EGL_CONTEXT_CLIENT_VERSION: i32 = 12440
@@ -1687,6 +1715,7 @@ const EGL_WIDTH: i32 = 12375
 const EGL_HEIGHT: i32 = 12374
 const EGL_CONTEXT_LOST: i32 = 12302
 
+static mut G_OPENING: bool = false
 static mut G_SWAPPED: bool = false
 static mut G_SWAP_DONE: bool = false
 
@@ -1713,6 +1742,10 @@ fn egl_surface(x: *mut Platte) -> bool {
     if srf == 0 {
         egl_say("android: eglCreateWindowSurface failed\n")
         return false
+    }
+    if intentx.ix_bool("direct", false) {
+        let pa: u32 = eglSurfaceAttrib((*x).egl_d, srf, EGL_SWAP_BEHAVIOR, EGL_BUFFER_PRESERVED)
+        if pa != 0 as u32 { egl_say("android: direct: buffer preserved on\n") } else { egl_say("android: direct: buffer preserved FAILED\n") }
     }
     stage.stage_mark("egl_make_current")
     if eglMakeCurrent((*x).egl_d, srf, srf, (*x).egl_c) == 0 as u32 {
@@ -1759,8 +1792,10 @@ fn r_gpu_open(x: *mut Platte, api: u64) -> bool {
         return false
     }
     stage.stage_mark("egl_choose_config")
+    var stype: i32 = EGL_WINDOW_BIT
+    if intentx.ix_bool("direct", false) { stype = EGL_WINDOW_BIT + EGL_SWAP_BEHAVIOR_PRESERVED_BIT }
     var at: [i32; 17] = [EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8,
+        EGL_SURFACE_TYPE, stype, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_DEPTH_SIZE, 0,
         EGL_STENCIL_SIZE, 0, EGL_NONE]
     var cfg: [u64; 1] = [0]

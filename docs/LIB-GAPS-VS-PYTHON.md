@@ -68,3 +68,15 @@ Callbacks are plain `fn` values (no capturing closures), generic fns are called 
 | `lib/std/deque.fi` | `tests/4442_std_deque.fi` (16 checks x 4 opt levels) | 4 runs (unbounded, maxlen 1/5/64), rotate, extend, extendleft, reverse vs `collections.deque` (`tools/libs_py_cross/deque_ref.py`) |
 
 Notes: the module is called `rng`, not `random`, because the loader resolves modules by their last path component and `std.crypto.random` already owns `random`. Non-generic functions and types of a module are used qualified (`rng.Rng`, `rng.randint(&r, 1, 6)`); generic ones are bare (`rng_shuffle[T]`, `heap_push[T]`, `Deque[T]`).
+
+## 4. Round 2 (w3libs) -- built 2026-10-19
+
+| Lib | Tests | Python cross-check |
+|---|---|---|
+| `lib/std/itertools.fi` (eager chain/product/permutations/combinations/cwr/accumulate/groupby/islice/takewhile/dropwhile/filterfalse/compress/pairwise/batched/zip/zip_longest/cycle/repeat, next/prev_permutation) | `tests/4520_std_itertools.fi` (15 checks x 4 opt levels) | 10 aggregate (count, checksum) pairs vs CPython 3.11 `itertools` (`tools/libs_py_cross/itertools_ref.py`), 0 deviations |
+| `lib/std/mathx.fi` (asin/acos/sinh/cosh/tanh/asinh/acosh/atanh/expm1/log1p/cbrt/erf/erfc/gamma/lgamma, copysign/remainder/fmod_py/degrees/radians/isclose/fsum, factorial/comb/perm/gcd_i64/lcm_i64/floordiv/floormod/mul_mod/pow_mod/mod_inv) | `tests/4521_std_mathx.fi` (22 checks), `tests/4522_std_mathx_int.fi` (8 checks) | ~750 float cases as CPython bit patterns (exact ones bit-equal, transcendental within 1e-11), 127 fsum vectors bit-exact; integer checksums over ~4500 cases (`mathx_gen.py`, `mathx_int_ref.py`) |
+| `lib/std/setops.fi` (union/intersection/difference/symmetric_difference/is_subset/superset/disjoint/equal, update forms) | `tests/4523_std_setops.fi` | 400 random rounds vs CPython `set` |
+| `lib/std/bisect.fi` (bisect_left/right with lo/hi, insort, `_by` callbacks) | `tests/4524_std_bisect.fi` | 300 random rounds vs `bisect` |
+| `lib/std/statx.fi` (median_low/high, fmean, geometric/harmonic mean, covariance, correlation, linear_regression, quantiles both methods, mode/multimode) | `tests/4525_std_statx.fi` (3 checks) | 80 data sets vs `statistics`: order statistics bit-exact, means/regression within 1e-11 |
+
+Still open from the table above: `datetime` strftime/strptime + timedelta, `pathlib`-style Path object, popcount/clz/ctz intrinsics (compiler + firnc1; a64 backend belongs to the fUi manager), typed ndarray (plan: `docs/NDARRAY-PLAN.md`), `NormalDist`, `functools.lru_cache`.

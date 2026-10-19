@@ -79,7 +79,7 @@ export {
     Target, target_new, gpu_target_make, gpu_target_free, gpu_target_ok, gpu_copy,
     gpu_draw_target, gpu_draw_pixels, gpu_draw_image, gpu_draw_photo, gpu_main, gpu_clear_rows, gpu_tmp,
     AKey, akey_new, gpu_atlas_find, gpu_atlas_put, gpu_atlas_draw,
-    gpu_stats, GPU_VERSION, gpu_set_budget, gpu_set_budget_default, gpu_set_memlog,
+    gpu_stats, GPU_VERSION, gpu_set_budget, gpu_set_budget_default, gpu_set_memlog, gpu_set_debug, gpu_set_direct, gpu_set_origin,
 }
 
 const GPU_VERSION: u32 = 1
@@ -115,9 +115,41 @@ static mut STREAM_H: usize = 1024
 static mut TABLE_N: usize = 16384
 static mut BUDGET_SET: bool = false
 static mut MEMLOG: bool = false
+static mut DBG: i32 = 0
 
 // r449: log (tag GPUMEM, platform log) every texture the painter makes: size and format. For memory hunts (bench app, intent smaps).
 fn gpu_set_memlog(on: bool) { MEMLOG = on }
+
+// r462 memory probe (bench only): 1 = glFinish after a target is replaced; 4 = delete the main texture at present 4 WITHOUT re-making it (meminfo then shows what main owned).
+fn gpu_set_debug(n: i32) { DBG = n }
+
+// r472 probe (bench intent direct=true, default OFF): `main` is NOT an offscreen texture; the canvas is painted straight into the
+// window surface (EGL swap behaviour "buffer preserved" keeps the previous picture, so dirty-rect painting still works).
+// Not supported in this mode: effects that SAMPLE main (blur/glass backdrop) and the software fallback upload.
+static mut DIRECT: bool = false
+static mut DCLEAR: bool = false
+static mut DOX: i32 = 0
+static mut DOY: i32 = 0
+fn gpu_set_direct(on: bool) { DIRECT = on }
+// where the canvas's top left corner sits on the window surface (set before gpu_frame_begin)
+fn gpu_set_origin(ox: i32, oy: i32) {
+    DOX = ox
+    DOY = oy
+}
+fn is_direct(g: *mut Gpu, t: *mut Target) -> bool { return DIRECT && t == &(*g).main }
+// offset of target t's pixel (0, bottom row) on the framebuffer it lives in
+fn tgt_x(g: *mut Gpu, t: *mut Target) -> i32 {
+    if is_direct(g, t) {
+        return DOX
+    }
+    return 0
+}
+fn tgt_y(g: *mut Gpu, t: *mut Target) -> i32 {
+    if is_direct(g, t) {
+        return (*g).screen_h - DOY - (*t).h
+    }
+    return 0
+}
 
 // MEMORY BUDGET of the GPU painter (call BEFORE the window opens): the glyph/icon atlas (aw x ah octets of R8, texture + a mirror
 // in memory), the transient stream texture (sw x sh, same) and the entry table (tn slots of 112 octets, a power of two is
@@ -510,11 +542,47 @@ fn uloc(g: *mut Gpu, s: str) -> u32 {
 
 fn gpu_target_make(g: *mut Gpu, t: *mut Target, w: i32, h: i32) -> bool {
     let api: *mut gl.GlApi = a(g)
+    if is_direct(g, t) {
+        // r472: no texture, no framebuffer object: the default framebuffer (fb 0) of the window surface
+        if (*t).w == w && (*t).h == h && (*t).gen == (*g).gen && (*t).tex == 0 as u32 {
+            return true
+        }
+        gpu_flush(g)
+        gpu_target_free(g, t)
+        (*t).gen = (*g).gen
+        (*t).tex = 0 as u32
+        (*t).fb = 0 as u32
+        (*t).w = w
+        (*t).h = h
+        (*g).tgt = 0 as u64 as *mut Target
+        DCLEAR = true
+        if MEMLOG { blog.log("GPUMEM", "main DIRECT " + dec_i(w as i64) + "x" + dec_i(h as i64)) }
+        return true
+    }
     if (*t).fb != 0 as u32 && (*t).w == w && (*t).h == h && (*t).gen == (*g).gen {
         return true
     }
     gpu_flush(g)
+    if MEMLOG && t == &(*g).main { blog.log("GPUMEM", "main make " + dec_i(w as i64) + "x" + dec_i(h as i64) + " frames=" + dec_i((*g).frames as i64)) }
+    // r467: same texture object, new size (glTexImage2D respecifies the storage, so the driver drops the old block now
+    // instead of keeping a deleted texture around until it is idle)
+    if DBG >= 2 && (*t).fb != 0 as u32 && (*t).tex != 0 as u32 && (*t).gen == (*g).gen {
+        x_active_texture(api, gl.GL_TEXTURE0)
+        x_bind_texture(api, gl.GL_TEXTURE_2D, (*t).tex)
+        x_tex_image_2d(api, gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, 0, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, 0, 0)
+        if DBG == 3 { x_finish(api) }
+        x_tex_image_2d(api, gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, w, h, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, 0, 0)
+        x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, (*t).fb)
+        x_framebuffer_texture_2d(api, gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, (*t).tex, 0)
+        let st2: u32 = x_check_framebuffer_status(api, gl.GL_FRAMEBUFFER)
+        if MEMLOG { blog.log("GPUMEM", "respec " + dec_i(w as i64) + "x" + dec_i(h as i64)) }
+        (*t).w = w
+        (*t).h = h
+        (*g).tgt = 0 as u64 as *mut Target
+        return st2 == gl.GL_FRAMEBUFFER_COMPLETE
+    }
     gpu_target_free(g, t)
+    if DBG == 1 { x_finish(api) }
     (*t).gen = (*g).gen
     (*t).tex = make_texture(g, gl.GL_RGBA8, w, h, gl.GL_RGBA)
     (*t).fb = x_create_framebuffer(api)
@@ -588,7 +656,7 @@ fn gpu_detach(g: *mut Gpu, cv: *mut canvas.Canvas) {
 fn bind_target(g: *mut Gpu, t: *mut Target) {
     let api: *mut gl.GlApi = a(g)
     x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, (*t).fb)
-    x_viewport(api, 0, 0, (*t).w, (*t).h)
+    x_viewport(api, tgt_x(g, t), tgt_y(g, t), (*t).w, (*t).h)
 }
 
 // The batch goes out: the atlas and the stream uploaded where they
@@ -1265,9 +1333,11 @@ fn gpu_copy(g: *mut Gpu, from: *mut Target, sx: i32, sy: i32, w: i32, h: i32,
     x_bind_framebuffer(api, gl.GL_READ_FRAMEBUFFER, (*from).fb)
     x_bind_framebuffer(api, gl.GL_DRAW_FRAMEBUFFER, (*to).fb)
     // GL rows count from the bottom
-    let sy0: i32 = (*from).h - (sy + h)
-    let dy0: i32 = (*to).h - (dy + h)
-    x_blit_framebuffer(api, sx, sy0, sx + w, sy0 + h, dx, dy0, dx + w, dy0 + h,
+    let sy0: i32 = (*from).h - (sy + h) + tgt_y(g, from)
+    let dy0: i32 = (*to).h - (dy + h) + tgt_y(g, to)
+    let sx1: i32 = sx + tgt_x(g, from)
+    let dx1: i32 = dx + tgt_x(g, to)
+    x_blit_framebuffer(api, sx1, sy0, sx1 + w, sy0 + h, dx1, dy0, dx1 + w, dy0 + h,
         gl.GL_COLOR_BUFFER_BIT, gl.GL_NEAREST)
     x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, 0 as u32)
     (*g).tgt = 0 as u64 as *mut Target
@@ -1463,7 +1533,7 @@ fn gpu_clear_rows(g: *mut Gpu, t: *mut Target, y0: i32, y1: i32) {
     let api: *mut gl.GlApi = a(g)
     bind_target(g, t)
     x_enable(api, gl.GL_SCISSOR_TEST)
-    x_scissor(api, 0, (*t).h - y1, (*t).w, y1 - y0)
+    x_scissor(api, tgt_x(g, t), tgt_y(g, t) + (*t).h - y1, (*t).w, y1 - y0)
     x_clear_color(api, 0.0, 0.0, 0.0, 0.0)
     x_clear(api, gl.GL_COLOR_BUFFER_BIT)
     x_disable(api, gl.GL_SCISSOR_TEST)
@@ -1488,7 +1558,7 @@ fn gpu_read(g: *mut Gpu, x0: i32, y0: i32, x1: i32, y1: i32, dst: u64,
         return
     }
     x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, (*g).main.fb)
-    x_read_pixels(api, x0, (*g).main.h - y1, w, h, tmp)
+    x_read_pixels(api, x0 + tgt_x(g, &(*g).main), (*g).main.h - y1 + tgt_y(g, &(*g).main), w, h, tmp)
     var r: i32 = 0
     while r < h {
         // GL row 0 is the bottom one
@@ -1828,6 +1898,16 @@ fn gpu_frame_begin(g: *mut Gpu, screen_w: i32, screen_h: i32) {
     (*g).ss_h = 0
     (*g).sd_y0 = STREAM_H
     (*g).sd_y1 = 0
+    if DIRECT && DCLEAR && screen_w > 0 && screen_h > 0 {
+        // r472: a fresh window surface (or a new canvas size): the whole surface black once, the canvas paints over its rect
+        DCLEAR = false
+        let api: *mut gl.GlApi = a(g)
+        x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, 0 as u32)
+        x_viewport(api, 0, 0, screen_w, screen_h)
+        x_clear_color(api, 0.0, 0.0, 0.0, 1.0)
+        x_clear(api, gl.GL_COLOR_BUFFER_BIT)
+        (*g).tgt = 0 as u64 as *mut Target
+    }
 }
 
 // The picture of the canvas onto the screen (the default framebuffer).
@@ -1841,6 +1921,13 @@ fn gpu_present(g: *mut Gpu) {
 fn gpu_present_at(g: *mut Gpu, ox: i32, oy: i32) {
     gpu_flush(g)
     let api: *mut gl.GlApi = a(g)
+    if DIRECT {
+        // r472: everything is already on the window surface; the swap (host) shows it
+        x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, 0 as u32)
+        (*g).tgt = 0 as u64 as *mut Target
+        (*g).frames = (*g).frames + 1
+        return
+    }
     let w: i32 = (*g).main.w
     let h: i32 = (*g).main.h
     let sw: i32 = (*g).screen_w
@@ -1860,6 +1947,13 @@ fn gpu_present_at(g: *mut Gpu, ox: i32, oy: i32) {
     x_bind_framebuffer(api, gl.GL_FRAMEBUFFER, 0 as u32)
     (*g).tgt = 0 as u64 as *mut Target
     (*g).frames = (*g).frames + 1
+    if DBG == 4 && (*g).frames == 4 as u64 {
+        x_finish(api)
+        x_delete_obj(api, gl.GLK_FRAMEBUFFER, (*g).main.fb)
+        x_delete_obj(api, gl.GLK_TEXTURE, (*g).main.tex)
+        x_finish(api)
+        if MEMLOG { blog.log("GPUMEM", "probe: main deleted") }
+    }
 }
 
 // Wait until the GPU is done (for measuring).

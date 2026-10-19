@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/statx.fi -- std.statx: the rest of Python's `statistics` that
+// std.stats does not have, over a `Vec[f64]` (or `Vec[T: Ord]` for the modes).
+//
+//     import std.statx
+//
+//     statx.median_low(&v)  statx.median_high(&v)  statx.fmean(&v)
+//     statx.geometric_mean(&v)  statx.harmonic_mean(&v)      // NaN for x <= 0
+//     statx.covariance(&x, &y)  statx.correlation(&x, &y)    // sample, n-1; NaN if undefined
+//     var slope: f64 = 0.0
+//     var icpt: f64 = 0.0
+//     statx.linear_regression(&x, &y, &slope, &icpt)         // false if undefined
+//     var q: Vec[f64] = vec_new[f64]()
+//     statx.quantiles(&v, 4, false, &q)                       // quantiles(v, n=4)             (exclusive)
+//     statx.quantiles(&v, 4, true, &q)                        // ... method='inclusive'      (APPENDS n-1 cut points)
+//     var m: i64 = 0
+//     stat_mode[i64](&iv, &m)                                 // statistics.mode: first of the most common
+//     stat_multimode[i64](&iv, &list)                         // statistics.multimode, first-seen order
+//
+// Not here: NormalDist, Fraction-exact arithmetic (results are within a few
+// 1e-16 relative of Python's, tolerance-checked in tests/4525), median_grouped.
+// Generic functions (`stat_*`) are bare, the f64 ones are called `statx.`.
+// Cross-checked against CPython in tests/4525.
+import std.rt
+import std.vec
+import std.math
+import std.mathx
+import std.stats
+
+export { median_low, median_high, fmean, geometric_mean, harmonic_mean,
+    covariance, correlation, linear_regression, quantiles,
+    stat_mode, stat_multimode }
+
+#[allow_fp]
+fn sorted_copy(v: *mut Vec[f64]) -> Vec[f64] {
+    var c: Vec[f64] = vec_new[f64]()
+    vec_copy[f64](v, &c)
+    stats.sort_vec(&c)
+    return c
+}
+
+#[allow_fp]
+fn at(v: *mut Vec[f64], i: usize) -> f64 {
+    return *vec_elem_ptr[f64](v, i)
+}
+
+// statistics.median_low: the lower middle element for an even count.
+#[allow_fp]
+fn median_low(v: *mut Vec[f64]) -> f64 {
+    let n: usize = vec_len[f64](v)
+    if n == 0 { return math.NAN() }
+    var c: Vec[f64] = sorted_copy(v)
+    var r: f64 = 0.0
+    if n % 2 == 1 { r = at(&c, n / 2) } else { r = at(&c, n / 2 - 1) }
+    vec_free[f64](&c)
+    return r
+}
+
+#[allow_fp]
+fn median_high(v: *mut Vec[f64]) -> f64 {
+    let n: usize = vec_len[f64](v)
+    if n == 0 { return math.NAN() }
+    var c: Vec[f64] = sorted_copy(v)
+    let r: f64 = at(&c, n / 2)
+    vec_free[f64](&c)
+    return r
+}
+
+// statistics.fmean: fsum(data) / n  (NaN for the empty set).
+#[allow_fp]
+fn fmean(v: *mut Vec[f64]) -> f64 {
+    let n: usize = vec_len[f64](v)
+    if n == 0 { return math.NAN() }
+    return mathx.fsum(v) / (n as f64)
+}
+
+// exp(fmean(log x)); NaN unless every x > 0.
+#[allow_fp]
+fn geometric_mean(v: *mut Vec[f64]) -> f64 {
+    let n: usize = vec_len[f64](v)
+    if n == 0 { return math.NAN() }
+    var l: Vec[f64] = vec_new[f64]()
+    var i: usize = 0
+    while i < n {
+        let x: f64 = at(v, i)
+        if !(x > 0.0) {
+            vec_free[f64](&l)
+            return math.NAN()
+        }
+        vec_push[f64](&l, math.ln(x))
+        i = i + 1
+    }
+    let r: f64 = math.exp(fmean(&l))
+    vec_free[f64](&l)
+    return r
+}
+
+// n / sum(1/x); NaN for a negative x, 0.0 when any x is 0 (as Python).
+#[allow_fp]
+fn harmonic_mean(v: *mut Vec[f64]) -> f64 {
+    let n: usize = vec_len[f64](v)
+    if n == 0 { return math.NAN() }
+    var inv: Vec[f64] = vec_new[f64]()
+    var i: usize = 0
+    while i < n {
+        let x: f64 = at(v, i)
+        if x < 0.0 {
+            vec_free[f64](&inv)
+            return math.NAN()
+        }
+        if x == 0.0 {
+            vec_free[f64](&inv)
+            return 0.0
+        }
+        vec_push[f64](&inv, 1.0 / x)
+        i = i + 1
+    }
+    let r: f64 = (n as f64) / mathx.fsum(&inv)
+    vec_free[f64](&inv)
+    return r
+}
+
+// sum((x - xbar) * (y - ybar)) with exactly-summed terms; NaN if lengths differ or n < 2.
+#[allow_fp]
+fn cross_sum(x: *mut Vec[f64], y: *mut Vec[f64], same: bool) -> f64 {
+    let n: usize = vec_len[f64](x)
+    let xb: f64 = fmean(x)
+    let yb: f64 = fmean(y)
+    var t: Vec[f64] = vec_new[f64]()
+    var i: usize = 0
+    while i < n {
+        vec_push[f64](&t, (at(x, i) - xb) * (at(y, i) - yb))
+        i = i + 1
+    }
+    let r: f64 = mathx.fsum(&t)
+    vec_free[f64](&t)
+    return r
+}
+
+#[allow_fp]
+fn covariance(x: *mut Vec[f64], y: *mut Vec[f64]) -> f64 {
+    let n: usize = vec_len[f64](x)
+    if n != vec_len[f64](y) || n < 2 { return math.NAN() }
+    return cross_sum(x, y, false) / ((n - 1) as f64)
+}
+
+// Pearson's r; NaN if either input is constant.
+#[allow_fp]
+fn correlation(x: *mut Vec[f64], y: *mut Vec[f64]) -> f64 {
+    let n: usize = vec_len[f64](x)
+    if n != vec_len[f64](y) || n < 2 { return math.NAN() }
+    let sxy: f64 = cross_sum(x, y, false)
+    let sxx: f64 = cross_sum(x, x, true)
+    let syy: f64 = cross_sum(y, y, true)
+    if sxx == 0.0 || syy == 0.0 { return math.NAN() }
+    return sxy / math.sqrt(sxx * syy)
+}
+
+// Simple linear regression y = slope * x + intercept; false if undefined.
+#[allow_fp]
+fn linear_regression(x: *mut Vec[f64], y: *mut Vec[f64], slope: *mut f64, intercept: *mut f64) -> bool {
+    let n: usize = vec_len[f64](x)
+    if n != vec_len[f64](y) || n < 2 { return false }
+    let sxy: f64 = cross_sum(x, y, false)
+    let sxx: f64 = cross_sum(x, x, true)
+    if sxx == 0.0 { return false }
+    let s: f64 = sxy / sxx
+    *slope = s
+    *intercept = fmean(y) - s * fmean(x)
+    return true
+}
+
+// statistics.quantiles(data, n=n, method=...): APPENDS the n - 1 cut points.
+// Needs at least 2 data points and n >= 1 (else appends nothing, returns false).
+#[allow_fp]
+fn quantiles(v: *mut Vec[f64], n: usize, inclusive: bool, out: *mut Vec[f64]) -> bool {
+    let ld: usize = vec_len[f64](v)
+    if n < 1 || ld < 2 { return false }
+    var c: Vec[f64] = sorted_copy(v)
+    var i: usize = 1
+    if inclusive {
+        let m: usize = ld - 1
+        while i < n {
+            let j: usize = (i * m) / n
+            let delta: usize = i * m - j * n
+            vec_push[f64](out, (at(&c, j) * ((n - delta) as f64) + at(&c, j + 1) * (delta as f64)) / (n as f64))
+            i = i + 1
+        }
+    } else {
+        let m: usize = ld + 1
+        while i < n {
+            var j: usize = (i * m) / n
+            if j < 1 { j = 1 }
+            if j > ld - 1 { j = ld - 1 }
+            // delta can be negative when j was clamped (Python ints, here i64)
+            let delta: i64 = (i * m) as i64 - (j * n) as i64
+            vec_push[f64](out, (at(&c, j - 1) * (((n as i64) - delta) as f64) + at(&c, j) * (delta as f64)) / (n as f64))
+            i = i + 1
+        }
+    }
+    vec_free[f64](&c)
+    return true
+}
+
+// Sorted copy + count of the run of equal elements starting at i (equal = neither less).
+fn run_len[T: Ord](c: *mut Vec[T], i: usize) -> usize {
+    var j: usize = i + 1
+    while j < vec_len[T](c) {
+        let a: *mut T = vec_elem_ptr[T](c, i)
+        let b: *mut T = vec_elem_ptr[T](c, j)
+        if a.less(b) || b.less(a) { break }
+        j = j + 1
+    }
+    return j - i
+}
+
+// How often does x occur (binary search on the sorted copy).
+fn count_of[T: Ord](c: *mut Vec[T], x: T) -> usize {
+    var w: T = x
+    var lo: usize = 0
+    var hi: usize = vec_len[T](c)
+    while lo < hi {
+        let m: usize = lo + (hi - lo) / 2
+        if vec_elem_ptr[T](c, m).less(&w) { lo = m + 1 } else { hi = m }
+    }
+    if lo >= vec_len[T](c) { return 0 }
+    let p: *mut T = vec_elem_ptr[T](c, lo)
+    if w.less(p) { return 0 }
+    return run_len[T](c, lo)
+}
+
+fn max_count[T: Ord](c: *mut Vec[T]) -> usize {
+    var best: usize = 0
+    var i: usize = 0
+    while i < vec_len[T](c) {
+        let r: usize = run_len[T](c, i)
+        if r > best { best = r }
+        i = i + r
+    }
+    return best
+}
+
+// statistics.mode: the FIRST element (in input order) with the highest count.
+// false for an empty input.
+fn stat_mode[T: Ord](v: *mut Vec[T], out: *mut T) -> bool {
+    if vec_len[T](v) == 0 { return false }
+    var c: Vec[T] = vec_new[T]()
+    vec_copy[T](v, &c)
+    vec_sort[T](&c)
+    let best: usize = max_count[T](&c)
+    var i: usize = 0
+    while i < vec_len[T](v) {
+        let x: T = *vec_elem_ptr[T](v, i)
+        if count_of[T](&c, x) == best {
+            *out = x
+            break
+        }
+        i = i + 1
+    }
+    vec_free[T](&c)
+    return true
+}
+
+// statistics.multimode: every element with the highest count, in first-seen
+// order, each once. APPENDS to `out`.
+fn stat_multimode[T: Ord](v: *mut Vec[T], out: *mut Vec[T]) {
+    if vec_len[T](v) == 0 { return }
+    var c: Vec[T] = vec_new[T]()
+    vec_copy[T](v, &c)
+    vec_sort[T](&c)
+    let best: usize = max_count[T](&c)
+    var seen: Vec[T] = vec_new[T]()
+    var i: usize = 0
+    while i < vec_len[T](v) {
+        let x: T = *vec_elem_ptr[T](v, i)
+        if count_of[T](&c, x) == best && count_of[T](&seen, x) == 0 {
+            vec_push[T](out, x)
+            vec_push[T](&seen, x)
+            vec_sort[T](&seen)
+        }
+        i = i + 1
+    }
+    vec_free[T](&seen)
+    vec_free[T](&c)
+}

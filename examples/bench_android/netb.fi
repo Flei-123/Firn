@@ -1,0 +1,119 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/bench_android/netb.fi -- network benchmark of the bench app (spec: NETB_SPEC.md).
+//
+// Ten GETs of <base>nb_small.bin, each on a FRESH connection (no keep-alive: DNS cache + TCP + TLS 1.3 handshake + request), then one GET of
+// <base>nb_big.bin (5 MiB). Per request: ms to the complete response head (ttfb), ms to the complete body (total), body length and an
+// FNV-1a 32 checksum of the body (same as the hash kernel of CPU_SPEC.md). The Kotlin app (LabScreen.kt, NetBench) does the same.
+// Requests run strictly one after another on the UI loop (async.ahttp), the checksum runs inside the callback and is NOT part of "total".
+//
+// Log lines (tag BENCH):
+//   netb small i=<n> status=<s> bytes=<n> ttfb=<ms> total=<ms> fnv=<cs>
+//   netb big status=<s> bytes=<n> ttfb=<ms> total=<ms> fnv=<cs>
+//   netb_sum small_ttfb_med=<ms> small_total_med=<ms> small_ttfb_first=<ms> small_total_first=<ms> big_ttfb=<ms> big_total=<ms> ok=<0|1>
+import std.rt
+import async.ahttp
+import plat.blog
+
+export { start, running }
+
+const N_SMALL: usize = 10
+
+static mut G_CLIENT: u64 = 0
+static mut G_BASE_P: u64 = 0
+static mut G_BASE_N: usize = 0
+static mut G_I: usize = 0
+static mut G_RUN: bool = false
+static mut G_OK: bool = true
+static mut G_TTFB: [i64; 10] = [0; 10]
+static mut G_TOT: [i64; 10] = [0; 10]
+
+fn dec(v: i64) -> str {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_dec_i64(&b, v)
+    let s: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return s
+}
+
+fn running() -> bool { return G_RUN }
+
+fn base() -> str {
+    return str { p: G_BASE_P as *mut u8, n: G_BASE_N }
+}
+
+// FNV-1a 32 over n octets at p (masked to 32 bits after every step: no overflow)
+fn fnv32(p: u64, n: usize) -> i64 {
+    var h: i64 = 2166136261
+    var i: usize = 0
+    while i < n {
+        h = ((h ^ (rt.ld8(p, i) as i64)) * 16777619) & 4294967295
+        i = i + 1
+    }
+    return h
+}
+
+fn median(a: *mut [i64; 10], n: usize) -> i64 {
+    var t: [i64; 10] = [0; 10]
+    var i: usize = 0
+    while i < n {
+        t[i] = (*a)[i]
+        i = i + 1
+    }
+    i = 1
+    while i < n {
+        let v: i64 = t[i]
+        var j: usize = i
+        while j > 0 && t[j - 1] > v {
+            t[j] = t[j - 1]
+            j = j - 1
+        }
+        t[j] = v
+        i = i + 1
+    }
+    return t[n / 2]
+}
+
+// base: URL prefix ending in '/', e.g. "https://jarvis.fleitec.com/abc123/"
+fn start(client: u64, b: str) {
+    if G_RUN { return }
+    G_RUN = true
+    G_OK = true
+    G_CLIENT = client
+    let keep: str = __str_copy(b)
+    G_BASE_P = keep.p as u64
+    G_BASE_N = keep.n
+    G_I = 0
+    ahttp.aclient_set_keepalive(client as *mut ahttp.AClient, false)
+    next()
+}
+
+fn next() {
+    var u: str = base() + "nb_small.bin"
+    if G_I >= N_SMALL { u = base() + "nb_big.bin" }
+    let r: *mut ahttp.Request = ahttp.aclient_get_str(G_CLIENT as *mut ahttp.AClient, u, 30000, done, 0)
+}
+
+fn done(r: *mut ahttp.Request, ud: u64) {
+    let st: i64 = ahttp.areq_status(r) as i64
+    let nb: usize = ahttp.areq_body_len(r)
+    let tot: i64 = ahttp.areq_elapsed_ms(r)
+    let ttfb: i64 = ahttp.areq_first_ms(r)
+    var cs: i64 = 0 - 1
+    if st == 200 && ahttp.areq_error(r) == 0 { cs = fnv32(ahttp.areq_body_ptr(r), nb) } else { G_OK = false }
+    if G_I < N_SMALL {
+        G_TTFB[G_I] = ttfb
+        G_TOT[G_I] = tot
+        blog.log("BENCH", "netb small i=" + dec(G_I as i64) + " status=" + dec(st) + " bytes=" + dec(nb as i64)
+            + " ttfb=" + dec(ttfb) + " total=" + dec(tot) + " fnv=" + dec(cs))
+        G_I = G_I + 1
+        next()
+        return
+    }
+    blog.log("BENCH", "netb big status=" + dec(st) + " bytes=" + dec(nb as i64) + " ttfb=" + dec(ttfb) + " total=" + dec(tot) + " fnv=" + dec(cs))
+    var ok: i64 = 0
+    if G_OK { ok = 1 }
+    blog.log("BENCH", "netb_sum small_ttfb_med=" + dec(median(&G_TTFB, N_SMALL)) + " small_total_med=" + dec(median(&G_TOT, N_SMALL))
+        + " small_ttfb_first=" + dec(G_TTFB[0]) + " small_total_first=" + dec(G_TOT[0])
+        + " big_ttfb=" + dec(ttfb) + " big_total=" + dec(tot) + " ok=" + dec(ok))
+    G_RUN = false
+}

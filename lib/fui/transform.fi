@@ -231,7 +231,8 @@ fn xf_scale_hint(x: *mut Xform) -> f64 {
 // for the STRAIGHT size of a widget -- a rotated rectangle
 // needs the bounding box of the rotated corners, and that is larger.
 struct Window {
-    ra: raster.Raster,
+    ra: raster.Raster, // own raster: only for a window larger than the painter's buffer
+    shared: bool, // true = the raster is the painter's own (r459), false = `ra`
     buf: *mut u8,
     n: usize,
     ox: i64,
@@ -239,9 +240,23 @@ struct Window {
     ok: bool,
 }
 
-fn window_open(x0: f64, y0: f64, x1: f64, y1: f64) -> Window {
-    var f: Window = Window { ra: raster.raster_new(), buf: 0 as *mut u8,
+fn window_blank() -> Window {
+    return Window { ra: raster.raster_new(), shared: false, buf: 0 as *mut u8,
         n: 0, ox: 0, oy: 0, ok: false }
+}
+
+// r459: a window that fits into the painter's own raster buffer (sized for the whole canvas) uses THAT one: no allocation of
+// (w + 2) * h * 8 octets and no clearing of fresh memory for every rotated box / glyph run of every animation frame -- the raster
+// cleans up what it used when the next window begins. Only a window larger than that buffer gets a buffer of its own, as before.
+fn wra(z: *mut painter.Painter, f: *mut Window) -> *mut raster.Raster {
+    if (*f).shared {
+        return &(*z).ra
+    }
+    return &(*f).ra
+}
+
+fn window_open(z: *mut painter.Painter, f: *mut Window, x0: f64, y0: f64, x1: f64, y1: f64) {
+    (*f).ok = false
     var ax: i64 = (matrix.m_floor(x0) as i64) - 1
     var ay: i64 = (matrix.m_floor(y0) as i64) - 1
     if ax < 0 { ax = 0 }
@@ -251,20 +266,26 @@ fn window_open(x0: f64, y0: f64, x1: f64, y1: f64) -> Window {
     let w: i64 = bx - ax
     let h: i64 = by - ay
     if w <= 0 || h <= 0 {
-        return f
+        return
     }
     let n: usize = raster.raster_bytes_needed(w as usize, h as usize)
-    f.buf = rt.heap_alloc(n) as *mut u8
-    if f.buf as usize == 0 {
-        return f
+    if n <= (*z).rcap && (*z).rbuf as usize != 0 {
+        (*f).shared = true
+        if !raster.raster_begin(&(*z).ra, ax as f64, ay as f64, w as usize, h as usize) {
+            return
+        }
+    } else {
+        (*f).buf = rt.heap_alloc(n) as *mut u8
+        if (*f).buf as usize == 0 {
+            return
+        }
+        (*f).n = n
+        raster.raster_attach(&(*f).ra, (*f).buf, n)
+        raster.raster_begin(&(*f).ra, ax as f64, ay as f64, w as usize, h as usize)
     }
-    f.n = n
-    raster.raster_attach(&f.ra, f.buf, n)
-    raster.raster_begin(&f.ra, ax as f64, ay as f64, w as usize, h as usize)
-    f.ox = ax
-    f.oy = ay
-    f.ok = true
-    return f
+    (*f).ox = ax
+    (*f).oy = ay
+    (*f).ok = true
 }
 
 fn window_close(f: *mut Window) {
@@ -296,16 +317,17 @@ fn tf_fill_quad(z: *mut painter.Painter, x0: f64, y0: f64, x1: f64,
     let ly: f64 = less(less(y0, y1), less(y2, y3))
     let hx: f64 = greater(greater(x0, x1), greater(x2, x3))
     let hy: f64 = greater(greater(y0, y1), greater(y2, y3))
-    var f: Window = window_open(lx, ly, hx, hy)
+    var f: Window = window_blank()
+    window_open(z, &f, lx, ly, hx, hy)
     if !f.ok {
         return
     }
-    raster.raster_line(&f.ra, x0, y0, x1, y1)
-    raster.raster_line(&f.ra, x1, y1, x2, y2)
-    raster.raster_line(&f.ra, x2, y2, x3, y3)
-    raster.raster_line(&f.ra, x3, y3, x0, y0)
-    raster.raster_finish(&f.ra)
-    painter.painter_fill_raster(z, &f.ra,
+    raster.raster_line(wra(z, &f), x0, y0, x1, y1)
+    raster.raster_line(wra(z, &f), x1, y1, x2, y2)
+    raster.raster_line(wra(z, &f), x2, y2, x3, y3)
+    raster.raster_line(wra(z, &f), x3, y3, x0, y0)
+    raster.raster_finish(wra(z, &f))
+    painter.painter_fill_raster(z, wra(z, &f),
         f.ox as usize, f.oy as usize, col)
     window_close(&f)
 }
@@ -350,7 +372,8 @@ fn tf_fill_round_rect(z: *mut painter.Painter, xf: *mut Xform, x: f64,
     let ey2: f64 = matrix.mat_y(m, x + w, y + h)
     let ex3: f64 = matrix.mat_x(m, x, y + h)
     let ey3: f64 = matrix.mat_y(m, x, y + h)
-    var f: Window = window_open(
+    var f: Window = window_blank()
+    window_open(z, &f,
         less(less(ex0, ex1), less(ex2, ex3)),
         less(less(ey0, ey1), less(ey2, ey3)),
         greater(greater(ex0, ex1), greater(ex2, ex3)),
@@ -362,16 +385,16 @@ fn tf_fill_round_rect(z: *mut painter.Painter, xf: *mut Xform, x: f64,
     let x1: f64 = x + w
     let y1: f64 = y + h
     // top, clockwise -- the same direction of travel as painter.path_round
-    lin(&f.ra, m, x + r, y, x1 - r, y)
-    kub(&f.ra, m, x1 - r, y, x1 - r + k, y, x1, y + r - k, x1, y + r)
-    lin(&f.ra, m, x1, y + r, x1, y1 - r)
-    kub(&f.ra, m, x1, y1 - r, x1, y1 - r + k, x1 - r + k, y1, x1 - r, y1)
-    lin(&f.ra, m, x1 - r, y1, x + r, y1)
-    kub(&f.ra, m, x + r, y1, x + r - k, y1, x, y1 - r + k, x, y1 - r)
-    lin(&f.ra, m, x, y1 - r, x, y + r)
-    kub(&f.ra, m, x, y + r, x, y + r - k, x + r - k, y, x + r, y)
-    raster.raster_finish(&f.ra)
-    painter.painter_fill_raster(z, &f.ra,
+    lin(wra(z, &f), m, x + r, y, x1 - r, y)
+    kub(wra(z, &f), m, x1 - r, y, x1 - r + k, y, x1, y + r - k, x1, y + r)
+    lin(wra(z, &f), m, x1, y + r, x1, y1 - r)
+    kub(wra(z, &f), m, x1, y1 - r, x1, y1 - r + k, x1 - r + k, y1, x1 - r, y1)
+    lin(wra(z, &f), m, x1 - r, y1, x + r, y1)
+    kub(wra(z, &f), m, x + r, y1, x + r - k, y1, x, y1 - r + k, x, y1 - r)
+    lin(wra(z, &f), m, x, y1 - r, x, y + r)
+    kub(wra(z, &f), m, x, y + r, x, y + r - k, x + r - k, y, x + r, y)
+    raster.raster_finish(wra(z, &f))
+    painter.painter_fill_raster(z, wra(z, &f),
         f.ox as usize, f.oy as usize, col)
     window_close(&f)
 }
@@ -602,7 +625,8 @@ fn tf_text(z: *mut painter.Painter, xf: *mut Xform, x: f64, base_y: f64,
     let e2y: f64 = matrix.mat_y(m, lx1, ly1)
     let e3x: f64 = matrix.mat_x(m, lx0, ly1)
     let e3y: f64 = matrix.mat_y(m, lx0, ly1)
-    var f: Window = window_open(
+    var f: Window = window_blank()
+    window_open(z, &f,
         less(less(e0x, e1x), less(e2x, e3x)),
         less(less(e0y, e1y), less(e2y, e3y)),
         greater(greater(e0x, e1x), greater(e2x, e3x)),
@@ -638,7 +662,7 @@ fn tf_text(z: *mut painter.Painter, xf: *mut Xform, x: f64, base_y: f64,
         var adv: usize = 1
         let cp: u32 = utf8_bei(p, cnt, i, &adv)
         let gid: u32 = ttf.font_glyph_for(fnt, cp)
-        let okg: bool = ttf.outline_at(fnt, gid, &f.ra,
+        let okg: bool = ttf.outline_at(fnt, gid, wra(z, &f),
             matrix.mat_x(m, pen, base_y), matrix.mat_y(m, pen, base_y),
             gsc, m00, m01, m10, m11, 0.0, 0.0, sc, TF_SCRATCH, 0)
         var step: f64 = metrics.fm_advance(fm, size, cp)
@@ -651,8 +675,8 @@ fn tf_text(z: *mut painter.Painter, xf: *mut Xform, x: f64, base_y: f64,
         pen = pen + step
         i = i + adv
     }
-    raster.raster_finish(&f.ra)
-    painter.painter_fill_raster(z, &f.ra,
+    raster.raster_finish(wra(z, &f))
+    painter.painter_fill_raster(z, wra(z, &f),
         f.ox as usize, f.oy as usize, col)
     rt.heap_free(sc as u64, TF_SCRATCH)
     window_close(&f)

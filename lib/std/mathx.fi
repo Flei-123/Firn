@@ -1,0 +1,571 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/std/mathx.fi -- std.mathx: the part of Python's `math` that std.math
+// does not have. Import both; call everything qualified (`mathx.comb(..)`).
+//
+//     import std.mathx
+//
+//     mathx.copysign(3.0, -0.0)      // -3
+//     mathx.remainder(7.0, 2.0)      // -1   (IEEE, round-half-even quotient)
+//     mathx.asin(0.5)  mathx.acos(x)  mathx.sinh(x)  mathx.tanh(x)  mathx.asinh(x)
+//     mathx.expm1(1e-10)  mathx.log1p(1e-10)  mathx.cbrt(27.0)
+//     mathx.degrees(x)  mathx.radians(x)  mathx.erf(x)  mathx.erfc(x)
+//     mathx.gamma(5.0)  mathx.lgamma(x)
+//     mathx.isclose(a, b, 1e-9, 0.0)      // math.isclose(a, b, rel_tol, abs_tol)
+//     mathx.fsum(&v)                      // math.fsum: correctly rounded sum of a Vec[f64]
+//
+//     // integers (u64 results report overflow instead of wrapping)
+//     var r: u64 = 0
+//     mathx.factorial(20, &r)             // true, r = 2432902008176640000
+//     mathx.comb(60, 30, &r)  mathx.perm(10, 3, &r)
+//     mathx.gcd_i64(-12, 18)  mathx.lcm_i64(4, -6)   // always >= 0, like Python
+//     mathx.floordiv(-7, 2)  mathx.floormod(-7, 2)   // -4, 1 (Python // and %)
+//     mathx.fmod_py(-7.5, 2.0)                       // Python float %  -> 0.5
+//     mathx.mul_mod(a, b, m)  mathx.pow_mod(b, e, m)  mathx.mod_inv(a, m, &inv)
+//
+// Accuracy: the transcendental functions sit on std.math exp/ln/atan2 (about
+// 1e-12 relative, see tests/805); copysign, remainder, fsum, isclose,
+// degrees/radians and all integer functions are exact (tests/4521, 4522
+// compare bit for bit with CPython). Needs `import std.math`'s kernel-pure
+// base only; allocates just in fsum.
+import std.rt
+import std.vec
+import std.math
+
+export { copysign, remainder, degrees, radians, asin, acos, sinh, cosh, tanh,
+    asinh, acosh, atanh, expm1, log1p, cbrt, erf, erfc, gamma, lgamma,
+    isclose, fsum, factorial, comb, perm, gcd_i64, lcm_i64, floordiv, floormod,
+    fmod_py, mul_mod, pow_mod, mod_inv }
+
+fn vec_f(v: *mut Vec[f64], i: usize) -> f64 {
+    return *vec_elem_ptr[f64](v, i)
+}
+
+// ------------------------------------------------------------------ floats
+
+#[allow_fp]
+fn copysign(x: f64, y: f64) -> f64 {
+    let sign: u64 = 0x8000000000000000
+    let bx: u64 = math.math_bits(x) & (sign ^ 0xffffffffffffffff)
+    let by: u64 = math.math_bits(y) & sign
+    return math.math_f64(bx | by)
+}
+
+// IEEE 754 remainder: x - n*y with n = x/y rounded half to even. Exact.
+#[allow_fp]
+fn remainder(x: f64, y: f64) -> f64 {
+    if math.is_nan(x) || math.is_nan(y) || math.is_infinite(x) || y == 0.0 {
+        return math.NAN()
+    }
+    if math.is_infinite(y) {
+        return x
+    }
+    let ax: f64 = math.fabs(x)
+    let ay: f64 = math.fabs(y)
+    let r2: f64 = math.fmod(ax, 2.0 * ay)
+    var rem: f64 = r2
+    if 2.0 * r2 > ay {
+        let t: f64 = r2 - ay
+        if 2.0 * t < ay {
+            rem = t
+        } else {
+            rem = t - ay
+        }
+    }
+    if rem == 0.0 {
+        return copysign(0.0, x)
+    }
+    if x < 0.0 {
+        return 0.0 - rem
+    }
+    return rem
+}
+
+#[allow_fp]
+fn degrees(x: f64) -> f64 {
+    return x * (180.0 / math.PI())
+}
+
+#[allow_fp]
+fn radians(x: f64) -> f64 {
+    return x * (math.PI() / 180.0)
+}
+
+#[allow_fp]
+fn asin(x: f64) -> f64 {
+    if math.is_nan(x) || math.fabs(x) > 1.0 { return math.NAN() }
+    return math.atan2(x, math.sqrt((1.0 - x) * (1.0 + x)))
+}
+
+#[allow_fp]
+fn acos(x: f64) -> f64 {
+    if math.is_nan(x) || math.fabs(x) > 1.0 { return math.NAN() }
+    return math.atan2(math.sqrt((1.0 - x) * (1.0 + x)), x)
+}
+
+// exp(x) - 1 without the cancellation near 0.
+#[allow_fp]
+fn expm1(x: f64) -> f64 {
+    if math.is_nan(x) { return x }
+    if math.fabs(x) < 0.5 {
+        // Taylor series, converges fast and loses nothing for |x| < 0.5
+        var term: f64 = x
+        var sum: f64 = x
+        var n: i64 = 2
+        while n < 30 {
+            term = term * x / (n as f64)
+            sum = sum + term
+            if math.fabs(term) < 1e-18 * math.fabs(sum) { break }
+            n = n + 1
+        }
+        return sum
+    }
+    return math.exp(x) - 1.0
+}
+
+// ln(1 + x) without the cancellation near 0.
+#[allow_fp]
+fn log1p(x: f64) -> f64 {
+    if math.is_nan(x) || x < -1.0 { return math.NAN() }
+    if x == -1.0 { return 0.0 - math.INF() }
+    if math.fabs(x) < 0.25 {
+        // ln(1+x) = 2 atanh(s), s = x / (2 + x)
+        let s: f64 = x / (2.0 + x)
+        let q: f64 = s * s
+        var term: f64 = s
+        var sum: f64 = s
+        var k: i64 = 1
+        while k < 40 {
+            term = term * q
+            let add: f64 = term / ((2 * k + 1) as f64)
+            sum = sum + add
+            if math.fabs(add) < 1e-18 * math.fabs(sum) { break }
+            k = k + 1
+        }
+        return 2.0 * sum
+    }
+    return math.ln(1.0 + x)
+}
+
+#[allow_fp]
+fn sinh(x: f64) -> f64 {
+    if math.is_nan(x) || math.is_infinite(x) { return x }
+    let a: f64 = math.fabs(x)
+    var r: f64 = 0.0
+    if a < 0.5 {
+        let e: f64 = expm1(a)
+        r = 0.5 * (e + e / (e + 1.0))
+    } else if a > 700.0 {
+        r = math.exp(a - 0.6931471805599453) // exp(a) / 2 without overflow
+    } else {
+        let e: f64 = math.exp(a)
+        r = 0.5 * (e - 1.0 / e)
+    }
+    if x < 0.0 { return 0.0 - r }
+    return r
+}
+
+#[allow_fp]
+fn cosh(x: f64) -> f64 {
+    if math.is_nan(x) { return x }
+    let a: f64 = math.fabs(x)
+    if math.is_infinite(a) { return a }
+    if a > 700.0 { return math.exp(a - 0.6931471805599453) }
+    let e: f64 = math.exp(a)
+    return 0.5 * (e + 1.0 / e)
+}
+
+#[allow_fp]
+fn tanh(x: f64) -> f64 {
+    if math.is_nan(x) { return x }
+    let a: f64 = math.fabs(x)
+    var r: f64 = 1.0
+    if a < 20.0 {
+        let e: f64 = expm1(2.0 * a)
+        r = e / (e + 2.0)
+    }
+    if x < 0.0 { return 0.0 - r }
+    return r
+}
+
+#[allow_fp]
+fn asinh(x: f64) -> f64 {
+    if math.is_nan(x) || math.is_infinite(x) { return x }
+    let a: f64 = math.fabs(x)
+    var r: f64 = 0.0
+    if a > 1e150 {
+        r = math.ln(a) + math.LN2()
+    } else {
+        r = log1p(a + a * a / (1.0 + math.sqrt(1.0 + a * a)))
+    }
+    if x < 0.0 { return 0.0 - r }
+    return r
+}
+
+#[allow_fp]
+fn acosh(x: f64) -> f64 {
+    if math.is_nan(x) || x < 1.0 { return math.NAN() }
+    if math.is_infinite(x) { return x }
+    if x > 1e150 { return math.ln(x) + math.LN2() }
+    let t: f64 = x - 1.0
+    return log1p(t + math.sqrt(2.0 * t + t * t))
+}
+
+#[allow_fp]
+fn atanh(x: f64) -> f64 {
+    if math.is_nan(x) || math.fabs(x) > 1.0 { return math.NAN() }
+    if x == 1.0 { return math.INF() }
+    if x == -1.0 { return 0.0 - math.INF() }
+    return 0.5 * log1p(2.0 * x / (1.0 - x))
+}
+
+#[allow_fp]
+fn cbrt(x: f64) -> f64 {
+    if x == 0.0 || math.is_nan(x) || math.is_infinite(x) { return x }
+    let a: f64 = math.fabs(x)
+    var y: f64 = math.exp(math.ln(a) / 3.0)
+    var i: i64 = 0
+    while i < 3 {
+        y = y - (y * y * y - a) / (3.0 * y * y)
+        i = i + 1
+    }
+    if x < 0.0 { return 0.0 - y }
+    return y
+}
+
+// erf by the all-positive series  2/sqrt(pi) e^{-x^2} sum 2^n x^{2n+1} / (2n+1)!!
+// (no cancellation); erfc by a continued fraction for x >= 2.
+#[allow_fp]
+fn erf(x: f64) -> f64 {
+    if math.is_nan(x) { return x }
+    let a: f64 = math.fabs(x)
+    var r: f64 = 1.0
+    if a < 3.0 {
+        var term: f64 = a
+        var sum: f64 = a
+        var n: i64 = 1
+        while n < 200 {
+            term = term * 2.0 * a * a / ((2 * n + 1) as f64)
+            sum = sum + term
+            if term < 1e-18 * sum { break }
+            n = n + 1
+        }
+        r = 1.1283791670955126 * math.exp(0.0 - a * a) * sum
+    } else if a < 6.0 {
+        r = 1.0 - erfc_cf(a)
+    }
+    if x < 0.0 { return 0.0 - r }
+    return r
+}
+
+// erfc(x) for x >= 2 by the Laplace continued fraction (modified Lentz).
+#[allow_fp]
+fn erfc_cf(a: f64) -> f64 {
+    // erfc(a) = exp(-a^2)/sqrt(pi) * 1/(a + (1/2)/(a + 1/(a + (3/2)/(a + 2/(a + ...)))))
+    var f: f64 = a
+    var k: i64 = 60
+    while k >= 1 {
+        f = a + ((k as f64) * 0.5) / f
+        k = k - 1
+    }
+    return math.exp(0.0 - a * a) / (1.7724538509055159 * f)
+}
+
+#[allow_fp]
+fn erfc(x: f64) -> f64 {
+    if math.is_nan(x) { return x }
+    if x >= 2.0 {
+        if x > 27.0 { return 0.0 }
+        return erfc_cf(x)
+    }
+    return 1.0 - erf(x)
+}
+
+// Lanczos approximation, g = 7, n = 9 (about 1e-15 relative).
+#[allow_fp]
+fn lanczos_sum(x: f64) -> f64 {
+    var c: [f64; 9] = [0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+        771.32342877765313, -176.61502916214059, 12.507343278686905,
+        -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7]
+    var s: f64 = c[0]
+    var i: usize = 1
+    while i < 9 {
+        s = s + c[i] / (x + (i as f64) - 1.0)
+        i = i + 1
+    }
+    return s
+}
+
+#[allow_fp]
+fn lgamma(x: f64) -> f64 {
+    if math.is_nan(x) { return x }
+    if math.is_infinite(x) { return math.INF() }
+    if x <= 0.0 && math.floor(x) == x { return math.INF() }
+    if x < 0.5 {
+        // reflection: lgamma(x) = ln(pi / |sin(pi x)|) - lgamma(1 - x)
+        return math.ln(math.PI() / math.fabs(math.sin(math.PI() * x))) - lgamma(1.0 - x)
+    }
+    let y: f64 = x - 1.0
+    let t: f64 = y + 7.5
+    return 0.9189385332046727 + (y + 0.5) * math.ln(t) - t + math.ln(lanczos_sum(y + 1.0))
+}
+
+#[allow_fp]
+fn gamma(x: f64) -> f64 {
+    if math.is_nan(x) { return x }
+    if x == math.INF() { return x }
+    if x <= 0.0 && math.floor(x) == x { return math.NAN() }
+    if x == math.floor(x) && x < 24.0 {
+        // exact small factorials
+        var r: f64 = 1.0
+        var k: f64 = 2.0
+        while k < x {
+            r = r * k
+            k = k + 1.0
+        }
+        return r
+    }
+    if x < 0.5 {
+        return math.PI() / (math.sin(math.PI() * x) * gamma(1.0 - x))
+    }
+    if x > 171.7 { return math.INF() }
+    let y: f64 = x - 1.0
+    let t: f64 = y + 7.5
+    // halve the power so t^(y+0.5) cannot overflow before exp(-t) shrinks it
+    let p: f64 = math.powf(t, (y + 0.5) * 0.5)
+    return 2.5066282746310002 * p * math.exp(0.0 - t) * p * lanczos_sum(y + 1.0)
+}
+
+// math.isclose
+#[allow_fp]
+fn isclose(a: f64, b: f64, rel_tol: f64, abs_tol: f64) -> bool {
+    if a == b { return true }
+    if math.is_nan(a) || math.is_nan(b) { return false }
+    if math.is_infinite(a) || math.is_infinite(b) { return false }
+    let diff: f64 = math.fabs(b - a)
+    return diff <= math.fabs(rel_tol * b) || diff <= math.fabs(rel_tol * a) || diff <= abs_tol
+}
+
+// math.fsum: Shewchuk's exact partial sums, rounded once (CPython's msum,
+// including the half-way correction).
+#[allow_fp]
+fn fsum(v: *mut Vec[f64]) -> f64 {
+    var partials: Vec[f64] = vec_new[f64]()
+    var special: f64 = 0.0
+    var has_special: bool = false
+    var i: usize = 0
+    while i < vec_len[f64](v) {
+        var x: f64 = vec_f(v, i)
+        i = i + 1
+        if !math.is_finite(x) {
+            special = special + x
+            has_special = true
+        } else {
+            var used: usize = 0
+            var j: usize = 0
+            while j < vec_len[f64](&partials) {
+                var y: f64 = vec_f(&partials, j)
+                if math.fabs(x) < math.fabs(y) {
+                    let t: f64 = x
+                    x = y
+                    y = t
+                }
+                let hi: f64 = x + y
+                let lo: f64 = y - (hi - x)
+                if lo != 0.0 {
+                    vec_set[f64](&partials, used, lo)
+                    used = used + 1
+                }
+                x = hi
+                j = j + 1
+            }
+            // partials[used:] = [x]
+            partials.len = used
+            vec_push[f64](&partials, x)
+        }
+    }
+    if has_special {
+        vec_free[f64](&partials)
+        return special
+    }
+    var n: usize = vec_len[f64](&partials)
+    var hi: f64 = 0.0
+    if n > 0 {
+        n = n - 1
+        hi = vec_f(&partials, n)
+        var lo: f64 = 0.0
+        while n > 0 {
+            let x: f64 = hi
+            n = n - 1
+            let y: f64 = vec_f(&partials, n)
+            hi = x + y
+            let yr: f64 = hi - x
+            lo = y - yr
+            if lo != 0.0 { break }
+        }
+        if n > 0 {
+            let prev: f64 = vec_f(&partials, n - 1)
+            if (lo < 0.0 && prev < 0.0) || (lo > 0.0 && prev > 0.0) {
+                let y: f64 = lo * 2.0
+                let x: f64 = hi + y
+                let yr: f64 = x - hi
+                if y == yr { hi = x }
+            }
+        }
+    }
+    vec_free[f64](&partials)
+    return hi
+}
+
+// Python's float `%`: the result has the sign of y.
+#[allow_fp]
+fn fmod_py(x: f64, y: f64) -> f64 {
+    if y == 0.0 || math.is_nan(x) || math.is_nan(y) || math.is_infinite(x) { return math.NAN() }
+    var m: f64 = math.fmod(x, y)
+    if m != 0.0 {
+        if (y < 0.0) != (m < 0.0) { m = m + y }
+    } else {
+        m = copysign(0.0, y)
+    }
+    return m
+}
+
+// ---------------------------------------------------------------- integers
+
+fn gcd_i64(a: i64, b: i64) -> i64 {
+    return math.gcd(abs_u(a), abs_u(b)) as i64
+}
+
+fn abs_u(a: i64) -> u64 {
+    if a < 0 { return (0 as u64) -% (a as u64) }
+    return a as u64
+}
+
+// lcm(a, b) >= 0; 0 when either is 0. Wraps on overflow like `*%`.
+fn lcm_i64(a: i64, b: i64) -> i64 {
+    if a == 0 || b == 0 { return 0 }
+    let g: u64 = math.gcd(abs_u(a), abs_u(b))
+    return ((abs_u(a) / g) *% abs_u(b)) as i64
+}
+
+// Python `//` and `%` on integers (floor semantics). b must not be 0.
+fn floordiv(a: i64, b: i64) -> i64 {
+    var q: i64 = a / b
+    if (a % b != 0) && ((a < 0) != (b < 0)) { q = q - 1 }
+    return q
+}
+
+fn floormod(a: i64, b: i64) -> i64 {
+    var m: i64 = a % b
+    if m != 0 && ((m < 0) != (b < 0)) { m = m + b }
+    return m
+}
+
+// n! into *out; false (out untouched) when it does not fit in u64 (n > 20).
+fn factorial(n: u64, out: *mut u64) -> bool {
+    if n > 20 { return false }
+    var r: u64 = 1
+    var k: u64 = 2
+    while k <= n {
+        r = r * k
+        k = k + 1
+    }
+    *out = r
+    return true
+}
+
+// comb(n, k) into *out; k > n gives 0 (true). false = does not fit in u64.
+fn comb(n: u64, k0: u64, out: *mut u64) -> bool {
+    if k0 > n {
+        *out = 0
+        return true
+    }
+    var k: u64 = k0
+    if n - k < k { k = n - k }
+    var r: u64 = 1
+    var i: u64 = 0
+    while i < k {
+        // r = r * (n - i) / (i + 1), exact; reduce first so only a true
+        // overflow of the result is reported
+        let d: u64 = i + 1
+        let g: u64 = math.gcd(r, d)
+        let r1: u64 = r / g
+        let d1: u64 = d / g
+        let m: u64 = (n - i) / d1
+        if r1 != 0 && m > 0xffffffffffffffff / r1 { return false }
+        r = r1 * m
+        i = i + 1
+    }
+    *out = r
+    return true
+}
+
+// perm(n, k) = n! / (n-k)! into *out; k > n gives 0.
+fn perm(n: u64, k: u64, out: *mut u64) -> bool {
+    if k > n {
+        *out = 0
+        return true
+    }
+    var r: u64 = 1
+    var i: u64 = 0
+    while i < k {
+        let m: u64 = n - i
+        if m > 0 && r > 0xffffffffffffffff / m { return false }
+        r = r * m
+        i = i + 1
+    }
+    *out = r
+    return true
+}
+
+// (a * b) mod m for any u64 without a 128 bit type (m != 0).
+fn mul_mod(a0: u64, b0: u64, m: u64) -> u64 {
+    var a: u64 = a0 % m
+    var b: u64 = b0 % m
+    var r: u64 = 0
+    while b > 0 {
+        if (b & 1) == 1 {
+            // r = (r + a) mod m without overflow
+            if r >= m - a { r = r - (m - a) } else { r = r + a }
+        }
+        // a = (2a) mod m
+        if a >= m - a { a = a - (m - a) } else { a = a + a }
+        b = b >> 1
+    }
+    return r
+}
+
+// pow(b, e, m) (m != 0).
+fn pow_mod(b: u64, e0: u64, m: u64) -> u64 {
+    if m == 1 { return 0 }
+    var r: u64 = 1
+    var base: u64 = b % m
+    var e: u64 = e0
+    while e > 0 {
+        if (e & 1) == 1 { r = mul_mod(r, base, m) }
+        base = mul_mod(base, base, m)
+        e = e >> 1
+    }
+    return r
+}
+
+// pow(a, -1, m): the inverse of a modulo m (m >= 2); false when gcd(a, m) != 1.
+fn mod_inv(a: u64, m: u64, out: *mut u64) -> bool {
+    if m < 2 { return false }
+    var r0: i64 = m as i64
+    var r1: i64 = (a % m) as i64
+    var t0: i64 = 0
+    var t1: i64 = 1
+    while r1 != 0 {
+        let q: i64 = r0 / r1
+        let r2: i64 = r0 - q * r1
+        r0 = r1
+        r1 = r2
+        let t2: i64 = t0 - q * t1
+        t0 = t1
+        t1 = t2
+    }
+    if r0 != 1 { return false }
+    if t0 < 0 { t0 = t0 + (m as i64) }
+    *out = t0 as u64
+    return true
+}
