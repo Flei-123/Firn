@@ -1,0 +1,464 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/fontpick.fi -- WHICH TEXT FACE: the choice of the user (system | inter | grotesk | mono), the same four as the
+// web app of JARVIS (lib/theme.js FONTS).
+//
+//   system   the face the PHONE shows: /system/etc/fonts.xml is parsed at run time, the first <font> of the family
+//            "sans-serif" (weight 400, style normal) is looked up in /system/fonts, /product/fonts, /system_ext/fonts,
+//            /data/fonts/files, /vendor/fonts (the first readable file that loads wins). Nothing found: sysfont's old
+//            chain (RobotoStatic ...). A bold face is taken the same way (weight 700) when it is another file.
+//   inter    <dir>/Inter-Regular.ttf + Inter-Bold.ttf        (static 400 / 700 instances of the web's variable font,
+//   grotesk  <dir>/SpaceGrotesk-Regular.ttf + ...-Bold.ttf    served by the server under /vendor/fonts/; the app saves them)
+//   mono     the monospace family of fonts.xml, else DroidSansMono / CutiveMono / RobotoMono
+//
+// Font slot 1 of the painter is the monospace face (title, code, meta text, like the web). Weight face 0 is the bold face.
+// lib/font reads TrueType (glyf) and the DEFAULT instance of a variable font only.
+//
+// Test hooks (host): FUI_FONTS_XML=<fonts.xml>, FUI_FONTS_DIR=<dir with the font files>.
+import std.rt
+import std.fs
+import font.metrics
+import fui.painter
+import plat.envvar
+
+export {
+    FP_SYSTEM, FP_INTER, FP_GROTESK, FP_MONO,
+    fontpick_id, fontpick_name, fontpick_boot, fontpick_choice, fontpick_dir, fontpick_set, fontpick_save,
+    fontpick_file_name, fontpick_files_present, fontpick_load_main, fontpick_apply, fontpick_apply_boot, fontpick_active, fontpick_switch, fontpick_system_file,
+}
+
+const FP_SYSTEM: usize = 0
+const FP_INTER: usize = 1
+const FP_GROTESK: usize = 2
+const FP_MONO: usize = 3
+
+const FONTSET_BYTES: usize = 4096
+const MAX_FONT: usize = 40000000
+
+static mut G_CHOICE: usize = 0
+static mut G_ACTIVE: bool = false
+static mut G_DIR: [u8; 400] = [0; 400]
+static mut G_DIR_N: usize = 0
+static mut G_SYS: [u8; 96] = [0; 96]
+static mut G_SYS_N: usize = 0
+
+// ------------------------------------------------------------------ ids
+
+// "system" | "inter" | "grotesk" | "mono" -> FP_*; anything else is the system face.
+fn fontpick_id(s: str) -> usize {
+    if s == "inter" { return FP_INTER }
+    if s == "grotesk" { return FP_GROTESK }
+    if s == "mono" { return FP_MONO }
+    return FP_SYSTEM
+}
+
+fn fontpick_name(c: usize) -> str {
+    if c == FP_INTER { return "inter" }
+    if c == FP_GROTESK { return "grotesk" }
+    if c == FP_MONO { return "mono" }
+    return "system"
+}
+
+fn fontpick_choice() -> usize { return G_CHOICE }
+
+// Did the program opt in (fontpick_boot)? Only then the window hosts use this module; every other program keeps sysfont's chain.
+fn fontpick_active() -> bool { return G_ACTIVE }
+
+// The window host calls it once the painter exists (before the first frame).
+fn fontpick_apply_boot(z: *mut painter.Painter) {
+    if G_ACTIVE { fontpick_apply(z) }
+}
+
+// The directory of the downloaded files (the app's data dir + "/fonts").
+fn fontpick_dir() -> str { return str { p: (&G_DIR[0]) as *mut u8, n: G_DIR_N } }
+
+fn fontpick_set(c: usize) { G_CHOICE = c }
+
+// The name of the system file that was used for the main face (log line), "" = none.
+fn fontpick_system_file() -> str { return str { p: (&G_SYS[0]) as *mut u8, n: G_SYS_N } }
+
+// The file of the web font for a choice: want_bold false = Regular, true = Bold; "" = the choice has no file.
+fn fontpick_file_name(c: usize, want_bold: bool) -> str {
+    if c == FP_INTER {
+        if want_bold { return "Inter-Bold.ttf" }
+        return "Inter-Regular.ttf"
+    }
+    if c == FP_GROTESK {
+        if want_bold { return "SpaceGrotesk-Bold.ttf" }
+        return "SpaceGrotesk-Regular.ttf"
+    }
+    return ""
+}
+
+// ------------------------------------------------------------------ small helpers
+
+fn put(b: *mut rt.Buf, s: str) { rt.buf_push_bytes(b, s.p as u64, s.n) }
+
+fn put_nul(b: *mut rt.Buf) {
+    var z: [u8; 1] = [0; 1]
+    rt.buf_push_bytes(b, (&z[0]) as u64, 1)
+}
+
+fn at(p: u64, i: usize) -> u8 { return rt.ld8(p, i) }
+
+// Does `s` stand at p[i..]? (within n)
+fn eq_at(p: u64, n: usize, i: usize, s: str) -> bool {
+    if i + s.n > n { return false }
+    var k: usize = 0
+    while k < s.n {
+        if at(p, i + k) != *(s.p + k) { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// Index of the first `s` in p[from..to), `to` when there is none.
+fn find(p: u64, to: usize, from: usize, s: str) -> usize {
+    var i: usize = from
+    while i + s.n <= to {
+        if eq_at(p, to, i, s) { return i }
+        i = i + 1
+    }
+    return to
+}
+
+fn is_ws(c: u8) -> bool { return c == 32 as u8 || c == 10 as u8 || c == 13 as u8 || c == 9 as u8 }
+
+// The value of ` name="..."` in p[from..to): start and length; false when the attribute is not there.
+fn attr_find(p: u64, from: usize, to: usize, name: str, vs: *mut usize, vl: *mut usize) -> bool {
+    var i: usize = from
+    while i < to {
+        if is_ws(at(p, i)) && eq_at(p, to, i + 1, name) && at(p, i + 1 + name.n) == 61 as u8 && at(p, i + 2 + name.n) == 34 as u8 {
+            let s: usize = i + 3 + name.n
+            var e: usize = s
+            while e < to && at(p, e) != 34 as u8 { e = e + 1 }
+            *vs = s
+            *vl = e - s
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn span_is(p: u64, s: usize, n: usize, lit: str) -> bool {
+    return n == lit.n && eq_at(p, s + n, s, lit)
+}
+
+fn span_num(p: u64, s: usize, n: usize) -> usize {
+    var v: usize = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = at(p, s + i)
+        if c < 48 as u8 || c > 57 as u8 { return 0 }
+        v = v * 10 + ((c - 48 as u8) as usize)
+        i = i + 1
+    }
+    return v
+}
+
+// Reads the file named by the NUL-terminated `path` and opens it as a font into `fs`. The octets stay in memory (the font
+// points into them). False = unreadable, too small/big, or not a TrueType font.
+fn load_path(path: *mut rt.Buf, fs: *mut metrics.FontSet) -> bool {
+    var data: rt.Buf = rt.buf_new()
+    if !rt.read_file(rt.buf_ptr(path), &data) {
+        rt.buf_free(&data)
+        return false
+    }
+    let n: usize = rt.buf_len(&data)
+    if n < 1024 || n > MAX_FONT {
+        rt.buf_free(&data)
+        return false
+    }
+    *fs = metrics.fontset_new()
+    if metrics.fontset_load(fs, rt.buf_ptr(&data) as *mut u8, n) { return true }
+    rt.buf_free(&data)
+    *fs = metrics.fontset_new()
+    return false
+}
+
+fn load_in(dir: str, name_p: u64, name_n: usize, fs: *mut metrics.FontSet) -> bool {
+    var path: rt.Buf = rt.buf_new()
+    put(&path, dir)
+    rt.buf_push_bytes(&path, name_p, name_n)
+    put_nul(&path)
+    let ok: bool = load_path(&path, fs)
+    rt.buf_free(&path)
+    return ok
+}
+
+fn env_str(name: str, out: *mut [u8; 300]) -> usize {
+    return envvar.env_value_copy(name, (&(*out)[0]) as u64, 300)
+}
+
+// A font file by its name in the places the system keeps them.
+fn load_system_named(name_p: u64, name_n: usize, fs: *mut metrics.FontSet) -> bool {
+    var eb: [u8; 300] = [0; 300]
+    let en: usize = env_str("FUI_FONTS_DIR", &eb)
+    if en > 0 {
+        var dd: rt.Buf = rt.buf_new()
+        rt.buf_push_bytes(&dd, (&eb[0]) as u64, en)
+        put(&dd, "/")
+        let okk: bool = load_in(str { p: rt.buf_ptr(&dd) as *mut u8, n: rt.buf_len(&dd) }, name_p, name_n, fs)
+        rt.buf_free(&dd)
+        if okk { return true }
+    }
+    if load_in("/system/fonts/", name_p, name_n, fs) { return true }
+    if load_in("/product/fonts/", name_p, name_n, fs) { return true }
+    if load_in("/system_ext/fonts/", name_p, name_n, fs) { return true }
+    if load_in("/data/fonts/files/", name_p, name_n, fs) { return true }
+    if load_in("/vendor/fonts/", name_p, name_n, fs) { return true }
+    return false
+}
+
+fn load_system_lit(name: str, fs: *mut metrics.FontSet) -> bool {
+    return load_system_named(name.p as u64, name.n, fs)
+}
+
+// ------------------------------------------------------------------ fonts.xml
+
+// The first font of family `fam` with `weight` (style normal) that loads. `skip_i/skip_n` (index in xml, length) = a file name to pass over (the
+// regular face when the bold one is wanted), skip_n 0 = none. `got` gets the file name (a view into `xml`).
+fn xml_font(xml: *mut rt.Buf, fam: str, weight: usize, skip_i: usize, skip_n: usize, fs: *mut metrics.FontSet,
+    got_s: *mut usize, got_n: *mut usize) -> bool {
+    let p: u64 = rt.buf_ptr(xml)
+    let n: usize = rt.buf_len(xml)
+    var i: usize = 0
+    while i < n {
+        let f: usize = find(p, n, i, "<family ")
+        if f >= n { return false }
+        let fe: usize = find(p, n, f, ">")
+        var e: usize = find(p, n, f, "</family>")
+        if fe < e {
+            var vs: usize = 0
+            var vl: usize = 0
+            if attr_find(p, f, fe, "name", &vs, &vl) && span_is(p, vs, vl, fam) {
+                var j: usize = fe
+                while j < e {
+                    let g: usize = find(p, e, j, "<font")
+                    if g >= e { break }
+                    let ge: usize = find(p, e, g, ">")
+                    var ws: usize = 0
+                    var wl: usize = 0
+                    var ss: usize = 0
+                    var sl: usize = 0
+                    var okw: bool = false
+                    if attr_find(p, g, ge, "weight", &ws, &wl) && span_num(p, ws, wl) == weight { okw = true }
+                    if okw && attr_find(p, g, ge, "style", &ss, &sl) && !span_is(p, ss, sl, "normal") { okw = false }
+                    if okw {
+                        var a: usize = ge + 1
+                        while a < e && is_ws(at(p, a)) { a = a + 1 }
+                        var b: usize = a
+                        while b < e && at(p, b) != 60 as u8 { b = b + 1 }
+                        while b > a && is_ws(at(p, b - 1)) { b = b - 1 }
+                        if b > a && !(skip_n > 0 && b - a == skip_n && same_span(p, a, skip_i, skip_n)) {
+                            if load_system_named(p + (a as u64), b - a, fs) {
+                                *got_s = a
+                                *got_n = b - a
+                                return true
+                            }
+                        }
+                    }
+                    j = ge + 1
+                }
+            }
+        }
+        if e >= n { return false }
+        i = e + 1
+    }
+    return false
+}
+
+fn same_span(p: u64, a: usize, c: usize, n: usize) -> bool {
+    var k: usize = 0
+    while k < n {
+        if at(p, a + k) != at(p, c + k) { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// fonts.xml of the machine (or FUI_FONTS_XML) into `out`; false = there is none.
+fn read_xml(out: *mut rt.Buf) -> bool {
+    var eb: [u8; 300] = [0; 300]
+    let en: usize = env_str("FUI_FONTS_XML", &eb)
+    if en > 0 {
+        if rt.read_file((&eb[0]) as u64, out) { return true }
+    }
+    var path: [u8; 22] = "/system/etc/fonts.xml\0"
+    return rt.read_file((&path[0]) as u64, out)
+}
+
+// ------------------------------------------------------------------ loading
+
+// The main face for the choice into `fs` (the old chain of sysfont is the caller's fallback). False = nothing found.
+fn fontpick_load_main(fs: *mut metrics.FontSet) -> bool {
+    let c: usize = G_CHOICE
+    if c == FP_INTER || c == FP_GROTESK {
+        if load_in_dir_file(fontpick_file_name(c, false), fs) { return true }
+    }
+    if c == FP_MONO {
+        if load_mono(fs) { return true }
+    }
+    return load_sans(fs, false)
+}
+
+fn load_in_dir_file(name: str, fs: *mut metrics.FontSet) -> bool {
+    if G_DIR_N == 0 || name.n == 0 { return false }
+    var d: rt.Buf = rt.buf_new()
+    put(&d, fontpick_dir())
+    put(&d, "/")
+    let ok: bool = load_in(str { p: rt.buf_ptr(&d) as *mut u8, n: rt.buf_len(&d) }, name.p as u64, name.n, fs)
+    rt.buf_free(&d)
+    return ok
+}
+
+// The sans-serif face of the phone (weight 400, or 700 for the bold one when it is another file than the regular one).
+fn load_sans(fs: *mut metrics.FontSet, bold: bool) -> bool {
+    var xml: rt.Buf = rt.buf_new()
+    if !read_xml(&xml) {
+        rt.buf_free(&xml)
+        return false
+    }
+    var gs: usize = 0
+    var gn: usize = 0
+    var ok: bool = false
+    if !bold {
+        ok = xml_font(&xml, "sans-serif", 400, 0, 0, fs, &gs, &gn)
+        if ok {
+            G_SYS_N = 0
+            while G_SYS_N < gn && G_SYS_N < 95 {
+                G_SYS[G_SYS_N] = at(rt.buf_ptr(&xml), gs + G_SYS_N)
+                G_SYS_N = G_SYS_N + 1
+            }
+        }
+    } else {
+        // the regular file is the one to pass over: a variable font serves 400 and 700 from one file (default instance only)
+        var rs: usize = 0
+        var rn: usize = 0
+        var tmp: metrics.FontSet = metrics.fontset_new()
+        if xml_font(&xml, "sans-serif", 400, 0, 0, &tmp, &rs, &rn) {
+            ok = xml_font(&xml, "sans-serif", 700, rs, rn, fs, &gs, &gn)
+        }
+    }
+    rt.buf_free(&xml)
+    return ok
+}
+
+fn load_mono(fs: *mut metrics.FontSet) -> bool {
+    var xml: rt.Buf = rt.buf_new()
+    if read_xml(&xml) {
+        var gs: usize = 0
+        var gn: usize = 0
+        if xml_font(&xml, "monospace", 400, 0, 0, fs, &gs, &gn) {
+            rt.buf_free(&xml)
+            return true
+        }
+    }
+    rt.buf_free(&xml)
+    if load_system_lit("DroidSansMono.ttf", fs) { return true }
+    if load_system_lit("RobotoMono-Regular.ttf", fs) { return true }
+    if load_system_lit("CutiveMono.ttf", fs) { return true }
+    var d: [u8; 52] = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf\0"
+    var pb: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&pb, (&d[0]) as u64, 52)
+    let ok: bool = load_path(&pb, fs)
+    rt.buf_free(&pb)
+    return ok
+}
+
+fn new_set() -> *mut metrics.FontSet {
+    return rt.heap_alloc(FONTSET_BYTES) as *mut metrics.FontSet
+}
+
+// The extras on a painter whose main face is already set: bold face (weight face 0) and the monospace face (slot 1).
+// Safe to call again (a live switch): old font sets stay in memory, the program switches rarely.
+fn fontpick_apply(z: *mut painter.Painter) {
+    let c: usize = G_CHOICE
+    // bold
+    let bs: *mut metrics.FontSet = new_set()
+    var bold_ok: bool = false
+    if bs as u64 != 0 {
+        if c == FP_INTER || c == FP_GROTESK {
+            bold_ok = load_in_dir_file(fontpick_file_name(c, true), bs)
+        } else if c == FP_SYSTEM {
+            bold_ok = load_sans(bs, true)
+        }
+    }
+    if bold_ok {
+        painter.painter_set_weight_face(z, 0, 700, bs as u64)
+    } else {
+        painter.painter_set_weight_face(z, 0, 0, 0)
+    }
+    // monospace
+    let ms: *mut metrics.FontSet = new_set()
+    if ms as u64 != 0 && load_mono(ms) {
+        painter.painter_set_font_slot(z, 1, ms as u64)
+    }
+}
+
+// Set the main face of a LIVE painter to the current choice (after the files arrived). False = nothing loaded (face unchanged).
+fn fontpick_switch(z: *mut painter.Painter) -> bool {
+    let fs: *mut metrics.FontSet = new_set()
+    if fs as u64 == 0 || !fontpick_load_main(fs) { return false }
+    painter.painter_set_font(z, fs as u64)
+    fontpick_apply(z)
+    return true
+}
+
+// Are the files of a choice in the directory? (system / mono: always true)
+fn fontpick_files_present(c: usize) -> bool {
+    if c != FP_INTER && c != FP_GROTESK { return true }
+    var fs: metrics.FontSet = metrics.fontset_new()
+    if !load_in_dir_file(fontpick_file_name(c, false), &fs) { return false }
+    return load_in_dir_file(fontpick_file_name(c, true), &fs)
+}
+
+// ------------------------------------------------------------------ choice on disk
+
+// The app calls it once at the start: `dir` = the folder of the downloaded files; the saved choice is read (<dir>/choice).
+fn fontpick_boot(dir: str) {
+    G_ACTIVE = true
+    G_DIR_N = 0
+    var i: usize = 0
+    while i < dir.n && i < 399 {
+        G_DIR[i] = *(dir.p + i)
+        i = i + 1
+    }
+    G_DIR_N = i
+    var path: rt.Buf = rt.buf_new()
+    put(&path, dir)
+    put(&path, "/choice")
+    put_nul(&path)
+    var data: rt.Buf = rt.buf_new()
+    G_CHOICE = FP_SYSTEM
+    if rt.read_file(rt.buf_ptr(&path), &data) {
+        var s: usize = 0
+        var w: [u8; 16] = [0; 16]
+        while s < rt.buf_len(&data) && s < 15 && !is_ws(rt.ld8(rt.buf_ptr(&data), s)) {
+            w[s] = rt.ld8(rt.buf_ptr(&data), s)
+            s = s + 1
+        }
+        G_CHOICE = fontpick_id(str { p: (&w[0]) as *mut u8, n: s })
+    }
+    rt.buf_free(&path)
+    rt.buf_free(&data)
+}
+
+// Remember the choice for the next start.
+fn fontpick_save(c: usize) -> bool {
+    if G_DIR_N == 0 { return false }
+    let m: bool = fs_mkdirs(fontpick_dir())
+    var path: rt.Buf = rt.buf_new()
+    put(&path, fontpick_dir())
+    put(&path, "/choice")
+    put_nul(&path)
+    let nm: str = fontpick_name(c)
+    let ok: bool = rt.write_file(rt.buf_ptr(&path), nm.p as u64, nm.n)
+    rt.buf_free(&path)
+    return ok
+}
+
+fn fs_mkdirs(d: str) -> bool {
+    let r: bool = fs.mkdir_all(d) catch false
+    return r
+}
