@@ -238,6 +238,29 @@ if [ -n "$GH" ]; then tap_word "$GH" 1 2; shot 07e_collapsed
     tap_word "$GH" 1 2; shot 07f_expanded
     check "the group expands again" "$(OCR_TRIES=8 wait_ocr 07f_expanded 'worker')" 1
 else note "no group header found by OCR"; fi
+# "..." menu of an entry (long press) + the Back key (A46; written, not run by the author)
+shot _lp; LP=$(word_at _lp 'worker' 1)
+if [ -n "$LP" ]; then
+    set -- $LP; $ADB shell input swipe $1 $2 $1 $2 800; sleep 2; shot 07i_menu # a long press on a chat entry opens its menu page
+    check "long press opens the entry menu (rename + delete)" "$(OCR_TRIES=8 wait_ocr 07i_menu 'Umbenennen')" 1 # english: ok
+    tap_word "Umbenennen" 1 2; shot 07j_rename # english: ok
+    check "rename shows the title field + save" "$(OCR_TRIES=8 wait_ocr 07j_rename 'Speichern')" 1 # english: ok
+    $ADB shell input keyevent KEYCODE_BACK; sleep 2; shot 07k_back1
+    check "Back leaves the rename step (menu page again, app still open)" "$(OCR_TRIES=8 wait_ocr 07k_back1 'L.schen')" 1 # english: ok
+    $ADB shell input keyevent KEYCODE_BACK; sleep 2; shot 07l_back2
+    check "Back closes the menu (list with Workers tab again)" "$(OCR_TRIES=8 wait_ocr 07l_back2 'Workers')" 1
+    check "the app is still in the foreground after Back" "$($ADB shell dumpsys window 2>/dev/null | grep -c 'mCurrentFocus.*org.fleitec.jarvis')" 1
+    set -- $LP; $ADB shell input swipe $1 $2 $1 $2 800; sleep 2
+    tap_word "Umbenennen" 1 2; sleep 1 # english: ok
+    $ADB shell input text "Renamed" ; $ADB shell input keyevent KEYCODE_ENTER; tap_word "Speichern" 1 3 # english: ok
+    check "rename reached the server (POST /api/m/chats/rename)" "$(wait_log '"path": "/api/m/chats/rename"' 10 | awk '{print ($1>0)?"yes":"no"}')" yes
+    shot 07m_renamed
+    check "the sidebar shows the new title" "$(OCR_TRIES=10 wait_ocr 07m_renamed 'Renamed')" 1
+    $ADB shell input keyevent KEYCODE_BACK; sleep 2; shot 07n_back3
+    check "Back closes the sidebar" "$(ocr 07n_back3 | grep -ci 'Workers')" 0
+    open_sidebar # the next steps pick a chat from the open sidebar
+else note "no chat entry found by OCR for the long press"; fi
+
 tap_word "task" 1 3; shot 07g_picked # the fake server lists 150 generated chats
 check "choosing a chat closes the sidebar" "$(ocr 07g_picked | grep -ci 'Workers')" 0
 check "the chosen chat was asked for (history route)" "$(wait_log '"path": "/api/conversations/' 10 | awk '{print ($1>0)?"yes":"no"}')" yes

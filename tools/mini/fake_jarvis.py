@@ -109,7 +109,14 @@ def sidebar_chats():
             row("s8", "Diplomarbeit", 100 * h), row("s9", "Anzug-KI", 24 * 20 * h), row("s10", "Russisch", 24 * 90 * h),
             row("w1", "Daidalos: Render", 6 * h, True, "worker", True)]
 
+RENAMED = {}   # POST /api/m/chats/rename: id -> new title (FAKE_NO_CHAT_OPS=1: an older server, 404)
+REMOVED = set()  # POST /api/m/chats/remove
+
 def all_chats():
+    rows = all_chats_raw()
+    return [dict(c, title=RENAMED.get(c["id"], c["title"])) for c in rows if c["id"] not in REMOVED]
+
+def all_chats_raw():
     if os.environ.get("FAKE_SIDEBAR") == "1":
         return sidebar_chats()
     base = [{"id": "c1", "title": "worker one", "kind": "worker", "updatedAt": 1760000000001, "running": True, "fav": True, "parent": None},
@@ -340,6 +347,17 @@ def rest(method, rawpath, hdr, body):
                                       "running": False if not part else True, "partial": part, "beat": None},
                              "first": lo, "hasMore": lo > 0,
                              "messages": [dict(m, i=i, at=1760000000000 + i) for i, m in enumerate(msgs) if lo <= i < end]})
+        if mp in ("chats/rename", "chats/remove") and method == "POST":
+            if os.environ.get("FAKE_NO_CHAT_OPS"): return out(404, {"error": "Not found"})
+            row = next((c for c in all_chats() if c["id"] == (j or {}).get("id")), None)
+            if not row: return out(404, {"error": "Not found"})
+            if mp == "chats/rename":
+                if not (j.get("title") or "").strip(): return out(400, {"error": "id/title missing"})
+                RENAMED[row["id"]] = j["title"][:120]
+                return out(200, {"ok": True, "id": row["id"], "title": RENAMED[row["id"]]})
+            if row.get("running"): return out(409, {"error": "Chat is running"})
+            REMOVED.add(row["id"])
+            return out(200, {"ok": True, "id": row["id"]})
         if mp == "push/register" and method == "POST":
             return out(200, {"pushToken": "00112233445566778899aabbccddeeff", "relay": {"host": "127.0.0.1", "port": 7781, "tls": False, "pin": None, "hello": True, "sni": None}, "poll": "/api/m/push/poll"})
         if mp == "push/test" and method == "POST":

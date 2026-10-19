@@ -12,7 +12,12 @@
 //   sidebar_refresh(a)            every second (main tick)         sidebar_tick(a)   every 100 ms (live search)
 //
 // The module does not import screen_chat (the chat header opens the sidebar): the chat tab and the new-chat action are wired by main.fi.
-// No "..." menu on the entries: the mobile API has no rename / delete route yet (docs/ANDROID-APP-API.md).
+// "..." menu per chat entry (web convMenu): a tap on the three dots at the right edge of an entry or a long press opens a page in the
+// panel (it replaces the list): Rename (input + save), Delete (asks first). Both go to POST /api/m/chats/rename | remove
+// (docs/ANDROID-APP-API.md; 404 on an older server, 409 while the chat runs -> a line of text, no crash). Favorite / folders have
+// no mobile route yet and are left out.
+//   sidebar_back(a)               Android Back key: one step back (menu step, menu, drawer); false = nothing was open
+//   sidebar_api(x, kind, status)  the answer of rename / remove (main.on_api); true = ours
 import std.rt
 import std.time
 import std.vec
@@ -31,6 +36,8 @@ import fui.vlist
 import fui.wave3
 import net.jarvisc
 import net.jarvisapi
+import plat.tzinfo
+import fui.applay
 import jshell
 import jtexts
 import jdata
@@ -42,7 +49,7 @@ import jtokens
 
 export {
     sidebar_build, sidebar_install_rules, sidebar_open, sidebar_close, sidebar_is_open, sidebar_set_handlers, sidebar_picked_cid,
-    sidebar_refresh, sidebar_tick, sidebar_dump, local_offset_min,
+    sidebar_refresh, sidebar_tick, sidebar_dump, local_offset_min, sidebar_back, sidebar_api,
 }
 
 const K_SB_PANEL: u32 = 70
@@ -75,6 +82,22 @@ static mut G_SEARCH: usize = 0
 static mut G_LIST: usize = 0
 static mut G_USER: usize = 0
 static mut G_HOOKS: u64 = 0
+static mut G_MENU: usize = 0 // the "..." page (column), replaces seg + search + list while a chat's menu is open
+static mut G_M_TITLE: usize = 0
+static mut G_M_REN: usize = 0
+static mut G_M_DEL: usize = 0
+static mut G_M_IN: usize = 0
+static mut G_M_SAVE: usize = 0
+static mut G_M_ASK: usize = 0
+static mut G_M_CONF: usize = 0
+static mut G_M_CANCEL: usize = 0
+static mut G_M_ERR: usize = 0
+static mut G_M_MODE: usize = 0 // 0 = no menu, 1 = actions, 2 = rename, 3 = delete asks
+static mut G_M_BUSY: bool = false // a request is in flight
+static mut G_M_ID: [u8; 96] = [0; 96]
+static mut G_M_ID_N: usize = 0
+static mut G_M_TT: [u8; 160] = [0; 160]
+static mut G_M_TT_N: usize = 0
 static mut G_OPEN: bool = false
 static mut G_TAB: usize = 0 // 0 chats, 1 workers
 static mut G_CLOSED: u32 = 0 // bit per group: folded
@@ -137,8 +160,11 @@ fn eu_switch_ms(year: i32, month: u32) -> i64 {
     return (d31 - wd) * 86400000 + 3600000
 }
 
-// Europe/Vienna: UTC+1, UTC+2 between the last Sundays of March and October (minutes)
+// UTC offset (minutes) of the DEVICE zone (java.util.TimeZone through plat.tzinfo); Europe/Vienna when it is not known (desktop, JNI failed):
+// UTC+1, UTC+2 between the last Sundays of March and October.
 fn local_offset_min(ms: i64) -> i64 {
+    let dev: i64 = tzinfo.tz_offset_min(ms)
+    if dev != tzinfo.TZ_UNKNOWN { return dev }
     let dt: time.DateTime = time.civil_from_unix(ms)
     let y: i32 = dt.year
     var off: i64 = 60
@@ -388,6 +414,7 @@ fn rows(ud: u64, i: usize, out: *mut vlist.VRow) {
     var f: u32 = 0 as u32
     if (*c).running || G_KIDS_RUN[idx] > 0 { f = f | 2 as u32 }
     if (*c).id == cur_cid() { f = f | 4 as u32 }
+    f = f | 8 as u32 // SB_MENU: the "..." at the right edge
     (*out).sbf = f
     if G_KIDS[idx] > 0 { (*out).badge = G_KIDS[idx] }
 }
@@ -411,6 +438,171 @@ fn on_pick(a: *mut app.App, id: usize, row: usize) {
     rt.mem_copy((&G_PICKED[0]) as u64, (*c).id.p as u64, n)
     G_PICKED_N = n
     (*hooks()).open_chat(a)
+}
+
+// ---------------------------------------------------------------- the "..." menu
+
+fn copy_to(dst: *mut u8, cap: usize, src: str) -> usize {
+    var n: usize = src.n
+    if n > cap { n = cap }
+    rt.mem_copy(dst as u64, src.p as u64, n)
+    return n
+}
+
+fn m_id() -> str { return str { p: (&G_M_ID[0]) as *mut u8, n: G_M_ID_N } }
+fn m_title() -> str { return str { p: (&G_M_TT[0]) as *mut u8, n: G_M_TT_N } }
+
+// show / hide the pages of the panel for the current menu mode
+fn menu_apply(a: *mut app.App) {
+    if G_MENU == 0 { return }
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let on: bool = G_M_MODE != 0
+    jshell.set_shown(a, G_SEG, !on, 0)
+    jshell.set_shown(a, G_SEARCH, !on, 0)
+    scene.node_set_hidden(sc, G_LIST, on)
+    if on { scene.node_set_flexitem(sc, G_LIST, 0, 0, 0, 1) } else { scene.node_set_flexitem(sc, G_LIST, 1000, 1000, 60, 0) }
+    jshell.set_shown(a, G_MENU, on, 1)
+    jshell.set_shown(a, G_M_REN, G_M_MODE == 1, 0)
+    jshell.set_shown(a, G_M_DEL, G_M_MODE == 1, 0)
+    jshell.set_shown(a, G_M_IN, G_M_MODE == 2, 0)
+    jshell.set_shown(a, G_M_SAVE, G_M_MODE == 2, 0)
+    jshell.set_shown(a, G_M_ASK, G_M_MODE == 3, 0)
+    jshell.set_shown(a, G_M_CONF, G_M_MODE == 3, 0)
+    jshell.set_shown(a, G_M_ERR, false, 0)
+    if G_M_MODE == 1 { app.set_text(a, G_M_CANCEL, jtexts.t("sb.m-back")) } else { app.set_text(a, G_M_CANCEL, jtexts.t("sb.m-cancel")) }
+    app.set_text(a, G_M_TITLE, m_title())
+}
+
+fn menu_open(a: *mut app.App, c: *mut jarvisapi.ConvRow) {
+    G_M_ID_N = copy_to(&G_M_ID[0], 96, (*c).id)
+    G_M_TT_N = copy_to(&G_M_TT[0], 160, (*c).title)
+    G_M_MODE = 1
+    G_M_BUSY = false
+    menu_apply(a)
+}
+
+fn menu_close(a: *mut app.App) {
+    G_M_MODE = 0
+    G_M_BUSY = false
+    menu_apply(a)
+}
+
+fn menu_error(a: *mut app.App, text: str) {
+    app.set_text(a, G_M_ERR, text)
+    jshell.set_shown(a, G_M_ERR, true, 0)
+}
+
+// the "..." of an entry (tap at the right edge) or a long press: the actions page. false = not a chat entry (header, hint line)
+fn on_long(a: *mut app.App, id: usize, row: usize) -> bool {
+    if row >= G_N || G_M_MODE != 0 { return false }
+    let e: u32 = G_E[row]
+    if e / 1000 as u32 != 2 as u32 { return false }
+    menu_open(a, conv_at((e % 1000 as u32) as usize))
+    return true
+}
+
+fn on_m_ren(a: *mut app.App) {
+    G_M_MODE = 2
+    menu_apply(a)
+    app.set_text(a, G_M_IN, m_title())
+    app.set_focus(a, G_M_IN)
+}
+
+fn on_m_del(a: *mut app.App) {
+    G_M_MODE = 3
+    menu_apply(a)
+}
+
+fn on_m_cancel(a: *mut app.App) {
+    if G_M_MODE == 2 || G_M_MODE == 3 { G_M_MODE = 1 } else { G_M_MODE = 0 }
+    G_M_BUSY = false
+    menu_apply(a)
+}
+
+fn on_m_save(a: *mut app.App) {
+    if G_M_BUSY { return }
+    let t: str = app.text(a, G_M_IN)
+    var s: usize = 0
+    var e: usize = t.n
+    while s < e && rt.ld8(t.p as u64, s) == 32 as u8 { s = s + 1 }
+    while e > s && rt.ld8(t.p as u64, e - 1) == 32 as u8 { e = e - 1 }
+    if e == s {
+        menu_error(a, jtexts.t("sb.m-empty"))
+        return
+    }
+    let title: str = str { p: ((t.p as u64) + (s as u64)) as *mut u8, n: e - s }
+    if jarvisapi.ja_chat_rename(jshell.api(), m_id(), title) { G_M_BUSY = true } else { menu_error(a, jtexts.t("sb.m-err")) }
+}
+
+fn on_m_conf(a: *mut app.App) {
+    if G_M_BUSY { return }
+    if jarvisapi.ja_chat_remove(jshell.api(), m_id()) { G_M_BUSY = true } else { menu_error(a, jtexts.t("sb.m-err")) }
+}
+
+// main.on_api: the answer of rename / remove. 200 = done (list reloads); 409 = the chat runs; 404 = older server or the chat is gone.
+fn sidebar_api(x: *mut jarvisapi.Api, kind: u32, status: i64) -> bool {
+    if kind != jarvisapi.AK_CHAT_OP { return false }
+    let a: *mut app.App = jshell.app_ui()
+    G_M_BUSY = false
+    if G_M_MODE == 0 { return true }
+    if status == 200 {
+        let removed: bool = jarvisapi.ja_key(x) == "/api/m/chats/remove"
+        let was_current: bool = m_id() == cur_cid()
+        menu_close(a)
+        jdata.refresh_convs(true)
+        G_SEEN_VER = 0
+        if removed && was_current { (*hooks()).new_chat(a) }
+        return true
+    }
+    if status == 409 { menu_error(a, jtexts.t("sb.m-err-busy")) }
+    else if status == 404 { menu_error(a, jtexts.t("sb.m-err-404")) }
+    else { menu_error(a, jtexts.t("sb.m-err") + ": " + jshell.dec(status)) }
+    return true
+}
+
+// Android Back: one step back inside the drawer. true = it took the key.
+fn sidebar_back(a: *mut app.App) -> bool {
+    if G_M_MODE != 0 {
+        on_m_cancel(a)
+        return true
+    }
+    if G_OPEN {
+        sidebar_close(a)
+        return true
+    }
+    return false
+}
+
+fn build_menu(a: *mut app.App) {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    G_MENU = app.column(a)
+    scene.node_set_flex(sc, G_MENU, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_gap(sc, G_MENU, 10, 10)
+    scene.node_set_padding(sc, G_MENU, 4, 8, 4, 0)
+    jshell.fill_stretch(a, G_MENU)
+    G_M_TITLE = app.label(a, "", 0)
+    jtheme.style_node(a, G_M_TITLE, jtheme.K_TITLE)
+    applay.align_start(a, G_M_TITLE)
+    G_M_REN = app.button(a, jtexts.t("sb.m-rename"), on_m_ren)
+    jtheme.style_node(a, G_M_REN, jtheme.K_CHIP)
+    applay.stretch(a, G_M_REN)
+    G_M_DEL = app.button(a, jtexts.t("sb.m-delete"), on_m_del)
+    jtheme.style_node(a, G_M_DEL, jtheme.K_CHIP)
+    applay.stretch(a, G_M_DEL)
+    G_M_IN = jsetui.input(a, jtexts.t("sb.m-rename-hint"))
+    G_M_SAVE = jsetui.primary(a, jtexts.t("sb.m-save"), on_m_save)
+    G_M_ASK = app.label(a, jtexts.t("sb.m-ask"), 0)
+    jtheme.style_node(a, G_M_ASK, jsetui.K_SET_HINT)
+    applay.align_start(a, G_M_ASK)
+    G_M_CONF = jsetui.primary(a, jtexts.t("sb.m-delete"), on_m_conf)
+    G_M_CANCEL = app.button(a, jtexts.t("sb.m-back"), on_m_cancel)
+    jtheme.style_node(a, G_M_CANCEL, jtheme.K_CHIP)
+    applay.stretch(a, G_M_CANCEL)
+    G_M_ERR = app.label(a, "", 0)
+    jtheme.style_node(a, G_M_ERR, jsetui.K_SET_ERR)
+    applay.align_start(a, G_M_ERR)
+    app.end(a)
+    jshell.set_shown(a, G_MENU, false, 0)
 }
 
 // ---------------------------------------------------------------- painting
@@ -630,6 +822,8 @@ fn sidebar_build(a: *mut app.App, main_node: usize) -> usize {
     app.vlist_on_pick(a, G_LIST, on_pick)
     jshell.fill_stretch(a, G_LIST)
     scene.node_set_flexitem(sc, G_LIST, 1000, 1000, 60, 0)
+    app.vlist_on_long(a, G_LIST, on_long)
+    build_menu(a)
     // the user line
     G_USER = app.custom(a, widget.KIND_TILE, 340, 60)
     scene.node_set_size(sc, G_USER, 340.0, USER_H)
@@ -657,6 +851,8 @@ fn sidebar_build(a: *mut app.App, main_node: usize) -> usize {
 fn sidebar_open(a: *mut app.App) {
     if G_ROOT == 0 { return }
     G_OPEN = true
+    G_M_MODE = 0
+    menu_apply(a)
     let sc: *mut scene.Scene = app.app_scene(a)
     let r: bool = scene.node_remove_class(sc, G_DIM, K_SB_DIM_D)
     let r2: bool = scene.node_remove_class(sc, G_DIM, K_SB_DIM_L)
@@ -671,6 +867,8 @@ fn sidebar_open(a: *mut app.App) {
 fn sidebar_close(a: *mut app.App) {
     if G_ROOT == 0 || !G_OPEN { return }
     G_OPEN = false
+    G_M_MODE = 0
+    menu_apply(a)
     jshell.set_shown(a, G_ROOT, false, 0)
     jshell.set_shown_flex(a, G_MAIN, true)
 }
@@ -706,5 +904,5 @@ fn sidebar_tick(a: *mut app.App) {
 // one log line for the tests: tab, entries, groups, query
 fn sidebar_dump() -> str {
     return "sidebar: open=" + jshell.dec(1) + " tab=" + jshell.dec(G_TAB as i64) + " entries=" + jshell.dec(G_N as i64) + " workers_run=" +
-        jshell.dec(G_WORKERS_RUN) + " query_len=" + jshell.dec(G_QUERY_N as i64)
+        jshell.dec(G_WORKERS_RUN) + " query_len=" + jshell.dec(G_QUERY_N as i64) + " menu=" + jshell.dec(G_M_MODE as i64)
 }
