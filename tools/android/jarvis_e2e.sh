@@ -128,7 +128,7 @@ tap_hdr() { $ADB shell input tap $(($1 * SW / 1080)) "$(hdr_y)"; sleep "${2:-2}"
 open_sidebar() { tap_hdr 74 2; }
 sidebar_new() { tap_hdr 907 2; } # the plus sits at the right edge of the drawer panel (84 % wide); x 998 would hit the dim strip and close it
 # type into the composer field (place), or into the field whose hint is $1 (OCR) for other screens, then leave the keyboard
-type_into() { if [ "$1" = Message ]; then tap_px 240 $((COMP_Y - 160)) 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
+type_into() { if [ "$1" = Message ]; then tap_px 240 $((COMP_Y - 160)) 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep "${TYPE_SETTLE:-4}"; hide_kbd; } # slow host: the last typed character is lost if BACK follows too soon
 send_text() { type_into "Message" "$1" && tap_send; }
 notes() { $ADB shell dumpsys notification --noredact; }
 # title / text lines of the notifications of the app (not the service one)
