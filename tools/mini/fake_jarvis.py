@@ -94,7 +94,24 @@ def chat_row(i):
             "updatedAt": 1760000000000 - i * 60000, "running": i < NRUNNING,
             "fav": i % 11 == 0, "parent": None if i % 4 else "o1"}
 
+def sidebar_chats():
+    # FAKE_SIDEBAR=1: the chats of the web sidebar reference (AKTIV / HEUTE / GESTERN, sub-workers under OrientOS, a Workers tab)
+    now = int(time.time() * 1000)
+    h = 3600000
+    def row(i, t, ago, run=False, kind="chat", disp=False, parent=None, fav=False):
+        return {"id": i, "title": t, "kind": kind, "updatedAt": now - ago, "running": run, "fav": fav, "parent": parent, "dispatched": disp}
+    return [row("o1", "Leitstand", 0, kind="orchestrator"),
+            row("s1", "Certus", 1000, True), row("s2", "OrientOS", 2000),
+            row("s2a", "OrientOS: Treiber", 3000, True, "worker", True, "s2"), row("s2b", "OrientOS: Netz", 4000, False, "worker", True, "s2"),
+            row("s2c", "OrientOS: Boot", 5000, False, "worker", True, "s2"),
+            row("s3", "Firn", 2 * h), row("s4", "fUi", 3 * h),
+            row("s5", "Jarvis", 30 * h), row("s6", "Minecraft", 31 * h), row("s7", "Fleitec All-in-One", 32 * h),
+            row("s8", "Diplomarbeit", 100 * h), row("s9", "Anzug-KI", 24 * 20 * h), row("s10", "Russisch", 24 * 90 * h),
+            row("w1", "Daidalos: Render", 6 * h, True, "worker", True)]
+
 def all_chats():
+    if os.environ.get("FAKE_SIDEBAR") == "1":
+        return sidebar_chats()
     base = [{"id": "c1", "title": "worker one", "kind": "worker", "updatedAt": 1760000000001, "running": True, "fav": True, "parent": None},
             {"id": "c2", "title": "worker two", "kind": "worker", "updatedAt": 1760000000002, "running": False, "fav": False, "parent": None},
             {"id": "o1", "title": "Leitstand", "kind": "orchestrator", "updatedAt": 5, "running": False, "fav": False, "parent": None}]
@@ -281,7 +298,7 @@ def rest(method, rawpath, hdr, body):
         if mp == "chats" and method == "GET":
             allc = all_chats()
             if not REAL:
-                return out(200, {"total": 3, "chats": allc})
+                return out(200, {"total": len(allc), "chats": allc})
             lim = max(1, min(100, int(q.get("limit", ["30"])[0] or 30))); off = max(0, int(q.get("offset", ["0"])[0] or 0))
             qq = (q.get("q", [""])[0] or "").lower()
             if qq: allc = [c for c in allc if qq in str(c["title"] or "").lower()]

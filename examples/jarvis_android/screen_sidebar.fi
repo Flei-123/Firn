@@ -1,0 +1,705 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_android/screen_sidebar.fi -- the chat list as the web sidebar (public/index.html .sidebar, style.css .conv-*):
+// brand line with "+" (new chat), segment Chats | Workers with a counter, search field, groups AKTIV / FAVORITEN / HEUTE / GESTERN /
+// LETZTE 7 TAGE / LETZTE 30 TAGE / ÄLTER (fold + count), entries with a status circle and a counter pill (sub-workers), and the
+// user line with the avatar at the bottom. It is a DRAWER: a page of the root column that replaces the main column while it is open
+// (fUi has no overlays); the left 84 % are the panel, the right 16 % a dark strip that closes it with a tap.
+//
+//   sidebar_build(a, main_node)   once, after the main column was built; returns the page node (hidden at first)
+//   sidebar_install_rules(a)      once, with the other style rules
+//   sidebar_open(a) / sidebar_close(a) / sidebar_is_open()
+//   sidebar_set_handlers(a, open_chat, new_chat, user)   open_chat reads sidebar_picked_cid(); all three are plain fn(*mut app.App)
+//   sidebar_refresh(a)            every second (main tick)         sidebar_tick(a)   every 100 ms (live search)
+//
+// The module does not import screen_chat (the chat header opens the sidebar): the chat tab and the new-chat action are wired by main.fi.
+// No "..." menu on the entries: the mobile API has no rename / delete route yet (docs/ANDROID-APP-API.md).
+import std.rt
+import std.time
+import std.vec
+import fui.app
+import fui.render
+import fui.scene
+import fui.flex
+import fui.widget
+import fui.style
+import fui.event
+import fui.sheet
+import fui.painter
+import fui.icons
+import fui.lucide
+import fui.vlist
+import fui.wave3
+import net.jarvisc
+import net.jarvisapi
+import jshell
+import jtexts
+import jdata
+import jlist
+import jsetui
+import jicons
+import jtheme
+import jtokens
+
+export {
+    sidebar_build, sidebar_install_rules, sidebar_open, sidebar_close, sidebar_is_open, sidebar_set_handlers, sidebar_picked_cid,
+    sidebar_refresh, sidebar_tick, sidebar_dump,
+}
+
+const K_SB_PANEL: u32 = 70
+const K_SB_PLUS: u32 = 71
+const K_SB_SEARCH: u32 = 72
+const K_SB_DIM_D: u32 = 73
+const K_SB_DIM_L: u32 = 74
+
+const MAXC: usize = 128 // conversations looked at (the app asks for 100)
+const MAXE: usize = 192 // display entries: headers + entries
+const NGROUPS: usize = 7
+const ROW_PT: usize = 46
+const SEG_H: f64 = 44.0
+const USER_H: f64 = 60.0
+const G_ACTIVE: usize = 0
+const G_FAV: usize = 1
+
+struct Hooks {
+    open_chat: fn(*mut app.App),
+    new_chat: fn(*mut app.App),
+    user: fn(*mut app.App),
+}
+
+static mut G_ROOT: usize = 0
+static mut G_PANEL: usize = 0
+static mut G_DIM: usize = 0
+static mut G_MAIN: usize = 0
+static mut G_SEG: usize = 0
+static mut G_SEARCH: usize = 0
+static mut G_LIST: usize = 0
+static mut G_USER: usize = 0
+static mut G_HOOKS: u64 = 0
+static mut G_OPEN: bool = false
+static mut G_TAB: usize = 0 // 0 chats, 1 workers
+static mut G_CLOSED: u32 = 0 // bit per group: folded
+static mut G_SEEN_VER: u64 = 0
+static mut G_SEEN_CID: [u8; 64] = [0; 64]
+static mut G_SEEN_CID_N: usize = 0
+static mut G_QUERY: [u8; 96] = [0; 96]
+static mut G_QUERY_N: usize = 0
+static mut G_PICKED: [u8; 96] = [0; 96]
+static mut G_PICKED_N: usize = 0
+static mut G_N: usize = 0 // display entries
+static mut G_E: [u32; 192] = [0; 192] // kind * 1000 + index: 1 = group header (group), 2 = chat entry (conversation), 3 = message line (text key)
+static mut G_GRP: [i64; 128] = [0; 128] // group of conversation i, -1 = not shown
+static mut G_PAR: [i64; 128] = [0; 128] // index of the parent conversation shown, -1 = none
+static mut G_KIDS: [i64; 128] = [0; 128] // sub-workers of i
+static mut G_KIDS_RUN: [i64; 128] = [0; 128] // sub-workers of i that work
+static mut G_GCOUNT: [i64; 8] = [0; 8]
+static mut G_WORKERS_RUN: i64 = 0
+static mut G_CHATS_RUN: i64 = 0
+static mut G_WORKERS_ALL: i64 = 0
+
+fn noop(a: *mut app.App) {}
+
+fn hooks() -> *mut Hooks { return G_HOOKS as *mut Hooks }
+
+fn sidebar_set_handlers(a: *mut app.App, open_chat: fn(*mut app.App), new_chat: fn(*mut app.App), user: fn(*mut app.App)) {
+    (*hooks()).open_chat = open_chat
+    (*hooks()).new_chat = new_chat
+    (*hooks()).user = user
+}
+
+fn sidebar_picked_cid() -> str { return str { p: (&G_PICKED[0]) as *mut u8, n: G_PICKED_N } }
+fn sidebar_is_open() -> bool { return G_OPEN }
+
+// ---------------------------------------------------------------- data
+
+fn conv_count() -> usize {
+    if !jdata.has_convs() { return 0 }
+    var n: usize = vec_len[jarvisapi.ConvRow](&(*jdata.convs()).rows)
+    if n > MAXC { n = MAXC }
+    return n
+}
+
+fn conv_at(i: usize) -> *mut jarvisapi.ConvRow {
+    return vec_elem_ptr[jarvisapi.ConvRow](&(*jdata.convs()).rows, i)
+}
+
+fn is_worker(c: *mut jarvisapi.ConvRow) -> bool { return (*c).dispatched || (*c).kind == "worker" }
+
+fn floor_div(a: i64, b: i64) -> i64 {
+    var q: i64 = a / b
+    if a % b < 0 { q = q - 1 }
+    return q
+}
+
+// last Sunday of `month` (3 or 10) of `year`, at 01:00 UTC, in ms
+fn eu_switch_ms(year: i32, month: u32) -> i64 {
+    let d31: i64 = time.days_from_civil(year, month, 31 as u32)
+    let wd: i64 = (d31 + 4) % 7 // 0 = Sunday (1970-01-01 was a Thursday)
+    return (d31 - wd) * 86400000 + 3600000
+}
+
+// Europe/Vienna: UTC+1, UTC+2 between the last Sundays of March and October
+fn local_day(ms: i64) -> i64 {
+    let dt: time.DateTime = time.civil_from_unix(ms)
+    let y: i32 = dt.year
+    var off: i64 = 60
+    if ms >= eu_switch_ms(y, 3 as u32) && ms < eu_switch_ms(y, 10 as u32) { off = 120 }
+    return floor_div(ms + off * 60000, 86400000)
+}
+
+fn lower(b: u8) -> u8 {
+    if b >= 65 as u8 && b <= 90 as u8 { return b + 32 as u8 }
+    return b
+}
+
+// does `hay` contain the query (ASCII case-insensitive, UTF-8 bytes otherwise exact)
+fn has_query(hay: str) -> bool {
+    if G_QUERY_N == 0 { return true }
+    if hay.n < G_QUERY_N { return false }
+    var i: usize = 0
+    while i + G_QUERY_N <= hay.n {
+        var k: usize = 0
+        while k < G_QUERY_N {
+            if lower(rt.ld8(hay.p as u64, i + k)) != G_QUERY[k] { break }
+            k = k + 1
+        }
+        if k == G_QUERY_N { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn read_query(a: *mut app.App) -> bool {
+    let q: str = app.text(a, G_SEARCH)
+    var n: usize = q.n
+    if n > 96 { n = 96 }
+    var same: bool = n == G_QUERY_N
+    var i: usize = 0
+    while i < n {
+        let b: u8 = lower(rt.ld8(q.p as u64, i))
+        if same && G_QUERY[i] != b { same = false }
+        G_QUERY[i] = b
+        i = i + 1
+    }
+    G_QUERY_N = n
+    return !same
+}
+
+fn cur_cid() -> str { return jarvisc.jc_cid(jshell.jc()) }
+
+fn group_of(i: usize, today: i64) -> i64 {
+    let c: *mut jarvisapi.ConvRow = conv_at(i)
+    if (*c).running || G_KIDS_RUN[i] > 0 { return G_ACTIVE as i64 }
+    if (*c).fav { return G_FAV as i64 }
+    if (*c).updated <= 0 { return 6 }
+    let days: i64 = today - local_day((*c).updated)
+    if days <= 0 { return 2 }
+    if days == 1 { return 3 }
+    if days <= 7 { return 4 }
+    if days <= 30 { return 5 }
+    return 6
+}
+
+// rebuild the display list from the conversations, the tab, the query and the folded groups
+fn rebuild(a: *mut app.App) {
+    let n: usize = conv_count()
+    let today: i64 = local_day(time.now_unix_ms())
+    var i: usize = 0
+    G_WORKERS_RUN = 0
+    G_CHATS_RUN = 0
+    G_WORKERS_ALL = 0
+    while i < n {
+        G_PAR[i] = 0 - 1
+        G_KIDS[i] = 0
+        G_KIDS_RUN[i] = 0
+        G_GRP[i] = 0 - 1
+        let c: *mut jarvisapi.ConvRow = conv_at(i)
+        if (*c).kind != "orchestrator" {
+            if is_worker(c) {
+                G_WORKERS_ALL = G_WORKERS_ALL + 1
+                if (*c).running { G_WORKERS_RUN = G_WORKERS_RUN + 1 }
+            } else if (*c).running {
+                G_CHATS_RUN = G_CHATS_RUN + 1
+            }
+        }
+        i = i + 1
+    }
+    // sub-workers hang under their parent (when the parent is in the list too)
+    i = 0
+    while i < n {
+        let c: *mut jarvisapi.ConvRow = conv_at(i)
+        if (*c).parent.n > 0 && (*c).parent != (*c).id {
+            var j: usize = 0
+            while j < n {
+                if j != i && (*conv_at(j)).id == (*c).parent {
+                    G_PAR[i] = j as i64
+                    G_KIDS[j] = G_KIDS[j] + 1
+                    if (*c).running { G_KIDS_RUN[j] = G_KIDS_RUN[j] + 1 }
+                    break
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    G_N = 0
+    var g: usize = 0
+    var k: usize = 0
+    var shown: usize = 0
+    if G_QUERY_N > 0 {
+        // search: a flat list of hits (both tabs), no groups
+        i = 0
+        while i < n && G_N < MAXE {
+            let c: *mut jarvisapi.ConvRow = conv_at(i)
+            if has_query((*c).title) {
+                G_E[G_N] = (2000 + i) as u32
+                G_N = G_N + 1
+                shown = shown + 1
+            }
+            i = i + 1
+        }
+    } else {
+        // the Leitstand is pinned on top of the Chats tab
+        if G_TAB == 0 {
+            i = 0
+            while i < n && G_N < MAXE {
+                if (*conv_at(i)).kind == "orchestrator" {
+                    G_E[G_N] = (2000 + i) as u32
+                    G_N = G_N + 1
+                    shown = shown + 1
+                }
+                i = i + 1
+            }
+        }
+        i = 0
+        while i < n {
+            let c: *mut jarvisapi.ConvRow = conv_at(i)
+            var inside: bool = (*c).kind != "orchestrator" && G_PAR[i] < 0
+            if inside {
+                let w: bool = is_worker(c)
+                if (G_TAB == 1) != w { inside = false }
+            }
+            if inside { G_GRP[i] = group_of(i, today) }
+            i = i + 1
+        }
+        g = 0
+        while g < NGROUPS {
+            var cnt: i64 = 0
+            i = 0
+            while i < n {
+                if G_GRP[i] == g as i64 { cnt = cnt + 1 }
+                i = i + 1
+            }
+            G_GCOUNT[g] = cnt
+            if cnt > 0 && G_N < MAXE {
+                G_E[G_N] = (1000 + g) as u32
+                G_N = G_N + 1
+                if (G_CLOSED & ((1 as u32) << (g as u32))) == 0 as u32 {
+                    i = 0
+                    while i < n && G_N < MAXE {
+                        if G_GRP[i] == g as i64 {
+                            G_E[G_N] = (2000 + i) as u32
+                            G_N = G_N + 1
+                        }
+                        i = i + 1
+                    }
+                }
+                shown = shown + 1
+            }
+            g = g + 1
+        }
+    }
+    if shown == 0 && G_N < MAXE {
+        var key: usize = 0
+        if G_QUERY_N > 0 { key = 2 } else if G_TAB == 1 { key = 1 }
+        G_E[G_N] = (3000 + key) as u32
+        G_N = G_N + 1
+    }
+    app.vlist_set_count(a, G_LIST, G_N)
+    app.vlist_changed(a, G_LIST)
+    if G_SEG != app.NONE { scene.node_set_draw(app.app_scene(a), G_SEG, 0, draw_seg) }
+}
+
+fn group_name(g: usize) -> str {
+    if g == 0 { return jtexts.t("sb.g-active") }
+    if g == 1 { return jtexts.t("sb.g-fav") }
+    if g == 2 { return jtexts.t("sb.g-today") }
+    if g == 3 { return jtexts.t("sb.g-yday") }
+    if g == 4 { return jtexts.t("sb.g-7") }
+    if g == 5 { return jtexts.t("sb.g-30") }
+    return jtexts.t("sb.g-older")
+}
+
+// the count of a group header into the row's detail cell (no allocation: the row source runs for every visible row in every frame)
+#[allow_escape]
+fn put_count(out: *mut vlist.VRow, v: i64) {
+    var tmp: [u8; 8] = [0; 8]
+    var k: usize = 0
+    var x: i64 = v
+    if x > 9999 { x = 9999 }
+    if x <= 0 {
+        tmp[0] = 48 as u8
+        k = 1
+    }
+    var rev: [u8; 8] = [0; 8]
+    var r: usize = 0
+    while x > 0 {
+        rev[r] = (48 + x % 10) as u8
+        x = x / 10
+        r = r + 1
+    }
+    while r > 0 {
+        r = r - 1
+        tmp[k] = rev[r]
+        k = k + 1
+    }
+    vlist.vrow_detail(out, str { p: (&tmp[0]) as *mut u8, n: k })
+}
+
+fn rows(ud: u64, i: usize, out: *mut vlist.VRow) {
+    if i >= G_N { return }
+    let e: u32 = G_E[i]
+    let kind: u32 = e / 1000 as u32
+    let idx: usize = (e % 1000 as u32) as usize
+    if kind == 1 as u32 {
+        jlist.put(out, group_name(idx))
+        put_count(out, G_GCOUNT[idx])
+        (*out).sbk = 1 as u32
+        var f: u32 = 0 as u32
+        if (G_CLOSED & ((1 as u32) << (idx as u32))) == 0 as u32 { f = f | 1 as u32 }
+        if idx == G_ACTIVE { f = f | 2 as u32 }
+        (*out).sbf = f
+        return
+    }
+    if kind == 3 as u32 {
+        var key: str = jtexts.t("sb.empty")
+        if idx == 1 { key = jtexts.t("sb.empty-workers") }
+        if idx == 2 { key = jtexts.t("sb.empty-search") }
+        jlist.put(out, key)
+        (*out).sbk = 1 as u32
+        return
+    }
+    let c: *mut jarvisapi.ConvRow = conv_at(idx)
+    jlist.put(out, (*c).title)
+    (*out).sbk = 2 as u32
+    var f: u32 = 0 as u32
+    if (*c).running || G_KIDS_RUN[idx] > 0 { f = f | 2 as u32 }
+    if (*c).id == cur_cid() { f = f | 4 as u32 }
+    (*out).sbf = f
+    if G_KIDS[idx] > 0 { (*out).badge = G_KIDS[idx] }
+}
+
+// a tap on a row: a group header folds, an entry opens its chat
+fn on_pick(a: *mut app.App, id: usize, row: usize) {
+    if row >= G_N { return }
+    let e: u32 = G_E[row]
+    let kind: u32 = e / 1000 as u32
+    let idx: usize = (e % 1000 as u32) as usize
+    if kind == 1 as u32 {
+        G_CLOSED = G_CLOSED ^ ((1 as u32) << (idx as u32))
+        rebuild(a)
+        return
+    }
+    if kind != 2 as u32 { return }
+    let c: *mut jarvisapi.ConvRow = conv_at(idx)
+    var n: usize = (*c).id.n
+    if n == 0 { return }
+    if n > 96 { n = 96 }
+    rt.mem_copy((&G_PICKED[0]) as u64, (*c).id.p as u64, n)
+    G_PICKED_N = n
+    (*hooks()).open_chat(a)
+}
+
+// ---------------------------------------------------------------- painting
+
+fn tok(c: *mut render.Ctx, t: u32) -> u32 { return render.color_of(c, style.color_token(t)) }
+
+fn badge_text(buf: *mut [u8; 4], v: i64) -> usize {
+    if v > 9 {
+        (*buf)[0] = 57 as u8
+        (*buf)[1] = 43 as u8
+        return 2
+    }
+    (*buf)[0] = (48 + v) as u8
+    return 1
+}
+
+// one half of the segment: [dot] label [counter]
+fn seg_half(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, label: str, active: bool, dot: bool, count: i64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var fg: u32 = style.color_token(style.TOK_TEXT_MUTED)
+    if active { fg = style.color_token(style.TOK_ACCENT) }
+    let px: f64 = render.text_len_of(c, 13)
+    let tw: f64 = painter.text_width(z, label.p as u64, label.n, px)
+    let dd: f64 = render.len_of(c, 8)
+    let bs: f64 = render.len_of(c, 20)
+    let gap: f64 = render.len_of(c, 6)
+    var total: f64 = tw
+    if dot { total = total + dd + gap }
+    if count > 0 { total = total + bs + gap }
+    var cx: f64 = x + (w - total) / 2.0
+    if dot {
+        painter.round_rect(z, cx, y + (h - dd) / 2.0, dd, dd, dd / 2.0, render.color_of(c, style.color_token(style.TOK_ACCENT)))
+        cx = cx + dd + gap
+    }
+    let lh: f64 = render.len_of(c, 20)
+    wave3.cell_text_weight(c, label.p as u64, label.n, cx, y + (h - lh) / 2.0, tw + render.len_of(c, 2), lh, fg, style.ALIGN_LEFT, 13, 600 as u32)
+    cx = cx + tw + gap
+    if count > 0 {
+        painter.round_rect(z, cx, y + (h - bs) / 2.0, bs, bs, bs / 2.0, render.color_of(c, style.color_token(style.TOK_ACCENT)))
+        var bt: [u8; 4] = [0; 4]
+        let bn: usize = badge_text(&bt, count)
+        wave3.cell_text_weight(c, (&bt[0]) as u64, bn, cx, y + (h - bs) / 2.0, bs, bs, style.color_token(style.TOK_TEXT_ON_ACCENT),
+            style.ALIGN_CENTER, 12, 700 as u32)
+    }
+}
+
+fn draw_seg(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    painter.round_rect(z, x, y, w, h, render.len_of(c, 12), tok(c, style.TOK_SURFACE))
+    let pad: f64 = render.len_of(c, 3)
+    let hw: f64 = (w - 2.0 * pad) / 2.0
+    var ax: f64 = x + pad
+    if G_TAB == 1 { ax = ax + hw }
+    painter.round_rect(z, ax, y + pad, hw, h - 2.0 * pad, render.len_of(c, 10), tok(c, style.TOK_BUTTON_HOVER))
+    seg_half(c, x + pad, y, hw, h, jtexts.t("sb.chats"), G_TAB == 0, G_CHATS_RUN > 0, 0)
+    seg_half(c, x + pad + hw, y, hw, h, jtexts.t("sb.workers"), G_TAB == 1, G_WORKERS_RUN > 0, G_WORKERS_RUN)
+}
+
+fn on_seg(ud: u64, e: *mut event.Ev) -> u32 {
+    if event.ev_kind(e) != event.EV_TAP { return event.H_GO }
+    let a: *mut app.App = jshell.app_ui()
+    let sc: *mut scene.Scene = app.app_scene(a)
+    var t: usize = 0
+    if event.ev_x(e) > scene.node_x(sc, G_SEG) + scene.node_w(sc, G_SEG) / 2.0 { t = 1 }
+    if t != G_TAB {
+        G_TAB = t
+        rebuild(a)
+    }
+    return event.H_STOP
+}
+
+fn user_initial(buf: *mut [u8; 4]) -> usize {
+    let u: str = jarvisc.jc_user(jshell.jc())
+    if u.n == 0 {
+        (*buf)[0] = 74 as u8
+        return 1
+    }
+    let b0: u8 = rt.ld8(u.p as u64, 0)
+    var n: usize = 1
+    if b0 >= 240 as u8 { n = 4 } else if b0 >= 224 as u8 { n = 3 } else if b0 >= 192 as u8 { n = 2 }
+    if n > u.n { n = u.n }
+    var k: usize = 0
+    while k < n {
+        (*buf)[k] = rt.ld8(u.p as u64, k)
+        k = k + 1
+    }
+    if n == 1 && b0 >= 97 as u8 && b0 <= 122 as u8 { (*buf)[0] = b0 - 32 as u8 }
+    return n
+}
+
+fn draw_user(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let x: f64 = widget.w_x(e)
+    let y: f64 = widget.w_y(e)
+    let w: f64 = widget.w_w(e)
+    let h: f64 = widget.w_h(e)
+    painter.surface(z, x, y, w, 1.0, tok(c, style.TOK_SEPARATOR))
+    let av: f64 = render.len_of(c, 36)
+    let ax: f64 = x + render.len_of(c, 8)
+    let ay: f64 = y + (h - av) / 2.0 + 1.0
+    painter.round_rect_grad(z, ax, ay, av, av, av / 2.0, render.color_of(c, style.color_literal(0x2f80ff)),
+        render.color_of(c, style.color_literal(0x36c5ff)), 1.0, 1.0)
+    var ib: [u8; 4] = [0; 4]
+    let inn: usize = user_initial(&ib)
+    wave3.cell_text_weight(c, (&ib[0]) as u64, inn, ax, ay, av, av, style.color_literal(0xffffff), style.ALIGN_CENTER, 15, 700 as u32)
+    let name: str = jarvisc.jc_user(jshell.jc())
+    let tx: f64 = ax + av + render.len_of(c, 12)
+    let isz: f64 = render.len_of(c, 16)
+    let lh: f64 = render.len_of(c, 22)
+    wave3.cell_text_weight(c, name.p as u64, name.n, tx, ay + (av - lh) / 2.0, x + w - tx - isz - render.len_of(c, 16), lh,
+        style.color_token(style.TOK_TEXT), style.ALIGN_LEFT, 15, 500 as u32)
+    icons.icon(z, lucide.CHEVRON_DOWN, x + w - isz - render.len_of(c, 12), ay + (av - isz) / 2.0, isz, tok(c, style.TOK_TEXT_MUTED))
+}
+
+fn on_user(ud: u64, e: *mut event.Ev) -> u32 {
+    if event.ev_kind(e) != event.EV_TAP { return event.H_GO }
+    (*hooks()).user(jshell.app_ui())
+    return event.H_STOP
+}
+
+fn on_dim(ud: u64, e: *mut event.Ev) -> u32 {
+    if event.ev_kind(e) != event.EV_TAP { return event.H_GO }
+    sidebar_close(jshell.app_ui())
+    return event.H_STOP
+}
+
+fn on_plus(a: *mut app.App) { (*hooks()).new_chat(a) }
+
+// ---------------------------------------------------------------- build
+
+fn rule(a: *mut app.App, k: u32, st: style.Style) {
+    let r: usize = sheet.sheet_rule(&(*a).sh, sheet.sel_class(k), st)
+}
+
+fn sidebar_install_rules(a: *mut app.App) {
+    var st: style.Style = style.style_new()
+    st = style.style_set_bg(st, style.color_token(style.TOK_BASE))
+    rule(a, K_SB_PANEL, st)
+    // "+": flat, accent, round
+    st = style.style_new()
+    st = style.style_set_bg(st, style.color_token(style.TOK_BASE))
+    st = style.style_set_fg(st, style.color_token(style.TOK_ACCENT))
+    st = style.style_set_border(st, style.color_token(style.TOK_BASE), 0)
+    st = style.style_set_radius(st, 12)
+    st = style.style_set_size(st, 44, 40)
+    rule(a, K_SB_PLUS, st)
+    // search: .conv-search input (1 px line, radius 12, a little lighter than the ground)
+    st = style.style_new()
+    st = style.style_set_bg(st, style.color_token(style.TOK_SURFACE))
+    st = style.style_set_border(st, style.color_token(style.TOK_SEPARATOR), 1)
+    st = style.style_set_radius(st, jtokens.R_MD)
+    st = style.style_set_pad(st, 12, 8)
+    st = style.style_set_font(st, 0, jtokens.FONT_BODY)
+    rule(a, K_SB_SEARCH, st)
+    // the strip beside the drawer: the web scrim (rgba(0,0,0,.5)) over the page, precomputed
+    st = style.style_new()
+    st = style.style_set_bg(st, style.color_literal(0x06070f))
+    rule(a, K_SB_DIM_D, st)
+    st = style.style_new()
+    st = style.style_set_bg(st, style.color_literal(0x7a7f90))
+    rule(a, K_SB_DIM_L, st)
+}
+
+fn sidebar_build(a: *mut app.App, main_node: usize) -> usize {
+    G_MAIN = main_node
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let hk: u64 = rt.heap_alloc(64)
+    *(hk as *mut Hooks) = Hooks { open_chat: noop, new_chat: noop, user: noop }
+    G_HOOKS = hk
+    G_ROOT = app.row(a)
+    scene.node_set_flex(sc, G_ROOT, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_gap(sc, G_ROOT, 0, 0)
+    scene.node_set_padding(sc, G_ROOT, 0, 0, 0, 0)
+    jshell.fill_stretch(a, G_ROOT)
+    // panel
+    G_PANEL = app.column(a)
+    scene.node_set_flex(sc, G_PANEL, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_padding(sc, G_PANEL, 12, 10, 12, 8)
+    scene.node_set_gap(sc, G_PANEL, 10, 10)
+    scene.node_set_align_self(sc, G_PANEL, flex.AL_STRETCH)
+    scene.node_set_base(sc, G_PANEL, 0)
+    scene.node_set_flexitem(sc, G_PANEL, 840, 1000, 0, 0)
+    jtheme.style_node(a, G_PANEL, K_SB_PANEL)
+    // brand line: J.A.R.V.I.S. ........ +
+    let top: usize = app.row(a)
+    scene.node_set_flex(sc, top, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_CENTER)
+    scene.node_set_padding(sc, top, 4, 0, 0, 0)
+    scene.node_set_gap(sc, top, 6, 6)
+    jshell.fill_stretch(a, top)
+    let brand: usize = app.label(a, jtexts.t("sb.brand"), 0)
+    jtheme.style_node(a, brand, jtheme.K_BRAND)
+    let sp: usize = app.spacer(a, 1, 1)
+    scene.node_set_grow(sc, sp, 1, 0)
+    let plus: usize = app.button(a, "", on_plus)
+    jtheme.style_node(a, plus, K_SB_PLUS)
+    jicons.put(a, plus, "plus")
+    app.end(a)
+    // segment Chats | Workers
+    G_SEG = app.custom(a, widget.KIND_TILE, 340, 44)
+    scene.node_set_size(sc, G_SEG, 340.0, SEG_H)
+    jshell.fill_stretch(a, G_SEG)
+    scene.node_set_flexitem(sc, G_SEG, 0, 0, 0, 0)
+    scene.node_set_draw(sc, G_SEG, 0, draw_seg)
+    let b0: bool = app.on(a, G_SEG, event.ev_bit(event.EV_TAP), on_seg)
+    // search
+    G_SEARCH = jsetui.input(a, jtexts.t("sb.search"))
+    jtheme.style_node(a, G_SEARCH, K_SB_SEARCH)
+    // the list
+    G_LIST = app.vlist_new(a, jtexts.t("chat.list-title"), 340, 300, 0, rows, 0)
+    jtheme.style_node(a, G_LIST, jsetui.K_CONV_LIST)
+    app.vlist_set_row_pt(a, G_LIST, ROW_PT)
+    app.vlist_on_pick(a, G_LIST, on_pick)
+    jshell.fill_stretch(a, G_LIST)
+    scene.node_set_flexitem(sc, G_LIST, 1000, 1000, 60, 0)
+    // the user line
+    G_USER = app.custom(a, widget.KIND_TILE, 340, 60)
+    scene.node_set_size(sc, G_USER, 340.0, USER_H)
+    jshell.fill_stretch(a, G_USER)
+    scene.node_set_flexitem(sc, G_USER, 0, 0, 0, 0)
+    scene.node_set_draw(sc, G_USER, 0, draw_user)
+    let b1: bool = app.on(a, G_USER, event.ev_bit(event.EV_TAP), on_user)
+    app.end(a)
+    // the strip: a tap closes the drawer
+    G_DIM = app.column(a)
+    scene.node_set_flex(sc, G_DIM, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_align_self(sc, G_DIM, flex.AL_STRETCH)
+    scene.node_set_base(sc, G_DIM, 0)
+    scene.node_set_flexitem(sc, G_DIM, 160, 1000, 0, 0)
+    jtheme.style_node(a, G_DIM, K_SB_DIM_D)
+    let b2: bool = app.on(a, G_DIM, event.ev_bit(event.EV_TAP), on_dim)
+    app.end(a)
+    app.end(a)
+    jshell.set_shown(a, G_ROOT, false, 0)
+    return G_ROOT
+}
+
+// ---------------------------------------------------------------- open / close / refresh
+
+fn sidebar_open(a: *mut app.App) {
+    if G_ROOT == 0 { return }
+    G_OPEN = true
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let r: bool = scene.node_remove_class(sc, G_DIM, K_SB_DIM_D)
+    let r2: bool = scene.node_remove_class(sc, G_DIM, K_SB_DIM_L)
+    if jshell.theme_mode() == "light" { jtheme.style_node(a, G_DIM, K_SB_DIM_L) } else { jtheme.style_node(a, G_DIM, K_SB_DIM_D) }
+    jshell.set_shown_flex(a, G_MAIN, false)
+    jshell.set_shown(a, G_ROOT, true, 1)
+    jdata.refresh_convs(true)
+    G_SEEN_VER = 0
+    sidebar_refresh(a)
+}
+
+fn sidebar_close(a: *mut app.App) {
+    if G_ROOT == 0 || !G_OPEN { return }
+    G_OPEN = false
+    jshell.set_shown(a, G_ROOT, false, 0)
+    jshell.set_shown_flex(a, G_MAIN, true)
+}
+
+// 1 s while open: new data / another current chat -> rebuild
+fn sidebar_refresh(a: *mut app.App) {
+    if !G_OPEN { return }
+    jdata.refresh_convs(false)
+    let cid: str = cur_cid()
+    var same_cid: bool = cid.n == G_SEEN_CID_N
+    if same_cid {
+        var k: usize = 0
+        while k < cid.n {
+            if rt.ld8(cid.p as u64, k) != G_SEEN_CID[k] { same_cid = false }
+            k = k + 1
+        }
+    }
+    if jdata.ver_convs() == G_SEEN_VER && same_cid { return }
+    G_SEEN_VER = jdata.ver_convs()
+    var n: usize = cid.n
+    if n > 64 { n = 64 }
+    rt.mem_copy((&G_SEEN_CID[0]) as u64, cid.p as u64, n)
+    G_SEEN_CID_N = n
+    rebuild(a)
+}
+
+// 100 ms while open: the search field filters while typing
+fn sidebar_tick(a: *mut app.App) {
+    if !G_OPEN { return }
+    if read_query(a) { rebuild(a) }
+}
+
+// one log line for the tests: tab, entries, groups, query
+fn sidebar_dump() -> str {
+    return "sidebar: open=" + jshell.dec(1) + " tab=" + jshell.dec(G_TAB as i64) + " entries=" + jshell.dec(G_N as i64) + " workers_run=" +
+        jshell.dec(G_WORKERS_RUN) + " query_len=" + jshell.dec(G_QUERY_N as i64)
+}
