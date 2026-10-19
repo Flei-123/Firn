@@ -123,6 +123,12 @@ static mut G_COPY: usize = 0
 static mut G_PHOTO: usize = 0
 static mut G_FOLLOW: bool = true
 static mut G_ANS_AT: usize = 0
+static mut G_SPLIT: usize = 0 // where the tool step group of the streamed answer sits: behind the text said before the first tool call
+static mut G_TXT_AT: usize = 0 // start of the streamed text not yet folded into the steps (text between two tool calls goes into the group)
+static mut G_HELD: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // history: the last answer text, held until we know whether a tool call follows (then it is folded into the steps)
+static mut G_HELD_ON: bool = false
+static mut G_HELD_DUR: i64 = 0
+static mut G_HELD_AT: i64 = 0
 static mut G_HIST_ASKED: bool = false
 static mut G_BUSY: bool = false
 static mut G_MIC: usize = 0
@@ -156,7 +162,7 @@ fn mdv() -> *mut markdownview.MdView { return G_MD as *mut markdownview.MdView }
 static mut G_VIEW: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the source of the view: G_CHAT with the tool step groups expanded (jsteps)
 
 fn chat_changed() {
-    jsteps.compose(&G_CHAT, G_ANS_AT, &G_VIEW)
+    jsteps.compose(&G_CHAT, G_SPLIT, &G_VIEW)
     markdownview.mdv_set_markdown(mdv(), str { p: G_VIEW.ptr as *mut u8, n: G_VIEW.len }, doc.opts_default())
     G_FOLLOW = true
 }
@@ -254,6 +260,29 @@ fn chat_add_answer(text: str, dur_ms: i64, at_ms: i64, model: str) {
     chat_changed()
 }
 
+// plain text (no meta line, no copy icons): the words said before the first tool call
+fn chat_add_plain(text: str) {
+    rt.buf_push_bytes(&G_CHAT, text.p as u64, text.n)
+    rt.buf_push_bytes(&G_CHAT, "\n\n".p as u64, 2)
+    chat_changed()
+}
+
+// history: the held answer text becomes a real answer (the group collected before it comes first)
+fn release_held() {
+    if !G_HELD_ON { return }
+    G_HELD_ON = false
+    jsteps.flush(&G_CHAT)
+    chat_add_answer(__str_copy(str { p: G_HELD.ptr as *mut u8, n: G_HELD.len }), G_HELD_DUR, G_HELD_AT, "")
+}
+
+// live: the text streamed since the last tool call goes into the steps (web: the bot text between tools is folded)
+fn fold_text() {
+    if G_CHAT.len > G_TXT_AT {
+        jsteps.add_text(str { p: ((G_CHAT.ptr as u64) + G_TXT_AT as u64) as *mut u8, n: G_CHAT.len - G_TXT_AT })
+        G_CHAT.len = G_TXT_AT
+    }
+}
+
 // a message of the person: a block quote, which the markdown view draws as the web app's blue bubble at the right edge (mdv_set_bubble)
 fn chat_add_user(t: str) {
     rt.buf_clear(&G_LAST_USER)
@@ -280,6 +309,9 @@ fn chat_clear() {
     G_ANS_N = 0
     rt.buf_clear(&G_ANS_POOL)
     jsteps.reset()
+    G_HELD_ON = false
+    G_SPLIT = 0
+    G_TXT_AT = 0
     rt.buf_clear(&G_CHAT)
     chat_changed()
     G_HIST_ASKED = false
@@ -1393,6 +1425,9 @@ fn send_now(a: *mut app.App) {
 fn send_text(a: *mut app.App, t: str) {
     chat_add_user(t)
     G_ANS_AT = G_CHAT.len
+    G_SPLIT = G_CHAT.len
+    G_TXT_AT = G_CHAT.len
+    jsteps.new_turn()
     G_SENT_MS = time.now_unix_ms()
     set_busy(a, true)
     jarvisc.jc_send(jshell.jc(), t)
@@ -1699,18 +1734,33 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
     } else if kind == jarvisc.JE_CLOSE || kind == jarvisc.JE_NETERR {
         jshell.set_status("Offline - verbinde neu")
     } else if kind == jarvisc.JE_HIST_TOOL {
+        if G_HELD_ON {
+            G_HELD_ON = false
+            if jsteps.has_pending() {
+                jsteps.add_text(str { p: G_HELD.ptr as *mut u8, n: G_HELD.len })
+            } else {
+                chat_add_plain(__str_copy(str { p: G_HELD.ptr as *mut u8, n: G_HELD.len }))
+            }
+        }
         jsteps.hist_tool(jarvisc.jc_text(c), jarvisc.jc_options(c), jarvisc.jc_result(c), arg)
     } else if kind == jarvisc.JE_HIST {
-        jsteps.flush(&G_CHAT)
+        release_held()
         if arg == 1 {
+            jsteps.flush(&G_CHAT)
             chat_add_user(jarvisc.jc_text(c))
         } else {
             var hd: i64 = 0
             var ha: i64 = 0
             parse_hist_id(jarvisc.jc_id(c), &hd, &ha)
-            chat_add_answer(jarvisc.jc_clean(jarvisc.jc_text(c)), hd, ha, "")
+            let hc: str = jarvisc.jc_clean(jarvisc.jc_text(c))
+            rt.buf_clear(&G_HELD)
+            rt.buf_push_bytes(&G_HELD, hc.p as u64, hc.n)
+            G_HELD_ON = true
+            G_HELD_DUR = hd
+            G_HELD_AT = ha
         }
     } else if kind == jarvisc.JE_HIST_END {
+        release_held()
         jsteps.flush(&G_CHAT)
         chat_changed()
         // the history is in: the pill "opening the chat ..." (open from a notification / the list) must not stay (r141)
@@ -1721,6 +1771,15 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
         jshell.set_status(jtexts.t("chat.thinking"))
     } else if kind == jarvisc.JE_TOOL {
         jshell.set_status("Werkzeug: " + jarvisc.jc_text(c))
+        if !jsteps.hidden(jarvisc.jc_text(c)) {
+            if !jsteps.turn_has_group() {
+                // the first tool call: the words said before it stay above the steps
+                G_SPLIT = G_CHAT.len
+                G_TXT_AT = G_CHAT.len
+            } else {
+                fold_text()
+            }
+        }
         jsteps.tool_start(jarvisc.jc_text(c), jarvisc.jc_options(c), jarvisc.jc_id(c))
         chat_changed()
     } else if kind == jarvisc.JE_TOOL_RESULT {
@@ -1740,15 +1799,24 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
         rt.buf_free(&card)
         // a48: no auto-open; the card above opens the file on a tap (on_link)
     } else if kind == jarvisc.JE_ERROR {
-        jsteps.flush_at(&G_CHAT, G_ANS_AT)
+        jsteps.flush_at(&G_CHAT, G_SPLIT)
         chat_add("\n\n**error:** " + jarvisc.jc_text(c) + "\n\n")
         set_busy(jshell.app_ui(), false)
     } else if kind == jarvisc.JE_DONE {
         // cut the ">STATUS:" line the server appends to an answer
-        let ans: str = __str_copy(str { p: ((G_CHAT.ptr as u64) + G_ANS_AT as u64) as *mut u8, n: G_CHAT.len - G_ANS_AT })
+        var intro: str = ""
+        var from: usize = G_ANS_AT
+        if jsteps.turn_has_group() && G_SPLIT >= G_ANS_AT && G_TXT_AT >= G_SPLIT && G_TXT_AT <= G_CHAT.len {
+            intro = __str_copy(str { p: ((G_CHAT.ptr as u64) + G_ANS_AT as u64) as *mut u8, n: G_SPLIT - G_ANS_AT })
+            from = G_TXT_AT
+        }
+        let ans: str = __str_copy(str { p: ((G_CHAT.ptr as u64) + from as u64) as *mut u8, n: G_CHAT.len - from })
         G_CHAT.len = G_ANS_AT
         let clean: str = jarvisc.jc_clean(ans)
+        if intro.n > 0 { chat_add_plain(intro) }
         jsteps.flush(&G_CHAT)
+        G_SPLIT = G_CHAT.len
+        G_TXT_AT = G_CHAT.len
         var dur: i64 = 0
         let fin: i64 = time.now_unix_ms()
         if G_SENT_MS > 0 {
