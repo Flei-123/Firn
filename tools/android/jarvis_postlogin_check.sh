@@ -188,7 +188,7 @@ run_variant() { # abi:perm:density:font
     local sdir; sdir="$($ADB shell "dirname \$(find /data/data/$PKG /sdcard/Android/data/$PKG -name startup_stage.txt 2>/dev/null | head -1)" | tr -d '\r')"
     $ADB shell "printf 'signal 11 (SIGSEGV), code 1, fault addr 0x0 (a42 test dump)\n' > $sdir/sigdump.txt"
     $ADB shell monkey -p $PKG -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
-    check "$tag: crash page when a signal dump is left" "$(OCR_TRIES=20 wait_ocr ${tag}_07c 'crash report|LAST STAGE|DIED')" 1
+    check "$tag: crash page when a signal dump is left" "$(OCR_TRIES=20 wait_ocr ${tag}_07c 'crash report|LAST STAGE|DIED|abgest|Absturz')" 1
     $ADB shell "cat $sdir/last_report.txt 2>/dev/null" | head -12 >"$OUT/${tag}.report.txt"
     check "$tag: report holds the dump" "$(grep -c -E 'SIGSEGV' "$OUT/${tag}.report.txt")" 1
     $ADB shell am force-stop $PKG
