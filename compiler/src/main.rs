@@ -57,6 +57,7 @@ mod inline;
 mod layout;
 mod lexer;
 mod licm;
+mod tailrec;
 mod phi;
 mod lower;
 mod lower_errors;

@@ -205,6 +205,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "strength reduction of induction variables: a * iv + b becomes its own phi stepped by a * c (round TEMPO 15)",
     },
     PassInfo {
+        name: "tailrec",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "self tail calls (and `e + f(..)`, `e * f(..)`, or, xor accumulator forms) become a loop; runs once at the end of the fixpoint (FIRN_NO_TAILREC=1 switches it off)",
+    },
+    PassInfo {
         name: "thread-bool",
         scope: Scope::Func,
         debug_preserving: true,
@@ -671,6 +677,7 @@ fn phi_check(f: &Func, pass: &str) {
 
 fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut PassClock) {
     let mut round = 0;
+    let mut tailrec_done = false;
     let mut fx = Fix::new();
     loop {
         round += 1;
@@ -819,6 +826,22 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
         }
         clk.rounds += 1;
         if !fx.changed || round >= MAX_ROUNDS {
+            // Self tail recursion becomes a loop: once, at the end of the
+            // first fixpoint, then the cheap passes get another round on the
+            // new loop (`tailrec.rs`).
+            if !tailrec_done {
+                tailrec_done = true;
+                if cfg.runs("tailrec") && std::env::var_os("FIRN_NO_TAILREC").is_none() {
+                    let t = std::time::Instant::now();
+                    let c = crate::tailrec::run(f);
+                    clk.add2("tailrec", t, c);
+                    phi_check(f, "tailrec");
+                    if c {
+                        fx.version += 1;
+                        continue;
+                    }
+                }
+            }
             break;
         }
     }
