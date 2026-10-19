@@ -47,11 +47,37 @@ import screen_sidebar
 
 export {
     screen_chat_build, screen_chat_refresh, screen_chat_event, screen_chat_api, screen_chat_voice_tick, screen_chat_enter, screen_chat_in_node, chat_clear,
-    chat_view_tick, screen_chat_open_cid, screen_chat_build_header, screen_chat_set_usage, screen_chat_set_model, screen_chat_new,
+    chat_view_tick, screen_chat_open_cid, screen_chat_build_header, screen_chat_set_usage, screen_chat_set_model, screen_chat_set_models, screen_chat_new,
 }
 
 static mut G_SPK: usize = 0 // header speaker icon (accent while the spoken answer is on)
 static mut G_MODEL: usize = 0 // header: the model pill
+// model dropdown (the pill opens it): rows come from GET /api/m/models (net.jarvisapi parse_model_list)
+const MODEL_ROWS: usize = 8
+const EFFORT_CHIPS: usize = 5
+static mut G_DD: usize = 0 // the panel under the header
+static mut G_DD_OPEN: bool = false
+static mut G_MROW: [usize; 8] = [0; 8]
+static mut G_EROW: [usize; 5] = [0; 5]
+static mut G_EFF_ROW: usize = 0
+static mut G_MN: usize = 0 // models listed
+static mut G_EN: usize = 0 // efforts listed
+static mut G_ROWS: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // "alias \x01 label \x01 effort(0|1)\n" per model
+static mut G_EFFS: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // "low\nmedium\n..."
+static mut G_CUR_M: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_CUR_E: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+
+// copy button under every answer: the byte range of each answer in G_CHAT (the n-th meta line of the view belongs to answer n)
+const ANS_MAX: usize = 512
+static mut G_ANS_S: [usize; 512] = [0; 512]
+static mut G_ANS_E: [usize; 512] = [0; 512]
+static mut G_ANS_N: usize = 0
+static mut G_COPIED_IDX: usize = 9999999
+static mut G_COPIED_UNTIL: i64 = 0
+static mut G_COPY_ICON: i64 = -1
+static mut G_CHECK_ICON: i64 = -1
+const COPY_PT: usize = 15
+
 static mut G_SPIN: usize = 0 // composer: busy marker (shown while an answer is being made)
 static mut G_SENT_MS: i64 = 0 // when the last message went out (the meta line under the answer shows how long it took)
 static mut G_USE_A: i64 = -1 // usage strip: percent of the 5 h window, -1 = unknown
@@ -105,6 +131,21 @@ fn chat_add(s: str) {
     chat_changed()
 }
 
+// an assistant answer + its meta line (the line carries the copy button, see paint_copy_icons)
+fn chat_add_answer(text: str, meta: str) {
+    let s: usize = G_CHAT.len
+    rt.buf_push_bytes(&G_CHAT, text.p as u64, text.n)
+    if G_ANS_N < ANS_MAX {
+        G_ANS_S[G_ANS_N] = s
+        G_ANS_E[G_ANS_N] = G_CHAT.len
+    }
+    G_ANS_N = G_ANS_N + 1
+    rt.buf_push_bytes(&G_CHAT, "\n\n###### ".p as u64, 9)
+    rt.buf_push_bytes(&G_CHAT, meta.p as u64, meta.n)
+    rt.buf_push_bytes(&G_CHAT, "\n\n".p as u64, 2)
+    chat_changed()
+}
+
 // a message of the person: a block quote, which the markdown view draws as the web app's blue bubble at the right edge (mdv_set_bubble)
 fn chat_add_user(t: str) {
     rt.buf_push_bytes(&G_CHAT, "> ".p as u64, 2)
@@ -124,6 +165,7 @@ fn chat_add_user(t: str) {
 }
 
 fn chat_clear() {
+    G_ANS_N = 0
     rt.buf_clear(&G_CHAT)
     chat_changed()
     G_HIST_ASKED = false
@@ -144,7 +186,82 @@ fn draw_chat(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     }
     G_VIEW_H = scene.node_h(sc, n)
     G_AT_BOTTOM = markdownview.mdv_offset(v) + G_VIEW_H + render.len_of(c, 24) >= markdownview.mdv_content_height(v)
+    paint_copy_icons(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_h(sc, n))
     if !G_AT_BOTTOM { paint_chip(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n)) }
+}
+
+// ---- copy button under each answer (web: the copy button in the message footer)
+// window rectangle of the copy icon of answer i (right of its meta line); false = no such line or not fully inside the view
+fn copy_rect(c: *mut render.Ctx, i: usize, ny: f64, nh: f64, rx: *mut f64, ry: *mut f64, rs: *mut f64) -> bool {
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var w: f64 = 0.0
+    var h: f64 = 0.0
+    if i >= G_ANS_N || i >= ANS_MAX { return false }
+    if !markdownview.mdv_meta_rect(mdv(), i, &x, &y, &w, &h) { return false }
+    let side: f64 = render.len_of(c, COPY_PT)
+    *rs = side
+    *rx = x + w + render.len_of(c, 8)
+    *ry = y + (h - side) * 0.5
+    return *ry >= ny && *ry + side <= ny + nh
+}
+
+fn paint_copy_icons(c: *mut render.Ctx, nx: f64, ny: f64, nh: f64) {
+    if G_COPY_ICON < 0 {
+        G_COPY_ICON = listrow.icon_named("copy")
+        G_CHECK_ICON = listrow.icon_named("check")
+    }
+    let f: *mut theme.Colors = theme.theme_colors(render.ctx_theme(c))
+    let now: i64 = time.now_unix_ms()
+    var i: usize = 0
+    let shown: usize = markdownview.mdv_meta_count(mdv())
+    while i < shown {
+        var rx: f64 = 0.0
+        var ry: f64 = 0.0
+        var rs: f64 = 0.0
+        if copy_rect(c, i, ny, nh, &rx, &ry, &rs) {
+            if i == G_COPIED_IDX && now < G_COPIED_UNTIL {
+                jicons.draw_at(c, G_CHECK_ICON, rx, ry, rs, (*f).accent)
+            } else {
+                jicons.draw_at(c, G_COPY_ICON, rx, ry, rs, (*f).text_muted)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// the answer whose copy icon the tap (window coordinates) hit, else a huge number
+fn copy_hit(a: *mut app.App, tx: f64, ty: f64) -> usize {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let c: *mut render.Ctx = app.app_ctx(a)
+    let m: f64 = render.len_of(c, 10)
+    var i: usize = 0
+    let shown: usize = markdownview.mdv_meta_count(mdv())
+    while i < shown {
+        var rx: f64 = 0.0
+        var ry: f64 = 0.0
+        var rs: f64 = 0.0
+        if copy_rect(c, i, scene.node_y(sc, G_NODE), scene.node_h(sc, G_NODE), &rx, &ry, &rs) {
+            if tx >= rx - m && tx <= rx + rs + m && ty >= ry - m && ty <= ry + rs + m { return i }
+        }
+        i = i + 1
+    }
+    return 9999999
+}
+
+// copy answer i to the system clipboard (window.clipboard_set = ClipboardManager on Android)
+fn copy_answer(i: usize) {
+    if i >= ANS_MAX || i >= G_ANS_N { return }
+    let s: usize = G_ANS_S[i]
+    let e: usize = G_ANS_E[i]
+    if e <= s || e > G_CHAT.len { return }
+    if clip_write((G_CHAT.ptr as u64) + s as u64, e - s) {
+        G_COPIED_IDX = i
+        G_COPIED_UNTIL = time.now_unix_ms() + 1500
+        jshell.set_status("Kopiert")
+    } else {
+        jshell.set_status("Kopieren fehlgeschlagen")
+    }
 }
 
 // the round "scroll to the end" chip at the top centre of the view (web: the arrow chip above the messages)
@@ -212,6 +329,11 @@ fn on_touch(ud: u64, e: *mut event.Ev) -> u32 {
             markdownview.mdv_set_offset(v, markdownview.mdv_content_height(v))
             return event.H_STOP
         }
+        let ci: usize = copy_hit(a, event.ev_x(e), event.ev_y(e))
+        if ci != 9999999 {
+            copy_answer(ci)
+            return event.H_STOP
+        }
         let t: bool = markdownview.mdv_touch_tap(v, app.app_ctx(a), event.ev_x(e), event.ev_y(e))
         sel_changed(a)
         return event.H_STOP
@@ -261,7 +383,238 @@ fn on_voice(a: *mut app.App) {
 
 // header hooks: the hamburger (main.fi opens the chat list), the model pill, the sliders (Settings tab)
 fn on_menu(a: *mut app.App) { screen_sidebar.sidebar_open(a) }
-fn on_model(a: *mut app.App) { jshell.set_status(jtexts.t("chat.model-note")) }
+fn on_noop(a: *mut app.App) { }
+
+// ---- model dropdown: the pill (or its chevron) opens a panel under the header with the enabled models and the effort levels
+// line `idx` of buf `b` (up to the next newline) and its field `f` (fields are split by byte 1); "" when missing. A view into `b`.
+fn line_field(b: *mut rt.Buf, idx: usize, f: usize) -> str {
+    let p: u64 = (*b).ptr
+    let n: usize = (*b).len
+    var i: usize = 0
+    var ln: usize = 0
+    while ln < idx && i < n {
+        if rt.ld8(p, i) == 10 as u8 { ln = ln + 1 }
+        i = i + 1
+    }
+    var e: usize = i
+    while e < n && rt.ld8(p, e) != 10 as u8 { e = e + 1 }
+    var fs: usize = i
+    var fi: usize = 0
+    while fi < f && fs < e {
+        if rt.ld8(p, fs) == 1 as u8 { fi = fi + 1 }
+        fs = fs + 1
+    }
+    if fi < f { return "" }
+    var fe: usize = fs
+    while fe < e && rt.ld8(p, fe) != 1 as u8 { fe = fe + 1 }
+    return str { p: (p + fs as u64) as *mut u8, n: fe - fs }
+}
+
+fn count_lines(b: *mut rt.Buf) -> usize {
+    var k: usize = 0
+    var i: usize = 0
+    while i < (*b).len {
+        if rt.ld8((*b).ptr, i) == 10 as u8 { k = k + 1 }
+        i = i + 1
+    }
+    return k
+}
+
+fn buf_is(b: *mut rt.Buf, s: str) -> bool {
+    return (*b).len == s.n && s.n > 0 && rt.mem_eq((*b).ptr, s.p as u64, s.n)
+}
+
+fn buf_set(b: *mut rt.Buf, s: str) {
+    rt.buf_clear(b)
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+// "medium" -> "Medium"
+fn cap_first(s: str) -> str {
+    if s.n == 0 { return s }
+    var b: rt.Buf = rt.buf_new()
+    var c0: u8 = *(s.p)
+    if c0 >= 97 as u8 && c0 <= 122 as u8 { c0 = c0 - 32 as u8 }
+    rt.buf_push(&b, c0)
+    rt.buf_push_bytes(&b, (s.p + 1) as u64, s.n - 1)
+    let r: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return r
+}
+
+fn chip_on(a: *mut app.App, n: usize, on: bool) {
+    if n == app.NONE { return }
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let r: bool = scene.node_remove_class(sc, n, jtheme.K_CHIP_ON)
+    if on { let q: bool = scene.node_add_class(sc, n, jtheme.K_CHIP_ON) }
+}
+
+// does the current model take an effort level (the 3rd field of its row)?
+fn cur_has_effort() -> bool {
+    var i: usize = 0
+    while i < G_MN {
+        if buf_is(&G_CUR_M, line_field(&G_ROWS, i, 0)) { return line_field(&G_ROWS, i, 2) == "1" }
+        i = i + 1
+    }
+    return true
+}
+
+// the pill text: "Claude Sonnet 5.5 Medium" like the web
+fn pill_text() -> str {
+    var i: usize = 0
+    while i < G_MN {
+        if buf_is(&G_CUR_M, line_field(&G_ROWS, i, 0)) {
+            var t: str = __str_copy(line_field(&G_ROWS, i, 1))
+            if G_CUR_E.len > 0 && cur_has_effort() {
+                t = t + " " + cap_first(__str_copy(str { p: G_CUR_E.ptr as *mut u8, n: G_CUR_E.len }))
+            }
+            return t
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn refresh_dd(a: *mut app.App) {
+    var i: usize = 0
+    while i < MODEL_ROWS {
+        let n: usize = G_MROW[i]
+        if i < G_MN {
+            app.set_text(a, n, line_field(&G_ROWS, i, 1))
+            chip_on(a, n, buf_is(&G_CUR_M, line_field(&G_ROWS, i, 0)))
+            jshell.set_shown(a, n, true, 0)
+        } else {
+            jshell.set_shown(a, n, false, 0)
+        }
+        i = i + 1
+    }
+    let eff: bool = cur_has_effort() && G_EN > 0
+    var j: usize = 0
+    while j < EFFORT_CHIPS {
+        let n: usize = G_EROW[j]
+        if j < G_EN && eff {
+            let name: str = line_field(&G_EFFS, j, 0)
+            app.set_text(a, n, cap_first(name))
+            chip_on(a, n, buf_is(&G_CUR_E, name))
+            jshell.set_shown(a, n, true, 0)
+        } else {
+            jshell.set_shown(a, n, false, 0)
+        }
+        j = j + 1
+    }
+    jshell.set_shown(a, G_EFF_ROW, eff, 0)
+    let t: str = pill_text()
+    if t.n > 0 { app.set_text(a, G_MODEL, t) }
+}
+
+fn dd_show(a: *mut app.App, on: bool) {
+    G_DD_OPEN = on
+    jshell.set_shown(a, G_DD, on, 0)
+}
+
+fn on_model(a: *mut app.App) {
+    if G_MN == 0 {
+        jshell.set_status(jtexts.t("chat.model-note"))
+        return
+    }
+    dd_show(a, !G_DD_OPEN)
+}
+
+// the list arrived (jmeta.jmeta_api): rows / efforts / stored choice; an empty list = an older server, the pill stays a plain label
+fn screen_chat_set_models(a: *mut app.App, rows: str, efforts: str, cur_model: str, cur_effort: str) {
+    buf_set(&G_ROWS, rows)
+    buf_set(&G_EFFS, efforts)
+    buf_set(&G_CUR_M, cur_model)
+    buf_set(&G_CUR_E, cur_effort)
+    G_MN = count_lines(&G_ROWS)
+    if G_MN > MODEL_ROWS { G_MN = MODEL_ROWS }
+    G_EN = count_lines(&G_EFFS)
+    if G_EN > EFFORT_CHIPS { G_EN = EFFORT_CHIPS }
+    if G_DD == 0 { return }
+    if G_MN == 0 { dd_show(a, false) }
+    refresh_dd(a)
+}
+
+// a model was tapped: store it (POST) and tell the open socket (the web app's "/model <alias>" command)
+fn pick_model(a: *mut app.App, i: usize) {
+    if i >= G_MN { return }
+    let alias: str = __str_copy(line_field(&G_ROWS, i, 0))
+    buf_set(&G_CUR_M, alias)
+    let b1: bool = jarvisapi.ja_models_set(jshell.api(), alias, "")
+    jarvisc.jc_send(jshell.jc(), "/model " + alias)
+    refresh_dd(a)
+    if !cur_has_effort() { dd_show(a, false) }
+}
+
+fn pick_effort(a: *mut app.App, j: usize) {
+    if j >= G_EN { return }
+    let name: str = __str_copy(line_field(&G_EFFS, j, 0))
+    buf_set(&G_CUR_E, name)
+    let b1: bool = jarvisapi.ja_models_set(jshell.api(), "", name)
+    jarvisc.jc_send(jshell.jc(), "/effort " + name)
+    refresh_dd(a)
+    dd_show(a, false)
+}
+
+fn pm0(a: *mut app.App) { pick_model(a, 0) }
+fn pm1(a: *mut app.App) { pick_model(a, 1) }
+fn pm2(a: *mut app.App) { pick_model(a, 2) }
+fn pm3(a: *mut app.App) { pick_model(a, 3) }
+fn pm4(a: *mut app.App) { pick_model(a, 4) }
+fn pm5(a: *mut app.App) { pick_model(a, 5) }
+fn pm6(a: *mut app.App) { pick_model(a, 6) }
+fn pm7(a: *mut app.App) { pick_model(a, 7) }
+fn pe0(a: *mut app.App) { pick_effort(a, 0) }
+fn pe1(a: *mut app.App) { pick_effort(a, 1) }
+fn pe2(a: *mut app.App) { pick_effort(a, 2) }
+fn pe3(a: *mut app.App) { pick_effort(a, 3) }
+fn pe4(a: *mut app.App) { pick_effort(a, 4) }
+
+// the panel node tree (hidden until the pill is tapped): one chip per model, one row of effort chips
+fn build_dropdown(a: *mut app.App) {
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let dd: usize = app.column(a)
+    G_DD = dd
+    scene.node_set_flex(sc, dd, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+    scene.node_set_gap(sc, dd, 4, 4)
+    scene.node_set_padding(sc, dd, 10, 8, 10, 8)
+    jshell.fill_stretch(a, dd)
+    jtheme.style_node(a, dd, jtheme.K_LIST)
+    G_MROW[0] = app.button(a, "", pm0)
+    G_MROW[1] = app.button(a, "", pm1)
+    G_MROW[2] = app.button(a, "", pm2)
+    G_MROW[3] = app.button(a, "", pm3)
+    G_MROW[4] = app.button(a, "", pm4)
+    G_MROW[5] = app.button(a, "", pm5)
+    G_MROW[6] = app.button(a, "", pm6)
+    G_MROW[7] = app.button(a, "", pm7)
+    let er: usize = app.row(a)
+    G_EFF_ROW = er
+    scene.node_set_flex(sc, er, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_CENTER)
+    scene.node_set_gap(sc, er, 4, 4)
+    jshell.fill_stretch(a, er)
+    G_EROW[0] = app.button(a, "", pe0)
+    G_EROW[1] = app.button(a, "", pe1)
+    G_EROW[2] = app.button(a, "", pe2)
+    G_EROW[3] = app.button(a, "", pe3)
+    G_EROW[4] = app.button(a, "", pe4)
+    app.end(a)
+    app.end(a)
+    var i: usize = 0
+    while i < MODEL_ROWS {
+        jtheme.style_node(a, G_MROW[i], jtheme.K_CHIP)
+        jshell.set_shown(a, G_MROW[i], false, 0)
+        i = i + 1
+    }
+    var j: usize = 0
+    while j < EFFORT_CHIPS {
+        jtheme.style_node(a, G_EROW[j], jtheme.K_CHIP)
+        jshell.set_shown(a, G_EROW[j], false, 0)
+        j = j + 1
+    }
+    jshell.set_shown(a, G_EFF_ROW, false, 0)
+    jshell.set_shown(a, dd, false, 0)
+}
 fn on_sliders(a: *mut app.App) { jshell.request_tab(jshell.TAB_SETTINGS) }
 
 // the busy marker in the composer (an answer is being made)
@@ -614,6 +967,8 @@ fn screen_chat_build_header(a: *mut app.App) -> usize {
     let model: usize = app.button(a, jtexts.t("chat.model"), on_model)
     G_MODEL = model
     jtheme.style_node(a, model, jtheme.K_MODEL)
+    // the pill gives room (shrink 1000 per mille): on a narrow screen the long label shrinks instead of pushing speaker / mic / sliders out of the window
+    scene.node_set_flexitem(sc, model, 0, 1000, 1, 0)
     let chev: usize = app.button(a, "", on_model)
     jtheme.style_node(a, chev, jtheme.K_HDRBTN)
     jicons.put(a, chev, "chevron-down")
@@ -630,6 +985,7 @@ fn screen_chat_build_header(a: *mut app.App) -> usize {
     jicons.put(a, sl, "sliders-horizontal")
     app.end(a)
     let sep: usize = app.separator(a)
+    build_dropdown(a)
     app.end(a)
     return col
 }
@@ -675,7 +1031,7 @@ fn screen_chat_build(a: *mut app.App) {
     let att: usize = app.button(a, "", on_attach)
     jtheme.style_node(a, att, jtheme.K_ICONBTN)
     jicons.put(a, att, "paperclip")
-    G_SPIN = app.button(a, "", on_model)
+    G_SPIN = app.button(a, "", on_noop)
     jtheme.style_node(a, G_SPIN, jtheme.K_ICONBTN)
     jicons.put(a, G_SPIN, "loader-circle")
     jshell.set_shown(a, G_SPIN, false, 0)
@@ -763,7 +1119,7 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
         if arg == 1 {
             chat_add_user(jarvisc.jc_text(c))
         } else {
-            chat_add(jarvisc.jc_clean(jarvisc.jc_text(c)) + "\n\n")
+            chat_add_answer(jarvisc.jc_clean(jarvisc.jc_text(c)), "Jarvis")
         }
     } else if kind == jarvisc.JE_HIST_END {
         // the history is in: the pill "opening the chat ..." (open from a notification / the list) must not stay (r141)
@@ -786,7 +1142,7 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
         let ans: str = __str_copy(str { p: ((G_CHAT.ptr as u64) + G_ANS_AT as u64) as *mut u8, n: G_CHAT.len - G_ANS_AT })
         G_CHAT.len = G_ANS_AT
         let clean: str = jarvisc.jc_clean(ans)
-        chat_add(clean + "\n\n")
+        var meta: str = "Jarvis"
         if G_SENT_MS > 0 {
             // the meta line (a level-6 heading, drawn small and dim by the markdown view): how long the answer took
             let secs: i64 = (time.now_unix_ms() - G_SENT_MS) / 1000
@@ -800,9 +1156,10 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
             var ms2: str = jshell.dec(mm)
             if hh < 10 { hs = "0" + hs }
             if mm < 10 { ms2 = "0" + ms2 }
-            chat_add("###### " + dur + " - finished " + hs + ":" + ms2 + "\n\n")
+            meta = dur + " - finished " + hs + ":" + ms2
             G_SENT_MS = 0
         }
+        chat_add_answer(clean, meta)
         if G_VOICE && !voiceio.vio_say(clean) {
             jshell.set_status(jtexts.t("chat.no-speech"))
         }

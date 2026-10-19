@@ -55,6 +55,15 @@ PMIN = int(os.environ.get("FAKE_PARTIAL_MIN_KB", "50")) * 1024
 PMAX = int(os.environ.get("FAKE_PARTIAL_MAX_KB", "200")) * 1024
 STREAM = os.environ.get("FAKE_STREAM", "0") == "1"
 MODELS = ["opus", "sonnet", "haiku", "fable", "hy3", "glm"]
+# GET/POST /api/m/models: the models the "admin" enabled, the stored choice (docs/ANDROID-APP-API.md)
+ENABLED = ["sonnet", "haiku", "opus"]
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+MODEL_LABELS = {"sonnet": "Claude Sonnet 5.5", "haiku": "Claude Haiku 5", "opus": "Claude Opus 5.5"}
+MODEL_STATE = {"model": "sonnet", "effort": "medium"}
+
+
+def model_current():
+    return {"model": MODEL_STATE["model"], "effort": MODEL_STATE["effort"], "thinking": False, "label": MODEL_LABELS[MODEL_STATE["model"]], "provider": "claude"}
 SNIPPETS = [
     "Wird erledigt, Boss. Größe: 42 MB, Übergabe über Straße: ä ö ü Ä Ö Ü ß €.\n",
     "```js\nconst a = { \"k\": [1, 2, 3], 'q': `tpl ${x}` }; // \\ backslash \\\\ double\n```\n",
@@ -290,9 +299,18 @@ def rest(method, rawpath, hdr, body):
         if mp == "usage" and method == "GET":
             if os.environ.get("FAKE_NO_USAGE"): return out(503, {"error": "no usage source"})
             return out(200, {"provider": "claude", "name": "Claude", "p5": 37, "p7": 64, "reset5": None, "reset7": None, "providers": {}})
-        if mp.startswith("models") and method == "GET":
-            if os.environ.get("FAKE_NO_USAGE"): return out(503, {"error": "no models"})
-            return out(200, {"models": [], "efforts": ["low", "medium", "high"], "current": {"model": "sonnet", "effort": "medium", "thinking": False, "label": "Claude Sonnet 5.5", "provider": "claude"}, "chat": None})
+        if mp.startswith("models") and method == "GET":  # FAKE_NO_USAGE: an older server; FAKE_NO_MODELS=1: 503 only for the list
+            if os.environ.get("FAKE_NO_USAGE") or os.environ.get("FAKE_NO_MODELS"): return out(503, {"error": "no models"})
+            return out(200, {"models": [{"alias": a, "label": MODEL_LABELS[a], "blurb": "", "provider": "claude", "effort": a != "haiku", "thinking": True, "vision": True} for a in ENABLED],
+                             "efforts": EFFORTS, "current": model_current(), "chat": None})
+        if mp == "models" and method == "POST" and j:
+            if j.get("model") is not None:
+                if j["model"] not in ENABLED: return out(400, {"error": "Modell nicht verfuegbar"})
+                MODEL_STATE["model"] = j["model"]
+            if j.get("effort") is not None:
+                if j["effort"] not in EFFORTS: return out(400, {"error": "Effort unbekannt"})
+                MODEL_STATE["effort"] = j["effort"]
+            return out(200, {"ok": True, "current": model_current()})
         if mp == "projects" and method == "GET":
             return out(200, {"projects": [psummary(p) for p in PROJECTS.values()]})
         if mp.startswith("projects/") and method == "GET":
@@ -480,6 +498,12 @@ async def handler(ws):
         if t == "message":
             text = m["text"]
             cid = m.get("cid")
+            if text.startswith("/model ") or text.startswith("/effort "):  # slash commands: stored like the web ones, no chat turn
+                cmd, arg = text.split(" ", 1)
+                if cmd == "/model" and arg.strip() in ENABLED: MODEL_STATE["model"] = arg.strip()
+                if cmd == "/effort" and arg.strip() in EFFORTS: MODEL_STATE["effort"] = arg.strip()
+                await send(ws, {"type": "system", "content": "ok " + text})
+                continue
             if not cid:
                 seq += 1
                 cid = "fake%d" % seq
@@ -498,6 +522,8 @@ async def handler(ws):
                 await send(ws, {"type": "ask_request", "id": "a1", "cid": cid, "question": "Which?", "options": ["A", {"label": "B"}]})
                 r = json.loads(await ws.recv()); LOG.write(json.dumps(r) + "\n")
                 await send(ws, {"type": "token", "cid": cid, "content": "ans=%s" % r["answers"][0]})
+            elif text == "code":  # a fenced block + inline code: the monospace face (font slot 1) check
+                await send(ws, {"type": "token", "cid": cid, "content": "Run `ls -la` here:\n\n```sh\nfor f in *.fi; do echo \"$f\"; done\n```\n"})
             elif text == "file":
                 FILES["report.txt"] = b"hello report from the fake server\n"
                 await send(ws, {"type": "token", "cid": cid, "content": "Here is the file."})
