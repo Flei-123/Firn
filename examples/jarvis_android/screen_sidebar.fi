@@ -14,8 +14,12 @@
 // The module does not import screen_chat (the chat header opens the sidebar): the chat tab and the new-chat action are wired by main.fi.
 // "..." menu per chat entry (web convMenu): a tap on the three dots at the right edge of an entry or a long press opens a page in the
 // panel (it replaces the list): Rename (input + save), Delete (asks first). Both go to POST /api/m/chats/rename | remove
-// (docs/ANDROID-APP-API.md; 404 on an older server, 409 while the chat runs -> a line of text, no crash). Favorite / folders have
-// no mobile route yet and are left out.
+// (docs/ANDROID-APP-API.md; 404 on an older server, 409 while the chat runs -> a line of text, no crash).
+// FOLDERS (A48, web: the "Ordner" block of public/app.js renderConvList): on the Chats tab a block header "ORDNER" (fold + "..." = new
+// folder) over one header per folder (folder icon, fold, count, "..." = rename / delete) with its chats indented below; chats that sit in
+// a folder are NOT repeated in the date groups. The chat menu got "Favorit" (star) and "In Ordner verschieben" (a picker list: no folder /
+// each folder / new folder). All of it is POST /api/m/folders/(add|rename|remove) and /api/m/chats/move. Fold state is kept in the
+// app settings (sb.closed = bit per group, bit 7 = folder block; sb.fclosed = ",id,id," of the closed folders).
 //   sidebar_back(a)               Android Back key: one step back (menu step, menu, drawer); false = nothing was open
 //   sidebar_api(x, kind, status)  the answer of rename / remove (main.on_api); true = ours
 import std.rt
@@ -58,8 +62,8 @@ const K_SB_SEARCH: u32 = 72
 const K_SB_DIM_D: u32 = 73
 const K_SB_DIM_L: u32 = 74
 
-const MAXC: usize = 128 // conversations looked at (the app asks for 100)
-const MAXE: usize = 192 // display entries: headers + entries
+const MAXC: usize = 256 // conversations looked at (the app asks for 100, plus every chat that sits in a folder)
+const MAXE: usize = 320 // display entries: headers + entries
 const NGROUPS: usize = 7
 const ROW_PT: usize = 46
 const SEG_H: f64 = 44.0
@@ -109,15 +113,31 @@ static mut G_QUERY_N: usize = 0
 static mut G_PICKED: [u8; 96] = [0; 96]
 static mut G_PICKED_N: usize = 0
 static mut G_N: usize = 0 // display entries
-static mut G_E: [u32; 192] = [0; 192] // kind * 1000 + index: 1 = group header (group), 2 = chat entry (conversation), 3 = message line (text key)
-static mut G_GRP: [i64; 128] = [0; 128] // group of conversation i, -1 = not shown
-static mut G_PAR: [i64; 128] = [0; 128] // index of the parent conversation shown, -1 = none
-static mut G_KIDS: [i64; 128] = [0; 128] // sub-workers of i
-static mut G_KIDS_RUN: [i64; 128] = [0; 128] // sub-workers of i that work
+static mut G_E: [u32; 320] = [0; 320] // kind * 1000 + index: 1 = group header (group), 2 = chat entry (conversation), 3 = message line (text key), 4 = the folder block header, 5 = a folder header (folder index)
+static mut G_GRP: [i64; 256] = [0; 256] // group of conversation i, -1 = not shown
+static mut G_PAR: [i64; 256] = [0; 256] // index of the parent conversation shown, -1 = none
+static mut G_KIDS: [i64; 256] = [0; 256] // sub-workers of i
+static mut G_KIDS_RUN: [i64; 256] = [0; 256] // sub-workers of i that work
 static mut G_GCOUNT: [i64; 8] = [0; 8]
 static mut G_WORKERS_RUN: i64 = 0
 static mut G_CHATS_RUN: i64 = 0
 static mut G_WORKERS_ALL: i64 = 0
+static mut G_FIDX: [i64; 256] = [0; 256] // folder index of conversation i, -1 = in no (known) folder
+static mut G_FCOUNT: [i64; 48] = [0; 48] // chats per folder
+static mut G_FRUN: [i64; 48] = [0; 48] // working chats per folder
+static mut G_FC: [u8; 1024] = [0; 1024] // closed folders: ",id,id,"
+static mut G_FC_N: usize = 0
+static mut G_LOADED: bool = false // fold state read from the settings
+static mut G_M_TGT: usize = 0 // what the menu works on: 0 chat, 1 folder, 2 new folder, 3 new folder + put the chat in it
+static mut G_M_THEN: bool = false // a "new folder" answer must be followed by moving the chat
+static mut G_F_ID: [u8; 64] = [0; 64]
+static mut G_F_ID_N: usize = 0
+static mut G_F_NM: [u8; 96] = [0; 96]
+static mut G_F_NM_N: usize = 0
+static mut G_M_FAV: usize = 0
+static mut G_M_MOVE: usize = 0
+const FOLD_BIT: u32 = 7 // G_CLOSED bit of the whole folder block
+const MAXF: usize = 48
 
 fn noop(a: *mut app.App) {}
 
@@ -139,6 +159,116 @@ fn conv_count() -> usize {
     var n: usize = vec_len[jarvisapi.ConvRow](&(*jdata.convs()).rows)
     if n > MAXC { n = MAXC }
     return n
+}
+
+fn folder_count() -> usize {
+    if !jdata.has_convs() { return 0 }
+    var n: usize = vec_len[jarvisapi.FolderRow](&(*jdata.convs()).folders)
+    if n > MAXF { n = MAXF }
+    return n
+}
+
+fn folder_at(i: usize) -> *mut jarvisapi.FolderRow {
+    return vec_elem_ptr[jarvisapi.FolderRow](&(*jdata.convs()).folders, i)
+}
+
+// position of ",id," in the closed-folder list, -1 = not closed
+fn fc_find(id: str) -> i64 {
+    if id.n == 0 || G_FC_N < id.n + 2 { return 0 - 1 }
+    var i: usize = 0
+    while i + id.n + 2 <= G_FC_N {
+        if G_FC[i] == 44 as u8 && G_FC[i + id.n + 1] == 44 as u8 {
+            var k: usize = 0
+            while k < id.n {
+                if G_FC[i + 1 + k] != rt.ld8(id.p as u64, k) { break }
+                k = k + 1
+            }
+            if k == id.n { return i as i64 }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn folder_closed(i: usize) -> bool { return fc_find((*folder_at(i)).id) >= 0 }
+
+fn fold_persist() {
+    jshell.cfg_set("sb.closed", jshell.dec(G_CLOSED as i64))
+    jshell.cfg_set("sb.fclosed", str { p: (&G_FC[0]) as *mut u8, n: G_FC_N })
+}
+
+fn fc_toggle(id: str) {
+    let at: i64 = fc_find(id)
+    if at >= 0 {
+        // drop "id," (the leading comma stays as the separator of the next entry)
+        let from: usize = at as usize + 1
+        let cut: usize = id.n + 1
+        var i: usize = from
+        while i + cut < G_FC_N {
+            G_FC[i] = G_FC[i + cut]
+            i = i + 1
+        }
+        G_FC_N = G_FC_N - cut
+        if G_FC_N <= 1 { G_FC_N = 0 }
+    } else if G_FC_N + id.n + 2 < 1024 {
+        if G_FC_N == 0 {
+            G_FC[0] = 44 as u8
+            G_FC_N = 1
+        }
+        var k: usize = 0
+        while k < id.n {
+            G_FC[G_FC_N + k] = rt.ld8(id.p as u64, k)
+            k = k + 1
+        }
+        G_FC_N = G_FC_N + id.n
+        G_FC[G_FC_N] = 44 as u8
+        G_FC_N = G_FC_N + 1
+    }
+    fold_persist()
+}
+
+fn parse_u32(s: str) -> u32 {
+    var v: u32 = 0 as u32
+    var i: usize = 0
+    while i < s.n && i < 9 {
+        let b: u8 = rt.ld8(s.p as u64, i)
+        if b < 48 as u8 || b > 57 as u8 { break }
+        v = v * (10 as u32) + ((b - 48 as u8) as u32)
+        i = i + 1
+    }
+    return v
+}
+
+// once, the first time the drawer opens (the settings exist by then)
+fn fold_load() {
+    if G_LOADED { return }
+    G_LOADED = true
+    G_CLOSED = parse_u32(jshell.cfg_get("sb.closed", "0"))
+    let fc: str = jshell.cfg_get("sb.fclosed", "")
+    var n: usize = fc.n
+    if n > 1000 { n = 0 }
+    rt.mem_copy((&G_FC[0]) as u64, fc.p as u64, n)
+    G_FC_N = n
+}
+
+fn conv_find(id: str) -> i64 {
+    let n: usize = conv_count()
+    var i: usize = 0
+    while i < n {
+        if (*conv_at(i)).id == id { return i as i64 }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn folder_find(id: str) -> i64 {
+    let n: usize = folder_count()
+    var i: usize = 0
+    while i < n {
+        if (*folder_at(i)).id == id { return i as i64 }
+        i = i + 1
+    }
+    return 0 - 1
 }
 
 fn conv_at(i: usize) -> *mut jarvisapi.ConvRow {
@@ -253,6 +383,28 @@ fn rebuild(a: *mut app.App) {
         }
         i = i + 1
     }
+    // folders: a chat of the Chats tab whose folder exists hangs in that folder (not in a date group)
+    let nf: usize = folder_count()
+    var fi0: usize = 0
+    while fi0 < MAXF {
+        G_FCOUNT[fi0] = 0
+        G_FRUN[fi0] = 0
+        fi0 = fi0 + 1
+    }
+    i = 0
+    while i < n {
+        G_FIDX[i] = 0 - 1
+        let c: *mut jarvisapi.ConvRow = conv_at(i)
+        if (*c).folder.n > 0 && (*c).kind != "orchestrator" && !is_worker(c) && (*c).parent.n == 0 {
+            let fx: i64 = folder_find((*c).folder)
+            if fx >= 0 {
+                G_FIDX[i] = fx
+                G_FCOUNT[fx as usize] = G_FCOUNT[fx as usize] + 1
+                if (*c).running { G_FRUN[fx as usize] = G_FRUN[fx as usize] + 1 }
+            }
+        }
+        i = i + 1
+    }
     // sub-workers hang under their parent (when the parent is in the list too)
     i = 0
     while i < n {
@@ -300,6 +452,34 @@ fn rebuild(a: *mut app.App) {
                 i = i + 1
             }
         }
+        // the folder block (Chats tab): the block header, then each folder with its chats (working ones first)
+        if G_TAB == 0 && G_N < MAXE {
+            G_E[G_N] = 4000 as u32
+            G_N = G_N + 1
+            shown = shown + 1
+            if (G_CLOSED & ((1 as u32) << FOLD_BIT)) == 0 as u32 {
+                var fx: usize = 0
+                while fx < nf && G_N < MAXE {
+                    G_E[G_N] = (5000 + fx) as u32
+                    G_N = G_N + 1
+                    if !folder_closed(fx) {
+                        var pass: usize = 0
+                        while pass < 2 {
+                            i = 0
+                            while i < n && G_N < MAXE {
+                                if G_FIDX[i] == fx as i64 && ((*conv_at(i)).running == (pass == 0)) {
+                                    G_E[G_N] = (2000 + i) as u32
+                                    G_N = G_N + 1
+                                }
+                                i = i + 1
+                            }
+                            pass = pass + 1
+                        }
+                    }
+                    fx = fx + 1
+                }
+            }
+        }
         i = 0
         while i < n {
             let c: *mut jarvisapi.ConvRow = conv_at(i)
@@ -308,7 +488,7 @@ fn rebuild(a: *mut app.App) {
                 let w: bool = is_worker(c)
                 if (G_TAB == 1) != w { inside = false }
             }
-            if inside { G_GRP[i] = group_of(i, today) }
+            if inside && G_FIDX[i] < 0 { G_GRP[i] = group_of(i, today) }
             i = i + 1
         }
         g = 0
@@ -344,7 +524,7 @@ fn rebuild(a: *mut app.App) {
         G_E[G_N] = (3000 + key) as u32
         G_N = G_N + 1
     }
-    app.vlist_set_count(a, G_LIST, G_N)
+    if G_M_MODE == 4 { app.vlist_set_count(a, G_LIST, folder_count() + 2) } else { app.vlist_set_count(a, G_LIST, G_N) }
     app.vlist_changed(a, G_LIST)
     if G_SEG != app.NONE { scene.node_set_draw(app.app_scene(a), G_SEG, 0, draw_seg) }
 }
@@ -386,6 +566,7 @@ fn put_count(out: *mut vlist.VRow, v: i64) {
 }
 
 fn rows(ud: u64, i: usize, out: *mut vlist.VRow) {
+    if G_M_MODE == 4 { pick_rows(ud, i, out); return }
     if i >= G_N { return }
     let e: u32 = G_E[i]
     let kind: u32 = e / 1000 as u32
@@ -398,6 +579,32 @@ fn rows(ud: u64, i: usize, out: *mut vlist.VRow) {
         if (G_CLOSED & ((1 as u32) << (idx as u32))) == 0 as u32 { f = f | 1 as u32 }
         if idx == G_ACTIVE { f = f | 2 as u32 }
         (*out).sbf = f
+        return
+    }
+    if kind == 4 as u32 {
+        jlist.put(out, jtexts.t("sb.g-folders"))
+        put_count(out, folder_count() as i64)
+        (*out).sbk = 1 as u32
+        var f4: u32 = 8 as u32 // SB_MENU: "..." = new folder
+        if (G_CLOSED & ((1 as u32) << FOLD_BIT)) == 0 as u32 { f4 = f4 | 1 as u32 }
+        var fr: i64 = 0
+        var q: usize = 0
+        while q < folder_count() {
+            fr = fr + G_FRUN[q]
+            q = q + 1
+        }
+        if fr > 0 { f4 = f4 | 2 as u32 }
+        (*out).sbf = f4
+        return
+    }
+    if kind == 5 as u32 {
+        jlist.put(out, (*folder_at(idx)).name)
+        put_count(out, G_FCOUNT[idx])
+        (*out).sbk = 1 as u32
+        var f5: u32 = 8 as u32 | 16 as u32 // SB_MENU | SB_FOLDER
+        if !folder_closed(idx) { f5 = f5 | 1 as u32 }
+        if G_FRUN[idx] > 0 { f5 = f5 | 2 as u32 }
+        (*out).sbf = f5
         return
     }
     if kind == 3 as u32 {
@@ -415,18 +622,33 @@ fn rows(ud: u64, i: usize, out: *mut vlist.VRow) {
     if (*c).running || G_KIDS_RUN[idx] > 0 { f = f | 2 as u32 }
     if (*c).id == cur_cid() { f = f | 4 as u32 }
     f = f | 8 as u32 // SB_MENU: the "..." at the right edge
+    if G_QUERY_N == 0 && G_FIDX[idx] >= 0 { f = f | 32 as u32 } // SB_INDENT: inside a folder
+    if (*c).fav && G_GRP[idx] != G_FAV as i64 { f = f | 64 as u32 } // SB_STAR (the favorites group needs none)
     (*out).sbf = f
     if G_KIDS[idx] > 0 { (*out).badge = G_KIDS[idx] }
 }
 
 // a tap on a row: a group header folds, an entry opens its chat
 fn on_pick(a: *mut app.App, id: usize, row: usize) {
+    if G_M_MODE == 4 { on_pick_folder(a, id, row); return }
     if row >= G_N { return }
     let e: u32 = G_E[row]
     let kind: u32 = e / 1000 as u32
     let idx: usize = (e % 1000 as u32) as usize
     if kind == 1 as u32 {
         G_CLOSED = G_CLOSED ^ ((1 as u32) << (idx as u32))
+        fold_persist()
+        rebuild(a)
+        return
+    }
+    if kind == 4 as u32 {
+        G_CLOSED = G_CLOSED ^ ((1 as u32) << FOLD_BIT)
+        fold_persist()
+        rebuild(a)
+        return
+    }
+    if kind == 5 as u32 {
+        fc_toggle((*folder_at(idx)).id)
         rebuild(a)
         return
     }
@@ -453,37 +675,87 @@ fn m_id() -> str { return str { p: (&G_M_ID[0]) as *mut u8, n: G_M_ID_N } }
 fn m_title() -> str { return str { p: (&G_M_TT[0]) as *mut u8, n: G_M_TT_N } }
 
 // show / hide the pages of the panel for the current menu mode
+// modes: 0 none, 1 chat actions, 2 name input (G_M_TGT says for what), 3 delete asks, 4 folder picker, 6 folder actions
 fn menu_apply(a: *mut app.App) {
     if G_MENU == 0 { return }
     let sc: *mut scene.Scene = app.app_scene(a)
     let on: bool = G_M_MODE != 0
     jshell.set_shown(a, G_SEG, !on, 0)
     jshell.set_shown(a, G_SEARCH, !on, 0)
-    scene.node_set_hidden(sc, G_LIST, on)
-    if on { scene.node_set_flexitem(sc, G_LIST, 0, 0, 0, 1) } else { scene.node_set_flexitem(sc, G_LIST, 1000, 1000, 60, 0) }
-    jshell.set_shown(a, G_MENU, on, 1)
-    jshell.set_shown(a, G_M_REN, G_M_MODE == 1, 0)
-    jshell.set_shown(a, G_M_DEL, G_M_MODE == 1, 0)
+    let hide_list: bool = on && G_M_MODE != 4
+    scene.node_set_hidden(sc, G_LIST, hide_list)
+    if hide_list { scene.node_set_flexitem(sc, G_LIST, 0, 0, 0, 1) } else { scene.node_set_flexitem(sc, G_LIST, 1000, 1000, 60, 0) }
+    var mg: i64 = 1
+    if G_M_MODE == 4 { mg = 0 }
+    jshell.set_shown(a, G_MENU, on, mg)
+    let acts: bool = G_M_MODE == 1 || G_M_MODE == 6
+    jshell.set_shown(a, G_M_FAV, G_M_MODE == 1, 0)
+    jshell.set_shown(a, G_M_MOVE, G_M_MODE == 1, 0)
+    jshell.set_shown(a, G_M_REN, acts, 0)
+    jshell.set_shown(a, G_M_DEL, acts, 0)
     jshell.set_shown(a, G_M_IN, G_M_MODE == 2, 0)
     jshell.set_shown(a, G_M_SAVE, G_M_MODE == 2, 0)
     jshell.set_shown(a, G_M_ASK, G_M_MODE == 3, 0)
     jshell.set_shown(a, G_M_CONF, G_M_MODE == 3, 0)
     jshell.set_shown(a, G_M_ERR, false, 0)
-    if G_M_MODE == 1 { app.set_text(a, G_M_CANCEL, jtexts.t("sb.m-back")) } else { app.set_text(a, G_M_CANCEL, jtexts.t("sb.m-cancel")) }
-    app.set_text(a, G_M_TITLE, m_title())
+    if acts || G_M_MODE == 4 { app.set_text(a, G_M_CANCEL, jtexts.t("sb.m-back")) } else { app.set_text(a, G_M_CANCEL, jtexts.t("sb.m-cancel")) }
+    if G_M_MODE == 1 {
+        let ci: i64 = conv_find(m_id())
+        if ci >= 0 && (*conv_at(ci as usize)).fav { app.set_text(a, G_M_FAV, jtexts.t("sb.m-fav-off")) } else { app.set_text(a, G_M_FAV, jtexts.t("sb.m-fav-on")) }
+    }
+    if G_M_MODE == 3 {
+        if G_M_TGT == 1 { app.set_text(a, G_M_ASK, jtexts.t("sb.m-ask-folder")) } else { app.set_text(a, G_M_ASK, jtexts.t("sb.m-ask")) }
+    }
+    if G_M_MODE == 2 && G_M_TGT >= 2 {
+        app.set_text(a, G_M_TITLE, jtexts.t("sb.m-new-folder"))
+    } else if G_M_MODE == 4 {
+        app.set_text(a, G_M_TITLE, jtexts.t("sb.m-move"))
+    } else if G_M_TGT == 1 {
+        app.set_text(a, G_M_TITLE, str { p: (&G_F_NM[0]) as *mut u8, n: G_F_NM_N })
+    } else {
+        app.set_text(a, G_M_TITLE, m_title())
+    }
+    if G_M_MODE == 4 { app.vlist_set_count(a, G_LIST, folder_count() + 2) } else { app.vlist_set_count(a, G_LIST, G_N) }
+    app.vlist_changed(a, G_LIST)
 }
 
 fn menu_open(a: *mut app.App, c: *mut jarvisapi.ConvRow) {
     G_M_ID_N = copy_to(&G_M_ID[0], 96, (*c).id)
     G_M_TT_N = copy_to(&G_M_TT[0], 160, (*c).title)
+    G_M_TGT = 0
+    G_M_THEN = false
     G_M_MODE = 1
     G_M_BUSY = false
     menu_apply(a)
 }
 
+// the "..." of a folder header: rename / delete
+fn menu_open_folder(a: *mut app.App, idx: usize) {
+    let f: *mut jarvisapi.FolderRow = folder_at(idx)
+    G_F_ID_N = copy_to(&G_F_ID[0], 64, (*f).id)
+    G_F_NM_N = copy_to(&G_F_NM[0], 96, (*f).name)
+    G_M_TGT = 1
+    G_M_THEN = false
+    G_M_MODE = 6
+    G_M_BUSY = false
+    menu_apply(a)
+}
+
+// the "..." of the folder block: a name input for a new folder
+fn menu_open_new_folder(a: *mut app.App) {
+    G_M_TGT = 2
+    G_M_THEN = false
+    G_M_MODE = 2
+    G_M_BUSY = false
+    menu_apply(a)
+    app.set_text(a, G_M_IN, "")
+    app.set_focus(a, G_M_IN)
+}
+
 fn menu_close(a: *mut app.App) {
     G_M_MODE = 0
     G_M_BUSY = false
+    G_M_THEN = false
     menu_apply(a)
 }
 
@@ -492,19 +764,32 @@ fn menu_error(a: *mut app.App, text: str) {
     jshell.set_shown(a, G_M_ERR, true, 0)
 }
 
-// the "..." of an entry (tap at the right edge) or a long press: the actions page. false = not a chat entry (header, hint line)
+// the "..." of an entry (tap at the right edge) or a long press: the actions page. false = not a menu row (hint line)
 fn on_long(a: *mut app.App, id: usize, row: usize) -> bool {
+    if G_M_MODE != 0 { return false }
     if row >= G_N || G_M_MODE != 0 { return false }
     let e: u32 = G_E[row]
-    if e / 1000 as u32 != 2 as u32 { return false }
-    menu_open(a, conv_at((e % 1000 as u32) as usize))
-    return true
+    let kind: u32 = e / 1000 as u32
+    let idx: usize = (e % 1000 as u32) as usize
+    if kind == 2 as u32 {
+        menu_open(a, conv_at(idx))
+        return true
+    }
+    if kind == 4 as u32 {
+        menu_open_new_folder(a)
+        return true
+    }
+    if kind == 5 as u32 {
+        menu_open_folder(a, idx)
+        return true
+    }
+    return false
 }
 
 fn on_m_ren(a: *mut app.App) {
     G_M_MODE = 2
     menu_apply(a)
-    app.set_text(a, G_M_IN, m_title())
+    if G_M_TGT == 1 { app.set_text(a, G_M_IN, str { p: (&G_F_NM[0]) as *mut u8, n: G_F_NM_N }) } else { app.set_text(a, G_M_IN, m_title()) }
     app.set_focus(a, G_M_IN)
 }
 
@@ -513,9 +798,33 @@ fn on_m_del(a: *mut app.App) {
     menu_apply(a)
 }
 
+// favorite on / off for the chat of the menu
+fn on_m_fav(a: *mut app.App) {
+    if G_M_BUSY { return }
+    let ci: i64 = conv_find(m_id())
+    var want: i64 = 1
+    if ci >= 0 && (*conv_at(ci as usize)).fav { want = 0 }
+    if jarvisapi.ja_chat_move(jshell.api(), m_id(), false, "", want) { G_M_BUSY = true } else { menu_error(a, jtexts.t("sb.m-err")) }
+}
+
+fn on_m_move(a: *mut app.App) {
+    G_M_MODE = 4
+    menu_apply(a)
+}
+
 fn on_m_cancel(a: *mut app.App) {
-    if G_M_MODE == 2 || G_M_MODE == 3 { G_M_MODE = 1 } else { G_M_MODE = 0 }
+    if G_M_MODE == 2 {
+        if G_M_TGT == 3 { G_M_MODE = 4 } else if G_M_TGT == 2 { G_M_MODE = 0 } else if G_M_TGT == 1 { G_M_MODE = 6 } else { G_M_MODE = 1 }
+    } else if G_M_MODE == 3 {
+        if G_M_TGT == 1 { G_M_MODE = 6 } else { G_M_MODE = 1 }
+    } else if G_M_MODE == 4 {
+        G_M_MODE = 1
+        G_M_TGT = 0
+    } else {
+        G_M_MODE = 0
+    }
     G_M_BUSY = false
+    G_M_THEN = false
     menu_apply(a)
 }
 
@@ -531,31 +840,112 @@ fn on_m_save(a: *mut app.App) {
         return
     }
     let title: str = str { p: ((t.p as u64) + (s as u64)) as *mut u8, n: e - s }
-    if jarvisapi.ja_chat_rename(jshell.api(), m_id(), title) { G_M_BUSY = true } else { menu_error(a, jtexts.t("sb.m-err")) }
+    var ok: bool = false
+    if G_M_TGT == 0 {
+        ok = jarvisapi.ja_chat_rename(jshell.api(), m_id(), title)
+    } else if G_M_TGT == 1 {
+        ok = jarvisapi.ja_folder_op(jshell.api(), "rename", str { p: (&G_F_ID[0]) as *mut u8, n: G_F_ID_N }, title)
+    } else {
+        G_M_THEN = G_M_TGT == 3
+        ok = jarvisapi.ja_folder_op(jshell.api(), "add", "", title)
+    }
+    if ok { G_M_BUSY = true } else { menu_error(a, jtexts.t("sb.m-err")) }
 }
 
 fn on_m_conf(a: *mut app.App) {
     if G_M_BUSY { return }
-    if jarvisapi.ja_chat_remove(jshell.api(), m_id()) { G_M_BUSY = true } else { menu_error(a, jtexts.t("sb.m-err")) }
+    var ok: bool = false
+    if G_M_TGT == 1 {
+        ok = jarvisapi.ja_folder_op(jshell.api(), "remove", str { p: (&G_F_ID[0]) as *mut u8, n: G_F_ID_N }, "")
+    } else {
+        ok = jarvisapi.ja_chat_remove(jshell.api(), m_id())
+    }
+    if ok { G_M_BUSY = true } else { menu_error(a, jtexts.t("sb.m-err")) }
 }
 
-// main.on_api: the answer of rename / remove. 200 = done (list reloads); 409 = the chat runs; 404 = older server or the chat is gone.
+// the folder picker: row 0 = no folder, rows 1..n = the folders, last row = new folder
+fn pick_rows(ud: u64, i: usize, out: *mut vlist.VRow) {
+    let nf: usize = folder_count()
+    let ci: i64 = conv_find(m_id())
+    var cur: str = ""
+    if ci >= 0 { cur = (*conv_at(ci as usize)).folder }
+    (*out).sbk = 2 as u32
+    if i == 0 {
+        jlist.put(out, jtexts.t("sb.m-nofolder"))
+        if cur.n == 0 || folder_find(cur) < 0 { (*out).sbf = 6 as u32 }
+        return
+    }
+    if i <= nf {
+        let f: *mut jarvisapi.FolderRow = folder_at(i - 1)
+        jlist.put(out, (*f).name)
+        if (*f).id == cur { (*out).sbf = 6 as u32 }
+        return
+    }
+    jlist.put(out, jtexts.t("sb.m-new-folder"))
+}
+
+fn on_pick_folder(a: *mut app.App, id: usize, row: usize) {
+    if G_M_MODE != 4 || G_M_BUSY { return }
+    let nf: usize = folder_count()
+    if row == 0 {
+        if jarvisapi.ja_chat_move(jshell.api(), m_id(), true, "", 0 - 1) { G_M_BUSY = true } else { menu_error(a, jtexts.t("sb.m-err")) }
+        return
+    }
+    if row <= nf {
+        if jarvisapi.ja_chat_move(jshell.api(), m_id(), true, (*folder_at(row - 1)).id, 0 - 1) { G_M_BUSY = true } else { menu_error(a, jtexts.t("sb.m-err")) }
+        return
+    }
+    G_M_TGT = 3
+    G_M_MODE = 2
+    menu_apply(a)
+    app.set_text(a, G_M_IN, "")
+    app.set_focus(a, G_M_IN)
+}
+
+// the first "id":"..." of an answer body (the new folder of folders/add)
+fn first_id(body: str) -> str {
+    var i: usize = 0
+    while i + 6 < body.n {
+        if rt.ld8(body.p as u64, i) == 34 as u8 && rt.ld8(body.p as u64, i + 1) == 105 as u8 && rt.ld8(body.p as u64, i + 2) == 100 as u8 &&
+            rt.ld8(body.p as u64, i + 3) == 34 as u8 && rt.ld8(body.p as u64, i + 4) == 58 as u8 && rt.ld8(body.p as u64, i + 5) == 34 as u8 {
+            var j: usize = i + 6
+            while j < body.n && rt.ld8(body.p as u64, j) != 34 as u8 { j = j + 1 }
+            return str { p: ((body.p as u64) + ((i + 6) as u64)) as *mut u8, n: j - i - 6 }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// main.on_api: the answer of rename / remove / folder ops / move. 200 = done (list reloads); 409 = the chat runs; 404 = older server or gone.
 fn sidebar_api(x: *mut jarvisapi.Api, kind: u32, status: i64) -> bool {
     if kind != jarvisapi.AK_CHAT_OP { return false }
     let a: *mut app.App = jshell.app_ui()
     G_M_BUSY = false
     if G_M_MODE == 0 { return true }
     if status == 200 {
-        let removed: bool = jarvisapi.ja_key(x) == "/api/m/chats/remove"
-        let was_current: bool = m_id() == cur_cid()
+        let key: str = jarvisapi.ja_key(x)
+        if key == "/api/m/folders/add" && G_M_THEN {
+            // the new folder exists: put the chat in it
+            G_M_THEN = false
+            let fid: str = first_id(jarvisapi.ja_body(x))
+            if fid.n > 0 && jarvisapi.ja_chat_move(jshell.api(), m_id(), true, fid, 0 - 1) {
+                G_M_BUSY = true
+                return true
+            }
+        }
+        let removed: bool = key == "/api/m/chats/remove"
+        let was_current: bool = G_M_TGT == 0 && m_id() == cur_cid()
         menu_close(a)
         jdata.refresh_convs(true)
         G_SEEN_VER = 0
         if removed && was_current { (*hooks()).new_chat(a) }
         return true
     }
+    G_M_THEN = false
     if status == 409 { menu_error(a, jtexts.t("sb.m-err-busy")) }
     else if status == 404 { menu_error(a, jtexts.t("sb.m-err-404")) }
+    else if status == 400 { menu_error(a, jtexts.t("sb.m-err-400")) }
     else { menu_error(a, jtexts.t("sb.m-err") + ": " + jshell.dec(status)) }
     return true
 }
@@ -583,6 +973,12 @@ fn build_menu(a: *mut app.App) {
     G_M_TITLE = app.label(a, "", 0)
     jtheme.style_node(a, G_M_TITLE, jtheme.K_TITLE)
     applay.align_start(a, G_M_TITLE)
+    G_M_FAV = app.button(a, jtexts.t("sb.m-fav-on"), on_m_fav)
+    jtheme.style_node(a, G_M_FAV, jtheme.K_CHIP)
+    applay.stretch(a, G_M_FAV)
+    G_M_MOVE = app.button(a, jtexts.t("sb.m-move"), on_m_move)
+    jtheme.style_node(a, G_M_MOVE, jtheme.K_CHIP)
+    applay.stretch(a, G_M_MOVE)
     G_M_REN = app.button(a, jtexts.t("sb.m-rename"), on_m_ren)
     jtheme.style_node(a, G_M_REN, jtheme.K_CHIP)
     applay.stretch(a, G_M_REN)
@@ -815,7 +1211,8 @@ fn sidebar_build(a: *mut app.App, main_node: usize) -> usize {
     // search
     G_SEARCH = jsetui.input(a, jtexts.t("sb.search"))
     jtheme.style_node(a, G_SEARCH, K_SB_SEARCH)
-    // the list
+    build_menu(a)
+    // the list (also the folder picker: mode 4 swaps its rows)
     G_LIST = app.vlist_new(a, jtexts.t("chat.list-title"), 340, 300, 0, rows, 0)
     jtheme.style_node(a, G_LIST, jsetui.K_CONV_LIST)
     app.vlist_set_row_pt(a, G_LIST, ROW_PT)
@@ -825,7 +1222,6 @@ fn sidebar_build(a: *mut app.App, main_node: usize) -> usize {
     app.vlist_on_long(a, G_LIST, on_long)
     jlist.pull_add(G_LIST, on_pull_convs) // a48: pull down at the top = reload the chat/worker list now
     jlist.pull_install(a)
-    build_menu(a)
     // the user line
     G_USER = app.custom(a, widget.KIND_TILE, 340, 60)
     scene.node_set_size(sc, G_USER, 340.0, USER_H)
@@ -860,6 +1256,7 @@ fn clear_search(a: *mut app.App) {
 
 fn sidebar_open(a: *mut app.App) {
     if G_ROOT == 0 { return }
+    fold_load()
     G_OPEN = true
     G_M_MODE = 0
     clear_search(a)
