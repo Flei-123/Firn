@@ -327,7 +327,7 @@ def rest(method, rawpath, hdr, body):
             ff = os.environ.get("FAKE_FONT", "system")
             files = {"inter": {"regular": "/vendor/fonts/Inter-Regular.ttf", "bold": "/vendor/fonts/Inter-Bold.ttf"},
                      "grotesk": {"regular": "/vendor/fonts/SpaceGrotesk-Regular.ttf", "bold": "/vendor/fonts/SpaceGrotesk-Bold.ttf"}}.get(ff)
-            return out(200, {"font": ff, "fontCss": "system-ui", "scale": 100, "radius": 12, "density": "kompakt", "preset": "fleitec", "accent": "#3b82f6", "motion": True, "lang": "auto", "fontFiles": files})
+            return out(200, {"font": ff, "fontCss": "system-ui", "scale": 100, "radius": 12, "density": "kompakt", "preset": os.environ.get("FAKE_PRESET", "fleitec"), "accent": "#3b82f6", "motion": True, "lang": "auto", "fontFiles": files})
         if mp == "usage" and method == "GET":
             if os.environ.get("FAKE_NO_USAGE"): return out(503, {"error": "no usage source"})
             return out(200, {"provider": "claude", "name": "Claude", "p5": 37, "p7": 64, "reset5": None, "reset7": None, "providers": {}})
