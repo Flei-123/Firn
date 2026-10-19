@@ -81,7 +81,7 @@ export {
     Jc,
     JE_LOGIN, JE_OPEN, JE_CLOSE, JE_NETERR, JE_TOKEN, JE_DONE, JE_TOOL, JE_THINKING,
     JE_CONVERSATION, JE_ERROR, JE_SYSTEM, JE_INFO, JE_USER, JE_CONFIRM, JE_ASK,
-    JE_ASK_END, JE_FILE, JE_HIST, JE_HIST_END, JE_HTTP_ERR,
+    JE_ASK_END, JE_FILE, JE_HIST, JE_HIST_END, JE_HTTP_ERR, md_target, md_label,
     jc_new, jc_free, jc_set_base, jc_set_token, jc_has_token, jc_set_tz, jc_set_dev,
     jc_add_trust_pem, jc_login, jc_connect, jc_disconnect, jc_is_open,
     jc_send, jc_stop, jc_confirm, jc_answer, jc_history, jc_new_chat,
@@ -960,6 +960,112 @@ fn jc_answer(c: *mut Jc, label: str) {
 
 // ------------------------------------------------------------------ history
 
+// text + the media markdown -> one JE_HIST
+fn emit_hist(c: *mut Jc, t: str.Span, extra: *mut rt.Buf, who: i64) {
+    if (*extra).len == 0 {
+        emit_span(c, JE_HIST, t, who)
+        return
+    }
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, t.p as u64, t.n)
+    rt.buf_push_bytes(&b, (*extra).ptr, (*extra).len)
+    emit(c, JE_HIST, str { p: b.ptr as *mut u8, n: b.len }, who)
+    rt.buf_free(&b)
+}
+
+// a link target the markdown parser keeps whole: spaces and brackets are percent-escaped
+fn md_target(b: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        if ch == 32 as u8 { rt.buf_push_bytes(b, "%20".p as u64, 3) }
+        else if ch == 40 as u8 { rt.buf_push_bytes(b, "%28".p as u64, 3) }
+        else if ch == 41 as u8 { rt.buf_push_bytes(b, "%29".p as u64, 3) }
+        else if ch == 10 as u8 || ch == 13 as u8 { rt.buf_push(b, 32 as u8) }
+        else { rt.buf_push(b, ch) }
+        i = i + 1
+    }
+}
+
+// link text: brackets and line breaks of a file name are dropped
+fn md_label(b: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        if ch != 91 as u8 && ch != 93 as u8 && ch != 10 as u8 && ch != 13 as u8 { rt.buf_push(b, ch) }
+        i = i + 1
+    }
+}
+
+// "images":[ "url" | {"url"} ] and "files":[{"name","mime","size","url"}] of a history message -> markdown lines in `out`
+fn hist_media(d: *mut json.Json, m: u32, out: *mut rt.Buf) {
+    let im: u32 = json.json_get(d, m, "images".p as u64, 6)
+    if im != json.JSON_NONE && json.json_kind(d, im) == json.JSON_ARRAY {
+        var k: u32 = json.json_child(d, im)
+        var count: usize = 0
+        while k != json.JSON_NONE && count < 12 {
+            var u: str.Span = str.span_empty()
+            if json.json_kind(d, k) == json.JSON_STRING { u = json.json_string(d, k) }
+            else if json.json_kind(d, k) == json.JSON_OBJECT { u = jget_str(d, k, "url") }
+            if u.n > 0 && u.n < 1800 {
+                rt.buf_push_bytes(out, "\n\n![](".p as u64, 6)
+                md_target(out, u.p as u64, u.n)
+                rt.buf_push(out, 41 as u8)
+                count = count + 1
+            }
+            k = json.json_next(d, k)
+        }
+    }
+    let fl: u32 = json.json_get(d, m, "files".p as u64, 5)
+    if fl != json.JSON_NONE && json.json_kind(d, fl) == json.JSON_ARRAY {
+        var k2: u32 = json.json_child(d, fl)
+        var count2: usize = 0
+        while k2 != json.JSON_NONE && count2 < 12 {
+            if json.json_kind(d, k2) == json.JSON_OBJECT {
+                let u2: str.Span = jget_str(d, k2, "url")
+                let nm: str.Span = jget_str(d, k2, "name")
+                let sz: u32 = json.json_get(d, k2, "size".p as u64, 4)
+                if u2.n > 0 && u2.n < 1800 {
+                    rt.buf_push_bytes(out, "\n\n[File: ".p as u64, 9)
+                    md_label(out, nm.p as u64, nm.n)
+                    if sz != json.JSON_NONE && json.json_kind(d, sz) == json.JSON_NUMBER {
+                        let bytes: i64 = json.json_int(d, sz)
+                        var kb: i64 = bytes / 1024
+                        if kb < 1 { kb = 1 }
+                        rt.buf_push_bytes(out, ", ".p as u64, 2)
+                        push_dec(out, kb)
+                        rt.buf_push_bytes(out, " kB".p as u64, 3)
+                    }
+                    rt.buf_push_bytes(out, "](".p as u64, 2)
+                    md_target(out, u2.p as u64, u2.n)
+                    rt.buf_push(out, 41 as u8)
+                    count2 = count2 + 1
+                }
+            }
+            k2 = json.json_next(d, k2)
+        }
+    }
+}
+
+fn push_dec(b: *mut rt.Buf, v: i64) {
+    var tmp: [u8; 24] = [0 as u8; 24]
+    var n: usize = 0
+    var x: i64 = v
+    if x <= 0 {
+        rt.buf_push(b, 48 as u8)
+        return
+    }
+    while x > 0 && n < 22 {
+        tmp[n] = (48 + (x % 10)) as u8
+        x = x / 10
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        rt.buf_push(b, tmp[n])
+    }
+}
+
 fn on_hist(r: *mut ahttp.Request, ud: u64) {
     let c: *mut Jc = ud as *mut Jc
     (*c).busy_hist = false
@@ -994,17 +1100,21 @@ fn on_hist(r: *mut ahttp.Request, ud: u64) {
             while e != json.JSON_NONE {
                 let role: str.Span = jget_str(&d, e, "role")
                 let t: str.Span = jget_str(&d, e, "text")
+                // pictures and files of the message become markdown ("![](url)", "[name](url)") behind the text
+                var extra: rt.Buf = rt.buf_new()
+                hist_media(&d, e, &extra)
                 if span_is(role, "user") {
-                    emit_span(c, JE_HIST, t, 1)
+                    emit_hist(c, t, &extra, 1)
                 } else if !(span_is(role, "tool") || span_is(role, "thinking") || span_is(role, "sys")
-                    || span_is(role, "reminder") || span_is(role, "file") || span_is(role, "ask")) && t.n > 0 {
+                    || span_is(role, "reminder") || span_is(role, "file") || span_is(role, "ask")) && (t.n > 0 || extra.len > 0) {
                     // jc_id() of an answer: "<genMs>,<at>" (epoch ms; 0 = the server did not store it)
                     rt.buf_clear(&(*c).id)
                     rt.buf_push_dec_i64(&(*c).id, jget_num(&d, e, "genMs"))
                     rt.buf_push_bytes(&(*c).id, ",".p as u64, 1)
                     rt.buf_push_dec_i64(&(*c).id, jget_num(&d, e, "at"))
-                    emit_span(c, JE_HIST, t, 0)
+                    emit_hist(c, t, &extra, 0)
                 }
+                rt.buf_free(&extra)
                 e = json.json_next(&d, e)
             }
         }

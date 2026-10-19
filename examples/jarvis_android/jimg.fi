@@ -1,0 +1,355 @@
+// SPDX-License-Identifier: MPL-2.0
+// english: ok
+// examples/jarvis_android/jimg.fi -- the pictures of the chat: the image hook of the markdown view (fui.markdownview.mdv_set_image_cb).
+//
+// A picture in an answer or in the history ("![alt](url)") is a server path ("/img/<uid>/<cid>/<name>", fetched with the session cookie)
+// or an "https://..." address (fetched by a SECOND client without the cookie, so the session never goes to a foreign host).
+// Flow: hook -> table entry (QUEUED) -> disk cache (cache dir, one file per url) or GET (3 at a time) -> decode (PNG/JPEG/WebP/GIF) ->
+// box-filtered down to at most MAX_SIDE pixels -> RGBA in the heap -> READY. While it is not there the view draws a frame with the
+// alt text; a failed picture gets the "broken" mark and a tap on it asks again (retry).
+// The table never drops a ready picture while the chat shows it (the view points into the pixels); `reset` frees them when the
+// chat is replaced. At most MAX_ENTRIES pictures per chat, MAX_SIDE 1080 -> at most about 4.7 MB each.
+import std.rt
+import async.loop
+import net.jarvisc
+import net.jarvisapi
+import net.jarvis_cache
+import fui.markdownview
+import fui.uiimagedec
+import fui.uiimage
+import appkit.appinfo
+import appkit.platform
+import appkit.util
+import appkit.log
+import jshell
+
+export {
+    on_image, take_changed, reset, retry, lookup, E_QUEUED, E_LOADING, E_READY, E_FAILED, state_of,
+}
+
+const MAX_ENTRIES: usize = 64
+const ENTRY_SZ: usize = 64 // a PicEntry is 56 octets
+const MAX_SIDE: usize = 1080
+const MAX_FLIGHT: usize = 3
+const MAX_BODY: usize = 12582912 // a download over 12 MB is no chat picture
+const MAX_PIXELS: u64 = 12000000 // decoder limit (a 12 megapixel phone photo passes)
+const E_QUEUED: u32 = 0
+const E_LOADING: u32 = 1
+const E_READY: u32 = 2
+const E_FAILED: u32 = 3
+
+struct PicEntry {
+    url_p: u64,
+    url_n: usize,
+    state: u32,
+    w: usize,
+    h: usize,
+    px: u64,
+    px_n: usize,
+}
+
+static mut G_TAB: u64 = 0 // MAX_ENTRIES x PicEntry
+static mut G_N: usize = 0
+static mut G_FLIGHT: usize = 0
+static mut G_CHANGED: bool = false
+static mut G_SRV: u64 = 0 // client with the session cookie (server paths)
+static mut G_EXT: u64 = 0 // client without a token (foreign https hosts)
+static mut G_DISK: u64 = 0 // net.jarvis_cache.Cache of the raw files
+
+fn entry(i: usize) -> *mut PicEntry {
+    return (G_TAB + (i * ENTRY_SZ) as u64) as *mut PicEntry
+}
+
+fn ensure() -> bool {
+    if G_TAB == 0 {
+        G_TAB = rt.heap_alloc(ENTRY_SZ * MAX_ENTRIES)
+        if G_TAB == 0 { return false }
+    }
+    if G_SRV == 0 {
+        let s: *mut jarvisapi.Api = jarvisapi.ja_new(jshell.loop_of(), on_api, 0)
+        let x: *mut jarvisapi.Api = jarvisapi.ja_new(jshell.loop_of(), on_api, 0)
+        if s as u64 == 0 || x as u64 == 0 { return false }
+        jarvisapi.ja_set_timeout(s, 30000)
+        jarvisapi.ja_set_timeout(x, 30000)
+        G_SRV = s as u64
+        G_EXT = x as u64
+    }
+    if G_DISK == 0 {
+        var dir: rt.Buf = rt.buf_new()
+        let ok: bool = platform.plat_dir(platform.DIR_CACHE, appinfo.app_id(), appinfo.app_vendor(), &dir)
+        let base: str = util.buf_to_str_copy(&dir)
+        rt.buf_free(&dir)
+        if ok {
+            G_DISK = rt.heap_alloc(256)
+            *(G_DISK as *mut jarvis_cache.Cache) = jarvis_cache.cache_new(base + "/img")
+        }
+    }
+    return true
+}
+
+fn is_server_path(url: str) -> bool {
+    return url.n > 0 && rt.ld8(url.p as u64, 0) == 47 as u8
+}
+
+fn entry_url(e: *mut PicEntry) -> str {
+    return str { p: (*e).url_p as *mut u8, n: (*e).url_n }
+}
+
+fn find(p: u64, n: usize) -> usize {
+    var i: usize = 0
+    while i < G_N {
+        let e: *mut PicEntry = entry(i)
+        if (*e).url_n == n {
+            var k: usize = 0
+            var same: bool = true
+            while k < n && same {
+                if rt.ld8((*e).url_p, k) != rt.ld8(p, k) { same = false }
+                k = k + 1
+            }
+            if same { return i }
+        }
+        i = i + 1
+    }
+    return MAX_ENTRIES
+}
+
+// the file name of a url in the disk cache: FNV-1a of the url as a decimal number
+fn disk_key(url: str) -> str {
+    var h: u64 = 14695981039346656037
+    var i: usize = 0
+    while i < url.n {
+        h = (h ^ (rt.ld8(url.p as u64, i) as u64)) *% 1099511628211
+        i = i + 1
+    }
+    return "i" + jshell.dec((h >> 2) as i64)
+}
+
+// release the pixels of a picture
+fn drop_px(e: *mut PicEntry) {
+    if (*e).px != 0 { rt.heap_free((*e).px, (*e).px_n) }
+    (*e).px = 0
+    (*e).px_n = 0
+    (*e).w = 0
+    (*e).h = 0
+}
+
+// decode `n` octets at `p` into the entry: box-filter down to MAX_SIDE, own RGBA copy. False = no picture (damaged, too big, unknown).
+fn decode_into(e: *mut PicEntry, p: u64, n: usize) -> bool {
+    var dec: uiimagedec.Decoded = uiimagedec.decoded_new()
+    var view: uiimage.Image = uiimage.image_new()
+    if !uiimagedec.image_from_bytes_limited(p, n, MAX_PIXELS, &dec, &view) {
+        uiimagedec.decoded_free(&dec)
+        return false
+    }
+    let w: usize = view.w
+    let h: usize = view.h
+    if w == 0 || h == 0 || view.px == 0 {
+        uiimagedec.decoded_free(&dec)
+        return false
+    }
+    var big: usize = w
+    if h > big { big = h }
+    var f: usize = (big + MAX_SIDE - 1) / MAX_SIDE
+    if f < 1 { f = 1 }
+    let nw: usize = w / f
+    let nh: usize = h / f
+    if nw == 0 || nh == 0 {
+        uiimagedec.decoded_free(&dec)
+        return false
+    }
+    let bytes: usize = nw * nh * 4
+    let out: u64 = rt.heap_alloc(bytes)
+    if out == 0 {
+        uiimagedec.decoded_free(&dec)
+        return false
+    }
+    let stride: usize = view.stride
+    var y: usize = 0
+    while y < nh {
+        let orow: u64 = out + (y * nw * 4) as u64
+        if f == 1 {
+            rt.mem_copy(orow, view.px + (y * stride) as u64, nw * 4)
+        } else {
+            var x: usize = 0
+            while x < nw {
+                var sa: u64 = 0
+                var sr: u64 = 0
+                var sg: u64 = 0
+                var sb: u64 = 0
+                var dy: usize = 0
+                while dy < f {
+                    let srow: u64 = view.px + ((y * f + dy) * stride) as u64
+                    var dx: usize = 0
+                    while dx < f {
+                        let v: u32 = rt.ld32(srow, x * f + dx)
+                        sa = sa + ((v >> 24) as u64)
+                        sr = sr + (((v >> 16) & 255 as u32) as u64)
+                        sg = sg + (((v >> 8) & 255 as u32) as u64)
+                        sb = sb + ((v & 255 as u32) as u64)
+                        dx = dx + 1
+                    }
+                    dy = dy + 1
+                }
+                let cnt: u64 = (f * f) as u64
+                let o: u32 = (((sa / cnt) as u32) << 24) | (((sr / cnt) as u32) << 16) | (((sg / cnt) as u32) << 8) | ((sb / cnt) as u32)
+                rt.st32(orow, x, o)
+                x = x + 1
+            }
+        }
+        y = y + 1
+    }
+    uiimagedec.decoded_free(&dec)
+    drop_px(e)
+    (*e).px = out
+    (*e).px_n = bytes
+    (*e).w = nw
+    (*e).h = nh
+    return true
+}
+
+fn finish(e: *mut PicEntry, ok: bool) {
+    if ok { (*e).state = E_READY } else { (*e).state = E_FAILED }
+    G_CHANGED = true
+}
+
+// start the queued pictures: disk first, else a GET (at most MAX_FLIGHT at a time)
+fn pump() {
+    var i: usize = 0
+    while i < G_N && G_FLIGHT < MAX_FLIGHT {
+        let e: *mut PicEntry = entry(i)
+        if (*e).state == E_QUEUED {
+            let url: str = entry_url(e)
+            var from_disk: bool = false
+            if G_DISK != 0 {
+                var raw: rt.Buf = rt.buf_new()
+                if jarvis_cache.cache_get(G_DISK as *mut jarvis_cache.Cache, disk_key(url), &raw) && raw.len > 0 {
+                    from_disk = decode_into(e, raw.ptr, raw.len)
+                }
+                rt.buf_free(&raw)
+            }
+            if from_disk {
+                finish(e, true)
+            } else {
+                var api: *mut jarvisapi.Api = G_EXT as *mut jarvisapi.Api
+                if is_server_path(url) {
+                    api = G_SRV as *mut jarvisapi.Api
+                    jarvisapi.ja_use_jc(api, jshell.jc())
+                } else {
+                    jarvisapi.ja_set_base(api, jarvisc.jc_base(jshell.jc())) // the base only has to exist (the url is absolute)
+                }
+                if jarvisapi.ja_fetch(api, jarvisapi.AK_IMAGE, url) {
+                    (*e).state = E_LOADING
+                    G_FLIGHT = G_FLIGHT + 1
+                } else {
+                    finish(e, false)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// a GET answered
+fn on_api(x: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
+    if kind != jarvisapi.AK_IMAGE { return }
+    if G_FLIGHT > 0 { G_FLIGHT = G_FLIGHT - 1 }
+    let key: str = jarvisapi.ja_key(x)
+    let i: usize = find(key.p as u64, key.n)
+    if i < MAX_ENTRIES {
+        let e: *mut PicEntry = entry(i)
+        var ok: bool = false
+        let n: usize = jarvisapi.ja_body_len(x)
+        if status == 200 && n > 0 && n <= MAX_BODY {
+            ok = decode_into(e, jarvisapi.ja_body_ptr(x), n)
+            if ok && G_DISK != 0 {
+                let w: bool = jarvis_cache.cache_put(G_DISK as *mut jarvis_cache.Cache, disk_key(entry_url(e)), jarvisapi.ja_body_ptr(x), n)
+            }
+        } else {
+            log.log_info("jimg", "picture status " + jshell.dec(status))
+        }
+        finish(e, ok)
+    }
+    pump()
+}
+
+// the image hook of the markdown view
+fn on_image(ud: u64, url: u64, n: usize, info: *mut markdownview.ImgInfo) -> u32 {
+    if !ensure() { return markdownview.IMG_FAILED }
+    var i: usize = find(url, n)
+    if i == MAX_ENTRIES {
+        if G_N >= MAX_ENTRIES || n == 0 || n > 2000 { return markdownview.IMG_FAILED }
+        let cp: u64 = rt.heap_alloc(n)
+        if cp == 0 { return markdownview.IMG_FAILED }
+        rt.mem_copy(cp, url, n)
+        i = G_N
+        G_N = G_N + 1
+        *entry(i) = PicEntry { url_p: cp, url_n: n, state: E_QUEUED, w: 0, h: 0, px: 0, px_n: 0 }
+        pump()
+    }
+    let e: *mut PicEntry = entry(i)
+    if (*e).state == E_READY {
+        (*info).px = (*e).px
+        (*info).w = (*e).w
+        (*info).h = (*e).h
+        (*info).stride = (*e).w * 4
+        (*info).anim = 0
+        return markdownview.IMG_READY
+    }
+    if (*e).state == E_FAILED { return markdownview.IMG_FAILED }
+    return markdownview.IMG_PENDING
+}
+
+// something changed since the last call (a picture arrived or failed): the caller invalidates its view
+fn take_changed() -> bool {
+    let c: bool = G_CHANGED
+    G_CHANGED = false
+    return c
+}
+
+// the state of a url (E_*), E_FAILED when unknown
+fn state_of(url: u64, n: usize) -> u32 {
+    let i: usize = find(url, n)
+    if i == MAX_ENTRIES { return E_FAILED }
+    return (*entry(i)).state
+}
+
+// the pixels of a ready picture (for the full-screen view): true + info; false = not ready
+fn lookup(url: u64, n: usize, px: *mut u64, w: *mut usize, h: *mut usize) -> bool {
+    let i: usize = find(url, n)
+    if i == MAX_ENTRIES { return false }
+    let e: *mut PicEntry = entry(i)
+    if (*e).state != E_READY { return false }
+    *px = (*e).px
+    *w = (*e).w
+    *h = (*e).h
+    return true
+}
+
+// a failed picture is asked for again (tap on the broken frame)
+fn retry(url: u64, n: usize) {
+    let i: usize = find(url, n)
+    if i == MAX_ENTRIES { return }
+    let e: *mut PicEntry = entry(i)
+    if (*e).state != E_FAILED { return }
+    (*e).state = E_QUEUED
+    pump()
+    G_CHANGED = true
+}
+
+// the chat was replaced: free every picture that is not in flight (the view re-lays out before it paints again)
+fn reset() {
+    var keep: usize = 0
+    var i: usize = 0
+    while i < G_N {
+        let e: *mut PicEntry = entry(i)
+        if (*e).state == E_LOADING {
+            if keep != i { *entry(keep) = *e }
+            keep = keep + 1
+        } else {
+            drop_px(e)
+            rt.heap_free((*e).url_p, (*e).url_n)
+        }
+        i = i + 1
+    }
+    G_N = keep
+}
