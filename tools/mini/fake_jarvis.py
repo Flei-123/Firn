@@ -118,6 +118,8 @@ def sidebar_chats():
             row("s8", "Diplomarbeit", 100 * h), row("s9", "Anzug-KI", 24 * 20 * h), row("s10", "Russisch", 24 * 90 * h),
             row("w1", "Daidalos: Render", 6 * h, True, "worker", True)]
 
+# user settings (A50): GET/POST /api/settings (switches + persona)
+SETTINGS = {"personality": "jarvis", "personas": [{"id": "p_demo", "name": "Bro", "base": "jarvis"}], "autoConfirm": True, "deepMode": True, "expMode": False, "learnMode": False, "planMode": False}
 # folders (A48): FAKE_FOLDERS=1 starts with two folders and puts s1/s3/s5 in them; POST /api/m/folders/(add|rename|remove), /api/m/chats/move
 FOLDERS = [{"id": "f_work", "name": "Work", "order": 0}, {"id": "f_priv", "name": "Privat", "order": 1}] if os.environ.get("FAKE_FOLDERS") == "1" else []
 CHAT_FOLDER = {"s1": "f_work", "s3": "f_work", "s5": "f_priv"} if os.environ.get("FAKE_FOLDERS") == "1" else {}
@@ -266,7 +268,7 @@ def rest(method, rawpath, hdr, body):
     path = u.path
     q = parse_qs(u.query)
     if not (path in ("/api/me", "/api/projects", "/api/command-center", "/api/conversations", "/api/tasks",
-                     "/api/remote/devices", "/api/push-token", "/api/stt", "/api/m/upload")
+                     "/api/remote/devices", "/api/settings", "/api/push-token", "/api/stt", "/api/m/upload")
             or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
             or path.startswith("/vendor/fonts/")):
         return None
@@ -420,6 +422,13 @@ def rest(method, rawpath, hdr, body):
         if mp == "push/test" and method == "POST":
             return out(200, {"ok": True, "sent": 1})
         return out(404, {"error": "Not found"})
+    if path == "/api/settings":
+        if method in ("POST", "PATCH"):
+            try:
+                SETTINGS.update(json.loads(body or b"{}"))
+            except Exception:
+                return out(400, {"error": "bad json"})
+        return out(200, {"settings": SETTINGS})
     if path == "/api/me":
         return out(200, {"username": "justin", "admin": True, "deviceToken": "dt1", "settings": {}})
     if path == "/api/projects" and method == "GET":
