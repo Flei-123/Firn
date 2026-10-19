@@ -46,6 +46,9 @@ import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Locale
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -72,7 +75,7 @@ fun LabScreen(launch: LaunchConfig, onAutorunConsumed: () -> Unit, modifier: Mod
         LaunchedEffect(launch.autorun, section) {
             if (!launch.autorun) return@LaunchedEffect
             when (section) {
-                LabSection.Net -> { onAutorunConsumed(); scope.launch { net.run() } }
+                LabSection.Net -> { onAutorunConsumed(); scope.launch { if (launch.netBase.isNullOrEmpty()) net.run() else NetBench.run(launch.netBase!!) } }
                 LabSection.Cpu -> { onAutorunConsumed(); scope.launch { cpu.run() } }
                 else -> Unit
             }
@@ -242,6 +245,66 @@ fun NetSection(state: NetState, onGet: () -> Unit) {
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Button(onClick = onGet, enabled = !state.running) { Text("GET") }
         Text(state.text, style = MaterialTheme.typography.bodyLarge)
+    }
+}
+
+/**
+ * Network benchmark (spec: examples/bench_android/netb.fi): ten GETs of nb_small.bin on a FRESH connection each, then nb_big.bin.
+ * ttfb = ms until the response head is complete (responseCode returns), total = ms until the body is read; fnv = FNV-1a 32 of the body.
+ * `variant` "sys" = the default HttpsURLConnection (Conscrypt may resume TLS sessions), "cold" = a new SSLContext per request (no resumption).
+ */
+object NetBench {
+    private class One(val status: Int, val bytes: Int, val ttfb: Long, val total: Long, val fnv: Long)
+
+    private fun fnv32(b: ByteArray): Long {
+        var h = 2166136261L
+        for (x in b) h = ((h xor (x.toLong() and 255)) * 16777619L) and 4294967295L
+        return h
+    }
+
+    private fun get(url: String, cold: Boolean): One {
+        val t0 = System.nanoTime()
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.connectTimeout = 30000
+        conn.readTimeout = 30000
+        conn.useCaches = false
+        conn.setRequestProperty("Connection", "close")
+        if (cold && conn is HttpsURLConnection) {
+            val ctx = SSLContext.getInstance("TLS")
+            ctx.init(null, null, null)
+            conn.sslSocketFactory = ctx.socketFactory
+        }
+        val status = conn.responseCode
+        val ttfb = (System.nanoTime() - t0) / 1_000_000
+        val body = conn.inputStream.use { it.readBytes() }
+        val total = (System.nanoTime() - t0) / 1_000_000
+        conn.disconnect()
+        return One(status, body.size, ttfb, total, fnv32(body))
+    }
+
+    private fun med(v: List<Long>): Long = v.sorted()[v.size / 2]
+
+    private fun pass(base: String, variant: String) {
+        val small = ArrayList<One>()
+        var ok = true
+        for (i in 0 until 10) {
+            val r = try { get(base + "nb_small.bin", variant == "cold") } catch (e: Exception) { ok = false; One(-1, 0, 0, 0, -1) }
+            small.add(r)
+            BenchLog.i("netb small i=$i status=${r.status} bytes=${r.bytes} ttfb=${r.ttfb} total=${r.total} fnv=${r.fnv}")
+        }
+        val big = try { get(base + "nb_big.bin", variant == "cold") } catch (e: Exception) { ok = false; One(-1, 0, 0, 0, -1) }
+        BenchLog.i("netb big status=${big.status} bytes=${big.bytes} ttfb=${big.ttfb} total=${big.total} fnv=${big.fnv}")
+        BenchLog.i(
+            "netb_sum variant=$variant small_ttfb_med=${med(small.map { it.ttfb })} small_total_med=${med(small.map { it.total })} " +
+                "small_ttfb_first=${small[0].ttfb} small_total_first=${small[0].total} big_ttfb=${big.ttfb} big_total=${big.total} ok=${if (ok) 1 else 0}",
+        )
+    }
+
+    suspend fun run(base: String) {
+        withContext(Dispatchers.IO) {
+            pass(base, "sys")
+            pass(base, "cold")
+        }
     }
 }
 
