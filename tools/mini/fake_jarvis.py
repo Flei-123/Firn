@@ -395,6 +395,8 @@ def rest(method, rawpath, hdr, body):
         if mp == "devices":
             return out(200, {"devices": [{"name": "Dell", "type": "Windows", "online": True}, {"name": "Phone", "type": "Android", "online": False}]})
         if mp == "chats" and method == "GET":
+            if os.environ.get("FAKE_SLOW_CHATS"): time.sleep(int(os.environ["FAKE_SLOW_CHATS"]) / 1000.0)  # a53: slow chat list (ms, blocks the whole fake server); FAKE_FAIL_CHATS=1 answers 502
+            if os.environ.get("FAKE_FAIL_CHATS"): return out(502, {"error": "bad gateway"})
             allc = all_chats()
             if os.environ.get("FAKE_NO_FOLDERS"):  # an older server: no folders / folder / fav keys in the chat list
                 allc = [{k: v for k, v in c.items() if k not in ("folder", "fav")} for c in allc]
