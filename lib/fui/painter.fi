@@ -108,6 +108,7 @@ export {
     run_set_tracking, run_set_word_spacing, run_set_kerning,
     run_set_weight, run_set_slant, run_set_line_height,
     run_set_outline, run_set_shadow, run_set_gradient,
+    bgcache_blit, bgcache_store, bgcache_reset,
     run_width, run_fits_upto, run_draw, run_line_height,
     run_fits_ellipsis, run_draw_ellipsis, ellipsis_w,
     run_line_upto, run_line_count, run_draw_wrapped,
@@ -1013,6 +1014,135 @@ fn round_rect_grad(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
         }
         yy = yy + 1
     }
+}
+
+// ================================================ THE BACKDROP CACHE
+//
+// A page ground made of gradients (linear ramp + radial lights, style.SF_BG_GLOW) costs a float calculation per pixel. It is the
+// same picture every frame, so the finished pixels of the box are kept (premultiplied RGBA, as the canvas has them) and copied
+// back by rows. `key` says what the picture is (colours, light, size; the caller hashes them); any MISS clears every slot, so a
+// box painted over another cached one never reuses a stale underlay. Only square boxes on a canvas in memory, and a copy only
+// inside the current clip (a partial repaint touches nothing outside its damage rectangle). A store only happens when the clip
+// covers the whole box (otherwise the pixels outside would be old ones).
+struct BgSlot {
+    px: u64,
+    cap: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    key: u64,
+}
+
+static mut BG_SLOTS: [BgSlot; 4] = [BgSlot { px: 0, cap: 0, x: 0, y: 0, w: 0, h: 0, key: 0 }; 4]
+
+fn bgcache_reset() {
+    var i: usize = 0
+    while i < 4 {
+        if BG_SLOTS[i].px != 0 {
+            rt.heap_free(BG_SLOTS[i].px, BG_SLOTS[i].cap)
+        }
+        BG_SLOTS[i] = BgSlot { px: 0, cap: 0, x: 0, y: 0, w: 0, h: 0, key: 0 }
+        i = i + 1
+    }
+}
+
+// The integer pixel box of (x, y, w, h) on the canvas; false = nothing to cache (empty, GPU canvas, or a clip mask is active).
+fn bgcache_box(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, x0: *mut usize, y0: *mut usize, x1: *mut usize, y1: *mut usize) -> bool {
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    if (*z).ok == 0 || canvas.canvas_gpu(cv) != 0 {
+        return false
+    }
+    if !px_span(cv, x, y, w, h, x0, y0, x1, y1) {
+        return false
+    }
+    if canvas.canvas_clip_masked(cv) {
+        return false
+    }
+    return true
+}
+
+// Copy the cached picture of this box (same key and place) onto the canvas, inside the clip. true = done, nothing to paint.
+fn bgcache_blit(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, key: u64) -> bool {
+    var x0: usize = 0
+    var y0: usize = 0
+    var x1: usize = 0
+    var y1: usize = 0
+    if !bgcache_box(z, x, y, w, h, &x0, &y0, &x1, &y1) {
+        return false
+    }
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    var i: usize = 0
+    while i < 4 {
+        let sl: *mut BgSlot = &BG_SLOTS[i]
+        if (*sl).px != 0 && (*sl).key == key && (*sl).x == x0 && (*sl).y == y0 && (*sl).w == x1 - x0 && (*sl).h == y1 - y0 {
+            // inside the clip only (whole pixels)
+            var cx0: usize = x0
+            var cy0: usize = y0
+            var cx1: usize = x1
+            var cy1: usize = y1
+            canvas.canvas_clip_pixels(cv, &cx0, &cy0, &cx1, &cy1)
+            if cx1 > cx0 && cy1 > cy0 {
+                let cw: usize = canvas.canvas_width(cv)
+                let row: usize = cx1 - cx0
+                var yy: usize = cy0
+                while yy < cy1 {
+                    let dst: u64 = canvas.canvas_pixels(cv) as u64 + ((yy * cw + cx0) * 4) as u64
+                    let src: u64 = (*sl).px + (((yy - y0) * (*sl).w + (cx0 - x0)) * 4) as u64
+                    rt.mem_copy(dst, src, row * 4)
+                    yy = yy + 1
+                }
+            }
+            return true
+        }
+        i = i + 1
+    }
+    // a miss: nothing that was kept can be trusted any more
+    bgcache_reset()
+    return false
+}
+
+// Keep what the box looks like NOW (call right after painting it). Skipped unless the clip covers the whole box.
+fn bgcache_store(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, key: u64) {
+    var x0: usize = 0
+    var y0: usize = 0
+    var x1: usize = 0
+    var y1: usize = 0
+    if !bgcache_box(z, x, y, w, h, &x0, &y0, &x1, &y1) {
+        return
+    }
+    let cv: *mut canvas.Canvas = painter_canvas(z)
+    var cx0: usize = x0
+    var cy0: usize = y0
+    var cx1: usize = x1
+    var cy1: usize = y1
+    canvas.canvas_clip_pixels(cv, &cx0, &cy0, &cx1, &cy1)
+    if cx0 != x0 || cy0 != y0 || cx1 != x1 || cy1 != y1 {
+        return
+    }
+    var slot: usize = 4
+    var i: usize = 0
+    while i < 4 && slot == 4 {
+        if BG_SLOTS[i].px == 0 {
+            slot = i
+        }
+        i = i + 1
+    }
+    if slot == 4 {
+        return
+    }
+    let n: usize = (x1 - x0) * (y1 - y0) * 4
+    let buf: u64 = rt.heap_alloc(n)
+    if buf == 0 {
+        return
+    }
+    let cw: usize = canvas.canvas_width(cv)
+    var yy: usize = y0
+    while yy < y1 {
+        rt.mem_copy(buf + ((yy - y0) * (x1 - x0) * 4) as u64, canvas.canvas_pixels(cv) as u64 + ((yy * cw + x0) * 4) as u64, (x1 - x0) * 4)
+        yy = yy + 1
+    }
+    BG_SLOTS[slot] = BgSlot { px: buf, cap: n, x: x0, y: y0, w: x1 - x0, h: y1 - y0, key: key }
 }
 
 // A SOFT LIGHT IN A ROUND RECTANGLE -- a radial gradient from `col` in

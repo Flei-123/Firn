@@ -245,6 +245,9 @@ fi
 # the app is open reaches the app); without it the plain NativeActivity.
 MAINACT=android.app.NativeActivity; LAUNCHMODE=""
 if [ $OWNDEX -eq 1 ] && [ "${PLAINACT:-0}" -eq 0 ]; then MAINACT=org.firn.FirnMain; LAUNCHMODE='android:launchMode="singleTop"'; fi
+# SOFT_INPUT=adjustResize (opt-in, e.g. jarvis_build.sh): the system shrinks the window when the keyboard opens, so the app lays out
+# in the visible part and a bottom composer stays above the keyboard; unset = the system default
+if [ -n "${SOFT_INPUT:-}" ]; then LAUNCHMODE="$LAUNCHMODE android:windowSoftInputMode=\"$SOFT_INPUT\""; fi
 HASCODE=false
 [ -n "$DEX" ] && HASCODE=true
 MAN=$BUILD/AndroidManifest.xml
