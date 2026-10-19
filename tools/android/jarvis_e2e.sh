@@ -438,6 +438,31 @@ send_text "voicetest"
 check "the app lives after a spoken answer" "$(OCR_TRIES=12 wait_ocr 11_say 'Hallo voicetest')" 1
 check "app alive after voice output" "$([ -n "$($ADB shell pidof $PKG)" ] && echo yes)" yes
 
+# ---- 8a. model dropdown + copy button (a46) ------------------------------------------------------------------------------------
+echo "== 8a. model dropdown and copy button"
+# frame coords of the 1080x2340 layout (412 dp wide, 2.62 px per dp): the pill sits right of the hamburger (x 400, shrinks on narrow screens);
+# the panel under the header lists the models as full-width chips (first row 57 dp below the header centre, 44 dp apart) and, below them, the
+# effort chips (214 dp below the header centre; Low 34 dp, Medium 97, High 161, Xhigh 218, Max 276 from the left edge). Fake server: sonnet, haiku, opus.
+tap_hdr_dy() { $ADB shell input tap $(($1 * SW / 1080)) $(( $(hdr_y) + $2 * SW / 1080 )); sleep "${3:-1.5}"; } # x in the 1080 frame, dy in 1080-frame pixels below the header centre
+tap_hdr 400 2; shot 12_dropdown
+check "dropdown lists Haiku" "$(ocr 12_dropdown | grep -ci 'haiku')" 1
+check "dropdown lists the effort levels (Medium)" "$(ocr 12_dropdown | grep -ci 'medium')" 1
+tap_hdr_dy 540 380 2 # third model chip (Opus has effort levels, the panel stays open)
+tap_hdr_dy 422 561 2 # effort chip High: stored, the panel closes
+check "dropdown: the socket got '/model opus'" "$(wait_log '"text": "/model opus"' 10)" 1
+check "dropdown: the socket got '/effort high'" "$(wait_log '"text": "/effort high"' 10)" 1
+check "dropdown: POST /api/m/models stored the model" "$(wait_log '"json": {"model": "opus"}' 10)" 1
+shot 12_dropdown_closed
+check "dropdown: the pill shows Opus" "$(ocr 12_dropdown_closed | grep -ci 'opus')" 1
+# copy button: right of the meta line "<n>s - finished HH:MM" under the last answer (about 79 dp = 207 px right of the word "finished")
+shot _w; FP=$(word_at _w 'finished' 1)
+if [ -n "$FP" ]; then
+    set -- $FP; $ADB shell input tap $(($1 + 207 * SW / 1080)) $2; sleep 1.5; shot 12_copied
+    check "copy button: the status line says 'Kopiert'" "$(ocr_crop 12_copied 150 $((COMP_Y * SH / 2340 - 45)) 900 $((COMP_Y * SH / 2340 + 45)) | grep -ci 'opiert')" 1
+else
+    check "copy button: the meta line 'finished' is on the screen" no yes
+fi
+
 # ---- 8b. speech output WITH an engine (google_apis image: com.google.android.tts) ----------------------------------------------
 echo "== 8b. voice output with a speech engine"
 ENG=$($ADB shell cmd package query-services -a android.intent.action.TTS_SERVICE 2>/dev/null | grep -c 'GoogleTtsService')
