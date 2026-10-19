@@ -1635,6 +1635,10 @@ build rotpaint
 "$W/rotpaint"
 build xcut
 "$W/xcut"
+# r459 / r461: set_text_scoped repaints only the label's rectangle (rotpaint); the x-cut also covers round_ring / round_rect_grad (xcut);
+# a transformed shape rasterised in the painter's own buffer == one in a buffer of its own (tfwin).
+build tfwin
+"$W/tfwin"
 
 echo "== 18q2. fui.appctl PART 2: MENU BAR, TOOLTIP, DIALOGS =="
 # lib/fui/appctl.fi: Alt+letter, shortcuts, Left / Right between menus, check items, the context menu,
