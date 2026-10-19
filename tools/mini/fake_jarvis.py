@@ -244,7 +244,8 @@ def rest(method, rawpath, hdr, body):
     q = parse_qs(u.query)
     if not (path in ("/api/me", "/api/projects", "/api/command-center", "/api/conversations", "/api/tasks",
                      "/api/remote/devices", "/api/push-token", "/api/stt", "/api/m/upload")
-            or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")):
+            or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
+            or path.startswith("/vendor/fonts/")):
         return None
     jtype = hdr.get("content-type")
     entry = {"type": "rest", "method": method, "path": rawpath, "ctype": jtype, "n": len(body)}
@@ -260,12 +261,30 @@ def rest(method, rawpath, hdr, body):
     def out(st, obj): return (st, json.dumps(obj).encode(), "application/json")
     if path.startswith("/api/m/") and path != "/api/m/upload" and os.environ.get("FAKE_NO_MOBILE"):
         return out(404, {"error": "Not found"})  # an older server without the mobile routes
+    if path.startswith("/vendor/fonts/"):  # public static files (no login), like the real server
+        fp = os.path.join(os.environ.get("FAKE_FONT_DIR", "/root/jarvis/public/vendor/fonts"), os.path.basename(path))
+        if os.environ.get("FAKE_NO_FONTS") or not os.path.isfile(fp):
+            return out(404, {"error": "Not found"})
+        with open(fp, "rb") as fh:
+            return (200, fh.read(), "font/ttf")
     if path == "/api/m/ping":
         return out(200, {"ok": True, "api": 1, "time": 1760726400000, "push": {"tcp": True, "host": "127.0.0.1", "port": 7781, "poll": True}})
     if not ok:
         return out(401, {"error": "Not logged in"})
     if path.startswith("/api/m/") and path != "/api/m/upload":
         mp = path[len("/api/m/"):]
+        if mp == "theme" and method == "GET":  # FAKE_FONT = system|inter|grotesk|mono (FAKE_NO_THEME: an older server)
+            if os.environ.get("FAKE_NO_THEME"): return out(404, {"error": "Not found"})
+            ff = os.environ.get("FAKE_FONT", "system")
+            files = {"inter": {"regular": "/vendor/fonts/Inter-Regular.ttf", "bold": "/vendor/fonts/Inter-Bold.ttf"},
+                     "grotesk": {"regular": "/vendor/fonts/SpaceGrotesk-Regular.ttf", "bold": "/vendor/fonts/SpaceGrotesk-Bold.ttf"}}.get(ff)
+            return out(200, {"font": ff, "fontCss": "system-ui", "scale": 100, "radius": 12, "density": "kompakt", "preset": "fleitec", "accent": "#3b82f6", "motion": True, "lang": "auto", "fontFiles": files})
+        if mp == "usage" and method == "GET":
+            if os.environ.get("FAKE_NO_USAGE"): return out(503, {"error": "no usage source"})
+            return out(200, {"provider": "claude", "name": "Claude", "p5": 37, "p7": 64, "reset5": None, "reset7": None, "providers": {}})
+        if mp.startswith("models") and method == "GET":
+            if os.environ.get("FAKE_NO_USAGE"): return out(503, {"error": "no models"})
+            return out(200, {"models": [], "efforts": ["low", "medium", "high"], "current": {"model": "sonnet", "effort": "medium", "thinking": False, "label": "Claude Sonnet 5.5", "provider": "claude"}, "chat": None})
         if mp == "projects" and method == "GET":
             return out(200, {"projects": [psummary(p) for p in PROJECTS.values()]})
         if mp.startswith("projects/") and method == "GET":

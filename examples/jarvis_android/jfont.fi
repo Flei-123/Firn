@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_android/jfont.fi -- the text face of the app is the face of the web app: the signed-in user's choice
+// (system | inter | grotesk | mono) comes from GET /api/m/theme (field `font`), re-read about every 5 minutes.
+//   boot     fontpick_boot(<data dir>/fonts) BEFORE the window opens: the saved choice (<dir>/choice) is the first face.
+//   inter / grotesk need static TrueType files: fetched from /vendor/fonts/<name>.ttf (public, no login), saved in <dir>.
+//   404 / old server: the system face. A failed request changes nothing (retry after one minute).
+// The face is switched live (fontpick_switch on the painter) as soon as the files are on disk.
+import std.rt
+import std.fs
+import std.time
+import appkit.appinfo
+import appkit.platform
+import appkit.util
+import appkit.log
+import fui.app
+import fui.render
+import net.jarvisapi
+import plat.fontpick
+import jshell
+
+export { jfont_boot, jfont_tick, jfont_api, jfont_reset }
+
+const POLL_MS: i64 = 300000
+const RETRY_MS: i64 = 60000
+const MIN_FILE: usize = 1000
+const MAX_FILE: usize = 2000000
+const URL_PREFIX: str = "/vendor/fonts/"
+
+static mut G_NEXT_MS: i64 = 0
+static mut G_BUSY: bool = false // a theme request is on the wire
+static mut G_WANT: usize = 0 // the choice whose files are being fetched
+static mut G_STEP: usize = 0 // 0 idle, 1 regular file in flight, 2 bold file in flight
+
+// Before app.window: the folder of the downloaded files and the saved choice.
+fn jfont_boot() {
+    var d: rt.Buf = rt.buf_new()
+    if platform.plat_dir(platform.DIR_DATA, appinfo.app_id(), appinfo.app_vendor(), &d) {
+        let base: str = util.buf_to_str_copy(&d)
+        fontpick.fontpick_boot(base + "/fonts")
+    }
+    rt.buf_free(&d)
+}
+
+// sign-out / new sign-in: ask again at the next tick
+fn jfont_reset() {
+    G_NEXT_MS = 0
+}
+
+// every second while signed in: ask for the theme when it is time
+fn jfont_tick(signed_in: bool) {
+    if !signed_in || !fontpick.fontpick_active() || G_BUSY || G_STEP != 0 { return }
+    let now: i64 = time.now_unix_ms()
+    if now < G_NEXT_MS { return }
+    G_NEXT_MS = now + RETRY_MS
+    if jarvisapi.ja_get_abs(jshell.api(), jarvisapi.AK_THEME, "/api/m/theme", "") {
+        G_BUSY = true
+    }
+}
+
+fn is_font_url(k: str) -> bool {
+    if k.n <= URL_PREFIX.n { return false }
+    var i: usize = 0
+    while i < URL_PREFIX.n {
+        if *(k.p + i) != *(URL_PREFIX.p + i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Answers of net.jarvisapi: true = this was ours (main.on_api must not hand it on).
+fn jfont_api(x: *mut jarvisapi.Api, kind: u32, status: i64) -> bool {
+    if kind == jarvisapi.AK_THEME {
+        G_BUSY = false
+        theme_answer(x, status)
+        return true
+    }
+    if kind == jarvisapi.AK_DOWNLOAD && is_font_url(jarvisapi.ja_key(x)) {
+        file_answer(x, status)
+        return true
+    }
+    return false
+}
+
+fn theme_answer(x: *mut jarvisapi.Api, status: i64) {
+    if status == 404 {
+        take(fontpick.FP_SYSTEM)
+        G_NEXT_MS = time.now_unix_ms() + POLL_MS
+        return
+    }
+    if status != 200 { return }
+    let f: str = jarvisapi.parse_text_field(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), "font")
+    if f.n == 0 { return }
+    G_NEXT_MS = time.now_unix_ms() + POLL_MS
+    let c: usize = fontpick.fontpick_id(f)
+    if fontpick.fontpick_files_present(c) {
+        take(c)
+        return
+    }
+    G_WANT = c
+    G_STEP = 1
+    if !fetch(c, false) { G_STEP = 0 }
+}
+
+fn fetch(c: usize, bold: bool) -> bool {
+    return jarvisapi.ja_download(jshell.api(), URL_PREFIX + fontpick.fontpick_file_name(c, bold))
+}
+
+fn file_answer(x: *mut jarvisapi.Api, status: i64) {
+    let c: usize = G_WANT
+    let bold: bool = G_STEP == 2
+    if G_STEP == 0 { return }
+    let n: usize = jarvisapi.ja_body_len(x)
+    if status != 200 || n < MIN_FILE || n > MAX_FILE {
+        log.log_warn("font", "download failed status=" + jshell.dec(status) + " bytes=" + jshell.dec(n as i64))
+        G_STEP = 0
+        return
+    }
+    let dir: str = fontpick.fontpick_dir()
+    let mk: bool = fs.mkdir_all(dir) catch false
+    let ok: bool = fs.write_atomic(dir + "/" + fontpick.fontpick_file_name(c, bold), jarvisapi.ja_body_ptr(x), n) catch false
+    if !ok {
+        log.log_warn("font", "cannot save the font file")
+        G_STEP = 0
+        return
+    }
+    if !bold {
+        G_STEP = 2
+        if !fetch(c, true) { G_STEP = 0 }
+        return
+    }
+    G_STEP = 0
+    if fontpick.fontpick_files_present(c) { take(c) }
+}
+
+// The choice is final: remember it and switch the live painter (only when it changes).
+fn take(c: usize) {
+    if c == fontpick.fontpick_choice() { return }
+    fontpick.fontpick_set(c)
+    let saved: bool = fontpick.fontpick_save(c)
+    let a: *mut app.App = jshell.app_ui()
+    let ok: bool = fontpick.fontpick_switch(render.ctx_painter(app.app_ctx(a)))
+    log.log_info("font", "face " + fontpick.fontpick_name(c) + " live=" + okw(ok))
+    jshell.apply_theme()
+}
+
+fn okw(b: bool) -> str {
+    if b { return "1" }
+    return "0"
+}
