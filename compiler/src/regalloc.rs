@@ -1131,7 +1131,7 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
                 Op::Bin(BinOp::Div, a, _) | Op::Bin(BinOp::Rem, a, _) => {
                     kill(*a, &mut bad);
                 }
-                Op::Bin(BinOp::Shl, a, _) | Op::Bin(BinOp::Shr, a, _) => kill(*a, &mut bad),
+                Op::Bin(BinOp::Shl, a, _) | Op::Bin(BinOp::Shr, a, _) | Op::Bin(BinOp::Rotr32, a, _) => kill(*a, &mut bad),
                 Op::Cast { src, .. } => kill(*src, &mut bad),
                 // untouchable (SPEC §9.2): unchanged as at the base path
                 Op::Select { cond, a, b: b2 } => {
@@ -5633,11 +5633,26 @@ fn emit_div_const(
         // x % 2^L = x - (q << L) = x - ((x + bias) & -2^L).
         if k > 1 && (k & (k - 1)) == 0 && k <= (1i128 << 30) {
             let l = k.trailing_zeros();
-            ra.load_ext(e, "rcx", a, ty, bits);
-            e.line(&format!("mov {}, {}", ra_w("rax"), ra_w("rcx")));
-            e.line(&format!("sar {}, {}", ra_w("rax"), bits - 1));
-            e.line(&format!("shr {}, {}", ra_w("rax"), bits - l));
-            e.line(&format!("add {}, {}", ra_w("rax"), ra_w("rcx")));
+            // The quotient only reads the dividend: when it already sits in a register of full
+            // width, use that register instead of copying it to `rcx` first.
+            let direct = match ra.a.place(a) {
+                Loc::Reg(r) if !rem && ty.bits() == bits && ra.a.imm(a).is_none() => Some(r),
+                _ => None,
+            };
+            let src = match direct {
+                Some(r) => r,
+                None => {
+                    ra.load_ext(e, "rcx", a, ty, bits);
+                    "rcx"
+                }
+            };
+            e.line(&format!("mov {}, {}", ra_w("rax"), ra_w(src)));
+            // the sign mask shifted right is just the sign bit when L == 1
+            if l > 1 {
+                e.line(&format!("sar {}, {}", ra_w("rax"), bits - 1));
+            }
+            e.line(&format!("shr {}, {}", ra_w("rax"), if l > 1 { bits - l } else { bits - 1 }));
+            e.line(&format!("add {}, {}", ra_w("rax"), ra_w(src)));
             if rem {
                 e.line(&format!("and {}, {}", ra_w("rax"), -(k as i64)));
                 e.line(&format!("sub {}, {}", ra_w("rcx"), ra_w("rax")));
@@ -5957,7 +5972,17 @@ fn emit_block(
     }
     let mergeable = cmp_br_mergeable(ra, b);
     let n = if mergeable { b.insts.len() - 1 } else { b.insts.len() };
+    let mut folded_load = false;
     for (ii, i) in b.insts[..n].iter().enumerate() {
+        if folded_load {
+            // the arithmetic instruction after a folded load: already emitted with the memory operand
+            folded_load = false;
+            continue;
+        }
+        if ii + 1 < n && fold_float_load(e, ra, b, ii)? {
+            folded_load = true;
+            continue;
+        }
         // ROUND 94 -- the register allocated path carries the line table too.
         // Before this round it emitted only the `fn` line, which is why an
         // optimized build claimed the function's first line for its whole
@@ -6233,6 +6258,70 @@ fn jcc_inverse(jcc: &str) -> &'static str {
         "ja" => "jbe",
         _ => unreachable!("unknown jump {}", jcc),
     }
+}
+
+/// **x86 load-op folding for floating point.** A `load.f64` whose ONLY reader is the arithmetic
+/// instruction directly after it (`add/sub/mul/div`) becomes the memory operand of that
+/// instruction:
+///
+/// ```text
+///     movsd xmm14, qword ptr [r10+rdx*8]          mulsd xmm13, qword ptr [r10+rdx*8]
+///     mulsd xmm13, xmm14                    ->
+/// ```
+///
+/// One instruction and one register less. Only when the two instructions are ADJACENT: nothing
+/// can write the memory or reuse an address register in between, so the value read is the same.
+/// For `+` and `*` the load may be either operand (commutative, bit for bit); for `-` and `/`
+/// only the second. Returns true when both instructions were emitted here.
+/// `FIRN_NO_LOADOP=1` switches it off.
+fn fold_float_load(
+    e: &mut Emitter,
+    ra: &Ra,
+    b: &Block,
+    ii: usize,
+) -> Result<bool, String> {
+    let (i, nx) = (&b.insts[ii], &b.insts[ii + 1]);
+    let addr = match &i.op {
+        Op::Load { addr } if i.ty.is_float() => *addr,
+        _ => return Ok(false),
+    };
+    let d = match i.dst {
+        Some(d) => d,
+        None => return Ok(false),
+    };
+    let (op, x, y) = match &nx.op {
+        Op::Bin(op, x, y) if nx.ty == i.ty && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) => {
+            (*op, *x, *y)
+        }
+        _ => return Ok(false),
+    };
+    let nd = match nx.dst {
+        Some(nd) => nd,
+        None => return Ok(false),
+    };
+    if x == y || ra.read.get(d as usize).copied() != Some(1) || ra.a.cell(addr).is_some() || ra.a.alias.contains_key(&d) {
+        return Ok(false);
+    }
+    if ra.a.call_saves.contains_key(&(b.id as usize, ii)) || ra.a.call_saves.contains_key(&(b.id as usize, ii + 1)) {
+        return Ok(false);
+    }
+    if ra.a.alias.contains_key(&nd) || std::env::var_os("FIRN_NO_LOADOP").is_some() {
+        return Ok(false);
+    }
+    let (a, bb) = if y == d {
+        (x, y)
+    } else if x == d && matches!(op, BinOp::Add | BinOp::Mul) {
+        (y, x)
+    } else {
+        return Ok(false);
+    };
+    e.loc_at(i.loc);
+    let mem = ra.addr_mem(e, addr);
+    let single = i.ty == FTy::F32;
+    let mem = format!("{} ptr {}", if single { "dword" } else { "qword" }, mem);
+    e.loc_at(nx.loc);
+    emit_bin_mem(e, ra, op, nx.ty, a, bb, nd, Some(mem))?;
+    Ok(true)
 }
 
 fn emit_inst(
@@ -6942,9 +7031,12 @@ fn emit_inst(
         Op::Un(UnOp::Sqrt, x) if ty.is_float() => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
             let single = ty == FTy::F32;
-            ra.fp_into(e, "xmm0", *x, single);
-            e.line(if single { "sqrtss xmm0, xmm0" } else { "sqrtsd xmm0, xmm0" });
-            ra.fp_out(e, d, "xmm0", single);
+            // Computed IN the target's own register when it has one (copy in, `sqrtsd w, w`): the
+            // result needs no copy out of `xmm0`, and `w, w` keeps the register fully written first.
+            let w = ra.fp_work(d);
+            ra.fp_into(e, w, *x, single);
+            e.line(&format!("{} {}, {}", if single { "sqrtss" } else { "sqrtsd" }, w, w));
+            ra.fp_out(e, d, w, single);
         }
         // ROUND RFAST -- `__bits` / `__f64_from_bits` / `__f32_from_bits`: the
         // bit pattern changes the register class, nothing else. The target
@@ -7012,12 +7104,24 @@ fn emit_inst(
             if ty.is_float() {
                 // Integer -> floating point. The source is brought to 64 bits;
                 // `cvtsi2ss/sd` reads signed.
-                ra.load_ext(e, "rax", *src, *from, 64);
+                // An `i64` that already sits in a register is read from there: no copy to `rax`.
+                let direct = match ra.a.place(*src) {
+                    Loc::Reg(r) if *from == FTy::I64 && ra.a.imm(*src).is_none() && ra.a.cell(*src).is_none() => Some(r),
+                    _ => None,
+                };
+                let srcreg = match direct {
+                    Some(r) => r,
+                    None => {
+                        ra.load_ext(e, "rax", *src, *from, 64);
+                        "rax"
+                    }
+                };
                 let w = ra.fp_work(d);
                 e.line(&format!(
-                    "{} {}, rax",
+                    "{} {}, {}",
                     if ty == FTy::F32 { "cvtsi2ss" } else { "cvtsi2sd" },
-                    w
+                    w,
+                    srcreg
                 ));
                 ra.fp_out(e, d, w, ty == FTy::F32);
                 return Ok(());
@@ -7568,8 +7672,14 @@ fn emit_inst(
                 // allocator has coalesced by accident costs no instruction.
                 Loc::Reg(r) => ra.load_full(e, r, *src),
                 Loc::Slot(_) => {
-                    ra.load_full(e, "rax", *src);
-                    ra.store_dst(e, d, "rax");
+                    // register -> slot: store the register itself, no detour over `rax`
+                    let o = ra.opnd(*src);
+                    if is_reg64(&o) {
+                        ra.store_dst(e, d, &o);
+                    } else {
+                        ra.load_full(e, "rax", *src);
+                        ra.store_dst(e, d, "rax");
+                    }
                 }
             }
         }
@@ -7746,6 +7856,22 @@ fn emit_bin(
     b: Val,
     d: Val,
 ) -> Result<(), String> {
+    emit_bin_mem(e, ra, op, ty, a, b, d, None)
+}
+
+/// `emit_bin` with an optional MEMORY operand for `b` (floating point only): the load of `b` was
+/// folded into the arithmetic instruction (`mulsd xmm, qword ptr [mem]`), see `fold_float_load`.
+#[allow(clippy::too_many_arguments)]
+fn emit_bin_mem(
+    e: &mut Emitter,
+    ra: &Ra,
+    op: BinOp,
+    ty: FTy,
+    a: Val,
+    b: Val,
+    d: Val,
+    mem_b: Option<String>,
+) -> Result<(), String> {
     // ROUND XMM3 -- the four basic arithmetic operations on the SSE unit. The calculation
     // is done IN the destination register if the value has one; otherwise in `xmm0`. If
     // the second operand happens to lie in the destination register, it is saved beforehand to
@@ -7783,7 +7909,10 @@ fn emit_bin(
                 ra.fp_into(e, "xmm0", a, single);
                 "xmm0".to_string()
             };
-            let src2 = ra.fpo(b, single);
+            let src2 = match &mem_b {
+                Some(mm) => mm.clone(),
+                None => ra.fpo(b, single),
+            };
             e.line(&format!("v{} {}, {}, {}", m, w, src1, src2));
             ra.fp_out(e, d, w, single);
             return Ok(());
@@ -7797,7 +7926,7 @@ fn emit_bin(
         // round symmetrically (for NaN the same holds: the result is a
         // quiet NaN, and Firn promises no particular payload pattern).
         // Subtraction and division stay untouched.
-        let (a, b) = if matches!(op, BinOp::Add | BinOp::Mul) {
+        let (a, b) = if mem_b.is_none() && matches!(op, BinOp::Add | BinOp::Mul) {
             let wb = matches!(ra.a.place(b), Loc::Reg(r) if r == w);
             let wa = matches!(ra.a.place(a), Loc::Reg(r) if r == w);
             if wb && !wa {
@@ -7808,7 +7937,10 @@ fn emit_bin(
         } else {
             (a, b)
         };
-        let mut ob = ra.fpo(b, single);
+        let mut ob = match &mem_b {
+            Some(mm) => mm.clone(),
+            None => ra.fpo(b, single),
+        };
         if is_xmm(&ob) && ob == w {
             e.line(&format!("movaps xmm1, {}", ob));
             ob = "xmm1".to_string();
@@ -8002,7 +8134,23 @@ fn emit_bin(
             ra.store_dst(e, d, res);
         }
         BinOp::Rotr32 => {
-            return Err(format!("internal error: '{}' is only generated for aarch64", op.name()));
+            // `rotate.rs`: rotate the low 32 bits right by the constant `b` (1..=31); `ror r32`
+            // zero-extends into the full register, exactly the FIR semantics.
+            let k = match ra.a.imm(b) {
+                Some(k) if (1..=31).contains(&k) => k,
+                _ => return Err("internal error: rotr32 needs a constant distance in 1..=31".to_string()),
+            };
+            match ra.a.loc(d) {
+                Loc::Reg(dr) => {
+                    ra.load_ext(e, dr, a, FTy::U32, 32);
+                    e.line(&format!("ror {}, {}", rn(dr, 32), k));
+                }
+                Loc::Slot(_) => {
+                    ra.load_ext(e, "rax", a, FTy::U32, 32);
+                    e.line(&format!("ror eax, {}", k));
+                    ra.store_dst(e, d, "rax");
+                }
+            }
         }
         BinOp::Shl | BinOp::Shr => {
             let m = match (op, ty.signed()) {

@@ -2046,7 +2046,11 @@ fn emit_bin(
             store_dst(e, fr, d, res);
         }
         BinOp::Rotr32 => {
-            return Err(format!("internal error: '{}' is only generated for aarch64", op.name()));
+            // `rotate.rs`: rotate the low 32 bits right by the constant `b`; `ror eax` zero-extends.
+            load_ext(e, fr, "rax", a, FTy::U32, 32);
+            load_full(e, fr, "rcx", b);
+            e.line("ror eax, cl");
+            store_dst(e, fr, d, "rax");
         }
         BinOp::Shl | BinOp::Shr => {
             // Widen the left operand exactly, so that `shr`/`sar` pull the right

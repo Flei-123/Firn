@@ -571,14 +571,16 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     }
     // r837: 32-bit rotate recognition. After the fixpoint and the inliner (the shift counts are
     // constants by now), before `fuse-checks`; the five operations of the old expression die in `dce`.
-    if cfg.runs("rotate") && crate::target::active() == crate::target::Target::Aarch64 {
+    // x86-64: `ror r32` also covers the plain `u32` form (`rotate::run_u32`), so the pass runs there too.
+    if cfg.runs("rotate") && matches!(crate::target::active(), crate::target::Target::Aarch64 | crate::target::Target::X86_64) {
         let t = std::time::Instant::now();
         let mut n = 0usize;
+        let x86 = crate::target::active() == crate::target::Target::X86_64;
         for f in m.funcs.iter_mut() {
             if f.constant_time || !f.secret.is_empty() {
                 continue;
             }
-            let k = crate::rotate::run(f);
+            let k = crate::rotate::run(f) + if x86 { crate::rotate::run_u32(f) } else { 0 };
             if k > 0 {
                 remove_dead_insts(f, &mut st);
                 phi_check(f, "rotate");

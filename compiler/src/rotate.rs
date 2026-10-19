@@ -143,6 +143,80 @@ pub(crate) fn run(f: &mut Func) -> usize {
     changed
 }
 
+/// **x86 rotate for 32-bit values.** Code that works on `u32` writes a rotate as
+///
+/// ```text
+///     or.u32( shr.u32(x, n), shl.u32(x, 32 - n) )          1 <= n <= 31
+/// ```
+///
+/// (four instructions plus a copy on x86). It is `ror r32, n`: one instruction that
+/// reads and writes the low half only. The result is a `u32` `BinOp::Rotr32`
+/// (low 32 bits rotated, zero-extended), the same op the aarch64 pass produces.
+/// Both shifts must read the SAME value and both counts must be constants. The
+/// shifts become dead when no one else reads them and `dce` removes them.
+pub(crate) fn run_u32(f: &mut Func) -> usize {
+    let mut consts: HashMap<Val, i128> = HashMap::new();
+    let mut bins: HashMap<Val, (BinOp, Val, Val)> = HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            let d = match i.dst {
+                Some(d) => d,
+                None => continue,
+            };
+            match &i.op {
+                Op::Const(c) if i.ty == FTy::U32 => {
+                    consts.insert(d, FTy::U32.truncate(*c));
+                }
+                Op::Bin(op, a, b2) if i.ty == FTy::U32 => {
+                    bins.insert(d, (*op, *a, *b2));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut changed = 0usize;
+    for bi in 0..f.blocks.len() {
+        for ii in 0..f.blocks[bi].insts.len() {
+            let (d, p, q) = {
+                let i = &f.blocks[bi].insts[ii];
+                match (&i.op, i.dst) {
+                    (Op::Bin(BinOp::Or, p, q), Some(d)) if i.ty == FTy::U32 => (d, *p, *q),
+                    _ => continue,
+                }
+            };
+            let mut hit: Option<(Val, Val)> = None;
+            for (sr, sl) in [(p, q), (q, p)] {
+                let (a_src, n_val) = match bins.get(&sr) {
+                    Some((BinOp::Shr, a, n)) => (*a, *n),
+                    _ => continue,
+                };
+                let (b_src, m_val) = match bins.get(&sl) {
+                    Some((BinOp::Shl, b, m)) => (*b, *m),
+                    _ => continue,
+                };
+                if a_src != b_src {
+                    continue;
+                }
+                let (n, m) = match (consts.get(&n_val), consts.get(&m_val)) {
+                    (Some(n), Some(m)) => (*n, *m),
+                    _ => continue,
+                };
+                if !(1..=31).contains(&n) || n + m != 32 {
+                    continue;
+                }
+                hit = Some((a_src, n_val));
+                break;
+            }
+            if let Some((src, n_val)) = hit {
+                f.blocks[bi].insts[ii].op = Op::Bin(BinOp::Rotr32, src, n_val);
+                bins.insert(d, (BinOp::Rotr32, src, n_val));
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +298,44 @@ mod tests {
     fn folding_a_constant_rotate() {
         // 0x80000001 rotated right by 1 = 0xC0000000
         assert_eq!(crate::opt::fold_bin(FTy::U64, BinOp::Rotr32, 0x8000_0001, 1), Some(0xC000_0000));
+    }
+
+    #[test]
+    fn u32_or_of_shifts_becomes_rotr32() {
+        for n in [1i128, 7, 16, 31] {
+            let mut f = Func::new("t", vec![FTy::U32], FTy::U32);
+            let x = f.param_val(0);
+            let cn = f.push(0, FTy::U32, Op::Const(n));
+            let cm = f.push(0, FTy::U32, Op::Const(32 - n));
+            let r = f.push(0, FTy::U32, Op::Bin(BinOp::Shr, x, cn));
+            let l = f.push(0, FTy::U32, Op::Bin(BinOp::Shl, x, cm));
+            let o = f.push(0, FTy::U32, Op::Bin(BinOp::Or, l, r));
+            f.set_term(0, Term::Ret(Some(o)));
+            assert_eq!(run_u32(&mut f), 1);
+            assert!(matches!(f.blocks[0].insts.last().unwrap().op, Op::Bin(BinOp::Rotr32, ..)));
+        }
+    }
+
+    #[test]
+    fn u32_rotate_needs_same_source_and_counts_summing_to_32() {
+        let mut f = Func::new("t", vec![FTy::U32, FTy::U32], FTy::U32);
+        let x = f.param_val(0);
+        let y = f.param_val(1);
+        let cn = f.push(0, FTy::U32, Op::Const(5));
+        let cm = f.push(0, FTy::U32, Op::Const(27));
+        let r = f.push(0, FTy::U32, Op::Bin(BinOp::Shr, x, cn));
+        let l = f.push(0, FTy::U32, Op::Bin(BinOp::Shl, y, cm)); // other source
+        let o = f.push(0, FTy::U32, Op::Bin(BinOp::Or, l, r));
+        f.set_term(0, Term::Ret(Some(o)));
+        assert_eq!(run_u32(&mut f), 0);
+        let mut g = Func::new("t", vec![FTy::U32], FTy::U32);
+        let x = g.param_val(0);
+        let cn = g.push(0, FTy::U32, Op::Const(5));
+        let cm = g.push(0, FTy::U32, Op::Const(26)); // 5 + 26 != 32
+        let r = g.push(0, FTy::U32, Op::Bin(BinOp::Shr, x, cn));
+        let l = g.push(0, FTy::U32, Op::Bin(BinOp::Shl, x, cm));
+        let o = g.push(0, FTy::U32, Op::Bin(BinOp::Or, l, r));
+        g.set_term(0, Term::Ret(Some(o)));
+        assert_eq!(run_u32(&mut g), 0);
     }
 }
