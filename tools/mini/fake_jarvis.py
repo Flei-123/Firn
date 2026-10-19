@@ -127,6 +127,7 @@ def sidebar_chats():
             row("s8", "Diplomarbeit", 100 * h), row("s9", "Anzug-KI", 24 * 20 * h), row("s10", "Russisch", 24 * 90 * h),
             row("w1", "Daidalos: Render", 6 * h, True, "worker", True)]
 
+ADMIN_LIMITS = {"maxSubworkers": 5, "heavySlots": 8, "autoLoop": True}
 RENAMED = {}   # POST /api/m/chats/rename: id -> new title (FAKE_NO_CHAT_OPS=1: an older server, 404)
 REMOVED = set()  # POST /api/m/chats/remove
 
@@ -326,6 +327,28 @@ def rest(method, rawpath, hdr, body):
             if os.environ.get("FAKE_NO_USAGE") or os.environ.get("FAKE_NO_MODELS"): return out(503, {"error": "no models"})
             return out(200, {"models": [{"alias": a, "label": MODEL_LABELS[a], "blurb": "", "provider": "claude", "effort": a != "haiku", "thinking": True, "vision": True} for a in ENABLED],
                              "efforts": EFFORTS, "current": model_current(), "chat": None})
+        # /api/m/me + /api/m/admin/*: FAKE_ROLE=user -> admin false and every admin route 403 (like the real server); FAKE_NO_ADMIN=1: older server (404)
+        if mp == "me" and method == "GET":
+            if os.environ.get("FAKE_NO_ADMIN"): return out(404, {"error": "Not found"})
+            return out(200, {"uid": "u1", "username": "justin", "email": "justin@fleitec.com", "admin": os.environ.get("FAKE_ROLE", "admin") != "user", "impersonating": False})
+        if mp == "admin" or mp.startswith("admin/"):
+            if os.environ.get("FAKE_NO_ADMIN"): return out(404, {"error": "Not found"})
+            if os.environ.get("FAKE_ROLE", "admin") == "user": return out(403, {"error": "Nur f\u00fcr Admins."})
+            if mp == "admin/users" and method == "GET":
+                return out(200, {"total": 3, "users": [{"id": "u1", "username": "justin", "email": "justin@fleitec.com", "admin": True, "createdAt": 1, "projects": 6},
+                                                       {"id": "u2", "username": "papa", "email": "info@fleitec.com", "admin": False, "createdAt": 2, "projects": 1},
+                                                       {"id": "u3", "username": "gast", "email": "", "admin": False, "createdAt": 3, "projects": 0}]})
+            if mp == "admin/limits" and method == "GET": return out(200, dict(ok=True, **ADMIN_LIMITS))
+            if mp == "admin/limits" and method == "POST" and j:
+                for k in ("maxSubworkers", "heavySlots", "autoLoop"):
+                    if k in j: ADMIN_LIMITS[k] = j[k]
+                return out(200, dict(ok=True, **ADMIN_LIMITS))
+            if mp == "admin/server" and method == "GET":
+                return out(200, {"host": "jarvis", "cpu": {"cores": 16, "load1": 2.5, "load5": 2.1, "load15": 1.9, "loadPct": 16}, "mem": {"totalBytes": 68719476736, "freeBytes": 21474836480, "usedPct": 69},
+                                 "disk": {"totalBytes": 1099511627776, "freeBytes": 214748364800, "usedPct": 80}, "uptimeSec": 1234567, "processUptimeSec": 4000, "node": "v18.20.8"})
+            if mp == "admin/logs" and method == "GET":
+                return out(200, {"file": "2026-10-19.log", "files": ["2026-10-19.log"], "size": 100, "lines": ["[2026-10-19T20:00:00Z] server start", "[2026-10-19T20:00:01Z] login justin", "[2026-10-19T20:00:05Z] worker a48 started"]})
+            return out(404, {"error": "Unbekannter Pfad"})
         if mp == "models" and method == "POST" and j:
             if j.get("model") is not None:
                 if j["model"] not in ENABLED: return out(400, {"error": "Modell nicht verfuegbar"})
