@@ -844,6 +844,14 @@ build access
 "$W/access" | tail -n 3
 build dpi
 "$W/dpi" | tail -n 3
+# plat.fontpick (host test, no window): the built-in mono face always loads;
+# a web-font choice whose directory is missing must report loaded=0 files=0
+# (a silent fallback to another face would be the error).
+build fontpick
+"$W/fontpick" mono | tee "$W/fontpick.out"
+grep -q "FONTPICK choice=mono loaded=1 " "$W/fontpick.out" || { echo "fontpick: mono face did not load"; exit 1; }
+"$W/fontpick" inter /nonexistent | tee "$W/fontpick.out"
+grep -q "FONTPICK choice=inter loaded=0 .* files=0" "$W/fontpick.out" || { echo "fontpick: missing web fonts not reported"; exit 1; }
 # W10: the AT-SPI bridge on a private dbus-daemon, headless and in a real window (own Xvfb);
 # exit 77 = prerequisites missing (not testable), anything else but 0 fails the run
 rc=0
