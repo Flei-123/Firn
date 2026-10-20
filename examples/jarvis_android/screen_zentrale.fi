@@ -1,0 +1,567 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_android/screen_zentrale.fi -- the "Zentrale" mode of the Board tab: the web command centre (#jarvisHud) as cards.
+// ONE virtual list with fixed STRIPES (ST_PT design points high). A card item spans several stripes; every stripe paints its slice of
+// the card (shell, header, item) under a clip, so the list keeps its cheap fixed-row scrolling. Rows are painted by the custom-row
+// hook of vlistview (VRow.sbk = SBK, VRow.badge = stripe index). Data: jdata.center() (/api/command-center).
+// Blocks: head (orb, title, clock, refresh), card System (CPU/RAM/Disk/Uptime + plan limits), Aufgaben, Geraete, Gedaechtnis, Aktivitaet.
+import std.rt
+import std.vec
+import std.time
+import fui.render
+import fui.painter
+import fui.style
+import fui.wave3
+import fui.icons
+import fui.lucide
+import fui.vlist
+import fui.vlistview
+import paint.canvas
+import net.jarvisapi
+import jshell
+import jdata
+import jtexts
+import screen_sidebar
+
+export { z_build, z_count, z_row, z_hook, z_is_head, ST_PT, SBK }
+
+const ST_PT: usize = 12
+const SBK: u32 = 16 as u32
+const CAP: usize = 360
+
+// block kinds
+const B_GAP: u32 = 0 as u32
+const B_HEAD: u32 = 1 as u32
+const B_CH: u32 = 2 as u32 // card header: a = card id
+const B_SYS: u32 = 3 as u32 // a = metric row
+const B_TASK: u32 = 4 as u32
+const B_DEV: u32 = 5 as u32
+const B_MEM: u32 = 6 as u32
+const B_ACT: u32 = 7 as u32
+const B_EMPTY: u32 = 8 as u32 // a = card id
+
+const C_SYS: i64 = 0
+const C_TASK: i64 = 1
+const C_DEV: i64 = 2
+const C_MEM: i64 = 3
+const C_ACT: i64 = 4
+
+// colours (0xRRGGBB, opaque: the web rgba values blended over the card panel)
+const COL_PANEL: u32 = 0x15172b
+const COL_EDGE: u32 = 0x1f2132
+const COL_HLINE: u32 = 0x28293d
+const COL_ROWLINE: u32 = 0x1c1e33
+const COL_TRACK: u32 = 0x25273b
+const COL_TXT: u32 = 0xe9ebf5
+const COL_DIM: u32 = 0x9aa0bb
+const COL_FAINT: u32 = 0x6b7193
+const COL_ACCENT: u32 = 0x2f86ff
+const COL_ACCENT2: u32 = 0x36c5ff
+const COL_OK: u32 = 0x2ee6a6
+const COL_WARN: u32 = 0xff5d5d
+const COL_AMB: u32 = 0xffb454
+const COL_CHIP_BG: u32 = 0x1d1f33
+const COL_OK_BG: u32 = 0x172c37
+const COL_OK_BD: u32 = 0x1c5550
+const COL_AMB_BG: u32 = 0x2c272f
+const COL_AMB_BD: u32 = 0x564336
+const COL_WARN_BG: u32 = 0x2c1e30
+const COL_WARN_BD: u32 = 0x5b2c3a
+const COL_BTN_BG: u32 = 0x14162b
+
+static mut G_N: usize = 0
+static mut G_BK: [u32; 360] = [0; 360]   // block kind
+static mut G_BA: [i64; 360] = [0; 360]   // block argument (item / card)
+static mut G_BJ: [u32; 360] = [0; 360]   // stripe index inside its block
+static mut G_BN: [u32; 360] = [0; 360]   // stripes of the block
+static mut G_CS: [u32; 360] = [0; 360]   // stripes since the card start (card stripes only)
+static mut G_CN: [u32; 360] = [0; 360]   // stripes of the card, 0 = not a card stripe
+static mut G_LAST: [u32; 360] = [0; 360] // 1 = last item of its card
+static mut G_CLOCK: i64 = 0
+static mut G_Y0: f64 = 0.0
+static mut G_Y1: f64 = 0.0
+static mut G_TMP: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+
+fn cen() -> *mut jarvisapi.Center { return jdata.center() }
+
+fn task_n() -> usize { if !jdata.has_center() { return 0 }
+    var n: usize = vec_len[jarvisapi.TaskRow](&(*cen()).tasks)
+    if n > 8 { n = 8 }
+    return n }
+fn dev_n() -> usize { if !jdata.has_center() { return 0 }
+    var n: usize = vec_len[jarvisapi.DevInfoRow](&(*cen()).dinfo)
+    if n > 8 { n = 8 }
+    return n }
+fn know_n() -> usize { if !jdata.has_center() { return 0 }
+    var n: usize = vec_len[jarvisapi.KnowRow](&(*cen()).know)
+    if n > 5 { n = 5 }
+    return n }
+fn act_n() -> usize { if !jdata.has_center() { return 0 }
+    var n: usize = vec_len[jarvisapi.ActRow](&(*cen()).activity)
+    if n > 10 { n = 10 }
+    return n }
+
+fn sys_rows() -> usize {
+    if !jdata.has_center() { return 0 }
+    if (*cen()).rate5 >= 0 || (*cen()).rate7 >= 0 { return 3 }
+    return 2
+}
+
+fn push_block(kind: u32, a: i64, n: usize, cn_total: usize, cs0: usize, last: bool) -> usize {
+    var j: usize = 0
+    while j < n && G_N < CAP {
+        G_BK[G_N] = kind
+        G_BA[G_N] = a
+        G_BJ[G_N] = j as u32
+        G_BN[G_N] = n as u32
+        G_CS[G_N] = (cs0 + j) as u32
+        G_CN[G_N] = cn_total as u32
+        G_LAST[G_N] = 0 as u32
+        if last { G_LAST[G_N] = 1 as u32 }
+        G_N = G_N + 1
+        j = j + 1
+    }
+    return cs0 + n
+}
+
+// one card: header (3 stripes) + `n` items of `per` stripes (or one empty line of 3); then a one-stripe gap
+fn push_card(card: i64, kind: u32, n: usize, per: usize) {
+    var body: usize = n * per
+    if n == 0 { body = 3 }
+    let total: usize = 3 + body
+    var cs: usize = push_block(B_CH, card, 3, total, 0, false)
+    if n == 0 {
+        cs = push_block(B_EMPTY, card, 3, total, cs, true)
+    } else {
+        var i: usize = 0
+        while i < n {
+            cs = push_block(kind, i as i64, per, total, cs, i + 1 == n)
+            i = i + 1
+        }
+    }
+    let g: usize = push_block(B_GAP, 0, 1, 0, 0, false)
+}
+
+// rebuild the stripe table from the loaded centre data
+fn z_build() {
+    G_N = 0
+    let g: usize = push_block(B_HEAD, 0, 4, 0, 0, false)
+    let g2: usize = push_block(B_GAP, 0, 1, 0, 0, false)
+    if !jdata.has_center() { return }
+    // system: header + metric rows of 4 stripes
+    let sr: usize = sys_rows()
+    var cs: usize = push_block(B_CH, C_SYS, 3, 3 + sr * 4, 0, false)
+    var r: usize = 0
+    while r < sr {
+        cs = push_block(B_SYS, r as i64, 4, 3 + sr * 4, cs, r + 1 == sr)
+        r = r + 1
+    }
+    let g3: usize = push_block(B_GAP, 0, 1, 0, 0, false)
+    push_card(C_TASK, B_TASK, task_n(), 4)
+    push_card(C_DEV, B_DEV, dev_n(), 4)
+    push_card(C_MEM, B_MEM, know_n(), 5)
+    push_card(C_ACT, B_ACT, act_n(), 2)
+}
+
+fn z_count() -> usize { return G_N }
+
+fn z_is_head(i: usize) -> bool { return i < G_N && G_BK[i] == B_HEAD }
+
+// the list row source: a stripe row is only a marker, the hook paints it
+fn z_row(i: usize, out: *mut vlist.VRow) {
+    if i >= G_N { return }
+    (*out).sbk = SBK
+    (*out).badge = i as i64
+}
+
+// ---- helpers ------------------------------------------------------------------------------------------------------------------
+
+fn two(v: i64) -> str {
+    if v < 10 { return "0" + jshell.dec(v) }
+    return jshell.dec(v)
+}
+
+fn iso_ms(s: str) -> i64 {
+    if s.n == 0 { return 0 }
+    let t: time.DateTime = time.parse_iso8601(s) catch | e | time.DateTime { year: 0, month: 0 as u32, day: 0 as u32, hour: 0 as u32, minute: 0 as u32, second: 0 as u32, ms: 0 as u32, offset_min: 0 as i32 }
+    if t.year == 0 { return 0 }
+    return time.unix_from_civil(t)
+}
+
+fn hhmm(ms: i64) -> str {
+    let d: time.DateTime = time.civil_from_unix(ms + screen_sidebar.local_offset_min(ms) * 60000)
+    return two(d.hour as i64) + ":" + two(d.minute as i64)
+}
+
+fn ddmm(ms: i64) -> str {
+    let d: time.DateTime = time.civil_from_unix(ms + screen_sidebar.local_offset_min(ms) * 60000)
+    return two(d.day as i64) + "." + two(d.month as i64) + "."
+}
+
+fn ago_text(ms: i64) -> str {
+    if ms <= 0 { return "" }
+    var s: i64 = (time.now_unix_ms() - ms) / 1000
+    if s < 0 { s = 0 }
+    if s < 60 { return jshell.dec(s) + "s" }
+    if s < 3600 { return jshell.dec(s / 60) + "m" }
+    if s < 86400 { return jshell.dec(s / 3600) + "h" }
+    return jshell.dec(s / 86400) + "d"
+}
+
+// bytes as the web `_fb`: "7.4GB", "120GB"
+fn fb(n: i64) -> str {
+    if n <= 0 { return "0" }
+    var v: i64 = n * 10
+    var u: usize = 0
+    while v >= 10240 && u < 4 { v = v / 1024; u = u + 1 }
+    var unit: str = "B"
+    if u == 1 { unit = "KB" } else if u == 2 { unit = "MB" } else if u == 3 { unit = "GB" } else if u == 4 { unit = "TB" }
+    if v < 100 { return jshell.dec(v / 10) + "." + jshell.dec(v % 10) + unit }
+    return jshell.dec(v / 10) + unit
+}
+
+fn unit_of(c: *mut render.Ctx) -> f64 { return render.len_of(c, 100) / 100.0 }
+
+// does [y, y+h) touch the stripe being painted?
+fn seen(y: f64, h: f64) -> bool { return y < G_Y1 && y + h > G_Y0 }
+
+fn fill(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, r: f64, rgb: u32) {
+    if !seen(y, h) { return }
+    painter.round_rect(render.ctx_painter(c), x, y, w, h, r, theme_opaque(rgb))
+}
+
+fn theme_opaque(rgb: u32) -> u32 { return rgb | 0xff000000 }
+
+fn ring(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, r: f64, st: f64, rgb: u32) {
+    if !seen(y, h) { return }
+    painter.round_ring(render.ctx_painter(c), x, y, w, h, r, st, theme_opaque(rgb))
+}
+
+// the text cut to `w` with "..." when it does not fit (one line, no wrapping)
+fn fit_text(c: *mut render.Ctx, s: str, px: usize, w: f64) -> str {
+    if s.n == 0 { return s }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let sz: f64 = render.text_len_of(c, px)
+    if painter.text_width(z, s.p as u64, s.n, sz) <= w { return s }
+    let dd: str = "..."
+    let dots: f64 = painter.text_width(z, dd.p as u64, 3, sz)
+    var k: usize = painter.text_fits_upto(z, s.p as u64, s.n, sz, w - dots)
+    rt.buf_clear(&G_TMP)
+    rt.buf_push_bytes(&G_TMP, s.p as u64, k)
+    rt.buf_push_bytes(&G_TMP, dd.p as u64, 3)
+    return str { p: G_TMP.ptr as *mut u8, n: G_TMP.len }
+}
+
+fn text_w(c: *mut render.Ctx, s: str, px: usize) -> f64 {
+    if s.n == 0 { return 0.0 }
+    return painter.text_width(render.ctx_painter(c), s.p as u64, s.n, render.text_len_of(c, px))
+}
+
+// one text line in a box of height `h` (px) at `y`; skipped when it lies outside the stripe
+fn put_text(c: *mut render.Ctx, s: str, x: f64, y: f64, w: f64, h: f64, rgb: u32, align: u32, px: usize, weight: u32) {
+    if s.n == 0 || w <= 0.0 || !seen(y, h) { return }
+    let t: str = fit_text(c, s, px, w)
+    wave3.cell_text_weight(c, t.p as u64, t.n, x, y, w, h, style.color_literal(rgb), align, px, weight)
+}
+
+// a status pill (border + fill + text), returns its width
+fn pill(c: *mut render.Ctx, s: str, x: f64, y: f64, h: f64, px: usize, fg: u32, bg: u32, bd: u32) -> f64 {
+    let u: f64 = unit_of(c)
+    let w: f64 = text_w(c, s, px) + 18.0 * u
+    if seen(y, h) {
+        fill(c, x, y, w, h, h / 2.0, bd)
+        fill(c, x + u, y + u, w - 2.0 * u, h - 2.0 * u, (h - 2.0 * u) / 2.0, bg)
+        put_text(c, s, x + 9.0 * u, y, w - 18.0 * u, h, fg, style.ALIGN_LEFT, px, 600 as u32)
+    }
+    return w
+}
+
+fn metric(c: *mut render.Ctx, x: f64, y0: f64, w: f64, label: str, pct: i64, sub: str, big: str) {
+    let u: f64 = unit_of(c)
+    put_text(c, label, x, y0 + 6.0 * u, w, 14.0 * u, COL_DIM, style.ALIGN_LEFT, 11, 400 as u32)
+    if big.n > 0 {
+        put_text(c, big, x, y0 + 21.0 * u, w, 22.0 * u, COL_TXT, style.ALIGN_LEFT, 16, 400 as u32)
+        return
+    }
+    var p: i64 = pct
+    if p > 100 { p = 100 }
+    if p < 0 { p = 0 }
+    put_text(c, jshell.dec(p) + "%", x, y0 + 6.0 * u, w, 14.0 * u, COL_TXT, style.ALIGN_RIGHT, 11, 600 as u32)
+    let bh: f64 = 6.0 * u
+    fill(c, x, y0 + 24.0 * u, w, bh, bh / 2.0, COL_TRACK)
+    var col: u32 = COL_ACCENT
+    if p > 85 { col = COL_WARN }
+    if p > 0 { fill(c, x, y0 + 24.0 * u, w * (p as f64) / 100.0, bh, bh / 2.0, col) }
+    put_text(c, sub, x, y0 + 33.0 * u, w, 13.0 * u, COL_FAINT, style.ALIGN_LEFT, 10, 400 as u32)
+}
+
+fn card_shell(c: *mut render.Ctx, i: usize, x: f64, y: f64, w: f64, h: f64) {
+    let cn: usize = G_CN[i] as usize
+    if cn == 0 { return }
+    let u: f64 = unit_of(c)
+    let cs: usize = G_CS[i] as usize
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    if cs == 0 || cs + 1 == cn {
+        let top: f64 = y - (cs as f64) * h
+        let tot: f64 = (cn as f64) * h
+        painter.round_rect(z, x, top, w, tot, 12.0 * u, theme_opaque(COL_EDGE))
+        painter.round_rect(z, x + u, top + u, w - 2.0 * u, tot - 2.0 * u, 11.0 * u, theme_opaque(COL_PANEL))
+    } else {
+        painter.surface(z, x, y, w, h, theme_opaque(COL_EDGE))
+        painter.surface(z, x + u, y, w - 2.0 * u, h, theme_opaque(COL_PANEL))
+    }
+}
+
+fn card_title(card: i64) -> str {
+    if card == C_SYS { return jtexts.t("cc.system") }
+    if card == C_TASK { return jtexts.t("cc.tasks") }
+    if card == C_DEV { return jtexts.t("cc.devices") }
+    if card == C_MEM { return jtexts.t("cc.memory") }
+    return jtexts.t("cc.activity")
+}
+
+fn card_count(card: i64) -> str {
+    if card == C_SYS { return (*cen()).host }
+    if card == C_TASK { return jshell.dec(vec_len[jarvisapi.TaskRow](&(*cen()).tasks) as i64) }
+    if card == C_DEV {
+        var on: i64 = 0
+        var k: usize = 0
+        let n: usize = vec_len[jarvisapi.DevInfoRow](&(*cen()).dinfo)
+        while k < n {
+            if (*vec_elem_ptr[jarvisapi.DevInfoRow](&(*cen()).dinfo, k)).online { on = on + 1 }
+            k = k + 1
+        }
+        if n == 0 { return jshell.dec(vec_len[str](&(*cen()).devices) as i64) }
+        return jshell.dec(on)
+    }
+    if card == C_MEM {
+        if (*cen()).memory_count > 0 { return jshell.dec((*cen()).memory_count) }
+        return jshell.dec(vec_len[jarvisapi.KnowRow](&(*cen()).know) as i64)
+    }
+    return ""
+}
+
+fn draw_head(c: *mut render.Ctx, x: f64, y0: f64, w: f64) {
+    let u: f64 = unit_of(c)
+    let ox: f64 = x + 4.0 * u
+    let oy: f64 = y0 + 4.0 * u
+    // orb: faint ring, glow disc, bright core
+    ring(c, ox, oy, 40.0 * u, 40.0 * u, 20.0 * u, 1.2 * u, 0x1d4a7f)
+    fill(c, ox + 4.0 * u, oy + 4.0 * u, 32.0 * u, 32.0 * u, 16.0 * u, 0x0f2150)
+    ring(c, ox + 7.0 * u, oy + 7.0 * u, 26.0 * u, 26.0 * u, 13.0 * u, 1.0 * u, 0x2a5fb5)
+    fill(c, ox + 11.0 * u, oy + 11.0 * u, 18.0 * u, 18.0 * u, 9.0 * u, 0x1f6fe0)
+    fill(c, ox + 15.0 * u, oy + 15.0 * u, 10.0 * u, 10.0 * u, 5.0 * u, COL_ACCENT2)
+    let tx: f64 = ox + 40.0 * u + 9.0 * u
+    put_text(c, "J.A.R.V.I.S.", tx, y0 + 5.0 * u, 140.0 * u, 20.0 * u, COL_TXT, style.ALIGN_LEFT, 15, 700 as u32)
+    put_text(c, jtexts.t("cc.centre"), tx, y0 + 25.0 * u, 160.0 * u, 14.0 * u, COL_DIM, style.ALIGN_LEFT, 11, 400 as u32)
+    // refresh button
+    let bw: f64 = 30.0 * u
+    let bx: f64 = x + w - bw - 2.0 * u
+    let by: f64 = y0 + 9.0 * u
+    fill(c, bx, by, bw, bw, 8.0 * u, COL_HLINE)
+    fill(c, bx + u, by + u, bw - 2.0 * u, bw - 2.0 * u, 7.0 * u, COL_BTN_BG)
+    if seen(by, bw) {
+        icons.icon(render.ctx_painter(c), lucide.REFRESH_CW, bx + 7.5 * u, by + 7.5 * u, 15.0 * u, theme_opaque(COL_DIM))
+    }
+    // clock hh:mm:ss in the device zone
+    let ms: i64 = time.now_unix_ms()
+    let d: time.DateTime = time.civil_from_unix(ms + screen_sidebar.local_offset_min(ms) * 60000)
+    let ck: str = two(d.hour as i64) + ":" + two(d.minute as i64) + ":" + two(d.second as i64)
+    put_text(c, ck, bx - 12.0 * u - 110.0 * u, y0 + 11.0 * u, 110.0 * u, 26.0 * u, COL_TXT, style.ALIGN_RIGHT, 15, 500 as u32)
+}
+
+fn draw_ch(c: *mut render.Ctx, i: usize, x: f64, y0: f64, w: f64) {
+    let u: f64 = unit_of(c)
+    let card: i64 = G_BA[i]
+    put_text(c, card_title(card), x + 13.0 * u, y0, w - 100.0 * u, 36.0 * u, COL_DIM, style.ALIGN_LEFT, 11, 600 as u32)
+    let n: str = card_count(card)
+    if n.n > 0 {
+        let pw: f64 = text_w(c, n, 10) + 16.0 * u
+        let px: f64 = x + w - 13.0 * u - pw
+        fill(c, px, y0 + 9.0 * u, pw, 18.0 * u, 9.0 * u, COL_HLINE)
+        fill(c, px + u, y0 + 10.0 * u, pw - 2.0 * u, 16.0 * u, 8.0 * u, COL_CHIP_BG)
+        put_text(c, n, px + 8.0 * u, y0 + 9.0 * u, pw - 16.0 * u, 18.0 * u, COL_FAINT, style.ALIGN_LEFT, 10, 400 as u32)
+    }
+    fill(c, x + u, y0 + 35.0 * u, w - 2.0 * u, u, 0.0, COL_HLINE)
+}
+
+fn row_line(c: *mut render.Ctx, i: usize, x: f64, y0: f64, w: f64, hh: f64) {
+    if G_LAST[i] != 0 as u32 { return }
+    let u: f64 = unit_of(c)
+    fill(c, x + 13.0 * u, y0 + hh - u, w - 26.0 * u, u, 0.0, COL_ROWLINE)
+}
+
+fn draw_sys(c: *mut render.Ctx, i: usize, x: f64, y0: f64, w: f64) {
+    let u: f64 = unit_of(c)
+    let ce: *mut jarvisapi.Center = cen()
+    let cw: f64 = (w - 26.0 * u - 14.0 * u) / 2.0
+    let x1: f64 = x + 13.0 * u
+    let x2: f64 = x1 + cw + 14.0 * u
+    let r: i64 = G_BA[i]
+    if r == 0 {
+        var cpu: i64 = 0
+        if (*ce).cpus > 0 { cpu = ((*ce).load1 * 100.0) as i64 / (*ce).cpus }
+        var ls: str = jshell.dec(((*ce).load1 * 100.0) as i64 / 100) + "." + two(((*ce).load1 * 100.0) as i64 % 100)
+        metric(c, x1, y0, cw, "CPU", cpu, ls + " / " + jshell.dec((*ce).cpus) + " " + jtexts.t("cc.cores"), "")
+        var ram: i64 = 0
+        if (*ce).mem_total > 0 { ram = ((*ce).mem_total - (*ce).mem_free) * 100 / (*ce).mem_total }
+        metric(c, x2, y0, cw, "RAM", ram, fb((*ce).mem_total - (*ce).mem_free) + " / " + fb((*ce).mem_total), "")
+    } else if r == 1 {
+        var dp: i64 = 0
+        if (*ce).disk_total > 0 { dp = ((*ce).disk_total - (*ce).disk_free) * 100 / (*ce).disk_total }
+        metric(c, x1, y0, cw, "Disk", dp, fb((*ce).disk_total - (*ce).disk_free) + " / " + fb((*ce).disk_total), "")
+        metric(c, x2, y0, cw, "Uptime", 0, "", jshell.dec((*ce).uptime / 86400) + "d " + jshell.dec((*ce).uptime % 86400 / 3600) + "h")
+    } else {
+        if (*ce).rate5 >= 0 { metric(c, x1, y0, cw, jtexts.t("cc.limit5"), (*ce).rate5, "", "") }
+        if (*ce).rate7 >= 0 { metric(c, x2, y0, cw, jtexts.t("cc.limit7"), (*ce).rate7, "", "") }
+    }
+}
+
+fn draw_task(c: *mut render.Ctx, i: usize, x: f64, y0: f64, w: f64) {
+    let u: f64 = unit_of(c)
+    let k: usize = G_BA[i] as usize
+    if k >= vec_len[jarvisapi.TaskRow](&(*cen()).tasks) { return }
+    let t: *mut jarvisapi.TaskRow = vec_elem_ptr[jarvisapi.TaskRow](&(*cen()).tasks, k)
+    var cat: str = (*t).category
+    if cat.n == 0 { cat = "TODO" }
+    var fg: u32 = COL_AMB
+    var bg: u32 = COL_AMB_BG
+    var bd: u32 = COL_AMB_BD
+    if (*t).overdue { fg = COL_WARN; bg = COL_WARN_BG; bd = COL_WARN_BD }
+    let pw: f64 = pill(c, cat, x + 13.0 * u, y0 + 8.0 * u, 17.0 * u, 10, fg, bg, bd)
+    let tx: f64 = x + 13.0 * u + pw + 9.0 * u
+    let tw: f64 = x + w - 13.0 * u - tx
+    put_text(c, (*t).text, tx, y0 + 6.0 * u, tw, 17.0 * u, COL_TXT, style.ALIGN_LEFT, 12, 400 as u32)
+    var when: str = ""
+    if (*t).due.n > 0 {
+        let ms: i64 = iso_ms((*t).due)
+        if (*t).overdue { when = jtexts.t("cc.overdue") }
+        else if ms > 0 { when = hhmm(ms) + " " + ddmm(ms) }
+        if (*t).repeat.n > 0 { when = when + " " + (*t).repeat }
+    }
+    put_text(c, when, tx, y0 + 24.0 * u, tw, 14.0 * u, COL_FAINT, style.ALIGN_LEFT, 10, 400 as u32)
+    row_line(c, i, x, y0, w, 48.0 * u)
+}
+
+fn draw_dev(c: *mut render.Ctx, i: usize, x: f64, y0: f64, w: f64) {
+    let u: f64 = unit_of(c)
+    let k: usize = G_BA[i] as usize
+    if k >= vec_len[jarvisapi.DevInfoRow](&(*cen()).dinfo) { return }
+    let d: *mut jarvisapi.DevInfoRow = vec_elem_ptr[jarvisapi.DevInfoRow](&(*cen()).dinfo, k)
+    var lab: str = jtexts.t("cc.offline")
+    var fg: u32 = COL_DIM
+    var bg: u32 = COL_CHIP_BG
+    var bd: u32 = COL_HLINE
+    if (*d).online { lab = jtexts.t("cc.online"); fg = COL_OK; bg = COL_OK_BG; bd = COL_OK_BD }
+    let pw: f64 = pill(c, "\u{25cf} " + lab, x + 13.0 * u, y0 + 8.0 * u, 17.0 * u, 10, fg, bg, bd)
+    let tx: f64 = x + 13.0 * u + pw + 9.0 * u
+    let tw: f64 = x + w - 13.0 * u - tx
+    put_text(c, (*d).name, tx, y0 + 6.0 * u, tw, 17.0 * u, COL_TXT, style.ALIGN_LEFT, 12, 400 as u32)
+    var sub: str = (*d).kind
+    if (*d).ago.n > 0 { if sub.n > 0 { sub = sub + " \u{b7} " + (*d).ago } else { sub = (*d).ago } }
+    put_text(c, sub, tx, y0 + 24.0 * u, tw, 14.0 * u, COL_DIM, style.ALIGN_LEFT, 11, 400 as u32)
+    row_line(c, i, x, y0, w, 48.0 * u)
+}
+
+// the text cut into two lines at the last space that fits
+fn put_two_lines(c: *mut render.Ctx, s: str, x: f64, y: f64, w: f64, lh: f64, rgb: u32, px: usize) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let sz: f64 = render.text_len_of(c, px)
+    var cut: usize = painter.text_fits_upto(z, s.p as u64, s.n, sz, w)
+    if cut >= s.n {
+        put_text(c, s, x, y, w, lh, rgb, style.ALIGN_LEFT, px, 400 as u32)
+        return
+    }
+    var sp: usize = cut
+    while sp > 0 && *((s.p as u64 + sp as u64 - 1 as u64) as *mut u8) != 32 as u8 { sp = sp - 1 }
+    if sp == 0 { sp = cut }
+    let a: str = str { p: s.p, n: sp }
+    let b: str = str { p: (s.p as u64 + sp as u64) as *mut u8, n: s.n - sp }
+    var bs: str = b
+    while bs.n > 0 && *(bs.p as *mut u8) == 32 as u8 { bs = str { p: (bs.p as u64 + 1 as u64) as *mut u8, n: bs.n - 1 } }
+    put_text(c, a, x, y, w, lh, rgb, style.ALIGN_LEFT, px, 400 as u32)
+    put_text(c, bs, x, y + lh, w, lh, rgb, style.ALIGN_LEFT, px, 400 as u32)
+}
+
+fn draw_mem(c: *mut render.Ctx, i: usize, x: f64, y0: f64, w: f64) {
+    let u: f64 = unit_of(c)
+    let k: usize = G_BA[i] as usize
+    if k >= vec_len[jarvisapi.KnowRow](&(*cen()).know) { return }
+    let kr: *mut jarvisapi.KnowRow = vec_elem_ptr[jarvisapi.KnowRow](&(*cen()).know, k)
+    let ms: i64 = iso_ms((*kr).at)
+    var lab: str = "\u{25c8}"
+    if ms > 0 { lab = lab + " " + jtexts.t1("cc.mem-ago", "value", ago_text(ms)) }
+    put_text(c, lab, x + 13.0 * u, y0 + 6.0 * u, w - 26.0 * u, 13.0 * u, COL_ACCENT2, style.ALIGN_LEFT, 10, 600 as u32)
+    put_two_lines(c, (*kr).text, x + 13.0 * u, y0 + 20.0 * u, w - 26.0 * u, 17.0 * u, COL_DIM, 11)
+    row_line(c, i, x, y0, w, 60.0 * u)
+}
+
+fn draw_act(c: *mut render.Ctx, i: usize, x: f64, y0: f64, w: f64) {
+    let u: f64 = unit_of(c)
+    let k: usize = G_BA[i] as usize
+    if k >= vec_len[jarvisapi.ActRow](&(*cen()).activity) { return }
+    let a: *mut jarvisapi.ActRow = vec_elem_ptr[jarvisapi.ActRow](&(*cen()).activity, k)
+    var ms: i64 = (*a).at_n
+    if ms <= 0 { ms = iso_ms((*a).at) }
+    var ts: str = ""
+    if ms > 0 { ts = hhmm(ms) }
+    var who: str = (*a).role
+    if who.n == 0 { who = "sys" }
+    if who.n > 4 { who = str { p: who.p, n: 4 } }
+    var up: str = ""
+    var q: usize = 0
+    rt.buf_clear(&G_TMP)
+    while q < who.n {
+        var ch: u8 = *((who.p as u64 + q as u64) as *mut u8)
+        if ch >= 97 as u8 && ch <= 122 as u8 { ch = ch - 32 as u8 }
+        var cb: [u8; 1] = [0; 1]
+        cb[0] = ch
+        rt.buf_push_bytes(&G_TMP, (&cb[0]) as u64, 1)
+        q = q + 1
+    }
+    up = str { p: G_TMP.ptr as *mut u8, n: G_TMP.len }
+    var wc: u32 = COL_DIM
+    if (*a).role == "user" { wc = COL_ACCENT2 }
+    if (*a).role == "assistant" { wc = COL_OK }
+    let cx: f64 = x + 13.0 * u
+    put_text(c, ts, cx, y0, 36.0 * u, 24.0 * u, COL_FAINT, style.ALIGN_LEFT, 11, 400 as u32)
+    put_text(c, up, cx + 38.0 * u, y0, 34.0 * u, 24.0 * u, wc, style.ALIGN_LEFT, 9, 700 as u32)
+    var conv: str = (*a).conv
+    if conv.n > 14 { conv = str { p: conv.p, n: 14 } }
+    let cvw: f64 = text_w(c, conv, 11)
+    put_text(c, conv, cx + 74.0 * u, y0, cvw + 2.0 * u, 24.0 * u, COL_DIM, style.ALIGN_LEFT, 11, 400 as u32)
+    let tx: f64 = cx + 74.0 * u + cvw + 8.0 * u
+    put_text(c, (*a).text, tx, y0, x + w - 13.0 * u - tx, 24.0 * u, COL_TXT, style.ALIGN_LEFT, 11, 400 as u32)
+    row_line(c, i, x, y0, w, 24.0 * u)
+}
+
+fn draw_empty(c: *mut render.Ctx, i: usize, x: f64, y0: f64, w: f64) {
+    let u: f64 = unit_of(c)
+    var s: str = jtexts.t("cc.no-tasks")
+    if G_BA[i] == C_DEV { s = jtexts.t("cc.no-devices") }
+    else if G_BA[i] == C_MEM { s = jtexts.t("cc.no-memory") }
+    else if G_BA[i] == C_ACT { s = jtexts.t("cc.no-activity") }
+    put_text(c, s, x, y0, w, 36.0 * u, COL_FAINT, style.ALIGN_CENTER, 12, 400 as u32)
+}
+
+// the custom-row hook of vlistview: paints stripe `ix` into the box (x, y, w, h)
+fn z_hook(c: *mut render.Ctx, k: u32, ix: i64, x: f64, y: f64, w0: f64, h: f64) {
+    if ix < 0 || ix as usize >= G_N { return }
+    let i: usize = ix as usize
+    G_Y0 = y
+    G_Y1 = y + h
+    let w: f64 = w0
+    let cv: *mut canvas.Canvas = painter.painter_canvas(render.ctx_painter(c))
+    if !canvas.clip_push_rect(cv, x, y, x + w, y + h) { return }
+    card_shell(c, i, x, y, w, h)
+    let y0: f64 = y - (G_BJ[i] as f64) * h
+    let kind: u32 = G_BK[i]
+    if kind == B_HEAD { draw_head(c, x, y0, w) }
+    else if kind == B_CH { draw_ch(c, i, x, y0, w) }
+    else if kind == B_SYS { draw_sys(c, i, x, y0, w) }
+    else if kind == B_TASK { draw_task(c, i, x, y0, w) }
+    else if kind == B_DEV { draw_dev(c, i, x, y0, w) }
+    else if kind == B_MEM { draw_mem(c, i, x, y0, w) }
+    else if kind == B_ACT { draw_act(c, i, x, y0, w) }
+    else if kind == B_EMPTY { draw_empty(c, i, x, y0, w) }
+    canvas.clip_pop(cv)
+}

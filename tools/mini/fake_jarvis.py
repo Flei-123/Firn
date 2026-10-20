@@ -544,6 +544,27 @@ def rest(method, rawpath, hdr, body):
                     n["done"] = True; n["answer"] = j.get("answer", "")
             return out(200, {"project": pfull(p)})
         return out(404, {"error": "Unknown"})
+    if path == "/api/command-center" and os.environ.get("FAKE_CC") == "1":  # a64 fixture of the web command centre (rate, deviceInfo, knowledge, tasks with category)
+        iso = lambda ago: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - ago))
+        return out(200, {"now": int(time.time() * 1000), "user": "justin",
+            "workers": [{"id": "c1", "title": "worker one", "running": True, "updatedAt": 1760000000001, "last": "doing", "partial": "par"}],
+            "orchestrator": {"id": "o1", "title": "Leitstand", "running": False, "updatedAt": 5}, "otherChatCount": 7,
+            "devices": ["Dell", "Phone"],
+            "deviceInfo": [{"name": "Dell", "type": "OrientOS", "online": True, "lastSeen": iso(30)},
+                           {"name": "Xiaomi", "type": "Android", "online": False, "lastSeen": iso(7200)}],
+            "tasks": [{"id": "t1", "text": "Pull the a64 branches and check the Xiaomi build", "due": iso(-3600), "category": "Projekt", "repeat": None, "overdue": False},
+                      {"id": "t2", "text": "Buy milk and a very long second part that has to be cut at the card edge", "due": iso(3600), "category": None, "repeat": "weekly", "overdue": True},
+                      {"id": "t3", "text": "Call Papa", "due": None, "category": "Privat", "repeat": None, "overdue": False}],
+            "sys": {"cpus": 4, "load": [1.37, 0.9, 0.5], "uptime": 3 * 86400 + 5 * 3600, "memTotal": 16000000000, "memFree": 3000000000,
+                    "disk": {"total": 500000000000, "free": 60000000000}, "host": "jarvis-srv"},
+            "rate": {"fiveHour": {"util": 6}, "sevenDay": {"util": 85}},
+            "memory": {"count": 3281, "knowledge": [
+                {"at": iso(600), "text": "Firn Beat Kotlin F: main e396c4988 = a64 Crossing-Analyse (caller-saved x2-x8 are not kept over a call)"},
+                {"at": iso(5400), "text": "OrientOS w-bench: Limine timeout 5 s"},
+                {"at": iso(90000), "text": "Short note"}]},
+            "activity": [{"cid": "c1", "conv": "worker one", "kind": "chat", "role": "assistant", "at": iso(120), "text": "Build finished, APK 0.2.46 checked on the phone"},
+                         {"cid": "c1", "conv": "Leitstand", "kind": "chat", "role": "user", "at": iso(400), "text": "next step?"},
+                         {"cid": "c2", "conv": "sys", "kind": "chat", "role": "system", "at": iso(900), "text": "worker started"}]})
     if path == "/api/command-center":
         return out(200, {"now": 1760000000000, "user": "justin",
             "workers": [{"id": "c1", "title": "worker one", "running": True, "updatedAt": 1760000000001, "last": "doing", "partial": "par"}],
