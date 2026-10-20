@@ -178,6 +178,8 @@ fn mdv() -> *mut markdownview.MdView { return G_MD as *mut markdownview.MdView }
 static mut G_DR_CID: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the chat the composer text belongs to
 static mut G_DR_SEEN: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the text last written / read
 static mut G_DR_INIT: bool = false
+static mut G_DR_HINT_P: u64 = 0 // the placeholder text of the composer (permanent copy, never a draft)
+static mut G_DR_HINT_N: usize = 0
 static mut G_DR_CHG_MS: i64 = 0
 static mut G_DR_SENT_NEW: bool = false // a message went out of a chat without id: its id arrives soon, the text typed meanwhile is for that chat
 
@@ -221,7 +223,22 @@ fn dr_path(cid: str) -> str {
     return dir + "/" + nm + ".txt"
 }
 
+// a65 guard: a draft file only holds text the user typed. Empty -> removed; text that is not valid UTF-8 / has control bytes (a stray
+// buffer) or is the placeholder itself is never written.
+fn dr_text_ok(t: str) -> bool {
+    var i: usize = 0
+    while i < t.n {
+        let ch: u8 = *((t.p as u64 + i as u64) as *mut u8)
+        if ch < 32 as u8 && ch != 10 as u8 && ch != 9 as u8 && ch != 13 as u8 { return false }
+        if ch == 127 as u8 || ch == 255 as u8 || ch == 192 as u8 || ch == 193 as u8 { return false }
+        i = i + 1
+    }
+    if t.n > 0 && t.n == G_DR_HINT_N && rt.mem_eq(G_DR_HINT_P, t.p as u64, t.n) { return false }
+    return true
+}
+
 fn dr_put(cid: str, t: str) {
+    if t.n > 0 && !dr_text_ok(t) { return }
     let path: str = dr_path(cid)
     if path.n == 0 { return }
     if t.n == 0 {
@@ -271,7 +288,7 @@ fn draft_tick(a: *mut app.App) {
             return
         }
         G_DR_SENT_NEW = false
-        dr_put(old, cur)
+        if !buf_eq(&G_DR_SEEN, cur) { dr_put(old, cur) } // unchanged = already on disk (or never typed)
         dr_show(a, dr_get(cid))
         return
     }
@@ -291,11 +308,25 @@ fn draft_tick(a: *mut app.App) {
     }
 }
 
+// a65: a chat switch (drawer, new chat, notification) calls chat_clear, which empties the composer BEFORE draft_tick sees the new chat id:
+// the typed text of the old chat was lost (and its file removed). Save it first; the composer is then empty on purpose (SEEN = "").
+fn draft_stash(a: *mut app.App) {
+    if G_IN == 0 || !G_DR_INIT { return }
+    if buf_eq(&G_DR_CID, jarvisc.jc_cid(jshell.jc())) { return } // same chat: nothing to keep apart
+    let cur: str = app.text(a, G_IN)
+    if !buf_eq(&G_DR_SEEN, cur) { // typed since the last read / write; else it is on disk already
+        dr_put(__str_copy(str { p: G_DR_CID.ptr as *mut u8, n: G_DR_CID.len }), cur)
+    }
+    rt.buf_clear(&G_DR_SEEN) // the composer is emptied right after this: draft_tick must not take that for an edit
+    G_DR_CHG_MS = 0
+}
+
 // the app goes to the background (main.fi watch_front): write the text now, the process may be killed
 fn screen_chat_draft_flush() {
     if G_IN == 0 || !G_DR_INIT { return }
     let a: *mut app.App = jshell.app_ui()
     let cur: str = app.text(a, G_IN)
+    if buf_eq(&G_DR_SEEN, cur) { return } // nothing typed since the last read / write
     dr_put(__str_copy(str { p: G_DR_CID.ptr as *mut u8, n: G_DR_CID.len }), cur)
     buf_set(&G_DR_SEEN, cur)
     G_DR_CHG_MS = 0
@@ -703,6 +734,7 @@ fn clear_composer(a: *mut app.App) {
 }
 
 fn chat_clear() {
+    draft_stash(jshell.app_ui())
     clear_composer(jshell.app_ui())
     if G_EDIT_END > 0 {
         G_EDIT_END = 0
@@ -2416,7 +2448,10 @@ fn screen_chat_build(a: *mut app.App) {
     jshell.fill_stretch(a, comp)
     G_COMP = comp
     jtheme.style_node(a, comp, jtheme.K_COMPOSER)
-    G_IN = app.textarea_auto(a, jtexts.tp("chat.message"), 1, 5) // one row when empty, grows to 5, then scrolls (web #input)
+    let ph: str = jtexts.tp("chat.message")
+    G_DR_HINT_P = rt.heap_alloc(ph.n)
+    if G_DR_HINT_P != 0 { rt.mem_copy(G_DR_HINT_P, ph.p as u64, ph.n); G_DR_HINT_N = ph.n }
+    G_IN = app.textarea_auto(a, ph, 1, 5) // one row when empty, grows to 5, then scrolls (web #input)
     jtheme.style_node(a, G_IN, jtheme.K_FIELD)
     app.area_set_metrics(a, G_IN, 24, 14) // web #input: 16 px / 24 px rows, padding 14.4
     jshell.fill_stretch(a, G_IN)
