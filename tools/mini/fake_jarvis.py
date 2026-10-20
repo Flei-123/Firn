@@ -79,11 +79,13 @@ MODELS = ["opus", "sonnet", "haiku", "fable", "hy3", "glm"]
 ENABLED = ["sonnet", "haiku", "opus"]
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 MODEL_LABELS = {"sonnet": "Claude Sonnet 5.5", "haiku": "Claude Haiku 5", "opus": "Claude Opus 5.5"}
-MODEL_STATE = {"model": "sonnet", "effort": "medium"}
+MODEL_STATE = {"model": "sonnet", "effort": "medium", "thinking": False}
+THINK_MODELS = ["sonnet", "opus"]  # haiku cannot think (the app greys the switch out)
+THINK_LOG = []  # every /thinking command and POST thinking value, newest last (tests read it)
 
 
 def model_current():
-    return {"model": MODEL_STATE["model"], "effort": MODEL_STATE["effort"], "thinking": False, "label": MODEL_LABELS[MODEL_STATE["model"]], "provider": "claude"}
+    return {"model": MODEL_STATE["model"], "effort": MODEL_STATE["effort"], "thinking": MODEL_STATE["thinking"], "label": MODEL_LABELS[MODEL_STATE["model"]], "provider": "claude"}
 SNIPPETS = [
     "Wird erledigt, Boss. Größe: 42 MB, Übergabe über Straße: ä ö ü Ä Ö Ü ß €.\n",
     "```js\nconst a = { \"k\": [1, 2, 3], 'q': `tpl ${x}` }; // \\ backslash \\\\ double\n```\n",
@@ -457,7 +459,7 @@ def rest(method, rawpath, hdr, body):
             return out(200, {"provider": "claude", "name": "Claude", "p5": 37, "p7": 64, "reset5": None, "reset7": None, "providers": {}})
         if mp.startswith("models") and method == "GET":  # FAKE_NO_USAGE: an older server; FAKE_NO_MODELS=1: 503 only for the list
             if os.environ.get("FAKE_NO_USAGE") or os.environ.get("FAKE_NO_MODELS"): return out(503, {"error": "no models"})
-            return out(200, {"models": [{"alias": a, "label": MODEL_LABELS[a], "blurb": "", "provider": "claude", "effort": a != "haiku", "thinking": True, "vision": True} for a in ENABLED],
+            return out(200, {"models": [{"alias": a, "label": MODEL_LABELS[a], "blurb": "", "provider": "claude", "effort": a != "haiku", "thinking": a in THINK_MODELS, "vision": True} for a in ENABLED],
                              "efforts": EFFORTS, "current": model_current(), "chat": None})
         # /api/m/me + /api/m/admin/*: FAKE_ROLE=user -> admin false and every admin route 403 (like the real server); FAKE_NO_ADMIN=1: older server (404)
         if mp == "me" and method == "GET":
@@ -488,6 +490,8 @@ def rest(method, rawpath, hdr, body):
             if j.get("effort") is not None:
                 if j["effort"] not in EFFORTS: return out(400, {"error": "Effort unbekannt"})
                 MODEL_STATE["effort"] = j["effort"]
+            if isinstance(j.get("thinking"), bool):
+                MODEL_STATE["thinking"] = j["thinking"]; THINK_LOG.append("post:" + str(j["thinking"]))
             return out(200, {"ok": True, "current": model_current()})
         if mp == "projects" and method == "GET":
             return out(200, {"projects": [psummary(p) for p in PROJECTS.values()]})
@@ -828,6 +832,13 @@ async def handler(ws):
         if t == "message":
             text = m["text"]
             cid = m.get("cid")
+            if text.startswith("/thinking"):  # the web switch sends "/thinking on|off"
+                a = text[9:].strip()
+                MODEL_STATE["thinking"] = a in ("on", "an", "1", "true") if a else not MODEL_STATE["thinking"]
+                THINK_LOG.append("ws:" + text)
+                print("THINK", text, flush=True)
+                await send(ws, {"type": "system", "content": "ok " + text, "thinking": MODEL_STATE["thinking"]})
+                continue
             if text.startswith("/model ") or text.startswith("/effort "):  # slash commands: stored like the web ones, no chat turn
                 cmd, arg = text.split(" ", 1)
                 if cmd == "/model" and arg.strip() in ENABLED: MODEL_STATE["model"] = arg.strip()
@@ -880,6 +891,10 @@ async def handler(ws):
                 await send(ws, {"type": "token", "cid": cid, "content": "Pic rel:\n\n![rel](/img/u1/%s/rel.png)\n\n" % cid})
                 await send(ws, {"type": "token", "cid": cid, "content": "Pic abs:\n\n![abs](http://127.0.0.1:%d/img/u1/%s/abs.png)\n\n" % (HTTPPORT, cid)})
                 await send(ws, {"type": "token", "cid": cid, "content": "Pic dl:\n\n![dl](/dl/u1/x/dl.png)\n\nEnd.\n>STATUS: status=done"})
+            elif text == "imgfile":  # a66: the assistant delivers an image file (type "file", mime image/png): shown inline + as a file card
+                await send(ws, {"type": "token", "cid": cid, "content": "Here is the picture:"})
+                await send(ws, {"type": "file", "cid": cid, "name": "chart.png", "url": "/dl/u1/%s/chart.png" % cid, "mime": "image/png"})
+                await send(ws, {"type": "token", "cid": cid, "content": "\n\nDone.\n>STATUS: status=done"})
             elif text == "file":
                 FILES["report.txt"] = b"hello report from the fake server\n"
                 await send(ws, {"type": "token", "cid": cid, "content": "Here is the file."})
