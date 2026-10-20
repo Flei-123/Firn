@@ -101,7 +101,7 @@ export {
     AClient, Request,
     AE_TIMEOUT, AE_CANCELLED,
     aclient_new, aclient_init, aclient_free, aclient_http,
-    aclient_request, aclient_get, aclient_get_str, aclient_post,
+    aclient_request, aclient_request_inm, aclient_get, aclient_get_inm, aclient_get_str, aclient_post,
     areq_error, areq_tls_error, areq_tls_verify, areq_layer, areq_layer_name,
     NL_NONE, NL_URL, NL_DNS, NL_TCP, NL_TLS_NOROOTS, NL_TLS_CERT, NL_TLS_OTHER,
     NL_TIMEOUT, NL_CLOSED, NL_CANCELLED, NL_OTHER,
@@ -193,6 +193,7 @@ struct Request {
     reused: bool, // this request runs on a parked connection
     nopool: bool, // do not take a parked connection (the retry after a dead one)
     in0: u64, // stream octets-in when the parked connection was taken
+    inm: rt.Buf, // If-None-Match value to send (conditional GET), empty = none
 }
 
 // `size_of` needs a generic parameter outside the root file (see stream.fi).
@@ -337,6 +338,12 @@ fn aclient_get(a: *mut AClient, u: u64, n: usize, timeout_ms: i64,
     return aclient_request(a, "GET".p as u64, 3, u, n, 0 as u64, 0, 0 as u64, 0, timeout_ms, cb, ud)
 }
 
+// A conditional GET: `inm` (n octets, 0 = none) is sent as `If-None-Match`; a 304 answer has no body (areq_status == 304).
+fn aclient_get_inm(a: *mut AClient, u: u64, n: usize, timeout_ms: i64, inm: u64, ninm: usize,
+    cb: fn(*mut Request, u64), ud: u64) -> *mut Request {
+    return aclient_request_inm(a, "GET".p as u64, 3, u, n, 0 as u64, 0, 0 as u64, 0, timeout_ms, inm, ninm, cb, ud)
+}
+
 fn aclient_post(a: *mut AClient, u: u64, n: usize, body: u64, nb: usize,
     ctype: u64, nct: usize, timeout_ms: i64,
     cb: fn(*mut Request, u64), ud: u64) -> *mut Request {
@@ -350,6 +357,13 @@ fn aclient_post(a: *mut AClient, u: u64, n: usize, body: u64, nb: usize,
 // call). Returns 0 only when there is no memory for the request itself.
 fn aclient_request(a: *mut AClient, method: u64, nm: usize, u: u64, n: usize,
     body: u64, nb: usize, ctype: u64, nct: usize, timeout_ms: i64,
+    cb: fn(*mut Request, u64), ud: u64) -> *mut Request {
+    return aclient_request_inm(a, method, nm, u, n, body, nb, ctype, nct, timeout_ms, 0 as u64, 0, cb, ud)
+}
+
+// aclient_request plus an `If-None-Match` value (ninm == 0 = none).
+fn aclient_request_inm(a: *mut AClient, method: u64, nm: usize, u: u64, n: usize,
+    body: u64, nb: usize, ctype: u64, nct: usize, timeout_ms: i64, inm: u64, ninm: usize,
     cb: fn(*mut Request, u64), ud: u64) -> *mut Request {
     let p: u64 = ah_obj_alloc[Request]()
     if p == 0 {
@@ -365,10 +379,11 @@ fn aclient_request(a: *mut AClient, method: u64, nm: usize, u: u64, n: usize,
         is_tls_done: false, gone: false, defer_pending: false, busy: 0,
         dq: 0 as *mut adns.AQuery, sink_fd: 0 - 1, sink_got: 0, sink_failed: false,
         sink_sha: sha256.sha256_new(), sink_cb: sink_none, sink_ud: 0,
-        keepable: false, reused: false, nopool: false, in0: 0 }
+        keepable: false, reused: false, nopool: false, in0: 0, inm: rt.buf_new() }
     rt.buf_push_bytes(&(*rq).meth, method, nm)
     rt.buf_push_bytes(&(*rq).body, body, nb)
     rt.buf_push_bytes(&(*rq).ctype, ctype, nct)
+    rt.buf_push_bytes(&(*rq).inm, inm, ninm)
     (*a).active = (*a).active + 1
     if !url.url_parse(u, n, &(*rq).cur) {
         (*rq).err = 1
@@ -724,7 +739,7 @@ fn send_request(rq: *mut Request, s: *mut stream.Stream) {
     var req: rt.Buf = rt.buf_new()
     http.build_request(&(*a).c, &(*rq).cur, (*rq).meth.ptr, (*rq).meth.len,
         (*rq).body.ptr, (*rq).body.len, (*rq).ctype.ptr, (*rq).ctype.len,
-        0 as u64, 0, 0 as u64, 0, &req)
+        (*rq).inm.ptr, (*rq).inm.len, 0 as u64, 0, &req)
     let ok: bool = stream.stream_write(s, req.ptr, req.len)
     rt.buf_free(&req)
     if !ok {
@@ -1371,6 +1386,7 @@ fn release(rq: *mut Request) {
     rt.buf_free(&(*rq).body)
     rt.buf_free(&(*rq).ctype)
     rt.buf_free(&(*rq).chain)
+    rt.buf_free(&(*rq).inm)
     http.resp_free(&(*rq).r)
     ah_obj_free[Request](rq as u64)
 }
