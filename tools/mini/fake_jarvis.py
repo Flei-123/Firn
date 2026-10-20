@@ -242,6 +242,17 @@ def reply(status, obj, extra=None):
         h[k] = v
     return Response(status, HTTPStatus(status).phrase, h, body)
 
+def a64_fixture():
+    # same text as tmp/a64/layout/fixture.md (the web render is made from it)
+    md = open(os.environ.get("FAKE_A64_MD", os.path.join(os.path.dirname(os.path.abspath(__file__)), "a64_fixture.md")), encoding="utf-8").read()
+    now = int(time.time() * 1000)
+    return [
+        {"role": "user", "text": "Zeig mir bitte den Status und pr\u00fcfe `check` noch einmal.", "at": now - 60000},
+        {"role": "assistant", "text": md, "genMs": 17000, "at": now - 20000},
+        {"role": "sys", "text": "\u2705 Worker fertig \u2014 \u201eGer\u00e4te-Status Check\u201c (Chat c_lfh_znA5mgLN): **N-WORT** \u2013 verbunden. Sonst keine Ger\u00e4te online, Boss.", "at": now - 10000},
+    ]
+
+
 async def process_request(conn, request):
     u = urlparse(request.path)
     if u.path.startswith("/api/conversations/"):
@@ -249,6 +260,8 @@ async def process_request(conn, request):
             return reply(401, {"error": "Not logged in"})
         cid = unquote(u.path[len("/api/conversations/"):])
         LOG.write(json.dumps({"type": "rest", "method": "GET", "path": u.path, "auth": True}) + "\n"); LOG.flush()
+        if cid not in CONV and os.environ.get("FAKE_A64") == "1":  # a64: the layout fixture of the web comparison (user bubble, markdown answer with meta line, worker note)
+            CONV[cid] = a64_fixture()
         if cid not in CONV and os.environ.get("FAKE_HIST") == "1":
             CONV[cid] = gen_messages(cid)
             for _m in CONV[cid]: _m["text"] = _m["text"].replace("\x02", "")  # jsteps.fi panics on a stray \x02 (open point), not the subject here
@@ -256,9 +269,25 @@ async def process_request(conn, request):
                 CONV[cid] = [{"role": "user", "text": "show pics", "at": 1760000000000},
                              {"role": "assistant", "text": "md:\n\n![md-hist](/img/u1/%s/md.png)\n\nabs:\n\n![md-abs](http://127.0.0.1:%d/img/u1/%s/abs.png)\n\ndl alias:\n\n![alias](/downloads/u1/x/dl.png)\n" % (cid, HTTPPORT, cid), "images": [{"url": "/img/u1/%s/pic.png" % cid}], "at": 1760000001000}]
             # a59: any chat id of the sidebar has a history (picture in message 3, markdown pictures in 7)
+        if cid not in CONV and os.environ.get("FAKE_PAGING") == "1":
+            # a64: 400 messages (200 turns) for pagination; the window rules of server lib/conversations.js full(): ?turns=n / ?before=<idx>&turns=n
+            CONV[cid] = []
+            for _i in range(200):
+                CONV[cid].append({"role": "user", "text": "question %d" % _i, "at": 1760000000000 + _i * 60000})
+                CONV[cid].append({"role": "assistant", "text": "answer %d: " % _i + "lorem ipsum dolor sit amet " * (3 + _i % 5), "at": 1760000030000 + _i * 60000, "genMs": 30000})
         if cid not in CONV:
             return reply(404, {"error": "Not found"})
-        return reply(200, {"conversation": {"messages": CONV[cid]}, "running": False, "partial": ""})
+        msgs = CONV[cid]
+        q = dict(x.split("=", 1) for x in u.query.split("&") if "=" in x)
+        if os.environ.get("FAKE_PAGING") == "1" and ("turns" in q or "before" in q):
+            end = min(int(q["before"]), len(msgs)) if "before" in q else len(msgs)
+            n = int(q.get("turns", "5")); start = end; c = 0
+            while start > 0 and c < n:
+                start -= 1
+                if msgs[start]["role"] == "user": c += 1
+            LOG.write(json.dumps({"type": "page", "before": q.get("before"), "turns": n, "from": start, "to": end}) + "\n"); LOG.flush()
+            return reply(200, {"conversation": {"messages": msgs[start:end] if "before" in q else msgs[start:], "from": start, "total": len(msgs)}, "running": False, "partial": ""})
+        return reply(200, {"conversation": {"messages": msgs}, "running": False, "partial": ""})
     if u.path == "/":
         if "websocket" not in request.headers.get("Upgrade", "").lower():
             return reply(404, {"error": "no"})
