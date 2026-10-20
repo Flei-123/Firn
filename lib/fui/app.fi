@@ -122,12 +122,12 @@ export {
     set_ctl, set_ctl_edit, node_new, app_ctx, ctl_ready, ctl_data,
     // r631: the virtual list (lib/fui/vlist.fi + vlistview.fi) as a node of the window
     vlist_new, vlist_set_count, vlist_changed, vlist_model, vlist_selected, vlist_select,
-    vlist_set_row_pt, vlist_on_pick, vlist_on_activate, vlist_on_long, vlist_on_sort, vlist_moving,
+    vlist_set_row_pt, vlist_on_pick, vlist_on_activate, vlist_on_long, vlist_on_sort, vlist_moving, set_extra_wake, extra_wake_tick, extra_wake_wait,
     VL_MAX,
     NONE,
     // the side a host and the tests see (lib/@*/fui/apphost.fi,
     // tools/fui/app_main.fi)
-    refresh_hz, frame_wait_ms, frame_stats_on, frame_stats_reset, frame_stat, frame_phase, FS_FRAMES, FS_AVG_US, FS_MAX_US, FS_SLOW, FS_IV_P95_US, FS_IV_MAX_US,
+    refresh_hz, fit_stat, frame_wait_ms, frame_stats_on, frame_stats_reset, frame_stat, frame_phase, FS_FRAMES, FS_AVG_US, FS_MAX_US, FS_SLOW, FS_IV_P95_US, FS_IV_MAX_US,
     app_paint, app_attach, app_key, app_char, app_press, app_act,
     app_done, app_host, app_theme, app_entry_box, app_entry_buf, app_scene, app_reduced_motion,
     app_hook,
@@ -303,6 +303,10 @@ struct App {
     // r631: the virtual lists
     vl: [VlSlot; 8],
     vl_n: usize,
+    // a63: an extra program timer (a view that scrolls/animates by itself, e.g. the chat's markdown view): tick(ud, now) = paint again, wait(ud, now) = ms to the next tick (-1: none)
+    xw_ud: u64,
+    xw_tick: fn(u64, i64) -> bool,
+    xw_wait: fn(u64, i64) -> i64,
     last_act: usize,
 }
 
@@ -454,7 +458,7 @@ fn app_blank() -> App {
         wh_on: false, wh_f: wh_none, mo_on: false, mo_f: mo_none,
         ctl_on: false, ctl_ud: 0, ctl_key: kh_key_none, ctl_chr: kh_key_none, ctl_ptr: mo_none_b,
         ctl_act: ctl_act_none, ctl_paint: ctl_paint_none, ctl_edit: ctl_edit_none,
-        vl: [vslot_blank(); 8], vl_n: 0, last_act: NONE }
+        vl: [vslot_blank(); 8], vl_n: 0, xw_ud: 0, xw_tick: xw_tick_none, xw_wait: xw_wait_none, last_act: NONE }
 }
 
 // ============================================================ ACTIONS AND CONTEXT MENUS (r161)
@@ -1465,9 +1469,36 @@ fn vlist_moving(a: *mut App) -> bool {
     return false
 }
 
+fn xw_tick_none(ud: u64, now: i64) -> bool { return false }
+fn xw_wait_none(ud: u64, now: i64) -> i64 { return 0 - 1 }
+
+// a63: register the extra timer (call once, after the window exists). The window repaints when `tick` says so and wakes
+// every `wait` ms; this is what runs a fling / animated pictures of a view that is no virtual list.
+fn set_extra_wake(a: *mut App, ud: u64, tick: fn(u64, i64) -> bool, wait: fn(u64, i64) -> i64) {
+    (*a).xw_ud = ud
+    (*a).xw_tick = tick
+    (*a).xw_wait = wait
+    fuiwirt.host_set_wake(&(*a).w, a as u64, vl_wake_tick, vl_wake_wait)
+}
+
+// the extra timer: true = paint again
+fn extra_wake_tick(a: *mut App, now: i64) -> bool {
+    let f: fn(u64, i64) -> bool = (*a).xw_tick
+    return f((*a).xw_ud, now)
+}
+
+// the extra timer: ms to the next tick (-1: none)
+fn extra_wake_wait(a: *mut App, now: i64) -> i64 {
+    let f: fn(u64, i64) -> i64 = (*a).xw_wait
+    return f((*a).xw_ud, now)
+}
+
 // the program timer of the window (fuiwirt.host_set_wake); appctl takes it over and calls vlist_moving itself
 fn vl_wake_tick(ud: u64, now: i64) -> bool {
-    return vlist_moving(ud as *mut App)
+    let a: *mut App = ud as *mut App
+    var r: bool = vlist_moving(a)
+    if extra_wake_tick(a, now) { r = true }
+    return r
 }
 
 // a48: a running list ticks at half a display frame (4 ms at 120 Hz), not a fixed 16 ms (that capped a 120 Hz screen at ~62 fps)
@@ -1480,10 +1511,12 @@ fn frame_wait_ms(a: *mut App) -> i64 {
 }
 
 fn vl_wake_wait(ud: u64, now: i64) -> i64 {
-    if vlist_moving(ud as *mut App) {
-        return frame_wait_ms(ud as *mut App)
-    }
-    return 0 - 1
+    let a: *mut App = ud as *mut App
+    var w: i64 = 0 - 1
+    if vlist_moving(a) { w = frame_wait_ms(a) }
+    let x: i64 = extra_wake_wait(a, now)
+    if x >= 0 && (w < 0 || x < w) { w = x }
+    return w
 }
 
 // A virtual list of `w` x `h` design points in the current container with `n` rows. `src(ud, i, &row)`
@@ -2824,7 +2857,39 @@ fn count_lines(z: *mut painter.Painter, r: *mut painter.TextRun, p: u64,
 // node that measures wider than the window's inner width gets that width
 // and as many lines as run_line_upto says it needs (at most 8), and gives
 // both back when it fits again.
+// a63: FIT CACHE. fit_labels (style + measure of the whole scene + a line count per wide label) cost 6-14 ms per frame on the phone, also when the
+// frame only scrolled a view. Its result (label sizes + wrap flags) depends on the node tree / texts (scene epoch), the width and the text scale only.
+// Same inputs as at the end of the last run = skip it: the labels keep their sizes, the caller styles as usual (return false).
+static mut FIT_EPOCH: u64 = 0
+static mut FIT_W: usize = 0
+static mut FIT_SCALE: usize = 0
+static mut FIT_VALID: bool = false
+static mut FIT_RUNS: i64 = 0
+static mut FIT_HITS: i64 = 0
+
+// FIT_RUNS (0) / FIT_HITS (1): how often fit_labels ran / was skipped (since start)
+fn fit_stat(k: usize) -> i64 {
+    if k == 0 { return FIT_RUNS }
+    return FIT_HITS
+}
+
 fn fit_labels(a: *mut App, w: usize) -> bool {
+    let sc0: *mut scene.Scene = &(*a).sc
+    let scl: usize = (theme.theme_scale(&(*a).m) as usize) + 100000 * (theme.theme_text_scale(&(*a).m) as usize)
+    if FIT_VALID && FIT_EPOCH == scene.scene_epoch() && FIT_W == w && FIT_SCALE == scl && scene.scene_count(sc0) > 0 {
+        FIT_HITS = FIT_HITS + 1
+        return false
+    }
+    FIT_RUNS = FIT_RUNS + 1
+    let r: bool = fit_labels_run(a, w)
+    FIT_EPOCH = scene.scene_epoch()
+    FIT_W = w
+    FIT_SCALE = scl
+    FIT_VALID = r
+    return r
+}
+
+fn fit_labels_run(a: *mut App, w: usize) -> bool {
     let sc: *mut scene.Scene = &(*a).sc
     let n: usize = scene.scene_count(sc)
     var i: usize = 0
