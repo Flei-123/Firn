@@ -45,6 +45,7 @@ LOG = open(sys.argv[1], "a", buffering=1)
 CONV = {}      # cid -> list of {role, text}
 seq = 0
 CONV["c1"] = [{"role": "user", "text": "hi", "at": "2026-10-17T18:00:00Z"}, {"role": "assistant", "text": "hello\n>STATUS: status=done", "at": "2026-10-17T18:00:05Z"}]
+if os.environ.get("FAKE_SYS") == "1": CONV["c1"].insert(1, {"role": "sys", "text": "Worker a64-layout3 gestartet - 3 Aufgaben offen (Umlaute: äöü)", "at": "2026-10-17T18:00:02Z"})
 
 CONV["c2"] = [{"role": "user", "text": "second question", "at": "2026-10-17T19:00:00Z"}, {"role": "assistant", "text": "second answer\n>STATUS: status=done", "at": "2026-10-17T19:00:05Z"}]
 if os.environ.get("FAKE_TOOLS") == "1":  # c1 history with tool steps (ok, failed, long output, no output stored)
