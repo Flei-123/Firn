@@ -139,7 +139,15 @@ def sidebar_chats():
     h = 3600000
     def row(i, t, ago, run=False, kind="chat", disp=False, parent=None, fav=False):
         return {"id": i, "title": t, "kind": kind, "updatedAt": now - ago, "running": run, "fav": fav, "parent": parent, "dispatched": disp}
-    return [row("o1", "Leitstand", 0, kind="orchestrator"),
+    extra = []
+    if os.environ.get("FAKE_WORKERS") == "1":
+        # a67: a Workers tab like the live one: a manager worker with sub-workers, workers dispatched from a normal chat (parent = chat in
+        # the OTHER tab), a plain worker; badge = 3 running
+        extra = [row("m1", "Server Manager", 500, True, "worker", True),
+                 row("m1a", "Server Manager: Backup", 1500, True, "worker", True, "m1"),
+                 row("m1b", "Server Manager: Updates", 2500, False, "worker", True, "m1"),
+                 row("m1c", "Server Manager: Logs", 2600, False, "worker", True, "m1b")]
+    return extra + [row("o1", "Leitstand", 0, kind="orchestrator"),
             row("s1", "Certus", 1000, True), row("s2", "OrientOS", 2000),
             row("s2a", "OrientOS: Treiber", 3000, True, "worker", True, "s2"), row("s2b", "OrientOS: Netz", 4000, False, "worker", True, "s2"),
             row("s2c", "OrientOS: Boot", 5000, False, "worker", True, "s2"),
