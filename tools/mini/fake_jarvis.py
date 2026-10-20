@@ -79,11 +79,13 @@ MODELS = ["opus", "sonnet", "haiku", "fable", "hy3", "glm"]
 ENABLED = ["sonnet", "haiku", "opus"]
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 MODEL_LABELS = {"sonnet": "Claude Sonnet 5.5", "haiku": "Claude Haiku 5", "opus": "Claude Opus 5.5"}
-MODEL_STATE = {"model": "sonnet", "effort": "medium"}
+MODEL_STATE = {"model": "sonnet", "effort": "medium", "thinking": False}
+THINK_MODELS = ["sonnet", "opus"]  # haiku cannot think (the app greys the switch out)
+THINK_LOG = []  # every /thinking command and POST thinking value, newest last (tests read it)
 
 
 def model_current():
-    return {"model": MODEL_STATE["model"], "effort": MODEL_STATE["effort"], "thinking": False, "label": MODEL_LABELS[MODEL_STATE["model"]], "provider": "claude"}
+    return {"model": MODEL_STATE["model"], "effort": MODEL_STATE["effort"], "thinking": MODEL_STATE["thinking"], "label": MODEL_LABELS[MODEL_STATE["model"]], "provider": "claude"}
 SNIPPETS = [
     "Wird erledigt, Boss. Größe: 42 MB, Übergabe über Straße: ä ö ü Ä Ö Ü ß €.\n",
     "```js\nconst a = { \"k\": [1, 2, 3], 'q': `tpl ${x}` }; // \\ backslash \\\\ double\n```\n",
@@ -396,6 +398,19 @@ def mem_route(method, q, b):
         return out(404, {"error": "Nicht gefunden"})
     return out(400, {"error": "Unbekannte Aktion"})
 
+ADM = {"users": [{"id": "u1", "username": "justin", "email": "justin@fleitec.com", "admin": True, "online": True, "hasPush": True},
+                 {"id": "u2", "username": "papa", "email": "info@fleitec.com", "admin": False, "online": False, "hasPush": True, "rights": {"projects": {"firn": "write"}}},
+                 {"id": "u3", "username": "gast", "email": "", "admin": False, "online": False, "hasPush": False}],
+       "inv": [{"code": "ABCD-1234", "note": "Volker", "createdBy": "justin", "createdAt": 1, "expiresAt": None, "usedBy": None, "usedByName": None, "revoked": False, "status": "offen"},
+               {"code": "WXYZ-9876", "note": "", "createdBy": "justin", "createdAt": 1, "expiresAt": None, "usedBy": "u3", "usedByName": "gast", "revoked": False, "status": "benutzt"}],
+       "dauer": False, "borrow": {},
+       "acc": [{"id": "a1", "label": "Konto 1", "mode": "login", "active": True, "disabled": False, "free": 60, "runs": 14, "rate": {"fiveHour": {"util": 30}, "sevenDay": {"util": 40}}},
+               {"id": "a2", "label": "Token 2", "mode": "token", "active": False, "disabled": True, "free": 100, "runs": 2, "rate": {}}],
+       "models": {"enabled": ["opus", "sonnet"], "defaultModel": "sonnet", "defaultEffort": "high"},
+       "prov": [{"provider": "openai", "label": "OpenAI", "set": True, "source": "config.json", "obscured": "sk-abc\u2026wxyz"}, {"provider": "openrouter", "label": "OpenRouter", "set": False, "source": "kein", "obscured": ""}],
+       "pve": [{"id": "k_1", "label": "Laptop", "active": True, "fp": "SHA256:abcdef", "type": "ssh-ed25519"}],
+       "prompt": "Verwende so wenig Worte wie moeglich.\nAntworte immer uebersichtlich."}
+
 def rest(method, rawpath, hdr, body):
     """-> (status, bytes, ctype) or None (not a REST route of the app client)."""
     global tseq
@@ -403,8 +418,8 @@ def rest(method, rawpath, hdr, body):
     path = u.path
     q = parse_qs(u.query)
     if not (path in ("/api/me", "/api/projects", "/api/command-center", "/api/conversations", "/api/tasks",
-                     "/api/remote/devices", "/api/settings", "/api/voices", "/tts", "/api/push-token", "/api/stt", "/api/m/upload", "/api/account/password")
-            or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
+                     "/api/remote/devices", "/api/settings", "/api/voices", "/tts", "/api/push-token", "/api/stt", "/api/m/upload", "/api/account/password", "/api/accounts")
+            or path.startswith("/api/admin/") or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
             or path.startswith("/vendor/fonts/") or path.startswith("/img/") or path.startswith("/dl/")):
         return None
     jtype = hdr.get("content-type")
@@ -445,7 +460,7 @@ def rest(method, rawpath, hdr, body):
             return out(200, {"provider": "claude", "name": "Claude", "p5": 37, "p7": 64, "reset5": None, "reset7": None, "providers": {}})
         if mp.startswith("models") and method == "GET":  # FAKE_NO_USAGE: an older server; FAKE_NO_MODELS=1: 503 only for the list
             if os.environ.get("FAKE_NO_USAGE") or os.environ.get("FAKE_NO_MODELS"): return out(503, {"error": "no models"})
-            return out(200, {"models": [{"alias": a, "label": MODEL_LABELS[a], "blurb": "", "provider": "claude", "effort": a != "haiku", "thinking": True, "vision": True} for a in ENABLED],
+            return out(200, {"models": [{"alias": a, "label": MODEL_LABELS[a], "blurb": "", "provider": "claude", "effort": a != "haiku", "thinking": a in THINK_MODELS, "vision": True} for a in ENABLED],
                              "efforts": EFFORTS, "current": model_current(), "chat": None})
         # /api/m/me + /api/m/admin/*: FAKE_ROLE=user -> admin false and every admin route 403 (like the real server); FAKE_NO_ADMIN=1: older server (404)
         if mp == "me" and method == "GET":
@@ -476,6 +491,8 @@ def rest(method, rawpath, hdr, body):
             if j.get("effort") is not None:
                 if j["effort"] not in EFFORTS: return out(400, {"error": "Effort unbekannt"})
                 MODEL_STATE["effort"] = j["effort"]
+            if isinstance(j.get("thinking"), bool):
+                MODEL_STATE["thinking"] = j["thinking"]; THINK_LOG.append("post:" + str(j["thinking"]))
             return out(200, {"ok": True, "current": model_current()})
         if mp == "projects" and method == "GET":
             return out(200, {"projects": [psummary(p) for p in PROJECTS.values()]})
@@ -614,6 +631,70 @@ def rest(method, rawpath, hdr, body):
         pcm = b"".join(struct.pack("<h", int(6000 * math.sin(2 * math.pi * 440 * i / rate))) for i in range(n))
         hdr = b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) + b"data" + struct.pack("<I", len(pcm))
         return (200, hdr + pcm, "audio/wav")
+    if path.startswith("/api/admin/") or path == "/api/accounts":  # a66: the web admin routes the app's Admin tabs use (state in ADM)
+        if os.environ.get("FAKE_ROLE", "admin") == "user": return out(403, {"error": "Nur f\u00fcr Admins."})
+        b = j if isinstance(j, dict) else {}
+        if method == "POST":
+            if path == "/api/admin/users":
+                for u_ in ADM["users"]:
+                    if u_["id"] == b.get("uid") and "admin" in b and "action" not in b: u_["admin"] = bool(b["admin"])
+                if b.get("action") == "create": ADM["users"].append({"id": "u%d" % (len(ADM["users"]) + 1), "username": b.get("username"), "email": "", "admin": False, "online": False, "hasPush": False})
+                if b.get("action") == "remove": ADM["users"] = [u_ for u_ in ADM["users"] if u_["id"] != b.get("uid")]
+            elif path == "/api/admin/invites":
+                a_ = b.get("action")
+                if a_ == "create":
+                    ADM["inv"].insert(0, {"code": "NEW%d" % len(ADM["inv"]), "note": b.get("note", ""), "createdBy": "justin", "createdAt": 1, "expiresAt": None, "usedBy": None, "usedByName": None, "revoked": False, "status": "offen"})
+                    return out(200, {"ok": True, "invite": ADM["inv"][0]})
+                for i_ in ADM["inv"]:
+                    if i_["code"] == b.get("code") and a_ == "revoke": i_["revoked"] = True; i_["status"] = "zur\u00fcckgezogen"
+                if a_ == "remove": ADM["inv"] = [i_ for i_ in ADM["inv"] if i_["code"] != b.get("code")]
+                if a_ == "dauercode": ADM["dauer"] = b.get("an") is True
+            elif path == "/api/accounts":
+                for c_ in ADM["acc"]:
+                    if c_["id"] == b.get("toggle"): c_["disabled"] = bool(b.get("disabled"))
+                if b.get("remove"): ADM["acc"] = [c_ for c_ in ADM["acc"] if c_["id"] != b["remove"]]
+                if b.get("token"): ADM["acc"].append({"id": "t%d" % len(ADM["acc"]), "label": b.get("label") or "token", "mode": "token", "active": False, "disabled": False, "free": 100, "runs": 0, "rate": {}})
+            elif path == "/api/admin/devices":
+                ADM["borrow"][b.get("uid", "") + ":" + b.get("name", "")] = bool(b.get("borrow"))
+            elif path == "/api/admin/models":
+                ADM["models"].update({k: b[k] for k in ("enabled", "defaultModel", "defaultEffort") if k in b})
+            elif path == "/api/admin/providers":
+                for p_ in ADM["prov"]:
+                    if p_["provider"] == b.get("provider"):
+                        p_["set"] = b.get("key") is not None; p_["obscured"] = "sk-xxx\u2026abcd" if p_["set"] else ""
+            elif path == "/api/admin/pve-keys":
+                a_ = b.get("action")
+                if a_ == "add": ADM["pve"].append({"id": "k_%d" % len(ADM["pve"]), "label": b.get("label") or "new", "active": True, "fp": "SHA256:newkey", "type": "ssh-ed25519"})
+                if a_ == "toggle":
+                    for k_ in ADM["pve"]:
+                        if k_["id"] == b.get("id"): k_["active"] = bool(b.get("active"))
+                if a_ == "remove": ADM["pve"] = [k_ for k_ in ADM["pve"] if k_["id"] != b.get("id")]
+            elif path == "/api/admin/system-prompt":
+                ADM["prompt"] = b.get("prompt", "")
+                return out(200, {"ok": True, "prompt": ADM["prompt"]})
+            elif path == "/api/admin/rights":
+                for u_ in ADM["users"]:
+                    if u_["id"] == b.get("uid"):
+                        pr_ = u_.setdefault("rights", {}).setdefault("projects", {})
+                        if b.get("level"): pr_[b["project"]] = b["level"]
+                        else: pr_.pop(b["project"], None)
+            if os.environ.get("FAKE_ADM_FAIL"): return out(400, {"error": "fake failure"})
+        if path == "/api/admin/users": return out(200, {"users": ADM["users"], "me": "u1"})
+        if path == "/api/admin/invites": return out(200, {"invites": ADM["inv"], "dauercode": "DAUER-42", "dauercodeAktiv": ADM["dauer"]})
+        if path == "/api/accounts": return out(200, {"accounts": ADM["acc"], "activeId": "a1"})
+        if path == "/api/admin/devices":
+            return out(200, {"devices": [{"uid": "u1", "username": "justin", "name": "Dell", "own": True, "borrowed": False},
+                                          {"uid": "u2", "username": "papa", "name": "Laptop", "own": False, "borrowed": ADM["borrow"].get("u2:Laptop", False)}]})
+        if path == "/api/admin/models":
+            m_ = ADM["models"]
+            return out(200, {"all": ["opus", "sonnet", "haiku", "gpt-5", "grok"], "enabled": m_["enabled"], "defaultModel": m_["defaultModel"], "custom": [], "defaultEffort": m_["defaultEffort"], "efforts": ["low", "medium", "high"]})
+        if path == "/api/admin/providers": return out(200, {"providers": ADM["prov"]})
+        if path == "/api/admin/pve-keys": return out(200, {"host": "pve", "port": 22, "user": "root", "keys": ADM["pve"]})
+        if path == "/api/admin/system-prompt": return out(200, {"prompt": ADM["prompt"], "effective": "..."})
+        if path == "/api/admin/rights":
+            return out(200, {"projects": ["firn", "osum", "certus", "jarvis"], "levels": ["read", "write", "shell"],
+                             "users": [{"id": x["id"], "username": x["username"], "admin": x["admin"], "rights": x.get("rights", {"projects": {}})} for x in ADM["users"]], "me": "u1"})
+        return out(404, {"error": "Not found"})
     if path == "/api/voices":  # a65: the Piper voice list of the web settings
         return out(200, {"voices": [{"id": "de_thorsten", "label": "Thorsten", "gender": "m", "default": True}, {"id": "de_kerstin", "label": "Kerstin", "gender": "w"}]})
     if path == "/api/settings":
@@ -768,6 +849,13 @@ async def handler(ws):
         if t == "message":
             text = m["text"]
             cid = m.get("cid")
+            if text.startswith("/thinking"):  # the web switch sends "/thinking on|off"
+                a = text[9:].strip()
+                MODEL_STATE["thinking"] = a in ("on", "an", "1", "true") if a else not MODEL_STATE["thinking"]
+                THINK_LOG.append("ws:" + text)
+                print("THINK", text, flush=True)
+                await send(ws, {"type": "system", "content": "ok " + text, "thinking": MODEL_STATE["thinking"]})
+                continue
             if text.startswith("/model ") or text.startswith("/effort "):  # slash commands: stored like the web ones, no chat turn
                 cmd, arg = text.split(" ", 1)
                 if cmd == "/model" and arg.strip() in ENABLED: MODEL_STATE["model"] = arg.strip()
@@ -820,6 +908,10 @@ async def handler(ws):
                 await send(ws, {"type": "token", "cid": cid, "content": "Pic rel:\n\n![rel](/img/u1/%s/rel.png)\n\n" % cid})
                 await send(ws, {"type": "token", "cid": cid, "content": "Pic abs:\n\n![abs](http://127.0.0.1:%d/img/u1/%s/abs.png)\n\n" % (HTTPPORT, cid)})
                 await send(ws, {"type": "token", "cid": cid, "content": "Pic dl:\n\n![dl](/dl/u1/x/dl.png)\n\nEnd.\n>STATUS: status=done"})
+            elif text == "imgfile":  # a66: the assistant delivers an image file (type "file", mime image/png): shown inline + as a file card
+                await send(ws, {"type": "token", "cid": cid, "content": "Here is the picture:"})
+                await send(ws, {"type": "file", "cid": cid, "name": "chart.png", "url": "/dl/u1/%s/chart.png" % cid, "mime": "image/png"})
+                await send(ws, {"type": "token", "cid": cid, "content": "\n\nDone.\n>STATUS: status=done"})
             elif text == "file":
                 FILES["report.txt"] = b"hello report from the fake server\n"
                 await send(ws, {"type": "token", "cid": cid, "content": "Here is the file."})
