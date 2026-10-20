@@ -20,6 +20,7 @@
 # BAD NETWORK (REST only; the WebSocket keeps working): POST /fake/net {"delay_ms":3000,"drop":1000000,"status":503} slows the REST
 # answers, drops the connection without an answer (drop = how many requests; 1000000 = all) or answers every data route with that
 # status (ping stays 200). Start values: FAKE_REST_DELAY_MS / FAKE_REST_DROP / FAKE_REST_STATUS.
+# a61: GET /api/m/chats sends ETag (W/"sha1") and answers If-None-Match with 304 and no body; FAKE_NO_ETAG=1 = an older server (no ETag, never 304). The log shows "inm" on conditional requests and {"type":"net","what":"304"}.
 # Text "file" in a chat message -> the server sends a file event (report.txt) that the client fetches over /file/.
 # REALISTIC DATA (default on, FAKE_REALISTIC=0 = the old tiny answers): the WebSocket `info` is shaped like the real server's
 # (server.js ~4154: active_model, efforts, devices, deviceInfo, models, modelIds, caps, labels, providers, running, partials,
@@ -28,7 +29,7 @@
 # as raw UTF-8. /api/m/chats lists FAKE_NCHATS (150) chats (emoji, umlauts, 300-char titles, null/empty titles, null parents) and
 # /api/m/chats/<id> serves any of them with big answers (code, tables, CJK, emoji, control chars). FAKE_STREAM=1: after `info` the
 # server streams tokens of the other running chats all the time (the client must skip them).
-import asyncio, json, os, random, sys, time
+import asyncio, hashlib, json, os, random, sys, time
 from urllib.parse import unquote, urlparse, parse_qs, quote
 from http import HTTPStatus
 from websockets.asyncio.server import serve
@@ -119,6 +120,7 @@ def chat_row(i):
 def sidebar_chats():
     # FAKE_SIDEBAR=1: the chats of the web sidebar reference (AKTIV / HEUTE / GESTERN, sub-workers under OrientOS, a Workers tab)
     now = int(time.time() * 1000)
+    if os.environ.get("FAKE_STABLE_CHATS") == "1": now = now // 3600000 * 3600000  # a61: same list body across requests / restarts (ETag tests)
     h = 3600000
     def row(i, t, ago, run=False, kind="chat", disp=False, parent=None, fav=False):
         return {"id": i, "title": t, "kind": kind, "updatedAt": now - ago, "running": run, "fav": fav, "parent": parent, "dispatched": disp}
@@ -310,6 +312,7 @@ def rest(method, rawpath, hdr, body):
         return None
     jtype = hdr.get("content-type")
     entry = {"type": "rest", "method": method, "path": rawpath, "ctype": jtype, "n": len(body)}
+    if hdr.get("if-none-match"): entry["inm"] = hdr["if-none-match"]  # a61: the request log shows the conditional GET
     cookie = [c for c in hdr.get("cookie", "").split(";")]
     ok = any(c.strip().partition("=")[0] == "fleitec_session" and unquote(c.strip().partition("=")[2]) == TOKEN for c in cookie)
     entry["auth"] = ok
@@ -768,7 +771,16 @@ async def main():
                 LOG.write(json.dumps({"type": "net", "what": "status", "path": path, "status": NET["status"]}) + "\n")
                 rr = (NET["status"], b'{"error":"fake failure"}', "application/json")
             st, data, ct = rr
-            writer.write(("HTTP/1.1 %d X\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % (st, ct, len(data))).encode() + data)
+            xh = ""
+            # a61: GET /api/m/chats carries a weak ETag of the body and answers If-None-Match with 304 and no body (FAKE_NO_ETAG=1: an older server)
+            if method == "GET" and path.split("?")[0] == "/api/m/chats" and st == 200 and not os.environ.get("FAKE_NO_ETAG"):
+                et = 'W/"%s"' % hashlib.sha1(data).hexdigest()[:20]
+                xh = "ETag: %s\r\nCache-Control: private, no-cache\r\n" % et
+                if hdr.get("if-none-match") == et:
+                    LOG.write(json.dumps({"type": "net", "what": "304", "path": path}) + "\n")
+                    writer.write(("HTTP/1.1 304 Not Modified\r\n%sConnection: close\r\n\r\n" % xh).encode())
+                    await writer.drain(); writer.close(); return
+            writer.write(("HTTP/1.1 %d X\r\nContent-Type: %s\r\n%sContent-Length: %d\r\nConnection: close\r\n\r\n" % (st, ct, xh, len(data))).encode() + data)
             await writer.drain(); writer.close(); return
         # everything else: tunnel to the websockets server
         r2, w2 = await asyncio.open_connection("127.0.0.1", WSPORT)
@@ -789,7 +801,7 @@ async def main():
     global WSPORT
     srv = await serve(handler, "127.0.0.1", 0, process_request=process_request, compression=None)
     WSPORT = srv.sockets[0].getsockname()[1]
-    fs = await asyncio.start_server(front, "127.0.0.1", 0)
+    fs = await asyncio.start_server(front, "127.0.0.1", int(os.environ.get("FAKE_PORT", "0")))  # a61: FAKE_PORT = fixed port (a restart must keep the address the app saved)
     global HTTPPORT
     HTTPPORT = fs.sockets[0].getsockname()[1]
     print("PORT", fs.sockets[0].getsockname()[1], flush=True)

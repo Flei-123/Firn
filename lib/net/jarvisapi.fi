@@ -92,7 +92,7 @@ export {
     PushEvent, PushEvents, pushevents_new, pushevents_free, parse_push_events,
     PushReg, pushreg_new, pushreg_free, parse_push_register, ja_upload, ja_download,
     ja_get, ja_post_json, ja_kind_name, ja_get_abs, ja_post_abs, ja_chat_rename, ja_chat_remove, ja_folder_op, ja_chat_move, FolderRow, parse_usage, parse_usage_info, parse_model_label,
-    ja_body_ptr, ja_body_len, ja_body, ja_key, ja_age_s, ja_status, ja_cache_peek,
+    ja_body_ptr, ja_body_len, ja_body, ja_key, ja_age_s, ja_status, ja_cache_peek, ja_unchanged,
     Me, ProjectRow, Projects, RoadItem, NeedItem, ChatRef, ProjectFull,
     WorkerRow, ActRow, Center, ConvRow, Convs, Msg, Conv, TaskRow, Tasks, DeviceRow, Devices,
     me_new, me_free, parse_me,
@@ -193,6 +193,7 @@ struct Api {
     net_verify: u32, // x509 verdict (x509.V_*) when net_layer is tls-cert
     net_reused: bool, // the last request ran on a parked (keep-alive) connection
     net_ms: i64, // how long the last request took (answer or failure)
+    unchanged: bool, // the answer being delivered was a 304 for our If-None-Match: status is 200, the body is EMPTY, the stored copy is still current
     mobile: bool, // the /api/m/* routes (docs/ANDROID-APP-API.md) are switched on, see ja_set_mobile
 }
 
@@ -201,6 +202,7 @@ struct Call {
     kind: u32,
     post: bool,
     cacheable: bool, // a good answer is stored; only a GET is replayed from the store
+    cond: bool, // the request carried If-None-Match (a 304 means: the stored copy is current)
     key: rt.Buf,
 }
 
@@ -300,7 +302,7 @@ fn ja_new(l: *mut loop.Loop, cb: fn(*mut Api, u64, u32, i64), ud: u64) -> *mut A
             convs: rt.buf_new(), tasks: rt.buf_new(), devices: rt.buf_new(), push: rt.buf_new(),
             stt: rt.buf_new(), upload: rt.buf_new() },
         cache: 0 as *mut jarvis_cache.Cache, body: rt.buf_new(), key: rt.buf_new(), url: rt.buf_new(),
-        req: rt.buf_new(), age: -1, status: 0, timeout_ms: TIMEOUT_MS, net_layer: 0, net_tls: 0, net_verify: 0, net_reused: false, net_ms: 0, mobile: false }
+        req: rt.buf_new(), age: -1, status: 0, timeout_ms: TIMEOUT_MS, net_layer: 0, net_tls: 0, net_verify: 0, net_reused: false, net_ms: 0, unchanged: false, mobile: false }
     if !ahttp.aclient_init(&(*a).ah, l) {
         obj_free[Api](p)
         return 0 as *mut Api
@@ -442,6 +444,8 @@ fn ja_cache_peek(a: *mut Api, kind: u32, key: str, out: *mut rt.Buf) -> i64 {
     return age
 }
 fn ja_status(a: *mut Api) -> i64 { return (*a).status }
+// true when the delivered answer (status 200) was a 304: the body is empty and the stored copy (ja_cache_peek) is still current
+fn ja_unchanged(a: *mut Api) -> bool { return (*a).unchanged }
 // why the request being delivered failed (status 0 or 203): ahttp.NL_* / tls error / x509 verdict / milliseconds it took
 fn ja_net_layer(a: *mut Api) -> u32 { return (*a).net_layer }
 fn ja_net_tls(a: *mut Api) -> u32 { return (*a).net_tls }
@@ -514,6 +518,60 @@ fn body_is_json(a: *mut Api) -> bool {
     return ok
 }
 
+// Kinds whose server answer carries an ETag (GET /api/m/chats today): the ETag of the last good answer is stored next to the body and sent back
+// as If-None-Match; a 304 keeps the stored copy. An older server sends no ETag -> nothing is stored, nothing is sent (plain GET as before).
+fn kind_has_etag(kind: u32) -> bool { return kind == AK_CONVS }
+
+fn etag_key(kind: u32, key: str, out: *mut rt.Buf) {
+    put(out, "etag-")
+    put(out, ja_kind_name(kind))
+    put(out, ":")
+    put(out, key)
+}
+
+// a stored ETag is only sent with a stored body, and only when it is one clean header line
+fn load_etag(a: *mut Api, kind: u32, key: str, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    if (*a).cache as u64 == 0 { return }
+    var bk: rt.Buf = rt.buf_new()
+    put(&bk, ja_kind_name(kind))
+    put(&bk, ":")
+    put(&bk, key)
+    var ek: rt.Buf = rt.buf_new()
+    etag_key(kind, key, &ek)
+    if jarvis_cache.cache_has((*a).cache, as_str(&bk)) && jarvis_cache.cache_get((*a).cache, as_str(&ek), out) {
+        var i: usize = 0
+        while i < (*out).len {
+            let ch: u8 = rt.ld8((*out).ptr, i)
+            if ch < 32 as u8 || ch > 126 as u8 {
+                rt.buf_clear(out)
+                break
+            }
+            i = i + 1
+        }
+    }
+    rt.buf_free(&bk)
+    rt.buf_free(&ek)
+}
+
+// after a 200: keep the answer's ETag with the body just stored (stored == false or no header: drop the old one, it no longer matches)
+fn save_etag(r: *mut ahttp.Request, a: *mut Api, call: *mut Call, stored: bool) {
+    var ek: rt.Buf = rt.buf_new()
+    let ks: str = as_str(&(*call).key)
+    etag_key((*call).kind, ks, &ek)
+    let eks: str = as_str(&ek)
+    var at: u64 = 0
+    let n: usize = ahttp.areq_header(r, "ETag".p as u64, 4, &at)
+    var done: bool = false
+    if stored && n > 0 && n <= 200 {
+        done = jarvis_cache.cache_put((*a).cache, eks, at, n)
+    }
+    if !done {
+        let gone: bool = jarvis_cache.cache_remove((*a).cache, eks)
+    }
+    rt.buf_free(&ek)
+}
+
 fn on_done(r: *mut ahttp.Request, ud: u64) {
     let call: *mut Call = ud as *mut Call
     let a: *mut Api = (*call).a
@@ -527,16 +585,31 @@ fn on_done(r: *mut ahttp.Request, ud: u64) {
     (*a).net_verify = ahttp.areq_tls_verify(r)
     (*a).net_ms = ahttp.areq_elapsed_ms(r)
     (*a).net_reused = ahttp.areq_reused(r)
+    (*a).unchanged = false
     rt.buf_clear(&(*a).body)
     var age: i64 = -1
     if status > 0 {
         rt.buf_push_bytes(&(*a).body, ahttp.areq_body_ptr(r), ahttp.areq_body_len(r))
+    }
+    // 304 for our If-None-Match: the stored copy is current -> report a 200 with an empty body and the `unchanged` flag (no reparse by the caller)
+    if status == 304 && (*call).cond {
+        var bk: rt.Buf = rt.buf_new()
+        cache_key(call, &bk)
+        if (*a).cache as u64 != 0 && jarvis_cache.cache_has((*a).cache, as_str(&bk)) {
+            status = 200
+            (*a).unchanged = true
+            rt.buf_clear(&(*a).body)
+        } else {
+            status = 0
+        }
+        rt.buf_free(&bk)
     }
     if status == 200 && (*call).cacheable && (*a).cache as u64 != 0 && body_is_json(a) {
         var ck: rt.Buf = rt.buf_new()
         cache_key(call, &ck)
         let ok: bool = jarvis_cache.cache_put((*a).cache, as_str(&ck), (*a).body.ptr, (*a).body.len)
         rt.buf_free(&ck)
+        if kind_has_etag((*call).kind) { save_etag(r, a, call, ok) }
     }
     if status == 0 && (*call).cacheable && !(*call).post && (*a).cache as u64 != 0 {
         var ck2: rt.Buf = rt.buf_new()
@@ -567,15 +640,19 @@ fn start(a: *mut Api, kind: u32, post: bool, cacheable: bool, url_len: usize, ke
         return false
     }
     let call: *mut Call = p as *mut Call
-    *call = Call { a: a, kind: kind, post: post, cacheable: cacheable, key: rt.buf_new() }
+    *call = Call { a: a, kind: kind, post: post, cacheable: cacheable, cond: false, key: rt.buf_new() }
     put(&(*call).key, key)
+    var inm: rt.Buf = rt.buf_new()
+    if !post && cacheable && kind_has_etag(kind) { load_etag(a, kind, key, &inm) }
+    (*call).cond = inm.len > 0
     var r: *mut ahttp.Request = 0 as *mut ahttp.Request
     if post {
         r = ahttp.aclient_post(&(*a).ah, (*a).url.ptr, (*a).url.len, body, body_n, ctype.p as u64, ctype.n,
             (*a).timeout_ms, on_done, p)
     } else {
-        r = ahttp.aclient_get(&(*a).ah, (*a).url.ptr, (*a).url.len, (*a).timeout_ms, on_done, p)
+        r = ahttp.aclient_get_inm(&(*a).ah, (*a).url.ptr, (*a).url.len, (*a).timeout_ms, inm.ptr, inm.len, on_done, p)
     }
+    rt.buf_free(&inm)
     if r as u64 == 0 {
         rt.buf_free(&(*call).key)
         obj_free[Call](p)
