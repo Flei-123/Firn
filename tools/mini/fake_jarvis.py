@@ -260,6 +260,9 @@ async def process_request(conn, request):
             return reply(401, {"error": "Not logged in"})
         cid = unquote(u.path[len("/api/conversations/"):])
         LOG.write(json.dumps({"type": "rest", "method": "GET", "path": u.path, "auth": True}) + "\n"); LOG.flush()
+        if "/input/" in cid:  # a64: the full input of a step the history sent as {"__cut": n} (server lib/conversations.js inputAt)
+            _n = cid.rsplit("/input/", 1)[1]
+            return reply(200, {"input": {"command": "echo full input %s" % _n}})
         if cid not in CONV and os.environ.get("FAKE_A64") == "1":  # a64: the layout fixture of the web comparison (user bubble, markdown answer with meta line, worker note)
             CONV[cid] = a64_fixture()
         if cid not in CONV and os.environ.get("FAKE_HIST") == "1":
@@ -735,7 +738,8 @@ async def handler(ws):
                     except asyncio.TimeoutError:
                         pass
             else:
-                await send(ws, {"type": "thinking", "cid": cid})
+                await send(ws, {"type": "thinking", "cid": cid, "content": "I check the shell first.\nThen I answer."})
+                if os.environ.get("FAKE_THINKLIVE") == "1": await asyncio.sleep(float(os.environ.get("FAKE_THINKLIVE_S", "6")))
                 await send(ws, {"type": "tool", "cid": cid, "name": "mcp__jarvis__run_shell"})
                 await send(ws, {"type": "token", "cid": cid, "content": "Hallo "})
                 await send(ws, {"type": "token", "cid": cid, "content": text + "\n>STATUS: status=done"})

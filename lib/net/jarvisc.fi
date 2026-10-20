@@ -44,7 +44,7 @@
 //   JE_OPEN       the socket is open               JE_CLOSE   arg = close code
 //   JE_NETERR     arg = wsc error code (jc_ws_status = HTTP status of a refused upgrade)
 //   JE_TOKEN      text = a piece of the answer     JE_DONE    the answer is complete
-//   JE_TOOL       text = tool name (mcp__x__ cut)  JE_THINKING
+//   JE_TOOL       text = tool name (mcp__x__ cut)  JE_THINKING  (text = a piece of the live reasoning)
 //   JE_CONVERSATION  text = the new chat's id (stored: jc_cid)
 //   JE_ERROR      text = the server's message      JE_SYSTEM  text
 //   JE_INFO       after (re)connect: arg 1 = our chat runs, 0 = it does not, -1 = no chat yet
@@ -85,7 +85,7 @@ export {
     Jc,
     JE_LOGIN, JE_OPEN, JE_CLOSE, JE_NETERR, JE_TOKEN, JE_DONE, JE_TOOL, JE_THINKING,
     JE_CONVERSATION, JE_ERROR, JE_SYSTEM, JE_INFO, JE_USER, JE_CONFIRM, JE_ASK,
-    JE_ASK_END, JE_FILE, JE_HIST, JE_HIST_END, JE_HTTP_ERR, JE_TOOL_RESULT, JE_HIST_TOOL, JE_HIST_PAGE, JE_HIST_PAGE_END, JE_HIST_PAGE_ERR, jc_history_older, jc_hist_from, jc_hist_total, jc_hist_restore, md_target, md_label,
+    JE_ASK_END, JE_FILE, JE_HIST, JE_HIST_END, JE_HTTP_ERR, JE_TOOL_RESULT, JE_HIST_TOOL, JE_HIST_PAGE, JE_HIST_PAGE_END, JE_HIST_PAGE_ERR, JE_HIST_THINK, JE_INPUT, jc_input, jc_cut, jc_history_older, jc_hist_from, jc_hist_total, jc_hist_restore, md_target, md_label,
     jc_new, jc_free, jc_set_base, jc_set_token, jc_has_token, jc_set_tz, jc_set_dev,
     jc_add_trust_pem, jc_login, jc_connect, jc_disconnect, jc_is_open,
     jc_send, jc_stop, jc_confirm, jc_answer, jc_history, jc_new_chat,
@@ -121,6 +121,11 @@ const JE_HIST_TOOL: u32 = 22
 const JE_HIST_PAGE: u32 = 23
 const JE_HIST_PAGE_END: u32 = 24
 const JE_HIST_PAGE_ERR: u32 = 25
+// a64: a thought block of the history (role "thinking"): text = the thought, arg = how long it took (genMs)
+const JE_HIST_THINK: u32 = 26
+// a64: the full input of a tool step whose input the history sent only as {__cut: n} (jc_input): arg = n, jc_options = the short argument
+// (empty when the server has no such input any more / the request failed)
+const JE_INPUT: u32 = 27
 
 const COOKIE_NAME: str = "fleitec_session"
 
@@ -151,6 +156,9 @@ struct Jc {
     busy_login: bool,
     busy_hist: bool,
     busy_older: bool, // a64: an older page is on its way
+    busy_input: bool, // a64: a full tool input is on its way (jc_input)
+    cut: i64, // a64: JE_HIST_TOOL / JE_TOOL: the input was sent as {__cut: n} (fetch it with jc_input); -1 = the input came whole
+    input_n: i64, // a64: the __cut index jc_input asked for
     hist_from: i64, // a64: absolute index of the first message held (server `from`); 0 = the history is complete
     hist_total: i64, // a64: server `total` (messages in the chat)
     older_cid: rt.Buf, // a64: the chat the older page was asked for (a chat change drops the answer)
@@ -176,7 +184,7 @@ fn jc_new(l: *mut loop.Loop, cb: fn(*mut Jc, u64, u32, i64), ud: u64) -> *mut Jc
         base: rt.buf_new(), token: rt.buf_new(), user: rt.buf_new(), cid: rt.buf_new(),
         tz: rt.buf_new(), dev: rt.buf_new(), last_sent: rt.buf_new(), text: rt.buf_new(),
         id: rt.buf_new(), opts: rt.buf_new(), res: rt.buf_new(), outq: rt.buf_new(), req_url: rt.buf_new(),
-        req_body: rt.buf_new(), net_layer: 0, net_tls: 0, net_verify: 0, no_sys: false, busy_login: false, busy_hist: false, busy_older: false, hist_from: 0, hist_total: 0, older_cid: rt.buf_new(), started: false, seq: 0 }
+        req_body: rt.buf_new(), net_layer: 0, net_tls: 0, net_verify: 0, no_sys: false, busy_login: false, busy_hist: false, busy_older: false, busy_input: false, cut: 0 - 1, input_n: 0, hist_from: 0, hist_total: 0, older_cid: rt.buf_new(), started: false, seq: 0 }
     if !ahttp.aclient_init(&(*c).ah, l) {
         jc_obj_free[Jc](p)
         return 0 as *mut Jc
@@ -696,7 +704,10 @@ fn arg_key(k: usize) -> str {
 }
 fn tool_arg(c: *mut Jc, d: *mut json.Json, inp: u32) {
     rt.buf_clear(&(*c).opts)
+    (*c).cut = 0 - 1
     if inp == json.JSON_NONE || json.json_kind(d, inp) != json.JSON_OBJECT { return }
+    let cutn: u32 = json.json_get(d, inp, "__cut".p as u64, 5)
+    if cutn != json.JSON_NONE && json.json_kind(d, cutn) == json.JSON_NUMBER { (*c).cut = jget_num(d, inp, "__cut") }
     var s: str.Span = str.span_empty()
     var k: usize = 0
     while k < 15 && s.n == 0 {
@@ -881,7 +892,7 @@ fn handle(c: *mut Jc, p: u64, n: usize) {
                 emit_span(c, JE_USER, t, 0)
             }
         } else if span_is(ty, "thinking") {
-            emit(c, JE_THINKING, "", 0)
+            emit_span(c, JE_THINKING, jget_str(&d, o, "content"), 0)
         } else if span_is(ty, "tool") {
             let tid: str.Span = jget_str(&d, o, "id")
             rt.buf_clear(&(*c).id)
@@ -1247,6 +1258,8 @@ fn hist_done(r: *mut ahttp.Request, ud: u64, older: bool) {
                     emit_hist(c, t, &extra, 1)
                 } else if span_is(role, "tool") {
                     hist_tool(c, &d, e, t)
+                } else if span_is(role, "thinking") {
+                    emit_span(c, JE_HIST_THINK, t, jget_num(&d, e, "genMs"))
                 } else if !(span_is(role, "tool") || span_is(role, "thinking") || span_is(role, "sys")
                     || span_is(role, "reminder") || span_is(role, "file") || span_is(role, "ask")) && (t.n > 0 || extra.len > 0) {
                     // jc_id() of an answer: "<genMs>,<at>" (epoch ms; 0 = the server did not store it)
@@ -1297,6 +1310,44 @@ fn jc_history(c: *mut Jc) -> bool {
     }
     return true
 }
+
+// a64: the full input of a step whose input the history cut ({__cut: n}): GET /api/conversations/<cid>/input/<n>. The answer comes as
+// JE_INPUT (arg = n, jc_options = the short argument; empty = not found / failed). false = nothing asked (busy / no chat).
+fn on_input(r: *mut ahttp.Request, ud: u64) {
+    let c: *mut Jc = ud as *mut Jc
+    (*c).busy_input = false
+    rt.buf_clear(&(*c).opts)
+    if ahttp.areq_error(r) == 0 && ahttp.areq_status(r) == 200 {
+        var d: json.Json = json.json_new()
+        let ok: bool = json.json_parse(&d, ahttp.areq_body_ptr(r), ahttp.areq_body_len(r)) catch false
+        if ok && json.json_kind(&d, json.json_root(&d)) == json.JSON_OBJECT {
+            tool_arg(c, &d, json.json_get(&d, json.json_root(&d), "input".p as u64, 5))
+        }
+        json.json_free(&d)
+    }
+    emit(c, JE_INPUT, "", (*c).input_n)
+}
+
+fn jc_input(c: *mut Jc, n: i64) -> bool {
+    if (*c).busy_input || n < 0 || (*c).cid.len == 0 || (*c).base.len == 0 { return false }
+    rt.buf_clear(&(*c).req_url)
+    rt.buf_push_bytes(&(*c).req_url, (*c).base.ptr, (*c).base.len)
+    put(&(*c).req_url, "/api/conversations/")
+    push_cookie_value(&(*c).req_url, (*c).cid.ptr, (*c).cid.len)
+    put(&(*c).req_url, "/input/")
+    rt.buf_push_dec_i64(&(*c).req_url, n)
+    (*c).input_n = n
+    (*c).busy_input = true
+    let r: *mut ahttp.Request = ahttp.aclient_get(&(*c).ah, (*c).req_url.ptr, (*c).req_url.len, 15000, on_input, c as u64)
+    if r as u64 == 0 {
+        (*c).busy_input = false
+        return false
+    }
+    return true
+}
+
+// a64: the __cut index of the last JE_HIST_TOOL / JE_TOOL (-1 = the input came whole)
+fn jc_cut(c: *mut Jc) -> i64 { return (*c).cut }
 
 // a64: the index of the first message held / the number of messages in the chat (server `from` / `total`; 0 = unknown)
 fn jc_hist_from(c: *mut Jc) -> i64 { return (*c).hist_from }
