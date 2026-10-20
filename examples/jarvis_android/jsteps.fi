@@ -12,7 +12,7 @@
 import std.rt
 import jtexts
 
-export { room, reset, tool_start, tool_result, hist_tool, add_text, new_turn, turn_has_group, flush, flush_at, compose, on_link, has_pending, hidden }
+export { room, reset, tool_start, tool_result, hist_tool, add_text, new_turn, turn_has_group, flush, flush_at, flush_group_at, compose, on_link, has_pending, hidden, keep_visible, hist_think, think_live, think_end, think_running, take_fetch, set_cut_arg }
 
 const MAXS: usize = 4096 // steps kept (more are dropped)
 const MAXG: usize = 1024 // groups kept
@@ -34,13 +34,22 @@ static mut S_TID_O: [usize; 4096] = [0; 4096]
 static mut S_TID_N: [usize; 4096] = [0; 4096]
 static mut S_ST: [u8; 4096] = [0; 4096] // 0 running (no result yet), 1 ok, 2 failed, 3 done without stored output, 4 = folded text of the AI between two tool calls (its text is in RES)
 static mut S_FULL: [u8; 4096] = [0; 4096]
-static mut S_DET: [u8; 4096] = [0; 4096] // the output of the step is shown (tap on its pill)
+static mut S_DET: [u8; 4096] = [0; 4096] // the output of the step is shown (tap on its pill); a thought: its text is shown
+static mut S_CUT: [i64; 4096] = [0; 4096] // the history sent the input only as {__cut: n} (n >= 0): fetched when the detail is opened; -1 = whole / fetched
+static mut S_SECS: [i64; 4096] = [0; 4096] // a thought: how many seconds it took
 static mut G_N: usize = 0
 static mut G_FIRST: [usize; 1024] = [0; 1024]
 static mut G_CNT: [usize; 1024] = [0; 1024]
 static mut G_OPEN: [u8; 1024] = [0; 1024]
 static mut PEND: usize = 999999 // the group being filled (none = 999999)
 static mut TURN_GRP: bool = false // the answer being streamed already has a group (its later text is folded into the steps)
+static mut PT_N: usize = 0 // thoughts of the turn BEFORE its first tool call: steps at the end of S_*, in no group yet (web: pendingThinks); the first tool adopts them
+static mut VG_OPEN: bool = false // the live "Denkt nach" pill (the pending thoughts as a virtual group) is open
+static mut LIVE_I: usize = 999999 // the thought being streamed (S_ST 6), none = 999999
+static mut LIVE_T0: i64 = 0
+static mut LIVE_TXT: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut FETCH: i64 = 0 - 1 // a tapped step with a cut input: the __cut index the screen has to fetch (take_fetch)
+const VG: usize = 1024 // the group id of the virtual live group
 
 fn put(b: *mut rt.Buf, s: str) { rt.buf_push_bytes(b, s.p as u64, s.n) }
 
@@ -59,9 +68,13 @@ fn reset() {
     G_N = 0
     PEND = 999999
     TURN_GRP = false
+    PT_N = 0
+    LIVE_I = 999999
+    FETCH = 0 - 1
+    rt.buf_clear(&LIVE_TXT)
 }
 
-fn has_pending() -> bool { return PEND != 999999 }
+fn has_pending() -> bool { return PEND != 999999 || PT_N > 0 }
 
 // a64: room for another page of history (steps / groups kept are capped)
 fn room() -> bool { return S_N + 300 < MAXS && G_N + 40 < MAXG }
@@ -144,16 +157,20 @@ fn hidden(name: str) -> bool {
     return name == "ToolSearch" || name == "ask_user" || name == "say"
 }
 
-fn open_group() {
+// a new pending group; the thoughts in front of the first tool call (PT_N) belong to it. `tool` = it comes with a tool / folded text (the turn has a group)
+fn open_group_x(tool: bool) {
     if PEND != 999999 { return }
     if G_N >= MAXG { return }
-    G_FIRST[G_N] = S_N
-    G_CNT[G_N] = 0
+    G_FIRST[G_N] = S_N - PT_N
+    G_CNT[G_N] = PT_N
     G_OPEN[G_N] = 0
+    PT_N = 0
     PEND = G_N
     G_N = G_N + 1
-    TURN_GRP = true
+    if tool { TURN_GRP = true }
 }
+
+fn open_group() { open_group_x(true) }
 
 // one new step in the pending group; returns its index or 999999 (full / hidden)
 fn add_step(name: str, arg: str, tid: str) -> usize {
@@ -175,6 +192,8 @@ fn add_step(name: str, arg: str, tid: str) -> usize {
     S_ST[i] = 0 as u8
     S_FULL[i] = 0 as u8
     S_DET[i] = 0 as u8
+    S_CUT[i] = 0 - 1
+    S_SECS[i] = 0
     G_CNT[PEND] = G_CNT[PEND] + 1
     return i
 }
@@ -228,6 +247,8 @@ fn add_text(text: str) {
     S_ST[i] = 4 as u8
     S_FULL[i] = 0 as u8
     S_DET[i] = 0 as u8
+    S_CUT[i] = 0 - 1
+    S_SECS[i] = 0
     G_CNT[PEND] = G_CNT[PEND] + 1
 }
 
@@ -252,9 +273,10 @@ fn tool_result(tid: str, text: str, ok: i64) {
 }
 
 // history: a finished step (ok 1 / 0, 2 = no output stored)
-fn hist_tool(name: str, arg: str, text: str, ok: i64) {
+fn hist_tool(name: str, arg: str, text: str, ok: i64, cut: i64) {
     let i: usize = add_step(name, arg, "")
     if i == 999999 { return }
+    if arg.n == 0 { S_CUT[i] = cut }
     if ok == 2 {
         S_ST[i] = 3 as u8
     } else {
@@ -262,8 +284,175 @@ fn hist_tool(name: str, arg: str, text: str, ok: i64) {
     }
 }
 
-// the pending group becomes a placeholder in `buf` at byte `pos` (everything behind moves up)
-fn flush_at(buf: *mut rt.Buf, pos: usize) {
+
+// ---- thoughts (web: .think-block). Before the first tool call of a turn they wait in PT_N (no group yet; the first tool adopts them, so
+// the group lands UNDER the leading text); after it they go straight into the pending group.
+
+// a step for a thought, in the group (the turn has tool steps) or in front of the first group (PT_N)
+fn add_thought_step() -> usize {
+    if S_N >= MAXS { return 999999 }
+    var grp: bool = TURN_GRP || PEND != 999999
+    if grp {
+        open_group_x(true)
+        if PEND == 999999 { return 999999 }
+    }
+    let i: usize = S_N
+    S_N = S_N + 1
+    S_NAME_O[i] = 0
+    S_NAME_N[i] = 0
+    S_ARG_O[i] = 0
+    S_ARG_N[i] = 0
+    S_TID_O[i] = 0
+    S_TID_N[i] = 0
+    S_RES_O[i] = 0
+    S_RES_N[i] = 0
+    S_ST[i] = 5 as u8
+    S_FULL[i] = 0 as u8
+    S_DET[i] = 0 as u8
+    S_CUT[i] = 0 - 1
+    S_SECS[i] = 0
+    if grp { G_CNT[PEND] = G_CNT[PEND] + 1 } else { PT_N = PT_N + 1 }
+    return i
+}
+
+fn trim_cap(text: str, cap: usize) -> str {
+    var a: usize = 0
+    var e: usize = text.n
+    while a < e && (rt.ld8(text.p as u64, a) == 32 as u8 || rt.ld8(text.p as u64, a) == 10 as u8 || rt.ld8(text.p as u64, a) == 13 as u8 || rt.ld8(text.p as u64, a) == 9 as u8) { a = a + 1 }
+    while e > a && (rt.ld8(text.p as u64, e - 1) == 32 as u8 || rt.ld8(text.p as u64, e - 1) == 10 as u8 || rt.ld8(text.p as u64, e - 1) == 13 as u8 || rt.ld8(text.p as u64, e - 1) == 9 as u8) { e = e - 1 }
+    var n: usize = e - a
+    if n > cap {
+        n = cap
+        while n > 0 && (rt.ld8(text.p as u64, a + n) & 192 as u8) == 128 as u8 { n = n - 1 }
+    }
+    return str { p: ((text.p as u64) + a as u64) as *mut u8, n: n }
+}
+
+// history: a finished thought (role "thinking"): text + how long it took (genMs)
+fn hist_think(text: str, gen_ms: i64) {
+    let i: usize = add_thought_step()
+    if i == 999999 { return }
+    let tx: str = trim_cap(text, TEXT_CAP)
+    S_RES_O[i] = pool_add(tx)
+    S_RES_N[i] = tx.n
+    var secs: i64 = 0
+    if gen_ms > 0 { secs = (gen_ms + 500) / 1000 }
+    S_SECS[i] = secs
+}
+
+// live: a piece of the reasoning (JE_THINKING); `now` = unix ms. The first piece starts the thought.
+fn think_live(piece: str, now: i64) {
+    if LIVE_I == 999999 {
+        let i: usize = add_thought_step()
+        if i == 999999 { return }
+        LIVE_I = i
+        LIVE_T0 = now
+        rt.buf_clear(&LIVE_TXT)
+        S_ST[i] = 6 as u8
+        S_DET[i] = 1 as u8
+        VG_OPEN = true
+    }
+    if LIVE_TXT.len < 3 * TEXT_CAP { rt.buf_push_bytes(&LIVE_TXT, piece.p as u64, piece.n) }
+}
+
+fn think_running() -> bool { return LIVE_I != 999999 }
+
+// live: the reasoning is over (the answer / a tool call / the end follows): the thought is kept and folded. true = something changed.
+fn think_end(now: i64) -> bool {
+    if LIVE_I == 999999 { return false }
+    let i: usize = LIVE_I
+    LIVE_I = 999999
+    let tx: str = trim_cap(str { p: LIVE_TXT.ptr as *mut u8, n: LIVE_TXT.len }, TEXT_CAP)
+    S_RES_O[i] = pool_add(tx)
+    S_RES_N[i] = tx.n
+    var secs: i64 = (now - LIVE_T0 + 500) / 1000
+    if secs < 0 { secs = 0 }
+    S_SECS[i] = secs
+    S_ST[i] = 5 as u8
+    S_DET[i] = 0 as u8
+    rt.buf_clear(&LIVE_TXT)
+    VG_OPEN = false
+    return true
+}
+
+// web keepBotVisible(): text between two tool calls that stays a visible answer (a question, several lines, a list / heading / code / table,
+// or longer than 200 characters); a short transition line ("I look at the commits:") is folded into the steps instead
+fn keep_visible(text: str) -> bool {
+    let t: str = trim_cap(text, 100000000)
+    if t.n == 0 { return false }
+    let b: u64 = t.p as u64
+    var lines: usize = 0
+    var chars: usize = 0
+    var ls: bool = true // at the start of a line (blanks skipped)
+    var i: usize = 0
+    var line_has: bool = false
+    while i < t.n {
+        let c: u8 = rt.ld8(b, i)
+        if (c & 192 as u8) != 128 as u8 { chars = chars + 1 }
+        if c == 63 as u8 { return true } // ?
+        if c == 239 as u8 && i + 2 < t.n && rt.ld8(b, i + 1) == 188 as u8 && rt.ld8(b, i + 2) == 159 as u8 { return true } // fullwidth ?
+        if c == 10 as u8 {
+            if line_has { lines = lines + 1 }
+            line_has = false
+            ls = true
+        } else if c == 32 as u8 || c == 9 as u8 || c == 13 as u8 {
+            // blanks do not start a line
+        } else {
+            line_has = true
+            if ls {
+                ls = false
+                var c1: u8 = 0 as u8
+                var c2: u8 = 0 as u8
+                if i + 1 < t.n { c1 = rt.ld8(b, i + 1) }
+                if i + 2 < t.n { c2 = rt.ld8(b, i + 2) }
+                if (c == 45 as u8 || c == 42 as u8 || c == 43 as u8 || c == 62 as u8) && (c1 == 32 as u8 || c1 == 9 as u8) { return true } // - * + > then a blank
+                if c == 124 as u8 { return true } // |
+                if c == 96 as u8 && c1 == 96 as u8 && c2 == 96 as u8 { return true } // ```
+                if c == 35 as u8 {
+                    var h: usize = 0
+                    while i + h < t.n && rt.ld8(b, i + h) == 35 as u8 { h = h + 1 }
+                    if h <= 6 && i + h < t.n && (rt.ld8(b, i + h) == 32 as u8 || rt.ld8(b, i + h) == 9 as u8) { return true }
+                }
+                if c >= 48 as u8 && c <= 57 as u8 {
+                    var d: usize = 0
+                    while i + d < t.n && rt.ld8(b, i + d) >= 48 as u8 && rt.ld8(b, i + d) <= 57 as u8 { d = d + 1 }
+                    if i + d + 1 < t.n && (rt.ld8(b, i + d) == 46 as u8 || rt.ld8(b, i + d) == 41 as u8) && (rt.ld8(b, i + d + 1) == 32 as u8 || rt.ld8(b, i + d + 1) == 9 as u8) { return true }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if line_has { lines = lines + 1 }
+    if lines >= 2 { return true }
+    return chars > 200
+}
+
+// a tapped step with a cut input: the __cut index to fetch (jarvisc.jc_input), or -1; asked once
+fn take_fetch() -> i64 {
+    let v: i64 = FETCH
+    FETCH = 0 - 1
+    return v
+}
+
+// the full input arrived (JE_INPUT): the short argument of every step cut at `n`
+fn set_cut_arg(n: i64, arg: str) {
+    var k: usize = 0
+    while k < S_N {
+        if S_CUT[k] == n {
+            S_CUT[k] = 0 - 1
+            var an: usize = arg.n
+            if an > ARG_CAP { an = ARG_CAP }
+            S_ARG_O[k] = pool_add(str { p: arg.p, n: an })
+            S_ARG_N[k] = an
+        }
+        k = k + 1
+    }
+}
+
+// the pending group becomes a placeholder in `buf` at byte `pos` (everything behind moves up). The thoughts of a turn without a tool call
+// (waiting in PT_N) become a group of their own, but only when `all`.
+fn flush_x(buf: *mut rt.Buf, pos: usize, all: bool) {
+    if PEND == 999999 && all && PT_N > 0 && LIVE_I == 999999 { open_group_x(false) }
     if PEND == 999999 { return }
     let g: usize = PEND
     PEND = 999999
@@ -272,6 +461,7 @@ fn flush_at(buf: *mut rt.Buf, pos: usize) {
     var tail: rt.Buf = rt.buf_new()
     rt.buf_push_bytes(&tail, ((*buf).ptr as u64) + at as u64, (*buf).len - at)
     (*buf).len = at
+    if at > 0 { put(buf, "\n\n") }
     rt.buf_push(buf, 2 as u8)
     rt.buf_push_dec_i64(buf, g as i64)
     rt.buf_push(buf, 3 as u8)
@@ -280,7 +470,12 @@ fn flush_at(buf: *mut rt.Buf, pos: usize) {
     rt.buf_free(&tail)
 }
 
-fn flush(buf: *mut rt.Buf) { flush_at(buf, (*buf).len) }
+fn flush_at(buf: *mut rt.Buf, pos: usize) { flush_x(buf, pos, true) }
+
+fn flush(buf: *mut rt.Buf) { flush_x(buf, (*buf).len, true) }
+
+// only the group of tool steps (a text that stays visible between two tool calls); thoughts before the first tool call wait for it
+fn flush_group_at(buf: *mut rt.Buf, pos: usize) { flush_x(buf, pos, false) }
 
 // ---- rendering
 
@@ -425,19 +620,93 @@ fn group_label(out: *mut rt.Buf, n: usize) {
     }
 }
 
+// the text of a thought as markdown-safe lines (every line break stays one); the rail dims it
+fn put_thought(out: *mut rt.Buf, i: usize) {
+    var p: u64 = (POOL.ptr as u64) + S_RES_O[i] as u64
+    var n: usize = S_RES_N[i]
+    if S_ST[i] == 6 as u8 {
+        p = LIVE_TXT.ptr as u64
+        n = LIVE_TXT.len
+        let t: str = trim_cap(str { p: p as *mut u8, n: n }, TEXT_CAP)
+        p = t.p as u64
+        n = t.n
+    }
+    var k: usize = 0
+    while k < n {
+        var c: u8 = rt.ld8(p, k)
+        if c == 10 as u8 {
+            put(out, "  \n")
+        } else if c == 13 as u8 || (c < 32 as u8 && c != 9 as u8) {
+            // dropped
+        } else {
+            if c == 9 as u8 { c = 32 as u8 }
+            if c == 92 as u8 || c == 96 as u8 || c == 42 as u8 || c == 95 as u8 || c == 91 as u8 || c == 93 as u8 || c == 60 as u8 || c == 62 as u8 || c == 35 as u8 || c == 124 as u8 || c == 126 as u8 || c == 38 as u8 || c == 33 as u8 {
+                rt.buf_push(out, 92 as u8)
+            }
+            rt.buf_push(out, c)
+        }
+        k = k + 1
+    }
+    put(out, "\n\n")
+}
+
+// "Nachgedacht · 8s" / "Denkt nach..." (web: .think-lbl)
+fn put_think_label(out: *mut rt.Buf, i: usize) {
+    if S_ST[i] == 6 as u8 {
+        put(out, jtexts.t("think.live"))
+        return
+    }
+    put(out, jtexts.t("think.done"))
+    if S_SECS[i] > 0 {
+        put(out, " · ")
+        rt.buf_push_dec_i64(out, S_SECS[i])
+        put(out, "s")
+    }
+}
+
+// a thought inside a group: the head row (bulb + label + chevron, no pill) and, when open, its text
+fn render_thought(out: *mut rt.Buf, i: usize, tight: bool) {
+    put(out, "[")
+    put_think_label(out, i)
+    if S_DET[i] != 0 as u8 { put(out, "](thro:") } else { put(out, "](thr:") }
+    rt.buf_push_dec_i64(out, i as i64)
+    put(out, ")")
+    if S_DET[i] != 0 as u8 {
+        put(out, "\n\n")
+        put_thought(out, i)
+    } else if tight {
+        put(out, "  \n")
+    } else {
+        put(out, "\n\n")
+    }
+}
+
+fn is_tool_step(i: usize) -> bool { return S_ST[i] != 4 as u8 && S_ST[i] != 5 as u8 && S_ST[i] != 6 as u8 }
+
 fn render_group(out: *mut rt.Buf, g: usize) {
-    if g >= G_N { return }
-    let n: usize = G_CNT[g]
+    var f: usize = 0
+    var n: usize = 0
+    if g == VG {
+        n = PT_N
+        f = S_N - PT_N
+    } else {
+        if g >= G_N { return }
+        n = G_CNT[g]
+        f = G_FIRST[g]
+    }
     if n == 0 { return }
-    let f: usize = G_FIRST[g]
     var run: bool = false
+    var nt: usize = 0 // thoughts
+    var nf: usize = 0 // folded texts
+    var nl: usize = 0 // tool steps
     var k: usize = 0
     while k < n {
         if S_ST[f + k] == 0 as u8 { run = true }
+        if S_ST[f + k] == 5 as u8 || S_ST[f + k] == 6 as u8 { nt = nt + 1 } else if S_ST[f + k] == 4 as u8 { nf = nf + 1 } else { nl = nl + 1 }
         k = k + 1
     }
     // exactly one tool call: no pill, just its row (web: .tool-group.single)
-    if n == 1 && S_ST[f] != 4 as u8 {
+    if n == 1 && is_tool_step(f) {
         render_chip(out, f, false)
         if S_DET[f] != 0 as u8 {
             render_arg(out, f)
@@ -445,13 +714,25 @@ fn render_group(out: *mut rt.Buf, g: usize) {
         }
         return
     }
+    // only reasoning (no tool, no folded text): the pill says "Nachgedacht" with a bulb, the open group shows the thoughts without heads
+    let only_thought: bool = nl == 0 && nt >= 1 && nf == 0
+    var open: bool = G_OPEN[0] != 0 as u8
+    if g == VG { open = VG_OPEN } else { open = G_OPEN[g] != 0 as u8 }
     put(out, "[")
-    group_label(out, n)
-    if run && g == PEND { put(out, " ...") }
-    if G_OPEN[g] != 0 as u8 { put(out, "](stepo:") } else { put(out, "](step:") }
+    if only_thought {
+        if S_ST[f + n - 1] == 6 as u8 { put(out, jtexts.t("think.live")) } else { put(out, jtexts.t("think.done")) }
+    } else {
+        group_label(out, n)
+        if run && g == PEND { put(out, " ...") }
+    }
+    if only_thought {
+        if open { put(out, "](thinko:g") } else { put(out, "](think:g") }
+    } else {
+        if open { put(out, "](stepo:") } else { put(out, "](step:") }
+    }
     rt.buf_push_dec_i64(out, g as i64)
     put(out, ")\n\n")
-    if G_OPEN[g] == 0 as u8 { return }
+    if !open { return }
     var tmp: rt.Buf = rt.buf_new()
     k = 0
     while k < n {
@@ -459,6 +740,14 @@ fn render_group(out: *mut rt.Buf, g: usize) {
         if S_ST[i] == 4 as u8 {
             rt.buf_push_bytes(&tmp, (POOL.ptr as u64) + S_RES_O[i] as u64, S_RES_N[i])
             put(&tmp, "\n\n")
+        } else if S_ST[i] == 5 as u8 || S_ST[i] == 6 as u8 {
+            if only_thought {
+                put_thought(&tmp, i)
+            } else {
+                var tightt: bool = false
+                if S_DET[i] == 0 as u8 && k + 1 < n && S_ST[i + 1] != 4 as u8 { tightt = true }
+                render_thought(&tmp, i, tightt)
+            }
         } else {
             // rows stack tight (hard break) unless a detail block or a text follows
             var tight: bool = false
@@ -475,19 +764,29 @@ fn render_group(out: *mut rt.Buf, g: usize) {
     rt.buf_free(&tmp)
 }
 
+// blank line before a group, so its pill never sticks to the text in front
+fn sep(out: *mut rt.Buf) {
+    if (*out).len == 0 { return }
+    if (*out).len >= 2 && rt.ld8((*out).ptr as u64, (*out).len - 1) == 10 as u8 && rt.ld8((*out).ptr as u64, (*out).len - 2) == 10 as u8 { return }
+    put(out, "\n\n")
+}
+
 // the markdown source of the view: `src` (G_CHAT) with every placeholder expanded and the pending group inserted at `live_at`
 fn compose(src: *mut rt.Buf, live_at: usize, out: *mut rt.Buf) {
     rt.buf_clear(out)
     let base: u64 = (*src).ptr as u64
     let n: usize = (*src).len
-    var live_done: bool = PEND == 999999
+    var live_done: bool = PEND == 999999 && PT_N == 0
+    var live_g: usize = PEND
+    if PEND == 999999 { live_g = VG }
     var i: usize = 0
     var from: usize = 0
     while i < n {
         if !live_done && i == live_at {
             rt.buf_push_bytes(out, base + from as u64, i - from)
             from = i
-            render_group(out, PEND)
+            sep(out)
+            render_group(out, live_g)
             live_done = true
         }
         if rt.ld8(base, i) == 2 as u8 {
@@ -499,6 +798,7 @@ fn compose(src: *mut rt.Buf, live_at: usize, out: *mut rt.Buf) {
                 if d >= 48 as u8 && d <= 57 as u8 && g < 100000000 { g = g * 10 + (d - 48 as u8) as usize }
                 j = j + 1
             }
+            sep(out)
             render_group(out, g)
             i = j + 1
             from = i
@@ -507,11 +807,14 @@ fn compose(src: *mut rt.Buf, live_at: usize, out: *mut rt.Buf) {
         }
     }
     rt.buf_push_bytes(out, base + from as u64, n - from)
-    if !live_done { render_group(out, PEND) }
+    if !live_done {
+        sep(out)
+        render_group(out, live_g)
+    }
 }
 
 // a tapped link of the view: true = it was ours (step:<g> toggles a group, chip:/err:<step> shows / hides a step's output,
-// more:<step> shows more / fewer lines), re-render
+// more:<step> shows more / fewer lines, thr:<step> a thought, think:g<g> a group of thoughts), re-render
 fn on_link(p: u64, n: usize) -> bool {
     var kind: u8 = 0 as u8
     var skip: usize = 5
@@ -526,6 +829,22 @@ fn on_link(p: u64, n: usize) -> bool {
         kind = 3 as u8
         skip = 4
     }
+    if n > 4 && rt.mem_eq(p, "thr:".p as u64, 4) {
+        kind = 4 as u8
+        skip = 4
+    }
+    if n > 5 && rt.mem_eq(p, "thro:".p as u64, 5) {
+        kind = 4 as u8
+        skip = 5
+    }
+    if n > 7 && rt.mem_eq(p, "think:g".p as u64, 7) {
+        kind = 1 as u8
+        skip = 7
+    }
+    if n > 8 && rt.mem_eq(p, "thinko:g".p as u64, 8) {
+        kind = 1 as u8
+        skip = 8
+    }
     if kind == 0 as u8 { return false }
     var v: usize = 0
     var i: usize = skip
@@ -535,13 +854,23 @@ fn on_link(p: u64, n: usize) -> bool {
         i = i + 1
     }
     if kind == 1 as u8 {
+        if v == VG {
+            VG_OPEN = !VG_OPEN
+            return true
+        }
         if v >= G_N { return false }
         if G_OPEN[v] == 0 as u8 { G_OPEN[v] = 1 as u8 } else { G_OPEN[v] = 0 as u8 }
         return true
     }
     if v >= S_N { return false }
-    if kind == 3 as u8 {
-        if S_DET[v] == 0 as u8 { S_DET[v] = 1 as u8 } else { S_DET[v] = 0 as u8 }
+    if kind == 3 as u8 || kind == 4 as u8 {
+        if S_DET[v] == 0 as u8 {
+            S_DET[v] = 1 as u8
+            // a cut input is fetched when the detail opens (web: showToolDetail loads /input/<n>)
+            if kind == 3 as u8 && S_CUT[v] >= 0 && S_ARG_N[v] == 0 { FETCH = S_CUT[v] }
+        } else {
+            S_DET[v] = 0 as u8
+        }
         return true
     }
     if S_FULL[v] == 0 as u8 { S_FULL[v] = 1 as u8 } else { S_FULL[v] = 0 as u8 }

@@ -135,6 +135,7 @@ static mut G_SELROW: usize = 0 // row with Copy + Quote, shown while text is sel
 static mut G_PHOTO: usize = 0
 static mut G_FOLLOW: bool = true
 static mut G_ANS_AT: usize = 0
+static mut G_THINK_MS: i64 = 0 // last repaint while the reasoning streams (throttled)
 static mut G_SPLIT: usize = 0 // where the tool step group of the streamed answer sits: behind the text said before the first tool call
 static mut G_TXT_AT: usize = 0 // start of the streamed text not yet folded into the steps (text between two tool calls goes into the group)
 static mut G_HELD: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // history: the last answer text, held until we know whether a tool call follows (then it is folded into the steps)
@@ -498,6 +499,11 @@ fn on_md_link(ud: u64, p: u64, n: usize) {
         chat_changed()
         G_FOLLOW = false
         markdownview.mdv_set_offset(mdv(), off)
+        // a step whose input the history cut: load it now (JE_INPUT fills the argument box)
+        let cn: i64 = jsteps.take_fetch()
+        if cn >= 0 {
+            let ok: bool = jarvisc.jc_input(jshell.jc(), cn)
+        }
         return
     }
     on_link(ud, p, n)
@@ -597,6 +603,23 @@ fn release_held() {
     G_HELD_ON = false
     jsteps.flush(&G_CHAT)
     chat_add_answer(__str_copy(str { p: G_HELD.ptr as *mut u8, n: G_HELD.len }), G_HELD_DUR, G_HELD_AT, "")
+    // a finished run (the server stored how long it took) ends the turn: the next steps start a fresh group (web: isFinished)
+    if G_HELD_DUR > 0 { jsteps.new_turn() }
+}
+
+// history: the held text is followed by a tool call. Like the web: the words before the first tool call and a text that is a real answer
+// (a question, several lines, a list, long: jsteps.keep_visible) stay visible and the next steps start a fresh group; a short
+// transition line goes into the group.
+fn resolve_held_for_tool() {
+    if !G_HELD_ON { return }
+    G_HELD_ON = false
+    let ht: str = str { p: G_HELD.ptr as *mut u8, n: G_HELD.len }
+    if !jsteps.turn_has_group() || jsteps.keep_visible(ht) {
+        jsteps.flush_group_at(&G_CHAT, G_CHAT.len)
+        chat_add_plain(__str_copy(ht))
+    } else {
+        jsteps.add_text(ht)
+    }
 }
 
 // live: the text streamed since the last tool call goes into the steps (web: the bot text between tools is folded)
@@ -2354,19 +2377,23 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
     } else if kind == jarvisc.JE_CLOSE || kind == jarvisc.JE_NETERR {
         jshell.set_status("Offline - verbinde neu")
     } else if kind == jarvisc.JE_HIST_TOOL {
-        if G_HELD_ON {
-            G_HELD_ON = false
-            if jsteps.has_pending() {
-                jsteps.add_text(str { p: G_HELD.ptr as *mut u8, n: G_HELD.len })
-            } else {
-                chat_add_plain(__str_copy(str { p: G_HELD.ptr as *mut u8, n: G_HELD.len }))
-            }
-        }
-        jsteps.hist_tool(jarvisc.jc_text(c), jarvisc.jc_options(c), jarvisc.jc_result(c), arg)
+        resolve_held_for_tool()
+        jsteps.hist_tool(jarvisc.jc_text(c), jarvisc.jc_options(c), jarvisc.jc_result(c), arg, jarvisc.jc_cut(c))
+    } else if kind == jarvisc.JE_HIST_THINK {
+        // a thought of the history: arg = genMs (the held text, if any, stays held: a thought is no activity that folds it)
+        jsteps.hist_think(jarvisc.jc_text(c), arg)
+    } else if kind == jarvisc.JE_INPUT {
+        // the full input of a cut step arrived: show its argument
+        jsteps.set_cut_arg(arg, jarvisc.jc_options(c))
+        let off: f64 = markdownview.mdv_offset(mdv())
+        chat_changed()
+        G_FOLLOW = false
+        markdownview.mdv_set_offset(mdv(), off)
     } else if kind == jarvisc.JE_HIST {
         release_held()
         if arg == 1 {
             jsteps.flush(&G_CHAT)
+            jsteps.new_turn()
             chat_add_user(jarvisc.jc_text(c))
         } else {
             var hd: i64 = 0
@@ -2394,14 +2421,29 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
         // the history is in: the pill "opening the chat ..." (open from a notification / the list) must not stay (r141)
         if arg == 1 { jshell.set_status(jtexts.t("chat.thinking")) } else { jshell.set_status("online") }
     } else if kind == jarvisc.JE_TOKEN {
+        let te: bool = jsteps.think_end(time.now_unix_ms())
         chat_add(jarvisc.jc_text(c))
     } else if kind == jarvisc.JE_THINKING {
         jshell.set_status(jtexts.t("chat.thinking"))
+        // the reasoning itself (web: a live "Denkt nach" block) goes into the steps
+        let tnow: i64 = time.now_unix_ms()
+        jsteps.think_live(jarvisc.jc_text(c), tnow)
+        if tnow - G_THINK_MS > 150 {
+            G_THINK_MS = tnow
+            chat_changed()
+        }
     } else if kind == jarvisc.JE_TOOL {
         jshell.set_status("Werkzeug: " + jarvisc.jc_text(c))
+        let te: bool = jsteps.think_end(time.now_unix_ms())
         if !jsteps.hidden(jarvisc.jc_text(c)) {
             if !jsteps.turn_has_group() {
                 // the first tool call: the words said before it stay above the steps
+                G_SPLIT = G_CHAT.len
+                G_TXT_AT = G_CHAT.len
+            } else if G_CHAT.len > G_TXT_AT && jsteps.keep_visible(str { p: ((G_CHAT.ptr as u64) + G_TXT_AT as u64) as *mut u8, n: G_CHAT.len - G_TXT_AT }) {
+                // a real answer between two tool calls (web keepBotVisible) stays: the group so far sits in front of it, the next steps start a new one
+                jsteps.flush_group_at(&G_CHAT, G_TXT_AT)
+                chat_add("\n\n")
                 G_SPLIT = G_CHAT.len
                 G_TXT_AT = G_CHAT.len
             } else {
@@ -2433,10 +2475,12 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
         rt.buf_free(&card)
         // a48: no auto-open; the card above opens the file on a tap (on_link)
     } else if kind == jarvisc.JE_ERROR {
+        let te: bool = jsteps.think_end(time.now_unix_ms())
         jsteps.flush_at(&G_CHAT, G_SPLIT)
         chat_add("\n\n**error:** " + jarvisc.jc_text(c) + "\n\n")
         set_busy(jshell.app_ui(), false)
     } else if kind == jarvisc.JE_DONE {
+        let te: bool = jsteps.think_end(time.now_unix_ms())
         // cut the ">STATUS:" line the server appends to an answer
         var intro: str = ""
         var from: usize = G_ANS_AT
