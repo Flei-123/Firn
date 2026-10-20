@@ -1,0 +1,205 @@
+// SPDX-License-Identifier: MPL-2.0
+// english: ok
+// lib/fui/popmenu.fi -- a small popup menu card (the look of the JARVIS web app's .attach-menu / .menu): a dark rounded card with a
+// hairline, a soft shadow and rows of "icon + label". It pops over the content (no layout room), fades + slides in, and closes on
+// a tap outside. One struct, no scene node: the host paints it last in its own draw hook and routes taps to it.
+//
+//     var m: popmenu.PopMenu = popmenu.pm_new()
+//     popmenu.pm_add(&m, "Image", lucide.IMAGE, false)         // up to PM_MAX rows; `on` = accent coloured (a switch that is on)
+//     popmenu.pm_open(&m, ax, ay, true, false, now_ms)         // anchor point in window px: opens ABOVE (up) or BELOW it; right = right-aligned
+//     let running: bool = popmenu.pm_paint(c, &m, now_ms)      // every frame while open; true = still animating (ask for another frame)
+//     let i: i64 = popmenu.pm_hit(&m, x, y)                    // tap: row index, PM_OUTSIDE (close it), PM_CARD (on the card, no row)
+//
+// The geometry is pure math (pm_layout, pm_hit take pixels), so tools/fui/popmenu_main.fi tests it without a window.
+import std.rt
+import fui.render
+import fui.painter
+import fui.theme
+import fui.style
+import fui.icons
+import fui.kit
+
+export {
+    PopMenu, PM_MAX, PM_OUTSIDE, PM_CARD, PM_ANIM_MS,
+    pm_new, pm_clear, pm_add, pm_set_on, pm_count, pm_open, pm_close, pm_is_open, pm_layout, pm_progress, pm_hit, pm_paint, pm_content_w,
+}
+
+const PM_MAX: usize = 8
+const PM_OUTSIDE: i64 = 0 - 1
+const PM_CARD: i64 = 0 - 2
+const PM_ANIM_MS: i64 = 140
+
+// design points (web .attach-menu: padding 6, radius 12, row padding 10 / 12, gap 2, icon 18, label 14 px)
+const PAD: f64 = 6.0
+const ROW_PAD_X: f64 = 12.0
+const ROW_H: f64 = 41.0
+const ROW_GAP: f64 = 2.0
+const ICON: f64 = 18.0
+const ICON_GAP: f64 = 10.0
+const MIN_ROW_W: f64 = 148.0
+const RADIUS: f64 = 12.0
+const EDGE: f64 = 8.0 // distance between the card and the anchor point
+const MARGIN: f64 = 4.0 // distance to the window edge
+const SLIDE: f64 = 6.0
+
+struct PopMenu {
+    open: bool,
+    t0: i64,
+    n: usize,
+    label: [str; 8],
+    icon: [i64; 8],
+    on: [bool; 8],
+    ax: f64,
+    ay: f64,
+    up: bool,
+    right: bool,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    unit: f64, // pixels per design point of the last layout
+}
+
+fn pm_new() -> PopMenu {
+    return PopMenu { open: false, t0: 0, n: 0, label: [""; 8], icon: [0; 8], on: [false; 8], ax: 0.0, ay: 0.0, up: true, right: false, x: 0.0, y: 0.0, w: 0.0, h: 0.0, unit: 1.0 }
+}
+
+fn pm_clear(p: *mut PopMenu) {
+    (*p).n = 0
+    (*p).open = false
+}
+
+// one more row; false when the menu is full. The label must stay valid while the menu is used (a literal or a persistent copy).
+fn pm_add(p: *mut PopMenu, label: str, icon: i64, on: bool) -> bool {
+    if (*p).n >= PM_MAX { return false }
+    let k: usize = (*p).n
+    (*p).label[k] = label
+    (*p).icon[k] = icon
+    (*p).on[k] = on
+    (*p).n = k + 1
+    return true
+}
+
+fn pm_set_on(p: *mut PopMenu, k: usize, on: bool) {
+    if k < (*p).n { (*p).on[k] = on }
+}
+
+fn pm_count(p: *mut PopMenu) -> usize { return (*p).n }
+fn pm_is_open(p: *mut PopMenu) -> bool { return (*p).open }
+
+fn pm_open(p: *mut PopMenu, ax: f64, ay: f64, up: bool, right: bool, now_ms: i64) {
+    if (*p).n == 0 { return }
+    (*p).ax = ax
+    (*p).ay = ay
+    (*p).up = up
+    (*p).right = right
+    (*p).t0 = now_ms
+    (*p).open = true
+}
+
+fn pm_close(p: *mut PopMenu) { (*p).open = false }
+
+// the widest row content in pixels given the widest label (px): icon + gap + label, at least the web minimum
+fn pm_content_w(unit: f64, label_w: f64) -> f64 {
+    var w: f64 = (ICON + ICON_GAP) * unit + label_w
+    let m: f64 = MIN_ROW_W * unit
+    if w < m { w = m }
+    return w
+}
+
+// the card rectangle in window pixels for a window of win_w x win_h; label_w = widest label in pixels
+fn pm_layout(p: *mut PopMenu, unit: f64, win_w: f64, win_h: f64, label_w: f64) {
+    (*p).unit = unit
+    let n: f64 = (*p).n as f64
+    (*p).w = pm_content_w(unit, label_w) + (ROW_PAD_X * 2.0 + PAD * 2.0) * unit
+    (*p).h = (n * ROW_H + (n - 1.0) * ROW_GAP + PAD * 2.0) * unit
+    var x: f64 = (*p).ax
+    if (*p).right { x = (*p).ax - (*p).w }
+    var y: f64 = (*p).ay + EDGE * unit
+    if (*p).up { y = (*p).ay - (*p).h - EDGE * unit }
+    let mg: f64 = MARGIN * unit
+    if x + (*p).w > win_w - mg { x = win_w - mg - (*p).w }
+    if x < mg { x = mg }
+    if y + (*p).h > win_h - mg { y = win_h - mg - (*p).h }
+    if y < mg { y = mg }
+    (*p).x = x
+    (*p).y = y
+}
+
+// 0.0 .. 1.0, eased out
+fn pm_progress(p: *mut PopMenu, now_ms: i64) -> f64 {
+    var t: f64 = ((now_ms - (*p).t0) as f64) / (PM_ANIM_MS as f64)
+    if t < 0.0 { t = 0.0 }
+    if t > 1.0 { t = 1.0 }
+    let u: f64 = 1.0 - t
+    return 1.0 - u * u
+}
+
+// the row under a point (window pixels): its index, PM_CARD on the card but between rows, PM_OUTSIDE off the card
+fn pm_hit(p: *mut PopMenu, x: f64, y: f64) -> i64 {
+    if !(*p).open { return PM_OUTSIDE }
+    if x < (*p).x || x > (*p).x + (*p).w || y < (*p).y || y > (*p).y + (*p).h { return PM_OUTSIDE }
+    let u: f64 = (*p).unit
+    var i: usize = 0
+    while i < (*p).n {
+        let ry: f64 = (*p).y + (PAD + (i as f64) * (ROW_H + ROW_GAP)) * u
+        if y >= ry && y <= ry + ROW_H * u { return i as i64 }
+        i = i + 1
+    }
+    return PM_CARD
+}
+
+// colour `col` (0xAARRGGBB) with its alpha scaled by k (0..1)
+fn fade(col: u32, k: f64) -> u32 {
+    let a: f64 = ((col >> 24) as f64) * k
+    return (((a as u32) & 255 as u32) << 24) | (col & 16777215 as u32)
+}
+
+// Paints the card. Call it last in the host's draw hook. Returns true while the pop-in still runs.
+fn pm_paint(c: *mut render.Ctx, p: *mut PopMenu, now_ms: i64) -> bool {
+    if !(*p).open || (*p).n == 0 { return false }
+    let u: f64 = render.len_of(c, 1)
+    var maxw: f64 = 0.0
+    var i: usize = 0
+    while i < (*p).n {
+        let tw: f64 = kit.text_width(c, 14.0, 400, (*p).label[i])
+        if tw > maxw { maxw = tw }
+        i = i + 1
+    }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    pm_layout(p, u, ((*z).w) as f64, ((*z).h) as f64, maxw) // the painter's surface = the window
+    let k: f64 = pm_progress(p, now_ms)
+    let dy: f64 = (1.0 - k) * SLIDE * u
+    var ox: f64 = (*p).x
+    var oy: f64 = (*p).y + dy
+    if !(*p).up { oy = (*p).y - dy }
+    let f: *mut theme.Colors = theme.theme_colors(render.ctx_theme(c))
+    // soft shadow: three growing translucent rings under the card (web 0 10px 28px rgba(0,0,0,.35))
+    var s: usize = 0
+    while s < 3 {
+        let g: f64 = ((s + 1) as f64) * 5.0 * u
+        painter.round_rect(z, ox - g * 0.6, oy - g * 0.1 + 4.0 * u, (*p).w + g * 1.2, (*p).h + g * 1.2, RADIUS * u + g, fade(0x14000000 as u32, k))
+        s = s + 1
+    }
+    painter.round_rect(z, ox, oy, (*p).w, (*p).h, RADIUS * u, fade((*f).separator | 4278190080 as u32, k))
+    painter.round_rect(z, ox + 1.0, oy + 1.0, (*p).w - 2.0, (*p).h - 2.0, RADIUS * u - 1.0, fade(theme.opaque((*f).surface), k))
+    let txt: u32 = render.color_of(c, style.color_token(style.TOK_TEXT))
+    let acc: u32 = render.color_of(c, style.color_token(style.TOK_ACCENT))
+    let dim: u32 = render.color_of(c, style.color_token(style.TOK_TEXT_MUTED))
+    i = 0
+    while i < (*p).n {
+        let ry: f64 = oy + (PAD + (i as f64) * (ROW_H + ROW_GAP)) * u
+        var fg: u32 = txt
+        var ic: u32 = dim
+        if (*p).on[i] {
+            fg = acc
+            ic = acc
+        }
+        let ix: f64 = ox + (PAD + ROW_PAD_X) * u
+        icons.icon(z, (*p).icon[i], ix, ry + (ROW_H - ICON) * 0.5 * u, ICON * u, fade(ic, k))
+        let tx: f64 = ix + (ICON + ICON_GAP) * u
+        let w: f64 = kit.draw_label(c, tx, ry, ROW_H * u, 14.0, 400, fade(fg, k), (*p).label[i], 0.0)
+        i = i + 1
+    }
+    return k < 1.0
+}

@@ -237,6 +237,17 @@ def reply(status, obj, extra=None):
         h[k] = v
     return Response(status, HTTPStatus(status).phrase, h, body)
 
+def a64_fixture():
+    # same text as tmp/a64/layout/fixture.md (the web render is made from it)
+    md = open(os.environ.get("FAKE_A64_MD", os.path.join(os.path.dirname(os.path.abspath(__file__)), "a64_fixture.md")), encoding="utf-8").read()
+    now = int(time.time() * 1000)
+    return [
+        {"role": "user", "text": "Zeig mir bitte den Status und pr\u00fcfe `check` noch einmal.", "at": now - 60000},
+        {"role": "assistant", "text": md, "genMs": 17000, "at": now - 20000},
+        {"role": "sys", "text": "\u2705 Worker fertig \u2014 \u201eGer\u00e4te-Status Check\u201c (Chat c_lfh_znA5mgLN): **N-WORT** \u2013 verbunden. Sonst keine Ger\u00e4te online, Boss.", "at": now - 10000},
+    ]
+
+
 async def process_request(conn, request):
     u = urlparse(request.path)
     if u.path.startswith("/api/conversations/"):
@@ -244,6 +255,8 @@ async def process_request(conn, request):
             return reply(401, {"error": "Not logged in"})
         cid = unquote(u.path[len("/api/conversations/"):])
         LOG.write(json.dumps({"type": "rest", "method": "GET", "path": u.path, "auth": True}) + "\n"); LOG.flush()
+        if cid not in CONV and os.environ.get("FAKE_A64") == "1":  # a64: the layout fixture of the web comparison (user bubble, markdown answer with meta line, worker note)
+            CONV[cid] = a64_fixture()
         if cid not in CONV and os.environ.get("FAKE_HIST") == "1":
             CONV[cid] = gen_messages(cid)
             for _m in CONV[cid]: _m["text"] = _m["text"].replace("\x02", "")  # jsteps.fi panics on a stray \x02 (open point), not the subject here
