@@ -141,7 +141,7 @@ def sidebar_chats():
 
 ADMIN_LIMITS = {"maxSubworkers": 5, "heavySlots": 8, "autoLoop": True}
 # user settings (A50): GET/POST /api/settings (switches + persona)
-SETTINGS = {"personality": "jarvis", "personas": [{"id": "p_demo", "name": "Bro", "base": "jarvis"}], "autoConfirm": True, "deepMode": True, "expMode": False, "learnMode": False, "planMode": False}
+SETTINGS = {"personality": "jarvis", "personas": [{"id": "p_demo", "name": "Bro", "base": "jarvis"}], "ttsRate": 1.05, "ttsVoice": "", "ttsSpeaker": "", "autoConfirm": True, "deepMode": True, "expMode": False, "learnMode": False, "planMode": False}
 # folders (A48): FAKE_FOLDERS=1 starts with two folders and puts s1/s3/s5 in them; POST /api/m/folders/(add|rename|remove), /api/m/chats/move
 FOLDERS = [{"id": "f_work", "name": "Work", "order": 0}, {"id": "f_priv", "name": "Privat", "order": 1}] if os.environ.get("FAKE_FOLDERS") == "1" else []
 CHAT_FOLDER = {"s1": "f_work", "s3": "f_work", "s5": "f_priv"} if os.environ.get("FAKE_FOLDERS") == "1" else {}
@@ -337,6 +337,64 @@ def psummary(p):
 def pfull(p):
     return psummary(p) | {"roadmap": p["roadmap"], "needs": p["needs"], "chats": p["chats"]}
 
+PW = {"cur": os.environ.get("FAKE_PW", "secret1234")}
+MEM = {"k": [], "t": [], "p": {"Name": "Justin", "Wohnort": "Innsbruck"}, "seq": 0}
+def mem_seed():
+    for i in range(1, 61):
+        MEM["k"].append({"id": "mk%03d" % i, "text": ("Fakt %d: Firn Beat Kotlin Messung, Umlaute aeoeue \u00e4\u00f6\u00fc, langer Text " % i) + "x" * (i * 9 % 500), "tag": ["firn", "osum", "certus", ""][i % 4], "at": "2026-10-%02dT10:00:00.000Z" % (1 + i % 28)})
+    MEM["t"].append({"id": "mt001", "text": "Aufgabe: Zahnarzt anrufen", "tag": "", "at": "2026-10-19T08:00:00.000Z", "done": False})
+mem_seed()
+def mem_items():
+    out = [dict(x, type="knowledge") for x in MEM["k"]] + [dict(x, type="task") for x in MEM["t"]]
+    out += [{"id": "p:" + k, "type": "profile", "tag": "", "text": k + ": " + v, "at": ""} for k, v in MEM["p"].items()]
+    return out
+def mem_pub(e, full):
+    lim = 4000 if full else 400
+    o = {"id": e["id"], "type": e["type"], "tag": e.get("tag", ""), "text": e["text"][:lim], "chars": len(e["text"]), "at": e.get("at", "")}
+    if len(e["text"]) > lim: o["trunc"] = True
+    return o
+def mem_route(method, q, b):
+    def out(st, obj): return (st, json.dumps(obj).encode(), "application/json")
+    items = mem_items()
+    if method == "GET":
+        if q.get("id"):
+            e = [x for x in items if x["id"] == q["id"][0]]
+            return out(200, {"item": mem_pub(e[0], True)}) if e else out(404, {"error": "Nicht gefunden"})
+        qq = (q.get("q") or [""])[0].lower().strip(); ty = (q.get("type") or [""])[0]
+        lim = int((q.get("limit") or ["40"])[0]); off = int((q.get("offset") or ["0"])[0])
+        hits = [x for x in items if (not ty or x["type"] == ty) and (not qq or qq in x["text"].lower() or qq in x.get("tag", ""))]
+        hits.sort(key=lambda x: x.get("at", ""), reverse=True)
+        tags = {}
+        for x in MEM["k"]:
+            if x.get("tag"): tags[x["tag"]] = tags.get(x["tag"], 0) + 1
+        return out(200, {"total": len(hits), "all": len(items), "items": [mem_pub(x, False) for x in hits[off:off + lim]], "tags": [{"name": k, "n": v} for k, v in tags.items()]})
+    act = b.get("action"); text = str(b.get("text", "")).strip(); i = str(b.get("id", ""))
+    if act == "add":
+        if not text: return out(400, {"error": "Text fehlt"})
+        MEM["seq"] += 1; ty = b.get("type")
+        if ty == "profile" and ":" in text:
+            k, _, v = text.partition(":"); MEM["p"][k.strip()] = v.strip()
+        else:
+            MEM["t" if ty == "task" else "k"].append({"id": "mn%03d" % MEM["seq"], "text": text, "tag": str(b.get("tag", "")).lower(), "at": "2026-10-20T09:00:00.000Z"})
+        return out(200, {"ok": True})
+    if act == "edit":
+        if not text: return out(400, {"error": "Text fehlt"})
+        if i.startswith("p:"):
+            MEM["p"].pop(i[2:], None); k, _, v = text.partition(":"); MEM["p"][k.strip() if v else i[2:]] = (v or text).strip(); return out(200, {"ok": True})
+        for lst in (MEM["k"], MEM["t"]):
+            for e in lst:
+                if e["id"] == i:
+                    e["text"] = text; e["tag"] = str(b.get("tag", e.get("tag", ""))).lower(); e["at"] = "2026-10-20T09:30:00.000Z"; return out(200, {"ok": True})
+        return out(404, {"error": "Nicht gefunden"})
+    if act == "delete":
+        if i.startswith("p:"):
+            return out(200, {"ok": True}) if MEM["p"].pop(i[2:], None) is not None else out(404, {"error": "Nicht gefunden"})
+        for lst in (MEM["k"], MEM["t"]):
+            for e in lst:
+                if e["id"] == i: lst.remove(e); return out(200, {"ok": True})
+        return out(404, {"error": "Nicht gefunden"})
+    return out(400, {"error": "Unbekannte Aktion"})
+
 def rest(method, rawpath, hdr, body):
     """-> (status, bytes, ctype) or None (not a REST route of the app client)."""
     global tseq
@@ -344,7 +402,7 @@ def rest(method, rawpath, hdr, body):
     path = u.path
     q = parse_qs(u.query)
     if not (path in ("/api/me", "/api/projects", "/api/command-center", "/api/conversations", "/api/tasks",
-                     "/api/remote/devices", "/api/settings", "/api/push-token", "/api/stt", "/api/m/upload")
+                     "/api/remote/devices", "/api/settings", "/api/voices", "/api/push-token", "/api/stt", "/api/m/upload", "/api/account/password")
             or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
             or path.startswith("/vendor/fonts/") or path.startswith("/img/") or path.startswith("/dl/")):
         return None
@@ -525,9 +583,22 @@ def rest(method, rawpath, hdr, body):
             return out(200, {"ok": True, "id": row["id"]})
         if mp == "push/register" and method == "POST":
             return out(200, {"pushToken": "00112233445566778899aabbccddeeff", "relay": {"host": "127.0.0.1", "port": 7781, "tls": False, "pin": None, "hello": True, "sni": None}, "poll": "/api/m/push/poll"})
+        if mp == "memory":  # a65: the user's memory (FAKE_NO_MEMORY=1: older server, 404)
+            if os.environ.get("FAKE_NO_MEMORY"): return out(404, {"error": "Not found"})
+            return mem_route(method, q, j or {})
         if mp == "push/test" and method == "POST":
             return out(200, {"ok": True, "sent": 1})
         return out(404, {"error": "Not found"})
+    if path == "/api/account/password" and method == "POST":  # a65: FAKE_PW = current password, FAKE_PW_NOTOKEN=1 = server without the token in the answer, FAKE_PW_LOCK=1 = 429
+        b = j or {}
+        if os.environ.get("FAKE_PW_LOCK"): return out(429, {"error": "Zu viele Fehlversuche. Bitte in 30s erneut versuchen."})
+        if len(str(b.get("password", ""))) < 8: return out(400, {"error": "Passwort zu kurz (min. 8)"})
+        if str(b.get("old", "")) == str(b.get("password", "")): return out(400, {"error": "Das neue Passwort ist das alte."})
+        if str(b.get("old", "")) != PW["cur"]: return out(403, {"error": "Aktuelles Passwort stimmt nicht."})
+        PW["cur"] = str(b.get("password"))
+        return out(200, {"ok": True} if os.environ.get("FAKE_PW_NOTOKEN") else {"ok": True, "token": TOKEN})
+    if path == "/api/voices":  # a65: the Piper voice list of the web settings
+        return out(200, {"voices": [{"id": "de_thorsten", "label": "Thorsten", "gender": "m", "default": True}, {"id": "de_kerstin", "label": "Kerstin", "gender": "w"}]})
     if path == "/api/settings":
         if method in ("POST", "PATCH"):
             try:
@@ -691,6 +762,14 @@ async def handler(ws):
                 cid = "fake%d" % seq
                 CONV[cid] = []
                 await send(ws, {"type": "conversation", "id": cid, "title": "t"})
+            if m.get("editEnd"):  # a65: edit / repeat from a message: cut the n-th user message from the END and all after it (server lib/conversations.js cutAtUserFromEnd)
+                cnt = 0
+                for k in range(len(CONV[cid]) - 1, -1, -1):
+                    if CONV[cid][k]["role"] == "user":
+                        cnt += 1
+                        if cnt == int(m["editEnd"]):
+                            del CONV[cid][k:]
+                            break
             CONV[cid].append({"role": "user", "text": text})
             await send(ws, {"type": "user", "cid": cid, "text": text})  # echo of my own message
             if text == "drop":

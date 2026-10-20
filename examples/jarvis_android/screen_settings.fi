@@ -40,11 +40,29 @@ static mut G_SW: [usize; 5] = [0; 5]
 static mut G_FLAGS: u32 = 0
 static mut G_PERS: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_PERSONAS: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+// a65: speech output (web: Settings > Sprache): tempo = ttsRate (also used by the device voice of "read aloud"), voice = ttsVoice (Piper id of the web)
+static mut G_TEMPO_B: usize = 0
+static mut G_VOICE_B: usize = 0
+static mut G_TEST_B: usize = 0
+static mut G_RATE100: i64 = 0 // ttsRate * 100, 0 = not loaded yet
+static mut G_VOICE: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_SPEAKER: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_VOICES: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // "id\x01label\n" lines of GET /api/voices
+static mut G_VOICES_N: u64 = 0
 static mut G_SET_N: u64 = 0
 static mut G_SET_OK: bool = false
 static mut G_SET_NOTE: usize = 0 // hint line of the switches card: the settings route is missing (older server) or a change was not stored
 static mut G_SET_FAIL: i64 = 0 // HTTP status of the last failed settings request, 0 = fine
 static mut G_SET_FAIL_GET: bool = false
+static mut G_PW_BOX: usize = 0 // Settings > Account > Change password: the form (hidden until the chip is tapped)
+static mut G_PW_OLD: usize = 0
+static mut G_PW_NEW: usize = 0
+static mut G_PW_REP: usize = 0
+static mut G_PW_SHOW: usize = 0
+static mut G_PW_NOTE: usize = 0 // result line (stays after the form closes)
+static mut G_PW_BUSY: bool = false
+static mut G_PW_VIS: bool = false
+static mut G_PW_OPEN: bool = false
 
 // Advanced: the server address is not a setting for people. This opens the sign-in page with the developer panel.
 fn on_advanced(a: *mut app.App) { jshell.request_dev() }
@@ -131,6 +149,90 @@ fn on_channel(a: *mut app.App) {
 }
 
 fn on_logout(a: *mut app.App) { jshell.request_logout() }
+
+
+// ---------------------------------------------------------------- change password (POST /api/account/password)
+
+fn pw_note(a: *mut app.App, s: str) {
+    app.set_text(a, G_PW_NOTE, s)
+    jshell.set_shown(a, G_PW_NOTE, s.n > 0, 0)
+}
+
+fn pw_clear(a: *mut app.App) {
+    app.set_text(a, G_PW_OLD, "")
+    app.set_text(a, G_PW_NEW, "")
+    app.set_text(a, G_PW_REP, "")
+}
+
+fn pw_open(a: *mut app.App, on: bool) {
+    G_PW_OPEN = on
+    jshell.set_shown(a, G_PW_BOX, on, 0)
+    if !on { pw_clear(a) }
+}
+
+fn on_pw_toggle(a: *mut app.App) {
+    if G_PW_BUSY { return }
+    let open: bool = !G_PW_OPEN
+    pw_note(a, "")
+    pw_open(a, open)
+    if open { app.set_focus(a, G_PW_OLD) }
+}
+
+fn on_pw_show(a: *mut app.App) {
+    G_PW_VIS = !G_PW_VIS
+    app.set_secret(a, G_PW_OLD, !G_PW_VIS)
+    app.set_secret(a, G_PW_NEW, !G_PW_VIS)
+    app.set_secret(a, G_PW_REP, !G_PW_VIS)
+    if G_PW_VIS { app.set_text(a, G_PW_SHOW, jtexts.t("login.hide")) } else { app.set_text(a, G_PW_SHOW, jtexts.t("login.show")) }
+}
+
+fn on_pw_save(a: *mut app.App) {
+    if G_PW_BUSY { return }
+    let old: str = __str_copy(app.text(a, G_PW_OLD))
+    let fresh: str = __str_copy(app.text(a, G_PW_NEW))
+    let rep: str = __str_copy(app.text(a, G_PW_REP))
+    if old.n == 0 || fresh.n == 0 || rep.n == 0 { pw_note(a, jtexts.t("pw.empty")); return }
+    if fresh.n < 8 { pw_note(a, jtexts.t("pw.short")); return }
+    if !(fresh == rep) { pw_note(a, jtexts.t("pw.mismatch")); return }
+    if fresh == old { pw_note(a, jtexts.t("pw.same")); return }
+    if jarvisapi.ja_account_password(jshell.api(), old, fresh) {
+        G_PW_BUSY = true
+        pw_note(a, jtexts.t("pw.busy"))
+    } else {
+        pw_note(a, jtexts.t("pw.offline"))
+    }
+}
+
+// the answer of the password call: the server keeps THIS session (new token in the body); an older server does not send one -> sign in again
+fn pw_answer(x: *mut jarvisapi.Api, status: i64) {
+    let a: *mut app.App = jshell.app_ui()
+    G_PW_BUSY = false
+    if status == 200 {
+        let tk: str = jarvisapi.parse_text_field(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), "token")
+        pw_open(a, false)
+        if tk.n > 0 {
+            jarvisc.jc_set_token(jshell.jc(), tk)
+            jarvisapi.ja_set_token(jshell.api(), tk)
+            let saved: bool = jarvisc.jc_save(jshell.jc(), jshell.SERVICE)
+            pw_note(a, jtexts.t("pw.ok"))
+        } else {
+            pw_note(a, jtexts.t("pw.ok-relogin"))
+            jshell.request_logout()
+        }
+        return
+    }
+    if status == 403 { pw_note(a, jtexts.t("pw.wrong")); return }
+    if status == 429 { pw_note(a, jtexts.t("pw.locked")); return }
+    if status == 404 { pw_note(a, jtexts.t("pw.unavail")); return }
+    if status == 400 {
+        let em: str = jarvisapi.parse_text_field(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), "error")
+        if em.n > 0 { pw_note(a, em); return }
+    }
+    if status == 0 { pw_note(a, jtexts.t("pw.offline")); return }
+    pw_note(a, jtexts.t1("pw.failed", "code", jshell.dec(status)))
+}
+
+fn on_memory(a: *mut app.App) { jshell.request_tab(jshell.TAB_MEMORY) }
 
 // A short German reason for the Status row (the long English text stays in app.log); it must fit next to the label.
 fn err_short(e: u64) -> str {
@@ -303,6 +405,114 @@ fn on_persona_next(a: *mut app.App) {
     show_settings(a)
 }
 
+
+// ---------------------------------------------------------------- a65: speech output (tempo, voice, sample)
+const TEMPO_N: usize = 8
+
+fn tempo_step(i: usize) -> i64 {
+    if i == 0 { return 75 }
+    if i == 1 { return 90 }
+    if i == 2 { return 100 }
+    if i == 3 { return 105 }
+    if i == 4 { return 125 }
+    if i == 5 { return 150 }
+    if i == 6 { return 175 }
+    return 200
+}
+
+// "1.05x" for 105
+fn tempo_text(x100: i64) -> str {
+    let w: i64 = x100 / 100
+    let f: i64 = x100 % 100
+    var fs: str = jshell.dec(f)
+    if f < 10 { fs = "0" + fs }
+    return jshell.dec(w) + "." + fs + "x"
+}
+
+fn on_tempo_next(a: *mut app.App) {
+    if G_RATE100 <= 0 { return }
+    var nx: i64 = tempo_step(0)
+    var i: usize = 0
+    while i < TEMPO_N {
+        if tempo_step(i) > G_RATE100 {
+            nx = tempo_step(i)
+            i = TEMPO_N
+        } else {
+            i = i + 1
+        }
+    }
+    G_RATE100 = nx
+    screen_chat.screen_chat_set_tts_rate(nx)
+    let ok: bool = jarvisapi.ja_settings_set_num(jshell.api(), "ttsRate", (nx as f64) / 100.0)
+    show_tts(a)
+}
+
+fn voice_count() -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < G_VOICES.len {
+        if rt.ld8(G_VOICES.ptr, i) == 10 as u8 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// field f (0 = id, 1 = label) of voice k (k = 0: the default voice, k >= 1: line k-1)
+fn voice_field(k: usize, f: usize) -> str {
+    if k == 0 { if f == 0 { return "" } else { return jtexts.t("set.voice-default") } }
+    var line: usize = 0
+    var st: usize = 0
+    var i: usize = 0
+    while i < G_VOICES.len {
+        if rt.ld8(G_VOICES.ptr, i) == 10 as u8 {
+            if line + 1 == k {
+                var sep: usize = st
+                while sep < i && rt.ld8(G_VOICES.ptr, sep) != 1 as u8 { sep = sep + 1 }
+                if f == 0 { return str { p: ((G_VOICES.ptr) + st as u64) as *mut u8, n: sep - st } }
+                if sep < i { return str { p: ((G_VOICES.ptr) + (sep + 1) as u64) as *mut u8, n: i - sep - 1 } }
+                return ""
+            }
+            line = line + 1
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn voice_cur() -> usize {
+    let n: usize = voice_count() + 1
+    var k: usize = 1
+    while k < n {
+        let id: str = voice_field(k, 0)
+        if G_VOICE.len == id.n && id.n > 0 && rt.mem_eq(G_VOICE.ptr, id.p as u64, id.n) { return k }
+        k = k + 1
+    }
+    return 0
+}
+
+fn on_voice_next(a: *mut app.App) {
+    if voice_count() == 0 {
+        let g: bool = jarvisapi.ja_voices_get(jshell.api())
+        return
+    }
+    let nx: usize = (voice_cur() + 1) % (voice_count() + 1)
+    let id: str = __str_copy(voice_field(nx, 0))
+    rt.buf_clear(&G_VOICE)
+    rt.buf_push_bytes(&G_VOICE, id.p as u64, id.n)
+    let ok: bool = jarvisapi.ja_settings_set_str(jshell.api(), "ttsVoice", id)
+    show_tts(a)
+}
+
+fn on_voice_test(a: *mut app.App) { screen_chat.screen_chat_say(jtexts.t("set.voice-sample")) }
+
+fn show_tts(a: *mut app.App) {
+    var t: str = "..."
+    if G_RATE100 > 0 { t = tempo_text(G_RATE100) }
+    app.set_text(a, G_TEMPO_B, jtexts.t1("set.tempo-btn", "value", t))
+    app.set_text(a, G_VOICE_B, jtexts.t1("set.voice-btn", "name", voice_field(voice_cur(), 1)))
+}
+
 fn show_settings(a: *mut app.App) {
     var i: usize = 0
     while i < 5 {
@@ -314,6 +524,7 @@ fn show_settings(a: *mut app.App) {
         i = i + 1
     }
     app.set_text(a, G_PERSONA_B, jtexts.t1("set.persona-btn", "name", persona_field(persona_cur(), 1)))
+    show_tts(a)
 }
 
 // a49: older server (404) or a failed write: say it instead of dead switches
@@ -348,6 +559,18 @@ fn screen_settings_api(x: *mut jarvisapi.Api, kind: u32, status: i64) -> bool {
     if kind == jarvisapi.AK_ME {
         return false // main.fi keeps the user name
     }
+    if kind == jarvisapi.AK_PW {
+        pw_answer(x, status)
+        return true
+    }
+    if kind == jarvisapi.AK_VOICES {
+        if status == 200 {
+            rt.buf_clear(&G_VOICES)
+            let ok: bool = jarvisapi.parse_voices(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &G_VOICES)
+            show_tts(jshell.app_ui())
+        }
+        return true
+    }
     if kind == jarvisapi.AK_SETTINGS || kind == jarvisapi.AK_SETTINGS_SET {
         if status == 200 {
             var f: u32 = 0 as u32
@@ -356,6 +579,13 @@ fn screen_settings_api(x: *mut jarvisapi.Api, kind: u32, status: i64) -> bool {
             if jarvisapi.parse_settings(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &f, &G_PERS, &G_PERSONAS) {
                 G_FLAGS = f
                 G_SET_OK = true
+                var r100: i64 = 0
+                rt.buf_clear(&G_VOICE)
+                rt.buf_clear(&G_SPEAKER)
+                if jarvisapi.parse_tts_settings(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &r100, &G_VOICE, &G_SPEAKER) && r100 > 0 {
+                    G_RATE100 = r100
+                    screen_chat.screen_chat_set_tts_rate(r100)
+                }
                 screen_chat.screen_chat_set_modes(f, true)
                 G_SET_FAIL = 0
                 show_settings(jshell.app_ui())
@@ -387,6 +617,17 @@ fn screen_settings_build(a: *mut app.App) {
     jsetui.chip_row(a)
     G_PERSONA_B = app.button(a, jtexts.t1("set.persona-btn", "name", "-"), on_persona_next)
     jtheme.style_node(a, G_PERSONA_B, jtheme.K_CHIP)
+    app.end(a)
+    app.end(a)
+    // a65: SPRACHAUSGABE (web: Settings > Sprache)
+    jsetui.card(a, jtexts.t("set.speech"))
+    jsetui.chip_row(a)
+    G_TEMPO_B = app.button(a, jtexts.t1("set.tempo-btn", "value", "..."), on_tempo_next)
+    jtheme.style_node(a, G_TEMPO_B, jtheme.K_CHIP)
+    G_VOICE_B = app.button(a, jtexts.t1("set.voice-btn", "name", jtexts.t("set.voice-default")), on_voice_next)
+    jtheme.style_node(a, G_VOICE_B, jtheme.K_CHIP)
+    G_TEST_B = app.button(a, jtexts.t("set.voice-test"), on_voice_test)
+    jtheme.style_node(a, G_TEST_B, jtheme.K_CHIP)
     app.end(a)
     app.end(a)
     // SCHALTER
@@ -460,6 +701,32 @@ fn screen_settings_build(a: *mut app.App) {
     jtheme.style_node(a, G_ADMIN_BTN, jtheme.K_CHIP)
     jshell.set_shown(a, G_ADMIN_BTN, false, 0)
     app.end(a)
+    jsetui.chip_row(a)
+    jtheme.style_node(a, app.button(a, jtexts.t("pw.open"), on_pw_toggle), jtheme.K_CHIP)
+    jtheme.style_node(a, app.button(a, jtexts.t("mem.open"), on_memory), jtheme.K_CHIP)
+    app.end(a)
+    G_PW_NOTE = app.label(a, "", 0)
+    jtheme.style_node(a, G_PW_NOTE, jsetui.K_SET_HINT)
+    applay.align_start(a, G_PW_NOTE)
+    jshell.set_shown(a, G_PW_NOTE, false, 0)
+    G_PW_BOX = applay.vstack(a)
+    applay.gap(a, G_PW_BOX, 8, 8)
+    G_PW_OLD = jsetui.input(a, jtexts.tp("pw.old"))
+    app.set_secret(a, G_PW_OLD, true)
+    app.set_ime_next(a, G_PW_OLD, true)
+    G_PW_NEW = jsetui.input(a, jtexts.tp("pw.new"))
+    app.set_secret(a, G_PW_NEW, true)
+    app.set_ime_next(a, G_PW_NEW, true)
+    G_PW_REP = jsetui.input(a, jtexts.tp("pw.repeat"))
+    app.set_secret(a, G_PW_REP, true)
+    jsetui.chip_row(a)
+    jtheme.style_node(a, app.button(a, jtexts.t("pw.save"), on_pw_save), jtheme.K_CHIP)
+    G_PW_SHOW = app.button(a, jtexts.t("login.show"), on_pw_show)
+    jtheme.style_node(a, G_PW_SHOW, jtheme.K_CHIP)
+    jtheme.style_node(a, app.button(a, jtexts.t("pw.cancel"), on_pw_toggle), jtheme.K_CHIP)
+    app.end(a)
+    app.end(a)
+    jshell.set_shown(a, G_PW_BOX, false, 0)
     app.end(a)
     // APP
     jsetui.card(a, jtexts.t("set.about"))
@@ -487,6 +754,7 @@ fn screen_settings_refresh(a: *mut app.App) {
         let g: bool = jarvisapi.ja_settings_get(jshell.api())
         if G_SET_N == 1 { let m2: bool = jarvisapi.ja_me(jshell.api()) }
     }
+    if G_VOICES.len == 0 && G_SET_N % 40 == 11 { let vg: bool = jarvisapi.ja_voices_get(jshell.api()) }
     let nx: str = next_channel(update.status_channels(s), appinfo.app_channel())
     jshell.set_shown(a, G_CHAN, nx.n > 0, 0)
     if nx.n > 0 { app.set_text(a, G_CHAN, jtexts.t1("set.channel-btn", "name", channel_title(nx))) }
