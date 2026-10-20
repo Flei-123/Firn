@@ -54,10 +54,16 @@ import jicons
 import jsteps
 import jask
 import screen_sidebar
+import fui.popmenu
+import fui.lucide
+import std.fs
+import appkit.platform
+import appkit.appinfo
+import appkit.util
 
 export {
     screen_chat_build, screen_chat_refresh, screen_chat_event, screen_chat_api, screen_chat_voice_tick, screen_chat_enter, screen_chat_in_node, chat_clear,
-    chat_view_tick, screen_chat_geom, screen_chat_open_cid, screen_chat_build_header, screen_chat_set_usage, screen_chat_set_usage_info, screen_chat_set_model, screen_chat_set_models, screen_chat_new, screen_chat_viewer_back, screen_chat_viewer_open, screen_chat_cycle_model, screen_chat_cycle_effort, screen_chat_cur_model, screen_chat_cur_effort,
+    chat_view_tick, screen_chat_geom, screen_chat_open_cid, screen_chat_build_header, screen_chat_set_usage, screen_chat_set_usage_info, screen_chat_set_model, screen_chat_set_models, screen_chat_new, screen_chat_viewer_back, screen_chat_viewer_open, screen_chat_cycle_model, screen_chat_cycle_effort, screen_chat_cur_model, screen_chat_cur_effort, screen_chat_set_modes, screen_chat_draft_flush,
 }
 
 static mut G_SPK: usize = 0 // header speaker icon (accent while the spoken answer is on)
@@ -165,6 +171,294 @@ const PHOTO_CAP: usize = 3145728 // the picker hands out JPEGs up to this size (
 const FILE_CAP: usize = 20971520 // a file up to this size (the limit of POST /api/m/upload); the buffer is made at the first file
 
 fn mdv() -> *mut markdownview.MdView { return G_MD as *mut markdownview.MdView }
+
+// ---- a64: draft per chat (web: localStorage). One small file per chat id in <app data>/drafts/. Written 0.7 s after the last change, on a chat
+// switch and when the app goes to the background (screen_chat_draft_flush); read back when the chat comes up. Empty text = file removed.
+static mut G_DR_CID: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the chat the composer text belongs to
+static mut G_DR_SEEN: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the text last written / read
+static mut G_DR_INIT: bool = false
+static mut G_DR_CHG_MS: i64 = 0
+static mut G_DR_SENT_NEW: bool = false // a message went out of a chat without id: its id arrives soon, the text typed meanwhile is for that chat
+
+fn buf_eq(b: *mut rt.Buf, s: str) -> bool {
+    if (*b).len != s.n { return false }
+    if s.n == 0 { return true }
+    return rt.mem_eq((*b).ptr, s.p as u64, s.n)
+}
+
+fn dr_dir() -> str {
+    var d: rt.Buf = rt.buf_new()
+    if !platform.plat_dir(platform.DIR_DATA, appinfo.app_id(), appinfo.app_vendor(), &d) {
+        rt.buf_free(&d)
+        return ""
+    }
+    let base: str = util.buf_to_str_copy(&d)
+    rt.buf_free(&d)
+    let dir: str = base + "/drafts"
+    let mk: bool = fs.mkdir_all(dir) catch false
+    if !mk && !fs.exists(dir) { return "" }
+    return dir
+}
+
+// file name of a chat id: only [A-Za-z0-9_-], "new" for a chat without id
+fn dr_path(cid: str) -> str {
+    let dir: str = dr_dir()
+    if dir.n == 0 { return "" }
+    var nm: str = "new"
+    if cid.n > 0 {
+        var b: rt.Buf = rt.buf_new()
+        var i: usize = 0
+        while i < cid.n && i < 80 {
+            let ch: u8 = *((cid.p as u64 + i as u64) as *mut u8)
+            let ok: bool = (ch >= 48 as u8 && ch <= 57 as u8) || (ch >= 65 as u8 && ch <= 90 as u8) || (ch >= 97 as u8 && ch <= 122 as u8) || ch == 45 as u8 || ch == 95 as u8
+            if ok { rt.buf_push(&b, ch) } else { rt.buf_push(&b, 95 as u8) }
+            i = i + 1
+        }
+        nm = util.buf_to_str_copy(&b)
+        rt.buf_free(&b)
+    }
+    return dir + "/" + nm + ".txt"
+}
+
+fn dr_put(cid: str, t: str) {
+    let path: str = dr_path(cid)
+    if path.n == 0 { return }
+    if t.n == 0 {
+        if fs.exists(path) { let r: bool = fs.remove(path) catch false }
+        return
+    }
+    let w: usize = fs.write_file(path, t.p as u64, t.n) catch 0
+}
+
+fn dr_get(cid: str) -> str {
+    let path: str = dr_path(cid)
+    if path.n == 0 || !fs.exists(path) { return "" }
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path, &b) catch 0
+    let r: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return r
+}
+
+fn dr_show(a: *mut app.App, t: str) {
+    app.set_text(a, G_IN, t)
+    kbd.kbd_reset_input()
+    buf_set(&G_DR_SEEN, t)
+    G_DR_CHG_MS = 0
+}
+
+// every refresh: switch (save the old chat's text, load the new one) and the debounced save
+fn draft_tick(a: *mut app.App) {
+    if G_IN == 0 { return }
+    let cid: str = jarvisc.jc_cid(jshell.jc())
+    let cur: str = app.text(a, G_IN)
+    if !G_DR_INIT {
+        G_DR_INIT = true
+        buf_set(&G_DR_CID, cid)
+        dr_show(a, dr_get(cid))
+        return
+    }
+    if !buf_eq(&G_DR_CID, cid) {
+        let old: str = __str_copy(str { p: G_DR_CID.ptr as *mut u8, n: G_DR_CID.len })
+        buf_set(&G_DR_CID, cid)
+        if old.n == 0 && G_DR_SENT_NEW && cid.n > 0 {
+            // the id of the chat we just wrote in: what is typed now belongs to it
+            G_DR_SENT_NEW = false
+            dr_put(old, "")
+            dr_put(cid, cur)
+            buf_set(&G_DR_SEEN, cur)
+            return
+        }
+        G_DR_SENT_NEW = false
+        dr_put(old, cur)
+        dr_show(a, dr_get(cid))
+        return
+    }
+    if buf_eq(&G_DR_SEEN, cur) {
+        G_DR_CHG_MS = 0
+        return
+    }
+    let now: i64 = time.now_unix_ms()
+    if G_DR_CHG_MS == 0 {
+        G_DR_CHG_MS = now
+        return
+    }
+    if now - G_DR_CHG_MS >= 700 {
+        dr_put(cid, cur)
+        buf_set(&G_DR_SEEN, cur)
+        G_DR_CHG_MS = 0
+    }
+}
+
+// the app goes to the background (main.fi watch_front): write the text now, the process may be killed
+fn screen_chat_draft_flush() {
+    if G_IN == 0 || !G_DR_INIT { return }
+    let a: *mut app.App = jshell.app_ui()
+    let cur: str = app.text(a, G_IN)
+    dr_put(__str_copy(str { p: G_DR_CID.ptr as *mut u8, n: G_DR_CID.len }), cur)
+    buf_set(&G_DR_SEEN, cur)
+    G_DR_CHG_MS = 0
+}
+
+// ---- a64: popup menus (lib/fui/popmenu.fi): attach (Photo / File), chat modes, model + effort. The card is painted at the end of draw_chat,
+// taps arrive in on_touch (a tap outside closes it). Kinds: 1 attach, 2 modes, 3 model.
+static mut G_PM: u64 = 0
+static mut G_PM_KIND: i64 = 0
+static mut G_PM_ANIM: bool = false
+static mut G_PM_NODE: usize = 0
+static mut G_PM_UP: bool = false
+static mut G_PM_RIGHT: bool = false
+static mut G_ATT_BTN: usize = 0 // the paperclip (anchor of the attach menu)
+static mut G_SL_BTN: usize = 0 // header sliders (anchor of the modes menu)
+static mut G_MODES: u32 = 0 // bit i = mode i is on (auto, deep, exp, learn, plan); GET /api/settings
+static mut G_MODES_OK: bool = false
+static mut G_CHIP_ROW: usize = 0 // attachment chip above the composer
+static mut G_COMP: usize = 0 // the composer card (the attach menu opens above it)
+static mut G_STOP: usize = 0 // stop button (visible while an answer runs)
+
+fn pmenu() -> *mut popmenu.PopMenu { return G_PM as *mut popmenu.PopMenu }
+
+fn pm_now(a: *mut app.App) -> i64 { return fuiwirt.host_now(app.app_host(a)) }
+
+fn pm_close_all() {
+    if G_PM == 0 { return }
+    popmenu.pm_close(pmenu())
+    G_PM_KIND = 0
+}
+
+fn mode_bit(i: usize) -> bool { return (G_MODES & ((1 as u32) << (i as u32))) != (0 as u32) }
+
+fn pm_fill(kind: i64) {
+    let m: *mut popmenu.PopMenu = pmenu()
+    popmenu.pm_clear(m)
+    if kind == 1 {
+        let b1: bool = popmenu.pm_add(m, jtexts.tp("chat.photo"), lucide.IMAGE, false)
+        let b2: bool = popmenu.pm_add(m, jtexts.tp("chat.file"), lucide.FILE_TEXT, false)
+    } else if kind == 2 {
+        let b1: bool = popmenu.pm_add(m, jtexts.tp("set.sw-auto"), lucide.ZAP, mode_bit(0))
+        let b2: bool = popmenu.pm_add(m, jtexts.tp("set.sw-deep"), lucide.LIGHTBULB, mode_bit(1))
+        let b3: bool = popmenu.pm_add(m, jtexts.tp("set.sw-exp"), lucide.ROCKET, mode_bit(2))
+        let b4: bool = popmenu.pm_add(m, jtexts.tp("set.sw-learn"), lucide.MESSAGE_SQUARE, mode_bit(3))
+        let b5: bool = popmenu.pm_add(m, jtexts.tp("set.sw-plan"), lucide.LIST_CHECKS, mode_bit(4))
+        let b6: bool = popmenu.pm_add(m, jtexts.tp("tab.tasks"), lucide.CHECK, false)
+        let b7: bool = popmenu.pm_add(m, jtexts.tp("chat.menu-settings"), lucide.SETTINGS, false)
+    } else if kind == 3 {
+        var i: usize = 0
+        while i < G_MN {
+            let on: bool = buf_is(&G_CUR_M, line_field(&G_ROWS, i, 0))
+            let b: bool = popmenu.pm_add(m, __str_copy(line_field(&G_ROWS, i, 1)), lucide.SPARKLES, on)
+            i = i + 1
+        }
+        if cur_has_effort() {
+            var j: usize = 0
+            while j < G_EN {
+                let name: str = line_field(&G_EFFS, j, 0)
+                let on: bool = buf_is(&G_CUR_E, name)
+                let b: bool = popmenu.pm_add(m, __str_copy(cap_first(name)), lucide.ZAP, on)
+                j = j + 1
+            }
+        }
+    }
+}
+
+// opens the menu of `kind` at the node (above it when `up`, right-aligned when `right`)
+fn pm_show(a: *mut app.App, kind: i64, node: usize, up: bool, right: bool) {
+    if G_PM == 0 || node == 0 { return }
+    if kind == 2 && !G_MODES_OK {
+        let g: bool = jarvisapi.ja_settings_get(jshell.api()) // the answer fills the switches (screen_chat_set_modes)
+    }
+    pm_fill(kind)
+    G_PM_KIND = kind
+    G_PM_NODE = node
+    G_PM_UP = up
+    G_PM_RIGHT = right
+    let sc: *mut scene.Scene = app.app_scene(a)
+    var ax: f64 = scene.node_x(sc, node)
+    var ay: f64 = scene.node_y(sc, node)
+    if right { ax = ax + scene.node_w(sc, node) }
+    if !up { ay = ay + scene.node_h(sc, node) }
+    if kind == 1 && G_COMP != 0 {
+        ax = scene.node_x(sc, G_COMP) + 6.0 // above the whole card, not above the paperclip (the card would sit behind the composer)
+        ay = scene.node_y(sc, G_COMP)
+    }
+    popmenu.pm_open(pmenu(), ax, ay, up, right, pm_now(a))
+    G_PM_ANIM = true
+}
+
+fn pm_toggle(a: *mut app.App, kind: i64, node: usize, up: bool, right: bool) {
+    if G_PM_KIND == kind && popmenu.pm_is_open(pmenu()) {
+        pm_close_all()
+        return
+    }
+    pm_show(a, kind, node, up, right)
+}
+
+fn mode_key(i: usize) -> str {
+    if i == 0 { return "autoConfirm" }
+    if i == 1 { return "deepMode" }
+    if i == 2 { return "expMode" }
+    if i == 3 { return "learnMode" }
+    return "planMode"
+}
+
+// the settings screen (or the answer of GET /api/settings) tells the current switches
+fn screen_chat_set_modes(f: u32, ok: bool) {
+    G_MODES = f
+    G_MODES_OK = ok
+    if G_PM != 0 && G_PM_KIND == 2 {
+        var i: usize = 0
+        while i < 5 {
+            popmenu.pm_set_on(pmenu(), i, mode_bit(i))
+            i = i + 1
+        }
+    }
+}
+
+fn mode_toggle(a: *mut app.App, i: usize) {
+    if !G_MODES_OK {
+        jshell.set_status("...")
+        return
+    }
+    let bit: u32 = (1 as u32) << (i as u32)
+    let on: bool = (G_MODES & bit) == (0 as u32)
+    if on { G_MODES = G_MODES | bit } else { G_MODES = G_MODES & ~bit }
+    let ok: bool = jarvisapi.ja_settings_set_bool(jshell.api(), mode_key(i), on)
+    popmenu.pm_set_on(pmenu(), i, on)
+}
+
+fn pm_tap(a: *mut app.App, x: f64, y: f64) {
+    let r: i64 = popmenu.pm_hit(pmenu(), x, y)
+    if r == popmenu.PM_OUTSIDE {
+        pm_close_all()
+        return
+    }
+    if r == popmenu.PM_CARD { return }
+    let kind: i64 = G_PM_KIND
+    if kind == 1 {
+        pm_close_all()
+        if r == 0 { on_photo(a) } else { on_file(a) }
+        return
+    }
+    if kind == 2 {
+        if r < 5 {
+            mode_toggle(a, r as usize) // the card stays open: several switches in a row, like the web menu
+            return
+        }
+        pm_close_all()
+        if r == 5 { jshell.request_tab(jshell.TAB_TASKS) } else { jshell.request_tab(jshell.TAB_SETTINGS) }
+        return
+    }
+    if kind == 3 {
+        if r < (G_MN as i64) {
+            pick_model(a, r as usize)
+            // the effort rows depend on the model: show the card again with the new rows
+            if cur_has_effort() && G_EN > 0 { pm_show(a, 3, G_PM_NODE, G_PM_UP, G_PM_RIGHT) } else { pm_close_all() }
+        } else {
+            pm_close_all()
+            pick_effort(a, (r - (G_MN as i64)) as usize)
+        }
+    }
+}
 
 // a64: paging of the history. G_MORE = older messages exist on the server; the next page is asked for when the reader gets near the top.
 static mut G_MORE: bool = false
@@ -407,6 +701,11 @@ fn draw_chat(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     if G_MORE_BUSY && markdownview.mdv_offset(v) < G_VIEW_H { paint_loading(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n)) }
     if G_INFO_ON { paint_info(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n)) }
     if G_VIEW_ON { paint_viewer(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n), scene.node_h(sc, n)) }
+    G_PM_ANIM = false
+    if G_PM_KIND != 0 && G_PM != 0 {
+        G_PM_ANIM = popmenu.pm_paint(c, pmenu(), pm_now(a))
+        if !popmenu.pm_is_open(pmenu()) { G_PM_KIND = 0 }
+    }
 }
 
 // ---- full-screen picture: black ground over the chat view, the picture fitted into it, a round close button top right;
@@ -942,6 +1241,10 @@ fn on_touch(ud: u64, e: *mut event.Ev) -> u32 {
         viewer_touch(a, e)
         return event.H_STOP
     }
+    if G_PM_KIND != 0 {
+        if k == event.EV_TAP { pm_tap(a, event.ev_x(e), event.ev_y(e)) }
+        return event.H_STOP
+    }
     if k == event.EV_PINCH_START || k == event.EV_PINCH_MOVE || k == event.EV_PINCH_END || k == event.EV_DOUBLE_TAP { return event.H_GO }
     if G_INFO_ON && k == event.EV_TAP {
         info_tap(a, event.ev_x(e), event.ev_y(e))
@@ -1032,7 +1335,7 @@ fn on_new(a: *mut app.App) {
     jarvisc.jc_new_chat(jshell.jc())
     chat_clear()
     G_PHOTO_N = 0
-    app.set_text(a, G_PHOTO, "")
+    att_set(a, "")
     jshell.set_status("Neuer Chat")
 }
 
@@ -1052,7 +1355,10 @@ fn on_voice(a: *mut app.App) {
 }
 
 // header hooks: the hamburger (main.fi opens the chat list), the model pill, the sliders (Settings tab)
-fn on_menu(a: *mut app.App) { screen_sidebar.sidebar_open(a) }
+fn on_menu(a: *mut app.App) {
+    pm_close_all()
+    screen_sidebar.sidebar_open(a)
+}
 fn on_noop(a: *mut app.App) { }
 
 // ---- model dropdown: the pill (or its chevron) opens a panel under the header with the enabled models and the effort levels
@@ -1216,7 +1522,7 @@ fn on_model(a: *mut app.App) {
         jshell.set_status(jtexts.t("chat.model-note"))
         return
     }
-    dd_show(a, !G_DD_OPEN)
+    pm_toggle(a, 3, G_MODEL, false, false)
 }
 
 // the list arrived (jmeta.jmeta_api): rows / efforts / stored choice; an empty list = an older server, the pill stays a plain label
@@ -1333,12 +1639,13 @@ fn build_dropdown(a: *mut app.App) {
     jshell.set_shown(a, G_EFF_ROW, false, 0)
     jshell.set_shown(a, dd, false, 0)
 }
-fn on_sliders(a: *mut app.App) { jshell.request_tab(jshell.TAB_SETTINGS) }
+fn on_sliders(a: *mut app.App) { pm_toggle(a, 2, G_SL_BTN, false, true) }
 
 // the busy marker in the composer (an answer is being made)
 fn set_busy(a: *mut app.App, on: bool) {
     G_BUSY = on
     jshell.set_shown(a, G_SPIN, on, 0)
+    jshell.set_shown(a, G_STOP, on, 0)
 }
 
 
@@ -1462,16 +1769,27 @@ fn screen_chat_voice_tick(a: *mut app.App) {
 }
 
 // "+" shows (or hides) the two choices
-fn on_attach(a: *mut app.App) {
-    G_ATT_SHOWN = !G_ATT_SHOWN
-    jshell.set_shown(a, G_ATT_ROW, G_ATT_SHOWN, 0)
+fn on_attach(a: *mut app.App) { pm_toggle(a, 1, G_ATT_BTN, true, false) }
+
+fn att_hide(a: *mut app.App) { pm_close_all() }
+
+// the attachment chip above the composer: text + X; empty text hides it
+fn att_set(a: *mut app.App, t: str) {
+    app.set_text(a, G_PHOTO, t)
+    jshell.set_shown(a, G_CHIP_ROW, t.n > 0, 0)
 }
 
-static mut G_ATT_SHOWN: bool = false
+fn on_att_clear(a: *mut app.App) {
+    G_PHOTO_N = 0
+    G_ATT_KIND = 0
+    att_set(a, "")
+}
 
-fn att_hide(a: *mut app.App) {
-    G_ATT_SHOWN = false
-    jshell.set_shown(a, G_ATT_ROW, false, 0)
+// the stop button: ends the running answer (the server answers with its own end event; the marker goes now)
+fn on_stop(a: *mut app.App) {
+    jarvisc.jc_stop(jshell.jc())
+    set_busy(a, false)
+    jshell.set_status(jtexts.t("chat.stopped"))
 }
 
 fn on_photo(a: *mut app.App) {
@@ -1527,12 +1845,13 @@ fn file_picked(a: *mut app.App) {
     }
     G_ATT_KIND = 1
     G_PHOTO_N = n
-    app.set_text(a, G_PHOTO, jtexts.t("chat.file-word") + " " + __str_copy(str { p: G_ATT_NAME.ptr as *mut u8, n: G_ATT_NAME.len }) + ", " + jshell.dec((n / 1024) as i64) + " kB")
+    att_set(a, jtexts.t("chat.file-word") + " " + __str_copy(str { p: G_ATT_NAME.ptr as *mut u8, n: G_ATT_NAME.len }) + ", " + jshell.dec((n / 1024) as i64) + " kB")
 }
 
 fn send_now(a: *mut app.App) {
+    pm_close_all()
     let t: str = __str_copy(app.text(a, G_IN))
-    if t.n == 0 { return }
+    if t.n == 0 && G_PHOTO_N == 0 { return }
     if G_UPLOADING {
         jshell.set_status(jtexts.t("chat.uploading"))
         return
@@ -1568,6 +1887,7 @@ fn send_text(a: *mut app.App, t: str) {
         clear_composer(a)
         return
     }
+    if jarvisc.jc_cid(jshell.jc()).n == 0 { G_DR_SENT_NEW = true }
     chat_add_user(t)
     G_ANS_AT = G_CHAT.len
     G_SPLIT = G_CHAT.len
@@ -1593,11 +1913,13 @@ fn upload_done(x: *mut jarvisapi.Api, status: i64) {
     let t: str = __str_copy(str { p: G_PENDING.ptr as *mut u8, n: G_PENDING.len })
     var kind: str = "photo"
     if G_ATT_KIND == 1 { kind = "file" }
-    var full: str = t + "\n\n[" + kind + " " + up.name + " (" + jshell.dec(up.size / 1024) + " kB) on the server: " + up.path + "]"
-    if up.path.n == 0 { full = t + "\n\n[" + kind + " " + up.name + ": " + up.url + "]" }
+    var gap: str = "\n\n"
+    if t.n == 0 { gap = "" } // an attachment alone: no empty lines in front of the marker
+    var full: str = t + gap + "[" + kind + " " + up.name + " (" + jshell.dec(up.size / 1024) + " kB) on the server: " + up.path + "]"
+    if up.path.n == 0 { full = t + gap + "[" + kind + " " + up.name + ": " + up.url + "]" }
     jarvisapi.uploaded_free(&up)
     G_PHOTO_N = 0
-    app.set_text(a, G_PHOTO, "")
+    att_set(a, "")
     send_text(a, full)
 }
 
@@ -1674,7 +1996,7 @@ fn screen_chat_open_cid(a: *mut app.App, cid: str) {
     let saved: bool = jarvisc.jc_save(jshell.jc(), jshell.SERVICE)
     chat_clear()
     G_PHOTO_N = 0
-    app.set_text(a, G_PHOTO, "")
+    att_set(a, "")
     G_HIST_ASKED = true
     let h: bool = jarvisc.jc_history(jshell.jc())
     jshell.set_status(jtexts.t("chat.opening-push"))
@@ -1723,6 +2045,7 @@ fn screen_chat_build_header(a: *mut app.App) -> usize {
     jtheme.style_node(a, G_MIC, jtheme.K_HDRBTN)
     jicons.put(a, G_MIC, "mic")
     let sl: usize = app.button(a, "", on_sliders)
+    G_SL_BTN = sl
     jtheme.style_node(a, sl, jtheme.K_HDRBTN)
     jicons.put(a, sl, "sliders-horizontal")
     app.end(a)
@@ -1768,12 +2091,22 @@ fn screen_chat_build(a: *mut app.App) {
     let b: bool = app.on(a, G_NODE, event.EV_PAN_ALL | event.EV_PINCH_ALL | event.ev_bit(event.EV_TAP) | event.ev_bit(event.EV_DOUBLE_TAP) | event.ev_bit(event.EV_LONG_PRESS) | event.ev_bit(event.EV_POINTER_DOWN), on_touch)
     app.set_extra_wake(a, 0, chat_wake_tick, chat_wake_wait)
     jask.ask_build(a)
+    G_PM = rt.heap_alloc(2048)
+    *(G_PM as *mut popmenu.PopMenu) = popmenu.pm_new()
+    // attachment chip (web .att-chip): file / photo name + X, above the composer
+    G_CHIP_ROW = app.row(a)
+    scene.node_set_flex(sc, G_CHIP_ROW, flex.FLEX_ROW, flex.JUSTIFY_START, flex.AL_CENTER)
+    scene.node_set_gap(sc, G_CHIP_ROW, 4, 4)
+    scene.node_set_padding(sc, G_CHIP_ROW, 0, 2, 0, 12)
+    applay.align_start(a, G_CHIP_ROW)
+    jtheme.style_node(a, G_CHIP_ROW, jtheme.K_CHIP)
+    let lead: usize = app.spacer(a, 6, 1)
     G_PHOTO = app.label(a, "", 11)
-    G_ATT_ROW = app.row(a)
-    app.button(a, jtexts.t("chat.photo"), on_photo)
-    app.button(a, jtexts.t("chat.file"), on_file)
+    let xb: usize = app.button(a, "", on_att_clear)
+    jtheme.style_node(a, xb, jtheme.K_ICONBTN)
+    jicons.put(a, xb, "x")
     app.end(a)
-    jshell.set_shown(a, G_ATT_ROW, false, 0)
+    jshell.set_shown(a, G_CHIP_ROW, false, 0)
     // the composer card (web footer): the text area on top, below it the paperclip, the busy marker + status, the round send button
     let comp: usize = app.column(a)
     scene.node_set_flex(sc, comp, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
@@ -1781,6 +2114,7 @@ fn screen_chat_build(a: *mut app.App) {
     // the style padding is not part of the layout: without it the children touch the 1-px border and paint over it
     scene.node_set_padding(sc, comp, 8, 6, 8, 6)
     jshell.fill_stretch(a, comp)
+    G_COMP = comp
     jtheme.style_node(a, comp, jtheme.K_COMPOSER)
     G_IN = app.textarea_auto(a, jtexts.tp("chat.message"), 1, 5) // one row when empty, grows to 5, then scrolls (web #input)
     jtheme.style_node(a, G_IN, jtheme.K_FIELD)
@@ -1790,6 +2124,7 @@ fn screen_chat_build(a: *mut app.App) {
     scene.node_set_gap(sc, low, 4, 4)
     jshell.fill_stretch(a, low)
     let att: usize = app.button(a, "", on_attach)
+    G_ATT_BTN = att
     jtheme.style_node(a, att, jtheme.K_ICONBTN)
     jicons.put(a, att, "paperclip")
     G_SPIN = app.button(a, "", on_noop)
@@ -1800,6 +2135,10 @@ fn screen_chat_build(a: *mut app.App) {
     jtheme.style_node(a, st, jtheme.K_META)
     scene.node_set_grow(sc, st, 1, 1)
     jshell.status_line2(st)
+    G_STOP = app.button(a, "", on_stop)
+    jtheme.style_node(a, G_STOP, jtheme.K_ICONBTN)
+    jicons.put(a, G_STOP, "square")
+    jshell.set_shown(a, G_STOP, false, 0)
     let snd: usize = app.button(a, "", on_send)
     jtheme.style_node(a, snd, jtheme.K_SEND)
     jicons.put(a, snd, "arrow-up")
@@ -1840,12 +2179,14 @@ fn screen_chat_build(a: *mut app.App) {
 
 // a63: the window's extra timer (app.set_extra_wake): runs the fling of the chat view and the animated pictures. true = paint again.
 fn chat_wake_tick(ud: u64, now_ms: i64) -> bool {
+    if G_PM_ANIM { return true }
     if G_MD == 0 { return false }
     return markdownview.mdv_tick(mdv(), now_ms)
 }
 
 // ms until the next tick: one display frame while the view runs out, else the next animated picture (-1: nothing to do)
 fn chat_wake_wait(ud: u64, now_ms: i64) -> i64 {
+    if G_PM_ANIM { return app.frame_wait_ms(jshell.app_ui()) }
     if G_MD == 0 { return 0 - 1 }
     if markdownview.mdv_moving(mdv()) { return app.frame_wait_ms(jshell.app_ui()) }
     return markdownview.mdv_next_ms(mdv(), now_ms)
@@ -1860,6 +2201,7 @@ fn screen_chat_refresh(a: *mut app.App) {
     jshell.mark_once("first_chat_draw")
     if jshell.win() as u64 == 0 { return }
     fit_pill(a)
+    draft_tick(a)
     let st: i32 = window.pick_poll(jshell.win())
     if st == 2 && G_PICKING == 1 {
         G_PICKING = -1
@@ -1872,7 +2214,7 @@ fn screen_chat_refresh(a: *mut app.App) {
         if window.pick_take(jshell.win(), G_PHOTO_BUF, PHOTO_CAP, &n, &w, &h) {
             G_ATT_KIND = 0
             G_PHOTO_N = n
-            app.set_text(a, G_PHOTO, "Foto " + jshell.dec(w as i64) + "x" + jshell.dec(h as i64) + ", " + jshell.dec((n / 1024) as i64) + " kB")
+            att_set(a, "Foto " + jshell.dec(w as i64) + "x" + jshell.dec(h as i64) + ", " + jshell.dec((n / 1024) as i64) + " kB")
         }
     } else if st == 4 {
         if G_PICKING == 1 && window.pick_file_too_big(jshell.win()) {
