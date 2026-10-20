@@ -108,7 +108,7 @@ export {
     run_set_tracking, run_set_word_spacing, run_set_kerning,
     run_set_weight, run_set_slant, run_set_line_height,
     run_set_outline, run_set_shadow, run_set_gradient,
-    bgcache_blit, bgcache_store, bgcache_reset,
+    bgcache_blit, bgcache_store, bgcache_reset, bgcache_frame,
     run_width, run_fits_upto, run_draw, run_line_height,
     run_fits_ellipsis, run_draw_ellipsis, ellipsis_w,
     run_line_upto, run_line_count, run_draw_wrapped,
@@ -1045,6 +1045,14 @@ struct BgSlot {
     key: u64,
 }
 
+static mut BG_NEXT: usize = 0
+static mut BG_CHAIN: u64 = 0
+static mut BG_PEND: u64 = 0
+
+// A frame (or a partial repaint) begins: the chain of lit grounds starts over.
+fn bgcache_frame() {
+    BG_CHAIN = 0
+}
 static mut BG_SLOTS: [BgSlot; 4] = [BgSlot { px: 0, cap: 0, x: 0, y: 0, w: 0, h: 0, key: 0 }; 4]
 
 fn bgcache_reset() {
@@ -1074,7 +1082,9 @@ fn bgcache_box(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, x0: *mut usize, 
 }
 
 // Copy the cached picture of this box (same key and place) onto the canvas, inside the clip. true = done, nothing to paint.
-fn bgcache_blit(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, key: u64) -> bool {
+fn bgcache_blit(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, key0: u64) -> bool {
+    let key: u64 = (key0 ^ BG_CHAIN) *% (1099511628211 as u64)
+    BG_PEND = key
     var x0: usize = 0
     var y0: usize = 0
     var x1: usize = 0
@@ -1093,6 +1103,7 @@ fn bgcache_blit(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, key: u64) -> bo
             var cx1: usize = x1
             var cy1: usize = y1
             canvas.canvas_clip_pixels(cv, &cx0, &cy0, &cx1, &cy1)
+            BG_CHAIN = key
             if cx1 > cx0 && cy1 > cy0 {
                 let cw: usize = canvas.canvas_width(cv)
                 let row: usize = cx1 - cx0
@@ -1108,13 +1119,16 @@ fn bgcache_blit(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, key: u64) -> bo
         }
         i = i + 1
     }
-    // a miss: nothing that was kept can be trusted any more
-    bgcache_reset()
+    // a miss: keep the other slots. Several lit grounds (the window root, the main column on it) live side by side, each found by its key.
+    // A picture holds everything painted below it (the column's glow lies over the root's ramp), so its key is mixed with the chain of
+    // the grounds that came before it in this frame (BG_CHAIN): a changed ground below changes every key above it.
     return false
 }
 
 // Keep what the box looks like NOW (call right after painting it). Skipped unless the clip covers the whole box.
-fn bgcache_store(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, key: u64) {
+fn bgcache_store(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, key0: u64) {
+    let key: u64 = BG_PEND
+    BG_CHAIN = key
     var x0: usize = 0
     var y0: usize = 0
     var x1: usize = 0
@@ -1131,8 +1145,16 @@ fn bgcache_store(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, key: u64) {
     if cx0 != x0 || cy0 != y0 || cx1 != x1 || cy1 != y1 {
         return
     }
+    // the slot of this very box (its picture is out of date), else a free one, else the oldest (round robin)
     var slot: usize = 4
     var i: usize = 0
+    while i < 4 && slot == 4 {
+        if BG_SLOTS[i].px != 0 && BG_SLOTS[i].x == x0 && BG_SLOTS[i].y == y0 && BG_SLOTS[i].w == x1 - x0 && BG_SLOTS[i].h == y1 - y0 {
+            slot = i
+        }
+        i = i + 1
+    }
+    i = 0
     while i < 4 && slot == 4 {
         if BG_SLOTS[i].px == 0 {
             slot = i
@@ -1140,7 +1162,12 @@ fn bgcache_store(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, key: u64) {
         i = i + 1
     }
     if slot == 4 {
-        return
+        slot = BG_NEXT % 4
+        BG_NEXT = BG_NEXT + 1
+    }
+    if BG_SLOTS[slot].px != 0 {
+        rt.heap_free(BG_SLOTS[slot].px, BG_SLOTS[slot].cap)
+        BG_SLOTS[slot] = BgSlot { px: 0, cap: 0, x: 0, y: 0, w: 0, h: 0, key: 0 }
     }
     let n: usize = (x1 - x0) * (y1 - y0) * 4
     let buf: u64 = rt.heap_alloc(n)
