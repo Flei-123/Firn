@@ -67,6 +67,19 @@ if os.environ.get("FAKE_LONG") == "1":  # a66c: c1 = a long worker chat (bubbles
     for k in range(1, 9):
         _msgs.append({"role": "user", "text": "question %d: why is the command centre on the phone so slow and what does the manager do about it" % k, "at": 1760000000000 + k * 10})
         _msgs.append({"role": "assistant", "text": "Answer %d, short version:\n\n- **Cause 1:** the kernel spins in a loop (`sched.tget`) with 99 %% host CPU.\n- **Cause 2, open:** the popup manager builds it like the web style, which takes a while.\n- **Your VM:** runs with the new image on 1 core.\n\nNothing needed from you.\n>STATUS: status=done" % k, "at": 1760000000000 + k * 10 + 5})
+    if os.environ.get("FAKE_STEPS") == "1":  # a67: tool + thinking steps between the turns (worker reader: one row per step, tap opens)
+        _long = "\n".join("line %d of a long output" % j for j in range(1, 31))
+        _out = []
+        for _m in _msgs:
+            _out.append(_m)
+            if _m["role"] == "user" and _m["at"] // 10 % 1000 in (6, 7, 8):
+                _t = _m["at"]
+                _out += [
+                    {"role": "thinking", "text": "First look at the load.\nThen read the file.", "genMs": 8000, "at": _t + 1},
+                    {"role": "tool", "text": "mcp__jarvis__run_shell", "input": {"command": "uptime && df -h"}, "result": {"ok": True, "text": _long, "images": []}, "at": _t + 2},
+                    {"role": "tool", "text": "mcp__jarvis__read_file", "input": {"path": "/root/jarvis/server.js"}, "result": {"ok": False, "text": "ENOENT: no such file", "images": []}, "at": _t + 3},
+                ]
+        _msgs = _out
     CONV["c1"] = _msgs
 
 if os.environ.get("FAKE_CHATJSON"):  # a real server answer ({"conversation": {"messages": [...]}}): the history of c1/s1/s2 (real tool steps, thinking, cut inputs)

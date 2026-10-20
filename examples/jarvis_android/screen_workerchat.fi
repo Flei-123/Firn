@@ -15,6 +15,9 @@ import fui.widget
 import fui.style
 import fui.event
 import fui.markdownview
+import fui.painter
+import fui.theme
+import fui.wave3
 import markdown.doc
 import net.jarvisc
 import net.jarvisapi
@@ -28,7 +31,17 @@ export { wc_set_shown, wc_build, wc_show_text, wc_show_chat, wc_refresh, wc_forc
 
 static mut G_MD: u64 = 0
 static mut G_NODE: usize = 0
-static mut G_FOLLOW: bool = false
+static mut G_NEED_END: bool = false // a67: the next frame scrolls to the end (new data while the reader is at the end, or a new chat)
+static mut G_STICK: bool = true // a67: the reader is at the end -> follow new data; scrolling up clears it, scrolling back to the end sets it
+static mut G_HINT_ON: bool = false // the "down" pill is drawn (hit area below)
+static mut G_HINT_X: f64 = 0.0
+static mut G_HINT_Y: f64 = 0.0
+static mut G_HINT_W: f64 = 0.0
+static mut G_HINT_H: f64 = 0.0
+const OPEN_MAX: usize = 512
+static mut G_OPEN: [i64; 512] = [0; 512] // a67: keys of the opened steps (hash of time + tool name): survives every refresh
+static mut G_OPEN_N: usize = 0
+static mut G_OPEN_W: usize = 0
 static mut G_IS_CHAT: bool = false
 static mut G_SEEN: u64 = 0
 static mut G_BUF: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
@@ -40,18 +53,52 @@ fn wc_is_chat() -> bool { return G_IS_CHAT }
 fn wc_cid() -> str { return str { p: G_CID.ptr as *mut u8, n: G_CID.len } }
 fn wc_title() -> str { return str { p: G_TITLE.ptr as *mut u8, n: G_TITLE.len } }
 
+// a67: the reader is at the end when the offset plus the view height reaches the content height (small tolerance)
+fn at_end(v: *mut markdownview.MdView, h: f64, tol: f64) -> bool {
+    return markdownview.mdv_offset(v) + h + tol >= markdownview.mdv_content_height(v)
+}
+
+fn paint_hint(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64) {
+    let f: *mut theme.Colors = theme.theme_colors(render.ctx_theme(c))
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let lbl: str = "↓ " + jtexts.t("wc.bottom")
+    let ph: f64 = render.len_of(c, 32)
+    let pw: f64 = render.len_of(c, 120)
+    let px: f64 = x + w - pw - render.len_of(c, 12)
+    let py: f64 = y + h - ph - render.len_of(c, 12)
+    painter.round_rect(z, px, py, pw, ph, ph * 0.5, (*f).separator)
+    painter.round_rect(z, px + 1.0, py + 1.0, pw - 2.0, ph - 2.0, ph * 0.5 - 1.0, (*f).surface)
+    wave3.cell_text_weight(c, lbl.p as u64, lbl.n, px, py, pw, ph, (*f).text, style.ALIGN_CENTER, 13, 500 as u32)
+    G_HINT_X = px
+    G_HINT_Y = py
+    G_HINT_W = pw
+    G_HINT_H = ph
+    G_HINT_ON = true
+}
+
 fn draw_node(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
     let a: *mut app.App = jshell.app_ui()
     let sc: *mut scene.Scene = app.app_scene(a)
     let n: usize = scene.scene_node_of(sc, e)
     let v: *mut markdownview.MdView = mdv()
-    markdownview.mdv_set_rect(v, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n), scene.node_h(sc, n))
+    let h: f64 = scene.node_h(sc, n)
+    markdownview.mdv_set_rect(v, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n), h)
     // a66c: ONE paint per frame (the end offset is set before it; a second paint drew a second text layer on the phone)
-    if G_FOLLOW {
-        G_FOLLOW = false
+    var fresh: bool = false
+    if G_NEED_END {
+        G_NEED_END = false
+        fresh = true
         markdownview.mdv_scroll_end(v, c)
     }
     markdownview.mdv_paint(v, c)
+    // a67: follow only while the reader sits at the end; a frame that just jumped keeps the flag
+    if fresh {
+        G_STICK = true
+    } else {
+        G_STICK = at_end(v, h, render.len_of(c, 24))
+    }
+    G_HINT_ON = false
+    if G_IS_CHAT && !G_STICK { paint_hint(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n), h) }
 }
 
 fn on_touch(ud: u64, e: *mut event.Ev) -> u32 {
@@ -67,6 +114,14 @@ fn on_touch(ud: u64, e: *mut event.Ev) -> u32 {
         return event.H_STOP
     }
     if k == event.EV_TAP {
+        if G_HINT_ON {
+            let tx: f64 = event.ev_x(e)
+            let ty: f64 = event.ev_y(e)
+            if tx >= G_HINT_X && tx <= G_HINT_X + G_HINT_W && ty >= G_HINT_Y && ty <= G_HINT_Y + G_HINT_H {
+                G_NEED_END = true
+                return event.H_STOP
+            }
+        }
         let t: bool = markdownview.mdv_touch_tap(v, app.app_ctx(a), event.ev_x(e), event.ev_y(e))
         return event.H_STOP
     }
@@ -79,6 +134,7 @@ fn wc_build(a: *mut app.App) {
     G_MD = box
     *(box as *mut markdownview.MdView) = md
     markdownview.mdv_set_base_size(mdv(), 14)
+    markdownview.mdv_set_link_cb(mdv(), 0, on_link)
     markdownview.mdv_set_bar_pt(mdv(), 0) // a66: no scrollbar strip, like the chat page
     markdownview.mdv_set_background(mdv(), 4294967295) // no own ground: the page gradient shows through (markdownview.NIL)
     G_NODE = app.custom(a, widget.KIND_TILE, 340, 120)
@@ -101,9 +157,18 @@ fn wc_set_shown(a: *mut app.App, on: bool) {
     }
 }
 
-fn set_markdown(follow: bool) {
-    markdownview.mdv_set_markdown(mdv(), str { p: G_BUF.ptr as *mut u8, n: G_BUF.len }, doc.opts_default())
-    G_FOLLOW = follow
+// mode 0 = new content: from the top, a chat then jumps to its end; 1 = refresh: the position stays, the reader follows only when it
+// sits at the end (G_STICK); 2 = the same content re-laid (a step opened / closed): the position stays, no follow
+fn set_markdown(mode: u32) {
+    let src: str = str { p: G_BUF.ptr as *mut u8, n: G_BUF.len }
+    if mode == 0 as u32 {
+        markdownview.mdv_set_markdown(mdv(), src, doc.opts_default())
+        G_NEED_END = G_IS_CHAT
+        G_STICK = true
+    } else {
+        markdownview.mdv_set_markdown_keep(mdv(), src, doc.opts_default())
+        G_NEED_END = mode == 1 as u32 && G_STICK
+    }
 }
 
 fn put(s: str) { rt.buf_push_bytes(&G_BUF, s.p as u64, s.n) }
@@ -121,7 +186,7 @@ fn wc_show_text(md: str) {
     G_IS_CHAT = false
     rt.buf_clear(&G_BUF)
     put(md)
-    set_markdown(false)
+    set_markdown(0 as u32)
 }
 
 // text of a chat answer without the ">STATUS:" line the server appends
@@ -146,40 +211,206 @@ fn put_user(t: str) {
     put("\n\n")
 }
 
-// a run of tool calls / thoughts: ONE collapsed line "N steps" in the rail look of the chat's step groups (jsteps emit_rail)
-fn put_steps(n: usize) {
-    put("> ***\n>\n> ")
-    if n == 1 {
-        put(jtexts.t("steps.one"))
-    } else {
-        put(jtexts.t1("steps.n", "n", jshell.dec(n as i64)))
-    }
-    put("\n\n")
-}
-
 fn is_step(role: str) -> bool { return role == "tool" || role == "thinking" }
 
+// ---- a67: worker steps. One row per step (tool pill + short argument, or the "Nachgedacht" row); a tap opens / closes the details
+// (argument + output as code blocks, a thought's text). The open state is kept by KEY (hash of time + name), not by position, so
+// it survives refreshes and the 30-turn window moving on.
+fn step_key(m: *mut jarvisapi.Msg) -> i64 {
+    var h: u64 = 1469598103934665603 as u64
+    var i: usize = 0
+    while i < (*m).at.n {
+        h = (h ^ (rt.ld8((*m).at.p as u64, i) as u64)) * 1099511628211 as u64
+        i = i + 1
+    }
+    i = 0
+    while i < (*m).text.n {
+        h = (h ^ (rt.ld8((*m).text.p as u64, i) as u64)) * 1099511628211 as u64
+        i = i + 1
+    }
+    return (h & 4503599627370495 as u64) as i64 // 52 bits: positive, exact in decimal
+}
+
+fn is_open(k: i64) -> bool {
+    var i: usize = 0
+    while i < G_OPEN_N {
+        if G_OPEN[i] == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn toggle_open(k: i64) {
+    var i: usize = 0
+    while i < G_OPEN_N {
+        if G_OPEN[i] == k {
+            G_OPEN[i] = G_OPEN[G_OPEN_N - 1]
+            G_OPEN_N = G_OPEN_N - 1
+            return
+        }
+        i = i + 1
+    }
+    if G_OPEN_N < OPEN_MAX {
+        G_OPEN[G_OPEN_N] = k
+        G_OPEN_N = G_OPEN_N + 1
+    } else {
+        G_OPEN[G_OPEN_W] = k // full: the oldest slot is reused
+        G_OPEN_W = (G_OPEN_W + 1) % OPEN_MAX
+    }
+}
+
+// "mcp__jarvis__run_shell" -> "run_shell"
+fn tool_short(s: str) -> str {
+    if s.n > 5 && rt.mem_eq(s.p as u64, "mcp__".p as u64, 5) {
+        var i: usize = 5
+        while i + 1 < s.n {
+            if rt.ld8(s.p as u64, i) == 95 as u8 && rt.ld8(s.p as u64, i + 1) == 95 as u8 {
+                return str { p: ((s.p as u64) + (i + 2) as u64) as *mut u8, n: s.n - i - 2 }
+            }
+            i = i + 1
+        }
+    }
+    return s
+}
+
+// at most `maxl` lines / `maxb` bytes of `s` as a code block; a cut adds a last line "... N more"
+fn put_block(out: *mut rt.Buf, s: str, maxl: usize, maxb: usize) {
+    var end: usize = s.n
+    var cut: bool = false
+    var lines: usize = 1
+    var i: usize = 0
+    while i < s.n {
+        if i >= maxb { end = i
+            cut = true
+            break }
+        if rt.ld8(s.p as u64, i) == 10 as u8 {
+            if lines >= maxl { end = i
+                cut = true
+                break }
+            lines = lines + 1
+        }
+        i = i + 1
+    }
+    while end > 0 && (rt.ld8(s.p as u64, end) & 192 as u8) == 128 as u8 && end < s.n { end = end - 1 }
+    while end > 0 && (rt.ld8(s.p as u64, end - 1) == 10 as u8 || rt.ld8(s.p as u64, end - 1) == 13 as u8) { end = end - 1 }
+    if end == 0 { return }
+    put_to(out, "`````\n")
+    jsteps.put_clean(out, s.p as u64, end)
+    if cut { put_to(out, "\n...") }
+    put_to(out, "\n`````\n\n")
+}
+
+fn put_to(out: *mut rt.Buf, s: str) { rt.buf_push_bytes(out, s.p as u64, s.n) }
+
+// a thought as a nested rail quote (like jsteps.put_thought): every line break stays one
+fn put_thought_text(out: *mut rt.Buf, t: str) {
+    put_to(out, "> ***\n> ***\n>\n> ")
+    var m: usize = t.n
+    if m > 1500 {
+        m = 1500
+        while m > 0 && (rt.ld8(t.p as u64, m) & 192 as u8) == 128 as u8 { m = m - 1 }
+    }
+    var k: usize = 0
+    while k < m {
+        var c: u8 = rt.ld8(t.p as u64, k)
+        if c == 10 as u8 {
+            put_to(out, "  \n> ")
+        } else if c == 13 as u8 || (c < 32 as u8 && c != 9 as u8) {
+        } else {
+            if c == 9 as u8 { c = 32 as u8 }
+            if c == 92 as u8 || c == 96 as u8 || c == 42 as u8 || c == 95 as u8 || c == 91 as u8 || c == 93 as u8 || c == 60 as u8 || c == 62 as u8 || c == 35 as u8 || c == 124 as u8 || c == 126 as u8 || c == 38 as u8 || c == 33 as u8 {
+                rt.buf_push(out, 92 as u8)
+            }
+            rt.buf_push(out, c)
+        }
+        k = k + 1
+    }
+    if m < t.n { put_to(out, "...") }
+    put_to(out, "\n\n")
+}
+
+// one step into `tmp` (the rail body)
+fn put_step(tmp: *mut rt.Buf, m: *mut jarvisapi.Msg) {
+    let k: i64 = step_key(m)
+    let open: bool = is_open(k)
+    if (*m).role == "thinking" {
+        put_to(tmp, "[")
+        put_to(tmp, jtexts.t("think.done"))
+        if (*m).gen_ms > 0 {
+            put_to(tmp, " · ")
+            rt.buf_push_dec_i64(tmp, ((*m).gen_ms + 500) / 1000)
+            put_to(tmp, "s")
+        }
+        if open { put_to(tmp, "](thro:") } else { put_to(tmp, "](thr:") }
+        rt.buf_push_dec_i64(tmp, k)
+        put_to(tmp, ")")
+        if open {
+            put_to(tmp, "\n\n")
+            put_thought_text(tmp, (*m).text)
+        } else {
+            put_to(tmp, "  \n")
+        }
+        return
+    }
+    let nm: str = jsteps.label(tool_short((*m).text))
+    put_to(tmp, "[")
+    jsteps.put_esc(tmp, nm.p as u64, nm.n, 80)
+    if (*m).ok == 0 { put_to(tmp, "](err:") } else { put_to(tmp, "](chip:") }
+    rt.buf_push_dec_i64(tmp, k)
+    put_to(tmp, ")")
+    if open {
+        put_to(tmp, "\n\n")
+        if (*m).arg.n > 0 { put_block(tmp, (*m).arg, 6, 600) }
+        if (*m).res.n > 0 { put_block(tmp, (*m).res, 10, 1200) }
+    } else {
+        if (*m).arg.n > 0 {
+            put_to(tmp, " ")
+            jsteps.put_esc(tmp, (*m).arg.p as u64, (*m).arg.n, 70)
+        }
+        put_to(tmp, "  \n")
+    }
+}
+
+// a tapped link of the reader: our step rows toggle their details
+fn on_link(ud: u64, p: u64, n: usize) {
+    var skip: usize = 0
+    if n > 5 && rt.mem_eq(p, "chip:".p as u64, 5) { skip = 5 }
+    if n > 4 && rt.mem_eq(p, "err:".p as u64, 4) { skip = 4 }
+    if n > 4 && rt.mem_eq(p, "thr:".p as u64, 4) { skip = 4 }
+    if n > 5 && rt.mem_eq(p, "thro:".p as u64, 5) { skip = 5 }
+    if skip == 0 { return }
+    var k: i64 = 0
+    var i: usize = skip
+    while i < n {
+        let d: u8 = rt.ld8(p, i)
+        if d >= 48 as u8 && d <= 57 as u8 { k = k * 10 + (d - 48 as u8) as i64 }
+        i = i + 1
+    }
+    toggle_open(k)
+    render_chat(2 as u32)
+}
+
 // a66: the chat like the web: bubbles for the person, answers as Markdown, steps as a rail line, worker notes as the dashed box
-fn render_chat() {
+fn render_chat(mode: u32) {
     let c: *mut jarvisapi.Conv = jdata.conv()
     rt.buf_clear(&G_BUF)
     if !jdata.has_conv() || jdata.conv_cid() != wc_cid() {
         put(jtexts.t("wc.loading"))
-        set_markdown(false)
+        set_markdown(0 as u32)
         return
     }
     let n: usize = vec_len[jarvisapi.Msg](&(*c).msgs)
     if n == 0 { put(jtexts.t("wc.none") + "\n\n") }
     var i: usize = 0
-    var steps: usize = 0
+    var tmp: rt.Buf = rt.buf_new() // the rows of the step run being collected
     while i < n {
         let m: *mut jarvisapi.Msg = vec_elem_ptr[jarvisapi.Msg](&(*c).msgs, i)
         if is_step((*m).role) {
-            steps = steps + 1
+            if !jsteps.hidden(tool_short((*m).text)) { put_step(&tmp, m) }
         } else {
-            if steps > 0 {
-                put_steps(steps)
-                steps = 0
+            if tmp.len > 0 {
+                jsteps.emit_rail(&G_BUF, &tmp)
+                rt.buf_clear(&tmp)
             }
             if (*m).role == "user" {
                 put_user((*m).text)
@@ -194,12 +425,13 @@ fn render_chat() {
         }
         i = i + 1
     }
-    if steps > 0 { put_steps(steps) }
+    if tmp.len > 0 { jsteps.emit_rail(&G_BUF, &tmp) }
+    rt.buf_free(&tmp)
     if (*c).running {
         put_answer((*c).partial)
         put("\n\n###### " + jtexts.t("wc.running") + " ...\n\n")
     }
-    set_markdown(true)
+    set_markdown(mode)
 }
 
 fn wc_show_chat(cid: str, title: str) {
@@ -213,7 +445,7 @@ fn wc_show_chat(cid: str, title: str) {
         rt.buf_clear(&G_TITLE)
         rt.buf_push_bytes(&G_TITLE, title.p as u64, title.n)
         G_SEEN = 0 as u64
-        render_chat()
+        render_chat(0 as u32)
     }
     jdata.load_chat(cid, false)
 }
@@ -223,7 +455,7 @@ fn wc_refresh() {
     if !G_IS_CHAT { return }
     if jdata.ver_conv() != G_SEEN {
         G_SEEN = jdata.ver_conv()
-        render_chat()
+        render_chat(1 as u32)
     }
     jdata.load_chat(wc_cid(), false)
 }
