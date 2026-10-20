@@ -108,7 +108,7 @@ export {
     run_set_tracking, run_set_word_spacing, run_set_kerning,
     run_set_weight, run_set_slant, run_set_line_height,
     run_set_outline, run_set_shadow, run_set_gradient,
-    bgcache_blit, bgcache_store, bgcache_reset, bgcache_frame,
+    bgcache_blit, bgcache_store, bgcache_reset, bgcache_frame, bgcache_stat,
     run_width, run_fits_upto, run_draw, run_line_height,
     run_fits_ellipsis, run_draw_ellipsis, ellipsis_w,
     run_line_upto, run_line_count, run_draw_wrapped,
@@ -1048,6 +1048,13 @@ struct BgSlot {
 static mut BG_NEXT: usize = 0
 static mut BG_CHAIN: u64 = 0
 static mut BG_PEND: u64 = 0
+static mut BG_ST: [i64; 4] = [0; 4] // 0 hit, 1 miss, 2 refused because the canvas is GPU-backed, 3 refused otherwise
+
+// Counters of the lit-ground cache since process start (diagnostics): hit, miss, GPU refusal, other refusal.
+fn bgcache_stat(k: usize) -> i64 {
+    if k >= 4 { return 0 }
+    return BG_ST[k]
+}
 
 // A frame (or a partial repaint) begins: the chain of lit grounds starts over.
 fn bgcache_frame() {
@@ -1069,13 +1076,20 @@ fn bgcache_reset() {
 // The integer pixel box of (x, y, w, h) on the canvas; false = nothing to cache (empty, GPU canvas, or a clip mask is active).
 fn bgcache_box(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, x0: *mut usize, y0: *mut usize, x1: *mut usize, y1: *mut usize) -> bool {
     let cv: *mut canvas.Canvas = painter_canvas(z)
-    if (*z).ok == 0 || canvas.canvas_gpu(cv) != 0 {
+    if canvas.canvas_gpu(cv) != 0 {
+        BG_ST[2] = BG_ST[2] + 1
+        return false
+    }
+    if (*z).ok == 0 {
+        BG_ST[3] = BG_ST[3] + 1
         return false
     }
     if !px_span(cv, x, y, w, h, x0, y0, x1, y1) {
+        BG_ST[3] = BG_ST[3] + 1
         return false
     }
     if canvas.canvas_clip_masked(cv) {
+        BG_ST[3] = BG_ST[3] + 1
         return false
     }
     return true
@@ -1104,6 +1118,7 @@ fn bgcache_blit(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, key0: u64) -> b
             var cy1: usize = y1
             canvas.canvas_clip_pixels(cv, &cx0, &cy0, &cx1, &cy1)
             BG_CHAIN = key
+            BG_ST[0] = BG_ST[0] + 1
             if cx1 > cx0 && cy1 > cy0 {
                 let cw: usize = canvas.canvas_width(cv)
                 let row: usize = cx1 - cx0
@@ -1119,6 +1134,7 @@ fn bgcache_blit(z: *mut Painter, x: f64, y: f64, w: f64, h: f64, key0: u64) -> b
         }
         i = i + 1
     }
+    BG_ST[1] = BG_ST[1] + 1
     // a miss: keep the other slots. Several lit grounds (the window root, the main column on it) live side by side, each found by its key.
     // A picture holds everything painted below it (the column's glow lies over the root's ramp), so its key is mixed with the chain of
     // the grounds that came before it in this frame (BG_CHAIN): a changed ground below changes every key above it.
@@ -1198,6 +1214,9 @@ fn round_rect_radial(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
     }
     let cv: *mut canvas.Canvas = painter_canvas(z)
     let g: *mut gpu.Gpu = gpu.gpu_of(cv)
+    if g as u64 != 0 && r <= 0.0 && radial_gpu_kept(g, cv, x, y, w, h, col, cx, cy, rx, ry) {
+        return
+    }
     var b0: i32 = 0
     var b1: i32 = 0
     var b2: i32 = 0
@@ -1264,6 +1283,102 @@ fn round_rect_radial(z: *mut Painter, x: f64, y: f64, w: f64, h: f64,
     if g as u64 != 0 {
         gpu.gpu_sw_end(g, cv, b0, b1, b2, b3)
     }
+}
+
+
+static mut RK_NEXT: usize = 0
+
+fn rk_mix(k: u64, v: f64) -> u64 {
+    return (k ^ ((v * 64.0) as i64 as u64)) *% (1099511628211 as u64)
+}
+
+// THE LIGHT OF A SQUARE PAGE GROUND ON A GPU CANVAS: the picture (premultiplied RGBA of the box, computed once in memory, no
+// read-back of the GPU) is kept in a texture slot and laid over the ground with one quad per frame. The software fallback below
+// read the band back from the GPU and painted it per pixel EVERY frame (~150 ms a frame on a phone). false = not handled.
+fn radial_gpu_kept(g: *mut gpu.Gpu, cv: *mut canvas.Canvas, x: f64, y: f64, w: f64, h: f64, col: u32,
+    cx: f64, cy: f64, rx: f64, ry: f64) -> bool {
+    if canvas.canvas_clip_masked(cv) {
+        return false
+    }
+    let cw: f64 = canvas.canvas_width(cv) as f64
+    let ch: f64 = canvas.canvas_height(cv) as f64
+    let b0: i32 = floor_px(clamp(x, 0.0, cw)) as i32
+    let b1: i32 = floor_px(clamp(y, 0.0, ch)) as i32
+    var b2: i32 = (clamp(x + w, 0.0, cw)) as i32
+    var b3: i32 = (clamp(y + h, 0.0, ch)) as i32
+    if (b2 as f64) < clamp(x + w, 0.0, cw) { b2 = b2 + 1 }
+    if (b3 as f64) < clamp(y + h, 0.0, ch) { b3 = b3 + 1 }
+    if b2 <= b0 || b3 <= b1 {
+        return true
+    }
+    let base: u32 = mit_alpha(col)
+    var key: u64 = 1469598103934665603 as u64
+    key = rk_mix(key, x)
+    key = rk_mix(key, y)
+    key = rk_mix(key, w)
+    key = rk_mix(key, h)
+    key = rk_mix(key, cx)
+    key = rk_mix(key, cy)
+    key = rk_mix(key, rx)
+    key = rk_mix(key, ry)
+    key = (key ^ (base as u64)) *% (1099511628211 as u64)
+    key = (key ^ ((b2 - b0) as u64 * 65536 as u64 + (b3 - b1) as u64)) *% (1099511628211 as u64)
+    if key == 0 as u64 { key = 1 as u64 }
+    var sl: i32 = gpu.gpu_slot_find(g, key)
+    if sl >= 0 {
+        BG_ST[0] = BG_ST[0] + 1
+        gpu.gpu_draw_photo_slot(g, sl, key, 0, b2 - b0, b3 - b1, b0 as f64, b1 as f64)
+        return true
+    }
+    let iw: usize = (b2 - b0) as usize
+    let ih: usize = (b3 - b1) as usize
+    let buf: u64 = rt.heap_alloc(iw * ih * 4)
+    if buf == 0 {
+        return false
+    }
+    BG_ST[1] = BG_ST[1] + 1
+    let a0: f64 = ((base >> 24) & 255 as u32) as f64
+    let cr: u32 = (base >> 16) & 255 as u32
+    let cg: u32 = (base >> 8) & 255 as u32
+    let cb: u32 = base & 255 as u32
+    let irx: f64 = 1.0 / (rx * rx)
+    let iry: f64 = 1.0 / (ry * ry)
+    var yy: usize = 0
+    while yy < ih {
+        let py: f64 = (b1 as f64) + (yy as f64) + 0.5
+        let inside_y: bool = py >= y && py <= y + h
+        let dy: f64 = py - cy
+        let qy: f64 = dy * dy * iry
+        var xx: usize = 0
+        while xx < iw {
+            let o: u64 = buf + ((yy * iw + xx) * 4) as u64
+            var v: u32 = 0 as u32
+            let pxc: f64 = (b0 as f64) + (xx as f64) + 0.5
+            if inside_y && qy < 1.0 && pxc >= x && pxc <= x + w {
+                let dx: f64 = pxc - cx
+                let d2: f64 = dx * dx * irx + qy
+                if d2 < 1.0 {
+                    let u: f64 = 1.0 - d2
+                    let a: u32 = (a0 * u * u + 0.5) as u32
+                    if a > 0 as u32 {
+                        // bytes R, G, B, A (little endian word: A B G R), premultiplied
+                        let pr: u32 = (cr * a + 127 as u32) / 255 as u32
+                        let pg: u32 = (cg * a + 127 as u32) / 255 as u32
+                        let pb: u32 = (cb * a + 127 as u32) / 255 as u32
+                        v = pr | (pg << 8) | (pb << 16) | (a << 24)
+                    }
+                }
+            }
+            *(o as *mut u32) = v
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    sl = RK_NEXT as i32
+    RK_NEXT = (RK_NEXT + 1) % 4
+    gpu.gpu_draw_photo_slot(g, sl, key, buf, iw as i32, ih as i32, b0 as f64, b1 as f64)
+    rt.heap_free(buf, iw * ih * 4)
+    return true
 }
 
 // The pixel rows of (x, y, w, h) clipped to the canvas: *y0..*y1,
