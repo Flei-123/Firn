@@ -80,9 +80,9 @@ static mut G_CUR_M: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_CUR_E: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 
 // copy button under every answer: the byte range of each answer in G_CHAT (the n-th meta line of the view belongs to answer n)
-const ANS_MAX: usize = 512
-static mut G_ANS_S: [usize; 512] = [0; 512]
-static mut G_ANS_E: [usize; 512] = [0; 512]
+const ANS_MAX: usize = 1024
+static mut G_ANS_S: [usize; 1024] = [0; 1024]
+static mut G_ANS_E: [usize; 1024] = [0; 1024]
 static mut G_ANS_N: usize = 0
 static mut G_COPIED_IDX: usize = 9999999
 static mut G_COPIED_UNTIL: i64 = 0
@@ -110,10 +110,10 @@ static mut G_INFO_N: usize = 0
 static mut G_INFO_BUF: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_INFO_OFF: [usize; 6] = [0; 6]
 static mut G_INFO_LEN: [usize; 6] = [0; 6]
-static mut G_ANS_DUR: [i64; 512] = [0; 512] // per answer: run time (ms, 0 = unknown), time it finished (ms, 0 = unknown), model label (pool offset / length)
-static mut G_ANS_FIN: [i64; 512] = [0; 512]
-static mut G_ANS_MO: [usize; 512] = [0; 512]
-static mut G_ANS_ML: [usize; 512] = [0; 512]
+static mut G_ANS_DUR: [i64; 1024] = [0; 1024] // per answer: run time (ms, 0 = unknown), time it finished (ms, 0 = unknown), model label (pool offset / length)
+static mut G_ANS_FIN: [i64; 1024] = [0; 1024]
+static mut G_ANS_MO: [usize; 1024] = [0; 1024]
+static mut G_ANS_ML: [usize; 1024] = [0; 1024]
 static mut G_ANS_POOL: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_USE_PA: usize = 0
 static mut G_USE_PB: usize = 0
@@ -163,12 +163,35 @@ const FILE_CAP: usize = 20971520 // a file up to this size (the limit of POST /a
 
 fn mdv() -> *mut markdownview.MdView { return G_MD as *mut markdownview.MdView }
 
+// a64: paging of the history. G_MORE = older messages exist on the server; the next page is asked for when the reader gets near the top.
+static mut G_MORE: bool = false
+static mut G_MORE_BUSY: bool = false // a page is on its way (the top shows the loading line)
+static mut G_PG_ON: bool = false // events of a page are being received: they build up behind the text held, chat_changed does nothing
+static mut G_PG_SKIP: bool = false // this page cannot be used (an answer is streaming meanwhile): drop it
+static mut G_PG_TAIL: usize = 0 // G_CHAT length / answer count when the page began (the text and answers already shown)
+static mut G_PG_ANS0: usize = 0
+static mut G_PG_PREV: i64 = 0 // `from` before the page (restored when the page is dropped)
+static mut G_PG_RETRY_MS: i64 = 0 // no new page before this time (after a failed one)
+static mut G_PG_TMP: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut T_ANS_S: [usize; 1024] = [0; 1024]
+static mut T_ANS_E: [usize; 1024] = [0; 1024]
+static mut T_ANS_DUR: [i64; 1024] = [0; 1024]
+static mut T_ANS_FIN: [i64; 1024] = [0; 1024]
+static mut T_ANS_MO: [usize; 1024] = [0; 1024]
+static mut T_ANS_ML: [usize; 1024] = [0; 1024]
 static mut G_VIEW: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the source of the view: G_CHAT with the tool step groups expanded (jsteps)
 
 fn chat_changed() {
+    if G_PG_ON { return }
     jsteps.compose(&G_CHAT, G_SPLIT, &G_VIEW)
     markdownview.mdv_set_markdown(mdv(), str { p: G_VIEW.ptr as *mut u8, n: G_VIEW.len }, doc.opts_default())
     G_FOLLOW = true
+}
+
+// a64: like chat_changed, but the reader stays where he is (older messages came in front): no jump to the end, no fling stop
+fn chat_changed_keep() {
+    jsteps.compose(&G_CHAT, G_SPLIT, &G_VIEW)
+    markdownview.mdv_set_markdown_keep(mdv(), str { p: G_VIEW.ptr as *mut u8, n: G_VIEW.len }, doc.opts_default())
 }
 
 // a tap on a link of the view: the tool step headers / "more lines" toggle (jsteps); the view keeps its scroll position
@@ -289,8 +312,10 @@ fn fold_text() {
 
 // a message of the person: a block quote, which the markdown view draws as the web app's blue bubble at the right edge (mdv_set_bubble)
 fn chat_add_user(t: str) {
-    rt.buf_clear(&G_LAST_USER)
-    rt.buf_push_bytes(&G_LAST_USER, t.p as u64, t.n)
+    if !G_PG_ON {
+        rt.buf_clear(&G_LAST_USER)
+        rt.buf_push_bytes(&G_LAST_USER, t.p as u64, t.n)
+    }
     rt.buf_push_bytes(&G_CHAT, "> ".p as u64, 2)
     var i: usize = 0
     var from: usize = 0
@@ -325,6 +350,9 @@ fn chat_clear() {
     G_SPLIT = 0
     G_TXT_AT = 0
     rt.buf_clear(&G_CHAT)
+    G_MORE = false
+    G_MORE_BUSY = false
+    G_PG_ON = false
     chat_changed()
     G_HIST_ASKED = false
 }
@@ -347,9 +375,11 @@ fn draw_chat(ud: u64, c: *mut render.Ctx, e: *mut widget.Widget) {
         markdownview.mdv_paint(v, c)
     }
     G_VIEW_H = scene.node_h(sc, n)
+    page_check(a)
     G_AT_BOTTOM = markdownview.mdv_offset(v) + G_VIEW_H + render.len_of(c, 24) >= markdownview.mdv_content_height(v)
     paint_copy_icons(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_h(sc, n))
     if !G_AT_BOTTOM { paint_chip(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n)) }
+    if G_MORE_BUSY && markdownview.mdv_offset(v) < G_VIEW_H { paint_loading(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n)) }
     if G_INFO_ON { paint_info(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n)) }
     if G_VIEW_ON { paint_viewer(c, scene.node_x(sc, n), scene.node_y(sc, n), scene.node_w(sc, n), scene.node_h(sc, n)) }
 }
@@ -897,11 +927,12 @@ fn on_touch(ud: u64, e: *mut event.Ev) -> u32 {
         return event.H_GO
     }
     if k == event.EV_PAN_MOVE {
-        markdownview.mdv_touch_pan(v, event.ev_dx(e), event.ev_dy(e))
+        markdownview.mdv_touch_pan_at(v, event.ev_dx(e), event.ev_dy(e), fuiwirt.host_now(app.app_host(a)))
         return event.H_STOP
     }
     if k == event.EV_PAN_END && event.ev_fling(e) {
-        markdownview.mdv_touch_fling(v, event.ev_vx(e), event.ev_vy(e), fuiwirt.host_now(app.app_host(a)))
+        // a64: the android curve (OverScroller) with the real pixel density, not the plain exponential
+        markdownview.mdv_touch_fling_android(v, event.ev_vx(e), event.ev_vy(e), fuiwirt.host_now(app.app_host(a)), render.len_of(app.app_ctx(a), 160))
         return event.H_STOP
     }
     if k == event.EV_TAP {
@@ -1650,6 +1681,7 @@ fn screen_chat_build(a: *mut app.App) {
     *(box as *mut markdownview.MdView) = md
     markdownview.mdv_set_background(mdv(), 4294967295) // no own ground: the page gradient shows through (markdownview.NIL)
     markdownview.mdv_set_clipboard(mdv(), clip_write)
+    markdownview.mdv_set_overscroll(mdv(), true) // a64: rubber band at both ends, like a native list
     markdownview.mdv_set_image_cb(mdv(), 0, jimg.on_image)
     markdownview.mdv_set_image_tap_cb(mdv(), 0, on_image_tap)
     markdownview.mdv_set_link_cb(mdv(), 0, on_md_link)
@@ -1787,6 +1819,104 @@ fn screen_chat_refresh(a: *mut app.App) {
     sel_changed(a)
 }
 
+// ---- a64: older messages. The page arrives as JE_HIST_PAGE, the usual JE_HIST / JE_HIST_TOOL events, JE_HIST_PAGE_END. They are added BEHIND the text
+// held (chat_changed is off meanwhile), then the new part is rotated to the front, the tables of answers / positions move with it, and the view keeps
+// the reader's place: mdv_anchor_begin adds the growth of the text to the offset, a running fling goes on.
+fn page_begin(c: *mut jarvisc.Jc) {
+    G_PG_ON = true
+    G_PG_SKIP = G_BUSY || jsteps.has_pending() || G_HELD_ON
+    G_PG_TAIL = G_CHAT.len
+    G_PG_ANS0 = G_ANS_N
+}
+
+fn page_end(c: *mut jarvisc.Jc, from: i64) {
+    G_MORE_BUSY = false
+    if !G_PG_ON { return }
+    release_held()
+    jsteps.flush(&G_CHAT)
+    G_PG_ON = false
+    if G_PG_SKIP || G_ANS_N > ANS_MAX || G_CHAT.len <= G_PG_TAIL {
+        // not usable: back to what was shown, the same page is asked again later
+        G_CHAT.len = G_PG_TAIL
+        G_ANS_N = G_PG_ANS0
+        jarvisc.jc_hist_restore(c, G_PG_PREV)
+        G_PG_RETRY_MS = time.now_unix_ms() + 1500
+        return
+    }
+    let tail: usize = G_PG_TAIL
+    let olen: usize = G_CHAT.len - tail
+    // text: [tail][older] -> [older][tail]
+    rt.buf_clear(&G_PG_TMP)
+    rt.buf_push_bytes(&G_PG_TMP, (G_CHAT.ptr as u64) + tail as u64, olen)
+    rt.buf_push_bytes(&G_PG_TMP, G_CHAT.ptr as u64, tail)
+    rt.buf_clear(&G_CHAT)
+    rt.buf_push_bytes(&G_CHAT, G_PG_TMP.ptr as u64, G_PG_TMP.len)
+    // answers: [tail answers][older answers] -> [older answers][tail answers]
+    let tn: usize = G_PG_ANS0
+    let k: usize = G_ANS_N - tn
+    var i: usize = 0
+    while i < k {
+        T_ANS_S[i] = G_ANS_S[tn + i]
+        T_ANS_E[i] = G_ANS_E[tn + i]
+        T_ANS_DUR[i] = G_ANS_DUR[tn + i]
+        T_ANS_FIN[i] = G_ANS_FIN[tn + i]
+        T_ANS_MO[i] = G_ANS_MO[tn + i]
+        T_ANS_ML[i] = G_ANS_ML[tn + i]
+        i = i + 1
+    }
+    i = tn
+    while i > 0 {
+        i = i - 1
+        G_ANS_S[i + k] = G_ANS_S[i] + olen
+        G_ANS_E[i + k] = G_ANS_E[i] + olen
+        G_ANS_DUR[i + k] = G_ANS_DUR[i]
+        G_ANS_FIN[i + k] = G_ANS_FIN[i]
+        G_ANS_MO[i + k] = G_ANS_MO[i]
+        G_ANS_ML[i + k] = G_ANS_ML[i]
+    }
+    i = 0
+    while i < k {
+        G_ANS_S[i] = T_ANS_S[i]
+        G_ANS_E[i] = T_ANS_E[i]
+        G_ANS_DUR[i] = T_ANS_DUR[i]
+        G_ANS_FIN[i] = T_ANS_FIN[i]
+        G_ANS_MO[i] = T_ANS_MO[i]
+        G_ANS_ML[i] = T_ANS_ML[i]
+        i = i + 1
+    }
+    G_SPLIT = G_SPLIT + olen
+    G_TXT_AT = G_TXT_AT + olen
+    G_ANS_AT = G_ANS_AT + olen
+    markdownview.mdv_anchor_begin(mdv())
+    chat_changed_keep()
+    G_MORE = from > 0 && G_ANS_N + 40 < ANS_MAX && jsteps.room()
+}
+
+// the reader is near the top and older messages exist: ask for the next page (once at a time)
+fn page_check(a: *mut app.App) {
+    if !G_MORE || G_MORE_BUSY || G_PG_ON || G_BUSY || jsteps.has_pending() { return }
+    if time.now_unix_ms() < G_PG_RETRY_MS { return }
+    if markdownview.mdv_offset(mdv()) > G_VIEW_H * 2.0 { return }
+    if jarvisc.jc_history_older(jshell.jc()) {
+        G_MORE_BUSY = true
+        G_PG_PREV = jarvisc.jc_hist_from(jshell.jc())
+    }
+}
+
+// a slim line at the top of the chat while older messages are loaded
+fn paint_loading(c: *mut render.Ctx, x: f64, y: f64, w: f64) {
+    let f: *mut theme.Colors = theme.theme_colors(render.ctx_theme(c))
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let lbl: str = jtexts.t("chat.older-loading")
+    let ph: f64 = render.len_of(c, 28)
+    let pw: f64 = render.len_of(c, 200)
+    let px: f64 = x + (w - pw) * 0.5
+    let py: f64 = y + render.len_of(c, 8)
+    painter.round_rect(z, px, py, pw, ph, ph * 0.5, (*f).separator)
+    painter.round_rect(z, px + 1.0, py + 1.0, pw - 2.0, ph - 2.0, ph * 0.5 - 1.0, (*f).surface)
+    wave3.cell_text_weight(c, lbl.p as u64, lbl.n, px, py, pw, ph, (*f).text_muted, style.ALIGN_CENTER, 12, 400 as u32)
+}
+
 // ---- events from net.jarvisc (history, streamed answer, tools)
 fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
     if kind == jarvisc.JE_OPEN {
@@ -1828,10 +1958,18 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
             G_HELD_DUR = hd
             G_HELD_AT = ha
         }
+    } else if kind == jarvisc.JE_HIST_PAGE {
+        page_begin(c)
+    } else if kind == jarvisc.JE_HIST_PAGE_END {
+        page_end(c, arg)
+    } else if kind == jarvisc.JE_HIST_PAGE_ERR {
+        G_MORE_BUSY = false
+        G_PG_RETRY_MS = time.now_unix_ms() + 4000
     } else if kind == jarvisc.JE_HIST_END {
         release_held()
         jsteps.flush(&G_CHAT)
         chat_changed()
+        G_MORE = jarvisc.jc_hist_from(c) > 0
         // the history is in: the pill "opening the chat ..." (open from a notification / the list) must not stay (r141)
         if arg == 1 { jshell.set_status(jtexts.t("chat.thinking")) } else { jshell.set_status("online") }
     } else if kind == jarvisc.JE_TOKEN {

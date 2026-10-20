@@ -85,7 +85,7 @@ export {
     VP_UP, VP_DOWN, VP_LEFT, VP_RIGHT,
     VP_PAGE_UP, VP_PAGE_DOWN, VP_HOME, VP_END,
     VP_STEP, VP_WHEEL_STEP, VP_FLING_MS, VP_FLING_K, VP_FLING_MIN, VP_SMOOTH_TAU,
-    viewport_fling_friction, viewport_fling_android, viewport_scroll_smooth,
+    viewport_fling_friction, viewport_fling_android, viewport_scroll_smooth, viewport_shift, viewport_drag,
 }
 
 import std.math
@@ -177,6 +177,12 @@ struct Viewport {
     fl_t0: i64,
     // a48: decay constant of the running friction fling (per ms); VP_FLING_K for the plain one
     fl_k: f64,
+    // a64: 1 = the run-out follows the android spline (fl_dx/fl_dy = signed total distance, fl_tx/fl_ty = duration in ms per axis), 0 = exponential
+    fl_mode: u32,
+    fl_dx: f64,
+    fl_dy: f64,
+    fl_tx: f64,
+    fl_ty: f64,
     fr_on: u32,
     sm_x: f64,
     sm_y: f64,
@@ -208,7 +214,7 @@ fn viewport_new(x: f64, y: f64, w: f64, h: f64, cw: f64,
         fx: anim.anim_new(0, 1, 0.0, 0.0, anim.easing_linear()),
         fy: anim.anim_new(0, 1, 0.0, 0.0, anim.easing_linear()),
         fx_on: 0 as u32, fy_on: 0 as u32,
-        fl_ox: 0.0, fl_oy: 0.0, fl_vx: 0.0, fl_vy: 0.0, fl_t0: 0, fl_k: VP_FLING_K, fr_on: 0 as u32,
+        fl_ox: 0.0, fl_oy: 0.0, fl_vx: 0.0, fl_vy: 0.0, fl_t0: 0, fl_k: VP_FLING_K, fl_mode: 0 as u32, fl_dx: 0.0, fl_dy: 0.0, fl_tx: 0.0, fl_ty: 0.0, fr_on: 0 as u32,
         sm_x: 0.0, sm_y: 0.0, sm_t: 0, sm_on: 0 as u32,
         drag: VP_BAR_NONE, tombstone: 0.0, tombstone_off: 0.0,
         os_en: 0 as u32, osx: 0.0, osy: 0.0, ovx: 0.0, ovy: 0.0, os_t: 0 - 1,
@@ -454,6 +460,7 @@ fn viewport_fling_friction(v: *mut Viewport, vx: f64, vy: f64, now_ms: i64) {
     (*v).fl_vy = vy
     (*v).fl_t0 = now_ms
     (*v).fl_k = VP_FLING_K
+    (*v).fl_mode = 0 as u32
     (*v).sm_on = 0 as u32
     (*v).fx_on = 0 as u32
     (*v).fy_on = 0 as u32
@@ -471,14 +478,106 @@ fn viewport_fling_friction(v: *mut Viewport, vx: f64, vy: f64, now_ms: i64) {
 // further, slow ones stop soon. `ppi` = device pixels per inch (160 dp). vy in px/ms.
 fn viewport_fling_android(v: *mut Viewport, vx: f64, vy: f64, now_ms: i64, ppi: f64) {
     viewport_fling_friction(v, vx, vy, now_ms)
-    var m: f64 = vy
-    if m < 0.0 { m = 0.0 - m }
-    var ax: f64 = vx
-    if ax < 0.0 { ax = 0.0 - ax }
-    if ax > m { m = ax }
-    let dist: f64 = anim.android_fling_dist(m * 1000.0, ppi)
-    if dist > 1.0 && m > 0.0 {
-        (*v).fl_k = m / dist
+    // a64: the real OverScroller curve (distance AND duration AND shape per axis); vx / vy are px per ms
+    (*v).fl_mode = 1 as u32
+    (*v).fl_dx = 0.0
+    (*v).fl_dy = 0.0
+    (*v).fl_tx = 0.0
+    (*v).fl_ty = 0.0
+    let dx: f64 = anim.android_fling_dist(vx * 1000.0, ppi)
+    let dy: f64 = anim.android_fling_dist(vy * 1000.0, ppi)
+    if dx > 1.0 {
+        (*v).fl_dx = dx
+        if vx < 0.0 { (*v).fl_dx = 0.0 - dx }
+        (*v).fl_tx = anim.android_fling_ms(vx * 1000.0, ppi)
+    } else {
+        (*v).fr_on = (*v).fr_on & 2 as u32
+    }
+    if dy > 1.0 {
+        (*v).fl_dy = dy
+        if vy < 0.0 { (*v).fl_dy = 0.0 - dy }
+        (*v).fl_ty = anim.android_fling_ms(vy * 1000.0, ppi)
+    } else {
+        (*v).fr_on = (*v).fr_on & 1 as u32
+    }
+}
+
+// a64: one axis of a running fling at `dt` ms: the offset and the speed (px/ms). Exponential for the plain friction fling,
+// the android spline for viewport_fling_android. `done` is set when the run-out has ended on its own.
+fn fling_axis(v: *mut Viewport, y: bool, dt: f64, sp: *mut f64, done: *mut bool) -> f64 {
+    var o0: f64 = (*v).fl_ox
+    var v0: f64 = (*v).fl_vx
+    var dist: f64 = (*v).fl_dx
+    var tot: f64 = (*v).fl_tx
+    if y {
+        o0 = (*v).fl_oy
+        v0 = (*v).fl_vy
+        dist = (*v).fl_dy
+        tot = (*v).fl_ty
+    }
+    *done = false
+    if (*v).fl_mode == 1 as u32 && tot > 0.0 {
+        if dt >= tot {
+            *sp = 0.0
+            *done = true
+            return o0 + dist
+        }
+        let f: f64 = dt / tot
+        *sp = anim.android_spline_vel(f) * dist / tot
+        if *sp < 0.0 { *sp = 0.0 - *sp }
+        return o0 + dist * anim.android_spline_pos(f)
+    }
+    let n: f64 = anim.fling_pos(o0, v0, (*v).fl_k, dt)
+    var s: f64 = anim.fling_vel(v0, (*v).fl_k, dt)
+    if s < 0.0 { s = 0.0 - s }
+    *sp = s
+    if s < VP_FLING_MIN { *done = true }
+    return n
+}
+
+// a64: the content grew or shrank ABOVE the viewed part (older messages were put in front): move the offset by `d` without stopping
+// a running fling (its closed form starts at fl_oy, so that moves too).
+fn viewport_shift(v: *mut Viewport, dy: f64) {
+    (*v).oy = (*v).oy + dy
+    (*v).fl_oy = (*v).fl_oy + dy
+    (*v).sm_y = (*v).sm_y + dy
+    clamp_offset(v)
+}
+
+// a64: a finger drags the content by (dx, dy). Inside the content it follows 1:1; what the finger drags past an end (or while the band is
+// already pulled) goes into the rubber band (viewport_pull) when overscroll is on, else it is dropped.
+fn viewport_drag(v: *mut Viewport, dx: f64, dy: f64, now_ms: i64) {
+    if (*v).os_en == 0 as u32 {
+        viewport_scroll_by(v, dx, dy)
+        return
+    }
+    fling_stop(v)
+    let my: f64 = viewport_max_y(v)
+    let mx: f64 = viewport_max_x(v)
+    var rx: f64 = 0.0
+    var ry: f64 = 0.0
+    if dy != 0.0 && my > 0.0 {
+        if (*v).osy != 0.0 {
+            ry = dy
+        } else {
+            let t: f64 = (*v).oy + dy
+            if t < 0.0 { (*v).oy = 0.0; ry = t }
+            else if t > my { (*v).oy = my; ry = t - my }
+            else { (*v).oy = t }
+        }
+    }
+    if dx != 0.0 && mx > 0.0 {
+        if (*v).osx != 0.0 {
+            rx = dx
+        } else {
+            let t2: f64 = (*v).ox + dx
+            if t2 < 0.0 { (*v).ox = 0.0; rx = t2 }
+            else if t2 > mx { (*v).ox = mx; rx = t2 - mx }
+            else { (*v).ox = t2 }
+        }
+    }
+    if rx != 0.0 || ry != 0.0 {
+        viewport_pull(v, rx, ry, now_ms)
     }
 }
 
@@ -601,35 +700,35 @@ fn viewport_tick(v: *mut Viewport, now_ms: i64) -> bool {
             dt = 0.0
         }
         if ((*v).fr_on & 1 as u32) != 0 as u32 {
-            var n: f64 = anim.fling_pos((*v).fl_ox, (*v).fl_vx, (*v).fl_k, dt)
-            var sp: f64 = anim.fling_vel((*v).fl_vx, (*v).fl_k, dt)
-            if sp < 0.0 { sp = 0.0 - sp }
+            var sp: f64 = 0.0
+            var dn: bool = false
+            var n: f64 = fling_axis(v, false, dt, &sp, &dn)
             let mx: f64 = viewport_max_x(v)
             if n <= 0.0 || n >= mx {
                 if (*v).os_en != 0 as u32 && mx > 0.0 {
-                    inject_over(v, true, anim.fling_vel((*v).fl_vx, (*v).fl_k, dt), n >= mx, now_ms)
+                    inject_over(v, true, sp, n >= mx, now_ms)
                 }
                 if n < 0.0 { n = 0.0 }
                 if n > mx { n = mx }
                 (*v).fr_on = (*v).fr_on & 2 as u32
-            } else if sp < VP_FLING_MIN {
+            } else if dn {
                 (*v).fr_on = (*v).fr_on & 2 as u32
             }
             (*v).ox = n
         }
         if ((*v).fr_on & 2 as u32) != 0 as u32 {
-            var n2: f64 = anim.fling_pos((*v).fl_oy, (*v).fl_vy, (*v).fl_k, dt)
-            var sp2: f64 = anim.fling_vel((*v).fl_vy, (*v).fl_k, dt)
-            if sp2 < 0.0 { sp2 = 0.0 - sp2 }
+            var sp2: f64 = 0.0
+            var dn2: bool = false
+            var n2: f64 = fling_axis(v, true, dt, &sp2, &dn2)
             let my: f64 = viewport_max_y(v)
             if n2 <= 0.0 || n2 >= my {
                 if (*v).os_en != 0 as u32 && my > 0.0 {
-                    inject_over(v, false, anim.fling_vel((*v).fl_vy, (*v).fl_k, dt), n2 >= my, now_ms)
+                    inject_over(v, false, sp2, n2 >= my, now_ms)
                 }
                 if n2 < 0.0 { n2 = 0.0 }
                 if n2 > my { n2 = my }
                 (*v).fr_on = (*v).fr_on & 1 as u32
-            } else if sp2 < VP_FLING_MIN {
+            } else if dn2 {
                 (*v).fr_on = (*v).fr_on & 1 as u32
             }
             (*v).oy = n2
