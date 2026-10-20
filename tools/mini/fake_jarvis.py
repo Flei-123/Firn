@@ -62,6 +62,13 @@ if os.environ.get("FAKE_TOOLS") == "1":  # c1 history with tool steps (ok, faile
     CONV["s2"] = CONV["c1"]
 
 
+if os.environ.get("FAKE_LONG") == "1":  # a66c: c1 = a long worker chat (bubbles, bullet lists, code) that scrolls: the reader must follow the end
+    _msgs = []
+    for k in range(1, 9):
+        _msgs.append({"role": "user", "text": "question %d: why is the command centre on the phone so slow and what does the manager do about it" % k, "at": 1760000000000 + k * 10})
+        _msgs.append({"role": "assistant", "text": "Answer %d, short version:\n\n- **Cause 1:** the kernel spins in a loop (`sched.tget`) with 99 %% host CPU.\n- **Cause 2, open:** the popup manager builds it like the web style, which takes a while.\n- **Your VM:** runs with the new image on 1 core.\n\nNothing needed from you.\n>STATUS: status=done" % k, "at": 1760000000000 + k * 10 + 5})
+    CONV["c1"] = _msgs
+
 if os.environ.get("FAKE_CHATJSON"):  # a real server answer ({"conversation": {"messages": [...]}}): the history of c1/s1/s2 (real tool steps, thinking, cut inputs)
     with open(os.environ["FAKE_CHATJSON"]) as _f:
         _real = json.load(_f)["conversation"]["messages"]
@@ -541,6 +548,8 @@ def rest(method, rawpath, hdr, body):
             row = next((c for c in all_chats() if c["id"] == cid), None)
             if cid not in CONV and not (REAL and row):
                 return out(404, {"error": "Not found"})
+            if os.environ.get("FAKE_GROW") == "1" and cid == "c1" and "before" not in q:  # a66c: the worker grows on every poll
+                CONV[cid].append({"role": "assistant", "text": "Grown message %d: one more line of text that wraps over two lines of the phone screen.\n>STATUS: status=active" % len(CONV[cid]), "at": 1760000100000 + len(CONV[cid])})
             msgs = CONV[cid] if cid in CONV else gen_messages(cid)
             lim = max(1, min(100, int(q.get("limit", ["30"])[0] or 30)))
             end = len(msgs)
