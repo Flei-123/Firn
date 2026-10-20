@@ -160,6 +160,8 @@ def sidebar_chats():
                  row("m1a", "Server Manager: Backup", 1500, True, "worker", True, "m1"),
                  row("m1b", "Server Manager: Updates", 2500, False, "worker", True, "m1"),
                  row("m1c", "Server Manager: Logs", 2600, False, "worker", True, "m1b")]
+    many = int(os.environ.get("FAKE_MANY", "0") or "0")  # a68: N more old chats (paging: limit/offset of /api/m/chats)
+    extra = extra + [row("z%03d" % i, "Old chat %d" % i, (200 + i) * h) for i in range(many)]
     return extra + [row("o1", "Leitstand", 0, kind="orchestrator"),
             row("s1", "Certus", 1000, True), row("s2", "OrientOS", 2000),
             row("s2a", "OrientOS: Treiber", 3000, True, "worker", True, "s2"), row("s2b", "OrientOS: Netz", 4000, False, "worker", True, "s2"),
@@ -566,7 +568,7 @@ def rest(method, rawpath, hdr, body):
             if os.environ.get("FAKE_NO_FOLDERS"):  # an older server: no folders / folder / fav keys in the chat list
                 allc = [{k: v for k, v in c.items() if k not in ("folder", "fav")} for c in allc]
             fkey = {} if os.environ.get("FAKE_NO_FOLDERS") else {"folders": FOLDERS}
-            if not REAL:
+            if not REAL and not os.environ.get("FAKE_MANY"):
                 return out(200, dict({"total": len(allc), "chats": allc}, **fkey))
             lim = max(1, min(100, int(q.get("limit", ["30"])[0] or 30))); off = max(0, int(q.get("offset", ["0"])[0] or 0))
             qq = (q.get("q", [""])[0] or "").lower()

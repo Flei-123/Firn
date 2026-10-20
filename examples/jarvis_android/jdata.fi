@@ -29,6 +29,7 @@ import jtexts
 export {
     Ref, NeedRec, api, ensure, refresh_projects, refresh_center, refresh_tasks, refresh_devices, preload_devices, load_chat,
     refresh_convs, preload_convs, convs, has_convs, ver_convs, invalidate_all,
+    conv_rows_n, conv_row, convs_total, convs_more_avail, convs_more_loading, convs_load_more, CONV_VIEW_MAX,
     answer_need, task_add, task_complete, task_remove, forget_all,
     ver_projects, ver_needs, ver_center, ver_tasks, ver_devices, ver_conv, ver_stand,
     projects, has_projects, center, has_center, tasks, has_tasks, devices, has_devices, conv, has_conv, conv_cid,
@@ -131,6 +132,24 @@ static mut G_AGE: [i64; 7] = [0; 7]
 static mut G_CONVS: u64 = 0
 static mut G_HAS_CONVS: bool = false
 static mut G_V_CONVS: u64 = 0
+// a68 paging: page 0 is G_CONVS (the newest 100 + every chat in a folder); further pages (100 each, offset 100*k) sit in G_XPAGES[k-1].
+// G_VIEW is the flat list the drawer reads (page 0, then the pages in order, a chat id only once).
+const CONV_VIEW_MAX: usize = 640
+const XPAGES_MAX: usize = 5
+const PAGE_SIZE: i64 = 100
+static mut G_XPAGES: [u64; 5] = [0; 5]
+static mut G_XPAGES_N: usize = 0 // pages stored
+static mut G_XWANT: usize = 0 // pages wanted (the user asked for more)
+static mut G_XNEXT: usize = 0 // the next page index to GET (0-based) -- below G_XWANT means a GET is due
+static mut G_XFLIGHT: bool = false
+static mut G_XREQ: usize = 0 // the page index the GET in flight is for
+static mut G_XRETRY_AT: i64 = 0
+static mut G_XDEAD: bool = false // the server had nothing more at the last ask
+static mut G_SIG_TOTAL: i64 = 0 // page 0 signature: total + id of its 100th row; a change shifts the later pages -> they are asked again
+static mut G_SIG_ID: [u8; 48] = [0; 48]
+static mut G_SIG_N: usize = 0
+static mut G_VIEW: [u64; 640] = [0; 640]
+static mut G_VIEW_N: usize = 0
 static mut G_CONVS_304: i64 = 0 // a61: how many chat-list GETs were answered 304 (unchanged)
 static mut G_NOTE: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_CID: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
@@ -349,12 +368,15 @@ fn on_api(a: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
             G_CONVS_304 = G_CONVS_304 + 1
             if G_CONVS_304 <= 5 { log.log_info("net", "chats 304 (unchanged, kept the list), count " + jshell.dec(G_CONVS_304)) }
         } else if good { take_convs(p, n) }
+    } else if kind == jarvisapi.AK_CONVS_MORE {
+        take_page(p, n, status)
     } else if kind == jarvisapi.AK_CONV {
         stand_note(K_CONV, status, age)
         if good { take_conv(p, n) }
     }
     // a place on the wire is free again: the next wanted GET goes out (after the answer was taken, never inside the parse)
     pump()
+    more_pump()
 }
 
 // ---- loop lag meter: the window and the network share ONE thread, so anything that blocks it (a blocking name lookup, a big parse, the
@@ -476,6 +498,7 @@ fn forget_all() {
     G_HAS_DEV = false
     G_HAS_CONV = false
     G_HAS_CONVS = false
+    forget_pages()
     G_V_CONVS = G_V_CONVS + 1 as u64
     G_V_PROJ = G_V_PROJ + 1 as u64
     G_V_CENTER = G_V_CENTER + 1 as u64
@@ -624,6 +647,162 @@ fn take_convs(p: u64, n: usize) {
     if G_HAS_CONVS { jarvisapi.convs_free(convs()) }
     *convs() = t
     G_HAS_CONVS = true
+    sig_check()
+    view_build()
+    G_V_CONVS = G_V_CONVS + 1 as u64
+}
+
+// ---- a68: more pages of the chat list
+fn xpage(k: usize) -> *mut jarvisapi.Convs { return G_XPAGES[k] as *mut jarvisapi.Convs }
+
+// page 0 changed in a way that moves the rows of the later pages (a new chat, a chat that went to the top): ask them again, in place
+fn sig_check() {
+    let c: *mut jarvisapi.Convs = convs()
+    let nr: usize = vec_len[jarvisapi.ConvRow](&(*c).rows)
+    var at: usize = nr
+    if at > 100 { at = 100 }
+    var same: bool = (*c).total == G_SIG_TOTAL
+    var n: usize = 0
+    if at > 0 {
+        let id: str = (*vec_elem_ptr[jarvisapi.ConvRow](&(*c).rows, at - 1)).id
+        n = id.n
+        if n > 48 { n = 48 }
+        if n != G_SIG_N { same = false }
+        var i: usize = 0
+        while same && i < n {
+            if rt.ld8(id.p as u64, i) != G_SIG_ID[i] { same = false }
+            i = i + 1
+        }
+        if !same { rt.mem_copy((&G_SIG_ID[0]) as u64, id.p as u64, n) }
+    }
+    if !same {
+        G_SIG_N = n
+        G_SIG_TOTAL = (*c).total
+        G_XDEAD = false
+        if G_XWANT > 0 { G_XNEXT = 0 }
+    }
+}
+
+fn forget_pages() {
+    var k: usize = 0
+    while k < XPAGES_MAX {
+        if G_XPAGES[k] != 0 { jarvisapi.convs_free(xpage(k)) }
+        k = k + 1
+    }
+    G_XPAGES_N = 0
+    G_XWANT = 0
+    G_XNEXT = 0
+    G_XDEAD = false
+    G_VIEW_N = 0
+}
+
+// the flat list: page 0, then every further page; a chat id only once (the first page 0 carries the folder chats beyond its 100)
+fn view_build() {
+    G_VIEW_N = 0
+    if !G_HAS_CONVS { return }
+    var pg: usize = 0
+    while pg <= G_XPAGES_N && pg <= XPAGES_MAX {
+        var c: *mut jarvisapi.Convs = convs()
+        if pg > 0 { c = xpage(pg - 1) }
+        let nr: usize = vec_len[jarvisapi.ConvRow](&(*c).rows)
+        var i: usize = 0
+        while i < nr && G_VIEW_N < CONV_VIEW_MAX {
+            let r: *mut jarvisapi.ConvRow = vec_elem_ptr[jarvisapi.ConvRow](&(*c).rows, i)
+            var dup: bool = false
+            if pg > 0 {
+                var j: usize = 0
+                while j < G_VIEW_N {
+                    if (*(G_VIEW[j] as *mut jarvisapi.ConvRow)).id == (*r).id { dup = true; break }
+                    j = j + 1
+                }
+            }
+            if !dup {
+                G_VIEW[G_VIEW_N] = r as u64
+                G_VIEW_N = G_VIEW_N + 1
+            }
+            i = i + 1
+        }
+        pg = pg + 1
+    }
+}
+
+fn conv_rows_n() -> usize { return G_VIEW_N }
+fn conv_row(i: usize) -> *mut jarvisapi.ConvRow { return G_VIEW[i] as *mut jarvisapi.ConvRow }
+fn convs_total() -> i64 {
+    if !G_HAS_CONVS { return 0 }
+    return (*convs()).total
+}
+
+// more chats exist on the server than are loaded (and the app may still ask for a page)
+fn convs_more_avail() -> bool {
+    if !G_HAS_CONVS || G_XDEAD { return false }
+    if G_XNEXT < G_XWANT { return true }
+    if G_XWANT >= XPAGES_MAX { return false }
+    return (G_VIEW_N as i64) < convs_total() && G_VIEW_N < CONV_VIEW_MAX
+}
+
+fn convs_more_loading() -> bool { return G_XNEXT < G_XWANT }
+
+// the user scrolled to the end of the list / tapped "load more": one more page
+fn convs_load_more() {
+    if !convs_more_avail() || G_XNEXT < G_XWANT || G_XWANT >= XPAGES_MAX { return }
+    G_XWANT = G_XWANT + 1
+    G_V_CONVS = G_V_CONVS + 1 as u64
+    more_pump()
+}
+
+fn more_pump() {
+    if G_XFLIGHT || G_XNEXT >= G_XWANT || !G_HAS_CONVS { return }
+    if G_FLIGHT >= MAX_FLIGHT { return }
+    let now: i64 = time.now_unix_ms()
+    if now < G_XRETRY_AT { return }
+    if G_PROBING && now - G_PING_AT < HOLD_PING_MS { return }
+    let a: *mut jarvisapi.Api = ensure()
+    if jarvisapi.ja_convs_page(a, ((G_XNEXT as i64 + 1) * PAGE_SIZE) as u32) {
+        G_FLIGHT = G_FLIGHT + 1
+        G_XFLIGHT = true
+        G_XREQ = G_XNEXT
+    } else {
+        G_XRETRY_AT = now + 5000
+    }
+}
+
+fn take_page(p: u64, n: usize, status: i64) {
+    G_XFLIGHT = false
+    var ok: bool = false
+    if status == 200 || status == 203 {
+        var t: jarvisapi.Convs = jarvisapi.convs_new()
+        if jarvisapi.parse_convs(p, n, &t) {
+            if vec_len[jarvisapi.ConvRow](&t.rows) == 0 {
+                // nothing more: stop asking until page 0 changes
+                jarvisapi.convs_free(&t)
+                G_XDEAD = true
+                G_XWANT = G_XREQ
+                G_XNEXT = G_XREQ
+            } else {
+                let k: usize = G_XREQ
+                if k < XPAGES_MAX {
+                    if G_XPAGES[k] == 0 {
+                        G_XPAGES[k] = rt.heap_alloc(256)
+                    } else {
+                        jarvisapi.convs_free(xpage(k))
+                    }
+                    *xpage(k) = t
+                    if k + 1 > G_XPAGES_N { G_XPAGES_N = k + 1 }
+                    if G_XNEXT == k { G_XNEXT = k + 1 }
+                    ok = true
+                } else {
+                    jarvisapi.convs_free(&t)
+                    G_XWANT = XPAGES_MAX
+                    G_XNEXT = XPAGES_MAX
+                }
+            }
+        } else {
+            jarvisapi.convs_free(&t)
+        }
+    }
+    if !ok && !G_XDEAD && G_XNEXT < G_XWANT { G_XRETRY_AT = time.now_unix_ms() + 5000 }
+    view_build()
     G_V_CONVS = G_V_CONVS + 1 as u64
 }
 
@@ -761,6 +940,7 @@ fn refresh_tasks(force: bool) {
 // the chat list for the chat tab's drawer (newest 40)
 fn refresh_convs(force: bool) {
     preload_convs()
+    more_pump()
     if !due(K_CONVS, force) { return }
     want(K_CONVS)
 }

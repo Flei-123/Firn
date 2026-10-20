@@ -42,6 +42,7 @@ import net.jarvisc
 import net.jarvisapi
 import plat.tzinfo
 import fui.applay
+import fui.lay
 import jshell
 import jtexts
 import jdata
@@ -62,8 +63,8 @@ const K_SB_SEARCH: u32 = 72
 const K_SB_DIM_D: u32 = 73
 const K_SB_DIM_L: u32 = 74
 
-const MAXC: usize = 256 // conversations looked at (the app asks for 100, plus every chat that sits in a folder)
-const MAXE: usize = 320 // display entries: headers + entries
+const MAXC: usize = 640 // conversations looked at (page 0 = 100 + every chat in a folder, then up to 5 more pages of 100: jdata paging)
+const MAXE: usize = 800 // display entries: headers + entries
 const NGROUPS: usize = 7
 const ROW_PT: usize = 46
 const SEG_H: f64 = 44.0
@@ -96,6 +97,7 @@ static mut G_M_ASK: usize = 0
 static mut G_M_CONF: usize = 0
 static mut G_M_CANCEL: usize = 0
 static mut G_M_ERR: usize = 0
+static mut G_M_SC: usize = 4294967295 // lay.scroll_v index of the menu page (rename on a scrollable page: the open keyboard cannot hide the field)
 static mut G_M_MODE: usize = 0 // 0 = no menu, 1 = actions, 2 = rename, 3 = delete asks
 static mut G_M_BUSY: bool = false // a request is in flight
 static mut G_M_ID: [u8; 96] = [0; 96]
@@ -113,17 +115,23 @@ static mut G_QUERY_N: usize = 0
 static mut G_PICKED: [u8; 96] = [0; 96]
 static mut G_PICKED_N: usize = 0
 static mut G_N: usize = 0 // display entries
-static mut G_E: [u32; 320] = [0; 320] // kind * 1000 + index: 1 = group header (group), 2 = chat entry (conversation), 3 = message line (text key), 4 = the folder block header, 5 = a folder header (folder index)
-static mut G_GRP: [i64; 256] = [0; 256] // group of conversation i, -1 = not shown
-static mut G_PAR: [i64; 256] = [0; 256] // index of the parent conversation shown, -1 = none
-static mut G_KIDS: [i64; 256] = [0; 256] // sub-workers of i
-static mut G_DEPTH: [u8; 256] = [0; 256] // nesting depth of conversation i in the shown list (0 = top level)
-static mut G_KIDS_RUN: [i64; 256] = [0; 256] // sub-workers of i that work
+static mut G_E: [u32; 800] = [0; 800] // kind * 1000 + index: 1 = group header (group), 2 = chat entry (conversation), 3 = message line (text key), 4 = the folder block header, 5 = a folder header (folder index)
+static mut G_GRP: [i64; 640] = [0; 640] // group of conversation i, -1 = not shown
+static mut G_PAR: [i64; 640] = [0; 640] // index of the parent conversation shown, -1 = none
+static mut G_KIDS: [i64; 640] = [0; 640] // sub-workers of i
+static mut G_DEPTH: [u8; 640] = [0; 640] // nesting depth of conversation i in the shown list (0 = top level)
+static mut G_KIDS_RUN: [i64; 640] = [0; 640] // sub-workers of i that work
+static mut G_UPD: [i64; 640] = [0; 640] // last activity of conversation i INCLUDING its sub-workers (the parent sorts by its newest child)
+static mut G_ACT: [i64; 640] = [0; 640] // sort key: working (itself or a child) = now, else G_UPD
+static mut G_ORD: [u32; 640] = [0; 640] // conversation indexes by G_ACT, newest first (stable: ties keep the server order)
+static mut G_KC: [u8; 2048] = [0; 2048] // parents folded in the tree: ",id,id," (sb.kclosed in the app settings)
+static mut G_KC_N: usize = 0
+static mut G_NEED_MORE: bool = false // the "load more" row was drawn: the tick asks jdata for the next page
 static mut G_GCOUNT: [i64; 8] = [0; 8]
 static mut G_WORKERS_RUN: i64 = 0
 static mut G_CHATS_RUN: i64 = 0
 static mut G_WORKERS_ALL: i64 = 0
-static mut G_FIDX: [i64; 256] = [0; 256] // folder index of conversation i, -1 = in no (known) folder
+static mut G_FIDX: [i64; 640] = [0; 640] // folder index of conversation i, -1 = in no (known) folder
 static mut G_FCOUNT: [i64; 48] = [0; 48] // chats per folder
 static mut G_FRUN: [i64; 48] = [0; 48] // working chats per folder
 static mut G_FC: [u8; 1024] = [0; 1024] // closed folders: ",id,id,"
@@ -157,7 +165,7 @@ fn sidebar_is_open() -> bool { return G_OPEN }
 
 fn conv_count() -> usize {
     if !jdata.has_convs() { return 0 }
-    var n: usize = vec_len[jarvisapi.ConvRow](&(*jdata.convs()).rows)
+    var n: usize = jdata.conv_rows_n() // page 0 + the pages loaded later, every chat once
     if n > MAXC { n = MAXC }
     return n
 }
@@ -173,15 +181,15 @@ fn folder_at(i: usize) -> *mut jarvisapi.FolderRow {
     return vec_elem_ptr[jarvisapi.FolderRow](&(*jdata.convs()).folders, i)
 }
 
-// position of ",id," in the closed-folder list, -1 = not closed
-fn fc_find(id: str) -> i64 {
-    if id.n == 0 || G_FC_N < id.n + 2 { return 0 - 1 }
+// position of ",id," in a closed-list buffer (",id,id,"), -1 = not in it
+fn lst_find(buf: *mut u8, bn: usize, id: str) -> i64 {
+    if id.n == 0 || bn < id.n + 2 { return 0 - 1 }
     var i: usize = 0
-    while i + id.n + 2 <= G_FC_N {
-        if G_FC[i] == 44 as u8 && G_FC[i + id.n + 1] == 44 as u8 {
+    while i + id.n + 2 <= bn {
+        if rt.ld8(buf as u64, i) == 44 as u8 && rt.ld8(buf as u64, i + id.n + 1) == 44 as u8 {
             var k: usize = 0
             while k < id.n {
-                if G_FC[i + 1 + k] != rt.ld8(id.p as u64, k) { break }
+                if rt.ld8(buf as u64, i + 1 + k) != rt.ld8(id.p as u64, k) { break }
                 k = k + 1
             }
             if k == id.n { return i as i64 }
@@ -191,40 +199,58 @@ fn fc_find(id: str) -> i64 {
     return 0 - 1
 }
 
-fn folder_closed(i: usize) -> bool { return fc_find((*folder_at(i)).id) >= 0 }
-
-fn fold_persist() {
-    jshell.cfg_set("sb.closed", jshell.dec(G_CLOSED as i64))
-    jshell.cfg_set("sb.fclosed", str { p: (&G_FC[0]) as *mut u8, n: G_FC_N })
-}
-
-fn fc_toggle(id: str) {
-    let at: i64 = fc_find(id)
+// toggle `id` in a closed-list buffer of capacity `cap`; returns the new length
+fn lst_toggle(buf: *mut u8, bn: usize, cap: usize, id: str) -> usize {
+    var n: usize = bn
+    let at: i64 = lst_find(buf, n, id)
     if at >= 0 {
         // drop "id," (the leading comma stays as the separator of the next entry)
         let from: usize = at as usize + 1
         let cut: usize = id.n + 1
         var i: usize = from
-        while i + cut < G_FC_N {
-            G_FC[i] = G_FC[i + cut]
+        while i + cut < n {
+            *((buf as u64 + i as u64) as *mut u8) = rt.ld8(buf as u64, i + cut)
             i = i + 1
         }
-        G_FC_N = G_FC_N - cut
-        if G_FC_N <= 1 { G_FC_N = 0 }
-    } else if G_FC_N + id.n + 2 < 1024 {
-        if G_FC_N == 0 {
-            G_FC[0] = 44 as u8
-            G_FC_N = 1
+        n = n - cut
+        if n <= 1 { n = 0 }
+    } else if n + id.n + 2 < cap {
+        if n == 0 {
+            *(buf as *mut u8) = 44 as u8
+            n = 1
         }
         var k: usize = 0
         while k < id.n {
-            G_FC[G_FC_N + k] = rt.ld8(id.p as u64, k)
+            *((buf as u64 + (n + k) as u64) as *mut u8) = rt.ld8(id.p as u64, k)
             k = k + 1
         }
-        G_FC_N = G_FC_N + id.n
-        G_FC[G_FC_N] = 44 as u8
-        G_FC_N = G_FC_N + 1
+        n = n + id.n
+        *((buf as u64 + n as u64) as *mut u8) = 44 as u8
+        n = n + 1
     }
+    return n
+}
+
+fn fc_find(id: str) -> i64 { return lst_find(&G_FC[0], G_FC_N, id) }
+
+fn folder_closed(i: usize) -> bool { return fc_find((*folder_at(i)).id) >= 0 }
+
+fn fold_persist() {
+    jshell.cfg_set("sb.closed", jshell.dec(G_CLOSED as i64))
+    jshell.cfg_set("sb.fclosed", str { p: (&G_FC[0]) as *mut u8, n: G_FC_N })
+    jshell.cfg_set("sb.kclosed", str { p: (&G_KC[0]) as *mut u8, n: G_KC_N })
+}
+
+fn fc_toggle(id: str) {
+    G_FC_N = lst_toggle(&G_FC[0], G_FC_N, 1024, id)
+    fold_persist()
+}
+
+// a68: the sub-workers of a parent are folded (the arrow at the parent); the state is stored by chat id, so it survives the refresh
+fn kc_closed(id: str) -> bool { return lst_find(&G_KC[0], G_KC_N, id) >= 0 }
+
+fn kc_toggle(id: str) {
+    G_KC_N = lst_toggle(&G_KC[0], G_KC_N, 2048, id)
     fold_persist()
 }
 
@@ -250,6 +276,11 @@ fn fold_load() {
     if n > 1000 { n = 0 }
     rt.mem_copy((&G_FC[0]) as u64, fc.p as u64, n)
     G_FC_N = n
+    let kc: str = jshell.cfg_get("sb.kclosed", "")
+    var kn: usize = kc.n
+    if kn > 2040 { kn = 0 }
+    rt.mem_copy((&G_KC[0]) as u64, kc.p as u64, kn)
+    G_KC_N = kn
 }
 
 fn conv_find(id: str) -> i64 {
@@ -273,7 +304,7 @@ fn folder_find(id: str) -> i64 {
 }
 
 fn conv_at(i: usize) -> *mut jarvisapi.ConvRow {
-    return vec_elem_ptr[jarvisapi.ConvRow](&(*jdata.convs()).rows, i)
+    return jdata.conv_row(i)
 }
 
 fn is_worker(c: *mut jarvisapi.ConvRow) -> bool { return (*c).dispatched || (*c).kind == "worker" }
@@ -351,8 +382,8 @@ fn group_of(i: usize, today: i64) -> i64 {
     let c: *mut jarvisapi.ConvRow = conv_at(i)
     if (*c).running || G_KIDS_RUN[i] > 0 { return G_ACTIVE as i64 }
     if (*c).fav { return G_FAV as i64 }
-    if (*c).updated <= 0 { return 6 }
-    let days: i64 = today - local_day((*c).updated)
+    if G_UPD[i] <= 0 { return 6 }
+    let days: i64 = today - local_day(G_UPD[i])
     if days <= 0 { return 2 }
     if days == 1 { return 3 }
     if days <= 7 { return 4 }
@@ -363,15 +394,56 @@ fn group_of(i: usize, today: i64) -> i64 {
 // the children of conversation i (sub-workers) right below it, indented (web: .conv-sub); depth-limited against parent cycles
 fn emit_kids(i: usize, depth: usize) {
     if depth >= 4 { return }
-    var j: usize = 0
-    while j < conv_count() && G_N < MAXE {
+    if G_KIDS[i] > 0 && kc_closed((*conv_at(i)).id) { return } // folded at the parent's arrow
+    var oi: usize = 0
+    while oi < conv_count() && G_N < MAXE {
+        let j: usize = G_ORD[oi] as usize
+        oi = oi + 1
         if G_PAR[j] == i as i64 {
             G_DEPTH[j] = (depth + 1) as u8
             G_E[G_N] = (2000 + j) as u32
             G_N = G_N + 1
             emit_kids(j, depth + 1)
         }
-        j = j + 1
+    }
+}
+
+// a68: activity of every conversation including its sub-workers (a parent sorts by its newest child; the date groups follow it) and the
+// display order: working first, then newest. An insertion sort: the server list is nearly in that order already.
+fn sort_by_activity(n: usize, now: i64) {
+    var i: usize = 0
+    while i < n {
+        G_UPD[i] = (*conv_at(i)).updated
+        i = i + 1
+    }
+    var pass: usize = 0
+    while pass < 5 {
+        i = 0
+        var moved: bool = false
+        while i < n {
+            let p: i64 = G_PAR[i]
+            if p >= 0 && G_UPD[i] > G_UPD[p as usize] {
+                G_UPD[p as usize] = G_UPD[i]
+                moved = true
+            }
+            i = i + 1
+        }
+        if !moved { break }
+        pass = pass + 1
+    }
+    i = 0
+    while i < n {
+        G_ACT[i] = G_UPD[i]
+        if (*conv_at(i)).running || G_KIDS_RUN[i] > 0 { G_ACT[i] = now }
+        G_ORD[i] = i as u32
+        var k: usize = i
+        while k > 0 && G_ACT[G_ORD[k - 1] as usize] < G_ACT[G_ORD[k] as usize] {
+            let t: u32 = G_ORD[k - 1]
+            G_ORD[k - 1] = G_ORD[k]
+            G_ORD[k] = t
+            k = k - 1
+        }
+        i = i + 1
     }
 }
 
@@ -442,6 +514,7 @@ fn rebuild(a: *mut app.App) {
         }
         i = i + 1
     }
+    sort_by_activity(n, time.now_unix_ms())
     G_N = 0
     var g: usize = 0
     var k: usize = 0
@@ -484,14 +557,15 @@ fn rebuild(a: *mut app.App) {
                     if !folder_closed(fx) {
                         var pass: usize = 0
                         while pass < 2 {
-                            i = 0
-                            while i < n && G_N < MAXE {
+                            var oj: usize = 0
+                            while oj < n && G_N < MAXE {
+                                i = G_ORD[oj] as usize
+                                oj = oj + 1
                                 if G_FIDX[i] == fx as i64 && ((*conv_at(i)).running == (pass == 0)) {
                                     G_E[G_N] = (2000 + i) as u32
                                     G_N = G_N + 1
                                     emit_kids(i, 0)
                                 }
-                                i = i + 1
                             }
                             pass = pass + 1
                         }
@@ -524,14 +598,15 @@ fn rebuild(a: *mut app.App) {
                 G_E[G_N] = (1000 + g) as u32
                 G_N = G_N + 1
                 if (G_CLOSED & ((1 as u32) << (g as u32))) == 0 as u32 {
-                    i = 0
-                    while i < n && G_N < MAXE {
+                    var ok2: usize = 0
+                    while ok2 < n && G_N < MAXE {
+                        i = G_ORD[ok2] as usize
+                        ok2 = ok2 + 1
                         if G_GRP[i] == g as i64 {
                             G_E[G_N] = (2000 + i) as u32
                             G_N = G_N + 1
                             emit_kids(i, 0)
                         }
-                        i = i + 1
                     }
                 }
                 shown = shown + 1
@@ -543,6 +618,11 @@ fn rebuild(a: *mut app.App) {
         var key: usize = 0
         if G_QUERY_N > 0 { key = 2 } else if G_TAB == 1 { key = 1 }
         G_E[G_N] = (3000 + key) as u32
+        G_N = G_N + 1
+    }
+    // a68: more chats on the server than loaded -> a "load more" row at the end (drawn = scrolled to = the next page is asked)
+    if G_QUERY_N == 0 && jdata.convs_more_avail() && G_N < MAXE {
+        G_E[G_N] = 6000 as u32
         G_N = G_N + 1
     }
     if G_M_MODE == 4 { app.vlist_set_count(a, G_LIST, folder_count() + 2) } else { app.vlist_set_count(a, G_LIST, G_N) }
@@ -628,6 +708,20 @@ fn rows(ud: u64, i: usize, out: *mut vlist.VRow) {
         (*out).sbf = f5
         return
     }
+    if kind == 6 as u32 {
+        if jdata.convs_more_loading() {
+            jlist.put(out, jtexts.t("sb.more-load"))
+            (*out).sbf = 2 as u32
+        } else {
+            jlist.put(out, jtexts.t("sb.more"))
+            (*out).sbf = 0 as u32
+            G_NEED_MORE = true // the row is on screen: the 100 ms tick loads the next page (scrolling to the end loads on)
+        }
+        let left: i64 = jdata.convs_total() - (jdata.conv_rows_n() as i64)
+        if left > 0 { put_count(out, left) }
+        (*out).sbk = 3 as u32
+        return
+    }
     if kind == 3 as u32 {
         var key: str = jtexts.t("sb.empty")
         if idx == 1 { key = jtexts.t("sb.empty-workers") }
@@ -643,7 +737,18 @@ fn rows(ud: u64, i: usize, out: *mut vlist.VRow) {
     if (*c).running || G_KIDS_RUN[idx] > 0 { f = f | 2 as u32 }
     if (*c).id == cur_cid() { f = f | 4 as u32 }
     f = f | 8 as u32 // SB_MENU: the "..." at the right edge
-    if G_QUERY_N == 0 && (G_FIDX[idx] >= 0 || G_DEPTH[idx] > (0 as u8)) { f = f | 32 as u32 } // SB_INDENT: inside a folder / a sub-worker
+    if G_QUERY_N == 0 {
+        // indent level (16 pt each, bits 9-10): inside a folder +1, every sub-worker depth +1; SB_INDENT stays set for level >= 1
+        var lvl: u32 = (G_DEPTH[idx] as u32)
+        if G_FIDX[idx] >= 0 { lvl = lvl + (1 as u32) }
+        if lvl > (3 as u32) { lvl = 3 as u32 }
+        if lvl > (0 as u32) { f = f | 32 as u32 | (lvl << (9 as u32)) }
+        // the fold arrow of a parent (SB_KIDS 128, SB_KOPEN 256)
+        if G_KIDS[idx] > 0 {
+            f = f | 128 as u32
+            if !kc_closed((*c).id) { f = f | 256 as u32 }
+        }
+    }
     if (*c).fav && G_GRP[idx] != G_FAV as i64 { f = f | 64 as u32 } // SB_STAR (the favorites group needs none)
     (*out).sbf = f
     if G_KIDS[idx] > 0 { (*out).badge = G_KIDS[idx] }
@@ -673,8 +778,26 @@ fn on_pick(a: *mut app.App, id: usize, row: usize) {
         rebuild(a)
         return
     }
+    if kind == 6 as u32 {
+        jdata.convs_load_more()
+        rebuild(a)
+        return
+    }
     if kind != 2 as u32 { return }
     let c: *mut jarvisapi.ConvRow = conv_at(idx)
+    if G_QUERY_N == 0 && G_KIDS[idx] > 0 {
+        // a tap on the arrow zone (left of the status circle) folds / unfolds the sub-workers; elsewhere on the row it opens the chat
+        var lvl: u32 = (G_DEPTH[idx] as u32)
+        if G_FIDX[idx] >= 0 { lvl = lvl + (1 as u32) }
+        if lvl > (3 as u32) { lvl = 3 as u32 }
+        let ctx: *mut render.Ctx = app.app_ctx(a)
+        let zone: f64 = render.len_of(ctx, 40 + 16 * (lvl as usize))
+        if app.vlist_tap_rel_x(a, G_LIST) < zone {
+            kc_toggle((*c).id)
+            rebuild(a)
+            return
+        }
+    }
     var n: usize = (*c).id.n
     if n == 0 { return }
     if n > 96 { n = 96 }
@@ -718,7 +841,7 @@ fn menu_apply(a: *mut app.App) {
     if hide_list { scene.node_set_flexitem(sc, G_LIST, 0, 0, 0, 1) } else { scene.node_set_flexitem(sc, G_LIST, 1000, 1000, 60, 0) }
     var mg: i64 = 1
     if G_M_MODE == 4 { mg = 0 }
-    jshell.set_shown(a, G_MENU, on, mg)
+    if on && G_M_MODE != 4 { jshell.set_shown_flex(a, G_MENU, true) } else { jshell.set_shown(a, G_MENU, on, mg) }
     let acts: bool = G_M_MODE == 1 || G_M_MODE == 6
     mshow(a, G_M_FAV, G_M_MODE == 1)
     mshow(a, G_M_MOVE, G_M_MODE == 1)
@@ -1001,6 +1124,21 @@ fn sidebar_back(a: *mut app.App) -> bool {
     return false
 }
 
+// a finger drag on the menu page scrolls it (a pan wins over a tap, so a swipe never presses a button)
+fn on_pan_menu(ud: u64, e: *mut event.Ev) -> u32 {
+    if G_M_SC == 4294967295 { return event.H_GO }
+    let kind: u32 = event.ev_kind(e)
+    if kind == event.EV_PAN_MOVE {
+        lay.scroll_pan(G_M_SC, event.ev_dy(e))
+        return event.H_STOP
+    }
+    if kind == event.EV_PAN_END && event.ev_fling(e) {
+        lay.scroll_fling(G_M_SC, event.ev_vy(e), event.ev_time(e))
+        return event.H_STOP
+    }
+    return event.H_GO
+}
+
 fn build_menu(a: *mut app.App) {
     let sc: *mut scene.Scene = app.app_scene(a)
     G_MENU = app.column(a)
@@ -1008,6 +1146,15 @@ fn build_menu(a: *mut app.App) {
     scene.node_set_gap(sc, G_MENU, 0, 0) // a49: hidden children still add a gap; the 10 pt spacing is a top margin of the SHOWN rows (mshow)
     scene.node_set_padding(sc, G_MENU, 4, 8, 4, 0)
     jshell.fill_stretch(a, G_MENU)
+    // a68: the page scrolls (lay.scroll_v shrinks with the keyboard; main.kb_reveal scrolls the focused field above it)
+    let sv: usize = lay.scroll_v(a)
+    if sv != app.NONE {
+        G_M_SC = lay.scroll_last()
+        lay.scroll_set_bar(G_M_SC, 0)
+        let pb: bool = app.on(a, lay.scroll_node(G_M_SC), event.EV_PAN_ALL, on_pan_menu)
+        scene.node_set_flex(sc, sv, flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
+        scene.node_set_gap(sc, sv, 0, 0)
+    }
     G_M_TITLE = app.label(a, "", 0)
     jtheme.style_node(a, G_M_TITLE, jtheme.K_TITLE)
     applay.align_start(a, G_M_TITLE)
@@ -1035,6 +1182,7 @@ fn build_menu(a: *mut app.App) {
     G_M_ERR = app.label(a, "", 0)
     jtheme.style_node(a, G_M_ERR, jsetui.K_SET_ERR)
     applay.align_start(a, G_M_ERR)
+    if sv != app.NONE { app.end(a) }
     app.end(a)
     jshell.set_shown(a, G_MENU, false, 0)
 }
@@ -1376,6 +1524,14 @@ fn sidebar_refresh(a: *mut app.App) {
 fn sidebar_tick(a: *mut app.App) {
     if !G_OPEN { return }
     if read_query(a) { rebuild(a) }
+    // a68: the "load more" row was drawn (the list is scrolled to its end) or a search is running (it must see every chat): the next page
+    if G_NEED_MORE || (G_QUERY_N > 0 && jdata.convs_more_avail()) {
+        G_NEED_MORE = false
+        if !jdata.convs_more_loading() {
+            jdata.convs_load_more()
+            rebuild(a)
+        }
+    }
 }
 
 // one log line for the tests: tab, entries, groups, query
