@@ -1,0 +1,533 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_android/screen_memory.fi -- the Memory page (Settings > Memory; web: the memory button): the entries the assistant keeps
+// about the user (knowledge / profile / task). List with search + type filter, add, edit (full text in a text area), delete (asks twice).
+// API: GET /api/m/memory?q=&type=&offset=&limit= (rows hold only the start of a text), GET ?id= (full text), POST {action: add|edit|delete}.
+// An older server (404) shows "not available". Entries longer than the text area (4000 chars) are read-only (the server flags them).
+import std.rt
+import fui.app
+import fui.vlist
+import net.jarvisapi
+import jshell
+import jtheme
+import jlist
+import jtexts
+import jsetui
+import fui.applay
+
+export { screen_memory_build, screen_memory_refresh, memory_api, memory_reset }
+
+const MAX_ROWS: usize = 200
+const PAGE: usize = 40
+const PREVIEW: usize = 150
+
+static mut G_LIST: usize = 0
+static mut G_STAND: usize = 0
+static mut G_EMPTY: usize = 0
+static mut G_SRCH_ROW: usize = 0
+static mut G_BTNS: usize = 0
+static mut G_SEARCH: usize = 0
+static mut G_TYPE_B: usize = 0
+static mut G_DEL_B: usize = 0
+static mut G_MORE_B: usize = 0
+static mut G_ED_BOX: usize = 0
+static mut G_ED_HEAD: usize = 0
+static mut G_ED_TYPE_B: usize = 0
+static mut G_ED_TAG: usize = 0
+static mut G_ED_TEXT: usize = 0
+static mut G_ED_NOTE: usize = 0
+
+static mut G_REC: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // records: id \x01 type \x01 tag \x01 chars \x01 trunc \x01 text \x02
+static mut G_OFF: [usize; 202] = [0; 202] // start of record i; G_OFF[G_N] = end of the last
+static mut G_N: usize = 0
+static mut G_TOTAL: i64 = 0
+static mut G_ALL: i64 = 0
+static mut G_Q: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the query of the loaded list
+static mut G_EDIT_ID: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_CONF_ID: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // id of the row whose delete was asked once
+static mut G_TYPE: usize = 0 // filter: 0 all, 1 knowledge, 2 profile, 3 task
+static mut G_NEW_TYPE: usize = 1 // type of a new entry: 1..3
+static mut G_MODE: usize = 0 // 0 list, 1 edit, 2 new
+static mut G_VER: u64 = 1
+static mut G_SEEN: u64 = 0
+static mut G_ERR: i64 = 0
+static mut G_LOADED: bool = false
+static mut G_FLIGHT: bool = false
+static mut G_PENDING: bool = false
+static mut G_APPEND: bool = false // the request in flight asked for the next page
+static mut G_NOTE_KEY: usize = 0 // stand line text: 0 count, 1 saved, 2 deleted, 3 pick first, 4 confirm delete, 5 too long
+
+fn type_name(t: usize) -> str {
+    if t == 1 { return "knowledge" }
+    if t == 2 { return "profile" }
+    if t == 3 { return "task" }
+    return ""
+}
+
+fn type_label(name: str) -> str {
+    if name == "knowledge" { return jtexts.t("mem.t-knowledge") }
+    if name == "profile" { return jtexts.t("mem.t-profile") }
+    if name == "task" { return jtexts.t("mem.t-task") }
+    return name
+}
+
+// ---- records -------------------------------------------------------------------------------------------------------------------
+
+fn rebuild_offsets() {
+    var n: usize = 0
+    G_OFF[0] = 0
+    var i: usize = 0
+    while i < G_REC.len && n < MAX_ROWS {
+        if rt.ld8(G_REC.ptr as u64, i) == 2 as u8 {
+            n = n + 1
+            G_OFF[n] = i + 1
+        }
+        i = i + 1
+    }
+    G_N = n
+    G_REC.len = G_OFF[n] // a cut tail is dropped
+}
+
+// field f of record i: 0 id, 1 type, 2 tag, 3 chars, 4 trunc, 5 text (a view into G_REC)
+fn field_of(buf: *mut rt.Buf, st: usize, en: usize, f: usize) -> str {
+    var k: usize = 0
+    var b: usize = st
+    var i: usize = st
+    while i <= en {
+        if i == en || rt.ld8((*buf).ptr as u64, i) == 1 as u8 {
+            if k == f { return str { p: ((*buf).ptr as u64 + b as u64) as *mut u8, n: i - b } }
+            k = k + 1
+            b = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn rec_field(i: usize, f: usize) -> str {
+    if i >= G_N { return "" }
+    return field_of(&G_REC, G_OFF[i], G_OFF[i + 1] - 1, f)
+}
+
+fn buf_set(b: *mut rt.Buf, s: str) {
+    rt.buf_clear(b)
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn buf_str(b: *mut rt.Buf) -> str {
+    return str { p: (*b).ptr as *mut u8, n: (*b).len }
+}
+
+// ---- the list ------------------------------------------------------------------------------------------------------------------
+
+// a row: "[tag] start of the text" on one line (line breaks become spaces, cut at a character boundary)
+fn rows(ud: u64, i: usize, out: *mut vlist.VRow) {
+    if i >= G_N { return }
+    let tag: str = rec_field(i, 2)
+    if tag.n > 0 {
+        jlist.put(out, "[")
+        jlist.put(out, tag)
+        jlist.put(out, "] ")
+    }
+    let tx: str = rec_field(i, 5)
+    var n: usize = tx.n
+    if n > PREVIEW {
+        n = PREVIEW
+        while n > 0 && (rt.ld8(tx.p as u64, n) & 192 as u8) == 128 as u8 { n = n - 1 } // do not cut inside a UTF-8 character
+    }
+    var k: usize = (*out).n
+    var j: usize = 0
+    while j < n && k < vlist.VROW_TEXT {
+        var ch: u8 = rt.ld8(tx.p as u64, j)
+        if ch == 10 as u8 || ch == 13 as u8 { ch = 32 as u8 }
+        (*out).text[k] = ch
+        k = k + 1
+        j = j + 1
+    }
+    (*out).n = k
+    vlist.vrow_detail(out, type_label(rec_field(i, 1)))
+}
+
+fn selected(a: *mut app.App) -> usize {
+    let s: usize = app.vlist_selected(a, G_LIST)
+    if s == app.NONE || s >= G_N { return app.NONE }
+    return s
+}
+
+fn set_stand_key(k: usize) {
+    G_NOTE_KEY = k
+    G_VER = G_VER + 1
+}
+
+// ask the server: reset = from the first row (new search / filter / reload), else the next page
+fn load(reset: bool) {
+    if G_FLIGHT {
+        G_PENDING = true
+        return
+    }
+    var off: usize = G_N
+    if reset { off = 0 }
+    if off >= MAX_ROWS { return }
+    G_APPEND = !reset
+    if jarvisapi.ja_memory_list(jshell.api(), buf_str(&G_Q), type_name(G_TYPE), off, PAGE) {
+        G_FLIGHT = true
+    } else {
+        G_ERR = 599
+        G_VER = G_VER + 1
+    }
+}
+
+fn start_query(a: *mut app.App) {
+    buf_set(&G_Q, __str_copy(app.text(a, G_SEARCH)))
+    G_PENDING = false
+    load(true)
+}
+
+fn on_search(a: *mut app.App) { start_query(a) }
+fn on_reload(a: *mut app.App) { start_query(a) }
+fn on_more(a: *mut app.App) { load(false) }
+
+fn type_btn_text() -> str {
+    if G_TYPE == 0 { return jtexts.t1("mem.type", "name", jtexts.t("mem.t-all")) }
+    return jtexts.t1("mem.type", "name", type_label(type_name(G_TYPE)))
+}
+
+fn on_type(a: *mut app.App) {
+    G_TYPE = (G_TYPE + 1) % 4
+    app.set_text(a, G_TYPE_B, type_btn_text())
+    start_query(a)
+}
+
+// ---- delete (asks twice) -------------------------------------------------------------------------------------------------------
+
+fn reset_confirm(a: *mut app.App) {
+    if G_CONF_ID.len > 0 {
+        rt.buf_clear(&G_CONF_ID)
+        app.set_text(a, G_DEL_B, jtexts.t("mem.delete"))
+    }
+}
+
+fn on_delete(a: *mut app.App) {
+    let s: usize = selected(a)
+    if s == app.NONE {
+        set_stand_key(3)
+        return
+    }
+    let id: str = rec_field(s, 0)
+    if G_CONF_ID.len == id.n && id.n > 0 && rt.mem_eq(G_CONF_ID.ptr as u64, id.p as u64, id.n) {
+        let ok: bool = jarvisapi.ja_memory_op(jshell.api(), "delete", __str_copy(id), "", "", "")
+        reset_confirm(a)
+        if !ok { set_stand_key(6) }
+        return
+    }
+    buf_set(&G_CONF_ID, id)
+    app.set_text(a, G_DEL_B, jtexts.t("mem.delete-sure"))
+    set_stand_key(4)
+}
+
+// ---- editor --------------------------------------------------------------------------------------------------------------------
+
+fn show_editor(a: *mut app.App, on: bool) {
+    jshell.set_shown(a, G_ED_BOX, on, 0)
+    jshell.set_shown(a, G_SRCH_ROW, !on, 0)
+    jshell.set_shown(a, G_BTNS, !on, 0)
+    jshell.set_shown(a, G_MORE_B, !on && (G_N as i64) < G_TOTAL && G_N < MAX_ROWS, 0)
+    if on {
+        jshell.set_shown_list(a, G_LIST, false)
+        jshell.set_shown(a, G_EMPTY, false, 0)
+    } else {
+        G_SEEN = 0 // the list part is shown again by the next refresh
+        G_VER = G_VER + 1
+    }
+}
+
+fn ed_type_text() -> str {
+    return jtexts.t1("mem.type", "name", type_label(type_name(G_NEW_TYPE)))
+}
+
+fn ed_note(a: *mut app.App, s: str) {
+    app.set_text(a, G_ED_NOTE, s)
+    jshell.set_shown(a, G_ED_NOTE, s.n > 0, 0)
+}
+
+// open the editor: mode 2 = new entry (empty), mode 1 = the entry whose full text is in (tag, text)
+fn open_editor(a: *mut app.App, mode: usize, ty: str, tag: str, text: str) {
+    G_MODE = mode
+    if mode == 2 {
+        app.set_text(a, G_ED_HEAD, jtexts.t("mem.new"))
+    } else {
+        app.set_text(a, G_ED_HEAD, jtexts.t1("mem.edit", "name", type_label(ty)))
+    }
+    jshell.set_shown(a, G_ED_TYPE_B, mode == 2, 0)
+    app.set_text(a, G_ED_TYPE_B, ed_type_text())
+    jshell.set_shown(a, G_ED_TAG, !(ty == "profile") && !(mode == 2 && G_NEW_TYPE == 2), 0)
+    app.set_text(a, G_ED_TAG, tag)
+    app.set_text(a, G_ED_TEXT, text)
+    ed_note(a, "")
+    show_editor(a, true)
+    app.set_focus(a, G_ED_TEXT)
+}
+
+fn on_new(a: *mut app.App) {
+    reset_confirm(a)
+    buf_set(&G_EDIT_ID, "")
+    open_editor(a, 2, type_name(G_NEW_TYPE), "", "")
+}
+
+fn on_ed_type(a: *mut app.App) {
+    G_NEW_TYPE = G_NEW_TYPE % 3 + 1
+    app.set_text(a, G_ED_TYPE_B, ed_type_text())
+    jshell.set_shown(a, G_ED_TAG, G_NEW_TYPE != 2, 0)
+}
+
+fn on_edit(a: *mut app.App) {
+    let s: usize = selected(a)
+    if s == app.NONE {
+        set_stand_key(3)
+        return
+    }
+    reset_confirm(a)
+    // the list rows hold only the start of a text: fetch the full entry first
+    let ok: bool = jarvisapi.ja_memory_item(jshell.api(), __str_copy(rec_field(s, 0)))
+    if !ok { set_stand_key(6) }
+}
+
+fn on_cancel(a: *mut app.App) {
+    G_MODE = 0
+    show_editor(a, false)
+}
+
+fn on_save(a: *mut app.App) {
+    let text: str = __str_copy(app.text(a, G_ED_TEXT))
+    if text.n == 0 {
+        ed_note(a, jtexts.t("mem.empty-text"))
+        return
+    }
+    let tag: str = __str_copy(app.text(a, G_ED_TAG))
+    var ok: bool = false
+    if G_MODE == 2 {
+        ok = jarvisapi.ja_memory_op(jshell.api(), "add", "", type_name(G_NEW_TYPE), tag, text)
+    } else {
+        ok = jarvisapi.ja_memory_op(jshell.api(), "edit", __str_copy(buf_str(&G_EDIT_ID)), "", tag, text)
+    }
+    if ok { ed_note(a, jtexts.t("pw.busy")) } else { ed_note(a, jtexts.t("pw.offline")) }
+}
+
+// ---- answers -------------------------------------------------------------------------------------------------------------------
+
+fn words_for(status: i64) -> str {
+    if status == 404 { return jtexts.t("mem.unavail") }
+    if status == 0 { return jtexts.t("pw.offline") }
+    return jtexts.t1("mem.failed", "code", jshell.dec(status))
+}
+
+// true = ours
+fn memory_api(x: *mut jarvisapi.Api, kind: u32, status: i64) -> bool {
+    let a: *mut app.App = jshell.app_ui()
+    if kind == jarvisapi.AK_MEM_LIST {
+        G_FLIGHT = false
+        if status == 200 {
+            var b: rt.Buf = rt.buf_new()
+            var total: i64 = 0
+            var all: i64 = 0
+            if jarvisapi.parse_memory(kind, jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &b, &total, &all) {
+                if !G_APPEND { rt.buf_clear(&G_REC) }
+                rt.buf_push_bytes(&G_REC, b.ptr as u64, b.len)
+                rebuild_offsets()
+                G_TOTAL = total
+                G_ALL = all
+                G_ERR = 0
+                G_LOADED = true
+            } else {
+                G_ERR = 502
+            }
+            rt.buf_free(&b)
+        } else {
+            G_ERR = status
+            if status == 404 { G_LOADED = true }
+        }
+        G_NOTE_KEY = 0
+        G_VER = G_VER + 1
+        if G_PENDING {
+            G_PENDING = false
+            load(true)
+        }
+        return true
+    }
+    if kind == jarvisapi.AK_MEM_ONE {
+        if status == 200 {
+            var b: rt.Buf = rt.buf_new()
+            var total: i64 = 0
+            var all: i64 = 0
+            if jarvisapi.parse_memory(kind, jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &b, &total, &all) {
+                let id: str = field_of(&b, 0, b.len - 1, 0)
+                let ty: str = field_of(&b, 0, b.len - 1, 1)
+                let tag: str = field_of(&b, 0, b.len - 1, 2)
+                let tr: str = field_of(&b, 0, b.len - 1, 4)
+                let tx: str = field_of(&b, 0, b.len - 1, 5)
+                if tr == "1" {
+                    set_stand_key(5)
+                } else {
+                    buf_set(&G_EDIT_ID, id)
+                    open_editor(a, 1, ty, tag, tx)
+                }
+            } else {
+                set_stand_key(6)
+            }
+            rt.buf_free(&b)
+        } else {
+            G_ERR = status
+            G_NOTE_KEY = 6
+            G_VER = G_VER + 1
+        }
+        return true
+    }
+    if kind == jarvisapi.AK_MEM_OP {
+        let act: str = jarvisapi.ja_key(x)
+        if status == 200 {
+            if G_MODE != 0 {
+                G_MODE = 0
+                show_editor(a, false)
+            }
+            if act == "delete" { set_stand_key(2) } else { set_stand_key(1) }
+            G_PENDING = false
+            load(true)
+        } else {
+            var msg: str = words_for(status)
+            if status == 400 {
+                let em: str = jarvisapi.parse_text_field(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), "error")
+                if em.n > 0 { msg = em }
+            }
+            if status == 404 && !(act == "add") { msg = jtexts.t("mem.gone") }
+            if G_MODE != 0 { ed_note(a, msg) } else {
+                G_ERR = status
+                set_stand_key(6)
+            }
+        }
+        return true
+    }
+    return false
+}
+
+// ---- page ----------------------------------------------------------------------------------------------------------------------
+
+fn screen_memory_build(a: *mut app.App) {
+    let ttl: usize = app.label(a, jtexts.t("mem.title"), 0)
+    jtheme.style_node(a, ttl, jtheme.K_TITLE)
+    applay.align_start(a, ttl)
+    G_STAND = app.label(a, jtexts.t("ls.loading"), 11)
+    applay.align_start(a, G_STAND)
+    jtheme.style_node(a, G_STAND, jtheme.K_DIM)
+    G_SRCH_ROW = applay.hline(a)
+    G_SEARCH = app.entry(a, jtexts.tp("mem.search"))
+    applay.field_fill(a, G_SEARCH)
+    jtheme.style_node(a, app.button(a, jtexts.t("mem.find"), on_search), jtheme.K_CHIP)
+    app.end(a)
+    G_BTNS = applay.hrow(a)
+    G_TYPE_B = app.button(a, type_btn_text(), on_type)
+    jtheme.style_node(a, G_TYPE_B, jtheme.K_CHIP)
+    jtheme.style_node(a, app.button(a, jtexts.t("mem.add"), on_new), jtheme.K_CHIP)
+    jtheme.style_node(a, app.button(a, jtexts.t("mem.change"), on_edit), jtheme.K_CHIP)
+    G_DEL_B = app.button(a, jtexts.t("mem.delete"), on_delete)
+    jtheme.style_node(a, G_DEL_B, jtheme.K_CHIP)
+    app.end(a)
+    G_EMPTY = app.label(a, jtexts.t("mem.empty"), 0)
+    applay.align_start(a, G_EMPTY)
+    jtheme.style_node(a, G_EMPTY, jtheme.K_EMPTY)
+    jshell.set_shown(a, G_EMPTY, false, 0)
+    G_LIST = app.vlist_new(a, "Memory", 340, 120, 0, rows, 0)
+    app.vlist_set_bar_pt(a, G_LIST, 0) // no scrollbar strip (web mobile has none): equal page edges
+    jtheme.style_node(a, G_LIST, jtheme.K_CARD)
+    applay.stretch(a, G_LIST)
+    app.vlist_set_row_pt(a, G_LIST, jlist.ROW_PT)
+    jlist.fit(a, G_LIST, 0, 1, 8)
+    jlist.flex_list(a, G_LIST, 60)
+    jlist.pull_add(G_LIST, on_reload)
+    jlist.pull_install(a)
+    G_MORE_B = app.button(a, jtexts.t("mem.more"), on_more)
+    jtheme.style_node(a, G_MORE_B, jtheme.K_CHIP)
+    applay.align_start(a, G_MORE_B)
+    jshell.set_shown(a, G_MORE_B, false, 0)
+    // the editor (instead of the list while it is open)
+    G_ED_BOX = jsetui.card(a, "")
+    G_ED_HEAD = app.label(a, jtexts.t("mem.new"), 0)
+    jtheme.style_node(a, G_ED_HEAD, jtheme.K_TITLE)
+    applay.align_start(a, G_ED_HEAD)
+    G_ED_TYPE_B = app.button(a, ed_type_text(), on_ed_type)
+    jtheme.style_node(a, G_ED_TYPE_B, jtheme.K_CHIP)
+    applay.align_start(a, G_ED_TYPE_B)
+    G_ED_TAG = jsetui.input(a, jtexts.tp("mem.tag"))
+    G_ED_TEXT = app.textarea(a, jtexts.tp("mem.text"), 8)
+    applay.stretch(a, G_ED_TEXT)
+    G_ED_NOTE = app.label(a, "", 0)
+    jtheme.style_node(a, G_ED_NOTE, jsetui.K_SET_ERR)
+    applay.align_start(a, G_ED_NOTE)
+    jshell.set_shown(a, G_ED_NOTE, false, 0)
+    applay.hrow(a)
+    jtheme.style_node(a, app.button(a, jtexts.t("pw.save"), on_save), jtheme.K_CHIP)
+    jtheme.style_node(a, app.button(a, jtexts.t("pw.cancel"), on_cancel), jtheme.K_CHIP)
+    app.end(a)
+    app.end(a)
+    jshell.set_shown(a, G_ED_BOX, false, 0)
+}
+
+fn stand_text() -> str {
+    if G_ERR == 404 { return jtexts.t("mem.unavail") }
+    if G_NOTE_KEY == 1 { return jtexts.t("mem.saved") }
+    if G_NOTE_KEY == 2 { return jtexts.t("mem.deleted") }
+    if G_NOTE_KEY == 3 { return jtexts.t("mem.pick") }
+    if G_NOTE_KEY == 4 { return jtexts.t("mem.confirm") }
+    if G_NOTE_KEY == 5 { return jtexts.t("mem.toolong") }
+    if G_NOTE_KEY == 6 { return jtexts.t1("mem.failed", "code", jshell.dec(G_ERR)) }
+    if G_ERR != 0 { return jtexts.t1("mem.failed", "code", jshell.dec(G_ERR)) }
+    if !G_LOADED { return jtexts.t("ls.loading") }
+    return jtexts.t1("mem.count", "value", jshell.dec(G_N as i64) + " / " + jshell.dec(G_TOTAL) + " (" + jshell.dec(G_ALL) + ")")
+}
+
+fn screen_memory_refresh(a: *mut app.App) {
+    if !G_LOADED && !G_FLIGHT && G_ERR == 0 { start_query(a) }
+    // another row picked: the "really delete?" question belongs to the old one
+    let sel: usize = selected(a)
+    if G_CONF_ID.len > 0 {
+        var keep: bool = false
+        if sel != app.NONE {
+            let id: str = rec_field(sel, 0)
+            keep = G_CONF_ID.len == id.n && rt.mem_eq(G_CONF_ID.ptr as u64, id.p as u64, id.n)
+        }
+        if !keep {
+            reset_confirm(a)
+            if G_NOTE_KEY == 4 { G_NOTE_KEY = 0 }
+            G_VER = G_VER + 1
+        }
+    }
+    if G_VER != G_SEEN && G_MODE == 0 {
+        G_SEEN = G_VER
+        app.vlist_set_count(a, G_LIST, G_N)
+        app.vlist_changed(a, G_LIST)
+        let any: bool = G_N > 0
+        jshell.set_shown_list(a, G_LIST, any)
+        jshell.set_shown(a, G_EMPTY, !any && G_LOADED && G_ERR == 0, 0)
+        jlist.fit(a, G_LIST, G_N, 1, 8)
+        jshell.set_shown(a, G_MORE_B, (G_N as i64) < G_TOTAL && G_N < MAX_ROWS, 0)
+        app.set_text(a, G_STAND, stand_text())
+    }
+}
+
+// sign-out: forget the entries (the next account sees its own)
+fn memory_reset() {
+    rt.buf_clear(&G_REC)
+    rt.buf_clear(&G_Q)
+    rt.buf_clear(&G_CONF_ID)
+    rt.buf_clear(&G_EDIT_ID)
+    G_N = 0
+    G_TOTAL = 0
+    G_ALL = 0
+    G_TYPE = 0
+    G_MODE = 0
+    G_ERR = 0
+    G_LOADED = false
+    G_FLIGHT = false
+    G_PENDING = false
+    G_NOTE_KEY = 0
+    G_SEEN = 0
+    G_VER = G_VER + 1
+}
