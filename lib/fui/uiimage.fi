@@ -304,6 +304,54 @@ fn image_draw(z: *mut painter.Painter, im: *mut Image, x: f64, y: f64,
     image_draw_rect(z, im, dx, dy, dw, dh, tint)
 }
 
+// A name for the pixels of `im`: address, size and 16 sampled pixels (a freed picture whose address is reused by another one of the
+// same size gets another name)
+fn kept_key(im: *mut Image) -> u64 {
+    var k: u64 = (*im).px *% (1099511628211 as u64)
+    k = (k ^ (((*im).w as u64) * (65536 as u64) + ((*im).h as u64))) *% (1099511628211 as u64)
+    var i: usize = 0
+    while i < 16 {
+        let x: usize = ((*im).w * (2 * i + 1)) / 32
+        let y: usize = ((*im).h * ((i * 7) % 16 + 1)) / 17
+        k = (k ^ (image_pixel_at(im, x, y) as u64)) *% (1099511628211 as u64)
+        i = i + 1
+    }
+    if k == 0 as u64 { k = 1 as u64 }
+    return k
+}
+
+// The kept-texture path of image_draw_rect. false = not handled (draw per pixel).
+fn draw_kept(g: *mut gpu.Gpu, im: *mut Image, dx: f64, dy: f64, dw: f64, dh: f64) -> bool {
+    let iw: i32 = (*im).w as i32
+    let ih: i32 = (*im).h as i32
+    if iw <= 0 || ih <= 0 || iw > 8192 || ih > 8192 { return false }
+    let key: u64 = kept_key(im)
+    if gpu.gpu_photo_kept(g, key, iw, ih) {
+        gpu.gpu_draw_photo(g, key, (*im).px, (*im).stride, iw, ih, dx, dy, dx + dw, dy + dh, 0.0, 0.0, iw as f64, ih as f64, 255 as u32)
+        return true
+    }
+    // first time: the texture wants premultiplied RGBA; an opaque picture is that already (the bytes are R, G, B, A)
+    var opaque: bool = true
+    var y: usize = 0
+    while y < (*im).h && opaque {
+        var x: usize = 0
+        while x < (*im).w {
+            if b8((*im).px, y * (*im).stride + x * 4 + 3) != 255 as u8 {
+                opaque = false
+                break
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if opaque {
+        gpu.gpu_draw_photo(g, key, (*im).px, (*im).stride, iw, ih, dx, dy, dx + dw, dy + dh, 0.0, 0.0, iw as f64, ih as f64, 255 as u32)
+        return true
+    }
+    // a picture with transparency needs premultiplying (a copy, the heap): not in this kernel-clean file -> per pixel
+    return false
+}
+
 // Draw into EXACTLY this rectangle, no fitting. The one that does the
 // work.
 fn image_draw_rect(z: *mut painter.Painter, im: *mut Image, dx: f64,
@@ -323,6 +371,14 @@ fn image_draw_rect(z: *mut painter.Painter, im: *mut Image, dx: f64,
     var y1: i64 = ffloor_i(fmin(dy + dh, ch) + 0.999999)
     if x1 <= x0 || y1 <= y0 {
         return
+    }
+    // ON THE GPU, opaque or not, no tint, no mask: the picture stays in a GPU texture (keyed by its pixels) and one bilinear
+    // quad draws it. The loop below walks every destination pixel (and reads the band back): ~85 ms a frame for a 1100x730 photo
+    if tint == 0 as u32 && !canvas.canvas_clip_masked(cv) {
+        let gp: *mut gpu.Gpu = gpu.gpu_of(cv)
+        if gp as u64 != 0 && draw_kept(gp, im, dx, dy, dw, dh) {
+            return
+        }
     }
     // ON THE GPU (lib/fui/gpu.fi): the band is read back, the picture is
     // drawn into it in memory by the loop below, and the band goes back
