@@ -61,6 +61,11 @@ if os.environ.get("FAKE_TOOLS") == "1":  # c1 history with tool steps (ok, faile
     CONV["s2"] = CONV["c1"]
 
 
+if os.environ.get("FAKE_CHATJSON"):  # a real server answer ({"conversation": {"messages": [...]}}): the history of c1/s1/s2 (real tool steps, thinking, cut inputs)
+    with open(os.environ["FAKE_CHATJSON"]) as _f:
+        _real = json.load(_f)["conversation"]["messages"]
+    CONV["c1"] = CONV["s1"] = CONV["s2"] = _real
+
 # ------------------------------------------------------------------ realistic data (shapes of the real server)
 REAL = os.environ.get("FAKE_REALISTIC", "1") != "0"
 NCHATS = int(os.environ.get("FAKE_NCHATS", "150"))

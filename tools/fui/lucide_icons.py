@@ -166,8 +166,17 @@ def to_d(tag, a):
     raise SystemExit("lucide_icons: element <%s> is not handled" % tag)
 
 
+# NOT Lucide: icons copied from the JARVIS web app so the Android app matches it (appended LAST: the ids of the others stay).
+EXTRA = {
+    "wrench": [["path", {"d": "M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2-2 2.6-2.6z"}]],
+    "lightbulb": [["path", {"d": "M11 3a5 5 0 0 0-5 5c0 1.6.8 2.6 1.5 3.4.5.6 1 1.1 1 2.1v.5h5v-.5c0-1 .5-1.5 1-2.1C16.2 10.6 17 9.6 17 8a5 5 0 0 0-5-5z"}],
+                  ["path", {"d": "M10 20h4M11 22h2"}]],
+}
+
+
 def main():
     nodes = json.load(open(sys.argv[1], encoding="utf-8"))
+    nodes.update(EXTRA)
     out = []
     w = out.append
     w("// SPDX-License-Identifier: ISC")
@@ -189,7 +198,7 @@ def main():
     w("// per icon: all its elements, turned into path commands.")
     w("")
     names = []
-    for n in WANTED:
+    for n in WANTED + list(EXTRA):
         if n not in nodes:
             raise SystemExit("lucide_icons: no icon '%s' in %s" % (n, sys.argv[1]))
         names.append(n)
