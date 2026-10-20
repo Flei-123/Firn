@@ -668,6 +668,8 @@ build app
 "$W/app"
 build wrapgrow
 "$W/wrapgrow"
+build wrapdens
+"$W/wrapdens"
 build ttschunk
 "$W/ttschunk"
 
