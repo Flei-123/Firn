@@ -141,7 +141,7 @@ def sidebar_chats():
 
 ADMIN_LIMITS = {"maxSubworkers": 5, "heavySlots": 8, "autoLoop": True}
 # user settings (A50): GET/POST /api/settings (switches + persona)
-SETTINGS = {"personality": "jarvis", "personas": [{"id": "p_demo", "name": "Bro", "base": "jarvis"}], "autoConfirm": True, "deepMode": True, "expMode": False, "learnMode": False, "planMode": False}
+SETTINGS = {"personality": "jarvis", "personas": [{"id": "p_demo", "name": "Bro", "base": "jarvis"}], "ttsRate": 1.05, "ttsVoice": "", "ttsSpeaker": "", "autoConfirm": True, "deepMode": True, "expMode": False, "learnMode": False, "planMode": False}
 # folders (A48): FAKE_FOLDERS=1 starts with two folders and puts s1/s3/s5 in them; POST /api/m/folders/(add|rename|remove), /api/m/chats/move
 FOLDERS = [{"id": "f_work", "name": "Work", "order": 0}, {"id": "f_priv", "name": "Privat", "order": 1}] if os.environ.get("FAKE_FOLDERS") == "1" else []
 CHAT_FOLDER = {"s1": "f_work", "s3": "f_work", "s5": "f_priv"} if os.environ.get("FAKE_FOLDERS") == "1" else {}
@@ -402,7 +402,7 @@ def rest(method, rawpath, hdr, body):
     path = u.path
     q = parse_qs(u.query)
     if not (path in ("/api/me", "/api/projects", "/api/command-center", "/api/conversations", "/api/tasks",
-                     "/api/remote/devices", "/api/settings", "/api/push-token", "/api/stt", "/api/m/upload", "/api/account/password")
+                     "/api/remote/devices", "/api/settings", "/api/voices", "/api/push-token", "/api/stt", "/api/m/upload", "/api/account/password")
             or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
             or path.startswith("/vendor/fonts/") or path.startswith("/img/") or path.startswith("/dl/")):
         return None
@@ -597,6 +597,8 @@ def rest(method, rawpath, hdr, body):
         if str(b.get("old", "")) != PW["cur"]: return out(403, {"error": "Aktuelles Passwort stimmt nicht."})
         PW["cur"] = str(b.get("password"))
         return out(200, {"ok": True} if os.environ.get("FAKE_PW_NOTOKEN") else {"ok": True, "token": TOKEN})
+    if path == "/api/voices":  # a65: the Piper voice list of the web settings
+        return out(200, {"voices": [{"id": "de_thorsten", "label": "Thorsten", "gender": "m", "default": True}, {"id": "de_kerstin", "label": "Kerstin", "gender": "w"}]})
     if path == "/api/settings":
         if method in ("POST", "PATCH"):
             try:
@@ -760,6 +762,14 @@ async def handler(ws):
                 cid = "fake%d" % seq
                 CONV[cid] = []
                 await send(ws, {"type": "conversation", "id": cid, "title": "t"})
+            if m.get("editEnd"):  # a65: edit / repeat from a message: cut the n-th user message from the END and all after it (server lib/conversations.js cutAtUserFromEnd)
+                cnt = 0
+                for k in range(len(CONV[cid]) - 1, -1, -1):
+                    if CONV[cid][k]["role"] == "user":
+                        cnt += 1
+                        if cnt == int(m["editEnd"]):
+                            del CONV[cid][k:]
+                            break
             CONV[cid].append({"role": "user", "text": text})
             await send(ws, {"type": "user", "cid": cid, "text": text})  # echo of my own message
             if text == "drop":
