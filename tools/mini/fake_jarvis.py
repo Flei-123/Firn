@@ -324,6 +324,7 @@ TASKS = [{"id": "t1", "text": "buy milk", "due": "2026-10-18T09:00", "category":
 FILES = {}     # disk name -> bytes
 EVENTS = []    # push events (poll feed)
 EVSEQ = int(os.environ.get("FAKE_EVENT_BASE", "1000"))
+TTSN = {"n": 0}
 tseq = 1
 
 def pstats(p):
@@ -402,7 +403,7 @@ def rest(method, rawpath, hdr, body):
     path = u.path
     q = parse_qs(u.query)
     if not (path in ("/api/me", "/api/projects", "/api/command-center", "/api/conversations", "/api/tasks",
-                     "/api/remote/devices", "/api/settings", "/api/voices", "/api/push-token", "/api/stt", "/api/m/upload", "/api/account/password")
+                     "/api/remote/devices", "/api/settings", "/api/voices", "/tts", "/api/push-token", "/api/stt", "/api/m/upload", "/api/account/password")
             or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
             or path.startswith("/vendor/fonts/") or path.startswith("/img/") or path.startswith("/dl/")):
         return None
@@ -597,6 +598,22 @@ def rest(method, rawpath, hdr, body):
         if str(b.get("old", "")) != PW["cur"]: return out(403, {"error": "Aktuelles Passwort stimmt nicht."})
         PW["cur"] = str(b.get("password"))
         return out(200, {"ok": True} if os.environ.get("FAKE_PW_NOTOKEN") else {"ok": True, "token": TOKEN})
+    if path == "/tts":  # a66: the Piper proxy of the real server: a WAV (22.05 kHz mono 16 bit); a sine tone whose length follows the text and the speed
+        # FAKE_TTS=off -> 503 (tts offline), FAKE_TTS=empty -> 204, FAKE_TTS=fail2 -> the SECOND request fails (503); the request (text, speed, voice) is in the log
+        import math, struct
+        text = q.get("text", [""])[0]
+        speed = float(q.get("speed", ["1"])[0] or 1)
+        TTSN["n"] += 1
+        LOG.write(json.dumps({"type": "tts", "n": TTSN["n"], "text": text, "speed": speed, "voice": q.get("voice", [""])[0], "speaker": q.get("speaker", [""])[0]}) + "\n")
+        mode = os.environ.get("FAKE_TTS", "")
+        if mode == "off" or (mode == "fail2" and TTSN["n"] == 2): return (503, b"tts offline", "text/plain")
+        if mode == "empty" or not text.strip(): return (204, b"", "text/plain")
+        rate = 22050
+        secs = min(3.0, max(0.3, len(text) * float(os.environ.get("FAKE_TTS_SEC_PER_CHAR", "0.04")) / max(0.5, speed)))
+        n = int(rate * secs)
+        pcm = b"".join(struct.pack("<h", int(6000 * math.sin(2 * math.pi * 440 * i / rate))) for i in range(n))
+        hdr = b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) + b"data" + struct.pack("<I", len(pcm))
+        return (200, hdr + pcm, "audio/wav")
     if path == "/api/voices":  # a65: the Piper voice list of the web settings
         return out(200, {"voices": [{"id": "de_thorsten", "label": "Thorsten", "gender": "m", "default": True}, {"id": "de_kerstin", "label": "Kerstin", "gender": "w"}]})
     if path == "/api/settings":

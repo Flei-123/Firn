@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/plat/android/pcmplay.fi -- PLAYS A 16 BIT PCM WAV through AAudio (the output counterpart of speech.fi).
+//
+//     import plat.android.pcmplay
+//
+//   let e: i32 = pcmplay.pcmplay_start(wav, n)     // PP_OK, or PP_ARGS / PP_FORMAT / PP_OPEN / PP_START
+//   ... every frame (<= 100 ms), on the program's thread:
+//   let s: i32 = pcmplay.pcmplay_poll()            // PP_PLAYING -> PP_DONE (or PP_FAILED); never blocks
+//   pcmplay.pcmplay_stop()                         // cut the sound, close the stream
+//
+// `wav` = a RIFF/WAVE file in memory (mono or stereo, 16 bit PCM, any rate: Piper sends 22.05 kHz mono). The samples are NOT copied:
+// the memory at `wav` must stay valid until pcmplay_poll says PP_DONE / PP_FAILED or pcmplay_stop was called. A running playback is
+// replaced by the next pcmplay_start. AAudio resamples to the device rate itself (API 28+); on API 26/27 a stream that opens with a
+// different rate than asked is refused (PP_FORMAT) instead of playing at the wrong speed.
+// Build: tools/android/build.sh ... --speech   (links libaaudio, same as the microphone)
+import plat.android.pcmwav
+
+export {
+    PP_OK, PP_ARGS, PP_FORMAT, PP_OPEN, PP_START,
+    PP_IDLE, PP_PLAYING, PP_DONE, PP_FAILED,
+    pcmplay_start, pcmplay_poll, pcmplay_stop, pcmplay_state, pcmplay_ms, pcmplay_last_aaudio,
+}
+
+const PP_OK: i32 = 0
+const PP_ARGS: i32 = 1
+const PP_FORMAT: i32 = 2
+const PP_OPEN: i32 = 3
+const PP_START: i32 = 4
+
+const PP_IDLE: i32 = 0
+const PP_PLAYING: i32 = 1
+const PP_DONE: i32 = 2
+const PP_FAILED: i32 = 3
+
+// aaudio.h values
+const AAUDIO_DIRECTION_OUTPUT: i32 = 0
+const AAUDIO_FORMAT_PCM_I16: i32 = 1
+const AAUDIO_SHARING_SHARED: i32 = 1
+const AAUDIO_PERFORMANCE_MODE_POWER_SAVING: i32 = 11
+
+const WRITE_ROUNDS: i32 = 16
+const DRAIN_SLACK_MS: i64 = 2500 // after the last frame went in: the device may take this long longer than the audio before we give up
+
+#[no_gc]
+extern fn AAudio_createStreamBuilder(out: u64) -> i32;
+#[no_gc]
+extern fn AAudioStreamBuilder_setDirection(b: u64, d: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_setSampleRate(b: u64, r: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_setChannelCount(b: u64, c: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_setFormat(b: u64, f: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_setSharingMode(b: u64, m: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_setBufferCapacityInFrames(b: u64, n: i32);
+#[no_gc]
+extern fn AAudioStreamBuilder_setPerformanceMode(b: u64, m: i32);
+#[no_gc]
+extern fn AAudioStream_getBufferCapacityInFrames(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_setBufferSizeInFrames(s: u64, n: i32) -> i32;
+#[no_gc]
+extern fn AAudioStreamBuilder_openStream(b: u64, out: u64) -> i32;
+#[no_gc]
+extern fn AAudioStreamBuilder_delete(b: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_requestStart(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_requestStop(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_close(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_write(s: u64, buf: u64, frames: i32, timeout_ns: i64) -> i32;
+#[no_gc]
+extern fn AAudioStream_getSampleRate(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_getChannelCount(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_getFormat(s: u64) -> i32;
+#[no_gc]
+extern fn AAudioStream_getFramesRead(s: u64) -> i64;
+
+static mut G_STREAM: u64 = 0
+static mut G_STATE: i32 = 0
+static mut G_PCM: u64 = 0 // first sample
+static mut G_FRAMES: i64 = 0 // frames in the WAV
+static mut G_SENT: i64 = 0 // frames handed to AAudio
+static mut G_FSIZE: usize = 2 // octets per frame
+static mut G_RATE: i32 = 0
+static mut G_T_END: i64 = 0 // when the last frame went in (ms)
+static mut G_AA: i32 = 0 // last AAudio result code that was not OK
+static mut G_MS: i32 = 0 // length of the audio in ms
+
+#[no_gc]
+fn now_ms() -> i64 {
+    var ts: [i64; 2] = [0; 2]
+    let r: i64 = syscall(228, 1, (&ts[0]) as i64, 0, 0, 0, 0)
+    return ts[0] * 1000 + ts[1] / 1000000
+}
+
+#[no_gc]
+fn stream_close() {
+    if G_STREAM != 0 {
+        let a: i32 = AAudioStream_requestStop(G_STREAM)
+        let b: i32 = AAudioStream_close(G_STREAM)
+        G_STREAM = 0
+    }
+}
+
+// Stops what plays and opens a stream for the WAV at p[0, n). Returns PP_OK (state PP_PLAYING) or the reason.
+#[no_gc]
+fn pcmplay_start(p: u64, n: usize) -> i32 {
+    pcmplay_stop()
+    if p == 0 || n < pcmwav.WAV_HEADER_SIZE { return PP_ARGS }
+    var info: pcmwav.WavInfo = pcmwav.WavInfo { rate: 0 as u32, channels: 0 as u32, bits: 0 as u32, data_at: 0, data_len: 0 }
+    if !pcmwav.wav_parse(p, n, &info) { return PP_ARGS }
+    if info.bits != 16 as u32 || info.channels < 1 as u32 || info.channels > 2 as u32 { return PP_FORMAT }
+    if info.rate < 8000 as u32 || info.rate > 192000 as u32 { return PP_FORMAT }
+    G_FSIZE = (info.channels as usize) * 2
+    let frames: i64 = (info.data_len / G_FSIZE) as i64
+    if frames <= 0 { return PP_ARGS }
+    G_AA = 0
+    var bp: [u64; 1] = [0]
+    let r0: i32 = AAudio_createStreamBuilder((&bp[0]) as u64)
+    if r0 != 0 || bp[0] == 0 {
+        G_AA = r0
+        return PP_OPEN
+    }
+    let b: u64 = bp[0]
+    AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT)
+    AAudioStreamBuilder_setSampleRate(b, info.rate as i32)
+    AAudioStreamBuilder_setChannelCount(b, info.channels as i32)
+    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16)
+    AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_SHARED)
+    // the program feeds the device from a 100 ms timer, not from a data callback: ask for a buffer of about one second of audio
+    // (power saving mode = big buffers, latency does not matter for speech) so that the device never runs dry between two polls
+    AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_POWER_SAVING)
+    AAudioStreamBuilder_setBufferCapacityInFrames(b, info.rate as i32)
+    var sp: [u64; 1] = [0]
+    let r1: i32 = AAudioStreamBuilder_openStream(b, (&sp[0]) as u64)
+    let rd: i32 = AAudioStreamBuilder_delete(b)
+    if r1 != 0 || sp[0] == 0 {
+        G_AA = r1
+        return PP_OPEN
+    }
+    let s: u64 = sp[0]
+    if AAudioStream_getFormat(s) != AAUDIO_FORMAT_PCM_I16 || AAudioStream_getChannelCount(s) != (info.channels as i32)
+        || AAudioStream_getSampleRate(s) != (info.rate as i32) {
+        let rc: i32 = AAudioStream_close(s)
+        return PP_FORMAT
+    }
+    let cap: i32 = AAudioStream_getBufferCapacityInFrames(s)
+    if cap > 0 {
+        let sz: i32 = AAudioStream_setBufferSizeInFrames(s, cap)
+    }
+    G_STREAM = s
+    G_PCM = p + info.data_at as u64
+    G_FRAMES = frames
+    G_SENT = 0
+    G_RATE = info.rate as i32
+    G_MS = ((frames * 1000) / (info.rate as i64)) as i32
+    G_T_END = 0
+    G_STATE = PP_PLAYING
+    // the first buffer goes in BEFORE the start: the sound begins without a gap
+    let first: i32 = write_some()
+    let r2: i32 = AAudioStream_requestStart(s)
+    if r2 != 0 {
+        G_AA = r2
+        stream_close()
+        G_STATE = PP_IDLE
+        return PP_START
+    }
+    return PP_OK
+}
+
+// hands as much as AAudio takes right now to the device (timeout 0: never blocks). Returns frames written, -1 on error.
+#[no_gc]
+fn write_some() -> i32 {
+    var total: i32 = 0
+    var rounds: i32 = 0
+    while rounds < WRITE_ROUNDS && G_SENT < G_FRAMES {
+        rounds = rounds + 1
+        var want: i64 = G_FRAMES - G_SENT
+        if want > 4096 { want = 4096 }
+        let at: u64 = G_PCM + (G_SENT as u64) * (G_FSIZE as u64)
+        let w: i32 = AAudioStream_write(G_STREAM, at, want as i32, 0)
+        if w < 0 {
+            G_AA = w
+            return 0 - 1
+        }
+        if w == 0 { break }
+        G_SENT = G_SENT + w as i64
+        total = total + w
+    }
+    return total
+}
+
+// Feeds the device and watches the end. Returns the state: PP_PLAYING until the last frame was PLAYED (frames read by the device),
+// then PP_DONE (the stream is closed); PP_FAILED when AAudio reports an error or the device stalls.
+#[no_gc]
+fn pcmplay_poll() -> i32 {
+    if G_STATE != PP_PLAYING || G_STREAM == 0 { return G_STATE }
+    if G_SENT < G_FRAMES {
+        let w: i32 = write_some()
+        if w < 0 {
+            stream_close()
+            G_STATE = PP_FAILED
+            return G_STATE
+        }
+        if G_SENT >= G_FRAMES { G_T_END = now_ms() }
+        return G_STATE
+    }
+    if G_T_END == 0 { G_T_END = now_ms() }
+    let played: i64 = AAudioStream_getFramesRead(G_STREAM)
+    if played >= G_FRAMES {
+        stream_close()
+        G_STATE = PP_DONE
+        return G_STATE
+    }
+    // safety net: the device never reports the end (a stalled stream) -> give up after the audio length plus a slack
+    if now_ms() - G_T_END > (G_MS as i64) + DRAIN_SLACK_MS {
+        stream_close()
+        G_STATE = PP_FAILED
+    }
+    return G_STATE
+}
+
+#[no_gc]
+fn pcmplay_stop() {
+    stream_close()
+    G_STATE = PP_IDLE
+    G_PCM = 0
+    G_FRAMES = 0
+    G_SENT = 0
+}
+
+#[no_gc]
+fn pcmplay_state() -> i32 { return G_STATE }
+
+// length of the audio being played in ms (0 when nothing plays)
+#[no_gc]
+fn pcmplay_ms() -> i32 { return G_MS }
+
+#[no_gc]
+fn pcmplay_last_aaudio() -> i32 { return G_AA }

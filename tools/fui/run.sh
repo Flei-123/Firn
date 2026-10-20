@@ -664,6 +664,8 @@ build app
 "$W/app"
 build wrapgrow
 "$W/wrapgrow"
+build ttschunk
+"$W/ttschunk"
 
 echo
 echo "== 18p3. ZEILEN MIT SYMBOLEN (lib/fui/listrow.fi, r129) =="
