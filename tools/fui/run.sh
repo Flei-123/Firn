@@ -672,6 +672,8 @@ build wrapdens
 "$W/wrapdens"
 build ttschunk
 "$W/ttschunk"
+build ttssent
+"$W/ttssent"
 
 echo
 echo "== 18p3. ZEILEN MIT SYMBOLEN (lib/fui/listrow.fi, r129) =="
