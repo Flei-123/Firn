@@ -102,7 +102,7 @@ bar_check() { # name tab-number ; waits for a geom line of that tab that is newe
     local i n0 L; n0=$(app_log | grep -c "geom.*tab=$2 ")
     for i in $(seq 8); do [ "$(app_log | grep -c "geom.*tab=$2 ")" -gt "$n0" ] && break; sleep 1.5; done
     L=$(app_log | grep "geom.*tab=$2 " | tail -1)
-    check "tab bar visible on $1" "$(echo "$L" | grep -c 'bar_visible=1')" 1
+    check "page inside the window on $1 (tab bar hidden by design, a64)" "$(echo "$L" | grep -c 'bar_visible=1\|bar_hidden=1')" 1
 }
 kbd() { $ADB shell dumpsys input_method | grep -c 'mInputShown=true'; }
 # BACK only while the keyboard is up: without it BACK leaves the app (a slow host shows the keyboard seconds late)
@@ -111,12 +111,19 @@ hide_kbd() { if [ "$(kbd)" = 1 ]; then $ADB shell input keyevent KEYCODE_BACK; f
 # the composer buttons are vector icons without text (Plus, Mic, Send): touch them by place, as pixels of the 1080x2340 layout
 # (the field "Message" grey hint is lost by OCR as well). Row y 2028 (a42: composer sits directly above the tab bar; a40 and older 1911), centres: plus 103, field 305, mic 790, send 960
 # the composer row sits higher with the 3-button navigation bar (settings navigation_mode 0) than with gestures (2)
-if [ "$($ADB shell settings get secure navigation_mode 2>/dev/null | tr -d '\r')" = 2 ]; then COMP_Y=1944; TAB_Y=2207; else COMP_Y=1878; TAB_Y=2141; fi
+if [ "$($ADB shell settings get secure navigation_mode 2>/dev/null | tr -d '\r')" = 2 ]; then COMP_Y=2098; else COMP_Y=2032; fi # a64: no bottom tab bar any more (the composer moved down by its height, ~154 px); comp_y_update reads the real place from the app log
 tap_px() { $ADB shell input tap $(($1 * SW / 1080)) $(($2 * SH / 2340)); sleep "${3:-1.5}"; }
 # a44 layout: the composer is a card (text area on top, below it the paperclip left and the round send button right); the microphone sits in the header
 # frame coords of the 1080x2340 layout: paperclip x 108, send x 972 (row COMP_Y), text area y COMP_Y-160, hamburger x 74, speaker x 783, sidebar plus x 998 (all at the header height: tap_hdr)
-tap_plus() { tap_px 108 $COMP_Y 2; }
-tap_send() { tap_px 972 $COMP_Y 1; }
+# a64: the row of the paperclip / send button from the app's geom line (in_y + in_h = bottom of the text area, + ~22 dp to the row centre)
+comp_y_update() { local L iy ih; L=$(app_log | grep 'geom.*tab=0 .*in_y=' | tail -1)
+    iy=$(echo "$L" | sed -n 's/.* in_y=\([0-9]*\).*/\1/p'); ih=$(echo "$L" | sed -n 's/.* in_h=\([0-9]*\).*/\1/p')
+    [ -n "$iy" ] && [ -n "$ih" ] && COMP_Y=$(( (iy + ih + 22 * SW / 393) * 2340 / SH )); return 0; }
+# a64: the pages Board / Tasks / Devices / More are reached from the sidebar (4 chips above the user row); BACK on a page returns to the chat
+goto_tab() { open_sidebar; tap_word "$1" 1 "${2:-3}"; }
+goto_chat() { $ADB shell input keyevent KEYCODE_BACK; sleep "${1:-2}"; }
+tap_plus() { comp_y_update; tap_px 108 $COMP_Y 2; }
+tap_send() { comp_y_update; tap_px 972 $COMP_Y 1; }
 # the header row sits at a different height with a different status bar: find the top of the header (first row below the black status bar, column 8) and tap its centre
 hdr_y() { shot _h; python3 -I -c "import sys
 from PIL import Image
@@ -128,7 +135,7 @@ tap_hdr() { $ADB shell input tap $(($1 * SW / 1080)) "$(hdr_y)"; sleep "${2:-2}"
 open_sidebar() { tap_hdr 74 2; }
 sidebar_new() { tap_hdr 907 2; } # the plus sits at the right edge of the drawer panel (84 % wide); x 998 would hit the dim strip and close it
 # type into the composer field (place), or into the field whose hint is $1 (OCR) for other screens, then leave the keyboard
-type_into() { if [ "$1" = Message ]; then tap_px 240 $((COMP_Y - 160)) 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep "${TYPE_SETTLE:-4}"; hide_kbd; } # slow host: the last typed character is lost if BACK follows too soon
+type_into() { if [ "$1" = Message ]; then comp_y_update; tap_px 240 $((COMP_Y - 110)) 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep "${TYPE_SETTLE:-4}"; hide_kbd; } # slow host: the last typed character is lost if BACK follows too soon
 send_text() { type_into "Message" "$1" && tap_send; }
 notes() { $ADB shell dumpsys notification --noredact; }
 # title / text lines of the notifications of the app (not the service one)
@@ -195,7 +202,7 @@ fi
 
 # ---- 2. Board: projects, a need answered; Tasks: add ---------------------------------------------------------------------
 echo "== 2. Board and Tasks"
-tap_word "Board" 1 4
+goto_tab "Board" 4
 bar_check Board 1
 check "the mobile routes were asked for (ping)" "$(wait_log '"path": "/api/m/ping"' 15 | awk '{print ($1>0)?"yes":"no"}')" yes
 check "Board lists the project" "$(OCR_TRIES=15 wait_ocr 04_board 'Jarvis')" 1
@@ -206,15 +213,15 @@ check "Needs list shows the question" "$(OCR_TRIES=10 wait_ocr 05_needs 'Merge')
 tap_word 'Merge\?' 1 2; shot 05b_need_answers
 tap_word "Yes" 1 3
 check "need answered over /api/m/needs/answer" "$(wait_log '"path": "/api/m/needs/answer".*"answer": "Yes"' 10)" 1
-tap_word "Aufgaben" 1 4
+goto_tab "Aufgaben" 4
 bar_check Tasks 2
 check "Tasks list shows the task" "$(OCR_TRIES=15 wait_ocr 06_tasks 'milk')" 1
 type_into "Neue|Aufgabe|Text" "callmum" && tap_word "Hinzuf.{1,2}gen" 1 3
 check "task added over /api/m/tasks" "$(wait_log '"path": "/api/m/tasks".*callmum' 10 | awk '{print ($1>0)?"yes":"no"}')" yes
 # the two remaining tab pages, only photographed (design review)
-tap_word "Ger.te" 1 3; shot 06b_devices
+goto_tab "Ger.te" 3; shot 06b_devices
 bar_check Devices 3
-tap_px 965 $TAB_Y 3; shot 06c_more # More tab by place: OCR does not find the small word
+goto_tab "Mehr|More" 3; shot 06c_more
 bar_check More 4
 # swipe on More (touch pan): with many projects / a small window the page must scroll; the app logs "pan" lines
 SW_X=$((SW / 2)); SW_Y1=$((SH * 70 / 100)); SW_Y2=$((SH * 30 / 100))
@@ -223,8 +230,8 @@ check "More receives the touch pan (app log 'pan: more end')" "$(app_log | grep 
 cmp -s "$OUT/06c_more.png" "$OUT/06d_more_scrolled.png" && note "More did not move after the swipe (content may fit the window)" || echo "  (More content moved after the swipe)"
 bar_check "More after swipe" 4
 [ "${E2E_STOP:-}" = tabs ] && { echo "stopped after the tab pages (E2E_STOP=tabs): $PASS ok, $FAIL failed"; exit 0; }
-# the Chat tab by place (the word is too small for OCR on the More page, and a miss would leave the next taps on that page: Logout!)
-tap_px 106 $TAB_Y 2
+# back to the chat: Android BACK on a page (a64: there is no Chat tab button any more)
+goto_chat 2
 
 # ---- 3. sidebar (the conversation list: hamburger in the chat header) -----------------------------------------------------
 echo "== 3. sidebar"
@@ -281,7 +288,7 @@ echo "== 4. photo upload"
 open_sidebar; sidebar_new; shot 07h_new
 check "the sidebar plus opens a new chat (chat screen, sidebar closed)" "$(OCR_TRIES=10 wait_ocr 07h_new 'Standard\|Nachricht')" 1
 tap_plus
-tap_word "Foto|Photo" 1 4 # "+" shows the two choices (Photo / File)
+tap_word "Foto|Photo" 1 4 # a64: the paperclip opens a menu card above the composer (rows Photo / File)
 U=$(ui)
 check "the system's picker opens" "$(echo "$U" | grep -cE '(text|content-desc)="(Media picker|Photos|Files|Gallery|Camera|Recent|Photo taken)' | awk '{print ($1>0)?"yes":"no"}')" yes
 P0=$($ADB shell pidof $PKG)
@@ -448,7 +455,7 @@ check "no cid tap: no crash so far" "$($ADB logcat -d | grep -cE 'FATAL|SIGSEGV|
 echo "== 7. frame time"
 # scroll the chat and open tabs so that frames are painted, then read the app's own frame lines
 for _ in 1 2 3; do $ADB shell input swipe 540 900 540 1500 150; $ADB shell input swipe 540 1500 540 900 150; done
-tap_word "Board" 1 3; tap_px 106 $TAB_Y 3 # the Chat tab by place (the word "Chat" also sits in the header pill)
+goto_tab "Board" 3; goto_chat 3
 sleep 7
 FL=$(app_log | grep ' frames: ' | tail -20)
 check "frame lines in the app log" "$(echo "$FL" | grep -c 'n=' | awk '{print ($1>0)?"yes":"no"}')" yes
