@@ -1,0 +1,515 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/ttssent.fi -- read aloud SENTENCE by SENTENCE (a67): cleans a markdown answer for the voice and cuts it into speech blocks.
+//
+//   ttssent.clean(p, n, out)                    markdown -> plain speech text: code blocks gone, `code` / **bold** unwrapped, [text](url) -> text,
+//                                               bare URLs -> "Link", list / heading / quote marks gone, emojis + symbols gone. Every line ends
+//                                               with a stop (a line without one gets a "."), so list items and headings get a pause.
+//   ttssent.sent_end(p, n, start)               end (exclusive, incl. the blanks behind it) of the sentence that starts at `start`
+//   ttssent.block_end(p, n, start, first)       end of the next block to send to /tts: ONE sentence (tiny ones are joined with the next so the
+//                                               requests stay worth it); `first`: the block that must start the voice fast (short, may end at a comma)
+//
+// A "." is NOT a sentence end: inside a number (3.14), after an abbreviation (z.B. Dr. ca. usw. is handled: see NOBREAK), after one letter
+// (J. Smith), after a day number before a month or a lower case word (am 3. Mai), before a lower case letter. ! ? ... end a sentence when a
+// blank / line break / the end follows. A line break always ends a sentence. Only ASCII octets decide, so UTF-8 is never cut.
+// A sentence longer than LONG_SENT is cut at a comma (or at a blank), never above HARD_MAX (the server cuts a request at 1000 characters).
+import std.rt
+
+export { clean, sent_end, block_end, is_space, FIRST_MAX, FIRST_MIN, MERGE_MIN, MERGE_MAX, LONG_SENT, HARD_MAX }
+
+const FIRST_MAX: usize = 90 // the first block stays short: the voice starts fast
+const FIRST_MIN: usize = 25 // a first sentence shorter than this is joined with the next one
+const MERGE_MIN: usize = 40 // a later sentence shorter than this is joined with the next one
+const MERGE_MAX: usize = 240 // ... as long as the joined block stays within this
+const LONG_SENT: usize = 300 // a sentence longer than this is cut at a comma
+const HARD_MAX: usize = 700 // never send more than this per block (/tts cuts at 1000 characters after its own cleaning)
+
+// abbreviations after which a "." is no sentence end (lower case, without the final dot; "z.b" = z.B.)
+const NOBREAK: str = "z.b|d.h|u.a|u.ä|o.ä|i.d.r|s.o|s.u|u.u|z.t|v.a|m.e|bzw|ca|evtl|ggf|inkl|exkl|vgl|zzgl|dr|prof|hr|fr|nr|st|str|tel|abb|kap|mio|mrd|tsd|sog|vs|dipl|ing|bsp|bspw|ggü|e.g|i.e|approx|mr|mrs|ms|jr|sr|geb|hrsg|usf|bes|zus|ggfs|ev"
+const MONTHS: str = "januar|jänner|februar|märz|april|mai|juni|juli|august|september|oktober|november|dezember|jan|feb|mär|apr|jun|jul|aug|sep|sept|okt|nov|dez"
+
+fn is_space(c: u8) -> bool { return c == 32 as u8 || c == 10 as u8 || c == 13 as u8 || c == 9 as u8 }
+
+fn at(p: u64, i: usize) -> i32 { return rt.ld8(p, i) as i32 }
+
+fn low(c: i32) -> i32 {
+    if c >= 65 && c <= 90 { return c + 32 }
+    return c
+}
+
+// lower case letter at p[i]: a-z, ß, and the Latin-1 letters ä ö ü é ... (UTF-8 C3 9F, C3 A0..BF except the division sign)
+fn is_lower_at(p: u64, n: usize, i: usize) -> bool {
+    if i >= n { return false }
+    let c: i32 = at(p, i)
+    if c >= 97 && c <= 122 { return true }
+    if c == 195 && i + 1 < n {
+        let d: i32 = at(p, i + 1)
+        if d == 159 { return true }
+        if d >= 160 && d <= 191 && d != 183 { return true }
+    }
+    return false
+}
+
+fn is_digit_c(c: i32) -> bool { return c >= 48 && c <= 57 }
+
+fn is_letter_c(c: i32) -> bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c >= 128 }
+
+// does p[s, e) (compared in lower case) equal one entry of the '|' separated `list`?
+fn in_list(p: u64, s: usize, e: usize, list: str) -> bool {
+    let len: usize = e - s
+    if len == 0 { return false }
+    var k: usize = 0
+    while k <= list.n {
+        // the entry runs from k to the next '|' or the end
+        var q: usize = k
+        while q < list.n && rt.ld8(list.p as u64, q) != 124 as u8 { q = q + 1 }
+        if q - k == len {
+            var same: bool = true
+            var j: usize = 0
+            while j < len {
+                if low(at(p, s + j)) != at(list.p as u64, k + j) { same = false }
+                j = j + 1
+            }
+            if same { return true }
+        }
+        k = q + 1
+    }
+    return false
+}
+
+// closing marks that belong to the sentence before them:  ) ] " ' and the UTF-8 » “ ” ’  -- returns the number of octets (0 = none)
+fn closer_len(p: u64, n: usize, i: usize) -> usize {
+    if i >= n { return 0 }
+    let c: i32 = at(p, i)
+    if c == 41 || c == 93 || c == 34 || c == 39 { return 1 }
+    if c == 194 && i + 1 < n && at(p, i + 1) == 187 { return 2 }
+    if c == 226 && i + 2 < n && at(p, i + 1) == 128 {
+        let d: i32 = at(p, i + 2)
+        if d == 156 || d == 157 || d == 153 || d == 185 { return 3 }
+    }
+    return 0
+}
+
+// first octet of the next word after position j: skips blanks and opening marks ( [ " ' « „ “ ‘ -- (n when none)
+fn next_word(p: u64, n: usize, j: usize) -> usize {
+    var q: usize = j
+    while q < n {
+        let c: i32 = at(p, q)
+        if is_space(c as u8) || c == 40 || c == 91 || c == 34 || c == 39 || c == 45 { q = q + 1 }
+        else if c == 194 && q + 1 < n && at(p, q + 1) == 171 { q = q + 2 }
+        else if c == 226 && q + 2 < n && at(p, q + 1) == 128 && (at(p, q + 2) == 158 || at(p, q + 2) == 156 || at(p, q + 2) == 152) { q = q + 3 }
+        else { return q }
+    }
+    return n
+}
+
+// the end (exclusive) of the word that starts at `s`
+fn word_end(p: u64, n: usize, s: usize) -> usize {
+    var q: usize = s
+    while q < n && is_letter_c(at(p, q)) { q = q + 1 }
+    return q
+}
+
+// Is the "." at p[t] (a candidate stop, followed by a blank / the end at `j`) a real sentence end?
+fn dot_ends(p: u64, n: usize, t: usize, j: usize) -> bool {
+    // the token before the dot: back to a blank or an opening mark
+    var ts: usize = t
+    while ts > 0 {
+        let c: i32 = at(p, ts - 1)
+        if is_space(c as u8) || c == 40 || c == 91 || c == 34 || c == 39 || c == 44 || c == 59 || c == 58 || c == 47 { break }
+        ts = ts - 1
+    }
+    let w: usize = next_word(p, n, j)
+    if w >= n { return true } // the end of the text
+    let tl: usize = t - ts
+    if tl == 0 { return true }
+    // a line break behind the dot always ends the sentence
+    var k: usize = j
+    while k < w { if at(p, k) == 10 { return true }  k = k + 1 }
+    if is_lower_at(p, n, w) { return false } // "ggf. weiter", "e. V."
+    if in_list(p, ts, t, NOBREAK) { return false }
+    // one letter ("J. Smith") or letter.letter.letter ("U.S.A. Army", "z.B"): a chain of one-letter segments
+    var chain: bool = true
+    var seg: usize = 0
+    var q: usize = ts
+    var dots: usize = 0
+    while q < t {
+        let c: i32 = at(p, q)
+        if c == 46 {
+            if seg != 1 { chain = false }
+            seg = 0
+            dots = dots + 1
+        } else {
+            seg = seg + 1
+        }
+        q = q + 1
+    }
+    if seg != 1 { chain = false }
+    if chain && is_letter_c(at(p, ts)) { return false }
+    // a short number ("am 3. Mai", "Punkt 2. Dann"): no stop before a month, a digit or lower case; a long number (a year) ends the sentence
+    var alldig: bool = true
+    q = ts
+    while q < t {
+        if !is_digit_c(at(p, q)) { alldig = false }
+        q = q + 1
+    }
+    if alldig && tl <= 2 {
+        if is_digit_c(at(p, w)) { return false }
+        let we: usize = word_end(p, n, w)
+        if in_list(p, w, we, MONTHS) { return false }
+    }
+    return true
+}
+
+// End (exclusive) of the sentence that starts at `start`, including the blanks / line breaks behind its stop. Scans at most HARD_MAX + 64
+// octets (a longer stretch without a stop is cut by block_end).
+fn sent_end(p: u64, n: usize, start: usize) -> usize {
+    var scan_end: usize = n
+    if start + HARD_MAX + 64 < n { scan_end = start + HARD_MAX + 64 }
+    var i: usize = start
+    while i < scan_end {
+        let c: i32 = at(p, i)
+        if c == 10 {
+            var e: usize = i + 1
+            while e < n && is_space(rt.ld8(p, e)) { e = e + 1 }
+            return e
+        }
+        var stop: bool = false
+        var dot: bool = false
+        var after: usize = i + 1
+        if c == 46 { dot = true; stop = true }
+        else if c == 33 || c == 63 { stop = true }
+        else if c == 226 && i + 2 < n && at(p, i + 1) == 128 && at(p, i + 2) == 166 { // the ellipsis character
+            dot = true
+            stop = true
+            after = i + 3
+        }
+        if !stop {
+            i = i + 1
+            continue
+        }
+        // more stop characters (?!, ..., ?!) and closing marks belong to this stop
+        var j: usize = after
+        var more: bool = true
+        while more && j < n {
+            let d: i32 = at(p, j)
+            if d == 46 || d == 33 || d == 63 {
+                if d != 46 { dot = false }
+                j = j + 1
+            } else {
+                let cl: usize = closer_len(p, n, j)
+                if cl > 0 { j = j + cl } else { more = false }
+            }
+        }
+        let end_ok: bool = j >= n || is_space(rt.ld8(p, j))
+        if !end_ok {
+            i = j // "3.14", "file.txt", "wow!!x": no stop here
+            continue
+        }
+        var ends: bool = true
+        if dot { ends = dot_ends(p, n, i, j) }
+        else if j < n {
+            // "! " / "? " before a lower case word still ends ("Wow! cool") except a lone "?" inside a quote -- keep it simple: it ends
+            ends = true
+        }
+        if ends {
+            var e: usize = j
+            while e < n && is_space(rt.ld8(p, e)) { e = e + 1 }
+            return e
+        }
+        i = j
+    }
+    return scan_end
+}
+
+// position after the first , ; : (followed by a blank) at or after `from`, searched up to `upto`; 0 when none. Blanks behind it belong to it.
+fn comma_after(p: u64, n: usize, from: usize, upto: usize) -> usize {
+    var i: usize = from
+    var lim: usize = upto
+    if lim > n { lim = n }
+    while i + 1 < lim {
+        let c: i32 = at(p, i)
+        if (c == 44 || c == 59 || c == 58) && is_space(rt.ld8(p, i + 1)) {
+            var e: usize = i + 1
+            while e < n && is_space(rt.ld8(p, e)) { e = e + 1 }
+            return e
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// the cut of a too long sentence [start, e): at the last comma in [start+60, start+LONG_SENT], else (when above HARD_MAX) at the last blank
+// before HARD_MAX, else a hard cut that never splits a UTF-8 character
+fn long_cut(p: u64, n: usize, start: usize, e: usize) -> usize {
+    var k: usize = start + LONG_SENT
+    if k > e { k = e }
+    while k > start + 60 {
+        let c: i32 = at(p, k - 1)
+        if (c == 44 || c == 59 || c == 58) && k < n && is_space(rt.ld8(p, k)) {
+            var r: usize = k
+            while r < n && is_space(rt.ld8(p, r)) { r = r + 1 }
+            return r
+        }
+        k = k - 1
+    }
+    if e - start <= HARD_MAX { return e }
+    var b: usize = start + HARD_MAX
+    while b > start + 1 && !is_space(rt.ld8(p, b)) { b = b - 1 }
+    if b > start + 1 {
+        var r2: usize = b
+        while r2 < n && is_space(rt.ld8(p, r2)) { r2 = r2 + 1 }
+        return r2
+    }
+    b = start + HARD_MAX
+    while b > start + 1 && (at(p, b) & 192) == 128 { b = b - 1 } // not inside a UTF-8 character
+    return b
+}
+
+// one unit: a sentence, with the cut of a too long one applied
+fn unit_end(p: u64, n: usize, start: usize) -> usize {
+    let e: usize = sent_end(p, n, start)
+    if e - start > LONG_SENT { return long_cut(p, n, start, e) }
+    return e
+}
+
+fn trimmed_len(p: u64, start: usize, e: usize) -> usize {
+    var te: usize = e
+    while te > start && is_space(rt.ld8(p, te - 1)) { te = te - 1 }
+    return te - start
+}
+
+// The block that starts at `start` (a non blank octet): one sentence. first = the block that must start the voice quickly.
+fn block_end(p: u64, n: usize, start: usize, first: bool) -> usize {
+    var e: usize = unit_end(p, n, start)
+    if first && trimmed_len(p, start, e) > FIRST_MAX {
+        // a long first sentence: the voice starts at its first pause (comma after 25 octets), not after the whole sentence
+        let c: usize = comma_after(p, n, start + FIRST_MIN, start + 160)
+        if c > 0 && c < e { return c }
+        return e
+    }
+    var min_len: usize = MERGE_MIN
+    var cap: usize = MERGE_MAX
+    if first {
+        min_len = FIRST_MIN
+        cap = FIRST_MAX
+    }
+    while e < n && trimmed_len(p, start, e) < min_len {
+        let e2: usize = unit_end(p, n, e)
+        if trimmed_len(p, start, e2) > cap { break }
+        e = e2
+    }
+    return e
+}
+
+// ---------------------------------------------------------------------------------------------------------------- markdown -> speech
+
+fn out_last(out: *mut rt.Buf) -> i32 {
+    if (*out).len == 0 { return 0 - 1 }
+    return rt.ld8((*out).ptr as u64, (*out).len - 1) as i32
+}
+
+// a line break (once; never at the start)
+fn emit_break(out: *mut rt.Buf) {
+    while (*out).len > 0 && out_last(out) == 32 { (*out).len = (*out).len - 1 }
+    if (*out).len == 0 { return }
+    let l: i32 = out_last(out)
+    if l == 10 { return }
+    // a line without a stop gets one: the voice makes a pause (list items, headings)
+    if !(l == 46 || l == 33 || l == 63 || l == 58 || l == 59 || l == 44) { rt.buf_push(out, 46 as u8) }
+    rt.buf_push(out, 10 as u8)
+}
+
+fn emit_byte(out: *mut rt.Buf, c: u8) {
+    let ci: i32 = c as i32
+    if ci == 32 || ci == 9 {
+        let l: i32 = out_last(out)
+        if l == 32 || l == 10 || l < 0 { return } // no double blank, none at the line start
+        rt.buf_push(out, 32 as u8)
+        return
+    }
+    if (ci == 44 || ci == 46 || ci == 59 || ci == 58 || ci == 33 || ci == 63) && out_last(out) == 32 { (*out).len = (*out).len - 1 } // "a ," -> "a,"
+    rt.buf_push(out, c)
+}
+
+// number of octets of an emoji / pictogram / arrow / variation selector at p[k] (0 = none)
+fn symbol_len(p: u64, k: usize, b: usize) -> usize {
+    let c: i32 = at(p, k)
+    if c == 240 && k + 3 < b { return 4 }
+    if c == 226 && k + 2 < b {
+        let d: i32 = at(p, k + 1)
+        if d == 134 || d == 135 || d == 152 || d == 153 || d == 154 || d == 155 || d == 156 || d == 157 || d == 158 || d == 172 || d == 173 || d == 174 || d == 175 { return 3 }
+        if d == 128 && at(p, k + 2) == 141 { return 3 } // zero width joiner
+    }
+    if c == 239 && k + 2 < b && at(p, k + 1) == 184 && at(p, k + 2) >= 128 && at(p, k + 2) <= 143 { return 3 } // variation selector
+    return 0
+}
+
+fn starts_with_ci(p: u64, k: usize, b: usize, lit: str) -> bool {
+    if k + lit.n > b { return false }
+    var j: usize = 0
+    while j < lit.n {
+        if low(at(p, k + j)) != at(lit.p as u64, j) { return false }
+        j = j + 1
+    }
+    return true
+}
+
+// inline markdown of p[a, b) -> out
+fn inline_md(p: u64, a: usize, b: usize, out: *mut rt.Buf) {
+    var k: usize = a
+    while k < b {
+        let c: i32 = at(p, k)
+        // [text](url) and ![alt](url) -> text
+        var lb: usize = k
+        var is_link: bool = false
+        if c == 91 { is_link = true }
+        else if c == 33 && k + 1 < b && at(p, k + 1) == 91 {
+            is_link = true
+            lb = k + 1
+        }
+        if is_link {
+            var j: usize = lb + 1
+            while j < b && at(p, j) != 93 { j = j + 1 }
+            if j + 1 < b && at(p, j + 1) == 40 {
+                var m: usize = j + 2
+                while m < b && at(p, m) != 41 { m = m + 1 }
+                if m < b {
+                    inline_md(p, lb + 1, j, out)
+                    k = m + 1
+                    continue
+                }
+            }
+        }
+        // a bare URL -> "Link" (a closing punctuation mark behind it stays)
+        if (c == 104 || c == 72) && (starts_with_ci(p, k, b, "http://") || starts_with_ci(p, k, b, "https://")) {
+            var u: usize = k
+            while u < b && !is_space(rt.ld8(p, u)) { u = u + 1 }
+            var ue: usize = u
+            while ue > k && (at(p, ue - 1) == 46 || at(p, ue - 1) == 44 || at(p, ue - 1) == 59 || at(p, ue - 1) == 58 || at(p, ue - 1) == 33 || at(p, ue - 1) == 63 || at(p, ue - 1) == 41) { ue = ue - 1 }
+            emit_byte(out, 32 as u8)
+            var li: usize = 0
+            while li < 4 {
+                emit_byte(out, rt.ld8("Link".p as u64, li))
+                li = li + 1
+            }
+            emit_byte(out, 32 as u8)
+            k = ue
+            continue
+        }
+        let sl: usize = symbol_len(p, k, b)
+        if sl > 0 {
+            emit_byte(out, 32 as u8)
+            k = k + sl
+            continue
+        }
+        if c == 96 || c == 42 { // ` and *
+            k = k + 1
+            continue
+        }
+        if c == 95 { // _ -> blank (snake_case, _italic_)
+            emit_byte(out, 32 as u8)
+            k = k + 1
+            continue
+        }
+        if c == 126 && k + 1 < b && at(p, k + 1) == 126 { // ~~strike~~
+            k = k + 2
+            continue
+        }
+        if c == 124 { // table cell
+            emit_byte(out, 44 as u8)
+            k = k + 1
+            continue
+        }
+        emit_byte(out, c as u8)
+        k = k + 1
+    }
+}
+
+fn starts3(p: u64, a: usize, b: usize, ch: i32) -> bool {
+    return a + 3 <= b && at(p, a) == ch && at(p, a + 1) == ch && at(p, a + 2) == ch
+}
+
+// a horizontal rule / table separator row: only - * _ = | : and blanks, at least 3 of - * _ =
+fn is_rule(p: u64, a: usize, b: usize) -> bool {
+    var cnt: usize = 0
+    var k: usize = a
+    while k < b {
+        let c: i32 = at(p, k)
+        if c == 45 || c == 42 || c == 95 || c == 61 { cnt = cnt + 1 }
+        else if !(c == 124 || c == 58 || c == 32 || c == 9) { return false }
+        k = k + 1
+    }
+    return cnt >= 3
+}
+
+// Markdown text p[0, n) -> out: the plain text the voice should say (see the header). `out` is appended to.
+fn clean(p: u64, n: usize, out: *mut rt.Buf) {
+    var i: usize = 0
+    var in_fence: bool = false
+    while i < n {
+        var le: usize = i
+        while le < n && at(p, le) != 10 { le = le + 1 }
+        var a: usize = i
+        var b: usize = le
+        i = le + 1
+        while a < b && (at(p, a) == 32 || at(p, a) == 9) { a = a + 1 }
+        while b > a && is_space(rt.ld8(p, b - 1)) { b = b - 1 }
+        if starts3(p, a, b, 96) || starts3(p, a, b, 126) {
+            in_fence = !in_fence
+            emit_break(out)
+            continue
+        }
+        if in_fence { continue }
+        if a >= b {
+            emit_break(out)
+            continue
+        }
+        if is_rule(p, a, b) {
+            emit_break(out)
+            continue
+        }
+        // block marks: quote ">", heading "#", list "- * + •" / "1." / "1)", task box "[ ]" "[x]"
+        var again: bool = true
+        while again && a < b {
+            again = false
+            let c: i32 = at(p, a)
+            if c == 62 { // >
+                a = a + 1
+                while a < b && at(p, a) == 32 { a = a + 1 }
+                again = true
+            } else if c == 35 { // # ... #
+                var h: usize = a
+                while h < b && at(p, h) == 35 { h = h + 1 }
+                if h - a <= 6 && h < b && at(p, h) == 32 {
+                    a = h
+                    while a < b && at(p, a) == 32 { a = a + 1 }
+                    again = true
+                }
+            } else if (c == 45 || c == 42 || c == 43) && a + 1 < b && at(p, a + 1) == 32 {
+                a = a + 2
+                while a < b && at(p, a) == 32 { a = a + 1 }
+                if a + 2 < b && at(p, a) == 91 && at(p, a + 2) == 93 {
+                    a = a + 3
+                    while a < b && at(p, a) == 32 { a = a + 1 }
+                }
+                again = true
+            } else if c == 226 && a + 3 < b && at(p, a + 1) == 128 && at(p, a + 2) == 162 && at(p, a + 3) == 32 { // •
+                a = a + 4
+                again = true
+            } else if is_digit_c(c) {
+                var d: usize = a
+                while d < b && d < a + 3 && is_digit_c(at(p, d)) { d = d + 1 }
+                if d < b && (at(p, d) == 46 || at(p, d) == 41) && d + 1 < b && at(p, d + 1) == 32 {
+                    a = d + 2
+                    while a < b && at(p, a) == 32 { a = a + 1 }
+                    again = true
+                }
+            }
+        }
+        while a < b && at(p, a) == 124 { a = a + 1 } // table: leading |
+        while b > a && (at(p, b - 1) == 124 || is_space(rt.ld8(p, b - 1))) { b = b - 1 }
+        inline_md(p, a, b, out)
+        emit_break(out)
+    }
+    while (*out).len > 0 && is_space(rt.ld8((*out).ptr as u64, (*out).len - 1)) { (*out).len = (*out).len - 1 }
+}
