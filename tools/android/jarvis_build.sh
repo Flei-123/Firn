@@ -33,6 +33,7 @@ done
 FIRNC=${FIRNC:-$ROOT/compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 export FIRNC FIRNLIB=$ROOT/lib
+export SOFT_INPUT=adjustResize # composer above the keyboard (build.sh writes android:windowSoftInputMode)
 export FIRN_APP_VERSION=$VERSION FIRN_APP_CHANNEL=${CHANNEL:-test}
 IFS=. read -r MA MI PA _ <<<"${VERSION%%-*}"
 VCODE=$(( ${MA:-0} * 10000 + ${MI:-0} * 100 + ${PA:-0} ))

@@ -91,7 +91,7 @@ import highlight.highlight
 
 export {
     MdView, ImgInfo, mdv_new, mdv_free, mdv_set_markdown, mdv_set_base_size,
-    mdv_set_link_cb, mdv_set_image_cb, mdv_set_rect, mdv_set_pad,
+    mdv_set_link_cb, mdv_set_image_cb, mdv_set_image_tap_cb, mdv_set_rect, mdv_set_pad,
     mdv_set_background, mdv_set_bubble, mdv_set_bubble_end, mdv_set_meta_h6, mdv_invalidate, mdv_paint, mdv_layout,
     mdv_wheel, mdv_key, mdv_pointer_move, mdv_pointer_down, mdv_pointer_up,
     mdv_pointer_leave, mdv_link_count, mdv_link_url, mdv_hover_link,
@@ -219,6 +219,9 @@ struct MdView {
     img_ud: u64,
     img_cb: fn(u64, u64, usize, *mut ImgInfo) -> u32,
     has_img_cb: bool,
+    imgtap_ud: u64,
+    imgtap_cb: fn(u64, u64, usize, u32),
+    has_imgtap_cb: bool,
     drag_bar: bool,
     // syntax highlighting of fenced code (lib/highlight): on by default
     hl: highlight.Highlighter,
@@ -247,6 +250,9 @@ fn clip_none(p: u64, n: usize) -> bool {
     return false
 }
 
+fn cb_imgtap_none(ud: u64, p: u64, n: usize, st: u32) {
+}
+
 fn cb_img_none(ud: u64, p: u64, n: usize, info: *mut ImgInfo) -> u32 {
     return IMG_PENDING
 }
@@ -259,7 +265,8 @@ fn mdv_new() -> MdView {
         base_pt: 15, pad_pt: 12, bg_tok: NIL, lay_w: 0.0, lay_scale: 0,
         total_h: 0.0, dirty: true, hover: NIL, press: NIL,
         link_ud: 0, link_cb: cb_link_none, has_link_cb: false,
-        img_ud: 0, img_cb: cb_img_none, has_img_cb: false, drag_bar: false,
+        img_ud: 0, img_cb: cb_img_none, has_img_cb: false,
+        imgtap_ud: 0, imgtap_cb: cb_imgtap_none, has_imgtap_cb: false, drag_bar: false,
         hl: highlight.hl_new(), hl_on: true, hl_spans: vec_new[highlight.HlSpan](),
         sel_on: false, sa_item: 0, sa_off: 0, sf_item: 0, sf_off: 0, sel_drag: false, now_ms: 0,
         last_down_ms: -100000, last_x: 0.0, last_y: 0.0, clicks: 0 as u32, clip_write: clip_none, has_clip: false,
@@ -419,6 +426,14 @@ fn mdv_set_image_cb(v: *mut MdView, ud: u64, f: fn(u64, u64, usize, *mut ImgInfo
 }
 
 // Pictures arrived (or went away): lay out again, keep the scroll position.
+// A tap on a picture that is no link: f(ud, url_ptr, url_len, state) with state IMG_READY / IMG_PENDING / IMG_FAILED
+// (the url is valid during the call only). A chat app opens its full-screen viewer there.
+fn mdv_set_image_tap_cb(v: *mut MdView, ud: u64, f: fn(u64, u64, usize, u32)) {
+    (*v).imgtap_ud = ud
+    (*v).imgtap_cb = f
+    (*v).has_imgtap_cb = true
+}
+
 fn mdv_invalidate(v: *mut MdView) {
     (*v).dirty = true
 }
@@ -760,6 +775,15 @@ fn place_word(l: *mut L, pool: u32, off: u32, n: usize, flags: u32, size: f64, l
         }
         if link != NIL {
             it.tok = TOK_LINK
+            // a link whose target starts with "err:" is drawn in the error colour (the app's failed tool steps)
+            let lu: doc.Slice = mdv_link_url((*l).v, link as usize)
+            if lu.n >= 4 && rt.mem_eq(lu.p as u64, "err:".p as u64, 4) {
+                it.tok = style.TOK_ERROR
+            }
+            // the header pill of a steps group is dim like in the web app (.tool-group-head)
+            if lu.n >= 5 && rt.mem_eq(lu.p as u64, "step:".p as u64, 5) {
+                it.tok = style.TOK_TEXT_MUTED
+            }
         }
         if (*l).tok_over != NIL {
             it.tok = (*l).tok_over
@@ -908,6 +932,10 @@ fn flow_image(l: *mut L, n: u32, flags: u32, size: f64, link: u32) {
     it.off = alt_off
     it.n = alt_n as u32
     it.extra = (st as i64)
+    // the url (for mdv_set_image_tap_cb): offset in the pool in `tok`, length in `radius`
+    it.tok = rt.buf_len(&(*v).vpool) as u32
+    it.radius = u.n as f64
+    rt.buf_push_bytes(&(*v).vpool, u.p, u.n)
     if ready {
         // keep the pixel description in the view's pool: 5 words (the last: the animation)
         it.extra = 100
@@ -1100,6 +1128,34 @@ fn heading_scale(level: i64) -> f64 {
     return 0.9
 }
 
+// A "rail" block quote (the app's tool steps): its FIRST child is a thematic break ("> ***"), which is not drawn.
+// The rest is laid out dim, indented behind a thin vertical line (web: .tool-group-body, border-left 1px).
+fn quote_is_rail(d: *mut doc.Doc, n: u32) -> bool {
+    let f: u32 = doc.node_first(d, n)
+    if f == doc.NIL { return false }
+    return doc.node_kind(d, f) == doc.K_THEMATIC
+}
+
+fn lay_rail(l: *mut L, n: u32, x0: f64, w: f64, flags: u32) {
+    let d: *mut doc.Doc = &(*(*l).v).d
+    let y0: f64 = (*l).y
+    let bar: usize = add_rect(l, IT_RECT, x0 + px(l, 3), y0, px(l, 1), 0.0, style.TOK_BORDER, 0.0)
+    let ind: f64 = px(l, 14)
+    var c: u32 = doc.node_next(d, doc.node_first(d, n))
+    while c != doc.NIL {
+        lay_block(l, c, x0 + ind, w - ind, true, flags | FL_MUTED)
+        (*l).y = (*l).y + px(l, 2)
+        c = doc.node_next(d, c)
+    }
+    let it: *mut Item = item_at(l, bar)
+    var hh: f64 = (*l).y - y0 - px(l, 3)
+    if hh < 0.0 {
+        hh = (*l).y - y0
+    }
+    (*it).h = hh
+    (*l).y = (*l).y + px(l, 3)
+}
+
 fn lay_children(l: *mut L, parent: u32, x0: f64, w: f64, tight: bool, flags: u32) {
     let d: *mut doc.Doc = &(*(*l).v).d
     var c: u32 = doc.node_first(d, parent)
@@ -1149,6 +1205,8 @@ fn lay_block(l: *mut L, n: u32, x0: f64, w: f64, tight: bool, flags: u32) {
         (*l).y = (*l).y + px(l, 2) + base * 0.9
     } else if k == doc.K_CODE_BLOCK || k == doc.K_HTML_BLOCK {
         lay_code(l, n, x0, w)
+    } else if k == doc.K_QUOTE && quote_is_rail(d, n) {
+        lay_rail(l, n, x0, w, flags)
     } else if k == doc.K_QUOTE && G_BUBBLE != 4294967295 as u32 {
         lay_bubble(l, n, x0, w, tight, flags)
     } else if k == doc.K_QUOTE {
@@ -1659,6 +1717,52 @@ fn paint_code_ground(v: *mut MdView, c: *mut render.Ctx, it: *mut Item, ox: f64,
         render.len_of(c, 4), tokc(c, style.TOK_BUTTON))
 }
 
+// Links whose target starts with "chip:" / "err:" (a tool step) or "step:" (a steps header) are drawn as a pill
+// (the web app's tool chips): 1 = chip, 2 = header pill (round, with a border).
+fn chip_kind(v: *mut MdView, link: u32) -> u32 {
+    let lu: doc.Slice = mdv_link_url(v, link as usize)
+    if lu.n >= 5 && rt.mem_eq(lu.p as u64, "chip:".p as u64, 5) { return 1 as u32 }
+    if lu.n >= 4 && rt.mem_eq(lu.p as u64, "err:".p as u64, 4) { return 1 as u32 }
+    if lu.n >= 5 && rt.mem_eq(lu.p as u64, "step:".p as u64, 5) { return 2 as u32 }
+    return 0 as u32
+}
+
+// one pill behind a run of words of the same link on the same line (drawn at its first word)
+fn paint_chip_ground(v: *mut MdView, c: *mut render.Ctx, i: usize, ox: f64, oy: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+    if i > 0 {
+        let pv: *mut Item = vec_elem_ptr[Item](&(*v).items, i - 1)
+        let dy: f64 = (*pv).y - (*it).y
+        if (*pv).kind == IT_TEXT && (*pv).link == (*it).link && dy < 1.0 && dy > -1.0 { return }
+    }
+    let n: usize = vec_len[Item](&(*v).items)
+    var j: usize = i
+    while j + 1 < n {
+        let nx: *mut Item = vec_elem_ptr[Item](&(*v).items, j + 1)
+        let dy: f64 = (*nx).y - (*it).y
+        if (*nx).kind == IT_TEXT && (*nx).link == (*it).link && dy < 1.0 && dy > -1.0 {
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    let last: *mut Item = vec_elem_ptr[Item](&(*v).items, j)
+    let kind: u32 = chip_kind(v, (*it).link)
+    let pad: f64 = render.len_of(c, 6)
+    let vm: f64 = render.len_of(c, 2)
+    let x: f64 = ox + (*it).x - pad
+    let w: f64 = ((*last).x + (*last).w) - (*it).x + 2.0 * pad
+    let y: f64 = oy + (*it).y - vm
+    let h: f64 = (*it).asc + (*it).desc + 2.0 * vm
+    var rad: f64 = render.len_of(c, 8)
+    if kind == 2 as u32 { rad = h / 2.0 }
+    painter.round_rect(z, x, y, w, h, rad, tokc(c, style.TOK_BUTTON))
+    if kind == 2 as u32 {
+        painter.round_ring(z, x, y, w, h, rad, render.len_of(c, 1), tokc(c, style.TOK_BORDER))
+    }
+}
+
 fn paint_image(v: *mut MdView, c: *mut render.Ctx, it: *mut Item, x: f64, y: f64) {
     let z: *mut painter.Painter = render.ctx_painter(c)
     if (*it).extra == 100 as i64 {
@@ -1716,6 +1820,9 @@ fn mdv_paint(v: *mut MdView, c: *mut render.Ctx) {
         while i < n {
             let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
             if (*it).y + (*it).h + (*it).lh >= top && (*it).y <= bot {
+                if (*it).kind == IT_TEXT && (*it).link != NIL && chip_kind(v, (*it).link) != 0 as u32 {
+                    paint_chip_ground(v, c, i, ox, oy)
+                }
                 if (*it).kind == IT_TEXT && ((*it).flags & FL_CODE) != 0 as u32 {
                     // a code BLOCK has the rectangle of its block; inline code
                     // is told apart by the padding flags (or sits in the middle
@@ -2365,11 +2472,34 @@ fn mdv_touch_fling(v: *mut MdView, vx_per_s: f64, vy_per_s: f64, now_ms: i64) {
     viewport.viewport_fling_friction(&(*v).vp, (0.0 - vx_per_s) / 1000.0, (0.0 - vy_per_s) / 1000.0, now_ms)
 }
 
+// A picture without a link under a window point: the image-tap callback runs.
+fn image_tap(v: *mut MdView, x: f64, y: f64) -> bool {
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    if !viewport.viewport_hit(&(*v).vp, x, y, &cx, &cy) { return false }
+    let n: usize = vec_len[Item](&(*v).items)
+    var i: usize = 0
+    while i < n {
+        let it: *mut Item = vec_elem_ptr[Item](&(*v).items, i)
+        if (*it).kind == IT_IMAGE && (*it).link == NIL && (*it).radius > 0.0
+            && cx >= (*it).x && cx < (*it).x + (*it).w && cy >= (*it).y && cy < (*it).y + (*it).h {
+            var st: u32 = IMG_PENDING
+            if (*it).extra == 100 as i64 { st = IMG_READY } else if (*it).extra == 2 as i64 { st = IMG_FAILED }
+            let f: fn(u64, u64, usize, u32) = (*v).imgtap_cb
+            f((*v).imgtap_ud, rt.buf_ptr(&(*v).vpool) + ((*it).tok as u64), (*it).radius as usize, st)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
 // A tap at a window point: a link under it is followed (the link callback runs); a tap
 // elsewhere clears the selection. True when a link was followed.
 fn mdv_touch_tap(v: *mut MdView, c: *mut render.Ctx, x: f64, y: f64) -> bool {
     let l: u32 = link_at(v, x, y)
     if l == NIL {
+        if (*v).has_imgtap_cb && image_tap(v, x, y) { return true }
         (*v).sel_on = false
         return false
     }

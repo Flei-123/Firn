@@ -1,0 +1,507 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_android/jsteps.fi -- the collapsible TOOL STEPS under an answer (web: .tool-group, "N Schritte" + one row per call).
+// The chat is ONE markdown view (screen_chat.fi, G_CHAT). A step group sits in G_CHAT as a placeholder  (byte 2) <group> (byte 3)  and is
+// expanded only when the view's source is composed (compose): collapsed = one link line "> 3 Schritte" (target step:<g>),
+// open = "v 3 Schritte" + per step "**Tool name** `short argument`" + the output as a code block (monospace, cut to LINES lines,
+// "... N more lines" = link more:<step> shows more). A failed call gets a red "error" word (link target err:, drawn in the
+// error colour by fui.markdownview). The open/closed state lives HERE per group, so a re-render never resets it.
+// LIVE: JE_TOOL starts a step in the pending group, JE_TOOL_RESULT fills it; the pending group is shown at the start of the
+// answer being streamed (compose gets that byte position) and becomes a placeholder in G_CHAT when the answer is done (flush).
+// HISTORY: JE_HIST_TOOL steps collect into the pending group, flush puts it in front of the next message.
+// Hidden like in the web app: ToolSearch, ask_user, say. Text is German, like the web app (labels = public/i18n.js tool.*).
+import std.rt
+
+export { reset, tool_start, tool_result, hist_tool, add_text, new_turn, turn_has_group, flush, flush_at, compose, on_link, has_pending, hidden }
+
+const MAXS: usize = 1024 // steps kept (more are dropped)
+const MAXG: usize = 256 // groups kept
+const RES_CAP: usize = 6000 // bytes of one output kept
+const LINES: usize = 10 // output lines shown while a step is "short"
+const LINES_FULL: usize = 80 // ... after "more"
+const ARG_CAP: usize = 160
+const TEXT_CAP: usize = 6000 // bytes of one folded text kept
+
+static mut POOL: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut S_N: usize = 0
+static mut S_NAME_O: [usize; 1024] = [0; 1024]
+static mut S_NAME_N: [usize; 1024] = [0; 1024]
+static mut S_ARG_O: [usize; 1024] = [0; 1024]
+static mut S_ARG_N: [usize; 1024] = [0; 1024]
+static mut S_RES_O: [usize; 1024] = [0; 1024]
+static mut S_RES_N: [usize; 1024] = [0; 1024]
+static mut S_TID_O: [usize; 1024] = [0; 1024]
+static mut S_TID_N: [usize; 1024] = [0; 1024]
+static mut S_ST: [u8; 1024] = [0; 1024] // 0 running (no result yet), 1 ok, 2 failed, 3 done without stored output, 4 = folded text of the AI between two tool calls (its text is in RES)
+static mut S_FULL: [u8; 1024] = [0; 1024]
+static mut S_DET: [u8; 1024] = [0; 1024] // the output of the step is shown (tap on its pill)
+static mut G_N: usize = 0
+static mut G_FIRST: [usize; 256] = [0; 256]
+static mut G_CNT: [usize; 256] = [0; 256]
+static mut G_OPEN: [u8; 256] = [0; 256]
+static mut PEND: usize = 999999 // the group being filled (none = 999999)
+static mut TURN_GRP: bool = false // the answer being streamed already has a group (its later text is folded into the steps)
+
+fn put(b: *mut rt.Buf, s: str) { rt.buf_push_bytes(b, s.p as u64, s.n) }
+
+fn pool_add(s: str) -> usize {
+    let o: usize = POOL.len
+    rt.buf_push_bytes(&POOL, s.p as u64, s.n)
+    return o
+}
+
+fn pool_str(o: usize, n: usize) -> str { return str { p: ((POOL.ptr as u64) + o as u64) as *mut u8, n: n } }
+
+// forget everything (a new chat is opened / the view is cleared)
+fn reset() {
+    rt.buf_clear(&POOL)
+    S_N = 0
+    G_N = 0
+    PEND = 999999
+    TURN_GRP = false
+}
+
+fn has_pending() -> bool { return PEND != 999999 }
+
+// the tool name in German like the web app (unknown names stay as they are)
+fn label(name: str) -> str {
+    if name == "run_shell" { return "Shell (Server)" } // english: ok
+    if name == "run_parallel" { return "Shell parallel (Server)" } // english: ok
+    if name == "read_file" { return "Datei lesen (Server)" } // english: ok
+    if name == "write_file" { return "Datei schreiben (Server)" } // english: ok
+    if name == "list_dir" { return "Ordner (Server)" } // english: ok
+    if name == "delete_file" { return "Datei löschen (Server)" } // english: ok
+    if name == "system_info" { return "System-Info" } // english: ok
+    if name == "restart_service" { return "Dienst neu starten" } // english: ok
+    if name == "ssh" { return "SSH" } // english: ok
+    if name == "ssh_key" { return "SSH-Schlüssel" } // english: ok
+    if name == "run_python" { return "Python ausführen" } // english: ok
+    if name == "browse" { return "Browser" } // english: ok
+    if name == "my_files" { return "Meine Dateien" } // english: ok
+    if name == "computer" { return "Computer steuern" } // english: ok
+    if name == "list_devices" { return "Geräte auflisten" } // english: ok
+    if name == "remote_shell" { return "Shell auf Gerät" } // english: ok
+    if name == "remote_parallel" { return "Shell parallel (Gerät)" } // english: ok
+    if name == "remote_mkdir" { return "Ordner anlegen" } // english: ok
+    if name == "remote_search" { return "Dateien suchen" } // english: ok
+    if name == "remote_read" { return "Datei lesen (Gerät)" } // english: ok
+    if name == "remote_write" { return "Datei schreiben (Gerät)" } // english: ok
+    if name == "deliver_file" { return "Datei liefern" } // english: ok
+    if name == "remote_deliver" { return "Datei liefern" } // english: ok
+    if name == "memory_remember" { return "merken" } // english: ok
+    if name == "memory_recall" { return "Gedächtnis" } // english: ok
+    if name == "memory_forget" { return "vergessen" } // english: ok
+    if name == "memory_update" { return "Gedächtnis aktualisieren" } // english: ok
+    if name == "workflow_list" { return "Workflows auflisten" } // english: ok
+    if name == "workflow_get" { return "Workflow ansehen" } // english: ok
+    if name == "workflow_save" { return "Workflow speichern" } // english: ok
+    if name == "workflow_run" { return "Workflow starten" } // english: ok
+    if name == "workflow_types" { return "Schritt-Typen" } // english: ok
+    if name == "mcp_admin" { return "MCP-Verwaltung" } // english: ok
+    if name == "view_image" { return "Bild ansehen" } // english: ok
+    if name == "archive_list" { return "Archiv auflisten" } // english: ok
+    if name == "archive_read" { return "Archiv lesen" } // english: ok
+    if name == "archive_create" { return "Archiv anlegen" } // english: ok
+    if name == "archive_edit" { return "Archiv bearbeiten" } // english: ok
+    if name == "archive_delete" { return "Archiv löschen" } // english: ok
+    if name == "task_add" { return "Aufgabe anlegen" } // english: ok
+    if name == "task_list" { return "Aufgaben ansehen" } // english: ok
+    if name == "task_complete" { return "Aufgabe erledigt" } // english: ok
+    if name == "task_remove" { return "Aufgabe streichen" } // english: ok
+    if name == "delegate" { return "Teilaufgaben verteilen" } // english: ok
+    if name == "gauntlet" { return "Gauntlet (bauen lassen)" } // english: ok
+    if name == "dispatch_work" { return "Arbeit abgeben" } // english: ok
+    if name == "list_chats" { return "Chats auflisten" } // english: ok
+    if name == "read_chat" { return "Chat lesen" } // english: ok
+    if name == "ask_user" { return "Rückfrage" } // english: ok
+    if name == "mc_servers" { return "Gameserver auflisten" } // english: ok
+    if name == "mc_power" { return "Server starten/stoppen" } // english: ok
+    if name == "mc_command" { return "Server-Befehl" } // english: ok
+    if name == "mc_console" { return "Server-Konsole" } // english: ok
+    if name == "mc_files" { return "Server-Dateien" } // english: ok
+    if name == "mc_backup" { return "Server-Backup" } // english: ok
+    if name == "mc_players" { return "Spieler" } // english: ok
+    if name == "WebSearch" { return "Websuche" } // english: ok
+    if name == "WebFetch" { return "Webseite lesen" } // english: ok
+    if name == "TaskCreate" { return "Arbeitsschritt anlegen" } // english: ok
+    if name == "TaskUpdate" { return "Arbeitsschritt aktualisieren" } // english: ok
+    if name == "TaskList" { return "Arbeitsschritte ansehen" } // english: ok
+    if name == "TaskGet" { return "Arbeitsschritt lesen" } // english: ok
+    if name == "Read" { return "Datei lesen" } // english: ok
+    if name == "Write" { return "Datei schreiben" } // english: ok
+    if name == "Edit" { return "Datei bearbeiten" } // english: ok
+    if name == "Bash" { return "Shell" } // english: ok
+    if name == "Grep" { return "Im Code suchen" } // english: ok
+    if name == "Glob" { return "Dateien finden" } // english: ok
+    if name == "NotebookEdit" { return "Notebook bearbeiten" } // english: ok
+    return name
+}
+
+fn hidden(name: str) -> bool {
+    return name == "ToolSearch" || name == "ask_user" || name == "say"
+}
+
+fn open_group() {
+    if PEND != 999999 { return }
+    if G_N >= MAXG { return }
+    G_FIRST[G_N] = S_N
+    G_CNT[G_N] = 0
+    G_OPEN[G_N] = 0
+    PEND = G_N
+    G_N = G_N + 1
+    TURN_GRP = true
+}
+
+// one new step in the pending group; returns its index or 999999 (full / hidden)
+fn add_step(name: str, arg: str, tid: str) -> usize {
+    if hidden(name) || S_N >= MAXS { return 999999 }
+    open_group()
+    if PEND == 999999 { return 999999 }
+    let i: usize = S_N
+    S_N = S_N + 1
+    S_NAME_O[i] = pool_add(name)
+    S_NAME_N[i] = name.n
+    var an: usize = arg.n
+    if an > ARG_CAP { an = ARG_CAP }
+    S_ARG_O[i] = pool_add(str { p: arg.p, n: an })
+    S_ARG_N[i] = an
+    S_TID_O[i] = pool_add(tid)
+    S_TID_N[i] = tid.n
+    S_RES_O[i] = 0
+    S_RES_N[i] = 0
+    S_ST[i] = 0 as u8
+    S_FULL[i] = 0 as u8
+    S_DET[i] = 0 as u8
+    G_CNT[PEND] = G_CNT[PEND] + 1
+    return i
+}
+
+fn set_result(i: usize, text: str, ok: i64) {
+    var n: usize = text.n
+    var cut: bool = false
+    if n > RES_CAP {
+        n = RES_CAP
+        while n > 0 && (rt.ld8(text.p as u64, n) & 192 as u8) == 128 as u8 { n = n - 1 }
+        cut = true
+    }
+    S_RES_O[i] = pool_add(str { p: text.p, n: n })
+    S_RES_N[i] = n
+    if cut {
+        let m: str = "\n..."
+        rt.buf_push_bytes(&POOL, m.p as u64, m.n)
+        S_RES_N[i] = n + m.n
+    }
+    if ok == 0 { S_ST[i] = 2 as u8 } else { S_ST[i] = 1 as u8 }
+}
+
+fn new_turn() { TURN_GRP = false }
+
+fn turn_has_group() -> bool { return TURN_GRP }
+
+// text of the AI between two tool calls: goes into the pending group as a dim line block (web: .folded-text); blank text is dropped
+fn add_text(text: str) {
+    var a: usize = 0
+    var e: usize = text.n
+    while a < e && (rt.ld8(text.p as u64, a) == 32 as u8 || rt.ld8(text.p as u64, a) == 10 as u8 || rt.ld8(text.p as u64, a) == 13 as u8 || rt.ld8(text.p as u64, a) == 9 as u8) { a = a + 1 }
+    while e > a && (rt.ld8(text.p as u64, e - 1) == 32 as u8 || rt.ld8(text.p as u64, e - 1) == 10 as u8 || rt.ld8(text.p as u64, e - 1) == 13 as u8 || rt.ld8(text.p as u64, e - 1) == 9 as u8) { e = e - 1 }
+    if e <= a || S_N >= MAXS { return }
+    open_group()
+    if PEND == 999999 { return }
+    var n: usize = e - a
+    if n > TEXT_CAP {
+        n = TEXT_CAP
+        while n > 0 && (rt.ld8(text.p as u64, a + n) & 192 as u8) == 128 as u8 { n = n - 1 }
+    }
+    let i: usize = S_N
+    S_N = S_N + 1
+    S_NAME_O[i] = 0
+    S_NAME_N[i] = 0
+    S_ARG_O[i] = 0
+    S_ARG_N[i] = 0
+    S_TID_O[i] = 0
+    S_TID_N[i] = 0
+    S_RES_O[i] = pool_add(str { p: ((text.p as u64) + a as u64) as *mut u8, n: n })
+    S_RES_N[i] = n
+    S_ST[i] = 4 as u8
+    S_FULL[i] = 0 as u8
+    S_DET[i] = 0 as u8
+    G_CNT[PEND] = G_CNT[PEND] + 1
+}
+
+// live: a tool call started (JE_TOOL)
+fn tool_start(name: str, arg: str, tid: str) {
+    let i: usize = add_step(name, arg, tid)
+}
+
+// live: its output arrived (JE_TOOL_RESULT; ok 1 / 0). Matched by call id, newest first.
+fn tool_result(tid: str, text: str, ok: i64) {
+    if tid.n == 0 { return }
+    var k: usize = S_N
+    var seen: usize = 0
+    while k > 0 && seen < 96 {
+        k = k - 1
+        seen = seen + 1
+        if S_TID_N[k] == tid.n && S_ST[k] == 0 as u8 && rt.mem_eq(((POOL.ptr as u64) + S_TID_O[k] as u64), tid.p as u64, tid.n) {
+            set_result(k, text, ok)
+            return
+        }
+    }
+}
+
+// history: a finished step (ok 1 / 0, 2 = no output stored)
+fn hist_tool(name: str, arg: str, text: str, ok: i64) {
+    let i: usize = add_step(name, arg, "")
+    if i == 999999 { return }
+    if ok == 2 {
+        S_ST[i] = 3 as u8
+    } else {
+        set_result(i, text, ok)
+    }
+}
+
+// the pending group becomes a placeholder in `buf` at byte `pos` (everything behind moves up)
+fn flush_at(buf: *mut rt.Buf, pos: usize) {
+    if PEND == 999999 { return }
+    let g: usize = PEND
+    PEND = 999999
+    var at: usize = pos
+    if at > (*buf).len { at = (*buf).len }
+    var tail: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&tail, ((*buf).ptr as u64) + at as u64, (*buf).len - at)
+    (*buf).len = at
+    rt.buf_push(buf, 2 as u8)
+    rt.buf_push_dec_i64(buf, g as i64)
+    rt.buf_push(buf, 3 as u8)
+    put(buf, "\n\n")
+    rt.buf_push_bytes(buf, tail.ptr as u64, tail.len)
+    rt.buf_free(&tail)
+}
+
+fn flush(buf: *mut rt.Buf) { flush_at(buf, (*buf).len) }
+
+// ---- rendering
+
+// markdown-safe copy of `n` bytes, at most `cap` of them (cut at a character border): control characters and line breaks
+// become blanks, characters that would start markdown get a backslash
+fn put_esc(b: *mut rt.Buf, p: u64, n: usize, cap: usize) {
+    var m: usize = n
+    var cut: bool = false
+    if m > cap {
+        m = cap
+        while m > 0 && (rt.ld8(p, m) & 192 as u8) == 128 as u8 { m = m - 1 }
+        cut = true
+    }
+    var i: usize = 0
+    while i < m {
+        var c: u8 = rt.ld8(p, i)
+        if c < 32 as u8 { c = 32 as u8 }
+        if c == 92 as u8 || c == 96 as u8 || c == 42 as u8 || c == 95 as u8 || c == 91 as u8 || c == 93 as u8 || c == 60 as u8 || c == 62 as u8 || c == 35 as u8 || c == 124 as u8 || c == 126 as u8 || c == 38 as u8 || c == 33 as u8 {
+            rt.buf_push(b, 92 as u8)
+        }
+        rt.buf_push(b, c)
+        i = i + 1
+    }
+    if cut { put(b, "...") }
+}
+
+fn put_clean(b: *mut rt.Buf, p: u64, n: usize) {
+    // backticks would end the fence; control characters are dropped
+    var i: usize = 0
+    while i < n {
+        var c: u8 = rt.ld8(p, i)
+        if c == 96 as u8 { c = 39 as u8 }
+        if c == 13 as u8 { i = i + 1 }
+        else if c < 32 as u8 && c != 10 as u8 && c != 9 as u8 { i = i + 1 }
+        else {
+            rt.buf_push(b, c)
+            i = i + 1
+        }
+    }
+}
+
+// the pill of one step: [Tool name](chip:<i>) (err:<i> = a failed call, drawn red); a tap shows / hides its output
+fn render_chip(out: *mut rt.Buf, i: usize, with_arg: bool) {
+    put(out, "[")
+    let nm: str = label(pool_str(S_NAME_O[i], S_NAME_N[i]))
+    put_esc(out, nm.p as u64, nm.n, 80)
+    if S_ST[i] == 2 as u8 { put(out, "](err:") } else { put(out, "](chip:") }
+    rt.buf_push_dec_i64(out, i as i64)
+    put(out, ")")
+    if S_ST[i] == 0 as u8 { put(out, " ...") }
+    if with_arg && S_ARG_N[i] > 0 {
+        put(out, " ")
+        put_esc(out, (POOL.ptr as u64) + S_ARG_O[i] as u64, S_ARG_N[i], 70)
+    }
+    put(out, "\n\n")
+}
+
+// the output of a step as a code block (at most LINES lines, LINES_FULL after "more")
+fn render_out(out: *mut rt.Buf, i: usize) {
+    if S_ST[i] == 0 as u8 { return }
+    if S_RES_N[i] == 0 { return }
+    var lim: usize = LINES
+    if S_FULL[i] != 0 as u8 { lim = LINES_FULL }
+    let base: u64 = (POOL.ptr as u64) + S_RES_O[i] as u64
+    let n: usize = S_RES_N[i]
+    var k: usize = 0
+    var lines: usize = 0
+    var end: usize = n
+    var total: usize = 0
+    // count the lines, find the byte where line `lim` ends
+    while k < n {
+        if rt.ld8(base, k) == 10 as u8 {
+            lines = lines + 1
+            if lines == lim && end == n { end = k }
+        }
+        k = k + 1
+    }
+    total = lines + 1
+    if n > 0 && rt.ld8(base, n - 1) == 10 as u8 { total = lines }
+    while end > 0 && (rt.ld8(base, end - 1) == 10 as u8 || rt.ld8(base, end - 1) == 13 as u8) { end = end - 1 }
+    put(out, "`````\n")
+    put_clean(out, base, end)
+    put(out, "\n`````\n\n")
+    if total > lim {
+        put(out, "[... ")
+        rt.buf_push_dec_i64(out, (total - lim) as i64)
+        put(out, " weitere Zeilen](more:") // english: ok
+        rt.buf_push_dec_i64(out, i as i64)
+        put(out, ")\n\n")
+    } else if S_FULL[i] != 0 as u8 && total > LINES {
+        put(out, "[weniger](more:") // english: ok
+        rt.buf_push_dec_i64(out, i as i64)
+        put(out, ")\n\n")
+    }
+}
+
+// `tmp` as a rail block quote (markdownview: first child = thematic break = a thin vertical line, dim text), like the web's .tool-group-body
+fn emit_rail(out: *mut rt.Buf, tmp: *mut rt.Buf) {
+    put(out, "> ***\n>\n")
+    let base: u64 = (*tmp).ptr as u64
+    let n: usize = (*tmp).len
+    var i: usize = 0
+    while i < n {
+        var e: usize = i
+        while e < n && rt.ld8(base, e) != 10 as u8 { e = e + 1 }
+        if e > i {
+            put(out, "> ")
+            rt.buf_push_bytes(out, base + i as u64, e - i)
+        } else {
+            put(out, ">")
+        }
+        put(out, "\n")
+        i = e + 1
+    }
+    put(out, "\n")
+}
+
+fn render_group(out: *mut rt.Buf, g: usize) {
+    if g >= G_N { return }
+    let n: usize = G_CNT[g]
+    if n == 0 { return }
+    let f: usize = G_FIRST[g]
+    var run: bool = false
+    var k: usize = 0
+    while k < n {
+        if S_ST[f + k] == 0 as u8 { run = true }
+        k = k + 1
+    }
+    // exactly one tool call: no header, just its pill (web: .tool-group.single)
+    if n == 1 && S_ST[f] != 4 as u8 {
+        render_chip(out, f, true)
+        if S_DET[f] != 0 as u8 { render_out(out, f) }
+        return
+    }
+    put(out, "[")
+    if G_OPEN[g] != 0 as u8 { put(out, "v ") } else { put(out, "> ") }
+    rt.buf_push_dec_i64(out, n as i64)
+    if n == 1 { put(out, " Schritt") } else { put(out, " Schritte") } // english: ok
+    if run && g == PEND { put(out, " ...") }
+    put(out, "](step:")
+    rt.buf_push_dec_i64(out, g as i64)
+    put(out, ")\n\n")
+    if G_OPEN[g] == 0 as u8 { return }
+    var tmp: rt.Buf = rt.buf_new()
+    k = 0
+    while k < n {
+        let i: usize = f + k
+        if S_ST[i] == 4 as u8 {
+            rt.buf_push_bytes(&tmp, (POOL.ptr as u64) + S_RES_O[i] as u64, S_RES_N[i])
+            put(&tmp, "\n\n")
+        } else {
+            render_chip(&tmp, i, true)
+            if S_DET[i] != 0 as u8 { render_out(&tmp, i) }
+        }
+        k = k + 1
+    }
+    emit_rail(out, &tmp)
+    rt.buf_free(&tmp)
+}
+
+// the markdown source of the view: `src` (G_CHAT) with every placeholder expanded and the pending group inserted at `live_at`
+fn compose(src: *mut rt.Buf, live_at: usize, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    let base: u64 = (*src).ptr as u64
+    let n: usize = (*src).len
+    var live_done: bool = PEND == 999999
+    var i: usize = 0
+    var from: usize = 0
+    while i < n {
+        if !live_done && i == live_at {
+            rt.buf_push_bytes(out, base + from as u64, i - from)
+            from = i
+            render_group(out, PEND)
+            live_done = true
+        }
+        if rt.ld8(base, i) == 2 as u8 {
+            rt.buf_push_bytes(out, base + from as u64, i - from)
+            var j: usize = i + 1
+            var g: usize = 0
+            while j < n && rt.ld8(base, j) != 3 as u8 {
+                let d: u8 = rt.ld8(base, j)
+                if d >= 48 as u8 && d <= 57 as u8 { g = g * 10 + (d - 48 as u8) as usize }
+                j = j + 1
+            }
+            render_group(out, g)
+            i = j + 1
+            from = i
+        } else {
+            i = i + 1
+        }
+    }
+    rt.buf_push_bytes(out, base + from as u64, n - from)
+    if !live_done { render_group(out, PEND) }
+}
+
+// a tapped link of the view: true = it was ours (step:<g> toggles a group, chip:/err:<step> shows / hides a step's output,
+// more:<step> shows more / fewer lines), re-render
+fn on_link(p: u64, n: usize) -> bool {
+    var kind: u8 = 0 as u8
+    var skip: usize = 5
+    if n > 5 && rt.mem_eq(p, "step:".p as u64, 5) { kind = 1 as u8 }
+    if n > 5 && rt.mem_eq(p, "more:".p as u64, 5) { kind = 2 as u8 }
+    if n > 5 && rt.mem_eq(p, "chip:".p as u64, 5) { kind = 3 as u8 }
+    if n > 4 && rt.mem_eq(p, "err:".p as u64, 4) {
+        kind = 3 as u8
+        skip = 4
+    }
+    if kind == 0 as u8 { return false }
+    var v: usize = 0
+    var i: usize = skip
+    while i < n {
+        let d: u8 = rt.ld8(p, i)
+        if d >= 48 as u8 && d <= 57 as u8 { v = v * 10 + (d - 48 as u8) as usize }
+        i = i + 1
+    }
+    if kind == 1 as u8 {
+        if v >= G_N { return false }
+        if G_OPEN[v] == 0 as u8 { G_OPEN[v] = 1 as u8 } else { G_OPEN[v] = 0 as u8 }
+        return true
+    }
+    if v >= S_N { return false }
+    if kind == 3 as u8 {
+        if S_DET[v] == 0 as u8 { S_DET[v] = 1 as u8 } else { S_DET[v] = 0 as u8 }
+        return true
+    }
+    if S_FULL[v] == 0 as u8 { S_FULL[v] = 1 as u8 } else { S_FULL[v] = 0 as u8 }
+    return true
+}

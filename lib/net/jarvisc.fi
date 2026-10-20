@@ -52,7 +52,11 @@
 //   JE_CONFIRM    text = question, jc_id(c) = id   JE_ASK     text = question, jc_options(c) =
 //                 labels one per line (arg 1 = a simple single choice you can answer with jc_answer)
 //   JE_ASK_END    the question went away           JE_FILE    text = file name
-//   JE_HIST       arg 1 = user, 0 = JARVIS, text   JE_HIST_END  arg 1 = running, text = partial
+//   JE_HIST       arg 1 = user, 0 = JARVIS, text (JARVIS: jc_id = "genMs,at")   JE_HIST_END  arg 1 = running, text = partial
+//   JE_TOOL       (also) jc_id = the call id, jc_options = its short argument (command / path / query ..., one line cut)
+//   JE_TOOL_RESULT  jc_id = the call id, jc_result = the output text, arg 1 = ok, 0 = error
+//   JE_HIST_TOOL  a tool step of the history: text = tool name, jc_options = short argument, jc_result = output (arg 1 ok,
+//                 0 error, 2 = no output stored)
 //   JE_HTTP_ERR   a history request failed; arg = status (401 = log in again,
 //                 404 = the chat is gone, the stored id is dropped)
 //
@@ -81,12 +85,12 @@ export {
     Jc,
     JE_LOGIN, JE_OPEN, JE_CLOSE, JE_NETERR, JE_TOKEN, JE_DONE, JE_TOOL, JE_THINKING,
     JE_CONVERSATION, JE_ERROR, JE_SYSTEM, JE_INFO, JE_USER, JE_CONFIRM, JE_ASK,
-    JE_ASK_END, JE_FILE, JE_HIST, JE_HIST_END, JE_HTTP_ERR,
+    JE_ASK_END, JE_FILE, JE_HIST, JE_HIST_END, JE_HTTP_ERR, JE_TOOL_RESULT, JE_HIST_TOOL, md_target, md_label,
     jc_new, jc_free, jc_set_base, jc_set_token, jc_has_token, jc_set_tz, jc_set_dev,
     jc_add_trust_pem, jc_login, jc_connect, jc_disconnect, jc_is_open,
     jc_send, jc_stop, jc_confirm, jc_answer, jc_history, jc_new_chat,
     jc_set_system_trust, jc_net_layer, jc_net_tls, jc_net_verify, jc_net_layer_name,
-    jc_text, jc_id, jc_options, jc_cid, jc_set_cid, jc_ws_status, jc_user, jc_set_user, jc_user_from_json, jc_token, jc_base,
+    jc_text, jc_id, jc_options, jc_result, jc_cid, jc_set_cid, jc_ws_status, jc_user, jc_set_user, jc_user_from_json, jc_token, jc_base,
     jc_save, jc_restore, jc_forget, jc_clean,
 }
 
@@ -110,6 +114,8 @@ const JE_FILE: u32 = 17
 const JE_HIST: u32 = 18
 const JE_HIST_END: u32 = 19
 const JE_HTTP_ERR: u32 = 20
+const JE_TOOL_RESULT: u32 = 21
+const JE_HIST_TOOL: u32 = 22
 
 const COOKIE_NAME: str = "fleitec_session"
 
@@ -128,7 +134,8 @@ struct Jc {
     last_sent: rt.Buf,
     text: rt.Buf, // the payload of the event being delivered
     id: rt.Buf, // id of the open confirm / ask
-    opts: rt.Buf, // options of the open ask, one per line
+    opts: rt.Buf, // options of the open ask, one per line (JE_TOOL / JE_HIST_TOOL: the short argument of the call)
+    res: rt.Buf, // JE_TOOL_RESULT / JE_HIST_TOOL: the result text of a tool call
     outq: rt.Buf, // [u32 len][bytes] ... messages written while the socket is down
     req_url: rt.Buf,
     req_body: rt.Buf,
@@ -159,7 +166,7 @@ fn jc_new(l: *mut loop.Loop, cb: fn(*mut Jc, u64, u32, i64), ud: u64) -> *mut Jc
     *c = Jc { l: l, cb: cb, ud: ud, ah: ahttp.aclient_new(), ws: 0 as *mut wsc.WsClient,
         base: rt.buf_new(), token: rt.buf_new(), user: rt.buf_new(), cid: rt.buf_new(),
         tz: rt.buf_new(), dev: rt.buf_new(), last_sent: rt.buf_new(), text: rt.buf_new(),
-        id: rt.buf_new(), opts: rt.buf_new(), outq: rt.buf_new(), req_url: rt.buf_new(),
+        id: rt.buf_new(), opts: rt.buf_new(), res: rt.buf_new(), outq: rt.buf_new(), req_url: rt.buf_new(),
         req_body: rt.buf_new(), net_layer: 0, net_tls: 0, net_verify: 0, no_sys: false, busy_login: false, busy_hist: false, started: false, seq: 0 }
     if !ahttp.aclient_init(&(*c).ah, l) {
         jc_obj_free[Jc](p)
@@ -188,6 +195,7 @@ fn jc_free(c: *mut Jc) {
     rt.buf_free(&(*c).text)
     rt.buf_free(&(*c).id)
     rt.buf_free(&(*c).opts)
+    rt.buf_free(&(*c).res)
     rt.buf_free(&(*c).outq)
     rt.buf_free(&(*c).req_url)
     rt.buf_free(&(*c).req_body)
@@ -279,6 +287,7 @@ fn emit_span(c: *mut Jc, kind: u32, s: str.Span, arg: i64) {
 fn jc_text(c: *mut Jc) -> str { return as_str(&(*c).text) }
 fn jc_id(c: *mut Jc) -> str { return as_str(&(*c).id) }
 fn jc_options(c: *mut Jc) -> str { return as_str(&(*c).opts) }
+fn jc_result(c: *mut Jc) -> str { return as_str(&(*c).res) }
 fn jc_cid(c: *mut Jc) -> str { return as_str(&(*c).cid) }
 fn jc_user(c: *mut Jc) -> str { return as_str(&(*c).user) }
 
@@ -637,6 +646,100 @@ fn jget_str(d: *mut json.Json, obj: u32, name: str) -> str.Span {
     return json.json_string(d, n)
 }
 
+// a number field of an object as i64 (0 when missing / not a number)
+fn jget_num(d: *mut json.Json, obj: u32, name: str) -> i64 {
+    let n: u32 = json.json_get(d, obj, name.p as u64, name.n)
+    if n == json.JSON_NONE || json.json_kind(d, n) != json.JSON_NUMBER { return 0 }
+    if json.json_is_int(d, n) { return json.json_int(d, n) }
+    let f: f64 = json.json_number(d, n)
+    if f != f || f > 9.0e18 || f < -9.0e18 { return 0 }
+    return f as i64
+}
+
+// the string value of `name` in object `o`, or empty when it is no string
+fn jget_text(d: *mut json.Json, o: u32, name: str) -> str.Span {
+    let n: u32 = json.json_get(d, o, name.p as u64, name.n)
+    if n == json.JSON_NONE || json.json_kind(d, n) != json.JSON_STRING {
+        return str.span_empty()
+    }
+    return json.json_string(d, n)
+}
+
+// The short argument of a tool call (what the web app's step shows): the first of command / path / query / ... in the
+// input object, cut to ARG_MAX bytes (not inside a UTF-8 sequence), lands in (*c).opts. `commands` (run_parallel) = first + " (+N)".
+const ARG_MAX: usize = 160
+fn arg_key(k: usize) -> str {
+    if k == 0 { return "command" }
+    if k == 1 { return "path" }
+    if k == 2 { return "query" }
+    if k == 3 { return "url" }
+    if k == 4 { return "action" }
+    if k == 5 { return "text" }
+    if k == 6 { return "message" }
+    if k == 7 { return "host" }
+    if k == 8 { return "name" }
+    if k == 9 { return "title" }
+    if k == 10 { return "goal" }
+    if k == 11 { return "server" }
+    if k == 12 { return "source" }
+    if k == 13 { return "prompt" }
+    return "code"
+}
+fn tool_arg(c: *mut Jc, d: *mut json.Json, inp: u32) {
+    rt.buf_clear(&(*c).opts)
+    if inp == json.JSON_NONE || json.json_kind(d, inp) != json.JSON_OBJECT { return }
+    var s: str.Span = str.span_empty()
+    var k: usize = 0
+    while k < 15 && s.n == 0 {
+        s = jget_text(d, inp, arg_key(k))
+        k = k + 1
+    }
+    var extra: usize = 0
+    if s.n == 0 {
+        let cn: u32 = json.json_get(d, inp, "commands".p as u64, 8)
+        if cn != json.JSON_NONE && json.json_kind(d, cn) == json.JSON_ARRAY {
+            let f: u32 = json.json_child(d, cn)
+            if f != json.JSON_NONE && json.json_kind(d, f) == json.JSON_STRING { s = json.json_string(d, f) }
+            let cnt: usize = json.json_count(d, cn)
+            if cnt > 1 { extra = cnt - 1 }
+        }
+    }
+    if s.n == 0 { return }
+    var n: usize = s.n
+    if n > ARG_MAX {
+        n = ARG_MAX
+        while n > 0 && (rt.ld8(s.p as u64, n) & 192 as u8) == 128 as u8 { n = n - 1 }
+    }
+    rt.buf_push_bytes(&(*c).opts, s.p as u64, n)
+    if n < s.n { put(&(*c).opts, "...") }
+    if extra > 0 {
+        put(&(*c).opts, " (+")
+        var dg: [u8; 20] = [0; 20]
+        var m: usize = extra
+        var len: usize = 0
+        while m > 0 { dg[len] = (48 + m % 10) as u8; len = len + 1; m = m / 10 }
+        while len > 0 { len = len - 1; rt.buf_push_bytes(&(*c).opts, (&dg[len]) as u64, 1) }
+        put(&(*c).opts, ")")
+    }
+}
+
+// a message with role "tool" of the history: name (text), input, result {ok, text}
+fn hist_tool(c: *mut Jc, d: *mut json.Json, e: u32, name: str.Span) {
+    if name.n == 0 { return }
+    tool_arg(c, d, json.json_get(d, e, "input".p as u64, 5))
+    rt.buf_clear(&(*c).res)
+    var okf: i64 = 2
+    let r: u32 = json.json_get(d, e, "result".p as u64, 6)
+    if r != json.JSON_NONE && json.json_kind(d, r) == json.JSON_OBJECT {
+        okf = 1
+        let rt2: str.Span = jget_text(d, r, "text")
+        rt.buf_push_bytes(&(*c).res, rt2.p as u64, rt2.n)
+        let okn: u32 = json.json_get(d, r, "ok".p as u64, 2)
+        if okn != json.JSON_NONE && json.json_kind(d, okn) == json.JSON_FALSE { okf = 0 }
+    }
+    emit_span(c, JE_HIST_TOOL, tool_short(name), okf)
+}
+
 // "mcp__server__tool" -> "tool"
 fn tool_short(s: str.Span) -> str.Span {
     if s.n > 5 && rt.mem_eq(s.p as u64, "mcp__".p as u64, 5) {
@@ -771,7 +874,22 @@ fn handle(c: *mut Jc, p: u64, n: usize) {
         } else if span_is(ty, "thinking") {
             emit(c, JE_THINKING, "", 0)
         } else if span_is(ty, "tool") {
+            let tid: str.Span = jget_str(&d, o, "id")
+            rt.buf_clear(&(*c).id)
+            rt.buf_push_bytes(&(*c).id, tid.p as u64, tid.n)
+            tool_arg(c, &d, json.json_get(&d, o, "input".p as u64, 5))
             emit_span(c, JE_TOOL, tool_short(jget_str(&d, o, "name")), 0)
+        } else if span_is(ty, "tool_result") {
+            let rid: str.Span = jget_str(&d, o, "id")
+            rt.buf_clear(&(*c).id)
+            rt.buf_push_bytes(&(*c).id, rid.p as u64, rid.n)
+            let rt2: str.Span = jget_str(&d, o, "text")
+            rt.buf_clear(&(*c).res)
+            rt.buf_push_bytes(&(*c).res, rt2.p as u64, rt2.n)
+            var okf: i64 = 1
+            let okn: u32 = json.json_get(&d, o, "ok".p as u64, 2)
+            if okn != json.JSON_NONE && json.json_kind(&d, okn) == json.JSON_FALSE { okf = 0 }
+            emit(c, JE_TOOL_RESULT, "", okf)
         } else if span_is(ty, "token") {
             emit_span(c, JE_TOKEN, jget_str(&d, o, "content"), 0)
         } else if span_is(ty, "done") {
@@ -950,6 +1068,112 @@ fn jc_answer(c: *mut Jc, label: str) {
 
 // ------------------------------------------------------------------ history
 
+// text + the media markdown -> one JE_HIST
+fn emit_hist(c: *mut Jc, t: str.Span, extra: *mut rt.Buf, who: i64) {
+    if (*extra).len == 0 {
+        emit_span(c, JE_HIST, t, who)
+        return
+    }
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, t.p as u64, t.n)
+    rt.buf_push_bytes(&b, (*extra).ptr, (*extra).len)
+    emit(c, JE_HIST, str { p: b.ptr as *mut u8, n: b.len }, who)
+    rt.buf_free(&b)
+}
+
+// a link target the markdown parser keeps whole: spaces and brackets are percent-escaped
+fn md_target(b: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        if ch == 32 as u8 { rt.buf_push_bytes(b, "%20".p as u64, 3) }
+        else if ch == 40 as u8 { rt.buf_push_bytes(b, "%28".p as u64, 3) }
+        else if ch == 41 as u8 { rt.buf_push_bytes(b, "%29".p as u64, 3) }
+        else if ch == 10 as u8 || ch == 13 as u8 { rt.buf_push(b, 32 as u8) }
+        else { rt.buf_push(b, ch) }
+        i = i + 1
+    }
+}
+
+// link text: brackets and line breaks of a file name are dropped
+fn md_label(b: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let ch: u8 = rt.ld8(p, i)
+        if ch != 91 as u8 && ch != 93 as u8 && ch != 10 as u8 && ch != 13 as u8 { rt.buf_push(b, ch) }
+        i = i + 1
+    }
+}
+
+// "images":[ "url" | {"url"} ] and "files":[{"name","mime","size","url"}] of a history message -> markdown lines in `out`
+fn hist_media(d: *mut json.Json, m: u32, out: *mut rt.Buf) {
+    let im: u32 = json.json_get(d, m, "images".p as u64, 6)
+    if im != json.JSON_NONE && json.json_kind(d, im) == json.JSON_ARRAY {
+        var k: u32 = json.json_child(d, im)
+        var count: usize = 0
+        while k != json.JSON_NONE && count < 12 {
+            var u: str.Span = str.span_empty()
+            if json.json_kind(d, k) == json.JSON_STRING { u = json.json_string(d, k) }
+            else if json.json_kind(d, k) == json.JSON_OBJECT { u = jget_str(d, k, "url") }
+            if u.n > 0 && u.n < 1800 {
+                rt.buf_push_bytes(out, "\n\n![](".p as u64, 6)
+                md_target(out, u.p as u64, u.n)
+                rt.buf_push(out, 41 as u8)
+                count = count + 1
+            }
+            k = json.json_next(d, k)
+        }
+    }
+    let fl: u32 = json.json_get(d, m, "files".p as u64, 5)
+    if fl != json.JSON_NONE && json.json_kind(d, fl) == json.JSON_ARRAY {
+        var k2: u32 = json.json_child(d, fl)
+        var count2: usize = 0
+        while k2 != json.JSON_NONE && count2 < 12 {
+            if json.json_kind(d, k2) == json.JSON_OBJECT {
+                let u2: str.Span = jget_str(d, k2, "url")
+                let nm: str.Span = jget_str(d, k2, "name")
+                let sz: u32 = json.json_get(d, k2, "size".p as u64, 4)
+                if u2.n > 0 && u2.n < 1800 {
+                    rt.buf_push_bytes(out, "\n\n[File: ".p as u64, 9)
+                    md_label(out, nm.p as u64, nm.n)
+                    if sz != json.JSON_NONE && json.json_kind(d, sz) == json.JSON_NUMBER {
+                        let bytes: i64 = json.json_int(d, sz)
+                        var kb: i64 = bytes / 1024
+                        if kb < 1 { kb = 1 }
+                        rt.buf_push_bytes(out, ", ".p as u64, 2)
+                        push_dec(out, kb)
+                        rt.buf_push_bytes(out, " kB".p as u64, 3)
+                    }
+                    rt.buf_push_bytes(out, "](".p as u64, 2)
+                    md_target(out, u2.p as u64, u2.n)
+                    rt.buf_push(out, 41 as u8)
+                    count2 = count2 + 1
+                }
+            }
+            k2 = json.json_next(d, k2)
+        }
+    }
+}
+
+fn push_dec(b: *mut rt.Buf, v: i64) {
+    var tmp: [u8; 24] = [0 as u8; 24]
+    var n: usize = 0
+    var x: i64 = v
+    if x <= 0 {
+        rt.buf_push(b, 48 as u8)
+        return
+    }
+    while x > 0 && n < 22 {
+        tmp[n] = (48 + (x % 10)) as u8
+        x = x / 10
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        rt.buf_push(b, tmp[n])
+    }
+}
+
 fn on_hist(r: *mut ahttp.Request, ud: u64) {
     let c: *mut Jc = ud as *mut Jc
     (*c).busy_hist = false
@@ -984,12 +1208,23 @@ fn on_hist(r: *mut ahttp.Request, ud: u64) {
             while e != json.JSON_NONE {
                 let role: str.Span = jget_str(&d, e, "role")
                 let t: str.Span = jget_str(&d, e, "text")
+                // pictures and files of the message become markdown ("![](url)", "[name](url)") behind the text
+                var extra: rt.Buf = rt.buf_new()
+                hist_media(&d, e, &extra)
                 if span_is(role, "user") {
-                    emit_span(c, JE_HIST, t, 1)
+                    emit_hist(c, t, &extra, 1)
+                } else if span_is(role, "tool") {
+                    hist_tool(c, &d, e, t)
                 } else if !(span_is(role, "tool") || span_is(role, "thinking") || span_is(role, "sys")
-                    || span_is(role, "reminder") || span_is(role, "file") || span_is(role, "ask")) && t.n > 0 {
-                    emit_span(c, JE_HIST, t, 0)
+                    || span_is(role, "reminder") || span_is(role, "file") || span_is(role, "ask")) && (t.n > 0 || extra.len > 0) {
+                    // jc_id() of an answer: "<genMs>,<at>" (epoch ms; 0 = the server did not store it)
+                    rt.buf_clear(&(*c).id)
+                    rt.buf_push_dec_i64(&(*c).id, jget_num(&d, e, "genMs"))
+                    rt.buf_push_bytes(&(*c).id, ",".p as u64, 1)
+                    rt.buf_push_dec_i64(&(*c).id, jget_num(&d, e, "at"))
+                    emit_hist(c, t, &extra, 0)
                 }
+                rt.buf_free(&extra)
                 e = json.json_next(&d, e)
             }
         }

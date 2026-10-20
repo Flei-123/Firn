@@ -19,6 +19,7 @@ import plat.tzinfo
 import plat.backkey
 import fui.app
 import fui.looppump
+import fui.painter
 import fui.scene
 import fui.flex
 import fui.editor
@@ -53,6 +54,8 @@ import screen_leitstand
 import screen_tasks
 import screen_devices
 import screen_settings
+import screen_admin
+import plat.kbd
 
 static mut G_LOGIN: usize = 0
 static mut G_MAIN: usize = 0
@@ -61,6 +64,7 @@ static mut G_P1: usize = 0
 static mut G_P2: usize = 0
 static mut G_P3: usize = 0
 static mut G_P4: usize = 0
+static mut G_P5: usize = 0 // the Admin page (no tab-bar button)
 static mut G_BAR: usize = 0
 static mut G_SIDEBAR: usize = 0
 static mut G_NOTICE: usize = 0
@@ -85,14 +89,18 @@ fn page_node(i: usize) -> usize {
     if i == 1 { return G_P1 }
     if i == 2 { return G_P2 }
     if i == 3 { return G_P3 }
+    if i == 5 { return G_P5 }
     return G_P4
 }
+
+static mut G_DEV_WARM: bool = false // the background fetch of the Devices list ran once
 
 fn refresh_tab(a: *mut app.App, i: usize) {
     if i == jshell.TAB_CHAT { screen_chat.screen_chat_refresh(a) }
     else if i == jshell.TAB_LEITSTAND { screen_leitstand.screen_leitstand_refresh(a) }
     else if i == jshell.TAB_TASKS { screen_tasks.screen_tasks_refresh(a) }
     else if i == jshell.TAB_DEVICES { screen_devices.screen_devices_refresh(a) }
+    else if i == jshell.TAB_ADMIN { screen_admin.screen_admin_refresh(a) }
     else { screen_settings.screen_settings_refresh(a) }
 }
 
@@ -114,7 +122,7 @@ fn show_tab(a: *mut app.App, i: usize) {
     if i != G_TAB && !G_NOHIST { hist_push(G_TAB) }
     let sc: *mut scene.Scene = app.app_scene(a)
     var k: usize = 0
-    while k < jshell.TAB_COUNT {
+    while k < jshell.PAGE_COUNT {
         jshell.set_shown_flex(a, page_node(k), k == i)
         // a hidden page keeps its padding as room (flex): without this the shown page starts ~60 dp under the header (A40 note)
         if k == i {
@@ -131,7 +139,7 @@ fn show_tab(a: *mut app.App, i: usize) {
     jshell.set_shown(a, G_CHDR, i == 0, 0)
     var tj: usize = 0
     while tj < jshell.TAB_COUNT {
-        jtheme.set_tab_on(a, G_TABN[tj], tj == i)
+        jtheme.set_tab_on(a, G_TABN[tj], tj == i || (i == jshell.TAB_ADMIN && tj == jshell.TAB_SETTINGS))
         tj = tj + 1
     }
     refresh_tab(a, i)
@@ -216,6 +224,7 @@ fn to_login(msg: str) {
     jpush.stop()
     jfont.jfont_reset()
     jmeta.jmeta_reset()
+    screen_admin.admin_reset()
     jdata.forget_all()
     screen_login.screen_login_reset()
     show_login(a, true)
@@ -258,6 +267,8 @@ fn on_api(x: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
         to_login(jtexts.t("login.expired"))
         return
     }
+    let st_me: bool = screen_settings.screen_settings_api(x, kind, status)
+    if st_me { return }
     if kind == jarvisapi.AK_ME && status == 200 {
         // a restored session has no user name yet: /api/me tells it (More > Account > User)
         if jarvisc.jc_user_from_json(jshell.jc(), jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x)) {
@@ -268,6 +279,7 @@ fn on_api(x: *mut jarvisapi.Api, ud: u64, kind: u32, status: i64) {
     if screen_sidebar.sidebar_api(x, kind, status) { return }
     if jfont.jfont_api(x, kind, status) { return }
     if jmeta.jmeta_api(x, kind, status) { return }
+    if screen_admin.admin_api(x, kind, status) { return }
     screen_chat.screen_chat_api(x, kind, status)
 }
 
@@ -288,6 +300,37 @@ fn fast_tick(l: *mut loop.Loop, ud: u64) {
     }
     voiceio.vio_poll()
     screen_chat.screen_chat_voice_tick(jshell.app_ui())
+    kb_tick(jshell.app_ui())
+    looppump.quiet_done() // a56: a tick that edited nothing paints no frame
+}
+
+// a48: the keyboard. The window is not resized and the insets stay 0 on the device (adjustResize alone does nothing for this native
+// surface), so the app asks Android where the visible part of the window ends (getWindowVisibleDisplayFrame). The part under the keyboard
+// becomes extra bottom padding (the composer lies right above the keyboard) and the tab bar is hidden while the keyboard is up.
+static mut G_VB_MAX: i64 = 0 // the largest visible bottom seen = keyboard closed
+static mut G_RH_MAX: i64 = 0 // window height with the keyboard closed
+static mut G_KB: i64 = 0 // keyboard height now (device px), 0 = closed
+static mut G_KB_PAD: i64 = 0 // extra bottom padding now: the part of the keyboard the system did NOT cut off the window
+fn kb_tick(a: *mut app.App) {
+    if G_BAR == 0 { return }
+    let vb: i64 = kbd.kbd_visible_bottom() as i64
+    if vb <= 0 { return }
+    let sc: *mut scene.Scene = app.app_scene(a)
+    let rh: i64 = scene.node_h(sc, app.root(a)) as i64
+    if vb > G_VB_MAX { G_VB_MAX = vb }
+    var ovl: i64 = G_VB_MAX - vb
+    if ovl < 200 { ovl = 0 }
+    if ovl == 0 { G_RH_MAX = rh } else if rh > G_RH_MAX { G_RH_MAX = rh }
+    // the system may shrink the window by itself (adjustResize): only the rest needs padding
+    var pad: i64 = ovl - (G_RH_MAX - rh)
+    if pad < 100 { pad = 0 }
+    if ovl == G_KB && pad == G_KB_PAD { return }
+    var base: f64 = app.inset(a, 3) - (G_KB_PAD as f64)
+    if base < 0.0 { base = 0.0 }
+    G_KB = ovl
+    G_KB_PAD = pad
+    app.set_insets(a, app.inset(a, 0), app.inset(a, 1), app.inset(a, 2), base + (pad as f64))
+    scene.node_set_hidden(sc, G_BAR, ovl > 0)
 }
 
 fn on_key(a: *mut app.App, key: u32, mods: u32) -> bool {
@@ -311,7 +354,13 @@ fn log_frames() {
     let n: i64 = app.frame_stat(app.FS_FRAMES)
     if n == 0 { return }
     log.log_info("frames", "n=" + jshell.dec(n) + " avg_us=" + jshell.dec(app.frame_stat(app.FS_AVG_US)) + " max_us=" +
-        jshell.dec(app.frame_stat(app.FS_MAX_US)) + " over16ms=" + jshell.dec(app.frame_stat(app.FS_SLOW)))
+        jshell.dec(app.frame_stat(app.FS_MAX_US)) + " over16ms=" + jshell.dec(app.frame_stat(app.FS_SLOW)) +
+        " iv_p95_us=" + jshell.dec(app.frame_stat(app.FS_IV_P95_US)) + " iv_max_us=" + jshell.dec(app.frame_stat(app.FS_IV_MAX_US)) +
+        " hz=" + jshell.dec(app.refresh_hz(jshell.app_ui())) + " ph_us=" + jshell.dec(app.frame_phase(0)) + "/" + jshell.dec(app.frame_phase(1)) +
+        "/" + jshell.dec(app.frame_phase(2)) + "/" + jshell.dec(app.frame_phase(3)) + "/" + jshell.dec(app.frame_phase(4)) + "/" +
+        jshell.dec(app.frame_phase(5)) + "/" + jshell.dec(app.frame_phase(6)) + "/" + jshell.dec(app.frame_phase(7)) +
+        " bg=" + jshell.dec(painter.bgcache_stat(0)) + "/" + jshell.dec(painter.bgcache_stat(1)) + "/" + jshell.dec(painter.bgcache_stat(2)) + "/" +
+        jshell.dec(painter.bgcache_stat(3)))
     app.frame_stats_reset()
     log_geom()
 }
@@ -326,7 +375,7 @@ fn log_geom() {
     let bh: f64 = scene.node_h(sc, G_BAR)
     var ok: str = "0"
     if bh > 1.0 && by + bh <= rh + 1.0 { ok = "1" }
-    log.log_info("geom", "tab=" + jshell.dec(G_TAB as i64) + " bar_y=" + jshell.dec(by as i64) + " bar_h=" + jshell.dec(bh as i64) + " root_h=" + jshell.dec(rh as i64) + " bar_visible=" + ok)
+    log.log_info("geom", "tab=" + jshell.dec(G_TAB as i64) + " bar_y=" + jshell.dec(by as i64) + " bar_h=" + jshell.dec(bh as i64) + " root_h=" + jshell.dec(rh as i64) + " bar_visible=" + ok + " kb=" + jshell.dec(G_KB) + " kbpad=" + jshell.dec(G_KB_PAD) + " vbmax=" + jshell.dec(G_VB_MAX) + " inset_b=" + jshell.dec(app.inset(a, 3) as i64) + " inset_t=" + jshell.dec(app.inset(a, 1) as i64) + screen_chat.screen_chat_geom(a))
 }
 
 static mut G_TABN: [usize; 5] = [0 as usize; 5]
@@ -345,6 +394,7 @@ fn watch_front() {
     if f == G_FRONT_SEEN { return }
     G_FRONT_SEEN = f
     if f == 1 { stage.stage_mark("fg") } else { stage.stage_mark("bg") }
+    if f == 1 { jdata.invalidate_all() } // a48: back in front = reload the lists now (Boss: workers were stale)
     // a run that ends in the background is no crash: the next start writes no report (r120a)
     crash.crash_set_background(f == 0)
 }
@@ -426,11 +476,17 @@ fn tick(l: *mut loop.Loop, ud: u64) {
     jcrash.tick()
     jfont.jfont_tick(G_LOGGED_IN)
     jmeta.jmeta_tick(G_LOGGED_IN)
+    screen_admin.admin_tick(G_LOGGED_IN)
     follow_push(a)
     log_frames()
     if G_LOGGED_IN && G_TICKS % 2 as u64 == 0 as u64 { refresh_tab(a, G_TAB) }
     screen_sidebar.sidebar_refresh(a)
     update_schedule()
+    // the Devices list is fetched once in the background (a few seconds after sign-in) so the tab opens with data, not "Loading"
+    if G_LOGGED_IN && !G_DEV_WARM && G_TICKS >= 4 as u64 {
+        G_DEV_WARM = true
+        jdata.refresh_devices(false)
+    }
     if G_TICKS == 3 as u64 { stage.stage_mark("alive_3s") }
     if G_TICKS == 6 as u64 { update.update_mark_healthy(jshell.updater()) }
 }
@@ -471,11 +527,12 @@ fn sb_user(a: *mut app.App) {
 // Android Back: close what is open, else go back one page; only on the root (chat tab, nothing open) Back leaves the app (the system does it).
 fn back_wanted() -> bool {
     if !G_LOGGED_IN || G_CRASH_ON { return false }
-    return screen_sidebar.sidebar_is_open() || G_HIST_N > 0 || G_TAB != jshell.TAB_CHAT
+    return screen_sidebar.sidebar_is_open() || screen_chat.screen_chat_viewer_open() || G_HIST_N > 0 || G_TAB != jshell.TAB_CHAT
 }
 
 fn go_back(a: *mut app.App) {
     if !G_LOGGED_IN || G_CRASH_ON { return }
+    if screen_chat.screen_chat_viewer_back() { return }
     if screen_sidebar.sidebar_back(a) {
         log.log_info("back", "closed sidebar step: " + screen_sidebar.sidebar_dump())
         return
@@ -515,6 +572,7 @@ fn build_ui(a: *mut app.App) {
     // main page: header, five tab pages, tab bar
     G_MAIN = app.column(a)
     jshell.fill(a, G_MAIN)
+    scene.node_add_class(sc, G_MAIN, jtheme.K_PAGEGLOW)
     // the five tab pages are children of this column: a gap between them would be paid for by every HIDDEN page (4 x ~10 pt of air)
     scene.node_set_gap(sc, G_MAIN, 0, 0)
     let hr: usize = app.row(a)
@@ -558,12 +616,15 @@ fn build_ui(a: *mut app.App) {
     screen_settings.screen_settings_build(a)
     app.end(a)
     app.end(a)
+    G_P5 = app.column(a)
+    screen_admin.screen_admin_build(a)
+    app.end(a)
     // a finger drag on the More page scrolls it (the router lets a pan win over a tap, so a swipe never presses a button)
     let pb: bool = app.on(a, G_P4, event.EV_PAN_ALL, on_pan_more)
     // the list pages start at the top (a column centres its children by default)
     scene.node_set_padding(sc, G_P0, 12, 0, 12, 10)
     var pk: usize = 1
-    while pk < jshell.TAB_COUNT {
+    while pk < jshell.PAGE_COUNT {
         jshell.fill_stretch(a, page_node(pk))
         // node_set_flex builds a NEW flexbox (padding and gap are gone): padding and gap come AFTER it
         scene.node_set_flex(sc, page_node(pk), flex.FLEX_COLUMN, flex.JUSTIFY_START, flex.AL_STRETCH)
@@ -597,7 +658,7 @@ fn build_ui(a: *mut app.App) {
     show_login(a, true)
     jshell.set_shown(a, G_NOTICE, false, 0)
     var k: usize = 1
-    while k < jshell.TAB_COUNT {
+    while k < jshell.PAGE_COUNT {
         jshell.set_shown(a, page_node(k), false, 0)
         scene.node_set_padding(sc, page_node(k), 0, 0, 0, 0)
         k = k + 1
@@ -657,6 +718,7 @@ fn main(start: u64) -> i32 {
     scene.node_set_gap(app.app_scene(a), r, 0, 0)
     scene.node_set_padding(app.app_scene(a), r, 0, 0, 0, 0)
     jtheme.install_rules(a)
+    scene.node_add_class(app.app_scene(a), r, jtheme.K_PAGEBG)
     jsetui.install_rules(a)
     screen_sidebar.sidebar_install_rules(a)
     jshell.apply_theme()

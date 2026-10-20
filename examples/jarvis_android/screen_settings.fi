@@ -17,8 +17,9 @@ import jpush
 import jtexts
 import net.jarvisc
 import net.jarvisapi
+import screen_chat
 
-export { screen_settings_build, screen_settings_refresh }
+export { screen_settings_build, screen_settings_refresh, screen_settings_api }
 
 static mut G_THEME: usize = 0
 static mut G_UPD_ST: usize = 0
@@ -30,10 +31,24 @@ static mut G_NOTE: [usize; 8] = [0; 8] // line 0: heading, 1..7: the release not
 static mut G_CHAN: usize = 0
 static mut G_PUSH: usize = 0
 static mut G_INSTALL: usize = 0
+static mut G_ADMIN_BTN: usize = 0 // Settings > Admin: only after /api/m/me said admin
 static mut G_ME_N: u64 = 0
+static mut G_MODEL_B: usize = 0
+static mut G_EFFORT_B: usize = 0
+static mut G_PERSONA_B: usize = 0
+static mut G_SW: [usize; 5] = [0; 5]
+static mut G_FLAGS: u32 = 0
+static mut G_PERS: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_PERSONAS: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_SET_N: u64 = 0
+static mut G_SET_OK: bool = false
+static mut G_SET_NOTE: usize = 0 // hint line of the switches card: the settings route is missing (older server) or a change was not stored
+static mut G_SET_FAIL: i64 = 0 // HTTP status of the last failed settings request, 0 = fine
+static mut G_SET_FAIL_GET: bool = false
 
 // Advanced: the server address is not a setting for people. This opens the sign-in page with the developer panel.
 fn on_advanced(a: *mut app.App) { jshell.request_dev() }
+fn on_admin(a: *mut app.App) { jshell.admin_open() }
 
 fn theme_label(a: *mut app.App) {
     let m: str = jshell.theme_mode()
@@ -195,8 +210,207 @@ fn show_notes(a: *mut app.App, s: *mut update.Status) {
     }
 }
 
+// ---------------------------------------------------------------- model, persona, switches (GET/POST /api/settings)
+
+fn sw_name(i: usize) -> str {
+    if i == 0 { return "autoConfirm" }
+    if i == 1 { return "deepMode" }
+    if i == 2 { return "expMode" }
+    if i == 3 { return "learnMode" }
+    return "planMode"
+}
+
+fn sw_label(i: usize) -> str {
+    if i == 0 { return jtexts.t("set.sw-auto") }
+    if i == 1 { return jtexts.t("set.sw-deep") }
+    if i == 2 { return jtexts.t("set.sw-exp") }
+    if i == 3 { return jtexts.t("set.sw-learn") }
+    return jtexts.t("set.sw-plan")
+}
+
+fn sw_toggle(a: *mut app.App, i: usize) {
+    if !G_SET_OK { return }
+    let bit: u32 = (1 as u32) << (i as u32)
+    let on: bool = (G_FLAGS & bit) == (0 as u32)
+    if on { G_FLAGS = G_FLAGS | bit } else { G_FLAGS = G_FLAGS & ~bit }
+    let ok: bool = jarvisapi.ja_settings_set_bool(jshell.api(), sw_name(i), on)
+    show_settings(a)
+}
+fn on_sw0(a: *mut app.App) { sw_toggle(a, 0) }
+fn on_sw1(a: *mut app.App) { sw_toggle(a, 1) }
+fn on_sw2(a: *mut app.App) { sw_toggle(a, 2) }
+fn on_sw3(a: *mut app.App) { sw_toggle(a, 3) }
+fn on_sw4(a: *mut app.App) { sw_toggle(a, 4) }
+
+fn on_model_next(a: *mut app.App) { screen_chat.screen_chat_cycle_model(a) }
+fn on_effort_next(a: *mut app.App) { screen_chat.screen_chat_cycle_effort(a) }
+
+// persona ids: jarvis, normal, then the user's personas ("id\x01name\n" lines)
+fn persona_count() -> usize {
+    var n: usize = 2
+    var i: usize = 0
+    while i < G_PERSONAS.len {
+        if rt.ld8(G_PERSONAS.ptr, i) == 10 as u8 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// field f (0 = id, 1 = name) of persona k (k >= 2 -> custom line k-2)
+fn persona_field(k: usize, f: usize) -> str {
+    if k == 0 { if f == 0 { return "jarvis" } else { return jtexts.t("set.persona-jarvis") } }
+    if k == 1 { if f == 0 { return "normal" } else { return jtexts.t("set.persona-normal") } }
+    var line: usize = 0
+    var st: usize = 0
+    var i: usize = 0
+    while i < G_PERSONAS.len {
+        if rt.ld8(G_PERSONAS.ptr, i) == 10 as u8 {
+            if line == k - 2 {
+                var sep: usize = st
+                while sep < i && rt.ld8(G_PERSONAS.ptr, sep) != 1 as u8 { sep = sep + 1 }
+                if f == 0 { return str { p: ((G_PERSONAS.ptr) + st as u64) as *mut u8, n: sep - st } }
+                if sep < i { return str { p: ((G_PERSONAS.ptr) + (sep + 1) as u64) as *mut u8, n: i - sep - 1 } }
+                return ""
+            }
+            line = line + 1
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn persona_cur() -> usize {
+    let n: usize = persona_count()
+    var k: usize = 0
+    while k < n {
+        let id: str = persona_field(k, 0)
+        if G_PERS.len == id.n && id.n > 0 && rt.mem_eq(G_PERS.ptr, id.p as u64, id.n) { return k }
+        k = k + 1
+    }
+    return 0
+}
+
+fn on_persona_next(a: *mut app.App) {
+    if !G_SET_OK { return }
+    let n: usize = persona_count()
+    let nx: usize = (persona_cur() + 1) % n
+    let id: str = __str_copy(persona_field(nx, 0))
+    rt.buf_clear(&G_PERS)
+    rt.buf_push_bytes(&G_PERS, id.p as u64, id.n)
+    let ok: bool = jarvisapi.ja_settings_set_str(jshell.api(), "personality", id)
+    show_settings(a)
+}
+
+fn show_settings(a: *mut app.App) {
+    var i: usize = 0
+    while i < 5 {
+        let bit: u32 = (1 as u32) << (i as u32)
+        var st: str = jtexts.t("set.sw-off")
+        if (G_FLAGS & bit) != (0 as u32) { st = jtexts.t("set.sw-on") }
+        if !G_SET_OK { st = "..." } // a49: not loaded yet (the server answers in 2-5 s): a placeholder, never an empty pill
+        app.set_text(a, G_SW[i], sw_label(i) + ": " + st)
+        i = i + 1
+    }
+    app.set_text(a, G_PERSONA_B, jtexts.t1("set.persona-btn", "name", persona_field(persona_cur(), 1)))
+}
+
+// a49: older server (404) or a failed write: say it instead of dead switches
+fn show_set_note(a: *mut app.App) {
+    if G_SET_NOTE == 0 { return }
+    if G_SET_FAIL == 0 {
+        jshell.set_shown(a, G_SET_NOTE, false, 0)
+        return
+    }
+    if G_SET_FAIL_GET {
+        app.set_text(a, G_SET_NOTE, jtexts.t1("set.unavail", "code", jshell.dec(G_SET_FAIL)))
+    } else {
+        app.set_text(a, G_SET_NOTE, jtexts.t1("set.notsaved", "code", jshell.dec(G_SET_FAIL)))
+    }
+    jshell.set_shown(a, G_SET_NOTE, true, 0)
+}
+
+fn show_model(a: *mut app.App) {
+    let m: str = screen_chat.screen_chat_cur_model()
+    let e: str = screen_chat.screen_chat_cur_effort()
+    if m.n == 0 {
+        app.set_text(a, G_MODEL_B, jtexts.t("set.model-none"))
+    } else {
+        app.set_text(a, G_MODEL_B, jtexts.t1("set.model-btn", "name", m))
+    }
+    jshell.set_shown(a, G_EFFORT_B, e.n > 0, 0)
+    if e.n > 0 { app.set_text(a, G_EFFORT_B, jtexts.t1("set.effort-btn", "name", e)) }
+}
+
+// true = ours
+fn screen_settings_api(x: *mut jarvisapi.Api, kind: u32, status: i64) -> bool {
+    if kind == jarvisapi.AK_ME {
+        return false // main.fi keeps the user name
+    }
+    if kind == jarvisapi.AK_SETTINGS || kind == jarvisapi.AK_SETTINGS_SET {
+        if status == 200 {
+            var f: u32 = 0 as u32
+            rt.buf_clear(&G_PERS)
+            rt.buf_clear(&G_PERSONAS)
+            if jarvisapi.parse_settings(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &f, &G_PERS, &G_PERSONAS) {
+                G_FLAGS = f
+                G_SET_OK = true
+                G_SET_FAIL = 0
+                show_settings(jshell.app_ui())
+            }
+        } else if status > 0 {
+            // 404 / 403 / 5xx: no crash, no dead silence -- a hint line says what is wrong
+            G_SET_FAIL = status
+            G_SET_FAIL_GET = kind == jarvisapi.AK_SETTINGS
+            if kind == jarvisapi.AK_SETTINGS_SET { G_SET_N = 0 } // not stored: read the real state again soon
+        }
+        show_set_note(jshell.app_ui())
+        return true
+    }
+    return false
+}
+
 fn screen_settings_build(a: *mut app.App) {
     jsetui.page(a)
+    // MODELL + PERSOENLICHKEIT
+    jsetui.card(a, jtexts.t("set.model"))
+    jsetui.chip_row(a)
+    G_MODEL_B = app.button(a, jtexts.t("set.model-none"), on_model_next)
+    jtheme.style_node(a, G_MODEL_B, jtheme.K_CHIP)
+    G_EFFORT_B = app.button(a, "", on_effort_next)
+    jtheme.style_node(a, G_EFFORT_B, jtheme.K_CHIP)
+    app.end(a)
+    app.end(a)
+    jsetui.card(a, jtexts.t("set.persona"))
+    jsetui.chip_row(a)
+    G_PERSONA_B = app.button(a, jtexts.t1("set.persona-btn", "name", "-"), on_persona_next)
+    jtheme.style_node(a, G_PERSONA_B, jtheme.K_CHIP)
+    app.end(a)
+    app.end(a)
+    // SCHALTER
+    jsetui.card(a, jtexts.t("set.switches"))
+    G_SET_NOTE = app.label(a, "", 0)
+    jtheme.style_node(a, G_SET_NOTE, jsetui.K_SET_ERR)
+    applay.align_start(a, G_SET_NOTE)
+    jshell.set_shown(a, G_SET_NOTE, false, 0)
+    jsetui.chip_row(a)
+    G_SW[0] = app.button(a, "", on_sw0)
+    G_SW[1] = app.button(a, "", on_sw1)
+    app.end(a)
+    jsetui.chip_row(a)
+    G_SW[2] = app.button(a, "", on_sw2)
+    G_SW[3] = app.button(a, "", on_sw3)
+    app.end(a)
+    jsetui.chip_row(a)
+    G_SW[4] = app.button(a, "", on_sw4)
+    app.end(a)
+    var q: usize = 0
+    while q < 5 {
+        jtheme.style_node(a, G_SW[q], jtheme.K_CHIP)
+        q = q + 1
+    }
+    show_settings(a) // labels from the start, so the chips keep their size when the real state arrives (no relayout)
+    app.end(a)
     // ERSCHEINUNGSBILD
     jsetui.card(a, jtexts.t("set.look"))
     G_THEME = jsetui.row(a, jtexts.t("set.look-theme"))
@@ -240,6 +454,9 @@ fn screen_settings_build(a: *mut app.App) {
     jsetui.chip_row(a)
     jtheme.style_node(a, app.button(a, jtexts.t("set.logout"), on_logout), jtheme.K_CHIP)
     jtheme.style_node(a, app.button(a, jtexts.t("settings.advanced"), on_advanced), jtheme.K_CHIP)
+    G_ADMIN_BTN = app.button(a, jtexts.t("adm.open"), on_admin)
+    jtheme.style_node(a, G_ADMIN_BTN, jtheme.K_CHIP)
+    jshell.set_shown(a, G_ADMIN_BTN, false, 0)
     app.end(a)
     app.end(a)
     // APP
@@ -262,9 +479,16 @@ fn screen_settings_refresh(a: *mut app.App) {
         if G_ME_N % 8 == 1 { let m: bool = jarvisapi.ja_me(jshell.api()) }
     }
     show_notes(a, s)
+    show_model(a)
+    G_SET_N = G_SET_N + 1
+    if G_SET_N % 40 == 1 {
+        let g: bool = jarvisapi.ja_settings_get(jshell.api())
+        if G_SET_N == 1 { let m2: bool = jarvisapi.ja_me(jshell.api()) }
+    }
     let nx: str = next_channel(update.status_channels(s), appinfo.app_channel())
     jshell.set_shown(a, G_CHAN, nx.n > 0, 0)
     if nx.n > 0 { app.set_text(a, G_CHAN, jtexts.t1("set.channel-btn", "name", channel_title(nx))) }
     app.set_text(a, G_PUSH, jpush.state_text())
+    jshell.set_shown(a, G_ADMIN_BTN, jshell.is_admin(), 0)
     jshell.set_shown(a, G_INSTALL, (*s).phase == update.PH_AVAILABLE || (*s).phase == update.PH_READY, 0)
 }

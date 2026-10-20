@@ -68,7 +68,7 @@ import fui.textbuf
 
 export {
     ime_activity, ime_attach, ime_sync, ime_serve, ime_status,
-    ime_available, IME_CMD, IME_CHANGED, IME_ENTER,
+    ime_available, ime_restart, IME_CMD, IME_CHANGED, IME_ENTER,
 }
 
 // The command octet that wakes the app thread (activity.CMD_IME).
@@ -100,10 +100,21 @@ const O_SYNC_SA: u64 = 120 // what the app thread tells the keyboard
 const O_SYNC_SB: u64 = 128
 const O_SYNC_CA: u64 = 136
 const O_SYNC_CB: u64 = 144
+const O_QH: u64 = 152 // write queue: entries the keyboard thread has posted (only it writes)
+const O_QT: u64 = 160 // write queue: entries the app thread has served (only it writes)
 const O_REQ_TEXT: u64 = 256 // TXT_CAP units
 const O_RES_TEXT: u64 = 16640 // TXT_CAP units
 const O_SCRATCH: u64 = 33024 // SCRATCH_CAP octets (UTF-8 of a request)
 const O_TEXT16: u64 = 57600 // TEXT16_CAP units: the whole field as UTF-16
+// THE WRITE QUEUE. Edits (commit, composing text, delete, key, selection) are posted here and answered `true` AT ONCE; the app thread
+// serves them in order before anything else. The old way waited for each edit (REQUEST_WAIT_US) and DROPPED it on a timeout: a
+// busy app thread (a slow frame) lost the last edit, and because composing text is cumulative only the LAST one stayed lost
+// ('hell' instead of 'hello'). Reads (text before the caret ...) stay synchronous and are served after the queue.
+const Q_BASE: u64 = 92160
+const Q_STRIDE: u64 = 640 // +0 op, +8 a, +16 b, +24 c, +32 units, +64 text
+const Q_TEXT: u64 = 64
+const Q_N: u64 = 16
+const Q_TEXT_CAP: usize = 256 // units; a longer text takes the synchronous path
 const TXT_CAP: usize = 8192
 const SCRATCH_CAP: usize = 24576
 const TEXT16_CAP: usize = 16384
@@ -130,6 +141,7 @@ const OP_INFO: u64 = 16
 const MP_SHOW: u8 = 1
 const MP_HIDE: u8 = 2
 const MP_SYNC: u8 = 3
+const MP_RESTART: u8 = 4
 
 // Android numbers.
 const TYPE_CLASS_TEXT: i32 = 1
@@ -142,7 +154,7 @@ const IME_FLAG_NO_EXTRACT_UI: i32 = 268435456
 const META_SHIFT_ON: i32 = 1
 const META_SHIFT_LEFT_ON: i32 = 64
 const META_SHIFT_RIGHT_ON: i32 = 128
-const REQUEST_WAIT_US: i64 = 400000
+const REQUEST_WAIT_US: i64 = 2000000 // a read waits this long for the app thread (was 0.4 s: a slow frame took longer)
 
 // ---------------------------------------------------------------- state
 static mut G_IM: u64 = 0
@@ -382,6 +394,8 @@ fn run_main(op: u8) {
         main_hide()
     } else if op == MP_SYNC {
         main_sync()
+    } else if op == MP_RESTART {
+        main_restart()
     }
 }
 
@@ -441,6 +455,17 @@ fn main_sync() {
     args[3] = int_arg(ldi(O_SYNC_CA))
     args[4] = int_arg(ldi(O_SYNC_CB))
     let u: bool = jnicall.j_void(G_ENV, G_IMM, G_M_UPDATE, (&args[0]) as u64)
+}
+
+// The keyboard starts the input again: it forgets its copy of the text and its composing word and asks for the field anew.
+#[no_gc]
+fn main_restart() {
+    if G_STATE != 1 {
+        return
+    }
+    var args: [u64; 2] = [0; 2]
+    args[0] = G_VIEW
+    let r: bool = jnicall.j_void(G_ENV, G_IMM, G_M_RESTART, (&args[0]) as u64)
 }
 
 // A jvalue for an int: the low 32 bits, the rest zero.
@@ -514,6 +539,8 @@ const S_CAPSMODE: str = "initialCapsMode\0"
 const S_MSG_START: str = "ime: building the classes\0"
 const S_MSG_FAIL: str = "ime: build failed\0"
 const S_MSG_NOAVAIL: str = "ime: not available\0"
+const S_MSG_TIMEOUT: str = "ime: request timed out (app thread busy)\0"
+const S_MSG_LATE: str = "ime: edits served behind the app thread (queued)\0"
 const S_MSG_READY: str = "ime: ready\0"
 
 // The chain, step for step. All on the main thread. False = it broke
@@ -920,6 +947,34 @@ fn make_view() -> bool {
 // THE NATIVE METHODS (main thread, called by the keyboard)
 // ================================================================
 
+// An edit that needs no answer: queued, `true` at once. Texts above Q_TEXT_CAP, a full queue and a missing field use the
+// synchronous way (rpc) -- it serves the queue first, so the order stays.
+#[no_gc]
+fn post(op: u64, a: i64, b: i64, c: i64, nreq: usize) -> bool {
+    if G_IM == 0 || ld_sync(O_ATTACHED) == 0 {
+        return false
+    }
+    let qh: u64 = ld(O_QH)
+    if nreq > Q_TEXT_CAP || qh - ld_sync(O_QT) >= Q_N {
+        return rpc(op, a, b, c, 0, nreq)
+    }
+    let base: u64 = Q_BASE + (qh % Q_N) * Q_STRIDE
+    st(base, op)
+    sti(base + 8, a)
+    sti(base + 16, b)
+    sti(base + 24, c)
+    st(base + 32, nreq as u64)
+    var i: usize = 0
+    while i < nreq {
+        u16_put(base + Q_TEXT, i, u16_at(O_REQ_TEXT, i))
+        i = i + 1
+    }
+    // the entry is complete before the new head goes out (barrier)
+    __atomic_add((G_IM + O_QH) as *mut u64, 1)
+    wake_app()
+    return true
+}
+
 // One request to the app thread and its answer. false = no field, no
 // answer in time, or the app thread said no.
 #[no_gc]
@@ -946,6 +1001,7 @@ fn rpc(op: u64, a: i64, b: i64, c: i64, d: i64, nreq: usize) -> bool {
         if waited > REQUEST_WAIT_US {
             // give up; the app thread, if it comes later, finds nothing
             st(O_DONE, seq)
+            say(S_MSG_TIMEOUT.p as u64)
             return false
         }
     }
@@ -1053,28 +1109,28 @@ fn n_ocic(env: u64, this: u64, ei: u64) -> u64 {
 #[no_gc]
 fn n_commit(env: u64, this: u64, cs: u64, pos: i32) -> i32 {
     let n: usize = cs_to_req(env, cs)
-    return b2i(rpc(OP_COMMIT, pos as i64, 0, 0, 0, n))
+    return b2i(post(OP_COMMIT, pos as i64, 0, 0, n))
 }
 
 #[no_gc]
 fn n_setcomp(env: u64, this: u64, cs: u64, pos: i32) -> i32 {
     let n: usize = cs_to_req(env, cs)
-    return b2i(rpc(OP_SETCOMP, pos as i64, 0, 0, 0, n))
+    return b2i(post(OP_SETCOMP, pos as i64, 0, 0, n))
 }
 
 #[no_gc]
 fn n_fincomp(env: u64, this: u64) -> i32 {
-    return b2i(rpc(OP_FINISH, 0, 0, 0, 0, 0))
+    return b2i(post(OP_FINISH, 0, 0, 0, 0))
 }
 
 #[no_gc]
 fn n_delsur(env: u64, this: u64, before: i32, after: i32) -> i32 {
-    return b2i(rpc(OP_DELSUR, before as i64, after as i64, 0, 0, 0))
+    return b2i(post(OP_DELSUR, before as i64, after as i64, 0, 0))
 }
 
 #[no_gc]
 fn n_delcp(env: u64, this: u64, before: i32, after: i32) -> i32 {
-    return b2i(rpc(OP_DELCP, before as i64, after as i64, 0, 0, 0))
+    return b2i(post(OP_DELCP, before as i64, after as i64, 0, 0))
 }
 
 // A KeyEvent from the keyboard (Backspace, Enter, arrows, a character).
@@ -1101,7 +1157,7 @@ fn n_sendkey(env: u64, this: u64, ev: u64) -> i32 {
     || (meta & META_SHIFT_RIGHT_ON) != 0 {
         shift = 1
     }
-    return b2i(rpc(OP_KEY, code as i64, uni as i64, shift, 0, 0))
+    return b2i(post(OP_KEY, code as i64, uni as i64, shift, 0))
 }
 
 // The surroundings. The answer is at most TXT_CAP units.
@@ -1136,17 +1192,17 @@ fn n_caps(env: u64, this: u64, modes: i32) -> i32 {
 
 #[no_gc]
 fn n_action(env: u64, this: u64, action: i32) -> i32 {
-    return b2i(rpc(OP_ACTION, action as i64, 0, 0, 0, 0))
+    return b2i(post(OP_ACTION, action as i64, 0, 0, 0))
 }
 
 #[no_gc]
 fn n_setsel(env: u64, this: u64, a: i32, b: i32) -> i32 {
-    return b2i(rpc(OP_SETSEL, a as i64, b as i64, 0, 0, 0))
+    return b2i(post(OP_SETSEL, a as i64, b as i64, 0, 0))
 }
 
 #[no_gc]
 fn n_setreg(env: u64, this: u64, a: i32, b: i32) -> i32 {
-    return b2i(rpc(OP_SETREG, a as i64, b as i64, 0, 0, 0))
+    return b2i(post(OP_SETREG, a as i64, b as i64, 0, 0))
 }
 
 // replaceText(start, end, text, newCursorPosition, attribute) (API 34)
@@ -1154,7 +1210,7 @@ fn n_setreg(env: u64, this: u64, a: i32, b: i32) -> i32 {
 fn n_replace(env: u64, this: u64, a: i32, b: i32, cs: u64, pos: i32,
     attr: u64) -> i32 {
     let n: usize = cs_to_req(env, cs)
-    return b2i(rpc(OP_REPLACE, a as i64, b as i64, pos as i64, 0, n))
+    return b2i(post(OP_REPLACE, a as i64, b as i64, pos as i64, n))
 }
 
 // getSurroundingText(before, after, flags): a SurroundingText (API 31).
@@ -1218,6 +1274,10 @@ fn ime_attach(on: bool, tb: u64, secret: bool) -> bool {
         }
         return false
     }
+    if G_TB != 0 {
+        // edits the keyboard posted for the old field land there, not in the new one (or nowhere)
+        let pend: u32 = ime_serve()
+    }
     if on {
         G_TB = tb
         var k: u64 = 0
@@ -1238,6 +1298,20 @@ fn ime_attach(on: bool, tb: u64, secret: bool) -> bool {
         post_main(MP_HIDE)
     }
     return true
+}
+
+// The program replaced or cleared the text of the field on its own (message sent, other chat): the keyboard's copy of it and its
+// composing word are stale and would come back ('Ot' in an empty field). Edits posted before this call belong to the old text and
+// are dropped; then the keyboard restarts its input on the current (empty) text.
+#[no_gc]
+fn ime_restart() {
+    if !ime_available() || G_TB == 0 || G_IM == 0 {
+        return
+    }
+    st(O_QT, ld_sync(O_QH))
+    G_SIG = signature(G_TB)
+    publish_sync(G_TB)
+    post_main(MP_RESTART)
 }
 
 // Once per turn of the loop while a field has the input. Serves what the
@@ -1308,28 +1382,46 @@ fn ime_serve() -> u32 {
     if G_IM == 0 {
         return 0
     }
+    var all: u32 = 0
+    // 1. the posted edits, in order (a detached field drops them)
+    var served: u64 = 0
+    while ld_sync(O_QT) != ld_sync(O_QH) {
+        let base: u64 = Q_BASE + (ld(O_QT) % Q_N) * Q_STRIDE
+        if G_TB != 0 {
+            var fq: u32 = 0
+            let okq: bool = serve_op(ld(base), ldi(base + 8), ldi(base + 16), ldi(base + 24), ld(base + 32) as usize,
+                base + Q_TEXT, &fq)
+            all = all | fq
+        }
+        __atomic_add((G_IM + O_QT) as *mut u64, 1)
+        served = served + 1
+    }
+    if served > 1 {
+        say(S_MSG_LATE.p as u64)
+    }
+    // 2. the request the keyboard waits for
     let seq: u64 = ld_sync(O_SEQ)
-    if seq == ld_sync(O_DONE) {
-        return 0
-    }
-    var flags: u32 = 0
-    var ok: bool = false
-    st(O_RES_OK, 0)
-    if G_TB != 0 {
-        ok = serve_op(ld(O_OP), &flags)
-    }
-    if ok {
-        st(O_RES_OK, 1)
+    if seq != ld_sync(O_DONE) {
+        var flags: u32 = 0
+        var ok: bool = false
+        st(O_RES_OK, 0)
+        if G_TB != 0 {
+            ok = serve_op(ld(O_OP), ldi(O_A), ldi(O_B), ldi(O_C), ld(O_REQ_N) as usize, O_REQ_TEXT, &flags)
+        }
+        if ok {
+            st(O_RES_OK, 1)
+        }
+        // the answer goes out through a barrier
+        st(O_DONE, seq)
+        ld_sync(O_DONE)
+        all = all | flags
     }
     if G_TB != 0 {
         // the keyboard knows what it did: no sync message for it
         G_SIG = signature(G_TB)
     }
-    // the answer goes out through a barrier
-    st(O_DONE, seq)
-    ld_sync(O_DONE)
-    G_FLAGS = G_FLAGS | flags
-    return flags
+    G_FLAGS = G_FLAGS | all
+    return all
 }
 
 // ------------------------------------------------ UTF-16 <-> the TextBuf
@@ -1469,17 +1561,13 @@ fn slice_res(t: *mut textbuf.TextBuf, from: usize, to: usize) {
 
 // The request. true = done (the keyboard hears "true").
 #[no_gc]
-fn serve_op(op: u64, flags: *mut u32) -> bool {
+fn serve_op(op: u64, a: i64, b: i64, c: i64, nreq: usize, toff: u64, flags: *mut u32) -> bool {
     let t: *mut textbuf.TextBuf = G_TB as *mut textbuf.TextBuf
-    let a: i64 = ldi(O_A)
-    let b: i64 = ldi(O_B)
-    let c: i64 = ldi(O_C)
-    let nreq: usize = ld(O_REQ_N) as usize
     if op == OP_COMMIT || op == OP_SETCOMP {
         var x: usize = 0
         var y: usize = 0
         target(t, &x, &y)
-        let k: usize = encode_units(O_REQ_TEXT, nreq)
+        let k: usize = encode_units(toff, nreq)
         if !textbuf.tb_replace(t, x, y, G_IM + O_SCRATCH, k) {
             return false
         }
@@ -1507,7 +1595,7 @@ fn serve_op(op: u64, flags: *mut u32) -> bool {
         }
         let x: usize = byte_of(t, s)
         let y: usize = byte_of(t, e)
-        let k: usize = encode_units(O_REQ_TEXT, nreq)
+        let k: usize = encode_units(toff, nreq)
         if !textbuf.tb_replace(t, x, y, G_IM + O_SCRATCH, k) {
             return false
         }

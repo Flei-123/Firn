@@ -10,6 +10,7 @@
 // NEEDS: the server has no "all open needs" route on today's main (A2 adds /api/m/needs). The aggregate is built from
 // /api/projects (needs counter) + /api/projects/<id> for every project with open needs, one after the other, into a second
 // pool that replaces the shown one when the cycle ends (no flicker). Switching to /api/m/* later = `ja_set_path` calls in `api()`.
+import fui.looppump
 import std.rt
 import std.vec
 import std.time
@@ -26,8 +27,8 @@ import jshell
 import jtexts
 
 export {
-    Ref, NeedRec, api, ensure, refresh_projects, refresh_center, refresh_tasks, refresh_devices, load_chat,
-    refresh_convs, convs, has_convs, ver_convs,
+    Ref, NeedRec, api, ensure, refresh_projects, refresh_center, refresh_tasks, refresh_devices, preload_devices, load_chat,
+    refresh_convs, preload_convs, convs, has_convs, ver_convs, invalidate_all,
     answer_need, task_add, task_complete, task_remove, forget_all,
     ver_projects, ver_needs, ver_center, ver_tasks, ver_devices, ver_conv, ver_stand,
     projects, has_projects, center, has_center, tasks, has_tasks, devices, has_devices, conv, has_conv, conv_cid,
@@ -37,6 +38,8 @@ export {
 }
 
 const REFRESH_MS: i64 = 15000
+// a48: what the Boss watches live (workers/board, chat list, projects) is asked every 5 s while its screen is up; the rest every 15 s
+const LIVE_MS: i64 = 5000
 const PROBE_RETRY_MS: i64 = 300000 // an older server is asked again after 5 min (it may have been restarted since)
 const PROBE_LOST_MS: i64 = 5000 // no connection: ask again soon
 const NEED_OPTS: usize = 4
@@ -116,6 +119,7 @@ static mut G_WHY_LAYER: [i64; 7] = [0; 7] // ahttp.NL_* of the last failure
 static mut G_WHY_TLS: [i64; 7] = [0; 7]
 static mut G_WHY_VER: [i64; 7] = [0; 7]
 static mut G_WHY_MS: [i64; 7] = [0; 7]
+static mut G_PRIO: i64 = 0 // bit per slot: the screen shown now asks for it -> it goes out before the others (pump)
 static mut G_WANT: i64 = 0 // bit per slot: a GET is wanted and waits for a free place (pump)
 static mut G_FLIGHT: i64 = 0 // requests of the jdata client on the wire
 static mut G_PING_AT: i64 = 0 // when the last /api/m/ping went out
@@ -359,6 +363,7 @@ fn lag_tick(l: *mut loop.Loop, ud: u64) {
     if G_LAG_N % 50 == 0 && G_LAG_N <= 1200 {
         log.log_info("lag", "loop alive: rounds " + jshell.dec(loop.stat_rounds(l) as i64) + " events " + jshell.dec(loop.stat_events(l) as i64) + " timers " + jshell.dec(loop.stat_timers(l) as i64))
     }
+    looppump.quiet_done() // a56: a watchdog edits nothing, it must not repaint the window
 }
 
 fn ensure_init() {
@@ -381,6 +386,7 @@ fn ensure_init() {
     let a: *mut jarvisapi.Api = jarvisapi.ja_new(jshell.loop_of(), on_api, 0)
     jarvisapi.ja_set_cache(a, G_CACHE as *mut jarvis_cache.Cache)
     jarvisapi.ja_set_timeout(a, NET_TIMEOUT_MS)
+    preload_convs_with(a) // a53: the last stored chat list is shown at once (stale-while-revalidate)
     var sd: rt.Buf = rt.buf_new()
     if platform.plat_dir(platform.DIR_STATE, appinfo.app_id(), appinfo.app_vendor(), &sd) {
         rt.buf_push_bytes(&G_NETLOG_PATH, sd.ptr, sd.len)
@@ -626,9 +632,23 @@ fn take_conv(p: u64, n: usize) {
 // of the slot numbers, and the first ones wait a moment for the /api/m/ping answer. A failed slot is asked again with a backoff.
 
 // the milliseconds until a slot may be asked again on its own (not forced)
+fn base_ms(slot: usize) -> i64 {
+    if slot == K_CENTER || slot == K_CONVS || slot == K_PROJECTS || slot == K_NEED { return LIVE_MS }
+    return REFRESH_MS
+}
+
+// a48: the app came back to the foreground (or a push arrived): every slot is due at the next screen tick
+fn invalidate_all() {
+    var k: usize = 0
+    while k < K_COUNT {
+        G_LAST[k] = 0
+        k = k + 1
+    }
+}
+
 fn interval(slot: usize) -> i64 {
     var f: i64 = G_FAILS[slot]
-    if f <= 0 { return REFRESH_MS }
+    if f <= 0 { return base_ms(slot) }
     var v: i64 = RETRY_FIRST_MS
     while f > 1 && v < REFRESH_MS {
         v = v * 2
@@ -694,12 +714,15 @@ fn pump() {
     if G_PROBING && time.now_unix_ms() - G_PING_AT < HOLD_PING_MS { return }
     while G_WANT != 0 && G_FLIGHT < MAX_FLIGHT {
         var slot: usize = 0
+        while slot < K_COUNT && (G_WANT & G_PRIO & (1 << slot as i64)) == 0 { slot = slot + 1 }
+        if slot >= K_COUNT { slot = 0 }
         while slot < K_COUNT && (G_WANT & (1 << slot as i64)) == 0 { slot = slot + 1 }
         if slot >= K_COUNT {
             G_WANT = 0
             return
         }
         G_WANT = G_WANT & (0 - 1 - (1 << slot as i64))
+        G_PRIO = G_PRIO & (0 - 1 - (1 << slot as i64))
         if !issue(slot) {
             G_CUR_LAYER = 0
             stand_note(slot, NET_NOT_SENT, 0 - 1)
@@ -725,13 +748,51 @@ fn refresh_tasks(force: bool) {
 
 // the chat list for the chat tab's drawer (newest 40)
 fn refresh_convs(force: bool) {
+    preload_convs()
     if !due(K_CONVS, force) { return }
     want(K_CONVS)
 }
 
+// a53 stale-while-revalidate: the last stored chat list (jarvis_cache, written by every good GET /api/m/chats; folders and favourites are in the same
+// body) is taken BEFORE the first network answer (status 204 = "from the store, refreshing"). The GET still goes out; a failed GET (timeout, 5xx, no
+// connection) never replaces the list, so the sidebar stays filled instead of going empty.
+fn preload_convs_with(ap: *mut jarvisapi.Api) {
+    if G_HAS_CONVS || G_STATUS[K_CONVS] != 0 { return }
+    var b: rt.Buf = rt.buf_new()
+    let age: i64 = jarvisapi.ja_cache_peek(ap, jarvisapi.AK_CONVS, "", &b)
+    if age >= 0 && b.len > 0 {
+        take_convs(b.ptr, b.len)
+        if G_HAS_CONVS {
+            G_STATUS[K_CONVS] = 204
+            G_AGE[K_CONVS] = age
+            G_V_STAND = G_V_STAND + 1 as u64
+        }
+    }
+    rt.buf_free(&b)
+}
+
+fn preload_convs() { preload_convs_with(api()) }
+
+// the Devices tab: the last stored list shows AT ONCE (status 204 = "from the store, refreshing"), the GET goes out first in the queue
 fn refresh_devices(force: bool) {
+    preload_devices()
     if !due(K_DEVICES, force) { return }
+    G_PRIO = G_PRIO | (1 << K_DEVICES as i64)
     want(K_DEVICES)
+}
+
+fn preload_devices() {
+    if G_HAS_DEV || G_STATUS[K_DEVICES] != 0 { return }
+    let ap: *mut jarvisapi.Api = api()
+    var b: rt.Buf = rt.buf_new()
+    let age: i64 = jarvisapi.ja_cache_peek(ap, jarvisapi.AK_DEVICES, "", &b)
+    if age >= 0 && b.len > 0 {
+        take_devices(b.ptr, b.len)
+        G_STATUS[K_DEVICES] = 204
+        G_AGE[K_DEVICES] = age
+        G_V_STAND = G_V_STAND + 1 as u64
+    }
+    rt.buf_free(&b)
 }
 
 // the last 30 turns of a chat (a worker chat too)
@@ -815,6 +876,7 @@ fn stand_text(slot: usize) -> str {
     // 0 = no answer yet: "Loading" (a request that is only on its way is NOT a lost connection); a failure is G_FAILED
     if st == 0 && G_FAILED[slot] == 0 { return jtexts.t("ls.loading") }
     if st == 200 { return jtexts.t("ls.live") }
+    if st == 204 { return jtexts.t("ls.refreshing") }
     if st == 203 {
         let age: i64 = G_AGE[slot]
         var ago: str = jtexts.t1("ls.off-d", "value", jshell.dec(age / 86400))

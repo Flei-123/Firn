@@ -45,6 +45,18 @@ seq = 0
 CONV["c1"] = [{"role": "user", "text": "hi", "at": "2026-10-17T18:00:00Z"}, {"role": "assistant", "text": "hello\n>STATUS: status=done", "at": "2026-10-17T18:00:05Z"}]
 
 CONV["c2"] = [{"role": "user", "text": "second question", "at": "2026-10-17T19:00:00Z"}, {"role": "assistant", "text": "second answer\n>STATUS: status=done", "at": "2026-10-17T19:00:05Z"}]
+if os.environ.get("FAKE_TOOLS") == "1":  # c1 history with tool steps (ok, failed, long output, no output stored)
+    _long = "\n".join("line %d of a long output" % k for k in range(1, 31))
+    CONV["c1"][1:1] = [
+        {"role": "assistant", "text": "Ich schaue kurz nach.", "at": 1760000000400},
+        {"role": "tool", "text": "mcp__jarvis__run_parallel", "input": {"commands": ["ls /root", "df -h"]}, "result": {"ok": True, "text": _long, "images": []}, "at": 1760000000450},
+        {"role": "tool", "text": "mcp__jarvis__read_file", "input": {"path": "/root/jarvis/server.js"}, "result": {"ok": True, "text": "import express from 'express'\nconst app = express()\napp.listen(3000)", "images": []}, "at": 1760000000500},
+        {"role": "assistant", "text": "Die Datei ist da, ich pruefe noch den Rest.", "at": 1760000000550},
+        {"role": "tool", "text": "mcp__jarvis__run_shell", "input": {"command": "cat /nonexistent/file"}, "result": {"ok": False, "text": "cat: /nonexistent/file: No such file or directory", "images": []}, "at": 1760000000600},
+                {"role": "tool", "text": "mcp__jarvis__list_devices", "input": {}, "at": 1760000000800},
+    ]
+    CONV["s1"] = CONV["c1"]  # the first chat of the FAKE_SIDEBAR list
+    CONV["s2"] = CONV["c1"]
 
 
 # ------------------------------------------------------------------ realistic data (shapes of the real server)
@@ -118,12 +130,21 @@ def sidebar_chats():
             row("s8", "Diplomarbeit", 100 * h), row("s9", "Anzug-KI", 24 * 20 * h), row("s10", "Russisch", 24 * 90 * h),
             row("w1", "Daidalos: Render", 6 * h, True, "worker", True)]
 
+ADMIN_LIMITS = {"maxSubworkers": 5, "heavySlots": 8, "autoLoop": True}
+# user settings (A50): GET/POST /api/settings (switches + persona)
+SETTINGS = {"personality": "jarvis", "personas": [{"id": "p_demo", "name": "Bro", "base": "jarvis"}], "autoConfirm": True, "deepMode": True, "expMode": False, "learnMode": False, "planMode": False}
+# folders (A48): FAKE_FOLDERS=1 starts with two folders and puts s1/s3/s5 in them; POST /api/m/folders/(add|rename|remove), /api/m/chats/move
+FOLDERS = [{"id": "f_work", "name": "Work", "order": 0}, {"id": "f_priv", "name": "Privat", "order": 1}] if os.environ.get("FAKE_FOLDERS") == "1" else []
+CHAT_FOLDER = {"s1": "f_work", "s3": "f_work", "s5": "f_priv"} if os.environ.get("FAKE_FOLDERS") == "1" else {}
+CHAT_FAV = {}  # POST /api/m/chats/move {fav}: id -> bool
+FOLDER_SEQ = [0]
+
 RENAMED = {}   # POST /api/m/chats/rename: id -> new title (FAKE_NO_CHAT_OPS=1: an older server, 404)
 REMOVED = set()  # POST /api/m/chats/remove
 
 def all_chats():
     rows = all_chats_raw()
-    return [dict(c, title=RENAMED.get(c["id"], c["title"])) for c in rows if c["id"] not in REMOVED]
+    return [dict(c, title=RENAMED.get(c["id"], c["title"]), folder=CHAT_FOLDER.get(c["id"], ""), fav=CHAT_FAV.get(c["id"], c.get("fav", False))) for c in rows if c["id"] not in REMOVED]
 
 def all_chats_raw():
     if os.environ.get("FAKE_SIDEBAR") == "1":
@@ -147,8 +168,22 @@ def gen_messages(cid):
         if role == "assistant":
             txt += "\n>STATUS: status=done braucht_nutzer=\"\" naechster_schritt=\"ä\"" 
         m = {"role": role, "text": txt, "at": 1760000000000 + i * 1000}
-        if i == 3: m["images"] = [{"url": "/file/u1/%s/img.png" % cid}]
+        if i == 3: m["images"] = [{"url": "/img/u1/%s/pic.png" % cid}]
+        if i == 5: m["files"] = [{"name": "report.txt", "mime": "text/plain", "size": 2048, "url": "/file/u1/%s/report.txt" % cid}]
         msgs.append(m)
+    if os.environ.get("FAKE_TOOLS") == "1" and len(msgs) >= 2:
+        # tool steps before the last answer: ok, failed, long output (the app's collapsible step groups)
+        long_out = "\n".join("line %d of a long output" % k for k in range(1, 31))
+        steps = [
+            {"role": "tool", "text": "mcp__jarvis__read_file", "input": {"path": "/root/jarvis/server.js"},
+             "result": {"ok": True, "text": "import express from 'express'\nconst app = express()\napp.listen(3000)", "images": []}, "at": 1760000000500},
+            {"role": "tool", "text": "mcp__jarvis__run_shell", "input": {"command": "cat /nonexistent/file"},
+             "result": {"ok": False, "text": "cat: /nonexistent/file: No such file or directory", "images": []}, "at": 1760000000600},
+            {"role": "tool", "text": "mcp__jarvis__run_parallel", "input": {"commands": ["ls /root", "df -h"]},
+             "result": {"ok": True, "text": long_out, "images": []}, "at": 1760000000700},
+            {"role": "tool", "text": "mcp__jarvis__list_devices", "input": {}, "at": 1760000000800},
+        ]
+        msgs[-1:-1] = steps
     return msgs
 
 def real_info(conn_no):
@@ -260,9 +295,9 @@ def rest(method, rawpath, hdr, body):
     path = u.path
     q = parse_qs(u.query)
     if not (path in ("/api/me", "/api/projects", "/api/command-center", "/api/conversations", "/api/tasks",
-                     "/api/remote/devices", "/api/push-token", "/api/stt", "/api/m/upload")
+                     "/api/remote/devices", "/api/settings", "/api/push-token", "/api/stt", "/api/m/upload")
             or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
-            or path.startswith("/vendor/fonts/")):
+            or path.startswith("/vendor/fonts/") or path.startswith("/img/")):
         return None
     jtype = hdr.get("content-type")
     entry = {"type": "rest", "method": method, "path": rawpath, "ctype": jtype, "n": len(body)}
@@ -295,7 +330,7 @@ def rest(method, rawpath, hdr, body):
             ff = os.environ.get("FAKE_FONT", "system")
             files = {"inter": {"regular": "/vendor/fonts/Inter-Regular.ttf", "bold": "/vendor/fonts/Inter-Bold.ttf"},
                      "grotesk": {"regular": "/vendor/fonts/SpaceGrotesk-Regular.ttf", "bold": "/vendor/fonts/SpaceGrotesk-Bold.ttf"}}.get(ff)
-            return out(200, {"font": ff, "fontCss": "system-ui", "scale": 100, "radius": 12, "density": "kompakt", "preset": "fleitec", "accent": "#3b82f6", "motion": True, "lang": "auto", "fontFiles": files})
+            return out(200, {"font": ff, "fontCss": "system-ui", "scale": 100, "radius": 12, "density": "kompakt", "preset": os.environ.get("FAKE_PRESET", "fleitec"), "accent": "#3b82f6", "motion": True, "lang": "auto", "fontFiles": files})
         if mp == "usage" and method == "GET":
             if os.environ.get("FAKE_NO_USAGE"): return out(503, {"error": "no usage source"})
             return out(200, {"provider": "claude", "name": "Claude", "p5": 37, "p7": 64, "reset5": None, "reset7": None, "providers": {}})
@@ -303,6 +338,28 @@ def rest(method, rawpath, hdr, body):
             if os.environ.get("FAKE_NO_USAGE") or os.environ.get("FAKE_NO_MODELS"): return out(503, {"error": "no models"})
             return out(200, {"models": [{"alias": a, "label": MODEL_LABELS[a], "blurb": "", "provider": "claude", "effort": a != "haiku", "thinking": True, "vision": True} for a in ENABLED],
                              "efforts": EFFORTS, "current": model_current(), "chat": None})
+        # /api/m/me + /api/m/admin/*: FAKE_ROLE=user -> admin false and every admin route 403 (like the real server); FAKE_NO_ADMIN=1: older server (404)
+        if mp == "me" and method == "GET":
+            if os.environ.get("FAKE_NO_ADMIN"): return out(404, {"error": "Not found"})
+            return out(200, {"uid": "u1", "username": "justin", "email": "justin@fleitec.com", "admin": os.environ.get("FAKE_ROLE", "admin") != "user", "impersonating": False})
+        if mp == "admin" or mp.startswith("admin/"):
+            if os.environ.get("FAKE_NO_ADMIN"): return out(404, {"error": "Not found"})
+            if os.environ.get("FAKE_ROLE", "admin") == "user": return out(403, {"error": "Nur f\u00fcr Admins."})
+            if mp == "admin/users" and method == "GET":
+                return out(200, {"total": 3, "users": [{"id": "u1", "username": "justin", "email": "justin@fleitec.com", "admin": True, "createdAt": 1, "projects": 6},
+                                                       {"id": "u2", "username": "papa", "email": "info@fleitec.com", "admin": False, "createdAt": 2, "projects": 1},
+                                                       {"id": "u3", "username": "gast", "email": "", "admin": False, "createdAt": 3, "projects": 0}]})
+            if mp == "admin/limits" and method == "GET": return out(200, dict(ok=True, **ADMIN_LIMITS))
+            if mp == "admin/limits" and method == "POST" and j:
+                for k in ("maxSubworkers", "heavySlots", "autoLoop"):
+                    if k in j: ADMIN_LIMITS[k] = j[k]
+                return out(200, dict(ok=True, **ADMIN_LIMITS))
+            if mp == "admin/server" and method == "GET":
+                return out(200, {"host": "jarvis", "cpu": {"cores": 16, "load1": 2.5, "load5": 2.1, "load15": 1.9, "loadPct": 16}, "mem": {"totalBytes": 68719476736, "freeBytes": 21474836480, "usedPct": 69},
+                                 "disk": {"totalBytes": 1099511627776, "freeBytes": 214748364800, "usedPct": 80}, "uptimeSec": 1234567, "processUptimeSec": 4000, "node": "v18.20.8"})
+            if mp == "admin/logs" and method == "GET":
+                return out(200, {"file": "2026-10-19.log", "files": ["2026-10-19.log"], "size": 100, "lines": ["[2026-10-19T20:00:00Z] server start", "[2026-10-19T20:00:01Z] login justin", "[2026-10-19T20:00:05Z] worker a48 started"]})
+            return out(404, {"error": "Unbekannter Pfad"})
         if mp == "models" and method == "POST" and j:
             if j.get("model") is not None:
                 if j["model"] not in ENABLED: return out(400, {"error": "Modell nicht verfuegbar"})
@@ -341,13 +398,18 @@ def rest(method, rawpath, hdr, body):
         if mp == "devices":
             return out(200, {"devices": [{"name": "Dell", "type": "Windows", "online": True}, {"name": "Phone", "type": "Android", "online": False}]})
         if mp == "chats" and method == "GET":
+            if os.environ.get("FAKE_SLOW_CHATS"): time.sleep(int(os.environ["FAKE_SLOW_CHATS"]) / 1000.0)  # a53: slow chat list (ms, blocks the whole fake server); FAKE_FAIL_CHATS=1 answers 502
+            if os.environ.get("FAKE_FAIL_CHATS"): return out(502, {"error": "bad gateway"})
             allc = all_chats()
+            if os.environ.get("FAKE_NO_FOLDERS"):  # an older server: no folders / folder / fav keys in the chat list
+                allc = [{k: v for k, v in c.items() if k not in ("folder", "fav")} for c in allc]
+            fkey = {} if os.environ.get("FAKE_NO_FOLDERS") else {"folders": FOLDERS}
             if not REAL:
-                return out(200, {"total": len(allc), "chats": allc})
+                return out(200, dict({"total": len(allc), "chats": allc}, **fkey))
             lim = max(1, min(100, int(q.get("limit", ["30"])[0] or 30))); off = max(0, int(q.get("offset", ["0"])[0] or 0))
             qq = (q.get("q", [""])[0] or "").lower()
             if qq: allc = [c for c in allc if qq in str(c["title"] or "").lower()]
-            return out(200, {"total": len(allc), "chats": allc[off:off + lim]})
+            return out(200, dict({"total": len(allc), "chats": allc[off:off + lim]}, **fkey))
         if mp.startswith("chats/") and method == "GET":
             cid = unquote(mp[len("chats/"):])
             row = next((c for c in all_chats() if c["id"] == cid), None)
@@ -365,6 +427,41 @@ def rest(method, rawpath, hdr, body):
                                       "running": False if not part else True, "partial": part, "beat": None},
                              "first": lo, "hasMore": lo > 0,
                              "messages": [dict(m, i=i, at=1760000000000 + i) for i, m in enumerate(msgs) if lo <= i < end]})
+        if os.environ.get("FAKE_NO_FOLDERS") and (mp.startswith("folders") or mp == "chats/move"):  # FAKE_NO_FOLDERS=1: older server, 404
+            return out(404, {"error": "Not found"})
+        if mp == "folders" and method == "GET":
+            return out(200, {"folders": FOLDERS})
+        if mp in ("folders/add", "folders/rename", "folders/remove") and method == "POST":
+            if os.environ.get("FAKE_NO_CHAT_OPS"): return out(404, {"error": "Not found"})
+            j = j or {}
+            if mp == "folders/add":
+                nm = (j.get("name") or "").strip()[:40]
+                if not nm or len(FOLDERS) >= 40: return out(400, {"error": "Name missing or too many folders"})
+                FOLDER_SEQ[0] += 1
+                f = {"id": "f_new%d" % FOLDER_SEQ[0], "name": nm, "order": len(FOLDERS)}
+                FOLDERS.append(f)
+                return out(200, {"folder": f, "folders": FOLDERS})
+            f = next((x for x in FOLDERS if x["id"] == j.get("id")), None)
+            if not f: return out(404, {"error": "Folder not found"})
+            if mp == "folders/rename":
+                nm = (j.get("name") or "").strip()[:40]
+                if not nm: return out(404, {"error": "Name empty"})
+                f["name"] = nm
+                return out(200, {"folder": f, "folders": FOLDERS})
+            FOLDERS.remove(f)
+            for k in [k for k, v in CHAT_FOLDER.items() if v == f["id"]]: del CHAT_FOLDER[k]
+            return out(200, {"ok": True, "folders": FOLDERS})
+        if mp == "chats/move" and method == "POST":
+            if os.environ.get("FAKE_NO_CHAT_OPS"): return out(404, {"error": "Not found"})
+            j = j or {}
+            row = next((c for c in all_chats() if c["id"] == j.get("id")), None)
+            if not row: return out(404, {"error": "Not found"})
+            if not isinstance(j.get("folder"), str) and not isinstance(j.get("fav"), bool): return out(400, {"error": "folder or fav missing"})
+            if isinstance(j.get("folder"), str):
+                if j["folder"] and any(x["id"] == j["folder"] for x in FOLDERS): CHAT_FOLDER[row["id"]] = j["folder"]
+                else: CHAT_FOLDER.pop(row["id"], None)
+            if isinstance(j.get("fav"), bool): CHAT_FAV[row["id"]] = j["fav"]
+            return out(200, {"ok": True, "id": row["id"]})
         if mp in ("chats/rename", "chats/remove") and method == "POST":
             if os.environ.get("FAKE_NO_CHAT_OPS"): return out(404, {"error": "Not found"})
             row = next((c for c in all_chats() if c["id"] == (j or {}).get("id")), None)
@@ -381,6 +478,13 @@ def rest(method, rawpath, hdr, body):
         if mp == "push/test" and method == "POST":
             return out(200, {"ok": True, "sent": 1})
         return out(404, {"error": "Not found"})
+    if path == "/api/settings":
+        if method in ("POST", "PATCH"):
+            try:
+                SETTINGS.update(json.loads(body or b"{}"))
+            except Exception:
+                return out(400, {"error": "bad json"})
+        return out(200, {"settings": SETTINGS})
     if path == "/api/me":
         return out(200, {"username": "justin", "admin": True, "deviceToken": "dt1", "settings": {}})
     if path == "/api/projects" and method == "GET":
@@ -457,6 +561,13 @@ def rest(method, rawpath, hdr, body):
         import hashlib  # the proof for the file picker check: what the server GOT (name, mime, size, sha256 of the octets)
         LOG.write(json.dumps({"type": "upload_body", "name": name, "mime": q.get("mime", [jtype])[0], "size": len(body), "sha256": hashlib.sha256(body).hexdigest()}) + "\n")
         return out(200, {"file": {"name": name, "size": len(body), "mime": jtype, "url": "/file/u1/%s/%s" % (q.get("cid", ["c0"])[0], quote(disk)), "path": "/srv/uploads/u1/%s/%s" % (q.get("cid", ["mobile"])[0], disk)}})
+    if path.startswith("/img/"):  # a PNG gradient (320x200), behind the login like the real /img/
+        import zlib, struct
+        w, h = 320, 200
+        raw = b"".join(b"\x00" + b"".join(bytes((x * 255 // w, y * 255 // h, 160)) for x in range(w)) for y in range(h))
+        def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+        png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+        return (200, png, "image/png")
     if path.startswith("/file/"):
         disk = unquote(path.split("/")[-1])
         if disk not in FILES:
@@ -522,6 +633,20 @@ async def handler(ws):
                 await send(ws, {"type": "ask_request", "id": "a1", "cid": cid, "question": "Which?", "options": ["A", {"label": "B"}]})
                 r = json.loads(await ws.recv()); LOG.write(json.dumps(r) + "\n")
                 await send(ws, {"type": "token", "cid": cid, "content": "ans=%s" % r["answers"][0]})
+            elif text == "tools":  # live tool steps: ok, failed, long output
+                await send(ws, {"type": "token", "cid": cid, "content": "Ich schaue kurz nach. "})
+                await asyncio.sleep(0.2)
+                await send(ws, {"type": "tool", "cid": cid, "name": "mcp__jarvis__run_shell", "id": "t1", "input": {"command": "ls -la /root"}})
+                await asyncio.sleep(0.3)
+                await send(ws, {"type": "tool_result", "id": "t1", "ok": True, "text": "total 4\ndrwx------ 2 root root 4096 Oct 19 .\n", "images": []})
+                await send(ws, {"type": "token", "cid": cid, "content": "Zwischenstand: das erste Kommando lief."})
+                await asyncio.sleep(0.2)
+                await send(ws, {"type": "tool", "cid": cid, "name": "mcp__jarvis__read_file", "id": "t2", "input": {"path": "/etc/nothing"}})
+                await asyncio.sleep(0.3)
+                await send(ws, {"type": "tool_result", "id": "t2", "ok": False, "text": "ENOENT: no such file", "images": []})
+                await send(ws, {"type": "tool", "cid": cid, "name": "mcp__jarvis__run_shell", "id": "t3", "input": {"command": "seq 1 25"}})
+                await send(ws, {"type": "tool_result", "id": "t3", "ok": True, "text": "\n".join(str(k) for k in range(1, 26)), "images": []})
+                await send(ws, {"type": "token", "cid": cid, "content": "Done: 3 steps.\n>STATUS: status=done"})
             elif text == "code":  # a fenced block + inline code: the monospace face (font slot 1) check
                 await send(ws, {"type": "token", "cid": cid, "content": "Run `ls -la` here:\n\n```sh\nfor f in *.fi; do echo \"$f\"; done\n```\n"})
             elif text == "file":

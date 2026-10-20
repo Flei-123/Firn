@@ -128,7 +128,7 @@ tap_hdr() { $ADB shell input tap $(($1 * SW / 1080)) "$(hdr_y)"; sleep "${2:-2}"
 open_sidebar() { tap_hdr 74 2; }
 sidebar_new() { tap_hdr 907 2; } # the plus sits at the right edge of the drawer panel (84 % wide); x 998 would hit the dim strip and close it
 # type into the composer field (place), or into the field whose hint is $1 (OCR) for other screens, then leave the keyboard
-type_into() { if [ "$1" = Message ]; then tap_px 240 $((COMP_Y - 160)) 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep 1; hide_kbd; }
+type_into() { if [ "$1" = Message ]; then tap_px 240 $((COMP_Y - 160)) 1.5; else tap_word "$1" 1 1.5 || return 1; fi; wait_kbd_up || note "keyboard did not show for $1"; $ADB shell input text "$2"; sleep "${TYPE_SETTLE:-4}"; hide_kbd; } # slow host: the last typed character is lost if BACK follows too soon
 send_text() { type_into "Message" "$1" && tap_send; }
 notes() { $ADB shell dumpsys notification --noredact; }
 # title / text lines of the notifications of the app (not the service one)
@@ -182,6 +182,15 @@ check "login request reached the server" "$(grep -c '"type": "login"' "$SLOG")" 
 send_text hello
 check "message 'hello' reached the server" "$(wait_log '"text": "hello"' 15 | awk '{print ($1>0)?"yes":"no"}')" yes
 check "streamed reply visible" "$(OCR_TRIES=15 wait_ocr 03_reply 'Hallo hello')" 1
+if [ -n "${E2E_COMPOSER:-}" ]; then # a52: the composer must be empty after "new chat" and after Send (no stale keyboard buffer)
+    echo "== 1b. composer buffer"
+    type_into "Message" "Otter"; shot 03b_typed
+    check "typed text shows in the composer" "$(ocr 03b_typed | grep -c 'Otter')" 1
+    open_sidebar; tap_hdr 951 3; shot 03c_after_new  # a52: UNVERIFIED x (plus of the a46 sidebar header ~ 951 in the 1080 frame; 907 missed it): check 03c shows the chat, not the drawer
+    check "composer is empty after a new chat" "$(ocr 03c_after_new | grep -c 'Otter')" 0
+    send_text "abc"
+    check "next message is exactly 'abc'" "$(wait_log '"text": "abc"' 15 | awk '{print ($1>0)?"yes":"no"}')" yes
+fi
 [ "${E2E_STOP:-}" = reply ] && { echo "stopped after the reply (E2E_STOP=reply): $PASS ok, $FAIL failed"; exit 0; }
 
 # ---- 2. Board: projects, a need answered; Tasks: add ---------------------------------------------------------------------
@@ -480,13 +489,13 @@ check "dropdown: the socket got '/effort high'" "$(wait_log '"text": "/effort hi
 check "dropdown: POST /api/m/models stored the model" "$(wait_log '"json": {"model": "opus"}' 10)" 1
 shot 12_dropdown_closed
 check "dropdown: the pill shows Opus" "$(ocr 12_dropdown_closed | grep -ci 'opus')" 1
-# copy button: right of the meta line "<n>s - finished HH:MM" under the last answer (about 79 dp = 207 px right of the word "finished")
-shot _w; FP=$(word_at _w 'finished' 1)
+# copy button: right of the meta line "<n>s · HH:MM" under the last answer (about 8 dp + the width of "HH:MM" = ~130 px right of the start of the time word)
+shot _w; FP=$(word_at _w '[0-9][0-9]:[0-9][0-9]' 1)
 if [ -n "$FP" ]; then
-    set -- $FP; $ADB shell input tap $(($1 + 207 * SW / 1080)) $2; sleep 1.5; shot 12_copied
+    set -- $FP; $ADB shell input tap $(($1 + 130 * SW / 1080)) $2; sleep 1.5; shot 12_copied
     check "copy button: the status line says 'Kopiert'" "$(ocr_crop 12_copied 150 $((COMP_Y * SH / 2340 - 45)) 900 $((COMP_Y * SH / 2340 + 45)) | grep -ci 'opiert')" 1
 else
-    check "copy button: the meta line 'finished' is on the screen" no yes
+    check "copy button: the meta line time (HH:MM) is on the screen" no yes
 fi
 
 # ---- 8b. speech output WITH an engine (google_apis image: com.google.android.tts) ----------------------------------------------

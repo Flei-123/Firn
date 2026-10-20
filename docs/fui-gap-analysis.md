@@ -182,7 +182,7 @@ Vorgänger: `docs/GAP-ANALYSE-0710.md` (07.10.). Diese Datei ersetzt sie nicht, 
 | Feature | fUi-Status | Beleg | Qt | Flutter | WinUI3 | GTK | Compose | SwiftUI | Slint | egui | Prio | Messwert/Test-Gate |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | Rect/Rund/Ring/Linie/Schatten/Blur/Glas | **vorhanden** | painter.fi; effect.fi | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | - | effect_main |
-| Gradient linear/radial (Rechteck/Text) | **teilweise** | painter.grad_rect/round_rect_radial; style background:gradient; konisch + Pfad fehlen | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P2 | - |
+| Gradient linear/radial (Rechteck/Text) | **teilweise** | painter.grad_rect/round_rect_radial; style background:gradient + SF_BG_GLOW; Seitengrund-Cache `painter.bgcache_*` (a48: Pixel einmal, dann zeilenweise kopiert); nur EIN Licht je Box (zwei = zwei geschachtelte Boxen), kein Dithering, konisch + Pfad fehlen | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ~ | P2 | - |
 | Vektorpfade (Bezier, Füllregeln, Stroke Cap/Join/Dash) als Zeichner-API | **teilweise** | svg/path.fi, paint/stroke.fi, icons.fill_path vorhanden; kein offener Painter-Pfad-Aufruf | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P1 (neu) | 30 Pfade gegen resvg ≤ 0.5 % Pixel |
 | Clip (Rechteck/Rund/Pfad/Maske) | **teilweise** | canvas.clip_push_rect/mask; Pfad-Clip fehlt | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | P2 | in Pfad-API |
 | Blend-Modes | **teilweise** | canvas BLEND_* (8 Modi); nicht im Stil/GPU | ✓ | ✓ | ~ | ~ | ✓ | ✓ | ~ | ~ | P3 | - |
@@ -333,3 +333,10 @@ Neu in main (alles reine Modelle mit Prüfprogramm in `tools/fui/run.sh`, Gerüs
 ## W42-c (18.10.2026): Wave 12 (r45 rest)
 * `lib/fui/wave12.fi`: calendar (one day or a RANGE, month arrows, arrows/PgUp/PgDn/Home/End), navigation view (hamburger + `kit.nav_*` list; expanded 240 / compact 64 / hidden 48, Esc closes the minimal overlay), tree view (flat pre-order list, Left/Right expand/collapse, keys scroll). appctl: `datepicker*`, `navview*`, `tree*` (one node each, a11y role + description). Tests `wave12_main` (147 checks, light/dark/RTL) and `appw12_main` (appctl clicks/keys/a11y), both in `run.sh`. Rows 25, 32, 33, 35 are now covered (rows stay "teilweise": wheel scrolling, lazy tree, nested nav levels, min/max dates).
 * **Offen (r45-Rest):** Flyout/Popover/TeachingTip (row 39), Golden fuer wave8/wave12, Host-Leser (Insets, Textskalierung), Tree-Lazy-Load/Drag-Umordnen, Nav-Untermenues.
+
+## a48 (19.10.2026): Composer-Autogrow, Seitenverlauf, Tastatur
+* `app.textarea_auto(a, hint, rows_min, rows_max)`: Textfeld waechst mit den Zeilen (1 erlaubt, Rest scrollt), schrumpft zurueck; `app.textarea` bleibt fest (min. 2 Zeilen). Hoehe folgt der Zeilenzahl des Vorframes (`app.sync_areas`).
+* `painter.bgcache_blit/store/reset` + `render.glow_key`: Boxen mit `SF_BG_GLOW` (quadratisch, CPU-Canvas) werden einmal gemalt und danach aus dem Cache kopiert (clip-sicher, jeder Treffer-Fehlschlag leert alle Slots). Aktiv fuer die Jarvis-Seite (Linearverlauf 160deg + zwei Lichter, Tokens `examples/jarvis_android/jtokens.fi`).
+* `anim.trans_apply`: ein voellig transparentes Ziel bleibt `color_transparent()` (vorher schrieb die Animation ein Literal 0x000000 -> schwarze Kaesten ueber dem Seitenverlauf).
+* **Luecken:** Dithering gegen Banding (Verlauf ist 8-Bit, flache Stufen bei 0.3 Alpha moeglich); mehrere Radial-Lichter in EINEM Style; Backdrop-Blur auf Panels (effect.backdrop_blur ~100 ms/Dialog, zu teuer fuer Dauerbetrieb -> nicht umgesetzt); GPU-Canvas nimmt den Cache nicht (faellt auf den normalen Pfad); Cache bei Rundung (radius > 0) aus; Preset `claude` (flach #262624) und /api/m/theme-Preset sind in der Jarvis-App noch nicht gemappt (nur `fleitec`).
+* `tools/android/build.sh`: `SOFT_INPUT=adjustResize` (opt-in, `jarvis_build.sh` setzt es) schreibt `android:windowSoftInputMode` ins Manifest -> Fenster schrumpft mit der Tastatur, Composer bleibt darueber; Chat-Liste bleibt am Ende, wenn sie hoeher/niedriger wird (`screen_chat.draw_chat`).
