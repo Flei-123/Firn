@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/fui/ttsstream_main.fi -- read aloud while the answer streams (lib/net/ttsstream.fi + ttssent.stream_cut / ready_end), a68.
+//     FIRNLIB=$PWD/lib firnc -o /tmp/ttsstream tools/fui/ttsstream_main.fi && /tmp/ttsstream
+// Main property: feeding the answer in ANY chunk size gives exactly the blocks of the one-shot run (nothing twice, nothing lost, nothing
+// cut differently), and no block comes out before it is final.
+import std.rt
+import net.ttssent
+import net.ttsstream
+
+static mut BAD: usize = 0
+
+fn say(s: str) { rt.write_everything(1, s.p as u64, s.n) }
+
+fn same(a: *mut rt.Buf, b: str) -> bool {
+    if (*a).len != b.n { return false }
+    return rt.mem_eq((*a).ptr, b.p as u64, b.n)
+}
+
+fn show(a: *mut rt.Buf) { rt.write_everything(1, (*a).ptr, (*a).len) }
+
+fn check(ok: bool, what: str) {
+    if ok { say("  ok    ") } else { say("  WRONG "); BAD = BAD + 1 }
+    say(what)
+    say("\n")
+}
+
+// hands out every ready block, appended to out as "block|block|..."
+fn drain(s: *mut ttsstream.Stream, out: *mut rt.Buf) -> usize {
+    var cnt: usize = 0
+    var a: usize = 0
+    var b: usize = 0
+    var guard: usize = 0
+    while ttsstream.st_next(s, &a, &b) && guard < 1000 {
+        if (*out).len > 0 { rt.buf_push(out, 124 as u8) }
+        rt.buf_push_bytes(out, (*s).txt.ptr + a as u64, b - a)
+        cnt = cnt + 1
+        guard = guard + 1
+    }
+    return cnt
+}
+
+// the whole text at once (the non-streaming read aloud)
+fn oneshot(src: str, out: *mut rt.Buf) {
+    var s: ttsstream.Stream = ttsstream.Stream { txt: rt.buf_new(), seg_at: 0, seg_open: false, fed_w: 0, ended: false, pos: 0, nblock: 0 }
+    ttsstream.st_feed(&s, src.p as u64, src.n, true)
+    ttsstream.st_end(&s)
+    let c: usize = drain(&s, out)
+    rt.buf_free(&s.txt)
+}
+
+// the text grows `step` octets at a time (a cut can fall inside a UTF-8 character: the tokens of a stream do that)
+fn streamed(src: str, step: usize, out: *mut rt.Buf, early: *mut usize) {
+    var s: ttsstream.Stream = ttsstream.Stream { txt: rt.buf_new(), seg_at: 0, seg_open: false, fed_w: 0, ended: false, pos: 0, nblock: 0 }
+    var k: usize = 0
+    while k < src.n {
+        k = k + step
+        if k > src.n { k = src.n }
+        if k < src.n { // the last step is the final feed below
+            ttsstream.st_feed(&s, src.p as u64, k, false)
+            let c: usize = drain(&s, out)
+            if c > 0 && *early == 0 { *early = k }
+        }
+    }
+    ttsstream.st_feed(&s, src.p as u64, src.n, true)
+    ttsstream.st_end(&s)
+    let c2: usize = drain(&s, out)
+    rt.buf_free(&s.txt)
+}
+
+fn t_chunks(src: str, what: str) {
+    var ref: rt.Buf = rt.buf_new()
+    oneshot(src, &ref)
+    var steps: [usize; 9] = [1, 2, 3, 5, 8, 13, 29, 64, 200]
+    var i: usize = 0
+    var allok: bool = true
+    var firstk: usize = 0
+    while i < 9 {
+        var got: rt.Buf = rt.buf_new()
+        var early: usize = 0
+        streamed(src, steps[i], &got, &early)
+        if i == 0 { firstk = early }
+        if !same(&got, rt.buf_str(&ref)) {
+            allok = false
+            say("     step ")
+            say(dec(steps[i]))
+            say(" got : [")
+            show(&got)
+            say("]\n     want       : [")
+            show(&ref)
+            say("]\n")
+        }
+        rt.buf_free(&got)
+        i = i + 1
+    }
+    check(allok, what)
+    rt.buf_free(&ref)
+}
+
+fn dec(v: usize) -> str {
+    var b: rt.Buf = rt.buf_new()
+    var x: usize = v
+    var tmp: [u8; 20] = [0; 20]
+    var n: usize = 0
+    if x == 0 { tmp[0] = 48 as u8; n = 1 }
+    while x > 0 {
+        tmp[n] = (48 + x % 10) as u8
+        x = x / 10
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        rt.buf_push(&b, tmp[n])
+    }
+    return rt.buf_str(&b)
+}
+
+// stream_cut(p, n) == want
+fn t_cut(src: str, want: usize, what: str) {
+    let got: usize = ttssent.stream_cut(src.p as u64, src.n)
+    let ok: bool = got == want
+    check(ok, what)
+    if !ok {
+        say("     got ")
+        say(dec(got))
+        say(" want ")
+        say(dec(want))
+        say("\n")
+    }
+}
+
+// after feeding `src` (not final) the blocks that are ready, joined with '|'
+fn t_ready(src: str, want: str, what: str) {
+    var s: ttsstream.Stream = ttsstream.Stream { txt: rt.buf_new(), seg_at: 0, seg_open: false, fed_w: 0, ended: false, pos: 0, nblock: 0 }
+    ttsstream.st_feed(&s, src.p as u64, src.n, false)
+    var out: rt.Buf = rt.buf_new()
+    let c: usize = drain(&s, &out)
+    let ok: bool = same(&out, want)
+    check(ok, what)
+    if !ok {
+        say("     got : [")
+        show(&out)
+        say("]\n     want: [")
+        say(want)
+        say("]\n")
+    }
+    rt.buf_free(&out)
+    rt.buf_free(&s.txt)
+}
+
+fn main() -> i32 {
+    say("== stream_cut ==\n")
+    t_cut("", 0, "empty")
+    t_cut("Hallo", 0, "one word being typed: nothing")
+    t_cut("Hallo Welt", 6, "the last word waits")
+    t_cut("Hallo Welt ", 11, "behind a blank: all")
+    t_cut("Hallo Welt\n", 11, "line break: all")
+    t_cut("Eins. Zwei\nDrei vier", 16, "last line: up to its last blank")
+    t_cut("Mit `code und mehr", 0, "open code span: wait for the line end")
+    t_cut("Mit `code` und mehr", 15, "closed code span")
+    t_cut("Siehe [die Doku](https://x.y/ab und", 0, "open link: wait")
+    t_cut("Siehe [die Doku](https://x.y/ab) und", 33, "closed link")
+    t_cut("Fertig.\n\n>STATUS: status=done", 9, "status line cut off")
+    t_cut("Fertig.\n\n>STAT", 9, "status line beginning cut off")
+    t_cut("Fertig.\n\n>STATUS:", 9, "status line colon only")
+    t_cut("Fertig.\n\n> Zitat hier", 17, "a quote is not the status line")
+
+    say("== ready blocks of a growing text ==\n")
+    t_ready("Das ist ein erster Satz, der laenger ist", "", "no stop yet: nothing")
+    t_ready("Das ist ein erster ganzer Satz. Der zweite", "Das ist ein erster ganzer Satz.", "first sentence out as soon as the next word is complete")
+    t_ready("Das ist ein erster ganzer Satz. Der", "", "next word still being typed: the stop is not certain yet")
+    t_ready("Das ist ein erster ganzer Satz. Der zweite Satz ist hier. Und", "Das ist ein erster ganzer Satz.", "first sentence out, the second still open")
+    t_ready("Kurz. Und noch ein ziemlich langer zweiter Satz mit viel Text. Dritter", "", "tiny first sentence + second: both wait (the third could still join)")
+    t_ready("Kurz. Und noch ein ziemlich langer zweiter Satz mit viel Text. Dritter Satz", "Kurz. Und noch ein ziemlich langer zweiter Satz mit viel Text.", "tiny first sentence joined with the second")
+    t_ready("Am 3. Mai war es so. Dann", "", "3. Mai: not a stop, the sentence is open")
+    t_ready("Wir haben das gemacht, geprueft und dokumentiert und dazu noch einiges mehr getan, damit alles passt", "Wir haben das gemacht, geprueft und dokumentiert und dazu noch einiges mehr getan,", "long first sentence: starts at its first comma behind 25 octets")
+    t_ready("Liste:\n- Punkt eins ist hier\n- Punkt zwei ist hier\n- Punkt", "Liste:\nPunkt eins ist hier.", "list lines (the last item waits for its first word)")
+    t_ready("```py\nprint(1)\n```\nDanach geht es weiter mit Text. Und mehr", "Danach geht es weiter mit Text.", "code block never spoken")
+    t_ready("Fertig, das war es jetzt wirklich so.\n\n>STATUS: status=done braucht_nutzer=\"\"", "", "status line is not spoken (last sentence waits for the end)")
+
+    say("== chunk size does not matter ==\n")
+    t_chunks("Das ist ein Satz. Und noch einer, der etwas laenger ist. Ok. Am 3. Mai, z.B. mit Dr. Meier, war es so. Fertig!", "plain sentences + abbreviations + day number")
+    t_chunks("## Ergebnis\n\nDas Tool laeuft, z.B. mit **Piper**. Siehe [Doku](https://x.y/z).\n\n```py\nprint(1)\n```\n\n- Punkt eins\n- Punkt zwei ist deutlich laenger als der erste Punkt\n\nFertig.", "markdown answer: heading, bold, link, code, list")
+    t_chunks("Wir haben das gemacht, geprueft und dokumentiert und dazu noch einiges mehr getan, damit alles passt, und ausserdem laeuft es. Danach kommt noch ein Satz.", "long first sentence")
+    t_chunks("Umlaute: äöü Überprüfung läuft — alles gut 😀 und weiter. Nächster Satz hier.", "UTF-8 cut inside a character")
+    t_chunks("Ein `Code` im Satz und ein [Link mit Leerzeichen](https://a.b/c d) davor. Zweiter Satz mit **fett und mehr** drin.", "inline code + link with blanks")
+    t_chunks("Eine Zeile ohne Punkt\nNoch eine Zeile\nUnd eine dritte Zeile mit Punkt.", "lines without stops")
+    t_chunks("| a | b |\n|---|---|\n| eins | zwei |\n\nDanach Text. Mehr.", "table")
+    t_chunks("Erster Satz. Zweiter Satz.", "two short sentences")
+    t_chunks("Nur ein Wort", "one line without a stop")
+
+    say("== segments (text between tool calls) ==\n")
+    {
+        var s: ttsstream.Stream = ttsstream.Stream { txt: rt.buf_new(), seg_at: 0, seg_open: false, fed_w: 0, ended: false, pos: 0, nblock: 0 }
+        var out: rt.Buf = rt.buf_new()
+        let a: str = "Ich pruefe das gleich. Moment"
+        ttsstream.st_feed(&s, a.p as u64, a.n, false)
+        let c1: usize = drain(&s, &out)
+        check(out.len == 0, "segment 1 open: the first sentence is tiny and waits")
+        ttsstream.st_feed(&s, a.p as u64, a.n, true) // a tool call: segment 1 is complete
+        let c2: usize = drain(&s, &out)
+        check(same(&out, "Ich pruefe das gleich. Moment."), "segment 1 closed: flushed")
+        let b: str = "Das Ergebnis ist da. Alles gut. Und dann noch ein Satz hier. Ende jetzt"
+        ttsstream.st_feed(&s, b.p as u64, b.n, false) // segment 2 starts behind segment 1
+        let c3: usize = drain(&s, &out)
+        check(same(&out, "Ich pruefe das gleich. Moment.|Das Ergebnis ist da. Alles gut. Und dann noch ein Satz hier."), "segment 2 appended, segment 1 not spoken again")
+        ttsstream.st_feed(&s, b.p as u64, b.n, true)
+        ttsstream.st_end(&s)
+        let c4: usize = drain(&s, &out)
+        check(same(&out, "Ich pruefe das gleich. Moment.|Das Ergebnis ist da. Alles gut. Und dann noch ein Satz hier.|Ende jetzt."), "end: the rest comes out")
+        check(ttsstream.st_done(&s), "done")
+        // after the end nothing is taken any more
+        ttsstream.st_feed(&s, b.p as u64, b.n, false)
+        check(drain(&s, &out) == 0, "feed after the end ignored")
+        rt.buf_free(&out)
+        rt.buf_free(&s.txt)
+    }
+
+    say("== first block is early ==\n")
+    {
+        var s: ttsstream.Stream = ttsstream.Stream { txt: rt.buf_new(), seg_at: 0, seg_open: false, fed_w: 0, ended: false, pos: 0, nblock: 0 }
+        var out: rt.Buf = rt.buf_new()
+        let src: str = "Das ist der erste Satz der Antwort. Hier kommt noch viel mehr Text, der gerade erst geschrieben wird und lang wird"
+        ttsstream.st_feed(&s, src.p as u64, src.n, false)
+        let c: usize = drain(&s, &out)
+        check(same(&out, "Das ist der erste Satz der Antwort."), "first sentence out while the second is still being written")
+        rt.buf_free(&out)
+        rt.buf_free(&s.txt)
+    }
+
+    if BAD == 0 { say("ALL OK\n"); return 0 }
+    say("FAILED\n")
+    return 1
+}

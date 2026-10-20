@@ -5,6 +5,10 @@
 //   jtts_say(text, rate100, voice, speaker)   clean the markdown (net.ttssent), cut the text SENTENCE by sentence (the first block short = fast
 //                                             start), fetch block 1, play it (plat.voiceio vio_play_*: AAudio on Android), fetch block 2 WHILE
 //                                             block 1 plays, ... (a67; before: ~280 character pieces)
+//   jtts_stream_arm(on) / jtts_stream_feed(raw, rate100, voice, speaker, last) / jtts_stream_end()   (a68) read WHILE the answer is written: the
+//                                             chat arms a turn, feeds the whole current text segment on every token (last = the segment is
+//                                             complete), ends it at the end of the answer. A sentence is spoken as soon as it is certain
+//                                             (net.ttsstream); a stop (jtts_stop) disarms: later feeds of that answer are ignored.
 //   jtts_stop()                               cut the sound, forget the queue (a late answer of the server is dropped by its generation)
 //   jtts_active()                             a session runs (or the device voice of the fallback is still speaking)
 //   jtts_tick()                               every 100 ms (main.fi fast_tick): starts the next piece, fetches the following one
@@ -14,6 +18,7 @@
 // One Api client of its own (the shared one may be busy with other calls), one request in flight, at most one piece fetched ahead.
 import std.rt
 import net.ttssent
+import net.ttsstream
 import net.jarvisapi
 import plat.voiceio
 import appkit.log
@@ -22,18 +27,18 @@ import jtexts
 
 export {
     jtts_say, jtts_stop, jtts_active, jtts_tick, jtts_api, jtts_take_changed, jtts_fallback_used,
+    jtts_stream_arm, jtts_stream_feed, jtts_stream_end, jtts_stream_used, jtts_stream_armed,
 }
 
 const TEXT_MAX: usize = 24000 // longer texts are cut (a very long answer is not read for minutes)
 const MIN_WAV: usize = 64 // smaller answers are no audio
 
 static mut G_API: u64 = 0
-static mut G_TXT: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the whole text of the session
+static mut G_ST: ttsstream.Stream = ttsstream.Stream { txt: rt.Buf { ptr: 0, len: 0, cap: 0 }, seg_at: 0, seg_open: false, fed_w: 0, ended: false, pos: 0, nblock: 0 } // the speech text of the session + what was handed out
 static mut G_VOICE: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_SPEAKER: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut G_CUR: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the WAV that plays (AAudio reads it directly: must not move)
 static mut G_PEND: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the WAV fetched ahead
-static mut G_POS: usize = 0 // text octets already handed to a request
 static mut G_ASKED_AT: usize = 0 // start of the piece that is in flight / was asked last (the fallback speaks from here)
 static mut G_RATE: i64 = 105
 static mut G_GEN: i64 = 0 // session number; the key of a request, an answer of an older session is dropped
@@ -41,7 +46,9 @@ static mut G_ACTIVE: bool = false
 static mut G_FLIGHT: bool = false
 static mut G_HAVE: bool = false // G_PEND holds a WAV
 static mut G_PLAYING: bool = false
-static mut G_NCHUNK: usize = 0
+static mut G_ARMED: bool = false // a68: this answer may be read while it streams (the chat armed it, no stop since)
+static mut G_STREAM_USED: bool = false // ... and a feed was accepted this turn
+static mut G_STREAMING: bool = false // the session still gets text
 static mut G_CHANGED: bool = false
 static mut G_FELL_BACK: bool = false
 static mut G_CUR_AT: usize = 0 // text position where the piece in G_CUR starts
@@ -80,11 +87,13 @@ fn finish() {
     G_HAVE = false
     G_PLAYING = false
     G_FAILED = false
+    G_STREAMING = false
     rt.buf_clear(&G_CUR)
     rt.buf_clear(&G_PEND)
 }
 
 fn jtts_stop() {
+    G_ARMED = false // a68: a stop ends the read-aloud of the streaming answer for good
     voiceio.vio_play_stop()
     voiceio.vio_say_stop()
     G_GEN = G_GEN + 1 // an answer that is still on its way belongs to the dead session
@@ -96,11 +105,12 @@ fn fall_back(from: usize) {
     log.log_info("jtts", "fallback to the device voice")
     voiceio.vio_play_stop()
     G_GEN = G_GEN + 1
-    let rest: usize = if from < G_TXT.len { G_TXT.len - from } else { 0 }
+    G_ARMED = false // the device voice reads what is there; later text of a streaming answer is not read
+    let rest: usize = if from < G_ST.txt.len { G_ST.txt.len - from } else { 0 }
     var ok: bool = false
     if rest > 0 {
         voiceio.vio_set_rate((G_RATE as f32) / 100.0f)
-        ok = voiceio.vio_say(str { p: ((G_TXT.ptr as u64) + from as u64) as *mut u8, n: rest })
+        ok = voiceio.vio_say(str { p: ((G_ST.txt.ptr as u64) + from as u64) as *mut u8, n: rest })
     }
     G_FELL_BACK = true
     finish()
@@ -118,21 +128,25 @@ fn jtts_say(text: str, rate100: i64, voice: str, speaker: str) {
         while n > 0 && !ttssent.is_space(*(text.p + n)) { n = n - 1 } // cut at a blank
         if n == 0 { n = TEXT_MAX }
     }
-    rt.buf_clear(&G_TXT)
-    ttssent.clean(text.p as u64, n, &G_TXT) // a67: markdown / code / links out, every line ends with a stop; the blocks are cut from THIS text
-    if G_TXT.len == 0 { return } // nothing to say (only code / symbols)
+    ttsstream.st_reset(&G_ST)
+    ttsstream.st_feed(&G_ST, text.p as u64, n, true) // a67: markdown / code / links out, every line ends with a stop; the blocks are cut from THIS text
+    ttsstream.st_end(&G_ST)
+    if G_ST.txt.len == 0 { return } // nothing to say (only code / symbols)
+    begin(rate100, voice, speaker)
+}
+
+// the common start of a session whose text is in G_ST
+fn begin(rate100: i64, voice: str, speaker: str) {
     rt.buf_clear(&G_VOICE)
     rt.buf_push_bytes(&G_VOICE, voice.p as u64, voice.n)
     rt.buf_clear(&G_SPEAKER)
     rt.buf_push_bytes(&G_SPEAKER, speaker.p as u64, speaker.n)
     G_RATE = rate100
-    G_POS = 0
     G_ASKED_AT = 0
     G_CUR_AT = 0
     G_PEND_AT = 0
     G_FAILED = false
     G_FAIL_AT = 0
-    G_NCHUNK = 0
     G_ACTIVE = true
     G_CHANGED = true
     if !ensure() {
@@ -142,26 +156,64 @@ fn jtts_say(text: str, rate100: i64, voice: str, speaker: str) {
     request_next()
 }
 
+// ---- a68: read while the answer streams
+
+// A new answer starts (on = the voice mode is on): the old voice is cut; the feeds of this answer are accepted until a stop.
+fn jtts_stream_arm(on: bool) {
+    jtts_stop()
+    G_ARMED = on
+    G_STREAM_USED = false
+}
+
+// did this answer start a streaming read-aloud (then the end of the answer must not say the whole text again)
+fn jtts_stream_used() -> bool { return G_STREAM_USED }
+
+// still armed (no stop / fallback since the answer started)
+fn jtts_stream_armed() -> bool { return G_ARMED }
+
+// The raw markdown of the CURRENT text segment so far (the whole segment, every time). last = the segment is complete.
+fn jtts_stream_feed(text: str, rate100: i64, voice: str, speaker: str, last: bool) {
+    if !G_ARMED { return }
+    var n: usize = text.n
+    if n > TEXT_MAX {
+        n = TEXT_MAX
+        while n > 0 && !ttssent.is_space(*(text.p + n)) { n = n - 1 }
+        if n == 0 { n = TEXT_MAX }
+    }
+    if !G_STREAMING {
+        // the first text of the answer: nothing to say yet means no session yet (a tiny first line must not flash the stop icon)
+        if !last && ttssent.stream_cut(text.p as u64, n) == 0 { return }
+        G_FELL_BACK = false
+        ttsstream.st_reset(&G_ST)
+        G_STREAMING = true
+        G_STREAM_USED = true
+        ttsstream.st_feed(&G_ST, text.p as u64, n, last)
+        begin(rate100, voice, speaker)
+        return
+    }
+    ttsstream.st_feed(&G_ST, text.p as u64, n, last)
+    request_next()
+}
+
+// The answer is complete: whatever is left is flushed; the session ends when it was spoken.
+fn jtts_stream_end() {
+    if !G_STREAMING { return }
+    ttsstream.st_end(&G_ST)
+    request_next()
+    if G_ACTIVE && !G_PLAYING && !G_HAVE && !G_FLIGHT && ttsstream.st_done(&G_ST) { finish() }
+}
+
 // asks the server for the next piece (one request at a time)
 fn request_next() {
     if G_FLIGHT || G_HAVE || !G_ACTIVE { return }
-    // skip blanks, find the end of the piece
-    var s: usize = G_POS
-    while s < G_TXT.len && ttssent.is_space(rt.ld8(G_TXT.ptr, s)) { s = s + 1 }
-    if s >= G_TXT.len {
-        G_POS = G_TXT.len
-        return
-    }
-    let e: usize = ttssent.block_end(G_TXT.ptr, G_TXT.len, s, G_NCHUNK == 0) // a67: one sentence per request (tiny ones joined)
-    var te: usize = e // the piece without its trailing blanks
-    while te > s + 1 && ttssent.is_space(rt.ld8(G_TXT.ptr, te - 1)) { te = te - 1 }
+    var s: usize = 0
+    var te: usize = 0
+    if !ttsstream.st_next(&G_ST, &s, &te) { return } // a67: one sentence per request (tiny ones joined); a68: only when it cannot change any more
     let api: *mut jarvisapi.Api = G_API as *mut jarvisapi.Api
     jarvisapi.ja_use_jc(api, jshell.jc())
-    let piece: str = str { p: ((G_TXT.ptr as u64) + s as u64) as *mut u8, n: te - s }
+    let piece: str = str { p: ((G_ST.txt.ptr as u64) + s as u64) as *mut u8, n: te - s }
     let key: str = jshell.dec(G_GEN)
     G_ASKED_AT = s
-    G_POS = e
-    G_NCHUNK = G_NCHUNK + 1
     if jarvisapi.ja_tts(api, piece, G_RATE, str { p: G_VOICE.ptr as *mut u8, n: G_VOICE.len }, str { p: G_SPEAKER.ptr as *mut u8, n: G_SPEAKER.len }, key) {
         G_FLIGHT = true
     } else {
@@ -247,7 +299,7 @@ fn jtts_tick() {
         }
     }
     request_next()
-    if !G_PLAYING && !G_HAVE && !G_FLIGHT && G_POS >= G_TXT.len {
+    if !G_PLAYING && !G_HAVE && !G_FLIGHT && ttsstream.st_done(&G_ST) {
         finish() // all pieces played
     }
 }

@@ -7,6 +7,8 @@
 //   ttssent.sent_end(p, n, start)               end (exclusive, incl. the blanks behind it) of the sentence that starts at `start`
 //   ttssent.block_end(p, n, start, first)       end of the next block to send to /tts: ONE sentence (tiny ones are joined with the next so the
 //                                               requests stay worth it); `first`: the block that must start the voice fast (short, may end at a comma)
+//   ttssent.stream_cut(p, n)                    (a68) how much of a still GROWING raw answer may be cleaned + spoken now (see net.ttsstream)
+//   ttssent.ready_end(p, n, start, first, done) (a68) like block_end, but 0 = this block is not final yet (more text could change it)
 //
 // A "." is NOT a sentence end: inside a number (3.14), after an abbreviation (z.B. Dr. ca. usw. is handled: see NOBREAK), after one letter
 // (J. Smith), after a day number before a month or a lower case word (am 3. Mai), before a lower case letter. ! ? ... end a sentence when a
@@ -14,7 +16,7 @@
 // A sentence longer than LONG_SENT is cut at a comma (or at a blank), never above HARD_MAX (the server cuts a request at 1000 characters).
 import std.rt
 
-export { clean, sent_end, block_end, is_space, FIRST_MAX, FIRST_MIN, MERGE_MIN, MERGE_MAX, LONG_SENT, HARD_MAX }
+export { clean, sent_end, block_end, ready_end, stream_cut, is_space, FIRST_MAX, FIRST_MIN, MERGE_MIN, MERGE_MAX, LONG_SENT, HARD_MAX }
 
 const FIRST_MAX: usize = 90 // the first block stays short: the voice starts fast
 const FIRST_MIN: usize = 25 // a first sentence shorter than this is joined with the next one
@@ -298,6 +300,85 @@ fn block_end(p: u64, n: usize, start: usize, first: bool) -> usize {
         if trimmed_len(p, start, e2) > cap { break }
         e = e2
     }
+    return e
+}
+
+// ---------------------------------------------------------------------------------------------------------------- streaming (a68)
+
+// How many octets of the raw markdown p[0, n) of a still growing answer are safe to clean and speak now.
+//  - the ">STATUS:" line the server appends (and its first letters while it arrives) is never spoken
+//  - the word that is still being typed (behind the last blank) waits: a sentence end is only certain when the next word is complete
+//  - a line with an open `code span` or an open [link](url) waits for its end (the cleaner would read the half span as plain text)
+fn stream_cut(p: u64, n: usize) -> usize {
+    var end: usize = n
+    var ls: usize = 0
+    while ls < end {
+        // ls = start of a line
+        var le: usize = ls
+        while le < end && at(p, le) != 10 { le = le + 1 }
+        if at(p, ls) == 62 { // ">"
+            let ll: usize = le - ls
+            if ll >= 8 {
+                if rt.mem_eq(p + ls as u64, ">STATUS:".p as u64, 8) {
+                    end = ls
+                    break
+                }
+            } else if le == end {
+                // the last (unfinished) line is a prefix of ">STATUS:": wait
+                if rt.mem_eq(p + ls as u64, ">STATUS:".p as u64, ll) {
+                    end = ls
+                    break
+                }
+            }
+        }
+        ls = le + 1
+    }
+    // start of the last line inside [0, end)
+    var nl: usize = end
+    while nl > 0 && at(p, nl - 1) != 10 { nl = nl - 1 }
+    if nl == end { return end } // the text ends with a line break (or is empty): every line is complete
+    // behind the last blank of the unfinished line
+    var w: usize = end
+    while w > nl && !is_space(rt.ld8(p, w - 1)) { w = w - 1 }
+    if w == nl { return nl }
+    var ticks: usize = 0
+    var lb: usize = 0
+    var rb: usize = 0
+    var k: usize = nl
+    var link_open: bool = false
+    while k < w {
+        let c: i32 = at(p, k)
+        if c == 96 { ticks = ticks + 1 }
+        else if c == 91 { lb = lb + 1 }
+        else if c == 93 {
+            rb = rb + 1
+            if k + 1 < w && at(p, k + 1) == 40 { link_open = true }
+        } else if c == 41 { link_open = false }
+        k = k + 1
+    }
+    if ticks % 2 == 1 || lb > rb || link_open { return nl }
+    return w
+}
+
+// Like block_end, but returns 0 while the block is not final yet: `n` is the end of the text SO FAR, `done` = no more text will come.
+// A block is only given out when more text follows it (a later word could make the sentence longer, join a tiny one, or turn
+// "3." into "3. Mai"); exception: a long first sentence already has its first comma, a very long sentence already has its comma cut.
+fn ready_end(p: u64, n: usize, start: usize, first: bool, done: bool) -> usize {
+    if done { return block_end(p, n, start, first) }
+    let e0: usize = sent_end(p, n, start)
+    if e0 >= n {
+        if first && trimmed_len(p, start, e0) > FIRST_MAX {
+            let c: usize = comma_after(p, n, start + FIRST_MIN, start + 160)
+            if c > 0 && c < n { return c }
+        }
+        if e0 - start > LONG_SENT {
+            let u: usize = long_cut(p, n, start, e0)
+            if u < n { return u }
+        }
+        return 0
+    }
+    let e: usize = block_end(p, n, start, first)
+    if e >= n { return 0 }
     return e
 }
 
