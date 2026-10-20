@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: MPL-2.0
+// english: ok
+// lib/fui/zoomview.fi -- the math of a zoomable picture: pinch zoom, pan, double tap, and the crop that is really on the screen.
+//
+// No drawing, no events here: the caller feeds numbers (finger deltas, the pinch scale, the tap point) and asks where the picture lies.
+// All coordinates are window pixels. The viewport (x, y, w, h) is where the picture may show; the picture is fitted into it at zoom 1
+// (whole picture visible, centred) and zoomed on top of that: 1.0 .. ZV_MAX.
+//
+//     var z: zoomview.ZoomView = zoomview.zv_new()
+//     zoomview.zv_open(&z, image_w, image_h)                 // new picture: zoom 1, centred
+//     zoomview.zv_layout(&z, x, y, w, h)                     // every frame (the viewport can change)
+//     zoomview.zv_pan(&z, dx, dy)                            // one finger moved (only moves a zoomed picture)
+//     zoomview.zv_pinch_start(&z, mid_x, mid_y)              // the second finger came down
+//     zoomview.zv_pinch_move(&z, scale, mid_x, mid_y)        // scale = distance now / distance at the start
+//     zoomview.zv_pinch_end(&z)
+//     zoomview.zv_double_tap(&z, x, y)                       // zoomed -> back to 1, else ZV_DOUBLE about the tap point
+//     zoomview.zv_dest(&z, &dx, &dy, &dw, &dh)               // where the whole picture lies (may reach out of the viewport)
+//     zoomview.zv_visible(&z, &sx, &sy, &sw, &sh, &tx, &ty, &tw, &th)   // the part inside the viewport: source pixels + target rect
+//
+// The picture never leaves the viewport: a picture bigger than the viewport (on one axis) is clamped so that no empty edge opens; a
+// smaller one stays centred on that axis.
+
+export {
+    ZoomView, ZV_MAX, ZV_DOUBLE,
+    zv_new, zv_open, zv_layout, zv_pan, zv_pinch_start, zv_pinch_move, zv_pinch_end, zv_double_tap, zv_reset, zv_zoom, zv_zoomed,
+    zv_dest, zv_visible, zv_contains,
+}
+
+const ZV_MAX: f64 = 8.0
+const ZV_DOUBLE: f64 = 2.5
+const ZV_MIN: f64 = 1.0
+
+struct ZoomView {
+    iw: f64, // picture size in its own pixels
+    ih: f64,
+    z: f64, // zoom against the fitted size
+    ox: f64, // offset of the picture centre from the viewport centre
+    oy: f64,
+    base_z: f64, // zoom at the start of a pinch
+    last_mx: f64, // pinch mid point of the last event (two-finger drag)
+    last_my: f64,
+    vx: f64, // viewport
+    vy: f64,
+    vw: f64,
+    vh: f64,
+}
+
+fn zv_new() -> ZoomView {
+    return ZoomView { iw: 1.0, ih: 1.0, z: 1.0, ox: 0.0, oy: 0.0, base_z: 1.0, last_mx: 0.0, last_my: 0.0, vx: 0.0, vy: 0.0, vw: 1.0, vh: 1.0 }
+}
+
+fn fmin(a: f64, b: f64) -> f64 {
+    if a < b { return a }
+    return b
+}
+
+fn fmax(a: f64, b: f64) -> f64 {
+    if a > b { return a }
+    return b
+}
+
+// a new picture: zoom 1, centred
+fn zv_open(v: *mut ZoomView, iw: usize, ih: usize) {
+    (*v).iw = fmax(iw as f64, 1.0)
+    (*v).ih = fmax(ih as f64, 1.0)
+    zv_reset(v)
+}
+
+fn zv_reset(v: *mut ZoomView) {
+    (*v).z = 1.0
+    (*v).ox = 0.0
+    (*v).oy = 0.0
+    (*v).base_z = 1.0
+}
+
+fn zv_zoomed(v: *mut ZoomView) -> bool { return (*v).z > 1.02 }
+fn zv_zoom(v: *mut ZoomView) -> f64 { return (*v).z }
+
+// the scale that fits the whole picture into the viewport
+fn fit(v: *mut ZoomView) -> f64 {
+    return fmin((*v).vw / (*v).iw, (*v).vh / (*v).ih)
+}
+
+// keep the picture inside: bigger than the viewport on an axis = no empty edge; smaller = centred
+fn clamp_offset(v: *mut ZoomView) {
+    let s: f64 = fit(v) * (*v).z
+    let mx: f64 = fmax(((*v).iw * s - (*v).vw) * 0.5, 0.0)
+    let my: f64 = fmax(((*v).ih * s - (*v).vh) * 0.5, 0.0)
+    (*v).ox = fmax(-mx, fmin(mx, (*v).ox))
+    (*v).oy = fmax(-my, fmin(my, (*v).oy))
+}
+
+fn zv_layout(v: *mut ZoomView, x: f64, y: f64, w: f64, h: f64) {
+    (*v).vx = x
+    (*v).vy = y
+    (*v).vw = fmax(w, 1.0)
+    (*v).vh = fmax(h, 1.0)
+    clamp_offset(v)
+}
+
+// a finger moved by (dx, dy): drags a zoomed picture
+fn zv_pan(v: *mut ZoomView, dx: f64, dy: f64) {
+    if !zv_zoomed(v) { return }
+    (*v).ox = (*v).ox + dx
+    (*v).oy = (*v).oy + dy
+    clamp_offset(v)
+}
+
+// zoom to `zn` so that the picture point under (fx, fy) stays under it
+fn zoom_about(v: *mut ZoomView, fx: f64, fy: f64, zn0: f64) {
+    let zn: f64 = fmax(ZV_MIN, fmin(ZV_MAX, zn0))
+    let zo: f64 = (*v).z
+    let cx: f64 = (*v).vx + (*v).vw * 0.5
+    let cy: f64 = (*v).vy + (*v).vh * 0.5
+    let k: f64 = zn / zo
+    (*v).ox = (fx - cx) - (fx - cx - (*v).ox) * k
+    (*v).oy = (fy - cy) - (fy - cy - (*v).oy) * k
+    (*v).z = zn
+    if zn <= ZV_MIN + 0.001 {
+        (*v).ox = 0.0
+        (*v).oy = 0.0
+    }
+    clamp_offset(v)
+}
+
+fn zv_pinch_start(v: *mut ZoomView, mx: f64, my: f64) {
+    (*v).base_z = (*v).z
+    (*v).last_mx = mx
+    (*v).last_my = my
+}
+
+// scale: finger distance now against the start. The mid point also drags (two fingers move the picture).
+fn zv_pinch_move(v: *mut ZoomView, scale: f64, mx: f64, my: f64) {
+    if scale <= 0.0 { return }
+    let ddx: f64 = mx - (*v).last_mx
+    let ddy: f64 = my - (*v).last_my
+    (*v).last_mx = mx
+    (*v).last_my = my
+    zoom_about(v, mx - ddx, my - ddy, (*v).base_z * scale)
+    if zv_zoomed(v) {
+        (*v).ox = (*v).ox + ddx
+        (*v).oy = (*v).oy + ddy
+        clamp_offset(v)
+    }
+}
+
+fn zv_pinch_end(v: *mut ZoomView) {
+    if (*v).z < 1.02 { zv_reset(v) }
+    (*v).base_z = (*v).z
+}
+
+// zoomed -> back to the fitted picture, else zoom in on the tapped point
+fn zv_double_tap(v: *mut ZoomView, x: f64, y: f64) {
+    if zv_zoomed(v) {
+        zv_reset(v)
+    } else {
+        zoom_about(v, x, y, ZV_DOUBLE)
+    }
+}
+
+// where the whole picture lies now
+fn zv_dest(v: *mut ZoomView, dx: *mut f64, dy: *mut f64, dw: *mut f64, dh: *mut f64) {
+    let s: f64 = fit(v) * (*v).z
+    *dw = (*v).iw * s
+    *dh = (*v).ih * s
+    *dx = (*v).vx + (*v).vw * 0.5 + (*v).ox - *dw * 0.5
+    *dy = (*v).vy + (*v).vh * 0.5 + (*v).oy - *dh * 0.5
+}
+
+// is the point on the picture (not on the black ground around it)?
+fn zv_contains(v: *mut ZoomView, x: f64, y: f64) -> bool {
+    var dx: f64 = 0.0
+    var dy: f64 = 0.0
+    var dw: f64 = 0.0
+    var dh: f64 = 0.0
+    zv_dest(v, &dx, &dy, &dw, &dh)
+    return x >= dx && x < dx + dw && y >= dy && y < dy + dh
+}
+
+// The part of the picture inside the viewport: the source rectangle (picture pixels, whole numbers) and the matching target rectangle
+// (window pixels). The painter only clips to the canvas, so the caller draws just this crop. False = nothing visible.
+fn zv_visible(v: *mut ZoomView, sx: *mut usize, sy: *mut usize, sw: *mut usize, sh: *mut usize, tx: *mut f64, ty: *mut f64, tw: *mut f64, th: *mut f64) -> bool {
+    var dx: f64 = 0.0
+    var dy: f64 = 0.0
+    var dw: f64 = 0.0
+    var dh: f64 = 0.0
+    zv_dest(v, &dx, &dy, &dw, &dh)
+    let x0: f64 = fmax(dx, (*v).vx)
+    let y0: f64 = fmax(dy, (*v).vy)
+    let x1: f64 = fmin(dx + dw, (*v).vx + (*v).vw)
+    let y1: f64 = fmin(dy + dh, (*v).vy + (*v).vh)
+    if x1 <= x0 || y1 <= y0 { return false }
+    let kx: f64 = (*v).iw / dw // picture pixels per window pixel
+    let ky: f64 = (*v).ih / dh
+    var a: usize = ((x0 - dx) * kx) as usize
+    var b: usize = ((y0 - dy) * ky) as usize
+    var c: usize = ((x1 - dx) * kx + 0.999) as usize
+    var d: usize = ((y1 - dy) * ky + 0.999) as usize
+    let iw: usize = (*v).iw as usize
+    let ih: usize = (*v).ih as usize
+    if c > iw { c = iw }
+    if d > ih { d = ih }
+    if c <= a || d <= b { return false }
+    *sx = a
+    *sy = b
+    *sw = c - a
+    *sh = d - b
+    // the target of the whole-pixel crop (so the crop keeps its scale)
+    *tx = dx + (a as f64) / kx
+    *ty = dy + (b as f64) / ky
+    *tw = (c - a) as f64 / kx
+    *th = (d - b) as f64 / ky
+    return true
+}

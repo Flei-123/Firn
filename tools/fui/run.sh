@@ -1712,6 +1712,7 @@ fi
 build recorder; "$W/recorder" | tail -1
 build ripple; "$W/ripple" | tail -1
 build splitter; "$W/splitter" | tail -1
+build zoomview; "$W/zoomview" | tail -1 # a59: pinch / pan / double tap math of the chat picture viewer
 build xrandr; "$W/xrandr" | tail -1
 build ecosystem; "$W/ecosystem" check | tail -1
 # rechook: the program is built here, the live run (private Xvfb + xdotool, SKIP without them) is the script.

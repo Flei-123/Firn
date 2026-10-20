@@ -36,6 +36,7 @@ from websockets.http11 import Response
 from websockets.datastructures import Headers
 
 TOKEN = "fake.tok+en=1_x"
+HTTPPORT = 0
 # bad network on purpose, REST only (POST /fake/net changes it, or the FAKE_REST_* environment at start)
 NET = {"delay_ms": int(os.environ.get("FAKE_REST_DELAY_MS", "0")), "drop": int(os.environ.get("FAKE_REST_DROP", "0")),
        "status": int(os.environ.get("FAKE_REST_STATUS", "0"))}
@@ -168,7 +169,8 @@ def gen_messages(cid):
         if role == "assistant":
             txt += "\n>STATUS: status=done braucht_nutzer=\"\" naechster_schritt=\"ä\"" 
         m = {"role": role, "text": txt, "at": 1760000000000 + i * 1000}
-        if i == 3: m["images"] = [{"url": "/img/u1/%s/pic.png" % cid}]
+        if i == 7 and os.environ.get("FAKE_NOMD") != "1": m["text"] += "\n\n![md-hist](/img/u1/%s/md.png)\n\nand an absolute one: ![md-abs](http://127.0.0.1:%d/img/u1/%s/abs.png)\n" % (cid, HTTPPORT, cid)
+        if i == 3 and os.environ.get("FAKE_NOIMG") != "1": m["images"] = [{"url": "/img/u1/%s/pic.png" % cid}]
         if i == 5: m["files"] = [{"name": "report.txt", "mime": "text/plain", "size": 2048, "url": "/file/u1/%s/report.txt" % cid}]
         msgs.append(m)
     if os.environ.get("FAKE_TOOLS") == "1" and len(msgs) >= 2:
@@ -240,6 +242,13 @@ async def process_request(conn, request):
             return reply(401, {"error": "Not logged in"})
         cid = unquote(u.path[len("/api/conversations/"):])
         LOG.write(json.dumps({"type": "rest", "method": "GET", "path": u.path, "auth": True}) + "\n"); LOG.flush()
+        if cid not in CONV and os.environ.get("FAKE_HIST") == "1":
+            CONV[cid] = gen_messages(cid)
+            for _m in CONV[cid]: _m["text"] = _m["text"].replace("\x02", "")  # jsteps.fi panics on a stray \x02 (open point), not the subject here
+            if os.environ.get("FAKE_HISTSHORT") == "1":  # short history: one answer with a markdown picture, an own-host absolute one and images[]
+                CONV[cid] = [{"role": "user", "text": "show pics", "at": 1760000000000},
+                             {"role": "assistant", "text": "md:\n\n![md-hist](/img/u1/%s/md.png)\n\nabs:\n\n![md-abs](http://127.0.0.1:%d/img/u1/%s/abs.png)\n\ndl alias:\n\n![alias](/downloads/u1/x/dl.png)\n" % (cid, HTTPPORT, cid), "images": [{"url": "/img/u1/%s/pic.png" % cid}], "at": 1760000001000}]
+            # a59: any chat id of the sidebar has a history (picture in message 3, markdown pictures in 7)
         if cid not in CONV:
             return reply(404, {"error": "Not found"})
         return reply(200, {"conversation": {"messages": CONV[cid]}, "running": False, "partial": ""})
@@ -297,7 +306,7 @@ def rest(method, rawpath, hdr, body):
     if not (path in ("/api/me", "/api/projects", "/api/command-center", "/api/conversations", "/api/tasks",
                      "/api/remote/devices", "/api/settings", "/api/push-token", "/api/stt", "/api/m/upload")
             or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
-            or path.startswith("/vendor/fonts/") or path.startswith("/img/")):
+            or path.startswith("/vendor/fonts/") or path.startswith("/img/") or path.startswith("/dl/")):
         return None
     jtype = hdr.get("content-type")
     entry = {"type": "rest", "method": method, "path": rawpath, "ctype": jtype, "n": len(body)}
@@ -561,7 +570,7 @@ def rest(method, rawpath, hdr, body):
         import hashlib  # the proof for the file picker check: what the server GOT (name, mime, size, sha256 of the octets)
         LOG.write(json.dumps({"type": "upload_body", "name": name, "mime": q.get("mime", [jtype])[0], "size": len(body), "sha256": hashlib.sha256(body).hexdigest()}) + "\n")
         return out(200, {"file": {"name": name, "size": len(body), "mime": jtype, "url": "/file/u1/%s/%s" % (q.get("cid", ["c0"])[0], quote(disk)), "path": "/srv/uploads/u1/%s/%s" % (q.get("cid", ["mobile"])[0], disk)}})
-    if path.startswith("/img/"):  # a PNG gradient (320x200), behind the login like the real /img/
+    if path.startswith("/img/") or path.startswith("/dl/"):  # a PNG gradient (320x200), behind the login like the real /img/
         import zlib, struct
         w, h = 320, 200
         raw = b"".join(b"\x00" + b"".join(bytes((x * 255 // w, y * 255 // h, 160)) for x in range(w)) for y in range(h))
@@ -649,6 +658,10 @@ async def handler(ws):
                 await send(ws, {"type": "token", "cid": cid, "content": "Done: 3 steps.\n>STATUS: status=done"})
             elif text == "code":  # a fenced block + inline code: the monospace face (font slot 1) check
                 await send(ws, {"type": "token", "cid": cid, "content": "Run `ls -la` here:\n\n```sh\nfor f in *.fi; do echo \"$f\"; done\n```\n"})
+            elif text == "img":  # live answer with markdown pictures: relative, absolute own host, delivered (/dl)
+                await send(ws, {"type": "token", "cid": cid, "content": "Pic rel:\n\n![rel](/img/u1/%s/rel.png)\n\n" % cid})
+                await send(ws, {"type": "token", "cid": cid, "content": "Pic abs:\n\n![abs](http://127.0.0.1:%d/img/u1/%s/abs.png)\n\n" % (HTTPPORT, cid)})
+                await send(ws, {"type": "token", "cid": cid, "content": "Pic dl:\n\n![dl](/dl/u1/x/dl.png)\n\nEnd.\n>STATUS: status=done"})
             elif text == "file":
                 FILES["report.txt"] = b"hello report from the fake server\n"
                 await send(ws, {"type": "token", "cid": cid, "content": "Here is the file."})
@@ -777,6 +790,8 @@ async def main():
     srv = await serve(handler, "127.0.0.1", 0, process_request=process_request, compression=None)
     WSPORT = srv.sockets[0].getsockname()[1]
     fs = await asyncio.start_server(front, "127.0.0.1", 0)
+    global HTTPPORT
+    HTTPPORT = fs.sockets[0].getsockname()[1]
     print("PORT", fs.sockets[0].getsockname()[1], flush=True)
     async with fs:
         await fs.serve_forever()
