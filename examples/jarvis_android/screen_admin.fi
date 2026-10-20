@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
-// examples/jarvis_android/screen_admin.fi -- the Admin page (admins only): users, limits, server status, logs.
-// The menu entry (Settings > Admin) exists only after GET /api/m/me said admin == true; every /api/m/admin/* call is checked by the
-// server again (403 for non-admins), so a hidden button is never the protection. An older server (404) = no admin page.
-// Data: jarvisapi.AK_ADM_* answers are rendered to text lines (parse_admin_text) and shown in one list.
+// examples/jarvis_android/screen_admin.fi -- the Admin page (admins only), the web admin modal as tabs:
+// Users | Invites | Accounts | Devices | Models | Keys | Prompt | Permissions (+ app-only: Server, Logs).
+// The menu entry (Settings > Admin) exists only after GET /api/m/me said admin == true; every admin route checks the session again
+// (403 for non-admins), so a hidden button is never the protection. An older server (404) = no admin page.
+// Data: the SAME routes the web UI uses (/api/admin/*, /api/accounts; the app's session cookie is accepted); answers become flat
+// records (jadmin.fi) shown as cards. Actions: pick a card, tap a button below the tabs; destructive ones ask twice (tap again).
+// Server / Logs keep the old /api/m/admin/* text lines.
 import std.rt
 import std.time
+import std.clipboard
 import fui.app
 import fui.vlist
 import net.jarvisapi
@@ -12,25 +16,64 @@ import jshell
 import jtheme
 import jlist
 import jtexts
+import jadmin
 import fui.applay
 
 export { screen_admin_build, screen_admin_refresh, admin_api, admin_tick, admin_reset }
 
-const SEC_USERS: usize = 0
-const SEC_LIMITS: usize = 1
-const SEC_SERVER: usize = 2
-const SEC_LOGS: usize = 3
+const T_USERS: usize = 0
+const T_INVITES: usize = 1
+const T_ACCOUNTS: usize = 2
+const T_DEVICES: usize = 3
+const T_MODELS: usize = 4
+const T_KEYS: usize = 5
+const T_PROMPT: usize = 6
+const T_RIGHTS: usize = 7
+const T_SERVER: usize = 8
+const T_LOGS: usize = 9
+const NTABS: usize = 10
+const NBTN: usize = 6
 const ME_EVERY_MS: i64 = 300000
 const LIVE_EVERY_MS: i64 = 10000
+const ROW_PT: usize = 64
+const MAX_MODELS: usize = 256
 
 static mut G_LIST: usize = 0
 static mut G_STAND: usize = 0
-static mut G_LROW: usize = 0
-static mut G_SEC: usize = 0
-static mut G_TEXT: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_INFO: usize = 0
+static mut G_FORM: usize = 0
+static mut G_E1: usize = 0
+static mut G_E2: usize = 0
+static mut G_BTNROW: usize = 0
+static mut G_PBOX: usize = 0
+static mut G_PTEXT: usize = 0
+static mut G_LIMINFO: usize = 0
+static mut G_TABB: [usize; 10] = [0; 10]
+static mut G_BTN: [usize; 6] = [0; 6]
+
+static mut G_TAB: usize = 0
+static mut G_REC: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // records of the shown tab (Keys: the provider keys)
+static mut G_REC2: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // Keys: the SSH keys
+static mut G_N: usize = 0
+static mut G_N2: usize = 0
+static mut G_META: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_RAW: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // Permissions: the last answer (re-read for another user)
+static mut G_TEXT: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // Server / Logs lines
+static mut G_TMP: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_MSG: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // server error text of the last failed action
+static mut G_PROMPT: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_DEFM: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // Models: default alias
+static mut G_EFF: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // Models: default effort
+static mut G_EFFS: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // Models: efforts joined by ","
+static mut G_FL: [u8; 256] = [0; 256] // Models: enabled flag per row
+static mut G_MDIRTY: bool = false
+static mut G_PLOADED: bool = false
+static mut G_RU: usize = 0 // Permissions: which non-admin user
+static mut G_NU: usize = 0
 static mut G_LINES: usize = 0
 static mut G_SEEN: u64 = 0
 static mut G_VER: u64 = 1
+static mut G_LAY: bool = true
 static mut G_NEXT_MS: i64 = 0
 static mut G_ME_NEXT_MS: i64 = 0
 static mut G_ME_FLIGHT: bool = false
@@ -38,41 +81,151 @@ static mut G_SUB: i64 = 0
 static mut G_SLOTS: i64 = 0
 static mut G_LOOP: bool = false
 static mut G_ERR: i64 = 0
+static mut G_LOADED: bool = false
+static mut G_NOTE: usize = 0 // stand line: 0 count, 1 saved, 2 pick a row, 3 confirm, 4 server error, 5 copied, 6 input missing, 7 unsaved
+static mut G_CONF_SEL: usize = 0 // row + 1 whose action asked for the second tap (0 = none)
+static mut G_CONF_ACT: usize = 0
 
-fn sec_kind(sec: usize) -> u32 {
-    if sec == SEC_USERS { return jarvisapi.AK_ADM_USERS }
-    if sec == SEC_LIMITS { return jarvisapi.AK_ADM_LIMITS }
-    if sec == SEC_SERVER { return jarvisapi.AK_ADM_SERVER }
+fn is_text_tab() -> bool { return G_TAB == T_SERVER || G_TAB == T_LOGS }
+
+fn tab_label(t: usize) -> str {
+    if t == T_USERS { return jtexts.t("adm.users") }
+    if t == T_INVITES { return jtexts.t("adm.tab-invites") }
+    if t == T_ACCOUNTS { return jtexts.t("adm.tab-accounts") }
+    if t == T_DEVICES { return jtexts.t("adm.tab-devices") }
+    if t == T_MODELS { return jtexts.t("adm.tab-models") }
+    if t == T_KEYS { return jtexts.t("adm.tab-keys") }
+    if t == T_PROMPT { return jtexts.t("adm.tab-prompt") }
+    if t == T_RIGHTS { return jtexts.t("adm.tab-rights") }
+    if t == T_SERVER { return jtexts.t("adm.server") }
+    return jtexts.t("adm.logs")
+}
+
+fn text_kind(t: usize) -> u32 {
+    if t == T_SERVER { return jarvisapi.AK_ADM_SERVER }
     return jarvisapi.AK_ADM_LOGS
 }
 
-fn sec_path(sec: usize) -> str {
-    if sec == SEC_USERS { return "/api/m/admin/users" }
-    if sec == SEC_LIMITS { return "/api/m/admin/limits" }
-    if sec == SEC_SERVER { return "/api/m/admin/server" }
+fn buf_str(b: *mut rt.Buf) -> str {
+    return str { p: (*b).ptr as *mut u8, n: (*b).len }
+}
+
+fn buf_set(b: *mut rt.Buf, s: str) {
+    rt.buf_clear(b)
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn tmp_clear() { rt.buf_clear(&G_TMP) }
+
+fn tmp_put(s: str) { rt.buf_push_bytes(&G_TMP, s.p as u64, s.n) }
+
+fn tmp_sep() {
+    let sep: str = " · "
+    if G_TMP.len > 0 { rt.buf_push_bytes(&G_TMP, sep.p as u64, sep.n) }
+}
+
+fn tmp_str() -> str { return buf_str(&G_TMP) }
+
+fn rec_n() -> usize { return G_N + G_N2 }
+
+// field f of row r (Keys: the SSH keys follow the provider keys)
+fn fld(r: usize, f: usize) -> str {
+    if r < G_N { return jadmin.rec_field(&G_REC, r, f) }
+    return jadmin.rec_field(&G_REC2, r - G_N, f)
+}
+
+fn flag(r: usize, f: usize) -> bool {
+    return fld(r, f) == "1"
+}
+
+fn to_int(s: str) -> i64 {
+    var v: i64 = 0
+    var neg: bool = false
+    var i: usize = 0
+    while i < s.n {
+        let ch: u8 = rt.ld8(s.p as u64, i)
+        if ch == 45 as u8 { neg = true } else if ch >= 48 as u8 && ch <= 57 as u8 { v = v * 10 + (ch - 48 as u8) as i64 }
+        i = i + 1
+    }
+    if neg { return 0 - v }
+    return v
+}
+
+// ---- requests -------------------------------------------------------------------------------------------------------------------
+
+fn get_tab(path: str, key: str) {
+    let ok: bool = jarvisapi.ja_get_abs(jshell.api(), jadmin.AK_TAB_GET, path, key)
+}
+
+fn text_path(t: usize) -> str {
+    if t == T_SERVER { return "/api/m/admin/server" }
     return "/api/m/admin/logs?lines=80"
 }
 
-// one request for the shown section (the answer comes to admin_api)
 fn ask() {
     G_NEXT_MS = time.now_unix_ms() + LIVE_EVERY_MS
-    let ok: bool = jarvisapi.ja_get_abs(jshell.api(), sec_kind(G_SEC), sec_path(G_SEC), "")
+    let t: usize = G_TAB
+    if is_text_tab() {
+        let ok: bool = jarvisapi.ja_get_abs(jshell.api(), text_kind(t), text_path(t), "")
+        return
+    }
+    if t == T_USERS { get_tab("/api/admin/users", "u") }
+    else if t == T_INVITES { get_tab("/api/admin/invites", "i") }
+    else if t == T_ACCOUNTS { get_tab("/api/accounts", "c") }
+    else if t == T_DEVICES { get_tab("/api/admin/devices", "d") }
+    else if t == T_MODELS { get_tab("/api/admin/models", "m") }
+    else if t == T_KEYS {
+        get_tab("/api/admin/providers", "p")
+        get_tab("/api/admin/pve-keys", "k")
+    } else if t == T_PROMPT {
+        get_tab("/api/admin/system-prompt", "s")
+        let ok: bool = jarvisapi.ja_get_abs(jshell.api(), jarvisapi.AK_ADM_LIMITS, "/api/m/admin/limits", "")
+    } else if t == T_RIGHTS { get_tab("/api/admin/rights", "r") }
+}
+
+fn reset_tab_state() {
+    rt.buf_clear(&G_REC)
+    rt.buf_clear(&G_REC2)
+    rt.buf_clear(&G_META)
+    rt.buf_clear(&G_RAW)
+    rt.buf_clear(&G_TEXT)
+    G_N = 0
+    G_N2 = 0
+    G_LINES = 0
+    G_ERR = 0
+    G_LOADED = false
+    G_NOTE = 0
+    G_CONF_SEL = 0
+    G_MDIRTY = false
+    G_PLOADED = false
+    G_RU = 0
+    G_NU = 0
 }
 
 fn select(sec: usize) {
-    G_SEC = sec
-    rt.buf_clear(&G_TEXT)
-    G_LINES = 0
-    G_ERR = 0
+    G_TAB = sec
+    reset_tab_state()
+    G_LAY = true
     G_VER = G_VER + 1
     ask()
 }
 
-fn on_users(a: *mut app.App) { select(SEC_USERS) }
-fn on_limits(a: *mut app.App) { select(SEC_LIMITS) }
-fn on_server(a: *mut app.App) { select(SEC_SERVER) }
-fn on_logs(a: *mut app.App) { select(SEC_LOGS) }
-fn on_reload(a: *mut app.App) { ask() }
+fn on_t0(a: *mut app.App) { select(0) }
+fn on_t1(a: *mut app.App) { select(1) }
+fn on_t2(a: *mut app.App) { select(2) }
+fn on_t3(a: *mut app.App) { select(3) }
+fn on_t4(a: *mut app.App) { select(4) }
+fn on_t5(a: *mut app.App) { select(5) }
+fn on_t6(a: *mut app.App) { select(6) }
+fn on_t7(a: *mut app.App) { select(7) }
+fn on_t8(a: *mut app.App) { select(8) }
+fn on_t9(a: *mut app.App) { select(9) }
+
+fn on_reload(a: *mut app.App) {
+    G_PLOADED = false
+    G_MDIRTY = false
+    ask()
+}
 
 fn on_sub_dec(a: *mut app.App) { if G_SUB > 1 { let ok: bool = jarvisapi.ja_admin_limit_set(jshell.api(), "maxSubworkers", G_SUB - 1) } }
 fn on_sub_inc(a: *mut app.App) { if G_SUB < 50 { let ok: bool = jarvisapi.ja_admin_limit_set(jshell.api(), "maxSubworkers", G_SUB + 1) } }
@@ -84,7 +237,8 @@ fn on_loop(a: *mut app.App) {
     let ok: bool = jarvisapi.ja_admin_limit_set(jshell.api(), "autoLoop", v)
 }
 
-// the i-th text line (start offset and length); false = no such line
+// ---- rows -----------------------------------------------------------------------------------------------------------------------
+
 fn line_at(i: usize, start: *mut usize, len: *mut usize) -> bool {
     var k: usize = 0
     var pos: usize = 0
@@ -102,14 +256,6 @@ fn line_at(i: usize, start: *mut usize, len: *mut usize) -> bool {
     return false
 }
 
-fn rows(ud: u64, i: usize, out: *mut vlist.VRow) {
-    var st: usize = 0
-    var ln: usize = 0
-    if !line_at(i, &st, &ln) { return }
-    jlist.put(out, str { p: (G_TEXT.ptr as u64 + st as u64) as *mut u8, n: ln })
-    vlist.vrow_sub(out, " ")
-}
-
 fn count_lines() -> usize {
     var n: usize = 0
     var i: usize = 0
@@ -120,6 +266,568 @@ fn count_lines() -> usize {
     return n
 }
 
+fn is_default(r: usize) -> bool {
+    let al: str = fld(r, 0)
+    return G_DEFM.len == al.n && al.n > 0 && rt.mem_eq(G_DEFM.ptr as u64, al.p as u64, al.n)
+}
+
+fn status_word(s: str) -> str {
+    if s == "offen" { return jtexts.t("adm.w-open") }
+    if s == "benutzt" { return jtexts.t("adm.w-used") }
+    if s == "zurückgezogen" { return jtexts.t("adm.w-revoked") }
+    if s == "abgelaufen" { return jtexts.t("adm.w-expired") }
+    return s
+}
+
+fn level_word(l: i64) -> str {
+    if l == 1 { return "read" }
+    if l == 2 { return "write" }
+    if l == 3 { return "shell" }
+    return jtexts.t("adm.w-none")
+}
+
+fn put_title(out: *mut vlist.VRow, s: str) {
+    jlist.put(out, s)
+}
+
+fn row_users(r: usize, out: *mut vlist.VRow) {
+    put_title(out, fld(r, 1))
+    if flag(r, 6) {
+        jlist.put(out, " (")
+        jlist.put(out, jtexts.t("adm.w-you"))
+        jlist.put(out, ")")
+    }
+    if flag(r, 2) { vlist.vrow_detail(out, jtexts.t("adm.w-admin")) }
+    vlist.vrow_sub(out, fld(r, 3))
+    tmp_clear()
+    if flag(r, 4) { tmp_put(jtexts.t("adm.w-online")) }
+    if flag(r, 5) {
+        tmp_sep()
+        tmp_put(jtexts.t("adm.w-push"))
+    }
+    vlist.vrow_sub2(out, tmp_str())
+}
+
+fn row_invites(r: usize, out: *mut vlist.VRow) {
+    put_title(out, fld(r, 0))
+    vlist.vrow_detail(out, status_word(fld(r, 2)))
+    tmp_clear()
+    tmp_put(fld(r, 1))
+    if fld(r, 3).n > 0 {
+        tmp_sep()
+        tmp_put(fld(r, 3))
+    }
+    vlist.vrow_sub(out, tmp_str())
+    tmp_clear()
+    if fld(r, 4).n > 0 {
+        tmp_put(jtexts.t1("adm.w-usedby", "name", fld(r, 4)))
+    } else if fld(r, 2) == "offen" {
+        let days: i64 = to_int(fld(r, 5))
+        if days < 0 { tmp_put(jtexts.t("adm.w-forever")) } else { tmp_put(jtexts.t1("adm.w-days", "value", jshell.dec(days))) }
+    }
+    vlist.vrow_sub2(out, tmp_str())
+}
+
+fn row_accounts(r: usize, out: *mut vlist.VRow) {
+    put_title(out, fld(r, 1))
+    if flag(r, 3) {
+        vlist.vrow_detail(out, jtexts.t("adm.w-off"))
+    } else if flag(r, 2) {
+        vlist.vrow_detail(out, jtexts.t("adm.w-active"))
+        (*out).pill_tint = 0x3fb950 as u32
+    }
+    tmp_clear()
+    let p5: i64 = to_int(fld(r, 6))
+    if p5 >= 0 {
+        tmp_put("5h ")
+        tmp_put(jshell.dec(p5))
+        tmp_put(" %")
+        let p7: i64 = to_int(fld(r, 7))
+        if p7 >= 0 {
+            tmp_sep()
+            tmp_put("7d ")
+            tmp_put(jshell.dec(p7))
+            tmp_put(" %")
+        }
+    }
+    let fr: i64 = to_int(fld(r, 5))
+    if fr >= 0 {
+        tmp_sep()
+        tmp_put(jtexts.t1("adm.w-free", "value", jshell.dec(fr)))
+    }
+    vlist.vrow_sub(out, tmp_str())
+    tmp_clear()
+    tmp_put(jtexts.t1("adm.w-runs", "value", fld(r, 8)))
+    if fld(r, 4) == "token" {
+        tmp_sep()
+        tmp_put("setup-token")
+    }
+    if flag(r, 9) {
+        tmp_sep()
+        tmp_put(jtexts.t("adm.w-blocked"))
+    }
+    vlist.vrow_sub2(out, tmp_str())
+}
+
+fn row_devices(r: usize, out: *mut vlist.VRow) {
+    put_title(out, fld(r, 1))
+    if flag(r, 4) {
+        vlist.vrow_detail(out, jtexts.t("adm.w-mine"))
+    } else if flag(r, 3) {
+        vlist.vrow_detail(out, jtexts.t("adm.w-own"))
+    }
+    vlist.vrow_sub(out, fld(r, 2))
+}
+
+fn row_models(r: usize, out: *mut vlist.VRow) {
+    put_title(out, fld(r, 0))
+    if is_default(r) { vlist.vrow_detail(out, jtexts.t("adm.w-default")) }
+    if r < MAX_MODELS && G_FL[r] != 0 as u8 {
+        vlist.vrow_sub(out, jtexts.t("adm.w-on"))
+        (*out).pill_tint = 0x3fb950 as u32
+    } else {
+        vlist.vrow_sub(out, jtexts.t("adm.w-off"))
+    }
+}
+
+fn row_keys(r: usize, out: *mut vlist.VRow) {
+    put_title(out, fld(r, 1))
+    let provider: bool = fld(r, 6) == "P"
+    if provider {
+        if flag(r, 2) { vlist.vrow_detail(out, jtexts.t("adm.w-set")) } else { vlist.vrow_detail(out, jtexts.t("adm.w-empty")) }
+        tmp_clear()
+        tmp_put(fld(r, 3))
+        if fld(r, 4).n > 0 {
+            tmp_sep()
+            tmp_put(fld(r, 4))
+        }
+        vlist.vrow_sub(out, tmp_str())
+        vlist.vrow_sub2(out, "API")
+    } else {
+        if flag(r, 2) { vlist.vrow_detail(out, jtexts.t("adm.w-on")) } else { vlist.vrow_detail(out, jtexts.t("adm.w-off")) }
+        vlist.vrow_sub(out, fld(r, 3))
+        vlist.vrow_sub2(out, "SSH")
+    }
+}
+
+fn row_rights(r: usize, out: *mut vlist.VRow) {
+    put_title(out, fld(r, 0))
+    vlist.vrow_detail(out, level_word(to_int(fld(r, 1))))
+    vlist.vrow_sub(out, fld(r, 3))
+}
+
+fn rows(ud: u64, i: usize, out: *mut vlist.VRow) {
+    if is_text_tab() {
+        var st: usize = 0
+        var ln: usize = 0
+        if !line_at(i, &st, &ln) { return }
+        jlist.put(out, str { p: (G_TEXT.ptr as u64 + st as u64) as *mut u8, n: ln })
+        vlist.vrow_sub(out, " ")
+        return
+    }
+    if i >= rec_n() { return }
+    let t: usize = G_TAB
+    if t == T_USERS { row_users(i, out) }
+    else if t == T_INVITES { row_invites(i, out) }
+    else if t == T_ACCOUNTS { row_accounts(i, out) }
+    else if t == T_DEVICES { row_devices(i, out) }
+    else if t == T_MODELS { row_models(i, out) }
+    else if t == T_KEYS { row_keys(i, out) }
+    else if t == T_RIGHTS { row_rights(i, out) }
+}
+
+// ---- actions --------------------------------------------------------------------------------------------------------------------
+
+fn note(k: usize) {
+    G_NOTE = k
+    G_VER = G_VER + 1
+}
+
+fn selected(a: *mut app.App) -> usize {
+    let s: usize = app.vlist_selected(a, G_LIST)
+    if s == app.NONE || s >= rec_n() { return app.NONE }
+    return s
+}
+
+// a row must be picked; shows the hint when not
+fn need_row(a: *mut app.App) -> usize {
+    let s: usize = selected(a)
+    if s == app.NONE { note(2) }
+    return s
+}
+
+// second tap on the same row and button = go on
+fn confirmed(sel: usize, act: usize) -> bool {
+    if G_CONF_SEL == sel + 1 && G_CONF_ACT == act {
+        G_CONF_SEL = 0
+        return true
+    }
+    G_CONF_SEL = sel + 1
+    G_CONF_ACT = act
+    note(3)
+    return false
+}
+
+fn send(path: str, key: str) {
+    if !jadmin.post_spec(jshell.api(), path, key) {
+        G_ERR = 599
+        note(4)
+    }
+}
+
+fn b2s(v: bool) -> str {
+    if v { return "1" }
+    return "0"
+}
+
+fn act_users(a: *mut app.App, i: usize) {
+    if i == 2 {
+        let name: str = app.text(a, G_E1)
+        let pw: str = app.text(a, G_E2)
+        if name.n < 2 || pw.n < 8 {
+            note(6)
+            return
+        }
+        jadmin.spec_clear()
+        jadmin.spec_add("action", "s", "create")
+        jadmin.spec_add("username", "s", name)
+        jadmin.spec_add("password", "s", pw)
+        send("/api/admin/users", "u")
+        return
+    }
+    let s: usize = need_row(a)
+    if s == app.NONE { return }
+    jadmin.spec_clear()
+    jadmin.spec_add("uid", "s", fld(s, 0))
+    if i == 0 {
+        jadmin.spec_add("admin", "b", b2s(!flag(s, 2)))
+    } else if i == 1 {
+        let pw: str = app.text(a, G_E2)
+        if pw.n < 8 {
+            note(6)
+            return
+        }
+        jadmin.spec_add("action", "s", "setpw")
+        jadmin.spec_add("password", "s", pw)
+    } else {
+        if !confirmed(s, i) { return }
+        jadmin.spec_add("action", "s", "remove")
+    }
+    send("/api/admin/users", "u")
+}
+
+fn act_invites(a: *mut app.App, i: usize) {
+    if i == 0 {
+        jadmin.spec_clear()
+        jadmin.spec_add("action", "s", "create")
+        jadmin.spec_add("note", "s", app.text(a, G_E1))
+        jadmin.spec_add("days", "i", "7")
+        send("/api/admin/invites", "i")
+        return
+    }
+    if i == 4 {
+        let on: bool = jadmin.rec_field(&G_META, 0, 1) == "1"
+        jadmin.spec_clear()
+        jadmin.spec_add("action", "s", "dauercode")
+        jadmin.spec_add("an", "b", b2s(!on))
+        send("/api/admin/invites", "i")
+        return
+    }
+    let s: usize = need_row(a)
+    if s == app.NONE { return }
+    if i == 1 {
+        let ok: bool = clipboard.copy_text(fld(s, 0))
+        note(5)
+        return
+    }
+    jadmin.spec_clear()
+    jadmin.spec_add("code", "s", fld(s, 0))
+    if i == 2 {
+        jadmin.spec_add("action", "s", "revoke")
+    } else {
+        if !confirmed(s, i) { return }
+        jadmin.spec_add("action", "s", "remove")
+    }
+    send("/api/admin/invites", "i")
+}
+
+fn act_accounts(a: *mut app.App, i: usize) {
+    if i == 2 {
+        let tok: str = app.text(a, G_E2)
+        if tok.n < 8 {
+            note(6)
+            return
+        }
+        jadmin.spec_clear()
+        jadmin.spec_add("token", "s", tok)
+        jadmin.spec_add("label", "s", app.text(a, G_E1))
+        send("/api/accounts", "c")
+        return
+    }
+    let s: usize = need_row(a)
+    if s == app.NONE { return }
+    jadmin.spec_clear()
+    if i == 0 {
+        jadmin.spec_add("toggle", "s", fld(s, 0))
+        jadmin.spec_add("disabled", "b", b2s(!flag(s, 3)))
+    } else {
+        if fld(s, 4) != "token" { return }
+        if !confirmed(s, i) { return }
+        jadmin.spec_add("remove", "s", fld(s, 0))
+    }
+    send("/api/accounts", "c")
+}
+
+fn act_devices(a: *mut app.App, i: usize) {
+    let s: usize = need_row(a)
+    if s == app.NONE { return }
+    jadmin.spec_clear()
+    jadmin.spec_add("uid", "s", fld(s, 0))
+    jadmin.spec_add("name", "s", fld(s, 1))
+    jadmin.spec_add("borrow", "b", b2s(!flag(s, 4)))
+    send("/api/admin/devices", "d")
+}
+
+// next effort of the list after the current one (the first when none / last)
+fn next_effort() {
+    let all: str = buf_str(&G_EFFS)
+    if all.n == 0 { return }
+    var pos: usize = 0
+    var first_s: usize = 0
+    var first_e: usize = 0
+    var have_first: bool = false
+    var take_next: bool = false
+    while pos <= all.n {
+        var e: usize = pos
+        while e < all.n && rt.ld8(all.p as u64, e) != 44 as u8 { e = e + 1 }
+        let item: str = str { p: (all.p as u64 + pos as u64) as *mut u8, n: e - pos }
+        if item.n > 0 {
+            if !have_first {
+                have_first = true
+                first_s = pos
+                first_e = e
+            }
+            if take_next {
+                buf_set(&G_EFF, item)
+                return
+            }
+            if G_EFF.len == item.n && rt.mem_eq(G_EFF.ptr as u64, item.p as u64, item.n) { take_next = true }
+        }
+        pos = e + 1
+    }
+    buf_set(&G_EFF, str { p: (all.p as u64 + first_s as u64) as *mut u8, n: first_e - first_s })
+}
+
+fn act_models(a: *mut app.App, i: usize) {
+    if i == 2 {
+        next_effort()
+        G_MDIRTY = true
+        note(7)
+        return
+    }
+    if i == 3 {
+        var en: rt.Buf = rt.buf_new()
+        var r: usize = 0
+        var first: bool = true
+        while r < G_N && r < MAX_MODELS {
+            if G_FL[r] != 0 as u8 {
+                if !first { rt.buf_push(&en, 3 as u8) }
+                first = false
+                rt.buf_push_bytes(&en, fld(r, 0).p as u64, fld(r, 0).n)
+            }
+            r = r + 1
+        }
+        jadmin.spec_clear()
+        jadmin.spec_add("enabled", "a", buf_str(&en))
+        rt.buf_free(&en)
+        if G_DEFM.len > 0 { jadmin.spec_add("defaultModel", "s", buf_str(&G_DEFM)) }
+        if G_EFF.len > 0 { jadmin.spec_add("defaultEffort", "s", buf_str(&G_EFF)) }
+        send("/api/admin/models", "m")
+        return
+    }
+    let s: usize = need_row(a)
+    if s == app.NONE || s >= MAX_MODELS { return }
+    if i == 0 {
+        if G_FL[s] != 0 as u8 { G_FL[s] = 0 as u8 } else { G_FL[s] = 1 as u8 }
+    } else {
+        buf_set(&G_DEFM, fld(s, 0))
+        G_FL[s] = 1 as u8
+    }
+    G_MDIRTY = true
+    G_SEEN = 0
+    note(7)
+}
+
+fn act_keys(a: *mut app.App, i: usize) {
+    if i == 4 {
+        let key: str = app.text(a, G_E2)
+        if key.n < 20 {
+            note(6)
+            return
+        }
+        jadmin.spec_clear()
+        jadmin.spec_add("action", "s", "add")
+        jadmin.spec_add("key", "s", key)
+        jadmin.spec_add("label", "s", app.text(a, G_E1))
+        send("/api/admin/pve-keys", "k")
+        return
+    }
+    let s: usize = need_row(a)
+    if s == app.NONE { return }
+    let provider: bool = fld(s, 6) == "P"
+    jadmin.spec_clear()
+    if i == 0 || i == 1 {
+        if !provider { return }
+        jadmin.spec_add("provider", "s", fld(s, 0))
+        if i == 0 {
+            let key: str = app.text(a, G_E2)
+            if key.n < 8 {
+                note(6)
+                return
+            }
+            jadmin.spec_add("key", "s", key)
+        } else {
+            if !confirmed(s, i) { return }
+            jadmin.spec_add("key", "n", "")
+        }
+        send("/api/admin/providers", "p")
+        return
+    }
+    if provider { return }
+    jadmin.spec_add("id", "s", fld(s, 0))
+    if i == 2 {
+        jadmin.spec_add("action", "s", "toggle")
+        jadmin.spec_add("active", "b", b2s(!flag(s, 2)))
+    } else {
+        if !confirmed(s, i) { return }
+        jadmin.spec_add("action", "s", "remove")
+    }
+    send("/api/admin/pve-keys", "k")
+}
+
+fn rights_parse() {
+    rt.buf_clear(&G_REC)
+    let ok: bool = jadmin.parse_rights(G_RAW.ptr as u64, G_RAW.len, &G_REC, &G_META, G_RU)
+    G_N = jadmin.rec_count(&G_REC)
+    G_NU = to_int(jadmin.rec_field(&G_META, 0, 0)) as usize
+}
+
+fn act_rights(a: *mut app.App, i: usize) {
+    if i == 0 {
+        if G_NU > 0 { G_RU = (G_RU + 1) % G_NU }
+        rights_parse()
+        G_SEEN = 0
+        G_VER = G_VER + 1
+        return
+    }
+    let s: usize = need_row(a)
+    if s == app.NONE { return }
+    var lv: usize = (to_int(fld(s, 1)) as usize + 1) % 4
+    jadmin.spec_clear()
+    jadmin.spec_add("uid", "s", fld(s, 2))
+    jadmin.spec_add("project", "s", fld(s, 0))
+    if lv == 0 { jadmin.spec_add("level", "n", "") } else { jadmin.spec_add("level", "s", jadmin.level_name(lv)) }
+    send("/api/admin/rights", "r")
+}
+
+fn act(a: *mut app.App, i: usize) {
+    let t: usize = G_TAB
+    if t == T_USERS { act_users(a, i) }
+    else if t == T_INVITES { act_invites(a, i) }
+    else if t == T_ACCOUNTS { act_accounts(a, i) }
+    else if t == T_DEVICES { act_devices(a, i) }
+    else if t == T_MODELS { act_models(a, i) }
+    else if t == T_KEYS { act_keys(a, i) }
+    else if t == T_RIGHTS { act_rights(a, i) }
+}
+
+fn on_b0(a: *mut app.App) { act(a, 0) }
+fn on_b1(a: *mut app.App) { act(a, 1) }
+fn on_b2(a: *mut app.App) { act(a, 2) }
+fn on_b3(a: *mut app.App) { act(a, 3) }
+fn on_b4(a: *mut app.App) { act(a, 4) }
+fn on_b5(a: *mut app.App) { act(a, 5) }
+
+fn on_prompt_save(a: *mut app.App) {
+    jadmin.spec_clear()
+    jadmin.spec_add("prompt", "s", app.text(a, G_PTEXT))
+    send("/api/admin/system-prompt", "s")
+}
+
+// label of action button i on the shown tab ("" = not used)
+fn btn_label(t: usize, i: usize) -> str {
+    if t == T_USERS {
+        if i == 0 { return jtexts.t("adm.b-admin") }
+        if i == 1 { return jtexts.t("adm.b-setpw") }
+        if i == 2 { return jtexts.t("adm.b-create") }
+        if i == 3 { return jtexts.t("adm.b-remove") }
+    } else if t == T_INVITES {
+        if i == 0 { return jtexts.t("adm.b-newcode") }
+        if i == 1 { return jtexts.t("adm.b-copy") }
+        if i == 2 { return jtexts.t("adm.b-revoke") }
+        if i == 3 { return jtexts.t("adm.b-remove") }
+        if i == 4 { return jtexts.t("adm.b-perm") }
+    } else if t == T_ACCOUNTS {
+        if i == 0 { return jtexts.t("adm.b-toggle") }
+        if i == 1 { return jtexts.t("adm.b-remove") }
+        if i == 2 { return jtexts.t("adm.b-addtoken") }
+    } else if t == T_DEVICES {
+        if i == 0 { return jtexts.t("adm.b-borrow") }
+    } else if t == T_MODELS {
+        if i == 0 { return jtexts.t("adm.b-toggle") }
+        if i == 1 { return jtexts.t("adm.b-default") }
+        if i == 2 {
+            if G_EFF.len == 0 { return jtexts.t1("adm.b-effort", "name", "-") }
+            return jtexts.t1("adm.b-effort", "name", buf_str(&G_EFF))
+        }
+        if i == 3 { return jtexts.t("adm.b-save") }
+    } else if t == T_KEYS {
+        if i == 0 { return jtexts.t("adm.b-setkey") }
+        if i == 1 { return jtexts.t("adm.b-delkey") }
+        if i == 2 { return jtexts.t("adm.b-active") }
+        if i == 3 { return jtexts.t("adm.b-remove") }
+        if i == 4 { return jtexts.t("adm.b-addssh") }
+    } else if t == T_RIGHTS {
+        if i == 0 {
+            if G_REC.len > 0 { return jtexts.t1("adm.b-user", "name", fld(0, 3)) }
+            return jtexts.t1("adm.b-user", "name", "-")
+        }
+        if i == 1 { return jtexts.t("adm.b-level") }
+    }
+    return ""
+}
+
+fn info_text() -> str {
+    tmp_clear()
+    if G_TAB == T_INVITES && G_LOADED {
+        tmp_put(jtexts.t("adm.i-perm"))
+        tmp_put(": ")
+        tmp_put(jadmin.rec_field(&G_META, 0, 0))
+        tmp_put(" (")
+        if jadmin.rec_field(&G_META, 0, 1) == "1" { tmp_put(jtexts.t("adm.w-on")) } else { tmp_put(jtexts.t("adm.w-off")) }
+        tmp_put(")")
+    } else if G_TAB == T_MODELS && G_DEFM.len > 0 {
+        tmp_put(jtexts.t1("adm.i-model", "name", buf_str(&G_DEFM)))
+    }
+    return tmp_str()
+}
+
+fn conf_reset() { G_CONF_SEL = 0 }
+
+// ---- page -----------------------------------------------------------------------------------------------------------------------
+
+fn chip(a: *mut app.App, idx: usize, handler: fn(*mut app.App)) {
+    let b: usize = app.button(a, tab_label(idx), handler)
+    jtheme.style_node(a, b, jtheme.K_CHIP)
+    G_TABB[idx] = b
+}
+
+fn abtn(a: *mut app.App, idx: usize, handler: fn(*mut app.App)) {
+    let b: usize = app.button(a, " ", handler)
+    jtheme.style_node(a, b, jtheme.K_CHIP)
+    G_BTN[idx] = b
+}
+
 fn screen_admin_build(a: *mut app.App) {
     let ttl: usize = app.label(a, jtexts.t("adm.title"), 0)
     jtheme.style_node(a, ttl, jtheme.K_TITLE)
@@ -128,13 +836,47 @@ fn screen_admin_build(a: *mut app.App) {
     applay.align_start(a, G_STAND)
     jtheme.style_node(a, G_STAND, jtheme.K_DIM)
     applay.hrow(a)
-    jtheme.style_node(a, app.button(a, jtexts.t("adm.users"), on_users), jtheme.K_CHIP)
-    jtheme.style_node(a, app.button(a, jtexts.t("adm.limits"), on_limits), jtheme.K_CHIP)
-    jtheme.style_node(a, app.button(a, jtexts.t("adm.server"), on_server), jtheme.K_CHIP)
-    jtheme.style_node(a, app.button(a, jtexts.t("adm.logs"), on_logs), jtheme.K_CHIP)
+    chip(a, 0, on_t0)
+    chip(a, 1, on_t1)
+    chip(a, 2, on_t2)
+    chip(a, 3, on_t3)
+    chip(a, 4, on_t4)
+    chip(a, 5, on_t5)
+    chip(a, 6, on_t6)
+    chip(a, 7, on_t7)
+    chip(a, 8, on_t8)
+    chip(a, 9, on_t9)
     app.end(a)
-    G_LROW = applay.vstack(a)
-    applay.gap(a, G_LROW, 4, 4)
+    G_INFO = app.label(a, " ", 11)
+    applay.align_start(a, G_INFO)
+    jtheme.style_node(a, G_INFO, jtheme.K_DIM)
+    G_FORM = applay.vstack(a)
+    applay.gap(a, G_FORM, 6, 6)
+    G_E1 = app.entry(a, jtexts.tp("adm.h-name"))
+    applay.stretch(a, G_E1)
+    G_E2 = app.entry(a, jtexts.tp("adm.h-secret"))
+    applay.stretch(a, G_E2)
+    app.set_secret(a, G_E2, true)
+    app.end(a)
+    G_BTNROW = applay.hrow(a)
+    abtn(a, 0, on_b0)
+    abtn(a, 1, on_b1)
+    abtn(a, 2, on_b2)
+    abtn(a, 3, on_b3)
+    abtn(a, 4, on_b4)
+    abtn(a, 5, on_b5)
+    app.end(a)
+    // Prompt tab: the admin prompt (text area + save) and the limits
+    G_PBOX = applay.vstack(a)
+    applay.gap(a, G_PBOX, 6, 6)
+    G_PTEXT = app.textarea(a, jtexts.tp("adm.h-prompt"), 12)
+    applay.stretch(a, G_PTEXT)
+    applay.hrow(a)
+    jtheme.style_node(a, app.button(a, jtexts.t("adm.b-save"), on_prompt_save), jtheme.K_CHIP)
+    app.end(a)
+    G_LIMINFO = app.label(a, " ", 11)
+    applay.align_start(a, G_LIMINFO)
+    jtheme.style_node(a, G_LIMINFO, jtheme.K_DIM)
     applay.hrow(a)
     jtheme.style_node(a, app.button(a, jtexts.t("adm.sub") + " -", on_sub_dec), jtheme.K_CHIP)
     jtheme.style_node(a, app.button(a, jtexts.t("adm.sub") + " +", on_sub_inc), jtheme.K_CHIP)
@@ -149,8 +891,8 @@ fn screen_admin_build(a: *mut app.App) {
     app.vlist_set_bar_pt(a, G_LIST, 0) // no scrollbar strip (web mobile has none): equal page edges
     jtheme.style_node(a, G_LIST, jtheme.K_PLAIN)
     applay.stretch(a, G_LIST)
-    app.vlist_set_row_pt(a, G_LIST, jlist.CARD_PT / 2)
-    jlist.fit_pt(a, G_LIST, 0, 1, 8, jlist.CARD_PT / 2)
+    app.vlist_set_row_pt(a, G_LIST, ROW_PT)
+    jlist.fit_pt(a, G_LIST, 0, 1, 8, ROW_PT)
     jlist.flex_list(a, G_LIST, 60)
     jlist.pull_add(G_LIST, on_reload)
     jlist.pull_install(a)
@@ -159,35 +901,179 @@ fn screen_admin_build(a: *mut app.App) {
     app.end(a)
 }
 
+// what the shown tab needs: form fields, action buttons, list or prompt box
+fn apply_layout(a: *mut app.App) {
+    let t: usize = G_TAB
+    var i: usize = 0
+    while i < NTABS {
+        if i == t { jtheme.style_node(a, G_TABB[i], jtheme.K_CHIP_ON) } else { jtheme.style_node(a, G_TABB[i], jtheme.K_CHIP) }
+        i = i + 1
+    }
+    let form: bool = t == T_USERS || t == T_INVITES || t == T_ACCOUNTS || t == T_KEYS
+    jshell.set_shown(a, G_FORM, form, 0)
+    jshell.set_shown(a, G_E2, t != T_INVITES, 0)
+    let btns: bool = t <= T_KEYS || t == T_RIGHTS
+    jshell.set_shown(a, G_BTNROW, btns && t != T_PROMPT, 0)
+    jshell.set_shown(a, G_PBOX, t == T_PROMPT, 0)
+    app.set_text(a, G_E1, "")
+    app.set_text(a, G_E2, "")
+    G_SEEN = 0
+}
+
+fn relabel(a: *mut app.App) {
+    var i: usize = 0
+    while i < NBTN {
+        let s: str = btn_label(G_TAB, i)
+        if s.n > 0 { app.set_text(a, G_BTN[i], s) }
+        jshell.set_shown(a, G_BTN[i], s.n > 0, 0)
+        i = i + 1
+    }
+}
+
+fn stand_text() -> str {
+    if G_ERR == 403 { return jtexts.t("adm.denied") }
+    if G_ERR == 404 { return jtexts.t("adm.unavail") }
+    if G_NOTE == 4 {
+        if G_MSG.len > 0 { return jtexts.t1("adm.m-error", "name", buf_str(&G_MSG)) }
+        return jtexts.t1("adm.m-error", "name", jshell.dec(G_ERR))
+    }
+    if G_ERR != 0 { return jtexts.t("adm.failed") + " (" + jshell.dec(G_ERR) + ")" }
+    if G_NOTE == 1 { return jtexts.t("adm.m-saved") }
+    if G_NOTE == 2 { return jtexts.t("adm.m-pick") }
+    if G_NOTE == 3 { return jtexts.t("adm.m-confirm") }
+    if G_NOTE == 5 { return jtexts.t("adm.m-copied") }
+    if G_NOTE == 6 { return jtexts.t("adm.m-need") }
+    if G_NOTE == 7 { return jtexts.t("adm.m-dirty") }
+    if !G_LOADED { return jtexts.t("ls.loading") }
+    return ""
+}
+
 fn screen_admin_refresh(a: *mut app.App) {
     // not (or no longer) an admin: leave the page, nothing to show
     if !jshell.is_admin() {
         jshell.request_tab(jshell.TAB_CHAT)
         return
     }
-    if time.now_unix_ms() >= G_NEXT_MS && (G_SEC == SEC_SERVER || G_SEC == SEC_LOGS || G_LINES == 0) { ask() }
-    jshell.set_shown(a, G_LROW, G_SEC == SEC_LIMITS, 0)
+    if time.now_unix_ms() >= G_NEXT_MS && (is_text_tab() || !G_LOADED) { ask() }
+    // another row picked: the "tap again" question belongs to the old one
+    if G_CONF_SEL > 0 && selected(a) + 1 != G_CONF_SEL {
+        G_CONF_SEL = 0
+        if G_NOTE == 3 { G_NOTE = 0 }
+        G_VER = G_VER + 1
+    }
+    if G_LAY {
+        G_LAY = false
+        apply_layout(a)
+    }
     if G_VER != G_SEEN {
         G_SEEN = G_VER
-        G_LINES = count_lines()
-        app.vlist_set_count(a, G_LIST, G_LINES)
-        app.vlist_changed(a, G_LIST)
-        jlist.fit_pt(a, G_LIST, G_LINES, 1, 8, jlist.CARD_PT / 2)
-        app.vlist_set_row_pt(a, G_LIST, jlist.CARD_PT / 2)
-        jshell.set_shown_list(a, G_LIST, G_LINES > 0)
-        if G_ERR == 403 {
-            app.set_text(a, G_STAND, jtexts.t("adm.denied"))
-        } else if G_ERR == 404 {
-            app.set_text(a, G_STAND, jtexts.t("adm.unavail"))
-        } else if G_ERR != 0 {
-            app.set_text(a, G_STAND, jtexts.t("adm.failed") + " (" + jshell.dec(G_ERR) + ")")
-        } else if G_LINES == 0 {
-            app.set_text(a, G_STAND, jtexts.t("ls.loading"))
-        } else {
-            app.set_text(a, G_STAND, "")
+        var n: usize = rec_n()
+        if is_text_tab() {
+            G_LINES = count_lines()
+            n = G_LINES
         }
-        jshell.set_shown(a, G_STAND, G_LINES == 0 || G_ERR != 0, 0)
+        let list_tab: bool = G_TAB != T_PROMPT
+        app.vlist_set_count(a, G_LIST, n)
+        app.vlist_changed(a, G_LIST)
+        jlist.fit_pt(a, G_LIST, n, 1, 8, ROW_PT)
+        app.vlist_set_row_pt(a, G_LIST, ROW_PT)
+        jshell.set_shown_list(a, G_LIST, list_tab && n > 0)
+        relabel(a)
+        let inf: str = info_text()
+        app.set_text(a, G_INFO, inf)
+        jshell.set_shown(a, G_INFO, inf.n > 0, 0)
+        if G_TAB == T_PROMPT {
+            if G_PROMPT.len > 0 || G_LOADED {
+                if !G_PLOADED && G_LOADED {
+                    app.set_text(a, G_PTEXT, buf_str(&G_PROMPT))
+                    G_PLOADED = true
+                }
+            }
+            app.set_text(a, G_LIMINFO, jtexts.t1("adm.i-limits", "name", jshell.dec(G_SUB)) + " " + jshell.dec(G_SLOTS))
+        }
+        let st: str = stand_text()
+        app.set_text(a, G_STAND, st)
+        jshell.set_shown(a, G_STAND, st.n > 0, 0)
     }
+}
+
+// ---- answers --------------------------------------------------------------------------------------------------------------------
+
+fn tab_ok(k0: u8) -> bool {
+    let t: usize = G_TAB
+    if k0 == 117 as u8 { return t == T_USERS }
+    if k0 == 105 as u8 { return t == T_INVITES }
+    if k0 == 99 as u8 { return t == T_ACCOUNTS }
+    if k0 == 100 as u8 { return t == T_DEVICES }
+    if k0 == 109 as u8 { return t == T_MODELS }
+    if k0 == 112 as u8 || k0 == 107 as u8 { return t == T_KEYS }
+    if k0 == 115 as u8 { return t == T_PROMPT }
+    if k0 == 114 as u8 { return t == T_RIGHTS }
+    return false
+}
+
+fn models_loaded() {
+    // flags from the answer; the default model / effort / effort list from the meta record
+    var r: usize = 0
+    while r < G_N && r < MAX_MODELS {
+        if flag(r, 1) { G_FL[r] = 1 as u8 } else { G_FL[r] = 0 as u8 }
+        r = r + 1
+    }
+    buf_set(&G_DEFM, jadmin.rec_field(&G_META, 0, 0))
+    buf_set(&G_EFF, jadmin.rec_field(&G_META, 0, 1))
+    buf_set(&G_EFFS, jadmin.rec_field(&G_META, 0, 2))
+}
+
+fn tab_answer(x: *mut jarvisapi.Api, k0: u8) -> bool {
+    let p: u64 = jarvisapi.ja_body_ptr(x)
+    let n: usize = jarvisapi.ja_body_len(x)
+    var ok: bool = false
+    if k0 == 117 as u8 {
+        rt.buf_clear(&G_REC)
+        ok = jadmin.parse_users(p, n, &G_REC)
+        G_N = jadmin.rec_count(&G_REC)
+    } else if k0 == 105 as u8 {
+        rt.buf_clear(&G_REC)
+        ok = jadmin.parse_invites(p, n, &G_REC, &G_META)
+        G_N = jadmin.rec_count(&G_REC)
+    } else if k0 == 99 as u8 {
+        rt.buf_clear(&G_REC)
+        ok = jadmin.parse_accounts(p, n, &G_REC)
+        G_N = jadmin.rec_count(&G_REC)
+    } else if k0 == 100 as u8 {
+        rt.buf_clear(&G_REC)
+        ok = jadmin.parse_devices(p, n, &G_REC)
+        G_N = jadmin.rec_count(&G_REC)
+    } else if k0 == 109 as u8 {
+        if !G_MDIRTY {
+            rt.buf_clear(&G_REC)
+            ok = jadmin.parse_models(p, n, &G_REC, &G_META)
+            G_N = jadmin.rec_count(&G_REC)
+            models_loaded()
+        } else {
+            ok = true
+        }
+    } else if k0 == 112 as u8 {
+        rt.buf_clear(&G_REC)
+        ok = jadmin.parse_providers(p, n, &G_REC)
+        G_N = jadmin.rec_count(&G_REC)
+    } else if k0 == 107 as u8 {
+        rt.buf_clear(&G_REC2)
+        ok = jadmin.parse_pve(p, n, &G_REC2)
+        G_N2 = jadmin.rec_count(&G_REC2)
+    } else if k0 == 115 as u8 {
+        rt.buf_clear(&G_PROMPT)
+        ok = jadmin.parse_prompt(p, n, &G_PROMPT)
+    } else if k0 == 114 as u8 {
+        buf_set(&G_RAW, jarvisapi.ja_body(x))
+        rights_parse()
+        ok = G_RAW.len > 0
+    }
+    return ok
+}
+
+fn want_hide(status: i64) {
+    if status == 403 { jshell.set_admin(false) } // not an admin (any more): screen_admin_refresh leaves the page
 }
 
 // true = ours
@@ -208,29 +1094,76 @@ fn admin_api(x: *mut jarvisapi.Api, kind: u32, status: i64) -> bool {
     if kind == jarvisapi.AK_ADM_LIMIT_SET {
         if status == 200 { ask() } else {
             G_ERR = status
-            if status == 403 || status == 404 { jshell.set_admin(false) }
+            want_hide(status)
             G_VER = G_VER + 1
         }
         return true
     }
-    if kind != jarvisapi.AK_ADM_USERS && kind != jarvisapi.AK_ADM_LIMITS && kind != jarvisapi.AK_ADM_SERVER && kind != jarvisapi.AK_ADM_LOGS { return false }
-    if kind != sec_kind(G_SEC) { return true } // the answer of a section that is no longer shown
+    if kind == jadmin.AK_TAB_POST {
+        if status == 200 {
+            G_ERR = 0
+            G_MSG.len = 0
+            G_NOTE = 1
+            let k: str = jarvisapi.ja_key(x)
+            if k == "m" { G_MDIRTY = false }
+            if k == "s" {
+                G_PLOADED = true
+            } else {
+                ask()
+            }
+        } else {
+            rt.buf_clear(&G_MSG)
+            let em: str = jarvisapi.parse_text_field(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), "error")
+            rt.buf_push_bytes(&G_MSG, em.p as u64, em.n)
+            G_ERR = status
+            G_NOTE = 4
+            want_hide(status)
+        }
+        G_VER = G_VER + 1
+        return true
+    }
+    if kind == jadmin.AK_TAB_GET {
+        let k: str = jarvisapi.ja_key(x)
+        if k.n == 0 { return true }
+        let k0: u8 = rt.ld8(k.p as u64, 0)
+        if !tab_ok(k0) { return true } // the answer of a tab that is no longer shown
+        if status == 200 {
+            if tab_answer(x, k0) {
+                G_ERR = 0
+                G_LOADED = true
+            } else {
+                G_ERR = 502
+            }
+        } else {
+            G_ERR = status
+            want_hide(status)
+        }
+        G_VER = G_VER + 1
+        return true
+    }
+    if kind == jarvisapi.AK_ADM_LIMITS {
+        if status == 200 {
+            let ok: bool = jarvisapi.parse_admin_limits(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &G_SUB, &G_SLOTS, &G_LOOP)
+            G_VER = G_VER + 1
+        }
+        return true
+    }
+    if kind != jarvisapi.AK_ADM_SERVER && kind != jarvisapi.AK_ADM_LOGS && kind != jarvisapi.AK_ADM_USERS { return false }
+    if kind != text_kind(G_TAB) { return true } // the answer of a section that is no longer shown
     if status == 200 {
         var b: rt.Buf = rt.buf_new()
         if jarvisapi.parse_admin_text(kind, jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &b) {
             rt.buf_clear(&G_TEXT)
             rt.buf_push_bytes(&G_TEXT, b.ptr as u64, b.len)
             G_ERR = 0
+            G_LOADED = true
         } else {
             G_ERR = 502
         }
         rt.buf_free(&b)
-        if kind == jarvisapi.AK_ADM_LIMITS {
-            let ok: bool = jarvisapi.parse_admin_limits(jarvisapi.ja_body_ptr(x), jarvisapi.ja_body_len(x), &G_SUB, &G_SLOTS, &G_LOOP)
-        }
     } else {
         G_ERR = status
-        if status == 403 || status == 404 { jshell.set_admin(false) } // older server without the admin routes: hide the page (screen_admin_refresh leaves it)
+        want_hide(status)
         rt.buf_clear(&G_TEXT)
     }
     G_VER = G_VER + 1
@@ -251,9 +1184,10 @@ fn admin_reset() {
     G_ME_NEXT_MS = 0
     G_ME_FLIGHT = false
     G_NEXT_MS = 0
-    G_SEC = SEC_USERS
-    rt.buf_clear(&G_TEXT)
-    G_LINES = 0
-    G_ERR = 0
+    G_TAB = T_USERS
+    reset_tab_state()
+    rt.buf_clear(&G_PROMPT)
+    rt.buf_clear(&G_MSG)
+    G_LAY = true
     G_VER = G_VER + 1
 }

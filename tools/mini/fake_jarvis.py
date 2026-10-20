@@ -395,6 +395,19 @@ def mem_route(method, q, b):
         return out(404, {"error": "Nicht gefunden"})
     return out(400, {"error": "Unbekannte Aktion"})
 
+ADM = {"users": [{"id": "u1", "username": "justin", "email": "justin@fleitec.com", "admin": True, "online": True, "hasPush": True},
+                 {"id": "u2", "username": "papa", "email": "info@fleitec.com", "admin": False, "online": False, "hasPush": True, "rights": {"projects": {"firn": "write"}}},
+                 {"id": "u3", "username": "gast", "email": "", "admin": False, "online": False, "hasPush": False}],
+       "inv": [{"code": "ABCD-1234", "note": "Volker", "createdBy": "justin", "createdAt": 1, "expiresAt": None, "usedBy": None, "usedByName": None, "revoked": False, "status": "offen"},
+               {"code": "WXYZ-9876", "note": "", "createdBy": "justin", "createdAt": 1, "expiresAt": None, "usedBy": "u3", "usedByName": "gast", "revoked": False, "status": "benutzt"}],
+       "dauer": False, "borrow": {},
+       "acc": [{"id": "a1", "label": "Konto 1", "mode": "login", "active": True, "disabled": False, "free": 60, "runs": 14, "rate": {"fiveHour": {"util": 30}, "sevenDay": {"util": 40}}},
+               {"id": "a2", "label": "Token 2", "mode": "token", "active": False, "disabled": True, "free": 100, "runs": 2, "rate": {}}],
+       "models": {"enabled": ["opus", "sonnet"], "defaultModel": "sonnet", "defaultEffort": "high"},
+       "prov": [{"provider": "openai", "label": "OpenAI", "set": True, "source": "config.json", "obscured": "sk-abc\u2026wxyz"}, {"provider": "openrouter", "label": "OpenRouter", "set": False, "source": "kein", "obscured": ""}],
+       "pve": [{"id": "k_1", "label": "Laptop", "active": True, "fp": "SHA256:abcdef", "type": "ssh-ed25519"}],
+       "prompt": "Verwende so wenig Worte wie moeglich.\nAntworte immer uebersichtlich."}
+
 def rest(method, rawpath, hdr, body):
     """-> (status, bytes, ctype) or None (not a REST route of the app client)."""
     global tseq
@@ -402,8 +415,8 @@ def rest(method, rawpath, hdr, body):
     path = u.path
     q = parse_qs(u.query)
     if not (path in ("/api/me", "/api/projects", "/api/command-center", "/api/conversations", "/api/tasks",
-                     "/api/remote/devices", "/api/settings", "/api/voices", "/api/push-token", "/api/stt", "/api/m/upload", "/api/account/password")
-            or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
+                     "/api/remote/devices", "/api/settings", "/api/voices", "/api/push-token", "/api/stt", "/api/m/upload", "/api/account/password", "/api/accounts")
+            or path.startswith("/api/admin/") or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
             or path.startswith("/vendor/fonts/") or path.startswith("/img/") or path.startswith("/dl/")):
         return None
     jtype = hdr.get("content-type")
@@ -597,6 +610,70 @@ def rest(method, rawpath, hdr, body):
         if str(b.get("old", "")) != PW["cur"]: return out(403, {"error": "Aktuelles Passwort stimmt nicht."})
         PW["cur"] = str(b.get("password"))
         return out(200, {"ok": True} if os.environ.get("FAKE_PW_NOTOKEN") else {"ok": True, "token": TOKEN})
+    if path.startswith("/api/admin/") or path == "/api/accounts":  # a66: the web admin routes the app's Admin tabs use (state in ADM)
+        if os.environ.get("FAKE_ROLE", "admin") == "user": return out(403, {"error": "Nur f\u00fcr Admins."})
+        b = j if isinstance(j, dict) else {}
+        if method == "POST":
+            if path == "/api/admin/users":
+                for u_ in ADM["users"]:
+                    if u_["id"] == b.get("uid") and "admin" in b and "action" not in b: u_["admin"] = bool(b["admin"])
+                if b.get("action") == "create": ADM["users"].append({"id": "u%d" % (len(ADM["users"]) + 1), "username": b.get("username"), "email": "", "admin": False, "online": False, "hasPush": False})
+                if b.get("action") == "remove": ADM["users"] = [u_ for u_ in ADM["users"] if u_["id"] != b.get("uid")]
+            elif path == "/api/admin/invites":
+                a_ = b.get("action")
+                if a_ == "create":
+                    ADM["inv"].insert(0, {"code": "NEW%d" % len(ADM["inv"]), "note": b.get("note", ""), "createdBy": "justin", "createdAt": 1, "expiresAt": None, "usedBy": None, "usedByName": None, "revoked": False, "status": "offen"})
+                    return out(200, {"ok": True, "invite": ADM["inv"][0]})
+                for i_ in ADM["inv"]:
+                    if i_["code"] == b.get("code") and a_ == "revoke": i_["revoked"] = True; i_["status"] = "zur\u00fcckgezogen"
+                if a_ == "remove": ADM["inv"] = [i_ for i_ in ADM["inv"] if i_["code"] != b.get("code")]
+                if a_ == "dauercode": ADM["dauer"] = b.get("an") is True
+            elif path == "/api/accounts":
+                for c_ in ADM["acc"]:
+                    if c_["id"] == b.get("toggle"): c_["disabled"] = bool(b.get("disabled"))
+                if b.get("remove"): ADM["acc"] = [c_ for c_ in ADM["acc"] if c_["id"] != b["remove"]]
+                if b.get("token"): ADM["acc"].append({"id": "t%d" % len(ADM["acc"]), "label": b.get("label") or "token", "mode": "token", "active": False, "disabled": False, "free": 100, "runs": 0, "rate": {}})
+            elif path == "/api/admin/devices":
+                ADM["borrow"][b.get("uid", "") + ":" + b.get("name", "")] = bool(b.get("borrow"))
+            elif path == "/api/admin/models":
+                ADM["models"].update({k: b[k] for k in ("enabled", "defaultModel", "defaultEffort") if k in b})
+            elif path == "/api/admin/providers":
+                for p_ in ADM["prov"]:
+                    if p_["provider"] == b.get("provider"):
+                        p_["set"] = b.get("key") is not None; p_["obscured"] = "sk-xxx\u2026abcd" if p_["set"] else ""
+            elif path == "/api/admin/pve-keys":
+                a_ = b.get("action")
+                if a_ == "add": ADM["pve"].append({"id": "k_%d" % len(ADM["pve"]), "label": b.get("label") or "new", "active": True, "fp": "SHA256:newkey", "type": "ssh-ed25519"})
+                if a_ == "toggle":
+                    for k_ in ADM["pve"]:
+                        if k_["id"] == b.get("id"): k_["active"] = bool(b.get("active"))
+                if a_ == "remove": ADM["pve"] = [k_ for k_ in ADM["pve"] if k_["id"] != b.get("id")]
+            elif path == "/api/admin/system-prompt":
+                ADM["prompt"] = b.get("prompt", "")
+                return out(200, {"ok": True, "prompt": ADM["prompt"]})
+            elif path == "/api/admin/rights":
+                for u_ in ADM["users"]:
+                    if u_["id"] == b.get("uid"):
+                        pr_ = u_.setdefault("rights", {}).setdefault("projects", {})
+                        if b.get("level"): pr_[b["project"]] = b["level"]
+                        else: pr_.pop(b["project"], None)
+            if os.environ.get("FAKE_ADM_FAIL"): return out(400, {"error": "fake failure"})
+        if path == "/api/admin/users": return out(200, {"users": ADM["users"], "me": "u1"})
+        if path == "/api/admin/invites": return out(200, {"invites": ADM["inv"], "dauercode": "DAUER-42", "dauercodeAktiv": ADM["dauer"]})
+        if path == "/api/accounts": return out(200, {"accounts": ADM["acc"], "activeId": "a1"})
+        if path == "/api/admin/devices":
+            return out(200, {"devices": [{"uid": "u1", "username": "justin", "name": "Dell", "own": True, "borrowed": False},
+                                          {"uid": "u2", "username": "papa", "name": "Laptop", "own": False, "borrowed": ADM["borrow"].get("u2:Laptop", False)}]})
+        if path == "/api/admin/models":
+            m_ = ADM["models"]
+            return out(200, {"all": ["opus", "sonnet", "haiku", "gpt-5", "grok"], "enabled": m_["enabled"], "defaultModel": m_["defaultModel"], "custom": [], "defaultEffort": m_["defaultEffort"], "efforts": ["low", "medium", "high"]})
+        if path == "/api/admin/providers": return out(200, {"providers": ADM["prov"]})
+        if path == "/api/admin/pve-keys": return out(200, {"host": "pve", "port": 22, "user": "root", "keys": ADM["pve"]})
+        if path == "/api/admin/system-prompt": return out(200, {"prompt": ADM["prompt"], "effective": "..."})
+        if path == "/api/admin/rights":
+            return out(200, {"projects": ["firn", "osum", "certus", "jarvis"], "levels": ["read", "write", "shell"],
+                             "users": [{"id": x["id"], "username": x["username"], "admin": x["admin"], "rights": x.get("rights", {"projects": {}})} for x in ADM["users"]], "me": "u1"})
+        return out(404, {"error": "Not found"})
     if path == "/api/voices":  # a65: the Piper voice list of the web settings
         return out(200, {"voices": [{"id": "de_thorsten", "label": "Thorsten", "gender": "m", "default": True}, {"id": "de_kerstin", "label": "Kerstin", "gender": "w"}]})
     if path == "/api/settings":

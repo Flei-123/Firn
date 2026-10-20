@@ -1,0 +1,530 @@
+// SPDX-License-Identifier: MPL-2.0
+// examples/jarvis_android/jadmin.fi -- the admin tabs' wire side: JSON answers of the web admin routes (/api/admin/*, /api/accounts)
+// -> flat records, and a tiny request builder. The routes are the SAME ones the web UI uses (the session cookie of the app is
+// accepted there), so no server change is needed.
+// Record format: fields joined by \x01, records ended by \x02. Fields are RAW values (flags "0"/"1", numbers, server words); the
+// screen turns them into localized card texts. Field meaning per tab is documented at each parser.
+import std.rt
+import std.str
+import std.json
+import std.time
+import net.jarvisapi
+
+export {
+    AK_TAB_GET, AK_TAB_POST, G_NONE_INT,
+    parse_users, parse_invites, parse_accounts, parse_devices, parse_models, parse_providers, parse_pve, parse_rights, parse_prompt,
+    spec_clear, spec_add, post_spec, rec_count, rec_field, level_name, LV_NONE, LV_READ, LV_WRITE, LV_SHELL,
+}
+
+const AK_TAB_GET: u32 = 60 // GET of an admin tab (key = the tab id)
+const AK_TAB_POST: u32 = 61 // POST of an admin action (key = the tab id)
+const G_NONE_INT: i64 = 0 - 1
+const LV_NONE: usize = 0
+const LV_READ: usize = 1
+const LV_WRITE: usize = 2
+const LV_SHELL: usize = 3
+
+static mut G_SPEC: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+static mut G_REQ: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
+
+// ---------------------------------------------------------------- JSON helpers
+
+fn view(s: str.Span) -> str {
+    return str { p: s.p, n: s.n }
+}
+
+fn gs(d: *mut json.Json, o: u32, name: str) -> str {
+    if o == json.JSON_NONE || json.json_kind(d, o) != json.JSON_OBJECT { return "" }
+    let n: u32 = json.json_get(d, o, name.p as u64, name.n)
+    if n == json.JSON_NONE || json.json_kind(d, n) != json.JSON_STRING { return "" }
+    return view(json.json_string(d, n))
+}
+
+// a number member, or `none` when missing / not a number
+fn gn(d: *mut json.Json, o: u32, name: str, none: i64) -> i64 {
+    if o == json.JSON_NONE || json.json_kind(d, o) != json.JSON_OBJECT { return none }
+    let n: u32 = json.json_get(d, o, name.p as u64, name.n)
+    if n == json.JSON_NONE || json.json_kind(d, n) != json.JSON_NUMBER { return none }
+    if json.json_is_int(d, n) { return json.json_int(d, n) }
+    let f: f64 = json.json_number(d, n)
+    if f != f || f > 9.0e18 || f < -9.0e18 { return none }
+    return f as i64
+}
+
+fn gb(d: *mut json.Json, o: u32, name: str) -> bool {
+    if o == json.JSON_NONE || json.json_kind(d, o) != json.JSON_OBJECT { return false }
+    let n: u32 = json.json_get(d, o, name.p as u64, name.n)
+    return n != json.JSON_NONE && json.json_kind(d, n) == json.JSON_TRUE
+}
+
+fn gc(d: *mut json.Json, o: u32, name: str, kind: u8) -> u32 {
+    if o == json.JSON_NONE || json.json_kind(d, o) != json.JSON_OBJECT { return json.JSON_NONE }
+    let n: u32 = json.json_get(d, o, name.p as u64, name.n)
+    if n == json.JSON_NONE || json.json_kind(d, n) != kind { return json.JSON_NONE }
+    return n
+}
+
+fn open_doc(d: *mut json.Json, p: u64, n: usize) -> bool {
+    if p == 0 || n == 0 { return false }
+    let ok: bool = json.json_parse(d, p, n) catch false
+    if !ok || json.json_kind(d, json.json_root(d)) != json.JSON_OBJECT { return false }
+    return true
+}
+
+fn put(b: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(b, s.p as u64, s.n)
+}
+
+fn fs(out: *mut rt.Buf, s: str) {
+    put(out, s)
+    rt.buf_push(out, 1 as u8)
+}
+
+fn fi(out: *mut rt.Buf, v: i64) {
+    rt.buf_push_dec_i64(out, v)
+    rt.buf_push(out, 1 as u8)
+}
+
+fn fb(out: *mut rt.Buf, v: bool) {
+    if v { put(out, "1") } else { put(out, "0") }
+    rt.buf_push(out, 1 as u8)
+}
+
+fn rend(out: *mut rt.Buf) {
+    rt.buf_push(out, 2 as u8)
+}
+
+// ---------------------------------------------------------------- record access (shared by the screen)
+
+fn rec_count(b: *mut rt.Buf) -> usize {
+    var n: usize = 0
+    var i: usize = 0
+    while i < (*b).len {
+        if rt.ld8((*b).ptr as u64, i) == 2 as u8 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// field f of record r ("" when missing); a view into the buffer
+fn rec_field(b: *mut rt.Buf, r: usize, f: usize) -> str {
+    var k: usize = 0
+    var i: usize = 0
+    var st: usize = 0
+    while i < (*b).len && k < r {
+        if rt.ld8((*b).ptr as u64, i) == 2 as u8 {
+            k = k + 1
+            st = i + 1
+        }
+        i = i + 1
+    }
+    if k != r { return "" }
+    var fk: usize = 0
+    var fb0: usize = st
+    var j: usize = st
+    while j < (*b).len {
+        let ch: u8 = rt.ld8((*b).ptr as u64, j)
+        if ch == 1 as u8 || ch == 2 as u8 {
+            if fk == f { return str { p: ((*b).ptr as u64 + fb0 as u64) as *mut u8, n: j - fb0 } }
+            if ch == 2 as u8 { return "" }
+            fk = fk + 1
+            fb0 = j + 1
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+fn level_name(l: usize) -> str {
+    if l == LV_READ { return "read" }
+    if l == LV_WRITE { return "write" }
+    if l == LV_SHELL { return "shell" }
+    return ""
+}
+
+// ---------------------------------------------------------------- parsers
+
+// users: id, name, admin, email, online, push, me
+fn parse_users(p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var d: json.Json = json.json_new()
+    var ok: bool = false
+    if open_doc(&d, p, n) {
+        let root: u32 = json.json_root(&d)
+        let me: str = __str_copy(gs(&d, root, "me"))
+        let us: u32 = gc(&d, root, "users", json.JSON_ARRAY)
+        if us != json.JSON_NONE {
+            ok = true
+            var e: u32 = json.json_child(&d, us)
+            while e != json.JSON_NONE {
+                if json.json_kind(&d, e) == json.JSON_OBJECT {
+                    let id: str = gs(&d, e, "id")
+                    fs(out, id)
+                    fs(out, gs(&d, e, "username"))
+                    fb(out, gb(&d, e, "admin"))
+                    fs(out, gs(&d, e, "email"))
+                    fb(out, gb(&d, e, "online"))
+                    fb(out, gb(&d, e, "hasPush"))
+                    fb(out, id.n > 0 && id == me)
+                    rend(out)
+                }
+                e = json.json_next(&d, e)
+            }
+        }
+    }
+    json.json_free(&d)
+    return ok
+}
+
+// invites: code, note, status (server word), createdBy, usedByName, days left (-1 = no expiry), -
+// meta: permanent code \x01 active(0|1)
+fn parse_invites(p: u64, n: usize, out: *mut rt.Buf, meta: *mut rt.Buf) -> bool {
+    var d: json.Json = json.json_new()
+    var ok: bool = false
+    if open_doc(&d, p, n) {
+        let root: u32 = json.json_root(&d)
+        rt.buf_clear(meta)
+        fs(meta, gs(&d, root, "dauercode"))
+        fb(meta, gb(&d, root, "dauercodeAktiv"))
+        let arr: u32 = gc(&d, root, "invites", json.JSON_ARRAY)
+        if arr != json.JSON_NONE {
+            ok = true
+            let now: i64 = time.now_unix_ms()
+            var e: u32 = json.json_child(&d, arr)
+            while e != json.JSON_NONE {
+                if json.json_kind(&d, e) == json.JSON_OBJECT {
+                    fs(out, gs(&d, e, "code"))
+                    fs(out, gs(&d, e, "note"))
+                    fs(out, gs(&d, e, "status"))
+                    fs(out, gs(&d, e, "createdBy"))
+                    fs(out, gs(&d, e, "usedByName"))
+                    let exp: i64 = gn(&d, e, "expiresAt", 0 - 1)
+                    if exp < 0 { fi(out, 0 - 1) } else { fi(out, (exp - now) / 86400000) }
+                    fs(out, "")
+                    rend(out)
+                }
+                e = json.json_next(&d, e)
+            }
+        }
+    }
+    json.json_free(&d)
+    return ok
+}
+
+// accounts: id, label, active, disabled, mode, free % (-1), 5h % (-1), 7d % (-1), runs, blocked
+fn parse_accounts(p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var d: json.Json = json.json_new()
+    var ok: bool = false
+    if open_doc(&d, p, n) {
+        let root: u32 = json.json_root(&d)
+        let arr: u32 = gc(&d, root, "accounts", json.JSON_ARRAY)
+        if arr != json.JSON_NONE {
+            ok = true
+            let now: i64 = time.now_unix_ms()
+            var e: u32 = json.json_child(&d, arr)
+            while e != json.JSON_NONE {
+                if json.json_kind(&d, e) == json.JSON_OBJECT {
+                    fs(out, gs(&d, e, "id"))
+                    fs(out, gs(&d, e, "label"))
+                    fb(out, gb(&d, e, "active"))
+                    fb(out, gb(&d, e, "disabled"))
+                    fs(out, gs(&d, e, "mode"))
+                    fi(out, gn(&d, e, "free", 0 - 1))
+                    let rate: u32 = gc(&d, e, "rate", json.JSON_OBJECT)
+                    fi(out, gn(&d, gc(&d, rate, "fiveHour", json.JSON_OBJECT), "util", 0 - 1))
+                    fi(out, gn(&d, gc(&d, rate, "sevenDay", json.JSON_OBJECT), "util", 0 - 1))
+                    fi(out, gn(&d, e, "runs", 0))
+                    fb(out, gn(&d, e, "blockedUntil", 0) > now)
+                    rend(out)
+                }
+                e = json.json_next(&d, e)
+            }
+        }
+    }
+    json.json_free(&d)
+    return ok
+}
+
+// devices: uid, name, username, own, borrowed
+fn parse_devices(p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var d: json.Json = json.json_new()
+    var ok: bool = false
+    if open_doc(&d, p, n) {
+        let arr: u32 = gc(&d, json.json_root(&d), "devices", json.JSON_ARRAY)
+        if arr != json.JSON_NONE {
+            ok = true
+            var e: u32 = json.json_child(&d, arr)
+            while e != json.JSON_NONE {
+                if json.json_kind(&d, e) == json.JSON_OBJECT {
+                    fs(out, gs(&d, e, "uid"))
+                    fs(out, gs(&d, e, "name"))
+                    fs(out, gs(&d, e, "username"))
+                    fb(out, gb(&d, e, "own"))
+                    fb(out, gb(&d, e, "borrowed"))
+                    rend(out)
+                }
+                e = json.json_next(&d, e)
+            }
+        }
+    }
+    json.json_free(&d)
+    return ok
+}
+
+fn in_array(d: *mut json.Json, arr: u32, s: str) -> bool {
+    if arr == json.JSON_NONE { return false }
+    var e: u32 = json.json_child(d, arr)
+    while e != json.JSON_NONE {
+        if json.json_kind(d, e) == json.JSON_STRING && view(json.json_string(d, e)) == s { return true }
+        e = json.json_next(d, e)
+    }
+    return false
+}
+
+// models: alias, enabled(0|1)
+// meta: default model \x01 default effort \x01 effort list joined by ","
+fn parse_models(p: u64, n: usize, out: *mut rt.Buf, meta: *mut rt.Buf) -> bool {
+    var d: json.Json = json.json_new()
+    var ok: bool = false
+    if open_doc(&d, p, n) {
+        let root: u32 = json.json_root(&d)
+        rt.buf_clear(meta)
+        fs(meta, gs(&d, root, "defaultModel"))
+        fs(meta, gs(&d, root, "defaultEffort"))
+        let ef: u32 = gc(&d, root, "efforts", json.JSON_ARRAY)
+        if ef != json.JSON_NONE {
+            var x: u32 = json.json_child(&d, ef)
+            var first: bool = true
+            while x != json.JSON_NONE {
+                if json.json_kind(&d, x) == json.JSON_STRING {
+                    if !first { put(meta, ",") }
+                    first = false
+                    put(meta, view(json.json_string(&d, x)))
+                }
+                x = json.json_next(&d, x)
+            }
+        }
+        rt.buf_push(meta, 1 as u8)
+        let all: u32 = gc(&d, root, "all", json.JSON_ARRAY)
+        let en: u32 = gc(&d, root, "enabled", json.JSON_ARRAY)
+        if all != json.JSON_NONE {
+            ok = true
+            var e: u32 = json.json_child(&d, all)
+            while e != json.JSON_NONE {
+                if json.json_kind(&d, e) == json.JSON_STRING {
+                    let al: str = view(json.json_string(&d, e))
+                    fs(out, al)
+                    fb(out, in_array(&d, en, al))
+                    rend(out)
+                }
+                e = json.json_next(&d, e)
+            }
+        }
+    }
+    json.json_free(&d)
+    return ok
+}
+
+// providers + pve keys share one layout: id, label, flag (key set | key active), text (masked key | fingerprint), source, -, kind ("P"|"K")
+fn parse_providers(p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var d: json.Json = json.json_new()
+    var ok: bool = false
+    if open_doc(&d, p, n) {
+        let arr: u32 = gc(&d, json.json_root(&d), "providers", json.JSON_ARRAY)
+        if arr != json.JSON_NONE {
+            ok = true
+            var e: u32 = json.json_child(&d, arr)
+            while e != json.JSON_NONE {
+                if json.json_kind(&d, e) == json.JSON_OBJECT {
+                    fs(out, gs(&d, e, "provider"))
+                    fs(out, gs(&d, e, "label"))
+                    fb(out, gb(&d, e, "set"))
+                    fs(out, gs(&d, e, "obscured"))
+                    fs(out, gs(&d, e, "source"))
+                    fs(out, "")
+                    fs(out, "P")
+                    rend(out)
+                }
+                e = json.json_next(&d, e)
+            }
+        }
+    }
+    json.json_free(&d)
+    return ok
+}
+
+fn parse_pve(p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var d: json.Json = json.json_new()
+    var ok: bool = false
+    if open_doc(&d, p, n) {
+        let root: u32 = json.json_root(&d)
+        let arr: u32 = gc(&d, root, "keys", json.JSON_ARRAY)
+        if arr != json.JSON_NONE {
+            ok = true
+            var e: u32 = json.json_child(&d, arr)
+            while e != json.JSON_NONE {
+                if json.json_kind(&d, e) == json.JSON_OBJECT {
+                    fs(out, gs(&d, e, "id"))
+                    fs(out, gs(&d, e, "label"))
+                    fb(out, gb(&d, e, "active"))
+                    fs(out, gs(&d, e, "fp"))
+                    fs(out, gs(&d, e, "type"))
+                    fs(out, "")
+                    fs(out, "K")
+                    rend(out)
+                }
+                e = json.json_next(&d, e)
+            }
+        }
+    }
+    json.json_free(&d)
+    return ok
+}
+
+fn level_of(s: str) -> usize {
+    if s == "read" { return LV_READ }
+    if s == "write" { return LV_WRITE }
+    if s == "shell" { return LV_SHELL }
+    return LV_NONE
+}
+
+// rights of the user_idx-th NON-admin user: project, level (0..3), uid, username
+// meta: number of non-admin users \x01
+fn parse_rights(p: u64, n: usize, out: *mut rt.Buf, meta: *mut rt.Buf, user_idx: usize) -> bool {
+    var d: json.Json = json.json_new()
+    var ok: bool = false
+    if open_doc(&d, p, n) {
+        let root: u32 = json.json_root(&d)
+        let projs: u32 = gc(&d, root, "projects", json.JSON_ARRAY)
+        let us: u32 = gc(&d, root, "users", json.JSON_ARRAY)
+        if projs != json.JSON_NONE && us != json.JSON_NONE {
+            ok = true
+            var count: i64 = 0
+            var u: u32 = json.json_child(&d, us)
+            while u != json.JSON_NONE {
+                if json.json_kind(&d, u) == json.JSON_OBJECT && !gb(&d, u, "admin") {
+                    if count as usize == user_idx {
+                        let rp: u32 = gc(&d, gc(&d, u, "rights", json.JSON_OBJECT), "projects", json.JSON_OBJECT)
+                        let uid: str = gs(&d, u, "id")
+                        let uname: str = gs(&d, u, "username")
+                        var pr: u32 = json.json_child(&d, projs)
+                        while pr != json.JSON_NONE {
+                            if json.json_kind(&d, pr) == json.JSON_STRING {
+                                let name: str = view(json.json_string(&d, pr))
+                                var lv: usize = LV_NONE
+                                if rp != json.JSON_NONE { lv = level_of(gs(&d, rp, name)) }
+                                fs(out, name)
+                                fi(out, lv as i64)
+                                fs(out, uid)
+                                fs(out, uname)
+                                rend(out)
+                            }
+                            pr = json.json_next(&d, pr)
+                        }
+                    }
+                    count = count + 1
+                }
+                u = json.json_next(&d, u)
+            }
+            rt.buf_clear(meta)
+            fi(meta, count)
+        }
+    }
+    json.json_free(&d)
+    return ok
+}
+
+// the admin prompt text (a COPY is written to `out`)
+fn parse_prompt(p: u64, n: usize, out: *mut rt.Buf) -> bool {
+    var d: json.Json = json.json_new()
+    var ok: bool = false
+    if open_doc(&d, p, n) {
+        ok = true
+        put(out, gs(&d, json.json_root(&d), "prompt"))
+    }
+    json.json_free(&d)
+    return ok
+}
+
+// ---------------------------------------------------------------- request builder
+// spec item: name \x02 type \x02 value, items joined by \x01. Types: s string, b bool ("1"), i integer, n null, a array of strings (values joined by \x03).
+
+fn spec_clear() {
+    rt.buf_clear(&G_SPEC)
+}
+
+fn spec_add(name: str, ty: str, val: str) {
+    if G_SPEC.len > 0 { rt.buf_push(&G_SPEC, 1 as u8) }
+    put(&G_SPEC, name)
+    rt.buf_push(&G_SPEC, 2 as u8)
+    put(&G_SPEC, ty)
+    rt.buf_push(&G_SPEC, 2 as u8)
+    put(&G_SPEC, val)
+}
+
+fn atoi(s: str) -> i64 {
+    var v: i64 = 0
+    var neg: bool = false
+    var i: usize = 0
+    while i < s.n {
+        let ch: u8 = rt.ld8(s.p as u64, i)
+        if ch == 45 as u8 { neg = true } else if ch >= 48 as u8 && ch <= 57 as u8 { v = v * 10 + (ch - 48 as u8) as i64 }
+        i = i + 1
+    }
+    if neg { return 0 - v }
+    return v
+}
+
+// split s at the first byte `sep` from `start`; returns the end index (== s.n when none)
+fn find(s: str, start: usize, sep: u8) -> usize {
+    var i: usize = start
+    while i < s.n && rt.ld8(s.p as u64, i) != sep { i = i + 1 }
+    return i
+}
+
+fn sub(s: str, a: usize, b: usize) -> str {
+    return str { p: (s.p as u64 + a as u64) as *mut u8, n: b - a }
+}
+
+// POST the collected spec as a JSON object to `path` (absolute server path) -> AK_TAB_POST (key = tab id)
+fn post_spec(api: *mut jarvisapi.Api, path: str, key: str) -> bool {
+    rt.buf_clear(&G_REQ)
+    var w: json.JsonWriter = json.jw_new(&G_REQ, false)
+    json.jw_begin_object(&w)
+    let sp: str = str { p: G_SPEC.ptr as *mut u8, n: G_SPEC.len }
+    var pos: usize = 0
+    while pos < sp.n {
+        var e: usize = find(sp, pos, 1 as u8)
+        let item: str = sub(sp, pos, e)
+        let c1: usize = find(item, 0, 2 as u8)
+        let c2: usize = find(item, c1 + 1, 2 as u8)
+        if c1 < item.n && c2 < item.n {
+            let name: str = sub(item, 0, c1)
+            let ty: str = sub(item, c1 + 1, c2)
+            let val: str = sub(item, c2 + 1, item.n)
+            json.jw_key(&w, name.p as u64, name.n)
+            if ty == "s" {
+                json.jw_string(&w, val.p as u64, val.n)
+            } else if ty == "b" {
+                json.jw_bool(&w, val == "1")
+            } else if ty == "i" {
+                json.jw_int(&w, atoi(val))
+            } else if ty == "a" {
+                json.jw_begin_array(&w)
+                var q: usize = 0
+                while q < val.n {
+                    let qe: usize = find(val, q, 3 as u8)
+                    let one: str = sub(val, q, qe)
+                    if one.n > 0 { json.jw_string(&w, one.p as u64, one.n) }
+                    q = qe + 1
+                }
+                json.jw_end(&w)
+            } else {
+                json.jw_null(&w)
+            }
+        }
+        pos = e + 1
+    }
+    json.jw_end(&w)
+    json.jw_free(&w)
+    return jarvisapi.ja_post_abs(api, AK_TAB_POST, path, key, G_REQ.ptr, G_REQ.len)
+}
