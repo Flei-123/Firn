@@ -1302,16 +1302,19 @@ pub(crate) const ST_MULTI: u64 = 1992;
 /// The block header in front of the payload (`HEADER` in `lib/gc/gc.fi`).
 pub(crate) const BLOCK_HEADER: u64 = 16;
 /// The payload sizes of the size classes (`__gc_classes_bytes`).
-pub(crate) const CLASS_BYTES: [u64; 13] =
-    [32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096];
+pub(crate) const CLASS_BYTES: [u64; 14] =
+    [32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096, 16];
 
 /// Which size class does an object of `size` octets fall into? The same
 /// answer as `__gc_class_for` in `lib/gc/gc.fi`, for every size.
 /// `CLASS_BYTES.len()` = no class of its own -- such an object gets a chunk
 /// to itself and never walks the fast path.
 pub(crate) fn class_for(size: u64) -> usize {
+    if size <= 16 {
+        return 13;
+    }
     let mut k = 0;
-    while k < CLASS_BYTES.len() {
+    while k < 13 {
         if size <= CLASS_BYTES[k] {
             return k;
         }
@@ -1672,11 +1675,13 @@ mod tests {
                 b
             );
         }
-        assert_eq!(class_for(0), 0);
+        assert_eq!(class_for(0), 13);
+        assert_eq!(class_for(16), 13);
+        assert_eq!(class_for(17), 0);
         assert_eq!(class_for(32), 0);
         assert_eq!(class_for(33), 1);
         assert_eq!(class_for(4096), 12);
-        assert_eq!(class_for(4097), 13);
+        assert_eq!(class_for(4097), 14);
     }
 
     /// `__gc_class_and_bytes` is written without calls (dev-fast has no
@@ -1711,7 +1716,7 @@ mod tests {
                     }
                     i = j;
                 } else if let Some(v) = l.strip_prefix("return ") {
-                    return Some(v.parse().unwrap_or(13));
+                    return Some(v.parse().unwrap_or(14));
                 } else {
                     panic!("unexpected line: {}", l);
                 }
@@ -1720,7 +1725,7 @@ mod tests {
         }
         for size in 0..=5000u64 {
             let k = class_for(size);
-            let want = if k >= 13 { 13 } else { k as u64 + CLASS_BYTES[k] as u64 * 16 };
+            let want = if k >= 14 { 14 } else { k as u64 + CLASS_BYTES[k] as u64 * 16 };
             assert_eq!(run(&lines, size), Some(want), "size {}", size);
         }
     }

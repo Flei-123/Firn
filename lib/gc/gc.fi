@@ -40,6 +40,7 @@
 //   [0]  next chunk        [8]  size in bytes    [16] block size
 //   [24] number of blocks  [32] data start (64)  [40] size class
 //   [48] empty hysteresis  (1 = it was already empty at the last sweep)
+//   [56] reciprocal of the block size, ceil(2^32 / block); 0 = none (single object chunk)
 
 const GC_SYS_WRITE: i64 = 1
 const GC_SYS_OPEN: i64 = 2
@@ -146,7 +147,7 @@ const S_D_ALLOK: u64 = 1528
 // which otherwise swamp everything at measurements in the percent range.
 const S_INKRAB: u64 = 1536
 // Sweeping: one flag per size class saying whether its free list has already
-// been emptied during THIS sweep run (13 classes, 1544..1648).
+// been emptied during THIS sweep run (14 classes, 1544..1656).
 const S_SWKL: u64 = 1544
 // A histogram of the whole interruption in PURE CPU TIME (16 buckets like
 // S_HIST), its maximum, and the switch for it (0 = off, no extra clock;
@@ -458,7 +459,9 @@ const INCR_FROM: u64 = 0
 const HEADER: u64 = 16
 const CHUNK_HEADER: u64 = 64
 const CHUNK_BYTES: u64 = 262144
-const CLASSES: u64 = 13
+// 13 ordered classes (32..4096) plus class 13 = 16 byte payload (block 32), added
+// last so that no class id changes. Id 14 = no class of its own.
+const CLASSES: u64 = 14
 const MARK_BYTES: u64 = 1048576
 // Default growth of the allocation budget between two runs: limit = live * 2 / 1,
 // i.e. the next run starts when twice as much has been allocated since as is
@@ -957,10 +960,13 @@ fn gc_diag(i: u64) -> u64 {
 
 // ROUND ANLEGEWEG: the same table, but as a BINARY search -- at most four
 // comparisons instead of up to thirteen. The values are unchanged:
-// 32 48 64 96 128 192 256 384 512 768 1024 2048 4096. This table is the
+// 16(id 13) 32 48 64 96 128 192 256 384 512 768 1024 2048 4096. This table is the
 // contract with `compiler/src/gc.rs` (`CLASS_BYTES`, checked by the test
 // `class_table_matches_the_runtime`) and with `lib/firnc1/gc.fi`.
 fn __gc_classes_bytes(k: u64) -> u64 {
+    if k == 13 {
+        return 16
+    }
     if k < 4 {
         if k < 2 {
             if k == 0 {
@@ -1006,6 +1012,9 @@ fn __gc_classes_bytes(k: u64) -> u64 {
 // is four comparisons. Now it is a binary search without a single call.
 // The answer is identical for every size.
 fn __gc_class_for(size: u64) -> u64 {
+    if size <= 16 {
+        return 13
+    }
     if size <= 128 {
         if size <= 48 {
             if size <= 32 {
@@ -1052,8 +1061,11 @@ fn __gc_class_for(size: u64) -> u64 {
 // the fast path needs both, and every call is measurable there. Packed:
 // the class in the lowest four bits, the payload size above them. The
 // table itself stands only in `__gc_classes_bytes`.
-// `CLASSES` (= 13) as the answer means: no size class of its own.
+// `CLASSES` (= 14) as the answer means: no size class of its own.
 fn __gc_class_and_bytes(size: u64) -> u64 {
+    if size <= 16 {
+        return 269
+    }
     // Self-contained (no calls): the dev-fast level has no inliner, and the
     // three calls this used to make were measurable on every allocation.
     // The packed values are `class + payload_bytes * 16` for the table in
@@ -1130,6 +1142,11 @@ fn __gc_chunk_new(class: u64, payload: u64) -> u64 {
     *((p + 24) as *mut u64) = count
     *((p + 32) as *mut u64) = CHUNK_HEADER
     *((p + 40) as *mut u64) = class
+    // Reciprocal of the block size for __gc_block_of (0 = use the division;
+    // single object chunks can be larger than the 2^18 the magic is exact for).
+    if class < CLASSES {
+        *((p + 56) as *mut u64) = (4294967296 + block - 1) / block
+    }
     *((st + S_CHUNKS) as *mut u64) = p
     // CERTUS ROUND M1: the same chunk goes into the sorted index.
     __gc_idx_add(p)
@@ -1368,6 +1385,10 @@ fn __gc_block_of(a: u64) -> u64 {
         let blk0: u64 = (*((cc + 16) as *mut u64))
         let end0: u64 = data0 + blk0 * (*((cc + 24) as *mut u64))
         if a >= data0 && a < end0 {
+            let m0: u64 = (*((cc + 56) as *mut u64))
+            if m0 != 0 {
+                return data0 + (((a - data0) * m0) >> 32) * blk0
+            }
             return data0 + (a - data0) / blk0 * blk0
         }
     }
@@ -1401,6 +1422,10 @@ fn __gc_block_of(a: u64) -> u64 {
                 let block2: u64 = (*((c2 + 16) as *mut u64))
                 if a >= data2 && a < data2 + block2 * (*((c2 + 24) as *mut u64)) {
                     *((st + S_CHUNK_CACHE) as *mut u64) = c2
+                    let m2: u64 = (*((c2 + 56) as *mut u64))
+                    if m2 != 0 {
+                        return data2 + (((a - data2) * m2) >> 32) * block2
+                    }
                     return data2 + (a - data2) / block2 * block2
                 }
             }
@@ -1424,6 +1449,10 @@ fn __gc_block_of(a: u64) -> u64 {
             *((st + S_CHUNK_CACHE) as *mut u64) = ci
             if slot != 0 {
                 *((slot) as *mut u64) = ci
+            }
+            let mi: u64 = (*((ci + 56) as *mut u64))
+            if mi != 0 {
+                return datai + (((a - datai) * mi) >> 32) * blocki
             }
             return datai + (a - datai) / blocki * blocki
         }
