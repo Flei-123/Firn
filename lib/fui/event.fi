@@ -107,7 +107,7 @@ export {
     PT_MOUSE, PT_TOUCH, PT_PEN,
     G_NONE, G_TAP, G_LONG, G_PAN, G_PINCH,
     MC_ADDED, MC_REMOVED, MC_MOVED, MC_TEXT, MC_VALUE, MC_STATE, MC_FOCUS,
-    TOUCH_SLOP, LONG_MS, DOUBLE_MS, DOUBLE_DIST, FLING_MIN, FLING_MAX,
+    TOUCH_SLOP, LONG_MS, DOUBLE_MS, DOUBLE_DIST, FLING_MIN, FLING_MAX, ev_set_density, ev_fit_velocity,
     EV_HANDLER_MAX, EV_PTR_MAX, EV_PATH_MAX, OBS_REC_MAX,
 }
 
@@ -193,6 +193,25 @@ const FLING_MIN: f64 = 50.0
 const FLING_MAX: f64 = 8000.0
 // the window the fling velocity is measured over
 const VEL_MS: i64 = 100
+// a64: a finger that rested this long before it lifted gives no fling (android: ASSUME_POINTER_STOPPED_TIME)
+const VEL_STOP_MS: i64 = 40
+
+// a64: pixels per dp of the screen (1.0 = the constants above are right as they are). The slop and the fling limits are written for
+// density 1; on a phone with 2.75 px per dp the slop is 8 dp = 22 px and the fastest fling 8000 dp/s = 22000 px/s, as in android.
+static mut DENS: f64 = 1.0
+
+fn ev_set_density(d: f64) {
+    if d >= 1.0 && d <= 6.0 { DENS = d } else { DENS = 1.0 }
+}
+
+fn touch_slop() -> f64 {
+    let s: f64 = 8.0 * DENS
+    if s > TOUCH_SLOP { return s }
+    return TOUCH_SLOP
+}
+
+fn fling_min() -> f64 { return FLING_MIN * DENS }
+fn fling_max() -> f64 { return FLING_MAX * DENS }
 
 // The fixed sizes. The lengths below must be written as digits (Firn takes
 // no name as an array length); these names are the same numbers.
@@ -773,35 +792,96 @@ fn pinch_event(r: *mut Router, sc: *mut scene.Scene, kind: u32, t: i64) {
     let ok: bool = ev_dispatch(r, sc, &e)
 }
 
+// a64: the velocity (px per second) of the finger at its LAST sample, like android's VelocityTracker (LSQ2): a quadratic fit through the
+// samples of the last VEL_MS before it. A finger that rested VEL_STOP_MS before `t` (the lift) has no velocity (false). The fit is
+// distrusted (the plain end-to-end speed is taken) when it is not the same direction or far off it, as a bent fit does at a reversal.
+fn fit_axis(r: *mut Router, o: usize, l: usize, yaxis: bool) -> f64 {
+    let n: usize = l - o + 1
+    let tl: i64 = (*r).smp[l].t
+    var span: f64 = ((tl - (*r).smp[o].t) as f64) / 1000.0
+    var p0: f64 = (*r).smp[o].x
+    var pl: f64 = (*r).smp[l].x
+    if yaxis {
+        p0 = (*r).smp[o].y
+        pl = (*r).smp[l].y
+    }
+    if span <= 0.0 { return 0.0 }
+    let ends: f64 = (pl - p0) / span
+    if n < 3 { return ends }
+    var s0: f64 = 0.0
+    var s1: f64 = 0.0
+    var s2: f64 = 0.0
+    var s3: f64 = 0.0
+    var s4: f64 = 0.0
+    var y0: f64 = 0.0
+    var y1: f64 = 0.0
+    var y2: f64 = 0.0
+    var k: usize = o
+    while k <= l {
+        let t: f64 = (((*r).smp[k].t - tl) as f64) / 1000.0
+        var y: f64 = (*r).smp[k].x
+        if yaxis { y = (*r).smp[k].y }
+        let t2: f64 = t * t
+        s0 = s0 + 1.0
+        s1 = s1 + t
+        s2 = s2 + t2
+        s3 = s3 + t2 * t
+        s4 = s4 + t2 * t2
+        y0 = y0 + y
+        y1 = y1 + y * t
+        y2 = y2 + y * t2
+        k = k + 1
+    }
+    // normal equations of y = a + b t + c t^2, Cramer's rule; b is the speed at t = 0 (the last sample)
+    let det: f64 = s0 * (s2 * s4 - s3 * s3) - s1 * (s1 * s4 - s3 * s2) + s2 * (s1 * s3 - s2 * s2)
+    if det < 0.000000000001 && det > 0.0 - 0.000000000001 { return ends }
+    let db: f64 = s0 * (y1 * s4 - s3 * y2) - y0 * (s1 * s4 - s3 * s2) + s2 * (s1 * y2 - y1 * s2)
+    let b: f64 = db / det
+    if (b > 0.0 && ends < 0.0) || (b < 0.0 && ends > 0.0) { return ends }
+    var ab: f64 = b
+    if ab < 0.0 { ab = 0.0 - ab }
+    var ae: f64 = ends
+    if ae < 0.0 { ae = 0.0 - ae }
+    if ab > ae * 2.5 || ab * 2.5 < ae { return ends }
+    return b
+}
+
+fn ev_fit_velocity(r: *mut Router, t: i64, vx: *mut f64, vy: *mut f64) -> bool {
+    *vx = 0.0
+    *vy = 0.0
+    if (*r).nsmp < 2 { return false }
+    let l: usize = (*r).nsmp - 1
+    if t - (*r).smp[l].t > VEL_STOP_MS { return false }
+    var o: usize = l
+    while o > 0 && (*r).smp[l].t - (*r).smp[o - 1].t <= VEL_MS {
+        o = o - 1
+    }
+    if o == l { return false }
+    *vx = fit_axis(r, o, l, false)
+    *vy = fit_axis(r, o, l, true)
+    return true
+}
+
 fn pan_end(r: *mut Router, sc: *mut scene.Scene, t: i64, fling_ok: bool) {
     let p: *mut Ptr = &(*r).ps[(*r).lead]
     var e: Ev = gesture_event(r, sc, EV_PAN_END, (*p).x, (*p).y, t)
     if fling_ok {
-        // the oldest sample inside the window, against the last one
-        var k: usize = 0
-        var o: usize = NONE
-        while k < (*r).nsmp {
-            if o == NONE && (*r).smp[k].t >= t - VEL_MS {
-                o = k
-            }
-            k = k + 1
+        // the lift itself is a sample (android feeds the UP event to the tracker too)
+        if (*r).nsmp > 0 && t > (*r).smp[(*r).nsmp - 1].t && ((*p).x != (*r).smp[(*r).nsmp - 1].x || (*p).y != (*r).smp[(*r).nsmp - 1].y) {
+            add_sample(r, t, (*p).x, (*p).y)
         }
-        if o != NONE && (*r).nsmp > 0 {
-            let l: usize = (*r).nsmp - 1
-            let dt: i64 = (*r).smp[l].t - (*r).smp[o].t
-            if dt > 0 {
-                var vx: f64 = ((*r).smp[l].x - (*r).smp[o].x) * 1000.0 / (dt as f64)
-                var vy: f64 = ((*r).smp[l].y - (*r).smp[o].y) * 1000.0 / (dt as f64)
-                let sp: f64 = matrix.m_sqrt(vx * vx + vy * vy)
-                if sp > FLING_MAX {
-                    vx = vx * FLING_MAX / sp
-                    vy = vy * FLING_MAX / sp
-                }
-                e.vx = vx
-                e.vy = vy
-                if sp >= FLING_MIN {
-                    e.fling = 1 as u32
-                }
+        var vx: f64 = 0.0
+        var vy: f64 = 0.0
+        if ev_fit_velocity(r, t, &vx, &vy) {
+            let sp: f64 = matrix.m_sqrt(vx * vx + vy * vy)
+            if sp > fling_max() {
+                vx = vx * fling_max() / sp
+                vy = vy * fling_max() / sp
+            }
+            e.vx = vx
+            e.vy = vy
+            if sp >= fling_min() {
+                e.fling = 1 as u32
             }
         }
     }
@@ -974,7 +1054,7 @@ fn ev_pointer_move(r: *mut Router, sc: *mut scene.Scene, pid: u32,
     if (*p).ptype == PT_MOUSE || (*r).seq == 0 as u32 {
         return true
     }
-    if dist(x, y, (*p).x0, (*p).y0) > TOUCH_SLOP {
+    if dist(x, y, (*p).x0, (*p).y0) > touch_slop() {
         (*p).moved = 1 as u32
     }
     if s == (*r).lead {

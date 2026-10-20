@@ -10,11 +10,12 @@
 // HISTORY: JE_HIST_TOOL steps collect into the pending group, flush puts it in front of the next message.
 // Hidden like in the web app: ToolSearch, ask_user, say. Text is German, like the web app (labels = public/i18n.js tool.*).
 import std.rt
+import jtexts
 
-export { reset, tool_start, tool_result, hist_tool, add_text, new_turn, turn_has_group, flush, flush_at, compose, on_link, has_pending, hidden }
+export { room, reset, tool_start, tool_result, hist_tool, add_text, new_turn, turn_has_group, flush, flush_at, compose, on_link, has_pending, hidden }
 
-const MAXS: usize = 1024 // steps kept (more are dropped)
-const MAXG: usize = 256 // groups kept
+const MAXS: usize = 4096 // steps kept (more are dropped)
+const MAXG: usize = 1024 // groups kept
 const RES_CAP: usize = 6000 // bytes of one output kept
 const LINES: usize = 10 // output lines shown while a step is "short"
 const LINES_FULL: usize = 80 // ... after "more"
@@ -23,21 +24,21 @@ const TEXT_CAP: usize = 6000 // bytes of one folded text kept
 
 static mut POOL: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 }
 static mut S_N: usize = 0
-static mut S_NAME_O: [usize; 1024] = [0; 1024]
-static mut S_NAME_N: [usize; 1024] = [0; 1024]
-static mut S_ARG_O: [usize; 1024] = [0; 1024]
-static mut S_ARG_N: [usize; 1024] = [0; 1024]
-static mut S_RES_O: [usize; 1024] = [0; 1024]
-static mut S_RES_N: [usize; 1024] = [0; 1024]
-static mut S_TID_O: [usize; 1024] = [0; 1024]
-static mut S_TID_N: [usize; 1024] = [0; 1024]
-static mut S_ST: [u8; 1024] = [0; 1024] // 0 running (no result yet), 1 ok, 2 failed, 3 done without stored output, 4 = folded text of the AI between two tool calls (its text is in RES)
-static mut S_FULL: [u8; 1024] = [0; 1024]
-static mut S_DET: [u8; 1024] = [0; 1024] // the output of the step is shown (tap on its pill)
+static mut S_NAME_O: [usize; 4096] = [0; 4096]
+static mut S_NAME_N: [usize; 4096] = [0; 4096]
+static mut S_ARG_O: [usize; 4096] = [0; 4096]
+static mut S_ARG_N: [usize; 4096] = [0; 4096]
+static mut S_RES_O: [usize; 4096] = [0; 4096]
+static mut S_RES_N: [usize; 4096] = [0; 4096]
+static mut S_TID_O: [usize; 4096] = [0; 4096]
+static mut S_TID_N: [usize; 4096] = [0; 4096]
+static mut S_ST: [u8; 4096] = [0; 4096] // 0 running (no result yet), 1 ok, 2 failed, 3 done without stored output, 4 = folded text of the AI between two tool calls (its text is in RES)
+static mut S_FULL: [u8; 4096] = [0; 4096]
+static mut S_DET: [u8; 4096] = [0; 4096] // the output of the step is shown (tap on its pill)
 static mut G_N: usize = 0
-static mut G_FIRST: [usize; 256] = [0; 256]
-static mut G_CNT: [usize; 256] = [0; 256]
-static mut G_OPEN: [u8; 256] = [0; 256]
+static mut G_FIRST: [usize; 1024] = [0; 1024]
+static mut G_CNT: [usize; 1024] = [0; 1024]
+static mut G_OPEN: [u8; 1024] = [0; 1024]
 static mut PEND: usize = 999999 // the group being filled (none = 999999)
 static mut TURN_GRP: bool = false // the answer being streamed already has a group (its later text is folded into the steps)
 
@@ -61,6 +62,9 @@ fn reset() {
 }
 
 fn has_pending() -> bool { return PEND != 999999 }
+
+// a64: room for another page of history (steps / groups kept are capped)
+fn room() -> bool { return S_N + 300 < MAXS && G_N + 40 < MAXG }
 
 // the tool name in German like the web app (unknown names stay as they are)
 fn label(name: str) -> str {
@@ -318,8 +322,9 @@ fn put_clean(b: *mut rt.Buf, p: u64, n: usize) {
     }
 }
 
-// the pill of one step: [Tool name](chip:<i>) (err:<i> = a failed call, drawn red); a tap shows / hides its output
-fn render_chip(out: *mut rt.Buf, i: usize, with_arg: bool) {
+// one tool row: [Tool name](chip:<i>) (err:<i> = a failed call, drawn red); the view paints the wrench in front. A tap shows / hides its detail
+// (the argument + the output, like the web's tool detail). `last` = ends the line with a hard break so the rows stack tight (web: .tool rows).
+fn render_chip(out: *mut rt.Buf, i: usize, tight: bool) {
     put(out, "[")
     let nm: str = label(pool_str(S_NAME_O[i], S_NAME_N[i]))
     put_esc(out, nm.p as u64, nm.n, 80)
@@ -327,11 +332,15 @@ fn render_chip(out: *mut rt.Buf, i: usize, with_arg: bool) {
     rt.buf_push_dec_i64(out, i as i64)
     put(out, ")")
     if S_ST[i] == 0 as u8 { put(out, " ...") }
-    if with_arg && S_ARG_N[i] > 0 {
-        put(out, " ")
-        put_esc(out, (POOL.ptr as u64) + S_ARG_O[i] as u64, S_ARG_N[i], 70)
-    }
-    put(out, "\n\n")
+    if tight { put(out, "  \n") } else { put(out, "\n\n") }
+}
+
+// the argument of a step as a code block (shown with the detail)
+fn render_arg(out: *mut rt.Buf, i: usize) {
+    if S_ARG_N[i] == 0 { return }
+    put(out, "`````\n")
+    put_clean(out, (POOL.ptr as u64) + S_ARG_O[i] as u64, S_ARG_N[i])
+    put(out, "\n`````\n\n")
 }
 
 // the output of a step as a code block (at most LINES lines, LINES_FULL after "more")
@@ -394,6 +403,28 @@ fn emit_rail(out: *mut rt.Buf, tmp: *mut rt.Buf) {
     put(out, "\n")
 }
 
+static mut NB: [u8; 24] = [0; 24] // the group size as text (the argument of steps.n)
+
+fn group_label(out: *mut rt.Buf, n: usize) {
+    var len: usize = 0
+    var m: usize = n
+    if m == 0 { NB[0] = 48 as u8
+        len = 1 }
+    var tmp: [u8; 24] = [0; 24]
+    var k: usize = 0
+    while m > 0 && k < 20 { tmp[k] = (48 + m % 10) as u8
+        k = k + 1
+        m = m / 10 }
+    while k > 0 { k = k - 1
+        NB[len] = tmp[k]
+        len = len + 1 }
+    if n == 1 {
+        put(out, jtexts.t("steps.one"))
+    } else {
+        put(out, jtexts.t1("steps.n", "n", str { p: (&NB[0]) as *mut u8, n: len }))
+    }
+}
+
 fn render_group(out: *mut rt.Buf, g: usize) {
     if g >= G_N { return }
     let n: usize = G_CNT[g]
@@ -405,18 +436,19 @@ fn render_group(out: *mut rt.Buf, g: usize) {
         if S_ST[f + k] == 0 as u8 { run = true }
         k = k + 1
     }
-    // exactly one tool call: no header, just its pill (web: .tool-group.single)
+    // exactly one tool call: no pill, just its row (web: .tool-group.single)
     if n == 1 && S_ST[f] != 4 as u8 {
-        render_chip(out, f, true)
-        if S_DET[f] != 0 as u8 { render_out(out, f) }
+        render_chip(out, f, false)
+        if S_DET[f] != 0 as u8 {
+            render_arg(out, f)
+            render_out(out, f)
+        }
         return
     }
     put(out, "[")
-    if G_OPEN[g] != 0 as u8 { put(out, "v ") } else { put(out, "> ") }
-    rt.buf_push_dec_i64(out, n as i64)
-    if n == 1 { put(out, " Schritt") } else { put(out, " Schritte") } // english: ok
+    group_label(out, n)
     if run && g == PEND { put(out, " ...") }
-    put(out, "](step:")
+    if G_OPEN[g] != 0 as u8 { put(out, "](stepo:") } else { put(out, "](step:") }
     rt.buf_push_dec_i64(out, g as i64)
     put(out, ")\n\n")
     if G_OPEN[g] == 0 as u8 { return }
@@ -428,8 +460,14 @@ fn render_group(out: *mut rt.Buf, g: usize) {
             rt.buf_push_bytes(&tmp, (POOL.ptr as u64) + S_RES_O[i] as u64, S_RES_N[i])
             put(&tmp, "\n\n")
         } else {
-            render_chip(&tmp, i, true)
-            if S_DET[i] != 0 as u8 { render_out(&tmp, i) }
+            // rows stack tight (hard break) unless a detail block or a text follows
+            var tight: bool = false
+            if S_DET[i] == 0 as u8 && k + 1 < n && S_ST[i + 1] != 4 as u8 { tight = true }
+            render_chip(&tmp, i, tight)
+            if S_DET[i] != 0 as u8 {
+                render_arg(&tmp, i)
+                render_out(&tmp, i)
+            }
         }
         k = k + 1
     }
@@ -478,6 +516,10 @@ fn on_link(p: u64, n: usize) -> bool {
     var kind: u8 = 0 as u8
     var skip: usize = 5
     if n > 5 && rt.mem_eq(p, "step:".p as u64, 5) { kind = 1 as u8 }
+    if n > 6 && rt.mem_eq(p, "stepo:".p as u64, 6) {
+        kind = 1 as u8
+        skip = 6
+    }
     if n > 5 && rt.mem_eq(p, "more:".p as u64, 5) { kind = 2 as u8 }
     if n > 5 && rt.mem_eq(p, "chip:".p as u64, 5) { kind = 3 as u8 }
     if n > 4 && rt.mem_eq(p, "err:".p as u64, 4) {

@@ -61,6 +61,11 @@ if os.environ.get("FAKE_TOOLS") == "1":  # c1 history with tool steps (ok, faile
     CONV["s2"] = CONV["c1"]
 
 
+if os.environ.get("FAKE_CHATJSON"):  # a real server answer ({"conversation": {"messages": [...]}}): the history of c1/s1/s2 (real tool steps, thinking, cut inputs)
+    with open(os.environ["FAKE_CHATJSON"]) as _f:
+        _real = json.load(_f)["conversation"]["messages"]
+    CONV["c1"] = CONV["s1"] = CONV["s2"] = _real
+
 # ------------------------------------------------------------------ realistic data (shapes of the real server)
 REAL = os.environ.get("FAKE_REALISTIC", "1") != "0"
 NCHATS = int(os.environ.get("FAKE_NCHATS", "150"))
@@ -264,9 +269,25 @@ async def process_request(conn, request):
                 CONV[cid] = [{"role": "user", "text": "show pics", "at": 1760000000000},
                              {"role": "assistant", "text": "md:\n\n![md-hist](/img/u1/%s/md.png)\n\nabs:\n\n![md-abs](http://127.0.0.1:%d/img/u1/%s/abs.png)\n\ndl alias:\n\n![alias](/downloads/u1/x/dl.png)\n" % (cid, HTTPPORT, cid), "images": [{"url": "/img/u1/%s/pic.png" % cid}], "at": 1760000001000}]
             # a59: any chat id of the sidebar has a history (picture in message 3, markdown pictures in 7)
+        if cid not in CONV and os.environ.get("FAKE_PAGING") == "1":
+            # a64: 400 messages (200 turns) for pagination; the window rules of server lib/conversations.js full(): ?turns=n / ?before=<idx>&turns=n
+            CONV[cid] = []
+            for _i in range(200):
+                CONV[cid].append({"role": "user", "text": "question %d" % _i, "at": 1760000000000 + _i * 60000})
+                CONV[cid].append({"role": "assistant", "text": "answer %d: " % _i + "lorem ipsum dolor sit amet " * (3 + _i % 5), "at": 1760000030000 + _i * 60000, "genMs": 30000})
         if cid not in CONV:
             return reply(404, {"error": "Not found"})
-        return reply(200, {"conversation": {"messages": CONV[cid]}, "running": False, "partial": ""})
+        msgs = CONV[cid]
+        q = dict(x.split("=", 1) for x in u.query.split("&") if "=" in x)
+        if os.environ.get("FAKE_PAGING") == "1" and ("turns" in q or "before" in q):
+            end = min(int(q["before"]), len(msgs)) if "before" in q else len(msgs)
+            n = int(q.get("turns", "5")); start = end; c = 0
+            while start > 0 and c < n:
+                start -= 1
+                if msgs[start]["role"] == "user": c += 1
+            LOG.write(json.dumps({"type": "page", "before": q.get("before"), "turns": n, "from": start, "to": end}) + "\n"); LOG.flush()
+            return reply(200, {"conversation": {"messages": msgs[start:end] if "before" in q else msgs[start:], "from": start, "total": len(msgs)}, "running": False, "partial": ""})
+        return reply(200, {"conversation": {"messages": msgs}, "running": False, "partial": ""})
     if u.path == "/":
         if "websocket" not in request.headers.get("Upgrade", "").lower():
             return reply(404, {"error": "no"})
