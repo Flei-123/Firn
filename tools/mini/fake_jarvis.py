@@ -814,6 +814,10 @@ async def handler(ws):
                 await send(ws, {"type": "token", "cid": cid, "content": "Pic rel:\n\n![rel](/img/u1/%s/rel.png)\n\n" % cid})
                 await send(ws, {"type": "token", "cid": cid, "content": "Pic abs:\n\n![abs](http://127.0.0.1:%d/img/u1/%s/abs.png)\n\n" % (HTTPPORT, cid)})
                 await send(ws, {"type": "token", "cid": cid, "content": "Pic dl:\n\n![dl](/dl/u1/x/dl.png)\n\nEnd.\n>STATUS: status=done"})
+            elif text == "imgfile":  # a66: the assistant delivers an image file (type "file", mime image/png): shown inline + as a file card
+                await send(ws, {"type": "token", "cid": cid, "content": "Here is the picture:"})
+                await send(ws, {"type": "file", "cid": cid, "name": "chart.png", "url": "/dl/u1/%s/chart.png" % cid, "mime": "image/png"})
+                await send(ws, {"type": "token", "cid": cid, "content": "\n\nDone.\n>STATUS: status=done"})
             elif text == "file":
                 FILES["report.txt"] = b"hello report from the fake server\n"
                 await send(ws, {"type": "token", "cid": cid, "content": "Here is the file."})
