@@ -662,6 +662,8 @@ done
 echo "  examples/fui/{hello_window,counter,form,touchpad,notes,files,launcher_kit,context}.fi build native + wasm32   OK"
 build app
 "$W/app"
+build wrapgrow
+"$W/wrapgrow"
 
 echo
 echo "== 18p3. ZEILEN MIT SYMBOLEN (lib/fui/listrow.fi, r129) =="
