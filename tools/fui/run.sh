@@ -486,6 +486,10 @@ else
 fi
 
 echo
+echo "== 18k. fUi MDVSCROLL: LAYOUT OF A LONG CHAT (word-width cache, highlight cache) =="
+"$FIRNC" --opt-level=release-fast -o "$W/mdvscroll" tools/fui/mdvscroll_main.fi
+"$W/mdvscroll" 60
+
 echo "== 18j. fUi TEMPO: DER DECKUNGS-CACHE UND DER CLIP AENDERN KEIN OKTETT =="
 # lib/fui/fcache.fi (rasterised text and icons are kept) and
 # painter.clip_rows (shapes outside the clip are not rasterised):

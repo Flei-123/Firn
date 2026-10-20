@@ -92,7 +92,7 @@ import highlight.highlight
 export {
     MdView, ImgInfo, mdv_new, mdv_free, mdv_set_markdown, mdv_set_base_size,
     mdv_set_link_cb, mdv_set_image_cb, mdv_set_image_tap_cb, mdv_set_rect, mdv_set_pad,
-    mdv_set_background, mdv_set_bubble, mdv_set_bubble_end, mdv_set_meta_h6, mdv_set_web_style, mdv_set_copy_label, mdv_set_web_padx, mdv_set_bar_pt, mdv_set_code_bg, mdv_invalidate, mdv_paint, mdv_layout,
+    mdv_set_background, mdv_set_bubble, mdv_set_bubble_end, mdv_set_meta_h6, mdv_set_web_style, mdv_set_copy_label, mdv_set_web_padx, mdv_set_bar_pt, mdv_set_code_bg, mdv_invalidate, mdv_paint, mdv_layout, mdv_cache_clear, mdv_cache_stat, mdv_hl_stat, mdv_hl_pending,
     mdv_wheel, mdv_key, mdv_pointer_move, mdv_pointer_down, mdv_pointer_up,
     mdv_pointer_leave, mdv_link_count, mdv_link_url, mdv_hover_link,
     mdv_content_height, mdv_offset, mdv_set_offset, mdv_item_count,
@@ -668,12 +668,56 @@ fn font_leave(z: *mut painter.Painter, old: u64) {
     }
 }
 
+// a66: WORD WIDTH CACHE. A layout measured every word twice (the word and the space before it) through the shaper: ~8 us per word, so a
+// chat with a long history cost 100-300 ms per full layout (every streamed token, every older page, a picture arriving). The width of a
+// text depends on its bytes, the style flags, the size and the face only: kept in a direct-mapped table keyed by a 60-bit hash of those.
+// The face is part of the key (code runs use slot 1); a live face switch clears the table (mdv_cache_clear).
+const WC_N: usize = 16384
+static mut WC_KEY: [u64; 16384] = [0; 16384]
+static mut WC_VAL: [f64; 16384] = [0.0; 16384]
+static mut WC_HITS: i64 = 0
+static mut WC_MISSES: i64 = 0
+
+fn mdv_cache_clear() {
+    var i: usize = 0
+    while i < WC_N {
+        WC_KEY[i] = 0
+        i = i + 1
+    }
+}
+
+// (hits, misses) since start: k = 0 hits, 1 misses
+fn mdv_cache_stat(k: usize) -> i64 {
+    if k == 0 { return WC_HITS }
+    return WC_MISSES
+}
+
 // The width of the text (p, n) in a style.
 fn measure(l: *mut L, flags: u32, size: f64, p: u64, n: usize) -> f64 {
-    var r: painter.TextRun = mk_run(flags, size)
     let old: u64 = font_enter((*l).z, flags)
+    let face: u64 = painter.painter_font((*l).z)
+    var h1: u64 = ((flags as u64) * 7919 + (face % 1000003) + ((size * 64.0) as u64) * 104729) % 1000000007
+    var h2: u64 = ((size * 64.0) as u64 + (face % 999983) * 31 + (flags as u64) * 17) % 998244353
+    var i: usize = 0
+    while i < n {
+        let b: u64 = rt.ld8(p, i) as u64
+        h1 = (h1 * 131 + b + 1) % 1000000007
+        h2 = (h2 * 257 + b + 3) % 998244353
+        i = i + 1
+    }
+    let key: u64 = ((h1 << 32) | h2) + 1
+    let slot: usize = ((h1 ^ (h2 * 2654435761 % 16384)) % 16384) as usize
+    if WC_KEY[slot] == key {
+        WC_HITS = WC_HITS + 1
+        font_leave((*l).z, old)
+        return WC_VAL[slot]
+    }
+    var r: painter.TextRun = mk_run(flags, size)
     let w: f64 = painter.run_width((*l).z, &r, p, n)
     font_leave((*l).z, old)
+    WC_MISSES = WC_MISSES + 1
+    WC_KEY[slot] = key
+    WC_VAL[slot] = w
     return w
 }
 
@@ -1599,6 +1643,122 @@ fn hl_first_span(spans: *mut Vec[highlight.HlSpan], pos: usize) -> usize {
     return lo
 }
 
+// a66: HIGHLIGHT CACHE. Tokenizing a code block (regex rules) cost ~0.8 ms for six lines, on EVERY layout: a chat with 60 code blocks
+// spent 49 of its 67 ms layout there (every streamed token, every older page). The spans of a block depend on its language and bytes only:
+// kept in a pool (parallel u32 arrays) behind a direct-mapped table keyed by a 60-bit hash. A full pool clears everything.
+const HC_SLOTS: usize = 1024
+const HC_POOL: usize = 32768
+static mut HC_KEY: [u64; 1024] = [0; 1024]
+static mut HC_OFF: [u32; 1024] = [0 as u32; 1024]
+static mut HC_CNT: [u32; 1024] = [0 as u32; 1024]
+static mut HC_S: [u32; 32768] = [0 as u32; 32768]
+static mut HC_L: [u32; 32768] = [0 as u32; 32768]
+static mut HC_K: [u8; 32768] = [0 as u8; 32768]
+static mut HC_TOP: usize = 0
+const HC_BUDGET: i64 = 3
+static mut HC_LEFT: i64 = 3
+static mut HC_PENDING: bool = false
+static mut HC_POLLS: i64 = 0
+static mut HC_HITS: i64 = 0
+static mut HC_MISSES: i64 = 0
+
+// a66: true while code blocks still wait for their highlighting (the host paints again; every paint finishes a few more)
+// (safety: the answer turns false after 8 polls without a layout in between, e.g. when the chat page is not on screen)
+fn mdv_hl_pending() -> bool {
+    if !HC_PENDING { return false }
+    HC_POLLS = HC_POLLS + 1
+    return HC_POLLS <= 8
+}
+
+fn hl_cache_clear() {
+    var i: usize = 0
+    while i < HC_SLOTS {
+        HC_KEY[i] = 0
+        i = i + 1
+    }
+    HC_TOP = 0
+}
+
+// (hits, misses) since start: k = 0 hits, 1 misses
+fn mdv_hl_stat(k: usize) -> i64 {
+    if k == 0 { return HC_HITS }
+    return HC_MISSES
+}
+
+fn hl_cached(h: *mut highlight.Highlighter, lang: u32, p: u64, n: usize, out: *mut Vec[highlight.HlSpan]) -> bool {
+    var h1: u64 = (lang as u64) + 17
+    var h2: u64 = (lang as u64) * 3 + 5
+    var i: usize = 0
+    while i < n {
+        let b: u64 = rt.ld8(p, i) as u64
+        h1 = (h1 * 131 + b + 1) % 1000000007
+        h2 = (h2 * 257 + b + 3) % 998244353
+        i = i + 1
+    }
+    let key: u64 = ((h1 << 32) | h2) + (n as u64) * 1000003 + 1
+    // linear probing (8 slots): two blocks with the same home slot must not evict each other on every layout (that would never settle)
+    let home: usize = (key % 1024) as usize
+    var slot: usize = home
+    var pr: usize = 0
+    var found: bool = false
+    var free: usize = 1024
+    while pr < 8 {
+        let sx: usize = (home + pr) % 1024
+        if HC_KEY[sx] == key {
+            slot = sx
+            found = true
+            pr = 8
+        } else {
+            if HC_KEY[sx] == 0 && free == 1024 { free = sx }
+            pr = pr + 1
+        }
+    }
+    if found {
+        HC_HITS = HC_HITS + 1
+        vec_clear[highlight.HlSpan](out)
+        let o: usize = HC_OFF[slot] as usize
+        let c: usize = HC_CNT[slot] as usize
+        var k: usize = 0
+        while k < c {
+            vec_push[highlight.HlSpan](out, highlight.HlSpan { start: HC_S[o + k] as usize, len: HC_L[o + k] as usize, kind: HC_K[o + k] as u32 })
+            k = k + 1
+        }
+        return true
+    }
+    // a66: at most HC_BUDGET new blocks are tokenized per layout; the rest is laid out plain this time and finished by the next layouts
+    // (mdv_hl_pending tells the host to paint again). Keeps a page of 20 fresh code blocks from stalling one frame.
+    if HC_LEFT == 0 {
+        HC_PENDING = true
+        return false
+    }
+    HC_LEFT = HC_LEFT - 1
+    HC_MISSES = HC_MISSES + 1
+    if !highlight.hl_tokenize(h, lang, p, n, out) {
+        return false
+    }
+    let c: usize = vec_len[highlight.HlSpan](out)
+    if c > HC_POOL {
+        return true
+    }
+    if HC_TOP + c > HC_POOL {
+        hl_cache_clear()
+    }
+    var k: usize = 0
+    while k < c {
+        let sp: *mut highlight.HlSpan = vec_elem_ptr[highlight.HlSpan](out, k)
+        HC_S[HC_TOP + k] = (*sp).start as u32
+        HC_L[HC_TOP + k] = (*sp).len as u32
+        HC_K[HC_TOP + k] = (*sp).kind as u8
+        k = k + 1
+    }
+    if free != 1024 { slot = free } else { slot = home }
+    HC_KEY[slot] = key
+    HC_OFF[slot] = HC_TOP as u32
+    HC_CNT[slot] = c as u32
+    HC_TOP = HC_TOP + c
+    return true
+}
+
 fn lay_code(l: *mut L, n: u32, x0: f64, w: f64) {
     let d: *mut doc.Doc = &(*(*l).v).d
     let base: f64 = (*l).base
@@ -1686,7 +1846,7 @@ fn lay_code(l: *mut L, n: u32, x0: f64, w: f64) {
         }
     }
     if hl_lang != highlight.HL_NONE {
-        if !highlight.hl_tokenize(&(*(*l).v).hl, hl_lang, t.p, t.n, &(*(*l).v).hl_spans) {
+        if !hl_cached(&(*(*l).v).hl, hl_lang, t.p, t.n, &(*(*l).v).hl_spans) {
             hl_lang = highlight.HL_NONE
         }
     }
@@ -2037,6 +2197,9 @@ fn lay_table(l: *mut L, n: u32, x0: f64, w: f64, flags: u32) {
 
 // Lay the document out at `width` (device points, the width of the content).
 fn mdv_layout(v: *mut MdView, c: *mut render.Ctx, width: f64) {
+    HC_LEFT = HC_BUDGET
+    HC_PENDING = false
+    HC_POLLS = 0
     vec_clear[Item](&(*v).items)
     vec_clear[LinkRec](&(*v).link_tab)
     vec_clear[MetaRec](&(*v).meta_tab)
@@ -2107,7 +2270,7 @@ fn ensure_layout(v: *mut MdView, c: *mut render.Ctx) {
         }
         (*v).lay_w = w
         (*v).lay_scale = sc
-        (*v).dirty = false
+        (*v).dirty = HC_PENDING
     }
 }
 
