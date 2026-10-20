@@ -674,10 +674,10 @@ build wrapgrow
 "$W/wrapgrow"
 build wrapdens
 "$W/wrapdens"
-build ttschunk
-"$W/ttschunk"
 build ttssent
 "$W/ttssent"
+build ttsstream
+"$W/ttsstream"
 
 echo
 echo "== 18p3. ZEILEN MIT SYMBOLEN (lib/fui/listrow.fi, r129) =="

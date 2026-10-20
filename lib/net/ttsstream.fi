@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/net/ttsstream.fi -- read aloud WHILE the answer is still being written (a68). The speech text and the "what was handed out"
+// bookkeeping of one read-aloud session; no audio, no network (examples/jarvis_android/jtts.fi plays the blocks).
+//
+//   st_reset(s)                          new session (frees nothing the caller still reads: the text buffer is cleared)
+//   st_feed(s, p, n, final)              the raw markdown of the CURRENT text segment so far (the whole segment every time, not the delta).
+//                                        final = the segment is complete (a tool call follows / the answer is done). The next feed after
+//                                        a final one starts a NEW segment (text between two tool calls), appended behind the old one.
+//   st_end(s)                            no more text will come (everything left is flushed)
+//   st_next(s, &a, &b)                   the next block that is safe to speak: text[a, b) (blanks trimmed); false = nothing ready yet
+//   st_done(s)                           ended and every block handed out
+//
+// A block is only handed out when it cannot change any more (net.ttssent.ready_end): the last sentence of a growing segment waits until the
+// next word has arrived; a block that was handed out is never handed out again (the position only moves forward), so nothing is spoken twice.
+// The cleaned text of the growing segment is rebuilt from the raw text on every feed (cleaning is cheap); what was already handed out stays
+// valid because the rebuilt text only differs behind the last complete sentence.
+import std.rt
+import net.ttssent
+
+export { Stream, st_reset, st_feed, st_end, st_next, st_done, st_text, st_complete }
+
+struct Stream {
+    txt: rt.Buf, // the speech text of all segments (cleaned)
+    seg_at: usize, // where the cleaned text of the current segment starts
+    seg_open: bool, // a segment is growing
+    fed_w: usize, // raw octets of the segment the text was built from
+    ended: bool,
+    pos: usize, // everything before this was handed out
+    nblock: usize,
+}
+
+fn st_reset(s: *mut Stream) {
+    rt.buf_clear(&(*s).txt)
+    (*s).seg_at = 0
+    (*s).seg_open = false
+    (*s).fed_w = 0
+    (*s).ended = false
+    (*s).pos = 0
+    (*s).nblock = 0
+}
+
+// the speech text so far
+fn st_text(s: *mut Stream) -> str { return rt.buf_str(&(*s).txt) }
+
+// no text can follow right now: the session is ended or the last segment is closed
+fn st_complete(s: *mut Stream) -> bool { return (*s).ended || !(*s).seg_open }
+
+fn st_feed(s: *mut Stream, p: u64, n: usize, final: bool) {
+    if (*s).ended { return }
+    var w: usize = n
+    if !final {
+        w = ttssent.stream_cut(p, n)
+        if (*s).seg_open && w <= (*s).fed_w { return } // nothing new that is safe (the text never shrinks)
+    }
+    if !(*s).seg_open {
+        (*s).seg_open = true
+        (*s).seg_at = (*s).txt.len
+        (*s).fed_w = 0
+    }
+    (*s).txt.len = (*s).seg_at
+    ttssent.clean(p, w, &(*s).txt)
+    (*s).fed_w = w
+    if (*s).pos > (*s).txt.len { (*s).pos = (*s).txt.len }
+    if final {
+        if (*s).txt.len > (*s).seg_at { rt.buf_push(&(*s).txt, 10 as u8) } // a break between two segments
+        (*s).seg_open = false
+    }
+}
+
+fn st_end(s: *mut Stream) { (*s).ended = true }
+
+fn st_next(s: *mut Stream, out_a: *mut usize, out_b: *mut usize) -> bool {
+    var a: usize = (*s).pos
+    let len: usize = (*s).txt.len
+    while a < len && ttssent.is_space(rt.ld8((*s).txt.ptr, a)) { a = a + 1 }
+    if a >= len {
+        (*s).pos = len
+        return false
+    }
+    let e: usize = ttssent.ready_end((*s).txt.ptr, len, a, (*s).nblock == 0, st_complete(s))
+    if e == 0 { return false }
+    var te: usize = e
+    while te > a + 1 && ttssent.is_space(rt.ld8((*s).txt.ptr, te - 1)) { te = te - 1 }
+    *out_a = a
+    *out_b = te
+    (*s).pos = e
+    (*s).nblock = (*s).nblock + 1
+    return true
+}
+
+// ended and nothing left to hand out
+fn st_done(s: *mut Stream) -> bool {
+    if !(*s).ended { return false }
+    var a: usize = (*s).pos
+    while a < (*s).txt.len && ttssent.is_space(rt.ld8((*s).txt.ptr, a)) { a = a + 1 }
+    return a >= (*s).txt.len
+}

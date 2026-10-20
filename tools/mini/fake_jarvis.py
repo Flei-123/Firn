@@ -8,6 +8,7 @@
 #   confirm  -> confirm_request, waits for confirm_result
 #   ask      -> ask_request (options A, B), waits for ask_result
 #   slow     -> tokens until a "stop" arrives, then done
+#   readstream -> a markdown answer word by word (FAKE_STREAM_MS per word), for the read-aloud while streaming (a68)
 #   other    -> answer, then a "user" event as if typed on another device
 #   drop     -> the server closes the socket (client must reconnect)
 #   else     -> thinking, tool, "Hallo " + text split in two tokens, done
@@ -659,7 +660,7 @@ def rest(method, rawpath, hdr, body):
         text = q.get("text", [""])[0]
         speed = float(q.get("speed", ["1"])[0] or 1)
         TTSN["n"] += 1
-        LOG.write(json.dumps({"type": "tts", "n": TTSN["n"], "text": text, "speed": speed, "voice": q.get("voice", [""])[0], "speaker": q.get("speaker", [""])[0]}) + "\n")
+        LOG.write(json.dumps({"type": "tts", "n": TTSN["n"], "text": text, "speed": speed, "voice": q.get("voice", [""])[0], "speaker": q.get("speaker", [""])[0], "t": int(time.time() * 1000)}) + "\n")
         mode = os.environ.get("FAKE_TTS", "")
         if mode == "off" or (mode == "fail2" and TTSN["n"] == 2): return (503, b"tts offline", "text/plain")
         if mode == "empty" or not text.strip(): return (204, b"", "text/plain")
@@ -982,6 +983,15 @@ async def handler(ws):
                 FILES["report.txt"] = b"hello report from the fake server\n"
                 await send(ws, {"type": "token", "cid": cid, "content": "Here is the file."})
                 await send(ws, {"type": "file", "cid": cid, "name": "report.txt", "url": "/file/u1/%s/report.txt" % cid, "mime": "text/plain"})
+            elif text == "readstream":  # a68: a markdown answer that arrives word by word (FAKE_STREAM_MS per word, default 120): the app reads it while it streams
+                words = ("Das ist der erste Satz der Antwort. Der zweite Satz kommt gleich danach, z.B. mit einer Abkuerzung. Am 3. Mai war es so.\n\n"
+                         "- Punkt eins ist hier\n- Punkt zwei ist auch hier\n\n```sh\nls -la\n```\n\nZum Schluss ein [Link](https://x.y/z) und das Ende.").replace("\n", " \n ").split(" ")
+                LOG.write(json.dumps({"type": "stream", "phase": "start", "t": int(time.time() * 1000)}) + "\n")
+                for w in words:
+                    await send(ws, {"type": "token", "cid": cid, "content": (w if w == "\n" else w + " ")})
+                    await asyncio.sleep(float(os.environ.get("FAKE_STREAM_MS", "120")) / 1000.0)
+                await send(ws, {"type": "token", "cid": cid, "content": "\n>STATUS: status=done"})
+                LOG.write(json.dumps({"type": "stream", "phase": "end", "t": int(time.time() * 1000)}) + "\n")
             elif text == "slow":
                 while True:
                     await send(ws, {"type": "token", "cid": cid, "content": "."})

@@ -1105,6 +1105,33 @@ fn screen_chat_say(txt: str) {
 
 fn screen_chat_say_stop() { jtts.jtts_stop() }
 
+// ---- a68: read the answer aloud WHILE it streams (voice mode). jtts cuts the text sentence by sentence and speaks a sentence as soon as it is
+// certain. Like the web (ttsGate), a text segment is only read live once it is clearly a visible answer (jsteps.keep_visible): a short transition
+// line before a tool call is folded into the steps and never read. At the end of the answer the last segment is fed as the final one.
+const TTS_GATE_CHARS: usize = 120
+static mut G_TTS_GATE: bool = false // the current text segment passed the gate
+static mut G_TTS_TURN: bool = false // this answer was started with the voice mode on (armed)
+
+// the current text segment [G_TXT_AT, end of the chat) goes to the voice; last = it is complete
+fn tts_live_feed(last: bool) {
+    if !G_TTS_TURN || !jtts.jtts_stream_armed() { return }
+    if G_CHAT.len <= G_TXT_AT || G_TXT_AT > G_CHAT.len { return }
+    let seg: str = str { p: ((G_CHAT.ptr as u64) + G_TXT_AT as u64) as *mut u8, n: G_CHAT.len - G_TXT_AT }
+    if !G_TTS_GATE {
+        if !jsteps.keep_visible(seg) && seg.n < TTS_GATE_CHARS { return } // a transition line is short; 120 octets of text are an answer
+        G_TTS_GATE = true
+    }
+    var x: i64 = G_TTS_X100
+    if x <= 0 { x = 105 }
+    jtts.jtts_stream_feed(seg, x, str { p: G_TTS_VOICE.ptr as *mut u8, n: G_TTS_VOICE.len }, str { p: G_TTS_SPEAKER.ptr as *mut u8, n: G_TTS_SPEAKER.len }, last)
+}
+
+// a tool call (or the end) closes the current text segment: what was read live so far is flushed to the end
+fn tts_live_close() {
+    if G_TTS_GATE { tts_live_feed(true) }
+    G_TTS_GATE = false
+}
+
 // ---- a65: edit a message / repeat from a message (web: editMessage + regenerateFrom). A tap on one of my bubbles opens a small menu (Edit, Copy,
 // Repeat from here). The user messages are the "> > " blocks of G_CHAT (a worker note is "> > > "); bubble i of the view = block i. The server
 // wants the position counted from the END ("editEnd": 1 = my last message) because the window of the chat is only the newest part.
@@ -2296,6 +2323,9 @@ fn send_text(a: *mut app.App, t: str) {
     G_ANS_AT = G_CHAT.len
     G_SPLIT = G_CHAT.len
     G_TXT_AT = G_CHAT.len
+    G_TTS_GATE = false
+    G_TTS_TURN = G_VOICE
+    jtts.jtts_stream_arm(G_VOICE) // a68: a new answer cuts the old voice; with the voice mode on its text is read while it streams
     jsteps.new_turn()
     G_SENT_MS = time.now_unix_ms()
     set_busy(a, true)
@@ -2802,6 +2832,7 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
     } else if kind == jarvisc.JE_TOKEN {
         let te: bool = jsteps.think_end(time.now_unix_ms())
         chat_add(jarvisc.jc_text(c))
+        if G_TTS_TURN { tts_live_feed(false) }
     } else if kind == jarvisc.JE_THINKING {
         jshell.set_status(jtexts.t("chat.thinking"))
         // the reasoning itself (web: a live "Denkt nach" block) goes into the steps
@@ -2815,6 +2846,7 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
         jshell.set_status("Werkzeug: " + jarvisc.jc_text(c))
         let te: bool = jsteps.think_end(time.now_unix_ms())
         if !jsteps.hidden(jarvisc.jc_text(c)) {
+            tts_live_close() // a68: the text so far is complete (read live: the rest of it is flushed)
             if !jsteps.turn_has_group() {
                 // the first tool call: the words said before it stay above the steps
                 G_SPLIT = G_CHAT.len
@@ -2866,6 +2898,8 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
     } else if kind == jarvisc.JE_ERROR {
         let te: bool = jsteps.think_end(time.now_unix_ms())
         jsteps.flush_at(&G_CHAT, G_SPLIT)
+        tts_live_close()
+        jtts.jtts_stream_end()
         chat_add("\n\n**error:** " + jarvisc.jc_text(c) + "\n\n")
         set_busy(jshell.app_ui(), false)
     } else if kind == jarvisc.JE_DONE {
@@ -2892,7 +2926,20 @@ fn screen_chat_event(c: *mut jarvisc.Jc, kind: u32, arg: i64) {
         }
         jask.ask_end(jshell.app_ui())
         chat_add_answer(clean, dur, fin, __str_copy(str { p: G_PILL_FULL.ptr as *mut u8, n: G_PILL_FULL.len }))
-        if G_VOICE { screen_chat_say(clean) }
+        if G_VOICE {
+            if !G_TTS_TURN {
+                screen_chat_say(clean) // the voice mode went on during the answer: read the whole answer now
+            } else if jtts.jtts_stream_armed() {
+                // a68: the last segment is the final one of the read-aloud that ran while the answer streamed (or starts it: a short answer)
+                var x: i64 = G_TTS_X100
+                if x <= 0 { x = 105 }
+                if clean.n > 0 { jtts.jtts_stream_feed(clean, x, str { p: G_TTS_VOICE.ptr as *mut u8, n: G_TTS_VOICE.len }, str { p: G_TTS_SPEAKER.ptr as *mut u8, n: G_TTS_SPEAKER.len }, true) }
+                jtts.jtts_stream_end()
+            }
+            // else: a stop (or the device voice fallback) ended it: stays quiet
+        }
+        G_TTS_TURN = false
+        G_TTS_GATE = false
         set_busy(jshell.app_ui(), false)
         jshell.set_status("online")
     }
