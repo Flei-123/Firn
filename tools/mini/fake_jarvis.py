@@ -139,7 +139,15 @@ def sidebar_chats():
     h = 3600000
     def row(i, t, ago, run=False, kind="chat", disp=False, parent=None, fav=False):
         return {"id": i, "title": t, "kind": kind, "updatedAt": now - ago, "running": run, "fav": fav, "parent": parent, "dispatched": disp}
-    return [row("o1", "Leitstand", 0, kind="orchestrator"),
+    extra = []
+    if os.environ.get("FAKE_WORKERS") == "1":
+        # a67: a Workers tab like the live one: a manager worker with sub-workers, workers dispatched from a normal chat (parent = chat in
+        # the OTHER tab), a plain worker; badge = 3 running
+        extra = [row("m1", "Server Manager", 500, True, "worker", True),
+                 row("m1a", "Server Manager: Backup", 1500, True, "worker", True, "m1"),
+                 row("m1b", "Server Manager: Updates", 2500, False, "worker", True, "m1"),
+                 row("m1c", "Server Manager: Logs", 2600, False, "worker", True, "m1b")]
+    return extra + [row("o1", "Leitstand", 0, kind="orchestrator"),
             row("s1", "Certus", 1000, True), row("s2", "OrientOS", 2000),
             row("s2a", "OrientOS: Treiber", 3000, True, "worker", True, "s2"), row("s2b", "OrientOS: Netz", 4000, False, "worker", True, "s2"),
             row("s2c", "OrientOS: Boot", 5000, False, "worker", True, "s2"),
@@ -147,6 +155,14 @@ def sidebar_chats():
             row("s5", "Jarvis", 30 * h), row("s6", "Minecraft", 31 * h), row("s7", "Fleitec All-in-One", 32 * h),
             row("s8", "Diplomarbeit", 100 * h), row("s9", "Anzug-KI", 24 * 20 * h), row("s10", "Russisch", 24 * 90 * h),
             row("w1", "Daidalos: Render", 6 * h, True, "worker", True)]
+
+def cc_workers():
+    # a67: FAKE_CC_WORKERS=N -> N workers in /api/command-center (the live board shows 8); default one worker
+    n = int(os.environ.get("FAKE_CC_WORKERS", "1") or "1")
+    if n <= 1:
+        return [{"id": "c1", "title": "worker one", "running": True, "updatedAt": 1760000000001, "last": "doing", "partial": "par"}]
+    return [{"id": "w%03d" % i, "title": "a67-worker %d: a long title that has to wrap or be cut" % i, "running": i % 2 == 0,
+             "updatedAt": 1760000000001 - i, "last": "doing", "partial": ""} for i in range(n)]
 
 ADMIN_LIMITS = {"maxSubworkers": 5, "heavySlots": 8, "autoLoop": True}
 # user settings (A50): GET/POST /api/settings (switches + persona)
@@ -750,7 +766,7 @@ def rest(method, rawpath, hdr, body):
     if path == "/api/command-center" and os.environ.get("FAKE_CC") == "1":  # a64 fixture of the web command centre (rate, deviceInfo, knowledge, tasks with category)
         iso = lambda ago: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - ago))
         return out(200, {"now": int(time.time() * 1000), "user": "justin",
-            "workers": [{"id": "c1", "title": "worker one", "running": True, "updatedAt": 1760000000001, "last": "doing", "partial": "par"}],
+            "workers": cc_workers(),
             "orchestrator": {"id": "o1", "title": "Leitstand", "running": False, "updatedAt": 5}, "otherChatCount": 7,
             "devices": ["Dell", "Phone"],
             "deviceInfo": [{"name": "Dell", "type": "OrientOS", "online": True, "lastSeen": iso(30)},
@@ -770,7 +786,7 @@ def rest(method, rawpath, hdr, body):
                          {"cid": "c2", "conv": "sys", "kind": "chat", "role": "system", "at": iso(900), "text": "worker started"}]})
     if path == "/api/command-center":
         return out(200, {"now": 1760000000000, "user": "justin",
-            "workers": [{"id": "c1", "title": "worker one", "running": True, "updatedAt": 1760000000001, "last": "doing", "partial": "par"}],
+            "workers": cc_workers(),
             "orchestrator": {"id": "o1", "title": "Leitstand", "running": False, "updatedAt": 5}, "otherChatCount": 7,
             "devices": ["Dell", "Phone"], "deviceInfo": [], "tasks": [{"id": "t1", "text": "buy milk", "due": None, "category": None, "repeat": None, "overdue": True}],
             "sys": {"cpus": 4, "load": [0.5, 0.4, 0.3], "uptime": 99, "memTotal": 8000000000, "memFree": 1000000000,
