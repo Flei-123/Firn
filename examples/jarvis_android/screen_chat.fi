@@ -172,6 +172,134 @@ const FILE_CAP: usize = 20971520 // a file up to this size (the limit of POST /a
 
 fn mdv() -> *mut markdownview.MdView { return G_MD as *mut markdownview.MdView }
 
+// ---- a64: draft per chat (web: localStorage). One small file per chat id in <app data>/drafts/. Written 0.7 s after the last change, on a chat
+// switch and when the app goes to the background (screen_chat_draft_flush); read back when the chat comes up. Empty text = file removed.
+static mut G_DR_CID: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the chat the composer text belongs to
+static mut G_DR_SEEN: rt.Buf = rt.Buf { ptr: 0, len: 0, cap: 0 } // the text last written / read
+static mut G_DR_INIT: bool = false
+static mut G_DR_CHG_MS: i64 = 0
+static mut G_DR_SENT_NEW: bool = false // a message went out of a chat without id: its id arrives soon, the text typed meanwhile is for that chat
+
+fn buf_eq(b: *mut rt.Buf, s: str) -> bool {
+    if (*b).len != s.n { return false }
+    if s.n == 0 { return true }
+    return rt.mem_eq((*b).ptr, s.p as u64, s.n)
+}
+
+fn dr_dir() -> str {
+    var d: rt.Buf = rt.buf_new()
+    if !platform.plat_dir(platform.DIR_DATA, appinfo.app_id(), appinfo.app_vendor(), &d) {
+        rt.buf_free(&d)
+        return ""
+    }
+    let base: str = util.buf_to_str_copy(&d)
+    rt.buf_free(&d)
+    let dir: str = base + "/drafts"
+    let mk: bool = fs.mkdir_all(dir) catch false
+    if !mk && !fs.exists(dir) { return "" }
+    return dir
+}
+
+// file name of a chat id: only [A-Za-z0-9_-], "new" for a chat without id
+fn dr_path(cid: str) -> str {
+    let dir: str = dr_dir()
+    if dir.n == 0 { return "" }
+    var nm: str = "new"
+    if cid.n > 0 {
+        var b: rt.Buf = rt.buf_new()
+        var i: usize = 0
+        while i < cid.n && i < 80 {
+            let ch: u8 = *((cid.p as u64 + i as u64) as *mut u8)
+            let ok: bool = (ch >= 48 as u8 && ch <= 57 as u8) || (ch >= 65 as u8 && ch <= 90 as u8) || (ch >= 97 as u8 && ch <= 122 as u8) || ch == 45 as u8 || ch == 95 as u8
+            if ok { rt.buf_push(&b, ch) } else { rt.buf_push(&b, 95 as u8) }
+            i = i + 1
+        }
+        nm = util.buf_to_str_copy(&b)
+        rt.buf_free(&b)
+    }
+    return dir + "/" + nm + ".txt"
+}
+
+fn dr_put(cid: str, t: str) {
+    let path: str = dr_path(cid)
+    if path.n == 0 { return }
+    if t.n == 0 {
+        if fs.exists(path) { let r: bool = fs.remove(path) catch false }
+        return
+    }
+    let w: usize = fs.write_file(path, t.p as u64, t.n) catch 0
+}
+
+fn dr_get(cid: str) -> str {
+    let path: str = dr_path(cid)
+    if path.n == 0 || !fs.exists(path) { return "" }
+    var b: rt.Buf = rt.buf_new()
+    let n: usize = fs.read_file(path, &b) catch 0
+    let r: str = __str_copy(str { p: b.ptr as *mut u8, n: b.len })
+    rt.buf_free(&b)
+    return r
+}
+
+fn dr_show(a: *mut app.App, t: str) {
+    app.set_text(a, G_IN, t)
+    kbd.kbd_reset_input()
+    buf_set(&G_DR_SEEN, t)
+    G_DR_CHG_MS = 0
+}
+
+// every refresh: switch (save the old chat's text, load the new one) and the debounced save
+fn draft_tick(a: *mut app.App) {
+    if G_IN == 0 { return }
+    let cid: str = jarvisc.jc_cid(jshell.jc())
+    let cur: str = app.text(a, G_IN)
+    if !G_DR_INIT {
+        G_DR_INIT = true
+        buf_set(&G_DR_CID, cid)
+        dr_show(a, dr_get(cid))
+        return
+    }
+    if !buf_eq(&G_DR_CID, cid) {
+        let old: str = __str_copy(str { p: G_DR_CID.ptr as *mut u8, n: G_DR_CID.len })
+        buf_set(&G_DR_CID, cid)
+        if old.n == 0 && G_DR_SENT_NEW && cid.n > 0 {
+            // the id of the chat we just wrote in: what is typed now belongs to it
+            G_DR_SENT_NEW = false
+            dr_put(old, "")
+            dr_put(cid, cur)
+            buf_set(&G_DR_SEEN, cur)
+            return
+        }
+        G_DR_SENT_NEW = false
+        dr_put(old, cur)
+        dr_show(a, dr_get(cid))
+        return
+    }
+    if buf_eq(&G_DR_SEEN, cur) {
+        G_DR_CHG_MS = 0
+        return
+    }
+    let now: i64 = time.now_unix_ms()
+    if G_DR_CHG_MS == 0 {
+        G_DR_CHG_MS = now
+        return
+    }
+    if now - G_DR_CHG_MS >= 700 {
+        dr_put(cid, cur)
+        buf_set(&G_DR_SEEN, cur)
+        G_DR_CHG_MS = 0
+    }
+}
+
+// the app goes to the background (main.fi watch_front): write the text now, the process may be killed
+fn screen_chat_draft_flush() {
+    if G_IN == 0 || !G_DR_INIT { return }
+    let a: *mut app.App = jshell.app_ui()
+    let cur: str = app.text(a, G_IN)
+    dr_put(__str_copy(str { p: G_DR_CID.ptr as *mut u8, n: G_DR_CID.len }), cur)
+    buf_set(&G_DR_SEEN, cur)
+    G_DR_CHG_MS = 0
+}
+
 // ---- a64: popup menus (lib/fui/popmenu.fi): attach (Photo / File), chat modes, model + effort. The card is painted at the end of draw_chat,
 // taps arrive in on_touch (a tap outside closes it). Kinds: 1 attach, 2 modes, 3 model.
 static mut G_PM: u64 = 0
@@ -1737,6 +1865,7 @@ fn send_text(a: *mut app.App, t: str) {
         clear_composer(a)
         return
     }
+    if jarvisc.jc_cid(jshell.jc()).n == 0 { G_DR_SENT_NEW = true }
     chat_add_user(t)
     G_ANS_AT = G_CHAT.len
     G_SPLIT = G_CHAT.len
@@ -2045,6 +2174,7 @@ fn screen_chat_refresh(a: *mut app.App) {
     jshell.mark_once("first_chat_draw")
     if jshell.win() as u64 == 0 { return }
     fit_pill(a)
+    draft_tick(a)
     let st: i32 = window.pick_poll(jshell.win())
     if st == 2 && G_PICKING == 1 {
         G_PICKING = -1
