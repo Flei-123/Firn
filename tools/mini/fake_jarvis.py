@@ -425,7 +425,7 @@ def rest(method, rawpath, hdr, body):
     path = u.path
     q = parse_qs(u.query)
     if not (path in ("/api/me", "/api/projects", "/api/command-center", "/api/conversations", "/api/tasks",
-                     "/api/remote/devices", "/api/settings", "/api/voices", "/tts", "/api/push-token", "/api/stt", "/api/m/upload", "/api/account/password", "/api/accounts")
+                     "/api/remote/devices", "/api/settings", "/api/voices", "/tts", "/api/push-token", "/api/stt", "/api/m/upload", "/api/account/password", "/api/accounts", "/api/usage-all", "/api/usage-insights", "/api/models/new")
             or path.startswith("/api/admin/") or path.startswith("/api/projects/") or path.startswith("/api/m/") or path.startswith("/file/")
             or path.startswith("/vendor/fonts/") or path.startswith("/img/") or path.startswith("/dl/")):
         return None
@@ -640,9 +640,37 @@ def rest(method, rawpath, hdr, body):
         pcm = b"".join(struct.pack("<h", int(6000 * math.sin(2 * math.pi * 440 * i / rate))) for i in range(n))
         hdr = b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16) + b"data" + struct.pack("<I", len(pcm))
         return (200, hdr + pcm, "audio/wav")
+    if path == "/api/usage-all":  # a67: provider rates of the Usage tab
+        return out(200, {"rates": {"claude": {"fiveHour": {"util": 42}, "sevenDay": {"util": 17}, "source": "claude", "label": "Claude", "subscription": "max"},
+                                   "moonshot": {"fiveHour": None, "sevenDay": {"util": 8}, "source": "moonshot", "label": "Kimi", "subscription": None}}})
+    if path == "/api/usage-insights":
+        wk = q.get("win", ["day"])[0] == "week"
+        return out(200, {"rate": None, "user": "justin", "totals": {"turns": 310 if wk else 44, "in": 1840000 if wk else 210000, "out": 920000 if wk else 98000, "cr": 41000000 if wk else 5200000, "cw": 1},
+                         "topChats": [{"cid": "c1", "title": "Firn: Admin Tabs", "turns": 80, "kind": "chat", "in": 500000, "out": 1, "cr": 9000000, "cw": 0, "maxCtx": 1, "avgCr": 1, "pct": 34},
+                                      {"cid": "c2", "title": "OrientOS Worker mit einem sehr langen Titel der umbrechen muss", "turns": 41, "kind": "worker", "in": 300000, "out": 1, "cr": 4000000, "cw": 0, "maxCtx": 1, "avgCr": 1, "pct": 18}] if wk else []})
+    if path == "/api/models/new":  # a67: model guard
+        if method == "POST": ADM["guard_check"] = "2026-10-20T09:55:12.000Z"
+        return out(200, {"pending": [{"kind": "upgrade", "alias": "sonnet", "id": "claude-sonnet-5-6", "prevId": "claude-sonnet-5-5", "label": "Sonnet 5.6", "family": "sonnet", "at": "x"},
+                                     {"kind": "new", "alias": "haiku", "id": "claude-haiku-5", "prevId": None, "label": "Haiku 5", "family": "haiku", "at": "x"}],
+                         "aliases": ["sonnet", "haiku"], "lastCheck": ADM.get("guard_check", "2026-10-20T07:12:33.123Z"), "ok": True})
     if path.startswith("/api/admin/") or path == "/api/accounts":  # a66: the web admin routes the app's Admin tabs use (state in ADM)
         if os.environ.get("FAKE_ROLE", "admin") == "user": return out(403, {"error": "Nur f\u00fcr Admins."})
         b = j if isinstance(j, dict) else {}
+        if path == "/api/admin/mcp" and method == "GET":  # a67
+            return out(200, {"servers": [{"name": "context7", "transport": "stdio", "summary": "npx -y @upstash/context7-mcp", "enabled": True, "admin_only": False, "accounts": [], "auto_allow": ["*"], "note": ""},
+                                         {"name": "logiclab", "transport": "stdio", "summary": "logiclab-mcp --stdio", "enabled": False, "admin_only": True, "accounts": [], "auto_allow": [], "note": "circuits"}],
+                             "invalid": [{"name": "kaputt", "error": "command fehlt"}]})
+        if path == "/api/admin/mcp/test" and method == "POST":
+            if b.get("name") == "logiclab": return out(200, {"ok": False, "error": "Zeitueberschreitung (10 s) - keine initialize-Antwort."})
+            return out(200, {"ok": True, "status": 200, "note": "Handshake ok, 3 Tools"})
+        if path == "/api/admin/mcp/remove" and method == "POST": return out(200, {"ok": True, "servers": [], "invalid": []})
+        if path == "/api/admin/openrouter-models" and method == "GET":
+            return out(200, {"models": [{"id": "openai/gpt-5", "name": "OpenAI: GPT-5", "ctx": 400000, "reasoning": True, "effort": True, "vision": True, "prompt": 0.00000125, "completion": 0.00001},
+                                        {"id": "anthropic/claude-sonnet-5", "name": "Anthropic: Claude Sonnet 5", "ctx": 1000000, "reasoning": True, "effort": False, "vision": True, "prompt": 0.000003, "completion": 0.000015},
+                                        {"id": "meta/llama-free", "name": "Llama (free)", "ctx": 128000, "reasoning": False, "effort": False, "vision": False, "prompt": 0, "completion": 0}]})
+        if path == "/api/admin/impersonate" and method == "POST":  # FAKE_IMP_NOTOKEN=1 = server without the app token in the answer
+            ADM["imp"] = b.get("uid")
+            return out(200, {"ok": True, "username": "papa"} if os.environ.get("FAKE_IMP_NOTOKEN") else {"ok": True, "username": "papa", "token": TOKEN})
         if method == "POST":
             if path == "/api/admin/users":
                 for u_ in ADM["users"]:
