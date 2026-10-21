@@ -953,6 +953,15 @@ if [ -x /usr/lib/wine/wine64 ]; then
 else
     echo "  uiacom: wine missing, skipped"
 fi
+# W7: screen apps (settings, form) cross-built for Windows, run under Wine in --shot mode: byte-identical PNG to Linux; skipped without Wine
+if [ -x /usr/lib/wine/wine64 ]; then
+    rc=0
+    FIRNC="$FIRNC" bash tools/fui/screenwin.sh >"$W/screenwin.log" 2>&1 || rc=$?
+    tail -n 3 "$W/screenwin.log"
+    if [ "$rc" != 0 ]; then echo "screenwin FAILED ($rc)"; exit 1; fi
+else
+    echo "  screenwin: wine missing, skipped"
+fi
 # W18c: the UIA model (same tree as the AT-SPI bridge) and the system appearance (dark/accent/high contrast)
 build uia
 "$W/uia" | tail -n 3

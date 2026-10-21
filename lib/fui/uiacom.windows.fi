@@ -60,7 +60,7 @@ import window.window
 import gpu.wgl
 
 export {
-    attach, opened, enable_from_env, is_attached, root_interface, entry_count, test_attach, getobject_count,
+    attach, opened, enable_from_env, source_bind, source_attach, is_attached, root_interface, entry_count, test_attach, getobject_count,
     poll, event_count, event_at, force_listening, double_caller,
     S_SIMPLE, S_FRAGMENT, S_ROOT, S_INVOKE, S_TOGGLE, S_VALUE, S_RANGE, S_EXPAND, S_SELITEM,
     S_SELECTION, S_GRID, S_TABLE, S_GRIDITEM, S_TABLEITEM,
@@ -87,6 +87,13 @@ const S_TABLEITEM: usize = 13
 
 const NONE: usize = 4294967295
 
+struct Source {
+    ud: u64,
+    act: fn(u64, usize) -> bool,
+    focus: fn(u64, usize) -> bool,
+    click: fn(u64, f64, f64) -> bool,
+}
+
 const S_OK: u64 = 0
 const E_NOINTERFACE: u64 = 0x80004002
 const E_POINTER: u64 = 0x80004003
@@ -98,6 +105,7 @@ const UIA_E_NOTSUPPORTED: u64 = 0x80040204
 
 static mut G_PV: u64 = 0 // *mut uia.Provider
 static mut G_APP: u64 = 0 // *mut app.App
+static mut G_SRC: u64 = 0 // *mut Source (a program that draws its own tree: lib/fui/screen.fi), 0 = an app.App
 static mut G_HWND: u64 = 0
 static mut G_OLD: u64 = 0 // the window procedure we replaced
 static mut G_POOL: u64 = 0 // NENT * NSLOT * 16 octets
@@ -286,11 +294,13 @@ fn bstr_lit(s: str) -> u64 {
 // ------------------------------------------------------------------ actions (same path as a mouse click)
 
 fn click_node(node: usize) -> bool {
-    let a: *mut app.App = G_APP as *mut app.App
-    let w: *mut fuiwirt.Host = app.app_host(a)
-    let sc: *mut scene.Scene = app.app_scene(a)
+    let sc: *mut scene.Scene = (*pv()).sc
     if node >= scene.scene_count(sc) {
         return false
+    }
+    if G_SRC != 0 {
+        let src: *mut Source = G_SRC as *mut Source
+        return ((*src).act)((*src).ud, node)
     }
     let x: f64 = scene.node_x(sc, node) + scene.node_w(sc, node) / 2.0
     let y: f64 = scene.node_y(sc, node) + scene.node_h(sc, node) / 2.0
@@ -300,6 +310,11 @@ fn click_node(node: usize) -> bool {
 
 // a left click at window coordinates (x, y) through the host's pointer path
 fn pointer_click(x: f64, y: f64) {
+    if G_SRC != 0 {
+        let src: *mut Source = G_SRC as *mut Source
+        let ok: bool = ((*src).click)((*src).ud, x, y)
+        return
+    }
     let a: *mut app.App = G_APP as *mut app.App
     let w: *mut fuiwirt.Host = app.app_host(a)
     let c1: u32 = fuiwirt.host_pointer_move(w, x, y)
@@ -321,9 +336,7 @@ fn f64_of(b: u64) -> f64 {
 // Set a slider / progress / scrollbar node to `target` (0 .. a11y max) the way a mouse does: click on the
 // computed track position, measure, correct (the handle size is not known here). Last resort: write the value.
 fn set_range_node(node: usize, target: i64) -> bool {
-    let a: *mut app.App = G_APP as *mut app.App
-    let w: *mut fuiwirt.Host = app.app_host(a)
-    let sc: *mut scene.Scene = app.app_scene(a)
+    let sc: *mut scene.Scene = (*pv()).sc
     if node >= scene.scene_count(sc) {
         return false
     }
@@ -368,8 +381,9 @@ fn set_range_node(node: usize, target: i64) -> bool {
         c = c + (((target - cur) as f64) / span) * travel
         k = k + 1
     }
+    if G_SRC != 0 { return false }
     widget.w_set_value(wd, target)
-    fuiwirt.host_touch(w)
+    fuiwirt.host_touch(app.app_host(G_APP as *mut app.App))
     return widget.w_value(wd) == target
 }
 
@@ -404,8 +418,7 @@ fn do_click(this: u64) -> u64 {
 
 // Click the visible part of a row (the row rectangle cut to the table node, window coordinates).
 fn click_row(el: uia.El) -> bool {
-    let a: *mut app.App = G_APP as *mut app.App
-    let sc: *mut scene.Scene = app.app_scene(a)
+    let sc: *mut scene.Scene = (*pv()).sc
     if !uia.el_is_none(el) && el.node >= scene.scene_count(sc) {
         return false
     }
@@ -737,6 +750,11 @@ fn m_setfocus(this: u64, b: u64, c: u64, d: u64) -> u64 {
     let el: uia.El = el_of(e)
     if el.kind != 1 as u32 {
         return UIA_E_NOTSUPPORTED
+    }
+    if G_SRC != 0 {
+        let src: *mut Source = G_SRC as *mut Source
+        if !((*src).focus)((*src).ud, el.node) { return UIA_E_ELEMENTNOTAVAILABLE }
+        return S_OK
     }
     let w: *mut fuiwirt.Host = app.app_host(G_APP as *mut app.App)
     let pn: *mut control.Panel = fuiwirt.host_panel(w)
@@ -1120,7 +1138,7 @@ fn m_setvalue_text(this: u64, bs: u64, c: u64, d: u64) -> u64 {
         return UIA_E_ELEMENTNOTENABLED
     }
     let r: u32 = a11y.a11y_role((*pv()).sc, (*pv()).ax, el.node)
-    if r != a11y.ROLE_TEXTBOX || uia.el_readonly(pv(), el) {
+    if r != a11y.ROLE_TEXTBOX || uia.el_readonly(pv(), el) || G_SRC != 0 {
         return UIA_E_NOTSUPPORTED
     }
     var buf: [u8; 2048] = [0 as u8; 2048]
@@ -1910,6 +1928,16 @@ fn load_functions() -> bool {
 // The state without a window: tables, pool, provider. `test_attach` and `attach` both start here.
 #[allow_escape]
 fn setup(a: *mut app.App, title: str) -> bool {
+    if !setup_core(app.app_scene(a), app.ax(a), title) {
+        return false
+    }
+    uia.provider_set_app(G_PV as *mut uia.Provider, a)
+    G_APP = a as u64
+    return true
+}
+
+#[allow_escape]
+fn setup_core(sc: *mut scene.Scene, ax: *mut a11y.A11y, title: str) -> bool {
     if G_READY {
         return true
     }
@@ -1929,9 +1957,7 @@ fn setup(a: *mut app.App, title: str) -> bool {
     || G_PEND == 0 || G_NB == 0 {
         return false
     }
-    *(G_PV as *mut uia.Provider) = uia.provider_new(app.app_scene(a), app.ax(a), title)
-    uia.provider_set_app(G_PV as *mut uia.Provider, a)
-    G_APP = a as u64
+    *(G_PV as *mut uia.Provider) = uia.provider_new(sc, ax, title)
     build_tables()
     G_READY = true
     return true
@@ -1982,6 +2008,13 @@ fn attach(a: *mut app.App, hwnd: u64, title: str) -> bool {
     if !setup(a, title) {
         return false
     }
+    return hook_window(hwnd)
+}
+
+fn hook_window(hwnd: u64) -> bool {
+    if G_OLD != 0 {
+        return true
+    }
     // an STA for the window thread: UseComThreading marshals every UIA call here (S_OK / S_FALSE = fine)
     let co: u64 = wgl.dll_sym("ole32.dll", "CoInitializeEx")
     if co != 0 {
@@ -2003,6 +2036,34 @@ fn attach(a: *mut app.App, hwnd: u64, title: str) -> bool {
         let t: u64 = wgl.call4(F_SETTIMER, hwnd, TIMER_ID, 100, 0)
     }
     return true
+}
+
+#[allow_escape]
+fn source_bind(sc: *mut scene.Scene, ax: *mut a11y.A11y, title: str, ud: u64, act: fn(u64, usize) -> bool, focus: fn(u64, usize) -> bool, click: fn(u64, f64, f64) -> bool) -> bool {
+    if env.get("FUI_UIA") == "0" {
+        return false
+    }
+    if !setup_core(sc, ax, title) {
+        return false
+    }
+    let src: *mut Source = rt.heap_alloc(64) as *mut Source
+    if (src as u64) == 0 {
+        return false
+    }
+    (*src).ud = ud
+    (*src).act = act
+    (*src).focus = focus
+    (*src).click = click
+    G_SRC = src as u64
+    return true
+}
+
+fn source_attach(win: u64) -> bool {
+    if G_SRC == 0 {
+        return false
+    }
+    let f: *mut window.Window = win as *mut window.Window
+    return hook_window(window.ime_handle(f))
 }
 
 // `app.set_window_hooks(a, a as u64, uiacom.opened, hotkey)`: the native window is open.
