@@ -782,6 +782,11 @@ done
 echo "  settings 1100x700 shot, light + dark + open list   OK"
 build kitset
 "$W/kitset"
+build screenax
+"$W/screenax"
+build screenaxbench
+"$W/screenaxbench"
+FIRNC="$FIRNC" sh tools/fui/screenax.sh; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 77 ] || exit 1
 "$FIRNC" --opt-level=dev -o "$W/fuiapp_chat" examples/fui_apps/chat/main.fi
 for th in light dark; do
     "$W/fuiapp_chat" --theme $th --shot "$W/chat-$th.png"
