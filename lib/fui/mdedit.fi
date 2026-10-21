@@ -1,0 +1,185 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/mdedit.fi -- A MARKDOWN EDITOR WITH A LIVE PREVIEW, FOR IMMEDIATE-MODE SCREENS (lib/fui/screen.fi).
+//
+// The glue between lib/fui/textarea.fi (several lines, wrapped, caret, selection, scroll) and
+// lib/fui/markdownview.fi (headings, bold, lists, code, links). The text lives in an editor; every
+// change marks the preview stale and the next `preview_draw` re-parses it. Several documents
+// (a note list) share ONE editor: `open(m, i)` stores the current text and loads document i.
+//
+//   let m: *mut mdedit.MdEd = mdedit.new()
+//   mdedit.set_text(m, "# Title")                      // replace the text of the open document
+//   mdedit.editor_draw(c, m, x, y, w, h)               // the text area (no frame, flat)
+//   mdedit.preview_draw(c, m, x, y, w, h)              // the rendered Markdown
+//   mdedit.press(c, m, px, py, now_us) / key / text / wheel   // input (true = used)
+import std.rt
+import fui.editor
+import fui.textbuf
+import fui.textarea
+import fui.markdownview
+import fui.painter
+import fui.render
+import fui.style
+import fui.widget
+import markdown.doc
+
+const CAP: usize = 65536
+const DOCS: usize = 16
+
+struct MdEd {
+    ed: editor.Editor,
+    ln: textarea.Lines,
+    v: markdownview.MdView,
+    raw: u64,
+    docs: [rt.Buf; 16],
+    cur: usize,
+    live: bool,
+    rev: u32,
+    shown: u32,
+    focus: bool,
+    rx: f64,
+    ry: f64,
+    rw: f64,
+    rh: f64,
+    ox: f64,
+    oy: f64,
+}
+
+fn blank() -> MdEd {
+    return MdEd { ed: editor.editor_new(), ln: textarea.ta_new(), v: markdownview.mdv_new(), raw: 0,
+        docs: [rt.buf_new(); 16], cur: 0, live: false, rev: 1, shown: 0, focus: false, rx: 0.0, ry: 0.0, rw: 0.0, rh: 0.0, ox: 0.0, oy: 0.0 }
+}
+
+fn size_of_mdedit() -> usize {
+    var probe: [MdEd; 2] = [blank(), blank()]
+    return ((&probe[1]) as usize) - ((&probe[0]) as usize)
+}
+
+// An editor on the heap (lives as long as the program).
+fn new() -> *mut MdEd {
+    let m: *mut MdEd = rt.heap_alloc(size_of_mdedit()) as *mut MdEd
+    *m = blank()
+    (*m).raw = rt.heap_alloc(CAP)
+    editor.editor_init_cap(&(*m).ed, (*m).raw, CAP, 4096)
+    editor.editor_set_multiline(&(*m).ed, true)
+    textarea.ta_init(&(*m).ln, 0)
+    markdownview.mdv_set_background(&(*m).v, style.TOK_SURFACE)
+    markdownview.mdv_set_bar_pt(&(*m).v, 0)
+    markdownview.mdv_set_pad(&(*m).v, 24)
+    markdownview.mdv_set_base_size(&(*m).v, 14)
+    return m
+}
+
+fn text(m: *mut MdEd) -> str {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(&(*m).ed)
+    return str { p: textbuf.tb_ptr(t) as *mut u8, n: textbuf.tb_len(t) }
+}
+
+// Replace the text of the open document (caret to the start, scroll to the top).
+fn set_text(m: *mut MdEd, s: str) {
+    let t: *mut textbuf.TextBuf = editor.editor_buf(&(*m).ed)
+    textbuf.tb_set_text(t, s.p as u64, s.n)
+    textbuf.tb_set_range(t, 0, 0)
+    (*m).ln.scroll_y = 0.0
+    (*m).rev = (*m).rev + 1
+}
+
+// Keep the text of the open document, show document `i` (empty if it was never filled).
+fn open(m: *mut MdEd, i: usize) {
+    if (*m).live {
+        let t: str = text(m)
+        rt.buf_clear(&(*m).docs[(*m).cur])
+        rt.buf_push_bytes(&(*m).docs[(*m).cur], t.p as u64, t.n)
+    }
+    (*m).live = true
+    (*m).cur = i
+    set_text(m, str { p: rt.buf_ptr(&(*m).docs[i]) as *mut u8, n: rt.buf_len(&(*m).docs[i]) })
+}
+
+// Fill document `i` (not open) from three parts, e.g. put(m, i, "# ", title, "\n\nEmpty note.").
+fn put(m: *mut MdEd, i: usize, a: str, b: str, d: str) {
+    rt.buf_clear(&(*m).docs[i])
+    rt.buf_push_bytes(&(*m).docs[i], a.p as u64, a.n)
+    rt.buf_push_bytes(&(*m).docs[i], b.p as u64, b.n)
+    rt.buf_push_bytes(&(*m).docs[i], d.p as u64, d.n)
+}
+
+// Fill document `i` (not open) from a file; false when it cannot be read.
+fn load(m: *mut MdEd, i: usize, path: str) -> bool {
+    var p: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&p, path.p as u64, path.n)
+    rt.buf_push(&p, 0 as u8)
+    rt.buf_clear(&(*m).docs[i])
+    let ok: bool = rt.read_file(rt.buf_ptr(&p), &(*m).docs[i])
+    rt.buf_free(&p)
+    return ok
+}
+
+// The text area box: flat (the page colour, no border), 26 x 24 pt padding.
+fn field(c: *mut render.Ctx, m: *mut MdEd, x: f64, y: f64, w: f64, h: f64) -> widget.Widget {
+    var e: widget.Widget = widget.widget_new(widget.KIND_TEXTBOX)
+    widget.w_place(&e, x, y, w, h)
+    var st: style.Style = style.style_new()
+    st = style.style_set_pad(st, 26, 24)
+    st = style.style_set_bg(st, style.color_token(style.TOK_BASE))
+    st = style.style_set_border(st, style.color_transparent(), 0)
+    st = style.style_set_radius(st, 0)
+    widget.w_set_style(&e, st)
+    widget.w_set_focus(&e, (*m).focus)
+    return e
+}
+
+fn editor_draw(c: *mut render.Ctx, m: *mut MdEd, x: f64, y: f64, w: f64, h: f64) {
+    var e: widget.Widget = field(c, m, x, y, w, h)
+    (*m).rx = x
+    (*m).ry = y
+    (*m).rw = w
+    (*m).rh = h
+    (*m).ox = render.field_text_x0(c, &e)
+    (*m).oy = y + render.pady_of(c, &e)
+    textarea.ta_draw(c, &e, &(*m).ed, &(*m).ln, (*m).focus)
+}
+
+fn preview_draw(c: *mut render.Ctx, m: *mut MdEd, x: f64, y: f64, w: f64, h: f64) {
+    if (*m).shown != (*m).rev {
+        markdownview.mdv_set_markdown_keep(&(*m).v, text(m), doc.opts_default())
+        (*m).shown = (*m).rev
+    }
+    markdownview.mdv_set_rect(&(*m).v, x, y, w, h)
+    markdownview.mdv_paint(&(*m).v, c)
+}
+
+fn inside(m: *mut MdEd, px: f64, py: f64) -> bool {
+    return px >= (*m).rx && px < (*m).rx + (*m).rw && py >= (*m).ry && py < (*m).ry + (*m).rh
+}
+
+// A press: inside the text area it takes the focus and puts the caret; elsewhere it drops the focus.
+fn press(c: *mut render.Ctx, m: *mut MdEd, px: f64, py: f64, now_us: u64) -> bool {
+    (*m).focus = inside(m, px, py)
+    if !(*m).focus { return false }
+    textarea.ta_mouse_down(&(*m).ln, &(*m).ed, px - (*m).ox, py - (*m).oy, now_us, false)
+    return true
+}
+
+fn drag(m: *mut MdEd, px: f64, py: f64) {
+    if (*m).focus { textarea.ta_mouse_drag(&(*m).ln, &(*m).ed, px - (*m).ox, py - (*m).oy) }
+}
+
+fn done(m: *mut MdEd, r: u32) -> bool {
+    if r == editor.RES_CHANGED { (*m).rev = (*m).rev + 1 }
+    return r != editor.RES_PASS
+}
+
+fn key(m: *mut MdEd, k: u32, mods: u32) -> bool {
+    if !(*m).focus { return false }
+    return done(m, textarea.ta_key(&(*m).ln, &(*m).ed, k, mods))
+}
+
+fn char(m: *mut MdEd, cp: u32, mods: u32) -> bool {
+    if !(*m).focus { return false }
+    return done(m, textarea.ta_char(&(*m).ln, &(*m).ed, cp, mods))
+}
+
+// The wheel over the text area scrolls it, over the preview the preview.
+fn wheel(m: *mut MdEd, px: f64, py: f64, dy: f64) {
+    if inside(m, px, py) { textarea.ta_wheel(&(*m).ln, dy) } else { markdownview.mdv_wheel(&(*m).v, dy) }
+}

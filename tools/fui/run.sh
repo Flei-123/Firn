@@ -764,6 +764,14 @@ done
 echo "  form wizard 1100x700 shot, light + dark + errors   OK"
 build kitform
 "$W/kitform"
+"$FIRNC" --opt-level=dev -o "$W/fuiapp_notes" examples/fui_apps/notes/main.fi
+for th in light dark; do
+    "$W/fuiapp_notes" --theme $th --shot "$W/notes-$th.png"
+    [ "$(wc -c < "$W/notes-$th.png")" -gt 15000 ] || { echo "  notes $th shot too small"; exit 1; }
+done
+echo "  notes 1100x700 shot, light + dark   OK"
+build mdedit
+"$W/mdedit"
 
 echo
 echo "== 18p6. THE LAUNCHER KIT IN A REAL WINDOW (Xvfb, xdotool, xwd) =="
