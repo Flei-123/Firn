@@ -1,0 +1,242 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/tsvtable.fi -- a tab separated text as the model of a virtual table (fui.vlist).
+//
+//     var t: tsvtable.Tsv = tsvtable.tsv_new()
+//     tsvtable.tsv_load(&t, &buf)              // first line = header; the buffer is taken over
+//     tsvtable.tsv_set_numeric(&t, 2)          // bit mask of the numeric columns (1 << col)
+//     tsvtable.tsv_sort(&t, 1, true)           // by column 1, descending
+//     tsvtable.tsv_filter(&t, 0, 0, "rep")     // slot 0: rows whose column 0 contains "rep" (any case); slot 1 is a second AND
+//     tsvtable.tsv_put(&t, i, col, &row)       // cell of shown row i for a vlist source
+//
+// The rows are not copied: an index of line starts (4 bytes per row) points into the text; sorting
+// and filtering only permute a second 4-byte index. 100000 rows cost 0.8 MB of index.
+import std.rt
+import std.vec
+import fui.vlist
+
+export { Tsv, tsv_new, tsv_load, tsv_free, tsv_total, tsv_shown, tsv_cols, tsv_header, tsv_cell,
+    tsv_put, put_size, tsv_num, tsv_set_numeric, tsv_sort, tsv_filter, tsv_row_of }
+
+struct Tsv {
+    text: rt.Buf,
+    starts: vec.Vec[u32],
+    order: vec.Vec[u32],
+    ncol: usize,
+    numeric: u32,
+    scol: usize,
+    sdesc: bool,
+    sorted: bool,
+    fcol: [usize; 2],
+    needle: [u8; 128],
+    nn: [usize; 2],
+}
+
+static mut SORT_T: u64 = 0
+
+fn tsv_new() -> Tsv {
+    return Tsv { text: rt.buf_new(), starts: vec.vec_new[u32](), order: vec.vec_new[u32](), ncol: 0,
+        numeric: 0 as u32, scol: 0, sdesc: false, sorted: false, fcol: [0; 2], needle: [0 as u8; 128], nn: [0; 2] }
+}
+
+fn tsv_free(t: *mut Tsv) {
+    rt.buf_free(&(*t).text)
+}
+
+fn byte(t: *mut Tsv, i: usize) -> u8 {
+    return *((rt.buf_ptr(&(*t).text) + i as u64) as *mut u8)
+}
+
+// Takes over `b` (text) and indexes it: the first line is the header, the rest are rows.
+fn tsv_load(t: *mut Tsv, b: *mut rt.Buf) {
+    (*t).text = *b
+    let n: usize = rt.buf_len(&(*t).text)
+    var i: usize = 0
+    var line: usize = 0
+    var at: usize = 0
+    while i < n {
+        if line == 0 && byte(t, i) == 9 as u8 {
+            (*t).ncol = (*t).ncol + 1
+        }
+        if byte(t, i) == 10 as u8 {
+            if line == 0 {
+                (*t).ncol = (*t).ncol + 1
+            } else if i > at {
+                vec.vec_push[u32](&(*t).starts, at as u32)
+            }
+            line = line + 1
+            at = i + 1
+        }
+        i = i + 1
+    }
+    if at < n && line > 0 {
+        vec.vec_push[u32](&(*t).starts, at as u32)
+    }
+    tsv_filter(t, 0, 0, "")
+}
+
+fn tsv_total(t: *mut Tsv) -> usize { return vec.vec_len[u32](&(*t).starts) }
+fn tsv_shown(t: *mut Tsv) -> usize { return vec.vec_len[u32](&(*t).order) }
+fn tsv_cols(t: *mut Tsv) -> usize { return (*t).ncol }
+fn tsv_set_numeric(t: *mut Tsv, mask: u32) { (*t).numeric = mask }
+
+// the start offset of cell (data row r, column c) and its length
+fn locate(t: *mut Tsv, r: usize, c: usize, len: *mut usize) -> usize {
+    var p: usize = vec.vec_at[u32](&(*t).starts, r) as usize
+    let n: usize = rt.buf_len(&(*t).text)
+    var k: usize = 0
+    while k < c && p < n {
+        if byte(t, p) == 9 as u8 { k = k + 1 }
+        p = p + 1
+    }
+    var e: usize = p
+    while e < n && byte(t, e) != 9 as u8 && byte(t, e) != 10 as u8 { e = e + 1 }
+    *len = e - p
+    return p
+}
+
+// cell of DATA row r (not shown row): pointer and length
+fn tsv_cell(t: *mut Tsv, r: usize, c: usize, len: *mut usize) -> u64 {
+    let p: usize = locate(t, r, c, len)
+    return rt.buf_ptr(&(*t).text) + p as u64
+}
+
+// the data row behind shown row i
+fn tsv_row_of(t: *mut Tsv, i: usize) -> usize { return vec.vec_at[u32](&(*t).order, i) as usize }
+
+fn tsv_num(t: *mut Tsv, r: usize, c: usize) -> u64 {
+    var n: usize = 0
+    var p: usize = locate(t, r, c, &n)
+    var v: u64 = 0
+    var k: usize = 0
+    while k < n {
+        let d: u8 = byte(t, p + k)
+        if d >= 48 as u8 && d <= 57 as u8 { v = v * 10 + (d - 48 as u8) as u64 }
+        k = k + 1
+    }
+    return v
+}
+
+// the text of the header cell c is not kept: the program names its own columns
+
+// fill a vlist cell with column `c` of SHOWN row i
+fn tsv_put(t: *mut Tsv, i: usize, c: usize, out: *mut vlist.VRow) {
+    if i >= tsv_shown(t) { return }
+    var n: usize = 0
+    let p: u64 = tsv_cell(t, tsv_row_of(t, i), c, &n)
+    vlist.vrow_bytes(out, p, n)
+}
+
+fn lower(b: u8) -> u8 {
+    if b >= 65 as u8 && b <= 90 as u8 { return b + 32 as u8 }
+    return b
+}
+
+fn less(x: *u32, y: *u32) -> bool {
+    let t: *mut Tsv = SORT_T as *mut Tsv
+    let xa: u32 = *x
+    let xb: u32 = *y
+    let a: usize = xa as usize
+    let b: usize = xb as usize
+    var r: i64 = 0
+    if ((*t).numeric >> (*t).scol as u32) & 1 as u32 == 1 as u32 {
+        let u: u64 = tsv_num(t, a, (*t).scol)
+        let v: u64 = tsv_num(t, b, (*t).scol)
+        if u < v { r = 0 - 1 }
+        if u > v { r = 1 }
+    } else {
+        var na: usize = 0
+        var nb: usize = 0
+        let pa: usize = locate(t, a, (*t).scol, &na)
+        let pb: usize = locate(t, b, (*t).scol, &nb)
+        var k: usize = 0
+        while r == 0 && k < na && k < nb {
+            let ca: u8 = lower(byte(t, pa + k))
+            let cb: u8 = lower(byte(t, pb + k))
+            if ca < cb { r = 0 - 1 }
+            if ca > cb { r = 1 }
+            k = k + 1
+        }
+        if r == 0 {
+            if na < nb { r = 0 - 1 }
+            if na > nb { r = 1 }
+        }
+    }
+    if r == 0 { return a < b }
+    if (*t).sdesc { return r > 0 }
+    return r < 0
+}
+
+fn tsv_sort(t: *mut Tsv, col: usize, desc: bool) {
+    (*t).scol = col
+    (*t).sdesc = desc
+    (*t).sorted = true
+    SORT_T = t as u64
+    vec.vec_sort_by[u32](&(*t).order, less)
+}
+
+fn has_in(t: *mut Tsv, r: usize, f: usize) -> bool {
+    let k: usize = (*t).nn[f]
+    if k == 0 { return true }
+    var n: usize = 0
+    let p: usize = locate(t, r, (*t).fcol[f], &n)
+    if k > n { return false }
+    var i: usize = 0
+    while i + k <= n {
+        var j: usize = 0
+        while j < k && lower(byte(t, p + i + j)) == lower((*t).needle[f * 64 + j]) { j = j + 1 }
+        if j == k { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Keep the rows whose column `col` contains `s` (empty = no condition). Two conditions (slot 0 and 1)
+// combine with AND; the sort order stays.
+fn tsv_filter(t: *mut Tsv, slot: usize, col: usize, s: str) {
+    var k: usize = s.n
+    if k > 64 { k = 64 }
+    var i: usize = 0
+    while i < k {
+        (*t).needle[slot * 64 + i] = *((s.p as u64 + i as u64) as *mut u8)
+        i = i + 1
+    }
+    (*t).nn[slot] = k
+    (*t).fcol[slot] = col
+    vec.vec_clear[u32](&(*t).order)
+    var r: usize = 0
+    let n: usize = tsv_total(t)
+    while r < n {
+        if has_in(t, r, 0) && has_in(t, r, 1) { vec.vec_push[u32](&(*t).order, r as u32) }
+        r = r + 1
+    }
+    if (*t).sorted { tsv_sort(t, (*t).scol, (*t).sdesc) }
+}
+
+// a byte count as "812 B", "40 KB", "5.7 MB", "1.2 GB" into a vlist cell
+fn put_size(out: *mut vlist.VRow, n: u64) {
+    var b: rt.Buf = rt.buf_new()
+    var unit: str = " B"
+    var whole: u64 = n
+    var tenth: u64 = 0
+    if n >= 1073741824 {
+        whole = n / 1073741824
+        tenth = (n / 107374183) % 10
+        unit = " GB"
+    } else if n >= 1048576 {
+        whole = n / 1048576
+        tenth = (n / 104858) % 10
+        unit = " MB"
+    } else if n >= 1024 {
+        whole = n / 1024
+        tenth = (n / 102) % 10
+        unit = " KB"
+    }
+    rt.buf_push_dec_i64(&b, whole as i64)
+    if tenth > 0 && whole < 10 && n >= 1024 {
+        rt.buf_push(&b, 46 as u8)
+        rt.buf_push_dec_i64(&b, tenth as i64)
+    }
+    rt.buf_push_bytes(&b, unit.p as u64, unit.n)
+    vlist.vrow_bytes(out, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}

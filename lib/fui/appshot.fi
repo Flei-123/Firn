@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/appshot.fi -- command line + one-frame screenshot for fui.app programs.
+//
+//     fn main(start: u64) -> i32 {
+//         let a: *mut app.App = app.window("Title", 1100, 700)
+//         ... build the window ...
+//         return appshot.finish(a, start, 1100, 700)
+//     }
+//
+//     prog [--theme light|dark] [--shot out.png] [--data DIR]
+//
+// Without `--shot` the window opens normally. With `--shot` the program paints ONE
+// settled frame headless (no display needed), writes a PNG of w x h and returns 0.
+// Dark is the default; the launcher accent (kitcolor) is applied in both themes.
+import std.rt
+import html.mem
+import paint.canvas
+import paint.png
+import font.metrics
+import fui.painter
+import fui.app
+import fui.theme
+import fui.kitcolor
+import fui.safeout
+import fui.vlist
+import std.time
+import plat.fuiwirt
+import plat.sysfont
+
+export { bench_target, finish, opt_dark, opt_value, load_data, DATA_DIR }
+
+static mut BENCH_LIST: usize = 4294967295
+
+// the virtual list `--bench` scrolls (3 rows per frame) and times
+fn bench_target(list: usize) { BENCH_LIST = list }
+
+const DATA_DIR: str = "/root/jarvis/data/staff_scratch/uivgl/data"
+
+fn same(p: u64, s: str) -> bool {
+    if rt.c_length(p) != s.n {
+        return false
+    }
+    var i: usize = 0
+    while i < s.n {
+        if *((p + i as u64) as *mut u8) != *((s.p as u64 + i as u64) as *mut u8) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// the C string after option `name` (0 = not given)
+fn opt_value(start: u64, name: str) -> u64 {
+    var i: usize = 1
+    while i + 1 < rt.arg_count(start) {
+        if same(rt.arg_ptr(start, i), name) {
+            return rt.arg_ptr(start, i + 1)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// dark unless `--theme light`
+fn opt_dark(start: u64) -> bool {
+    let t: u64 = opt_value(start, "--theme")
+    return !(t != 0 && same(t, "light"))
+}
+
+// read DATA_DIR (or `--data DIR`) / name into `out`
+fn load_data(start: u64, name: str, out: *mut rt.Buf) -> bool {
+    var path: rt.Buf = rt.buf_new()
+    let d: u64 = opt_value(start, "--data")
+    if d != 0 {
+        rt.buf_push_bytes(&path, d, rt.c_length(d))
+    } else {
+        rt.buf_push_bytes(&path, DATA_DIR.p as u64, DATA_DIR.n)
+    }
+    rt.buf_push(&path, 47 as u8)
+    rt.buf_push_bytes(&path, name.p as u64, name.n)
+    rt.buf_push(&path, 0 as u8)
+    let ok: bool = rt.read_file(rt.buf_ptr(&path), out)
+    rt.buf_free(&path)
+    return ok
+}
+
+fn write_shot(cv: *mut canvas.Canvas, path: u64) -> bool {
+    var out: mem.Buf = mem.buf_new()
+    mem.buf_init(&out)
+    var ok: bool = false
+    if png.write_png(cv, &out) {
+        ok = safeout.write_file(path, mem.buf_ptr(&out) as u64, mem.buf_len(&out))
+    }
+    return ok
+}
+
+struct Surface {
+    cv: canvas.Canvas,
+    z: painter.Painter,
+}
+
+fn frame(a: *mut app.App, w: usize, h: usize) {
+    app.app_paint(a as u64, w, h)
+    fuiwirt.host_painted(app.app_host(a))
+    let c: u32 = fuiwirt.host_after_layout(app.app_host(a))
+}
+
+// SCROLL BENCHMARK: 240 frames, each scrolls the list by 3 rows and paints the whole window on the CPU
+// painter; prints `BENCH scroll_ms median=.. avg=.. max=..` (microseconds / 1000).
+fn run_bench(a: *mut app.App, w: usize, h: usize) {
+    let v: *mut vlist.Vlist = app.vlist_model(a, BENCH_LIST)
+    var us: [i64; 240] = [0; 240]
+    var i: usize = 0
+    var sum: i64 = 0
+    var mx: i64 = 0
+    while i < 240 {
+        vlist.vl_scroll_to(v, 1000 + i * 3, vlist.SCROLL_TOP)
+        let t0: u64 = time.monotonic_ns()
+        app.app_paint(a as u64, w, h)
+        fuiwirt.host_painted(app.app_host(a))
+        let d: i64 = ((time.monotonic_ns() - t0) / 1000) as i64
+        us[i] = d
+        sum = sum + d
+        if d > mx { mx = d }
+        i = i + 1
+    }
+    var j: usize = 1
+    while j < 240 {
+        let k: i64 = us[j]
+        var m: usize = j
+        while m > 0 && us[m - 1] > k {
+            us[m] = us[m - 1]
+            m = m - 1
+        }
+        us[m] = k
+        j = j + 1
+    }
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, "BENCH scroll_us median=".p as u64, 23)
+    rt.buf_push_dec_i64(&b, us[120])
+    rt.buf_push_bytes(&b, " avg=".p as u64, 5)
+    rt.buf_push_dec_i64(&b, sum / 240)
+    rt.buf_push_bytes(&b, " max=".p as u64, 5)
+    rt.buf_push_dec_i64(&b, mx)
+    rt.buf_push(&b, 10 as u8)
+    rt.write_everything(1, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+// theme + accent, then run the window or take the one-frame picture
+fn finish(a: *mut app.App, start: u64, w: usize, h: usize) -> i32 {
+    let dark: bool = opt_dark(start)
+    kitcolor.kit_navy(app.app_theme(a), dark)
+    let shot: u64 = opt_value(start, "--shot")
+    let bench: bool = opt_value(start, "--bench") != 0
+    if shot == 0 && !bench {
+        return app.run(a)
+    }
+    let fs: *mut metrics.FontSet = rt.heap_alloc(4096) as *mut metrics.FontSet
+    if !sysfont.sysfont_load(fs) {
+        return 9
+    }
+    let s: *mut Surface = rt.heap_alloc(65536) as *mut Surface
+    (*s).cv = canvas.canvas_new()
+    (*s).z = painter.painter_new()
+    if !canvas.canvas_init(&(*s).cv, w, h) || !painter.painter_init(&(*s).z, &(*s).cv, w, h) {
+        return 9
+    }
+    painter.painter_set_font(&(*s).z, fs as u64)
+    app.app_attach(a as u64, &(*s).z)
+    fuiwirt.host_bind(app.app_host(a))
+    frame(a, w, h)
+    frame(a, w, h)
+    kitcolor.kit_apply(app.app_theme(a))
+    frame(a, w, h)
+    if bench {
+        run_bench(a, w, h)
+    }
+    if shot != 0 && !write_shot(&(*s).cv, shot) {
+        return 10
+    }
+    return 0
+}
