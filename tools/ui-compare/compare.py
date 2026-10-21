@@ -89,6 +89,8 @@ def table(shots):
         if len(parts) < 3:
             continue
         app, theme, toolkit = parts[0], parts[-1], "-".join(parts[1:-1])
+        if theme not in ("light", "dark"):
+            continue
         ref_name = "%s-%s-%s.png" % (app, "original" if app == "flei" else "web", theme)
         if f == ref_name:
             continue
