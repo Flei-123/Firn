@@ -790,6 +790,8 @@ done
 echo "  chat messenger 1100x700 shot, light + dark   OK"
 build kitchat
 "$W/kitchat"
+build kitfx
+"$W/kitfx"
 
 echo
 echo "== 18p6. THE LAUNCHER KIT IN A REAL WINDOW (Xvfb, xdotool, xwd) =="

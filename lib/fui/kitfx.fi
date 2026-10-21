@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/kitfx.fi -- THE "WEBSITE" LOOK FOR APP SCREENS: glowing ground, glow buttons, round pictures, small string helpers.
+//
+// Immediate mode like kit.fi (`*_draw(c, x, y, w, h, ...)`), lengths in design points (kit.ln), colours from the theme.
+//
+//   ground_draw          page ground: three soft coloured lights + a fine 64 pt line grid that fades out downwards
+//   button_glow_draw     primary button: 135 deg accent gradient, coloured glow under it (stronger on hover), 1-2 label lines
+//   card_lift            the hover offset of a card (CSS translateY(-3px)); 0 when not hovered
+//   pic_load / pic_draw  decode a PNG/JPEG file once, draw it as a cover-fitted round-cornered square
+//   cat3                 "a" + "sep" + "b" as one str (a small ring of buffers; use the result at once)
+import std.rt
+import fui.kit
+import fui.kitcolor
+import fui.painter
+import fui.render
+import fui.style
+import fui.theme
+import fui.uiimage
+import fui.uiimagedec
+
+export { ground_draw, button_glow_draw, button_flat_draw, card_lift, Pic, pic_load, pic_ok, pic_draw, cat3, str_eq }
+
+// -- the ground ---------------------------------------------------------------------------------
+
+// A soft light: `rgb` at `a` (0..255) strongest, falling off to nothing at the ellipse (rx, ry) round (cx, cy).
+fn light(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, rgb: u32, a: u32, cx: f64, cy: f64, rx: f64, ry: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    painter.round_rect_radial(z, x, y, w, h, 0.0, kit.with_alpha(theme.opaque(rgb), a), cx, cy, rx, ry)
+}
+
+// The mask of the grid: 1 inside 30 % of the ellipse (rx, ry) at (mx, 0), fading to 0 at 75 % (as CSS radial-gradient(ellipse ..., #000 30%, transparent 75%)).
+fn grid_mask(px: f64, py: f64, mx: f64, rx: f64, ry: f64) -> f64 {
+    let dx: f64 = (px - mx) / rx
+    let dy: f64 = py / ry
+    let d: f64 = fsqrt(dx * dx + dy * dy)
+    if d <= 0.3 { return 1.0 }
+    if d >= 0.75 { return 0.0 }
+    return (0.75 - d) / 0.45
+}
+
+fn fsqrt(v: f64) -> f64 {
+    if v <= 0.0 { return 0.0 }
+    var g: f64 = v
+    if g < 1.0 { g = 1.0 }
+    var i: usize = 0
+    while i < 24 {
+        g = (g + v / g) / 2.0
+        i = i + 1
+    }
+    return g
+}
+
+// The page ground in the box (x, y, w, h): lights in the accent (top left, low middle) and a blue one (right), then the grid.
+// `accent` = 0xRRGGBB. Paint it FIRST, the panels of the page over it.
+fn ground_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, accent: u32, blue: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    // lights on a dark ground only (on a light page they would grey it)
+    if theme.luminance(kit.tokc(c, style.TOK_BASE) & 16777215 as u32) > 0.3 { return }
+    light(c, x, y, w, h, accent, 42 as u32, x - kit.ln(c, 40), y - kit.ln(c, 140), kit.ln(c, 560) * 0.68, kit.ln(c, 520) * 0.68)
+    light(c, x, y, w, h, blue, 31 as u32, x + w + kit.ln(c, 140), y + h * 0.16, kit.ln(c, 640) * 0.7, kit.ln(c, 600) * 0.7)
+    light(c, x, y, w, h, accent, 18 as u32, x + w * 0.32, y + h * 1.2, kit.ln(c, 520) * 0.72, kit.ln(c, 480) * 0.72)
+    let cell: f64 = kit.ln(c, 64)
+    let seg: f64 = kit.ln(c, 6)
+    let mx: f64 = x + w / 2.0
+    let rx: f64 = w * 0.8
+    let ry: f64 = h * 0.6
+    let limit: f64 = ry * 0.75
+    var gx: f64 = x
+    while gx < x + w {
+        var sy: f64 = 0.0
+        while sy < limit && y + sy < y + h {
+            let m: f64 = grid_mask(gx, sy + seg / 2.0, mx, rx, ry)
+            if m > 0.0 {
+                painter.surface(z, gx, y + sy, 1.0, seg, kit.with_alpha(16777215 as u32 | 4278190080 as u32, (13.0 * m) as u32))
+            }
+            sy = sy + seg
+        }
+        gx = gx + cell
+    }
+    var gy: f64 = y
+    while gy < y + limit {
+        var sx: f64 = x
+        while sx < x + w {
+            let m: f64 = grid_mask(sx + seg / 2.0, gy - y, mx, rx, ry)
+            if m > 0.0 {
+                painter.surface(z, sx, gy, seg, 1.0, kit.with_alpha(16777215 as u32 | 4278190080 as u32, (13.0 * m) as u32))
+            }
+            sx = sx + seg
+        }
+        gy = gy + cell
+    }
+}
+
+// -- buttons and cards ----------------------------------------------------------------------------
+
+// A primary button: accent gradient (135 deg, to a darker accent), a glow of the accent under it, the label in the colour that reads.
+// `line2` = "" for one line; else two centred lines (a label that wraps).
+fn button_glow_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, line1: str, line2: str, hover: bool) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let r: f64 = kit.ln(c, 8)
+    var y0: f64 = y
+    if hover { y0 = y - kit.ln(c, 1) }
+    let a0: u32 = kit.accent_gfx(c, style.TOK_BASE)
+    let a1: u32 = theme.opaque(theme.mix(a0 & 16777215 as u32, 0 as u32, 150))
+    var ga: u32 = 120 as u32
+    var gs: f64 = kit.ln(c, 12)
+    if hover {
+        ga = 150 as u32
+        gs = kit.ln(c, 18)
+    }
+    kit.glow_rect(c, x, y0, w, h, r, a0, gs, kit.ln(c, 6), ga)
+    painter.round_rect_grad(z, x, y0, w, h, r, a0, a1, 1.0, 1.0)
+    let fg: u32 = theme.opaque(kitcolor_on(c, a0))
+    if line2.n == 0 {
+        kit.draw_label(c, x + (w - kit.text_width(c, kit.ln(c, 14), 700, line1)) / 2.0, y0, h, kit.ln(c, 14), 700, fg, line1, 0.0)
+    } else {
+        let lh: f64 = kit.ln(c, 18)
+        let t1: f64 = kit.text_width(c, kit.ln(c, 14), 700, line1)
+        let t2: f64 = kit.text_width(c, kit.ln(c, 14), 700, line2)
+        kit.draw_label(c, x + (w - t1) / 2.0, y0 + (h - 2.0 * lh) / 2.0, lh, kit.ln(c, 14), 700, fg, line1, 0.0)
+        kit.draw_label(c, x + (w - t2) / 2.0, y0 + (h - 2.0 * lh) / 2.0 + lh, lh, kit.ln(c, 14), 700, fg, line2, 0.0)
+    }
+}
+
+// A quiet button: a ground a little darker than the page, a hair line, a bold label (hover: the button colour).
+fn button_flat_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, label: str, hover: bool) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let r: f64 = kit.ln(c, 8)
+    var bg: u32 = theme.mix(kit.tokc(c, style.TOK_BASE) & 16777215 as u32, kit.tokc(c, style.TOK_SURFACE) & 16777215 as u32, 500)
+    if hover { bg = kit.tokc(c, style.TOK_BUTTON_HOVER) & 16777215 as u32 }
+    painter.round_rect(z, x, y, w, h, r, theme.opaque(bg))
+    painter.round_ring(z, x, y, w, h, r, kit.ln(c, 1), kit.tokc(c, style.TOK_SEPARATOR))
+    let tw: f64 = kit.text_width(c, kit.ln(c, 14), 700, label)
+    kit.draw_label(c, x + (w - tw) / 2.0, y, h, kit.ln(c, 14), 700, kit.tokc(c, style.TOK_TEXT), label, 0.0)
+}
+
+fn kitcolor_on(c: *mut render.Ctx, fill: u32) -> u32 {
+    return kitcolor.on_color(kit.theme_of(c), fill)
+}
+
+// How far a card rises when hovered (design points -> px), 0 otherwise.
+fn card_lift(c: *mut render.Ctx, hover: bool) -> f64 {
+    if hover { return 0.0 - kit.ln(c, 3) }
+    return 0.0
+}
+
+// -- pictures -------------------------------------------------------------------------------------
+
+struct Pic {
+    dec: uiimagedec.Decoded,
+    view: uiimage.Image,
+    file: rt.Buf,
+    ok: bool,
+}
+
+// Read and decode a PNG/JPEG/WebP/GIF file (once, keep the result); not ok when it is missing or no picture.
+fn pic_load(path: str) -> *mut Pic {
+    let p: *mut Pic = rt.heap_alloc(1 << 16) as *mut Pic
+    (*p).dec = uiimagedec.decoded_new()
+    (*p).view = uiimage.image_new()
+    (*p).file = rt.buf_new()
+    (*p).ok = false
+    var nm: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&nm, path.p as u64, path.n)
+    rt.buf_push(&nm, 0 as u8)
+    if rt.read_file(rt.buf_ptr(&nm), &(*p).file) {
+        (*p).ok = uiimagedec.image_from_bytes(rt.buf_ptr(&(*p).file), rt.buf_len(&(*p).file), &(*p).dec, &(*p).view)
+    }
+    rt.buf_free(&nm)
+    return p
+}
+
+fn pic_ok(p: *mut Pic) -> bool {
+    return p as u64 != 0 && (*p).ok
+}
+
+// The picture as a square d x d at (x, y) with corner radius r: cover fit (the middle square), the corners cut with a ring of the ground
+// colour `bg` (a token colour of what is behind: the card surface).
+fn pic_draw(c: *mut render.Ctx, p: *mut Pic, x: f64, y: f64, d: f64, r: f64, bg: u32) {
+    if !pic_ok(p) { return }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let w: usize = (*p).view.w
+    let h: usize = (*p).view.h
+    var side: usize = w
+    if h < side { side = h }
+    let ox: usize = (w - side) / 2
+    let oy: usize = (h - side) / 2
+    var sub: uiimage.Image = uiimage.image_wrap((*p).view.px + (oy * (*p).view.stride + ox * 4) as u64, side, side, (*p).view.stride)
+    uiimage.image_draw_rect(z, &sub, x, y, d, d, 0 as u32)
+    painter.round_ring(z, x - r, y - r, d + 2.0 * r, d + 2.0 * r, 2.0 * r, r, bg)
+}
+
+// -- strings --------------------------------------------------------------------------------------
+
+static mut CAT_BUF: u64 = 0
+static mut CAT_AT: usize = 0
+
+// a + sep + b in a ring of 16 buffers of 128 bytes (cut at 127); valid until 16 more cat3 calls.
+fn cat3(a: str, sep: str, b: str) -> str {
+    if CAT_BUF == 0 { CAT_BUF = rt.heap_alloc(2048) }
+    let base: u64 = CAT_BUF + (CAT_AT * 128) as u64
+    CAT_AT = (CAT_AT + 1) % 16
+    var n: usize = 0
+    var k: usize = 0
+    while k < a.n && n < 127 {
+        *((base + n as u64) as *mut u8) = *((a.p as u64 + k as u64) as *mut u8)
+        n = n + 1
+        k = k + 1
+    }
+    k = 0
+    while k < sep.n && n < 127 {
+        *((base + n as u64) as *mut u8) = *((sep.p as u64 + k as u64) as *mut u8)
+        n = n + 1
+        k = k + 1
+    }
+    k = 0
+    while k < b.n && n < 127 {
+        *((base + n as u64) as *mut u8) = *((b.p as u64 + k as u64) as *mut u8)
+        n = n + 1
+        k = k + 1
+    }
+    return str { p: base as *mut u8, n: n }
+}
+
+// Two strings equal?
+fn str_eq(a: str, b: str) -> bool {
+    if a.n != b.n { return false }
+    var i: usize = 0
+    while i < a.n {
+        if *((a.p as u64 + i as u64) as *mut u8) != *((b.p as u64 + i as u64) as *mut u8) { return false }
+        i = i + 1
+    }
+    return true
+}
