@@ -37,6 +37,18 @@ def main():
     apps = set(x for x in a.only.split(",") if x)
     tks = set(x for x in a.toolkit.split(",") if x)
     cfgs = sorted(glob.glob(os.path.join(HERE, "apps", "*", "*", "measure.json")))
+    # web apps without their own measure.json get a default one (Chromium via webapp.sh)
+    have = {os.path.dirname(c) for c in cfgs}
+    for d in sorted(glob.glob(os.path.join(HERE, "apps", "*", "web"))):
+        if d not in have and os.path.exists(os.path.join(d, "index.html")):
+            cfg = {"cmd": "%s %s {theme} {shot}" % (os.path.join(SCRIPTS, "webapp.sh"), os.path.basename(os.path.dirname(d))),
+                   "run_cmd": "%s %s {theme}" % (os.path.join(SCRIPTS, "webapp.sh"), os.path.basename(os.path.dirname(d))),
+                   "src": [d], "size_paths": [d], "runtime_size_paths": ["/usr/lib/chromium"],
+                   "input": "key:Tab"}
+            with open(os.path.join(d, "measure.json"), "w") as f:
+                json.dump(cfg, f, indent=1)
+            cfgs.append(os.path.join(d, "measure.json"))
+    cfgs.sort()
     if not cfgs:
         print("no apps/*/*/measure.json found yet - nothing to measure")
         return 0
