@@ -1,0 +1,239 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/kitplot.fi -- DATA CHARTS FOR APP SCREENS: area/line, bars, donut + legend, hover tooltips.
+//
+// Immediate mode like kit.fi: `*_draw(c, x, y, w, h, series, ...)` paints from a JSON list (lib/fui/kitdata.fi).
+// The pointer (px, py) comes from screen.run's paint callback; a chart under it shows a tooltip.
+//
+//   ser(d, list, vkey, lkey)      a series over a JSON list: values at key `vkey`, labels at key `lkey`
+//   ser_fmt(s, prefix, suffix, places)   how values read as text ("EUR " / "%" / decimals)
+//   area_draw   grid, gradient area, line, crosshair + dot + tooltip     bars_draw    bars with labels, hovered bar lit
+//   donut_draw  ring of sectors      legend_draw  swatch, label, bold value per row     series_col  colour of series i
+import std.rt
+import fui.kit
+import fui.kitchart
+import fui.kitdata
+import fui.kitfmt
+import fui.painter
+import fui.render
+import fui.style
+import fui.theme
+
+export { Ser, ser, ser_fmt, ser_val, ser_label, ser_text, series_col, area_draw, bars_draw, donut_draw, legend_draw, donut_legend_draw, tip_draw }
+
+struct Ser {
+    d: *mut kitdata.Doc,
+    list: u32,
+    vkey: str,
+    lkey: str,
+    n: usize,
+    prefix: str,
+    suffix: str,
+    places: usize,
+}
+
+fn ser(d: *mut kitdata.Doc, list: u32, vkey: str, lkey: str) -> Ser {
+    return Ser { d: d, list: list, vkey: vkey, lkey: lkey, n: kitdata.count(d, list), prefix: "", suffix: "", places: 0 }
+}
+
+fn ser_fmt(s: Ser, prefix: str, suffix: str, places: usize) -> Ser {
+    var o: Ser = s
+    o.prefix = prefix
+    o.suffix = suffix
+    o.places = places
+    return o
+}
+
+fn ser_val(s: Ser, i: usize) -> f64 {
+    return kitdata.float(s.d, kitdata.get(s.d, kitdata.at(s.d, s.list, i), s.vkey))
+}
+
+fn ser_label(s: Ser, i: usize) -> str {
+    return kitdata.text(s.d, kitdata.get(s.d, kitdata.at(s.d, s.list, i), s.lkey))
+}
+
+fn ser_text(s: Ser, i: usize) -> str {
+    let v: f64 = ser_val(s, i)
+    if s.places == 0 { return kitfmt.join3(s.prefix, kitfmt.uint(v as u64, true), s.suffix) }
+    return kitfmt.join3(s.prefix, kitfmt.dec(v, s.places), s.suffix)
+}
+
+static mut PAL_DARK: [u32; 4] = [0x6c8cff, 0x3ddc84, 0xffb14c, 0xff6b8a]
+static mut PAL_LIGHT: [u32; 4] = [0x4a6ef0, 0x16b765, 0xf0961c, 0xe8486a]
+
+fn series_col(c: *mut render.Ctx, i: usize) -> u32 {
+    var rgb: u32 = PAL_LIGHT[i % 4]
+    if theme.theme_is_dark(render.ctx_theme(c)) { rgb = PAL_DARK[i % 4] }
+    return theme.opaque(rgb)
+}
+
+// A small box with two lines (muted label, bold value) next to the point (ax, ay), kept inside the box (bx, by, bw, bh).
+fn tip_draw(c: *mut render.Ctx, ax: f64, ay: f64, bx: f64, by: f64, bw: f64, bh: f64, line1: str, line2: str) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let pad: f64 = kit.ln(c, 10)
+    let w1: f64 = kit.text_width(c, kit.ln(c, 11), 400, line1)
+    let w2: f64 = kit.text_width(c, kit.ln(c, 13), 700, line2)
+    var tw: f64 = w1
+    if w2 > tw { tw = w2 }
+    let w: f64 = tw + pad * 2.0
+    let h: f64 = kit.ln(c, 44)
+    var x: f64 = ax + kit.ln(c, 12)
+    if x + w > bx + bw { x = ax - kit.ln(c, 12) - w }
+    var y: f64 = ay - h - kit.ln(c, 10)
+    if y < by { y = ay + kit.ln(c, 14) }
+    if y + h > by + bh { y = by + bh - h }
+    let r: f64 = kit.ln(c, 8)
+    kit.soft_shadow(c, x, y, w, h, r, kit.ln(c, 10), kit.ln(c, 4), 60)
+    painter.round_rect(z, x, y, w, h, r, kit.tokc(c, style.TOK_SURFACE_RAISED))
+    painter.round_ring(z, x, y, w, h, r, kit.ln(c, 1), kit.tokc(c, style.TOK_BORDER))
+    kit.draw_label(c, x + pad, y + kit.ln(c, 6), kit.ln(c, 15), kit.ln(c, 11), 400, kit.tokc(c, style.TOK_TEXT_MUTED), line1, 0.0)
+    kit.draw_label(c, x + pad, y + kit.ln(c, 22), kit.ln(c, 17), kit.ln(c, 13), 700, kit.tokc(c, style.TOK_TEXT), line2, 0.0)
+}
+
+static mut XS: [f64; 512] = [0.0; 512]
+static mut YS: [f64; 512] = [0.0; 512]
+static mut AX: [f64; 512] = [0.0; 512]
+static mut AY: [f64; 512] = [0.0; 512]
+
+fn extent(s: Ser, first: usize, cnt: usize, lo: *mut f64, hi: *mut f64) {
+    var mx: f64 = 0.0
+    var mn: f64 = 1.0e18
+    var i: usize = 0
+    while i < cnt {
+        let v: f64 = ser_val(s, first + i)
+        if v > mx { mx = v }
+        if v < mn { mn = v }
+        i = i + 1
+    }
+    *lo = mn * 0.95
+    *hi = mx * 1.05
+}
+
+// Evenly spaced guide lines at 5, 60, 115, 170 of a 170 unit tall plot; the data uses the top 160 of them.
+fn grid_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var g: usize = 0
+    while g < 4 {
+        painter.surface(z, x, y + (5.0 + 55.0 * (g as f64)) / 170.0 * h, w, kit.ln(c, 1), kit.tokc(c, style.TOK_SEPARATOR))
+        g = g + 1
+    }
+}
+
+fn area_hover(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, s: Ser, first: usize, cnt: usize, col: u32, px: f64, py: f64) {
+    if px < x || px > x + w || py < y || py > y + h { return }
+    var i: usize = (((px - x) / w) * ((cnt - 1) as f64) + 0.5) as usize
+    if i >= cnt { i = cnt - 1 }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    painter.surface(z, XS[i], y, kit.ln(c, 1), h, kit.with_alpha(col, 120 as u32))
+    let d: f64 = kit.ln(c, 5)
+    painter.round_rect(z, XS[i] - d - 2.0, YS[i] - d - 2.0, d * 2.0 + 4.0, d * 2.0 + 4.0, d + 2.0, kit.tokc(c, style.TOK_SURFACE))
+    painter.round_rect(z, XS[i] - d, YS[i] - d, d * 2.0, d * 2.0, d, col)
+    tip_draw(c, XS[i], YS[i], x, y, w, h, ser_label(s, first + i), ser_text(s, first + i))
+}
+
+// The last `cnt` points from `first` as a line over a faded area, in the box (x, y, w, h).
+fn area_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, s: Ser, first: usize, cnt: usize, col: u32, px: f64, py: f64) {
+    if cnt < 2 || cnt > 510 { return }
+    grid_draw(c, x, y, w, h)
+    var lo: f64 = 0.0
+    var hi: f64 = 0.0
+    extent(s, first, cnt, &lo, &hi)
+    var i: usize = 0
+    var top: f64 = y + h
+    while i < cnt {
+        XS[i] = x + w * (i as f64) / ((cnt - 1) as f64)
+        YS[i] = y + (170.0 - ((ser_val(s, first + i) - lo) / (hi - lo)) * 160.0) / 170.0 * h
+        AX[i] = XS[i]
+        AY[i] = YS[i]
+        if YS[i] < top { top = YS[i] }
+        i = i + 1
+    }
+    AX[cnt] = x + w
+    AY[cnt] = y + h
+    AX[cnt + 1] = x
+    AY[cnt + 1] = y + h
+    let bg: u32 = kit.tokc(c, style.TOK_SURFACE) & 16777215 as u32
+    let tint: u32 = theme.mix(bg, col & 16777215 as u32, 350)
+    kitchart.fill_poly_grad(c, &AX, &AY, cnt + 2, theme.opaque(tint), theme.opaque(bg), top, y + h)
+    kitchart.polyline(c, &XS, &YS, cnt, kit.ln(c, 2), col)
+    area_hover(c, x, y, w, h, s, first, cnt, col, px, py)
+}
+
+// One bar per entry, scaled to the full height; the tallest give way to the label line under the bars.
+fn bars_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, s: Ser, col: u32, px: f64, py: f64) {
+    let n: usize = s.n
+    if n == 0 { return }
+    var mx: f64 = 1.0
+    var i: usize = 0
+    while i < n {
+        if ser_val(s, i) > mx { mx = ser_val(s, i) }
+        i = i + 1
+    }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let gap: f64 = kit.ln(c, 10)
+    let lab: f64 = kit.ln(c, 12)
+    let bw: f64 = (w - gap * ((n - 1) as f64)) / (n as f64)
+    let base: f64 = y + h - lab - kit.ln(c, 5)
+    var hit: usize = n
+    i = 0
+    while i < n {
+        let bx: f64 = x + (bw + gap) * (i as f64)
+        var bh: f64 = h * ser_val(s, i) / mx
+        if bh > base - y { bh = base - y }
+        var a: u32 = 230 as u32
+        if px >= bx - gap / 2.0 && px < bx + bw + gap / 2.0 && py >= y && py < y + h {
+            hit = i
+            a = 255 as u32
+        }
+        painter.round_rect(z, bx, base - bh, bw, bh, kit.ln(c, 5), kit.with_alpha(col, a))
+        let label: str = ser_label(s, i)
+        let lw: f64 = kit.text_width(c, kit.ln(c, 10), 400, label)
+        kit.draw_label(c, bx + (bw - lw) / 2.0, base + kit.ln(c, 5), lab, kit.ln(c, 10), 400, kit.tokc(c, style.TOK_TEXT_DISABLED), label, 0.0)
+        i = i + 1
+    }
+    if hit < n {
+        let bx: f64 = x + (bw + gap) * (hit as f64) + bw / 2.0
+        tip_draw(c, bx, py, x, y, w, h, ser_label(s, hit), ser_text(s, hit))
+    }
+}
+
+// A ring of sectors (share = value / sum) from 12 o'clock, clockwise, centred at (cx, cy).
+fn donut_draw(c: *mut render.Ctx, cx: f64, cy: f64, r_in: f64, r_out: f64, s: Ser) {
+    var tot: f64 = 0.0
+    var i: usize = 0
+    while i < s.n {
+        tot = tot + ser_val(s, i)
+        i = i + 1
+    }
+    var a0: f64 = 0.0 - 1.5707963267948966
+    i = 0
+    while i < s.n {
+        let a1: f64 = a0 + (ser_val(s, i) / tot) * 6.283185307179586
+        kitchart.sector(c, cx, cy, r_in, r_out, a0, a1, series_col(c, i))
+        a0 = a1
+        i = i + 1
+    }
+}
+
+// One row per entry: colour swatch, muted label, bold value text. Returns the width of the widest row.
+fn legend_draw(c: *mut render.Ctx, x: f64, y: f64, s: Ser) -> f64 {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    var wide: f64 = 0.0
+    var i: usize = 0
+    while i < s.n {
+        let yy: f64 = y + (kit.ln(c, 15) + kit.ln(c, 7)) * (i as f64)
+        painter.round_rect(z, x, yy + kit.ln(c, 3), kit.ln(c, 10), kit.ln(c, 10), kit.ln(c, 3), series_col(c, i))
+        let lw: f64 = kit.draw_label(c, x + kit.ln(c, 18), yy, kit.ln(c, 15), kit.ln(c, 13), 400, kit.tokc(c, style.TOK_TEXT_MUTED), kitfmt.join(ser_label(s, i), " "), 0.0)
+        let vw: f64 = kit.draw_label(c, x + kit.ln(c, 18) + lw, yy, kit.ln(c, 15), kit.ln(c, 13), 700, kit.tokc(c, style.TOK_TEXT), ser_text(s, i), 0.0)
+        if lw + vw > wide { wide = lw + vw }
+        i = i + 1
+    }
+    return wide + kit.ln(c, 18)
+}
+
+// A donut of `d` (outer diameter, design points) with its legend 16 pt to the right, both centred in the box (x, y, w, h).
+fn donut_legend_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, s: Ser, d: f64) {
+    let r_out: f64 = kit.ln(c, 1) * d / 2.0 * 0.9666
+    let cy: f64 = y + h / 2.0
+    donut_draw(c, x + d / 2.0, cy, r_out * 0.7241, r_out, s)
+    legend_draw(c, x + d + kit.ln(c, 16), cy - (kit.ln(c, 22) * (s.n as f64) - kit.ln(c, 7)) / 2.0, s)
+}
