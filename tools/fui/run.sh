@@ -812,6 +812,9 @@ done
 echo "  dash 1100x700 shot, light + dark   OK"
 build kitdash
 "$W/kitdash"
+build navmock
+mkdir -p "$W/navpics"
+"$W/navmock" "$W/navpics"
 
 echo
 echo "== 18p6. THE LAUNCHER KIT IN A REAL WINDOW (Xvfb, xdotool, xwd) =="
