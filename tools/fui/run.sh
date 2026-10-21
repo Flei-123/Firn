@@ -648,6 +648,11 @@ build glide
 "$W/glide"
 
 echo
+echo "== W1. SCREEN MOTION: hover fade, lift, focus ring, caret blink + wake-up, page fade-up =="
+build screenanim
+"$W/screenanim"
+
+echo
 echo "== 18g. ORPHANED TRANSITION ENTRIES ARE GIVEN BACK (r115) =="
 # a full registry hands the slot of an entry nobody asked for during 2 s to a
 # newcomer; counter-checks: nothing stale = refused, ten live widgets keep theirs
