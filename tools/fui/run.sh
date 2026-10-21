@@ -804,6 +804,14 @@ build kitfx
 "$W/kitfx"
 build preset
 "$W/preset"
+"$FIRNC" --opt-level=dev -o "$W/fuiapp_dash" examples/fui_apps/dash/main.fi
+for th in light dark; do
+    "$W/fuiapp_dash" --theme $th --shot "$W/dash-$th.png"
+    [ "$(wc -c < "$W/dash-$th.png")" -gt 20000 ] || { echo "  dash $th shot too small"; exit 1; }
+done
+echo "  dash 1100x700 shot, light + dark   OK"
+build kitdash
+"$W/kitdash"
 
 echo
 echo "== 18p6. THE LAUNCHER KIT IN A REAL WINDOW (Xvfb, xdotool, xwd) =="
