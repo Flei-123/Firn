@@ -797,6 +797,8 @@ build kitchat
 "$W/kitchat"
 build kitfx
 "$W/kitfx"
+build preset
+"$W/preset"
 
 echo
 echo "== 18p6. THE LAUNCHER KIT IN A REAL WINDOW (Xvfb, xdotool, xwd) =="
