@@ -38,7 +38,8 @@ def main():
         ("Lines of code (non-empty, non-comment)", lambda r: str(r["lines"]["total"]) if r.get("lines") else "-"),
         ("Binary / bundle size (MB)", lambda r: "%.2f" % (r["size_bytes"] / 1e6) if r.get("size_bytes") else "-"),
         ("Build time (s, clean)", lambda r: "%.0f" % r["build_s"] if r.get("build_s") is not None and r.get("build_rc") == 0 else "-"),
-        ("Startup to 1st frame (ms, median)", lambda r: rng(r.get("startup_ms"))),
+        ("First draw, interactive start (ms): spawn -> first pixel change", lambda r: rng(r.get("first_draw_ms"))),
+        ("Startup to --shot PNG (ms; includes per-toolkit artificial waits, see notes)", lambda r: rng(r.get("startup_ms"))),
         ("RAM idle PSS (MB, median)", lambda r: rng(r.get("ram_pss_kb"), 0, 1024.0)),
         ("CPU idle (% of one core)", lambda r: rng(r.get("cpu_idle_pct"), 1)),
         ("Input -> pixel latency (ms)", lambda r: rng(r.get("input_latency_ms"), 1)),
@@ -57,6 +58,27 @@ def main():
                     cells.append("-")
             out.append("| %s | %s |" % (app, " | ".join(cells)))
         out.append("")
+    out.append("### Lines of code: app file only (shared glue common.py / lib.rs excluded)")
+    out.append("| app | " + " | ".join(TKS) + " |")
+    out.append("|---|" + "---|" * len(TKS))
+    for app in APPS:
+        cells = []
+        for tk in TKS:
+            r = jl(os.path.join(RES, "%s-%s.json" % (app, tk)))
+            if not r or not r.get("lines"):
+                cells.append("-")
+                continue
+            tot = sum(n for p, n in r["lines"]["files"].items() if os.path.basename(p) not in ("common.py", "lib.rs"))
+            cells.append(str(tot))
+        out.append("| %s | %s |" % (app, " | ".join(cells)))
+    out.append("")
+    out.append("### Runtime size (MB, not part of binary/bundle size): Web = Chromium, gtk = python3, qt = PySide6+shiboken")
+    out.append("| toolkit | MB |")
+    out.append("|---|---|")
+    for tk in ("web", "gtk", "qt"):
+        r = jl(os.path.join(RES, "chat-%s.json" % tk)) or {}
+        out.append("| %s | %s |" % (tk, "%.1f" % (r["runtime_size_bytes"] / 1e6) if r.get("runtime_size_bytes") else "-"))
+    out.append("")
     rt = jl(os.path.join(RES, "chat-web.json")) or {}
     if rt.get("runtime_size_bytes"):
         out.append("Runtime (Chromium, /usr/lib/chromium): %.0f MB (not part of the Web bundle size above)." % (rt["runtime_size_bytes"] / 1e6))

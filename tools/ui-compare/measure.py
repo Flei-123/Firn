@@ -15,6 +15,8 @@ Usage:
 Output: results/<app>-<toolkit>.json with median/min/max for each metric.
 
 Method (all under a private Xvfb 1100x700x24, no window manager, DPR 1):
+ first_draw_ms   interactive start (no --shot): spawn -> first changed pixel in the root window (toolkit-neutral
+                 "window appears"; the shot-mode startup_ms contains per-app artificial waits, see docs)
  startup_ms      wall time from spawn of --cmd until <shot>.png exists, is a complete PNG, and
                  (when the process exits) it exits. Reported value = time to complete PNG.
  size_bytes      sum of file sizes of --size-paths.
@@ -348,6 +350,26 @@ def m_latency(a, xv, work):
     return s, note
 
 
+def m_firstdraw(a, xv, work):
+    """Interactive start: spawn -> first changed pixel of the (initially empty) root window."""
+    cmd = fmt(a.run_cmd, os.path.join(work, "unused.png"), a.theme)
+    x = XConn(xv.display)
+    vals = []
+    for i in range(a.runs):
+        time.sleep(0.3)
+        g0 = x.grab()
+        t0 = time.perf_counter()
+        p = spawn(cmd, xv.display, a.cwd)
+        got = None
+        while time.perf_counter() - t0 < 30 and p.poll() is None:
+            if x.grab() != g0:
+                got = (time.perf_counter() - t0) * 1000
+                break
+        kill_tree(p)
+        vals.append(got)
+    return stats(vals, 1)
+
+
 def m_frames(a, xv, work):
     fp = os.path.join(work, "frames.json")
     cmd = fmt(a.run_cmd, os.path.join(work, "unused.png"), a.theme)
@@ -396,7 +418,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=60)
     ap.add_argument("--cwd", default=None)
     ap.add_argument("--out", default="json", help="'json' (= results/ dir) or a directory")
-    ap.add_argument("--only", default="", help="comma list: startup,idle,latency,frames,build,size,lines")
+    ap.add_argument("--only", default="", help="comma list: startup,firstdraw,idle,latency,frames,build,size,lines")
     a = ap.parse_args()
     a.idle_runs = a.idle_runs or a.runs
     if not a.run_cmd:
@@ -431,6 +453,8 @@ def main():
             res["startup_ms"] = s
             if err:
                 res["notes"].append("startup: " + err)
+        if "firstdraw" in only:
+            res["first_draw_ms"] = m_firstdraw(a, xv, work)
         if "idle" in only:
             pss, cpu, err = m_idle(a, xv, work)
             res["ram_pss_kb"], res["cpu_idle_pct"] = pss, cpu
@@ -451,6 +475,16 @@ def main():
             xv.close()
         shutil.rmtree(work, ignore_errors=True)
     path = os.path.join(outdir, "%s-%s.json" % (a.app, a.toolkit))
+    if a.only and os.path.exists(path):  # partial re-measure: keep the other metrics
+        try:
+            with open(path) as f:
+                old = json.load(f)
+            notes = [n for n in old.get("notes", []) if n.split(":")[0] not in {x.split(":")[0] for x in res["notes"]}]
+            old.update({k: v for k, v in res.items() if k not in ("notes",)})
+            old["notes"] = notes + res["notes"]
+            res = old
+        except ValueError:
+            pass
     with open(path, "w") as f:
         json.dump(res, f, indent=1)
     print(json.dumps({k: (v if not isinstance(v, dict) or "median" not in v else v["median"])
