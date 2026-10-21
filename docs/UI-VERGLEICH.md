@@ -82,12 +82,12 @@ Windows and phone numbers: **needs laptop** (offline; nothing guessed).
 ### First draw, interactive start (ms): spawn -> first pixel change
 | app | original | fui | web | egui | gtk | qt |
 |---|---|---|---|---|---|---|
-| flei | - | - | 616 (510-757) | 209 (206-240) | 219 (210-314) | 371 (324-411) |
+| flei | - | 27 (23-33) | 616 (510-757) | 209 (206-240) | 219 (210-314) | 371 (324-411) |
 | chat | - | - | 626 (557-710) | 242 (196-359) | 389 (320-464) | 457 (336-635) |
 | settings | - | - | 510 (481-568) | 208 (196-314) | 264 (255-338) | 359 (298-412) |
-| dash | - | - | 563 (559-710) | 212 (201-250) | 336 (260-378) | 380 (334-438) |
-| files | - | - | 649 (546-755) | 316 (304-347) | 7985 (7540-8300) | 878 (565-957) |
-| form | - | - | 528 (513-658) | 196 (158-299) | 242 (199-286) | 323 (313-446) |
+| dash | - | 27 (22-36) | 563 (559-710) | 212 (201-250) | 336 (260-378) | 380 (334-438) |
+| files | - | 54 (47-63) | 649 (546-755) | 316 (304-347) | 7985 (7540-8300) | 878 (565-957) |
+| form | - | 27 (22-35) | 528 (513-658) | 196 (158-299) | 242 (199-286) | 323 (313-446) |
 | notes | - | - | 524 (502-578) | 185 (168-200) | 237 (229-297) | 338 (311-357) |
 
 ### Startup to --shot PNG (ms; includes per-toolkit artificial waits, see notes)
@@ -176,6 +176,7 @@ Runtime (Chromium, /usr/lib/chromium): 354 MB (not part of the Web bundle size a
 ## Notes and honest caveats
 - **Startup columns**: "First draw" (interactive start, spawn -> first changed pixel) is the toolkit-neutral number. "Startup to --shot PNG"
   contains per-toolkit waits of the shot mode (GTK 900 ms timer, Qt 700 ms timer, egui 6 frames, Web = Chromium cold start incl. profile creation) and is NOT comparable across toolkits.
+- **First draw caveat**: first changed pixel = first paint of the window; some toolkits may paint an empty window background first, so it is a lower bound of "content visible" (fUi ~27 ms looks like window + first frame; Web/Qt/GTK include their runtime start).
 - **Lines**: first table = app file + shared glue (gtk/qt `common.py`, egui `lib.rs` counted again for every app), second table = app file only.
   Python lines are denser (many `;`). Web counts html+css+js, never the data (read from `data/`). fUi counts only the app's `main.fi`.
   **fUi kit effort is NOT in the fUi numbers**: the kit parts written for these apps are `screen.fi` 148 + `kitapp.fi` 91 + `kitdata.fi` 48 lines (in main) plus the files-app parts (appshot, tsvtable, jsontree, skin: ~416 lines, not merged);

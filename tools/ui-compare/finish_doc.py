@@ -37,7 +37,7 @@ Windows and phone numbers: **needs laptop** (offline; nothing guessed).
 ## Notes and honest caveats
 - **Startup columns**: "First draw" (interactive start, spawn -> first changed pixel) is the toolkit-neutral number. "Startup to --shot PNG"
   contains per-toolkit waits of the shot mode (GTK 900 ms timer, Qt 700 ms timer, egui 6 frames, Web = Chromium cold start incl. profile creation) and is NOT comparable across toolkits.
-- **Lines**: first table = app file + shared glue (gtk/qt `common.py`, egui `lib.rs` counted again for every app), second table = app file only.
+- **First draw caveat**: first changed pixel = first paint of the window; some toolkits may paint an empty window background first, so it is a lower bound of "content visible" (fUi ~27 ms looks like window + first frame; Web/Qt/GTK include their runtime start).\n- **Lines**: first table = app file + shared glue (gtk/qt `common.py`, egui `lib.rs` counted again for every app), second table = app file only.
   Python lines are denser (many `;`). Web counts html+css+js, never the data (read from `data/`). fUi counts only the app's `main.fi`.
   **fUi kit effort is NOT in the fUi numbers**: the kit parts written for these apps are `screen.fi` 148 + `kitapp.fi` 91 + `kitdata.fi` 48 lines (in main) plus the files-app parts (appshot, tsvtable, jsontree, skin: ~416 lines, not merged);
   the whole existing fUi library is 86442 lines (`lib/fui`). The short app files are only possible because that library exists (same holds for Qt/GTK/egui/Chromium, which are not counted either).

@@ -423,7 +423,7 @@ def main():
     a.idle_runs = a.idle_runs or a.runs
     if not a.run_cmd:
         a.run_cmd = re.sub(r"\s*--shot\s+\S*\{shot\}\S*", "", a.cmd)
-    only = set(x for x in a.only.split(",") if x) or {"startup", "idle", "latency", "frames", "build", "size", "lines"}
+    only = set(x for x in a.only.split(",") if x) or {"startup", "firstdraw", "idle", "latency", "frames", "build", "size", "lines"}
     outdir = os.path.join(HERE, "results") if a.out == "json" else a.out
     os.makedirs(outdir, exist_ok=True)
     work = tempfile.mkdtemp(prefix="uivgl-")
