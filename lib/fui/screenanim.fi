@@ -1,0 +1,123 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/screenanim.fi -- MOTION FOR IMMEDIATE-MODE SCREENS: hover fades, focus ring fade, caret blink, page fade-up.
+//
+// An immediate-mode control has no identity, so every channel is keyed by where the control sits (its REST position)
+// and a small id. The kit draws call these themselves; an app does nothing except `screen.run*`.
+//
+//   hover(c, x, y, on)          0..1, 150 ms ease-out: the hover amount of the control at (x, y)
+//   mix(c, a, b, t)             colour a -> b
+//   lift(c, x, y, on)           the card rise (negative y offset), 3 pt at full hover
+//   level(c, x, y, id, on, ms)  any other 0..1 channel (slider halo ...)
+//   ring(c, x, y)               0..1: the focus ring that fades in when it appears
+//   caret_on(c, ed, focused)    the blinking caret (visible while typing); asks for the wake-up of its next flip
+//   page(c, id)                 0..1: restarts when `id` changes (fade-up of a page); rise(c, t) = the y offset
+//   veil(c, x, y, w, h, t)      lays the ground over a region at (1 - t) -- the cheap fade of what was just drawn
+//
+// While anything moves the registry of the Ctx keeps asking for frames (anim.chan_*); when everything rests the loop sleeps.
+// The wake-up (`wake_tick` / `wake_wait`, fuiwirt.host_set_wake) is only for the caret. Without a bound registry (tests, no
+// window) every call returns its target at once.
+import fui.anim
+import fui.editor
+import fui.painter
+import fui.render
+import fui.style
+
+export { key_at, hover, mix, lift, level, ring, caret_on, page, rise, veil, begin_frame, wake_tick, wake_wait, want, HOVER_MS }
+
+const HOVER_MS: i64 = 150
+const RING_MS: i64 = 120
+const PAGE_MS: i64 = 240
+const ID_HOVER: u32 = 901
+const ID_RING: u32 = 902
+const ID_PAGE: u32 = 903
+
+static mut FRAME: u64 = 1
+static mut WAKE_AT: i64 = 0
+static mut RING_KEY: u64 = 0
+static mut RING_FRAME: u64 = 0
+static mut RING_EPOCH: u64 = 0
+static mut PAGE_ID: i64 = 0 - 1
+static mut PAGE_EPOCH: u64 = 0
+
+fn key_at(x: f64, y: f64) -> u64 {
+    let a: u64 = ((x + 32768.5) as i64 as u64) & 131071
+    let b: u64 = ((y + 32768.5) as i64 as u64) & 131071
+    return (a << 24) | (b << 4)
+}
+
+fn level(c: *mut render.Ctx, x: f64, y: f64, id: u32, on: bool, ms: i64) -> f64 {
+    var target: f64 = 0.0
+    if on { target = 1.0 }
+    return anim.chan_f(c, key_at(x, y), id, target, ms)
+}
+
+fn hover(c: *mut render.Ctx, x: f64, y: f64, on: bool) -> f64 {
+    return level(c, x, y, ID_HOVER, on, HOVER_MS)
+}
+
+fn mix(c: *mut render.Ctx, a: u32, b: u32, t: f64) -> u32 {
+    if t <= 0.0 { return a }
+    if t >= 1.0 { return b }
+    return anim.mix_srgb(a, b, t)
+}
+
+fn lift(c: *mut render.Ctx, x: f64, y: f64, on: bool) -> f64 {
+    return 0.0 - render.len_of(c, 3) * hover(c, x, y, on)
+}
+
+fn ring(c: *mut render.Ctx, x: f64, y: f64) -> f64 {
+    let k: u64 = key_at(x, y)
+    if k != RING_KEY || RING_FRAME + 1 < FRAME {
+        RING_EPOCH = RING_EPOCH + 1
+        RING_KEY = k
+    }
+    RING_FRAME = FRAME
+    return anim.chan_f_from(c, k | (RING_EPOCH << 44), ID_RING, 0.0, 1.0, RING_MS)
+}
+
+fn want(c: *mut render.Ctx, at_ms: i64) {
+    if WAKE_AT == 0 || at_ms < WAKE_AT { WAKE_AT = at_ms }
+}
+
+fn caret_on(c: *mut render.Ctx, ed: *mut editor.Editor, focused: bool) -> bool {
+    if !focused { return false }
+    let now: i64 = render.ctx_time(c)
+    let on: bool = editor.editor_caret_tick(ed, (now + 1) as u64 * 1000)
+    want(c, (editor.editor_caret_due_us(ed) / 1000) as i64)
+    return on
+}
+
+fn page(c: *mut render.Ctx, id: i64) -> f64 {
+    if id != PAGE_ID {
+        PAGE_ID = id
+        PAGE_EPOCH = PAGE_EPOCH + 1
+    }
+    return anim.chan_f_from(c, (PAGE_EPOCH << 44) | 1, ID_PAGE, 0.0, 1.0, PAGE_MS)
+}
+
+fn rise(c: *mut render.Ctx, t: f64) -> f64 {
+    return (1.0 - t) * render.len_of(c, 10)
+}
+
+fn veil(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, t: f64) {
+    if t >= 1.0 { return }
+    let a: u32 = ((1.0 - t) * 235.0) as u32 + 1 as u32
+    let base: u32 = render.color_of(c, style.color_token(style.TOK_BASE))
+    painter.surface(render.ctx_painter(c), x, y, w, h, (a << 24) | (base & 16777215 as u32))
+}
+
+fn begin_frame() {
+    FRAME = FRAME + 1
+    WAKE_AT = 0
+}
+
+fn wake_tick(ud: u64, now: i64) -> bool {
+    return WAKE_AT != 0 && now >= WAKE_AT
+}
+
+fn wake_wait(ud: u64, now: i64) -> i64 {
+    if WAKE_AT == 0 { return 0 - 1 }
+    let d: i64 = WAKE_AT - now
+    if d < 1 { return 1 }
+    return d
+}
