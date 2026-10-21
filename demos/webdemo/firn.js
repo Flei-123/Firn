@@ -440,6 +440,8 @@ const firnTag = document.currentScript;
     // own) is taken whole up to the next blank.
     const extraAsked = ((firnTag.dataset.fonts || '').match(/data:\S+|[^\s,]+/g) || [])
         .map((f) => fetch(f).then((r) => r.arrayBuffer()));
+    const assetAsked = ((firnTag.dataset.assets || '').match(/[^\s,]+/g) || [])
+        .map((f) => fetch(f).then((r) => r.arrayBuffer()).then((b) => [f.split('/').pop(), new Uint8Array(b)]));
     const wasmAsked = fetch(wasm);
     let instance;
     const resp = await wasmAsked;
@@ -452,6 +454,16 @@ const firnTag = document.currentScript;
     mem = x.memory;
     window.firnExports = x; // for tests (a page's own exported stopwatch)
     onDemand = typeof x.firn_web_clock === 'function' && x.firn_web_clock() >= 2;
+    if (assetAsked.length && typeof x.firn_web_asset === 'function') {
+        for (const [name, f] of await Promise.all(assetAsked)) {
+            const nb = new TextEncoder().encode(name);
+            const np = x.firn_web_alloc(nb.length);
+            bytes(np, nb.length).set(nb);
+            const p = x.firn_web_alloc(f.length);
+            bytes(p, f.length).set(f);
+            if (!x.firn_web_asset(np, nb.length, p, f.length)) console.error(`firn: asset ${name} was refused`);
+        }
+    }
     try {
         x._start();
     } catch (e) {

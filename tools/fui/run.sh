@@ -812,6 +812,12 @@ done
 echo "  dash 1100x700 shot, light + dark   OK"
 build kitdash
 "$W/kitdash"
+echo "== 18p5c. THE APP SCREENS AS WEBASSEMBLY (tools/wasm/screenapps.sh): Inter + assets, pixel-equal to the native shot =="
+if command -v chromium >/dev/null 2>&1; then
+    FIRNC="$FIRNC" bash tools/wasm/screenapps.sh flei settings notes chat dash form || exit 1
+else
+    echo "  chromium missing -- skipped"
+fi
 build navmock
 mkdir -p "$W/navpics"
 "$W/navmock" "$W/navpics"
