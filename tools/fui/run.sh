@@ -754,6 +754,16 @@ for th in light dark; do
     [ "$(wc -c < "$W/flei-$th.png")" -gt 20000 ] || { echo "  flei $th shot too small"; exit 1; }
 done
 echo "  flei 1100x700 shot, light + dark   OK"
+"$FIRNC" --opt-level=dev -o "$W/fuiapp_form" examples/fui_apps/form/main.fi
+for th in light dark; do
+    "$W/fuiapp_form" --theme $th --shot "$W/form-$th.png"
+    [ "$(wc -c < "$W/form-$th.png")" -gt 15000 ] || { echo "  form $th shot too small"; exit 1; }
+done
+"$W/fuiapp_form" --theme dark --invalid --shot "$W/form-err.png"
+[ "$(wc -c < "$W/form-err.png")" -gt 15000 ] || { echo "  form error shot too small"; exit 1; }
+echo "  form wizard 1100x700 shot, light + dark + errors   OK"
+build kitform
+"$W/kitform"
 
 echo
 echo "== 18p6. THE LAUNCHER KIT IN A REAL WINDOW (Xvfb, xdotool, xwd) =="
