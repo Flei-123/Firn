@@ -194,12 +194,18 @@ class XConn:
         return data
 
     def send(self, spec):
-        """spec: key:Tab | click:x,y | move:x,y"""
+        """spec: key:Tab | click:x,y | move:x,y | wheel:N"""
         kind, _, arg = spec.partition(":")
         if kind == "key":
             kc = self.x.XKeysymToKeycode(self.d, self.x.XStringToKeysym(arg.encode()))
             self.t.XTestFakeKeyEvent(self.d, kc, 1, 0)
             self.t.XTestFakeKeyEvent(self.d, kc, 0, 0)
+        elif kind == "wheel":  # wheel:N  N>0 = N notches down (button 5), N<0 up (button 4)
+            n = int(arg)
+            b = 5 if n > 0 else 4
+            for _ in range(abs(n)):
+                self.t.XTestFakeButtonEvent(self.d, b, 1, 0)
+                self.t.XTestFakeButtonEvent(self.d, b, 0, 0)
         elif kind in ("click", "move"):
             xx, yy = [int(v) for v in arg.split(",")]
             self.t.XTestFakeMotionEvent(self.d, 0, xx, yy, 0)
@@ -288,6 +294,11 @@ def m_latency(a, xv, work):
     cmd = fmt(a.run_cmd, os.path.join(work, "unused.png"), a.theme)
     p = spawn(cmd, xv.display, a.cwd)
     x = XConn(xv.display)
+    # wait until the app has drawn something (root image differs from the empty one), then settle
+    g0 = x.grab()
+    t_lim = time.time() + 20
+    while time.time() < t_lim and x.grab() == g0 and p.poll() is None:
+        time.sleep(0.05)
     time.sleep(a.settle)
     if p.poll() is not None:
         kill_tree(p)
@@ -381,7 +392,7 @@ def main():
     ap.add_argument("--idle-runs", type=int)
     ap.add_argument("--theme", default="dark")
     ap.add_argument("--input", default="key:Tab", help="';'-separated XTest specs used round-robin")
-    ap.add_argument("--settle", type=float, default=3.0)
+    ap.add_argument("--settle", type=float, default=2.0)
     ap.add_argument("--timeout", type=int, default=60)
     ap.add_argument("--cwd", default=None)
     ap.add_argument("--out", default="json", help="'json' (= results/ dir) or a directory")

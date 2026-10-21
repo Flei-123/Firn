@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--runs", default="5")
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--metrics", default="", help="forwarded as --only to measure.py")
+    ap.add_argument("--idle-runs", default="", help="forwarded to measure.py (default = --runs)")
+    ap.add_argument("--parallel", action="store_true", help="one lane per toolkit, lanes run concurrently (faster, slightly noisier startup/latency)")
     a = ap.parse_args()
     apps = set(x for x in a.only.split(",") if x)
     tks = set(x for x in a.toolkit.split(",") if x)
@@ -52,7 +54,7 @@ def main():
     if not cfgs:
         print("no apps/*/*/measure.json found yet - nothing to measure")
         return 0
-    fails = 0
+    jobs = []
     for c in cfgs:
         tk = os.path.basename(os.path.dirname(c))
         app = os.path.basename(os.path.dirname(os.path.dirname(c)))
@@ -62,6 +64,8 @@ def main():
             cfg = json.load(f)
         cmd = [sys.executable, os.path.join(SCRIPTS, "measure.py"), "--app", app, "--toolkit", tk,
                "--cmd", cfg["cmd"], "--runs", a.runs]
+        if a.idle_runs:
+            cmd += ["--idle-runs", a.idle_runs]
         if cfg.get("run_cmd"):
             cmd += ["--run-cmd", cfg["run_cmd"]]
         if cfg.get("src"):
@@ -78,11 +82,30 @@ def main():
             cmd += ["--cwd", cfg["cwd"]]
         if a.metrics:
             cmd += ["--only", a.metrics]
+        jobs.append((app, tk, cmd))
+    fails = 0
+
+    def run(job):
+        app, tk, cmd = job
         print("== %s / %s" % (app, tk), flush=True)
-        r = subprocess.run(cmd)
+        r = subprocess.run(cmd, stdout=subprocess.DEVNULL if a.parallel else None)
         if r.returncode != 0:
-            print("!! measure failed for %s/%s (rc=%d)" % (app, tk, r.returncode))
-            fails += 1
+            print("!! measure failed for %s/%s (rc=%d)" % (app, tk, r.returncode), flush=True)
+            return 1
+        print("   done %s / %s" % (app, tk), flush=True)
+        return 0
+
+    if a.parallel:
+        from concurrent.futures import ThreadPoolExecutor
+        lanes = {}
+        for j in jobs:
+            lanes.setdefault(j[1], []).append(j)
+        with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as ex:
+            for rc in ex.map(lambda ls: sum(run(j) for j in ls), lanes.values()):
+                fails += rc
+    else:
+        for j in jobs:
+            fails += run(j)
     return 1 if fails else 0
 
 
