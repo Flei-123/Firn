@@ -747,6 +747,15 @@ build kit
 "$W/kit"
 
 echo
+echo "== 18p5b. THE APP SCREENS (lib/fui/screen.fi, kitapp.fi, kitdata.fi): examples/fui_apps/flei, headless --shot =="
+"$FIRNC" --opt-level=dev -o "$W/fuiapp_flei" examples/fui_apps/flei/main.fi
+for th in light dark; do
+    "$W/fuiapp_flei" --theme $th --shot "$W/flei-$th.png"
+    [ "$(wc -c < "$W/flei-$th.png")" -gt 20000 ] || { echo "  flei $th shot too small"; exit 1; }
+done
+echo "  flei 1100x700 shot, light + dark   OK"
+
+echo
 echo "== 18p6. THE LAUNCHER KIT IN A REAL WINDOW (Xvfb, xdotool, xwd) =="
 # examples/fui/launcher_kit runs on its own X server and is operated from
 # outside; what is checked is what the server shows, plus the CPU it used while
