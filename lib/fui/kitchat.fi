@@ -1,0 +1,607 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/kitchat.fi -- THE PARTS OF A MESSENGER on top of lib/fui/kit.fi, and a ready screen model.
+//
+// Immediate mode like kit.fi: `*_draw` paints from the state the app keeps. Parts (reusable alone):
+//   avatar_rgb_draw    disc with initials in a given colour      badge_draw       count pill (accent)
+//   contact_row_draw   avatar + name + preview + unread badge     daysep_draw      centred date pill
+//   bubble_draw        message bubble (side, wrapped text, time)  bubble_height    its height (no painting)
+//   composer_draw      input field + Send button                  day_label        "2026-10-22T..." -> "Thursday 22 October"
+//   hex_color          "#e57373" -> 0xE57373
+// The screen model (`Chat`): contacts + messages, a search field, an input field, a log that sticks to the
+// bottom (autoscroll) until the user scrolls up; `chat_paint/press/key/text/wheel` fit screen.run_wheel.
+//
+//     let z: *mut kitchat.Chat = kitchat.chat_new()
+//     kitchat.add_contact(z, "Anna Berger", "AB", kitchat.hex_color("#e57373"), 2)
+//     kitchat.add_msg(z, 0, false, "Hello", "2026-10-19T11:21:00")
+//     screen.run_wheel(start, "Chat", 1100, 700, z as u64, kitchat.chat_paint, kitchat.chat_press,
+//         kitchat.chat_key, kitchat.chat_text, kitchat.chat_wheel, kitcolor.blue)
+import std.rt
+import fui.kit
+import fui.kitform
+import fui.editor
+import fui.painter
+import fui.render
+import fui.style
+import fui.widget
+
+const MAX_CONTACTS: usize = 16
+const MAX_MSGS: usize = 160
+const FOCUS_NONE: u32 = 0
+const FOCUS_SEARCH: u32 = 1
+const FOCUS_INPUT: u32 = 2
+
+struct Contact {
+    name: str,
+    ini: str,
+    rgb: u32,
+    unread: u32,
+}
+
+struct Msg {
+    who: usize,
+    mine: bool,
+    text: str,
+    ts: str,
+}
+
+struct Chat {
+    cs: [Contact; 16],
+    ms: [Msg; 160],
+    nc: usize,
+    nm: usize,
+    sel: usize,
+    scroll: f64,
+    top: f64,
+    stick: bool,
+    q: u64,
+    inp: u64,
+    focus: u32,
+    ctx: u64,
+    now: u64,
+    w: f64,
+    h: f64,
+}
+
+// ---------------------------------------------------------------- small helpers
+
+fn tok(c: *mut render.Ctx, t: u32) -> u32 { return kit.tokc(c, t) }
+
+// whole pixels (a bubble's edges must land on pixel borders, or the two shapes of its corner blend twice at the seam)
+fn snap(v: f64) -> f64 { return ((v + 0.5) as i64) as f64 }
+
+// design size in half points (21 = 10.5 pt)
+fn half(c: *mut render.Ctx, n2: usize) -> f64 { return kit.ln(c, n2) / 2.0 }
+
+fn hexv(b: u8) -> u32 {
+    if b >= 48 as u8 && b <= 57 as u8 { return (b - 48 as u8) as u32 }
+    if b >= 97 as u8 && b <= 102 as u8 { return (b - 87 as u8) as u32 }
+    if b >= 65 as u8 && b <= 70 as u8 { return (b - 55 as u8) as u32 }
+    return 0 as u32
+}
+
+// "#e57373" -> 0xE57373 (0 for anything else)
+fn hex_color(s: str) -> u32 {
+    if s.n != 7 || rt.ld8(s.p as u64, 0) != 35 as u8 { return 0 as u32 }
+    var v: u32 = 0 as u32
+    var i: usize = 1
+    while i < 7 {
+        v = v * 16 as u32 + hexv(rt.ld8(s.p as u64, i))
+        i = i + 1
+    }
+    return v
+}
+
+fn num2(s: str, at: usize) -> usize {
+    return ((rt.ld8(s.p as u64, at) - 48 as u8) as usize) * 10 + ((rt.ld8(s.p as u64, at + 1) - 48 as u8) as usize)
+}
+
+// The weekday (0 = Sunday) of a date (Sakamoto).
+fn weekday(y0: usize, m: usize, d: usize) -> usize {
+    var y: usize = y0
+    if m < 3 { y = y - 1 }
+    let t: str = "032503514624"
+    return (y + y / 4 - y / 100 + y / 400 + ((rt.ld8(t.p as u64, m - 1) - 48 as u8) as usize) + d) % 7
+}
+
+fn put(out: *mut [u8; 48], k: usize, s: str) -> usize {
+    var i: usize = 0
+    var n: usize = k
+    while i < s.n && n < 47 {
+        (*out)[n] = rt.ld8(s.p as u64, i)
+        n = n + 1
+        i = i + 1
+    }
+    return n
+}
+
+// "2026-10-22T03:30:00" -> "Thursday 22 October" into `out`; returns the length (0 if ts is not a timestamp)
+fn day_label(ts: str, out: *mut [u8; 48]) -> usize {
+    if ts.n < 10 { return 0 }
+    let y: usize = num2(ts, 0) * 100 + num2(ts, 2)
+    let m: usize = num2(ts, 5)
+    let d: usize = num2(ts, 8)
+    if m < 1 || m > 12 || d < 1 { return 0 }
+    var k: usize = put(out, 0, kitform.nth("Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday", weekday(y, m, d)))
+    k = put(out, k, " ")
+    var dd: [u8; 24] = [0 as u8; 24]
+    let nd: usize = kit.fmt_uint(d as u64, &dd)
+    k = put(out, k, str { p: ((&dd[0]) as u64) as *mut u8, n: nd })
+    k = put(out, k, " ")
+    return put(out, k, kitform.nth("January|February|March|April|May|June|July|August|September|October|November|December", m - 1))
+}
+
+fn same_day(a: str, b: str) -> bool {
+    if a.n < 10 || b.n < 10 { return false }
+    var i: usize = 0
+    while i < 10 {
+        if rt.ld8(a.p as u64, i) != rt.ld8(b.p as u64, i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- parts
+
+// A disc of diameter `d` with the initials `ini` in white, filled with 0xRRGGBB.
+fn avatar_rgb_draw(c: *mut render.Ctx, x: f64, y: f64, d: f64, rgb: u32, ini: str) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    painter.round_rect(z, x, y, d, d, d / 2.0, (rgb & 16777215 as u32) | ((255 as u32) << 24))
+    if ini.n == 0 { return }
+    let size: f64 = render.tsz(c, d / 3.0)
+    var r: painter.TextRun = painter.run_set_weight(painter.run_new(size), 700)
+    let tw: f64 = painter.run_width(z, &r, ini.p as u64, ini.n)
+    let by: f64 = painter.text_baseline_mid(z, y, d, size)
+    painter.run_draw(z, &r, x + (d - tw) / 2.0, by, tw + 4.0, 0xFFFFFFFF as u32, ini.p as u64, ini.n, painter.TEXT_L)
+}
+
+// An accent pill with the count (99+ above 99); returns its width. Drawn vertically centred in [y, y + h].
+fn badge_draw(c: *mut render.Ctx, x: f64, y: f64, h: f64, n: usize) -> f64 {
+    var buf: [u8; 24] = [0 as u8; 24]
+    var k: usize = 0
+    if n > 99 {
+        buf[0] = 57 as u8
+        buf[1] = 57 as u8
+        buf[2] = 43 as u8
+        k = 3
+    } else {
+        k = kit.fmt_uint(n as u64, &buf)
+    }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let size: f64 = render.tsz(c, half(c, 23))
+    var r: painter.TextRun = painter.run_set_weight(painter.run_new(size), 700)
+    let tw: f64 = painter.run_width(z, &r, (&buf[0]) as u64, k)
+    var w: f64 = tw + kit.ln(c, 12)
+    if w < kit.ln(c, 20) { w = kit.ln(c, 20) }
+    let bh: f64 = kit.ln(c, 20)
+    let by0: f64 = y + (h - bh) / 2.0
+    painter.round_rect(z, x, by0, w, bh, bh / 2.0, tok(c, style.TOK_ACCENT))
+    painter.run_draw(z, &r, x + (w - tw) / 2.0, painter.text_baseline_mid(z, by0, bh, size), tw + 4.0,
+        tok(c, style.TOK_TEXT_ON_ACCENT), (&buf[0]) as u64, k, painter.TEXT_L)
+    return w
+}
+
+// state: 0 plain, 1 hovered, 2 selected. Row = 12 pt round box: avatar 42, name (bold), preview (muted, cut), unread badge.
+fn contact_row_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, rgb: u32, ini: str, name: str,
+    preview: str, unread: usize, state: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    if state == 2 as u32 {
+        painter.round_rect(z, x, y, w, h, kit.ln(c, 12), tok(c, style.TOK_BUTTON))
+    } else if state == 1 as u32 {
+        painter.round_rect(z, x, y, w, h, kit.ln(c, 12), tok(c, style.TOK_FIELD))
+    }
+    let d: f64 = kit.ln(c, 42)
+    avatar_rgb_draw(c, x + kit.ln(c, 12), y + (h - d) / 2.0, d, rgb, ini)
+    var room: f64 = w - kit.ln(c, 78)
+    if unread > 0 {
+        let bw: f64 = kit.ln(c, 20)
+        room = room - bw - kit.ln(c, 8)
+        badge_draw(c, x + w - kit.ln(c, 12) - bw, y, h, unread)
+    }
+    kit.draw_label(c, x + kit.ln(c, 66), y + kit.ln(c, 12), kit.ln(c, 22), kit.ln(c, 14), 700, tok(c, style.TOK_TEXT), name, room)
+    kit.draw_label(c, x + kit.ln(c, 66), y + kit.ln(c, 31), kit.ln(c, 18), half(c, 25), 400, tok(c, style.TOK_TEXT_MUTED), preview, room)
+}
+
+// A centred date pill (fills `label` in a 22 pt round box); returns the height 22 pt.
+fn daysep_draw(c: *mut render.Ctx, cx: f64, y: f64, label: str) -> f64 {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let tw: f64 = kit.text_width(c, half(c, 23), 400, label)
+    let h: f64 = kit.ln(c, 22)
+    painter.round_rect(z, cx - tw / 2.0 - kit.ln(c, 12), y, tw + kit.ln(c, 24), h, kit.ln(c, 12), tok(c, style.TOK_FIELD))
+    kit.draw_label(c, cx - tw / 2.0, y, h, half(c, 23), 400, tok(c, style.TOK_TEXT_MUTED), label, 0.0)
+    return h
+}
+
+// size of a bubble (outer) for `text` + `time` with at most `maxw` width: out[0] = width, out[1] = height, out[2] = text lines
+fn bubble_measure(c: *mut render.Ctx, text: str, time: str, maxw: f64, mine: bool, out: *mut [f64; 3]) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let ts: f64 = kit.ln(c, 14)
+    let pad: f64 = kit.ln(c, 28)
+    let border: f64 = kit.ln(c, 1)
+    var tw: f64 = kit.text_width(c, ts, 400, text) + 2.0
+    let mw: f64 = kit.text_width(c, half(c, 21), 400, time)
+    if mw > tw { tw = mw }
+    var w: f64 = tw + pad + 2.0 * border
+    var lines: usize = 1
+    if w > maxw {
+        w = maxw
+        var r: painter.TextRun = painter.run_new(render.tsz(c, ts))
+        lines = painter.run_line_count(z, &r, text.p as u64, text.n, w - pad - 2.0 * border, 60)
+        if lines < 1 { lines = 1 }
+    }
+    (*out)[0] = snap(w)
+    (*out)[1] = snap(kit.ln(c, 9) + (lines as f64) * ts * 1.4 + kit.ln(c, 2) + half(c, 21) * 1.4 + kit.ln(c, 6) + 2.0 * border)
+    (*out)[2] = lines as f64
+}
+
+fn bubble_height(c: *mut render.Ctx, text: str, time: str, maxw: f64, mine: bool) -> f64 {
+    var m: [f64; 3] = [0.0; 3]
+    bubble_measure(c, text, time, maxw, mine, &m)
+    return m[1]
+}
+
+// One side of the bubble gets the small corner (5 pt): the lower right for mine, the lower left otherwise.
+fn bubble_shape(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, r: f64, rs: f64, mine: bool, col: u32) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    painter.round_rect(z, x, y, w, h, r, col)
+    if mine {
+        painter.round_rect(z, x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0, rs, col)
+    } else {
+        painter.round_rect(z, x, y + h / 2.0, w / 2.0, h / 2.0, rs, col)
+    }
+}
+
+// A message bubble, flush left at `left` (theirs: surface-raised + 1 pt border) or flush right at `right` (mine: accent).
+// Text wraps at `maxw` (outer width), the time sits bottom right. Returns the height.
+fn bubble_draw(c: *mut render.Ctx, left: f64, right: f64, y: f64, maxw: f64, text: str, time: str, mine: bool) -> f64 {
+    var m: [f64; 3] = [0.0; 3]
+    bubble_measure(c, text, time, maxw, mine, &m)
+    let w: f64 = m[0]
+    let h: f64 = m[1]
+    var x: f64 = left
+    if mine { x = right - w }
+    let r: f64 = kit.ln(c, 16)
+    let rs: f64 = kit.ln(c, 5)
+    var fg: u32 = tok(c, style.TOK_TEXT)
+    var bo: f64 = kit.ln(c, 1)
+    if mine {
+        bo = 0.0
+        fg = tok(c, style.TOK_TEXT_ON_ACCENT)
+        bubble_shape(c, x, y, w, h, r, rs, true, tok(c, style.TOK_ACCENT))
+    } else {
+        bubble_shape(c, x, y, w, h, r, rs, false, tok(c, style.TOK_BORDER))
+        bubble_shape(c, x + bo, y + bo, w - 2.0 * bo, h - 2.0 * bo, r - bo, rs - bo, false, tok(c, style.TOK_SURFACE_RAISED))
+    }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let ts: f64 = render.tsz(c, kit.ln(c, 14))
+    var run: painter.TextRun = painter.run_new(ts)
+    let lh: f64 = ts * 1.4
+    painter.run_draw_wrapped(z, &run, x + bo + kit.ln(c, 14), painter.text_baseline_mid(z, y + bo + kit.ln(c, 9), lh, ts),
+        w - 2.0 * bo - kit.ln(c, 28), lh, fg, text.p as u64, text.n, painter.TEXT_L, 60)
+    let tw: f64 = kit.text_width(c, half(c, 21), 400, time)
+    kit.draw_label(c, x + w - bo - kit.ln(c, 14) - tw, y + h - bo - kit.ln(c, 6) - half(c, 21) * 1.4, half(c, 21) * 1.4,
+        half(c, 21), 400, kit.with_alpha(fg, 160 as u32), time, 0.0)
+    return h
+}
+
+// The input row: a text field (hint while empty and not focused) and the Send button (84 pt) at the right.
+// (x, y, w, h) = the field plus button row; `st` = kit.ST_HOVER for the button.
+fn composer_draw(c: *mut render.Ctx, f: *mut kit.Search, x: f64, y: f64, w: f64, h: f64, hint: str, caret: bool, st: u32) {
+    let bw: f64 = kit.ln(c, 84)
+    let fw: f64 = w - bw - kit.ln(c, 10)
+    var e: widget.Widget = kitform.field_widget(c, f, x, y, fw, h)
+    render.draw_textfield(c, &e, &(*f).ed, caret && kit.search_has_focus(f))
+    if kit.search_text_len(f) == 0 && !kit.search_has_focus(f) {
+        kit.draw_label(c, x + kit.ln(c, 14), y, h, kit.ln(c, 14), 400, tok(c, style.TOK_TEXT_DISABLED), hint, fw - kit.ln(c, 28))
+    }
+    // the accent button with the same label colour as the bubbles of mine (kit.button_draw picks black or white by its own rule)
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let r: f64 = kit.ln(c, 10)
+    painter.round_rect(z, x + w - bw, y, bw, h, r, tok(c, style.TOK_ACCENT))
+    if st == kit.ST_HOVER { painter.round_rect(z, x + w - bw, y, bw, h, r, 0x28FFFFFF as u32) }
+    let lw: f64 = kit.text_width(c, kit.ln(c, 14), 700, "Send")
+    kit.draw_label(c, x + w - bw + (bw - lw) / 2.0, y, h, kit.ln(c, 14), 700, tok(c, style.TOK_TEXT_ON_ACCENT), "Send", 0.0)
+}
+
+// ---------------------------------------------------------------- model
+
+fn chat_new() -> *mut Chat {
+    let z: *mut Chat = rt.heap_alloc(1 << 15) as *mut Chat
+    (*z).nc = 0
+    (*z).nm = 0
+    (*z).sel = 0
+    (*z).scroll = 0.0
+    (*z).top = 0.0
+    (*z).stick = true
+    (*z).focus = FOCUS_NONE
+    (*z).ctx = 0 as u64
+    (*z).now = 0 as u64
+    (*z).q = kitform.field_new() as u64
+    (*z).inp = kitform.field_new() as u64
+    return z
+}
+
+fn qf(z: *mut Chat) -> *mut kit.Search { return (*z).q as *mut kit.Search }
+fn inf(z: *mut Chat) -> *mut kit.Search { return (*z).inp as *mut kit.Search }
+
+fn add_contact(z: *mut Chat, name: str, ini: str, rgb: u32, unread: u32) -> usize {
+    if (*z).nc >= MAX_CONTACTS { return 0 }
+    (*z).cs[(*z).nc] = Contact { name: name, ini: ini, rgb: rgb, unread: unread }
+    (*z).nc = (*z).nc + 1
+    return (*z).nc - 1
+}
+
+fn add_msg(z: *mut Chat, who: usize, mine: bool, text: str, ts: str) {
+    if (*z).nm >= MAX_MSGS { return }
+    (*z).ms[(*z).nm] = Msg { who: who, mine: mine, text: text, ts: ts }
+    (*z).nm = (*z).nm + 1
+}
+
+fn select(z: *mut Chat, i: usize) {
+    if i >= (*z).nc { return }
+    (*z).sel = i
+    (*z).stick = true
+}
+
+// the last message of contact `i`: index + 1, 0 = none
+fn last_msg(z: *mut Chat, i: usize) -> usize {
+    var k: usize = (*z).nm
+    while k > 0 {
+        if (*z).ms[k - 1].who == i { return k }
+        k = k - 1
+    }
+    return 0
+}
+
+fn lower(b: u8) -> u8 {
+    if b >= 65 as u8 && b <= 90 as u8 { return b + 32 as u8 }
+    return b
+}
+
+// does `name` contain `q` (ASCII case-insensitive)? an empty q matches all
+fn matches(name: str, q: str) -> bool {
+    if q.n == 0 { return true }
+    var i: usize = 0
+    while i + q.n <= name.n {
+        var k: usize = 0
+        while k < q.n && lower(rt.ld8(name.p as u64, i + k)) == lower(rt.ld8(q.p as u64, k)) { k = k + 1 }
+        if k == q.n { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// the contacts the search field lets through (indices into cs), in order; returns how many
+fn visible(z: *mut Chat, out: *mut [u32; 16]) -> usize {
+    let q: str = kitform.field_text(qf(z))
+    var n: usize = 0
+    var i: usize = 0
+    while i < (*z).nc {
+        if matches((*z).cs[i].name, q) {
+            (*out)[n] = i as u32
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn copy_str(s: str) -> str {
+    if s.n == 0 { return s }
+    let p: u64 = rt.heap_alloc(s.n + 1)
+    var i: usize = 0
+    while i < s.n {
+        rt.st8(p, i, rt.ld8(s.p as u64, i))
+        i = i + 1
+    }
+    return str { p: p as *mut u8, n: s.n }
+}
+
+// the timestamp one minute after the newest message (no clock needed): same date, "HH:MM" bumped
+fn next_ts(z: *mut Chat) -> str {
+    if (*z).nm == 0 { return "2026-01-01T00:00:00" }
+    let t: str = copy_str((*z).ms[(*z).nm - 1].ts)
+    if t.n < 16 { return t }
+    var m: usize = (num2(t, 11) * 60 + num2(t, 14) + 1) % 1440
+    rt.st8(t.p as u64, 11, (48 + m / 600) as u8)
+    rt.st8(t.p as u64, 12, (48 + (m / 60) % 10) as u8)
+    rt.st8(t.p as u64, 14, (48 + (m % 60) / 10) as u8)
+    rt.st8(t.p as u64, 15, (48 + m % 10) as u8)
+    return t
+}
+
+// Send the input text to the selected contact (blank text is ignored); clears the field, sticks to the bottom. true = sent.
+fn chat_send(z: *mut Chat) -> bool {
+    let t: str = kitform.field_text(inf(z))
+    var blank: bool = true
+    var i: usize = 0
+    while i < t.n {
+        if rt.ld8(t.p as u64, i) != 32 as u8 { blank = false }
+        i = i + 1
+    }
+    if blank || (*z).nc == 0 || (*z).nm >= MAX_MSGS { return false }
+    add_msg(z, (*z).sel, true, copy_str(t), next_ts(z))
+    kit.search_set_text(inf(z), "")
+    (*z).stick = true
+    return true
+}
+
+// ---------------------------------------------------------------- screen
+
+fn side_w(c: *mut render.Ctx) -> f64 { return kit.ln(c, 300) }
+
+// walk the log of the selected contact: returns the content height; with draw the bubbles are painted
+// (the first one at y = view top + 18 - scroll)
+#[allow_escape]
+fn log_walk(z: *mut Chat, c: *mut render.Ctx, w: f64, y0: f64, draw: bool) -> f64 {
+    let sx: f64 = side_w(c)
+    let left: f64 = sx + kit.ln(c, 28)
+    let right: f64 = w - kit.ln(c, 28)
+    let maxw: f64 = (right - left) * 0.62
+    var y: f64 = y0 + kit.ln(c, 18)
+    var prev: str = ""
+    var k: usize = 0
+    while k < (*z).nm {
+        let m: *mut Msg = &(*z).ms[k]
+        if (*m).who == (*z).sel {
+            let tm: str = str { p: ((*m).ts.p as u64 + 11 as u64) as *mut u8, n: 5 }
+            if !same_day(prev, (*m).ts) {
+                prev = (*m).ts
+                var lb: [u8; 48] = [0 as u8; 48]
+                let ln: usize = day_label((*m).ts, &lb)
+                y = y + kit.ln(c, 10)
+                if draw { daysep_draw(c, (left + right) / 2.0, y, str { p: ((&lb[0]) as u64) as *mut u8, n: ln }) }
+                y = y + kit.ln(c, 22) + kit.ln(c, 10) + kit.ln(c, 6)
+            }
+            var h: f64 = 0.0
+            if draw {
+                h = bubble_draw(c, left, right, y, maxw, (*m).text, tm, (*m).mine)
+            } else {
+                h = bubble_height(c, (*m).text, tm, maxw, (*m).mine)
+            }
+            y = y + h + kit.ln(c, 6)
+        }
+        k = k + 1
+    }
+    return y - kit.ln(c, 6) + kit.ln(c, 18) - y0
+}
+
+fn chat_paint(ud: u64, c: *mut render.Ctx, w: f64, h: f64, px: f64, py: f64) {
+    let z: *mut Chat = ud as *mut Chat
+    (*z).ctx = c as u64
+    (*z).w = w
+    (*z).h = h
+    let zp: *mut painter.Painter = render.ctx_painter(c)
+    let sx: f64 = side_w(c)
+    let hdr: f64 = kit.ln(c, 71)
+    let bar: f64 = kit.ln(c, 67)
+    let view: f64 = h - hdr - bar
+    // log first (header and composer paint over what scrolls under them), autoscroll to the end
+    var max: f64 = log_walk(z, c, w, 0.0, false) - view
+    if max < 0.0 { max = 0.0 }
+    if (*z).stick || (*z).scroll > max { (*z).scroll = max }
+    if (*z).scroll < 0.0 { (*z).scroll = 0.0 }
+    (*z).scroll = snap((*z).scroll)
+    (*z).top = max
+    log_walk(z, c, w, hdr - (*z).scroll, true)
+    // header
+    painter.surface(zp, sx, 0.0, w - sx, hdr, tok(c, style.TOK_SURFACE))
+    painter.surface(zp, sx, hdr - kit.ln(c, 1), w - sx, kit.ln(c, 1), tok(c, style.TOK_SEPARATOR))
+    if (*z).nc > 0 {
+        let cc: *mut Contact = &(*z).cs[(*z).sel]
+        avatar_rgb_draw(c, sx + kit.ln(c, 22), kit.ln(c, 14), kit.ln(c, 42), (*cc).rgb, (*cc).ini)
+        kit.draw_label(c, sx + kit.ln(c, 76), kit.ln(c, 14), kit.ln(c, 24), half(c, 31), 700, tok(c, style.TOK_TEXT), (*cc).name, w - sx - kit.ln(c, 100))
+        kit.draw_label(c, sx + kit.ln(c, 76), kit.ln(c, 36), kit.ln(c, 18), kit.ln(c, 12), 400, tok(c, style.TOK_TEXT_MUTED), "online", 0.0)
+    }
+    // composer
+    painter.surface(zp, sx, h - bar, w - sx, bar, tok(c, style.TOK_SURFACE))
+    painter.surface(zp, sx, h - bar, w - sx, kit.ln(c, 1), tok(c, style.TOK_SEPARATOR))
+    var bst: u32 = 0 as u32
+    let bx: f64 = w - kit.ln(c, 22) - kit.ln(c, 84)
+    if px >= bx && px < bx + kit.ln(c, 84) && py >= h - bar + kit.ln(c, 14) && py < h - bar + kit.ln(c, 52) { bst = kit.ST_HOVER }
+    composer_draw(c, inf(z), sx + kit.ln(c, 22), h - bar + kit.ln(c, 14), w - sx - kit.ln(c, 44), kit.ln(c, 38), "Write a message...", true, bst)
+    // side bar
+    painter.surface(zp, 0.0, 0.0, sx, h, tok(c, style.TOK_SURFACE))
+    painter.surface(zp, sx - kit.ln(c, 1), 0.0, kit.ln(c, 1), h, tok(c, style.TOK_SEPARATOR))
+    kit.search_draw(c, qf(z), kit.ln(c, 16), kit.ln(c, 16), sx - kit.ln(c, 32), kit.ln(c, 38), "Search contacts", false)
+    var vis: [u32; 16] = [0 as u32; 16]
+    let n: usize = visible(z, &vis)
+    var i: usize = 0
+    while i < n {
+        let ci: usize = vis[i] as usize
+        let cc: *mut Contact = &(*z).cs[ci]
+        let ry: f64 = kit.ln(c, 70) + (i as f64) * kit.ln(c, 62)
+        let rx: f64 = kit.ln(c, 8)
+        let rw: f64 = sx - kit.ln(c, 16)
+        var st: u32 = 0 as u32
+        if px >= rx && px < rx + rw && py >= ry && py < ry + kit.ln(c, 62) { st = 1 as u32 }
+        var un: usize = (*cc).unread as usize
+        if ci == (*z).sel { st = 2 as u32; un = 0 }
+        var pv: str = "No messages"
+        let lm: usize = last_msg(z, ci)
+        if lm > 0 { pv = (*z).ms[lm - 1].text }
+        contact_row_draw(c, rx, ry, rw, kit.ln(c, 62), (*cc).rgb, (*cc).ini, (*cc).name, pv, un, st)
+        i = i + 1
+    }
+}
+
+fn scroll_by(z: *mut Chat, dy: f64) {
+    (*z).scroll = (*z).scroll + dy
+    if (*z).scroll < 0.0 { (*z).scroll = 0.0 }
+    (*z).stick = (*z).scroll >= (*z).top
+    if (*z).stick { (*z).scroll = (*z).top }
+}
+
+fn chat_wheel(ud: u64, px: f64, py: f64, dx: f64, dy: f64) -> bool {
+    let z: *mut Chat = ud as *mut Chat
+    if (*z).ctx == 0 as u64 { return false }
+    let c: *mut render.Ctx = (*z).ctx as *mut render.Ctx
+    if px < side_w(c) { return false }
+    scroll_by(z, dy * kit.ln(c, 48))
+    return true
+}
+
+fn focus_on(z: *mut Chat, f: u32) {
+    kit.search_focus(qf(z), f == FOCUS_SEARCH)
+    kit.search_focus(inf(z), f == FOCUS_INPUT)
+    (*z).focus = f
+}
+
+fn chat_press(ud: u64, x: f64, y: f64) {
+    let z: *mut Chat = ud as *mut Chat
+    if (*z).ctx == 0 as u64 { return }
+    let c: *mut render.Ctx = (*z).ctx as *mut render.Ctx
+    (*z).now = (*z).now + 1000000 as u64
+    let sx: f64 = side_w(c)
+    let bar: f64 = kit.ln(c, 67)
+    if kit.search_press(c, qf(z), kit.ln(c, 16), kit.ln(c, 16), sx - kit.ln(c, 32), kit.ln(c, 38), x, y, (*z).now) != kit.SEARCH_HIT_NONE as u32 {
+        focus_on(z, FOCUS_SEARCH)
+        return
+    }
+    let fy: f64 = (*z).h - bar + kit.ln(c, 14)
+    let fw: f64 = (*z).w - sx - kit.ln(c, 44) - kit.ln(c, 94)
+    if kit.search_press(c, inf(z), sx + kit.ln(c, 22), fy, fw, kit.ln(c, 38), x, y, (*z).now) != kit.SEARCH_HIT_NONE as u32 {
+        focus_on(z, FOCUS_INPUT)
+        return
+    }
+    if x >= (*z).w - kit.ln(c, 106) && x < (*z).w - kit.ln(c, 22) && y >= fy && y < fy + kit.ln(c, 38) {
+        chat_send(z)
+        return
+    }
+    if x < sx {
+        var vis: [u32; 16] = [0 as u32; 16]
+        let n: usize = visible(z, &vis)
+        let row: f64 = (y - kit.ln(c, 70)) / kit.ln(c, 62)
+        if row >= 0.0 && (row as usize) < n && x >= kit.ln(c, 8) && x < sx - kit.ln(c, 8) { select(z, vis[row as usize] as usize) }
+    }
+}
+
+fn chat_key(ud: u64, k: u32, mods: u32) -> bool {
+    let z: *mut Chat = ud as *mut Chat
+    var step: f64 = 48.0
+    if (*z).ctx != 0 as u64 { step = kit.ln((*z).ctx as *mut render.Ctx, 48) }
+    if k == editor.KEY_UP { scroll_by(z, 0.0 - step); return true }
+    if k == editor.KEY_DOWN { scroll_by(z, step); return true }
+    if k == editor.KEY_PGUP { scroll_by(z, 0.0 - step * 8.0); return true }
+    if k == editor.KEY_PGDN { scroll_by(z, step * 8.0); return true }
+    if k == editor.KEY_TAB {
+        if (*z).focus == FOCUS_INPUT { focus_on(z, FOCUS_SEARCH) } else { focus_on(z, FOCUS_INPUT) }
+        return true
+    }
+    if k == editor.KEY_ENTER {
+        if (*z).focus != FOCUS_SEARCH { chat_send(z) }
+        return true
+    }
+    if (*z).focus == FOCUS_NONE { focus_on(z, FOCUS_INPUT) }
+    var f: *mut kit.Search = inf(z)
+    if (*z).focus == FOCUS_SEARCH { f = qf(z) }
+    return kit.search_key(f, k, mods) != editor.RES_PASS
+}
+
+fn chat_text(ud: u64, cp: u32, mods: u32) -> bool {
+    let z: *mut Chat = ud as *mut Chat
+    if (*z).focus == FOCUS_NONE { focus_on(z, FOCUS_INPUT) }
+    var f: *mut kit.Search = inf(z)
+    if (*z).focus == FOCUS_SEARCH { f = qf(z) }
+    kit.search_char(f, cp, mods)
+    return true
+}
