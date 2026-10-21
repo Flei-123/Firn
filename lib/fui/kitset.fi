@@ -1,0 +1,449 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/fui/kitset.fi -- SETTINGS ROWS: toggle, drop-down, radio group, slider, colour swatches, text field.
+//
+// Immediate mode like kit.fi. One `Set` holds the VALUE of every control (by id 0..23) and, after each
+// paint, the rectangle each control was drawn at -- so `press`, `key` and `text` need no layout of
+// their own. A row is a card with a title (+ a muted line) at the left and its control at the right.
+//
+//   begin(s, c, x, y, w, px, py)          start a frame (the rows stack from y)
+//   row_toggle / row_select / row_radio   one row each; `opts` = "a|b|c" (radio: at most 4)
+//   row_slider / row_colors / row_field   slider lo..hi + unit, swatches "3ddc84|5b8cff", text field
+//   end(s, c)                             the open drop-down list (call last: it floats over the rows)
+//   press(s, x, y) -> id | NONE           a click: flips, selects, opens, sets, focuses
+//   key / text                            Tab walks the controls, arrows change, Enter/Space act, Esc closes
+//   val / set_val / text_of / set_text    the state
+//
+//     let s: *mut kitset.Set = kitset.set_new()
+//     kitset.begin(s, c, 274.0, 70.0, 780.0, px, py)
+//     kitset.row_toggle(s, c, 1, "Notifications", "")
+//     kitset.end(s, c)
+import std.rt
+import fui.editor
+import fui.kit
+import fui.kitapp
+import fui.kitform
+import fui.lucide
+import fui.painter
+import fui.render
+import fui.style
+
+const TOGGLE: u32 = 1
+const SELECT: u32 = 2
+const RADIO: u32 = 3
+const SLIDER: u32 = 4
+const COLORS: u32 = 5
+const FIELD: u32 = 6
+const NONE: usize = 18446744073709551615
+const CAP: usize = 24
+
+struct Set {
+    v: [i64; 24],
+    lo: [i64; 24],
+    hi: [i64; 24],
+    k: [u32; 24],
+    f: [u64; 24],
+    o: [u64; 24],
+    on: [usize; 24],
+    r: [f64; 96],
+    b: [f64; 96],
+    reg: [usize; 24],
+    n: usize,
+    foc: usize,
+    kbd: bool,
+    open: usize,
+    x: f64,
+    y: f64,
+    w: f64,
+    cx: f64,
+    cy: f64,
+    px: f64,
+    py: f64,
+    now: u64,
+    ctx: u64,
+}
+
+fn set_new() -> *mut Set {
+    let s: *mut Set = rt.heap_alloc(1 << 13) as *mut Set
+    var i: usize = 0
+    while i < CAP {
+        (*s).v[i] = 0
+        (*s).lo[i] = 0
+        (*s).hi[i] = 100
+        (*s).k[i] = 0 as u32
+        (*s).f[i] = 0
+        (*s).o[i] = 0
+        (*s).on[i] = 0
+        (*s).reg[i] = 0
+        i = i + 1
+    }
+    i = 0
+    while i < CAP * 4 {
+        (*s).r[i] = 0.0
+        (*s).b[i] = 0.0
+        i = i + 1
+    }
+    (*s).n = 0
+    (*s).foc = NONE
+    (*s).kbd = false
+    (*s).open = NONE
+    (*s).now = 0
+    (*s).ctx = 0
+    (*s).px = 0.0 - 1.0
+    (*s).py = 0.0 - 1.0
+    return s
+}
+
+fn val(s: *mut Set, id: usize) -> i64 { return (*s).v[id] }
+fn set_val(s: *mut Set, id: usize, v: i64) { (*s).v[id] = v }
+
+fn fld(s: *mut Set, id: usize) -> *mut kit.Search {
+    if (*s).f[id] == 0 { (*s).f[id] = kitform.field_new() as u64 }
+    return (*s).f[id] as *mut kit.Search
+}
+
+fn text_of(s: *mut Set, id: usize) -> str { return kitform.field_text(fld(s, id)) }
+fn set_text(s: *mut Set, id: usize, t: str) { kit.search_set_text(fld(s, id), t) }
+
+fn opts(s: *mut Set, id: usize) -> str {
+    return str { p: (*s).o[id] as *mut u8, n: (*s).on[id] }
+}
+
+// put control `id` of `kind` at (x, y, w, h) in this frame's order (row_* do this; a test can too)
+fn reg_add(s: *mut Set, id: usize, kind: u32, x: f64, y: f64, w: f64, h: f64) {
+    (*s).k[id] = kind
+    (*s).r[id * 4] = x
+    (*s).r[id * 4 + 1] = y
+    (*s).r[id * 4 + 2] = w
+    (*s).r[id * 4 + 3] = h
+    if (*s).n < CAP {
+        (*s).reg[(*s).n] = id
+        (*s).n = (*s).n + 1
+    }
+}
+
+fn inside(s: *mut Set, id: usize, x: f64, y: f64) -> bool {
+    return x >= (*s).r[id * 4] && x < (*s).r[id * 4] + (*s).r[id * 4 + 2] && y >= (*s).r[id * 4 + 1] && y < (*s).r[id * 4 + 1] + (*s).r[id * 4 + 3]
+}
+
+fn begin(s: *mut Set, c: *mut render.Ctx, x: f64, y: f64, w: f64, px: f64, py: f64) {
+    (*s).x = x
+    (*s).y = y
+    (*s).w = w
+    (*s).px = px
+    (*s).py = py
+    (*s).n = 0
+    (*s).ctx = c as u64
+}
+
+// the card, the title (and the muted line) at the left; the control box (cw x ch) lands at the right in s.cx, s.cy
+fn row(s: *mut Set, c: *mut render.Ctx, id: usize, kind: u32, title: str, sub: str, cw: f64, ch: f64) {
+    var rh: f64 = kit.ln(c, 58)
+    if sub.n > 0 { rh = kit.ln(c, 66) }
+    if ch + kit.ln(c, 22) > rh { rh = ch + kit.ln(c, 22) }
+    kitapp.card_draw(c, (*s).x, (*s).y, (*s).w, rh, false)
+    var ty: f64 = (*s).y + rh / 2.0 - kit.ln(c, 9)
+    if sub.n > 0 {
+        ty = (*s).y + rh / 2.0 - kit.ln(c, 19)
+        kitapp.text(c, (*s).x + kit.ln(c, 20), (*s).y + rh / 2.0 + kit.ln(c, 1), kit.ln(c, 16), 12, 400, style.TOK_TEXT_MUTED, sub)
+    }
+    kitapp.text(c, (*s).x + kit.ln(c, 20), ty, kit.ln(c, 18), 14, 400, style.TOK_TEXT, title)
+    (*s).cx = (*s).x + (*s).w - kit.ln(c, 20) - cw
+    (*s).cy = (*s).y + (rh - ch) / 2.0
+    reg_add(s, id, kind, (*s).cx, (*s).cy, cw, ch)
+    if (*s).foc == id && (*s).kbd { kit.focus_ring(c, (*s).cx - kit.ln(c, 3), (*s).cy - kit.ln(c, 3), cw + kit.ln(c, 6), ch + kit.ln(c, 6), kit.ln(c, 10), style.TOK_SURFACE) }
+    (*s).y = (*s).y + rh + kit.ln(c, 10)
+}
+
+fn hov(s: *mut Set, id: usize) -> bool { return inside(s, id, (*s).px, (*s).py) }
+
+fn row_toggle(s: *mut Set, c: *mut render.Ctx, id: usize, title: str, sub: str) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    row(s, c, id, TOGGLE, title, sub, kit.ln(c, 42), kit.ln(c, 24))
+    let x: f64 = (*s).cx
+    let y: f64 = (*s).cy
+    var track: u32 = kit.tokc(c, style.TOK_BUTTON)
+    var knob: u32 = kit.tokc(c, style.TOK_TEXT_MUTED)
+    var kx: f64 = x + kit.ln(c, 3)
+    if (*s).v[id] != 0 {
+        track = kit.tokc(c, style.TOK_ACCENT)
+        knob = 0xFFFFFFFF as u32
+        kx = x + kit.ln(c, 42 - 3 - 18)
+    } else {
+        painter.round_ring(z, x, y, kit.ln(c, 42), kit.ln(c, 24), kit.ln(c, 12), kit.ln(c, 1), kit.tokc(c, style.TOK_BORDER))
+    }
+    painter.round_rect(z, x, y, kit.ln(c, 42), kit.ln(c, 24), kit.ln(c, 12), track)
+    painter.round_rect(z, kx, y + kit.ln(c, 3), kit.ln(c, 18), kit.ln(c, 18), kit.ln(c, 9), knob)
+}
+
+fn row_select(s: *mut Set, c: *mut render.Ctx, id: usize, title: str, list: str) {
+    (*s).o[id] = list.p as u64
+    (*s).on[id] = list.n
+    row(s, c, id, SELECT, title, "", kit.ln(c, 240), kit.ln(c, 36))
+    kitapp.select_draw(c, (*s).cx, (*s).cy, kit.ln(c, 240), kit.ln(c, 36), kitform.nth(list, (*s).v[id] as usize), hov(s, id) || (*s).open == id)
+}
+
+// x offset of option i of a radio group (i = parts: the end, without the last gap)
+fn radio_off(c: *mut render.Ctx, list: str, i: usize) -> f64 {
+    var x: f64 = 0.0
+    var j: usize = 0
+    while j < i {
+        x = x + kit.ln(c, 32) + kit.text_width(c, kit.ln(c, 14), 400, kitform.nth(list, j)) + kit.ln(c, 14)
+        j = j + 1
+    }
+    return x
+}
+
+// a radio group, at most 4 options
+fn row_radio(s: *mut Set, c: *mut render.Ctx, id: usize, title: str, sub: str, list: str) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let n: usize = kitform.parts(list)
+    (*s).o[id] = list.p as u64
+    (*s).on[id] = list.n
+    row(s, c, id, RADIO, title, sub, radio_off(c, list, n) - kit.ln(c, 14), kit.ln(c, 24))
+    var i: usize = 0
+    while i < n && i < 4 {
+        let ox: f64 = (*s).cx + radio_off(c, list, i)
+        var ring: u32 = kit.tokc(c, style.TOK_TEXT_MUTED)
+        if (*s).v[id] == i as i64 {
+            ring = kit.tokc(c, style.TOK_ACCENT)
+            painter.round_rect(z, ox + kit.ln(c, 4), (*s).cy + kit.ln(c, 8), kit.ln(c, 8), kit.ln(c, 8), kit.ln(c, 4), ring)
+        }
+        painter.round_ring(z, ox, (*s).cy + kit.ln(c, 4), kit.ln(c, 16), kit.ln(c, 16), kit.ln(c, 8), kit.ln(c, 2), ring)
+        kitapp.text(c, ox + kit.ln(c, 24), (*s).cy, kit.ln(c, 24), 14, 400, style.TOK_TEXT, kitform.nth(list, i))
+        (*s).b[id * 4 + i] = radio_off(c, list, i + 1)
+        i = i + 1
+    }
+}
+
+// "<v> <unit>" into buf; its length
+fn val_text(v: i64, unit: str, buf: *mut [u8; 40]) -> usize {
+    var d: [u8; 24] = [0 as u8; 24]
+    let n: usize = kit.fmt_uint(v as u64, &d)
+    var i: usize = 0
+    while i < n { (*buf)[i] = d[i]; i = i + 1 }
+    (*buf)[n] = 32 as u8
+    i = 0
+    while i < unit.n && n + 1 + i < 39 { (*buf)[n + 1 + i] = rt.ld8(unit.p as u64, i); i = i + 1 }
+    return n + 1 + i
+}
+
+fn permille(s: *mut Set, id: usize) -> i64 {
+    return ((*s).v[id] - (*s).lo[id]) * 1000 / ((*s).hi[id] - (*s).lo[id])
+}
+
+// a slider lo..hi; the value + `unit` is the muted line under the title
+#[allow_escape]
+fn row_slider(s: *mut Set, c: *mut render.Ctx, id: usize, title: str, lo: i64, hi: i64, unit: str) {
+    (*s).lo[id] = lo
+    (*s).hi[id] = hi
+    var buf: [u8; 40] = [0 as u8; 40]
+    let n: usize = val_text((*s).v[id], unit, &buf)
+    row(s, c, id, SLIDER, title, str { p: ((&buf[0]) as u64) as *mut u8, n: n }, kit.ln(c, 220), kit.ln(c, 24))
+    kitapp.slider_draw(c, (*s).cx, (*s).cy + kit.ln(c, 9), kit.ln(c, 220), permille(s, id))
+}
+
+// "3ddc84" or "#3ddc84" as 0xRRGGBB
+fn hex(t: str) -> u32 {
+    var v: u32 = 0 as u32
+    var i: usize = 0
+    while i < t.n {
+        let ch: u8 = rt.ld8(t.p as u64, i)
+        if ch != 35 as u8 {
+            var d: u32 = (ch - 48 as u8) as u32
+            if ch >= 97 as u8 { d = (ch - 87 as u8) as u32 }
+            v = v * 16 as u32 + d
+        }
+        i = i + 1
+    }
+    return v
+}
+
+// the index of `t` in "a|b|c" (0 if absent)
+fn index_of(list: str, t: str) -> i64 {
+    var i: usize = 0
+    while i < kitform.parts(list) {
+        let o: str = kitform.nth(list, i)
+        if o.n == t.n && rt.mem_eq(o.p as u64, t.p as u64, t.n) { return i as i64 }
+        i = i + 1
+    }
+    return 0
+}
+
+// forget focus and an open list (a page change)
+fn reset(s: *mut Set) {
+    blur(s)
+    (*s).foc = NONE
+    (*s).open = NONE
+}
+
+// swatches "3ddc84|5b8cff|..." (hex, lower case); the value is the chosen index
+fn row_colors(s: *mut Set, c: *mut render.Ctx, id: usize, title: str, pal: str) {
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let n: usize = kitform.parts(pal)
+    (*s).o[id] = pal.p as u64
+    (*s).on[id] = pal.n
+    row(s, c, id, COLORS, title, "", kit.ln(c, 34) * (n as f64) - kit.ln(c, 10), kit.ln(c, 24))
+    var i: usize = 0
+    while i < n {
+        let sx: f64 = (*s).cx + kit.ln(c, 34) * (i as f64)
+        painter.round_rect(z, sx, (*s).cy, kit.ln(c, 24), kit.ln(c, 24), kit.ln(c, 12), 0xFF000000 as u32 | hex(kitform.nth(pal, i)))
+        if (*s).v[id] == i as i64 { painter.round_ring(z, sx - kit.ln(c, 3), (*s).cy - kit.ln(c, 3), kit.ln(c, 30), kit.ln(c, 30), kit.ln(c, 15), kit.ln(c, 2), kit.tokc(c, style.TOK_TEXT)) }
+        i = i + 1
+    }
+}
+
+fn row_field(s: *mut Set, c: *mut render.Ctx, id: usize, title: str, hint: str) {
+    row(s, c, id, FIELD, title, "", kit.ln(c, 240), kit.ln(c, 38))
+    kitform.field_box(c, fld(s, id), (*s).cx, (*s).cy, kit.ln(c, 240), kit.ln(c, 38), hint, false, true)
+}
+
+// the geometry of the open list: x, y, w, h of item i (i = n: the whole list)
+fn item_rect(s: *mut Set, c: *mut render.Ctx, id: usize, i: usize, out: *mut [f64; 4]) {
+    let n: usize = kitform.parts(opts(s, id))
+    (*out)[0] = (*s).r[id * 4] + kit.ln(c, 4)
+    (*out)[2] = (*s).r[id * 4 + 2] - kit.ln(c, 8)
+    (*out)[1] = (*s).r[id * 4 + 1] + (*s).r[id * 4 + 3] + kit.ln(c, 8) + kit.ln(c, 34) * (i as f64)
+    (*out)[3] = kit.ln(c, 34)
+    if i == n {
+        (*out)[0] = (*s).r[id * 4]
+        (*out)[2] = (*s).r[id * 4 + 2]
+        (*out)[1] = (*s).r[id * 4 + 1] + (*s).r[id * 4 + 3] + kit.ln(c, 4)
+        (*out)[3] = kit.ln(c, 34) * (n as f64) + kit.ln(c, 8)
+    }
+}
+
+// the open drop-down list, over everything painted before
+fn end(s: *mut Set, c: *mut render.Ctx) {
+    let id: usize = (*s).open
+    if id == NONE { return }
+    let z: *mut painter.Painter = render.ctx_painter(c)
+    let n: usize = kitform.parts(opts(s, id))
+    var q: [f64; 4] = [0.0; 4]
+    item_rect(s, c, id, n, &q)
+    kit.soft_shadow(c, q[0], q[1], q[2], q[3], kit.ln(c, 8), kit.ln(c, 16), kit.ln(c, 6), 200)
+    painter.round_rect(z, q[0], q[1], q[2], q[3], kit.ln(c, 8), kit.tokc(c, style.TOK_SURFACE_RAISED))
+    painter.round_ring(z, q[0], q[1], q[2], q[3], kit.ln(c, 8), kit.ln(c, 1), kit.tokc(c, style.TOK_BORDER))
+    var i: usize = 0
+    while i < n {
+        item_rect(s, c, id, i, &q)
+        if (*s).px >= q[0] && (*s).px < q[0] + q[2] && (*s).py >= q[1] && (*s).py < q[1] + q[3] {
+            painter.round_rect(z, q[0], q[1], q[2], q[3], kit.ln(c, 6), kit.tokc(c, style.TOK_BUTTON_HOVER))
+        }
+        kitapp.text(c, q[0] + kit.ln(c, 10), q[1], q[3], 13, 400, style.TOK_TEXT, kitform.nth(opts(s, id), i))
+        if (*s).v[id] == i as i64 { kit.sym(c, lucide.CHECK, q[0] + q[2] - kit.ln(c, 28), q[1] + (q[3] - kit.ln(c, 16)) / 2.0, kit.ln(c, 16), kit.accent_gfx(c, style.TOK_SURFACE_RAISED)) }
+        i = i + 1
+    }
+}
+
+fn blur(s: *mut Set) {
+    var i: usize = 0
+    while i < (*s).n {
+        if (*s).k[(*s).reg[i]] == FIELD { kit.search_focus(fld(s, (*s).reg[i]), false) }
+        i = i + 1
+    }
+}
+
+fn clamp_set(s: *mut Set, id: usize, v: i64, lo: i64, hi: i64) {
+    var x: i64 = v
+    if x < lo { x = lo }
+    if x > hi { x = hi }
+    (*s).v[id] = x
+}
+
+// a click at (x, y): returns the id of the control it changed or focused, NONE if it hit nothing
+fn press(s: *mut Set, x: f64, y: f64) -> usize {
+    let c: *mut render.Ctx = (*s).ctx as *mut render.Ctx
+    (*s).now = (*s).now + 1000000
+    if (*s).open != NONE {
+        let id: usize = (*s).open
+        (*s).open = NONE
+        var q: [f64; 4] = [0.0; 4]
+        var i: usize = 0
+        while i < kitform.parts(opts(s, id)) {
+            item_rect(s, c, id, i, &q)
+            if x >= q[0] && x < q[0] + q[2] && y >= q[1] && y < q[1] + q[3] { (*s).v[id] = i as i64; return id }
+            i = i + 1
+        }
+        if inside(s, id, x, y) { return id }
+    }
+    blur(s)
+    (*s).foc = NONE
+    (*s).kbd = false
+    var i: usize = 0
+    while i < (*s).n {
+        let id: usize = (*s).reg[i]
+        i = i + 1
+        if !inside(s, id, x, y) { continue }
+        (*s).foc = id
+        let kind: u32 = (*s).k[id]
+        if kind == TOGGLE { (*s).v[id] = 1 - (*s).v[id] }
+        if kind == SELECT { (*s).open = id }
+        if kind == RADIO {
+            var j: usize = 0
+            while j < 3 && x - (*s).r[id * 4] >= (*s).b[id * 4 + j] { j = j + 1 }
+            (*s).v[id] = j as i64
+        }
+        if kind == SLIDER {
+            let t: f64 = (x - (*s).r[id * 4] - 9.0) / ((*s).r[id * 4 + 2] - 18.0)
+            clamp_set(s, id, (*s).lo[id] + (((*s).hi[id] - (*s).lo[id]) as f64 * t + 0.5) as i64, (*s).lo[id], (*s).hi[id])
+        }
+        if kind == COLORS {
+            clamp_set(s, id, ((x - (*s).r[id * 4]) / ((*s).r[id * 4 + 2] + 10.0) * (kitform.parts(opts(s, id)) as f64)) as i64, 0, kitform.parts(opts(s, id)) as i64 - 1)
+        }
+        if kind == FIELD { kitform.field_box_press(c, fld(s, id), (*s).r[id * 4], (*s).r[id * 4 + 1], (*s).r[id * 4 + 2], (*s).r[id * 4 + 3], x, y, (*s).now) }
+        return id
+    }
+    return NONE
+}
+
+// +1 / -1: the next / previous value of the focused control (radio, colours, slider, list)
+fn step(s: *mut Set, id: usize, d: i64) {
+    let kind: u32 = (*s).k[id]
+    if kind == SLIDER {
+        var st: i64 = ((*s).hi[id] - (*s).lo[id]) / 20
+        if st < 1 { st = 1 }
+        clamp_set(s, id, (*s).v[id] + d * st, (*s).lo[id], (*s).hi[id])
+    }
+    if kind == RADIO || kind == COLORS || kind == SELECT { clamp_set(s, id, (*s).v[id] + d, 0, kitform.parts(opts(s, id)) as i64 - 1) }
+    if kind == TOGGLE { (*s).v[id] = 1 - (*s).v[id] }
+}
+
+fn focus_next(s: *mut Set) {
+    if (*s).n == 0 { return }
+    var at: usize = 0
+    var i: usize = 0
+    while i < (*s).n {
+        if (*s).reg[i] == (*s).foc { at = i + 1 }
+        i = i + 1
+    }
+    blur(s)
+    (*s).open = NONE
+    (*s).foc = (*s).reg[at % (*s).n]
+    (*s).kbd = true
+    if (*s).k[(*s).foc] == FIELD { kit.search_focus(fld(s, (*s).foc), true) }
+}
+
+fn key(s: *mut Set, k: u32, mods: u32) -> bool {
+    let id: usize = (*s).foc
+    if k == editor.KEY_ESC && (*s).open != NONE { (*s).open = NONE; return true }
+    if k == editor.KEY_TAB { focus_next(s); return true }
+    if id == NONE { return false }
+    let kind: u32 = (*s).k[id]
+    if kind == FIELD { return kit.search_key(fld(s, id), k, mods) != editor.RES_PASS }
+    if k == editor.KEY_ENTER {
+        if kind == SELECT { if (*s).open == id { (*s).open = NONE } else { (*s).open = id }; return true }
+        if kind == TOGGLE { step(s, id, 1); return true }
+    }
+    if k == editor.KEY_RIGHT || k == editor.KEY_DOWN { step(s, id, 1); return kind != TOGGLE }
+    if k == editor.KEY_LEFT || k == editor.KEY_UP { step(s, id, 0 - 1); return kind != TOGGLE }
+    return false
+}
+
+// a typed character: into the focused field, else Space = Enter
+fn text(s: *mut Set, cp: u32, mods: u32) -> bool {
+    let id: usize = (*s).foc
+    if id == NONE { return false }
+    if (*s).k[id] == FIELD { kit.search_char(fld(s, id), cp, mods); return true }
+    if cp == 32 as u32 { return key(s, editor.KEY_ENTER, mods) }
+    return false
+}

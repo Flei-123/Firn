@@ -772,6 +772,16 @@ done
 echo "  notes 1100x700 shot, light + dark   OK"
 build mdedit
 "$W/mdedit"
+"$FIRNC" --opt-level=dev -o "$W/fuiapp_settings" examples/fui_apps/settings/main.fi
+for th in light dark; do
+    "$W/fuiapp_settings" --theme $th --shot "$W/settings-$th.png"
+    [ "$(wc -c < "$W/settings-$th.png")" -gt 15000 ] || { echo "  settings $th shot too small"; exit 1; }
+done
+"$W/fuiapp_settings" --theme dark --open --shot "$W/settings-open.png"
+[ "$(wc -c < "$W/settings-open.png")" -gt 15000 ] || { echo "  settings open-list shot too small"; exit 1; }
+echo "  settings 1100x700 shot, light + dark + open list   OK"
+build kitset
+"$W/kitset"
 
 echo
 echo "== 18p6. THE LAUNCHER KIT IN A REAL WINDOW (Xvfb, xdotool, xwd) =="
