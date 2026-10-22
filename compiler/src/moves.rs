@@ -609,10 +609,15 @@ impl<'a> Walk<'a> {
                     }
                     None => false,
                 };
+                let explicit_drop = crate::impls::method_name(name) == Some("drop");
                 for (i, a) in args.iter().enumerate() {
                     if i == 0 && by_address_recv {
-                        self.temp_check(a);
-                        self.read(a);
+                        if explicit_drop && matches!(a.kind, ExprKind::Ident(_)) && self.is_nt(a) {
+                            self.consume(a);
+                        } else {
+                            self.temp_check(a);
+                            self.read(a);
+                        }
                     } else {
                         self.consume(a);
                     }

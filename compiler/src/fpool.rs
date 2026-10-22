@@ -80,7 +80,7 @@ pub fn rodata_asm() -> String {
         if p.is_empty() {
             return;
         }
-        out.push_str(".section .rodata\n");
+        out.push_str(&format!("{}\n", crate::target::rodata()));
         for (i, (bits, single)) in p.iter().enumerate() {
             if *single {
                 out.push_str("    .align 4\n");

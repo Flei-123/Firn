@@ -35,6 +35,7 @@ mod comptime;
 mod env;
 mod config;
 mod checkmode;
+mod stackguard;
 mod ct;
 mod diag;
 mod dwarf;

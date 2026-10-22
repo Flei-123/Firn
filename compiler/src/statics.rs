@@ -213,7 +213,7 @@ pub fn data_asm() -> String {
         for s in t.iter() {
             let zero = s.bytes.iter().all(|b| *b == 0);
             let section = if !s.mutable {
-                ".section .rodata"
+                crate::target::rodata()
             } else if zero {
                 if crate::target::windows() {
                     ".section .bss,\"bw\""

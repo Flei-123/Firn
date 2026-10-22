@@ -199,13 +199,23 @@ pub fn pic() -> bool {
     PIC.with(|p| p.get())
 }
 
+/// The read-only data section. A Windows PE gets `"dr"`, otherwise mingw `as`
+/// makes `.rodata` read+write (0xC0000040).
+pub fn rodata() -> &'static str {
+    if windows() {
+        ".section .rodata,\"dr\""
+    } else {
+        ".section .rodata"
+    }
+}
+
 /// The section for a table that holds addresses. Without `--pic`
 /// exactly what stood there before.
 pub fn reloc_rodata() -> &'static str {
     if pic() {
         ".section .data.rel.ro"
     } else {
-        ".section .rodata"
+        rodata()
     }
 }
 

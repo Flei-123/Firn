@@ -2251,6 +2251,15 @@ if [ "$F148RC" -eq 0 ]; then
 else
     bad "tools/diff_c0c1.sh failed (see .test-work/diff148.log)"
     grep -E '^DEVIATION' "$WORK/diff148.log" | head -12 | sed 's/^/   /' || true
+echo "== 149. memory-safety UB probes recorded per build level (tools/safety/run.sh against tools/safety/expected.txt, docs/SAFETY.md; tools/safety/pe.sh: Windows .rodata read-only) =="
+FIRNC="$FIRNC" bash tools/safety/run.sh > "$WORK/safety149.log" 2>&1 && F149RC=0 || F149RC=$?
+FIRNC="$FIRNC" bash tools/safety/pe.sh >> "$WORK/safety149.log" 2>&1 || F149RC=1
+if [ "$F149RC" -eq 0 ]; then
+    ok
+    tail -2 "$WORK/safety149.log" | sed 's/^/ /'
+else
+    bad "tools/safety/run.sh failed (see .test-work/safety149.log)"
+    grep -E '^[-+][a-z]|^FAIL' "$WORK/safety149.log" | head -12 | sed 's/^/   /' || true
 fi
 
 TOTAL=$((PASS + FAIL))

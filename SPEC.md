@@ -403,6 +403,14 @@ justification as a comment (`--deny=undocumented-unsafe`, the default in the
 `kernel` profile). Satisfies `L3` -- the rasterizer cannot be written fast
 without this exception.
 
+**Implementation status (r908, 22.10.2026).** The rule above is the target, not
+what `firnc0`/`firnc1` enforce today: there is no `unsafe { }` block yet (it is a
+parse error) and raw pointer dereference, pointer arithmetic and casts are
+accepted everywhere, in every profile and build level (tests `4710`,
+`tools/safety/ub/ub25`). The whole library is written that way. Enforcing the
+rule means adding the block and marking every existing site first; until then
+`L3` holds by convention only. `docs/SAFETY.md` N16.
+
 #### 3.6.1 A raw pointer must not outlive its frame (round 79)
 
 The address of a LOCAL -- a `let`/`var`, an array or a field of one, or a

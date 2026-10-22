@@ -377,6 +377,10 @@ pub fn emit(m: &Module) -> Result<String, String> {
     e.raw(".globl _start");
     e.raw("_start:");
     e.line("xor rbp, rbp");
+    let stack_guard = crate::stackguard::enabled();
+    if stack_guard {
+        crate::stackguard::emit_start(&mut e);
+    }
     // HOOK gc (ROUND 88): THE COLLECTOR STARTS ITSELF.
     //
     // Whoever writes `let b = a + " and more"` allocates on the GC heap --
@@ -420,6 +424,9 @@ pub fn emit(m: &Module) -> Result<String, String> {
     }
     e.line("syscall");
     e.line("hlt");
+    if stack_guard {
+        crate::stackguard::emit_tail(&mut e);
+    }
     }
 
     if !freestanding && !no_start && !m.funcs.iter().any(|f| f.name == "main") {

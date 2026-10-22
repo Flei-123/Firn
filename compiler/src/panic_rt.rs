@@ -214,7 +214,7 @@ pub fn rodata_asm() -> String {
         if t.msgs.is_empty() {
             return;
         }
-        out.push_str(".section .rodata\n");
+        out.push_str(&format!("{}\n", crate::target::rodata()));
         for (i, m) in t.msgs.iter().enumerate() {
             out.push_str(&format!("{}:\n", label_of(i)));
             out.push_str(&format!("    .ascii \"{}\"\n", crate::fir::asm_escape(m)));
