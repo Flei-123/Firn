@@ -46,11 +46,11 @@ contacts = [
     {"id": 6, "name": "Team Fleitec", "initials": "TE", "color": "#4db6ac", "unread": 0},
 ]
 lines = [
-    "Hey, bist du da?", "Jo, was gibt's?", "Hast du den neuen Build gesehen?", "Ja, sieht gut aus :)",
-    "Wann treffen wir uns?", "Morgen um 15 Uhr?", "Passt, bis dann!", "Kannst du das Foto schicken?",
-    "Klar, gleich", "Danke dir!", "Lust auf Minecraft heute Abend?", "Immer, 20 Uhr?",
-    "Ich bring den Server hoch", "Top :D", "Hast du die Datei bekommen?", "Ja, alles angekommen",
-    "Super, dann machen wir weiter", "Kurze Pause, bin gleich zurueck", "Okay", "Bis spaeter",
+    "Hey, are you there?", "Yep, what's up?", "Did you see the new build?", "Yes, looks good :)",
+    "When do we meet?", "Tomorrow at 3 pm?", "Works, see you then!", "Can you send the photo?",
+    "Sure, right away", "Thank you!", "Up for Minecraft tonight?", "Always, 8 pm?",
+    "I'll bring the server up", "Nice :D", "Did you get the file?", "Yes, everything arrived",
+    "Great, let's continue", "Short break, back soon", "Okay", "See you later",
 ]
 messages = []
 t = BASE - dt.timedelta(days=2, hours=3)

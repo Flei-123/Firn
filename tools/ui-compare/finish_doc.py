@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Regenerate the '## Results' section of docs/UI-VERGLEICH.md from results/*.json.
-Usage: finish_doc.py <path to UI-VERGLEICH.md>"""
+"""Regenerate the '## Results' section of docs/UI-COMPARISON.md from results/*.json.
+Usage: finish_doc.py <path to UI-COMPARISON.md>"""
 import datetime
 import json
 import os

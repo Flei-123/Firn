@@ -354,9 +354,9 @@ sleep 8 # the first poll only learns the last event id
 open_sidebar; sidebar_new # an empty chat: the history of the event's chat must show up after the tap
 $ADB shell input keyevent KEYCODE_HOME; sleep 3
 check "the app is in the background" "$($ADB shell dumpsys activity activities | grep -c "topResumedActivity=.*$PKG")" 0
-push "Worker done" "Merge finished äö"
+push "Worker done" "Merge finished äö" # english: ok
 for _ in $(seq 20); do note_lines | grep -q 'Worker done' && break; sleep 1; done
-check "a real notification: title | text" "$(note_lines | grep 'Worker done' | head -1)" "Worker done | Merge finished äö"
+check "a real notification: title | text" "$(note_lines | grep 'Worker done' | head -1)" "Worker done | Merge finished äö" # english: ok
 check "the process lives on (foreground service)" "$($ADB shell pidof $PKG)" "$P1"
 check "the service text is neutral (no 'Relay')" "$(notes | grep -A25 "pkg=$PKG" | grep -ci 'relay')" 0
 push "Second" "another line"
@@ -387,7 +387,7 @@ shot 09_after_tap
 check "tap: the chat of the event is on screen (its history 'hi / hello')" "$(OCR_TRIES=10 wait_ocr 09_after_tap 'hello')" 1
 # r141: the header pill "opening the chat of the notification" goes away once the history is in (status back to online)
 sleep 3; shot 09_pill
-check "tap: the header pill 'opening the chat' is gone after the history" "$(ocr 09_pill | grep -ci 'ffne den Chat')" 0
+check "tap: the header pill 'opening the chat' is gone after the history" "$(ocr 09_pill | grep -ci 'ffne den Chat')" 0 # english: ok
 echo "  tap the notification of c2"
 $ADB shell input keyevent KEYCODE_HOME; sleep 3
 tap_note "Chat two again"
