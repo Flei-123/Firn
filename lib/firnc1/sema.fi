@@ -77,6 +77,8 @@ struct Sema {
     w32: Vec[u8],
     v_name: Vec[u32], // scopes: names, types and bounds
     v_ty: Vec[u32],
+    v_mut: Vec[u32], // 1 = declared with `var`; params, `for` and match bindings are fixed
+    lv_fixed: u32, // set by `lvalue`: 1 = the place cannot be written (sema.rs::Mutability::Fixed)
     b_limit: Vec[u32],
     k_name: Vec[u32], // constants
     k_ty: Vec[u32],
@@ -151,7 +153,7 @@ fn sema_new(b: u64, it: u64) -> Sema {
         b: b, it: it,
         ty: types.types_new(),
         etyp: vec_new[u32](), w32: vec_new[u8](),
-        v_name: vec_new[u32](), v_ty: vec_new[u32](), b_limit: vec_new[u32](),
+        v_name: vec_new[u32](), v_ty: vec_new[u32](), v_mut: vec_new[u32](), lv_fixed: 0, b_limit: vec_new[u32](),
         k_name: vec_new[u32](), k_ty: vec_new[u32](), k_value: vec_new[u64](),
         k_toff: vec_new[u32](), k_tlen: vec_new[u32](), k_tdata: rt.buf_new(),
         g_name: vec_new[u32](), g_ty: vec_new[u32](), g_mut: vec_new[u32](),
@@ -184,6 +186,7 @@ fn sema_free(s: *mut Sema) {
     vec_free[u8](&(*s).w32)
     vec_free[u32](&(*s).v_name)
     vec_free[u32](&(*s).v_ty)
+    vec_free[u32](&(*s).v_mut)
     vec_free[u32](&(*s).b_limit)
     vec_free[u32](&(*s).g_name)
     vec_free[u32](&(*s).g_ty)
@@ -641,12 +644,29 @@ fn range_off(s: *mut Sema) {
     while vec_len[u32](&(*s).v_name) > g as usize {
         vec_pop[u32](&(*s).v_name)
         vec_pop[u32](&(*s).v_ty)
+        vec_pop[u32](&(*s).v_mut)
     }
 }
 
 fn var_create(s: *mut Sema, name: u32, t: u32) {
+    var_create_m(s, name, t, 0)
+}
+
+fn var_create_m(s: *mut Sema, name: u32, t: u32, m: u32) {
     vec_push[u32](&(*s).v_name, name)
     vec_push[u32](&(*s).v_ty, t)
+    vec_push[u32](&(*s).v_mut, m)
+}
+
+fn var_is_mut(s: *mut Sema, name: u32) -> bool {
+    var i: usize = vec_len[u32](&(*s).v_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*s).v_name, i) == name {
+            return vec_at[u32](&(*s).v_mut, i) != 0
+        }
+    }
+    return false
 }
 
 // r900: is the name already declared in the innermost block (sema.rs::declare_var)?
@@ -913,7 +933,64 @@ fn convertible(s: *mut Sema, t: u32) -> bool {
 
 // Resolves a type expression of the tree.
 fn ast_ty(s: *mut Sema, te: u32) -> u32 {
-    return types.resolve(table(s), tree(s), names(s), te)
+    let before: u32 = types.types_unknown(table(s))
+    let r: u32 = types.resolve(table(s), tree(s), names(s), te)
+    if types.types_unknown(table(s)) != before {
+        complain(s)
+    }
+    return r
+}
+
+// r912 (sema.rs::collect_structs / collect_fns / check_main): a struct or a function declared
+// twice, and a `main` that is not `fn main()` / `fn main(u64)` returning `i32`.
+fn check_declarations(s: *mut Sema) {
+    let b: *mut ast.Tree = tree(s)
+    var seen: Vec[u8] = vec_new[u8]()
+    var i: usize = 0
+    while i < ast.structure_count(b) {
+        let n: usize = ast.structure_name(b, i) as usize
+        while vec_len[u8](&seen) <= n {
+            vec_push[u8](&seen, 0 as u8)
+        }
+        if vec_at[u8](&seen, n) != 0 as u8 {
+            complain(s)
+        }
+        vec_set[u8](&seen, n, 1 as u8)
+        i = i + 1
+    }
+    vec_clear[u8](&seen)
+    var main_nr: i64 = -1
+    var m: [u8; 4] = "main"
+    main_nr = intern.intern_find(names(s), (&m[0]) as u64, 4)
+    i = 0
+    while i < ast.fn_count(b) {
+        let n: usize = ast.fn_name(b, i) as usize
+        while vec_len[u8](&seen) <= n {
+            vec_push[u8](&seen, 0 as u8)
+        }
+        if vec_at[u8](&seen, n) != 0 as u8 {
+            complain(s)
+        }
+        vec_set[u8](&seen, n, 1 as u8)
+        if n as i64 == main_nr {
+            let rk: u32 = types.ty_kind(table(s), types.ret_ty_the_func(table(s), i))
+            var ok: bool = rk == types.K_I32
+            if ast.fn_plen(b, i) > 1 {
+                ok = false
+            }
+            if ast.fn_plen(b, i) == 1 {
+                let pk: u32 = types.ty_kind(table(s), types.param_ty_resolved(table(s), i, 0))
+                if pk != types.K_U64 && pk != types.K_USIZE {
+                    ok = false
+                }
+            }
+            if !ok {
+                complain(s)
+            }
+        }
+        i = i + 1
+    }
+    vec_free[u8](&seen)
 }
 
 // ---------------------------------------------------------------- probe
@@ -2117,11 +2194,16 @@ fn lvalue(s: *mut Sema, e: u32) -> u32 {
         let v: u32 = var_search(s, ast.e_a(b, e))
         if v != NONE {
             remember(s, e, v)
+            (*s).lv_fixed = 1
+            if var_is_mut(s, ast.e_a(b, e)) {
+                (*s).lv_fixed = 0
+            }
             return v
         }
         let k: u32 = const_search(s, ast.e_a(b, e))
         if k != NONE {
             remember(s, e, k)
+            (*s).lv_fixed = 1
             return k
         }
         // ROUND 89 -- a `static` IS a place, but only `static mut` may be
@@ -2132,10 +2214,12 @@ fn lvalue(s: *mut Sema, e: u32) -> u32 {
                 complain(s)
             }
             remember(s, e, g)
+            (*s).lv_fixed = 0
             return g
         }
         complain(s)
         remember(s, e, (*s).t_error)
+        (*s).lv_fixed = 0
         return (*s).t_error
     }
     if a == ast.E_FIELD {
@@ -2152,6 +2236,7 @@ fn lvalue(s: *mut Sema, e: u32) -> u32 {
             if gc.gc_is_gc_ptr(gcp(s), table(s), gt) {
                 let ft: u32 = field_ty(s, gt, ast.e_b(b, e))
                 remember(s, e, ft)
+                (*s).lv_fixed = 0
                 return ft
             }
             complain(s)
@@ -2161,8 +2246,10 @@ fn lvalue(s: *mut Sema, e: u32) -> u32 {
         if bt == NONE {
             return NONE
         }
+        let fx: u32 = (*s).lv_fixed
         let t: u32 = field_ty(s, bt, ast.e_b(b, e))
         remember(s, e, t)
+        (*s).lv_fixed = fx
         return t
     }
     if a == ast.E_IDX {
@@ -2170,8 +2257,13 @@ fn lvalue(s: *mut Sema, e: u32) -> u32 {
         if bt == NONE {
             return NONE
         }
+        var fx: u32 = (*s).lv_fixed
         let t: u32 = index_ty(s, bt, ast.e_b(b, e))
         remember(s, e, t)
+        if str_like(s, bt) {
+            fx = 1
+        }
+        (*s).lv_fixed = fx
         return t
     }
     if a == ast.E_UN && ast.e_a(b, e) == 3 {
@@ -2183,6 +2275,7 @@ fn lvalue(s: *mut Sema, e: u32) -> u32 {
             complain(s)
         }
         remember(s, e, t)
+        (*s).lv_fixed = 0
         return t
     }
     infer(s, e)
@@ -2239,6 +2332,10 @@ fn unary(s: *mut Sema, e: u32, note: u32) -> u32 {
         (*s).addr_depth = (*s).addr_depth + 1
         let t: u32 = lvalue(s, inner)
         (*s).addr_depth = (*s).addr_depth - 1
+        if t != NONE && op == 5 && (*s).lv_fixed != 0 {
+            complain(s)
+            return (*s).t_error
+        }
         if t == NONE || is_error(s, t) {
             return (*s).t_error
         }
@@ -5128,7 +5225,11 @@ fn stmt(s: *mut Sema, i: u32) {
         if declared_here(s, ast.s_a(b, i)) {
             complain(s)
         }
-        var_create(s, ast.s_a(b, i), t)
+        var mu: u32 = 0
+        if a == ast.S_VAR {
+            mu = 1
+        }
+        var_create_m(s, ast.s_a(b, i), t, mu)
         return
     }
     if a == ast.S_ZUW {
@@ -5136,6 +5237,9 @@ fn stmt(s: *mut Sema, i: u32) {
         if t == NONE {
             expr(s, ast.s_b(b, i), (*s).t_i64)
             return
+        }
+        if (*s).lv_fixed != 0 {
+            complain(s)
         }
         // HOOK error unions: implicit conversion in an assignment.
         if has_fe(s) && coerce_check(s, ast.s_b(b, i), t) {
@@ -5155,6 +5259,9 @@ fn stmt(s: *mut Sema, i: u32) {
         if t == NONE {
             expr(s, ast.s_b(b, i), (*s).t_i64)
             return
+        }
+        if (*s).lv_fixed != 0 {
+            complain(s)
         }
         // HOOK ptrarith (round GAPS): `p += n` / `p -= n`.
         if (ast.s_c(b, i) == 0 || ast.s_c(b, i) == 1) && arith_ptr(s, t) {
@@ -5182,6 +5289,9 @@ fn stmt(s: *mut Sema, i: u32) {
         let t: u32 = lvalue(s, ast.s_a(b, i))
         if t == NONE {
             return
+        }
+        if (*s).lv_fixed != 0 {
+            complain(s)
         }
         if !is_error(s, t) && !is_int(s, t) && !arith_ptr(s, t) {
             complain(s)
@@ -5655,6 +5765,10 @@ fn sema_run(s: *mut Sema) {
     // 1. Struct layout and function signatures -- the same computation as
     //    in `types.fi`, here once for everything.
     types.types_resolve(table(s), b, names(s))
+    if types.types_unknown(table(s)) != 0 {
+        complain(s)
+    }
+    check_declarations(s)
     // 1a. Interfaces: check every implementation completely -- all methods
     //    present, all signatures matching (`hook_check_impls` in stage 0). Runs
     //    AFTER the signatures and BEFORE the bodies.
