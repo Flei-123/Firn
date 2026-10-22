@@ -10,6 +10,7 @@
 //   cat3                 "a" + "sep" + "b" as one str (a small ring of buffers; use the result at once)
 import std.rt
 import plat.assetio
+import paint.canvas
 import fui.kit
 import fui.screenax
 import fui.widget
@@ -56,7 +57,7 @@ fn fsqrt(v: f64) -> f64 {
 
 // The page ground in the box (x, y, w, h): lights in the accent (top left, low middle) and a blue one (right), then the grid.
 // `accent` = 0xRRGGBB. Paint it FIRST, the panels of the page over it.
-fn ground_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, accent: u32, blue: u32) {
+fn ground_paint(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, accent: u32, blue: u32) {
     let z: *mut painter.Painter = render.ctx_painter(c)
     // lights on a dark ground only (on a light page they would grey it)
     if theme.luminance(kit.tokc(c, style.TOK_BASE) & 16777215 as u32) > 0.3 { return }
@@ -93,6 +94,50 @@ fn ground_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, accent: u32, 
         }
         gy = gy + cell
     }
+}
+
+static mut GROUND_BUF: u64 = 0
+static mut GROUND_KEY: u64 = 0
+static mut GROUND_LEN: usize = 0
+
+fn ground_mix(k: u64, v: u64) -> u64 {
+    return (k * 1000003 + v) % 4294967291
+}
+
+fn ground_key(cv: *mut canvas.Canvas, cw: usize, ch: usize, accent: u32, blue: u32) -> u64 {
+    var k: u64 = ground_mix(cw as u64, ch as u64)
+    k = ground_mix(k, accent as u64)
+    k = ground_mix(k, blue as u64)
+    k = ground_mix(k, canvas.canvas_get(cv, 0, 0) as u64)
+    k = ground_mix(k, canvas.canvas_get(cv, cw - 1, 0) as u64)
+    k = ground_mix(k, canvas.canvas_get(cv, 0, ch - 1) as u64)
+    k = ground_mix(k, canvas.canvas_get(cv, cw - 1, ch - 1) as u64)
+    k = ground_mix(k, canvas.canvas_get(cv, cw / 2, ch / 2) as u64)
+    return k
+}
+
+fn ground_draw(c: *mut render.Ctx, x: f64, y: f64, w: f64, h: f64, accent: u32, blue: u32) {
+    let cv: *mut canvas.Canvas = painter.painter_canvas(render.ctx_painter(c))
+    let cw: usize = canvas.canvas_width(cv)
+    let ch: usize = canvas.canvas_height(cv)
+    let full: bool = x == 0.0 && y == 0.0 && w == cw as f64 && h == ch as f64 && cw > 1 && ch > 1
+    if !full || canvas.canvas_gpu(cv) != 0 || canvas.clip_depth(cv) != 0 || canvas.canvas_pixels(cv) as u64 == 0 {
+        ground_paint(c, x, y, w, h, accent, blue)
+        return
+    }
+    let key: u64 = ground_key(cv, cw, ch, accent, blue)
+    let n: usize = cw * ch * 4
+    if GROUND_BUF != 0 && GROUND_KEY == key && GROUND_LEN == n {
+        rt.mem_copy(canvas.canvas_pixels(cv) as u64, GROUND_BUF, n)
+        return
+    }
+    ground_paint(c, x, y, w, h, accent, blue)
+    if GROUND_LEN != n {
+        GROUND_BUF = rt.heap_alloc(n)
+        GROUND_LEN = n
+    }
+    rt.mem_copy(GROUND_BUF, canvas.canvas_pixels(cv) as u64, n)
+    GROUND_KEY = key
 }
 
 // -- buttons and cards ----------------------------------------------------------------------------
@@ -152,6 +197,8 @@ struct Pic {
     view: uiimage.Image,
     file: rt.Buf,
     ok: bool,
+    cache: u64,
+    cache_d: usize,
 }
 
 // Read and decode a PNG/JPEG/WebP/GIF asset (once, keep the result); not ok when it is missing or no picture.
@@ -161,6 +208,8 @@ fn pic_load(name: str) -> *mut Pic {
     (*p).view = uiimage.image_new()
     (*p).file = rt.buf_new()
     (*p).ok = false
+    (*p).cache = 0
+    (*p).cache_d = 0
     if assetio.read(name, &(*p).file) {
         (*p).ok = uiimagedec.image_from_bytes(rt.buf_ptr(&(*p).file), rt.buf_len(&(*p).file), &(*p).dec, &(*p).view)
     }
@@ -183,8 +232,22 @@ fn pic_draw(c: *mut render.Ctx, p: *mut Pic, x: f64, y: f64, d: f64, r: f64, bg:
     let ox: usize = (w - side) / 2
     let oy: usize = (h - side) / 2
     var sub: uiimage.Image = uiimage.image_wrap((*p).view.px + (oy * (*p).view.stride + ox * 4) as u64, side, side, (*p).view.stride)
-    uiimage.image_draw_rect(z, &sub, x, y, d, d, 0 as u32)
+    let di: usize = d as usize
+    if di >= 1 && di <= 1024 && di as f64 == d {
+        pic_cache_fill(p, &sub, di)
+        var scaled: uiimage.Image = uiimage.image_wrap((*p).cache, di, di, di * 4)
+        uiimage.image_draw_rect(z, &scaled, x, y, d, d, 0 as u32)
+    } else {
+        uiimage.image_draw_rect(z, &sub, x, y, d, d, 0 as u32)
+    }
     painter.round_ring(z, x - r, y - r, d + 2.0 * r, d + 2.0 * r, 2.0 * r, r, bg)
+}
+
+fn pic_cache_fill(p: *mut Pic, sub: *mut uiimage.Image, di: usize) {
+    if (*p).cache != 0 && (*p).cache_d == di { return }
+    (*p).cache = rt.heap_alloc(di * di * 4)
+    (*p).cache_d = di
+    uiimage.image_box_fill(sub, (*p).cache, di)
 }
 
 fn pic_draw_plain(c: *mut render.Ctx, p: *mut Pic, x: f64, y: f64, w: f64, h: f64) {

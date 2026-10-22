@@ -7,7 +7,7 @@ FIRNC=${FIRNC:-/root/firn/compiler/target/release/firnc}
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 APPS=${APPS:-"settings form"}
-bash "$R/tools/fui/screenwin/pack.sh" "$D/win" $APPS || exit 2
+OPT=dev bash "$R/tools/fui/screenwin/pack.sh" "$D/win" $APPS || exit 2
 export WINEPREFIX=$D/wp WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=d" DISPLAY=
 bad=0
 for a in $APPS; do
