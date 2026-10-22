@@ -58,6 +58,7 @@ mod layout;
 mod lexer;
 mod licm;
 mod tailrec;
+mod guardsplit;
 mod phi;
 mod lower;
 mod lower_errors;

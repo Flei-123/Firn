@@ -235,6 +235,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "self tail calls (and `e + f(..)`, `e * f(..)`, or, xor accumulator forms) become a loop; runs once at the end of the fixpoint (FIRN_NO_TAILREC=1 switches it off)",
     },
     PassInfo {
+        name: "guardsplit",
+        scope: Scope::Module,
+        debug_preserving: false,
+        what: "the pure entry guard of a self-recursive function runs at its recursive call sites, only failing calls stay calls (FIRN_NO_GUARDSPLIT=1 switches it off)",
+    },
+    PassInfo {
         name: "thread-bool",
         scope: Scope::Func,
         debug_preserving: true,
@@ -485,6 +491,15 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
             if k == 0 {
                 break;
             }
+        }
+    }
+    if cfg.runs("guardsplit") && std::env::var_os("FIRN_NO_GUARDSPLIT").is_none() {
+        let t = std::time::Instant::now();
+        let changed = crate::guardsplit::run(m);
+        clk.add("guardsplit", t);
+        for ci in changed {
+            phi_check(&m.funcs[ci], "guardsplit");
+            optimize_func(&mut m.funcs[ci], &mut st, cfg, &mut clk);
         }
     }
     if cfg.runs("inline") {
