@@ -2242,6 +2242,17 @@ else
     grep -E 'FAIL' "$WORK/webglloss141.log" | head -12 | sed 's/^/   /' || true
 fi
 
+echo "== 148. differential test firnc0 against firnc1 (419 generated programs: errors, overflow, casts, shifts, layout, ABI, optimized builds; tools/diff_c0c1.sh, tests/diff, r900) =="
+# Heavy (about 4 minutes on an idle machine): the whole corpus at four build levels in both compilers.
+FIRNC="$FIRNC" bash tools/diff_c0c1.sh > "$WORK/diff148.log" 2>&1 && F148RC=0 || F148RC=$?
+if [ "$F148RC" -eq 0 ]; then
+    ok
+    grep -E '^(programs|DEVIATIONS|UNSUPPORTED)' "$WORK/diff148.log" | sed 's/^/ /'
+else
+    bad "tools/diff_c0c1.sh failed (see .test-work/diff148.log)"
+    grep -E '^DEVIATION' "$WORK/diff148.log" | head -12 | sed 's/^/   /' || true
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
