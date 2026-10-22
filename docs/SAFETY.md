@@ -25,6 +25,9 @@ skipped in release-fast by `// not_mode: opt`). Measured behaviour in release-fa
 | `i32::MAX + 1` | P | wraps (exit 7) | ub09 |
 | `0usize - 1` | P | wraps | ub10 |
 | `x / 0` | P | T (SIGFPE 136) | ub11 |
+| `-i32::MIN` | P | wraps to MIN (exit 7) | ub14 |
+| `1u32 << 40` | P | count modulo 32 (exit 8) | ub15 |
+| `i32::MIN / -1` | P | wraps to MIN, `% -1` is 0 | tests `4815` |
 | `300i64 as u8` | P | truncates (44) | ub12 |
 | array index 4 of `[i32; 4]` | P | reads the stack, no check | ub06 |
 | `str` index past the end | P | no check | ub07 |
@@ -50,6 +53,9 @@ skipped in release-fast by `// not_mode: opt`). Measured behaviour in release-fa
 | G14 | `rt.heap_free` of a block that is already free (cached block): message `firn: double free (heap_free)`, exit 101, in every build level. Detection is a mark word at offset 8 (`p ^ FREE_MARK`) set when the block is cached and cleared when it is handed out again: one load and one store per call | P | `4730`, `4731`, `4734` (reuse stays clean), ub16, ub18 |
 | G15 | Stack overflow by unbounded recursion: `firn: stack overflow`, exit 101 (SIGSEGV handler on an alternate stack; it only claims faults within 1 MiB of the faulting `rsp`, any other SIGSEGV stays 139). Levels dev, dev-fast, release-safe; Linux x86-64 user programs, main thread | P | `4732`, `4733` (null deref still 139), ub05 |
 | G16 | An explicit `x.drop()` on a local with a `drop` is a move: no second drop at scope end, reading `x` afterwards is rejected | C + codegen | `4711`, neg `4735` |
+| G17 | `-MIN` (`-i32::MIN`, `-i64::MIN`, any signed width) | P (release-fast wraps to `MIN`) | `4810`, `4811`, ub13, ub14 |
+| G18 | Shift count outside `0 .. bits-1` (also negative, also `<<=`) | P (release-fast: count modulo the width) | `4812`, `4813`, `4814`, ub15 |
+| G19 | `MIN / -1`, `MIN % -1` | P (release-fast: `MIN`, `0`, no SIGFPE) | `4815`, `div_*_min_m1_i32` |
 
 ## Non-guarantees (nothing catches these)
 
@@ -70,8 +76,8 @@ Green tests that PIN the current behaviour: `4709`-`4712`. Everything else is in
 | N10 | Two raw pointers to one local; raw pointer plus `inout` of the same place in DIFFERENT statements | accepted, defined by execution order | ub23, green pin `4709` |
 | N11 | `Vec[T]` is a trivial type (ptr/len/cap): copying and passing by value does not move it, no use-after-move | accepted | green pin `4712` |
 | N13 | `Gc[T]` hidden as integer or stored in untyped memory (`rt.heap_alloc`) is NOT a root | object is collected while the integer still holds the address | ub24 |
-| N14 | `-MIN` (`-i32::MIN`, `-i64::MIN`) | NOT checked in any level, stays negative | ub13, ub14 |
-| N15 | Shift by >= bit width | NOT checked; x86-64 masks the count (`1u32 << 40 == 256`), aarch64 differs | ub15 |
+| N14 | (closed by G17, r903) | | |
+| N15 | (closed by G18, r914) | | |
 | N16 | `unsafe { }` | NOT in stage 0 (parse error). Raw pointer deref and casts are allowed everywhere. SPEC 3.6 now says so (implementation status, r908): the rule is the target | ub25, green pin `4710` |
 | N17 | Data races between threads, `Gc[T]` crossing threads | not analysed (no `Send` check) | not tested |
 | N18 | Exclusivity of `inout` across statements and through callees: a callee can turn a reference into a raw pointer | not checked (SPEC 1560, ROADMAP r193) | ub23 |
@@ -96,7 +102,6 @@ Green tests that PIN the current behaviour: `4709`-`4712`. Everything else is in
 ## Gaps (roadmap)
 
 - Kernel W^X (page tables + PHDRS + `noexecstack`).
-- `-MIN` negation and shift count checks in the safe levels (N14, N15).
 - Stack overflow guard for release-fast, threads (own `sigaltstack` per thread), aarch64 (`panic_rt_a64`/startup, fUi owns it) and Windows (N3).
 - Use after `heap_free` (reads of cached blocks return 0, no detection) and double free of uncached blocks (N5, N6, N8, N9).
 - Make `Vec` / `Buf` non-trivial (move semantics) or add a `drop` that is checked (N7, N11).

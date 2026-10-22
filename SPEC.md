@@ -1375,6 +1375,22 @@ brackets a line break has never ended anything and still does not. Proof:
   | `release-safe` | yes |
   | `release-fast` | no -- wraps, silently and by definition |
 
+  **Negation, `MIN / -1` and shifts (r903, r913, r914).** The same table
+  holds for three more cases, and the release-fast side is DEFINED, in both
+  compilers and on every backend:
+
+  | case | `dev` / `dev-fast` / `release-safe` | `release-fast` |
+  |---|---|---|
+  | `-x` for a signed `x == MIN` | panic (`integer overflow in '-i32'`) | wraps: `-MIN == MIN` |
+  | `MIN / -1`, `MIN % -1` (signed) | panic | wraps: `MIN / -1 == MIN`, `MIN % -1 == 0`; never a hardware trap |
+  | `x << n`, `x >> n` with `n` outside `0 .. bits-1` | panic (`shift amount out of range`) | `n` is taken modulo the width: modulo 32 for types up to 32 bits, modulo 64 for 64-bit types |
+
+  `bits` is the width of the LEFT operand. The count may have any integer
+  type; a negative count is out of range (the test is unsigned). The check
+  covers `<<=` and `>>=` too. A literal count below the width needs no test
+  and costs nothing. `x / 0` stays a panic in the checked levels and a
+  hardware trap in release-fast. Tests `4810`-`4816`, probes `ub13`-`ub15`.
+
   In addition there are explicit operators that are NEVER checked, in any
   level, on purpose: `+% -% *%` (wrapping) and `+| -| *|` (saturating) --
   written where the wrap-around itself is the point (a hash function's own
