@@ -3135,7 +3135,33 @@ impl<'a> Fx<'a> {
                     (_, true) => pick(w::I32_REM_S, w::I64_REM_S),
                     (_, false) => pick(w::I32_REM_U, w::I64_REM_U),
                 };
-                self.num(n);
+                if s && ty.bits() >= 32 {
+                    let (ta, tb, tr) = (self.tmp(vt), self.tmp(vt), self.tmp(vt));
+                    self.ins(Ins::LocalSet(tb));
+                    self.ins(Ins::LocalSet(ta));
+                    self.ins(Ins::LocalGet(tb));
+                    self.ins(if wide { Ins::I64Const(-1) } else { Ins::I32Const(-1) });
+                    self.num(pick(w::I32_EQ, w::I64_EQ));
+                    self.ins(Ins::If);
+                    self.ins(if wide { Ins::I64Const(0) } else { Ins::I32Const(0) });
+                    if op == BinOp::Div {
+                        self.ins(Ins::LocalGet(ta));
+                        self.num(pick(w::I32_SUB, w::I64_SUB));
+                    }
+                    self.ins(Ins::LocalSet(tr));
+                    self.ins(Ins::Else);
+                    self.ins(Ins::LocalGet(ta));
+                    self.ins(Ins::LocalGet(tb));
+                    self.num(n);
+                    self.ins(Ins::LocalSet(tr));
+                    self.ins(Ins::End);
+                    self.ins(Ins::LocalGet(tr));
+                    self.release(vt, ta);
+                    self.release(vt, tb);
+                    self.release(vt, tr);
+                } else {
+                    self.num(n);
+                }
                 if !wide {
                     self.normalize(ty);
                 }

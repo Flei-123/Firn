@@ -1072,6 +1072,11 @@ impl<'a> Lower<'a> {
             ast::UnOp::Neg => {
                 let ft = self.fty_of(e)?;
                 let v = self.lower_expr(inner)?;
+                if crate::checkmode::is_checked() && ft.signed() && !matches!(inner.kind, ExprKind::Int(_)) {
+                    let zero = self.constant(ft, 0);
+                    let msg = self.neg_msg(e.span, ft);
+                    return Some(self.push(ft, Op::CheckedBin { op: FBin::Sub, a: zero, b: v, msg }));
+                }
                 Some(self.push(ft, Op::Un(FUn::Neg, v)))
             }
             // `!b` (bool) and `~x` (integer) become the SAME FIR operation;
@@ -1183,12 +1188,8 @@ impl<'a> Lower<'a> {
         let av = self.lower_expr(a)?;
         let mut bv = self.lower_expr(b)?;
         if matches!(op, B::Shl | B::Shr) {
-            // The shift amount is brought to the width of the left operand;
-            // the kind of shift follows `ft`.
             let bt = self.fty_of(b)?;
-            if bt != ft {
-                bv = self.push(ft, Op::Cast { src: bv, from: bt });
-            }
+            bv = self.shift_amount(e.span, op, ft, b, bv, bt);
         }
         Some(self.push(ft, Op::Bin(bop, av, bv)))
     }
@@ -1221,6 +1222,46 @@ impl<'a> Lower<'a> {
         format!(
             "panic: index out of bounds in '{}' at {}:{}:{}",
             self.info.tcx.name_of(arr),
+            self.dg.file_name(span.file),
+            span.line,
+            span.col,
+        )
+    }
+
+    /// The shift amount, brought to the width of the left operand. A checked
+    /// build tests it against that width first (unsigned, so a negative amount
+    /// fails too); a literal below the width needs no test.
+    fn shift_amount(&mut self, span: Span, op: ast::BinOp, ft: FTy, amount: &Expr, v: Val, bt: FTy) -> Val {
+        let bits = ft.bits() as i128;
+        let literal_ok = matches!(&amount.kind, ExprKind::Int(n) if *n >= 0 && *n < bits);
+        if crate::checkmode::is_checked() && !literal_ok {
+            let wide = if bt == FTy::U64 { v } else { self.push(FTy::U64, Op::Cast { src: v, from: bt }) };
+            let msg = self.shift_msg(span, op, ft);
+            let checked = self.push(FTy::U64, Op::CheckedIdx { idx: wide, len: bits as u64, msg });
+            return self.push(ft, Op::Cast { src: checked, from: FTy::U64 });
+        }
+        if bt != ft {
+            return self.push(ft, Op::Cast { src: v, from: bt });
+        }
+        v
+    }
+
+    fn shift_msg(&self, span: Span, op: ast::BinOp, ft: FTy) -> String {
+        format!(
+            "panic: shift amount out of range in '{} {} {}' at {}:{}:{}",
+            ft.name(),
+            op.text(),
+            ft.name(),
+            self.dg.file_name(span.file),
+            span.line,
+            span.col,
+        )
+    }
+
+    fn neg_msg(&self, span: Span, ft: FTy) -> String {
+        format!(
+            "panic: integer overflow in '-{}' at {}:{}:{}",
+            ft.name(),
             self.dg.file_name(span.file),
             span.line,
             span.col,
@@ -2130,12 +2171,8 @@ impl<'a> Lower<'a> {
                 let cur = self.load(ft, addr);
                 let mut rhs = self.lower_expr(value)?;
                 if matches!(op, ast::BinOp::Shl | ast::BinOp::Shr) {
-                    // The shift amount is brought to the width of the left
-                    // operand - the same line as in `lower_binary`.
                     let bt = self.fty_of(value)?;
-                    if bt != ft {
-                        rhs = self.push(ft, Op::Cast { src: rhs, from: bt });
-                    }
+                    rhs = self.shift_amount(*span, *op, ft, value, rhs, bt);
                 }
                 let bop = match op {
                     ast::BinOp::Add => FBin::Add,

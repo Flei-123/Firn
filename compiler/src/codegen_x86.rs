@@ -1956,6 +1956,23 @@ fn emit_inst(
     Ok(())
 }
 
+/// Release-fast `MIN / -1` and `MIN % -1` wrap (`MIN`, `0`) instead of
+/// raising SIGFPE: with the divisor `-1`, `a / -1` becomes `-a / 1` and
+/// `a % -1` becomes `a % 1`. Expects the operands in rax/rcx, branch free.
+pub(crate) fn signed_div_wrap_guard(e: &mut Emitter, div: bool, wide: bool) {
+    let (ra, rc, rd) = if wide { ("rax", "rcx", "rdx") } else { ("eax", "ecx", "edx") };
+    if div {
+        e.line(&format!("mov {}, {}", rd, ra));
+        e.line(&format!("neg {}", rd));
+        e.line(&format!("cmp {}, -1", rc));
+        e.line(&format!("cmove {}, {}", ra, rd));
+    } else {
+        e.line(&format!("cmp {}, -1", rc));
+    }
+    e.line("mov edx, 1");
+    e.line(&format!("cmove {}, {}", rc, rd));
+}
+
 fn emit_bin(
     e: &mut Emitter,
     fr: &Frame,
@@ -2034,6 +2051,7 @@ fn emit_bin(
             load_ext(e, fr, "rax", a, ty, bits);
             load_ext(e, fr, "rcx", b, ty, bits);
             if ty.signed() {
+                signed_div_wrap_guard(e, op == BinOp::Div, wide);
                 if wide {
                     e.line("cqo");
                     e.line("idiv rcx");

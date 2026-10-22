@@ -8177,6 +8177,7 @@ fn emit_bin_mem(
             ra.load_ext(e, "rax", a, ty, bits);
             ra.load_ext(e, "rcx", b, ty, bits);
             if ty.signed() {
+                crate::codegen_x86::signed_div_wrap_guard(e, op == BinOp::Div, wide);
                 if wide {
                     e.line("cqo");
                     e.line("idiv rcx");
