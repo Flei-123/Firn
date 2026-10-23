@@ -29,7 +29,7 @@ def med(xs):
 
 print('| res | r | client | n | p50 | p95 | p99 | 1%low | avg fps | cpu %core | peak WS MB | private MB | t_window ms | t_join ms | p50 per run |')
 print('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
-order = {'vanilla': 0, 'mcplaygl': 1, 'mcplayvk': 2}
+order = {'vanilla': 0, 'mcplaygl': 1, 'mcplayvk': 2, 'mcplayglcap': 3, 'mcplayvkcap': 4}
 for key in sorted(cells, key=lambda k: (-int(k[0].split('x')[0]), k[1], order.get(k[2], 9))):
     c = cells[key]
     res, r, client = key

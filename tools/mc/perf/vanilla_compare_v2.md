@@ -46,3 +46,9 @@ Spalten: n = Anzahl Laeufe; cpu = % eines Kerns; t_window = Prozessstart bis Fen
 ## Aufraeumen
 - Server-JVM gestoppt, %TEMP%\mcvan, Public\mcvan_*.ps1, mcplay-bench.exe geloescht; Plan Ausbalanciert wieder aktiv, Hoechstleistung-Duplikat geloescht; PresentMon-ETW-Session gestoppt; Firefox neu gestartet (andere geschlossene Programme NICHT neu gestartet: Teams, OneNote, PowerPoint, Word, Notepad, FxSound, VirtualBox, certus).
 - Hinweis: Mein Batch wurde beim Zeitlimit abgebrochen (PowerShell-Prozess beendet); der fremde winidle-Prozess 'big.exe' (Certus) laeuft weiter, nicht angefasst.
+
+## v3 (23.10., after r277) -- NOT measured, blocked
+- Laptop HOLO-LAPTOP-3 was on the Windows lock screen (LogonUI running, secure desktop): PresentMon sees no presents at all (even system-wide), so no CSV. Unlock needed; nothing can be done remotely.
+- The Windows dist rebuild (`heavy bash tools/mc/dist.sh`) stayed queued for >20 min (server load 25-43 > heavy limit 24); the job was cancelled, rebuild it when load allows.
+- Scripts prepared (merged): `mcvan_run.ps1 -Fps` (0 = uncapped MCPLAY_FPS=0, -1 = default 60 fps cap, N), `mcvan_batch.ps1` client spec `mcplay:gl:cap` / `mcplay:vk:cap`, `mcvan_agg.py` orders the capped cells.
+- Resume: unlock laptop + disable lock timeout (Hoechstleistung plan: VIDEOCONLOCK 0), dist -> public/<random> -> curl.exe + SHA256 -> `setup.exe /S`, server jar `/root/.w5/jars/server-1.20.1.jar` -> %TEMP%\mcvan\srv, PresentMon 2.6.0 from GitHub, then batch (Secs 30 / Settle 20 keeps a 3-rep matrix of 720p r8/r16 + 360p r8 at ~40 min).
