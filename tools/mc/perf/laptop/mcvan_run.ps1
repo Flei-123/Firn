@@ -1,4 +1,5 @@
-param([string]$Target, [int]$Radius, [string]$Tag, [int]$Secs = 45, [int]$Settle = 30, [int]$W = 1280, [int]$H = 720, [string]$Gfx = 'gl', [string]$Exe = 'mcplay-console.exe')
+param([string]$Target, [int]$Radius, [string]$Tag, [int]$Secs = 45, [int]$Settle = 30, [int]$W = 1280, [int]$H = 720, [string]$Gfx = 'gl', [string]$Exe = 'mcplay-console.exe', [int]$Fps = 0)
+# -Fps 0 = uncapped (MCPLAY_FPS=0), -Fps -1 = mcplay default cap (60, real player case), -Fps N = cap N.
 # Target = server | vanilla | mcplay. -Gfx gl|vk selects the mcplay back end (Vanilla ignores it). -W/-H = window client size.
 # Vanilla 1.20.1 vs mcplay measurement on one Windows laptop (see tools/mc/perf/vanilla_compare.md).
 # Target = server (start local vanilla server + rcon, once) | vanilla | mcplay.
@@ -99,7 +100,7 @@ $j0 = Join-Count
 $proc = $null
 $t0 = [Diagnostics.Stopwatch]::StartNew()
 $tWin = -1.0
-$tg = if ($Target -eq 'mcplay') { "mcplay$Gfx" } else { $Target }
+$tg = if ($Target -eq 'mcplay') { "mcplay$Gfx" + $(if ($Fps -ne 0) { 'cap' } else { '' }) } else { $Target }
 $pmCsv = Join-Path $out ("pm_{0}_{1}x{2}_r{3}_{4}.csv" -f $tg, $W, $H, $Radius, $Tag)
 Remove-Item $pmCsv -ErrorAction SilentlyContinue
 if ($Target -eq 'vanilla') {
@@ -137,7 +138,7 @@ if ($Target -eq 'vanilla') {
   L "vanilla started pid $($proc.Id) cp=$($cp.Count)"
 } else {
   $inst = Join-Path $env:LOCALAPPDATA 'Programs\Voxel Client'
-  if ($Gfx -eq 'vk') { $env:MCPLAY_GFX = 'vk'; Remove-Item Env:MCPLAY_GL -ErrorAction SilentlyContinue } else { $env:MCPLAY_GL = '1'; Remove-Item Env:MCPLAY_GFX -ErrorAction SilentlyContinue }; $env:MCPLAY_VSYNC = '0'; $env:MCPLAY_FPS = '0'; $env:MCPLAY_VIEW = "$Radius"
+  if ($Gfx -eq 'vk') { $env:MCPLAY_GFX = 'vk'; Remove-Item Env:MCPLAY_GL -ErrorAction SilentlyContinue } else { $env:MCPLAY_GL = '1'; Remove-Item Env:MCPLAY_GFX -ErrorAction SilentlyContinue }; $env:MCPLAY_VSYNC = '0'; if ($Fps -lt 0) { Remove-Item Env:MCPLAY_FPS -ErrorAction SilentlyContinue } else { $env:MCPLAY_FPS = "$Fps" }; $env:MCPLAY_VIEW = "$Radius"
   $env:MCPLAY_W = "$W"; $env:MCPLAY_H = "$H"; $env:MCPLAY_FRAME_STATS = '1'; $env:MCPLAY_PROGRESS = '1'
   $env:MCPLAY_SOUNDS = '0'; $env:MCPLAY_AUDIO = '0'
   $env:MCPLAY_RUN_S = [string]($Settle + $Secs + 90); $qf = Join-Path $out ('quit_' + $Tag); Remove-Item $qf -ErrorAction SilentlyContinue; $env:MCPLAY_QUIT_FILE = $qf
