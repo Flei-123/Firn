@@ -56,6 +56,7 @@ skipped in release-fast by `// not_mode: opt`). Measured behaviour in release-fa
 | G17 | `-MIN` (`-i32::MIN`, `-i64::MIN`, any signed width) | P (release-fast wraps to `MIN`) | `4810`, `4811`, ub13, ub14 |
 | G18 | Shift count outside `0 .. bits-1` (also negative, also `<<=`) | P (release-fast: count modulo the width) | `4812`, `4813`, `4814`, ub15 |
 | G19 | `MIN / -1`, `MIN % -1` | P (release-fast: `MIN`, `0`, no SIGFPE) | `4815`, `div_*_min_m1_i32` |
+| G20 | `x += y`, `-=`, `*=`, `/=`, `%=`, `x++`, `x--` are exactly `x = x op y` (SPEC 12.7): overflow, underflow and `/ 0` panic (r935; before, they wrapped in every level) | P (release-fast wraps; `+%` / `-%` / `*%` spell the opt-in) | `4850`-`4855`, `4856`, `4857` |
 
 ## Non-guarantees (nothing catches these)
 

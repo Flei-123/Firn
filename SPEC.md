@@ -1105,6 +1105,10 @@ not a second kind of arithmetic; it is a shorter way of writing the same
 one. In the compiler both go through the very same check
 (`sema::binop_type`), so that they cannot drift apart.
 
+This holds for `x++` and `x--` too (r935, `tests/4850`-`4857`): `x += y` past the range of its
+type panics in `dev-fast` and `release-safe` like `x = x + y`, and `x /= 0` panics. Whoever wants the
+wrap writes `x = x +% y`.
+
 **The left side is evaluated ONCE.** `a[f()] += 1` calls `f()` exactly once.
 That is a guarantee of the language, not a property of the optimizer: the
 compound assignment is its own statement, and the lowering computes the

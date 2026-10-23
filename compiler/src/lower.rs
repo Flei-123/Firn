@@ -1194,6 +1194,44 @@ impl<'a> Lower<'a> {
         Some(self.push(ft, Op::Bin(bop, av, bv)))
     }
 
+    /// `x op= y` and `x++` / `x--` compute the very same operation as
+    /// `x = x op y` (SPEC 12.7): checked in the checked levels for `+ - * / %`,
+    /// plain everywhere else (release-fast, bit operations, shifts, floats).
+    fn compound_value(&mut self, span: Span, op: ast::BinOp, ft: FTy, cur: Val, rhs: Val) -> Option<Val> {
+        use ast::BinOp as B;
+        if crate::checkmode::is_checked() && ft != FTy::Bool && ft != FTy::Ptr && !ft.is_float() {
+            match op {
+                B::Add | B::Sub | B::Mul => {
+                    let msg = self.overflow_msg(span, op, ft);
+                    return Some(self.push(ft, Op::CheckedBin { op: bin_of(op), a: cur, b: rhs, msg }));
+                }
+                B::Div | B::Rem => {
+                    let msg_zero = self.div_zero_msg(span, op, ft);
+                    let msg_range = self.div_range_msg(span, op, ft);
+                    return Some(self.push(
+                        ft,
+                        Op::CheckedDiv { op: bin_of(op), a: cur, b: rhs, msg_zero, msg_range },
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let bop = match op {
+            B::Add => FBin::Add,
+            B::Sub => FBin::Sub,
+            B::Mul => FBin::Mul,
+            B::Div => FBin::Div,
+            B::Rem => FBin::Rem,
+            B::And => FBin::And,
+            B::Or => FBin::Or,
+            B::Xor => FBin::Xor,
+            B::Shl => FBin::Shl,
+            B::Shr => FBin::Shr,
+            _ => return self.ice(span, "unknown operator in a compound assignment"),
+        };
+        Some(self.push(ft, Op::Bin(bop, cur, rhs)))
+    }
+
     /// The message text baked into a checked `+ - *` at LOWERING time (SPEC
     /// §13, `L9`): file, line, the type, the operator — everything that is
     /// known here and nowhere later, because FIR carries no source
@@ -2174,26 +2212,13 @@ impl<'a> Lower<'a> {
                     let bt = self.fty_of(value)?;
                     rhs = self.shift_amount(*span, *op, ft, value, rhs, bt);
                 }
-                let bop = match op {
-                    ast::BinOp::Add => FBin::Add,
-                    ast::BinOp::Sub => FBin::Sub,
-                    ast::BinOp::Mul => FBin::Mul,
-                    ast::BinOp::Div => FBin::Div,
-                    ast::BinOp::Rem => FBin::Rem,
-                    ast::BinOp::And => FBin::And,
-                    ast::BinOp::Or => FBin::Or,
-                    ast::BinOp::Xor => FBin::Xor,
-                    ast::BinOp::Shl => FBin::Shl,
-                    ast::BinOp::Shr => FBin::Shr,
-                    _ => return self.ice(*span, "unknown operator in a compound assignment"),
-                };
-                let res = self.push(ft, Op::Bin(bop, cur, rhs));
+                let res = self.compound_value(*span, *op, ft, cur, rhs)?;
                 self.store(ft, addr, res);
                 crate::gc_lower::hook_assign(self, target, addr)
             }
             // ROUND 70 - `x++` / `x--`: load, plus/minus one, store. The
             // address is computed once here as well.
-            Stmt::Step { target, up, .. } => {
+            Stmt::Step { target, up, span } => {
                 let addr = self.lower_addr(target)?;
                 // HOOK ptrarith: `p++` / `p--` move one element (ptrarith.rs)
                 let pt = self.ty_of(target);
@@ -2208,8 +2233,8 @@ impl<'a> Lower<'a> {
                 let ft = self.fty_of(target)?;
                 let cur = self.load(ft, addr);
                 let one = self.constant(ft, 1);
-                let bop = if *up { FBin::Add } else { FBin::Sub };
-                let res = self.push(ft, Op::Bin(bop, cur, one));
+                let sop = if *up { ast::BinOp::Add } else { ast::BinOp::Sub };
+                let res = self.compound_value(*span, sop, ft, cur, one)?;
                 self.store(ft, addr, res);
                 Some(())
             }
