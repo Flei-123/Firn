@@ -3619,6 +3619,23 @@ fn foldable_addresses(
                     && !a.frame_addr.contains_key(&v)
                     && a.imm(v).is_none()
             };
+            // GAPS-FRAME: a frame address (`alloca`) plus index or constant straight into the
+            // access: `[rbp + idx - N]` instead of `lea` + access.
+            if gfold {
+                if let Some(boff) = a.frame_addr.get(&base).copied() {
+                    if let Some(k) = a.imm(off) {
+                        let delta = k - boff as i64;
+                        if (i32::MIN as i64..=i32::MAX as i64).contains(&delta) && !f.is_secret(off) {
+                            out.insert(d, Address { base: "rbp", index: None, offset: delta });
+                        }
+                    } else if let Some(ir) = pure_reg(off) {
+                        if ir != "rbp" {
+                            out.insert(d, Address { base: "rbp", index: Some((ir, 1)), offset: -(boff as i64) });
+                        }
+                    }
+                    continue;
+                }
+            }
             let gsym: Option<&'static str> = gname.get(&base).copied();
             let (br, base_preload) = if let Some(sym) = gsym {
                 gbase.insert(d, base);
@@ -3676,10 +3693,15 @@ fn foldable_addresses(
                     }
                     Some((y, k, pd))
                 };
-                let p1 = &b.insts[idx - 1];
-                // scaled: add at idx-2, shl/mul at idx-1
+                // a sunk `globaladdr` copy may stand between the chain and the address
+                let mut j1 = idx - 1;
+                while gsym.is_some() && j1 > 0 && b.insts[j1].dst.map_or(false, |x| gname.contains_key(&x)) {
+                    j1 -= 1;
+                }
+                let p1 = &b.insts[j1];
+                // scaled: add at j1-1, shl/mul at j1
                 let mut hit: Option<(Val, i64, i64, Val, Option<Val>)> = None; // (y, k, factor, add dst, scale dst)
-                if p1.dst == Some(off) && p1.ty.bits() == 64 && idx > 1 && read.get(off as usize).copied() == Some(1) && single(off) && !f.is_secret(off) && !a.alias.contains_key(&off) && a.cell(off).is_none() {
+                if p1.dst == Some(off) && p1.ty.bits() == 64 && j1 > 0 && read.get(off as usize).copied() == Some(1) && single(off) && !f.is_secret(off) && !a.alias.contains_key(&off) && a.cell(off).is_none() {
                     let skal = match &p1.op {
                         Op::Bin(BinOp::Shl, xi, ki) => match a.imm(*ki) {
                             Some(k) if (0..=3).contains(&k) => Some((*xi, 1i64 << k)),
@@ -3692,7 +3714,7 @@ fn foldable_addresses(
                         _ => None,
                     };
                     if let Some((xi, fact)) = skal {
-                        let p2 = &b.insts[idx - 2];
+                        let p2 = &b.insts[j1 - 1];
                         if p2.dst == Some(xi) {
                             if let Some((y, k, pd)) = addc(p2) {
                                 hit = Some((y, k, fact, pd, Some(off)));
@@ -3723,7 +3745,11 @@ fn foldable_addresses(
             }
             // (3b) index with factor: the scaling sits right in front of it
             if read.get(off as usize).copied() == Some(1) && idx > 0 && single(off) {
-                let p = &b.insts[idx - 1];
+                let mut jb = idx - 1;
+                while gsym.is_some() && jb > 0 && b.insts[jb].dst.map_or(false, |x| gname.contains_key(&x)) {
+                    jb -= 1;
+                }
+                let p = &b.insts[jb];
                 let skal = if p.dst == Some(off) && p.ty.bits() == 64 {
                     match &p.op {
                         Op::Bin(BinOp::Shl, xi, ki) => match a.imm(*ki) {
