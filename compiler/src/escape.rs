@@ -428,6 +428,25 @@ impl<'a> Pass<'a> {
         matches!(self.tys.get(e.id as usize), Some(Type::Ptr { .. }))
     }
 
+    /// A value of a type narrower than an address (`u32`, `bool`, `f64`, ...)
+    /// cannot be the address of a local, whatever struct it was read out of.
+    fn cannot_hold_address(&self, e: &Expr) -> bool {
+        matches!(
+            self.tys.get(e.id as usize),
+            Some(
+                Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::U8
+                    | Type::U16
+                    | Type::U32
+                    | Type::Bool
+                    | Type::F32
+                    | Type::F64
+            )
+        )
+    }
+
     fn decl_of(&self, name: &str) -> Option<Span> {
         self.locals.iter().find(|(n, _)| n == name).map(|(_, s)| *s)
     }
@@ -574,6 +593,9 @@ impl<'a> Pass<'a> {
 
     /// The taint of the VALUE of `e`.
     fn value(&self, e: &Expr) -> Taint {
+        if self.cannot_hold_address(e) {
+            return Taint::default();
+        }
         match &e.kind {
             ExprKind::Ident(n) => self.taint_under(n),
             ExprKind::Unary(UnOp::AddrOf | UnOp::InoutOf, inner) => self.address_of(inner, e.span),
