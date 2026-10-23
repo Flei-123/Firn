@@ -492,6 +492,22 @@ fn optimize_batch(funcs: &mut [Func], only: Option<&[usize]>, st: &mut OptStats,
     st.add(&s);
 }
 
+/// `optimize_batch` for the bodies the inliner keeps in a table (r948).
+fn optimize_map(map: &mut HashMap<String, Func>, st: &mut OptStats, cfg: &OptConfig, clk: &mut PassClock) {
+    if clk.on || crate::parfn::threads() <= 1 {
+        for f in map.values_mut() {
+            optimize_func(f, st, cfg, clk);
+        }
+        return;
+    }
+    let tasks: Vec<(&mut Func, usize)> = map.values_mut().map(|f| (f, 1usize)).collect();
+    let s = crate::parfn::run(tasks, |f, s| {
+        let mut clk = PassClock::default();
+        optimize_func(f, s, cfg, &mut clk);
+    });
+    st.add(&s);
+}
+
 pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     let mut st = OptStats::default();
     if cfg.level == Level::Dev {
@@ -566,14 +582,10 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         // ROUND TK2 (r136): the recursive callers kept for the frame budget go
         // through the same passes as the module.
         let mut kept = crate::inline::rec_originals_take();
-        for f in kept.values_mut() {
-            optimize_func(f, &mut st, cfg, &mut clk);
-        }
+        optimize_map(&mut kept, &mut st, cfg, &mut clk);
         crate::inline::rec_originals_put(kept);
         let mut small = crate::inline::rec_small_take();
-        for f in small.values_mut() {
-            optimize_func(f, &mut st, cfg, &mut clk);
-        }
+        optimize_map(&mut small, &mut st, cfg, &mut clk);
         crate::inline::rec_small_put(small);
         // TEMPO 15: a second round on the cleaned up bodies (see
         // `inline_module_again`); only the callers that got something are
