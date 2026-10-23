@@ -73,6 +73,17 @@ struct Cg {
     // means the program contains no checked operation at all and pays not
     // one octet for the feature.
     pmsg: Vec[u32]
+    // r945: message id -> its index in `pmsg` (NONE = not there yet). A
+    // direct table: intern numbers are small and dense. Replaces the linear
+    // search, which cost ~n^2/2 steps on programs with 30k messages.
+    pmap: Vec[u32],
+    // r945 peephole: right after `store_slot(koff, kreg)` the output is `kpos`
+    // octets long. A `load_slot` of the same slot while the output is STILL
+    // that long (no instruction, no label in between) finds the value in
+    // `kreg` -- no memory read needed.
+    kpos: usize,
+    koff: u64,
+    kreg: u32,
     // ROUND 89 (statics.rs): the type checker, so that the data section
     // of the global variables can be written -- their finished octets live
     // there (`sema.sema_static_*`). 0 = not registered.
@@ -108,7 +119,7 @@ fn cg_new(f: u64, it: u64) -> Cg {
         slot: vec_new[u64](), aslot: vec_new[u64](),
         frame: 0, unsuitable: false, gcr: 0, ifr: 0, free: false,
         tr: 0, ext_out: 0,
-        pmsg: vec_new[u32](), site: 0, sm: 0, idx_used: false,
+        pmsg: vec_new[u32](), pmap: vec_new[u32](), kpos: 0, koff: 0, kreg: 0, site: 0, sm: 0, idx_used: false,
         fstart: vec_new[u64](), tail_off: 0, tr_a: 0, tr_b: 0,
         pref: vec_new[u64](), poff: vec_new[u64](),
     }
@@ -166,6 +177,7 @@ fn cg_free(c: *mut Cg) {
     vec_free[u64](&(*c).slot)
     vec_free[u64](&(*c).aslot)
     vec_free[u32](&(*c).pmsg)
+    vec_free[u32](&(*c).pmap)
     vec_free[u64](&(*c).fstart)
     vec_free[u64](&(*c).pref)
     vec_free[u64](&(*c).poff)
@@ -396,6 +408,15 @@ fn w(c: *mut Cg, p: u64, n: usize) {
 
 // `mov <reg>, qword ptr [rbp-<off>]`
 fn load_slot(c: *mut Cg, r: u32, off: u64) {
+    if (*c).kpos != 0 && (*c).koff == off && rt.buf_len(&(*c).out) == (*c).kpos {
+        // the slot was written from `kreg` by the very last instruction
+        if (*c).kreg == r {
+            return
+        }
+        var mv: [u8; 3] = "mov"
+        op2(c, (&mv[0]) as u64, 3, r, (*c).kreg)
+        return
+    }
     ins(c)
     var m: [u8; 4] = "mov "
     w(c, (&m[0]) as u64, 4)
@@ -417,6 +438,9 @@ fn store_slot(c: *mut Cg, off: u64, r: u32) {
     w(c, (&s[0]) as u64, 3)
     reg64(c, r)
     nl(c)
+    (*c).kpos = rt.buf_len(&(*c).out)
+    (*c).koff = off
+    (*c).kreg = r
 }
 
 fn slot_of(c: *mut Cg, v: u32) -> u64 {
@@ -742,6 +766,20 @@ fn emit_cmp(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
 }
 
 fn emit_const(c: *mut Cg, ty: u32, raw_value: u64, dst: u32) {
+    // r945: a literal that fits a sign-extended imm32 goes straight into
+    // its slot -- one line instead of `movabs` + store.
+    let sv: i64 = raw_value as i64
+    if sv >= -2147483648 && sv <= 2147483647 {
+        ins(c)
+        var mi: [u8; 19] = "mov qword ptr [rbp-"
+        w(c, (&mi[0]) as u64, 19)
+        number(c, slot_of(c, dst))
+        var si: [u8; 3] = "], "
+        w(c, (&si[0]) as u64, 3)
+        inum(c, sv)
+        nl(c)
+        return
+    }
     ins(c)
     var m: [u8; 7] = "movabs "
     w(c, (&m[0]) as u64, 7)
@@ -1960,20 +1998,21 @@ const PANIC_CAST: u64 = 6
 const PANIC_INDEX: u64 = 7
 
 fn panic_msg_index(c: *mut Cg, id: u32) -> u32 {
-    var i: usize = 0
-    while i < vec_len[u32](&(*c).pmsg) {
-        if vec_at[u32](&(*c).pmsg, i) == id {
-            return i as u32
-        }
-        i = i + 1
+    if (id as usize) >= vec_len[u32](&(*c).pmap) {
+        return NONE
     }
-    return NONE
+    return vec_at[u32](&(*c).pmap, id as usize)
 }
 
 fn panic_msg_add(c: *mut Cg, id: u32) {
-    if panic_msg_index(c, id) == NONE {
-        vec_push[u32](&(*c).pmsg, id)
+    if panic_msg_index(c, id) != NONE {
+        return
     }
+    while vec_len[u32](&(*c).pmap) <= (id as usize) {
+        vec_push[u32](&(*c).pmap, NONE)
+    }
+    vec_set[u32](&(*c).pmap, id as usize, vec_len[u32](&(*c).pmsg) as u32)
+    vec_push[u32](&(*c).pmsg, id)
 }
 
 // Every message the program really uses, in the order of its first
@@ -2878,7 +2917,13 @@ fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
 fn emit_term(c: *mut Cg, fnr: u32, bb: u32) {
     let f: *mut fir.Fir = ff(c)
     let kind: u32 = fir.b_term_of(f, fnr, bb)
+    // r945: the next block follows right behind this one in the output, so a
+    // jump to it is dead weight.
+    let nextb: u32 = bb + 1
     if kind == fir.TERM_BR {
+        if fir.b_t1_of(f, fnr, bb) == nextb {
+            return
+        }
         ins(c)
         var j: [u8; 4] = "jmp "
         w(c, (&j[0]) as u64, 4)
@@ -2890,11 +2935,23 @@ fn emit_term(c: *mut Cg, fnr: u32, bb: u32) {
         load_value(c, R_AX, fir.b_t1_of(f, fnr, bb))
         var tst: [u8; 11] = "test eax, 1"
         raw(c, (&tst[0]) as u64, 11)
+        if fir.b_t2_of(f, fnr, bb) == nextb && fir.b_t3_of(f, fnr, bb) != nextb {
+            // the true branch falls through: jump away on `false`
+            ins(c)
+            var jz: [u8; 3] = "je "
+            w(c, (&jz[0]) as u64, 3)
+            blocklabel(c, fir.f_name_of(f, fnr), fir.b_t3_of(f, fnr, bb))
+            nl(c)
+            return
+        }
         ins(c)
         var jn: [u8; 4] = "jne "
         w(c, (&jn[0]) as u64, 4)
         blocklabel(c, fir.f_name_of(f, fnr), fir.b_t2_of(f, fnr, bb))
         nl(c)
+        if fir.b_t3_of(f, fnr, bb) == nextb {
+            return
+        }
         ins(c)
         var jm: [u8; 4] = "jmp "
         w(c, (&jm[0]) as u64, 4)
@@ -2913,6 +2970,9 @@ fn emit_term(c: *mut Cg, fnr: u32, bb: u32) {
         let off: u32 = fir.b_t3_of(f, fnr, bb)
         let len: u32 = fir.b_t4_of(f, fnr, bb)
         if len == 0 {
+            if def == nextb {
+                return
+            }
             ins(c)
             var j0: [u8; 4] = "jmp "
             w(c, (&j0[0]) as u64, 4)
@@ -2934,6 +2994,9 @@ fn emit_term(c: *mut Cg, fnr: u32, bb: u32) {
             blocklabel(c, fir.f_name_of(f, fnr), fir.sw_target(f, off + k))
             nl(c)
             k = k + 1
+        }
+        if def == nextb {
+            return
         }
         ins(c)
         var j9: [u8; 4] = "jmp "
