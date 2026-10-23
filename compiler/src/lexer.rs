@@ -837,8 +837,8 @@ thread_local! {
     /// three times per compilation (import scan, GC-runtime search, parse);
     /// the second and third time are a lookup. A run WITH errors is never
     /// stored, so the real diagnostics still come out of the one real run.
-    static TOKEN_CACHE: std::cell::RefCell<std::collections::HashMap<(u32, usize, usize), std::rc::Rc<Vec<Token>>>>
-        = std::cell::RefCell::new(std::collections::HashMap::new());
+    static TOKEN_CACHE: std::cell::RefCell<crate::fx::HashMap<(u32, usize, usize), std::rc::Rc<Vec<Token>>>>
+        = std::cell::RefCell::new(crate::fx::HashMap::default());
 }
 
 /// Like `lex_file`, but remembers error-free results (see `TOKEN_CACHE`).

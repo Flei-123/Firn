@@ -16,7 +16,7 @@ use crate::ast::{
     Attr, Block, ConstDecl, Expr, ExprKind, BinOp, ExternInfo, FnDecl, ImportDecl, Param, Program, Stmt,
     StructDecl, TypeExpr, UnOp,
 };
-use std::collections::HashSet;
+use crate::fx::HashSet;
 use crate::diag::{Diags, Span};
 use crate::lexer::{TokKind, Token};
 
@@ -3363,7 +3363,7 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         no_struct_lit: false,
         paren_depth: 0,
         file,
-        modules: HashSet::new(),
+        modules: HashSet::default(),
         loop_depth: 0,
         pending_attrs: Vec::new(),
         hoist: Vec::new(),

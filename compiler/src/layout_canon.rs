@@ -20,12 +20,12 @@
 use crate::abi::{self, ArgClass};
 use crate::ast::{Program, TypeExpr};
 use crate::types::{Type, TypeCtx};
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 pub fn render(p: &Program) -> String {
     // 1. Register the structs (order = declaration order).
     let mut tcx = TypeCtx::new();
-    let mut idx: HashMap<String, usize> = HashMap::new();
+    let mut idx: HashMap<String, usize> = HashMap::default();
     for s in &p.structs {
         let i = tcx.declare(&s.name);
         idx.insert(s.name.clone(), i);

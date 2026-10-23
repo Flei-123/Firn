@@ -131,7 +131,8 @@ use crate::fir::{BinOp, BlockId, CmpOp, FTy, Func, Inst, Module, Op, Term, UnOp,
 use crate::syscalls::{self, Wasm as Sys};
 use crate::wasm_cfg::{self, Cfg};
 use crate::wasm_enc::{self as w, Ins, VT};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+use crate::fx::{HashMap, HashSet};
 
 /// What `emit` hands back.
 pub struct Output {
@@ -500,8 +501,8 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
     if crate::statics::any_data() {
         img.parse(&crate::statics::data_asm())?;
     }
-    let mut by_name: HashMap<String, usize> = HashMap::new();
-    let mut sym2name: HashMap<String, String> = HashMap::new();
+    let mut by_name: HashMap<String, usize> = HashMap::default();
+    let mut sym2name: HashMap<String, String> = HashMap::default();
     for (i, f) in m.funcs.iter().enumerate() {
         by_name.insert(f.name.clone(), i);
         sym2name.insert(crate::codegen_x86::label(&f.name), f.name.clone());
@@ -524,8 +525,8 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
             roots.push(f.name.clone());
         }
     }
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut parent: HashMap<String, String> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::default();
+    let mut parent: HashMap<String, String> = HashMap::default();
     let mut queue: VecDeque<String> = VecDeque::new();
     for r in &roots {
         if seen.insert(r.clone()) {
@@ -537,8 +538,8 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
     let mut fnref_targets: Vec<String> = Vec::new();
     let mut direct_targets: Vec<String> = Vec::new();
     let mut msgs: Vec<String> = Vec::new();
-    let mut calls: HashMap<String, Vec<String>> = HashMap::new();
-    let mut indirect: HashSet<String> = HashSet::new();
+    let mut calls: HashMap<String, Vec<String>> = HashMap::default();
+    let mut indirect: HashSet<String> = HashSet::default();
     while let Some(name) = queue.pop_front() {
         let f = &m.funcs[by_name[&name]];
         let mut callees: Vec<String> = Vec::new();
@@ -674,7 +675,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
     }
     if !refusals.is_empty() {
         let mut out = String::new();
-        let mut shown: HashSet<(String, String)> = HashSet::new();
+        let mut shown: HashSet<(String, String)> = HashSet::default();
         let mut n = 0;
         for r in &refusals {
             if !shown.insert((r.func.clone(), r.what.clone())) {
@@ -715,7 +716,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
         let t = wm.type_index(w::FuncType { params: ps.to_vec(), results: rs.to_vec() });
         wm.imports.push(w::Import { module: "firn".into(), name: nm.to_string(), ty: t, sym: format!("firn.{}", nm) });
     }
-    let mut externs: HashMap<String, (u32, w::FuncType)> = HashMap::new();
+    let mut externs: HashMap<String, (u32, w::FuncType)> = HashMap::default();
     for (nm, sig) in &externs_sig {
         let link = crate::extfn::extern_link_name(nm).unwrap_or_else(|| nm.clone());
         let t = wm.type_index(sig.clone());
@@ -724,7 +725,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
         externs.insert(nm.clone(), (idx, sig.clone()));
     }
     let nimp = wm.imports.len() as u32;
-    let mut fidx: HashMap<String, u32> = HashMap::new();
+    let mut fidx: HashMap<String, u32> = HashMap::default();
     for (k, i) in emitted.iter().enumerate() {
         fidx.insert(m.funcs[*i].name.clone(), nimp + k as u32);
     }
@@ -758,8 +759,8 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
 
     // ------------------------------------------------ 4. the table
     let mut table: Vec<u32> = Vec::new();
-    let mut t_direct: HashMap<String, u32> = HashMap::new();
-    let mut t_fnref: HashMap<String, u32> = HashMap::new();
+    let mut t_direct: HashMap<String, u32> = HashMap::default();
+    let mut t_fnref: HashMap<String, u32> = HashMap::default();
     wm.table_base = 1;
     for n in &direct_targets {
         t_direct.insert(n.clone(), 1 + table.len() as u32);
@@ -860,7 +861,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
     wm.globals.push(w::Global { vt: VT::I32, mutable: true, init: 0, sym: "__free_list".into() });
 
     // ------------------------------------------------ 6. who may collect
-    let mut may_collect: HashSet<String> = HashSet::new();
+    let mut may_collect: HashSet<String> = HashSet::default();
     if gc_active {
         for r in ["gc_init", "gc_collect", "__gc_alloc_raw", "__gc_collect_now"] {
             if seen.contains(r) {
@@ -900,7 +901,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
     // registry of `extfn.rs`, which is thread local.
     let syms: Vec<String> = m.funcs.iter().map(|f| crate::codegen_x86::label(&f.name)).collect();
     let handler = crate::panic_rt::handler();
-    let mut records: HashMap<String, u32> = HashMap::new();
+    let mut records: HashMap<String, u32> = HashMap::default();
     for t in &fnref_targets {
         if let Some(a) = img.addr(&crate::fnval::record_label(t)) {
             records.insert(t.clone(), a);
@@ -1045,7 +1046,7 @@ fn emit_inner(m: &Module) -> Result<Output, String> {
 /// the constant its `const` names (the same rule `codegen_a64::layout`
 /// follows for the system call number).
 fn single_consts(f: &Func) -> HashMap<Val, i128> {
-    let mut defs: HashMap<Val, u32> = HashMap::new();
+    let mut defs: HashMap<Val, u32> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let Some(d) = i.dst {
@@ -1053,7 +1054,7 @@ fn single_consts(f: &Func) -> HashMap<Val, i128> {
             }
         }
     }
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
@@ -1083,8 +1084,8 @@ fn single_consts(f: &Func) -> HashMap<Val, i128> {
 /// Constants and data addresses defined once are simply computed again at
 /// every use.
 fn plan_trees(f: &Func, cfg: &Cfg) -> (HashMap<Val, (u32, usize)>, HashMap<Val, (u32, usize)>) {
-    let mut inline: HashMap<Val, (u32, usize)> = HashMap::new();
-    let mut remat: HashMap<Val, (u32, usize)> = HashMap::new();
+    let mut inline: HashMap<Val, (u32, usize)> = HashMap::default();
+    let mut remat: HashMap<Val, (u32, usize)> = HashMap::default();
     if std::env::var_os("FIRN_WASM_NO_TREES").is_some() {
         return (inline, remat);
     }
@@ -1141,7 +1142,7 @@ fn plan_trees(f: &Func, cfg: &Cfg) -> (HashMap<Val, (u32, usize)>, HashMap<Val, 
     for &b in &cfg.order {
         let blk = &f.blocks[b as usize];
         let nb = blk.insts.len();
-        let mut fpos: HashMap<usize, usize> = HashMap::new();
+        let mut fpos: HashMap<usize, usize> = HashMap::default();
         for k in (0..nb).rev() {
             let i = &blk.insts[k];
             let d = match i.dst {
@@ -1488,14 +1489,14 @@ impl<'a> Fx<'a> {
             nparams,
             fp: u32::MAX,
             frame: 0,
-            alloca_off: HashMap::new(),
-            spill_off: HashMap::new(),
-            spills: HashMap::new(),
+            alloca_off: HashMap::default(),
+            spill_off: HashMap::default(),
+            spills: HashMap::default(),
             consts,
             ctx: Vec::new(),
             free_tmp: Vec::new(),
             dispatch_local: u32::MAX,
-            dispatch_pos: HashMap::new(),
+            dispatch_pos: HashMap::default(),
             inline_def,
             remat,
             emitting: Vec::new(),

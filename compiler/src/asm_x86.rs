@@ -50,7 +50,7 @@
 #![allow(dead_code)]
 
 use crate::x86enc::{self as E, Buf, Inst, Mem, Opnd};
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 // ===========================================================================
 // Result
@@ -172,7 +172,7 @@ impl Asm {
             cur: SEC_TEXT,
             globals: Vec::new(),
             aligns: [1, 1, 1, 1, 1],
-            numeric: HashMap::new(),
+            numeric: HashMap::default(),
             line_no: 0,
         }
     }
@@ -929,7 +929,7 @@ impl Asm {
     /// builds the finished sections from them.
     pub fn finish(mut self) -> Result<Assembled, String> {
         // Which names are global?
-        let mut is_global: HashMap<&str, ()> = HashMap::new();
+        let mut is_global: HashMap<&str, ()> = HashMap::default();
         for g in &self.globals {
             is_global.insert(g.as_str(), ());
         }
@@ -938,7 +938,7 @@ impl Asm {
         // `as` starts short and only lets jumps grow. That makes the fixed
         // point unique and it is reached in a few passes.
         let mut offsets: [Vec<u64>; N_SEC] = Default::default();
-        let mut labels: HashMap<String, (usize, u64)> = HashMap::new();
+        let mut labels: HashMap<String, (usize, u64)> = HashMap::default();
         for _round in 0..64 {
             // 1. offsets from the current lengths
             labels.clear();
@@ -1021,7 +1021,7 @@ impl Asm {
         let secnames: [&'static str; N_SEC] =
             [".text", ".data", ".rodata", ".note.GNU-stack", ".bss"];
         let mut symbols: Vec<Sym> = Vec::new();
-        let mut symidx: HashMap<String, usize> = HashMap::new();
+        let mut symidx: HashMap<String, usize> = HashMap::default();
         for (i, n) in secnames.iter().enumerate() {
             symidx.insert(format!("\u{3}sec{}", i), symbols.len());
             symbols.push(Sym {

@@ -29,7 +29,7 @@
 #![allow(dead_code)]
 
 use crate::a64enc::{self as A, Buf, FixKind};
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 pub const SEC_TEXT: usize = 0;
 pub const SEC_DATA: usize = 1;
@@ -124,7 +124,7 @@ impl Asm {
             cur: SEC_TEXT,
             globals: Vec::new(),
             aligns: [4, 1, 1, 1, 1],
-            numeric: HashMap::new(),
+            numeric: HashMap::default(),
             line_no: 0,
         }
     }
@@ -566,13 +566,13 @@ pub fn assemble_to_object(text: &str) -> Result<Vec<u8>, String> {
 
 impl Asm {
     pub fn finish(mut self) -> Result<Assembled, String> {
-        let mut is_global: HashMap<&str, ()> = HashMap::new();
+        let mut is_global: HashMap<&str, ()> = HashMap::default();
         for g in &self.globals {
             is_global.insert(g.as_str(), ());
         }
 
         // Offsets -- one pass suffices, because no length is variable.
-        let mut labels: HashMap<String, (usize, u64)> = HashMap::new();
+        let mut labels: HashMap<String, (usize, u64)> = HashMap::default();
         for sec in 0..N_SEC {
             let mut off = 0u64;
             for p in &self.pieces[sec] {
@@ -594,7 +594,7 @@ impl Asm {
 
         let secnames: [&'static str; N_SEC] = [".text", ".data", ".rodata", ".note.GNU-stack", ".bss"];
         let mut symbols: Vec<Sym> = Vec::new();
-        let mut symidx: HashMap<String, usize> = HashMap::new();
+        let mut symidx: HashMap<String, usize> = HashMap::default();
         for (i, n) in secnames.iter().enumerate() {
             symidx.insert(format!("\u{3}sec{}", i), symbols.len());
             symbols.push(Sym {

@@ -47,13 +47,13 @@
 
 use crate::ast::{StructDecl, TypeExpr};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 thread_local! {
     /// internal call name (post module-rewrite) -> C link name
-    static EXTERNS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static EXTERNS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::default());
     /// internal names of functions marked `#[export_c]`
-    static EXPORTED: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static EXPORTED: RefCell<HashMap<String, String>> = RefCell::new(HashMap::default());
     /// libraries named by `#[link_lib(..)]`, in first-seen order
     static LIBS: RefCell<Vec<String>> = RefCell::new(Vec::new());
 }
@@ -98,7 +98,7 @@ pub struct ExportAbi {
 
 thread_local! {
     /// aggregate ABI of every export, by internal name (filled by `lower::lower_fn`)
-    static ABIS: RefCell<HashMap<String, ExportAbi>> = RefCell::new(HashMap::new());
+    static ABIS: RefCell<HashMap<String, ExportAbi>> = RefCell::new(HashMap::default());
 }
 
 /// Called by lowering for every `#[export_c]` function.
@@ -110,7 +110,7 @@ thread_local! {
     /// exported signatures, in source order (for `--header` / `--shared`)
     static SIGS: RefCell<Vec<ExportSig>> = RefCell::new(Vec::new());
     /// every struct declaration of the program, by source name
-    static STRUCTS: RefCell<HashMap<String, StructDecl>> = RefCell::new(HashMap::new());
+    static STRUCTS: RefCell<HashMap<String, StructDecl>> = RefCell::new(HashMap::default());
 }
 
 /// Only for self tests, which compile several programs in ONE process.

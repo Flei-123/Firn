@@ -82,7 +82,7 @@
 //! `FIRN_NO_UNROLL=1` switches the pass off for comparison measurements.
 
 use crate::fir::{BlockId, CmpOp, FTy, Func, Inst, Op, Term, Val};
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 /// At most this many passes are unrolled.
 const MAX_TRIPS: u64 = 16;
@@ -196,7 +196,7 @@ fn find(f: &Func) -> Option<Plan> {
         }
         // back edges into h
         let latches: Vec<usize> =
-            preds[h].iter().copied().filter(|&p| reach[p] && dom[p][h]).collect();
+            preds[h].iter().copied().filter(|&p| reach[p] && dom.has(p, h)).collect();
         if latches.len() != 1 {
             continue;
         }
@@ -228,7 +228,7 @@ fn find(f: &Func) -> Option<Plan> {
         // exits besides the header's are counted (at most MAX_SIDE_EXITS)
         let mut side_edges = 0usize;
         for &b in &blocks {
-            if !reach[b] || !dom[b][h] {
+            if !reach[b] || !dom.has(b, h) {
                 continue 'head;
             }
             for s in f.blocks[b].term.successors() {
@@ -238,7 +238,7 @@ fn find(f: &Func) -> Option<Plan> {
                 }
                 if inl[s] {
                     // an edge back to a block that dominates b is a loop
-                    if dom[b][s] && !(s == h && b == latch) {
+                    if dom.has(b, s) && !(s == h && b == latch) {
                         continue 'head;
                     }
                 } else if b != h {
@@ -511,7 +511,7 @@ fn apply(f: &mut Func, pl: &Plan) {
     // copy `trips` only the header
     let mut bmap: Vec<HashMap<usize, BlockId>> = Vec::new();
     for j in 0..=trips {
-        let mut m = HashMap::new();
+        let mut m = HashMap::default();
         for &b in &pl.blocks {
             if j == trips && b != h {
                 continue;
@@ -521,10 +521,10 @@ fn apply(f: &mut Func, pl: &Plan) {
         bmap.push(m);
     }
     let resolve = |m: &HashMap<Val, Val>, v: Val| -> Val { m.get(&v).copied().unwrap_or(v) };
-    let mut prev: HashMap<Val, Val> = HashMap::new();
+    let mut prev: HashMap<Val, Val> = HashMap::default();
     let mut vms: Vec<HashMap<Val, Val>> = Vec::new();
     for j in 0..=trips {
-        let mut vm: HashMap<Val, Val> = HashMap::new();
+        let mut vm: HashMap<Val, Val> = HashMap::default();
         for &(d, from_p, from_l) in &hphis {
             let v = if j == 0 { from_p } else { resolve(&prev, from_l) };
             vm.insert(d, v);
@@ -630,7 +630,7 @@ fn apply(f: &mut Func, pl: &Plan) {
     // behind the loop: header values are those of the last header copy,
     // and the exit's phis come from it
     let header_vals: Vec<Val> = f.blocks[h].insts.iter().filter_map(|i| i.dst).collect();
-    let mut outm: HashMap<Val, Val> = HashMap::new();
+    let mut outm: HashMap<Val, Val> = HashMap::default();
     for d in header_vals {
         outm.insert(d, resolve(&prev, d));
     }
@@ -810,9 +810,9 @@ impl<'a> Reach<'a> {
 fn fix_side_exits(f: &mut Func, pl: &Plan, bmap: &[HashMap<usize, BlockId>], vms: &[HashMap<Val, Val>]) {
     let h = pl.h;
     let trips = pl.trips as usize;
-    let in_loop: std::collections::HashSet<usize> = pl.blocks.iter().copied().collect();
-    let mut copy_of: HashMap<usize, usize> = HashMap::new();
-    let mut new_block_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let in_loop: crate::fx::HashSet<usize> = pl.blocks.iter().copied().collect();
+    let mut copy_of: HashMap<usize, usize> = HashMap::default();
+    let mut new_block_set: crate::fx::HashSet<usize> = crate::fx::HashSet::default();
     for (j, m) in bmap.iter().enumerate() {
         for &nb in m.values() {
             copy_of.insert(nb as usize, j);
@@ -850,10 +850,10 @@ fn fix_side_exits(f: &mut Func, pl: &Plan, bmap: &[HashMap<usize, BlockId>], vms
         }
     }
     // header values: phis and instructions of the header
-    let hdefs: std::collections::HashSet<Val> = f.blocks[h].insts.iter().filter_map(|i| i.dst).collect();
+    let hdefs: crate::fx::HashSet<Val> = f.blocks[h].insts.iter().filter_map(|i| i.dst).collect();
     // the old phi entries of the exit blocks, before anything is changed
     let outside: Vec<usize> = (0..nb_all).filter(|b| !in_loop.contains(b) && !new_block_set.contains(b)).collect();
-    let mut reach = Reach { f, preds, copy_of, vms, memo: HashMap::new(), phis: Vec::new() };
+    let mut reach = Reach { f, preds, copy_of, vms, memo: HashMap::default(), phis: Vec::new() };
     // 1. plan the new phi entries and the renamed uses of every outside block
     struct Edit {
         phi_inc: Vec<Vec<(BlockId, Val)>>,
@@ -887,7 +887,7 @@ fn fix_side_exits(f: &mut Func, pl: &Plan, bmap: &[HashMap<usize, BlockId>], vms
             }
         }
         term_uses(&reach.f.blocks[u].term, &mut uses);
-        let mut rename: HashMap<Val, Val> = HashMap::new();
+        let mut rename: HashMap<Val, Val> = HashMap::default();
         for d in uses {
             if hdefs.contains(&d) && !rename.contains_key(&d) {
                 let v = reach.at_start(u, d);

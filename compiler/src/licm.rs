@@ -53,7 +53,7 @@
 //! round. In `matmul` `r * n` reaches the head of the `cc` loop that way.
 
 use crate::fir::{BinOp, Func, Inst, Op, Term, Val};
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 /// Hoists loop invariant instructions into the preheader. Yields the count.
 pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
@@ -90,7 +90,7 @@ pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
     for (b, blk) in f.blocks.iter().enumerate() {
         for s in blk.term.successors() {
             let h = s as usize;
-            if h < n && dom[b][h] {
+            if h < n && dom.has(b, h) {
                 edges.push((h, b));
             }
         }
@@ -124,7 +124,7 @@ pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
 /// Body of the natural loop belonging to the back edge `back -> head`:
 /// `head` plus everything that reaches `back` without passing `head`.
 pub(crate) fn natural_loop(head: usize, back: usize, preds: &[Vec<usize>]) -> HashSet<usize> {
-    let mut body = HashSet::new();
+    let mut body = HashSet::default();
     body.insert(head);
     let mut stack = Vec::new();
     if back != head {
@@ -167,12 +167,12 @@ pub(crate) fn preheader_of(f: &Func, head: usize, body: &HashSet<usize>, preds: 
 /// decoder: `synth` loads its four rounding constants and two limit vectors
 /// in every pass -- six loads and three shuffles, twice.
 pub(crate) fn rodata_addrs(f: &Func) -> HashMap<Val, u64> {
-    let mut ro: HashMap<Val, u64> = HashMap::new();
+    let mut ro: HashMap<Val, u64> = HashMap::default();
     // cheap exit: no global address at all (most functions)
     if !f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, Op::GlobalAddr { .. }))) {
         return ro;
     }
-    let mut consts: HashMap<Val, i128> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             match (&i.op, i.dst) {
@@ -291,7 +291,7 @@ fn hoist_out(
     let mut buf: Vec<Val> = Vec::new();
     let mut order: Vec<usize> = body.iter().copied().collect();
     order.sort_unstable();
-    let mut in_loop: HashSet<Val> = HashSet::new();
+    let mut in_loop: HashSet<Val> = HashSet::default();
     for &b in &order {
         for i in &f.blocks[b].insts {
             if let Some(d) = i.dst {

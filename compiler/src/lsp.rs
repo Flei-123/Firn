@@ -26,7 +26,7 @@
 //! „jump to definition" — the diagnostics come from a compilation of the
 //! whole module tree all the same, so nothing is claimed that is untrue.
 
-use std::collections::HashMap;
+use crate::fx::HashMap;
 use std::io::{Read, Write};
 
 use crate::ast::{Block, Program, Stmt};
@@ -945,7 +945,7 @@ fn run_formatter(src: &str) -> Option<String> {
 
 /// The main loop: read a message, answer it. Ends with `exit`.
 pub fn serve() -> i32 {
-    let mut server = Server { docs: HashMap::new(), out: std::io::stdout() };
+    let mut server = Server { docs: HashMap::default(), out: std::io::stdout() };
     let mut input = std::io::stdin();
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];

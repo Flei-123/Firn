@@ -36,7 +36,7 @@
 //! leave. With them the lowering knows at every exit which locals still own
 //! a value and calls their `drop` in reverse order of declaration.
 
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diag::Span;
@@ -76,8 +76,8 @@ pub(crate) fn hook_check(ck: &mut Checker, prog: &Program) {
     }
     // 2. the moves
     let mut errors: Vec<(Span, String, String)> = Vec::new();
-    let mut moved: HashSet<ExprId> = HashSet::new();
-    let mut if_leaves: HashMap<ExprId, (bool, bool)> = HashMap::new();
+    let mut moved: HashSet<ExprId> = HashSet::default();
+    let mut if_leaves: HashMap<ExprId, (bool, bool)> = HashMap::default();
     for f in &prog.funcs {
         if f.extern_info.is_some() {
             continue;
@@ -138,7 +138,7 @@ pub(crate) fn nontrivial_in(tcx: &TypeCtx, drops: &HashSet<usize>, t: &Type, dep
 
 /// The structs that have a `drop` of their own.
 fn drop_types(tcx: &TypeCtx, fns: &HashMap<String, FnSig>) -> HashSet<usize> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for (i, s) in tcx.structs.iter().enumerate() {
         let prefix = s.name.strip_prefix("gc ").unwrap_or(&s.name);
         if fns.contains_key(&format!("{}__drop", prefix)) {

@@ -14,7 +14,7 @@
 //! a lone remainder slower. Switch: `--no-pass=divrem`.
 
 use crate::fir::{BinOp, FTy, Func, Inst, Op, Val};
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 type Key = (u32, bool, Val, i128);
 
@@ -24,7 +24,7 @@ fn key(ty: FTy, a: Val, c: i128) -> Key {
 
 /// Rewrites matching remainders; returns how many.
 pub fn run(f: &mut Func) -> usize {
-    let mut consts: HashMap<Val, i128> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
@@ -39,7 +39,7 @@ pub fn run(f: &mut Func) -> usize {
         let m = c.unsigned_abs();
         c != 0 && m != 1 && !m.is_power_of_two()
     };
-    let mut divs: HashSet<Key> = HashSet::new();
+    let mut divs: HashSet<Key> = HashSet::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let Op::Bin(BinOp::Div, a, d) = &i.op {

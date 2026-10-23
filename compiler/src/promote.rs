@@ -88,7 +88,7 @@
 //! synchronisation. Every atomic operation counts as a write of every cell.
 
 use crate::fir::{BinOp, BlockId, FTy, Func, Inst, Loc, Module, Op, Term, Val};
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 /// Largest header (instructions besides phis) that `rotate_loops` duplicates.
 const ROT_LIMIT: usize = 24;
@@ -317,13 +317,13 @@ impl LoopInfo {
 
 /// All natural loops, one per header (bodies of several back edges into the
 /// same header are united). Sorted by size, smallest first.
-fn find_loops(f: &Func, preds: &[Vec<usize>], dom: &[Vec<bool>]) -> Vec<LoopInfo> {
+fn find_loops(f: &Func, preds: &[Vec<usize>], dom: &crate::mem2reg::Dom) -> Vec<LoopInfo> {
     let n = f.blocks.len();
-    let mut by_head: HashMap<usize, (Vec<bool>, Vec<usize>)> = HashMap::new();
+    let mut by_head: HashMap<usize, (Vec<bool>, Vec<usize>)> = HashMap::default();
     for (b, blk) in f.blocks.iter().enumerate() {
         for s in blk.term.successors() {
             let h = s as usize;
-            if h < n && dom[b][h] {
+            if h < n && dom.has(b, h) {
                 let body = natural_loop(h, b, preds, n);
                 let e = by_head.entry(h).or_insert_with(|| (vec![false; n], Vec::new()));
                 for i in 0..n {
@@ -371,7 +371,7 @@ pub(crate) fn rotate_loops(f: &mut Func, only: &HashSet<usize>, guards: &HashSet
         return 0;
     }
     let mut done = 0;
-    let mut tried: HashSet<usize> = HashSet::new();
+    let mut tried: HashSet<usize> = HashSet::default();
     // One loop per round; the analysis is rebuilt after every change.
     for _ in 0..64 {
         let preds = crate::mem2reg::preds(f);
@@ -469,7 +469,7 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>], guard: bool) -> 
         }
     }
     // Values defined in H.
-    let mut defined: HashSet<Val> = HashSet::new();
+    let mut defined: HashSet<Val> = HashSet::default();
     for i in &f.blocks[h].insts {
         if let Some(d) = i.dst {
             defined.insert(d);
@@ -530,7 +530,7 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>], guard: bool) -> 
     let x = if !guard && preds[x].len() != 1 { split_edge(f, h, x) } else { x };
 
     // ---- demote the values used outside H into slots
-    let mut slot_of: HashMap<Val, Val> = HashMap::new();
+    let mut slot_of: HashMap<Val, Val> = HashMap::default();
     for v in &need {
         let t = f.val_ty(*v);
         let bytes = t.bytes().max(1);
@@ -619,7 +619,7 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>], guard: bool) -> 
                 if !matches!(i.op, Op::Phi { .. }) {
                     let mut us = Vec::new();
                     i.op.uses(&mut us);
-                    let mut local: HashMap<Val, Val> = HashMap::new();
+                    let mut local: HashMap<Val, Val> = HashMap::default();
                     for u in us {
                         if let Some(&s) = slot_of.get(&u) {
                             if !local.contains_key(&u) {
@@ -658,7 +658,7 @@ fn rotate_one(f: &mut Func, l: &LoopInfo, preds: &[Vec<usize>], guard: bool) -> 
     // ---- the guard: a clone of H for the entry from P
     let g = f.add_block() as usize;
     let p2 = f.add_block() as usize;
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     let hinsts = f.blocks[h].insts.clone();
     let mut ginsts: Vec<Inst> = Vec::with_capacity(hinsts.len());
     for i in hinsts {
@@ -744,8 +744,8 @@ fn syscall_unmaps(nr: Option<i128>) -> bool {
 }
 
 fn const_defs(f: &Func) -> HashMap<Val, i128> {
-    let mut cnt: HashMap<Val, u32> = HashMap::new();
-    let mut val: HashMap<Val, i128> = HashMap::new();
+    let mut cnt: HashMap<Val, u32> = HashMap::default();
+    let mut val: HashMap<Val, i128> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let Some(d) = i.dst {
@@ -966,7 +966,7 @@ impl<'a> Ctx<'a> {
 /// Stack slots whose address never leaves loads/stores (as the address) and
 /// constant `ptradd`s thereof: nothing but their own root can reach them.
 fn private_slots(f: &Func) -> HashSet<Val> {
-    let mut cand: HashSet<Val> = HashSet::new();
+    let mut cand: HashSet<Val> = HashSet::default();
     for i in &f.blocks[0].insts {
         if let (Op::Alloca { .. }, Some(d)) = (&i.op, i.dst) {
             cand.insert(d);
@@ -996,7 +996,7 @@ fn private_slots(f: &Func) -> HashSet<Val> {
             break;
         }
     }
-    let mut bad: HashSet<Val> = HashSet::new();
+    let mut bad: HashSet<Val> = HashSet::default();
     let mut us = Vec::new();
     for b in &f.blocks {
         for i in &b.insts {
@@ -1112,7 +1112,7 @@ impl<'a> Ctx<'a> {
                 Some(c) => c,
                 None => continue,
             };
-            let mut seen: HashSet<Val> = HashSet::new();
+            let mut seen: HashSet<Val> = HashSet::default();
             let mut stack: Vec<Val> = vec![c];
             let mut hit = false;
             while let Some(v) = stack.pop() {
@@ -1193,12 +1193,12 @@ impl<'a> Ctx<'a> {
 /// The loops worth rotating (promotion targets) and the inner loops worth a
 /// guard (their direct children).
 pub(crate) fn candidate_loops(f: &mut Func, nounmap: &HashSet<String>) -> (HashSet<usize>, HashSet<usize>) {
-    let mut heads: HashSet<usize> = HashSet::new();
-    let mut kids: HashSet<usize> = HashSet::new();
+    let mut heads: HashSet<usize> = HashSet::default();
+    let mut kids: HashSet<usize> = HashSet::default();
     if !fit(f) {
         return (heads, kids);
     }
-    let mut rejected: HashSet<(usize, Cell)> = HashSet::new();
+    let mut rejected: HashSet<(usize, Cell)> = HashSet::default();
     let mut found: Vec<(usize, Vec<usize>)> = Vec::new();
     scan(f, nounmap, &mut rejected, Some(&mut found));
     let no_children = std::env::var_os("FIRN_PROMOTE_NO_CHILD_GUARD").is_some();
@@ -1224,7 +1224,7 @@ pub(crate) fn promote_cells(f: &mut Func, nounmap: &HashSet<String>) -> usize {
         return 0;
     }
     let mut done = 0;
-    let mut rejected: HashSet<(usize, Cell)> = HashSet::new();
+    let mut rejected: HashSet<(usize, Cell)> = HashSet::default();
     for _ in 0..256 {
         match scan(f, nounmap, &mut rejected, None) {
             true => done += 1,
@@ -1379,7 +1379,7 @@ fn analyse(
     f: &Func,
     cx: &Ctx,
     preds: &[Vec<usize>],
-    dom: &[Vec<bool>],
+    dom: &crate::mem2reg::Dom,
     loops: &[LoopInfo],
     l: &LoopInfo,
     blocks: &[usize],
@@ -1470,12 +1470,12 @@ fn analyse(
     }
     // outside the regions: exact accesses, reads, no foreign writes
     let mut exact: Vec<(usize, usize)> = Vec::new();
-    let mut reads: HashSet<(usize, usize)> = HashSet::new();
+    let mut reads: HashSet<(usize, usize)> = HashSet::default();
     let mut guard_access = false;
     let mut any_store = false;
     let mut guard_store = false;
     let dominates_all = |d: usize| -> bool {
-        l.latches.iter().all(|&t| dom[t][d]) && exiting.iter().all(|&e| dom[e][d])
+        l.latches.iter().all(|&t| dom.has(t, d)) && exiting.iter().all(|&e| dom.has(e, d))
     };
     for &b in blocks {
         if !live[b] {

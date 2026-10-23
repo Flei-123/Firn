@@ -31,7 +31,7 @@
 
 use crate::fir::{BinOp, FTy, Func, Inst, Op, Term, Val};
 use crate::simd::SimdKind;
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 /// The copy with sunk addresses, or `None` when there is nothing to sink.
 pub fn sink(f: &Func) -> Option<Func> {
@@ -39,7 +39,7 @@ pub fn sink(f: &Func) -> Option<Func> {
         return None;
     }
     let nv = f.val_types.len();
-    let mut consts: HashMap<Val, i128> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
     let mut defs = vec![0u32; nv];
     for b in &f.blocks {
         for i in &b.insts {
@@ -54,7 +54,7 @@ pub fn sink(f: &Func) -> Option<Func> {
         }
     }
     // candidates: d -> (the defining op to copy, its type)
-    let mut cand: HashMap<Val, (Op, FTy)> = HashMap::new();
+    let mut cand: HashMap<Val, (Op, FTy)> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             let d = match i.dst {
@@ -86,8 +86,8 @@ pub fn sink(f: &Func) -> Option<Func> {
         return None;
     }
     // every reader must be a memory access through it; count them
-    let mut readers: HashMap<Val, u32> = HashMap::new();
-    let mut bad: std::collections::HashSet<Val> = std::collections::HashSet::new();
+    let mut readers: HashMap<Val, u32> = HashMap::default();
+    let mut bad: crate::fx::HashSet<Val> = crate::fx::HashSet::default();
     let mut buf = Vec::new();
     for b in &f.blocks {
         for i in b.insts.iter() {
@@ -126,7 +126,7 @@ pub fn sink(f: &Func) -> Option<Func> {
     // Only addresses with two or more readers: a single reader either
     // stands right behind (folded already) or the sinking buys one `lea`
     // for a longer base -- not worth a second allocation.
-    let sinkable: std::collections::HashSet<Val> = cand
+    let sinkable: crate::fx::HashSet<Val> = cand
         .keys()
         .copied()
         .filter(|d| !bad.contains(d) && readers.get(d).copied().unwrap_or(0) >= 2)

@@ -58,7 +58,7 @@
 //!   that statement false, so interrupt handlers keep the old path.
 
 use crate::fir::{FTy, Func, Inst, Op, Term, Val};
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 /// The registers handed out. Callee-saved (AAPCS64) AND covered by the
 /// register save of `emit_gc_addr` — see the header.
@@ -310,8 +310,8 @@ thread_local! {
     /// r845: the functions of the module that can NEVER reach a safepoint (no `GcAddr`, no system call, no atomic, no
     /// thread operation, no inline assembler, no indirect call, no call of anything outside the module -- transitively).
     /// Filled by `compute_silent` at the start of the code generation of a module.
-    static SILENT: std::cell::RefCell<std::collections::HashSet<String>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
+    static SILENT: std::cell::RefCell<crate::fx::HashSet<String>> =
+        std::cell::RefCell::new(crate::fx::HashSet::default());
 }
 
 /// r845: greatest fixed point over the call graph. A function is silent if it consists of plain operations and calls of
@@ -319,9 +319,9 @@ thread_local! {
 /// world -- so a caller may keep a value (a pointer too) in x25-x28 ACROSS a call of it, although the collector reads
 /// only x19-x24 at a save point.
 pub(crate) fn compute_silent(m: &crate::fir::Module) {
-    use std::collections::{HashMap, HashSet};
-    let mut cand: HashSet<&str> = HashSet::new();
-    let mut calls: HashMap<&str, Vec<&str>> = HashMap::new();
+    use crate::fx::{HashMap, HashSet};
+    let mut cand: HashSet<&str> = HashSet::default();
+    let mut calls: HashMap<&str, Vec<&str>> = HashMap::default();
     for f in &m.funcs {
         if f.interrupt {
             continue;
@@ -500,7 +500,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     // here word for word: only a value with EXACTLY ONE definition IS the
     // constant its `const` instruction names. After `phi.rs` a value can be
     // written from several blocks.
-    let mut defs: HashMap<Val, u32> = HashMap::new();
+    let mut defs: HashMap<Val, u32> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let Some(d) = i.dst {
@@ -570,7 +570,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     let cells = if std::env::var_os("FIRN_A64_CELLS").is_some() {
         crate::regalloc::promotable_cells(f)
     } else {
-        HashMap::new()
+        HashMap::default()
     };
 
     // ---- intervals and weights ----------------------------------------
@@ -726,7 +726,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     if !leaf {
         let mut bar_all: Vec<usize> = Vec::new();
         let mut bar_gc: Vec<usize> = Vec::new();
-        let mut bar_call: HashMap<usize, Val> = HashMap::new();
+        let mut bar_call: HashMap<usize, Val> = HashMap::default();
         SILENT.with(|sl| {
             let sl = sl.borrow();
             for (bi, b) in f.blocks.iter().enumerate() {
@@ -799,7 +799,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     // `safepoints`.
     if live.converged && !ra.saved.is_empty() {
         // Occupied intervals, sorted by register.
-        let mut per_reg: HashMap<&'static str, Vec<(usize, usize)>> = HashMap::new();
+        let mut per_reg: HashMap<&'static str, Vec<(usize, usize)>> = HashMap::default();
         for (k, iv) in ivs.iter().enumerate() {
             if let Some(r) = got[k] {
                 per_reg.entry(r).or_default().push((iv.start, iv.end));
@@ -829,7 +829,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
     }
     // ---- where a pointer dies ----------------------------------------------
     if live.converged {
-        let mut per_reg: HashMap<&'static str, Vec<(usize, usize)>> = HashMap::new();
+        let mut per_reg: HashMap<&'static str, Vec<(usize, usize)>> = HashMap::default();
         for (k, iv) in ivs.iter().enumerate() {
             if let Some(r) = got[k] {
                 per_reg.entry(r).or_default().push((iv.start, iv.end));
@@ -846,7 +846,7 @@ pub(crate) fn allocate(f: &Func) -> RaA64 {
         // value is neither live-out of this block nor live-in of any later one
         // -- otherwise `touch(block_end)` / `touch(block_start)` would have
         // pushed the end there. Exactly then the clearing is safe.
-        let mut place: HashMap<usize, (usize, usize)> = HashMap::new();
+        let mut place: HashMap<usize, (usize, usize)> = HashMap::default();
         for (bi, b) in f.blocks.iter().enumerate() {
             for ii in 0..b.insts.len() {
                 place.insert(live.pos[bi][ii], (bi, ii));

@@ -29,7 +29,7 @@
 //! carries `must_consume = true`, `sema::check_discard` reports discarding it.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 use crate::ast::{Expr, ExprId, ExprKind, TypeExpr};
 use crate::diag::Span;
@@ -739,7 +739,7 @@ fn check_catch(ck: &mut Checker, id: ExprId, args: &[Expr]) -> Type {
             Some(t) => t,
             None => Type::Error,
         };
-        ck.scopes.push(std::collections::HashMap::new());
+        ck.scopes.push(crate::fx::HashMap::default());
         ck.declare_var(name, set_ty, false, rhs.span);
     }
     let rt = ck.expr(rhs, Some(&want));

@@ -182,7 +182,7 @@ fn pattern(
     preds: &[Vec<usize>],
     defblock: &[Option<usize>],
     npar: usize,
-    dom: &[Vec<bool>],
+    dom: &crate::mem2reg::Dom,
     h: usize,
 ) -> Option<(usize, usize, Val, Val, Val, u8)> {
     // --- head: phi, unsigned 64 bit compare, conditional jump -------------
@@ -331,7 +331,7 @@ fn pattern(
             continue;
         }
         match defblock.get(v as usize).copied().flatten() {
-            Some(db) if db == p || dom[p][db] => {}
+            Some(db) if db == p || dom.has(p, db) => {}
             _ => return None,
         }
     }

@@ -72,7 +72,7 @@ use crate::ast::{Expr, ExprId, ExprKind, FnDecl, Param, Program, TypeExpr, UnOp}
 use crate::diag::Span;
 use crate::lexer::TokKind;
 use crate::parser::Parser;
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 use crate::sema::{Checker, FnSig, TypeInfo};
 use crate::types::{Type, TypeCtx};

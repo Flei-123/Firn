@@ -23,7 +23,7 @@
 //! module and there are no interface files.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::ast::{Block, Expr, ExprKind, Program, Stmt, TypeExpr};
@@ -174,13 +174,13 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
     let work_dir = package_world::cwd();
     let base = root.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let mut out: Vec<SourceFile> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut seen: HashSet<PathBuf> = HashSet::default();
     let mut queue: Vec<Waiting> = vec![Waiting {
         path: root.to_path_buf(),
         span: Span::none(),
     }];
     // module name -> path seen first, for the conflict check.
-    let mut names: HashMap<String, String> = HashMap::new();
+    let mut names: HashMap<String, String> = HashMap::default();
     while !queue.is_empty() {
         let entry = queue.remove(0);
         let path = entry.path;
@@ -587,7 +587,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     // Which module offers what?
     let mut infos: Vec<ModuleInfo> = Vec::new();
     for (f, p) in files.iter().zip(progs.iter()) {
-        let mut items: HashSet<String> = HashSet::new();
+        let mut items: HashSet<String> = HashSet::default();
         let consts: HashSet<String> = p.consts.iter().map(|c| c.name.clone()).collect();
         for x in &p.funcs {
             items.insert(x.name.clone());
@@ -708,8 +708,8 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
                     .collect()
             })
             .collect(),
-        done: RefCell::new(HashMap::new()),
-        visiting: RefCell::new(HashSet::new()),
+        done: RefCell::new(HashMap::default()),
+        visiting: RefCell::new(HashSet::default()),
     };
 
     for (idx, mut p) in progs.into_iter().enumerate() {
@@ -862,7 +862,7 @@ struct Renamer<'a, 'b> {
 
 impl<'a, 'b> Renamer<'a, 'b> {
     fn push_scope(&mut self) {
-        self.locals.push(HashSet::new());
+        self.locals.push(HashSet::default());
     }
     fn pop_scope(&mut self) {
         self.locals.pop();

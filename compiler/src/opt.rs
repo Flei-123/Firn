@@ -28,7 +28,7 @@
 //! the optimizer cannot hang under any circumstances.
 
 use crate::fir::{BinOp, BlockId, CmpOp, FTy, Func, Module, Op, Term, UnOp, Val};
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 /// hard upper bound of the fixpoint iterations
 const MAX_ROUNDS: u32 = 50;
@@ -1045,8 +1045,8 @@ fn cse(f: &mut Func) -> usize {
     let dom = crate::mem2reg::dominators(f);
     let n = f.blocks.len();
     let ro = crate::licm::rodata_addrs(f);
-    let mut avail: HashMap<Key, Vec<(usize, Val)>> = HashMap::new();
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut avail: HashMap<Key, Vec<(usize, Val)>> = HashMap::default();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     let mut kill: Vec<(usize, usize)> = Vec::new();
     for bi in 0..n {
         for ii in 0..f.blocks[bi].insts.len() {
@@ -1066,7 +1066,7 @@ fn cse(f: &mut Func) -> usize {
             let mut hit = None;
             for &(ob, ov) in e.iter() {
                 // Dominance: same block (earlier) or dominating block
-                if (ob == bi || dom[bi][ob]) && !f.is_secret(ov) {
+                if (ob == bi || dom.has(bi, ob)) && !f.is_secret(ov) {
                     hit = Some(ov);
                     break;
                 }
@@ -1123,10 +1123,10 @@ fn cse(f: &mut Func) -> usize {
 fn known_facts(f: &Func) -> Vec<HashMap<Val, bool>> {
     let preds = crate::mem2reg::preds(f);
     let n = f.blocks.len();
-    let mut known: Vec<HashMap<Val, bool>> = vec![HashMap::new(); n];
+    let mut known: Vec<HashMap<Val, bool>> = vec![HashMap::default(); n];
     for bi in 0..n {
         let mut cur = bi;
-        let mut facts: HashMap<Val, bool> = HashMap::new();
+        let mut facts: HashMap<Val, bool> = HashMap::default();
         for _ in 0..64 {
             if preds[cur].len() != 1 {
                 break;
@@ -1232,7 +1232,7 @@ fn remove_provable_index_checks(f: &mut Func) -> usize {
     }
     let consts = const_map(f);
     // Every comparison in the function, by the value it produces.
-    let mut cmps: HashMap<Val, (CmpOp, Val, Val)> = HashMap::new();
+    let mut cmps: HashMap<Val, (CmpOp, Val, Val)> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Cmp { op, a, b: rhs, .. }) = (i.dst, &i.op) {
@@ -1243,9 +1243,9 @@ fn remove_provable_index_checks(f: &mut Func) -> usize {
     let known = known_facts(f);
     let preds = crate::mem2reg::preds(f);
     // Where every value is defined: (block, position in that block).
-    let mut site: HashMap<Val, (usize, usize)> = HashMap::new();
+    let mut site: HashMap<Val, (usize, usize)> = HashMap::default();
     // The address a value was LOADED from, if it is a load.
-    let mut loaded_from: HashMap<Val, Val> = HashMap::new();
+    let mut loaded_from: HashMap<Val, Val> = HashMap::default();
     for (bi, b) in f.blocks.iter().enumerate() {
         for (ii, i) in b.insts.iter().enumerate() {
             if let Some(d) = i.dst {
@@ -1352,7 +1352,7 @@ fn remove_provable_index_checks(f: &mut Func) -> usize {
     if hits.is_empty() {
         return 0;
     }
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     for (bi, ii, dst, idx) in hits {
         f.blocks[bi].insts[ii].op = Op::Const(0);
         map.insert(dst, idx);
@@ -1366,7 +1366,7 @@ fn remove_provable_index_checks(f: &mut Func) -> usize {
 
 /// Collects all known constant values of the function.
 fn const_map(f: &Func) -> HashMap<Val, i128> {
-    let mut m = HashMap::new();
+    let mut m = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
@@ -1836,8 +1836,8 @@ fn collect_uses_filtered(
     blocks: &[usize],
     phi_edge: &dyn Fn(crate::fir::BlockId) -> bool,
 ) -> HashSet<Val> {
-    let mut used: HashSet<Val> = HashSet::new();
-    let mut phi_args: HashMap<Val, Vec<Val>> = HashMap::new();
+    let mut used: HashSet<Val> = HashSet::default();
+    let mut phi_args: HashMap<Val, Vec<Val>> = HashMap::default();
     let mut work: Vec<Val> = Vec::new();
     let mut buf = Vec::new();
     for &bi in blocks {
@@ -1890,7 +1890,7 @@ fn remove_unreachable_blocks(f: &mut Func, st: &mut OptStats) -> bool {
     if f.blocks.is_empty() {
         return false;
     }
-    let mut index_of: HashMap<BlockId, usize> = HashMap::new();
+    let mut index_of: HashMap<BlockId, usize> = HashMap::default();
     for (i, b) in f.blocks.iter().enumerate() {
         index_of.insert(b.id, i);
     }
@@ -1971,7 +1971,7 @@ fn remove_unreachable_blocks(f: &mut Func, st: &mut OptStats) -> bool {
     let removed_blocks = reachable.iter().filter(|&&r| !r).count();
 
     // renumber without gaps, the order survives
-    let mut new_id: HashMap<BlockId, BlockId> = HashMap::new();
+    let mut new_id: HashMap<BlockId, BlockId> = HashMap::default();
     let mut kept = Vec::with_capacity(live_idx.len());
     for (n, &i) in live_idx.iter().enumerate() {
         new_id.insert(f.blocks[i].id, n as BlockId);

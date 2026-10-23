@@ -52,7 +52,7 @@
 
 use crate::codegen_x86::{block_label, label, size_word, Emitter, Frame, ARG_REGS};
 use crate::fir::{BinOp, Block, BlockId, CmpOp, FTy, Func, Inst, Op, Term, UnOp, Val};
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 /// Place of a value after the allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -975,7 +975,7 @@ fn exact_crossings(f: &Func, live: &Live) -> Vec<RegMask> {
 
 /// Finds `alloca`s that can live entirely in a register.
 pub(crate) fn promotable_cells(f: &Func) -> HashMap<Val, FTy> {
-    let mut cand: HashMap<Val, Option<FTy>> = HashMap::new();
+    let mut cand: HashMap<Val, Option<FTy>> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Alloca { size, .. }) = (i.dst, &i.op) {
@@ -986,7 +986,7 @@ pub(crate) fn promotable_cells(f: &Func) -> HashMap<Val, FTy> {
         }
     }
     if cand.is_empty() {
-        return HashMap::new();
+        return HashMap::default();
     }
     let mut bad: Vec<Val> = Vec::new();
     let mut buf = Vec::new();
@@ -1068,7 +1068,7 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
     // of the sum was replaced by the immediate `0` of its FIRST definition
     // and the `add` on the back edge wrote a value nobody looked at again.
     // The same trap sits in `codegen_a64.rs::layout`.
-    let mut defs: HashMap<Val, u32> = HashMap::new();
+    let mut defs: HashMap<Val, u32> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let Some(d) = i.dst {
@@ -1076,7 +1076,7 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
             }
         }
     }
-    let mut cand: HashMap<Val, i64> = HashMap::new();
+    let mut cand: HashMap<Val, i64> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
@@ -1168,7 +1168,7 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
 /// base of a `ptradd`: they are addressed through `rbp` directly, the pointer
 /// never has to sit in a register.
 fn direct_frame_addrs(f: &Func, fr: &Frame) -> HashMap<Val, u64> {
-    let mut cand: HashMap<Val, u64> = HashMap::new();
+    let mut cand: HashMap<Val, u64> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Alloca { .. }) = (i.dst, &i.op) {
@@ -1473,15 +1473,15 @@ pub fn allocate(f: &Func) -> Alloc {
     }
     let mut alloc = Alloc {
         locs,
-        alias: HashMap::new(),
-        alias_src: HashMap::new(),
-        imms: HashMap::new(),
-        frame_addr: HashMap::new(),
-        fconst: HashMap::new(),
-        cells: HashMap::new(),
-        cell_ty: HashMap::new(),
+        alias: HashMap::default(),
+        alias_src: HashMap::default(),
+        imms: HashMap::default(),
+        frame_addr: HashMap::default(),
+        fconst: HashMap::default(),
+        cells: HashMap::default(),
+        cell_ty: HashMap::default(),
         saved: Vec::new(),
-        call_saves: HashMap::new(),
+        call_saves: HashMap::default(),
         frame,
         stats: None,
         value_slots: nv,
@@ -1522,7 +1522,7 @@ pub fn allocate(f: &Func) -> Alloc {
     // as a memory operand from `.rodata`. Condition: the value is touched ONLY
     // in the floating-point path of the output (otherwise someone would fetch it with `mov`
     // from a slot that does not exist) and is not `secret`.
-    let mut fconst: HashMap<Val, (String, bool)> = HashMap::new();
+    let mut fconst: HashMap<Val, (String, bool)> = HashMap::default();
     let only_here = match std::env::var("FIRN_FPOOL_ONLY") {
         Ok(v) => f.name.contains(&v),
         Err(_) => true,
@@ -1536,7 +1536,7 @@ pub fn allocate(f: &Func) -> Alloc {
         // pool reads the 1.0 forever in the loop -- measured:
         // `math.powi(2.0, 10)` gave 1.0 instead of 1024.0. So only values with EXACTLY
         // ONE write site (the same rule as in `immediate_consts`).
-        let mut defs: HashMap<Val, u32> = HashMap::new();
+        let mut defs: HashMap<Val, u32> = HashMap::default();
         for b in &f.blocks {
             for i in &b.insts {
                 if let Some(d) = i.dst {
@@ -1581,7 +1581,7 @@ pub fn allocate(f: &Func) -> Alloc {
     // round XMM 3: the calling convention copies aggregates
     // eight bytes at a time and reads an `f64` with `mov` in doing so).
     let fp_ok = fp_taugt(f);
-    let mut fp_cells: std::collections::HashSet<Val> = std::collections::HashSet::new();
+    let mut fp_cells: crate::fx::HashSet<Val> = crate::fx::HashSet::default();
     if std::env::var_os("FIRN_NO_FP_CELLS").is_none() {
         for (&c, t) in cells.iter() {
             if !t.is_float() {
@@ -1689,7 +1689,7 @@ pub fn allocate(f: &Func) -> Alloc {
         }
         c
     };
-    let mut save_set: std::collections::HashSet<Val> = std::collections::HashSet::new();
+    let mut save_set: crate::fx::HashSet<Val> = crate::fx::HashSet::default();
     let cs_int = std::env::var_os("FIRN_CS_INT").is_some();
     let cs_k: u64 = std::env::var("FIRN_CS_K").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
 
@@ -1885,7 +1885,7 @@ pub fn allocate(f: &Func) -> Alloc {
     // with one another: an `if` in the loop body writes the
     // loop variable once in each branch, and the branches
     // exclude each other.
-    let mut coalesced: HashMap<Val, Val> = HashMap::new();
+    let mut coalesced: HashMap<Val, Val> = HashMap::default();
     // NOT WITHOUT A FIXED POINT OF THE LIVENESS. Below the round limit of
     // `compute_live` the sets are possibly TOO SMALL -- and a
     // value that is wrongly assumed to be no longer alive would be
@@ -1904,7 +1904,7 @@ pub fn allocate(f: &Func) -> Alloc {
         // whole function for every candidate -- in `bin/firnc1.fi`
         // that cost twelve percent of translation time for nothing.
         let mut defs: Vec<u32> = vec![0; nv];
-        let mut defsites: HashMap<Val, Vec<(usize, usize)>> = HashMap::new();
+        let mut defsites: HashMap<Val, Vec<(usize, usize)>> = HashMap::default();
         for (bi, b) in f.blocks.iter().enumerate() {
             for (ii, i) in b.insts.iter().enumerate() {
                 if let Some(d) = i.dst {
@@ -1918,7 +1918,7 @@ pub fn allocate(f: &Func) -> Alloc {
         let read0 = count_reads(f);
         let coal_multi = std::env::var_os("FIRN_COAL_SINGLE").is_none();
         let np = f.params.len() as Val;
-        let mut sources: HashMap<Val, Vec<Val>> = HashMap::new();
+        let mut sources: HashMap<Val, Vec<Val>> = HashMap::default();
         for (bi, b) in f.blocks.iter().enumerate() {
             for (ii, i) in b.insts.iter().enumerate() {
                 // ROUND TEMPO 10 -- THE TWO-OPERAND FORM IS ALSO A
@@ -2334,9 +2334,9 @@ pub fn allocate(f: &Func) -> Alloc {
     let mut free_arg: Vec<&'static str> = ARG_SPARE.to_vec();
     let mut free_div: Vec<&'static str> = DIV_SPARE.to_vec();
     let mut active: Vec<(Iv, &'static str)> = Vec::new();
-    let mut assign: HashMap<Val, &'static str> = HashMap::new();
+    let mut assign: HashMap<Val, &'static str> = HashMap::default();
     let mut used_saved: Vec<&'static str> = Vec::new();
-    let mut fp_assign: HashMap<Val, &'static str> = HashMap::new();
+    let mut fp_assign: HashMap<Val, &'static str> = HashMap::default();
 
     let free = |r: &'static str,
                      free_saved: &mut Vec<&'static str>,
@@ -2960,7 +2960,7 @@ pub fn allocate(f: &Func) -> Alloc {
     // in the same register, and restoring would overwrite the result.
     // ROUND TK2: which value owns the slot named in a save entry (the frame
     // is compacted below, and the entries have to follow their values).
-    let mut save_owner: HashMap<u64, Val> = HashMap::new();
+    let mut save_owner: HashMap<u64, Val> = HashMap::default();
     if !save_set.is_empty() {
         let mut sv: Vec<Val> = save_set.iter().copied().collect();
         sv.sort_unstable();
@@ -3121,7 +3121,7 @@ fn compact_frame(
         }
     }
     // The values still homed in a slot, grouped by the slot they have now.
-    let mut groups: HashMap<u64, Vec<Val>> = HashMap::new();
+    let mut groups: HashMap<u64, Vec<Val>> = HashMap::default();
     for v in 0..nv {
         if let Loc::Slot(off) = alloc.locs[v] {
             if off != 0 {
@@ -3164,7 +3164,7 @@ fn compact_frame(
     }
     cand.sort_by(|a, b| (a.0, a.1, a.3).cmp(&(b.0, b.1, b.3)));
     // linear scan over the slots
-    let mut slot_no: HashMap<u64, u64> = HashMap::new(); // old slot -> new slot number
+    let mut slot_no: HashMap<u64, u64> = HashMap::default(); // old slot -> new slot number
     let mut nslots: u64 = 0;
     let mut free: Vec<u64> = Vec::new();
     let mut active: std::collections::BinaryHeap<std::cmp::Reverse<(usize, u64)>> =
@@ -3314,7 +3314,7 @@ struct Ra<'a> {
     /// they move entirely into its operand.
     offset: HashMap<Val, Address>,
     /// Instructions (scaling `shl`/`mul`) that disappear entirely along the way.
-    skipped: std::collections::HashSet<Val>,
+    skipped: crate::fx::HashSet<Val>,
     /// Instructions of which only the FILLING of their register is left:
     /// value -> source value. The rest of the computation sits in the memory
     /// operand of the following access.
@@ -3423,14 +3423,14 @@ fn foldable_addresses(
     read: &[u32],
 ) -> (
     HashMap<Val, Address>,
-    std::collections::HashSet<Val>,
+    crate::fx::HashSet<Val>,
     HashMap<Val, Val>,
     HashMap<Val, (&'static str, &'static str, i64)>,
 ) {
-    use std::collections::HashSet;
-    let mut out: HashMap<Val, Address> = HashMap::new();
-    let mut away: HashSet<Val> = HashSet::new();
-    let mut before: HashMap<Val, Val> = HashMap::new();
+    use crate::fx::HashSet;
+    let mut out: HashMap<Val, Address> = HashMap::default();
+    let mut away: HashSet<Val> = HashSet::default();
+    let mut before: HashMap<Val, Val> = HashMap::default();
     // ROUND TEMPO 3 -- the SCALING INTO THE ADDRESS CALCULATION.
     //
     // A base pointer that SEVERAL accesses use cannot move into the
@@ -3439,7 +3439,7 @@ fn foldable_addresses(
     // the same as `lea t, [idx*4]` followed by `lea d, [base + t]` -- in
     // one instruction instead of two. Measured in the hot loop of the
     // synthesis filter bank: there this pair stands twice per iteration.
-    let mut scale: HashMap<Val, (&'static str, &'static str, i64)> = HashMap::new();
+    let mut scale: HashMap<Val, (&'static str, &'static str, i64)> = HashMap::default();
     if std::env::var_os("FIRN_NO_FALTUNG").is_some() {
         return (out, away, before, scale);
     }
@@ -3691,7 +3691,7 @@ fn foldable_addresses(
                             }
                         }
                     }
-                    let mut rd: HashMap<Val, Vec<(usize, usize)>> = HashMap::new();
+                    let mut rd: HashMap<Val, Vec<(usize, usize)>> = HashMap::default();
                     let mut buf = Vec::new();
                     for (bj, bb) in f.blocks.iter().enumerate() {
                         for (jj, ins) in bb.insts.iter().enumerate() {
@@ -4446,9 +4446,9 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
     let max_slot = nv as u64 * 8;
     let mut out = String::with_capacity(asm.len());
     // slot_off -> (register with the same content, width of the storage)
-    let mut sync: HashMap<u64, (String, u32)> = HashMap::new();
+    let mut sync: HashMap<u64, (String, u32)> = HashMap::default();
     // register -> slot_off (the reverse)
-    let mut holds: HashMap<String, u64> = HashMap::new();
+    let mut holds: HashMap<String, u64> = HashMap::default();
     // ZERO EXTENSION (round 51). `nullab[r] = k` means: all bits from k on
     // are guaranteed zero in `r`. Without an entry nothing is known.
     //
@@ -4462,7 +4462,7 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
     // — but only if r8 is zero up top anyway. Exactly that condition was
     // missing in round 43, which is why the case was deferred there
     // (docs/ROUND43.md §6).
-    let mut nullab: HashMap<String, u32> = HashMap::new();
+    let mut nullab: HashMap<String, u32> = HashMap::default();
     let kill_reg = |r: &str,
                     sync: &mut HashMap<u64, (String, u32)>,
                     holds: &mut HashMap<String, u64>| {
@@ -5012,7 +5012,7 @@ fn fp_handover(
     a: &Alloc,
     read: &[u32],
 ) -> HashMap<Val, &'static str> {
-    let mut out: HashMap<Val, &'static str> = HashMap::new();
+    let mut out: HashMap<Val, &'static str> = HashMap::default();
     if std::env::var_os("FIRN_NO_FP_HAND").is_some() {
         return out;
     }
@@ -5023,7 +5023,7 @@ fn fp_handover(
     // values those are ten.
     let mut hand: Vec<&'static str> = vec!["xmm2", "xmm3"];
     {
-        let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut used: crate::fx::HashSet<&str> = crate::fx::HashSet::default();
         for l in a.locs.iter() {
             if let Loc::Reg(r) = l {
                 if is_xmm(r) {
@@ -5475,7 +5475,7 @@ fn layout_depth(f: &Func) -> Vec<u32> {
     for b in 0..n {
         for s in f.blocks[b].term.successors() {
             let h = s as usize;
-            if h >= n || !dom[b][h] {
+            if h >= n || !dom.has(b, h) {
                 continue;
             }
             body.iter_mut().for_each(|x| *x = false);

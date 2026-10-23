@@ -26,7 +26,7 @@ use crate::ast::*;
 use crate::diag::{Diags, Span};
 use crate::lexer::TokKind;
 use crate::parser::Parser;
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 const INFER: &str = "__infer";
 const RET_EXPR: &str = "__lam_expr";
@@ -485,9 +485,9 @@ pub fn apply(prog: &mut Program, dg: &mut Diags) {
 }
 
 fn round(prog: &mut Program, dg: &mut Diags, start: usize) -> bool {
-    let mut sigs: HashMap<String, Vec<TypeExpr>> = HashMap::new();
-    let mut msigs: HashMap<String, Vec<Vec<TypeExpr>>> = HashMap::new();
-    let mut methods: HashSet<String> = HashSet::new();
+    let mut sigs: HashMap<String, Vec<TypeExpr>> = HashMap::default();
+    let mut msigs: HashMap<String, Vec<Vec<TypeExpr>>> = HashMap::default();
+    let mut methods: HashSet<String> = HashSet::default();
     for f in &prog.funcs {
         let tys: Vec<TypeExpr> = f.params.iter().map(|p| p.ty.clone()).collect();
         if f.params.first().map_or(false, |p| p.name == "self") {
@@ -498,19 +498,19 @@ fn round(prog: &mut Program, dg: &mut Diags, start: usize) -> bool {
         }
         sigs.insert(f.name.clone(), tys);
     }
-    let mut fields: HashMap<String, HashMap<String, TypeExpr>> = HashMap::new();
+    let mut fields: HashMap<String, HashMap<String, TypeExpr>> = HashMap::default();
     for s in &prog.structs {
         fields.insert(s.name.clone(), s.fields.iter().map(|(n, t, _)| (n.clone(), t.clone())).collect());
     }
     let rets: HashMap<String, TypeExpr> =
         prog.funcs.iter().filter_map(|f| f.ret.clone().map(|r| (f.name.clone(), r))).collect();
-    let mut elems: HashMap<String, TypeExpr> = HashMap::new();
+    let mut elems: HashMap<String, TypeExpr> = HashMap::default();
     for (name, inst) in crate::sema_generic::instantiations() {
         if !inst.is_fn && !inst.is_abstract && inst.base == "Vec" && inst.args.len() == 1 {
             elems.insert(name, inst.args[0].clone());
         }
     }
-    let mut globals: HashMap<String, TypeExpr> = HashMap::new();
+    let mut globals: HashMap<String, TypeExpr> = HashMap::default();
     for c in &prog.consts {
         globals.insert(c.name.clone(), c.ty.clone());
     }
@@ -527,12 +527,12 @@ fn round(prog: &mut Program, dg: &mut Diags, start: usize) -> bool {
         methods: &methods,
         scopes: Vec::new(),
         ret: None,
-        inst_rets: HashMap::new(),
+        inst_rets: HashMap::default(),
         pending: false,
         next: prog.expr_count,
-        coll_res: HashMap::new(),
-        coll_failed: HashSet::new(),
-        new_elems: HashMap::new(),
+        coll_res: HashMap::default(),
+        coll_failed: HashSet::default(),
+        new_elems: HashMap::default(),
         dg,
     };
     for f in prog.funcs.iter_mut().skip(start) {
@@ -543,7 +543,7 @@ fn round(prog: &mut Program, dg: &mut Diags, start: usize) -> bool {
         block(&mut cx, &mut f.body);
     }
     cx.ret = None;
-    cx.scopes = vec![HashMap::new()];
+    cx.scopes = vec![HashMap::default()];
     if start == 0 {
         for c in prog.consts.iter_mut() {
             let t = c.ty.clone();
@@ -562,7 +562,7 @@ fn round(prog: &mut Program, dg: &mut Diags, start: usize) -> bool {
 fn block(cx: &mut Cx, b: &mut Block) {
     // r742: block scoping -- a `let` inside `{ .. }` ends with the block and a
     // shadowing `let` of another type does not leak into the outer one
-    cx.scopes.push(HashMap::new());
+    cx.scopes.push(HashMap::default());
     for s in b.stmts.iter_mut() {
         stmt(cx, s);
     }
@@ -636,7 +636,7 @@ fn stmt(cx: &mut Cx, s: &mut Stmt) {
         Stmt::For { name, start, end, body, .. } => {
             want(cx, start, None);
             want(cx, end, None);
-            cx.scopes.push(HashMap::new());
+            cx.scopes.push(HashMap::default());
             // r751: the loop variable has the type of its range (a literal range is i32)
             let (s1, w1) = val_ty(cx, start);
             let (s2, w2) = val_ty(cx, end);

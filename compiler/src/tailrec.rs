@@ -30,7 +30,7 @@
 //! Switch it off with `--no-pass=tailrec` or `FIRN_NO_TAILREC=1`.
 
 use crate::fir::*;
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AccOp {
@@ -84,7 +84,7 @@ struct Site {
 }
 
 fn use_counts(f: &Func) -> HashMap<Val, usize> {
-    let mut m: HashMap<Val, usize> = HashMap::new();
+    let mut m: HashMap<Val, usize> = HashMap::default();
     let mut buf = Vec::new();
     for b in &f.blocks {
         for i in &b.insts {
@@ -116,7 +116,7 @@ fn eligible(f: &Func) -> bool {
         }
     }
     // stack cells: only direct load/store addressing
-    let mut cells: HashMap<Val, ()> = HashMap::new();
+    let mut cells: HashMap<Val, ()> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             match (&i.op, i.dst) {
@@ -272,7 +272,7 @@ pub fn run(f: &mut Func) -> bool {
             }
         }
     }
-    let mut pmap: HashMap<Val, Val> = HashMap::new();
+    let mut pmap: HashMap<Val, Val> = HashMap::default();
     for i in 0..nparams {
         if changing[i] {
             let ty = f.params[i];

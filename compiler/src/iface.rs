@@ -64,7 +64,7 @@
 //! guarantee would be worse than a missing convenience.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use crate::fx::HashSet;
 
 use crate::ast::{Expr, TypeExpr};
 use crate::diag::{Diags, Span};

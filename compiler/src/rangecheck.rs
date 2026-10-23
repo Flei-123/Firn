@@ -81,7 +81,7 @@
 //! construction of the control flow), and the type (holds by definition).
 
 use crate::fir::{BinOp, CmpOp, FTy, Func, Module, Op, Term, Val};
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 thread_local! {
     /// r761: the functions of the module that are PURE LENGTH GETTERS
@@ -89,12 +89,12 @@ thread_local! {
     /// `u64` word at `param + K`. name -> K. Filled by `note_len_getters`
     /// before the first function is optimised (the shape is read from the
     /// raw body too), so the order of optimisation does not matter.
-    static LEN_GETTERS: std::cell::RefCell<HashMap<String, i128>> = std::cell::RefCell::new(HashMap::new());
+    static LEN_GETTERS: std::cell::RefCell<HashMap<String, i128>> = std::cell::RefCell::new(HashMap::default());
 }
 
 /// Scan the module for pure length getters (see `LEN_GETTERS`).
 pub(crate) fn note_len_getters(m: &Module) {
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for f in &m.funcs {
         if let Some(k) = len_getter_offset(f) {
             map.insert(f.name.clone(), k);
@@ -125,7 +125,7 @@ pub(crate) fn len_getter_offset(f: &Func) -> Option<i128> {
         Term::Ret(Some(v)) => v,
         _ => return None,
     };
-    let mut sym: HashMap<Val, Sym> = HashMap::new();
+    let mut sym: HashMap<Val, Sym> = HashMap::default();
     sym.insert(0, Sym::Param);
     let mut cell_holds_param = false;
     let mut cell: Option<Val> = None;
@@ -226,7 +226,7 @@ struct Ana<'a> {
     /// predecessors per block (for the memory-clean chain walk)
     preds: Vec<Vec<usize>>,
     /// r797: `dom[b][a]` = block `a` dominates block `b` (empty when the function is too big)
-    dom: Vec<Vec<bool>>,
+    dom: crate::mem2reg::Dom,
     /// r797: what a CHECK that did not trap proves about its operand, with the block of the check: a checked
     /// conversion proves the source fits the target type, a checked `x * c` proves `x <= MAX / c`. The fact holds in
     /// every block the check's block strictly dominates (the check ran on the way in, on the same SSA value).
@@ -272,7 +272,7 @@ fn facts_per_block(f: &Func, preds: &[Vec<usize>]) -> Vec<Vec<(Val, bool)>> {
                 continue;
             }
             for b in 0..n {
-                if dom[b][succ] && !out[b].iter().any(|(c, _)| *c == cond) {
+                if dom.has(b, succ) && !out[b].iter().any(|(c, _)| *c == cond) {
                     out[b].push((cond, truth));
                 }
             }
@@ -283,8 +283,8 @@ fn facts_per_block(f: &Func, preds: &[Vec<usize>]) -> Vec<Vec<(Val, bool)>> {
 
 impl<'a> Ana<'a> {
     fn new(f: &'a Func) -> Ana<'a> {
-        let mut site = HashMap::new();
-        let mut cmps = HashMap::new();
+        let mut site = HashMap::default();
+        let mut cmps = HashMap::default();
         for (bi, b) in f.blocks.iter().enumerate() {
             for (ii, i) in b.insts.iter().enumerate() {
                 if let Some(d) = i.dst {
@@ -296,8 +296,8 @@ impl<'a> Ana<'a> {
             }
         }
         let preds = crate::mem2reg::preds(f);
-        let mut chk: HashMap<Val, Vec<(usize, Range)>> = HashMap::new();
-        let mut dom = Vec::new();
+        let mut chk: HashMap<Val, Vec<(usize, Range)>> = HashMap::default();
+        let mut dom = crate::mem2reg::Dom::empty();
         if f.blocks.len() <= 512 && f.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i) {
             dom = crate::mem2reg::dominators(f);
             let const_fact = |x: Val| -> Option<i128> {
@@ -392,7 +392,7 @@ impl<'a> Ana<'a> {
         if use_facts {
             if let Some(list) = self.chk.get(&v) {
                 for &(cb, cr) in list {
-                    if cb != at && self.dom.get(at).map(|row| row[cb]).unwrap_or(false) {
+                    if cb != at && (at < self.dom.len() && self.dom.has(at, cb)) {
                         r = meet(r, cr);
                     }
                 }
@@ -1441,7 +1441,7 @@ pub(crate) fn remove_provable_arith_checks(f: &mut Func) -> usize {
                     x1 == x2
                         && l1 <= l2
                         && (b1, i1) != (b2, i2)
-                        && ((b1 == b2 && i1 < i2) || (b1 != b2 && dom[b2][b1]))
+                        && ((b1 == b2 && i1 < i2) || (b1 != b2 && dom.has(b2, b1)))
                 });
                 if covered {
                     extra.push((b2, i2, d2, x2));
@@ -1451,7 +1451,7 @@ pub(crate) fn remove_provable_arith_checks(f: &mut Func) -> usize {
         }
     }
     if !idx_hits.is_empty() {
-        let mut map: HashMap<Val, Val> = HashMap::new();
+        let mut map: HashMap<Val, Val> = HashMap::default();
         for (bi, ii, dst, idx) in idx_hits {
             f.blocks[bi].insts[ii].op = Op::Const(0);
             map.insert(dst, idx);

@@ -783,6 +783,25 @@ pub enum Term {
 }
 
 impl Term {
+    /// Calls `g` for every successor (with duplicates), without allocating.
+    #[inline]
+    pub fn for_each_succ(&self, mut g: impl FnMut(BlockId)) {
+        match self {
+            Term::Br(b) => g(*b),
+            Term::BrCond { then_bb, else_bb, .. } => {
+                g(*then_bb);
+                g(*else_bb);
+            }
+            Term::Switch { cases, default, .. } => {
+                for (_, b) in cases.iter() {
+                    g(*b);
+                }
+                g(*default);
+            }
+            Term::Ret(_) | Term::Unset => {}
+        }
+    }
+
     pub fn successors(&self) -> Vec<BlockId> {
         match self {
             Term::Br(b) => vec![*b],
@@ -828,7 +847,7 @@ pub struct Func {
     /// Values that stem from `secret[T]` (SPEC §9.2). The optimizer and the
     /// code generator treat them specially: no branch, no data dependent
     /// access, no removal of writes.
-    pub secret: std::collections::HashSet<Val>,
+    pub secret: crate::fx::HashSet<Val>,
     /// `#[constant_time]`: the code generator aborts when a conditional jump
     /// depends on a `secret` value.
     pub constant_time: bool,
@@ -865,7 +884,7 @@ pub struct Func {
     ///
     /// Empty in every function that comes from the front end; only the
     /// allocator fills it, and only for its own second version.
-    pub no_coalesce: std::collections::HashSet<Val>,
+    pub no_coalesce: crate::fx::HashSet<Val>,
 }
 
 impl Func {
@@ -879,12 +898,12 @@ impl Func {
             ret,
             blocks: vec![Block { id: 0, insts: Vec::new(), term: Term::Unset }],
             val_types,
-            secret: std::collections::HashSet::new(),
+            secret: crate::fx::HashSet::default(),
             constant_time: false,
             interrupt: false,
             inline_hint: None,
             loc_stamp: Loc::NONE,
-            no_coalesce: std::collections::HashSet::new(),
+            no_coalesce: crate::fx::HashSet::default(),
         }
     }
 

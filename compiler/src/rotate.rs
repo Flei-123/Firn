@@ -28,19 +28,19 @@
 //! and `dce` removes them.
 
 use crate::fir::{BinOp, FTy, Func, Op, Val};
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 const M32: i128 = 0xFFFF_FFFF;
 
 /// How many expressions were turned into a `Rotr32`.
 pub(crate) fn run(f: &mut Func) -> usize {
     // ---- tables (SSA: one definition per value) ---------------------------
-    let mut consts: HashMap<Val, i128> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
     // u64 binary operations by result value
-    let mut bins: HashMap<Val, (BinOp, Val, Val)> = HashMap::new();
+    let mut bins: HashMap<Val, (BinOp, Val, Val)> = HashMap::default();
     // values that are known to be below 2^32 for another reason: a zero
     // extended narrow load/cast
-    let mut small: HashMap<Val, ()> = HashMap::new();
+    let mut small: HashMap<Val, ()> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             let d = match i.dst {
@@ -155,8 +155,8 @@ pub(crate) fn run(f: &mut Func) -> usize {
 /// Both shifts must read the SAME value and both counts must be constants. The
 /// shifts become dead when no one else reads them and `dce` removes them.
 pub(crate) fn run_u32(f: &mut Func) -> usize {
-    let mut consts: HashMap<Val, i128> = HashMap::new();
-    let mut bins: HashMap<Val, (BinOp, Val, Val)> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
+    let mut bins: HashMap<Val, (BinOp, Val, Val)> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             let d = match i.dst {
