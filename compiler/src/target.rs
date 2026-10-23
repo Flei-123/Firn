@@ -289,6 +289,40 @@ pub fn align(bytes: u64) -> String {
     active().align_directive(bytes)
 }
 
+/// Copy of every per-compilation switch of this module, for threads that
+/// work on behalf of the compiling thread (`parfn.rs`).
+#[derive(Clone, Copy)]
+pub(crate) struct State {
+    active: Target,
+    avx: bool,
+    pic: bool,
+    shared: bool,
+    android: bool,
+    windows: bool,
+}
+
+/// The switches of the calling thread.
+pub(crate) fn state() -> State {
+    State {
+        active: ACTIVE.with(|a| a.get()),
+        avx: AVX.with(|a| a.get()),
+        pic: PIC.with(|a| a.get()),
+        shared: SHARED.with(|a| a.get()),
+        android: ANDROID.with(|a| a.get()),
+        windows: WINDOWS.with(|a| a.get()),
+    }
+}
+
+/// Make the calling thread see the switches of `s`.
+pub(crate) fn set_state(s: State) {
+    ACTIVE.with(|a| a.set(s.active));
+    AVX.with(|a| a.set(s.avx));
+    PIC.with(|a| a.set(s.pic));
+    SHARED.with(|a| a.set(s.shared));
+    ANDROID.with(|a| a.set(s.android));
+    WINDOWS.with(|a| a.set(s.windows));
+}
+
 /// Reset — only for the module tests, which compile several programs in one
 /// process (the same reason `prof::reset` exists).
 #[cfg(test)]

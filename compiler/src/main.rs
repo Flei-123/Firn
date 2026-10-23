@@ -7,6 +7,7 @@
 
 mod abi;
 mod fx;
+mod parfn;
 mod alias;
 mod archsel;
 mod ast;

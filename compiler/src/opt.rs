@@ -65,6 +65,26 @@ pub struct OptStats {
     pub promoted_cells: usize,
 }
 
+impl OptStats {
+    /// Sum another run's counters into this one (`parfn.rs` merges its workers with it).
+    pub(crate) fn add(&mut self, o: &OptStats) {
+        self.folded += o.folded;
+        self.removed_insts += o.removed_insts;
+        self.removed_blocks += o.removed_blocks;
+        self.promoted_loads += o.promoted_loads;
+        self.copies += o.copies;
+        self.cse += o.cse;
+        self.merged_blocks += o.merged_blocks;
+        self.inlined += o.inlined;
+        self.removed_checks += o.removed_checks;
+        self.hoisted += o.hoisted;
+        self.threaded += o.threaded;
+        self.strength += o.strength;
+        self.phis_folded += o.phis_folded;
+        self.promoted_cells += o.promoted_cells;
+    }
+}
+
 // ----------------------------------------------------- Pass register ---
 //
 // DESIGN_GOALS.md §5 and §10.4 point 4: every optimization pass has a NAME,
@@ -435,6 +455,43 @@ impl PassClock {
     }
 }
 
+/// `optimize_func` over a whole slice of functions, or over the ones listed in
+/// `only` (an index listed twice runs twice, like the serial loops did).
+/// Several threads when `parfn` allows it (r948); the result is the same as
+/// the serial loop. Pass timings (`FIRN_PASS_TIMINGS`) force the serial path.
+fn optimize_batch(funcs: &mut [Func], only: Option<&[usize]>, st: &mut OptStats, cfg: &OptConfig, clk: &mut PassClock) {
+    if clk.on || crate::parfn::threads() <= 1 {
+        match only {
+            None => {
+                for f in funcs.iter_mut() {
+                    optimize_func(f, st, cfg, clk);
+                }
+            }
+            Some(ix) => {
+                for &ci in ix {
+                    optimize_func(&mut funcs[ci], st, cfg, clk);
+                }
+            }
+        }
+        return;
+    }
+    let mut reps: Vec<usize> = vec![0; funcs.len()];
+    match only {
+        None => reps.iter_mut().for_each(|r| *r = 1),
+        Some(ix) => ix.iter().for_each(|&ci| reps[ci] += 1),
+    }
+    let tasks: Vec<(&mut Func, usize)> = funcs
+        .iter_mut()
+        .zip(reps)
+        .filter(|(_, r)| *r > 0)
+        .collect();
+    let s = crate::parfn::run(tasks, |f, s| {
+        let mut clk = PassClock::default();
+        optimize_func(f, s, cfg, &mut clk);
+    });
+    st.add(&s);
+}
+
 pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     let mut st = OptStats::default();
     if cfg.level == Level::Dev {
@@ -449,9 +506,7 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     crate::rangecheck::note_len_getters(m);
     // Clean up per function first, so that the size heuristic of the inliner
     // works on bodies that are already simplified.
-    for f in m.funcs.iter_mut() {
-        optimize_func(f, &mut st, cfg, &mut clk);
-    }
+    optimize_batch(&mut m.funcs, None, &mut st, cfg, &mut clk);
     // Round EINBETTEN -- the explicit will first. It holds on every level;
     // the size rule below only on `release-*`. If both run, the second pass
     // finds the requested sites already done.
@@ -462,9 +517,7 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         for f in m.funcs.iter() {
             phi_check(f, "inline-requested");
         }
-        for f in m.funcs.iter_mut() {
-            optimize_func(f, &mut st, cfg, &mut clk);
-        }
+        optimize_batch(&mut m.funcs, None, &mut st, cfg, &mut clk);
     }
     // r591 -- the leaf inliner of the debug-preserving levels. Two rounds: a
     // thin wrapper (`fn chars(self, i) { return chars(self, i) }`) is a leaf
@@ -486,8 +539,8 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
             }
             for &ci in &changed {
                 phi_check(&m.funcs[ci], "inline-leaf");
-                optimize_func(&mut m.funcs[ci], &mut st, &cheap, &mut clk);
             }
+            optimize_batch(&mut m.funcs, Some(&changed), &mut st, &cheap, &mut clk);
             if k == 0 {
                 break;
             }
@@ -497,10 +550,10 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         let t = std::time::Instant::now();
         let changed = crate::guardsplit::run(m);
         clk.add("guardsplit", t);
-        for ci in changed {
+        for &ci in &changed {
             phi_check(&m.funcs[ci], "guardsplit");
-            optimize_func(&mut m.funcs[ci], &mut st, cfg, &mut clk);
         }
+        optimize_batch(&mut m.funcs, Some(&changed), &mut st, cfg, &mut clk);
     }
     if cfg.runs("inline") {
         let t = std::time::Instant::now();
@@ -509,9 +562,7 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         for f in m.funcs.iter() {
             phi_check(f, "inline");
         }
-        for f in m.funcs.iter_mut() {
-            optimize_func(f, &mut st, cfg, &mut clk);
-        }
+        optimize_batch(&mut m.funcs, None, &mut st, cfg, &mut clk);
         // ROUND TK2 (r136): the recursive callers kept for the frame budget go
         // through the same passes as the module.
         let mut kept = crate::inline::rec_originals_take();
@@ -532,10 +583,10 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
             let (k, changed) = crate::inline::inline_module_again(m);
             st.inlined += k;
             clk.add("inline", t);
-            for ci in changed {
+            for &ci in &changed {
                 phi_check(&m.funcs[ci], "inline");
-                optimize_func(&mut m.funcs[ci], &mut st, cfg, &mut clk);
             }
+            optimize_batch(&mut m.funcs, Some(&changed), &mut st, cfg, &mut clk);
         }
     }
     if cfg.runs("promote") && std::env::var_os("FIRN_NO_PROMOTE").is_none() {
@@ -548,7 +599,43 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         let mut t_check = 0f64;
         let mut promoted_funcs = 0usize;
         let mut n_check = 0usize;
+        // r948: without the bisecting/tracing aids every function is independent, so the loop
+        // below runs on several threads (same result as the serial loop).
+        let promote_aids = [
+            "FIRN_PROMOTE_LIMIT", "FIRN_PROMOTE_ONLY", "FIRN_PROMOTE_ROTATE_ALL",
+            "FIRN_PROMOTE_CLEANUP_FIRST", "FIRN_PROMOTE_ONLY_ROTATE",
+        ]
+        .iter()
+        .any(|k| std::env::var_os(k).is_some());
+        let promote_par = !trace && !clk.on && !promote_aids && crate::parfn::threads() > 1;
+        if promote_par {
+            let nounmap = &nounmap;
+            let tasks: Vec<(&mut Func, usize)> = m.funcs.iter_mut().map(|f| (f, 1usize)).collect();
+            let s = crate::parfn::run(tasks, |f, s| {
+                let (cand, kids) = crate::promote::candidate_loops(f, nounmap);
+                if cand.is_empty() {
+                    return;
+                }
+                let mut g = f.clone();
+                crate::promote::rotate_loops(&mut g, &cand, &kids);
+                let p = crate::promote::promote_cells(&mut g, nounmap);
+                if p > 0 {
+                    let mut clk = PassClock::default();
+                    optimize_func(&mut g, s, cfg, &mut clk);
+                    if let Err(e) = g.verify_phis() {
+                        eprintln!("promote: @{} skipped ({})", f.name, e);
+                        return;
+                    }
+                    s.promoted_cells += p;
+                    *f = g;
+                }
+            });
+            st.add(&s);
+        }
         for f in m.funcs.iter_mut() {
+            if promote_par {
+                break;
+            }
             // Rotation alone is kept only where it lets a cell move into a
             // register: the other passes and both register allocators were
             // tuned on top-tested loops, and a rotated loop that promotes

@@ -92,6 +92,16 @@ thread_local! {
     static LEN_GETTERS: std::cell::RefCell<HashMap<String, i128>> = std::cell::RefCell::new(HashMap::default());
 }
 
+/// Copy of the table for worker threads (`parfn.rs`).
+pub(crate) fn len_getters_get() -> HashMap<String, i128> {
+    LEN_GETTERS.with(|g| g.borrow().clone())
+}
+
+/// Install a copy made by `len_getters_get` on the calling (worker) thread.
+pub(crate) fn len_getters_set(m: HashMap<String, i128>) {
+    LEN_GETTERS.with(|g| *g.borrow_mut() = m);
+}
+
 /// Scan the module for pure length getters (see `LEN_GETTERS`).
 pub(crate) fn note_len_getters(m: &Module) {
     let mut map = HashMap::default();

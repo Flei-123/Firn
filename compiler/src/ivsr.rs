@@ -65,6 +65,21 @@ thread_local! {
     static TOUCHED: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::default());
 }
 
+/// Copy of the set for worker threads (`parfn.rs`).
+pub(crate) fn touched_get() -> HashSet<String> {
+    TOUCHED.with(|t| t.borrow().clone())
+}
+
+/// Replace the set (worker thread start).
+pub(crate) fn touched_set(s: HashSet<String>) {
+    TOUCHED.with(|t| *t.borrow_mut() = s);
+}
+
+/// Merge the names a worker added back into the calling thread's set.
+pub(crate) fn touched_extend(s: HashSet<String>) {
+    TOUCHED.with(|t| t.borrow_mut().extend(s));
+}
+
 /// A loop invariant expression, built from values that dominate the
 /// preheader and from constants.
 #[derive(Clone, Debug, PartialEq)]

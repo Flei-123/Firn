@@ -82,6 +82,29 @@ pub struct StaticInfo {
 
 thread_local! {
     static TABLE: RefCell<Vec<StaticInfo>> = const { RefCell::new(Vec::new()) };
+    /// Worker threads of the parallel optimizer (`parfn.rs`) do not own the
+    /// table; they carry this read-only copy of the sizes of the immutable
+    /// statics instead. `None` on the compiling thread.
+    static SIZES: RefCell<Option<std::sync::Arc<crate::fx::HashMap<String, u64>>>> = const { RefCell::new(None) };
+}
+
+/// Name -> size of every immutable static, the same answer `rodata_size`
+/// gives from the table (first immutable entry of a name wins).
+pub(crate) fn rodata_sizes() -> std::sync::Arc<crate::fx::HashMap<String, u64>> {
+    let mut m: crate::fx::HashMap<String, u64> = crate::fx::HashMap::default();
+    TABLE.with(|t| {
+        for s in t.borrow().iter() {
+            if !s.mutable {
+                m.entry(s.name.clone()).or_insert(s.bytes.len() as u64);
+            }
+        }
+    });
+    std::sync::Arc::new(m)
+}
+
+/// Install the copy made by `rodata_sizes` on the calling (worker) thread.
+pub(crate) fn rodata_sizes_install(m: std::sync::Arc<crate::fx::HashMap<String, u64>>) {
+    SIZES.with(|s| *s.borrow_mut() = Some(m));
 }
 
 /// Empties the table — between compilations of the SAME process (module
@@ -162,6 +185,9 @@ pub fn any() -> bool {
 /// store of the program can ever change it), `None` for a `static mut` or an
 /// unknown name. `licm.rs` asks: a load from there is loop invariant.
 pub fn rodata_size(name: &str) -> Option<u64> {
+    if let Some(r) = SIZES.with(|s| s.borrow().as_ref().map(|m| m.get(name).copied())) {
+        return r;
+    }
     TABLE.with(|t| {
         t.borrow()
             .iter()
