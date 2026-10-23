@@ -1,0 +1,470 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/window/shellthread.fi -- the window on its own thread: the shell thread owns the OS window and its message loop, the app thread talks to it through lock-free channels (events out, commands and frames in). docs/SHELL_THREAD.md.
+import std.rt
+import std.time
+import chan.chan
+import window.window
+import window.shellproto
+import window.shellos
+
+export {
+    shell_start, shell_main, shell_wait_open, shell_poll, shell_wait,
+    shell_frame_acquire, shell_frame_submit,
+    shell_set_title, shell_set_cursor, shell_set_size, shell_redraw, shell_close, shell_stop,
+    shell_stat, shell_width, shell_height, shell_dpi, shell_state,
+}
+
+const GAP_COLOUR: u32 = 2105376
+const TIMER_OFF: i64 = 2147483647
+const TIMER_DRAG_MS: i64 = 8
+
+fn pool_get(sh: u64, i: usize, which: usize) -> u64 {
+    return rt.ld64(sh, shellproto.B_POOL + i * shellproto.POOL_ENTRY + which)
+}
+
+fn pool_set(sh: u64, i: usize, which: usize, v: u64) {
+    rt.st64(sh, shellproto.B_POOL + i * shellproto.POOL_ENTRY + which, v)
+}
+
+fn pool_find(sh: u64, ptr: u64) -> usize {
+    var i: usize = 0
+    let n: usize = shellproto.MAX_BUFS as usize
+    while i < n {
+        if pool_get(sh, i, 0) == ptr {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn drain_free(sh: u64) {
+    var fr: chan.Chan = shellproto.sh_chan(sh, shellproto.B_FREE)
+    var rec: [u64; 2] = [0; 2]
+    while chan.chan_try_recv(&fr, &rec[0]) {
+        let i: usize = pool_find(sh, rec[0])
+        if i < shellproto.MAX_BUFS as usize {
+            pool_set(sh, i, 2, 0)
+        }
+    }
+}
+
+fn send_cmd(sh: u64, rec: *mut u64) -> bool {
+    var cc: chan.Chan = shellproto.sh_chan(sh, shellproto.B_CMD)
+    let ok: bool = chan.chan_try_send(&cc, rec)
+    shellos.os_wake(shellproto.sh_get(sh, shellproto.B_EVT))
+    return ok
+}
+
+fn shell_start(title: str, w: usize, h: usize) -> u64 {
+    let sh: u64 = rt.heap_alloc(shellproto.B_TOTAL * 8)
+    if sh == 0 {
+        return 0
+    }
+    rt.mem_set(sh, 0 as u8, shellproto.B_TOTAL * 8)
+    let ev: chan.Chan = chan.chan_new(512, shellproto.EV_WORDS as u64)
+    let cm: chan.Chan = chan.chan_new(64, shellproto.CMD_WORDS as u64)
+    let fm: chan.Chan = chan.chan_new(8, shellproto.FRAME_WORDS as u64)
+    let fr: chan.Chan = chan.chan_new(16, shellproto.FREE_WORDS as u64)
+    shellproto.sh_put(sh, shellproto.B_EV, ev.blk)
+    shellproto.sh_put(sh, shellproto.B_CMD, cm.blk)
+    shellproto.sh_put(sh, shellproto.B_FRM, fm.blk)
+    shellproto.sh_put(sh, shellproto.B_FREE, fr.blk)
+    shellproto.sh_put(sh, shellproto.B_EVT, shellos.os_event_new())
+    shellproto.sh_put(sh, shellproto.B_W0, w as u64)
+    shellproto.sh_put(sh, shellproto.B_H0, h as u64)
+    var n: usize = title.n
+    if n > shellproto.TITLE_MAX {
+        n = shellproto.TITLE_MAX
+    }
+    rt.mem_copy(sh + (shellproto.B_TITLE * 8) as u64, title.p as u64, n)
+    shellproto.sh_put(sh, shellproto.B_TITLE_N, n as u64)
+    let th: u64 = thread_start(shellproto.SHELL_KIND, sh)
+    if th == 0 {
+        shell_stop(sh)
+        return 0
+    }
+    shellproto.sh_put(sh, shellproto.B_THREAD, th)
+    return sh
+}
+
+fn shell_state(sh: u64) -> u64 {
+    return shellproto.sh_get(sh, shellproto.B_STATE)
+}
+
+fn shell_wait_open(sh: u64, ms: u64) -> bool {
+    let deadline: u64 = time.monotonic_ns() + ms * 1000000
+    while true {
+        let st: u64 = shell_state(sh)
+        if st == shellproto.ST_OPEN {
+            return true
+        }
+        if st == shellproto.ST_FAILED || st == shellproto.ST_ENDED {
+            return false
+        }
+        if time.monotonic_ns() >= deadline {
+            return false
+        }
+        thread_sleep(1)
+    }
+    return false
+}
+
+fn shell_poll(sh: u64, rec: *mut u64) -> bool {
+    var c: chan.Chan = shellproto.sh_chan(sh, shellproto.B_EV)
+    return chan.chan_try_recv(&c, rec)
+}
+
+fn shell_wait(sh: u64, rec: *mut u64, ms: u64) -> u64 {
+    var c: chan.Chan = shellproto.sh_chan(sh, shellproto.B_EV)
+    return chan.chan_recv_timeout(&c, rec, ms)
+}
+
+fn shell_frame_acquire(sh: u64, w: usize, h: usize) -> u64 {
+    if w == 0 || h == 0 {
+        return 0
+    }
+    drain_free(sh)
+    let need: usize = shellproto.FRAME_HEAD + w * h * 4
+    let n: usize = shellproto.MAX_BUFS as usize
+    var pick: usize = n
+    var empty: usize = n
+    var i: usize = 0
+    while i < n {
+        let p: u64 = pool_get(sh, i, 0)
+        if p == 0 {
+            if empty == n {
+                empty = i
+            }
+        } else if pool_get(sh, i, 2) == 0 {
+            if pool_get(sh, i, 1) >= need as u64 {
+                pick = i
+                break
+            }
+            if empty == n {
+                empty = i
+            }
+        }
+        i = i + 1
+    }
+    if pick == n {
+        if empty == n {
+            return 0
+        }
+        let old: u64 = pool_get(sh, empty, 0)
+        if old != 0 {
+            rt.heap_free(old, pool_get(sh, empty, 1) as usize)
+        }
+        let np: u64 = rt.heap_alloc(need)
+        if np == 0 {
+            pool_set(sh, empty, 0, 0)
+            pool_set(sh, empty, 1, 0)
+            return 0
+        }
+        pool_set(sh, empty, 0, np)
+        pool_set(sh, empty, 1, need as u64)
+        pick = empty
+    }
+    pool_set(sh, pick, 2, 1)
+    return pool_get(sh, pick, 0) + shellproto.FRAME_HEAD as u64
+}
+
+fn shell_frame_submit(sh: u64, pix: u64, w: usize, h: usize) -> bool {
+    let ptr: u64 = pix - shellproto.FRAME_HEAD as u64
+    let i: usize = pool_find(sh, ptr)
+    if i >= shellproto.MAX_BUFS as usize {
+        return false
+    }
+    let id: u64 = shellproto.sh_get(sh, shellproto.B_NEXT_ID) + 1
+    shellproto.sh_put(sh, shellproto.B_NEXT_ID, id)
+    var rec: [u64; 8] = [0; 8]
+    rec[0] = ptr
+    rec[1] = w as u64
+    rec[2] = h as u64
+    rec[3] = (w * 4) as u64
+    rec[4] = id
+    pool_set(sh, i, 2, 2)
+    var fc: chan.Chan = shellproto.sh_chan(sh, shellproto.B_FRM)
+    if !chan.chan_try_send(&fc, &rec[0]) {
+        pool_set(sh, i, 2, 1)
+        return false
+    }
+    shellos.os_wake(shellproto.sh_get(sh, shellproto.B_EVT))
+    return true
+}
+
+fn shell_set_title(sh: u64, title: str) -> bool {
+    var rec: [u64; 16] = [0; 16]
+    var n: usize = title.n
+    if n > shellproto.TITLE_MAX {
+        n = shellproto.TITLE_MAX
+    }
+    rec[0] = shellproto.CMD_TITLE
+    rec[1] = n as u64
+    rt.mem_copy((&rec[2]) as u64, title.p as u64, n)
+    return send_cmd(sh, &rec[0])
+}
+
+fn shell_set_cursor(sh: u64, shape: u32) -> bool {
+    var rec: [u64; 16] = [0; 16]
+    rec[0] = shellproto.CMD_CURSOR
+    rec[1] = shape as u64
+    return send_cmd(sh, &rec[0])
+}
+
+fn shell_set_size(sh: u64, w: usize, h: usize) -> bool {
+    var rec: [u64; 16] = [0; 16]
+    rec[0] = shellproto.CMD_SIZE
+    rec[1] = w as u64
+    rec[2] = h as u64
+    return send_cmd(sh, &rec[0])
+}
+
+fn shell_redraw(sh: u64) -> bool {
+    var rec: [u64; 16] = [0; 16]
+    rec[0] = shellproto.CMD_REDRAW
+    return send_cmd(sh, &rec[0])
+}
+
+fn shell_close(sh: u64) -> bool {
+    var rec: [u64; 16] = [0; 16]
+    rec[0] = shellproto.CMD_CLOSE
+    return send_cmd(sh, &rec[0])
+}
+
+fn shell_stat(sh: u64, which: u64) -> u64 {
+    return shellproto.sh_get(sh, shellproto.B_SHOWN + which as usize)
+}
+
+fn shell_width(sh: u64) -> usize {
+    return shellproto.sh_get(sh, shellproto.B_W) as usize
+}
+
+fn shell_height(sh: u64) -> usize {
+    return shellproto.sh_get(sh, shellproto.B_H) as usize
+}
+
+fn shell_dpi(sh: u64) -> usize {
+    return shellproto.sh_get(sh, shellproto.B_DPI) as usize
+}
+
+fn shell_stop(sh: u64) {
+    shellproto.sh_put(sh, shellproto.B_STOP, 1)
+    shellos.os_wake(shellproto.sh_get(sh, shellproto.B_EVT))
+    let th: u64 = shellproto.sh_get(sh, shellproto.B_THREAD)
+    if th != 0 {
+        thread_wait(th)
+    }
+    var i: usize = 0
+    while i < shellproto.MAX_BUFS as usize {
+        let p: u64 = pool_get(sh, i, 0)
+        if p != 0 {
+            rt.heap_free(p, pool_get(sh, i, 1) as usize)
+        }
+        i = i + 1
+    }
+    var c: chan.Chan = shellproto.sh_chan(sh, shellproto.B_EV)
+    chan.chan_free(&c)
+    c = shellproto.sh_chan(sh, shellproto.B_CMD)
+    chan.chan_free(&c)
+    c = shellproto.sh_chan(sh, shellproto.B_FRM)
+    chan.chan_free(&c)
+    c = shellproto.sh_chan(sh, shellproto.B_FREE)
+    chan.chan_free(&c)
+    rt.heap_free(sh, shellproto.B_TOTAL * 8)
+}
+
+fn ev_push(sh: u64, f: *mut window.Window, kind: u32) {
+    var c: chan.Chan = shellproto.sh_chan(sh, shellproto.B_EV)
+    if kind == window.EV_MOTION && chan.chan_len(&c) > chan.chan_cap(&c) / 2 {
+        rt.st64(sh, shellproto.B_EVDROP, shellproto.sh_get(sh, shellproto.B_EVDROP) + 1)
+        return
+    }
+    let seq: u64 = shellproto.sh_get(sh, shellproto.B_SEQ) + 1
+    rt.st64(sh, shellproto.B_SEQ, seq)
+    var rec: [u64; 8] = [0; 8]
+    rec[0] = kind as u64
+    rec[1] = window.ev_a(f) as u64
+    rec[2] = window.ev_x(f) as u64
+    rec[3] = window.ev_y(f) as u64
+    rec[4] = window.ev_state(f) as u64
+    rec[5] = window.dpi(f) as u64
+    rec[6] = seq
+    rec[7] = time.monotonic_ns() / 1000000
+    if !chan.chan_try_send(&c, &rec[0]) {
+        rt.st64(sh, shellproto.B_EVDROP, shellproto.sh_get(sh, shellproto.B_EVDROP) + 1)
+    }
+}
+
+fn pump_events(sh: u64, f: *mut window.Window) -> bool {
+    var dirty: bool = false
+    while window.pending(f) {
+        let k: u32 = window.next_event(f)
+        if k == window.EV_NONE {
+            break
+        }
+        if k == window.EV_CONFIGURE {
+            rt.st64(sh, shellproto.B_W, window.width(f) as u64)
+            rt.st64(sh, shellproto.B_H, window.height(f) as u64)
+            rt.st64(sh, shellproto.B_DPI, window.dpi(f) as u64)
+            dirty = true
+        }
+        if k == window.EV_EXPOSE {
+            dirty = true
+        }
+        ev_push(sh, f, k)
+    }
+    var d: u64 = 0
+    if window.dragging(f) {
+        d = 1
+    }
+    if d != shellproto.sh_get(sh, shellproto.B_DRAG) {
+        rt.st64(sh, shellproto.B_DRAG, d)
+        if d != 0 {
+            shellos.os_timer(f, TIMER_DRAG_MS)
+        } else {
+            shellos.os_timer(f, TIMER_OFF)
+            dirty = true
+        }
+        ev_push_drag(sh, f, d)
+    }
+    return dirty
+}
+
+fn ev_push_drag(sh: u64, f: *mut window.Window, d: u64) {
+    var c: chan.Chan = shellproto.sh_chan(sh, shellproto.B_EV)
+    let seq: u64 = shellproto.sh_get(sh, shellproto.B_SEQ) + 1
+    rt.st64(sh, shellproto.B_SEQ, seq)
+    var rec: [u64; 8] = [0; 8]
+    rec[0] = shellproto.SE_DRAG as u64
+    rec[1] = d
+    rec[5] = window.dpi(f) as u64
+    rec[6] = seq
+    rec[7] = time.monotonic_ns() / 1000000
+    if !chan.chan_try_send(&c, &rec[0]) {
+        rt.st64(sh, shellproto.B_EVDROP, shellproto.sh_get(sh, shellproto.B_EVDROP) + 1)
+    }
+}
+
+fn pump_cmds(sh: u64, f: *mut window.Window) -> bool {
+    var dirty: bool = false
+    var c: chan.Chan = shellproto.sh_chan(sh, shellproto.B_CMD)
+    var rec: [u64; 16] = [0; 16]
+    while chan.chan_try_recv(&c, &rec[0]) {
+        let k: u64 = rec[0]
+        if k == shellproto.CMD_TITLE {
+            window.title(f, (&rec[2]) as u64, rec[1] as usize)
+        } else if k == shellproto.CMD_CURSOR {
+            window.cursor_shape(f, rec[1] as u32)
+        } else if k == shellproto.CMD_SIZE {
+            shellos.os_set_size(f, rec[1] as usize, rec[2] as usize)
+        } else if k == shellproto.CMD_CLOSE {
+            window.close_window(f)
+        } else if k == shellproto.CMD_REDRAW {
+            dirty = true
+        }
+    }
+    return dirty
+}
+
+fn paint(sh: u64, f: *mut window.Window) {
+    let cur: u64 = shellproto.sh_get(sh, shellproto.B_CUR)
+    if cur == 0 || !window.is_open(f) {
+        return
+    }
+    let w: usize = shellproto.sh_get(sh, shellproto.B_CUR_W) as usize
+    let h: usize = shellproto.sh_get(sh, shellproto.B_CUR_H) as usize
+    let ww: usize = window.width(f)
+    let wh: usize = window.height(f)
+    window.image(f, cur + shellproto.FRAME_HEAD as u64, w, h, 0, 0)
+    if w < ww {
+        window.fill(f, GAP_COLOUR, w, 0, ww - w, wh)
+    }
+    if h < wh {
+        var fw: usize = w
+        if fw > ww {
+            fw = ww
+        }
+        window.fill(f, GAP_COLOUR, 0, h, fw, wh - h)
+    }
+    window.present(f)
+    rt.st64(sh, shellproto.B_PAINTS, shellproto.sh_get(sh, shellproto.B_PAINTS) + 1)
+}
+
+fn pump_frames(sh: u64, f: *mut window.Window, dirty: bool) {
+    var fc: chan.Chan = shellproto.sh_chan(sh, shellproto.B_FRM)
+    var rec: [u64; 8] = [0; 8]
+    var got: bool = false
+    while chan.chan_try_recv(&fc, &rec[0]) {
+        let old: u64 = shellproto.sh_get(sh, shellproto.B_CUR)
+        if old != 0 {
+            shellproto.give_back(sh, old)
+            if got {
+                rt.st64(sh, shellproto.B_DROPPED, shellproto.sh_get(sh, shellproto.B_DROPPED) + 1)
+            }
+        }
+        rt.st64(sh, shellproto.B_CUR, rec[0])
+        rt.st64(sh, shellproto.B_CUR_W, rec[1])
+        rt.st64(sh, shellproto.B_CUR_H, rec[2])
+        got = true
+    }
+    if got {
+        rt.st64(sh, shellproto.B_SHOWN, shellproto.sh_get(sh, shellproto.B_SHOWN) + 1)
+    }
+    if got || dirty {
+        paint(sh, f)
+    }
+}
+
+fn service(sh: u64, f: *mut window.Window) {
+    if shellproto.sh_get(sh, shellproto.B_BUSY) != 0 {
+        return
+    }
+    rt.st64(sh, shellproto.B_BUSY, 1)
+    var dirty: bool = pump_cmds(sh, f)
+    if pump_events(sh, f) {
+        dirty = true
+    }
+    pump_frames(sh, f, dirty)
+    rt.st64(sh, shellproto.B_BUSY, 0)
+}
+
+fn shell_hook(sh: u64) {
+    let f: u64 = shellproto.sh_get(sh, shellproto.B_WIN)
+    if f != 0 {
+        service(sh, f as *mut window.Window)
+    }
+}
+
+#[allow_escape]
+fn shell_main(sh: u64) -> u64 {
+    thread_blocking_an()
+    var f: window.Window = window.window_new()
+    let w0: usize = shellproto.sh_get(sh, shellproto.B_W0) as usize
+    let h0: usize = shellproto.sh_get(sh, shellproto.B_H0) as usize
+    if !window.open_window(&f, 0) || !window.make(&f, w0, h0) {
+        rt.st64(sh, shellproto.B_STATE, shellproto.ST_FAILED)
+        thread_blocking_out()
+        return 1
+    }
+    window.full_input(&f, true)
+    window.title(&f, sh + (shellproto.B_TITLE * 8) as u64, shellproto.sh_get(sh, shellproto.B_TITLE_N) as usize)
+    window.show_window(&f)
+    rt.st64(sh, shellproto.B_WIN, (&f) as u64)
+    rt.st64(sh, shellproto.B_W, window.width(&f) as u64)
+    rt.st64(sh, shellproto.B_H, window.height(&f) as u64)
+    rt.st64(sh, shellproto.B_DPI, window.dpi(&f) as u64)
+    shellos.os_hook(&f, shell_hook, sh)
+    rt.st64(sh, shellproto.B_STATE, shellproto.ST_OPEN)
+    let evt: u64 = shellproto.sh_get(sh, shellproto.B_EVT)
+    while shellproto.sh_get(sh, shellproto.B_STOP) == 0 {
+        shellos.os_wait(evt, 250)
+        window.wait_event(&f, 0)
+        service(sh, &f)
+    }
+    rt.st64(sh, shellproto.B_WIN, 0)
+    window.close_window(&f)
+    rt.st64(sh, shellproto.B_STATE, shellproto.ST_ENDED)
+    thread_blocking_out()
+    return 0
+}
