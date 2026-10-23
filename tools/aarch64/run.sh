@@ -175,6 +175,12 @@ one_case() {
         *) echo "X86BAD $file :: no expectation in line 1"; return ;;
     esac
 
+    # `// only_target: x86_64` = the feature under test exists on x86-64 only
+    # (r904 stack guard: aarch64 startup belongs to fUi). Not comparable.
+    if head -5 "$file" | grep -q '^// only_target: x86_64$'; then
+        echo "NOTSUP $file :: [x86-only] the feature this case tests exists on x86-64 only"
+        return
+    fi
     # r778: `// only_mode: opt` = the file exists to show the UNCHECKED
     # wraparound of release-fast (tests/028, 030, 054, 1334b); the checked
     # default would trap on purpose. Build both sides at that level.
@@ -327,7 +333,7 @@ echo "  build stage:    $LABEL"
 echo "  SAME:           $SAME"
 echo "  DIFFERENT:      $DIFF"
 echo "  NOT SUPPORTED:  $NOTSUP"
-for c in x86-asm link-lib gap; do
+for c in x86-asm link-lib x86-only gap; do
     n=$(grep -c "^NOTSUP .* :: \[$c\]" "$WORK/result.$LABEL.txt" || true)
     [ "$n" -gt 0 ] && echo "    of which $c: $n"
 done
