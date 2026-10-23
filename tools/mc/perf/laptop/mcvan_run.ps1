@@ -1,4 +1,5 @@
-param([string]$Target, [int]$Radius, [string]$Tag, [int]$Secs = 45, [int]$Settle = 30)
+param([string]$Target, [int]$Radius, [string]$Tag, [int]$Secs = 45, [int]$Settle = 30, [int]$W = 1280, [int]$H = 720, [string]$Gfx = 'gl', [string]$Exe = 'mcplay-console.exe')
+# Target = server | vanilla | mcplay. -Gfx gl|vk selects the mcplay back end (Vanilla ignores it). -W/-H = window client size.
 # Vanilla 1.20.1 vs mcplay measurement on one Windows laptop (see tools/mc/perf/vanilla_compare.md).
 # Target = server (start local vanilla server + rcon, once) | vanilla | mcplay.
 # Needs in %TEMP%\mcvan: srv\server.jar (1.20.1), pm\PresentMon.exe (v2.6.0 x64). No accounts/tokens: offline server + offline client.
@@ -96,7 +97,10 @@ max-tick-time=-1
 Rcon-Open
 $j0 = Join-Count
 $proc = $null
-$pmCsv = Join-Path $out ("pm_{0}_r{1}_{2}.csv" -f $Target, $Radius, $Tag)
+$t0 = [Diagnostics.Stopwatch]::StartNew()
+$tWin = -1.0
+$tg = if ($Target -eq 'mcplay') { "mcplay$Gfx" } else { $Target }
+$pmCsv = Join-Path $out ("pm_{0}_{1}x{2}_r{3}_{4}.csv" -f $tg, $W, $H, $Radius, $Tag)
 Remove-Item $pmCsv -ErrorAction SilentlyContinue
 if ($Target -eq 'vanilla') {
   $mc = Join-Path $env:APPDATA '.minecraft'
@@ -128,22 +132,28 @@ if ($Target -eq 'vanilla') {
   $opt = "version:3465`nenableVsync:false`nmaxFps:260`nrenderDistance:$Radius`nsimulationDistance:5`nfullscreen:false`nonboardAccessibility:false`nskipMultiplayerWarning:true`ntutorialStep:none`nguiScale:2`nsoundCategory_master:0.0`nmusicVolume:0.0`nshowAutosaveIndicator:false`nautoJump:false`n"
   Set-Content -Path (Join-Path $gd 'options.txt') -Value $opt -Encoding ASCII
   $a = @('-Xmx2G','-XX:+UseG1GC',"-Djava.library.path=$nat","-Djna.tmpdir=$nat","-Dorg.lwjgl.system.SharedLibraryExtractPath=$nat","-Dio.netty.native.workdir=$nat",'-cp',($cp -join ';'),'net.minecraft.client.main.Main',
-    '--username',"V$Tag",'--version','1.20.1','--gameDir',$gd,'--assetsDir',(Join-Path $mc 'assets'),'--assetIndex','5','--uuid','00000000-0000-0000-0000-000000000001','--accessToken','0','--userType','legacy','--versionType','release','--width','1280','--height','720','--quickPlayMultiplayer',"127.0.0.1:$port")
+    '--username',"V$Tag",'--version','1.20.1','--gameDir',$gd,'--assetsDir',(Join-Path $mc 'assets'),'--assetIndex','5','--uuid','00000000-0000-0000-0000-000000000001','--accessToken','0','--userType','legacy','--versionType','release','--width',"$W",'--height',"$H",'--quickPlayMultiplayer',"127.0.0.1:$port")
   $proc = Start-Process -FilePath $java17 -ArgumentList $a -WorkingDirectory $gd -PassThru
   L "vanilla started pid $($proc.Id) cp=$($cp.Count)"
 } else {
   $inst = Join-Path $env:LOCALAPPDATA 'Programs\Voxel Client'
-  $env:MCPLAY_GL = '1'; $env:MCPLAY_VSYNC = '0'; $env:MCPLAY_FPS = '0'; $env:MCPLAY_VIEW = "$Radius"
-  $env:MCPLAY_W = '1280'; $env:MCPLAY_H = '720'; $env:MCPLAY_FRAME_STATS = '1'; $env:MCPLAY_PROGRESS = '1'
+  if ($Gfx -eq 'vk') { $env:MCPLAY_GFX = 'vk'; Remove-Item Env:MCPLAY_GL -ErrorAction SilentlyContinue } else { $env:MCPLAY_GL = '1'; Remove-Item Env:MCPLAY_GFX -ErrorAction SilentlyContinue }; $env:MCPLAY_VSYNC = '0'; $env:MCPLAY_FPS = '0'; $env:MCPLAY_VIEW = "$Radius"
+  $env:MCPLAY_W = "$W"; $env:MCPLAY_H = "$H"; $env:MCPLAY_FRAME_STATS = '1'; $env:MCPLAY_PROGRESS = '1'
   $env:MCPLAY_SOUNDS = '0'; $env:MCPLAY_AUDIO = '0'
   $env:MCPLAY_RUN_S = [string]($Settle + $Secs + 90); $qf = Join-Path $out ('quit_' + $Tag); Remove-Item $qf -ErrorAction SilentlyContinue; $env:MCPLAY_QUIT_FILE = $qf
-  $proc = Start-Process -FilePath (Join-Path $inst 'mcplay-console.exe') -ArgumentList '127.0.0.1',"$port","M$Tag" -WorkingDirectory $inst -PassThru -RedirectStandardOutput (Join-Path $out ("mcplay_{0}_r{1}_{2}.out" -f $Target, $Radius, $Tag)) -RedirectStandardError (Join-Path $out ("mcplay_{0}_r{1}_{2}.err" -f $Target, $Radius, $Tag))
+  $proc = Start-Process -FilePath (Join-Path $inst $Exe) -ArgumentList '127.0.0.1',"$port","M$Tag" -WorkingDirectory $inst -PassThru -RedirectStandardOutput (Join-Path $out ("mcplay_{0}_{1}x{2}_r{3}_{4}.out" -f $tg, $W, $H, $Radius, $Tag)) -RedirectStandardError (Join-Path $out ("mcplay_{0}_{1}x{2}_r{3}_{4}.err" -f $tg, $W, $H, $Radius, $Tag))
   L "mcplay started pid $($proc.Id)"
 }
 # wait for join
 $joined = $false
-for ($i = 0; $i -lt 150; $i++) { Start-Sleep 1; if ((Join-Count) -gt $j0) { $joined = $true; break }; if ($proc.HasExited) { break } }
-L "joined=$joined after ~${i}s exited=$($proc.HasExited)"
+for ($i = 0; $i -lt 600; $i++) {
+  Start-Sleep -Milliseconds 250
+  if ($tWin -lt 0) { $proc.Refresh(); if ($proc.MainWindowHandle -ne [IntPtr]::Zero) { $tWin = $t0.ElapsedMilliseconds } }
+  if (($i % 4) -eq 3 -and (Join-Count) -gt $j0) { $joined = $true; break }
+  if ($proc.HasExited) { break }
+}
+$tJoin = $t0.ElapsedMilliseconds
+L "joined=$joined t_window_ms=$tWin t_join_ms=$tJoin exited=$($proc.HasExited)"
 if (-not $joined) { if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }; exit 2 }
 # window to front, topmost, report client size
 Start-Sleep 3
@@ -159,8 +169,9 @@ Start-Sleep $Settle
 Rcon 'tp @a 0.5 ~ 0.5 0 8' | Out-Null
 Start-Sleep 2
 # PresentMon + yaw sweep: one full turn over $Secs seconds, one tp (rotation only) every 50 ms via rcon
-$pm = Start-Process -FilePath (Join-Path $base 'pm\PresentMon.exe') -ArgumentList '--process_id',$proc.Id,'--output_file',$pmCsv,'--timed',"$Secs",'--terminate_after_timed','--no_console_stats' -PassThru -WindowStyle Hidden
+$pm = Start-Process -FilePath (Join-Path $base 'pm\PresentMon.exe') -ArgumentList '--process_id',$proc.Id,'--output_file',$pmCsv,'--timed',"$Secs",'--terminate_after_timed','--no_console_stats','--stop_existing_session' -PassThru -WindowStyle Hidden
 $n = $Secs * 20
+$proc.Refresh(); $cpu0 = $proc.TotalProcessorTime.TotalSeconds; $wall0 = [Diagnostics.Stopwatch]::StartNew()
 $sw = [Diagnostics.Stopwatch]::StartNew()
 for ($k = 0; $k -lt $n; $k++) {
   $yaw = -180 + 360.0 * $k / $n
@@ -169,6 +180,11 @@ for ($k = 0; $k -lt $n; $k++) {
   if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
 }
 L "sweep done ${n} tp, elapsed $($sw.ElapsedMilliseconds) ms"
+$proc.Refresh(); $cpuS = $proc.TotalProcessorTime.TotalSeconds - $cpu0; $wallS = $wall0.Elapsed.TotalSeconds
+$cores = [Environment]::ProcessorCount
+$srvp = Get-CimInstance Win32_Process -Filter "name='javaw.exe'" | ? { $_.CommandLine -match 'server.jar' } | select -First 1
+$srvWs = 0; if ($srvp) { $sp = Get-Process -Id $srvp.ProcessId -ErrorAction SilentlyContinue; if ($sp) { $srvWs = [int]($sp.PeakWorkingSet64 / 1MB) } }
+L ("METRICS target=$tg res=${W}x${H} r=$Radius tag=$Tag t_window_ms=$tWin t_join_ms=$tJoin cpu_core_pct={0:N0} cpu_total_pct={1:N1} peak_ws_mb={2} priv_mb={3} srv_peak_ws_mb={4}" -f (100.0 * $cpuS / $wallS), (100.0 * $cpuS / $wallS / $cores), [int]($proc.PeakWorkingSet64 / 1MB), [int]($proc.PrivateMemorySize64 / 1MB), $srvWs)
 $pm.WaitForExit(15000) | Out-Null
 if ($Target -eq 'mcplay') { Set-Content $qf 'q'; $proc.WaitForExit(15000) | Out-Null }
 if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
