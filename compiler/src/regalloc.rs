@@ -3586,6 +3586,80 @@ fn foldable_addresses(
                 }
                 continue;
             }
+            // (3a2) ROUND GAPS-IDX -- `base + (y + c) * F`: the constant add (and the
+            // scaling, if any) sit right in front of the address and have no other
+            // reader. The sum folds into the displacement: `[base + y*F + c*F]`.
+            // 64-bit wrap-around of the add and of the addressing are the same.
+            if std::env::var_os("FIRN_NO_IDXDISP").is_none() && idx > 0 {
+                let addc = |p: &Inst| -> Option<(Val, i64, Val)> {
+                    let pd = p.dst?;
+                    if p.ty.bits() != 64 {
+                        return None;
+                    }
+                    let (y, k) = match &p.op {
+                        Op::Bin(BinOp::Add, y, c) => (*y, a.imm(*c)?),
+                        Op::Bin(BinOp::Sub, y, c) => (*y, a.imm(*c)?.checked_neg()?),
+                        _ => return None,
+                    };
+                    if a.imm(y).is_some() {
+                        return None;
+                    }
+                    if read.get(pd as usize).copied() != Some(1)
+                        || !single(pd)
+                        || f.is_secret(pd)
+                        || a.alias.contains_key(&pd)
+                        || a.frame_addr.contains_key(&pd)
+                        || a.cell(pd).is_some()
+                    {
+                        return None;
+                    }
+                    Some((y, k, pd))
+                };
+                let p1 = &b.insts[idx - 1];
+                // scaled: add at idx-2, shl/mul at idx-1
+                let mut hit: Option<(Val, i64, i64, Val, Option<Val>)> = None; // (y, k, factor, add dst, scale dst)
+                if p1.dst == Some(off) && p1.ty.bits() == 64 && idx > 1 && read.get(off as usize).copied() == Some(1) && single(off) && !f.is_secret(off) && !a.alias.contains_key(&off) && a.cell(off).is_none() {
+                    let skal = match &p1.op {
+                        Op::Bin(BinOp::Shl, xi, ki) => match a.imm(*ki) {
+                            Some(k) if (0..=3).contains(&k) => Some((*xi, 1i64 << k)),
+                            _ => None,
+                        },
+                        Op::Bin(BinOp::Mul, xi, ki) => match a.imm(*ki) {
+                            Some(k) if [1, 2, 4, 8].contains(&k) => Some((*xi, k)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((xi, fact)) = skal {
+                        let p2 = &b.insts[idx - 2];
+                        if p2.dst == Some(xi) {
+                            if let Some((y, k, pd)) = addc(p2) {
+                                hit = Some((y, k, fact, pd, Some(off)));
+                            }
+                        }
+                    }
+                } else if let Some((y, k, pd)) = addc(p1) {
+                    // unscaled: the add at idx-1 is the index itself
+                    if pd == off {
+                        hit = Some((y, k, 1, pd, None));
+                    }
+                }
+                if let Some((y, k, fact, pd, sc)) = hit {
+                    if let (Some(yr), Some(disp)) = (pure_reg(y), k.checked_mul(fact)) {
+                        if (i32::MIN as i64..=i32::MAX as i64).contains(&disp) && (!base_preload || yr != br) && Some(yr) != None {
+                            out.insert(d, Address { base: br, index: Some((yr, fact)), offset: disp });
+                            away.insert(pd);
+                            if let Some(s2) = sc {
+                                away.insert(s2);
+                            }
+                            if base_preload {
+                                before.insert(d, base);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
             // (3b) index with factor: the scaling sits right in front of it
             if read.get(off as usize).copied() == Some(1) && idx > 0 && single(off) {
                 let p = &b.insts[idx - 1];
