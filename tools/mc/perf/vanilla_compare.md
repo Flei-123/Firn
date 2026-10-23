@@ -53,3 +53,6 @@ Reading (facts only)
 - mcplay r8 is bimodal: two runs at 15.6 ms (= mcplay's own `frame_stats` p50 15.6 ms), one at 7.5 ms (own p50 7.1 ms). Cause NOT investigated (system timer was 1 ms; not a cap: `MCPLAY_FPS=0`, vsync 0). Earlier bench_gl at 640x360 r8 gave 8.7 ms (different harness, 4x fewer pixels, no network).
 - Not compared: sound (off for both), CPU/RAM use, Vanilla "Fast" graphics, GPU utilisation, mcplay Vulkan, load time. Only one machine, one world position (spawn), one 35 s window per run.
 - Vanilla `MsBetweenPresents` p95 = 10.00 ms in all three r8 runs (same value to two decimals) -- looks like a quantised stall pattern; not examined.
+
+## v2 (Hoechstleistung, VK, 640x360)
+See tools/mc/perf/vanilla_compare_v2.md. Scripts: mcvan_run.ps1 (-W -H -Gfx -Exe), mcvan_batch.ps1, mcvan_report.ps1 + mcvan_agg.py. mcplay: MCPLAY_VSYNC=0 now also selects IMMEDIATE/MAILBOX for MCPLAY_GFX=vk. Key finding: mcplay GL/VK sit at 15.6 ms (wait limit), see roadmap r277.
