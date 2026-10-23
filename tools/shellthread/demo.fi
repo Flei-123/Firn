@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: MPL-2.0
+// tools/shellthread/demo.fi -- shell thread demo and measurement: an app thread that sleeps 500 ms per frame, a WM_NULL ping thread, with and without the shell thread (docs/SHELL_THREAD.md).
+import std.rt
+import std.io
+import std.time
+import std.vec
+import window.window
+import window.shellos
+import window.shellthread
+import window.shellproto
+
+extern fn SendMessageTimeoutW(h: i64, msg: i64, wp: i64, lp: i64, flags: i64, ms: i64, res: u64) -> i64;
+extern fn PostMessageW(h: i64, msg: i64, wp: i64, lp: i64) -> i32;
+
+const KIND_PING: u64 = 2
+const SAMPLE_MAX: usize = 4096
+const WM_SYSCOMMAND: i64 = 274
+const WM_KEYDOWN: i64 = 256
+const SC_MOVE: i64 = 61456
+const VK_RETURN: i64 = 13
+const VK_ESCAPE: i64 = 27
+const VK_RIGHT: i64 = 39
+const VK_LEFT: i64 = 37
+
+const P_HWND: usize = 0
+const P_DUR: usize = 1
+const P_N: usize = 2
+const P_TIMEOUTS: usize = 3
+const P_STOP: usize = 4
+const P_DONE: usize = 5
+const P_SAMPLES: usize = 6
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == shellproto.SHELL_KIND {
+        return shellthread.shell_main(arg)
+    }
+    if kind == KIND_PING {
+        return ping_main(arg)
+    }
+    return 9
+}
+
+fn say(label: str, v: u64) {
+    var b: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&b, label.p as u64, label.n)
+    rt.buf_push_dec_i64(&b, v as i64)
+    rt.buf_push_bytes(&b, "\n".p as u64, 1)
+    rt.write_everything(1, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+fn ping_main(ctx: u64) -> u64 {
+    let hwnd: u64 = rt.ld64(ctx, P_HWND)
+    let dur: u64 = rt.ld64(ctx, P_DUR)
+    let samples: u64 = rt.ld64(ctx, P_SAMPLES)
+    let t_end: u64 = time.monotonic_ns() + dur * 1000000
+    var res: [u64; 1] = [0; 1]
+    var n: usize = 0
+    while time.monotonic_ns() < t_end && n < SAMPLE_MAX && rt.ld64(ctx, P_STOP) == 0 {
+        let t0: u64 = time.monotonic_ns()
+        thread_blocking_an()
+        let r: i64 = SendMessageTimeoutW(hwnd as i64, 0, 0, 0, 2, 2000, (&res[0]) as u64)
+        thread_blocking_out()
+        let t1: u64 = time.monotonic_ns()
+        var us: u64 = (t1 - t0) / 1000
+        if r == 0 {
+            us = 2000000
+            rt.st64(ctx, P_TIMEOUTS, rt.ld64(ctx, P_TIMEOUTS) + 1)
+        }
+        rt.st64(samples, n, us)
+        n = n + 1
+        rt.st64(ctx, P_N, n as u64)
+        thread_sleep(10)
+    }
+    rt.st64(ctx, P_DONE, 1)
+    return 0
+}
+
+fn ctx_new(hwnd: u64, dur: u64) -> u64 {
+    let ctx: u64 = rt.heap_alloc((P_SAMPLES + 1) * 8)
+    rt.mem_set(ctx, 0 as u8, (P_SAMPLES + 1) * 8)
+    rt.st64(ctx, P_HWND, hwnd)
+    rt.st64(ctx, P_DUR, dur)
+    let sp: u64 = rt.heap_alloc(SAMPLE_MAX * 8)
+    rt.mem_set(sp, 0 as u8, SAMPLE_MAX * 8)
+    rt.st64(ctx, P_SAMPLES, sp)
+    return ctx
+}
+
+fn ctx_report(ctx: u64, label: str) -> u64 {
+    let n: usize = rt.ld64(ctx, P_N) as usize
+    let sp: u64 = rt.ld64(ctx, P_SAMPLES)
+    var i: usize = 1
+    while i < n {
+        let v: u64 = rt.ld64(sp, i)
+        var j: usize = i
+        while j > 0 && rt.ld64(sp, j - 1) > v {
+            rt.st64(sp, j, rt.ld64(sp, j - 1))
+            j = j - 1
+        }
+        rt.st64(sp, j, v)
+        i = i + 1
+    }
+    io.print(label)
+    io.print_line("")
+    say("samples=", n as u64)
+    say("timeouts=", rt.ld64(ctx, P_TIMEOUTS))
+    if n > 0 {
+        say("p50_us=", rt.ld64(sp, n / 2))
+        say("p95_us=", rt.ld64(sp, n * 95 / 100))
+        say("p99_us=", rt.ld64(sp, n * 99 / 100))
+        say("max_us=", rt.ld64(sp, n - 1))
+        return rt.ld64(sp, n * 95 / 100)
+    }
+    return 0
+}
+
+fn ctx_free(ctx: u64) {
+    rt.heap_free(rt.ld64(ctx, P_SAMPLES), SAMPLE_MAX * 8)
+    rt.heap_free(ctx, (P_SAMPLES + 1) * 8)
+}
+
+fn paint_into(pix: u64, w: usize, h: usize, frame: u64) {
+    var y: usize = 0
+    while y < h {
+        let row: u64 = pix + (y * w * 4) as u64
+        let base: u32 = (((y * 255 / h) as u32) << 8) | (((frame * 16) % 256) as u32)
+        var x: usize = 0
+        while x < w {
+            rt.st32(row, x, base | (((x * 255 / w) as u32) << 16))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    var k: usize = 0
+    while k < 20 && k < h {
+        var x2: usize = 0
+        let bar: usize = ((frame % 40) as usize) * w / 40
+        let row2: u64 = pix + (k * w * 4) as u64
+        while x2 < bar {
+            rt.st32(row2, x2, 16777215 as u32)
+            x2 = x2 + 1
+        }
+        k = k + 1
+    }
+}
+
+fn gc_churn() {
+    var v: Vec[u64] = vec_new[u64]()
+    var i: u64 = 0
+    while i < 2000 {
+        vec_push[u64](&v, i)
+        i = i + 1
+    }
+    gc_collect()
+    vec_free[u64](&v)
+}
+
+fn run_shell_mode(dur: u64, sleep_ms: u64, move_win: bool) -> u64 {
+    let sh: u64 = shellthread.shell_start("shell thread demo", 640, 400)
+    if sh == 0 || !shellthread.shell_wait_open(sh, 10000) {
+        io.print_line("FAIL: shell thread did not open the window")
+        return 1
+    }
+    let ctx: u64 = ctx_new(shellthread.shell_hwnd(sh), dur)
+    let ph: u64 = thread_start(KIND_PING, ctx)
+    let t_end: u64 = time.monotonic_ns() + dur * 1000000
+    var frame: u64 = 0
+    var evs: u64 = 0
+    var drags: u64 = 0
+    var rec: [u64; 8] = [0; 8]
+    let hw: i64 = shellthread.shell_hwnd(sh) as i64
+    while time.monotonic_ns() < t_end {
+        let w: usize = shellthread.shell_width(sh)
+        let h: usize = shellthread.shell_height(sh)
+        let pix: u64 = shellthread.shell_frame_acquire(sh, w, h)
+        if pix != 0 {
+            paint_into(pix, w, h, frame)
+            shellthread.shell_frame_submit(sh, pix, w, h)
+        }
+        frame = frame + 1
+        if move_win && frame == 3 {
+            PostMessageW(hw, WM_SYSCOMMAND, SC_MOVE, 0)
+            time.sleep_ms(300)
+            var k: i64 = 0
+            while k < 30 {
+                PostMessageW(hw, WM_KEYDOWN, VK_RIGHT, 0)
+                k = k + 1
+            }
+            PostMessageW(hw, WM_KEYDOWN, VK_RETURN, 0)
+        }
+        while shellthread.shell_poll(sh, &rec[0]) {
+            evs = evs + 1
+            if rec[0] == shellproto.SE_DRAG as u64 && rec[1] == 1 {
+                drags = drags + 1
+            }
+        }
+        gc_churn()
+        thread_sleep(sleep_ms)
+    }
+    while shellthread.shell_poll(sh, &rec[0]) {
+        evs = evs + 1
+    }
+    rt.st64(ctx, P_STOP, 1)
+    thread_wait(ph)
+    PostMessageW(hw, WM_KEYDOWN, VK_ESCAPE, 0)
+    let p95: u64 = ctx_report(ctx, "mode=shell")
+    say("frames_submitted=", frame)
+    say("frames_shown=", shellthread.shell_stat(sh, shellproto.STAT_SHOWN))
+    say("frames_dropped=", shellthread.shell_stat(sh, shellproto.STAT_DROPPED))
+    say("paints=", shellthread.shell_stat(sh, shellproto.STAT_PAINTS))
+    say("events=", evs)
+    say("events_dropped=", shellthread.shell_stat(sh, shellproto.STAT_EVDROP))
+    say("drag_starts=", drags)
+    shellthread.shell_stop(sh)
+    ctx_free(ctx)
+    return p95
+}
+
+fn run_direct_mode(dur: u64, sleep_ms: u64) -> u64 {
+    var f: window.Window = window.window_new()
+    if !window.open_window(&f, 0) || !window.make(&f, 640, 400) {
+        io.print_line("FAIL: window did not open")
+        return 1
+    }
+    window.show_window(&f)
+    let ctx: u64 = ctx_new(shellos.os_hwnd(&f), dur)
+    let ph: u64 = thread_start(KIND_PING, ctx)
+    let t_end: u64 = time.monotonic_ns() + dur * 1000000
+    var frame: u64 = 0
+    var pix: u64 = rt.heap_alloc(1920 * 1200 * 4)
+    while time.monotonic_ns() < t_end {
+        while window.wait_event(&f, 0) {
+            if window.next_event(&f) == window.EV_NONE {
+                break
+            }
+        }
+        let w: usize = window.width(&f)
+        let h: usize = window.height(&f)
+        if w * h * 4 <= 1920 * 1200 * 4 {
+            paint_into(pix, w, h, frame)
+            window.image(&f, pix, w, h, 0, 0)
+            window.present(&f)
+        }
+        frame = frame + 1
+        gc_churn()
+        thread_sleep(sleep_ms)
+    }
+    rt.st64(ctx, P_STOP, 1)
+    thread_wait(ph)
+    let p95: u64 = ctx_report(ctx, "mode=direct")
+    say("frames_submitted=", frame)
+    window.close_window(&f)
+    rt.heap_free(pix, 1920 * 1200 * 4)
+    ctx_free(ctx)
+    return p95
+}
+
+fn arg_is(start: u64, i: usize, s: str) -> bool {
+    if i >= rt.arg_count(start) {
+        return false
+    }
+    let p: u64 = rt.arg_ptr(start, i)
+    if rt.c_length(p) != s.n {
+        return false
+    }
+    var k: usize = 0
+    while k < s.n {
+        if rt.ld8(p, k) != rt.ld8(s.p as u64, k) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+fn main(start: u64) -> i32 {
+    var mode_direct: bool = false
+    var selftest: bool = false
+    var move_win: bool = false
+    var dur: u64 = 10000
+    var i: usize = 1
+    while i < rt.arg_count(start) {
+        if arg_is(start, i, "--direct") {
+            mode_direct = true
+        } else if arg_is(start, i, "--selftest") {
+            selftest = true
+            dur = 6000
+        } else if arg_is(start, i, "--move") {
+            move_win = true
+        } else if arg_is(start, i, "--short") {
+            dur = 3000
+        }
+        i = i + 1
+    }
+    var p95: u64 = 0
+    if mode_direct {
+        p95 = run_direct_mode(dur, 500)
+    } else {
+        p95 = run_shell_mode(dur, 500, move_win)
+    }
+    if selftest {
+        if mode_direct || p95 < 100000 {
+            io.print_line("SELFTEST OK")
+            return 0
+        }
+        io.print_line("SELFTEST FAIL: p95 above 100 ms")
+        return 3
+    }
+    return 0
+}
