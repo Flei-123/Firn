@@ -3156,18 +3156,19 @@ fn cg_run(c: *mut Cg) {
 //
 // `as` is single threaded and needs about 0.12 s per MB of text, which was
 // 54 % of the wall time for a kernel-sized program. The text is therefore cut
-// into `nf` runs of whole functions (parts 0..nf-1) plus one part with
-// everything behind the last function (part nf: tables, statics, the panic
-// messages). The parts are assembled in parallel and joined with `ld -r`.
+// into `nf` runs of whole functions; the LAST part also carries everything
+// behind the last function (tables, statics, the panic messages). The parts
+// are assembled in parallel (one `as` process each) and joined with `ld -r`.
 //
 // What makes the cut safe:
 //  * Function bodies only refer to labels of their own function, to global
 //    function symbols, and to the labels of the tail. The tail labels in a
 //    data section (`.Lpanicmsg<n>`, `.Lstatic_*`, `.L__fnv.*`, `.L__iface.*`,
-//    `.L__gc_*`) get `.globl` + `.hidden` in the tail part, so the other parts
+//    `.L__gc_*`) get `.globl` + `.hidden` in the last part, so the other parts
 //    can refer to them (the final link makes them local again).
 //  * The panic trampoline is TEXT with labels of its own (`.Lpanic_*`): every
-//    function part gets its own copy, so no text label crosses a part.
+//    part gets its own copy (the last one has it in the tail), so no text
+//    label crosses a part.
 //  * Every part ends with the GNU-stack note like the whole text does.
 
 const PART_MAX: u32 = 8
@@ -3186,8 +3187,8 @@ fn split_cut(c: *mut Cg, target: u64) -> u64 {
     return (*c).tail_off
 }
 
-// How many function parts: `want` (clamped by the number of functions and
-// PART_MAX). The caller adds one for the tail. Returns 0 = do not split.
+// How many parts: `want` (clamped by the number of functions and PART_MAX).
+// Returns 0 = do not split.
 fn cg_split_count(c: *mut Cg, want: u32) -> u32 {
     var nf: u32 = want
     if nf > PART_MAX {
@@ -3230,37 +3231,42 @@ fn split_note(out: *mut rt.Buf) {
     rt.buf_push_bytes(out, (&gnu[0]) as u64, 38)
 }
 
-// Part `k` of `nf + 1` into `out` (cleared first). 0 <= k < nf: functions;
-// k == nf: the tail.
+// Part `k` of `nf` into `out` (cleared first).
 fn cg_split_fill(c: *mut Cg, k: u32, nf: u32, out: *mut rt.Buf) {
     rt.buf_clear(out)
     let base: u64 = rt.buf_ptr(&(*c).out)
     let len: u64 = rt.buf_len(&(*c).out) as u64
-    if k < nf {
-        var a: u64 = 0
-        if k > 0 {
-            a = split_cut(c, (*c).tail_off / nf as u64 * k as u64)
-        }
-        var b: u64 = (*c).tail_off
-        if k + 1 < nf {
-            b = split_cut(c, (*c).tail_off / nf as u64 * (k + 1) as u64)
-        }
-        if k > 0 {
-            split_prelude(out)
-        }
-        if b > a {
-            rt.buf_push_bytes(out, base + a, (b - a) as usize)
-        }
-        if (*c).tr_b > (*c).tr_a {
-            rt.buf_push_bytes(out, base + (*c).tr_a, ((*c).tr_b - (*c).tr_a) as usize)
-        }
-        split_note(out)
+    var a: u64 = 0
+    if k > 0 {
+        a = split_cut(c, len / nf as u64 * k as u64)
+    }
+    var b: u64 = (*c).tail_off
+    let last: bool = k + 1 == nf
+    if !last {
+        b = split_cut(c, len / nf as u64 * (k + 1) as u64)
+    }
+    if k > 0 {
+        split_prelude(out)
+    }
+    if b > a {
+        rt.buf_push_bytes(out, base + a, (b - a) as usize)
+    }
+    if last {
+        split_tail(c, out)
         return
     }
-    // The tail. Section tracking: `codegen` only writes `.text` and
-    // `.section <name>` lines. Labels at column 0 in a data section are the
-    // ones the function parts refer to.
-    split_prelude(out)
+    if (*c).tr_b > (*c).tr_a {
+        rt.buf_push_bytes(out, base + (*c).tr_a, ((*c).tr_b - (*c).tr_a) as usize)
+    }
+    split_note(out)
+}
+
+// Everything behind the last function. Section tracking: `codegen` only
+// writes `.text` and `.section <name>` lines. Labels at column 0 in a data
+// section are the ones the function parts refer to.
+fn split_tail(c: *mut Cg, out: *mut rt.Buf) {
+    let base: u64 = rt.buf_ptr(&(*c).out)
+    let len: u64 = rt.buf_len(&(*c).out) as u64
     var gl: [u8; 7] = ".globl "
     var hd: [u8; 8] = ".hidden "
     var sec: [u8; 9] = ".section "
