@@ -213,6 +213,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "r837: ((x & M32) >> n | x << (32 - n)) & M32 becomes one 32-bit rotate (aarch64 only, once, after the fixpoint)",
     },
     PassInfo {
+        name: "bitsel",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "GAPS: (e&f)^(~e&g) becomes g^(e&(f^g)), (a&b)^(a&c)^(b&c) becomes (a&(b^c))^(b&c) (x86-64 only, once, after rotate)",
+    },
+    PassInfo {
         name: "licm",
         scope: Scope::Func,
         debug_preserving: true,
@@ -720,6 +726,23 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
             n += k;
         }
         clk.add2("rotate", t, n > 0);
+    }
+    // GAPS: bit-select / majority identities (SHA-2 `ch` and `maj`), x86-64 only.
+    if cfg.runs("bitsel") && crate::target::active() == crate::target::Target::X86_64 {
+        let t = std::time::Instant::now();
+        let mut n = 0usize;
+        for f in m.funcs.iter_mut() {
+            if f.constant_time || !f.secret.is_empty() {
+                continue;
+            }
+            let k = crate::bitsel::run(f);
+            if k > 0 {
+                remove_dead_insts(f, &mut st);
+                phi_check(f, "bitsel");
+            }
+            n += k;
+        }
+        clk.add2("bitsel", t, n > 0);
     }
     // r806: the very last step, once per function. Earlier it would hide the checks from `bce`
     // and the range analysis, and from the inliner's size heuristic.

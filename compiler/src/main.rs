@@ -107,6 +107,7 @@ mod sema_generic;
 mod sema_match;
 mod peephole;
 mod rotate;
+mod bitsel;
 mod promote;
 mod rangecheck;
 mod strings;

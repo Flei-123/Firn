@@ -3400,6 +3400,23 @@ impl Address {
     }
 }
 
+thread_local! {
+    static SYM_TEXT: std::cell::RefCell<crate::fx::HashMap<String, &'static str>> = std::cell::RefCell::new(crate::fx::HashMap::default());
+}
+
+/// Interned `'static` text for a symbolic address base (a handful of statics per program).
+fn intern_sym(s: String) -> &'static str {
+    SYM_TEXT.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some(t) = m.get(&s) {
+            return *t;
+        }
+        let t: &'static str = Box::leak(s.clone().into_boxed_str());
+        m.insert(s, t);
+        t
+    })
+}
+
 /// Address computations that may move completely into the memory access.
 ///
 /// Up to round 43 this produced
@@ -3513,12 +3530,45 @@ fn foldable_addresses(
             Loc::Slot(_) => None,
         }
     };
+    // GAPS-GLOBAL: a `globaladdr` with ONE reader (after `addrsink` gave every access its own
+    // copy) needs no register: the access names the symbol itself. Without an index it is
+    // `[rip + sym + k]` (every target); with an index it is `[sym + idx*F + k]` -- an absolute
+    // 32-bit displacement, which only a non-PIC ELF target can link.
+    let mut gname: HashMap<Val, &'static str> = HashMap::default();
+    let mut gbase: HashMap<Val, Val> = HashMap::default();
+    let gfold = std::env::var_os("FIRN_NO_GFOLD").is_none();
+    let abs_ok = gfold && !crate::target::windows() && !crate::target::pic();
+    if gfold {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let (Some(d), Op::GlobalAddr { name }) = (i.dst, &i.op) {
+                    if single(d) && read.get(d as usize).copied() == Some(1) && !f.is_secret(d) {
+                        gname.insert(d, intern_sym(crate::statics::label_of(name)));
+                    }
+                }
+            }
+        }
+    }
     for b in &f.blocks {
         for (idx, i) in b.insts.iter().enumerate() {
             let d = match i.dst {
                 Some(d) => d,
                 None => continue,
             };
+            // (0) a global address read ONLY by the access right behind it
+            if let (Some(sym), Op::GlobalAddr { .. }) = (gname.get(&d), &i.op) {
+                if let Some(n) = b.insts.get(idx + 1) {
+                    let fits = match &n.op {
+                        Op::Load { addr } => *addr == d,
+                        Op::Store { addr, val } => *addr == d && *val != d,
+                        _ => false,
+                    };
+                    if fits {
+                        out.insert(d, Address { base: intern_sym(format!("rip + {}", sym)), index: None, offset: 0 });
+                    }
+                }
+                continue;
+            }
             // (1) address forming instruction
             let (base, off) = match &i.op {
                 Op::PtrAdd { base, off } => (*base, *off),
@@ -3569,21 +3619,32 @@ fn foldable_addresses(
                     && !a.frame_addr.contains_key(&v)
                     && a.imm(v).is_none()
             };
-            let (br, base_preload) = match pure_reg(base) {
-                Some(r) => (r, false),
-                None => match (a.loc(d), base_may_read(base)) {
-                    (Loc::Reg(dr), true) if Some(dr) != value_reg => (dr, true),
-                    _ => continue,
-                },
+            let gsym: Option<&'static str> = gname.get(&base).copied();
+            let (br, base_preload) = if let Some(sym) = gsym {
+                gbase.insert(d, base);
+                (sym, false)
+            } else {
+                match pure_reg(base) {
+                    Some(r) => (r, false),
+                    None => match (a.loc(d), base_may_read(base)) {
+                        (Loc::Reg(dr), true) if Some(dr) != value_reg => (dr, true),
+                        _ => continue,
+                    },
+                }
             };
             // (3a) constant offset
             if let Some(k) = a.imm(off) {
                 if (0..=i32::MAX as i64).contains(&k) && !f.is_secret(off) {
-                    out.insert(d, Address { base: br, index: None, offset: k });
+                    let bt = if gsym.is_some() { intern_sym(format!("rip + {}", br)) } else { br };
+                    out.insert(d, Address { base: bt, index: None, offset: k });
                     if base_preload {
                         before.insert(d, base);
                     }
                 }
+                continue;
+            }
+            // A symbolic base with an index needs the absolute form.
+            if gsym.is_some() && !abs_ok {
                 continue;
             }
             // (3a2) ROUND GAPS-IDX -- `base + (y + c) * F`: the constant add (and the
@@ -3936,6 +3997,12 @@ fn foldable_addresses(
                 scale.insert(d, (br, ir, fact));
                 away.insert(off);
             }
+        }
+    }
+    // The `globaladdr` behind a folded address is not emitted any more.
+    for (d, g) in gbase.iter() {
+        if out.contains_key(d) {
+            away.insert(*g);
         }
     }
     (out, away, before, scale)
@@ -7867,6 +7934,9 @@ fn emit_inst(
         // Round 89 (statics.rs), like `FnRef`: a link time constant address.
         Op::GlobalAddr { name } => {
             let d = i.dst.ok_or("internal error: globaladdr without target")?;
+            if ra.offset.contains_key(&d) || ra.skipped.contains(&d) {
+                return Ok(()); // the symbol stands in the access
+            }
             e.line(&format!(
                 "lea rax, [rip + {}]",
                 crate::statics::label_of(name)
