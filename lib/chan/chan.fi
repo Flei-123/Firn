@@ -1,0 +1,403 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/chan/chan.fi -- chan: a thread safe bounded ring channel (SPSC / MPSC), records of 64 bit words, futex waits, docs/CHAN.md.
+
+import std.rt
+import std.time
+
+export {
+    Chan,
+    chan_new, chan_free, chan_close, chan_len, chan_is_closed, chan_cap, chan_rec_words,
+    chan_try_send, chan_send, chan_try_recv, chan_recv, chan_recv_timeout,
+    chan_send1, chan_recv1,
+    RECV_OK, RECV_TIMEOUT, RECV_CLOSED,
+}
+
+const RECV_OK: u64 = 0
+const RECV_TIMEOUT: u64 = 1
+const RECV_CLOSED: u64 = 2
+
+const MINUS1: u64 = 18446744073709551615
+const SPIN: u64 = 1024
+const CAP_MAX: u64 = 1073741824
+const REC_WORDS_MAX: u64 = 4096
+
+const C_ENQ: usize = 0
+const C_DEQ: usize = 16
+const C_DATA: usize = 32
+const C_RECV_WAITERS: usize = 33
+const C_SPACE: usize = 48
+const C_SEND_WAITERS: usize = 49
+const C_CLOSED: usize = 64
+const C_MASK: usize = 65
+const C_CAP: usize = 66
+const C_REC_WORDS: usize = 67
+const C_STRIDE: usize = 68
+const C_RING: usize = 69
+const C_RING_BYTES: usize = 70
+const C_WORDS: usize = 80
+
+struct Chan {
+    blk: u64,
+}
+
+fn waddr(base: u64, w: usize) -> u64 {
+    return base + (w * 8) as u64
+}
+
+fn aload(p: u64) -> u64 {
+    return __atomic_add(p as *mut u64, 0)
+}
+
+fn slot_at(ring: u64, mask: u64, bytes: u64, pos: u64) -> u64 {
+    return ring + (pos & mask) * bytes
+}
+
+fn closed_now(blk: u64) -> bool {
+    return rt.ld64(blk, C_CLOSED) != 0
+}
+
+fn closed_sure(blk: u64) -> bool {
+    return aload(waddr(blk, C_CLOSED)) != 0
+}
+
+fn chan_new(cap: u64, rec_words: u64) -> Chan {
+    var rw: u64 = rec_words
+    if rw == 0 {
+        rw = 1
+    }
+    if rw > REC_WORDS_MAX {
+        return Chan { blk: 0 }
+    }
+    var n: u64 = 2
+    while n < cap && n < CAP_MAX {
+        n = n * 2
+    }
+    let stride: u64 = rw + 1
+    let blk: u64 = rt.heap_alloc(C_WORDS * 8)
+    if blk == 0 {
+        return Chan { blk: 0 }
+    }
+    rt.mem_set(blk, 0 as u8, C_WORDS * 8)
+    let bytes: usize = (n * stride * 8) as usize
+    let ring: u64 = rt.heap_alloc(bytes)
+    if ring == 0 {
+        rt.heap_free(blk, C_WORDS * 8)
+        return Chan { blk: 0 }
+    }
+    rt.mem_set(ring, 0 as u8, bytes)
+    var i: u64 = 0
+    while i < n {
+        rt.st64(ring, (i * stride) as usize, i)
+        i = i + 1
+    }
+    rt.st64(blk, C_MASK, n - 1)
+    rt.st64(blk, C_CAP, n)
+    rt.st64(blk, C_REC_WORDS, rw)
+    rt.st64(blk, C_STRIDE, stride)
+    rt.st64(blk, C_RING, ring)
+    rt.st64(blk, C_RING_BYTES, bytes as u64)
+    return Chan { blk: blk }
+}
+
+fn chan_free(c: *mut Chan) {
+    let blk: u64 = (*c).blk
+    if blk == 0 {
+        return
+    }
+    rt.heap_free(rt.ld64(blk, C_RING), rt.ld64(blk, C_RING_BYTES) as usize)
+    rt.heap_free(blk, C_WORDS * 8)
+    (*c).blk = 0
+}
+
+fn chan_cap(c: *mut Chan) -> u64 {
+    if (*c).blk == 0 {
+        return 0
+    }
+    return rt.ld64((*c).blk, C_CAP)
+}
+
+fn chan_rec_words(c: *mut Chan) -> u64 {
+    if (*c).blk == 0 {
+        return 0
+    }
+    return rt.ld64((*c).blk, C_REC_WORDS)
+}
+
+fn chan_is_closed(c: *mut Chan) -> bool {
+    if (*c).blk == 0 {
+        return true
+    }
+    return closed_sure((*c).blk)
+}
+
+fn chan_len(c: *mut Chan) -> u64 {
+    let blk: u64 = (*c).blk
+    if blk == 0 {
+        return 0
+    }
+    let d: u64 = aload(waddr(blk, C_DEQ))
+    let e: u64 = aload(waddr(blk, C_ENQ))
+    if e <= d {
+        return 0
+    }
+    let cap: u64 = rt.ld64(blk, C_CAP)
+    if e - d > cap {
+        return cap
+    }
+    return e - d
+}
+
+fn put_raw(blk: u64, src: u64) -> u64 {
+    let enq: u64 = waddr(blk, C_ENQ)
+    let ring: u64 = rt.ld64(blk, C_RING)
+    let mask: u64 = rt.ld64(blk, C_MASK)
+    let bytes: u64 = rt.ld64(blk, C_STRIDE) * 8
+    var pos: u64 = rt.ld64(blk, C_ENQ)
+    while true {
+        let slot: u64 = slot_at(ring, mask, bytes, pos)
+        let seq: u64 = rt.ld64(slot, 0)
+        if seq == pos {
+            if __atomic_swap(enq as *mut u64, pos, pos + 1) == pos {
+                break
+            }
+            pos = rt.ld64(blk, C_ENQ)
+        } else if seq < pos {
+            return 1
+        } else {
+            pos = rt.ld64(blk, C_ENQ)
+        }
+    }
+    let slot: u64 = slot_at(ring, mask, bytes, pos)
+    let rw: u64 = rt.ld64(blk, C_REC_WORDS)
+    var i: u64 = 0
+    while i < rw {
+        rt.st64(slot, (i + 1) as usize, rt.ld64(src, i as usize))
+        i = i + 1
+    }
+    __atomic_add(slot as *mut u64, 1)
+    return 0
+}
+
+fn take_raw(blk: u64, dst: u64) -> u64 {
+    let deq: u64 = waddr(blk, C_DEQ)
+    let cap: u64 = rt.ld64(blk, C_CAP)
+    let ring: u64 = rt.ld64(blk, C_RING)
+    let mask: u64 = rt.ld64(blk, C_MASK)
+    let bytes: u64 = rt.ld64(blk, C_STRIDE) * 8
+    var pos: u64 = rt.ld64(blk, C_DEQ)
+    while true {
+        let slot: u64 = slot_at(ring, mask, bytes, pos)
+        let seq: u64 = rt.ld64(slot, 0)
+        if seq == pos + 1 {
+            if __atomic_swap(deq as *mut u64, pos, pos + 1) == pos {
+                break
+            }
+            pos = rt.ld64(blk, C_DEQ)
+        } else if seq < pos + 1 {
+            return 1
+        } else {
+            pos = rt.ld64(blk, C_DEQ)
+        }
+    }
+    let slot: u64 = slot_at(ring, mask, bytes, pos)
+    let rw: u64 = rt.ld64(blk, C_REC_WORDS)
+    var i: u64 = 0
+    while i < rw {
+        rt.st64(dst, i as usize, rt.ld64(slot, (i + 1) as usize))
+        i = i + 1
+    }
+    __atomic_add(slot as *mut u64, cap - 1)
+    return 0
+}
+
+fn wake_receivers(blk: u64) {
+    if rt.ld64(blk, C_RECV_WAITERS) != 0 {
+        __atomic_add(waddr(blk, C_DATA) as *mut u64, 1)
+        __thread_futex_wake(waddr(blk, C_DATA), 1)
+    }
+}
+
+fn wake_senders(blk: u64) {
+    if rt.ld64(blk, C_SEND_WAITERS) != 0 {
+        __atomic_add(waddr(blk, C_SPACE) as *mut u64, 1)
+        __thread_futex_wake(waddr(blk, C_SPACE), 1)
+    }
+}
+
+fn try_send_blk(blk: u64, src: u64) -> u64 {
+    if closed_now(blk) {
+        return 2
+    }
+    let r: u64 = put_raw(blk, src)
+    if r == 0 {
+        wake_receivers(blk)
+    }
+    return r
+}
+
+fn try_recv_blk(blk: u64, dst: u64) -> u64 {
+    let r: u64 = take_raw(blk, dst)
+    if r == 0 {
+        wake_senders(blk)
+    }
+    return r
+}
+
+fn chan_try_send(c: *mut Chan, rec: *mut u64) -> bool {
+    let blk: u64 = (*c).blk
+    if blk == 0 {
+        return false
+    }
+    return try_send_blk(blk, rec as u64) == 0
+}
+
+fn chan_try_recv(c: *mut Chan, out: *mut u64) -> bool {
+    let blk: u64 = (*c).blk
+    if blk == 0 {
+        return false
+    }
+    return try_recv_blk(blk, out as u64) == 0
+}
+
+fn send_blk(blk: u64, src: u64) -> bool {
+    var spin: u64 = 0
+    while true {
+        let r: u64 = try_send_blk(blk, src)
+        if r == 0 {
+            return true
+        }
+        if r == 2 {
+            return false
+        }
+        if spin < SPIN {
+            spin = spin + 1
+            continue
+        }
+        __atomic_add(waddr(blk, C_SEND_WAITERS) as *mut u64, 1)
+        let sv: u64 = rt.ld64(blk, C_SPACE)
+        let r2: u64 = try_send_blk(blk, src)
+        if r2 == 1 {
+            thread_blocking_an()
+            __thread_futex_wait(waddr(blk, C_SPACE), sv)
+            thread_blocking_out()
+        }
+        __atomic_add(waddr(blk, C_SEND_WAITERS) as *mut u64, MINUS1)
+        if r2 == 0 {
+            return true
+        }
+        if r2 == 2 {
+            return false
+        }
+    }
+    return false
+}
+
+fn recv_blk(blk: u64, dst: u64) -> u64 {
+    var spin: u64 = 0
+    while true {
+        if try_recv_blk(blk, dst) == 0 {
+            return RECV_OK
+        }
+        if closed_now(blk) {
+            if try_recv_blk(blk, dst) == 0 {
+                return RECV_OK
+            }
+            return RECV_CLOSED
+        }
+        if spin < SPIN {
+            spin = spin + 1
+            continue
+        }
+        __atomic_add(waddr(blk, C_RECV_WAITERS) as *mut u64, 1)
+        let sv: u64 = rt.ld64(blk, C_DATA)
+        var got: bool = false
+        var done: bool = false
+        if try_recv_blk(blk, dst) == 0 {
+            got = true
+        } else if closed_now(blk) {
+            done = true
+        } else {
+            thread_blocking_an()
+            __thread_futex_wait(waddr(blk, C_DATA), sv)
+            thread_blocking_out()
+        }
+        __atomic_add(waddr(blk, C_RECV_WAITERS) as *mut u64, MINUS1)
+        if got {
+            return RECV_OK
+        }
+        if done {
+            if try_recv_blk(blk, dst) == 0 {
+                return RECV_OK
+            }
+            return RECV_CLOSED
+        }
+    }
+    return RECV_CLOSED
+}
+
+fn chan_send(c: *mut Chan, rec: *mut u64) -> bool {
+    let blk: u64 = (*c).blk
+    if blk == 0 {
+        return false
+    }
+    return send_blk(blk, rec as u64)
+}
+
+fn chan_recv(c: *mut Chan, out: *mut u64) -> bool {
+    let blk: u64 = (*c).blk
+    if blk == 0 {
+        return false
+    }
+    return recv_blk(blk, out as u64) == RECV_OK
+}
+
+fn chan_recv_timeout(c: *mut Chan, out: *mut u64, ms: u64) -> u64 {
+    let blk: u64 = (*c).blk
+    if blk == 0 {
+        return RECV_CLOSED
+    }
+    let dst: u64 = out as u64
+    let deadline: u64 = time.monotonic_ns() + ms * 1000000
+    var spin: u64 = 0
+    while true {
+        if try_recv_blk(blk, dst) == 0 {
+            return RECV_OK
+        }
+        if closed_now(blk) {
+            if try_recv_blk(blk, dst) == 0 {
+                return RECV_OK
+            }
+            return RECV_CLOSED
+        }
+        if spin < SPIN {
+            spin = spin + 1
+            continue
+        }
+        if time.monotonic_ns() >= deadline {
+            return RECV_TIMEOUT
+        }
+        thread_sleep(1)
+    }
+    return RECV_TIMEOUT
+}
+
+fn chan_close(c: *mut Chan) {
+    let blk: u64 = (*c).blk
+    if blk == 0 {
+        return
+    }
+    __atomic_swap(waddr(blk, C_CLOSED) as *mut u64, 0, 1)
+    __atomic_add(waddr(blk, C_DATA) as *mut u64, 1)
+    __atomic_add(waddr(blk, C_SPACE) as *mut u64, 1)
+    __thread_futex_wake(waddr(blk, C_DATA), 1024)
+    __thread_futex_wake(waddr(blk, C_SPACE), 1024)
+}
+
+fn chan_send1(c: *mut Chan, v: u64) -> bool {
+    var t: u64 = v
+    return chan_send(c, (&t) as *mut u64)
+}
+
+fn chan_recv1(c: *mut Chan, out: *mut u64) -> bool {
+    return chan_recv(c, out)
+}

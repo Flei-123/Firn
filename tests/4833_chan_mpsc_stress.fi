@@ -1,0 +1,122 @@
+// expect_exit: 0
+// tests/4833_chan_mpsc_stress.fi -- lib/chan: four producer threads, one consumer (the main thread).
+//
+// A  4 x 500,000 records of 2 words (producer id, counter) through a ring of 512: per producer the counters
+//    arrive in order and without gaps, the sum is exact
+// B  the same through a ring of 4 (producers block on a full ring most of the time)
+// C  4 producers, the consumer sleeps first (ring full, all producers blocked), then drains
+// D  multi consumer as a bonus: 2 producers, 2 consumer threads, every message exactly once (atomic sum and count)
+import std.rt
+import std.time
+import chan.chan
+
+static mut g_blk: u64 = 0
+static mut g_n: u64 = 0
+static mut g_acc: u64 = 0
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    var c: chan.Chan = chan.Chan { blk: g_blk }
+    if kind == 1 {
+        var rec: [u64; 2] = [0; 2]
+        var i: u64 = 0
+        while i < g_n {
+            rec[0] = arg
+            rec[1] = i
+            if !chan.chan_send(&c, &rec[0]) { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    if kind == 2 {
+        var v: u64 = 0
+        while chan.chan_recv(&c, &v) {
+            __atomic_add(g_acc as *mut u64, v)
+            __atomic_add((g_acc + 8) as *mut u64, 1)
+        }
+        return 0
+    }
+    if kind == 3 {
+        var i: u64 = 0
+        while i < g_n {
+            if !chan.chan_send1(&c, arg * 1000000 + i + 1) { return 1 }
+            i = i + 1
+        }
+        return 0
+    }
+    return 9
+}
+
+fn run_mpsc(cap: u64, per: u64, producers: u64, delay_ms: u64) -> u64 {
+    var c: chan.Chan = chan.chan_new(cap, 2)
+    g_blk = c.blk
+    g_n = per
+    var hs: [u64; 4] = [0; 4]
+    var p: u64 = 0
+    while p < producers {
+        hs[p as usize] = thread_start(1, p)
+        p = p + 1
+    }
+    if delay_ms > 0 {
+        time.sleep_ms(delay_ms)
+        if chan.chan_len(&c) != chan.chan_cap(&c) { return 9 }
+    }
+    var next: [u64; 4] = [0; 4]
+    var rec: [u64; 2] = [0; 2]
+    var total: u64 = per * producers
+    var got: u64 = 0
+    var sum: u64 = 0
+    while got < total {
+        if !chan.chan_recv(&c, &rec[0]) { return 1 }
+        if rec[0] >= producers { return 2 }
+        if rec[1] != next[rec[0] as usize] { return 3 }
+        next[rec[0] as usize] = next[rec[0] as usize] + 1
+        sum = sum + rec[1]
+        got = got + 1
+    }
+    p = 0
+    while p < producers {
+        if thread_wait(hs[p as usize]) != 0 { return 4 }
+        if next[p as usize] != per { return 5 }
+        p = p + 1
+    }
+    if sum != producers * (per * (per - 1) / 2) { return 6 }
+    if chan.chan_try_recv(&c, &rec[0]) { return 7 }
+    chan.chan_free(&c)
+    return 0
+}
+
+fn run_mpmc() -> u64 {
+    var c: chan.Chan = chan.chan_new(32, 1)
+    g_blk = c.blk
+    g_n = 200000
+    g_acc = rt.heap_alloc(16)
+    rt.mem_set(g_acc, 0 as u8, 16)
+    let c1: u64 = thread_start(2, 0)
+    let c2: u64 = thread_start(2, 0)
+    let p1: u64 = thread_start(3, 1)
+    let p2: u64 = thread_start(3, 2)
+    if thread_wait(p1) != 0 { return 1 }
+    if thread_wait(p2) != 0 { return 2 }
+    chan.chan_close(&c)
+    if thread_wait(c1) != 0 { return 3 }
+    if thread_wait(c2) != 0 { return 4 }
+    if rt.ld64(g_acc, 1) != 400000 { return 5 }
+    let n: u64 = 200000
+    let expect: u64 = (1 * 1000000 + 2 * 1000000) * n + 2 * (n * (n + 1) / 2)
+    if rt.ld64(g_acc, 0) != expect { return 6 }
+    rt.heap_free(g_acc, 16)
+    chan.chan_free(&c)
+    return 0
+}
+
+fn main() -> i32 {
+    let a: u64 = run_mpsc(512, 500000, 4, 0)
+    if a != 0 { return (10 + a) as i32 }
+    let b: u64 = run_mpsc(4, 100000, 4, 0)
+    if b != 0 { return (20 + b) as i32 }
+    let c: u64 = run_mpsc(8, 20000, 4, 100)
+    if c != 0 { return (30 + c) as i32 }
+    let d: u64 = run_mpmc()
+    if d != 0 { return (40 + d) as i32 }
+    return 0
+}

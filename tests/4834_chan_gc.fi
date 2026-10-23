@@ -1,0 +1,141 @@
+// expect_exit: 0
+// tests/4834_chan_gc.fi -- lib/chan and the garbage collector (docs/CHAN.md C-G1).
+//
+// The words in a channel are NOT scanned: a Gc pointer in a record would not keep its object alive. So the sender
+// keeps the objects in a handle table of its own (a stack array the collector scans) and sends only the index and a
+// serial number. A second thread receives, allocates garbage and forces collections, and acknowledges through a second
+// channel. The sender checks that every acknowledged object is still there, unchanged, after collections run on both
+// threads while both channels carry traffic.
+import std.rt
+import chan.chan
+
+gc class Cell {
+    next: Gc[Cell],
+    value: u64,
+}
+
+static mut g_req: u64 = 0
+static mut g_ack: u64 = 0
+static mut g_forced: u64 = 0
+
+fn mk(i: u64, next: Gc[Cell]) -> AllocError!Gc[Cell] {
+    let c: Gc[Cell] = try gc Cell { next: next, value: i }
+    return c
+}
+
+fn churn(rounds: u64) -> u64 {
+    var head: Gc[Cell] = gc_null[Cell]()
+    var i: u64 = 0
+    while i < rounds {
+        var nx: Gc[Cell] = gc_null[Cell]()
+        if i % 10 == 0 {
+            nx = head
+        }
+        let c: Gc[Cell] = mk(i, nx) catch gc_null[Cell]()
+        if c == gc_null[Cell]() {
+            return 0
+        }
+        if i % 10 == 0 {
+            head = c
+        }
+        i = i + 1
+    }
+    var n: u64 = 0
+    var p: Gc[Cell] = head
+    while p != gc_null[Cell]() {
+        n = n + 1
+        p = p.next
+    }
+    return n
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    var req: chan.Chan = chan.Chan { blk: g_req }
+    var ack: chan.Chan = chan.Chan { blk: g_ack }
+    var rec: [u64; 3] = [0; 3]
+    var seen: u64 = 0
+    var keep: u64 = 0
+    while chan.chan_recv(&req, &rec[0]) {
+        if rec[2] != rec[0] * 31 + rec[1] * 7 + 5 {
+            return 1
+        }
+        keep = keep + churn(300)
+        seen = seen + 1
+        if seen % 40 == 0 {
+            gc_collect()
+            __atomic_add((g_forced) as *mut u64, 1)
+        }
+        if !chan.chan_send(&ack, &rec[0]) {
+            return 2
+        }
+    }
+    chan.chan_close(&ack)
+    if keep == 0 {
+        return 3
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    var req: chan.Chan = chan.chan_new(16, 3)
+    var ack: chan.Chan = chan.chan_new(16, 3)
+    g_req = req.blk
+    g_ack = ack.blk
+    g_forced = rt.heap_alloc(8)
+    rt.st64(g_forced, 0, 0)
+
+    var tbl: [Gc[Cell]; 32] = [gc_null[Cell](); 32]
+    var rec: [u64; 3] = [0; 3]
+    var got: [u64; 3] = [0; 3]
+    let h: u64 = thread_start(1, 0)
+    let total: u64 = 4000
+    var sent: u64 = 0
+    var acked: u64 = 0
+    var own_forced: u64 = 0
+    while sent < total {
+        while sent - acked >= 32 || (sent == total) {
+            if !chan.chan_recv(&ack, &got[0]) { return 1 }
+            let idx: u64 = got[0]
+            let c: Gc[Cell] = tbl[idx as usize]
+            if c == gc_null[Cell]() { return 2 }
+            if c.value != got[1] * 7 + 3 { return 3 }
+            acked = acked + 1
+            if acked % 25 == 0 {
+                gc_collect()
+                own_forced = own_forced + 1
+            }
+        }
+        let idx: u64 = sent % 32
+        let cell: Gc[Cell] = mk(sent * 7 + 3, gc_null[Cell]()) catch gc_null[Cell]()
+        if cell == gc_null[Cell]() { return 4 }
+        tbl[idx as usize] = cell
+        rec[0] = idx
+        rec[1] = sent
+        rec[2] = idx * 31 + sent * 7 + 5
+        if !chan.chan_send(&req, &rec[0]) { return 5 }
+        sent = sent + 1
+    }
+    while acked < total {
+        if !chan.chan_recv(&ack, &got[0]) { return 6 }
+        let c: Gc[Cell] = tbl[got[0] as usize]
+        if c == gc_null[Cell]() { return 7 }
+        if got[1] % 32 != got[0] { return 8 }
+        acked = acked + 1
+    }
+    chan.chan_close(&req)
+    if chan.chan_recv(&ack, &got[0]) { return 9 }
+    if thread_wait(h) != 0 { return 10 }
+    if own_forced < 100 { return 11 }
+    if rt.ld64(g_forced, 0) < 90 { return 12 }
+    var t: u64 = 0
+    while t < 32 {
+        let c: Gc[Cell] = tbl[t as usize]
+        if c == gc_null[Cell]() { return 13 }
+        if c.value % 7 != 3 { return 14 }
+        t = t + 1
+    }
+    rt.heap_free(g_forced, 8)
+    chan.chan_free(&req)
+    chan.chan_free(&ack)
+    return 0
+}
