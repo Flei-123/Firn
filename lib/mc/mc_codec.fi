@@ -39,7 +39,7 @@ import std.crypto.aes
 export {
     WireError, Wire,
     wire_open, wire_close, wire_set_threshold, wire_read_packet,
-    wire_send_packet, wire_timeout, wire_stat_in, wire_stat_inflated,
+    wire_send_packet, wire_timeout, wire_poll_gate, wire_stat_in, wire_stat_inflated,
     wire_stat_packets, wire_stat_compressed, wire_enable_encryption,
     wire_encrypted, wire_view_rest,
     MAX_PACKET, MAX_INFLATED,
@@ -84,6 +84,7 @@ struct Wire {
     aes: aes.Aes,
     iv_rx: [u8; 16], // the CFB8 shift registers, one per direction, for the life of the connection
     iv_tx: [u8; 16],
+    gate: bool, // r277: fill() asks poll(0) before every read (never blocks, never waits for a timer tick)
 }
 
 fn wire_open(c: net.Conn) -> Wire {
@@ -92,7 +93,7 @@ fn wire_open(c: net.Conn) -> Wire {
         threshold: 0 - 1, zin: rt.buf_new(), zout: rt.buf_new(),
         frame: bytes.bytes_new(), n_in: 0, n_inflated: 0, n_packets: 0,
         n_compressed: 0, crypt: false, aes: aes.aes128_new((&zero16[0]) as u64),
-        iv_rx: [0; 16], iv_tx: [0; 16] }
+        iv_rx: [0; 16], iv_tx: [0; 16], gate: false }
 }
 
 fn wire_close(w: *mut Wire) {
@@ -138,6 +139,12 @@ fn wire_set_threshold(w: *mut Wire, t: i32) {
 
 fn wire_timeout(w: *mut Wire, ms: u64) -> bool {
     return net.set_timeout(&(*w).conn, ms) catch false
+}
+
+// r277: true = the frame loop never waits on the socket: every read is gated by poll(0).
+// SO_RCVTIMEO(2 ms) cost a whole 15.6 ms timer tick per idle frame on Windows.
+fn wire_poll_gate(w: *mut Wire, on: bool) {
+    (*w).gate = on
 }
 
 fn wire_stat_in(w: *mut Wire) -> u64 { return (*w).n_in }
@@ -199,6 +206,9 @@ fn fill(w: *mut Wire, n: usize) -> WireError!bool {
             }
         }
         let room: usize = (*w).rcap - (*w).rend
+        if (*w).gate && !net.readable_now(&(*w).conn) {
+            return WireError::Timeout
+        }
         let got: usize = net.read(&(*w).conn, (*w).rbuf + (*w).rend as u64, room) catch 99999999999
         if got == 99999999999 {
             let ce: i32 = net.conn_error(&(*w).conn)
