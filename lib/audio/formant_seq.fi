@@ -1,0 +1,393 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/formant_seq.fi -- audio.formant_seq: sequencer for sung syllables (formant synthesis).
+//
+//     import audio.formant_seq
+//     import audio.formant_table
+//     var s: formant_seq.Seq = formant_seq.seq_new(44100)
+//     // "Dai": d + a-i (ah -> ee), A4, 600 ms, legato to the next one
+//     formant_seq.seq_note(&s, 600.0, 440.0, formant_table.VOWEL_AH, formant_table.VOWEL_EE,
+//                          formant_table.CONS_D, formant_table.CONS_NONE, 0.9, true)
+//     formant_seq.seq_rest(&s, 200.0)
+//     var n: usize = 0
+//     let sig: u64 = formant_seq.seq_render(&s, &n)         // n = round(sum of durations * rate / 1000)
+//     synth_osc.sig_free(sig, n)
+//     formant_seq.seq_free(&s)
+//
+// EVENT = duration (ms), pitch (Hz; `seq_note_midi` takes a MIDI note), vowel (+ optional second vowel for a
+// diphthong), consonant BEFORE and AFTER the vowel, level 0 .. 1, legato flag. A rest is a pitch of 0.
+//
+// TIMING. The events lie back to back; event j covers samples [b_j, b_{j+1}) with b_j = round(sum of the
+// durations before j * rate / 1000), so the total length is the rounded sum of all durations (a consonant does
+// not make the line longer: it takes its time from the START (before) or the END (after) of its own event, at most
+// 40 % / 35 % of it). Plosives: closure, 12 ms burst, aspiration (p t k, 45 % of the rest); fricatives: noise over
+// the whole consonant time; nasals m n: murmur with its own formants.
+//
+// VOICE. One continuous glottis (saw / pulse), phase kept over the whole line; pitch glides (8 ms; 35 ms between
+// legato notes), vowels glide by smoothstep (45 ms), vibrato (`vib_*` in the Seq record, fades in at every note
+// start), amplitude slew 8 ms up / 15 ms down; non-legato notes end with an 18 ms gap.
+//
+// HONEST
+// Q1  No co-articulation: the vowel is its table value, the consonant its own sound; transitions are only the
+//     smoothstep glide. The syllable timing is "consonant first, then vowel", not phonetic timing before the beat.
+// Q2  The whole line is rendered in one pass in memory (about 13 f64 arrays of line length): 30 s at 44.1 kHz need
+//     about 140 MB. Split long songs into parts.
+// Q3  `peak` (default 0.8) normalises the whole line afterwards; with 0 the raw level stays (can exceed 1).
+import std.rt
+import std.vec
+import audio.synth_osc
+import audio.synth_fx
+import audio.formant
+import audio.formant_table
+import audio.formant_cons
+import audio.pcm
+
+export {
+    Ev, Seq, seq_new, seq_free, seq_note, seq_note_midi, seq_rest, seq_count, seq_total_ms, seq_length,
+    seq_render, seq_to_s16, seq_wav,
+}
+
+struct Ev {
+    dur_ms: f64,
+    hz: f64,
+    vowel: i32,
+    vowel2: i32,
+    cb: i32,
+    ca: i32,
+    level: f64,
+    legato: bool,
+}
+
+struct Seq {
+    rate: u32,
+    evs: vec.Vec[Ev],
+    shift: f64,
+    vib_rate: f64,
+    vib_cents: f64,
+    vib_fade_ms: f64,
+    source: i32,
+    seed: u64,
+    peak: f64,
+}
+
+fn seq_new(rate: u32) -> Seq {
+    return Seq {
+        rate: rate,
+        evs: vec.vec_new[Ev](),
+        shift: 1.0,
+        vib_rate: 5.5,
+        vib_cents: 35.0,
+        vib_fade_ms: 250.0,
+        source: formant.SRC_SAW,
+        seed: 1,
+        peak: 0.8,
+    }
+}
+
+fn seq_free(s: *mut Seq) {
+    vec.vec_free[Ev](&(*s).evs)
+}
+
+fn seq_count(s: *mut Seq) -> usize {
+    return vec.vec_len[Ev](&(*s).evs)
+}
+
+// A sung note. vowel2 < 0: plain vowel. cb / ca: CONS_* before / after (CONS_NONE = none).
+fn seq_note(s: *mut Seq, dur_ms: f64, hz: f64, vowel: i32, vowel2: i32, cb: i32, ca: i32, level: f64, legato: bool) {
+    let e: Ev = Ev { dur_ms: dur_ms, hz: hz, vowel: vowel, vowel2: vowel2, cb: cb, ca: ca, level: level, legato: legato }
+    vec.vec_push[Ev](&(*s).evs, e)
+}
+
+fn seq_note_midi(s: *mut Seq, dur_ms: f64, midi: f64, vowel: i32, vowel2: i32, cb: i32, ca: i32, level: f64, legato: bool) {
+    seq_note(s, dur_ms, formant.midi_to_hz(midi), vowel, vowel2, cb, ca, level, legato)
+}
+
+fn seq_rest(s: *mut Seq, dur_ms: f64) {
+    seq_note(s, dur_ms, 0.0, 0, -1, 0, 0, 0.0, false)
+}
+
+fn seq_total_ms(s: *mut Seq) -> f64 {
+    var t: f64 = 0.0
+    var j: usize = 0
+    while j < seq_count(s) {
+        t = t + (*vec.vec_elem_ptr[Ev](&(*s).evs, j)).dur_ms
+        j = j + 1
+    }
+    return t
+}
+
+fn bound(ms: f64, rate: u32) -> usize {
+    return (ms * (rate as f64) / 1000.0 + 0.5) as usize
+}
+
+// Number of samples seq_render returns.
+fn seq_length(s: *mut Seq) -> usize {
+    return bound(seq_total_ms(s), (*s).rate)
+}
+
+fn ms_to_n(ms: f64, rate: f64) -> usize {
+    return (ms * rate / 1000.0 + 0.5) as usize
+}
+
+fn clamp01(u: f64) -> f64 {
+    if u < 0.0 { return 0.0 }
+    if u > 1.0 { return 1.0 }
+    return u
+}
+
+// Formant state of the voice: 6 values (F1 F2 F3 BW1 BW2 BW3).
+fn set6_vowel(p: *mut [f64; 6], v: i32, shift: f64) {
+    var k: i32 = 0
+    while k < 3 {
+        (*p)[k as usize] = formant_table.vowel_f(v, k) * shift
+        (*p)[(3 + k) as usize] = formant_table.vowel_bw(v, k)
+        k = k + 1
+    }
+}
+
+fn set6_nasal(p: *mut [f64; 6], c: i32) {
+    var k: i32 = 0
+    while k < 3 {
+        (*p)[k as usize] = formant_cons.nasal_f(c, k)
+        (*p)[(3 + k) as usize] = formant_cons.nasal_bw(k)
+        k = k + 1
+    }
+}
+
+// Renders the line. Returns the address of n f64 samples (free with synth_osc.sig_free(p, n)); *n_out = n.
+fn seq_render(s: *mut Seq, n_out: *mut usize) -> u64 {
+    let m: usize = seq_count(s)
+    let rate_u: u32 = (*s).rate
+    let rate: f64 = rate_u as f64
+    let n: usize = seq_length(s)
+    *n_out = n
+    let out: u64 = synth_osc.sig_new(n)
+    if n == 0 || m == 0 { return out }
+    let f0: u64 = synth_osc.sig_new(n)
+    let amp: u64 = synth_osc.sig_new(n)
+    let vdep: u64 = synth_osc.sig_new(n)
+    let cons: u64 = synth_osc.sig_new(n)
+    let tr: u64 = formant.track_new(n)
+    let shift: f64 = (*s).shift
+
+    var f_state: f64 = 220.0
+    var a_state: f64 = 0.0
+    var last: [f64; 6] = [0.0; 6]
+    var t1: [f64; 6] = [0.0; 6]
+    var t2: [f64; 6] = [0.0; 6]
+    var nas: [f64; 6] = [0.0; 6]
+    var cur: [f64; 6] = [0.0; 6]
+    set6_vowel(&last, formant_table.VOWEL_AH, shift)
+    let up: f64 = 1.0 / (0.008 * rate)
+    let dn: f64 = 1.0 / (0.015 * rate)
+    let glide_n: usize = ms_to_n(45.0, rate)
+    var cum: f64 = 0.0
+    var j: usize = 0
+    while j < m {
+        let e: Ev = *vec.vec_elem_ptr[Ev](&(*s).evs, j)
+        let b0: usize = bound(cum, rate_u)
+        cum = cum + e.dur_ms
+        let b1: usize = bound(cum, rate_u)
+        let len: usize = b1 - b0
+        let is_rest: bool = e.hz <= 0.0
+        var hz: f64 = e.hz
+        if is_rest { hz = f_state }
+        var c1: usize = 0
+        var c2: usize = 0
+        if !is_rest {
+            c1 = ms_to_n(formant_table.cons_ms(e.cb), rate)
+            c2 = ms_to_n(formant_table.cons_ms(e.ca), rate)
+            let cap1: usize = (len as f64 * 0.40) as usize
+            let cap2: usize = (len as f64 * 0.35) as usize
+            if c1 > cap1 { c1 = cap1 }
+            if c2 > cap2 { c2 = cap2 }
+        }
+        let v0: usize = b0 + c1
+        let v1: usize = b1 - c2
+        let vlen: usize = v1 - v0
+        // glide speed of the pitch: slower between legato notes
+        var gl: f64 = 8.0
+        if e.legato { gl = 35.0 }
+        let fk: f64 = 1.0 / (gl * rate / 1000.0 + 1.0)
+        set6_vowel(&t1, e.vowel, shift)
+        if e.vowel2 >= 0 {
+            set6_vowel(&t2, e.vowel2, shift)
+        } else {
+            set6_vowel(&t2, e.vowel, shift)
+        }
+        if formant_table.cons_is_nasal(e.cb) {
+            set6_nasal(&nas, e.cb)
+            last = nas
+        }
+        if formant_table.cons_is_nasal(e.ca) {
+            set6_nasal(&nas, e.ca)
+        }
+        var tr0: usize = v0
+        if e.legato && e.cb == formant_table.CONS_NONE { tr0 = b0 }
+        let d0: usize = v0 + (vlen as f64 * 0.35) as usize
+        let d1: usize = v0 + (vlen as f64 * 0.85) as usize
+        let g2: usize = ms_to_n(30.0, rate)
+        let gap: usize = ms_to_n(18.0, rate)
+        var gap_n: usize = gap
+        if gap_n > len / 8 { gap_n = len / 8 }
+        let vib_len: usize = ms_to_n((*s).vib_fade_ms, rate)
+        var i: usize = b0
+        while i < b1 {
+            // pitch
+            f_state = f_state + (hz - f_state) * fk
+            synth_osc.pf(f0, i, f_state)
+            // formants: last -> t1 (-> t2 for diphthongs), then towards the nasal set at the end
+            var u1: f64 = 1.0
+            if i < tr0 {
+                u1 = 0.0
+            } else if glide_n > 0 {
+                u1 = formant.smoothstep(((i - tr0) as f64) / (glide_n as f64))
+            }
+            var u2: f64 = 0.0
+            if e.vowel2 >= 0 && d1 > d0 && i >= d0 {
+                u2 = formant.smoothstep(((i - d0) as f64) / ((d1 - d0) as f64))
+            }
+            var wn: f64 = 0.0
+            if formant_table.cons_is_nasal(e.ca) && i + g2 >= v1 && g2 > 0 {
+                wn = formant.smoothstep(((i + g2 - v1) as f64) / (g2 as f64))
+            }
+            var k: usize = 0
+            while k < 6 {
+                let tgt: f64 = t1[k] + (t2[k] - t1[k]) * u2
+                var f: f64 = last[k] + (tgt - last[k]) * u1
+                f = f + (nas[k] - f) * wn
+                cur[k] = f
+                synth_osc.pf(tr + ((n * k + i) * 8) as u64, 0, f)
+                k = k + 1
+            }
+            // amplitude target
+            var tgt_a: f64 = 0.0
+            if !is_rest {
+                tgt_a = e.level
+                if i < v0 {
+                    tgt_a = voiced_level(e.cb, e.level, i - b0, c1)
+                } else if i >= v1 {
+                    tgt_a = voiced_level(e.ca, e.level, i - v1, c2)
+                }
+                if !e.legato && i + gap_n >= b1 { tgt_a = 0.0 }
+            }
+            var da: f64 = tgt_a - a_state
+            if da > up { da = up }
+            if da < 0.0 - dn { da = 0.0 - dn }
+            a_state = a_state + da
+            synth_osc.pf(amp, i, a_state)
+            // vibrato depth: fades in from the start of every sung note
+            var vd: f64 = 1.0
+            if vib_len > 0 && i - b0 < vib_len { vd = ((i - b0) as f64) / (vib_len as f64) }
+            synth_osc.pf(vdep, i, vd)
+            i = i + 1
+        }
+        last = cur
+        // consonant noise
+        if !is_rest {
+            render_cons(cons, n, rate, e.cb, b0, c1, true, formant_table.cons_ms(e.cb), synth_osc.mix_seed((*s).seed, (j * 4) as u64))
+            render_cons(cons, n, rate, e.ca, v1, c2, false, formant_table.cons_ms(e.ca), synth_osc.mix_seed((*s).seed, (j * 4 + 1) as u64))
+        }
+        j = j + 1
+    }
+    // voice: f0 curve with vibrato -> glottis -> formant bank -> amplitude
+    formant.vibrato_apply(f0, n, rate, (*s).vib_rate, (*s).vib_cents, 0.0, vdep)
+    let src: u64 = synth_osc.sig_new(n)
+    formant.glottis_fill(src, n, rate, (*s).source, f0)
+    synth_osc.sig_free(f0, n)
+    synth_osc.sig_free(vdep, n)
+    let voice: u64 = synth_osc.sig_new(n)
+    formant.formant_bank(src, voice, n, rate, tr)
+    synth_osc.sig_free(src, n)
+    formant.track_free(tr, n)
+    var i2: usize = 0
+    while i2 < n {
+        let v: f64 = synth_osc.gf(voice, i2) * synth_osc.gf(amp, i2) * formant.BANK_GAIN + synth_osc.gf(cons, i2) * CONS_MIX
+        synth_osc.pf(out, i2, v)
+        i2 = i2 + 1
+    }
+    synth_osc.sig_free(voice, n)
+    synth_osc.sig_free(amp, n)
+    synth_osc.sig_free(cons, n)
+    if (*s).peak > 0.0 {
+        synth_fx.fx_normalize(out, n, (*s).peak)
+    }
+    return out
+}
+
+const CONS_MIX: f64 = 0.5
+
+// Voice amplitude during a consonant segment: voiceless -> 0, voiced fricatives / plosives are murmured quietly.
+fn voiced_level(c: i32, level: f64, pos: usize, len: usize) -> f64 {
+    if c == formant_table.CONS_NONE { return level }
+    if formant_table.cons_is_nasal(c) { return level * 0.6 }
+    if c == formant_table.CONS_Z || c == formant_table.CONS_V { return level * 0.4 }
+    if c == formant_table.CONS_B || c == formant_table.CONS_D || c == formant_table.CONS_G {
+        // voice bar in the closure, then silent for the burst
+        if pos * 10 < len * 7 { return level * 0.25 }
+        return 0.0
+    }
+    return 0.0
+}
+
+// Adds the noise of consonant c to `cons` in [start, start + len): `before` = at the start of the event (burst,
+// then aspiration), else at the end (closure, then burst).
+fn render_cons(cons: u64, n: usize, rate: f64, c: i32, start: usize, len: usize, before: bool, ms: f64, seed: u64) {
+    if len == 0 || c == formant_table.CONS_NONE { return }
+    if formant_table.cons_is_fricative(c) {
+        let tmp: u64 = synth_osc.sig_new(len)
+        formant_cons.fric_fill(tmp, len, rate, c, seed)
+        add_into(cons, n, start, tmp, len)
+        synth_osc.sig_free(tmp, len)
+        return
+    }
+    if formant_table.cons_is_plosive(c) {
+        let bl: usize = formant_cons.burst_len(rate as u32)
+        var b: usize = bl
+        if b > len { b = len }
+        let tmp: u64 = synth_osc.sig_new(b)
+        let w: usize = formant_cons.burst_fill(tmp, b, rate, c, seed)
+        if before {
+            var asp: usize = 0
+            if !formant_table.cons_voiced(c) { asp = ((len - b) as f64 * 0.45) as usize }
+            let closure: usize = len - b - asp
+            add_into(cons, n, start + closure, tmp, w)
+            if asp > 0 {
+                let a: u64 = synth_osc.sig_new(asp)
+                formant_cons.fric_fill(a, asp, rate, formant_table.CONS_SH, seed + 7)
+                var q: usize = 0
+                while q < asp {
+                    synth_osc.pf(a, q, synth_osc.gf(a, q) * 0.3)
+                    q = q + 1
+                }
+                add_into(cons, n, start + closure + b, a, asp)
+                synth_osc.sig_free(a, asp)
+            }
+        } else {
+            add_into(cons, n, start + len - b, tmp, w)
+        }
+        synth_osc.sig_free(tmp, b)
+    }
+}
+
+fn add_into(dst: u64, n: usize, at: usize, src: u64, len: usize) {
+    var i: usize = 0
+    while i < len && at + i < n {
+        synth_osc.pf(dst, at + i, synth_osc.gf(dst, at + i) + synth_osc.gf(src, i))
+        i = i + 1
+    }
+}
+
+// Signal -> S16LE bytes (n * 2 octets at dst); returns the number of clipped samples (synth_fx.fx_to_s16).
+fn seq_to_s16(sig: u64, n: usize, dst: u64) -> usize {
+    return synth_fx.fx_to_s16(sig, n, dst)
+}
+
+// A complete mono S16 WAVE file (44 octet header + n samples) appended to `out`; returns the number of clipped samples.
+fn seq_wav(sig: u64, n: usize, rate: u32, out: *mut rt.Buf) -> usize {
+    pcm.wav_header(out, rate, 1 as u32, (n * 2) as u32)
+    let b: u64 = rt.heap_alloc(n * 2 + 2)
+    let hits: usize = synth_fx.fx_to_s16(sig, n, b)
+    rt.buf_push_bytes(out, b, n * 2)
+    rt.heap_free(b, n * 2 + 2)
+    return hits
+}

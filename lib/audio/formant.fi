@@ -1,0 +1,243 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/formant.fi -- audio.formant: formant synthesis core (glottis source + parallel formant filters).
+//
+//     import audio.formant
+//     import audio.formant_table
+//     import audio.synth_osc
+//     let n: usize = 44100
+//     let out: u64 = synth_osc.sig_new(n)
+//     // one second of "ah" at 220 Hz with vibrato (5.5 Hz, +-35 cents, fades in over 200 ms)
+//     formant.sing_vowel(out, n, 44100.0, 220.0, 5.5, 35.0, 200.0, formant_table.VOWEL_AH, 1.0, 0.5)
+//     synth_osc.sig_free(out, n)
+//
+// SIGNAL FLOW
+//     F0 curve (Hz per sample, vibrato)  ->  glottis source (saw / impulse train)
+//        -> 3 band-pass filters in PARALLEL (F1 F2 F3, centre + bandwidth per sample), summed with the formant levels
+//        -> output (f64, about -1 .. 1; amplitude is the job of the caller / the sequencer)
+//
+// The band-pass filters are `synth_fx.fx_biquad` (RBJ cookbook, 0 dB at the centre, Q = F / bandwidth): the same
+// code as everywhere else in audio.synth_*. Formant frequencies and bandwidths are arrays per sample (a "track",
+// see `track_new`), so a vowel can move smoothly (`track_set_morph`: smoothstep interpolation of F and BW).
+//
+// DETERMINISM: only + - * / and comparisons on f64 (no libm, no FMA), integer xorshift for noise: the samples
+// are the same on every platform; tools/formant/gen_ref.py reproduces them bit for bit.
+//
+// HONEST
+// M1  Parallel formant bank with 3 formants, no nasal anti-resonance and no F4/F5: the voice sounds like a
+//     buzzing "robot choir", not like a recording. That is intended (formant synthesis, not speech synthesis).
+// M2  The impulse-train source puts the pulse on whole samples (jitter below one sample, audible as a faint
+//     noise floor at high F0); the saw is band-limited by PolyBLEP (synth_osc, note O1).
+// M3  `shift` scales all formants equally (about 1.17 woman, 1.3 child); it does not change the vowel shapes.
+// M4  The RBJ band-pass has coefficients recomputed every 8 samples (synth_fx): fast formant moves are
+//     stepwise on that grid; the smooth morph needs no more than that.
+import std.rt
+import audio.synth_osc
+import audio.synth_fx
+import audio.formant_table
+
+export {
+    SRC_SAW, SRC_PULSE, BANK_GAIN,
+    midi_to_hz, smoothstep, f0_const, vibrato_apply, glottis_fill,
+    track_new, track_free, track_f, track_bw, track_set_const, track_set_morph,
+    formant_bank, sing_vowel, sing_morph,
+}
+
+const SRC_SAW: i32 = 0
+const SRC_PULSE: i32 = 1
+
+// Gain applied by sing_vowel / sing_morph before `level` (keeps level 1.0 below full scale, test 4963).
+const BANK_GAIN: f64 = 1.5
+
+// MIDI note (69 = A4 = 440 Hz, may be fractional) -> Hz
+fn midi_to_hz(m: f64) -> f64 {
+    return 440.0 * synth_osc.pow2((m - 69.0) / 12.0)
+}
+
+// 0 at u <= 0, 1 at u >= 1, smooth in between (zero slope at both ends)
+fn smoothstep(u: f64) -> f64 {
+    if u <= 0.0 { return 0.0 }
+    if u >= 1.0 { return 1.0 }
+    return u * u * (3.0 - 2.0 * u)
+}
+
+// n samples of the constant frequency f0 (Hz)
+fn f0_const(out: u64, n: usize, f0: f64) {
+    var i: usize = 0
+    while i < n {
+        synth_osc.pf(out, i, f0)
+        i = i + 1
+    }
+}
+
+// Multiplies the Hz curve in place by 2^(cents/1200 * depth(t) * sin(2 pi vib_rate t)). depth(t) rises linearly
+// from 0 to 1 over `fade_ms` (0 = full depth at once). `depth_arr` != 0: per-sample extra factor 0 .. 1.
+fn vibrato_apply(f0: u64, n: usize, rate: f64, vib_rate: f64, cents: f64, fade_ms: f64, depth_arr: u64) {
+    if cents == 0.0 || vib_rate <= 0.0 { return }
+    var vph: f64 = 0.0
+    let dph: f64 = vib_rate / rate
+    var i: usize = 0
+    while i < n {
+        var d: f64 = 1.0
+        if fade_ms > 0.0 {
+            d = ((i as f64) * 1000.0 / rate) / fade_ms
+            if d > 1.0 { d = 1.0 }
+        }
+        if depth_arr != 0 { d = d * synth_osc.gf(depth_arr, i) }
+        let e: f64 = cents * (1.0 / 1200.0) * d * synth_osc.sin_turn(vph)
+        synth_osc.pf(f0, i, synth_osc.gf(f0, i) * synth_osc.pow2(e))
+        vph = vph + dph
+        vph = vph - synth_osc.ffloor(vph)
+        i = i + 1
+    }
+}
+
+// Glottis source for the Hz curve `f0`: SRC_SAW = band-limited sawtooth (amplitude 1), SRC_PULSE = one impulse per
+// period (height scaled so that the harmonics are as strong as the saw's around the 5th).
+fn glottis_fill(out: u64, n: usize, rate: f64, kind: i32, f0: u64) {
+    if kind == SRC_PULSE {
+        var ph: f64 = 0.0
+        var i: usize = 0
+        while i < n {
+            var f: f64 = synth_osc.gf(f0, i)
+            if f < 20.0 { f = 20.0 }
+            ph = ph + f / rate
+            var v: f64 = 0.0
+            if ph >= 1.0 {
+                ph = ph - 1.0
+                v = 0.06 * rate / f
+            }
+            synth_osc.pf(out, i, v)
+            i = i + 1
+        }
+        return
+    }
+    synth_osc.osc_fill(out, n, rate, synth_osc.WAVE_SAW, f0, 0, 0.0, 0.5, 0.0)
+}
+
+// ------------------------------------------------------------------------------------------------ tracks
+
+// A track = 6 arrays of n f64 in one block: F1 F2 F3 (Hz), BW1 BW2 BW3 (Hz). `track_f(tr, n, k)` / `track_bw` give
+// the address of array k.
+fn track_new(n: usize) -> u64 {
+    return synth_osc.sig_new(n * 6)
+}
+
+fn track_free(tr: u64, n: usize) {
+    synth_osc.sig_free(tr, n * 6)
+}
+
+fn track_f(tr: u64, n: usize, k: i32) -> u64 {
+    return tr + ((n * (k as usize)) * 8) as u64
+}
+
+fn track_bw(tr: u64, n: usize, k: i32) -> u64 {
+    return tr + ((n * ((3 + k) as usize)) * 8) as u64
+}
+
+// Samples [from, to) of the track = vowel v (all formants scaled by `shift`).
+fn track_set_const(tr: u64, n: usize, from: usize, to: usize, v: i32, shift: f64) {
+    var k: i32 = 0
+    while k < 3 {
+        let fa: u64 = track_f(tr, n, k)
+        let ba: u64 = track_bw(tr, n, k)
+        let f: f64 = formant_table.vowel_f(v, k) * shift
+        let b: f64 = formant_table.vowel_bw(v, k)
+        var i: usize = from
+        while i < to && i < n {
+            synth_osc.pf(fa, i, f)
+            synth_osc.pf(ba, i, b)
+            i = i + 1
+        }
+        k = k + 1
+    }
+}
+
+// Samples [from, to): vowel `va` before sample `t0`, vowel `vb` after sample `t1`, in between a smoothstep
+// interpolation of F and BW (the soft transition between two vowels).
+fn track_set_morph(tr: u64, n: usize, from: usize, to: usize, va: i32, vb: i32, t0: usize, t1: usize, shift: f64) {
+    var k: i32 = 0
+    while k < 3 {
+        let fa: u64 = track_f(tr, n, k)
+        let ba: u64 = track_bw(tr, n, k)
+        let f0: f64 = formant_table.vowel_f(va, k) * shift
+        let f1: f64 = formant_table.vowel_f(vb, k) * shift
+        let b0: f64 = formant_table.vowel_bw(va, k)
+        let b1: f64 = formant_table.vowel_bw(vb, k)
+        var i: usize = from
+        while i < to && i < n {
+            var u: f64 = 0.0
+            if i >= t1 {
+                u = 1.0
+            } else if i > t0 {
+                u = smoothstep(((i - t0) as f64) / ((t1 - t0) as f64))
+            }
+            synth_osc.pf(fa, i, f0 + (f1 - f0) * u)
+            synth_osc.pf(ba, i, b0 + (b1 - b0) * u)
+            i = i + 1
+        }
+        k = k + 1
+    }
+}
+
+// Parallel formant bank: out = sum_k gain_k * BP(F_k, Q = F_k / BW_k)(src). `src` and `out` may not be the same
+// array. n samples.
+fn formant_bank(src: u64, out: u64, n: usize, rate: f64, tr: u64) {
+    let q: u64 = synth_osc.sig_new(n)
+    let tmp: u64 = synth_osc.sig_new(n)
+    var i: usize = 0
+    while i < n {
+        synth_osc.pf(out, i, 0.0)
+        i = i + 1
+    }
+    var k: i32 = 0
+    while k < 3 {
+        let fa: u64 = track_f(tr, n, k)
+        let ba: u64 = track_bw(tr, n, k)
+        i = 0
+        while i < n {
+            var b: f64 = synth_osc.gf(ba, i)
+            if b < 1.0 { b = 1.0 }
+            synth_osc.pf(q, i, synth_osc.gf(fa, i) / b)
+            i = i + 1
+        }
+        synth_fx.fx_biquad(src, tmp, n, rate, synth_fx.FILT_BP, fa, q)
+        let g: f64 = formant_table.vowel_gain(k)
+        i = 0
+        while i < n {
+            synth_osc.pf(out, i, synth_osc.gf(out, i) + g * synth_osc.gf(tmp, i))
+            i = i + 1
+        }
+        k = k + 1
+    }
+    synth_osc.sig_free(q, n)
+    synth_osc.sig_free(tmp, n)
+}
+
+fn scale_in_place(p: u64, n: usize, g: f64) {
+    var i: usize = 0
+    while i < n {
+        synth_osc.pf(p, i, synth_osc.gf(p, i) * g)
+        i = i + 1
+    }
+}
+
+// Convenience: n samples of a sustained vowel `v` at f0 Hz with vibrato, written to `out`; level 0 .. 1.
+fn sing_vowel(out: u64, n: usize, rate: f64, f0: f64, vib_rate: f64, vib_cents: f64, vib_fade_ms: f64, v: i32, shift: f64, level: f64) {
+    sing_morph(out, n, rate, f0, vib_rate, vib_cents, vib_fade_ms, v, v, 0.0, 0.0, shift, level, SRC_SAW)
+}
+
+// Convenience: vowel `va` -> vowel `vb`, transition between t0_ms and t1_ms (smoothstep), source kind selectable.
+fn sing_morph(out: u64, n: usize, rate: f64, f0: f64, vib_rate: f64, vib_cents: f64, vib_fade_ms: f64, va: i32, vb: i32, t0_ms: f64, t1_ms: f64, shift: f64, level: f64, kind: i32) {
+    let fc: u64 = synth_osc.sig_new(n)
+    f0_const(fc, n, f0)
+    vibrato_apply(fc, n, rate, vib_rate, vib_cents, vib_fade_ms, 0)
+    let src: u64 = synth_osc.sig_new(n)
+    glottis_fill(src, n, rate, kind, fc)
+    let tr: u64 = track_new(n)
+    track_set_morph(tr, n, 0, n, va, vb, (t0_ms * rate / 1000.0) as usize, (t1_ms * rate / 1000.0) as usize, shift)
+    formant_bank(src, out, n, rate, tr)
+    scale_in_place(out, n, BANK_GAIN * level)
+    track_free(tr, n)
+    synth_osc.sig_free(src, n)
+    synth_osc.sig_free(fc, n)
+}

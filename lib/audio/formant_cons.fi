@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/audio/formant_cons.fi -- audio.formant_cons: consonant sounds for formant synthesis (hiss and plosive bursts).
+//
+//     import audio.formant_cons
+//     import audio.formant_table
+//     let n: usize = 4410
+//     let out: u64 = synth_osc.sig_new(n)
+//     formant_cons.fric_fill(out, n, 44100.0, formant_table.CONS_S, 1)        // 100 ms "ssss"
+//     let b: usize = formant_cons.burst_len(44100)                              // 529 samples = 12 ms
+//     formant_cons.burst_fill(out, n, 44100.0, formant_table.CONS_K, 1)         // "k" click at out[0 .. 529)
+//
+// FRICATIVES (s sh f z v): white noise (deterministic xorshift, `seed`) through ONE band-pass
+// (`formant_table.cons_center` / `cons_q`): s high (7 kHz), sh middle (3.2 kHz), f wide and quiet; trapezoid
+// envelope (attack 10 ms, release 15 ms, at most a third of the length each).
+//
+// PLOSIVE BURST (b d g p t k): exactly `burst_len(rate)` = round(rate * 12 ms) samples: band noise whose centre
+// depends on the place (labial low, alveolar high, velar middle) times the squared falling envelope (1 - u)^2,
+// plus for the voiced b d g a damped sine "thump" (voice bar at 110 / 150 / 130 Hz). Voiceless p t k have the
+// full noise; the aspiration that follows them is made by the sequencer.
+//
+// HONEST
+// C1  The burst is a stylised click, not a measured one; the three places are only told apart by the centre
+//     frequency of the noise (and the thump of the voiced ones).
+// C2  `rate` is f64 like in audio.synth_*; `burst_len` takes the integer rate.
+import std.rt
+import audio.synth_osc
+import audio.synth_fx
+import audio.formant_table
+
+export { BURST_MS, burst_len, burst_fill, fric_fill, nasal_f, nasal_bw }
+
+const BURST_MS: u32 = 12
+
+// round(rate * 12 ms) in samples
+fn burst_len(rate: u32) -> usize {
+    return (((rate as u64) * (BURST_MS as u64) + 500) / 1000) as usize
+}
+
+fn band_noise(out: u64, n: usize, rate: f64, center: f64, q: f64, seed: u64) {
+    let w: u64 = synth_osc.sig_new(n)
+    synth_osc.noise_fill(w, n, synth_osc.NOISE_WHITE, seed)
+    let c: u64 = synth_osc.sig_const(n, center)
+    let qq: u64 = synth_osc.sig_const(n, q)
+    synth_fx.fx_biquad(w, out, n, rate, synth_fx.FILT_BP, c, qq)
+    synth_osc.sig_free(w, n)
+    synth_osc.sig_free(c, n)
+    synth_osc.sig_free(qq, n)
+}
+
+// Writes n samples of fricative `cons` (CONS_S .. CONS_V) to out (overwrites). Other ids: silence.
+fn fric_fill(out: u64, n: usize, rate: f64, cons: i32, seed: u64) {
+    if !formant_table.cons_is_fricative(cons) || n == 0 {
+        var z: usize = 0
+        while z < n {
+            synth_osc.pf(out, z, 0.0)
+            z = z + 1
+        }
+        return
+    }
+    band_noise(out, n, rate, formant_table.cons_center(cons), formant_table.cons_q(cons), seed)
+    let g: f64 = formant_table.cons_gain(cons)
+    var att: usize = (0.010 * rate) as usize
+    var rel: usize = (0.015 * rate) as usize
+    if att > n / 3 { att = n / 3 }
+    if rel > n / 3 { rel = n / 3 }
+    var i: usize = 0
+    while i < n {
+        var e: f64 = 1.0
+        if i < att {
+            e = ((i + 1) as f64) / ((att + 1) as f64)
+        } else if i + rel >= n {
+            e = ((n - i) as f64) / ((rel + 1) as f64)
+        }
+        synth_osc.pf(out, i, synth_osc.gf(out, i) * g * e)
+        i = i + 1
+    }
+}
+
+// Frequency of the voice bar thump of the voiced plosives
+fn thump_hz(cons: i32) -> f64 {
+    if cons == formant_table.CONS_B { return 110.0 }
+    if cons == formant_table.CONS_D { return 150.0 }
+    return 130.0
+}
+
+// Writes burst_len samples of the plosive `cons` at out[0 ..] (overwrites) and returns that count; if
+// n < burst_len only n samples are written (and n returned). Other ids: writes nothing, returns 0.
+fn burst_fill(out: u64, n: usize, rate: f64, cons: i32, seed: u64) -> usize {
+    if !formant_table.cons_is_plosive(cons) { return 0 }
+    var len: usize = burst_len(rate as u32)
+    if len > n { len = n }
+    if len == 0 { return 0 }
+    let voiced: bool = formant_table.cons_voiced(cons)
+    let noise: u64 = synth_osc.sig_new(len)
+    band_noise(noise, len, rate, formant_table.cons_center(cons), formant_table.cons_q(cons), seed)
+    var noise_gain: f64 = formant_table.cons_gain(cons)
+    if voiced { noise_gain = noise_gain * 0.5 }
+    let hz: f64 = thump_hz(cons)
+    var ph: f64 = 0.0
+    var i: usize = 0
+    while i < len {
+        let u: f64 = (i as f64) / (len as f64)
+        let e: f64 = (1.0 - u) * (1.0 - u)
+        var v: f64 = noise_gain * synth_osc.gf(noise, i) * e
+        if voiced {
+            v = v + 0.7 * synth_osc.sin_turn(ph) * e
+            ph = ph + hz / rate
+            ph = ph - synth_osc.ffloor(ph)
+        }
+        synth_osc.pf(out, i, v)
+        i = i + 1
+    }
+    synth_osc.sig_free(noise, len)
+    return len
+}
+
+// Formants of the nasal murmur (m, n): low F1 with a wide bandwidth, F2 by place, F3 weak.
+fn nasal_f(cons: i32, k: i32) -> f64 {
+    if k == 0 { return 250.0 }
+    if k == 1 {
+        if cons == formant_table.CONS_M { return 1100.0 }
+        return 1500.0
+    }
+    return 2500.0
+}
+
+fn nasal_bw(k: i32) -> f64 {
+    if k == 0 { return 100.0 }
+    if k == 1 { return 200.0 }
+    return 300.0
+}

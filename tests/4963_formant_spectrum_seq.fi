@@ -1,0 +1,224 @@
+// expect_exit: 0
+// audio.formant: spectrum (saw harmonics at k*F0, formant peaks within 10 %), determinism, sequencer length / range /
+// WAV header / pinned hash, plosive burst length (12 ms).
+import std.rt
+import std.io
+import audio.pcm
+import audio.synth_osc
+import audio.synth_fx
+import audio.formant
+import audio.formant_cons
+import audio.formant_table
+import audio.formant_seq
+import audio.formant_songs
+
+const SEQ_CRC: u32 = 133138244 as u32
+
+fn check(ok: bool, what: str, fails: *mut i32) {
+    if !ok {
+        io.fmt_print(f"FAIL {what}\n")
+        *fails = *fails + 1
+    }
+}
+
+fn fabs(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// power of one frequency by a direct sum over [from, from + len)
+fn power_at(p: u64, from: usize, len: usize, rate: f64, hz: f64) -> f64 {
+    var re: f64 = 0.0
+    var im: f64 = 0.0
+    var i: usize = 0
+    while i < len {
+        let ph: f64 = hz * ((from + i) as f64) / rate
+        let v: f64 = synth_osc.gf(p, from + i)
+        re = re + v * synth_osc.cos_turn(ph)
+        im = im + v * synth_osc.sin_turn(ph)
+        i = i + 1
+    }
+    return (re * re + im * im) / ((len as f64) * (len as f64))
+}
+
+// frequency of the strongest harmonic k*f0 in [lo, hi]
+fn peak_hz(p: u64, from: usize, len: usize, rate: f64, f0: f64, lo: f64, hi: f64) -> f64 {
+    var best: f64 = 0.0
+    var best_hz: f64 = 0.0
+    var k: f64 = 1.0
+    while k * f0 <= hi {
+        if k * f0 >= lo {
+            let pw: f64 = power_at(p, from, len, rate, k * f0)
+            if pw > best {
+                best = pw
+                best_hz = k * f0
+            }
+        }
+        k = k + 1.0
+    }
+    return best_hz
+}
+
+fn near(a: f64, b: f64, tol: f64) -> bool {
+    return fabs(a - b) <= tol * b
+}
+
+fn sig_hash(p: u64, n: usize) -> u64 {
+    var h: u64 = 14695981039346656037
+    var i: usize = 0
+    while i < n {
+        h = (h ^ rt.ld64(p, i)) *% 1099511628211
+        i = i + 1
+    }
+    return h
+}
+
+fn le32(b: u64, at: usize) -> u32 {
+    return (rt.ld8(b, at) as u32) | ((rt.ld8(b, at + 1) as u32) << 8) | ((rt.ld8(b, at + 2) as u32) << 16) | ((rt.ld8(b, at + 3) as u32) << 24)
+}
+
+fn tag_is(b: u64, at: usize, s: str) -> bool {
+    return rt.mem_eq(b + at as u64, s.p as u64, 4)
+}
+
+fn build_seq(rate: u32) -> formant_seq.Seq {
+    var s: formant_seq.Seq = formant_seq.seq_new(rate)
+    formant_seq.seq_note(&s, 300.0, 330.0, formant_table.VOWEL_AH, formant_table.VOWEL_EE, formant_table.CONS_D, formant_table.CONS_NONE, 0.9, true)
+    formant_seq.seq_note(&s, 450.0, 262.0, formant_table.VOWEL_EE, 0 - 1, formant_table.CONS_S, formant_table.CONS_N, 0.8, false)
+    formant_seq.seq_rest(&s, 100.0)
+    formant_seq.seq_note(&s, 200.0, 196.0, formant_table.VOWEL_OO, 0 - 1, formant_table.CONS_K, formant_table.CONS_NONE, 1.0, false)
+    return s
+}
+
+fn main() -> i32 {
+    var fails: i32 = 0
+    let rate: f64 = 44100.0
+
+    // (b1) raw saw at 441 Hz (100 samples per period): harmonic k has power ~ 1/k^2
+    let n0: usize = 4410
+    let saw: u64 = synth_osc.sig_new(n0)
+    let fr: u64 = synth_osc.sig_const(n0, 441.0)
+    formant.glottis_fill(saw, n0, rate, formant.SRC_SAW, fr)
+    let p1: f64 = power_at(saw, 0, n0, rate, 441.0)
+    var k: f64 = 2.0
+    while k <= 8.0 {
+        let r: f64 = power_at(saw, 0, n0, rate, 441.0 * k) / p1 * k * k
+        check(r > 0.8 && r < 1.25, "saw harmonic power 1/k^2", &fails)
+        k = k + 1.0
+    }
+    let between: f64 = power_at(saw, 0, n0, rate, 441.0 * 2.5) / p1
+    check(between < 0.001, "saw: nothing between harmonics", &fails)
+    synth_osc.sig_free(saw, n0)
+    synth_osc.sig_free(fr, n0)
+
+    // (b2) formant peaks: F0 = 50 Hz (882 samples per period), window of 10 periods after 2 settling periods
+    let n1: usize = 10584
+    var v: i32 = 0
+    while v < 5 {
+        var vow: i32 = formant_table.VOWEL_AH
+        if v == 1 { vow = formant_table.VOWEL_EE }
+        if v == 2 { vow = formant_table.VOWEL_OO }
+        if v == 3 { vow = formant_table.VOWEL_AE }
+        if v == 4 { vow = formant_table.VOWEL_OH }
+        let o: u64 = synth_osc.sig_new(n1)
+        formant.sing_vowel(o, n1, rate, 50.0, 0.0, 0.0, 0.0, vow, 1.0, 1.0)
+        let f1: f64 = formant_table.vowel_f(vow, 0)
+        let f2: f64 = formant_table.vowel_f(vow, 1)
+        let h1: f64 = peak_hz(o, 1764, 8820, rate, 50.0, f1 * 0.6, f1 * 1.4)
+        let h2: f64 = peak_hz(o, 1764, 8820, rate, 50.0, f2 * 0.75, f2 * 1.25)
+        check(near(h1, f1, 0.10), "F1 peak within 10 percent", &fails)
+        check(near(h2, f2, 0.10), "F2 peak within 10 percent", &fails)
+        // level 1.0 stays below full scale
+        check(synth_fx.fx_peak(o, n1) < 1.0, "vowel peak below 1", &fails)
+        synth_osc.sig_free(o, n1)
+        v = v + 1
+    }
+
+    // (c) determinism
+    let a: u64 = synth_osc.sig_new(2000)
+    let b: u64 = synth_osc.sig_new(2000)
+    let c: u64 = synth_osc.sig_new(2000)
+    formant_cons.fric_fill(a, 2000, rate, formant_table.CONS_S, 1)
+    formant_cons.fric_fill(b, 2000, rate, formant_table.CONS_S, 1)
+    formant_cons.fric_fill(c, 2000, rate, formant_table.CONS_S, 2)
+    check(sig_hash(a, 2000) == sig_hash(b, 2000), "same seed -> same noise", &fails)
+    check(sig_hash(a, 2000) != sig_hash(c, 2000), "other seed -> other noise", &fails)
+    synth_osc.sig_free(a, 2000)
+    synth_osc.sig_free(b, 2000)
+    synth_osc.sig_free(c, 2000)
+
+    // (d) sequencer: length = rounded sum of the durations, range, no NaN, determinism, WAV
+    var s1: formant_seq.Seq = build_seq(44100 as u32)
+    var s2: formant_seq.Seq = build_seq(44100 as u32)
+    var n: usize = 0
+    var m: usize = 0
+    let x1: u64 = formant_seq.seq_render(&s1, &n)
+    let x2: u64 = formant_seq.seq_render(&s2, &m)
+    check(n == 46305 && m == n, "sequencer length = sum of durations (1050 ms)", &fails)
+    check(formant_seq.seq_length(&s1) == n, "seq_length", &fails)
+    check(sig_hash(x1, n) == sig_hash(x2, n), "sequencer deterministic", &fails)
+    var ok_range: bool = true
+    var i: usize = 0
+    while i < n {
+        let y: f64 = synth_osc.gf(x1, i)
+        if !(y == y) || y > 1.0 || y < 0.0 - 1.0 { ok_range = false }
+        i = i + 1
+    }
+    check(ok_range, "no NaN, |x| <= 1", &fails)
+    check(near(synth_fx.fx_peak(x1, n), 0.8, 0.001), "normalised to peak 0.8", &fails)
+    var w: rt.Buf = rt.buf_new()
+    let clipped: usize = formant_seq.seq_wav(x1, n, 44100 as u32, &w)
+    let wp: u64 = rt.buf_ptr(&w)
+    check(clipped == 0, "no clipped samples", &fails)
+    check(rt.buf_len(&w) == 44 + n * 2, "wav size", &fails)
+    check(tag_is(wp, 0, "RIFF") && tag_is(wp, 8, "WAVE") && tag_is(wp, 12, "fmt ") && tag_is(wp, 36, "data"), "wav tags", &fails)
+    check(le32(wp, 4) == (36 + n * 2) as u32 && le32(wp, 16) == 16 as u32 && le32(wp, 24) == 44100 as u32 && le32(wp, 28) == 88200 as u32 && le32(wp, 40) == (n * 2) as u32, "wav fields", &fails)
+    check((rt.ld8(wp, 20) as u32) == 1 && (rt.ld8(wp, 22) as u32) == 1 && (rt.ld8(wp, 32) as u32) == 2 && (rt.ld8(wp, 34) as u32) == 16, "wav pcm mono 16 bit", &fails)
+    let crc: u32 = pcm.crc32(wp + 44 as u64, n * 2)
+    if crc != SEQ_CRC {
+        io.fmt_print(f"seq crc {crc as i64}\n")
+    }
+    check(crc == SEQ_CRC, "sequencer samples pinned (crc32)", &fails)
+    rt.buf_free(&w)
+    synth_osc.sig_free(x1, n)
+    synth_osc.sig_free(x2, m)
+    formant_seq.seq_free(&s1)
+    formant_seq.seq_free(&s2)
+
+    // Daisy Bell, line 1 at 22.05 kHz: 21 beats of 500 ms = 10500 ms
+    var d: formant_seq.Seq = formant_seq.seq_new(22050 as u32)
+    formant_songs.daisy_bell(&d, 500.0, 1)
+    var dn: usize = 0
+    let dx: u64 = formant_seq.seq_render(&d, &dn)
+    check(dn == 231525, "daisy line 1 length", &fails)
+    check(synth_fx.fx_peak(dx, dn) <= 0.8001, "daisy range", &fails)
+    synth_osc.sig_free(dx, dn)
+    formant_seq.seq_free(&d)
+
+    // (e) plosive burst: 12 ms
+    check(formant_cons.burst_len(44100) == 529, "burst 12 ms @ 44100", &fails)
+    check(formant_cons.burst_len(22050) == 265, "burst 12 ms @ 22050", &fails)
+    check(formant_cons.burst_len(48000) == 576, "burst 12 ms @ 48000", &fails)
+    check(formant_cons.burst_len(8000) == 96, "burst 12 ms @ 8000", &fails)
+    var cs: i32 = formant_table.CONS_B
+    while cs <= formant_table.CONS_K {
+        let bb: u64 = synth_osc.sig_new(700)
+        let wn: usize = formant_cons.burst_fill(bb, 700, rate, cs, 3)
+        check(wn == 529, "burst length 529", &fails)
+        var tail: f64 = 0.0
+        var j: usize = 529
+        while j < 700 {
+            tail = tail + fabs(synth_osc.gf(bb, j))
+            j = j + 1
+        }
+        check(tail == 0.0, "nothing after the burst", &fails)
+        check(fabs(synth_osc.gf(bb, 528)) < 0.01 * synth_fx.fx_peak(bb, 529) + 0.001, "burst decays to zero", &fails)
+        check(synth_fx.fx_peak(bb, 529) > 0.01, "burst is audible", &fails)
+        synth_osc.sig_free(bb, 700)
+        cs = cs + 1
+    }
+    if fails == 0 {
+        io.fmt_print(f"formant spectrum/seq: ok\n")
+    }
+    return fails
+}
