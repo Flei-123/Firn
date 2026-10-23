@@ -98,6 +98,11 @@ while IFS= read -r f; do
         skipped=$((skipped+1))
         continue
     fi
+    # r936: `// self_compare_skip: <why>` = the output holds timings, so two correct builds never print the same.
+    if head -n 3 "$f" | grep -q '^// self_compare_skip'; then
+        skipped=$((skipped+1))
+        continue
+    fi
     # Only files that `firnc0` can compile -- otherwise they would be two
     # different inputs. Since round 29 files with `import` count
     # as well: `firnc1` resolves them itself.

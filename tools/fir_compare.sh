@@ -138,6 +138,15 @@ while IFS= read -r f; do
     fi
     "$DUMP" "$f" > "$TMPD"/firv_b.txt 2>/dev/null
     rc=$?
+    if [ "$rc" -eq 0 ] && grep -q ' at lib/gc/gc.fi:' "$TMPD"/firv_a.txt && ! grep -q ' at lib/gc/gc.fi:' "$TMPD"/firv_b.txt; then
+        # r936: a file that uses `str` pulls the whole gc runtime into firnc0's merged program; the
+        # one-file dump has no module loader. Compare the functions the file defines itself.
+        if python3 tools/fir_subset.py "$TMPD"/firv_a.txt "$TMPD"/firv_b.txt > "$TMPD"/firm_n.txt; then
+            same=$((same+1))
+            instructions=$((instructions + $(cat "$TMPD"/firm_n.txt)))
+            continue
+        fi
+    fi
     case "$rc" in
         3) noncore=$((noncore+1)); continue;;
         4) comptime=$((comptime+1)); continue;;
