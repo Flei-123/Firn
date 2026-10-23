@@ -1942,6 +1942,24 @@ pub fn allocate(f: &Func) -> Alloc {
                     {
                         (*a, p, true)
                     }
+                    // WIN B: the integer two-operand forms (`mov d, a` + `xor d, b`)
+                    // are copies just the same. Only operations that are really
+                    // emitted as copy + op: bitwise ops, `sub` with a register
+                    // operand, `imul` register form, constant shifts/rotates.
+                    (Op::Bin(op, a, b), Some(p))
+                        if !i.ty.is_float()
+                            && i.ty != FTy::V128
+                            && i.ty.bits() >= 32
+                            && std::env::var_os("FIRN_NO_COAL_INT").is_none()
+                            && match op {
+                                BinOp::And | BinOp::Or | BinOp::Xor => true,
+                                BinOp::Sub | BinOp::Mul => !alloc.imms.contains_key(b),
+                                BinOp::Shl | BinOp::Shr | BinOp::Rotr32 => alloc.imms.contains_key(b),
+                                _ => false,
+                            } =>
+                    {
+                        (*a, p, true)
+                    }
                     (Op::Un(UnOp::Neg, a), Some(p)) if i.ty.is_float() => (*a, p, true),
                     (Op::Simd { kind, args, .. }, Some(p))
                         if two_address_simd(*kind) && !args.is_empty() =>
@@ -1965,7 +1983,16 @@ pub fn allocate(f: &Func) -> Alloc {
                 if f.no_coalesce.contains(&t) || f.no_coalesce.contains(&p) {
                     reject!("Schnitt")
                 }
-                if t < np || coalesced.contains_key(&t) || sources.contains_key(&t) {
+                // WIN B: a chain `a = x ^ y; b = a ^ z; c = b ^ w` merges all of
+                // its links into one register. `t` may already be the target of
+                // earlier merges (a representative) when this is a two-operand
+                // form; its whole group then moves to `p` (checked below).
+                let chain_ok = two_address
+                    && std::env::var_os("FIRN_NO_COAL_CHAIN").is_none();
+                if t < np
+                    || coalesced.contains_key(&t)
+                    || (sources.contains_key(&t) && !chain_ok)
+                {
                     reject!("t already assigned")
                 }
                 if coalesced.contains_key(&p) {
@@ -2028,9 +2055,20 @@ pub fn allocate(f: &Func) -> Alloc {
                 if interferes(f, &live, &defsites, t, p, Some((bi, ii))) {
                     reject!("Stoerung")
                 }
+                // Members of `t`'s own group (earlier links of the chain).
+                let group: Vec<Val> = sources.get(&t).cloned().unwrap_or_default();
+                if group.iter().any(|&m| interferes(f, &live, &defsites, m, p, None)) {
+                    reject!("group member interferes with p")
+                }
                 let taken = sources.entry(p).or_default();
                 if taken.iter().any(|&u| interferes(f, &live, &defsites, u, t, None)) {
                     reject!("disturbs an already merged source")
+                }
+                if taken
+                    .iter()
+                    .any(|&u| group.iter().any(|&m| interferes(f, &live, &defsites, u, m, None)))
+                {
+                    reject!("disturbs an already merged source (group)")
                 }
                 if let Ok(n) = std::env::var("FIRN_COAL_N") {
                     if coalesced.len() >= n.parse::<usize>().unwrap_or(usize::MAX) {
@@ -2041,7 +2079,12 @@ pub fn allocate(f: &Func) -> Alloc {
                     eprintln!("COAL {} t=%{} p=%{} -> JA", f.name, t, p);
                 }
                 taken.push(t);
+                taken.extend(group.iter().copied());
+                sources.remove(&t);
                 coalesced.insert(t, p);
+                for m in group {
+                    coalesced.insert(m, p);
+                }
             }
         }
         // Put the intervals together: `p` carries from now on the lifetime,
