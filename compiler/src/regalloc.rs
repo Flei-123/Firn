@@ -248,6 +248,12 @@ fn two_address_bin(op: BinOp) -> bool {
     matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
 }
 
+/// Commutative integer operators: `emit_bin` may swap the operands when the
+/// second one already lives in the target register.
+fn int_commutative_bin(op: BinOp) -> bool {
+    matches!(op, BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor)
+}
+
 /// Does this type belong in the SSE class (floating-point number or vector)?
 fn sse_class(t: FTy) -> bool {
     t.is_float() || t == FTy::V128
@@ -1958,9 +1964,34 @@ pub fn allocate(f: &Func) -> Alloc {
                                 _ => false,
                             } =>
                     {
-                        (*a, p, true)
+                        if !live_after(f, &live, *a, bi, ii)
+                            || !int_commutative_bin(*op)
+                            || alloc.imms.contains_key(a)
+                            || alloc.imms.contains_key(b)
+                            || *a == *b
+                            || live_after(f, &live, *b, bi, ii)
+                        {
+                            (*a, p, true)
+                        } else {
+                            (*b, p, true)
+                        }
                     }
                     (Op::Un(UnOp::Neg, a), Some(p)) if i.ty.is_float() => (*a, p, true),
+                    // ROUND WINA: an integer conversion whose source dies is a
+                    // copy as well (`load_ext` writes nothing when source and
+                    // target agree, or one in-place `movzx`).
+                    (Op::Cast { src, from }, Some(p))
+                        if !i.ty.is_float()
+                            && !from.is_float()
+                            && i.ty != FTy::Bool
+                            && *from != FTy::Bool
+                            && i.ty != FTy::V128
+                            && *from != FTy::V128
+                            && !alloc.imms.contains_key(src)
+                            && std::env::var_os("FIRN_NO_COALESCE_INT").is_none() =>
+                    {
+                        (*src, p, true)
+                    }
                     (Op::Simd { kind, args, .. }, Some(p))
                         if two_address_simd(*kind) && !args.is_empty() =>
                     {
@@ -1995,6 +2026,7 @@ pub fn allocate(f: &Func) -> Alloc {
                 {
                     reject!("t already assigned")
                 }
+                let tgroup: Vec<Val> = sources.get(&t).cloned().unwrap_or_default();
                 if coalesced.contains_key(&p) {
                     reject!("p is itself a source")
                 }
@@ -2023,7 +2055,12 @@ pub fn allocate(f: &Func) -> Alloc {
                     reject!("defs/reads")
                 }
                 // (2) same type, no special slot.
-                if f.val_ty(t) != f.val_ty(p) || f.val_ty(t) != i.ty {
+                let is_int_cast = matches!(i.op, Op::Cast { .. });
+                if is_int_cast {
+                    if sse_class(f.val_ty(t)) || sse_class(f.val_ty(p)) || f.val_ty(p) != i.ty {
+                        reject!("Typ")
+                    }
+                } else if f.val_ty(t) != f.val_ty(p) || f.val_ty(t) != i.ty {
                     reject!("Typ")
                 }
                 if f.is_secret(t) || f.is_secret(p) {
@@ -4361,7 +4398,7 @@ fn emit_variant(f: &Func) -> Result<String, String> {
     tmp.flush_cold();
     // ROUND TK2: the value slots are 8..=value_slots*8 (compact_frame)
     let text = expand_save_markers(&tmp.out, a);
-    Ok(descriptor_peephole(&text, a.value_slots))
+    Ok(drop_redundant_zext(&descriptor_peephole(&text, a.value_slots)))
 }
 
 // ------------------------------------------------- Register descriptor ---
@@ -4398,6 +4435,96 @@ fn emit_variant(f: &Func) -> Result<String, String> {
 //    old code fell through silently, so every instruction somebody adds to
 //    the backend without touching this table was a latent wrong-code bug.
 //    Now the worst a new instruction can cost is a missed reload.
+/// ROUND WINA -- `mov e??, e??` (same register) and `movzx e??, <low byte>`
+/// directly behind an instruction that already left the upper bits zero.
+///
+/// A 32-bit write zero-extends into the full register, so a conversion
+/// `u32 -> u64` that the allocator turned into an in-place `mov esi, esi`
+/// is a no-op after `and esi, 255`. It is not a free one: that `mov` cannot be
+/// eliminated by the renamer and sits on the loop-carried chain of table
+/// driven loops (CRC-32). Only the immediately preceding instruction counts
+/// (`.loc` lines are skipped, a label or any other line stops the search).
+fn drop_redundant_zext(asm: &str) -> String {
+    fn is_reg32(r: &str) -> bool {
+        matches!(r, "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp")
+            || (r.len() >= 3
+                && r.starts_with('r')
+                && r.ends_with('d')
+                && r[1..r.len() - 1].chars().all(|c| c.is_ascii_digit()))
+    }
+    fn low8(r: &str) -> Option<String> {
+        let s = match r {
+            "eax" => "al",
+            "ebx" => "bl",
+            "ecx" => "cl",
+            "edx" => "dl",
+            "esi" => "sil",
+            "edi" => "dil",
+            "ebp" => "bpl",
+            _ => return Some(format!("{}b", &r[..r.len() - 1])),
+        };
+        Some(s.to_string())
+    }
+    // Does this line write the 32-bit register `reg` (and so clear bits 32..64)?
+    fn writes32(line: &str, reg: &str) -> bool {
+        let t = line.trim();
+        let (m, rest) = match t.split_once(' ') {
+            Some(x) => x,
+            None => return false,
+        };
+        if !matches!(
+            m,
+            "add" | "sub" | "and" | "or" | "xor" | "imul" | "shl" | "shr" | "sar" | "neg" | "not" | "lea"
+                | "mov" | "movzx" | "popcnt" | "lzcnt" | "tzcnt" | "bsf" | "bsr" | "ror" | "rol" | "adc" | "sbb"
+        ) {
+            return false;
+        }
+        let first = rest.split(',').next().unwrap_or("").trim();
+        first == reg
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut last_real: Option<usize> = None;
+    for line in asm.lines() {
+        let t = line.trim();
+        let mut drop = false;
+        if let (Some(k), true) = (last_real, line.starts_with("    ")) {
+            let prev = out[k];
+            if let Some(rest) = t.strip_prefix("mov ") {
+                if let Some((d, s)) = rest.split_once(", ") {
+                    if d == s && is_reg32(d) && writes32(prev, d) {
+                        drop = true;
+                    }
+                }
+            } else if let Some(rest) = t.strip_prefix("movzx ") {
+                if let Some((d, s)) = rest.split_once(", ") {
+                    if is_reg32(d) && low8(d).as_deref() == Some(s) {
+                        let pt = prev.trim();
+                        if let Some(pr) = pt.strip_prefix("movzx ") {
+                            if let Some((pd, ps)) = pr.split_once(", ") {
+                                if pd == d && (ps.starts_with("byte ptr") || ps == s) {
+                                    drop = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if drop {
+            continue;
+        }
+        out.push(line);
+        if !t.is_empty() && !t.starts_with(".loc ") {
+            last_real = Some(out.len() - 1);
+        }
+    }
+    let mut r = out.join("\n");
+    if asm.ends_with('\n') {
+        r.push('\n');
+    }
+    r
+}
+
 fn descriptor_peephole(asm: &str, nv: usize) -> String {
     /// 64-bit trunk register of a register name at any width.
     fn stem(r: &str) -> &str {
@@ -8203,6 +8330,14 @@ fn emit_bin_mem(
                 if ob != rn(dr, bits) {
                     ra.load_full(e, dr, a);
                     e.line(&format!("{} {}, {}", m, rn(dr, bits), ob));
+                    return Ok(());
+                }
+                // ROUND WINA: the second operand already is the target and the
+                // operator is commutative -- swap instead of the detour
+                // through `rax`: `xor dst, a`.
+                if int_commutative_bin(op) && ra.a.imm(a).is_none() {
+                    let oa = ra.opnd_w(a, bits);
+                    e.line(&format!("{} {}, {}", m, rn(dr, bits), oa));
                     return Ok(());
                 }
             }
