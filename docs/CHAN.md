@@ -1,6 +1,8 @@
 # lib/chan -- a bounded ring channel between threads
 
-`import chan.chan` (module name `chan`). One file, `lib/chan/chan.fi`.
+`import chan.chan` (module name `chan`). One file, `lib/chan/chan.fi`. Status: final for the first integration (23.10.2026); names and signatures below were checked against the source, the examples are tests 4830 (SPSC) and 4861 (MPSC).
+
+Purpose: hand records between threads without locks and without the GC. Used by `lib/window/shellthread.fi` (four rings between app thread and window thread, `docs/SHELL_THREAD.md`).
 
 A channel moves RECORDS of `rec_words` 64 bit words from threads that send to
 threads that receive. Meant for MPSC (many producers, one consumer) and SPSC;
@@ -59,6 +61,86 @@ on such a channel is a no-op that answers false / closed.
 | `chan_send1(c, v)`, `chan_recv1(c, out)` | one word channels (`rec_words == 1`) without a buffer of your own. |
 
 `rec` and `out` are `*mut u64` (Firn has no `*const`); a send does not write to `rec`.
+
+## Thread rules
+
+* **Who may call what.** Any thread may call any function on a shared `Chan` (the ring is thread safe); `chan_new` and `chan_free` are called once, by the owner, while nobody else uses the channel.
+* **No GC allocation in the channel code.** The ring and header are `rt.heap_alloc` memory. The `try_` calls never block, so they are the ones to use in a thread that is marked `thread_blocking_an()` (the window shell thread, `docs/SHELL_THREAD.md`). The waiting calls (`chan_send`, `chan_recv`, `chan_recv_timeout`) wrap their sleep in `thread_blocking_an()/thread_blocking_out()` themselves, so they are for ordinary GC threads.
+* **Return values.** `bool` calls: `true` = the record moved. `chan_recv_timeout` returns `RECV_OK` 0, `RECV_TIMEOUT` 1, `RECV_CLOSED` 2.
+* **Bad channel.** `blk == 0` (failed `chan_new`) makes every call a no-op that answers `false` / closed. After `chan_free` the handle word `c.blk` is 0 in that copy only; other copies of the word dangle, so free only when all users are done.
+
+## Example 2: MPSC with timeout and close (test 4861)
+
+Two producers send `(id, n)` records; the consumer uses `chan_recv_timeout`, closes after both producers are joined, and drains until `RECV_CLOSED`. Closing only after the join avoids C-3.
+
+```
+import chan.chan
+
+static mut g_blk: u64 = 0
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    var c: chan.Chan = chan.Chan { blk: g_blk }
+    var rec: [u64; 2] = [0; 2]
+    var n: u64 = 0
+    while n < 1000 {
+        rec[0] = arg
+        rec[1] = n
+        if !chan.chan_send(&c, &rec[0]) {
+            return 1
+        }
+        n = n + 1
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    var c: chan.Chan = chan.chan_new(16, 2)
+    if c.blk == 0 {
+        return 1
+    }
+    g_blk = c.blk
+    let a: u64 = thread_start(1, 0)
+    let b: u64 = thread_start(1, 1)
+    var next: [u64; 2] = [0; 2]
+    var out: [u64; 2] = [0; 2]
+    var total: u64 = 0
+    var closed: bool = false
+    while true {
+        let r: u64 = chan.chan_recv_timeout(&c, &out[0], 20)
+        if r == chan.RECV_OK {
+            if out[0] > 1 || out[1] != next[out[0] as usize] {
+                return 2
+            }
+            next[out[0] as usize] = out[1] + 1
+            total = total + 1
+        } else if r == chan.RECV_CLOSED {
+            break
+        } else if !closed && total == 2000 {
+            // both producers are done: nobody sends any more, so closing loses nothing
+            thread_wait(a)
+            thread_wait(b)
+            chan.chan_close(&c)
+            closed = true
+        }
+    }
+    chan.chan_free(&c)
+    if total != 2000 {
+        return 3
+    }
+    return 0
+}
+```
+
+Build and run: `firnc tests/4861_chan_doc_example.fi -o x && ./x` (exit 0); also `--target=x86_64-windows` under Wine.
+
+## Integration checklist for Certus
+
+1. `import chan.chan`; nothing else needed, no compiler support beyond threads (`thread_start`, `thread_wait`, futex seam).
+2. Windows target: needs the thread support of the WIN-THREADS patch (`WaitOnAddress`, `WakeByAddressSingle/All`; for `firnc-gc`: `patches-pending/compiler-0027-win-threads.patch`). Windows 8 or newer.
+3. Share a channel by sharing the `blk` word (`static mut`, or a field of the `thread_start` argument block) and rebuild `chan.Chan { blk: ... }` in the other thread. Do not call `chan_free` twice.
+4. Use `rec_words` words per message: ids, indexes, numbers. Never a Gc pointer (C-G1).
+5. In a thread without GC rights use only `chan_try_send` / `chan_try_recv`.
+6. Close the channel to stop consumers; join producers first when every record matters (C-3).
 
 ## Model
 
@@ -151,6 +233,8 @@ One thread, send + receive in turn: ~67 ns per pair. The MPSC numbers are
 bounded by the producers fighting over one cache line (`enq`) and the slot
 lines (a producer-only run without consumer: 4 producers ~2.5 M/s).
 
+Re-run 23.10.2026 (same server, load 18, one run of `bench/chan/chan_bench.fi`, release-fast): SPSC ring 1024 13.4 M/s, ring 64 15.7 M/s, ring 2 3.1 M/s, MPSC 4 producers ring 1024 3.7 M/s, MPSC 2 producers ring 64 9.6 M/s, ping-pong round trip 196 ns (the table above says 0.6 .. 0.9 us for the first runs; the spread is mostly machine load).
+
 Windows (HOLO-LAPTOP-3, 8 logical cores, real hardware, one run): SPSC ring
 1024 12.2 M/s, ring 64 10.8 M/s, ring 2 4.9 M/s, MPSC 4 producers 3.4 M/s, MPSC
 2 producers 5.4 M/s, ping-pong 304 ns. Wine on the server: SPSC 12.9 M/s,
@@ -168,4 +252,5 @@ ping-pong 961 ns.
 * `tests/4833_chan_mpsc_stress.fi` -- 4 producers x 500 k (order per producer,
   sum), ring of 4, full ring + sleeping consumer, 2 consumers (bonus).
 * `tests/4834_chan_gc.fi` -- the GC interaction of C-G1.
-* All five in dev-fast, release-safe, release-fast and `--no-opt`; also x86_64-windows (Wine + real Windows), aarch64 (qemu).
+* `tests/4861_chan_doc_example.fi` -- the MPSC example above (recv_timeout, close, drain).
+* All of them in dev-fast, release-safe, release-fast and `--no-opt`; also x86_64-windows (Wine + real Windows), aarch64 (qemu).
