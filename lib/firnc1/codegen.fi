@@ -42,7 +42,7 @@ import ast
 import sema
 
 export { Cg, cg_new, cg_free, cg_run, cg_unsuitable, cg_text, cg_gc_set,
-    cg_freestanding_set,
+    cg_freestanding_set, cg_split_count, cg_split_fill,
     cg_if_set, cg_tree_set, cg_sema_set }
 
 const NONE: u32 = 4294967295
@@ -83,7 +83,15 @@ struct Cg {
     // Label counter of the CURRENT function. Value numbers restart at 0 in
     // every function, so a label built from them alone collides across
     // functions -- the function's own name is folded in as well.
-    site: u64
+    site: u64,
+    // r944 (parallel `as`): where things start in `out`. `fstart[i]` is the
+    // offset of function i, `tail_off` where the data after the last function
+    // begins, `tr_a`..`tr_b` the panic trampoline (text, copied into every
+    // part so that its local labels stay local).
+    fstart: Vec[u64],
+    tail_off: u64,
+    tr_a: u64,
+    tr_b: u64
 }
 
 fn cg_new(f: u64, it: u64) -> Cg {
@@ -94,6 +102,7 @@ fn cg_new(f: u64, it: u64) -> Cg {
         frame: 0, unsuitable: false, gcr: 0, ifr: 0, free: false,
         tr: 0, ext_out: 0,
         pmsg: vec_new[u32](), site: 0, sm: 0, idx_used: false,
+        fstart: vec_new[u64](), tail_off: 0, tr_a: 0, tr_b: 0,
     }
 }
 
@@ -149,6 +158,7 @@ fn cg_free(c: *mut Cg) {
     vec_free[u64](&(*c).slot)
     vec_free[u64](&(*c).aslot)
     vec_free[u32](&(*c).pmsg)
+    vec_free[u64](&(*c).fstart)
 }
 
 fn cg_unsuitable(c: *mut Cg) -> bool { return (*c).unsuitable }
@@ -3011,6 +3021,7 @@ fn cg_run(c: *mut Cg) {
 
     var fi: u32 = 0
     while fi < fir.fn_count(f) as u32 {
+        vec_push[u64](&(*c).fstart, rt.buf_len(&(*c).out) as u64)
         frame_build(c, fi)
         // ROUND 72: one label counter per function (panic_rt.rs::SiteCounter).
         (*c).site = 0
@@ -3107,6 +3118,7 @@ fn cg_run(c: *mut Cg) {
         }
         fi = fi + 1
     }
+    (*c).tail_off = rt.buf_len(&(*c).out) as u64
     // HOOK gc: type table (.rodata) and state block (.data) of the collector --
     // only if the program really contains a `gc class` (gc.rs).
     if has_gc(c) {
@@ -3126,7 +3138,9 @@ fn cg_run(c: *mut Cg) {
     // never reaches a checked path, carries not one octet of it.
     if has_panic(c) {
         panic_rodata(c)
+        (*c).tr_a = rt.buf_len(&(*c).out) as u64
         panic_trampoline(c)
+        (*c).tr_b = rt.buf_len(&(*c).out) as u64
     }
     // HOOK statics: `.bss`/`.data`/`.rodata` of the global variables
     // (round 89, SPEC 14.1.statics) -- only when the program declares a
@@ -3136,4 +3150,152 @@ fn cg_run(c: *mut Cg) {
     }
     var gnu: [u8; 38] = ".section .note.GNU-stack,\"\",@progbits\n"
     t(c, (&gnu[0]) as u64, 38)
+}
+
+// ------------------------------------------- r944: the text in several parts
+//
+// `as` is single threaded and needs about 0.12 s per MB of text, which was
+// 54 % of the wall time for a kernel-sized program. The text is therefore cut
+// into `nf` runs of whole functions (parts 0..nf-1) plus one part with
+// everything behind the last function (part nf: tables, statics, the panic
+// messages). The parts are assembled in parallel and joined with `ld -r`.
+//
+// What makes the cut safe:
+//  * Function bodies only refer to labels of their own function, to global
+//    function symbols, and to the labels of the tail. The tail labels in a
+//    data section (`.Lpanicmsg<n>`, `.Lstatic_*`, `.L__fnv.*`, `.L__iface.*`,
+//    `.L__gc_*`) get `.globl` + `.hidden` in the tail part, so the other parts
+//    can refer to them (the final link makes them local again).
+//  * The panic trampoline is TEXT with labels of its own (`.Lpanic_*`): every
+//    function part gets its own copy, so no text label crosses a part.
+//  * Every part ends with the GNU-stack note like the whole text does.
+
+const PART_MAX: u32 = 8
+
+// First function that starts at or behind `target` (or the tail).
+fn split_cut(c: *mut Cg, target: u64) -> u64 {
+    var i: usize = 0
+    let n: usize = vec_len[u64](&(*c).fstart)
+    while i < n {
+        let o: u64 = vec_at[u64](&(*c).fstart, i)
+        if o >= target {
+            return o
+        }
+        i = i + 1
+    }
+    return (*c).tail_off
+}
+
+// How many function parts: `want` (clamped by the number of functions and
+// PART_MAX). The caller adds one for the tail. Returns 0 = do not split.
+fn cg_split_count(c: *mut Cg, want: u32) -> u32 {
+    var nf: u32 = want
+    if nf > PART_MAX {
+        nf = PART_MAX
+    }
+    let fns: usize = vec_len[u64](&(*c).fstart)
+    if (fns as u64) < nf as u64 {
+        nf = fns as u32
+    }
+    if nf < 2 {
+        return 0
+    }
+    if (*c).tail_off == 0 {
+        return 0
+    }
+    return nf
+}
+
+fn eq_lit(base: u64, pos: usize, end: usize, lit: u64, n: usize) -> bool {
+    if pos + n > end {
+        return false
+    }
+    var k: usize = 0
+    while k < n {
+        if rt.ld8(base, pos + k) != rt.ld8(lit, k) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+fn split_prelude(out: *mut rt.Buf) {
+    var pre: [u8; 29] = ".intel_syntax noprefix\n.text\n"
+    rt.buf_push_bytes(out, (&pre[0]) as u64, 29)
+}
+
+fn split_note(out: *mut rt.Buf) {
+    var gnu: [u8; 38] = ".section .note.GNU-stack,\"\",@progbits\n"
+    rt.buf_push_bytes(out, (&gnu[0]) as u64, 38)
+}
+
+// Part `k` of `nf + 1` into `out` (cleared first). 0 <= k < nf: functions;
+// k == nf: the tail.
+fn cg_split_fill(c: *mut Cg, k: u32, nf: u32, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    let base: u64 = rt.buf_ptr(&(*c).out)
+    let len: u64 = rt.buf_len(&(*c).out) as u64
+    if k < nf {
+        var a: u64 = 0
+        if k > 0 {
+            a = split_cut(c, (*c).tail_off / nf as u64 * k as u64)
+        }
+        var b: u64 = (*c).tail_off
+        if k + 1 < nf {
+            b = split_cut(c, (*c).tail_off / nf as u64 * (k + 1) as u64)
+        }
+        if k > 0 {
+            split_prelude(out)
+        }
+        if b > a {
+            rt.buf_push_bytes(out, base + a, (b - a) as usize)
+        }
+        if (*c).tr_b > (*c).tr_a {
+            rt.buf_push_bytes(out, base + (*c).tr_a, ((*c).tr_b - (*c).tr_a) as usize)
+        }
+        split_note(out)
+        return
+    }
+    // The tail. Section tracking: `codegen` only writes `.text` and
+    // `.section <name>` lines. Labels at column 0 in a data section are the
+    // ones the function parts refer to.
+    split_prelude(out)
+    var gl: [u8; 7] = ".globl "
+    var hd: [u8; 8] = ".hidden "
+    var sec: [u8; 9] = ".section "
+    var sectext: [u8; 14] = ".section .text"
+    var txt: [u8; 5] = ".text"
+    var in_text: bool = true
+    var pos: u64 = (*c).tail_off
+    while pos < len {
+        var e: u64 = pos
+        while e < len {
+            if rt.ld8(base, e as usize) == 10 as u8 {
+                break
+            }
+            e = e + 1
+        }
+        let n: usize = (e - pos) as usize
+        let p: usize = pos as usize
+        if eq_lit(base, p, e as usize, (&sec[0]) as u64, 9) {
+            in_text = eq_lit(base, p, e as usize, (&sectext[0]) as u64, 14)
+        } else if n == 5 && eq_lit(base, p, e as usize, (&txt[0]) as u64, 5) {
+            in_text = true
+        } else if !in_text && n > 3 && rt.ld8(base, p) == 46 as u8
+            && rt.ld8(base, p + 1) == 76 as u8 && rt.ld8(base, p + n - 1) == 58 as u8 {
+            rt.buf_push_bytes(out, (&gl[0]) as u64, 7)
+            rt.buf_push_bytes(out, base + pos, n - 1)
+            rt.buf_push(out, 10 as u8)
+            rt.buf_push_bytes(out, (&hd[0]) as u64, 8)
+            rt.buf_push_bytes(out, base + pos, n - 1)
+            rt.buf_push(out, 10 as u8)
+        }
+        if e < len {
+            rt.buf_push_bytes(out, base + pos, n + 1)
+        } else {
+            rt.buf_push_bytes(out, base + pos, n)
+        }
+        pos = e + 1
+    }
 }
