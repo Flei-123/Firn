@@ -91,7 +91,14 @@ struct Cg {
     fstart: Vec[u64],
     tail_off: u64,
     tr_a: u64,
-    tr_b: u64
+    tr_b: u64,
+    // r944: every REFERENCE to a panic message label: (offset in `out`, index)
+    // pairs, flat. The split rewrites them to `.Lpanicmsg0+<offset>` so that
+    // only ONE message symbol has to cross the parts (31 000 hidden symbols
+    // would stay in the symbol table of the kernel image). `poff[k]` = octets
+    // before message k, filled when the split starts.
+    pref: Vec[u64],
+    poff: Vec[u64]
 }
 
 fn cg_new(f: u64, it: u64) -> Cg {
@@ -103,6 +110,7 @@ fn cg_new(f: u64, it: u64) -> Cg {
         tr: 0, ext_out: 0,
         pmsg: vec_new[u32](), site: 0, sm: 0, idx_used: false,
         fstart: vec_new[u64](), tail_off: 0, tr_a: 0, tr_b: 0,
+        pref: vec_new[u64](), poff: vec_new[u64](),
     }
 }
 
@@ -159,6 +167,8 @@ fn cg_free(c: *mut Cg) {
     vec_free[u64](&(*c).aslot)
     vec_free[u32](&(*c).pmsg)
     vec_free[u64](&(*c).fstart)
+    vec_free[u64](&(*c).pref)
+    vec_free[u64](&(*c).poff)
 }
 
 fn cg_unsuitable(c: *mut Cg) -> bool { return (*c).unsuitable }
@@ -2002,6 +2012,14 @@ fn has_panic(c: *mut Cg) -> bool {
 }
 
 // `.Lpanicmsg<n>`
+// A REFERENCE to message `k` (the definition in `panic_rodata` stays a plain
+// `panic_label`): remembered for the split.
+fn panic_ref(c: *mut Cg, k: u32) {
+    vec_push[u64](&(*c).pref, rt.buf_len(&(*c).out) as u64)
+    vec_push[u64](&(*c).pref, k as u64)
+    panic_label(c, k)
+}
+
 fn panic_label(c: *mut Cg, k: u32) {
     var p: [u8; 10] = ".Lpanicmsg"
     t(c, (&p[0]) as u64, 10)
@@ -2234,7 +2252,7 @@ fn trampoline_jump(c: *mut Cg, code: u64, msgid: u32, unsigned: bool) {
     ins(c)
     var le: [u8; 16] = "lea rdi, [rip + "
     w(c, (&le[0]) as u64, 16)
-    panic_label(c, panic_msg_index(c, msgid))
+    panic_ref(c, panic_msg_index(c, msgid))
     rt.buf_push(&(*c).out, 93 as u8)
     nl(c)
     ins(c)
@@ -2268,7 +2286,7 @@ fn trampoline_jump_index(c: *mut Cg, msgid: u32) {
     ins(c)
     var le: [u8; 16] = "lea rdi, [rip + "
     w(c, (&le[0]) as u64, 16)
-    panic_label(c, panic_msg_index(c, msgid))
+    panic_ref(c, panic_msg_index(c, msgid))
     rt.buf_push(&(*c).out, 93 as u8)
     nl(c)
     ins(c)
@@ -3204,7 +3222,48 @@ fn cg_split_count(c: *mut Cg, want: u32) -> u32 {
     if (*c).tail_off == 0 {
         return 0
     }
+    // Octets before each message: the labels sit back to back in `.rodata`.
+    var acc: u64 = 0
+    var m: usize = 0
+    while m < vec_len[u32](&(*c).pmsg) {
+        vec_push[u64](&(*c).poff, acc)
+        let id: u32 = vec_at[u32](&(*c).pmsg, m)
+        acc = acc + intern.intern_length(it(c), id) as u64
+        m = m + 1
+    }
     return nf
+}
+
+// Copy `[a, b)` of the text; a reference to message k > 0 becomes
+// `.Lpanicmsg0+<octets before k>`.
+fn split_copy(c: *mut Cg, out: *mut rt.Buf, a: u64, b: u64) {
+    let base: u64 = rt.buf_ptr(&(*c).out)
+    var from: u64 = a
+    var i: usize = 0
+    let n: usize = vec_len[u64](&(*c).pref)
+    while i < n {
+        let pos: u64 = vec_at[u64](&(*c).pref, i)
+        let k: u64 = vec_at[u64](&(*c).pref, i + 1)
+        i = i + 2
+        if pos < a || pos >= b || k == 0 {
+            continue
+        }
+        // `.Lpanicmsg<k>` is 10 + digits(k) octets long.
+        var digits: u64 = 1
+        var q: u64 = k
+        while q >= 10 {
+            q = q / 10
+            digits = digits + 1
+        }
+        rt.buf_push_bytes(out, base + from, (pos - from) as usize)
+        var pm: [u8; 12] = ".Lpanicmsg0+"
+        rt.buf_push_bytes(out, (&pm[0]) as u64, 12)
+        rt.buf_push_dec_u64(out, vec_at[u64](&(*c).poff, k as usize))
+        from = pos + 10 + digits
+    }
+    if b > from {
+        rt.buf_push_bytes(out, base + from, (b - from) as usize)
+    }
 }
 
 fn eq_lit(base: u64, pos: usize, end: usize, lit: u64, n: usize) -> bool {
@@ -3249,7 +3308,7 @@ fn cg_split_fill(c: *mut Cg, k: u32, nf: u32, out: *mut rt.Buf) {
         split_prelude(out)
     }
     if b > a {
-        rt.buf_push_bytes(out, base + a, (b - a) as usize)
+        split_copy(c, out, a, b)
     }
     if last {
         split_tail(c, out)
@@ -3272,6 +3331,8 @@ fn split_tail(c: *mut Cg, out: *mut rt.Buf) {
     var sec: [u8; 9] = ".section "
     var sectext: [u8; 14] = ".section .text"
     var txt: [u8; 5] = ".text"
+    // `.Lpanicmsg<k>` (k > 0) stays local: the references say `.Lpanicmsg0+off`.
+    var pmsg: [u8; 10] = ".Lpanicmsg"
     var in_text: bool = true
     var pos: u64 = (*c).tail_off
     while pos < len {
@@ -3289,7 +3350,9 @@ fn split_tail(c: *mut Cg, out: *mut rt.Buf) {
         } else if n == 5 && eq_lit(base, p, e as usize, (&txt[0]) as u64, 5) {
             in_text = true
         } else if !in_text && n > 3 && rt.ld8(base, p) == 46 as u8
-        && rt.ld8(base, p + 1) == 76 as u8 && rt.ld8(base, p + n - 1) == 58 as u8 {
+        && rt.ld8(base, p + 1) == 76 as u8 && rt.ld8(base, p + n - 1) == 58 as u8
+        && !(eq_lit(base, p, e as usize, (&pmsg[0]) as u64, 10)
+            && !(n == 12 && rt.ld8(base, p + 10) == 48 as u8)) {
             rt.buf_push_bytes(out, (&gl[0]) as u64, 7)
             rt.buf_push_bytes(out, base + pos, n - 1)
             rt.buf_push(out, 10 as u8)
