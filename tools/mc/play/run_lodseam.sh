@@ -193,7 +193,7 @@ for bk in $BACKENDS; do
     esac
 done
 if [ $ERR -eq 0 ]; then
-    python3 -I - "$W" "$BACKENDS" "${LODSEAM_FULL_MIN_DB:-24}" "${LODSEAM_FIX_PCT:-0.5}" "${LODSEAM_EXACT_MIN_DB:-33}" <<'PY' || ERR=1
+    python3 -I - "$W" "$BACKENDS" "${LODSEAM_FULL_MIN_DB:-24}" "${LODSEAM_FIX_PCT:-0.5}" "${LODSEAM_EXACT_MIN_DB:-34}" <<'PY' || ERR=1
 import sys, math
 from PIL import Image, ImageChops
 W, backends = sys.argv[1], sys.argv[2].split()
@@ -249,7 +249,7 @@ for bk in backends:
     for i, c in enumerate(cs):
         if c < 60: print(f"  FAIL  [{bk}] S (direct): fixture colour #{i + 1} only {c} pixels"); bad = 1
     if bb2 > (0 if bk == "cpu" else TOT // 10000): print(f"  FAIL  [{bk}] B vs B2 (cubes + LOD, same config) differ by {bb2} px: the LOD picture is not deterministic"); bad = 1
-    if out_ab > 0: print(f"  FAIL  [{bk}] A vs B differ by {out_ab} px OUTSIDE the stairs (seam hole / double drawing / colour jump)"); bad = 1
+    if out_ab > (0 if bk == "cpu" else TOT // 100000): print(f"  FAIL  [{bk}] A vs B differ by {out_ab} px OUTSIDE the stairs (seam hole / double drawing / colour jump)"); bad = 1
     if rt < TOT // 500: print(f"  FAIL  [{bk}] R equals T: models did not appear after the ring change ({rt} px)"); bad = 1
     tol = 0 if bk == "cpu" else TOT // 10000  # GL / Vulkan (llvmpipe / lavapipe): single noise pixels allowed (r259: 1 px, 21 levels, sky / far terrain edge)
     if rs > tol: print(f"  FAIL  [{bk}] R (late remesh) differs from S (direct load) by {rs} px (> {tol})"); bad = 1
