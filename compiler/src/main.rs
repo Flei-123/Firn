@@ -6,6 +6,7 @@
 //! `as` and `ld` get used EXCLUSIVELY as assembler/linker.
 
 mod abi;
+mod fx;
 mod alias;
 mod archsel;
 mod ast;
@@ -1053,7 +1054,7 @@ fn run(opts: &Options) -> i32 {
         let mut scratch = diag::Diags::new(&root.path.display().to_string(), &root.src);
         impls::log_begin();
         let _ = sema::check(&prog, &mut scratch);
-        let resolved: std::collections::HashMap<ast::ExprId, String> = impls::log_take().into_iter().collect();
+        let resolved: crate::fx::HashMap<ast::ExprId, String> = impls::log_take().into_iter().collect();
         let rest = dargs::apply_late(&mut prog, &mut dg, &dargs_pending, &resolved, false);
         if rest.len() >= dargs_pending.len() {
             dargs::apply_late(&mut prog, &mut dg, &rest, &resolved, true);

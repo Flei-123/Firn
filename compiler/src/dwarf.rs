@@ -38,7 +38,7 @@
 //! value in the debugger is worse than none, so `--no-opt` is the condition
 //! (`ACCEPTANCE.md`, `docs/DEBUGGER.md`).
 
-use std::collections::HashMap;
+use crate::fx::HashMap;
 use std::sync::Mutex;
 
 /// A type, reduced to what DWARF needs. Deliberately its own enum and not

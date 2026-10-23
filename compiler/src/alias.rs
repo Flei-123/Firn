@@ -40,7 +40,7 @@
 //! * An alias cannot have the name of a struct of the same file.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 use crate::ast::TypeExpr;
 use crate::diag::Span;
@@ -156,7 +156,7 @@ pub(crate) fn hook_begin(p: &mut Parser) {
         return;
     }
     // Duplicates and the clash with a struct of the same file are errors.
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut seen: HashMap<String, usize> = HashMap::default();
     for e in found.iter_mut() {
         if seen.insert(e.name.clone(), 0).is_some() {
             p.dg.error(e.span, format!("type alias '{}' is already declared", e.name));

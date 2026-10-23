@@ -23,7 +23,7 @@
 //! unsatisfied is a plain error with line and column.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 use crate::ast::{Expr, ExprKind, FnDecl, StructDecl, TypeExpr};
 use crate::diag::Span;
@@ -110,11 +110,11 @@ struct Registry {
     structs: HashMap<String, StructTemplate>,
     /// Round MODGEN: instantiation names the module renamer replaced by a
     /// qualified one (`Vec__Block` -> `Vec__refdes__Block`) ...
-    superseded: std::collections::HashSet<String>,
+    superseded: crate::fx::HashSet<String>,
     /// ... and names it saw in use unchanged. A superseded name that no file
     /// still uses is not instantiated: its argument names a type that exists
     /// only under the qualified name.
-    kept: std::collections::HashSet<String>,
+    kept: crate::fx::HashSet<String>,
     insts: HashMap<String, Instantiation>,
     order: Vec<String>,
     /// nesting depth while parsing a template
@@ -855,7 +855,7 @@ pub(crate) fn infer_fn_value(name: &str, expected: &TypeExpr, at: Span) -> Resul
         TypeExpr::Fn { params, ret, .. } => (params, ret),
         _ => return Err(format!("'{}' is a generic function: write the type arguments, e.g. '{}[i32]'", name, name)),
     };
-    let mut map: HashMap<String, TypeExpr> = HashMap::new();
+    let mut map: HashMap<String, TypeExpr> = HashMap::default();
     let ok = tpl.decl.params.len() == eparams.len()
         && tpl.decl.params.iter().zip(eparams.iter()).all(|(p, e)| unify_ty(&p.ty, e, &tpl.params, &mut map))
         && match (&tpl.decl.ret, eret) {
@@ -913,7 +913,7 @@ pub(crate) fn infer_call(
             strong.len()
         ));
     }
-    let mut map: HashMap<String, TypeExpr> = HashMap::new();
+    let mut map: HashMap<String, TypeExpr> = HashMap::default();
     for (p, t) in tpl.decl.params.iter().zip(strong.iter()) {
         if let Some(t) = t {
             let mut trial = map.clone();

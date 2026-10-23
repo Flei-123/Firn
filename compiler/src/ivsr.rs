@@ -55,14 +55,14 @@
 //! reduced root.
 
 use crate::fir::{BinOp, FTy, Func, Inst, Op, Term, Val, WrapSatKind};
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 const MAX_NEW_PHIS: usize = 6;
 
 thread_local! {
     /// Functions this pass has changed (by name): only there can a dead
     /// induction cycle or a twin phi of its own making stand.
-    static TOUCHED: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::new());
+    static TOUCHED: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::default());
 }
 
 /// A loop invariant expression, built from values that dominate the
@@ -214,7 +214,7 @@ pub fn run(f: &mut Func) -> usize {
 fn def_maps(f: &Func) -> (Vec<usize>, HashMap<Val, i128>) {
     let nv = f.val_types.len();
     let mut defb: Vec<usize> = vec![usize::MAX; nv];
-    let mut consts: HashMap<Val, i128> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
     for (bi, b) in f.blocks.iter().enumerate() {
         for i in &b.insts {
             if let Some(d) = i.dst {
@@ -258,10 +258,10 @@ fn reduce_loop(
     };
 
     // 1. basic induction variables: header phi, back edge value phi +/- c
-    let mut ivs: HashMap<Val, (Val, Inv, Val)> = HashMap::new(); // phi -> (init, step, next)
+    let mut ivs: HashMap<Val, (Val, Inv, Val)> = HashMap::default(); // phi -> (init, step, next)
     let lat_id = latch as u32;
     let pre_id = pre as u32;
-    let mut def_inst: HashMap<Val, (usize, usize)> = HashMap::new();
+    let mut def_inst: HashMap<Val, (usize, usize)> = HashMap::default();
     for &bi in body.iter() {
         for (ii, i) in f.blocks[bi].insts.iter().enumerate() {
             if let Some(d) = i.dst {
@@ -319,7 +319,7 @@ fn reduce_loop(
 
     // 2. affine values, in dominance order (block order within the body is
     // not dominance order in general, so iterate to a fixpoint)
-    let mut aff: HashMap<Val, Aff> = HashMap::new();
+    let mut aff: HashMap<Val, Aff> = HashMap::default();
     for (&p, _) in ivs.iter() {
         aff.insert(p, Aff { iv: p, a: Inv::C(1), b: Inv::C(0), base: None, cost: 0 });
     }
@@ -462,8 +462,8 @@ fn reduce_loop(
         return 0;
     }
     // 3. roots: affine, with a multiplication, used by something non-affine
-    let mut used_outside: HashSet<Val> = HashSet::new();
-    let mut no_root: HashSet<Val> = HashSet::new();
+    let mut used_outside: HashSet<Val> = HashSet::default();
+    let mut no_root: HashSet<Val> = HashSet::default();
     let mut buf = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         for i in &b.insts {
@@ -532,7 +532,7 @@ fn reduce_loop(
     // 4. rewrite
     let trace = std::env::var_os("FIRN_IVSR_TRACE").is_some();
     let mut made: Vec<(String, Val)> = Vec::new();
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     let pre_loc = f.blocks[pre].insts.last().map(|i| i.loc).unwrap_or(crate::fir::Loc::NONE);
     let mut new_pre: Vec<Inst> = Vec::new();
     let mut new_latch: Vec<Inst> = Vec::new();
@@ -716,7 +716,7 @@ fn remove_dead_cycles(f: &mut Func) -> usize {
         return 0;
     }
     // step value -> the phi it steps
-    let mut step_of: HashMap<Val, Val> = HashMap::new();
+    let mut step_of: HashMap<Val, Val> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let Some(d) = i.dst {
@@ -764,7 +764,7 @@ fn remove_dead_cycles(f: &mut Func) -> usize {
             _ => {}
         }
     }
-    let mut dead: HashSet<Val> = HashSet::new();
+    let mut dead: HashSet<Val> = HashSet::default();
     for b in &f.blocks {
         for i in &b.insts[..b.phi_count()] {
             if let (Op::Phi { incoming }, Some(p)) = (&i.op, i.dst) {
@@ -796,7 +796,7 @@ fn remove_dead_cycles(f: &mut Func) -> usize {
 /// and its copy again after. The second twin is replaced by the first.
 fn merge_twins(f: &mut Func) -> usize {
     // only the back edge values of phis are of interest
-    let mut want: HashSet<Val> = HashSet::new();
+    let mut want: HashSet<Val> = HashSet::default();
     for b in &f.blocks {
         for i in &b.insts[..b.phi_count()] {
             if let Op::Phi { incoming } = &i.op {
@@ -806,7 +806,7 @@ fn merge_twins(f: &mut Func) -> usize {
             }
         }
     }
-    let mut def: HashMap<Val, Op> = HashMap::new();
+    let mut def: HashMap<Val, Op> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let Some(d) = i.dst {
@@ -829,7 +829,7 @@ fn merge_twins(f: &mut Func) -> usize {
             _ => None,
         }
     };
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     for b in &f.blocks {
         // (entries with the latch value replaced by its step) -> phi
         let mut seen: Vec<(Vec<(u32, Val, Option<(u8, Val)>)>, FTy, Val)> = Vec::new();

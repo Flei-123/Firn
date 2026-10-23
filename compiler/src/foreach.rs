@@ -369,12 +369,12 @@ const SLICE: &str = "slice";
 thread_local! {
     /// Element type per `Vec__..` struct, noted by the type check for the
     /// lowering of `v[a:b]` (the lowering cannot resolve type expressions).
-    static SLICE_ELEM: std::cell::RefCell<std::collections::HashMap<String, Type>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static SLICE_ELEM: std::cell::RefCell<crate::fx::HashMap<String, Type>> =
+        std::cell::RefCell::new(crate::fx::HashMap::default());
     /// r738: per `Vec__..` struct: does the element type hold GC pointers, and
     /// the root raster (`sizeof::type_raster`) -- for the copies of the slice sugar.
-    static SLICE_GC: std::cell::RefCell<std::collections::HashMap<String, (bool, u64)>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static SLICE_GC: std::cell::RefCell<crate::fx::HashMap<String, (bool, u64)>> =
+        std::cell::RefCell::new(crate::fx::HashMap::default());
 }
 
 pub(crate) fn slice_reset() {
@@ -415,7 +415,7 @@ pub(crate) enum VecSugar {
     AssignStep,
 }
 
-pub(crate) fn vec_sugar(tcx: &crate::types::TypeCtx, fns: &std::collections::HashMap<String, crate::sema::FnSig>, name: &str, recv: &Type, nargs: usize) -> Option<VecSugar> {
+pub(crate) fn vec_sugar(tcx: &crate::types::TypeCtx, fns: &crate::fx::HashMap<String, crate::sema::FnSig>, name: &str, recv: &Type, nargs: usize) -> Option<VecSugar> {
     let m = crate::impls::method_name(name)?;
     let k = match (m, nargs) {
         (crate::parser::SLICE_STEP, 5) => VecSugar::Step,
@@ -553,7 +553,7 @@ pub(crate) fn lower_vec_sugar(
 /// result is a non-owning VIEW (`Vec[T]` with `cap = 0`, same element
 /// storage, Python bound rules: negative from the end, clamped). `str` and
 /// `Span` keep their own `slice` method (strtype / lib).
-pub(crate) fn is_vec_slice(tcx: &crate::types::TypeCtx, fns: &std::collections::HashMap<String, crate::sema::FnSig>, name: &str, recv: &Type, nargs: usize) -> bool {
+pub(crate) fn is_vec_slice(tcx: &crate::types::TypeCtx, fns: &crate::fx::HashMap<String, crate::sema::FnSig>, name: &str, recv: &Type, nargs: usize) -> bool {
     if crate::impls::method_name(name) != Some(SLICE) || nargs != 3 {
         return false;
     }

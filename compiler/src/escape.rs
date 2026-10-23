@@ -86,7 +86,7 @@
 //! order, or a program with two escaping locals would be blamed for
 //! different ones.
 
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 use crate::ast::{BinOp, Block, Expr, ExprKind, FnDecl, Program, Stmt, UnOp};
 use crate::diag::{Diag, Span};
@@ -266,7 +266,7 @@ fn reach_enabled() -> bool {
 fn reachable(prog: &Program) -> Option<Vec<bool>> {
     let main = prog.funcs.iter().find(|f| f.name == "main")?;
     let file = main.span.file;
-    let mut by_name: HashMap<&str, usize> = HashMap::with_capacity(prog.funcs.len());
+    let mut by_name: HashMap<&str, usize> = HashMap::with_capacity_and_hasher(prog.funcs.len(), Default::default());
     for (i, f) in prog.funcs.iter().enumerate() {
         by_name.entry(f.name.as_str()).or_insert(i);
     }
@@ -302,7 +302,7 @@ fn collect_findings(prog: &Program, tys: &[Type]) -> Vec<(Span, String, String, 
     let reach: Option<Vec<bool>> = if reach_enabled() { reachable(prog) } else { None };
     let skip = |i: usize| reach.as_ref().map(|r| !r[i]).unwrap_or(false);
     // --- phase 1: the summaries, to a fixed point ---------------------------
-    let mut sums: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut sums: HashMap<String, Vec<u64>> = HashMap::default();
     for f in &prog.funcs {
         // Declared twice is an error of the type check; the first entry wins
         // here and the run stays deterministic.

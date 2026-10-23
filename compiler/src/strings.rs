@@ -699,7 +699,7 @@ pub const STATIC_ATOMS: &[&str] = &[
 #[derive(Clone, Debug)]
 pub struct AtomTable {
     names: Vec<Vec<u8>>,
-    map: std::collections::HashMap<Vec<u8>, u32>,
+    map: crate::fx::HashMap<Vec<u8>, u32>,
 }
 
 impl Default for AtomTable {
@@ -710,7 +710,7 @@ impl Default for AtomTable {
 
 impl AtomTable {
     pub fn new() -> AtomTable {
-        let mut t = AtomTable { names: Vec::new(), map: std::collections::HashMap::new() };
+        let mut t = AtomTable { names: Vec::new(), map: crate::fx::HashMap::default() };
         for s in STATIC_ATOMS {
             t.intern(s.as_bytes());
         }

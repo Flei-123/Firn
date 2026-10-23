@@ -14,7 +14,7 @@
 //! values are skipped. Switch: `--no-pass=storemerge`.
 
 use crate::fir::{FTy, Func, Inst, Op, Val};
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 struct St {
     /// index of the store instruction in the block
@@ -29,8 +29,8 @@ pub fn run(f: &mut Func) -> usize {
     if f.constant_time || !f.secret.is_empty() {
         return 0;
     }
-    let mut consts: HashMap<Val, i128> = HashMap::new();
-    let mut allocas: HashMap<Val, u64> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
+    let mut allocas: HashMap<Val, u64> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             match (&i.dst, &i.op) {
@@ -48,7 +48,7 @@ pub fn run(f: &mut Func) -> usize {
         return 0;
     }
     // address value -> (alloca, offset)
-    let mut addr_of: HashMap<Val, (Val, u64)> = HashMap::new();
+    let mut addr_of: HashMap<Val, (Val, u64)> = HashMap::default();
     for (&a, _) in allocas.iter() {
         addr_of.insert(a, (a, 0));
     }
@@ -166,8 +166,8 @@ pub fn run(f: &mut Func) -> usize {
             continue;
         }
         // apply in one rebuild pass (indices stay valid)
-        let mut replace: HashMap<usize, (Inst, Inst)> = HashMap::new();
-        let mut removed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut replace: HashMap<usize, (Inst, Inst)> = HashMap::default();
+        let mut removed: crate::fx::HashSet<usize> = crate::fx::HashSet::default();
         for p in plans {
             let ty = match p.width {
                 8 => FTy::U64,

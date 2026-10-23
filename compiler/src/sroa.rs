@@ -48,15 +48,16 @@
 //! Can be switched off with `--no-pass=sroa` or `FIRN_NO_SROA=1`.
 
 use crate::fir::{Func, Op, Term, Val};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+use crate::fx::{HashMap, HashSet};
 
 pub(crate) fn split(f: &mut Func) -> usize {
     if std::env::var_os("FIRN_NO_SROA").is_some() {
         return 0;
     }
     // Constants (for the offsets).
-    let mut consts: HashMap<Val, i128> = HashMap::new();
-    let mut cells: HashMap<Val, (u64, u64)> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
+    let mut cells: HashMap<Val, (u64, u64)> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             match (&i.op, i.dst) {
@@ -74,8 +75,8 @@ pub(crate) fn split(f: &mut Func) -> usize {
         return 0;
     }
     // ptradd-Ergebnis -> (Zelle, Versatz)
-    let mut feldzeiger: HashMap<Val, (Val, i128)> = HashMap::new();
-    let mut bad: HashSet<Val> = HashSet::new();
+    let mut feldzeiger: HashMap<Val, (Val, i128)> = HashMap::default();
+    let mut bad: HashSet<Val> = HashSet::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Op::PtrAdd { base, off }, Some(d)) = (&i.op, i.dst) {
@@ -93,7 +94,7 @@ pub(crate) fn split(f: &mut Func) -> usize {
         }
     }
     // Cell -> offset -> type; every other use makes the cell bad.
-    let mut fields: HashMap<Val, BTreeMap<i128, crate::fir::FTy>> = HashMap::new();
+    let mut fields: HashMap<Val, BTreeMap<i128, crate::fir::FTy>> = HashMap::default();
     let root = |v: Val| -> Option<(Val, i128)> {
         if cells.contains_key(&v) {
             Some((v, 0))
@@ -190,7 +191,7 @@ pub(crate) fn split(f: &mut Func) -> usize {
     }
     // Fixed order (fixed point: two runs must give the same text).
     candidates.sort_unstable();
-    let mut neu: HashMap<(Val, i128), Val> = HashMap::new();
+    let mut neu: HashMap<(Val, i128), Val> = HashMap::default();
     for z in &candidates {
         let (_, align) = cells[z];
         for (&k, t) in fields[z].iter() {

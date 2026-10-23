@@ -4,7 +4,7 @@
 //! Struct layout: declaration order, natural alignment, no reordering of
 //! the fields. The size is rounded up to the alignment of the struct.
 
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {

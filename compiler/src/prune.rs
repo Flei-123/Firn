@@ -20,7 +20,7 @@
 //! Only for hosted x86-64 Linux executables.
 
 use crate::fir::{Module, Op};
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 pub fn enabled() -> bool {
     std::env::var("FIRN_PRUNE_FIR").map(|v| v == "1").unwrap_or(false)
@@ -103,8 +103,8 @@ pub fn applicable(only_object: bool, exe: bool) -> bool {
 /// Removes the unreachable functions; returns how many were dropped.
 pub fn prune(m: &mut Module) -> usize {
     let n = m.funcs.len();
-    let mut by_name: HashMap<&str, usize> = HashMap::with_capacity(n);
-    let mut by_label: HashMap<String, usize> = HashMap::with_capacity(n);
+    let mut by_name: HashMap<&str, usize> = HashMap::with_capacity_and_hasher(n, Default::default());
+    let mut by_label: HashMap<String, usize> = HashMap::with_capacity_and_hasher(n, Default::default());
     for (i, f) in m.funcs.iter().enumerate() {
         by_name.insert(f.name.as_str(), i);
         by_label.insert(crate::codegen_x86::label(&f.name), i);
@@ -140,7 +140,7 @@ pub fn prune(m: &mut Module) -> usize {
         }
     }
     let dropped = keep.iter().filter(|k| !**k).count();
-    let mut live_refs: HashSet<String> = HashSet::new();
+    let mut live_refs: HashSet<String> = HashSet::default();
     let mut idx = 0usize;
     if dropped > 0 {
         m.funcs.retain(|_| {

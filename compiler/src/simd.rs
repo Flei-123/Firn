@@ -1498,7 +1498,7 @@ mod tests {
 
     #[test]
     fn every_name_is_unique() {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::fx::HashSet::default();
         for e in TABLE {
             assert!(seen.insert(e.name), "duplicate: {}", e.name);
         }

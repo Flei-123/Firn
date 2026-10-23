@@ -476,7 +476,7 @@ fn ex_expr(e: &Expr, dg: &mut Diags) {
 // (resolved through the receiver type) and the bodies of methods, generic
 // instances and closures. The parameter kinds come from `Param::refk`.
 
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 use crate::sema::Checker;
 
@@ -562,7 +562,7 @@ fn ref_name_in<'a>(a: &'a Expr, refs: &[String]) -> Option<&'a str> {
 /// * a reference parameter is never handed to a plain pointer parameter:
 ///   there the callee could keep it.
 pub(crate) fn hook_calls(ck: &mut Checker, prog: &Program) {
-    let mut sigs: HashMap<&str, &[Param]> = HashMap::new();
+    let mut sigs: HashMap<&str, &[Param]> = HashMap::default();
     for f in &prog.funcs {
         sigs.entry(f.name.as_str()).or_insert(f.params.as_slice());
     }

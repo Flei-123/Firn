@@ -39,7 +39,7 @@ use crate::parser::Parser;
 use crate::sema::Checker;
 use crate::types::Type;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 /// Reserved identifier prefix. Firn identifiers cannot contain a `$`, so a
 /// collision with user code is ruled out.
@@ -65,7 +65,7 @@ pub(crate) fn prefix_of(name: &str) -> Option<&'static str> {
 
 thread_local! {
     /// Identifier -> size. Filled by the type checker, read by lowering.
-    static VALUES: RefCell<HashMap<String, i128>> = RefCell::new(HashMap::new());
+    static VALUES: RefCell<HashMap<String, i128>> = RefCell::new(HashMap::default());
     /// Round TUPLES: the type arguments that are no plain name (`(i32, i32)`,
     /// `*mut u8`) which `size_of[T]()` met inside a template. The call name
     /// can only carry a name, so it carries `#<index>` into this list.

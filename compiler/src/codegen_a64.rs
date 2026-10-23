@@ -77,7 +77,7 @@ use crate::codegen_x86::{block_label, label, Emitter};
 use crate::fir::{BinOp, Block, CmpOp, FTy, Func, Inst, Module, Op, Term, UnOp, Val};
 use crate::regalloc_a64::{self, RaA64};
 use crate::syscalls;
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 /// `--shared` (aarch64 .so): `tpidr_el0` belongs to the HOST (glibc TLS), so the Firn runtime cannot keep its
 /// per-thread block pointer there. Instead the library keeps two words:
@@ -259,7 +259,7 @@ fn layout(f: &Func) -> Frame {
         *s = cursor;
     }
     let mut alloca_off: Vec<Option<u64>> = vec![None; n];
-    let mut consts: HashMap<Val, i128> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
     let mut outgoing = 0u64;
     for b in &f.blocks {
         if b.id != f.entry() && b.insts.iter().any(|i| matches!(i.op, Op::Alloca { .. })) {
@@ -278,7 +278,7 @@ fn layout(f: &Func) -> Frame {
     // ROUND 92: only a value with EXACTLY ONE definition is the constant its
     // `const` instruction names. After `phi.rs` a value can be written from
     // several blocks -- see the long note in `regalloc.rs::immediate_consts`.
-    let mut defs: HashMap<Val, u32> = HashMap::new();
+    let mut defs: HashMap<Val, u32> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let Some(d) = i.dst {
@@ -2706,7 +2706,7 @@ fn cold_checks(text: &str) -> String {
     let mut skip = vec![false; n];
     // block start -> (end exclusive) for blocks to move; parked[after_idx] = blocks to emit after that line
     let mut pending: Vec<(usize, usize)> = Vec::new();
-    let mut parked: std::collections::HashMap<usize, Vec<(usize, usize)>> = std::collections::HashMap::new();
+    let mut parked: crate::fx::HashMap<usize, Vec<(usize, usize)>> = crate::fx::HashMap::default();
     let mut drop_b = vec![false; n];
     let is_term = |l: &str| {
         let t = l.trim_start();

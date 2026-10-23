@@ -25,7 +25,7 @@
 
 use crate::ast::*;
 use crate::diag::{did_you_mean, nearest, Diags, Span};
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 #[derive(Clone)]
 struct Sig {
@@ -54,7 +54,7 @@ struct Cx<'a> {
 /// `apply_late` finishes those once the type checker has told which method
 /// each one reaches.
 pub fn apply(prog: &mut Program, dg: &mut Diags) -> Vec<ExprId> {
-    run(prog, dg, None, HashSet::new())
+    run(prog, dg, None, HashSet::default())
 }
 
 /// r705: second run for the calls `apply` left. `resolved` maps the receiver
@@ -73,8 +73,8 @@ thread_local! {
 }
 
 fn run(prog: &mut Program, dg: &mut Diags, late: Option<&HashMap<ExprId, String>>, late_set: HashSet<ExprId>) -> Vec<ExprId> {
-    let mut sigs: HashMap<String, Sig> = HashMap::new();
-    let mut msigs: HashMap<String, Vec<Sig>> = HashMap::new();
+    let mut sigs: HashMap<String, Sig> = HashMap::default();
+    let mut msigs: HashMap<String, Vec<Sig>> = HashMap::default();
     let consts: HashSet<String> = prog.consts.iter().map(|c| c.name.clone()).collect();
     for f in &prog.funcs {
         for p in &f.params {

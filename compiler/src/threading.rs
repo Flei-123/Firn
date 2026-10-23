@@ -81,7 +81,7 @@
 //! Switchable off with `--no-pass=thread-bool`.
 
 use crate::fir::{BlockId, FTy, Func, Op, Term, Val};
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 /// Does this instruction change memory that we cannot survey?
 fn disturbs_memory(op: &Op) -> bool {
@@ -124,8 +124,8 @@ struct Fork {
 /// cell that stands in a fork block is left in memory for exactly one more
 /// round; afterwards the fork block is unreachable, this list is empty, and
 /// the cell is promoted like any other.
-pub(crate) fn fork_cells(f: &Func) -> std::collections::HashSet<Val> {
-    let mut out = std::collections::HashSet::new();
+pub(crate) fn fork_cells(f: &Func) -> crate::fx::HashSet<Val> {
+    let mut out = crate::fx::HashSet::default();
     if f.constant_time || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return out;
     }
@@ -302,7 +302,7 @@ pub(crate) fn thread_bool_phis(f: &mut Func) -> usize {
     // phi is read by NOTHING but the `brcond` of its own block. That leaves
     // the case the pass was written for -- the short circuit of `&&` / `||`,
     // whose phi is read exactly once -- untouched.
-    let mut foreign: std::collections::HashSet<Val> = std::collections::HashSet::new();
+    let mut foreign: crate::fx::HashSet<Val> = crate::fx::HashSet::default();
     {
         let mut buf: Vec<Val> = Vec::new();
         for b in f.blocks.iter() {
@@ -499,7 +499,7 @@ pub(crate) fn thread_bool_cells(f: &mut Func) -> usize {
     }
 
     // 1. Collect the switch blocks.
-    let mut forks: HashMap<BlockId, Fork> = HashMap::new();
+    let mut forks: HashMap<BlockId, Fork> = HashMap::default();
     for b in &f.blocks {
         if b.id == 0 || b.insts.len() != 1 {
             continue; // bb0 carries the allocas
@@ -567,9 +567,9 @@ pub(crate) fn thread_bool_cells(f: &mut Func) -> usize {
 }
 
 /// `alloca`s whose pointer does NOT escape (address of `load`/`store` only).
-fn simple_cells(f: &Func) -> std::collections::HashSet<Val> {
-    use std::collections::HashSet;
-    let mut cells: HashSet<Val> = HashSet::new();
+fn simple_cells(f: &Func) -> crate::fx::HashSet<Val> {
+    use crate::fx::HashSet;
+    let mut cells: HashSet<Val> = HashSet::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Alloca { .. }) = (i.dst, &i.op) {
@@ -580,7 +580,7 @@ fn simple_cells(f: &Func) -> std::collections::HashSet<Val> {
     if cells.is_empty() {
         return cells;
     }
-    let mut out: HashSet<Val> = HashSet::new();
+    let mut out: HashSet<Val> = HashSet::default();
     let mut buf = Vec::new();
     for b in &f.blocks {
         for i in &b.insts {

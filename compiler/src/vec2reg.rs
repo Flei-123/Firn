@@ -47,7 +47,7 @@
 
 use crate::fir::{FTy, Func, Inst, Op, Term, Val};
 use crate::simd::SimdKind;
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 #[derive(Clone, Copy, PartialEq)]
 enum St {
@@ -107,7 +107,7 @@ pub fn run(f: &mut Func) -> usize {
 /// the narrowing keeps exactly that half. Five instructions per sample in
 /// `synth` (`pshufd`, `movd`, two moves, `movsxd`) become one.
 fn narrow_lanes(f: &mut Func) -> usize {
-    let mut def: HashMap<Val, (SimdKind, Val, u8)> = HashMap::new();
+    let mut def: HashMap<Val, (SimdKind, Val, u8)> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Op::Simd { kind, args, imm }, Some(d)) = (&i.op, i.dst) {
@@ -146,7 +146,7 @@ fn narrow_lanes(f: &mut Func) -> usize {
 }
 
 fn const_of(f: &Func) -> HashMap<Val, i128> {
-    let mut m = HashMap::new();
+    let mut m = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Op::Const(k), Some(d)) = (&i.op, i.dst) {
@@ -159,7 +159,7 @@ fn const_of(f: &Func) -> HashMap<Val, i128> {
 
 fn promote_cell(f: &mut Func, cell: Val, consts: &HashMap<Val, i128>) -> bool {
     // 1. the addresses: the cell itself and `ptradd cell, const`
-    let mut lane_of: HashMap<Val, u8> = HashMap::new();
+    let mut lane_of: HashMap<Val, u8> = HashMap::default();
     lane_of.insert(cell, 0);
     for b in &f.blocks {
         for i in &b.insts {
@@ -277,7 +277,7 @@ fn promote_cell(f: &mut Func, cell: Val, consts: &HashMap<Val, i128>) -> bool {
     // 4. the rewrite
     let old = std::mem::take(&mut f.blocks[bi].insts);
     let mut out: Vec<Inst> = Vec::with_capacity(old.len());
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     let mut st = St::Unknown;
     let mut ai = 0usize;
     for (k, inst) in old.into_iter().enumerate() {

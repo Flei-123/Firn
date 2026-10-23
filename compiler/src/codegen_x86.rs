@@ -672,8 +672,8 @@ fn asm_symbols(text: &str, mut each: impl FnMut(&str)) {
 }
 
 fn prune_unreachable(m: &Module, out: &str, ranges: &[(usize, usize)]) -> String {
-    use std::collections::HashMap;
-    let mut by_sym: HashMap<String, usize> = HashMap::with_capacity(m.funcs.len());
+    use crate::fx::HashMap;
+    let mut by_sym: HashMap<String, usize> = HashMap::with_capacity_and_hasher(m.funcs.len(), Default::default());
     for (i, f) in m.funcs.iter().enumerate() {
         by_sym.insert(label(&f.name), i);
     }

@@ -32,7 +32,7 @@
 //!  * at most `MAX_INLINES` embeddings per module.
 
 use crate::fir::{FTy, Func, Inst, Module, Op, Term, Val};
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 const MAX_CALLEE_INSTS: usize = 40;
 const MAX_CALLEE_BLOCKS: usize = 8;
@@ -390,11 +390,11 @@ fn inline_one_pooled(
     } else {
         None
     };
-    let mut valmap: HashMap<Val, Val> = HashMap::new();
+    let mut valmap: HashMap<Val, Val> = HashMap::default();
     for (k, a) in args.iter().enumerate() {
         valmap.insert(k as Val, *a);
     }
-    let mut used: HashMap<(u64, u64), usize> = HashMap::new();
+    let mut used: HashMap<(u64, u64), usize> = HashMap::default();
     for b in &callee.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Alloca { size, align }) = (i.dst, &i.op) {
@@ -441,7 +441,7 @@ fn inline_one_pooled(
     let mv = |v: Val| -> Val { valmap.get(&v).copied().unwrap_or(v) };
 
     // 3. Create the blocks of the body + the continuation block.
-    let mut blockmap: HashMap<u32, u32> = HashMap::new();
+    let mut blockmap: HashMap<u32, u32> = HashMap::default();
     let mut new_ids: Vec<u32> = Vec::with_capacity(callee.blocks.len() + 1);
     for b in &callee.blocks {
         let nb = f.add_block();
@@ -690,7 +690,7 @@ pub(crate) fn reorder_blocks(f: &mut Func, after: usize, new_ids: &[u32]) {
     }
     // The desired order: everything up to and including `after`, then the
     // new blocks, then the rest.
-    let new_set: std::collections::HashSet<u32> = new_ids.iter().copied().collect();
+    let new_set: crate::fx::HashSet<u32> = new_ids.iter().copied().collect();
     let mut order: Vec<u32> = Vec::with_capacity(n);
     for i in 0..=after {
         let id = i as u32;
@@ -899,7 +899,7 @@ fn inline_flagged_leaves_x(
                 continue;
             }
         }
-        let mut pool: SlotPool = HashMap::new();
+        let mut pool: SlotPool = HashMap::default();
         // Resume the scan where the last embedding happened: the blocks
         // before it hold no trivial call any more.
         let mut start_b = 0usize;
@@ -985,7 +985,7 @@ impl CallGraph {
                 v
             })
             .collect();
-        CallGraph { succ, memo: HashMap::new(), mark: vec![0; m.funcs.len()], epoch: 0 }
+        CallGraph { succ, memo: HashMap::default(), mark: vec![0; m.funcs.len()], epoch: 0 }
     }
 
     /// Can `from` reach `to` through calls (`from == to` counts)?
@@ -1096,8 +1096,8 @@ fn inline_by_size_with(
     let mut grown = 0usize;
     let mut n = 0usize;
     let mut per_tier: Vec<usize> = Vec::new();
-    let mut kept: HashMap<String, Func> = HashMap::new();
-    let mut small: HashMap<String, Func> = HashMap::new();
+    let mut kept: HashMap<String, Func> = HashMap::default();
+    let mut small: HashMap<String, Func> = HashMap::default();
     // One tier per callee size, from just above the trivial leaves up: when
     // the growth guard stops the phase, it stops at a size boundary.
     let tiers: Vec<usize> = (MAX_TRIVIAL_INSTS + 1..=MAX_CALLEE_INSTS).collect();

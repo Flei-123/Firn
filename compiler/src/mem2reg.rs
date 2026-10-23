@@ -29,7 +29,7 @@
 //! branch.
 
 use crate::fir::{BinOp, FTy, Func, Inst, Op, Term, Val};
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 /// Instructions that the optimizer treats as untouchable (SPEC §9 and
 /// — since round 52 — SPEC §2: inline assembler and MMIO are `volatile`).
@@ -52,17 +52,173 @@ pub(crate) fn preds(f: &Func) -> Vec<Vec<usize>> {
     let n = f.blocks.len();
     let mut p = vec![Vec::new(); n];
     for (i, b) in f.blocks.iter().enumerate() {
-        for s in b.term.successors() {
+        // blocks are visited in ascending order, so `i` is already in `p[s]`
+        // exactly when it is the last entry
+        b.term.for_each_succ(|s| {
             let s = s as usize;
-            if s < n && !p[s].contains(&i) {
+            if s < n && p[s].last() != Some(&i) {
                 p[s].push(i);
             }
-        }
+        });
     }
     p
 }
 
-/// `dom[b][d] == true`  <=>  block `d` dominates block `b`.
+/// Dominator sets as a flat bit matrix: `has(b, d)` <=> block `d` dominates block `b`.
+/// 64 blocks per word; replaces the former `Vec<Vec<bool>>` (n*n octets).
+pub(crate) struct Dom {
+    n: usize,
+    w: usize,
+    bits: Vec<u64>,
+}
+
+impl Dom {
+    pub(crate) fn empty() -> Dom {
+        Dom { n: 0, w: 0, bits: Vec::new() }
+    }
+    /// Number of blocks covered (0 when empty).
+    pub(crate) fn len(&self) -> usize {
+        self.n
+    }
+    /// Does block `d` dominate block `b`? Panics when out of range, like the old matrix did.
+    #[inline]
+    pub(crate) fn has(&self, b: usize, d: usize) -> bool {
+        assert!(b < self.n && d < self.n);
+        self.bits[b * self.w + (d >> 6)] & (1u64 << (d & 63)) != 0
+    }
+}
+
+/// `has(b, d)`  <=>  block `d` dominates block `b`.
+///
+/// Fast path (every block reachable from the entry): Cooper/Harvey/Kennedy
+/// `idoms`, then `dom(b) = dom(idom(b)) + {b}` in reverse postorder. Exactly the
+/// maximal fixed point of the data flow. With unreachable blocks the old
+/// iterative data flow is used instead (its answer for them is different
+/// and callers have always seen that answer).
+pub(crate) fn dominators(f: &Func) -> Dom {
+    let n = f.blocks.len();
+    if n == 0 {
+        return Dom::empty();
+    }
+    // successor lists in CSR form (no per-block allocation)
+    let mut sidx: Vec<u32> = Vec::with_capacity(n + 1);
+    let mut sadj: Vec<u32> = Vec::with_capacity(n * 2);
+    for b in f.blocks.iter() {
+        sidx.push(sadj.len() as u32);
+        b.term.for_each_succ(|s| {
+            if (s as usize) < n {
+                sadj.push(s);
+            }
+        });
+    }
+    sidx.push(sadj.len() as u32);
+    // iterative depth first postorder from the entry
+    let mut post: Vec<u32> = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    let mut stack: Vec<(u32, u32)> = Vec::with_capacity(64);
+    seen[0] = true;
+    stack.push((0, sidx[0]));
+    while let Some((b, k)) = stack.pop() {
+        if k < sidx[b as usize + 1] {
+            stack.push((b, k + 1));
+            let s = sadj[k as usize];
+            if !seen[s as usize] {
+                seen[s as usize] = true;
+                stack.push((s, sidx[s as usize]));
+            }
+        } else {
+            post.push(b);
+        }
+    }
+    if post.len() != n {
+        return dominators_iter(f); // unreachable blocks: keep the old answer for them
+    }
+    let mut rpo_num = vec![0u32; n];
+    for (i, &b) in post.iter().rev().enumerate() {
+        rpo_num[b as usize] = i as u32;
+    }
+    // predecessor lists in CSR form
+    let mut pidx = vec![0u32; n + 2];
+    for &s in sadj.iter() {
+        pidx[s as usize + 2] += 1;
+    }
+    for i in 2..n + 2 {
+        pidx[i] += pidx[i - 1];
+    }
+    let mut padj = vec![0u32; sadj.len()];
+    for b in 0..n {
+        for k in sidx[b]..sidx[b + 1] {
+            let s = sadj[k as usize] as usize;
+            padj[pidx[s + 1] as usize] = b as u32;
+            pidx[s + 1] += 1;
+        }
+    }
+    // Cooper/Harvey/Kennedy
+    let none = u32::MAX;
+    let mut idom = vec![none; n];
+    idom[0] = 0;
+    let mut rounds = 0;
+    loop {
+        rounds += 1;
+        let mut changed = false;
+        for &b in post.iter().rev().skip(1) {
+            let b = b as usize;
+            let mut new_idom = none;
+            for k in pidx[b]..pidx[b + 1] {
+                let p = padj[k as usize];
+                if idom[p as usize] == none {
+                    continue;
+                }
+                new_idom = if new_idom == none {
+                    p
+                } else {
+                    let (mut x, mut y) = (p, new_idom);
+                    while x != y {
+                        while rpo_num[x as usize] > rpo_num[y as usize] {
+                            x = idom[x as usize];
+                        }
+                        while rpo_num[y as usize] > rpo_num[x as usize] {
+                            y = idom[y as usize];
+                        }
+                    }
+                    x
+                };
+            }
+            if new_idom != none && idom[b] != new_idom {
+                idom[b] = new_idom;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        if rounds > n + 4 {
+            return dominators_iter(f); // cannot happen
+        }
+    }
+    let w = n.div_ceil(64);
+    let mut bits = vec![0u64; n * w];
+    bits[0] = 1;
+    for &b in post.iter().rev().skip(1) {
+        let b = b as usize;
+        let id = idom[b] as usize;
+        if id >= n {
+            return dominators_iter(f); // cannot happen
+        }
+        let (lo, hi) = (id.min(b), id.max(b));
+        let (head, tail) = bits.split_at_mut(hi * w);
+        if id < b {
+            tail[..w].copy_from_slice(&head[lo * w..lo * w + w]);
+        } else {
+            let src = &tail[..w];
+            head[lo * w..lo * w + w].copy_from_slice(src);
+        }
+        bits[b * w + (b >> 6)] |= 1u64 << (b & 63);
+    }
+    Dom { n, w, bits }
+}
+
+/// `dom.has(b, d) == true`  <=>  block `d` dominates block `b`.
 ///
 /// ROUND 87 -- THE SAME SET, IN WORDS INSTEAD OF OCTETS.
 ///
@@ -81,10 +237,10 @@ pub(crate) fn preds(f: &Func) -> Vec<Vec<usize>> {
 /// The `Vec<Vec<bool>>` at the end stays, because that is what the callers
 /// read; building it costs one pass over the result, which is the size of
 /// the result anyway.
-pub(crate) fn dominators(f: &Func) -> Vec<Vec<bool>> {
+fn dominators_iter(f: &Func) -> Dom {
     let n = f.blocks.len();
     if n == 0 {
-        return Vec::new();
+        return Dom { n: 0, w: 0, bits: Vec::new() };
     }
     let pr = preds(f);
     let w = n.div_ceil(64);
@@ -129,13 +285,7 @@ pub(crate) fn dominators(f: &Func) -> Vec<Vec<bool>> {
             break;
         }
     }
-    let mut out = vec![vec![false; n]; n];
-    for b in 0..n {
-        for d in 0..n {
-            out[b][d] = dom[b * w + (d >> 6)] & (1u64 << (d & 63)) != 0;
-        }
-    }
-    out
+    Dom { n, w, bits: dom }
 }
 
 /// Is the value `v` untouchable (secret) in `f`?
@@ -188,7 +338,7 @@ struct CellUse {
 }
 
 fn scan_cells(f: &Func) -> HashMap<Val, CellUse> {
-    let mut cells: HashMap<Val, CellUse> = HashMap::new();
+    let mut cells: HashMap<Val, CellUse> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Alloca { .. }) = (i.dst, &i.op) {
@@ -259,7 +409,7 @@ pub(crate) fn promote_single_store(f: &mut Func) -> usize {
         return 0;
     }
     let dom = dominators(f);
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     for (cell, u) in cells.iter() {
         if !u.simple || u.stores.len() != 1 || u.loads.is_empty() || locked(f, *cell) {
             continue;
@@ -283,7 +433,7 @@ pub(crate) fn promote_single_store(f: &mut Func) -> usize {
                 ok = false; // other width: memory semantics, do not touch
                 break;
             }
-            let dominates = if lb == sb { li > si } else { dom[lb][sb] };
+            let dominates = if lb == sb { li > si } else { dom.has(lb, sb) };
             if !dominates {
                 ok = false;
                 break;
@@ -503,8 +653,8 @@ pub(crate) fn dom_frontiers(dt: &DomTree) -> Vec<Vec<u32>> {
 /// deliberately does not rewrite those operands -- so a value one of them
 /// reads must never be deleted, and a cell whose `load` feeds one is not
 /// promotable.
-fn untouchable_uses(f: &Func) -> std::collections::HashSet<Val> {
-    let mut out = std::collections::HashSet::new();
+fn untouchable_uses(f: &Func) -> crate::fx::HashSet<Val> {
+    let mut out = crate::fx::HashSet::default();
     let mut buf = Vec::new();
     for b in &f.blocks {
         for i in &b.insts {
@@ -622,7 +772,7 @@ pub(crate) fn promote_allocas(f: &mut Func) -> usize {
         return 0;
     }
     let ncell = list.len();
-    let mut idx_of: HashMap<Val, usize> = HashMap::new();
+    let mut idx_of: HashMap<Val, usize> = HashMap::default();
     for (k, (c, _)) in list.iter().enumerate() {
         idx_of.insert(*c, k);
     }
@@ -634,7 +784,7 @@ pub(crate) fn promote_allocas(f: &mut Func) -> usize {
 
     // ---- 3. phi placement ------------------------------------------------
     // `phi_of[b][k]` = the value the phi for cell k defines in block b.
-    let mut phi_of: Vec<HashMap<usize, Val>> = vec![HashMap::new(); nb];
+    let mut phi_of: Vec<HashMap<usize, Val>> = vec![HashMap::default(); nb];
     let mut defs: Vec<Vec<usize>> = vec![Vec::new(); ncell];
     for (k, (cell, _)) in list.iter().enumerate() {
         let u = &cells[cell];
@@ -713,7 +863,7 @@ pub(crate) fn promote_allocas(f: &mut Func) -> usize {
     }
     let mut stack: Vec<Vec<Val>> = vec![Vec::new(); ncell];
     let mut pushed: Vec<Vec<usize>> = vec![Vec::new(); nb];
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     let mut resolved = 0usize;
     // (block, is_exit)
     let mut work: Vec<(usize, bool)> = Vec::new();
@@ -913,7 +1063,7 @@ pub(crate) fn simplify_phis(f: &mut Func) -> usize {
         return 0;
     }
     let pr = preds(f);
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     let mut changed = 0usize;
     for (bi, b) in f.blocks.iter_mut().enumerate() {
         let np = b.phi_count();
@@ -1038,10 +1188,10 @@ fn clobbers_memory(op: &Op) -> bool {
 /// each only within one block and only without a memory effect between
 /// them. Yields the number of forwarded `load`s.
 pub(crate) fn forward_local_loads(f: &mut Func) -> usize {
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     for b in &f.blocks {
         // known cell contents: address value -> (type, value)
-        let mut known: HashMap<Val, (crate::fir::FTy, Val)> = HashMap::new();
+        let mut known: HashMap<Val, (crate::fir::FTy, Val)> = HashMap::default();
         for i in &b.insts {
             match &i.op {
                 Op::Load { addr } => {
@@ -1082,7 +1232,7 @@ pub(crate) fn forward_local_loads(f: &mut Func) -> usize {
 /// Identities and trivial algebraic simplifications. Yields the number of
 /// substitutions.
 pub(crate) fn copy_propagate(f: &mut Func) -> usize {
-    let mut consts: HashMap<Val, i128> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
@@ -1090,7 +1240,7 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
             }
         }
     }
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             let d = match i.dst {

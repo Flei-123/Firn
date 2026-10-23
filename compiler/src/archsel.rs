@@ -153,7 +153,7 @@ pub fn select(prog: &mut Program, dg: &mut Diags) {
     }
     // Which names survive at all? Collected BEFORE the throwing away,
     // because afterwards there is nothing left to ask.
-    let mut survives: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut survives: crate::fx::HashSet<&str> = crate::fx::HashSet::default();
     for f in &prog.funcs {
         match wanted(f) {
             None => {
@@ -169,7 +169,7 @@ pub fn select(prog: &mut Program, dg: &mut Diags) {
     // A name whose every definition belongs to another machine. Said once
     // per NAME -- three variants for three other machines would otherwise
     // produce three copies of the same sentence.
-    let mut said: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut said: crate::fx::HashSet<&str> = crate::fx::HashSet::default();
     for f in &prog.funcs {
         let a = match wanted(f) {
             Some(a) => a,

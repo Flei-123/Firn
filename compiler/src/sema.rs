@@ -19,7 +19,7 @@
 //! As many errors as possible are collected: after an error the check carries
 //! on with `Type::Error`, which is compatible with everything.
 
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 use crate::ast::{
     BinOp, Block, Expr, ExprId, ExprKind, FnDecl, Program, Stmt, TypeExpr, UnOp,
@@ -110,7 +110,7 @@ pub(crate) struct Checker<'a> {
     /// (`f"{x}"` with an i32 into `io.fmt_number(… i64)`). A set, not a
     /// single slot: the chain of an `f"…"` is itself made of such calls, so
     /// while one is being checked the next one is already being resolved.
-    widen: std::collections::HashSet<crate::ast::ExprId>,
+    widen: crate::fx::HashSet<crate::ast::ExprId>,
     /// **ROUND 71** — see `TypeInfo::widen_f32`.
     pub(crate) widen_f32: HashSet<crate::ast::ExprId>,
     pub(crate) dg: &'a mut Diags,
@@ -150,24 +150,24 @@ pub(crate) struct Checker<'a> {
 
 pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
     let mut ck = Checker {
-        widen: std::collections::HashSet::new(),
-        widen_f32: HashSet::new(),
+        widen: crate::fx::HashSet::default(),
+        widen_f32: HashSet::default(),
         dg,
         tcx: TypeCtx::new(),
-        fns: HashMap::new(),
-        consts: HashMap::new(),
-        const_texts: HashMap::new(),
-        statics: HashMap::new(),
+        fns: HashMap::default(),
+        consts: HashMap::default(),
+        const_texts: HashMap::default(),
+        statics: HashMap::default(),
         prog: None,
         expr_types: vec![Type::Error; prog.expr_count as usize],
         scopes: Vec::new(),
         ret: Type::Void,
         depth: 0,
-        must_consume_fns: HashSet::new(),
+        must_consume_fns: HashSet::default(),
         capture_frames: Vec::new(),
-        drops: HashSet::new(),
-        moved: HashSet::new(),
-        if_leaves: HashMap::new(),
+        drops: HashSet::default(),
+        moved: HashSet::default(),
+        if_leaves: HashMap::default(),
         tuple_phase: false,
         tuple_pending: Vec::new(),
     };
@@ -560,7 +560,7 @@ impl<'a> Checker<'a> {
         // 2. resolve the field types
         let mut resolved: Vec<Vec<(String, Type)>> = Vec::with_capacity(prog.structs.len());
         for s in &prog.structs {
-            let mut seen: HashSet<String> = HashSet::new();
+            let mut seen: HashSet<String> = HashSet::default();
             let mut fields: Vec<(String, Type)> = Vec::new();
             for (name, te, span) in &s.fields {
                 let ty = self.resolve_ty(te);
@@ -606,7 +606,7 @@ impl<'a> Checker<'a> {
         }
         let mut state = vec![0u8; n]; // 0 = new, 1 = on the path, 2 = done
         let mut order: Vec<usize> = Vec::new();
-        let mut bad: HashSet<usize> = HashSet::new();
+        let mut bad: HashSet<usize> = HashSet::default();
         for i in 0..n {
             find_cycles(i, &deps, &mut state, &mut order, &mut bad);
         }
@@ -660,7 +660,7 @@ impl<'a> Checker<'a> {
     fn collect_fns(&mut self, prog: &Program) {
         for f in &prog.funcs {
             let mut params = Vec::new();
-            let mut seen: HashSet<String> = HashSet::new();
+            let mut seen: HashSet<String> = HashSet::default();
             for p in &f.params {
                 let ty = self.resolve_ty(&p.ty);
                 if !seen.insert(p.name.clone()) {
@@ -751,7 +751,7 @@ impl<'a> Checker<'a> {
         };
         self.ret = sig.ret.clone();
         self.scopes.clear();
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
         for (p, ty) in f.params.iter().zip(sig.params.iter()) {
             self.declare_var(&p.name, ty.clone(), false, p.span);
         }
@@ -1426,7 +1426,7 @@ constants declared before it, and '+ - * /'"
 
     pub(crate) fn check_block(&mut self, b: &Block, reuse_scope: bool) {
         if !reuse_scope {
-            self.scopes.push(HashMap::new());
+            self.scopes.push(HashMap::default());
         }
         for s in &b.stmts {
             self.check_stmt(s);
@@ -1659,7 +1659,7 @@ constants declared before it, and '+ - * /'"
                 } else {
                     st
                 };
-                self.scopes.push(HashMap::new());
+                self.scopes.push(HashMap::default());
                 self.declare_var(name, ty, false, *name_span);
                 self.check_block(body, true);
                 self.scopes.pop();
@@ -3153,7 +3153,7 @@ constants declared before it, and '+ - * /'"
             .get(idx)
             .map(|s| s.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect())
             .unwrap_or_default();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::default();
         for (fname, fexpr, fspan) in fields {
             match def_fields.iter().find(|(n, _)| n == fname) {
                 Some((_, ft)) => {
@@ -4107,23 +4107,23 @@ mod tests {
         first: &Program,
     ) -> Checker<'d> {
         let mut ck = Checker {
-        widen: std::collections::HashSet::new(),
-        widen_f32: HashSet::new(),
+        widen: crate::fx::HashSet::default(),
+        widen_f32: HashSet::default(),
             dg,
             tcx: TypeCtx::new(),
-            fns: HashMap::new(),
-            consts: HashMap::new(),
-            const_texts: HashMap::new(),
-            statics: HashMap::new(),
+            fns: HashMap::default(),
+            consts: HashMap::default(),
+            const_texts: HashMap::default(),
+            statics: HashMap::default(),
             expr_types: vec![Type::Error; first.expr_count as usize],
             scopes: Vec::new(),
             ret: Type::Void,
             depth: 0,
-            must_consume_fns: HashSet::new(),
+            must_consume_fns: HashSet::default(),
             capture_frames: Vec::new(),
-            drops: HashSet::new(),
-            moved: HashSet::new(),
-            if_leaves: HashMap::new(),
+            drops: HashSet::default(),
+            moved: HashSet::default(),
+            if_leaves: HashMap::default(),
             tuple_phase: false,
             tuple_pending: Vec::new(),
             prog: None,

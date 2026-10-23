@@ -69,7 +69,7 @@
 //! ordinary uses, not in the phis.
 
 use crate::fir::{Func, Inst, Op, Term, Val};
-use std::collections::HashSet;
+use crate::fx::HashSet;
 
 /// Cuts lifetimes at loop boundaries. Returns the number of
 /// inserted copies.
@@ -95,7 +95,7 @@ pub(crate) fn split_at_loops(f: &mut Func) -> usize {
     for (b, blk) in f.blocks.iter().enumerate() {
         for s in blk.term.successors() {
             let h = s as usize;
-            if h < n && dom[b][h] {
+            if h < n && dom.has(b, h) {
                 edges.push((h, b));
             }
         }
@@ -139,7 +139,7 @@ pub(crate) fn split_at_loops(f: &mut Func) -> usize {
         Err(_) => 3,
     };
     let mut inserted = 0usize;
-    let mut already: HashSet<usize> = HashSet::new(); // head already processed
+    let mut already: HashSet<usize> = HashSet::default(); // head already processed
 
     for (head, body) in loops {
         if !already.insert(head) {
@@ -151,7 +151,7 @@ pub(crate) fn split_at_loops(f: &mut Func) -> usize {
         };
         // --- count: how often is which value READ in the body? ------------
         let mut readers: Vec<u32> = vec![0; f.val_types.len()];
-        let mut written: HashSet<Val> = HashSet::new();
+        let mut written: HashSet<Val> = HashSet::default();
         let mut buf = Vec::new();
         for &bi in body.iter() {
             for i in &f.blocks[bi].insts {
@@ -200,7 +200,7 @@ pub(crate) fn split_at_loops(f: &mut Func) -> usize {
                         if body.contains(&db) {
                             continue;
                         }
-                        if db != preheader && !dom[preheader][db] {
+                        if db != preheader && !dom.has(preheader, db) {
                             continue;
                         }
                     }
@@ -301,7 +301,7 @@ pub(crate) fn after_allocation(
     for (b, blk) in f.blocks.iter().enumerate() {
         for s in blk.term.successors() {
             let h = s as usize;
-            if h < n && dom[b][h] {
+            if h < n && dom.has(b, h) {
                 edges.push((h, b));
             }
         }
@@ -337,7 +337,7 @@ pub(crate) fn after_allocation(
 
     let mut g = f.clone();
     let mut fresh: Vec<Val> = Vec::new();
-    let mut done: HashSet<usize> = HashSet::new();
+    let mut done: HashSet<usize> = HashSet::default();
 
     for (head, body) in loops {
         if !done.insert(head) {
@@ -348,7 +348,7 @@ pub(crate) fn after_allocation(
             None => continue,
         };
         let mut readers: Vec<u32> = vec![0; nv];
-        let mut written: HashSet<Val> = HashSet::new();
+        let mut written: HashSet<Val> = HashSet::default();
         let mut buf = Vec::new();
         for &bi in body.iter() {
             for i in &f.blocks[bi].insts {
@@ -394,7 +394,7 @@ pub(crate) fn after_allocation(
                         if body.contains(&db) {
                             continue;
                         }
-                        if db != preheader && !dom[preheader][db] {
+                        if db != preheader && !dom.has(preheader, db) {
                             continue;
                         }
                     }

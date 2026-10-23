@@ -31,7 +31,7 @@
 //! The types come first, so that a `DW_AT_type` can point BACKWARDS at an
 //! offset that is already known. That saves a second pass.
 
-use std::collections::HashMap;
+use crate::fx::HashMap;
 
 use crate::dwarf::{DType, VarNote};
 
@@ -393,7 +393,7 @@ fn key(t: &DType) -> String {
 
 impl Types {
     fn new() -> Types {
-        Types { at: HashMap::new(), order: Vec::new() }
+        Types { at: HashMap::default(), order: Vec::new() }
     }
     /// Enters a type and everything it is made of, deepest first.
     fn collect(&mut self, t: &DType) {

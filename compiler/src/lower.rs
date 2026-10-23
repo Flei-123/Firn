@@ -12,7 +12,7 @@
 //! Aggregates (structs, arrays) are never FIR values but always addresses
 //! only; copies run through `copymem`.
 
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 use crate::ast::{self, Expr, ExprKind, Program, Stmt};
 use crate::diag::{Diags, Span};
@@ -421,7 +421,7 @@ impl<'a> Lower<'a> {
     }
 
     pub(crate) fn enter(&mut self) {
-        self.scopes.push(HashMap::new());
+        self.scopes.push(HashMap::default());
     }
     pub(crate) fn leave(&mut self) {
         self.scopes.pop();
@@ -2380,14 +2380,14 @@ impl<'a> Lower<'a> {
         // ROUND OWN-2: which values are moved away AFTER the `if` is what the
         // branches that do not leave agree on (`moves.rs` checks they agree).
         let track = !self.info.moved.is_empty();
-        let before = if track { self.moved_slots.clone() } else { HashSet::new() };
+        let before = if track { self.moved_slots.clone() } else { HashSet::default() };
 
         self.cur = then_bb;
         self.lower_block(then)?;
         if !self.terminated() {
             self.set_term(Term::Br(join_bb));
         }
-        let after_then = if track { self.moved_slots.clone() } else { HashSet::new() };
+        let after_then = if track { self.moved_slots.clone() } else { HashSet::default() };
         if track {
             self.moved_slots = before.clone();
         }
@@ -2663,7 +2663,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
     f.inline_hint = crate::core::inline_hint(d);
     dwarf::set_fn(&d.name, d.span.file, d.span.line);
     let mut lo = Lower {
-        pinned: HashMap::new(),
+        pinned: HashMap::default(),
         info,
         dg,
         f,
@@ -2673,7 +2673,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         fname: d.name.clone(),
         loops: Vec::new(),
             defers: Vec::new(),
-        moved_slots: HashSet::new(),
+        moved_slots: HashSet::default(),
         sret: None,
 
         params_done: false,
@@ -2881,8 +2881,8 @@ pub fn lower_reach(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Mo
     let lambdas = crate::fnval::collect(prog);
     let n = prog.funcs.len();
     let total = n + lambdas.len();
-    let mut by_name: HashMap<String, usize> = HashMap::with_capacity(total);
-    let mut by_label: HashMap<String, usize> = HashMap::with_capacity(total);
+    let mut by_name: HashMap<String, usize> = HashMap::with_capacity_and_hasher(total, Default::default());
+    let mut by_label: HashMap<String, usize> = HashMap::with_capacity_and_hasher(total, Default::default());
     for (i, d) in prog.funcs.iter().enumerate() {
         if d.extern_info.is_some() {
             continue;
@@ -3026,11 +3026,11 @@ mod tests {
         let mut ti = TypeInfo {
             tcx,
             expr_types: b.types.clone(),
-            consts: HashMap::new(),
-            const_texts: HashMap::new(),
-            statics: HashMap::new(),
-            fns: HashMap::new(),
-            widen_f32: std::collections::HashSet::new(),
+            consts: HashMap::default(),
+            const_texts: HashMap::default(),
+            statics: HashMap::default(),
+            fns: HashMap::default(),
+            widen_f32: crate::fx::HashSet::default(),
             ..Default::default()
         };
         for (n, s) in fns {

@@ -32,7 +32,7 @@
 //! Switch: `--no-pass=loadcse`.
 
 use crate::fir::{FTy, Func, Op, Term, Val};
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 enum Root {
@@ -71,7 +71,7 @@ fn size_of(ty: FTy) -> u64 {
 }
 
 fn analyse(f: &Func) -> Facts {
-    let mut consts: HashMap<Val, i128> = HashMap::new();
+    let mut consts: HashMap<Val, i128> = HashMap::default();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
@@ -79,7 +79,7 @@ fn analyse(f: &Func) -> Facts {
             }
         }
     }
-    let mut loc: HashMap<Val, Loc> = HashMap::new();
+    let mut loc: HashMap<Val, Loc> = HashMap::default();
     // fixpoint over ptradd chains (block order is not definition order)
     loop {
         let mut grew = false;
@@ -126,7 +126,7 @@ fn analyse(f: &Func) -> Facts {
         }
     }
     // escape analysis for allocas
-    let mut escaping: HashSet<Val> = HashSet::new();
+    let mut escaping: HashSet<Val> = HashSet::default();
     let root_of = |v: &Val, loc: &HashMap<Val, Loc>| -> Option<Val> {
         match loc.get(v) {
             Some(Loc { root: Root::Alloca(a), .. }) => Some(*a),
@@ -265,7 +265,7 @@ pub fn run(f: &mut Func) -> usize {
         order.reverse();
     }
     let mut out_state: Vec<Option<Table>> = vec![None; n];
-    let mut subst: HashMap<Val, Val> = HashMap::new();
+    let mut subst: HashMap<Val, Val> = HashMap::default();
     for &bi in &order {
         let mut tab: Table = if pred_cnt[bi] == 1 && pred_one[bi] != bi {
             out_state[pred_one[bi]].clone().unwrap_or_default()

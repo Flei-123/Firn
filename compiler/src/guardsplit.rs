@@ -13,7 +13,7 @@
 //! replaced by the values flowing in from `bb0`.
 
 use crate::fir::{FTy, Func, Inst, Module, Op, Term, Val};
-use std::collections::{HashMap, HashSet};
+use crate::fx::{HashMap, HashSet};
 
 const MAX_GUARD_INSTS: usize = 12;
 const MAX_SITES_PER_FUNC: usize = 4;
@@ -102,7 +102,7 @@ fn expand_site(f: &mut Func, g: &Guard, bi: usize, ii: usize) -> Val {
         Inst { dst: Some(d), ty, op: Op::Call { args, name }, loc } => (args.clone(), *d, *ty, *loc, name.clone()),
         _ => unreachable!(),
     };
-    let mut map: HashMap<Val, Val> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::default();
     for (k, a) in args.iter().enumerate() {
         map.insert(k as Val, *a);
     }
@@ -203,7 +203,7 @@ fn run_func(f: &mut Func) -> usize {
         None => return 0,
     };
     let me = f.name.clone();
-    let mut done: HashSet<Val> = HashSet::new();
+    let mut done: HashSet<Val> = HashSet::default();
     let mut n = 0;
     while n < MAX_SITES_PER_FUNC {
         let mut site = None;
