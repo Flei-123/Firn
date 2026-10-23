@@ -1341,12 +1341,15 @@ fn run(opts: &Options) -> i32 {
             Some(p) => p.clone(),
             None => out.with_extension("o"),
         };
+        tm.mark("write .s");
         if let Err(code) = assemble(&asm_path, &obj_path) {
             return code;
         }
+        tm.mark("as");
         if !opts.keep_asm {
             let _ = std::fs::remove_file(&asm_path);
         }
+        tm.print();
         return 0;
     }
     let obj_path = out.with_extension("o");

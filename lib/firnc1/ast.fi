@@ -51,7 +51,7 @@ export { Tree, tree_new, tree_free,
     panic_handler, panic_handler_set,
     structure_count, structure_name, structure_foff, structure_flen, structure_mc,
     field_name, field_ty, field_add,
-    fn_count, closure_take, fn_name, fn_poff, fn_plen, fn_ret, fn_body, fn_nogc, fn_mc,
+    fn_count, fn_find, fn_find_next, closure_take, fn_name, fn_poff, fn_plen, fn_ret, fn_body, fn_nogc, fn_mc,
     fn_int,
     fn_extern, fn_link, fn_link_set, fn_export,
     param_name, param_ty, param_add, prof,
@@ -232,6 +232,12 @@ struct Tree {
     // parses it; the number goes into the packed position of every node of
     // that file.
     fitext: rt.Buf, fi_off: Vec[u32], fi_len: Vec[u32],
+    // Name index of the functions (fn_find): open addressing over the
+    // intern number of the name. fx_tab holds (index of the FIRST function
+    // with this name) + 1, fx_next chains the later functions of the same
+    // name in index order, fx_n = how many functions are indexed so far.
+    // Built lazily; the lookups keep the semantics of the linear scans.
+    fx_tab: Vec[u32], fx_next: Vec[u32], fx_n: usize,
     pa_name: Vec[u32], pa_ty: Vec[u32],
     // ROUND 79: where the parameter is written. A parameter slot lies in
     // the frame like any local, so `&p` can escape just as `&x` can -- and
@@ -293,6 +299,7 @@ fn tree_new() -> Tree {
         f_export: vec_new[u32](),
         f_esc: vec_new[u32](), f_end: vec_new[u64](), f_pos: vec_new[u64](),
         fitext: rt.buf_new(), fi_off: vec_new[u32](), fi_len: vec_new[u32](),
+        fx_tab: vec_new[u32](), fx_next: vec_new[u32](), fx_n: 0,
         pa_name: vec_new[u32](), pa_ty: vec_new[u32](),
         pa_pos: vec_new[u64](),
         pa_def: vec_new[u32](),
@@ -397,6 +404,8 @@ fn tree_free(b: *mut Tree) {
     vec_free[u32](&(*b).fd_name)
     vec_free[u32](&(*b).fd_ty)
     vec_free[u32](&(*b).f_name)
+    vec_free[u32](&(*b).fx_tab)
+    vec_free[u32](&(*b).fx_next)
     vec_free[u32](&(*b).f_poff)
     vec_free[u32](&(*b).f_plen)
     vec_free[u32](&(*b).f_ret)
@@ -631,6 +640,91 @@ fn fn_add(b: *mut Tree, n: u32, poff: u32, plen: u32, ret: u32, body: u32,
     vec_push[u32](&(*b).f_esc, 0)
     vec_push[u64](&(*b).f_end, 0)
     vec_push[u64](&(*b).f_pos, 0)
+}
+
+// --------------------------------------------------- function name index
+//
+// `fn_find(b, name)` = the index of the FIRST function with this name, or
+// -1; `fn_find_next(b, i)` = the next function with the same name after
+// `i`, or -1. Together they replace the linear scans `while i < fn_count`
+// (every call checked by escape.fi and every symbol written by codegen.fi
+// walked the whole function list: quadratic on a kernel-sized program).
+fn fx_slot(name: u32, mask: usize) -> usize {
+    return ((((name as u64) *% 2654435761 as u64) >> 11) as usize) & mask
+}
+fn fx_insert(b: *mut Tree, i: usize, mask: usize) {
+    let name: u32 = vec_at[u32](&(*b).f_name, i)
+    var h: usize = fx_slot(name, mask)
+    while true {
+        let v: u32 = vec_at[u32](&(*b).fx_tab, h)
+        if v == 0 {
+            vec_set[u32](&(*b).fx_tab, h, (i + 1) as u32)
+            return
+        }
+        var j: usize = (v - 1) as usize
+        if vec_at[u32](&(*b).f_name, j) == name {
+            while vec_at[u32](&(*b).fx_next, j) != 0 {
+                j = (vec_at[u32](&(*b).fx_next, j) - 1) as usize
+            }
+            vec_set[u32](&(*b).fx_next, j, (i + 1) as u32)
+            return
+        }
+        h = (h + 1) & mask
+    }
+}
+fn fx_sync(b: *mut Tree) {
+    let n: usize = vec_len[u32](&(*b).f_name)
+    if (*b).fx_n == n {
+        return
+    }
+    var cap: usize = vec_len[u32](&(*b).fx_tab)
+    if cap < 2 * n + 2 {
+        // grow: rebuild the table from scratch (amortized by doubling)
+        var nc: usize = 64
+        while nc < 4 * n + 4 {
+            nc = nc * 2
+        }
+        vec_clear[u32](&(*b).fx_tab)
+        vec_reserve[u32](&(*b).fx_tab, nc)
+        var z: usize = 0
+        while z < nc {
+            vec_push[u32](&(*b).fx_tab, 0)
+            z = z + 1
+        }
+        vec_clear[u32](&(*b).fx_next)
+        (*b).fx_n = 0
+        cap = nc
+    }
+    let mask: usize = cap - 1
+    while (*b).fx_n < n {
+        vec_push[u32](&(*b).fx_next, 0)
+        fx_insert(b, (*b).fx_n, mask)
+        (*b).fx_n = (*b).fx_n + 1
+    }
+}
+fn fn_find(b: *mut Tree, name: u32) -> i64 {
+    fx_sync(b)
+    let cap: usize = vec_len[u32](&(*b).fx_tab)
+    if cap == 0 {
+        return 0 - 1
+    }
+    let mask: usize = cap - 1
+    var h: usize = fx_slot(name, mask)
+    while true {
+        let v: u32 = vec_at[u32](&(*b).fx_tab, h)
+        if v == 0 {
+            return 0 - 1
+        }
+        if vec_at[u32](&(*b).f_name, (v - 1) as usize) == name {
+            return (v - 1) as i64
+        }
+        h = (h + 1) & mask
+    }
+    return 0 - 1
+}
+fn fn_find_next(b: *mut Tree, i: usize) -> i64 {
+    fx_sync(b)
+    return (vec_at[u32](&(*b).fx_next, i) as i64) - 1
 }
 
 // --------------------------------------------------- ROUND 79: positions
