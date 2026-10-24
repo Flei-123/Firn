@@ -56,12 +56,12 @@ import mc.mc_sem
 import mc.mc_version
 
 export {
-    McAudio, SoundPkt, StopPkt, Walker,
+    McAudio, SoundPkt, StopPkt, Walker, FallCtx,
     mca_new, mca_free, mca_bank_load_text, mca_bank_load_file, mca_update, mca_update_entities,
     mca_set_listener, mca_set_category_volume, mca_get_category_volume, mca_set_muted, mca_is_muted, mca_category_bus,
     mca_play_event, mca_play_at, mca_play_entity, mca_play_ui, mca_stop_entity, mca_stop_all, mca_set_range,
     mca_block_sound, mca_block_sound_name, mca_material_of_name, mca_material_name, mca_action_name,
-    mca_state_at, mca_walker_new, mca_walker_server, mca_walk,
+    mca_state_at, mca_walker_new, mca_walker_server, mca_walk, mca_walk_ctx, mca_fall_ctx_unknown, mca_fall_damage, mca_fall_multiplier,
     mca_category_of_name, mca_category_of_event, mca_event_name, mca_find, mca_type_material,
     mca_mc_gain, mca_atten, mca_pan, mca_pan_lr,
     mca_sound_id_set, mca_sound_name, mca_decode_sound_effect, mca_decode_entity_sound, mca_decode_stop_sound,
@@ -881,6 +881,39 @@ struct Walker {
     walked: f64, // total horizontal distance on the ground (stats)
     steps: i32, // step sounds started (stats)
     predict_fall: bool, // false when a server sends the fall sound itself
+    py: f64,
+    last_fall: f64,
+}
+
+struct FallCtx {
+    known: bool,
+    fall: f64,
+    exempt: bool,
+    wet: bool,
+    jump: i32,
+    slow_fall: i32,
+}
+
+fn mca_fall_ctx_unknown() -> FallCtx {
+    return FallCtx { known: false, fall: 0.0, exempt: false, wet: false, jump: 0, slow_fall: 0 }
+}
+
+fn mca_fall_damage(dist: f64, jump: i32, mult: f64) -> i32 {
+    let d: f64 = (dist - FALL_SOUND_MIN - (jump as f64)) * mult
+    if d <= 0.0 { return 0 }
+    return math.ceil(d) as i32
+}
+
+fn mca_fall_multiplier(reg: *mut mc_registry.Registry, state: i32, sneaking: bool) -> f64 {
+    if state < 0 { return 1.0 }
+    let b: i32 = mc_registry.reg_block_of_state(reg, state)
+    if b < 0 { return 1.0 }
+    var n: usize = 0
+    let p: u64 = mc_registry.reg_block_name(reg, b, &n)
+    if has(p, n, "honey_block") || has(p, n, "hay_block") { return 0.2 }
+    if has(p, n, "_bed") { return 0.5 }
+    if has(p, n, "slime_block") && !sneaking { return 0.0 }
+    return 1.0
 }
 
 fn mca_walker_server() -> Walker {
@@ -890,20 +923,28 @@ fn mca_walker_server() -> Walker {
 }
 
 fn mca_walker_new() -> Walker {
-    return Walker { dist: 0.0, px: 0.0, pz: 0.0, started: false, was_ground: true, top: 0.0, walked: 0.0, steps: 0, predict_fall: true }
+    return Walker { dist: 0.0, px: 0.0, pz: 0.0, started: false, was_ground: true, top: 0.0, walked: 0.0, steps: 0, predict_fall: true, py: 0.0, last_fall: 0.0 }
 }
 
 // Call once per tick with the feet position. Plays a step each 1/0.6 blocks of horizontal travel on the ground
 // (not when sneaking) and a fall sound when landing after more than 3 blocks (the game's fall damage threshold). Returns the number of sounds started.
 fn mca_walk(m: *mut McAudio, w: *mut Walker, reg: *mut mc_registry.Registry, world: *mut mc_world.World, min_y: i32,
     x: f64, y: f64, z: f64, on_ground: bool, sneaking: bool) -> i32 {
+    return mca_walk_ctx(m, w, reg, world, min_y, x, y, z, on_ground, sneaking, mca_fall_ctx_unknown())
+}
+
+fn mca_walk_ctx(m: *mut McAudio, w: *mut Walker, reg: *mut mc_registry.Registry, world: *mut mc_world.World, min_y: i32,
+    x: f64, y: f64, z: f64, on_ground: bool, sneaking: bool, fc: FallCtx) -> i32 {
     var started: i32 = 0
+    let prev_y: f64 = (*w).py
+    (*w).py = y
     if !(*w).started {
         (*w).started = true
         (*w).px = x
         (*w).pz = z
         (*w).top = y
         (*w).was_ground = on_ground
+        (*w).last_fall = 0.0
         return 0
     }
     let dx: f64 = x - (*w).px
@@ -925,16 +966,25 @@ fn mca_walk(m: *mut McAudio, w: *mut Walker, reg: *mut mc_registry.Registry, wor
     if (*w).dist > STEP_DISTANCE * 2.0 { (*w).dist = STEP_DISTANCE * 2.0 }
     if !on_ground {
         if (*w).was_ground || y > (*w).top { (*w).top = y }
+        if (*w).was_ground { (*w).last_fall = 0.0 } else { (*w).last_fall = fc.fall }
         (*w).was_ground = false
         return 0
     }
     (*w).walked = (*w).walked + hd
     if !(*w).was_ground {
-        let fall: f64 = (*w).top - y
+        var fall: f64 = (*w).top - y
+        if fc.known {
+            fall = (*w).last_fall
+            if prev_y > y { fall = fall + (prev_y - y) }
+            if fc.exempt || fc.wet || fc.slow_fall > 0 { fall = 0.0 }
+        }
         (*w).was_ground = true
         (*w).top = y
-        if fall > FALL_SOUND_MIN && (*w).predict_fall {
-            let damage: i32 = math.ceil(fall - FALL_SOUND_MIN) as i32
+        (*w).last_fall = 0.0
+        var mult: f64 = 1.0
+        if fc.known { mult = mca_fall_multiplier(reg, mca_state_at(world, min_y, bx, by, bz), sneaking) }
+        let damage: i32 = mca_fall_damage(fall, fc.jump, mult)
+        if damage > 0 && (*w).predict_fall {
             var hurt: str = "entity.player.small_fall"
             if damage > FALL_BIG_DAMAGE { hurt = "entity.player.big_fall" }
             if mca_play_at(m, hurt, CAT_PLAYERS, x, y, z, 1.0 as f32, 1.0 as f32) != 0 as u32 { started = started + 1 }
