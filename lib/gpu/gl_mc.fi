@@ -200,6 +200,14 @@ struct GlBackend {
     org_max: usize,
     pend: u64, // slot index per collected draw
     pend_n: usize,
+    ashadow: u64,
+    ashadow_bytes: usize,
+    sh_tile: i32,
+    sh_cols: i32,
+    sh_rows: i32,
+    mpend: u64,
+    mpend_n: usize,
+    mpend_cap: usize,
     pend_cap: usize,
     sc_counts: u64, // scratch: i32 per draw
     sc_offs: u64, // scratch: u64 per draw (byte offset into the index buffer)
@@ -234,7 +242,7 @@ fn empty(c: glctx.GlCtx, w: i32, h: i32) -> GlBackend {
         fog_on: false, fog_start: 0.0, fog_end: 1.0, fog_r: 0.0, fog_g: 0.0, fog_b: 0.0, day: 256.0, tint_r: 256.0, tint_g: 224.0, tint_b: 176.0, cull: true,
         slots: 0, slot_cap: 0, pix: 0, tmp: 0, fresh: false, draws: 0, tris: 0, calls: 0, log: [0; 512],
         mode: MODE_MULTI, page_verts: DEFAULT_PAGE_VERTS, pages: 0, npages: 0, page_cap: 0, cur_vao: 0 as u32, defrags: 0,
-        org_cpu: 0, org_buf: 0 as u32, org_tex: 0 as u32, org_cap: 0, org_max: 0, pend: 0, pend_n: 0, pend_cap: 0,
+        org_cpu: 0, org_buf: 0 as u32, org_tex: 0 as u32, org_cap: 0, org_max: 0, pend: 0, pend_n: 0, pend_cap: 0, ashadow: 0, ashadow_bytes: 0, sh_tile: 0, sh_cols: 0, sh_rows: 0, mpend: 0, mpend_n: 0, mpend_cap: 0,
         sc_counts: 0, sc_offs: 0, sc_bv: 0, ind_buf: 0 as u32, facecull: false, up_keep: false, tris_sub: 0 as u64, batch: 1 as u64, mip: false, aniso: 1.0, budget: 0, staged: 0,
         up_bytes: 0, frame_up: 0, x: gl_ext.glx_new(), xok: false, msaa: 0,
         mt: gl_fbo.Target { ok: false, w: w, h: h, n_color: 1, depth_mode: gl_fbo.DEPTH_RENDERBUFFER, samples: 0, fbo: 0 as u32,
@@ -939,6 +947,9 @@ fn be_atlas(o: u64, a: u64) {
     if (*at).px == 0 {
         return
     }
+    if atlas_update_tiles(gb, at) {
+        return
+    }
     free_atlas_pages(gb)
     let t: usize = (*at).tile as usize
     let total: usize = ((*at).cols as usize) * ((*at).rows as usize)
@@ -1009,6 +1020,83 @@ fn be_atlas(o: u64, a: u64) {
     }
     (*gb).atile = (*at).tile
     (*gb).acols = (*at).cols
+    atlas_shadow_store(gb, at)
+}
+
+fn atlas_shadow_store(gb: *mut GlBackend, at: *mut mc_texture.Atlas) {
+    let bytes: usize = ((*at).w as usize) * ((*at).h as usize) * 4
+    if (*gb).ashadow != 0 && (*gb).ashadow_bytes != bytes {
+        rt.heap_free((*gb).ashadow, (*gb).ashadow_bytes)
+        (*gb).ashadow = 0
+    }
+    if (*gb).ashadow == 0 {
+        (*gb).ashadow = rt.heap_alloc(bytes)
+        (*gb).ashadow_bytes = bytes
+    }
+    if (*gb).ashadow == 0 {
+        (*gb).ashadow_bytes = 0
+        return
+    }
+    rt.mem_copy((*gb).ashadow, (*at).px, bytes)
+    (*gb).sh_tile = (*at).tile
+    (*gb).sh_cols = (*at).cols
+    (*gb).sh_rows = (*at).rows
+}
+
+fn atlas_tile_changed(gb: *mut GlBackend, at: *mut mc_texture.Atlas, g: usize) -> bool {
+    let t: usize = (*at).tile as usize
+    let row: usize = t * 4
+    let stride: usize = ((*at).w as usize) * 4
+    let col: usize = g % ((*at).cols as usize)
+    let rw: usize = g / ((*at).cols as usize)
+    var y: usize = 0
+    while y < t {
+        let off: usize = (rw * t + y) * stride + col * row
+        if !rt.mem_eq((*gb).ashadow + off as u64, (*at).px + off as u64, row) { return true }
+        y = y + 1
+    }
+    return false
+}
+
+fn atlas_tile_gather(gb: *mut GlBackend, at: *mut mc_texture.Atlas, g: usize, out: u64) {
+    let t: usize = (*at).tile as usize
+    let row: usize = t * 4
+    let stride: usize = ((*at).w as usize) * 4
+    let col: usize = g % ((*at).cols as usize)
+    let rw: usize = g / ((*at).cols as usize)
+    var y: usize = 0
+    while y < t {
+        let off: usize = (rw * t + y) * stride + col * row
+        rt.mem_copy(out + (y * row) as u64, (*at).px + off as u64, row)
+        rt.mem_copy((*gb).ashadow + off as u64, (*at).px + off as u64, row)
+        y = y + 1
+    }
+}
+
+fn atlas_update_tiles(gb: *mut GlBackend, at: *mut mc_texture.Atlas) -> bool {
+    if (*gb).mip || (*gb).atlas_tex == 0 as u32 || (*gb).ashadow == 0 { return false }
+    if (*gb).sh_tile != (*at).tile || (*gb).sh_cols != (*at).cols || (*gb).sh_rows != (*at).rows { return false }
+    if (*gb).ashadow_bytes != ((*at).w as usize) * ((*at).h as usize) * 4 { return false }
+    let t: usize = (*at).tile as usize
+    let total: usize = ((*at).cols as usize) * ((*at).rows as usize)
+    let buf: u64 = rt.heap_alloc(t * t * 4)
+    if buf == 0 { return false }
+    let pl: usize = (*gb).page_layers as usize
+    var g: usize = 0
+    while g < total {
+        if atlas_tile_changed(gb, at, g) {
+            atlas_tile_gather(gb, at, g, buf)
+            let pg: usize = g / pl
+            var tex: u32 = (*gb).atlas_tex
+            if pg > 0 && pg <= 3 { tex = (*gb).atlas_x[pg - 1] }
+            if pg <= 3 && tex != 0 as u32 {
+                gl33.gl_tex_array_sub_layer(&(*gb).g, tex, (g % pl) as i32, (*at).tile, (*at).tile, buf)
+            }
+        }
+        g = g + 1
+    }
+    rt.heap_free(buf, t * t * 4)
+    return true
 }
 
 fn free_atlas_pages(gb: *mut GlBackend) {
@@ -1265,14 +1353,10 @@ fn qd(p: u64, i: usize) -> f64 {
 // Draws a model slot now (the collected voxel draws are submitted first so the draw order stays the submission order).
 // MESH_MODEL_T: the quads are sorted far to near by the mean view depth of their corners (like raster_draw_models_ex) and the index buffer
 // is rewritten; blending / depth write come from the pass state (apply_pass).
-fn draw_model(gb: *mut GlBackend, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
+fn model_sort_translucent(gb: *mut GlBackend, h: usize, ox: f64, oy: f64, oz: f64) {
     let g: *mut gl33.Gl = &(*gb).g
     let b: usize = (h - 1) * SLOT_WORDS
     let nq: usize = rt.ld64((*gb).slots, b + S_MNQ) as usize
-    if nq == 0 || (*gb).mprog == 0 as u32 { return 0 as u64 }
-    if (*gb).mode >= MODE_MULTI {
-        flush_batch(gb)
-    }
     let vao: u32 = rt.ld64((*gb).slots, b + S_VAO) as u32
     if rt.ld64((*gb).slots, b + S_MODEL) == 3 as u64 && rt.ld64((*gb).slots, b + S_MV) != 0 as u64 {
         let cv: u64 = rt.ld64((*gb).slots, b + S_MV)
@@ -1326,6 +1410,10 @@ fn draw_model(gb: *mut GlBackend, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
             rt.heap_free(ord, nq * 8 * 2 + nq * 24)
         }
     }
+}
+
+fn model_setup(gb: *mut GlBackend) {
+    let g: *mut gl33.Gl = &(*gb).g
     gl33.gl_use(g, (*gb).mprog)
     gl33.gl_u1i(g, (*gb).ml[MLOC_ATLAS], 0)
     gl33.gl_u1i(g, (*gb).ml[MLOC_ATLAS1], 3)
@@ -1342,15 +1430,88 @@ fn draw_model(gb: *mut GlBackend, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
     gl33.gl_u4f(g, (*gb).ml[MLOC_FOG], if (*gb).fog_on { 1.0 } else { 0.0 }, (*gb).fog_start, (*gb).fog_end, 0.0)
     gl33.gl_u3f(g, (*gb).ml[MLOC_FOGC], (*gb).fog_r, (*gb).fog_g, (*gb).fog_b)
     gl33.gl_u4f(g, (*gb).ml[MLOC_LIGHT], (*gb).day, (*gb).tint_r, (*gb).tint_g, (*gb).tint_b)
+}
+
+fn model_emit(gb: *mut GlBackend, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
+    let g: *mut gl33.Gl = &(*gb).g
+    let b: usize = (h - 1) * SLOT_WORDS
+    let nq: usize = rt.ld64((*gb).slots, b + S_MNQ) as usize
+    let vao: u32 = rt.ld64((*gb).slots, b + S_VAO) as u32
     gl33.gl_u3f(g, (*gb).ml[MLOC_ORIGIN], ox - (*gb).cx, oy - (*gb).cy, oz - (*gb).cz)
     gl33.gl_bind_vao(g, vao)
     gl33.gl_draw_elements(g, gl33.GL_TRIANGLES, (nq * 6) as i32, gl33.GL_UNSIGNED_INT, 0)
+    (*gb).calls = (*gb).calls + 1 as u64
+    return (nq * 2) as u64
+}
+
+fn model_end(gb: *mut GlBackend) {
+    let g: *mut gl33.Gl = &(*gb).g
     gl33.gl_bind_vao(g, 0 as u32)
     (*gb).cur_vao = 0 as u32
     gl33.gl_use(g, (*gb).prog)
-    (*gb).calls = (*gb).calls + 1 as u64
     (*gb).fresh = false
-    return (nq * 2) as u64
+}
+
+fn ensure_mpend(gb: *mut GlBackend) {
+    if (*gb).mpend_n < (*gb).mpend_cap {
+        return
+    }
+    let ncap: usize = (*gb).mpend_cap * 2 + 256
+    let np: u64 = rt.heap_alloc(ncap * 32)
+    if (*gb).mpend != 0 {
+        rt.mem_copy(np, (*gb).mpend, (*gb).mpend_n * 32)
+        rt.heap_free((*gb).mpend, (*gb).mpend_cap * 32)
+    }
+    (*gb).mpend = np
+    (*gb).mpend_cap = ncap
+}
+
+fn queue_model(gb: *mut GlBackend, h: usize, ox: f64, oy: f64, oz: f64) {
+    ensure_mpend(gb)
+    let q: u64 = (*gb).mpend + ((*gb).mpend_n * 32) as u64
+    rt.st64(q, 0, h as u64)
+    *((q + 8 as u64) as *mut f32) = (ox - (*gb).cx) as f32
+    *((q + 12 as u64) as *mut f32) = (oy - (*gb).cy) as f32
+    *((q + 16 as u64) as *mut f32) = (oz - (*gb).cz) as f32
+    (*gb).mpend_n = (*gb).mpend_n + 1
+}
+
+fn flush_models(gb: *mut GlBackend) {
+    if (*gb).mpend_n == 0 {
+        return
+    }
+    let g: *mut gl33.Gl = &(*gb).g
+    model_setup(gb)
+    var i: usize = 0
+    while i < (*gb).mpend_n {
+        let q: u64 = (*gb).mpend + (i * 32) as u64
+        let h: usize = rt.ld64(q, 0) as usize
+        let b: usize = (h - 1) * SLOT_WORDS
+        let nq: usize = rt.ld64((*gb).slots, b + S_MNQ) as usize
+        gl33.gl_u3f(g, (*gb).ml[MLOC_ORIGIN], (*((q + 8 as u64) as *mut f32)) as f64, (*((q + 12 as u64) as *mut f32)) as f64, (*((q + 16 as u64) as *mut f32)) as f64)
+        gl33.gl_bind_vao(g, rt.ld64((*gb).slots, b + S_VAO) as u32)
+        gl33.gl_draw_elements(g, gl33.GL_TRIANGLES, (nq * 6) as i32, gl33.GL_UNSIGNED_INT, 0)
+        (*gb).calls = (*gb).calls + 1 as u64
+        i = i + 1
+    }
+    (*gb).mpend_n = 0
+    model_end(gb)
+}
+
+fn draw_model(gb: *mut GlBackend, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
+    let b: usize = (h - 1) * SLOT_WORDS
+    let nq: usize = rt.ld64((*gb).slots, b + S_MNQ) as usize
+    if nq == 0 || (*gb).mprog == 0 as u32 { return 0 as u64 }
+    if (*gb).mode >= MODE_MULTI {
+        flush_batch(gb)
+    }
+    if rt.ld64((*gb).slots, b + S_MODEL) == 3 as u64 && rt.ld64((*gb).slots, b + S_MV) != 0 as u64 {
+        model_sort_translucent(gb, h, ox, oy, oz)
+    }
+    model_setup(gb)
+    let t: u64 = model_emit(gb, h, ox, oy, oz)
+    model_end(gb)
+    return t
 }
 
 fn be_upload(o: u64, key: u64, verts: u64, nverts: usize, idx: u64, nidx: usize) -> usize {
@@ -1572,6 +1733,7 @@ fn be_begin(o: u64, cam: u64, rgba: u32) {
     (*gb).frame_up = 0 as u64
     (*gb).near = (*c).near
     (*gb).trans_pass = false
+    (*gb).mpend_n = 0
     if (*gb).staged > 0 {
         glbe_flush_uploads(gb, (*gb).budget)
     }
@@ -1837,6 +1999,13 @@ fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
         return 0 as u64
     }
     if rt.ld64((*gb).slots, b + S_MODEL) != 0 as u64 {
+        if (*gb).mode >= MODE_MULTI && !(*gb).trans_pass && (*gb).mprog != 0 as u32 && rt.ld64((*gb).slots, b + S_MNQ) != 0 as u64 {
+            queue_model(gb, h, ox, oy, oz)
+            let qt: u64 = rt.ld64((*gb).slots, b + S_MNQ) * 2 as u64
+            (*gb).draws = (*gb).draws + 1 as u64
+            (*gb).tris = (*gb).tris + qt
+            return qt
+        }
         let mt: u64 = draw_model(gb, h, ox, oy, oz)
         (*gb).draws = (*gb).draws + 1 as u64
         (*gb).tris = (*gb).tris + mt
@@ -1892,6 +2061,11 @@ fn be_draw(o: u64, h: usize, ox: f64, oy: f64, oz: f64) -> u64 {
 
 // Submits the collected draws: per page ONE multi draw (or one indirect call).
 fn flush_batch(gb: *mut GlBackend) {
+    flush_voxels(gb)
+    flush_models(gb)
+}
+
+fn flush_voxels(gb: *mut GlBackend) {
     let g: *mut gl33.Gl = &(*gb).g
     if (*gb).pend_n == 0 {
         return
