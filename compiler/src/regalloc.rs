@@ -1469,6 +1469,43 @@ fn seg_len(a: &[(usize, usize)]) -> u64 {
     a.iter().map(|(x, y)| (y - x + 1) as u64).sum()
 }
 
+fn call_arg_hints(f: &Func, pref: &[&'static str]) -> HashMap<Val, usize> {
+    let mut hints: HashMap<Val, usize> = HashMap::default();
+    if std::env::var_os("FIRN_NO_ARGHINT").is_some() {
+        return hints;
+    }
+    let mut conflicted: Vec<Val> = Vec::new();
+    for b in f.blocks.iter() {
+        for i in b.insts.iter() {
+            let args = match &i.op {
+                Op::Call { args, .. } => args,
+                _ => continue,
+            };
+            let (spot, _) = crate::codegen_x86::place_args(f, args);
+            for (k, arg) in args.iter().enumerate() {
+                let r = match spot[k] {
+                    Some(r) if !is_xmm(r) => r,
+                    _ => continue,
+                };
+                let idx = match pref.iter().position(|p| *p == r) {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+                match hints.get(arg) {
+                    Some(&old) if old != idx => conflicted.push(*arg),
+                    _ => {
+                        hints.insert(*arg, idx);
+                    }
+                }
+            }
+        }
+    }
+    for v in conflicted {
+        hints.remove(&v);
+    }
+    hints
+}
+
 pub fn allocate(f: &Func) -> Alloc {
     let nv = f.val_types.len();
     let nb = f.blocks.len();
@@ -2423,6 +2460,7 @@ pub fn allocate(f: &Func) -> Alloc {
             .copied()
             .collect();
         let mut on_reg: Vec<Vec<Iv>> = vec![Vec::new(); pref.len()];
+        let arg_hint = call_arg_hints(f, &pref);
         let dens = |iv: &Iv| -> u64 {
             if std::env::var_os("FIRN_HOLES_SPAN").is_some() {
                 return density(iv);
@@ -2444,6 +2482,10 @@ pub fn allocate(f: &Func) -> Alloc {
                 o
             } else {
                 (0..pref.len()).collect()
+            };
+            let order: Vec<usize> = match arg_hint.get(&iv.val) {
+                Some(&h) => std::iter::once(h).chain(order.into_iter().filter(|&k| k != h)).collect(),
+                None => order,
             };
             for &k in order.iter() {
                 let r = &pref[k];
