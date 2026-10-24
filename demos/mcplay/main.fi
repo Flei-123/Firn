@@ -15,7 +15,7 @@
 //   MCPLAY_SHOT_SETTLE=1  the MCPLAY_SHOT picture is taken after a stream flush also with LOD (LOD builds + cross-fades done): reproducible picture (r265; CPU vs CPU was 32 dB without)
 //   MCPLAY_FACECULL=1  GL: opaque meshes sorted by face direction, a section draws only directions facing the camera (same image; 0 = off)
 //   MCPLAY_VIEW=6      view distance in chunks            MCPLAY_PROTOCOL=763   protocol number
-//   MCPLAY_LOD=<n>     LOD terrain beyond MCPLAY_VIEW up to n chunks (mc_stream + mc_lod, cross-fade at ring changes; asks the server for n chunks); 0 = off (default)
+//   MCPLAY_LOD=<n>     LOD terrain beyond MCPLAY_VIEW up to n chunks (mc_stream + mc_lod, cross-fade at ring changes; asks the server for n chunks); 0 = off. Default: MCPLAY_VIEW > 8 draws 8 chunks in full detail and LOD up to MCPLAY_VIEW
 //   MCPLAY_MODELS=1    (default: auto = on whenever resource packs are loaded, also with MCPLAY_LOD (models only in the full-detail ring, the LOD rings stay cubes), on every back end (CPU / GL / Vulkan); 0 = off) resource pack models (blockstates + models of the packs, mc_model_mesh): stairs, slabs, plants ... are drawn from their baked quads instead of
 //                      full cubes. Needs packs (MC_PACKS ...); works on the CPU, GL (MCPLAY_GL=1) and Vulkan (MCPLAY_GFX=vk) back ends; works with mc_stream (worker meshing, MCPLAY_STREAM=1, default) and with MCPLAY_STREAM=0; no LOD; the T key reloads the models too.
 //   MCPLAY_PICK_PROBE="ox,oy,oz,dx,dy,dz[;...]"  pick rays (thousandths) at the end of the run, printed as `mcplay: probe ...` (tests; with MCPLAY_MODELS=1 through mc_model_pick)
@@ -78,6 +78,7 @@ import mc.mc_render_world
 import mc.mc_model_mesh
 import mc.mc_model_pick
 import mc.mc_stream
+import mc.mc_lod_policy
 import mc.mc_perf
 import mc.mc_prof
 import jobs.jobs
@@ -2295,17 +2296,21 @@ fn draw_frame_gl(c: *mut Ctx) {
     let fog_start: f64 = view * 16.0 * 0.5
     let fog_end: f64 = view * 16.0 + 8.0
     let clear: u32 = (255 as u32 << 24 as u32) | (FOG_B << 16 as u32) | (FOG_G << 8 as u32) | FOG_R
+    var dl: u64 = now_ns()
     gl_scene.scene_frame(&(*c).gsc)
     gl_mc.glbe_set_fog(&(*c).gb, true, fog_start, fog_end, (*c).sky.fr as u32, (*c).sky.fg as u32, (*c).sky.fb as u32)
     (*c).be.begin((*c).be.obj, ((&(*c).cam) as u64), clear)
+    dl = mc_prof.prof_lap(mc_prof.PH_PRE, dl)
     gl_scene.scene_sky(&(*c).gsc, &(*c).cam, &(*c).sky)
     gl_scene.scene_pass_begin(&(*c).gsc, 0)
     if (*c).light { mc_render_world.wr_set_daylight(&(*c).be, (*c).sky.daylight) }
+    dl = mc_prof.prof_lap(mc_prof.PH_SKY, dl)
     if (*c).have_pos {
         if (*c).stream_on {
             let ts0: u64 = now_ns()
             let tg: u64 = mc_stream.stream_frame(&(*c).stm, &(*c).world, &(*c).be, &(*c).cam)
             stream_time(c, now_ns() - ts0)
+            dl = now_ns()
         } else {
             let ts0: u64 = now_ns()
             mc_render_world.wr_render_b(&(*c).g.wr, &(*c).world, &(*c).be, &(*c).cam, 0 - 1)
@@ -2314,6 +2319,7 @@ fn draw_frame_gl(c: *mut Ctx) {
     }
     (*c).be.end((*c).be.obj)
     gl_scene.scene_pass_end(&(*c).gsc, 0)
+    dl = mc_prof.prof_lap(mc_prof.PH_END, dl)
     // entity boxes: ONE instanced call through the scene layer, after end (the world is in the depth buffer)
     var ebe: mc_backend.Backend = (*c).be
     gl_scene.scene_attach(&(*c).gsc, &ebe)
@@ -2357,6 +2363,7 @@ fn draw_frame_gl(c: *mut Ctx) {
     mc_hud.hud_record(0 as *mut rt.Buf)
     gl_scene.scene_hud(&(*c).gsc, &rec)
     rt.buf_free(&rec)
+    dl = mc_prof.prof_lap(mc_prof.PH_POST, dl)
 }
 
 // MCPLAY_GFX=vk
@@ -2746,7 +2753,7 @@ fn main(start: u64) -> i32 {
     if s_view > 0 { view_def = s_view }
     var proto_def: i32 = 763
     if s_proto > 0 { proto_def = s_proto }
-    let view: i32 = env_int("MCPLAY_VIEW", view_def)
+    let view_req: i32 = env_int("MCPLAY_VIEW", view_def)
     let proto: i32 = env_int("MCPLAY_PROTOCOL", proto_def)
     let w0: i32 = env_int("MCPLAY_W", 854)
     let h0: i32 = env_int("MCPLAY_H", 480)
@@ -2767,7 +2774,9 @@ fn main(start: u64) -> i32 {
         return 3
     }
     net.set_no_delay(&conn, true) catch false
-    var lod_n: i32 = env_int("MCPLAY_LOD", 0)
+    let lod_plan: mc_lod_policy.LodPlan = mc_lod_policy.lod_plan(view_req, env_int("MCPLAY_LOD", mc_lod_policy.LOD_UNSET))
+    let view: i32 = lod_plan.view
+    let lod_n: i32 = lod_plan.lod
     // MCPLAY_MODELS: unset / empty = auto (on when resource packs are loaded, also with LOD: models only in the full ring; on every back end; without packs nothing changes),
     // 1 = on (warns and falls back when a condition is missing), 0 = off (full cubes like before r244)
     var models_auto: bool = true
@@ -2934,6 +2943,10 @@ fn main(start: u64) -> i32 {
             io.eprint_line("mcplay: GL back end failed")
             return 6
         }
+        if env.has("MCPLAY_GL_MODE") {
+            let gmode: i32 = gl_mc.glbe_set_mode(&c.gb, env_int("MCPLAY_GL_MODE", 2))
+            say(f"mcplay: gl mode {gmode}\n")
+        }
         gl_mc.glbe_set_facecull(&c.gb, env_flag("MCPLAY_FACECULL", true)) // MCPLAY_FACECULL=0: no face-direction buckets (docs/MC-PERF.md 7)
         c.gsc = gl_scene.scene_open(&c.gb)
         if !c.gsc.ok || !glshow.show_init(&c.sh, gl_mc.glbe_gl(&c.gb)) {
@@ -3009,19 +3022,27 @@ fn main(start: u64) -> i32 {
     var fstats_n: usize = 0
     if fstats_on { fstats_buf = rt.heap_alloc(fstats_cap * 8) }
     var prof: mc_prof.Prof = mc_prof.prof_new(env_flag("MCPLAY_PROFILE", false))
+    mc_prof.prof_attach(&prof)
     let prof_from_ms: u64 = (env_int("MCPLAY_PROFILE_FROM", 5) as u64) * 1000 as u64
+    let spin_step: f64 = (env_int("MCPLAY_SPIN", 0) as f64) * 0.1
     var prof_d0: u64 = 0 as u64
     var prof_t0: u64 = 0 as u64
     var prof_c0: u64 = 0 as u64
     while !c.closed && alive {
         let f0: u64 = now_ns()
+        var pl: u64 = f0
         pump(&c)
         handle_window(&c)
+        pl = mc_prof.prof_lap(mc_prof.PH_PUMP, pl)
         alive = net_drain(&c, 400)
+        pl = mc_prof.prof_lap(mc_prof.PH_DRAIN, pl)
         sync_position(&c)
+        pl = mc_prof.prof_lap(mc_prof.PH_SYNC, pl)
         light_region_tick(&c)
+        pl = mc_prof.prof_lap(mc_prof.PH_LREG, pl)
         stream_window_tick(&c)
         handle_hotbar(&c)
+        pl = mc_prof.prof_lap(mc_prof.PH_WTICK, pl)
         let nowm: u64 = now_ms()
         var nt: i32 = 0
         while nowm >= t_tick + TICK_MS && nt < 5 {
@@ -3033,11 +3054,13 @@ fn main(start: u64) -> i32 {
             tick_dropped = tick_dropped + (nowm - t_tick) / TICK_MS
             t_tick = nowm
         }
+        pl = mc_prof.prof_lap(mc_prof.PH_TICKS, pl)
         if prog_on && c.n_ticks >= last_prog + 10 as u64 {
             last_prog = c.n_ticks
             say(f"mcplay: progress ticks={c.n_ticks} pos={c.have_pos} chunks={c.n_chunks} ground={c.pl.on_ground} y_mm={(c.pl.y * 1000.0) as i64} walked_mm={(c.wk.walked * 1000.0) as i64} steps={c.wk.steps}\n")
         }
         if quit_file.length() > 0 && c.n_frames % 5 as u64 == 0 as u64 && fs.exists(quit_file) { c.closed = true }
+        if spin_step != 0.0 { c.pl.yaw = c.pl.yaw + spin_step }
         if c.have_pos {
             mc_input.player_set_camera(&c.pl, &c.cam)
             if c.models_on {
@@ -3046,9 +3069,12 @@ fn main(start: u64) -> i32 {
                 c.hit = mc_input.input_pick_camera(&c.world, c.dim.min_y, &c.itb, &c.cam, mc_input.player_reach(&c.pl), &c.pk)
             }
         }
+        pl = mc_prof.prof_lap(mc_prof.PH_PICK, pl)
         handle_mouse(&c)
         audio_frame(&c)
+        pl = mc_prof.prof_lap(mc_prof.PH_AUDIO, pl)
         ents_step(&c)
+        pl = mc_prof.prof_lap(mc_prof.PH_ENTS, pl)
         let pf1: u64 = now_ns()
         if prof.on && c.gl {
             prof_d0 = gl_mc.glbe_draws(&c.gb)
