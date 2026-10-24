@@ -48,6 +48,8 @@ grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did
 sleep "${RUN_INV_WARMUP:-0}" # a cold 1.21.11 / 26.1 server answers the first login late
 for gr in "doDaylightCycle false" "doMobSpawning false"; do echo "gamerule $gr" >&3; done
 echo "time set day" >&3
+echo "op ChatA" >&3
+sleep 1
 DN=$((120 + RANDOM % 70))
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
@@ -58,8 +60,6 @@ MCPLAY_AUDIO=0 MCPLAY_CHAT_LOG=1 MCPLAY_CHAT_TEST='hi there|/time set day' MCPLA
 PP=$!
 for i in $(seq 1 90); do grep -q "ChatA joined the game" "$W/server.log" 2>/dev/null && break; sleep 1; done
 sleep 8
-echo "op ChatA" >&3
-sleep 2
 echo "say hello_chat" >&3
 echo "tellraw ChatA {\"text\":\"raw_line\",\"color\":\"gold\"}" >&3
 wait $PP
