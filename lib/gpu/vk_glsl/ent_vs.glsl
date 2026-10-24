@@ -14,6 +14,7 @@ layout(location = 3) in vec4 a_i1;
 layout(location = 4) in vec4 a_i2;
 layout(location = 0) flat out vec3 v_col;
 layout(location = 1) flat out int v_fk;
+layout(location = 3) flat out float v_em;
 layout(location = 2) out float v_depth;
 const int FK[8] = int[8](204, 204, 128, 256, 153, 153, 256, 256);
 void main() {
@@ -25,5 +26,7 @@ void main() {
     v_depth = gl_Position.w;
     gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;
     v_col = a_i2.xyz;
+    v_em = a_i2.w;
     v_fk = FK[int(a_face + 0.5)];
+    if (a_i2.w > 0.5) v_fk = 256;
 }

@@ -25,6 +25,10 @@ Default is `--opt dev` (`--no-opt`): statement-precise lines, nothing removed. `
 
 `--test` builds with `firnc --test --no-run` and runs the test executable under `--trace-children=yes`; every per-case process writes its own callgrind file and all are merged, so a case that dies still counts. The synthetic `<test runner>` file is the generated runner.
 
+## Suite behavior
+
+`suite` decides per file: a `fn main` means a normal run, no `main` but `#[test]` functions means a `--test` run, neither means the file is skipped. A build or run failure of one program never aborts the suite. The summary on stderr lists `profiled`, `skipped` and `failed` counts and names each skipped and failed file. Exit 0 when at least one program was profiled, exit 2 when none was.
+
 ## Formats
 
 - `text`: per file `hit/total` lines and functions; `--missing` lists uncovered line ranges and function names.
@@ -43,3 +47,14 @@ Default is `--opt dev` (`--no-opt`): statement-precise lines, nothing removed. `
 ## Proof
 
 `bash tools/coverage/run.sh` (test.sh 53d): exact uncovered lines and hit counts on a known program, all formats, merge equal to `suite`, the four build levels, `#[test]` with a crashing case, thresholds and filters, and counter-checks (bad profile, missing source, build failure, wrong expectation strikes).
+
+## Baseline
+
+62 `tests/*.fi` programs with `fn main` (every 16th file, picked by number order) built with `--opt dev`, run through `/root/jarvis/bin/heavy` with `firncov suite -j 6` (about 12 minutes wall, host load about 20). Selection `--include lib/`:
+
+| Measure | Hit / total | Percent |
+|---|---|---|
+| Lines | 40939 / 116178 | 35.2 |
+| Functions | 3453 / 9125 | 37.8 |
+
+The same run over everything (library plus the test files): 46437 / 121852 lines (38.1 %), 3760 / 9443 functions (39.8 %). The test programs themselves are about 100 % covered; the denominator is every imported library function the compiler emits, so a small sample leaves most of `lib/` at 0 %. Files with `#[test]` only and no `main` need `--test` with `run`.
