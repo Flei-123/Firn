@@ -48,7 +48,7 @@ Voxel client $VERSION (Windows)
   mcplay.exe <host-ipv4> <port> <name>     play (no console window; log: %LOCALAPPDATA%\\mcplay\\mcplay.log)
   mcplay-console.exe ...                   the same with a console (log on screen)
   mcclient.exe <host> <port> <name> ...    headless join / chunk dump
-Environment: MCPLAY_GL=1 (OpenGL), MCPLAY_VIEW=<chunks>, MCPLAY_LOG=<file|->, MCPLAY_SOUNDS=<dir>, FIRN_AUDIO=device|null
+Environment: MCPLAY_GL=1 (OpenGL), MCPLAY_VIEW=<chunks> (above 8: 8 chunks full detail + LOD up to the view, MCPLAY_LOD=0 turns LOD off), MCPLAY_LOG=<file|->, MCPLAY_SOUNDS=<dir>, FIRN_AUDIO=device|null
 Sound bank: sounds\\ next to the exe is used automatically.
 EOF
 

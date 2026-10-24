@@ -96,7 +96,7 @@ Screen-door (ordered dither) fade between two representations of a column, in th
 - Skyline pixels: already explained above (rasterizer, not LOD height); PASS_LOD band unchanged.
 
 ## Client integration + ring bench (z4, 14.10.)
-- mcplay draws through mc_stream by default (a2; `MCPLAY_STREAM=0` = old mc_render_world path): `MCPLAY_LOD=<n>` adds LOD up to n chunks beyond `MCPLAY_VIEW`, `MCPLAY_WORKERS` = mesher threads.
+- mcplay draws through mc_stream by default (a2; `MCPLAY_STREAM=0` = old mc_render_world path): `MCPLAY_LOD=<n>` adds LOD up to n chunks beyond `MCPLAY_VIEW`; LOD is the DEFAULT when `MCPLAY_VIEW` > 8 (lib/mc/mc_lod_policy.fi: 8 chunks full detail, LOD up to the requested view; same rule in mcview via `MCVIEW_LOD`), `MCPLAY_LOD=0` = opt-out (all chunks full detail), `MCPLAY_WORKERS` = mesher threads.
   With LOD the client asks the server for n chunks (`client_send_settings`), `dist` of the stream = MCPLAY_VIEW (full detail), `lod_dist` = n; fog and far plane use n. The stream meshes inline (pool 0, the budgets of mc_stream apply).
   Column unload packets go to `stream_chunk_unloaded`, edits to `stream_mark_block`, the moving light region marks its sections through `stream_mark_section` (`stream_region_follow`). Resize frees the stream before the raster changes and re-announces every loaded column.
   Default stays `mc_render_world` (no behaviour change without the env vars). End line: `mcplay: stream sections=.. lod_cols=.. lod_tris=..`.
