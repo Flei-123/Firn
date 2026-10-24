@@ -97,6 +97,8 @@ run_one() { # name, env...
 }
 run_one A MCPLAY_VIEW=3 MCPLAY_LOD=9
 run_one B MCPLAY_VIEW=3
+run_one C MCPLAY_VIEW=12
+run_one D MCPLAY_VIEW=12 MCPLAY_LOD=0
 # only the `mcplay: end` / `mcplay: stream` lines: `mcplay: entities_draw ... frames=0` (entity draw frames) comes after them and used to win the tail -1
 num() { grep -E "mcplay: (end|stream)" "$W/$1.out" | grep -o "$2=[0-9]*" | tail -1 | cut -d= -f2; }
 FA=$(num A frames); FB=$(num B frames); CA=$(num A chunks); CB=$(num B chunks)
@@ -112,7 +114,13 @@ grep -q 'stream workers=3 pool=true' "$W/B.out" || { echo "  FAIL  stream has no
 [ "${WB:-0}" -gt 0 ] || { echo "  FAIL  window sync did nothing (window_ops=${WB:-?}) although the server sends more than view+2"; ERR=1; }
 [ "${KB:-9999}" -lt "${CB:-0}" ] || { echo "  FAIL  stream keeps all ${KB:-?} of ${CB:-?} columns"; ERR=1; }
 echo "  B window_ops=${WB:-?} stream_cols=${KB:-?}"
-[ -s "$W/A.png" ] && [ -s "$W/B.png" ] || { echo "  FAIL  no screenshot"; ERR=1; }
+FC=$(num C frames); FD=$(num D frames); LC=$(num C lod_cols); TC=$(num C lod_tris); LD=$(num D lod_cols)
+echo "  C (view 12, default LOD) frames=${FC:-?} lod_cols=${LC:-?} lod_tris=${TC:-?}   D (view 12, MCPLAY_LOD=0) frames=${FD:-?} lod_cols=${LD:-?}"
+[ "${FC:-0}" -gt 20 ] && [ "${FD:-0}" -gt 20 ] || { echo "  FAIL  too few frames in the default-LOD runs"; ERR=1; }
+[ "${LC:-0}" -gt 0 ] && [ "${TC:-0}" -gt 0 ] || { echo "  FAIL  view 12 without MCPLAY_LOD drew no LOD columns (LOD must be the default beyond view 8)"; ERR=1; }
+[ "${LD:-0}" -eq 0 ] || { echo "  FAIL  MCPLAY_LOD=0 still drew LOD columns (${LD:-?})"; ERR=1; }
+grep -q 'stream workers=3 pool=true' "$W/C.out" || { echo "  FAIL  default-LOD run has no mesher pool"; ERR=1; }
+[ -s "$W/A.png" ] && [ -s "$W/B.png" ] && [ -s "$W/C.png" ] && [ -s "$W/D.png" ] || { echo "  FAIL  no screenshot"; ERR=1; }
 # compare only the 3D view (rows 60..330: no debug text top-left, no hotbar): LOD must add visible terrain (>= 1 % of the pixels differ)
 if [ -s "$W/A.png" ] && [ -s "$W/B.png" ]; then
     DIFF=$(python3 -I - "$W/A.png" "$W/B.png" <<'PY'

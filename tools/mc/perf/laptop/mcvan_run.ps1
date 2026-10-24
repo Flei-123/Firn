@@ -139,7 +139,7 @@ if ($Target -eq 'vanilla') {
   L "vanilla started pid $($proc.Id) cp=$($cp.Count)"
 } else {
   $inst = Join-Path $env:LOCALAPPDATA 'Programs\Voxel Client'
-  if ($Gfx -eq 'vk') { $env:MCPLAY_GFX = 'vk'; Remove-Item Env:MCPLAY_GL -ErrorAction SilentlyContinue } else { $env:MCPLAY_GL = '1'; Remove-Item Env:MCPLAY_GFX -ErrorAction SilentlyContinue }; $env:MCPLAY_VSYNC = '0'; if ($Fps -lt 0) { Remove-Item Env:MCPLAY_FPS -ErrorAction SilentlyContinue } else { $env:MCPLAY_FPS = "$Fps" }; $env:MCPLAY_VIEW = "$Radius"
+  if ($Gfx -eq 'vk') { $env:MCPLAY_GFX = 'vk'; Remove-Item Env:MCPLAY_GL -ErrorAction SilentlyContinue } else { $env:MCPLAY_GL = '1'; Remove-Item Env:MCPLAY_GFX -ErrorAction SilentlyContinue }; $env:MCPLAY_VSYNC = '0'; if ($Fps -lt 0) { Remove-Item Env:MCPLAY_FPS -ErrorAction SilentlyContinue } else { $env:MCPLAY_FPS = "$Fps" }; $env:MCPLAY_VIEW = "$Radius"; if ($env:MCVAN_LOD) { $env:MCPLAY_LOD = $env:MCVAN_LOD } else { $env:MCPLAY_LOD = '0' }
   $env:MCPLAY_W = "$W"; $env:MCPLAY_H = "$H"; $env:MCPLAY_FRAME_STATS = '1'; $env:MCPLAY_PROFILE = '1'; $env:MCPLAY_PROFILE_FROM = [string]($Settle + 6); $env:MCPLAY_PROGRESS = '1'
   $env:MCPLAY_SOUNDS = '0'; $env:MCPLAY_AUDIO = '0'
   $env:MCPLAY_RUN_S = [string]($Settle + $Secs + 90); $qf = Join-Path $out ('quit_' + $Tag); Remove-Item $qf -ErrorAction SilentlyContinue; $env:MCPLAY_QUIT_FILE = $qf

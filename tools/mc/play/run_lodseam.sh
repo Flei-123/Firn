@@ -308,7 +308,7 @@ if [ "${LODSEAM_PERF:-0}" = 1 ]; then
     : > "$W/perf.txt"
     for rep in $(seq 1 "$REPS"); do
         run_one "PML$rep" "" MCPLAY_MODELS=1 MCPLAY_LOD=9 MCPLAY_FRAME_STATS=1 MCPLAY_FPS=0
-        run_one "PMN$rep" "" MCPLAY_MODELS=1 MCPLAY_VIEW=9 MCPLAY_FRAME_STATS=1 MCPLAY_FPS=0
+        run_one "PMN$rep" "" MCPLAY_MODELS=1 MCPLAY_VIEW=9 MCPLAY_LOD=0 MCPLAY_FRAME_STATS=1 MCPLAY_FPS=0
         run_one "PCL$rep" "" MCPLAY_MODELS=0 MCPLAY_LOD=9 MCPLAY_FRAME_STATS=1 MCPLAY_FPS=0
         for k in ML MN CL; do
             P=$(grep -E "^mcplay: frame_stats" "$W/P$k$rep.out" | grep -o 'p50_us=[0-9]*' | cut -d= -f2)
