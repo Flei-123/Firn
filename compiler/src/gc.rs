@@ -60,46 +60,6 @@ pub(crate) const P_TY_PUB: &str = P_TY;
 pub(crate) const P_WTYP_PUB: &str = P_WTYP;
 const P_AS: &str = "__gc#as:";
 
-/// Call names of the runtime (`lib/gc/gc.fi`) that can trigger a collection
-/// run or touch the state of the collector.
-const RUNTIME_COLLECTS: [&str; 5] =
-    ["gc_init", "gc_collect", "__gc_alloc_raw", "__gc_collect_now", "gc_bottom_swap"];
-/// Further runtime names: pure queries, but part of the collector.
-const RUNTIME_QUERY: [&str; 26] = [
-    "gc_set_max_bytes",
-    "gc_max_bytes",
-    "gc_total_bytes",
-    "gc_collections",
-    "gc_live_objects",
-    "gc_heap_bytes",
-    "gc_live_bytes",
-    "gc_pause_ns_last",
-    "gc_pause_ns_max",
-    "gc_pause_ns_total",
-    "gc_barriers",
-    // The growth factor of the allocation budget (settable, readable).
-    "gc_set_growth",
-    "gc_growth_num",
-    "gc_growth_den",
-    // Round C-043 (memory): the breakdown of the live objects per class. Pure
-    // queries -- they start no collection run, they only read through the
-    // heap and the type table.
-    "gc_count_classes",
-    "gc_class_count",
-    "gc_class_bytes",
-    "gc_class_total",
-    "gc_class_name",
-    "gc_class_size",
-    "gc_len_histogram",
-    "gc_len_bucket",
-    "gc_field_count32",
-    // Round C-045: the same for a 64-bit field (pointer questions).
-    "gc_field_count64",
-    // Round C-045: who points at a class.
-    "gc_refs_to",
-    "gc_slot_refs_to",
-];
-
 /// Compiler intrinsics that `gc_lower.rs` turns into `Op::GcAddr`.
 pub(crate) const INTR_STATE: &str = "__gc_state";
 pub(crate) const INTR_REGS: &str = "__gc_save_regs";
@@ -243,10 +203,8 @@ pub(crate) fn is_gc_alloc_call(name: &str) -> bool {
     // The module path in front of it counts as well (`module__gc_collect`),
     // otherwise the guarantee could be dodged across a module boundary.
     let blank = name.rsplit("__").next().unwrap_or(name);
-    RUNTIME_COLLECTS.contains(&name)
-        || RUNTIME_COLLECTS.contains(&blank)
-        || RUNTIME_QUERY.contains(&name)
-        || RUNTIME_QUERY.contains(&blank)
+    crate::gc_names::is_runtime_name(name)
+        || crate::gc_names::is_runtime_name(blank)
         || name == INTR_STATE
         || name == INTR_REGS
         || name == FN_WEAK

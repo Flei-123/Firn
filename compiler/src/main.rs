@@ -51,6 +51,7 @@ mod fnval;
 mod refparam;
 mod fpool;
 mod gc;
+mod gc_names;
 mod ifexpr;
 mod gc_lower;
 mod iface;

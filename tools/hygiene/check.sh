@@ -2,6 +2,7 @@
 # tools/hygiene/check.sh -- cheap repository guards (r574).
 #   1. lib/firnc1/gctext.fi must equal what tools/gen_gctext.sh produces
 #      from lib/gc/*.fi (a stale file once broke fixpoint.sh).
+#      Same for lib/firnc1/gcnames.fi from lib/gc/runtime_names.txt.
 #   2. No NEW duplicate test numbers in tests/ (numbers listed in
 #      tools/hygiene/known_dup_testnums.txt are grandfathered).
 #   3. docs/LIBS.md (the lib/ index) must match lib/ -- stale means a module,
@@ -17,6 +18,12 @@ trap 'rm -rf "$T"' EXIT
 bash tools/gen_gctext.sh "$T/gctext.fi" >/dev/null
 if ! cmp -s "$T/gctext.fi" lib/firnc1/gctext.fi; then
     echo "HYGIENE: lib/firnc1/gctext.fi is stale -- run: bash tools/gen_gctext.sh (and cargo build)"
+    rc=1
+fi
+
+bash tools/gen_gcnames.sh "$T/gcnames.fi" >/dev/null
+if ! cmp -s "$T/gcnames.fi" lib/firnc1/gcnames.fi; then
+    echo "HYGIENE: lib/firnc1/gcnames.fi is stale -- run: bash tools/gen_gcnames.sh"
     rc=1
 fi
 
