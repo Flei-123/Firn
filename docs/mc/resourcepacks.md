@@ -8,6 +8,7 @@ ZIP with `pack.mcmeta` (JSON, `{"pack":{"pack_format":N,"description":...}}`) an
 
 ## Clean room / licence
 * The PLAYER supplies packs locally at run time (file path / drag-and-drop). Nothing from any pack is committed, bundled or downloaded by us.
+* Vanilla default (mcplay, below): assets are read at run time from the player's OWN installed client jar and cached in the user profile. Never in the repo, never in the installer (`tools/mc/dist.sh` fails when the package holds a jar / textures / blockstates).
 * We read no Mojang files and ship none. Tests use packs built in-process from own pixel patterns. Default look = our own `mc_texture` tiles.
 * File/path names are a public format convention; the `tile_file` name table contains names only.
 
@@ -145,3 +146,15 @@ Tests 4031 (blend + ring) and 4032 (colormap).
 r260 Biome blend cost + fluid water tint:
 - `ms_blend_color_p` (used by `ms_mesh_split_bio`): the first 9 blocks of a (height, tint class) layer of a section are blended one by one (`ms_blend_color_c`); from the 10th block on the whole 16 x 16 layer is computed by `ms_blend_plane` with separable window sums (packed r|g|b in 16 bit lanes, sums along x then z, integer mean sum / n per channel) = bit-identical to vanilla `calculateBlockTint`, window columns computed once instead of (2r+1)^2 times. Bench `tools/mc/biomezoom/bench.sh` (hashes equal before / after), tests 4092-4094, 4111.
 - Fluid water has no blockstate in vanilla (rendered in code) -> it stayed on the cube path WITHOUT biome tint. `ms_set_water_tint(ms, true)` (mcplay: `MCPLAY_WATER_TINT=1`, default OFF) bakes water states as 6 full-cube quads (`mc_model.water_cube_bake`, texture `block/water_still`, tint class 2); faces next to opaque blocks or other water are hidden. The colour goes through the same blend + Voronoi zoom as grass / leaves. Test 4112. NOT done: picture gate on a real server, flowing-water heights (cube path has none either), default on.
+
+
+## Vanilla pack default (lib/mc/mc_vanilla.fi, mcplay only)
+* mcplay uses the original look by default: `vanilla_ensure(protocol)` finds the client jar of the game version, extracts `assets/minecraft/{textures/block, textures/blocks, textures/colormap, blockstates, models/block}` into a cache ZIP (+ synthetic `pack.mcmeta`, pack_format of the version) and `mc_packs` adds it as the LOWEST priority pack (user packs on top).
+* Jar search: `MC_VANILLA_JAR`, `MC_VANILLA_DIR` / `MC_PACK_DIR` + `/versions/<v>/<v>.jar`, `%APPDATA%/.minecraft`, `~/Library/Application Support/minecraft`, `~/.minecraft`, `~/.local/share/minecraft`. Version from the protocol (47, 340, 754, 763, 764, 767, 769, 772, 774, 775) or `MC_VANILLA_VERSION`. No download (no Mojang manifest client in the libs yet).
+* Cache: `MC_VANILLA_CACHE`, else `%LOCALAPPDATA%/mcplay`, `$XDG_CACHE_HOME/mcplay`, `~/.cache/mcplay`; file `vanilla-<version>-<jar size>.zip`, written atomically, rebuilt when the jar size changes (~1.5 s once, 1.4 MB).
+* No jar: log line `mcplay: vanilla resources unavailable (...) -- built-in textures`, nothing else changes. `MC_VANILLA=0` switches the feature off. With a pack the models switch on automatically (`MCPLAY_MODELS` auto rule).
+* Sounds: not in the jar (they live in the launcher's asset index), so `sounds=` stays synth.
+* mcview does not use it. `tools/mc/run.sh` exports `MC_VANILLA=0` so the gates stay deterministic on machines that have a jar.
+* Real pack check (r233, 1.20.1 jar, test 4401 with `MC_VANILLA_JAR`): 24135 block states, 21879 bake to quads, 0 model textures without an atlas tile. The rest has no elements in the vanilla files (beds, signs, chests, banners, skulls, shulkers, decorated pot = entity models; water/lava/air; walls without post or side).
+* Model-only textures: `tools/mcgen/extract_model_textures.py <client.jar> tools/mcgen/model_textures.txt` lists the texture names the block models use; `gen_blocktex.py` appends the ones no block slot knows (333 slots, e.g. door_top, redstone_dust_dot, rail) and `tex_build_tables_ext` assigns every slot, so the atlas has ~1450 layers (GL/VK need >= 1500).
+* Gate: `bash tools/mc/run.sh vanillaplay` (`tools/mc/play/run_vanilla.sh`, fetches the client jar via `tools/mcclient/fetch_client.sh` into a temp dir).
