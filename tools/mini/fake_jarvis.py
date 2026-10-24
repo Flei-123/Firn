@@ -688,10 +688,25 @@ def rest(method, rawpath, hdr, body):
     if path.startswith("/api/admin/") or path == "/api/accounts":  # a66: the web admin routes the app's Admin tabs use (state in ADM)
         if os.environ.get("FAKE_ROLE", "admin") == "user": return out(403, {"error": "Nur f\u00fcr Admins."})
         b = j if isinstance(j, dict) else {}
+        mcp_state = ADM.setdefault("mcp", {"context7": True, "logiclab": False})
+        def mcp_list():
+            return {"servers": [{"name": "context7", "transport": "stdio", "summary": "npx -y @upstash/context7-mcp", "enabled": mcp_state["context7"], "admin_only": False, "accounts": [], "auto_allow": ["*"], "note": ""},
+                                {"name": "logiclab", "transport": "stdio", "summary": "logiclab-mcp --stdio", "enabled": mcp_state["logiclab"], "admin_only": True, "accounts": [], "auto_allow": [], "note": "circuits"}],
+                    "invalid": [{"name": "kaputt", "error": "command fehlt"}]}
         if path == "/api/admin/mcp" and method == "GET":  # a67
-            return out(200, {"servers": [{"name": "context7", "transport": "stdio", "summary": "npx -y @upstash/context7-mcp", "enabled": True, "admin_only": False, "accounts": [], "auto_allow": ["*"], "note": ""},
-                                         {"name": "logiclab", "transport": "stdio", "summary": "logiclab-mcp --stdio", "enabled": False, "admin_only": True, "accounts": [], "auto_allow": [], "note": "circuits"}],
-                             "invalid": [{"name": "kaputt", "error": "command fehlt"}]})
+            return out(200, mcp_list())
+        if path == "/api/admin/mcp/enable" and method == "POST":  # a69
+            if b.get("name") not in mcp_state: return out(404, {"error": "unknown"})
+            if not isinstance(b.get("enabled"), bool): return out(400, {"error": "enabled must be boolean"})
+            mcp_state[b["name"]] = b["enabled"]
+            return out(200, dict(mcp_list(), ok=True))
+        if path == "/api/admin/usage-by" and method == "GET":  # a69
+            by = q.get("by", ["user"])[0]
+            rows = ([{"key": "u1", "label": "justin", "tokens_in": 1840000, "tokens_out": 920000, "cache_read": 41000000, "cache_write": 300000, "requests": 310, "cost": None},
+                     {"key": "u2", "label": "papa", "tokens_in": 52000, "tokens_out": 18000, "cache_read": 400000, "cache_write": 0, "requests": 12, "cost": None}] if by == "user" else
+                    [{"key": "sonnet", "label": "sonnet", "tokens_in": 1500000, "tokens_out": 800000, "cache_read": 30000000, "cache_write": 200000, "requests": 250, "cost": None},
+                     {"key": "haiku", "label": "haiku", "tokens_in": 392000, "tokens_out": 138000, "cache_read": 11400000, "cache_write": 100000, "requests": 72, "cost": None}])
+            return out(200, {"by": by, "range": q.get("range", ["day"])[0], "since": 0, "rows": rows, "total": {}})
         if path == "/api/admin/mcp/test" and method == "POST":
             if b.get("name") == "logiclab": return out(200, {"ok": False, "error": "Zeitueberschreitung (10 s) - keine initialize-Antwort."})
             return out(200, {"ok": True, "status": 200, "note": "Handshake ok, 3 Tools"})
