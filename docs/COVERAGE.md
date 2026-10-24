@@ -43,3 +43,14 @@ Default is `--opt dev` (`--no-opt`): statement-precise lines, nothing removed. `
 ## Proof
 
 `bash tools/coverage/run.sh` (test.sh 53d): exact uncovered lines and hit counts on a known program, all formats, merge equal to `suite`, the four build levels, `#[test]` with a crashing case, thresholds and filters, and counter-checks (bad profile, missing source, build failure, wrong expectation strikes).
+
+## Baseline
+
+62 `tests/*.fi` programs with `fn main` (every 16th file, picked by number order) built with `--opt dev`, run through `/root/jarvis/bin/heavy` with `firncov suite -j 6` (about 12 minutes wall, host load about 20). Selection `--include lib/`:
+
+| Measure | Hit / total | Percent |
+|---|---|---|
+| Lines | 40939 / 116178 | 35.2 |
+| Functions | 3453 / 9125 | 37.8 |
+
+The same run over everything (library plus the test files): 46437 / 121852 lines (38.1 %), 3760 / 9443 functions (39.8 %). The test programs themselves are about 100 % covered; the denominator is every imported library function the compiler emits, so a small sample leaves most of `lib/` at 0 %. Files with `#[test]` only and no `main` need `--test`; `suite` aborts on a file without `main`.
