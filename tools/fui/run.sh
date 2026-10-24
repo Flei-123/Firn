@@ -493,6 +493,10 @@ echo "== 18i3. X11 WAKE DESCRIPTOR: an eventfd written from outside ends the wai
 FIRNC="$FIRNC" bash tools/window/wake.sh || exit 1
 
 echo
+echo "== 18i4. X11 FOCUS EVENTS SWITCH: window.focus_events delivers EV_FOCUS, default stays silent =="
+FIRNC="$FIRNC" bash tools/window/focus.sh || exit 1
+
+echo
 echo "== 18k. fUi MDVSCROLL: LAYOUT OF A LONG CHAT (word-width cache, highlight cache) =="
 "$FIRNC" --opt-level=release-fast -o "$W/mdvscroll" tools/fui/mdvscroll_main.fi
 "$W/mdvscroll" 60
