@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tools/mc/play/run_packsnd.sh -- mcplay with pack sounds (MC_PACK_SOUNDS=both|original) end to end: Xvfb + official 1.20.1 server + mcplay + xdotool.
-# Runs: (1) both, FILE sink: start + hot reload (key T) with a CHANGED OGG -> sample table must not grow; (2) both, DEVICE sink (private
+# Runs: (1) both, FILE sink: start + hot reload (key F5) with a CHANGED OGG -> sample table must not grow; (2) both, DEVICE sink (private
 # PulseAudio null sink): same, the audio thread is stopped / restarted around the reload; (3) original, FILE sink: only pack events.
 # (4) O key: packs off/on at runtime; (5) original start + O twice = still pack-only (no synth events). Prints `RESULT mc-packsnd: ok`. Env: FIRNC, MC_VIEW (3), MCCLIENT_JAR_CACHE, MCPLAY_SKIP_PULSE=1.
 set -uo pipefail
@@ -68,7 +68,7 @@ sleep 2
 export DISPLAY=:$DN
 ERR=0
 
-# run <name> <mode> <sink> <reload 0|1> : mcplay in the background, optional T key after 9 s with q.zip swapped in
+# run <name> <mode> <sink> <reload 0|1> : mcplay in the background, optional F5 key after 9 s with q.zip swapped in
 run() {
     local name=$1 mode=$2 sink=$3 reload=$4
     cp "$W/p.zip" "$W/cur.zip"
@@ -78,7 +78,7 @@ run() {
     if [ "$reload" = 1 ]; then
         sleep 9
         cp "$W/q.zip" "$W/cur.zip"
-        xdotool mousemove 320 180 2>/dev/null; xdotool key t; sleep 0.5
+        xdotool mousemove 320 180 2>/dev/null; xdotool key F5; sleep 0.5
     elif [ "$reload" = 2 ]; then
         # O key twice: packs off (synth bank back), packs on again
         sleep 9
