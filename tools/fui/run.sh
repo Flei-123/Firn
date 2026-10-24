@@ -777,6 +777,16 @@ for th in light dark; do
     "$W/fuiapp_notes" --theme $th --shot "$W/notes-$th.png"
     [ "$(wc -c < "$W/notes-$th.png")" -gt 15000 ] || { echo "  notes $th shot too small"; exit 1; }
 done
+"$W/fuiapp_notes" --theme dark --size 360x800 --shot "$W/notes-phone.png"
+"$W/fuiapp_notes" --theme dark --size 360x800 --open --shot "$W/notes-phone-open.png"
+"$W/fuiapp_notes" --theme dark --size 360x800 --preview --shot "$W/notes-phone-preview.png"
+for k in phone phone-open phone-preview; do
+    [ "$(wc -c < "$W/notes-$k.png")" -gt 10000 ] || { echo "  notes $k shot too small"; exit 1; }
+done
+[ "$(cmp -s "$W/notes-phone.png" "$W/notes-phone-open.png"; echo $?)" = 1 ] || { echo "  notes phone list equals phone editor"; exit 1; }
+[ "$(cmp -s "$W/notes-phone-open.png" "$W/notes-phone-preview.png"; echo $?)" = 1 ] || { echo "  notes phone editor equals phone preview"; exit 1; }
+[ "$(cmp -s "$W/notes-phone.png" "$W/notes-dark.png"; echo $?)" = 1 ] || { echo "  notes phone shot equals desktop shot"; exit 1; }
+echo "  notes phone layout (360x800 list / editor / preview)  OK"
 echo "  notes 1100x700 shot, light + dark   OK"
 build mdedit
 "$W/mdedit"
@@ -804,6 +814,14 @@ for th in light dark; do
     "$W/fuiapp_chat" --theme $th --shot "$W/chat-$th.png"
     [ "$(wc -c < "$W/chat-$th.png")" -gt 20000 ] || { echo "  chat $th shot too small"; exit 1; }
 done
+"$W/fuiapp_chat" --theme dark --size 360x800 --shot "$W/chat-phone.png"
+"$W/fuiapp_chat" --theme dark --size 360x800 --open --shot "$W/chat-phone-open.png"
+for k in phone phone-open; do
+    [ "$(wc -c < "$W/chat-$k.png")" -gt 15000 ] || { echo "  chat $k shot too small"; exit 1; }
+done
+[ "$(cmp -s "$W/chat-phone.png" "$W/chat-phone-open.png"; echo $?)" = 1 ] || { echo "  chat phone list equals phone chat"; exit 1; }
+[ "$(cmp -s "$W/chat-phone.png" "$W/chat-dark.png"; echo $?)" = 1 ] || { echo "  chat phone shot equals desktop shot"; exit 1; }
+echo "  chat phone layout (360x800 contacts / conversation)  OK"
 echo "  chat messenger 1100x700 shot, light + dark   OK"
 build kitchat
 "$W/kitchat"
