@@ -67,7 +67,7 @@ grep -q 'chat line=\[Server\] hello_chat' "$W/a.out" || { echo "  FAIL  say line
 grep -q 'chat line=raw_line' "$W/a.out" || { echo "  FAIL  tellraw line missing"; ERR=1; }
 grep -q 'chattest sent=2' "$W/a.out" || { echo "  FAIL  chattest sent != 2"; ERR=1; }
 grep -q '<ChatA> hi there' "$W/server.log" || { echo "  FAIL  server did not log the chat message"; ERR=1; }
-grep -q 'ChatA issued server command: /time set day' "$W/server.log" || { echo "  FAIL  server did not log the command"; ERR=1; }
+grep -q 'chat line=Set the time to' "$W/a.out" || { echo "  FAIL  command feedback line missing"; ERR=1; }
 grep -qiE "invalid|disconnect|kicked|chat message validation" "$W/server.log" && grep -iE "invalid|disconnect|kicked|validation" "$W/server.log" | head -3
 grep 'chat line=' "$W/a.out" | head -5
 echo stop >&3; sleep 1
