@@ -109,6 +109,25 @@ PY
 )
 check "suite equals merge of single runs" $?
 
+echo "== 4b. suite survives files without main and failing programs =="
+"$COV" suite -j 2 -o "$T/mixed_suite.json" suite/lib_only.fi suite/broken.fi suite/tests_only.fi left_main.fi right_main.fi > "$T/mixed_suite.txt" 2> "$T/mixed_suite.err"
+check "suite exits 0 with skipped and failed entries" $?
+grep -q "3 profiled, 1 skipped (no main, no tests), 1 failed" "$T/mixed_suite.err"
+check "suite summary counts profiled, skipped and failed" $?
+grep -q "skipped suite/lib_only.fi" "$T/mixed_suite.err"
+check "suite names the skipped file" $?
+grep -q "suite/broken.fi: build failed" "$T/mixed_suite.err"
+check "suite names the failed file" $?
+py "$T/mixed_suite.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))
+assert "suite/tests_only.fi" in p["files"] and "shared.fi" in p["files"], list(p["files"])
+assert "suite/lib_only.fi" not in p["files"]
+PY
+check "test-only file profiled via --test, main files kept" $?
+"$COV" suite -o "$T/none.json" suite/lib_only.fi suite/broken.fi > /dev/null 2>&1
+[ $? -eq 2 ]; check "suite with no usable program exits 2" $?
+
 echo "== 5. build levels =="
 for level in dev-fast release-safe release-fast; do
     "$COV" run --opt "$level" -o "$T/o-$level.json" branch.fi > /dev/null

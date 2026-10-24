@@ -1,6 +1,7 @@
 import argparse
 import concurrent.futures
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -20,6 +21,25 @@ def gather_sources(paths):
         else:
             out.append(path)
     return out
+
+
+MAIN_PATTERN = re.compile(r"^\s*(export\s+)?fn\s+main\b", re.M)
+TEST_PATTERN = re.compile(r"^\s*#\[test\]", re.M)
+
+
+def plan_source(source, test_mode):
+    if test_mode:
+        return "test"
+    try:
+        with open(source, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return "run"
+    if MAIN_PATTERN.search(text):
+        return "run"
+    if TEST_PATTERN.search(text):
+        return "test"
+    return "skip"
 
 
 def add_run_options(sub):
@@ -42,14 +62,38 @@ def run_command(args):
         raise runner.RunError("run takes exactly one source")
     program_args = args.program_args if args.command == "run" else []
 
+    skipped = []
+    failed = []
+
     def one(source):
-        return runner.run_one(source, args.opt, args.test, program_args, args.timeout)
+        if args.command == "run":
+            return runner.run_one(source, args.opt, args.test, program_args, args.timeout)
+        mode = plan_source(source, args.test)
+        if mode == "skip":
+            skipped.append(source)
+            return None
+        try:
+            return runner.run_one(source, args.opt, mode == "test", program_args, args.timeout)
+        except runner.RunError as error:
+            failed.append((source, str(error).splitlines()[0]))
+            return None
 
     result = profiles.empty()
+    merged = 0
     jobs = getattr(args, "jobs", 1)
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
         for item in pool.map(one, sources):
-            profiles.merge(result, item)
+            if item is not None:
+                profiles.merge(result, item)
+                merged += 1
+    if args.command == "suite":
+        print(f"suite: {merged} profiled, {len(skipped)} skipped (no main, no tests), {len(failed)} failed", file=sys.stderr)
+        for source in skipped:
+            print(f"  skipped {source}", file=sys.stderr)
+        for source, reason in failed:
+            print(f"  failed {reason}", file=sys.stderr)
+        if merged == 0:
+            raise runner.RunError("suite produced no profile")
     profiles.save(result, args.out)
     print(report.text(result), end="")
     return 0
