@@ -67,6 +67,13 @@ for b in bl:
     ids = cs["blocks"].get(name)
     for st in range(b["minStateId"], b["maxStateId"] + 1):
         sid = ids[st - b["minStateId"]] if isinstance(ids, list) else ids
+        if name == "scaffolding":
+            if st in got and got[st][0] in (728, 729):
+                cnt["scaffold_dynamic"] = cnt.get("scaffold_dynamic", 0) + 1
+            else:
+                bad += 1
+                print("DIFF scaffold dynamic code", name, st)
+            continue
         exp = vox(shapes[str(sid)])
         if st not in got:
             if exp:
