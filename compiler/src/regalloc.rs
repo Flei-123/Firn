@@ -2020,7 +2020,14 @@ pub fn allocate(f: &Func) -> Alloc {
                 // form; its whole group then moves to `p` (checked below).
                 let chain_ok = two_address
                     && std::env::var_os("FIRN_NO_COAL_CHAIN").is_none();
-                if t < np
+                let param_src_ok = t < np
+                    && p >= np
+                    && !two_address
+                    && !sse_class(f.val_ty(t))
+                    && !defsites.contains_key(&t)
+                    && !live.live_in.first().map_or(true, |l| l.get(p as usize).copied().unwrap_or(true))
+                    && std::env::var_os("FIRN_NO_COAL_PARAM").is_none();
+                if (t < np && !param_src_ok)
                     || coalesced.contains_key(&t)
                     || (sources.contains_key(&t) && !chain_ok)
                 {
@@ -4317,8 +4324,14 @@ fn interferes(
     // with several write sites at all. Simpler and
     // safe: a parameter is not merged.
     let np = f.params.len() as Val;
-    if a < np || b < np {
+    if a < np && b < np {
         return true;
+    }
+    if a < np || b < np {
+        let (pa, other) = if a < np { (a, b) } else { (b, a) };
+        if defsites.contains_key(&pa) || live.live_in.first().map_or(true, |l| l.get(other as usize).copied().unwrap_or(true)) {
+            return true;
+        }
     }
     for (x, y) in [(a, b), (b, a)] {
         for &(bi, ii) in defsites.get(&x).map(|v| v.as_slice()).unwrap_or(&[]) {
