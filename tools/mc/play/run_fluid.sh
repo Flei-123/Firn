@@ -68,6 +68,12 @@ srv_cmd "setblock 64 -53 8 minecraft:water" "Changed the block" || fail "shaft s
 srv_cmd "fill -2 -60 41 2 -48 41 minecraft:stone" "Successfully filled" || fail "vine wall"
 srv_cmd "fill 0 -60 40 0 -49 40 minecraft:vine[south=true]" "Successfully filled" || fail "vines"
 srv_cmd "setblock 50 -60 20 minecraft:water" "Changed the block" || fail "flow source"
+srv_cmd "fill 70 -60 20 70 -55 20 minecraft:scaffolding" "Successfully filled" || fail "scaffolding column"
+srv_cmd "fill 78 -61 18 110 -61 22 minecraft:packed_ice" "Successfully filled" || fail "ice floor"
+srv_cmd "fill 89 -61 29 91 -48 31 minecraft:stone" "Successfully filled" || fail "bubble walls"
+srv_cmd "fill 90 -60 30 90 -52 30 minecraft:water" "Changed the block\|Successfully filled" || fail "bubble water"
+srv_cmd "fill 90 -51 30 90 -49 30 minecraft:air" "Successfully filled" || fail "bubble air"
+srv_cmd "setblock 90 -61 30 minecraft:soul_sand" "Changed the block" || fail "bubble soul sand"
 sleep 8
 srv_cmd "tp $PN 33.5 -53 8.5 0 0" "Teleported $PN to" || { echo "  FAIL  lava tp not confirmed"; ERR=1; }
 wait_ticks 20 || { echo "  FAIL  no poslog ticks"; ERR=1; }
@@ -104,8 +110,42 @@ wait_ticks 10
 VH0=$(cur_tick); wait_ticks 40; VH1=$(cur_tick)
 xdotool keyup shift
 VD0=$(cur_tick); wait_ticks 30; VD1=$(cur_tick)
-echo "marks lsink=$LS0-$LS1 lhold=$LH0-$LH1 lexit=$LX0-$LX1 flow=$FL0-$FL1 fall=$FF0-$FF1 vine=$VC0-$VC1 vhold=$VH0-$VH1 vdown=$VD0-$VD1"
-python3 -I tools/mc/play/check_fluid.py "$W/a.out" "$W" "$LS0:$LS1" "$LH0:$LH1" "$LX0:$LX1" "$FL0:$FL1" "$FF0:$FF1" "$VC0:$VC1" "$VH0:$VH1" "$VD0:$VD1" || ERR=1
+srv_cmd "tp $PN 70.5 -52 20.5 0 0" "Teleported $PN to" || { echo "  FAIL  scaffold land tp not confirmed"; ERR=1; }
+wait_ticks 4
+SL0=$(cur_tick); wait_ticks 30; SL1=$(cur_tick)
+srv_cmd "data get entity $PN Pos" "$PN has the following entity data" && grep "$PN has the following entity data" "$W/server.log" | tail -1 > "$W/scland.pos"
+srv_cmd "tp $PN 67.5 -60 20.5 -90 0" "Teleported $PN to" || { echo "  FAIL  scaffold walk tp not confirmed"; ERR=1; }
+wait_ticks 4
+xdotool keydown w
+SW0=$(cur_tick); wait_ticks 40; SW1=$(cur_tick)
+xdotool keyup w
+wait_ticks 10
+srv_cmd "data get entity $PN Pos" "$PN has the following entity data" && grep "$PN has the following entity data" "$W/server.log" | tail -1 > "$W/scwalk.pos"
+srv_cmd "tp $PN 70.5 -60 20.5 0 0" "Teleported $PN to" || { echo "  FAIL  scaffold climb tp not confirmed"; ERR=1; }
+wait_ticks 4
+xdotool keydown space
+SC0=$(cur_tick); wait_ticks 70; SC1=$(cur_tick)
+xdotool keyup space
+wait_ticks 30
+srv_cmd "data get entity $PN Pos" "$PN has the following entity data" && grep "$PN has the following entity data" "$W/server.log" | tail -1 > "$W/scclimb.pos"
+xdotool keydown shift
+SD0=$(cur_tick); wait_ticks 50; SD1=$(cur_tick)
+xdotool keyup shift
+wait_ticks 6
+srv_cmd "data get entity $PN Pos" "$PN has the following entity data" && grep "$PN has the following entity data" "$W/server.log" | tail -1 > "$W/scdown.pos"
+srv_cmd "tp $PN 80.5 -60 20.5 -90 0" "Teleported $PN to" || { echo "  FAIL  ice tp not confirmed"; ERR=1; }
+wait_ticks 6
+xdotool keydown w
+IH0=$(cur_tick); wait_ticks 30; IH1=$(cur_tick)
+xdotool keyup w
+IC0=$(cur_tick); wait_ticks 40; IC1=$(cur_tick)
+srv_cmd "data get entity $PN Pos" "$PN has the following entity data" && grep "$PN has the following entity data" "$W/server.log" | tail -1 > "$W/icecoast.pos"
+srv_cmd "tp $PN 90.5 -59 30.5 0 0" "Teleported $PN to" || { echo "  FAIL  bubble tp not confirmed"; ERR=1; }
+wait_ticks 1
+BC0=$(cur_tick); wait_ticks 12; BC1=$(cur_tick)
+srv_cmd "data get entity $PN Pos" "$PN has the following entity data" && grep "$PN has the following entity data" "$W/server.log" | tail -1 > "$W/bubble.pos"
+echo "marks lsink=$LS0-$LS1 lhold=$LH0-$LH1 lexit=$LX0-$LX1 flow=$FL0-$FL1 fall=$FF0-$FF1 vine=$VC0-$VC1 vhold=$VH0-$VH1 vdown=$VD0-$VD1 scland=$SL0-$SL1 scwalk=$SW0-$SW1 scclimb=$SC0-$SC1 scdown=$SD0-$SD1 icehold=$IH0-$IH1 icecoast=$IC0-$IC1 bubble=$BC0-$BC1"
+python3 -I tools/mc/play/check_fluid.py "$W/a.out" "$W" "$LS0:$LS1" "$LH0:$LH1" "$LX0:$LX1" "$FL0:$FL1" "$FF0:$FF1" "$VC0:$VC1" "$VH0:$VH1" "$VD0:$VD1" "$SL0:$SL1" "$SW0:$SW1" "$SC0:$SC1" "$SD0:$SD1" "$IH0:$IH1" "$IC0:$IC1" "$BC0:$BC1" || ERR=1
 if grep -qE "moved too quickly|moved wrongly" "$W/server.log"; then
     echo "  FAIL  server complains about movement:"; grep -E "moved too quickly|moved wrongly" "$W/server.log" | head -3; ERR=1
 fi
