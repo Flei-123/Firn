@@ -76,6 +76,7 @@ mod divnonneg;
 mod retsink;
 mod fpomit;
 mod zextflow;
+mod phisink;
 mod divrem;
 mod loadcse;
 mod storemerge;

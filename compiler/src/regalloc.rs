@@ -4603,7 +4603,7 @@ fn emit_variant(f: &Func) -> Result<String, String> {
     tmp.flush_cold();
     // ROUND TK2: the value slots are 8..=value_slots*8 (compact_frame)
     let text = expand_save_markers(&tmp.out, a);
-    Ok(crate::fpomit::run(&crate::retsink::run(&crate::zextflow::run(&drop_redundant_zext(&descriptor_peephole(&text, a.value_slots))))))
+    Ok(crate::phisink::strip_marks(&crate::fpomit::run(&crate::retsink::run(&crate::phisink::run(&crate::zextflow::run(&drop_redundant_zext(&descriptor_peephole(&text, a.value_slots))))))))
 }
 
 // ------------------------------------------------- Register descriptor ---
@@ -7916,7 +7916,8 @@ fn emit_inst(
             for (r, arg) in later {
                 ra.load_full(e, r, arg);
             }
-            e.line(&format!("call {}", label(name)));
+            let used_regs: Vec<&str> = spot.iter().flatten().copied().filter(|r| !is_xmm(r)).collect();
+            e.line(&format!("call {} #{}", label(name), if used_regs.is_empty() { "-".to_string() } else { used_regs.join(",") }));
             if space > 0 {
                 e.line(&format!("add rsp, {}", space));
             }
