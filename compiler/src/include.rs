@@ -83,6 +83,7 @@ impl<'a> Parser<'a> {
                 None => rel_path.to_path_buf(),
             }
         };
+        crate::buildcache::taint();
         let bytes = match std::fs::read(&full) {
             Ok(b) => b,
             Err(e) => {

@@ -333,6 +333,7 @@ impl<'a> Execution<'a> {
                 ));
             }
             let full = self.base.join(p);
+            crate::buildcache::taint();
             let content = std::fs::read(&full).map_err(|e| {
                 (
                     span,

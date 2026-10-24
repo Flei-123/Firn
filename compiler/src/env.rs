@@ -242,6 +242,7 @@ pub fn lookup(name: &str) -> Result<Option<Vec<u8>>, String> {
 
 /// Records one read of `__env_or` for the manifest of `--env-log`.
 pub fn note(name: &str, value: &[u8], from_env: bool) {
+    crate::buildcache::taint();
     CFG.with(|c| {
         c.borrow_mut().notes.push(Note {
             name: name.to_string(),
@@ -254,6 +255,7 @@ pub fn note(name: &str, value: &[u8], from_env: bool) {
 
 /// Records one read of `__env_has`.
 pub fn note_has(name: &str, set: bool) {
+    crate::buildcache::taint();
     CFG.with(|c| {
         c.borrow_mut().notes.push(Note {
             name: name.to_string(),

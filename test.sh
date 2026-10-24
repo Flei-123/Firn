@@ -214,6 +214,9 @@
 #      programs of tests/ in the four build levels as json, jsonl, junit or
 #      text with name, status, duration and file:line:col -- checked on a tree
 #      whose result is known case by case, with counter-checks.
+#  53c. THE COMPILE CACHE (tools/cache/run.sh, roadmap r59, docs/CACHE.md): hit and
+#      miss on import and flag changes, byte-identical to --no-cache, eight
+#      parallel builds, damaged entries, size cap.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -1298,6 +1301,16 @@ if [ "$SRRC" -eq 0 ]; then
 else
     bad "tools/testrunner/suite.sh failed (see .test-work/suite_runner.log)"
     grep FAIL "$WORK/suite_runner.log" | head -10 | sed 's/^/   /' || true
+fi
+
+echo "== 53c. the compile cache: hit, miss, byte-identical to uncached, concurrent (tools/cache/run.sh, r59) =="
+bash tools/cache/run.sh > "$WORK/cache_proof.log" 2>&1 && CCRC=0 || CCRC=$?
+if [ "$CCRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/cache_proof.log" | sed 's/^/   /' || true
+else
+    bad "tools/cache/run.sh failed (see .test-work/cache_proof.log)"
+    grep FAIL "$WORK/cache_proof.log" | head -10 | sed 's/^/   /' || true
 fi
 
 # ROUND K3. Sections 53 and 54 belong to the rounds running in parallel;

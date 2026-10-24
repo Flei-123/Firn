@@ -118,6 +118,7 @@ mod peephole;
 mod rotate;
 mod bitsel;
 mod bswapload;
+mod buildcache;
 mod chainsink;
 mod usecount;
 mod promote;
@@ -201,6 +202,7 @@ struct Options {
     test_limit: u32,
     /// `--no-run`: build the test binary, do not start it.
     no_run: bool,
+    no_cache: bool,
     /// **ROUND FIRN-ENV** — `--env-allow=<prefix>`: which environment
     /// variables `__env_or`/`__env_has` may read. Adds to the default
     /// prefix `FIRN_`; may be given several times and may carry a comma
@@ -351,6 +353,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut test_format = testrun::Format::Json;
     let mut test_limit: u32 = 30;
     let mut no_run = false;
+    let mut no_cache = false;
     let mut env_allow: Vec<String> = Vec::new();
     let mut env_log = false;
     let mut i = 0;
@@ -480,6 +483,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             }
             "--test" => test_mode = true,
             "--no-run" => no_run = true,
+            "--no-cache" => no_cache = true,
             _ if a.starts_with("--format=") => {
                 let v = &a["--format=".len()..];
                 match testrun::Format::from_str(v) {
@@ -592,6 +596,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         test_format,
         test_limit,
         no_run,
+        no_cache,
     })
 }
 
@@ -828,6 +833,26 @@ fn run(opts: &Options) -> i32 {
             return 2;
         }
     };
+    let cache_dir = cache_dir_for(opts);
+    if cache_dir.is_none() {
+        buildcache::log("off");
+    }
+    let cache_key = match &cache_dir {
+        Some(_) => {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            let manifests: Vec<String> = world.packages.iter().map(|p| p.manifestpfad.clone()).collect();
+            buildcache::key(&args, &files, &manifests)
+        }
+        None => None,
+    };
+    if let (Some(dir), Some(key)) = (&cache_dir, &cache_key) {
+        if let Some(hit) = buildcache::lookup(dir, key) {
+            buildcache::log("hit");
+            let mut tm = Timings::new(false);
+            return finish(opts, path, target_out_manifest, &hit.asm, &hit.link, &mut tm);
+        }
+        buildcache::log("miss");
+    }
     let mut dg = diag::Diags::new(&root.path.display().to_string(), &root.src);
     for f in files.iter().skip(1) {
         dg.add_file(&f.path.display().to_string(), &f.src);
@@ -1274,6 +1299,45 @@ fn run(opts: &Options) -> i32 {
     };
 
     tm.mark("codegen");
+    if let (Some(dir), Some(key)) = (&cache_dir, &cache_key) {
+        if !buildcache::tainted() && prog.comptime_blocks.is_empty() {
+            let link = buildcache::LinkInfo::capture();
+            if buildcache::store(dir, key, &link, &asm) {
+                buildcache::log("store");
+            }
+        } else {
+            buildcache::log("skip");
+        }
+    }
+    let link = buildcache::LinkInfo::capture();
+    finish(opts, path, target_out_manifest, &asm, &link, &mut tm)
+}
+
+fn cache_dir_for(opts: &Options) -> Option<PathBuf> {
+    let cacheable = matches!(opts.emit, Emit::Exe | Emit::Asm)
+        && !opts.no_cache
+        && !buildcache::disabled_by_env()
+        && !opts.stats
+        && !opts.timings
+        && !opts.env_log
+        && opts.header.is_none()
+        && opts.def_file.is_none()
+        && opts.deps_out.is_none()
+        && !target::active().is_wasm();
+    if !cacheable {
+        return None;
+    }
+    buildcache::cache_dir()
+}
+
+fn finish(
+    opts: &Options,
+    path: &Path,
+    target_out_manifest: Option<PathBuf>,
+    asm: &str,
+    link: &buildcache::LinkInfo,
+    tm: &mut Timings,
+) -> i32 {
     if let Some(h) = &opts.header {
         let stem = Path::new(h).file_stem().and_then(|x| x.to_str()).unwrap_or("firn");
         let guard: String = format!("FIRN_{}_H", stem)
@@ -1324,7 +1388,7 @@ fn run(opts: &Options) -> i32 {
     // ROUND 52 (SPEC §2): the kernel profile produces a freestanding
     // ELF OBJECT FILE. No `ld`, no `_start`, no libc contact — linking
     // happens later at the kernel build with its own linker script.
-    let object = opts.only_object || prof::is_kernel();
+    let object = opts.only_object || link.kernel;
     let asm_path = out.with_extension("s");
     if let Err(e) = std::fs::write(&asm_path, asm.as_bytes()) {
         eprintln!("error: cannot write '{}': {}", asm_path.display(), e);
@@ -1345,7 +1409,7 @@ fn run(opts: &Options) -> i32 {
             if !opts.keep_asm {
                 let _ = std::fs::remove_file(&asm_path);
             }
-            let r = link_shared(&obj_path, &so);
+            let r = link_shared(&obj_path, &so, link);
             let _ = std::fs::remove_file(&obj_path);
             return match r {
                 Ok(()) => 0,
@@ -1369,7 +1433,7 @@ fn run(opts: &Options) -> i32 {
     }
     let obj_path = out.with_extension("o");
     tm.mark("write .s");
-    if let Err(code) = assemble_and_link(&asm_path, &obj_path, &out) {
+    if let Err(code) = assemble_and_link(&asm_path, &obj_path, &out, link) {
         return code;
     }
     tm.mark("as + ld");
@@ -1479,13 +1543,13 @@ fn default_output(input: &Path) -> PathBuf {
 /// `--shared`: link the object into a C-ABI shared object. Only the
 /// `#[export_c]` symbols are visible (version script), calls inside the
 /// library never go through the PLT (`-Bsymbolic`).
-fn link_shared(obj: &Path, so: &Path) -> Result<(), i32> {
+fn link_shared(obj: &Path, so: &Path, link: &buildcache::LinkInfo) -> Result<(), i32> {
     let t = target::active();
     if target::android() || matches!(t, target::Target::Wasm32Browser) {
         eprintln!("error: --shared builds a Linux .so (x86-64, aarch64) or a Windows DLL (x86_64-windows) only");
         return Err(2);
     }
-    let names = extfn::export_names();
+    let names = link.exports.clone();
     if names.is_empty() {
         eprintln!("error: --shared: no #[export_c] function in the program");
         return Err(2);
@@ -1509,8 +1573,8 @@ fn link_shared(obj: &Path, so: &Path) -> Result<(), i32> {
         .arg("-o")
         .arg(so)
         .arg(obj);
-    for l in extfn::link_libs() {
-        cmd.arg(extfn::link_lib_arg(&l));
+    for l in &link.libs {
+        cmd.arg(extfn::link_lib_arg(l));
     }
     let res = cmd.status();
     let _ = std::fs::remove_file(&ver);
@@ -1631,9 +1695,9 @@ fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
     }
 }
 
-fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
+fn assemble_and_link(asm: &Path, obj: &Path, out: &Path, link: &buildcache::LinkInfo) -> Result<(), i32> {
     let t = target::active();
-    if t == target::Target::Aarch64 && !extfn::link_libs().is_empty() {
+    if t == target::Target::Aarch64 && !link.libs.is_empty() {
         // Dynamic linking exists for x86_64 only; say so instead of letting `ld` fail on dlopen/dlsym.
         eprintln!("error: `#[link_lib]` (dynamic linking, std.dynlib) is not supported on aarch64");
         return Err(3);
@@ -1660,18 +1724,18 @@ fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
         // never appears here, and no foreign object file enters the image.
         cmd.arg("-e").arg("_start");
         cmd.arg("--subsystem").arg(win::subsystem());
-    } else if !extfn::link_libs().is_empty() && t == target::Target::X86_64 {
+    } else if !link.libs.is_empty() && t == target::Target::X86_64 {
         // `#[link_lib(..)]` (docs/FFI.md): a dynamically linked image --
         // PT_INTERP + DT_NEEDED, so that `dlopen`/`dlsym` of libc resolve.
         // No `-n`: the loader maps page aligned segments.
         cmd.arg("-dynamic-linker").arg("/lib64/ld-linux-x86-64.so.2");
-    } else if !crate::statics::any() {
+    } else if !link.statics {
         cmd.arg("-n");
     }
     cmd.arg("-o").arg(out).arg(obj);
     if !target::windows() && t == target::Target::X86_64 {
-        for l in extfn::link_libs() {
-            cmd.arg(extfn::link_lib_arg(&l));
+        for l in &link.libs {
+            cmd.arg(extfn::link_lib_arg(l));
         }
     }
     let st = cmd.status();
