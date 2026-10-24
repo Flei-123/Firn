@@ -55,9 +55,8 @@ APK=$ROOT/build/android/fui_form/fui_form.apk
 [ -f "$APK" ] || { echo "no APK"; exit 1; }
 $ADB root >/dev/null 2>&1; sleep 2; $ADB wait-for-device
 $ADB install -r "$APK" | tail -1
+set_rotation 0 || echo "   FAILED  portrait rotation did not apply"
 dismiss_anr
-$ADB shell settings put system accelerometer_rotation 0
-$ADB shell settings put system user_rotation 0
 $ADB shell wm user-rotation lock 0 >/dev/null 2>&1
 # the soft keyboard is shown although the emulator has a hardware keyboard
 $ADB shell settings put secure show_ime_with_hard_keyboard 1

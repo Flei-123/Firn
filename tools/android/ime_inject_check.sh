@@ -31,9 +31,8 @@ APK=$ROOT/build/android/ime_test/ime_test.apk
 [ -f "$APK" ] || { echo "no APK"; exit 1; }
 $ADB root >/dev/null 2>&1; sleep 2; $ADB wait-for-device
 $ADB install -r "$APK" | tail -1
+set_rotation 0 || echo "   FAILED  portrait rotation did not apply"
 dismiss_anr
-$ADB shell settings put system accelerometer_rotation 0
-$ADB shell settings put system user_rotation 0
 $ADB shell settings put secure show_ime_with_hard_keyboard 1
 SIZE=$($ADB shell wm size | grep -o '[0-9]*x[0-9]*' | tail -1)
 W=${SIZE%x*}; H=${SIZE#*x}
