@@ -108,3 +108,9 @@ Spalten: n = Anzahl Laeufe; cpu = % eines Kerns; t_window = Prozessstart bis Fen
 - Ratio vs Vanilla: r8 1.5x, r16 1.22x. 2x NOT reached. At r8 the frame is GPU/present bound (CPU savings of 210 us net_tick give no p50 change).
 - n_wtick was 194 us of env lookups in handle_hotbar (8 env_flag per frame), now cached. Vanilla pack default is 3.5x slower on Iris Xe (roadmap r300).
 - Not measured: 360p, capped, r32, VK, walking with section changes.
+
+## v7 (24.10., r308 attempt) -- NOT MEASURED, laptop locked
+- Planned matrix (main fa9d47880, cull graph fix): per rep and radius (8, 16) interleaved A = mcplay GL `MC_VANILLA=0` SPIN=3, V = Vanilla 1.20.1, P = Vanilla-pack default SPIN=3; n=3, median. Runner: `tools/mc/perf/laptop/mcvan_go.ps1 -Kinds W,A,V,P` (W = Vanilla warm-up for world generation; untested script, copy next to mcvan_run.ps1/mcvan_stats.ps1 in C:\Users\Public).
+- Setup finished (dist build, server jar SHA256 ok, PresentMon 2.6.0, padded `mcplay-bench.exe`, local server up, Hoechstleistung plan), then `Get-Process LogonUI` appeared (LockApp since 16:27): the laptop locks itself while idle. PresentMon would write no CSV. Run aborted, laptop cleaned (server stopped, %TEMP%\mcvan, scripts, bench exe removed, plan back to Ausbalanciert, duplicate plan deleted).
+- Resume: Boss unlocks the laptop and sets "never" for screen lock / sleep (settings, not possible remotely), then repeat setup (~6 min: dist ~2 min at heavy load < 24) and run the matrix (~35 min).
+- Server-side reference (llvmpipe, relative only): steady-state cull mean 1401 -> ~325 us (r8, SPIN=3, n=3, profile_gl.sh).
