@@ -879,6 +879,12 @@ echo "  files phone folder drawer (360x800 tree full width)   OK"
 echo "  files 1100x700 shot, light + dark, phone layout (360x800 side column hidden, two columns)   OK"
 build kitdash
 "$W/kitdash"
+build screenpan
+"$W/screenpan"
+build appresize
+"$W/appresize"
+build mdscroll
+"$W/mdscroll"
 echo "== 18p5c. THE APP SCREENS AS WEBASSEMBLY (tools/wasm/screenapps.sh): Inter + assets, pixel-equal to the native shot =="
 if command -v chromium >/dev/null 2>&1; then
     FIRNC="$FIRNC" bash tools/wasm/screenapps.sh flei settings notes chat dash form || exit 1

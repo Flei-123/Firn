@@ -33,6 +33,9 @@ import fui.a11y
 import fui.screenax
 import fui.screenaxtree
 import fui.screenbridge
+import fui.screenext
+import fui.screenpan
+import plat.backkey
 import fui.apphost
 import plat.fuiwirt
 import plat.sysfont
@@ -57,6 +60,9 @@ struct Screen {
     tree: u64,
     px: f64,
     py: f64,
+    ex: screenext.Extras,
+    pn: screenpan.Pan,
+    back_held: bool,
 }
 
 fn screen_blank() -> Screen {
@@ -68,6 +74,7 @@ fn screen_blank() -> Screen {
         hk: apphost.hooks_blank(),
         tr: anim.transreg_new(),
         ud: 0, paint: no_paint, press: no_press, key: no_key, text: no_key, wheel: no_wheel, pointer: no_pointer, dark: true, skin: no_skin, themed: false, tree: 0, px: 0.0 - 1.0, py: 0.0 - 1.0,
+        ex: screenext.extras_blank(), pn: screenpan.pan_new(), back_held: false,
     }
 }
 
@@ -112,6 +119,13 @@ fn on_paint(ud: u64, w: usize, h: usize) {
     ((*s).paint)((*s).ud, c, w as f64, h as f64, (*s).px, (*s).py)
     focus_ring(c)
     if (*s).tree != 0 && screenax.changed() { screenaxtree.publish((*s).tree as *mut screenaxtree.Tree) }
+    sync_back(s)
+}
+
+fn sync_back(s: *mut Screen) {
+    if !(*s).ex.back_on { return }
+    (*s).back_held = ((*s).ex.back_wanted)((*s).ud)
+    backkey.back_hold((*s).back_held)
 }
 
 fn focus_ring(c: *mut render.Ctx) {
@@ -120,16 +134,25 @@ fn focus_ring(c: *mut render.Ctx) {
     kit.focus_ring(c, q[0] - kit.ln(c, 3), q[1] - kit.ln(c, 3), q[2] + kit.ln(c, 6), q[3] + kit.ln(c, 6), kit.ln(c, 10), style.TOK_BASE)
 }
 
-fn on_press(ud: u64, x: f64, y: f64) {
-    let s: *mut Screen = ud as *mut Screen
-    fuiwirt.host_touch(&(*s).w)
+fn press_now(s: *mut Screen, x: f64, y: f64) {
     screenax.focus_clear()
     ((*s).press)((*s).ud, x, y)
 }
 
+fn on_press(ud: u64, x: f64, y: f64) {
+    let s: *mut Screen = ud as *mut Screen
+    fuiwirt.host_touch(&(*s).w)
+    if (*s).ex.pan_on {
+        screenpan.pan_down(&(*s).pn, x, y)
+        return
+    }
+    press_now(s, x, y)
+}
+
 fn ax_click(ud: u64, x: f64, y: f64) -> bool {
     let s: *mut Screen = ud as *mut Screen
-    on_press(ud, x, y)
+    fuiwirt.host_touch(&(*s).w)
+    press_now(s, x, y)
     ((*s).pointer)((*s).ud, fuiwirt.HOOK_UP, x, y)
     return true
 }
@@ -152,9 +175,11 @@ fn on_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     if kind == fuiwirt.HOOK_LEAVE {
         (*s).px = 0.0 - 1.0
         (*s).py = 0.0 - 1.0
+        screenpan.pan_cancel(&(*s).pn)
     } else if kind != fuiwirt.HOOK_WHEEL {
         (*s).px = x
         (*s).py = y
+        if (*s).ex.pan_on && (kind == fuiwirt.HOOK_MOVE || kind == fuiwirt.HOOK_UP) { return pan_hook(s, kind, x, y) }
         if kind == fuiwirt.HOOK_MOVE || kind == fuiwirt.HOOK_UP { ((*s).pointer)((*s).ud, kind, x, y) }
     } else {
         fuiwirt.host_touch(&(*s).w)
@@ -163,10 +188,31 @@ fn on_hook(ud: u64, kind: u32, x: f64, y: f64) -> bool {
     return true
 }
 
+fn pan_hook(s: *mut Screen, kind: u32, x: f64, y: f64) -> bool {
+    let p: *mut screenpan.Pan = &(*s).pn
+    if kind == fuiwirt.HOOK_MOVE {
+        let d: f64 = screenpan.pan_move(p, x, y)
+        if screenpan.pan_active(p) {
+            if d != 0.0 { ((*s).ex.pan)((*s).ud, (*p).x0, (*p).y0, d) }
+            return true
+        }
+        ((*s).pointer)((*s).ud, kind, x, y)
+        return true
+    }
+    let r: u32 = screenpan.pan_up(p)
+    if r == screenpan.UP_TAP { press_now(s, (*p).x0, (*p).y0) }
+    if r != screenpan.UP_PAN { ((*s).pointer)((*s).ud, kind, x, y) }
+    return true
+}
+
 fn on_key(ud: u64, key: u32, mods: u32) -> bool {
     let s: *mut Screen = ud as *mut Screen
     fuiwirt.host_touch(&(*s).w)
     if ((*s).key)((*s).ud, key, mods) { return true }
+    if key == editor.KEY_ESC && (*s).ex.back_on && ((*s).ex.back_wanted)((*s).ud) {
+        ((*s).ex.back_go)((*s).ud)
+        return true
+    }
     return ax_key(s, key, mods)
 }
 
@@ -186,6 +232,24 @@ fn on_text(ud: u64, cp: u32, mods: u32) -> bool {
     if cp != 32 as u32 { return false }
     return ax_key(s, editor.KEY_ENTER, mods)
 }
+fn wake_tick(ud: u64, now: i64) -> bool {
+    let s: *mut Screen = ud as *mut Screen
+    var ch: bool = screenanim.wake_tick(ud, now)
+    if (*s).back_held && backkey.back_take() {
+        ((*s).ex.back_go)((*s).ud)
+        sync_back(s)
+        ch = true
+    }
+    return ch
+}
+
+fn wake_wait(ud: u64, now: i64) -> i64 {
+    let s: *mut Screen = ud as *mut Screen
+    let w: i64 = screenanim.wake_wait(ud, now)
+    if (*s).back_held && (w < 0 || w > 100) { return 100 }
+    return w
+}
+
 fn on_act(ud: u64, i: usize) {}
 fn on_done(ud: u64) -> bool { return false }
 fn on_field(ud: u64, out: *mut [f64; 4]) -> bool { return false }
@@ -300,6 +364,15 @@ fn run_full(start: u64, title: str, w: usize, h: usize, ud: u64,
     paint: fn(u64, *mut render.Ctx, f64, f64, f64, f64), press: fn(u64, f64, f64),
     key: fn(u64, u32, u32) -> bool, text: fn(u64, u32, u32) -> bool,
     wheel: fn(u64, f64, f64, f64, f64) -> bool, pointer: fn(u64, u32, f64, f64) -> bool, skin: fn(*mut theme.Theme, bool)) -> i32 {
+    return run_ext(start, title, w, h, ud, paint, press, key, text, wheel, pointer, screenext.extras_blank(), skin)
+}
+
+// `run_full` plus `ex` (lib/fui/screenext.fi): touch pan (a press is held until the release, a drag past the slop calls `pan(ud, x0, y0, dy)`)
+// and the Back key (`back_wanted(ud)` = a detail view is open; Escape and Android Back then call `back_go(ud)`; otherwise Back closes the app).
+fn run_ext(start: u64, title: str, w: usize, h: usize, ud: u64,
+    paint: fn(u64, *mut render.Ctx, f64, f64, f64, f64), press: fn(u64, f64, f64),
+    key: fn(u64, u32, u32) -> bool, text: fn(u64, u32, u32) -> bool,
+    wheel: fn(u64, f64, f64, f64, f64) -> bool, pointer: fn(u64, u32, f64, f64) -> bool, ex: screenext.Extras, skin: fn(*mut theme.Theme, bool)) -> i32 {
     screenax.install()
     let p: u64 = rt.heap_alloc(size_of_screen())
     if p == 0 { return 12 }
@@ -312,6 +385,7 @@ fn run_full(start: u64, title: str, w: usize, h: usize, ud: u64,
     (*s).text = text
     (*s).wheel = wheel
     (*s).pointer = pointer
+    (*s).ex = ex
     var dark: bool = true
     let t: u64 = arg_after(start, "--theme")
     if t != 0 && *(t as *mut u8) == 108 as u8 { dark = false }
@@ -331,7 +405,7 @@ fn run_full(start: u64, title: str, w: usize, h: usize, ud: u64,
     (*s).w = fuiwirt.host_new(&(*s).sc, &(*s).c)
     fuiwirt.host_set_transitions(&(*s).w, &(*s).tr)
     fuiwirt.host_set_hook(&(*s).w, p, on_hook)
-    fuiwirt.host_set_wake(&(*s).w, p, screenanim.wake_tick, screenanim.wake_wait)
+    fuiwirt.host_set_wake(&(*s).w, p, wake_tick, wake_wait)
     fuiwirt.host_bind(&(*s).w)
     (*s).hk = apphost.hooks_new(p, &(*s).m, &(*s).w, on_attach, on_paint, on_key, on_text,
         on_press, on_act, on_done, on_field, title, w, h)
