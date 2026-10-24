@@ -55,6 +55,7 @@ fn sink_globals(f: &Func) -> Option<Func> {
     if std::env::var_os("FIRN_NO_GFOLD").is_some() || !f.secret.is_empty() || f.constant_time {
         return None;
     }
+    let indexed_ok = !crate::target::windows() && !crate::target::pic();
     let nv = f.val_types.len();
     let mut defs = vec![0u32; nv];
     let mut cand: HashMap<Val, (String, FTy)> = HashMap::default();
@@ -88,8 +89,8 @@ fn sink_globals(f: &Func) -> Option<Func> {
                 let ok = match &i.op {
                     Op::Load { addr } => addr == u,
                     Op::Store { addr, val } => addr == u && val != u,
-                    Op::PtrAdd { base, off } => base == u && off != u,
-                    Op::Bin(BinOp::Add, x, y) if i.ty.bits() == 64 => (x == u) != (y == u),
+                    Op::PtrAdd { base, off } => indexed_ok && base == u && off != u,
+                    Op::Bin(BinOp::Add, x, y) if i.ty.bits() == 64 => indexed_ok && (x == u) != (y == u),
                     _ => false,
                 };
                 if ok {

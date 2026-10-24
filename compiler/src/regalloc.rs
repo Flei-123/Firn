@@ -3547,10 +3547,17 @@ fn foldable_addresses(
     let abs_ok = gfold && !crate::target::windows() && !crate::target::pic();
     if gfold {
         for b in &f.blocks {
-            for i in &b.insts {
+            for (idx, i) in b.insts.iter().enumerate() {
                 if let (Some(d), Op::GlobalAddr { name }) = (i.dst, &i.op) {
                     if single(d) && read.get(d as usize).copied() == Some(1) && !f.is_secret(d) {
-                        gname.insert(d, intern_sym(crate::statics::label_of(name)));
+                        let direct = match b.insts.get(idx + 1).map(|n| &n.op) {
+                            Some(Op::Load { addr }) => *addr == d,
+                            Some(Op::Store { addr, val }) => *addr == d && *val != d,
+                            _ => false,
+                        };
+                        if abs_ok || direct {
+                            gname.insert(d, intern_sym(crate::statics::label_of(name)));
+                        }
                     }
                 }
             }
