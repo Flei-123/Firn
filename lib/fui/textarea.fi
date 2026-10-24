@@ -60,6 +60,7 @@ import fui.widget
 import fui.style
 import fui.theme
 import paint.canvas
+import fui.viewport
 
 export {
     Lines, ta_new, ta_init, ta_free,
@@ -69,6 +70,7 @@ export {
     ta_key, ta_char, ta_mouse_down, ta_mouse_drag, ta_wheel,
     ta_scroll_y, ta_scroll_to_caret, ta_content_h, ta_row_h, ta_visible_rows,
     ta_caret_box, ta_draw, ta_set_metrics,
+    ta_touch_down, ta_touch_move, ta_touch_up, ta_kin_tick, ta_moving, ta_over,
 }
 
 // How many visual lines at most. A text over this many lines is cut: the
@@ -94,6 +96,11 @@ struct Lines {
     px_pt: f64,
     row_k: f64,
     bar_off: bool,
+    kin: viewport.Viewport,
+    tr_y: [f64; 16],
+    tr_t: [i64; 16],
+    tr_n: usize,
+    tr_pos: f64,
 }
 
 fn meas_none(ctx: u64, p: u64, n: usize) -> f64 { return 0.0 }
@@ -106,6 +113,7 @@ fn ta_new() -> Lines {
         goal_x: 0.0, goal_on: 0, goal_caret: 0,
         meas: meas_none, mctx: 0, z: 0, run: painter.run_new(14.0),
         px_pt: 0.0, row_k: 0.0, bar_off: false,
+        kin: viewport.viewport_new(0.0, 0.0, 0.0, 0.0, 0.0, 0.0), tr_y: [0.0; 16], tr_t: [0; 16], tr_n: 0, tr_pos: 0.0,
     }
 }
 
@@ -465,6 +473,111 @@ fn ta_clamp_scroll(l: *mut Lines) {
 fn ta_wheel(l: *mut Lines, dy: f64) {
     (*l).scroll_y = (*l).scroll_y + dy
     ta_clamp_scroll(l)
+    ta_kin_stop(l)
+}
+
+fn ta_kin_stop(l: *mut Lines) {
+    ta_kin_sync(l)
+    viewport.viewport_set_offset(&(*l).kin, 0.0, (*l).scroll_y)
+    viewport.viewport_set_overscroll(&(*l).kin, false)
+}
+
+const FLING_DP: f64 = 160.0
+const FLING_MIN_PX_S: f64 = 120.0
+const TR_HORIZON_US: i64 = 100000
+const TR_REST_US: i64 = 80000
+
+fn ta_kin_sync(l: *mut Lines) {
+    var w: f64 = (*l).width
+    if w < 1.0 {
+        w = 1.0
+    }
+    viewport.viewport_set_bar(&(*l).kin, 0)
+    viewport.viewport_set_rect(&(*l).kin, 0.0, 0.0, w, (*l).view_h)
+    viewport.viewport_set_content(&(*l).kin, w, ta_content_h(l))
+    viewport.viewport_set_overscroll(&(*l).kin, true)
+}
+
+fn ta_over(l: *mut Lines) -> f64 { return viewport.viewport_over_y(&(*l).kin) }
+
+fn ta_moving(l: *mut Lines) -> bool { return viewport.viewport_moving(&(*l).kin) }
+
+fn tr_add(l: *mut Lines, us: i64) {
+    var n: usize = (*l).tr_n
+    if n >= 16 {
+        var i: usize = 1
+        while i < 16 {
+            (*l).tr_y[i - 1] = (*l).tr_y[i]
+            (*l).tr_t[i - 1] = (*l).tr_t[i]
+            i = i + 1
+        }
+        n = 15
+    }
+    (*l).tr_y[n] = (*l).tr_pos
+    (*l).tr_t[n] = us
+    (*l).tr_n = n + 1
+}
+
+fn tr_velocity(l: *mut Lines, us: i64) -> f64 {
+    let n: usize = (*l).tr_n
+    if n < 2 {
+        return 0.0
+    }
+    let t_last: i64 = (*l).tr_t[n - 1]
+    if us - t_last > TR_REST_US {
+        return 0.0
+    }
+    var i: usize = n - 1
+    while i > 0 && t_last - (*l).tr_t[i - 1] <= TR_HORIZON_US {
+        i = i - 1
+    }
+    let span: i64 = t_last - (*l).tr_t[i]
+    if span < 4000 as i64 {
+        return 0.0
+    }
+    return ((*l).tr_y[n - 1] - (*l).tr_y[i]) / ((span as f64) / 1000000.0)
+}
+
+fn ta_touch_down(l: *mut Lines, us: i64) {
+    ta_kin_sync(l)
+    viewport.viewport_set_offset(&(*l).kin, 0.0, (*l).scroll_y)
+    (*l).tr_n = 0
+    (*l).tr_pos = 0.0
+    tr_add(l, us)
+}
+
+fn ta_touch_move(l: *mut Lines, dy: f64, now_ms: i64, us: i64) {
+    ta_kin_sync(l)
+    viewport.viewport_set_offset(&(*l).kin, 0.0, (*l).scroll_y)
+    viewport.viewport_drag(&(*l).kin, 0.0, 0.0 - dy, now_ms)
+    (*l).scroll_y = viewport.viewport_off_y(&(*l).kin)
+    (*l).tr_pos = (*l).tr_pos + dy
+    tr_add(l, us)
+}
+
+fn ta_touch_up(l: *mut Lines, now_ms: i64, us: i64) {
+    let v: f64 = tr_velocity(l, us)
+    var speed: f64 = v
+    if speed < 0.0 {
+        speed = 0.0 - speed
+    }
+    if speed < FLING_MIN_PX_S || viewport.viewport_over_y(&(*l).kin) != 0.0 {
+        return
+    }
+    var ppi: f64 = FLING_DP
+    if (*l).px_pt > 0.0 {
+        ppi = FLING_DP * (*l).px_pt
+    }
+    viewport.viewport_fling_android(&(*l).kin, 0.0, 0.0 - v / 1000.0, now_ms, ppi)
+}
+
+fn ta_kin_tick(l: *mut Lines, now_ms: i64) {
+    if !viewport.viewport_moving(&(*l).kin) {
+        return
+    }
+    ta_kin_sync(l)
+    viewport.viewport_tick(&(*l).kin, now_ms)
+    (*l).scroll_y = viewport.viewport_off_y(&(*l).kin)
 }
 
 // Scroll so that the line of the caret is entirely visible.
@@ -479,6 +592,7 @@ fn ta_scroll_to_caret(l: *mut Lines, ed: *mut editor.Editor) {
         (*l).scroll_y = top + (*l).row_h - (*l).view_h
     }
     ta_clamp_scroll(l)
+    ta_kin_stop(l)
 }
 
 // The caret as a box in the area's own coordinates (top left of the text,
@@ -686,6 +800,8 @@ fn ta_draw(c: *mut render.Ctx, e0: *mut widget.Widget,
     ta_bind_painter(l, z, &r)
     ta_set_view(l, cw, ch, rh)
     ta_relayout(l, ed)
+    ta_kin_tick(l, render.ctx_time(c))
+    let sy: f64 = (*l).scroll_y + ta_over(l)
 
     let t: *mut textbuf.TextBuf = editor.editor_buf(ed)
     let p: u64 = textbuf.tb_ptr(t)
@@ -714,10 +830,10 @@ fn ta_draw(c: *mut render.Ctx, e0: *mut widget.Widget,
         return
     }
     var first: usize = 0
-    if (*l).scroll_y > 0.0 {
-        first = ((*l).scroll_y / rh) as usize
+    if sy > 0.0 {
+        first = (sy / rh) as usize
     }
-    var last: usize = (((*l).scroll_y + ch) / rh) as usize
+    var last: usize = ((sy + ch) / rh) as usize
     if last >= (*l).n {
         last = (*l).n - 1
     }
@@ -728,7 +844,7 @@ fn ta_draw(c: *mut render.Ctx, e0: *mut widget.Widget,
     while i <= last {
         let a: usize = gs(l, i)
         let b: usize = ge(l, i)
-        let top: f64 = cy + (i as f64) * rh - (*l).scroll_y
+        let top: f64 = cy + (i as f64) * rh - sy
         let base: f64 = painter.text_baseline_mid(z, top, rh, px)
         if has_sel {
             // the selected part of this line ...

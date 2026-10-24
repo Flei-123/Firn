@@ -80,6 +80,33 @@ T=$(field t)
 check "a swipe up scrolls the text area (t=$T > 20)" "[ \"${T:-0}\" -gt 20 ]"
 check "the vertical area did not move" "[ \"$(field v)\" = 0 ]"
 
+restart() {
+    $ADB logcat -c
+    $ADB shell am force-stop $PKG
+    $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null
+    sleep 8
+    dismiss_anr
+    $ADB shell input swipe 1 1 2 2 50
+    sleep 1
+}
+
+echo "== 6b. text area fling =="
+restart
+swipe 500 942 500 921 2500
+TS=$(field t)
+restart
+swipe 500 942 500 921 150
+TF=$(field t)
+echo "   INFO    quick flick t=$TF, slow drag t=$TS (fling on the emulator is not asserted yet)"
+
+echo "== 6c. text area rubber band =="
+restart
+$ADB shell input swipe $((500 * W / 1000)) $((921 * H / 1000)) $((500 * W / 1000)) $((942 * H / 1000)) 600
+sleep 3
+check "pulling the text area past its top stretched the band (to < 0 was logged)" "[ $(seen 'to=-') -gt 0 ]"
+check "the text area band sprang back (to = 0)" "[ \"$(field to)\" = 0 ]"
+check "the text area stays at its top (t = 0)" "[ \"$(field t)\" = 0 ]"
+
 echo "== 7. no crash =="
 check "the process is alive" "$ADB shell pidof $PKG | grep -q ."
 
