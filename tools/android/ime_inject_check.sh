@@ -47,11 +47,11 @@ wait_shown() {
     done
     return 1
 }
-crop() {
-    local i=0 all=""
+crop() { # name [x0 y0 x1 y1] in 1/1000 of the screen; default: the name field
+    local i=0 all="" box="${2:-100} ${3:-195} ${4:-900} ${5:-240}"
     while [ $i -lt 6 ]; do
         $ADB exec-out screencap -p > "$OUT/$1.png"
-        all="$all $(python3 - "$OUT/$1.png" 100 255 900 310 <<'PY'
+        all="$all $(python3 - "$OUT/$1.png" $box <<'PY'
 import sys, hashlib
 from PIL import Image
 im = Image.open(sys.argv[1]).convert('RGB')
@@ -84,11 +84,12 @@ expect() { check "$1" "[ \"\$(text)\" = '$2' ]"; }
 
 echo "== 2. the field takes the focus =="
 $ADB logcat -c
+$ADB shell setprop debug.firn.ime '""'
 $ADB shell am force-stop $PKG
 $ADB shell am start -n $PKG/android.app.NativeActivity >/dev/null
 sleep 8
 dismiss_anr
-tap 500 447
+tap 500 385
 wait_shown 1; check "tap into the field: the keyboard is shown" "[ $? = 0 ]"
 sleep 2
 $ADB logcat -d 2>/dev/null | grep -q 'firn *: ime: ready'
@@ -128,6 +129,29 @@ echo "== 5. Enter =="
 inject enter
 sleep 1
 check "the Enter action reached the program" "$ADB logcat -d -s firn:I 2>/dev/null | grep -q 'imenote=enter'"
+
+echo "== 5b. multi-line text area =="
+tap 500 365
+sleep 2
+inject commit 48 69 a 4e
+expect "text area: commit across a line break" 48690a4e
+inject comp fc
+expect "text area: composing text lands on the second line" 48690a4ec3bc
+AC=$(crop acomp 100 308 900 420)
+inject finish
+sleep 1
+AF=$(crop afin 100 308 900 420)
+check "text area: the underline of the composing word is drawn and goes away" "disjoint '$AC' '$AF'"
+inject comp 64 e4
+expect "text area: composing replaces the composing word" 48690a4ec3bc64c3a4
+inject finish
+inject delsur 1 0
+expect "text area: deleteSurroundingText removes the a-umlaut" 48690a4ec3bc64
+inject key 67
+inject key 67
+inject key 67
+inject key 67
+expect "text area: Backspace removes d, u-umlaut, N and the line break" 4869
 
 echo "== 6. no timeouts, no crash =="
 check "no 'ime: request timed out' in the log" "! $ADB logcat -d 2>/dev/null | grep -q 'ime: .*timed out'"
