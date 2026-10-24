@@ -35,35 +35,35 @@ use crate::fir::{FTy, Func, Op, Term, Val};
 use crate::fx::{HashMap, HashSet};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-enum Root {
+pub(crate) enum Root {
     Alloca(Val),
     Global(String),
     Sym(Val),
 }
 
 #[derive(Clone, Debug)]
-struct Loc {
-    root: Root,
-    /// `None` = unknown offset inside the root
-    off: Option<i64>,
+pub(crate) struct Loc {
+    pub(crate) root: Root,
+    pub(crate) off: Option<i64>,
 }
 
 #[derive(Clone)]
-struct Entry {
-    root: Root,
-    off: i64,
-    size: u64,
-    ty: FTy,
-    val: Val,
+pub(crate) struct Entry {
+    pub(crate) root: Root,
+    pub(crate) off: i64,
+    pub(crate) size: u64,
+    pub(crate) ty: FTy,
+    pub(crate) val: Val,
 }
 
-type Table = Vec<Entry>;
+pub(crate) type Table = Vec<Entry>;
 
 const MAX_ENTRIES: usize = 48;
 
-struct Facts {
+pub(crate) struct Facts {
     loc: HashMap<Val, Loc>,
     escaping: HashSet<Val>,
+    taken: Option<crate::gtaken::Taken>,
 }
 
 fn size_of(ty: FTy) -> u64 {
@@ -179,7 +179,7 @@ fn analyse(f: &Func) -> Facts {
             _ => {}
         }
     }
-    Facts { loc, escaping }
+    Facts { loc, escaping, taken: crate::gtaken::get() }
 }
 
 fn is_defined_by_ptr_op(f: &Func, v: Val) -> bool {
@@ -194,7 +194,7 @@ fn is_defined_by_ptr_op(f: &Func, v: Val) -> bool {
 }
 
 impl Facts {
-    fn locate(&self, v: Val) -> Loc {
+    pub(crate) fn locate(&self, v: Val) -> Loc {
         self.loc.get(&v).cloned().unwrap_or(Loc { root: Root::Sym(v), off: Some(0) })
     }
 
@@ -212,9 +212,20 @@ impl Facts {
     fn roots_may_alias(&self, a: &Root, b: &Root) -> bool {
         match (a, b) {
             (Root::Alloca(x), Root::Alloca(y)) => x == y,
+            (Root::Alloca(x), Root::Global(g)) | (Root::Global(g), Root::Alloca(x)) => {
+                self.escaping.contains(x) && self.is_taken(g)
+            }
             (Root::Alloca(x), _) | (_, Root::Alloca(x)) => self.escaping.contains(x),
             (Root::Global(x), Root::Global(y)) => x == y,
+            (Root::Global(g), Root::Sym(_)) | (Root::Sym(_), Root::Global(g)) => self.is_taken(g),
             _ => true,
+        }
+    }
+
+    fn is_taken(&self, name: &str) -> bool {
+        match &self.taken {
+            Some(t) => t.contains(name),
+            None => true,
         }
     }
 }
@@ -233,12 +244,14 @@ pub fn run(f: &mut Func) -> usize {
     // predecessor counts and the single predecessor
     let mut pred_cnt = vec![0usize; n];
     let mut pred_one = vec![usize::MAX; n];
+    let mut pred_list: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (bi, b) in f.blocks.iter().enumerate() {
         for s in b.term.successors() {
             let s = s as usize;
             if s < n {
                 pred_cnt[s] += 1;
                 pred_one[s] = bi;
+                pred_list[s].push(bi);
             }
         }
     }
@@ -266,9 +279,14 @@ pub fn run(f: &mut Func) -> usize {
     }
     let mut out_state: Vec<Option<Table>> = vec![None; n];
     let mut subst: HashMap<Val, Val> = HashMap::default();
+    let mut pre = 0usize;
     for &bi in &order {
         let mut tab: Table = if pred_cnt[bi] == 1 && pred_one[bi] != bi {
             out_state[pred_one[bi]].clone().unwrap_or_default()
+        } else if pred_cnt[bi] >= 2 {
+            let (seeded, inserted) = crate::loadpre::seed(f, bi, &pred_list[bi], &out_state, &facts);
+            pre += inserted;
+            seeded
         } else {
             Vec::new()
         };
@@ -322,7 +340,7 @@ pub fn run(f: &mut Func) -> usize {
         out_state[bi] = Some(tab);
     }
     if subst.is_empty() {
-        return 0;
+        return pre;
     }
     // resolve chains (a replaced value may itself have been replaced)
     let keys: Vec<Val> = subst.keys().copied().collect();
@@ -339,10 +357,10 @@ pub fn run(f: &mut Func) -> usize {
         subst.insert(k, v);
     }
     crate::mem2reg::replace_uses(f, &subst);
-    subst.len()
+    subst.len() + pre
 }
 
-fn has_memory_effect(op: &Op) -> bool {
+pub(crate) fn has_memory_effect(op: &Op) -> bool {
     !matches!(
         op,
         Op::Const(_)
