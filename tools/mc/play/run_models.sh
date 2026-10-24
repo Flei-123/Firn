@@ -2,10 +2,10 @@
 # tools/mc/play/run_models.sh -- mcplay with MCPLAY_MODELS=1 (pack blockstates + models: stairs from baked quads instead of cubes) against the official 1.20.1
 # server (flat world): Xvfb + server + mcplay + xdotool. Own fixture pack (built here with python zipfile + PIL, NO Mojang file): oak_planks.png with four
 # pure quadrant colours (red / green top, blue / yellow bottom), a stairs model (parent block/stairs) and an oak_stairs blockstate with all four facings.
-# Run A: MCPLAY_MODELS=1 MCPLAY_STREAM=0 (mc_render_world). Run B: same world, MCPLAY_MODELS unset (default: the stairs are full cubes). Run C: like A, but the T key (pack reload) is
+# Run A: MCPLAY_MODELS=1 MCPLAY_STREAM=0 (mc_render_world). Run B: same world, MCPLAY_MODELS unset (default: the stairs are full cubes). Run C: like A, but the F5 key (pack reload) is
 # pressed after the blocks stand -> ModelSet reset + wr_clear, the picture must have the models again.
 # Runs D / E / F (r236b): like A / C, but with the mc_stream path (MCPLAY_STREAM=1 = default, worker pool): D must look like A (same fixture colours, picture
-# differs from A by no more than the same pair without models, F (cubes, STREAM=0) vs B, exactly 0 px since r246, randomTickSpeed 0), E (T key: stream_release -> ms_reset -> new stream with stream_set_models) must have the models again. Same pick probes.
+# differs from A by no more than the same pair without models, F (cubes, STREAM=0) vs B, exactly 0 px since r246, randomTickSpeed 0), E (F5 key: stream_release -> ms_reset -> new stream with stream_set_models) must have the models again. Same pick probes.
 # Pick probes (MCPLAY_PICK_PROBE, r236b): A / C pick the quads of the stairs (mc_model_pick: distances 3.0 / 4.5 / 4.0), B the whole voxel (2.5 / 4.0 / 4.0).
 # Checks: exit 0, frames; A and C print `models on` + `models states=N unmapped=0` (N > 0); B prints no `models` line; A has >= 120 pixels of EACH of
 # the four fixture colours in the 3D view; B differs from A in >= 1 % of the 3D view pixels (stairs vs cubes); C has the fixture colours again.
@@ -114,7 +114,7 @@ run_one() { # name, reload, env...
             echo "tp $pn 0.5 -60 0.5 0 20" >&3
             wait_log "Teleported $pn to" 10 "$nl" || ok=0
             sleep 4
-            if [ "$reload" = 1 ]; then xdotool key t; sleep 6; fi
+            if [ "$reload" = 1 ]; then xdotool key F5; sleep 6; fi
         else
             ok=0
         fi

@@ -44,7 +44,7 @@ Gamepad PLAN: `lib/input/pad*.fi` -> left stick = WASD vector (needs analog move
 dx/dy scaled per tick, A = jump, RT/LT = place/break, shoulder buttons = hotbar -/+, Start = Esc.
 
 ## Update 14.10. (mc-t2)
-* Time of day from the update_time packet (MCPLAY_TICKS only until the first packet), vertex light (mc_wlight) + sky daylight uniform every frame, resource pack tick/hot reload (T) on the current back end.
+* Time of day from the update_time packet (MCPLAY_TICKS only until the first packet), vertex light (mc_wlight) + sky daylight uniform every frame, resource pack tick/hot reload (F5) on the current back end.
 * Sound: `FIRN_AUDIO=file:/x.wav|null|device`, bank from `tools/sounds/gen tools/sounds/mc.json <dir>` (MCPLAY_SOUNDS, default ~/.cache/mcplay/sounds; run.sh builds it when missing). Walk steps (mca_walk), break/place block sounds (place plays when the server's Block Update arrives), sound packets (mca_on_packet), volumes MCPLAY_VOL_<CAT>=0..100, M = mute. At exit: `audio bytes= crc= sounds= played=`. NOT heard on the server; the WAV is the proof. Device sink = audio thread (`__thread_work` in main.fi).
 * GL path: `MCPLAY_GL=1` (+ MCPLAY_VSYNC=0|1): glwindow (EGL/GLX) + gl_mc back end + gl_scene (sky, world via wr_render_b, selection box = 12 thin boxes, HUD rectangles) + scene_present_window (no read back) + swap; resize = glbe_resize. Screenshot = one read back at exit. run.sh: GL stage under Xvfb + llvmpipe (software, NOT a real GPU): 147 frames at ~23 fps vs CPU 3-5 fps in the same test.
 * glctx.fi: local `at` renamed (clashed with a generic `at` pulled in by audio.engine -> any program mixing audio.engine and gpu.glctx failed to compile).

@@ -78,7 +78,7 @@ run_one() { # name, reload, env...
             echo "tp $pn 0.5 -60 0.5 0 20" >&3
             wait_log "Teleported $pn to" 10 "$nl" || ok=0
             sleep 4
-            if [ "$reload" = 1 ]; then xdotool key t; sleep 6; fi
+            if [ "$reload" = 1 ]; then xdotool key F5; sleep 6; fi
         else
             ok=0
         fi

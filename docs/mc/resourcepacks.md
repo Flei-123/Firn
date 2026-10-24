@@ -108,7 +108,7 @@ tiles and opaque bit). Weighted variants use `seed_from_pos` (4 seeds per state,
 Own built-ins: stairs, inner_stairs, outer_stairs. Output = `MQ_WORDS` (24) f64 per quad, drawn by the CPU raster as `MESH_MODEL` meshes
 (`mesh_class(MESH_MODEL)` + `mesh_upload`, `raster_draw_models`). `mc_render_world.wr_set_models(wr, &modelset)` switches it on (default off).
 **mcplay (r235):** `MCPLAY_MODELS=1` builds the ModelSet from `res.stack` / `res.ex` (needs packs, CPU back end; forces `MCPLAY_STREAM=0`, LOD off; GL / VK ignore it with a
-warning). The T key (pack reload) drops the meshes (`wr_clear_b`), resets the ModelSet (`ms_reset`), restores the cube tables (`res_build_tables`) and re-derives the
+warning). The F5 key (pack reload) drops the meshes (`wr_clear_b`), resets the ModelSet (`ms_reset`), restores the cube tables (`res_build_tables`) and re-derives the
 translucent table. Default (no env) is unchanged. Exit line: `mcplay: models states=N unmapped=M`.
 **Picture test (r235):** `tests/3948_mc_model_image.fi` renders four stairs (all facings, uvlock) through `wr_render` and compares pixel classes with a ray caster over the baked quads
 (four-colour texture; swapped / mirrored UV or reversed quad winding give 12-100 % mismatch, the correct code ~1.6 % = edges). Quad winding (CCW from outside) and UV orientation of

@@ -32,7 +32,7 @@
 //   log:   MCPLAY_LOG=<file> (stdout+stderr into a file; "-" = never; unset = automatic when there is no console)
 //   sound: MCPLAY_SOUNDS=<dir with bank.json + wavs> (default: <exe dir>/sounds, then $HOME/.cache/mcplay/sounds; made by tools/sounds/gen tools/sounds/mc.json <dir>)
 //          FIRN_AUDIO=file:/x.wav|null|device (default device); MCPLAY_AUDIO=0 off; MCPLAY_VOL_<MASTER|BLOCKS|AMBIENT|PLAYERS|HOSTILE|NEUTRAL|MUSIC|UI>=0..100; M = mute
-//   packs: MC_PACKS / MC_PACK_CONFIG / MC_PACK_AUTO (see docs/mc/resourcepacks.md); T = hot reload (atlas + pack sounds), animated tiles tick at 20 Hz
+//   packs: MC_PACKS / MC_PACK_CONFIG / MC_PACK_AUTO (see docs/mc/resourcepacks.md); F5 = hot reload (atlas + pack sounds), animated tiles tick at 20 Hz
 //          MC_PACK_SOUNDS=synth|original|both (default synth; original/both read sounds.json + OGG of the packs, both = synth bank + pack events on top)
 //          config file (MC_PACK_CONFIG) line `sounds=synth|original|both` does the same; O = switch pack sounds off/on while playing; pack "weight" entries are honoured
 //   MCPLAY_DIG_MS=700  hold time before the "finish digging" packet in survival (there is no hardness table yet)
@@ -88,6 +88,11 @@ import mc.mc_shapes
 import mc.mc_hud
 import mc.mc_blockset
 import mc.mc_play
+import mc.mc_chat
+import mc.mc_chat_ui
+import mc.mc_chat_net
+import mc.mc_health
+import mc.mc_health_ui
 import mc.mc_wlight
 import mc.mc_packs
 import mc.mc_packsnd
@@ -131,7 +136,7 @@ const SC_ESC: u32 = 1
 const SC_F: u32 = 33
 const SC_N: u32 = 49
 const SC_F11: u32 = 87
-const SC_T: u32 = 20
+const SC_F5: u32 = 63
 const SC_M: u32 = 50
 const SC_O: u32 = 24
 const AUDIO_RATE: u32 = 44100
@@ -451,6 +456,10 @@ struct Ctx {
     dg: mc_dig.DigData,
     rcp: mc_craft.Recipes, // recipe table of the version for the craft result prediction (mc_inv.inv_use_recipes)
     show_inv: bool,
+    chat: mc_chat.Chat,
+    chat_net: mc_chat_net.ChatNet,
+    health: mc_health.Health,
+    chat_test_done: bool,
     cont_ui: bool, // the inventory panel was opened by a container window (chest ...): closes with it
     ui_regrab: bool, // the mouse was captured when the panel opened: capture it again on close
     give_done: bool,
@@ -773,8 +782,22 @@ fn apply_hashed_seed(c: *mut Ctx, id: i32) {
     mc_model_mesh.ms_set_seed(&(*c).ms, seed)
 }
 
+fn health_sig(h: *mut mc_health.Health) -> u64 {
+    return (*h).n_updates + (*h).n_deaths * 1000 as u64 + (*h).n_alive * 1000000 as u64 + (mc_health.health_message_len(h) as u64) * 1000000000 as u64
+}
+
+fn on_health(c: *mut Ctx, id: i32) {
+    let h: *mut mc_health.Health = &(*c).health
+    let before: u64 = health_sig(h)
+    mc_health.health_on_packet(h, &(*c).chat_net, &(*c).cl, id, now_ms())
+    if health_sig(h) == before || !env_flag("MCPLAY_HEALTH_LOG", false) { return }
+    let msg: str = str { p: mc_health.health_message_ptr(h) as *u8, n: mc_health.health_message_len(h) }
+    say(f"mcplay: health hp={(*h).hp} food={(*h).food} dead={(*h).dead} deaths={(*h).n_deaths} alive={(*h).n_alive} respawn_sent={(*h).n_respawn_sent} msg={msg}\n")
+}
+
 fn on_packet(c: *mut Ctx, id: i32) {
     let cl: *mut mc_client.Client = &(*c).cl
+    on_health(c, id)
     if mc_client.client_auto_reply(cl, id) {
     } else if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_JOIN_GAME) {
         if !(*c).join {
@@ -827,6 +850,7 @@ fn on_packet(c: *mut Ctx, id: i32) {
         apply_hashed_seed(c, id)
         mc_entity.store_clear(&(*c).ents)
         (*c).ent_resets = (*c).ent_resets + 1 as u64
+    } else if on_chat(c, id) {
     } else if mc_entity.entity_on_packet(&(*c).ents, &(*cl).ver, id, mc_client.client_body(cl)) {
         let n: usize = mc_entity.store_count(&(*c).ents)
         if n > (*c).ent_peak { (*c).ent_peak = n }
@@ -869,6 +893,7 @@ fn pump(c: *mut Ctx) {
     var guard: i32 = 0
     while k != window.EV_NONE && guard < 20000 {
         guard = guard + 1
+        if k == window.EV_CHAR { mc_chat_ui.chat_ui_char(&(*c).chat, window.ev_a((*c).wp), !(*c).show_inv && !(*c).health.dead) }
         if k == window.EV_CONFIGURE {
             (*c).resized = true
         } else if k == window.EV_CLOSED {
@@ -888,10 +913,51 @@ fn pump(c: *mut Ctx) {
         }
     }
     raw.raw_end(&(*c).rw)
+    chat_pump_end(c)
+}
+
+fn chat_pump_end(c: *mut Ctx) {
+    let ch: *mut mc_chat.Chat = &(*c).chat
+    let k: i32 = mc_chat_ui.chat_ui_keys(ch, &(*c).rw, !(*c).show_inv && !(*c).health.dead)
+    if (*ch).open && !(*ch).was_open {
+        (*ch).was_open = true
+        (*ch).regrab = (*c).grab
+        if (*c).grab { grab_mouse(c, false) }
+    }
+    if (k & mc_chat_ui.CK_SUBMIT) != 0 { mc_chat_net.chat_send_input(ch, &(*c).cl) }
+    if !(*ch).open && (*ch).was_open {
+        (*ch).was_open = false
+        if (*ch).regrab { grab_mouse(c, true) }
+        (*ch).regrab = false
+    }
+    if mc_health_ui.health_ui_keys(&(*c).health, &(*c).rw) {
+        mc_health.health_respawn(&(*c).health, &(*c).cl, now_ms())
+        raw.raw_clear(&(*c).rw)
+    }
+    if k != 0 { raw.raw_clear(&(*c).rw) }
+}
+
+fn on_chat(c: *mut Ctx, id: i32) -> bool {
+    if !mc_chat_net.chat_on_packet(&(*c).chat_net, &(*c).chat, &(*c).cl, id, now_ms()) { return false }
+    if env_flag("MCPLAY_CHAT_LOG", false) && mc_chat.chat_line_count(&(*c).chat) > 0 {
+        let line: str = str { p: mc_chat.chat_line_ptr(&(*c).chat, 0) as *u8, n: mc_chat.chat_line_len(&(*c).chat, 0) }
+        say(f"mcplay: chat line={line}\n")
+    }
+    return true
+}
+
+fn chat_test(c: *mut Ctx) {
+    if (*c).chat_test_done || (*c).n_ticks < (env_int("MCPLAY_CHAT_TEST_TICKS", 60) as u64) { return }
+    (*c).chat_test_done = true
+    let s: str = env.get("MCPLAY_CHAT_TEST")
+    if s.n == 0 { return }
+    let n: i32 = mc_chat_net.chat_send_script(&(*c).chat, &(*c).cl, s.p as u64, s.n)
+    say(f"mcplay: chattest sent={n}\n")
 }
 
 fn keys_now(c: *mut Ctx) -> u32 {
     var m: u32 = 0 as u32
+    if (*c).chat.open || (*c).health.dead { return m }
     if (*c).show_inv { return m } // an open inventory / container panel takes the keys
     if env_flag("MCPLAY_FORCE_SNEAK", false) { m = m | mc_input.K_SNEAK }
     var sc: u32 = 0 as u32
@@ -961,7 +1027,7 @@ fn handle_window(c: *mut Ctx) {
         mc_audio.mca_set_muted((*c).ma, (*c).aud_muted)
     }
     if (*c).aud && (*c).g.use_res && raw.key_pressed(&(*c).rw, SC_O) { audio_sounds_toggle(c) }
-    if (*c).g.use_res && raw.key_pressed(&(*c).rw, SC_T) {
+    if (*c).g.use_res && raw.key_pressed(&(*c).rw, SC_F5) {
         var be: mc_backend.Backend = cur_be(c)
         let nr: i32 = mc_packs.res_on_key(&(*c).g.res, &be, mc_packs.RES_KEY_RELOAD)
         if nr >= 0 {
@@ -976,7 +1042,7 @@ fn handle_window(c: *mut Ctx) {
     }
 }
 
-// MCPLAY_MODELS after a pack reload (T): the models / blockstates / texture names may all have changed. Drops every mesh, forgets the baked models
+// MCPLAY_MODELS after a pack reload (F5): the models / blockstates / texture names may all have changed. Drops every mesh, forgets the baked models
 // and restores the cube tables (ms_prepare took the faces of model states out of them), then the translucent table is derived again.
 fn models_reload(c: *mut Ctx) {
     if !(*c).models_on { return }
@@ -1052,6 +1118,7 @@ fn handle_hotbar(c: *mut Ctx) {
         }
     }
     if (*c).have_pos { give_items(c) }
+    if (*c).have_pos { chat_test(c) }
     if (*c).have_pos {
         let tf: i32 = test_flags()
         if tf != 0 { run_tests(c, tf) }
@@ -1178,6 +1245,8 @@ fn draw_slot_label(c: *mut Ctx, r: *mut mc_raster.Raster, x: i32, y: i32, s: i32
 // Hotbar item labels, the dig progress bar and (E) the inventory panel (36 slots: main 3 rows, hotbar row below).
 fn draw_inventory(c: *mut Ctx, r: *mut mc_raster.Raster) {
     let s: i32 = mc_hud.hud_scale((*c).w, (*c).h)
+    mc_health_ui.health_ui_draw(&(*c).health, r, s)
+    mc_chat_ui.chat_ui_draw(&(*c).chat, r, s, now_ms())
     let bx: i32 = ((*r).w - 181 * s) / 2
     let by: i32 = (*r).h - 23 * s
     var k: i32 = 0
@@ -1935,6 +2004,7 @@ fn chest_test(c: *mut Ctx) {
 }
 
 fn handle_mouse(c: *mut Ctx) {
+    if (*c).chat.open || (*c).health.dead { return }
     if (*c).show_inv && (*c).have_pos {
         ui_inv_click(c)
         return
@@ -2866,7 +2936,7 @@ fn main(start: u64) -> i32 {
         pend_place: false, pend_x: 0, pend_y: 0, pend_z: 0, pend_t: 0, n_snd: 0, n_snd_pkt: 0,
         probe: env_flag("MCPLAY_AUDIO_PROBE", false), probe_i: 0, probe_next: 0 as u64, amb: mc_audio.mca_ambient_new(4242 as i64), amb_x: (env_int("MCPLAY_AMBIENT_X", 1) as f64), amb_dark: env_flag("MCPLAY_AMBIENT_DARK", false), n_amb: 0 as u64,
         n_chunks: 0, n_unload: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, fps: 0,
-        inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), rcp: mc_craft_sel.recipes_for_protocol(proto), ct4_phase: 0, ct4_t: 0 as u64, ct4_src: 0 - 1, ct4_n0: 0 as u32, show_inv: false, cont_ui: false, ui_regrab: false, give_done: false, dig_total: 0,
+        chat: mc_chat.chat_new(), chat_net: mc_chat_net.chat_net_new(), health: mc_health.health_new(), chat_test_done: false, inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), rcp: mc_craft_sel.recipes_for_protocol(proto), ct4_phase: 0, ct4_t: 0 as u64, ct4_src: 0 - 1, ct4_n0: 0 as u32, show_inv: false, cont_ui: false, ui_regrab: false, give_done: false, dig_total: 0,
         fx: mc_effect.fx_new(), fx_ticks: 0 - 1, fx_plain: 0 - 1, click_phase: 0, click_t: 0 as u64, click_src: 0 - 1, ct2_phase: 0, ct2_t: 0 as u64, ct2_a: 0 - 1, ct2_b: 0 - 1, ct2_d: 0 - 1, ct3_phase: 0, ct3_t: 0 as u64, ct3_tries: 0, tt_phase: 0, tt_t: 0 as u64, tt_tries: 0, tt_n0: 0 as u32, st_phase: 0, st_t: 0 as u64, st_seen: 0, st_x: 0, st_y: 0, st_z: 0, sneak_sent: false, loaded_sent: false, n_sneak: 0 as u32, ht_phase: 0, ht_t: 0 as u64, ht_a: 0 - 1, ht_b: 0 - 1, ht_n0: 0 as u32, ht_d: [0; 4], last_click_slot: 0 - 1, last_click_t: 0 as u64,
     }
     if !c.g.ok {
