@@ -88,6 +88,7 @@ existing installs can never be updated again (users have to uninstall).
 | `lib/plat/sysfont.fi` | The system face: DejaVu on Linux, Roboto on Android. |
 | `tools/android/build.sh` | Any entry file -> APK. |
 | `tools/android/gallery_check.sh` | The acceptance run on a device or emulator. |
+| `tools/android/accept.sh` | Gallery, ime inject, keyboard and swipe checks one after another on one emulator (boots its own on port 5590 unless `SERIAL` is set), one summary line `ANDROID ACCEPT: n passed, m failed`. |
 | `lib/plat/android/pick.fi` | A photo from the gallery or the camera, pictures into pixels (see below). |
 
 ## Measured (emulator, Android 15 x86_64, 23.09.2026)
@@ -335,9 +336,12 @@ focus; nothing is built before.
 * **Text area composition (r972).** `textarea.ta_draw` underlines the composing word per line; `ime_inject_check.sh` section 5b injects a
   multi-line commit, composition, replacement and deletion into the text area of `imetest_app.fi` (the pump logs the focused field).
 * **Finger scrolling (r71).** `lay.scroll_v` and the new `lay.scroll_h(a, height_pt)` register `touchscroll.pan_handler`: the finger drags the
-  area 1:1, past an end the rubber band (`viewport_drag`, overscroll on) stretches and springs back, a flick runs out. A text area drags
-  1:1 (no fling, no band yet). `tools/android/swipe_check.sh` runs `swipe_app.fi` and `adb shell input swipe` on both areas and the text
-  area (offsets logged as `swipe v= h= t= ov= oh=`). Programs without `mobile.sync` must call `lay.scroll_sync` every frame.
+  area 1:1, past an end the rubber band (`viewport_drag`, overscroll on) stretches and springs back, a flick runs out. A text area (r973) has the same
+  kinetics: `textarea.ta_touch_down/move/up` drive an embedded viewport (1:1 drag, rubber band past an end, android fling after a quick lift;
+  the wheel, the caret and key scrolling stop a run-out). Mouse and keys on `lay.scroll_h` (r974): the plain wheel over a horizontal-only
+  area scrolls sideways (or the vertical ancestor, if there is one), shift + wheel, the sideways wheel, Left / Right, Home / End / Page keys
+  and the scroll bar. `tools/android/swipe_check.sh` runs `swipe_app.fi` and `adb shell input swipe` on both areas and the text
+  area (offsets logged as `swipe v= h= t= ov= oh= to=`). Programs without `mobile.sync` must call `lay.scroll_sync` every frame.
 * **Not done:** a real phone (the emulator's AOSP keyboard is what was run),
   more than one line of text, the full-screen extract UI (the flags ask the
   keyboard not to use it).
