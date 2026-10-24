@@ -1,0 +1,382 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/window/cfdib.fi -- the Windows clipboard picture formats CF_DIB / CF_DIBV5 <-> PNG, pure functions (no system calls).
+//
+// Windows programs that predate the registered format "PNG" (Paint classic, Word, screenshot tools, Snipping Tool) only
+// know the device independent bitmap. This file makes the two clipboard blocks:
+//
+//   cf_dibv5_from_png   PNG octets  -> BITMAPV5HEADER (124 octets) + 32 bit BGRA, bottom-up, STRAIGHT alpha, BI_BITFIELDS
+//   cf_png_from_dib     CF_DIB or CF_DIBV5 block of any program -> PNG octets (RGBA, 8 bit)
+//
+// Reading accepts: header 40/52/56/108/124 octets; 32, 24 and 8 (palette) bits per pixel; BI_RGB, BI_BITFIELDS (3) and
+// BI_ALPHABITFIELDS (6); bottom-up and top-down (negative height). A 32 bit picture whose alpha octets are ALL zero is
+// treated as opaque (BI_RGB 32 bit has no defined alpha; many programs leave it 0). Anything else (RLE, JPEG/PNG inside the
+// DIB, 1/4/16 bit, OS/2 12 octet header) is refused.
+import std.rt
+import std.deflate
+import paint.png
+
+export { cf_dibv5_from_png, cf_png_from_dib, cf_dibv5_build, cf_dib_parse, cf_png_encode_rgba }
+
+const DIB_MAX_SIDE: usize = 16384
+const DIB_MAX_PIXELS: usize = 100000000
+
+fn rd32(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8) | ((rt.ld8(p, off + 2) as u32) << 16)
+        | ((rt.ld8(p, off + 3) as u32) << 24)
+}
+
+fn rd16(p: u64, off: usize) -> u32 {
+    return (rt.ld8(p, off) as u32) | ((rt.ld8(p, off + 1) as u32) << 8)
+}
+
+fn put_le32(out: *mut rt.Buf, v: u32) {
+    rt.buf_push(out, (v & 255 as u32) as u8)
+    rt.buf_push(out, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(out, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(out, ((v >> 24) & 255 as u32) as u8)
+}
+
+fn put_le16(out: *mut rt.Buf, v: u32) {
+    rt.buf_push(out, (v & 255 as u32) as u8)
+    rt.buf_push(out, ((v >> 8) & 255 as u32) as u8)
+}
+
+fn put_be32(out: *mut rt.Buf, v: u32) {
+    rt.buf_push(out, ((v >> 24) & 255 as u32) as u8)
+    rt.buf_push(out, ((v >> 16) & 255 as u32) as u8)
+    rt.buf_push(out, ((v >> 8) & 255 as u32) as u8)
+    rt.buf_push(out, (v & 255 as u32) as u8)
+}
+
+// APPENDS the CF_DIBV5 block of w*h straight RGBA pixels (top-down, 4 octets each) to `out`.
+fn cf_dibv5_build(rgba: u64, w: usize, h: usize, out: *mut rt.Buf) -> bool {
+    if w == 0 || h == 0 || w > DIB_MAX_SIDE || h > DIB_MAX_SIDE || w * h > DIB_MAX_PIXELS {
+        return false
+    }
+    put_le32(out, 124 as u32) // bV5Size
+    put_le32(out, w as u32) // bV5Width
+    put_le32(out, h as u32) // bV5Height > 0: bottom-up
+    put_le16(out, 1 as u32) // planes
+    put_le16(out, 32 as u32) // bit count
+    put_le32(out, 3 as u32) // BI_BITFIELDS
+    put_le32(out, (w * h * 4) as u32) // size of the pixel data
+    put_le32(out, 3780 as u32) // 96 dpi in pixels per metre
+    put_le32(out, 3780 as u32)
+    put_le32(out, 0 as u32) // colours used
+    put_le32(out, 0 as u32) // colours important
+    put_le32(out, 16711680 as u32) // red mask   0x00FF0000
+    put_le32(out, 65280 as u32) // green mask 0x0000FF00
+    put_le32(out, 255 as u32) // blue mask  0x000000FF
+    put_le32(out, 4278190080 as u32) // alpha mask 0xFF000000
+    put_le32(out, 1934772034 as u32) // LCS_sRGB ('sRGB')
+    var z: usize = 0
+    while z < 9 {
+        put_le32(out, 0 as u32) // CIEXYZTRIPLE endpoints (unused for sRGB)
+        z = z + 1
+    }
+    put_le32(out, 0 as u32) // gamma red / green / blue
+    put_le32(out, 0 as u32)
+    put_le32(out, 0 as u32)
+    put_le32(out, 4 as u32) // LCS_GM_IMAGES
+    put_le32(out, 0 as u32) // profile data / size / reserved
+    put_le32(out, 0 as u32)
+    put_le32(out, 0 as u32)
+    var y: usize = h
+    while y > 0 {
+        y = y - 1
+        let row: u64 = rgba + (y * w * 4) as u64
+        var x: usize = 0
+        while x < w {
+            rt.buf_push(out, rt.ld8(row, x * 4 + 2)) // B
+            rt.buf_push(out, rt.ld8(row, x * 4 + 1)) // G
+            rt.buf_push(out, rt.ld8(row, x * 4)) // R
+            rt.buf_push(out, rt.ld8(row, x * 4 + 3)) // A
+            x = x + 1
+        }
+    }
+    return true
+}
+
+// Index of the lowest set bit and the width of the run of ones from there (0 mask -> shift 0, bits 0).
+fn mask_shift(m: u32) -> u32 {
+    if m == 0 as u32 {
+        return 0 as u32
+    }
+    var s: u32 = 0
+    while ((m >> s) & 1 as u32) == 0 as u32 {
+        s = s + 1 as u32
+    }
+    return s
+}
+
+fn mask_bits(m: u32) -> u32 {
+    if m == 0 as u32 {
+        return 0 as u32
+    }
+    var s: u32 = mask_shift(m)
+    var n: u32 = 0
+    while s < 32 as u32 && ((m >> s) & 1 as u32) != 0 as u32 {
+        n = n + 1 as u32
+        s = s + 1 as u32
+    }
+    return n
+}
+
+// One masked channel scaled to 0..255.
+fn chan8(px: u32, m: u32, sh: u32, bits: u32) -> u8 {
+    if bits == 0 as u32 {
+        return 0 as u8
+    }
+    let v: u32 = (px & m) >> sh
+    if bits == 8 as u32 {
+        return v as u8
+    }
+    if bits >= 32 as u32 {
+        return (v >> 24) as u8
+    }
+    let top: u32 = (1 as u32 << bits) - 1 as u32
+    return ((v * 255 as u32 + top / 2 as u32) / top) as u8
+}
+
+// Reads a CF_DIB / CF_DIBV5 block. `rgba` receives w*h straight RGBA pixels, TOP-down. false = unsupported / damaged.
+fn cf_dib_parse(src: u64, size: usize, rgba: *mut rt.Buf, wout: *mut usize, hout: *mut usize) -> bool {
+    rt.buf_clear(rgba)
+    if size < 40 {
+        return false
+    }
+    let hs: usize = rd32(src, 0) as usize
+    if hs != 40 && hs != 52 && hs != 56 && hs != 108 && hs != 124 {
+        return false
+    }
+    if size < hs {
+        return false
+    }
+    // width / height are signed 32 bit values; handled as u32 (a negative height = top-down rows)
+    let wr: u32 = rd32(src, 4)
+    let hr: u32 = rd32(src, 8)
+    var topdown: bool = false
+    var hh: usize = hr as usize
+    if hr >= 2147483648 as u32 {
+        topdown = true
+        hh = (4294967295 as u32 - hr + 1 as u32) as usize
+    }
+    let w: usize = wr as usize
+    if wr == 0 as u32 || wr > 16384 as u32 || hh == 0 || hh > DIB_MAX_SIDE {
+        return false
+    }
+    if w > DIB_MAX_SIDE || w * hh > DIB_MAX_PIXELS {
+        return false
+    }
+    if rd16(src, 12) != 1 as u32 {
+        return false
+    }
+    let bpp: usize = rd16(src, 14) as usize
+    let comp: u32 = rd32(src, 16)
+    if bpp != 32 && bpp != 24 && bpp != 8 {
+        return false
+    }
+    if comp != 0 as u32 && comp != 3 as u32 && comp != 6 as u32 {
+        return false
+    }
+    if (comp == 3 as u32 || comp == 6 as u32) && bpp != 32 {
+        return false
+    }
+    var off: usize = hs
+    var rm: u32 = 16711680 as u32
+    var gm: u32 = 65280 as u32
+    var bm: u32 = 255 as u32
+    var am: u32 = 4278190080 as u32
+    if comp == 3 as u32 || comp == 6 as u32 {
+        if hs == 40 {
+            // the masks follow the header: 3 DWORDs for BI_BITFIELDS, 4 for BI_ALPHABITFIELDS
+            var nm: usize = 12
+            if comp == 6 as u32 {
+                nm = 16
+            }
+            if size < 40 + nm {
+                return false
+            }
+            rm = rd32(src, 40)
+            gm = rd32(src, 44)
+            bm = rd32(src, 48)
+            am = 0 as u32
+            if comp == 6 as u32 {
+                am = rd32(src, 52)
+            }
+            off = 40 + nm
+        } else {
+            rm = rd32(src, 40)
+            gm = rd32(src, 44)
+            bm = rd32(src, 48)
+            am = 0 as u32
+            if hs >= 56 {
+                am = rd32(src, 52)
+            }
+        }
+    }
+    var ncol: usize = 0
+    if bpp == 8 {
+        ncol = rd32(src, 32) as usize
+        if ncol == 0 || ncol > 256 {
+            ncol = 256
+        }
+    }
+    let pal: usize = off
+    off = off + ncol * 4
+    let stride: usize = ((w * bpp + 31) / 32) * 4
+    if off + stride * hh > size {
+        return false
+    }
+    let rs: u32 = mask_shift(rm)
+    let rb: u32 = mask_bits(rm)
+    let gs: u32 = mask_shift(gm)
+    let gb: u32 = mask_bits(gm)
+    let bs: u32 = mask_shift(bm)
+    let bb: u32 = mask_bits(bm)
+    let ash: u32 = mask_shift(am)
+    let ab: u32 = mask_bits(am)
+    rt.buf_reserve(rgba, w * hh * 4)
+    var anya: bool = false
+    var y: usize = 0
+    while y < hh {
+        var sy: usize = y
+        if !topdown {
+            sy = hh - 1 - y
+        }
+        let row: u64 = src + (off + sy * stride) as u64
+        var x: usize = 0
+        while x < w {
+            var r: u8 = 0 as u8
+            var g: u8 = 0 as u8
+            var b: u8 = 0 as u8
+            var a: u8 = 255 as u8
+            if bpp == 32 {
+                let px: u32 = rd32(row, x * 4)
+                r = chan8(px, rm, rs, rb)
+                g = chan8(px, gm, gs, gb)
+                b = chan8(px, bm, bs, bb)
+                if am != 0 as u32 {
+                    a = chan8(px, am, ash, ab)
+                    if a != 0 as u8 {
+                        anya = true
+                    }
+                }
+            } else if bpp == 24 {
+                b = rt.ld8(row, x * 3)
+                g = rt.ld8(row, x * 3 + 1)
+                r = rt.ld8(row, x * 3 + 2)
+            } else {
+                var ix: usize = rt.ld8(row, x) as usize
+                if ix >= ncol {
+                    ix = 0
+                }
+                b = rt.ld8(src + pal as u64, ix * 4)
+                g = rt.ld8(src + pal as u64, ix * 4 + 1)
+                r = rt.ld8(src + pal as u64, ix * 4 + 2)
+            }
+            rt.buf_push(rgba, r)
+            rt.buf_push(rgba, g)
+            rt.buf_push(rgba, b)
+            rt.buf_push(rgba, a)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    if am == 0 as u32 || !anya {
+        // no usable alpha: opaque
+        let p: u64 = rt.buf_ptr(rgba)
+        var i: usize = 0
+        while i < w * hh {
+            rt.st8(p, i * 4 + 3, 255 as u8)
+            i = i + 1
+        }
+    }
+    *wout = w
+    *hout = hh
+    return true
+}
+
+fn png_chunk(out: *mut rt.Buf, t0: u8, t1: u8, t2: u8, t3: u8, p: u64, n: usize) {
+    put_be32(out, n as u32)
+    let start: usize = rt.buf_len(out)
+    rt.buf_push(out, t0)
+    rt.buf_push(out, t1)
+    rt.buf_push(out, t2)
+    rt.buf_push(out, t3)
+    rt.buf_push_bytes(out, p, n)
+    put_be32(out, deflate.crc32(rt.buf_ptr(out) + start as u64, 4 + n))
+}
+
+// APPENDS a PNG (8 bit RGBA, filter "Sub" on every row) of w*h straight RGBA pixels to `out`.
+fn cf_png_encode_rgba(rgba: u64, w: usize, h: usize, out: *mut rt.Buf) -> bool {
+    if w == 0 || h == 0 || w > DIB_MAX_SIDE || h > DIB_MAX_SIDE || w * h > DIB_MAX_PIXELS {
+        return false
+    }
+    let stride: usize = w * 4
+    var raw: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&raw, (stride + 1) * h)
+    var y: usize = 0
+    while y < h {
+        let row: u64 = rgba + (y * stride) as u64
+        rt.buf_push(&raw, 1 as u8) // filter Sub
+        var i: usize = 0
+        while i < stride {
+            var left: u8 = 0 as u8
+            if i >= 4 {
+                left = rt.ld8(row, i - 4)
+            }
+            rt.buf_push(&raw, ((rt.ld8(row, i) as u32 + 256 as u32 - left as u32) & 255 as u32) as u8)
+            i = i + 1
+        }
+        y = y + 1
+    }
+    var z: rt.Buf = rt.buf_new()
+    let zn: usize = deflate.zlib_compress(rt.buf_ptr(&raw), rt.buf_len(&raw), 6, &z) catch 0
+    rt.buf_free(&raw)
+    if zn == 0 {
+        rt.buf_free(&z)
+        return false
+    }
+    var sig: [u8; 8] = [137 as u8, 80 as u8, 78 as u8, 71 as u8, 13 as u8, 10 as u8, 26 as u8, 10 as u8]
+    rt.buf_push_bytes(out, (&sig[0]) as u64, 8)
+    var ihdr: rt.Buf = rt.buf_new()
+    put_be32(&ihdr, w as u32)
+    put_be32(&ihdr, h as u32)
+    rt.buf_push(&ihdr, 8 as u8) // bit depth
+    rt.buf_push(&ihdr, 6 as u8) // RGBA
+    rt.buf_push(&ihdr, 0 as u8)
+    rt.buf_push(&ihdr, 0 as u8)
+    rt.buf_push(&ihdr, 0 as u8)
+    png_chunk(out, 73 as u8, 72 as u8, 68 as u8, 82 as u8, rt.buf_ptr(&ihdr), 13)
+    png_chunk(out, 73 as u8, 68 as u8, 65 as u8, 84 as u8, rt.buf_ptr(&z), rt.buf_len(&z))
+    png_chunk(out, 73 as u8, 69 as u8, 78 as u8, 68 as u8, 0 as u64, 0)
+    rt.buf_free(&ihdr)
+    rt.buf_free(&z)
+    return true
+}
+
+// PNG octets -> CF_DIBV5 block (APPENDED to `out`).
+fn cf_dibv5_from_png(png_p: u64, png_n: usize, out: *mut rt.Buf) -> bool {
+    var im: png.Image = png.image_new()
+    if !png.decode_png(png_p, png_n, &im) {
+        png.image_free(&im)
+        return false
+    }
+    let ok: bool = cf_dibv5_build(png.image_points(&im), png.image_width(&im), png.image_height(&im), out)
+    png.image_free(&im)
+    return ok
+}
+
+// CF_DIB / CF_DIBV5 block -> PNG octets (APPENDED to `out`).
+fn cf_png_from_dib(src: u64, size: usize, out: *mut rt.Buf) -> bool {
+    var px: rt.Buf = rt.buf_new()
+    var w: usize = 0
+    var h: usize = 0
+    if !cf_dib_parse(src, size, &px, &w, &h) {
+        rt.buf_free(&px)
+        return false
+    }
+    let ok: bool = cf_png_encode_rgba(rt.buf_ptr(&px), w, h, out)
+    rt.buf_free(&px)
+    return ok
+}

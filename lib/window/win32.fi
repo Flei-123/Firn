@@ -45,6 +45,8 @@ import window.window
 import window.win32_proc
 import window.pointers
 import window.hostmetrics
+import window.cfhtml
+import window.cfdib
 import desktop.notify
 import std.cmdline
 import paint.gl
@@ -80,7 +82,7 @@ export {
     // fUi tempo, stage 2b: THE GPU (only Android has it so far)
     r_gpu_open, r_gpu_swap, r_gpu_close, r_gpu_place, r_gpu_lost,
     r_gpu_gl, r_gpu_proc, r_gpu_vsync, r_fullscreen, r_is_fullscreen, r_cursor_mode, r_cursor_delta,
-    r_raw_input, r_ime_events, r_ime_handle, r_cursor_shape, r_cursor_raw, r_cursor_is_raw,
+    r_raw_input, r_focus_events, r_ime_events, r_ime_handle, r_cursor_shape, r_cursor_raw, r_cursor_is_raw,
     r_native, r_native_visual, r_set_size,
     r_set_topmost, r_is_topmost, r_set_visible, r_is_visible, r_set_frameless, r_is_frameless,
     r_work_area, r_outer_rect, r_place, r_hotkey_set, r_hotkey_clear,
@@ -187,6 +189,7 @@ extern fn CloseClipboard() -> i32;
 extern fn EmptyClipboard() -> i32;
 extern fn SetClipboardData(fmt: i64, h: i64) -> i64;
 extern fn GetClipboardData(fmt: i64) -> i64;
+extern fn IsClipboardFormatAvailable(fmt: i64) -> i32;
 extern fn EnumClipboardFormats(fmt: i64) -> i32;
 extern fn RegisterClipboardFormatW(name: u64) -> i32;
 extern fn GetClipboardFormatNameW(fmt: i64, buf: u64, n: i64) -> i32;
@@ -669,6 +672,7 @@ struct Platte {
     cur_hidden: bool,
     // lib/input round: raw keys / focus, the raw mouse (WM_INPUT), the cursor shape
     rawk: bool,
+    focus_ev: bool,
     // window.ime_events: WM_IME_STARTCOMPOSITION / COMPOSITION / ENDCOMPOSITION go to the host as EV_IME
     imev: bool,
     raw_dx: i64,
@@ -713,7 +717,7 @@ fn surface_new() -> Platte {
         drop: rt.buf_new(), drop_n: 0, clip_own: false,
         gl: wgl.wgl_new(), gpu: false, fs: false, fs_style: 0, fs_x: 0, fs_y: 0,
         fs_w: 0, fs_h: 0, cur_mode: 0 as u32, cur_hidden: false,
-        rawk: false, imev: false, raw_dx: 0, raw_dy: 0, raw_seen: false, raw_reg: false, raw_off: false, cur_shape: 0 as u32,
+        rawk: false, focus_ev: false, imev: false, raw_dx: 0, raw_dy: 0, raw_seen: false, raw_reg: false, raw_off: false, cur_shape: 0 as u32,
         fl_on: false, fl_style: 0, hk_n: 0, hk_id: [0 as u32; 8] }
 }
 
@@ -1077,15 +1081,30 @@ fn nccalc(w: *mut Platte, lp: u64) -> u64 {
     }
     let rb: i64 = border_width(w)
     // NCCALCSIZE_PARAMS: the first RECT is four i32 (l, t, r, b).
-    let l: i32 = rt.ld32(lp, 0) as i32
-    let t: i32 = rt.ld32(lp, 1) as i32
-    let r: i32 = rt.ld32(lp, 2) as i32
-    let b: i32 = rt.ld32(lp, 3) as i32
-    rt.st32(lp, 0, ((l as i64) + rb) as u32)
-    rt.st32(lp, 1, ((t as i64) + rb) as u32)
-    rt.st32(lp, 2, ((r as i64) - rb) as u32)
-    rt.st32(lp, 3, ((b as i64) - rb) as u32)
+    let l: i64 = sext32(rt.ld32(lp, 0))
+    let t: i64 = sext32(rt.ld32(lp, 1))
+    let r: i64 = sext32(rt.ld32(lp, 2))
+    let b: i64 = sext32(rt.ld32(lp, 3))
+    rt.st32(lp, 0, wrap32(l + rb))
+    rt.st32(lp, 1, wrap32(t + rb))
+    rt.st32(lp, 2, wrap32(r - rb))
+    rt.st32(lp, 3, wrap32(b - rb))
     return 0 as u64
+}
+
+fn sext32(v: u32) -> i64 {
+    let x: i64 = v as i64
+    if x >= 2147483648 {
+        return x - 4294967296
+    }
+    return x
+}
+
+fn wrap32(x: i64) -> u32 {
+    if x < 0 {
+        return (x + 4294967296) as u32
+    }
+    return x as u32
 }
 
 // WM_NCHITTEST -- WHAT LIES HERE?
@@ -1334,6 +1353,11 @@ fn r_raw_input(x: *mut Platte, on: bool) -> bool {
     return true
 }
 
+fn r_focus_events(x: *mut Platte, on: bool) -> bool {
+    (*x).focus_ev = on
+    return true
+}
+
 fn r_ime_events(x: *mut Platte, on: bool) -> bool {
     (*x).imev = on
     return true
@@ -1532,8 +1556,18 @@ fn wndproc_body(hwnd: u64, msg: u64, wp: u64, lp: u64) -> u64 {
         }
         return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
     }
+    if m == WM_ACTIVATE {
+        if (*w).focus_ev {
+            var act: u32 = 1 as u32
+            if ((wp as i64) & 65535) == 0 {
+                act = 0 as u32
+            }
+            push_ev(w, window.EV_FOCUS, act, 0 as u32, 0 as u32, 0 as u32)
+        }
+        return DefWindowProcW(hwnd as i64, m, wp as i64, lp as i64) as u64
+    }
     if m == WM_SETFOCUS || m == WM_KILLFOCUS {
-        if (*w).rawk {
+        if (*w).rawk && !(*w).focus_ev {
             var gain: u32 = 0 as u32
             if m == WM_SETFOCUS {
                 gain = 1 as u32
@@ -3419,6 +3453,8 @@ fn clip_format_of(mime: str) -> i64 {
     var m: str = mime
     if mime == "image/png" {
         m = "PNG"
+    } else if mime == "text/html" {
+        m = "HTML Format"
     }
     cmdline.utf8_to_utf16(m.p as u64, m.length(), &name)
     rt.buf_push(&name, 0 as u8)
@@ -3448,6 +3484,56 @@ fn clip_put(fmt: i64, p: u64, n: usize) -> bool {
         return false
     }
     return true
+}
+
+fn clip_put_exact(fmt: i64, p: u64, n: usize) -> bool {
+    let hm: i64 = GlobalAlloc(2, n as i64)
+    if hm == 0 {
+        return false
+    }
+    let q: u64 = GlobalLock(hm)
+    if q == 0 as u64 {
+        GlobalFree(hm)
+        return false
+    }
+    rt.mem_copy(q, p, n)
+    GlobalUnlock(hm)
+    if SetClipboardData(fmt, hm) == 0 {
+        GlobalFree(hm)
+        return false
+    }
+    return true
+}
+
+fn clip_put_dibv5(p: u64, n: usize) {
+    var dib: rt.Buf = rt.buf_new()
+    if cfdib.cf_dibv5_from_png(p, n, &dib) {
+        clip_put_exact(17, rt.buf_ptr(&dib), rt.buf_len(&dib))
+    }
+    rt.buf_free(&dib)
+}
+
+fn clip_get_dib_as_png(out: *mut rt.Buf) -> bool {
+    var h: i64 = 0
+    if IsClipboardFormatAvailable(17) != 0 {
+        h = GetClipboardData(17)
+    }
+    if h == 0 && IsClipboardFormatAvailable(8) != 0 {
+        h = GetClipboardData(8)
+    }
+    if h == 0 {
+        return false
+    }
+    let q: u64 = GlobalLock(h)
+    if q == 0 as u64 {
+        return false
+    }
+    let ok: bool = cfdib.cf_png_from_dib(q, GlobalSize(h) as usize, out)
+    GlobalUnlock(h)
+    if !ok {
+        rt.buf_clear(out)
+    }
+    return ok && rt.buf_len(out) > 0
 }
 
 fn hexv(c: u8) -> i32 {
@@ -3561,6 +3647,22 @@ fn r_clip_set(x: *mut Platte, mime: str, p: u64, n: usize) -> bool {
             ok = clip_put(15, rt.buf_ptr(&d), rt.buf_len(&d))
         }
         rt.buf_free(&d)
+    } else if mime == "text/html" {
+        var blk: rt.Buf = rt.buf_new()
+        cfhtml.cf_html_build(p, n, &blk)
+        let f: i64 = clip_format_of(mime)
+        if f != 0 {
+            ok = clip_put(f, rt.buf_ptr(&blk), rt.buf_len(&blk))
+        }
+        rt.buf_free(&blk)
+    } else if mime == "image/png" {
+        let f: i64 = clip_format_of(mime)
+        if f != 0 {
+            ok = clip_put_exact(f, p, n)
+            if ok {
+                clip_put_dibv5(p, n)
+            }
+        }
     } else {
         let f: i64 = clip_format_of(mime)
         if f != 0 {
@@ -3673,16 +3775,35 @@ fn r_clip_get(x: *mut Platte, mime: str, out: *mut rt.Buf) -> bool {
         }
     } else {
         let f: i64 = clip_format_of(mime)
+        var found: bool = false
         if f != 0 {
             let h: i64 = GetClipboardData(f)
             if h != 0 {
                 let q: u64 = GlobalLock(h)
                 if q != 0 as u64 {
-                    rt.buf_push_bytes(out, q, GlobalSize(h) as usize)
+                    let size: usize = GlobalSize(h) as usize
+                    found = true
+                    if mime == "text/html" {
+                        ok = cfhtml.cf_html_extract(q, size, out)
+                    } else if mime == "image/png" {
+                        let exact: usize = cfhtml.cf_png_exact_len(q, size)
+                        if exact > 0 {
+                            rt.buf_push_bytes(out, q, exact)
+                            ok = true
+                        }
+                    } else {
+                        rt.buf_push_bytes(out, q, size)
+                        ok = true
+                    }
                     GlobalUnlock(h)
-                    ok = true
                 }
             }
+        }
+        if !found && mime == "image/png" {
+            ok = clip_get_dib_as_png(out)
+        }
+        if !ok {
+            rt.buf_clear(out)
         }
     }
     CloseClipboard()
@@ -3697,8 +3818,13 @@ fn r_clip_types(x: *mut Platte, out: *mut rt.Buf) -> usize {
         return 0
     }
     var count: usize = 0
+    var png_seen: bool = false
+    var dib_seen: bool = false
     var f: i32 = EnumClipboardFormats(0)
     while f != 0 {
+        if f == 8 || f == 17 {
+            dib_seen = true
+        }
         if f == 13 {
             let t: str = "text/plain;charset=utf-8\n"
             rt.buf_push_bytes(out, t.p as u64, t.length())
@@ -3716,6 +3842,10 @@ fn r_clip_types(x: *mut Platte, out: *mut rt.Buf) -> usize {
                 if rt.buf_len(&u) == 3 && rt.buf_at(&u, 0) == 80 as u8 && rt.buf_at(&u, 1) == 78 as u8 && rt.buf_at(&u, 2) == 71 as u8 {
                     let t: str = "image/png\n"
                     rt.buf_push_bytes(out, t.p as u64, t.length())
+                    png_seen = true
+                } else if rt.buf_len(&u) == 11 && rt.buf_at(&u, 0) == 72 as u8 && rt.buf_at(&u, 1) == 84 as u8 && rt.buf_at(&u, 2) == 77 as u8 && rt.buf_at(&u, 3) == 76 as u8 {
+                    let t: str = "text/html\n"
+                    rt.buf_push_bytes(out, t.p as u64, t.length())
                 } else {
                     rt.buf_push_bytes(out, rt.buf_ptr(&u), rt.buf_len(&u))
                     rt.buf_push(out, 10 as u8)
@@ -3725,6 +3855,11 @@ fn r_clip_types(x: *mut Platte, out: *mut rt.Buf) -> usize {
             }
         }
         f = EnumClipboardFormats(f as i64)
+    }
+    if dib_seen && !png_seen {
+        let t: str = "image/png\n"
+        rt.buf_push_bytes(out, t.p as u64, t.length())
+        count = count + 1
     }
     CloseClipboard()
     return count

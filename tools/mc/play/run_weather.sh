@@ -58,7 +58,7 @@ Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
 ERR=0
-FIRN_AUDIO="file:$W/weather.wav" MCPLAY_AUDIO_LOG=1 MCPLAY_WEATHER_LOG=1 MCPLAY_RUN_S=${WEATHER_RUN_S:-150} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+FIRN_AUDIO="file:$W/weather.wav" MCPLAY_AUDIO_LOG=1 MCPLAY_WEATHER_LOG=1 MCPLAY_BIOME_LOG=1 MCPLAY_RUN_S=${WEATHER_RUN_S:-150} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 200 "$W/mcplay" 127.0.0.1 "$PORT" WeatherA > "$W/a.out" 2>&1 &
 PP=$!
 wait_for() { # pattern, seconds
@@ -82,6 +82,12 @@ if [ "$PROTO" = 763 ]; then
     NENT=$(tail -n +"$((FALL_FROM + 1))" "$W/a.out" | grep -cE 'audiolog .* ev=entity\.player\.(small|big)_fall ')
     echo "  fall sounds: block=$NBLK entity=$NENT"
     [ "$NBLK" = 1 ] || { echo "  FAIL  expected exactly one block fall sound, got $NBLK"; ERR=1; }
+    [ "$NENT" = 1 ] || { echo "  FAIL  expected exactly one entity fall sound, got $NENT"; ERR=1; }
+    grep -qE 'audiolog .* ev=entity\.player\.big_fall ' "$W/a.out" || { echo "  FAIL  a 12 block fall must play entity.player.big_fall"; ERR=1; }
+    echo "execute at WeatherA run fillbiome ~-8 ~-3 ~-8 ~8 ~3 ~8 minecraft:desert" >&3
+    wait_for 'mcplay: biomes updated chunks=[1-9]' 30 || { echo "  FAIL  fillbiome did not reach the client (no chunk_biomes packet handled)"; ERR=1; }
+    echo "execute at WeatherA run fillbiome ~-8 ~-3 ~-8 ~8 ~3 ~8 minecraft:plains" >&3
+    wait_for 'mcplay: biomes updated chunks=[1-9][0-9]* total=([2-9]|[1-9][0-9])' 30 || { echo "  FAIL  second fillbiome (back to plains) did not reach the client"; ERR=1; }
 fi
 echo "weather rain 1000" >&3
 wait_for 'weather raining=true rain=1000 ' 40 || { echo "  FAIL  rain level did not reach 1000"; ERR=1; }
