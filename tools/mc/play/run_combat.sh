@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/mc/play/run_combat.sh [mc_version=1.20.1] -- combat against an official server: entity pick under the crosshair -> attack (cow loses 2 hp), interact, use item (snowball is consumed), release
 
-# Also: Q drops one snowball, F swaps it into the offhand, holding LMB repeats the attack (cooldown), hit feedback from the damage event.
+# Also: hurt tint on the hit entity, offhand slot in the HUD, bow draw bar + shot. Q drops one snowball, F swaps it into the offhand, holding LMB repeats the attack (cooldown), hit feedback from the damage event.
 # Prints `RESULT mc-play-combat: ok|FAIL`. Env as run_inv.sh (FIRNC, JAVA, MC_VIEW, MCPLAY_KEEP_DIR).
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
@@ -99,6 +99,16 @@ wait_srv 'Cow has the following entity data: [0-5]\.0f' 15 || { echo "  FAIL  ho
 [ "$(grep -c 'combat attack target=.* sent=true' "$W/a.out")" -ge 5 ] || { echo "  FAIL  hold-to-repeat sent fewer than 3 extra attacks"; ERR=1; }
 grep -Eq 'combat fx hurts=[0-9]+ hits=[1-9]' "$W/a.out" || { echo "  FAIL  no confirmed hit feedback (damage event / status) for the attacked cow"; ERR=1; }
 grep -E 'combat fx' "$W/a.out" | tail -1
+grep -Eq 'combat hud tint_frames=[1-9]' "$W/a.out" || { echo "  FAIL  hurt tint never applied to the hit cow"; ERR=1; }
+grep -Eq 'combat hud .*offhand_frames=[1-9]' "$W/a.out" || { echo "  FAIL  offhand slot not drawn after F swap"; ERR=1; }
+echo 'kill @e[tag=tgt]' >&3
+echo "give CombatA minecraft:bow" >&3
+echo "give CombatA minecraft:arrow 8" >&3
+sleep 3
+xdotool mousedown 3; sleep 1.4; xdotool mouseup 3; sleep 1.5
+grep -Eq 'combat hud .*use_max=1000' "$W/a.out" || { echo "  FAIL  bow draw bar never reached full"; grep 'combat hud' "$W/a.out" | tail -2; ERR=1; }
+echo "clear CombatA minecraft:arrow 0" >&3
+wait_srv 'Found 7 matching item\(s\) on player CombatA' 15 || { echo "  FAIL  bow did not shoot an arrow (arrow count != 7)"; grep -E 'matching|No items' "$W/server.log" | tail -2; ERR=1; }
 grep -qiE "invalid|disconnect|kicked|illegal|protocol error" "$W/server.log" && { grep -iE "invalid|disconnect|kicked|illegal|protocol error" "$W/server.log" | head -3; ERR=1; }
 grep 'mcplay: combat' "$W/a.out" | grep -v 'combat attack' | head -12
 echo stop >&3; sleep 1
