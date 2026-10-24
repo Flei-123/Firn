@@ -4585,7 +4585,7 @@ fn emit_variant(f: &Func) -> Result<String, String> {
     tmp.flush_cold();
     // ROUND TK2: the value slots are 8..=value_slots*8 (compact_frame)
     let text = expand_save_markers(&tmp.out, a);
-    Ok(drop_redundant_zext(&descriptor_peephole(&text, a.value_slots)))
+    Ok(crate::retsink::run(&drop_redundant_zext(&descriptor_peephole(&text, a.value_slots))))
 }
 
 // ------------------------------------------------- Register descriptor ---

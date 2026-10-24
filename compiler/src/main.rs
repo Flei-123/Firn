@@ -72,6 +72,7 @@ mod mem2reg;
 mod memcpy_idiom;
 mod memset;
 mod divnonneg;
+mod retsink;
 mod divrem;
 mod loadcse;
 mod storemerge;
