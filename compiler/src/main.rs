@@ -73,6 +73,8 @@ mod memcpy_idiom;
 mod memset;
 mod divnonneg;
 mod retsink;
+mod fpomit;
+mod zextflow;
 mod divrem;
 mod loadcse;
 mod storemerge;

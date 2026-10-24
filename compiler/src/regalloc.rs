@@ -4585,7 +4585,7 @@ fn emit_variant(f: &Func) -> Result<String, String> {
     tmp.flush_cold();
     // ROUND TK2: the value slots are 8..=value_slots*8 (compact_frame)
     let text = expand_save_markers(&tmp.out, a);
-    Ok(crate::retsink::run(&drop_redundant_zext(&descriptor_peephole(&text, a.value_slots))))
+    Ok(crate::fpomit::run(&crate::retsink::run(&crate::zextflow::run(&drop_redundant_zext(&descriptor_peephole(&text, a.value_slots))))))
 }
 
 // ------------------------------------------------- Register descriptor ---
@@ -5495,6 +5495,7 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     let mut sse_i = 0usize;
     let mut stack_i = 0usize;
     let mut from_stack: Vec<(usize, u64)> = Vec::new();
+    let mut narrow_params: Vec<String> = Vec::new();
     for (i, t) in f.params.iter().enumerate() {
         if t.is_float() {
             if sse_i < crate::codegen_x86::SSE_REGS.len() {
@@ -5518,7 +5519,12 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
             int_i += 1;
             match ra.a.loc(i as Val) {
                 Loc::Slot(off) => e.line(&format!("mov qword ptr [rbp-{}], {}", off, r)),
-                Loc::Reg(dst) => prolog_moves.push((dst.to_string(), r.to_string())),
+                Loc::Reg(dst) => {
+                    if *t == FTy::U32 {
+                        narrow_params.push(dst.to_string());
+                    }
+                    prolog_moves.push((dst.to_string(), r.to_string()))
+                }
             }
             continue;
         }
@@ -5528,7 +5534,7 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
         from_stack.push((i, 16 + 8 * stack_i as u64));
         stack_i += 1;
     }
-    parallel_reg_moves(e, &prolog_moves);
+    parallel_reg_moves_narrow(e, &prolog_moves, &narrow_params);
     parallel_xmm_moves(e, &fp_moves);
     for (i, of) in from_stack {
         let t = f.params[i];
@@ -6120,6 +6126,17 @@ fn is_reg64(s: &str) -> bool {
 /// them is broken open through `rax` — `rax` is never the home of a value
 /// (neither in `CALLEE_SAVED` nor in `TEMP_REGS`).
 fn parallel_reg_moves(e: &mut Emitter, pairs: &[(String, String)]) {
+    parallel_reg_moves_narrow(e, pairs, &[])
+}
+
+fn parallel_reg_moves_narrow(e: &mut Emitter, pairs: &[(String, String)], narrow: &[String]) {
+    let emit_mov = |e: &mut Emitter, z: &str, q: &str| {
+        if narrow.iter().any(|n| n == z) {
+            e.line(&format!("mov {}, {}", rn(z, 32), rn(q, 32)));
+        } else {
+            e.line(&format!("mov {}, {}", z, q));
+        }
+    };
     let mut open: Vec<(String, String)> =
         pairs.iter().filter(|(z, q)| z != q).cloned().collect();
     while !open.is_empty() {
@@ -6128,7 +6145,7 @@ fn parallel_reg_moves(e: &mut Emitter, pairs: &[(String, String)]) {
             .position(|(z, _)| !open.iter().any(|(_, q)| q == z))
         {
             let (z, q) = open.remove(i);
-            e.line(&format!("mov {}, {}", z, q));
+            emit_mov(e, &z, &q);
             continue;
         }
         // Only cycles left: rescue the old content of the target into rax, so
@@ -6141,7 +6158,7 @@ fn parallel_reg_moves(e: &mut Emitter, pairs: &[(String, String)]) {
                 *source = "rax".to_string();
             }
         }
-        e.line(&format!("mov {}, {}", z, q));
+        emit_mov(e, &z, &q);
         open.remove(0);
     }
 }
