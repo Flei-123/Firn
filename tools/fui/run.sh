@@ -767,6 +767,13 @@ echo "  flei 1100x700 shot, light + dark   OK"
 [ "$(wc -c < "$W/flei-phone.png")" -gt 15000 ] || { echo "  flei phone shot too small"; exit 1; }
 [ "$(cmp -s "$W/flei-phone.png" "$W/flei-dark.png"; echo $?)" = 1 ] || { echo "  flei phone shot equals desktop shot"; exit 1; }
 [ "$(cmp -s "$W/flei-phone.png" "$W/flei-phone-scroll.png"; echo $?)" = 1 ] || { echo "  flei phone scroll does not move"; exit 1; }
+"$W/fuiapp_flei" --theme dark --size 360x800 --tab 1 --shot "$W/flei-phone-mods.png"
+"$W/fuiapp_flei" --theme dark --size 360x800 --tab 3 --shot "$W/flei-phone-friends.png"
+"$W/fuiapp_flei" --theme dark --tab 1 --shot "$W/flei-mods.png"
+[ "$(cmp -s "$W/flei-phone.png" "$W/flei-phone-mods.png"; echo $?)" = 1 ] || { echo "  flei phone Mods tab equals Home"; exit 1; }
+[ "$(cmp -s "$W/flei-phone-mods.png" "$W/flei-phone-friends.png"; echo $?)" = 1 ] || { echo "  flei phone Friends tab equals Mods"; exit 1; }
+[ "$(cmp -s "$W/flei-dark.png" "$W/flei-mods.png"; echo $?)" = 1 ] || { echo "  flei desktop Mods page equals Home"; exit 1; }
+echo "  flei tabs switch the page (phone tab strip + desktop nav)   OK"
 echo "  flei phone layout (360x800 tab strip, one column, scroll)   OK"
 "$FIRNC" --opt-level=dev -o "$W/fuiapp_form" examples/fui_apps/form/main.fi
 for th in light dark; do
@@ -833,6 +840,10 @@ for k in phone phone-open; do
 done
 [ "$(cmp -s "$W/chat-phone.png" "$W/chat-phone-open.png"; echo $?)" = 1 ] || { echo "  chat phone list equals phone chat"; exit 1; }
 [ "$(cmp -s "$W/chat-phone.png" "$W/chat-dark.png"; echo $?)" = 1 ] || { echo "  chat phone shot equals desktop shot"; exit 1; }
+"$W/fuiapp_chat" --theme dark --size 360x400 --shot "$W/chat-short.png"
+"$W/fuiapp_chat" --theme dark --size 360x400 --scroll 120 --shot "$W/chat-short-scroll.png"
+[ "$(cmp -s "$W/chat-short.png" "$W/chat-short-scroll.png"; echo $?)" = 1 ] || { echo "  chat phone contact list does not scroll"; exit 1; }
+echo "  chat phone contact list scroll (360x400)  OK"
 echo "  chat phone layout (360x800 contacts / conversation)  OK"
 echo "  chat messenger 1100x700 shot, light + dark   OK"
 build kitchat
@@ -861,6 +872,10 @@ done
 "$W/fuiapp_files" --theme dark --size 360x800 --shot "$W/files-phone.png"
 [ "$(wc -c < "$W/files-phone.png")" -gt 20000 ] || { echo "  files phone shot too small"; exit 1; }
 [ "$(cmp -s "$W/files-phone.png" "$W/files-dark.png"; echo $?)" = 1 ] || { echo "  files phone shot equals desktop shot"; exit 1; }
+"$W/fuiapp_files" --theme dark --size 360x800 --drawer --shot "$W/files-phone-drawer.png"
+[ "$(wc -c < "$W/files-phone-drawer.png")" -gt 8000 ] || { echo "  files phone drawer shot too small"; exit 1; }
+[ "$(cmp -s "$W/files-phone.png" "$W/files-phone-drawer.png"; echo $?)" = 1 ] || { echo "  files phone drawer equals the file list"; exit 1; }
+echo "  files phone folder drawer (360x800 tree full width)   OK"
 echo "  files 1100x700 shot, light + dark, phone layout (360x800 side column hidden, two columns)   OK"
 build kitdash
 "$W/kitdash"
