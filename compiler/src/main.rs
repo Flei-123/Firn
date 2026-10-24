@@ -109,6 +109,7 @@ mod peephole;
 mod rotate;
 mod bitsel;
 mod bswapload;
+mod chainsink;
 mod usecount;
 mod promote;
 mod rangecheck;

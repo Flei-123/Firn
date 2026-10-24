@@ -35,11 +35,13 @@ use crate::fx::HashMap;
 
 /// The copy with sunk addresses, or `None` when there is nothing to sink.
 pub fn sink(f: &Func) -> Option<Func> {
-    let a = sink_consts(f);
-    let base: &Func = a.as_ref().unwrap_or(f);
+    let c = crate::chainsink::sink(f);
+    let c_ref: &Func = c.as_ref().unwrap_or(f);
+    let a = sink_consts(c_ref);
+    let base: &Func = a.as_ref().or(c.as_ref()).unwrap_or(f);
     match sink_globals(base) {
         Some(g) => Some(g),
-        None => a,
+        None => a.or(c),
     }
 }
 
