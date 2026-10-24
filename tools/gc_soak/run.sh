@@ -35,7 +35,12 @@ cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
 
 FIRNC=compiler/target/release/firnc
-WORK=.soak-work
+mkdir -p .soak-work
+WORK=$(mktemp -d "$ROOT/.soak-work/run.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT
+LOCK="$ROOT/.soak-work/lock"
+exec 9>"$LOCK"
+flock -n 9 || { echo "ERROR: another gc_soak run holds $LOCK."; exit 1; }
 OUT=tools/gc_soak
 LONG=tools/gc_soak/longrun
 SECS=${SOAK_SEC:-120}
@@ -55,7 +60,7 @@ if [ ! -x "$FIRNC" ]; then
     exit 1
 fi
 [ -f "$OUT/soak.fi" ] || { echo "ERROR: $OUT/soak.fi is missing."; exit 1; }
-mkdir -p "$WORK" "$LONG"
+mkdir -p "$LONG"
 
 # $1 target  $2 budget ms  $3 sample ms  $4 mode
 adjust() {
@@ -116,15 +121,16 @@ for mode in 0 1; do
         exit 1
     fi
     start=$(date +%s)
-    ( ulimit -v $((LEAK_MB * 1024)); exec "$WORK/soak_$mode" ) > "$OUT/measurement-$mode.tsv"
+    ( ulimit -v $((LEAK_MB * 1024)); exec "$WORK/soak_$mode" ) > "$WORK/measurement-$mode.tsv"
     rc=$?
     seconds=$(( $(date +%s) - start ))
+    cp "$WORK/measurement-$mode.tsv" "$OUT/measurement-$mode.tsv"
     if [ $rc -ne 0 ] && [ "$mode" = 0 ]; then
         echo "   ERROR: run $mode ended with $rc:"
-        grep '^# error' "$OUT/measurement-$mode.tsv" | head -2
+        grep '^# error' "$WORK/measurement-$mode.tsv" | head -2
         exit 1
     fi
-    echo "   mode $mode: $(grep '^# done' "$OUT/measurement-$mode.tsv" | cut -c1-100) (${seconds}s wall clock, exit $rc)"
+    echo "   mode $mode: $(grep '^# done' "$WORK/measurement-$mode.tsv" | cut -c1-100) (${seconds}s wall clock, exit $rc)"
 done
 
 # ---------------------------------------------------------- 3. the A/B run
@@ -144,7 +150,7 @@ print('   the two call sites of __gc_roots_rescan are removed for the B side')
 PY
     rc=$?
     if [ $rc -ne 0 ]; then cp "$WORK/gc.fi.orig" lib/gc/gc.fi; exit 1; fi
-    CARGO_TARGET_DIR="$ROOT/$WORK/tgt-nr" cargo build --release \
+    CARGO_TARGET_DIR="$WORK/tgt-nr" cargo build --release \
         --manifest-path compiler/Cargo.toml > "$WORK/cargo-nr.log" 2>&1
     rc=$?
     cp "$WORK/tgt-nr/release/firnc" "$WORK/firnc-norescan" 2>/dev/null
