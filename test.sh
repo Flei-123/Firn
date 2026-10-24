@@ -1324,7 +1324,7 @@ if [ "$COVRC" -eq 0 ]; then
 else
     bad "tools/coverage/run.sh failed (see .test-work/coverage.log)"
     grep FAIL "$WORK/coverage.log" | head -10 | sed 's/^/   /' || true
-echo "== 53d. the compile cache of firnc1: hit, miss, byte-identical to uncached, damaged entries, concurrent (tools/cache/run_c1.sh, r989) =="
+echo "== 53e. the compile cache of firnc1: hit, miss, byte-identical to uncached, damaged entries, concurrent (tools/cache/run_c1.sh, r989) =="
 bash tools/cache/run_c1.sh > "$WORK/cache_c1_proof.log" 2>&1 && CC1RC=0 || CC1RC=$?
 if [ "$CC1RC" -eq 0 ]; then
     ok
