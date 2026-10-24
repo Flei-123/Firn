@@ -78,6 +78,7 @@ C0=$(cur_tick); wait_ticks 60; C1=$(cur_tick)
 xdotool keyup w
 wait_ticks 4
 xdotool keydown shift
+wait_ticks 10
 H0=$(cur_tick); wait_ticks 40; H1=$(cur_tick)
 srv_cmd "data get entity $PN Pos" "$PN has the following entity data" && grep "$PN has the following entity data" "$W/server.log" | tail -1 > "$W/hold.pos"
 xdotool keyup shift
@@ -142,9 +143,11 @@ if hp:
     check(max(abs(hold[-1][2] - hp[0]), abs(hold[-1][4] - hp[2])) <= 250 and abs(hold[-1][3] - hp[1]) <= 250, "hold: client and server positions differ")
 dd = down[0][3] - down[-1][3]
 dv = min(r[5] for r in down)
-print("  down: y %d -> %d (drop %d mm) vy_min=%d" % (down[0][3], down[-1][3], dd, dv))
+slide = max((a[3] - b[3]) * 1.0 / (b[0] - a[0]) for a, b in zip(down, down[1:]))
+print("  down: y %d -> %d (drop %d mm) vy_min=%d slide=%.0f mm/tick" % (down[0][3], down[-1][3], dd, dv, slide))
 check(dd >= 2500, "slide down only %d mm" % dd)
-check(dv >= -170, "slide vy min %d below -170 mm/tick (clamp 150)" % dv)
+check(dv >= -230, "slide vy min %d below -230 mm/tick" % dv)
+check(slide <= 155, "slide speed %.0f mm/tick above the 150 clamp" % slide)
 sys.exit(1 if bad else 0)
 PY
 if grep -qE "moved too quickly|moved wrongly" "$W/server.log"; then
