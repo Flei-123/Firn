@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.process
+
+export {
+    r_update_run, r_update_poll, r_new_window, r_restart_self,
+}
+
+const PATH_CAP: usize = 1024
+const URL_MAX: usize = 1000
+
+static mut G_UPDATE: process.Child = process.Child { pid: 0, h: 0 as u64, in_fd: -1, out_fd: -1, err_fd: -1,
+    done: true, code: 0, sig: 0, own: false }
+static mut G_UPDATE_ON: bool = false
+
+fn blank_child() -> process.Child {
+    return process.Child { pid: 0, h: 0 as u64, in_fd: -1, out_fd: -1, err_fd: -1,
+        done: true, code: 0, sig: 0, own: false }
+}
+
+fn dead_child(failed: *mut bool) -> process.Child {
+    *failed = true
+    return blank_child()
+}
+
+fn cstr_view(buf: u64, n: usize) -> str {
+    return str { p: buf as *mut u8, n: n }
+}
+
+fn exe_path(buf: u64) -> usize {
+    var link: [u8; 15] = "/proc/self/exe\0"
+    let n: i64 = syscall(89, (&link[0]) as i64, buf as i64, (PATH_CAP - 1) as i64, 0, 0, 0)
+    if n <= 0 {
+        return 0
+    }
+    return n as usize
+}
+
+fn dir_len(buf: u64, n: usize) -> usize {
+    var i: usize = n
+    while i > 0 {
+        i = i - 1
+        if rt.ld8(buf, i) == 47 as u8 {
+            return i
+        }
+    }
+    return 0
+}
+
+fn sibling_path(name: str, buf: u64) -> usize {
+    let n: usize = exe_path(buf)
+    if n == 0 {
+        return 0
+    }
+    let d: usize = dir_len(buf, n)
+    if d == 0 || d + name.n + 2 >= PATH_CAP {
+        return 0
+    }
+    rt.st8(buf, d, 47 as u8)
+    rt.mem_copy(buf + d as u64 + 1 as u64, name.p as u64, name.n)
+    rt.st8(buf, d + 1 + name.n, 0 as u8)
+    return d + 1 + name.n
+}
+
+fn launch(c: *mut process.Command, detach: bool, out: *mut process.Child) -> bool {
+    process.set_detach(c, detach)
+    var failed: bool = false
+    let ch: process.Child = process.spawn(c) catch | e | dead_child(&failed)
+    process.command_free(c)
+    if failed {
+        return false
+    }
+    *out = ch
+    return true
+}
+
+fn launch_detached(c: *mut process.Command) -> bool {
+    var ignored: process.Child = blank_child()
+    return launch(c, true, &ignored)
+}
+
+fn update_flag(mode: u32) -> str {
+    if mode == 1 as u32 {
+        return "--jetzt"
+    }
+    if mode == 2 as u32 {
+        return "--laden"
+    }
+    if mode == 3 as u32 {
+        return "--anwenden"
+    }
+    if mode == 4 as u32 {
+        return "--bestaetigen"
+    }
+    return "--pruefen"
+}
+
+fn updater_path(buf: u64) -> usize {
+    let n: usize = sibling_path("certus-update", buf)
+    if n == 0 {
+        return 0
+    }
+    if syscall(21, buf as i64, 1, 0, 0, 0, 0) < 0 {
+        return 0
+    }
+    return n
+}
+
+fn r_update_run(mode: u32) -> bool {
+    if mode != 4 as u32 && G_UPDATE_ON {
+        return false
+    }
+    var pbuf: [u8; 1024] = [0 as u8; 1024]
+    let n: usize = updater_path((&pbuf[0]) as u64)
+    if n == 0 {
+        return false
+    }
+    var c: process.Command = process.command(cstr_view((&pbuf[0]) as u64, n))
+    process.add_arg(&c, update_flag(mode))
+    if mode == 4 as u32 {
+        return launch_detached(&c)
+    }
+    var ch: process.Child = blank_child()
+    if !launch(&c, false, &ch) {
+        return false
+    }
+    G_UPDATE = ch
+    G_UPDATE_ON = true
+    return true
+}
+
+fn r_update_poll() -> i64 {
+    if !G_UPDATE_ON {
+        return -2
+    }
+    if !process.try_wait(&G_UPDATE) {
+        return -1
+    }
+    G_UPDATE_ON = false
+    if process.term_signal(&G_UPDATE) != 0 {
+        return 255
+    }
+    let code: i32 = process.exit_code(&G_UPDATE)
+    if code < 0 {
+        return -2
+    }
+    return code as i64
+}
+
+fn r_new_window(url: u64, url_len: usize, private_mode: bool) -> bool {
+    var pbuf: [u8; 1024] = [0 as u8; 1024]
+    let n: usize = exe_path((&pbuf[0]) as u64)
+    if n == 0 {
+        return false
+    }
+    var c: process.Command = process.command(cstr_view((&pbuf[0]) as u64, n))
+    var l: usize = url_len
+    if l > URL_MAX {
+        l = URL_MAX
+    }
+    process.add_arg(&c, cstr_view(url, l))
+    if private_mode {
+        process.add_arg(&c, "--privat=1")
+    }
+    return launch_detached(&c)
+}
+
+fn r_restart_self() -> bool {
+    var pbuf: [u8; 1024] = [0 as u8; 1024]
+    let n: usize = updater_path((&pbuf[0]) as u64)
+    if n != 0 {
+        var u: process.Command = process.command(cstr_view((&pbuf[0]) as u64, n))
+        process.add_arg(&u, "--start")
+        return launch_detached(&u)
+    }
+    let m: usize = exe_path((&pbuf[0]) as u64)
+    if m == 0 {
+        return false
+    }
+    var s: process.Command = process.command(cstr_view((&pbuf[0]) as u64, m))
+    return launch_detached(&s)
+}

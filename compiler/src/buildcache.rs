@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 const MAGIC: &str = "FIRNCACHE1";
+const OBJECT_MAGIC: &str = "FIRNOBJECT1";
 const DEFAULT_MAX_MB: u64 = 512;
 const STALE_TMP: Duration = Duration::from_secs(3600);
 const EXCLUDED_ENV: [&str; 4] = ["FIRN_CACHE_DIR", "FIRN_CACHE_MAX_MB", "FIRN_NO_CACHE", "FIRN_CACHE_LOG"];
@@ -48,6 +49,20 @@ impl LinkInfo {
 pub struct Entry {
     pub link: LinkInfo,
     pub asm: String,
+}
+
+pub struct Head {
+    pub link: LinkInfo,
+    path: PathBuf,
+    offset: usize,
+    len: usize,
+    sum: String,
+}
+
+#[derive(Clone)]
+pub struct Slot {
+    pub dir: PathBuf,
+    pub key: String,
 }
 
 pub fn cache_dir() -> Option<PathBuf> {
@@ -182,12 +197,10 @@ fn encode_head(link: &LinkInfo, asm: &str) -> String {
     s
 }
 
-fn decode(mut bytes: Vec<u8>) -> Option<Entry> {
+fn parse_head(bytes: &[u8]) -> Option<(LinkInfo, usize, usize, String)> {
     let marker = b"\n---\n";
     let at = bytes.windows(marker.len()).take(4096).position(|w| w == marker)?;
-    let head = std::str::from_utf8(&bytes[..at]).ok()?.to_string();
-    bytes.drain(..at + marker.len());
-    let body = &bytes[..];
+    let head = std::str::from_utf8(&bytes[..at]).ok()?;
     let mut lines = head.lines();
     if lines.next()? != MAGIC {
         return None;
@@ -207,27 +220,120 @@ fn decode(mut bytes: Vec<u8>) -> Option<Entry> {
             _ => return None,
         }
     }
-    if body.len() != len? {
+    Some((link, at + marker.len(), len?, sum?))
+}
+
+fn decode(mut bytes: Vec<u8>) -> Option<Entry> {
+    let (link, offset, len, sum) = parse_head(&bytes)?;
+    bytes.drain(..offset);
+    if bytes.len() != len {
         return None;
     }
-    if format!("{:016x}", fast_sum(body)) != sum? {
+    if format!("{:016x}", fast_sum(&bytes)) != sum {
         return None;
     }
     let asm = String::from_utf8(bytes).ok()?;
     Some(Entry { link, asm })
 }
 
+fn touch(path: &Path) {
+    if let Ok(f) = std::fs::File::options().append(true).open(path) {
+        let _ = f.set_modified(SystemTime::now());
+    }
+}
+
 pub fn lookup(dir: &Path, key: &str) -> Option<Entry> {
     let path = entry_path(dir, key);
     let bytes = std::fs::read(&path).ok()?;
     let e = decode(bytes)?;
-    if let Ok(f) = std::fs::File::options().append(true).open(&path) {
-        let _ = f.set_modified(SystemTime::now());
-    }
+    touch(&path);
     Some(e)
 }
 
-pub fn store(dir: &Path, key: &str, link: &LinkInfo, asm: &str) -> bool {
+pub fn lookup_head(dir: &Path, key: &str) -> Option<Head> {
+    use std::io::Read;
+    let path = entry_path(dir, key);
+    let mut f = std::fs::File::open(&path).ok()?;
+    let total = f.metadata().ok()?.len() as usize;
+    let mut buf = vec![0u8; 4096.min(total)];
+    f.read_exact(&mut buf).ok()?;
+    let (link, offset, len, sum) = parse_head(&buf)?;
+    if offset + len != total {
+        return None;
+    }
+    touch(&path);
+    Some(Head { link, path, offset, len, sum })
+}
+
+impl Head {
+    pub fn read_asm(&self) -> Option<String> {
+        let mut bytes = std::fs::read(&self.path).ok()?;
+        if bytes.len() != self.offset + self.len {
+            return None;
+        }
+        bytes.drain(..self.offset);
+        if format!("{:016x}", fast_sum(&bytes)) != self.sum {
+            return None;
+        }
+        String::from_utf8(bytes).ok()
+    }
+}
+
+fn object_path(dir: &Path, key: &str, id: &str) -> PathBuf {
+    objects_dir(dir).join(format!("{}.{}.o", key, id))
+}
+
+fn encode_object(obj: &[u8]) -> Vec<u8> {
+    let mut v = format!(
+        "{}\nlen={}\nsum={:016x}\n---\n",
+        OBJECT_MAGIC,
+        obj.len(),
+        fast_sum(obj)
+    )
+    .into_bytes();
+    v.extend_from_slice(obj);
+    v
+}
+
+fn decode_object(mut bytes: Vec<u8>) -> Option<Vec<u8>> {
+    let marker = b"\n---\n";
+    let at = bytes.windows(marker.len()).take(256).position(|w| w == marker)?;
+    let head = std::str::from_utf8(&bytes[..at]).ok()?;
+    let mut lines = head.lines();
+    if lines.next()? != OBJECT_MAGIC {
+        return None;
+    }
+    let len: usize = lines.next()?.strip_prefix("len=")?.parse().ok()?;
+    let sum = lines.next()?.strip_prefix("sum=")?.to_string();
+    bytes.drain(..at + marker.len());
+    if bytes.len() != len || format!("{:016x}", fast_sum(&bytes)) != sum {
+        return None;
+    }
+    Some(bytes)
+}
+
+pub fn object_id(assembler: &str) -> String {
+    let mut h = Sha256::new();
+    push_field(&mut h, "assembler", assembler.as_bytes());
+    h.hex()[..16].to_string()
+}
+
+pub fn lookup_object(slot: &Slot, id: &str) -> Option<Vec<u8>> {
+    let path = object_path(&slot.dir, &slot.key, id);
+    let obj = decode_object(std::fs::read(&path).ok()?)?;
+    touch(&path);
+    Some(obj)
+}
+
+pub fn store_object(slot: &Slot, id: &str, obj: &[u8]) -> bool {
+    if !entry_path(&slot.dir, &slot.key).is_file() {
+        return false;
+    }
+    write_atomic(&slot.dir, &object_path(&slot.dir, &slot.key, id), &encode_object(obj))
+}
+
+fn write_atomic(dir: &Path, target: &Path, data: &[u8]) -> bool {
+    use std::io::Write;
     let objs = objects_dir(dir);
     if std::fs::create_dir_all(&objs).is_err() {
         return false;
@@ -237,11 +343,8 @@ pub fn store(dir: &Path, key: &str, link: &LinkInfo, asm: &str) -> bool {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = objs.join(format!(".tmp-{}-{}", std::process::id(), nonce));
-    if write_entry(&tmp, link, asm).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return false;
-    }
-    if std::fs::rename(&tmp, entry_path(dir, key)).is_err() {
+    let written = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(data).and_then(|_| f.flush()));
+    if written.is_err() || std::fs::rename(&tmp, target).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
@@ -249,12 +352,10 @@ pub fn store(dir: &Path, key: &str, link: &LinkInfo, asm: &str) -> bool {
     true
 }
 
-fn write_entry(tmp: &Path, link: &LinkInfo, asm: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(tmp)?;
-    f.write_all(encode_head(link, asm).as_bytes())?;
-    f.write_all(asm.as_bytes())?;
-    f.flush()
+pub fn store(dir: &Path, key: &str, link: &LinkInfo, asm: &str) -> bool {
+    let mut data = encode_head(link, asm).into_bytes();
+    data.extend_from_slice(asm.as_bytes());
+    write_atomic(dir, &entry_path(dir, key), &data)
 }
 
 pub fn prune(dir: &Path, cap: u64) {
@@ -387,6 +488,53 @@ mod tests {
             h.join().unwrap();
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn head_lookup_reads_link_info_and_asm_on_demand() {
+        let d = tmpdir("head");
+        let e = entry("body text\n");
+        assert!(store(&d, "k1", &e.link, &e.asm));
+        let h = lookup_head(&d, "k1").unwrap();
+        assert_eq!(h.link, e.link);
+        assert_eq!(h.read_asm().unwrap(), e.asm);
+        let p = entry_path(&d, "k1");
+        let mut b = std::fs::read(&p).unwrap();
+        let n = b.len();
+        b[n - 2] ^= 1;
+        std::fs::write(&p, &b).unwrap();
+        let h = lookup_head(&d, "k1").unwrap();
+        assert!(h.read_asm().is_none());
+        b.pop();
+        std::fs::write(&p, &b).unwrap();
+        assert!(lookup_head(&d, "k1").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn object_roundtrip_needs_entry_and_matching_id() {
+        let d = tmpdir("obj");
+        let slot = Slot { dir: d.clone(), key: "k1".to_string() };
+        let obj = vec![0x7f, b'E', b'L', b'F', 0, 1, 2, 3];
+        assert!(!store_object(&slot, "aa", &obj));
+        let e = entry("x\n");
+        assert!(store(&d, "k1", &e.link, &e.asm));
+        assert!(store_object(&slot, "aa", &obj));
+        assert_eq!(lookup_object(&slot, "aa").unwrap(), obj);
+        assert!(lookup_object(&slot, "bb").is_none());
+        let p = object_path(&d, "k1", "aa");
+        let mut b = std::fs::read(&p).unwrap();
+        let n = b.len();
+        b[n - 1] ^= 1;
+        std::fs::write(&p, &b).unwrap();
+        assert!(lookup_object(&slot, "aa").is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn object_id_depends_on_assembler_text() {
+        assert_ne!(object_id("as 2.40"), object_id("as 2.41"));
+        assert_eq!(object_id("as 2.40"), object_id("as 2.40"));
     }
 
     #[test]

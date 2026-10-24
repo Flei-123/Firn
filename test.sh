@@ -216,7 +216,7 @@
 #      whose result is known case by case, with counter-checks.
 #  53c. THE COMPILE CACHE (tools/cache/run.sh, roadmap r59, docs/CACHE.md): hit and
 #      miss on import and flag changes, byte-identical to --no-cache, eight
-#      parallel builds, damaged entries, size cap.
+#      parallel builds, damaged entries, size cap, assembled object cache.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -1569,7 +1569,7 @@ echo "== 69. WINDOWS: the same programs on two operating systems (x86_64-windows
 #             and the X server sees the pointer move.
 # All of them SKIP (exit 0) without mingw binutils / Wine / Xvfb.
 WINRC=0
-for t in tools/windows/machine.sh tools/windows/net.sh tools/windows/run.sh tools/windows/wincred.sh tools/input/win.sh tools/phone_remote/win.sh; do
+for t in tools/windows/machine.sh tools/windows/net.sh tools/windows/run.sh tools/windows/wincred.sh tools/windows/updproc.sh tools/input/win.sh tools/phone_remote/win.sh; do
     lg="$WORK/win_$(basename "$(dirname "$t")")_$(basename "$t" .sh).log"
     bash "$t" > "$lg" 2>&1 || WINRC=1
     grep -E '^  (passed|SKIP|RESULT)|^(SKIP|INPUT-WIN)' "$lg" | sed 's/^/   /' || true

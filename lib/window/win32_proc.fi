@@ -1,0 +1,257 @@
+import std.rt
+
+export {
+    r_update_run, r_update_poll, r_restart_self,
+}
+
+#[no_gc]
+extern fn CloseHandle(h: i64) -> i32;
+extern fn CreateFileW(p: u64, acc: i64, share: i64, sec: u64, disp: i64, flags: i64, tmpl: i64) -> i64;
+extern fn ReadFile(h: i64, buf: u64, n: i64, got: u64, ov: u64) -> i32;
+#[no_gc]
+extern fn GetModuleFileNameW(m: i64, buf: u64, n: i64) -> i32;
+#[no_gc]
+extern fn CreateProcessW(app: u64, line: u64, pa: i64, ta: i64,
+    inherit: i64, flags: i64, env: i64, dir: u64, si: u64,
+    pi: u64) -> i32;
+#[no_gc]
+extern fn GetExitCodeProcess(h: i64, code: u64) -> i32;
+
+const PATH_UNITS: usize = 320
+const LINE_UNITS: usize = 96
+const EXE_SUFFIX_UNITS: usize = 4
+const STILL_ACTIVE: u32 = 259
+const CREATE_NO_WINDOW: i64 = 134217728
+const MODE_CONFIRM: u32 = 4
+const MODE_FETCH: u32 = 2
+const PROTO_MARK_LEN: usize = 21
+
+static mut G_UPD_PROC: i64 = 0
+
+fn put_ascii(dst: u64, at: usize, src: u64, n: usize) -> usize {
+    var i: usize = 0
+    while i < n {
+        rt.st16(dst, at + i, rt.ld8(src, i) as u16)
+        i = i + 1
+    }
+    return at + n
+}
+
+fn own_path(path: u64) -> usize {
+    let n: i32 = GetModuleFileNameW(0, path, PATH_UNITS as i64)
+    if n <= 0 || n as usize >= PATH_UNITS {
+        return 0
+    }
+    return n as usize
+}
+
+fn is_exe_suffix(path: u64, n: usize) -> bool {
+    if n <= EXE_SUFFIX_UNITS {
+        return false
+    }
+    var suffix: [u8; 4] = ".exe"
+    var i: usize = 0
+    while i < EXE_SUFFIX_UNITS {
+        var c: u16 = rt.ld16(path, n - EXE_SUFFIX_UNITS + i)
+        if c >= 65 as u16 && c <= 90 as u16 {
+            c = c + 32 as u16
+        }
+        if c != suffix[i] as u16 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn updater_path(path: u64) -> bool {
+    let n: usize = own_path(path)
+    if !is_exe_suffix(path, n) {
+        return false
+    }
+    var tail: [u8; 11] = "-update.exe"
+    let stem: usize = n - EXE_SUFFIX_UNITS
+    if stem + 12 >= PATH_UNITS {
+        return false
+    }
+    let end: usize = put_ascii(path, stem, (&tail[0]) as u64, 11)
+    rt.st16(path, end, 0 as u16)
+    return true
+}
+
+fn spawn(path: u64, line: u64) -> i64 {
+    var si: [u8; 104] = [0; 104]
+    var pi: [u8; 24] = [0; 24]
+    rt.st32((&si[0]) as u64, 0, 104 as u32)
+    let ok: i32 = CreateProcessW(path, line, 0, 0, 0, CREATE_NO_WINDOW, 0, 0,
+        (&si[0]) as u64, (&pi[0]) as u64)
+    if ok == 0 {
+        return 0
+    }
+    CloseHandle(rt.ld64((&pi[0]) as u64, 1) as i64)
+    return rt.ld64((&pi[0]) as u64, 0) as i64
+}
+
+fn updater_speaks_protocol(path: u64) -> bool {
+    let h: i64 = CreateFileW(path, 2147483648, 1, 0, 3, 0, 0)
+    if h == 0 || h == 0 - 1 {
+        return false
+    }
+    var mark: [u8; 21] = "CERTUS-UPDATE-PROTO-2"
+    var buf: [u8; 8192] = [0; 8192]
+    var got: [u32; 2] = [0; 2]
+    var carry: usize = 0
+    var found: bool = false
+    var rounds: usize = 0
+    while !found && rounds < 200 {
+        rounds = rounds + 1
+        got[0] = 0 as u32
+        let ok: i32 = ReadFile(h, ((&buf[0]) as u64) + carry as u64, (8192 - carry) as i64, (&got[0]) as u64, 0)
+        let n: usize = (got[0] as usize) + carry
+        if ok == 0 || got[0] == 0 as u32 {
+            break
+        }
+        var i: usize = 0
+        while i + PROTO_MARK_LEN <= n && !found {
+            var j: usize = 0
+            while j < PROTO_MARK_LEN && buf[i + j] == mark[j] {
+                j = j + 1
+            }
+            if j == PROTO_MARK_LEN {
+                found = true
+            }
+            i = i + 1
+        }
+        let keep: usize = PROTO_MARK_LEN - 1
+        if n > keep {
+            var m: usize = 0
+            while m < keep {
+                buf[m] = buf[n - keep + m]
+                m = m + 1
+            }
+            carry = keep
+        } else {
+            carry = n
+        }
+    }
+    CloseHandle(h)
+    return found
+}
+
+fn flag_len(mode: u32) -> usize {
+    if mode == 1 as u32 {
+        return 7
+    }
+    if mode == 2 as u32 {
+        return 7
+    }
+    if mode == 3 as u32 {
+        return 10
+    }
+    if mode == MODE_CONFIRM {
+        return 13
+    }
+    return 9
+}
+
+fn put_flag(line: u64, at: usize, mode: u32) -> usize {
+    var f0: [u8; 9] = "--pruefen"
+    var f1: [u8; 7] = "--jetzt"
+    var f2: [u8; 7] = "--laden"
+    var f3: [u8; 10] = "--anwenden"
+    var f4: [u8; 13] = "--bestaetigen"
+    var src: u64 = (&f0[0]) as u64
+    if mode == 1 as u32 {
+        src = (&f1[0]) as u64
+    } else if mode == 2 as u32 {
+        src = (&f2[0]) as u64
+    } else if mode == 3 as u32 {
+        src = (&f3[0]) as u64
+    } else if mode == MODE_CONFIRM {
+        src = (&f4[0]) as u64
+    }
+    return put_ascii(line, at, src, flag_len(mode))
+}
+
+fn build_line(path: u64, line: u64, mode: u32) -> bool {
+    var n: usize = 0
+    while n < PATH_UNITS && rt.ld16(path, n) != 0 as u16 {
+        n = n + 1
+    }
+    if n + flag_len(mode) + 4 >= LINE_UNITS {
+        return false
+    }
+    rt.st16(line, 0, 34 as u16)
+    var i: usize = 0
+    while i < n {
+        rt.st16(line, 1 + i, rt.ld16(path, i))
+        i = i + 1
+    }
+    rt.st16(line, 1 + n, 34 as u16)
+    rt.st16(line, 2 + n, 32 as u16)
+    let end: usize = put_flag(line, 3 + n, mode)
+    rt.st16(line, end, 0 as u16)
+    return true
+}
+
+fn r_update_run(mode: u32) -> bool {
+    if mode != MODE_CONFIRM && G_UPD_PROC != 0 {
+        return false
+    }
+    var path: [u16; 320] = [0; 320]
+    let pp: u64 = (&path[0]) as u64
+    if !updater_path(pp) {
+        return false
+    }
+    if mode >= MODE_FETCH && !updater_speaks_protocol(pp) {
+        return false
+    }
+    var line: [u16; 96] = [0; 96]
+    let lp: u64 = (&line[0]) as u64
+    if !build_line(pp, lp, mode) {
+        return false
+    }
+    let h: i64 = spawn(pp, lp)
+    if h == 0 {
+        return false
+    }
+    if mode == MODE_CONFIRM {
+        CloseHandle(h)
+        return true
+    }
+    G_UPD_PROC = h
+    return true
+}
+
+fn r_update_poll() -> i64 {
+    if G_UPD_PROC == 0 {
+        return -2
+    }
+    var code: [u32; 1] = [0; 1]
+    let ok: i32 = GetExitCodeProcess(G_UPD_PROC, (&code[0]) as u64)
+    if ok == 0 {
+        CloseHandle(G_UPD_PROC)
+        G_UPD_PROC = 0
+        return -2
+    }
+    if code[0] == STILL_ACTIVE {
+        return -1
+    }
+    CloseHandle(G_UPD_PROC)
+    G_UPD_PROC = 0
+    return code[0] as i64
+}
+
+fn r_restart_self() -> bool {
+    var path: [u16; 320] = [0; 320]
+    let pp: u64 = (&path[0]) as u64
+    if own_path(pp) == 0 {
+        return false
+    }
+    let h: i64 = spawn(pp, 0)
+    if h == 0 {
+        return false
+    }
+    CloseHandle(h)
+    return true
+}

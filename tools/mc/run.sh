@@ -143,6 +143,7 @@ fi
 if [ -z "$ONLY" ] || [ "$ONLY" = startplay ]; then
     echo "== mc/startplay =="
     bash tools/mc/play/run_start.sh || ERR=$((ERR+1))
+    bash tools/mc/play/run_startmouse.sh || ERR=$((ERR+1))
 fi
 # health: UPDATE_HEALTH hearts / food, death screen from DEATH_COMBAT_EVENT, respawn key -> client_command respawn (1.20.1 + 1.21.4)
 if [ -z "$ONLY" ] || [ "$ONLY" = healthplay ]; then
