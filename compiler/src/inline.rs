@@ -141,7 +141,7 @@ fn max_inlines() -> usize {
 /// Name -> position of every function. The list of functions does not change
 /// while bodies are embedded (only the caller's body does), so one index serves
 /// a whole phase.
-fn name_index(m: &Module) -> HashMap<String, usize> {
+pub(crate) fn name_index(m: &Module) -> HashMap<String, usize> {
     m.funcs.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect()
 }
 
@@ -175,7 +175,7 @@ fn self_recursive_all(cg: &mut CallGraph, n: usize) -> Vec<bool> {
 ///    of `ret` (round 52). The body does not belong into an ordinary frame.
 ///  * an unfinished block (`Term::Unset`) or a block list whose numbers are
 ///    not in order -- then `blockmap` is wrong.
-fn allowed_at_all(callee: &Func) -> bool {
+pub(crate) fn allowed_at_all(callee: &Func) -> bool {
     !callee.constant_time
         && callee.secret.is_empty()
         && !callee.interrupt
@@ -215,7 +215,7 @@ fn inlinable(callee: &Func) -> bool {
 /// embeddings — only the caller is mutated).
 /// Blocks of `f` that lie on a loop (inside the natural loop of some back
 /// edge).
-fn loop_blocks(f: &Func) -> Vec<bool> {
+pub(crate) fn loop_blocks(f: &Func) -> Vec<bool> {
     let n = f.blocks.len();
     let mut on = vec![false; n];
     if n < 2 {
@@ -351,7 +351,7 @@ fn find_site_x(
 }
 
 /// Embeds exactly one call site.
-fn inline_one(m: &mut Module, ci: usize, bi: usize, ii: usize, gi: usize) {
+pub(crate) fn inline_one(m: &mut Module, ci: usize, bi: usize, ii: usize, gi: usize) {
     inline_one_pooled(m, ci, bi, ii, gi, None)
 }
 
@@ -957,7 +957,7 @@ fn inline_flagged_leaves_x(
 /// f->callees(g), which f reached through g anyway), so a graph taken before
 /// is a superset of the current one: every "reaches" answer from it is
 /// conservative, and a cached `false` stays true.
-struct CallGraph {
+pub(crate) struct CallGraph {
     succ: Vec<Vec<usize>>,
     memo: HashMap<(usize, usize), bool>,
     mark: Vec<u32>,
@@ -965,7 +965,7 @@ struct CallGraph {
 }
 
 impl CallGraph {
-    fn new(m: &Module, idx: &HashMap<String, usize>) -> CallGraph {
+    pub(crate) fn new(m: &Module, idx: &HashMap<String, usize>) -> CallGraph {
         let succ = m
             .funcs
             .iter()
@@ -989,7 +989,7 @@ impl CallGraph {
     }
 
     /// Can `from` reach `to` through calls (`from == to` counts)?
-    fn reaches(&mut self, from: usize, to: usize) -> bool {
+    pub(crate) fn reaches(&mut self, from: usize, to: usize) -> bool {
         if from == to {
             return true;
         }
@@ -1016,7 +1016,7 @@ impl CallGraph {
     }
 
     /// Can `g` reach itself through at least one call?
-    fn self_recursive(&mut self, g: usize) -> bool {
+    pub(crate) fn self_recursive(&mut self, g: usize) -> bool {
         let succ = self.succ[g].clone();
         succ.into_iter().any(|c| self.reaches(c, g))
     }

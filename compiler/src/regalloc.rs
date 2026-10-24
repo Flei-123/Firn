@@ -2018,7 +2018,7 @@ pub fn allocate(f: &Func) -> Alloc {
                 // its links into one register. `t` may already be the target of
                 // earlier merges (a representative) when this is a two-operand
                 // form; its whole group then moves to `p` (checked below).
-                let chain_ok = two_address
+                let chain_ok = (two_address || std::env::var_os("FIRN_NO_COALCOPY").is_none())
                     && std::env::var_os("FIRN_NO_COAL_CHAIN").is_none();
                 let param_src_ok = t < np
                     && p >= np
@@ -4340,10 +4340,28 @@ fn interferes(
             return true;
         }
     }
+    let copy_exempt = std::env::var_os("FIRN_NO_COALCOPY").is_none();
     for (x, y) in [(a, b), (b, a)] {
         for &(bi, ii) in defsites.get(&x).map(|v| v.as_slice()).unwrap_or(&[]) {
             if ausnahme == Some((bi, ii)) {
                 continue;
+            }
+            if copy_exempt {
+                if let Some(Op::Copy { src }) = f.blocks.get(bi).and_then(|b| b.insts.get(ii)).map(|i| &i.op) {
+                    if *src == y {
+                        continue;
+                    }
+                    let stable = defsites.get(src).map_or(true, |d| d.len() == 1);
+                    let from_here = f.blocks[bi].insts[..ii]
+                            .iter()
+                            .filter(|k| k.dst == Some(y))
+                            .all(|k| matches!(&k.op, Op::Copy { src: s2 } if s2 == src))
+                        && f.blocks[bi].insts[..ii].iter().any(|k| k.dst == Some(y))
+                        && !f.blocks[bi].insts[ii + 1..].iter().any(|k| k.dst == Some(y));
+                    if stable && from_here {
+                        continue;
+                    }
+                }
             }
             if live_after(f, live, y, bi, ii) {
                 return true;

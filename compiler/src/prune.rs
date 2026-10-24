@@ -27,7 +27,7 @@ pub fn enabled() -> bool {
 }
 
 /// Identifiers of an assembler text (a template names `_F0.symbol` labels).
-fn idents(text: &str, mut each: impl FnMut(&str)) {
+pub(crate) fn idents(text: &str, mut each: impl FnMut(&str)) {
     let b = text.as_bytes();
     let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$';
     let mut i = 0usize;

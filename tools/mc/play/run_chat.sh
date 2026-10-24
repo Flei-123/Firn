@@ -53,16 +53,22 @@ Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
 sleep 2
 export DISPLAY=:$DN
 ERR=0
-MCPLAY_AUDIO=0 MCPLAY_CHAT_LOG=1 MCPLAY_CHAT_TEST_TICKS=260 MCPLAY_CHAT_TEST='hi there|/time set day' MCPLAY_RUN_S=${CHAT_RUN_S:-30} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
+MCPLAY_AUDIO=0 MCPLAY_CHAT_LOG=1 MCPLAY_CHAT_TEST_TICKS=380 MCPLAY_CHAT_TEST='hi there|/time set day' MCPLAY_RUN_S=${CHAT_RUN_S:-45} MCPLAY_VIEW=$VIEW MCPLAY_FPS=30 MCPLAY_W=640 MCPLAY_H=360 \
     timeout 170 "$W/mcplay" 127.0.0.1 "$PORT" ChatA > "$W/a.out" 2>&1 &
 PP=$!
 for i in $(seq 1 90); do grep -q "ChatA joined the game" "$W/server.log" 2>/dev/null && break; sleep 1; done
 sleep 8
+MCPLAY_AUDIO=0 MCPLAY_RUN_S=${CHAT_PEER_S:-10} MCPLAY_VIEW=2 MCPLAY_FPS=15 MCPLAY_W=320 MCPLAY_H=180 timeout 120 "$W/mcplay" 127.0.0.1 "$PORT" ChatB > "$W/b.out" 2>&1 &
+PB=$!
+for i in $(seq 1 60); do grep -q "ChatB joined the game" "$W/server.log" 2>/dev/null && break; sleep 1; done
 echo "op ChatA" >&3
 echo "say hello_chat" >&3
 echo "tellraw ChatA {\"text\":\"raw_line\",\"color\":\"gold\"}" >&3
 wait $PP
-grep -q 'chat line=.*ChatA joined the game' "$W/a.out" || echo "  note  join message line not shown (sent during the login drain)"
+wait $PB
+grep -q 'chat line=ChatB joined the game' "$W/a.out" || { echo "  FAIL  join line of the second player missing"; ERR=1; }
+grep -q 'chat line=ChatB left the game' "$W/a.out" || echo "  note  leave line of the second player not seen (peer may outlive the run)"
+grep -q 'chat line=.*ChatA joined the game' "$W/a.out" && echo "  note  own join line shown"
 grep -q 'chat line=\[Server\] hello_chat' "$W/a.out" || { echo "  FAIL  say line missing"; ERR=1; }
 grep -q 'chat line=raw_line' "$W/a.out" || { echo "  FAIL  tellraw line missing"; ERR=1; }
 grep -q 'chattest sent=2' "$W/a.out" || { echo "  FAIL  chattest sent != 2"; ERR=1; }

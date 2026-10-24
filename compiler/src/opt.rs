@@ -612,6 +612,15 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
             }
             optimize_batch(&mut m.funcs, Some(&changed), &mut st, cfg, &mut clk);
         }
+        let t = std::time::Instant::now();
+        let changed = crate::inline_once::run(m);
+        clk.add("inline", t);
+        if !changed.is_empty() {
+            for &ci in &changed {
+                phi_check(&m.funcs[ci], "inline_once");
+            }
+            optimize_batch(&mut m.funcs, Some(&changed), &mut st, cfg, &mut clk);
+        }
     }
     if cfg.runs("promote") && std::env::var_os("FIRN_NO_PROMOTE").is_none() {
         let t = std::time::Instant::now();
