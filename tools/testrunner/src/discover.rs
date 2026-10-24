@@ -2,7 +2,7 @@ use crate::cli::Options;
 use std::path::{Path, PathBuf};
 
 pub enum Job {
-    Run { rel: String, level: String },
+    Run { rel: String, levels: Vec<String> },
     Negative { rel: String },
     Unit { rel: String },
     Skip { rel: String, level: String, reason: &'static str },
@@ -66,11 +66,15 @@ pub fn collect(o: &Options) -> Vec<Job> {
                 }
                 continue;
             }
+            let mut levels = Vec::new();
             for level in &o.levels {
                 match skip_reason(&src, level) {
                     Some(reason) => jobs.push(Job::Skip { rel: rel.clone(), level: level.clone(), reason }),
-                    None => jobs.push(Job::Run { rel: rel.clone(), level: level.clone() }),
+                    None => levels.push(level.clone()),
                 }
+            }
+            if !levels.is_empty() {
+                jobs.push(Job::Run { rel, levels });
             }
         }
     }

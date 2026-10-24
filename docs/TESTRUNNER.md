@@ -18,7 +18,7 @@ testrunner [--root DIR] [--compiler PATH] [--format text|json|jsonl|junit] [--ou
 | `--root` | `.` | repository root; `tests/`, `tests/opt/`, `examples/`, `tests/neg/` below it |
 | `--compiler` | `ROOT/compiler/target/release/firnc` | compiler binary |
 | `--levels` | all four | `opt` = release-fast, `noopt`, `devfast` = dev-fast, `safe` = release-safe |
-| `--jobs` | 4 | cases in parallel (each case is a compile plus a run) |
+| `--jobs` | 4 | files in parallel; the levels of one file run one after the other (tests that use a fixed temp path would collide otherwise). Timing sensitive tests (threads, shell) can still flake under load: `--jobs 1` is the exact `test.sh` behaviour |
 | `--timeout` | 120 | seconds per compile and per run; the child is killed and the case fails |
 | `--filter` | none | substring of the relative path |
 | `--out` | stdout | write the report to a file |

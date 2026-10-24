@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 fn execute(o: &Options, work: &Path, job: &Job) -> Vec<Case> {
     match job {
-        Job::Run { rel, level } => vec![check_run::run_program(o, work, rel, level)],
+        Job::Run { rel, levels } => levels.iter().map(|l| check_run::run_program(o, work, rel, l)).collect(),
         Job::Negative { rel } => vec![check_neg::run_negative(o, work, rel)],
         Job::Unit { rel } => check_unit::run_unit(o, work, rel),
         Job::Skip { rel, level, reason } => vec![Case::new(rel, level, "run").skipped(reason)],
