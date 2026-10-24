@@ -52,3 +52,21 @@ Spalten: n = Anzahl Laeufe; cpu = % eines Kerns; t_window = Prozessstart bis Fen
 - The Windows dist rebuild (`heavy bash tools/mc/dist.sh`) stayed queued for >20 min (server load 25-43 > heavy limit 24); the job was cancelled, rebuild it when load allows.
 - Scripts prepared (merged): `mcvan_run.ps1 -Fps` (0 = uncapped MCPLAY_FPS=0, -1 = default 60 fps cap, N), `mcvan_batch.ps1` client spec `mcplay:gl:cap` / `mcplay:vk:cap`, `mcvan_agg.py` orders the capped cells.
 - Resume: unlock laptop + disable lock timeout (Hoechstleistung plan: VIDEOCONLOCK 0), dist -> public/<random> -> curl.exe + SHA256 -> `setup.exe /S`, server jar `/root/.w5/jars/server-1.20.1.jar` -> %TEMP%\mcvan\srv, PresentMon 2.6.0 from GitHub, then batch (Secs 30 / Settle 20 keeps a 3-rep matrix of 720p r8/r16 + 360p r8 at ~40 min).
+
+## v3 (24.10., after r277 fix, MEASURED) -- Laptop HOLO-LAPTOP-3, Hoechstleistung plan, 1280x720, uncapped, PresentMon
+- Setup: main 304af0917 dist (mcplay-console.exe), `MCPLAY_FPS=0 MCPLAY_VSYNC=0` (GL: `MCPLAY_GL=1`, VK: `MCPLAY_GFX=vk`), Vanilla 1.20.1 maxFps unlimited + VSync off, same local server/world/spawn, view distance 8 and 16, 30 s window after 20 s settle, first 10 s dropped. Medians of 3 valid runs (Vanilla r8: runs n3-n5; n1 had no world loaded, n2 overlapped the power plan switch).
+- Windows Defender flagged the unmodified dist exe as `Trojan:Win32/Bearfoos.B!ml` (false positive) and deleted it at first start; a copy padded with 64 KiB zero bytes ran. No admin rights for an exclusion.
+
+| res | r | client | n | p50 ms | p95 | p99 | 1%low | avg fps | cpu %core | peak WS MB | private MB | t_window ms | t_join ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1280x720 | 8 | vanilla | 3 | 2.55 | 5.14 | 6.45 | 7.19 | 350 | 136 | 1637 | 1902 | 6078 | 10784 |
+| 1280x720 | 8 | mcplay GL | 3 | 2.12 | 3.42 | 4.78 | 5.90 | 422 | 169 | 485 | 514 | 305 | 1087 |
+| 1280x720 | 8 | mcplay VK | 3 | 1.84 | 2.97 | 4.08 | 6.95 | 495 | 108 | 620 | 657 | 310 | 1096 |
+| 1280x720 | 16 | vanilla | 3 | 5.97 | 9.60 | 11.21 | 12.54 | 165 | 137 | 1664 | 1960 | 6368 | 11983 |
+| 1280x720 | 16 | mcplay GL | 3 | 5.10 | 7.47 | 9.03 | 11.23 | 184 | 92 | 646 | 676 | 563 | 1095 |
+| 1280x720 | 16 | mcplay VK | 3 | 5.18 | 6.47 | 7.33 | 7.84 | 188 | 102 | 771 | 809 | 312 | 1090 |
+
+- p50 per run: Vanilla r8 2.05/2.61/2.55, GL r8 2.05/2.22/2.12, VK r8 1.78/1.84/1.89; Vanilla r16 5.95/5.97/6.17, GL r16 5.18/5.10/5.00, VK r16 5.18/5.14/5.26.
+- Result: after the r277 fix mcplay is at or slightly under Vanilla frame time (r8 ~0.4-0.7 ms, r16 ~0.8-1.0 ms lower p50), 1% lows similar, RAM 2.5-3.4x lower, start-to-join ~10x faster. Spread between Vanilla runs (2.05-2.61) is as large as the r8 gap: treat r8 as "on par", r16 as "mcplay ~15% faster".
+- Not comparable: Vanilla renders shaders/light/entities/weather/particles/fancy graphics, mcplay a simpler renderer; one spot, one machine, 30 s per run, n=3. 1%-low outliers (41 ms) in one GL r16 and one VK r16 run.
+- 360p and capped (default 60 fps) variants not run (time).
