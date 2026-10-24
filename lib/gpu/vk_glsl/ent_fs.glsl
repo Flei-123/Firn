@@ -6,11 +6,12 @@
 #include "vk_frame.glsl"
 layout(location = 0) flat in vec3 v_col;
 layout(location = 1) flat in int v_fk;
+layout(location = 3) flat in float v_em;
 layout(location = 2) in float v_depth;
 layout(location = 0) out vec4 o_color;
 void main() {
     ivec3 c = (ivec3(v_col + 0.5) * v_fk) >> 8;
-    if (u_fog.x > 0.5) {
+    if (u_fog.x > 0.5 && v_em < 0.5) {
         float tt = clamp((v_depth - u_fog.y) / (u_fog.z - u_fog.y), 0.0, 1.0);
         int f = int(floor(tt * 256.0));
         c = (c * (256 - f) + ivec3(u_fogc) * f) >> 8;
