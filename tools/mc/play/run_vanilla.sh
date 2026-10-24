@@ -93,11 +93,11 @@ run_one() { # name, reload, env...
 
 MCCLIENT_JAR_CACHE=${VANILLA_JAR_CACHE:-/root/.w5/jars} bash tools/mcclient/fetch_client.sh "$W/jar" "$MCV" >/dev/null 2>&1 || fail "client jar download"
 export MC_VANILLA_CACHE="$W/vcache"
-run_one V1 0 MC_PACKS= MC_VANILLA_JAR="$W/jar/client.jar"
+run_one V1 0 MC_PACKS= MC_VANILLA=1 MC_VANILLA_JAR="$W/jar/client.jar"
 run_one V2 0 MC_PACKS= MC_VANILLA=0 MC_VANILLA_JAR="$W/jar/client.jar"
-run_one V3 0 MC_PACKS= MC_VANILLA_JAR= MC_VANILLA_DIR="$W/nodir" HOME="$W/nohome" APPDATA=
+run_one V3 0 MC_PACKS= MC_VANILLA=1 MC_VANILLA_JAR= MC_VANILLA_DIR="$W/nodir" HOME="$W/nohome" APPDATA=
 CF=$(ls "$W"/vcache/vanilla-*.zip 2>/dev/null | head -1); T1=$(stat -c %Y "$CF" 2>/dev/null)
-run_one V4 0 MC_PACKS= MC_VANILLA_JAR="$W/jar/client.jar"
+run_one V4 0 MC_PACKS= MC_VANILLA=1 MC_VANILLA_JAR="$W/jar/client.jar"
 T2=$(stat -c %Y "$CF" 2>/dev/null)
 [ -n "$CF" ] || fail "no cache zip written"
 grep -q "^mcplay: vanilla resources from" "$W/V1.out" || { echo "  FAIL  V1: no 'vanilla resources from' line"; ERR=1; }
