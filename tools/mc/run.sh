@@ -6,7 +6,7 @@
 #     independent reference (python / node / java tools, never Mojang code).
 #     Each prints a line `RESULT <name>: ok` and exits 0 on success.
 #
-# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | chatplay | healthplay | combatplay | swimplay | fluidplay | sessplay | edge | modelplay | vanillaplay | lodseam | biomezoom)
+# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | chatplay | healthplay | combatplay | swimplay | fluidplay | weatherplay | startplay | sessplay | edge | modelplay | vanillaplay | lodseam | biomezoom)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
@@ -16,7 +16,7 @@ FIRNC=${FIRNC:-compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 # r220: a firnc older than r167 makes every GL stage (mcplay MCPLAY_GL=1 with mesher threads) segfault in the first frame
 case " $ONLY " in
-    "  "|" chatplay "|" healthplay "|" combatplay "|" swimplay "|" fluidplay "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" sessplay "|" modelplay "|" vanillaplay "|" lodseam "|" biomezoom "|" play ")
+    "  "|" weatherplay "|" startplay "|" chatplay "|" healthplay "|" combatplay "|" swimplay "|" fluidplay "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" sessplay "|" modelplay "|" vanillaplay "|" lodseam "|" biomezoom "|" play ")
         bash tools/mc/check_firnc.sh "$FIRNC" || { echo "RESULT mc: FAIL (stale firnc)"; exit 1; } ;;
 esac
 # every .fi file of the tree must be in the canonical shape of firnfmt (test.sh section 23
@@ -132,6 +132,17 @@ if [ -z "$ONLY" ] || [ "$ONLY" = chatplay ]; then
     echo "== mc/chatplay =="
     bash tools/mc/play/run_chat.sh 1.20.1 || ERR=$((ERR+1))
     bash tools/mc/play/run_chat.sh 1.21.4 || ERR=$((ERR+1))
+fi
+# weather: GAME_STATE_CHANGE rain / thunder / clear -> client levels ramp up and decay (1.20.1 + 1.21.4)
+if [ -z "$ONLY" ] || [ "$ONLY" = weatherplay ]; then
+    echo "== mc/weatherplay =="
+    bash tools/mc/play/run_weather.sh 1.20.1 || ERR=$((ERR+1))
+    bash tools/mc/play/run_weather.sh 1.21.4 || ERR=$((ERR+1))
+fi
+# start screen: mcplay without arguments (config file, auto start, typed form, Escape)
+if [ -z "$ONLY" ] || [ "$ONLY" = startplay ]; then
+    echo "== mc/startplay =="
+    bash tools/mc/play/run_start.sh || ERR=$((ERR+1))
 fi
 # health: UPDATE_HEALTH hearts / food, death screen from DEATH_COMBAT_EVENT, respawn key -> client_command respawn (1.20.1 + 1.21.4)
 if [ -z "$ONLY" ] || [ "$ONLY" = healthplay ]; then
