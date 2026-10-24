@@ -762,6 +762,12 @@ for th in light dark; do
     [ "$(wc -c < "$W/flei-$th.png")" -gt 20000 ] || { echo "  flei $th shot too small"; exit 1; }
 done
 echo "  flei 1100x700 shot, light + dark   OK"
+"$W/fuiapp_flei" --theme dark --size 360x800 --shot "$W/flei-phone.png"
+"$W/fuiapp_flei" --theme dark --size 360x800 --scroll 300 --shot "$W/flei-phone-scroll.png"
+[ "$(wc -c < "$W/flei-phone.png")" -gt 15000 ] || { echo "  flei phone shot too small"; exit 1; }
+[ "$(cmp -s "$W/flei-phone.png" "$W/flei-dark.png"; echo $?)" = 1 ] || { echo "  flei phone shot equals desktop shot"; exit 1; }
+[ "$(cmp -s "$W/flei-phone.png" "$W/flei-phone-scroll.png"; echo $?)" = 1 ] || { echo "  flei phone scroll does not move"; exit 1; }
+echo "  flei phone layout (360x800 tab strip, one column, scroll)   OK"
 "$FIRNC" --opt-level=dev -o "$W/fuiapp_form" examples/fui_apps/form/main.fi
 for th in light dark; do
     "$W/fuiapp_form" --theme $th --shot "$W/form-$th.png"
@@ -770,6 +776,12 @@ done
 "$W/fuiapp_form" --theme dark --invalid --shot "$W/form-err.png"
 [ "$(wc -c < "$W/form-err.png")" -gt 15000 ] || { echo "  form error shot too small"; exit 1; }
 echo "  form wizard 1100x700 shot, light + dark + errors   OK"
+"$W/fuiapp_form" --theme dark --size 360x800 --shot "$W/form-phone.png"
+"$W/fuiapp_form" --theme dark --size 360x800 --fill --step 4 --shot "$W/form-phone-sum.png"
+[ "$(wc -c < "$W/form-phone.png")" -gt 8000 ] || { echo "  form phone shot too small"; exit 1; }
+[ "$(cmp -s "$W/form-phone.png" "$W/form-dark.png"; echo $?)" = 1 ] || { echo "  form phone shot equals desktop shot"; exit 1; }
+[ "$(wc -c < "$W/form-phone-sum.png")" -gt 15000 ] || { echo "  form phone summary shot too small"; exit 1; }
+echo "  form phone layout (360x800 full-width card, one field per row, stacked summary)   OK"
 build kitform
 "$W/kitform"
 "$FIRNC" --opt-level=dev -o "$W/fuiapp_notes" examples/fui_apps/notes/main.fi
@@ -835,6 +847,21 @@ for th in light dark; do
     [ "$(wc -c < "$W/dash-$th.png")" -gt 20000 ] || { echo "  dash $th shot too small"; exit 1; }
 done
 echo "  dash 1100x700 shot, light + dark   OK"
+"$W/fuiapp_dash" --theme dark --size 360x800 --shot "$W/dash-phone.png"
+"$W/fuiapp_dash" --theme dark --size 360x800 --scroll 400 --shot "$W/dash-phone-scroll.png"
+[ "$(wc -c < "$W/dash-phone.png")" -gt 15000 ] || { echo "  dash phone shot too small"; exit 1; }
+[ "$(cmp -s "$W/dash-phone.png" "$W/dash-dark.png"; echo $?)" = 1 ] || { echo "  dash phone shot equals desktop shot"; exit 1; }
+[ "$(cmp -s "$W/dash-phone.png" "$W/dash-phone-scroll.png"; echo $?)" = 1 ] || { echo "  dash phone scroll does not move"; exit 1; }
+echo "  dash phone layout (360x800 two-column KPIs, stacked cards, scroll)   OK"
+"$FIRNC" --opt-level=dev -o "$W/fuiapp_files" examples/fui_apps/files/main.fi
+for th in light dark; do
+    "$W/fuiapp_files" --theme $th --shot "$W/files-$th.png"
+    [ "$(wc -c < "$W/files-$th.png")" -gt 20000 ] || { echo "  files $th shot too small"; exit 1; }
+done
+"$W/fuiapp_files" --theme dark --size 360x800 --shot "$W/files-phone.png"
+[ "$(wc -c < "$W/files-phone.png")" -gt 20000 ] || { echo "  files phone shot too small"; exit 1; }
+[ "$(cmp -s "$W/files-phone.png" "$W/files-dark.png"; echo $?)" = 1 ] || { echo "  files phone shot equals desktop shot"; exit 1; }
+echo "  files 1100x700 shot, light + dark, phone layout (360x800 side column hidden, two columns)   OK"
 build kitdash
 "$W/kitdash"
 echo "== 18p5c. THE APP SCREENS AS WEBASSEMBLY (tools/wasm/screenapps.sh): Inter + assets, pixel-equal to the native shot =="
