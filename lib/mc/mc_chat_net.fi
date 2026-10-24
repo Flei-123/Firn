@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_chat_net.fi -- chat packets <-> mc_chat.Chat, any version with the packet.
+//
+//   chat_net_new()                           the translation table (mc_chat_lang) + the decoder state
+//   chat_on_packet(&net, &ch, cl, id, now)   System Chat / Player Chat / Disguised Chat / Action Bar / pre-1.19 Chat -> lines; false = not a chat packet
+//   chat_send_input(&ch, cl)                 sends the input line (a leading '/' = command) and clears it; false = empty or refused
+//
+// Components are JSON strings up to 1.20.2 and network NBT from 1.20.3 (protocol 765). Player chat shows `<name> message` (the chat type
+// translation of the registry is not read), disguised chat (`/say`, plugins) shows `[name] message`.
+
+import std.rt
+import std.bytes
+import mc.mc_client
+import mc.mc_schema
+import mc.mc_sem
+import mc.mc_version
+import mc.mc_text
+import mc.mc_text_nbt
+import mc.mc_chat
+import mc.mc_chat_lang
+import mc.mc_play
+
+export { ChatNet, chat_net_new, chat_net_free, chat_on_packet, chat_send_input, chat_send_script, NBT_PROTOCOL }
+
+const NBT_PROTOCOL: i32 = 765
+const COLOR_ACTION: u32 = 0xFFFFFFFF
+
+struct ChatNet {
+    tr: mc_text.Translations,
+}
+
+fn chat_net_new() -> ChatNet {
+    var n: ChatNet = ChatNet { tr: mc_text.tr_new() }
+    var j: rt.Buf = rt.buf_new()
+    mc_chat_lang.lang_basic(&j)
+    mc_text.tr_load(&n.tr, rt.buf_ptr(&j), rt.buf_len(&j))
+    rt.buf_free(&j)
+    return n
+}
+
+fn chat_net_free(n: *mut ChatNet) {
+    mc_text.tr_free(&(*n).tr)
+}
+
+fn field_of(cl: *mut mc_client.Client, id: i32, name: str, p: *mut u64, n: *mut usize) -> bool {
+    let sch: u64 = (*cl).ver.schema_of(mc_version.ST_PLAY, mc_version.DIR_S2C, id)
+    if sch == 0 { return false }
+    var off: usize = 0
+    var len: usize = 0
+    if !mc_schema.field_range(sch, name.p as u64, name.n, mc_client.client_body(cl), &off, &len) { return false }
+    *p = bytes.bytes_ptr(mc_client.client_body(cl)) + off as u64
+    *n = len
+    return true
+}
+
+fn flag_of(cl: *mut mc_client.Client, id: i32, name: str) -> bool {
+    var p: u64 = 0
+    var n: usize = 0
+    if !field_of(cl, id, name, &p, &n) || n != 1 { return false }
+    return rt.ld8(p, 0) != 0 as u8
+}
+
+fn component(net: *mut ChatNet, cl: *mut mc_client.Client, id: i32, name: str, t: *mut mc_text.TextDoc) -> bool {
+    var p: u64 = 0
+    var n: usize = 0
+    if !field_of(cl, id, name, &p, &n) { return false }
+    if (*cl).ver.protocol >= NBT_PROTOCOL { return mc_text_nbt.text_from_nbt(t, p, n, &(*net).tr) }
+    return mc_text.text_from_json(t, p, n, &(*net).tr)
+}
+
+fn plain_field(cl: *mut mc_client.Client, id: i32, name: str, out: *mut rt.Buf) -> bool {
+    var p: u64 = 0
+    var n: usize = 0
+    if !field_of(cl, id, name, &p, &n) { return false }
+    rt.buf_push_bytes(out, p, n)
+    return true
+}
+
+fn component_plain(net: *mut ChatNet, cl: *mut mc_client.Client, id: i32, name: str, out: *mut rt.Buf) -> bool {
+    var t: mc_text.TextDoc = mc_text.text_new()
+    var ok: bool = component(net, cl, id, name, &t)
+    if ok { mc_text.text_plain(&t, out) }
+    mc_text.text_free(&t)
+    return ok
+}
+
+fn add_component(net: *mut ChatNet, ch: *mut mc_chat.Chat, cl: *mut mc_client.Client, id: i32, name: str, now: u64, action: bool) -> bool {
+    var t: mc_text.TextDoc = mc_text.text_new()
+    let ok: bool = component(net, cl, id, name, &t)
+    if ok {
+        if action {
+            mc_chat.chat_set_action(ch, mc_text.text_ptr(&t), mc_text.text_len(&t), COLOR_ACTION, now)
+        } else {
+            mc_chat.chat_add_doc(ch, &t, now)
+        }
+    }
+    mc_text.text_free(&t)
+    return ok
+}
+
+fn add_named(net: *mut ChatNet, ch: *mut mc_chat.Chat, name: *mut rt.Buf, msg: *mut rt.Buf, open: u8, close: u8, now: u64) {
+    var line: rt.Buf = rt.buf_new()
+    rt.buf_push(&line, open)
+    rt.buf_push_bytes(&line, rt.buf_ptr(name), rt.buf_len(name))
+    rt.buf_push(&line, close)
+    rt.buf_push(&line, 32)
+    rt.buf_push_bytes(&line, rt.buf_ptr(msg), rt.buf_len(msg))
+    mc_chat.chat_add_plain(ch, rt.buf_ptr(&line), rt.buf_len(&line), mc_chat.WHITE, now)
+    rt.buf_free(&line)
+}
+
+fn on_player_chat(net: *mut ChatNet, ch: *mut mc_chat.Chat, cl: *mut mc_client.Client, id: i32, now: u64) {
+    var name: rt.Buf = rt.buf_new()
+    var msg: rt.Buf = rt.buf_new()
+    component_plain(net, cl, id, "networkName", &name)
+    plain_field(cl, id, "plainMessage", &msg)
+    add_named(net, ch, &name, &msg, 60, 62, now)
+    rt.buf_free(&name)
+    rt.buf_free(&msg)
+}
+
+fn on_disguised_chat(net: *mut ChatNet, ch: *mut mc_chat.Chat, cl: *mut mc_client.Client, id: i32, now: u64) {
+    var name: rt.Buf = rt.buf_new()
+    var msg: rt.Buf = rt.buf_new()
+    component_plain(net, cl, id, "name", &name)
+    component_plain(net, cl, id, "message", &msg)
+    add_named(net, ch, &name, &msg, 91, 93, now)
+    rt.buf_free(&name)
+    rt.buf_free(&msg)
+}
+
+fn chat_on_packet(net: *mut ChatNet, ch: *mut mc_chat.Chat, cl: *mut mc_client.Client, id: i32, now: u64) -> bool {
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_SYSTEM_CHAT) {
+        add_component(net, ch, cl, id, "content", now, flag_of(cl, id, "isActionBar"))
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_ACTION_BAR) {
+        add_component(net, ch, cl, id, "text", now, true)
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_PLAYER_CHAT) {
+        on_player_chat(net, ch, cl, id, now)
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_PROFILELESS_CHAT) {
+        on_disguised_chat(net, ch, cl, id, now)
+        return true
+    }
+    if (*cl).ver.protocol < 759 && mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_CHAT) {
+        var p: u64 = 0
+        var n: usize = 0
+        var action: bool = false
+        if field_of(cl, id, "position", &p, &n) && n == 1 { action = rt.ld8(p, 0) == 2 as u8 }
+        add_component(net, ch, cl, id, "message", now, action)
+        return true
+    }
+    return false
+}
+
+fn chat_send_input(ch: *mut mc_chat.Chat, cl: *mut mc_client.Client) -> bool {
+    let n: usize = mc_chat.chat_input_len(ch)
+    let p: u64 = mc_chat.chat_input_ptr(ch)
+    var ok: bool = false
+    if n > 0 {
+        if rt.ld8(p, 0) == 47 as u8 {
+            if n > 1 { ok = mc_play.send_command(cl, p + 1 as u64, n - 1) }
+        } else {
+            ok = mc_play.send_chat(cl, p, n)
+        }
+    }
+    if ok { (*ch).sent = (*ch).sent + 1 as u64 }
+    mc_chat.chat_input_clear(ch)
+    return ok
+}
+
+fn chat_send_script(ch: *mut mc_chat.Chat, cl: *mut mc_client.Client, p: u64, n: usize) -> i32 {
+    var sent: i32 = 0
+    var start: usize = 0
+    var i: usize = 0
+    while i <= n {
+        if i == n || rt.ld8(p, i) == 124 as u8 {
+            mc_chat.chat_input_set(ch, p + start as u64, i - start)
+            if chat_send_input(ch, cl) { sent = sent + 1 }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return sent
+}

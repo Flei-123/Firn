@@ -1,0 +1,317 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/mc/mc_chat.fi -- chat state without a window: a ring of the last MAX_LINES lines (text + one colour per glyph), the input line with
+// a cursor, the action bar text. Pure state: packets arrive through mc_chat_net, drawing is mc_chat_ui.
+//
+//   chat_new() / chat_free(&ch)
+//   chat_add_doc(&ch, &doc, now_ms)             a mc_text.TextDoc as lines (split at '\n' and at LINE_MAX glyphs)
+//   chat_add_plain(&ch, p, n, argb, now_ms)     plain octets in one colour (0xAABBGGRR like mc_hud)
+//   chat_line_count(&ch)                        lines held; k = 0 is the newest
+//   chat_line_len / chat_line_ptr / chat_line_color / chat_line_time (&ch, k)
+//   chat_set_action(&ch, p, n, now_ms)          action bar text, shown for ACTION_MS
+//   chat_input_char / _backspace / _delete / _left / _right / _home / _end / _clear / _set
+//
+// Non ASCII input is stored as UTF-8 and sent as it is; lines received are reduced to ASCII (every multi-octet sequence becomes one '?').
+
+import std.rt
+import mc.mc_text
+
+export {
+    Chat, chat_new, chat_free, chat_add_doc, chat_add_plain, chat_line_count, chat_line_len, chat_line_ptr, chat_line_color, chat_line_time,
+    chat_set_action, chat_action_len, chat_action_ptr, chat_action_color, chat_action_live,
+    chat_input_char, chat_input_backspace, chat_input_delete, chat_input_left, chat_input_right, chat_input_home, chat_input_end,
+    chat_input_clear, chat_input_set, chat_input_len, chat_input_ptr, chat_input_cursor,
+    MAX_LINES, LINE_MAX, INPUT_MAX, ACTION_MS, WHITE,
+}
+
+const MAX_LINES: usize = 100
+const LINE_MAX: usize = 240
+const INPUT_MAX: usize = 256
+const ACTION_MS: u64 = 3000
+const WHITE: u32 = 0xFFFFFFFF
+
+struct Chat {
+    text: rt.Buf,
+    color: rt.Buf,
+    lens: rt.Buf,
+    time: rt.Buf,
+    head: usize,
+    count: usize,
+    input: rt.Buf,
+    cur: usize,
+    action: rt.Buf,
+    action_color: u32,
+    action_t: u64,
+    open: bool,
+    was_open: bool,
+    scroll: i32,
+    guard: i32,
+    regrab: bool,
+    received: u64,
+    sent: u64,
+}
+
+fn zero_fill(b: *mut rt.Buf, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, 0)
+        i = i + 1
+    }
+}
+
+fn chat_new() -> Chat {
+    var ch: Chat = Chat { text: rt.buf_new(), color: rt.buf_new(), lens: rt.buf_new(), time: rt.buf_new(), head: 0, count: 0,
+        input: rt.buf_new(), cur: 0, action: rt.buf_new(), action_color: WHITE, action_t: 0 as u64, open: false, was_open: false, scroll: 0, guard: 0,
+        regrab: false, received: 0 as u64, sent: 0 as u64 }
+    zero_fill(&ch.text, MAX_LINES * LINE_MAX)
+    zero_fill(&ch.color, MAX_LINES * LINE_MAX * 4)
+    zero_fill(&ch.lens, MAX_LINES * 4)
+    zero_fill(&ch.time, MAX_LINES * 4)
+    return ch
+}
+
+fn chat_free(ch: *mut Chat) {
+    rt.buf_free(&(*ch).text)
+    rt.buf_free(&(*ch).color)
+    rt.buf_free(&(*ch).lens)
+    rt.buf_free(&(*ch).time)
+    rt.buf_free(&(*ch).input)
+    rt.buf_free(&(*ch).action)
+}
+
+fn argb_of(rgb: i32) -> u32 {
+    if rgb < 0 { return WHITE }
+    let r: u32 = ((rgb >> 16) & 255) as u32
+    let g: u32 = ((rgb >> 8) & 255) as u32
+    let b: u32 = (rgb & 255) as u32
+    return 0xFF000000 | (b << 16) | (g << 8) | r
+}
+
+fn push_line(ch: *mut Chat, tp: *mut rt.Buf, cp: *mut rt.Buf, n: usize, now: u64) {
+    if n == 0 { return }
+    let idx: usize = (*ch).head
+    let tb: u64 = rt.buf_ptr(&(*ch).text) + (idx * LINE_MAX) as u64
+    let cb: u64 = rt.buf_ptr(&(*ch).color) + (idx * LINE_MAX * 4) as u64
+    var i: usize = 0
+    while i < n {
+        rt.st8(tb, i, rt.ld8(rt.buf_ptr(tp), i))
+        rt.st32(cb, i, rt.ld32(rt.buf_ptr(cp), i))
+        i = i + 1
+    }
+    rt.st32(rt.buf_ptr(&(*ch).lens), idx, n as u32)
+    rt.st32(rt.buf_ptr(&(*ch).time), idx, (now & 4294967295 as u64) as u32)
+    (*ch).head = (idx + 1) % MAX_LINES
+    if (*ch).count < MAX_LINES { (*ch).count = (*ch).count + 1 }
+    (*ch).received = (*ch).received + 1 as u64
+}
+
+fn flush_line(ch: *mut Chat, tp: *mut rt.Buf, cp: *mut rt.Buf, now: u64) {
+    push_line(ch, tp, cp, rt.buf_len(tp), now)
+    rt.buf_clear(tp)
+    rt.buf_clear(cp)
+}
+
+fn push_glyph(tp: *mut rt.Buf, cp: *mut rt.Buf, c: u8, argb: u32) {
+    rt.buf_push(tp, c)
+    let n: usize = rt.buf_len(cp)
+    zero_fill(cp, 4)
+    rt.st32(rt.buf_ptr(cp), n / 4, argb)
+}
+
+fn chat_add_octets(ch: *mut Chat, p: u64, n: usize, spans: *mut mc_text.TextDoc, use_spans: bool, now: u64, argb: u32) {
+    var tp: rt.Buf = rt.buf_new()
+    var cp: rt.Buf = rt.buf_new()
+    var span: usize = 0
+    var spans_n: usize = 0
+    if use_spans { spans_n = mc_text.text_span_count(spans) }
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        var col: u32 = argb
+        if spans_n > 0 {
+            while span < spans_n && mc_text.text_span_off(spans, span) + mc_text.text_span_len(spans, span) <= i { span = span + 1 }
+            if span < spans_n && mc_text.text_span_off(spans, span) <= i { col = argb_of(mc_text.text_span_color(spans, span)) }
+        }
+        if c == 10 as u8 {
+            flush_line(ch, &tp, &cp, now)
+        } else if c >= 128 as u8 && c < 192 as u8 {
+        } else {
+            var g: u8 = c
+            if c >= 192 as u8 || c < 32 as u8 { g = 63 as u8 }
+            push_glyph(&tp, &cp, g, col)
+            if rt.buf_len(&tp) >= LINE_MAX { flush_line(ch, &tp, &cp, now) }
+        }
+        i = i + 1
+    }
+    flush_line(ch, &tp, &cp, now)
+    rt.buf_free(&tp)
+    rt.buf_free(&cp)
+    (*ch).scroll = 0
+}
+
+fn chat_add_doc(ch: *mut Chat, doc: *mut mc_text.TextDoc, now: u64) {
+    chat_add_octets(ch, mc_text.text_ptr(doc), mc_text.text_len(doc), doc, true, now, WHITE)
+}
+
+fn chat_add_plain(ch: *mut Chat, p: u64, n: usize, argb: u32, now: u64) {
+    var none: mc_text.TextDoc = mc_text.text_new()
+    chat_add_octets(ch, p, n, &none, false, now, argb)
+    mc_text.text_free(&none)
+}
+
+fn chat_line_count(ch: *mut Chat) -> usize { return (*ch).count }
+
+fn line_index(ch: *mut Chat, k: usize) -> usize {
+    return ((*ch).head + MAX_LINES * 2 - 1 - k) % MAX_LINES
+}
+
+fn chat_line_len(ch: *mut Chat, k: usize) -> usize {
+    if k >= (*ch).count { return 0 }
+    return rt.ld32(rt.buf_ptr(&(*ch).lens), line_index(ch, k)) as usize
+}
+
+fn chat_line_ptr(ch: *mut Chat, k: usize) -> u64 {
+    return rt.buf_ptr(&(*ch).text) + (line_index(ch, k) * LINE_MAX) as u64
+}
+
+fn chat_line_color(ch: *mut Chat, k: usize, j: usize) -> u32 {
+    return rt.ld32(rt.buf_ptr(&(*ch).color) + (line_index(ch, k) * LINE_MAX * 4) as u64, j)
+}
+
+fn chat_line_time(ch: *mut Chat, k: usize) -> u32 {
+    return rt.ld32(rt.buf_ptr(&(*ch).time), line_index(ch, k))
+}
+
+fn chat_set_action(ch: *mut Chat, p: u64, n: usize, argb: u32, now: u64) {
+    rt.buf_clear(&(*ch).action)
+    var i: usize = 0
+    while i < n && i < LINE_MAX {
+        let c: u8 = rt.ld8(p, i)
+        if c >= 32 as u8 && c < 128 as u8 { rt.buf_push(&(*ch).action, c) } else if c >= 192 as u8 { rt.buf_push(&(*ch).action, 63) }
+        i = i + 1
+    }
+    (*ch).action_color = argb
+    (*ch).action_t = now
+}
+
+fn chat_action_len(ch: *mut Chat) -> usize { return rt.buf_len(&(*ch).action) }
+fn chat_action_ptr(ch: *mut Chat) -> u64 { return rt.buf_ptr(&(*ch).action) }
+fn chat_action_color(ch: *mut Chat) -> u32 { return (*ch).action_color }
+
+fn chat_action_live(ch: *mut Chat, now: u64) -> bool {
+    return rt.buf_len(&(*ch).action) > 0 && now < (*ch).action_t + ACTION_MS
+}
+
+fn chat_input_len(ch: *mut Chat) -> usize { return rt.buf_len(&(*ch).input) }
+fn chat_input_ptr(ch: *mut Chat) -> u64 { return rt.buf_ptr(&(*ch).input) }
+fn chat_input_cursor(ch: *mut Chat) -> usize { return (*ch).cur }
+
+fn chat_input_clear(ch: *mut Chat) {
+    rt.buf_clear(&(*ch).input)
+    (*ch).cur = 0
+}
+
+fn input_insert(ch: *mut Chat, at: usize, p: *mut rt.Buf) {
+    let n: usize = rt.buf_len(p)
+    let old: usize = rt.buf_len(&(*ch).input)
+    zero_fill(&(*ch).input, n)
+    let d: u64 = rt.buf_ptr(&(*ch).input)
+    var i: usize = old
+    while i > at {
+        i = i - 1
+        rt.st8(d, i + n, rt.ld8(d, i))
+    }
+    var k: usize = 0
+    while k < n {
+        rt.st8(d, at + k, rt.ld8(rt.buf_ptr(p), k))
+        k = k + 1
+    }
+    (*ch).cur = at + n
+}
+
+fn input_remove(ch: *mut Chat, from: usize, to: usize) {
+    let len: usize = rt.buf_len(&(*ch).input)
+    let d: u64 = rt.buf_ptr(&(*ch).input)
+    var i: usize = to
+    while i < len {
+        rt.st8(d, from + (i - to), rt.ld8(d, i))
+        i = i + 1
+    }
+    rt.buf_set_len(&(*ch).input, len - (to - from))
+    if (*ch).cur > from { (*ch).cur = from }
+}
+
+fn chat_input_char(ch: *mut Chat, code: u32) -> bool {
+    var enc: rt.Buf = rt.buf_new()
+    if code >= 32 as u32 && code < 127 as u32 {
+        rt.buf_push(&enc, code as u8)
+    } else if code >= 160 as u32 && code < 2048 as u32 {
+        rt.buf_push(&enc, (192 as u32 | (code >> 6)) as u8)
+        rt.buf_push(&enc, (128 as u32 | (code & 63 as u32)) as u8)
+    } else if code >= 2048 as u32 && code < 65536 as u32 {
+        rt.buf_push(&enc, (224 as u32 | (code >> 12)) as u8)
+        rt.buf_push(&enc, (128 as u32 | ((code >> 6) & 63 as u32)) as u8)
+        rt.buf_push(&enc, (128 as u32 | (code & 63 as u32)) as u8)
+    } else if code >= 65536 as u32 && code < 1114112 as u32 {
+        rt.buf_push(&enc, (240 as u32 | (code >> 18)) as u8)
+        rt.buf_push(&enc, (128 as u32 | ((code >> 12) & 63 as u32)) as u8)
+        rt.buf_push(&enc, (128 as u32 | ((code >> 6) & 63 as u32)) as u8)
+        rt.buf_push(&enc, (128 as u32 | (code & 63 as u32)) as u8)
+    }
+    var ok: bool = false
+    let n: usize = rt.buf_len(&enc)
+    if n > 0 && rt.buf_len(&(*ch).input) + n <= INPUT_MAX {
+        input_insert(ch, (*ch).cur, &enc)
+        ok = true
+    }
+    rt.buf_free(&enc)
+    return ok
+}
+
+fn is_cont(c: u8) -> bool { return c >= 128 as u8 && c < 192 as u8 }
+
+fn chat_input_backspace(ch: *mut Chat) {
+    if (*ch).cur == 0 { return }
+    var from: usize = (*ch).cur - 1
+    let d: u64 = rt.buf_ptr(&(*ch).input)
+    while from > 0 && is_cont(rt.ld8(d, from)) { from = from - 1 }
+    input_remove(ch, from, (*ch).cur)
+}
+
+fn chat_input_delete(ch: *mut Chat) {
+    let len: usize = rt.buf_len(&(*ch).input)
+    if (*ch).cur >= len { return }
+    var to: usize = (*ch).cur + 1
+    let d: u64 = rt.buf_ptr(&(*ch).input)
+    while to < len && is_cont(rt.ld8(d, to)) { to = to + 1 }
+    input_remove(ch, (*ch).cur, to)
+}
+
+fn chat_input_left(ch: *mut Chat) {
+    if (*ch).cur == 0 { return }
+    var c: usize = (*ch).cur - 1
+    let d: u64 = rt.buf_ptr(&(*ch).input)
+    while c > 0 && is_cont(rt.ld8(d, c)) { c = c - 1 }
+    (*ch).cur = c
+}
+
+fn chat_input_right(ch: *mut Chat) {
+    let len: usize = rt.buf_len(&(*ch).input)
+    if (*ch).cur >= len { return }
+    var c: usize = (*ch).cur + 1
+    let d: u64 = rt.buf_ptr(&(*ch).input)
+    while c < len && is_cont(rt.ld8(d, c)) { c = c + 1 }
+    (*ch).cur = c
+}
+
+fn chat_input_home(ch: *mut Chat) { (*ch).cur = 0 }
+fn chat_input_end(ch: *mut Chat) { (*ch).cur = rt.buf_len(&(*ch).input) }
+
+fn chat_input_set(ch: *mut Chat, p: u64, n: usize) {
+    chat_input_clear(ch)
+    var i: usize = 0
+    while i < n && i < INPUT_MAX {
+        rt.buf_push(&(*ch).input, rt.ld8(p, i))
+        i = i + 1
+    }
+    (*ch).cur = rt.buf_len(&(*ch).input)
+}
