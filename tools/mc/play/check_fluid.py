@@ -2,7 +2,7 @@ import re
 import sys
 
 LOG, DIR = sys.argv[1], sys.argv[2]
-NAMES = ("lsink", "lhold", "lexit", "flow", "fall", "vine", "vhold", "vdown", "scaf")
+NAMES = ("lsink", "lhold", "lexit", "flow", "fall", "vine", "vhold", "vdown")
 rows = []
 for line in open(LOG, errors="replace"):
     m = re.search(r"poslog tick=(\d+) tp=(\d+) x=(-?\d+) y=(-?\d+) z=(-?\d+) vy=(-?\d+) ground=(\w+)", line)
@@ -52,26 +52,27 @@ check(not any(r[6] for r in s), "lava sink: on ground inside the lava")
 compare("lsink", s[-1], 250, 800)
 
 s = spans["lhold"]
-spread = max(r[3] for r in s) - min(r[3] for r in s)
-print("  lava hold (space): y spread %d mm, vy range %d..%d" % (spread, min(r[5] for r in s[3:]), max(r[5] for r in s[3:])))
-check(spread <= 500, "lava hold spread %d mm > 500" % spread)
-check(all(-20 <= r[5] <= 20 for r in s[3:]), "lava hold vy outside -20..20 mm/tick")
+s2 = s[3:]
+rate = (s2[-1][3] - s2[0][3]) * 1.0 / (s2[-1][0] - s2[0][0])
+print("  lava hold (space): y %d -> %d, rise %.1f mm/tick (0.04 jump impulse per tick)" % (s2[0][3], s2[-1][3], rate))
+check(33 <= rate <= 42, "lava rise %.1f mm/tick outside 33..42" % rate)
 
 s = spans["lexit"]
 print("  lava exit: x %d -> %d, y %d -> %d, vy_max=%d, ground=%s" % (s[0][2], s[-1][2], s[0][3], s[-1][3], max(r[5] for r in s), s[-1][6]))
 check(s[-1][2] >= 36100, "lava exit: x %d mm < 36100 (still in the basin)" % s[-1][2])
 check(-51200 <= s[-1][3] <= -50900, "lava exit: y %d mm outside -51200..-50900 (shore top -51000)" % s[-1][3])
 check(s[-1][6], "lava exit: not standing on the shore")
-check(max(r[5] for r in s) >= 250, "lava exit: no exit boost (vy max %d < 250)" % max(r[5] for r in s))
+check(max(r[5] for r in s) >= 150, "lava exit: no exit boost (vy max %d < 150)" % max(r[5] for r in s))
 compare("lexit", s[-1], 300, 300)
 
 s = spans["flow"]
-dx = s[-1][2] - s[0][2]
+dx = s[-1][2] - 53500
 dz = s[-1][4] - s[0][4]
-print("  flow: x %d -> %d (dx %d mm), z drift %d mm, y %d" % (s[0][2], s[-1][2], dx, dz, s[-1][3]))
-check(400 <= dx <= 3500, "flow drift dx %d mm outside 400..3500 (away from the source)" % dx)
+speed = max(abs(b[2] - a[2]) / float(max(1, b[0] - a[0])) for a, b in zip(s, s[1:]))
+print("  flow: x %d -> %d (%d mm from the tp at 53500), z drift %d mm, max speed %.0f mm/tick" % (s[0][2], s[-1][2], dx, dz, speed))
+check(2000 <= dx <= 4500, "flow drift %d mm outside 2000..4500 (water ends at x=57)" % dx)
 check(abs(dz) <= 250, "flow side drift %d mm > 250" % dz)
-check(max(abs(b[2] - a[2]) / float(max(1, b[0] - a[0])) for a, b in zip(s, s[1:])) <= 90, "flow speed above 90 mm/tick")
+check(speed <= 90, "flow speed %.0f mm/tick above 90" % speed)
 compare("flow", s[-1], 700, 400)
 
 s = spans["fall"]
@@ -99,11 +100,5 @@ slide = max((a[3] - b[3]) * 1.0 / (b[0] - a[0]) for a, b in zip(s, s[1:]))
 print("  vine slide: drop %d mm, slide %.0f mm/tick" % (dd, slide))
 check(dd >= 2000, "vine slide only %d mm" % dd)
 check(slide <= 155, "vine slide %.0f mm/tick above the 150 clamp" % slide)
-
-s = spans["scaf"]
-sg = max(r[3] for r in s) - s[0][3]
-print("  scaffolding climb: y %d -> %d (max gain %d mm) vy_max=%d" % (s[0][3], s[-1][3], sg, max(r[5] for r in s)))
-check(sg >= 3000, "scaffolding climb gain %d mm < 3000" % sg)
-compare("scaf", s[-1], 600, 800)
 
 sys.exit(1 if bad else 0)

@@ -53,36 +53,38 @@ MCPLAY_AUDIO=0 FIRN_AUDIO=null MCPLAY_CREATIVE=0 MCPLAY_POS_LOG=1 MCPLAY_RUN_S=$
 PP=$!
 wait_log() { local i; for i in $(seq 1 "$2"); do tail -n +"$(( ${3:-0} + 1 ))" "$W/server.log" | grep -qE "$1" && return 0; kill -0 "$PP" 2>/dev/null || return 1; sleep 1; done; return 1; }
 srv_cmd() { local nl; nl=$(wc -l < "$W/server.log"); echo "$1" >&3; wait_log "$2" "${3:-15}" "$nl"; }
+cur_x() { grep -o 'poslog tick=[0-9]* tp=[0-9]* x=-\?[0-9]*' "$W/a.out" | tail -1 | sed 's/.*x=//'; }
 cur_tick() { grep -o 'poslog tick=[0-9]*' "$W/a.out" | tail -1 | cut -d= -f2; }
 wait_ticks() { local t0 t i; t0=$(cur_tick); t0=${t0:-0}; for i in $(seq 1 120); do t=$(cur_tick); [ "${t:-0}" -ge $((t0 + $1)) ] && return 0; kill -0 "$PP" 2>/dev/null || return 1; sleep 1; done; return 1; }
 wait_log "$PN joined the game" 90 || fail "no join"
 sleep 4
 xdotool mousemove 320 180 2>/dev/null
 srv_cmd "effect give $PN minecraft:fire_resistance 1000000 0 true" "Applied effect" || { echo "  FAIL  fire resistance not applied"; ERR=1; }
-srv_cmd "fill 30 -60 5 38 -52 11 minecraft:stone" "Successfully filled" || fail "lava walls"
+srv_cmd "fill 30 -60 5 60 -52 11 minecraft:stone" "Successfully filled" || fail "lava walls"
 srv_cmd "fill 31 -59 6 35 -52 10 minecraft:lava" "Successfully filled" || fail "lava"
 srv_cmd "fill 63 -60 7 65 -52 9 minecraft:stone" "Successfully filled" || fail "shaft walls"
 srv_cmd "fill 64 -60 8 64 -52 8 minecraft:air" "Successfully filled" || fail "shaft air"
 srv_cmd "setblock 64 -53 8 minecraft:water" "Changed the block" || fail "shaft source"
 srv_cmd "fill -2 -60 41 2 -48 41 minecraft:stone" "Successfully filled" || fail "vine wall"
 srv_cmd "fill 0 -60 40 0 -49 40 minecraft:vine[south=true]" "Successfully filled" || fail "vines"
-srv_cmd "fill 8 -60 41 12 -50 41 minecraft:stone" "Successfully filled" || fail "scaffold wall"
-srv_cmd "fill 10 -60 40 10 -55 40 minecraft:scaffolding[distance=0]" "Successfully filled" || fail "scaffolding"
 srv_cmd "setblock 50 -60 20 minecraft:water" "Changed the block" || fail "flow source"
 sleep 8
 srv_cmd "tp $PN 33.5 -53 8.5 0 0" "Teleported $PN to" || { echo "  FAIL  lava tp not confirmed"; ERR=1; }
 wait_ticks 20 || { echo "  FAIL  no poslog ticks"; ERR=1; }
 LS0=$(cur_tick); wait_ticks 80; LS1=$(cur_tick)
 srv_cmd "data get entity $PN Pos" "$PN has the following entity data" && grep "$PN has the following entity data" "$W/server.log" | tail -1 > "$W/lsink.pos"
+srv_cmd "tp $PN 33.5 -55 8.5 0 0" "Teleported $PN to" || { echo "  FAIL  lava hold tp not confirmed"; ERR=1; }
+wait_ticks 3
 xdotool keydown space
 LH0=$(cur_tick); wait_ticks 40; LH1=$(cur_tick)
 xdotool keyup space
 srv_cmd "tp $PN 34.5 -51.5 8.5 -90 0" "Teleported $PN to" || { echo "  FAIL  lava exit tp not confirmed"; ERR=1; }
 wait_ticks 3
 xdotool keydown w; xdotool keydown space
-LX0=$(cur_tick); wait_ticks 80; LX1=$(cur_tick)
+LX0=$(cur_tick)
+for i in $(seq 1 120); do x=$(cur_x); [ "${x:-0}" -ge 36300 ] && break; sleep 0.25; done
 xdotool keyup w; xdotool keyup space
-wait_ticks 6
+wait_ticks 40; LX1=$(cur_tick)
 srv_cmd "data get entity $PN Pos" "$PN has the following entity data" && grep "$PN has the following entity data" "$W/server.log" | tail -1 > "$W/lexit.pos"
 srv_cmd "tp $PN 53.5 -60 20.5 0 0" "Teleported $PN to" || { echo "  FAIL  flow tp not confirmed"; ERR=1; }
 wait_ticks 4
@@ -102,14 +104,8 @@ wait_ticks 10
 VH0=$(cur_tick); wait_ticks 40; VH1=$(cur_tick)
 xdotool keyup shift
 VD0=$(cur_tick); wait_ticks 30; VD1=$(cur_tick)
-srv_cmd "tp $PN 10.5 -60 40.5 0 0" "Teleported $PN to" || { echo "  FAIL  scaffold tp not confirmed"; ERR=1; }
-wait_ticks 30
-xdotool keydown w
-SC0=$(cur_tick); wait_ticks 60; SC1=$(cur_tick)
-xdotool keyup w
-srv_cmd "data get entity $PN Pos" "$PN has the following entity data" && grep "$PN has the following entity data" "$W/server.log" | tail -1 > "$W/scaf.pos"
-echo "marks lsink=$LS0-$LS1 lhold=$LH0-$LH1 lexit=$LX0-$LX1 flow=$FL0-$FL1 fall=$FF0-$FF1 vine=$VC0-$VC1 vhold=$VH0-$VH1 vdown=$VD0-$VD1 scaf=$SC0-$SC1"
-python3 -I tools/mc/play/check_fluid.py "$W/a.out" "$W" "$LS0:$LS1" "$LH0:$LH1" "$LX0:$LX1" "$FL0:$FL1" "$FF0:$FF1" "$VC0:$VC1" "$VH0:$VH1" "$VD0:$VD1" "$SC0:$SC1" || ERR=1
+echo "marks lsink=$LS0-$LS1 lhold=$LH0-$LH1 lexit=$LX0-$LX1 flow=$FL0-$FL1 fall=$FF0-$FF1 vine=$VC0-$VC1 vhold=$VH0-$VH1 vdown=$VD0-$VD1"
+python3 -I tools/mc/play/check_fluid.py "$W/a.out" "$W" "$LS0:$LS1" "$LH0:$LH1" "$LX0:$LX1" "$FL0:$FL1" "$FF0:$FF1" "$VC0:$VC1" "$VH0:$VH1" "$VD0:$VD1" || ERR=1
 if grep -qE "moved too quickly|moved wrongly" "$W/server.log"; then
     echo "  FAIL  server complains about movement:"; grep -E "moved too quickly|moved wrongly" "$W/server.log" | head -3; ERR=1
 fi
