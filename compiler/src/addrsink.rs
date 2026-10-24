@@ -35,6 +35,120 @@ use crate::fx::HashMap;
 
 /// The copy with sunk addresses, or `None` when there is nothing to sink.
 pub fn sink(f: &Func) -> Option<Func> {
+    let c = crate::chainsink::sink(f);
+    let c_ref: &Func = c.as_ref().unwrap_or(f);
+    let a = sink_consts(c_ref);
+    let base: &Func = a.as_ref().or(c.as_ref()).unwrap_or(f);
+    match sink_globals(base) {
+        Some(g) => Some(g),
+        None => a.or(c),
+    }
+}
+
+/// GAPS-GLOBAL: every reader of a `globaladdr` gets its own copy right in front of it, so the
+/// address of a `static` lives for one access instead of a whole loop (or function). Done only
+/// when EVERY reader is the address of a load/store or the base of a `ptradd`/64-bit `add`
+/// (anything else keeps the address in a register anyway). `regalloc.rs::foldable_addresses`
+/// then names the symbol in the access (`[rip + sym]`, or `[sym + idx*F]` on non-PIC ELF).
+/// `FIRN_NO_GFOLD=1` switches it off.
+fn sink_globals(f: &Func) -> Option<Func> {
+    if std::env::var_os("FIRN_NO_GFOLD").is_some() || !f.secret.is_empty() || f.constant_time {
+        return None;
+    }
+    let indexed_ok = !crate::target::windows() && !crate::target::pic();
+    let nv = f.val_types.len();
+    let mut defs = vec![0u32; nv];
+    let mut cand: HashMap<Val, (String, FTy)> = HashMap::default();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Some(d) = i.dst {
+                if let Some(c) = defs.get_mut(d as usize) {
+                    *c += 1;
+                }
+                if let Op::GlobalAddr { name } = &i.op {
+                    cand.insert(d, (name.clone(), i.ty));
+                }
+            }
+        }
+    }
+    cand.retain(|d, _| defs.get(*d as usize) == Some(&1));
+    if cand.is_empty() {
+        return None;
+    }
+    let mut bad: crate::fx::HashSet<Val> = crate::fx::HashSet::default();
+    let mut nreaders: HashMap<Val, u32> = HashMap::default();
+    let mut buf = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            buf.clear();
+            i.op.uses(&mut buf);
+            for u in &buf {
+                if !cand.contains_key(u) {
+                    continue;
+                }
+                let ok = match &i.op {
+                    Op::Load { addr } => addr == u,
+                    Op::Store { addr, val } => addr == u && val != u,
+                    Op::PtrAdd { base, off } => indexed_ok && base == u && off != u,
+                    Op::Bin(BinOp::Add, x, y) if i.ty.bits() == 64 => indexed_ok && (x == u) != (y == u),
+                    _ => false,
+                };
+                if ok {
+                    *nreaders.entry(*u).or_insert(0) += 1;
+                } else {
+                    bad.insert(*u);
+                }
+            }
+        }
+        let tv: Option<Val> = match &b.term {
+            Term::BrCond { cond, .. } => Some(*cond),
+            Term::Switch { val, .. } => Some(*val),
+            Term::Ret(Some(v)) => Some(*v),
+            _ => None,
+        };
+        if let Some(v) = tv {
+            bad.insert(v);
+        }
+    }
+    // worth it only when the address is read more than once (a single reader right behind it
+    // is folded already) or far from its definition; keep it simple: >= 1 reader, not bad
+    let sinkable: crate::fx::HashSet<Val> = cand
+        .keys()
+        .copied()
+        .filter(|d| !bad.contains(d) && nreaders.get(d).copied().unwrap_or(0) >= 1)
+        .collect();
+    if sinkable.is_empty() {
+        return None;
+    }
+    let mut g = f.clone();
+    for bi in 0..g.blocks.len() {
+        let old = std::mem::take(&mut g.blocks[bi].insts);
+        let mut out: Vec<Inst> = Vec::with_capacity(old.len() + 8);
+        for mut i in old {
+            if let Some(d) = i.dst {
+                if sinkable.contains(&d) {
+                    continue;
+                }
+            }
+            let mut pre: Vec<Inst> = Vec::new();
+            let loc = i.loc;
+            i.op.for_each_use_mut(|v| {
+                if sinkable.contains(v) {
+                    let (name, ty) = cand[v].clone();
+                    let nd = g.new_val_pub(ty);
+                    pre.push(Inst::like(Some(nd), ty, Op::GlobalAddr { name }, loc));
+                    *v = nd;
+                }
+            });
+            out.extend(pre);
+            out.push(i);
+        }
+        g.blocks[bi].insts = out;
+    }
+    Some(g)
+}
+
+fn sink_consts(f: &Func) -> Option<Func> {
     if std::env::var_os("FIRN_NO_ADDRSINK").is_some() || !f.secret.is_empty() || f.constant_time {
         return None;
     }

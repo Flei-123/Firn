@@ -1291,6 +1291,17 @@ fn combine(op: BinOp, a: Range, b: Range) -> Option<Range> {
 /// practice.
 const DEPTH: u32 = 4;
 
+pub(crate) fn nonneg_at(f: &Func, queries: &[(usize, Val)]) -> Vec<bool> {
+    if f.blocks.len() > 512 || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
+        return vec![false; queries.len()];
+    }
+    let ana = Ana::new(f);
+    queries
+        .iter()
+        .map(|&(bi, v)| !f.is_secret(v) && ana.range(v, bi, DEPTH).map_or(false, |r| r.0 >= 0))
+        .collect()
+}
+
 /// Replaces every checked operation whose check provably cannot fire with
 /// the unchecked one. Yields how many.
 pub(crate) fn remove_provable_arith_checks(f: &mut Func) -> usize {
