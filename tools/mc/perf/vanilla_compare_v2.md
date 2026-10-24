@@ -70,3 +70,28 @@ Spalten: n = Anzahl Laeufe; cpu = % eines Kerns; t_window = Prozessstart bis Fen
 - Result: after the r277 fix mcplay is at or slightly under Vanilla frame time (r8 ~0.4-0.7 ms, r16 ~0.8-1.0 ms lower p50), 1% lows similar, RAM 2.5-3.4x lower, start-to-join ~10x faster. Spread between Vanilla runs (2.05-2.61) is as large as the r8 gap: treat r8 as "on par", r16 as "mcplay ~15% faster".
 - Not comparable: Vanilla renders shaders/light/entities/weather/particles/fancy graphics, mcplay a simpler renderer; one spot, one machine, 30 s per run, n=3. 1%-low outliers (41 ms) in one GL r16 and one VK r16 run.
 - 360p and capped (default 60 fps) variants not run (time).
+
+## v4 (24.10., profile + 2x hunt) -- Laptop HOLO-LAPTOP-3, Hoechstleistung, 1280x720, uncapped, PresentMon
+- New opt-in profile: `MCPLAY_PROFILE=1` (+ `MCPLAY_PROFILE_FROM=<s>`) prints at exit `mcplay: profile phase=<name> n p50_us p95_us mean_us` for frame, net_tick, draw_cpu, world_cpu (stream_frame), cull, submit, upload, stream_draw, present, plus per-frame counters draw_calls / tris / gl_calls / visible and the GL timer passes (terrain, sky, hud, present). Scripts pass it on (`mcvan_run.ps1`). Lib: `lib/mc/mc_prof.fi`.
+- Runs: n=1-2 per cell (time), sweep 30 s after 20 s settle, same world as v3. Vanilla re-run in the same session (r8 2.44/2.51, r16 5.74/5.97 -> v3 numbers reproduce; a 4.15 ms r16 value was a world-generation warm-up and is invalid).
+
+| config | PresentMon p50 ms | note |
+|---|---|---|
+| Vanilla r8 | 2.44 / 2.51 | n=2 |
+| Vanilla r16 | 5.74 / 5.97 | n=2 |
+| mcplay GL r8 | 2.04 / 2.05 | |
+| mcplay VK r8 | 1.74 / 1.76 | |
+| mcplay GL r16 | 5.02 / 4.97 | |
+| mcplay VK r16 | 5.08 | |
+| GL view 8 + LOD 16 (= Vanilla r16 distance) | 2.26 | `MCPLAY_LOD=16` |
+| GL view 6 + LOD 16 | 1.88 | |
+| GL view 4 + LOD 16 | 1.36 | |
+| GL view 4 + LOD 8 (= Vanilla r8 distance) | 1.30 | |
+| GL r16, `MCPLAY_FACECULL=0` | 5.53 | terrain GPU 2.7 -> 7.2 ms |
+
+- Profile GL r8 (median per frame, us): frame 2040 = net_tick 350 + draw_cpu 1370 (world_cpu 1180 = cull 345 + submit 190 + draw loop 630) + present 270. GPU terrain 0.87 ms (sky 0.1, rest < 0.05). 643 visible, 537 drawn sections, 277k submitted tris.
+- Profile GL r16: frame 5040 = world_cpu 3900 (cull 1890 + submit 280 + draw loop 1670) + net_tick 390 + present 260. GPU terrain 2.7 ms. 3865 visible, 2184 drawn, 1.18M tris.
+- Verdict: CPU-bound on the render thread (stream_frame: cull BFS, schedule scan, per-section draw collection), identical on GL and VK (VK r8 world_cpu 1050, r16 4240). GPU is ~40-55 % of the frame. Fixed overhead ~0.8 ms even with almost nothing drawn (view 4 + LOD 8: world_cpu 520 of 1300).
+- Tried and dropped: cull micro-opts (closed-form pair bit, Ciura gap sort, memset of the window, removing the known-count pass): r16 cull 1894 -> 1939 us = no gain, reverted. Face-direction buckets confirmed (off = slower).
+- Result: the renderer alone is NOT 2x Vanilla (r8 1.2x, r16 1.1-1.2x). With LOD at equal view distance mcplay is 2.5-2.6x faster at the Vanilla r16 distance (view 8 + LOD 16: 2.26 vs 5.74-5.97 ms) and ~1.9x at the r8 distance (view 4 + LOD 8: 1.30 vs 2.44-2.51). The far terrain is then simplified LOD, and mcplay still has a simpler renderer than Vanilla (no shaders/entities/particles/weather), so this is not like-for-like.
+- Next levers (CPU): sub-profile net_tick (350 us) and the draw loop (1.2 us per drawn section), cache cull result across frames / thread the cull + draw-list build, reduce the 0.8 ms fixed per-frame overhead. GPU at r16 (2.7 ms, 1.18M tris) needs fewer triangles (LOD default for r > 8).
