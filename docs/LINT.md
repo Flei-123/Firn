@@ -34,3 +34,5 @@ A name counts as used when it appears as a word anywhere after the declaration (
 ## Proof
 
 `bash tools/lint/run.sh [--fast]`: fixtures, exit-code counter-checks, self-lint of the tool, whole-tree run (every refused file must also be rejected by the compiler), and an oracle that deletes flagged imports and turns flagged `var` into `let` in sample programs and checks they still compile.
+
+`bash tools/lint/fix.sh LINT_BINARY lib/path/file.fi...` rewrites every `var-never-mutated` finding to `let`. Per file it checks that `import <module>` still compiles before and after; if the batch fails it retries line by line and keeps only the edits that compile. Files that do not compile before the fix are skipped. Needs FIRNC when there is no compiler/target in the tree.
