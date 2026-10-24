@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import std.bytes
+import mc.mc_client
+import mc.mc_sem
+import mc.mc_play
+import mc.mc_chat_net
+
+export {
+    Health, health_new, health_free, health_set, health_set_dead, health_set_alive, health_on_game_state, health_on_packet,
+    health_respawn, health_visible, health_hearts_x2, health_message_ptr, health_message_len,
+    RESPAWN_RETRY_MS, GAME_STATE_MODE,
+}
+
+const RESPAWN_RETRY_MS: u64 = 1000
+const GAME_STATE_MODE: i32 = 3
+const MESSAGE_MAX: usize = 200
+
+struct Health {
+    hp: i32,
+    food: i32,
+    sat_x10: i32,
+    known: bool,
+    dead: bool,
+    died_ms: u64,
+    sent_ms: u64,
+    mode: i32,
+    msg: rt.Buf,
+    n_updates: u64,
+    n_deaths: u64,
+    n_respawn_sent: u64,
+    n_alive: u64,
+}
+
+fn health_new() -> Health {
+    return Health {
+        hp: 20, food: 20, sat_x10: 50, known: false, dead: false, died_ms: 0 as u64, sent_ms: 0 as u64, mode: 0 - 1,
+        msg: rt.buf_new(), n_updates: 0 as u64, n_deaths: 0 as u64, n_respawn_sent: 0 as u64, n_alive: 0 as u64,
+    }
+}
+
+fn health_free(h: *mut Health) {
+    rt.buf_free(&(*h).msg)
+}
+
+fn round_i32(v: f32) -> i32 {
+    let d: f64 = v as f64
+    if !(d < 100000.0 && d > -100000.0) { return 0 }
+    if d < 0.0 { return 0 }
+    return (d + 0.5) as i32
+}
+
+fn health_set_dead(h: *mut Health, p: u64, n: usize, now: u64) {
+    if !(*h).dead {
+        (*h).dead = true
+        (*h).died_ms = now
+        (*h).sent_ms = 0 as u64
+        (*h).n_deaths = (*h).n_deaths + 1 as u64
+    }
+    rt.buf_clear(&(*h).msg)
+    var m: usize = n
+    if m > MESSAGE_MAX { m = MESSAGE_MAX }
+    if m > 0 { rt.buf_push_bytes(&(*h).msg, p, m) }
+}
+
+fn health_set_alive(h: *mut Health) {
+    if (*h).dead {
+        (*h).dead = false
+        (*h).n_alive = (*h).n_alive + 1 as u64
+        rt.buf_clear(&(*h).msg)
+    }
+}
+
+fn health_set(h: *mut Health, health: f32, food: i32, sat: f32, now: u64) {
+    (*h).hp = round_i32(health)
+    (*h).food = food
+    (*h).sat_x10 = round_i32(sat * 10.0 as f32)
+    (*h).known = true
+    (*h).n_updates = (*h).n_updates + 1 as u64
+    if (*h).hp <= 0 {
+        health_set_dead(h, 0 as u64, 0, now)
+    } else {
+        health_set_alive(h)
+    }
+}
+
+fn health_on_game_state(h: *mut Health, reason: i32, value: f32) {
+    if reason == GAME_STATE_MODE { (*h).mode = round_i32(value) }
+}
+
+fn health_visible(h: *mut Health) -> bool {
+    if !(*h).known { return false }
+    return (*h).mode != 1 && (*h).mode != 3
+}
+
+fn health_hearts_x2(h: *mut Health) -> i32 {
+    if (*h).hp > 20 { return 20 }
+    return (*h).hp
+}
+
+fn health_message_ptr(h: *mut Health) -> u64 {
+    return rt.buf_ptr(&(*h).msg)
+}
+
+fn health_message_len(h: *mut Health) -> usize {
+    return rt.buf_len(&(*h).msg)
+}
+
+fn view_of(cl: *mut mc_client.Client, id: i32, name: str, b: *mut bytes.Bytes) -> bool {
+    var p: u64 = 0
+    var n: usize = 0
+    if !mc_chat_net.field_of(cl, id, name, &p, &n) { return false }
+    *b = bytes.Bytes { data: p, cap: n, len: n, pos: 0, bad: false }
+    return true
+}
+
+fn field_f32(cl: *mut mc_client.Client, id: i32, name: str, out: *mut f32) -> bool {
+    var v: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    if !view_of(cl, id, name, &v) || v.len != 4 { return false }
+    *out = bytes.get_f32(&v) catch (0.0 as f32)
+    return true
+}
+
+fn field_varint(cl: *mut mc_client.Client, id: i32, name: str, out: *mut i32) -> bool {
+    var v: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+    if !view_of(cl, id, name, &v) { return false }
+    *out = bytes.get_varint(&v) catch (0 - 1)
+    return true
+}
+
+fn health_on_packet(h: *mut Health, net: *mut mc_chat_net.ChatNet, cl: *mut mc_client.Client, id: i32, now: u64) -> bool {
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_UPDATE_HEALTH) {
+        var hp: f32 = 0.0 as f32
+        var sat: f32 = 0.0 as f32
+        var food: i32 = 0
+        if !field_f32(cl, id, "health", &hp) { return true }
+        if !field_varint(cl, id, "food", &food) { food = (*h).food }
+        if !field_f32(cl, id, "foodSaturation", &sat) { sat = 0.0 as f32 }
+        health_set(h, hp, food, sat, now)
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_DEATH_COMBAT_EVENT) {
+        var msg: rt.Buf = rt.buf_new()
+        mc_chat_net.component_plain(net, cl, id, "message", &msg)
+        health_set_dead(h, rt.buf_ptr(&msg), rt.buf_len(&msg), now)
+        rt.buf_free(&msg)
+        return true
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_GAME_STATE_CHANGE) {
+        var reason: bytes.Bytes = bytes.Bytes { data: 0 as u64, cap: 0, len: 0, pos: 0, bad: false }
+        var value: f32 = 0.0 as f32
+        if view_of(cl, id, "reason", &reason) && reason.len == 1 && field_f32(cl, id, "gameMode", &value) {
+            health_on_game_state(h, rt.ld8(reason.data, 0) as i32, value)
+        }
+        return false
+    }
+    if mc_client.client_is(cl, id, mc_sem.SEM_PLAY_S2C_RESPAWN) {
+        health_set_alive(h)
+        return false
+    }
+    return false
+}
+
+fn health_respawn(h: *mut Health, cl: *mut mc_client.Client, now: u64) -> bool {
+    if !(*h).dead { return false }
+    if (*h).sent_ms != 0 as u64 && now < (*h).sent_ms + RESPAWN_RETRY_MS { return false }
+    (*h).sent_ms = now
+    if now == 0 as u64 { (*h).sent_ms = 1 as u64 }
+    let ok: bool = mc_play.send_client_command(cl, mc_play.CLIENT_RESPAWN)
+    if ok { (*h).n_respawn_sent = (*h).n_respawn_sent + 1 as u64 }
+    return ok
+}
