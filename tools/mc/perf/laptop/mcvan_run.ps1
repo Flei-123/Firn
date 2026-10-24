@@ -140,7 +140,7 @@ if ($Target -eq 'vanilla') {
 } else {
   $inst = Join-Path $env:LOCALAPPDATA 'Programs\Voxel Client'
   if ($Gfx -eq 'vk') { $env:MCPLAY_GFX = 'vk'; Remove-Item Env:MCPLAY_GL -ErrorAction SilentlyContinue } else { $env:MCPLAY_GL = '1'; Remove-Item Env:MCPLAY_GFX -ErrorAction SilentlyContinue }; $env:MCPLAY_VSYNC = '0'; if ($Fps -lt 0) { Remove-Item Env:MCPLAY_FPS -ErrorAction SilentlyContinue } else { $env:MCPLAY_FPS = "$Fps" }; $env:MCPLAY_VIEW = "$Radius"
-  $env:MCPLAY_W = "$W"; $env:MCPLAY_H = "$H"; $env:MCPLAY_FRAME_STATS = '1'; $env:MCPLAY_PROGRESS = '1'
+  $env:MCPLAY_W = "$W"; $env:MCPLAY_H = "$H"; $env:MCPLAY_FRAME_STATS = '1'; $env:MCPLAY_PROFILE = '1'; $env:MCPLAY_PROFILE_FROM = [string]($Settle + 6); $env:MCPLAY_PROGRESS = '1'
   $env:MCPLAY_SOUNDS = '0'; $env:MCPLAY_AUDIO = '0'
   $env:MCPLAY_RUN_S = [string]($Settle + $Secs + 90); $qf = Join-Path $out ('quit_' + $Tag); Remove-Item $qf -ErrorAction SilentlyContinue; $env:MCPLAY_QUIT_FILE = $qf
   $proc = Start-Process -FilePath (Join-Path $inst $Exe) -ArgumentList '127.0.0.1',"$port","M$Tag" -WorkingDirectory $inst -PassThru -RedirectStandardOutput (Join-Path $out ("mcplay_{0}_{1}x{2}_r{3}_{4}.out" -f $tg, $W, $H, $Radius, $Tag)) -RedirectStandardError (Join-Path $out ("mcplay_{0}_{1}x{2}_r{3}_{4}.err" -f $tg, $W, $H, $Radius, $Tag))
