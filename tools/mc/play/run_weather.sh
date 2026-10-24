@@ -34,6 +34,7 @@ online-mode=false
 gamemode=survival
 force-gamemode=true
 level-seed=4242
+level-type=minecraft\:flat
 view-distance=$VIEW
 simulation-distance=$VIEW
 spawn-protection=0
@@ -50,7 +51,7 @@ SRV_PID=$!
 for i in $(seq 1 180); do grep -q 'Done (' "$W/server.log" 2>/dev/null && break; kill -0 "$SRV_PID" 2>/dev/null || break; sleep 1; done
 grep -q 'Done (' "$W/server.log" || { tail -10 "$W/server.log"; fail "server did not start"; }
 sleep "${RUN_INV_WARMUP:-0}" # a cold 1.21.11 / 26.1 server answers the first login late
-for gr in "doDaylightCycle false" "doMobSpawning false" "doWeatherCycle false"; do echo "gamerule $gr" >&3; done
+for gr in "doDaylightCycle false" "doMobSpawning false" "doWeatherCycle false" "naturalRegeneration false"; do echo "gamerule $gr" >&3; done
 echo "time set day" >&3
 DN=$((120 + RANDOM % 70))
 Xvfb :$DN -screen 0 1024x600x24 >"$W/xvfb.log" 2>&1 & XV_PID=$!
@@ -67,6 +68,21 @@ wait_for() { # pattern, seconds
 }
 for i in $(seq 1 90); do grep -q "WeatherA joined the game" "$W/server.log" 2>/dev/null && break; sleep 1; done
 sleep 4
+if [ "$PROTO" = 763 ]; then
+    FALL_FROM=$(wc -l < "$W/a.out")
+    echo "execute at WeatherA run tp WeatherA ~ ~12 ~" >&3
+    wait_for 'audiolog .* ev=block\.[a-z_]+\.fall ' 40 || { echo "  FAIL  no block fall sound logged after a 12 block fall"; ERR=1; }
+    sleep 3
+    echo "data get entity WeatherA Health" >&3
+    sleep 2
+    HP=$(grep -E 'WeatherA has the following entity data' "$W/server.log" | tail -1 | sed 's/.*data: //; s/f$//')
+    echo "  health after fall: $HP"
+    awk -v h="${HP:-20}" 'BEGIN{exit !(h+0 < 19)}' || { echo "  FAIL  no fall damage (the fall did not happen)"; ERR=1; }
+    NBLK=$(tail -n +"$((FALL_FROM + 1))" "$W/a.out" | grep -cE 'audiolog .* ev=block\.[a-z_]+\.fall ')
+    NENT=$(tail -n +"$((FALL_FROM + 1))" "$W/a.out" | grep -cE 'audiolog .* ev=entity\.player\.(small|big)_fall ')
+    echo "  fall sounds: block=$NBLK entity=$NENT"
+    [ "$NBLK" = 1 ] || { echo "  FAIL  expected exactly one block fall sound, got $NBLK"; ERR=1; }
+fi
 echo "weather rain 1000" >&3
 wait_for 'weather raining=true rain=1000 ' 40 || { echo "  FAIL  rain level did not reach 1000"; ERR=1; }
 wait_for 'audiolog .* ev=weather\.rain ' 40 || { echo "  FAIL  no rain sound logged"; ERR=1; }
@@ -79,22 +95,12 @@ wait_for 'audiolog .* ev=entity\.lightning_bolt\.thunder ' 20 || { echo "  FAIL 
 wait_for 'audiolog .* ev=entity\.lightning_bolt\.impact ' 20 || { echo "  FAIL  no lightning impact sound logged"; ERR=1; }
 echo "weather clear 1000" >&3
 wait_for 'weather raining=false rain=0 ' 60 || { echo "  FAIL  weather did not clear to 0"; ERR=1; }
-if [ "$PROTO" = 763 ]; then
-    FALL_FROM=$(wc -l < "$W/a.out")
-    echo "execute at WeatherA run tp WeatherA ~ ~12 ~" >&3
-    wait_for 'audiolog .* ev=entity\.player\.(small|big)_fall ' 40 || { echo "  FAIL  no fall sound logged after a 12 block fall"; ERR=1; }
-    sleep 3
-    NFALL=$(tail -n +"$((FALL_FROM + 1))" "$W/a.out" | grep -cE 'audiolog .* ev=entity\.player\.(small|big)_fall ')
-    NBLK=$(tail -n +"$((FALL_FROM + 1))" "$W/a.out" | grep -cE 'audiolog .* ev=block\.[a-z_]+\.fall ')
-    echo "  fall sounds: entity=$NFALL block=$NBLK"
-    [ "$NFALL" = 1 ] || { echo "  FAIL  expected exactly one entity fall sound, got $NFALL"; ERR=1; }
-    [ "$NBLK" -le 1 ] || { echo "  FAIL  block fall sound doubled ($NBLK)"; ERR=1; }
-fi
 wait $PP
 grep -qiE "invalid|disconnect|kicked|illegal" "$W/server.log" && grep -iE "invalid|disconnect|kicked|illegal" "$W/server.log" | head -3
 grep 'weather raining=' "$W/a.out" | sed -n '1p;$p'
+grep -E 'mcplay: audio bytes' "$W/a.out" | sed 's/.*sounds=/  audio: sounds=/'
 grep 'lightning new=' "$W/a.out" | head -2
-grep -E 'audiolog .* ev=(weather\.rain|entity\.lightning_bolt|entity\.player\.(small|big)_fall|block\.[a-z_]+\.fall) ' "$W/a.out" | cut -d' ' -f3 | sort | uniq -c
+grep -E 'audiolog .* ev=(weather\.rain|entity\.lightning_bolt|entity\.player\.(small|big)_fall|block\.[a-z_]+\.fall)' "$W/a.out" | cut -d' ' -f3 | sort | uniq -c
 echo stop >&3; sleep 1
 [ $ERR -eq 0 ] && echo "RESULT mc-play-weather: ok" || echo "RESULT mc-play-weather: FAIL"
 exit $ERR
