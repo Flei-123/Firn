@@ -62,6 +62,14 @@ if ! cmp -s "$GCTMP" lib/firnc1/gctext.fi; then
     exit 1
 fi
 rm -f "$GCTMP"
+GCNTMP=$(mktemp)
+bash tools/gen_gcnames.sh "$GCNTMP" >/dev/null
+if ! cmp -s "$GCNTMP" lib/firnc1/gcnames.fi; then
+    rm -f "$GCNTMP"
+    echo "lib/firnc1/gcnames.fi does not match lib/gc/runtime_names.txt -- run tools/gen_gcnames.sh"
+    exit 1
+fi
+rm -f "$GCNTMP"
 
 # --- stage 1 ---------------------------------------------------------------
 # Rebuild when .firnc1 is missing OR a source file is younger -- an
