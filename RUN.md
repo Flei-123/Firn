@@ -97,17 +97,17 @@ about 50 minutes, on an idle one a few minutes.
 The UI library's own acceptance run is separate and IS green -- see
 section 9: `sh tools/fui/run.sh --images` ends on `ALL CHECKS PASSED`.
 
-Machine-readable (CI, goal 9 / ACCEPTANCE item 4 A):
+Machine-readable (CI, goal 9 / ACCEPTANCE item 4 A), see docs/TESTRUNNER.md:
 
 ```sh
 cargo build --release --manifest-path tools/testrunner/Cargo.toml
-./tools/testrunner/target/release/testrunner --format=json > /tmp/firn.json
-python3 -c "import json;d=json.load(open('/tmp/firn.json'));print(d['total'],d['passed'],d['failed'],d['rate'])"
-# 337 337 0 1.0
+./tools/testrunner/target/release/testrunner --format json --out /tmp/firn.json
+./tools/testrunner/target/release/testrunner --format junit --out /tmp/firn.xml --levels opt,safe
+python3 -c "import json;d=json.load(open('/tmp/firn.json'));print(d['total'],d['passed'],d['failed'],d['skipped'])"
 ```
 
-(337 instead of 485: the runner contains neither the optimizer proof
-`test_opt.sh` nor sections 6-9 of `test.sh`.)
+The runner covers `tests/`, `tests/opt/`, `examples/` (four build levels, `#[test]` files through
+`firnc --test`) and `tests/neg/`; it does not contain the optimizer proof `test_opt.sh` or sections 6-9 of `test.sh`.
 
 ## 4. The proofs one by one -- what the jury checks
 
