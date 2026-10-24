@@ -762,6 +762,19 @@ for th in light dark; do
     [ "$(wc -c < "$W/flei-$th.png")" -gt 20000 ] || { echo "  flei $th shot too small"; exit 1; }
 done
 echo "  flei 1100x700 shot, light + dark   OK"
+"$W/fuiapp_flei" --theme dark --size 360x800 --shot "$W/flei-phone.png"
+"$W/fuiapp_flei" --theme dark --size 360x800 --scroll 300 --shot "$W/flei-phone-scroll.png"
+[ "$(wc -c < "$W/flei-phone.png")" -gt 15000 ] || { echo "  flei phone shot too small"; exit 1; }
+[ "$(cmp -s "$W/flei-phone.png" "$W/flei-dark.png" && echo 0 || echo $?)" = 1 ] || { echo "  flei phone shot equals desktop shot"; exit 1; }
+[ "$(cmp -s "$W/flei-phone.png" "$W/flei-phone-scroll.png" && echo 0 || echo $?)" = 1 ] || { echo "  flei phone scroll does not move"; exit 1; }
+"$W/fuiapp_flei" --theme dark --size 360x800 --tab 1 --shot "$W/flei-phone-mods.png"
+"$W/fuiapp_flei" --theme dark --size 360x800 --tab 3 --shot "$W/flei-phone-friends.png"
+"$W/fuiapp_flei" --theme dark --tab 1 --shot "$W/flei-mods.png"
+[ "$(cmp -s "$W/flei-phone.png" "$W/flei-phone-mods.png" && echo 0 || echo $?)" = 1 ] || { echo "  flei phone Mods tab equals Home"; exit 1; }
+[ "$(cmp -s "$W/flei-phone-mods.png" "$W/flei-phone-friends.png" && echo 0 || echo $?)" = 1 ] || { echo "  flei phone Friends tab equals Mods"; exit 1; }
+[ "$(cmp -s "$W/flei-dark.png" "$W/flei-mods.png" && echo 0 || echo $?)" = 1 ] || { echo "  flei desktop Mods page equals Home"; exit 1; }
+echo "  flei tabs switch the page (phone tab strip + desktop nav)   OK"
+echo "  flei phone layout (360x800 tab strip, one column, scroll)   OK"
 "$FIRNC" --opt-level=dev -o "$W/fuiapp_form" examples/fui_apps/form/main.fi
 for th in light dark; do
     "$W/fuiapp_form" --theme $th --shot "$W/form-$th.png"
@@ -770,6 +783,12 @@ done
 "$W/fuiapp_form" --theme dark --invalid --shot "$W/form-err.png"
 [ "$(wc -c < "$W/form-err.png")" -gt 15000 ] || { echo "  form error shot too small"; exit 1; }
 echo "  form wizard 1100x700 shot, light + dark + errors   OK"
+"$W/fuiapp_form" --theme dark --size 360x800 --shot "$W/form-phone.png"
+"$W/fuiapp_form" --theme dark --size 360x800 --fill --step 4 --shot "$W/form-phone-sum.png"
+[ "$(wc -c < "$W/form-phone.png")" -gt 8000 ] || { echo "  form phone shot too small"; exit 1; }
+[ "$(cmp -s "$W/form-phone.png" "$W/form-dark.png" && echo 0 || echo $?)" = 1 ] || { echo "  form phone shot equals desktop shot"; exit 1; }
+[ "$(wc -c < "$W/form-phone-sum.png")" -gt 15000 ] || { echo "  form phone summary shot too small"; exit 1; }
+echo "  form phone layout (360x800 full-width card, one field per row, stacked summary)   OK"
 build kitform
 "$W/kitform"
 "$FIRNC" --opt-level=dev -o "$W/fuiapp_notes" examples/fui_apps/notes/main.fi
@@ -777,6 +796,16 @@ for th in light dark; do
     "$W/fuiapp_notes" --theme $th --shot "$W/notes-$th.png"
     [ "$(wc -c < "$W/notes-$th.png")" -gt 15000 ] || { echo "  notes $th shot too small"; exit 1; }
 done
+"$W/fuiapp_notes" --theme dark --size 360x800 --shot "$W/notes-phone.png"
+"$W/fuiapp_notes" --theme dark --size 360x800 --open --shot "$W/notes-phone-open.png"
+"$W/fuiapp_notes" --theme dark --size 360x800 --preview --shot "$W/notes-phone-preview.png"
+for k in phone phone-open phone-preview; do
+    [ "$(wc -c < "$W/notes-$k.png")" -gt 10000 ] || { echo "  notes $k shot too small"; exit 1; }
+done
+[ "$(cmp -s "$W/notes-phone.png" "$W/notes-phone-open.png" && echo 0 || echo $?)" = 1 ] || { echo "  notes phone list equals phone editor"; exit 1; }
+[ "$(cmp -s "$W/notes-phone-open.png" "$W/notes-phone-preview.png" && echo 0 || echo $?)" = 1 ] || { echo "  notes phone editor equals phone preview"; exit 1; }
+[ "$(cmp -s "$W/notes-phone.png" "$W/notes-dark.png" && echo 0 || echo $?)" = 1 ] || { echo "  notes phone shot equals desktop shot"; exit 1; }
+echo "  notes phone layout (360x800 list / editor / preview)  OK"
 echo "  notes 1100x700 shot, light + dark   OK"
 build mdedit
 "$W/mdedit"
@@ -787,6 +816,10 @@ for th in light dark; do
 done
 "$W/fuiapp_settings" --theme dark --open --shot "$W/settings-open.png"
 [ "$(wc -c < "$W/settings-open.png")" -gt 15000 ] || { echo "  settings open-list shot too small"; exit 1; }
+"$W/fuiapp_settings" --theme dark --size 360x800 --shot "$W/settings-phone.png"
+[ "$(wc -c < "$W/settings-phone.png")" -gt 15000 ] || { echo "  settings phone shot too small"; exit 1; }
+[ "$(cmp -s "$W/settings-phone.png" "$W/settings-dark.png" && echo 0 || echo $?)" = 1 ] || { echo "  settings phone shot equals desktop shot"; exit 1; }
+echo "  settings phone layout (360x800 tabs)  OK"
 echo "  settings 1100x700 shot, light + dark + open list   OK"
 build kitset
 "$W/kitset"
@@ -800,6 +833,18 @@ for th in light dark; do
     "$W/fuiapp_chat" --theme $th --shot "$W/chat-$th.png"
     [ "$(wc -c < "$W/chat-$th.png")" -gt 20000 ] || { echo "  chat $th shot too small"; exit 1; }
 done
+"$W/fuiapp_chat" --theme dark --size 360x800 --shot "$W/chat-phone.png"
+"$W/fuiapp_chat" --theme dark --size 360x800 --open --shot "$W/chat-phone-open.png"
+for k in phone phone-open; do
+    [ "$(wc -c < "$W/chat-$k.png")" -gt 15000 ] || { echo "  chat $k shot too small"; exit 1; }
+done
+[ "$(cmp -s "$W/chat-phone.png" "$W/chat-phone-open.png" && echo 0 || echo $?)" = 1 ] || { echo "  chat phone list equals phone chat"; exit 1; }
+[ "$(cmp -s "$W/chat-phone.png" "$W/chat-dark.png" && echo 0 || echo $?)" = 1 ] || { echo "  chat phone shot equals desktop shot"; exit 1; }
+"$W/fuiapp_chat" --theme dark --size 360x400 --shot "$W/chat-short.png"
+"$W/fuiapp_chat" --theme dark --size 360x400 --scroll 120 --shot "$W/chat-short-scroll.png"
+[ "$(cmp -s "$W/chat-short.png" "$W/chat-short-scroll.png" && echo 0 || echo $?)" = 1 ] || { echo "  chat phone contact list does not scroll"; exit 1; }
+echo "  chat phone contact list scroll (360x400)  OK"
+echo "  chat phone layout (360x800 contacts / conversation)  OK"
 echo "  chat messenger 1100x700 shot, light + dark   OK"
 build kitchat
 "$W/kitchat"
@@ -813,8 +858,33 @@ for th in light dark; do
     [ "$(wc -c < "$W/dash-$th.png")" -gt 20000 ] || { echo "  dash $th shot too small"; exit 1; }
 done
 echo "  dash 1100x700 shot, light + dark   OK"
+"$W/fuiapp_dash" --theme dark --size 360x800 --shot "$W/dash-phone.png"
+"$W/fuiapp_dash" --theme dark --size 360x800 --scroll 400 --shot "$W/dash-phone-scroll.png"
+[ "$(wc -c < "$W/dash-phone.png")" -gt 15000 ] || { echo "  dash phone shot too small"; exit 1; }
+[ "$(cmp -s "$W/dash-phone.png" "$W/dash-dark.png" && echo 0 || echo $?)" = 1 ] || { echo "  dash phone shot equals desktop shot"; exit 1; }
+[ "$(cmp -s "$W/dash-phone.png" "$W/dash-phone-scroll.png" && echo 0 || echo $?)" = 1 ] || { echo "  dash phone scroll does not move"; exit 1; }
+echo "  dash phone layout (360x800 two-column KPIs, stacked cards, scroll)   OK"
+"$FIRNC" --opt-level=dev -o "$W/fuiapp_files" examples/fui_apps/files/main.fi
+for th in light dark; do
+    "$W/fuiapp_files" --theme $th --shot "$W/files-$th.png"
+    [ "$(wc -c < "$W/files-$th.png")" -gt 20000 ] || { echo "  files $th shot too small"; exit 1; }
+done
+"$W/fuiapp_files" --theme dark --size 360x800 --shot "$W/files-phone.png"
+[ "$(wc -c < "$W/files-phone.png")" -gt 20000 ] || { echo "  files phone shot too small"; exit 1; }
+[ "$(cmp -s "$W/files-phone.png" "$W/files-dark.png" && echo 0 || echo $?)" = 1 ] || { echo "  files phone shot equals desktop shot"; exit 1; }
+"$W/fuiapp_files" --theme dark --size 360x800 --drawer --shot "$W/files-phone-drawer.png"
+[ "$(wc -c < "$W/files-phone-drawer.png")" -gt 8000 ] || { echo "  files phone drawer shot too small"; exit 1; }
+[ "$(cmp -s "$W/files-phone.png" "$W/files-phone-drawer.png" && echo 0 || echo $?)" = 1 ] || { echo "  files phone drawer equals the file list"; exit 1; }
+echo "  files phone folder drawer (360x800 tree full width)   OK"
+echo "  files 1100x700 shot, light + dark, phone layout (360x800 side column hidden, two columns)   OK"
 build kitdash
 "$W/kitdash"
+build screenpan
+"$W/screenpan"
+build appresize
+"$W/appresize"
+build mdscroll
+"$W/mdscroll"
 echo "== 18p5c. THE APP SCREENS AS WEBASSEMBLY (tools/wasm/screenapps.sh): Inter + assets, pixel-equal to the native shot =="
 if command -v chromium >/dev/null 2>&1; then
     FIRNC="$FIRNC" bash tools/wasm/screenapps.sh flei settings notes chat dash form || exit 1

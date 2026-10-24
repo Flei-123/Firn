@@ -65,9 +65,20 @@ fn prologue(lines: &[&str]) -> Option<(usize, usize, usize)> {
     }
 }
 
+fn own_label(lines: &[&str]) -> Option<String> {
+    lines
+        .iter()
+        .map(|l| l.trim())
+        .find(|t| t.ends_with(':') && !t.contains(' ') && !t.starts_with(".L"))
+        .map(|t| t.trim_end_matches(':').to_string())
+}
+
 fn rewrite_function(lines: &[&str]) -> Option<Vec<String>> {
     let (first, second, pushes) = prologue(lines)?;
+    let own = own_label(lines);
+    let no_pad_ok = std::env::var_os("FIRN_NO_SELFPAD").is_none();
     let mut has_call = false;
+    let mut foreign_call = false;
     let mut pop_rbp: Vec<usize> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if i == first || i == second || !is_real(line) {
@@ -83,12 +94,16 @@ fn rewrite_function(lines: &[&str]) -> Option<Vec<String>> {
         }
         if is_call(t) {
             has_call = true;
+            let self_call = no_pad_ok && own.as_deref().map(|o| t.strip_prefix("call ").map(|c| c.split(" #").next().unwrap_or(c).trim()) == Some(o)).unwrap_or(false);
+            if !self_call {
+                foreign_call = true;
+            }
         }
     }
     if pop_rbp.is_empty() {
         return None;
     }
-    let pad = has_call && pushes % 2 == 0;
+    let pad = has_call && foreign_call && pushes % 2 == 0;
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     for (i, line) in lines.iter().enumerate() {
         if i == first {
