@@ -67,11 +67,14 @@ echo "weather rain 1000" >&3
 wait_for 'weather raining=true rain=1000 ' 40 || { echo "  FAIL  rain level did not reach 1000"; ERR=1; }
 echo "weather thunder 1000" >&3
 wait_for 'weather raining=true rain=1000 thunder=1000 ' 40 || { echo "  FAIL  thunder level did not reach 1000"; ERR=1; }
+echo "execute at WeatherA run summon lightning_bolt ~4 ~ ~" >&3
+wait_for 'lightning new=' 30 || { echo "  FAIL  lightning bolt entity not seen"; ERR=1; }
 echo "weather clear 1000" >&3
 wait_for 'weather raining=false rain=0 ' 60 || { echo "  FAIL  weather did not clear to 0"; ERR=1; }
 wait $PP
 grep -qiE "invalid|disconnect|kicked|illegal" "$W/server.log" && grep -iE "invalid|disconnect|kicked|illegal" "$W/server.log" | head -3
 grep 'weather raining=' "$W/a.out" | sed -n '1p;$p'
+grep 'lightning new=' "$W/a.out" | head -2
 echo stop >&3; sleep 1
 [ $ERR -eq 0 ] && echo "RESULT mc-play-weather: ok" || echo "RESULT mc-play-weather: FAIL"
 exit $ERR
