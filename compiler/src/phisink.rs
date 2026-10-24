@@ -36,7 +36,7 @@ const RMW: [&str; 24] = [
     "imul", "bswap", "cmove", "cmovne", "cmovl", "cmovg", "cmovb", "cmova",
 ];
 
-pub(crate) fn reg_of(tok: &str) -> Option<(usize, usize)> {
+fn reg_of(tok: &str) -> Option<(usize, usize)> {
     for (i, row) in NAMES.iter().enumerate() {
         for (w, n) in row.iter().enumerate() {
             if *n == tok {
@@ -53,7 +53,7 @@ pub(crate) fn reg_of(tok: &str) -> Option<(usize, usize)> {
     }
 }
 
-pub(crate) fn regs_in(s: &str) -> u16 {
+fn regs_in(s: &str) -> u16 {
     let mut mask = 0u16;
     for tok in s.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
         if let Some((i, _)) = reg_of(tok) {
