@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/firnc1/cacheprune.fi -- size cap of the compile cache: oldest entries go first.
+
+import rt
+import vec
+import cachefs
+
+export { prune }
+
+const STALE_TMP_NS: u64 = 3600000000000
+
+fn is_temp(name: u64) -> bool {
+    var tag: [u8; 5] = ".tmp-"
+    var i: usize = 0
+    while i < 5 {
+        if rt.ld8(name, i) != tag[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn join_path(out: *mut rt.Buf, dir: u64, dir_n: usize, name: u64) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, dir, dir_n)
+    rt.buf_push(out, 47 as u8)
+    rt.buf_push_bytes(out, name, rt.c_length(name) + 1)
+}
+
+fn prune(dir: u64, dir_n: usize, cap: u64) {
+    var names: rt.Buf = rt.buf_new()
+    var offs: Vec[u32] = vec_new[u32]()
+    var sizes: Vec[u64] = vec_new[u64]()
+    var times: Vec[u64] = vec_new[u64]()
+    var path: rt.Buf = rt.buf_new()
+    var info: cachefs.FileInfo = cachefs.fs_info_new()
+    var total: u64 = 0
+    let now: u64 = cachefs.fs_now_ns()
+    if cachefs.fs_list(dir, &names, &offs) {
+        var i: usize = 0
+        var count: usize = vec_len[u32](&offs)
+        while i < count {
+            let name: u64 = rt.buf_ptr(&names) + vec_at[u32](&offs, i) as u64
+            join_path(&path, dir, dir_n, name)
+            var keep: bool = cachefs.fs_stat(rt.buf_ptr(&path), &info) && info.regular
+            if keep && is_temp(name) {
+                if now > info.mtime_ns && now - info.mtime_ns > STALE_TMP_NS {
+                    cachefs.fs_unlink(rt.buf_ptr(&path))
+                }
+                keep = false
+            }
+            if keep {
+                total = total + info.size
+                vec_push[u64](&sizes, info.size)
+                vec_push[u64](&times, info.mtime_ns)
+            } else {
+                vec_push[u64](&sizes, 0)
+                vec_push[u64](&times, 0)
+                vec_set[u32](&offs, i, 4294967295)
+            }
+            i = i + 1
+        }
+        let goal: u64 = cap / 10 * 8
+        var over: bool = total > cap
+        while over && total > goal {
+            var best: usize = count
+            var j: usize = 0
+            while j < count {
+                if vec_at[u32](&offs, j) != 4294967295 {
+                    if best == count || vec_at[u64](&times, j) < vec_at[u64](&times, best) {
+                        best = j
+                    }
+                }
+                j = j + 1
+            }
+            if best == count {
+                break
+            }
+            join_path(&path, dir, dir_n, rt.buf_ptr(&names) + vec_at[u32](&offs, best) as u64)
+            if cachefs.fs_unlink(rt.buf_ptr(&path)) {
+                total = total - vec_at[u64](&sizes, best)
+            }
+            vec_set[u32](&offs, best, 4294967295)
+        }
+    }
+    rt.buf_free(&names)
+    vec_free[u32](&offs)
+    vec_free[u64](&sizes)
+    vec_free[u64](&times)
+    rt.buf_free(&path)
+}

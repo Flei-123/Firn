@@ -1,4 +1,4 @@
-# Compile cache (firnc0)
+# Compile cache (firnc0 and firnc1)
 
 `firnc` stores the generated assembler text of a successful build and, after the assembler ran, the assembled object. It reuses them when nothing that could change the output has changed. On an object hit the front end, the optimizer, the code generator and the assembler are skipped; only the linker runs (kernel objects and `-c` builds: nothing runs at all). If the object is missing the assembler text is used and the object is stored afterwards.
 
@@ -32,4 +32,6 @@ File `objects/<key>.<id>.o` next to the text entry `<key>.fc`; `<id>` = SHA-256 
 
 ## Proof
 
-`bash tools/cache/run.sh`: hit and miss, byte-identity against `--no-cache` (executables, x86-64 and aarch64 assembler, kernel objects), import change, flag change, environment switch, damaged entry, size cap, eight parallel builds, unwritable cache directory, assembled object (kernel, aarch64, static, `--asm-intern`, other assembler version, damaged object, parallel builds, cap 0). firnc1 has no cache; it accepts `--no-cache` and ignores it (kmain.fi: cold 13.8 s, text hit 4.2 s, object hit 0.6 s on a busy host).
+`bash tools/cache/run.sh`: hit and miss, byte-identity against `--no-cache` (executables, x86-64 and aarch64 assembler, kernel objects), import change, flag change, environment switch, damaged entry, size cap, eight parallel builds, unwritable cache directory, assembled object (kernel, aarch64, static, `--asm-intern`, other assembler version, damaged object, parallel builds, cap 0). firnc1 has its own cache (`lib/firnc1/cache.fi`, `cachekey.fi`, `cachefs.fi`, `cacheprune.fi`, proof `bash tools/cache/run_c1.sh`, 44 checks). Same switches, same key recipe, same file format and directory; the compiler binary is part of the key, so firnc0 and firnc1 never share entries. Differences: `<output>.s` is always written (also on a hit, firnc1 leaves it next to the output); the object identity is the SHA-256 of `/usr/bin/as` (plus `/usr/bin/ld` for split builds) and `--64`; the entry also records the split count, and a split build without a stored object is a miss; `--timings` and `--env-log` switch the cache off; the entry checksum is the same 64-bit sum as firnc0 (wrapping multiply).
+
+(firnc0 on kmain.fi: cold 13.8 s, text hit 4.2 s, object hit 0.6 s on a busy host).

@@ -1,0 +1,517 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/firnc1/cache.fi -- the compile cache of firnc1 (twin of compiler/src/buildcache.rs, docs/CACHE.md).
+
+import rt
+import vec
+import sha256
+import cachefs
+import cachekey
+import cacheprune
+
+export {
+    Cache, cache_new, cache_free, cache_active, cache_log, cache_set_key,
+    cache_lookup, cache_kernel, cache_split, cache_text, cache_text_ptr, cache_text_len,
+    cache_store,
+    cache_object_load, cache_object_store, cache_object_ptr, cache_object_len,
+}
+
+const DEFAULT_MAX_MB: u64 = 512
+const HEAD_BYTES: usize = 4096
+
+struct Cache {
+    active: bool,
+    log: bool,
+    dir: rt.Buf,
+    key: rt.Buf,
+    tool: rt.Buf,
+    max_bytes: u64,
+    kernel: bool,
+    split: u32,
+    text_off: usize,
+    text_len: usize,
+    text_sum: u64,
+    obj_off: usize,
+    obj_len: usize,
+}
+
+fn cache_new(start: u64, disabled: bool) -> Cache {
+    var c: Cache = Cache {
+        active: false, log: false, dir: rt.buf_new(), key: rt.buf_new(), tool: rt.buf_new(),
+        max_bytes: 0, kernel: false, split: 0, text_off: 0, text_len: 0, text_sum: 0,
+        obj_off: 0, obj_len: 0,
+    }
+    var n_log: [u8; 15] = "FIRN_CACHE_LOG\0"
+    var n_off: [u8; 14] = "FIRN_NO_CACHE\0"
+    var n_dir: [u8; 15] = "FIRN_CACHE_DIR\0"
+    var n_max: [u8; 18] = "FIRN_CACHE_MAX_MB\0"
+    var n_home: [u8; 5] = "HOME\0"
+    c.log = rt.env_value(start, (&n_log[0]) as u64, 14) != 0
+    var off: bool = disabled
+    let ov: u64 = rt.env_value(start, (&n_off[0]) as u64, 13)
+    if ov != 0 && rt.ld8(ov, 0) != 0 as u8 && !(rt.ld8(ov, 0) == 48 as u8 && rt.ld8(ov, 1) == 0 as u8) {
+        off = true
+    }
+    let dv: u64 = rt.env_value(start, (&n_dir[0]) as u64, 14)
+    if dv != 0 && rt.ld8(dv, 0) != 0 as u8 {
+        rt.buf_push_bytes(&c.dir, dv, rt.c_length(dv))
+    } else {
+        let hv: u64 = rt.env_value(start, (&n_home[0]) as u64, 4)
+        if hv != 0 && rt.ld8(hv, 0) != 0 as u8 {
+            var tail: [u8; 12] = "/.cache/firn"
+            rt.buf_push_bytes(&c.dir, hv, rt.c_length(hv))
+            rt.buf_push_bytes(&c.dir, (&tail[0]) as u64, 12)
+        } else {
+            off = true
+        }
+    }
+    var mb: u64 = DEFAULT_MAX_MB
+    let mv: u64 = rt.env_value(start, (&n_max[0]) as u64, 17)
+    if mv != 0 {
+        var parsed: u64 = 0
+        var digits: usize = 0
+        var i: usize = 0
+        while rt.ld8(mv, i) == 32 as u8 {
+            i = i + 1
+        }
+        while rt.ld8(mv, i) >= 48 as u8 && rt.ld8(mv, i) <= 57 as u8 && digits < 9 {
+            parsed = parsed * 10 + (rt.ld8(mv, i) as u64 - 48)
+            digits = digits + 1
+            i = i + 1
+        }
+        var j: usize = i
+        while rt.ld8(mv, j) == 32 as u8 {
+            j = j + 1
+        }
+        if digits > 0 && rt.ld8(mv, j) == 0 as u8 {
+            mb = parsed
+        }
+    }
+    c.max_bytes = mb * 1048576
+    c.active = !off
+    return c
+}
+
+fn cache_free(c: *mut Cache) {
+    rt.buf_free(&(*c).dir)
+    rt.buf_free(&(*c).key)
+    rt.buf_free(&(*c).tool)
+}
+
+fn cache_active(c: *mut Cache) -> bool {
+    return (*c).active
+}
+
+fn cache_log(c: *mut Cache, event: u64, n: usize) {
+    if !(*c).log {
+        return
+    }
+    var line: rt.Buf = rt.buf_new()
+    var pre: [u8; 7] = "cache: "
+    rt.buf_push_bytes(&line, (&pre[0]) as u64, 7)
+    rt.buf_push_bytes(&line, event, n)
+    rt.buf_push(&line, 10 as u8)
+    rt.write_everything(2, rt.buf_ptr(&line), rt.buf_len(&line))
+    rt.buf_free(&line)
+}
+
+fn cache_set_key(c: *mut Cache, key: *mut rt.Buf) {
+    rt.buf_clear(&(*c).key)
+    rt.buf_push_bytes(&(*c).key, rt.buf_ptr(key), rt.buf_len(key))
+}
+
+fn objects_dir(c: *mut Cache, out: *mut rt.Buf) {
+    var sub: [u8; 8] = "/objects"
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, rt.buf_ptr(&(*c).dir), rt.buf_len(&(*c).dir))
+    rt.buf_push_bytes(out, (&sub[0]) as u64, 8)
+}
+
+fn entry_path(c: *mut Cache, out: *mut rt.Buf, suffix: u64, suffix_n: usize, id: *mut rt.Buf, with_id: bool) {
+    objects_dir(c, out)
+    rt.buf_push(out, 47 as u8)
+    rt.buf_push_bytes(out, rt.buf_ptr(&(*c).key), rt.buf_len(&(*c).key))
+    if with_id {
+        rt.buf_push(out, 46 as u8)
+        rt.buf_push_bytes(out, rt.buf_ptr(id), rt.buf_len(id))
+    }
+    rt.buf_push_bytes(out, suffix, suffix_n)
+    rt.buf_push(out, 0 as u8)
+}
+
+fn text_path(c: *mut Cache, out: *mut rt.Buf) {
+    var ext: [u8; 3] = ".fc"
+    entry_path(c, out, (&ext[0]) as u64, 3, &(*c).key, false)
+}
+
+fn object_path(c: *mut Cache, out: *mut rt.Buf, id: *mut rt.Buf) {
+    var ext: [u8; 2] = ".o"
+    entry_path(c, out, (&ext[0]) as u64, 2, id, true)
+}
+
+fn fast_sum(p: u64, n: usize) -> u64 {
+    var h: u64 = (0x9E3779B97F4A7C15 as u64) ^ (n as u64)
+    var mul: u64 = 0x517CC1B727220A95 as u64
+    var i: usize = 0
+    while i < n / 8 {
+        h = (((h << 5) | (h >> 59)) ^ rt.ld64(p, i)) *% mul
+        i = i + 1
+    }
+    var b: usize = n / 8 * 8
+    while b < n {
+        h = (((h << 5) | (h >> 59)) ^ (rt.ld8(p, b) as u64)) *% mul
+        b = b + 1
+    }
+    return h ^ (h >> 32)
+}
+
+fn push_line(b: *mut rt.Buf, key: u64, key_n: usize, value: u64) {
+    rt.buf_push_bytes(b, key, key_n)
+    rt.buf_push_dec_u64(b, value)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn push_sum(b: *mut rt.Buf, value: u64) {
+    var k: [u8; 4] = "sum="
+    rt.buf_push_bytes(b, (&k[0]) as u64, 4)
+    rt.buf_push_hex_u64(b, value, 16)
+    rt.buf_push(b, 10 as u8)
+}
+
+fn encode_text_head(b: *mut rt.Buf, kernel: bool, split: u32, p: u64, n: usize) {
+    var magic: [u8; 11] = "FIRNCACHE1\n"
+    var k_kernel: [u8; 7] = "kernel="
+    var k_statics: [u8; 8] = "statics="
+    var k_split: [u8; 6] = "split="
+    var k_len: [u8; 4] = "len="
+    var sep: [u8; 4] = "---\n"
+    var kv: u64 = 0
+    if kernel {
+        kv = 1
+    }
+    rt.buf_push_bytes(b, (&magic[0]) as u64, 11)
+    push_line(b, (&k_kernel[0]) as u64, 7, kv)
+    push_line(b, (&k_statics[0]) as u64, 8, 0)
+    push_line(b, (&k_split[0]) as u64, 6, split as u64)
+    push_line(b, (&k_len[0]) as u64, 4, n as u64)
+    push_sum(b, fast_sum(p, n))
+    rt.buf_push_bytes(b, (&sep[0]) as u64, 4)
+}
+
+fn parse_decimal(p: u64, n: usize, out: *mut u64) -> bool {
+    if n == 0 || n > 18 {
+        return false
+    }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < n {
+        let d: u8 = rt.ld8(p, i)
+        if d < 48 as u8 || d > 57 as u8 {
+            return false
+        }
+        v = v * 10 + (d as u64 - 48)
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+fn parse_hex(p: u64, n: usize, out: *mut u64) -> bool {
+    if n != 16 {
+        return false
+    }
+    var v: u64 = 0
+    var i: usize = 0
+    while i < n {
+        let d: u8 = rt.ld8(p, i)
+        var x: u64 = 0
+        if d >= 48 as u8 && d <= 57 as u8 {
+            x = d as u64 - 48
+        } else if d >= 97 as u8 && d <= 102 as u8 {
+            x = d as u64 - 87
+        } else {
+            return false
+        }
+        v = (v << 4) | x
+        i = i + 1
+    }
+    *out = v
+    return true
+}
+
+fn line_end(p: u64, from: usize, n: usize) -> usize {
+    var i: usize = from
+    while i < n && rt.ld8(p, i) != 10 as u8 {
+        i = i + 1
+    }
+    return i
+}
+
+fn has_prefix(p: u64, at: usize, n: usize, lit: u64, lit_n: usize) -> bool {
+    if at + lit_n > n {
+        return false
+    }
+    var i: usize = 0
+    while i < lit_n {
+        if rt.ld8(p, at + i) != rt.ld8(lit, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn parse_text_head(c: *mut Cache, p: u64, n: usize) -> bool {
+    var magic: [u8; 10] = "FIRNCACHE1"
+    var k_kernel: [u8; 7] = "kernel="
+    var k_statics: [u8; 8] = "statics="
+    var k_split: [u8; 6] = "split="
+    var k_len: [u8; 4] = "len="
+    var k_sum: [u8; 4] = "sum="
+    var sep: [u8; 3] = "---"
+    var at: usize = line_end(p, 0, n)
+    if at != 10 || !has_prefix(p, 0, n, (&magic[0]) as u64, 10) {
+        return false
+    }
+    at = at + 1
+    var seen: u32 = 0
+    var done: bool = false
+    var v: u64 = 0
+    while !done {
+        let e: usize = line_end(p, at, n)
+        if e >= n {
+            return false
+        }
+        if e == at + 3 && has_prefix(p, at, n, (&sep[0]) as u64, 3) {
+            at = e + 1
+            done = true
+        } else if has_prefix(p, at, n, (&k_kernel[0]) as u64, 7) {
+            if !parse_decimal(p + (at + 7) as u64, e - at - 7, &v) {
+                return false
+            }
+            (*c).kernel = v == 1
+            seen = seen | 1
+            at = e + 1
+        } else if has_prefix(p, at, n, (&k_statics[0]) as u64, 8) {
+            if !parse_decimal(p + (at + 8) as u64, e - at - 8, &v) || v != 0 {
+                return false
+            }
+            at = e + 1
+        } else if has_prefix(p, at, n, (&k_split[0]) as u64, 6) {
+            if !parse_decimal(p + (at + 6) as u64, e - at - 6, &v) {
+                return false
+            }
+            (*c).split = v as u32
+            seen = seen | 2
+            at = e + 1
+        } else if has_prefix(p, at, n, (&k_len[0]) as u64, 4) {
+            if !parse_decimal(p + (at + 4) as u64, e - at - 4, &v) {
+                return false
+            }
+            (*c).text_len = v as usize
+            seen = seen | 4
+            at = e + 1
+        } else if has_prefix(p, at, n, (&k_sum[0]) as u64, 4) {
+            if !parse_hex(p + (at + 4) as u64, e - at - 4, &v) {
+                return false
+            }
+            (*c).text_sum = v
+            seen = seen | 8
+            at = e + 1
+        } else {
+            return false
+        }
+    }
+    (*c).text_off = at
+    return seen == 15
+}
+
+fn cache_lookup(c: *mut Cache) -> bool {
+    var path: rt.Buf = rt.buf_new()
+    var head: rt.Buf = rt.buf_new()
+    text_path(c, &path)
+    let total: i64 = cachefs.fs_read_prefix(rt.buf_ptr(&path), &head, HEAD_BYTES)
+    var ok: bool = total >= 0 && parse_text_head(c, rt.buf_ptr(&head), rt.buf_len(&head))
+    if ok {
+        ok = (*c).text_off + (*c).text_len == total as usize
+    }
+    if ok {
+        cachefs.fs_touch(rt.buf_ptr(&path))
+    }
+    rt.buf_free(&path)
+    rt.buf_free(&head)
+    return ok
+}
+
+fn cache_kernel(c: *mut Cache) -> bool {
+    return (*c).kernel
+}
+
+fn cache_split(c: *mut Cache) -> u32 {
+    return (*c).split
+}
+
+fn cache_text(c: *mut Cache, out: *mut rt.Buf) -> bool {
+    var path: rt.Buf = rt.buf_new()
+    text_path(c, &path)
+    rt.buf_clear(out)
+    var ok: bool = rt.read_file(rt.buf_ptr(&path), out)
+    rt.buf_free(&path)
+    if !ok || rt.buf_len(out) != (*c).text_off + (*c).text_len {
+        return false
+    }
+    return fast_sum(rt.buf_ptr(out) + (*c).text_off as u64, (*c).text_len) == (*c).text_sum
+}
+
+fn cache_text_ptr(c: *mut Cache, buf: *mut rt.Buf) -> u64 {
+    return rt.buf_ptr(buf) + (*c).text_off as u64
+}
+
+fn cache_text_len(c: *mut Cache) -> usize {
+    return (*c).text_len
+}
+
+fn write_entry(c: *mut Cache, path: *mut rt.Buf, data: *mut rt.Buf) -> bool {
+    var objects: rt.Buf = rt.buf_new()
+    objects_dir(c, &objects)
+    var ok: bool = cachefs.fs_mkdir_all(rt.buf_ptr(&objects), rt.buf_len(&objects))
+    if ok {
+        ok = cachefs.fs_write_atomic(rt.buf_ptr(&objects), rt.buf_len(&objects),
+            rt.buf_ptr(path), rt.buf_ptr(data), rt.buf_len(data), cachefs.fs_now_ns())
+    }
+    if ok {
+        cacheprune.prune(rt.buf_ptr(&objects), rt.buf_len(&objects), (*c).max_bytes)
+    }
+    rt.buf_free(&objects)
+    return ok
+}
+
+fn cache_store(c: *mut Cache, kernel: bool, split: u32, p: u64, n: usize) -> bool {
+    var data: rt.Buf = rt.buf_new()
+    var path: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&data, n + 256)
+    encode_text_head(&data, kernel, split, p, n)
+    rt.buf_push_bytes(&data, p, n)
+    text_path(c, &path)
+    let ok: bool = write_entry(c, &path, &data)
+    rt.buf_free(&data)
+    rt.buf_free(&path)
+    return ok
+}
+
+fn tool_id(c: *mut Cache, with_linker: bool) -> bool {
+    var as_path: [u8; 12] = "/usr/bin/as\0"
+    var ld_path: [u8; 12] = "/usr/bin/ld\0"
+    var t_as: [u8; 9] = "assembler"
+    var t_ld: [u8; 6] = "linker"
+    var t_flags: [u8; 5] = "flags"
+    var flags: [u8; 4] = "--64"
+    var bin: rt.Buf = rt.buf_new()
+    var h: sha256.Hash = sha256.hash_new()
+    var ok: bool = rt.read_file((&as_path[0]) as u64, &bin)
+    if ok {
+        cachekey.key_field(&h, (&t_as[0]) as u64, 9, rt.buf_ptr(&bin), rt.buf_len(&bin))
+        cachekey.key_field(&h, (&t_flags[0]) as u64, 5, (&flags[0]) as u64, 4)
+        if with_linker {
+            rt.buf_clear(&bin)
+            ok = rt.read_file((&ld_path[0]) as u64, &bin)
+            cachekey.key_field(&h, (&t_ld[0]) as u64, 6, rt.buf_ptr(&bin), rt.buf_len(&bin))
+        }
+    }
+    rt.buf_clear(&(*c).tool)
+    if ok {
+        var full: rt.Buf = rt.buf_new()
+        sha256.hash_hex(&h, &full)
+        rt.buf_push_bytes(&(*c).tool, rt.buf_ptr(&full), 16)
+        rt.buf_free(&full)
+    }
+    sha256.hash_free(&h)
+    rt.buf_free(&bin)
+    return ok
+}
+
+fn cache_object_load(c: *mut Cache, with_linker: bool, out: *mut rt.Buf) -> bool {
+    if !tool_id(c, with_linker) {
+        return false
+    }
+    var path: rt.Buf = rt.buf_new()
+    object_path(c, &path, &(*c).tool)
+    rt.buf_clear(out)
+    var ok: bool = rt.read_file(rt.buf_ptr(&path), out)
+    if ok {
+        ok = parse_object(c, rt.buf_ptr(out), rt.buf_len(out))
+    }
+    if ok {
+        cachefs.fs_touch(rt.buf_ptr(&path))
+    }
+    rt.buf_free(&path)
+    return ok
+}
+
+fn parse_object(c: *mut Cache, p: u64, n: usize) -> bool {
+    var magic: [u8; 11] = "FIRNOBJECT1"
+    var k_len: [u8; 4] = "len="
+    var k_sum: [u8; 4] = "sum="
+    var sep: [u8; 3] = "---"
+    var len: u64 = 0
+    var sum: u64 = 0
+    var at: usize = line_end(p, 0, n)
+    if at != 11 || !has_prefix(p, 0, n, (&magic[0]) as u64, 11) {
+        return false
+    }
+    var e: usize = line_end(p, at + 1, n)
+    if !has_prefix(p, at + 1, n, (&k_len[0]) as u64, 4)
+    || !parse_decimal(p + (at + 5) as u64, e - at - 5, &len) {
+        return false
+    }
+    at = e
+    e = line_end(p, at + 1, n)
+    if !has_prefix(p, at + 1, n, (&k_sum[0]) as u64, 4)
+    || !parse_hex(p + (at + 5) as u64, e - at - 5, &sum) {
+        return false
+    }
+    at = e
+    e = line_end(p, at + 1, n)
+    if e != at + 4 || !has_prefix(p, at + 1, n, (&sep[0]) as u64, 3) || e >= n {
+        return false
+    }
+    (*c).obj_off = e + 1
+    (*c).obj_len = len as usize
+    if (*c).obj_off + (*c).obj_len != n {
+        return false
+    }
+    return fast_sum(p + (*c).obj_off as u64, (*c).obj_len) == sum
+}
+
+fn cache_object_ptr(c: *mut Cache, buf: *mut rt.Buf) -> u64 {
+    return rt.buf_ptr(buf) + (*c).obj_off as u64
+}
+
+fn cache_object_len(c: *mut Cache) -> usize {
+    return (*c).obj_len
+}
+
+fn cache_object_store(c: *mut Cache, with_linker: bool, p: u64, n: usize) -> bool {
+    var entry: rt.Buf = rt.buf_new()
+    text_path(c, &entry)
+    let present: bool = cachefs.fs_is_file(rt.buf_ptr(&entry))
+    rt.buf_free(&entry)
+    if !present || !tool_id(c, with_linker) {
+        return false
+    }
+    var magic: [u8; 12] = "FIRNOBJECT1\n"
+    var k_len: [u8; 4] = "len="
+    var sep: [u8; 4] = "---\n"
+    var data: rt.Buf = rt.buf_new()
+    var path: rt.Buf = rt.buf_new()
+    rt.buf_reserve(&data, n + 128)
+    rt.buf_push_bytes(&data, (&magic[0]) as u64, 12)
+    push_line(&data, (&k_len[0]) as u64, 4, n as u64)
+    push_sum(&data, fast_sum(p, n))
+    rt.buf_push_bytes(&data, (&sep[0]) as u64, 4)
+    rt.buf_push_bytes(&data, p, n)
+    object_path(c, &path, &(*c).tool)
+    let ok: bool = write_entry(c, &path, &data)
+    rt.buf_free(&data)
+    rt.buf_free(&path)
+    return ok
+}

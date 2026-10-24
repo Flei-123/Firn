@@ -1324,6 +1324,14 @@ if [ "$COVRC" -eq 0 ]; then
 else
     bad "tools/coverage/run.sh failed (see .test-work/coverage.log)"
     grep FAIL "$WORK/coverage.log" | head -10 | sed 's/^/   /' || true
+echo "== 53d. the compile cache of firnc1: hit, miss, byte-identical to uncached, damaged entries, concurrent (tools/cache/run_c1.sh, r989) =="
+bash tools/cache/run_c1.sh > "$WORK/cache_c1_proof.log" 2>&1 && CC1RC=0 || CC1RC=$?
+if [ "$CC1RC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/cache_c1_proof.log" | sed 's/^/   /' || true
+else
+    bad "tools/cache/run_c1.sh failed (see .test-work/cache_c1_proof.log)"
+    grep FAIL "$WORK/cache_c1_proof.log" | head -10 | sed 's/^/   /' || true
 fi
 
 # ROUND K3. Sections 53 and 54 belong to the rounds running in parallel;
