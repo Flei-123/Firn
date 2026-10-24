@@ -217,6 +217,9 @@
 #  53c. THE COMPILE CACHE (tools/cache/run.sh, roadmap r59, docs/CACHE.md): hit and
 #      miss on import and flag changes, byte-identical to --no-cache, eight
 #      parallel builds, damaged entries, size cap, assembled object cache.
+#  53d. CODE COVERAGE (tools/coverage/run.sh, roadmap r982, docs/COVERAGE.md): lines and
+#      functions of a run via callgrind and the line table -- exact uncovered lines
+#      and hit counts, merge, build levels, #[test] programs, counter-checks.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -1311,6 +1314,16 @@ if [ "$CCRC" -eq 0 ]; then
 else
     bad "tools/cache/run.sh failed (see .test-work/cache_proof.log)"
     grep FAIL "$WORK/cache_proof.log" | head -10 | sed 's/^/   /' || true
+fi
+
+echo "== 53d. code coverage: lines and functions via callgrind and the line table (tools/coverage/run.sh, r982) =="
+bash tools/coverage/run.sh > "$WORK/coverage.log" 2>&1 && COVRC=0 || COVRC=$?
+if [ "$COVRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/coverage.log" | sed 's/^/   /' || true
+else
+    bad "tools/coverage/run.sh failed (see .test-work/coverage.log)"
+    grep FAIL "$WORK/coverage.log" | head -10 | sed 's/^/   /' || true
 fi
 
 # ROUND K3. Sections 53 and 54 belong to the rounds running in parallel;
