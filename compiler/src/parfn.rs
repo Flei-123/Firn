@@ -45,6 +45,7 @@ struct Ctx {
     rodata: std::sync::Arc<HashMap<String, u64>>,
     len_getters: HashMap<String, i128>,
     touched: HashSet<String>,
+    gtaken: Option<crate::gtaken::Taken>,
 }
 
 impl Ctx {
@@ -54,6 +55,7 @@ impl Ctx {
             rodata: crate::statics::rodata_sizes(),
             len_getters: crate::rangecheck::len_getters_get(),
             touched: crate::ivsr::touched_get(),
+            gtaken: crate::gtaken::get(),
         }
     }
 
@@ -62,6 +64,7 @@ impl Ctx {
         crate::statics::rodata_sizes_install(self.rodata.clone());
         crate::rangecheck::len_getters_set(self.len_getters.clone());
         crate::ivsr::touched_set(self.touched.clone());
+        crate::gtaken::set(self.gtaken.clone());
     }
 }
 

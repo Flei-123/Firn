@@ -1,0 +1,273 @@
+// SPDX-License-Identifier: MPL-2.0
+import std.rt
+import android.ndk
+import android.inputmethod
+
+export {
+    inject_poll, inject_log_text, inject_note,
+}
+
+#[no_gc]
+#[link_name(__system_property_get)]
+extern fn system_property_get(name: u64, value: u64) -> i32;
+
+const PROP: str = "debug.firn.ime\0"
+const TAG: str = "firn\0"
+const S_COMP: str = "comp"
+const S_COMMIT: str = "commit"
+const S_FINISH: str = "finish"
+const S_DELSUR: str = "delsur"
+const S_DELCP: str = "delcp"
+const S_KEY: str = "key"
+const S_ENTER: str = "enter"
+const S_LOG_INJECT: str = "imeinject seq="
+const S_LOG_OK: str = " ok="
+const S_LOG_TEXT: str = "imetext="
+const S_LOG_NOTE: str = "imenote="
+const LINE_CAP: usize = 256
+const SHOWN_CAP: usize = 96
+
+static mut G_SEQ: i64 = 0 - 1
+static mut G_SHOWN: [u8; 96] = [0 as u8; 96]
+static mut G_SHOWN_N: usize = 0 - 1
+
+fn byte_at(base: u64, i: usize) -> u8 {
+    return *((base + i as u64) as *mut u8)
+}
+
+fn skip_spaces(base: u64, n: usize, pos: *mut usize) {
+    while *pos < n && byte_at(base, *pos) == 32 as u8 {
+        *pos = *pos + 1
+    }
+}
+
+fn word_end(base: u64, n: usize, from: usize) -> usize {
+    var e: usize = from
+    while e < n && byte_at(base, e) != 32 as u8 {
+        e = e + 1
+    }
+    return e
+}
+
+fn parse_dec(base: u64, a: usize, b: usize) -> i64 {
+    var v: i64 = 0
+    var neg: bool = false
+    var i: usize = a
+    if i < b && byte_at(base, i) == 45 as u8 {
+        neg = true
+        i = i + 1
+    }
+    while i < b {
+        let c: u8 = byte_at(base, i)
+        if c >= 48 as u8 && c <= 57 as u8 {
+            v = v * 10 + (c - 48 as u8) as i64
+        }
+        i = i + 1
+    }
+    if neg {
+        return 0 - v
+    }
+    return v
+}
+
+fn parse_hex(base: u64, a: usize, b: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = a
+    while i < b {
+        let c: u8 = byte_at(base, i)
+        var d: u32 = 0
+        if c >= 48 as u8 && c <= 57 as u8 {
+            d = (c - 48 as u8) as u32
+        } else if c >= 97 as u8 && c <= 102 as u8 {
+            d = (c - 87 as u8) as u32
+        }
+        v = v * 16 + d
+        i = i + 1
+    }
+    return v
+}
+
+fn word_is(base: u64, a: usize, b: usize, lit: str) -> bool {
+    return b - a == lit.n && rt.mem_eq(base + a as u64, lit.p as u64, lit.n)
+}
+
+fn put_unit(buf: u64, k: usize, v: u32) {
+    *((buf + k as u64 * 2) as *mut u16) = v as u16
+}
+
+fn put_code_point(buf: u64, k: usize, cp: u32) -> usize {
+    if cp >= 65536 as u32 {
+        let c: u32 = cp - 65536 as u32
+        put_unit(buf, k, 55296 as u32 + (c >> 10))
+        put_unit(buf, k + 1, 56320 as u32 + (c & 1023 as u32))
+        return k + 2
+    }
+    put_unit(buf, k, cp)
+    return k + 1
+}
+
+fn put_text(buf: u64, k: usize, s: str) -> usize {
+    rt.mem_copy(buf + k as u64, s.p as u64, s.n)
+    return k + s.n
+}
+
+fn put_dec(buf: u64, k: usize, v: i64) -> usize {
+    var digits: [u8; 24] = [0 as u8; 24]
+    var n: usize = 0
+    var x: i64 = v
+    if x < 0 {
+        x = 0 - x
+    }
+    if x == 0 {
+        digits[0] = 48 as u8
+        n = 1
+    }
+    while x > 0 {
+        digits[n] = (48 + x % 10) as u8
+        x = x / 10
+        n = n + 1
+    }
+    var out: usize = k
+    if v < 0 {
+        *((buf + out as u64) as *mut u8) = 45 as u8
+        out = out + 1
+    }
+    while n > 0 {
+        n = n - 1
+        *((buf + out as u64) as *mut u8) = digits[n]
+        out = out + 1
+    }
+    return out
+}
+
+fn put_hex_byte(buf: u64, k: usize, v: u8) -> usize {
+    let hi: u8 = v >> 4
+    let lo: u8 = v & 15 as u8
+    var h: u8 = 48 as u8 + hi
+    if hi > 9 as u8 {
+        h = 87 as u8 + hi
+    }
+    var l: u8 = 48 as u8 + lo
+    if lo > 9 as u8 {
+        l = 87 as u8 + lo
+    }
+    *((buf + k as u64) as *mut u8) = h
+    *((buf + k as u64 + 1) as *mut u8) = l
+    return k + 2
+}
+
+fn emit(buf: u64, k: usize) {
+    *((buf + k as u64) as *mut u8) = 0 as u8
+    ndk.log_write(ndk.LOG_INFO, TAG.p as u64, buf)
+}
+
+fn collect_units(base: u64, n: usize, from: usize, units: u64) -> usize {
+    var pos: usize = from
+    var k: usize = 0
+    skip_spaces(base, n, &pos)
+    while pos < n && k < 120 {
+        let e: usize = word_end(base, n, pos)
+        k = put_code_point(units, k, parse_hex(base, pos, e))
+        pos = e
+        skip_spaces(base, n, &pos)
+    }
+    return k
+}
+
+fn run_command(base: u64, n: usize, a: usize, b: usize, args: usize) -> bool {
+    var units: [u8; 256] = [0 as u8; 256]
+    let ub: u64 = (&units[0]) as u64
+    if word_is(base, a, b, S_COMP) {
+        return inputmethod.ime_inject(inputmethod.OP_SETCOMP, 1, 0, ub, collect_units(base, n, args, ub))
+    }
+    if word_is(base, a, b, S_COMMIT) {
+        return inputmethod.ime_inject(inputmethod.OP_COMMIT, 1, 0, ub, collect_units(base, n, args, ub))
+    }
+    if word_is(base, a, b, S_FINISH) {
+        return inputmethod.ime_inject(inputmethod.OP_FINISH, 0, 0, ub, 0)
+    }
+    if word_is(base, a, b, S_ENTER) {
+        return inputmethod.ime_inject(inputmethod.OP_ACTION, 0, 0, ub, 0)
+    }
+    var pos: usize = args
+    skip_spaces(base, n, &pos)
+    let e1: usize = word_end(base, n, pos)
+    let first: i64 = parse_dec(base, pos, e1)
+    pos = e1
+    skip_spaces(base, n, &pos)
+    let e2: usize = word_end(base, n, pos)
+    let second: i64 = parse_dec(base, pos, e2)
+    if word_is(base, a, b, S_KEY) {
+        return inputmethod.ime_inject(inputmethod.OP_KEY, first, 0, ub, 0)
+    }
+    if word_is(base, a, b, S_DELSUR) {
+        return inputmethod.ime_inject(inputmethod.OP_DELSUR, first, second, ub, 0)
+    }
+    if word_is(base, a, b, S_DELCP) {
+        return inputmethod.ime_inject(inputmethod.OP_DELCP, first, second, ub, 0)
+    }
+    return false
+}
+
+fn inject_poll() -> bool {
+    var val: [u8; 96] = [0 as u8; 96]
+    let got: i32 = system_property_get(PROP.p as u64, (&val[0]) as u64)
+    if got <= 0 {
+        return false
+    }
+    let base: u64 = (&val[0]) as u64
+    let n: usize = got as usize
+    var pos: usize = 0
+    skip_spaces(base, n, &pos)
+    let se: usize = word_end(base, n, pos)
+    let seq: i64 = parse_dec(base, pos, se)
+    if seq == G_SEQ {
+        return false
+    }
+    G_SEQ = seq
+    pos = se
+    skip_spaces(base, n, &pos)
+    let ce: usize = word_end(base, n, pos)
+    let ok: bool = run_command(base, n, pos, ce, ce)
+    var line: [u8; 256] = [0 as u8; 256]
+    let lb: u64 = (&line[0]) as u64
+    var k: usize = put_text(lb, 0, S_LOG_INJECT)
+    k = put_dec(lb, k, seq)
+    k = put_text(lb, k, S_LOG_OK)
+    if ok {
+        k = put_dec(lb, k, 1)
+    } else {
+        k = put_dec(lb, k, 0)
+    }
+    emit(lb, k)
+    return true
+}
+
+fn inject_log_text(p: u64, n: usize) {
+    var m: usize = n
+    if m > SHOWN_CAP {
+        m = SHOWN_CAP
+    }
+    if m == G_SHOWN_N && rt.mem_eq((&G_SHOWN[0]) as u64, p, m) {
+        return
+    }
+    G_SHOWN_N = m
+    rt.mem_copy((&G_SHOWN[0]) as u64, p, m)
+    var line: [u8; 256] = [0 as u8; 256]
+    let lb: u64 = (&line[0]) as u64
+    var k: usize = put_text(lb, 0, S_LOG_TEXT)
+    var i: usize = 0
+    while i < m {
+        k = put_hex_byte(lb, k, byte_at(p, i))
+        i = i + 1
+    }
+    emit(lb, k)
+}
+
+fn inject_note(note: str) {
+    var line: [u8; 256] = [0 as u8; 256]
+    let lb: u64 = (&line[0]) as u64
+    var k: usize = put_text(lb, 0, S_LOG_NOTE)
+    k = put_text(lb, k, note)
+    emit(lb, k)
+}
