@@ -332,6 +332,12 @@ focus; nothing is built before.
   each edit to `inputmethod.ime_inject` (`lib/android/imeinject.fi`), the same `serve_op` the keyboard's calls end in; the field text is
   logged as hex octets (`imetext=`). Checked: commit, u-umlaut/a-umlaut/sharp s composing (cumulative, replaced word), underline pixels
   vs. finished text, emoji as a surrogate pair, `deleteSurroundingText` / `...InCodePoints` over the pair, Backspace key, Enter.
+* **Text area composition (r972).** `textarea.ta_draw` underlines the composing word per line; `ime_inject_check.sh` section 5b injects a
+  multi-line commit, composition, replacement and deletion into the text area of `imetest_app.fi` (the pump logs the focused field).
+* **Finger scrolling (r71).** `lay.scroll_v` and the new `lay.scroll_h(a, height_pt)` register `touchscroll.pan_handler`: the finger drags the
+  area 1:1, past an end the rubber band (`viewport_drag`, overscroll on) stretches and springs back, a flick runs out. A text area drags
+  1:1 (no fling, no band yet). `tools/android/swipe_check.sh` runs `swipe_app.fi` and `adb shell input swipe` on both areas and the text
+  area (offsets logged as `swipe v= h= t= ov= oh=`). Programs without `mobile.sync` must call `lay.scroll_sync` every frame.
 * **Not done:** a real phone (the emulator's AOSP keyboard is what was run),
   more than one line of text, the full-screen extract UI (the flags ask the
   keyboard not to use it).
