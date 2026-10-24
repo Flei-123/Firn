@@ -1338,6 +1338,7 @@ fn inline_module_track_x(
     // of embeddings (measured on `bin/firnc1.fi` with the bound lifted: the
     // restart made it run for minutes).
     let mut start = 0usize;
+    let mut budgeted = 0usize;
     'outer: loop {
         for ci in start..m.funcs.len() {
             if let Some((bi, ii, gi)) =
@@ -1348,11 +1349,15 @@ fn inline_module_track_x(
                         m.funcs[ci].name, m.funcs[gi].name,
                         m.funcs[gi].inst_count(), m.funcs[gi].blocks.len());
                 }
+                let requested = m.funcs[gi].inline_hint == Some(true);
                 inline_one(m, ci, bi, ii, gi);
                 changed.push(ci);
                 n += 1;
-                if n - trivial_done - size_done >= max_inlines() {
-                    break 'outer;
+                if !requested {
+                    budgeted += 1;
+                    if budgeted >= max_inlines() {
+                        break 'outer;
+                    }
                 }
                 start = ci;
                 continue 'outer;
@@ -1679,6 +1684,24 @@ mod tests {
         let n = inline_module(&mut m);
         assert_eq!(n, 2500);
         assert_eq!(calls_to(&m, "user", "leaf"), 0);
+    }
+
+    #[test]
+    fn requested_sites_do_not_count_against_the_module_budget() {
+        let build = |hint: Option<bool>| {
+            let mut m = Module::new();
+            let mut g = chain_fn("leaf", 12);
+            g.inline_hint = hint;
+            m.funcs.push(g);
+            let names: Vec<&str> = std::iter::repeat("leaf").take(2500).collect();
+            m.funcs.push(caller_of("user", &names));
+            m
+        };
+        let mut marked = build(Some(true));
+        assert_eq!(inline_module_requested_only(&mut marked), 2500);
+        assert_eq!(calls_to(&marked, "user", "leaf"), 0);
+        let mut plain = build(None);
+        assert_eq!(inline_module_requested_only(&mut plain), 0);
     }
 
     #[test]
