@@ -4645,7 +4645,7 @@ fn emit_variant(f: &Func) -> Result<String, String> {
     tmp.flush_cold();
     // ROUND TK2: the value slots are 8..=value_slots*8 (compact_frame)
     let text = expand_save_markers(&tmp.out, a);
-    Ok(crate::phisink::strip_marks(&crate::fpomit::run(&crate::retsink::run(&crate::phisink::run(&crate::zextflow::run(&drop_redundant_zext(&descriptor_peephole(&text, a.value_slots))))))))
+    Ok(crate::phisink::strip_marks(&crate::edgesink::run(&crate::fpomit::run(&crate::retsink::run(&crate::phisink::run(&crate::zextflow::run(&drop_redundant_zext(&descriptor_peephole(&text, a.value_slots)))))))))
 }
 
 // ------------------------------------------------- Register descriptor ---

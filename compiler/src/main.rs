@@ -75,6 +75,7 @@ mod memset;
 mod divnonneg;
 mod retsink;
 mod fpomit;
+mod edgesink;
 mod zextflow;
 mod phisink;
 mod divrem;
