@@ -983,7 +983,8 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             // checks".
             let r = remove_redundant_checks(f)
                 + remove_provable_index_checks(f)
-                + crate::rangecheck::remove_provable_arith_checks(f);
+                + crate::rangecheck::remove_provable_arith_checks(f)
+                + crate::divnonneg::run(f);
             st.removed_checks += r;
             clk.add2("bce", t, r > 0);
             fx.note(6, r > 0);
