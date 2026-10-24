@@ -23,6 +23,13 @@ fix_file() {
         echo "skip (does not compile before fix): $f"
         return 1
     fi
+    if [ "$RULE" = unused-import ] && [ "$CTX_MODE" != bare ]; then
+        while read -r l; do
+            sed -n "${l}p" "$f" | grep -Eq '^import std\.(rt|str)\s*$' || echo "$l"
+        done < "$T/lines.txt" > "$T/lines2.txt"
+        mv "$T/lines2.txt" "$T/lines.txt"
+        [ -s "$T/lines.txt" ] || return 1
+    fi
     cp "$f" "$T/orig.fi"
     python3 "$EDIT" "$RULE" "$f" $(cat "$T/lines.txt") > /dev/null
     if ! cmp -s "$f" "$T/orig.fi" && ctx_compiles "$f"; then
