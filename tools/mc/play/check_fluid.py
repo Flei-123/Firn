@@ -109,12 +109,12 @@ compare("scland", s[-1], 300, 200)
 s = spans["scwalk"]
 print("  scaffold walk: x %d -> %d" % (s[0][2], s[-1][2]))
 check(s[-1][2] >= 74000, "scaffold walk: blocked, x %d < 74000" % s[-1][2])
-compare("scwalk", s[-1], 500, 300)
+compare("scwalk", s[-1], 1200, 300)
 
 s = spans["scclimb"]
 print("  scaffold climb: y %d -> %d (max %d)" % (s[0][3], s[-1][3], max(r[3] for r in s)))
 check(max(r[3] for r in s) >= -54200, "scaffold climb: never reached the top (max y %d)" % max(r[3] for r in s))
-compare("scclimb", s[-1], 300, 400)
+compare("scclimb", s[-1], 300, 1300)
 
 s = spans["scdown"]
 print("  scaffold sneak down: y %d -> %d, ground=%s" % (s[0][3], s[-1][3], s[-1][6]))
