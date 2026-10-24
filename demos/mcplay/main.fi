@@ -93,6 +93,7 @@ import mc.mc_chat_ui
 import mc.mc_chat_net
 import mc.mc_health
 import mc.mc_health_ui
+import mc.mc_combat
 import mc.mc_wlight
 import mc.mc_packs
 import mc.mc_packsnd
@@ -459,6 +460,12 @@ struct Ctx {
     chat: mc_chat.Chat,
     chat_net: mc_chat_net.ChatNet,
     health: mc_health.Health,
+    combat: mc_combat.Combat,
+    tgt: mc_combat.Target,
+    tgt_hit: bool, // an attackable entity is under the crosshair and nearer than the block pick
+    combat_log: bool,
+    cbt_phase: i32, // MCPLAY_COMBAT_TEST script (attack / interact / use item on the entity under the crosshair)
+    cbt_t: u64,
     chat_test_done: bool,
     cont_ui: bool, // the inventory panel was opened by a container window (chest ...): closes with it
     ui_regrab: bool, // the mouse was captured when the panel opened: capture it again on close
@@ -1073,6 +1080,7 @@ fn test_flags() -> i32 {
     if env_flag("MCPLAY_TABLE_TEST2", false) { f = f | 32 }
     if env_flag("MCPLAY_SNEAK_TEST", false) { f = f | 64 }
     if env_flag("MCPLAY_HASH_TEST", false) { f = f | 128 }
+    if env_flag("MCPLAY_COMBAT_TEST", false) { f = f | 256 }
     TEST_FLAGS = f
     return f
 }
@@ -1086,6 +1094,7 @@ fn run_tests(c: *mut Ctx, tf: i32) {
     if (tf & 32) != 0 { table_test2(c) }
     if (tf & 64) != 0 { sneak_test(c) }
     if (tf & 128) != 0 { hash_test(c) }
+    if (tf & 256) != 0 { combat_test(c) }
 }
 
 fn handle_hotbar(c: *mut Ctx) {
@@ -2003,6 +2012,76 @@ fn chest_test(c: *mut Ctx) {
     (*c).ct3_t = now
 }
 
+fn pick_entity(c: *mut Ctx) {
+    (*c).tgt_hit = false
+    if !(*c).have_pos { return }
+    var block_dist: f64 = 0.0 - 1.0
+    if (*c).hit { block_dist = (*c).pk.dist }
+    let cam: *mut mc_camera.Camera = &(*c).cam
+    (*c).tgt_hit = mc_combat.combat_pick(&(*c).ents, &(*c).reg, (*c).fx.own, (*cam).x, (*cam).y, (*cam).z, (*cam).fx, (*cam).fy, (*cam).fz,
+        mc_combat.combat_reach((*c).creative), block_dist, &(*c).tgt)
+}
+
+fn attack_target(c: *mut Ctx) {
+    (*c).seq = (*c).seq + 1
+    let ok: bool = mc_combat.combat_attack(&(*c).combat, &(*c).cl, (*c).tgt.id, (*c).pl.sneaking, (*c).seq, now_ms())
+    if (*c).combat_log { say(f"mcplay: combat attack target={(*c).tgt.id} dist_mm={((*c).tgt.dist * 1000.0) as i64} sent={ok} n={(*c).combat.n_attacks}\n") }
+}
+
+fn interact_target(c: *mut Ctx) {
+    (*c).seq = (*c).seq + 1
+    let ok: bool = mc_combat.combat_interact(&(*c).combat, &(*c).cl, &(*c).tgt, (*c).pl.sneaking, (*c).seq)
+    if (*c).combat_log { say(f"mcplay: combat interact target={(*c).tgt.id} sent={ok} n={(*c).combat.n_interacts}\n") }
+}
+
+fn use_held_item(c: *mut Ctx) {
+    (*c).seq = (*c).seq + 1
+    let ok: bool = mc_combat.combat_use_item(&(*c).combat, &(*c).cl, (*c).seq, (*c).pl.yaw, (*c).pl.pitch)
+    if (*c).combat_log { say(f"mcplay: combat use sent={ok} n={(*c).combat.n_uses}\n") }
+}
+
+fn release_held_item(c: *mut Ctx) {
+    let was: bool = (*c).combat.using_item
+    let ok: bool = mc_combat.combat_release_use(&(*c).combat, &(*c).cl)
+    if (*c).combat_log && was { say(f"mcplay: combat release sent={ok} n={(*c).combat.n_releases}\n") }
+}
+
+// MCPLAY_COMBAT_TEST=1 (survival, a cow with NoAI in front of the player, `give <name> snowball 5`): attack twice, interact, use the snowball, release
+fn combat_test(c: *mut Ctx) {
+    let now: u64 = now_ms()
+    let ph: i32 = (*c).cbt_phase
+    if ph == 0 && !(*c).tgt_hit {
+        var yaw: f64 = 0.0
+        var pitch: f64 = 0.0
+        if mc_combat.aim_nearest(&(*c).ents, &(*c).reg, (*c).fx.own, (*c).cam.x, (*c).cam.y, (*c).cam.z, 6.0, &yaw, &pitch) {
+            (*c).pl.yaw = yaw
+            (*c).pl.pitch = pitch
+        }
+    }
+    if ph >= 6 || !(*c).tgt_hit { return }
+    if ph == 0 {
+        (*c).cbt_phase = 1
+        (*c).cbt_t = now
+        return
+    }
+    if now - (*c).cbt_t < 900 as u64 { return }
+    if ph == 1 || ph == 2 {
+        attack_target(c)
+    } else if ph == 3 {
+        interact_target(c)
+    } else if ph == 4 {
+        let want: str = "snowball"
+        let sn: i32 = mc_registry.reg_item_by_name(&(*c).reg, want.p as u64, want.n)
+        if sn < 0 || mc_inv.inv_held_item(&(*c).inv, (*c).pl.slot) != sn { return }
+        use_held_item(c)
+    } else if ph == 5 {
+        release_held_item(c)
+        say(f"mcplay: combat_test done attacks={(*c).combat.n_attacks} interacts={(*c).combat.n_interacts} uses={(*c).combat.n_uses} releases={(*c).combat.n_releases}\n")
+    }
+    (*c).cbt_phase = ph + 1
+    (*c).cbt_t = now
+}
+
 fn handle_mouse(c: *mut Ctx) {
     if (*c).chat.open || (*c).health.dead { return }
     if (*c).show_inv && (*c).have_pos {
@@ -2019,7 +2098,9 @@ fn handle_mouse(c: *mut Ctx) {
     if !(*c).have_pos { return }
     if (*c).show_inv { return }
     let cl: *mut mc_client.Client = &(*c).cl
-    if lp && (*c).hit {
+    if raw.mouse_released(&(*c).rw, raw.MB_RIGHT) { release_held_item(c) }
+    if lp && (*c).tgt_hit { attack_target(c) }
+    if lp && !(*c).tgt_hit && (*c).hit {
         let face: i32 = mc_play.face_of((*c).pk.nx, (*c).pk.ny, (*c).pk.nz)
         (*c).seq = (*c).seq + 1
         mc_play.send_swing(cl, (*c).seq)
@@ -2055,7 +2136,9 @@ fn handle_mouse(c: *mut Ctx) {
             (*c).digging = false
         }
     }
-    if rp && (*c).hit {
+    if rp && (*c).tgt_hit { interact_target(c) }
+    if rp && !(*c).tgt_hit && !(*c).hit { use_held_item(c) }
+    if rp && !(*c).tgt_hit && (*c).hit {
         let face3: i32 = mc_play.face_of((*c).pk.nx, (*c).pk.ny, (*c).pk.nz)
         (*c).seq = (*c).seq + 1
         mc_play.send_place(cl, (*c).pk.x, (*c).pk.y, (*c).pk.z, face3, (*c).seq)
@@ -2070,6 +2153,8 @@ fn handle_mouse(c: *mut Ctx) {
         if (*c).place_id > 0 {
             mark_air(c, (*c).pk.x + (*c).pk.nx, (*c).pk.y + (*c).pk.ny, (*c).pk.z + (*c).pk.nz, (*c).place_id)
         }
+        let held: i32 = mc_inv.inv_held_item(&(*c).inv, (*c).pl.slot)
+        if held >= 0 && !mc_combat.held_is_block(&(*c).reg, held) { use_held_item(c) }
     }
 }
 
@@ -2936,7 +3021,7 @@ fn main(start: u64) -> i32 {
         pend_place: false, pend_x: 0, pend_y: 0, pend_z: 0, pend_t: 0, n_snd: 0, n_snd_pkt: 0,
         probe: env_flag("MCPLAY_AUDIO_PROBE", false), probe_i: 0, probe_next: 0 as u64, amb: mc_audio.mca_ambient_new(4242 as i64), amb_x: (env_int("MCPLAY_AMBIENT_X", 1) as f64), amb_dark: env_flag("MCPLAY_AMBIENT_DARK", false), n_amb: 0 as u64,
         n_chunks: 0, n_unload: 0, n_bchange: 0, n_mchange: 0, n_dig: 0, n_place: 0, n_ticks: 0, n_frames: 0, n_kick: 0, fps: 0,
-        chat: mc_chat.chat_new(), chat_net: mc_chat_net.chat_net_new(), health: mc_health.health_new(), chat_test_done: false, inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), rcp: mc_craft_sel.recipes_for_protocol(proto), ct4_phase: 0, ct4_t: 0 as u64, ct4_src: 0 - 1, ct4_n0: 0 as u32, show_inv: false, cont_ui: false, ui_regrab: false, give_done: false, dig_total: 0,
+        chat: mc_chat.chat_new(), chat_net: mc_chat_net.chat_net_new(), health: mc_health.health_new(), combat: mc_combat.combat_new(), tgt: mc_combat.Target { id: 0 - 1, dist: 0.0, hx: 0.0, hy: 0.0, hz: 0.0 }, tgt_hit: false, combat_log: env_flag("MCPLAY_COMBAT_LOG", false), cbt_phase: 0, cbt_t: 0 as u64, chat_test_done: false, inv: mc_inv.inv_new(), dg: mc_dig_sel.dig_for_protocol(proto), rcp: mc_craft_sel.recipes_for_protocol(proto), ct4_phase: 0, ct4_t: 0 as u64, ct4_src: 0 - 1, ct4_n0: 0 as u32, show_inv: false, cont_ui: false, ui_regrab: false, give_done: false, dig_total: 0,
         fx: mc_effect.fx_new(), fx_ticks: 0 - 1, fx_plain: 0 - 1, click_phase: 0, click_t: 0 as u64, click_src: 0 - 1, ct2_phase: 0, ct2_t: 0 as u64, ct2_a: 0 - 1, ct2_b: 0 - 1, ct2_d: 0 - 1, ct3_phase: 0, ct3_t: 0 as u64, ct3_tries: 0, tt_phase: 0, tt_t: 0 as u64, tt_tries: 0, tt_n0: 0 as u32, st_phase: 0, st_t: 0 as u64, st_seen: 0, st_x: 0, st_y: 0, st_z: 0, sneak_sent: false, loaded_sent: false, n_sneak: 0 as u32, ht_phase: 0, ht_t: 0 as u64, ht_a: 0 - 1, ht_b: 0 - 1, ht_n0: 0 as u32, ht_d: [0; 4], last_click_slot: 0 - 1, last_click_t: 0 as u64,
     }
     if !c.g.ok {
@@ -3171,6 +3256,7 @@ fn main(start: u64) -> i32 {
                 c.hit = mc_input.input_pick_camera(&c.world, c.dim.min_y, &c.itb, &c.cam, mc_input.player_reach(&c.pl), &c.pk)
             }
         }
+        pick_entity(&c)
         pl = mc_prof.prof_lap(mc_prof.PH_PICK, pl)
         handle_mouse(&c)
         audio_frame(&c)
