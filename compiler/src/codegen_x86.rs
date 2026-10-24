@@ -1486,6 +1486,7 @@ fn emit_inst(
             match op {
                 UnOp::Neg => e.line(&format!("neg {}", reg("rax", bits))),
                 UnOp::Sqrt | UnOp::Bits => unreachable!(),
+                UnOp::Bswap => e.line("bswap eax"),
                 UnOp::Not => {
                     if ty == FTy::Bool {
                         e.line("xor eax, 1");

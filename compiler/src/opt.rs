@@ -219,6 +219,12 @@ pub const PASSES: &[PassInfo] = &[
         what: "GAPS: (e&f)^(~e&g) becomes g^(e&(f^g)), (a&b)^(a&c)^(b&c) becomes (a&(b^c))^(b&c) (x86-64 only, once, after rotate)",
     },
     PassInfo {
+        name: "bswapload",
+        scope: Scope::Func,
+        debug_preserving: false,
+        what: "GAPS: four adjacent byte loads or-ed together become one 32-bit load (+ bswap when big-endian) (x86-64 only, once, after bitsel)",
+    },
+    PassInfo {
         name: "licm",
         scope: Scope::Func,
         debug_preserving: true,
@@ -744,6 +750,22 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         }
         clk.add2("bitsel", t, n > 0);
     }
+    if cfg.runs("bswapload") && crate::target::active() == crate::target::Target::X86_64 {
+        let t = std::time::Instant::now();
+        let mut n = 0usize;
+        for f in m.funcs.iter_mut() {
+            if f.constant_time || !f.secret.is_empty() {
+                continue;
+            }
+            let k = crate::bswapload::run(f);
+            if k > 0 {
+                remove_dead_insts(f, &mut st);
+                phi_check(f, "bswapload");
+            }
+            n += k;
+        }
+        clk.add2("bswapload", t, n > 0);
+    }
     // r806: the very last step, once per function. Earlier it would hide the checks from `bce`
     // and the range analysis, and from the inliner's size heuristic.
     if cfg.runs("fuse-checks") {
@@ -1121,6 +1143,7 @@ fn unk(o: UnOp) -> u8 {
         UnOp::Not => 2,
         UnOp::Sqrt => 3,
         UnOp::Bits => 4,
+        UnOp::Bswap => 5,
     }
 }
 
@@ -1800,6 +1823,7 @@ fn fold_un(ty: FTy, op: UnOp, a: i128) -> i128 {
         // Reached for `__f64_from_bits(<const>)` -- a float constant is
         // carried as its bit pattern anyway.
         UnOp::Bits => a,
+        UnOp::Bswap => ty.truncate((a as u32).swap_bytes() as i128),
         UnOp::Not => {
             if ty == FTy::Bool {
                 if a & 1 != 0 {

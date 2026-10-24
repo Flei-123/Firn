@@ -7460,6 +7460,20 @@ fn emit_inst(
                 ra.fp_out(e, d, "xmm0", single);
             }
         }
+        Op::Un(UnOp::Bswap, x) => {
+            let d = i.dst.ok_or("internal error: unary operation without target")?;
+            match ra.a.loc(d) {
+                Loc::Reg(r) => {
+                    ra.load_full(e, r, *x);
+                    e.line(&format!("bswap {}", rn(r, 32)));
+                }
+                Loc::Slot(_) => {
+                    ra.load_full(e, "rax", *x);
+                    e.line("bswap eax");
+                    ra.store_dst(e, d, "rax");
+                }
+            }
+        }
         Op::Un(op, x) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
             let bits = if ty.bits() > 32 { 64 } else { 32 };
@@ -7471,7 +7485,7 @@ fn emit_inst(
             ra.load_full(e, "rax", *x);
             match op {
                 UnOp::Neg => e.line(&format!("neg {}", rn("rax", bits))),
-                UnOp::Sqrt | UnOp::Bits => unreachable!(),
+                UnOp::Sqrt | UnOp::Bits | UnOp::Bswap => unreachable!(),
                 UnOp::Not => {
                     if ty == FTy::Bool {
                         e.line("xor eax, 1");

@@ -19,7 +19,7 @@
 //! old operations stay alive and nothing is gained). `u32` and `u64` only.
 //! The replaced operations die in `dce`. `FIRN_NO_BITSEL=1` switches it off.
 
-use crate::fir::{BinOp, FTy, Func, Inst, Op, Term, UnOp, Val};
+use crate::fir::{BinOp, FTy, Func, Inst, Op, UnOp, Val};
 use crate::fx::HashMap;
 
 type Bins = HashMap<Val, (BinOp, Val, Val, FTy)>;
@@ -133,21 +133,12 @@ pub(crate) fn run(f: &mut Func) -> usize {
     if std::env::var_os("FIRN_NO_BITSEL").is_some() {
         return 0;
     }
-    let nv = f.val_types.len();
-    let mut uses = vec![0u32; nv];
+    let uses = crate::usecount::counts(f);
     let mut consts: HashMap<Val, i128> = HashMap::default();
     let mut bins: Bins = HashMap::default();
     let mut nots: HashMap<Val, Val> = HashMap::default();
-    let mut buf = Vec::new();
     for b in &f.blocks {
         for i in &b.insts {
-            buf.clear();
-            i.op.uses(&mut buf);
-            for u in &buf {
-                if let Some(c) = uses.get_mut(*u as usize) {
-                    *c += 1;
-                }
-            }
             if let Some(d) = i.dst {
                 match &i.op {
                     Op::Const(c) => {
@@ -161,17 +152,6 @@ pub(crate) fn run(f: &mut Func) -> usize {
                     }
                     _ => {}
                 }
-            }
-        }
-        let tv: Option<Val> = match &b.term {
-            Term::BrCond { cond, .. } => Some(*cond),
-            Term::Switch { val, .. } => Some(*val),
-            Term::Ret(Some(v)) => Some(*v),
-            _ => None,
-        };
-        if let Some(v) = tv {
-            if let Some(c) = uses.get_mut(v as usize) {
-                *c += 1;
             }
         }
     }

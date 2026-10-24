@@ -108,6 +108,8 @@ mod sema_match;
 mod peephole;
 mod rotate;
 mod bitsel;
+mod bswapload;
+mod usecount;
 mod promote;
 mod rangecheck;
 mod strings;

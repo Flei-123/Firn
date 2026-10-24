@@ -222,6 +222,8 @@ pub enum UnOp {
     /// `__f64_from_bits`, `__f32_from_bits`, fbits.rs). The instruction type
     /// is the target, the operand keeps its own type of the same width.
     Bits,
+    /// **Round GAPS** -- byte swap of a 32-bit integer (bswapload.rs, x86-64 only).
+    Bswap,
 }
 
 #[derive(Clone, Debug)]
@@ -1163,6 +1165,7 @@ pub(crate) fn fmt_inst(i: &Inst) -> String {
             UnOp::Not => format!("not.{} %{}", t, a),
             UnOp::Sqrt => format!("sqrt.{} %{}", t, a),
             UnOp::Bits => format!("bits.{} %{}", t, a),
+            UnOp::Bswap => format!("bswap.{} %{}", t, a),
         },
         Op::Cast { src, from } => format!("cast.{}.{} %{}", from.name(), t, src),
         Op::Alloca { size, align } => format!("alloca.ptr size={} align={}", size, align),
