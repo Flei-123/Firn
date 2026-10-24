@@ -1017,6 +1017,9 @@ build mobile
 # lay.scroll_v: a scroll area between bar and footer (size, content height, wheel, clamp)
 build layscroll
 "$W/layscroll" | tail -n 3 | grep -q "LAYSCROLL PASSED"
+# lay.scroll_v: a finger drags the area, a flick runs out, a tap and a mouse drag do not scroll
+build touchscroll
+"$W/touchscroll" | tail -n 3 | grep -q "TOUCHSCROLL PASSED"
 python3 tools/fui/uistr_audit.py
 build touch
 "$W/touch" | tail -n 3
