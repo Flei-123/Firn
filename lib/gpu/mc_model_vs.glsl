@@ -8,6 +8,9 @@ layout(location = 1) in vec4 a_uvt;   // u, v in tile units, tile id, face brigh
 layout(location = 2) in vec4 a_lt;    // sky, block light 0..15, tint (R | G << 8 | B << 16, -1 none), ao 0..3
 uniform mat4 u_rv;
 uniform vec3 u_origin;
+uniform int u_pool;
+uniform usamplerBuffer u_gran;
+uniform samplerBuffer u_org;
 uniform vec4 u_fade;     // x = fade a, y = inverted, z = frame height, w = frame width (vertex snap, r261)
 out vec2 v_light;
 out vec3 v_uvao;
@@ -16,7 +19,12 @@ flat out int v_fk;
 flat out int v_tint;
 out float v_depth;
 void main() {
-    gl_Position = u_rv * vec4(a_pos + u_origin, 1.0);
+    vec3 org = u_origin;
+    if (u_pool != 0) {
+        int slot = int(texelFetch(u_gran, gl_VertexID >> 6).r);
+        org = texelFetch(u_org, slot).xyz;
+    }
+    gl_Position = u_rv * vec4(a_pos + org, 1.0);
     v_depth = gl_Position.w;
     // r261: snap the vertex to the 1/16 pixel grid of lib/mc/mc_raster.fi (snap()), so llvmpipe / lavapipe / a GPU (1/256 or 1/4096 px) see the
     // same triangle corners as the CPU rasterizer. u_fade.w = frame width in pixels (0 = off); u_fade.z = frame height.
