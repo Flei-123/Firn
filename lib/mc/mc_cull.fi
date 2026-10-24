@@ -22,6 +22,7 @@ import std.rt
 import std.math
 import mc.mc_camera
 import mc.mc_world
+import mc.mc_prof
 
 export {
     Cull, CullStats, CONN_ALL, cull_new, cull_free, cull_conn, cull_conn_ref, cull_pair_bit, cull_connected,
@@ -42,9 +43,22 @@ struct CullStats {
     blocked: u32, // steps refused by connectivity or the set-back rule
     known: u32, // result sections with a known connectivity (meshed)
     ncells: u32, // window cells
+    reused: u32,
+}
+
+struct CullSig {
+    valid: bool,
+    gen: u64,
+    dist: i32,
+    setback: bool,
+    x: f64, y: f64, z: f64, yaw: f64, pitch: f64, fov: f64, near: f64, far: f64,
+    w: i32, h: i32,
 }
 
 struct Cull {
+    sig: CullSig,
+    gen: u64,
+    reuse: bool,
     min_y: i32,
     nsec: i32, // sections per column the search covers
     tbl: u64, // hash: [key, value] u64 pairs; value 0 = empty, 1 = deleted, else conn | 65536
@@ -62,10 +76,11 @@ struct Cull {
 }
 
 fn cull_new(min_y: i32, nsec: i32) -> Cull {
-    return Cull { min_y: min_y, nsec: nsec, tbl: 0, cap: 0, used: 0, live: 0, nodes: 0, queue: 0, qcap: 0, cells: 0,
+    return Cull { sig: CullSig { valid: false, gen: 0 as u64, dist: 0, setback: false, x: 0.0, y: 0.0, z: 0.0, yaw: 0.0, pitch: 0.0, fov: 0.0, near: 0.0, far: 0.0, w: 0, h: 0 },
+        gen: 0 as u64, reuse: true, min_y: min_y, nsec: nsec, tbl: 0, cap: 0, used: 0, live: 0, nodes: 0, queue: 0, qcap: 0, cells: 0,
         out: 0, nout: 0, ocap: 0,
         st: CullStats { visited: 0 as u32, frustum_tests: 0 as u32, frustum_out: 0 as u32, blocked: 0 as u32,
-            known: 0 as u32, ncells: 0 as u32 } }
+            known: 0 as u32, ncells: 0 as u32, reused: 0 as u32 } }
 }
 
 fn cull_free(c: *mut Cull) {
@@ -441,6 +456,7 @@ fn insert_raw(c: *mut Cull, key: u64, v: u64) {
 fn cull_set(c: *mut Cull, cx: i32, sy: i32, cz: i32, conn: u32) {
     let key: u64 = cull_pack(cx, sy, cz)
     let v: u64 = (conn as u64) | 65536 as u64
+    (*c).gen = (*c).gen + 1 as u64
     let s: i64 = find_slot(c, key)
     if s >= 0 {
         rt.st64((*c).tbl, (s as usize) * 2 + 1, v)
@@ -467,6 +483,7 @@ fn cull_known(c: *mut Cull) -> usize { return (*c).live }
 
 // Forgets the sections 0..nsec-1 of a chunk column (it was unloaded).
 fn cull_remove_column(c: *mut Cull, cx: i32, cz: i32) {
+    (*c).gen = (*c).gen + 1 as u64
     var sy: i32 = 0
     while sy < (*c).nsec {
         let s: i64 = find_slot(c, cull_pack(cx, sy, cz))
@@ -479,6 +496,7 @@ fn cull_remove_column(c: *mut Cull, cx: i32, cz: i32) {
 }
 
 fn cull_clear(c: *mut Cull) {
+    (*c).gen = (*c).gen + 1 as u64
     if (*c).tbl != 0 {
         var i: usize = 0
         while i < (*c).cap * 2 {
@@ -565,9 +583,10 @@ fn center_d2(cam: *mut mc_camera.Camera, min_y: i32, cx: i32, sy: i32, cz: i32) 
 // Frustum culling only: every section of the window (|dx|, |dz| <= dist columns around the camera, 0 <= sy < nsec) that
 // intersects the frustum. Result in c.out (front to back). The "before" of cull_run.
 fn cull_run_frustum(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32) -> usize {
+    (*c).sig.valid = false
     (*c).nout = 0
     (*c).st = CullStats { visited: 0 as u32, frustum_tests: 0 as u32, frustum_out: 0 as u32, blocked: 0 as u32,
-        known: 0 as u32, ncells: 0 as u32 }
+        known: 0 as u32, ncells: 0 as u32, reused: 0 as u32 }
     let ccx: i32 = mc_world.block_to_chunk(floor_i((*cam).x))
     let ccz: i32 = mc_world.block_to_chunk(floor_i((*cam).z))
     var dz: i32 = 0 - dist
@@ -603,10 +622,42 @@ fn node_enqueue(c: *mut Cull, cell: usize, qh: *mut usize, qn: *mut usize) {
 // The visibility search. `dist` = window radius in columns (as mc_render_world), the camera section is the start.
 // `setback` false drops the set-back rule (slower to cull, strictly more conservative). Result in c.out (front to back),
 // c.st has the numbers. Returns the number of visible sections.
+fn sig_same(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32, setback: bool) -> bool {
+    let g: *mut CullSig = &(*c).sig
+    if !(*g).valid || !(*c).reuse { return false }
+    return (*g).gen == (*c).gen && (*g).dist == dist && (*g).setback == setback
+        && (*g).x == (*cam).x && (*g).y == (*cam).y && (*g).z == (*cam).z
+        && (*g).yaw == (*cam).yaw && (*g).pitch == (*cam).pitch && (*g).fov == (*cam).fov
+        && (*g).near == (*cam).near && (*g).far == (*cam).far && (*g).w == (*cam).width && (*g).h == (*cam).height
+}
+
+fn sig_store(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32, setback: bool) {
+    let g: *mut CullSig = &(*c).sig
+    (*g).valid = true
+    (*g).gen = (*c).gen
+    (*g).dist = dist
+    (*g).setback = setback
+    (*g).x = (*cam).x
+    (*g).y = (*cam).y
+    (*g).z = (*cam).z
+    (*g).yaw = (*cam).yaw
+    (*g).pitch = (*cam).pitch
+    (*g).fov = (*cam).fov
+    (*g).near = (*cam).near
+    (*g).far = (*cam).far
+    (*g).w = (*cam).width
+    (*g).h = (*cam).height
+}
+
 fn cull_run(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32, setback: bool) -> usize {
+    if sig_same(c, cam, dist, setback) {
+        (*c).st.reused = (*c).st.reused + 1 as u32
+        return (*c).nout
+    }
+    var tl: u64 = mc_prof.prof_active_now()
     (*c).nout = 0
     (*c).st = CullStats { visited: 0 as u32, frustum_tests: 0 as u32, frustum_out: 0 as u32, blocked: 0 as u32,
-        known: 0 as u32, ncells: 0 as u32 }
+        known: 0 as u32, ncells: 0 as u32, reused: 0 as u32 }
     let w: i32 = dist * 2 + 1
     let nsec: i32 = (*c).nsec
     let cells: usize = ((w * w) as usize) * (nsec as usize)
@@ -621,6 +672,7 @@ fn cull_run(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32, setback: bool) 
     if csy >= nsec { csy = nsec - 1 }
     let ww: usize = w as usize
     let start: usize = ((csy as usize) * ww + (dist as usize)) * ww + (dist as usize)
+    tl = mc_prof.prof_lap(mc_prof.PH_CINIT, tl)
     var qh: usize = 0
     var qn: usize = 0
     rt.st16((*c).nodes, start, (F_START | F_VISITED) as u16) // empty step history
@@ -720,7 +772,9 @@ fn cull_run(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32, setback: bool) 
             f = f + 1
         }
     }
+    tl = mc_prof.prof_lap(mc_prof.PH_CBFS, tl)
     out_sort(c)
+    tl = mc_prof.prof_lap(mc_prof.PH_CSORT, tl)
     (*c).st.visited = (*c).nout as u32
     var k: usize = 0
     var kn: u32 = 0 as u32
@@ -730,5 +784,7 @@ fn cull_run(c: *mut Cull, cam: *mut mc_camera.Camera, dist: i32, setback: bool) 
         k = k + 1
     }
     (*c).st.known = kn
+    tl = mc_prof.prof_lap(mc_prof.PH_CKN, tl)
+    sig_store(c, cam, dist, setback)
     return (*c).nout
 }

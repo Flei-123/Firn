@@ -27,6 +27,7 @@ import mc.mc_mesh
 import mc.mc_camera
 import mc.mc_backend
 import mc.mc_cull
+import mc.mc_prof
 import mc.mc_lod
 import mc.mc_wlight
 import mc.mc_model_mesh
@@ -173,6 +174,9 @@ struct Stream {
     wl: u64, // *mut mc_wlight.WorldLight (region volume + tables; its nsec must equal the stream's)
     models: u64, // *mut mc_model_mesh.ModelSet or 0 (stream_set_models; CPU back end only)
 }
+
+static mut ENT_BUF: u64 = 0
+static mut ENT_CAP: usize = 0
 
 fn now_ns() -> u64 {
     return time.monotonic_ns()
@@ -1340,6 +1344,19 @@ fn consume(s: *mut Stream, b: *mut mc_backend.Backend, deadline_ns: u64) {
 }
 
 // One frame: search, schedule, upload, draw. Call b.begin before and b.end after. Returns the triangles drawn.
+fn ent_cache(s: *mut Stream, nvis: usize) {
+    if nvis > ENT_CAP {
+        if ENT_BUF != 0 as u64 { rt.heap_free(ENT_BUF, ENT_CAP * 8) }
+        ENT_CAP = nvis * 2 + 1024
+        ENT_BUF = rt.heap_alloc(ENT_CAP * 8)
+    }
+    var k: usize = 0
+    while k < nvis {
+        rt.st64(ENT_BUF, k, sec_find(s, mc_cull.cull_out_key(&(*s).cull, k)) as u64)
+        k = k + 1
+    }
+}
+
 fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backend, cam: *mut mc_camera.Camera) -> u64 {
     (*s).frame = (*s).frame + 1 as u32
     let keep_up: u64 = (*s).st.upload_bytes
@@ -1353,6 +1370,7 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
     } else {
         nvis = mc_cull.cull_run_frustum(&(*s).cull, cam, (*s).dist + lod_extra(s))
     }
+    ent_cache(s, nvis)
     let t1: u64 = now_ns()
     (*s).st.cull_us = (t1 - t0) / 1000 as u64
     (*s).st.visible = nvis as u32
@@ -1374,8 +1392,8 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
     var k: usize = 0
     while k < nvis && started < (*s).max_submit && (*s).inflight < (*s).max_inflight {
         let key: u64 = mc_cull.cull_out_key(&(*s).cull, k)
+        let e: i64 = rt.ld64(ENT_BUF, k) as i64
         k = k + 1
-        let e: i64 = sec_find(s, key)
         if e >= 0 && wants_mesh(s, e as usize) {
             if try_submit(s, b, e as usize) { started = started + 1 }
             if now_ns() > snap_deadline { break }
@@ -1442,7 +1460,6 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
     }
     let t4: u64 = now_ns()
     (*s).st.upload_us = (t4 - t3) / 1000 as u64
-    // compact the pending list (entries that are clean or gone)
     var wi: usize = 0
     var ri: usize = 0
     while ri < (*s).npend {
@@ -1461,6 +1478,7 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
         ri = ri + 1
     }
     (*s).npend = wi
+    let tcp: u64 = mc_prof.prof_lap(mc_prof.PH_COMPACT, t4)
     (*s).st.pending = wi as u32
     (*s).st.inflight = (*s).inflight as u32
     // 5b LOD builds (nearest first, own budget)
@@ -1473,8 +1491,8 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
     k = 0
     while k < nvis {
         let key: u64 = mc_cull.cull_out_key(&(*s).cull, k)
+        let e: i64 = rt.ld64(ENT_BUF, k) as i64
         k = k + 1
-        let e: i64 = sec_find(s, key)
         var inf: u64 = 0 as u64
         if e >= 0 && (*s).lod_dist > 0 { inf = col_draw_info(s, key_cx(key), key_cz(key)) }
         let imode: u64 = inf & 255 as u64
@@ -1484,14 +1502,14 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
         } else if e >= 0 {
             let h: usize = rt.ld64((*s).tbl, (e as usize) * EW + 1) as usize
             if h != 0 {
-                fade_apply(b, ifk, inf >> 16 as u64, false)
+                if (*s).lod_dist > 0 { fade_apply(b, ifk, inf >> 16 as u64, false) }
                 tris = tris + (*b).draw((*b).obj, h, (key_cx(key) * 16) as f64, ((*s).min_y + key_sy(key) * 16) as f64,
                     (key_cz(key) * 16) as f64)
                 drawn = drawn + 1 as u32
             }
             let hmd: usize = rt.ld64((*s).tbl, (e as usize) * EW + 8) as usize
             if hmd != 0 {
-                fade_apply(b, ifk, inf >> 16 as u64, false)
+                if (*s).lod_dist > 0 { fade_apply(b, ifk, inf >> 16 as u64, false) }
                 tris = tris + (*b).draw((*b).obj, hmd, (key_cx(key) * 16) as f64, ((*s).min_y + key_sy(key) * 16) as f64,
                     (key_cz(key) * 16) as f64)
                 if h == 0 { drawn = drawn + 1 as u32 }
@@ -1499,9 +1517,11 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
         }
     }
     fade_off(b)
+    var tpl: u64 = mc_prof.prof_active_now()
     (*b).set_pass((*b).obj, mc_backend.PASS_LOD)
     tris = tris + lod_draw(s, b, cam)
     (*b).set_pass((*b).obj, mc_backend.PASS_OPAQUE)
+    tpl = mc_prof.prof_lap(mc_prof.PH_LODD, tpl)
     if (*s).trans_tab != 0 {
         // translucent pass: every opaque mesh and LOD column is in the frame; sections BACK TO FRONT (the draw list reversed)
         (*b).set_pass((*b).obj, mc_backend.PASS_TRANS)
@@ -1509,21 +1529,21 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
         while kt > 0 {
             kt = kt - 1
             let tkey: u64 = mc_cull.cull_out_key(&(*s).cull, kt)
-            let te: i64 = sec_find(s, tkey)
+            let te: i64 = rt.ld64(ENT_BUF, kt) as i64
             var tinf: u64 = 0 as u64
             if te >= 0 && (*s).lod_dist > 0 { tinf = col_draw_info(s, key_cx(tkey), key_cz(tkey)) }
             let tfk: u64 = (tinf >> 8 as u64) & 255 as u64
             if te >= 0 && ((tinf & 255 as u64) == 0 as u64 || tfk == FK_TOLOD) {
                 let th: usize = rt.ld64((*s).tbl, (te as usize) * EW + 7) as usize
                 if th != 0 {
-                    fade_apply(b, tfk, tinf >> 16 as u64, false)
+                    if (*s).lod_dist > 0 { fade_apply(b, tfk, tinf >> 16 as u64, false) }
                     tris = tris + (*b).draw((*b).obj, th, (key_cx(tkey) * 16) as f64, ((*s).min_y + key_sy(tkey) * 16) as f64,
                         (key_cz(tkey) * 16) as f64)
                     (*s).st.drawn_trans = (*s).st.drawn_trans + 1 as u32
                 }
                 let thm: usize = rt.ld64((*s).tbl, (te as usize) * EW + 9) as usize
                 if thm != 0 {
-                    fade_apply(b, tfk, tinf >> 16 as u64, false)
+                    if (*s).lod_dist > 0 { fade_apply(b, tfk, tinf >> 16 as u64, false) }
                     tris = tris + (*b).draw((*b).obj, thm, (key_cx(tkey) * 16) as f64, ((*s).min_y + key_sy(tkey) * 16) as f64,
                         (key_cz(tkey) * 16) as f64)
                 }
@@ -1533,6 +1553,7 @@ fn stream_frame(s: *mut Stream, w: *mut mc_world.World, b: *mut mc_backend.Backe
         (*b).set_pass((*b).obj, mc_backend.PASS_OPAQUE)
         fade_off(b)
     }
+    tpl = mc_prof.prof_lap(mc_prof.PH_TRANSD, tpl)
     (*s).st.drawn = drawn
     (*s).st.tris = tris
     (*s).st.draw_us = (now_ns() - t4) / 1000 as u64
