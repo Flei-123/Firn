@@ -119,6 +119,7 @@ mod rotate;
 mod bitsel;
 mod bswapload;
 mod buildcache;
+mod objcache;
 mod chainsink;
 mod usecount;
 mod promote;
@@ -846,10 +847,22 @@ fn run(opts: &Options) -> i32 {
         None => None,
     };
     if let (Some(dir), Some(key)) = (&cache_dir, &cache_key) {
-        if let Some(hit) = buildcache::lookup(dir, key) {
-            buildcache::log("hit");
-            let mut tm = Timings::new(false);
-            return finish(opts, path, target_out_manifest, &hit.asm, &hit.link, &mut tm);
+        let slot = buildcache::Slot { dir: dir.clone(), key: key.clone() };
+        if let Some(head) = buildcache::lookup_head(dir, key) {
+            let object = if opts.emit == Emit::Exe && !opts.keep_asm {
+                objcache::load(&slot)
+            } else {
+                None
+            };
+            let asm = if object.is_some() { None } else { head.read_asm() };
+            if object.is_some() || asm.is_some() {
+                buildcache::log("hit");
+                if object.is_some() {
+                    buildcache::log("objload");
+                }
+                let mut tm = Timings::new(false);
+                return finish(opts, path, target_out_manifest, asm.as_deref(), object, &head.link, Some(&slot), &mut tm);
+            }
         }
         buildcache::log("miss");
     }
@@ -1299,18 +1312,20 @@ fn run(opts: &Options) -> i32 {
     };
 
     tm.mark("codegen");
+    let mut slot = None;
     if let (Some(dir), Some(key)) = (&cache_dir, &cache_key) {
         if !buildcache::tainted() && prog.comptime_blocks.is_empty() {
             let link = buildcache::LinkInfo::capture();
             if buildcache::store(dir, key, &link, &asm) {
                 buildcache::log("store");
+                slot = Some(buildcache::Slot { dir: dir.clone(), key: key.clone() });
             }
         } else {
             buildcache::log("skip");
         }
     }
     let link = buildcache::LinkInfo::capture();
-    finish(opts, path, target_out_manifest, &asm, &link, &mut tm)
+    finish(opts, path, target_out_manifest, Some(&asm), None, &link, slot.as_ref(), &mut tm)
 }
 
 fn cache_dir_for(opts: &Options) -> Option<PathBuf> {
@@ -1330,14 +1345,64 @@ fn cache_dir_for(opts: &Options) -> Option<PathBuf> {
     buildcache::cache_dir()
 }
 
+fn output_path(opts: &Options, path: &Path, target_out_manifest: Option<PathBuf>) -> PathBuf {
+    opts.output
+        .clone()
+        .or(target_out_manifest)
+        .unwrap_or_else(|| {
+            // ROUND 94: a test binary is not the program, so it does not take
+            // the program's name -- `x.fi` becomes `x.test`.
+            let d = default_output(path);
+            if opts.test_mode {
+                d.with_extension("test")
+            } else {
+                d
+            }
+        })
+}
+
+fn make_object(
+    asm: Option<&str>,
+    cached: &mut Option<Vec<u8>>,
+    asm_path: &Path,
+    obj_path: &Path,
+    slot: Option<&buildcache::Slot>,
+    tm: &mut Timings,
+) -> Result<(), i32> {
+    if let Some(bytes) = cached.take() {
+        if let Err(e) = std::fs::write(obj_path, &bytes) {
+            eprintln!("error: cannot write '{}': {}", obj_path.display(), e);
+            return Err(2);
+        }
+        return Ok(());
+    }
+    let text = asm.unwrap_or("");
+    if let Err(e) = std::fs::write(asm_path, text.as_bytes()) {
+        eprintln!("error: cannot write '{}': {}", asm_path.display(), e);
+        return Err(2);
+    }
+    tm.mark("write .s");
+    assemble(asm_path, obj_path)?;
+    if let Some(s) = slot {
+        if objcache::save(s, obj_path) {
+            buildcache::log("objsave");
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn finish(
     opts: &Options,
     path: &Path,
     target_out_manifest: Option<PathBuf>,
-    asm: &str,
+    asm: Option<&str>,
+    object: Option<Vec<u8>>,
     link: &buildcache::LinkInfo,
+    slot: Option<&buildcache::Slot>,
     tm: &mut Timings,
 ) -> i32 {
+    let mut object = object;
     if let Some(h) = &opts.header {
         let stem = Path::new(h).file_stem().and_then(|x| x.to_str()).unwrap_or("firn");
         let guard: String = format!("FIRN_{}_H", stem)
@@ -1361,22 +1426,9 @@ fn finish(
             return 2;
         }
     }
-    let out = opts
-        .output
-        .clone()
-        .or_else(|| target_out_manifest.clone())
-        .unwrap_or_else(|| {
-            // ROUND 94: a test binary is not the program, so it does not take
-            // the program's name -- `x.fi` becomes `x.test`.
-            let d = default_output(path);
-            if opts.test_mode {
-                d.with_extension("test")
-            } else {
-                d
-            }
-        });
+    let out = output_path(opts, path, target_out_manifest);
     if opts.emit == Emit::Asm {
-        if let Err(e) = std::fs::write(&out, asm.as_bytes()) {
+        if let Err(e) = std::fs::write(&out, asm.unwrap_or("").as_bytes()) {
             eprintln!("error: cannot write '{}': {}", out.display(), e);
             return 2;
         }
@@ -1388,22 +1440,16 @@ fn finish(
     // ROUND 52 (SPEC §2): the kernel profile produces a freestanding
     // ELF OBJECT FILE. No `ld`, no `_start`, no libc contact — linking
     // happens later at the kernel build with its own linker script.
-    let object = opts.only_object || link.kernel;
+    let object_out = opts.only_object || link.kernel;
     let asm_path = out.with_extension("s");
-    if let Err(e) = std::fs::write(&asm_path, asm.as_bytes()) {
-        eprintln!("error: cannot write '{}': {}", asm_path.display(), e);
-        return 2;
-    }
-    if object {
-        // Without `-o` the result is called `<input>.o`; with `-o` exactly as
-        // written there (the name may then stay without a suffix).
+    if object_out {
         if opts.shared {
             let so = match &opts.output {
                 Some(p) => p.clone(),
                 None => out.with_extension("so"),
             };
             let obj_path = so.with_extension("o");
-            if let Err(code) = assemble(&asm_path, &obj_path) {
+            if let Err(code) = make_object(asm, &mut object, &asm_path, &obj_path, slot, tm) {
                 return code;
             }
             if !opts.keep_asm {
@@ -1420,8 +1466,7 @@ fn finish(
             Some(p) => p.clone(),
             None => out.with_extension("o"),
         };
-        tm.mark("write .s");
-        if let Err(code) = assemble(&asm_path, &obj_path) {
+        if let Err(code) = make_object(asm, &mut object, &asm_path, &obj_path, slot, tm) {
             return code;
         }
         tm.mark("as");
@@ -1432,8 +1477,13 @@ fn finish(
         return 0;
     }
     let obj_path = out.with_extension("o");
-    tm.mark("write .s");
-    if let Err(code) = assemble_and_link(&asm_path, &obj_path, &out, link) {
+    if let Err(code) = check_link(link) {
+        return code;
+    }
+    if let Err(code) = make_object(asm, &mut object, &asm_path, &obj_path, slot, tm) {
+        return code;
+    }
+    if let Err(code) = link_executable(&obj_path, &out, link) {
         return code;
     }
     tm.mark("as + ld");
@@ -1695,14 +1745,17 @@ fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
     }
 }
 
-fn assemble_and_link(asm: &Path, obj: &Path, out: &Path, link: &buildcache::LinkInfo) -> Result<(), i32> {
-    let t = target::active();
-    if t == target::Target::Aarch64 && !link.libs.is_empty() {
+fn check_link(link: &buildcache::LinkInfo) -> Result<(), i32> {
+    if target::active() == target::Target::Aarch64 && !link.libs.is_empty() {
         // Dynamic linking exists for x86_64 only; say so instead of letting `ld` fail on dlopen/dlsym.
         eprintln!("error: `#[link_lib]` (dynamic linking, std.dynlib) is not supported on aarch64");
         return Err(3);
     }
-    assemble(asm, obj)?;
+    Ok(())
+}
+
+fn link_executable(obj: &Path, out: &Path, link: &buildcache::LinkInfo) -> Result<(), i32> {
+    let t = target::active();
     // `-n` (`--nmagic`) switches OFF the page alignment of the sections and
     // puts everything into ONE loadable segment. That was free as long as
     // a Firn program had nothing but `.text` and `.rodata`: one segment,

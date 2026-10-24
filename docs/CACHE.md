@@ -1,6 +1,6 @@
 # Compile cache (firnc0)
 
-`firnc` stores the generated assembler text of a successful build and reuses it when nothing that could change the output has changed. The assembler and linker still run on a hit; the front end, the optimizer and the code generator are skipped.
+`firnc` stores the generated assembler text of a successful build and, after the assembler ran, the assembled object. It reuses them when nothing that could change the output has changed. On an object hit the front end, the optimizer, the code generator and the assembler are skipped; only the linker runs (kernel objects and `-c` builds: nothing runs at all). If the object is missing the assembler text is used and the object is stored afterwards.
 
 ## Switches
 
@@ -10,7 +10,7 @@
 | `FIRN_NO_CACHE=1` | same, from the environment |
 | `FIRN_CACHE_DIR=<dir>` | cache location (default `~/.cache/firn`) |
 | `FIRN_CACHE_MAX_MB=<n>` | size cap, default 512; the oldest entries (by last use) go first, down to 80 % of the cap; 0 keeps nothing |
-| `FIRN_CACHE_LOG=1` | one line per build on stderr: `cache: miss`, `cache: store`, `cache: hit`, `cache: skip`, `cache: off` |
+| `FIRN_CACHE_LOG=1` | lines on stderr: `cache: miss`, `cache: store`, `cache: hit`, `cache: skip`, `cache: off`, plus `cache: objload` (object served) and `cache: objsave` (object stored) |
 
 ## Key
 
@@ -20,6 +20,10 @@ SHA-256 over: the bytes of the running compiler binary, the working directory, t
 
 The assembler text plus the link state that the front end would otherwise provide: kernel profile, presence of a `static`, `#[link_lib]` names, `#[export_c]` names. Entries are written to a temporary file and renamed into place, so concurrent builds see either a whole entry or none. Every entry carries its length and SHA-256; a damaged entry is a miss and is overwritten.
 
+## Object entry
+
+File `objects/<key>.<id>.o` next to the text entry `<key>.fc`; `<id>` = SHA-256 (16 hex digits) of the assembler identity: first line of `as --version` (`aarch64-linux-gnu-as`, `x86_64-w64-mingw32-as` per target) plus its flags, or `intern` for `--asm-intern`. A different assembler version therefore gets its own object next to the old one. The object is written only when the text entry exists, atomically, with length and checksum; a damaged object is a miss for the object only (the text entry is used and the object is rewritten). `--keep-asm` builds never load the object (they need the `.s`). The `.s` name does not enter the object (checked: identical objects under different `-o`). Text entry and object count toward the size cap and are pruned oldest first.
+
 ## Not cached
 
 - `--emit` other than `exe` and `asm`, `--stats`, `--timings`, `--env-log`, `--header`, `--def`, `--deps-out`, `--target=wasm32-browser`
@@ -28,4 +32,4 @@ The assembler text plus the link state that the front end would otherwise provid
 
 ## Proof
 
-`bash tools/cache/run.sh`: hit and miss, byte-identity against `--no-cache` (executables, x86-64 and aarch64 assembler, kernel objects), import change, flag change, environment switch, damaged entry, size cap, eight parallel builds, unwritable cache directory. firnc1 has no cache yet.
+`bash tools/cache/run.sh`: hit and miss, byte-identity against `--no-cache` (executables, x86-64 and aarch64 assembler, kernel objects), import change, flag change, environment switch, damaged entry, size cap, eight parallel builds, unwritable cache directory, assembled object (kernel, aarch64, static, `--asm-intern`, other assembler version, damaged object, parallel builds, cap 0). firnc1 has no cache; it accepts `--no-cache` and ignores it (kmain.fi: cold 13.8 s, text hit 4.2 s, object hit 0.6 s on a busy host).

@@ -216,7 +216,7 @@
 #      whose result is known case by case, with counter-checks.
 #  53c. THE COMPILE CACHE (tools/cache/run.sh, roadmap r59, docs/CACHE.md): hit and
 #      miss on import and flag changes, byte-identical to --no-cache, eight
-#      parallel builds, damaged entries, size cap.
+#      parallel builds, damaged entries, size cap, assembled object cache.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
