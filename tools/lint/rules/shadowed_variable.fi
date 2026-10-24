@@ -1,0 +1,160 @@
+import rt.rt
+import fmt
+import ctx
+import toks
+
+export { name, summary, run }
+
+fn name() -> str { return "shadowed-variable" }
+
+fn summary() -> str { return "let/var or parameter that hides a live binding of the same function" }
+
+struct Decls {
+    name: rt.Buf,
+    owner: rt.Buf,
+    base: usize,
+}
+
+fn col_push(b: *mut rt.Buf, v: u32) {
+    rt.buf_push(b, (v & 255) as u8)
+    rt.buf_push(b, ((v >> 8) & 255) as u8)
+    rt.buf_push(b, ((v >> 16) & 255) as u8)
+    rt.buf_push(b, ((v >> 24) & 255) as u8)
+}
+
+fn decl_count(d: *mut Decls) -> usize {
+    return rt.buf_len(&(*d).name) / 4
+}
+
+fn add(d: *mut Decls, tok: usize, owner: u32) {
+    col_push(&(*d).name, tok as u32)
+    col_push(&(*d).owner, owner)
+}
+
+fn is_underscore(f: *mut fmt.Form, i: usize) -> bool {
+    return rt.ld8(toks.word_str(f, i).p as u64, 0) == 95 as u8
+}
+
+fn find_live(c: *mut ctx.Ctx, d: *mut Decls, tok: usize) -> usize {
+    let f: *mut fmt.Form = (*c).f
+    var k: usize = decl_count(d)
+    while k > (*d).base {
+        k = k - 1
+        let o: u32 = rt.ld32(rt.buf_ptr(&(*d).owner), k)
+        let t: usize = rt.ld32(rt.buf_ptr(&(*d).name), k) as usize
+        if o != ctx.NONE && (o as usize) < tok && toks.same_word(f, t, tok) {
+            let cl: u32 = ctx.close_of(c, o as usize)
+            if cl == ctx.NONE || (cl as usize) > tok {
+                return t
+            }
+        }
+    }
+    return ctx.ctx_count(c)
+}
+
+fn body_brace(f: *mut fmt.Form, rparen: usize) -> u32 {
+    let n: usize = fmt.form_count(f)
+    var k: usize = rparen + 1
+    var steps: usize = 0
+    while k < n && steps < 16 {
+        if fmt.is_sign(f, k, fmt.S_LBRACE) {
+            return k as u32
+        }
+        if toks.is_kw(f, k, "fn") {
+            break
+        }
+        k = k + 1
+        steps = steps + 1
+    }
+    return ctx.NONE
+}
+
+fn read_params(c: *mut ctx.Ctx, d: *mut Decls, fn_name: usize) {
+    let f: *mut fmt.Form = (*c).f
+    let n: usize = fmt.form_count(f)
+    var k: usize = toks.next_code(f, fn_name)
+    if k < n && fmt.is_sign(f, k, fmt.S_LBRACKET) {
+        var depth: u32 = 0
+        while k < n {
+            if fmt.is_sign(f, k, fmt.S_LBRACKET) {
+                depth = depth + 1
+            } else if fmt.is_sign(f, k, fmt.S_RBRACKET) {
+                depth = depth - 1
+                if depth == 0 {
+                    break
+                }
+            }
+            k = k + 1
+        }
+        k = toks.next_code(f, k)
+    }
+    if k >= n || !fmt.is_sign(f, k, fmt.S_LPAREN) {
+        return
+    }
+    var depth: u32 = 0
+    var names: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&names)
+    var close: usize = n
+    while k < n {
+        if fmt.is_sign(f, k, fmt.S_LPAREN) || fmt.is_sign(f, k, fmt.S_LBRACKET) {
+            depth = depth + 1
+        } else if fmt.is_sign(f, k, fmt.S_RPAREN) || fmt.is_sign(f, k, fmt.S_RBRACKET) {
+            depth = depth - 1
+            if depth == 0 {
+                close = k
+                break
+            }
+        } else if depth == 1 && toks.is_word(f, k) {
+            let p: usize = toks.prev_code(f, k)
+            let nx: usize = toks.next_code(f, k)
+            if nx < n && fmt.is_sign(f, nx, fmt.S_COLON) && (fmt.is_sign(f, p, fmt.S_LPAREN) || fmt.is_sign(f, p, fmt.S_COMMA)) {
+                col_push(&names, k as u32)
+            }
+        }
+        k = k + 1
+    }
+    if close >= n {
+        return
+    }
+    let body: u32 = body_brace(f, close)
+    if body == ctx.NONE {
+        return
+    }
+    var j: usize = 0
+    while j < rt.buf_len(&names) / 4 {
+        add(d, rt.ld32(rt.buf_ptr(&names), j) as usize, body)
+        j = j + 1
+    }
+}
+
+fn run(c: *mut ctx.Ctx) {
+    let f: *mut fmt.Form = (*c).f
+    let n: usize = ctx.ctx_count(c)
+    var d: Decls = Decls { name: rt.buf_new(), owner: rt.buf_new(), base: 0 }
+    defer rt.buf_free(&d.name)
+    defer rt.buf_free(&d.owner)
+    var i: usize = 0
+    while i < n {
+        if toks.is_kw(f, i, "fn") {
+            let nm: usize = toks.next_code(f, i)
+            if nm < n && toks.is_word(f, nm) {
+                d.base = decl_count(&d)
+                read_params(c, &d, nm)
+            }
+        } else if (toks.is_kw(f, i, "let") || toks.is_kw(f, i, "var")) && ctx.owner_of(c, i) != ctx.NONE {
+            let b: usize = toks.next_code(f, i)
+            if b < n && toks.is_word(f, b) && !is_underscore(f, b) {
+                let prev: usize = find_live(c, &d, b)
+                if prev < n {
+                    ctx.ctx_emit_head(c, name(), fmt.tok_line(f, b))
+                    toks.put_quoted_word(c, b)
+                    toks.put(c, " hides the binding on line ")
+                    toks.put_num(c, fmt.tok_line(f, prev) as u64)
+                    ctx.ctx_emit_done(c)
+                }
+                add(&d, b, ctx.owner_of(c, i))
+            }
+        }
+        i = i + 1
+    }
+}

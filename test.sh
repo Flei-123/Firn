@@ -210,6 +210,10 @@
 #      same file is core language for BOTH compilers. Section 25
 #      (tools/dwarf/run.sh) grew the second half of the round: the line
 #      table is held against the panic message the program prints itself.
+#  53b. THE SUITE RUNNER (tools/testrunner/suite.sh, roadmap r26): the
+#      programs of tests/ in the four build levels as json, jsonl, junit or
+#      text with name, status, duration and file:line:col -- checked on a tree
+#      whose result is known case by case, with counter-checks.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -1284,6 +1288,16 @@ if [ "$TRRC" -eq 0 ]; then
 else
     bad "tools/testrunner/run.sh failed (see .test-work/testrunner.log)"
     grep FAIL "$WORK/testrunner.log" | head -10 | sed 's/^/   /' || true
+fi
+
+echo "== 53b. the suite runner: json / jsonl / junit over a known tree (tools/testrunner/suite.sh, r26) =="
+bash tools/testrunner/suite.sh > "$WORK/suite_runner.log" 2>&1 && SRRC=0 || SRRC=$?
+if [ "$SRRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/suite_runner.log" | sed 's/^/   /' || true
+else
+    bad "tools/testrunner/suite.sh failed (see .test-work/suite_runner.log)"
+    grep FAIL "$WORK/suite_runner.log" | head -10 | sed 's/^/   /' || true
 fi
 
 # ROUND K3. Sections 53 and 54 belong to the rounds running in parallel;
