@@ -6,7 +6,7 @@
 #     independent reference (python / node / java tools, never Mojang code).
 #     Each prints a line `RESULT <name>: ok` and exits 0 on success.
 #
-# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | chatplay | healthplay | combatplay | sessplay | edge | modelplay | vanillaplay | lodseam | biomezoom)
+# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | chatplay | healthplay | combatplay | swimplay | sessplay | edge | modelplay | vanillaplay | lodseam | biomezoom)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
@@ -16,7 +16,7 @@ FIRNC=${FIRNC:-compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 # r220: a firnc older than r167 makes every GL stage (mcplay MCPLAY_GL=1 with mesher threads) segfault in the first frame
 case " $ONLY " in
-    "  "|" chatplay "|" healthplay "|" combatplay "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" sessplay "|" modelplay "|" vanillaplay "|" lodseam "|" biomezoom "|" play ")
+    "  "|" chatplay "|" healthplay "|" combatplay "|" swimplay "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" sessplay "|" modelplay "|" vanillaplay "|" lodseam "|" biomezoom "|" play ")
         bash tools/mc/check_firnc.sh "$FIRNC" || { echo "RESULT mc: FAIL (stale firnc)"; exit 1; } ;;
 esac
 # every .fi file of the tree must be in the canonical shape of firnfmt (test.sh section 23
@@ -151,6 +151,11 @@ if [ -z "$ONLY" ] || [ "$ONLY" = edge ]; then
     bash tools/mc/play/run_edge.sh || ERR=$((ERR+1))
     MC_VERSION=1.21.4 bash tools/mc/play/run_edge.sh || ERR=$((ERR+1))
     MC_VERSION=1.21.8 bash tools/mc/play/run_edge.sh || ERR=$((ERR+1))
+fi
+if [ -z "$ONLY" ] || [ "$ONLY" = swimplay ]; then
+    echo "== mc/swimplay =="
+    bash tools/mc/play/run_swim.sh 1.20.1 || ERR=$((ERR+1))
+    bash tools/mc/play/run_swim.sh 1.21.4 || ERR=$((ERR+1))
 fi
 if [ $ERR -eq 0 ]; then echo "RESULT mc: ok"; else echo "RESULT mc: $ERR failing parts"; fi
 exit $ERR
