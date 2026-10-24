@@ -91,13 +91,34 @@ restart() {
 }
 
 echo "== 6b. text area fling =="
-restart
-swipe 500 942 500 921 2500
-TS=$(field t)
-restart
-swipe 500 942 500 921 150
-TF=$(field t)
-echo "   INFO    quick flick t=$TF, slow drag t=$TS (fling on the emulator is not asserted yet)"
+fling_attempt() {
+    restart
+    $ADB shell input swipe $((500 * W / 1000)) $((925 * H / 1000)) $((500 * W / 1000)) $((835 * H / 1000)) $1
+    sleep 3
+    $ADB logcat -d -v epoch -s firn:I 2>/dev/null | grep ' swipe v=' | awk '{
+        t = ""; tm = ""
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^t=/) t = substr($i, 3)
+            if ($i ~ /^tm=/) tm = substr($i, 4)
+        }
+        if (tm == 1) {
+            n++
+            if (n == 1) { t0 = t; ms0 = $1 * 1000 }
+            t1 = t; ms1 = $1 * 1000
+        }
+        last = t
+    } END { printf "%d %d %d\n", n + 0, t1 - t0, ms1 - ms0 }'
+}
+FL_N=0; FL_DT=0; FL_MS=0
+for dur in 500 700 500 900; do
+    read -r FL_N FL_DT FL_MS < <(fling_attempt $dur)
+    echo "   INFO    swipe ${dur} ms: moving frames after lift=$FL_N, extra scroll=$FL_DT px over $FL_MS ms"
+    [ "$FL_N" -ge 3 ] && [ "$FL_DT" -ge 8 ] && break
+done
+check "the text area keeps moving after the finger left (>= 3 frames, >= 8 px, got $FL_N / $FL_DT)" "[ $FL_N -ge 3 ] && [ $FL_DT -ge 8 ]"
+check "the run-out lasts at least 80 ms (got $FL_MS)" "[ $FL_MS -ge 80 ]"
+check "the run-out comes to rest (moving flag back to 0)" "[ \"\$($ADB logcat -d -s firn:I 2>/dev/null | grep ' swipe v=' | tail -1 | grep -o ' tm=[01]' | tail -1)\" = ' tm=0' ]"
+check "the text area scrolled forward (t > 0)" "[ \"\$(field t)\" -gt 0 ]"
 
 echo "== 6c. text area rubber band =="
 restart
