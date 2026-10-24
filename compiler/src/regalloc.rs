@@ -6278,6 +6278,9 @@ fn cmp_behind_copies(ra: &Ra, b: &Block) -> Option<Block> {
             if *src == cond {
                 return None;
             }
+            if ra.a.imm(*src).is_none() && ra.a.cell(*src).is_none() && ra.a.loc(*src) == ra.a.loc(d) {
+                continue;
+            }
         }
         if places.iter().any(|p| *p == ra.a.loc(d)) {
             return None;
