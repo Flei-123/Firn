@@ -45,6 +45,8 @@ import window.window
 import window.win32_proc
 import window.pointers
 import window.hostmetrics
+import window.cfhtml
+import window.cfdib
 import desktop.notify
 import std.cmdline
 import paint.gl
@@ -187,6 +189,7 @@ extern fn CloseClipboard() -> i32;
 extern fn EmptyClipboard() -> i32;
 extern fn SetClipboardData(fmt: i64, h: i64) -> i64;
 extern fn GetClipboardData(fmt: i64) -> i64;
+extern fn IsClipboardFormatAvailable(fmt: i64) -> i32;
 extern fn EnumClipboardFormats(fmt: i64) -> i32;
 extern fn RegisterClipboardFormatW(name: u64) -> i32;
 extern fn GetClipboardFormatNameW(fmt: i64, buf: u64, n: i64) -> i32;
@@ -3435,6 +3438,8 @@ fn clip_format_of(mime: str) -> i64 {
     var m: str = mime
     if mime == "image/png" {
         m = "PNG"
+    } else if mime == "text/html" {
+        m = "HTML Format"
     }
     cmdline.utf8_to_utf16(m.p as u64, m.length(), &name)
     rt.buf_push(&name, 0 as u8)
@@ -3464,6 +3469,56 @@ fn clip_put(fmt: i64, p: u64, n: usize) -> bool {
         return false
     }
     return true
+}
+
+fn clip_put_exact(fmt: i64, p: u64, n: usize) -> bool {
+    let hm: i64 = GlobalAlloc(2, n as i64)
+    if hm == 0 {
+        return false
+    }
+    let q: u64 = GlobalLock(hm)
+    if q == 0 as u64 {
+        GlobalFree(hm)
+        return false
+    }
+    rt.mem_copy(q, p, n)
+    GlobalUnlock(hm)
+    if SetClipboardData(fmt, hm) == 0 {
+        GlobalFree(hm)
+        return false
+    }
+    return true
+}
+
+fn clip_put_dibv5(p: u64, n: usize) {
+    var dib: rt.Buf = rt.buf_new()
+    if cfdib.cf_dibv5_from_png(p, n, &dib) {
+        clip_put_exact(17, rt.buf_ptr(&dib), rt.buf_len(&dib))
+    }
+    rt.buf_free(&dib)
+}
+
+fn clip_get_dib_as_png(out: *mut rt.Buf) -> bool {
+    var h: i64 = 0
+    if IsClipboardFormatAvailable(17) != 0 {
+        h = GetClipboardData(17)
+    }
+    if h == 0 && IsClipboardFormatAvailable(8) != 0 {
+        h = GetClipboardData(8)
+    }
+    if h == 0 {
+        return false
+    }
+    let q: u64 = GlobalLock(h)
+    if q == 0 as u64 {
+        return false
+    }
+    let ok: bool = cfdib.cf_png_from_dib(q, GlobalSize(h) as usize, out)
+    GlobalUnlock(h)
+    if !ok {
+        rt.buf_clear(out)
+    }
+    return ok && rt.buf_len(out) > 0
 }
 
 fn hexv(c: u8) -> i32 {
@@ -3577,6 +3632,22 @@ fn r_clip_set(x: *mut Platte, mime: str, p: u64, n: usize) -> bool {
             ok = clip_put(15, rt.buf_ptr(&d), rt.buf_len(&d))
         }
         rt.buf_free(&d)
+    } else if mime == "text/html" {
+        var blk: rt.Buf = rt.buf_new()
+        cfhtml.cf_html_build(p, n, &blk)
+        let f: i64 = clip_format_of(mime)
+        if f != 0 {
+            ok = clip_put(f, rt.buf_ptr(&blk), rt.buf_len(&blk))
+        }
+        rt.buf_free(&blk)
+    } else if mime == "image/png" {
+        let f: i64 = clip_format_of(mime)
+        if f != 0 {
+            ok = clip_put_exact(f, p, n)
+            if ok {
+                clip_put_dibv5(p, n)
+            }
+        }
     } else {
         let f: i64 = clip_format_of(mime)
         if f != 0 {
@@ -3689,16 +3760,35 @@ fn r_clip_get(x: *mut Platte, mime: str, out: *mut rt.Buf) -> bool {
         }
     } else {
         let f: i64 = clip_format_of(mime)
+        var found: bool = false
         if f != 0 {
             let h: i64 = GetClipboardData(f)
             if h != 0 {
                 let q: u64 = GlobalLock(h)
                 if q != 0 as u64 {
-                    rt.buf_push_bytes(out, q, GlobalSize(h) as usize)
+                    let size: usize = GlobalSize(h) as usize
+                    found = true
+                    if mime == "text/html" {
+                        ok = cfhtml.cf_html_extract(q, size, out)
+                    } else if mime == "image/png" {
+                        let exact: usize = cfhtml.cf_png_exact_len(q, size)
+                        if exact > 0 {
+                            rt.buf_push_bytes(out, q, exact)
+                            ok = true
+                        }
+                    } else {
+                        rt.buf_push_bytes(out, q, size)
+                        ok = true
+                    }
                     GlobalUnlock(h)
-                    ok = true
                 }
             }
+        }
+        if !found && mime == "image/png" {
+            ok = clip_get_dib_as_png(out)
+        }
+        if !ok {
+            rt.buf_clear(out)
         }
     }
     CloseClipboard()
@@ -3713,8 +3803,13 @@ fn r_clip_types(x: *mut Platte, out: *mut rt.Buf) -> usize {
         return 0
     }
     var count: usize = 0
+    var png_seen: bool = false
+    var dib_seen: bool = false
     var f: i32 = EnumClipboardFormats(0)
     while f != 0 {
+        if f == 8 || f == 17 {
+            dib_seen = true
+        }
         if f == 13 {
             let t: str = "text/plain;charset=utf-8\n"
             rt.buf_push_bytes(out, t.p as u64, t.length())
@@ -3732,6 +3827,10 @@ fn r_clip_types(x: *mut Platte, out: *mut rt.Buf) -> usize {
                 if rt.buf_len(&u) == 3 && rt.buf_at(&u, 0) == 80 as u8 && rt.buf_at(&u, 1) == 78 as u8 && rt.buf_at(&u, 2) == 71 as u8 {
                     let t: str = "image/png\n"
                     rt.buf_push_bytes(out, t.p as u64, t.length())
+                    png_seen = true
+                } else if rt.buf_len(&u) == 11 && rt.buf_at(&u, 0) == 72 as u8 && rt.buf_at(&u, 1) == 84 as u8 && rt.buf_at(&u, 2) == 77 as u8 && rt.buf_at(&u, 3) == 76 as u8 {
+                    let t: str = "text/html\n"
+                    rt.buf_push_bytes(out, t.p as u64, t.length())
                 } else {
                     rt.buf_push_bytes(out, rt.buf_ptr(&u), rt.buf_len(&u))
                     rt.buf_push(out, 10 as u8)
@@ -3741,6 +3840,11 @@ fn r_clip_types(x: *mut Platte, out: *mut rt.Buf) -> usize {
             }
         }
         f = EnumClipboardFormats(f as i64)
+    }
+    if dib_seen && !png_seen {
+        let t: str = "image/png\n"
+        rt.buf_push_bytes(out, t.p as u64, t.length())
+        count = count + 1
     }
     CloseClipboard()
     return count

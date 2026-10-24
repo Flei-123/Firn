@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: MPL-2.0
+// lib/window/cfhtml.fi -- the Windows clipboard format "HTML Format" (CF_HTML), pure functions (no system calls).
+//
+// A clipboard HTML block is a text header with byte offsets, then the HTML:
+//
+//   Version:0.9
+//   StartHTML:0000000105     offset of the first octet of the HTML text (= header length, 105)
+//   EndHTML:0000000XXX       offset after the last octet
+//   StartFragment:0000000XXX offset of the copied fragment (after the <!--StartFragment--> comment)
+//   EndFragment:0000000XXX   offset after the fragment (before the <!--EndFragment--> comment)
+//   <html><body>
+//   <!--StartFragment-->FRAGMENT<!--EndFragment-->
+//   </body></html>
+//
+// All numbers are 10 digits, zero padded, counted in OCTETS of the UTF-8 text from the first octet of the block.
+// Every line ends with CR LF. `cf_html_build` makes the block from a fragment; `cf_html_extract` takes the fragment
+// out of a block made by any program (it trusts StartFragment/EndFragment, falls back to StartHTML/EndHTML, then to
+// the comment markers, then to the whole text).
+import std.rt
+
+export { cf_html_build, cf_html_extract, cf_png_exact_len }
+
+fn cf_put(out: *mut rt.Buf, s: str) {
+    rt.buf_push_bytes(out, s.p as u64, s.length())
+}
+
+fn cf_crlf(out: *mut rt.Buf) {
+    rt.buf_push(out, 13 as u8)
+    rt.buf_push(out, 10 as u8)
+}
+
+fn cf_dec10(out: *mut rt.Buf, v: usize) {
+    var d: [u8; 10] = [48 as u8; 10]
+    var k: usize = 10
+    var r: usize = v
+    while k > 0 {
+        k = k - 1
+        d[k] = (48 + (r % 10)) as u8
+        r = r / 10
+    }
+    rt.buf_push_bytes(out, (&d[0]) as u64, 10)
+}
+
+// APPENDS the CF_HTML block of the fragment p[0..n] to `out`.
+fn cf_html_build(p: u64, n: usize, out: *mut rt.Buf) {
+    let pre: str = "<html><body>"
+    let mark_a: str = "<!--StartFragment-->"
+    let mark_b: str = "<!--EndFragment-->"
+    let post: str = "</body></html>"
+    let head: usize = 105 // 13 + 22 + 20 + 26 + 24
+    let sf: usize = head + pre.length() + 2 + mark_a.length()
+    let ef: usize = sf + n
+    let eh: usize = ef + mark_b.length() + 2 + post.length()
+    cf_put(out, "Version:0.9")
+    cf_crlf(out)
+    cf_put(out, "StartHTML:")
+    cf_dec10(out, head)
+    cf_crlf(out)
+    cf_put(out, "EndHTML:")
+    cf_dec10(out, eh)
+    cf_crlf(out)
+    cf_put(out, "StartFragment:")
+    cf_dec10(out, sf)
+    cf_crlf(out)
+    cf_put(out, "EndFragment:")
+    cf_dec10(out, ef)
+    cf_crlf(out)
+    cf_put(out, pre)
+    cf_crlf(out)
+    cf_put(out, mark_a)
+    rt.buf_push_bytes(out, p, n)
+    cf_put(out, mark_b)
+    cf_crlf(out)
+    cf_put(out, post)
+}
+
+// The decimal number after `key` in the header (first 400 octets), -1 = no such line.
+fn cf_hdr(p: u64, n: usize, key: str) -> i64 {
+    var lim: usize = n
+    if lim > 400 {
+        lim = 400
+    }
+    let kl: usize = key.length()
+    var i: usize = 0
+    while i + kl < lim {
+        var same: bool = true
+        var j: usize = 0
+        while j < kl && same {
+            if rt.ld8(p, i + j) != key.chars(j) {
+                same = false
+            }
+            j = j + 1
+        }
+        if same && (i == 0 || rt.ld8(p, i - 1) == 10 as u8) {
+            var v: i64 = 0
+            var k: usize = i + kl
+            var any: bool = false
+            while k < lim && rt.ld8(p, k) >= 48 as u8 && rt.ld8(p, k) <= 57 as u8 {
+                v = v * 10 + (rt.ld8(p, k) - 48 as u8) as i64
+                any = true
+                k = k + 1
+            }
+            if any {
+                return v
+            }
+            return 0 - 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn cf_find(p: u64, n: usize, pat: str, from: usize) -> i64 {
+    let pl: usize = pat.length()
+    var i: usize = from
+    while i + pl <= n {
+        var same: bool = true
+        var j: usize = 0
+        while j < pl && same {
+            if rt.ld8(p, i + j) != pat.chars(j) {
+                same = false
+            }
+            j = j + 1
+        }
+        if same {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// APPENDS the fragment of the CF_HTML block p[0..n] to `out`. false = nothing found (`out` unchanged).
+fn cf_html_extract(p: u64, n0: usize, out: *mut rt.Buf) -> bool {
+    var n: usize = n0
+    while n > 0 && rt.ld8(p, n - 1) == 0 as u8 { // Windows may hand out a block that is longer than the data
+        n = n - 1
+    }
+    let sf: i64 = cf_hdr(p, n, "StartFragment:")
+    let ef: i64 = cf_hdr(p, n, "EndFragment:")
+    if sf >= 0 && ef >= sf && (ef as usize) <= n {
+        rt.buf_push_bytes(out, p + sf as u64, (ef - sf) as usize)
+        return true
+    }
+    let sh: i64 = cf_hdr(p, n, "StartHTML:")
+    let eh: i64 = cf_hdr(p, n, "EndHTML:")
+    if sh >= 0 && eh > sh && (eh as usize) <= n {
+        rt.buf_push_bytes(out, p + sh as u64, (eh - sh) as usize)
+        return true
+    }
+    let a: i64 = cf_find(p, n, "<!--StartFragment-->", 0)
+    if a >= 0 {
+        let from: usize = (a as usize) + 20
+        let b: i64 = cf_find(p, n, "<!--EndFragment-->", from)
+        if b >= 0 {
+            rt.buf_push_bytes(out, p + from as u64, (b as usize) - from)
+            return true
+        }
+    }
+    return false
+}
+
+// The length of the PNG file at p (n octets there): signature, then chunks up to and including IEND. 0 = not a complete PNG.
+// Windows hands out a block that may be a few octets larger than the data.
+fn cf_png_exact_len(p: u64, n: usize) -> usize {
+    if n < 20 || rt.ld8(p, 0) != 0x89 as u8 || rt.ld8(p, 1) != 0x50 as u8 || rt.ld8(p, 2) != 0x4E as u8 || rt.ld8(p, 3) != 0x47 as u8 {
+        return 0
+    }
+    var at: usize = 8
+    while at + 12 <= n {
+        let len: usize = ((rt.ld8(p, at) as usize) << 24) | ((rt.ld8(p, at + 1) as usize) << 16)
+            | ((rt.ld8(p, at + 2) as usize) << 8) | (rt.ld8(p, at + 3) as usize)
+        if len > n || at + 12 + len > n {
+            return 0
+        }
+        let is_end: bool = rt.ld8(p, at + 4) == 0x49 as u8 && rt.ld8(p, at + 5) == 0x45 as u8
+            && rt.ld8(p, at + 6) == 0x4E as u8 && rt.ld8(p, at + 7) == 0x44 as u8
+        at = at + 12 + len
+        if is_end {
+            return at
+        }
+    }
+    return 0
+}
