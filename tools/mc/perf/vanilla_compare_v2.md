@@ -95,3 +95,16 @@ Spalten: n = Anzahl Laeufe; cpu = % eines Kerns; t_window = Prozessstart bis Fen
 - Tried and dropped: cull micro-opts (closed-form pair bit, Ciura gap sort, memset of the window, removing the known-count pass): r16 cull 1894 -> 1939 us = no gain, reverted. Face-direction buckets confirmed (off = slower).
 - Result: the renderer alone is NOT 2x Vanilla (r8 1.2x, r16 1.1-1.2x). With LOD at equal view distance mcplay is 2.5-2.6x faster at the Vanilla r16 distance (view 8 + LOD 16: 2.26 vs 5.74-5.97 ms) and ~1.9x at the r8 distance (view 4 + LOD 8: 1.30 vs 2.44-2.51). The far terrain is then simplified LOD, and mcplay still has a simpler renderer than Vanilla (no shaders/entities/particles/weather), so this is not like-for-like.
 - Next levers (CPU): sub-profile net_tick (350 us) and the draw loop (1.2 us per drawn section), cache cull result across frames / thread the cull + draw-list build, reduce the 0.8 ms fixed per-frame overhead. GPU at r16 (2.7 ms, 1.18M tris) needs fewer triangles (LOD default for r > 8).
+
+## v6 (24.10., cull graph cache + hotbar env cache) -- Laptop HOLO-LAPTOP-3, Hoechstleistung, 1280x720, uncapped, GL, MCPLAY_SPIN=3 + rcon yaw sweep, MC_VANILLA=0
+| config | r8 p50 ms | r16 p50 ms |
+|---|---|---|
+| Vanilla 1.20.1 (n=3) | 2.46 | 5.81 |
+| mcplay base (graph off, n=2) | 1.97 / 2.06 | 5.47 / 5.48 |
+| + cull graph cache (n=2) | 1.62 / 1.76 | 4.80 / 4.69 |
+| + hotbar env cache, idle schedule skip, window sync gate (default, n=3) | 1.64 / 1.64 / 1.65 | 4.77 / 4.89 / 4.76 |
+| + MCPLAY_GL_MODE=3 (n=1) | 1.65 | 4.62 |
+| Vanilla pack default (MC_VANILLA=1, n=1) | 5.84 | - |
+- Ratio vs Vanilla: r8 1.5x, r16 1.22x. 2x NOT reached. At r8 the frame is GPU/present bound (CPU savings of 210 us net_tick give no p50 change).
+- n_wtick was 194 us of env lookups in handle_hotbar (8 env_flag per frame), now cached. Vanilla pack default is 3.5x slower on Iris Xe (roadmap r300).
+- Not measured: 360p, capped, r32, VK, walking with section changes.
