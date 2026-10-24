@@ -50,7 +50,11 @@ Voxel client $VERSION (Windows)
   mcclient.exe <host> <port> <name> ...    headless join / chunk dump
 Environment: MCPLAY_GL=1 (OpenGL), MCPLAY_VIEW=<chunks>, MCPLAY_LOG=<file|->, MCPLAY_SOUNDS=<dir>, FIRN_AUDIO=device|null
 Sound bank: sounds\\ next to the exe is used automatically.
+Textures and models: read at run time from your own Minecraft installation (versions\\<version>\\<version>.jar, or MC_VANILLA_JAR), cached in %LOCALAPPDATA%\\mcplay. No Mojang files are shipped. MC_VANILLA=0 turns it off.
 EOF
+
+if find "$PKG" \( -iname '*.jar' -o -name blockstates -o -name textures -o -name pack.mcmeta -o -iname '*.ogg' \) | grep -q .; then fail "package contains Mojang-style assets"; fi
+echo "  ok  no Mojang assets in the package"
 
 # 4) zip + installer
 python3 -I tools/pack/pack.py win-zip --id mcplay --name "Voxel Client" --version "$VERSION" --vendor Fleitec --exe-name mcplay.exe \

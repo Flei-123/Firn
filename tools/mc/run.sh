@@ -6,16 +6,17 @@
 #     independent reference (python / node / java tools, never Mojang code).
 #     Each prints a line `RESULT <name>: ok` and exits 0 on success.
 #
-# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | sessplay | edge | modelplay | lodseam | biomezoom)
+# Usage: bash tools/mc/run.sh [lib]      (lib = a directory name under tools/mc/, or wine | lodplay | ents | vkplay | vkview | tpplay | ajplay | hashplay | contplay | sessplay | edge | modelplay | vanillaplay | lodseam | biomezoom)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ERR=0
 ONLY=${1:-}
+export MC_VANILLA=${MC_VANILLA:-0}
 FIRNC=${FIRNC:-compiler/target/release/firnc}
 [ -x "$FIRNC" ] || FIRNC=/root/firn/compiler/target/release/firnc
 # r220: a firnc older than r167 makes every GL stage (mcplay MCPLAY_GL=1 with mesher threads) segfault in the first frame
 case " $ONLY " in
-    "  "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" sessplay "|" modelplay "|" lodseam "|" biomezoom "|" play ")
+    "  "|" wine "|" lodplay "|" ents "|" vkplay "|" vkview "|" tpplay "|" ajplay "|" hashplay "|" contplay "|" sessplay "|" modelplay "|" vanillaplay "|" lodseam "|" biomezoom "|" play ")
         bash tools/mc/check_firnc.sh "$FIRNC" || { echo "RESULT mc: FAIL (stale firnc)"; exit 1; } ;;
 esac
 # every .fi file of the tree must be in the canonical shape of firnfmt (test.sh section 23
@@ -67,6 +68,11 @@ fi
 if [ -z "$ONLY" ] || [ "$ONLY" = modelplay ] || [ "$ONLY" = modelgl ]; then
     echo "== mc/modelgl =="
     bash tools/mc/play/run_models_gl.sh || ERR=$((ERR+1))
+fi
+# vanilla resource pack default: jar -> run time cache -> mcplay (models on), MC_VANILLA=0 and no-jar fallback, cache reuse: ~4 min, needs Xvfb + xdotool + java + network (client jar, cached).
+if [ "$ONLY" = vanillaplay ]; then
+    echo "== mc/vanillaplay =="
+    bash tools/mc/play/run_vanilla.sh || ERR=$((ERR+1))
 fi
 # entities in the mcplay play path against the real server (live packets + CPU/GL pictures with / without boxes): ~4 min, needs Xvfb + java; plus the rider entity scenario of tools/mcclient/run.sh.
 if [ -z "$ONLY" ] || [ "$ONLY" = ents ]; then
